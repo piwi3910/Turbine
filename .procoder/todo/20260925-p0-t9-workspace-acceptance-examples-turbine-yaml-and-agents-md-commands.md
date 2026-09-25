@@ -1,6 +1,6 @@
 # P0-T9 Workspace acceptance, examples/turbine.yaml and AGENTS.md commands
 
-Status: open
+Status: closed 2026-09-25
 Created: 2026-09-25
 
 ## Description

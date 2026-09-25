@@ -1,6 +1,6 @@
 # P0-T2 turbine-observability — tracing, metrics registry, HTTP layers
 
-Status: open
+Status: closed 2026-09-25
 Created: 2026-09-25
 
 ## Description

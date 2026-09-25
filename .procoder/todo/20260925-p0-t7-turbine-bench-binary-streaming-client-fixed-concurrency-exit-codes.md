@@ -1,6 +1,6 @@
 # P0-T7 turbine-bench binary — streaming client, fixed concurrency, exit codes
 
-Status: open
+Status: closed 2026-09-25
 Created: 2026-09-25
 
 ## Description

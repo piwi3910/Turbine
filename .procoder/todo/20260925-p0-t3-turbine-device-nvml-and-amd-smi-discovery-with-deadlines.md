@@ -1,6 +1,6 @@
 # P0-T3 turbine-device — NVML and amd-smi discovery with deadlines
 
-Status: open
+Status: closed 2026-09-25
 Created: 2026-09-25
 
 ## Description

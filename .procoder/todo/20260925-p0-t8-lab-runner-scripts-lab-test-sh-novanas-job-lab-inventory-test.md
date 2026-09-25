@@ -1,6 +1,6 @@
 # P0-T8 Lab runner — scripts/lab-test.sh, novanas Job, lab inventory test
 
-Status: open
+Status: closed 2026-09-25
 Created: 2026-09-25
 
 ## Description

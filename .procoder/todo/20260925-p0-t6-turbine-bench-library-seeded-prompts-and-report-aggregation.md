@@ -1,6 +1,6 @@
 # P0-T6 turbine-bench library — seeded prompts and report aggregation
 
-Status: open
+Status: closed 2026-09-25
 Created: 2026-09-25
 
 ## Description
