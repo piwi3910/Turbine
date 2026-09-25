@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repository.
 
 ## Project state
 
-Turbine is a Rust LLM inference engine (reliability-first, hierarchical KV cache, no Python/PyTorch in the serving path). `turbine-spec.md` is the original product vision; the work is driven by procoder's chain in `.procoder/`:
+Turbine is a Rust LLM inference engine (reliability-first, hierarchical KV cache, no Python/PyTorch in the serving path). The repository holds the spec plus the Phase 0 skeleton: six crates (`crates/turbine-{core,observability,device,api,server}`, `benches/turbine-bench`) that serve the V1 route surface without a model. `turbine-spec.md` is the original product vision; the work is driven by procoder's chain in `.procoder/`:
 
 - `.procoder/specs/phase-*.md` — one complete spec per phase (0, 1, 2, 2b, 3–8). Where a phase spec amends `turbine-spec.md`, the phase spec wins.
 - `.procoder/plans/phase-*.md` — one implementation plan per phase; build task by task, test first, gate-clean, one commit per task.
@@ -15,13 +15,20 @@ If reality contradicts a spec or plan mid-build, update the spec/plan first and 
 
 ## Commands
 
-None exist yet. The spec prescribes a Cargo workspace, so once Phase 0 lands the standard forms apply:
+Toolchain: Rust 1.97, edition 2024 (workspace `rust-version`). No GPU is needed to build or test: GPU libraries (NVML, amd-smi) are loaded at runtime, and GPU-dependent tests are `#[ignore]`d and run only on the lab hosts.
 
-- `cargo build --workspace`
-- `cargo test --workspace` / single crate: `cargo test -p turbine-kv` / single test: `cargo test -p turbine-kv <test_name>`
-- `cargo clippy --workspace --all-targets` and `cargo fmt --all`
-
-Update this section with real commands (CUDA build requirements, benches, integration-test gating) as they are added.
+- Build: `cargo build --workspace`
+- Test: `cargo test --workspace`
+- One crate: `cargo test -p turbine-core`
+- One unit test: `cargo test -p turbine-core config::tests::byte_size_parsing`
+- One integration test: `cargo test -p turbine-api --test api route_table_phase0`
+- Lint: `cargo clippy --workspace --all-targets -- -D warnings`
+- Format: `cargo fmt --all` (check only: `cargo fmt --all --check`)
+- Lab test: `scripts/lab-test.sh novanas|dgx-spark|dgx-spark2` — rsyncs the tree and runs `cargo test --workspace -- --include-ignored` on that host; exits with the test exit code. **Ask the user before every lab run** (the hosts are shared; the GPUs may be held by other workloads). Phase 0 runs `novanas` only; the Spark branches are exercised from Phase 2b.
+- Validate a config: `cargo run -p turbine-server -- --config examples/turbine.yaml --check-config`
+- Run the server: `cargo run -p turbine-server -- --config examples/turbine.yaml --set server.listen=127.0.0.1:8000` (`--set <dotted.key>=<yaml value>` overrides any key; stop with Ctrl-C or SIGTERM). Exit codes: `0` clean shutdown, `1` runtime failure (port bind, explicitly configured GPU library fails to load), `2` invalid configuration (reported before any port is bound).
+- Bench help: `cargo run -p turbine-bench -- --help`
+- Bench run: `cargo run --release -p turbine-bench -- --url http://127.0.0.1:8000 --concurrency 2 --requests 10 --output json` — `http://` only; needs an OpenAI-compatible endpoint that serves a model: a local or `novanas` Turbine from Phase 1 on (the Phase 0 server lists no models, so the bench exits 2 there; add `--model <id>` to skip the `/v1/models` lookup). Ask before any lab benchmark run. Exit codes: `0` at least one request succeeded, `1` every request failed or the target cannot be queried, `2` usage error (bad flags, non-`http://` URL, no model to target).
 
 ## Architecture (planned — spec §4–§11)
 

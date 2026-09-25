@@ -1,0 +1,32 @@
+# Development configuration: the TS §15 example plus the Phase 0 logging/devices sections.
+# model.path is not read in Phase 0 (Phase 1 requires a real model directory).
+server:
+  listen: 127.0.0.1:8000
+  max_request_bytes: 8MiB
+model:
+  path: /models/llama-3.2-3b-instruct
+  dtype: bf16
+kv:
+  block_tokens: 16
+  gpu: { enabled: true }
+  cpu:
+    enabled: true
+    max_bytes: 64GiB
+  nvme:
+    enabled: false
+    path: /var/lib/turbine/kv
+reliability:
+  enabled: true
+  emergency_vram_reserve: 2GiB
+  adaptive_admission: true
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+distributed:
+  enabled: false
+logging:
+  format: text
+  level: info
+devices:
+  nvml_library: null
+  amd_smi_library: null
