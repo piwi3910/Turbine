@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use turbine_kernels::KernelError;
 use turbine_tensor::MemoryError;
 
+pub mod budget;
 pub mod chat_template;
 pub mod config;
 pub mod loader;
@@ -14,6 +15,7 @@ pub mod testing;
 pub mod tokenizer;
 
 pub use crate::safetensors::{SafetensorsIndex, TensorEntry};
+pub use budget::{BudgetTerms, available_bytes, check_budget, host_mem_available};
 pub use chat_template::ChatTemplate;
 pub use config::{
     Architecture, GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config,
