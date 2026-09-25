@@ -17,12 +17,15 @@ serde.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Simulator: seeded ChaCha8 arrivals and deterministic request ids
+rand_chacha.workspace = true
+rand_core.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 serde_json.workspace = true
 turbine-tensor.workspace = true
-uuid.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

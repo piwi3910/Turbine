@@ -823,7 +823,9 @@ impl Scheduler {
             }
             if all_forked {
                 let p = self.seqs.get_mut(&parent).expect("parent tracked");
-                if p.state == RequestState::Prefilling {
+                // Only a parent whose shared prefill is complete waits here; a parent that
+                // re-prefills after a preemption is promoted by `complete` when it finishes.
+                if p.state == RequestState::Prefilling && p.table.tokens >= p.target {
                     p.start_decoding(parent);
                 } else if !p.state.is_live() && !p.table.blocks.is_empty() {
                     // The parent finished at its prefill; its table was held for the forks.

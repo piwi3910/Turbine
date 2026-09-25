@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod queue;
 pub mod request;
 pub mod scheduler;
+pub mod sim;
 
 pub use metrics::SchedulerMetrics;
 pub use queue::WaitingQueue;

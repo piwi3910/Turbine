@@ -1984,6 +1984,8 @@ version = "0.1.0"
 dependencies = [
  "prometheus-client",
  "proptest",
+ "rand_chacha",
+ "rand_core",
  "serde",
  "serde_json",
  "smallvec",
