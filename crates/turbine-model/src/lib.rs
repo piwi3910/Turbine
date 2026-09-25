@@ -9,6 +9,7 @@ use turbine_tensor::MemoryError;
 pub mod budget;
 pub mod chat_template;
 pub mod config;
+pub mod executor;
 pub mod loader;
 pub mod safetensors;
 pub mod testing;

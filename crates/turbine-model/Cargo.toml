@@ -41,3 +41,7 @@ rand_core.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[dev-dependencies]
+# hip_matches_cpu (lab only): the AMD device the HIP context is created on
+turbine-device.workspace = true
