@@ -1,0 +1,4 @@
+[git]
+# Oversized-file threshold for the gate, in MB (user decision 2026-09-25: the
+# 16 MB Llama tokenizer.json test fixture is committed raw).
+max_file_mb = 20

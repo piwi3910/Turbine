@@ -1,0 +1,4 @@
+# Downloaded model fixtures and generated golden files must stay byte-identical
+# to their source (sha256-checked), so the formatter never rewrites them.
+crates/*/tests/fixtures/
+tests/golden/

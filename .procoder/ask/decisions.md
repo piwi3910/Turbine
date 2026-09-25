@@ -253,3 +253,11 @@
 - No: keep strict phase order
 
 **Answer (2026-09-25):** Yes — run GPU-free parts of later phases ahead on their own branches (runahead/*), merged when their phase opens.
+
+## P1: 16 MB Llama tokenizer.json fixture vs the gate's 5 MB file limit
+
+- Commit it gzip-compressed (2.5 MB, `tokenizer.json.gz`), decompress in tests via a `flate2` dev-dependency; sha256 of the decompressed file checked against the pinned revision (recommended)
+- Git LFS for large fixtures
+- Raise the gate limit to 20 MB in .procoder/config.toml
+
+**Answer (2026-09-25):** raise the gate limit — `.procoder/config.toml` `max_file_mb = 20`; raw tokenizer.json committed. `.prettierignore` keeps downloaded fixtures and golden files byte-identical.
