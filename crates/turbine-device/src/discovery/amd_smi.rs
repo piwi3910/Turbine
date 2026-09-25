@@ -303,17 +303,41 @@ impl Session for Api {
 /// library already initialising returns success before the first caller has enumerated the
 /// sockets, and the first `amdsmi_shut_down` tears the shared state down under the others. On
 /// novanas, 8 concurrent discoveries all reported `Ok` with 0 devices (2 × R9700 present).
-/// Every session in this process therefore runs under this lock. A session stuck inside
-/// amd-smi keeps it held; later discoveries then block too and report `timeout` at their
-/// deadline instead of an empty inventory.
-static SESSION: Mutex<()> = Mutex::new(());
+/// Every user in this process therefore shares one session counted here: the first
+/// `session_begin` initialises amd-smi completely under the lock before anyone queries, and
+/// only the last `session_end` shuts it down. Discovery sessions and the Phase 3 live telemetry
+/// (which keeps its session open for the life of the sampler) use it alike — an `amdsmi_init`
+/// / `amdsmi_shut_down` pair of one never tears the library down under the other (novanas lab:
+/// a discovery beside running telemetry saw 0 devices, and the telemetry went `unavailable`).
+/// A call stuck inside amd-smi's init keeps the lock held; later discoveries then block and
+/// report `timeout` at their deadline instead of an empty inventory.
+static SESSIONS: Mutex<u32> = Mutex::new(0);
 
-/// Run one complete init → query → shut_down session, serialised process-wide.
+/// Joins the process-wide amd-smi session, running `init` when none is open. A failed `init`
+/// leaves nothing open (and is never shut down).
+pub(crate) fn session_begin(init: impl FnOnce() -> AmdsmiStatus) -> Result<(), String> {
+    let mut open = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    if *open == 0 {
+        check(init(), "amdsmi_init")?;
+    }
+    *open += 1;
+    Ok(())
+}
+
+/// Leaves the process-wide amd-smi session; the last user runs `shut_down`.
+pub(crate) fn session_end(shut_down: impl FnOnce() -> AmdsmiStatus) {
+    let mut open = SESSIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    *open = open.saturating_sub(1);
+    if *open == 0 {
+        let _ = shut_down();
+    }
+}
+
+/// Run one complete init → query → shut_down session within the process-wide session.
 fn run_session(session: &impl Session) -> Result<Vec<DeviceInfo>, String> {
-    let _guard = SESSION.lock().unwrap_or_else(PoisonError::into_inner);
-    check(session.init(), "amdsmi_init")?;
+    session_begin(|| session.init())?;
     let result = session.devices();
-    let _ = session.shut_down();
+    session_end(|| session.shut_down());
     result
 }
 
@@ -335,6 +359,9 @@ impl DiscoveryBackend for AmdSmiBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session tests share the process-wide session count.
+    static SESSION_TESTS: Mutex<()> = Mutex::new(());
 
     #[test]
     fn struct_layouts_match_amdsmi_h() {
@@ -431,6 +458,7 @@ mod tests {
     /// sockets or a shut-down clears them under another thread (novanas: 0 of 2 R9700s).
     #[test]
     fn concurrent_sessions_each_see_every_device() {
+        let _serial = SESSION_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
         const THREADS: usize = 8;
         let lib = Arc::new(FakeLibrary::default());
         let barrier = Barrier::new(THREADS);
@@ -471,9 +499,40 @@ mod tests {
                 AMDSMI_STATUS_SUCCESS
             }
         }
+        let _serial = SESSION_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
         let failing = Failing(AtomicU32::new(0));
         let err = run_session(&failing).expect_err("init failure is reported");
         assert!(err.contains("amdsmi_init"), "{err}");
         assert_eq!(failing.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *SESSIONS.lock().unwrap(),
+            0,
+            "a failed init leaves no session open"
+        );
+    }
+
+    /// Catches (P3 lab, novanas): discovery running beside the live telemetry, whose amd-smi
+    /// session stays open for the sampler's life — a discovery's shut-down tore the shared
+    /// session down under the telemetry (then `unavailable`), and a discovery that joined an
+    /// open session was mistaken for a fresh one. Every discovery sees every device, the held
+    /// session survives them, and the library is shut down once, when the holder leaves.
+    #[test]
+    fn a_held_session_survives_discoveries() {
+        let _serial = SESSION_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let lib = Arc::new(FakeLibrary::default());
+        let held = FakeSession(Arc::clone(&lib));
+        session_begin(|| held.init()).expect("telemetry session");
+        for _ in 0..3 {
+            let found = run_session(&FakeSession(Arc::clone(&lib))).expect("discovery");
+            assert_eq!(found.len(), FAKE_GPUS as usize);
+        }
+        assert!(
+            lib.enumerated.load(Ordering::SeqCst),
+            "a discovery shut the held session down"
+        );
+        assert_eq!(*lib.refs.lock().unwrap(), 1, "one init for every user");
+        session_end(|| held.shut_down());
+        assert_eq!(*lib.refs.lock().unwrap(), 0);
+        assert_eq!(*SESSIONS.lock().unwrap(), 0);
     }
 }

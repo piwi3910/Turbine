@@ -2,7 +2,7 @@
 //! its own thread with a deadline, results are merged into one inventory with a stable global
 //! index, and each outcome is logged.
 
-mod amd_smi;
+pub(crate) mod amd_smi;
 mod nvml;
 
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use turbine_core::registry::{Module, Registry};
 use turbine_core::types::{DeviceId, Vendor};
 
 use crate::inventory::{BackendReport, BackendStatus, DeviceInfo, DeviceInventory, DiscoveryError};
+use crate::telemetry::VendorTelemetry;
 
 /// Library names searched by the platform loader when no explicit path is configured.
 const NVML_DEFAULT_LIBRARY: &str = "libnvidia-ml.so.1";
@@ -75,6 +76,9 @@ pub trait DiscoveryKind: Module {
     /// The library name the platform loader searches when none is configured.
     fn default_library(&self) -> &'static str;
     fn build(&self, library: PathBuf, opts: &DiscoveryOptions) -> Box<dyn DiscoveryBackend>;
+    /// The live telemetry backend (P3 vendor tick) over the same library, or why it cannot
+    /// load (its devices then stay `unavailable`).
+    fn telemetry(&self, opts: &DiscoveryOptions) -> Result<Box<dyn VendorTelemetry>, String>;
 }
 
 struct NvmlKind;
@@ -98,6 +102,10 @@ impl DiscoveryKind for NvmlKind {
     fn build(&self, library: PathBuf, opts: &DiscoveryOptions) -> Box<dyn DiscoveryBackend> {
         Box::new(nvml::NvmlBackend::new(library, opts.meminfo_path.clone()))
     }
+    fn telemetry(&self, opts: &DiscoveryOptions) -> Result<Box<dyn VendorTelemetry>, String> {
+        let t = crate::telemetry::nvml::NvmlTelemetry::open(self.configured_library(opts))?;
+        Ok(Box::new(t))
+    }
 }
 
 struct AmdSmiKind;
@@ -120,6 +128,10 @@ impl DiscoveryKind for AmdSmiKind {
     }
     fn build(&self, library: PathBuf, _opts: &DiscoveryOptions) -> Box<dyn DiscoveryBackend> {
         Box::new(amd_smi::AmdSmiBackend::new(library))
+    }
+    fn telemetry(&self, opts: &DiscoveryOptions) -> Result<Box<dyn VendorTelemetry>, String> {
+        let t = crate::telemetry::amd_smi::AmdSmiTelemetry::open(self.configured_library(opts))?;
+        Ok(Box::new(t))
     }
 }
 

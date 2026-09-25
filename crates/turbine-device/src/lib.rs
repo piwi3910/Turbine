@@ -4,10 +4,13 @@
 //! runtime-loaded FFI to `libamd_smi.so`. Nothing links a GPU library at build time. Each
 //! vendor's discovery is a [`DiscoveryKind`] in the `device_discovery` registry (Phase 2m,
 //! contract §24).
+//! [`telemetry`] (P3) samples host `/proc` files, the reservation ledger and the vendor
+//! libraries on two cadences.
 
 pub mod discovery;
 mod host;
 mod inventory;
+pub mod telemetry;
 
 pub use discovery::{DiscoveryBackend, DiscoveryKind, DiscoveryOptions, discover, run_backends};
 pub use host::host_mem_available;
