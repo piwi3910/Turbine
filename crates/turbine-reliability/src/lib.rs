@@ -7,6 +7,7 @@ pub mod budget;
 pub mod fault;
 pub mod ledger;
 pub mod metrics;
+pub mod reserve;
 pub mod signals;
 pub mod state;
 
