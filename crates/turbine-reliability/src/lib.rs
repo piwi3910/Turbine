@@ -3,6 +3,9 @@
 //! [`Clock`] so tests drive time deterministically (P3 S-1).
 
 pub mod budget;
+#[cfg(feature = "fault-injection")]
+pub mod fault;
+pub mod ledger;
 pub mod metrics;
 pub mod signals;
 
