@@ -2,6 +2,7 @@
 
 pub mod args;
 pub mod client;
+pub mod golden;
 pub mod prompt;
 pub mod report;
 

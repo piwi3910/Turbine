@@ -6,6 +6,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "turbine-bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "turbine-golden"
+path = "src/bin/turbine-golden.rs"
+
 [dependencies]
 clap.workspace = true
 reqwest.workspace = true
@@ -13,6 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
