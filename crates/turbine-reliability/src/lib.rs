@@ -3,6 +3,7 @@
 //! [`Clock`] so tests drive time deterministically (P3 S-1).
 
 pub mod budget;
+pub mod circuit;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
 pub mod horizon;
