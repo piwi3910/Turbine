@@ -10,8 +10,11 @@ pub mod budget;
 pub mod chat_template;
 pub mod config;
 pub mod executor;
+pub mod generate;
 pub mod loader;
+pub mod metrics;
 pub mod safetensors;
+pub mod sampler;
 pub mod testing;
 pub mod tokenizer;
 
@@ -22,7 +25,10 @@ pub use config::{
     Architecture, GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config,
     load_model_config,
 };
+pub use generate::{GenerateOptions, Generation, generate};
 pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot, llama_slots};
+pub use metrics::{ForwardPhase, ModelMetrics};
+pub use sampler::{SampledToken, Sampler};
 pub use tokenizer::{IncrementalDetokenizer, Tokenizer};
 
 /// Every failure of the model layer (contract §10). Messages name the offending file, field or
