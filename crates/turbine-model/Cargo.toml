@@ -1,0 +1,43 @@
+[package]
+name = "turbine-model"
+description = "Turbine model layer: HF config and allowlist, safetensors loading, tokenizer, chat template, Llama executor, sampling and generation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+turbine-core.workspace = true
+turbine-kernels.workspace = true
+turbine-observability.workspace = true
+turbine-tensor.workspace = true
+# config.json / generation_config.json parsing and chat-template message values; `preserve_order`
+# keeps object insertion order so the template's `tojson` matches Python json.dumps byte for byte
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+tracing.workspace = true
+# turbine_model_load_seconds, turbine_model_weight_bytes, turbine_forward_seconds
+prometheus-client.workspace = true
+# Safetensors header parsing and dtypes (tensor bytes are read with positioned reads, no mmap);
+# also writes the tiny synthetic checkpoint
+safetensors.workspace = true
+# tokenizer.json; pinned =0.21.* (the version toktrie_hf_tokenizers 1.8 builds against, so
+# Phase 2 structured output needs no tokenizer upgrade); default features off (no onig C
+# library), fancy-regex for the Llama-3 pre-tokenizer
+tokenizers.workspace = true
+# The model's Jinja chat template (Llama-3.2 ships it in tokenizer_config.json)
+minijinja.workspace = true
+# pycompat: the Python string/dict methods the template calls (`.strip()`, …)
+minijinja-contrib.workspace = true
+# EOS id lists without heap allocation
+smallvec.workspace = true
+# bf16 host conversion for weights, logits and the tiny checkpoint writer
+half.workspace = true
+# Seeded sampling: identical output for an identical `seed`
+rand_chacha.workspace = true
+# OS entropy seed (`os_rng`) when a request carries no `seed`
+rand_core.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

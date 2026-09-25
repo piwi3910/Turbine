@@ -9,10 +9,16 @@ Phase 1 plan Task 7 (`.procoder/plans/phase-1-single-request.md`, "## Task 7"): 
 
 ## Acceptance criteria
 
-- [ ] `cargo test -p turbine-model config::tests` passes (expect PASS)
-- [ ] Gate clean: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [ ] Committed on branch phase-1-single-request with the plan's commit message
+- [x] `cargo test -p turbine-model config::tests` passes (expect PASS)
+- [x] Gate clean: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] Committed on branch phase-1-single-request with the plan's commit message
 
 ## Evidence
 
-<!-- Filled at close time. -->
+- Red: `cargo test -p turbine-model config::tests::parses_target_config` before the implementation → `error[E0425]: cannot find function load_model_config in this scope` and `error[E0433]: cannot find type RopeScaling in this scope` (compile failure: config API absent).
+- Green: `cargo test -p turbine-model config::tests` → `test result: ok. 3 passed; 0 failed` (`parses_target_config`: 28 layers, hidden 3072, 24/8 heads, head_dim 128, intermediate 8192, vocab 128256, tied, theta 500000, `Llama3 { 32, 1, 4, 8192 }`, EOS `[128001, 128008, 128009]`, `kv_layout(16)` 114_688 / 1_835_008 B, shape weight_bytes 6_425_499_648; `rejects_unsupported`: `unsupported architectures = Qwen3MoeForCausalLM; supported: LlamaForCausalLM`, `quantization_config` → supported `none`, `torch_dtype float16` → `bfloat16`, rope_type `yarn` → `default, llama3`; `head_dim_and_eos_fallbacks`: hidden/heads head_dim, config.json EOS fallback, missing dir → `Io` naming `config.json`).
+- Deferred to Task 9 (coordinator adjustment): the third `rejects_unsupported` case (tiny checkpoint holding an `F8_E4M3` tensor → `ModelArchConfig::check_supported_weights` naming field `tensor dtype`, the tensor and supported `BF16`) needs `SafetensorsIndex` (Task 8) and the tiny checkpoint writer (Task 9); `check_supported_weights` and that case land with Task 9, which takes over the criterion.
+- Fixtures: `config.json` and `generation_config.json` fetched from `unsloth/Llama-3.2-3B-Instruct` at `006f5dcd1393c3add266de40994ba96225e9689d`, then reformatted by the gate's JSON formatter (whitespace and `1e-05` → `1e-5` only; same values). `tokenizer.json` (16 MB, over the gate's 5 MB blocking limit) and `tokenizer_config.json` are not committed here — they are outside this task's `Files:` line and are left to Tasks 11/12.
+- Workspace: `cargo test --workspace` → 72 passed, 0 failed.
+- Gate: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` → exit 0; `launcher.sh check` → 0 blocking.
+- Commit: `feat(turbine-model): HF config parsing and architecture allowlist` on the Task 7 worktree branch (branched from phase-1-single-request; lands there on merge).
