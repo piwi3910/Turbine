@@ -1,0 +1,23 @@
+[package]
+name = "turbine-api"
+description = "Turbine HTTP API: OpenAI-compatible routes and /turbine/v1 diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+turbine-core.workspace = true
+turbine-observability.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tower.workspace = true
+uuid.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
