@@ -241,7 +241,7 @@ Interfaces:
   Depends on: Task 9
 
 - [ ] Write failing test `turbine-model budget::tests::refuses_before_loading`: open the tiny checkpoint's index, truncate `model.safetensors` to its header length (any weight read would now fail with `Io`), compute terms (weights = `index.total_bytes()`, kv = `kv_layout(1).bytes_per_token() × 512`, workspace 1 MiB, reserve 1 MiB) against 1 KiB available → `ModelError::Budget` whose text lists weights, kv_reservation, workspace, emergency_reserve and available numbers. Run: `cargo test -p turbine-model budget::tests::refuses_before_loading` — expect FAIL
-- [ ] Write failing test `turbine-model budget::tests::available_memory_by_kind`: dedicated (10 GiB free, host 5 GiB) → 10 GiB; unified with host 5 GiB → 5 GiB and with host 20 GiB → 10 GiB; unified with host unknown → 10 GiB; `host_mem_available` on a written `/proc/meminfo` fixture with `MemAvailable: 126877932 kB` → 129922002368. Run: `cargo test -p turbine-model budget::tests::available_memory_by_kind` — expect FAIL
+- [ ] Write failing test `turbine-model budget::tests::available_memory_by_kind`: dedicated (10 GiB free, host 5 GiB) → 10 GiB; unified with host 5 GiB → 5 GiB and with host 20 GiB → 10 GiB; unified with host unknown → 10 GiB; `host_mem_available` on a written `/proc/meminfo` fixture with `MemAvailable: 126877932 kB` → 129923002368. Run: `cargo test -p turbine-model budget::tests::available_memory_by_kind` — expect FAIL
 - [ ] Implement the module (pure functions; nothing here touches weight files).
 - [ ] Run: `cargo test -p turbine-model budget::tests` — expect PASS
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
