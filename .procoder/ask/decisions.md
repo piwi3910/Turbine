@@ -261,3 +261,11 @@
 - Raise the gate limit to 20 MB in .procoder/config.toml
 
 **Answer (2026-09-25):** raise the gate limit — `.procoder/config.toml` `max_file_mb = 20`; raw tokenizer.json committed. `.prettierignore` keeps downloaded fixtures and golden files byte-identical.
+
+## Focus: Phase 1 first, or keep running later phases ahead in parallel?
+
+- Phase 1 first: start T14 (sampler) and T17 (server wiring) now against T13's interfaces; let the running run-ahead agents finish but start no new later-phase work until Phase 1 is merged and pushed (recommended)
+- Phase 1 only: also stop the running later-phase agents now
+- Keep going as now: Phase 1 plus run-ahead in parallel
+
+**Answer (2026-09-26):** Phase 1 first — T14 and T17 start now in parallel with T13; running run-ahead agents finish, no new later-phase work until Phase 1 is merged to main and pushed.
