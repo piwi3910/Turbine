@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use turbine_tensor::MemoryError;
 
 pub mod ops;
+pub mod registry;
 
 pub use ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AttentionConfig, AttentionContext,
@@ -15,6 +16,7 @@ pub use ops::{
     KernelProvider, NormConfig, NormContext, NormKernel, OpKind, ProviderId, RopeConfig,
     RopeContext, RopeKernel,
 };
+pub use registry::{KernelMetrics, KernelRegistry, OpConfig, OpRequirement, Selection};
 
 /// The kernel C ABI version this crate speaks; must equal `turbine_abi_version()` of the loaded
 /// shim library and `TURBINE_ABI_VERSION` in the header exactly (contract §9.1).
