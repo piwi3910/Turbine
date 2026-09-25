@@ -16,6 +16,7 @@ Date: 2026-09-25. Inputs: `turbine-spec.md` (cited "TS §N"), `.procoder/specs/p
 | Errors              | Every crate has one top-level error enum deriving `thiserror::Error` (TS §6).                                                                                                                                                                                                                                                                                                                            |
 | Clock               | Every time-dependent component takes `Arc<dyn turbine_core::clock::Clock>` (P3 S-1), never calls `Instant::now()` directly (contract-chosen generalisation).                                                                                                                                                                                                                                             |
 | Bounded label sets  | Every metric label value comes from a closed Rust enum rendered with its `as_str()`; no request id, path or address is ever a label value (P0, P3, P6).                                                                                                                                                                                                                                                  |
+| Change markers      | `(added P<n>-T<m>)`: a public name that plan task T<m> of phase <n> committed and that was folded into this contract afterwards. `(amended to match P<n>-T<m>)`: the contract signature was changed to what that task committed. Committed code is the reference for both; the markers record provenance, they do not relax any rule.                                                                    |
 
 ---
 
@@ -157,20 +158,22 @@ target/soak/<host>-<timestamp>/ (P3, written by overload-soak.sh on the workstat
 
 Model slugs (directory names under `/home/piwi/turbine-models/` and `tests/golden/`): `llama-3.2-3b-instruct`, `olmoe-1b-7b-0125-instruct` (P1, P2; CONFLICT C-15). Draft model for P8b: `llama-3.2-1b-instruct` (contract-chosen slug).
 
+Phase 1 weights source (DEC "Phase 1 model source while Meta's gate approval is pending", 2026-09-25): `unsloth/Llama-3.2-3B-Instruct` at revision `006f5dcd1393c3add266de40994ba96225e9689d`, an ungated re-upload with weights, architecture and tokenizer identical to `meta-llama/Llama-3.2-3B-Instruct`. The slug `llama-3.2-3b-instruct`, the fixture paths and the §21.2 lab config are unchanged; `meta-llama/Llama-3.2-3B-Instruct` may replace the source once Meta's gate approves (added P1, DEC).
+
 ---
 
 ## 3. `turbine-core`
 
 ### 3.1 Module map
 
-| Path                      | Phase                                                | Contents                                                                                                                       |
-| ------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `turbine_core::config`    | P0 (extended every phase)                            | `Config` + section structs (§3.2), `ByteSize`, `HumanDuration`, `Override`, `load`, `ConfigError`                              |
-| `turbine_core::types`     | P0 (extended)                                        | Shared vocabulary (§3.4)                                                                                                       |
-| `turbine_core::clock`     | P2 (contract-chosen; first user is the P2 simulator) | `Clock`, `SystemClock`, `FakeClock`                                                                                            |
-| `turbine_core::request`   | P1 (extended)                                        | `SamplingParams`, `StopConditions`, `GenerationRequest`, `GenerationEvent`, `Usage`, `FinishReason`, `ResourceEstimate` (§3.5) |
-| `turbine_core::telemetry` | P3                                                   | `TelemetrySample`, `HostSample`, `DeviceSample`, `SourceStatus`, `LedgerProbe` (§3.6)                                          |
-| `turbine_core::support`   | P8                                                   | Support matrix (§3.7)                                                                                                          |
+| Path                      | Phase                                                | Contents                                                                                                                                                                                    |
+| ------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `turbine_core::config`    | P0 (extended every phase)                            | `Config` + section structs (§3.2), `ByteSize`, `HumanDuration`, `Override`, `load`, `ConfigError`                                                                                           |
+| `turbine_core::types`     | P0 (extended)                                        | Shared vocabulary (§3.4)                                                                                                                                                                    |
+| `turbine_core::clock`     | P2 (contract-chosen; first user is the P2 simulator) | `Clock`, `SystemClock`, `FakeClock`                                                                                                                                                         |
+| `turbine_core::request`   | P1 (extended)                                        | `Endpoint`, `ErrorCode`, `CancelFlag` (added P0-T1 / P1-T1), `SamplingParams`, `StopConditions`, `GenerationRequest`, `GenerationEvent`, `Usage`, `FinishReason`, `ResourceEstimate` (§3.5) |
+| `turbine_core::telemetry` | P3                                                   | `TelemetrySample`, `HostSample`, `DeviceSample`, `SourceStatus`, `LedgerProbe` (§3.6)                                                                                                       |
+| `turbine_core::support`   | P8                                                   | Support matrix (§3.7)                                                                                                                                                                       |
 
 ### 3.2 Configuration model
 
@@ -201,6 +204,10 @@ Value types:
 
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)] pub struct ByteSize(pub u64);  // P0: int or "<int><B|KB|MB|GB|TB|KiB|MiB|GiB|TiB>", no space, case-sensitive
+impl ByteSize { pub const fn kib(n: u64) -> Self; pub const fn mib(n: u64) -> Self; pub const fn gib(n: u64) -> Self; }   // binary multiples (added P0-T1)
+impl std::str::FromStr for ByteSize { type Err = String; }   // message names the value and lists the nine units (added P0-T1)
+impl std::fmt::Display for ByteSize {}   // largest exact binary unit ("8MiB", "1GiB"), else "<n>B" (added P0-T1)
+// ByteSize serializes as a bare u64 byte count and deserializes an integer or a unit string (added P0-T1)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)] pub struct HumanDuration(pub std::time::Duration); // P2: "<int><ms|s|m|h>", no space (CONFLICT C-14: one parser, all four units, every phase)
 #[derive(Clone, Copy, Debug)] pub enum SizeOrAuto { Auto, Size(u32) }                     // P5 "integer or auto"
 ```
@@ -387,9 +394,12 @@ Validation order (P0, P1, P3, P5): static `validate()` (exit 2) → device disco
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct DeviceId(pub u32);                 // TS §6 name; the Phase 0 global inventory index (P0 §Data)
+// DeviceId is #[serde(transparent)]: a bare integer in JSON and YAML (added P0-T1)
 pub enum Vendor { Nvidia, Amd }               // serde "nvidia" | "amd" (P0); P8: Intel never added until hardware exists
+impl Vendor { pub fn as_str(self) -> &'static str; }                // "nvidia" | "amd"; metric label `vendor` (added P0-T1)
 pub enum MemoryKind { Dedicated, Unified }    // serde "dedicated" | "unified" (P0)
 pub enum ExecutionBackend { Hip, Cuda, Cpu }  // P1/P2b (config execution.backend)
+impl ExecutionBackend { pub fn as_str(self) -> &'static str; }      // "hip" | "cuda" | "cpu" (added P1-T1)
 pub enum CollectiveBackendKind { Nccl, Rccl, Host }   // P5 name; defined here, re-exported as turbine_distributed::collective::CollectiveBackendKind
 pub enum DType { BF16, F16, F32, I32, I64 }   // P1 S-5; re-exported as turbine_tensor::DType; P8a adds F8E4M3 etc.
 impl DType { pub fn size_bytes(self) -> usize; pub fn abi_code(self) -> i32; pub fn as_str(self) -> &'static str; }
@@ -397,6 +407,7 @@ pub enum KvDtype { Bf16, Fp16, Fp8E4m3PerTensorScale, Fp8E4m3PerBlockScale }  //
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct RequestId(pub uuid::Uuid);         // P2 S-2 (contract-chosen repr). Display with endpoint prefix: "cmpl-<uuid>" | "chatcmpl-<uuid>" (P2 S-2)
+impl RequestId { pub fn new_v4() -> Self; }                          // created by turbine-api per request (added P1-T1)
 pub struct SeqId(pub u64);                    // one sequence (= one choice of a request); engine-local counter (contract-chosen)
 pub struct BlockId(pub u32);                  // logical L0 block id; P5: allocated by the leader, same id on every rank (P5 §Data)
 pub struct ReplicaId(pub u32);                // P5 DP replica index
@@ -432,7 +443,14 @@ pub struct ModelShape {                        // model description consumed by 
 
 ```rust
 pub enum Endpoint { Completions, ChatCompletions }                         // metric label "/v1/completions" | "/v1/chat/completions" (P1)
+impl Endpoint { pub fn as_str(self) -> &'static str; }               // the route template = metric label (added P0-T1)
+#[non_exhaustive] pub enum ErrorCode {                               // serde snake_case; later phases add the rest of §14.3
+    ModelNotLoaded, NotImplemented, NotFound, RequestTooLarge, MethodNotAllowed /* (added P0-T1) */, InternalError,   // P0
+    ModelNotFound, UnsupportedParameter, ContextLengthExceeded, EngineBusy, TemplateError, InvalidRequest /* (added P1-T1) */,  // P1
+}
+impl ErrorCode { pub fn as_str(self) -> &'static str; }             // the wire `code` string (added P0-T1)
 pub struct SamplingParams {                                                 // P1 S-9, P2 S-10 (contract-chosen struct)
+    // impl Default: temperature 1.0, top_p 1.0, top_k -1 (disabled), seed None, logprobs None (added P1-T1)
     pub temperature: f32, pub top_p: f32, pub top_k: i32, pub seed: Option<u64>,
     pub presence_penalty: f32, pub frequency_penalty: f32, pub repetition_penalty: f32,   // P2
     pub logit_bias: Vec<(u32, f32)>, pub min_tokens: u32,                                 // P2
@@ -443,6 +461,7 @@ pub struct StopConditions {
     pub max_tokens: u32, pub ignore_eos: bool,
 }
 pub enum FinishReason { Stop, Length, ToolCalls /*P2*/, Error /*P7*/ }   // serde "stop" | "length" | "tool_calls" | "error"
+impl FinishReason { pub fn as_str(self) -> &'static str; }           // (added P1-T1)
 pub struct Usage { pub prompt_tokens: u32, pub completion_tokens: u32, pub cached_tokens: u32 /*P4*/ }
 
 pub struct GenerationRequest {                                             // built by turbine-server after tokenization (contract-chosen)
@@ -460,6 +479,7 @@ pub struct SessionHints { pub session_id: String, pub resume_within_secs: Option
 pub enum GenerationEvent {                                                 // per-request stream from engine → API; also P6 `StreamEvent.payload`
     Started { choice: u32 },                                               // first chunk carries delta.role (P1)
     Token { choice: u32, text: String, token_id: u32, logprob: Option<f32>, top_logprobs: Vec<(u32, f32)> },
+        // `text` is empty while bytes are held back (partial UTF-8 or a possible stop-string prefix); the API skips empty chunks (added P1-T1)
     ToolCalls { choice: u32, calls: Vec<ToolCallOut> },                    // P2 S-18
     Finished { choice: u32, reason: FinishReason, usage: Option<Usage> },
     Error { code: ErrorCode, message: String },                            // ErrorCode: §14.3
@@ -524,18 +544,22 @@ Note: the Rust type names of the config enums/structs in §3.2 (`ModelDtype`, `T
 pub fn init_tracing(cfg: &LoggingConfig) -> Result<(), ObservabilityError>;     // text | json; RUST_LOG overrides level (P0)
 #[derive(Clone)] pub struct MetricsRegistry(Arc<Mutex<prometheus_client::registry::Registry>>);   // (contract-chosen)
 impl MetricsRegistry {
-    pub fn new() -> Self;
+    pub fn new() -> Self;   // already holds turbine_build_info{version=<crate version>} 1; also impl Default (added P0-T2)
     pub fn register<M: prometheus_client::registry::Metric + Clone>(&self, name: &str, help: &str, metric: M) -> M;
     pub fn render(&self) -> Result<String, ObservabilityError>;          // OpenMetrics text; failure → /metrics 500 (P0)
 }
 pub const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";   // P0
 pub mod http {
+    pub const REQUEST_ID_HEADER: HeaderName;   // "x-request-id", both directions (added P0-T2)
+    pub fn valid_request_id(value: &str) -> bool;   // 1..=128 bytes, each 0x21..=0x7E; else a UUIDv4 replaces it (added P0-T2)
     pub fn request_id_layer() -> RequestIdLayer;       // echo x-request-id (≤128 visible ASCII) else UUIDv4; record on span (P0 S-3)
     pub fn http_metrics_layer(m: HttpMetrics) -> HttpMetricsLayer;   // route template or "unmatched"
     pub struct HttpMetrics { /* turbine_http_requests_total, turbine_http_request_duration_seconds */ }
+    impl HttpMetrics { pub fn register(reg: &MetricsRegistry) -> Self; }   // both HTTP families; turbine_api::router calls it (added P0-T2)
+    pub struct RequestIdLayer; pub struct RequestIdService<S>; pub struct HttpMetricsLayer; pub struct HttpMetricsService<S>;   // tower Layer/Service types (added P0-T2)
     pub struct RequestIdExt(pub String);               // request extension carrying the id (contract-chosen)
 }
-#[derive(Debug, thiserror::Error)] pub enum ObservabilityError { #[error("invalid log filter: {0}")] Filter(String), #[error("metrics render failed: {0}")] Render(String) }
+#[derive(Debug, thiserror::Error)] #[non_exhaustive] pub enum ObservabilityError { #[error("invalid log filter: {0}")] Filter(String), #[error("metrics render failed: {0}")] Render(String), #[error("cannot install the tracing subscriber: {0}")] Init(String) /* (added P0-T2): a global subscriber is already installed */ }
 ```
 
 Each domain crate owns a `<Crate>Metrics` struct (e.g. `turbine_kv::metrics::KvMetrics`) with `fn register(reg: &MetricsRegistry) -> Self` (contract-chosen pattern); names/labels are fixed in §17.
@@ -547,13 +571,18 @@ Each domain crate owns a `<Crate>Metrics` struct (e.g. `turbine_kv::metrics::KvM
 ### 5.1 Inventory (P0)
 
 ```rust
+pub const AMD_SMI_LIBRARY_ENV: &str = "TURBINE_AMD_SMI_LIBRARY";   // module turbine_device::discovery, re-exported at the root (added P0-T3)
 pub struct DiscoveryOptions {                      // (contract-chosen) built from DevicesConfig + env TURBINE_AMD_SMI_LIBRARY
     pub nvml_library: Option<PathBuf>, pub amd_smi_library: Option<PathBuf>,
     pub deadline: Duration /* 10 s per backend (P0) */, pub meminfo_path: PathBuf /* "/proc/meminfo" */,
 }
 pub fn discover(opts: &DiscoveryOptions) -> Result<DeviceInventory, DiscoveryError>;   // Err only for explicitly configured library failures (exit 1)
+impl Default for DiscoveryOptions {}   // no explicit libraries, 10 s deadline, "/proc/meminfo" (added P0-T3)
+impl DiscoveryOptions { pub fn from_config(cfg: &DevicesConfig) -> Self; }   // AMD_SMI_LIBRARY_ENV (non-empty) applies when devices.amd_smi_library is null (added P0-T3)
+pub fn run_backends(backends: Vec<Box<dyn DiscoveryBackend>>, deadline: Duration) -> DeviceInventory;   // one thread per backend; late backend → `timeout`, thread detached; indices reassigned in backend order (added P0-T3)
 
 #[derive(Serialize, Clone)] pub struct DeviceInventory { pub devices: Vec<DeviceInfo>, pub backends: Vec<BackendReport> }  // JSON = GET /turbine/v1/devices (P0 §Data)
+impl DeviceInventory { pub fn count(&self, vendor: Vendor) -> usize; }   // (added P0-T3)
 #[derive(Serialize, Clone)] pub struct DeviceInfo {
     pub index: DeviceId, pub vendor: Vendor, pub vendor_index: u32, pub name: String,
     pub uuid: Option<String>, pub pci_bus_id: Option<String>, pub arch: Option<String> /* "sm_121" | "gfx1201" */,
@@ -562,7 +591,10 @@ pub fn discover(opts: &DiscoveryOptions) -> Result<DeviceInventory, DiscoveryErr
 }
 #[derive(Serialize, Clone)] pub struct DeviceMemoryInfo { pub kind: MemoryKind, pub total_bytes: u64, pub shared_with_host: bool }
 #[derive(Serialize, Clone)] pub struct BackendReport { pub vendor: Vendor, pub status: BackendStatus, pub detail: String }
-pub enum BackendStatus { Ok, Unavailable, Timeout }       // serde lowercase
+#[non_exhaustive] pub enum BackendStatus { Ok, Unavailable, Timeout }   // serde lowercase (amended to match P0-T3: #[non_exhaustive])
+impl BackendStatus { pub fn as_str(self) -> &'static str; }   // (added P0-T3)
+pub struct DeviceMetrics { /* turbine_devices{vendor} */ }   // (added P0-T3)
+impl DeviceMetrics { pub fn register(reg: &MetricsRegistry) -> Self; pub fn record(&self, inventory: &DeviceInventory); }   // record sets every vendor, 0 when none (added P0-T3)
 #[derive(Debug, thiserror::Error)] pub enum DiscoveryError {
     #[error("cannot load {path}: {detail}")] ExplicitLibrary { path: PathBuf, detail: String },
 }
@@ -621,6 +653,7 @@ pub fn probe_capabilities(inv: &DeviceInventory, probes: &RuntimeProbes) -> Vec<
 ```rust
 pub use turbine_core::types::{DType, DeviceId};
 
+// Modules `buffer`, `dtype`, `host`, `tensor` are pub; the root re-exports DeviceBuffer, DeviceMemory, DevicePtr, DeviceSlice, MemInfo, MemoryError, StreamRef, DType, Tensor, TensorView, DeviceId (added P1-T2)
 pub struct Tensor {                                  // TS §6, verbatim
     pub storage: DeviceBuffer,
     pub shape: SmallVec<[usize; 4]>,
@@ -629,24 +662,40 @@ pub struct Tensor {                                  // TS §6, verbatim
     pub device: DeviceId,
 }
 pub struct TensorView<'a> { pub slice: DeviceSlice<'a>, pub shape: SmallVec<[usize; 4]>, pub strides: SmallVec<[usize; 4]>, pub dtype: DType }  // (contract-chosen)
+impl Tensor { pub fn empty(mem: &Arc<dyn DeviceMemory>, shape: &[usize], dtype: DType) -> Result<Tensor, MemoryError>; pub fn numel(&self) -> usize; pub fn view(&self) -> TensorView<'_>; }   // contiguous row-major, contents unspecified (added P1-T2)
+impl<'a> TensorView<'a> {   // (added P1-T2)
+    pub fn contiguous(slice: DeviceSlice<'a>, offset_elems: usize, shape: &[usize], dtype: DType) -> TensorView<'a>;   // panics when it does not fit
+    pub fn rows(&self, start: usize, count: usize) -> TensorView<'a>;   // dim-0 rows, strides kept; slice spans (count−1)·row_stride + row_width bytes
+    pub fn numel(&self) -> usize;
+}
+pub fn contiguous_strides(shape: &[usize]) -> SmallVec<[usize; 4]>;   // row-major, in elements (added P1-T2)
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct DevicePtr(u64);                           // opaque device address; never dereferenced outside unsafe-allowed crates (contract-chosen)
-impl DevicePtr { pub fn addr(self) -> u64; pub fn offset(self, bytes: u64) -> DevicePtr; }
+impl DevicePtr { pub const NULL: DevicePtr /* (added P1-T2): never returned by alloc */; pub fn from_addr(addr: u64) -> DevicePtr /* (added P1-T2) */; pub fn addr(self) -> u64; pub fn offset(self, bytes: u64) -> DevicePtr /* panics on overflow */; }
 
 pub struct DeviceBuffer { /* ptr: DevicePtr, len: usize, device: DeviceId, mem: Arc<dyn DeviceMemory> */ }   // P1 S-5: owns one allocation, freed on Drop; not Clone
 impl DeviceBuffer {
     pub fn alloc(mem: &Arc<dyn DeviceMemory>, bytes: usize) -> Result<DeviceBuffer, MemoryError>;
-    pub fn len(&self) -> usize; pub fn device(&self) -> DeviceId; pub fn ptr(&self) -> DevicePtr;
+    pub fn len(&self) -> usize; pub fn device(&self) -> DeviceId; pub fn ptr(&self) -> DevicePtr; pub fn is_empty(&self) -> bool;
+    pub fn memory(&self) -> &Arc<dyn DeviceMemory>;   // (added P1-T2)
+    pub fn whole(&self) -> DeviceSlice<'_>;   // = slice(0, len) (added P1-T2)
     pub fn slice(&self, offset: usize, len: usize) -> DeviceSlice<'_>;
     pub fn copy_from_host(&mut self, offset: usize, src: &[u8]) -> Result<(), MemoryError>;      // enqueued on the context stream; caller syncs
     pub fn copy_to_host(&self, offset: usize, dst: &mut [u8]) -> Result<(), MemoryError>;
 }
-pub struct DeviceSlice<'a> { /* buf: &'a DeviceBuffer, offset: usize, len: usize */ }            // P5 names it "phase-1 buffer handle"
-impl DeviceSlice<'_> { pub fn ptr(&self) -> DevicePtr; pub fn len(&self) -> usize; pub fn device(&self) -> DeviceId; }
+#[derive(Clone, Copy)] pub struct DeviceSlice<'a> { /* buf: &'a DeviceBuffer, offset: usize, len: usize */ }   // P5 names it "phase-1 buffer handle" (amended to match P1-T2: Clone + Copy)
+impl<'a> DeviceSlice<'a> {
+    pub fn ptr(&self) -> DevicePtr; pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool; pub fn device(&self) -> DeviceId;
+    pub fn memory(&self) -> &'a Arc<dyn DeviceMemory>;   // (added P1-T2)
+    pub fn sub(&self, offset: usize, len: usize) -> DeviceSlice<'a>;   // panics outside the slice (added P1-T2)
+    pub fn read_bytes(&self) -> Result<Vec<u8>, MemoryError>;   // blocking: synchronize, d2h, synchronize (added P1-T2)
+    pub fn write_bytes(&self, src: &[u8]) -> Result<(), MemoryError>;   // blocking, at the slice start; src longer than the slice → InvalidArgument (added P1-T2)
+}
 #[derive(Clone)] pub struct StreamRef { /* native: u64, device: DeviceId, owner: Arc<dyn DeviceMemory> */ }   // P5 "phase-1 stream handle"
-impl StreamRef { pub fn native_handle(&self) -> u64; pub fn device(&self) -> DeviceId; }       // native handle valid from ABI v4 (P5); 0 before
+impl StreamRef { pub fn new(native: u64, device: DeviceId, owner: Arc<dyn DeviceMemory>) -> StreamRef /* (added P1-T2) */; pub fn native_handle(&self) -> u64; pub fn device(&self) -> DeviceId; }   // native handle valid from ABI v4 (P5); 0 before
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)] pub struct MemInfo { pub free_bytes: u64, pub total_bytes: u64 }   // turbine_tensor::MemInfo (added P1-T2)
 /// Implemented by turbine-kernels::ShimContext (GPU) and turbine_tensor::host::HostMemory (CPU reference, collectives `host` backend).
 pub trait DeviceMemory: Send + Sync {                                                        // (contract-chosen) safe trait
     fn device(&self) -> DeviceId;
@@ -677,7 +726,14 @@ pub type CopySource = CopyTarget;
     #[error("invalid argument: {0}")] InvalidArgument(String),
     #[error("unsupported: {0}")] Unsupported(String),
 }
-pub mod host { pub struct HostMemory { /* id → Box<[u8]> */ }  impl HostMemory { pub fn with_slice<R>(&self, p: DevicePtr, len: usize, f: impl FnOnce(&[u8]) -> R) -> R; pub fn with_slice_mut<R>(…) -> R; } }
+pub mod host { pub struct HostMemory { /* bounded map addr → Box<[u8]> */ }   // (amended to match P1-T2)
+    impl HostMemory {
+        pub fn new(device: DeviceId, capacity: u64) -> Arc<HostMemory>;   // capacity bounds allocated bytes; mem_info free = capacity − used (added P1-T2)
+        pub fn with_slice<R>(&self, p: DevicePtr, len: usize, f: impl FnOnce(&[u8]) -> R) -> R;   // panics when the range is not allocated
+        pub fn with_slice_mut<R>(&self, p: DevicePtr, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R;
+    }
+    impl DeviceMemory for HostMemory {}
+}
 ```
 
 Ownership rules (P1 Constraints, TS §21 rule 10): every device pointer is allocated by the shim and owned by exactly one `DeviceBuffer`; the shim never retains a caller pointer beyond the call; streams/workspaces are owned by the shim context; a `DeviceBuffer` holds an `Arc` of its `DeviceMemory` (the context) so it cannot outlive it.
@@ -717,10 +773,12 @@ pub enum KernelError {                          // P2b names `KernelError::Devic
 impl KernelError {
     pub fn is_sticky(&self) -> bool;            // P3: Device whose message starts with a context-corrupting name
                                                 // (hipErrorIllegalAddress, hipErrorLaunchFailure, cudaErrorIllegalAddress, cudaErrorLaunchFailure,
-                                                //  cudaErrorIllegalInstruction, cudaErrorMisalignedAddress, …; list kept in turbine-kernels, contract-chosen)
+                                                //  cudaErrorIllegalInstruction, cudaErrorMisalignedAddress, …; list kept in turbine-kernels; P1 list: hipErrorIllegalAddress, hipErrorLaunchFailure, hipErrorAssert (amended to match P1-T3), contract-chosen)
     pub fn is_oom(&self) -> bool;
 }
 impl From<KernelError> for turbine_tensor::MemoryError;
+// OutOfMemory → OutOfMemory { requested: 0 }; InvalidArgument / Unsupported keep their message; the rest → Device { sticky: is_sticky() }
+impl From<turbine_tensor::MemoryError> for KernelError;   // OutOfMemory → OutOfMemory("<n> bytes requested"), Device → Device (added P1-T3)
 ```
 
 Kernel traits (TS §6 shape `supports(cfg) -> bool` + `execute(ctx) -> Result<()>`; one trait per op family, P1 S-6; contract-chosen names except `AttentionKernel`):
@@ -735,9 +793,24 @@ pub trait EmbeddingKernel: Send + Sync   { /* embedding */ }
 pub trait ElementwiseKernel: Send + Sync { /* add; P5 fill; P7 gather_rows, scatter_add_rows */ }
 pub trait KvCopyKernel: Send + Sync      { /* P2 copy_blocks */ }
 pub trait MoeKernel: Send + Sync         { /* P2 moe_route, moe_experts */ }
+// P1 families share the GemmKernel shape supports(&Cfg) / implementation(&Cfg) -> String / execute(&mut Ctx<'_>) (added P1-T3):
+// NormKernel ↔ NormConfig/NormContext, RopeKernel ↔ RopeConfig/RopeContext, ActivationKernel ↔ ActivationConfig/ActivationContext,
+// EmbeddingKernel ↔ EmbeddingConfig/EmbeddingContext, ElementwiseKernel ↔ ElementwiseConfig/ElementwiseContext. Module turbine_kernels::ops, re-exported at the root.
 pub enum AttentionKind { Prefill, Decode, PrefillPaged /*P2*/, DecodePaged /*P2*/ }
 pub struct AttentionConfig { pub kind: AttentionKind, pub num_q_heads: u32, pub num_kv_heads: u32, pub head_dim: u32,
                              pub dtype: DType, pub block_tokens: Option<u32>, pub causal: bool }
+impl AttentionConfig { pub fn op(&self) -> OpKind; }   // Prefill → AttentionPrefill, Decode → AttentionDecode (added P1-T3)
+// Display: "head_dim=128 kv_heads=8 dtype=bf16 q_heads=24 causal=1" + " block_tokens=16" when set (amended to match P1-T3)
+// Config structs, all Copy + Eq + Hash + Display (added P1-T3):
+pub struct GemmConfig { pub n: u64, pub k: u64, pub trans_b: bool, pub a_dtype: DType, pub b_dtype: DType, pub c_dtype: DType }   // "n=3072 k=8192 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32"
+pub struct NormConfig { pub dim: u64, pub dtype: DType }   // "dim=3072 dtype=bf16"
+pub struct RopeConfig { pub num_q_heads: u32, pub num_kv_heads: u32, pub head_dim: u32, pub rotary_dim: u32, pub dtype: DType }   // "head_dim=128 rotary_dim=128 q_heads=24 kv_heads=8 dtype=bf16"
+pub struct ActivationConfig { pub cols: u64, pub dtype: DType }   // "cols=8192 dtype=bf16"
+pub struct EmbeddingConfig { pub hidden: u64, pub vocab_rows: u64, pub dtype: DType }   // "hidden=3072 vocab_rows=128256 dtype=bf16"
+pub struct ElementwiseConfig { pub dtype: DType }   // "dtype=f32"
+// Context structs, every tensor field a TensorView<'a> (added P1-T3): GemmContext { a, b, c, trans_b, alpha, beta },
+// AttentionContext { cfg, q, k_cache, v_cache, out, q_start: u32, scale: f32 }, NormContext { x, weight, out, eps }, RopeContext { cfg, q, k, positions, inv_freq },
+// ActivationContext { gate, up, out }, EmbeddingContext { ids, table, out, vocab_offset: i64 }, ElementwiseContext { a, b, out }
 // Config structs carry shapes/dtypes only (no pointers); Context structs carry the TensorViews + stream. Display of a config
 // renders the P1 failure-message form, e.g. "head_dim=128 kv_heads=8 dtype=bf16".
 
@@ -746,22 +819,32 @@ pub trait KernelProvider: Send + Sync {
     fn gemm(&self) -> Option<&dyn GemmKernel>;  fn attention(&self) -> Option<&dyn AttentionKernel>;
     fn norm(&self) -> Option<&dyn NormKernel>;  fn rope(&self) -> Option<&dyn RopeKernel>;
     fn activation(&self) -> Option<&dyn ActivationKernel>; fn embedding(&self) -> Option<&dyn EmbeddingKernel>;
-    fn elementwise(&self) -> Option<&dyn ElementwiseKernel>; fn kv_copy(&self) -> Option<&dyn KvCopyKernel>; fn moe(&self) -> Option<&dyn MoeKernel>;
+    fn elementwise(&self) -> Option<&dyn ElementwiseKernel>; fn kv_copy(&self) -> Option<&dyn KvCopyKernel> /* P2 */; fn moe(&self) -> Option<&dyn MoeKernel> /* P2 */;   // (amended to match P1-T3: the P1 trait has the seven P1 accessors)
 }
-pub struct ProviderId(pub &'static str);
+pub struct ProviderId(pub &'static str);   // Copy + Eq + Hash + Display (added P1-T3)
 pub enum OpKind { Gemm, AttentionPrefill, AttentionDecode, Rmsnorm, Rope, SiluMul, Embedding, Add,        // P1
                   AttentionPrefillPaged, AttentionDecodePaged, CopyBlocks, MoeRoute, MoeExperts,          // P2
                   RowSumsq, RmsnormSharded, Fill,                                                        // P5
                   GatherRows, ScatterAddRows }                                                          // P7
 impl OpKind { pub fn as_str(&self) -> &'static str; }   // = C ABI suffix: "gemm", "attention_prefill", … (metric label `op`)
+impl OpKind { pub const ALL: &'static [OpKind]; }   // every variant of the current phase in declaration order; impl Display = as_str (added P1-T3)
 
-pub struct OpRequirement { pub op: OpKind, pub config: String /* rendered */, /* typed config enum */ }
+pub struct OpRequirement { pub op: OpKind, pub config: String /* rendered */, pub spec: OpConfig }   // (amended to match P1-T4: typed field `spec`); impl From<OpConfig> for OpRequirement
+pub enum OpConfig { Gemm(GemmConfig), Attention(AttentionConfig), Rmsnorm(NormConfig), Rope(RopeConfig), SiluMul(ActivationConfig), Embedding(EmbeddingConfig), Add(ElementwiseConfig) }   // (added P1-T4)
+impl OpConfig { pub fn op(&self) -> OpKind; pub fn render(&self) -> String; }   // (added P1-T4)
+pub struct Selection { pub op: OpKind, pub config: String, pub provider: ProviderId, pub implementation: String, pub reason: String }   // one logged choice (added P1-T4)
+pub struct KernelMetrics { pub provider_selected: Family<SelectedLabels, Gauge> }   // impl KernelMetrics { pub fn register(reg: &MetricsRegistry) -> KernelMetrics; } (added P1-T4)
+#[derive(EncodeLabelSet)] pub struct SelectedLabels { pub op: String, pub provider: String, pub r#impl: String }   // turbine_kernels::registry::SelectedLabels (added P1-T4)
 pub struct KernelRegistry { /* (op, config) → (provider, impl) */ }
 impl KernelRegistry {
     /// Picks, per requirement, the first provider in `order` whose supports() is true; logs op, config, provider, impl, reason;
     /// sets turbine_kernel_provider_selected{op,provider,impl}=1; Err(NoProvider) at startup, never deferred (P1 S-6).
+    /// Duplicate requirements are selected once; an id in `order` with no registered provider is skipped. `reason` is
+    /// "first provider in order supports config" or "first provider in order supporting config; unsupported by: <id>, <id>";
+    /// the log record has event = "kernel_selected" (added P1-T4).
     pub fn build(providers: Vec<Arc<dyn KernelProvider>>, order: &[ProviderId], reqs: &[OpRequirement], metrics: &KernelMetrics) -> Result<KernelRegistry, KernelError>;
-    pub fn gemm(&self, cfg: &GemmConfig) -> &dyn GemmKernel;  /* … one accessor per family */
+    pub fn selections(&self) -> &[Selection];   // startup choices in requirement order (added P1-T4)
+    pub fn gemm(&self, cfg: &GemmConfig) -> &dyn GemmKernel;   // + attention, norm, rope, activation, embedding, elementwise; panics for a config that was not a startup requirement (amended to match P1-T4)
 }
 pub fn cpu_reference_provider() -> Arc<dyn KernelProvider>;                    // "cpu-reference", f32 accumulation, always available
 pub fn shim_provider(ctx: Arc<ShimContext>) -> Arc<dyn KernelProvider>;         // id = backend name
@@ -1461,10 +1544,12 @@ pub fn router(state: ApiState) -> axum::Router;                    // all routes
 }
 pub trait InferenceBackend: Send + Sync {                          // (contract-chosen) implemented by turbine-server; P0 impl returns 503 model_not_loaded
     fn models(&self) -> Vec<ModelCard>;
-    fn submit(&self, req: InferenceRequest) -> BoxFuture<'_, Result<GenerationStream, ApiError>>;
+    fn submit(&self, req: InferenceRequest) -> BoxFuture<'_, Result<GenerationStream, ApiError>>;   // default body: Err(model_not_loaded) (amended to match P1-T15); Err before any event = plain HTTP error, even for stream: true
+    fn token_text(&self, token_id: u32) -> String;   // logprob token strings; default "token_id:<id>" (added P1-T15)
+    fn record_rejection(&self, endpoint: Endpoint, code: ErrorCode);   // an API rejection before submit → turbine_requests_total{outcome="rejected"}; default no-op (added P1-T15)
     fn prefetch(&self, req: PrefetchRequest) -> BoxFuture<'_, Result<PrefetchAccepted, ApiError>>;   // P4
 }
-pub struct InferenceRequest { pub endpoint: Endpoint, pub body: OpenAiRequest, pub http_request_id: String, pub hints: TurbineHeaders }
+pub struct InferenceRequest { pub id: RequestId /* (added P1-T15): created by the API */, pub endpoint: Endpoint, pub body: OpenAiRequest, pub http_request_id: String, pub hints: TurbineHeaders /* P4 */ }   // (amended to match P1-T15)
 pub struct TurbineHeaders { pub session_resume_within: Option<u32>, pub session_end: bool, pub cache_salt: Option<String>, pub target_replica: Option<String> /* fault-injection */ }
 pub type GenerationStream = tokio::sync::mpsc::Receiver<GenerationEvent>;   // bounded: 64 events (P1) → 256 (P2)
 pub trait Diagnostics: Send + Sync {                               // each returns the JSON document or ApiError::not_implemented() (501)
@@ -1476,6 +1561,10 @@ pub trait Diagnostics: Send + Sync {                               // each retur
 }
 pub trait Readiness: Send + Sync { fn ready(&self) -> ReadyState; }
 pub enum ReadyState { Ready, NotReady { reason: NotReadyReason } }
+#[non_exhaustive] pub enum NotReadyReason { NoModelLoaded /* (added P0-T4) */, LoadingModel, ModelLoadFailed, DeviceError /* (added P1-T15) */ }   // serde snake_case; impl NotReadyReason { pub fn as_str(self) -> &'static str; } (added P0-T4)
+#[derive(Serialize)] pub struct ModelCard { pub id: String, pub object: String, pub created: u64, pub owned_by: String, pub max_model_len: u32 }   // (added P0-T4)
+#[derive(Clone, Copy)] pub struct ApiLimits { pub max_request_bytes: usize }   // (added P0-T4)
+// Public modules: backend, error, openai (openai::request is pub; response and stream are crate-private). Root re-exports ApiLimits, ApiState, BoxFuture, Diagnostics, GenerationStream, InferenceBackend, InferenceRequest, ModelCard, NotReadyReason, Readiness, ReadyState, ApiError, ErrorType, ErrorCode, router (added P0-T4 / P1-T15)
 ```
 
 Documents are typed `Serialize` structs in their owning crates (`DeviceInventory`, `SchedulerSnapshot`, `KvDocument`, `PressureDocument`, `TopologyGraph`, `ClusterDocument`, `StatusDocument` in turbine-server); `turbine-api` sees `serde_json::Value` so it stays independent of them (contract-chosen).
@@ -1515,14 +1604,55 @@ Documents are typed `Serialize` structs in their owning crates (`DeviceInventory
 
 Streaming (P1): `text/event-stream`, chunks `data: {"id":"cmpl-…","object":"text_completion"|"chat.completion.chunk",…}`, first chat chunk carries `delta.role`, final usage chunk when `stream_options.include_usage`, then `data: [DONE]`. Error mid-stream: one `data: {"error":{"message","type","code"}}` event **followed by `data: [DONE]`** in every phase (CONFLICT C-3).
 
+SSE event order (amended to match P1-T16): the chat role chunk from `Started` (`delta: {"role":"assistant","content":""}`; completions have none), one chunk per non-empty token text, a finish chunk carrying `finish_reason`, the `{"choices":[],"usage":…}` chunk when `stream_options.include_usage`, then `data: [DONE]`. An engine `Error { code, message }` event, or an engine that drops the stream without `Finished` (`internal_error`, "generation ended without a finish event"), produces one `data: ApiError::from_code(code, message).to_json()` event followed by `data: [DONE]`. Non-streaming requests turn the same cases into the HTTP error of `ApiError::from_code`. A `submit` error is a plain HTTP error even with `stream: true`. The receiver lives in the response body: a client disconnect drops it, and the engine's next failed send is the cancellation signal. Logprob token strings come from `InferenceBackend::token_text`, or are `token_id:<id>` under `return_tokens_as_token_ids`.
+
 Request headers: `x-request-id` (P0), `x-turbine-session-resume-within`, `x-turbine-session-end`, `x-turbine-cache-salt` (P4), `x-turbine-target-replica` (P6, fault-injection only, contract-chosen). Response headers: `x-request-id` (P0), `retry-after` (P1+), `x-turbine-served-by: <node_id>/<replica>` (P6).
 
-OpenAI request fields accepted: P1 set (`model, prompt, messages, max_tokens, max_completion_tokens, temperature, top_p, top_k, seed, stop, stream, stream_options.include_usage, logprobs, top_logprobs, echo(false), n(1), ignore_eos, return_tokens_as_token_ids, chat_template_kwargs`); P2 adds `n>1, presence_penalty, frequency_penalty, repetition_penalty, logit_bias, min_tokens, stop_token_ids, priority, echo:true, user, response_format, tools, tool_choice, parallel_tool_calls`, assistant `tool_calls`, `tool` role; P4 adds `prompt_cache_key`. Unknown fields ignored; known-but-unsupported non-default fields → 400 `unsupported_parameter` naming the field.
+OpenAI request fields accepted: P1 set (`model, prompt, messages, max_tokens, max_completion_tokens, temperature, top_p, top_k, seed, stop, stream, stream_options.include_usage, logprobs, top_logprobs, echo(false), n(1), ignore_eos, return_tokens_as_token_ids, chat_template_kwargs`); P2 adds `n>1, presence_penalty, frequency_penalty, repetition_penalty, logit_bias, min_tokens, stop_token_ids, priority, echo:true, user, response_format, tools, tool_choice, parallel_tool_calls`, assistant `tool_calls`, `tool` role; P4 adds `prompt_cache_key`. Unknown fields ignored; known-but-unsupported non-default fields → 400 `unsupported_parameter` naming the field; P1 also refuses non-default `best_of` and `suffix`, roles other than system/user/assistant, message `tool_calls`/`tool_call_id` and non-text content parts (amended to match P1-T15). Supported fields that are malformed, missing or out of range → 400 `invalid_request` (added P1-T15).
+
+Handler order (added P1-T15): body limit (413) → no model loaded (503 `model_not_loaded`) → `OpenAiRequest::from_slice` → `validate(endpoint)` → `model` equals a served id (404 `model_not_found`) → `submit`. Every error before `submit` is reported through `InferenceBackend::record_rejection`.
+
+```rust
+// turbine_api::openai::request (added P1-T15)
+pub const MAX_LOGPROBS: u32 = 20;       // completions `logprobs`, chat `top_logprobs`
+pub const MAX_STOP_STRINGS: usize = 4;
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)] pub struct OpenAiRequest {   // every P1 field as Option<_>
+    pub model, prompt: Option<PromptInput>, messages: Option<Vec<ChatMessageIn>>, max_tokens, max_completion_tokens, temperature, top_p, top_k, seed,
+    pub stop: Option<StopInput>, stream, stream_options: Option<StreamOptions>, logprobs: Option<LogprobsField>, top_logprobs, echo, n, ignore_eos,
+    pub return_tokens_as_token_ids, chat_template_kwargs: Option<Map<String, Value>>,
+    pub tools, tool_choice, response_format, logit_bias, presence_penalty, frequency_penalty, repetition_penalty, best_of, suffix, parallel_tool_calls: Option<Value>,   // raw JSON, judged by value
+}
+impl OpenAiRequest {
+    pub fn from_slice(body: &[u8]) -> Result<Self, ApiError>;   // malformed JSON / mistyped field → 400 invalid_request
+    pub fn validate(&self, endpoint: Endpoint) -> Result<(), ApiError>;   // unsupported → model → messages|prompt → ranges → logprobs; first violation wins
+    pub fn messages_json(&self) -> Vec<Value>;   // chat-template input {"role","content"}, text parts joined by "\n"
+    pub fn stop_strings(&self) -> Vec<String>;
+    pub fn max_tokens(&self) -> Option<u32>;   // max_completion_tokens, else max_tokens; None = remaining context
+    pub fn include_usage(&self) -> bool;
+    pub fn logprobs_n(&self, endpoint: Endpoint) -> Option<u32>;   // → SamplingParams::logprobs
+}
+pub enum PromptInput { Text(String), Tokens(Vec<u32>) }   // untagged
+pub struct ChatMessageIn { pub role: String, pub content: Option<MessageContent>, pub tool_calls: Option<Value>, pub tool_call_id: Option<Value> }
+pub enum MessageContent { Text(String), Parts(Vec<ContentPart>) }
+pub struct ContentPart { pub kind: String /* JSON "type" */, pub text: Option<String> }
+pub enum StopInput { One(String), Many(Vec<String>) }
+pub struct StreamOptions { pub include_usage: Option<bool> }
+pub enum LogprobsField { Bool(bool) /* chat */, Int(u32) /* completions */ }
+```
 
 ### 14.3 Error codes (OpenAI shape `{"error":{"message","type","code"}}`)
 
 ```rust
 pub struct ApiError { pub status: StatusCode, pub kind: ErrorType, pub code: ErrorCode, pub message: String, pub retry_after: Option<u64> }
+impl ApiError {
+    // constructors (added P0-T4): new(status, kind, code, message), model_not_loaded(), not_implemented(), not_found(path), method_not_allowed(method, path),
+    //   request_too_large(limit), internal(message)
+    // constructors (added P1-T15): model_not_found(model), unsupported_parameter(field), context_length_exceeded(message), engine_busy() /* retry_after 1 */,
+    //   template_error(message), invalid_request(message)
+    pub fn from_code(code: ErrorCode, message: impl Into<String>) -> Self;   // status and type from the table below; EngineBusy → retry_after 1; other codes → 500 server_error (added P1-T15)
+    pub fn to_json(&self) -> serde_json::Value;   // {"error":{"message","type","code"}}; also the SSE error event (added P1-T15)
+}
+impl IntoResponse for ApiError {}   // JSON body + `retry-after` header when set
 pub enum ErrorType { InvalidRequestError, RateLimitError, ServiceUnavailable, NotImplemented, NotFound, ServerError, Timeout }   // serde snake_case
 pub enum ErrorCode { /* every code below, serde snake_case */ }      // defined in turbine_core::request (contract-chosen home: GenerationEvent::Error and P6 relay need it); re-exported by turbine-api
 ```
@@ -1533,12 +1663,14 @@ pub enum ErrorCode { /* every code below, serde snake_case */ }      // defined 
 | `not_implemented`                                                  | 501                           | `not_implemented`                              | P0                                                                                                                          | —                                                |
 | `not_found`                                                        | 404                           | `not_found`                                    | P0                                                                                                                          | —                                                |
 | `request_too_large`                                                | 413                           | `invalid_request_error`                        | P0                                                                                                                          | —                                                |
+| `method_not_allowed`                                               | 405                           | `invalid_request_error`                        | P0 (added P0-T1; route exists, method does not)                                                                             | —                                                |
 | `model_not_found`                                                  | 404                           | `invalid_request_error` (contract-chosen type) | P1                                                                                                                          | —                                                |
 | `unsupported_parameter`                                            | 400                           | `invalid_request_error`                        | P1                                                                                                                          | —                                                |
 | `context_length_exceeded`                                          | 400                           | `invalid_request_error`                        | P1                                                                                                                          | —                                                |
 | `engine_busy`                                                      | 429                           | `rate_limit_error` (contract-chosen type)      | P1 only                                                                                                                     | 1                                                |
 | `internal_error`                                                   | 500                           | `server_error` (contract-chosen type)          | P1                                                                                                                          | —                                                |
 | `template_error`                                                   | 400                           | `invalid_request_error`                        | P1 (contract-chosen code; P1 says "400 invalid_request_error with the template error")                                      | —                                                |
+| `invalid_request`                                                  | 400                           | `invalid_request_error`                        | P1 (added P1-T1; malformed body, missing or out-of-range field)                                                             | —                                                |
 | `queue_full`                                                       | 429                           | `rate_limit_error`                             | P2 (P3 type)                                                                                                                | P2: 1; P3: est. drain s, 1..60                   |
 | `queue_timeout`                                                    | 503                           | `service_unavailable`                          | P2                                                                                                                          | P3: same as queue_full                           |
 | `context_exceeds_kv_capacity`                                      | 400                           | `invalid_request_error`                        | P2 (CONFLICT C-2)                                                                                                           | —                                                |
@@ -1769,6 +1901,63 @@ pub enum ExitCode { Clean = 0, Startup = 1, Config = 2, DeviceFatal = 3 }   // (
 
 See §19 for flags. `turbine-bench` (P0) is the load generator (P3 open-loop, P4 multi-turn profile + `kv-sim`, P7 profiles + `compare` + `kv-transfer`); `turbine-golden` (P1) compares/captures fixtures (P2 `--concurrency`, P8 `eval`, `eval-compare`). Library modules (contract-chosen): `prompt` (seeded prompts; unit test `prompt::tests::prompts_are_deterministic`), `report`, `golden`, `kv_sim`, `kv_transfer`.
 
+```rust
+// turbine_bench (library), P0
+pub struct BenchArgs { pub url: String, pub model: Option<String>, pub endpoint: EndpointArg, pub concurrency: u32, pub requests: u32,
+    pub prompt_words: u32, pub max_tokens: u32, pub seed: u64, pub ignore_eos: bool, pub output: OutputFormat }   // clap; flags §19 (added P0-T7)
+pub enum EndpointArg { Chat, Completions }   pub enum OutputFormat { Text, Json }   // (added P0-T7)
+pub enum BenchError { Usage(String) /* exit 2 */, Target(String) /* exit 1 */ }   impl BenchError { pub fn exit_code(&self) -> u8; }   // (added P0-T7)
+pub async fn run(args: &BenchArgs) -> Result<Report, BenchError>;   // (added P0-T7)
+pub mod prompt { pub const WORD_COUNT: usize = 1000; pub fn word(i: usize) -> String; pub fn prompt(seed: u64, index: u64, words: u32) -> String;
+    pub fn prompts(seed: u64, count: u32, words: u32) -> Vec<String>; }   // SplitMix64 seeded with seed + index (added P0-T6)
+pub mod report { pub struct RequestStats { pub ttft: Duration, pub itls: Vec<Duration>, pub e2e: Duration, pub output_tokens: u64 }
+    pub struct Percentiles { pub p50: f64, pub p95: f64, pub p99: f64 }   pub struct Report { /* §19 JSON keys */ }
+    pub fn percentiles(values: Vec<f64>) -> Percentiles;
+    impl Report { pub fn from_results(ok: &[RequestStats], failed: u64, wall: Duration) -> Report; pub fn to_text(&self) -> String; } }   // (added P0-T6)
+
+// turbine_bench::golden, P1 (added P1-T18). Root re-exports: Endpoint, Generation, capture, compare, CompareReport, MissingTopK,
+// PromptVerdict, compare_prompt, judge, GoldenError, PromptKind, PromptRecord, ReferenceRecord, Tolerance.
+pub mod fixture {
+    pub enum GoldenError { Usage(String) /* exit 2 */, Io(String) /* exit 2 */, Endpoint(String) /* exit 1 */ }   impl GoldenError { pub fn exit_code(&self) -> u8; }
+    pub enum PromptKind { Completion, Chat }   // serde lowercase
+    pub struct PromptRecord { pub id: String, pub kind: PromptKind, pub prompt: Option<String>, pub messages: Option<Vec<Value>>, pub max_tokens: u32,
+        pub chat_template_kwargs: Option<Map<String, Value>> }
+    pub struct ReferenceRecord { pub id: String, pub engine: String, pub model: String, pub captured: String /* RFC 3339 UTC, whole seconds */,
+        pub prompt_token_ids: Vec<u32>, pub tokens: Vec<u32>, pub top_logprobs: Vec<Vec<(u32, f32)>> /* highest first */ }
+    #[serde(deny_unknown_fields)] pub struct Tolerance { pub min_identical_prefix: usize, pub min_prompts_passing: usize, pub top_k: usize,
+        pub max_abs_logprob_diff: f32, pub margin_nats: f32 }
+    pub fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, GoldenError>;   // blank lines skipped; no records → Usage
+    pub fn read_prompts(path: &Path) -> Result<Vec<PromptRecord>, GoldenError>;   // unique ids; exactly one of prompt (completion) / messages (chat)
+    pub fn read_tolerance(path: &Path) -> Result<Tolerance, GoldenError>;
+    pub fn write_jsonl_atomic<T: Serialize>(path: &Path, records: &[T]) -> Result<(), GoldenError>;   // <path>.tmp then rename; temp removed on error
+    pub fn tmp_path(path: &Path) -> PathBuf;
+}
+pub mod compare {
+    pub struct MissingTopK { pub position: usize, pub token_id: u32 }
+    pub struct PromptVerdict { pub id: String, pub reference_len: usize, pub identical_prefix: usize, pub first_divergence: Option<usize>,
+        pub margin_at_divergence: Option<f32>, pub max_abs_logprob_diff: f32, pub missing_top_k: Option<MissingTopK>, pub logprob_within_bound: bool, pub passed: bool }
+    pub fn compare_prompt(reference: &ReferenceRecord, got_tokens: &[u32], got_top: &[Vec<(u32, f32)>], tol: &Tolerance) -> PromptVerdict;
+    pub fn judge(verdicts: &[PromptVerdict], tol: &Tolerance) -> bool;   // non-empty, every logprob bound holds, ≥ min_prompts_passing passed
+    pub struct CompareReport { pub prompts: Vec<PromptVerdict>, pub prompts_passing: usize, pub prompts_total: usize, pub passed: bool, pub tolerance: Tolerance }
+    impl CompareReport { pub fn new(prompts: Vec<PromptVerdict>, tolerance: &Tolerance) -> Self; pub fn to_text(&self) -> String; }   // --output json = serde of CompareReport
+}
+pub mod client {
+    pub const COMPARE_TOP_LOGPROBS: u32 = 20;
+    pub struct Generation { pub tokens: Vec<u32>, pub top_logprobs: Vec<Vec<(u32, f32)>>, pub prompt_token_ids: Vec<u32>,
+        pub system_fingerprint: Option<String>, pub model: Option<String> }
+    pub struct Endpoint { /* reqwest client + http:// base URL */ }   // the HTTP target; distinct from turbine_core::request::Endpoint
+    impl Endpoint { pub fn new(url: &str) -> Result<Self, GoldenError>; pub async fn model(&self, explicit: Option<&str>) -> Result<String, GoldenError>;
+        pub async fn generate(&self, model: &str, prompt: &PromptRecord, top_logprobs: u32) -> Result<Generation, GoldenError>; }
+    pub fn request_body(model: &str, prompt: &PromptRecord, top_logprobs: u32) -> (&'static str, Value);   // temperature 0, ignore_eos, return_tokens_as_token_ids, return_token_ids, stream false
+    pub fn parse_completion(v: &Value, k: usize) -> Result<Generation, String>;   pub fn parse_chat(v: &Value, k: usize) -> Result<Generation, String>;
+    pub async fn compare(endpoint: &Endpoint, model: &str, references: &[ReferenceRecord], prompts: &[PromptRecord], tol: &Tolerance) -> Result<CompareReport, GoldenError>;
+    pub async fn capture(endpoint: &Endpoint, model: &str, prompts: &[PromptRecord], top_logprobs: u32) -> Result<Vec<ReferenceRecord>, GoldenError>;   // engine = system_fingerprint or "unknown"
+    pub fn rfc3339_utc(t: SystemTime) -> String;
+}
+```
+
+`turbine-golden` defaults (added P1-T18): `compare` without `--prompts` reads `prompts.jsonl` beside the reference, else one directory up (the committed layout `tests/golden/{prompts.jsonl,<slug>/reference.jsonl}`), and fails with exit 2 naming both paths when neither exists; without `--tolerance` it reads `tolerance.json` beside the reference; without `--model` it uses the first id of `GET <url>/v1/models`. `--url` must be `http://`. `capture --top-logprobs` accepts 2..=20.
+
 ---
 
 ## 17. Metrics by phase (Prometheus / OpenMetrics; owner crate registers)
@@ -1882,7 +2071,7 @@ Label rendering: `device` = global `DeviceId` as decimal; `replica` decimal; `pe
 | Event                                                                                                                      | Level                                 | Phase                | Fields (minimum)                                                                                                                                  |
 | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | discovery backend outcome                                                                                                  | INFO/WARN                             | P0                   | `vendor`, `status`, `detail`                                                                                                                      |
-| kernel selection                                                                                                           | INFO                                  | P1                   | `op`, `config`, `provider`, `impl`, `reason`                                                                                                      |
+| `kernel_selected` (amended to match P1-T4)                                                                                 | INFO                                  | P1                   | `op`, `config`, `provider`, `impl`, `reason`                                                                                                      |
 | `memory_budget`                                                                                                            | INFO                                  | P1 (P2b adds fields) | weights, kv_reservation, workspace, emergency_reserve, `available_bytes`; unified: `device_kind`, `device_free_bytes`, `host_mem_available_bytes` |
 | `kernel_library_loaded`                                                                                                    | INFO                                  | P2b                  | `path`, `backend`, `abi_version`, `build_archs`, `device_arch`, `driver_version`, `workspace_bytes`                                               |
 | reject / preempt / pause / cancel                                                                                          | INFO                                  | P2                   | `request_id`, `reason`                                                                                                                            |
@@ -1901,18 +2090,18 @@ Label rendering: `device` = global `DeviceId` as decimal; `replica` decimal; `pe
 
 ## 19. CLI binaries and flags
 
-| Binary (crate)                            | Invocation                                                                                                                                                                                                                                                                                          | Phase  |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| `turbine-server` (turbine-server)         | `--config <path> [--set k=v]... [--check-config]`; `--support-matrix [--output text\|json]`                                                                                                                                                                                                         | P0; P8 |
-| `turbine-bench` (turbine-bench)           | `--url <base> [--model <name>] [--endpoint chat\|completions] [--concurrency <n>=1] [--requests <n>=10] [--prompt-words <n>=256] [--max-tokens <n>=128] [--seed <u64>=0] [--ignore-eos] [--output text\|json]`; exit 0 ≥1 ok, 1 all failed, 2 usage                                                 | P0     |
-|                                           | `+ [--duration <dur>] [--rate <req/s>] [--prompt-words-range <min>..<max>] [--max-tokens-range <min>..<max>] [--pressure-timeline <file.jsonl>]`; report adds `by_status`, `by_error_code`, `client_dropped`, `streams_incomplete`                                                                  | P3     |
-|                                           | `+ --profile multi-turn --sessions <n> --turns <n> --shared-prefix-words <n> [--think-time <min>..<max>] [--session-hints]`; report adds `cached_tokens_ratio`, TTFT by turn                                                                                                                        | P4     |
-|                                           | `turbine-bench kv-sim --workload <multi-turn\|shared-system\|mixed> --policy <cost_aware\|lru> --l0-blocks <n> [--l1-blocks <n>] [--l2-blocks <n>] [--seed <u64>] [--output text\|json]` (JSON: `hit_rate_by_tier`, `recompute_tokens`, `transfer_bytes`, `evictions`, `simulated_prefill_seconds`) | P4     |
-|                                           | `+ --profile prefill-heavy\|decode-heavy`; `turbine-bench compare --baseline <report.json> --candidate <report.json>`; `turbine-bench kv-transfer --peer <host:port> --transport rdma\|tcp --bytes <size> --iterations <n> [--output text\|json]`                                                   | P7     |
-| `turbine-golden` (turbine-bench)          | `compare --url <base> --reference <reference.jsonl> [--model <name>] [--tolerance <tolerance.json>] [--output text\|json]`; `capture --url <base> --prompts <prompts.jsonl> --out <reference.jsonl> [--model <name>] [--top-logprobs 20]`; exit 0/1/2                                               | P1     |
-|                                           | `compare … [--concurrency <n>=1]`                                                                                                                                                                                                                                                                   | P2     |
-|                                           | `eval --url <base> --tasks <tasks.jsonl> [--model <name>] [--output text\|json]`; `eval-compare --baseline <r.json> --candidate <r.json> [--max-drop <float>]`                                                                                                                                      | P8     |
-| `turbine-collbench` (turbine-distributed) | `--backend rccl\|nccl\|host --devices <i,j,..> [--op all_reduce\|all_gather\|reduce_scatter\|broadcast\|all] [--min-bytes 8] [--max-bytes 1GiB] [--iters 20] [--warmup 5] [--dtype bf16\|fp32] [--rank <r> --world <n> --leader <addr>] [--output text\|json]`; exit 0/1/2                          | P5     |
+| Binary (crate)                            | Invocation                                                                                                                                                                                                                                                                                                  | Phase  |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| `turbine-server` (turbine-server)         | `--config <path> [--set k=v]... [--check-config]`; `--support-matrix [--output text\|json]`                                                                                                                                                                                                                 | P0; P8 |
+| `turbine-bench` (turbine-bench)           | `--url <base> [--model <name>] [--endpoint chat\|completions] [--concurrency <n>=1] [--requests <n>=10] [--prompt-words <n>=256] [--max-tokens <n>=128] [--seed <u64>=0] [--ignore-eos] [--output text\|json]`; exit 0 ≥1 ok, 1 all failed, 2 usage                                                         | P0     |
+|                                           | `+ [--duration <dur>] [--rate <req/s>] [--prompt-words-range <min>..<max>] [--max-tokens-range <min>..<max>] [--pressure-timeline <file.jsonl>]`; report adds `by_status`, `by_error_code`, `client_dropped`, `streams_incomplete`                                                                          | P3     |
+|                                           | `+ --profile multi-turn --sessions <n> --turns <n> --shared-prefix-words <n> [--think-time <min>..<max>] [--session-hints]`; report adds `cached_tokens_ratio`, TTFT by turn                                                                                                                                | P4     |
+|                                           | `turbine-bench kv-sim --workload <multi-turn\|shared-system\|mixed> --policy <cost_aware\|lru> --l0-blocks <n> [--l1-blocks <n>] [--l2-blocks <n>] [--seed <u64>] [--output text\|json]` (JSON: `hit_rate_by_tier`, `recompute_tokens`, `transfer_bytes`, `evictions`, `simulated_prefill_seconds`)         | P4     |
+|                                           | `+ --profile prefill-heavy\|decode-heavy`; `turbine-bench compare --baseline <report.json> --candidate <report.json>`; `turbine-bench kv-transfer --peer <host:port> --transport rdma\|tcp --bytes <size> --iterations <n> [--output text\|json]`                                                           | P7     |
+| `turbine-golden` (turbine-bench)          | `compare --url <base> --reference <reference.jsonl> [--prompts <prompts.jsonl>] (amended to match P1-T18) [--model <name>] [--tolerance <tolerance.json>] [--output text\|json]`; `capture --url <base> --prompts <prompts.jsonl> --out <reference.jsonl> [--model <name>] [--top-logprobs 20]`; exit 0/1/2 | P1     |
+|                                           | `compare … [--concurrency <n>=1]`                                                                                                                                                                                                                                                                           | P2     |
+|                                           | `eval --url <base> --tasks <tasks.jsonl> [--model <name>] [--output text\|json]`; `eval-compare --baseline <r.json> --candidate <r.json> [--max-drop <float>]`                                                                                                                                              | P8     |
+| `turbine-collbench` (turbine-distributed) | `--backend rccl\|nccl\|host --devices <i,j,..> [--op all_reduce\|all_gather\|reduce_scatter\|broadcast\|all] [--min-bytes 8] [--max-bytes 1GiB] [--iters 20] [--warmup 5] [--dtype bf16\|fp32] [--rank <r> --world <n> --leader <addr>] [--output text\|json]`; exit 0/1/2                                  | P5     |
 
 Bench JSON report keys (P0): `requests_ok`, `requests_failed`, `wall_seconds`, `request_throughput`, `output_token_throughput`, `ttft_ms`, `itl_ms`, `e2e_ms` (each `{p50,p95,p99}`). Pressure timeline line (P3): `t`, `state`, `circuit`, `dominant_signal`, `queue`, `kv_utilization` (or `{"t","error"}`).
 
@@ -1978,18 +2167,18 @@ All scripts: never stop/restart/reconfigure non-`turbine-lab-*` workloads; any r
 
 ### 21.3 Environment variables
 
-| Variable                                                   | Meaning                                                                         | Phase  |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------- | ------ |
-| `RUST_LOG`                                                 | overrides `logging.level`                                                       | P0     |
-| `TURBINE_EXPECT_NVIDIA`, `TURBINE_EXPECT_AMD`              | expected device counts in `lab inventory_matches_expectation` (skip when unset) | P0     |
-| `TURBINE_AMD_SMI_LIBRARY`                                  | explicit amd-smi path (fatal if it fails)                                       | P0     |
-| `TURBINE_KERNEL_LIBRARY`                                   | kernel shim path (second in search order)                                       | P1     |
-| `TURBINE_ROCM_PATH`                                        | CMake override of `/opt/rocm/rocm`                                              | P1     |
-| `TURBINE_TEST_MODEL_DIR`, `TURBINE_TEST_MOE_MODEL_DIR`     | real weights for ignored tests                                                  | P1, P2 |
-| `TURBINE_TEST_BACKEND`                                     | `hip` \| `cuda`; selects GPU tests                                              | P2b    |
-| `TURBINE_CUDA_ROOT`                                        | CMake cache variable (not env) for the toolkit                                  | P2b    |
-| `TURBINE_RDMA_DEVICE`, `TURBINE_RDMA_PEER`                 | RDMA lab test                                                                   | P7     |
-| `NCCL_IB_HCA=rocep1s0f0`, `NCCL_SOCKET_IFNAME=enp1s0f0np0` | cross-Spark NCCL                                                                | P6     |
+| Variable                                                   | Meaning                                                                                                                                                     | Phase  |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| `RUST_LOG`                                                 | overrides `logging.level`                                                                                                                                   | P0     |
+| `TURBINE_EXPECT_NVIDIA`, `TURBINE_EXPECT_AMD`              | expected device counts in `lab inventory_matches_expectation` (skip when unset)                                                                             | P0     |
+| `TURBINE_AMD_SMI_LIBRARY`                                  | explicit amd-smi path (fatal if it fails); `turbine_device::AMD_SMI_LIBRARY_ENV`, ignored when empty or when `devices.amd_smi_library` is set (added P0-T3) | P0     |
+| `TURBINE_KERNEL_LIBRARY`                                   | kernel shim path (second in search order)                                                                                                                   | P1     |
+| `TURBINE_ROCM_PATH`                                        | CMake override of `/opt/rocm/rocm`                                                                                                                          | P1     |
+| `TURBINE_TEST_MODEL_DIR`, `TURBINE_TEST_MOE_MODEL_DIR`     | real weights for ignored tests                                                                                                                              | P1, P2 |
+| `TURBINE_TEST_BACKEND`                                     | `hip` \| `cuda`; selects GPU tests                                                                                                                          | P2b    |
+| `TURBINE_CUDA_ROOT`                                        | CMake cache variable (not env) for the toolkit                                                                                                              | P2b    |
+| `TURBINE_RDMA_DEVICE`, `TURBINE_RDMA_PEER`                 | RDMA lab test                                                                                                                                               | P7     |
+| `NCCL_IB_HCA=rocep1s0f0`, `NCCL_SOCKET_IFNAME=enp1s0f0np0` | cross-Spark NCCL                                                                                                                                            | P6     |
 
 ### 21.4 Fixtures
 
