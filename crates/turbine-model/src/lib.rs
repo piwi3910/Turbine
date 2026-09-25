@@ -6,9 +6,11 @@ use std::path::PathBuf;
 use turbine_kernels::KernelError;
 use turbine_tensor::MemoryError;
 
+pub mod chat_template;
 pub mod config;
 pub mod tokenizer;
 
+pub use chat_template::ChatTemplate;
 pub use config::{
     Architecture, GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config,
     load_model_config,
