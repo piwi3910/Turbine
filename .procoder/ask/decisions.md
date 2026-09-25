@@ -201,3 +201,24 @@
 - Add arc-swap 1.x (safe, lock-free, tiny) (recommended)
 - std RwLock<Arc<T>> (not lock-free, no new dependency)
 - Hand-written AtomicPtr cell with unsafe in turbine-device
+
+## P0-T7: run the manual turbine-bench check against production vLLM on dgx-spark (10 requests, concurrency 2)?
+
+- Yes, run it now (small read-only load on production vLLM) (recommended)
+- Later, when you have moved workloads
+
+**Answer (2026-09-25):** "don't run on the spark, novanas only" — no turbine-bench run against the Sparks.
+
+## Scope of "no Sparks": Phase 0 only, or all phases until further notice?
+
+- Until you say otherwise: no Turbine runs on the Sparks; Spark lab steps (P0 Spark discovery check, P2b, P3 Spark soak, P6, P7 M1) wait (recommended)
+- Phase 0 only
+- Permanently: re-plan the Spark-based phases onto novanas
+
+## P0-T7 real-stream check with no OpenAI endpoint on novanas
+
+- Defer the check to Phase 1, run against Turbine itself on novanas (recommended)
+- Start a vLLM-ROCm k3s Job on novanas with a small model now
+
+**Answers (2026-09-25):** "no Sparks" applies to Phase 0 only — Phase 0's Spark lab checks move to Phase 2b (first phase that runs on the Sparks); later phases use the Sparks as planned, asking before heavy runs. P0-T7 real-stream check deferred to Phase 1, run against Turbine itself on novanas.
+
