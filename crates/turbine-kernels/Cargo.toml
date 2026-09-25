@@ -20,6 +20,10 @@ libloading.workspace = true
 # bf16/f16 <-> f32 conversion in the cpu-reference provider (the host-side numerical oracle)
 half.workspace = true
 
+[build-dependencies]
+# Finds the host C compiler that build.rs uses to compile the stub shim libraries for the tests
+cc.workspace = true
+
 [dev-dependencies]
 # Captures the JSON kernel selection log in registry tests
 tracing-subscriber.workspace = true

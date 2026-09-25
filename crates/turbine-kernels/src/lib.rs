@@ -7,8 +7,11 @@ use std::path::PathBuf;
 use turbine_tensor::MemoryError;
 
 pub mod cpu;
+pub(crate) mod ffi;
 pub mod ops;
 pub mod registry;
+pub mod shim;
+pub mod test_support;
 
 pub use cpu::{cpu_reference_provider, round_to};
 pub use ops::{
@@ -19,6 +22,7 @@ pub use ops::{
     RopeContext, RopeKernel,
 };
 pub use registry::{KernelMetrics, KernelRegistry, OpConfig, OpRequirement, Selection};
+pub use shim::{ShimContext, ShimLibrary, ShimProvider, shim_provider};
 
 /// The kernel C ABI version this crate speaks; must equal `turbine_abi_version()` of the loaded
 /// shim library and `TURBINE_ABI_VERSION` in the header exactly (contract §9.1).
