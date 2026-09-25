@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::types::{DeviceId, ExecutionBackend};
 
 /// TS §15 example, verbatim.
 const TS15_EXAMPLE: &str = r#"server:
@@ -189,4 +190,52 @@ fn set_overrides_apply() {
         "no-equals-sign".parse::<Override>(),
         Err(ConfigError::BadOverride { .. })
     ));
+}
+
+#[test]
+fn execution_and_model_keys() {
+    let c = parse(
+        "model:\n  path: /m\n  served_name: meta-llama/Llama-3.2-3B-Instruct\n  max_seq_len: 4096\n\
+         execution:\n  backend: cpu\n  device: 1\n  kernel_library: /opt/k/libturbine_hip.so\n",
+        &[],
+    )
+    .expect("execution and model keys must load");
+    assert_eq!(
+        c.model.served_name.as_deref(),
+        Some("meta-llama/Llama-3.2-3B-Instruct")
+    );
+    assert_eq!(c.model.max_seq_len, Some(4096));
+    assert_eq!(c.execution.backend, ExecutionBackend::Cpu);
+    assert_eq!(c.execution.device, DeviceId(1));
+    assert_eq!(
+        c.execution.kernel_library,
+        Some(PathBuf::from("/opt/k/libturbine_hip.so"))
+    );
+
+    // Defaults: hip on device 0, no explicit shim, every new model key unset.
+    let d = parse("model:\n  path: /m\n", &[]).unwrap();
+    assert_eq!(d.execution.backend, ExecutionBackend::Hip);
+    assert_eq!(d.execution.device, DeviceId(0));
+    assert_eq!(d.execution.kernel_library, None);
+    assert_eq!(d.model.served_name, None);
+    assert_eq!(d.model.tokenizer, None);
+    assert_eq!(d.model.chat_template, None);
+    assert_eq!(d.model.max_seq_len, None);
+
+    let base = "model:\n  path: /m\n";
+    assert_rejected(base, &["execution.backend=cuda"], "execution.backend");
+    let err = parse(base, &["execution.backend=cuda"]).unwrap_err();
+    assert_eq!(err.key(), Some("execution.backend"));
+    assert!(err.to_string().contains("phase-2b-nvidia"), "{err}");
+
+    assert_rejected(base, &["model.served_name=\"\""], "model.served_name");
+    let long = "x".repeat(257);
+    assert_rejected(
+        base,
+        &[&format!("model.served_name={long}")],
+        "model.served_name",
+    );
+    assert!(parse(base, &[&format!("model.served_name={}", "x".repeat(256))]).is_ok());
+    assert_rejected(base, &["model.max_seq_len=0"], "model.max_seq_len");
+    assert_rejected(base, &["execution.backend=rocm"], "execution.backend");
 }

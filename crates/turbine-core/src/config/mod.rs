@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_norway::{Mapping, Value};
 
 pub use byte_size::ByteSize;
+
+use crate::types::{DeviceId, ExecutionBackend};
 pub use overrides::Override;
 
 /// Configuration errors. Every variant maps to exit code 2 in `turbine-server`.
@@ -59,6 +61,7 @@ pub struct Config {
     pub distributed: DistributedConfig,
     pub logging: LoggingConfig,
     pub devices: DevicesConfig,
+    pub execution: ExecutionConfig,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -83,6 +86,14 @@ pub struct ModelConfig {
     /// Required; the empty default is rejected by `validate`.
     pub path: PathBuf,
     pub dtype: ModelDtype,
+    /// Default: `<org>/<name>` for a Hugging Face snapshot path, else the last path component.
+    pub served_name: Option<String>,
+    /// Default: `<model.path>/tokenizer.json`.
+    pub tokenizer: Option<PathBuf>,
+    /// Default: `<model.path>/chat_template.jinja`, else `<model.path>/tokenizer_config.json`.
+    pub chat_template: Option<PathBuf>,
+    /// Default: min(32768, max_position_embeddings); the upper bound is checked at startup.
+    pub max_seq_len: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -229,6 +240,27 @@ pub struct DevicesConfig {
     pub amd_smi_library: Option<PathBuf>,
 }
 
+/// `execution` section (Phase 1): which kernel backend runs the model, on which device.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields, default)]
+pub struct ExecutionConfig {
+    pub backend: ExecutionBackend,
+    /// Global index from the device inventory.
+    pub device: DeviceId,
+    /// Explicit kernel shim path; null → TURBINE_KERNEL_LIBRARY, beside the executable, loader path.
+    pub kernel_library: Option<PathBuf>,
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        ExecutionConfig {
+            backend: ExecutionBackend::Hip,
+            device: DeviceId(0),
+            kernel_library: None,
+        }
+    }
+}
+
 /// Read `path`, apply `overrides` in order, deserialize and validate.
 pub fn load(path: &Path, overrides: &[Override]) -> Result<Config, ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -323,6 +355,23 @@ impl Config {
             return Err(invalid(
                 "distributed.enabled",
                 "distributed mode is not supported in this build",
+            ));
+        }
+        if let Some(name) = &self.model.served_name
+            && (name.is_empty() || name.chars().count() > 256)
+        {
+            return Err(invalid(
+                "model.served_name",
+                "must be between 1 and 256 characters",
+            ));
+        }
+        if self.model.max_seq_len == Some(0) {
+            return Err(invalid("model.max_seq_len", "must be at least 1"));
+        }
+        if self.execution.backend == ExecutionBackend::Cuda {
+            return Err(invalid(
+                "execution.backend",
+                "cuda is not available in this build; NVIDIA execution arrives with phase-2b-nvidia",
             ));
         }
         if let Err(e) = tracing_subscriber::EnvFilter::try_new(&self.logging.level) {
