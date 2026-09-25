@@ -1,30 +1,29 @@
-# k3s Job run by scripts/lab-test.sh novanas: the full test suite, including #[ignore] GPU
-# tests, in rust:1.97-trixie with both R9700 GPUs, the host ROCm tree and the model weights
-# mounted read-only. Setup: cmake + python3 from Debian, libturbine_hip.so built from
-# kernels/rocm, uv (pinned) for scripts/golden/hf_reference.py. Each step prints
-# `lab-step: <name>`; a failing step prints `lab-step failed: <name>` and the Job fails with
-# that command's exit code.
+# k3s Job run by scripts/lab-serve.sh novanas <config.yaml>: turbine-server on one R9700 for
+# manual golden and benchmark runs, listening on the host network (server.listen of the config,
+# 0.0.0.0:18000 in scripts/lab/phase1-novanas.yaml). The script copies the config to
+# /home/piwi/turbine-ci/serve/config.yaml before applying this Job. Setup and mounts match
+# novanas-test-job.yaml: cmake + python3 from Debian, libturbine_hip.so built from kernels/rocm,
+# then the release turbine-server. Each step prints `lab-step: <name>`; a failing step prints
+# `lab-step failed: <name>`. The Job runs until `scripts/lab-serve.sh novanas --stop`.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: turbine-lab-test
+  name: turbine-lab-serve
   namespace: turbine-ci
   labels:
     turbine-lab: "true"
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 600
-  # A cold run fetches and compiles Composable Kernel and installs torch for the reference
-  # script; later runs reuse the kernel build dir, cargo target and uv cache on the host.
-  activeDeadlineSeconds: 5400
   template:
     metadata:
       labels:
         turbine-lab: "true"
     spec:
       restartPolicy: Never
+      hostNetwork: true
       containers:
-        - name: test
+        - name: serve
           image: rust:1.97-trixie
           workingDir: /home/piwi/turbine-ci/src
           command: ["bash", "-c"]
@@ -48,15 +47,11 @@ spec:
               test -f "$TURBINE_KERNEL_LIBRARY"
               echo "lab-step: built $TURBINE_KERNEL_LIBRARY"
 
-              step "install uv $UV_VERSION"
-              if [[ "$("$UV_INSTALL_DIR/uv" --version 2>/dev/null)" != "uv $UV_VERSION"* ]]; then
-                curl -LsSf "https://astral.sh/uv/$UV_VERSION/install.sh" | sh
-              fi
-              export PATH="$UV_INSTALL_DIR:$PATH"
-              uv --version
+              step "build turbine-server"
+              cargo build --release -p turbine-server
 
-              step "cargo test"
-              exec cargo test --workspace -- --include-ignored --show-output
+              step "turbine-server"
+              exec "$CARGO_TARGET_DIR/release/turbine-server" --config /home/piwi/turbine-ci/serve/config.yaml
           env:
             - name: CARGO_TARGET_DIR
               value: /home/piwi/turbine-ci/target
@@ -64,10 +59,6 @@ spec:
               value: /opt/rocm/rocm/lib:/opt/rocm/rocm/lib/rocm_sysdeps/lib
             - name: TURBINE_AMD_SMI_LIBRARY
               value: /opt/rocm/rocm/lib/libamd_smi.so.26.5.0
-            - name: TURBINE_EXPECT_AMD
-              value: "2"
-            - name: TURBINE_EXPECT_AMD_ARCH
-              value: gfx1201
             # Every top-level entry of /opt/rocm/rocm on novanas is an /etc/alternatives
             # symlink; inside the container the real versioned tree is the ROCm root.
             - name: TURBINE_ROCM_PATH
@@ -76,23 +67,9 @@ spec:
               value: /home/piwi/turbine-ci/target/kernels
             - name: TURBINE_KERNEL_LIBRARY
               value: /home/piwi/turbine-ci/target/kernels/libturbine_hip.so
-            - name: TURBINE_TEST_BACKEND
-              value: hip
-            - name: TURBINE_TEST_MODEL_DIR
-              value: /models/llama-3.2-3b-instruct
-            - name: UV_VERSION
-              value: 0.11.2
-            - name: UV_INSTALL_DIR
-              value: /home/piwi/turbine-ci/uv-cache/bin
-            - name: UV_NO_MODIFY_PATH
-              value: "1"
-            - name: UV_CACHE_DIR
-              value: /home/piwi/turbine-ci/uv-cache
-            - name: UV_PYTHON_INSTALL_DIR
-              value: /home/piwi/turbine-ci/uv-cache/python
           resources:
             limits:
-              amd.com/gpu: 2
+              amd.com/gpu: 1
           volumeMounts:
             - name: turbine-ci
               mountPath: /home/piwi/turbine-ci
@@ -105,7 +82,7 @@ spec:
             - name: rocm-lib-alternative
               mountPath: /etc/alternatives/rocm-lib
               readOnly: true
-            # Weights provisioned once over SSH; tests never download.
+            # Weights provisioned once over SSH; the server never downloads.
             - name: models
               mountPath: /models
               readOnly: true

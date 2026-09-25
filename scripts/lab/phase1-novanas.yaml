@@ -1,0 +1,11 @@
+# turbine-server configuration for the Phase 1 lab runs on novanas:
+#   scripts/lab-serve.sh novanas scripts/lab/phase1-novanas.yaml
+# Weights: /home/piwi/turbine-models/llama-3.2-3b-instruct on the host, mounted read-only at
+# /models by scripts/lab/novanas-serve-job.yaml.
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/llama-3.2-3b-instruct
+  served_name: meta-llama/Llama-3.2-3B-Instruct
+execution:
+  backend: hip

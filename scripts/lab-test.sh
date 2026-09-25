@@ -107,7 +107,7 @@ run_novanas() {
 	echo "lab-test: ${HOST}: streaming pod log"
 	kube "-n ${NS} logs -f job/${JOB}" || echo "lab-test: ${HOST}: log stream ended with an error" >&2
 
-	# The Job has activeDeadlineSeconds: 1800, so it always reaches a terminal state.
+	# The Job has activeDeadlineSeconds (5400), so it always reaches a terminal state.
 	local succeeded="" failed=""
 	while :; do
 		succeeded="$(kube "-n ${NS} get job ${JOB} -o jsonpath='{.status.succeeded}'" || true)"

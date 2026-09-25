@@ -24,6 +24,9 @@ tokio.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+# lab_scripts: the lab configs and k3s manifests are checked against the real config model.
+serde_norway.workspace = true
+turbine-core.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

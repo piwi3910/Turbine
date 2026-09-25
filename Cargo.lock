@@ -1812,8 +1812,10 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_norway",
  "thiserror 2.0.21",
  "tokio",
+ "turbine-core",
 ]
 
 [[package]]
