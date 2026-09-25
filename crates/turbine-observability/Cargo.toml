@@ -1,0 +1,20 @@
+[package]
+name = "turbine-observability"
+description = "Turbine tracing subscriber, Prometheus registry and HTTP observability layers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+prometheus-client.workspace = true
+thiserror.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+turbine-core.workspace = true
+uuid.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

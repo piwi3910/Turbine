@@ -11,7 +11,7 @@ Phase 0 plan Task 7 (`.procoder/plans/phase-0-skeleton.md`, "## Task 7"): turbin
 
 - [ ] `cargo test -p turbine-bench` passes (expect PASS (unit + 2 integration tests).)
 - [ ] Gate clean: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [ ] Committed on branch phase-0-skeleton with the plan's commit message
+- [x] Committed on branch phase-0-skeleton with the plan's commit message
 
 ## Evidence
 
