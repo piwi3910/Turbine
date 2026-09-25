@@ -1,5 +1,6 @@
 //! The tiny synthetic checkpoint (P1 S-12): a random-weight `LlamaForCausalLM` (2 layers,
-//! hidden 64, GQA with 4 query / 2 KV heads, head_dim 16, llama3 rope scaling, tied embeddings)
+//! hidden 64, GQA with 4 query / 2 KV heads, head_dim 16 (128 via [`TinyOptions::head_dim`]),
+//! llama3 rope scaling, tied embeddings)
 //! with a byte-level BPE tokenizer and the Llama-3.2 chat template, written in the Hugging Face
 //! layout so the loader, executor, server and `hf_reference.py` all run on it without weights.
 //!
@@ -154,6 +155,10 @@ pub struct TinyOptions {
     pub extra: Vec<String>,
     /// `true`: the exact Llama-3.2 template (renders tools); `false`: [`PLAIN_CHAT_TEMPLATE`].
     pub template_with_tools: bool,
+    /// Explicit `config.json` `head_dim` (default 16). Hidden stays 64, so q/o projections are
+    /// `[heads * head_dim, hidden]` / `[hidden, heads * head_dim]`; GPU executor tests use 128,
+    /// the only head_dim the HIP attention supports.
+    pub head_dim: u32,
 }
 
 impl Default for TinyOptions {
@@ -164,6 +169,7 @@ impl Default for TinyOptions {
             omit: Vec::new(),
             extra: Vec::new(),
             template_with_tools: true,
+            head_dim: 16,
         }
     }
 }
@@ -186,7 +192,10 @@ pub fn write_tiny_llama(dir: &Path, seed: u64) -> TinySpec {
 /// by `seed`: the same seed and options give byte-identical files.
 pub fn write_tiny_llama_with(dir: &Path, seed: u64, opts: &TinyOptions) -> TinySpec {
     std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
-    write_json(&dir.join("config.json"), &config_json(opts.tied));
+    write_json(
+        &dir.join("config.json"),
+        &config_json(opts.tied, opts.head_dim),
+    );
     write_json(
         &dir.join("generation_config.json"),
         &json!({
@@ -219,7 +228,7 @@ fn write_json(path: &Path, value: &serde_json::Value) {
     std::fs::write(path, text).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
-fn config_json(tied: bool) -> serde_json::Value {
+fn config_json(tied: bool, head_dim: u32) -> serde_json::Value {
     json!({
         "architectures": ["LlamaForCausalLM"],
         "model_type": "llama",
@@ -227,7 +236,7 @@ fn config_json(tied: bool) -> serde_json::Value {
         "attention_dropout": 0.0,
         "bos_token_id": BOS.1,
         "eos_token_id": TINY_EOS,
-        "head_dim": 16,
+        "head_dim": head_dim,
         "hidden_act": "silu",
         "hidden_size": 64,
         "initializer_range": 0.02,
@@ -453,6 +462,38 @@ mod tests {
         assert_eq!(spec.vocab, TINY_VOCAB);
         assert_eq!(cfg.max_position_embeddings, TINY_MAX_POSITIONS);
         assert_eq!(cfg.eos_token_ids.as_slice(), &TINY_EOS);
+    }
+
+    #[test]
+    fn head_dim_option_decouples_attention_width_from_hidden() {
+        let dir = TempDir::new("tiny-hd128");
+        let opts = TinyOptions {
+            head_dim: 128,
+            ..TinyOptions::default()
+        };
+        let spec = write_tiny_llama_with(dir.path(), 7, &opts);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(raw["head_dim"], 128);
+        let cfg = &spec.config;
+        assert_eq!(
+            (
+                cfg.hidden,
+                cfg.num_attention_heads,
+                cfg.num_kv_heads,
+                cfg.head_dim
+            ),
+            (64, 4, 2, 128)
+        );
+        let bytes = std::fs::read(dir.path().join("model.safetensors")).unwrap();
+        let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let shape = |name: &str| st.tensor(name).unwrap().shape().to_vec();
+        let p = "model.layers.0.self_attn";
+        assert_eq!(shape(&format!("{p}.q_proj.weight")), [512, 64]);
+        assert_eq!(shape(&format!("{p}.k_proj.weight")), [256, 64]);
+        assert_eq!(shape(&format!("{p}.v_proj.weight")), [256, 64]);
+        assert_eq!(shape(&format!("{p}.o_proj.weight")), [64, 512]);
     }
 
     #[test]

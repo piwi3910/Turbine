@@ -14,7 +14,9 @@ use turbine_kernels::{
 use turbine_model::config::{ModelArchConfig, RopeScaling};
 use turbine_model::executor::{BatchInput, LlamaExecutor, Logits, ModelExecutor};
 use turbine_model::testing::TempDir;
-use turbine_model::testing::tiny::{TinySpec, write_tiny_llama};
+use turbine_model::testing::tiny::{
+    TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with,
+};
 use turbine_model::{MAX_STAGING_BYTES, ModelError, SafetensorsIndex, WeightLoader, llama_slots};
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::DeviceMemory;
@@ -24,6 +26,17 @@ const SEED: u64 = 7;
 const PROMPT_LEN: usize = 20;
 const DECODE_STEPS: usize = 30;
 const MAX_SEQ_LEN: u32 = 64;
+/// The only head_dim the HIP attention (CK FMHA) supports (P1 S-7): GPU executor tests use a
+/// tiny checkpoint with this head_dim, hidden staying 64.
+const GPU_HEAD_DIM: u32 = 128;
+
+fn write_gpu_tiny(dir: &Path) -> TinySpec {
+    let opts = TinyOptions {
+        head_dim: GPU_HEAD_DIM,
+        ..TinyOptions::default()
+    };
+    write_tiny_llama_with(dir, SEED, &opts)
+}
 
 fn prompt(vocab: u32) -> Vec<u32> {
     (0..PROMPT_LEN as u32)
@@ -310,7 +323,25 @@ fn naive_inv_freq(cfg: &ModelArchConfig) -> Vec<f32> {
 #[test]
 fn cpu_forward_matches_naive() {
     let tmp = TempDir::new("tiny-model-naive");
-    let spec = write_tiny_llama(tmp.path(), SEED);
+    check_cpu_against_naive(&write_tiny_llama(tmp.path(), SEED));
+}
+
+/// The head_dim-128 variant the GPU tests use: q/o projections wider than hidden
+/// (`[512, 64]` / `[64, 512]`).
+#[test]
+fn cpu_forward_matches_naive_head_dim_128() {
+    let tmp = TempDir::new("tiny-model-naive-hd128");
+    let spec = write_gpu_tiny(tmp.path());
+    assert_eq!(
+        (spec.config.head_dim, spec.config.hidden),
+        (GPU_HEAD_DIM, 64)
+    );
+    check_cpu_against_naive(&spec);
+}
+
+/// Prefill, greedy decode past the rope original length and a restart: CPU provider logits
+/// within 1e-4 of the naive reference.
+fn check_cpu_against_naive(spec: &TinySpec) {
     let original = match spec.config.rope_scaling {
         Some(RopeScaling::Llama3 {
             original_max_position_embeddings,
@@ -323,7 +354,7 @@ fn cpu_forward_matches_naive() {
         "decode must pass the rope original length"
     );
     let naive = Naive::load(&spec.dir, &spec.config);
-    let mut exec = cpu_executor(&spec);
+    let mut exec = cpu_executor(spec);
     assert_eq!(exec.shape().vocab, spec.vocab);
     assert_eq!(exec.kv_layout().num_layers, spec.config.num_layers);
 
@@ -444,8 +475,8 @@ fn requirements_and_workspace() {
     assert_eq!(w1 - (w2 - w1), 2 * 64 + 4 * 263 + 4 * 8);
 }
 
-/// Lab only (Task 21): HIP provider logits on the tiny checkpoint match the CPU provider within
-/// 2e-2 and 32 greedy tokens are identical.
+/// Lab only (Task 21): HIP provider logits on the head_dim-128 tiny checkpoint match the CPU
+/// provider within 2e-2 and 32 greedy tokens are identical.
 #[test]
 #[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
 fn hip_matches_cpu() {
@@ -467,7 +498,7 @@ fn hip_matches_cpu() {
     let ctx = lib.create_context(device).expect("HIP context");
 
     let tmp = TempDir::new("tiny-model-hip");
-    let spec = write_tiny_llama(tmp.path(), SEED);
+    let spec = write_gpu_tiny(tmp.path());
     let mut cpu = cpu_executor(&spec);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
     let mut hip = executor(&spec, shim_provider(ctx), mem);

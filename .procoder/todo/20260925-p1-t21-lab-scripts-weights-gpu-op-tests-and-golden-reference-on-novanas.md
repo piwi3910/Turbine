@@ -13,7 +13,7 @@ Phase 1 plan Task 21 (`.procoder/plans/phase-1-single-request.md`, "## Task 21")
 - [x] Lab Job builds `libturbine_hip.so` for `gfx1201` with hipBLASLt 1.4.1 and CK `cd9574023093742434e8c992d13b89ab9a6c1cf8`
 - [x] `hip_ops` passes on the R9700: `test gemm_matches_cpu ... ok`, `test attention_matches_cpu ... ok`, `test norm_rope_silu_embedding_add_match_cpu ... ok`, each printing the `_impl` name
 - [x] Device inventory lab test passes on novanas (`test inventory_matches_expectation ... ok`, 2 × R9700 gfx1201)
-- [ ] `tiny_model hip_matches_cpu` passes on novanas (blocked: HIP attention has no head_dim 16 kernel, see Evidence)
+- [ ] `tiny_model hip_matches_cpu` passes on novanas (head_dim-128 tiny now selects every HIP op; fails the 2e-2 logit bound at step 0, see Evidence run 5)
 - [x] Gate clean: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` exits 0
 - [x] Committed on branch phase-1-single-request with the plan's commit message
 
@@ -39,3 +39,21 @@ Partial: the script/manifest part of the task (no Job has been run on novanas; t
 - `test attention_matches_cpu ... ok`, `test gemm_matches_cpu ... ok`, `test norm_rope_silu_embedding_add_match_cpu ... ok`
 - e.g. `gemm m=17 n=128256 k=3072 … c_dtype=f32: impl=hipblaslt max |Δ| 1.073e-5`, `attention_prefill q_len=4096 q_start=0 rows 0..16: impl=ck_tile_fmha_fwd max |Δ| 1.562e-2 ok`, `rmsnorm rows=17 dim=3072 dtype=bf16: impl=ck_tile_rmsnorm2d max |Δ| 1.562e-2 ok`, rope/silu_mul/embedding/add `impl=turbine_hip max |Δ| 0.000e0`
 - FAIL: `test hip_matches_cpu ... FAILED`: `every op has a provider: NoProvider { op: AttentionPrefill, config: "head_dim=16 kv_heads=2 dtype=bf16 q_heads=4 causal=1" }`. The tiny checkpoint has head_dim 16, but spec S-7 gives the HIP attention head_dim 128 only. This is a spec gap between S-7 and S-8/S-13 and needs a decision: a head_dim-128 tiny variant for the HIP test, a Turbine HIP attention kernel for other head dims, or a CPU fallback in the test registry. `lab-test: novanas: tests failed (exit 101)`. The golden tests `hf_reference_matches_cpu` / `logits_match_reference` do not exist in the tree yet.
+
+### Lab run (part 3: head_dim-128 tiny checkpoint, 2026-09-26)
+
+User decision (recorded for the NVIDIA path, applied to HIP by the coordinator): tiny checkpoints for GPU tests use head_dim 128. `TinyOptions::head_dim` (default 16; `config.json` always writes an explicit `head_dim`), hidden stays 64 so q/o projections are `[512, 64]` / `[64, 512]`: the loader (`llama_slots`) and executor (`q_dim`/`kv_dim` from `head_dim`) already decouple them. `hip_matches_cpu` uses the head_dim-128 variant; new `cpu_forward_matches_naive_head_dim_128` covers it on macOS (`test result: ok. 4 passed; 0 failed; 1 ignored` for `tiny_model`); `testing::tiny::tests::head_dim_option_decouples_attention_width_from_hidden` checks the config and tensor shapes. CPU logits on the 128 variant span -13.6..14.1 (top-1 14.12).
+
+`scripts/lab-test.sh novanas`, run 4 (GPUs free: `turbine-ci` held only an Error `turbine-lab-test` pod, no Running/Pending pod requested `amd.com/gpu`):
+
+- `turbine_hip: libturbine_hip.so built for gfx1201, ROCm 7.14.1, hipBLASLt 1.4.1, CK cd9574023093742434e8c992d13b89ab9a6c1cf8`
+- `test inventory_matches_expectation ... ok`; `hip_ops`: `test result: ok. 3 passed; 0 failed`
+- `test hf_reference_matches_cpu ... ok`
+- `test logits_match_reference ... FAILED`: `|Δ logprob| over the reference top-5 exceeds 0.15 (or an id is missing)`; 3/16 prompts PASS (p02, p05, p06), token prefixes 32/32 on 12 prompts, `max_abs_logprob_diff` 0.0947–0.4581 (p16 0.4581, p03 0.3940, p10 0.3484)
+- cargo stopped after the failing `golden` target, so `tiny_model` did not run: `lab-test: novanas: tests failed (exit 101)`
+
+Run 5: same Job with a temporary, uncommitted `--no-fail-fast` in the Job's `cargo test` line (reverted after the run; `lab_scripts` failed only because of that edit: `"exec cargo test --workspace -- --include-ignored --show-output" missing`):
+
+- `test cpu_forward_matches_naive_head_dim_128 ... ok` on the lab host
+- `test hip_matches_cpu ... FAILED`: `step 0: max abs diff 0.09702778` (bound 2e-2). The NoProvider failure is gone: every op, including `attention_prefill head_dim=128`, has a HIP provider. 0.097 on logits of magnitude ~14 is under 1 % relative, about one to two BF16 ulps at the logit scale; whether that is BF16 accumulation-order drift (hipBLASLt / CK vs sequential CPU) or a real defect, and whether the 2e-2 bound holds for a random-weight BF16 model, needs a decision.
+- `test logits_match_reference ... FAILED` (same verdicts as run 4); `error: 3 targets failed` (`lab_scripts` from the temporary edit, `golden`, `tiny_model`); `lab-test: novanas: tests failed (exit 101)`
