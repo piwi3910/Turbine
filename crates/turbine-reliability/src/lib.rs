@@ -8,6 +8,7 @@ pub mod fault;
 pub mod ledger;
 pub mod metrics;
 pub mod signals;
+pub mod state;
 
 pub use turbine_core::clock::Clock;
 pub use turbine_core::types::{CircuitState, PressureState};
