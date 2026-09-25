@@ -1332,6 +1332,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbine-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "turbine-api",
+ "turbine-core",
+ "turbine-device",
+ "turbine-observability",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
