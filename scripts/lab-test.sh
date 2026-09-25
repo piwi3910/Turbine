@@ -1,21 +1,48 @@
 #!/usr/bin/env bash
-# Run the full Turbine test suite, including #[ignore] GPU tests, on one lab host.
+# Run the Turbine test suite, including #[ignore] GPU tests, on one lab host.
 #
-#   scripts/lab-test.sh <dgx-spark|dgx-spark2|novanas>
+#   scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas> [--gpus 1|2] [--with-hf-reference]
+#                       [-- <cargo test arguments>]
+#   scripts/lab-test.sh [--dry-run] novanas --stop <run-id>
+#
+# Runs `cargo test --no-fail-fast <selection> -- --include-ignored --show-output`, so one run
+# reports every failing test target. <selection> defaults to --workspace; anything after `--`
+# replaces it (e.g. `-- -p turbine-kernels --test hip_ops`), and a second `--` passes the rest
+# to the test harness after ours (e.g. `-- -p turbine-model --test golden -- logits_match`).
+# The default run skips hf_reference_matches_cpu (the Hugging Face transformers CPU reference:
+# the golden references are committed, it only matters when regenerating them);
+# --with-hf-reference runs it and installs uv for it.
 #
 # dgx-spark / dgx-spark2: `docker run --rm --gpus all` of rust:1.97-trixie (container
 #   turbine-lab-test only; production vLLM containers are never touched).
-# novanas: k3s Job scripts/lab/novanas-test-job.yaml in namespace turbine-ci (amd.com/gpu: 2).
-# Exit code: the test command's exit code; non-zero with a message naming the failed step.
+# novanas: the k3s Job template scripts/lab/novanas-test-job.yaml in namespace turbine-ci, named
+#   turbine-lab-test-<run id> so several runs can go side by side. --gpus (default 1) is the
+#   R9700 count the Job requests and the AMD device count the inventory test expects; only the
+#   Phase 0 inventory check needs 2. The tree and the test command (NUL-separated argv) are
+#   uploaded to /home/piwi/turbine-ci/runs/<run id>; the Job syncs the tree into a cached
+#   workspace slot (see the template for the cache layout and the per-slot target dirs).
+#   Ctrl-C or a failed start deletes this run's Job and nothing else; `--stop <run-id>` does the
+#   same for a run started elsewhere.
+# --dry-run prints every command that would contact the host (and the rendered Job) instead of
+#   running it.
+# Exit code: the test command's exit code; 2 for usage errors; otherwise non-zero with a message
+# naming the failed step.
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/lab-test.sh <dgx-spark|dgx-spark2|novanas>" >&2
+	echo "usage: scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas> [--gpus 1|2] [--with-hf-reference] [-- <cargo test args>]" >&2
+	echo "       scripts/lab-test.sh [--dry-run] novanas --stop <run-id>" >&2
 	exit 2
 }
 
-[[ $# -eq 1 ]] || usage
+DRY_RUN=0
+if [[ "${1:-}" == --dry-run ]]; then
+	DRY_RUN=1
+	shift
+fi
+[[ $# -ge 1 ]] || usage
 HOST="$1"
+shift
 case "$HOST" in
 dgx-spark) ADDR=192.168.10.246 ;;
 dgx-spark2) ADDR=192.168.10.245 ;;
@@ -23,90 +50,215 @@ novanas) ADDR=192.168.10.203 ;;
 *) usage ;;
 esac
 
+MODE=run
+GPUS=1
+GPUS_SET=0
+HF_REFERENCE=0
+STOP_RUN=""
+CARGO_ARGS=()
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--gpus)
+		[[ $# -ge 2 && "$2" =~ ^[12]$ ]] || usage
+		GPUS="$2"
+		GPUS_SET=1
+		shift 2
+		;;
+	--with-hf-reference)
+		HF_REFERENCE=1
+		shift
+		;;
+	--stop)
+		[[ $# -eq 2 && "$2" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || usage
+		MODE=stop
+		STOP_RUN="$2"
+		shift 2
+		;;
+	--)
+		shift
+		CARGO_ARGS=("$@")
+		break
+		;;
+	*) usage ;;
+	esac
+done
+if [[ "$HOST" != novanas && ($MODE == stop || $GPUS_SET -eq 1) ]]; then
+	usage
+fi
+if [[ $MODE == stop && ($GPUS_SET -eq 1 || $HF_REFERENCE -eq 1 || ${#CARGO_ARGS[@]} -gt 0) ]]; then
+	usage
+fi
+
+# The test command, one argv: cargo test --no-fail-fast <selection> -- <harness args> [<extra>].
+TEST_CMD=(cargo test --no-fail-fast)
+build_test_command() {
+	local select=() extra=() seen=0 a
+	for a in ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}; do
+		if [[ $seen -eq 0 && "$a" == -- ]]; then
+			seen=1
+		elif [[ $seen -eq 0 ]]; then
+			select+=("$a")
+		else
+			extra+=("$a")
+		fi
+	done
+	[[ ${#select[@]} -gt 0 ]] || select=(--workspace)
+	TEST_CMD+=("${select[@]}" -- --include-ignored --show-output)
+	# The golden references are committed; the Hugging Face transformers CPU reference is only
+	# needed to regenerate them.
+	[[ $HF_REFERENCE -eq 1 ]] || TEST_CMD+=(--skip hf_reference_matches_cpu)
+	TEST_CMD+=(${extra[@]+"${extra[@]}"})
+}
+build_test_command
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE="piwi@${ADDR}"
 CI_ROOT=/home/piwi/turbine-ci
 IMAGE=rust:1.97-trixie
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 NS=turbine-ci
-JOB=turbine-lab-test
+# Short, unique and DNS-1123 safe: UTC time plus 30 random bits.
+RUN_ID="$(date -u +%m%d%H%M%S)-$(printf '%08x' $(((RANDOM << 15) | RANDOM)))"
+[[ $MODE == stop ]] && RUN_ID="$STOP_RUN"
+JOB="turbine-lab-test-${RUN_ID}"
+RUN_DIR="${CI_ROOT}/runs/${RUN_ID}"
 
 fail() {
 	echo "lab-test: ${HOST}: $1" >&2
 	exit "${2:-1}"
 }
 
+say() {
+	echo "lab-test: ${HOST}: $*"
+}
+
+# Runs a local command, or prints it under --dry-run.
+run() {
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ $*"
+	else
+		"$@"
+	fi
+}
+
 # Arguments are one remote shell command, expanded locally on purpose.
 # shellcheck disable=SC2029
 remote() {
-	ssh "${SSH_OPTS[@]}" "$REMOTE" "$@"
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ ssh ${SSH_OPTS[*]} ${REMOTE} '$*'"
+	else
+		ssh "${SSH_OPTS[@]}" "$REMOTE" "$@"
+	fi
 }
 
-echo "lab-test: ${HOST}: preparing ${CI_ROOT}"
-remote "mkdir -p ${CI_ROOT}/src ${CI_ROOT}/target ${CI_ROOT}/cargo-registry" ||
-	fail "ssh to ${REMOTE} failed"
-
-echo "lab-test: ${HOST}: syncing working tree"
-rsync -az --delete --exclude 'target/' --exclude '.git/' \
-	-e "ssh ${SSH_OPTS[*]}" "${REPO_ROOT}/" "${REMOTE}:${CI_ROOT}/src/" ||
-	fail "rsync to ${REMOTE}:${CI_ROOT}/src failed"
-
-run_spark() {
-	remote "command -v docker >/dev/null" || fail "docker is not available on ${HOST}"
-	# Only our own container name is ever removed (a leftover from an aborted run).
-	remote "docker rm -f ${JOB} >/dev/null 2>&1 || true"
-	echo "lab-test: ${HOST}: docker run ${IMAGE} cargo test --workspace -- --include-ignored"
-	set +e
-	remote "docker run --rm --gpus all --name ${JOB} --memory 32g \
-    -v ${CI_ROOT}/src:/src -v ${CI_ROOT}/target:/target -v turbine-cargo:/usr/local/cargo/registry \
-    -e CARGO_TARGET_DIR=/target -e TURBINE_EXPECT_NVIDIA=1 -e TURBINE_EXPECT_NVIDIA_MEMORY=unified \
-    -w /src ${IMAGE} cargo test --workspace -- --include-ignored --show-output"
-	local code=$?
-	set -e
-	case "$code" in
-	0) echo "lab-test: ${HOST}: PASS" ;;
-	125 | 126 | 127) fail "docker run failed (exit ${code})" "$code" ;;
-	255) fail "ssh connection lost during the test run" 255 ;;
-	*) fail "tests failed (exit ${code})" "$code" ;;
-	esac
+# Like remote, with stdin passed through (shown under --dry-run).
+# shellcheck disable=SC2029
+remote_stdin() {
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ ssh ${SSH_OPTS[*]} ${REMOTE} '$*' <<'EOF'"
+		tr '\0' '\n'
+		echo "EOF"
+	else
+		# Same kubectl warning filter as kube.
+		ssh "${SSH_OPTS[@]}" "$REMOTE" "$@" 2> >(grep -v -e 'permission denied' >&2)
+	fi
 }
 
 kube() {
 	# kubectl on novanas warns about unreadable config files for user piwi. KUBECTL_KUBERC=false
 	# silences the kuberc warning (it lacks a trailing newline, so a following error would share
 	# its line); the remaining k3s config.yaml warnings are whole lines and only those are dropped.
-	remote "export KUBECTL_KUBERC=false; kubectl $*" 2> >(grep -v -e 'permission denied' >&2)
+	if [[ $DRY_RUN -eq 1 ]]; then
+		remote "export KUBECTL_KUBERC=false; kubectl $*"
+	else
+		remote "export KUBECTL_KUBERC=false; kubectl $*" 2> >(grep -v -e 'permission denied' >&2)
+	fi
 }
 
-run_novanas() {
-	remote "command -v kubectl >/dev/null" || fail "kubectl is not available on ${HOST}"
-	kube "create namespace ${NS} --dry-run=client -o yaml | kubectl apply -f - >/dev/null" ||
-		fail "cannot create namespace ${NS}"
-	kube "-n ${NS} delete job ${JOB} --ignore-not-found --wait=true >/dev/null" ||
-		fail "cannot delete the previous ${JOB} job"
-	kube "apply -f ${CI_ROOT}/src/scripts/lab/novanas-test-job.yaml" || fail "kubectl apply failed"
+upload_tree() {
+	say "syncing working tree to ${1}"
+	run rsync -az --delete --exclude target/ --exclude .git/ --exclude .claude/ \
+		-e "ssh ${SSH_OPTS[*]}" "${REPO_ROOT}/" "${REMOTE}:${1}/" ||
+		fail "rsync to ${REMOTE}:${1} failed"
+}
 
-	# Wait for the pod to start (or finish); give up when it stays unschedulable.
+run_spark() {
+	say "preparing ${CI_ROOT}"
+	remote "mkdir -p ${CI_ROOT}/src ${CI_ROOT}/target ${CI_ROOT}/cargo-registry" ||
+		fail "ssh to ${REMOTE} failed"
+	upload_tree "${CI_ROOT}/src"
+	remote "command -v docker >/dev/null" || fail "docker is not available on ${HOST}"
+	# Only our own container name is ever removed (a leftover from an aborted run).
+	remote "docker rm -f turbine-lab-test >/dev/null 2>&1 || true"
+	local cmd
+	cmd="$(printf '%q ' "${TEST_CMD[@]}")"
+	say "docker run ${IMAGE} ${cmd}"
+	set +e
+	remote "docker run --rm --gpus all --name turbine-lab-test --memory 32g \
+    -v ${CI_ROOT}/src:/src -v ${CI_ROOT}/target:/target -v turbine-cargo:/usr/local/cargo/registry \
+    -e CARGO_TARGET_DIR=/target -e TURBINE_EXPECT_NVIDIA=1 -e TURBINE_EXPECT_NVIDIA_MEMORY=unified \
+    -w /src ${IMAGE} ${cmd}"
+	local code=$?
+	set -e
+	if [[ $DRY_RUN -eq 1 ]]; then
+		say "dry run: nothing contacted"
+		return
+	fi
+	case "$code" in
+	0) say "PASS" ;;
+	125 | 126 | 127) fail "docker run failed (exit ${code})" "$code" ;;
+	255) fail "ssh connection lost during the test run" 255 ;;
+	*) fail "tests failed (exit ${code})" "$code" ;;
+	esac
+}
+
+# Deletes this run's Job and upload, nothing else.
+cleanup_novanas() {
+	kube "-n ${NS} delete job ${JOB} --ignore-not-found" >/dev/null || true
+	remote "rm -rf ${RUN_DIR}" || true
+}
+
+on_interrupt() {
+	trap - INT TERM
+	echo "lab-test: ${HOST}: interrupted; deleting job ${JOB}" >&2
+	cleanup_novanas
+	exit 130
+}
+
+render_job() {
+	sed -e "s/__RUN_ID__/${RUN_ID}/g" -e "s/__GPUS__/${GPUS}/g" \
+		"${REPO_ROOT}/scripts/lab/novanas-test-job.yaml"
+}
+
+wait_for_pod() {
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ wait until pod job-name=${JOB} runs (unschedulable limit 120 s)"
+		return
+	fi
 	local waited=0 phase="" unschedulable=""
 	while :; do
-		phase="$(kube "-n ${NS} get pods -l job-name=${JOB} -o jsonpath='{.items[0].status.phase}'" || true)"
-		[[ "$phase" == Running || "$phase" == Succeeded || "$phase" == Failed ]] && break
-		unschedulable="$(kube "-n ${NS} get pods -l job-name=${JOB} -o jsonpath='{.items[0].status.conditions[?(@.reason==\"Unschedulable\")].message}'" || true)"
+		phase="$(kube "-n ${NS} get pods -l job-name=${JOB} -o jsonpath='{.items[*].status.phase}'" || true)"
+		[[ "$phase" == Running || "$phase" == Succeeded || "$phase" == Failed ]] && return 0
+		unschedulable="$(kube "-n ${NS} get pods -l job-name=${JOB} -o jsonpath='{.items[*].status.conditions[?(@.reason==\"Unschedulable\")].message}'" || true)"
 		if [[ -n "$unschedulable" && $waited -ge 120 ]]; then
-			kube "-n ${NS} delete job ${JOB} --ignore-not-found >/dev/null" || true
-			fail "pod unschedulable for 120 s (${unschedulable}); amd.com/gpu is held by another workload — ask the user to free the GPUs"
+			cleanup_novanas
+			fail "pod unschedulable for 120 s (${unschedulable}); ${GPUS} amd.com/gpu is not free — another workload holds it; ask the user"
 		fi
 		if [[ $waited -ge 1800 ]]; then
-			kube "-n ${NS} delete job ${JOB} --ignore-not-found >/dev/null" || true
+			cleanup_novanas
 			fail "pod did not start within 30 min (phase: ${phase:-none})"
 		fi
 		sleep 5
 		waited=$((waited + 5))
 	done
+}
 
-	echo "lab-test: ${HOST}: streaming pod log"
-	kube "-n ${NS} logs -f job/${JOB}" || echo "lab-test: ${HOST}: log stream ended with an error" >&2
-
+wait_for_result() {
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ wait until job ${JOB} succeeds or fails; exit with the test exit code"
+		say "dry run: nothing contacted"
+		return
+	fi
 	# The Job has activeDeadlineSeconds (5400), so it always reaches a terminal state.
 	local succeeded="" failed=""
 	while :; do
@@ -116,16 +268,49 @@ run_novanas() {
 		sleep 5
 	done
 	if [[ "$succeeded" == 1 ]]; then
-		echo "lab-test: ${HOST}: PASS"
+		say "PASS (job ${JOB})"
 		return 0
 	fi
 	local code
-	code="$(kube "-n ${NS} get pods -l job-name=${JOB} -o jsonpath='{.items[0].status.containerStatuses[0].state.terminated.exitCode}'" || true)"
+	code="$(kube "-n ${NS} get pods -l job-name=${JOB} -o jsonpath='{.items[*].status.containerStatuses[0].state.terminated.exitCode}'" || true)"
 	[[ "$code" =~ ^[0-9]+$ && "$code" -ne 0 ]] || code=1
-	fail "tests failed (exit ${code})" "$code"
+	fail "tests failed (exit ${code}, job ${JOB})" "$code"
 }
 
-case "$HOST" in
-dgx-spark | dgx-spark2) run_spark ;;
-novanas) run_novanas ;;
+run_novanas() {
+	say "run ${RUN_ID}: job ${JOB}, ${GPUS} GPU(s)"
+	remote "mkdir -p ${RUN_DIR}/src ${CI_ROOT}/cache/slots && find ${CI_ROOT}/runs -mindepth 1 -maxdepth 1 -mmin +1440 -exec rm -rf {} +" ||
+		fail "ssh to ${REMOTE} failed"
+	[[ $DRY_RUN -eq 1 ]] || trap on_interrupt INT TERM
+	upload_tree "${RUN_DIR}/src"
+	say "test command: ${TEST_CMD[*]}"
+	local cmd_file="cat > ${RUN_DIR}/test-command"
+	[[ $HF_REFERENCE -eq 1 ]] && cmd_file+=" && touch ${RUN_DIR}/hf-reference"
+	printf '%s\0' "${TEST_CMD[@]}" | remote_stdin "$cmd_file" ||
+		fail "writing the test command failed"
+
+	remote "command -v kubectl >/dev/null" || fail "kubectl is not available on ${HOST}"
+	kube "create namespace ${NS} --dry-run=client -o yaml | kubectl apply -f - >/dev/null" ||
+		fail "cannot create namespace ${NS}"
+	say "applying scripts/lab/novanas-test-job.yaml as ${JOB}"
+	render_job | remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" ||
+		fail "kubectl apply failed"
+
+	wait_for_pod
+	say "streaming pod log"
+	kube "-n ${NS} logs -f job/${JOB}" || echo "lab-test: ${HOST}: log stream ended with an error" >&2
+	wait_for_result
+}
+
+stop_novanas() {
+	say "deleting job ${JOB} in namespace ${NS}"
+	kube "-n ${NS} delete job ${JOB} --ignore-not-found --wait=true" || fail "cannot delete job ${JOB}"
+	remote "rm -rf ${RUN_DIR}" || fail "cannot remove ${RUN_DIR}"
+	if [[ $DRY_RUN -eq 1 ]]; then say "dry run: nothing contacted"; else say "stopped"; fi
+}
+
+case "$HOST:$MODE" in
+novanas:run) run_novanas ;;
+novanas:stop) stop_novanas ;;
+*) run_spark ;;
 esac

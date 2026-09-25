@@ -1,17 +1,21 @@
-# k3s Job run by scripts/lab-serve.sh novanas <config.yaml>: turbine-server on one R9700 for
-# manual golden and benchmark runs, listening on the host network (server.listen of the config,
-# 0.0.0.0:18000 in scripts/lab/phase1-novanas.yaml). The script copies the config to
-# /home/piwi/turbine-ci/serve/config.yaml before applying this Job. Setup and mounts match
-# novanas-test-job.yaml: cmake + python3 from Debian, libturbine_hip.so built from kernels/rocm,
-# then the release turbine-server. Each step prints `lab-step: <name>`; a failing step prints
+# k3s Job template run by scripts/lab-serve.sh novanas <config.yaml>: turbine-server on one R9700
+# for manual golden and benchmark runs, listening on the host network (server.listen of the
+# config, 0.0.0.0:18000 in scripts/lab/phase1-novanas.yaml). The script renders the RUN_ID
+# placeholder (a unique Job name) and uploads the tree to /home/piwi/turbine-ci/runs/<run id>/src and the config
+# to runs/<run id>/config.yaml before applying it. Caches and slot handling match
+# novanas-test-job.yaml, with the single release workspace slot cache/slots/serve-0 (one server
+# at a time: the port is fixed), so the release build never shares a target dir with the debug
+# test builds. Each step prints `lab-step: <name>`; a failing step prints
 # `lab-step failed: <name>`. The Job runs until `scripts/lab-serve.sh novanas --stop`.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: turbine-lab-serve
+  name: turbine-lab-serve-__RUN_ID__
   namespace: turbine-ci
   labels:
     turbine-lab: "true"
+    turbine-lab-role: serve
+    turbine-lab-run: "__RUN_ID__"
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 600
@@ -19,13 +23,15 @@ spec:
     metadata:
       labels:
         turbine-lab: "true"
+        turbine-lab-role: serve
+        turbine-lab-run: "__RUN_ID__"
     spec:
       restartPolicy: Never
       hostNetwork: true
       containers:
         - name: serve
           image: rust:1.97-trixie
-          workingDir: /home/piwi/turbine-ci/src
+          workingDir: /home/piwi/turbine-ci
           command: ["bash", "-c"]
           args:
             - |
@@ -34,15 +40,50 @@ spec:
               step() { STEP="$1"; echo "lab-step: $1"; }
               trap 'echo "lab-step failed: ${STEP}" >&2' ERR
               export DEBIAN_FRONTEND=noninteractive
+              RUN_DIR="$TURBINE_LAB_ROOT/runs/$TURBINE_LAB_RUN_ID"
 
-              step "install cmake python3"
-              apt-get update -qq >/dev/null
-              apt-get install -y -qq cmake python3 >/dev/null
+              step "install cmake ninja python3 rsync"
+              # Keep downloaded packages in the shared apt cache; refresh the lists at most every 6 h.
+              rm -f /etc/apt/apt.conf.d/docker-clean
+              mkdir -p /var/cache/apt/archives/partial /var/lib/apt/lists/partial
+              if [[ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' -mmin -360 -print -quit)" ]]; then
+                apt-get update -qq >/dev/null
+              fi
+              apt-get install -y -qq cmake ninja-build python3 rsync >/dev/null
               cmake --version | head -n 1
 
+              step "take the serve workspace slot"
+              SLOT=serve-0
+              SLOT_DIR="$TURBINE_LAB_CACHE/slots/$SLOT"
+              exec {LOCK_FD}>"$TURBINE_LAB_CACHE/slots/$SLOT.lock"
+              flock -w 1800 "$LOCK_FD"
+              export CARGO_TARGET_DIR="$SLOT_DIR/target"
+              export KERNEL_BUILD_DIR="$SLOT_DIR/kernels"
+              export TURBINE_KERNEL_LIBRARY="$KERNEL_BUILD_DIR/libturbine_hip.so"
+              mkdir -p "$SLOT_DIR/src" "$CARGO_TARGET_DIR" "$KERNEL_BUILD_DIR"
+              echo "lab-step: slot $SLOT (CARGO_TARGET_DIR=$CARGO_TARGET_DIR)"
+
+              step "sync the uploaded tree into the slot"
+              rsync -a --delete "$RUN_DIR/src/" "$SLOT_DIR/src/"
+              cp "$RUN_DIR/config.yaml" "$SLOT_DIR/config.yaml"
+              rm -rf "$RUN_DIR"
+              cd "$SLOT_DIR/src"
+
               step "build kernels/rocm"
-              cmake -S kernels/rocm -B "$KERNEL_BUILD_DIR" \
-                -DCMAKE_HIP_COMPILER="$TURBINE_ROCM_PATH/bin/hipcc" -DGPU_TARGETS=gfx1201
+              # A cache configured from another source tree or generator makes cmake refuse the
+              # build dir; drop only the cache (the fetched Composable Kernel sources are kept).
+              if [[ -f "$KERNEL_BUILD_DIR/CMakeCache.txt" ]] && {
+                ! grep -qx "CMAKE_HOME_DIRECTORY:INTERNAL=$PWD/kernels/rocm" "$KERNEL_BUILD_DIR/CMakeCache.txt" ||
+                  ! grep -qx "CMAKE_GENERATOR:INTERNAL=Ninja" "$KERNEL_BUILD_DIR/CMakeCache.txt"
+              }; then
+                echo "lab-step: resetting $KERNEL_BUILD_DIR cache from another source tree or generator"
+                rm -rf "$KERNEL_BUILD_DIR/CMakeCache.txt" "$KERNEL_BUILD_DIR/CMakeFiles"
+              fi
+              # Configure once; afterwards ninja re-runs cmake by itself when a CMakeLists changes.
+              if [[ ! -f "$KERNEL_BUILD_DIR/CMakeCache.txt" ]]; then
+                cmake -S kernels/rocm -B "$KERNEL_BUILD_DIR" -G Ninja \
+                  -DCMAKE_HIP_COMPILER="$TURBINE_ROCM_PATH/bin/hipcc" -DGPU_TARGETS=gfx1201
+              fi
               cmake --build "$KERNEL_BUILD_DIR" --parallel "$(nproc)"
               test -f "$TURBINE_KERNEL_LIBRARY"
               echo "lab-step: built $TURBINE_KERNEL_LIBRARY"
@@ -51,10 +92,15 @@ spec:
               cargo build --release -p turbine-server
 
               step "turbine-server"
-              exec "$CARGO_TARGET_DIR/release/turbine-server" --config /home/piwi/turbine-ci/serve/config.yaml
+              # exec keeps the slot lock (LOCK_FD is inherited) while the server runs.
+              exec "$CARGO_TARGET_DIR/release/turbine-server" --config "$SLOT_DIR/config.yaml"
           env:
-            - name: CARGO_TARGET_DIR
-              value: /home/piwi/turbine-ci/target
+            - name: TURBINE_LAB_RUN_ID
+              value: "__RUN_ID__"
+            - name: TURBINE_LAB_ROOT
+              value: /home/piwi/turbine-ci
+            - name: TURBINE_LAB_CACHE
+              value: /home/piwi/turbine-ci/cache
             - name: LD_LIBRARY_PATH
               value: /opt/rocm/rocm/lib:/opt/rocm/rocm/lib/rocm_sysdeps/lib
             - name: TURBINE_AMD_SMI_LIBRARY
@@ -63,10 +109,6 @@ spec:
             # symlink; inside the container the real versioned tree is the ROCm root.
             - name: TURBINE_ROCM_PATH
               value: /opt/rocm/rocm/core-7.14
-            - name: KERNEL_BUILD_DIR
-              value: /home/piwi/turbine-ci/target/kernels
-            - name: TURBINE_KERNEL_LIBRARY
-              value: /home/piwi/turbine-ci/target/kernels/libturbine_hip.so
           resources:
             limits:
               amd.com/gpu: 1
@@ -75,6 +117,12 @@ spec:
               mountPath: /home/piwi/turbine-ci
             - name: cargo-registry
               mountPath: /usr/local/cargo/registry
+            - name: cargo-git
+              mountPath: /usr/local/cargo/git
+            - name: apt-archives
+              mountPath: /var/cache/apt/archives
+            - name: apt-lists
+              mountPath: /var/lib/apt/lists
             - name: rocm
               mountPath: /opt/rocm/rocm
               readOnly: true
@@ -93,7 +141,19 @@ spec:
             type: Directory
         - name: cargo-registry
           hostPath:
-            path: /home/piwi/turbine-ci/cargo-registry
+            path: /home/piwi/turbine-ci/cache/cargo/registry
+            type: DirectoryOrCreate
+        - name: cargo-git
+          hostPath:
+            path: /home/piwi/turbine-ci/cache/cargo/git
+            type: DirectoryOrCreate
+        - name: apt-archives
+          hostPath:
+            path: /home/piwi/turbine-ci/cache/apt/archives
+            type: DirectoryOrCreate
+        - name: apt-lists
+          hostPath:
+            path: /home/piwi/turbine-ci/cache/apt/lists
             type: DirectoryOrCreate
         - name: rocm
           hostPath:
