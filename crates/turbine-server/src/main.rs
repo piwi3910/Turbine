@@ -2,6 +2,9 @@
 
 mod cli;
 mod exit;
+mod generation;
+mod metrics;
+mod model;
 mod startup;
 
 use clap::Parser;

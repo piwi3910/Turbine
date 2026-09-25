@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use turbine_model::testing::TempDir;
+use turbine_model::testing::tiny::write_tiny_llama;
+
 const POLL: Duration = Duration::from_millis(20);
 
 /// A config file in a per-test directory, removed on drop.
@@ -167,14 +170,48 @@ fn invalid_config_exits_2_before_bind() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "config ok");
 }
 
+/// A tiny synthetic checkpoint served as `m` on the cpu reference backend (Phase 1 needs a
+/// loadable model before the listener binds). The directory is removed on drop.
+fn tiny_model_yaml(addr: SocketAddr) -> (TempDir, String) {
+    let dir = TempDir::new("turbine-server-cli-model");
+    write_tiny_llama(dir.path(), 7);
+    let yaml = format!(
+        "model:\n  path: {}\n  served_name: m\n  max_seq_len: 64\nserver:\n  listen: {addr}\n\
+         execution:\n  backend: cpu\nreliability:\n  emergency_vram_reserve: 1MiB\n",
+        dir.path().display()
+    );
+    (dir, yaml)
+}
+
+/// Poll `GET /ready` until 200; fail early if the server exits.
+fn wait_until_ready(child: &mut Child, addr: SocketAddr) {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(60) {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("turbine-server exited early ({status})");
+        }
+        if let Ok(mut s) = TcpStream::connect(addr) {
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            s.write_all(b"GET /ready HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).ok();
+            if resp.starts_with("HTTP/1.1 200") {
+                return;
+            }
+        }
+        std::thread::sleep(POLL);
+    }
+    child.kill().ok();
+    panic!("turbine-server never became ready on {addr}");
+}
+
 #[test]
 fn port_in_use_exits_1() {
     let holder = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = holder.local_addr().unwrap();
-    let cfg = TempConfig::new(
-        "port-in-use",
-        &format!("model:\n  path: /m\nserver:\n  listen: {addr}\n"),
-    );
+    let (_model, yaml) = tiny_model_yaml(addr);
+    let cfg = TempConfig::new("port-in-use", &yaml);
     let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(20));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
@@ -189,12 +226,11 @@ fn port_in_use_exits_1() {
 #[test]
 fn sigterm_graceful_shutdown() {
     let addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
-    let cfg = TempConfig::new(
-        "sigterm",
-        &format!("model:\n  path: /m\nserver:\n  listen: {addr}\n"),
-    );
+    let (_model, yaml) = tiny_model_yaml(addr);
+    let cfg = TempConfig::new("sigterm", &yaml);
     let mut child = spawn_server(&[], &cfg.path);
     wait_until_serving(&mut child, addr);
+    wait_until_ready(&mut child, addr);
 
     // Put a request in flight: headers plus 10 of 30 declared body bytes. `Expect: 100-continue`
     // makes the server say when the handler starts reading the body, so the request is provably
@@ -227,8 +263,11 @@ fn sigterm_graceful_shutdown() {
     conn.write_all(&body[10..]).unwrap();
     let mut resp = String::new();
     conn.read_to_string(&mut resp).unwrap();
-    assert!(resp.starts_with("HTTP/1.1 503"), "response: {resp}");
-    assert!(resp.contains("model_not_loaded"), "response: {resp}");
+    assert!(resp.starts_with("HTTP/1.1 200"), "response: {resp}");
+    assert!(
+        resp.contains(r#""object":"text_completion""#),
+        "response: {resp}"
+    );
 
     let out = wait_with_timeout(child, Duration::from_secs(5));
     assert!(signalled.elapsed() < Duration::from_secs(5));

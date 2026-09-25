@@ -1906,14 +1906,19 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "prometheus-client",
  "serde",
  "serde_json",
+ "smallvec",
  "tokio",
  "tracing",
  "turbine-api",
  "turbine-core",
  "turbine-device",
+ "turbine-kernels",
+ "turbine-model",
  "turbine-observability",
+ "turbine-tensor",
 ]
 
 [[package]]

@@ -17,6 +17,16 @@ turbine-api.workspace = true
 turbine-core.workspace = true
 turbine-device.workspace = true
 turbine-observability.workspace = true
+# Device memory backends: HostMemory for the cpu reference backend
+turbine-tensor.workspace = true
+# Kernel shim loading, the cpu-reference provider and the kernel registry
+turbine-kernels.workspace = true
+# Model config, tokenizer, chat template, budget, weight loader, executor and generation loop
+turbine-model.workspace = true
+# turbine_requests_total, turbine_request_{ttft,itl,e2e}_seconds, turbine_tokens_total
+prometheus-client.workspace = true
+# EOS id lists (turbine_core::request::StopConditions)
+smallvec.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
