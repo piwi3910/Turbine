@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repository.
 
 ## Project state
 
-Turbine is a Rust LLM inference engine (reliability-first, hierarchical KV cache, no Python/PyTorch in the serving path). The repository holds the spec plus the Phase 0 skeleton: six crates (`crates/turbine-{core,observability,device,api,server}`, `benches/turbine-bench`) that serve the V1 route surface without a model. `turbine-spec.md` is the original product vision; the work is driven by procoder's chain in `.procoder/`:
+Turbine is a Rust LLM inference engine (reliability-first, hierarchical KV cache, no Python/PyTorch in the serving path). The repository holds the spec, the Phase 0 skeleton (`crates/turbine-{core,observability,device,api,server}`, `benches/turbine-bench`) and the Phase 1 single-request path under construction: `crates/turbine-{tensor,kernels,model}`, the vendor-neutral kernel C ABI `kernels/include/turbine_kernels.h` and the HIP shim `kernels/rocm/` (_libturbine_hip.so_), serving Llama-3.2-3B-Instruct (BF16) on one R9700 in `novanas`. `turbine-spec.md` is the original product vision; the work is driven by procoder's chain in `.procoder/`:
 
 - `.procoder/specs/phase-*.md` — one complete spec per phase (0, 1, 2, 2b, 3–8). Where a phase spec amends `turbine-spec.md`, the phase spec wins.
 - `.procoder/plans/phase-*.md` — one implementation plan per phase; build task by task, test first, gate-clean, one commit per task.
@@ -15,7 +15,7 @@ If reality contradicts a spec or plan mid-build, update the spec/plan first and 
 
 ## Commands
 
-Toolchain: Rust 1.97, edition 2024 (workspace `rust-version`). No GPU is needed to build or test: GPU libraries (NVML, amd-smi) are loaded at runtime, and GPU-dependent tests are `#[ignore]`d and run only on the lab hosts.
+Toolchain: Rust 1.97, edition 2024 (workspace `rust-version`). No GPU, ROCm install or model weights are needed to build or test: GPU libraries (NVML, amd-smi, _libturbine_hip.so_) are loaded at runtime, and GPU- or weights-dependent tests are `#[ignore]`d and run only on the lab hosts.
 
 - Build: `cargo build --workspace`
 - Test: `cargo test --workspace`
@@ -24,11 +24,29 @@ Toolchain: Rust 1.97, edition 2024 (workspace `rust-version`). No GPU is needed 
 - One integration test: `cargo test -p turbine-api --test api route_table_phase0`
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Format: `cargo fmt --all` (check only: `cargo fmt --all --check`)
-- Lab test: `scripts/lab-test.sh novanas|dgx-spark|dgx-spark2` — rsyncs the tree and runs `cargo test --workspace -- --include-ignored` on that host; exits with the test exit code. **Ask the user before every lab run** (the hosts are shared; the GPUs may be held by other workloads). Phase 0 runs `novanas` only; the Spark branches are exercised from Phase 2b.
+- No vendor GPU crate in the dependency tree: `! cargo tree --workspace | grep -Ei 'hip|rocm|cuda'`
 - Validate a config: `cargo run -p turbine-server -- --config examples/turbine.yaml --check-config`
-- Run the server: `cargo run -p turbine-server -- --config examples/turbine.yaml --set server.listen=127.0.0.1:8000` (`--set <dotted.key>=<yaml value>` overrides any key; stop with Ctrl-C or SIGTERM). Exit codes: `0` clean shutdown, `1` runtime failure (port bind, explicitly configured GPU library fails to load), `2` invalid configuration (reported before any port is bound).
-- Bench help: `cargo run -p turbine-bench -- --help`
-- Bench run: `cargo run --release -p turbine-bench -- --url http://127.0.0.1:8000 --concurrency 2 --requests 10 --output json` — `http://` only; needs an OpenAI-compatible endpoint that serves a model: a local or `novanas` Turbine from Phase 1 on (the Phase 0 server lists no models, so the bench exits 2 there; add `--model <id>` to skip the `/v1/models` lookup). Ask before any lab benchmark run. Exit codes: `0` at least one request succeeded, `1` every request failed or the target cannot be queried, `2` usage error (bad flags, non-`http://` URL, no model to target).
+- Run the server: `cargo run -p turbine-server -- --config examples/turbine.yaml --set server.listen=127.0.0.1:8000` (`--set <dotted.key>=<yaml value>` overrides any key; stop with Ctrl-C or SIGTERM). Exit codes: `0` clean shutdown, `1` runtime failure (port bind, explicitly configured GPU library fails to load, model directory or kernel library unusable), `2` invalid configuration (reported before any port is bound).
+- Run the server with a model (Phase 1; needs a HIP device, the weights and _libturbine_hip.so_, so in practice use `scripts/lab-serve.sh` below): `cargo run --release -p turbine-server -- --config examples/turbine.yaml --set model.path=<model-dir> --set execution.kernel_library=<build>/libturbine_hip.so`. `/ready` answers 503 `loading_model` until warm-up is done, then 200; one generation runs at a time (a second concurrent request gets 429 `engine_busy`).
+- Build the HIP kernel library (ROCm host only; the lab Jobs do this for you): `cmake -S kernels/rocm -B <build> -DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 && cmake --build <build>` produces `<build>/libturbine_hip.so`; `TURBINE_ROCM_PATH` overrides `/opt/rocm/rocm`. `execution.kernel_library: null` finds it via `TURBINE_KERNEL_LIBRARY`, then beside the executable, then the loader path.
+- GPU/weights tests read `TURBINE_TEST_BACKEND` (`hip`), `TURBINE_KERNEL_LIBRARY` and `TURBINE_TEST_MODEL_DIR`; an unset backend variable or a missing model directory fails the test (never skips, never downloads). Run them through `scripts/lab-test.sh`, not locally.
+- Bench help: `cargo run -p turbine-bench --bin turbine-bench -- --help` (the package has two binaries, so `--bin` is required)
+- Bench run: `cargo run --release -p turbine-bench --bin turbine-bench -- --url http://127.0.0.1:8000 --concurrency 1 --requests 10 --output json` — `http://` only; needs an OpenAI-compatible endpoint that serves a model (a Turbine server with a model, or `novanas` below; the Phase 0 server lists no models, so the bench exits 2 there; add `--model <id>` to skip the `/v1/models` lookup). Keep `--concurrency 1` against a Phase 1 Turbine: it runs one generation at a time. Exit codes: `0` at least one request succeeded, `1` every request failed or the target cannot be queried, `2` usage error (bad flags, non-`http://` URL, no model to target).
+- Golden compare: `cargo run --release -p turbine-bench --bin turbine-golden -- compare --url <base> --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl [--output json]` — replays every prompt of `tests/golden/prompts.jsonl` greedily and judges it against `tolerance.json` beside the reference. Exit `0` tolerance holds, `1` violated or the endpoint fails, `2` usage or I/O error.
+- Golden capture (record another engine alongside the committed reference): `cargo run --release -p turbine-bench --bin turbine-golden -- capture --url <base> --prompts tests/golden/prompts.jsonl --out <reference.jsonl>`
+- Golden reference from Hugging Face transformers (fixture generation only, never the serving path; run on a host holding the weights, CPU is enough for 3B): `uv run scripts/golden/hf_reference.py --model-dir <model-dir> --prompts tests/golden/prompts.jsonl --out tests/golden/llama-3.2-3b-instruct/reference.jsonl`. Chat-template render fixture: `uv run scripts/golden/render_fixture.py <tokenizer-dir> --out <file>`.
+
+Lab hosts (`novanas` 192.168.10.203 with two Radeon R9700s under k3s; `dgx-spark` / `dgx-spark2` with GB10):
+
+- Lab test: `scripts/lab-test.sh novanas|dgx-spark|dgx-spark2` — rsyncs the tree and runs `cargo test --workspace -- --include-ignored` on that host; exits with the test exit code. On `novanas` the k3s Job `scripts/lab/novanas-test-job.yaml` (namespace `turbine-ci`, `amd.com/gpu: 2`) also builds _libturbine_hip.so_, installs `uv` for the reference script and mounts the weights read-only at `/models` (`TURBINE_TEST_MODEL_DIR=/models/llama-3.2-3b-instruct`). Phases 0–2 run `novanas` only; the Spark branches are exercised from Phase 2b.
+- Lab server: `scripts/lab-serve.sh novanas scripts/lab/phase1-novanas.yaml` — rsyncs the tree, applies the k3s Job `scripts/lab/novanas-serve-job.yaml` (one R9700, host network), builds the kernel library and the release `turbine-server`, streams the log and exits 0 once `http://192.168.10.203:18000/ready` answers 200, leaving the server running. Stop it with `scripts/lab-serve.sh novanas --stop` (deletes that Job and nothing else). `scripts/lab-serve.sh --dry-run novanas <config.yaml>|--stop` prints every command that would contact the host instead of running it; `TURBINE_LAB_SERVE_TIMEOUT` (seconds, default 3600) bounds the wait for `/ready`.
+- Phase 1 golden and baseline runs against the lab server: `cargo run --release -p turbine-bench --bin turbine-golden -- compare --url http://192.168.10.203:18000 --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl`; single-request baseline `cargo run --release -p turbine-bench --bin turbine-bench -- --url http://192.168.10.203:18000 --concurrency 1 --requests 10 --max-tokens 128 --ignore-eos --output json`; real-stream check (natural EOS) `cargo run --release -p turbine-bench --bin turbine-bench -- --url http://192.168.10.203:18000 --concurrency 1 --requests 10 --output json` — expect `"requests_ok": 10`, `ttft_ms.p50` > 0 and `output_token_throughput` > 0.
+- Weights: provisioned once over SSH under `/home/piwi/turbine-models/<slug>` on `novanas` (Phase 1: `unsloth/Llama-3.2-3B-Instruct` at revision `006f5dcd1393c3add266de40994ba96225e9689d` in `/home/piwi/turbine-models/llama-3.2-3b-instruct`, fetched with `hf download … --revision <rev> --local-dir <dir>`). The Hugging Face token lives on `novanas` only (the user ran `hf auth login` there); never ask for it, read it or pass it in a script or command line. Tests and the server never download.
+
+Lab rules — the hosts are shared, and the GPUs may be held by other workloads:
+
+- **Ask the user first** before any lab run by default: every `scripts/lab-test.sh` / `scripts/lab-serve.sh` run, any benchmark against a lab host, anything that needs workloads moved or memory freed, and every run on `dgx-spark` / `dgx-spark2`. Never touch the production vLLM containers on the Sparks.
+- **Standing approval (decision 2026-09-25):** Phase 1 lab Jobs on `novanas` — the HIP library build, the GPU op and golden tests via `scripts/lab-test.sh novanas`, the serve Job via `scripts/lab-serve.sh novanas …`, and the golden and baseline runs above against it — may run without asking while its R9700s are free. If a Job cannot be scheduled because `amd.com/gpu` is held by another workload (`lab-serve.sh` reports this after 120 s), stop and ask the user; never evict or stop someone else's workload. Always `--stop` the serve Job when the runs are done.
 
 ## Architecture (planned — spec §4–§11)
 
@@ -42,8 +60,6 @@ Workspace layout: `crates/turbine-*` (each crate is created in the phase that gi
 - **Distributed-aware from day one**: V1 is single-GPU, but APIs stay multi-device aware; topology is a graph (node/NUMA/PCIe/GPU/NIC with edge bandwidth/latency), never a flat GPU list.
 
 Target order (user decisions): AMD first — Phases 1–2 run Llama-3.2-3B-Instruct (BF16) and then OLMoE-1B-7B on the Radeon R9700s in `novanas` (ROCm/HIP); NVIDIA GB10 (`dgx-spark`, `dgx-spark2`) follows in Phase 2b; Qwen families arrive in Phase 8. OpenAI-compatible API with SSE, tools and JSON-schema output (llguidance), continuous batching with chunked prefill, paged KV, Prometheus metrics. Diagnostics live under `/turbine/v1/*`, separate from the OpenAI routes.
-
-Lab hosts are shared: ask the user before any run that needs workloads moved or memory freed; never touch the production vLLM containers on the Sparks.
 
 ## Engineering rules (spec §21 — binding)
 

@@ -1,5 +1,7 @@
-# Development configuration: the TS §15 example plus the Phase 0 logging/devices sections.
-# model.path is not read in Phase 0 (Phase 1 requires a real model directory).
+# Development configuration: the TS §15 example plus the Phase 0 logging/devices sections and
+# the Phase 1 execution section. From Phase 1 turbine-server loads model.path at startup (exit 1
+# unless it is a directory holding config.json); point it at real weights with
+# --set model.path=<dir>. --check-config validates this file without reading the model.
 server:
   listen: 127.0.0.1:8000
   max_request_bytes: 8MiB
@@ -30,3 +32,12 @@ logging:
 devices:
   nvml_library: null
   amd_smi_library: null
+execution:
+  # Kernel backend: hip (AMD, Phase 1) or cpu (the reference provider; tests and tiny models
+  # only). cuda is rejected (exit 2) until phase-2b-nvidia.
+  backend: hip
+  # Global index from the device inventory (GET /turbine/v1/status); its vendor must match backend.
+  device: 0
+  # null: TURBINE_KERNEL_LIBRARY, then libturbine_hip.so beside the executable, then the loader
+  # path.
+  kernel_library: null
