@@ -8,8 +8,11 @@ use turbine_tensor::MemoryError;
 
 pub mod chat_template;
 pub mod config;
+pub mod safetensors;
+pub mod testing;
 pub mod tokenizer;
 
+pub use crate::safetensors::{SafetensorsIndex, TensorEntry};
 pub use chat_template::ChatTemplate;
 pub use config::{
     Architecture, GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config,
