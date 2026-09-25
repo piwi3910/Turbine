@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod tiny;
+
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 /// A uniquely named directory under `std::env::temp_dir()`, removed with its contents on `Drop`.

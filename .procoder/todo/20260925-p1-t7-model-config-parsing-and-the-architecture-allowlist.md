@@ -12,6 +12,7 @@ Phase 1 plan Task 7 (`.procoder/plans/phase-1-single-request.md`, "## Task 7"): 
 - [x] `cargo test -p turbine-model config::tests` passes (expect PASS)
 - [x] Gate clean: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` exits 0
 - [x] Committed on branch phase-1-single-request with the plan's commit message
+- [x] `config::tests::rejects_unsupported` F8_E4M3 case: `check_supported_weights` names field `tensor dtype`, the tensor and supported `BF16` (landed with Task 9)
 
 ## Evidence
 
@@ -22,3 +23,4 @@ Phase 1 plan Task 7 (`.procoder/plans/phase-1-single-request.md`, "## Task 7"): 
 - Workspace: `cargo test --workspace` → 72 passed, 0 failed.
 - Gate: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` → exit 0; `launcher.sh check` → 0 blocking.
 - Commit: `feat(turbine-model): HF config parsing and architecture allowlist` on the Task 7 worktree branch (branched from phase-1-single-request; lands there on merge).
+- F8_E4M3 case (Task 9 commit `feat(turbine-model): positioned-read weight loader and tiny synthetic checkpoint`): `ModelArchConfig::check_supported_weights` implemented; `cargo test -p turbine-model config::tests::rejects_unsupported` → `test result: ok. 1 passed` with the tiny checkpoint re-serialized so `model.layers.0.mlp.down_proj.weight` is F8_E4M3 → `unsupported tensor dtype = F8_E4M3 (model.layers.0.mlp.down_proj.weight); supported: BF16`. Mutation check: forcing the BF16 test to pass → the case fails with `called Result::unwrap_err() on an Ok value`.

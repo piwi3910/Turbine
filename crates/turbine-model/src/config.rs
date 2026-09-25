@@ -2,8 +2,8 @@
 //! (P1 S-3): architecture `LlamaForCausalLM`, BF16, no `quantization_config`. Anything else is
 //! refused with the offending field named and the supported set listed.
 //!
-//! The weight-dtype part of the allowlist (`check_supported_weights`, every tensor BF16) needs the
-//! safetensors index and lands with the weight loader.
+//! The weight-dtype part of the allowlist is `ModelArchConfig::check_supported_weights`: every
+//! tensor the architecture loads must be BF16.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,8 @@ use smallvec::SmallVec;
 use turbine_core::types::{DType, KvLayout, ModelShape};
 
 use crate::ModelError;
+use crate::loader::{llama_slots, require_bf16};
+use crate::safetensors::SafetensorsIndex;
 
 /// Model architectures this build can execute (`config.json` `architectures[0]`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -121,6 +123,21 @@ impl ModelArchConfig {
             dtype: DType::BF16,
             block_tokens,
         }
+    }
+
+    /// The dtype half of the allowlist: every checkpoint tensor this architecture loads must be
+    /// BF16 (`unsupported tensor dtype = F8_E4M3 (<tensor>); supported: BF16` otherwise). Missing
+    /// tensors are the loader's to report.
+    pub fn check_supported_weights(&self, index: &SafetensorsIndex) -> Result<(), ModelError> {
+        let slots = match self.architecture {
+            Architecture::Llama => llama_slots(self),
+        };
+        for slot in &slots {
+            if let Some(entry) = index.get(&slot.name) {
+                require_bf16(entry)?;
+            }
+        }
+        Ok(())
     }
 
     fn param_count(&self) -> u64 {
@@ -396,6 +413,8 @@ mod tests {
 
     use super::*;
     use crate::ModelError;
+    use crate::testing::TempDir;
+    use crate::testing::tiny::write_tiny_llama;
 
     fn fixture_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/llama-3.2-3b-instruct")
@@ -508,6 +527,36 @@ mod tests {
         }
     }
 
+    /// Re-serializes the checkpoint with `name` stored as F8_E4M3 (same shape, one byte per
+    /// element).
+    fn rewrite_as_f8(dir: &Path, index: &SafetensorsIndex, name: &str) {
+        use ::safetensors::Dtype;
+        use ::safetensors::tensor::TensorView;
+        let file = fs::read(dir.join("model.safetensors")).unwrap();
+        let tensors: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = index
+            .entries()
+            .map(|e| {
+                let bytes = &file[e.range.start as usize..e.range.end as usize];
+                if e.name == name {
+                    let f8 = bytes.chunks(2).map(|b| b[1]).collect();
+                    (e.name.clone(), Dtype::F8_E4M3, e.shape.clone(), f8)
+                } else {
+                    (e.name.clone(), e.dtype, e.shape.clone(), bytes.to_vec())
+                }
+            })
+            .collect();
+        let views: Vec<(String, TensorView<'_>)> = tensors
+            .iter()
+            .map(|(n, dtype, shape, data)| {
+                (
+                    n.clone(),
+                    TensorView::new(*dtype, shape.clone(), data).unwrap(),
+                )
+            })
+            .collect();
+        ::safetensors::serialize_to_file(views, None, &dir.join("model.safetensors")).unwrap();
+    }
+
     #[test]
     fn rejects_unsupported() {
         let dir = edited_config("qwen", |v| {
@@ -538,6 +587,25 @@ mod tests {
             ("torch_dtype", "float16", "bfloat16")
         );
         fs::remove_dir_all(dir).unwrap();
+
+        // A tiny checkpoint whose safetensors holds an F8_E4M3 tensor.
+        let tiny = TempDir::new("config-f8");
+        let spec = write_tiny_llama(tiny.path(), 5);
+        let index = SafetensorsIndex::open(tiny.path()).unwrap();
+        spec.config.check_supported_weights(&index).unwrap();
+        let f8 = "model.layers.0.mlp.down_proj.weight";
+        rewrite_as_f8(tiny.path(), &index, f8);
+        let index = SafetensorsIndex::open(tiny.path()).unwrap();
+        assert_eq!(index.get(f8).unwrap().dtype, ::safetensors::Dtype::F8_E4M3);
+        let err = spec.config.check_supported_weights(&index).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("unsupported tensor dtype = F8_E4M3 ({f8}); supported: BF16")
+        );
+        let (field, value, supported) = unsupported(err);
+        assert_eq!(field, "tensor dtype");
+        assert!(value.contains(f8), "{value}");
+        assert_eq!(supported, "BF16");
 
         let dir = edited_config("yarn", |v| {
             v["rope_scaling"] = serde_json::json!({"rope_type": "yarn", "factor": 4.0});
