@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod reserve;
 pub mod signals;
 pub mod state;
+pub mod throttle;
 
 pub use turbine_core::clock::Clock;
 pub use turbine_core::types::{CircuitState, PressureState};
