@@ -1,0 +1,24 @@
+[package]
+name = "turbine-device"
+description = "Turbine GPU discovery (NVML and amd-smi, loaded at runtime) and device inventory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libloading.workspace = true
+nvml-wrapper.workspace = true
+prometheus-client.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+turbine-core.workspace = true
+turbine-observability.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+# The only crate (with turbine-kernels from P1) allowed to contain `unsafe`: FFI to NVML / amd-smi.
+[lints.rust]
+unsafe_code = "allow"
