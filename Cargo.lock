@@ -1351,6 +1351,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbine-tensor"
+version = "0.1.0"
+dependencies = [
+ "smallvec",
+ "thiserror 2.0.21",
+ "turbine-core",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"

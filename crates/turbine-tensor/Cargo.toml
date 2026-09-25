@@ -1,0 +1,18 @@
+[package]
+name = "turbine-tensor"
+description = "Turbine device-memory handles, host-memory backend and tensors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+turbine-core.workspace = true
+# Shapes and strides of up to 4 dimensions stay inline (TS §6 Tensor)
+smallvec.workspace = true
+
+# Device memory is reached only through the safe `DeviceMemory` trait; backends that need
+# `unsafe` live in turbine-kernels.
+[lints.rust]
+unsafe_code = "forbid"

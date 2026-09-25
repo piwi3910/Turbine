@@ -13,6 +13,7 @@ turbine-core = { path = "crates/turbine-core" }
 turbine-observability = { path = "crates/turbine-observability" }
 turbine-device = { path = "crates/turbine-device" }
 turbine-api = { path = "crates/turbine-api" }
+turbine-tensor = { path = "crates/turbine-tensor" }
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 libloading = "0.9.0"
