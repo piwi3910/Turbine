@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures_util::stream::{self, StreamExt};
 use serde_json::{Value, json};
 
 use super::compare::{CompareReport, compare_prompt};
@@ -257,34 +258,54 @@ pub fn parse_chat(v: &Value, k: usize) -> Result<Generation, String> {
     Ok(envelope(v, choice, tokens, top))
 }
 
-/// Replay every reference prompt and judge it; `prompts` supplies the text by id.
+/// Replay every reference prompt and judge it; `prompts` supplies the text by id. At most
+/// `concurrency` prompts are in flight at once (`0` counts as 1); verdicts are reported in
+/// reference order whatever order the replies arrive in, and the first endpoint error ends the
+/// run.
 pub async fn compare(
     endpoint: &Endpoint,
     model: &str,
     references: &[ReferenceRecord],
     prompts: &[PromptRecord],
     tol: &Tolerance,
+    concurrency: usize,
 ) -> Result<CompareReport, GoldenError> {
     let by_id: HashMap<&str, &PromptRecord> = prompts.iter().map(|p| (p.id.as_str(), p)).collect();
-    let mut verdicts = Vec::with_capacity(references.len());
-    for reference in references {
-        let prompt = by_id.get(reference.id.as_str()).ok_or_else(|| {
-            GoldenError::Usage(format!(
-                "reference prompt {} is not in the prompts file",
-                reference.id
+    // Resolve every prompt before sending anything, so a missing id is a usage error up front.
+    let jobs = references
+        .iter()
+        .map(|reference| {
+            by_id
+                .get(reference.id.as_str())
+                .map(|prompt| (reference, *prompt))
+                .ok_or_else(|| {
+                    GoldenError::Usage(format!(
+                        "reference prompt {} is not in the prompts file",
+                        reference.id
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut replies = stream::iter(jobs.into_iter().enumerate())
+        .map(|(index, (reference, prompt))| async move {
+            let got = endpoint
+                .generate(model, prompt, COMPARE_TOP_LOGPROBS)
+                .await?;
+            Ok::<_, GoldenError>((
+                index,
+                compare_prompt(reference, &got.tokens, &got.top_logprobs, tol),
             ))
-        })?;
-        let got = endpoint
-            .generate(model, prompt, COMPARE_TOP_LOGPROBS)
-            .await?;
-        verdicts.push(compare_prompt(
-            reference,
-            &got.tokens,
-            &got.top_logprobs,
-            tol,
-        ));
+        })
+        .buffer_unordered(concurrency.max(1));
+    let mut verdicts = Vec::with_capacity(references.len());
+    while let Some(reply) = replies.next().await {
+        verdicts.push(reply?);
     }
-    Ok(CompareReport::new(verdicts, tol))
+    verdicts.sort_by_key(|(index, _)| *index);
+    Ok(CompareReport::new(
+        verdicts.into_iter().map(|(_, v)| v).collect(),
+        tol,
+    ))
 }
 
 /// Run every prompt and build reference records (engine from `system_fingerprint`).

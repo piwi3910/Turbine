@@ -48,6 +48,9 @@ enum Command {
         tolerance: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
+        /// Reference prompts in flight at once; results are still reported in prompt order.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        concurrency: u32,
     },
     /// Record reference.jsonl from any OpenAI-compatible endpoint.
     Capture {
@@ -101,6 +104,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             model,
             tolerance,
             output,
+            concurrency,
         } => {
             let endpoint = Endpoint::new(&url)?;
             let references: Vec<ReferenceRecord> = read_jsonl(&reference)?;
@@ -113,7 +117,15 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
                 tolerance.unwrap_or_else(|| reference_dir(&reference).join("tolerance.json"));
             let tol = read_tolerance(&tolerance)?;
             let model = endpoint.model(model.as_deref()).await?;
-            let report = compare(&endpoint, &model, &references, &prompts, &tol).await?;
+            let report = compare(
+                &endpoint,
+                &model,
+                &references,
+                &prompts,
+                &tol,
+                concurrency as usize,
+            )
+            .await?;
             match output {
                 OutputFormat::Json => println!(
                     "{}",

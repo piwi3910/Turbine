@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -77,6 +79,40 @@ fn script(variant: Variant) -> Script {
 struct Mock {
     script: Script,
     fail: bool,
+    /// Held by every generation request before it answers, so overlapping requests overlap.
+    delay: Duration,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+impl Mock {
+    fn new(script: Script, fail: bool, delay: Duration) -> Self {
+        Self {
+            script,
+            fail,
+            delay,
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Counts one generation request as in flight (and records the peak) until dropped.
+struct InFlight<'a>(&'a Mock);
+
+impl<'a> InFlight<'a> {
+    async fn enter(mock: &'a Mock) -> Self {
+        let now = mock.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        mock.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(mock.delay).await;
+        Self(mock)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn bad_request(msg: String) -> Response {
@@ -118,6 +154,7 @@ async fn models() -> Json<Value> {
 }
 
 async fn completions(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> Response {
+    let _in_flight = InFlight::enter(&mock).await;
     if mock.fail {
         return (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
     }
@@ -162,6 +199,7 @@ async fn completions(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> 
 }
 
 async fn chat(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> Response {
+    let _in_flight = InFlight::enter(&mock).await;
     if mock.fail {
         return (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
     }
@@ -215,10 +253,15 @@ async fn chat(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> Respons
 }
 
 async fn mock_server(variant: Variant) -> SocketAddr {
-    let mock = Arc::new(Mock {
-        script: script(variant),
-        fail: matches!(variant, Variant::Fail),
-    });
+    let mock = Arc::new(Mock::new(
+        script(variant),
+        matches!(variant, Variant::Fail),
+        Duration::ZERO,
+    ));
+    serve(mock).await
+}
+
+async fn serve(mock: Arc<Mock>) -> SocketAddr {
     let app = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/completions", post(completions))
@@ -286,8 +329,8 @@ fn prompt_report<'a>(report: &'a Value, id: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("{id} missing from {report}"))
 }
 
-fn temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("turbine-golden-roundtrip-{}", std::process::id()));
+fn temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("turbine-golden-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("mock")).unwrap();
     dir
@@ -296,7 +339,7 @@ fn temp_dir() -> PathBuf {
 #[tokio::test(flavor = "multi_thread")]
 async fn capture_and_compare_roundtrip() {
     // Committed layout: prompts.jsonl one level above <slug>/{reference.jsonl,tolerance.json}.
-    let dir = temp_dir();
+    let dir = temp_dir("roundtrip");
     let prompts = dir.join("prompts.jsonl");
     std::fs::write(
         &prompts,
@@ -463,6 +506,80 @@ async fn capture_and_compare_roundtrip() {
     assert_eq!(run.code, Some(2), "{}", run.stderr);
     let run = golden(compare_args(addr, &dir.join("absent.jsonl"), "json")).await;
     assert_eq!(run.code, Some(2), "{}", run.stderr);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_concurrency_bounded() {
+    // Eight completion prompts, each answered after 100 ms so that concurrent replays overlap.
+    const PROMPTS: usize = 8;
+    let dir = temp_dir("concurrency");
+    let keys: Vec<String> = (0..PROMPTS).map(|i| format!("prompt-{i}")).collect();
+    let script: Script = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k.clone(), scripted(100 * (i as u32 + 1), 5000, 2.0)))
+        .collect();
+    let prompts = dir.join("prompts.jsonl");
+    let lines: String = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            format!(
+                "{}\n",
+                json!({"id": format!("p{i:02}"), "kind": "completion", "prompt": k, "max_tokens": POSITIONS})
+            )
+        })
+        .collect();
+    std::fs::write(&prompts, lines).unwrap();
+    std::fs::write(
+        dir.join("mock/tolerance.json"),
+        r#"{"min_identical_prefix":8,"min_prompts_passing":8,"top_k":5,"max_abs_logprob_diff":0.15,"margin_nats":0.5}"#,
+    )
+    .unwrap();
+    let reference = dir.join("mock/reference.jsonl");
+
+    let mock = Arc::new(Mock::new(script, false, Duration::from_millis(100)));
+    let addr = serve(Arc::clone(&mock)).await;
+    let run = golden(strings(&[
+        "capture",
+        "--url",
+        &format!("http://{addr}"),
+        "--prompts",
+        prompts.to_str().unwrap(),
+        "--out",
+        reference.to_str().unwrap(),
+        "--model",
+        "mock-model",
+    ]))
+    .await;
+    assert_eq!(run.code, Some(0), "capture failed: {}", run.stderr);
+    mock.max_in_flight.store(0, Ordering::SeqCst);
+
+    let mut args = compare_args(addr, &reference, "json");
+    args.extend(strings(&["--concurrency", "3"]));
+    let run = golden(args).await;
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stdout, run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("report is not JSON ({e}): {}", run.stdout));
+    assert_eq!(report["passed"], true, "{report}");
+    assert_eq!(report["prompts_passing"], PROMPTS, "{report}");
+    // Results in prompt order, whatever order the replies arrived in.
+    let ids: Vec<&str> = report["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    let expected: Vec<String> = (0..PROMPTS).map(|i| format!("p{i:02}")).collect();
+    assert_eq!(ids, expected, "{report}");
+
+    let peak = mock.max_in_flight.load(Ordering::SeqCst);
+    assert!(
+        (2..=3).contains(&peak),
+        "--concurrency 3 put {peak} requests in flight at once"
+    );
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

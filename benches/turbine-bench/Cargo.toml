@@ -16,6 +16,7 @@ path = "src/bin/turbine-golden.rs"
 
 [dependencies]
 clap.workspace = true
+futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
