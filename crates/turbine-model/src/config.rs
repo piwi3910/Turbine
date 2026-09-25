@@ -13,7 +13,7 @@ use smallvec::SmallVec;
 use turbine_core::types::{DType, KvLayout, ModelShape};
 
 use crate::ModelError;
-use crate::loader::{llama_slots, require_bf16};
+use crate::loader::{require_bf16, weight_slots};
 use crate::safetensors::SafetensorsIndex;
 
 /// Model architectures this build can execute (`config.json` `architectures[0]`).
@@ -21,16 +21,19 @@ use crate::safetensors::SafetensorsIndex;
 #[non_exhaustive]
 pub enum Architecture {
     Llama,
+    /// Mixture of experts with RMSNorm over the full Q and K projections (P2 S-16).
+    Olmoe,
 }
 
 impl Architecture {
     /// Every supported architecture, in the order error messages list them.
-    pub const ALL: &'static [Architecture] = &[Architecture::Llama];
+    pub const ALL: &'static [Architecture] = &[Architecture::Llama, Architecture::Olmoe];
 
     /// The Hugging Face class name.
     pub fn as_str(self) -> &'static str {
         match self {
             Architecture::Llama => "LlamaForCausalLM",
+            Architecture::Olmoe => "OlmoeForCausalLM",
         }
     }
 
@@ -77,6 +80,22 @@ pub struct ModelArchConfig {
     pub max_position_embeddings: u32,
     /// From `generation_config.json`, else `config.json`; never empty.
     pub eos_token_ids: SmallVec<[u32; 4]>,
+    /// The expert layout of a mixture-of-experts model; `None` for a dense MLP.
+    pub moe: Option<MoeConfig>,
+    /// RMSNorm over the full Q and K projections before RoPE (`q_norm` / `k_norm`, OLMoE).
+    pub qk_norm: bool,
+}
+
+/// Per-layer mixture of experts: a router picks `experts_per_token` of `num_experts` SwiGLU
+/// experts of width `expert_intermediate` per token.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MoeConfig {
+    pub num_experts: u32,
+    pub experts_per_token: u32,
+    /// `intermediate_size` of each expert.
+    pub expert_intermediate: u32,
+    /// Renormalise the selected top-k softmax weights to sum to 1 (`false` for OLMoE).
+    pub norm_topk_prob: bool,
 }
 
 /// `generation_config.json`: EOS ids, BOS and the model's suggested sampling defaults.
@@ -106,8 +125,8 @@ impl ModelArchConfig {
             head_dim: self.head_dim,
             intermediate: self.intermediate,
             vocab: self.vocab_size,
-            num_experts: 0,
-            experts_per_token: 0,
+            num_experts: self.moe.map_or(0, |m| m.num_experts),
+            experts_per_token: self.moe.map_or(0, |m| m.experts_per_token),
             tied_embeddings: self.tie_word_embeddings,
             weight_bytes: self.param_count() * DType::BF16.size_bytes() as u64,
             max_position_embeddings: self.max_position_embeddings,
@@ -129,10 +148,7 @@ impl ModelArchConfig {
     /// BF16 (`unsupported tensor dtype = F8_E4M3 (<tensor>); supported: BF16` otherwise). Missing
     /// tensors are the loader's to report.
     pub fn check_supported_weights(&self, index: &SafetensorsIndex) -> Result<(), ModelError> {
-        let slots = match self.architecture {
-            Architecture::Llama => llama_slots(self),
-        };
-        for slot in &slots {
+        for slot in &weight_slots(self) {
             if let Some(entry) = index.get(&slot.name) {
                 require_bf16(entry)?;
             }
@@ -140,18 +156,12 @@ impl ModelArchConfig {
         Ok(())
     }
 
+    /// Parameters of every slot the executor loads, so the count cannot drift from the loader.
     fn param_count(&self) -> u64 {
-        let hidden = u64::from(self.hidden);
-        let q = u64::from(self.num_attention_heads) * u64::from(self.head_dim);
-        let kv = u64::from(self.num_kv_heads) * u64::from(self.head_dim);
-        let embed = u64::from(self.vocab_size) * hidden;
-        // q, k, v, o projections + gate, up, down + the two RMSNorm weights.
-        let per_layer = hidden * q * 2
-            + hidden * kv * 2
-            + 3 * hidden * u64::from(self.intermediate)
-            + 2 * hidden;
-        let lm_head = if self.tie_word_embeddings { 0 } else { embed };
-        embed + u64::from(self.num_layers) * per_layer + hidden + lm_head
+        weight_slots(self)
+            .iter()
+            .map(|s| s.shape.iter().map(|&d| d as u64).product::<u64>())
+            .sum()
     }
 }
 
@@ -198,6 +208,16 @@ struct RawConfig {
     eos_token_id: Option<TokenIds>,
     #[serde(default)]
     quantization_config: Option<serde_json::Value>,
+    /// Mixture-of-experts keys (OLMoE); `intermediate_size` is then each expert's width.
+    #[serde(default)]
+    num_experts: Option<u32>,
+    #[serde(default)]
+    num_experts_per_tok: Option<u32>,
+    #[serde(default)]
+    norm_topk_prob: Option<bool>,
+    /// OLMoE clamps Q/K/V to ±`clip_qkv` when set; no executor implements that.
+    #[serde(default)]
+    clip_qkv: Option<serde_json::Value>,
     #[serde(default)]
     torch_dtype: Option<String>,
     /// transformers ≥ 4.56 writes `dtype` instead of `torch_dtype`.
@@ -320,6 +340,33 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
         }
     }
 
+    let (moe, qk_norm) = match architecture {
+        Architecture::Llama => (None, false),
+        Architecture::Olmoe => {
+            if let Some(clip) = raw.clip_qkv.as_ref().filter(|c| !c.is_null()) {
+                return Err(unsupported("clip_qkv", clip.to_string(), "null"));
+            }
+            let required = |name: &str, value: Option<u32>| {
+                value.ok_or_else(|| invalid(format!("{} requires {name}", architecture.as_str())))
+            };
+            let num_experts = required("num_experts", raw.num_experts)?;
+            let experts_per_token = required("num_experts_per_tok", raw.num_experts_per_tok)?;
+            if experts_per_token == 0 || experts_per_token > num_experts {
+                return Err(invalid(format!(
+                    "num_experts_per_tok {experts_per_token} must be between 1 and num_experts \
+                     {num_experts}"
+                )));
+            }
+            let moe = MoeConfig {
+                num_experts,
+                experts_per_token,
+                expert_intermediate: raw.intermediate_size,
+                norm_topk_prob: raw.norm_topk_prob.unwrap_or(false),
+            };
+            (Some(moe), true)
+        }
+    };
+
     let rope_scaling = parse_rope_scaling(raw.rope_scaling, &config_path)?;
     let eos_token_ids = load_eos(dir, raw.eos_token_id, &config_path)?;
 
@@ -338,6 +385,8 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
         vocab_size: raw.vocab_size,
         max_position_embeddings: raw.max_position_embeddings,
         eos_token_ids,
+        moe,
+        qk_norm,
     })
 }
 
@@ -509,6 +558,103 @@ mod tests {
         assert_eq!(generation.top_k, None);
     }
 
+    fn olmoe_fixture_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/olmoe-1b-7b-0125-instruct")
+    }
+
+    #[test]
+    fn parses_olmoe_config() {
+        let cfg = load_model_config(&olmoe_fixture_dir()).unwrap();
+        assert_eq!(cfg.architecture, Architecture::Olmoe);
+        assert_eq!(cfg.architecture.as_str(), "OlmoeForCausalLM");
+        assert_eq!(cfg.num_layers, 16);
+        assert_eq!(cfg.hidden, 2048);
+        assert_eq!((cfg.num_attention_heads, cfg.num_kv_heads), (16, 16));
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(
+            cfg.moe,
+            Some(MoeConfig {
+                num_experts: 64,
+                experts_per_token: 8,
+                expert_intermediate: 1024,
+                norm_topk_prob: false,
+            })
+        );
+        assert!(cfg.qk_norm);
+        assert_eq!(cfg.rope_theta, 10_000.0);
+        assert_eq!(cfg.rope_scaling, None);
+        assert_eq!(cfg.vocab_size, 50_304);
+        assert_eq!(cfg.max_position_embeddings, 4096);
+        assert!(!cfg.tie_word_embeddings);
+        assert_eq!(cfg.rms_norm_eps, 1e-5);
+        assert_eq!(cfg.eos_token_ids.as_slice(), &[50_279]);
+
+        // Block bytes as in the spec: 16 x 2 x 16 x 16 x 128 x 2.
+        assert_eq!(cfg.kv_layout(16).block_bytes(), 2_097_152);
+
+        let shape = cfg.shape();
+        assert_eq!(shape.architecture, "OlmoeForCausalLM");
+        assert_eq!((shape.num_experts, shape.experts_per_token), (64, 8));
+        assert_eq!(shape.intermediate, 1024);
+        assert!(!shape.tied_embeddings);
+        // 6 919 161 856 BF16 parameters (untied, Q/K norm, 64 experts per layer).
+        assert_eq!(shape.weight_bytes, 13_838_323_712);
+
+        // The Llama checkpoint is dense with no Q/K norm.
+        let llama = load_model_config(&fixture_dir()).unwrap();
+        assert_eq!(llama.moe, None);
+        assert!(!llama.qk_norm);
+    }
+
+    #[test]
+    fn rejects_malformed_olmoe() {
+        let edited = |name: &str, edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&fs::read(olmoe_fixture_dir().join("config.json")).unwrap())
+                    .unwrap();
+            edit(&mut v);
+            let dir = scratch(name);
+            fs::write(dir.join("config.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+            dir
+        };
+        let detail = |dir: &Path| match load_model_config(dir).unwrap_err() {
+            ModelError::Io { detail, .. } => detail,
+            other => panic!("expected Io, got {other:?}"),
+        };
+
+        let dir = edited("olmoe-no-experts", &|v| {
+            v.as_object_mut().unwrap().remove("num_experts");
+        });
+        assert_eq!(detail(&dir), "OlmoeForCausalLM requires num_experts");
+        fs::remove_dir_all(dir).unwrap();
+
+        let dir = edited("olmoe-topk", &|v| {
+            v["num_experts_per_tok"] = serde_json::json!(65);
+        });
+        assert_eq!(
+            detail(&dir),
+            "num_experts_per_tok 65 must be between 1 and num_experts 64"
+        );
+        fs::remove_dir_all(dir).unwrap();
+
+        let dir = edited("olmoe-clip", &|v| {
+            v["clip_qkv"] = serde_json::json!(8.0);
+        });
+        let (field, value, supported) = unsupported(load_model_config(&dir).unwrap_err());
+        assert_eq!(
+            (field.as_str(), value.as_str(), supported.as_str()),
+            ("clip_qkv", "8.0", "null")
+        );
+        fs::remove_dir_all(dir).unwrap();
+
+        // norm_topk_prob defaults to false when absent (transformers' OlmoeConfig default).
+        let dir = edited("olmoe-norm-default", &|v| {
+            v.as_object_mut().unwrap().remove("norm_topk_prob");
+        });
+        assert!(!load_model_config(&dir).unwrap().moe.unwrap().norm_topk_prob);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn head_dim_and_eos_fallbacks() {
         // No explicit head_dim → hidden / heads; no generation_config.json → config.json EOS.
@@ -565,7 +711,8 @@ mod tests {
         let err = load_model_config(&dir).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unsupported architectures = Qwen3MoeForCausalLM; supported: LlamaForCausalLM"
+            "unsupported architectures = Qwen3MoeForCausalLM; supported: LlamaForCausalLM, \
+             OlmoeForCausalLM"
         );
         fs::remove_dir_all(dir).unwrap();
 

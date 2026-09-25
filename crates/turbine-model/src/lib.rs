@@ -21,11 +21,13 @@ pub mod tokenizer;
 pub use crate::safetensors::{SafetensorsIndex, TensorEntry};
 pub use budget::{BudgetTerms, available_bytes, check_budget, host_mem_available};
 pub use chat_template::ChatTemplate;
+pub use config::MoeConfig;
 pub use config::{
     Architecture, GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config,
     load_model_config,
 };
 pub use generate::{GenerateOptions, Generation, generate};
+pub use loader::olmoe_slots;
 pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot, llama_slots};
 pub use metrics::{ForwardPhase, ModelMetrics};
 pub use sampler::{SampledToken, Sampler};

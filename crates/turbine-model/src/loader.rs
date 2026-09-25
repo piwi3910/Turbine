@@ -14,7 +14,7 @@ use turbine_core::types::DType;
 use turbine_tensor::{DeviceMemory, Tensor};
 
 use crate::ModelError;
-use crate::config::ModelArchConfig;
+use crate::config::{Architecture, ModelArchConfig};
 use crate::safetensors::{Dtype, SafetensorsIndex, TensorEntry, io_err, open_regular};
 
 /// Upper bound of the host staging buffer (P1 bounded resources).
@@ -62,6 +62,62 @@ pub fn llama_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
         slots.push(slot(LM_HEAD.into(), vec![vocab, hidden]));
     }
     slots
+}
+
+/// Every parameter slot of an OLMoE model, in load order: embedding, per layer the attention
+/// weights with the Q/K norms (over the full `heads·head_dim` and `kv_heads·head_dim`
+/// projections), the router `mlp.gate.weight` `[experts, hidden]`, every expert's SwiGLU
+/// weights, the two layer norms, then the final norm and `lm_head.weight` only when untied.
+/// A dense config (`moe: None`) has no experts and yields only the non-MLP slots.
+pub fn olmoe_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
+    let hidden = cfg.hidden as usize;
+    let q = cfg.num_attention_heads as usize * cfg.head_dim as usize;
+    let kv = cfg.num_kv_heads as usize * cfg.head_dim as usize;
+    let vocab = cfg.vocab_size as usize;
+    let (experts, inter) = cfg.moe.map_or((0, 0), |m| {
+        (m.num_experts as usize, m.expert_intermediate as usize)
+    });
+    let slot = |name: String, shape: Vec<usize>| WeightSlot { name, shape };
+
+    let mut slots = vec![slot(
+        "model.embed_tokens.weight".into(),
+        vec![vocab, hidden],
+    )];
+    for i in 0..cfg.num_layers {
+        let p = format!("model.layers.{i}");
+        slots.extend([
+            slot(format!("{p}.input_layernorm.weight"), vec![hidden]),
+            slot(format!("{p}.self_attn.q_proj.weight"), vec![q, hidden]),
+            slot(format!("{p}.self_attn.k_proj.weight"), vec![kv, hidden]),
+            slot(format!("{p}.self_attn.v_proj.weight"), vec![kv, hidden]),
+            slot(format!("{p}.self_attn.o_proj.weight"), vec![hidden, q]),
+            slot(format!("{p}.self_attn.q_norm.weight"), vec![q]),
+            slot(format!("{p}.self_attn.k_norm.weight"), vec![kv]),
+            slot(format!("{p}.post_attention_layernorm.weight"), vec![hidden]),
+            slot(format!("{p}.mlp.gate.weight"), vec![experts, hidden]),
+        ]);
+        for e in 0..experts {
+            let x = format!("{p}.mlp.experts.{e}");
+            slots.extend([
+                slot(format!("{x}.gate_proj.weight"), vec![inter, hidden]),
+                slot(format!("{x}.up_proj.weight"), vec![inter, hidden]),
+                slot(format!("{x}.down_proj.weight"), vec![hidden, inter]),
+            ]);
+        }
+    }
+    slots.push(slot("model.norm.weight".into(), vec![hidden]));
+    if !cfg.tie_word_embeddings {
+        slots.push(slot(LM_HEAD.into(), vec![vocab, hidden]));
+    }
+    slots
+}
+
+/// The parameter slots of `cfg`'s architecture.
+pub(crate) fn weight_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
+    match cfg.architecture {
+        Architecture::Llama => llama_slots(cfg),
+        Architecture::Olmoe => olmoe_slots(cfg),
+    }
 }
 
 /// Phase 1 loads BF16 weights only; anything else is refused naming the tensor.
@@ -213,7 +269,9 @@ mod tests {
     use super::*;
     use crate::config::load_model_config;
     use crate::testing::TempDir;
-    use crate::testing::tiny::{TinyOptions, write_tiny_llama, write_tiny_llama_with};
+    use crate::testing::tiny::{
+        TinyOptions, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
+    };
 
     /// Host memory that counts allocations, to prove a failed validation allocates nothing.
     struct CountingMemory {
@@ -377,6 +435,73 @@ mod tests {
         assert_matches_file(&untied, &weights);
         assert_eq!(weights.tensors[LM_HEAD].shape.as_slice(), &[263, 64]);
         assert!(weights.ignored.is_empty());
+    }
+
+    #[test]
+    fn olmoe_slot_mapping() {
+        // OLMoE-1B-7B: 3 top-level tensors + per layer 9 attention/norm/router tensors and
+        // 64 experts × 3 projections = 3219, the tensor count of its safetensors index.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/olmoe-1b-7b-0125-instruct");
+        let cfg = load_model_config(&fixture).unwrap();
+        let slots = olmoe_slots(&cfg);
+        assert_eq!(slots.len(), 3219);
+        let shape = |name: &str| {
+            slots
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no slot {name}"))
+                .shape
+                .clone()
+        };
+        assert_eq!(shape("model.layers.15.self_attn.q_norm.weight"), [2048]);
+        assert_eq!(shape("model.layers.15.self_attn.k_norm.weight"), [2048]);
+        assert_eq!(shape("model.layers.0.mlp.gate.weight"), [64, 2048]);
+        assert_eq!(
+            shape("model.layers.3.mlp.experts.63.gate_proj.weight"),
+            [1024, 2048]
+        );
+        assert_eq!(
+            shape("model.layers.3.mlp.experts.0.up_proj.weight"),
+            [1024, 2048]
+        );
+        assert_eq!(
+            shape("model.layers.3.mlp.experts.7.down_proj.weight"),
+            [2048, 1024]
+        );
+        assert_eq!(shape(LM_HEAD), [50_304, 2048]);
+        assert!(!slots.iter().any(|s| s.name.contains("mlp.gate_proj")));
+
+        // The tiny OLMoE loads every slot with its exact bytes; nothing unexpected.
+        let dir = TempDir::new("load-tiny-olmoe");
+        let spec = write_tiny_olmoe(dir.path(), 4);
+        let index = SafetensorsIndex::open(dir.path()).unwrap();
+        let (_, mem) = counting();
+        let slots = olmoe_slots(&spec.config);
+        let weights = WeightLoader::load(&index, &slots, &mem, 1 << 20).unwrap();
+        assert!(weights.unexpected.is_empty() && weights.ignored.is_empty());
+        assert_eq!(weights.tensors.len(), slots.len());
+        let file = std::fs::read(dir.path().join("model.safetensors")).unwrap();
+        for slot in &slots {
+            let tensor = &weights.tensors[&slot.name];
+            let entry = index.get(&slot.name).unwrap();
+            let mut got = vec![0u8; tensor.storage.len()];
+            tensor.storage.copy_to_host(0, &mut got).unwrap();
+            assert!(
+                got == file[entry.range.start as usize..entry.range.end as usize],
+                "{}",
+                slot.name
+            );
+        }
+        assert_eq!(weights.weight_bytes, spec.config.shape().weight_bytes);
+
+        // The Llama slot set does not fit an OLMoE checkpoint: it is refused, naming a tensor.
+        let err = WeightLoader::load(&index, &llama_slots(&spec.config), &mem, 1 << 20)
+            .expect_err("llama slots on olmoe");
+        assert_eq!(
+            err.to_string(),
+            "missing tensor model.layers.0.mlp.gate_proj.weight"
+        );
     }
 
     #[test]

@@ -3,6 +3,8 @@
 //! llama3 rope scaling, tied embeddings)
 //! with a byte-level BPE tokenizer and the Llama-3.2 chat template, written in the Hugging Face
 //! layout so the loader, executor, server and `hf_reference.py` all run on it without weights.
+//! [`write_tiny_olmoe`] writes the mixture-of-experts sibling (`OlmoeForCausalLM`, P2 S-16) with
+//! the same tokenizer.
 //!
 //! Every function here panics on I/O failure: it is a test utility.
 use std::path::{Path, PathBuf};
@@ -15,7 +17,7 @@ use safetensors::tensor::TensorView;
 use serde_json::json;
 
 use crate::config::{ModelArchConfig, load_model_config};
-use crate::loader::llama_slots;
+use crate::loader::weight_slots;
 
 /// Byte symbols take ids 0..=255; the specials follow.
 pub const BOS: (&str, u32) = ("<|begin_of_text|>", 256);
@@ -191,11 +193,36 @@ pub fn write_tiny_llama(dir: &Path, seed: u64) -> TinySpec {
 /// `tokenizer_config.json` into `dir` (created if needed). Weights are BF16 from ChaCha8 seeded
 /// by `seed`: the same seed and options give byte-identical files.
 pub fn write_tiny_llama_with(dir: &Path, seed: u64, opts: &TinyOptions) -> TinySpec {
+    write_tiny(
+        dir,
+        seed,
+        &llama_config_json(opts.tied, opts.head_dim),
+        opts,
+    )
+}
+
+/// Writes the tiny `OlmoeForCausalLM` checkpoint into `dir`: 2 layers, hidden 64, 4 query and
+/// 4 KV heads of dimension 16 with Q/K norm, 8 SwiGLU experts of width 32 per layer with top-2
+/// routing and `norm_topk_prob: false`, rope theta 10000 without scaling, untied `lm_head`,
+/// the tiny tokenizer and [`PLAIN_CHAT_TEMPLATE`] (OLMoE's template renders no tools). Same
+/// files and determinism as [`write_tiny_llama_with`].
+pub fn write_tiny_olmoe(dir: &Path, seed: u64) -> TinySpec {
+    let opts = TinyOptions {
+        tied: false,
+        template_with_tools: false,
+        ..TinyOptions::default()
+    };
+    write_tiny(dir, seed, &olmoe_config_json(), &opts)
+}
+
+fn write_tiny(
+    dir: &Path,
+    seed: u64,
+    config_json: &serde_json::Value,
+    opts: &TinyOptions,
+) -> TinySpec {
     std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
-    write_json(
-        &dir.join("config.json"),
-        &config_json(opts.tied, opts.head_dim),
-    );
+    write_json(&dir.join("config.json"), config_json);
     write_json(
         &dir.join("generation_config.json"),
         &json!({
@@ -228,7 +255,41 @@ fn write_json(path: &Path, value: &serde_json::Value) {
     std::fs::write(path, text).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
-fn config_json(tied: bool, head_dim: u32) -> serde_json::Value {
+/// Keys as in `allenai/OLMoE-1B-7B-0125-Instruct` `config.json` (no `head_dim`: 64 / 4 = 16).
+fn olmoe_config_json() -> serde_json::Value {
+    json!({
+        "architectures": ["OlmoeForCausalLM"],
+        "model_type": "olmoe",
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "bos_token_id": BOS.1,
+        "clip_qkv": null,
+        "eos_token_id": TINY_EOS,
+        "hidden_act": "silu",
+        "hidden_size": 64,
+        "initializer_range": 0.02,
+        "intermediate_size": 32,
+        "max_position_embeddings": TINY_MAX_POSITIONS,
+        "norm_topk_prob": false,
+        "num_attention_heads": 4,
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 4,
+        "output_router_logits": false,
+        "pad_token_id": END_OF_TEXT.1,
+        "rms_norm_eps": 1e-5,
+        "rope_scaling": null,
+        "rope_theta": 10000.0,
+        "router_aux_loss_coef": 0.01,
+        "tie_word_embeddings": false,
+        "torch_dtype": "bfloat16",
+        "use_cache": true,
+        "vocab_size": TINY_VOCAB,
+    })
+}
+
+fn llama_config_json(tied: bool, head_dim: u32) -> serde_json::Value {
     json!({
         "architectures": ["LlamaForCausalLM"],
         "model_type": "llama",
@@ -389,7 +450,7 @@ fn random_bf16(rng: &mut ChaCha8Rng, name: &str, shape: &[usize]) -> Vec<u8> {
 fn write_weights(path: &Path, config: &ModelArchConfig, seed: u64, opts: &TinyOptions) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
-    for slot in llama_slots(config) {
+    for slot in weight_slots(config) {
         let data = random_bf16(&mut rng, &slot.name, &slot.shape);
         tensors.push((slot.name, slot.shape, data));
     }
@@ -419,7 +480,7 @@ fn write_weights(path: &Path, config: &ModelArchConfig, seed: u64, opts: &TinyOp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Architecture, RopeScaling};
+    use crate::config::{Architecture, MoeConfig, RopeScaling};
     use crate::testing::TempDir;
 
     #[test]
@@ -494,6 +555,68 @@ mod tests {
         assert_eq!(shape(&format!("{p}.k_proj.weight")), [256, 64]);
         assert_eq!(shape(&format!("{p}.v_proj.weight")), [256, 64]);
         assert_eq!(shape(&format!("{p}.o_proj.weight")), [64, 512]);
+    }
+
+    #[test]
+    fn tiny_olmoe_is_deterministic_and_parses() {
+        let a = TempDir::new("tiny-olmoe-a");
+        let b = TempDir::new("tiny-olmoe-b");
+        let spec = write_tiny_olmoe(a.path(), 7);
+        write_tiny_olmoe(b.path(), 7);
+        for file in ["model.safetensors", "config.json", "tokenizer_config.json"] {
+            let read = |d: &TempDir| std::fs::read(d.path().join(file)).unwrap();
+            assert_eq!(read(&a), read(&b), "{file}");
+        }
+
+        let cfg = &spec.config;
+        assert_eq!(cfg.architecture, Architecture::Olmoe);
+        assert_eq!(
+            (
+                cfg.num_layers,
+                cfg.hidden,
+                cfg.num_attention_heads,
+                cfg.num_kv_heads,
+                cfg.head_dim
+            ),
+            (2, 64, 4, 4, 16)
+        );
+        assert_eq!(
+            cfg.moe,
+            Some(MoeConfig {
+                num_experts: 8,
+                experts_per_token: 2,
+                expert_intermediate: 32,
+                norm_topk_prob: false,
+            })
+        );
+        assert!(cfg.qk_norm);
+        assert_eq!(cfg.rope_theta, 10_000.0);
+        assert_eq!(cfg.rope_scaling, None);
+        assert!(!cfg.tie_word_embeddings);
+        assert_eq!(cfg.vocab_size, TINY_VOCAB);
+        assert_eq!(cfg.eos_token_ids.as_slice(), &TINY_EOS);
+
+        // Every OLMoE slot is in the file with its shape, BF16, and nothing else is.
+        let index = crate::SafetensorsIndex::open(a.path()).unwrap();
+        let slots = crate::loader::olmoe_slots(cfg);
+        assert_eq!(slots.len(), 1 + 2 * (9 + 8 * 3) + 2);
+        assert_eq!(index.entries().count(), slots.len());
+        for slot in &slots {
+            let entry = index.get(&slot.name).unwrap();
+            assert_eq!(entry.shape, slot.shape, "{}", slot.name);
+            assert_eq!(entry.dtype, safetensors::Dtype::BF16);
+        }
+        cfg.check_supported_weights(&index).unwrap();
+
+        // Transformers loads it with the fast tokenizer class and a template without tools.
+        let tok_config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(a.path().join("tokenizer_config.json")).unwrap())
+                .unwrap();
+        assert_eq!(tok_config["tokenizer_class"], "PreTrainedTokenizerFast");
+        assert_eq!(tok_config["chat_template"], PLAIN_CHAT_TEMPLATE);
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(a.path().join("config.json")).unwrap()).unwrap();
+        assert_eq!(config["model_type"], "olmoe");
     }
 
     #[test]
