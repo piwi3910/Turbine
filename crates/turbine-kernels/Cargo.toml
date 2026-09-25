@@ -17,6 +17,8 @@ prometheus-client.workspace = true
 tracing.workspace = true
 # Runtime loading of the kernel shim library; nothing links a GPU library at build time
 libloading.workspace = true
+# bf16/f16 <-> f32 conversion in the cpu-reference provider (the host-side numerical oracle)
+half.workspace = true
 
 [dev-dependencies]
 # Captures the JSON kernel selection log in registry tests

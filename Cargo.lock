@@ -1825,6 +1825,7 @@ dependencies = [
 name = "turbine-kernels"
 version = "0.1.0"
 dependencies = [
+ "half",
  "libloading 0.9.0",
  "prometheus-client",
  "thiserror 2.0.21",

@@ -6,9 +6,11 @@ use std::path::PathBuf;
 
 use turbine_tensor::MemoryError;
 
+pub mod cpu;
 pub mod ops;
 pub mod registry;
 
+pub use cpu::{cpu_reference_provider, round_to};
 pub use ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AttentionConfig, AttentionContext,
     AttentionKernel, AttentionKind, ElementwiseConfig, ElementwiseContext, ElementwiseKernel,
