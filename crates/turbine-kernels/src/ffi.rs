@@ -1,4 +1,4 @@
-//! `#[repr(C)]` mirrors of `kernels/include/turbine_kernels.h` (ABI v1), the symbol table
+//! `#[repr(C)]` mirrors of `kernels/include/turbine_kernels.h` (ABI v2), the symbol table
 //! resolved once per loaded library, and the status-code mapping (contract §9.4).
 //!
 //! Descriptor field order and types match the header field for field. Pointer fields carry
@@ -134,6 +134,112 @@ pub(crate) struct AddDesc {
     pub dtype: i32,
 }
 
+/// `turbine_ctx_info` (v2): fixed properties of a context.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CtxInfo {
+    pub workspace_bytes: u64,
+    /// -1 when not applicable (AMD).
+    pub compute_major: i32,
+    pub compute_minor: i32,
+    /// NUL-terminated device architecture name.
+    pub device_arch: [c_char; 32],
+}
+
+impl CtxInfo {
+    pub(crate) fn zeroed() -> CtxInfo {
+        CtxInfo {
+            workspace_bytes: 0,
+            compute_major: -1,
+            compute_minor: -1,
+            device_arch: [0; 32],
+        }
+    }
+}
+
+/// `turbine_attention_paged_desc` (v2; prefill and decode share it).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttentionPagedDesc {
+    pub q: *const c_void,
+    pub k_new: *const c_void,
+    pub v_new: *const c_void,
+    pub out: *mut c_void,
+    pub kv_layer: *mut c_void,
+    pub block_table: *const i32,
+    pub q_indptr: *const i32,
+    pub kv_lens: *const i32,
+    pub num_seqs: i32,
+    pub total_q: i32,
+    pub max_q_len: i32,
+    pub max_kv_len: i32,
+    pub max_blocks_per_seq: i32,
+    pub num_blocks: i32,
+    pub block_tokens: i32,
+    pub num_q_heads: i32,
+    pub num_kv_heads: i32,
+    pub head_dim: i32,
+    pub q_stride_token: i64,
+    pub new_stride_token: i64,
+    pub out_stride_token: i64,
+    pub scale: f32,
+    pub causal: i32,
+    pub dtype: i32,
+}
+
+/// `turbine_copy_blocks_desc` (v2). `src_blocks`/`dst_blocks` are host arrays.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CopyBlocksDesc {
+    pub pool: *mut c_void,
+    pub layer_stride_bytes: i64,
+    pub block_bytes: i64,
+    pub num_layers: i32,
+    pub src_blocks: *const i32,
+    pub dst_blocks: *const i32,
+    pub count: i32,
+}
+
+/// `turbine_moe_route_desc` (v2).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MoeRouteDesc {
+    pub router_logits: *const f32,
+    pub num_tokens: i32,
+    pub num_experts: i32,
+    pub top_k: i32,
+    pub renormalize: i32,
+    pub topk_ids: *mut i32,
+    pub topk_weights: *mut f32,
+    pub sorted_rows: *mut i32,
+    pub expert_offsets: *mut i32,
+}
+
+/// `turbine_moe_experts_desc` (v2). `host_expert_offsets` is a host array.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MoeExpertsDesc {
+    pub x: *const c_void,
+    pub w_gate: *const c_void,
+    pub w_up: *const c_void,
+    pub w_down: *const c_void,
+    pub sorted_rows: *const i32,
+    pub expert_offsets: *const i32,
+    pub topk_weights: *const f32,
+    pub host_expert_offsets: *const i32,
+    pub out: *mut c_void,
+    pub workspace: *mut c_void,
+    pub workspace_bytes: usize,
+    pub num_tokens: i32,
+    pub hidden: i32,
+    pub inter: i32,
+    pub top_k: i32,
+    pub num_experts: i32,
+    pub expert_begin: i32,
+    pub expert_end: i32,
+    pub dtype: i32,
+}
+
 /// `turbine_<op>`: enqueue on the context's compute stream.
 pub(crate) type OpFn<D> = unsafe extern "C" fn(*mut TurbineCtx, *const D) -> i32;
 /// `turbine_<op>_supported`: 1 / 0 (negative on an internal error); pointers may be null.
@@ -157,7 +263,7 @@ impl<D> Clone for OpTrio<D> {
 }
 impl<D> Copy for OpTrio<D> {}
 
-/// Every function of ABI v1, resolved once in `ShimLibrary::load`. The pointers stay valid while
+/// Every function of ABI v2, resolved once in `ShimLibrary::load`. The pointers stay valid while
 /// the `libloading::Library` they came from is loaded; `ShimLibrary` owns both.
 #[derive(Clone, Copy)]
 pub(crate) struct ShimSymbols {
@@ -181,6 +287,12 @@ pub(crate) struct ShimSymbols {
     pub silu_mul: OpTrio<SiluMulDesc>,
     pub embedding: OpTrio<EmbeddingDesc>,
     pub add: OpTrio<AddDesc>,
+    pub ctx_get_info: unsafe extern "C" fn(*mut TurbineCtx, *mut CtxInfo) -> i32,
+    pub attention_prefill_paged: OpTrio<AttentionPagedDesc>,
+    pub attention_decode_paged: OpTrio<AttentionPagedDesc>,
+    pub copy_blocks: OpTrio<CopyBlocksDesc>,
+    pub moe_route: OpTrio<MoeRouteDesc>,
+    pub moe_experts: OpTrio<MoeExpertsDesc>,
 }
 
 /// Resolves the function `name` from `lib` as the fn-pointer type `T`; a missing symbol is a
@@ -207,7 +319,7 @@ fn trio<D>(lib: &Library, path: &Path, op: &str) -> Result<OpTrio<D>, KernelErro
 }
 
 impl ShimSymbols {
-    /// Resolves every ABI v1 function; the first missing one fails the load.
+    /// Resolves every ABI v2 function; the first missing one fails the load.
     pub(crate) fn resolve_all(lib: &Library, path: &Path) -> Result<ShimSymbols, KernelError> {
         Ok(ShimSymbols {
             abi_version: resolve(lib, path, "turbine_abi_version")?,
@@ -230,6 +342,12 @@ impl ShimSymbols {
             silu_mul: trio(lib, path, "silu_mul")?,
             embedding: trio(lib, path, "embedding")?,
             add: trio(lib, path, "add")?,
+            ctx_get_info: resolve(lib, path, "turbine_ctx_get_info")?,
+            attention_prefill_paged: trio(lib, path, "attention_prefill_paged")?,
+            attention_decode_paged: trio(lib, path, "attention_decode_paged")?,
+            copy_blocks: trio(lib, path, "copy_blocks")?,
+            moe_route: trio(lib, path, "moe_route")?,
+            moe_experts: trio(lib, path, "moe_experts")?,
         })
     }
 }

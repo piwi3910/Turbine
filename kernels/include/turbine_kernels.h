@@ -1,4 +1,4 @@
-/* Turbine vendor-neutral kernel C ABI, version 1 (contract section 9).
+/* Turbine vendor-neutral kernel C ABI, version 2 (contract section 9).
  *
  * Every backend shim library implements this header and is loaded by
  * turbine-kernels at run time. No vendor type, identifier or name appears here,
@@ -41,7 +41,7 @@
 extern "C" {
 #endif
 
-#define TURBINE_ABI_VERSION 1u
+#define TURBINE_ABI_VERSION 2u
 
 /* ---- status codes ---- */
 #define TURBINE_OK 0
@@ -219,6 +219,136 @@ const char *turbine_embedding_impl(const turbine_embedding_desc *d);
 int32_t turbine_add(turbine_ctx *ctx, const turbine_add_desc *d);
 int32_t turbine_add_supported(const turbine_add_desc *d);
 const char *turbine_add_impl(const turbine_add_desc *d);
+
+/* ======== v2: context info, paged attention, block copy, MoE ======== */
+
+/* Fixed properties of a context; out is a host struct. */
+typedef struct turbine_ctx_info {
+  /* fixed at context creation */
+  uint64_t workspace_bytes;
+  /* -1 when not applicable */
+  int32_t compute_major, compute_minor;
+  /* NUL-terminated device architecture name */
+  char device_arch[32];
+} turbine_ctx_info;
+int32_t turbine_ctx_get_info(turbine_ctx *ctx, turbine_ctx_info *out);
+
+/* Ragged batch over one layer of the paged KV pool: appends k_new/v_new into
+ * their page slots, then attends. Sequence s owns query rows
+ * [q_indptr[s], q_indptr[s+1]) and, after the append, kv_lens[s] tokens; its
+ * new tokens sit at positions [kv_lens[s] - q_len, kv_lens[s]). Token p lives
+ * in block block_table[s][p / block_tokens] at slot p % block_tokens. */
+typedef struct turbine_attention_paged_desc {
+  /* [total_q, num_q_heads, head_dim] */
+  const void *q;
+  /* [total_q, num_kv_heads, head_dim] */
+  const void *k_new;
+  const void *v_new;
+  /* [total_q, num_q_heads, head_dim] */
+  void *out;
+  /* this layer's pool [num_blocks, 2, block_tokens, num_kv_heads, head_dim] */
+  void *kv_layer;
+  /* [num_seqs, max_blocks_per_seq] */
+  const int32_t *block_table;
+  /* [num_seqs + 1] */
+  const int32_t *q_indptr;
+  /* [num_seqs], after the append */
+  const int32_t *kv_lens;
+  int32_t num_seqs, total_q, max_q_len, max_kv_len, max_blocks_per_seq,
+      num_blocks, block_tokens;
+  int32_t num_q_heads, num_kv_heads, head_dim;
+  int64_t q_stride_token, new_stride_token, out_stride_token;
+  float scale;
+  int32_t causal, dtype;
+} turbine_attention_paged_desc;
+typedef turbine_attention_paged_desc turbine_attention_prefill_paged_desc;
+typedef turbine_attention_paged_desc turbine_attention_decode_paged_desc;
+
+/* Forks blocks (n > 1) across all layers: for each i, block src_blocks[i] is
+ * copied to dst_blocks[i] in every layer. Layer l's block b is the block_bytes
+ * bytes at pool + l * layer_stride_bytes + b * block_bytes. */
+typedef struct turbine_copy_blocks_desc {
+  void *pool;
+  /* block_bytes = per-layer block size */
+  int64_t layer_stride_bytes, block_bytes;
+  int32_t num_layers;
+  /* host arrays [count] */
+  const int32_t *src_blocks;
+  const int32_t *dst_blocks;
+  int32_t count;
+} turbine_copy_blocks_desc;
+
+/* Softmax in F32, top-k (ties to the lower expert id), permutation. */
+typedef struct turbine_moe_route_desc {
+  /* [num_tokens, num_experts] F32 */
+  const float *router_logits;
+  /* renormalize = 0 keeps the softmax weights of the selected experts */
+  int32_t num_tokens, num_experts, top_k, renormalize;
+  /* [num_tokens, top_k], per token in descending weight */
+  int32_t *topk_ids;
+  float *topk_weights;
+  /* [num_tokens * top_k]: rows (token * top_k + slot) grouped by expert */
+  int32_t *sorted_rows;
+  /* [num_experts + 1] */
+  int32_t *expert_offsets;
+} turbine_moe_route_desc;
+
+/* out += sum_k w_k * down(silu(gate(x)) * up(x)) over the local experts,
+ * accumulated in ascending expert order. */
+typedef struct turbine_moe_experts_desc {
+  /* [num_tokens, hidden] */
+  const void *x;
+  /* [num_local_experts, inter, hidden] */
+  const void *w_gate;
+  const void *w_up;
+  /* [num_local_experts, hidden, inter] */
+  const void *w_down;
+  const int32_t *sorted_rows;
+  const int32_t *expert_offsets;
+  const float *topk_weights;
+  /* host copy [num_experts + 1], for group sizes */
+  const int32_t *host_expert_offsets;
+  /* [num_tokens, hidden], accumulated */
+  void *out;
+  void *workspace;
+  size_t workspace_bytes;
+  int32_t num_tokens, hidden, inter, top_k, num_experts;
+  /* local expert range [expert_begin, expert_end) */
+  int32_t expert_begin, expert_end;
+  int32_t dtype;
+} turbine_moe_experts_desc;
+
+/* v2 trios: attention_prefill_paged, attention_decode_paged, copy_blocks,
+ * moe_route, moe_experts. */
+int32_t
+turbine_attention_prefill_paged(turbine_ctx *ctx,
+                                const turbine_attention_prefill_paged_desc *d);
+int32_t turbine_attention_prefill_paged_supported(
+    const turbine_attention_prefill_paged_desc *d);
+const char *turbine_attention_prefill_paged_impl(
+    const turbine_attention_prefill_paged_desc *d);
+
+int32_t
+turbine_attention_decode_paged(turbine_ctx *ctx,
+                               const turbine_attention_decode_paged_desc *d);
+int32_t turbine_attention_decode_paged_supported(
+    const turbine_attention_decode_paged_desc *d);
+const char *turbine_attention_decode_paged_impl(
+    const turbine_attention_decode_paged_desc *d);
+
+int32_t turbine_copy_blocks(turbine_ctx *ctx,
+                            const turbine_copy_blocks_desc *d);
+int32_t turbine_copy_blocks_supported(const turbine_copy_blocks_desc *d);
+const char *turbine_copy_blocks_impl(const turbine_copy_blocks_desc *d);
+
+int32_t turbine_moe_route(turbine_ctx *ctx, const turbine_moe_route_desc *d);
+int32_t turbine_moe_route_supported(const turbine_moe_route_desc *d);
+const char *turbine_moe_route_impl(const turbine_moe_route_desc *d);
+
+int32_t turbine_moe_experts(turbine_ctx *ctx,
+                            const turbine_moe_experts_desc *d);
+int32_t turbine_moe_experts_supported(const turbine_moe_experts_desc *d);
+const char *turbine_moe_experts_impl(const turbine_moe_experts_desc *d);
 
 #ifdef __cplusplus
 }

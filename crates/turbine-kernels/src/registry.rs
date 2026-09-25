@@ -15,7 +15,8 @@ use crate::KernelError;
 use crate::ops::{
     ActivationConfig, ActivationKernel, AttentionConfig, AttentionKernel, ElementwiseConfig,
     ElementwiseKernel, EmbeddingConfig, EmbeddingKernel, GemmConfig, GemmKernel, KernelProvider,
-    NormConfig, NormKernel, OpKind, ProviderId, RopeConfig, RopeKernel,
+    KvCopyConfig, KvCopyKernel, MoeExpertsConfig, MoeKernel, MoeRouteConfig, NormConfig,
+    NormKernel, OpKind, ProviderId, RopeConfig, RopeKernel,
 };
 
 /// Labels of `turbine_kernel_provider_selected`.
@@ -46,7 +47,7 @@ impl KernelMetrics {
 }
 
 /// The typed config of one op; the variant fixes the op family (attention's `kind` picks
-/// prefill or decode).
+/// prefill or decode, contiguous or paged).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum OpConfig {
     Gemm(GemmConfig),
@@ -56,6 +57,9 @@ pub enum OpConfig {
     SiluMul(ActivationConfig),
     Embedding(EmbeddingConfig),
     Add(ElementwiseConfig),
+    CopyBlocks(KvCopyConfig),
+    MoeRoute(MoeRouteConfig),
+    MoeExperts(MoeExpertsConfig),
 }
 
 impl OpConfig {
@@ -68,6 +72,9 @@ impl OpConfig {
             OpConfig::SiluMul(_) => OpKind::SiluMul,
             OpConfig::Embedding(_) => OpKind::Embedding,
             OpConfig::Add(_) => OpKind::Add,
+            OpConfig::CopyBlocks(_) => OpKind::CopyBlocks,
+            OpConfig::MoeRoute(_) => OpKind::MoeRoute,
+            OpConfig::MoeExperts(_) => OpKind::MoeExperts,
         }
     }
 
@@ -81,6 +88,9 @@ impl OpConfig {
             OpConfig::SiluMul(cfg) => cfg.to_string(),
             OpConfig::Embedding(cfg) => cfg.to_string(),
             OpConfig::Add(cfg) => cfg.to_string(),
+            OpConfig::CopyBlocks(cfg) => cfg.to_string(),
+            OpConfig::MoeRoute(cfg) => cfg.to_string(),
+            OpConfig::MoeExperts(cfg) => cfg.to_string(),
         }
     }
 
@@ -116,6 +126,18 @@ impl OpConfig {
                 .elementwise()
                 .filter(|k| k.supports(cfg))
                 .map(|k| k.implementation(cfg)),
+            OpConfig::CopyBlocks(cfg) => provider
+                .kv_copy()
+                .filter(|k| k.supports(cfg))
+                .map(|k| k.implementation(cfg)),
+            OpConfig::MoeRoute(cfg) => provider
+                .moe()
+                .filter(|k| k.supports_route(cfg))
+                .map(|k| k.implementation_route(cfg)),
+            OpConfig::MoeExperts(cfg) => provider
+                .moe()
+                .filter(|k| k.supports_experts(cfg))
+                .map(|k| k.implementation_experts(cfg)),
         }
     }
 }
@@ -289,6 +311,26 @@ impl KernelRegistry {
             .elementwise()
             .expect("the selected provider implements add")
     }
+
+    pub fn kv_copy(&self, cfg: &KvCopyConfig) -> &dyn KvCopyKernel {
+        self.provider(OpConfig::CopyBlocks(*cfg))
+            .kv_copy()
+            .expect("the selected provider implements copy_blocks")
+    }
+
+    /// The MoE kernel selected for routing at `cfg`.
+    pub fn moe_route(&self, cfg: &MoeRouteConfig) -> &dyn MoeKernel {
+        self.provider(OpConfig::MoeRoute(*cfg))
+            .moe()
+            .expect("the selected provider implements moe_route")
+    }
+
+    /// The MoE kernel selected for expert compute at `cfg`.
+    pub fn moe_experts(&self, cfg: &MoeExpertsConfig) -> &dyn MoeKernel {
+        self.provider(OpConfig::MoeExperts(*cfg))
+            .moe()
+            .expect("the selected provider implements moe_experts")
+    }
 }
 
 #[cfg(test)]
@@ -299,7 +341,7 @@ mod tests {
     use turbine_core::types::DType;
 
     use super::*;
-    use crate::ops::{AttentionContext, AttentionKind};
+    use crate::ops::{AttentionContext, AttentionKind, PagedAttentionContext};
 
     /// A provider implementing only attention, supporting the configs `accepts` admits.
     struct FakeProvider {
@@ -315,6 +357,9 @@ mod tests {
             format!("{}_fmha", self.id)
         }
         fn execute(&self, _ctx: &mut AttentionContext<'_>) -> Result<(), KernelError> {
+            Ok(())
+        }
+        fn execute_paged(&self, _ctx: &mut PagedAttentionContext<'_>) -> Result<(), KernelError> {
             Ok(())
         }
     }
@@ -342,6 +387,12 @@ mod tests {
             None
         }
         fn elementwise(&self) -> Option<&dyn ElementwiseKernel> {
+            None
+        }
+        fn kv_copy(&self) -> Option<&dyn KvCopyKernel> {
+            None
+        }
+        fn moe(&self) -> Option<&dyn MoeKernel> {
             None
         }
     }
@@ -469,6 +520,98 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "no kernel provider supports attention_prefill head_dim=128 kv_heads=8 dtype=bf16 q_heads=24 causal=1"
+        );
+    }
+
+    #[test]
+    fn phase2_ops_select_and_skip_providers_without_the_family() {
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        let paged = AttentionConfig {
+            kind: AttentionKind::DecodePaged,
+            block_tokens: Some(16),
+            ..prefill_128_8()
+        };
+        let copy = KvCopyConfig {
+            num_layers: 28,
+            block_bytes: 65_536,
+        };
+        let route = MoeRouteConfig {
+            num_experts: 64,
+            top_k: 8,
+            renormalize: false,
+        };
+        let experts = MoeExpertsConfig {
+            hidden: 2048,
+            inter: 1024,
+            num_experts: 64,
+            top_k: 8,
+            expert_begin: 0,
+            expert_end: 64,
+            dtype: DType::BF16,
+        };
+        let reqs: Vec<OpRequirement> = [
+            OpConfig::Attention(paged),
+            OpConfig::CopyBlocks(copy),
+            OpConfig::MoeRoute(route),
+            OpConfig::MoeExperts(experts),
+        ]
+        .into_iter()
+        .map(OpRequirement::from)
+        .collect();
+        // `first` has neither kv_copy nor moe and rejects head_dim 128.
+        let registry = KernelRegistry::build(
+            vec![first(), crate::cpu_reference_provider()],
+            &[ProviderId("first"), ProviderId("cpu-reference")],
+            &reqs,
+            &metrics,
+        )
+        .expect("cpu-reference supports every phase 2 op");
+        let picked: Vec<(OpKind, &str, &str)> = registry
+            .selections()
+            .iter()
+            .map(|s| (s.op, s.provider.0, s.implementation.as_str()))
+            .collect();
+        assert_eq!(
+            picked,
+            [
+                (
+                    OpKind::AttentionDecodePaged,
+                    "cpu-reference",
+                    "cpu_attention_paged_f32acc"
+                ),
+                (OpKind::CopyBlocks, "cpu-reference", "cpu_copy_blocks"),
+                (OpKind::MoeRoute, "cpu-reference", "cpu_moe_route"),
+                (
+                    OpKind::MoeExperts,
+                    "cpu-reference",
+                    "cpu_moe_experts_f32acc"
+                ),
+            ]
+        );
+        assert!(registry.selections().iter().all(
+            |s| s.reason == "first provider in order supporting config; unsupported by: first"
+        ));
+        assert_eq!(
+            registry.selections()[1].config,
+            "num_layers=28 block_bytes=65536"
+        );
+        assert_eq!(
+            registry.kv_copy(&copy).implementation(&copy),
+            "cpu_copy_blocks"
+        );
+        assert_eq!(
+            registry.moe_route(&route).implementation_route(&route),
+            "cpu_moe_route"
+        );
+        assert_eq!(
+            registry
+                .moe_experts(&experts)
+                .implementation_experts(&experts),
+            "cpu_moe_experts_f32acc"
+        );
+        assert_eq!(
+            registry.attention(&paged).implementation(&paged),
+            "cpu_attention_paged_f32acc"
         );
     }
 

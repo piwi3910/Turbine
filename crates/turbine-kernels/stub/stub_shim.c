@@ -1,6 +1,6 @@
 /* Test-only stand-in for a kernel shim library (turbine-kernels shim tests).
  *
- * Implements every ABI v1 symbol of kernels/include/turbine_kernels.h without
+ * Implements every ABI v2 symbol of kernels/include/turbine_kernels.h without
  * a GPU: "device" memory is host heap memory, copies are memcpy, the stream is
  * always idle, and every op reports TURBINE_E_UNSUPPORTED. build.rs compiles
  * it with the host C compiler once per variant:
@@ -34,8 +34,9 @@ static void set_error(char *dst, const char *msg) {
 
 int32_t stub_live_contexts(void) { return atomic_load(&live_contexts); }
 
-/* Test hook: sizeof each op descriptor, indexed in header order (gemm,
- * attention, rmsnorm, rope, silu_mul, embedding, add); 0 past the end. */
+/* Test hook: sizeof each descriptor, indexed in header order (gemm,
+ * attention, rmsnorm, rope, silu_mul, embedding, add, then v2: ctx_info,
+ * attention_paged, copy_blocks, moe_route, moe_experts); 0 past the end. */
 size_t stub_desc_size(int32_t which) {
   switch (which) {
   case 0:
@@ -52,6 +53,16 @@ size_t stub_desc_size(int32_t which) {
     return sizeof(turbine_embedding_desc);
   case 6:
     return sizeof(turbine_add_desc);
+  case 7:
+    return sizeof(turbine_ctx_info);
+  case 8:
+    return sizeof(turbine_attention_paged_desc);
+  case 9:
+    return sizeof(turbine_copy_blocks_desc);
+  case 10:
+    return sizeof(turbine_moe_route_desc);
+  case 11:
+    return sizeof(turbine_moe_experts_desc);
   default:
     return 0;
   }
@@ -130,6 +141,25 @@ int32_t turbine_mem_info(turbine_ctx *ctx, size_t *free_bytes,
   return TURBINE_OK;
 }
 
+/* Workspace 1 MiB, no compute capability, device arch = first build arch. */
+int32_t turbine_ctx_get_info(turbine_ctx *ctx, turbine_ctx_info *out) {
+  if (out == NULL) {
+    set_error(ctx->last_error, "stub: null info pointer");
+    return TURBINE_E_ARGUMENT;
+  }
+  memset(out, 0, sizeof *out);
+  out->workspace_bytes = (uint64_t)1 << 20;
+  out->compute_major = -1;
+  out->compute_minor = -1;
+  const char *archs = STUB_ARCHS;
+  size_t n = strcspn(archs, ",");
+  if (n > sizeof out->device_arch - 1) {
+    n = sizeof out->device_arch - 1;
+  }
+  memcpy(out->device_arch, archs, n);
+  return TURBINE_OK;
+}
+
 size_t turbine_last_error(turbine_ctx *ctx, char *buf, size_t len) {
   const char *msg = ctx != NULL ? ctx->last_error : create_error;
   size_t n = strlen(msg);
@@ -164,3 +194,8 @@ STUB_OP(rope, turbine_rope_desc)
 STUB_OP(silu_mul, turbine_silu_mul_desc)
 STUB_OP(embedding, turbine_embedding_desc)
 STUB_OP(add, turbine_add_desc)
+STUB_OP(attention_prefill_paged, turbine_attention_prefill_paged_desc)
+STUB_OP(attention_decode_paged, turbine_attention_decode_paged_desc)
+STUB_OP(copy_blocks, turbine_copy_blocks_desc)
+STUB_OP(moe_route, turbine_moe_route_desc)
+STUB_OP(moe_experts, turbine_moe_experts_desc)

@@ -10,27 +10,31 @@
 //! - the context owns its streams and workspace and is destroyed exactly once, in
 //!   `ShimContext::drop`; every `DeviceBuffer` holds an `Arc` of its context, so no allocation
 //!   outlives it, and the context holds an `Arc` of its `ShimLibrary`, so the code stays loaded.
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use libloading::Library;
-use turbine_core::types::{DeviceId, ExecutionBackend};
+use turbine_core::types::{DType, DeviceId, ExecutionBackend};
 use turbine_device::DeviceInfo;
 use turbine_tensor::tensor::contiguous_strides;
-use turbine_tensor::{DeviceMemory, DevicePtr, MemInfo, MemoryError, StreamRef, TensorView};
+use turbine_tensor::{
+    DeviceMemory, DevicePtr, DeviceSlice, MemInfo, MemoryError, StreamRef, TensorView,
+};
 
 use crate::ffi::{
-    self, AddDesc, AttentionDesc, EmbeddingDesc, GemmDesc, OpTrio, RmsnormDesc, RopeDesc,
-    ShimSymbols, SiluMulDesc, TurbineCtx,
+    self, AddDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo, EmbeddingDesc,
+    GemmDesc, MoeExpertsDesc, MoeRouteDesc, OpTrio, RmsnormDesc, RopeDesc, ShimSymbols,
+    SiluMulDesc, TurbineCtx,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AttentionConfig, AttentionContext,
     AttentionKernel, AttentionKind, ElementwiseConfig, ElementwiseContext, ElementwiseKernel,
     EmbeddingConfig, EmbeddingContext, EmbeddingKernel, GemmConfig, GemmContext, GemmKernel,
-    KernelProvider, NormConfig, NormContext, NormKernel, ProviderId, RopeConfig, RopeContext,
-    RopeKernel,
+    KernelProvider, KvCopyConfig, KvCopyContext, KvCopyKernel, MoeExpertsConfig, MoeExpertsContext,
+    MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel,
+    PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel,
 };
 use crate::{KernelError, TURBINE_KERNELS_ABI_VERSION};
 
@@ -83,7 +87,7 @@ impl ShimLibrary {
     }
 
     /// Loads the library at `path`. The ABI version is checked before any other symbol is
-    /// resolved (a library of another ABI may lack them), then every ABI v1 symbol is resolved
+    /// resolved (a library of another ABI may lack them), then every ABI v2 symbol is resolved
     /// and the backend name compared with `expected_backend`.
     pub fn load(
         path: &Path,
@@ -181,12 +185,53 @@ impl ShimLibrary {
                 message: "turbine_ctx_create succeeded but returned a null context".into(),
             });
         }
+        let mut info = CtxInfo::zeroed();
+        // SAFETY: `raw` is the live context created above and `info` a live, writable
+        // `turbine_ctx_info` on this stack frame; the shim fills it and keeps no pointer to it.
+        let code = unsafe { (self.syms.ctx_get_info)(raw, &mut info) };
+        if let Err(e) = ffi::check(code, &self.syms, raw) {
+            // SAFETY: `raw` came from `turbine_ctx_create` above, was never shared, and is
+            // destroyed exactly once, here, because no `ShimContext` took ownership of it.
+            unsafe { (self.syms.ctx_destroy)(raw) };
+            return Err(e);
+        }
+        let info = ContextInfo::from_raw(&info);
         Ok(Arc::new_cyclic(|weak| ShimContext {
             raw,
             lib: Arc::clone(self),
             device: device.index,
+            info,
             self_ref: weak.clone(),
         }))
+    }
+}
+
+/// Fixed properties of a shim context (`turbine_ctx_get_info`), read once at creation.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ContextInfo {
+    /// Kernel workspace the context allocated at creation.
+    pub workspace_bytes: u64,
+    /// `(major, minor)` compute capability; `None` where the vendor has none (AMD).
+    pub compute_capability: Option<(i32, i32)>,
+    /// Device architecture as the runtime names it, e.g. `gfx1201` or `sm_121`.
+    pub device_arch: String,
+}
+
+impl ContextInfo {
+    fn from_raw(raw: &CtxInfo) -> ContextInfo {
+        let bytes: Vec<u8> = raw.device_arch.iter().map(|&c| c as u8).collect();
+        let device_arch = match CStr::from_bytes_until_nul(&bytes) {
+            Ok(s) => s.to_string_lossy().into_owned(),
+            // No NUL within the 32 bytes: take all of them.
+            Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+        };
+        let compute_capability = (raw.compute_major >= 0 && raw.compute_minor >= 0)
+            .then_some((raw.compute_major, raw.compute_minor));
+        ContextInfo {
+            workspace_bytes: raw.workspace_bytes,
+            compute_capability,
+            device_arch,
+        }
     }
 }
 
@@ -196,6 +241,7 @@ pub struct ShimContext {
     raw: *mut TurbineCtx,
     lib: Arc<ShimLibrary>,
     device: DeviceId,
+    info: ContextInfo,
     /// Lets `compute_stream` hand out an owning `Arc` of this context.
     self_ref: Weak<ShimContext>,
 }
@@ -231,6 +277,11 @@ impl ShimContext {
         &self.lib
     }
 
+    /// Workspace size, compute capability and device arch of this context.
+    pub fn info(&self) -> ContextInfo {
+        self.info.clone()
+    }
+
     fn check(&self, code: i32) -> Result<(), KernelError> {
         ffi::check(code, &self.lib.syms, self.raw)
     }
@@ -238,7 +289,12 @@ impl ShimContext {
     /// The device address of `v` for a descriptor, after checking the view's memory is this
     /// context (a host-backend or other-device pointer must never reach the shim).
     fn device_ptr(&self, name: &str, v: &TensorView<'_>) -> Result<*mut c_void, KernelError> {
-        let owner = Arc::as_ptr(v.slice.memory());
+        self.slice_ptr(name, &v.slice)
+    }
+
+    /// The device address of `s`, after the same ownership check as `device_ptr`.
+    fn slice_ptr(&self, name: &str, s: &DeviceSlice<'_>) -> Result<*mut c_void, KernelError> {
+        let owner = Arc::as_ptr(s.memory());
         if !std::ptr::addr_eq(owner, std::ptr::from_ref(self)) {
             return Err(KernelError::InvalidArgument {
                 message: format!(
@@ -247,7 +303,7 @@ impl ShimContext {
                 ),
             });
         }
-        Ok(v.slice.ptr().addr() as *mut c_void)
+        Ok(s.ptr().addr() as *mut c_void)
     }
 }
 
@@ -392,6 +448,21 @@ fn row_stride(name: &str, v: &TensorView<'_>, rank: usize) -> Result<i64, Kernel
     to_i64(&format!("{name} row stride"), v.strides[0])
 }
 
+/// Checks that `v` is a dense view of exactly `shape` and `dtype` (for descriptor fields that
+/// carry no strides).
+fn dense(name: &str, v: &TensorView<'_>, shape: &[usize], dtype: DType) -> Result<(), KernelError> {
+    if v.shape.as_slice() != shape || v.dtype != dtype || v.strides != contiguous_strides(shape) {
+        return Err(invalid(format!(
+            "{name} must be a dense {} view of shape {shape:?}, has {} shape {:?} strides {:?}",
+            dtype.as_str(),
+            v.dtype.as_str(),
+            v.shape.as_slice(),
+            v.strides.as_slice()
+        )));
+    }
+    Ok(())
+}
+
 fn null() -> *mut c_void {
     std::ptr::null_mut()
 }
@@ -421,10 +492,19 @@ impl ShimProvider {
         self.ctx.check(code)
     }
 
+    /// The contiguous entry point for `kind` (`Prefill`/`Decode`).
     fn attention_trio(&self, kind: AttentionKind) -> &OpTrio<AttentionDesc> {
         match kind {
             AttentionKind::Decode => &self.syms().attention_decode,
             _ => &self.syms().attention_prefill,
+        }
+    }
+
+    /// The paged entry point for `kind` (`PrefillPaged`/`DecodePaged`).
+    fn paged_trio(&self, kind: AttentionKind) -> &OpTrio<AttentionPagedDesc> {
+        match kind {
+            AttentionKind::DecodePaged => &self.syms().attention_decode_paged,
+            _ => &self.syms().attention_prefill_paged,
         }
     }
 }
@@ -542,6 +622,90 @@ fn embedding_probe(cfg: &EmbeddingConfig) -> EmbeddingDesc {
     }
 }
 
+fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
+    let (hq, hkv, d) = (
+        i64::from(cfg.num_q_heads),
+        i64::from(cfg.num_kv_heads),
+        i64::from(cfg.head_dim),
+    );
+    AttentionPagedDesc {
+        q: null(),
+        k_new: null(),
+        v_new: null(),
+        out: null(),
+        kv_layer: null(),
+        block_table: std::ptr::null(),
+        q_indptr: std::ptr::null(),
+        kv_lens: std::ptr::null(),
+        num_seqs: 1,
+        total_q: 1,
+        max_q_len: 1,
+        max_kv_len: 1,
+        max_blocks_per_seq: 1,
+        num_blocks: 1,
+        block_tokens: cfg.block_tokens.unwrap_or(0) as i32,
+        num_q_heads: cfg.num_q_heads as i32,
+        num_kv_heads: cfg.num_kv_heads as i32,
+        head_dim: cfg.head_dim as i32,
+        q_stride_token: hq * d,
+        new_stride_token: hkv * d,
+        out_stride_token: hq * d,
+        scale: 1.0 / (cfg.head_dim.max(1) as f32).sqrt(),
+        causal: i32::from(cfg.causal),
+        dtype: cfg.dtype.abi_code(),
+    }
+}
+
+fn copy_blocks_probe(cfg: &KvCopyConfig) -> CopyBlocksDesc {
+    CopyBlocksDesc {
+        pool: null(),
+        layer_stride_bytes: cfg.block_bytes as i64,
+        block_bytes: cfg.block_bytes as i64,
+        num_layers: cfg.num_layers as i32,
+        src_blocks: std::ptr::null(),
+        dst_blocks: std::ptr::null(),
+        count: 1,
+    }
+}
+
+fn moe_route_probe(cfg: &MoeRouteConfig) -> MoeRouteDesc {
+    MoeRouteDesc {
+        router_logits: std::ptr::null(),
+        num_tokens: 1,
+        num_experts: cfg.num_experts as i32,
+        top_k: cfg.top_k as i32,
+        renormalize: i32::from(cfg.renormalize),
+        topk_ids: std::ptr::null_mut(),
+        topk_weights: std::ptr::null_mut(),
+        sorted_rows: std::ptr::null_mut(),
+        expert_offsets: std::ptr::null_mut(),
+    }
+}
+
+fn moe_experts_probe(cfg: &MoeExpertsConfig) -> MoeExpertsDesc {
+    MoeExpertsDesc {
+        x: null(),
+        w_gate: null(),
+        w_up: null(),
+        w_down: null(),
+        sorted_rows: std::ptr::null(),
+        expert_offsets: std::ptr::null(),
+        topk_weights: std::ptr::null(),
+        host_expert_offsets: std::ptr::null(),
+        out: null(),
+        workspace: null(),
+        workspace_bytes: 0,
+        num_tokens: 1,
+        hidden: cfg.hidden as i32,
+        inter: cfg.inter as i32,
+        top_k: cfg.top_k as i32,
+        num_experts: cfg.num_experts as i32,
+        expert_begin: cfg.expert_begin as i32,
+        expert_end: cfg.expert_end as i32,
+        dtype: cfg.dtype.abi_code(),
+    }
+}
+
 fn add_probe(cfg: &ElementwiseConfig) -> AddDesc {
     AddDesc {
         a: null(),
@@ -585,16 +749,30 @@ impl GemmKernel for ShimProvider {
 
 impl AttentionKernel for ShimProvider {
     fn supports(&self, cfg: &AttentionConfig) -> bool {
-        // ABI v1 has contiguous per-sequence KV only; paged attention arrives with v2.
-        cfg.block_tokens.is_none()
-            && Self::supported(self.attention_trio(cfg.kind), &attention_probe(cfg))
+        if cfg.kind.is_paged() {
+            cfg.block_tokens.is_some_and(|b| b > 0)
+                && Self::supported(self.paged_trio(cfg.kind), &paged_probe(cfg))
+        } else {
+            cfg.block_tokens.is_none()
+                && Self::supported(self.attention_trio(cfg.kind), &attention_probe(cfg))
+        }
     }
 
     fn implementation(&self, cfg: &AttentionConfig) -> String {
-        Self::implementation_of(self.attention_trio(cfg.kind), &attention_probe(cfg))
+        if cfg.kind.is_paged() {
+            Self::implementation_of(self.paged_trio(cfg.kind), &paged_probe(cfg))
+        } else {
+            Self::implementation_of(self.attention_trio(cfg.kind), &attention_probe(cfg))
+        }
     }
 
     fn execute(&self, ctx: &mut AttentionContext<'_>) -> Result<(), KernelError> {
+        if ctx.cfg.kind.is_paged() {
+            return Err(invalid(format!(
+                "{} attention runs through execute_paged",
+                ctx.cfg.op()
+            )));
+        }
         let kv_stride_token = row_stride("k_cache", &ctx.k_cache, 3)?;
         if row_stride("v_cache", &ctx.v_cache, 3)? != kv_stride_token {
             return Err(invalid(
@@ -619,6 +797,233 @@ impl AttentionKernel for ShimProvider {
             dtype: ctx.cfg.dtype.abi_code(),
         };
         self.run(self.attention_trio(ctx.cfg.kind), &d)
+    }
+
+    fn execute_paged(&self, ctx: &mut PagedAttentionContext<'_>) -> Result<(), KernelError> {
+        let cfg = ctx.cfg;
+        let Some(block_tokens) = cfg.block_tokens.filter(|_| cfg.kind.is_paged()) else {
+            return Err(invalid(format!(
+                "{} attention with block_tokens {:?} is not paged",
+                cfg.op(),
+                cfg.block_tokens
+            )));
+        };
+        let (hkv, d) = (cfg.num_kv_heads as usize, cfg.head_dim as usize);
+        let new_stride_token = row_stride("k_new", &ctx.k_new, 3)?;
+        if row_stride("v_new", &ctx.v_new, 3)? != new_stride_token {
+            return Err(invalid(
+                "k_new and v_new must share one token stride".into(),
+            ));
+        }
+        let num_blocks = ctx.kv_layer.shape.first().copied().unwrap_or(0);
+        dense(
+            "kv_layer",
+            &ctx.kv_layer,
+            &[num_blocks, 2, block_tokens as usize, hkv, d],
+            cfg.dtype,
+        )?;
+        let num_seqs = ctx.kv_lens.shape.first().copied().unwrap_or(0);
+        let max_blocks = ctx.max_blocks_per_seq as usize;
+        dense("kv_lens", &ctx.kv_lens, &[num_seqs], DType::I32)?;
+        dense("q_indptr", &ctx.q_indptr, &[num_seqs + 1], DType::I32)?;
+        dense(
+            "block_table",
+            &ctx.block_table,
+            &[num_seqs, max_blocks],
+            DType::I32,
+        )?;
+        let d = AttentionPagedDesc {
+            q_stride_token: row_stride("q", &ctx.q, 3)?,
+            new_stride_token,
+            out_stride_token: row_stride("out", &ctx.out, 3)?,
+            q: self.ctx.device_ptr("q", &ctx.q)?,
+            k_new: self.ctx.device_ptr("k_new", &ctx.k_new)?,
+            v_new: self.ctx.device_ptr("v_new", &ctx.v_new)?,
+            out: self.ctx.device_ptr("out", &ctx.out)?,
+            kv_layer: self.ctx.device_ptr("kv_layer", &ctx.kv_layer)?,
+            block_table: self.ctx.device_ptr("block_table", &ctx.block_table)? as *const i32,
+            q_indptr: self.ctx.device_ptr("q_indptr", &ctx.q_indptr)? as *const i32,
+            kv_lens: self.ctx.device_ptr("kv_lens", &ctx.kv_lens)? as *const i32,
+            num_seqs: to_i32("num_seqs", num_seqs)?,
+            total_q: to_i32("total_q", ctx.q.shape[0])?,
+            max_q_len: to_i32("max_q_len", ctx.max_q_len)?,
+            max_kv_len: to_i32("max_kv_len", ctx.max_kv_len)?,
+            max_blocks_per_seq: to_i32("max_blocks_per_seq", ctx.max_blocks_per_seq)?,
+            num_blocks: to_i32("num_blocks", num_blocks)?,
+            block_tokens: to_i32("block_tokens", block_tokens)?,
+            num_q_heads: to_i32("num_q_heads", cfg.num_q_heads)?,
+            num_kv_heads: to_i32("num_kv_heads", cfg.num_kv_heads)?,
+            head_dim: to_i32("head_dim", cfg.head_dim)?,
+            scale: ctx.scale,
+            causal: i32::from(cfg.causal),
+            dtype: cfg.dtype.abi_code(),
+        };
+        self.run(self.paged_trio(cfg.kind), &d)
+    }
+}
+
+impl KvCopyKernel for ShimProvider {
+    fn supports(&self, cfg: &KvCopyConfig) -> bool {
+        Self::supported(&self.syms().copy_blocks, &copy_blocks_probe(cfg))
+    }
+
+    fn implementation(&self, cfg: &KvCopyConfig) -> String {
+        Self::implementation_of(&self.syms().copy_blocks, &copy_blocks_probe(cfg))
+    }
+
+    fn execute(&self, ctx: &mut KvCopyContext<'_>) -> Result<(), KernelError> {
+        if ctx.block_bytes == 0 || ctx.layer_stride_bytes < ctx.block_bytes {
+            return Err(invalid(format!(
+                "block_bytes {} must be positive and at most layer_stride_bytes {}",
+                ctx.block_bytes, ctx.layer_stride_bytes
+            )));
+        }
+        let pool_bytes = u64::from(ctx.num_layers) * ctx.layer_stride_bytes;
+        if pool_bytes > ctx.pool.len() as u64 {
+            return Err(invalid(format!(
+                "{} layers of {} bytes exceed the pool of {} bytes",
+                ctx.num_layers,
+                ctx.layer_stride_bytes,
+                ctx.pool.len()
+            )));
+        }
+        // Host arrays, read by the shim during the call only.
+        let blocks_per_layer = ctx.layer_stride_bytes / ctx.block_bytes;
+        let mut src = Vec::with_capacity(ctx.pairs.len());
+        let mut dst = Vec::with_capacity(ctx.pairs.len());
+        for &(s, d) in ctx.pairs {
+            for b in [s, d] {
+                if u64::from(b.0) >= blocks_per_layer {
+                    return Err(invalid(format!(
+                        "block id {} is outside the {blocks_per_layer} blocks of a layer",
+                        b.0
+                    )));
+                }
+            }
+            src.push(to_i32("src block", s.0)?);
+            dst.push(to_i32("dst block", d.0)?);
+        }
+        let d = CopyBlocksDesc {
+            pool: self.ctx.slice_ptr("pool", &ctx.pool)?,
+            layer_stride_bytes: to_i64("layer_stride_bytes", ctx.layer_stride_bytes)?,
+            block_bytes: to_i64("block_bytes", ctx.block_bytes)?,
+            num_layers: to_i32("num_layers", ctx.num_layers)?,
+            src_blocks: src.as_ptr(),
+            dst_blocks: dst.as_ptr(),
+            count: to_i32("count", ctx.pairs.len())?,
+        };
+        self.run(&self.syms().copy_blocks, &d)
+    }
+}
+
+impl MoeKernel for ShimProvider {
+    fn supports_route(&self, cfg: &MoeRouteConfig) -> bool {
+        Self::supported(&self.syms().moe_route, &moe_route_probe(cfg))
+    }
+
+    fn supports_experts(&self, cfg: &MoeExpertsConfig) -> bool {
+        Self::supported(&self.syms().moe_experts, &moe_experts_probe(cfg))
+    }
+
+    fn implementation_route(&self, cfg: &MoeRouteConfig) -> String {
+        Self::implementation_of(&self.syms().moe_route, &moe_route_probe(cfg))
+    }
+
+    fn implementation_experts(&self, cfg: &MoeExpertsConfig) -> String {
+        Self::implementation_of(&self.syms().moe_experts, &moe_experts_probe(cfg))
+    }
+
+    fn route(&self, ctx: &mut MoeRouteContext<'_>) -> Result<(), KernelError> {
+        let (experts, k) = (ctx.cfg.num_experts as usize, ctx.cfg.top_k as usize);
+        let tokens = ctx.router_logits.shape.first().copied().unwrap_or(0);
+        dense(
+            "router_logits",
+            &ctx.router_logits,
+            &[tokens, experts],
+            DType::F32,
+        )?;
+        dense("topk_ids", &ctx.topk_ids, &[tokens, k], DType::I32)?;
+        dense("topk_weights", &ctx.topk_weights, &[tokens, k], DType::F32)?;
+        dense("sorted_rows", &ctx.sorted_rows, &[tokens * k], DType::I32)?;
+        dense(
+            "expert_offsets",
+            &ctx.expert_offsets,
+            &[experts + 1],
+            DType::I32,
+        )?;
+        let d = MoeRouteDesc {
+            router_logits: self.ctx.device_ptr("router_logits", &ctx.router_logits)? as *const f32,
+            num_tokens: to_i32("num_tokens", tokens)?,
+            num_experts: to_i32("num_experts", ctx.cfg.num_experts)?,
+            top_k: to_i32("top_k", ctx.cfg.top_k)?,
+            renormalize: i32::from(ctx.cfg.renormalize),
+            topk_ids: self.ctx.device_ptr("topk_ids", &ctx.topk_ids)?.cast(),
+            topk_weights: self
+                .ctx
+                .device_ptr("topk_weights", &ctx.topk_weights)?
+                .cast(),
+            sorted_rows: self.ctx.device_ptr("sorted_rows", &ctx.sorted_rows)?.cast(),
+            expert_offsets: self
+                .ctx
+                .device_ptr("expert_offsets", &ctx.expert_offsets)?
+                .cast(),
+        };
+        self.run(&self.syms().moe_route, &d)
+    }
+
+    fn experts(&self, ctx: &mut MoeExpertsContext<'_>) -> Result<(), KernelError> {
+        let cfg = ctx.cfg;
+        let (h, inter) = (cfg.hidden as usize, cfg.inter as usize);
+        let (experts, k) = (cfg.num_experts as usize, cfg.top_k as usize);
+        let local = cfg.num_local_experts() as usize;
+        let tokens = ctx.x.shape.first().copied().unwrap_or(0);
+        dense("x", &ctx.x, &[tokens, h], cfg.dtype)?;
+        dense("out", &ctx.out, &[tokens, h], cfg.dtype)?;
+        dense("w_gate", &ctx.w_gate, &[local, inter, h], cfg.dtype)?;
+        dense("w_up", &ctx.w_up, &[local, inter, h], cfg.dtype)?;
+        dense("w_down", &ctx.w_down, &[local, h, inter], cfg.dtype)?;
+        dense("sorted_rows", &ctx.sorted_rows, &[tokens * k], DType::I32)?;
+        dense(
+            "expert_offsets",
+            &ctx.expert_offsets,
+            &[experts + 1],
+            DType::I32,
+        )?;
+        dense("topk_weights", &ctx.topk_weights, &[tokens, k], DType::F32)?;
+        if ctx.host_expert_offsets.len() != experts + 1 {
+            return Err(invalid(format!(
+                "host_expert_offsets has {} entries, expected {}",
+                ctx.host_expert_offsets.len(),
+                experts + 1
+            )));
+        }
+        let (workspace, workspace_bytes) = match &ctx.workspace {
+            Some(ws) => (self.ctx.slice_ptr("workspace", ws)?, ws.len()),
+            None => (null(), 0),
+        };
+        let d = MoeExpertsDesc {
+            x: self.ctx.device_ptr("x", &ctx.x)?,
+            w_gate: self.ctx.device_ptr("w_gate", &ctx.w_gate)?,
+            w_up: self.ctx.device_ptr("w_up", &ctx.w_up)?,
+            w_down: self.ctx.device_ptr("w_down", &ctx.w_down)?,
+            sorted_rows: self.ctx.device_ptr("sorted_rows", &ctx.sorted_rows)? as *const i32,
+            expert_offsets: self.ctx.device_ptr("expert_offsets", &ctx.expert_offsets)?
+                as *const i32,
+            topk_weights: self.ctx.device_ptr("topk_weights", &ctx.topk_weights)? as *const f32,
+            host_expert_offsets: ctx.host_expert_offsets.as_ptr(),
+            out: self.ctx.device_ptr("out", &ctx.out)?,
+            workspace,
+            workspace_bytes,
+            num_tokens: to_i32("num_tokens", tokens)?,
+            hidden: to_i32("hidden", cfg.hidden)?,
+            inter: to_i32("inter", cfg.inter)?,
+            top_k: to_i32("top_k", cfg.top_k)?,
+            num_experts: to_i32("num_experts", cfg.num_experts)?,
+            expert_begin: to_i32("expert_begin", cfg.expert_begin)?,
+            expert_end: to_i32("expert_end", cfg.expert_end)?,
+            dtype: cfg.dtype.abi_code(),
+        };
+        self.run(&self.syms().moe_experts, &d)
     }
 }
 
@@ -776,13 +1181,19 @@ impl KernelProvider for ShimProvider {
     fn elementwise(&self) -> Option<&dyn ElementwiseKernel> {
         Some(self)
     }
+    fn kv_copy(&self) -> Option<&dyn KvCopyKernel> {
+        Some(self)
+    }
+    fn moe(&self) -> Option<&dyn MoeKernel> {
+        Some(self)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use turbine_core::types::{DType, DeviceId, ExecutionBackend, MemoryKind, Vendor};
+    use turbine_core::types::{BlockId, DType, DeviceId, ExecutionBackend, MemoryKind, Vendor};
     use turbine_device::{DeviceInfo, DeviceMemoryInfo};
     use turbine_tensor::host::HostMemory;
     use turbine_tensor::{DeviceBuffer, Tensor};
@@ -836,7 +1247,7 @@ mod tests {
             matches!(
                 err,
                 KernelError::AbiMismatch {
-                    expected: 1,
+                    expected: 2,
                     found: 999
                 }
             ),
@@ -844,7 +1255,7 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "kernel ABI version mismatch: library 999, expected 1"
+            "kernel ABI version mismatch: library 999, expected 2"
         );
 
         let lib = ShimLibrary::load(
@@ -893,7 +1304,7 @@ mod tests {
             ExecutionBackend::Hip,
         )
         .expect("load");
-        assert_eq!(lib.abi_version(), 1);
+        assert_eq!(lib.abi_version(), 2);
         assert_eq!(lib.backend_name(), "hip");
         let before = live_contexts(&lib);
         let ctx = lib
@@ -901,6 +1312,14 @@ mod tests {
             .expect("context");
         assert_eq!(live_contexts(&lib), before + 1);
         assert!(Arc::ptr_eq(ctx.library(), &lib));
+        assert_eq!(
+            ctx.info(),
+            ContextInfo {
+                workspace_bytes: 1 << 20,
+                compute_capability: None,
+                device_arch: "gfx942".into(),
+            }
+        );
 
         let mem: Arc<dyn DeviceMemory> = ctx.clone();
         assert_eq!(mem.device(), DeviceId(0));
@@ -961,6 +1380,97 @@ mod tests {
     }
 
     #[test]
+    fn v2_ops_forward_through_the_abi() {
+        let lib = ShimLibrary::load(
+            Path::new(env!("TURBINE_STUB_GFX942")),
+            ExecutionBackend::Hip,
+        )
+        .expect("load");
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let provider = shim_provider(Arc::clone(&ctx));
+
+        let paged = AttentionConfig {
+            kind: AttentionKind::DecodePaged,
+            num_q_heads: 16,
+            num_kv_heads: 16,
+            head_dim: 128,
+            dtype: DType::BF16,
+            block_tokens: Some(16),
+            causal: true,
+        };
+        let attn = provider.attention().expect("attention family");
+        assert!(!attn.supports(&paged));
+        assert_eq!(attn.implementation(&paged), "stub_attention_decode_paged");
+        let prefill = AttentionConfig {
+            kind: AttentionKind::PrefillPaged,
+            ..paged
+        };
+        assert_eq!(
+            attn.implementation(&prefill),
+            "stub_attention_prefill_paged"
+        );
+        // A paged kind without a page size is never supported.
+        assert!(!attn.supports(&AttentionConfig {
+            block_tokens: None,
+            ..paged
+        }));
+
+        let copy = KvCopyConfig {
+            num_layers: 2,
+            block_bytes: 64,
+        };
+        let kv_copy = provider.kv_copy().expect("kv_copy family");
+        assert_eq!(kv_copy.implementation(&copy), "stub_copy_blocks");
+        let pool = DeviceBuffer::alloc(&mem, 2 * 4 * 64).expect("pool");
+        let err = kv_copy
+            .execute(&mut KvCopyContext {
+                pool: pool.whole(),
+                layer_stride_bytes: 4 * 64,
+                block_bytes: 64,
+                num_layers: 2,
+                pairs: &[(BlockId(1), BlockId(3))],
+            })
+            .expect_err("the stub implements no op");
+        assert!(
+            matches!(&err, KernelError::Unsupported { message } if message == "stub: copy_blocks is not implemented"),
+            "{err:?}"
+        );
+        let err = kv_copy
+            .execute(&mut KvCopyContext {
+                pool: pool.whole(),
+                layer_stride_bytes: 4 * 64,
+                block_bytes: 64,
+                num_layers: 2,
+                pairs: &[(BlockId(1), BlockId(4))],
+            })
+            .expect_err("block 4 is outside a 4-block layer");
+        assert!(err.to_string().contains("block id 4"), "{err}");
+
+        let moe = provider.moe().expect("moe family");
+        let route = MoeRouteConfig {
+            num_experts: 64,
+            top_k: 8,
+            renormalize: false,
+        };
+        assert!(!moe.supports_route(&route));
+        assert_eq!(moe.implementation_route(&route), "stub_moe_route");
+        let experts = MoeExpertsConfig {
+            hidden: 2048,
+            inter: 1024,
+            num_experts: 64,
+            top_k: 8,
+            expert_begin: 0,
+            expert_end: 64,
+            dtype: DType::BF16,
+        };
+        assert!(!moe.supports_experts(&experts));
+        assert_eq!(moe.implementation_experts(&experts), "stub_moe_experts");
+    }
+
+    #[test]
     fn descriptors_match_the_c_layout() {
         let lib = ShimLibrary::load(
             Path::new(env!("TURBINE_STUB_GFX942")),
@@ -985,6 +1495,11 @@ mod tests {
             size_of::<SiluMulDesc>(),
             size_of::<EmbeddingDesc>(),
             size_of::<AddDesc>(),
+            size_of::<CtxInfo>(),
+            size_of::<AttentionPagedDesc>(),
+            size_of::<CopyBlocksDesc>(),
+            size_of::<MoeRouteDesc>(),
+            size_of::<MoeExpertsDesc>(),
         ];
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");

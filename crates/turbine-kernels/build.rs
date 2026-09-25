@@ -2,7 +2,7 @@
 //! toolchain). Nothing here links a GPU library: the real shim is loaded at run time.
 //!
 //! Each variant's path is exported to the crate as a compile-time environment variable:
-//! `TURBINE_STUB_ABI999` (ABI version 999) and `TURBINE_STUB_GFX942` (ABI 1, backend `hip`,
+//! `TURBINE_STUB_ABI999` (ABI version 999) and `TURBINE_STUB_GFX942` (ABI 2, backend `hip`,
 //! build archs `gfx942`).
 use std::path::{Path, PathBuf};
 
@@ -36,7 +36,7 @@ fn build_stub(out_dir: &Path, name: &str, abi: u32, backend: &str, archs: &str) 
 fn main() {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
     let abi999 = build_stub(&out_dir, "turbine_stub_abi999", 999, "hip", "gfx1201");
-    let gfx942 = build_stub(&out_dir, "turbine_stub_gfx942", 1, "hip", "gfx942");
+    let gfx942 = build_stub(&out_dir, "turbine_stub_gfx942", 2, "hip", "gfx942");
     println!("cargo:rustc-env=TURBINE_STUB_ABI999={}", abi999.display());
     println!("cargo:rustc-env=TURBINE_STUB_GFX942={}", gfx942.display());
     println!("cargo:rerun-if-changed=stub/stub_shim.c");

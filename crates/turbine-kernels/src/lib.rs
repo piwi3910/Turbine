@@ -18,15 +18,16 @@ pub use ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AttentionConfig, AttentionContext,
     AttentionKernel, AttentionKind, ElementwiseConfig, ElementwiseContext, ElementwiseKernel,
     EmbeddingConfig, EmbeddingContext, EmbeddingKernel, GemmConfig, GemmContext, GemmKernel,
-    KernelProvider, NormConfig, NormContext, NormKernel, OpKind, ProviderId, RopeConfig,
-    RopeContext, RopeKernel,
+    KernelProvider, KvCopyConfig, KvCopyContext, KvCopyKernel, MoeExpertsConfig, MoeExpertsContext,
+    MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind,
+    PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel,
 };
 pub use registry::{KernelMetrics, KernelRegistry, OpConfig, OpRequirement, Selection};
-pub use shim::{ShimContext, ShimLibrary, ShimProvider, shim_provider};
+pub use shim::{ContextInfo, ShimContext, ShimLibrary, ShimProvider, shim_provider};
 
 /// The kernel C ABI version this crate speaks; must equal `turbine_abi_version()` of the loaded
 /// shim library and `TURBINE_ABI_VERSION` in the header exactly (contract §9.1).
-pub const TURBINE_KERNELS_ABI_VERSION: u32 = 1;
+pub const TURBINE_KERNELS_ABI_VERSION: u32 = 2;
 
 /// Device error names after which the context is corrupted and every later call fails
 /// (P3 "sticky" errors). Device messages start with the runtime's own error name (contract §9.2).

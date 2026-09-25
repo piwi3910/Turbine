@@ -21,10 +21,13 @@ use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AttentionConfig, AttentionContext,
     AttentionKernel, ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig,
     EmbeddingContext, EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, KernelProvider,
-    NormConfig, NormContext, NormKernel, ProviderId, RopeConfig, RopeContext, RopeKernel,
+    KvCopyKernel, MoeKernel, NormConfig, NormContext, NormKernel, PagedAttentionContext,
+    ProviderId, RopeConfig, RopeContext, RopeKernel,
 };
 
 mod math;
+mod moe;
+mod paged;
 
 /// The `cpu-reference` provider; stateless, implements every op family.
 pub struct CpuReference;
@@ -173,6 +176,31 @@ pub(crate) fn load_i32(v: &TensorView<'_>) -> Result<Vec<i32>, KernelError> {
         .collect())
 }
 
+/// Writes logical row-major `values` into an I32 view. Bytes of the slice that the view does not
+/// address are preserved.
+pub(crate) fn store_i32(v: &TensorView<'_>, values: &[i32]) -> Result<(), KernelError> {
+    if v.dtype != DType::I32 {
+        return Err(invalid(format!(
+            "expected an i32 view, got {}",
+            v.dtype.as_str()
+        )));
+    }
+    let offsets = element_offsets(v)?;
+    if values.len() != offsets.len() {
+        return Err(invalid(format!(
+            "{} values for a view of {} elements",
+            values.len(),
+            offsets.len()
+        )));
+    }
+    let mut bytes = v.slice.read_bytes()?;
+    for (&o, value) in offsets.iter().zip(values) {
+        bytes[o..o + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    v.slice.write_bytes(&bytes)?;
+    Ok(())
+}
+
 /// Writes logical row-major `values` into a bf16/f16/f32 view, rounding to its dtype. Bytes of
 /// the slice that the view does not address are preserved.
 pub(crate) fn store(v: &TensorView<'_>, values: &[f32]) -> Result<(), KernelError> {
@@ -255,15 +283,23 @@ impl AttentionKernel for CpuReference {
             && cfg.num_q_heads.is_multiple_of(cfg.num_kv_heads)
             && cfg.head_dim > 0
             && is_float(cfg.dtype)
-            && cfg.block_tokens.is_none()
+            && if cfg.kind.is_paged() {
+                cfg.block_tokens.is_some_and(|b| b > 0)
+            } else {
+                cfg.block_tokens.is_none()
+            }
     }
 
-    fn implementation(&self, _cfg: &AttentionConfig) -> String {
-        "cpu_attention_f32acc".into()
+    fn implementation(&self, cfg: &AttentionConfig) -> String {
+        if cfg.kind.is_paged() {
+            "cpu_attention_paged_f32acc".into()
+        } else {
+            "cpu_attention_f32acc".into()
+        }
     }
 
     fn execute(&self, ctx: &mut AttentionContext<'_>) -> Result<(), KernelError> {
-        if !AttentionKernel::supports(self, &ctx.cfg) {
+        if ctx.cfg.kind.is_paged() || !AttentionKernel::supports(self, &ctx.cfg) {
             return Err(KernelError::Unsupported {
                 message: format!("cpu-reference attention {}", ctx.cfg),
             });
@@ -303,6 +339,15 @@ impl AttentionKernel for CpuReference {
             &ctx.out,
             &math::attention(&q, &k, &v, &shape, ctx.scale, |p| round_to(dt, p)),
         )
+    }
+
+    fn execute_paged(&self, ctx: &mut PagedAttentionContext<'_>) -> Result<(), KernelError> {
+        if !ctx.cfg.kind.is_paged() || !AttentionKernel::supports(self, &ctx.cfg) {
+            return Err(KernelError::Unsupported {
+                message: format!("cpu-reference paged attention {}", ctx.cfg),
+            });
+        }
+        paged::attention(ctx)
     }
 }
 
@@ -481,6 +526,12 @@ impl KernelProvider for CpuReference {
     fn elementwise(&self) -> Option<&dyn ElementwiseKernel> {
         Some(self)
     }
+    fn kv_copy(&self) -> Option<&dyn KvCopyKernel> {
+        Some(self)
+    }
+    fn moe(&self) -> Option<&dyn MoeKernel> {
+        Some(self)
+    }
 }
 
 #[cfg(test)]
@@ -491,8 +542,14 @@ mod tests {
     use turbine_tensor::host::HostMemory;
     use turbine_tensor::{DeviceBuffer, DeviceMemory, Tensor, TensorView};
 
+    use turbine_core::types::BlockId;
+
     use super::*;
-    use crate::ops::{AttentionConfig, AttentionContext, AttentionKind, GemmConfig, GemmContext};
+    use crate::ops::{
+        AttentionConfig, AttentionContext, AttentionKind, GemmConfig, GemmContext, KvCopyConfig,
+        KvCopyContext, MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig, MoeRouteContext,
+        PagedAttentionContext,
+    };
 
     fn host() -> Arc<dyn DeviceMemory> {
         HostMemory::new(DeviceId(0), 1 << 20)
@@ -906,6 +963,333 @@ mod tests {
                 causal: true,
             }
         ));
+    }
+
+    /// Deterministic values in [-1, 1) (64-bit LCG), so the test needs no RNG crate.
+    fn seeded(seed: u64, n: usize) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn i32_tensor_2d(mem: &Arc<dyn DeviceMemory>, rows: usize, values: &[i32]) -> Tensor {
+        let t = Tensor::empty(mem, &[rows, values.len() / rows], DType::I32).expect("alloc");
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        t.storage.whole().write_bytes(&bytes).expect("write");
+        t
+    }
+
+    #[test]
+    fn paged_attention_equals_contiguous_and_moe_route_ties() {
+        let mem = HostMemory::new(DeviceId(0), 1 << 22) as Arc<dyn DeviceMemory>;
+        let cpu = cpu_reference_provider();
+        let (hq, hkv, d, bt) = (4usize, 2usize, 8usize, 16usize);
+        let dtype = DType::BF16;
+        let q_lens = [5usize, 1, 3];
+        let kv_lens = [20usize, 9, 3];
+        // Shuffled block table over an 8-block pool; unused entries are -1 and must not be read.
+        let table = [5, 2, 7, -1, 0, -1];
+        let num_blocks = 8;
+        let paged_cfg = AttentionConfig {
+            kind: AttentionKind::PrefillPaged,
+            num_q_heads: hq as u32,
+            num_kv_heads: hkv as u32,
+            head_dim: d as u32,
+            dtype,
+            block_tokens: Some(bt as u32),
+            causal: true,
+        };
+        let attn = cpu.attention().expect("attention family");
+        assert!(attn.supports(&paged_cfg));
+        assert_eq!(
+            attn.implementation(&paged_cfg),
+            "cpu_attention_paged_f32acc"
+        );
+
+        // Every sequence's full K/V history and its new queries.
+        let full_k: Vec<Vec<f32>> = (0..3)
+            .map(|s| seeded(10 + s as u64, kv_lens[s] * hkv * d))
+            .collect();
+        let full_v: Vec<Vec<f32>> = (0..3)
+            .map(|s| seeded(20 + s as u64, kv_lens[s] * hkv * d))
+            .collect();
+        let qs: Vec<Vec<f32>> = (0..3)
+            .map(|s| seeded(30 + s as u64, q_lens[s] * hq * d))
+            .collect();
+
+        // The pool of this layer holds the tokens before this step (kv_len − q_len of them).
+        let pool = Tensor::empty(&mem, &[num_blocks, 2, bt, hkv, d], dtype).expect("pool");
+        let mut pool_values = vec![0f32; num_blocks * 2 * bt * hkv * d];
+        let token = hkv * d;
+        for s in 0..3 {
+            for p in 0..kv_lens[s] - q_lens[s] {
+                let block = table[s * 2 + p / bt] as usize;
+                let k_at = ((block * 2) * bt + p % bt) * token;
+                let v_at = ((block * 2 + 1) * bt + p % bt) * token;
+                pool_values[k_at..k_at + token]
+                    .copy_from_slice(&full_k[s][p * token..(p + 1) * token]);
+                pool_values[v_at..v_at + token]
+                    .copy_from_slice(&full_v[s][p * token..(p + 1) * token]);
+            }
+        }
+        store(&pool.view(), &pool_values).expect("fill pool");
+
+        let total_q: usize = q_lens.iter().sum();
+        let mut q_all = Vec::new();
+        let (mut k_new, mut v_new) = (Vec::new(), Vec::new());
+        for s in 0..3 {
+            q_all.extend_from_slice(&qs[s]);
+            let first_new = (kv_lens[s] - q_lens[s]) * token;
+            k_new.extend_from_slice(&full_k[s][first_new..]);
+            v_new.extend_from_slice(&full_v[s][first_new..]);
+        }
+        let q = tensor(&mem, &[total_q, hq, d], dtype, &q_all);
+        let kn = tensor(&mem, &[total_q, hkv, d], dtype, &k_new);
+        let vn = tensor(&mem, &[total_q, hkv, d], dtype, &v_new);
+        let out = Tensor::empty(&mem, &[total_q, hq, d], dtype).expect("out");
+        let block_table = i32_tensor_2d(&mem, 3, &table);
+        let q_indptr = i32_tensor(&mem, &[0, 5, 6, 9]);
+        let kv_lens_t = i32_tensor(&mem, &[20, 9, 3]);
+        attn.execute_paged(&mut PagedAttentionContext {
+            cfg: paged_cfg,
+            q: q.view(),
+            k_new: kn.view(),
+            v_new: vn.view(),
+            out: out.view(),
+            kv_layer: pool.view(),
+            block_table: block_table.view(),
+            q_indptr: q_indptr.view(),
+            kv_lens: kv_lens_t.view(),
+            max_q_len: 5,
+            max_kv_len: 20,
+            max_blocks_per_seq: 2,
+            scale: 1.0 / (d as f32).sqrt(),
+        })
+        .expect("paged attention");
+        let paged_out = load(&out.view()).expect("load");
+
+        // Per sequence, the contiguous op over the same history gives the same rows.
+        let contiguous_cfg = AttentionConfig {
+            kind: AttentionKind::Prefill,
+            block_tokens: None,
+            ..paged_cfg
+        };
+        let mut row = 0;
+        for s in 0..3 {
+            let k = tensor(&mem, &[kv_lens[s], hkv, d], dtype, &full_k[s]);
+            let v = tensor(&mem, &[kv_lens[s], hkv, d], dtype, &full_v[s]);
+            let qv = tensor(&mem, &[q_lens[s], hq, d], dtype, &qs[s]);
+            let o = Tensor::empty(&mem, &[q_lens[s], hq, d], dtype).expect("out");
+            attn.execute(&mut AttentionContext {
+                cfg: contiguous_cfg,
+                q: qv.view(),
+                k_cache: k.view(),
+                v_cache: v.view(),
+                out: o.view(),
+                q_start: (kv_lens[s] - q_lens[s]) as u32,
+                scale: 1.0 / (d as f32).sqrt(),
+            })
+            .expect("contiguous attention");
+            let want = load(&o.view()).expect("load");
+            let n = q_lens[s] * hq * d;
+            assert_eq!(&paged_out[row..row + n], want.as_slice(), "sequence {s}");
+            row += n;
+        }
+        // The new K/V rows were appended into their page slots: sequence 0, token 17 → block 2,
+        // slot 1; sequence 2, token 0 → block 0, slot 0.
+        let pool_after = load(&pool.view()).expect("pool");
+        let k_slot = |block: usize, slot: usize| {
+            let at = (block * 2 * bt + slot) * token;
+            pool_after[at..at + token].to_vec()
+        };
+        let v_slot = |block: usize, slot: usize| {
+            let at = ((block * 2 + 1) * bt + slot) * token;
+            pool_after[at..at + token].to_vec()
+        };
+        let rounded = |v: &[f32]| v.iter().map(|&x| round_to(dtype, x)).collect::<Vec<_>>();
+        assert_eq!(k_slot(2, 1), rounded(&full_k[0][17 * token..18 * token]));
+        assert_eq!(v_slot(2, 1), rounded(&full_v[0][17 * token..18 * token]));
+        assert_eq!(k_slot(0, 0), rounded(&full_k[2][..token]));
+
+        // moe_route: logits [1, 1, 0, 0] top-2 → experts 0 then 1 with unrenormalised softmax
+        // weights; [0, 0, 0, 2] → expert 3, then the lowest id of the tied rest (0).
+        let route_cfg = MoeRouteConfig {
+            num_experts: 4,
+            top_k: 2,
+            renormalize: false,
+        };
+        let moe = cpu.moe().expect("moe family");
+        assert!(moe.supports_route(&route_cfg));
+        assert_eq!(moe.implementation_route(&route_cfg), "cpu_moe_route");
+        let logits = tensor(
+            &mem,
+            &[2, 4],
+            DType::F32,
+            &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0],
+        );
+        let topk_ids = Tensor::empty(&mem, &[2, 2], DType::I32).expect("ids");
+        let topk_weights = Tensor::empty(&mem, &[2, 2], DType::F32).expect("weights");
+        let sorted_rows = Tensor::empty(&mem, &[4], DType::I32).expect("rows");
+        let expert_offsets = Tensor::empty(&mem, &[5], DType::I32).expect("offsets");
+        moe.route(&mut MoeRouteContext {
+            cfg: route_cfg,
+            router_logits: logits.view(),
+            topk_ids: topk_ids.view(),
+            topk_weights: topk_weights.view(),
+            sorted_rows: sorted_rows.view(),
+            expert_offsets: expert_offsets.view(),
+        })
+        .expect("route");
+        assert_eq!(load_i32(&topk_ids.view()).expect("ids"), [0, 1, 3, 0]);
+        let e = std::f32::consts::E;
+        let (e2, sum1) = (e * e, 2.0 * e + 2.0);
+        assert_close(
+            &load(&topk_weights.view()).expect("weights"),
+            &[e / sum1, e / sum1, e2 / (e2 + 3.0), 1.0 / (e2 + 3.0)],
+            1e-6,
+        );
+        // Rows token·top_k + slot grouped by expert: e0 {0, 3}, e1 {1}, e2 {}, e3 {2}.
+        assert_eq!(load_i32(&sorted_rows.view()).expect("rows"), [0, 3, 1, 2]);
+        assert_eq!(
+            load_i32(&expert_offsets.view()).expect("offsets"),
+            [0, 2, 3, 3, 4]
+        );
+
+        // copy_blocks duplicates block 3 into block 7 on every layer and nothing else.
+        let (layers, blocks, block_bytes) = (3usize, 8usize, 24usize);
+        let buf = DeviceBuffer::alloc(&mem, layers * blocks * block_bytes).expect("pool");
+        let before: Vec<u8> = (0..buf.len()).map(|i| (i % 251) as u8).collect();
+        buf.whole().write_bytes(&before).expect("fill");
+        let copy_cfg = KvCopyConfig {
+            num_layers: layers as u32,
+            block_bytes: block_bytes as u64,
+        };
+        let kv_copy = cpu.kv_copy().expect("kv_copy family");
+        assert!(kv_copy.supports(&copy_cfg));
+        assert_eq!(kv_copy.implementation(&copy_cfg), "cpu_copy_blocks");
+        kv_copy
+            .execute(&mut KvCopyContext {
+                pool: buf.whole(),
+                layer_stride_bytes: (blocks * block_bytes) as u64,
+                block_bytes: block_bytes as u64,
+                num_layers: layers as u32,
+                pairs: &[(BlockId(3), BlockId(7))],
+            })
+            .expect("copy_blocks");
+        let after = buf.whole().read_bytes().expect("read");
+        let mut want = before.clone();
+        for l in 0..layers {
+            let src = (l * blocks + 3) * block_bytes;
+            let dst = (l * blocks + 7) * block_bytes;
+            want.copy_within(src..src + block_bytes, dst);
+        }
+        assert_eq!(after, want);
+        assert_ne!(after, before);
+    }
+
+    #[test]
+    fn moe_experts_accumulate_weighted_expert_outputs() {
+        let mem = host();
+        let moe = CpuReference.moe().expect("moe family");
+        let (h, inter, experts, top_k) = (3usize, 2usize, 3usize, 2usize);
+        // Two tokens: token 0 → experts (2, 0), token 1 → experts (0, 1); weights per slot.
+        let sorted = [1, 2, 3, 0]; // e0 {1, 2}, e1 {3}, e2 {0}
+        let offsets = [0, 2, 3, 4];
+        let weights = [0.5f32, 0.25, 0.75, 0.125];
+        let x_vals = [1.0f32, -2.0, 0.5, 0.25, 1.0, -1.0];
+        let wg = seeded(1, experts * inter * h);
+        let wu = seeded(2, experts * inter * h);
+        let wd = seeded(3, experts * h * inter);
+        let cfg = MoeExpertsConfig {
+            hidden: h as u32,
+            inter: inter as u32,
+            num_experts: experts as u32,
+            top_k: top_k as u32,
+            expert_begin: 0,
+            expert_end: experts as u32,
+            dtype: DType::F32,
+        };
+        assert!(moe.supports_experts(&cfg));
+        assert_eq!(moe.implementation_experts(&cfg), "cpu_moe_experts_f32acc");
+        let x = tensor(&mem, &[2, h], DType::F32, &x_vals);
+        let out = tensor(&mem, &[2, h], DType::F32, &[10.0; 6]);
+        let w_gate = tensor(&mem, &[experts, inter, h], DType::F32, &wg);
+        let w_up = tensor(&mem, &[experts, inter, h], DType::F32, &wu);
+        let w_down = tensor(&mem, &[experts, h, inter], DType::F32, &wd);
+        let sorted_rows = i32_tensor(&mem, &sorted);
+        let expert_offsets = i32_tensor(&mem, &offsets);
+        let topk_weights = tensor(&mem, &[2, top_k], DType::F32, &weights);
+        moe.experts(&mut MoeExpertsContext {
+            cfg,
+            x: x.view(),
+            w_gate: w_gate.view(),
+            w_up: w_up.view(),
+            w_down: w_down.view(),
+            sorted_rows: sorted_rows.view(),
+            expert_offsets: expert_offsets.view(),
+            topk_weights: topk_weights.view(),
+            host_expert_offsets: &offsets,
+            out: out.view(),
+            workspace: None,
+        })
+        .expect("experts");
+
+        // Naive: out[t] = 10 + Σ over experts in ascending id of w · expert_e(x[t]).
+        let expert = |e: usize, xt: &[f32]| -> Vec<f32> {
+            let act: Vec<f32> = (0..inter)
+                .map(|j| {
+                    let dot = |w: &[f32]| (0..h).map(|c| xt[c] * w[(e * inter + j) * h + c]).sum();
+                    let (g, u): (f32, f32) = (dot(&wg), dot(&wu));
+                    g / (1.0 + (-g).exp()) * u
+                })
+                .collect();
+            (0..h)
+                .map(|c| {
+                    (0..inter)
+                        .map(|j| act[j] * wd[(e * h + c) * inter + j])
+                        .sum()
+                })
+                .collect()
+        };
+        let routes = [[(2usize, 0.5f32), (0, 0.25)], [(0, 0.75), (1, 0.125)]];
+        let mut want = Vec::new();
+        for (t, route) in routes.iter().enumerate() {
+            let xt = &x_vals[t * h..(t + 1) * h];
+            let mut acc = [10.0f32; 3];
+            let mut by_expert = route.to_vec();
+            by_expert.sort_by_key(|&(e, _)| e);
+            for (e, w) in by_expert {
+                for (a, y) in acc.iter_mut().zip(expert(e, xt)) {
+                    *a += w * y;
+                }
+            }
+            want.extend_from_slice(&acc);
+        }
+        assert_close(&load(&out.view()).expect("out"), &want, 1e-5);
+
+        // The host copy of the offsets must agree with the device offsets.
+        let err = moe
+            .experts(&mut MoeExpertsContext {
+                cfg,
+                x: x.view(),
+                w_gate: w_gate.view(),
+                w_up: w_up.view(),
+                w_down: w_down.view(),
+                sorted_rows: sorted_rows.view(),
+                expert_offsets: expert_offsets.view(),
+                topk_weights: topk_weights.view(),
+                host_expert_offsets: &[0, 1, 3, 4],
+                out: out.view(),
+                workspace: None,
+            })
+            .expect_err("mismatched host offsets");
+        assert!(matches!(err, KernelError::InvalidArgument { .. }), "{err}");
     }
 
     #[test]

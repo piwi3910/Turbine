@@ -66,6 +66,16 @@ fn header_declares_every_registry_op() {
         .filter(|decl| !code.contains(decl.as_str()))
         .collect();
     assert!(missing.is_empty(), "turbine_kernels.h lacks {missing:?}");
+    for v2 in [
+        "turbine_ctx_get_info(",
+        "turbine_ctx_info;",
+        "turbine_attention_paged_desc;",
+        "turbine_copy_blocks_desc;",
+        "turbine_moe_route_desc;",
+        "turbine_moe_experts_desc;",
+    ] {
+        assert!(code.contains(v2), "turbine_kernels.h lacks the v2 {v2}");
+    }
 }
 
 #[test]
@@ -92,5 +102,5 @@ fn header_abi_version_matches_rust_constant() {
         .parse()
         .unwrap_or_else(|e| panic!("TURBINE_ABI_VERSION {}: {e}", defines[0]));
     assert_eq!(value, TURBINE_KERNELS_ABI_VERSION);
-    assert_eq!(TURBINE_KERNELS_ABI_VERSION, 1, "Phase 1 ships ABI v1");
+    assert_eq!(TURBINE_KERNELS_ABI_VERSION, 2, "Phase 2 ships ABI v2");
 }
