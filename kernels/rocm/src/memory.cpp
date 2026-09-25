@@ -1,0 +1,93 @@
+// Device allocation, host<->device copies, stream synchronisation and memory
+// info. Copies are enqueued on the context's compute stream; host buffers must
+// stay valid until the next turbine_stream_sync (ABI contract).
+#include <string>
+
+#include "turbine_hip.hpp"
+
+using turbine_hip::check_hip;
+using turbine_hip::enter;
+using turbine_hip::fail;
+
+extern "C" {
+
+int32_t turbine_malloc(turbine_ctx *ctx, size_t bytes, void **out) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (out == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_malloc: out is NULL");
+  }
+  *out = nullptr;
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  const std::string what = "hipMalloc " + std::to_string(bytes) + " bytes";
+  return check_hip(ctx, hipMalloc(out, bytes), what.c_str());
+}
+
+int32_t turbine_free(turbine_ctx *ctx, void *ptr) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (ptr == nullptr)
+    return TURBINE_OK;
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  return check_hip(ctx, hipFree(ptr), "hipFree");
+}
+
+int32_t turbine_memcpy_h2d(turbine_ctx *ctx, void *dst_device,
+                           const void *src_host, size_t bytes) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (bytes == 0)
+    return TURBINE_OK;
+  if (dst_device == nullptr || src_host == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_memcpy_h2d: NULL pointer");
+  }
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  return check_hip(ctx,
+                   hipMemcpyAsync(dst_device, src_host, bytes,
+                                  hipMemcpyHostToDevice, ctx->stream),
+                   "hipMemcpyAsync host to device");
+}
+
+int32_t turbine_memcpy_d2h(turbine_ctx *ctx, void *dst_host,
+                           const void *src_device, size_t bytes) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (bytes == 0)
+    return TURBINE_OK;
+  if (dst_host == nullptr || src_device == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_memcpy_d2h: NULL pointer");
+  }
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  return check_hip(ctx,
+                   hipMemcpyAsync(dst_host, src_device, bytes,
+                                  hipMemcpyDeviceToHost, ctx->stream),
+                   "hipMemcpyAsync device to host");
+}
+
+int32_t turbine_stream_sync(turbine_ctx *ctx) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  return check_hip(ctx, hipStreamSynchronize(ctx->stream),
+                   "hipStreamSynchronize");
+}
+
+int32_t turbine_mem_info(turbine_ctx *ctx, size_t *free_bytes,
+                         size_t *total_bytes) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (free_bytes == nullptr || total_bytes == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_mem_info: NULL output");
+  }
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  return check_hip(ctx, hipMemGetInfo(free_bytes, total_bytes),
+                   "hipMemGetInfo");
+}
+
+} // extern "C"
