@@ -1992,6 +1992,7 @@ dependencies = [
  "turbine-core",
  "turbine-kv",
  "turbine-observability",
+ "turbine-tensor",
  "uuid",
 ]
 
