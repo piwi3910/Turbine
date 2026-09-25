@@ -42,6 +42,13 @@ spec:
               cmake --version | head -n 1
 
               step "build kernels/rocm"
+              # A cache configured from another source tree makes cmake refuse the build dir;
+              # drop only the cache (the fetched Composable Kernel sources in _deps are kept).
+              if [[ -f "$KERNEL_BUILD_DIR/CMakeCache.txt" ]] &&
+                ! grep -qx "CMAKE_HOME_DIRECTORY:INTERNAL=$PWD/kernels/rocm" "$KERNEL_BUILD_DIR/CMakeCache.txt"; then
+                echo "lab-step: resetting $KERNEL_BUILD_DIR cache from another source tree"
+                rm -rf "$KERNEL_BUILD_DIR/CMakeCache.txt" "$KERNEL_BUILD_DIR/CMakeFiles"
+              fi
               cmake -S kernels/rocm -B "$KERNEL_BUILD_DIR" \
                 -DCMAKE_HIP_COMPILER="$TURBINE_ROCM_PATH/bin/hipcc" -DGPU_TARGETS=gfx1201
               cmake --build "$KERNEL_BUILD_DIR" --parallel "$(nproc)"
