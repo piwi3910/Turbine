@@ -23,10 +23,11 @@ use turbine_core::types::{ExecutionBackend, RequestId, Vendor};
 use turbine_kernels::{
     KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider, shim_provider,
 };
-use turbine_model::executor::{LlamaExecutor, ModelExecutor};
+use turbine_model::executor::{BatchInput, LlamaExecutor, ModelExecutor};
 use turbine_model::generate::{GenerateOptions, generate};
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::write_tiny_llama;
+use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::{
     ChatTemplate, MAX_STAGING_BYTES, SafetensorsIndex, Tokenizer, WeightLoader, llama_slots,
     load_model_config,
@@ -405,6 +406,15 @@ fn replay(
             prompt.id
         );
         let (tokens, tops) = greedy(exec, &tokenizer, ids, prompt.max_tokens, max_seq_len);
+        if std::env::var_os("TURBINE_GOLDEN_DUMP").is_some() {
+            // Diagnostics: the candidate in reference.jsonl shape, one line per prompt.
+            let line = serde_json::json!({
+                "id": prompt.id,
+                "tokens": tokens,
+                "top_logprobs": tops,
+            });
+            println!("golden-candidate {line}");
+        }
         verdicts.push(compare_prompt(reference, &tokens, &tops, tol));
     }
     verdicts
@@ -518,7 +528,12 @@ fn logits_match_reference() {
 
     let fixture = golden_dir().join("llama-3.2-3b-instruct");
     let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
-    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
+    // Diagnostics: TURBINE_GOLDEN_REFERENCE names another reference file in the fixture
+    // directory (e.g. one generated with `hf_reference.py --fp32-logits`).
+    let reference_file =
+        std::env::var("TURBINE_GOLDEN_REFERENCE").unwrap_or_else(|_| "reference.jsonl".into());
+    println!("reference: {reference_file}");
+    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join(&reference_file));
     let tol = read_tolerance(&fixture.join("tolerance.json"));
     let max_seq_len = needed_seq_len(&references);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
@@ -532,4 +547,106 @@ fn logits_match_reference() {
         max_seq_len,
     );
     assert_tolerance(&verdicts, &tol);
+}
+
+/// Lab diagnostic (precision investigation), a no-op unless `TURBINE_GOLDEN_TRACE` names
+/// prompts (comma-separated ids, e.g. `p01,p03`); run it alone in a release build, the
+/// cpu-reference executor on the 3B model is scalar. For each named prompt, Llama-3.2-3B on the
+/// HIP and the cpu-reference providers runs the reference's prompt ids and then its first
+/// `TRACE_DECODE` tokens (teacher-forced, so both see identical inputs), traced; prints the
+/// op-by-op HIP-vs-CPU table (accumulated divergence) and every HIP op recomputed on the host
+/// from the HIP trace's own inputs (the error each op adds).
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY, TURBINE_TEST_MODEL_DIR and TURBINE_GOLDEN_TRACE"]
+fn hip_trace_vs_cpu_3b() {
+    const TRACE_DECODE: usize = 2;
+    let Some(ids) = std::env::var("TURBINE_GOLDEN_TRACE")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        println!("TURBINE_GOLDEN_TRACE is not set: nothing traced");
+        return;
+    };
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
+        .filter(|v| !v.is_empty())
+        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+        .expect("load the HIP kernel library");
+    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
+        .expect("device discovery");
+    let device = inventory
+        .devices
+        .iter()
+        .find(|d| d.vendor == Vendor::Amd)
+        .expect("an AMD device");
+    let ctx = lib.create_context(device).expect("HIP context");
+
+    let fixture = golden_dir().join("llama-3.2-3b-instruct");
+    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
+    let selected: Vec<&ReferenceRecord> = ids
+        .split(',')
+        .map(|id| {
+            references
+                .iter()
+                .find(|r| r.id == id.trim())
+                .unwrap_or_else(|| panic!("no reference prompt {id}"))
+        })
+        .collect();
+    let max_seq_len = selected
+        .iter()
+        .map(|r| (r.prompt_token_ids.len() + TRACE_DECODE) as u32)
+        .max()
+        .expect("at least one prompt");
+    let cfg = load_model_config(&model_dir).expect("config.json");
+    let index = SafetensorsIndex::open(&model_dir).expect("open safetensors");
+    let host = HostMemory::new(turbine_core::types::DeviceId(0), 16 << 30);
+    let mut cpu = build_executor(&model_dir, cpu_reference_provider(), host, max_seq_len);
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut hip = build_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
+    cpu.set_trace(true);
+    hip.set_trace(true);
+    let weights = |name: &str| read_bf16_weight(&index, name);
+
+    for r in selected {
+        let mut accumulated = Vec::new();
+        let mut local = Vec::new();
+        let mut checker = LocalChecker::new(&cfg, &weights);
+        let mut batch = r.prompt_token_ids.clone();
+        let mut p0 = 0usize;
+        for step in 0..=TRACE_DECODE {
+            let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
+            let input = BatchInput {
+                tokens: &batch,
+                positions: &positions,
+            };
+            cpu.forward(&input).expect("cpu forward");
+            hip.forward(&input).expect("hip forward");
+            let (c, h) = (cpu.take_trace(), hip.take_trace());
+            accumulated.extend(compare_traces(step, &c, &h));
+            local.extend(checker.check_step(step, p0, &h));
+            p0 += batch.len();
+            batch = vec![r.tokens[step]];
+        }
+        println!(
+            "{}",
+            render(
+                &format!("3B {}: HIP vs cpu-reference (accumulated)", r.id),
+                &accumulated
+            )
+        );
+        println!(
+            "{}",
+            render(
+                &format!(
+                    "3B {}: HIP op vs host recompute from its own inputs (local)",
+                    r.id
+                ),
+                &local
+            )
+        );
+    }
 }

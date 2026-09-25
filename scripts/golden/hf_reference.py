@@ -33,6 +33,11 @@ Rules:
   that stops early as diverging at the position where it stopped.
 - Per generated position the script records the chosen token and the top-N
   `log_softmax` values of the BF16 logits upcast to FP32.
+- `--fp32-logits` (opt-in) instead computes the LM head in FP32: the final-norm
+  output (BF16, as the model produces it) and the LM head weight are upcast to
+  FP32 and multiplied there, so the logits are not rounded to BF16 (whose
+  spacing is 0.125 at |logit| in [16, 32)). Every other op stays BF16. The
+  engine string then ends in `-fp32-logits`.
 - Output goes to `<out>.tmp`, renamed over `<out>` only when every prompt
   succeeded. Any failure (including usage errors) exits 1 and leaves no file.
 
@@ -40,7 +45,7 @@ Usage:
     uv run scripts/golden/hf_reference.py --model-dir <dir> \
         --prompts tests/golden/prompts.jsonl \
         --out tests/golden/<model-slug>/reference.jsonl \
-        [--top-logprobs 20] [--device cpu|cuda] [--model-name <hub-id>]
+        [--top-logprobs 20] [--device cpu|cuda] [--model-name <hub-id>] [--fp32-logits]
 """
 
 from __future__ import annotations
@@ -72,6 +77,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--model-name",
         help="Hub id recorded as `model` (default: config.json _name_or_path or the directory name)",
+    )
+    p.add_argument(
+        "--fp32-logits",
+        action="store_true",
+        help="compute the LM head in FP32 from the BF16 final-norm output (default: BF16 logits)",
     )
     args = p.parse_args(argv)
     if not 1 <= args.top_logprobs <= 20:
@@ -152,18 +162,38 @@ def prompt_ids(tokenizer, rec: dict) -> list[int]:
     return [int(i) for i in ids]
 
 
-def generate(torch, model, ids: list[int], max_tokens: int, top_n: int, device: str):
+def generate(
+    torch,
+    model,
+    ids: list[int],
+    max_tokens: int,
+    top_n: int,
+    device: str,
+    fp32_logits: bool = False,
+):
     tokens: list[int] = []
     tops: list[list[list[float]]] = []
+    head_fp32 = model.lm_head.weight.to(torch.float32) if fp32_logits else None
+
+    def forward(input_ids, past):
+        if head_fp32 is None:
+            out = model(
+                input_ids=input_ids,
+                past_key_values=past,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            return out.logits[0, -1].to(torch.float32), out.past_key_values
+        # The decoder output is already final-normed (BF16); only the LM head runs in FP32.
+        out = model.model(input_ids=input_ids, past_key_values=past, use_cache=True)
+        last = out.last_hidden_state[0, -1].to(torch.float32)
+        return head_fp32 @ last, out.past_key_values
+
     with torch.inference_mode():
-        out = model(
-            input_ids=torch.tensor([ids], device=device),
-            use_cache=True,
-            logits_to_keep=1,
-        )
+        logits, past = forward(torch.tensor([ids], device=device), None)
         for step in range(max_tokens):
-            # BF16 logits of the last position, upcast to FP32 before log_softmax.
-            logprobs = torch.log_softmax(out.logits[0, -1].to(torch.float32), dim=-1)
+            # FP32 log_softmax of the last position's logits (BF16 upcast, or FP32 LM head).
+            logprobs = torch.log_softmax(logits, dim=-1)
             chosen = int(torch.argmax(logprobs))
             # torch.topk orders exact ties arbitrarily; argmax (like HF greedy)
             # picks the lowest id. Order ties by ascending id so top-1 is always
@@ -175,11 +205,7 @@ def generate(torch, model, ids: list[int], max_tokens: int, top_n: int, device: 
             tops.append([[int(i), float(logprobs[i])] for i in ranked])
             if step + 1 == max_tokens:
                 break
-            out = model(
-                input_ids=torch.tensor([[chosen]], device=device),
-                past_key_values=out.past_key_values,
-                use_cache=True,
-            )
+            logits, past = forward(torch.tensor([[chosen]], device=device), past)
     return tokens, tops
 
 
@@ -198,6 +224,8 @@ def run(args: argparse.Namespace) -> None:
     model.to(args.device)
     model.eval()
     engine = f"transformers-{transformers.__version__}-bf16-{args.device}"
+    if args.fp32_logits:
+        engine += "-fp32-logits"
     name = args.model_name or model_name(args.model_dir)
     revision = model_revision(args.model_dir)
     print(
@@ -212,7 +240,13 @@ def run(args: argparse.Namespace) -> None:
             for rec in prompts:
                 ids = prompt_ids(tokenizer, rec)
                 tokens, tops = generate(
-                    torch, model, ids, rec["max_tokens"], args.top_logprobs, args.device
+                    torch,
+                    model,
+                    ids,
+                    rec["max_tokens"],
+                    args.top_logprobs,
+                    args.device,
+                    args.fp32_logits,
                 )
                 captured = (
                     datetime.datetime.now(datetime.UTC)

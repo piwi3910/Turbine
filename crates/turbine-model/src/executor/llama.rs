@@ -7,6 +7,12 @@
 //! `[layers, 2, max_seq_len, kv_heads, head_dim]` BF16; activations live in buffers allocated
 //! once for `max_forward_tokens` tokens. Every kernel lookup uses a config `requirements`
 //! lists, so the registry built from it at startup serves every call.
+//!
+//! Diagnostics: [`LlamaExecutor::set_trace`] makes each forward record every intermediate
+//! tensor ([`TraceTensor`]) with a blocking device read after the op that wrote it; comparing
+//! two providers' traces locates the first op where their numerics part. Off by default and
+//! free when off (one branch per op).
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use turbine_core::types::{DType, KvLayout, ModelShape};
@@ -124,6 +130,37 @@ fn i32_bytes(values: &[u32], out: &mut Vec<u8>) {
     out.extend(values.iter().flat_map(|&v| (v as i32).to_le_bytes()));
 }
 
+/// One intermediate tensor of a traced forward ([`LlamaExecutor::set_trace`]), widened to
+/// f32 from its stored dtype (BF16 activations, F32 logits).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraceTensor {
+    /// Decoder layer; `None` for `embed`, `final_norm` and `logits`.
+    pub layer: Option<usize>,
+    /// The op output: `embed`; per layer `attn_norm`, `q`, `k`, `v` (projections of the new
+    /// rows), `q_rope`, `k_rope`, `attn`, `o_proj`, `resid_attn`, `mlp_norm`, `gate`, `up`,
+    /// `act`, `down`, `resid_mlp`; then `final_norm` (last row) and `logits`.
+    pub name: &'static str,
+    /// `[rows, cols]`: rows are the forward's tokens (1 for `final_norm` and `logits`).
+    pub shape: [usize; 2],
+    pub data: Vec<f32>,
+}
+
+/// Decodes a contiguous BF16 or F32 view read from the device into f32 values.
+fn read_f32(view: &TensorView<'_>) -> Result<Vec<f32>, ModelError> {
+    let bytes = view.slice.read_bytes()?;
+    Ok(match view.dtype {
+        DType::F32 => bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        DType::BF16 => bytes
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        other => return Err(invalid(format!("trace of a {other:?} tensor"))),
+    })
+}
+
 struct Layer {
     input_norm: Tensor,
     wq: Tensor,
@@ -179,6 +216,8 @@ pub struct LlamaExecutor {
     max_forward_tokens: u32,
     /// Positions `[0, cached_len)` of the current sequence hold valid K/V.
     cached_len: u32,
+    /// `Some` while tracing: the recorded tensors not yet taken.
+    trace: RefCell<Option<Vec<TraceTensor>>>,
 }
 
 impl LlamaExecutor {
@@ -311,7 +350,48 @@ impl LlamaExecutor {
             max_seq_len,
             max_forward_tokens,
             cached_len: 0,
+            trace: RefCell::new(None),
         })
+    }
+
+    /// Diagnostics: while enabled every forward records its intermediate tensors (one blocking
+    /// device read per op), returned by [`LlamaExecutor::take_trace`]. Disabling drops them.
+    pub fn set_trace(&mut self, enabled: bool) {
+        *self.trace.get_mut() = enabled.then(Vec::new);
+    }
+
+    /// The tensors recorded since tracing was enabled or last taken, in execution order; empty
+    /// when tracing is off.
+    pub fn take_trace(&mut self) -> Vec<TraceTensor> {
+        self.trace
+            .get_mut()
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Records `view` (`[rows, cols]` contiguous) under `name` when tracing.
+    fn record(
+        &self,
+        layer: Option<usize>,
+        name: &'static str,
+        view: TensorView<'_>,
+    ) -> Result<(), ModelError> {
+        if self.trace.borrow().is_none() {
+            return Ok(());
+        }
+        let rows = view.shape[0];
+        let cols = view.numel() / rows.max(1);
+        let data = read_f32(&view)?;
+        if let Some(trace) = self.trace.borrow_mut().as_mut() {
+            trace.push(TraceTensor {
+                layer,
+                name,
+                shape: [rows, cols],
+                data,
+            });
+        }
+        Ok(())
     }
 
     /// Checks one Phase 1 batch; returns its first position.
@@ -437,15 +517,20 @@ impl LlamaExecutor {
         let b = &self.bufs;
         let d = &self.dims;
 
+        let li = Some(i);
         // Attention block. K and V land in the cache rows of the new positions.
         self.rmsnorm(Self::rows(&b.x, t), &l.input_norm, Self::rows(&b.h, t))?;
+        self.record(li, "attn_norm", Self::rows(&b.h, t))?;
         self.linear(Self::rows(&b.h, t), &l.wq, Self::rows(&b.q, t))?;
+        self.record(li, "q", Self::rows(&b.q, t))?;
         let k_new = self.cache(i, 0, p0, t);
         let v_new = self.cache(i, 1, p0, t);
         let k_rows = TensorView::contiguous(k_new.slice, 0, &[t, d.kv_dim], ACT);
         let v_rows = TensorView::contiguous(v_new.slice, 0, &[t, d.kv_dim], ACT);
-        self.linear(Self::rows(&b.h, t), &l.wk, k_rows)?;
-        self.linear(Self::rows(&b.h, t), &l.wv, v_rows)?;
+        self.linear(Self::rows(&b.h, t), &l.wk, k_rows.clone())?;
+        self.record(li, "k", k_rows.clone())?;
+        self.linear(Self::rows(&b.h, t), &l.wv, v_rows.clone())?;
+        self.record(li, "v", v_rows)?;
         let rope = rope_cfg(&self.cfg);
         self.registry.rope(&rope).execute(&mut RopeContext {
             cfg: rope,
@@ -454,6 +539,8 @@ impl LlamaExecutor {
             positions: TensorView::contiguous(b.positions.whole(), 0, &[t], DType::I32),
             inv_freq: b.inv_freq.view(),
         })?;
+        self.record(li, "q_rope", Self::rows(&b.q, t))?;
+        self.record(li, "k_rope", k_rows)?;
         let kind = if t == 1 {
             AttentionKind::Decode
         } else {
@@ -471,13 +558,19 @@ impl LlamaExecutor {
                 q_start: p0 as u32,
                 scale: 1.0 / (d.head_dim as f32).sqrt(),
             })?;
+        self.record(li, "attn", Self::rows(&b.attn, t))?;
         self.linear(Self::rows(&b.attn, t), &l.wo, Self::rows(&b.proj, t))?;
+        self.record(li, "o_proj", Self::rows(&b.proj, t))?;
         self.residual_add(t)?;
+        self.record(li, "resid_attn", Self::rows(&b.x, t))?;
 
         // MLP block.
         self.rmsnorm(Self::rows(&b.x, t), &l.post_norm, Self::rows(&b.h, t))?;
+        self.record(li, "mlp_norm", Self::rows(&b.h, t))?;
         self.linear(Self::rows(&b.h, t), &l.w_gate, Self::rows(&b.gate, t))?;
+        self.record(li, "gate", Self::rows(&b.gate, t))?;
         self.linear(Self::rows(&b.h, t), &l.w_up, Self::rows(&b.up, t))?;
+        self.record(li, "up", Self::rows(&b.up, t))?;
         self.registry
             .activation(&activation_cfg(d))
             .execute(&mut ActivationContext {
@@ -485,8 +578,11 @@ impl LlamaExecutor {
                 up: Self::rows(&b.up, t),
                 out: Self::rows(&b.act, t),
             })?;
+        self.record(li, "act", Self::rows(&b.act, t))?;
         self.linear(Self::rows(&b.act, t), &l.w_down, Self::rows(&b.proj, t))?;
-        self.residual_add(t)
+        self.record(li, "down", Self::rows(&b.proj, t))?;
+        self.residual_add(t)?;
+        self.record(li, "resid_mlp", Self::rows(&b.x, t))
     }
 }
 
@@ -522,6 +618,7 @@ impl ModelExecutor for LlamaExecutor {
                 out: Self::rows(&b.x, t),
                 vocab_offset: 0,
             })?;
+        self.record(None, "embed", Self::rows(&b.x, t))?;
         for i in 0..self.layers.len() {
             self.layer(i, t, p0 as usize)?;
         }
@@ -530,8 +627,10 @@ impl ModelExecutor for LlamaExecutor {
             &self.final_norm,
             b.last.view(),
         )?;
+        self.record(None, "final_norm", b.last.view())?;
         let head = self.lm_head.as_ref().unwrap_or(&self.embed);
         self.linear(b.last.view(), head, b.logits.view())?;
+        self.record(None, "logits", b.logits.view())?;
         let raw = b.logits.storage.whole().read_bytes()?;
         let data: Vec<f32> = raw
             .chunks_exact(4)

@@ -7,7 +7,7 @@ use crate::ModelError;
 pub mod llama;
 pub mod rope;
 
-pub use llama::LlamaExecutor;
+pub use llama::{LlamaExecutor, TraceTensor};
 
 /// One forward step of a single sequence (Phase 1): `tokens[i]` sits at absolute position
 /// `positions[i]`. Positions are consecutive and start at or before the cached length; starting

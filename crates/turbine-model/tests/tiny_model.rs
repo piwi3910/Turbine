@@ -12,11 +12,12 @@ use turbine_kernels::{
     shim_provider,
 };
 use turbine_model::config::{ModelArchConfig, RopeScaling};
-use turbine_model::executor::{BatchInput, LlamaExecutor, Logits, ModelExecutor};
+use turbine_model::executor::{BatchInput, LlamaExecutor, Logits, ModelExecutor, TraceTensor};
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with,
 };
+use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::{MAX_STAGING_BYTES, ModelError, SafetensorsIndex, WeightLoader, llama_slots};
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::DeviceMemory;
@@ -516,4 +517,138 @@ fn hip_matches_cpu() {
         cpu_row = forward(&mut cpu, &[c], pos).row(0).to_vec();
         hip_row = forward(&mut hip, &[c], pos).row(0).to_vec();
     }
+}
+
+// ------------------------------------------------------------------------ trace diagnostics
+
+/// Prefill plus `decode` greedy steps on every executor in `execs` (tokens chosen by the first),
+/// tracing each forward. Returns per executor the trace of every step, and each step's first
+/// position.
+fn traced_run(
+    execs: &mut [&mut LlamaExecutor],
+    prompt: &[u32],
+    decode: usize,
+) -> (Vec<Vec<Vec<TraceTensor>>>, Vec<usize>) {
+    for e in execs.iter_mut() {
+        e.set_trace(true);
+    }
+    let mut traces = vec![Vec::new(); execs.len()];
+    let mut starts = Vec::new();
+    let mut batch = prompt.to_vec();
+    let mut p0 = 0usize;
+    for _ in 0..=decode {
+        let mut next = None;
+        for (i, e) in execs.iter_mut().enumerate() {
+            let logits = forward(e, &batch, p0 as u32);
+            next.get_or_insert(argmax(logits.row(0)));
+            traces[i].push(e.take_trace());
+        }
+        starts.push(p0);
+        p0 += batch.len();
+        batch = vec![next.expect("at least one executor")];
+    }
+    (traces, starts)
+}
+
+/// The trace records every op, and a host recomputation of each op from the trace's own inputs
+/// reproduces the cpu-reference provider bit for bit (the checker models its numerics exactly).
+#[test]
+fn cpu_trace_recomputes_exactly() {
+    let tmp = TempDir::new("tiny-model-trace");
+    let spec = write_tiny_llama(tmp.path(), SEED);
+    let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+    let mut exec = cpu_executor(&spec);
+    assert!(exec.take_trace().is_empty(), "tracing is off by default");
+
+    let (traces, starts) = traced_run(&mut [&mut exec], &prompt(spec.vocab), 3);
+    let layers = spec.config.num_layers as usize;
+    for (step, trace) in traces[0].iter().enumerate() {
+        // embed + 15 per layer + final_norm + logits.
+        assert_eq!(trace.len(), 1 + 15 * layers + 2, "step {step}");
+        let t = if step == 0 { PROMPT_LEN } else { 1 };
+        assert_eq!(trace[0].shape, [t, spec.config.hidden as usize]);
+    }
+    let weights = |name: &str| read_bf16_weight(&index, name);
+    let mut checker = LocalChecker::new(&spec.config, &weights);
+    let mut attn_p_bf16_differs = false;
+    for (step, trace) in traces[0].iter().enumerate() {
+        for row in checker.check_step(step, starts[step], trace) {
+            if row.name == "attn_p_bf16" {
+                attn_p_bf16_differs |= row.stats.differing > 0;
+                continue;
+            }
+            assert_eq!(row.stats.differing, 0, "{row:?}");
+        }
+    }
+    assert!(
+        attn_p_bf16_differs,
+        "BF16 probabilities must be a different numerics model"
+    );
+
+    // The recorded logits are the returned ones; disabling drops the trace.
+    let logits = forward(&mut exec, &prompt(spec.vocab), 0);
+    let trace = exec.take_trace();
+    let last = trace.last().expect("logits recorded");
+    assert_eq!((last.name, last.data.as_slice()), ("logits", logits.row(0)));
+    exec.set_trace(false);
+    forward(&mut exec, &prompt(spec.vocab), 0);
+    assert!(exec.take_trace().is_empty());
+}
+
+/// Lab diagnostic (precision investigation): HIP vs cpu-reference on the head_dim-128 tiny
+/// checkpoint op by op for the prefill and 3 decode steps (accumulated divergence), then every
+/// HIP op recomputed on the host from the HIP trace's own inputs (the error each op adds).
+/// Prints both tables; asserts only that the traces line up.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_trace_vs_cpu() {
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
+        .filter(|v| !v.is_empty())
+        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+        .expect("load the HIP kernel library");
+    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
+        .expect("device discovery");
+    let device = inventory
+        .devices
+        .iter()
+        .find(|d| d.vendor == Vendor::Amd)
+        .expect("an AMD device");
+    let ctx = lib.create_context(device).expect("HIP context");
+
+    let tmp = TempDir::new("tiny-model-hip-trace");
+    let spec = write_gpu_tiny(tmp.path());
+    let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+    let mut cpu = cpu_executor(&spec);
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut hip = executor(&spec, shim_provider(ctx), mem);
+    let (traces, starts) = traced_run(&mut [&mut cpu, &mut hip], &prompt(spec.vocab), 3);
+
+    let mut accumulated = Vec::new();
+    for (step, (c, h)) in traces[0].iter().zip(&traces[1]).enumerate() {
+        accumulated.extend(compare_traces(step, c, h));
+    }
+    println!(
+        "{}",
+        render(
+            "tiny hd128: HIP vs cpu-reference (accumulated)",
+            &accumulated
+        )
+    );
+    let weights = |name: &str| read_bf16_weight(&index, name);
+    let mut checker = LocalChecker::new(&spec.config, &weights);
+    let mut local = Vec::new();
+    for (step, trace) in traces[1].iter().enumerate() {
+        local.extend(checker.check_step(step, starts[step], trace));
+    }
+    println!(
+        "{}",
+        render(
+            "tiny hd128: HIP op vs host recompute from its own inputs (local)",
+            &local
+        )
+    );
 }
