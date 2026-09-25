@@ -5,6 +5,7 @@
 pub mod budget;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
+pub mod horizon;
 pub mod ledger;
 pub mod metrics;
 pub mod reserve;
