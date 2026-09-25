@@ -6,8 +6,8 @@
 //!   trace's inputs (HF BF16 rounding, sequential f32 accumulation, the cpu-reference numerics),
 //!   so the error an op adds on its own is separated from the error it inherits.
 //!
-//! Differences are reported in absolute terms and in BF16 ulps of the reference value
-//! (`2^(floor(log2 |v|) − 7)`), so a 1-ulp rounding flip reads as 1.0 at any magnitude.
+//! Differences are reported in absolute terms and in BF16 ulps (`2^(floor(log2 |v|) − 7)`) of
+//! the larger of the two magnitudes, so a 1-ulp rounding flip reads as 1.0 at any magnitude.
 //!
 //! [`LlamaExecutor::set_trace`]: crate::executor::LlamaExecutor::set_trace
 use std::io::{Read, Seek, SeekFrom};
@@ -55,7 +55,8 @@ pub struct DiffStats {
     /// Elements whose values differ at all.
     pub differing: usize,
     pub max_abs: f32,
-    /// Largest `|got − want|` in BF16 ulps of `want`.
+    /// Largest `|got − want|` in BF16 ulps of the larger magnitude of the two (values near zero
+    /// that differ read as many ulps: judge those by `max_abs`).
     pub max_ulps: f32,
     /// Largest `|want|`.
     pub max_ref: f32,
@@ -75,7 +76,7 @@ impl DiffStats {
                 s.differing += 1;
             }
             s.max_abs = s.max_abs.max(d);
-            s.max_ulps = s.max_ulps.max(d / bf16_ulp(w));
+            s.max_ulps = s.max_ulps.max(d / bf16_ulp(w.abs().max(g.abs())));
             s.max_ref = s.max_ref.max(w.abs());
         }
         s
