@@ -1,16 +1,24 @@
-//! Health, readiness, metrics and the OpenAI routes (Phase 0: no model, so 503).
+//! Health, readiness, metrics and the OpenAI routes.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
+use axum::extract::{Extension, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
+use turbine_core::request::Endpoint;
+use turbine_core::types::RequestId;
 use turbine_observability::OPENMETRICS_CONTENT_TYPE;
+use turbine_observability::http::RequestIdExt;
 
-use crate::backend::{ApiState, ReadyState};
+use crate::backend::{ApiState, InferenceRequest, ReadyState};
 use crate::error::ApiError;
+use crate::openai::request::OpenAiRequest;
+use crate::openai::response::{ResponseContext, collect};
+use crate::openai::stream::sse;
 
 pub(super) async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
@@ -41,29 +49,98 @@ pub(super) async fn models(State(state): State<ApiState>) -> Json<serde_json::Va
     Json(json!({"object": "list", "data": state.inference.models()}))
 }
 
-/// Read (and bound) the body before answering, so oversized requests get 413, not 503.
-fn check_body(state: &ApiState, body: Result<Bytes, BytesRejection>) -> Result<(), ApiError> {
-    match body {
-        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-            Err(ApiError::request_too_large(state.limits.max_request_bytes))
-        }
-        // Phase 0 does not parse inference bodies (Phase 2): any other body outcome is irrelevant.
-        _ => Ok(()),
-    }
-}
-
 pub(super) async fn chat_completions(
     State(state): State<ApiState>,
+    request_id: Option<Extension<RequestIdExt>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    check_body(&state, body)?;
-    Err(ApiError::model_not_loaded())
+    generate(state, Endpoint::ChatCompletions, request_id, body).await
 }
 
 pub(super) async fn completions(
     State(state): State<ApiState>,
+    request_id: Option<Extension<RequestIdExt>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    check_body(&state, body)?;
-    Err(ApiError::model_not_loaded())
+    generate(state, Endpoint::Completions, request_id, body).await
+}
+
+/// Shared completions/chat handler. Every error before `submit` returns a plain HTTP error and
+/// is reported through `record_rejection`; a `submit` error is a plain HTTP error even for
+/// `stream: true` (the engine counts those itself).
+async fn generate(
+    state: ApiState,
+    endpoint: Endpoint,
+    request_id: Option<Extension<RequestIdExt>>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    let created = unix_seconds();
+    let reject = |e: ApiError| {
+        state.inference.record_rejection(endpoint, e.code);
+        e
+    };
+    let (body, model) = admit(&state, endpoint, body).map_err(reject)?;
+
+    let id = RequestId::new_v4();
+    let stream = body.stream == Some(true);
+    let ctx = ResponseContext {
+        id: ResponseContext::response_id(endpoint, id),
+        endpoint,
+        created,
+        model,
+        logprobs: body.logprobs_n(endpoint).is_some(),
+        token_ids_as_text: body.return_tokens_as_token_ids == Some(true),
+        include_usage: body.include_usage(),
+        backend: state.inference.clone(),
+    };
+    let http_request_id = request_id
+        .map(|Extension(RequestIdExt(r))| r)
+        .unwrap_or_default();
+    let events = state
+        .inference
+        .submit(InferenceRequest {
+            id,
+            endpoint,
+            body,
+            http_request_id,
+        })
+        .await?;
+    if stream {
+        Ok(sse(events, ctx).into_response())
+    } else {
+        Ok(Json(collect(events, ctx).await?).into_response())
+    }
+}
+
+/// Body limit, model presence, JSON parsing, field validation and the `model` check, in that
+/// order. Returns the parsed body and the requested model id.
+fn admit(
+    state: &ApiState,
+    endpoint: Endpoint,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<(OpenAiRequest, String), ApiError> {
+    let bytes = match body {
+        Ok(bytes) => bytes,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return Err(ApiError::request_too_large(state.limits.max_request_bytes));
+        }
+        Err(rejection) => return Err(ApiError::invalid_request(rejection.body_text())),
+    };
+    let served = state.inference.models();
+    if served.is_empty() {
+        return Err(ApiError::model_not_loaded());
+    }
+    let body = OpenAiRequest::from_slice(&bytes)?;
+    body.validate(endpoint)?;
+    let model = body.model.clone().unwrap_or_default();
+    if !served.iter().any(|card| card.id == model) {
+        return Err(ApiError::model_not_found(&model));
+    }
+    Ok((body, model))
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
