@@ -18,6 +18,17 @@ pub struct BlockPoolConfig {
     pub num_blocks: u32,
 }
 
+impl BlockPoolConfig {
+    /// As many whole blocks as fit in `bytes` (`kv.gpu.max_bytes`). A zero-byte layout (the
+    /// simulator's) yields 0 blocks; the simulator sets `num_blocks` directly.
+    pub fn for_bytes(layout: KvLayout, bytes: u64) -> BlockPoolConfig {
+        let num_blocks = bytes
+            .checked_div(layout.block_bytes())
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+        BlockPoolConfig { layout, num_blocks }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
     #[error("KV block pool exhausted: requested {requested} blocks, {available} free")]
@@ -249,12 +260,15 @@ mod tests {
             p.free.len(),
             "a block is on the free list twice"
         );
+        let mut held = vec![0usize; p.total_blocks() as usize];
+        for t in tables {
+            for b in &t.blocks {
+                held[b.0 as usize] += 1;
+            }
+        }
         for b in 0..p.total_blocks() {
             let id = BlockId(b);
-            let holders = tables
-                .iter()
-                .map(|t| t.blocks.iter().filter(|x| **x == id).count())
-                .sum::<usize>();
+            let holders = held[b as usize];
             assert_eq!(
                 p.refcounts[b as usize] as usize, holders,
                 "refcount of {id:?} differs from the tables holding it"

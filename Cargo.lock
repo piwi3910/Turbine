@@ -1928,10 +1928,13 @@ dependencies = [
 name = "turbine-kv"
 version = "0.1.0"
 dependencies = [
+ "prometheus-client",
  "proptest",
  "serde",
+ "serde_json",
  "smallvec",
  "thiserror 2.0.21",
+ "tracing",
  "turbine-core",
  "turbine-observability",
  "turbine-tensor",

@@ -13,9 +13,13 @@ turbine-tensor.workspace = true
 serde.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
+# KvMetrics gauge family and the startup `kv_pool` log line
+prometheus-client.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+serde_json.workspace = true
 
 # Device memory is reached only through turbine-tensor's safe `DeviceMemory` trait.
 [lints.rust]
