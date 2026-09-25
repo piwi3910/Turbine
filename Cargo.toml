@@ -16,6 +16,7 @@ turbine-api = { path = "crates/turbine-api" }
 turbine-tensor = { path = "crates/turbine-tensor" }
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
+futures-util = "0.3.34"
 libloading = "0.9.0"
 nvml-wrapper = "0.13.0"
 prometheus-client = "0.25.1"

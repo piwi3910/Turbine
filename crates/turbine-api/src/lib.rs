@@ -3,11 +3,12 @@
 
 pub mod backend;
 pub mod error;
+pub mod openai;
 mod routes;
 
 pub use backend::{
-    ApiLimits, ApiState, Diagnostics, InferenceBackend, ModelCard, NotReadyReason, Readiness,
-    ReadyState,
+    ApiLimits, ApiState, BoxFuture, Diagnostics, GenerationStream, InferenceBackend,
+    InferenceRequest, ModelCard, NotReadyReason, Readiness, ReadyState,
 };
 pub use error::{ApiError, ErrorType};
 pub use routes::router;

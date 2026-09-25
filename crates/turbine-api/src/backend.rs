@@ -1,11 +1,34 @@
 //! Traits through which the API reaches the engine and diagnostics (implemented by turbine-server).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::Serialize;
+use turbine_core::request::{Endpoint, ErrorCode, GenerationEvent};
+use turbine_core::types::RequestId;
 use turbine_observability::MetricsRegistry;
 
 use crate::error::ApiError;
+use crate::openai::request::OpenAiRequest;
+
+/// A boxed, sendable future (keeps [`InferenceBackend`] object-safe).
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Per-request event stream from the engine (bounded: 64 events in Phase 1). Dropping the
+/// receiver is the cancellation signal: the engine stops generating when its send fails.
+pub type GenerationStream = tokio::sync::mpsc::Receiver<GenerationEvent>;
+
+/// A validated OpenAI request handed to the engine.
+#[derive(Clone, Debug)]
+pub struct InferenceRequest {
+    /// Created by the API; rendered as `cmpl-<uuid>` / `chatcmpl-<uuid>` in responses.
+    pub id: RequestId,
+    pub endpoint: Endpoint,
+    pub body: OpenAiRequest,
+    /// `x-request-id` of the HTTP request: a log field, never a metric label.
+    pub http_request_id: String,
+}
 
 /// `GET /v1/models` entry (empty list in Phase 0).
 #[derive(Clone, Debug, Serialize)]
@@ -17,9 +40,28 @@ pub struct ModelCard {
     pub max_model_len: u32,
 }
 
-/// Inference entry point. Phase 0 exposes the model list only; P1 adds `submit`.
+/// Inference entry point: the model list and request submission.
 pub trait InferenceBackend: Send + Sync {
     fn models(&self) -> Vec<ModelCard>;
+
+    /// Start a generation. An `Err` is returned before any event (templating, context length,
+    /// busy slot) and becomes a plain HTTP error even for streaming requests. The default is
+    /// the no-model answer, 503 `model_not_loaded`.
+    fn submit(&self, req: InferenceRequest) -> BoxFuture<'_, Result<GenerationStream, ApiError>> {
+        drop(req);
+        Box::pin(async { Err(ApiError::model_not_loaded()) })
+    }
+
+    /// Display text of one token for logprob entries; the default is the id form `token_id:<id>`.
+    fn token_text(&self, token_id: u32) -> String {
+        format!("token_id:{token_id}")
+    }
+
+    /// Count a request the API rejected before `submit`
+    /// (`turbine_requests_total{outcome="rejected"}`). The default records nothing.
+    fn record_rejection(&self, endpoint: Endpoint, code: ErrorCode) {
+        let _ = (endpoint, code);
+    }
 }
 
 /// `/turbine/v1/*` documents. Each returns the JSON document or `ApiError::not_implemented()`.
@@ -49,6 +91,10 @@ pub enum ReadyState {
 #[non_exhaustive]
 pub enum NotReadyReason {
     NoModelLoaded,
+    /// Startup is loading weights or warming up.
+    LoadingModel,
+    ModelLoadFailed,
+    DeviceError,
 }
 
 impl NotReadyReason {
@@ -56,6 +102,9 @@ impl NotReadyReason {
     pub fn as_str(self) -> &'static str {
         match self {
             NotReadyReason::NoModelLoaded => "no_model_loaded",
+            NotReadyReason::LoadingModel => "loading_model",
+            NotReadyReason::ModelLoadFailed => "model_load_failed",
+            NotReadyReason::DeviceError => "device_error",
         }
     }
 }
