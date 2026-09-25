@@ -1,0 +1,2074 @@
+# Turbine cross-phase interface contract
+
+Status: binding for every implementation plan of phases 0, 1, 2, 2b, 3, 4, 5, 6, 7 and 8 (umbrella).
+Date: 2026-09-25. Inputs: `turbine-spec.md` (cited "TS §N"), `.procoder/specs/phase-*.md` (cited "P0 §Interfaces", "P3 S-9", …), `.procoder/ask/decisions.md` (cited "DEC"), `AGENTS.md`.
+
+## 0. How to read this contract
+
+| Rule                | Meaning                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Verbatim            | A name that a spec already fixes is copied exactly and cited, e.g. `Collective` (P5 §Interfaces).                                                                                                                                                                                                                                                                                                        |
+| `(contract-chosen)` | The specs are silent; this contract picks a conventional Rust name/shape. Plans MUST use it.                                                                                                                                                                                                                                                                                                             |
+| `(CONFLICT C-n)`    | Two sources disagree; the contract picks one. Inline `(CONFLICT C-n)` is shorthand for the full `(CONFLICT: spec A says X, spec B says Y — chose X because …)` entry C-n in §23, where every conflict is listed. The pick is binding for every plan, including the earlier phase (plans are written in parallel against this contract, so an earlier-phase plan implements the final name from day one). |
+| "P<n> adds"         | The phase whose plan creates or extends the item. A later phase may only _add_ fields/variants/functions unless a conflict resolution says otherwise.                                                                                                                                                                                                                                                    |
+| Toolchain           | Edition 2024, `rust-version = "1.97"`, `license = "Apache-2.0"` in `[workspace.package]`, inherited by every crate (P0 S-1).                                                                                                                                                                                                                                                                             |
+| Non-exhaustive      | Every public enum that a later phase extends is `#[non_exhaustive]` (contract-chosen). Every public config struct is `#[serde(deny_unknown_fields, default)]` (P0 "unknown keys are errors").                                                                                                                                                                                                            |
+| Errors              | Every crate has one top-level error enum deriving `thiserror::Error` (TS §6).                                                                                                                                                                                                                                                                                                                            |
+| Clock               | Every time-dependent component takes `Arc<dyn turbine_core::clock::Clock>` (P3 S-1), never calls `Instant::now()` directly (contract-chosen generalisation).                                                                                                                                                                                                                                             |
+| Bounded label sets  | Every metric label value comes from a closed Rust enum rendered with its `as_str()`; no request id, path or address is ever a label value (P0, P3, P6).                                                                                                                                                                                                                                                  |
+
+---
+
+## 1. Crate map
+
+### 1.1 Crates
+
+| Crate (path)                                             | Created | Single responsibility                                                                                                                                                                                                                                                                              | `unsafe` status                                                                                                 | May depend on (internal)                                                                      |
+| -------------------------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `turbine-core` (`crates/turbine-core`)                   | P0      | Config model + validation, byte-size/duration parsing, shared vocabulary types (ids, vendor, dtype, pressure/circuit states, sampling params, generation events), `Clock`, telemetry sample types, support matrix (P8)                                                                             | `unsafe_code = "forbid"`                                                                                        | —                                                                                             |
+| `turbine-observability` (`crates/turbine-observability`) | P0      | tracing subscriber init, Prometheus registry wrapper + render, HTTP request-id / HTTP-metrics tower layers                                                                                                                                                                                         | forbid                                                                                                          | core                                                                                          |
+| `turbine-device` (`crates/turbine-device`)               | P0      | GPU discovery (NVML, amd-smi FFI), static inventory; P3 live telemetry sampler + `/proc` parsers; P5 node-local topology graph; P7 capability records                                                                                                                                              | **allowed** (FFI to NVML/amd-smi; every block `// SAFETY:`)                                                     | core, observability                                                                           |
+| `turbine-tensor` (`crates/turbine-tensor`)               | P1      | `DType` re-export, `Tensor`, `DeviceBuffer`, `DeviceSlice`, `StreamRef`, the safe `DeviceMemory`/`PinnedMemory`/`CopyEngine` traits that backends implement, host-memory backend                                                                                                                   | forbid                                                                                                          | core                                                                                          |
+| `turbine-kernels` (`crates/turbine-kernels`)             | P1      | Kernel capability traits, registry, `cpu-reference` provider, runtime-loaded shim bindings (`ShimLibrary`) for `libturbine_hip.so` / `libturbine_cuda.so`, P4 pinned host memory + copy streams (see CONFLICT C-6), `test_support`                                                                 | **allowed** (FFI to shims)                                                                                      | core, observability, tensor, device                                                           |
+| `turbine-model` (`crates/turbine-model`)                 | P1      | HF config parsing + allowlist/registry, safetensors loader, tokenizer + chat template, executors (Llama P1, OLMoE P2, P8c families), sampling + generation loop, startup memory budget (P1–P2), llguidance structured output (P2), tool-call parsing (P2), tiny synthetic checkpoints              | forbid                                                                                                          | core, observability, tensor, kernels, device, distributed (P5+: `collective`, `tp`, `expert`) |
+| `turbine-scheduler` (`crates/turbine-scheduler`)         | P2      | Request lifecycle, waiting/prefill/decode queues, per-iteration batch selection, preemption, deterministic simulator; P7 PD request flow, PD worker router, pipeline micro-batch scheduling                                                                                                        | forbid                                                                                                          | core, observability, reliability (P3+), kv                                                    |
+| `turbine-kv` (`crates/turbine-kv`)                       | P2      | P2 block pool + block tables + KV metrics; P4 identity, directory, tiers, policy, planner, transfer, session; P6 cluster directory + L3 tier adapter; P7 TKV1 wire format                                                                                                                          | forbid (device memory only through `turbine-tensor` traits)                                                     | core, observability, tensor, reliability (P3+)                                                |
+| `turbine-reliability` (`crates/turbine-reliability`)     | P3      | Memory budget + pools, reservation ledger, emergency reserve, pressure signals + state machine, exhaustion horizon, admission, throttle planner, recovery, circuit breaker; P5 multi-device accounting                                                                                             | forbid                                                                                                          | core, observability                                                                           |
+| `turbine-transport` (`crates/turbine-transport`)         | P6      | `Transport` trait, TCP + `mem` transports, frame codec; P7 `rdma` transport (ibverbs) and segmented bulk-transfer engine                                                                                                                                                                           | P6: forbid; P7: `#![deny(unsafe_code)]` at root, `#[allow(unsafe_code)]` only on module `rdma` (P7 Constraints) | core, observability                                                                           |
+| `turbine-distributed` (`crates/turbine-distributed`)     | P5      | `Collective` trait + `host` and `nccl_api` backends, parallel planner, rank runtime, TP sharding rules, DP router, `turbine-collbench`; P6 proto, auth, membership, cluster topology, placement, forwarding, cluster sim; P7 pipeline partitioner, expert placement/dispatch, capability validator | `#![deny(unsafe_code)]`; `#[allow(unsafe_code)]` only on `collective::ffi` (P5 Constraints)                     | core, observability, tensor, device, reliability, kv, transport (P6+)                         |
+| `turbine-api` (`crates/turbine-api`)                     | P0      | Axum router, OpenAI request/response types, OpenAI error shape, diagnostics routes; talks to the engine only through traits it defines                                                                                                                                                             | forbid                                                                                                          | core, observability, device                                                                   |
+| `turbine-server` (`crates/turbine-server`)               | P0      | `turbine-server` binary: CLI, startup order, engine thread (P2), KV orchestrator task (P4), wiring of every crate, exit codes, `fault-injection` feature (P3)                                                                                                                                      | forbid                                                                                                          | all crates above                                                                              |
+| `turbine-bench` (`benches/turbine-bench`)                | P0      | Binaries `turbine-bench` (P0), `turbine-golden` (P1); `kv-sim` (P4), `kv-transfer` (P7) subcommands                                                                                                                                                                                                | forbid                                                                                                          | core, kv (P4+), transport (P7+)                                                               |
+
+Crates never created: none — all 13 TS §5 crates appear (DEC "only crates with content"; each created in the phase that gives it content, P0 Out of scope). `docs/` and a root `tests/` crate are not created (contract-chosen: root `tests/` holds only fixtures, see §2).
+
+### 1.2 Dependency DAG (no cycles)
+
+```text
+turbine-core
+ ├─ turbine-observability
+ │   ├─ turbine-device
+ │   ├─ turbine-reliability ────────────┐
+ │   └─ turbine-transport               │
+ ├─ turbine-tensor                      │
+ │   ├─ turbine-kernels ← device        │
+ │   └─ turbine-kv ← reliability ◄──────┘
+ │        └─ turbine-scheduler ← reliability
+ ├─ turbine-distributed ← tensor, device, reliability, kv, transport
+ ├─ turbine-model ← tensor, kernels, device, distributed
+ ├─ turbine-api ← observability, device
+ ├─ turbine-server ← everything
+ └─ turbine-bench ← core, kv, transport
+```
+
+Hard constraints (from specs, checked by tests):
+
+| Constraint                                                                                                                                                                                                                                    | Source                                                                                                                                                                                | Check                                                                                                                                                               |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `turbine-scheduler` has no `turbine-kernels`, `turbine-model` or GPU crate in its tree                                                                                                                                                        | P2 AC S-1                                                                                                                                                                             | `cargo tree -p turbine-scheduler`                                                                                                                                   |
+| `turbine-reliability` has no `nvml-wrapper`, `libloading`, GPU crate, `unsafe`                                                                                                                                                                | P3 AC S-1                                                                                                                                                                             | `cargo tree -p turbine-reliability` — hence reliability does **not** depend on `turbine-device`; shared device vocabulary lives in `turbine-core` (contract-chosen) |
+| No crate links CUDA/HIP/NVML/ROCm/NCCL/ibverbs at build time; no `cudarc`                                                                                                                                                                     | P0, P1, P2b, P5, P7                                                                                                                                                                   | `cargo tree --workspace`                                                                                                                                            |
+| `turbine-kv` and `turbine-scheduler` do not depend on `turbine-kernels`                                                                                                                                                                       | P2 constraints + DAG (contract-chosen: KV device memory flows through `turbine_tensor::DeviceMemory`, implemented by `turbine-kernels::ShimContext` and injected by `turbine-server`) | `cargo tree`                                                                                                                                                        |
+| No public item of `turbine-kernels`, `turbine-tensor`, `turbine-scheduler`, `turbine-kv`, `turbine-reliability` names a vendor type (`cuda`, `hip`, `rocm`, `nccl`, `rccl`, `cublas`, `sycl`, `level_zero`) except backend-enum variant names | P8 S-5                                                                                                                                                                                | `turbine-kernels --test vendor_neutral_api`                                                                                                                         |
+
+### 1.3 `unsafe` allowlist (test `turbine-kernels --test unsafe_isolation`)
+
+| Phase | Allowlisted paths (all others: none; every block preceded by `// SAFETY:`)                                       |
+| ----- | ---------------------------------------------------------------------------------------------------------------- |
+| P0    | `crates/turbine-device/src` (P0 checks with grep in its AC; the test binary arrives P1)                          |
+| P1    | + `crates/turbine-kernels/src`                                                                                   |
+| P5    | + `crates/turbine-distributed/src/collective/ffi` (file `ffi.rs` or dir `ffi/`)                                  |
+| P7    | + `crates/turbine-transport/src/rdma` (CONFLICT C-19 with P8 Constraints, which omits the P5 module — both stay) |
+
+Manifests: every crate except `turbine-device`, `turbine-kernels`, `turbine-distributed` (P5+), `turbine-transport` (P7+) sets `[lints.rust] unsafe_code = "forbid"`; the two P5/P7 crates set `unsafe_code = "deny"` in the manifest and `#[allow(unsafe_code)]` on the single module (contract-chosen mechanism; P5 says `#![deny(unsafe_code)]` at crate root).
+
+### 1.4 Workspace external dependencies (added by phase)
+
+| Phase | Runtime                                                                                                                                                                                                                                                                                                  | Dev                                         |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| P0    | `tokio`, `axum` 0.8, `serde`, `serde_json` (contract-chosen: needed for JSON bodies), `serde_norway`, `tracing`, `tracing-subscriber`, `prometheus-client`, `thiserror`, `clap` 4, `nvml-wrapper`, `libloading`, `reqwest` (bench), `tower-http`, `tower` (contract-chosen), `uuid` v4 (contract-chosen) | —                                           |
+| P1    | `safetensors`, `tokenizers` (default features off, `onig` off, `fancy-regex` on), `minijinja`, `minijinja-contrib` (pycompat), `smallvec`, `half`, `rand_chacha`                                                                                                                                         | `cc` (build.rs stub shims, contract-chosen) |
+| P2    | `llguidance`, `toktrie_hf_tokenizers` (exact pins)                                                                                                                                                                                                                                                       | `proptest`, `jsonschema`                    |
+| P4    | `blake3`, `crc32c`                                                                                                                                                                                                                                                                                       | —                                           |
+| P5    | `postcard`                                                                                                                                                                                                                                                                                               | —                                           |
+| P6    | `hmac`, `sha2`, `rand`                                                                                                                                                                                                                                                                                   | —                                           |
+| P8    | —                                                                                                                                                                                                                                                                                                        | `syn` (vendor_neutral_api test)             |
+
+---
+
+## 2. File layout
+
+```text
+Cargo.toml                         # [workspace] members = crates/*, benches/turbine-bench   (P0)
+LICENSE                            # Apache-2.0 text (P0)
+AGENTS.md / CLAUDE.md              # Commands section updated each phase (P0 S-8)
+crates/
+  turbine-core/src/{lib.rs, config/…, types.rs, clock.rs, request.rs, telemetry.rs, support.rs}
+  turbine-observability/src/{lib.rs, tracing.rs, metrics.rs, http.rs}
+  turbine-device/src/{lib.rs, discovery/{mod.rs,nvml.rs,amd_smi.rs}, inventory.rs,
+                      telemetry/{mod.rs,proc.rs,vendor.rs} (P3), topology/{mod.rs,sysfs.rs} (P5), capability.rs (P7)}
+  turbine-device/tests/{lab.rs, fixtures/{proc/…, topology/{novanas,dgx-spark,dgx-spark2}/…}}   (fixture dirs contract-chosen)
+  turbine-tensor/src/{lib.rs, dtype.rs, tensor.rs, buffer.rs, host.rs}
+  turbine-kernels/src/{lib.rs, ffi.rs, shim.rs, registry.rs, ops/…, cpu/…, pinned.rs (P4), test_support.rs}
+  turbine-kernels/build.rs         # builds stub shim .so files for tests with the host C compiler (P1, P2b)
+  turbine-kernels/tests/{unsafe_isolation.rs, abi_header_neutral.rs, hip_ops.rs, cuda_ops.rs (P2b), lab.rs (P4), vendor_neutral_api.rs (P8)}
+  turbine-model/src/{lib.rs, config.rs, safetensors.rs, loader.rs, tokenizer.rs, chat_template.rs, budget.rs,
+                     executor/{mod.rs,llama.rs,olmoe.rs (P2)}, sampler.rs, generate.rs, structured.rs (P2), tools.rs (P2),
+                     registry.rs (P8c), testing/tiny.rs}
+  turbine-model/tests/{tiny_model.rs, golden.rs, fixtures/{llama-3.2-3b-instruct/, olmoe-1b-7b-0125-instruct/ (P2)}}
+  turbine-scheduler/src/{lib.rs, request.rs, queue.rs, scheduler.rs, sim/…, pd.rs (P7), router.rs (P7), pipeline.rs (P7)}
+  turbine-scheduler/tests/{overload_sim.rs (P3), kv_sim.rs (P4), sim.rs (P7)}
+  turbine-kv/src/{lib.rs, pool.rs, table.rs, metrics.rs, identity.rs (P4), directory/… (P4, P6), tier/{mod.rs,l0.rs,l1.rs,l2.rs,mem.rs,l3.rs (P6)},
+                  policy.rs, planner.rs, transfer.rs, session.rs (P4), tkv1.rs (P7)}
+  turbine-reliability/src/{lib.rs, budget.rs, ledger.rs, reserve.rs, signals.rs, state.rs, horizon.rs, admission.rs,
+                           throttle.rs, recovery.rs, circuit.rs, controller.rs, document.rs, multi_device.rs (P5)}
+  turbine-transport/src/{lib.rs, frame.rs, tcp.rs, mem.rs, rdma/… (P7), transfer.rs (P7)}
+  turbine-transport/tests/{transfer.rs (P7), lab.rs (P7)}
+  turbine-distributed/src/{lib.rs, collective/{mod.rs,host.rs,ffi.rs}, plan.rs, rank.rs, tp.rs, router.rs, bin/turbine-collbench.rs (P5),
+                           proto.rs, auth.rs, membership.rs, topology.rs, placement.rs, forward.rs, sim/… (P6),
+                           pipeline.rs, expert.rs, capability.rs (P7)}
+  turbine-distributed/tests/ep_lab.rs (P7)
+  turbine-api/src/{lib.rs, routes/…, openai/…, error.rs, backend.rs}
+  turbine-api/tests/api.rs
+  turbine-server/src/{main.rs, cli.rs, startup.rs, engine/… (P2), kv_orchestrator.rs (P4), exit.rs}
+  turbine-server/tests/{server_cli.rs, tiny_server.rs (P1), lab_openai.rs (P2), fault.rs (P3), kv_gpu.rs (P4)}
+benches/turbine-bench/src/{main.rs (turbine-bench), bin/turbine-golden.rs (P1), prompt.rs, report.rs, golden/… , kv_sim.rs (P4), kv_transfer.rs (P7)}
+benches/turbine-bench/tests/{bench.rs, golden.rs (P1), lab_scripts.rs (P2b), kv_sim.rs (P4)}
+kernels/
+  include/turbine_kernels.h        # vendor-neutral C ABI (P1; extended P2, P4, P5, P7, P8a)
+  rocm/{CMakeLists.txt, src/…, third_party/LICENSES/}      # libturbine_hip.so (P1)
+  cuda/{CMakeLists.txt, src/…, third_party/LICENSES/}      # libturbine_cuda.so (P2b)
+scripts/
+  lab-test.sh (P0)  lab-serve.sh (P1)  overload-soak.sh (P3)  lab-cluster.sh (P5)  lab-pd.sh (P7)
+  golden/hf_reference.py (P1)
+  lab/ novanas-test-job.yaml (P0) novanas-serve-job.yaml (P1) novanas-vllm-job.yaml (P2) spark.Dockerfile (P2b)
+       weights-manifest.sh (P2b) phase1-novanas.yaml (P1) phase2-novanas-{llama,olmoe}.yaml (P2)
+       phase2b-spark-{llama,olmoe}.yaml (P2b) pd-prefill-spark.yaml pd-decode-spark2.yaml pp2-spark.yaml
+       ep2-novanas.yaml pd-prefill-novanas.yaml k3s/{ep2-novanas-job.yaml,pd-prefill-novanas-job.yaml} (P7)
+       phase8-<track>-<host>.yaml (P8 tracks)
+tests/
+  golden/prompts.jsonl (P1)
+  golden/llama-3.2-3b-instruct/{reference.jsonl,tolerance.json} (P1)
+  golden/olmoe-1b-7b-0125-instruct/{reference.jsonl,tolerance.json} (P2)   # slug form: CONFLICT C-15
+  golden/tools/*.jsonl (P2)
+  eval/{gsm8k-200.jsonl, NOTICE, <model-slug>/<engine>.json} (P8)
+target/soak/<host>-<timestamp>/ (P3, written by overload-soak.sh on the workstation; not committed)
+```
+
+Model slugs (directory names under `/home/piwi/turbine-models/` and `tests/golden/`): `llama-3.2-3b-instruct`, `olmoe-1b-7b-0125-instruct` (P1, P2; CONFLICT C-15). Draft model for P8b: `llama-3.2-1b-instruct` (contract-chosen slug).
+
+---
+
+## 3. `turbine-core`
+
+### 3.1 Module map
+
+| Path                      | Phase                                                | Contents                                                                                                                       |
+| ------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `turbine_core::config`    | P0 (extended every phase)                            | `Config` + section structs (§3.2), `ByteSize`, `HumanDuration`, `Override`, `load`, `ConfigError`                              |
+| `turbine_core::types`     | P0 (extended)                                        | Shared vocabulary (§3.4)                                                                                                       |
+| `turbine_core::clock`     | P2 (contract-chosen; first user is the P2 simulator) | `Clock`, `SystemClock`, `FakeClock`                                                                                            |
+| `turbine_core::request`   | P1 (extended)                                        | `SamplingParams`, `StopConditions`, `GenerationRequest`, `GenerationEvent`, `Usage`, `FinishReason`, `ResourceEstimate` (§3.5) |
+| `turbine_core::telemetry` | P3                                                   | `TelemetrySample`, `HostSample`, `DeviceSample`, `SourceStatus`, `LedgerProbe` (§3.6)                                          |
+| `turbine_core::support`   | P8                                                   | Support matrix (§3.7)                                                                                                          |
+
+### 3.2 Configuration model
+
+Loading (P0 §Interfaces):
+
+```rust
+pub fn load(path: &Path, overrides: &[Override]) -> Result<Config, ConfigError>;   // read → apply --set → validate
+pub struct Override { pub key: String, pub value: serde_norway::Value }
+impl std::str::FromStr for Override { type Err = ConfigError; }                    // "<dotted.key>=<yaml scalar>"
+impl Config {
+    pub fn validate(&self) -> Result<(), ConfigError>;                                  // static rules → exit 2
+    pub fn validate_host(&self, host: &HostFacts) -> Result<(), ConfigError>;           // P4 (contract-chosen): rules needing MemTotal/free disk; exit 2 or 1 per key table
+}
+pub struct HostFacts { pub mem_total_bytes: Option<u64>, pub disk_free_bytes: Option<u64> }        // (contract-chosen)
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {                                                                   // (contract-chosen variants)
+    #[error("cannot read {path}: {source}")]          Io { path: PathBuf, source: std::io::Error },
+    #[error("{path}: not valid YAML: {detail}")]      Syntax { path: PathBuf, detail: String },
+    #[error("{key}: unknown key")]                     UnknownKey { key: String },
+    #[error("{key}: {reason}")]                        Invalid { key: String, reason: String },
+    #[error("--set {arg}: {reason}")]                  BadOverride { arg: String, reason: String },
+}
+impl ConfigError { pub fn key(&self) -> Option<&str>; }
+```
+
+Value types:
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)] pub struct ByteSize(pub u64);  // P0: int or "<int><B|KB|MB|GB|TB|KiB|MiB|GiB|TiB>", no space, case-sensitive
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)] pub struct HumanDuration(pub std::time::Duration); // P2: "<int><ms|s|m|h>", no space (CONFLICT C-14: one parser, all four units, every phase)
+#[derive(Clone, Copy, Debug)] pub enum SizeOrAuto { Auto, Size(u32) }                     // P5 "integer or auto"
+```
+
+Root and sections (every struct `#[derive(Deserialize, Serialize, Clone, Debug)] #[serde(deny_unknown_fields, default)]`; field = YAML key):
+
+```rust
+pub struct Config {
+    pub server: ServerConfig,                 // P0
+    pub model: ModelConfig,                   // P0
+    pub kv: KvConfig,                         // P0
+    pub reliability: ReliabilityConfig,       // P0
+    pub scheduler: SchedulerConfig,           // P0
+    pub distributed: DistributedConfig,       // P0 (enabled only) / P6 / P7
+    pub logging: LoggingConfig,               // P0
+    pub devices: DevicesConfig,               // P0
+    pub execution: ExecutionConfig,           // P1
+    pub structured_output: StructuredOutputConfig, // P2
+    pub parallel: ParallelConfig,             // P5
+    pub quality: QualityConfig,               // P8
+    pub speculative: SpeculativeConfig,       // P8b (reserved name, P8 §Interfaces; struct body defined by the P8b spec)
+}
+```
+
+Complete key table (type → Rust field type; default; phase; validation and the source):
+
+| Key                                                                                                                                                          | Rust type                                                                   | Default                                                                                 | Phase                          | Validation (exit 2 unless stated)                                                                                                                       |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `server.listen`                                                                                                                                              | `SocketAddr`                                                                | `0.0.0.0:8000`                                                                          | P0                             | parses (lab configs use `0.0.0.0:18000`; CONFLICT C-13)                                                                                                 |
+| `server.max_request_bytes`                                                                                                                                   | `ByteSize`                                                                  | `8MiB`                                                                                  | P0                             | 1 KiB ≤ v ≤ 256 MiB                                                                                                                                     |
+| `server.request_timeout`                                                                                                                                     | `HumanDuration`                                                             | `10m`                                                                                   | P2                             | > 0                                                                                                                                                     |
+| `server.slow_client_timeout`                                                                                                                                 | `HumanDuration`                                                             | `30s`                                                                                   | P2                             | > 0                                                                                                                                                     |
+| `server.shutdown_grace`                                                                                                                                      | `HumanDuration`                                                             | `30s`                                                                                   | P2                             | ≥ 0                                                                                                                                                     |
+| `model.path`                                                                                                                                                 | `PathBuf` (required)                                                        | —                                                                                       | P0                             | non-empty (P0); P1: existing dir with `config.json`, else exit 1 at startup                                                                             |
+| `model.dtype`                                                                                                                                                | `ModelDtype { Bf16 }`                                                       | `bf16`                                                                                  | P0                             | only `bf16`                                                                                                                                             |
+| `model.served_name`                                                                                                                                          | `Option<String>`                                                            | derived                                                                                 | P1                             | non-empty, ≤ 256 chars; default `<org>/<name>` from an HF snapshot path else last path component                                                        |
+| `model.tokenizer`                                                                                                                                            | `Option<PathBuf>`                                                           | `<model.path>/tokenizer.json`                                                           | P1                             | file exists at startup (exit 1)                                                                                                                         |
+| `model.chat_template`                                                                                                                                        | `Option<PathBuf>`                                                           | `chat_template.jinja`, else `tokenizer_config.json`                                     | P1                             | parses at startup (exit 1)                                                                                                                              |
+| `model.max_seq_len`                                                                                                                                          | `Option<u32>`                                                               | min(32768, `max_position_embeddings`)                                                   | P1                             | 1 ≤ v ≤ `max_position_embeddings`                                                                                                                       |
+| `model.tool_call_parser`                                                                                                                                     | `Option<ToolCallParserKind { Llama3Json, None }>`                           | null → `llama3_json` for `LlamaForCausalLM` whose template renders `tools`, else `none` | P2                             | enum                                                                                                                                                    |
+| `kv.block_tokens`                                                                                                                                            | `u32`                                                                       | `16`                                                                                    | P0                             | 1 ≤ v ≤ 1024 (P2b: CUDA paged kernels instantiated for 16 only → other values refused at startup by `_supported`)                                       |
+| `kv.gpu.enabled`                                                                                                                                             | `bool`                                                                      | `true`                                                                                  | P0                             | P2: `false` fails startup; P4: `false` rejected "L0 is required"                                                                                        |
+| `kv.gpu.max_bytes`                                                                                                                                           | `Option<ByteSize>`                                                          | P2: `8GiB`; P3+: null = the `kv` pool remainder of the budget (CONFLICT C-8)            | P2                             | ≥ one block per running request                                                                                                                         |
+| `kv.cpu.enabled`                                                                                                                                             | `bool`                                                                      | `true`                                                                                  | P0                             | P4: ignored with one WARN (`kv_l1_disabled_unified`) on unified devices                                                                                 |
+| `kv.cpu.max_bytes`                                                                                                                                           | `ByteSize`                                                                  | `64GiB`                                                                                 | P0                             | > 0 when enabled; P4: ≤ MemTotal − `reliability.memory.host_reserve_bytes` (exit 2)                                                                     |
+| `kv.nvme.enabled`                                                                                                                                            | `bool`                                                                      | `false`                                                                                 | P0                             | —                                                                                                                                                       |
+| `kv.nvme.path`                                                                                                                                               | `PathBuf`                                                                   | `/var/lib/turbine/kv`                                                                   | P0                             | absolute when enabled; P4: created if absent, writable else exit 1                                                                                      |
+| `kv.nvme.max_bytes`                                                                                                                                          | `ByteSize`                                                                  | `64GiB`                                                                                 | P4                             | > 0; ≤ free space − 10 % (exit 1)                                                                                                                       |
+| `kv.nvme.slab_bytes`                                                                                                                                         | `ByteSize`                                                                  | `1GiB`                                                                                  | P4                             | multiple of block size rounded to 4 KiB                                                                                                                 |
+| `kv.nvme.max_queue_depth`                                                                                                                                    | `u32`                                                                       | `64`                                                                                    | P4                             | 1..1024                                                                                                                                                 |
+| `kv.nvme.io_threads`                                                                                                                                         | `u32`                                                                       | `4`                                                                                     | P4                             | 1..64                                                                                                                                                   |
+| `kv.policy`                                                                                                                                                  | `KvPolicyKind { CostAware, Lru }`                                           | `cost_aware`                                                                            | P4                             | enum                                                                                                                                                    |
+| `kv.demote_min_value`                                                                                                                                        | `f64`                                                                       | `0.0`                                                                                   | P4                             | ≥ 0                                                                                                                                                     |
+| `kv.prefix_sharing`                                                                                                                                          | `bool`                                                                      | `true`                                                                                  | P4                             | —                                                                                                                                                       |
+| `kv.transfer.max_inflight_bytes`                                                                                                                             | `ByteSize`                                                                  | `1GiB`                                                                                  | P4                             | ≥ one block                                                                                                                                             |
+| `kv.session.max_sessions`                                                                                                                                    | `u32`                                                                       | `10000`                                                                                 | P4                             | 1..1_000_000                                                                                                                                            |
+| `kv.session.hot_ttl`                                                                                                                                         | `HumanDuration`                                                             | `60s`                                                                                   | P4                             | —                                                                                                                                                       |
+| `kv.session.warm_ttl`                                                                                                                                        | `HumanDuration`                                                             | `10m`                                                                                   | P4                             | > `hot_ttl`                                                                                                                                             |
+| `kv.session.max_idle`                                                                                                                                        | `HumanDuration`                                                             | `1h`                                                                                    | P4                             | —                                                                                                                                                       |
+| `kv.prefetch.lead_time`                                                                                                                                      | `HumanDuration`                                                             | `2s`                                                                                    | P4                             | —                                                                                                                                                       |
+| `kv.prefetch.max_queue`                                                                                                                                      | `u32`                                                                       | `256`                                                                                   | P4                             | —                                                                                                                                                       |
+| `kv.policy_weights.session_active`                                                                                                                           | `f64`                                                                       | `0.5`                                                                                   | P4                             | 0..1                                                                                                                                                    |
+| `kv.policy_weights.hit_half_life`                                                                                                                            | `HumanDuration`                                                             | `60s`                                                                                   | P4                             | —                                                                                                                                                       |
+| `kv.dtype`                                                                                                                                                   | `KvDtypeChoice { Bf16, Fp8E4m3 }`                                           | `bf16`                                                                                  | P8a (reserved, P8 §Interfaces) | `fp8_e4m3` only once P8a lands                                                                                                                          |
+| `reliability.enabled`                                                                                                                                        | `bool`                                                                      | `true`                                                                                  | P0                             | P3: false = state fixed GREEN; recovery + queue bounds remain                                                                                           |
+| `reliability.emergency_vram_reserve`                                                                                                                         | `ByteSize`                                                                  | `2GiB`                                                                                  | P0                             | P3: < budgeted device memory; 0 allowed (WARN)                                                                                                          |
+| `reliability.adaptive_admission`                                                                                                                             | `bool`                                                                      | `true`                                                                                  | P0                             | P3: false = only hard capacity + queue bounds                                                                                                           |
+| `reliability.memory.workspace_bytes`                                                                                                                         | `ByteSize`                                                                  | `1GiB`                                                                                  | P3                             | > 0                                                                                                                                                     |
+| `reliability.memory.runtime_overhead_bytes`                                                                                                                  | `ByteSize`                                                                  | `1GiB`                                                                                  | P3                             | ≥ 0                                                                                                                                                     |
+| `reliability.memory.device_budget_bytes`                                                                                                                     | `Option<ByteSize>`                                                          | null                                                                                    | P3                             | cap on everything Turbine claims per device (also the P7 "memory budget", CONFLICT C-12)                                                                |
+| `reliability.memory.host_reserve_bytes`                                                                                                                      | `ByteSize`                                                                  | `8GiB`                                                                                  | P3                             | —                                                                                                                                                       |
+| `reliability.telemetry.interval`                                                                                                                             | `HumanDuration`                                                             | `100ms`                                                                                 | P3                             | 50 ms ≤ v ≤ 10 s                                                                                                                                        |
+| `reliability.telemetry.vendor_interval`                                                                                                                      | `HumanDuration`                                                             | `1s`                                                                                    | P3                             | ≥ interval, ≤ 60 s                                                                                                                                      |
+| `reliability.telemetry.call_timeout`                                                                                                                         | `HumanDuration`                                                             | `500ms`                                                                                 | P3                             | < 10 s                                                                                                                                                  |
+| `reliability.telemetry.stale_after`                                                                                                                          | `HumanDuration`                                                             | `5s`                                                                                    | P3                             | > vendor_interval                                                                                                                                       |
+| `reliability.pressure.escalate_samples`                                                                                                                      | `u32`                                                                       | `2`                                                                                     | P3                             | 1..20                                                                                                                                                   |
+| `reliability.pressure.deescalate_dwell`                                                                                                                      | `HumanDuration`                                                             | `10s`                                                                                   | P3                             | ≥ interval                                                                                                                                              |
+| `reliability.pressure.exit_margin`                                                                                                                           | `f64`                                                                       | `0.05`                                                                                  | P3                             | 0 ≤ v < 0.5                                                                                                                                             |
+| `reliability.pressure.thresholds.<signal>`                                                                                                                   | `BTreeMap<PressureSignal, [Option<f64>; 4]>`                                | §8.3 table                                                                              | P3                             | monotonic (ascending, or descending for lower-is-worse); YAML list of 4, `null` = level unused (contract-chosen encoding)                               |
+| `reliability.admission.max_queue`                                                                                                                            | `u32`                                                                       | `256`                                                                                   | P3                             | 1..65536 — bounds the single waiting queue from P3 on (CONFLICT C-1)                                                                                    |
+| `reliability.admission.queue_timeout`                                                                                                                        | `HumanDuration`                                                             | `30s`                                                                                   | P3                             | 1 s..1 h (replaces `scheduler.queue_timeout`, CONFLICT C-1)                                                                                             |
+| `reliability.admission.large_prefill_tokens`                                                                                                                 | `u32`                                                                       | `2048`                                                                                  | P3                             | ≥ block size                                                                                                                                            |
+| `reliability.admission.max_bypass`                                                                                                                           | `u32`                                                                       | `8`                                                                                     | P3                             | —                                                                                                                                                       |
+| `reliability.admission.kv_overcommit`                                                                                                                        | —                                                                           | —                                                                                       | P3                             | removed key: always rejected naming it (P3 AC S-15)                                                                                                     |
+| `reliability.recovery.max_retries`                                                                                                                           | `u32`                                                                       | `3`                                                                                     | P3                             | 0..10                                                                                                                                                   |
+| `reliability.recovery.backoff`                                                                                                                               | `HumanDuration`                                                             | `50ms`                                                                                  | P3                             | doubled per retry                                                                                                                                       |
+| `reliability.circuit.oom_recoveries_to_open`                                                                                                                 | `u32`                                                                       | `3`                                                                                     | P3                             | —                                                                                                                                                       |
+| `reliability.circuit.window`                                                                                                                                 | `HumanDuration`                                                             | `60s`                                                                                   | P3                             | —                                                                                                                                                       |
+| `reliability.circuit.latency_drift_degraded`                                                                                                                 | `f64`                                                                       | `2.0`                                                                                   | P3                             | > 1                                                                                                                                                     |
+| `reliability.circuit.latency_drift_open`                                                                                                                     | `f64`                                                                       | `4.0`                                                                                   | P3                             | > degraded                                                                                                                                              |
+| `reliability.circuit.cooldown`                                                                                                                               | `HumanDuration`                                                             | `30s`                                                                                   | P3                             | —                                                                                                                                                       |
+| `reliability.circuit.drain_timeout`                                                                                                                          | `HumanDuration`                                                             | `120s`                                                                                  | P3                             | —                                                                                                                                                       |
+| `reliability.circuit.probe_successes`                                                                                                                        | `u32`                                                                       | `3`                                                                                     | P3                             | —                                                                                                                                                       |
+| `reliability.fault_injection.{alloc_fail_every, oom_at_iteration, kernel_error_at_iteration, kernel_error_sticky, telemetry_temperature_c, telemetry_delay}` | `Option<FaultInjectionConfig>` behind `#[cfg(feature = "fault-injection")]` | absent                                                                                  | P3                             | present without the feature → `UnknownKey`-style error naming the key. `kernel_error_sticky: bool` (contract-chosen; P3 AC S-12 needs a sticky variant) |
+| `scheduler.continuous_batching`                                                                                                                              | `bool`                                                                      | `true`                                                                                  | P0                             | P2: false forces `max_running_requests = 1`                                                                                                             |
+| `scheduler.chunked_prefill`                                                                                                                                  | `bool`                                                                      | `true`                                                                                  | P0                             | P2: false rejects prompts > `max_batch_tokens` at submission                                                                                            |
+| `scheduler.max_running_requests`                                                                                                                             | `u32`                                                                       | `64`                                                                                    | P2                             | 1..1024                                                                                                                                                 |
+| `scheduler.max_batch_tokens`                                                                                                                                 | `u32`                                                                       | `8192`                                                                                  | P2                             | ≥ max_running_requests and ≥ block_tokens                                                                                                               |
+| `scheduler.prefill_chunk_tokens`                                                                                                                             | `u32`                                                                       | `2048`                                                                                  | P2                             | 1..max_batch_tokens                                                                                                                                     |
+| `scheduler.max_queued_requests`                                                                                                                              | `u32`                                                                       | `256`                                                                                   | P2                             | 1..65536; P2: waiting-queue bound + submission channel capacity; P3+: submission channel capacity only (CONFLICT C-1)                                   |
+| `scheduler.queue_timeout`                                                                                                                                    | `HumanDuration`                                                             | `60s`                                                                                   | P2 only                        | P3 removes the key (rejected as removed, like `kv_overcommit`; CONFLICT C-1)                                                                            |
+| `distributed.enabled`                                                                                                                                        | `bool`                                                                      | `false`                                                                                 | P0                             | P0–P5: `true` rejected "distributed mode is not supported in this build"; P6 accepts                                                                    |
+| `distributed.cluster_name`                                                                                                                                   | `String`                                                                    | `turbine`                                                                               | P6                             | `[a-z0-9-]{1,63}`                                                                                                                                       |
+| `distributed.node_id`                                                                                                                                        | `Option<String>`                                                            | hostname                                                                                | P6                             | `[a-z0-9-]{1,63}`                                                                                                                                       |
+| `distributed.control_listen`                                                                                                                                 | `SocketAddr`                                                                | `0.0.0.0:8100`                                                                          | P6                             | —                                                                                                                                                       |
+| `distributed.control_advertise`                                                                                                                              | `Option<SocketAddr>`                                                        | null                                                                                    | P6                             | required when listen IP unspecified                                                                                                                     |
+| `distributed.data_listen`                                                                                                                                    | `SocketAddr`                                                                | `0.0.0.0:8101`                                                                          | P6                             | port ≠ control and server ports                                                                                                                         |
+| `distributed.data_advertise`                                                                                                                                 | `Option<SocketAddr>`                                                        | null                                                                                    | P6                             | as control                                                                                                                                              |
+| `distributed.seeds`                                                                                                                                          | `Vec<SocketAddr>`                                                           | `[]`                                                                                    | P6                             | —                                                                                                                                                       |
+| `distributed.max_nodes`                                                                                                                                      | `u32`                                                                       | `16`                                                                                    | P6                             | 1..256                                                                                                                                                  |
+| `distributed.groups`                                                                                                                                         | `Option<Vec<CrossNodeGroup>>`                                               | null                                                                                    | P6                             | `CrossNodeGroup { replica: u32, ranks: Vec<GroupRank { node: String, device: DeviceId }> }`                                                             |
+| `distributed.heartbeat.interval`                                                                                                                             | `HumanDuration`                                                             | `1s`                                                                                    | P6                             | 100 ms..10 s                                                                                                                                            |
+| `distributed.heartbeat.suspect_after`                                                                                                                        | `HumanDuration`                                                             | `3s`                                                                                    | P6                             | ≥ 2 × interval                                                                                                                                          |
+| `distributed.heartbeat.dead_after`                                                                                                                           | `HumanDuration`                                                             | `10s`                                                                                   | P6                             | > suspect_after                                                                                                                                         |
+| `distributed.auth.mode`                                                                                                                                      | `AuthMode { Psk, None }`                                                    | `psk`                                                                                   | P6                             | `none` + non-loopback listen → WARN each startup                                                                                                        |
+| `distributed.auth.psk_file`                                                                                                                                  | `Option<PathBuf>`                                                           | null                                                                                    | P6                             | required for psk; ≥ 32 bytes; mode 0600 or stricter                                                                                                     |
+| `distributed.transport.max_frame_bytes`                                                                                                                      | `ByteSize`                                                                  | `16MiB`                                                                                 | P6                             | 64 KiB..256 MiB                                                                                                                                         |
+| `distributed.transport.send_queue_frames`                                                                                                                    | `u32`                                                                       | `1024`                                                                                  | P6                             | 16..65536                                                                                                                                               |
+| `distributed.transport.tcp.data_streams`                                                                                                                     | `u32`                                                                       | `4`                                                                                     | P6                             | 1..16                                                                                                                                                   |
+| `distributed.transport.tcp.connect_timeout`                                                                                                                  | `HumanDuration`                                                             | `5s`                                                                                    | P6                             | —                                                                                                                                                       |
+| `distributed.transport.rdma.enabled`                                                                                                                         | `bool`                                                                      | `false`                                                                                 | P7                             | true requires library + device at startup (exit 1)                                                                                                      |
+| `distributed.transport.rdma.library`                                                                                                                         | `Option<PathBuf>`                                                           | null                                                                                    | P7                             | explicit + unloadable → exit 1                                                                                                                          |
+| `distributed.transport.rdma.device`                                                                                                                          | `Option<String>`                                                            | —                                                                                       | P7                             | required when enabled                                                                                                                                   |
+| `distributed.transport.rdma.gid_index`                                                                                                                       | `GidIndex { Auto, Index(u32) }`                                             | `auto`                                                                                  | P7                             | —                                                                                                                                                       |
+| `distributed.transport.rdma.queue_depth`                                                                                                                     | `u32`                                                                       | `256`                                                                                   | P7                             | 16..4096                                                                                                                                                |
+| `distributed.transport.rdma.bounce_bytes`                                                                                                                    | `ByteSize`                                                                  | `256MiB`                                                                                | P7                             | ≥ 16 MiB                                                                                                                                                |
+| `distributed.forwarding.max_inflight_per_peer`                                                                                                               | `u32`                                                                       | `256`                                                                                   | P6                             | 1..65536                                                                                                                                                |
+| `distributed.kv_directory.enabled`                                                                                                                           | `bool`                                                                      | `true`                                                                                  | P6                             | requires `kv.prefix_sharing`                                                                                                                            |
+| `distributed.kv_directory.max_entries`                                                                                                                       | `u64`                                                                       | `1000000`                                                                               | P6                             | ≥ 1024                                                                                                                                                  |
+| `distributed.kv_directory.announce_interval`                                                                                                                 | `HumanDuration`                                                             | `250ms`                                                                                 | P6                             | 10 ms..10 s                                                                                                                                             |
+| `distributed.kv_fetch.timeout`                                                                                                                               | `HumanDuration`                                                             | `2s`                                                                                    | P6                             | 10 ms..60 s                                                                                                                                             |
+| `distributed.kv_fetch.max_inflight_bytes`                                                                                                                    | `ByteSize`                                                                  | `1GiB`                                                                                  | P6                             | ≥ one block                                                                                                                                             |
+| `distributed.placement.cross_node_tp`                                                                                                                        | `CrossNodeTp { Never, WhenRequired, Declared }`                             | `when_required`                                                                         | P6                             | —                                                                                                                                                       |
+| `distributed.placement.weights.{queue,prefill,transfer,forward,pressure}`                                                                                    | `f64` each                                                                  | `1.0`                                                                                   | P6                             | ≥ 0                                                                                                                                                     |
+| `distributed.role`                                                                                                                                           | `WorkerRole { Prefill, Decode, Both }`                                      | `both`                                                                                  | P7                             | —                                                                                                                                                       |
+| `distributed.pipeline.stages`                                                                                                                                | `u32`                                                                       | `1`                                                                                     | P7                             | 1..layers                                                                                                                                               |
+| `distributed.pipeline.layer_split`                                                                                                                           | `Option<Vec<u32>>`                                                          | null                                                                                    | P7                             | len = stages, each ≥ 1, sum = layers                                                                                                                    |
+| `distributed.pipeline.micro_batches`                                                                                                                         | `Option<u32>`                                                               | = stages                                                                                | P7                             | 1..4×stages                                                                                                                                             |
+| `distributed.expert.parallel_size`                                                                                                                           | `u32`                                                                       | `1`                                                                                     | P7                             | divides routed expert count                                                                                                                             |
+| `distributed.expert.placement`                                                                                                                               | `ExpertPlacementSource { Contiguous, File(PathBuf) }`                       | `contiguous`                                                                            | P7                             | file = YAML `{layer: [rank per expert]}`                                                                                                                |
+| `distributed.expert.max_tokens_per_rank`                                                                                                                     | `u32`                                                                       | `8192`                                                                                  | P7                             | ≥ max_batch_tokens / parallel_size                                                                                                                      |
+| `distributed.pd.enabled`                                                                                                                                     | `bool`                                                                      | `false`                                                                                 | P7                             | requires `distributed.enabled`                                                                                                                          |
+| `distributed.pd.transfer_timeout`                                                                                                                            | `HumanDuration`                                                             | `10s`                                                                                   | P7                             | 100 ms..120 s                                                                                                                                           |
+| `distributed.pd.max_inflight_transfers`                                                                                                                      | `u32`                                                                       | `8`                                                                                     | P7                             | 1..256                                                                                                                                                  |
+| `distributed.pd.fallback`                                                                                                                                    | `PdFallback { Colocate, Reject }`                                           | `colocate`                                                                              | P7                             | —                                                                                                                                                       |
+| `distributed.pd.min_prompt_tokens`                                                                                                                           | `u32`                                                                       | `0`                                                                                     | P7                             | —                                                                                                                                                       |
+| `distributed.kv_conversion.allow_lossy`                                                                                                                      | `bool`                                                                      | `false`                                                                                 | P7                             | true → startup WARN per lossy conversion                                                                                                                |
+| `logging.format`                                                                                                                                             | `LogFormat { Text, Json }`                                                  | `text`                                                                                  | P0                             | —                                                                                                                                                       |
+| `logging.level`                                                                                                                                              | `String`                                                                    | `info`                                                                                  | P0                             | valid `EnvFilter`; `RUST_LOG` overrides                                                                                                                 |
+| `devices.nvml_library`                                                                                                                                       | `Option<PathBuf>`                                                           | null                                                                                    | P0                             | set + load failure → exit 1                                                                                                                             |
+| `devices.amd_smi_library`                                                                                                                                    | `Option<PathBuf>`                                                           | null                                                                                    | P0                             | set (or env `TURBINE_AMD_SMI_LIBRARY`) + load failure → exit 1                                                                                          |
+| `execution.backend`                                                                                                                                          | `ExecutionBackend { Hip, Cuda, Cpu }`                                       | `hip`                                                                                   | P1                             | P1: `cuda` → exit 2 naming `phase-2b-nvidia`; P2b: accepted; backend/device vendor mismatch → exit 1                                                    |
+| `execution.device`                                                                                                                                           | `DeviceId`                                                                  | `0`                                                                                     | P1                             | inventory index; vendor must match backend (exit 1)                                                                                                     |
+| `execution.kernel_library`                                                                                                                                   | `Option<PathBuf>`                                                           | null                                                                                    | P1                             | null → `TURBINE_KERNEL_LIBRARY`, then backend default file (`libturbine_hip.so` / `libturbine_cuda.so`) beside the executable, then loader path         |
+| `structured_output.max_schema_bytes`                                                                                                                         | `ByteSize`                                                                  | `64KiB`                                                                                 | P2                             | 1 KiB..1 MiB                                                                                                                                            |
+| `structured_output.compile_timeout`                                                                                                                          | `HumanDuration`                                                             | `5s`                                                                                    | P2                             | > 0                                                                                                                                                     |
+| `parallel.tensor_parallel_size`                                                                                                                              | `SizeOrAuto`                                                                | `1`                                                                                     | P5                             | 1..8, power of two, divides heads; divides or is a multiple of KV heads                                                                                 |
+| `parallel.data_parallel_size`                                                                                                                                | `SizeOrAuto`                                                                | `1`                                                                                     | P5                             | 1..64                                                                                                                                                   |
+| `parallel.devices`                                                                                                                                           | `DeviceSelection { Auto, List(Vec<DeviceId>) }`                             | `auto`                                                                                  | P5                             | single vendor; len = tp×dp unless sharing                                                                                                               |
+| `parallel.collective_backend`                                                                                                                                | `CollectiveBackendChoice { Auto, Nccl, Rccl, Host }`                        | `auto`                                                                                  | P5                             | vendor/backends rules P5                                                                                                                                |
+| `parallel.nccl_library` / `parallel.rccl_library`                                                                                                            | `Option<PathBuf>`                                                           | null                                                                                    | P5                             | explicit + load failure → exit 1                                                                                                                        |
+| `parallel.allow_device_sharing`                                                                                                                              | `bool`                                                                      | `false`                                                                                 | P5                             | DP replicas only                                                                                                                                        |
+| `parallel.plan_queue_depth`                                                                                                                                  | `u32`                                                                       | `2`                                                                                     | P5                             | 1..16                                                                                                                                                   |
+| `parallel.router`                                                                                                                                            | `DpRouterPolicy { PrefixAffinity, LeastLoaded }`                            | `prefix_affinity`                                                                       | P5                             | —                                                                                                                                                       |
+| `parallel.collective.init_timeout`                                                                                                                           | `HumanDuration`                                                             | `120s`                                                                                  | P5                             | 1 s..30 m                                                                                                                                               |
+| `parallel.collective.op_timeout`                                                                                                                             | `HumanDuration`                                                             | `30s`                                                                                   | P5                             | 100 ms..10 m                                                                                                                                            |
+| `parallel.ranks.mode`                                                                                                                                        | `RankMode { Local, Static }`                                                | `local`                                                                                 | P5                             | static requires tp > 1, dp = 1                                                                                                                          |
+| `parallel.ranks.rank`                                                                                                                                        | `u32`                                                                       | `0`                                                                                     | P5                             | < world size                                                                                                                                            |
+| `parallel.ranks.leader`                                                                                                                                      | `Option<SocketAddr>`                                                        | null                                                                                    | P5                             | required in static                                                                                                                                      |
+| `parallel.ranks.local_devices`                                                                                                                               | `Vec<DeviceId>`                                                             | `[0]`                                                                                   | P5                             | exactly one per rank process                                                                                                                            |
+| `quality.max_accuracy_drop`                                                                                                                                  | `f64`                                                                       | `0.01`                                                                                  | P8                             | 0..0.1                                                                                                                                                  |
+| `speculative.{method, num_tokens, draft_model_path, min_acceptance}`                                                                                         | defined by P8b                                                              | —                                                                                       | P8b                            | names reserved (P8 §Interfaces); `method ∈ {none, draft}`, `num_tokens ≤ 8` (P8 Constraints)                                                            |
+
+Validation order (P0, P1, P3, P5): static `validate()` (exit 2) → device discovery → `validate_host` (P4 rules) → P5 parallel plan (exit 2, before bind) → P8 support-matrix resolution (exit 1 at startup / exit 2 under `--check-config`) → kernel library/model/budget (exit 1).
+
+### 3.3 Cargo features
+
+| Feature           | Crate(s)                                                                                                                                                              | Phase           | Effect                                                                                                                                                                                                      |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fault-injection` | `turbine-server` → enables `turbine-core/fault-injection`, `turbine-reliability/fault-injection`, `turbine-distributed/fault-injection` (contract-chosen propagation) | P3 (P6 extends) | P3: `reliability.fault_injection` section; P6: `POST /turbine/v1/debug/faults`, lab-only header `x-turbine-target-replica: <node_id>/<replica>` (contract-chosen name, P6 AC S-7 "lab-only request header") |
+
+### 3.4 Shared vocabulary (`turbine_core::types`)
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct DeviceId(pub u32);                 // TS §6 name; the Phase 0 global inventory index (P0 §Data)
+pub enum Vendor { Nvidia, Amd }               // serde "nvidia" | "amd" (P0); P8: Intel never added until hardware exists
+pub enum MemoryKind { Dedicated, Unified }    // serde "dedicated" | "unified" (P0)
+pub enum ExecutionBackend { Hip, Cuda, Cpu }  // P1/P2b (config execution.backend)
+pub enum CollectiveBackendKind { Nccl, Rccl, Host }   // P5 name; defined here, re-exported as turbine_distributed::collective::CollectiveBackendKind
+pub enum DType { BF16, F16, F32, I32, I64 }   // P1 S-5; re-exported as turbine_tensor::DType; P8a adds F8E4M3 etc.
+impl DType { pub fn size_bytes(self) -> usize; pub fn abi_code(self) -> i32; pub fn as_str(self) -> &'static str; }
+pub enum KvDtype { Bf16, Fp16, Fp8E4m3PerTensorScale, Fp8E4m3PerBlockScale }  // P7 TKV1 kv_format codes 0..3 (wire_code()); only Bf16 used before P8a
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub struct RequestId(pub uuid::Uuid);         // P2 S-2 (contract-chosen repr). Display with endpoint prefix: "cmpl-<uuid>" | "chatcmpl-<uuid>" (P2 S-2)
+pub struct SeqId(pub u64);                    // one sequence (= one choice of a request); engine-local counter (contract-chosen)
+pub struct BlockId(pub u32);                  // logical L0 block id; P5: allocated by the leader, same id on every rank (P5 §Data)
+pub struct ReplicaId(pub u32);                // P5 DP replica index
+pub struct NodeId(pub String);                // P6, `[a-z0-9-]{1,63}`
+pub struct Priority(pub i32);                 // P2 `priority` (vLLM ext.): lower = served first; default 0 (CONFLICT C-10)
+impl Priority { pub fn class(self) -> PriorityClass; }                    // <0 High, 0 Normal, >0 Low
+pub enum PriorityClass { High, Normal, Low }  // P4 weights 2.0 / 1.0 / 0.5; P6 High excludes ORANGE/RED replicas
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PressureState { Green, Yellow, Orange, Red, Survival }     // TS §9 / P3 S-7; as_u8() 0..4 for gauges; serde "GREEN".."SURVIVAL" everywhere (CONFLICT C-5)
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CircuitState { Healthy, Degraded, CircuitOpen, Draining, Probing }   // TS §9 / P3 S-12; serde "HEALTHY", "CIRCUIT_OPEN", …
+
+pub struct ModelIdentity { pub config_hash: [u8; 32], pub weights_index_hash: [u8; 32] }  // P4 S-1 inputs (BLAKE3 of config.json bytes / of the safetensors index or single-file header), contract-chosen repr
+impl ModelIdentity { pub fn fingerprint(&self) -> ModelFingerprint; }                  // P5 `model_fingerprint`
+pub struct ModelFingerprint(pub [u8; 32]);    // BLAKE3(config_hash ‖ weights_index_hash) (contract-chosen)
+
+pub struct KvLayout {                          // per-token KV description used by budget, estimator, pool, TKV1 (contract-chosen home)
+    pub num_layers: u32, pub num_kv_heads: u32, pub head_dim: u32, pub dtype: DType, pub block_tokens: u32,
+}
+impl KvLayout { pub fn bytes_per_token(&self) -> u64; pub fn block_bytes(&self) -> u64; }  // Llama-3.2-3B BF16: 114_688 / 1_835_008 (P1, P2)
+
+pub struct ModelShape {                        // model description consumed by planners (contract-chosen)
+    pub architecture: String, pub num_layers: u32, pub hidden: u32, pub num_attention_heads: u32,
+    pub num_kv_heads: u32, pub head_dim: u32, pub intermediate: u32, pub vocab: u32,
+    pub num_experts: u32, pub experts_per_token: u32, pub tied_embeddings: bool,
+    pub weight_bytes: u64, pub max_position_embeddings: u32,
+}
+```
+
+### 3.5 Request, sampling and generation events (`turbine_core::request`)
+
+```rust
+pub enum Endpoint { Completions, ChatCompletions }                         // metric label "/v1/completions" | "/v1/chat/completions" (P1)
+pub struct SamplingParams {                                                 // P1 S-9, P2 S-10 (contract-chosen struct)
+    pub temperature: f32, pub top_p: f32, pub top_k: i32, pub seed: Option<u64>,
+    pub presence_penalty: f32, pub frequency_penalty: f32, pub repetition_penalty: f32,   // P2
+    pub logit_bias: Vec<(u32, f32)>, pub min_tokens: u32,                                 // P2
+    pub logprobs: Option<u32>,                                                            // top-N, 0..20
+}
+pub struct StopConditions {
+    pub eos_token_ids: SmallVec<[u32; 4]>, pub stop_strings: Vec<String>, pub stop_token_ids: Vec<u32> /*P2*/,
+    pub max_tokens: u32, pub ignore_eos: bool,
+}
+pub enum FinishReason { Stop, Length, ToolCalls /*P2*/, Error /*P7*/ }   // serde "stop" | "length" | "tool_calls" | "error"
+pub struct Usage { pub prompt_tokens: u32, pub completion_tokens: u32, pub cached_tokens: u32 /*P4*/ }
+
+pub struct GenerationRequest {                                             // built by turbine-server after tokenization (contract-chosen)
+    pub id: RequestId, pub endpoint: Endpoint, pub http_request_id: String /* x-request-id, label only */,
+    pub prompt_tokens: Vec<u32>, pub n: u32 /* P2 */, pub sampling: SamplingParams, pub stop: StopConditions,
+    pub priority: Priority /* P2 */, pub echo: bool /* P2 */, pub constraint: Option<ConstraintSpec> /* P2 */,
+    pub session: Option<SessionHints> /* P4 */, pub cache_salt: Option<String> /* P4 */, pub deadline_ms: u64 /* monotonic, P2 */,
+}
+pub enum ConstraintSpec { JsonObject, JsonSchema { schema: serde_json::Value }, ToolCall { grammar_source: String } }  // P2 S-17/S-18
+#[derive(Clone, Default)] pub struct CancelFlag(Arc<AtomicBool>);   // (contract-chosen) set by HTTP side / timeouts, polled by the engine at iteration boundaries
+impl CancelFlag { pub fn cancel(&self); pub fn is_cancelled(&self) -> bool; }
+pub struct SessionHints { pub session_id: String, pub resume_within_secs: Option<u32>, pub end: bool }                  // P4 §Session hints
+
+#[derive(Serialize, Deserialize)]
+pub enum GenerationEvent {                                                 // per-request stream from engine → API; also P6 `StreamEvent.payload`
+    Started { choice: u32 },                                               // first chunk carries delta.role (P1)
+    Token { choice: u32, text: String, token_id: u32, logprob: Option<f32>, top_logprobs: Vec<(u32, f32)> },
+    ToolCalls { choice: u32, calls: Vec<ToolCallOut> },                    // P2 S-18
+    Finished { choice: u32, reason: FinishReason, usage: Option<Usage> },
+    Error { code: ErrorCode, message: String },                            // ErrorCode: §14.3
+}
+pub struct ToolCallOut { pub index: u32, pub id: String /* "call_" + 24 alnum */, pub name: String, pub arguments: String }
+
+pub struct ResourceEstimate {                                              // P3 §Data (fields verbatim); P2 fills the first three and projected_kv_blocks
+    pub prompt_tokens: u32, pub cached_prefix_tokens: u32 /* 0 until P4 */, pub new_prefill_tokens: u32,
+    pub max_output_tokens: u32, pub projected_kv_blocks: u32, pub workspace_bytes: u64,
+    pub est_prefill_seconds: f64, pub est_decode_seconds: f64, pub estimated: bool,
+}
+```
+
+`projected_kv_blocks = ceil((prompt + max_output) / block_tokens) − cached full blocks` (P3). P2 test: 100-token prompt, `max_tokens: 60`, 16-token blocks → 10 blocks.
+
+### 3.6 Telemetry vocabulary (`turbine_core::telemetry`, P3; contract-chosen home so `turbine-reliability` need not depend on `turbine-device`)
+
+```rust
+pub enum SourceStatus { Ok, Unavailable, Stale }
+pub struct HostSample { pub mem_available_bytes: Option<u64>, pub swap_total_bytes: Option<u64>, pub swap_free_bytes: Option<u64>,
+                        pub pswpin_total: Option<u64>, pub psi_memory_some_avg10: Option<f64>, pub status: SourceStatus }
+pub struct DeviceSample { pub device: DeviceId, pub memory_used_bytes: Option<u64>, pub memory_free_bytes: Option<u64>,  // dedicated only
+                          pub temperature_c: Option<f64>, pub slowdown_temperature_c: Option<f64>, pub clock_mhz: Option<u32>,
+                          pub power_watts: Option<f64>, pub utilization: Option<f64>, pub throttle: ThrottleReasons, pub status: SourceStatus }
+pub struct ThrottleReasons { pub thermal: bool, pub power: bool, pub other: bool }
+pub struct TelemetrySample { pub at_mono_ns: u64, pub host: HostSample, pub devices: Vec<DeviceSample>, pub storage: Option<StorageSample> /* P4 */ }
+pub struct StorageSample { pub queue_depth: u32, pub max_queue_depth: u32, pub p99_latency_s: f64, pub calibration_latency_s: f64 }   // P4
+pub trait LedgerProbe: Send + Sync { fn kv_utilization(&self) -> f64; fn queue_fill(&self) -> f64; }   // read on the fast tick
+```
+
+### 3.7 Clock (`turbine_core::clock`)
+
+```rust
+pub trait Clock: Send + Sync { fn now_mono(&self) -> std::time::Duration; fn now_wall(&self) -> std::time::SystemTime; }
+pub struct SystemClock;                                   // monotonic (P3 "monotonic clock")
+pub struct FakeClock { /* Arc<Mutex<Duration>> */ }       // advance(&self, d); set(&self, t)
+```
+
+### 3.8 Support matrix (`turbine_core::support`, P8 S-2)
+
+```rust
+pub enum SupportStatus { Supported, Experimental, Unsupported { reason: String } }
+pub struct SupportKey { pub vendor: String, pub arch: String, pub architecture: String,
+                        pub weight_format: WeightFormat, pub kv_format: KvFormatColumn, pub speculative: SpeculativeColumn }
+pub enum WeightFormat { Bf16, ModeloptNvfp4, ModeloptFp8, ModeloptMixed, CtNvfp4 }   // serde "bf16","modelopt_nvfp4","modelopt_fp8","modelopt_mixed","ct_nvfp4"
+pub enum KvFormatColumn { Bf16, Fp8E4m3 }                                           // "bf16","fp8_e4m3"
+pub enum SpeculativeColumn { None, Draft }                                          // "none","draft"
+pub struct SupportRow { pub key: SupportKeyPattern /* each column Option = "*" */, pub status: SupportStatus }
+pub static SUPPORT_MATRIX: &[SupportRow];
+pub fn resolve(key: &SupportKey) -> SupportStatus;             // most specific row wins; no row → Unsupported{"no support-matrix row"}
+```
+
+Baseline rows (P8 AC): `supported` for (`amd`,`gfx1201`) and (`nvidia`,`sm_121`) × {`LlamaForCausalLM`, `OlmoeForCausalLM`} × `bf16` × `bf16` × `none`.
+
+Note: the Rust type names of the config enums/structs in §3.2 (`ModelDtype`, `ToolCallParserKind`, `KvPolicyKind`, `KvDtypeChoice`, `AuthMode`, `GidIndex`, `CrossNodeTp`, `WorkerRole`, `ExpertPlacementSource`, `PdFallback`, `LogFormat`, `DeviceSelection`, `CollectiveBackendChoice`, `DpRouterPolicy`, `RankMode`, `CrossNodeGroup`, `GroupRank`, section struct names `<Section>Config`) are (contract-chosen); YAML key names and serde value spellings are verbatim from the specs.
+
+---
+
+## 4. `turbine-observability` (P0)
+
+```rust
+pub fn init_tracing(cfg: &LoggingConfig) -> Result<(), ObservabilityError>;     // text | json; RUST_LOG overrides level (P0)
+#[derive(Clone)] pub struct MetricsRegistry(Arc<Mutex<prometheus_client::registry::Registry>>);   // (contract-chosen)
+impl MetricsRegistry {
+    pub fn new() -> Self;
+    pub fn register<M: prometheus_client::registry::Metric + Clone>(&self, name: &str, help: &str, metric: M) -> M;
+    pub fn render(&self) -> Result<String, ObservabilityError>;          // OpenMetrics text; failure → /metrics 500 (P0)
+}
+pub const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";   // P0
+pub mod http {
+    pub fn request_id_layer() -> RequestIdLayer;       // echo x-request-id (≤128 visible ASCII) else UUIDv4; record on span (P0 S-3)
+    pub fn http_metrics_layer(m: HttpMetrics) -> HttpMetricsLayer;   // route template or "unmatched"
+    pub struct HttpMetrics { /* turbine_http_requests_total, turbine_http_request_duration_seconds */ }
+    pub struct RequestIdExt(pub String);               // request extension carrying the id (contract-chosen)
+}
+#[derive(Debug, thiserror::Error)] pub enum ObservabilityError { #[error("invalid log filter: {0}")] Filter(String), #[error("metrics render failed: {0}")] Render(String) }
+```
+
+Each domain crate owns a `<Crate>Metrics` struct (e.g. `turbine_kv::metrics::KvMetrics`) with `fn register(reg: &MetricsRegistry) -> Self` (contract-chosen pattern); names/labels are fixed in §17.
+
+---
+
+## 5. `turbine-device`
+
+### 5.1 Inventory (P0)
+
+```rust
+pub struct DiscoveryOptions {                      // (contract-chosen) built from DevicesConfig + env TURBINE_AMD_SMI_LIBRARY
+    pub nvml_library: Option<PathBuf>, pub amd_smi_library: Option<PathBuf>,
+    pub deadline: Duration /* 10 s per backend (P0) */, pub meminfo_path: PathBuf /* "/proc/meminfo" */,
+}
+pub fn discover(opts: &DiscoveryOptions) -> Result<DeviceInventory, DiscoveryError>;   // Err only for explicitly configured library failures (exit 1)
+
+#[derive(Serialize, Clone)] pub struct DeviceInventory { pub devices: Vec<DeviceInfo>, pub backends: Vec<BackendReport> }  // JSON = GET /turbine/v1/devices (P0 §Data)
+#[derive(Serialize, Clone)] pub struct DeviceInfo {
+    pub index: DeviceId, pub vendor: Vendor, pub vendor_index: u32, pub name: String,
+    pub uuid: Option<String>, pub pci_bus_id: Option<String>, pub arch: Option<String> /* "sm_121" | "gfx1201" */,
+    pub driver_version: Option<String>, pub memory: DeviceMemoryInfo,
+    #[serde(skip_serializing_if = "Option::is_none")] pub capabilities: Option<DeviceCapabilities>,   // P7
+}
+#[derive(Serialize, Clone)] pub struct DeviceMemoryInfo { pub kind: MemoryKind, pub total_bytes: u64, pub shared_with_host: bool }
+#[derive(Serialize, Clone)] pub struct BackendReport { pub vendor: Vendor, pub status: BackendStatus, pub detail: String }
+pub enum BackendStatus { Ok, Unavailable, Timeout }       // serde lowercase
+#[derive(Debug, thiserror::Error)] pub enum DiscoveryError {
+    #[error("cannot load {path}: {detail}")] ExplicitLibrary { path: PathBuf, detail: String },
+}
+pub trait DiscoveryBackend: Send { fn vendor(&self) -> Vendor; fn discover(&mut self) -> Result<Vec<DeviceInfo>, String>; }  // injectable for tests (P0 AC backend_timeout) (contract-chosen)
+```
+
+Ordering: NVIDIA first (NVML order) then AMD (amd-smi order); `index` stable for process lifetime (P0).
+
+### 5.2 Telemetry (P3, module `turbine_device::telemetry`)
+
+```rust
+pub struct TelemetryConfig { pub interval: Duration, pub vendor_interval: Duration, pub call_timeout: Duration, pub stale_after: Duration }
+pub trait VendorTelemetry: Send { fn sample(&mut self, device: &DeviceInfo) -> Result<DeviceSample, String>; }   // NVML / amd-smi impls; fakes in tests
+pub trait ProcSource: Send { fn read(&self, file: ProcFile) -> std::io::Result<String>; }                           // ProcFile { Meminfo, Vmstat, PressureMemory }
+pub struct TelemetrySampler { /* two cadences, deadline per vendor call */ }
+impl TelemetrySampler {
+    pub fn spawn(cfg: TelemetryConfig, inventory: &DeviceInventory, vendor: Vec<Box<dyn VendorTelemetry>>, proc: Box<dyn ProcSource>,
+                 ledger: Arc<dyn LedgerProbe>, clock: Arc<dyn Clock>) -> (TelemetrySampler, LatestSample);
+}
+#[derive(Clone)] pub struct LatestSample(/* lock-free latest-value cell (P3 S-5) */);
+impl LatestSample { pub fn load(&self) -> Arc<TelemetrySample>; }
+pub mod proc { pub fn parse_meminfo(s: &str) -> Result<MemInfo, ParseError>; pub fn parse_vmstat(s: &str) -> …; pub fn parse_psi(s: &str) -> …; }
+```
+
+### 5.3 Topology (P5, module `turbine_device::topology`)
+
+```rust
+pub fn discover_topology(sysfs_root: &Path, inventory: &DeviceInventory, vendor: &mut dyn TopologyVendor) -> TopologyGraph; // never fails; missing → unknown + WARN
+#[derive(Serialize, Deserialize, Clone)] pub struct TopologyGraph { pub node: TopologyNode, pub vertices: Vec<Vertex>, pub edges: Vec<Edge> }  // JSON = GET /turbine/v1/topology (P5 §Data)
+pub struct TopologyNode { pub hostname: String, pub captured_at: String }
+pub struct Vertex { pub id: String /* "numa0","gpu0","nic:<netdev>" */, pub kind: VertexKind, #[serde(flatten)] pub attrs: VertexAttrs }
+pub enum VertexKind { Numa, PcieRoot, PcieSwitch, Gpu, Nic, Nvme }                      // P5 verbatim (snake_case)
+pub struct Edge { pub a: String, pub b: String, pub kind: EdgeKind, pub path: Option<PathClass>, pub hops: Option<u32>,
+                  pub link_gts: Option<f64>, pub width: Option<u32>, pub p2p: P2pStatus, pub vendor_interconnect: Option<String>,
+                  pub rdma: Option<bool>, pub source: Option<AttrSource> }
+pub enum EdgeKind { Pcie, Nvlink, Xgmi, Coherent, Numa, Network /* P6 cluster graph */ }
+pub enum PathClass { SelfPath /* "self" */, Pix, Pxb, Phb, Node, Sys, Nvlink, Xgmi }     // ordering for planner: Nvlink/Xgmi > Pix > Pxb > Phb > Node > Sys
+pub enum P2pStatus { Enabled, Disabled, Unknown }
+pub enum AttrSource { Nominal, Vendor, Sysfs }
+```
+
+### 5.4 Capabilities (P7, module `turbine_device::capability`)
+
+```rust
+#[derive(Serialize, Clone)] pub struct DeviceCapabilities {       // P7 §Data "capability records", verbatim field names
+    pub vendor: Vendor, pub arch: Option<String>, pub dtypes: Vec<DType>, pub kv_formats: Vec<KvDtype>,
+    pub execution_backend: Option<ExecutionBackend>, pub collective_backend: Option<CollectiveBackendKind>, pub rdma_devices: Vec<String>,
+}
+pub fn probe_capabilities(inv: &DeviceInventory, probes: &RuntimeProbes) -> Vec<DeviceCapabilities>;   // RuntimeProbes: kernel lib loaded?, collective lib loaded?, verbs devices (contract-chosen)
+```
+
+---
+
+## 6. `turbine-tensor` (P1)
+
+```rust
+pub use turbine_core::types::{DType, DeviceId};
+
+pub struct Tensor {                                  // TS §6, verbatim
+    pub storage: DeviceBuffer,
+    pub shape: SmallVec<[usize; 4]>,
+    pub strides: SmallVec<[usize; 4]>,
+    pub dtype: DType,
+    pub device: DeviceId,
+}
+pub struct TensorView<'a> { pub slice: DeviceSlice<'a>, pub shape: SmallVec<[usize; 4]>, pub strides: SmallVec<[usize; 4]>, pub dtype: DType }  // (contract-chosen)
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DevicePtr(u64);                           // opaque device address; never dereferenced outside unsafe-allowed crates (contract-chosen)
+impl DevicePtr { pub fn addr(self) -> u64; pub fn offset(self, bytes: u64) -> DevicePtr; }
+
+pub struct DeviceBuffer { /* ptr: DevicePtr, len: usize, device: DeviceId, mem: Arc<dyn DeviceMemory> */ }   // P1 S-5: owns one allocation, freed on Drop; not Clone
+impl DeviceBuffer {
+    pub fn alloc(mem: &Arc<dyn DeviceMemory>, bytes: usize) -> Result<DeviceBuffer, MemoryError>;
+    pub fn len(&self) -> usize; pub fn device(&self) -> DeviceId; pub fn ptr(&self) -> DevicePtr;
+    pub fn slice(&self, offset: usize, len: usize) -> DeviceSlice<'_>;
+    pub fn copy_from_host(&mut self, offset: usize, src: &[u8]) -> Result<(), MemoryError>;      // enqueued on the context stream; caller syncs
+    pub fn copy_to_host(&self, offset: usize, dst: &mut [u8]) -> Result<(), MemoryError>;
+}
+pub struct DeviceSlice<'a> { /* buf: &'a DeviceBuffer, offset: usize, len: usize */ }            // P5 names it "phase-1 buffer handle"
+impl DeviceSlice<'_> { pub fn ptr(&self) -> DevicePtr; pub fn len(&self) -> usize; pub fn device(&self) -> DeviceId; }
+#[derive(Clone)] pub struct StreamRef { /* native: u64, device: DeviceId, owner: Arc<dyn DeviceMemory> */ }   // P5 "phase-1 stream handle"
+impl StreamRef { pub fn native_handle(&self) -> u64; pub fn device(&self) -> DeviceId; }       // native handle valid from ABI v4 (P5); 0 before
+
+/// Implemented by turbine-kernels::ShimContext (GPU) and turbine_tensor::host::HostMemory (CPU reference, collectives `host` backend).
+pub trait DeviceMemory: Send + Sync {                                                        // (contract-chosen) safe trait
+    fn device(&self) -> DeviceId;
+    fn alloc(&self, bytes: usize) -> Result<DevicePtr, MemoryError>;
+    fn free(&self, ptr: DevicePtr);
+    fn copy_h2d(&self, dst: DevicePtr, src: &[u8]) -> Result<(), MemoryError>;
+    fn copy_d2h(&self, dst: &mut [u8], src: DevicePtr) -> Result<(), MemoryError>;
+    fn copy_d2d(&self, dst: DevicePtr, src: DevicePtr, bytes: usize) -> Result<(), MemoryError>;
+    fn synchronize(&self) -> Result<(), MemoryError>;
+    fn mem_info(&self) -> Result<MemInfo, MemoryError>;           // MemInfo { free_bytes: u64, total_bytes: u64 }
+    fn compute_stream(&self) -> StreamRef;
+    fn as_host(&self) -> Option<&host::HostMemory> { None }       // lets CPU kernels reach host bytes safely
+}
+/// P4: page-locked host memory + async copies (implemented by turbine-kernels over ABI v3; in-memory fake for macOS tests).
+pub trait PinnedMemory: Send + Sync { fn alloc_pinned(&self, bytes: usize) -> Result<PinnedBuffer, MemoryError>; }
+pub struct PinnedBuffer { /* host ptr as u64, len, owner */ }       // freed on Drop; bytes reachable via PinnedBuffer::with_bytes(&self, f)
+pub trait CopyEngine: Send + Sync {                                                          // P4, one copy stream per device
+    fn copy_async(&self, dst: CopyTarget, src: CopySource, bytes: usize) -> Result<CopyTicket, MemoryError>;
+    fn poll(&self, t: &CopyTicket) -> Result<bool, MemoryError>;      // event query
+    fn wait(&self, t: &CopyTicket) -> Result<(), MemoryError>;
+}
+pub enum CopyTarget { Device(DevicePtr), Pinned { buffer_id: u64, offset: usize } }
+pub type CopySource = CopyTarget;
+
+#[derive(Debug, thiserror::Error)] pub enum MemoryError {
+    #[error("out of device memory ({requested} bytes)")] OutOfMemory { requested: u64 },
+    #[error("device error: {message}")] Device { message: String, sticky: bool },
+    #[error("invalid argument: {0}")] InvalidArgument(String),
+    #[error("unsupported: {0}")] Unsupported(String),
+}
+pub mod host { pub struct HostMemory { /* id → Box<[u8]> */ }  impl HostMemory { pub fn with_slice<R>(&self, p: DevicePtr, len: usize, f: impl FnOnce(&[u8]) -> R) -> R; pub fn with_slice_mut<R>(…) -> R; } }
+```
+
+Ownership rules (P1 Constraints, TS §21 rule 10): every device pointer is allocated by the shim and owned by exactly one `DeviceBuffer`; the shim never retains a caller pointer beyond the call; streams/workspaces are owned by the shim context; a `DeviceBuffer` holds an `Arc` of its `DeviceMemory` (the context) so it cannot outlive it.
+
+---
+
+## 7. `turbine-kernels` (P1)
+
+### 7.1 Public Rust API
+
+```rust
+pub const TURBINE_KERNELS_ABI_VERSION: u32;          // P1 name; value per §9.1 (1 at P1 … 5 at P7)
+
+pub struct ShimLibrary { /* libloading::Library + resolved symbol table */ }   // P2b name: one type for hip and cuda, parameterised by expected backend
+impl ShimLibrary {
+    pub fn load(path: &Path, expected_backend: ExecutionBackend) -> Result<Arc<ShimLibrary>, KernelError>;   // checks abi_version, backend_name
+    pub fn search_paths(backend: ExecutionBackend, explicit: Option<&Path>) -> Vec<PathBuf>;              // P1/P2b search order, logged
+    pub fn abi_version(&self) -> u32; pub fn backend_name(&self) -> &str; pub fn build_archs(&self) -> &[String];
+    pub fn create_context(self: &Arc<Self>, device: &DeviceInfo) -> Result<Arc<ShimContext>, KernelError>; // arch ∈ build_archs, ctx_create(vendor_index)
+}
+pub struct ShimContext { /* *mut turbine_ctx, Arc<ShimLibrary> */ }   // implements turbine_tensor::DeviceMemory (+ PinnedMemory, CopyEngine from P4)
+impl ShimContext { pub fn info(&self) -> ContextInfo; }                // P2: ContextInfo { workspace_bytes, compute_capability: Option<(i32,i32)>, device_arch }
+
+#[derive(Debug, thiserror::Error)]
+pub enum KernelError {                          // P2b names `KernelError::Device`, `KernelError::OutOfMemory`
+    #[error("invalid argument: {message}")]                       InvalidArgument { message: String },            // code -1
+    #[error("unsupported configuration: {message}")]              Unsupported { message: String },                // code -2
+    #[error("out of device memory: {message}")]                   OutOfMemory { message: String },                // code -3
+    #[error("{message}")]                                         Device { message: String },                     // code -4; message starts with vendor error name (P2b S-5)
+    #[error("kernel library error: {message}")]                   Library { message: String },                    // code -5
+    #[error("cannot load {path}: {detail}")]                      Load { path: PathBuf, detail: String },
+    #[error("kernel ABI version mismatch: library {found}, expected {expected}")] AbiMismatch { expected: u32, found: u32 },
+    #[error("kernel library backend {found}, configured {expected}")] BackendMismatch { expected: String, found: String },
+    #[error("device arch {device_arch} not in library build archs {build_archs}")] ArchMismatch { device_arch: String, build_archs: String },
+    #[error("no kernel provider supports {op} {config}")]         NoProvider { op: OpKind, config: String },
+}
+impl KernelError {
+    pub fn is_sticky(&self) -> bool;            // P3: Device whose message starts with a context-corrupting name
+                                                // (hipErrorIllegalAddress, hipErrorLaunchFailure, cudaErrorIllegalAddress, cudaErrorLaunchFailure,
+                                                //  cudaErrorIllegalInstruction, cudaErrorMisalignedAddress, …; list kept in turbine-kernels, contract-chosen)
+    pub fn is_oom(&self) -> bool;
+}
+impl From<KernelError> for turbine_tensor::MemoryError;
+```
+
+Kernel traits (TS §6 shape `supports(cfg) -> bool` + `execute(ctx) -> Result<()>`; one trait per op family, P1 S-6; contract-chosen names except `AttentionKernel`):
+
+```rust
+pub trait GemmKernel: Send + Sync        { fn supports(&self, cfg: &GemmConfig) -> bool;       fn implementation(&self, cfg: &GemmConfig) -> String;       fn execute(&self, ctx: &mut GemmContext<'_>) -> Result<(), KernelError>; }
+pub trait AttentionKernel: Send + Sync   { fn supports(&self, cfg: &AttentionConfig) -> bool;  fn implementation(&self, cfg: &AttentionConfig) -> String;  fn execute(&self, ctx: &mut AttentionContext<'_>) -> Result<(), KernelError>; }  // TS §6 verbatim name
+pub trait NormKernel: Send + Sync        { /* rmsnorm; P5 row_sumsq, rmsnorm_sharded */ }
+pub trait RopeKernel: Send + Sync        { /* rope */ }
+pub trait ActivationKernel: Send + Sync  { /* silu_mul */ }
+pub trait EmbeddingKernel: Send + Sync   { /* embedding */ }
+pub trait ElementwiseKernel: Send + Sync { /* add; P5 fill; P7 gather_rows, scatter_add_rows */ }
+pub trait KvCopyKernel: Send + Sync      { /* P2 copy_blocks */ }
+pub trait MoeKernel: Send + Sync         { /* P2 moe_route, moe_experts */ }
+pub enum AttentionKind { Prefill, Decode, PrefillPaged /*P2*/, DecodePaged /*P2*/ }
+pub struct AttentionConfig { pub kind: AttentionKind, pub num_q_heads: u32, pub num_kv_heads: u32, pub head_dim: u32,
+                             pub dtype: DType, pub block_tokens: Option<u32>, pub causal: bool }
+// Config structs carry shapes/dtypes only (no pointers); Context structs carry the TensorViews + stream. Display of a config
+// renders the P1 failure-message form, e.g. "head_dim=128 kv_heads=8 dtype=bf16".
+
+pub trait KernelProvider: Send + Sync {
+    fn id(&self) -> ProviderId;                 // "cpu-reference" | "hip" | "cuda" (P1, P2b)
+    fn gemm(&self) -> Option<&dyn GemmKernel>;  fn attention(&self) -> Option<&dyn AttentionKernel>;
+    fn norm(&self) -> Option<&dyn NormKernel>;  fn rope(&self) -> Option<&dyn RopeKernel>;
+    fn activation(&self) -> Option<&dyn ActivationKernel>; fn embedding(&self) -> Option<&dyn EmbeddingKernel>;
+    fn elementwise(&self) -> Option<&dyn ElementwiseKernel>; fn kv_copy(&self) -> Option<&dyn KvCopyKernel>; fn moe(&self) -> Option<&dyn MoeKernel>;
+}
+pub struct ProviderId(pub &'static str);
+pub enum OpKind { Gemm, AttentionPrefill, AttentionDecode, Rmsnorm, Rope, SiluMul, Embedding, Add,        // P1
+                  AttentionPrefillPaged, AttentionDecodePaged, CopyBlocks, MoeRoute, MoeExperts,          // P2
+                  RowSumsq, RmsnormSharded, Fill,                                                        // P5
+                  GatherRows, ScatterAddRows }                                                          // P7
+impl OpKind { pub fn as_str(&self) -> &'static str; }   // = C ABI suffix: "gemm", "attention_prefill", … (metric label `op`)
+
+pub struct OpRequirement { pub op: OpKind, pub config: String /* rendered */, /* typed config enum */ }
+pub struct KernelRegistry { /* (op, config) → (provider, impl) */ }
+impl KernelRegistry {
+    /// Picks, per requirement, the first provider in `order` whose supports() is true; logs op, config, provider, impl, reason;
+    /// sets turbine_kernel_provider_selected{op,provider,impl}=1; Err(NoProvider) at startup, never deferred (P1 S-6).
+    pub fn build(providers: Vec<Arc<dyn KernelProvider>>, order: &[ProviderId], reqs: &[OpRequirement], metrics: &KernelMetrics) -> Result<KernelRegistry, KernelError>;
+    pub fn gemm(&self, cfg: &GemmConfig) -> &dyn GemmKernel;  /* … one accessor per family */
+}
+pub fn cpu_reference_provider() -> Arc<dyn KernelProvider>;                    // "cpu-reference", f32 accumulation, always available
+pub fn shim_provider(ctx: Arc<ShimContext>) -> Arc<dyn KernelProvider>;         // id = backend name
+```
+
+Provider order (contract-chosen; the specs define no config key): backend `hip` → `["hip"]`, `cuda` → `["cuda"]`, `cpu` → `["cpu-reference"]`; the CPU reference is never used for a GPU model (P2b edge cases). Implementation fallback inside one provider (e.g. CUDA `moe_experts` grouped → per-expert) is done by the shim's `_supported`/`_impl` pair.
+
+P4 additions (module `turbine_kernels::pinned`, CONFLICT C-6): `impl PinnedMemory for ShimContext`, `impl CopyEngine for ShimContext` (dedicated copy stream per context, events for completion).
+
+`turbine_kernels::test_support` (P2b S-8; always compiled, `pub`):
+
+```rust
+pub fn require_backend(backend: &str) -> bool;   // TURBINE_TEST_BACKEND equal → true; different → prints "SKIP backend=<value>", false; unset → panic naming the variable
+pub fn require_env_dir(var: &str) -> PathBuf;    // TURBINE_TEST_MODEL_DIR / TURBINE_TEST_MOE_MODEL_DIR: unset or missing → panic with that message (P1) (contract-chosen helper)
+```
+
+Usage in every ignored GPU test: `if !require_backend("hip") { return; }`.
+
+---
+
+## 8. `turbine-reliability` (P3; P5 adds `multi_device`)
+
+### 8.1 Module map and key items
+
+| Module                              | Items (P3 unless marked)                                                                     |
+| ----------------------------------- | -------------------------------------------------------------------------------------------- |
+| `budget`                            | `DeviceBudget`, `PoolKind`, `BudgetInputs`, `compute_budget`, `BudgetError`                  |
+| `ledger`                            | `Pool`, `Reservation` (RAII guard), `Ledger`, `LedgerError`                                  |
+| `reserve`                           | `EmergencyReserve`                                                                           |
+| `signals`                           | `PressureSignal`, `SignalValue`, `SignalThresholds`, `default_thresholds()`                  |
+| `state`                             | `PressureMachine`, `Transition`                                                              |
+| `horizon`                           | `ExhaustionHorizon`                                                                          |
+| `admission`                         | `AdmissionDecision`, `PressureReason`, `RejectionReason`, `Admission`, `AdmissionQueue`      |
+| `throttle`                          | `ThrottlePlan`, `AdmissionMode`, `KvReclaimer`, `ReclaimAction`                              |
+| `recovery`                          | `RecoveryController`, `RecoveryOutcome`                                                      |
+| `circuit`                           | `CircuitBreaker`, `CircuitReason`                                                            |
+| `controller`                        | `PressureController` (ties the above; published `ThrottlePlan` snapshot), `ControllerHandle` |
+| `document`                          | `PressureDocument` (serde; body of `GET /turbine/v1/pressure`)                               |
+| `multi_device` (P5)                 | `GroupState`, `group_state`, `GroupReservation`, `SharedDeviceBudget`                        |
+| `fault` (feature `fault-injection`) | `FaultInjector`                                                                              |
+
+### 8.2 Signatures
+
+```rust
+pub use turbine_core::clock::Clock;
+pub use turbine_core::types::{PressureState, CircuitState};
+
+// budget (P3 S-2)
+pub enum PoolKind { Weights, Kv, Workspace, Runtime, Reserve, Collective /* P5 */ }   // serde/label: "weights","kv","workspace","runtime","reserve","collective"
+pub struct BudgetInputs { pub device: DeviceId, pub memory_kind: MemoryKind, pub measured_free_bytes: Option<u64>,
+                          pub already_held_bytes: u64, pub host_mem_available_bytes: Option<u64>, pub weights_bytes: u64,
+                          pub kv_bytes_per_token: u64, pub max_seq_len: u32, pub block_bytes: u64, pub collective_bytes: u64 /* P5 */ }
+pub struct DeviceBudget { pub device: DeviceId, pub memory_kind: MemoryKind, pub budget_bytes: u64, pub pools: Vec<(PoolKind, u64)> }
+pub fn compute_budget(inp: &BudgetInputs, cfg: &ReliabilityConfig, kv_cap: Option<ByteSize> /* kv.gpu.max_bytes */) -> Result<DeviceBudget, BudgetError>;
+// dedicated: budget = measured free + already held; unified: MemAvailable − host_reserve_bytes; both capped by device_budget_bytes.
+// kv = budget − weights − workspace − runtime − reserve (− collective, P5), then min(kv_cap) (CONFLICT C-8).
+#[derive(Debug, thiserror::Error)] #[error("memory budget cannot hold the model: {breakdown}")]
+pub struct BudgetError { pub breakdown: String /* every pool and its bytes + measured free */ }
+
+// ledger (P3 S-3): reserve → commit → release; guards release on Drop
+pub struct Ledger { /* per device, per pool */ }
+impl Ledger {
+    pub fn new(budget: &DeviceBudget) -> Arc<Ledger>;
+    pub fn reserve(self: &Arc<Self>, device: DeviceId, pool: PoolKind, bytes: u64) -> Result<Reservation, LedgerError>;
+    pub fn usage(&self, device: DeviceId, pool: PoolKind) -> PoolUsage;   // PoolUsage { capacity, used, reserved }
+}
+pub struct Reservation { /* … */ }  impl Reservation { pub fn commit(&mut self); pub fn bytes(&self) -> u64; }  impl Drop for Reservation {}
+#[derive(Debug, thiserror::Error)] pub enum LedgerError { #[error("pool {pool:?} exhausted: requested {requested}, available {available}")] Exhausted { pool: PoolKind, requested: u64, available: u64 }, #[error("injected allocation failure")] Injected }
+
+// signals (P3 S-6)
+pub enum PressureSignal { KvUtilization, DeviceMemory, HostAvailable, PsiMemorySomeAvg10, SwapInRate, ExhaustionHorizon,
+                          QueueFill, StepTimeDrift, Thermal, TelemetryStale, AllocationFailure,
+                          StorageQueueDepth /* P4 */, StorageLatency /* P4 */ }
+// serde/label: "kv_utilization","device_memory","host_available","psi_memory_some_avg10","swap_in_rate","exhaustion_horizon",
+// "queue_fill","step_time_drift","thermal","telemetry_stale","allocation_failure","storage_queue_depth","storage_latency"
+pub struct SignalThresholds { pub levels: [Option<f64>; 4] /* Y,O,R,S */, pub lower_is_worse: bool }
+
+// admission (TS §9 verbatim enum; P3 reasons)
+pub enum AdmissionDecision { Admit, Queue { reason: PressureReason }, Reject { reason: RejectionReason } }
+pub enum PressureReason { KvReservation, PressureOrange, PressureRed, CircuitDegraded, PrefillBudget }        // P3 Queue reasons (CONFLICT C-11: P5 "KvCapacity" = KvReservation)
+pub enum RejectionReason { ContextExceedsKvCapacity, QueueFull, QueueTimeout, Survival, CircuitOpen }        // P3 Reject reasons
+impl RejectionReason { pub fn http(&self) -> (u16, &'static str /*type*/, &'static str /*code*/); }       // §14.3 table
+pub struct Admission { /* estimator EWMAs α=0.1 seeded from first 32 iterations */ }
+impl Admission {
+    pub fn estimate(&self, prompt_tokens: u32, cached_prefix_tokens: u32, max_tokens: Option<u32>, layout: &KvLayout, max_seq_len: u32) -> ResourceEstimate;
+    pub fn decide(&mut self, est: &ResourceEstimate, state: PressureState, circuit: CircuitState, queue_len: usize) -> AdmissionDecision;
+}
+pub struct AdmissionQueue { /* FIFO within Priority; max_queue; queue_timeout; max_bypass starvation guard */ }
+
+// throttle (P3 S-10)
+#[derive(Clone, Copy, Serialize)]
+pub struct ThrottlePlan { pub state: PressureState, pub batch_growth_limit: Option<u32> /* None = unlimited; Some(0) frozen */,
+                          pub shrink_only: bool, pub prefill_budget_fraction: f64, pub prefill_chunk_tokens: Option<u32>,
+                          pub admission: AdmissionMode, pub reclaim: ReclaimAction }
+pub enum AdmissionMode { Open, ExpensiveQueued, AllQueued, Stopped }   // serde "open","expensive_queued" (P3 §Data),"all_queued","stopped" (contract-chosen except expensive_queued)
+pub enum ReclaimAction { None, DemoteIdle, FreeCachedToOrange, FreeAllCachedAndOptional, ReleaseReserveAndPreemptIfNeeded }  // (contract-chosen)
+pub trait KvReclaimer: Send + Sync {                    // P3 S-10 name; P4 implements it in turbine-kv
+    fn demote(&self, target_utilization: f64) -> u64;   // bytes demoted (no-op in P3)
+    fn free_unreferenced(&self, target_utilization: f64) -> u64;   // P3 implementation frees unreferenced cached L0 blocks
+}
+pub fn plan_for(state: PressureState, cfg: &SchedulerLimits) -> ThrottlePlan;   // SchedulerLimits { prefill_chunk_tokens, block_tokens }; chunk floor 4 × block_tokens
+
+// circuit (P3 S-12)
+pub enum CircuitReason { LatencyDrift, ThermalThrottle, OomRecovered, TelemetryStale, RepeatedOom, RecoveryFailed, DeviceError,
+                         ProbeFailed, DeviceFatal, ControllerFailed, CollectiveFailed /* P5, contract-chosen */, NoTrigger /* DEGRADED→HEALTHY after window */ }
+pub struct CircuitBreaker { /* transition table P3 */ }
+impl CircuitBreaker { pub fn on_event(&mut self, ev: CircuitEvent, now: Duration) -> Option<(CircuitState, CircuitState, CircuitReason)>; pub fn state(&self) -> CircuitState; pub fn retry_after_secs(&self) -> u64; }
+
+// recovery (P3 S-11)
+pub enum RecoveryOutcome { Recovered { retries: u32 }, Failed }   // label "recovered" | "failed"
+
+// controller
+pub struct PressureController { /* telemetry-tick evaluation; supervised task */ }
+#[derive(Clone)] pub struct ControllerHandle { /* ArcSwap-like snapshot */ }
+impl ControllerHandle { pub fn throttle(&self) -> ThrottlePlan; pub fn state(&self) -> PressureState; pub fn circuit(&self) -> CircuitState; pub fn document(&self) -> PressureDocument; }
+
+// multi_device (P5 S-8)
+pub fn group_state(members: &[(DeviceId, PressureState)]) -> (PressureState, DeviceId /* limiting_device */);
+pub fn reserve_group(ledgers: &[(DeviceId, Arc<Ledger>)], blocks: u32, block_bytes_per_rank: u64) -> Result<Vec<Reservation>, AdmissionDecision>;  // all-or-nothing → Queue{KvReservation}
+```
+
+Exhaustion horizon (P3 S-8): `ExhaustionHorizon::predict(running: &[(remaining_tokens: u32)], decode_tokens_per_s: f64, free_blocks: u32, block_tokens: u32) -> f64` (+∞ when not growing).
+
+### 8.3 Default thresholds (P3 §Interfaces, verbatim) and P4 additions
+
+| Signal                                                              | Y         | O    | R    | S       | Lower is worse                                                     |
+| ------------------------------------------------------------------- | --------- | ---- | ---- | ------- | ------------------------------------------------------------------ |
+| `kv_utilization`                                                    | 0.70      | 0.82 | 0.90 | 0.97    | no                                                                 |
+| `device_memory` (dedicated only)                                    | 0.85      | 0.90 | 0.95 | 0.98    | no                                                                 |
+| `host_available` (× host_reserve_bytes)                             | 4.0       | 2.0  | 1.0  | 0.5     | yes                                                                |
+| `psi_memory_some_avg10`                                             | 5         | 10   | 25   | 50      | no                                                                 |
+| `swap_in_rate` (pages/s)                                            | 1         | 100  | 1000 | 10000   | no                                                                 |
+| `exhaustion_horizon` (s)                                            | 60        | 20   | 5    | 1       | yes                                                                |
+| `queue_fill`                                                        | 0.50      | 0.80 | 0.95 | —       | no                                                                 |
+| `step_time_drift`                                                   | 1.5       | 2.0  | 3.0  | —       | no                                                                 |
+| `thermal`                                                           | 1         | 2    | —    | —       | no                                                                 |
+| `telemetry_stale`                                                   | 1 (stale) | —    | —    | —       | no                                                                 |
+| `allocation_failure`                                                | —         | —    | —    | 1 (any) | no                                                                 |
+| `storage_queue_depth` (P4; queue depth / `kv.nvme.max_queue_depth`) | 0.50      | 0.75 | 0.90 | —       | no (contract-chosen values)                                        |
+| `storage_latency` (P4; L2 p99 / calibration p99)                    | 2         | 5    | 10   | —       | no (contract-chosen values; P4 "p99 > 10× calibration" = degraded) |
+
+### 8.4 Throttle plan per state (P3, verbatim summary)
+
+| State    | batch_growth_limit | prefill_budget_fraction | prefill_chunk_tokens  | admission                              | reclaim                                                                                       |
+| -------- | ------------------ | ----------------------- | --------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------- |
+| GREEN    | unlimited          | 1.0                     | configured            | open                                   | none                                                                                          |
+| YELLOW   | +1/iteration       | 1.0                     | configured            | open                                   | `KvReclaimer::demote` idle → YELLOW threshold                                                 |
+| ORANGE   | 0 (frozen)         | 0.5                     | halved, floor 4×block | expensive_queued (`pressure_orange`)   | free unreferenced cached to ORANGE; demote aggressively (P4)                                  |
+| RED      | shrink only        | no new prefill starts   | floor                 | all_queued (`pressure_red`)            | free all unreferenced cached + optional buffers                                               |
+| SURVIVAL | shrink only        | 0                       | —                     | stopped (`503 overloaded`), queue kept | release emergency reserve; preempt most recently admitted only if next decode cannot allocate |
+
+### 8.5 Pressure document (`GET /turbine/v1/pressure`)
+
+`PressureDocument` serialises exactly the P3 §Data example keys: `enabled, state, since, dominant_signal, exhaustion_horizon_seconds, signals[{name,value,level,stale}], throttle{batch_growth_limit,prefill_budget_fraction,prefill_chunk_tokens,admission}, memory[{device,memory_kind,budget_bytes,pools[{name,capacity_bytes,used_bytes,reserved_bytes}],emergency_reserve_held}], admission{queued,max_queue,decisions{admit,queue{…},reject{…}}}, circuit{state,since,last_reason}, transitions[{at,from,to,signal,value,threshold}]` (history cap 32). P5 adds `devices[]` (per-device budget by component and state), `groups[]` (`replica`, `state`, `limiting_device`), `replicas[]` (`replica`, `eligible`, `reason`) (field names inside the three arrays contract-chosen except `limiting_device`).
+
+---
+
+## 9. Vendor-neutral kernel C ABI (`kernels/include/turbine_kernels.h`)
+
+### 9.1 Versions
+
+| `TURBINE_ABI_VERSION` / `turbine_abi_version()` | Phase                                                                 | Adds                                                                                                                                                                                                                  |
+| ----------------------------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1                                               | P1                                                                    | identity, context, memory, sync, error functions; ops `gemm`, `attention_prefill`, `attention_decode`, `rmsnorm`, `rope`, `silu_mul`, `embedding`, `add`                                                              |
+| 2                                               | P2 (contract-chosen bump; P8 Constraints "any additive change bumps") | `turbine_ctx_get_info`; ops `attention_prefill_paged`, `attention_decode_paged`, `copy_blocks`, `moe_route`, `moe_experts`. P2b implements exactly v2 ("ABI version current at the end of Phase 2", no header change) |
+| 3                                               | P4 (CONFLICT C-6)                                                     | pinned host memory, copy streams, async memcpy, events                                                                                                                                                                |
+| 4                                               | P5 (contract-chosen)                                                  | `turbine_stream_native_handle` (collectives need the vendor stream), ops `row_sumsq`, `rmsnorm_sharded` (TP QK-norm), `fill` (vocab padding → −∞)                                                                     |
+| 5                                               | P7 (contract-chosen)                                                  | ops `gather_rows`, `scatter_add_rows` (EP dispatch/combine packing)                                                                                                                                                   |
+| ≥ 6                                             | P8a/P8b/P8c                                                           | quantized dtype codes and ops, linear-attention ops — defined by the track specs; both shims bump together (P8)                                                                                                       |
+
+The Rust constant `TURBINE_KERNELS_ABI_VERSION` must equal the library's value exactly; mismatch is fatal naming both numbers (P1). Both shims always implement the same version (P2b Constraints).
+
+### 9.2 Conventions
+
+- No vendor type or identifier in the header (P1 AC `abi_header_neutral`: no identifier starting with `hip`, `cuda`, `rocm`, `nv`, case-insensitive — contract-chosen reading of the rule; therefore no code is named `…INVALID…`).
+- Every function except identity functions and `turbine_ctx_destroy` returns `int32_t`: 0 success, negative code on failure. `_supported` returns 1 / 0 (negative on internal error). All pointers in descriptors are device pointers unless the field comment says "host". `_supported` and `_impl` ignore pointer fields (they may be NULL) and never need a context.
+- All work is enqueued on the context's compute stream; `turbine_stream_sync` (and, from v3, `turbine_event_synchronize`) are the only blocking calls (P2b S-5). Host buffers passed to `turbine_memcpy_h2d/d2h` must stay valid until the next sync.
+- Row-major everywhere; strides are in elements; "leading dimension" = row stride in elements.
+- Only `turbine_*` symbols are exported (`-fvisibility=hidden`; P2b).
+- The shim never retains a caller pointer beyond the call; the context owns its streams, library handles and workspace (P1).
+- Error message: `turbine_last_error(ctx, buf, len)` copies the NUL-terminated message of the most recent failure on `ctx` (or, with `ctx == NULL`, of the most recent failed `turbine_ctx_create` on the calling thread — contract-chosen), returns the full message length (excluding NUL). CUDA/HIP messages start with the vendor error name, e.g. `cudaErrorIllegalAddress: …` (P2b S-5).
+
+### 9.3 Header (normative)
+
+```c
+#ifndef TURBINE_KERNELS_H
+#define TURBINE_KERNELS_H
+#include <stddef.h>
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define TURBINE_ABI_VERSION 5u              /* value grows per §9.1; each phase's header carries its own value */
+
+/* ---- status codes (P1) ---- */
+#define TURBINE_OK                 0
+#define TURBINE_E_ARGUMENT        (-1)      /* invalid argument            */
+#define TURBINE_E_UNSUPPORTED     (-2)      /* unsupported configuration   */
+#define TURBINE_E_OUT_OF_MEMORY   (-3)      /* device (or pinned) OOM       */
+#define TURBINE_E_DEVICE          (-4)      /* device runtime error         */
+#define TURBINE_E_LIBRARY         (-5)      /* provider library error       */
+
+/* ---- dtype codes (P1; = Rust DType::abi_code) ---- */
+#define TURBINE_DTYPE_BF16   0
+#define TURBINE_DTYPE_F16    1
+#define TURBINE_DTYPE_F32    2
+#define TURBINE_DTYPE_I32    3
+#define TURBINE_DTYPE_I64    4
+/* 16..63 reserved for phase-8a quantized formats */
+
+typedef struct turbine_ctx    turbine_ctx;
+typedef struct turbine_stream turbine_stream;   /* v3 */
+typedef struct turbine_event  turbine_event;    /* v3 */
+
+/* ======== v1 (P1): identity, context, memory ======== */
+uint32_t    turbine_abi_version(void);
+const char *turbine_backend_name(void);          /* "hip" | "cuda" */
+const char *turbine_build_archs(void);           /* comma-separated: "gfx1201" | "sm_121" */
+int32_t     turbine_ctx_create(int32_t device_ordinal /* vendor_index */, turbine_ctx **out);
+void        turbine_ctx_destroy(turbine_ctx *ctx);
+int32_t     turbine_malloc(turbine_ctx *ctx, size_t bytes, void **out);
+int32_t     turbine_free(turbine_ctx *ctx, void *ptr);
+int32_t     turbine_memcpy_h2d(turbine_ctx *ctx, void *dst_device, const void *src_host, size_t bytes);
+int32_t     turbine_memcpy_d2h(turbine_ctx *ctx, void *dst_host, const void *src_device, size_t bytes);
+int32_t     turbine_stream_sync(turbine_ctx *ctx);
+int32_t     turbine_mem_info(turbine_ctx *ctx, size_t *free_bytes, size_t *total_bytes);
+size_t      turbine_last_error(turbine_ctx *ctx, char *buf, size_t len);
+
+/* ======== v1 (P1): op descriptors ======== */
+typedef struct turbine_gemm_desc {           /* c[m,n] = alpha * a[m,k] · op(b) + beta * c */
+    const void *a; const void *b; void *c;
+    int64_t m, n, k;
+    int64_t lda, ldb, ldc;
+    int32_t trans_b;                           /* 1: b is [n,k] (HF Linear weight), 0: b is [k,n] */
+    int32_t a_dtype, b_dtype, c_dtype;         /* BF16 in; BF16 or F32 out; F32 accumulate */
+    float   alpha, beta;
+} turbine_gemm_desc;
+
+typedef struct turbine_attention_desc {      /* contiguous per-sequence KV (P1) */
+    const void *q;                             /* [q_len, num_q_heads, head_dim] */
+    const void *k_cache; const void *v_cache;  /* [kv_capacity, num_kv_heads, head_dim], rows [0, q_start+q_len) valid */
+    void *out;                                 /* [q_len, num_q_heads, head_dim] */
+    int32_t q_len, q_start;                    /* decode: q_len = 1 */
+    int32_t num_q_heads, num_kv_heads, head_dim;
+    int64_t q_stride_token, kv_stride_token, out_stride_token;
+    float   scale;                             /* 1/sqrt(head_dim) */
+    int32_t causal, dtype;
+} turbine_attention_desc;
+typedef turbine_attention_desc turbine_attention_prefill_desc;
+typedef turbine_attention_desc turbine_attention_decode_desc;
+
+typedef struct turbine_rmsnorm_desc {
+    const void *x; const void *weight; void *out;
+    int64_t rows, dim, x_stride_row, out_stride_row;
+    float eps; int32_t dtype;
+} turbine_rmsnorm_desc;
+
+typedef struct turbine_rope_desc {           /* in place on q and k */
+    void *q; void *k;
+    const int32_t *positions;                  /* [num_tokens] */
+    const float   *inv_freq;                   /* [rotary_dim/2], computed on host in FP64 (llama3 scaling or standard), stored F32 */
+    int32_t num_tokens, num_q_heads, num_kv_heads, head_dim, rotary_dim;
+    int64_t q_stride_token, k_stride_token;
+    int32_t style;                             /* 0 = half-split (HF rotate_half) */
+    int32_t dtype;
+} turbine_rope_desc;
+
+typedef struct turbine_silu_mul_desc {       /* out = silu(gate) * up */
+    const void *gate; const void *up; void *out;
+    int64_t rows, cols, gate_stride_row, up_stride_row, out_stride_row;
+    int32_t dtype;
+} turbine_silu_mul_desc;
+
+typedef struct turbine_embedding_desc {      /* out[t] = table[ids[t] - vocab_offset] or 0 if outside the shard (P5 vocab-parallel) */
+    const int32_t *ids; const void *table; void *out;
+    int64_t num_tokens, hidden, vocab_offset, vocab_rows, out_stride_row;
+    int32_t dtype;
+} turbine_embedding_desc;
+
+typedef struct turbine_add_desc { const void *a; const void *b; void *out; int64_t n; int32_t dtype; } turbine_add_desc;
+
+/* one trio per op: <op> ∈ gemm, attention_prefill, attention_decode, rmsnorm, rope, silu_mul, embedding, add */
+int32_t     turbine_gemm(turbine_ctx *ctx, const turbine_gemm_desc *d);
+int32_t     turbine_gemm_supported(const turbine_gemm_desc *d);
+const char *turbine_gemm_impl(const turbine_gemm_desc *d);          /* e.g. "hipblaslt", "cublaslt", "ck_tile_fmha_fwd", "turbine_hip" */
+/* … identical trio for attention_prefill, attention_decode, rmsnorm, rope, silu_mul, embedding, add … */
+
+/* ======== v2 (P2) ======== */
+typedef struct turbine_ctx_info {
+    uint64_t workspace_bytes;                  /* fixed at ctx creation (P2b kernel_library_loaded.workspace_bytes) */
+    int32_t  compute_major, compute_minor;     /* -1 when not applicable */
+    char     device_arch[32];
+} turbine_ctx_info;
+int32_t turbine_ctx_get_info(turbine_ctx *ctx, turbine_ctx_info *out);
+
+typedef struct turbine_attention_paged_desc { /* ragged batch; appends k_new/v_new into their page slots, then attends */
+    const void *q;                             /* [total_q, num_q_heads, head_dim] */
+    const void *k_new; const void *v_new;      /* [total_q, num_kv_heads, head_dim] */
+    void *out;                                 /* [total_q, num_q_heads, head_dim] */
+    void *kv_layer;                            /* this layer's pool [num_blocks, 2, block_tokens, num_kv_heads, head_dim] */
+    const int32_t *block_table;                /* [num_seqs, max_blocks_per_seq] */
+    const int32_t *q_indptr;                   /* [num_seqs + 1] */
+    const int32_t *kv_lens;                    /* [num_seqs], after append */
+    int32_t num_seqs, total_q, max_q_len, max_kv_len, max_blocks_per_seq, num_blocks, block_tokens;
+    int32_t num_q_heads, num_kv_heads, head_dim;
+    int64_t q_stride_token, new_stride_token, out_stride_token;
+    float scale; int32_t causal, dtype;
+} turbine_attention_paged_desc;
+typedef turbine_attention_paged_desc turbine_attention_prefill_paged_desc;
+typedef turbine_attention_paged_desc turbine_attention_decode_paged_desc;
+
+typedef struct turbine_copy_blocks_desc {    /* fork blocks (n > 1) across all layers */
+    void *pool; int64_t layer_stride_bytes, block_bytes;   /* block_bytes = per-layer block size */
+    int32_t num_layers;
+    const int32_t *src_blocks; const int32_t *dst_blocks;  /* host arrays [count] */
+    int32_t count;
+} turbine_copy_blocks_desc;
+
+typedef struct turbine_moe_route_desc {      /* softmax, top-k (ties → lower expert id), permutation */
+    const float *router_logits;                /* [num_tokens, num_experts] F32 */
+    int32_t num_tokens, num_experts, top_k, renormalize;   /* OLMoE: renormalize = 0 */
+    int32_t *topk_ids; float *topk_weights;    /* [num_tokens, top_k] */
+    int32_t *sorted_rows;                      /* [num_tokens*top_k] (token*top_k + slot) grouped by expert */
+    int32_t *expert_offsets;                   /* [num_experts + 1] */
+} turbine_moe_route_desc;
+
+typedef struct turbine_moe_experts_desc {    /* out += Σ_k w_k · down(silu(gate(x)) * up(x)) over local experts */
+    const void *x;                             /* [num_tokens, hidden] */
+    const void *w_gate; const void *w_up;      /* [num_local_experts, inter, hidden] */
+    const void *w_down;                        /* [num_local_experts, hidden, inter] */
+    const int32_t *sorted_rows; const int32_t *expert_offsets; const float *topk_weights;
+    const int32_t *host_expert_offsets;        /* host copy [num_experts + 1] for group sizes */
+    void *out;                                 /* [num_tokens, hidden], accumulated */
+    void *workspace; size_t workspace_bytes;
+    int32_t num_tokens, hidden, inter, top_k, num_experts;
+    int32_t expert_begin, expert_end;          /* local expert range [begin, end) — TP (shard of inter) / EP (P7) */
+    int32_t dtype;
+} turbine_moe_experts_desc;
+/* trios: attention_prefill_paged, attention_decode_paged, copy_blocks, moe_route, moe_experts
+   CUDA impl names (P2b S-14): "cublaslt","flashinfer_prefill","flashinfer_decode","flashinfer_batch_prefill_paged",
+   "flashinfer_batch_decode_paged","flashinfer_rmsnorm","cublas_grouped_batched","cublaslt_per_expert","turbine_cuda" */
+
+/* ======== v3 (P4): pinned host memory, copy streams, events ======== */
+#define TURBINE_COPY_H2D 0
+#define TURBINE_COPY_D2H 1
+#define TURBINE_COPY_D2D 2
+int32_t turbine_host_alloc_pinned(turbine_ctx *ctx, size_t bytes, void **out);   /* hipHostMalloc / cudaHostAlloc inside the shim */
+int32_t turbine_host_free_pinned(turbine_ctx *ctx, void *ptr);
+int32_t turbine_copy_stream_create(turbine_ctx *ctx, turbine_stream **out);
+int32_t turbine_copy_stream_destroy(turbine_ctx *ctx, turbine_stream *s);
+int32_t turbine_memcpy_async(turbine_ctx *ctx, turbine_stream *s /* NULL = compute stream */,
+                             void *dst, const void *src, size_t bytes, int32_t kind);
+int32_t turbine_event_create(turbine_ctx *ctx, turbine_event **out);
+int32_t turbine_event_destroy(turbine_ctx *ctx, turbine_event *e);
+int32_t turbine_event_record(turbine_ctx *ctx, turbine_event *e, turbine_stream *s /* NULL = compute */);
+int32_t turbine_event_query(turbine_ctx *ctx, turbine_event *e);          /* 1 complete, 0 pending, <0 error */
+int32_t turbine_event_synchronize(turbine_ctx *ctx, turbine_event *e);
+int32_t turbine_stream_wait_event(turbine_ctx *ctx, turbine_stream *s /* NULL = compute */, turbine_event *e);
+
+/* ======== v4 (P5) ======== */
+int32_t turbine_stream_native_handle(turbine_ctx *ctx, turbine_stream *s /* NULL = compute */, void **out); /* opaque; passed to ncclAllReduce etc. */
+typedef struct turbine_row_sumsq_desc { const void *x; float *sumsq; int64_t rows, dim, x_stride_row; int32_t dtype; } turbine_row_sumsq_desc;
+typedef struct turbine_rmsnorm_sharded_desc {  /* out = x * rsqrt(sumsq/full_dim + eps) * weight_shard; sumsq already all-reduced */
+    const void *x; const void *weight; const float *sumsq; void *out;
+    int64_t rows, dim, full_dim, x_stride_row, out_stride_row; float eps; int32_t dtype;
+} turbine_rmsnorm_sharded_desc;
+typedef struct turbine_fill_desc { void *dst; int64_t rows, cols, stride_row; double value; int32_t dtype; } turbine_fill_desc;
+/* trios: row_sumsq, rmsnorm_sharded, fill */
+
+/* ======== v5 (P7) ======== */
+typedef struct turbine_gather_rows_desc {     /* dst[i] = src[rows[i]] */
+    const void *src; void *dst; const int32_t *rows;
+    int64_t count, cols, src_stride_row, dst_stride_row; int32_t dtype;
+} turbine_gather_rows_desc;
+typedef struct turbine_scatter_add_rows_desc { /* dst[rows[i]] += (weights ? weights[i] : 1) * src[i], fixed order i = 0..count-1 */
+    const void *src; void *dst; const int32_t *rows; const float *weights;
+    int64_t count, cols, src_stride_row, dst_stride_row; int32_t dtype;
+} turbine_scatter_add_rows_desc;
+/* trios: gather_rows, scatter_add_rows */
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+Descriptor field names/layouts beyond the P1 statement "plain C struct of device pointers, shapes, strides and dtype codes" are (contract-chosen). Function names `turbine_abi_version`, `turbine_backend_name`, `turbine_build_archs`, `turbine_ctx_create`, `turbine_ctx_destroy`, `turbine_malloc`, `turbine_free`, `turbine_memcpy_h2d`, `turbine_memcpy_d2h`, `turbine_stream_sync`, `turbine_mem_info`, `turbine_last_error`, `turbine_<op>`, `turbine_<op>_supported`, `turbine_<op>_impl` and the codes −1…−5 are verbatim (P1 §Interfaces).
+
+### 9.4 Rust FFI wrapper types (`turbine_kernels::ffi`, `unsafe` allowed)
+
+| Rust                                                                                                                                                                                                                                                                                                                       | Mirrors                               | Notes                                                                                                     |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `#[repr(C)] pub struct GemmDesc`, `AttentionDesc`, `RmsnormDesc`, `RopeDesc`, `SiluMulDesc`, `EmbeddingDesc`, `AddDesc` (P1); `CtxInfo`, `AttentionPagedDesc`, `CopyBlocksDesc`, `MoeRouteDesc`, `MoeExpertsDesc` (P2); `RowSumsqDesc`, `RmsnormShardedDesc`, `FillDesc` (P5); `GatherRowsDesc`, `ScatterAddRowsDesc` (P7) | the C structs                         | field-for-field; `pub(crate)`                                                                             |
+| `struct ShimSymbols`                                                                                                                                                                                                                                                                                                       | every function of the current version | resolved once in `ShimLibrary::load`; a missing symbol = `KernelError::Load`                              |
+| `fn check(code: i32, ctx) -> Result<(), KernelError>`                                                                                                                                                                                                                                                                      | codes −1…−5                           | maps to `InvalidArgument/Unsupported/OutOfMemory/Device/Library`, message from `turbine_last_error`       |
+| `ShimContext`                                                                                                                                                                                                                                                                                                              | `turbine_ctx*`                        | `Send + Sync`; methods take `&self`; one engine thread issues work per context (P2 engine thread owns it) |
+| `ShimStream`, `ShimEvent` (P4)                                                                                                                                                                                                                                                                                             | `turbine_stream*`, `turbine_event*`   | destroyed on Drop via the owning context                                                                  |
+| `PinnedBuffer` backing (P4)                                                                                                                                                                                                                                                                                                | `turbine_host_alloc_pinned`           | freed on Drop                                                                                             |
+
+Stub libraries for tests (`build.rs`, host C compiler): ABI 999; build archs `gfx942` vs mocked `gfx1201`; backend `"cuda"`/archs `"sm_121"`; archs `"sm_90"`; backend `"hip"` under `cuda`; `-4` with `cudaErrorIllegalAddress: an illegal memory access`; `-3` (P1 AC, P2b AC).
+
+### 9.5 Shim build contracts
+
+| Library              | Phase | Build command                                                                                                                                                                                                          | Provider mapping                                                                                                                                                                                                 |
+| -------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `libturbine_hip.so`  | P1    | `cmake -S kernels/rocm -B <build> -DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 && cmake --build <build>`; env `TURBINE_ROCM_PATH` overrides `/opt/rocm/rocm`; CK pinned commit via FetchContent | gemm: hipBLASLt; attention (P1) + paged (P2): CK ck_tile FMHA; rmsnorm: ck_tile `rmsnorm2d` where available; embedding, rope, silu_mul, add, moe_route: Turbine HIP kernels; moe_experts: hipBLASLt grouped GEMM |
+| `libturbine_cuda.so` | P2b   | `cmake -S kernels/cuda -B <build> -DCMAKE_CUDA_ARCHITECTURES=121a [-DTURBINE_CUDA_ROOT=<toolkit>] && cmake --build <build> --parallel`; static CUDA runtime; FlashInfer pinned via FetchContent                        | gemm: cuBLASLt; attention + paged: FlashInfer; rmsnorm: FlashInfer; moe_experts: `cublasGemmGroupedBatchedEx`, fallback per-expert cuBLASLt; others: Turbine CUDA kernels                                        |
+
+---
+
+## 10. `turbine-model` (P1; P2, P5, P7, P8 extend)
+
+| Module          | Phase         | Public items                                                                                                                                                                                                                                                                                                                                                                   |
+| --------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `config`        | P1            | `ModelArchConfig`, `Architecture`, `RopeScaling`, `GenerationConfig`, `load_model_config(dir) -> Result<ModelArchConfig, ModelError>`, `ModelArchConfig::shape() -> ModelShape`, `ModelArchConfig::kv_layout(block_tokens) -> KvLayout`                                                                                                                                        |
+| `safetensors`   | P1            | `SafetensorsIndex::open(dir) -> Result<Self, ModelError>` (index or single file; header ≤ 100 MiB; dtype/shape/range validation; pickle never opened), `TensorEntry { name, dtype, shape, file, range }`                                                                                                                                                                       |
+| `loader`        | P1            | `WeightLoader::load(index, slots, mem: &Arc<dyn DeviceMemory>, staging_bytes ≤ 256 MiB) -> Result<LoadedWeights, ModelError>`; positioned reads, no `mmap`; P5: `ShardSpec` argument (rank shard only)                                                                                                                                                                         |
+| `tokenizer`     | P1            | `Tokenizer::from_file`, `encode`, `decode`, `IncrementalDetokenizer::push(token) -> Option<String>` (never emits partial UTF-8)                                                                                                                                                                                                                                                |
+| `chat_template` | P1            | `ChatTemplate::load(path_or_tokenizer_config)`, `render(&self, messages, tools: Option<&[Tool]> /*P2*/, add_generation_prompt, kwargs: &serde_json::Map) -> Result<String, ModelError>`; host fns `raise_exception`, `strftime_now` (UTC)                                                                                                                                      |
+| `budget`        | P1            | `BudgetTerms { weights, kv_reservation, workspace, emergency_reserve, available }`, `available_bytes(kind: MemoryKind, device_free: u64, host_mem_available: Option<u64>) -> u64` (unified = min), `check_budget(&BudgetTerms) -> Result<(), ModelError>`; superseded for the live budget by `turbine_reliability::budget` in P3                                               |
+| `executor`      | P1            | `trait ModelExecutor` (below), `LlamaExecutor` (P1), `OlmoeExecutor` (P2)                                                                                                                                                                                                                                                                                                      |
+| `sampler`       | P1            | `Sampler::new(params: &SamplingParams) -> Sampler` (ChaCha seeded), `sample(&mut self, logits: &mut [f32], mask: Option<&TokenMask>) -> SampledToken`; penalties/bias/min_tokens P2; `SamplerState` (serialisable, P7 TKV1 sampler segment)                                                                                                                                    |
+| `generate`      | P1            | single-request loop `generate(exec, req, cancel) -> impl Iterator<Item = GenerationEvent>` (P1 only; P2 engine loop replaces it)                                                                                                                                                                                                                                               |
+| `structured`    | P2            | `trait TokenMatcher { fn allowed(&mut self, mask: &mut TokenMask) -> Result<(), ModelError>; fn commit(&mut self, token: u32) -> Result<(), ModelError>; fn accepts_eos(&self) -> bool; }`, `TokenMask` (bitset), `GrammarCompiler::compile(spec: &ConstraintSpec, limits) -> Result<Box<dyn TokenMatcher>, ModelError>` (llguidance; `toktrie_hf_tokenizers` trie built once) |
+| `tools`         | P2            | `trait ToolCallParser { fn parse(&self, text: &str) -> ToolParse; }`, `Llama3JsonParser`, `ToolParse { Calls(Vec<ToolCallOut>), Content(String) }`, `tool_call_grammar(tools, choice, parallel) -> ConstraintSpec`                                                                                                                                                             |
+| `registry`      | P8c           | `ArchitectureEntry { architectures0, model_type, parse, weight_map, build_executor, kv_layout }`, `lookup(architectures0, model_type)`; unregistered → exit 1 naming it                                                                                                                                                                                                        |
+| `testing::tiny` | P1 (P2 OLMoE) | `write_tiny_llama(dir: &Path, seed: u64) -> TinySpec`, `write_tiny_olmoe(dir, seed)` (2 layers; Llama 4/2 heads; OLMoE 8 experts top-2), plus matching tokenizer                                                                                                                                                                                                               |
+
+```rust
+pub enum Architecture { Llama /* "LlamaForCausalLM" */, Olmoe /* "OlmoeForCausalLM", P2 */ }   // P8c adds via registry
+pub struct ModelArchConfig {                       // (contract-chosen name; fields from P1 S-3 / P2 S-16)
+    pub architecture: Architecture, pub num_layers: u32, pub hidden: u32, pub num_attention_heads: u32, pub num_kv_heads: u32,
+    pub head_dim: u32, pub intermediate: u32, pub rms_norm_eps: f32, pub rope_theta: f64, pub rope_scaling: Option<RopeScaling>,
+    pub tie_word_embeddings: bool, pub vocab_size: u32, pub max_position_embeddings: u32, pub eos_token_ids: SmallVec<[u32; 4]>,
+    pub moe: Option<MoeConfig /* num_experts, experts_per_token, expert_intermediate, norm_topk_prob */>, pub qk_norm: bool /* OLMoE */,
+    pub identity: ModelIdentity /* P4 */,
+}
+pub enum RopeScaling { Llama3 { factor: f64, low_freq_factor: f64, high_freq_factor: f64, original_max_position_embeddings: u32 } }
+
+pub struct BatchInput<'a> {                         // P2 ragged batch (P1: a single sequence, contiguous KV)
+    pub tokens: &'a [u32], pub positions: &'a [u32],
+    pub seqs: &'a [SeqSlice],                       // SeqSlice { seq: SeqId, q_start: u32 /*offset into tokens*/, q_len: u32, kv_len: u32, block_table: &[BlockId] }
+    pub kv: &'a KvPoolView,                         // per-layer base pointers of the L0 pool + layout (built by turbine-server from turbine-kv)
+}
+pub trait ModelExecutor: Send {
+    fn shape(&self) -> &ModelShape;
+    fn kv_layout(&self) -> &KvLayout;
+    fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError>;   // FP32 last-position logits per sequence, one D2H copy per iteration (P2 S-9)
+    fn copy_blocks(&mut self, src: &[BlockId], dst: &[BlockId]) -> Result<(), ModelError>;  // P2 n > 1 fork
+}
+pub struct Logits { pub rows: usize, pub vocab: usize, pub data: Vec<f32> }
+
+#[derive(Debug, thiserror::Error)]
+pub enum ModelError {                                // (contract-chosen variants; messages per P1 §Failure modes)
+    #[error("{path}: {detail}")]                                   Io { path: PathBuf, detail: String },
+    #[error("{path}: pickle formats are not supported")]           Pickle { path: PathBuf },
+    #[error("unsupported {field} = {value}; supported: {supported}")] Unsupported { field: String, value: String, supported: String },
+    #[error("{file}: tensor {tensor}: {rule}")]                    Safetensors { file: PathBuf, tensor: String, rule: String },
+    #[error("missing tensor {0}")]                                 MissingTensor(String),
+    #[error("memory budget exceeded: {0}")]                        Budget(String),     // lists weights, KV reservation, workspace, reserve, available (+ sources on unified)
+    #[error("template: {0}")]                                      Template(String),   // → 400
+    #[error("constraint: {0}")]                                    Constraint(String), // grammar compile → 400 invalid_json_schema; step error → constraint_error
+    #[error(transparent)]                                          Kernel(#[from] KernelError),
+}
+```
+
+P5 TP: executors take `Option<TpContext>` (`TpContext { rank: u32, world: u32, collective: Arc<dyn turbine_distributed::collective::Collective>, stream: StreamRef }`, contract-chosen) and use `turbine_distributed::tp` sharding rules; P7 EP MoE layers call `turbine_distributed::expert::{dispatch, combine}`.
+
+---
+
+## 11. `turbine-kv` (P2; P4, P6, P7 extend)
+
+Boundaries (TS §21 rule 6; P2 Constraints; P4 Constraints): modules never reach into each other's internals; no catch-all "KV manager".
+
+| Module      | Phase              | Public items                                                                                                                               |
+| ----------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `pool`      | P2                 | `BlockPool` (L0 accounting + device storage), `BlockPoolConfig`, `PoolError`                                                               |
+| `table`     | P2                 | `BlockTable` (per-sequence ordered `BlockId`s)                                                                                             |
+| `metrics`   | P2 (P4 extends)    | `KvMetrics`                                                                                                                                |
+| `document`  | P2 (P4 extends)    | `KvDocument` (body of `GET /turbine/v1/kv`)                                                                                                |
+| `identity`  | P4                 | `KvKey`, `BlockKey` alias, `NamespaceKey`, `namespace_key(..)`, `block_key(..)`                                                            |
+| `directory` | P4 (P6, P7 extend) | `KvDirectory`, `KvBlock`, `PrefixMatch`, P6 `ClusterIndex`, `DirectoryEntry`, `RemoteKvDecision`, `decide_remote`                          |
+| `tier`      | P4 (P6 adds L3)    | `KvTier` trait, `TierId`, `L0Tier`, `L1PinnedTier`, `L2NvmeTier`, `MemTier` (test double), P6 `L3ClusterTier`, `RemoteKvSource` trait      |
+| `policy`    | P4                 | `EvictionPolicy` trait, `CostAwarePolicy`, `LruPolicy`, `BlockScoreInputs`                                                                 |
+| `planner`   | P4                 | `KvPlan`, `PlanReason`, `plan_prefix(..)`                                                                                                  |
+| `transfer`  | P4                 | `TransferEngine`, `TransferPath`, `TransferTicket`                                                                                         |
+| `session`   | P4                 | `SessionTable`, `Session`, `SessionHintsParsed`                                                                                            |
+| `tkv1`      | P7                 | `Tkv1Header`, `SegmentKind`, `SegmentEntry`, `encode`, `decode`, `Tkv1Error`, `ConversionKind`, `conversion`, `pack_block`, `unpack_block` |
+
+```rust
+// P2
+pub struct BlockPoolConfig { pub layout: KvLayout, pub num_blocks: u32 }       // num_blocks from kv.gpu.max_bytes (P2) / kv pool budget (P3+)
+pub struct BlockPool { /* storage: DeviceBuffer (one allocation, layers × [num_blocks, 2, block_tokens, kv_heads, head_dim]), free list, refcounts */ }
+impl BlockPool {
+    pub fn new(cfg: BlockPoolConfig, mem: Arc<dyn DeviceMemory>) -> Result<Self, PoolError>;
+    pub fn with_ledger(self, ledger: Arc<Ledger>, device: DeviceId) -> Self;               // P3: every block via a `kv` pool reservation
+    pub fn free_blocks(&self) -> u32; pub fn total_blocks(&self) -> u32; pub fn used_blocks(&self) -> u32;
+    pub fn allocate(&mut self, n: u32) -> Result<SmallVec<[BlockId; 8]>, PoolError>;   // PoolError::Exhausted — never an allocator failure (preallocated)
+    pub fn incref(&mut self, b: BlockId); pub fn release(&mut self, blocks: &[BlockId]);   // refcount → 0 frees (P4: frees to cache, not to free list, if keyed)
+    pub fn fork(&mut self, table: &BlockTable) -> Result<BlockTable, PoolError>;          // P2 n > 1 (shares full blocks, copies tail via copy_blocks)
+    pub fn view(&self) -> KvPoolView;                                                     // per-layer base pointers + strides for the executor
+}
+pub struct BlockTable { pub blocks: SmallVec<[BlockId; 16]>, pub tokens: u32 }
+pub fn blocks_for_tokens(tokens: u32, block_tokens: u32) -> u32;
+
+// P4 identity (P4 §Data: first 128 bits of BLAKE3(namespace_key ‖ parent_key ‖ token ids LE u32); hex display 32 chars)
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)] pub struct KvKey(pub [u8; 16]);   // TS §8 name
+pub type BlockKey = KvKey;                                                                              // P6 name (CONFLICT C-17)
+pub struct NamespaceKey(pub [u8; 32]);   // BLAKE3 of canonical JSON {model_config_hash, weights_index_hash, kv_format, block_tokens, cache_salt}
+pub fn namespace_key(id: &ModelIdentity, fmt: &KvFormat, cache_salt: &str) -> NamespaceKey;
+pub fn block_key(ns: &NamespaceKey, parent: Option<&KvKey>, tokens: &[u32]) -> KvKey;   // full blocks only
+
+// TS §8 KvBlock, verbatim fields + P4 additions
+pub struct KvBlock {
+    pub key: KvKey, pub model: ModelFingerprint /* TS "ModelId" (CONFLICT C-17) */, pub token_range: TokenRange, pub format: KvFormat,
+    pub size_bytes: u64, pub locations: SmallVec<[KvLocation; 3]>, pub access_count: u64, pub last_access: Timestamp,
+    pub ref_count: u32, pub priority: KvPriority, pub recompute_cost: CostEstimate,
+    pub decayed_hits: f64, pub session: Option<SessionId>, pub parent: Option<KvKey>, pub child_count: u32, pub tokens: Box<[u32]>,  // P4 S-2
+}
+pub struct TokenRange { pub start: u32, pub end: u32 }
+pub struct KvFormat { pub dtype: KvDtype, pub layout: KvLayout }
+pub enum TierId { L0, L1, L2, L3 /* P6 */ }                       // serde/label "l0".."l3" everywhere (CONFLICT C-4)
+pub struct KvLocation { pub tier: TierId, pub slot: u64 /* L0: BlockId; L1: slab<<32|slot; L2: slab<<32|slot; L3: holder index */ }
+pub type Timestamp = std::time::Duration;                          // monotonic, from Clock
+pub struct KvPriority(pub f32);                                    // 2.0 high, 1.0 normal, 0.5 low (P4; from PriorityClass)
+pub struct CostEstimate { pub seconds: f64 }
+
+pub trait KvTier: Send + Sync {                                    // P4 S-4
+    fn id(&self) -> TierId; fn enabled(&self) -> bool;
+    fn capacity_bytes(&self) -> u64; fn used_bytes(&self) -> u64; fn pressure(&self) -> PressureState;
+    fn est_latency(&self) -> Duration; fn est_bandwidth(&self) -> Option<f64>;
+    fn contains(&self, key: &KvKey) -> bool;
+    fn put(&self, key: KvKey, src: TierBlockRef<'_>) -> Result<TierSlot, TierError>;
+    fn get(&self, key: &KvKey, dst: TierBlockMut<'_>) -> Result<(), TierError>;
+    fn evict(&self, key: &KvKey) -> Result<(), TierError>;
+    fn degraded(&self) -> bool;
+}
+#[derive(Debug, thiserror::Error)] pub enum TierError { #[error("tier full")] Full, #[error("not found")] Missing, #[error("checksum mismatch")] Checksum, #[error("tier I/O: {0}")] Io(String), #[error("tier degraded")] Degraded }
+pub trait RemoteKvSource: Send + Sync {                            // P6 (contract-chosen): implemented by turbine-distributed over the data plane
+    fn fetch(&self, holder: &NodeId, compat: u64, keys: &[KvKey], deadline: Duration) -> Result<Vec<(KvKey, Vec<u8>)>, TierError>;
+}
+
+pub trait EvictionPolicy: Send + Sync {                            // P4 S-7
+    fn name(&self) -> &'static str;                                 // "cost_aware" | "lru"
+    fn score(&self, b: &BlockScoreInputs, now: Timestamp) -> f64;   // higher = keep
+}
+pub struct BlockScoreInputs { pub block: KvBlockSummary, pub tier: TierId, pub tier_capacity: u64, pub tier_pressure: PressureState,
+                              pub prefill_tps: f64, pub retrieval: CostEstimate, pub session_hot: bool, pub depth_tokens: u32 }
+
+pub struct KvPlan { pub reuse_l0: u32, pub promote: Vec<(TierId, u32)>, pub recompute_tokens: u32, pub reason: PlanReason }  // P4 verbatim
+pub enum PlanReason { AllL0, RetrieveCheaper, RecomputeCheaper, L0Pressure, TierDegraded, NoMatch }   // "all_l0", … (P4)
+
+pub enum TransferPath { L0ToL1, L1ToL0, L1ToL2, L2ToL1, L0ToL2, L2ToL0 }   // label "l0_to_l1", … (P4)
+
+// P6 cluster directory (P6 §Data)
+pub struct DirectoryEntry { pub key: KvKey, pub compat: u64, pub holder: NodeId, pub tier: TierId, pub bytes: u64, pub prefix_depth: u32,
+                            pub kv_format: Option<KvDtype> /* P7 */, pub transfer: Option<InflightTransfer> /* P7 */ }
+pub struct InflightTransfer { pub source: NodeId, pub destination: NodeId, pub bytes: u64, pub deadline_ms: u64 }   // P7 S-7
+pub enum RemoteKvDecision { RemoteRetrieve, RecomputeCheaper, IncompatibleLayout, HolderNotAlive, FetchBudgetFull }   // P6 reason codes
+pub fn decide_remote(rtt_ms: f64, bytes: u64, bandwidth_bps: f64, recompute_ms: f64, holder_alive: bool, compat_equal: bool, budget_ok: bool) -> RemoteKvDecision;  // retrieve iff 1.2 × retrieve_ms < recompute_ms
+pub fn compat_id(ns_without_salt: &NamespaceKey, tp_size: u32) -> u64;   // first 8 bytes LE of BLAKE3(ns ‖ tp) (contract-chosen)
+
+// P7 TKV1 (normative layout in P7 §Wire format TKV1; 128-byte fixed header, 32-byte segment entries, crc32c)
+pub const TKV1_MAGIC: [u8; 4] = *b"TKV1"; pub const TKV1_VERSION: u16 = 1;
+pub struct Tkv1Header { pub flags: u16, pub request_id: [u8; 16], pub model_fp: [u8; 32], pub kv_format: KvDtype, pub state_format: u16,
+                        pub block_tokens: u32, pub token_start: u64, pub token_count: u64, pub first_token: u32,
+                        pub attn_layers: u16, pub state_layers: u16, pub segment_count: u32 }
+pub enum SegmentKind { AttnKvBlock = 1, RecurrentState = 2 /* reserved */, ConvState = 3 /* reserved */, SamplerState = 4 }
+pub struct SegmentEntry { pub kind: SegmentKind, pub layer: u16, pub block_index: u32, pub offset: u64, pub length: u64, pub crc32c: u32 }
+#[derive(Debug, thiserror::Error)] pub enum Tkv1Error { BadMagic, UnsupportedVersion(u16), HeaderCrc, SegmentCrc { index: u32 },
+    ModelFingerprintMismatch, SegmentOutOfRange { index: u32 }, ReservedSegmentKind(u16), FormatMismatch { from: KvDtype, to: KvDtype } }
+pub enum ConversionKind { Copy, ExactUpcast, Lossy }                        // label "copy","exact_upcast","lossy" (P7)
+pub fn conversion(from: KvDtype, to: KvDtype, allow_lossy: bool) -> Result<ConversionKind, Tkv1Error>;  // receiver only
+```
+
+KV document (`GET /turbine/v1/kv`): P2 shape `{"tiers":[{tier, dtype, block_tokens, block_bytes, blocks_total, blocks_used, blocks_free}]}` with `tier: "l0"` (CONFLICT C-4); P4 replaces it by the P4 §Data document and keeps the P2 per-tier fields inside each tier object (union, contract-chosen); P6 adds `directory {entries, holders_by_node, last_delta_seq_by_node, fetches_inflight, fetch_bytes_inflight}`; P7 adds `transfers {inflight[≤64]{request_id, source, destination, transport, bytes, elapsed_ms}, completed_total, failed_total_by_reason}`. Note P4's own `transfers {inflight_bytes, max_inflight_bytes}` key collides with P7's `transfers` (CONFLICT C-18: P7's object keeps P4's two fields as additional keys).
+
+The directory, tiers and session table are owned by the KV orchestrator task in `turbine-server` (P4 §Data); the scheduler holds block references, never metadata.
+
+---
+
+## 12. `turbine-scheduler` (P2; P3, P4, P7 extend)
+
+```rust
+pub use turbine_core::types::{RequestId, SeqId, BlockId, Priority};
+
+pub enum RequestState { Waiting, Prefilling, Decoding, Paused, Finished, Cancelled, Failed }   // P2 S-2 verbatim (serde lowercase)
+impl RequestState { pub fn can_transition(self, to: RequestState) -> bool; }                   // disallowed → SchedError::IllegalTransition
+pub enum CancelReason { ClientDisconnect, RequestTimeout, SlowClient, Shutdown, QueueTimeout /*P3*/, CircuitOpen /*P3*/ }  // labels verbatim (P2)
+pub enum PreemptReason { KvExhausted /* P2 */, SurvivalDecodeAlloc /* P3 SURVIVAL rule, contract-chosen */ }
+
+pub struct SchedRequest {                          // what the engine submits (contract-chosen)
+    pub id: RequestId, pub seqs: SmallVec<[SeqId; 1]> /* n choices */, pub prompt_len: u32, pub max_new_tokens: u32,
+    pub priority: Priority, pub estimate: ResourceEstimate, pub arrival: Duration, pub cached_prefix: Option<PrefixAttach> /* P4 */,
+    pub cancel: CancelFlag /* turbine_core::request */,
+}
+pub struct SchedulerParams { pub max_running_requests: u32, pub max_batch_tokens: u32, pub prefill_chunk_tokens: u32,
+                             pub max_queued_requests: u32, pub chunked_prefill: bool, pub block_tokens: u32, pub free_watermark: f64 /* 0.01 */ }
+pub struct Scheduler { /* … */ }
+impl Scheduler {
+    pub fn new(p: SchedulerParams, clock: Arc<dyn Clock>) -> Self;
+    pub fn submit(&mut self, r: SchedRequest) -> Result<(), SubmitError>;
+    pub fn cancel(&mut self, id: RequestId, reason: CancelReason);
+    pub fn plan(&mut self, pool: &mut BlockPool, limits: &IterationLimits) -> IterationPlan;   // rules below
+    pub fn complete(&mut self, pool: &mut BlockPool, outcome: IterationOutcome);
+    pub fn pause(&mut self, seq: SeqId); pub fn resume(&mut self, seq: SeqId);                                      // bounded output channel full / drained
+    pub fn snapshot(&self) -> SchedulerSnapshot;                                                                     // body of GET /turbine/v1/scheduler (P2 §Data)
+}
+#[derive(Clone, Copy)] pub struct IterationLimits {                // (contract-chosen) P2 passes Default (= GREEN); P3 adds `impl From<&ThrottlePlan> for IterationLimits`
+    pub batch_growth_limit: Option<u32>, pub shrink_only: bool, pub prefill_budget_fraction: f64,
+    pub prefill_chunk_tokens: Option<u32>, pub admit_new: bool, pub start_new_prefills: bool,
+}
+pub struct IterationPlan { pub iteration: u64, pub items: Vec<BatchItem>, pub preempted: Vec<(SeqId, PreemptReason)>, pub dropped: Vec<(RequestId, CancelReason)> }
+pub struct BatchItem { pub seq: SeqId, pub kind: BatchKind, pub block_table: BlockTable }
+pub enum BatchKind { Prefill { start: u32, len: u32 }, Decode }
+pub struct IterationOutcome { pub iteration: u64, pub finished: Vec<(SeqId, FinishReason)>, pub appended: Vec<(SeqId, u32 /*tokens*/)>, pub failed: Option<IterationFailure> }
+#[derive(Debug, thiserror::Error)] pub enum SubmitError {
+    #[error("queue full")] QueueFull, #[error("context length exceeded")] ContextLengthExceeded,
+    #[error("context exceeds KV capacity")] ContextExceedsKvCapacity /* CONFLICT C-2 */, #[error("prompt exceeds batch budget")] PromptTooLong /* chunked_prefill=false */,
+    #[error("shutting down")] ShuttingDown,
+}
+#[derive(Debug, thiserror::Error)] pub enum SchedError { #[error("illegal transition {from:?} → {to:?}")] IllegalTransition { from: RequestState, to: RequestState } }
+```
+
+Per-iteration rules (P2 §Scheduling rules, verbatim order): (1) drop cancelled, free blocks; (2) decode set = every `decoding`, not `paused`, one token each; preempt (lowest priority, most recently admitted) until blocks suffice; (3) prefill budget = `max_batch_tokens` − decode tokens; continue `prefilling` oldest first with min(remaining, chunk, budget); then admit `waiting` by priority then arrival while running < max and pool covers first chunk + 1 % watermark; (4) no tokens → sleep until submission/cancellation. P3 overlays the `ThrottlePlan` (batch growth, prefill fraction, chunk size) and replaces "admit waiting" by `turbine_reliability::admission` decisions; below SURVIVAL no running sequence is preempted to make room (P3).
+
+`SchedulerSnapshot` = P2 §Data JSON (`config{max_running_requests,max_batch_tokens,prefill_chunk_tokens,max_queued_requests,chunked_prefill}, waiting, prefilling, decoding, paused, constrained, iterations_total, preemptions_total, last_iteration{prefill_tokens,decode_tokens,requests,duration_ms}`). P5: route returns an object keyed by replica index (`{"0": {…}, "1": {…}}`, contract-chosen encoding). P7 adds top-level `pipeline`, `expert`, `pd` sections (P7 §HTTP diagnostics).
+
+Simulator (P2 S-12, module `sim`): `SimExecutor { cost: CostModel }`, `CostModel { per_prefill_token_s, per_decode_step_s, per_seq_s }`, `ArrivalProcess::poisson(rate, seed)`, `Simulation::run(&mut self, until: Duration) -> SimReport` — virtual time via `FakeClock`, no sleeps, byte-identical for equal seeds. P3 `tests/overload_sim.rs` and P4 `tests/kv_sim.rs` drive the real scheduler + `turbine_reliability` + `turbine_kv` against `SimExecutor`.
+
+P7 additions: `pd::{PdPath, PdRequestFlow}` with `PdPath { Disaggregated, ShortPromptLocal, FallbackColocate, FallbackRecompute, Rejected }` (label values verbatim, P7 metrics); `router::{WorkerCandidate, PdRouteDecision, ScoreTerms}` scoring TS §11 `compute availability + KV locality + transfer cost + device pressure + SLA/priority`, every term logged for winner and runner-up; `pipeline::MicroBatchScheduler { stages, micro_batches }`.
+
+---
+
+## 13. `turbine-transport` (P6; P7 adds `rdma`, `transfer`)
+
+```rust
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;    // (contract-chosen: no `futures` dependency)
+
+pub struct TransportCaps { pub kind: TransportKind, pub rdma: bool, pub gpu_direct: bool, pub max_frame: u64 }   // P6 verbatim
+pub enum TransportKind { Tcp, Mem, Rdma /* P7 */ }                                                             // P6 verbatim
+pub trait Transport: Send + Sync + 'static {                                                                   // P6 verbatim
+    fn caps(&self) -> TransportCaps;
+    fn connect(&self, peer: &PeerAddr, class: ConnClass) -> BoxFuture<'_, Result<Connection, TransportError>>;
+    fn listen(&self, addr: &SocketAddr, class: ConnClass) -> BoxFuture<'_, Result<Listener, TransportError>>;
+}
+pub enum ConnClass { Control, Data }                                                                          // P6 verbatim
+pub struct PeerAddr { pub node: Option<String>, pub addr: SocketAddr }                                        // (contract-chosen)
+pub struct Frame { pub payload: Vec<u8> }                                                                     // wire: u32 LE length + payload; cap checked before allocation
+pub struct Connection { /* … */ }
+impl Connection {
+    pub async fn send(&self, f: Frame) -> Result<(), TransportError>;          // bounded (send_queue_frames), awaits capacity (P6)
+    pub async fn send_priority(&self, f: Frame) -> Result<(), TransportError>; // separate slot for heartbeats (P6 failure modes) (contract-chosen name)
+    pub async fn recv(&self) -> Result<Frame, TransportError>;
+    pub async fn close(&self);
+    pub fn peer(&self) -> &PeerAddr;
+}
+pub struct Listener { /* … */ }  impl Listener { pub async fn accept(&self) -> Result<Connection, TransportError>; }
+#[derive(Debug, thiserror::Error)]
+pub enum TransportError { #[error("timeout")] Timeout, #[error("closed")] Closed, #[error("frame too large")] FrameTooLarge, #[error("authentication failed")] Auth, #[error("I/O: {0}")] Io(String) }  // P6 verbatim variants
+pub struct TcpTransport { /* TCP_NODELAY control; data_streams parallel data conns */ }   impl TcpTransport { pub fn new(cfg: TcpTransportConfig) -> Self; }
+pub mod mem { pub struct MemNetwork; pub struct MemTransport; pub enum MemFault { Drop, Delay(Duration), Partition, Heal, Corrupt, Close } impl MemNetwork { pub fn inject(&self, a: &str, b: &str, f: MemFault); } }
+```
+
+P7 `rdma` (unsafe allowed; libibverbs.so.1 via `libloading`; own RC QP code):
+
+```rust
+pub struct RdmaTransport { /* implements Transport with TransportKind::Rdma; control exchange over the P6 control channel */ }
+pub fn open_verbs(explicit: Option<&Path>) -> Result<VerbsLibrary, RdmaError>;   // default search miss → Unavailable (TCP used); explicit miss → error naming path
+pub struct QpEndpoint { pub gid: [u8; 16], pub qpn: u32, pub psn: u32 }          // exchanged once per peer pair
+pub struct MemoryRegion { /* addr, len, lkey, rkey; REMOTE_READ only; deregistered only after all WRs referencing it completed or QP in error */ }
+pub struct RemoteRegion { pub addr: u64, pub rkey: u32, pub len: u64 }
+#[derive(Debug, thiserror::Error)] pub enum RdmaError { Unavailable(String), Library { path: PathBuf, detail: String }, Device(String), WorkCompletion(String), QpError }
+```
+
+P7 `transfer` (segmented bulk transfer, independent of TKV1 semantics; contract-chosen split — TKV1 encoding lives in `turbine-kv::tkv1`):
+
+```rust
+pub struct SegmentDesc { pub offset: u64, pub length: u64, pub crc32c: u32 }
+pub enum TransferFailure { Timeout, Checksum, TransportError, PeerLost, FormatMismatch, ReservationRefused }   // label values verbatim (P7 metrics)
+pub async fn pull_segments(conn: &TransferConn, src: &[RemoteRegion], segs: &[SegmentDesc], dst: &mut dyn SegmentSink, deadline: Duration) -> Result<u64, TransferFailure>;
+```
+
+---
+
+## 14. `turbine-api` (P0; every phase extends routes)
+
+### 14.1 Router and backend traits
+
+```rust
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;   // own alias, like turbine-transport (contract-chosen)
+pub fn router(state: ApiState) -> axum::Router;                    // all routes, body limit, request-id + metrics layers, 404 fallback
+#[derive(Clone)] pub struct ApiState {
+    pub inference: Arc<dyn InferenceBackend>, pub diagnostics: Arc<dyn Diagnostics>, pub readiness: Arc<dyn Readiness>,
+    pub metrics: MetricsRegistry, pub limits: ApiLimits /* max_request_bytes */,
+}
+pub trait InferenceBackend: Send + Sync {                          // (contract-chosen) implemented by turbine-server; P0 impl returns 503 model_not_loaded
+    fn models(&self) -> Vec<ModelCard>;
+    fn submit(&self, req: InferenceRequest) -> BoxFuture<'_, Result<GenerationStream, ApiError>>;
+    fn prefetch(&self, req: PrefetchRequest) -> BoxFuture<'_, Result<PrefetchAccepted, ApiError>>;   // P4
+}
+pub struct InferenceRequest { pub endpoint: Endpoint, pub body: OpenAiRequest, pub http_request_id: String, pub hints: TurbineHeaders }
+pub struct TurbineHeaders { pub session_resume_within: Option<u32>, pub session_end: bool, pub cache_salt: Option<String>, pub target_replica: Option<String> /* fault-injection */ }
+pub type GenerationStream = tokio::sync::mpsc::Receiver<GenerationEvent>;   // bounded: 64 events (P1) → 256 (P2)
+pub trait Diagnostics: Send + Sync {                               // each returns the JSON document or ApiError::not_implemented() (501)
+    fn status(&self) -> serde_json::Value;      fn devices(&self) -> serde_json::Value;
+    fn scheduler(&self) -> Result<serde_json::Value, ApiError>;    fn kv(&self) -> Result<serde_json::Value, ApiError>;
+    fn pressure(&self) -> Result<serde_json::Value, ApiError>;     fn topology(&self, scope: TopologyScope) -> Result<serde_json::Value, ApiError>;  // P5, scope P6
+    fn cluster(&self) -> Result<serde_json::Value, ApiError>;      // P6 (404 distributed_disabled when off)
+    fn debug_faults(&self, req: DebugFault) -> Result<(), ApiError>;   // P6, feature fault-injection
+}
+pub trait Readiness: Send + Sync { fn ready(&self) -> ReadyState; }
+pub enum ReadyState { Ready, NotReady { reason: NotReadyReason } }
+```
+
+Documents are typed `Serialize` structs in their owning crates (`DeviceInventory`, `SchedulerSnapshot`, `KvDocument`, `PressureDocument`, `TopologyGraph`, `ClusterDocument`, `StatusDocument` in turbine-server); `turbine-api` sees `serde_json::Value` so it stays independent of them (contract-chosen).
+
+`NotReadyReason` (body `{"ready":false,"reason":"<r>"}`, 503):
+
+| Reason                                                                     | Phase                                                                                          |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `no_model_loaded`                                                          | P0                                                                                             |
+| `loading_model`, `model_load_failed` (≤ 1 s before exit 1), `device_error` | P1 (P2 keeps `device_error` for 3 consecutive failed iterations until P3's circuit takes over) |
+| `shutting_down`                                                            | P2                                                                                             |
+| `circuit_open` (CIRCUIT_OPEN, DRAINING, PROBING)                           | P3                                                                                             |
+| `collective_init`, `loading_weights`, `rank_missing`                       | P5                                                                                             |
+| `no_eligible_replica`                                                      | P6                                                                                             |
+| `pipeline_stage_lost`, `pd_roles_incomplete`                               | P7 (contract-chosen strings; P7 says `/ready` turns false)                                     |
+
+### 14.2 Routes by phase
+
+| Route                                            | P0                                               | P1                                                                 | P2                           | P3                                  | P4                                    | P5                                                   | P6                                                                 | P7                           | P8                                                            |
+| ------------------------------------------------ | ------------------------------------------------ | ------------------------------------------------------------------ | ---------------------------- | ----------------------------------- | ------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------ | ---------------------------- | ------------------------------------------------------------- |
+| `GET /health`                                    | 200 `{"status":"ok"}`                            | =                                                                  | =                            | =                                   | =                                     | =                                                    | =                                                                  | =                            | =                                                             |
+| `GET /ready`                                     | 503 `no_model_loaded`                            | 503 loading → 200 `{"ready":true}`                                 | + `shutting_down`            | + `circuit_open`                    | =                                     | + P5 reasons; 200 only when every replica ready      | 200 if ≥ 1 eligible replica cluster-wide                           | + P7 reasons                 | =                                                             |
+| `GET /metrics`                                   | 200 OpenMetrics                                  | =                                                                  | =                            | =                                   | =                                     | =                                                    | =                                                                  | =                            | =                                                             |
+| `GET /v1/models`                                 | 200 empty list                                   | `{id, object:"model", created, owned_by:"turbine", max_model_len}` | =                            | =                                   | =                                     | =                                                    | =                                                                  | =                            | =                                                             |
+| `POST /v1/completions`                           | 503 `model_not_loaded`                           | single slot, 429 `engine_busy`                                     | concurrent; no `engine_busy` | admission errors                    | + `cached_tokens`, `prompt_cache_key` | `not_leader` on static workers                       | may be remote; `x-turbine-served-by`                               | PD/PP/EP paths               | =                                                             |
+| `POST /v1/chat/completions`                      | same                                             | same                                                               | + tools                      | same                                | same                                  | same                                                 | same                                                               | same                         | =                                                             |
+| `GET /turbine/v1/status`                         | `{version, uptime_seconds, ready, device_count}` | + `model{served_name, architecture, weight_bytes, load_seconds}`   | =                            | + `pressure_state`, `circuit_state` | =                                     | + `parallel{tp,dp,backend,mode,groups,plan_reasons}` | + `cluster{node_id,incarnation,state,members_alive,members_total}` | =                            | + `support{…resolved row, status}` (key name contract-chosen) |
+| `GET /turbine/v1/devices`                        | inventory                                        | =                                                                  | =                            | =                                   | =                                     | =                                                    | =                                                                  | + `capabilities` per device  | =                                                             |
+| `GET /turbine/v1/scheduler`                      | 501                                              | 501                                                                | 200 snapshot                 | =                                   | =                                     | keyed by replica                                     | =                                                                  | + `pipeline`, `expert`, `pd` | =                                                             |
+| `GET /turbine/v1/kv`                             | 501                                              | 501                                                                | 200 (P2 shape)               | =                                   | 200 P4 document                       | =                                                    | + `directory`                                                      | + `transfers`                | =                                                             |
+| `GET /turbine/v1/pressure`                       | 501                                              | 501                                                                | 501                          | 200 document                        | =                                     | + `devices`, `groups`, `replicas`                    | =                                                                  | =                            | =                                                             |
+| `POST /turbine/v1/kv/prefetch`                   | — (404)                                          | —                                                                  | —                            | —                                   | 202/404/429/409                       | =                                                    | =                                                                  | =                            | =                                                             |
+| `GET /turbine/v1/topology[?scope=node\|cluster]` | —                                                | —                                                                  | —                            | —                                   | —                                     | 200 node graph                                       | + `scope=cluster`                                                  | =                            | =                                                             |
+| `GET /turbine/v1/cluster`                        | —                                                | —                                                                  | —                            | —                                   | —                                     | —                                                    | 200 / 404 `distributed_disabled`                                   | =                            | =                                                             |
+| `POST /turbine/v1/debug/faults`                  | —                                                | —                                                                  | —                            | —                                   | —                                     | —                                                    | feature `fault-injection` only, else 404                           | =                            | =                                                             |
+| any other path                                   | 404 `not_found`                                  | =                                                                  | =                            | =                                   | =                                     | =                                                    | =                                                                  | =                            | =                                                             |
+
+Streaming (P1): `text/event-stream`, chunks `data: {"id":"cmpl-…","object":"text_completion"|"chat.completion.chunk",…}`, first chat chunk carries `delta.role`, final usage chunk when `stream_options.include_usage`, then `data: [DONE]`. Error mid-stream: one `data: {"error":{"message","type","code"}}` event **followed by `data: [DONE]`** in every phase (CONFLICT C-3).
+
+Request headers: `x-request-id` (P0), `x-turbine-session-resume-within`, `x-turbine-session-end`, `x-turbine-cache-salt` (P4), `x-turbine-target-replica` (P6, fault-injection only, contract-chosen). Response headers: `x-request-id` (P0), `retry-after` (P1+), `x-turbine-served-by: <node_id>/<replica>` (P6).
+
+OpenAI request fields accepted: P1 set (`model, prompt, messages, max_tokens, max_completion_tokens, temperature, top_p, top_k, seed, stop, stream, stream_options.include_usage, logprobs, top_logprobs, echo(false), n(1), ignore_eos, return_tokens_as_token_ids, chat_template_kwargs`); P2 adds `n>1, presence_penalty, frequency_penalty, repetition_penalty, logit_bias, min_tokens, stop_token_ids, priority, echo:true, user, response_format, tools, tool_choice, parallel_tool_calls`, assistant `tool_calls`, `tool` role; P4 adds `prompt_cache_key`. Unknown fields ignored; known-but-unsupported non-default fields → 400 `unsupported_parameter` naming the field.
+
+### 14.3 Error codes (OpenAI shape `{"error":{"message","type","code"}}`)
+
+```rust
+pub struct ApiError { pub status: StatusCode, pub kind: ErrorType, pub code: ErrorCode, pub message: String, pub retry_after: Option<u64> }
+pub enum ErrorType { InvalidRequestError, RateLimitError, ServiceUnavailable, NotImplemented, NotFound, ServerError, Timeout }   // serde snake_case
+pub enum ErrorCode { /* every code below, serde snake_case */ }      // defined in turbine_core::request (contract-chosen home: GenerationEvent::Error and P6 relay need it); re-exported by turbine-api
+```
+
+| Code                                                               | Status                        | `type`                                         | Phase                                                                                                                       | Retry-After                                      |
+| ------------------------------------------------------------------ | ----------------------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| `model_not_loaded`                                                 | 503                           | `service_unavailable`                          | P0                                                                                                                          | —                                                |
+| `not_implemented`                                                  | 501                           | `not_implemented`                              | P0                                                                                                                          | —                                                |
+| `not_found`                                                        | 404                           | `not_found`                                    | P0                                                                                                                          | —                                                |
+| `request_too_large`                                                | 413                           | `invalid_request_error`                        | P0                                                                                                                          | —                                                |
+| `model_not_found`                                                  | 404                           | `invalid_request_error` (contract-chosen type) | P1                                                                                                                          | —                                                |
+| `unsupported_parameter`                                            | 400                           | `invalid_request_error`                        | P1                                                                                                                          | —                                                |
+| `context_length_exceeded`                                          | 400                           | `invalid_request_error`                        | P1                                                                                                                          | —                                                |
+| `engine_busy`                                                      | 429                           | `rate_limit_error` (contract-chosen type)      | P1 only                                                                                                                     | 1                                                |
+| `internal_error`                                                   | 500                           | `server_error` (contract-chosen type)          | P1                                                                                                                          | —                                                |
+| `template_error`                                                   | 400                           | `invalid_request_error`                        | P1 (contract-chosen code; P1 says "400 invalid_request_error with the template error")                                      | —                                                |
+| `queue_full`                                                       | 429                           | `rate_limit_error`                             | P2 (P3 type)                                                                                                                | P2: 1; P3: est. drain s, 1..60                   |
+| `queue_timeout`                                                    | 503                           | `service_unavailable`                          | P2                                                                                                                          | P3: same as queue_full                           |
+| `context_exceeds_kv_capacity`                                      | 400                           | `invalid_request_error`                        | P2 (CONFLICT C-2)                                                                                                           | —                                                |
+| `invalid_json_schema`                                              | 400                           | `invalid_request_error`                        | P2                                                                                                                          | —                                                |
+| `tools_not_supported`                                              | 400                           | `invalid_request_error`                        | P2                                                                                                                          | —                                                |
+| `unknown_tool`                                                     | 400                           | `invalid_request_error`                        | P2 (contract-chosen code for a named function not in `tools`)                                                               | —                                                |
+| `shutting_down`                                                    | 503                           | `service_unavailable`                          | P2                                                                                                                          | —                                                |
+| `request_timeout`                                                  | 504                           | `timeout`                                      | P2                                                                                                                          | —                                                |
+| `slow_client`                                                      | stream only                   | `server_error`                                 | P2                                                                                                                          | —                                                |
+| `constraint_error`                                                 | 500 / stream                  | `server_error`                                 | P2 (reason logged; client sees `internal_error` per P2 → code stays `internal_error`, `constraint_error` is the log reason) | —                                                |
+| `overloaded`                                                       | 503                           | `service_unavailable`                          | P3                                                                                                                          | est. drain s, 1..60                              |
+| `circuit_open`                                                     | 503                           | `service_unavailable`                          | P3                                                                                                                          | remaining cooldown s, ≥ 1                        |
+| `resource_exhausted`                                               | 503 / stream (`server_error`) | `service_unavailable`                          | P3                                                                                                                          | —                                                |
+| `invalid_session_id`, `invalid_session_hint`, `invalid_cache_salt` | 400                           | `invalid_request_error`                        | P4                                                                                                                          | —                                                |
+| `session_not_found`                                                | 404                           | `not_found`                                    | P4                                                                                                                          | —                                                |
+| `prefetch_queue_full`                                              | 429                           | `rate_limit_error`                             | P4                                                                                                                          | —                                                |
+| `pressure_too_high`                                                | 409                           | `invalid_request_error` (contract-chosen type) | P4                                                                                                                          | —                                                |
+| `not_leader`                                                       | 503                           | `service_unavailable`                          | P5                                                                                                                          | —                                                |
+| `replica_failed`                                                   | 503 / stream                  | `server_error`                                 | P5                                                                                                                          | —                                                |
+| `distributed_disabled`                                             | 404                           | `not_found`                                    | P6                                                                                                                          | —                                                |
+| `worker_lost`                                                      | 502 / stream                  | `server_error`                                 | P6                                                                                                                          | —                                                |
+| `forward_failed`                                                   | 502                           | `server_error`                                 | P6                                                                                                                          | —                                                |
+| `no_capacity`                                                      | 503                           | `service_unavailable`                          | P6                                                                                                                          | `retry_after` present (value contract-chosen: 1) |
+| `kv_transfer_failed`                                               | 503                           | `service_unavailable`                          | P7                                                                                                                          | —                                                |
+| `pipeline_stage_lost`                                              | 503                           | `service_unavailable`                          | P7                                                                                                                          | —                                                |
+
+---
+
+## 15. `turbine-distributed` (P5; P6, P7 extend)
+
+### 15.1 Collectives (P5 §Interfaces, verbatim)
+
+```rust
+pub enum ReduceOp { Sum, Max }
+pub use turbine_core::types::CollectiveBackendKind;   // enum CollectiveBackendKind { Nccl, Rccl, Host }
+pub trait Collective: Send + Sync {
+    fn backend(&self) -> CollectiveBackendKind;
+    fn rank(&self) -> usize;
+    fn world_size(&self) -> usize;
+    fn all_reduce(&self, buf: &mut DeviceSlice, op: ReduceOp, stream: &StreamRef) -> Result<(), CollectiveError>;
+    fn all_gather(&self, send: &DeviceSlice, recv: &mut DeviceSlice, stream: &StreamRef) -> Result<(), CollectiveError>;
+    fn reduce_scatter(&self, send: &DeviceSlice, recv: &mut DeviceSlice, op: ReduceOp, stream: &StreamRef) -> Result<(), CollectiveError>;
+    fn broadcast(&self, buf: &mut DeviceSlice, root: usize, stream: &StreamRef) -> Result<(), CollectiveError>;
+    fn barrier(&self, stream: &StreamRef) -> Result<(), CollectiveError>;
+    fn abort(&self);
+    // P7 (contract-chosen): EP all-to-all built from ncclSend/ncclRecv inside ncclGroupStart/End
+    fn all_to_all_v(&self, send: &DeviceSlice, send_counts: &[usize], recv: &mut DeviceSlice, recv_counts: &[usize], stream: &StreamRef) -> Result<(), CollectiveError>;
+}
+#[derive(Debug, thiserror::Error)]
+pub enum CollectiveError {                                   // P5 verbatim variants
+    #[error("{op} timed out after {after:?}")] Timeout { op: &'static str, after: Duration },
+    #[error("rank {rank} aborted")]           RemoteAbort { rank: usize },
+    #[error("backend error {code}: {message}")] Backend { code: i32, message: String },
+    #[error("shape mismatch")]                ShapeMismatch,
+    #[error("{library} unavailable: {detail}")] Unavailable { library: String, detail: String },
+}
+pub mod host { pub struct HostCollective; impl HostCollective { pub fn group(world: usize, op_timeout: Duration) -> Vec<HostCollective>; } }  // threads, deterministic order
+pub mod ffi  { pub struct NcclApi { /* one binding table */ } impl NcclApi { pub fn load(kind: CollectiveBackendKind, explicit: Option<&Path>) -> Result<Arc<NcclApi>, CollectiveError>; } }
+```
+
+NCCL-API symbols bound (P5, exactly 13): `ncclGetVersion`, `ncclGetUniqueId`, `ncclCommInitRankConfig`, `ncclCommGetAsyncError`, `ncclCommAbort`, `ncclCommDestroy`, `ncclAllReduce`, `ncclAllGather`, `ncclReduceScatter`, `ncclBroadcast`, `ncclGroupStart`, `ncclGroupEnd`, `ncclGetErrorString`. P7 adds `ncclSend`, `ncclRecv` (contract-chosen; required for `all_to_all_v`; the P5 stub test keeps asserting the 13, P7's stub adds 2). Libraries: `librccl.so.1` → `rccl`, `libnccl.so.2` → `nccl`; RCCL default search `/opt/rocm/lib` then loader path. Supported dtypes BF16, FP32.
+
+### 15.2 Plan, ranks, TP, DP router (P5)
+
+```rust
+pub struct ParallelPlan { pub tp: u32, pub dp: u32, pub backend: CollectiveBackendKind, pub mode: RankMode, pub vendor: Vendor,
+                          pub excluded_devices: Vec<DeviceId>, pub groups: Vec<ReplicaGroup>, pub reasons: Vec<PlanReason> }   // P5 §Data
+pub struct ReplicaGroup { pub replica: ReplicaId, pub ranks: Vec<RankSlot> }
+pub struct RankSlot { pub rank: u32, pub device: DeviceId, pub host: String }
+pub enum PlanReason { FitsSingleDevice, TpRequiredForCapacity, GroupedByLink(PathClass), VendorHomogeneous, VendorExcluded(Vendor),
+                      ExplicitDevices, DeviceSharingEnabled }   // Display: "fits_single_device", "grouped_by_link:<path>", "vendor_excluded:<vendor>", …
+pub fn plan(inv: &DeviceInventory, topo: &TopologyGraph, cfg: &ParallelConfig, model: &ModelShape, device_budget: &dyn Fn(DeviceId) -> u64) -> Result<ParallelPlan, PlanError>;
+#[derive(Debug, thiserror::Error)] #[error("{key}: {reason}")] pub struct PlanError { pub key: String, pub reason: String }   // exit 2 before bind; "vendor-mixed plan"
+
+// rank runtime (local | static)
+pub struct StepPlan { pub step: u64, pub sequences: Vec<StepSeq> }                       // P5 verbatim fields
+pub struct StepSeq { pub seq_id: SeqId, pub tokens: Vec<u32>, pub positions: Vec<u32>, pub block_table: Vec<BlockId>, pub is_prefill: bool }
+pub trait StepExecutor: Send { fn execute(&mut self, plan: &StepPlan) -> Result<StepOutput, ExecError>; }   // (contract-chosen) implemented in turbine-server over turbine-model
+pub struct StepOutput { pub logits: Option<Vec<f32>> /* leader only, rows × vocab */, pub rows: usize, pub vocab: usize }
+#[derive(Debug, thiserror::Error)] pub enum ExecError { #[error(transparent)] Collective(#[from] CollectiveError), #[error("executor: {0}")] Executor(String), #[error("sticky device error: {0}")] DeviceFatal(String) }
+pub enum RankMessage {                                                                   // P5 static-mode protocol v1 (postcard, u32 LE length, ≤ 16 MiB)
+    Hello { protocol: u16, rank: u32, world_size: u32, model_fingerprint: ModelFingerprint, config_fingerprint: [u8; 32], device_vendor: Vendor, device_arch: String },
+    Welcome { unique_id: [u8; 128] },
+    Reject { reason: String },
+    StepPlan(StepPlan),
+    Shutdown { reason: String },
+}
+pub struct RankRuntime { /* leader or worker; plan channel depth = parallel.plan_queue_depth */ }
+
+// tp (sharding rules, P5 S-6)
+pub struct ShardSpec { pub rank: u32, pub world: u32 }
+pub fn head_range(num_heads: u32, s: ShardSpec) -> Range<u32>;
+pub fn kv_head_range(num_kv_heads: u32, s: ShardSpec) -> Range<u32>;          // replicated when tp > kv_heads and tp % kv_heads == 0
+pub fn column_range(dim: u32, s: ShardSpec) -> Range<u32>;                    // gate/up, experts along intermediate
+pub fn row_range(dim: u32, s: ShardSpec) -> Range<u32>;                       // o_proj, down_proj (+ all-reduce)
+pub fn vocab_shard(vocab: u32, s: ShardSpec) -> (u32 /*offset*/, u32 /*rows*/, u32 /*padded rows*/);   // padding masked to −inf before all-gather
+
+// DP router (P5 S-7)
+pub enum DpRouteReason { PrefixAffinity, LeastLoaded, PressureAvoidance, OnlyCandidate }   // label values verbatim
+pub struct ReplicaView { pub replica: ReplicaId, pub state: PressureState, pub circuit: CircuitState, pub outstanding_tokens: u64, pub has_prefix: bool }
+pub fn route(views: &[ReplicaView], policy: DpRouterPolicy) -> (ReplicaId, DpRouteReason);
+```
+
+Binary `turbine-collbench` (P5): `src/bin/turbine-collbench.rs`; flags in §19; JSON keys `bytes, time_us, algbw_gbps, busbw_gbps, correct`; busbw factor all-reduce 2(n−1)/n, all-gather/reduce-scatter (n−1)/n, broadcast 1.
+
+### 15.3 Cluster (P6)
+
+```rust
+// proto (P6 S-2): frames = u32 LE length + postcard(Message); ≤ distributed.transport.max_frame_bytes; ≤ 4096 delta entries per frame
+pub const PROTOCOL_MIN: u16 = 1; pub const PROTOCOL_MAX: u16 = 1;            // P7 raises PROTOCOL_MAX to 2 (contract-chosen)
+#[derive(Serialize, Deserialize)]
+pub enum Message {
+    // handshake (every control and data connection)
+    Hello { protocol_min: u16, protocol_max: u16, cluster_name: String, node_id: NodeId, incarnation: u64, serving_vendor: Option<Vendor>, nonce: [u8; 32] },
+    Challenge { nonce: [u8; 32], mac: [u8; 32] },            // mac = HMAC-SHA256(psk, their_nonce ‖ node_id)
+    Proof { mac: [u8; 32] },                                  // mac = HMAC-SHA256(psk, our_nonce ‖ node_id)
+    Accept { protocol: u16, cluster_vendor: Option<Vendor> },
+    Reject { reason: HandshakeReject },
+    // membership & topology
+    PeerList { peers: Vec<PeerInfo> },
+    Heartbeat { seq: u64, sent_at_mono_ns: u64, replicas: Vec<ReplicaLoad>, directory_seq: u64 },
+    Topology { graph: TopologyGraph },
+    // KV directory
+    DirectoryDelta { seq: u64, added: Vec<DirectoryEntry>, removed: Vec<BlockKey> },
+    DirectorySnapshotRequest,
+    DirectorySnapshot { seq: u64, chunk: u32, last: bool, entries: Vec<DirectoryEntry> },
+    // request forwarding
+    Forward { request_id: RequestId, deadline_ms: u64, replica: ReplicaId, body: Vec<u8> },   // body = postcard(ForwardBody) (contract-chosen)
+    StreamEvent { request_id: RequestId, payload: GenerationEvent },
+    StreamEnd { request_id: RequestId, usage: Usage, finish: FinishReason },
+    Cancel { request_id: RequestId },
+    // data plane
+    KvFetch { transfer_id: u64, compat: u64, keys: Vec<BlockKey> },
+    KvBlock { transfer_id: u64, key: BlockKey, rank: u32, crc32c: u32, bytes: Vec<u8> },
+    KvFetchEnd { transfer_id: u64, missing: Vec<BlockKey> },
+    // leave
+    Drain { reason: String },
+    Goodbye,
+    // cross-node TP bootstrap through membership (P6; contract-chosen wrapper)
+    Rank(RankMessage),
+    // ---- P7 (protocol 2; contract-chosen names, semantics P7 §RDMA transfer protocol) ----
+    PdReserve { request_id: RequestId, projected_blocks: u32, prompt_tokens: u32, max_tokens: u32 },
+    PdReserved { request_id: RequestId, held_blocks: Vec<u32> },
+    PdRefused { request_id: RequestId, reason: String, pressure: PressureState },
+    PdReady { request_id: RequestId, header: Vec<u8> /* TKV1 header + segment table */, regions: Vec<RemoteRegionMsg> },
+    PdCommitted { request_id: RequestId },
+    PdAborted { request_id: RequestId, reason: TransferFailureMsg },
+    RdmaConnect { gid: [u8; 16], qpn: u32, psn: u32 },
+    RdmaConnectAck { gid: [u8; 16], qpn: u32, psn: u32 },
+    StageActivation { pipeline: u32, micro_batch: u32, step: u64, from_stage: u32, bytes: Vec<u8> },   // PP activations (BF16 hidden × tokens)
+}
+pub struct RemoteRegionMsg { pub addr: u64, pub rkey: u32, pub len: u64 }                 // serde mirror of turbine_transport::rdma::RemoteRegion (contract-chosen)
+pub enum TransferFailureMsg { Timeout, Checksum, TransportError, PeerLost, FormatMismatch, ReservationRefused }   // serde mirror of TransferFailure
+pub enum HandshakeReject { BadAuth, ClusterMismatch, DuplicateNodeId, ProtocolUnsupported, ClusterFull, VendorMismatch }   // P6 verbatim
+pub struct PeerInfo { pub node_id: NodeId, pub incarnation: u64, pub control: SocketAddr, pub data: SocketAddr }
+pub struct ReplicaLoad { pub replica: ReplicaId, pub pressure: PressureState, pub circuit: CircuitState, pub queued_prefill_tokens: u64,
+                         pub active_seqs: u32, pub free_kv_blocks: u32, pub prefill_tps_ewma: f64 }
+pub struct ForwardBody { pub endpoint: Endpoint, pub openai_json: Vec<u8>, pub hints: ForwardHints /* session, salt, priority */ }
+
+// membership
+pub enum MemberState { Joining, Alive, Suspect, Dead, Leaving, Left }      // serde lowercase; `Left` from P6 AC graceful_leave (CONFLICT C-16)
+pub struct Membership { /* per-node view; incarnation = wall-clock ns at start */ }
+pub struct ClusterDocument { /* GET /turbine/v1/cluster, P6 §Data; pressure/circuit rendered uppercase (CONFLICT C-5) */ }
+
+// placement (P6)
+pub enum PlacementReason { LocalPrefixHit, RemotePrefixHit, LeastLoaded, PressureAvoidance, ForwardCheaper, OnlyCandidate }   // verbatim
+pub fn score(req: &PlacementQuery, cands: &[ReplicaCandidate], w: &PlacementWeights) -> Option<(ReplicaRef, PlacementReason)>;
+pub enum RecoveryAction { RestartRequest, FailRequest, PurgeDirectory, AbortFetch, AbortGroup }   // label values verbatim
+pub enum FailureDetector { Heartbeat, Connection, Collective }                                     // label values verbatim
+pub mod sim { pub struct ClusterSim; pub enum ScriptedFault { Kill(String), Restart(String), Partition(String, String), Heal(String, String), Delay(..), Drop(..), Corrupt(..) } }
+```
+
+### 15.4 Advanced distribution (P7)
+
+```rust
+pub mod pipeline { pub struct PipelinePlan { pub stages: Vec<StagePlan> }  pub struct StagePlan { pub stage: u32, pub device_group: u32, pub first_layer: u32, pub last_layer: u32, pub weight_bytes: u64, pub est_cost: f64 }
+                   pub fn partition(layer_costs: &[f64], stages: u32) -> PipelinePlan; pub fn validate_split(split: &[u32], layers: u32, stages: u32) -> Result<(), PlanError>; }
+pub mod expert   { pub struct ExpertPlacement { pub parallel_size: u32, pub map: Vec<Vec<u32> /* layer → rank per expert */> }
+                   pub fn contiguous(num_layers: u32, num_experts: u32, parallel_size: u32) -> Result<ExpertPlacement, PlanError>;
+                   pub fn from_file(path: &Path, …) -> Result<ExpertPlacement, PlanError>;
+                   pub fn dispatch(..); pub fn combine(..);   // fixed, rank-count-independent combine order }
+pub mod capability { pub fn validate(strategy: Strategy, devices: &[DeviceCapabilities], …) -> Result<(), CapabilityRefusal>;
+                     pub enum Strategy { Tp, Ep, Pp, Pd } }   // TP/EP same collective domain only; PP cross-vendor iff boundary dtype on both; PD cross-vendor iff same fingerprint, block_tokens and lossless conversion
+```
+
+---
+
+## 16. `turbine-server` (P0; every phase extends)
+
+### 16.1 CLI
+
+```
+turbine-server --config <path> [--set <dotted.key>=<yaml value>]... [--check-config]      # P0
+turbine-server --support-matrix [--output text|json]                                        # P8 (no config read)
+```
+
+`--check-config`: validate (P8: + resolve support-matrix row), print `config ok`, exit 0; else stderr, exit 2 — no discovery, no bind.
+
+### 16.2 Exit codes
+
+| Code | Meaning                                                                                                                                                                                                                                                                                                                | Phase |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| 0    | clean shutdown (SIGINT/SIGTERM; P2: after `server.shutdown_grace`)                                                                                                                                                                                                                                                     | P0    |
+| 1    | startup failure after config validation (bind, explicit GPU library, model files, architecture, kernel library/ABI/arch, budget, weights, warm-up, P5 collective library with tp > 1, P7 rdma), unsupported support-matrix row at startup (P8); runtime: 3 consecutive failed requests (P1) / iterations (P2) until P3 | P0    |
+| 2    | invalid configuration or CLI usage; P5 impossible parallel plan; P7 impossible placement; P8 unsupported row under `--check-config`                                                                                                                                                                                    | P0    |
+| 3    | sticky (context-corrupting) device error or controller panic after drain; external supervisor restarts (P3; P5 `local` mode: whole process)                                                                                                                                                                            | P3    |
+
+```rust
+pub enum ExitCode { Clean = 0, Startup = 1, Config = 2, DeviceFatal = 3 }   // (contract-chosen)
+```
+
+### 16.3 Startup order (P1 §Interfaces, extended)
+
+1. Parse CLI, load + validate config (exit 2). 2. Discover devices (P0). 3. P4 `validate_host`; P5 parallel plan (exit 2); P8 support row. 4. Load kernel provider for `execution.backend` (`ShimLibrary::load` → ABI → backend name → arch → `create_context(vendor_index)` → log `kernel_library_loaded`). 5. Parse model config + tokenizer. 6. Memory budget (P1 rule; P3 `compute_budget` after weights with pre-check before) — exit 1 before reading weights. 7. Bind listener (`/health` 200, `/ready` 503 `loading_model`). 8. Load weights (P5: every rank's shard). 9. Allocate KV pool, emergency reserve (P3), L1/L2 tiers (P4), communicators (P5), join cluster (P6). 10. One-token warm-up. 11. `/ready` 200.
+
+### 16.4 Engine thread (P2) and orchestrators
+
+- Dedicated OS thread owns the `ShimContext`, `Scheduler`, `BlockPool`, executor, sampler and llguidance matchers; never awaits a client (P2 Constraints).
+- `EngineHandle` (contract-chosen): `submit_tx: tokio::sync::mpsc::Sender<EngineCommand>` (capacity `scheduler.max_queued_requests`); `enum EngineCommand { Submit(Box<GenerationRequest>, mpsc::Sender<GenerationEvent> /* 256 */), Cancel { id: RequestId, reason: CancelReason }, Shutdown }`.
+- Grammar compilation on Tokio's blocking pool behind a semaphore of 4 permits and `structured_output.compile_timeout` (P2).
+- P3: `PressureController` task + `TelemetrySampler` threads; scheduler reads `ControllerHandle::throttle()` once per iteration.
+- P4: KV orchestrator task owns `KvDirectory`, tiers, `SessionTable`, `TransferEngine`; implements `KvReclaimer`.
+- P5: one engine per DP replica; `RankRuntime` per TP group. P6: membership/forwarding tasks on Tokio.
+
+---
+
+## 16A. `turbine-bench` binaries (`benches/turbine-bench`)
+
+See §19 for flags. `turbine-bench` (P0) is the load generator (P3 open-loop, P4 multi-turn profile + `kv-sim`, P7 profiles + `compare` + `kv-transfer`); `turbine-golden` (P1) compares/captures fixtures (P2 `--concurrency`, P8 `eval`, `eval-compare`). Library modules (contract-chosen): `prompt` (seeded prompts; unit test `prompt::tests::prompts_are_deterministic`), `report`, `golden`, `kv_sim`, `kv_transfer`.
+
+---
+
+## 17. Metrics by phase (Prometheus / OpenMetrics; owner crate registers)
+
+| Name                                                                                                                   | Type                          | Labels (closed sets)                                                                                                                                                            | Phase                                                                  | Owner         |
+| ---------------------------------------------------------------------------------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | ------------- |
+| `turbine_http_requests_total`                                                                                          | counter                       | `method`, `route` (template or `unmatched`), `status`                                                                                                                           | P0                                                                     | observability |
+| `turbine_http_request_duration_seconds`                                                                                | histogram                     | `method`, `route`                                                                                                                                                               | P0                                                                     | observability |
+| `turbine_build_info`                                                                                                   | gauge (=1)                    | `version`                                                                                                                                                                       | P0                                                                     | observability |
+| `turbine_devices`                                                                                                      | gauge                         | `vendor` ∈ nvidia, amd                                                                                                                                                          | P0                                                                     | device        |
+| `turbine_model_load_seconds`                                                                                           | gauge                         | —                                                                                                                                                                               | P1                                                                     | model         |
+| `turbine_model_weight_bytes`                                                                                           | gauge                         | `format` ∈ bf16 (P8a adds)                                                                                                                                                      | P1                                                                     | model         |
+| `turbine_kernel_provider_selected`                                                                                     | gauge (=1)                    | `op` (OpKind), `provider` ∈ cpu-reference, hip, cuda, `impl` (shim `_impl` strings)                                                                                             | P1                                                                     | kernels       |
+| `turbine_requests_total`                                                                                               | counter                       | `endpoint` ∈ /v1/completions, /v1/chat/completions; `outcome` ∈ ok, cancelled, rejected, failed                                                                                 | P1                                                                     | server        |
+| `turbine_request_ttft_seconds`, `turbine_request_itl_seconds`, `turbine_request_e2e_seconds`                           | histogram                     | —                                                                                                                                                                               | P1                                                                     | server        |
+| `turbine_tokens_total`                                                                                                 | counter                       | `kind` ∈ prompt, generated                                                                                                                                                      | P1                                                                     | server        |
+| `turbine_forward_seconds`                                                                                              | histogram                     | `phase` ∈ prefill, decode                                                                                                                                                       | P1                                                                     | model         |
+| `turbine_requests_active`                                                                                              | gauge                         | `state` ∈ prefilling, decoding, paused                                                                                                                                          | P2                                                                     | scheduler     |
+| `turbine_requests_queued`                                                                                              | gauge                         | —                                                                                                                                                                               | P2                                                                     | scheduler     |
+| `turbine_admission_total`                                                                                              | counter                       | `outcome` ∈ queued, rejected; `reason` ∈ ok, queue_full, context_length_exceeded, context_exceeds_kv_capacity (CONFLICT C-2), invalid_json_schema, shutting_down, queue_timeout | P2                                                                     | scheduler     |
+| `turbine_queue_wait_seconds`                                                                                           | histogram                     | —                                                                                                                                                                               | P2                                                                     | scheduler     |
+| `turbine_iteration_seconds`                                                                                            | histogram                     | —                                                                                                                                                                               | P2                                                                     | scheduler     |
+| `turbine_iteration_tokens`                                                                                             | histogram                     | `phase` ∈ prefill, decode                                                                                                                                                       | P2                                                                     | scheduler     |
+| `turbine_batch_requests`                                                                                               | histogram                     | —                                                                                                                                                                               | P2                                                                     | scheduler     |
+| `turbine_preemptions_total`                                                                                            | counter                       | `reason` ∈ kv_exhausted, survival_decode_alloc (P3, contract-chosen)                                                                                                            | P2                                                                     | scheduler     |
+| `turbine_requests_cancelled_total`                                                                                     | counter                       | `reason` ∈ client_disconnect, request_timeout, slow_client, shutdown (+ queue_timeout, circuit_open P3, contract-chosen)                                                        | P2                                                                     | scheduler     |
+| `turbine_kv_blocks`                                                                                                    | gauge                         | `tier` ∈ l0, l1, l2 (l3 P6); `state` ∈ used, free (CONFLICT C-4)                                                                                                                | P2                                                                     | kv            |
+| `turbine_stream_paused_total`                                                                                          | counter                       | —                                                                                                                                                                               | P2                                                                     | server        |
+| `turbine_grammar_compile_seconds`                                                                                      | histogram                     | `kind` ∈ json_object, json_schema, tool_call                                                                                                                                    | P2                                                                     | model         |
+| `turbine_token_mask_seconds`                                                                                           | histogram                     | —                                                                                                                                                                               | P2                                                                     | model         |
+| `turbine_tool_calls_total`                                                                                             | counter                       | `parser` ∈ llama3_json; `outcome` ∈ parsed, parse_failed                                                                                                                        | P2                                                                     | model         |
+| `turbine_pressure_state`                                                                                               | gauge (1 current)             | `state` ∈ GREEN…SURVIVAL                                                                                                                                                        | P3                                                                     | reliability   |
+| `turbine_pressure_transitions_total`                                                                                   | counter                       | `from`, `to`, `signal`                                                                                                                                                          | P3                                                                     | reliability   |
+| `turbine_pressure_signal`                                                                                              | gauge                         | `signal`                                                                                                                                                                        | P3                                                                     | reliability   |
+| `turbine_pressure_signal_level`                                                                                        | gauge (0–4)                   | `signal`                                                                                                                                                                        | P3                                                                     | reliability   |
+| `turbine_pressure_exhaustion_horizon_seconds`                                                                          | gauge (+Inf when not growing) | —                                                                                                                                                                               | P3                                                                     | reliability   |
+| `turbine_admission_decisions_total`                                                                                    | counter                       | `decision` ∈ admit, queue, reject; `reason` (PressureReason / RejectionReason snake_case, `none` for admit)                                                                     | P3                                                                     | reliability   |
+| `turbine_admission_queue_depth`                                                                                        | gauge                         | —                                                                                                                                                                               | P3                                                                     | reliability   |
+| `turbine_admission_queue_wait_seconds`                                                                                 | histogram                     | —                                                                                                                                                                               | P3                                                                     | reliability   |
+| `turbine_throttle_plan`                                                                                                | gauge                         | `field` ∈ batch_growth_limit, prefill_budget_fraction, prefill_chunk_tokens                                                                                                     | P3                                                                     | reliability   |
+| `turbine_reclaim_bytes_total`                                                                                          | counter                       | `action` ∈ demote, free_cached, free_optional, release_reserve (contract-chosen set)                                                                                            | P3                                                                     | reliability   |
+| `turbine_memory_pool_bytes`                                                                                            | gauge                         | `device`, `pool` (PoolKind), `kind` ∈ capacity, used, reserved                                                                                                                  | P3                                                                     | reliability   |
+| `turbine_emergency_reserve_held`                                                                                       | gauge                         | `device`                                                                                                                                                                        | P3                                                                     | reliability   |
+| `turbine_emergency_reserve_releases_total`                                                                             | counter                       | `device`                                                                                                                                                                        | P3                                                                     | reliability   |
+| `turbine_allocation_failures_total`                                                                                    | counter                       | `device`, `pool`                                                                                                                                                                | P3                                                                     | reliability   |
+| `turbine_recoveries_total`                                                                                             | counter                       | `outcome` ∈ recovered, failed                                                                                                                                                   | P3                                                                     | reliability   |
+| `turbine_recovery_retries_total`                                                                                       | counter                       | —                                                                                                                                                                               | P3                                                                     | reliability   |
+| `turbine_circuit_state`                                                                                                | gauge                         | `state` ∈ HEALTHY…PROBING                                                                                                                                                       | P3                                                                     | reliability   |
+| `turbine_circuit_transitions_total`                                                                                    | counter                       | `from`, `to`, `reason` (CircuitReason snake_case)                                                                                                                               | P3                                                                     | reliability   |
+| `turbine_gpu_temperature_celsius`, `turbine_gpu_clock_mhz`, `turbine_gpu_power_watts`, `turbine_gpu_utilization_ratio` | gauge                         | `device`                                                                                                                                                                        | P3                                                                     | device        |
+| `turbine_gpu_memory_bytes`                                                                                             | gauge                         | `device`, `kind` ∈ used, free (dedicated only)                                                                                                                                  | P3                                                                     | device        |
+| `turbine_gpu_throttle_active`                                                                                          | gauge                         | `device`, `reason` ∈ thermal, power, other                                                                                                                                      | P3                                                                     | device        |
+| `turbine_host_memory_available_bytes`, `turbine_host_psi_memory_some_avg10`, `turbine_host_swap_in_pages_per_second`   | gauge                         | —                                                                                                                                                                               | P3                                                                     | device        |
+| `turbine_telemetry_stale`                                                                                              | gauge                         | `source` ∈ host, device index, storage (contract-chosen set)                                                                                                                    | P3                                                                     | device        |
+| `turbine_telemetry_call_duration_seconds`                                                                              | histogram                     | `source`                                                                                                                                                                        | P3                                                                     | device        |
+| `turbine_kv_bytes`                                                                                                     | gauge                         | `tier` ∈ l0, l1, l2; `kind` ∈ capacity, used                                                                                                                                    | P4                                                                     | kv            |
+| `turbine_kv_lookups_total`                                                                                             | counter                       | `result` ∈ l0, l1, l2, miss (+ l3 P6)                                                                                                                                           | P4                                                                     | kv            |
+| `turbine_kv_prefix_cached_tokens_total`, `turbine_kv_prompt_tokens_total`                                              | counter                       | —                                                                                                                                                                               | P4                                                                     | kv            |
+| `turbine_kv_promotions_total`, `turbine_kv_demotions_total`                                                            | counter                       | `from`, `to` (tiers)                                                                                                                                                            | P4                                                                     | kv            |
+| `turbine_kv_evictions_total`                                                                                           | counter                       | `tier`; `reason` ∈ capacity, pressure, session_expired, checksum, tier_degraded                                                                                                 | P4                                                                     | kv            |
+| `turbine_kv_drops_total`                                                                                               | counter                       | `reason` (same set + below_min_value, no_room — contract-chosen additions)                                                                                                      | P4                                                                     | kv            |
+| `turbine_kv_recompute_tokens_total`, `turbine_kv_plans_total`                                                          | counter                       | `reason` (PlanReason)                                                                                                                                                           | P4                                                                     | kv            |
+| `turbine_kv_transfer_seconds`                                                                                          | histogram                     | `path` (TransferPath)                                                                                                                                                           | P4                                                                     | kv            |
+| `turbine_kv_transfer_bytes_total`                                                                                      | counter                       | `path` (TransferPath) — local tier copies only (CONFLICT C-9)                                                                                                                   | P4                                                                     | kv            |
+| `turbine_kv_transfer_bandwidth_bytes_per_second`                                                                       | gauge                         | `path`                                                                                                                                                                          | P4                                                                     | kv            |
+| `turbine_kv_prefetch_total`                                                                                            | counter                       | `outcome` ∈ used, wasted, cancelled, rejected                                                                                                                                   | P4                                                                     | kv            |
+| `turbine_kv_sessions`                                                                                                  | gauge                         | —                                                                                                                                                                               | P4                                                                     | kv            |
+| `turbine_kv_tier_degraded`                                                                                             | gauge                         | `tier`                                                                                                                                                                          | P4                                                                     | kv            |
+| `turbine_storage_queue_depth`                                                                                          | gauge                         | —                                                                                                                                                                               | P4                                                                     | kv            |
+| `turbine_storage_latency_seconds`                                                                                      | histogram                     | —                                                                                                                                                                               | P4                                                                     | kv            |
+| `turbine_collective_duration_seconds`                                                                                  | histogram                     | `op`, `backend`                                                                                                                                                                 | P5                                                                     | distributed   |
+| `turbine_collective_bytes_total`                                                                                       | counter                       | `op`, `backend`                                                                                                                                                                 | P5                                                                     | distributed   |
+| `turbine_collective_errors_total`                                                                                      | counter                       | `backend`, `kind` ∈ timeout, remote_abort, backend                                                                                                                              | P5                                                                     | distributed   |
+| `turbine_tp_step_skew_seconds`                                                                                         | histogram                     | `replica`                                                                                                                                                                       | P5                                                                     | distributed   |
+| `turbine_device_budget_bytes`                                                                                          | gauge                         | `device`, `component` ∈ weights, kv, workspace, collective, runtime, reserve                                                                                                    | P5                                                                     | reliability   |
+| `turbine_group_pressure_state`                                                                                         | gauge (0–4)                   | `replica`                                                                                                                                                                       | P5                                                                     | reliability   |
+| `turbine_group_limiting_device`                                                                                        | gauge                         | `replica`                                                                                                                                                                       | P5                                                                     | reliability   |
+| `turbine_dp_routed_total`                                                                                              | counter                       | `replica`, `reason` ∈ prefix_affinity, least_loaded, pressure_avoidance, only_candidate                                                                                         | P5                                                                     | distributed   |
+| `turbine_parallel_info`                                                                                                | gauge (=1)                    | `tp`, `dp`, `backend`, `mode`                                                                                                                                                   | P5                                                                     | distributed   |
+| `turbine_cluster_members`                                                                                              | gauge                         | `state` (MemberState)                                                                                                                                                           | P6                                                                     | distributed   |
+| `turbine_cluster_membership_transitions_total`                                                                         | counter                       | `from`, `to`                                                                                                                                                                    | P6                                                                     | distributed   |
+| `turbine_transport_bytes_total`                                                                                        | counter                       | `peer` (node id), `class` ∈ control, data; `direction` ∈ send, receive (contract-chosen values)                                                                                 | P6                                                                     | transport     |
+| `turbine_transport_errors_total`                                                                                       | counter                       | `peer`, `kind` (TransportError snake_case)                                                                                                                                      | P6                                                                     | transport     |
+| `turbine_transport_rtt_seconds`                                                                                        | histogram                     | `peer`                                                                                                                                                                          | P6                                                                     | distributed   |
+| `turbine_placement_decisions_total`                                                                                    | counter                       | `target` ∈ local, remote; `reason` (PlacementReason)                                                                                                                            | P6                                                                     | distributed   |
+| `turbine_forwarded_requests_total`                                                                                     | counter                       | `peer`, `outcome` ∈ ok, restarted, worker_lost, forward_failed, cancelled                                                                                                       | P6                                                                     | distributed   |
+| `turbine_kv_directory_entries`                                                                                         | gauge                         | `holder`                                                                                                                                                                        | P6                                                                     | kv            |
+| `turbine_kv_remote_decisions_total`                                                                                    | counter                       | `reason` (RemoteKvDecision)                                                                                                                                                     | P6                                                                     | kv            |
+| `turbine_kv_fetch_bytes_total`                                                                                         | counter                       | `peer`                                                                                                                                                                          | P6                                                                     | distributed   |
+| `turbine_kv_fetch_duration_seconds`                                                                                    | histogram                     | —                                                                                                                                                                               | P6                                                                     | distributed   |
+| `turbine_kv_fetch_failures_total`                                                                                      | counter                       | `kind` ∈ timeout, checksum, closed, missing                                                                                                                                     | P6                                                                     | distributed   |
+| `turbine_node_failures_total`                                                                                          | counter                       | `peer`, `detector` ∈ heartbeat, connection, collective                                                                                                                          | P6                                                                     | distributed   |
+| `turbine_recovery_actions_total`                                                                                       | counter                       | `action` ∈ restart_request, fail_request, purge_directory, abort_fetch, abort_group                                                                                             | P6                                                                     | distributed   |
+| `turbine_kv_network_transfer_bytes_total`                                                                              | counter                       | `transport` ∈ rdma, tcp, local; `direction` ∈ send, receive                                                                                                                     | P7 (renamed from P7's `turbine_kv_transfer_bytes_total`, CONFLICT C-9) | kv            |
+| `turbine_kv_transfer_duration_seconds`                                                                                 | histogram                     | `transport`                                                                                                                                                                     | P7                                                                     | kv            |
+| `turbine_kv_transfers_inflight`                                                                                        | gauge                         | —                                                                                                                                                                               | P7                                                                     | kv            |
+| `turbine_kv_transfer_failures_total`                                                                                   | counter                       | `reason` ∈ timeout, checksum, transport_error, peer_lost, format_mismatch, reservation_refused                                                                                  | P7                                                                     | kv            |
+| `turbine_kv_conversions_total`                                                                                         | counter                       | `kind` ∈ copy, exact_upcast, lossy                                                                                                                                              | P7                                                                     | kv            |
+| `turbine_pd_requests_total`                                                                                            | counter                       | `path` ∈ disaggregated, short_prompt_local, fallback_colocate, fallback_recompute, rejected                                                                                     | P7                                                                     | scheduler     |
+| `turbine_pipeline_stage_duration_seconds`                                                                              | histogram                     | `stage`                                                                                                                                                                         | P7                                                                     | distributed   |
+| `turbine_pipeline_bubble_ratio`                                                                                        | gauge                         | —                                                                                                                                                                               | P7                                                                     | scheduler     |
+| `turbine_expert_rank_tokens_total`                                                                                     | counter                       | `rank`                                                                                                                                                                          | P7                                                                     | distributed   |
+| `turbine_expert_imbalance_ratio`                                                                                       | gauge                         | —                                                                                                                                                                               | P7                                                                     | distributed   |
+| `turbine_ep_all_to_all_duration_seconds`                                                                               | histogram                     | `phase` ∈ dispatch, combine                                                                                                                                                     | P7                                                                     | distributed   |
+| `turbine_support_matrix_status`                                                                                        | gauge                         | `status` ∈ supported, experimental, unsupported                                                                                                                                 | P8                                                                     | server        |
+
+Label rendering: `device` = global `DeviceId` as decimal; `replica` decimal; `peer` = node id (bounded by `distributed.max_nodes`); pressure/circuit states rendered as their serde strings (uppercase, CONFLICT C-5).
+
+## 18. Structured log events (field `event` = name; `reason` = closed-enum code)
+
+| Event                                                                                                                      | Level                                 | Phase                | Fields (minimum)                                                                                                                                  |
+| -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| discovery backend outcome                                                                                                  | INFO/WARN                             | P0                   | `vendor`, `status`, `detail`                                                                                                                      |
+| kernel selection                                                                                                           | INFO                                  | P1                   | `op`, `config`, `provider`, `impl`, `reason`                                                                                                      |
+| `memory_budget`                                                                                                            | INFO                                  | P1 (P2b adds fields) | weights, kv_reservation, workspace, emergency_reserve, `available_bytes`; unified: `device_kind`, `device_free_bytes`, `host_mem_available_bytes` |
+| `kernel_library_loaded`                                                                                                    | INFO                                  | P2b                  | `path`, `backend`, `abi_version`, `build_archs`, `device_arch`, `driver_version`, `workspace_bytes`                                               |
+| reject / preempt / pause / cancel                                                                                          | INFO                                  | P2                   | `request_id`, `reason`                                                                                                                            |
+| `tool_call_parse_failed`                                                                                                   | INFO                                  | P2                   | `request_id`                                                                                                                                      |
+| `pressure_transition`                                                                                                      | INFO                                  | P3                   | `from`, `to`, `signal`, `value`, `threshold`                                                                                                      |
+| `admission_decision`                                                                                                       | DEBUG (Admit) / INFO                  | P3                   | `request_id`, `decision`, `reason`, estimate fields                                                                                               |
+| `throttle_plan_changed`, `reclaim`                                                                                         | INFO                                  | P3                   | plan fields / `action`, `bytes`                                                                                                                   |
+| `allocation_failure`, `recovery_attempt`, `recovery_outcome`, `circuit_transition`, `telemetry_stale`, `emergency_reserve` | WARN                                  | P3                   | reason + numeric inputs                                                                                                                           |
+| `kv_plan`                                                                                                                  | DEBUG                                 | P4                   | `request_id`, matched blocks per tier, costs, cutoff, `reason`                                                                                    |
+| `kv_evict`, `kv_demote`, `kv_promote`                                                                                      | DEBUG (INFO aggregated per iteration) | P4                   | tier, count, `reason`                                                                                                                             |
+| `kv_prefetch`, `kv_calibration`                                                                                            | INFO                                  | P4                   | —                                                                                                                                                 |
+| `kv_tier_degraded`, `kv_checksum_mismatch`, `kv_l1_disabled_unified`                                                       | WARN                                  | P4                   | `tier` / `key`                                                                                                                                    |
+| parallel plan decision, vendor choice, replica routing, group state                                                        | INFO                                  | P5                   | `reason`                                                                                                                                          |
+| membership transition, placement, forward, retrieve-vs-recompute, failure-handling step                                    | INFO/WARN                             | P6                   | `reason`, affected request ids/counts                                                                                                             |
+| placement / routing / fallback / transfer decision (all score terms of winner and runner-up)                               | INFO                                  | P7                   | `reason`, terms                                                                                                                                   |
+
+## 19. CLI binaries and flags
+
+| Binary (crate)                            | Invocation                                                                                                                                                                                                                                                                                          | Phase  |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| `turbine-server` (turbine-server)         | `--config <path> [--set k=v]... [--check-config]`; `--support-matrix [--output text\|json]`                                                                                                                                                                                                         | P0; P8 |
+| `turbine-bench` (turbine-bench)           | `--url <base> [--model <name>] [--endpoint chat\|completions] [--concurrency <n>=1] [--requests <n>=10] [--prompt-words <n>=256] [--max-tokens <n>=128] [--seed <u64>=0] [--ignore-eos] [--output text\|json]`; exit 0 ≥1 ok, 1 all failed, 2 usage                                                 | P0     |
+|                                           | `+ [--duration <dur>] [--rate <req/s>] [--prompt-words-range <min>..<max>] [--max-tokens-range <min>..<max>] [--pressure-timeline <file.jsonl>]`; report adds `by_status`, `by_error_code`, `client_dropped`, `streams_incomplete`                                                                  | P3     |
+|                                           | `+ --profile multi-turn --sessions <n> --turns <n> --shared-prefix-words <n> [--think-time <min>..<max>] [--session-hints]`; report adds `cached_tokens_ratio`, TTFT by turn                                                                                                                        | P4     |
+|                                           | `turbine-bench kv-sim --workload <multi-turn\|shared-system\|mixed> --policy <cost_aware\|lru> --l0-blocks <n> [--l1-blocks <n>] [--l2-blocks <n>] [--seed <u64>] [--output text\|json]` (JSON: `hit_rate_by_tier`, `recompute_tokens`, `transfer_bytes`, `evictions`, `simulated_prefill_seconds`) | P4     |
+|                                           | `+ --profile prefill-heavy\|decode-heavy`; `turbine-bench compare --baseline <report.json> --candidate <report.json>`; `turbine-bench kv-transfer --peer <host:port> --transport rdma\|tcp --bytes <size> --iterations <n> [--output text\|json]`                                                   | P7     |
+| `turbine-golden` (turbine-bench)          | `compare --url <base> --reference <reference.jsonl> [--model <name>] [--tolerance <tolerance.json>] [--output text\|json]`; `capture --url <base> --prompts <prompts.jsonl> --out <reference.jsonl> [--model <name>] [--top-logprobs 20]`; exit 0/1/2                                               | P1     |
+|                                           | `compare … [--concurrency <n>=1]`                                                                                                                                                                                                                                                                   | P2     |
+|                                           | `eval --url <base> --tasks <tasks.jsonl> [--model <name>] [--output text\|json]`; `eval-compare --baseline <r.json> --candidate <r.json> [--max-drop <float>]`                                                                                                                                      | P8     |
+| `turbine-collbench` (turbine-distributed) | `--backend rccl\|nccl\|host --devices <i,j,..> [--op all_reduce\|all_gather\|reduce_scatter\|broadcast\|all] [--min-bytes 8] [--max-bytes 1GiB] [--iters 20] [--warmup 5] [--dtype bf16\|fp32] [--rank <r> --world <n> --leader <addr>] [--output text\|json]`; exit 0/1/2                          | P5     |
+
+Bench JSON report keys (P0): `requests_ok`, `requests_failed`, `wall_seconds`, `request_throughput`, `output_token_throughput`, `ttft_ms`, `itl_ms`, `e2e_ms` (each `{p50,p95,p99}`). Pressure timeline line (P3): `t`, `state`, `circuit`, `dominant_signal`, `queue`, `kv_utilization` (or `{"t","error"}`).
+
+## 20. Tests
+
+### 20.1 Conventions
+
+| Rule                                                                                                                                                    | Source    |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| Unit tests live in `#[cfg(test)] mod tests` of the module and are addressed `cargo test -p <crate> <module>::tests::<name>`                             | all specs |
+| Integration tests: `crates/<crate>/tests/<binary>.rs`, addressed `cargo test -p <crate> --test <binary> <name>`                                         | all specs |
+| Anything needing a GPU, real weights, RDMA or a lab host is `#[ignore]` and runs only via `scripts/lab-test.sh <host>` (`-- --include-ignored`)         | P0, P1    |
+| Every ignored GPU test starts with `if !turbine_kernels::test_support::require_backend("hip"\|"cuda") { return; }`; `TURBINE_TEST_BACKEND` unset → fail | P2b S-8   |
+| A test whose `TURBINE_TEST_MODEL_DIR` (or `_MOE_`) is unset/missing fails with that message, never skips                                                | P1        |
+| Tests never download weights; never sleep in the simulator (virtual time)                                                                               | P1, P2    |
+| Non-ignored tests pass on macOS arm64 with no GPU libraries, no weights                                                                                 | P0–P8     |
+| Test names are `snake_case` and describe the asserted behaviour (as in the specs)                                                                       | all       |
+
+### 20.2 Named tests by crate (phase in brackets; `ign` = `#[ignore]`, lab only)
+
+| Crate               | Unit tests (`module::tests::name`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Integration tests (`--test bin name`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| turbine-core        | `config::tests::{example_config_loads, byte_size_parsing, impossible_configs_rejected, set_overrides_apply}` [P0]; `config::tests::reliability_config_validation` [P3]; `config::tests::kv_config_validation` [P4]; `config::tests::parallel_rejections` [P5]; `config::tests::distributed_rejections` [P6]; `support::tests::{resolution_and_refusal, baseline_rows_present}` [P8]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| turbine-device      | `discovery::tests::{no_libraries_means_empty_inventory, explicit_missing_library_is_fatal, backend_timeout, unified_memory_uses_host_total}` [P0]; `telemetry::tests::{proc_parsers, two_cadences, hung_call_marks_stale}` [P3]; `topology::tests::{novanas_fixture, spark_fixture, missing_sources_degrade}` [P5]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `lab inventory_matches_expectation` ign [P0]; `lab live_telemetry` ign [P3]; `lab topology_matches_host` ign [P5]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| turbine-kernels     | `registry::tests::{selection_order_and_reason, no_provider_is_startup_error}`, `shim::tests::abi_and_arch_mismatch_are_fatal` [P1]; `shim::tests::{backend_name_and_arch_checked, cuda_error_names_preserved}`, `test_support::tests::require_backend_semantics` [P2b]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | `unsafe_isolation`, `abi_header_neutral` [P1]; `hip_ops` ign [P1] (+ `paged_and_moe_ops` [P2]); `cuda_ops` ign [P2b] (+ `paged_and_moe_ops`, `exports_match_header`); `lab pinned_round_trip` ign [P4, moved here by CONFLICT C-6]; `vendor_neutral_api` [P8]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| turbine-model       | `safetensors::tests::rejects_malformed_headers`, `loader::tests::{tensor_mapping, never_opens_pickle}`, `config::tests::{parses_target_config, rejects_unsupported}`, `tokenizer::tests::incremental_detokenize_utf8`, `chat_template::tests::renders_target_template`, `budget::tests::{refuses_before_loading, available_memory_by_kind}`, `generate::tests::{stop_conditions, seeded_sampling_is_deterministic}` [P1]; `config::tests::parses_olmoe_config`, `structured::tests::mask_applied_before_sampling`, `tools::tests::llama3_json_parser`, `chat_template::tests::renders_llama_tools` [P2]; `budget::tests::unified_available_is_minimum` [P2b]                                                                                                                                                                                                                                                                                                         | `tiny_model {cpu_forward_matches_naive; hip_matches_cpu ign}` [P1]; `tiny_model {chunked_prefill_matches_unchunked, paged_matches_contiguous, olmoe_cpu_forward_matches_naive}` [P2]; `tiny_model cuda_matches_cpu` ign [P2b]; `golden {hf_reference_matches_cpu ign, logits_match_reference ign}` [P1; backend from env P2b]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| turbine-scheduler   | `request::tests::lifecycle_transitions`, `sim::tests::{ts_section7_iteration_pattern, decode_never_starved, chunk_budget_respected, preemption_by_recompute, cancellation_frees_within_one_iteration, bounded_under_overload}` [P2]; `pd::tests::short_and_single_token_requests_skip_transfer`, `router::tests::scores_locality_and_cost` [P7]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `overload_sim {cancellation_releases_reservations, ten_x_overload, active_generations_protected, oom_recovery_bounded}` [P3]; `kv_sim {prefix_reuse_refcounts, demotion_under_pressure, cancellation_releases_kv}` [P4]; `sim {pipeline_micro_batches_overlap, pd_request_flow, pd_admission_both_sides, pd_chaos, pipeline_stage_loss}` [P7]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| turbine-kv          | `pool::tests::blocks_conserved` [P2]; `identity::tests::keys_are_stable_and_scoped`, `directory::tests::{collision_is_a_miss, longest_prefix_across_tiers}`, `tier::tests::{contract_suite, l1_grows_and_shrinks, nvme_checksum_and_restart, faulty_tier_degrades_to_recompute}`, `transfer::tests::inflight_bounded`, `policy::tests::cost_aware_ordering`, `planner::tests::cutoff_minimises_cost`, `session::tests::lifecycle_and_prefetch` [P4]; `directory::tests::{delta_sequencing_and_cap, retrieve_vs_recompute}` [P6]; `tkv1::tests::{roundtrip_and_reject, conversion_table, canonical_layout_roundtrip}`, `directory::tests::inflight_transfer_visible` [P7]                                                                                                                                                                                                                                                                                             | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| turbine-reliability | `budget::tests::{pools_partition_free_memory, unified_budget_from_mem_available, impossible_budget_rejected}`, `ledger::tests::reservations_never_exceed_capacity`, `reserve::tests::reserve_only_released_in_survival`, `state::tests::{hysteresis_holds, escalation_and_stepwise_deescalation, transitions_explained}`, `horizon::tests::predicts_exhaustion`, `admission::tests::{decision_table, bypass_bounded}`, `throttle::tests::plan_per_state`, `circuit::tests::transition_table` [P3]; `multi_device::tests::{group_state_is_worst_member, atomic_group_reservation, shared_device_budget}` [P5]                                                                                                                                                                                                                                                                                                                                                         | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| turbine-transport   | `tcp::tests::{frame_roundtrip_and_cap, send_queue_backpressure}`, `mem::tests::fault_injection` [P6]; `rdma::tests::missing_library_behaviour` [P7]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | `transfer tcp_transfer_protocol_faults` [P7]; `lab rdma_read_roundtrip` ign [P7]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| turbine-distributed | `collective::host::tests::{ops_match_reference, op_timeout_aborts}`, `collective::ffi::tests::{missing_library, one_binding_both_libraries}`, `plan::tests::planner_cases`, `rank::tests::{static_protocol_handshake, leader_loss_aborts_workers, plan_queue_bounded}`, `tp::tests::sharded_layers_match_unsharded`, `router::tests::routing_policy` [P5]; `proto::tests::message_roundtrip_and_versioning`, `auth::tests::psk_handshake`, `sim::tests::{three_nodes_converge, suspect_dead_rejoin, graceful_leave, forward_and_relay, fetch_failures_fall_back, node_loss_is_scheduling_event, partition_and_heal, cross_node_group_abort, deterministic_replay}`, `topology::tests::cluster_graph_merge`, `placement::tests::{score_cases, model_placement}` [P6]; `pipeline::tests::{partition_balances_cost, explicit_split_validated}`, `expert::tests::{placement_map_valid, dispatch_combine_matches_local}`, `placement::tests::heterogeneous_refusals` [P7] | `--bin turbine-collbench tests::busbw_formulas` [P5]; `ep_lab ep2_olmoe_matches_single_device` ign [P7]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| turbine-api         | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `api {metrics_counts_requests, unmatched_route_label_is_bounded, request_id_echoed_or_generated, route_table_phase0, body_limit_413}` [P0]; `api {ready_follows_circuit, pressure_document_shape, admission_error_mapping, reliability_metrics_bounded}` [P3]; `api {cache_salt_isolates, kv_routes, kv_metrics_bounded}` [P4]; `api {topology_route, pressure_multi_device_view}` [P5]; `api {cluster_route, distributed_metrics_bounded}` [P6]; `api distribution_diagnostics_shape` [P7]; `api status_reports_support_row` [P8]                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| turbine-server      | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `server_cli {invalid_config_exits_2_before_bind, sigterm_graceful_shutdown, port_in_use_exits_1}` [P0], `server_cli sigterm_drains_then_cancels` [P2], `server_cli impossible_plan_exits_2_before_bind` [P5], `server_cli support_matrix_output` [P8]; `tiny_server {completions_stream_and_non_stream, single_slot_and_cancel, request_validation, startup_failures_exit_1, phase1_metrics}` [P1]; `tiny_server {preempted_output_unchanged, queue_full_429, slow_client_paused_then_cancelled, request_and_queue_timeouts, disconnect_releases_kv, openai_phase2_fields, diagnostics_shapes, phase2_metrics_and_reasons, response_format_json_schema, tool_choice_modes}` [P2]; `tiny_server {backend_device_mismatch, kernel_library_loaded_record}` [P2b]; `lab_openai tools_and_json_schema` ign [P2]; `fault {alloc_fail_every_injects; sticky_device_error_exits_3 ign}` (`--features fault-injection`) [P3]; `kv_gpu {prefix_reuse_matches_cold, nvme_round_trip_matches_cold}` ign [P4] |
+| turbine-bench       | `prompt::tests::prompts_are_deterministic` [P0]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `bench {mock_endpoint_measurements, failures_counted}` [P0]; `bench open_loop_rate_and_breakdown` [P3]; `golden capture_and_compare_roundtrip` [P1]; `golden {eval_accuracy_report, eval_task_set_valid}` [P8]; `lab_scripts spark_precondition_arithmetic` [P2b]; `kv_sim cost_aware_beats_lru` [P4]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+
+Superseded assertions: P1 `tiny_server single_slot_and_cancel` asserts `429 engine_busy`, which P2 removes — the P2 plan rewrites that test to assert queueing; P6 `proto::tests::message_roundtrip_and_versioning` uses protocol 2 as "unsupported", which the P7 plan changes to 3 when it raises `PROTOCOL_MAX` (contract-chosen).
+
+## 21. Lab scripts, environment and fixtures
+
+### 21.1 Scripts
+
+| Script                            | Args                                                                                                                                                                    | Phase                                                                                                | Contract                                                                                                                                                                                                                                                                                                                              |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scripts/lab-test.sh`             | `<dgx-spark\|dgx-spark2\|novanas>`                                                                                                                                      | P0 (P1 builds `kernels/rocm`; P2b Spark image + `kernels/cuda` + precondition MemAvailable ≥ 24 GiB) | rsync tree (excl. `target/`, `.git/`) to `/home/piwi/turbine-ci/src`; Sparks: `docker run --rm --gpus all --name turbine-lab-test --memory 32g` (P2b; P0 used `rust:1.97-trixie`); novanas: k3s Job `scripts/lab/novanas-test-job.yaml` in ns `turbine-ci`; runs `cargo test --workspace -- --include-ignored`; exit = test exit code |
+| `scripts/lab-serve.sh`            | `novanas <config.yaml>` \| `novanas --stop` \| `novanas --vllm <slug>` (P2) \| `<spark> <config>` \| `<spark> --vllm <slug>` \| `<spark> --stop` \| `--dry-run …` (P2b) | P1, P2, P2b                                                                                          | Turbine on :18000; vLLM baseline on :18100; containers `turbine-lab-serve`, `turbine-lab-vllm`; `--stop` removes only `turbine-lab-*`                                                                                                                                                                                                 |
+| `scripts/golden/hf_reference.py`  | `--model-dir <dir> --prompts <jsonl> --out <jsonl> [--top-logprobs 20] [--device cpu\|cuda]` (run with `uv run`, PEP 723 pins)                                          | P1                                                                                                   | temp file + rename; exit 1 on failure                                                                                                                                                                                                                                                                                                 |
+| `scripts/lab/weights-manifest.sh` | `<host> <slug>`                                                                                                                                                         | P2b                                                                                                  | prints `sha256  <file>` per file                                                                                                                                                                                                                                                                                                      |
+| `scripts/overload-soak.sh`        | `<novanas\|dgx-spark\|dgx-spark2> [--duration <dur>=10m] [--model <path>]`                                                                                              | P3                                                                                                   | precondition → calibrate 2 min → overload `--rate 4R` → cool-down 5 min → JSON verdict; outputs `target/soak/<host>-<timestamp>/`                                                                                                                                                                                                     |
+| `scripts/lab-cluster.sh`          | `[--dry-run] <collbench-novanas\|tp2-novanas\|dp2-novanas>` (P5); `<collbench-sparks\|tp2-sparks\|dp2-sparks\|kv-remote-hit\|chaos-kill-node\|chaos-partition>` (P6)    | P5, P6                                                                                               | novanas: one k3s Job `amd.com/gpu: 2`, label `turbine-lab=true`, loopback ports; Sparks: `turbine-lab-*` containers, HTTP :18000, control :18110, data :18111 on 192.168.47.x                                                                                                                                                         |
+| `scripts/lab-pd.sh`               | `<pd\|pp\|ep\|colocated> [--hetero] [--bench <profile>]`                                                                                                                | P7                                                                                                   | Sparks `docker run --rm --gpus all --network host --device /dev/infiniband` `turbine-lab-*`; novanas k3s Jobs `turbine-lab-*`; port 18100 (CONFLICT C-20); prints free memory + budget, refuses (exit 1) when it does not fit                                                                                                         |
+
+All scripts: never stop/restart/reconfigure non-`turbine-lab-*` workloads; any run needing production workloads moved or memory freed is asked of the user first (DEC); Spark correctness runs proceed after the MemAvailable precondition, benchmark/soak/overload runs always ask (DEC, P2b).
+
+### 21.2 Lab config files (YAML, `turbine-server --config`)
+
+| File                                                                                            | Phase | Key settings                                                                                                                                                                 |
+| ----------------------------------------------------------------------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scripts/lab/phase1-novanas.yaml`                                                               | P1    | `model.path: /models/llama-3.2-3b-instruct`, `model.served_name: meta-llama/Llama-3.2-3B-Instruct`, `execution.backend: hip`, `server.listen: 0.0.0.0:18000` (CONFLICT C-13) |
+| `scripts/lab/phase2-novanas-{llama,olmoe}.yaml`                                                 | P2    | as P1 with the respective `/models/<slug>`                                                                                                                                   |
+| `scripts/lab/phase2b-spark-{llama,olmoe}.yaml`                                                  | P2b   | `execution.backend: cuda`, `execution.device: 0`, `server.listen: 0.0.0.0:18000`, `kv.gpu.max_bytes: 4GiB`                                                                   |
+| `scripts/lab/{pd-prefill-spark,pd-decode-spark2,pp2-spark,ep2-novanas,pd-prefill-novanas}.yaml` | P7    | port 18100; budget via `reliability.memory.device_budget_bytes` (CONFLICT C-12)                                                                                              |
+| `scripts/lab/phase8-<track>-<host>.yaml`                                                        | P8    | port 18000                                                                                                                                                                   |
+
+### 21.3 Environment variables
+
+| Variable                                                   | Meaning                                                                         | Phase  |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------- | ------ |
+| `RUST_LOG`                                                 | overrides `logging.level`                                                       | P0     |
+| `TURBINE_EXPECT_NVIDIA`, `TURBINE_EXPECT_AMD`              | expected device counts in `lab inventory_matches_expectation` (skip when unset) | P0     |
+| `TURBINE_AMD_SMI_LIBRARY`                                  | explicit amd-smi path (fatal if it fails)                                       | P0     |
+| `TURBINE_KERNEL_LIBRARY`                                   | kernel shim path (second in search order)                                       | P1     |
+| `TURBINE_ROCM_PATH`                                        | CMake override of `/opt/rocm/rocm`                                              | P1     |
+| `TURBINE_TEST_MODEL_DIR`, `TURBINE_TEST_MOE_MODEL_DIR`     | real weights for ignored tests                                                  | P1, P2 |
+| `TURBINE_TEST_BACKEND`                                     | `hip` \| `cuda`; selects GPU tests                                              | P2b    |
+| `TURBINE_CUDA_ROOT`                                        | CMake cache variable (not env) for the toolkit                                  | P2b    |
+| `TURBINE_RDMA_DEVICE`, `TURBINE_RDMA_PEER`                 | RDMA lab test                                                                   | P7     |
+| `NCCL_IB_HCA=rocep1s0f0`, `NCCL_SOCKET_IFNAME=enp1s0f0np0` | cross-Spark NCCL                                                                | P6     |
+
+### 21.4 Fixtures
+
+| Path                                                                                                                                     | Phase  | Format                                                                                                                                     |
+| ---------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `tests/golden/prompts.jsonl`                                                                                                             | P1     | `{"id","kind":"completion"\|"chat","prompt"\|"messages","max_tokens":32,"chat_template_kwargs":{"date_string":"26 Jul 2024"}}`, 16 prompts |
+| `tests/golden/<slug>/reference.jsonl`                                                                                                    | P1/P2  | `{"id","engine","model","captured","prompt_token_ids","tokens","top_logprobs":[[[id,lp]…]…]}`                                              |
+| `tests/golden/<slug>/tolerance.json`                                                                                                     | P1/P2  | `{"min_identical_prefix":32,"min_prompts_passing":14,"top_k":5,"max_abs_logprob_diff":0.15,"margin_nats":0.5}`                             |
+| `tests/golden/tools/*.jsonl`                                                                                                             | P2     | chat requests with `tools` / `response_format`                                                                                             |
+| `tests/eval/gsm8k-200.jsonl`, `tests/eval/NOTICE`, `tests/eval/<slug>/<engine>.json`                                                     | P8     | `{"id","prompt"\|"messages","answer","match":"exact"\|"number"}`                                                                           |
+| `crates/turbine-model/tests/fixtures/<slug>/{config.json,generation_config.json,tokenizer.json,tokenizer_config.json, expected renders}` | P1, P2 | committed copies                                                                                                                           |
+| `crates/turbine-device/tests/fixtures/{proc,topology}/…`                                                                                 | P3, P5 | captured `/proc` files; novanas / dgx-spark sysfs + vendor captures (contract-chosen paths)                                                |
+| tiny synthetic checkpoints                                                                                                               | P1, P2 | generated per test into a temp dir from a fixed seed; never committed                                                                      |
+
+## 22. Core runtime types index (where each shared concept lives)
+
+| Concept            | Type                                                                                          | Crate::path                                  | Phase                   |
+| ------------------ | --------------------------------------------------------------------------------------------- | -------------------------------------------- | ----------------------- |
+| Request id         | `RequestId(Uuid)` (display `cmpl-`/`chatcmpl-`)                                               | `turbine_core::types`                        | P2 (P1 uses it for ids) |
+| HTTP request id    | `String` from `x-request-id`                                                                  | `turbine_observability::http::RequestIdExt`  | P0                      |
+| Lifecycle state    | `RequestState { Waiting, Prefilling, Decoding, Paused, Finished, Cancelled, Failed }`         | `turbine_scheduler`                          | P2                      |
+| Cancellation       | `CancelFlag`, `CancelReason`                                                                  | `turbine_core::request`, `turbine_scheduler` | P1/P2                   |
+| Resource estimate  | `ResourceEstimate`                                                                            | `turbine_core::request`                      | P2 (P3 fields)          |
+| Sequence           | `SeqId`, `BlockTable`, `BatchItem`                                                            | core / `turbine_kv::table` / scheduler       | P2                      |
+| Sampling           | `SamplingParams`, `StopConditions`, `Sampler`, `SamplerState`                                 | core / `turbine_model::sampler`              | P1 (P2, P7)             |
+| Stream events      | `GenerationEvent`, `FinishReason`, `Usage`, `ErrorCode`                                       | `turbine_core::request`                      | P1                      |
+| KV block id        | `BlockId(u32)`                                                                                | `turbine_core::types`                        | P2                      |
+| KV key             | `KvKey([u8;16])` (= `BlockKey`)                                                               | `turbine_kv::identity`                       | P4                      |
+| KV block metadata  | `KvBlock` (TS §8 + P4)                                                                        | `turbine_kv::directory`                      | P4                      |
+| KV location / tier | `KvLocation`, `TierId { L0, L1, L2, L3 }`, `KvTier` trait                                     | `turbine_kv::tier`                           | P4 (P6 L3)              |
+| KV layout / format | `KvLayout` / `KvFormat`, `KvDtype`                                                            | core / kv / core                             | P1–P7                   |
+| Pressure           | `PressureState`, `PressureSignal`, `ThrottlePlan`                                             | core / reliability                           | P3                      |
+| Circuit            | `CircuitState`, `CircuitReason`                                                               | core / reliability                           | P3                      |
+| Admission          | `AdmissionDecision { Admit, Queue{reason: PressureReason}, Reject{reason: RejectionReason} }` | `turbine_reliability::admission`             | P3                      |
+| Memory pools       | `PoolKind`, `Ledger`, `Reservation`                                                           | reliability                                  | P3                      |
+| Device inventory   | `DeviceInventory`, `DeviceInfo`, `DeviceId`, `Vendor`, `MemoryKind`                           | device / core                                | P0                      |
+| Telemetry          | `TelemetrySample`, `LatestSample`                                                             | core / device                                | P3                      |
+| Topology           | `TopologyGraph`, `Vertex`, `Edge`, `PathClass`, `P2pStatus`                                   | `turbine_device::topology`                   | P5 (P6 `Network` edges) |
+| Capabilities       | `DeviceCapabilities`                                                                          | `turbine_device::capability`                 | P7                      |
+| Device memory      | `DeviceBuffer`, `DeviceSlice`, `StreamRef`, `DeviceMemory`, `PinnedMemory`, `CopyEngine`      | `turbine_tensor`                             | P1 (P4, P5)             |
+| Kernels            | `ShimLibrary`, `ShimContext`, `KernelRegistry`, `KernelError`, `OpKind`                       | `turbine_kernels`                            | P1                      |
+| Parallel plan      | `ParallelPlan`, `ReplicaGroup`, `StepPlan`, `Collective`                                      | `turbine_distributed`                        | P5                      |
+| Cluster            | `NodeId`, `MemberState`, `Message`, `DirectoryEntry`                                          | core / distributed / kv                      | P6                      |
+| Transport          | `Transport`, `Connection`, `Frame`, `TransportError`                                          | `turbine_transport`                          | P6 (P7 RDMA)            |
+| KV wire format     | `Tkv1Header`, `SegmentEntry`                                                                  | `turbine_kv::tkv1`                           | P7                      |
+| Support matrix     | `SupportKey`, `SupportStatus`                                                                 | `turbine_core::support`                      | P8                      |
+
+---
+
+## 23. Conflicts
+
+Every conflict found between the specs, TS and DEC, with the binding pick. Plans implement the pick from their first commit, including earlier phases.
+
+| ID   | Conflict                                                                                                                                                                                                                                                                                                                                                                                  | Pick and reason                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C-1  | Waiting-queue bounds: P2 defines `scheduler.max_queued_requests` (256, 429 `queue_full`) and `scheduler.queue_timeout` (60s, 503 `queue_timeout`); P3 defines `reliability.admission.max_queue` (256) and `reliability.admission.queue_timeout` (30s) for the admission queue that precedes the scheduler.                                                                                | One waiting queue. P2 uses the `scheduler.*` keys. From P3 the queue is the P3 admission queue bounded by `reliability.admission.max_queue` / `queue_timeout` (richer reason codes, metrics and pressure-document fields depend on them); `scheduler.max_queued_requests` stays as the HTTP→engine submission-channel capacity (its P2 Constraints role); `scheduler.queue_timeout` is removed in P3 and rejected as a removed key (precedent: P3 removes `reliability.admission.kv_overcommit`). |
+| C-2  | Error code for a request whose KV at completion exceeds the pool: P2 `400 kv_capacity_exceeded`; P3 `400 context_exceeds_kv_capacity`.                                                                                                                                                                                                                                                    | `context_exceeds_kv_capacity` from P2 on, because P3 fixes the closed `RejectionReason` enum and HTTP table that all later phases use; P2's metric reason label uses the same string.                                                                                                                                                                                                                                                                                                             |
+| C-3  | Mid-stream error termination: P1 "an `error` event then the stream closes", P2 "stream closes without `[DONE]`" (AC `request_and_queue_timeouts` asserts no `[DONE]`); P3 (`resource_exhausted`) and P6 (`worker_lost` etc.) send the error event **then** `data: [DONE]`.                                                                                                                | Error event followed by `data: [DONE]` in every phase, because it is the later, cluster-wide convention (P3, P6, P7 relays) and lets OpenAI SDK stream readers terminate cleanly; the P1/P2 tests assert the error event then `[DONE]`.                                                                                                                                                                                                                                                           |
+| C-4  | KV tier names: P2 KV document and `turbine_kv_blocks{tier="gpu",state}`; P4 `tier ∈ l0,l1,l2` and `turbine_kv_blocks{tier}` (same metric name, different label set); P6 directory entry `tier: gpu\|cpu\|nvme`.                                                                                                                                                                           | `l0`, `l1`, `l2`, `l3` everywhere (P4 is the phase that defines the tier model; TS §8 names L0–L4). `turbine_kv_blocks` keeps P2's label set `{tier,state}` (`state ∈ used, free`) because one family cannot carry two label sets; P4's per-tier total is the sum.                                                                                                                                                                                                                                |
+| C-5  | Pressure/circuit casing: P3 pressure document and P4 KV document use `"ORANGE"`, `"HEALTHY"`; P6 cluster document uses `"green"`, `"healthy"`.                                                                                                                                                                                                                                            | Uppercase serde strings (`SCREAMING_SNAKE_CASE`) everywhere, including P6 JSON and metric label values, because P3 defines both enums and its closed sets are asserted by `reliability_metrics_bounded`.                                                                                                                                                                                                                                                                                          |
+| C-6  | Pinned L1 memory and copy streams: P4 puts `hipHostMalloc`/`cudaHostAlloc` FFI and copy streams in `turbine-device` (test `turbine-device --test lab pinned_round_trip`); P1/P2b/P5 route every vendor-runtime call through the kernel shim C ABI ("never a CUDA-only side channel", no CUDA binding in the Rust workspace, `turbine-distributed` "adds no HIP or CUDA runtime binding"). | Kernel C ABI v3 adds pinned alloc, copy streams, async memcpy and events (§9.3) in both shims; Rust wrappers live in `turbine-kernels` (`impl PinnedMemory, CopyEngine for ShimContext`); `turbine-device` gains no vendor-runtime binding; the lab test becomes `cargo test -p turbine-kernels --test lab pinned_round_trip -- --ignored`. Reason: a second copy of the HIP/CUDA runtime loaded outside the shim would break the P2b rule and the static-cudart build of `libturbine_cuda.so`.   |
+| C-7  | novanas lab image: P5 says "`rocm/dev` image pinned by digest as in phase-1"; P0/P1 use `rust:1.97-trixie` with ROCm mounted read-only from `/opt/rocm/rocm`.                                                                                                                                                                                                                             | `rust:1.97-trixie` + hostPath ROCm (P0/P1), because that is what P1 actually defines and P5 claims to reuse it.                                                                                                                                                                                                                                                                                                                                                                                   |
+| C-8  | KV pool size: P2 sizes the L0 pool from `kv.gpu.max_bytes` (default 8GiB); P3 derives the `kv` pool as the budget remainder (AC: 30 GiB free → KV 20 GiB, no cap mentioned).                                                                                                                                                                                                              | `kv.gpu.max_bytes` becomes `Option<ByteSize>`: default `8GiB` in P2; from P3 default null = budget remainder, and an explicit value caps the `kv` pool (P2b Spark configs keep their 4GiB cap).                                                                                                                                                                                                                                                                                                   |
+| C-9  | Metric name `turbine_kv_transfer_bytes_total`: P4 labels `{path}` (tier copies); P7 labels `{transport,direction}` (network transfers).                                                                                                                                                                                                                                                   | P4 keeps the name; P7's family is `turbine_kv_network_transfer_bytes_total{transport,direction}` (the P7 M1 acceptance check greps that name), because one family cannot carry two label sets and P4 lands first.                                                                                                                                                                                                                                                                                 |
+| C-10 | Priority semantics: P2 `priority` is the vLLM integer, lower served first; P4 values "1.0 normal, 2.0 high, 0.5 low"; P6 "high-priority requests".                                                                                                                                                                                                                                        | `Priority(i32)`, lower first (P2); classes: < 0 High (weight 2.0), 0 Normal (1.0), > 0 Low (0.5) — contract-chosen mapping that makes P4 and P6 well defined.                                                                                                                                                                                                                                                                                                                                     |
+| C-11 | Queue reason for an incomplete group reservation: P5 AC `Queue { reason: KvCapacity }`; P3 reason `kv_reservation`.                                                                                                                                                                                                                                                                       | `PressureReason::KvReservation` (P3's closed enum).                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| C-12 | Memory cap key: P7 lab text uses `_server.memory_budget_` (not defined anywhere); P3 defines `reliability.memory.device_budget_bytes`.                                                                                                                                                                                                                                                    | `reliability.memory.device_budget_bytes`; no `server.memory_budget` key exists (unknown keys are errors, P0).                                                                                                                                                                                                                                                                                                                                                                                     |
+| C-13 | Listen port key: P1 and P2b lab configs set `_server.port_` 18000; P0 defines only `server.listen` (socket address).                                                                                                                                                                                                                                                                      | `server.listen: 0.0.0.0:18000`; no `server.port` key.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| C-14 | Duration units: P2/P3 allow `ms`, `s`, `m`, `h`; P5 and P7 say `ms`, `s` or `m`.                                                                                                                                                                                                                                                                                                          | One parser for all keys accepting `ms`, `s`, `m`, `h` (superset; P4 default `1h` and P3 `1h` bound require `h`).                                                                                                                                                                                                                                                                                                                                                                                  |
+| C-15 | Golden fixture slugs: P1/P2 `tests/golden/llama-3.2-3b-instruct/`, `tests/golden/olmoe-1b-7b-0125-instruct/`; P7 `tests/golden/meta-llama--Llama-3.2-3B-Instruct/` and `tests/golden/allenai--OLMoE-1B-7B-0125-Instruct/`.                                                                                                                                                                | P1/P2 slugs (they create the files; P2b and P5 reuse them).                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| C-16 | Member states: P6 lists `JOINING → ALIVE → SUSPECT → DEAD` + `LEAVING`; its AC `graceful_leave` expects state `left`.                                                                                                                                                                                                                                                                     | `MemberState` has six variants incl. `Left` (terminal after `Goodbye`).                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| C-17 | Block identity names: TS §8 `KvKey`, `ModelId`; P6 `BlockKey`; P6 message `KvBlock{…}` vs TS struct `KvBlock`.                                                                                                                                                                                                                                                                            | Type `KvKey` with `pub type BlockKey = KvKey`; `KvBlock.model` is a `ModelFingerprint` (TS `ModelId` not introduced); the P6 wire message stays `Message::KvBlock` (distinct path from `turbine_kv::KvBlock`).                                                                                                                                                                                                                                                                                    |
+| C-18 | `GET /turbine/v1/kv` `transfers` key: P4 `{inflight_bytes, max_inflight_bytes}`; P7 `{inflight[], completed_total, failed_total_by_reason}`.                                                                                                                                                                                                                                              | One `transfers` object with all five keys (P4's two + P7's three).                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| C-19 | `unsafe` locations: P8 Constraints list `turbine-device`, `turbine-kernels` and the P7 transport module, omitting P5's `turbine-distributed::collective::ffi`.                                                                                                                                                                                                                            | Four locations: `turbine-device`, `turbine-kernels`, `turbine-distributed/src/collective/ffi` (P5), `turbine-transport/src/rdma` (P7); P8 made no decision to remove the P5 module.                                                                                                                                                                                                                                                                                                               |
+| C-20 | Spark lab ports: P2b fixes Turbine HTTP 18000–18099 and vLLM baseline 18100; P7 lab configs and URLs use 18100 for Turbine.                                                                                                                                                                                                                                                               | P7 keeps 18100 (its acceptance commands use it); `scripts/lab-pd.sh` refuses to start (exit 1, `precondition`) when `turbine-lab-vllm` or anything else holds 18100.                                                                                                                                                                                                                                                                                                                              |
+| C-21 | Data-plane port: P6 lab uses data :18111; P7 `turbine-bench kv-transfer --peer 192.168.47.245:8101` (the P6 default `data_listen`).                                                                                                                                                                                                                                                       | Lab runs use 18111 (P6 lab convention); the P7 command is run with `--peer 192.168.47.245:18111`.                                                                                                                                                                                                                                                                                                                                                                                                 |
+| C-22 | P6 says a KV fetch also moves "whatever linear-attention state snapshot phase-4 stores"; P4 puts hybrid prefix snapshots out of scope.                                                                                                                                                                                                                                                    | Phase 6 fetches attention KV only; state snapshots arrive with P8c (TKV1 segment kinds 2/3 are reserved for it, P7).                                                                                                                                                                                                                                                                                                                                                                              |
+| C-23 | Pool layout across backends: P7 says the HIP and CUDA attention providers' pool layouts differ and need pack/unpack; P2b keeps the P2 layout `[num_blocks, 2, block_tokens, kv_heads, head_dim]` unchanged on CUDA.                                                                                                                                                                       | The pool layout is identical on both backends (P2b). TKV1 pack/unpack is still implemented generically (canonical `[K\|V]` per layer per block) and its round-trip test stays, so a future provider with another layout plugs in.                                                                                                                                                                                                                                                                 |
+| C-24 | DEC records "remote test → Docker build container" and an open question about installing Docker on novanas; the approved P0 spec (and P7 "no Docker" on novanas) run novanas tests as k3s Jobs.                                                                                                                                                                                           | k3s Jobs on novanas, Docker on the Sparks (approved spec wins over the superseded answer).                                                                                                                                                                                                                                                                                                                                                                                                        |
+| C-25 | Device-error policy: P1 exits 1 after 3 consecutive failed **requests**; P2 after 3 consecutive failed **iterations** (`/ready` 503 `device_error`); P3 replaces both with circuit breaker + exit 3 only for sticky errors.                                                                                                                                                               | Phase-local: P1 rule in P1, P2 rule in P2–P2b, P3 circuit rules from P3 on (P3 explicitly owns recovery); the `device_error` readiness reason is retired in P3.                                                                                                                                                                                                                                                                                                                                   |
+
+Count of conflicts: 25.

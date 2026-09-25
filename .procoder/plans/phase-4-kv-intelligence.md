@@ -1,0 +1,377 @@
+# phase-4-kv-intelligence — implementation plan
+
+Status: draft
+Spec: .procoder/specs/phase-4-kv-intelligence.md
+
+## Goal
+
+Turn KV into a managed, tiered resource — content-addressed prefix sharing in L0, a pinned-host L1 (discrete VRAM only) and an NVMe L2, cost-aware leaf-first eviction, a recompute-vs-retrieve planner, session hints with prefetch — wired into Phase 3's admission estimate and `KvReclaimer` hook, observable through `GET /turbine/v1/kv`, metrics and logs.
+
+## Architecture
+
+`turbine-kv` gains the separate modules `identity` (BLAKE3 namespace and block keys), `directory` (sole owner of `KvBlock` metadata, longest-prefix lookup, leaf-first eligibility), `tier` (`KvTier` trait; `L0Tier` accounting view, `L1PinnedTier`, `L2NvmeTier`, `MemTier` test double), `policy`, `planner`, `transfer` (bounded in-flight bytes over a pluggable `TransferBackend`), `session` and `metrics`; a thin composition module `hierarchy` (`KvHierarchy`) uses only their public APIs and is driven synchronously at iteration boundaries on the engine thread, so the scheduler's deterministic `kv_sim` tests and `turbine-bench kv-sim` exercise exactly the production logic. Page-locked memory, copy streams and events come from kernel C ABI v3 in both shims, wrapped by `turbine-kernels` (`impl PinnedMemory, CopyEngine for ShimContext`, CONFLICT C-6); `turbine-server`'s `kv_orchestrator.rs` owns the `KvHierarchy`, the GPU `CopyStreamBackend`, startup calibration and the lock-free `KvReclaimHandle` handed to the Phase 3 controller, and `turbine-api` adds the session/salt headers, `prompt_cache_key`, `cached_tokens`, `POST /turbine/v1/kv/prefetch` and the P4 KV document.
+
+## Constraints
+
+Copied verbatim from the spec (Constraints):
+
+- Boundaries (TS §21 rule 6): `turbine-kv` modules `identity`, `directory`, `tier`, `policy`, `planner`, `transfer`, `session`, `metrics`, each with its own public API and unit tests; no module reaches into another's internals. Pinned-memory allocation and copy streams live in the kernel shims behind C ABI v3, wrapped in `turbine-kernels` (FFI, `// SAFETY:` comments stating who owns each host buffer and when a copy may be reused; no HIP/CUDA runtime binding outside the shim — CONFLICT C-6); `turbine-kv` stays `unsafe_code = "forbid"`.
+- Everything except the GPU/pinned-memory/NVMe backends builds and tests on macOS arm64 with no GPU; the NVMe tier's file layer is tested on macOS against a temp directory without `O_DIRECT` (`F_NOCACHE` is not required).
+- New dependencies with reasons: `blake3` (block hashing: fast, keyed, stable across platforms), `crc32c` (per-block checksum with hardware acceleration on arm64 and amd64). No other new runtime dependency.
+- Bounded everything (TS §21 rule 8): directory entries bounded by the sum of tier capacities in blocks; session table by `kv.session.max_sessions`; transfer in-flight bytes; NVMe queue depth; prefetch queue (`kv.prefetch.max_queue`).
+- The eviction policy and planner are pure functions of directory state, tier estimates and a clock, so they are deterministic under the simulator and benchmarkable (TS §8).
+- No decision without a reason (TS §21 rule 7): every eviction, demotion, promotion, plan and prefetch carries a reason code and is counted.
+- Memory: L0 capacity comes from the Phase 3 `kv` pool; L1 draws host memory that Phase 3's host signals watch and exists only on discrete-VRAM devices. On GB10 unified memory the Phase 3 budget (`MemAvailable` at startup − host reserve, capped by `reliability.memory.device_budget_bytes`) bounds L0 alone.
+- Model: per-token KV only. GPU tests use `meta-llama/Llama-3.2-3B-Instruct` in BF16 (28 layers × 8 KV heads × 128 head dim, 112 KiB of BF16 KV per token, 1,835,008 bytes per 16-token block) from `TURBINE_TEST_MODEL_DIR` (`/home/piwi/turbine-models/<slug>`); tests never download weights. KV dtype is BF16 only (Phase 2 decision).
+- Hardware order: GPU tests run first on novanas (one R9700 via a k3s Job requesting `amd.com/gpu: 1`, ROCm 7.14.1 at `/opt/rocm/rocm`), the only device where L1 is physically separate memory, then on the Sparks (GB10) with L1 disabled.
+- Asking first: the implementer asks the user before any run that needs production workloads moved or memory freed on any host (a free R9700 on novanas; room beside production vLLM on a Spark). Lab runs never stop or starve production vLLM themselves; runs on a Spark stay inside containers with a hard `--memory` cap.
+- Disk: the NVMe tier on the lab hosts lives at `/home/piwi/turbine-kv` on each host's root NVMe, capped at 64 GiB per host (the Sparks have about 133–153 GB free on 83–85 % used 916 GB disks; novanas has about 571 GB free on its ext4 root). Where the filesystem refuses `O_DIRECT` the tier falls back to buffered I/O with a WARN.
+
+From the interface contract (`.procoder/contract/interfaces.md`, binding):
+
+- Toolchain edition 2024, `rust-version = "1.97"`; public enums later phases extend are `#[non_exhaustive]`; config structs are `#[serde(deny_unknown_fields, default)]`; one `thiserror` error enum per crate.
+- Every time-dependent component takes `Arc<dyn turbine_core::clock::Clock>`; never `Instant::now()` for decisions (L2 I/O latency measurement is the only wall-clock use).
+- Metric label values come from closed enums rendered with `as_str()`; tier labels are `l0`, `l1`, `l2` (CONFLICT C-4); `turbine_kv_blocks` keeps the P2 label set `{tier,state}`; `turbine_kv_transfer_bytes_total{path}` is local tier copies only (CONFLICT C-9). Counters are registered without the `_total` suffix (prometheus-client appends it).
+- Pressure states serialise upper-case (`"YELLOW"`, CONFLICT C-5); priority classes map `< 0` High 2.0, `0` Normal 1.0, `> 0` Low 0.5 (CONFLICT C-10); `KvKey` with `pub type BlockKey = KvKey`, `KvBlock.model: ModelFingerprint` (CONFLICT C-17); the KV document's `transfers` object is the one P7 extends (CONFLICT C-18).
+- Pinned memory, copy streams, async memcpy and events are kernel C ABI v3 in both shims; the lab test is `cargo test -p turbine-kernels --test lab pinned_round_trip -- --ignored` (CONFLICT C-6).
+- `turbine-kv` and `turbine-scheduler` never depend on `turbine-kernels`; KV device memory reaches them only through `turbine_tensor` traits injected by `turbine-server`.
+- Unit tests live in `#[cfg(test)] mod tests` and run as `cargo test -p <crate> <module>::tests::<name>`; ignored GPU tests start with `if !turbine_kernels::test_support::require_backend("hip"|"cuda") { return; }`; a missing `TURBINE_TEST_MODEL_DIR` fails, never skips.
+- Lab: `scripts/lab-test.sh <host>` is the only way GPU tests run (novanas: k3s Job in ns `turbine-ci`; Sparks: `docker run … --memory 32g` inside the script); no `docker run` outside the defined lab scripts.
+
+Plan-wide decisions (this plan):
+
+- `KvHierarchy` runs on the engine thread next to the `Scheduler` and `BlockPool` (the "KV orchestrator task" of contract §16.4 is `turbine_server::kv_orchestrator::KvOrchestrator`, which owns it and is reached from Tokio through a bounded command channel); no lock is taken on the iteration hot path.
+- Leaf-first everywhere: a copy may leave a tier only when no child outside the set already leaving is cached in the same or a faster tier; choosing a victim makes its parent eligible (heap-ordered, one pass).
+- `KvBlock.ref_count` mirrors `BlockPool::refcount` for L0 copies (synchronised before every eviction decision); the pool is the owner of L0 references.
+- The cost-aware value multiplies by the retrieval cost (user decision 2026-09-25, amends TS §8); the tests assert the acceptance-criterion direction.
+- The workspace root `Cargo.toml` sets `[profile.dev.package.turbine-kv] opt-level = 3` and `[profile.dev.package.turbine-bench] opt-level = 3`: the simulator test takes about 17 s optimised versus about 5 minutes at opt-level 0 (measured on macOS arm64 during planning).
+
+## Task 1: `kv` configuration keys and validation
+
+Files: `crates/turbine-core/src/config/kv.rs` (the `kv` section structs, defaults, static/host/block-size validation and the `kv_config_validation` unit test), `crates/turbine-core/src/config/mod.rs` (call `self.kv.validate()?` from `Config::validate`, `self.kv.validate_host(host, self.reliability.memory.host_reserve_bytes)?` from `Config::validate_host`, add `HostFacts`), `examples/turbine.yaml` (document the new keys with their defaults)
+Interfaces:
+
+- `pub struct KvConfig { pub block_tokens: u32, pub gpu: KvGpuConfig, pub cpu: KvCpuConfig, pub nvme: KvNvmeConfig, pub policy: KvPolicyKind, pub demote_min_value: f64, pub prefix_sharing: bool, pub transfer: KvTransferConfig, pub session: KvSessionConfig, pub prefetch: KvPrefetchConfig, pub policy_weights: KvPolicyWeights }`
+- `pub struct KvGpuConfig { pub enabled: bool, pub max_bytes: Option<ByteSize> }`, `pub struct KvCpuConfig { pub enabled: bool, pub max_bytes: ByteSize }`
+- `pub struct KvNvmeConfig { pub enabled: bool, pub path: PathBuf, pub max_bytes: ByteSize, pub slab_bytes: ByteSize, pub max_queue_depth: u32, pub io_threads: u32 }`
+- `pub struct KvTransferConfig { pub max_inflight_bytes: ByteSize }`, `pub struct KvSessionConfig { pub max_sessions: u32, pub hot_ttl: HumanDuration, pub warm_ttl: HumanDuration, pub max_idle: HumanDuration }`
+- `pub struct KvPrefetchConfig { pub lead_time: HumanDuration, pub max_queue: u32 }`, `pub struct KvPolicyWeights { pub session_active: f64, pub hit_half_life: HumanDuration }`
+- `pub enum KvPolicyKind { CostAware, Lru }` (serde `cost_aware`, `lru`; `fn as_str(self) -> &'static str`), `pub const KV_IO_ALIGN: u64 = 4096`
+- `impl KvConfig { pub fn validate(&self) -> Result<(), ConfigError>; pub fn validate_block_bytes(&self, block_bytes: u64) -> Result<(), ConfigError>; pub fn validate_host(&self, host: &HostFacts, host_reserve: ByteSize) -> Result<(), ConfigError> }`
+- `pub struct HostFacts { pub mem_total_bytes: Option<u64>, pub disk_free_bytes: Option<u64> }` (contract §3.2)
+  Covers: S-15; `config::tests::kv_config_validation`
+  Depends on: phase-0 plan (config loader, `ByteSize`), phase-2 plan (`HumanDuration`, `kv.gpu.max_bytes`), phase-3 plan (`reliability.memory.host_reserve_bytes`)
+
+- [ ] Write failing test `crates/turbine-core/src/config/kv.rs` `config::tests::kv_config_validation`: asserts every default of the spec's configuration table (e.g. `cpu.max_bytes` 64GiB, `nvme.slab_bytes` 1GiB, `session.warm_ttl` 10m, `policy_weights.session_active` 0.5) and that `load` of each YAML below fails with an error whose text names the key: `kv.gpu.enabled: false`, `kv.policy: lfu`, `kv.nvme.max_bytes: 0`, `kv.session.hot_ttl: 60s` + `warm_ttl: 30s`, `kv.nvme.enabled: true` + `path: rel/kv`, `kv.transfer.max_inflight_bytes: 1`; plus `validate_host` with MemTotal 32 GiB / reserve 8 GiB rejects `kv.cpu.max_bytes` 64GiB, and with 50 GiB free disk rejects NVMe 64GiB naming the free space. Run: `cargo test -p turbine-core config::tests::kv_config_validation` — expect FAIL.
+- [ ] Implement the structs and three validators: static rules per the table (`gpu.enabled: false` → "L0 is required"; `warm_ttl > hot_ttl`; `session_active` 0..1; `max_queue_depth` 1..1024; `io_threads` 1..64; `max_sessions` 1..1000000; `slab_bytes` a non-zero multiple of 4 KiB; `max_inflight_bytes ≥ 4096` statically and `≥ block_bytes` in `validate_block_bytes` once the model layout is known, which also requires `slab_bytes ≥` one 4 KiB-rounded slot). Slots per slab are `slab_bytes / slot_bytes` rounded down (the 1GiB default is not a multiple of 1,835,008). `turbine-server` maps a `validate_host` error on a `kv.nvme.*` key to exit 1 and any other key to exit 2.
+- [ ] Run: `cargo test -p turbine-core config::tests::kv_config_validation` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(core): kv tier, policy, session and prefetch configuration keys`
+
+## Task 2: KV identity — namespace and block keys
+
+Files: `crates/turbine-kv/src/identity.rs` (keys, hashing, namespace memo, unit test), `crates/turbine-kv/src/lib.rs` (declare `identity`), `crates/turbine-kv/Cargo.toml` (add `blake3`), `Cargo.toml` (workspace dependency `blake3 = "1.8"`)
+Interfaces:
+
+- `pub struct KvKey(pub [u8; 16])` (Display = 32 lowercase hex), `pub type BlockKey = KvKey`, `pub struct NamespaceKey(pub [u8; 32])`, `pub struct KvFormat { pub dtype: KvDtype, pub layout: KvLayout }`
+- `pub fn namespace_key(id: &ModelIdentity, fmt: &KvFormat, cache_salt: &str) -> NamespaceKey`
+- `pub fn block_key(ns: &NamespaceKey, parent: Option<&KvKey>, tokens: &[u32]) -> KvKey`, `pub const ROOT_PARENT: KvKey` (16 zero bytes, hashed for root blocks)
+- `pub trait KeyHasher { fn key(&self, parent: Option<&KvKey>, tokens: &[u32]) -> KvKey; }`, `pub struct Blake3Hasher(pub NamespaceKey)`
+- `pub fn prefix_keys(hasher: &dyn KeyHasher, tokens: &[u32], block_tokens: u32) -> Vec<KvKey>`
+- `pub struct NamespaceCache` with `pub fn new(id: ModelIdentity, fmt: KvFormat) -> Self`, `pub fn get(&mut self, cache_salt: &str) -> NamespaceKey`, `pub fn format(&self) -> KvFormat` (memo cleared at 4096 distinct salts)
+  Covers: S-1; `identity::tests::keys_are_stable_and_scoped`
+  Depends on: phase-1 plan (`ModelIdentity`, `KvLayout` in `turbine_core::types`)
+
+- [ ] Write failing test `identity::tests::keys_are_stable_and_scoped`: for model identity `config_hash [1;32]`, `weights_index_hash [7;32]`, Llama-3.2-3B BF16 format with 16-token blocks and tokens 100..132, asserts the committed golden namespace key `7e1498499592da3bafd9f9da2af720288b56e58647a30c92555d8992abe96933` and block keys `048a689576719fe25e37707f36c80bcb`, `1a566e6449ac3bd7d1fccfda42604a3d`; that changing one token, the parent, the config hash, `block_tokens` (32) or the salt (`"a"`) changes the key; that the empty salt equals `NamespaceCache::get("")`; and that a 15-token prompt yields no key. Run: `cargo test -p turbine-kv identity::tests::keys_are_stable_and_scoped` — expect FAIL.
+- [ ] Implement: namespace key = BLAKE3 of the canonical JSON `{"block_tokens":…,"cache_salt":…,"kv_format":{"dtype","head_dim","num_kv_heads","num_layers"},"model_config_hash":hex,"weights_index_hash":hex}` serialised from a struct with fields in that (sorted) order; block key = first 16 bytes of BLAKE3(ns ‖ parent-or-`ROOT_PARENT` ‖ tokens as LE u32); `prefix_keys` uses `chunks_exact` so a trailing partial block has no key. The golden values above were produced by exactly this derivation during planning.
+- [ ] Run: `cargo test -p turbine-kv identity::tests::keys_are_stable_and_scoped` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(kv): namespace and block keys for prefix identity`
+
+## Task 3: KV directory and the phase-4 metric families
+
+Files: `crates/turbine-kv/src/directory.rs` (`KvBlock` metadata, lookup, leaf-first eligibility, pending registrations, unit tests), `crates/turbine-kv/src/metrics.rs` (extend the P2 `KvMetrics` with every P4 family and typed recorders), `crates/turbine-kv/src/lib.rs`, `crates/turbine-kv/Cargo.toml` (dev-dependency `tracing-subscriber` for log capture), `crates/turbine-kv/src/test_log.rs` (`#[cfg(test)]` helper capturing `tracing` output of a closure)
+Interfaces:
+
+- `pub struct KvBlock { key, model: ModelFingerprint, token_range: TokenRange, format: KvFormat, size_bytes: u64, locations: SmallVec<[KvLocation; 3]>, access_count: u64, last_access: Timestamp, ref_count: u32, priority: KvPriority, recompute_cost: CostEstimate, decayed_hits: f64, decayed_at: Timestamp, session: Option<SessionId>, parent: Option<KvKey>, child_count: u32, tokens: Box<[u32]> }` (all `pub`; `decayed_at` is a contract addition)
+- `pub struct SessionId { pub key: String, pub salt: String }` (derives `Ord`), `pub struct KvPriority(pub f32)` with `pub fn from_class(c: PriorityClass) -> Self`, `pub struct TokenRange { pub start: u32, pub end: u32 }`, `pub struct CostEstimate { pub seconds: f64 }`, `pub type Timestamp = Duration`
+- `pub struct MatchedBlock { pub key: KvKey, pub tier: TierId, pub location: KvLocation }`, `pub struct PrefixMatch { pub blocks: Vec<MatchedBlock>, pub mismatches: u32, pub keys: Vec<KvKey>, pub pending: Option<KvKey> }`
+- `impl KvDirectory { pub fn new(max_entries: usize) -> Self; pub fn insert(&mut self, b: KvBlock) -> Result<(), DirectoryError>; pub fn remove(&mut self, key: &KvKey) -> Option<KvBlock>; pub fn get/get_mut; pub fn add_location(&mut self, key: &KvKey, loc: KvLocation); pub fn remove_location(&mut self, key: &KvKey, tier: TierId) -> Option<usize>; pub fn lookup(&mut self, hasher: &dyn KeyHasher, tokens: &[u32], block_tokens: u32, now: Timestamp) -> PrefixMatch; pub fn register_pending(&mut self, key: KvKey, now: Timestamp); pub fn clear_pending(&mut self, key: &KvKey); pub fn record_hit(&mut self, key: &KvKey, now: Timestamp, half_life: Duration); pub fn candidates(&self, tier: TierId, departing: &HashSet<KvKey>) -> Vec<&KvBlock>; pub fn evictable(&self, b: &KvBlock, tier: TierId, departing: &HashSet<KvKey>) -> bool; pub fn stale_location(&mut self, key: &KvKey, tier: TierId) }`
+- `pub enum DirectoryError { Full(usize), MissingParent(KvKey) }`, `pub const PENDING_WAIT: Duration = 2 s`, `pub fn decay(hits: f64, at: Timestamp, now: Timestamp, half_life: Duration) -> f64`
+- `KvMetrics` adds `bytes, lookups, prefix_cached_tokens, prompt_tokens, promotions, demotions, evictions, drops, recompute_tokens, plans, transfer_seconds, transfer_bytes, transfer_bandwidth, prefetch, sessions, tier_degraded, storage_queue_depth, storage_latency` with `pub fn record_lookup(&self, m: &PrefixMatch)`, `eviction(TierId, EvictReason)`, `drop_block(EvictReason)`, `demotion/promotion(from, to)`, `plan(PlanReason, u32)`, `prefetch_outcome(PrefetchOutcome)`, `transfer(TransferPath, u64, f64, f64)`, `set_degraded(TierId, bool)`, `tier_usage(TierId, cap, used, used_blocks, free_blocks)`, `init_labels(&self)`, `pub fn unregistered() -> Self`
+- `pub enum EvictReason { Capacity, Pressure, SessionExpired, Checksum, TierDegraded, BelowMinValue, NoRoom }`, `pub enum PrefetchOutcome { Used, Wasted, Cancelled, Rejected }` (label strings per §17)
+  Covers: S-2 (with S-1 collision safety), S-14 (families); `directory::tests::collision_is_a_miss`, `directory::tests::longest_prefix_across_tiers`
+  Depends on: Task 2; phase-2 plan (`KvMetrics`, `turbine_kv_blocks{tier,state}`)
+
+- [ ] Write failing test `directory::tests::collision_is_a_miss`: with a `KeyHasher` returning `KvKey([0xab;16])` for everything, inserts tokens 0..16 in L0, asserts the same tokens hit and tokens 100..116 return an empty match with `mismatches == 1`, that `KvMetrics::record_lookup` counts `turbine_kv_lookups{result="miss"} == 1`, and that the captured log contains `kv_key_mismatch`. Run: `cargo test -p turbine-kv directory::tests::collision_is_a_miss` — expect FAIL.
+- [ ] Write failing test `directory::tests::longest_prefix_across_tiers`: 9 blocks of a 144-token prompt; blocks 0–3 in L0, 4–5 in L1, 6 in L2, block 7 missing and block 8 present; asserts the lookup returns exactly 7 matched blocks with tiers `[l0,l0,l0,l0,l1,l1,l2]`, 9 keys, and that adding an L0 copy to block 6 reports it as L0 (fastest). Run: `cargo test -p turbine-kv directory::tests::longest_prefix_across_tiers` — expect FAIL.
+- [ ] Implement the directory: `HashMap<KvKey, KvBlock>` plus a private children index; `insert` requires the parent (child_count +1) and respects `max_entries`; `lookup` walks `chunks_exact`, compares stored tokens (mismatch → WARN `kv_key_mismatch`, stop), reports a pending key registered < 2 s ago; `evictable` = copy in `tier`, not L0-referenced, and every child either in `departing` or cached only in slower tiers. Extend `KvMetrics::register` with the families of the spec's Metrics list (histograms with `exponential_buckets(1e-5, 4.0, 12)`) and touch every documented label value in `init_labels`.
+- [ ] Run: `cargo test -p turbine-kv directory::tests` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(kv): local KV directory with verified longest-prefix lookup`
+
+## Task 4: Tier trait, in-memory tier and the L2 NVMe tier
+
+Files: `crates/turbine-kv/src/tier/mod.rs` (`KvTier`, `TierId`, `KvLocation`, errors, `TierHealth`, helpers), `crates/turbine-kv/src/tier/mem.rs` (`MemTier`), `crates/turbine-kv/src/tier/l2.rs` (`L2NvmeTier`), `crates/turbine-kv/src/tier/l0.rs` (`L0Tier` accounting view over the pool snapshot), `crates/turbine-kv/src/tier/tests.rs` (tier unit tests), `crates/turbine-kv/Cargo.toml` (add `crc32c`, dev `tempfile`), `Cargo.toml` (workspace `crc32c = "0.6"`)
+Interfaces:
+
+- `pub trait KvTier: Send + Sync` exactly as contract §11 (`id, enabled, capacity_bytes, used_bytes, pressure, est_latency, est_bandwidth, contains, put, get, evict, degraded`)
+- `pub enum TierBlockRef<'a> { Host(&'a [u8]) }`, `pub enum TierBlockMut<'a> { Host(&'a mut [u8]) }`, `pub struct TierSlot(pub u64)`, `pub enum TierError { Full, Missing, Checksum, Io(String), Degraded }`
+- `pub struct TierHealth` with `new(probe_after: Option<Duration>)`, `record_error(&mut self, now) -> bool` (3 within 60 s → degraded), `is_degraded`, `probe_due(now)`, `probe_result(ok, now)`
+- `pub fn utilization_pressure(used: u64, capacity: u64) -> PressureState` (P3 `kv_utilization` thresholds), `pub fn demotion_target(from: TierId, l1_enabled: bool, l2_enabled: bool) -> Option<TierId>`
+- `impl MemTier { pub fn new(id: TierId, capacity_bytes: u64, clock: Arc<dyn Clock>) -> Self; pub fn payload_free(id: TierId, capacity_bytes: u64, block_bytes: u64, clock: Arc<dyn Clock>) -> Self; pub fn set_estimates(&self, latency: Duration, bandwidth: f64); pub fn inject_read_errors(&self, n: u32); pub fn inject_write_errors(&self, n: u32) }`
+- `pub struct L2Config { pub path: PathBuf, pub max_bytes: u64, pub slab_bytes: u64, pub max_queue_depth: u32, pub block_bytes: u64, pub namespace: NamespaceKey }`
+- `impl L2NvmeTier { pub fn open(cfg: L2Config, clock: Arc<dyn Clock>, metrics: KvMetrics) -> Result<Self, TierError>; pub fn slab_path(&self, slab: usize) -> PathBuf; pub fn queue_depth(&self) -> u32; pub fn p99_latency(&self) -> f64; pub fn set_calibration(&self, p99_seconds: f64, bandwidth: f64); pub fn check_slow(&self) -> bool; pub fn probe(&self) -> bool; pub fn uses_direct_io(&self) -> bool }`, `pub const SLAB_MAGIC: &[u8; 8] = b"TKVSLAB1"`
+  Covers: S-4, S-11; `tier::tests::contract_suite`, `tier::tests::nvme_checksum_and_restart`
+  Depends on: Task 3
+
+- [ ] Write failing test `tier::tests::contract_suite`: one generic `suite(&dyn KvTier, 4)` run against `MemTier` and against `L2NvmeTier` on a tempdir with 6,000-byte blocks (not 4 KiB aligned) asserts Missing on empty get/evict, 4 puts fit and the 5th is `Full`, byte-identical get of each block, put over an existing key replaces it without growing `used_bytes`, and evict frees exactly one block. Run: `cargo test -p turbine-kv tier::tests::contract_suite` — expect FAIL.
+- [ ] Write failing test `tier::tests::nvme_checksum_and_restart`: with `keep.txt` and a stale `turbine-kv-9999.slab` in the directory, opening deletes only the slab; after 3 puts the slab header starts with `TKVSLAB1`; flipping byte `4096 + 8192 + 17` (slot 1) makes that get return `Checksum`, drops the block and increments `turbine_kv_evictions{tier="l2",reason="checksum"}` to 1 while slot 2 still round-trips; reopening deletes `turbine-kv-0000.slab` and keeps `keep.txt`. Run: `cargo test -p turbine-kv tier::tests::nvme_checksum_and_restart` — expect FAIL.
+- [ ] Implement `MemTier` (a `Mutex` map; payload-free mode accounts `block_bytes` per key and returns zeros, for the simulator) and `L2NvmeTier`: slab files `turbine-kv-{n:04}.slab` created lazily up to `max_bytes / (4096 + slots × slot)`, 4 KiB header (magic, version 1 LE u32, namespace key, slot size, slot count), slots padded to 4 KiB, positioned I/O via `std::os::unix::fs::FileExt::{write_all_at, read_exact_at}` through a 4 KiB-aligned heap window (no `unsafe`), `O_DIRECT` through `OpenOptionsExt::custom_flags` with the per-arch constant (`0o040000` x86_64, `0o200000` aarch64) only on Linux, EINVAL on open → buffered I/O with WARN `kv_nvme_buffered_io`; CRC32C per block checked on read (mismatch → WARN `kv_checksum_mismatch`, slot freed, health error); queue depth bounded by a `Mutex<u32>` + `Condvar` gate feeding `turbine_storage_queue_depth` and `turbine_storage_latency_seconds`; degraded after 3 errors in 60 s or p99 > 10× calibration, probed once after 5 minutes. `L0Tier` reports the pool's capacity/used/pressure and `contains`; its `put`/`get` return `TierError::Io("L0 blocks move through the transfer engine")` because L0 data only moves on copy streams.
+- [ ] Run: `cargo test -p turbine-kv tier::tests` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(kv): tier trait, in-memory test tier and NVMe slab tier`
+
+## Task 5: Pinned-memory traits and the L1 pinned tier
+
+Files: `crates/turbine-tensor/src/pinned.rs` (the P4 traits and `PinnedBuffer`), `crates/turbine-tensor/src/host.rs` (add the `HostPinned` test allocator), `crates/turbine-tensor/src/lib.rs` (re-exports), `crates/turbine-kv/src/tier/l1.rs` (`L1PinnedTier`), `crates/turbine-kv/src/tier/tests.rs` (add the L1 test)
+Interfaces:
+
+- `pub trait PinnedMemory: Send + Sync { fn alloc_pinned(&self, bytes: usize) -> Result<PinnedBuffer, MemoryError>; }`
+- `pub trait PinnedOwner: Send + Sync { fn with_bytes_dyn(&self, id: u64, f: &mut dyn FnMut(&mut [u8])); fn free_pinned(&self, id: u64); }` (contract addition)
+- `impl PinnedBuffer { pub fn new(id: u64, len: usize, owner: Arc<dyn PinnedOwner>) -> Self; pub fn id(&self) -> u64; pub fn len(&self) -> usize; pub fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R; pub fn with_bytes_mut<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R }` (freed on Drop)
+- `pub trait CopyEngine: Send + Sync { fn copy_async(&self, dst: CopyTarget, src: CopySource, bytes: usize) -> Result<CopyTicket, MemoryError>; fn poll(&self, t: &CopyTicket) -> Result<bool, MemoryError>; fn wait(&self, t: &CopyTicket) -> Result<(), MemoryError>; }`, `pub enum CopyTarget { Device(DevicePtr), Pinned { buffer_id: u64, offset: usize } }`, `pub type CopySource = CopyTarget`, `pub struct CopyTicket { pub id: u64, pub bytes: usize }`
+- `impl turbine_tensor::host::HostPinned { pub fn new(limit_bytes: u64) -> Self; pub fn fail_next(&self, n: u64); pub fn allocated_bytes(&self) -> u64; pub fn live_buffers(&self) -> usize }` (implements `PinnedMemory`)
+- `pub struct L1Config { pub enabled: bool, pub max_bytes: u64, pub slab_bytes: u64, pub block_bytes: u64, pub memory_kind: MemoryKind }`
+- `impl L1PinnedTier { pub fn new(cfg: L1Config, alloc: Arc<dyn PinnedMemory>, clock: Arc<dyn Clock>) -> Self; pub fn slab_count(&self) -> usize; pub fn set_host_pressure(&self, p: PressureState); pub fn locate(&self, key: &KvKey) -> Option<(u64, usize)>; pub fn reserve(&self, key: KvKey) -> Result<(u64, usize), TierError>; pub fn commit(&self, key: &KvKey) -> TierSlot; pub fn record_copy_error(&self) -> bool }`
+  Covers: S-5; `tier::tests::l1_grows_and_shrinks`
+  Depends on: Task 4; phase-1 plan (`turbine_tensor::{DevicePtr, MemoryError}`)
+
+- [ ] Write failing test `tier::tests::l1_grows_and_shrinks`: with `HostPinned` and 2-block slabs up to 3 slabs, asserts no buffer before the first put, 2 slabs after 3 puts, a `fail_next(1)` slab failure makes the next overflowing put return `Full` with log `kv_l1_slab_alloc_failed` while existing blocks still read back, L1 grows to 3 slabs afterwards and never beyond (7th put `Full`), emptied slabs stay below RED and one is released at `set_host_pressure(Red)`; with `memory_kind: Unified` it reports `enabled() == false`, `capacity_bytes() == 0`, logs `kv_l1_disabled_unified` exactly once at WARN, and `demotion_target(L0, false, true) == Some(L2)`, `(L0, false, false) == None`. Run: `cargo test -p turbine-kv tier::tests::l1_grows_and_shrinks` — expect FAIL.
+- [ ] Implement the traits (the generic `with_bytes` wrappers call `with_bytes_dyn` exactly once) and `L1PinnedTier`: slot index `HashMap<KvKey, (slab, slot)>`, slabs of `slab_bytes / block_bytes` slots allocated only when no free slot exists and live slabs < `max_bytes / slab_bytes` and host pressure < RED; failed allocation logs WARN and returns `Full`; `reserve`/`commit` let the GPU copy stream write straight into a slot before it becomes visible to `contains`; unified memory disables the tier at construction with one WARN.
+- [ ] Run: `cargo test -p turbine-kv tier::tests::l1_grows_and_shrinks` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(kv): lazily grown pinned L1 tier over PinnedMemory`
+
+## Task 6: Cost-aware eviction policy
+
+Files: `crates/turbine-kv/src/policy.rs` (policies, scoring inputs, ordering, unit test), `crates/turbine-kv/src/lib.rs`
+Interfaces:
+
+- `pub trait EvictionPolicy: Send + Sync { fn name(&self) -> &'static str; fn score(&self, b: &BlockScoreInputs, now: Timestamp) -> f64; }` (contract §11)
+- `pub struct BlockScoreInputs { pub block: KvBlockSummary, pub tier: TierId, pub tier_capacity: u64, pub tier_pressure: PressureState, pub prefill_tps: f64, pub retrieval: CostEstimate, pub session_hot: bool, pub depth_tokens: u32 }`
+- `pub struct KvBlockSummary { pub key: KvKey, pub size_bytes: u64, pub tokens: u32, pub last_access: Timestamp, pub decayed_hits: f64, pub decayed_at: Timestamp, pub child_count: u32, pub priority: KvPriority }` with `pub fn of(b: &KvBlock) -> Self`
+- `pub struct CostAwarePolicy { pub session_active: f64, pub hit_half_life: Duration }` (`fn reuse_probability(&self, b: &BlockScoreInputs, now: Timestamp) -> f64`), `pub struct LruPolicy`
+- `pub fn make_policy(kind: KvPolicyKind, w: &KvPolicyWeights) -> Box<dyn EvictionPolicy>`, `pub fn order_victims(policy: &dyn EvictionPolicy, candidates: &[BlockScoreInputs], now: Timestamp) -> Vec<(KvKey, f64)>`, `pub fn recompute_seconds(tokens: u32, depth_tokens: u32, prefill_tps: f64) -> f64`
+  Covers: S-7; `policy::tests::cost_aware_ordering`
+  Depends on: Task 3
+
+- [ ] Write failing test `policy::tests::cost_aware_ordering`: from a base block (1 MiB, 16 tokens, 2 hits, 1 child, YELLOW L0 of 1 GiB, 10,000 tok/s, retrieval 1 ms, depth 1024) asserts that 20 hits, a hot session, depth 8192, 1,000 tok/s and priority 2.0 each raise the score, while 4 MiB size, RED pressure, 0.1 ms retrieval and priority 0.5 each lower it, and that hits decay over 600 s; that in a directory with a referenced block and a parent whose child is in L0 only the unreferenced leaf is a candidate, and the parent becomes one once the child lives only in L1; that equal LRU values order the older last access first. Run: `cargo test -p turbine-kv policy::tests::cost_aware_ordering` — expect FAIL.
+- [ ] Implement per P4 §Cost-aware value terms: reuse = min(1, session_active·[hot] + h/(1+h) + 0.25·c/(1+c)) with h decayed by `hit_half_life`; recompute = tokens / prefill_tps × (1 + depth/8192); memory = size / capacity × (1 + pressure level 0…4); retrieval floored at 1 µs; value = reuse × recompute × priority × retrieval / memory (retrieval multiplies: user decision 2026-09-25). `LruPolicy` scores `last_access`. Ties: older last access, then deeper block.
+- [ ] Run: `cargo test -p turbine-kv policy::tests::cost_aware_ordering` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(kv): pluggable cost-aware and LRU eviction policies`
+
+## Task 7: Recompute-vs-retrieve planner
+
+Files: `crates/turbine-kv/src/planner.rs` (plan types, cost function, planner, unit test), `crates/turbine-kv/src/lib.rs`
+Interfaces:
+
+- `pub struct KvPlan { pub reuse_l0: u32, pub promote: Vec<(TierId, u32)>, pub recompute_tokens: u32, pub reason: PlanReason }` with `pub fn cutoff_blocks(&self) -> u32`
+- `pub enum PlanReason { AllL0, RetrieveCheaper, RecomputeCheaper, L0Pressure, TierDegraded, NoMatch }` (`ALL`, `as_str`: `all_l0` …)
+- `pub struct PathCost { pub latency_s: f64, pub bandwidth_bps: f64 }` with `pub fn block_seconds(&self, block_bytes: u64) -> f64`
+- `pub struct PlanInputs<'a> { pub matched: &'a [TierId], pub prompt_tokens: u32, pub block_tokens: u32, pub block_bytes: u64, pub prefill_tps: f64, pub l1_to_l0: Option<PathCost>, pub l2_to_l0: Option<PathCost>, pub l0_state: PressureState, pub l1_degraded: bool, pub l2_degraded: bool }`
+- `pub fn plan_cost(inp: &PlanInputs<'_>, k: usize) -> f64`, `pub fn plan_prefix(inp: &PlanInputs<'_>) -> KvPlan`
+  Covers: S-9; `planner::tests::cutoff_minimises_cost`
+  Depends on: Task 4
+
+- [ ] Write failing test `planner::tests::cutoff_minimises_cost`: with L1 at 20 µs + 20 GB/s, L2 at 50 ms + 50 MB/s and 8,000 tok/s, asserts a 1,000-block L1 prefix of a 16,001-token prompt is `RetrieveCheaper` with `promote == [(l1, 1000)]` and 1 recomputed token; a 4-block L2 prefix of 65 tokens is `RecomputeCheaper` with cutoff 0; `[l0,l0,l1,l1]` at RED is `L0Pressure` reusing 2 and promoting none; a fully cached 64-token prompt reuses 3 blocks and recomputes 16 (`AllL0`); no match is `NoMatch`; and for 200 xorshift-seeded random cases (0–39 mixed-tier blocks, random prefill rate and L2 speed) the chosen cost never exceeds the brute-force minimum over all k. Run: `cargo test -p turbine-kv planner::tests::cutoff_minimises_cost` — expect FAIL.
+- [ ] Implement: cost(k) = Σ retrieval of blocks 0..k from their fastest tier (L0 = 0) + (prompt − k·block_tokens) / prefill_tps; k is capped so at least one prompt token is recomputed and stops before the first block of a degraded tier; argmin scans k ascending taking ties at the larger k; L0 at RED or above restricts the choice to the leading L0 blocks (`L0Pressure`); degraded tiers that change the choice give `TierDegraded`; otherwise `RetrieveCheaper` / `RecomputeCheaper` / `AllL0`.
+- [ ] Run: `cargo test -p turbine-kv planner::tests::cutoff_minimises_cost` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(kv): recompute-vs-retrieve planner`
+
+## Task 8: Transfer engine
+
+Files: `crates/turbine-kv/src/transfer.rs` (engine, paths, backend trait, virtual-time backend, unit test), `crates/turbine-kv/src/lib.rs`
+Interfaces:
+
+- `pub enum TransferPath { L0ToL1, L1ToL0, L1ToL2, L2ToL1, L0ToL2, L2ToL0 }` with `ALL`, `as_str`, `between(from, to) -> Option<Self>`, `from()`, `to()`, `fallback() -> PathCost` (8 GB/s L0↔L1, 1 GB/s others)
+- `pub enum TransferPurpose { Demote, Promote, Prefetch }`, `pub struct TransferRequest { pub path, pub key: KvKey, pub bytes: u64, pub owner: Option<RequestId>, pub purpose, pub src_slot: u64, pub dst_slot: u64 }`, `pub struct TransferTicket { pub id: u64, pub req: TransferRequest }`
+- `pub trait TransferBackend { fn start(&mut self, t: &TransferTicket) -> Result<(), TierError>; fn poll(&mut self, t: &TransferTicket) -> Result<Option<TierSlot>, TierError>; }`
+- `pub struct TransferCompletion { pub ticket: TransferTicket, pub result: Result<(Duration, TierSlot), TierError>, pub owner_cancelled: bool }`, `pub enum TransferError { QueueFull(usize) }`
+- `impl TransferEngine { pub fn new(max_inflight_bytes: u64, max_queued: usize, clock: Arc<dyn Clock>) -> Self; pub fn submit(&mut self, r: TransferRequest) -> Result<TransferTicket, TransferError>; pub fn pump(&mut self, b: &mut dyn TransferBackend) -> Vec<TransferCompletion>; pub fn cancel_owner(&mut self, owner: RequestId) -> Vec<TransferTicket>; pub fn seed(&mut self, p: TransferPath, c: PathCost); pub fn estimate(&self, p: TransferPath) -> PathCost; pub fn inflight_bytes(&self) -> u64; pub fn peak_inflight_bytes(&self) -> u64; pub fn is_busy_with(&self, key: &KvKey) -> bool; pub fn is_idle(&self) -> bool }`
+- `impl SimTransferBackend { pub fn new(clock: Arc<dyn Clock>, l1: Option<Arc<dyn KvTier>>, l2: Option<Arc<dyn KvTier>>, block_bytes: usize) -> Self; pub fn set_cost(&mut self, p: TransferPath, c: PathCost); pub fn fail_next(&mut self, n: u32) }`
+  Covers: S-6; `transfer::tests::inflight_bounded`
+  Depends on: Tasks 4, 7
+
+- [ ] Write failing test `transfer::tests::inflight_bounded`: queues 2,560 copies of 4 MiB (10 GiB) alternating L1→L0 and L2→L0 with `max_inflight_bytes` 1 GiB on a `FakeClock` + `SimTransferBackend`, pumping and advancing 200 µs per round, and asserts in-flight bytes never exceed 1 GiB, the peak exceeds 512 MiB, all 2,560 complete successfully, and the L1→L0 bandwidth estimate is positive. Run: `cargo test -p turbine-kv transfer::tests::inflight_bounded` — expect FAIL.
+- [ ] Implement: FIFO queue bounded by `max_queued`; `pump` first polls in-flight tickets (completion updates per-path EWMA α = 0.2 of bandwidth and latency), then starts queued tickets while `inflight + bytes ≤ max` (or nothing is in flight); a busy-key counter map backs `is_busy_with`; `cancel_owner` removes queued tickets and marks in-flight ones so their completion carries `owner_cancelled` (bytes land in the cache, never in the cancelled sequence). `SimTransferBackend` completes after latency + bytes/bandwidth of the path and moves bytes between host tiers with get/put (L0 has no bytes in the simulator; its slot is `dst_slot`).
+- [ ] Run: `cargo test -p turbine-kv transfer::tests::inflight_bounded` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(kv): bounded transfer engine with per-path estimates`
+
+## Task 9: Session table and prefetch accounting
+
+Files: `crates/turbine-kv/src/session.rs` (session state machine, prefetch tracker, unit test), `crates/turbine-kv/src/lib.rs`
+Interfaces:
+
+- `pub type SessionHintsParsed = turbine_core::request::SessionHints` (`SessionHints { session_id: String, resume_within_secs: Option<u32>, end: bool }`, contract §3.5)
+- `pub enum Warmth { Hot, Warm, Cold }`, `pub struct Session { pub id: SessionId, pub tail: Option<KvKey>, pub blocks: Vec<KvKey>, pub last_activity: Duration, pub gap_ewma: Option<Duration>, pub resume_until: Option<Duration>, pub inflight: u32, pub end_requested: bool, pub warmth: Warmth, pub prefetched: bool }`
+- `pub enum SessionAction { DemoteFromL0(Vec<KvKey>), DemoteFromL1(Vec<KvKey>), Prefetch(SessionId, Vec<KvKey>), Dropped(SessionId) }`
+- `impl SessionTable { pub fn new(cfg: KvSessionConfig, prefetch: &KvPrefetchConfig) -> Self; pub fn begin(&mut self, id: SessionId, hints: &SessionHints, now: Duration); pub fn finish(&mut self, id: &SessionId, blocks: Vec<KvKey>, now: Duration) -> bool; pub fn is_hot(&self, id: &SessionId, now: Duration) -> bool; pub fn sweep(&mut self, now: Duration, pressure: PressureState) -> Vec<SessionAction>; pub fn find_by_key(&self, key: &str) -> Option<&Session>; pub fn len(&self) -> usize; pub fn max(&self) -> u32 }`
+- `impl PrefetchTracker { pub fn issued(&mut self, k: KvKey); pub fn attached(&mut self, k: &KvKey) -> bool; pub fn evicted(&mut self, k: &KvKey) -> bool; pub fn cancelled(&mut self, k: &KvKey) -> bool }` with pub counters `used, wasted, cancelled, rejected`
+  Covers: S-10; `session::tests::lifecycle_and_prefetch`
+  Depends on: Task 3
+
+- [ ] Write failing test `session::tests::lifecycle_and_prefetch`: on a fake timeline with hot 60 s / warm 600 s / idle 3600 s / lead 2 s asserts `DemoteFromL0` at 61 s and `DemoteFromL1` at 601 s; a 800 s then 200 s gap gives gap EWMA 0.7·800 + 0.3·200 s and a single `Prefetch` exactly at last + EWMA − 2 s under YELLOW, none under ORANGE, none twice; `resume-within 600` keeps `is_hot` until 599 s and suppresses the TTL demotion; `end: true` releases the boost at once and drops the entry after the last of two in-flight requests; a 3-session table drops the least recently active session; expiry after 1 h emits `Dropped`; a prefetched key used once counts `used` and is never counted `wasted`. Run: `cargo test -p turbine-kv session::tests::lifecycle_and_prefetch` — expect FAIL.
+- [ ] Implement: sessions keyed by (`prompt_cache_key`, salt of the first request); `begin` updates the gap EWMA (α = 0.3) only between turns, sets `resume_until` from the hint and `end_requested`; `sweep` iterates sessions in sorted `SessionId` order (HashMap order is randomised; the simulator must be deterministic) and emits TTL demotions, expiry and predicted-resume prefetch only at GREEN/YELLOW once per idle gap.
+- [ ] Run: `cargo test -p turbine-kv session::tests::lifecycle_and_prefetch` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(kv): session table with TTL demotion and predicted-resume prefetch`
+
+## Task 10: `KvHierarchy` composition, pool additions and KV document
+
+Files: `crates/turbine-kv/src/hierarchy.rs` (composition, reclaim handle, prefetch entry, unit test), `crates/turbine-kv/src/pool.rs` (P4 cached-block additions to `BlockPool`), `crates/turbine-kv/src/document.rs` (P4 `KvDocument` replacing the P2 shape, `HitWindow`), `crates/turbine-kv/src/tier/tests.rs` (add the degraded-tier test), `crates/turbine-kv/src/lib.rs`
+Interfaces:
+
+- `BlockPool` additions: `pub fn refcount(&self, b: BlockId) -> u32; pub fn is_keyed(&self, b: BlockId) -> bool; pub fn set_keyed(&mut self, b: BlockId); pub fn evict_cached(&mut self, b: BlockId) -> bool; pub fn cached_unreferenced(&self) -> u32; pub fn referenced_blocks(&self) -> u32; pub fn available_blocks(&self) -> u32; pub fn set_reclaim_order(&mut self, order: Vec<BlockId>); pub fn take_reclaimed(&mut self) -> Vec<BlockId>`; `release` keeps a keyed block cached at ref count 0; `allocate` reclaims cached unreferenced blocks in reclaim order when the free list is short
+- `pub struct HierarchyConfig { block_tokens, block_bytes, policy, weights, demote_min_value, prefix_sharing, memory_kind, max_inflight_bytes, transfer_queue: usize, session, prefetch }` with `pub fn from_config(kv: &KvConfig, block_bytes: u64, memory_kind: MemoryKind) -> Self`
+- `pub struct PrefixAttach { pub blocks: SmallVec<[BlockId; 16]>, pub cached_tokens: u32, pub plan: KvPlan }` (the scheduler's `SchedRequest.cached_prefix`), `pub enum AttachOutcome { Ready(PrefixAttach), Promoting, WaitForPrefix }`, `pub struct AttachRequest<'a> { pub request: RequestId, pub prompt: &'a [u32], pub cache_salt: &'a str, pub session: Option<&'a SessionHints>, pub priority: Priority }`
+- `impl KvHierarchy { pub fn new(cfg: HierarchyConfig, model: ModelIdentity, format: KvFormat, l0_blocks: u32, l1: Option<Arc<dyn KvTier>>, l2: Option<Arc<dyn KvTier>>, clock: Arc<dyn Clock>, metrics: KvMetrics) -> Self; pub fn attach_prefix(&mut self, pool: &mut BlockPool, req: &AttachRequest<'_>) -> AttachOutcome; pub fn commit_progress(&mut self, pool: &mut BlockPool, request: RequestId, table: &[BlockId], tokens: &[u32]); pub fn request_done(&mut self, pool: &mut BlockPool, request: RequestId, cancelled: bool); pub fn poll(&mut self, pool: &mut BlockPool, backend: &mut dyn TransferBackend) -> Vec<(RequestId, PrefixAttach)>; pub fn refresh_reclaim_order(&mut self, pool: &mut BlockPool); pub fn after_plan(&mut self, pool: &mut BlockPool); pub fn demote_to(&mut self, pool: &mut BlockPool, target: f64, reason: EvictReason) -> u64; pub fn apply_reclaim(&mut self, pool: &mut BlockPool) -> u64; pub fn tick(&mut self, pool: &mut BlockPool); pub fn prefetch(&mut self, pool: &mut BlockPool, target: PrefetchTarget<'_>) -> Result<PrefetchAccepted, PrefetchError>; pub fn document(&self, pool: &BlockPool, hit_window: (u64, u64)) -> KvDocument; pub fn reclaimer(&self) -> Arc<KvReclaimHandle>; pub fn stats(&self) -> &KvStats; pub fn set_l0_state(&mut self, s: PressureState); pub fn set_prefill_tps(&mut self, tps: f64) }`
+- `pub struct KvReclaimHandle` implementing `turbine_reliability::throttle::KvReclaimer` (stores the target in an atomic, returns the requested bytes from a published snapshot); `pub enum PrefetchTarget<'a> { Session(&'a str), Tokens { prompt: &'a [u32], cache_salt: &'a str } }`, `pub struct PrefetchAccepted { pub blocks_queued: u32, pub blocks_resident: u32 }`, `pub enum PrefetchError { SessionNotFound, QueueFull, PressureTooHigh }`, `pub struct KvStats { pub lookups: [u64; 4], prompt_tokens, cached_tokens, recompute_tokens, transfer_bytes, promotions, demotions, evictions, drops, transfer_errors }`
+- `pub struct KvDocument { policy, prefix_sharing, block_tokens, block_bytes, tiers: Vec<TierDoc>, unified_memory, hit_rate: HitRate, sessions: Sessions, prefetch: Prefetch, transfers: Transfers }` (P4 §Data keys; `TierDoc` also keeps the P2 fields `dtype, block_tokens, block_bytes, blocks_total, blocks_used, blocks_free`)
+  Covers: S-3 (attach mechanics), S-8 (demotion/promotion mechanics), S-12; `tier::tests::faulty_tier_degrades_to_recompute`, `hierarchy::tests::demote_promote_round_trip` (contract addition)
+  Depends on: Tasks 2–9; phase-2 plan (`BlockPool`), phase-3 plan (`KvReclaimer`)
+
+- [ ] Write failing test `hierarchy::tests::demote_promote_round_trip`: an 8-block L0 pool and 16-block `MemTier` L1; a 65-token prompt run twice gives 0 then 64 cached tokens (`AllL0`); `demote_to(0.0)` schedules all 4 blocks at once (leaf-first chain drains in one call) but frees none before the copies complete; after completion L0 is empty with 4 demotions; a third attach returns `Promoting`, then `poll` reports the request ready with 64 cached tokens and reason `RetrieveCheaper`. Run: `cargo test -p turbine-kv hierarchy::tests::demote_promote_round_trip` — expect FAIL.
+- [ ] Write failing test `tier::tests::faulty_tier_degrades_to_recompute`: four 33-token prompts are prefilled, committed and demoted to a 64-block `MemTier` L1; with `inject_read_errors(3)` four re-attaches each end as ready (never an error, never lost) with reason `TierDegraded`, and the tier reports `degraded()`. Run: `cargo test -p turbine-kv tier::tests::faulty_tier_degrades_to_recompute` — expect FAIL.
+- [ ] Implement `KvHierarchy`: attach = lookup → `plan_prefix` → incref every reused L0 block first (so promotion allocations can never reclaim one) → allocate L0 targets and submit promotions → `after_plan` to forget reclaimed copies → register the prompt's unmatched keys as pending → `WaitForPrefix` when another request is computing the next block (< 2 s); `commit_progress` keys newly full blocks and `set_keyed`s them; victims come from a min-heap over `directory.evictable` candidates in which choosing a block makes its parent eligible; demotion copies first and frees on completion, drops below `demote_min_value` (`below_min_value`) or with no lower tier (`no_room`), sends L1 victims to L2 when storage pressure < ORANGE, else evicts; a failed promotion truncates the attach at that block, releases the unused blocks and reports `TierDegraded`. `KvDocument` rolls the hit rate over 300 s in 30 buckets of 10 s.
+- [ ] Run: `cargo test -p turbine-kv` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(kv): KvHierarchy composing directory, tiers, policy, planner and transfers`
+
+## Task 11: Scheduler integration and the `kv_sim` tests
+
+Files: `crates/turbine-scheduler/src/scheduler.rs` (admit with `cached_prefix`, never write shared blocks, prefill from `cached_tokens`), `crates/turbine-scheduler/src/request.rs` (`SchedRequest.cached_prefix: Option<PrefixAttach>`), `crates/turbine-scheduler/src/sim/mod.rs` (`KvSimDriver` driving `KvHierarchy` + `Scheduler` + P3 `Admission` against `SimExecutor`), `crates/turbine-scheduler/tests/kv_sim.rs` (three integration tests)
+Interfaces:
+
+- consumes `turbine_kv::hierarchy::{KvHierarchy, PrefixAttach, AttachOutcome}`, `turbine_kv::transfer::SimTransferBackend`, `turbine_reliability::admission::Admission::estimate(prompt_tokens, cached_prefix_tokens, max_tokens, layout, max_seq_len)`
+- `pub struct SchedRequest { …, pub cached_prefix: Option<PrefixAttach> }` (contract §12)
+- `pub struct KvSimDriver` with `pub fn new(sched: Scheduler, pool: BlockPool, kv: KvHierarchy, backend: SimTransferBackend, clock: FakeClock) -> Self; pub fn submit(&mut self, id: RequestId, prompt: Vec<u32>, max_tokens: u32) ; pub fn cancel(&mut self, id: RequestId); pub fn step(&mut self) -> IterationPlan; pub fn set_pressure(&mut self, s: PressureState); pub fn pool(&self) -> &BlockPool; pub fn kv(&self) -> &KvHierarchy; pub fn prefilled_tokens(&self, id: RequestId) -> u32; pub fn last_estimate(&self, id: RequestId) -> Option<ResourceEstimate>` (contract addition)
+  Covers: S-3, S-8, S-12; `kv_sim prefix_reuse_refcounts`, `kv_sim demotion_under_pressure`, `kv_sim cancellation_releases_kv`
+  Depends on: Task 10; phase-2 plan (`Scheduler`, `sim::SimExecutor`), phase-3 plan (`Admission`, `ThrottlePlan`)
+
+- [ ] Write failing test `kv_sim prefix_reuse_refcounts`: 50 requests sharing a 64-block (1,024-token) prefix plus distinct 20-token suffixes, arriving together; asserts the prefix's 1,024 tokens are prefilled once in total (the others wait on the pending keys, then attach), ref counts of shared blocks rise to the number of running sharers and return to 0 after completion, no `BatchItem` ever writes a shared block (prefill starts at `cached_tokens`), a fully cached 1,024-token prompt still prefills 16 tokens, and the admission estimate of a later request has `cached_prefix_tokens == 1024`. Run: `cargo test -p turbine-scheduler --test kv_sim prefix_reuse_refcounts` — expect FAIL.
+- [ ] Write failing test `kv_sim demotion_under_pressure`: with a full L0, 8-block L1 and 16-block L2 and pressure forced to ORANGE (reclaim to the ORANGE target), asserts unreferenced blocks are copied to L1 and freed only after their copy completes, blocks scoring below `demote_min_value` 1e9 are dropped (`turbine_kv_drops{reason="below_min_value"}`), L1 victims move to L2, and a later request sharing the prefix promotes them before its first prefill chunk; the same scenario with `MemoryKind::Unified` counts `turbine_kv_demotions{from="l0",to="l2"}` and never touches L1. Run: `cargo test -p turbine-scheduler --test kv_sim demotion_under_pressure` — expect FAIL.
+- [ ] Write failing test `kv_sim cancellation_releases_kv`: 100 requests whose prefixes are in L1/L2 are cancelled while promotions and a session prefetch are queued or in flight; asserts every reference is dropped within one iteration, no completed transfer lands in a cancelled sequence (in-flight completions become cached unreferenced blocks), and `pool.referenced_blocks()` returns to the pre-test baseline. Run: `cargo test -p turbine-scheduler --test kv_sim cancellation_releases_kv` — expect FAIL.
+- [ ] Implement: on admission a request with `cached_prefix` starts `Prefilling` with its `BlockTable` = attached blocks and prefill offset = `cached_tokens` (the tail block stays private); the driver runs, per iteration, `kv.poll` → attach retries for `WaitForPrefix`/`Promoting` requests → `refresh_reclaim_order` when free L0 < 10 % → `Scheduler::plan` → `kv.after_plan` → `SimExecutor` → `kv.commit_progress` for advanced sequences → `Scheduler::complete` → `request_done` for finished/cancelled → `apply_reclaim` and `tick`.
+- [ ] Run: `cargo test -p turbine-scheduler --test kv_sim` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(scheduler): attach cached prefixes and drive KV tiers in the simulator`
+
+## Task 12: `turbine-bench kv-sim` policy simulator
+
+Files: `benches/turbine-bench/src/kv_sim.rs` (arguments, workloads, replay, report), `benches/turbine-bench/src/lib.rs` (`pub mod kv_sim`), `benches/turbine-bench/src/main.rs` (dispatch `kv-sim` as the first argument to `KvSimArgs::parse_from`), `benches/turbine-bench/Cargo.toml` (depend on `turbine-kv`, `turbine-core`), `benches/turbine-bench/tests/kv_sim.rs` (policy comparison), `Cargo.toml` (`[profile.dev.package.turbine-kv] opt-level = 3`, `[profile.dev.package.turbine-bench] opt-level = 3`)
+Interfaces:
+
+- `pub struct KvSimArgs { pub workload: Workload, pub policy: PolicyArg, pub l0_blocks: u32, pub l1_blocks: u64, pub l2_blocks: u64, pub seed: u64, pub output: SimOutput }` (clap, flags per contract §19)
+- `pub enum Workload { MultiTurn, SharedSystem, Mixed }` (`multi-turn`, `shared-system`, `mixed`), `pub enum PolicyArg { CostAware, Lru }` (`cost_aware`, `lru`)
+- `pub struct KvSimReport { pub workload, pub policy: &'static str, pub requests: u64, pub hit_rate_by_tier: HitRateByTier { l0, l1, l2, miss }, pub recompute_tokens: u64, pub transfer_bytes: u64, pub evictions: u64, pub simulated_prefill_seconds: f64 }`
+- `pub fn workload(w: Workload, seed: u64) -> Vec<SimRequest>`, `pub fn run(args: &KvSimArgs) -> KvSimReport`
+  Covers: S-7, S-16; `turbine-bench -- kv-sim` commands, `kv_sim cost_aware_beats_lru`
+  Depends on: Task 10; phase-0 plan (`turbine-bench` binary)
+
+- [ ] Write failing test `benches/turbine-bench/tests/kv_sim.rs` `cost_aware_beats_lru`: runs each workload with `--l0-blocks 2048 --l1-blocks 8192 --seed 1` under both policies, asserts equal seeds produce equal reports, and `simulated_prefill_seconds` of `cost_aware` ≤ 0.9 × `lru` on `multi-turn` and `mixed` and ≤ 1.0 × on `shared-system`. Run: `cargo test -p turbine-bench --test kv_sim cost_aware_beats_lru` — expect FAIL.
+- [ ] Implement workloads (xorshift64*, virtual arrival times, merged by time): `multi-turn` = 160 sessions, 24 concurrent, 6–12 turns each of history + 200–1,200 new tokens and a 100–300-token reply, think time 20–180 s, hints `resume_within_secs: 200` and `end` on the last turn, 512-token shared prefix; `shared-system` = 1,500 requests over 8 Zipf-weighted 1,024-token system prompts + 32–128-token suffixes; `mixed` = 80 sessions (12 concurrent) + 800 shared-system requests + 300 one-off 2,048–4,096-token documents. Replay through `KvHierarchy` with payload-free `MemTier`s, `SimTransferBackend`, prefill 8,000 tok/s, decode 5 ms/token, reclaim to 0.70 at ≥ 0.82 L0 utilisation; `simulated_prefill_seconds` = Σ recomputed tokens / 8,000 + time waiting for promotions. Planning measured `multi-turn` 179.2 s vs 254.9 s (0.70), `mixed` 192.7 s vs 252.8 s (0.76), `shared-system` 15.9 s vs 15.9 s with this design.
+- [ ] Run: `cargo test -p turbine-bench --test kv_sim cost_aware_beats_lru` — expect PASS; then `cargo run -p turbine-bench -- kv-sim --workload mixed --policy cost_aware --l0-blocks 2048 --l1-blocks 8192 --seed 1 --output json` and the same with `--policy lru` — expect exit 0 and JSON keys `hit_rate_by_tier`, `recompute_tokens`, `transfer_bytes`, `evictions`, `simulated_prefill_seconds`.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(bench): kv-sim offline policy simulator`
+
+## Task 13: Kernel C ABI v3 — pinned memory, copy streams, events
+
+Files: `kernels/include/turbine_kernels.h` (ABI version 3 block per contract §9.3), `kernels/rocm/src/pinned.hip` (HIP implementation), `kernels/cuda/src/pinned.cu` (CUDA implementation), `kernels/rocm/CMakeLists.txt` and `kernels/cuda/CMakeLists.txt` (add the sources), `crates/turbine-kernels/src/ffi.rs` (symbols + `ShimStream`, `ShimEvent`), `crates/turbine-kernels/src/pinned.rs` (`impl PinnedMemory, PinnedOwner, CopyEngine for ShimContext`), `crates/turbine-kernels/src/lib.rs` (`TURBINE_KERNELS_ABI_VERSION` = 3), `crates/turbine-kernels/build.rs` (stub shims export the v3 symbols), `crates/turbine-kernels/tests/lab.rs` (`pinned_round_trip`, ignored)
+Interfaces:
+
+- C: `turbine_host_alloc_pinned`, `turbine_host_free_pinned`, `turbine_copy_stream_create/destroy`, `turbine_memcpy_async(ctx, s, dst, src, bytes, kind)`, `turbine_event_create/destroy/record/query/synchronize`, `turbine_stream_wait_event` (contract §9.3 signatures)
+- `impl PinnedMemory for ShimContext`, `impl CopyEngine for ShimContext` (one `ShimStream` per context, one `ShimEvent` per `CopyTicket`)
+  Covers: S-5, S-6, S-17; lab `cargo test -p turbine-kernels --test lab pinned_round_trip -- --ignored`
+  Depends on: Task 5; phase-1 plan (`ShimLibrary`, `ShimContext`, `check`, `unsafe_isolation`), phase-2b plan (CUDA shim)
+
+- [ ] Write failing test `crates/turbine-kernels/tests/lab.rs` `pinned_round_trip` (`#[ignore]`, `require_backend("hip")`): allocates two 1 GiB slabs through `alloc_pinned`, fills 1,000 random 1,835,008-byte GPU blocks, copies them device→pinned and back through `copy_async` with `wait`, asserts byte equality, asserts `poll` never reports a ticket complete before its event signals, and prints `pinned_round_trip d2h_gbps=<x> h2d_gbps=<y>`. Run: `cargo test -p turbine-kernels --test lab pinned_round_trip -- --ignored` on macOS — expect FAIL (`TURBINE_TEST_BACKEND` unset → panic naming it; the symbols are missing from the v2 stub).
+- [ ] Implement the shims: HIP `hipHostMalloc(&p, bytes, hipHostMallocDefault)` / `hipHostFree`, `hipStreamCreateWithFlags(&s, hipStreamNonBlocking)`, `hipMemcpyAsync` with `hipMemcpyHostToDevice/DeviceToHost/DeviceToDevice`, `hipEventCreateWithFlags(&e, hipEventDisableTiming)`, `hipEventRecord`, `hipEventQuery` (`hipErrorNotReady` → 0), `hipEventSynchronize`, `hipStreamWaitEvent(s, e, 0)`; CUDA the same with `cudaHostAlloc(&p, bytes, cudaHostAllocDefault)`, `cudaFreeHost`, `cudaStreamCreateWithFlags(…, cudaStreamNonBlocking)`, `cudaMemcpyAsync`, `cudaEventCreateWithFlags(…, cudaEventDisableTiming)`, `cudaEventQuery` (`cudaErrorNotReady` → 0). Verify each signature against `/opt/rocm/rocm/include/hip/hip_runtime_api.h` on novanas and `/usr/local/cuda-13.0/include/cuda_runtime_api.h` on dgx-spark (read-only SSH). In Rust every `unsafe` block has a `// SAFETY:` comment naming the owner: the pinned buffer is owned by exactly one `PinnedBuffer` and freed on its Drop; a slot's bytes are never read or written through `with_bytes_dyn` while a `CopyTicket` on it is unpolled; events and the copy stream are owned by the context and destroyed before it.
+- [ ] Run: `scripts/lab-test.sh novanas` (ASK THE USER FIRST: it needs one free R9700) — expect PASS with log line `test pinned_round_trip ... ok` and `pinned_round_trip d2h_gbps=` in the Job log; on macOS `cargo test --workspace` stays green with the test ignored.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(kernels): ABI v3 pinned host memory, copy streams and events`
+
+## Task 14: API — session hints, cache salt, cached tokens, KV routes
+
+Files: `crates/turbine-api/src/kv.rs` (header parsing and validation, prefetch body types), `crates/turbine-api/src/routes/diagnostics.rs` (`POST /turbine/v1/kv/prefetch` handler; `GET /turbine/v1/kv` unchanged path now returns the P4 document), `crates/turbine-api/src/routes/mod.rs` (register the prefetch route), `crates/turbine-api/src/routes/openai.rs` (accept `prompt_cache_key`, build `TurbineHeaders`, emit `usage.prompt_tokens_details.cached_tokens` incl. the final stream usage chunk), `crates/turbine-api/src/backend.rs` (`InferenceBackend::prefetch`, `TurbineHeaders`, `PrefetchRequest`, `PrefetchAccepted`), `crates/turbine-api/src/error.rs` (constructors for the P4 codes), `crates/turbine-core/src/request.rs` (`ErrorCode` P4 variants), `crates/turbine-api/tests/api.rs` (three tests against a simulated KV backend built on `KvHierarchy`)
+Interfaces:
+
+- `pub struct TurbineHeaders { pub session_resume_within: Option<u32>, pub session_end: bool, pub cache_salt: Option<String>, pub target_replica: Option<String> }` (contract §14.1)
+- `pub fn parse_turbine_headers(h: &HeaderMap, has_prompt_cache_key: bool) -> Result<TurbineHeaders, ApiError>`; `pub fn validate_session_id(id: &str) -> Result<(), ApiError>` (1–128 visible ASCII)
+- `pub enum PrefetchRequest { Session { session_id: String }, Prompt { prompt: String }, Messages { messages: Vec<ChatMessage> } }` plus `cache_salt: Option<String>`; `pub struct PrefetchAccepted { pub blocks_queued: u32, pub blocks_resident: u32 }`
+- `fn prefetch(&self, req: PrefetchRequest) -> BoxFuture<'_, Result<PrefetchAccepted, ApiError>>` (contract §14.1)
+- `ApiError::{invalid_session_id, invalid_session_hint, invalid_cache_salt, session_not_found, prefetch_queue_full, pressure_too_high}` (codes/statuses per §14.3)
+  Covers: S-1 (salt), S-3 (`cached_tokens`), S-10 (hints), S-13, S-14; `api cache_salt_isolates`, `api kv_routes`, `api kv_metrics_bounded`
+  Depends on: Tasks 3, 10; phase-0/1/2 plans (router, OpenAI types, SSE usage chunk)
+
+- [ ] Write failing test `api cache_salt_isolates`: the same 40-token prompt sent twice without salt (second `cached_tokens > 0`), then with `x-turbine-cache-salt: a` (0), again with `a` (> 0), then with `b` (0); a 129-character salt returns 400 `invalid_cache_salt`. Run: `cargo test -p turbine-api --test api cache_salt_isolates` — expect FAIL.
+- [ ] Write failing test `api kv_routes`: `GET /turbine/v1/kv` returns 200 with every key of the P4 §Data example (top level, each tier object, `hit_rate`, `sessions`, `prefetch`, `transfers`); `POST /turbine/v1/kv/prefetch` returns 202 `{"blocks_queued","blocks_resident"}` for a known session, 404 `session_not_found`, 429 `prefetch_queue_full` with a full queue, 409 `pressure_too_high` at ORANGE; a chat request with `prompt_cache_key: "s1"` raises `sessions.active` to 1; a 129-character `prompt_cache_key` → 400 `invalid_session_id`; `x-turbine-session-resume-within: 0` → 400 `invalid_session_hint`; `x-turbine-session-end: true` without `prompt_cache_key` → 400 `invalid_session_hint`. Run: `cargo test -p turbine-api --test api kv_routes` — expect FAIL.
+- [ ] Write failing test `api kv_metrics_bounded`: drives L0/L1/L2 hits, demotions, evictions, recomputes and all four prefetch outcomes through the simulated stack, renders `/metrics` and asserts every P4 family (`turbine_kv_blocks`, `turbine_kv_bytes`, `turbine_kv_lookups_total`, `turbine_kv_prefix_cached_tokens_total`, `turbine_kv_prompt_tokens_total`, `turbine_kv_promotions_total`, `turbine_kv_demotions_total`, `turbine_kv_evictions_total`, `turbine_kv_drops_total`, `turbine_kv_recompute_tokens_total`, `turbine_kv_plans_total`, `turbine_kv_transfer_seconds`, `turbine_kv_transfer_bytes_total`, `turbine_kv_transfer_bandwidth_bytes_per_second`, `turbine_kv_prefetch_total`, `turbine_kv_sessions`, `turbine_kv_tier_degraded`, `turbine_storage_queue_depth`, `turbine_storage_latency_seconds`) is present and every label value belongs to the documented sets. Run: `cargo test -p turbine-api --test api kv_metrics_bounded` — expect FAIL.
+- [ ] Implement: header validation per P4 §Session hints (resume-within integer 1..86400, end `true`/`false`, salt 1–128 visible ASCII, either session header without `prompt_cache_key` → `invalid_session_hint`); `prompt_cache_key` becomes `GenerationRequest.session` (`SessionHints`) and the salt `GenerationRequest.cache_salt`; the prefetch handler tokenizes `prompt`/`messages` like the OpenAI routes (through the backend) and maps `PrefetchError` to 404/429/409; usage carries `prompt_tokens_details: {cached_tokens}` from `Usage.cached_tokens`.
+- [ ] Run: `cargo test -p turbine-api --test api` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(api): session hints, cache salt, cached tokens and KV prefetch route`
+
+## Task 15: Server wiring — KV orchestrator, tiers, calibration, storage signals
+
+Files: `crates/turbine-server/src/kv_orchestrator.rs` (`KvOrchestrator` owning `KvHierarchy`, `CopyStreamBackend`, `IoPoolBackend`, command channel, calibration), `crates/turbine-server/src/startup.rs` (step 3 `validate_host` with MemTotal and free disk; step 9 L1/L2 construction, calibration, `KvReclaimHandle` registration), `crates/turbine-server/src/engine/mod.rs` (per-iteration hooks: poll, attach/commit, `after_plan`, `apply_reclaim`, `tick`, `set_l0_state`, `set_prefill_tps`), `crates/turbine-device/src/telemetry/mod.rs` (fill `TelemetrySample.storage: Option<StorageSample>` from the orchestrator's published L2 queue depth and p99), `crates/turbine-reliability/src/signals.rs` (evaluate `storage_queue_depth`, `storage_latency` with the §8.3 thresholds), `crates/turbine-server/tests/server_cli.rs` (startup failure test)
+Interfaces:
+
+- `pub struct KvOrchestrator` with `pub fn start(cfg: &KvConfig, layout: &KvLayout, memory_kind: MemoryKind, identity: ModelIdentity, ctx: Option<Arc<ShimContext>>, clock: Arc<dyn Clock>, metrics: KvMetrics) -> Result<(KvOrchestrator, KvHandle), StartupError>`; `pub struct KvHandle` (Tokio side: `prefetch`, `document`) over a bounded `tokio::sync::mpsc::Sender<KvCommand>` of capacity `kv.prefetch.max_queue`
+- `pub struct CopyStreamBackend` implementing `TransferBackend` over `Arc<dyn CopyEngine>` + `L1PinnedTier::{reserve, commit}` + the pool's per-layer block segments (`BlockPool::block_segments(&self, b: BlockId) -> SmallVec<[(DevicePtr, usize); 32]>`, contract addition); unified devices copy L0↔L2 through a pinned bounce buffer of one block
+- `pub struct IoPoolBackend` implementing `TransferBackend` for L1↔L2 on `kv.nvme.io_threads` threads with a queue bounded by `kv.nvme.max_queue_depth`
+- consumes `turbine_core::telemetry::StorageSample { queue_depth, max_queue_depth, p99_latency_s, calibration_latency_s }`, `PressureSignal::{StorageQueueDepth, StorageLatency}`
+  Covers: S-5 (startup rules), S-6 (calibration), S-8 (reclaimer wiring), S-11 (signals, path creation); `server_cli kv_startup_rules` (contract addition)
+  Depends on: Tasks 1, 10, 13, 14; phase-3 plan (controller, telemetry, `KvReclaimer` registration)
+
+- [ ] Write failing test `server_cli kv_startup_rules`: starting the binary with `kv.nvme.enabled: true` and `kv.nvme.path` pointing at a read-only temp directory exits 1 naming the path before binding; with `kv.cpu.max_bytes` above MemTotal − host reserve it exits 2 naming `kv.cpu.max_bytes`. Run: `cargo test -p turbine-server --test server_cli kv_startup_rules` — expect FAIL.
+- [ ] Implement startup: after discovery read MemTotal with the phase-3 `turbine_device::telemetry::proc::parse_meminfo` and the free space of `kv.nvme.path` with a new `pub fn disk_free_bytes(path: &Path) -> std::io::Result<u64>` in `crates/turbine-device/src/telemetry/proc.rs` that runs `df -Pk <path>` (POSIX output, works on Linux and macOS, no new dependency) and multiplies the "Available" column by 1024, then call `Config::validate_host`; create `kv.nvme.path` if absent. L1 is built only on `MemoryKind::Dedicated` with a GPU context (no pinned API → WARN, L0 only; explicit `kv.cpu.enabled: true` and a failing first slab → exit 1 naming the error); L2 `open` failure → exit 1 naming the path; calibration copies 64 MiB per enabled path, seeds `TransferEngine::seed` and `L2NvmeTier::set_calibration`, logs INFO `kv_calibration` with every measured bandwidth, and on failure seeds `TransferPath::fallback()` with a WARN. The engine loop runs the hierarchy hooks in the order of Task 11's driver and passes `KvHierarchy::reclaimer()` to the phase-3 controller as its `KvReclaimer`.
+- [ ] Run: `cargo test -p turbine-server --test server_cli kv_startup_rules` — expect PASS; `cargo test --workspace` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(server): KV orchestrator, tier startup, calibration and storage signals`
+
+## Task 16: GPU correctness — prefix reuse and NVMe round trip
+
+Files: `crates/turbine-server/tests/kv_gpu.rs` (two ignored lab tests), `scripts/lab/phase4-novanas.yaml` (Llama config with `kv.nvme.enabled: true`, `kv.nvme.path: /home/piwi/turbine-kv`, `kv.nvme.max_bytes: 64GiB`), `scripts/lab/novanas-test-job.yaml` (hostPath mount of `/home/piwi/turbine-kv`), `scripts/lab-test.sh` (Spark container: `-v /home/piwi/turbine-kv:/home/piwi/turbine-kv`)
+Interfaces:
+
+- consumes the `turbine-server` binary, `TURBINE_TEST_MODEL_DIR`, `turbine_kernels::test_support::require_backend`
+  Covers: S-3, S-11, S-17; lab `kv_gpu prefix_reuse_matches_cold`, lab `kv_gpu nvme_round_trip_matches_cold`
+  Depends on: Task 15
+
+- [ ] Write failing test `kv_gpu prefix_reuse_matches_cold` (`#[ignore]`): starts the server on the test model, sends 5 prompts with `kv.prefix_sharing: false` (cold), restarts with sharing on and sends each twice, greedy 64 tokens; asserts identical token ids between cold and warm and `cached_tokens > 0` on every warm run. Run: `cargo test -p turbine-server --test kv_gpu prefix_reuse_matches_cold -- --ignored` on macOS — expect FAIL (backend variable unset).
+- [ ] Write failing test `kv_gpu nvme_round_trip_matches_cold` (`#[ignore]`): with `kv.nvme.path: /home/piwi/turbine-kv`, `kv.nvme.max_bytes: 64GiB`, `kv.gpu.max_bytes: 1GiB` and `kv.cpu.max_bytes: 1GiB` (small tiers so demotion is forced), warms prompt A, then sends long filler prompts until `turbine_kv_demotions_total{from="l1",to="l2"}` (novanas) or `{from="l0",to="l2"}` (dgx-spark, L1 disabled) covers A's blocks, then re-sends A; asserts greedy tokens identical to A's cold run, `turbine_kv_promotions_total{from="l2"}` > 0, zero `turbine_kv_evictions_total{reason="checksum"}` (every promoted block's CRC32C matched the value recorded when it was written, i.e. byte-identical), and total size of `turbine-kv-*.slab` under the path ≤ 64 GiB. Run: `cargo test -p turbine-server --test kv_gpu nvme_round_trip_matches_cold -- --ignored` on macOS — expect FAIL (backend variable unset).
+- [ ] Implement the helpers the tests use (server spawn with a temp config derived from `scripts/lab/phase4-novanas.yaml`, greedy request, metric scrape) and the hostPath/volume additions to the lab runner; nothing else changes in the serving path.
+- [ ] Run: `scripts/lab-test.sh novanas` (ASK THE USER FIRST: one free R9700 and room for 64 GiB under `/home/piwi/turbine-kv`) — expect PASS with log lines `test prefix_reuse_matches_cold ... ok` and `test nvme_round_trip_matches_cold ... ok`; then, once the NVIDIA path exists, `scripts/lab-test.sh dgx-spark` (ASK THE USER FIRST: room beside production vLLM) — expect the same two lines.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `test(server): GPU prefix-reuse and NVMe round-trip correctness`
+
+## Task 17: `turbine-bench` multi-turn profile and the lab TTFT run
+
+Files: `benches/turbine-bench/src/args.rs` (`--profile multi-turn`, `--sessions`, `--turns`, `--shared-prefix-words`, `--think-time <min>..<max>`, `--session-hints`), `benches/turbine-bench/src/multi_turn.rs` (session driver), `benches/turbine-bench/src/report.rs` (`cached_tokens_ratio`, `ttft_ms_first_turn`, `ttft_ms_later_turns`), `benches/turbine-bench/tests/bench.rs` (mock-endpoint test)
+Interfaces:
+
+- `pub enum Profile { Default, MultiTurn }`; `pub async fn run_multi_turn(args: &BenchArgs) -> Result<Report, BenchError>`
+- report additions `pub cached_tokens_ratio: Option<f64>`, `pub ttft_ms_first_turn: Option<Percentiles>`, `pub ttft_ms_later_turns: Option<Percentiles>`
+  Covers: S-16; `bench multi_turn_profile` (contract addition), manual lab multi-turn run
+  Depends on: Tasks 14, 15; phase-0 and phase-3 bench plans
+
+- [ ] Write failing test `bench multi_turn_profile`: against the mock OpenAI endpoint, `--profile multi-turn --sessions 3 --turns 4 --shared-prefix-words 50 --session-hints` sends 12 requests, each turn's prompt = shared prefix + full history + new message, sequential within a session, `prompt_cache_key` and `x-turbine-session-resume-within` = max think time on every turn and `x-turbine-session-end: true` on the last; the JSON report has `cached_tokens_ratio` equal to the mock's cached/prompt ratio and both TTFT splits. Run: `cargo test -p turbine-bench --test bench multi_turn_profile` — expect FAIL.
+- [ ] Implement the session driver on the existing streaming client (sessions concurrent up to `--concurrency`, seeded think time between turns) and the report fields.
+- [ ] Run: `cargo test -p turbine-bench --test bench multi_turn_profile` — expect PASS.
+- [ ] Lab (ASK THE USER FIRST: a free R9700): `scripts/lab-serve.sh novanas scripts/lab/phase4-novanas.yaml`, then `turbine-bench --url http://192.168.10.203:18000 --profile multi-turn --sessions 16 --turns 8 --shared-prefix-words 2000 --concurrency 8 --session-hints --output json` with `kv.prefix_sharing` on and again off (`--set kv.prefix_sharing=false`); paste both JSON reports into the task evidence and require `cached_tokens_ratio` ≥ 0.6 with sharing on and `ttft_ms_later_turns.p50` ≤ 0.5 × the sharing-off value; expected serve log line `kv_calibration`; stop with `scripts/lab-serve.sh novanas --stop`. Repeat on dgx-spark once the NVIDIA path exists (ASK THE USER FIRST).
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(bench): multi-turn session profile with cached-token and per-turn TTFT report`

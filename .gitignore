@@ -1,0 +1,9 @@
+
+# Local AI coding hosts (procoder init); .procoder/ stays trackable.
+/.claude/
+
+# Build output and procoder derived state
+/target/
+.procoder/index/
+.procoder/state/
+.lycheecache

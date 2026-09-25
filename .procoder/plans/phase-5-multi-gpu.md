@@ -1,0 +1,360 @@
+# phase-5-multi-gpu — implementation plan
+
+Status: draft
+Spec: .procoder/specs/phase-5-multi-gpu.md
+
+## Goal
+
+Let one Turbine process drive several GPUs: discover the node-local topology graph, abstract collectives behind a backend-neutral `Collective` trait with a host reference backend and one runtime-loaded NCCL-API binding (RCCL now, NCCL later), plan single-vendor TP groups and DP replicas from link classes, run TP (local and static rank modes) and DP behind one API, and account pressure per device, group and replica — proven on the novanas R9700 pair.
+
+## Architecture
+
+`turbine-device::topology` builds a typed `TopologyGraph` from a sysfs root plus a `TopologyVendor` (amd-smi / NVML) and never fails. The new crate `turbine-distributed` holds `collective` (trait, `host` backend over `turbine_tensor::host::HostMemory`, `ffi` — the only `unsafe` module — with `NcclApi` and the watchdog-guarded `NcclCollective`), `plan` (config + inventory + graph → `ParallelPlan`, before bind), `rank` (leader/worker lockstep over bounded channels in `local` mode or postcard-framed TCP in `static` mode), `tp` (pure sharding rules), `router` (DP replica choice) and the `turbine-collbench` binary. `turbine-model` shards weights and inserts collectives through `TpContext`, kernel C ABI v4 supplies the stream handle and the sharded-norm/fill ops, `turbine-reliability::multi_device` adds group state, atomic group reservations and shared-device budgets, and `turbine-server` builds one engine per DP replica and one `RankRuntime` per TP group.
+
+## Constraints
+
+Copied verbatim from the spec (Constraints):
+
+- Rust only; no Python in the build or runtime path (TS §21 rule 4). RCCL and NCCL are loaded at runtime; nothing links against them at build time, so the workspace still builds and every non-ignored test passes on macOS arm64 with no GPU libraries.
+- `unsafe` and FFI stay isolated (TS §21 rule 10): in `turbine-distributed` only the module `collective::ffi` may contain `unsafe`; the crate root has `#![deny(unsafe_code)]` and that module carries `#[allow(unsafe_code)]`, each block with a `// SAFETY:` comment naming the owner of every device pointer, stream and communicator it touches. Device buffers and streams come from the phase-1 device layer; `turbine-distributed` never allocates model memory. The phase-1 `unsafe_isolation` allowlist gains exactly that one module.
+- New dependency, with its reason: `postcard` (compact serde framing for the static-mode rank protocol; no schema compiler). Local mode uses bounded `std::sync::mpsc::sync_channel`.
+- Every queue is bounded (TS §21 rule 8): the leader→worker plan channel holds at most _parallel.plan_queue_depth_ plans (default 2); frames on the static-mode socket are capped at 16 MiB.
+- No collective call may block forever: communicator init is bounded by `parallel.collective.init_timeout` and each step's collectives by `parallel.collective.op_timeout`; on expiry the communicator is aborted, the group enters the phase-3 circuit breaker as `CIRCUIT_OPEN`, and the reason is logged.
+- Every automatic decision (device grouping, vendor choice, backend choice, replica routing, pressure state of a group) emits a structured log line with a reason code and a metric (TS §14, §21 rule 7).
+- Correctness before speed (TS §21 rule 1): TP=2 must meet the phase-1 golden tolerance (≥ 14/16 prompts with the first 32 greedy tokens identical, top-5 |Δlogprob| ≤ 0.15 nats against the committed HF transformers BF16 fixtures) before any TP performance work is accepted.
+- Lab: Phase 5 hardware runs are on novanas only (k3s Job, `amd.com/gpu: 2`, `rust:1.97-trixie` image as in phase-0/phase-1 (CONFLICT C-7), hostPath `/opt/rocm/rocm` read-only; RCCL is `/opt/rocm/rocm/lib/librccl.so.1`). Ports are loopback inside the Job (HTTP 18000, static-mode leader 18100); no Service or host port is created. Read-only topology checks also run under `scripts/lab-test.sh dgx-spark`. Memory is capped by the phase-3 device budget.
+- Before any lab run that needs production workloads moved, GPUs emptied or memory freed on any host, the implementer asks the user first and waits; scripts never evict, scale or stop other workloads, and a Job that cannot be scheduled (GPUs in use) makes the script exit non-zero naming that reason.
+- With peer access disabled on novanas, RCCL uses host-staged transfers; the topology graph must report `p2p: disabled` rather than assume.
+
+From the interface contract (`.procoder/contract/interfaces.md`, binding):
+
+- Toolchain edition 2024, `rust-version = "1.97"`; `#[non_exhaustive]` on enums later phases extend; config structs `#[serde(deny_unknown_fields, default)]`; one `thiserror` error enum per crate; time through `Arc<dyn Clock>`.
+- `turbine-distributed` sets `unsafe_code = "deny"` in its manifest with `#[allow(unsafe_code)]` only on `collective::ffi` (file `crates/turbine-distributed/src/collective/ffi.rs`); the `unsafe_isolation` allowlist adds exactly `crates/turbine-distributed/src/collective/ffi` (§1.3, CONFLICT C-19).
+- `turbine-distributed` depends on core, observability, tensor, device, reliability, kv; `turbine-model` may depend on `turbine-distributed` (`collective`, `tp`); `turbine-reliability` never depends on `turbine-device`.
+- Durations accept `ms`, `s`, `m`, `h` through the one parser (CONFLICT C-14); an incomplete group reservation queues with `PressureReason::KvReservation` (CONFLICT C-11); the novanas lab image is `rust:1.97-trixie` with hostPath ROCm (CONFLICT C-7); golden fixtures live under `tests/golden/llama-3.2-3b-instruct/` and `tests/golden/olmoe-1b-7b-0125-instruct/` (CONFLICT C-15).
+- Kernel C ABI v4 (§9.1): `turbine_stream_native_handle`, ops `row_sumsq`, `rmsnorm_sharded`, `fill` in both shims; `TURBINE_KERNELS_ABI_VERSION` = 4.
+- Metric labels from closed enums; `device` and `replica` rendered as decimal indices; pressure states upper-case (CONFLICT C-5).
+- `/turbine/v1/scheduler` becomes an object keyed by replica index (`{"0": {…}}`); `/ready` adds `collective_init`, `loading_weights`, `rank_missing`; static-mode workers answer inference routes with 503 `not_leader`.
+- Lab: `scripts/lab-cluster.sh [--dry-run] <collbench-novanas|tp2-novanas|dp2-novanas>`, one k3s Job labelled `turbine-lab=true` in namespace `turbine-ci`; no `docker run` outside lab scripts.
+
+## Task 1: `parallel` configuration section
+
+Files: `crates/turbine-core/src/config/parallel.rs` (section structs, value types, static validation, unit test), `crates/turbine-core/src/config/mod.rs` (add `Config.parallel`, call `self.parallel.validate()?`), `examples/turbine.yaml` (document the section)
+Interfaces:
+
+- `pub struct ParallelConfig { pub tensor_parallel_size: SizeOrAuto, pub data_parallel_size: SizeOrAuto, pub devices: DeviceSelection, pub collective_backend: CollectiveBackendChoice, pub nccl_library: Option<PathBuf>, pub rccl_library: Option<PathBuf>, pub allow_device_sharing: bool, pub plan_queue_depth: u32, pub router: DpRouterPolicy, pub collective: CollectiveTimeouts, pub ranks: RanksConfig }`
+- `pub enum SizeOrAuto { Auto, Size(u32) }` (YAML integer or `auto`), `pub enum DeviceSelection { Auto, List(Vec<DeviceId>) }`, `pub enum CollectiveBackendChoice { Auto, Nccl, Rccl, Host }`, `pub enum DpRouterPolicy { PrefixAffinity, LeastLoaded }`, `pub enum RankMode { Local, Static }`
+- `pub struct CollectiveTimeouts { pub init_timeout: HumanDuration, pub op_timeout: HumanDuration }` (contract addition: struct name for `parallel.collective`), `pub struct RanksConfig { pub mode: RankMode, pub rank: u32, pub leader: Option<SocketAddr>, pub local_devices: Vec<DeviceId> }` (contract addition: struct name for `parallel.ranks`)
+- `impl ParallelConfig { pub fn validate(&self) -> Result<(), ConfigError>; pub fn validate_devices(&self, inv: &[(DeviceId, Vendor, Option<String>)]) -> Result<(), ConfigError> }`
+  Covers: S-4 (configuration); `config::tests::parallel_rejections`
+  Depends on: phase-0 plan (loader), phase-2 plan (`HumanDuration`), phase-3 plan (config sections)
+
+- [ ] Write failing test `config::tests::parallel_rejections`: asserts the defaults (tp 1, dp 1, `devices: auto`, backend `auto`, depth 2, router `prefix_affinity`, 120s/30s, mode `local`, `local_devices: [0]`) and that each of these fails with an error naming its key: `tensor_parallel_size: 3`, `tensor_parallel_size: 16`, `data_parallel_size: 0`, `devices: [0, 0]` with tp 2, `collective_backend: host` with tp 2 and inventory device 0 a GPU (`validate_devices`), `ranks.mode: static` with tp 1, `ranks.mode: static` without `ranks.leader`, `collective.op_timeout: 50ms`, `collective.op_timeout: 30 s`. Run: `cargo test -p turbine-core config::tests::parallel_rejections` — expect FAIL.
+- [ ] Implement: static rules from the spec's table (tp 1..8 power of two; dp 1..64; depth 1..16; init 1 s..30 m; op 100 ms..10 m; `static` requires tp > 1 and dp = 1 and a leader; `rank < tp`; exactly one `local_devices` entry in `static`); inventory rules in `validate_devices` (indices exist, one vendor, no index twice in a TP group, list length = tp × dp unless sharing, `host` backend with GPUs and tp > 1 rejected, `rccl` with NVIDIA / `nccl` with AMD rejected). Model-dependent head divisibility lives in the planner (Task 10). `"30 s"` fails in the shared duration parser because of the space.
+- [ ] Run: `cargo test -p turbine-core config::tests::parallel_rejections` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(core): parallel configuration section with static validation`
+
+## Task 2: Node-local topology discovery
+
+Files: `crates/turbine-device/src/topology/mod.rs` (graph types, `TopologyVendor`, assembly, unit tests), `crates/turbine-device/src/topology/sysfs.rs` (NUMA, PCIe tree, NICs, InfiniBand, NVMe parsers over a sysfs root), `crates/turbine-device/src/topology/vendor.rs` (`AmdSmiTopology`, `NvmlTopology`, `NoVendorTopology`), `crates/turbine-device/src/discovery/amd_smi.rs` (resolve `amdsmi_topo_get_link_type`, `amdsmi_is_P2P_accessible`), `crates/turbine-device/tests/fixtures/topology/novanas/capture.txt`, `crates/turbine-device/tests/fixtures/topology/dgx-spark/capture.txt` (captured sysfs files as `path<TAB>content` lines plus `vendor.json`), `crates/turbine-device/src/lib.rs`
+Interfaces:
+
+- `pub fn discover_topology(sysfs_root: &Path, inventory: &DeviceInventory, vendor: &mut dyn TopologyVendor) -> TopologyGraph` (contract §5.3; never fails)
+- `pub trait TopologyVendor { fn link(&mut self, a: &DeviceInfo, b: &DeviceInfo) -> Result<VendorLink, String>; fn gpu_nic_p2p(&mut self, gpu: &DeviceInfo) -> Result<Option<P2pStatus>, String>; fn coherent_host_link(&mut self, gpu: &DeviceInfo) -> Result<Option<String>, String>; }` and `pub struct VendorLink { pub kind: EdgeKind, pub path: PathClass, pub hops: Option<u32>, pub p2p: P2pStatus }` (contract additions)
+- `pub struct TopologyGraph { pub node: TopologyNode, pub vertices: Vec<Vertex>, pub edges: Vec<Edge> }`, `Vertex`, `VertexKind`, `VertexAttrs`, `Edge`, `EdgeKind`, `PathClass` (with `pub fn rank(self) -> u8`, NVLink/xGMI best … SYS worst), `P2pStatus`, `AttrSource` per contract §5.3
+- test helper `pub fn materialize_capture(capture: &Path, into: &Path) -> std::io::Result<()>` (`#[doc(hidden)]`, writes the capture lines as files)
+  Covers: S-1; `topology::tests::novanas_fixture`, `topology::tests::spark_fixture`, `topology::tests::missing_sources_degrade`
+  Depends on: phase-0 plan (inventory, amd-smi and NVML loaders)
+
+- [ ] Write failing test `topology::tests::novanas_fixture`: materialises the novanas capture (two gfx1201 GPUs at 32 GT/s x16, `numa_node` = -1, amd-smi link type PCIE, 2 hops, P2P accessible false) and asserts exactly one GPU↔GPU edge with `kind: pcie`, `path: sys`, `p2p: disabled`, `hops: 2`, `source: vendor`, and both GPU vertices with `numa: 0`, `numa_source: nominal`, plus one WARN per `numa_node = -1`. Run: `cargo test -p turbine-device topology::tests::novanas_fixture` — expect FAIL.
+- [ ] Write failing test `topology::tests::spark_fixture`: the dgx-spark capture yields one `gpu` vertex, four `nic` vertices with RDMA devices `rocep1s0f0`, `rocep1s0f1`, `roceP2p1s0f0`, `roceP2p1s0f1` (two at 200 Gb/s), a `coherent` GPU↔`numa0` edge with `vendor_interconnect: nvlink_c2c`, and `p2p: unknown` on every GPU↔NIC edge. Run: `cargo test -p turbine-device topology::tests::spark_fixture` — expect FAIL.
+- [ ] Write failing test `topology::tests::missing_sources_degrade`: an empty sysfs root with a vendor whose calls all return `Err` produces a graph (no panic) with the GPU vertices from the inventory, `unknown`/`null` attributes without `source`, the GPU↔GPU path `sys`, and exactly one WARN per missing source (`numa`, `pci`, `net`, `infiniband`, `nvme`, `vendor_link`). Run: `cargo test -p turbine-device topology::tests::missing_sources_degrade` — expect FAIL.
+- [ ] Implement: NUMA from `devices/system/node/node*/{cpulist,meminfo,distance}`; PCIe tree by resolving `bus/pci/devices/<bdf>` symlinks to their parent chain (root ports → `pcie_root`, bridges with class `0x0604` → `pcie_switch`), `current_link_speed` (e.g. `32.0 GT/s PCIe`) and `current_link_width`; NICs from `class/net/<if>/{device,speed,address}` joined to `class/infiniband/<dev>/{device,ports/1/link_layer,ports/1/rate}`; IPv4 addresses from `/proc/net/fib_trie` under the same root; NVMe from `class/nvme`. GPU↔GPU edges come from the vendor (`amdsmi_topo_get_link_type(src, dst, &hops, &type)`, `amdsmi_is_P2P_accessible(src, dst, &bool)`; NVML `Device::topology_common_ancestor` and `Device::p2p_status(&other, P2pCapabilitiesIndex::Read)` in nvml-wrapper 0.13), else from the PCIe tree with `source: nominal`; failures leave `unknown` and log WARN once per source.
+- [ ] Run: `cargo test -p turbine-device topology::tests` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(device): node-local topology graph from sysfs and vendor links`
+
+## Task 3: `GET /turbine/v1/topology`
+
+Files: `crates/turbine-api/src/backend.rs` (`Diagnostics::topology`, `TopologyScope`), `crates/turbine-api/src/routes/diagnostics.rs` (handler), `crates/turbine-api/src/routes/mod.rs` (route), `crates/turbine-server/src/startup.rs` (capture the graph after discovery with `discover_topology(Path::new("/sys"), …)` and log `topology_captured`), `crates/turbine-api/tests/api.rs` (test)
+Interfaces:
+
+- `fn topology(&self, scope: TopologyScope) -> Result<serde_json::Value, ApiError>` (contract §14.1), `pub enum TopologyScope { Node }` (`#[non_exhaustive]`; P6 adds `Cluster`)
+  Covers: S-1; `api topology_route`
+  Depends on: Task 2; phase-0 plan (router, `Diagnostics`)
+
+- [ ] Write failing test `api topology_route`: with a diagnostics fake returning a two-GPU graph, `GET /turbine/v1/topology` returns 200 whose `vertices` and `edges` arrays equal the injected graph's serialisation. Run: `cargo test -p turbine-api --test api topology_route` — expect FAIL.
+- [ ] Implement the route (query `scope=node` optional; other values 400 `unsupported_parameter` until P6) and the server's capture at startup.
+- [ ] Run: `cargo test -p turbine-api --test api topology_route` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(api): node topology diagnostics route`
+
+## Task 4: `turbine-distributed` crate, `Collective` trait and host backend
+
+Files: `crates/turbine-distributed/Cargo.toml` (new crate; `unsafe_code = "deny"`; deps core, observability, tensor, device, reliability, kv, `postcard`, `libloading`, `half`), `crates/turbine-distributed/src/lib.rs` (`#![deny(unsafe_code)]`, modules), `crates/turbine-distributed/src/collective/mod.rs` (trait, `ReduceOp`, `CollectiveError`, `CollectiveMetrics`), `crates/turbine-distributed/src/collective/host.rs` (thread-rank reference backend + unit tests), `Cargo.toml` (member, workspace deps `postcard = { version = "1", features = ["use-std"] }`)
+Interfaces:
+
+- `pub trait Collective: Send + Sync` exactly as contract §15.1 (P5 methods; `all_to_all_v` arrives with P7), `pub enum ReduceOp { Sum, Max }`, `pub use turbine_core::types::CollectiveBackendKind`
+- `pub enum CollectiveError { Timeout { op: &'static str, after: Duration }, RemoteAbort { rank: usize }, Backend { code: i32, message: String }, ShapeMismatch, Unavailable { library: String, detail: String } }`
+- `impl HostCollective { pub fn group(world: usize, op_timeout: Duration) -> Vec<HostCollective>; pub fn with_dtype(self, dtype: DType) -> Self }` (DType BF16 or F32 decides element interpretation; contract addition)
+- `pub struct CollectiveMetrics` with `register(reg: &MetricsRegistry) -> Self`, `observe(op: CollectiveOp, backend: CollectiveBackendKind, bytes: u64, seconds: f64)`, `error(backend, kind: CollectiveErrorKind)`; `pub enum CollectiveOp { AllReduce, AllGather, ReduceScatter, Broadcast, Barrier }`
+  Covers: S-2; `collective::host::tests::ops_match_reference`, `collective::host::tests::op_timeout_aborts`
+  Depends on: phase-1 plan (`DeviceSlice::{read_bytes, write_bytes}`, `StreamRef`, `host::HostMemory`)
+
+- [ ] Write failing test `collective::host::tests::ops_match_reference`: for world sizes 1, 2, 3, 4, 8 and FP32 and BF16 buffers of 1, 7 and 4099 elements (seeded values), runs all-reduce (Sum and Max), all-gather, reduce-scatter and broadcast on one thread per rank and asserts each rank's result equals a naive single-threaded computation bit for bit (BF16 sums accumulate in FP32 in rank order 0..n then round once). Run: `cargo test -p turbine-distributed collective::host::tests::ops_match_reference` — expect FAIL.
+- [ ] Write failing test `collective::host::tests::op_timeout_aborts`: with `op_timeout` 500 ms and world 2, rank 1 never enters; rank 0's all-reduce returns `Timeout { op: "all_reduce", .. }` within 1.5 s and every later call on either rank returns `RemoteAbort`. Run: `cargo test -p turbine-distributed collective::host::tests::op_timeout_aborts` — expect FAIL.
+- [ ] Implement the host backend: a shared rendezvous (`Mutex` + `Condvar`) per operation generation; each rank deposits its bytes, the last arrival computes the result in rank order and releases the others; waits use `wait_timeout` and on expiry set a shared aborted flag (then every call returns `RemoteAbort`); lengths that disagree return `ShapeMismatch`; buffers are read/written through `DeviceSlice::read_bytes`/`write_bytes` over `HostMemory`.
+- [ ] Run: `cargo test -p turbine-distributed collective::host::tests` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(distributed): collective trait and deterministic host backend`
+
+## Task 5: Runtime-loaded NCCL-API binding and the unsafe allowlist
+
+Files: `crates/turbine-distributed/src/collective/ffi.rs` (`#[allow(unsafe_code)]`; `NcclApi` binding table, version check, unit tests), `crates/turbine-distributed/build.rs` (compile `tests/stub/nccl_stub.c` with `cc` into `librccl.so.1`, `libnccl.so.2` and a low-version variant under `OUT_DIR`), `crates/turbine-distributed/tests/stub/nccl_stub.c` (the 13 symbols; version from `-DSTUB_VERSION`), `crates/turbine-kernels/tests/unsafe_isolation.rs` (allowlist + one path)
+Interfaces:
+
+- `impl NcclApi { pub fn load(kind: CollectiveBackendKind, explicit: Option<&Path>) -> Result<Arc<NcclApi>, CollectiveError>; pub fn load_from(path: &Path, kind: CollectiveBackendKind) -> Result<Arc<NcclApi>, CollectiveError>; pub fn backend(&self) -> CollectiveBackendKind; pub fn version(&self) -> i32; pub fn path(&self) -> &Path }` (`load_from` is a contract addition used by tests)
+- `pub const RCCL_MIN_VERSION: i32` (the `NCCL_VERSION_CODE` of the RCCL shipped with ROCm 7.14.1, read from `/opt/rocm/rocm/include/rccl/rccl.h` on novanas), `pub const NCCL_MIN_VERSION: i32 = 22_700`
+- resolved symbols (exactly 13): `ncclGetVersion`, `ncclGetUniqueId`, `ncclCommInitRankConfig`, `ncclCommGetAsyncError`, `ncclCommAbort`, `ncclCommDestroy`, `ncclAllReduce`, `ncclAllGather`, `ncclReduceScatter`, `ncclBroadcast`, `ncclGroupStart`, `ncclGroupEnd`, `ncclGetErrorString`
+  Covers: S-2; `collective::ffi::tests::missing_library`, `collective::ffi::tests::one_binding_both_libraries`, `turbine-kernels --test unsafe_isolation`
+  Depends on: Task 4; phase-1 plan (`unsafe_isolation` test)
+
+- [ ] Write failing test `collective::ffi::tests::missing_library`: on macOS `NcclApi::load(Rccl, None)` and `load(Nccl, None)` each return `Unavailable` whose detail carries the loader message, and `load(Rccl, Some("/nonexistent/librccl.so.1"))` returns an error whose text names that path; nothing panics. Run: `cargo test -p turbine-distributed collective::ffi::tests::missing_library` — expect FAIL.
+- [ ] Write failing test `collective::ffi::tests::one_binding_both_libraries`: `load_from` of the stub named `librccl.so.1` reports backend `rccl` and of the stub named `libnccl.so.2` reports `nccl`, both through the same `NcclApi` type with all 13 symbols resolved and `version()` equal to the stub's; the low-version stub is rejected with `Unavailable` naming the version; a stub missing `ncclGroupEnd` (built with `-DSTUB_OMIT_GROUP_END`) is rejected naming the symbol. Run: `cargo test -p turbine-distributed collective::ffi::tests::one_binding_both_libraries` — expect FAIL.
+- [ ] Extend `crates/turbine-kernels/tests/unsafe_isolation.rs` with `crates/turbine-distributed/src/collective/ffi` and run `cargo test -p turbine-kernels --test unsafe_isolation` — expect FAIL until the module exists, then it must also fail if `unsafe` appears anywhere else in `turbine-distributed`.
+- [ ] Implement with `libloading::Library::new` (0.9); default search: RCCL `/opt/rocm/lib/librccl.so.1`, then `librccl.so.1` on the loader path; NCCL `libnccl.so.2` on the loader path; an explicit path that fails is fatal naming it. Kind is taken from the file name the caller asked for (`librccl*` → `rccl`, `libnccl*` → `nccl`). Symbols are copied out as `extern "C"` function pointers while the `Library` stays owned by `NcclApi`; each `unsafe` block states that the library outlives every pointer copied from it. The stub C file implements the 13 functions with the NCCL signatures (`ncclResult_t` = int, `ncclUniqueId` = 128 bytes) and simple host semantics for world size 1.
+- [ ] Run: `cargo test -p turbine-distributed collective::ffi::tests && cargo test -p turbine-kernels --test unsafe_isolation` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(distributed): one runtime-loaded NCCL-API binding for RCCL and NCCL`
+
+## Task 6: Kernel C ABI v4 — stream handle, sharded norm, fill
+
+Files: `kernels/include/turbine_kernels.h` (v4 block of contract §9.3), `kernels/rocm/src/sharded_norm.hip` and `kernels/cuda/src/sharded_norm.cu` (`row_sumsq`, `rmsnorm_sharded`, `fill` trios), `kernels/rocm/src/context.hip` and `kernels/cuda/src/context.cu` (`turbine_stream_native_handle`), both `CMakeLists.txt`, `crates/turbine-kernels/src/ffi.rs` (`RowSumsqDesc`, `RmsnormShardedDesc`, `FillDesc`, symbols), `crates/turbine-kernels/src/ops/norm.rs` and `ops/elementwise.rs` (safe wrappers), `crates/turbine-kernels/src/cpu/` (CPU reference of the three ops), `crates/turbine-kernels/src/lib.rs` (`TURBINE_KERNELS_ABI_VERSION` = 4; `StreamRef` native handle filled from v4), `crates/turbine-kernels/build.rs` (stub exports), `crates/turbine-kernels/tests/hip_ops.rs` (`sharded_norm_ops`, ignored)
+Interfaces:
+
+- C: `int32_t turbine_stream_native_handle(turbine_ctx*, turbine_stream*, void**)`, `turbine_row_sumsq[_supported|_impl]`, `turbine_rmsnorm_sharded[…]`, `turbine_fill[…]` with the descriptor structs of contract §9.3
+- `OpKind::{RowSumsq, RmsnormSharded, Fill}`; `NormKernel` gains `row_sumsq` and `rmsnorm_sharded`, `ElementwiseKernel` gains `fill` (contract §7.1)
+  Covers: S-6 (kernel support); `hip_ops sharded_norm_ops` (contract addition)
+  Depends on: phase-1 plan (shim, registry, `cpu-reference`), phase-2b plan (CUDA shim)
+
+- [ ] Write failing tests: `cpu::tests::sharded_norm_matches_full` asserts that splitting a 4×256 FP32 row into two halves, summing `row_sumsq` of the halves and applying `rmsnorm_sharded` per half equals the full `rmsnorm` within 1e-6, and that `fill` writes −∞ to the requested rows/cols; ignored `hip_ops sharded_norm_ops` asserts the HIP ops match the CPU reference for BF16 inputs (atol 1e-2). Run: `cargo test -p turbine-kernels cpu::tests::sharded_norm_matches_full` — expect FAIL.
+- [ ] Implement: `row_sumsq` accumulates FP32 per row; `rmsnorm_sharded` computes `x * rsqrt(sumsq / full_dim + eps) * weight_shard`; `fill` writes a double converted to the dtype; `turbine_stream_native_handle` returns the `hipStream_t` / `cudaStream_t` of the context (NULL = compute stream) as an opaque pointer. Both shims bump `turbine_abi_version()` to 4 together.
+- [ ] Run: `cargo test -p turbine-kernels cpu::tests::sharded_norm_matches_full` — expect PASS; lab (ASK THE USER FIRST: one free R9700) `scripts/lab-test.sh novanas` — expect log line `test sharded_norm_ops ... ok`.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(kernels): ABI v4 stream handle, sharded RMSNorm and fill ops`
+
+## Task 7: `NcclCollective` with init and op watchdogs
+
+Files: `crates/turbine-distributed/src/collective/ffi.rs` (`NcclCollective` implementing `Collective`; communicator init/abort/destroy; watchdog thread), `crates/turbine-distributed/src/collective/mod.rs` (`pub fn open_collective(kind, api: Option<Arc<NcclApi>>, rank, world, unique_id: [u8; 128], init_timeout, op_timeout, clock, metrics) -> Result<Arc<dyn Collective>, CollectiveError>`)
+Interfaces:
+
+- `impl NcclApi { pub fn unique_id(&self) -> Result<[u8; 128], CollectiveError> }`
+- `impl NcclCollective { pub fn init(api: Arc<NcclApi>, rank: usize, world: usize, unique_id: [u8; 128], init_timeout: Duration, op_timeout: Duration, clock: Arc<dyn Clock>, metrics: CollectiveMetrics) -> Result<Self, CollectiveError> }`
+- `pub fn open_collective(…) -> Result<Arc<dyn Collective>, CollectiveError>` (contract addition)
+  Covers: S-2 (watchdog, abort); exercised by Task 9's lab run
+  Depends on: Tasks 5, 6
+
+- [ ] Write failing test `collective::ffi::tests::stub_init_times_out`: against a stub built with `-DSTUB_INIT_NEVER_COMPLETES` (`ncclCommGetAsyncError` keeps returning `ncclInProgress` = 7), `NcclCollective::init` with a 200 ms init timeout returns `Timeout { op: "comm_init", .. }` within 1 s and the stub records one `ncclCommAbort` call. Run: `cargo test -p turbine-distributed collective::ffi::tests::stub_init_times_out` — expect FAIL.
+- [ ] Implement: build `ncclConfig_t` with `blocking = 0` exactly as the installed header's `NCCL_CONFIG_INITIALIZER` (size, magic `0xcafebeef`, version, then fields in header order — verify against `/opt/rocm/rocm/include/rccl/rccl.h` on novanas and NCCL 2.27 `nccl.h` read-only before coding), call `ncclCommInitRankConfig` then poll `ncclCommGetAsyncError` every 1 ms until `ncclSuccess` or the deadline (then `ncclCommAbort`); every op passes `StreamRef::native_handle()`, maps dtype BF16 → `ncclBfloat16` (9), FP32 → `ncclFloat32` (7) and `ReduceOp` Sum → 0, Max → 2, and records a deadline that the watchdog thread checks every 10 ms (`ncclCommGetAsyncError` non-success or deadline passed → `ncclCommAbort`, `Timeout`/`Backend`/`RemoteAbort` returned to the caller and counted in `turbine_collective_errors_total`); `barrier` is an all-reduce of one FP32 on the stream followed by a stream sync.
+- [ ] Run: `cargo test -p turbine-distributed collective::ffi::tests` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(distributed): NCCL-API communicator with init and op watchdogs`
+
+## Task 8: `turbine-collbench` binary
+
+Files: `crates/turbine-distributed/src/bin/turbine-collbench.rs` (CLI, size sweep, busbw, host comparison, report, `tests` module), `crates/turbine-distributed/Cargo.toml` (`[[bin]]`, `clap`)
+Interfaces:
+
+- CLI per contract §19 (`--backend rccl|nccl|host --devices <i,j,..> [--op …] [--min-bytes 8] [--max-bytes 1GiB] [--iters 20] [--warmup 5] [--dtype bf16|fp32] [--rank --world --leader] [--output text|json]`)
+- `fn busbw_factor(op: CollectiveOp, n: usize) -> f64`; JSON row `{bytes, time_us, algbw_gbps, busbw_gbps, correct}`
+  Covers: S-3; `--bin turbine-collbench tests::busbw_formulas`
+  Depends on: Tasks 4, 7; phase-1 plan (kernel context for device buffers)
+
+- [ ] Write failing test `tests::busbw_formulas`: asserts factors 2(n−1)/n for all-reduce, (n−1)/n for all-gather and reduce-scatter and 1 for broadcast at n = 2 and n = 8, and that a serialised row has exactly the keys `bytes`, `time_us`, `algbw_gbps`, `busbw_gbps`, `correct`. Run: `cargo test -p turbine-distributed --bin turbine-collbench tests::busbw_formulas` — expect FAIL.
+- [ ] Implement: sizes double from `--min-bytes` to `--max-bytes`; per size run `--warmup` then `--iters` timed iterations (median `time_us`), algbw = bytes / time, busbw = algbw × factor; one thread per local device in one process, or one process per rank with `--rank/--world/--leader` (rank 0 listens on the leader address and writes the 128-byte `ncclGetUniqueId` value to each connecting rank; no other protocol); results copied back and compared with `HostCollective` on the same inputs (`correct`); exit 0 all correct, 1 any mismatch or collective error, 2 usage errors. Device buffers and streams come from `ShimContext` (`DeviceBuffer::alloc`, `compute_stream`); the binary adds no HIP/CUDA binding.
+- [ ] Run: `cargo test -p turbine-distributed --bin turbine-collbench tests::busbw_formulas` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(distributed): turbine-collbench with nccl-tests bandwidth formulas`
+
+## Task 9: `scripts/lab-cluster.sh` and the RCCL collective run
+
+Files: `scripts/lab-cluster.sh` (scenario runner with `--dry-run`), `scripts/lab/k3s/cluster-novanas-job.yaml` (Job template: `amd.com/gpu: 2`, image `rust:1.97-trixie`, label `turbine-lab=true`, hostPaths `/opt/rocm/rocm` and `/home/piwi/turbine-models` read-only, `TURBINE_TEST_MODEL_DIR`), `benches/turbine-bench/tests/lab_scripts.rs` (dry-run test)
+Interfaces:
+
+- `scripts/lab-cluster.sh [--dry-run] <collbench-novanas|tp2-novanas|dp2-novanas>`; final line `lab-cluster: <scenario> PASS` or `lab-cluster: <scenario> FAIL <reason>`; unschedulable Job → exit 1 with `lab-cluster: amd.com/gpu unavailable on novanas`
+  Covers: S-3, S-9; `bash -n scripts/lab-cluster.sh` + `lab-cluster.sh --dry-run tp2-novanas`, lab `lab-cluster.sh collbench-novanas`
+  Depends on: Task 8; phase-0 plan (`scripts/lab-test.sh`, `turbine-ci` namespace)
+
+- [ ] Write failing test `lab_scripts cluster_dry_run_manifest`: runs `bash -n scripts/lab-cluster.sh` and `scripts/lab-cluster.sh --dry-run tp2-novanas`, both exit 0, and the printed manifest requests `amd.com/gpu: 2`, mounts `/home/piwi/turbine-models` with `readOnly: true`, contains no `kind: Service` and no `hostPort`, and the script's cleanup command selects only `-l turbine-lab=true`. Run: `cargo test -p turbine-bench --test lab_scripts cluster_dry_run_manifest` — expect FAIL.
+- [ ] Implement the script: rsync the tree to `/home/piwi/turbine-ci/src`, render the Job for the scenario, `kubectl -n turbine-ci apply`, wait for scheduling (Pending with `Insufficient amd.com/gpu` for 60 s → delete the Job, exit 1), stream logs, exit with the Job's status, `trap` deletes only the Job it created (`-l turbine-lab=true,turbine-scenario=<scenario>`). `collbench-novanas` runs `turbine-collbench --backend rccl --devices 0,1 --op all --max-bytes 1GiB --output json` inside the Job and fails unless every row is `correct: true` and all-reduce `busbw_gbps` > 0 at 268,435,456 bytes.
+- [ ] Run: `cargo test -p turbine-bench --test lab_scripts cluster_dry_run_manifest` — expect PASS.
+- [ ] Lab (ASK THE USER FIRST: both R9700 must be free): `scripts/lab-cluster.sh collbench-novanas` — expect exit 0 and final log line `lab-cluster: collbench-novanas PASS`; paste the JSON into the task evidence.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(scripts): lab-cluster runner with RCCL collective benchmark scenario`
+
+## Task 10: Parallel planner
+
+Files: `crates/turbine-distributed/src/plan.rs` (planner, reason codes, unit tests), `crates/turbine-distributed/src/lib.rs`
+Interfaces:
+
+- `pub struct ParallelPlan { pub tp: u32, pub dp: u32, pub backend: CollectiveBackendKind, pub mode: RankMode, pub vendor: Vendor, pub excluded_devices: Vec<DeviceId>, pub groups: Vec<ReplicaGroup>, pub reasons: Vec<PlanReason> }`, `pub struct ReplicaGroup { pub replica: ReplicaId, pub ranks: Vec<RankSlot> }`, `pub struct RankSlot { pub rank: u32, pub device: DeviceId, pub host: String }`
+- `pub enum PlanReason { FitsSingleDevice, TpRequiredForCapacity, GroupedByLink(PathClass), VendorHomogeneous, VendorExcluded(Vendor), ExplicitDevices, DeviceSharingEnabled }` (Display per §Data)
+- `pub fn plan(inv: &DeviceInventory, topo: &TopologyGraph, cfg: &ParallelConfig, model: &ModelShape, device_budget: &dyn Fn(DeviceId) -> u64) -> Result<ParallelPlan, PlanError>`; `pub struct PlanError { pub key: String, pub reason: String }`
+  Covers: S-4; `plan::tests::planner_cases`
+  Depends on: Tasks 1, 2
+
+- [ ] Write failing test `plan::tests::planner_cases`: on synthetic graphs asserts the novanas graph with tp 2 → one group {0,1}, reason `grouped_by_link:sys`, backend `rccl`; four NVIDIA GPUs as two NVLink pairs with tp 2 → groups {0,1} and {2,3} with `grouped_by_link:nvlink`; `devices: [0,1]` with one NVIDIA and one AMD → error `vendor-mixed plan` for tp 2 and for tp 1/dp 2; three AMD + one NVIDIA with `devices: auto`, tp 1 → dp 3 on AMD with the NVIDIA index in `excluded_devices` and `vendor_excluded:nvidia`; Llama-3.2-3B shape with `tp: auto` on two 32 GiB R9700 budgets → tp 1, dp 2, `fits_single_device`; tp 4 with 2 KV heads accepted, tp 8 with 3 KV heads rejected naming `parallel.tensor_parallel_size`. Run: `cargo test -p turbine-distributed plan::tests::planner_cases` — expect FAIL.
+- [ ] Implement: vendor choice (most usable devices, tie → vendor of the lowest index; explicit lists must be single-vendor and single-arch per TP group); head rules (tp ≤ heads, tp divides heads, tp divides KV heads or is a multiple of them); `tp: auto` = smallest power of two whose per-rank weight shard + one max-length sequence's KV fits `device_budget`; TP groups built greedily from the best `PathClass::rank` edges between unassigned devices, never by index order; DP replicas take the remaining devices; each decision logs INFO with its reason and is returned in `reasons`.
+- [ ] Run: `cargo test -p turbine-distributed plan::tests::planner_cases` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(distributed): topology-driven single-vendor parallel planner`
+
+## Task 11: Plan before bind in `turbine-server`
+
+Files: `crates/turbine-server/src/startup.rs` (startup step 3: `ParallelConfig::validate_devices` + `plan`, exit 2 before bind; `turbine_parallel_info` gauge; `/turbine/v1/status` `parallel` object), `crates/turbine-server/src/exit.rs` (map `PlanError` → exit 2), `crates/turbine-server/tests/server_cli.rs` (test)
+Interfaces:
+
+- consumes `turbine_distributed::plan::{plan, ParallelPlan, PlanError}`; status `"parallel": {"tp","dp","backend","mode","groups":[{"replica","ranks":[{"rank","device","host"}]}],"plan_reasons"}`
+  Covers: S-4; `server_cli impossible_plan_exits_2_before_bind`
+  Depends on: Task 10; phase-0/phase-1 plans (startup order, exit codes)
+
+- [ ] Write failing test `server_cli impossible_plan_exits_2_before_bind`: starts the binary with `parallel.tensor_parallel_size: 2`, no GPU libraries (empty inventory) and a free port; asserts exit code 2, stderr containing `parallel.tensor_parallel_size`, and that the port can still be bound afterwards. Run: `cargo test -p turbine-server --test server_cli impossible_plan_exits_2_before_bind` — expect FAIL.
+- [ ] Implement the startup step between discovery and kernel loading (contract §16.3 step 3), registering `turbine_parallel_info{tp,dp,backend,mode} = 1` and storing the plan for the status document.
+- [ ] Run: `cargo test -p turbine-server --test server_cli impossible_plan_exits_2_before_bind` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(server): validate the parallel plan before binding`
+
+## Task 12: Rank runtime — local and static modes
+
+Files: `crates/turbine-distributed/src/rank.rs` (messages, framing, leader/worker runtime, unit tests), `crates/turbine-distributed/src/lib.rs`
+Interfaces:
+
+- `pub struct StepPlan { pub step: u64, pub sequences: Vec<StepSeq> }`, `pub struct StepSeq { pub seq_id: SeqId, pub tokens: Vec<u32>, pub positions: Vec<u32>, pub block_table: Vec<BlockId>, pub is_prefill: bool }`, `pub trait StepExecutor: Send { fn execute(&mut self, plan: &StepPlan) -> Result<StepOutput, ExecError>; }`, `pub struct StepOutput { pub logits: Option<Vec<f32>>, pub rows: usize, pub vocab: usize }`, `pub enum ExecError { Collective(CollectiveError), Executor(String), DeviceFatal(String) }` (contract §15.2)
+- `pub enum RankMessage { Hello { protocol: u16, rank: u32, world_size: u32, model_fingerprint: ModelFingerprint, config_fingerprint: [u8; 32], device_vendor: Vendor, device_arch: String }, Welcome { unique_id: [u8; 128] }, Reject { reason: String }, StepPlan(StepPlan), Shutdown { reason: String } }`
+- `pub fn write_frame(w: &mut impl Write, m: &RankMessage) -> std::io::Result<()>; pub fn read_frame(r: &mut impl Read) -> std::io::Result<RankMessage>` (u32 LE length, ≤ 16 MiB, postcard)
+- `impl RankRuntime { pub fn local(executors: Vec<Box<dyn StepExecutor>>, depth: usize) -> Self; pub fn static_leader(listen: SocketAddr, expect: HelloExpect, world: usize, init_timeout: Duration, unique_id: [u8; 128], depth: usize) -> Result<Self, RankError>; pub fn static_worker(leader: SocketAddr, hello: RankMessage, init_timeout: Duration) -> Result<WorkerLink, RankError>; pub fn step(&mut self, plan: StepPlan) -> Result<(), RankError>; pub fn shutdown(&mut self, reason: &str) }`; `pub struct HelloExpect { pub model_fingerprint: ModelFingerprint, pub config_fingerprint: [u8; 32], pub device_vendor: Vendor, pub device_arch: String }`; `pub enum RankError { Timeout { missing: Vec<u32> }, Rejected(String), Closed { rank: u32 }, Io(String) }` (contract additions)
+  Covers: S-5; `rank::tests::static_protocol_handshake`, `rank::tests::leader_loss_aborts_workers`, `rank::tests::plan_queue_bounded`
+  Depends on: Task 4
+
+- [ ] Write failing test `rank::tests::static_protocol_handshake`: over loopback TCP a leader and 3 workers exchange `Hello`/`Welcome` (all workers receive the same 128-byte id); a worker with a different `model_fingerprint` and one with `device_vendor: nvidia` each receive `Reject` whose reason names the field; a duplicate rank is rejected; with rank 2 absent the leader fails within the 1 s init timeout with `Timeout { missing: [2] }`. Run: `cargo test -p turbine-distributed rank::tests::static_protocol_handshake` — expect FAIL.
+- [ ] Write failing test `rank::tests::leader_loss_aborts_workers`: after the handshake the leader socket is dropped; every worker aborts its host-backend communicator (later calls return `RemoteAbort`) and its loop returns `RankError::Closed { rank: 0 }` within 2 s. Run: `cargo test -p turbine-distributed rank::tests::leader_loss_aborts_workers` — expect FAIL.
+- [ ] Write failing test `rank::tests::plan_queue_bounded`: in local mode with depth 2 and a worker executor blocked on a barrier, the leader's third `step` blocks (observed with a 200 ms timeout thread) instead of buffering, and resumes when the worker is released. Run: `cargo test -p turbine-distributed rank::tests::plan_queue_bounded` — expect FAIL.
+- [ ] Implement: local mode = one thread per rank fed by `std::sync::mpsc::sync_channel(depth)`; static mode = leader accepts until all ranks joined or the init timeout, checks fingerprints/vendor/arch/unique ranks, answers `Welcome` or `Reject`, then writes each `StepPlan` to every worker; workers retry connect with backoff (50 ms doubling to 1 s) until the init timeout; a closed socket is `RemoteAbort` (workers abort the communicator, release device memory and exit 1 from the server); `Shutdown` travels both ways.
+- [ ] Run: `cargo test -p turbine-distributed rank::tests` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(distributed): leader/worker rank runtime with local and static modes`
+
+## Task 13: Tensor-parallel sharding rules
+
+Files: `crates/turbine-distributed/src/tp.rs` (range functions, unit test with the in-test FP32 reference decoder), `crates/turbine-distributed/src/lib.rs`
+Interfaces:
+
+- `pub struct ShardSpec { pub rank: u32, pub world: u32 }`
+- `pub fn head_range(num_heads: u32, s: ShardSpec) -> Range<u32>`, `pub fn kv_head_range(num_kv_heads: u32, s: ShardSpec) -> Range<u32>`, `pub fn column_range(dim: u32, s: ShardSpec) -> Range<u32>`, `pub fn row_range(dim: u32, s: ShardSpec) -> Range<u32>`, `pub fn vocab_shard(vocab: u32, s: ShardSpec) -> (u32, u32, u32)` (contract §15.2)
+  Covers: S-6; `tp::tests::sharded_layers_match_unsharded`
+  Depends on: Task 4
+
+- [ ] Write failing test `tp::tests::sharded_layers_match_unsharded`: an in-test naive FP32 decoder block (seeded weights) — dense: 8 heads / 2 KV heads, tied embeddings, vocab 1003; MoE: 4 heads / 4 KV heads with full-projection QK-norm, 8 experts top-2, vocab 1003 — executed at tp 1, 2 and 4 on `HostCollective` using only the range functions (column-parallel q/k/v, gate/up and every expert along the intermediate dimension, row-parallel o/down + all-reduce, replicated router, QK-norm from all-reduced partial sums of squares, vocab-parallel embedding + all-reduce, LM head + all-gather with padded rows filled −∞, KV heads replicated at tp 4 with 2 KV heads) gives logits within 1e-5 absolute of tp 1. Run: `cargo test -p turbine-distributed tp::tests::sharded_layers_match_unsharded` — expect FAIL.
+- [ ] Implement: contiguous equal splits (`dim % world == 0` asserted for heads/intermediate); `kv_head_range` returns `rank / (world / kv_heads)` as a one-head range when `world > kv_heads` and `world % kv_heads == 0`; `vocab_shard` = (rank × ceil(vocab/world), rows in range, ceil(vocab/world)).
+- [ ] Run: `cargo test -p turbine-distributed tp::tests::sharded_layers_match_unsharded` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(distributed): tensor-parallel sharding rules verified against an unsharded reference`
+
+## Task 14: Multi-device pressure accounting
+
+Files: `crates/turbine-reliability/src/multi_device.rs` (group state, atomic reservation, shared budgets, unit tests), `crates/turbine-reliability/src/budget.rs` (`PoolKind::Collective`, `BudgetInputs.collective_bytes`), `crates/turbine-reliability/src/metrics.rs` (`turbine_device_budget_bytes`, `turbine_group_pressure_state`, `turbine_group_limiting_device`), `crates/turbine-reliability/src/document.rs` (`devices[]`, `groups[]`, `replicas[]`), `crates/turbine-reliability/src/lib.rs`
+Interfaces:
+
+- `pub struct GroupState { pub state: PressureState, pub limiting_device: DeviceId }`, `pub fn group_state(members: &[(DeviceId, PressureState)]) -> (PressureState, DeviceId)` (contract §8.2)
+- `pub fn reserve_group(ledgers: &[(DeviceId, Arc<Ledger>)], blocks: u32, block_bytes_per_rank: u64) -> Result<Vec<Reservation>, AdmissionDecision>` (all-or-nothing → `Queue { reason: PressureReason::KvReservation }`), `pub struct GroupReservation { pub reservations: Vec<Reservation> }` (RAII wrapper, contract addition of fields)
+- `pub struct SharedDeviceBudget` with `pub fn split(budget: &DeviceBudget, replicas: u32) -> Vec<DeviceBudget>` and `pub fn available(&self, device: DeviceId) -> u64`
+  Covers: S-8; `multi_device::tests::group_state_is_worst_member`, `multi_device::tests::atomic_group_reservation`, `multi_device::tests::shared_device_budget`
+  Depends on: phase-3 plan (`Ledger`, `PressureMachine`, `compute_budget`)
+
+- [ ] Write failing test `multi_device::tests::group_state_is_worst_member`: two `PressureMachine`s fed so device 0 is GREEN and device 1 ORANGE → group ORANGE with `limiting_device` 1; after device 1's samples drop below ORANGE the group stays ORANGE until device 1 has cleared the phase-3 hysteresis (`deescalate_dwell` on the fake clock), then returns stepwise to GREEN. Run: `cargo test -p turbine-reliability multi_device::tests::group_state_is_worst_member` — expect FAIL.
+- [ ] Write failing test `multi_device::tests::atomic_group_reservation`: with rank 1's `kv` pool one block short of N, `reserve_group` for N blocks returns `Queue { reason: KvReservation }` and both ledgers' `usage(kv)` are unchanged (nothing held on rank 0). Run: `cargo test -p turbine-reliability multi_device::tests::atomic_group_reservation` — expect FAIL.
+- [ ] Write failing test `multi_device::tests::shared_device_budget`: two replicas on one 32 GiB dedicated device each see half of the phase-3 device budget, and a KV reservation by replica 0 reduces replica 1's available headroom by the same bytes (one ledger per physical device, never two). Run: `cargo test -p turbine-reliability multi_device::tests::shared_device_budget` — expect FAIL.
+- [ ] Implement: group state = max of member states, limiting = the first device at that state; `reserve_group` reserves rank by rank and drops the already taken guards on the first failure; the collective component is measured by `turbine-server` as the drop of `mem_info().free_bytes` across communicator init and passed as `BudgetInputs.collective_bytes`; the pressure document adds the three arrays.
+- [ ] Run: `cargo test -p turbine-reliability multi_device::tests` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(reliability): group pressure state, atomic group reservations, shared device budgets`
+
+## Task 15: DP router
+
+Files: `crates/turbine-distributed/src/router.rs` (routing decision, metric, unit test), `crates/turbine-distributed/src/lib.rs`
+Interfaces:
+
+- `pub enum DpRouteReason { PrefixAffinity, LeastLoaded, PressureAvoidance, OnlyCandidate }` (label values verbatim), `pub struct ReplicaView { pub replica: ReplicaId, pub state: PressureState, pub circuit: CircuitState, pub outstanding_tokens: u64, pub has_prefix: bool }`
+- `pub fn route(views: &[ReplicaView], policy: DpRouterPolicy) -> (ReplicaId, DpRouteReason)` (contract §15.2); `pub struct RouterMetrics { pub fn register(reg: &MetricsRegistry) -> Self; pub fn routed(&self, r: ReplicaId, reason: DpRouteReason) }`
+  Covers: S-7; `router::tests::routing_policy`
+  Depends on: Task 4
+
+- [ ] Write failing test `router::tests::routing_policy`: prefix cached on replica 1 → (1, `prefix_affinity`); no prefix → the fewest outstanding tokens with `least_loaded`; prefix on an ORANGE replica while another is GREEN → the GREEN one with `pressure_avoidance`; all replicas RED → the least-loaded RED one; one replica → `only_candidate`; each decision passed to `RouterMetrics::routed` increments `turbine_dp_routed_total{replica,reason}` by one. Run: `cargo test -p turbine-distributed router::tests::routing_policy` — expect FAIL.
+- [ ] Implement: eligible = state < ORANGE and circuit not `CIRCUIT_OPEN`/`DRAINING`, falling back to all replicas when none is eligible; with `prefix_affinity` a prefix holder among the eligible wins; otherwise the least outstanding tokens (ties → lowest index); `pressure_avoidance` when a prefix holder was skipped for pressure; the server fills `has_prefix` from each replica's `KvDirectory::lookup` of the prompt's first block keys.
+- [ ] Run: `cargo test -p turbine-distributed router::tests::routing_policy` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(distributed): pressure-aware prefix-affinity DP router`
+
+## Task 16: Diagnostics for replicas, groups and devices
+
+Files: `crates/turbine-server/src/diagnostics.rs` (pressure document with `devices`, `groups`, `replicas`; scheduler keyed by replica; `/ready` P5 reasons; static workers `not_leader`), `crates/turbine-api/src/backend.rs` (`NotReadyReason::{CollectiveInit, LoadingWeights, RankMissing}`), `crates/turbine-core/src/request.rs` (`ErrorCode::{NotLeader, ReplicaFailed}`), `crates/turbine-api/tests/api.rs` (test)
+Interfaces:
+
+- `/turbine/v1/pressure` adds `devices[{device, state, budget{weights,kv,workspace,collective,runtime,reserve}}]`, `groups[{replica, state, limiting_device}]`, `replicas[{replica, eligible, reason}]`; `/turbine/v1/scheduler` = `{"<replica>": SchedulerSnapshot}`
+  Covers: S-8; `api pressure_multi_device_view`
+  Depends on: Tasks 14, 15
+
+- [ ] Write failing test `api pressure_multi_device_view`: with a diagnostics fake built from two `DeviceBudget`s and one group, asserts `/turbine/v1/pressure` has `devices`, `groups` (each with `limiting_device`) and `replicas` arrays, and `/metrics` contains `turbine_device_budget_bytes{device="0",component="collective"}`. Run: `cargo test -p turbine-api --test api pressure_multi_device_view` — expect FAIL.
+- [ ] Implement the document assembly and metric export (`component` label from `PoolKind`), the ready reasons and the `not_leader` 503 for inference routes on static workers.
+- [ ] Run: `cargo test -p turbine-api --test api pressure_multi_device_view` — expect PASS.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(server): per-device, group and replica pressure diagnostics`
+
+## Task 17: Tensor-parallel model execution and the TP lab run
+
+Files: `crates/turbine-model/src/loader.rs` (`ShardSpec` argument: row/column/vocab slices read by positioned reads of the rank's byte ranges only), `crates/turbine-model/src/executor/llama.rs` and `executor/olmoe.rs` (`Option<TpContext>`: all-reduce after o_proj and down_proj, vocab-parallel embedding + all-reduce, LM head + all-gather to the leader, sharded QK-norm via `row_sumsq` → all-reduce → `rmsnorm_sharded`), `crates/turbine-model/src/lib.rs` (`TpContext`), `crates/turbine-server/src/engine/tp.rs` (`StepExecutor` over the executors; one `RankRuntime` per group; circuit `CollectiveFailed` on collective errors, in-flight requests end with `replica_failed`), `crates/turbine-model/tests/tiny_model.rs` (TP test), `scripts/lab/phase5-novanas-{llama,olmoe}.yaml` (tp 2 configs, `server.listen: 127.0.0.1:18000`)
+Interfaces:
+
+- `pub struct TpContext { pub rank: u32, pub world: u32, pub collective: Arc<dyn Collective>, pub stream: StreamRef }` (contract §10)
+- `WeightLoader::load(index, slots, mem, staging_bytes, shard: Option<ShardSpec>) -> Result<LoadedWeights, ModelError>`; per-rank KV pools of the same block count indexed by the leader's logical `BlockId`s
+  Covers: S-6, S-9; `tiny_model tp2_matches_tp1_on_host` (contract addition), lab `lab-cluster.sh tp2-novanas`
+  Depends on: Tasks 6, 7, 11, 12, 13, 14; phase-1/phase-2 plans (executors, golden fixtures, `turbine-golden`)
+
+- [ ] Write failing test `tiny_model tp2_matches_tp1_on_host`: the tiny Llama (4 heads / 2 KV heads) and tiny OLMoE checkpoints run on the `cpu-reference` provider with two ranks over `HostCollective` produce greedy tokens identical to tp 1 for 16 steps and logits within 1e-4. Run: `cargo test -p turbine-model --test tiny_model tp2_matches_tp1_on_host` — expect FAIL.
+- [ ] Implement sharded loading and the collective insertion points listed above; the leader samples, workers only execute; cancellation drops a sequence from the next `StepPlan` and the leader's block manager frees its blocks on every rank; out-of-memory while loading a shard exits 1 naming rank, device, tensor and the budget breakdown.
+- [ ] Run: `cargo test -p turbine-model --test tiny_model tp2_matches_tp1_on_host` — expect PASS.
+- [ ] Lab (ASK THE USER FIRST: both R9700 must be free): `scripts/lab-cluster.sh tp2-novanas` — runs Llama-3.2-3B-Instruct at tp 2 in `local` mode, waits for `/ready` 200, `turbine-golden compare --url http://127.0.0.1:18000 --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl`; repeats in `static` mode (ranks 0 and 1, leader 127.0.0.1:18100); repeats `local` for OLMoE against `tests/golden/olmoe-1b-7b-0125-instruct/reference.jsonl`; then `turbine-bench --url http://127.0.0.1:18000 --concurrency 4 --requests 64 --output json` requiring `requests_ok: 64` — expect final log line `lab-cluster: tp2-novanas PASS`; paste compare outputs and TTFT/ITL beside the tp 1 run into the task evidence.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(model): tensor-parallel Llama and OLMoE execution over the collective trait`
+
+## Task 18: Data-parallel replicas and the DP lab run
+
+Files: `crates/turbine-server/src/engine/replicas.rs` (one engine thread, scheduler, KV pool, KV orchestrator and pressure controller per replica; router in front; shared-device budgets when `allow_device_sharing`), `crates/turbine-server/src/startup.rs` (build replicas from `ParallelPlan.groups`), `crates/turbine-server/tests/tiny_server.rs` (DP test on the CPU backend), `scripts/lab/phase5-novanas-dp2.yaml`
+Interfaces:
+
+- `pub struct Replicas` with `pub fn submit(&self, req: GenerationRequest) -> Result<(ReplicaId, mpsc::Receiver<GenerationEvent>), ApiError>`; consumes `router::route`, `RouterMetrics`, `SharedDeviceBudget`
+  Covers: S-7, S-9; `tiny_server dp2_routes_to_both_replicas` (contract addition), lab `lab-cluster.sh dp2-novanas`
+  Depends on: Tasks 15, 16, 17
+
+- [ ] Write failing test `tiny_server dp2_routes_to_both_replicas`: the tiny model with `execution.backend: cpu`, `data_parallel_size: 2`, `allow_device_sharing: true` serves 32 concurrent requests, all succeed, `/metrics` shows non-zero `turbine_dp_routed_total` for replica 0 and replica 1, and `/turbine/v1/scheduler` has keys `"0"` and `"1"`. Run: `cargo test -p turbine-server --test tiny_server dp2_routes_to_both_replicas` — expect FAIL.
+- [ ] Implement the replica set: each replica is one TP group with its own engine; the router reads each replica's `ControllerHandle::state()`, circuit and outstanding tokens; a replica whose communicator fails goes `CIRCUIT_OPEN` while the others serve.
+- [ ] Run: `cargo test -p turbine-server --test tiny_server dp2_routes_to_both_replicas` — expect PASS.
+- [ ] Lab (ASK THE USER FIRST: both R9700 must be free): `scripts/lab-cluster.sh dp2-novanas` — serves Llama-3.2-3B-Instruct with tp 1, dp 2, runs `turbine-bench --url http://127.0.0.1:18000 --concurrency 8 --requests 128 --output json` requiring `requests_ok: 128` and non-zero `turbine_dp_routed_total` for both replicas — expect final log line `lab-cluster: dp2-novanas PASS`; record throughput beside a dp 1 run in the task evidence.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `feat(server): data-parallel replicas behind one API`
+
+## Task 19: Topology on the real hosts
+
+Files: `crates/turbine-device/tests/lab.rs` (`topology_matches_host`, ignored)
+Interfaces:
+
+- consumes `discover_topology(Path::new("/sys"), &inventory, &mut vendor)`, `TURBINE_EXPECT_AMD`, `TURBINE_EXPECT_NVIDIA`
+  Covers: S-1, S-9; lab `cargo test -p turbine-device --test lab topology_matches_host -- --ignored` under `scripts/lab-test.sh novanas` and `scripts/lab-test.sh dgx-spark`
+  Depends on: Task 2; phase-0 plan (`scripts/lab-test.sh`, `lab.rs`)
+
+- [ ] Write failing test `lab topology_matches_host` (`#[ignore]`): read-only discovery (no device memory allocated); with `TURBINE_EXPECT_AMD=2` asserts two `gfx1201` GPU vertices and a PCIe GPU↔GPU edge with `p2p: disabled`; with `TURBINE_EXPECT_NVIDIA=1` asserts one GPU and a NIC with an RDMA device at 200 Gb/s; prints `topology_matches_host vertices=<n> edges=<m>`. Run: `cargo test -p turbine-device --test lab topology_matches_host -- --ignored` on macOS — expect FAIL (no devices, expectation variables unset → assertion on the empty inventory).
+- [ ] Implement only what the real captures reveal as misparsed (the fixture parsers from Task 2 are the implementation); add any new real-host line to the Task 2 capture files so the unit tests keep covering it.
+- [ ] Run: `scripts/lab-test.sh novanas` (ASK THE USER FIRST: the Job requests one R9700 even though discovery is read-only) and `scripts/lab-test.sh dgx-spark` (correctness run: proceeds after the script's MemAvailable precondition) — expect PASS with log line `test topology_matches_host ... ok` on both.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [ ] Commit: `test(device): topology discovery matches novanas and dgx-spark`

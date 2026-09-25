@@ -1,0 +1,263 @@
+# phase-2-serving-runtime
+
+Status: complete
+
+Source: `turbine-spec.md` §19 Phase 2 (serving runtime), with §3, §7, §8, §13, §14, §16, §17 and §21. Sections of that document are cited as "TS §N". Builds on `.procoder/specs/phase-0-skeleton.md` and `.procoder/specs/phase-1-single-request.md` (Llama-3.2-3B BF16 on one R9700 through `libturbine_hip.so`, kernel registry and vendor-neutral C ABI, single-request generation, HF transformers golden fixtures and `turbine-golden`). Decisions are recorded in `.procoder/ask/decisions.md` ("Answers log for phase 1–8 spec questions (2026-09-25)"), which this spec follows where it differs from TS.
+
+Amendments to TS made by those decisions:
+
+- Amends TS §3 ("prioritize current Qwen MoE architecture"): the first MoE model is `allenai/OLMoE-1B-7B-0125-Instruct` (BF16), added in this phase; Qwen MoE moves to the Phase 8 model-families track.
+- Amends TS §19 (AMD in Phase 8): Phase 2 runs on the novanas R9700 like Phase 1; NVIDIA/GB10 execution follows right after this phase in the proposed follow-on spec `phase-2b-nvidia` (see Out of scope).
+
+## Problem
+
+After Phase 1, Turbine produces reference-validated tokens for exactly one request at a time: a second caller gets 429, the KV cache is a contiguous buffer sized for one sequence, and prefill of a long prompt blocks everything. That is a correctness harness, not a server. Phase 2 turns it into a serving runtime (TS §7): many concurrent requests share the GPU through continuous batching, prefill and decode are scheduled from separate queues with chunked prefill so a long prompt cannot stall running generations, KV lives in a paged block pool, every queue is bounded with explicit backpressure, cancellation frees resources within one iteration, and the OpenAI surface covers what agent clients need — the core sampling fields, tool calls with `tools`/`tool_choice`, and JSON-schema structured output enforced by constrained decoding (llguidance). The scheduler must be testable as a deterministic simulation without a GPU (TS §17, §21), because it is the component every later phase (pressure control, KV tiers, distribution) plugs into. A second model, the mixture-of-experts OLMoE-1B-7B (64 experts, top-8 routing, ≈ 14 GB BF16), joins the dense Llama-3.2-3B so that batching is proven on both a dense and a routed forward pass before later phases (expert parallelism in Phase 7) build on MoE.
+
+## Users
+
+- **API clients (OpenAI SDKs, agents, tool-using applications):** need concurrent streaming completions with the request fields and response shapes they already use — including `tools`, `tool_choice` and `response_format` with a JSON schema whose output is guaranteed to parse — predictable 429/503 responses with `retry-after` under load instead of hangs, and prompt release when they disconnect.
+- **Operators:** need bounded queues and memory sized from configuration and checked at startup, `/turbine/v1/scheduler` and `/turbine/v1/kv` to see what the engine is doing, metrics for queue depth, batch composition, preemptions, cancellations and constrained decoding, and graceful shutdown.
+- **Turbine developers:** need a scheduler crate with a deterministic simulator, invariants tested without GPUs on macOS, and golden tests proving batching, chunking, preemption and MoE routing do not change outputs beyond the Phase 1 tolerance.
+- **Benchmark runners:** need Turbine to sustain `turbine-bench` at concurrency 16+ and to degrade by queuing and 429s, not crashes, when deliberately overloaded (TS §18), with a recorded baseline against vLLM-ROCm where it runs on RDNA4.
+
+## In scope
+
+- [S-1] New crates with Phase 2 content: `crates/turbine-scheduler` (request lifecycle, queues, per-iteration batch selection, simulator; no GPU dependency, no `unsafe`) and `crates/turbine-kv` (GPU block pool, per-request block tables, KV accounting; no `unsafe` — device memory comes through `turbine-kernels`). The engine loop that joins scheduler, KV and executor lives in `turbine-server` on a dedicated OS thread that owns the device context.
+- [S-2] Request lifecycle: every request has a stable id (the `x-request-id` of Phase 0 is reused as a label, the engine id is `cmpl-<uuid>`/`chatcmpl-<uuid>`), a state (`waiting`, `prefilling`, `decoding`, `paused`, `finished`, `cancelled`, `failed`), a cancellation token, and a resource estimate (prompt tokens, max new tokens, KV blocks at completion) computed before it is queued (TS §7).
+- [S-3] Continuous batching with separate prefill and decode queues: each iteration first includes every decodable running request (one token each), then fills the remaining token budget with prefill chunks — unfinished prefills oldest first, then newly admitted requests by priority then arrival — as in the TS §7 iteration example. Requests join and leave the batch at iteration boundaries.
+- [S-4] Chunked prefill: a prompt is prefilled in chunks of at most _scheduler.prefill_chunk_tokens_, carrying its KV in the block pool between chunks; with _scheduler.chunked_prefill_ false, a prompt must fit one iteration's budget or is rejected at submission.
+- [S-5] GPU paged KV (BF16 only, TS §3/§8; no KV dtype option in this phase): a pool of fixed-size blocks of _kv.block_tokens_ tokens for all layers, sized by `kv.gpu.max_bytes`, allocated once at startup; per-request block tables; blocks allocated on demand as tokens are appended and freed on finish, cancel, failure or preemption. Attention executes through new registry ops `attention_prefill_paged` and `attention_decode_paged` (ragged batch with page table), provided on AMD by the paged-KV variants of Composable Kernel ck_tile FMHA (batch prefill with page table, split-KV decode with page table); a `copy_blocks` op forks block contents for `n` > 1. Prefix sharing, CPU/NVMe tiers and eviction policy are Phase 4.
+- [S-6] Preemption by recompute: when the pool cannot supply the blocks needed for the next iteration's decodes, the lowest-priority, most recently admitted running request is preempted — its blocks freed, it returns to the front of the waiting queue, and on readmission it re-prefills its prompt plus already-generated tokens and continues its stream without resending tokens (its sampler PRNG and constrained-decoding state are kept on the host). Each preemption is logged with a reason code and counted.
+- [S-7] Backpressure and bounds (TS §21 rule 8): a bounded waiting queue (_scheduler.max_queued_requests_, excess → 429 `queue_full`), a bound on running requests (_scheduler.max_running_requests_), a per-iteration token budget (_scheduler.max_batch_tokens_), a queue wait limit (_scheduler.queue_timeout_), a bounded per-request output channel (256 events; when full the request is `paused` — excluded from decode while keeping its KV — and cancelled with reason `slow_client` after _server.slow_client_timeout_), and a total request deadline (_server.request_timeout_).
+- [S-8] Cancellation (TS §21 rule 9): client disconnect, timeout, slow client and shutdown cancel a request; the engine drops it at the next iteration boundary and returns its blocks to the pool before the next iteration's batch is chosen.
+- [S-9] Batched execution in the executor: ragged token batches mixing prefill chunks and decodes for both model families; one device-to-host copy of the batch's FP32 last-position logits per iteration; batched host sampling and logprobs (the Phase 1 sampler, applied per request with its penalties, bias and token mask). Device-side sampling is not built until a benchmark shows the copy or host sampling dominates an iteration (TS §21 rule 3).
+- [S-10] OpenAI core fields: the Phase 1 fields plus `n` > 1 (sequences forked after prefill by copying blocks), `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens`, `stop_token_ids`, `priority` (vLLM extension), `"echo": true` for completions, `user` (accepted, recorded on the request span), _stream_options.include_usage_ per choice, request timeouts and error events on streams.
+- [S-11] Diagnostics: `GET /turbine/v1/scheduler` and `GET /turbine/v1/kv` implemented (shapes in Data); `GET /turbine/v1/pressure` stays 501 until Phase 3.
+- [S-12] Deterministic scheduler simulator in `turbine-scheduler`: a `SimExecutor` with a seeded arrival process and a per-token cost model, driving the real scheduler and KV accounting with virtual time, used by unit and property tests on macOS.
+- [S-13] Graceful shutdown: on SIGINT/SIGTERM new requests get 503 `shutting_down`, running requests continue for up to _server.shutdown_grace_, then remaining ones are cancelled with reason `shutdown` and the process exits 0.
+- [S-14] Phase 2 metrics and structured logs for admission, queues, batch composition, preemption, cancellation, KV occupancy and constrained decoding (see Interfaces); every automatic decision (reject, preempt, pause, cancel) logged with a reason code (TS §14, §21 rule 7).
+- [S-15] Lab validation on novanas (one R9700 via `scripts/lab-test.sh novanas` and `scripts/lab-serve.sh novanas`): golden comparison under concurrency for both models, a concurrency baseline benchmark of Turbine and — if it runs on RDNA4 — vLLM-ROCm on the same model and card, and a deliberate-overload run that must end without worker death.
+- [S-16] OLMoE support: the `OlmoeForCausalLM` architecture added to the allowlist and executor — 16 layers, hidden 2048, 16 attention heads with 16 KV heads of dimension 128, RMSNorm on the full Q and K projections (_q_norm_/_k_norm_), standard RoPE (theta 10000), and per layer a router (softmax over 64 expert logits, top-8, weights not renormalised when _norm_topk_prob_ is false) feeding 64 SwiGLU experts of width 1024; untied LM head; vocabulary 50304; max positions 4096. New registry ops `moe_route` (softmax, top-k and token permutation; a minimal Turbine HIP kernel) and `moe_experts` (gate/up and down projections for all selected experts as hipBLASLt grouped GEMMs, SiLU-and-multiply between, weighted un-permute into the residual), each with a CPU reference. Weights in `/home/piwi/turbine-models/olmoe-1b-7b-0125-instruct`; golden fixtures generated by `scripts/golden/hf_reference.py` exactly as for Llama.
+- [S-17] Structured output with `response_format`: `{"type":"text"}` (default), `{"type":"json_object"}` and `{"type":"json_schema","json_schema":{"name":…,"schema":{…},"strict":…}}`, enforced by constrained decoding through the `llguidance` Rust crate: the grammar is compiled from the schema at submission (off the engine thread, bounded), a token trie is built once at startup from _tokenizer.json_ (`toktrie_hf_tokenizers`), and each decode step the request's allowed-token bitmask is computed on the host and applied to its logits before sampling; the sampled token is committed to the matcher. JSON is emitted compact (no free whitespace), so a bounded schema yields bounded output. EOS is allowed only when the matcher accepts.
+- [S-18] Tool calling: `tools` (type `function` with `name`, `description`, `parameters` JSON schema), `tool_choice` (`none`, `auto`, `required`, or `{"type":"function","function":{"name":…}}`), `parallel_tool_calls`, assistant messages carrying `tool_calls`, and `tool` role messages with `tool_call_id`, all rendered through the model's chat template. A tool-call parser selected by _model.tool_call_parser_ extracts calls from the output: `llama3_json` (the Llama-3.x JSON format: optional `<|python_tag|>`, then one or more `{"name":…,"parameters":{…}}` objects separated by `;`). With `required` or a named function the output is constrained by an llguidance grammar built from the tool schemas, so the call always parses and its arguments validate; with `auto` the model is unconstrained and the parser decides. Responses carry _message.tool_calls_ (streaming: _delta.tool_calls_) with ids `call_<24 alphanumerics>` and `finish_reason: "tool_calls"`.
+
+## Out of scope
+
+- NVIDIA/GB10 execution. Proposed follow-on spec `phase-2b-nvidia` (to be written with the user after this spec is approved; its content is not decided here): it brings the Phase 1–2 capabilities to the DGX Sparks through `libturbine_cuda.so` implementing the same vendor-neutral C ABI and kernel traits, with the NVIDIA providers of TS §6. It runs straight after Phase 2 and before Phase 3's GB10 work.
+- Reasoning-content splitting (`reasoning_content`); neither Phase 2 model emits reasoning. Tool-call parsers other than `llama3_json`; tool calling on models whose chat template does not render `tools` (OLMoE) — such requests are rejected.
+- Grammar formats other than JSON schema (`regex`, Lark, `structural_tag`), `guided_*` vLLM extensions.
+- FP8 or other lossy KV dtypes (Phase 8 quantization track, with quality validation per TS §8).
+- Pressure states, predictive admission from live telemetry, memory pools beyond the startup budget, adaptive chunk sizing, circuit breaker, recovery from allocation failure (Phase 3). Phase 2 admission uses static capacity only.
+- Prefix sharing and caching, block hashing, pinned-CPU and NVMe tiers, swap-based preemption, cost-aware eviction, session hints (Phase 4).
+- Multi-GPU (Phase 5, on the novanas R9700 pair), multi-node, disaggregated prefill/decode and expert parallelism (Phases 6–7). Speculative decoding (Phase 8).
+- Device-side sampling, HIP graphs, kernel fusion, custom kernels replacing library kernels and other hot-path specialisation before a benchmark shows the need (TS §21 rule 3).
+- A numeric performance exit bar: Phase 2 records a baseline only.
+- Priority aging/anti-starvation for low priorities, per-tenant quotas and accounting (TS §16 hooks only: the `user` field is recorded on the request span).
+- `best_of`, `suffix`, audio/image inputs, embeddings and other non-generation endpoints.
+
+## Constraints
+
+- Scheduler logic depends on no GPU, kernel provider or model crate; it sees requests, token counts, block counts and a cost model only (TS §21 rules 6 and 11). `turbine-scheduler` and `turbine-kv` build and test on macOS with no ROCm.
+- KV boundaries (TS §21 rule 6): block pool, block table and KV metrics are separate modules in `turbine-kv`; no module named or behaving as a catch-all "KV manager".
+- The HTTP runtime (Tokio) never blocks on the engine: submissions go through a bounded channel (capacity _scheduler.max_queued_requests_), outputs through bounded per-request channels; the engine thread never awaits a client. Grammar compilation runs on Tokio's blocking pool behind a semaphore of 4 permits with a timeout of _structured_output.compile_timeout_, never on the engine thread; per-step mask computation runs on the engine thread within llguidance's step limits.
+- Startup budget (extends Phase 1): weights + `kv.gpu.max_bytes` + workspace for _scheduler.max_batch_tokens_ (activations, logits, MoE permutation buffers) + _reliability.emergency_vram_reserve_ ≤ available device memory (device free memory on the R9700); violation exits 1 before weights load, naming each term.
+- Lab: novanas (192.168.10.203), one R9700 (`gfx1201`, 32 GB) per k3s Job, ROCm 7.14.1; the user empties the GPUs for Turbine work. Any run that needs production workloads moved or memory freed on any host — including the vLLM-ROCm baseline run and the overload run — is preceded by asking the user; the user moves workloads. Scripts never stop, restart or reconfigure other workloads.
+- Models: `meta-llama/Llama-3.2-3B-Instruct` and `allenai/OLMoE-1B-7B-0125-Instruct`, BF16, under `/home/piwi/turbine-models/<slug>`, downloaded once over SSH by Claude with a Hugging Face token the user supplies at that time (never stored in the repository or on the host); tests read `TURBINE_TEST_MODEL_DIR` (and `TURBINE_TEST_MOE_MODEL_DIR` for OLMoE) and never download.
+- New dependencies beyond Phase 1: `llguidance` and `toktrie_hf_tokenizers` (runtime; exact versions pinned in the workspace manifest, MIT license recorded in the manifest comment); `proptest` and `jsonschema` (dev-dependencies: scheduler invariants, validating structured outputs in tests).
+- Bounds on constrained decoding (TS §21 rule 8): schema or tool-definition JSON over _structured_output.max_schema_bytes_ is rejected; grammar compilation over _structured_output.compile_timeout_ is rejected; llguidance's per-step parser limits stay at their defaults and a step that exceeds them fails only that request.
+
+## Interfaces
+
+### Configuration additions and changes
+
+| Key                                  | Type      | Default | Validation                                                                                                                                                                                                                                                                                  |
+| ------------------------------------ | --------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| _scheduler.continuous_batching_      | bool      | `true`  | `false` forces _scheduler.max_running_requests_ to 1 (requests queue instead of Phase 1's 429)                                                                                                                                                                                              |
+| _scheduler.chunked_prefill_          | bool      | `true`  | `false`: prompts longer than _scheduler.max_batch_tokens_ are rejected at submission                                                                                                                                                                                                        |
+| _scheduler.max_running_requests_     | integer   | `64`    | 1 ≤ value ≤ 1024                                                                                                                                                                                                                                                                            |
+| _scheduler.max_batch_tokens_         | integer   | `8192`  | ≥ _scheduler.max_running_requests_ and ≥ _kv.block_tokens_                                                                                                                                                                                                                                  |
+| _scheduler.prefill_chunk_tokens_     | integer   | `2048`  | 1 ≤ value ≤ _scheduler.max_batch_tokens_                                                                                                                                                                                                                                                    |
+| _scheduler.max_queued_requests_      | integer   | `256`   | 1 ≤ value ≤ 65536; waiting-queue bound and HTTP→engine submission-channel capacity; from Phase 3 the submission-channel capacity only (the Phase 3 admission queue is the one waiting queue, CONFLICT C-1)                                                                                  |
+| _scheduler.queue_timeout_            | duration  | `60s`   | > 0; Phase 2 only: Phase 3 removes the key (rejected as a removed key; replaced by `reliability.admission.queue_timeout`, CONFLICT C-1)                                                                                                                                                     |
+| `kv.gpu.max_bytes`                   | byte size | `8GiB`  | optional (`null` allowed); from Phase 3 the default is null = the `kv` pool remainder of the budget and an explicit value caps that pool (CONFLICT C-8); ≥ one block per running request; part of the startup budget; with `kv.gpu.enabled: false` startup fails (the GPU tier is required) |
+| _server.request_timeout_             | duration  | `10m`   | > 0                                                                                                                                                                                                                                                                                         |
+| _server.slow_client_timeout_         | duration  | `30s`   | > 0                                                                                                                                                                                                                                                                                         |
+| _server.shutdown_grace_              | duration  | `30s`   | ≥ 0                                                                                                                                                                                                                                                                                         |
+| _model.tool_call_parser_             | enum/null | null    | `llama3_json` or `none`; null → `llama3_json` for `LlamaForCausalLM` whose template renders `tools`, else `none`                                                                                                                                                                            |
+| _structured_output.max_schema_bytes_ | byte size | `64KiB` | 1KiB ≤ value ≤ 1MiB                                                                                                                                                                                                                                                                         |
+| _structured_output.compile_timeout_  | duration  | `5s`    | > 0                                                                                                                                                                                                                                                                                         |
+
+Durations: `<integer><unit>` with unit `ms`, `s`, `m` or `h`, no space; anything else is an error naming the key. The Phase 1 _model.max_seq_len_ now bounds each request, not a preallocated buffer. The model allowlist gains `OlmoeForCausalLM`.
+
+### Scheduling rules (per iteration)
+
+1. Drop requests whose cancellation token fired; free their blocks.
+2. Decode set: every `decoding` request not `paused`, one token each. If the pool cannot supply the blocks these decodes need, preempt (S-6) until it can.
+3. Prefill: remaining budget = _scheduler.max_batch_tokens_ − decode tokens. Continue `prefilling` requests oldest first, each with min(remaining prompt, _scheduler.prefill_chunk_tokens_, budget) tokens; then admit `waiting` requests ordered by `priority` (lower first) then arrival, while running < _scheduler.max_running_requests_ and the pool can supply blocks for the first chunk plus a 1% free-block watermark.
+4. An iteration with no tokens sleeps until a submission or cancellation arrives (no busy loop).
+
+Submission checks (before queueing): prompt + `max_tokens` ≤ _model.max_seq_len_ else 400 `context_length_exceeded`; KV blocks at completion ≤ pool size else 400 `context_exceeds_kv_capacity` (the Phase 3 code, CONFLICT C-2); `response_format` or constrained tool grammar compiles within bounds else 400 `invalid_json_schema` naming the llguidance error or bound; queue full → 429 `queue_full` with `retry-after: 1`; shutting down → 503 `shutting_down`. Waiting longer than _scheduler.queue_timeout_ → 503 `queue_timeout`.
+
+### Structured output and tool-call rules
+
+- `response_format` `json_object` compiles the grammar of any JSON object; `json_schema` compiles `schema` (keywords llguidance does not support → 400 `invalid_json_schema` naming the keyword); `strict` is accepted and does not change enforcement (always enforced).
+- `tools` present with a model whose parser is `none` → 400 `invalid_request_error` code `tools_not_supported` naming the model. `tool_choice` defaults to `auto` when `tools` is non-empty; a named function not in `tools` → 400. `tool_choice: "none"` renders the template without tools and disables parsing.
+- `required`/named: grammar = optional `<|python_tag|>`, then one call object `{"name":<enum of allowed names>,"parameters":<that tool's schema>}`, repeated with `;` separators when `parallel_tool_calls` is true (default). `auto`: unconstrained; if the first non-whitespace output is `<|python_tag|>` or `{`, the output is buffered and parsed at finish; a successful parse yields `tool_calls` and `finish_reason: "tool_calls"`, a failed parse returns the raw text as `content` with `finish_reason` unchanged and a `tool_call_parse_failed` log record.
+- Streaming tool calls: content before a call streams normally; each parsed call is sent as one _delta.tool_calls_ entry with `index`, `id`, `type: "function"`, _function.name_ and the complete _function.arguments_ string.
+- `response_format` other than `text` combined with `tool_choice` other than `none` → 400 `unsupported_parameter`.
+- `max_tokens` reached before the grammar accepts: `finish_reason: "length"` and the (possibly incomplete) text is returned as generated.
+
+### HTTP routes (Phase 2 changes)
+
+| Route                       | Phase 2 response                                                                                                                                                                                       |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `POST /v1/completions`      | concurrent; Phase 1 behaviour plus the S-10 and S-17 fields; no more `429 engine_busy` (the Phase 1 test `tiny_server single_slot_and_cancel` is rewritten to assert the concurrent request is queued) |
+| `POST /v1/chat/completions` | same, plus S-18 tool calling                                                                                                                                                                           |
+| `GET /turbine/v1/scheduler` | `200` scheduler snapshot (Data)                                                                                                                                                                        |
+| `GET /turbine/v1/kv`        | `200` KV snapshot (Data)                                                                                                                                                                               |
+| `GET /turbine/v1/pressure`  | unchanged: `501`                                                                                                                                                                                       |
+| `GET /ready`                | `503` `{"ready":false,"reason":"shutting_down"}` once shutdown starts                                                                                                                                  |
+
+Timeouts: non-streaming → `504` type `timeout`, code `request_timeout`; streaming → a `data: {"error":{"message":…,"type":"timeout","code":"request_timeout"}}` event, then `data: [DONE]`, then the stream closes (CONFLICT C-3). Cancelled-by-server streams (slow client, shutdown) end the same way with codes `slow_client` and `shutting_down`.
+
+### `turbine-golden compare` (change)
+
+- New flag `--concurrency <n>` (default 1): sends up to `n` reference prompts at once; results and exit codes as in Phase 1.
+
+### Lab configs and jobs
+
+- `scripts/lab/phase2-novanas-llama.yaml` and `scripts/lab/phase2-novanas-olmoe.yaml`: the Phase 1 lab config with the model path set to the respective `/models/<slug>` and the scheduler defaults above.
+- `scripts/lab/novanas-test-job.yaml` additionally sets `TURBINE_TEST_MOE_MODEL_DIR=/models/olmoe-1b-7b-0125-instruct`.
+- `scripts/lab/novanas-vllm-job.yaml`: a k3s Job in `turbine-ci` running the upstream `rocm/vllm` image at a pinned tag on one R9700 (`amd.com/gpu: 1`, `hostNetwork: true`, port 18100) serving the same weights read-only with `--dtype bfloat16 --kv-cache-dtype auto`; `scripts/lab-serve.sh novanas --vllm <slug>` applies it and waits for `/v1/models`, or exits 1 with the pod log when vLLM fails to start or serve on `gfx1201`.
+
+### Metrics (added)
+
+- `turbine_requests_active{state}` gauge — `state` ∈ `prefilling`, `decoding`, `paused`; `turbine_requests_queued` gauge.
+- `turbine_admission_total{outcome,reason}` counter — `outcome` ∈ `queued`, `rejected`; `reason` ∈ `ok`, `queue_full`, `context_length_exceeded`, `context_exceeds_kv_capacity`, `invalid_json_schema`, `shutting_down`, `queue_timeout`.
+- `turbine_queue_wait_seconds` histogram.
+- `turbine_iteration_seconds` histogram; `turbine_iteration_tokens{phase}` histogram (`prefill`, `decode`); `turbine_batch_requests` histogram.
+- `turbine_preemptions_total{reason}` counter (`kv_exhausted`).
+- `turbine_requests_cancelled_total{reason}` counter — `client_disconnect`, `request_timeout`, `slow_client`, `shutdown`.
+- `turbine_kv_blocks{tier,state}` gauge — `tier` = `l0` (the GPU tier; Phase 4 tier names, CONFLICT C-4), `state` ∈ `used`, `free`.
+- `turbine_stream_paused_total` counter.
+- `turbine_grammar_compile_seconds{kind}` histogram and `turbine_token_mask_seconds` histogram — `kind` ∈ `json_object`, `json_schema`, `tool_call`.
+- `turbine_tool_calls_total{parser,outcome}` counter — `outcome` ∈ `parsed`, `parse_failed`.
+
+## Data
+
+- Nothing is persisted. KV blocks live in device memory, owned by the pool; block tables, request records, sampler state and llguidance matchers in engine-thread memory.
+- GPU block layout per layer: `[num_blocks, 2, block_tokens, kv_heads, head_dim]`, BF16 (the layout the CK paged FMHA kernels take). Block bytes = layers × 2 × block_tokens × kv_heads × head_dim × 2. With 16-token blocks: Llama-3.2-3B 28 × 2 × 16 × 8 × 128 × 2 = 1,835,008 bytes (4,681 blocks in the default 8 GiB); OLMoE-1B-7B 16 × 2 × 16 × 16 × 128 × 2 = 2,097,152 bytes (4,096 blocks). Logged at startup.
+- Golden fixtures: `tests/golden/olmoe-1b-7b-0125-instruct/reference.jsonl` and `tolerance.json` in the Phase 1 formats and tolerance, generated from the same `tests/golden/prompts.jsonl`; `tests/golden/tools/` holds the tool-calling and structured-output lab prompts (JSONL of chat requests with `tools`/`response_format`).
+- `GET /turbine/v1/scheduler`:
+
+```json
+{
+  "config": {
+    "max_running_requests": 64,
+    "max_batch_tokens": 8192,
+    "prefill_chunk_tokens": 2048,
+    "max_queued_requests": 256,
+    "chunked_prefill": true
+  },
+  "waiting": 3,
+  "prefilling": 1,
+  "decoding": 12,
+  "paused": 0,
+  "constrained": 2,
+  "iterations_total": 18233,
+  "preemptions_total": 2,
+  "last_iteration": {
+    "prefill_tokens": 2048,
+    "decode_tokens": 12,
+    "requests": 13,
+    "duration_ms": 41.7
+  }
+}
+```
+
+- `GET /turbine/v1/kv`:
+
+```json
+{
+  "tiers": [
+    {
+      "tier": "l0",
+      "dtype": "bf16",
+      "block_tokens": 16,
+      "block_bytes": 1835008,
+      "blocks_total": 4681,
+      "blocks_used": 1024,
+      "blocks_free": 3657
+    }
+  ]
+}
+```
+
+## Edge cases
+
+- A request cancelled while waiting, mid-prefill (between chunks), while paused, and in the same iteration it would finish.
+- A prompt of exactly _scheduler.prefill_chunk_tokens_, one token more, and exactly one block; a prompt whose last chunk ends on a block boundary.
+- Decode needs a new block for every running request in the same iteration and the pool is short by one.
+- Preempting the only running request (must not preempt itself into a livelock: a request whose full KV fits the empty pool always progresses).
+- A preempted request that already streamed tokens: recompute must not resend them; seeded sampling continues from the same PRNG state and the llguidance matcher keeps its position (it is not replayed).
+- `n: 4` where forking needs more blocks than are free (fork waits; the prompt is not re-prefilled); `n: 2` with `response_format` (each choice has its own matcher).
+- Priority ties; a burst of high-priority requests while low-priority ones wait (no aging in Phase 2 — documented starvation risk).
+- Slow client whose channel fills while the request holds many blocks; client that resumes reading just before the slow-client timeout.
+- Request timeout firing during prefill or during grammar compilation; shutdown with a full queue.
+- _scheduler.max_batch_tokens_ smaller than a single decode set (more running requests than budget tokens is prevented by validation).
+- OLMoE: all 8 selected experts of every token in a batch land on the same expert (maximally unbalanced grouped GEMM); an expert selected by no token; router ties; a prompt longer than OLMoE's 4096 positions → 400 `context_length_exceeded`.
+- Structured output: a schema llguidance rejects; an empty-object schema; `enum`/`const`; a schema with unbounded strings reaching `max_tokens` (`finish_reason: "length"`); `logit_bias` or `stop` that would forbid every grammar-allowed token (the mask wins over `logit_bias`; a stop string is still honoured and ends the request).
+- Tool calls: `auto` output that starts like JSON but is not a call; two calls separated by `;`; `parallel_tool_calls: false` with `required` (exactly one call); a tool name containing characters that need JSON escaping; tool messages whose `tool_call_id` matches no prior call (passed to the template unchanged).
+- Llama-3.2's chat template renders tools into the first user message by default; a conversation with no user message and `tools` set raises a template exception → 400.
+- Clock skew in the simulator: all simulator time is virtual; no test sleeps.
+
+## Failure modes
+
+- **Device or kernel error during an iteration:** every request in that iteration fails (500 / stream error event, code `internal_error`), their blocks are freed, waiting requests stay queued; after 3 consecutive failed iterations the server reports `/ready` 503 `device_error` and exits 1 (recovery is Phase 3).
+- **Block pool exhausted:** decodes are protected by preemption (S-6); new prefills wait. It is never an allocation failure because the pool is preallocated.
+- **Queue full or queue timeout:** 429 `queue_full` / 503 `queue_timeout` with reason metrics; no unbounded growth.
+- **Grammar compilation fails, is too large or times out:** 400 `invalid_json_schema` before queueing; nothing enters the engine.
+- **llguidance step limit exceeded or matcher error mid-generation:** that request alone ends with an `internal_error` event (non-streaming: 500), reason `constraint_error` logged; the batch continues.
+- **Engine thread panics:** the panic is logged with the iteration's request ids, all in-flight requests get an `internal_error` event, `/ready` becomes 503 and the process exits 1.
+- **Slow or stalled client:** paused, then cancelled with `slow_client`; other requests keep decoding.
+- **Startup budget exceeded:** exit 1 before loading weights, naming each budget term.
+- **vLLM-ROCm does not start or serve on `gfx1201`:** the baseline records "vLLM-ROCm did not run" with the pod log excerpt; Phase 2 exit is not blocked.
+
+## Acceptance criteria
+
+- [ ] [S-1] `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` exit 0 on macOS arm64 with no ROCm; `cargo tree -p turbine-scheduler` lists no `turbine-kernels`, `turbine-model` or GPU-related crate; fails if the scheduler gains a GPU or model dependency.
+- [ ] [S-2] `cargo test -p turbine-scheduler request::tests::lifecycle_transitions` exits 0; it asserts every allowed state transition succeeds, every disallowed one (e.g. `finished → decoding`) returns an error, and the resource estimate for a 100-token prompt with `max_tokens: 60` and 16-token blocks is 10 blocks; fails if an illegal transition is accepted or the estimate is off.
+- [ ] [S-3] `cargo test -p turbine-scheduler sim::tests::ts_section7_iteration_pattern` exits 0; it replays the TS §7 example (A: 3-chunk prompt, B: 1-chunk prompt arriving after iteration 1, C and D decoding) and asserts the three iteration compositions exactly; fails if decode is starved or prefill order changes.
+- [ ] [S-3] [S-12] `cargo test -p turbine-scheduler sim::tests::decode_never_starved` exits 0; with 1,000 seeded arrivals of mixed prompt lengths it asserts every `decoding` request not `paused` receives a token in every iteration and the simulation is byte-identical across two runs with the same seed; fails if any iteration skips a decodable request or the simulator is nondeterministic.
+- [ ] [S-4] `cargo test -p turbine-scheduler sim::tests::chunk_budget_respected` exits 0; it asserts no iteration exceeds _scheduler.max_batch_tokens_, no chunk exceeds _scheduler.prefill_chunk_tokens_, and with chunked prefill disabled an over-budget prompt is rejected at submission; fails if a budget is exceeded.
+- [ ] [S-4] [S-9] `cargo test -p turbine-model --test tiny_model chunked_prefill_matches_unchunked` exits 0; on the tiny Llama and tiny OLMoE synthetic checkpoints with the CPU provider it asserts the last-position logits after prefilling a 300-token prompt in chunks of 64 equal a single-chunk prefill within 1e-4; fails if chunk boundaries change numerics.
+- [ ] [S-5] `cargo test -p turbine-kv pool::tests::blocks_conserved` exits 0; a `proptest` of random allocate/append/free/fork sequences asserts used + free = total after every step, no block is owned by two tables, and freeing a table returns exactly its blocks; fails if any block leaks or is owned twice.
+- [ ] [S-5] [S-9] `cargo test -p turbine-model --test tiny_model paged_matches_contiguous` exits 0; it asserts batched paged-KV decoding of 4 sequences of different lengths on the CPU provider gives logits equal to four Phase 1 contiguous single-sequence runs within 1e-4, for both tiny checkpoints; fails if block tables or ragged indexing are wrong.
+- [ ] [S-5] [S-16] [S-15] `cargo test -p turbine-kernels --test hip_ops paged_and_moe_ops -- --ignored` passes inside `scripts/lab-test.sh novanas` (which exits 0); it asserts the HIP `attention_prefill_paged`, `attention_decode_paged`, `copy_blocks`, `moe_route` and `moe_experts` ops match the CPU reference on seeded ragged batches (tolerances as in Phase 1; `moe_route` selections identical), including a batch where every token selects the same 8 experts and one where an expert receives no token, and the log names the CK and hipBLASLt implementations used; fails if any batched op diverges.
+- [ ] [S-6] `cargo test -p turbine-scheduler sim::tests::preemption_by_recompute` exits 0; with a pool too small for all running requests it asserts the lowest-priority most-recent request is preempted, re-queued at the front, re-prefills prompt + generated tokens, emits no duplicate token, and that a request whose total KV fits the empty pool always completes; fails if the scheduler livelocks, picks the wrong victim or duplicates output.
+- [ ] [S-6] [S-9] `cargo test -p turbine-server --test tiny_server preempted_output_unchanged` exits 0; with a tiny `kv.gpu.max_bytes` forcing preemption, 8 seeded concurrent requests (two of them with a `json_schema` response format) produce the same tokens as the same requests run one at a time; fails if preemption changes output or breaks a constrained request.
+- [ ] [S-7] `cargo test -p turbine-server --test tiny_server queue_full_429` exits 0; with _scheduler.max_queued_requests_ 2 and _scheduler.max_running_requests_ 1 it sends 6 concurrent requests and asserts 3 complete, 3 get `429` `queue_full` with `retry-after`, and `turbine_admission_total{outcome="rejected",reason="queue_full"} 3`; fails if the queue grows past its bound.
+- [ ] [S-7] `cargo test -p turbine-server --test tiny_server slow_client_paused_then_cancelled` exits 0; with _server.slow_client_timeout_ 1s a client that stops reading is `paused` (visible in `/turbine/v1/scheduler`), other streams keep progressing, and after 1 s it is cancelled with reason `slow_client` and its blocks freed; fails if a slow client blocks the engine or holds blocks forever.
+- [ ] [S-7] `cargo test -p turbine-server --test tiny_server request_and_queue_timeouts` exits 0; it asserts a streaming request exceeding _server.request_timeout_ ends with an error event code `request_timeout` followed by `data: [DONE]` (CONFLICT C-3), a non-streaming one gets `504`, and a request waiting past _scheduler.queue_timeout_ gets `503` `queue_timeout`; fails if either timeout is ignored.
+- [ ] [S-8] `cargo test -p turbine-scheduler sim::tests::cancellation_frees_within_one_iteration` exits 0; it cancels requests in each state (waiting, prefilling between chunks, decoding, paused) and asserts their blocks are free before the next iteration is planned; fails if release takes more than one iteration.
+- [ ] [S-8] `cargo test -p turbine-server --test tiny_server disconnect_releases_kv` exits 0; it opens 8 streams, drops 4 clients, and asserts `/turbine/v1/kv` `blocks_used` falls to the remaining requests' usage within 1 s and to 0 after all finish, with `turbine_requests_cancelled_total{reason="client_disconnect"} 4`; fails if a disconnected request keeps blocks.
+- [ ] [S-10] `cargo test -p turbine-server --test tiny_server openai_phase2_fields` exits 0; it asserts `n: 3` returns 3 choices with indices 0–2 (streaming and not) from one prefill (`turbine_tokens_total{kind="prompt"}` grows by the prompt length once), penalties and `logit_bias` change greedy output as the reference host sampler predicts, `min_tokens` suppresses EOS, `stop_token_ids` stops, `"echo": true` prepends the prompt text to the completion, and `priority` orders two queued requests; fails if any field is ignored or rejected.
+- [ ] [S-11] `cargo test -p turbine-server --test tiny_server diagnostics_shapes` exits 0; it asserts `/turbine/v1/scheduler` and `/turbine/v1/kv` return the Data shapes with counts consistent with the running load, and `/turbine/v1/pressure` still returns 501; fails if a field is missing or counts disagree with the metrics.
+- [ ] [S-12] `cargo test -p turbine-scheduler sim::tests::bounded_under_overload` exits 0; it drives arrivals at 10× the simulated service rate for 10,000 virtual seconds and asserts the waiting queue never exceeds _scheduler.max_queued_requests_, running never exceeds _scheduler.max_running_requests_, and excess arrivals are rejected with `queue_full`; fails if any bound is exceeded.
+- [ ] [S-13] `cargo test -p turbine-server --test server_cli sigterm_drains_then_cancels` exits 0; with _server.shutdown_grace_ 2s it starts one short and one very long generation, sends SIGTERM, and asserts new requests get 503 `shutting_down`, the short one completes, the long one ends with error code `shutting_down`, and the process exits 0 within 3 s; fails if shutdown hangs or drops the short request.
+- [ ] [S-14] `cargo test -p turbine-server --test tiny_server phase2_metrics_and_reasons` exits 0; after a run that queues, rejects, preempts, cancels and serves a constrained request, it asserts each metric in Interfaces is present with the expected counts and that a JSON log record with `reason` exists for each reject, preemption and cancellation; fails if an automatic decision is unexplained.
+- [ ] [S-16] `cargo test -p turbine-model config::tests::parses_olmoe_config` exits 0; it parses the committed OLMoE-1B-7B-0125-Instruct `config.json` fixture and asserts 16 layers, hidden 2048, 16/16 heads, head_dim 128, 64 experts, top-8, expert width 1024, _norm_topk_prob_ false, rope theta 10000, vocab 50304, untied embeddings; fails if any field is misread or the architecture is refused.
+- [ ] [S-16] `cargo test -p turbine-model --test tiny_model olmoe_cpu_forward_matches_naive` exits 0; on a tiny synthetic OLMoE checkpoint (2 layers, 8 experts, top-2) it asserts CPU-provider logits equal an independent naive f32 implementation in the test within 1e-4, including Q/K norm and unrenormalised routing weights; fails if routing, expert compute or Q/K norm is wrong.
+- [ ] [S-17] `cargo test -p turbine-server --test tiny_server response_format_json_schema` exits 0; on the tiny random-weight checkpoint it sends 20 seeded sampled requests (`temperature: 1.0`) with `{"type":"json_schema"}` for an object with a boolean, an integer enum and a string enum (no additional properties), and 5 with `json_object`, and asserts every completed output parses and validates with `jsonschema`, contains no whitespace outside strings, and ends with `finish_reason: "stop"`; and that a schema with an unsupported keyword and one over _structured_output.max_schema_bytes_ each get 400 `invalid_json_schema`; fails if any output is invalid or a bad schema is queued.
+- [ ] [S-17] `cargo test -p turbine-model structured::tests::mask_applied_before_sampling` exits 0; it asserts that with a mock matcher allowing only token ids {5, 9}, greedy and seeded sampling never produce another id even when `logit_bias` favours id 3, and that EOS is masked until the matcher accepts; fails if the mask is applied after sampling or bypassed.
+- [ ] [S-18] `cargo test -p turbine-model tools::tests::llama3_json_parser` exits 0; it asserts the parser extracts one call, two `;`-separated calls, a call preceded by `<|python_tag|>`, returns content for plain text and for JSON that is not a call object, and re-serialises `parameters` as the `arguments` string; fails if a call is missed or plain text is turned into a call.
+- [ ] [S-18] `cargo test -p turbine-model chat_template::tests::renders_llama_tools` exits 0; it renders the committed Llama-3.2 template with a `get_weather` tool, an assistant `tool_calls` message and a `tool` result, and asserts the exact string transformers produces (recorded in the fixture); fails if tools or tool messages render differently.
+- [ ] [S-18] `cargo test -p turbine-server --test tiny_server tool_choice_modes` exits 0; on the tiny checkpoint with _model.tool_call_parser_ `llama3_json` it asserts `tool_choice` named returns exactly one call to that function whose arguments validate against its schema with `finish_reason: "tool_calls"` (streaming and not, ids matching `call_[A-Za-z0-9]{24}`), `required` with `parallel_tool_calls: false` returns exactly one call to a listed tool, `none` returns content only, an unknown named function gets 400, and `tools` against a checkpoint whose template has no `tools` gets 400 `tools_not_supported`; fails if a constrained call does not parse or validate.
+- [ ] [S-15] [S-16] Manual lab run (after asking the user that an R9700 is free): for each of `scripts/lab/phase2-novanas-llama.yaml` and `scripts/lab/phase2-novanas-olmoe.yaml`, `scripts/lab-serve.sh novanas <config>` reaches `/ready` 200 and `turbine-golden compare --url http://192.168.10.203:18000 --reference tests/golden/<slug>/reference.jsonl --concurrency 16` exits 0, meeting the Phase 1 tolerance with all prompts in flight at once; both outputs pasted into task evidence; fails if batching or MoE routing changes outputs beyond tolerance.
+- [ ] [S-15] [S-17] [S-18] `cargo test -p turbine-server --test lab_openai tools_and_json_schema -- --ignored` passes inside `scripts/lab-test.sh novanas` (which exits 0) with the real Llama-3.2-3B; it runs every request in `tests/golden/tools/` greedily and asserts `required`/named tool calls and `json_schema` outputs parse and validate, and `auto` requests return either valid tool calls or content with no raw call JSON leaking into `content`; fails if a constrained output is invalid or the parser leaks a call.
+- [ ] [S-15] Manual baseline run (after asking the user that an R9700 is free): `turbine-bench --url http://192.168.10.203:18000 --concurrency 16 --requests 200 --prompt-words 512 --max-tokens 256 --ignore-eos --output json` exits 0 with `requests_failed: 0` against Turbine serving each model; then `scripts/lab-serve.sh novanas --vllm <slug>` and the same command against `http://192.168.10.203:18100`, run for each model if vLLM-ROCm starts. All JSON reports (or the "vLLM-ROCm did not run" record with the pod log excerpt) are pasted into task evidence with the ROCm version, image tags and card noted as the Phase 2 baseline; there is no numeric bar; fails if Turbine fails any request or a report is missing.
+- [ ] [S-15] Manual overload run (after asking the user): `turbine-bench --url http://192.168.10.203:18000 --concurrency 512 --requests 2000 --max-tokens 256 --ignore-eos --output json` exits 0 against Turbine (Llama config) with _scheduler.max_queued_requests_ 256; the report shows some requests rejected with 429, the `turbine-server` pod is still running afterwards with `/ready` 200, and `/turbine/v1/kv` shows 0 used blocks once idle; fails if the worker dies, OOMs or leaks blocks.
+
+## Open questions
+
+<!-- None: decisions recorded in .procoder/ask/decisions.md -->
