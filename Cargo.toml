@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+turbine-core = { path = "crates/turbine-core" }
+turbine-observability = { path = "crates/turbine-observability" }
+turbine-device = { path = "crates/turbine-device" }
+turbine-api = { path = "crates/turbine-api" }
+axum = "0.8.9"
+clap = { version = "4.6.7", features = ["derive"] }
+libloading = "0.9.0"
+nvml-wrapper = "0.13.0"
+prometheus-client = "0.25.1"
+reqwest = { version = "0.13.5", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_norway = "0.9.42"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5.3", features = ["util"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1.26.1", features = ["v4"] }

@@ -1,0 +1,16 @@
+[package]
+name = "turbine-core"
+description = "Turbine configuration model and shared vocabulary types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_norway.workspace = true
+thiserror.workspace = true
+tracing-subscriber.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
