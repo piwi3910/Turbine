@@ -1979,6 +1979,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbine-scheduler"
+version = "0.1.0"
+dependencies = [
+ "prometheus-client",
+ "proptest",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tracing",
+ "turbine-core",
+ "turbine-kv",
+ "turbine-observability",
+ "uuid",
+]
+
+[[package]]
 name = "turbine-server"
 version = "0.1.0"
 dependencies = [
