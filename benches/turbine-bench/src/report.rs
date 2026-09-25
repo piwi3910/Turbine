@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::open_loop::Breakdown;
+
 /// Measurements of one successful request.
 #[derive(Clone, Debug)]
 pub struct RequestStats {
@@ -37,6 +39,9 @@ pub struct Report {
     pub ttft_ms: Percentiles,
     pub itl_ms: Percentiles,
     pub e2e_ms: Percentiles,
+    /// `by_status`, `by_error_code`, `client_dropped`, `streams_incomplete` (phase 3).
+    #[serde(flatten)]
+    pub breakdown: Breakdown,
 }
 
 /// Nearest-rank percentiles of `values`. Empty input gives zeros.
@@ -88,7 +93,14 @@ impl Report {
                     .collect(),
             ),
             e2e_ms: percentiles(ok.iter().map(|r| ms(r.e2e)).collect()),
+            breakdown: Breakdown::default(),
         }
+    }
+
+    /// The report with the run's status / error-code breakdown attached.
+    pub fn with_breakdown(mut self, breakdown: Breakdown) -> Report {
+        self.breakdown = breakdown;
+        self
     }
 
     /// Human-readable rendering: counts, wall time, throughputs and latency percentile rows.
@@ -108,6 +120,21 @@ impl Report {
             "output token throughput: {:.3} tok/s",
             self.output_token_throughput
         );
+        let counts = |m: &std::collections::BTreeMap<String, u64>| {
+            if m.is_empty() {
+                "-".to_string()
+            } else {
+                m.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        };
+        let b = &self.breakdown;
+        let _ = writeln!(s, "by status:               {}", counts(&b.by_status));
+        let _ = writeln!(s, "by error code:           {}", counts(&b.by_error_code));
+        let _ = writeln!(s, "client dropped:          {}", b.client_dropped);
+        let _ = writeln!(s, "streams incomplete:      {}", b.streams_incomplete);
         s.push_str("latency (ms):\n");
         for (name, p) in [
             ("ttft", &self.ttft_ms),
@@ -161,7 +188,12 @@ mod tests {
                 output_tokens: 2,
             },
         ];
-        let r = Report::from_results(&ok, 1, Duration::from_secs(2));
+        let mut breakdown = Breakdown::default();
+        breakdown.record(200, None, true);
+        breakdown.record(200, None, true);
+        breakdown.record(503, Some("overloaded"), false);
+        breakdown.dropped();
+        let r = Report::from_results(&ok, 1, Duration::from_secs(2)).with_breakdown(breakdown);
         assert_eq!(r.requests_ok, 2);
         assert_eq!(r.requests_failed, 1);
         assert_eq!(r.request_throughput, 1.0);
@@ -181,15 +213,27 @@ mod tests {
             "ttft_ms",
             "itl_ms",
             "e2e_ms",
+            "by_status",
+            "by_error_code",
+            "client_dropped",
+            "streams_incomplete",
         ] {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
+        assert_eq!(json["by_status"]["200"], 2);
+        assert_eq!(json["by_status"]["503"], 1);
+        assert_eq!(json["by_error_code"]["overloaded"], 1);
+        assert_eq!(json["client_dropped"], 1);
+        assert_eq!(json["streams_incomplete"], 0);
         assert!(json["ttft_ms"].get("p95").is_some());
 
         let text = r.to_text();
         assert!(text.contains("requests failed:         1"));
         assert!(text.contains("output token throughput: 2.500 tok/s"));
         assert!(text.contains("itl"));
+        assert!(text.contains("by status:               200=2 503=1"));
+        assert!(text.contains("by error code:           overloaded=1"));
+        assert!(text.contains("client dropped:          1"));
     }
 
     #[test]

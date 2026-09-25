@@ -2246,6 +2246,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
+ "rand_chacha",
  "reqwest",
  "serde",
  "serde_json",
