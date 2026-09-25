@@ -1,0 +1,73 @@
+# k3s Job run by scripts/lab-test.sh novanas: the full test suite, including #[ignore] GPU
+# tests, in rust:1.97-trixie with both R9700 GPUs and the host ROCm tree mounted read-only.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: turbine-lab-test
+  namespace: turbine-ci
+  labels:
+    turbine-lab: "true"
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        turbine-lab: "true"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: test
+          image: rust:1.97-trixie
+          workingDir: /home/piwi/turbine-ci/src
+          command:
+            - "cargo"
+            - "test"
+            - "--workspace"
+            - "--"
+            - "--include-ignored"
+            - "--show-output"
+          env:
+            - name: CARGO_TARGET_DIR
+              value: /home/piwi/turbine-ci/target
+            - name: LD_LIBRARY_PATH
+              value: /opt/rocm/rocm/lib:/opt/rocm/rocm/lib/rocm_sysdeps/lib
+            - name: TURBINE_AMD_SMI_LIBRARY
+              value: /opt/rocm/rocm/lib/libamd_smi.so.26.5.0
+            - name: TURBINE_EXPECT_AMD
+              value: "2"
+            - name: TURBINE_EXPECT_AMD_ARCH
+              value: gfx1201
+          resources:
+            limits:
+              amd.com/gpu: 2
+          volumeMounts:
+            - name: turbine-ci
+              mountPath: /home/piwi/turbine-ci
+            - name: cargo-registry
+              mountPath: /usr/local/cargo/registry
+            - name: rocm
+              mountPath: /opt/rocm/rocm
+              readOnly: true
+            # /opt/rocm/rocm/lib is a symlink to /etc/alternatives/rocm-lib on novanas.
+            - name: rocm-lib-alternative
+              mountPath: /etc/alternatives/rocm-lib
+              readOnly: true
+      volumes:
+        - name: turbine-ci
+          hostPath:
+            path: /home/piwi/turbine-ci
+            type: Directory
+        - name: cargo-registry
+          hostPath:
+            path: /home/piwi/turbine-ci/cargo-registry
+            type: DirectoryOrCreate
+        - name: rocm
+          hostPath:
+            path: /opt/rocm/rocm
+            type: Directory
+        - name: rocm-lib-alternative
+          hostPath:
+            path: /etc/alternatives/rocm-lib
+            type: Directory
