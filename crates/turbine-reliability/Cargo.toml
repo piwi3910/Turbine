@@ -1,0 +1,27 @@
+[package]
+name = "turbine-reliability"
+description = "Turbine memory budget, reservation ledger, pressure control, admission, recovery and circuit breaking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# P3 S-16: allocation fault injector; enabled through turbine-server's fault-injection feature.
+fault-injection = ["turbine-core/fault-injection"]
+
+[dependencies]
+arc-swap.workspace = true
+prometheus-client.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+turbine-core.workspace = true
+turbine-observability.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
