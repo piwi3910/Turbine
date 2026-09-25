@@ -1,0 +1,28 @@
+[package]
+name = "turbine-kernels"
+description = "Turbine kernel capability traits, registry, CPU reference provider and runtime-loaded shim bindings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+turbine-core.workspace = true
+turbine-device.workspace = true
+turbine-observability.workspace = true
+turbine-tensor.workspace = true
+# Kernel selection log and the turbine_kernel_provider_selected gauge
+prometheus-client.workspace = true
+tracing.workspace = true
+# Runtime loading of the kernel shim library; nothing links a GPU library at build time
+libloading.workspace = true
+
+[dev-dependencies]
+# Captures the JSON kernel selection log in registry tests
+tracing-subscriber.workspace = true
+
+# FFI to the kernel shim libraries; every `unsafe` block carries a `// SAFETY:` comment
+# (contract §1.3, checked by tests/unsafe_isolation.rs).
+[lints.rust]
+unsafe_code = "allow"

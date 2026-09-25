@@ -1,0 +1,96 @@
+//! The kernel C ABI header names no vendor, declares the entry-point trio of every op the
+//! registry binds, and carries the ABI version the Rust side expects (P1 AC S-1/S-7, contract §9).
+use std::path::Path;
+
+use turbine_kernels::TURBINE_KERNELS_ABI_VERSION;
+use turbine_kernels::ops::OpKind;
+
+/// Identifier prefixes that name a vendor or vendor runtime (contract §9.2), lowercase.
+const VENDOR_PREFIXES: &[&str] = &["hip", "cuda", "rocm", "nv"];
+
+fn header() -> String {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/include/turbine_kernels.h");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// Removes `/* … */` and `// …` comments (C comments do not nest).
+fn strip_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(c) = rest.chars().next() {
+        if let Some(r) = rest.strip_prefix("/*") {
+            out.push(' ');
+            rest = r.find("*/").map_or("", |e| &r[e + 2..]);
+        } else if let Some(r) = rest.strip_prefix("//") {
+            rest = r.find('\n').map_or("", |e| &r[e..]);
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
+/// C identifiers in `code`: maximal `[A-Za-z_][A-Za-z0-9_]*` runs.
+fn identifiers(code: &str) -> Vec<&str> {
+    code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| w.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
+        .collect()
+}
+
+#[test]
+fn header_has_no_vendor_identifiers() {
+    let code = strip_comments(&header());
+    let vendor: Vec<&str> = identifiers(&code)
+        .into_iter()
+        .filter(|id| {
+            let lower = id.to_ascii_lowercase();
+            VENDOR_PREFIXES.iter().any(|v| lower.starts_with(v))
+        })
+        .collect();
+    assert!(
+        vendor.is_empty(),
+        "vendor identifiers in turbine_kernels.h: {vendor:?}"
+    );
+}
+
+#[test]
+fn header_declares_every_registry_op() {
+    let code = strip_comments(&header());
+    let missing: Vec<String> = OpKind::ALL
+        .iter()
+        .flat_map(|op| {
+            ["", "_supported", "_impl"].map(|suffix| format!("turbine_{}{suffix}(", op.as_str()))
+        })
+        .filter(|decl| !code.contains(decl.as_str()))
+        .collect();
+    assert!(missing.is_empty(), "turbine_kernels.h lacks {missing:?}");
+}
+
+#[test]
+fn header_abi_version_matches_rust_constant() {
+    let code = strip_comments(&header());
+    let defines: Vec<&str> = code
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("#define TURBINE_ABI_VERSION"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        defines.len(),
+        1,
+        "expected exactly one TURBINE_ABI_VERSION define"
+    );
+    let value: u32 = defines[0]
+        .strip_suffix('u')
+        .unwrap_or_else(|| {
+            panic!(
+                "TURBINE_ABI_VERSION {} is not an unsigned literal",
+                defines[0]
+            )
+        })
+        .parse()
+        .unwrap_or_else(|e| panic!("TURBINE_ABI_VERSION {}: {e}", defines[0]));
+    assert_eq!(value, TURBINE_KERNELS_ABI_VERSION);
+    assert_eq!(TURBINE_KERNELS_ABI_VERSION, 1, "Phase 1 ships ABI v1");
+}

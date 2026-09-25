@@ -14,6 +14,7 @@ turbine-observability = { path = "crates/turbine-observability" }
 turbine-device = { path = "crates/turbine-device" }
 turbine-api = { path = "crates/turbine-api" }
 turbine-tensor = { path = "crates/turbine-tensor" }
+turbine-kernels = { path = "crates/turbine-kernels" }
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 futures-util = "0.3.34"
@@ -31,3 +32,8 @@ tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.26.1", features = ["serde", "v4"] }
+
+# The CPU reference provider is the numerical oracle for GPU op tests on real shapes; optimise it
+# even in dev/test builds so those comparisons finish in seconds.
+[profile.dev.package.turbine-kernels]
+opt-level = 3

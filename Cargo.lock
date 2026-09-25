@@ -1334,6 +1334,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbine-kernels"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.9.0",
+ "prometheus-client",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+ "turbine-core",
+ "turbine-device",
+ "turbine-observability",
+ "turbine-tensor",
+]
+
+[[package]]
 name = "turbine-observability"
 version = "0.1.0"
 dependencies = [
