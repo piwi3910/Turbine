@@ -147,6 +147,45 @@ pub struct ModelShape {
     pub max_position_embeddings: u32,
 }
 
+/// One sequence (= one choice of a request); an engine-local counter.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SeqId(pub u64);
+
+/// Logical L0 (GPU) KV block id: the block's index in the preallocated pool.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BlockId(pub u32);
+
+/// Request priority (the vLLM `priority` extension): lower is served first; default 0
+/// (CONFLICT C-10).
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct Priority(pub i32);
+
+impl Priority {
+    /// `< 0` High, `0` Normal, `> 0` Low (CONFLICT C-10).
+    pub fn class(self) -> PriorityClass {
+        match self.0 {
+            i32::MIN..=-1 => PriorityClass::High,
+            0 => PriorityClass::Normal,
+            _ => PriorityClass::Low,
+        }
+    }
+}
+
+/// Coarse priority class derived from `Priority` (P4 weights, P6 routing).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PriorityClass {
+    High,
+    Normal,
+    Low,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,6 +14,8 @@ tracing-subscriber.workspace = true
 # Phase 1: RequestId (uuid) and the EOS id list of StopConditions (smallvec)
 uuid.workspace = true
 smallvec.workspace = true
+# Phase 2: the JSON schema carried by ConstraintSpec::JsonSchema
+serde_json.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -1823,6 +1823,7 @@ name = "turbine-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "serde_norway",
  "smallvec",
  "thiserror 2.0.21",
