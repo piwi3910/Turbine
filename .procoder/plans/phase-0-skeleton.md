@@ -5,7 +5,7 @@ Spec: .procoder/specs/phase-0-skeleton.md
 
 ## Goal
 
-Stand up the Turbine Cargo workspace — configuration model, observability, GPU discovery, the V1 HTTP route shell, the `turbine-server` binary, the `turbine-bench` load generator and the lab test runner — so it builds, tests and lints on macOS without a GPU and proves device discovery on dgx-spark, dgx-spark2 and novanas.
+Stand up the Turbine Cargo workspace — configuration model, observability, GPU discovery, the V1 HTTP route shell, the `turbine-server` binary, the `turbine-bench` load generator and the lab test runner — so it builds, tests and lints on macOS without a GPU and proves device discovery on novanas. `scripts/lab-test.sh` supports the Sparks too, but Phase 0 does not run there: the Spark discovery check moves to phase-2b-nvidia and the real-stream `turbine-bench` check to phase-1-single-request (decisions 2026-09-25).
 
 ## Architecture
 
@@ -278,7 +278,7 @@ Interfaces:
 - `pub async fn run(args: &BenchArgs) -> Result<Report, BenchError>`; `pub enum BenchError { Usage(String), Target(String) }` + `pub fn exit_code(&self) -> u8` (2 / 1)
 - reqwest 0.13 without default features: `Client::post(url).header(..).body(String).send()`, `Response::chunk()` for streaming (no `stream` feature needed).
 
-Covers: S-6; `bench mock_endpoint_measurements`, `bench failures_counted`, manual run against dgx-spark vLLM.
+Covers: S-6; `bench mock_endpoint_measurements`, `bench failures_counted`. (The manual real-stream run moved to phase-1-single-request, decision 2026-09-25.)
 Depends on: Task 6.
 
 - [ ] Write failing test `bench mock_endpoint_measurements`: mock server sends a role-only chunk (`delta.content: ""`), waits 100 ms, sends 5 content chunks 20 ms apart, a usage chunk `completion_tokens: 5`, then `data: [DONE]`; `--model mock-model --concurrency 2 --requests 4 --output json` → exit 0, `requests_ok` 4, `ttft_ms.p50` ≥ 100, `itl_ms.p50` ≥ 20, `e2e_ms.p50` ≥ 180, `output_token_throughput × wall_seconds` = 20; a second server with `completion_tokens: 7` and 1 request gives 7 tokens (usage wins over chunk count).
@@ -290,7 +290,6 @@ Depends on: Task 6.
 - [ ] Run: `cargo test -p turbine-bench` — expect PASS (unit + 2 integration tests).
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 - [ ] Commit: `feat(bench): streaming OpenAI load generator with TTFT/ITL/E2E percentiles`
-- [ ] Lab (manual acceptance): ASK THE USER FIRST — this sends 10 requests to the production vLLM on dgx-spark:8000 (benchmark runs are always asked). After approval run `cargo run --release -p turbine-bench -- --url http://192.168.10.246:8000 --concurrency 2 --requests 10 --output json` — expect exit 0, `"requests_ok": 10`, `ttft_ms.p50` > 0 and `output_token_throughput` > 0; paste the JSON into the task evidence.
 
 ## Task 8: Lab runner — `scripts/lab-test.sh`, novanas Job, lab inventory test
 
@@ -307,7 +306,7 @@ Interfaces:
 - Log lines: the pretty inventory JSON and per device `lab-inventory: index=<i> vendor=<v> name=<debug-quoted> arch=<a> memory.kind=<k> total_bytes=<n>`.
 - Consumes `discover`, `DiscoveryOptions::from_config`, `DeviceInventory::count` (Task 3).
 
-Covers: S-7, S-4 on real hardware; `lab inventory_matches_expectation` and the three `scripts/lab-test.sh` runs.
+Covers: S-7, S-4 on real hardware; `lab inventory_matches_expectation` and the `scripts/lab-test.sh novanas` run. The script keeps its dgx-spark/dgx-spark2 branch, but Phase 0 does not run it; the Spark discovery check is phase-2b-nvidia's (decision 2026-09-25).
 Depends on: Tasks 1–7 (the lab run executes the whole suite).
 
 - [ ] Write failing test `lab inventory_matches_expectation` (`#[ignore = "needs lab GPUs; run via scripts/lab-test.sh"]`): discovers with `DiscoveryOptions::from_config(&DevicesConfig::default())`, prints the log lines above, asserts NVIDIA count = `TURBINE_EXPECT_NVIDIA`, AMD count = `TURBINE_EXPECT_AMD`, every NVIDIA device's kind = `TURBINE_EXPECT_NVIDIA_MEMORY` with total > 0 and `shared_with_host` matching, every AMD device's arch = `TURBINE_EXPECT_AMD_ARCH`, kind dedicated, total > 0.
@@ -319,8 +318,6 @@ Depends on: Tasks 1–7 (the lab run executes the whole suite).
 - [ ] Run: `ssh -o BatchMode=yes piwi@192.168.10.203 'kubectl apply --dry-run=client -o name -f -' < scripts/lab/novanas-test-job.yaml` — expect PASS (`job.batch/turbine-lab-test`, nothing created).
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 - [ ] Commit: `feat(lab): lab-test runner for dgx-spark, dgx-spark2 and novanas with inventory check`
-- [ ] Lab dgx-spark: check `ssh -o BatchMode=yes piwi@192.168.10.246 "awk '/MemAvailable/ {print int(\$2/1048576)}' /proc/meminfo"` ≥ 40 (GiB); if lower, ASK THE USER FIRST (production vLLM holds the memory; never stop it yourself). Run `scripts/lab-test.sh dgx-spark` — expect exit 0, `lab-inventory: index=0 vendor=nvidia name="NVIDIA GB10" arch=sm_121 memory.kind=unified total_bytes=<non-zero>`, `test inventory_matches_expectation ... ok`, final line `lab-test: dgx-spark: PASS`.
-- [ ] Lab dgx-spark2: same MemAvailable check against `piwi@192.168.10.245` (ASK THE USER FIRST if < 40 GiB), then `scripts/lab-test.sh dgx-spark2` — expect the same `vendor=nvidia name="NVIDIA GB10" arch=sm_121 memory.kind=unified` line and `lab-test: dgx-spark2: PASS`.
 - [ ] Lab novanas: ASK THE USER FIRST — on 2026-09-25 both `amd.com/gpu` were allocated to a pod in namespace `kuvryn-ai-workloads`; the user frees them. Confirm with `ssh -o BatchMode=yes piwi@192.168.10.203 'kubectl describe node 2>/dev/null | grep -A10 "Allocated resources" | grep amd.com/gpu'` showing `0  0`, then run `scripts/lab-test.sh novanas` — expect `lab-inventory: index=0 vendor=amd name="AMD Radeon AI PRO R9700" arch=gfx1201 memory.kind=dedicated`, the same for `index=1`, `test inventory_matches_expectation ... ok`, and `lab-test: novanas: PASS`. If the script reports the pod unschedulable, stop and ask.
 
 ## Task 9: Workspace acceptance, `examples/turbine.yaml` and `AGENTS.md` commands
@@ -339,7 +336,7 @@ Depends on: Tasks 1–8.
 
 - [ ] Write failing test: `cargo run -q -p turbine-server -- --config examples/turbine.yaml --check-config` — expect FAIL (`cannot read examples/turbine.yaml`, exit 2) before the file exists.
 - [ ] Implement `examples/turbine.yaml` as described; rerun — expect PASS (`config ok`, exit 0).
-- [ ] Implement `AGENTS.md`: replace the "Project state" paragraph with one stating the repo holds the spec plus the Phase 0 skeleton (the six crates serving the V1 route surface without a model; phase specs in `.procoder/specs/`, cross-phase names in `.procoder/contract/interfaces.md`); replace the whole "Commands" section with: toolchain Rust 1.97 / edition 2024 and "no GPU needed to build or test"; build `cargo build --workspace`; test `cargo test --workspace`; one crate `cargo test -p turbine-core`; one unit test `cargo test -p turbine-core config::tests::byte_size_parsing`; one integration test `cargo test -p turbine-api --test api route_table_phase0`; lint `cargo clippy --workspace --all-targets -- -D warnings`; format `cargo fmt --all` / `cargo fmt --all --check`; lab `scripts/lab-test.sh dgx-spark|dgx-spark2|novanas` with the ask-first rule; `cargo run -p turbine-server -- --config examples/turbine.yaml --check-config`; `cargo run -p turbine-server -- --config examples/turbine.yaml --set server.listen=127.0.0.1:8000`; `cargo run -p turbine-bench -- --help`; `cargo run --release -p turbine-bench -- --url http://127.0.0.1:8000 --concurrency 2 --requests 10 --output json` (http only; exit 0/1/2; production vLLM benchmarks asked first); and the server exit codes 0/1/2.
+- [ ] Implement `AGENTS.md`: replace the "Project state" paragraph with one stating the repo holds the spec plus the Phase 0 skeleton (the six crates serving the V1 route surface without a model; phase specs in `.procoder/specs/`, cross-phase names in `.procoder/contract/interfaces.md`); replace the whole "Commands" section with: toolchain Rust 1.97 / edition 2024 and "no GPU needed to build or test"; build `cargo build --workspace`; test `cargo test --workspace`; one crate `cargo test -p turbine-core`; one unit test `cargo test -p turbine-core config::tests::byte_size_parsing`; one integration test `cargo test -p turbine-api --test api route_table_phase0`; lint `cargo clippy --workspace --all-targets -- -D warnings`; format `cargo fmt --all` / `cargo fmt --all --check`; lab `scripts/lab-test.sh dgx-spark|dgx-spark2|novanas` with the ask-first rule; `cargo run -p turbine-server -- --config examples/turbine.yaml --check-config`; `cargo run -p turbine-server -- --config examples/turbine.yaml --set server.listen=127.0.0.1:8000`; `cargo run -p turbine-bench -- --help`; `cargo run --release -p turbine-bench -- --url http://127.0.0.1:8000 --concurrency 2 --requests 10 --output json` (http only; exit 0/1/2; target a local or novanas Turbine; lab benchmark runs are asked first); and the server exit codes 0/1/2.
 - [ ] Run: `cargo build --workspace && cargo test --workspace && cargo test -p turbine-core && cargo test -p turbine-core config::tests::byte_size_parsing && cargo test -p turbine-api --test api route_table_phase0 && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check && cargo run -q -p turbine-server -- --config examples/turbine.yaml --check-config && cargo run -q -p turbine-bench -- --help >/dev/null` — expect PASS (exit 0; 23 passed, 0 failed, 1 ignored across the workspace).
 - [ ] Run: `cargo run -q -p turbine-server -- --config examples/turbine.yaml --set server.listen=127.0.0.1:8000 & sleep 3; curl -s -i http://127.0.0.1:8000/ready | head -1; curl -s http://127.0.0.1:8000/metrics | grep turbine_devices; kill -TERM %1; wait %1; echo exit=$?` — expect PASS: `HTTP/1.1 503 Service Unavailable`, `turbine_devices{vendor="nvidia"} 0`, `turbine_devices{vendor="amd"} 0`, log `shutdown requested; finishing in-flight requests signal="SIGTERM"`, `exit=0` (use SIGTERM: a non-interactive shell starts background jobs with SIGINT ignored).
 - [ ] Run: `grep -rn "unsafe" crates/*/src benches/*/src | grep -v '^crates/turbine-device/src/'` — expect no output; `grep -L 'unsafe_code = "forbid"' crates/*/Cargo.toml benches/*/Cargo.toml` — expect exactly `crates/turbine-device/Cargo.toml`; every `unsafe {` in `crates/turbine-device/src` has `// SAFETY:` within the four lines above it.

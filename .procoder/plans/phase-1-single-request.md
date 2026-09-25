@@ -494,13 +494,14 @@ Files: `AGENTS.md` (Commands section: `scripts/lab-serve.sh`, `turbine-golden`, 
 Interfaces:
 
 - Consumes `scripts/lab-serve.sh novanas scripts/lab/phase1-novanas.yaml`, `turbine-golden compare`, `turbine-bench` (Phase 0)
-  Covers: S-1 AC (`cargo build --workspace`, `cargo test --workspace`, clippy and fmt on macOS arm64 with no ROCm and no weights); S-11/S-13 AC manual `turbine-golden compare --url http://192.168.10.203:18000 …`; S-14 AC manual `turbine-bench … --concurrency 1 --requests 10 --max-tokens 128 --ignore-eos --output json`
+  Covers: S-1 AC (`cargo build --workspace`, `cargo test --workspace`, clippy and fmt on macOS arm64 with no ROCm and no weights); S-11/S-13 AC manual `turbine-golden compare --url http://192.168.10.203:18000 …`; S-14 AC manual `turbine-bench … --concurrency 1 --requests 10 --max-tokens 128 --ignore-eos --output json`; S-14 AC manual real-stream check `turbine-bench … --concurrency 1 --requests 10 --output json` (moved from phase-0 S-6, decision 2026-09-25)
   Depends on: Tasks 17, 18, 21
 
 - [ ] Run on the macOS workstation: `cargo build --workspace && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check && ! cargo tree --workspace | grep -Ei 'hip|rocm|cuda'` — expect PASS with no ROCm installed and no `TURBINE_TEST_MODEL_DIR`.
 - [ ] ASK THE USER FIRST that an R9700 is free; run `scripts/lab-serve.sh novanas scripts/lab/phase1-novanas.yaml` — expect log line `listening` then `/ready` 200 reported by the script.
 - [ ] Run: `cargo run --release -p turbine-bench --bin turbine-golden -- compare --url http://192.168.10.203:18000 --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl` — expect exit 0 (≥ 14/16 prompts passing, max |Δ logprob| ≤ 0.15); paste the output into task evidence.
 - [ ] Run: `cargo run --release -p turbine-bench --bin turbine-bench -- --url http://192.168.10.203:18000 --concurrency 1 --requests 10 --max-tokens 128 --ignore-eos --output json` — expect exit 0 with `"requests_ok": 10`; paste the JSON as the Phase 1 single-request baseline.
+- [ ] Run (real-stream check moved from phase-0, decision 2026-09-25): `cargo run --release -p turbine-bench --bin turbine-bench -- --url http://192.168.10.203:18000 --concurrency 1 --requests 10 --output json` — expect exit 0 with `"requests_ok": 10`, `ttft_ms.p50` > 0 and `output_token_throughput` > 0 (natural EOS; concurrency 1 because a second concurrent request gets 429); paste the JSON into task evidence.
 - [ ] Run: `scripts/lab-serve.sh novanas --stop` — expect the Job deleted and nothing else touched.
 - [ ] Implement the AGENTS.md Commands update and `examples/turbine.yaml` `execution` block; every documented command runs as written.
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings

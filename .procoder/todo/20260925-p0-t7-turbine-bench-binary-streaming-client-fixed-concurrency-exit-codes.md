@@ -5,7 +5,7 @@ Created: 2026-09-25
 
 ## Description
 
-Phase 0 plan Task 7 (`.procoder/plans/phase-0-skeleton.md`, "## Task 7"): turbine-bench binary — streaming client, fixed concurrency, exit codes. Covers S-6; `bench mock_endpoint_measurements`, `bench failures_counted`, manual run against dgx-spark vLLM.. Done when every test step of the task passes, the gate is clean and the task's commit is on `phase-0-skeleton`.
+Phase 0 plan Task 7 (`.procoder/plans/phase-0-skeleton.md`, "## Task 7"): turbine-bench binary — streaming client, fixed concurrency, exit codes. Covers S-6; `bench mock_endpoint_measurements`, `bench failures_counted`. The manual real-stream run is no longer part of this task: it moved to phase-1-single-request (decision 2026-09-25). Done when every test step of the task passes, the gate is clean and the task's commit is on `phase-0-skeleton`.
 
 ## Acceptance criteria
 
@@ -20,4 +20,4 @@ Phase 0 plan Task 7 (`.procoder/plans/phase-0-skeleton.md`, "## Task 7"): turbin
 - `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` → exit 0; `cargo test --workspace` → every `test result: ok`.
 - `launcher.sh check` → `procoder gate: 4 clean, 0 unformatted, 0 unchecked, 1 out of scope, 15 hygiene finding(s) (0 blocking)`.
 - Committed on the task worktree branch with `feat(bench): streaming OpenAI load generator with TTFT/ITL/E2E percentiles`; the phase-0-skeleton criterion is ticked when the coordinator merges it.
-- Manual dgx-spark run (spec S-6 manual acceptance): NOT run, awaiting user approval. Command: `cargo run --release -p turbine-bench -- --url http://192.168.10.246:8000 --concurrency 2 --requests 10 --output json`.
+- Manual real-stream run: moved to phase-1-single-request (decision 2026-09-25: Phase 0 does not run on the Sparks; the check runs against Turbine itself on novanas in Phase 1 Task 22). Not a criterion of this task.
