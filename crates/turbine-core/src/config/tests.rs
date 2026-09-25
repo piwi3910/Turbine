@@ -239,3 +239,170 @@ fn execution_and_model_keys() {
     assert_rejected(base, &["model.max_seq_len=0"], "model.max_seq_len");
     assert_rejected(base, &["execution.backend=rocm"], "execution.backend");
 }
+
+#[test]
+fn phase2_keys() {
+    use std::time::Duration;
+
+    let base = "model:\n  path: /m\n";
+    // Defaults equal the P2 §Configuration table (and C-8 for kv.gpu.max_bytes).
+    let d = parse(base, &[]).unwrap();
+    assert_eq!(
+        d.server.request_timeout,
+        HumanDuration(Duration::from_secs(600))
+    );
+    assert_eq!(
+        d.server.slow_client_timeout,
+        HumanDuration(Duration::from_secs(30))
+    );
+    assert_eq!(
+        d.server.shutdown_grace,
+        HumanDuration(Duration::from_secs(30))
+    );
+    assert_eq!(d.scheduler.max_running_requests, 64);
+    assert_eq!(d.scheduler.max_batch_tokens, 8192);
+    assert_eq!(d.scheduler.prefill_chunk_tokens, 2048);
+    assert_eq!(d.scheduler.max_queued_requests, 256);
+    assert_eq!(
+        d.scheduler.queue_timeout,
+        HumanDuration(Duration::from_secs(60))
+    );
+    assert_eq!(d.kv.gpu.max_bytes, Some(ByteSize::gib(8)));
+    assert_eq!(d.model.tool_call_parser, None);
+    assert_eq!(d.structured_output.max_schema_bytes, ByteSize::kib(64));
+    assert_eq!(
+        d.structured_output.compile_timeout,
+        HumanDuration(Duration::from_secs(5))
+    );
+    assert_eq!(d.effective_max_running(), 64);
+
+    // Durations: <integer><ms|s|m|h>, no space, exact case (C-14).
+    for bad in ["1.5s", "\"2 s\"", "10d", "5", "10S", "s", "-1s"] {
+        assert_rejected(
+            base,
+            &[&format!("scheduler.queue_timeout={bad}")],
+            "scheduler.queue_timeout",
+        );
+    }
+    let t = |v: &str| {
+        parse(base, &[&format!("scheduler.queue_timeout={v}")])
+            .unwrap()
+            .scheduler
+            .queue_timeout
+            .0
+    };
+    assert_eq!(t("250ms"), Duration::from_millis(250));
+    assert_eq!(t("1h"), Duration::from_secs(3600));
+    assert_eq!(t("2m"), Duration::from_secs(120));
+    assert_eq!(t("45s"), Duration::from_secs(45));
+    assert_eq!("10m".parse::<HumanDuration>().unwrap().to_string(), "10m");
+    assert_eq!(
+        "1500ms".parse::<HumanDuration>().unwrap().to_string(),
+        "1500ms"
+    );
+    assert_rejected(
+        base,
+        &["scheduler.queue_timeout=0s"],
+        "scheduler.queue_timeout",
+    );
+    assert_rejected(
+        base,
+        &["server.request_timeout=0ms"],
+        "server.request_timeout",
+    );
+    assert_rejected(
+        base,
+        &["server.slow_client_timeout=0s"],
+        "server.slow_client_timeout",
+    );
+    assert!(parse(base, &["server.shutdown_grace=0s"]).is_ok());
+    assert_rejected(
+        base,
+        &["structured_output.compile_timeout=0s"],
+        "structured_output.compile_timeout",
+    );
+
+    // Scheduler bounds.
+    assert_rejected(
+        base,
+        &[
+            "scheduler.max_batch_tokens=32",
+            "scheduler.max_running_requests=64",
+        ],
+        "scheduler.max_batch_tokens",
+    );
+    assert_rejected(
+        base,
+        &[
+            "scheduler.max_batch_tokens=8",
+            "scheduler.max_running_requests=4",
+        ],
+        "scheduler.max_batch_tokens",
+    );
+    assert_rejected(
+        base,
+        &["scheduler.max_running_requests=0"],
+        "scheduler.max_running_requests",
+    );
+    assert_rejected(
+        base,
+        &["scheduler.max_running_requests=1025"],
+        "scheduler.max_running_requests",
+    );
+    assert_rejected(
+        base,
+        &["scheduler.prefill_chunk_tokens=0"],
+        "scheduler.prefill_chunk_tokens",
+    );
+    assert_rejected(
+        base,
+        &["scheduler.prefill_chunk_tokens=8193"],
+        "scheduler.prefill_chunk_tokens",
+    );
+    assert_rejected(
+        base,
+        &["scheduler.max_queued_requests=0"],
+        "scheduler.max_queued_requests",
+    );
+    assert_rejected(
+        base,
+        &["scheduler.max_queued_requests=65537"],
+        "scheduler.max_queued_requests",
+    );
+
+    // Structured output bounds: 1KiB..=1MiB.
+    assert_rejected(
+        base,
+        &["structured_output.max_schema_bytes=2MiB"],
+        "structured_output.max_schema_bytes",
+    );
+    assert_rejected(
+        base,
+        &["structured_output.max_schema_bytes=512"],
+        "structured_output.max_schema_bytes",
+    );
+    assert!(parse(base, &["structured_output.max_schema_bytes=1MiB"]).is_ok());
+
+    // continuous_batching: false forces one running request.
+    let single = parse(base, &["scheduler.continuous_batching=false"]).unwrap();
+    assert_eq!(single.effective_max_running(), 1);
+
+    let tools = parse(base, &["model.tool_call_parser=llama3_json"]).unwrap();
+    assert_eq!(
+        tools.model.tool_call_parser,
+        Some(ToolCallParserKind::Llama3Json)
+    );
+    let none = parse(base, &["model.tool_call_parser=none"]).unwrap();
+    assert_eq!(none.model.tool_call_parser, Some(ToolCallParserKind::None));
+    assert_rejected(
+        base,
+        &["model.tool_call_parser=hermes"],
+        "model.tool_call_parser",
+    );
+
+    // kv.gpu.max_bytes is optional (C-8).
+    let unset = parse(base, &["kv.gpu.max_bytes=null"]).unwrap();
+    assert_eq!(unset.kv.gpu.max_bytes, None);
+    let four = parse(base, &["kv.gpu.max_bytes=4GiB"]).unwrap();
+    assert_eq!(four.kv.gpu.max_bytes, Some(ByteSize::gib(4)));
+}

@@ -2,6 +2,7 @@
 //! static validation. Every error names the dotted key path.
 
 mod byte_size;
+mod duration;
 mod overrides;
 
 use std::net::SocketAddr;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_norway::{Mapping, Value};
 
 pub use byte_size::ByteSize;
+pub use duration::HumanDuration;
 
 use crate::types::{DeviceId, ExecutionBackend};
 pub use overrides::Override;
@@ -62,6 +64,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub devices: DevicesConfig,
     pub execution: ExecutionConfig,
+    pub structured_output: StructuredOutputConfig,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -69,6 +72,12 @@ pub struct Config {
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub max_request_bytes: ByteSize,
+    /// Total request deadline (Phase 2).
+    pub request_timeout: HumanDuration,
+    /// How long a request may stay paused on a full output channel (Phase 2).
+    pub slow_client_timeout: HumanDuration,
+    /// Drain time for running requests after SIGINT/SIGTERM (Phase 2).
+    pub shutdown_grace: HumanDuration,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +85,9 @@ impl Default for ServerConfig {
         ServerConfig {
             listen: SocketAddr::from(([0, 0, 0, 0], 8000)),
             max_request_bytes: ByteSize::mib(8),
+            request_timeout: HumanDuration::from_secs(600),
+            slow_client_timeout: HumanDuration::from_secs(30),
+            shutdown_grace: HumanDuration::from_secs(30),
         }
     }
 }
@@ -94,6 +106,19 @@ pub struct ModelConfig {
     pub chat_template: Option<PathBuf>,
     /// Default: min(32768, max_position_embeddings); the upper bound is checked at startup.
     pub max_seq_len: Option<u32>,
+    /// Tool-call output parser (Phase 2). Null → `llama3_json` for `LlamaForCausalLM` whose
+    /// template renders `tools`, else `none` (resolved at startup).
+    pub tool_call_parser: Option<ToolCallParserKind>,
+}
+
+/// `model.tool_call_parser` values.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ToolCallParserKind {
+    /// Llama-3.x JSON calls: optional `<|python_tag|>`, then `;`-separated call objects.
+    Llama3Json,
+    None,
 }
 
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -128,11 +153,17 @@ impl Default for KvConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct KvGpuConfig {
     pub enabled: bool,
+    /// L0 block-pool size (Phase 2, default 8GiB). Null is allowed; from Phase 3 null means
+    /// the `kv` pool remainder of the budget (CONFLICT C-8).
+    pub max_bytes: Option<ByteSize>,
 }
 
 impl Default for KvGpuConfig {
     fn default() -> Self {
-        KvGpuConfig { enabled: true }
+        KvGpuConfig {
+            enabled: true,
+            max_bytes: Some(ByteSize::gib(8)),
+        }
     }
 }
 
@@ -189,8 +220,18 @@ impl Default for ReliabilityConfig {
 #[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields, default)]
 pub struct SchedulerConfig {
+    /// `false` forces one running request (`Config::effective_max_running`).
     pub continuous_batching: bool,
+    /// `false` rejects prompts longer than `max_batch_tokens` at submission.
     pub chunked_prefill: bool,
+    pub max_running_requests: u32,
+    /// Per-iteration token budget (decodes + prefill chunks).
+    pub max_batch_tokens: u32,
+    pub prefill_chunk_tokens: u32,
+    /// Waiting-queue bound and HTTP→engine submission-channel capacity (Phase 2, C-1).
+    pub max_queued_requests: u32,
+    /// Longest wait in the queue before 503 `queue_timeout` (Phase 2 only, C-1).
+    pub queue_timeout: HumanDuration,
 }
 
 impl Default for SchedulerConfig {
@@ -198,6 +239,30 @@ impl Default for SchedulerConfig {
         SchedulerConfig {
             continuous_batching: true,
             chunked_prefill: true,
+            max_running_requests: 64,
+            max_batch_tokens: 8192,
+            prefill_chunk_tokens: 2048,
+            max_queued_requests: 256,
+            queue_timeout: HumanDuration::from_secs(60),
+        }
+    }
+}
+
+/// `structured_output` section (Phase 2): bounds on constrained-decoding grammars.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields, default)]
+pub struct StructuredOutputConfig {
+    /// Largest accepted schema or tool-definition JSON.
+    pub max_schema_bytes: ByteSize,
+    /// Longest grammar compilation before 400 `invalid_json_schema`.
+    pub compile_timeout: HumanDuration,
+}
+
+impl Default for StructuredOutputConfig {
+    fn default() -> Self {
+        StructuredOutputConfig {
+            max_schema_bytes: ByteSize::kib(64),
+            compile_timeout: HumanDuration::from_secs(5),
         }
     }
 }
@@ -378,6 +443,83 @@ impl Config {
             return Err(invalid(
                 "logging.level",
                 format!("not a valid tracing filter directive: {e}"),
+            ));
+        }
+        self.validate_phase2()
+    }
+
+    /// Running-request bound actually applied: `scheduler.continuous_batching: false` forces 1.
+    pub fn effective_max_running(&self) -> u32 {
+        if self.scheduler.continuous_batching {
+            self.scheduler.max_running_requests
+        } else {
+            1
+        }
+    }
+
+    /// Phase 2 keys: timeouts, scheduler bounds and structured-output bounds.
+    fn validate_phase2(&self) -> Result<(), ConfigError> {
+        for (key, d) in [
+            ("server.request_timeout", self.server.request_timeout),
+            (
+                "server.slow_client_timeout",
+                self.server.slow_client_timeout,
+            ),
+            ("scheduler.queue_timeout", self.scheduler.queue_timeout),
+            (
+                "structured_output.compile_timeout",
+                self.structured_output.compile_timeout,
+            ),
+        ] {
+            if d.is_zero() {
+                return Err(invalid(key, "must be greater than 0"));
+            }
+        }
+        let s = &self.scheduler;
+        if !(1..=1024).contains(&s.max_running_requests) {
+            return Err(invalid(
+                "scheduler.max_running_requests",
+                format!("must be between 1 and 1024, got {}", s.max_running_requests),
+            ));
+        }
+        if s.max_batch_tokens < s.max_running_requests {
+            return Err(invalid(
+                "scheduler.max_batch_tokens",
+                format!(
+                    "must be at least scheduler.max_running_requests ({}), got {}",
+                    s.max_running_requests, s.max_batch_tokens
+                ),
+            ));
+        }
+        if s.max_batch_tokens < self.kv.block_tokens {
+            return Err(invalid(
+                "scheduler.max_batch_tokens",
+                format!(
+                    "must be at least kv.block_tokens ({}), got {}",
+                    self.kv.block_tokens, s.max_batch_tokens
+                ),
+            ));
+        }
+        if !(1..=s.max_batch_tokens).contains(&s.prefill_chunk_tokens) {
+            return Err(invalid(
+                "scheduler.prefill_chunk_tokens",
+                format!(
+                    "must be between 1 and scheduler.max_batch_tokens ({}), got {}",
+                    s.max_batch_tokens, s.prefill_chunk_tokens
+                ),
+            ));
+        }
+        if !(1..=65536).contains(&s.max_queued_requests) {
+            return Err(invalid(
+                "scheduler.max_queued_requests",
+                format!("must be between 1 and 65536, got {}", s.max_queued_requests),
+            ));
+        }
+        let msb = self.structured_output.max_schema_bytes;
+        if msb < ByteSize::kib(1) || msb > ByteSize::mib(1) {
+            return Err(invalid(
+                "structured_output.max_schema_bytes",
+                format!("must be between 1KiB and 1MiB, got {msb}"),
             ));
         }
         Ok(())
