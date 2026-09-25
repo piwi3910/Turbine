@@ -1,0 +1,22 @@
+[package]
+name = "turbine-kv"
+description = "Turbine KV cache: L0 block pool, block tables, KV accounting and diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+turbine-core.workspace = true
+turbine-observability.workspace = true
+turbine-tensor.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+# Device memory is reached only through turbine-tensor's safe `DeviceMemory` trait.
+[lints.rust]
+unsafe_code = "forbid"
