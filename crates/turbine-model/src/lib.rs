@@ -7,11 +7,13 @@ use turbine_kernels::KernelError;
 use turbine_tensor::MemoryError;
 
 pub mod config;
+pub mod tokenizer;
 
 pub use config::{
     Architecture, GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config,
     load_model_config,
 };
+pub use tokenizer::{IncrementalDetokenizer, Tokenizer};
 
 /// Every failure of the model layer (contract §10). Messages name the offending file, field or
 /// tensor so a startup failure is actionable from the log line alone.
