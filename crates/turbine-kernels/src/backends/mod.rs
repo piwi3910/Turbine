@@ -12,6 +12,7 @@ use turbine_core::types::{DeviceId, MemoryKind};
 use turbine_device::{DeviceInfo, DeviceInventory};
 use turbine_tensor::DeviceMemory;
 
+use crate::cards::CardProfile;
 use crate::{KernelError, KernelProvider, ProviderId, Selection, ShimContext};
 
 pub mod cpu;
@@ -29,6 +30,9 @@ pub struct BackendRequest<'a> {
     pub inventory: &'a DeviceInventory,
     /// Host memory figures (`/proc/meminfo` in production, a fixture in tests).
     pub meminfo: &'a Path,
+    /// `execution.card_profile`: `auto` (the device architecture's profile) or a profile name.
+    /// Backends without card profiles (`cpu`) ignore it.
+    pub card_profile: &'a str,
 }
 
 /// An opened backend: device memory, kernel providers in selection order, and the context
@@ -45,6 +49,8 @@ pub struct OpenedBackend {
     pub graphs: Option<Arc<ShimContext>>,
     /// The device the backend runs on (`None` on `cpu`, which runs on the host).
     pub device: Option<DeviceInfo>,
+    /// The card profile of the device (`None` on `cpu`).
+    pub card: Option<&'static CardProfile>,
 }
 
 /// Why a backend could not be opened: exit 1 with this message.
@@ -142,6 +148,7 @@ mod tests {
                 kernel_library: None,
                 inventory: &inventory,
                 meminfo: &meminfo,
+                card_profile: "auto",
             })
             .unwrap();
         let ids: Vec<&str> = opened.providers.iter().map(|p| p.id().0).collect();
@@ -150,5 +157,6 @@ mod tests {
         assert_eq!(opened.mem.mem_info().unwrap().total_bytes, 1 << 30);
         assert_eq!(opened.memory_kind, MemoryKind::Dedicated);
         assert!(opened.context.is_none() && opened.graphs.is_none() && opened.device.is_none());
+        assert!(opened.card.is_none());
     }
 }

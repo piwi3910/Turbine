@@ -140,19 +140,18 @@ pub fn eos_token_ids(arch: &ModelArchConfig, generation: &GenerationConfig) -> V
     }
 }
 
-/// The opened `execution.backend`: device memory, kernel providers and the card profile.
+/// The opened `execution.backend`: device memory, kernel providers and the card profile
+/// (`opened.card`).
 pub struct Provider {
     /// The registered backend (`execution_backend`), for its notes on the kernel selections.
     pub backend: &'static dyn ExecutionBackend,
     pub opened: OpenedBackend,
-    /// The card profile in effect (`execution.card_profile`, `auto` → the device architecture's
-    /// profile); `None` on the cpu backend or a device no profile describes.
-    pub card_profile: Option<String>,
 }
 
 /// Step 4: open the registered backend `execution.backend` names (logged as `module_selected`)
-/// on `execution.device`. An unregistered name was refused with exit 2 before this point; a
-/// backend that cannot open is exit 1.
+/// on `execution.device` with `execution.card_profile`. An unregistered name was refused with
+/// exit 2 before this point; a backend that cannot open (including a device no card profile
+/// describes) is exit 1.
 pub fn load_provider(
     config: &Config,
     inventory: &DeviceInventory,
@@ -167,27 +166,10 @@ pub fn load_provider(
             kernel_library: exec.kernel_library.as_deref(),
             inventory,
             meminfo: Path::new(MEMINFO),
+            card_profile: exec.card_profile.as_str(),
         })
         .map_err(|e| StartupError::new(e.to_string()))?;
-    let card_profile = opened
-        .device
-        .as_ref()
-        .and_then(|device| card_profile(exec.card_profile.as_str(), device.arch.as_deref()));
-    Ok(Provider {
-        backend,
-        opened,
-        card_profile,
-    })
-}
-
-/// `execution.card_profile` on a device of architecture `arch`: a configured name as is; `auto`
-/// → the profile named after `arch` when one is registered, else none.
-fn card_profile(configured: &str, arch: Option<&str>) -> Option<String> {
-    if configured != "auto" {
-        return Some(configured.to_string());
-    }
-    arch.filter(|a| modules::CARD_PROFILES.contains(a))
-        .map(str::to_string)
+    Ok(Provider { backend, opened })
 }
 
 /// Everything resolved before the listener binds: the model is known to be loadable and to fit.
@@ -368,7 +350,7 @@ pub fn prepare(
         tool_format: tool_call_parser.map(str::to_string),
         weight_format: arch.weight_format.0.name().to_string(),
         backend: config.execution.backend.to_string(),
-        card_profile: provider.card_profile.clone(),
+        card_profile: provider.opened.card.map(|card| card.name.to_string()),
         scheduling_policy: config.scheduler.policy.to_string(),
     };
     modules.log();
@@ -583,20 +565,6 @@ mod tests {
     use super::*;
     use turbine_model::families::{Llama, Olmoe};
     use turbine_model::tools::LLAMA3_JSON;
-
-    #[test]
-    fn card_profile_auto_follows_the_device() {
-        assert_eq!(
-            card_profile("auto", Some("gfx1201")).as_deref(),
-            Some("gfx1201")
-        );
-        assert_eq!(card_profile("auto", Some("gfx942")), None);
-        assert_eq!(card_profile("auto", None), None);
-        assert_eq!(
-            card_profile("gfx1201", Some("gfx942")).as_deref(),
-            Some("gfx1201")
-        );
-    }
 
     #[test]
     fn served_name_from_hf_snapshot_or_last_component() {

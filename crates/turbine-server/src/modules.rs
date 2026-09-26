@@ -18,8 +18,11 @@ pub fn backends() -> &'static [&'static str] {
     static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
     NAMES.get_or_init(|| turbine_kernels::backends::registry().names())
 }
-/// Card profiles (`card_profile`; `turbine_kernels::cards` from Task 7).
-pub const CARD_PROFILES: &[&str] = &["gfx1201"];
+/// Card profiles (`card_profile`): the names of `turbine_kernels::cards::registry()`.
+pub fn card_profiles() -> &'static [&'static str] {
+    static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+    NAMES.get_or_init(|| turbine_kernels::cards::registry().names())
+}
 /// Scheduling policies (`scheduling_policy`): the names of `turbine_scheduler::policy::registry`.
 pub static SCHEDULING_POLICIES: LazyLock<Vec<&'static str>> =
     LazyLock::new(|| turbine_scheduler::policy::registry().names());
@@ -29,7 +32,7 @@ pub fn known_module_names() -> ModuleNames<'static> {
     ModuleNames {
         tool_formats: TOOL_FORMATS,
         backends: backends(),
-        card_profiles: CARD_PROFILES,
+        card_profiles: card_profiles(),
         scheduling_policies: &SCHEDULING_POLICIES,
     }
 }
@@ -42,7 +45,7 @@ pub struct ModuleChoices {
     pub tool_format: Option<String>,
     pub weight_format: String,
     pub backend: String,
-    /// `None` on a backend without card profiles (`cpu`) or a device no profile describes.
+    /// `None` on a backend without card profiles (`cpu`).
     pub card_profile: Option<String>,
     pub scheduling_policy: String,
 }
@@ -51,7 +54,8 @@ impl ModuleChoices {
     /// Logs `event="module_selected"` for every extension point whose registry does not log
     /// its own selection, once at startup. `scheduling_policy` is logged by
     /// `turbine_scheduler::policy::registry().select` when the engine starts, `execution_backend`
-    /// by `turbine_kernels::backends::registry().select`.
+    /// by `turbine_kernels::backends::registry().select`, and `card_profile` by
+    /// `turbine_kernels::cards::registry().select` when the backend has one.
     pub fn log(&self) {
         use turbine_core::registry::log_selected;
         log_selected("model_family", &self.family, "config.json architectures");
@@ -65,11 +69,9 @@ impl ModuleChoices {
             &self.weight_format,
             "config.json dtype and quantization_config",
         );
-        log_selected(
-            "card_profile",
-            self.card_profile.as_deref().unwrap_or("none"),
-            "execution.card_profile",
-        );
+        if self.card_profile.is_none() {
+            log_selected("card_profile", "none", "the backend has no card profiles");
+        }
     }
 }
 

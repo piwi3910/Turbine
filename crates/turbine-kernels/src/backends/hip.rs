@@ -11,6 +11,7 @@ use turbine_core::types::Vendor;
 use turbine_device::{DeviceInfo, DeviceInventory};
 
 use super::{BackendError, BackendNote, BackendRequest, ExecutionBackend, OpenedBackend};
+use crate::cards;
 use crate::{
     KernelError, KernelProvider, OpKind, Selection, ShimContext, ShimLibrary, shim_provider,
 };
@@ -27,19 +28,6 @@ impl HipBackend {
         "hipErrorLaunchFailure",
         "hipErrorAssert",
     ];
-
-    /// The library, the matched device and a context on it.
-    fn open_context<'a>(
-        &self,
-        req: &BackendRequest<'a>,
-    ) -> Result<(Arc<ShimLibrary>, &'a DeviceInfo, Arc<ShimContext>), BackendError> {
-        let lib = load_shim(self.name(), req.kernel_library)?;
-        let device = amd_device(req.inventory, req.device.0)?;
-        let ctx = lib
-            .create_context(device)
-            .map_err(|e| BackendError::Startup(format!("kernel library context: {e}")))?;
-        Ok((lib, device, ctx))
-    }
 }
 
 impl Module for HipBackend {
@@ -53,8 +41,16 @@ impl ExecutionBackend for HipBackend {
         Vendor::Amd.as_str()
     }
 
+    /// The library, the AMD device, its card profile (a device no profile describes is refused
+    /// before any context exists), then a context on the device.
     fn open(&self, req: &BackendRequest<'_>) -> Result<OpenedBackend, BackendError> {
-        let (lib, device, ctx) = self.open_context(req)?;
+        let lib = load_shim(self.name(), req.kernel_library)?;
+        let device = amd_device(req.inventory, req.device.0)?;
+        let card = cards::select(req.card_profile, device)
+            .map_err(|e| BackendError::Startup(format!("execution.card_profile: {e}")))?;
+        let ctx: Arc<ShimContext> = lib
+            .create_context(device)
+            .map_err(|e| BackendError::Startup(format!("kernel library context: {e}")))?;
         tracing::info!(
             event = "kernel_library_loaded",
             path = %lib.path().display(),
@@ -76,6 +72,7 @@ impl ExecutionBackend for HipBackend {
             context: Some(ctx),
             graphs,
             device: Some(device.clone()),
+            card: Some(card),
         })
     }
 
@@ -230,12 +227,38 @@ mod tests {
                 kernel_library: Some(Path::new(env!("TURBINE_STUB_GFX942"))),
                 inventory: &inventory,
                 meminfo: Path::new("/nonexistent"),
+                card_profile: "auto",
             })
             .err()
             .expect("an NVIDIA device under backend hip");
         assert_eq!(
             err.to_string(),
             "execution.device 0 is a nvidia device; backend hip needs an AMD device"
+        );
+    }
+
+    /// An AMD device whose architecture no card profile lists is refused before a context is
+    /// created (the stub library is built for `gfx942`, which has no profile).
+    #[test]
+    fn refuses_device_without_profile() {
+        let inventory = DeviceInventory {
+            devices: vec![device(Vendor::Amd, "gfx942")],
+            backends: Vec::new(),
+        };
+        let err = HipBackend
+            .open(&BackendRequest {
+                device: DeviceId(0),
+                kernel_library: Some(Path::new(env!("TURBINE_STUB_GFX942"))),
+                inventory: &inventory,
+                meminfo: Path::new("/nonexistent"),
+                card_profile: "auto",
+            })
+            .err()
+            .expect("a gfx942 device without a card profile");
+        assert_eq!(
+            err.to_string(),
+            "execution.card_profile: no card profile for device architecture gfx942 \
+             (profiles: gfx1201)"
         );
     }
 }

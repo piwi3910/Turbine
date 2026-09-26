@@ -39,6 +39,7 @@ pub fn open_backend(name: &str) -> OpenedBackend {
             kernel_library: library.as_deref(),
             inventory: &inventory,
             meminfo: Path::new("/proc/meminfo"),
+            card_profile: "auto",
         })
         .unwrap_or_else(|e| panic!("open execution backend {name}: {e}"))
 }

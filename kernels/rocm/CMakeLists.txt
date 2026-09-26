@@ -8,6 +8,9 @@
 #   cmake -S kernels/rocm -B <build> -DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc \
 #         -DGPU_TARGETS=gfx1201 && cmake --build <build>
 #
+# GPU_TARGETS defaults to every architecture of cmake/card_profiles.cmake (the card profiles of
+# crates/turbine-kernels/src/cards/) and must name only those.
+#
 # TURBINE_ROCM_PATH (cache variable or environment) overrides /opt/rocm/rocm.
 cmake_minimum_required(VERSION 3.25)
 
@@ -17,10 +20,16 @@ if(DEFINED ENV{TURBINE_ROCM_PATH})
 endif()
 message(STATUS "ROCm root: ${TURBINE_ROCM_PATH}")
 
-set(GPU_TARGETS "gfx1201" CACHE STRING "GPU architectures to compile for")
-if(NOT GPU_TARGETS STREQUAL "gfx1201")
-  message(FATAL_ERROR "libturbine_hip.so is built and validated for gfx1201 only (GPU_TARGETS=${GPU_TARGETS})")
-endif()
+# The architectures the card profiles describe (TURBINE_PROFILE_ARCHS): the default build list,
+# and the only ones a GPU_TARGETS entry may name.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/card_profiles.cmake)
+set(GPU_TARGETS "${TURBINE_PROFILE_ARCHS}" CACHE STRING "GPU architectures to compile for")
+foreach(arch IN LISTS GPU_TARGETS)
+  if(NOT arch IN_LIST TURBINE_PROFILE_ARCHS)
+    message(FATAL_ERROR "GPU_TARGETS ${arch} has no card profile; libturbine_hip.so builds the \
+card-profile architectures only (${TURBINE_PROFILE_ARCHS}, kernels/rocm/cmake/card_profiles.cmake)")
+  endif()
+endforeach()
 set(CMAKE_HIP_ARCHITECTURES "${GPU_TARGETS}")
 
 # CMake's HIP language drives ROCm's clang directly and rejects the hipcc

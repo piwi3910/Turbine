@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use turbine_tensor::MemoryError;
 
 pub mod backends;
+pub mod cards;
 pub mod cpu;
 pub(crate) mod ffi;
 pub mod ops;

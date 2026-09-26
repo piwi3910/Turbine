@@ -51,6 +51,7 @@ impl ExecutionBackend for CpuBackend {
             context: None,
             graphs: None,
             device: None,
+            card: None,
         })
     }
 }
