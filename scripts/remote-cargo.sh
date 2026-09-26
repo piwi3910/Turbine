@@ -14,6 +14,8 @@
 # Environment: TURBINE_REMOTE_HOST (default piwi@192.168.10.203, novanas), TURBINE_REMOTE_TOOLCHAIN
 # (default 1.97), TURBINE_REMOTE_JOBS (cargo build jobs, default 6: several checkouts share 16 cores).
 # Only builds and host-side tests run here: GPU tests stay #[ignore]d and run through lab-test.sh.
+# Builds take a shared lock on /home/piwi/turbine-ci/bench.lock: a benchmark holds it exclusively
+# (scripts/bench-lock.sh) so that no build competes with the server for CPU while it measures.
 set -euo pipefail
 
 host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
@@ -48,5 +50,5 @@ for a in "$@"; do
 	args+=" $(printf '%q' "$a")"
 done
 exec ssh -o BatchMode=yes "$host" \
-	"cd '$remote/src' && CARGO_TARGET_DIR='$remote/target' CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=$jobs \
+	"cd '$remote/src' && flock -s /home/piwi/turbine-ci/bench.lock env CARGO_TARGET_DIR='$remote/target' CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=$jobs \
    CARGO_TERM_COLOR=never nice -n 5 \$HOME/.cargo/bin/cargo +$toolchain$args"
