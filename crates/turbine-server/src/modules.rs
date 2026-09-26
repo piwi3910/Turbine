@@ -5,6 +5,8 @@
 //! Every lane of Phase 2m moves one field of [`known_module_names`] from the fixed list below to
 //! its registry's `names()`.
 
+use std::sync::LazyLock;
+
 use serde::Serialize;
 use turbine_core::config::ModuleNames;
 use turbine_model::tools::LLAMA3_JSON;
@@ -15,8 +17,9 @@ pub const TOOL_FORMATS: &[&str] = &[LLAMA3_JSON];
 pub const BACKENDS: &[&str] = &["cpu", "hip"];
 /// Card profiles (`card_profile`; `turbine_kernels::cards` from Task 7).
 pub const CARD_PROFILES: &[&str] = &["gfx1201"];
-/// Scheduling policies (`scheduling_policy`; `turbine_scheduler::policy` from Task 2).
-pub const SCHEDULING_POLICIES: &[&str] = &["default"];
+/// Scheduling policies (`scheduling_policy`): the names of `turbine_scheduler::policy::registry`.
+pub static SCHEDULING_POLICIES: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| turbine_scheduler::policy::registry().names());
 
 /// The registered module names, per configuration key, for `Config::validate_modules`.
 pub fn known_module_names() -> ModuleNames<'static> {
@@ -24,7 +27,7 @@ pub fn known_module_names() -> ModuleNames<'static> {
         tool_formats: TOOL_FORMATS,
         backends: BACKENDS,
         card_profiles: CARD_PROFILES,
-        scheduling_policies: SCHEDULING_POLICIES,
+        scheduling_policies: &SCHEDULING_POLICIES,
     }
 }
 
@@ -42,7 +45,9 @@ pub struct ModuleChoices {
 }
 
 impl ModuleChoices {
-    /// Logs `event="module_selected"` for every extension point, once at startup.
+    /// Logs `event="module_selected"` for every extension point whose registry does not log
+    /// its own selection, once at startup. `scheduling_policy` is logged by
+    /// `turbine_scheduler::policy::registry().select` when the engine starts.
     pub fn log(&self) {
         use turbine_core::registry::log_selected;
         log_selected("model_family", &self.family, "config.json architectures");
@@ -57,11 +62,6 @@ impl ModuleChoices {
             "card_profile",
             self.card_profile.as_deref().unwrap_or("none"),
             "execution.card_profile",
-        );
-        log_selected(
-            "scheduling_policy",
-            &self.scheduling_policy,
-            "scheduler.policy",
         );
     }
 }
@@ -85,5 +85,6 @@ mod tests {
                 assert!(valid_name(name), "{name}");
             }
         }
+        assert!(known.scheduling_policies.contains(&"default"));
     }
 }

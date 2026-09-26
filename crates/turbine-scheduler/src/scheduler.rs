@@ -7,11 +7,13 @@
 //! the KV of positions `[0, P + g)` (after a preemption `g > 0`: recompute) and its last
 //! position yields the next token; a decode writes the KV of the newest token and yields the
 //! next one. `BlockTable::tokens` counts written positions, including the ones planned for the
-//! iteration in flight. Preemption ranks requests by `(priority, admission order)`: the victim
-//! is the worst-ranked (largest priority value, then most recently admitted), and a prefill or
-//! fork may preempt only requests ranked below its own, so the best-ranked request always
-//! progresses — no livelock while each request's full KV fits the empty pool (checked at
-//! submission).
+//! iteration in flight. The scheduling policy (`crate::policy`, Phase 2m S-9) orders the
+//! waiting queue, ranks running requests for preemption, picks the victim and sizes prefill
+//! chunks; this module is the mechanism. Under the `default` policy the rank is
+//! `(priority, admission order)` and the victim the worst-ranked (largest priority value, then
+//! most recently admitted). Whatever the policy, a prefill or fork may preempt only requests
+//! ranked below its own, so the best-ranked request always progresses — no livelock while each
+//! request's full KV fits the empty pool (checked at submission).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -21,10 +23,11 @@ use serde::Serialize;
 use turbine_core::clock::Clock;
 use turbine_core::config::Config;
 use turbine_core::request::FinishReason;
-use turbine_core::types::{BlockId, Priority, RequestId, SeqId};
+use turbine_core::types::{BlockId, RequestId, SeqId};
 use turbine_kv::{BlockPool, BlockTable, blocks_for_tokens};
 
 use crate::metrics::SchedulerMetrics;
+use crate::policy::{AdmissionInfo, DefaultPolicy, PreemptionRank, RunningInfo, SchedulingPolicy};
 use crate::queue::WaitingQueue;
 use crate::request::{CancelReason, PreemptReason, RequestState, SchedRequest};
 
@@ -236,17 +239,12 @@ struct ReqEntry {
     /// Admission number of the current admission; `None` while waiting.
     admitted: Option<u64>,
     ever_admitted: bool,
+    /// The queue counter at submission (`AdmissionInfo::submit_no`).
+    submit_no: u64,
     queued_since: Duration,
     /// `seqs[0]`'s first prefill finished; the other choices fork from it.
     shared_prefill_done: bool,
     cancel: Option<CancelReason>,
-}
-
-impl ReqEntry {
-    /// Preemption rank: larger is worse (dropped first).
-    fn rank(&self) -> (Priority, u64) {
-        (self.req.priority, self.admitted.unwrap_or(u64::MAX))
-    }
 }
 
 struct SeqEntry {
@@ -285,6 +283,7 @@ pub struct Scheduler {
     params: SchedulerParams,
     clock: Arc<dyn Clock>,
     metrics: Option<SchedulerMetrics>,
+    policy: &'static dyn SchedulingPolicy,
     requests: HashMap<RequestId, ReqEntry>,
     /// Admitted requests in admission order.
     running: Vec<RequestId>,
@@ -307,6 +306,7 @@ impl Scheduler {
             params: p,
             clock,
             metrics: None,
+            policy: &DefaultPolicy,
             requests: HashMap::new(),
             running: Vec::new(),
             queue: WaitingQueue::new(),
@@ -329,6 +329,22 @@ impl Scheduler {
         self
     }
 
+    /// Schedule under `policy` (default: `DefaultPolicy`). Set it before the first submission:
+    /// queued requests keep the admission keys of the policy they were queued under.
+    pub fn with_policy(mut self, policy: &'static dyn SchedulingPolicy) -> Scheduler {
+        debug_assert!(
+            self.requests.is_empty(),
+            "policy changed with requests queued"
+        );
+        self.policy = policy;
+        self
+    }
+
+    /// The scheduling policy in use.
+    pub fn policy(&self) -> &'static dyn SchedulingPolicy {
+        self.policy
+    }
+
     pub fn params(&self) -> &SchedulerParams {
         &self.params
     }
@@ -346,7 +362,15 @@ impl Scheduler {
             }
             Ok(()) => {
                 let now = self.clock.now_mono();
-                self.queue.push(r.id, r.priority, r.arrival);
+                let submit_no = self.queue.next_order();
+                let key = self.policy.admission_key(&AdmissionInfo {
+                    priority: r.priority,
+                    arrival: r.arrival,
+                    submit_no,
+                    preempted: false,
+                    push_no: submit_no,
+                });
+                self.queue.push(r.id, key);
                 for &seq in &r.seqs {
                     self.seqs.insert(
                         seq,
@@ -367,6 +391,7 @@ impl Scheduler {
                         req: r,
                         admitted: None,
                         ever_admitted: false,
+                        submit_no,
                         queued_since: now,
                         shared_prefill_done: false,
                         cancel: None,
@@ -500,7 +525,7 @@ impl Scheduler {
         let mut budget = (f64::from(self.params.max_batch_tokens.saturating_sub(decode_tokens))
             * fraction)
             .floor() as u32;
-        let chunk_cap = self.chunk_cap(limits);
+        let chunk_cap = self.policy.chunk_cap(&self.params, limits);
         for id in self.running.clone() {
             for seq in self.prefill_seqs(id) {
                 if budget == 0 || !self.is_running(id) {
@@ -784,7 +809,7 @@ impl Scheduler {
                 continue;
             }
             let seqs = r.req.seqs.clone();
-            let rank = r.rank();
+            let rank = self.rank(id);
             let parent = seqs[0];
             let children: Vec<SeqId> = seqs[1..]
                 .iter()
@@ -864,7 +889,7 @@ impl Scheduler {
         }
         let need = e.table.blocks_needed(len, bt);
         if need > pool.free_blocks() && may_preempt {
-            let rank = self.requests[&id].rank();
+            let rank = self.rank(id);
             while need > pool.free_blocks() {
                 let Some(victim) =
                     self.worst_running(|v| v.0 != id && !in_plan.contains(&v.0) && v.1 > rank)
@@ -947,8 +972,16 @@ impl Scheduler {
         preempted_now: &mut HashSet<RequestId>,
     ) {
         self.running.retain(|r| *r != id);
+        let push_no = self.queue.next_order();
         let r = self.requests.get_mut(&id).expect("running request tracked");
         r.admitted = None;
+        let key = self.policy.admission_key(&AdmissionInfo {
+            priority: r.req.priority,
+            arrival: r.req.arrival,
+            submit_no: r.submit_no,
+            preempted: true,
+            push_no,
+        });
         let seqs = r.req.seqs.clone();
         for seq in seqs {
             let e = self.seqs.get_mut(&seq).expect("sequence tracked");
@@ -962,7 +995,7 @@ impl Scheduler {
                 plan.preempted.push((seq, PreemptReason::KvExhausted));
             }
         }
-        self.queue.push_front(id);
+        self.queue.push(id, key);
         preempted_now.insert(id);
         self.preemptions_total += 1;
         let reason = PreemptReason::KvExhausted.as_str();
@@ -1073,30 +1106,36 @@ impl Scheduler {
             .collect()
     }
 
-    /// The worst-ranked running request accepted by `eligible((id, rank))`.
-    fn worst_running(
-        &self,
-        eligible: impl Fn((RequestId, (Priority, u64))) -> bool,
-    ) -> Option<RequestId> {
-        self.running
-            .iter()
-            .map(|id| (*id, self.requests[id].rank()))
-            .filter(|c| eligible(*c))
-            .max_by_key(|(_, rank)| *rank)
-            .map(|(id, _)| id)
+    /// The policy's preemption rank of tracked request `id`: larger is dropped first.
+    fn rank(&self, id: RequestId) -> PreemptionRank {
+        let r = &self.requests[&id];
+        self.policy.preemption_rank(&RunningInfo {
+            id,
+            priority: r.req.priority,
+            admitted: r.admitted,
+        })
     }
 
-    fn chunk_cap(&self, limits: &IterationLimits) -> u32 {
-        let p = &self.params;
-        let cap = if p.chunked_prefill {
-            p.prefill_chunk_tokens
+    /// The policy's victim among the running requests accepted by `eligible((id, rank))`,
+    /// offered in admission order.
+    fn worst_running(
+        &self,
+        eligible: impl Fn((RequestId, PreemptionRank)) -> bool,
+    ) -> Option<RequestId> {
+        let candidates: Vec<(RequestId, PreemptionRank)> = self
+            .running
+            .iter()
+            .map(|id| (*id, self.rank(*id)))
+            .filter(|c| eligible(*c))
+            .collect();
+        let victim = self.policy.pick_victim(&candidates)?;
+        if candidates.iter().any(|(id, _)| *id == victim) {
+            Some(victim)
         } else {
-            p.max_batch_tokens
-        };
-        limits
-            .prefill_chunk_tokens
-            .map_or(cap, |c| c.min(cap))
-            .max(1)
+            tracing::error!(event = "scheduler_bug", request_id = %victim.0, policy = self.policy.name(), "policy picked an ineligible victim");
+            debug_assert!(false, "ineligible victim {victim:?}");
+            None
+        }
     }
 
     /// Without chunked prefill a prompt that fits one iteration's budget runs whole; longer
@@ -1142,7 +1181,7 @@ mod tests {
 
     use smallvec::smallvec;
     use turbine_core::clock::FakeClock;
-    use turbine_core::types::{DType, DeviceId, KvLayout};
+    use turbine_core::types::{DType, DeviceId, KvLayout, Priority};
     use turbine_kv::{BlockPool, BlockPoolConfig};
     use turbine_observability::MetricsRegistry;
     use turbine_tensor::DeviceMemory;
