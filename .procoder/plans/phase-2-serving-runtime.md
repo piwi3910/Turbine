@@ -425,7 +425,7 @@ Interfaces:
   Covers: S-15/S-17/S-18 AC `lab_openai tools_and_json_schema`; S-5/S-16/S-15 `hip_ops paged_and_moe_ops` (lab run); S-15 (lab configs and jobs)
   Depends on: Tasks 17, 18
 
-- [ ] ASK THE USER FIRST for a Hugging Face token; download once without storing it: `ssh piwi@192.168.10.203 'HF_TOKEN=<pasted> uvx --from huggingface_hub hf download allenai/OLMoE-1B-7B-0125-Instruct --local-dir /home/piwi/turbine-models/olmoe-1b-7b-0125-instruct'`
+- [ ] Download once with the hf CLI the user logged in on novanas (decision 2026-09-26; the token is never read or passed): `ssh piwi@192.168.10.203 '~/.local/bin/hf download allenai/OLMoE-1B-7B-0125-Instruct --revision b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e --local-dir /home/piwi/turbine-models/olmoe-1b-7b-0125-instruct'`
 - [ ] ASK THE USER FIRST that novanas CPU time is available, then generate the OLMoE reference: `ssh piwi@192.168.10.203 'cd /home/piwi/turbine-ci/src && uv run scripts/golden/hf_reference.py --model-dir /home/piwi/turbine-models/olmoe-1b-7b-0125-instruct --prompts tests/golden/prompts.jsonl --out tests/golden/olmoe-1b-7b-0125-instruct/reference.jsonl --top-logprobs 20 --device cpu'` and copy it back.
 - [ ] Write the ignored test `turbine-server --test lab_openai tools_and_json_schema` and the request fixture. Run: `scripts/lab-test.sh novanas` — expect FAIL until the configs and env exist
 - [ ] Implement configs, Job changes, the vLLM Job and the `--vllm` mode; `bash -n scripts/lab-serve.sh && shellcheck scripts/lab-serve.sh`.
