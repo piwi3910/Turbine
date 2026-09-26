@@ -100,10 +100,10 @@ fi
 ssh -o BatchMode=yes "$host" "pkill -u piwi -x turbine-server; sleep 1; cd '$remote/src' && \
   LD_LIBRARY_PATH=/opt/rocm/rocm/lib:/opt/rocm/rocm/lib/rocm_sysdeps/lib \
   TURBINE_AMD_SMI_LIBRARY=/opt/rocm/rocm/lib/libamd_smi.so.26.5.0 ROCR_VISIBLE_DEVICES=$gpu \
-  nohup '$remote/target/release/turbine-server' --config $cfg \
+  setsid nohup '$remote/target/release/turbine-server' --config $cfg \
     --set model.path=/home/piwi/turbine-models/$slug \
     --set execution.kernel_library='$remote/kbuild/libturbine_hip.so' $* \
-    > /tmp/lab-bench-server.log 2>&1 &"
+    > /tmp/lab-bench-server.log 2>&1 < /dev/null &"
 ready=0
 for _ in $(seq 1 150); do
 	if [[ "$(curl -s -o /dev/null -w '%{http_code}' "$url/ready")" == 200 ]]; then
