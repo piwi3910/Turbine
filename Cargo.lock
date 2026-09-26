@@ -2235,7 +2235,9 @@ dependencies = [
  "tower",
  "tracing",
  "turbine-core",
+ "turbine-device",
  "turbine-observability",
+ "turbine-reliability",
  "uuid",
 ]
 
