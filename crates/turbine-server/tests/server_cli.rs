@@ -12,6 +12,12 @@ use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::write_tiny_llama;
 
 const POLL: Duration = Duration::from_millis(20);
+/// The server's test-only cap on each accepted connection's kernel send buffer.
+const SEND_BUFFER_ENV: &str = "TURBINE_TEST_SOCKET_SEND_BUFFER";
+/// Kernel buffer bytes on each end of a held stream (Linux doubles and floors them), so a
+/// client that stops reading pauses its request after a bounded number of tokens instead of
+/// after however many megabytes the loopback autotuning allows.
+const HELD_SOCKET_BUFFER: usize = 4096;
 
 /// A config file in a per-test directory, removed on drop.
 struct TempConfig {
@@ -51,6 +57,7 @@ fn spawn_server(args: &[&str], config: &Path) -> Child {
         .arg("--config")
         .arg(config)
         .env_remove("TURBINE_AMD_SMI_LIBRARY")
+        .env(SEND_BUFFER_ENV, HELD_SOCKET_BUFFER.to_string())
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -289,10 +296,18 @@ fn sigterm_graceful_shutdown() {
 /// `max_position_embeddings` of the checkpoint `long_model_yaml` serves, so streams can be held.
 const LONG_POSITIONS: u32 = 8192;
 /// Tokens of a stream that must outlive the shutdown grace: far more events than the output
-/// channel (256) and the socket buffers hold, so a client that stops reading pauses it.
-const LONG_TOKENS: u32 = 4000;
-/// Tokens of a stream that is paused at the signal and completes within the grace once read.
-const SHORT_TOKENS: u32 = 1500;
+/// channel (256), hyper's write queue and the capped socket buffers hold, so a client that stops
+/// reading pauses it (after 300–500 tokens on Linux, 880 or more on macOS: see [`SHORT_TOKENS`]).
+const LONG_TOKENS: u32 = 1500;
+/// Tokens of a stream that is paused at the signal and completes within [`GRACE`] once read: a
+/// little over the tokens a stream generates before it pauses. On Linux both socket caps hold
+/// and a stream that stops reading pauses after about 300 tokens (up to 500 on a loaded host);
+/// macOS loopback keeps a receive buffer of at least 320 KiB whatever `SO_RCVBUF` says (more as
+/// it autotunes), so it pauses after 880 tokens or more.
+const SHORT_TOKENS: u32 = if cfg!(target_os = "macos") { 1200 } else { 600 };
+/// `server.shutdown_grace` of the drain test: time for the short stream's remaining tokens
+/// (at most about 300 on Linux, 320 on macOS) in a debug build.
+const GRACE: Duration = Duration::from_secs(if cfg!(target_os = "macos") { 5 } else { 2 });
 
 /// The tiny checkpoint patched to `LONG_POSITIONS` positions, served as `m` on the cpu backend
 /// with a 16 MiB KV pool; `server_extra` is appended to the `server` section verbatim.
@@ -351,7 +366,16 @@ impl HeldStream {
     fn open(addr: SocketAddr, max_tokens: u32) -> HeldStream {
         let body = serde_json::json!({"model": "m", "prompt": "Once upon a time",
             "max_tokens": max_tokens, "ignore_eos": true, "stream": true, "logprobs": 20});
-        let mut conn = TcpStream::connect(addr).unwrap();
+        // The receive buffer is set before connecting so the advertised window stays small.
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::STREAM,
+            None,
+        )
+        .unwrap();
+        socket.set_recv_buffer_size(HELD_SOCKET_BUFFER).unwrap();
+        socket.connect(&addr.into()).unwrap();
+        let mut conn: TcpStream = socket.into();
         conn.set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         write_request(&mut conn, "POST", "/v1/completions", &body.to_string());
@@ -413,9 +437,9 @@ fn paused_requests(addr: SocketAddr) -> u64 {
 #[cfg(unix)]
 #[test]
 fn sigterm_drains_then_cancels() {
-    const GRACE: Duration = Duration::from_secs(2);
     let addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
-    let (_model, yaml) = long_model_yaml(addr, "  shutdown_grace: 2s\n");
+    let (_model, yaml) =
+        long_model_yaml(addr, &format!("  shutdown_grace: {}s\n", GRACE.as_secs()));
     let cfg = TempConfig::new("sigterm-drain", &yaml);
     let mut child = spawn_server(&[], &cfg.path);
     wait_until_serving(&mut child, addr);
@@ -427,7 +451,7 @@ fn sigterm_drains_then_cancels() {
     let started = Instant::now();
     while paused_requests(addr) < 2 {
         assert!(
-            started.elapsed() < Duration::from_secs(20),
+            started.elapsed() < Duration::from_secs(60),
             "both streams should be paused"
         );
         std::thread::sleep(POLL);
@@ -485,10 +509,10 @@ fn sigterm_drains_then_cancels() {
 
     let out = wait_with_timeout(
         child,
-        Duration::from_secs(3).saturating_sub(signalled.elapsed()),
+        (GRACE + Duration::from_secs(1)).saturating_sub(signalled.elapsed()),
     );
     assert!(
-        signalled.elapsed() < Duration::from_secs(3),
+        signalled.elapsed() < GRACE + Duration::from_secs(1),
         "exit took {:?}",
         signalled.elapsed()
     );

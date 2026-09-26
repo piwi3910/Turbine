@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::serve::ListenerExt;
 use turbine_api::{ApiLimits, ApiState};
 use turbine_core::config::{self, Config};
 use turbine_device::{DeviceInventory, DeviceMetrics, DiscoveryOptions};
@@ -41,6 +42,25 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 /// After the grace: how long the engine may take to deliver the cancellations and stop, and
 /// then how long open connections may take to finish, before the process exits 0 regardless.
 const CLOSE_LIMIT: Duration = Duration::from_millis(500);
+/// Test-only, not a configuration key: a positive byte count caps every accepted connection's
+/// kernel send buffer (`SO_SNDBUF`; Linux doubles it and turns its autotuning off). The request
+/// output channel (P2 S-7) pauses a request once the client stops reading and everything
+/// between the two is full; with the kernel default that is megabytes on Linux loopback, so the
+/// black-box tests set this to make the pause come after a few KiB on every OS.
+const SEND_BUFFER_ENV: &str = "TURBINE_TEST_SOCKET_SEND_BUFFER";
+
+/// Parses [`SEND_BUFFER_ENV`]: unset → `None` (kernel default), else a positive byte count.
+fn send_buffer_cap(value: Option<&str>) -> Result<Option<usize>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.parse::<usize>() {
+        Ok(bytes) if bytes > 0 => Ok(Some(bytes)),
+        _ => Err(format!(
+            "{SEND_BUFFER_ENV} must be a positive byte count, got {value:?}"
+        )),
+    }
+}
 
 pub fn run(cli: Cli) -> ExitCode {
     let config = match config::load(&cli.config, &cli.set) {
@@ -121,6 +141,13 @@ async fn serve(
                 .unwrap_or(usize::MAX),
         },
     };
+    let send_buffer = match send_buffer_cap(std::env::var(SEND_BUFFER_ENV).ok().as_deref()) {
+        Ok(cap) => cap,
+        Err(e) => {
+            eprintln!("turbine-server: {e}");
+            return ExitCode::Startup;
+        }
+    };
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -152,6 +179,13 @@ async fn serve(
         config.server.shutdown_grace.0,
         drained_tx,
     );
+    let listener = listener.tap_io(move |conn: &mut tokio::net::TcpStream| {
+        if let Some(bytes) = send_buffer
+            && let Err(e) = socket2::SockRef::from(&*conn).set_send_buffer_size(bytes)
+        {
+            tracing::warn!(error = %e, bytes, "cannot cap the connection's send buffer");
+        }
+    });
     let server = axum::serve(listener, turbine_api::router(state)).with_graceful_shutdown(shutdown);
     let connections_closed = async {
         match drained_rx.await {
@@ -240,5 +274,22 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => tracing::info!(signal = "SIGINT", "shutdown requested; draining running requests"),
         () = terminate => tracing::info!(signal = "SIGTERM", "shutdown requested; draining running requests"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unset leaves the kernel's autotuning alone; a positive byte count caps; anything else is
+    /// refused rather than silently ignored (a typo would make the held-stream tests flaky).
+    #[test]
+    fn send_buffer_cap_parsing() {
+        assert_eq!(send_buffer_cap(None), Ok(None));
+        assert_eq!(send_buffer_cap(Some("4096")), Ok(Some(4096)));
+        for bad in ["", "0", "-1", "4KiB", "x"] {
+            let err = send_buffer_cap(Some(bad)).unwrap_err();
+            assert!(err.contains(SEND_BUFFER_ENV), "{bad:?}: {err}");
+        }
     }
 }

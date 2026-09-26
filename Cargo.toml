@@ -43,6 +43,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_norway = "0.9.42"
 smallvec = "1.16.2"
+# Socket buffer sizes: the server's test-only send-buffer cap and the held-stream test clients
+socket2 = "0.6.5"
 thiserror = "2.0.21"
 # Phase 2: builds the llguidance token trie from tokenizer.json; MIT license
 toktrie_hf_tokenizers = "=1.8.0"

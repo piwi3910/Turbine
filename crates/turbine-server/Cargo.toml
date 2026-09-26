@@ -29,6 +29,8 @@ prometheus-client.workspace = true
 smallvec.workspace = true
 # L0 KV block pool, its metrics and the /turbine/v1/kv document (Phase 2 engine)
 turbine-kv.workspace = true
+# Test-only cap on accepted connections' send buffers (startup::SEND_BUFFER_ENV)
+socket2.workspace = true
 # Continuous-batching scheduler, its metrics and the /turbine/v1/scheduler document
 turbine-scheduler.workspace = true
 
@@ -38,3 +40,5 @@ unsafe_code = "forbid"
 [dev-dependencies]
 # Validating structured outputs and tool-call arguments in the tiny_server tests
 jsonschema.workspace = true
+# Held-stream clients with a small receive buffer, so an unread stream back-pressures at once
+socket2.workspace = true

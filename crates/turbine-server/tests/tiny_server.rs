@@ -6,9 +6,13 @@
 //! output, tool calls and the Phase 2 metrics and log reasons.
 //!
 //! Streams that must stay open are made to back-pressure the engine: large events (20 logprobs
-//! each), thousands of `max_tokens` on a checkpoint patched to 8192 positions, and a client that
-//! stops reading after the first chunk — the request's output channel fills and the engine
-//! pauses it, holding its KV blocks, until the client reads on or goes away.
+//! each), more `max_tokens` than the path to the client buffers on a checkpoint patched to 8192
+//! positions, and a client that stops reading after the first chunk — the request's output
+//! channel (256 events) fills and the engine pauses it, holding its KV blocks, until the client
+//! reads on or goes away. The kernel socket buffers between the two are kept to a few KiB on
+//! both ends ([`SEND_BUFFER_ENV`] on the server, [`held_connection`] on the client), so the
+//! pause comes after a bounded few hundred tokens (see [`LONG_TOKENS`]) instead of after however
+//! many megabytes the loopback autotuning allows.
 //!
 //! Every wait is bounded and polls; ports come from binding `127.0.0.1:0`.
 
@@ -38,6 +42,10 @@ use turbine_tensor::host::HostMemory;
 
 const POLL: Duration = Duration::from_millis(20);
 const READY_LIMIT: Duration = Duration::from_secs(60);
+/// The server's test-only cap on each accepted connection's kernel send buffer.
+const SEND_BUFFER_ENV: &str = "TURBINE_TEST_SOCKET_SEND_BUFFER";
+/// Kernel buffer bytes on each end of a held stream (Linux doubles and floors them).
+const HELD_SOCKET_BUFFER: usize = 4096;
 
 fn free_addr() -> SocketAddr {
     TcpListener::bind("127.0.0.1:0")
@@ -52,6 +60,7 @@ fn spawn(config: &Path) -> Child {
         .arg(config)
         .env_remove("TURBINE_AMD_SMI_LIBRARY")
         .env_remove("TURBINE_KERNEL_LIBRARY")
+        .env(SEND_BUFFER_ENV, HELD_SOCKET_BUFFER.to_string())
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -118,11 +127,16 @@ impl Default for Setup<'_> {
 
 /// `max_position_embeddings` of the checkpoint `TinyServer::start_long` serves.
 const LONG_POSITIONS: u32 = 8192;
-/// Tokens a held stream asks for: far more events than the output channel (256) and the socket
-/// buffers hold (a stream that stops reading pauses after about 1400 tokens on macOS loopback),
-/// so it pauses long before it could finish. Not more: debug-build attention cost grows with
-/// the context, and some tests read the streams to the end.
-const LONG_TOKENS: u32 = 3000;
+/// Tokens a held stream asks for: well over what the output channel (256 events), hyper's write
+/// queue and the capped socket buffers hold together, so a stream that stops reading pauses
+/// long before it could finish — after about 300 tokens on Linux (up to 500 on a loaded host),
+/// where both socket caps hold, and about 880 on macOS, whose loopback keeps a receive buffer of about 320 KiB whatever
+/// `SO_RCVBUF` says. Not more: debug-build attention cost grows with the context, and some
+/// tests read the streams to the end.
+const LONG_TOKENS: u32 = 1500;
+/// `server` keys for tests whose streams must stay paused longer than the default 30 s
+/// `server.slow_client_timeout` might allow on a loaded host.
+const HOLD_PAUSED: &str = "  slow_client_timeout: 10m\n";
 /// KV blocks of the 16 MiB test pool.
 const POOL_BLOCKS: u64 = 4096;
 
@@ -284,6 +298,21 @@ fn wait_for(limit: Duration, what: &str, mut cond: impl FnMut() -> bool) {
     }
 }
 
+/// A connection whose receive buffer is [`HELD_SOCKET_BUFFER`] bytes, set before connecting so
+/// the advertised window stays that small: a client that stops reading stalls the server after
+/// a few KiB instead of the megabytes receive autotuning would take.
+fn held_connection(addr: SocketAddr) -> TcpStream {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        None,
+    )
+    .unwrap();
+    socket.set_recv_buffer_size(HELD_SOCKET_BUFFER).unwrap();
+    socket.connect(&addr.into()).unwrap();
+    socket.into()
+}
+
 /// A streaming completion whose body is read only on demand.
 struct OpenStream {
     reader: BufReader<TcpStream>,
@@ -293,7 +322,7 @@ impl OpenStream {
     /// Sends `body` to `/v1/completions` and reads the response head; with `first_chunk` also
     /// the first SSE chunk (a queued request produces none until it runs).
     fn open(addr: SocketAddr, body: &Value, first_chunk: bool) -> OpenStream {
-        let mut conn = TcpStream::connect(addr).unwrap();
+        let mut conn = held_connection(addr);
         conn.set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         write_request(
@@ -693,8 +722,10 @@ fn single_slot_and_cancel() {
 /// `queue_full` with `retry-after`, counted by reason.
 #[test]
 fn queue_full_429() {
-    let server =
-        TinyServer::start_long("scheduler:\n  max_queued_requests: 2\n  max_running_requests: 1\n");
+    let server = TinyServer::start_long_with(
+        HOLD_PAUSED,
+        "scheduler:\n  max_queued_requests: 2\n  max_running_requests: 1\n",
+    );
     let held = server.hold_stream();
     wait_for(Duration::from_secs(10), "first request running", || {
         let doc = server.scheduler();
@@ -730,9 +761,15 @@ fn queue_full_429() {
         assert_eq!(resp.error_code(), "queue_full");
         assert!(resp.head.contains("retry-after: 1"), "{}", resp.head);
     }
-    let doc = server.scheduler();
-    assert_eq!(doc["waiting"], 2, "{doc}");
-    assert_eq!(running(&doc), 1, "{doc}");
+    // The document is published after each engine turn, so it may trail the admissions.
+    wait_for(
+        Duration::from_secs(5),
+        "two queued behind the held one",
+        || {
+            let doc = server.scheduler();
+            doc["waiting"] == 2 && running(&doc) == 1
+        },
+    );
 
     // The held stream reads on and completes; then the two queued requests run.
     assert_eq!(stream_finish_reason(&held.read_rest()), "length");
@@ -763,7 +800,9 @@ fn queue_full_429() {
 /// them when they finish.
 #[test]
 fn disconnect_releases_kv() {
-    let server = TinyServer::start_long("");
+    // The streams stay paused while the others catch up (slowly on a loaded host): no
+    // slow-client cancellation may end them first.
+    let server = TinyServer::start_long_with(HOLD_PAUSED, "");
     let mut streams: Vec<OpenStream> = (0..8).map(|_| server.hold_stream()).collect();
     wait_for(Duration::from_secs(60), "all 8 streams paused", || {
         let doc = server.scheduler();
@@ -817,8 +856,10 @@ fn disconnect_releases_kv() {
 /// agree with the metrics; `/turbine/v1/pressure` stays 501.
 #[test]
 fn diagnostics_shapes() {
-    let server =
-        TinyServer::start_long("scheduler:\n  max_running_requests: 2\n  max_queued_requests: 4\n");
+    let server = TinyServer::start_long_with(
+        HOLD_PAUSED,
+        "scheduler:\n  max_running_requests: 2\n  max_queued_requests: 4\n",
+    );
     // Two paused streams run; two more wait behind them. The state is then stable.
     let held: Vec<OpenStream> = (0..2).map(|_| server.hold_stream()).collect();
     let waiting: Vec<OpenStream> = (0..2)
@@ -1170,7 +1211,7 @@ fn phase1_metrics() {
 fn slow_client_paused_then_cancelled() {
     let server = TinyServer::start_long_with("  slow_client_timeout: 1s\n", "");
     let slow = server.hold_stream();
-    wait_for(Duration::from_secs(10), "the slow client is paused", || {
+    wait_for(Duration::from_secs(30), "the slow client is paused", || {
         server.scheduler()["paused"] == 1
     });
     let paused_at = Instant::now();
@@ -1178,7 +1219,7 @@ fn slow_client_paused_then_cancelled() {
     // Another stream keeps progressing while the slow one is paused.
     let other = server.post(
         "/v1/completions",
-        &json!({"model": server.model, "prompt": "Hi", "max_tokens": 64, "ignore_eos": true,
+        &json!({"model": server.model, "prompt": "Hi", "max_tokens": 16, "ignore_eos": true,
                 "stream": true}),
     );
     assert_eq!(other.status, 200, "{}", other.body);
@@ -1223,8 +1264,14 @@ fn slow_client_paused_then_cancelled() {
 fn request_and_queue_timeouts() {
     // server.request_timeout: a held stream ends with the error event, then `[DONE]` (C-3).
     let server = TinyServer::start_long_with("  request_timeout: 1s\n", "");
-    let held = server.hold_stream();
+    // Timed from before the request is sent: its deadline runs from submission, which precedes
+    // the first chunk `hold_stream` waits for.
     let opened = Instant::now();
+    let held = server.hold_stream();
+    // The document is published after each iteration, so it may trail the first chunk by one.
+    wait_for(Duration::from_secs(5), "the held stream is running", || {
+        running(&server.scheduler()) == 1
+    });
     wait_for(
         Duration::from_secs(5),
         "the timed-out stream is dropped",
