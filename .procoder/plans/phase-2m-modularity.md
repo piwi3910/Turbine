@@ -451,7 +451,7 @@ Covers: S-5 AC (ABI group, v2.3 fallback); spec constraint (ABI additive, header
 - [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
 - [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops` — expect exit 0 with `implementations_enumerated ... ok`
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 10 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 10 row to `.procoder/perf-log.md`
 - [x] Commit: `feat(kernels): kernel ABI v2.4 implementation enumeration and card profile`
 
 Build notes (Task 10, as built):
@@ -487,8 +487,8 @@ Covers: S-5 AC; S-6 AC (`git grep` of C++ selection); S-13 kernel-implementation
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
 - [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops` and `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden` — expect exit 0 each, with `every_implementation_matches_cpu ... ok`
 - [x] Write the ignored lab test `turbine-model --test tiny_model hip_v23_library_matches_cpu`: loads `libturbine_hip_v23.so` from the directory of `TURBINE_KERNEL_LIBRARY` (Task 10's second target), asserts `enumerates_implementations()` is false and every selection's `reason_code` is `provider_internal`, then runs the `hip_matches_cpu` comparison (tiny Llama and OLMoE, same bound) on it. Run: `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model -- hip_v23_library_matches_cpu` — expect exit 0 (a v2.3 library still loads and serves)
-- [ ] Lab: `scripts/lab-serve.sh novanas scripts/lab/phase2c-novanas-llama.yaml`; `curl -s http://192.168.10.203:18000/turbine/v1/status | jq '[.kernels[] | {op, config, implementation}]' | diff - tests/lab/kernel-choices-llama.json`; `scripts/lab-serve.sh novanas --stop`; the same for OLMoE against `tests/lab/kernel-choices-olmoe.json` — expect no diff output for both
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 11 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-serve.sh novanas scripts/lab/phase2c-novanas-llama.yaml`; `curl -s http://192.168.10.203:18000/turbine/v1/status | jq '[.kernels[] | {op, config, implementation}]' | diff - tests/lab/kernel-choices-llama.json`; `scripts/lab-serve.sh novanas --stop`; the same for OLMoE against `tests/lab/kernel-choices-olmoe.json` — expect no diff output for both
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 11 row to `.procoder/perf-log.md`
 - [x] Commit: `feat(kernels): select kernel implementations in rust from the card profile`
 
 Build notes (Task 11, as built):
@@ -518,7 +518,7 @@ Covers: S-5 AC ("CPU reference provider split into one file per op family").
 - [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS with the same number of `turbine-kernels` unit tests as before the move (compare the `test result:` lines)
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
 - [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops` — expect exit 0
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 12 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 12 row to `.procoder/perf-log.md`
 - [x] Commit: `refactor(kernels): one cpu-reference file per op family`
 
 Build notes (Task 12, as built):
