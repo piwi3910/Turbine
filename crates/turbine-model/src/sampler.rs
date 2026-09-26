@@ -73,7 +73,9 @@ pub struct Sampler {
 /// Vocabulary-sized buffers of one sampler, kept between steps.
 #[derive(Clone, Debug, Default)]
 struct Scratch {
-    /// Top-n selection and truncated candidates `(id, logit / T)`, highest first.
+    /// Sort keys of the top-n selection, see [`desc_key`].
+    keys: Vec<u64>,
+    /// Truncated candidates `(id, logit / T)`, highest first.
     candidates: Vec<(u32, f32)>,
     /// Unnormalised probabilities of the candidates (of every id when nothing is cut).
     weights: Vec<f64>,
@@ -126,20 +128,46 @@ fn by_value_desc(a: &(u32, f32), b: &(u32, f32)) -> Ordering {
     }
 }
 
-/// The `n` largest `(id, value)` pairs of `values` into `out` (reused), highest first, ties by
-/// id.
-fn top_n_into(values: &[f32], n: usize, out: &mut Vec<(u32, f32)>) {
+/// A `u64` whose ascending order is [`by_value_desc`] on `(id, v)`: the high word is the
+/// complement of `v`'s IEEE total-order key (NaN: all ones, so it sorts last), the low word the
+/// id. Integer keys sort several times faster than the float comparator over a 128k vocabulary.
+fn desc_key(id: u32, v: f32) -> u64 {
+    let high = if v.is_nan() {
+        u32::MAX
+    } else {
+        // `f32::total_cmp`'s key: flip the magnitude bits of negatives, then bias the sign.
+        let bits = v.to_bits() as i32;
+        let total = (bits ^ ((((bits >> 31) as u32) >> 1) as i32)) as u32 ^ 0x8000_0000;
+        // Only the all-ones negative NaN has total key 0, so a number never collides with NaN.
+        !total
+    };
+    (u64::from(high) << 32) | u64::from(id)
+}
+
+/// The `n` largest `(id, value)` pairs of `values` into `out`, highest first, ties by id
+/// (`keys` is scratch).
+fn top_n_into(values: &[f32], n: usize, keys: &mut Vec<u64>, out: &mut Vec<(u32, f32)>) {
     out.clear();
     let n = n.min(values.len());
     if n == 0 {
         return;
     }
-    out.extend(values.iter().enumerate().map(|(i, &v)| (i as u32, v)));
-    if n < out.len() {
-        out.select_nth_unstable_by(n - 1, by_value_desc);
-        out.truncate(n);
+    keys.clear();
+    keys.extend(
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| desc_key(i as u32, v)),
+    );
+    if n < keys.len() {
+        keys.select_nth_unstable(n - 1);
+        keys.truncate(n);
     }
-    out.sort_unstable_by(by_value_desc);
+    keys.sort_unstable();
+    out.extend(keys.iter().map(|&k| {
+        let id = k as u32;
+        (id, values[id as usize])
+    }));
 }
 
 /// `ids` sorted ascending without duplicates.
@@ -241,9 +269,12 @@ impl Sampler {
         let lse = self.logprobs.then(|| log_sum_exp(logits));
         let top_logprobs = match lse {
             Some(lse) if self.top_logprobs > 0 => {
-                let top = &mut self.scratch.candidates;
-                top_n_into(logits, self.top_logprobs, top);
-                top.iter().map(|&(id, v)| (id, v - lse)).collect()
+                let mut top = Vec::with_capacity(self.top_logprobs);
+                top_n_into(logits, self.top_logprobs, &mut self.scratch.keys, &mut top);
+                for t in &mut top {
+                    t.1 -= lse;
+                }
+                top
             }
             _ => Vec::new(),
         };
@@ -344,6 +375,7 @@ impl Sampler {
         let vocab = logits.len();
         let k = self.top_k.map_or(vocab, |k| k.min(vocab));
         let Scratch {
+            keys,
             candidates,
             weights,
         } = &mut self.scratch;
@@ -351,7 +383,7 @@ impl Sampler {
         if k < vocab || self.top_p < 1.0 {
             // Candidates sorted descending (ties by id). Scaling by 1/T keeps the order, so the
             // top-k cut is taken on the raw logits.
-            top_n_into(logits, k, candidates);
+            top_n_into(logits, k, keys, candidates);
             for c in candidates.iter_mut() {
                 c.1 *= inv_t;
             }
@@ -553,6 +585,53 @@ mod tests {
         let mut resumed = Sampler::from_state(&p, &prompt, &[], state);
         let tail = run(&mut resumed, 23);
         assert_eq!([head, tail].concat(), expected);
+    }
+
+    /// The integer sort keys order exactly like the float comparator, NaN, signed zeros,
+    /// infinities, subnormals and ties included.
+    #[test]
+    fn desc_key_orders_like_by_value_desc() {
+        let specials = [
+            f32::NAN,
+            -f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE / 4.0,
+            -f32::MIN_POSITIVE / 4.0,
+            f32::MAX,
+            f32::MIN,
+            1.0,
+            1.0,
+            -1.0,
+            2.5,
+        ];
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        let mut values: Vec<f32> = specials.to_vec();
+        values.extend((0..2000).map(|_| (uniform(&mut rng) - 0.5) * 40.0));
+        values.extend((0..200).map(|_| f32::from_bits(rng.next_u32())));
+        let mut by_cmp: Vec<(u32, f32)> = values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i as u32, v))
+            .collect();
+        by_cmp.sort_by(by_value_desc);
+        let mut by_key: Vec<u64> = values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| desc_key(i as u32, v))
+            .collect();
+        by_key.sort_unstable();
+        let ids: Vec<u32> = by_key.iter().map(|&k| k as u32).collect();
+        assert_eq!(ids, by_cmp.iter().map(|p| p.0).collect::<Vec<_>>());
+        for n in [0, 1, 7, 100, values.len(), values.len() + 5] {
+            let want: Vec<u32> = by_cmp.iter().take(n).map(|p| p.0).collect();
+            let mut top = Vec::new();
+            top_n_into(&values, n, &mut Vec::new(), &mut top);
+            let got: Vec<u32> = top.iter().map(|p| p.0).collect();
+            assert_eq!(got, want, "top {n}");
+        }
     }
 
     #[test]
