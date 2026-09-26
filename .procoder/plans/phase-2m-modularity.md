@@ -551,8 +551,8 @@ Covers: S-11 AC (families on CPU, formats, `hermes` loads); S-2 AC (six families
 - [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS including `families_cpu_forward_matches_naive`, `families_ragged_batch_matches_single`, `family_requirements`, `mixtral_weight_map` and `unsupported_row_exits_2_before_bind` for `Qwen3ForCausalLM`
 - [x] Run: `git grep -nE 'Architecture::|match .*architecture' crates/ -- ':!crates/turbine-model/src/families'` — expect no output
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
-- [ ] Lab: `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden` — expect exit 0
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 14 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden` — expect exit 0
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 14 row to `.procoder/perf-log.md`
 - [x] Commit: `feat(model): qwen3, qwen3-moe, mistral and mixtral families with hermes and mistral formats`
 
 Build notes (Task 14, as built):
