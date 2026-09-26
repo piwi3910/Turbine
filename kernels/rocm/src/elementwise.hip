@@ -170,8 +170,78 @@ __global__ void silu_mul_kernel(const T *gate, const T *up, T *out,
   }
 }
 
+// ---- silu_mul for many rows (BF16) ----
+
+// BF16 elements per 16-byte load of silu_mul_vec_kernel.
+constexpr int64_t kSiluVec = 8;
+// Rows from which a BF16 silu_mul runs through silu_mul_vec_kernel; below it
+// (a decode batch) silu_mul_kernel's finer column chunks keep the whole device
+// busy.
+constexpr int64_t kSiluVecMinRows = 64;
+
+// silu_mul_kernel's arithmetic on 8 BF16 at a time: grid (rows, column chunks
+// of kBlock * kSiluVec), each thread one 16-byte slice of gate, up and out.
+// Launched only when silu_vec_eligible holds.
+__global__ __launch_bounds__(kBlock) void silu_mul_vec_kernel(
+    const Bf16 *gate, const Bf16 *up, Bf16 *out, int64_t cols,
+    int64_t gate_stride, int64_t up_stride, int64_t out_stride) {
+  const int64_t r = blockIdx.x;
+  const int64_t j =
+      (static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x) * kSiluVec;
+  if (j >= cols)
+    return;
+  const uint4 g4 = *reinterpret_cast<const uint4 *>(gate + r * gate_stride + j);
+  const uint4 u4 = *reinterpret_cast<const uint4 *>(up + r * up_stride + j);
+  const uint32_t gw[4] = {g4.x, g4.y, g4.z, g4.w};
+  const uint32_t uw[4] = {u4.x, u4.y, u4.z, u4.w};
+  uint32_t ow[4];
+#pragma unroll
+  for (int w = 0; w < 4; ++w) {
+    uint32_t packed = 0;
+#pragma unroll
+    for (int part = 0; part < 2; ++part) {
+      const int shift = part * 16;
+      const float g =
+          to_f32<Bf16>(Bf16{static_cast<uint16_t>((gw[w] >> shift) & 0xffffu)});
+      const float u =
+          to_f32<Bf16>(Bf16{static_cast<uint16_t>((uw[w] >> shift) & 0xffffu)});
+      const float silu = g / (1.0f + expf(-g));
+      packed |=
+          static_cast<uint32_t>(from_f32<Bf16>(round_to<Bf16>(silu) * u).bits)
+          << shift;
+    }
+    ow[w] = packed;
+  }
+  *reinterpret_cast<uint4 *>(out + r * out_stride + j) =
+      make_uint4(ow[0], ow[1], ow[2], ow[3]);
+}
+
+// d runs through silu_mul_vec_kernel: BF16, enough rows, and every 8-element
+// slice of every row 16-byte aligned.
+bool silu_vec_eligible(const turbine_silu_mul_desc *d) {
+  const auto aligned16 = [](const void *p) {
+    return reinterpret_cast<uintptr_t>(p) % 16 == 0;
+  };
+  return d->dtype == TURBINE_DTYPE_BF16 && d->rows >= kSiluVecMinRows &&
+         d->cols % kSiluVec == 0 && d->gate_stride_row % kSiluVec == 0 &&
+         d->up_stride_row % kSiluVec == 0 &&
+         d->out_stride_row % kSiluVec == 0 && aligned16(d->gate) &&
+         aligned16(d->up) && aligned16(d->out) &&
+         (d->cols / kSiluVec + kBlock - 1) / kBlock <= 65535;
+}
+
 template <typename T> struct SiluMulLaunch {
   static void run(hipStream_t s, const turbine_silu_mul_desc *d) {
+    if (silu_vec_eligible(d)) {
+      const int64_t chunks = (d->cols / kSiluVec + kBlock - 1) / kBlock;
+      hipLaunchKernelGGL(
+          silu_mul_vec_kernel,
+          dim3(static_cast<unsigned>(d->rows), static_cast<unsigned>(chunks)),
+          dim3(kBlock), 0, s, static_cast<const Bf16 *>(d->gate),
+          static_cast<const Bf16 *>(d->up), static_cast<Bf16 *>(d->out),
+          d->cols, d->gate_stride_row, d->up_stride_row, d->out_stride_row);
+      return;
+    }
     hipLaunchKernelGGL(
         silu_mul_kernel<T>,
         dim3(static_cast<unsigned>(d->rows), silu_chunks(d->cols)),
