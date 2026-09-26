@@ -93,5 +93,6 @@ execution:
   sampler_threads: 4
   # Launch each engine iteration before the host work (sampling, detokenisation, events) of the
   # previous one, its decodes taking their tokens on the device. Ignored when the kernel library
-  # lacks host staging (ABI v2.3) or device_sampling is off.
-  overlap_scheduling: true
+  # lacks host staging (ABI v2.3) or device_sampling is off. Off by default: on novanas it
+  # measured no faster and raised OLMoE's median time to first token.
+  overlap_scheduling: false

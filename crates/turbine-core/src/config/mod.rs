@@ -329,7 +329,8 @@ pub struct ExecutionConfig {
     pub sampler_threads: u32,
     /// Launch each engine iteration before the host work of the previous one, its decodes
     /// taking their tokens on the device (false: one iteration at a time). Needs a kernel
-    /// library with host staging (ABI v2.2) and device sampling; otherwise ignored.
+    /// library with host staging (ABI v2.3) and device sampling; otherwise ignored. Off by
+    /// default: it measured no faster on novanas and delayed OLMoE's first tokens.
     pub overlap_scheduling: bool,
 }
 
@@ -344,7 +345,7 @@ impl Default for ExecutionConfig {
             device_sampling: true,
             fused_ops: true,
             sampler_threads: 4,
-            overlap_scheduling: true,
+            overlap_scheduling: false,
         }
     }
 }

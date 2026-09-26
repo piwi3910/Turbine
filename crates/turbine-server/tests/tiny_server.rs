@@ -2378,8 +2378,8 @@ fn iteration_stage_breakdown() {
     );
 }
 
-/// P2c overlap scheduling end to end: `execution.overlap_scheduling` true (the default) and
-/// false give every request of a concurrent mix the same completion — greedy with and without
+/// P2c overlap scheduling end to end: `execution.overlap_scheduling` true and false (the default)
+/// give every request of a concurrent mix the same completion — greedy with and without
 /// logprobs, a stop string, EOS honoured, a seeded draw, `n` = 2, a JSON schema — and the server
 /// logs whether overlap scheduling is on (`overlap_scheduling`, `enabled`). Breaks if the key is
 /// not wired to the engine or overlap scheduling changes an output.

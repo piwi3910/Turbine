@@ -417,7 +417,7 @@ fn phase2c_execution_keys() {
     assert!(d.execution.device_sampling);
     assert!(d.execution.fused_ops);
     assert_eq!(d.execution.sampler_threads, 4);
-    assert!(d.execution.overlap_scheduling);
+    assert!(!d.execution.overlap_scheduling);
 
     for bad in ["0", "65"] {
         assert_rejected(
@@ -437,11 +437,11 @@ fn phase2c_execution_keys() {
             "execution.gemm_autotune=false",
             "execution.device_sampling=false",
             "execution.fused_ops=false",
-            "execution.overlap_scheduling=false",
+            "execution.overlap_scheduling=true",
         ],
     )
     .unwrap();
-    assert!(!c.execution.overlap_scheduling);
+    assert!(c.execution.overlap_scheduling);
     assert!(!c.execution.decode_graphs);
     assert!(!c.execution.gemm_autotune);
     assert!(!c.execution.device_sampling);
@@ -460,7 +460,7 @@ fn phase2c_execution_keys() {
     assert!(e.execution.gemm_autotune && e.execution.decode_graphs);
     assert!(e.execution.device_sampling && e.execution.fused_ops);
     assert_eq!(e.execution.sampler_threads, 4);
-    assert!(e.execution.overlap_scheduling);
+    assert!(!e.execution.overlap_scheduling);
     for key in [
         "gemm_autotune:",
         "decode_graphs:",
