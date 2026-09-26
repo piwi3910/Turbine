@@ -7,7 +7,8 @@
 # scheduler pair is tuned by the Phase 2c sweep (spec S-12): 2,048 batch tokens let an iteration
 # prefill about three ~680-token prompts instead of twelve, which the simulator
 # (turbine-scheduler sim::tests::phase2c_batch_shape_ttft) puts at a fifth of the median TTFT
-# for the same throughput; the lab sweep (scripts/lab-perf.sh --set ...) measures it.
+# for the same throughput. Measured on GPU 0 (scripts/lab-bench.sh, 2026-09-26): TTFT p50
+# 497 -> 195 ms (Llama) and 272 -> 134 ms (OLMoE) against 8,192, throughput unchanged.
 server:
   listen: 0.0.0.0:18000
 model:

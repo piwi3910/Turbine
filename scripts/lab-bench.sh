@@ -50,11 +50,11 @@ done
 case "$model" in
 llama)
 	slug=llama-3.2-3b-instruct
-	cfg=scripts/lab/phase2-novanas-llama.yaml
+	cfg=scripts/lab/phase2c-novanas-llama.yaml
 	;;
 olmoe)
 	slug=olmoe-1b-7b-0125-instruct
-	cfg=scripts/lab/phase2-novanas-olmoe.yaml
+	cfg=scripts/lab/phase2c-novanas-olmoe.yaml
 	;;
 *)
 	echo "lab-bench: unknown model $model" >&2
