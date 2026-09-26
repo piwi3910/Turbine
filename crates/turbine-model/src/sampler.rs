@@ -66,6 +66,17 @@ pub struct Sampler {
     rng: ChaCha8Rng,
     /// Raw values of the ids this step changed before sampling (reused across steps).
     originals: HashMap<u32, f32>,
+    /// Buffers reused across steps, so a step allocates nothing vocabulary-sized.
+    scratch: Scratch,
+}
+
+/// Vocabulary-sized buffers of one sampler, kept between steps.
+#[derive(Clone, Debug, Default)]
+struct Scratch {
+    /// Top-n selection and truncated candidates `(id, logit / T)`, highest first.
+    candidates: Vec<(u32, f32)>,
+    /// Unnormalised probabilities of the candidates (of every id when nothing is cut).
+    weights: Vec<f64>,
 }
 
 /// Index of the largest value; ties go to the lower id and NaN never wins.
@@ -115,23 +126,20 @@ fn by_value_desc(a: &(u32, f32), b: &(u32, f32)) -> Ordering {
     }
 }
 
-/// The `n` largest `(id, value)` pairs, highest first, ties by id.
-fn top_n(values: &[f32], n: usize) -> Vec<(u32, f32)> {
-    let mut pairs: Vec<(u32, f32)> = values
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| (i as u32, v))
-        .collect();
-    let n = n.min(pairs.len());
+/// The `n` largest `(id, value)` pairs of `values` into `out` (reused), highest first, ties by
+/// id.
+fn top_n_into(values: &[f32], n: usize, out: &mut Vec<(u32, f32)>) {
+    out.clear();
+    let n = n.min(values.len());
     if n == 0 {
-        return Vec::new();
+        return;
     }
-    if n < pairs.len() {
-        pairs.select_nth_unstable_by(n - 1, by_value_desc);
-        pairs.truncate(n);
+    out.extend(values.iter().enumerate().map(|(i, &v)| (i as u32, v)));
+    if n < out.len() {
+        out.select_nth_unstable_by(n - 1, by_value_desc);
+        out.truncate(n);
     }
-    pairs.sort_unstable_by(by_value_desc);
-    pairs
+    out.sort_unstable_by(by_value_desc);
 }
 
 /// `ids` sorted ascending without duplicates.
@@ -205,6 +213,7 @@ impl Sampler {
             counts: HashMap::new(),
             rng,
             originals: HashMap::new(),
+            scratch: Scratch::default(),
         }
     }
 
@@ -231,10 +240,11 @@ impl Sampler {
     pub fn sample(&mut self, logits: &mut [f32], mask: Option<&TokenMask>) -> SampledToken {
         let lse = self.logprobs.then(|| log_sum_exp(logits));
         let top_logprobs = match lse {
-            Some(lse) if self.top_logprobs > 0 => top_n(logits, self.top_logprobs)
-                .into_iter()
-                .map(|(id, v)| (id, v - lse))
-                .collect(),
+            Some(lse) if self.top_logprobs > 0 => {
+                let top = &mut self.scratch.candidates;
+                top_n_into(logits, self.top_logprobs, top);
+                top.iter().map(|&(id, v)| (id, v - lse)).collect()
+            }
             _ => Vec::new(),
         };
         self.adjust(logits, mask);
@@ -325,43 +335,38 @@ impl Sampler {
     }
 
     /// Temperature → top-k → top-p, then one draw over the kept candidates.
+    ///
+    /// The arithmetic is fixed so seeded streams keep their tokens: candidates `logit · (1/T)`
+    /// in f32, weights `exp(c − max)` in f64 summed in candidate order, the top-p prefix and
+    /// the draw `u · total` over that same order.
     fn draw(&mut self, logits: &[f32]) -> u32 {
         let inv_t = 1.0 / self.temperature;
         let vocab = logits.len();
         let k = self.top_k.map_or(vocab, |k| k.min(vocab));
-        let truncate = k < vocab || self.top_p < 1.0;
-        // Candidates: sorted descending (ties by id) when anything is cut, else in id order.
-        // Scaling by 1/T keeps the order, so the top-k cut is taken on the raw logits.
-        let mut candidates: Vec<(u32, f32)> = if truncate {
-            top_n(logits, k)
+        let Scratch {
+            candidates,
+            weights,
+        } = &mut self.scratch;
+        weights.clear();
+        if k < vocab || self.top_p < 1.0 {
+            // Candidates sorted descending (ties by id). Scaling by 1/T keeps the order, so the
+            // top-k cut is taken on the raw logits.
+            top_n_into(logits, k, candidates);
+            for c in candidates.iter_mut() {
+                c.1 *= inv_t;
+            }
+            let Some(max) = finite_max(candidates.iter().map(|c| c.1)) else {
+                return argmax(logits);
+            };
+            weights.extend(candidates.iter().map(|c| weight(c.1, max)));
         } else {
-            logits
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| (i as u32, v))
-                .collect()
-        };
-        for c in &mut candidates {
-            c.1 *= inv_t;
+            // Nothing is cut: every id in id order, so no candidate list is built.
+            candidates.clear();
+            let Some(max) = finite_max(logits.iter().map(|&v| v * inv_t)) else {
+                return argmax(logits);
+            };
+            weights.extend(logits.iter().map(|&v| weight(v * inv_t, max)));
         }
-        let max = candidates
-            .iter()
-            .map(|c| c.1)
-            .filter(|v| !v.is_nan())
-            .fold(f32::NEG_INFINITY, f32::max);
-        if !max.is_finite() {
-            return argmax(logits);
-        }
-        let mut weights: Vec<f64> = candidates
-            .iter()
-            .map(|c| {
-                if c.1.is_nan() {
-                    0.0
-                } else {
-                    f64::from(c.1 - max).exp()
-                }
-            })
-            .collect();
         let mut total: f64 = weights.iter().sum();
         if self.top_p < 1.0 {
             // Smallest prefix whose mass reaches top_p (at least one token).
@@ -378,17 +383,40 @@ impl Sampler {
             weights.truncate(keep);
             total = weights.iter().sum();
         }
+        let id_of = |i: usize| -> u32 {
+            if candidates.is_empty() {
+                i as u32
+            } else {
+                candidates[i].0
+            }
+        };
         let u = f64::from(uniform(&mut self.rng)) * total;
         let mut cum = 0.0;
         for (i, w) in weights.iter().enumerate() {
             cum += w;
             if u < cum {
-                return candidates[i].0;
+                return id_of(i);
             }
         }
         // Rounding left u at the total: the last kept candidate with non-zero weight.
-        let last = weights.iter().rposition(|&w| w > 0.0).unwrap_or(0);
-        candidates[last].0
+        id_of(weights.iter().rposition(|&w| w > 0.0).unwrap_or(0))
+    }
+}
+
+/// The largest non-NaN value; `None` when there is none or it is not finite.
+fn finite_max(values: impl Iterator<Item = f32>) -> Option<f32> {
+    let max = values
+        .filter(|v| !v.is_nan())
+        .fold(f32::NEG_INFINITY, f32::max);
+    max.is_finite().then_some(max)
+}
+
+/// Unnormalised probability of the scaled logit `c` under the maximum `max` (NaN weighs 0).
+fn weight(c: f32, max: f32) -> f64 {
+    if c.is_nan() {
+        0.0
+    } else {
+        f64::from(c - max).exp()
     }
 }
 
