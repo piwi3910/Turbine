@@ -22,6 +22,12 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 | 2026-09-26 | 288dbc2 | kernel ABI v2.1 (optional symbols; no runtime change) (285/0) | 292.1 | 45.6 | 1509 | 39.9 | c1 16/16; c16 16/16 | +2.3% |
 | 2026-09-26 | 750872c | **KV pages 128 → CK fmha_fwd_pagedkv for prefill and decode (290/0) — passes the 553 target (84% of vLLM)** | **623.6** | 21.9 | 575 | 19.6 | c1 16/16; c16 16/16 | +113% |
 | 2026-09-26 | (06f87c1, reverted) | fused QKV + gate/up GEMMs — REGRESSION; same build with execution.fused_ops=false: 624.6 tok/s, fwd 19.6 ms → the fused path itself is slower; reverted pending diagnosis | 556.7 | 25.1 | 572 | 22.2 | c1 16/16; c16 16/16 | −10.7% |
+| 2026-09-26 | 8c7d92a | **GPU 0 vs GPU 1, same build**: GPU 0 618.0 / GPU 1 533.3 tok/s. GPU 1's PCIe link was trained at Gen 1 (fixed by retrain → Gen 5 x8, but still 533.6); clocks/power/IRQs equal; cause open. From here all rows are **pinned to GPU 0** (scripts/lab-bench.sh). The 06f87c1 "regression" and the 536 tok/s after the MoE commit were GPU 1 runs. | 618.0 | 22.1 | – | – | c1 16/16 | new basis |
+| 2026-09-26 | d7dd545 | fused QKV/gate-up projections, opt-in (default off) (293/0) | 618.4 | 22.1 | 577 | 19.7 | c1 16/16; c16 16/16 | +0.1% |
+| 2026-09-26 | eaad734 | fused residual add + RMSNorm (CK rmsnorm2d add variant) (293/0) | 625.5 | 21.9 | 574 | 19.5 | c1 16/16; c16 15/16 flake | +1.1% |
+| 2026-09-26 | 3f21ad7 | GPU sampling 1/3: device logits reduce, Rust side (no kernel yet) (298/0) | 594.3 | 22.9 | 575 | 20.6 | c1 16/16; c16 16/16 | −5.0% (judged as a unit with the next two) |
+| 2026-09-26 | 0f4bb8f | GPU sampling 2/3: HIP logits_reduce kernel — only greedy rows eligible (1,024 of 52,225) (298/0) | 603.8 | 22.8 | 574 | 20.3 | c1 16/16; c16 16/16 | −3.5% vs eaad734 |
+| 2026-09-26 | 09a41da | **GPU sampling 3/3: device top_p — 52,224 of 52,225 rows reduced on the GPU (299/0) — 96% of vLLM's 738** | **708.2** | 18.8 | 573 | 18.1 | c1 16/16; c16 16/16 | **+13.2% vs eaad734** |
 
 ## OLMoE-1B-7B-0125-Instruct (BF16)
 
