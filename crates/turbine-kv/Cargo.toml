@@ -25,6 +25,8 @@ blake3.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Captures logged events in unit tests (test_log)
+tracing-subscriber.workspace = true
 
 # Device memory is reached only through turbine-tensor's safe traits (`DeviceMemory`,
 # `PinnedMemory`), injected by turbine-server.
