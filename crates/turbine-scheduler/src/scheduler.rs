@@ -20,12 +20,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
+use smallvec::SmallVec;
 use turbine_core::clock::Clock;
 use turbine_core::config::Config;
 use turbine_core::request::FinishReason;
-use turbine_core::types::{BlockId, RequestId, SeqId};
-use turbine_kv::{BlockPool, BlockTable, blocks_for_tokens};
+use turbine_core::types::{BlockId, PressureState, RequestId, SeqId};
+use turbine_kv::{BlockPool, BlockTable, PoolError, blocks_for_tokens};
+use turbine_reliability::admission::RejectionReason;
+use turbine_reliability::ledger::Reservation;
+use turbine_reliability::throttle::{AdmissionMode, ThrottlePlan};
 
+use crate::gate::{AdmissionGate, GateOutcome};
 use crate::metrics::SchedulerMetrics;
 use crate::policy::{AdmissionInfo, DefaultPolicy, PreemptionRank, RunningInfo, SchedulingPolicy};
 use crate::queue::WaitingQueue;
@@ -66,10 +71,12 @@ impl SchedulerParams {
 }
 
 /// Per-iteration throttles. Phase 2 always passes `Default` (GREEN: no limit); Phase 3 derives
-/// them from the pressure controller's throttle plan.
+/// them from the pressure controller's throttle plan (`From<&ThrottlePlan>`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IterationLimits {
-    /// At most this many admissions this iteration.
+    /// At most this many admissions this iteration. With an admission gate: growth of the
+    /// admitted count (running + waiting with a KV reservation) over the previous iteration's
+    /// (`Some(0)`: queued requests may replace finished ones, the batch does not grow).
     pub batch_growth_limit: Option<u32>,
     /// No admissions at all.
     pub shrink_only: bool,
@@ -79,6 +86,9 @@ pub struct IterationLimits {
     pub prefill_chunk_tokens: Option<u32>,
     pub admit_new: bool,
     pub start_new_prefills: bool,
+    /// Running requests may be preempted to make room. Phase 2: always; with an admission gate
+    /// (Phase 3) only in SURVIVAL, and only when the next decode step cannot allocate.
+    pub allow_preempt: bool,
 }
 
 impl Default for IterationLimits {
@@ -90,6 +100,24 @@ impl Default for IterationLimits {
             prefill_chunk_tokens: None,
             admit_new: true,
             start_new_prefills: true,
+            allow_preempt: true,
+        }
+    }
+}
+
+impl From<&ThrottlePlan> for IterationLimits {
+    /// The P3 throttle-plan table as scheduler limits. SURVIVAL has no prefill chunk and a
+    /// prefill budget of 0, so no prefill runs at all.
+    fn from(p: &ThrottlePlan) -> Self {
+        IterationLimits {
+            batch_growth_limit: p.batch_growth_limit,
+            shrink_only: p.shrink_only,
+            prefill_budget_fraction: p.prefill_budget_fraction,
+            prefill_chunk_tokens: p.prefill_chunk_tokens,
+            // RED (`AllQueued`) still pumps the gate's queue into finished slots.
+            admit_new: p.admission != AdmissionMode::Stopped,
+            start_new_prefills: p.start_new_prefills,
+            allow_preempt: p.state == PressureState::Survival,
         }
     }
 }
@@ -174,6 +202,7 @@ pub struct IterationFailure {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SubmitError {
     #[error("queue full")]
     QueueFull,
@@ -185,6 +214,13 @@ pub enum SubmitError {
     PromptTooLong,
     #[error("shutting down")]
     ShuttingDown,
+    /// The admission gate refused the request (P3 reject table); `retry_after_secs` is the
+    /// `Retry-After` hint (0 = none).
+    #[error("rejected: {}", reason.as_str())]
+    Rejected {
+        reason: RejectionReason,
+        retry_after_secs: u64,
+    },
 }
 
 impl SubmitError {
@@ -196,6 +232,7 @@ impl SubmitError {
             SubmitError::ContextExceedsKvCapacity => "context_exceeds_kv_capacity",
             SubmitError::PromptTooLong => "prompt_too_long",
             SubmitError::ShuttingDown => "shutting_down",
+            SubmitError::Rejected { reason, .. } => reason.as_str(),
         }
     }
 }
@@ -246,6 +283,11 @@ struct ReqEntry {
     /// `seqs[0]`'s first prefill finished; the other choices fork from it.
     shared_prefill_done: bool,
     cancel: Option<CancelReason>,
+    /// Worst-case KV reservation from the admission gate (P3); every block of the request is
+    /// paid from it, and dropping the entry releases it.
+    reservation: Option<Reservation>,
+    /// An admitted prefill above `large_prefill_tokens` that has not finished yet.
+    expensive: bool,
 }
 
 struct SeqEntry {
@@ -279,6 +321,18 @@ impl SeqEntry {
     }
 }
 
+/// Every choice's KV blocks at completion; choices share the prompt's full blocks.
+fn request_kv_blocks(r: &SchedRequest, block_tokens: u32) -> u64 {
+    let bt = block_tokens.max(1);
+    let one = u64::from(blocks_for_tokens(
+        r.prompt_len.saturating_add(r.max_new_tokens),
+        bt,
+    ));
+    let shared = u64::from(r.prompt_len / bt);
+    let extra_choices = r.seqs.len().saturating_sub(1) as u64;
+    one + extra_choices * (one - shared.min(one))
+}
+
 /// The Phase 2 continuous-batching scheduler. Single-threaded: owned by the engine thread.
 pub struct Scheduler {
     params: SchedulerParams,
@@ -299,6 +353,13 @@ pub struct Scheduler {
     shutting_down: bool,
     plan_started: Duration,
     last: LastIteration,
+    /// P3 admission gate; `None` keeps the Phase 2 behaviour.
+    gate: Option<AdmissionGate>,
+    /// Requests that left the gate's queue on `cancel`, reported by the next plan.
+    gate_dropped: Vec<(RequestId, CancelReason)>,
+    /// Admitted requests (running + waiting with a reservation) after the previous plan: the
+    /// reference for batch growth with a gate.
+    prev_admitted: usize,
 }
 
 impl Scheduler {
@@ -320,7 +381,33 @@ impl Scheduler {
             shutting_down: false,
             plan_started: Duration::ZERO,
             last: LastIteration::default(),
+            gate: None,
+            gate_dropped: Vec::new(),
+            prev_admitted: 0,
         }
+    }
+
+    /// Put the P3 admission gate in front of the scheduler: it owns the single waiting queue
+    /// (`scheduler.max_queued_requests` then bounds only the HTTP→engine channel, C-1), every
+    /// admitted request carries its worst-case KV reservation, and preemption happens only when
+    /// `IterationLimits::allow_preempt` (SURVIVAL).
+    pub fn with_gate(mut self, gate: AdmissionGate) -> Scheduler {
+        self.gate = Some(gate);
+        self
+    }
+
+    pub fn gate(&self) -> Option<&AdmissionGate> {
+        self.gate.as_ref()
+    }
+
+    pub fn gate_mut(&mut self) -> Option<&mut AdmissionGate> {
+        self.gate.as_mut()
+    }
+
+    /// Waiting requests: the gate's queue plus admitted requests not yet started (and
+    /// preempted ones).
+    pub fn queue_len(&self) -> usize {
+        self.queue.len() + self.gate.as_ref().map_or(0, AdmissionGate::queue_len)
     }
 
     /// Publish metrics to `m` (the simulator runs without).
@@ -350,61 +437,147 @@ impl Scheduler {
         &self.params
     }
 
-    /// Submission checks (P2 §Scheduling rules), then queue by priority and arrival.
-    pub fn submit(&mut self, r: SchedRequest, pool_total_blocks: u32) -> Result<(), SubmitError> {
-        let result = self.check_submission(&r, pool_total_blocks);
-        match result {
-            Err(e) => {
-                tracing::info!(event = "reject", request_id = %r.id.0, reason = e.as_str(), "request rejected");
-                if let Some(m) = &self.metrics {
-                    m.admission("rejected", e.as_str());
-                }
-                Err(e)
+    /// Submission checks (P2 §Scheduling rules), then queue by priority and arrival. With an
+    /// admission gate the gate decides: admitted (with its worst-case KV reservation) into the
+    /// scheduler's queue, held in the gate's queue, or rejected (P3 S-9).
+    pub fn submit(
+        &mut self,
+        mut r: SchedRequest,
+        pool_total_blocks: u32,
+    ) -> Result<(), SubmitError> {
+        if let Err(e) = self.check_submission(&r, pool_total_blocks) {
+            self.count_rejection(r.id, e);
+            return Err(e);
+        }
+        let block_tokens = self.params.block_tokens;
+        let submit_no = self.queue.next_order();
+        let Some(gate) = self.gate.as_mut() else {
+            self.enqueue(r, None, submit_no);
+            return Ok(());
+        };
+        // The reservation covers every choice's KV at completion.
+        r.estimate.projected_kv_blocks =
+            u32::try_from(request_kv_blocks(&r, block_tokens)).unwrap_or(u32::MAX);
+        let id = r.id;
+        // An immediate admission takes an admitted slot: within `max_running_requests` and the
+        // throttle plan's batch growth over the previous plan's admitted count, like the pump.
+        let limits = IterationLimits::from(&gate.controller().throttle());
+        let admitted = self.running.len() + self.queue.len();
+        let slot_free = admitted < self.params.max_running_requests as usize
+            && limits
+                .batch_growth_limit
+                .is_none_or(|g| admitted < self.prev_admitted + g as usize);
+        // The gate's queue is ordered by the policy's key, like the scheduler's own queue.
+        let key = self.policy.admission_key(&AdmissionInfo {
+            priority: r.priority,
+            arrival: r.arrival,
+            submit_no,
+            preempted: false,
+            push_no: submit_no,
+        });
+        match gate.offer(r, key, submit_no, slot_free) {
+            Ok(GateOutcome::Admitted(r, reservation)) => {
+                self.enqueue(r, Some(reservation), submit_no);
+                Ok(())
             }
-            Ok(()) => {
-                let now = self.clock.now_mono();
-                let submit_no = self.queue.next_order();
-                let key = self.policy.admission_key(&AdmissionInfo {
-                    priority: r.priority,
-                    arrival: r.arrival,
-                    submit_no,
-                    preempted: false,
-                    push_no: submit_no,
-                });
-                self.queue.push(r.id, key);
-                for &seq in &r.seqs {
-                    self.seqs.insert(
-                        seq,
-                        SeqEntry {
-                            request: r.id,
-                            state: RequestState::Waiting,
-                            table: BlockTable::new(),
-                            generated: 0,
-                            target: r.prompt_len,
-                            awaiting_fork: false,
-                            pause_pending: false,
-                        },
-                    );
-                }
-                self.requests.insert(
-                    r.id,
-                    ReqEntry {
-                        req: r,
-                        admitted: None,
-                        ever_admitted: false,
-                        submit_no,
-                        queued_since: now,
-                        shared_prefill_done: false,
-                        cancel: None,
-                    },
-                );
+            Ok(GateOutcome::Queued) => {
                 if let Some(m) = &self.metrics {
-                    m.admission("queued", "ok");
+                    m.admission("queued", "gated");
                 }
                 self.publish_gauges();
                 Ok(())
             }
+            Err(e) => {
+                self.count_rejection(id, e);
+                Err(e)
+            }
         }
+    }
+
+    /// An internal request (circuit probe) that bypasses the admission queue but still takes
+    /// its worst-case KV reservation; without a gate it is a plain submission.
+    pub fn submit_probe(
+        &mut self,
+        mut r: SchedRequest,
+        pool_total_blocks: u32,
+    ) -> Result<(), SubmitError> {
+        self.check_submission(&r, pool_total_blocks)?;
+        let block_tokens = self.params.block_tokens;
+        let reservation = match self.gate.as_ref() {
+            Some(gate) => {
+                r.estimate.projected_kv_blocks =
+                    u32::try_from(request_kv_blocks(&r, block_tokens)).unwrap_or(u32::MAX);
+                let res = gate
+                    .reserve_direct(&r.estimate)
+                    .map_err(|_| SubmitError::Rejected {
+                        reason: RejectionReason::QueueFull,
+                        retry_after_secs: 1,
+                    })?;
+                Some(res)
+            }
+            None => None,
+        };
+        let submit_no = self.queue.next_order();
+        self.enqueue(r, reservation, submit_no);
+        Ok(())
+    }
+
+    fn count_rejection(&self, id: RequestId, e: SubmitError) {
+        tracing::info!(event = "reject", request_id = %id.0, reason = e.as_str(), "request rejected");
+        if let Some(m) = &self.metrics {
+            m.admission("rejected", e.as_str());
+        }
+    }
+
+    /// Track `r` in the scheduler's own queue: Phase 2 queued, or admitted by the gate with
+    /// its reservation. `submit_no` is the queue counter taken at submission.
+    fn enqueue(&mut self, r: SchedRequest, reservation: Option<Reservation>, submit_no: u64) {
+        let expensive = reservation.is_some()
+            && self
+                .gate
+                .as_ref()
+                .is_some_and(|g| g.is_expensive(&r.estimate));
+        let now = self.clock.now_mono();
+        let key = self.policy.admission_key(&AdmissionInfo {
+            priority: r.priority,
+            arrival: r.arrival,
+            submit_no,
+            preempted: false,
+            push_no: submit_no,
+        });
+        self.queue.push(r.id, key);
+        for &seq in &r.seqs {
+            self.seqs.insert(
+                seq,
+                SeqEntry {
+                    request: r.id,
+                    state: RequestState::Waiting,
+                    table: BlockTable::new(),
+                    generated: 0,
+                    target: r.prompt_len,
+                    awaiting_fork: false,
+                    pause_pending: false,
+                },
+            );
+        }
+        self.requests.insert(
+            r.id,
+            ReqEntry {
+                req: r,
+                admitted: None,
+                ever_admitted: false,
+                submit_no,
+                queued_since: now,
+                shared_prefill_done: false,
+                cancel: None,
+                reservation,
+                expensive,
+            },
+        );
+        if let Some(m) = &self.metrics {
+            m.admission("queued", "ok");
+        }
+        self.publish_gauges();
     }
 
     fn check_submission(
@@ -423,18 +596,11 @@ impl Scheduler {
         if !p.chunked_prefill && r.prompt_len > p.max_batch_tokens {
             return Err(SubmitError::PromptTooLong);
         }
-        // Every choice's KV at completion; choices share the prompt's full blocks.
-        let bt = p.block_tokens.max(1);
-        let one = u64::from(blocks_for_tokens(
-            r.prompt_len.saturating_add(r.max_new_tokens),
-            bt,
-        ));
-        let shared = u64::from(r.prompt_len / bt);
-        let extra_choices = r.seqs.len().saturating_sub(1) as u64;
-        if one + extra_choices * (one - shared.min(one)) > u64::from(pool_total_blocks) {
+        if request_kv_blocks(r, p.block_tokens) > u64::from(pool_total_blocks) {
             return Err(SubmitError::ContextExceedsKvCapacity);
         }
-        if self.queue.len() >= p.max_queued_requests as usize {
+        // With a gate the admission queue has its own bound (C-1).
+        if self.gate.is_none() && self.queue.len() >= p.max_queued_requests as usize {
             return Err(SubmitError::QueueFull);
         }
         Ok(())
@@ -444,6 +610,11 @@ impl Scheduler {
     pub fn cancel(&mut self, id: RequestId, reason: CancelReason) {
         if let Some(e) = self.requests.get_mut(&id) {
             e.cancel.get_or_insert(reason);
+        } else if let Some(gate) = self.gate.as_mut()
+            && gate.remove(id).is_some()
+        {
+            // Still in the admission queue: it never took a reservation.
+            self.gate_dropped.push((id, reason));
         }
     }
 
@@ -482,7 +653,94 @@ impl Scheduler {
 
     /// No request is queued or running.
     pub fn is_idle(&self) -> bool {
-        self.requests.is_empty()
+        self.requests.is_empty() && self.gate.as_ref().is_none_or(|g| g.queue_len() == 0)
+    }
+
+    /// Admitted requests in admission order.
+    pub fn running_ids(&self) -> Vec<RequestId> {
+        self.running.clone()
+    }
+
+    /// Waiting requests: admitted but not started (preempted first), then the gate's queue.
+    pub fn queued_ids(&self) -> Vec<RequestId> {
+        let mut ids: Vec<RequestId> = self.queue.iter().collect();
+        if let Some(g) = &self.gate {
+            ids.extend(g.queued_ids());
+        }
+        ids
+    }
+
+    /// Tokens `seq` may still generate (`max_new_tokens − generated`).
+    pub fn token_limit(&self, seq: SeqId) -> Option<u32> {
+        let e = self.seqs.get(&seq)?;
+        let r = self.requests.get(&e.request)?;
+        Some(r.req.max_new_tokens.saturating_sub(e.generated))
+    }
+
+    /// Remaining tokens of every live sequence of the running requests (exhaustion horizon).
+    pub fn remaining_tokens(&self) -> Vec<u32> {
+        self.running
+            .iter()
+            .flat_map(|id| self.requests[id].req.seqs.iter())
+            .filter(|s| self.seqs.get(s).is_some_and(|e| e.state.is_live()))
+            .filter_map(|s| self.token_limit(*s))
+            .collect()
+    }
+
+    /// Recovery (P3 S-11): keep only the first `limit` items of the plan in flight and undo
+    /// the others — their positions are un-written and blocks allocated for them return to
+    /// the pool — so the iteration can be retried with a smaller batch.
+    pub fn shrink_plan(&mut self, pool: &mut BlockPool, plan: &mut IterationPlan, limit: usize) {
+        if plan.items.len() <= limit {
+            return;
+        }
+        let bt = self.params.block_tokens;
+        for item in plan.items.drain(limit..) {
+            let Some(e) = self.seqs.get_mut(&item.seq) else {
+                continue;
+            };
+            let written = match item.kind {
+                BatchKind::Decode => 1,
+                BatchKind::Prefill { len, .. } => len,
+            };
+            e.table.tokens = e.table.tokens.saturating_sub(written);
+            let keep = blocks_for_tokens(e.table.tokens, bt) as usize;
+            if e.table.blocks.len() > keep {
+                let extra: SmallVec<[BlockId; 16]> = e.table.blocks.drain(keep..).collect();
+                pool.release(&extra);
+            }
+        }
+        self.in_flight = plan.items.iter().map(|i| (i.seq, i.kind)).collect();
+        let kept: HashSet<RequestId> = plan
+            .items
+            .iter()
+            .filter_map(|i| self.seqs.get(&i.seq).map(|e| e.request))
+            .chain(
+                plan.forks
+                    .iter()
+                    .filter_map(|f| self.seqs.get(&f.dst).map(|e| e.request)),
+            )
+            .collect();
+        self.in_flight_requests.retain(|id| kept.contains(id));
+        self.last.prefill_tokens = plan.prefill_tokens();
+        self.last.decode_tokens = plan.decode_tokens();
+        self.last.requests = plan.items.len() as u32;
+    }
+
+    /// Fail `ids` (retries exhausted, P3 S-11): their blocks and reservations are released.
+    /// Returns the ones the scheduler still tracked.
+    pub fn fail_requests(&mut self, pool: &mut BlockPool, ids: &[RequestId]) -> Vec<RequestId> {
+        let mut failed = Vec::new();
+        for &id in ids {
+            if self.requests.contains_key(&id) {
+                tracing::warn!(event = "fail", request_id = %id.0, reason = "resource_exhausted", "request failed after recovery retries");
+                self.remove_request(pool, id, RequestState::Failed);
+                failed.push(id);
+            }
+        }
+        self.in_flight_requests.retain(|id| !failed.contains(id));
+        self.publish_gauges();
+        failed
     }
 
     /// State of a sequence the scheduler still tracks.
@@ -497,6 +755,12 @@ impl Scheduler {
             .get(&seq)
             .filter(|e| e.state == RequestState::Prefilling && !e.awaiting_fork)
             .map(|e| e.target)
+    }
+
+    /// Requests holding a running slot or waiting to start. With a gate every one of them
+    /// holds its worst-case KV reservation; batch growth limits this count.
+    pub fn admitted_count(&self) -> usize {
+        self.running.len() + self.queue.len()
     }
 
     /// One iteration's batch (P2 §Scheduling rules 1–3).
@@ -515,7 +779,7 @@ impl Scheduler {
         self.drop_cancelled(pool, now, &mut plan);
 
         // (2) Every decodable sequence decodes; preempt until the pool covers them.
-        self.plan_decodes(pool, &mut plan, &mut in_plan, &mut preempted_now);
+        self.plan_decodes(pool, limits, &mut plan, &mut in_plan, &mut preempted_now);
 
         // Forks of finished shared prefills (n > 1) wait for blocks, never re-prefill.
         self.plan_forks(pool, &mut plan, &mut in_plan, &mut preempted_now);
@@ -544,11 +808,35 @@ impl Scheduler {
                 );
             }
         }
-        if limits.admit_new && limits.start_new_prefills && !limits.shrink_only {
+        // With a gate every request in the scheduler's queue already holds its worst-case KV
+        // reservation: the admitted count is running + waiting, and it grows by at most
+        // `batch_growth_limit` over the previous iteration's (`Some(0)`: queued requests only
+        // refill slots of finished ones — RED included). The gate pumps its queue into the
+        // freed slots; admitted requests start as the prefill budget allows.
+        let gated = self.gate.is_some();
+        let may_start = limits.admit_new && limits.start_new_prefills && !limits.shrink_only;
+        if gated && may_start {
+            let admitted = self.admitted_count();
+            let allowance = limits.batch_growth_limit.map_or(usize::MAX, |g| {
+                (self.prev_admitted + g as usize).saturating_sub(admitted)
+            });
+            let slots = (self.params.max_running_requests as usize)
+                .saturating_sub(admitted)
+                .min(allowance);
+            let pumped = self
+                .gate
+                .as_mut()
+                .map(|g| g.pump(slots))
+                .unwrap_or_default();
+            for (r, reservation, submit_no) in pumped {
+                self.enqueue(r, Some(reservation), submit_no);
+            }
+        }
+        if may_start {
             let mut admitted_now = 0u32;
             while budget > 0
                 && (self.running.len() as u32) < self.params.max_running_requests
-                && limits.batch_growth_limit.is_none_or(|g| admitted_now < g)
+                && (gated || limits.batch_growth_limit.is_none_or(|g| admitted_now < g))
             {
                 let Some(head) = self.queue.peek() else {
                     break;
@@ -591,6 +879,7 @@ impl Scheduler {
             duration_ms: 0.0,
             stages_ms: BTreeMap::new(),
         };
+        self.prev_admitted = self.admitted_count();
         self.publish_gauges();
         plan
     }
@@ -651,6 +940,12 @@ impl Scheduler {
             let Some(r) = self.requests.get_mut(&id) else {
                 continue;
             };
+            if r.expensive {
+                r.expensive = false;
+                if let Some(g) = self.gate.as_mut() {
+                    g.admission_mut().expensive_prefill_finished();
+                }
+            }
             if r.req.seqs.first() == Some(&seq) && !r.shared_prefill_done {
                 r.shared_prefill_done = true;
                 let forks_waiting = r.req.seqs.iter().skip(1).any(|s| {
@@ -692,7 +987,7 @@ impl Scheduler {
                 max_queued_requests: p.max_queued_requests,
                 chunked_prefill: p.chunked_prefill,
             },
-            waiting: self.queue.len() as u32,
+            waiting: self.queue_len() as u32,
             prefilling,
             decoding,
             paused,
@@ -706,6 +1001,7 @@ impl Scheduler {
     // ---- rules -------------------------------------------------------------------------
 
     fn drop_cancelled(&mut self, pool: &mut BlockPool, now: Duration, plan: &mut IterationPlan) {
+        self.drop_gated(plan);
         let candidates: Vec<RequestId> = self
             .running
             .iter()
@@ -716,7 +1012,9 @@ impl Scheduler {
             let Some(e) = self.requests.get(&id) else {
                 continue;
             };
-            let timed_out = e.admitted.is_none()
+            // With a gate, admitted requests never time out: the gate's queue owns the wait.
+            let timed_out = self.gate.is_none()
+                && e.admitted.is_none()
                 && !e.ever_admitted
                 && now.saturating_sub(e.queued_since) > self.params.queue_timeout;
             let reason = e
@@ -747,23 +1045,60 @@ impl Scheduler {
         }
     }
 
+    /// Requests leaving the gate's queue: cancelled while queued, timed out, or rejected
+    /// because the circuit opened. None of them holds a reservation or a block.
+    fn drop_gated(&mut self, plan: &mut IterationPlan) {
+        let Some(gate) = self.gate.as_mut() else {
+            return;
+        };
+        let mut gone: Vec<(RequestId, CancelReason)> = std::mem::take(&mut self.gate_dropped);
+        gone.extend(
+            gate.take_cancelled()
+                .into_iter()
+                .map(|r| (r.id, CancelReason::ClientDisconnect)),
+        );
+        gone.extend(
+            gate.expire()
+                .into_iter()
+                .map(|r| (r.id, CancelReason::QueueTimeout)),
+        );
+        if gate.controller().circuit().blocks_readiness() {
+            gone.extend(
+                gate.reject_all()
+                    .into_iter()
+                    .map(|r| (r.id, CancelReason::CircuitOpen)),
+            );
+        }
+        for (id, reason) in gone {
+            plan.dropped.push((id, reason));
+            if matches!(
+                reason,
+                CancelReason::QueueTimeout | CancelReason::CircuitOpen
+            ) {
+                tracing::info!(event = "reject", request_id = %id.0, reason = reason.as_str(), "queued request rejected");
+                if let Some(m) = &self.metrics {
+                    m.admission("rejected", reason.as_str());
+                }
+            } else {
+                tracing::info!(event = "cancel", request_id = %id.0, reason = reason.as_str(), "queued request cancelled");
+                if let Some(m) = &self.metrics {
+                    m.cancelled(reason.as_str());
+                }
+            }
+        }
+    }
+
     fn plan_decodes(
         &mut self,
         pool: &mut BlockPool,
+        limits: &IterationLimits,
         plan: &mut IterationPlan,
         in_plan: &mut HashSet<RequestId>,
         preempted_now: &mut HashSet<RequestId>,
     ) {
         let bt = self.params.block_tokens;
-        loop {
-            let need: u32 = self
-                .decode_set()
-                .iter()
-                .map(|s| self.seqs[s].table.blocks_needed(1, bt))
-                .sum();
-            if need <= pool.free_blocks() {
-                break;
-            }
+        // Preempt until the pool covers every decode (never, without allow_preempt).
+        while limits.allow_preempt && self.decode_blocks_needed() > pool.free_blocks() {
             let Some(victim) = self.worst_running(|_| true) else {
                 break;
             };
@@ -775,13 +1110,23 @@ impl Scheduler {
                 .get_mut(&seq)
                 .expect("decode set holds tracked sequences");
             let need = e.table.blocks_needed(1, bt);
-            let Ok(blocks) = pool.allocate(need) else {
-                // Unreachable: the loop above made the pool cover every decode.
-                tracing::error!(
-                    event = "scheduler_bug",
-                    seq = seq.0,
-                    "decode lacks blocks after preemption"
-                );
+            let Ok(blocks) = Self::allocate_for(pool, &mut self.requests, e.request, need) else {
+                // With preemption allowed the loop above made the pool cover every decode;
+                // without it (a gate below SURVIVAL) the sequence waits for a block.
+                if limits.allow_preempt {
+                    tracing::error!(
+                        event = "scheduler_bug",
+                        seq = seq.0,
+                        "decode lacks blocks after preemption"
+                    );
+                } else {
+                    tracing::warn!(
+                        event = "decode_deferred",
+                        seq = seq.0,
+                        reason = "kv_exhausted",
+                        "decode waits for a KV block (no preemption below SURVIVAL)"
+                    );
+                }
                 continue;
             };
             e.table.blocks.extend(blocks);
@@ -825,7 +1170,7 @@ impl Scheduler {
             for child in children {
                 let parent_table = self.seqs[&parent].table.clone();
                 let mut forked = pool.fork(&parent_table);
-                if forked.is_err() {
+                if forked.is_err() && self.gate.is_none() {
                     // Make room from requests ranked below this one that are not in the plan.
                     while let Some(victim) =
                         self.worst_running(|v| v.0 != id && !in_plan.contains(&v.0) && v.1 > rank)
@@ -841,6 +1186,15 @@ impl Scheduler {
                     all_forked = false;
                     break; // waits for blocks; the prompt is not re-prefilled
                 };
+                if copy.is_some()
+                    && let Some(res) = self
+                        .requests
+                        .get_mut(&id)
+                        .and_then(|r| r.reservation.as_mut())
+                {
+                    // The fresh tail block is paid like any other block of the request.
+                    res.commit_bytes(pool.layout().block_bytes());
+                }
                 let c = self.seqs.get_mut(&child).expect("child tracked");
                 c.table = table;
                 c.awaiting_fork = false;
@@ -889,7 +1243,8 @@ impl Scheduler {
             return false;
         }
         let need = e.table.blocks_needed(len, bt);
-        if need > pool.free_blocks() && may_preempt {
+        // With a gate every request's KV is reserved: prefills never preempt (P3 §Throttle).
+        if need > pool.free_blocks() && may_preempt && self.gate.is_none() {
             let rank = self.rank(id);
             while need > pool.free_blocks() {
                 let Some(victim) =
@@ -900,7 +1255,7 @@ impl Scheduler {
                 self.preempt(pool, victim, plan, preempted_now);
             }
         }
-        let Ok(blocks) = pool.allocate(need) else {
+        let Ok(blocks) = Self::allocate_for(pool, &mut self.requests, id, need) else {
             return false; // new prefills wait for blocks
         };
         let e = self.seqs.get_mut(&seq).expect("sequence tracked");
@@ -934,7 +1289,12 @@ impl Scheduler {
         if len == 0 || (self.whole_prefill_required(target) && len < target) {
             return false;
         }
-        let watermark = (f64::from(pool.total_blocks()) * self.params.free_watermark).ceil() as u32;
+        // A request holding its KV reservation needs no free-block watermark.
+        let watermark = if r.reservation.is_some() {
+            0
+        } else {
+            (f64::from(pool.total_blocks()) * self.params.free_watermark).ceil() as u32
+        };
         pool.free_blocks() >= blocks_for_tokens(len, self.params.block_tokens) + watermark
     }
 
@@ -972,6 +1332,13 @@ impl Scheduler {
         plan: &mut IterationPlan,
         preempted_now: &mut HashSet<RequestId>,
     ) {
+        // With a gate preemption happens only in SURVIVAL (P3); the reservation is kept, so
+        // the recompute is guaranteed its KV.
+        let preempt_reason = if self.gate.is_some() {
+            PreemptReason::SurvivalDecodeAlloc
+        } else {
+            PreemptReason::KvExhausted
+        };
         self.running.retain(|r| *r != id);
         let push_no = self.queue.next_order();
         let r = self.requests.get_mut(&id).expect("running request tracked");
@@ -993,13 +1360,13 @@ impl Scheduler {
                 RequestState::Prefilling | RequestState::Decoding | RequestState::Paused
             ) {
                 e.set_state(RequestState::Waiting, seq);
-                plan.preempted.push((seq, PreemptReason::KvExhausted));
+                plan.preempted.push((seq, preempt_reason));
             }
         }
         self.queue.push(id, key);
         preempted_now.insert(id);
         self.preemptions_total += 1;
-        let reason = PreemptReason::KvExhausted.as_str();
+        let reason = preempt_reason.as_str();
         tracing::info!(event = "preempt", request_id = %id.0, reason, "request preempted by recompute");
         if let Some(m) = &self.metrics {
             m.preempted(reason);
@@ -1044,6 +1411,11 @@ impl Scheduler {
         });
         if done {
             let r = self.requests.remove(&id).expect("checked above");
+            if r.expensive
+                && let Some(g) = self.gate.as_mut()
+            {
+                g.admission_mut().expensive_prefill_finished();
+            }
             for s in &r.req.seqs {
                 self.seqs.remove(s);
             }
@@ -1057,6 +1429,11 @@ impl Scheduler {
         let Some(r) = self.requests.remove(&id) else {
             return;
         };
+        if r.expensive
+            && let Some(g) = self.gate.as_mut()
+        {
+            g.admission_mut().expensive_prefill_finished();
+        }
         for seq in &r.req.seqs {
             if let Some(mut e) = self.seqs.remove(seq) {
                 pool.release(&e.table.blocks);
@@ -1071,8 +1448,30 @@ impl Scheduler {
 
     // ---- helpers -----------------------------------------------------------------------
 
+    /// `n` blocks for request `id`, paid from its reservation when it has one.
+    fn allocate_for(
+        pool: &mut BlockPool,
+        requests: &mut HashMap<RequestId, ReqEntry>,
+        id: RequestId,
+        n: u32,
+    ) -> Result<SmallVec<[BlockId; 8]>, PoolError> {
+        match requests.get_mut(&id).and_then(|r| r.reservation.as_mut()) {
+            Some(res) => pool.allocate_reserved(n, res),
+            None => pool.allocate(n),
+        }
+    }
+
     fn is_running(&self, id: RequestId) -> bool {
         self.requests.get(&id).is_some_and(|r| r.admitted.is_some())
+    }
+
+    /// Blocks the decode set needs for one more token each.
+    fn decode_blocks_needed(&self) -> u32 {
+        let bt = self.params.block_tokens;
+        self.decode_set()
+            .iter()
+            .map(|s| self.seqs[s].table.blocks_needed(1, bt))
+            .sum()
     }
 
     /// Decoding (not paused) sequences of running requests, in admission order.

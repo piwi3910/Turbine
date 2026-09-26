@@ -12,6 +12,8 @@ license.workspace = true
 turbine-core.workspace = true
 turbine-observability.workspace = true
 turbine-kv.workspace = true
+# P3: admission gate, throttle plan, pressure and recovery controllers.
+turbine-reliability.workspace = true
 prometheus-client.workspace = true
 serde.workspace = true
 smallvec.workspace = true
@@ -21,11 +23,13 @@ tracing.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
 uuid.workspace = true
+# Overload simulation: a host-memory KV pool (turbine-kv already depends on it); the SSE
+# error event of a failed simulated stream.
+turbine-tensor.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-serde_json.workspace = true
-turbine-tensor.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

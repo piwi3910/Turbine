@@ -15,7 +15,8 @@ pub enum AdmissionMode {
     Open,
     /// Requests whose new prefill exceeds `large_prefill_tokens` queue (`pressure_orange`).
     ExpensiveQueued,
-    /// Every new request queues (`pressure_red`).
+    /// Every new request queues (`pressure_red`); queued requests only refill running slots
+    /// freed by finished sequences.
     AllQueued,
     /// New requests are rejected `503 overloaded`; the queue is kept but not drained.
     Stopped,
@@ -54,12 +55,13 @@ pub struct ThrottlePlan {
     pub state: PressureState,
     /// `None` = unlimited; `Some(0)` = frozen at the current running count.
     pub batch_growth_limit: Option<u32>,
-    /// Finished sequences are not replaced.
+    /// Finished sequences are not replaced (SURVIVAL).
     pub shrink_only: bool,
     pub prefill_budget_fraction: f64,
     /// `None` = no prefill at all (SURVIVAL).
     pub prefill_chunk_tokens: Option<u32>,
-    /// False from RED: in-progress prefills continue, none starts.
+    /// False in SURVIVAL: no prefill starts. In RED new prefills start only in slots freed by
+    /// finished sequences (batch growth 0).
     pub start_new_prefills: bool,
     pub admission: AdmissionMode,
     pub reclaim: ReclaimAction,
@@ -102,12 +104,12 @@ pub fn plan_for(state: PressureState, cfg: &SchedulerLimits) -> ThrottlePlan {
             reclaim: ReclaimAction::FreeCachedToOrange,
             ..open
         },
+        // RED refills finished slots from the queue (user decision 2026-09-26): the running
+        // count never grows, and every refill holds its worst-case KV reservation.
         PressureState::Red => ThrottlePlan {
             batch_growth_limit: Some(0),
-            shrink_only: true,
             prefill_budget_fraction: 0.5,
             prefill_chunk_tokens: Some(floor),
-            start_new_prefills: false,
             admission: AdmissionMode::AllQueued,
             reclaim: ReclaimAction::FreeAllCachedAndOptional,
             ..open
@@ -296,10 +298,10 @@ mod tests {
             row(p(PressureState::Red)),
             (
                 Some(0),
-                true,
+                false,
                 0.5,
                 Some(64),
-                false,
+                true,
                 AllQueued,
                 ReclaimAction::FreeAllCachedAndOptional
             )

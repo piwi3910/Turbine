@@ -204,6 +204,25 @@ impl Admission {
         self.decide_inner(est, state, circuit, queue_len)
     }
 
+    /// The decision for a queued request offered a running slot the throttle plan opened (the
+    /// admission gate's pump). RED refills finished slots (user decision 2026-09-26): its
+    /// `pressure_red` queueing binds new arrivals only, and a queued request is judged by
+    /// ORANGE's rules — expensive prefills keep waiting (`pressure_orange`). Hard capacity,
+    /// the circuit, SURVIVAL and the worst-case KV reservation apply unchanged; `queue_full`
+    /// never does (the request is already queued). Records nothing.
+    pub fn evaluate_refill(
+        &self,
+        est: &ResourceEstimate,
+        state: PressureState,
+        circuit: CircuitState,
+    ) -> AdmissionDecision {
+        let state = match state {
+            PressureState::Red => PressureState::Orange,
+            other => other,
+        };
+        self.decide_inner(est, state, circuit, 0)
+    }
+
     fn kv_bytes(&self, est: &ResourceEstimate) -> u64 {
         est.projected_kv_blocks as u64 * self.params.block_bytes
     }
@@ -342,29 +361,58 @@ impl Admission {
     }
 }
 
-/// One waiting request (payload = the engine's own request object).
-pub struct Queued<T> {
+/// One waiting request (payload = the engine's own request object). `key` orders the queue
+/// (smallest first): `(priority, arrival sequence)` by default, or the scheduling policy's
+/// admission key when the scheduler's gate supplies one (Phase 2m `scheduling_policy`).
+pub struct Queued<T, K = (Priority, u64)> {
     pub id: RequestId,
     pub priority: Priority,
     pub estimate: ResourceEstimate,
     pub reason: PressureReason,
     pub enqueued_at: Duration,
     pub bypassed: u32,
-    seq: u64,
+    pub key: K,
     pub payload: T,
 }
 
-/// FIFO within priority (lower `Priority` first), bounded by `max_queue` and `queue_timeout`; a request that
-/// fits may overtake a head that does not fit at most `max_bypass` times, then the head blocks the queue.
-pub struct AdmissionQueue<T> {
-    entries: Vec<Queued<T>>,
+/// Ordered by `K` (by default FIFO within priority, lower `Priority` first), bounded by
+/// `max_queue` and `queue_timeout`; a request that fits may overtake a head that does not fit
+/// at most `max_bypass` times, then the head blocks the queue.
+pub struct AdmissionQueue<T, K = (Priority, u64)> {
+    entries: Vec<Queued<T, K>>,
     max_queue: usize,
     queue_timeout: Duration,
     max_bypass: u32,
     next_seq: u64,
 }
 
-impl<T> AdmissionQueue<T> {
+impl<T> AdmissionQueue<T, (Priority, u64)> {
+    /// Queue by `(priority, arrival)`. Err(payload) when the queue is full (the caller
+    /// answers `queue_full`).
+    pub fn push(
+        &mut self,
+        id: RequestId,
+        priority: Priority,
+        estimate: ResourceEstimate,
+        reason: PressureReason,
+        now: Duration,
+        payload: T,
+    ) -> Result<(), T> {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.push_keyed(
+            id,
+            priority,
+            (priority, seq),
+            estimate,
+            reason,
+            now,
+            payload,
+        )
+    }
+}
+
+impl<T, K: Ord + Copy> AdmissionQueue<T, K> {
     pub fn new(max_queue: u32, queue_timeout: Duration, max_bypass: u32) -> Self {
         Self {
             entries: Vec::new(),
@@ -383,28 +431,27 @@ impl<T> AdmissionQueue<T> {
     pub fn max_queue(&self) -> usize {
         self.max_queue
     }
-    pub fn iter(&self) -> impl Iterator<Item = &Queued<T>> {
+    pub fn iter(&self) -> impl Iterator<Item = &Queued<T, K>> {
         self.entries.iter()
     }
 
-    /// Err(payload) when the queue is full (the caller answers `queue_full`).
-    pub fn push(
+    /// Queue at `key` (unique per entry; equal keys keep insertion order). `enqueued_at` starts
+    /// the `queue_timeout` clock. Err(payload) when the queue is full.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_keyed(
         &mut self,
         id: RequestId,
         priority: Priority,
+        key: K,
         estimate: ResourceEstimate,
         reason: PressureReason,
-        now: Duration,
+        enqueued_at: Duration,
         payload: T,
     ) -> Result<(), T> {
         if self.entries.len() >= self.max_queue {
             return Err(payload);
         }
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        let at = self
-            .entries
-            .partition_point(|e| (e.priority, e.seq) <= (priority, seq));
+        let at = self.entries.partition_point(|e| e.key <= key);
         self.entries.insert(
             at,
             Queued {
@@ -412,9 +459,9 @@ impl<T> AdmissionQueue<T> {
                 priority,
                 estimate,
                 reason,
-                enqueued_at: now,
+                enqueued_at,
                 bypassed: 0,
-                seq,
+                key,
                 payload,
             },
         );
@@ -422,13 +469,13 @@ impl<T> AdmissionQueue<T> {
     }
 
     /// Client disconnect: removed without ever taking a reservation.
-    pub fn remove(&mut self, id: RequestId) -> Option<Queued<T>> {
+    pub fn remove(&mut self, id: RequestId) -> Option<Queued<T, K>> {
         let i = self.entries.iter().position(|e| e.id == id)?;
         Some(self.entries.remove(i))
     }
 
     /// Entries older than `queue_timeout` (the caller answers `queue_timeout`).
-    pub fn expire(&mut self, now: Duration) -> Vec<Queued<T>> {
+    pub fn expire(&mut self, now: Duration) -> Vec<Queued<T, K>> {
         let (expired, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
             .into_iter()
             .partition(|e| now.saturating_sub(e.enqueued_at) >= self.queue_timeout);
@@ -437,12 +484,12 @@ impl<T> AdmissionQueue<T> {
     }
 
     /// Everything, in order (circuit open rejects the whole queue).
-    pub fn drain_all(&mut self) -> Vec<Queued<T>> {
+    pub fn drain_all(&mut self) -> Vec<Queued<T, K>> {
         std::mem::take(&mut self.entries)
     }
 
     /// Admits in queue order; `try_admit` returns true when the entry was admitted (it takes the reservation).
-    pub fn pump(&mut self, mut try_admit: impl FnMut(&Queued<T>) -> bool) -> Vec<Queued<T>> {
+    pub fn pump(&mut self, mut try_admit: impl FnMut(&Queued<T, K>) -> bool) -> Vec<Queued<T, K>> {
         let mut admitted = Vec::new();
         while let Some(head) = self.entries.first() {
             if try_admit(head) {
@@ -521,6 +568,79 @@ mod tests {
             ),
             ledger,
         )
+    }
+
+    /// RED refills finished slots (user decision 2026-09-26): a queued request offered a slot
+    /// the throttle plan opened is not held back by `pressure_red`, but keeps ORANGE's
+    /// expensive-prefill rule, the KV reservation and SURVIVAL's rejection.
+    #[test]
+    fn red_refill_from_queue() {
+        use AdmissionDecision::*;
+        use PressureState::*;
+        let (mut a, ledger) = setup(1024, true);
+        let h = CircuitState::Healthy;
+        let cheap = a.estimate(100, 0, Some(100), &LAYOUT, MAX_SEQ);
+        let expensive = a.estimate(4000, 0, Some(100), &LAYOUT, MAX_SEQ);
+        let red = Queue {
+            reason: PressureReason::PressureRed,
+        };
+        let orange = Queue {
+            reason: PressureReason::PressureOrange,
+        };
+        // New arrivals still queue in RED; a queued one refills a finished slot.
+        assert_eq!(a.decide(&cheap, Red, h, 0), red);
+        assert_eq!(a.evaluate(&cheap, Red, h, 0), red);
+        assert_eq!(a.evaluate_refill(&cheap, Red, h), Admit);
+        // Expensive prefills wait in RED as in ORANGE; cheap ones refill in ORANGE too.
+        assert_eq!(a.evaluate_refill(&expensive, Red, h), orange);
+        assert_eq!(a.evaluate_refill(&expensive, Orange, h), orange);
+        assert_eq!(a.evaluate_refill(&cheap, Orange, h), Admit);
+        assert_eq!(a.evaluate_refill(&expensive, Green, h), Admit);
+        // SURVIVAL never drains the queue; an open circuit rejects.
+        assert_eq!(
+            a.evaluate_refill(&cheap, Survival, h),
+            Reject {
+                reason: RejectionReason::Survival
+            }
+        );
+        assert_eq!(
+            a.evaluate_refill(&cheap, Red, CircuitState::CircuitOpen),
+            Reject {
+                reason: RejectionReason::CircuitOpen
+            }
+        );
+        // The worst-case KV reservation still bounds a refill.
+        let held = ledger
+            .reserve(DeviceId(0), PoolKind::Kv, 1020 * BLOCK_BYTES)
+            .unwrap();
+        assert_eq!(
+            a.evaluate_refill(&cheap, Red, h),
+            Queue {
+                reason: PressureReason::KvReservation
+            }
+        );
+        drop(held);
+        // A refill is not a queue insertion: `queue_full` never applies.
+        let before = a
+            .metrics()
+            .admission_decisions
+            .get_or_create(&DecisionLabels {
+                decision: "admit",
+                reason: "none",
+            })
+            .get();
+        assert_eq!(a.evaluate_refill(&cheap, Red, h), Admit);
+        assert_eq!(
+            a.metrics()
+                .admission_decisions
+                .get_or_create(&DecisionLabels {
+                    decision: "admit",
+                    reason: "none",
+                })
+                .get(),
+            before,
+            "evaluate_refill records nothing"
+        );
     }
 
     #[test]

@@ -2321,6 +2321,7 @@ dependencies = [
  "tracing",
  "turbine-core",
  "turbine-observability",
+ "turbine-reliability",
  "turbine-tensor",
 ]
 
@@ -2396,6 +2397,7 @@ dependencies = [
  "turbine-core",
  "turbine-kv",
  "turbine-observability",
+ "turbine-reliability",
  "turbine-tensor",
  "uuid",
 ]

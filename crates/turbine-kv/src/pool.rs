@@ -5,7 +5,9 @@
 use std::sync::Arc;
 
 use smallvec::SmallVec;
-use turbine_core::types::{BlockId, KvLayout};
+use turbine_core::types::{BlockId, DeviceId, KvLayout};
+use turbine_reliability::budget::PoolKind;
+use turbine_reliability::ledger::{Ledger, Reservation};
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, MemoryError};
 
 use crate::table::BlockTable;
@@ -39,6 +41,12 @@ pub enum PoolError {
         "KV block pool of {num_blocks} blocks × {block_bytes} bytes does not fit the address space"
     )]
     TooLarge { num_blocks: u32, block_bytes: u64 },
+    /// The allocation alone is larger than the whole KV reservation it is paid from: the
+    /// request's worst-case estimate was wrong (P3 S-3).
+    #[error(
+        "KV reservation short: {needed} bytes needed, {uncommitted} of the reservation uncommitted"
+    )]
+    ReservationShort { needed: u64, uncommitted: u64 },
 }
 
 /// L0 block accounting over one device allocation of `num_blocks × block_bytes`.
@@ -50,6 +58,8 @@ pub struct BlockPool {
     free: Vec<BlockId>,
     /// Reference count per block; 0 exactly when the block is on the free list.
     refcounts: Vec<u32>,
+    /// The reservation ledger whose `kv` pool pays for the blocks (P3), and its device.
+    ledger: Option<(Arc<Ledger>, DeviceId)>,
 }
 
 impl std::fmt::Debug for BlockPool {
@@ -80,7 +90,53 @@ impl BlockPool {
             storage,
             free: (0..cfg.num_blocks).rev().map(BlockId).collect(),
             refcounts: vec![0; cfg.num_blocks as usize],
+            ledger: None,
         })
+    }
+
+    /// Link the pool to `ledger`'s `kv` pool on `device` (P3 S-3): blocks are then paid from
+    /// per-request reservations through `allocate_reserved`. Panics when the pool's bytes
+    /// exceed the ledger's `kv` capacity — the budget must cover every block.
+    pub fn with_ledger(mut self, ledger: Arc<Ledger>, device: DeviceId) -> BlockPool {
+        let bytes = u64::from(self.total_blocks()) * self.layout.block_bytes();
+        let capacity = ledger.usage(device, PoolKind::Kv).capacity;
+        assert!(
+            bytes <= capacity,
+            "KV block pool of {bytes} bytes exceeds the ledger's kv pool of {capacity} bytes"
+        );
+        self.ledger = Some((ledger, device));
+        self
+    }
+
+    /// The ledger and device the pool is linked to.
+    pub fn ledger(&self) -> Option<&(Arc<Ledger>, DeviceId)> {
+        self.ledger.as_ref()
+    }
+
+    /// `allocate`, paid from `reservation`: commits `n × block_bytes` of it, saturating at its
+    /// total, so blocks re-allocated after a recompute are not paid twice. Releasing blocks
+    /// never touches the ledger — dropping the request's reservation does. `ReservationShort`
+    /// when the allocation alone exceeds the whole reservation (nothing is allocated).
+    pub fn allocate_reserved(
+        &mut self,
+        n: u32,
+        reservation: &mut Reservation,
+    ) -> Result<SmallVec<[BlockId; 8]>, PoolError> {
+        debug_assert_eq!(
+            reservation.pool(),
+            PoolKind::Kv,
+            "KV blocks paid from a non-kv pool"
+        );
+        let needed = u64::from(n) * self.layout.block_bytes();
+        if needed > reservation.bytes() {
+            return Err(PoolError::ReservationShort {
+                needed,
+                uncommitted: reservation.bytes() - reservation.committed(),
+            });
+        }
+        let blocks = self.allocate(n)?;
+        reservation.commit_bytes(needed);
+        Ok(blocks)
     }
 
     pub fn layout(&self) -> KvLayout {

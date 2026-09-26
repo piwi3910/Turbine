@@ -10,6 +10,8 @@ license.workspace = true
 turbine-core.workspace = true
 turbine-observability.workspace = true
 turbine-tensor.workspace = true
+# P3: every KV block is paid from a reservation-ledger `kv` pool reservation.
+turbine-reliability.workspace = true
 serde.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true

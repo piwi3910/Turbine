@@ -30,7 +30,7 @@ use turbine_device::DeviceInventory;
 use turbine_kernels::Selection;
 use turbine_kv::blocks_for_tokens;
 use turbine_model::{ChatTemplate, Tokenizer, ToolChoice};
-use turbine_scheduler::{SchedulerMetrics, SubmitError};
+use turbine_scheduler::{RejectionReason, SchedulerMetrics, SubmitError};
 
 use crate::engine::grammar::GrammarService;
 use crate::engine::{
@@ -538,6 +538,24 @@ impl ModelBackend {
                  must fit scheduler.max_batch_tokens ({})",
                 self.max_batch_tokens
             )),
+            // P3 admission gate (wired into the engine by phase-3 Task 14): the reject table.
+            SubmitError::Rejected {
+                reason,
+                retry_after_secs,
+            } => {
+                let code = match reason {
+                    RejectionReason::ContextExceedsKvCapacity => {
+                        ErrorCode::ContextExceedsKvCapacity
+                    }
+                    RejectionReason::QueueFull => ErrorCode::QueueFull,
+                    RejectionReason::QueueTimeout => ErrorCode::QueueTimeout,
+                    RejectionReason::Survival => ErrorCode::Overloaded,
+                    RejectionReason::CircuitOpen => ErrorCode::CircuitOpen,
+                    _ => ErrorCode::InternalError,
+                };
+                ApiError::overload(code, (retry_after_secs > 0).then_some(retry_after_secs))
+            }
+            _ => ApiError::internal(format!("submission refused: {e}")),
         }
     }
 

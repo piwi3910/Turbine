@@ -1001,13 +1001,15 @@ Exhaustion horizon (P3 S-8): `ExhaustionHorizon::predict(running: &[(remaining_t
 
 ### 8.4 Throttle plan per state (P3, verbatim summary)
 
-| State    | batch_growth_limit | prefill_budget_fraction | prefill_chunk_tokens  | admission                              | reclaim                                                                                       |
-| -------- | ------------------ | ----------------------- | --------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------- |
-| GREEN    | unlimited          | 1.0                     | configured            | open                                   | none                                                                                          |
-| YELLOW   | +1/iteration       | 1.0                     | configured            | open                                   | `KvReclaimer::demote` idle → YELLOW threshold                                                 |
-| ORANGE   | 0 (frozen)         | 0.5                     | halved, floor 4×block | expensive_queued (`pressure_orange`)   | free unreferenced cached to ORANGE; demote aggressively (P4)                                  |
-| RED      | shrink only        | no new prefill starts   | floor                 | all_queued (`pressure_red`)            | free all unreferenced cached + optional buffers                                               |
-| SURVIVAL | shrink only        | 0                       | —                     | stopped (`503 overloaded`), queue kept | release emergency reserve; preempt most recently admitted only if next decode cannot allocate |
+| State    | batch_growth_limit                                | prefill_budget_fraction                  | prefill_chunk_tokens  | admission                                                   | reclaim                                                                                       |
+| -------- | ------------------------------------------------- | ---------------------------------------- | --------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| GREEN    | unlimited                                         | 1.0                                      | configured            | open                                                        | none                                                                                          |
+| YELLOW   | +1/iteration                                      | 1.0                                      | configured            | open                                                        | `KvReclaimer::demote` idle → YELLOW threshold                                                 |
+| ORANGE   | 0 (frozen)                                        | 0.5                                      | halved, floor 4×block | expensive_queued (`pressure_orange`)                        | free unreferenced cached to ORANGE; demote aggressively (P4)                                  |
+| RED      | 0 (frozen; queued requests refill finished slots) | 0.5; new prefills only in refilled slots | floor                 | all_queued (`pressure_red`); refills judged by ORANGE rules | free all unreferenced cached + optional buffers                                               |
+| SURVIVAL | shrink only                                       | 0                                        | —                     | stopped (`503 overloaded`), queue kept                      | release emergency reserve; preempt most recently admitted only if next decode cannot allocate |
+
+Batch growth counts admitted requests (running + waiting with a worst-case KV reservation). RED refilling finished slots: DEC 2026-09-26 (`Admission::evaluate_refill`, `Scheduler::admitted_count`).
 
 ### 8.5 Pressure document (`GET /turbine/v1/pressure`)
 
