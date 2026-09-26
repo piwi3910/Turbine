@@ -1,6 +1,6 @@
 //! Model layer (Phase 1): the Hugging Face config and its architecture allowlist, safetensors
 //! loading, tokenizer and chat template, the Llama executor, sampling and the single-request
-//! generation loop.
+//! generation loop; Phase 2 adds sampler penalties and constrained decoding (`structured`).
 use std::path::PathBuf;
 
 use turbine_kernels::KernelError;
@@ -15,21 +15,32 @@ pub mod loader;
 pub mod metrics;
 pub mod safetensors;
 pub mod sampler;
+pub mod structured;
 pub mod testing;
 pub mod tokenizer;
+pub mod tools;
 
 pub use crate::safetensors::{SafetensorsIndex, TensorEntry};
 pub use budget::{BudgetTerms, available_bytes, check_budget, host_mem_available};
 pub use chat_template::ChatTemplate;
+pub use config::MoeConfig;
 pub use config::{
     Architecture, GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config,
     load_model_config,
 };
 pub use generate::{GenerateOptions, Generation, generate};
 pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot, llama_slots};
-pub use metrics::{ForwardPhase, ModelMetrics};
-pub use sampler::{SampledToken, Sampler};
+pub use loader::{StackPlace, gate_up_proj_name, olmoe_slots, qkv_proj_name, stacked_experts_name};
+pub use metrics::{ForwardPhase, ModelMetrics, ToolCallOutcome};
+pub use sampler::{SampleJob, SampledToken, Sampler, SamplerState, sample_rows};
+pub use structured::{
+    GrammarCompiler, GrammarLimits, JSON_MAX_WHITESPACE, TokenMask, TokenMatcher, constraint_kind,
+    json_options, step_mask,
+};
 pub use tokenizer::{IncrementalDetokenizer, Tokenizer};
+pub use tools::{
+    Llama3JsonParser, ToolCallParser, ToolChoice, ToolParse, new_call_id, tool_call_grammar,
+};
 
 /// Every failure of the model layer (contract §10). Messages name the offending file, field or
 /// tensor so a startup failure is actionable from the log line alone.
@@ -59,6 +70,10 @@ pub enum ModelError {
     Budget(String),
     #[error("template: {0}")]
     Template(String),
+    /// Constrained decoding (P2 S-17/S-18): a grammar that does not compile or exceeds its
+    /// bounds (naming the keyword or bound), or a matcher failing mid-generation.
+    #[error("constraint: {0}")]
+    Constraint(String),
     #[error(transparent)]
     Kernel(#[from] KernelError),
 }

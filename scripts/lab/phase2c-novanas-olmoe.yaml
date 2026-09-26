@@ -1,0 +1,31 @@
+# turbine-server configuration for the Phase 2c performance runs on novanas:
+#   scripts/lab-perf.sh novanas olmoe
+#   scripts/lab-serve.sh novanas scripts/lab/phase2c-novanas-olmoe.yaml [--set <k>=<v>]...
+# Weights: /home/piwi/turbine-models/olmoe-1b-7b-0125-instruct on the host, mounted read-only at
+# /models by scripts/lab/novanas-serve-job.yaml. The Phase 2 lab values plus the five Phase 2c
+# execution switches spelled out, so every lab-perf summary records what it ran with. The
+# scheduler pair is tuned by the Phase 2c sweep (spec S-12).
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/olmoe-1b-7b-0125-instruct
+  served_name: allenai/OLMoE-1B-7B-0125-Instruct
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 8GiB
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 8192
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+  queue_timeout: 60s

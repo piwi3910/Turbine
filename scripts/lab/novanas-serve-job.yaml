@@ -1,7 +1,8 @@
 # k3s Job template run by scripts/lab-serve.sh novanas <config.yaml>: turbine-server on one R9700
 # for manual golden and benchmark runs, listening on the host network (server.listen of the
 # config, 0.0.0.0:18000 in scripts/lab/phase1-novanas.yaml). The script renders the RUN_ID
-# placeholder (a unique Job name) and uploads the tree to /home/piwi/turbine-ci/runs/<run id>/src and the config
+# placeholder (a unique Job name) and the SERVER_ARGS placeholder (its `--set <k>=<v>` pairs,
+# empty without any) and uploads the tree to /home/piwi/turbine-ci/runs/<run id>/src and the config
 # to runs/<run id>/config.yaml before applying it. Caches and slot handling match
 # novanas-test-job.yaml, with the single release workspace slot cache/slots/serve-0 (one server
 # at a time: the port is fixed), so the release build never shares a target dir with the debug
@@ -46,10 +47,14 @@ spec:
               # Keep downloaded packages in the shared apt cache; refresh the lists at most every 6 h.
               rm -f /etc/apt/apt.conf.d/docker-clean
               mkdir -p /var/cache/apt/archives/partial /var/lib/apt/lists/partial
-              if [[ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' -mmin -360 -print -quit)" ]]; then
-                apt-get update -qq >/dev/null
-              fi
-              apt-get install -y -qq cmake ninja-build python3 rsync >/dev/null
+              # Concurrent Jobs share the apt cache: one apt run at a time.
+              (
+                flock -w 900 9
+                if [[ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' -mmin -360 -print -quit)" ]]; then
+                  apt-get update -qq >/dev/null
+                fi
+                apt-get install -y -qq cmake ninja-build python3 rsync >/dev/null
+              ) 9>/var/cache/apt/archives/turbine-lab.flock
               cmake --version | head -n 1
 
               step "take the serve workspace slot"
@@ -64,7 +69,7 @@ spec:
               echo "lab-step: slot $SLOT (CARGO_TARGET_DIR=$CARGO_TARGET_DIR)"
 
               step "sync the uploaded tree into the slot"
-              rsync -a --delete "$RUN_DIR/src/" "$SLOT_DIR/src/"
+              rsync -rlpc --delete "$RUN_DIR/src/" "$SLOT_DIR/src/"
               cp "$RUN_DIR/config.yaml" "$SLOT_DIR/config.yaml"
               rm -rf "$RUN_DIR"
               cd "$SLOT_DIR/src"
@@ -92,8 +97,9 @@ spec:
               cargo build --release -p turbine-server
 
               step "turbine-server"
-              # exec keeps the slot lock (LOCK_FD is inherited) while the server runs.
-              exec "$CARGO_TARGET_DIR/release/turbine-server" --config "$SLOT_DIR/config.yaml"
+              # exec keeps the slot lock (LOCK_FD is inherited) while the server runs. The script
+              # renders the --set pairs of `lab-serve.sh ... --set <k>=<v>` after the config.
+              exec "$CARGO_TARGET_DIR/release/turbine-server" --config "$SLOT_DIR/config.yaml"__SERVER_ARGS__
           env:
             - name: TURBINE_LAB_RUN_ID
               value: "__RUN_ID__"

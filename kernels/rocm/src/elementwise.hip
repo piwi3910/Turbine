@@ -1,5 +1,5 @@
 // Turbine HIP kernels: embedding gather, half-split RoPE, SiLU-and-multiply,
-// residual add and the RMSNorm fallback. No ROCm library ships these as
+// residual add and the RMSNorm and add+RMSNorm fallbacks. No ROCm library ships these as
 // standalone kernels (spec S-7). Numerics follow the cpu-reference provider:
 // f32 compute, rounding to the activation dtype at the points where the
 // Hugging Face BF16 forward materialises a tensor in that dtype.
@@ -144,6 +144,15 @@ bool add_supported(const turbine_add_desc *d) {
 
 // ---- silu_mul ----
 
+// Grid: (rows, column chunks of kSiluCols): a decode batch of a few rows
+// still spreads over the whole device.
+constexpr int64_t kSiluCols = 4 * kBlock;
+
+unsigned silu_chunks(int64_t cols) {
+  const int64_t chunks = (cols + kSiluCols - 1) / kSiluCols;
+  return static_cast<unsigned>(chunks < 65535 ? chunks : 65535);
+}
+
 template <typename T>
 __global__ void silu_mul_kernel(const T *gate, const T *up, T *out,
                                 int64_t cols, int64_t gate_stride,
@@ -152,7 +161,9 @@ __global__ void silu_mul_kernel(const T *gate, const T *up, T *out,
   const T *g_row = gate + r * gate_stride;
   const T *u_row = up + r * up_stride;
   T *o_row = out + r * out_stride;
-  for (int64_t j = threadIdx.x; j < cols; j += blockDim.x) {
+  const int64_t step = static_cast<int64_t>(gridDim.y) * blockDim.x;
+  for (int64_t j = static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+       j < cols; j += step) {
     const float g = to_f32<T>(g_row[j]);
     const float silu = g / (1.0f + expf(-g));
     o_row[j] = from_f32<T>(round_to<T>(silu) * to_f32<T>(u_row[j]));
@@ -161,11 +172,12 @@ __global__ void silu_mul_kernel(const T *gate, const T *up, T *out,
 
 template <typename T> struct SiluMulLaunch {
   static void run(hipStream_t s, const turbine_silu_mul_desc *d) {
-    hipLaunchKernelGGL(silu_mul_kernel<T>, dim3(static_cast<unsigned>(d->rows)),
-                       dim3(kBlock), 0, s, static_cast<const T *>(d->gate),
-                       static_cast<const T *>(d->up), static_cast<T *>(d->out),
-                       d->cols, d->gate_stride_row, d->up_stride_row,
-                       d->out_stride_row);
+    hipLaunchKernelGGL(
+        silu_mul_kernel<T>,
+        dim3(static_cast<unsigned>(d->rows), silu_chunks(d->cols)),
+        dim3(kBlock), 0, s, static_cast<const T *>(d->gate),
+        static_cast<const T *>(d->up), static_cast<T *>(d->out), d->cols,
+        d->gate_stride_row, d->up_stride_row, d->out_stride_row);
   }
 };
 
@@ -178,30 +190,68 @@ bool silu_mul_supported(const turbine_silu_mul_desc *d) {
 
 // ---- rope (half-split, HF rotate_half) ----
 
+// Rotary pairs whose cos/sin a block stages in LDS (half of rotary_dim); a
+// wider rotation evaluates them per element.
+constexpr int32_t kRopeMaxHalf = 512;
+
+// cos/sin of the f32 angle evaluated in f64 and rounded to f32: the correctly
+// rounded f32 value a host libm returns, which the device's f32 cosf/sinf (a
+// few ulp) can miss by one BF16 rounding step. Then rounded to T.
+template <typename T> __device__ inline float rope_cos(float f) {
+  return round_to<T>(static_cast<float>(cos(static_cast<double>(f))));
+}
+template <typename T> __device__ inline float rope_sin(float f) {
+  return round_to<T>(static_cast<float>(sin(static_cast<double>(f))));
+}
+
+// Heads (q heads, then k heads) one block rotates: enough pairs to fill it.
+int32_t rope_heads_per_block(int32_t half) {
+  const int32_t h = kBlock / half;
+  return h > 0 ? h : 1;
+}
+
+// Grid: (tokens, groups of heads_per_block heads). Each block evaluates the
+// token's cos/sin once per rotary pair (in LDS) for all of its heads.
 template <typename T>
-__global__ void
-rope_kernel(T *q, T *k, const int32_t *positions, const float *inv_freq,
-            int32_t num_q_heads, int32_t num_kv_heads, int32_t head_dim,
-            int32_t rotary_dim, int64_t q_stride, int64_t k_stride) {
+__global__ void rope_kernel(T *q, T *k, const int32_t *positions,
+                            const float *inv_freq, int32_t num_q_heads,
+                            int32_t num_kv_heads, int32_t head_dim,
+                            int32_t rotary_dim, int64_t q_stride,
+                            int64_t k_stride, int32_t heads_per_block) {
+  __shared__ float cos_s[kRopeMaxHalf];
+  __shared__ float sin_s[kRopeMaxHalf];
   const int64_t t = blockIdx.x;
   const int32_t half = rotary_dim / 2;
   const int32_t heads = num_q_heads + num_kv_heads;
+  const int32_t h0 = static_cast<int32_t>(blockIdx.y) * heads_per_block;
+  const int32_t h1 = min(heads, h0 + heads_per_block);
   const float pos = static_cast<float>(positions[t]);
-  for (int32_t w = threadIdx.x; w < heads * half; w += blockDim.x) {
-    const int32_t h = w / half;
+  const bool staged = half <= kRopeMaxHalf;
+  if (staged) {
+    for (int32_t i = threadIdx.x; i < half; i += blockDim.x) {
+      const float f = pos * inv_freq[i];
+      cos_s[i] = rope_cos<T>(f);
+      sin_s[i] = rope_sin<T>(f);
+    }
+    __syncthreads();
+  }
+  for (int32_t w = threadIdx.x; w < (h1 - h0) * half; w += blockDim.x) {
+    const int32_t h = h0 + w / half;
     const int32_t i = w % half;
     T *x = h < num_q_heads
                ? q + t * q_stride + static_cast<int64_t>(h) * head_dim
                : k + t * k_stride +
                      static_cast<int64_t>(h - num_q_heads) * head_dim;
-    const float f = pos * inv_freq[i];
-    // cos/sin of the f32 angle evaluated in f64 and rounded to f32: the
-    // correctly rounded f32 value a host libm returns, which the device's f32
-    // cosf/sinf (a few ulp) can miss by one BF16 rounding step.
-    const float c =
-        round_to<T>(static_cast<float>(cos(static_cast<double>(f))));
-    const float s =
-        round_to<T>(static_cast<float>(sin(static_cast<double>(f))));
+    float c;
+    float s;
+    if (staged) {
+      c = cos_s[i];
+      s = sin_s[i];
+    } else {
+      const float f = pos * inv_freq[i];
+      c = rope_cos<T>(f);
+      s = rope_sin<T>(f);
+    }
     const float x1 = to_f32<T>(x[i]);
     const float x2 = to_f32<T>(x[i + half]);
     x[i] = from_f32<T>(round_to<T>(x1 * c) + round_to<T>(-x2 * s));
@@ -211,11 +261,16 @@ rope_kernel(T *q, T *k, const int32_t *positions, const float *inv_freq,
 
 template <typename T> struct RopeLaunch {
   static void run(hipStream_t s, const turbine_rope_desc *d) {
+    const int32_t per_block = rope_heads_per_block(d->rotary_dim / 2);
+    const int32_t heads = d->num_q_heads + d->num_kv_heads;
+    const int32_t groups = (heads + per_block - 1) / per_block;
     hipLaunchKernelGGL(
-        rope_kernel<T>, dim3(static_cast<unsigned>(d->num_tokens)),
+        rope_kernel<T>,
+        dim3(static_cast<unsigned>(d->num_tokens),
+             static_cast<unsigned>(groups)),
         dim3(kBlock), 0, s, static_cast<T *>(d->q), static_cast<T *>(d->k),
         d->positions, d->inv_freq, d->num_q_heads, d->num_kv_heads, d->head_dim,
-        d->rotary_dim, d->q_stride_token, d->k_stride_token);
+        d->rotary_dim, d->q_stride_token, d->k_stride_token, per_block);
   }
 };
 
@@ -225,6 +280,8 @@ bool rope_supported(const turbine_rope_desc *d) {
          d->num_q_heads >= 1 && d->num_kv_heads >= 0 && d->head_dim >= 2 &&
          d->rotary_dim >= 2 && d->rotary_dim % 2 == 0 &&
          d->rotary_dim <= d->head_dim &&
+         // grid.y: one block per group of heads (at most one head per block).
+         static_cast<int64_t>(d->num_q_heads) + d->num_kv_heads <= 65535 &&
          d->q_stride_token >=
              static_cast<int64_t>(d->num_q_heads) * d->head_dim &&
          d->k_stride_token >=
@@ -271,6 +328,54 @@ template <typename T> struct RmsnormLaunch {
   }
 };
 
+// ---- add_rmsnorm fallback (ABI v2.1) ----
+
+// residual = round(residual + x) in place, then out = rmsnorm(residual): the
+// rmsnorm_kernel above on the rounded sum, each thread re-reading only the
+// elements it stored itself.
+template <typename T>
+__global__ void add_rmsnorm_kernel(T *residual, const T *x, const T *weight,
+                                   T *out, int64_t dim, int64_t residual_stride,
+                                   int64_t x_stride, int64_t out_stride,
+                                   float eps) {
+  __shared__ float partial[kBlock];
+  const int64_t r = blockIdx.x;
+  T *r_row = residual + r * residual_stride;
+  const T *x_row = x + r * x_stride;
+  T *o_row = out + r * out_stride;
+  float sum = 0.0f;
+  for (int64_t j = threadIdx.x; j < dim; j += blockDim.x) {
+    const float v = round_to<T>(to_f32<T>(r_row[j]) + to_f32<T>(x_row[j]));
+    r_row[j] = from_f32<T>(v);
+    sum += v * v;
+  }
+  partial[threadIdx.x] = sum;
+  __syncthreads();
+  for (int offset = kBlock / 2; offset > 0; offset /= 2) {
+    if (static_cast<int>(threadIdx.x) < offset) {
+      partial[threadIdx.x] += partial[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(dim) + eps);
+  for (int64_t j = threadIdx.x; j < dim; j += blockDim.x) {
+    const float normed = round_to<T>(to_f32<T>(r_row[j]) * inv);
+    o_row[j] = from_f32<T>(normed * to_f32<T>(weight[j]));
+  }
+}
+
+template <typename T> struct AddRmsnormLaunch {
+  static void run(hipStream_t s, const turbine_add_rmsnorm_desc *d) {
+    hipLaunchKernelGGL(add_rmsnorm_kernel<T>,
+                       dim3(static_cast<unsigned>(d->rows)), dim3(kBlock), 0, s,
+                       static_cast<T *>(d->residual),
+                       static_cast<const T *>(d->x),
+                       static_cast<const T *>(d->weight),
+                       static_cast<T *>(d->out), d->dim, d->residual_stride_row,
+                       d->x_stride_row, d->out_stride_row, d->eps);
+  }
+};
+
 std::string unsupported(const char *op, int32_t dtype) {
   return std::string(op) +
          ": unsupported configuration (dtype=" + std::to_string(dtype) + ")";
@@ -289,6 +394,19 @@ bool rmsnorm_fallback_supported(const turbine_rmsnorm_desc *d) {
 int32_t launch_rmsnorm(turbine_ctx *ctx, const turbine_rmsnorm_desc *d) {
   dispatch<RmsnormLaunch>(d->dtype, ctx->stream, d);
   return check_hip(ctx, hipGetLastError(), "rmsnorm kernel launch");
+}
+
+bool add_rmsnorm_fallback_supported(const turbine_add_rmsnorm_desc *d) {
+  return d != nullptr && float_dtype(d->dtype) && d->rows >= 1 &&
+         d->rows <= INT32_MAX && d->dim >= 1 &&
+         d->residual_stride_row >= d->dim && d->x_stride_row >= d->dim &&
+         d->out_stride_row >= d->dim;
+}
+
+int32_t launch_add_rmsnorm(turbine_ctx *ctx,
+                           const turbine_add_rmsnorm_desc *d) {
+  dispatch<AddRmsnormLaunch>(d->dtype, ctx->stream, d);
+  return check_hip(ctx, hipGetLastError(), "add_rmsnorm kernel launch");
 }
 
 } // namespace turbine_hip

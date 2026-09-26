@@ -1,31 +1,66 @@
 //! Startup order (P1 §Interfaces, contract §16.3): config (exit 2) → tracing → device discovery →
-//! kernel provider → model config, tokenizer, template → kernel registry → memory budget (each
-//! exit 1, nothing bound yet) → bind (`/health` 200, `/ready` 503 `loading_model`; exit 1) →
-//! weight load and one-token warm-up on the generation thread → `/ready` 200 → serve until
-//! SIGINT/SIGTERM (exit 0).
+//! kernel provider → model config, tokenizer, template → kernel registry → memory budget with
+//! the KV pool and the batch workspace (each exit 1, nothing bound yet) → bind (`/health` 200,
+//! `/ready` 503 `loading_model`; exit 1) → weight load, KV pool allocation and one-token warm-up
+//! on the engine thread → `/ready` 200 → serve until SIGINT/SIGTERM (exit 0).
+//!
+//! Shutdown (P2 S-13): on SIGINT/SIGTERM `/ready` and new requests answer 503 `shutting_down`
+//! while the listener stays open; running requests continue until none is left or
+//! `server.shutdown_grace` has passed; then `EngineCommand::Shutdown` cancels the rest with
+//! reason `shutdown` (their streams end with `shutting_down`), the engine delivers what it holds
+//! and stops, the listener closes, open connections finish (bounded by [`CLOSE_LIMIT`]) and the
+//! process exits 0.
 //!
 //! A load or warm-up failure after binding keeps `/ready` at 503 `model_load_failed` for
-//! [`FAILURE_GRACE`] and exits 1; so do three consecutive failed requests (`device_error`, C-25).
+//! [`FAILURE_GRACE`] and exits 1; so do three consecutive failed iterations or an engine panic
+//! (`device_error`, C-25).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc::UnboundedSender;
+use axum::serve::ListenerExt;
 use turbine_api::{ApiLimits, ApiState};
 use turbine_core::config::{self, Config};
 use turbine_device::{DeviceInventory, DeviceMetrics, DiscoveryOptions};
+use turbine_kv::KvMetrics;
 use turbine_model::ModelMetrics;
 use turbine_observability::MetricsRegistry;
+use turbine_scheduler::SchedulerMetrics;
 
+use crate::backend::ModelBackend;
 use crate::cli::Cli;
+use crate::engine::{self, EngineMetrics, Fatal, Timeouts};
 use crate::exit::ExitCode;
-use crate::generation::{Engine, Fatal, Job, ModelBackend};
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
 
 /// How long `/ready` reports the failure before the process exits 1 (P1: at most 1 s).
 const FAILURE_GRACE: Duration = Duration::from_millis(500);
+/// How often the shutdown sequence looks at the engine.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
+/// After the grace: how long the engine may take to deliver the cancellations and stop, and
+/// then how long open connections may take to finish, before the process exits 0 regardless.
+const CLOSE_LIMIT: Duration = Duration::from_millis(500);
+/// Test-only, not a configuration key: a positive byte count caps every accepted connection's
+/// kernel send buffer (`SO_SNDBUF`; Linux doubles it and turns its autotuning off). The request
+/// output channel (P2 S-7) pauses a request once the client stops reading and everything
+/// between the two is full; with the kernel default that is megabytes on Linux loopback, so the
+/// black-box tests set this to make the pause come after a few KiB on every OS.
+const SEND_BUFFER_ENV: &str = "TURBINE_TEST_SOCKET_SEND_BUFFER";
+
+/// Parses [`SEND_BUFFER_ENV`]: unset → `None` (kernel default), else a positive byte count.
+fn send_buffer_cap(value: Option<&str>) -> Result<Option<usize>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.parse::<usize>() {
+        Ok(bytes) if bytes > 0 => Ok(Some(bytes)),
+        _ => Err(format!(
+            "{SEND_BUFFER_ENV} must be a positive byte count, got {value:?}"
+        )),
+    }
+}
 
 pub fn run(cli: Cli) -> ExitCode {
     let config = match config::load(&cli.config, &cli.set) {
@@ -89,9 +124,13 @@ async fn serve(
     prepared: PreparedModel,
 ) -> ExitCode {
     let addr: SocketAddr = config.server.listen;
-    let server_metrics = ServerMetrics::register(&metrics);
-    let model_metrics = ModelMetrics::register(&metrics);
-    let backend = Arc::new(ModelBackend::new(&prepared, &inventory, server_metrics));
+    let engine_metrics = EngineMetrics {
+        server: ServerMetrics::register(&metrics),
+        model: ModelMetrics::register(&metrics),
+        scheduler: SchedulerMetrics::register(&metrics),
+        kv: KvMetrics::register(&metrics),
+    };
+    let backend = Arc::new(ModelBackend::new(&prepared, &inventory, &engine_metrics));
     let state = ApiState {
         inference: backend.clone(),
         diagnostics: backend.clone(),
@@ -101,6 +140,13 @@ async fn serve(
             max_request_bytes: usize::try_from(config.server.max_request_bytes.0)
                 .unwrap_or(usize::MAX),
         },
+    };
+    let send_buffer = match send_buffer_cap(std::env::var(SEND_BUFFER_ENV).ok().as_deref()) {
+        Ok(cap) => cap,
+        Err(e) => {
+            eprintln!("turbine-server: {e}");
+            return ExitCode::Startup;
+        }
     };
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -113,22 +159,45 @@ async fn serve(
     tracing::info!(%addr, devices = inventory.devices.len(), "listening; loading the model");
 
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
-    if let Err(e) = spawn_engine(
+    let queue_capacity = config.scheduler.max_queued_requests as usize;
+    if let Err(e) = engine::spawn(
         prepared,
         Arc::clone(&backend),
-        model_metrics,
+        engine_metrics,
+        queue_capacity,
+        Timeouts::from_config(&config.server),
         fatal_tx.clone(),
     ) {
         let _ = fatal_tx.send(Fatal::LoadFailed(format!(
-            "cannot start the generation thread: {e}"
+            "cannot start the engine thread: {e}"
         )));
     }
 
-    let server =
-        axum::serve(listener, turbine_api::router(state)).with_graceful_shutdown(shutdown_signal());
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+    let shutdown = drain_on_signal(
+        Arc::clone(&backend),
+        config.server.shutdown_grace.0,
+        drained_tx,
+    );
+    let listener = listener.tap_io(move |conn: &mut tokio::net::TcpStream| {
+        if let Some(bytes) = send_buffer
+            && let Err(e) = socket2::SockRef::from(&*conn).set_send_buffer_size(bytes)
+        {
+            tracing::warn!(error = %e, bytes, "cannot cap the connection's send buffer");
+        }
+    });
+    let server = axum::serve(listener, turbine_api::router(state)).with_graceful_shutdown(shutdown);
+    let connections_closed = async {
+        match drained_rx.await {
+            Ok(()) => tokio::time::sleep(CLOSE_LIMIT).await,
+            Err(_) => std::future::pending().await,
+        }
+    };
     tokio::select! {
         served = async { server.await } => match served {
             Ok(()) => {
+                // Every connection has closed; the engine cancels anything left and stops.
+                backend.stop_engine();
                 tracing::info!("shutdown complete");
                 ExitCode::Clean
             }
@@ -138,6 +207,10 @@ async fn serve(
                 ExitCode::Startup
             }
         },
+        () = connections_closed => {
+            tracing::warn!(event = "shutdown_connections_open", "connections still open after shutdown; exiting");
+            ExitCode::Clean
+        }
         Some(fatal) = fatal_rx.recv() => {
             backend.set_failed(&fatal);
             let message = match &fatal {
@@ -152,62 +225,32 @@ async fn serve(
     }
 }
 
-/// Starts the generation thread: it loads the weights, warms up, marks the backend ready and
-/// then serves jobs. Failures are reported on `fatal`.
-fn spawn_engine(
-    prepared: PreparedModel,
+/// Resolves when the listener should close: after a signal, the drain and the engine stop
+/// (module comment). `drained` fires at that point.
+async fn drain_on_signal(
     backend: Arc<ModelBackend>,
-    model_metrics: ModelMetrics,
-    fatal: UnboundedSender<Fatal>,
-) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("turbine-generation".into())
-        .spawn(move || {
-            let PreparedModel {
-                provider,
-                arch,
-                generation,
-                tokenizer,
-                index,
-                registry,
-                max_seq_len,
-                ..
-            } = prepared;
-            let warmup_token = generation.bos_token_id.unwrap_or(0);
-            let loaded = match model::load(
-                &arch,
-                &index,
-                registry,
-                provider.mem,
-                max_seq_len,
-                warmup_token,
-                &model_metrics,
-            ) {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
-                    return;
-                }
-            };
-            drop(index);
-            let mut executor = loaded.executor;
-            // Capacity 1: the slot admits one request, so at most one job is ever queued.
-            let (jobs_tx, jobs_rx) = std::sync::mpsc::sync_channel::<Job>(1);
-            backend.set_ready(jobs_tx, loaded.load_seconds, loaded.weight_bytes);
-            tracing::info!("ready");
-            let engine = Engine {
-                tokenizer,
-                max_seq_len,
-                slot: backend.slot(),
-                metrics: backend.metrics().clone(),
-                model_metrics,
-            };
-            drop(backend);
-            if let Err(message) = engine.run(&mut executor, &jobs_rx) {
-                let _ = fatal.send(Fatal::DeviceError(message));
-            }
-        })
-        .map(|_| ())
+    grace: Duration,
+    drained: tokio::sync::oneshot::Sender<()>,
+) {
+    shutdown_signal().await;
+    backend.begin_shutdown();
+    let draining = tokio::time::Instant::now();
+    while !backend.engine_idle() && draining.elapsed() < grace {
+        tokio::time::sleep(SHUTDOWN_POLL).await;
+    }
+    let left = !backend.engine_idle();
+    tracing::info!(
+        event = "shutdown_drained",
+        drained_seconds = draining.elapsed().as_secs_f64(),
+        cancelling = left,
+        "shutdown grace over; stopping the engine"
+    );
+    backend.stop_engine();
+    let stopping = tokio::time::Instant::now();
+    while !backend.engine_stopped() && stopping.elapsed() < CLOSE_LIMIT {
+        tokio::time::sleep(SHUTDOWN_POLL).await;
+    }
+    let _ = drained.send(());
 }
 
 async fn shutdown_signal() {
@@ -229,7 +272,24 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! {
-        () = ctrl_c => tracing::info!(signal = "SIGINT", "shutdown requested; finishing in-flight requests"),
-        () = terminate => tracing::info!(signal = "SIGTERM", "shutdown requested; finishing in-flight requests"),
+        () = ctrl_c => tracing::info!(signal = "SIGINT", "shutdown requested; draining running requests"),
+        () = terminate => tracing::info!(signal = "SIGTERM", "shutdown requested; draining running requests"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unset leaves the kernel's autotuning alone; a positive byte count caps; anything else is
+    /// refused rather than silently ignored (a typo would make the held-stream tests flaky).
+    #[test]
+    fn send_buffer_cap_parsing() {
+        assert_eq!(send_buffer_cap(None), Ok(None));
+        assert_eq!(send_buffer_cap(Some("4096")), Ok(Some(4096)));
+        for bad in ["", "0", "-1", "4KiB", "x"] {
+            let err = send_buffer_cap(Some(bad)).unwrap_err();
+            assert!(err.contains(SEND_BUFFER_ENV), "{bad:?}: {err}");
+        }
     }
 }

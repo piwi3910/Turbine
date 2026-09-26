@@ -1,4 +1,4 @@
-// Identity functions, context lifecycle and error reporting.
+// Identity functions, context lifecycle, context info and error reporting.
 #include <hipblaslt/hipblaslt-version.h>
 #include <rocm-core/rocm_version.h>
 
@@ -77,6 +77,7 @@ void log_banner() {
 
 // Releases whatever a (possibly partially built) context holds.
 void release(turbine_ctx *ctx) {
+  turbine_hip::abandon_capture(ctx);
   if (ctx->stream != nullptr)
     (void)hipStreamSynchronize(ctx->stream);
   if (ctx->blaslt != nullptr)
@@ -85,6 +86,8 @@ void release(turbine_ctx *ctx) {
     (void)hipFree(ctx->workspace);
   if (ctx->seqstart != nullptr)
     (void)hipFree(ctx->seqstart);
+  if (ctx->moe_scratch != nullptr)
+    (void)hipFree(ctx->moe_scratch);
   if (ctx->stream != nullptr)
     (void)hipStreamDestroy(ctx->stream);
   delete ctx;
@@ -166,6 +169,11 @@ extern "C" {
 
 uint32_t turbine_abi_version(void) { return TURBINE_ABI_VERSION; }
 
+// ABI v2.1: this library exports the optional add_rmsnorm trio (rmsnorm.cpp),
+// logits_reduce (logits_reduce.hip) and the graph functions (graph.cpp); the
+// other v2.1 group (options) is resolved only where its symbols exist.
+uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
+
 const char *turbine_backend_name(void) { return "hip"; }
 
 const char *turbine_build_archs(void) { return TURBINE_BUILD_ARCHS; }
@@ -206,6 +214,10 @@ int32_t turbine_ctx_create(int32_t device_ordinal, turbine_ctx **out) {
 
   auto *ctx = new turbine_ctx();
   ctx->device = device_ordinal;
+  {
+    const std::string full(props.gcnArchName);
+    ctx->arch = full.substr(0, full.find(':'));
+  }
   err = hipStreamCreateWithFlags(&ctx->stream, hipStreamNonBlocking);
   if (err != hipSuccess) {
     ctx->stream = nullptr;
@@ -238,7 +250,28 @@ int32_t turbine_ctx_create(int32_t device_ordinal, turbine_ctx **out) {
                        hip_message(err, "hipMalloc attention seqstart"));
   }
   log_banner();
+  ctx->moe_grouped = turbine_hip::probe_grouped_gemm(ctx);
   *out = ctx;
+  return TURBINE_OK;
+}
+
+int32_t turbine_ctx_get_info(turbine_ctx *ctx, turbine_ctx_info *out) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (out == nullptr) {
+    return turbine_hip::fail(ctx, TURBINE_E_ARGUMENT,
+                             "turbine_ctx_get_info: out is NULL");
+  }
+  *out = turbine_ctx_info{};
+  out->workspace_bytes = turbine_hip::kGemmWorkspaceBytes;
+  // AMD devices have no compute capability.
+  out->compute_major = -1;
+  out->compute_minor = -1;
+  const size_t n = ctx->arch.size() < sizeof(out->device_arch) - 1
+                       ? ctx->arch.size()
+                       : sizeof(out->device_arch) - 1;
+  std::memcpy(out->device_arch, ctx->arch.data(), n);
+  out->device_arch[n] = '\0';
   return TURBINE_OK;
 }
 

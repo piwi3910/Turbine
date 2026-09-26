@@ -1,7 +1,9 @@
 # libturbine_hip.so: the Turbine kernel C ABI (kernels/include/turbine_kernels.h)
 # on ROCm. GEMM through hipBLASLt, attention through Composable Kernel ck_tile
-# FMHA, RMSNorm through ck_tile rmsnorm2d where an instance exists, and small
-# Turbine HIP kernels for the rest. Loaded at run time by turbine-kernels.
+# FMHA (contiguous and, for 128-multiple pages, paged), RMSNorm through ck_tile
+# rmsnorm2d where an instance exists, MoE expert GEMMs through hipBLASLt, and
+# Turbine HIP kernels for the rest (16-token paged attention, MoE routing,
+# elementwise ops). Loaded at run time by turbine-kernels.
 #
 #   cmake -S kernels/rocm -B <build> -DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc \
 #         -DGPU_TARGETS=gfx1201 && cmake --build <build>
@@ -72,14 +74,17 @@ if(NOT EXISTS "${CK_FMHA_DIR}/generate.py")
   message(FATAL_ERROR "Composable Kernel checkout at ${CK_ROOT} lacks ${CK_FMHA_DIR}/generate.py")
 endif()
 
-# ---- CK FMHA forward instances: head_dim 128, BF16, no bias/lse/dropout ----
+# ---- CK FMHA instances: head_dim 128, BF16, no bias/lse/dropout/sink ----
+# fwd: contiguous prefill/decode (ABI v1 attention). pagedkv_prefill: group-mode
+# paged attention for pages of a multiple of 128 tokens (ABI v2 paged attention);
+# one --filter pattern per --api entry, in order.
 set(FMHA_GEN_DIR "${CMAKE_BINARY_DIR}/fmha")
 file(MAKE_DIRECTORY "${FMHA_GEN_DIR}")
 set(FMHA_GEN_ARGS
   "${CK_FMHA_DIR}/generate.py"
   --targets ${GPU_TARGETS}
-  --api fwd
-  --filter "*d128_bf16*nlogits_nbias*nlse_ndropout_nskip_nqscale_ntrload_nsink*")
+  --api fwd,pagedkv_prefill
+  --filter "*d128_bf16*nlogits_nbias*nlse_ndropout_nskip_nqscale_ntrload_nsink*,*d128_bf16_group*nlogits_nbias*nlse_nskip_nsquant_pagedkv_nsink*")
 file(REMOVE "${FMHA_GEN_DIR}/blobs.txt")
 execute_process(
   COMMAND "${Python3_EXECUTABLE}" ${FMHA_GEN_ARGS} --list_blobs "${FMHA_GEN_DIR}/blobs.txt"
@@ -92,23 +97,36 @@ list(LENGTH FMHA_BLOBS fmha_blob_count)
 if(fmha_blob_count LESS 2)
   message(FATAL_ERROR "CK FMHA generator listed no gfx1201 d128 bf16 instances")
 endif()
+set(fmha_pagedkv_blobs ${FMHA_BLOBS})
+list(FILTER fmha_pagedkv_blobs INCLUDE REGEX "fmha_fwd_pagedkv_d128_bf16_group")
+if(NOT fmha_pagedkv_blobs)
+  message(FATAL_ERROR "CK FMHA generator listed no gfx1201 d128 bf16 group-mode pagedkv instance")
+endif()
 message(STATUS "CK FMHA: ${fmha_blob_count} generated sources")
 file(GLOB_RECURSE FMHA_CODEGEN_SCRIPTS "${CK_FMHA_DIR}/codegen/*.py")
 add_custom_command(
   OUTPUT ${FMHA_BLOBS}
   COMMAND "${Python3_EXECUTABLE}" ${FMHA_GEN_ARGS} --output_dir "${FMHA_GEN_DIR}"
   DEPENDS "${CK_FMHA_DIR}/generate.py" ${FMHA_CODEGEN_SCRIPTS}
-  COMMENT "Generating CK FMHA forward instances for ${GPU_TARGETS}")
+  COMMENT "Generating CK FMHA forward and pagedkv instances for ${GPU_TARGETS}")
 
 # ---- the shared library ----
 set(TURBINE_SOURCES
   src/context.cpp
   src/memory.cpp
+  src/graph.cpp
   src/gemm.cpp
   src/attention.cpp
   src/rmsnorm.cpp
-  src/elementwise.hip)
-set(CK_SOURCES src/attention.cpp src/rmsnorm.cpp ${FMHA_BLOBS})
+  src/elementwise.hip
+  src/paged_attention.cpp
+  src/paged_attention.hip
+  src/copy_blocks.cpp
+  src/moe.cpp
+  src/moe.hip
+  src/moe_small_m.hip
+  src/logits_reduce.hip)
+set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/rmsnorm.cpp ${FMHA_BLOBS})
 
 add_library(turbine_hip SHARED ${TURBINE_SOURCES} ${FMHA_BLOBS})
 set_source_files_properties(${TURBINE_SOURCES} ${FMHA_BLOBS} PROPERTIES LANGUAGE HIP)

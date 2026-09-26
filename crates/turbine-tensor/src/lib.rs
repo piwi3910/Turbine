@@ -3,11 +3,13 @@
 pub mod buffer;
 pub mod dtype;
 pub mod host;
+pub mod kv_view;
 pub mod tensor;
 
 pub use buffer::{
     DeviceBuffer, DeviceMemory, DevicePtr, DeviceSlice, MemInfo, MemoryError, StreamRef,
 };
 pub use dtype::DType;
+pub use kv_view::KvPoolView;
 pub use tensor::{Tensor, TensorView};
 pub use turbine_core::types::DeviceId;

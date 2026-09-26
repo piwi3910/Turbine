@@ -5,8 +5,14 @@
 //!   `cpu-reference` provider against a reference generated on the spot.
 //! - `logits_match_reference` (lab only, needs a HIP device and the weights): Llama-3.2-3B on the
 //!   HIP provider against the committed `tests/golden/llama-3.2-3b-instruct/reference.jsonl`.
+//! - `olmoe_logits_match_reference` (lab only, likewise): OLMoE-1B-7B on the HIP provider against
+//!   `tests/golden/olmoe-1b-7b-0125-instruct/reference.jsonl` under its own calibrated
+//!   `tolerance.json` (see the README beside it).
+//! - `hip_trace_vs_cpu_3b` and `olmoe_teacher_forced_vs_reference` (lab diagnostics, no-ops
+//!   unless their environment variable names prompts): op-by-op HIP-vs-CPU traces of the 3B,
+//!   and teacher-forced OLMoE log-probabilities of both providers against its reference.
 //!
-//! Both judge with the committed `tolerance.json` and the same rule as `turbine-golden compare`,
+//! The first three judge with the committed `tolerance.json` and the same rule as `turbine-golden compare`,
 //! re-implemented in [`compare_prompt`] because this crate cannot depend on `turbine-bench`
 //! (contract §1.2).
 use std::path::{Path, PathBuf};
@@ -23,14 +29,15 @@ use turbine_core::types::{ExecutionBackend, RequestId, Vendor};
 use turbine_kernels::{
     KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider, shim_provider,
 };
-use turbine_model::executor::{BatchInput, LlamaExecutor, ModelExecutor};
+use turbine_model::config::Architecture;
+use turbine_model::executor::{self, ExecutorOptions, LlamaExecutor, ModelExecutor, SequenceKv};
 use turbine_model::generate::{GenerateOptions, generate};
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::write_tiny_llama;
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::{
     ChatTemplate, MAX_STAGING_BYTES, SafetensorsIndex, Tokenizer, WeightLoader, llama_slots,
-    load_model_config,
+    load_model_config, olmoe_slots,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::DeviceMemory;
@@ -84,6 +91,14 @@ struct Tolerance {
     max_abs_logprob_diff_tail: f32,
     likely_logprob_floor: f32,
     margin_nats: f32,
+    /// Bounds `turbine-golden compare` applies above concurrency 1 only; these tests generate
+    /// one sequence at a time and judge by the strict bounds.
+    #[serde(default)]
+    #[allow(dead_code)]
+    max_abs_logprob_diff_likely_batched: Option<f32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    max_abs_logprob_diff_tail_batched: Option<f32>,
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
@@ -252,6 +267,8 @@ fn compare_prompt_applies_the_tolerance_rule() {
         max_abs_logprob_diff_tail: 0.55,
         likely_logprob_floor: -2.0,
         margin_nats: 0.5,
+        max_abs_logprob_diff_likely_batched: None,
+        max_abs_logprob_diff_tail_batched: None,
     };
     // Four positions: token 10+i with runner-up 20+i at the given margin.
     let reference = |margins: [f32; 4]| ReferenceRecord {
@@ -323,6 +340,8 @@ fn logprob_bound_has_a_likely_and_a_tail_tier() {
         max_abs_logprob_diff_tail: 0.55,
         likely_logprob_floor: -2.0,
         margin_nats: 0.5,
+        max_abs_logprob_diff_likely_batched: None,
+        max_abs_logprob_diff_tail_batched: None,
     };
     // One position: top-1 token 10, runner-up 20 at `ref_lp`, moved by `delta` in the candidate.
     let check = |ref_lp: f32, delta: f32| {
@@ -387,6 +406,50 @@ fn committed_tolerance_and_reference() {
     );
 }
 
+/// OLMoE's committed tolerance is transformers' own spread (decision "OLMoE golden gate",
+/// 2026-09-26; measurement in the README beside it): the same rule and floor as Llama, bounds
+/// 1.01 / 1.66 that every transformers variant (sdpa/eager × BF16/FP32 × incremental/full)
+/// meets against the reference, at least 14/16 prompts. Breaks if the OLMoE file drifts from
+/// the documented calibration or Llama's file is loosened with it.
+#[test]
+fn olmoe_tolerance_is_the_calibrated_self_spread() {
+    let fixture = golden_dir().join("olmoe-1b-7b-0125-instruct");
+    let tol = read_tolerance(&fixture.join("tolerance.json"));
+    assert_eq!(
+        (tol.min_identical_prefix, tol.min_prompts_passing, tol.top_k),
+        (32, 14, 5)
+    );
+    assert_eq!(
+        (
+            tol.max_abs_logprob_diff_likely,
+            tol.max_abs_logprob_diff_tail,
+            tol.likely_logprob_floor,
+            tol.margin_nats
+        ),
+        (1.01, 1.66, -2.0, 0.5)
+    );
+    // The spread already spans GEMM shapes and kernels, so concurrency 16 gets the same bounds.
+    assert_eq!(
+        (
+            tol.max_abs_logprob_diff_likely_batched,
+            tol.max_abs_logprob_diff_tail_batched
+        ),
+        (Some(1.01), Some(1.66))
+    );
+    let readme = std::fs::read_to_string(fixture.join("README.md")).expect("README.md");
+    for bound in ["1.01", "1.66", "1.0092", "1.6569"] {
+        assert!(readme.contains(bound), "README.md lacks {bound}");
+    }
+    let llama = read_tolerance(&golden_dir().join("llama-3.2-3b-instruct/tolerance.json"));
+    assert_eq!(
+        (
+            llama.max_abs_logprob_diff_likely,
+            llama.max_abs_logprob_diff_tail
+        ),
+        (0.15, 0.55)
+    );
+}
+
 // ------------------------------------------------------------------------ replay helpers
 
 /// Prompt token ids exactly as the server builds them: chat prompts through the model's chat
@@ -418,6 +481,7 @@ fn prompt_token_ids(
 /// position.
 fn greedy(
     exec: &mut dyn ModelExecutor,
+    kv: &mut SequenceKv,
     tokenizer: &Arc<Tokenizer>,
     prompt_tokens: Vec<u32>,
     max_tokens: u32,
@@ -425,6 +489,11 @@ fn greedy(
 ) -> (Vec<u32>, Vec<Vec<(u32, f32)>>) {
     let req = GenerationRequest {
         id: RequestId::new_v4(),
+        n: 1,
+        priority: turbine_core::types::Priority::default(),
+        echo: false,
+        constraint: None,
+        deadline_ms: u64::MAX,
         endpoint: Endpoint::Completions,
         http_request_id: "golden".into(),
         prompt_tokens,
@@ -434,12 +503,14 @@ fn greedy(
             top_k: -1,
             seed: Some(0),
             logprobs: Some(TOP_LOGPROBS),
+            ..SamplingParams::default()
         },
         stop: StopConditions {
             eos_token_ids: SmallVec::new(),
             stop_strings: Vec::new(),
             max_tokens,
             ignore_eos: true,
+            ..StopConditions::default()
         },
     };
     let cancel = CancelFlag::default();
@@ -450,7 +521,7 @@ fn greedy(
     let mut tokens = Vec::new();
     let mut tops = Vec::new();
     let mut finished = None;
-    for event in generate(exec, Arc::clone(tokenizer), &req, &cancel, opts) {
+    for event in generate(exec, kv, Arc::clone(tokenizer), &req, &cancel, opts) {
         match event {
             GenerationEvent::Token {
                 token_id,
@@ -479,6 +550,7 @@ fn greedy(
 /// returns one verdict per prompt.
 fn replay(
     exec: &mut dyn ModelExecutor,
+    kv: &mut SequenceKv,
     model_dir: &Path,
     prompts: &[PromptRecord],
     references: &[ReferenceRecord],
@@ -508,7 +580,7 @@ fn replay(
             "{}",
             prompt.id
         );
-        let (tokens, tops) = greedy(exec, &tokenizer, ids, prompt.max_tokens, max_seq_len);
+        let (tokens, tops) = greedy(exec, kv, &tokenizer, ids, prompt.max_tokens, max_seq_len);
         if std::env::var_os("TURBINE_GOLDEN_DUMP").is_some() {
             // Diagnostics: the candidate in reference.jsonl shape, one line per prompt.
             let line = serde_json::json!({
@@ -532,12 +604,29 @@ fn needed_seq_len(references: &[ReferenceRecord]) -> u32 {
         .expect("at least one reference")
 }
 
+/// KV block size of the golden runs: the `kv.block_tokens` default (CK paged attention on HIP).
+const BLOCK_TOKENS: u32 = 128;
+
+/// Held by every test that loads a 3B-class model onto the GPU, so the test harness's threads
+/// never hold Llama-3.2-3B and OLMoE-1B-7B (and their KV) on one card at once.
+static GPU_MODEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu_model_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_MODEL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An executor and the single-sequence KV it generates on.
+struct Runner {
+    exec: LlamaExecutor,
+    kv: SequenceKv,
+}
+
 fn build_executor(
     model_dir: &Path,
     provider: Arc<dyn KernelProvider>,
     mem: Arc<dyn DeviceMemory>,
     max_seq_len: u32,
-) -> LlamaExecutor {
+) -> Runner {
     let cfg = load_model_config(model_dir).expect("config.json");
     let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
     let weights = WeightLoader::load(&index, &llama_slots(&cfg), &mem, MAX_STAGING_BYTES)
@@ -547,19 +636,23 @@ fn build_executor(
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &LlamaExecutor::requirements(&cfg),
+        &LlamaExecutor::requirements(&cfg, BLOCK_TOKENS, ExecutorOptions::default()),
         &metrics,
     )
     .expect("every op has a provider");
-    LlamaExecutor::new(
+    let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
+    let exec = LlamaExecutor::new(
         &cfg,
         weights,
         Arc::new(registry),
         mem,
+        BLOCK_TOKENS,
         max_seq_len,
-        max_seq_len,
+        1,
+        ExecutorOptions::default(),
     )
-    .expect("executor")
+    .expect("executor");
+    Runner { exec, kv }
 }
 
 // --------------------------------------------------------------------------------- tests
@@ -595,9 +688,10 @@ fn hf_reference_matches_cpu() {
     let tol = read_tolerance(&golden_dir().join("llama-3.2-3b-instruct/tolerance.json"));
     let max_seq_len = needed_seq_len(&references);
     let mem = HostMemory::new(turbine_core::types::DeviceId(0), 1 << 30);
-    let mut exec = build_executor(&model_dir, cpu_reference_provider(), mem, max_seq_len);
+    let mut runner = build_executor(&model_dir, cpu_reference_provider(), mem, max_seq_len);
     let verdicts = replay(
-        &mut exec,
+        &mut runner.exec,
+        &mut runner.kv,
         &model_dir,
         &prompts,
         &references,
@@ -612,6 +706,7 @@ fn hf_reference_matches_cpu() {
 #[test]
 #[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY and TURBINE_TEST_MODEL_DIR"]
 fn logits_match_reference() {
+    let _gpu = gpu_model_lock();
     if !turbine_kernels::test_support::require_backend("hip") {
         return;
     }
@@ -636,15 +731,63 @@ fn logits_match_reference() {
     let tol = read_tolerance(&fixture.join("tolerance.json"));
     let max_seq_len = needed_seq_len(&references);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
-    let mut exec = build_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
+    let mut runner = build_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
     let verdicts = replay(
-        &mut exec,
+        &mut runner.exec,
+        &mut runner.kv,
         &model_dir,
         &prompts,
         &references,
         &tol,
         max_seq_len,
     );
+    assert_tolerance(&verdicts, &tol);
+}
+
+/// Lab only: OLMoE-1B-7B-0125-Instruct on the HIP provider against the committed transformers
+/// reference, judged with OLMoE's calibrated `tolerance.json` (transformers' own spread across
+/// attention kernel, compute precision and decode shape; README beside it).
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY and TURBINE_TEST_MOE_MODEL_DIR"]
+fn olmoe_logits_match_reference() {
+    let _gpu = gpu_model_lock();
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MOE_MODEL_DIR");
+    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
+        .filter(|v| !v.is_empty())
+        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+        .expect("load the HIP kernel library");
+    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
+        .expect("device discovery");
+    let device = inventory
+        .devices
+        .iter()
+        .find(|d| d.vendor == Vendor::Amd)
+        .expect("an AMD device");
+    let ctx = lib.create_context(device).expect("HIP context");
+
+    let fixture = golden_dir().join("olmoe-1b-7b-0125-instruct");
+    let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
+    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
+    let tol = read_tolerance(&fixture.join("tolerance.json"));
+    let max_seq_len = needed_seq_len(&references);
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut runner = build_any_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
+    let verdicts = replay(
+        runner.exec.as_mut(),
+        &mut runner.kv,
+        &model_dir,
+        &prompts,
+        &references,
+        &tol,
+        max_seq_len,
+    );
+    for v in &verdicts {
+        println!("olmoe_golden {v:?}");
+    }
     assert_tolerance(&verdicts, &tol);
 }
 
@@ -658,6 +801,7 @@ fn logits_match_reference() {
 #[test]
 #[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY, TURBINE_TEST_MODEL_DIR and TURBINE_GOLDEN_TRACE"]
 fn hip_trace_vs_cpu_3b() {
+    let _gpu = gpu_model_lock();
     const TRACE_DECODE: usize = 2;
     let Some(ids) = std::env::var("TURBINE_GOLDEN_TRACE")
         .ok()
@@ -706,8 +850,8 @@ fn hip_trace_vs_cpu_3b() {
     let mut cpu = build_executor(&model_dir, cpu_reference_provider(), host, max_seq_len);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
     let mut hip = build_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
-    cpu.set_trace(true);
-    hip.set_trace(true);
+    cpu.exec.set_trace(true);
+    hip.exec.set_trace(true);
     let weights = |name: &str| read_bf16_weight(&index, name);
 
     for r in selected {
@@ -718,13 +862,11 @@ fn hip_trace_vs_cpu_3b() {
         let mut p0 = 0usize;
         for step in 0..=TRACE_DECODE {
             let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
-            let input = BatchInput {
-                tokens: &batch,
-                positions: &positions,
-            };
-            cpu.forward(&input).expect("cpu forward");
-            hip.forward(&input).expect("hip forward");
-            let (c, h) = (cpu.take_trace(), hip.take_trace());
+            for r in [&mut cpu, &mut hip] {
+                r.kv.forward(&mut r.exec, &batch, &positions)
+                    .expect("forward");
+            }
+            let (c, h) = (cpu.exec.take_trace(), hip.exec.take_trace());
             accumulated.extend(compare_traces(step, &c, &h));
             local.extend(checker.check_step(step, p0, &h));
             p0 += batch.len();
@@ -746,6 +888,191 @@ fn hip_trace_vs_cpu_3b() {
                 ),
                 &local
             )
+        );
+    }
+}
+
+// ------------------------------------------------------------------------------- OLMoE
+
+/// An executor of any architecture (through [`executor::build_executor`]) and the
+/// single-sequence KV it runs on.
+struct AnyRunner {
+    exec: Box<dyn ModelExecutor>,
+    kv: SequenceKv,
+}
+
+fn build_any_executor(
+    model_dir: &Path,
+    provider: Arc<dyn KernelProvider>,
+    mem: Arc<dyn DeviceMemory>,
+    max_seq_len: u32,
+) -> AnyRunner {
+    let cfg = load_model_config(model_dir).expect("config.json");
+    let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
+    let slots = if cfg.architecture == Architecture::Olmoe {
+        olmoe_slots(&cfg)
+    } else {
+        llama_slots(&cfg)
+    };
+    let weights =
+        WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("load weights");
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let order = [provider.id()];
+    let registry = KernelRegistry::build(
+        vec![provider],
+        &order,
+        &executor::requirements(&cfg, BLOCK_TOKENS, ExecutorOptions::default()),
+        &metrics,
+    )
+    .expect("every op has a provider");
+    let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
+    let exec = executor::build_executor(
+        &cfg,
+        weights,
+        Arc::new(registry),
+        mem,
+        BLOCK_TOKENS,
+        max_seq_len,
+        1,
+        ExecutorOptions::default(),
+    )
+    .expect("executor");
+    AnyRunner { exec, kv }
+}
+
+/// FP32 log-softmax of one logits row (accumulated in f64).
+fn log_softmax(row: &[f32]) -> Vec<f32> {
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f64 = row.iter().map(|&l| f64::from(l - max).exp()).sum();
+    let lse = f64::from(max) + sum.ln();
+    row.iter().map(|&l| (f64::from(l) - lse) as f32).collect()
+}
+
+/// One teacher-forced position: Turbine's argmax and the largest |Δ logprob| over the
+/// reference's top-5 (likely and tail tiers as in `tolerance.json`).
+#[derive(Debug)]
+struct ForcedPosition {
+    argmax: u32,
+    likely: f32,
+    tail: f32,
+}
+
+/// Runs `r`'s prompt and then its reference tokens (teacher-forced: every position sees the
+/// reference's own prefix, so one bad position does not cascade) and compares each position's
+/// log-probabilities with the reference's top-5.
+fn teacher_forced(runner: &mut AnyRunner, r: &ReferenceRecord, floor: f32) -> Vec<ForcedPosition> {
+    let mut out = Vec::with_capacity(r.tokens.len());
+    let mut batch = r.prompt_token_ids.clone();
+    let mut p0 = 0usize;
+    for step in 0..r.tokens.len() {
+        let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
+        let logits = runner
+            .kv
+            .forward(runner.exec.as_mut(), &batch, &positions)
+            .expect("forward");
+        let lp = log_softmax(logits.row(0));
+        let argmax = (0..lp.len())
+            .max_by(|&a, &b| lp[a].total_cmp(&lp[b]).then(b.cmp(&a)))
+            .expect("non-empty vocab") as u32;
+        let (mut likely, mut tail) = (0f32, 0f32);
+        for &(id, ref_lp) in r.top_logprobs[step].iter().take(5) {
+            let d = (lp[id as usize] - ref_lp).abs();
+            if ref_lp > floor {
+                likely = likely.max(d);
+            } else {
+                tail = tail.max(d);
+            }
+        }
+        out.push(ForcedPosition {
+            argmax,
+            likely,
+            tail,
+        });
+        p0 += batch.len();
+        batch = vec![r.tokens[step]];
+    }
+    out
+}
+
+/// Lab diagnostic (OLMoE numerics vs semantics), a no-op unless `TURBINE_GOLDEN_OLMOE` names
+/// prompts (comma-separated ids); run it alone in a release build (the cpu-reference provider
+/// is scalar). For each named prompt, OLMoE-1B-7B on the cpu-reference and the HIP provider
+/// runs the reference's prompt and then its tokens teacher-forced, and prints per position the
+/// largest |Δ logprob| against the transformers reference's top-5 for both providers.
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY, TURBINE_TEST_MOE_MODEL_DIR and TURBINE_GOLDEN_OLMOE"]
+fn olmoe_teacher_forced_vs_reference() {
+    let Some(ids) = std::env::var("TURBINE_GOLDEN_OLMOE")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        println!("TURBINE_GOLDEN_OLMOE is not set: nothing compared");
+        return;
+    };
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let _gpu = gpu_model_lock();
+    let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MOE_MODEL_DIR");
+    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
+        .filter(|v| !v.is_empty())
+        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+        .expect("load the HIP kernel library");
+    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
+        .expect("device discovery");
+    let device = inventory
+        .devices
+        .iter()
+        .find(|d| d.vendor == Vendor::Amd)
+        .expect("an AMD device");
+    let ctx = lib.create_context(device).expect("HIP context");
+
+    let fixture = golden_dir().join("olmoe-1b-7b-0125-instruct");
+    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
+    let tol = read_tolerance(&fixture.join("tolerance.json"));
+    let selected: Vec<&ReferenceRecord> = ids
+        .split(',')
+        .map(|id| {
+            references
+                .iter()
+                .find(|r| r.id == id.trim())
+                .unwrap_or_else(|| panic!("no reference prompt {id}"))
+        })
+        .collect();
+    let max_seq_len = selected
+        .iter()
+        .map(|r| (r.prompt_token_ids.len() + r.tokens.len()) as u32)
+        .max()
+        .expect("at least one prompt");
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut hip = build_any_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
+    let host = HostMemory::new(turbine_core::types::DeviceId(0), 24 << 30);
+    let mut cpu = build_any_executor(&model_dir, cpu_reference_provider(), host, max_seq_len);
+    for r in selected {
+        let h = teacher_forced(&mut hip, r, tol.likely_logprob_floor);
+        let worst = |v: &[ForcedPosition]| {
+            v.iter()
+                .fold((0f32, 0f32), |(l, t), p| (l.max(p.likely), t.max(p.tail)))
+        };
+        println!("OLMoE {} hip max {:?}", r.id, worst(&h));
+        let c = teacher_forced(&mut cpu, r, tol.likely_logprob_floor);
+        println!(
+            "OLMoE {} teacher-forced vs transformers (|Δ| likely / tail):",
+            r.id
+        );
+        println!("pos  ref_tok  cpu_argmax cpu_likely cpu_tail  hip_argmax hip_likely hip_tail");
+        for (pos, (c, h)) in c.iter().zip(&h).enumerate() {
+            println!(
+                "{pos:>3} {:>8} {:>10} {:>10.4} {:>8.4} {:>11} {:>10.4} {:>8.4}",
+                r.tokens[pos], c.argmax, c.likely, c.tail, h.argmax, h.likely, h.tail
+            );
+        }
+        println!(
+            "OLMoE {} max: cpu {:?}, hip {:?}",
+            r.id,
+            worst(&c),
+            worst(&h)
         );
     }
 }

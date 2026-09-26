@@ -1,6 +1,8 @@
 // Device allocation, host<->device copies, stream synchronisation and memory
 // info. Copies are enqueued on the context's compute stream; host buffers must
-// stay valid until the next turbine_stream_sync (ABI contract).
+// stay valid until the next turbine_stream_sync (ABI contract). While the
+// stream is captured into a graph (graph.cpp) allocations, copies and syncs
+// return TURBINE_E_ARGUMENT: only op calls may be captured.
 #include <string>
 
 #include "turbine_hip.hpp"
@@ -8,12 +10,15 @@
 using turbine_hip::check_hip;
 using turbine_hip::enter;
 using turbine_hip::fail;
+using turbine_hip::refuse_while_capturing;
 
 extern "C" {
 
 int32_t turbine_malloc(turbine_ctx *ctx, size_t bytes, void **out) {
   if (ctx == nullptr)
     return TURBINE_E_ARGUMENT;
+  if (ctx->capturing)
+    return refuse_while_capturing(ctx, "turbine_malloc");
   if (out == nullptr) {
     return fail(ctx, TURBINE_E_ARGUMENT, "turbine_malloc: out is NULL");
   }
@@ -27,6 +32,8 @@ int32_t turbine_malloc(turbine_ctx *ctx, size_t bytes, void **out) {
 int32_t turbine_free(turbine_ctx *ctx, void *ptr) {
   if (ctx == nullptr)
     return TURBINE_E_ARGUMENT;
+  if (ctx->capturing)
+    return refuse_while_capturing(ctx, "turbine_free");
   if (ptr == nullptr)
     return TURBINE_OK;
   if (int32_t rc = enter(ctx); rc != TURBINE_OK)
@@ -38,6 +45,8 @@ int32_t turbine_memcpy_h2d(turbine_ctx *ctx, void *dst_device,
                            const void *src_host, size_t bytes) {
   if (ctx == nullptr)
     return TURBINE_E_ARGUMENT;
+  if (ctx->capturing)
+    return refuse_while_capturing(ctx, "turbine_memcpy_h2d");
   if (bytes == 0)
     return TURBINE_OK;
   if (dst_device == nullptr || src_host == nullptr) {
@@ -55,6 +64,8 @@ int32_t turbine_memcpy_d2h(turbine_ctx *ctx, void *dst_host,
                            const void *src_device, size_t bytes) {
   if (ctx == nullptr)
     return TURBINE_E_ARGUMENT;
+  if (ctx->capturing)
+    return refuse_while_capturing(ctx, "turbine_memcpy_d2h");
   if (bytes == 0)
     return TURBINE_OK;
   if (dst_host == nullptr || src_device == nullptr) {
@@ -71,6 +82,8 @@ int32_t turbine_memcpy_d2h(turbine_ctx *ctx, void *dst_host,
 int32_t turbine_stream_sync(turbine_ctx *ctx) {
   if (ctx == nullptr)
     return TURBINE_E_ARGUMENT;
+  if (ctx->capturing)
+    return refuse_while_capturing(ctx, "turbine_stream_sync");
   if (int32_t rc = enter(ctx); rc != TURBINE_OK)
     return rc;
   return check_hip(ctx, hipStreamSynchronize(ctx->stream),

@@ -15,7 +15,7 @@ use crate::openai::request::OpenAiRequest;
 /// A boxed, sendable future (keeps [`InferenceBackend`] object-safe).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Per-request event stream from the engine (bounded: 64 events in Phase 1). Dropping the
+/// Per-request event stream from the engine (bounded: 64 events in Phase 1, 256 in Phase 2). Dropping the
 /// receiver is the cancellation signal: the engine stops generating when its send fails.
 pub type GenerationStream = tokio::sync::mpsc::Receiver<GenerationEvent>;
 
@@ -95,6 +95,8 @@ pub enum NotReadyReason {
     LoadingModel,
     ModelLoadFailed,
     DeviceError,
+    /// SIGINT/SIGTERM received: draining for up to `server.shutdown_grace` (Phase 2).
+    ShuttingDown,
 }
 
 impl NotReadyReason {
@@ -105,6 +107,7 @@ impl NotReadyReason {
             NotReadyReason::LoadingModel => "loading_model",
             NotReadyReason::ModelLoadFailed => "model_load_failed",
             NotReadyReason::DeviceError => "device_error",
+            NotReadyReason::ShuttingDown => "shutting_down",
         }
     }
 }

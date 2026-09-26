@@ -1,0 +1,31 @@
+[package]
+name = "turbine-scheduler"
+description = "Turbine scheduler: request lifecycle, queues, continuous batching and its simulator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# No GPU, kernel-provider or model dependency (TS §21 rules 6 and 11): the scheduler sees
+# requests, token counts, block counts and a cost model only.
+[dependencies]
+turbine-core.workspace = true
+turbine-observability.workspace = true
+turbine-kv.workspace = true
+prometheus-client.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Simulator: seeded ChaCha8 arrivals and deterministic request ids
+rand_chacha.workspace = true
+rand_core.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+turbine-tensor.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

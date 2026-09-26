@@ -25,8 +25,20 @@ turbine-kernels.workspace = true
 turbine-model.workspace = true
 # turbine_requests_total, turbine_request_{ttft,itl,e2e}_seconds, turbine_tokens_total
 prometheus-client.workspace = true
-# EOS id lists (turbine_core::request::StopConditions)
+# EOS id lists (turbine_core::request::StopConditions), sequence lists of a request
 smallvec.workspace = true
+# L0 KV block pool, its metrics and the /turbine/v1/kv document (Phase 2 engine)
+turbine-kv.workspace = true
+# Test-only cap on accepted connections' send buffers (startup::SEND_BUFFER_ENV)
+socket2.workspace = true
+# Continuous-batching scheduler, its metrics and the /turbine/v1/scheduler document
+turbine-scheduler.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[dev-dependencies]
+# Validating structured outputs and tool-call arguments in the tiny_server tests
+jsonschema.workspace = true
+# Held-stream clients with a small receive buffer, so an unread stream back-pressures at once
+socket2.workspace = true

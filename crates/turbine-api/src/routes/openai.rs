@@ -91,6 +91,7 @@ async fn generate(
         logprobs: body.logprobs_n(endpoint).is_some(),
         token_ids_as_text: body.return_tokens_as_token_ids == Some(true),
         include_usage: body.include_usage(),
+        choices: body.n(),
         backend: state.inference.clone(),
     };
     let http_request_id = request_id

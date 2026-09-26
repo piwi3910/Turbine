@@ -123,7 +123,8 @@ impl KvLayout {
             * u64::from(self.head_dim)
             * self.dtype.size_bytes() as u64
     }
-    /// One block of `block_tokens` tokens (Llama-3.2-3B, 16 tokens: 1 835 008).
+    /// One block of `block_tokens` tokens (Llama-3.2-3B: 1 835 008 at 16 tokens, 14 680 064 at
+    /// the default 128).
     pub fn block_bytes(&self) -> u64 {
         self.bytes_per_token() * u64::from(self.block_tokens)
     }
@@ -145,6 +146,45 @@ pub struct ModelShape {
     pub tied_embeddings: bool,
     pub weight_bytes: u64,
     pub max_position_embeddings: u32,
+}
+
+/// One sequence (= one choice of a request); an engine-local counter.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SeqId(pub u64);
+
+/// Logical L0 (GPU) KV block id: the block's index in the preallocated pool.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BlockId(pub u32);
+
+/// Request priority (the vLLM `priority` extension): lower is served first; default 0
+/// (CONFLICT C-10).
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct Priority(pub i32);
+
+impl Priority {
+    /// `< 0` High, `0` Normal, `> 0` Low (CONFLICT C-10).
+    pub fn class(self) -> PriorityClass {
+        match self.0 {
+            i32::MIN..=-1 => PriorityClass::High,
+            0 => PriorityClass::Normal,
+            _ => PriorityClass::Low,
+        }
+    }
+}
+
+/// Coarse priority class derived from `Priority` (P4 weights, P6 routing).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PriorityClass {
+    High,
+    Normal,
+    Low,
 }
 
 #[cfg(test)]
@@ -178,6 +218,11 @@ mod tests {
         };
         assert_eq!(layout.bytes_per_token(), 114_688);
         assert_eq!(layout.block_bytes(), 1_835_008);
+        let default_page = KvLayout {
+            block_tokens: 128,
+            ..layout
+        };
+        assert_eq!(default_page.block_bytes(), 14_680_064);
         assert_eq!(ExecutionBackend::Cpu.as_str(), "cpu");
         assert_ne!(RequestId::new_v4(), RequestId::new_v4());
     }

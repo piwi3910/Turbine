@@ -1,28 +1,37 @@
-//! Model startup (P1 §Interfaces, contract §16.3 steps 4–6, 8 and 10): the kernel provider for
+//! Model startup (P1 §Interfaces, contract §16.3 steps 4–6 and 8–10): the kernel provider for
 //! `execution.backend`, the model config, tokenizer and chat template, `model.max_seq_len`, the
-//! kernel registry, the memory budget (all before the listener binds), then the weight load and
-//! the one-token warm-up (after it binds).
+//! kernel registry, the memory budget — weights + the `kv.gpu.max_bytes` block pool + the
+//! executor workspace for `scheduler.max_batch_tokens` + the emergency reserve (P2
+//! Constraints) — all before the listener binds; then the weight load, the KV pool allocation
+//! and the one-token warm-up (after it binds).
 
 use std::fmt;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Instant;
 
-use turbine_core::config::Config;
+use turbine_core::config::{Config, StructuredOutputConfig, ToolCallParserKind};
+use turbine_core::types::SeqId;
 use turbine_core::types::{ExecutionBackend, MemoryKind, Vendor};
 use turbine_device::{DeviceInfo, DeviceInventory};
 use turbine_kernels::{
-    KernelError, KernelMetrics, KernelProvider, KernelRegistry, ProviderId, ShimContext,
-    ShimLibrary, cpu_reference_provider, shim_provider,
+    KernelError, KernelMetrics, KernelProvider, KernelRegistry, OpKind, ProviderId, Selection,
+    ShimContext, ShimLibrary, cpu_reference_provider, shim_provider,
 };
-use turbine_model::executor::{BatchInput, LlamaExecutor, ModelExecutor};
-
+use turbine_kv::metrics::log_pool_startup;
+use turbine_kv::{BlockPool, BlockPoolConfig};
+use turbine_model::executor::{
+    self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, ModelExecutor, SeqSlice, graphs,
+};
+use turbine_model::loader::LoadedWeights;
 use turbine_model::{
-    BudgetTerms, ChatTemplate, GenerationConfig, MAX_STAGING_BYTES, ModelArchConfig, ModelError,
-    ModelMetrics, SafetensorsIndex, Tokenizer, WeightLoader, available_bytes, check_budget,
-    host_mem_available, llama_slots, load_generation_config, load_model_config,
+    Architecture, BudgetTerms, ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES,
+    ModelArchConfig, ModelError, ModelMetrics, SafetensorsIndex, Tokenizer, WeightLoader,
+    WeightSlot, available_bytes, check_budget, host_mem_available, llama_slots,
+    load_generation_config, load_model_config, olmoe_slots,
 };
 use turbine_observability::MetricsRegistry;
+use turbine_scheduler::SchedulerParams;
 use turbine_tensor::DeviceMemory;
 use turbine_tensor::host::HostMemory;
 
@@ -91,12 +100,52 @@ pub fn resolve_max_seq_len(configured: Option<u32>, max_positions: u32) -> Resul
     }
 }
 
+/// `model.tool_call_parser`: `llama3_json` for a `LlamaForCausalLM` whose chat template renders
+/// `tools` when null. A parser is only usable with a template that renders `tools`: a
+/// configured `llama3_json` on any other template resolves to `none` (logged), so `tools`
+/// requests get 400 `tools_not_supported` instead of a prompt that silently lacks them.
+pub fn resolve_tool_call_parser(
+    configured: Option<ToolCallParserKind>,
+    architecture: Architecture,
+    renders_tools: bool,
+) -> ToolCallParserKind {
+    match configured {
+        Some(ToolCallParserKind::None) => ToolCallParserKind::None,
+        Some(kind) if renders_tools => kind,
+        Some(kind) => {
+            tracing::warn!(
+                parser = ?kind,
+                "model.tool_call_parser is set but the chat template does not render tools; \
+                 tool calling is disabled"
+            );
+            ToolCallParserKind::None
+        }
+        None if renders_tools && architecture == Architecture::Llama => {
+            ToolCallParserKind::Llama3Json
+        }
+        None => ToolCallParserKind::None,
+    }
+}
+
+/// The ids that end a generation: `config.json` `eos_token_id`, else
+/// `generation_config.json`'s.
+pub fn eos_token_ids(arch: &ModelArchConfig, generation: &GenerationConfig) -> Vec<u32> {
+    if arch.eos_token_ids.is_empty() {
+        generation.eos_token_ids.to_vec()
+    } else {
+        arch.eos_token_ids.to_vec()
+    }
+}
+
 /// The device-memory backend and kernel providers of `execution.backend`.
 pub struct Provider {
     pub mem: Arc<dyn DeviceMemory>,
     pub providers: Vec<Arc<dyn KernelProvider>>,
     pub order: Vec<ProviderId>,
     pub memory_kind: MemoryKind,
+    /// The context decode graphs capture on: `Some` on a backend whose kernel library exports
+    /// the ABI v2.1 graph functions.
+    pub graphs: Option<Arc<ShimContext>>,
 }
 
 /// Step 4: load the kernel provider. `hip`: the first loadable library of
@@ -130,6 +179,7 @@ pub fn load_provider(
                 providers: vec![cpu_reference_provider()],
                 order: vec![ProviderId("cpu-reference")],
                 memory_kind: MemoryKind::Dedicated,
+                graphs: None,
             })
         }
         ExecutionBackend::Hip => {
@@ -150,11 +200,13 @@ pub fn load_provider(
             );
             let provider = shim_provider(Arc::clone(&ctx));
             let id = provider.id();
+            let graphs = lib.supports_graphs().then(|| Arc::clone(&ctx));
             Ok(Provider {
                 mem: ctx,
                 providers: vec![provider],
                 order: vec![id],
                 memory_kind: device.memory.kind,
+                graphs,
             })
         }
         other => Err(StartupError::new(format!(
@@ -218,6 +270,22 @@ pub struct PreparedModel {
     pub index: SafetensorsIndex,
     pub registry: Arc<KernelRegistry>,
     pub max_seq_len: u32,
+    /// `kv.block_tokens`: the block size of the KV pool.
+    pub block_tokens: u32,
+    /// The L0 block pool `kv.gpu.max_bytes` holds.
+    pub pool: BlockPoolConfig,
+    /// Scheduler bounds; `max_batch_tokens` and `max_running_requests` also size the executor.
+    pub scheduler: SchedulerParams,
+    /// The executor's op sequence (`execution.fused_ops`).
+    pub executor_options: ExecutorOptions,
+    /// `execution.decode_graphs`, and the provider can capture graphs.
+    pub decode_graphs: bool,
+    /// Compiles `response_format` and tool grammars; its token trie is built once, here.
+    pub grammar: Arc<GrammarCompiler>,
+    /// `structured_output` bounds on those grammars.
+    pub structured_output: StructuredOutputConfig,
+    /// The resolved `model.tool_call_parser`.
+    pub tool_call_parser: ToolCallParserKind,
     pub served_name: String,
     pub budget: BudgetTerms,
 }
@@ -260,34 +328,112 @@ pub fn prepare(
     arch.check_supported_weights(&index)
         .map_err(|e| model_error("weights", e))?;
 
+    if !config.kv.gpu.enabled {
+        return Err(StartupError::new(
+            "kv.gpu.enabled is false: the GPU KV tier (the L0 block pool) is required",
+        ));
+    }
+    let block_tokens = config.kv.block_tokens;
+    let executor_options = ExecutorOptions::from_fused_ops(config.execution.fused_ops);
+    // Optional ops (kernel ABI v2.1) join the requirements only when a provider in the
+    // selection order has them; otherwise the executor runs their ABI v2 equivalent.
+    let ordered: Vec<Arc<dyn KernelProvider>> = provider
+        .providers
+        .iter()
+        .filter(|p| provider.order.contains(&p.id()))
+        .cloned()
+        .collect();
+    let mut requirements =
+        executor::available_requirements(&arch, block_tokens, executor_options, &ordered);
+    // Device-side logits reduction (P2c S-4) is optional: only when enabled and a provider
+    // implements it; otherwise the executor copies every row whole.
+    let reduce = executor::logits::reduce_requirement(&arch);
+    if config.execution.device_sampling
+        && ordered.iter().any(|p| reduce.spec.supported_by(p.as_ref()))
+    {
+        requirements.push(reduce);
+    }
     let registry = KernelRegistry::build(
         provider.providers.clone(),
         &provider.order,
-        &LlamaExecutor::requirements(&arch),
+        &requirements,
         &KernelMetrics::register(metrics),
     )
     .map_err(|e| kernel_error("kernel selection", e))?;
+    if let Some(implementation) =
+        paged_attention_fallback(config.execution.backend, registry.selections())
+    {
+        tracing::info!(
+            event = "paged_attention_fallback",
+            block_tokens,
+            "impl" = %implementation,
+            "paged attention is not on CK fmha_fwd_pagedkv: kv.block_tokens is not a multiple of 128"
+        );
+    }
 
+    let decode_graphs = config.execution.decode_graphs && provider.graphs.is_some();
+    if config.execution.decode_graphs && !decode_graphs {
+        tracing::warn!(
+            event = "decode_graphs_unavailable",
+            backend = config.execution.backend.as_str(),
+            "execution.decode_graphs is on but the kernel provider cannot capture graphs \
+             (kernel ABI v2.1 graph functions); decode iterations run eagerly"
+        );
+    }
+
+    let scheduler = SchedulerParams::from_config(config, max_seq_len);
     let device_free = provider
         .mem
         .mem_info()
         .map_err(|e| StartupError::new(format!("device memory info: {e}")))?
         .free_bytes;
-    let budget = BudgetTerms {
-        weights: arch.shape().weight_bytes,
-        kv_reservation: arch
-            .kv_layout(1)
-            .bytes_per_token()
-            .saturating_mul(u64::from(max_seq_len)),
-        workspace: LlamaExecutor::workspace_bytes(&arch, max_seq_len),
-        emergency_reserve: config.reliability.emergency_vram_reserve.0,
-        available: available_bytes(
-            provider.memory_kind,
-            device_free,
-            host_mem_available(Path::new(MEMINFO)),
+    let available = available_bytes(
+        provider.memory_kind,
+        device_free,
+        host_mem_available(Path::new(MEMINFO)),
+    );
+    let weights = arch.shape().weight_bytes;
+    let workspace = executor::workspace_bytes(
+        &arch,
+        block_tokens,
+        scheduler.max_batch_tokens,
+        scheduler.max_running_requests,
+    );
+    let emergency_reserve = config.reliability.emergency_vram_reserve.0;
+    let pool = kv_pool_config(
+        &arch,
+        block_tokens,
+        config.kv.gpu.max_bytes.map(|b| b.0),
+        available.saturating_sub(
+            weights
+                .saturating_add(workspace)
+                .saturating_add(emergency_reserve),
         ),
+        scheduler.max_running_requests,
+    )?;
+    let budget = BudgetTerms {
+        weights,
+        kv_reservation: u64::from(pool.num_blocks) * pool.layout.block_bytes(),
+        workspace,
+        emergency_reserve,
+        available,
     };
     check_budget(&budget).map_err(|e| model_error("startup", e))?;
+
+    let started = Instant::now();
+    let grammar = GrammarCompiler::new(&tokenizer, &eos_token_ids(&arch, &generation))
+        .map(Arc::new)
+        .map_err(|e| model_error("structured output", e))?;
+    let tool_call_parser = resolve_tool_call_parser(
+        config.model.tool_call_parser,
+        arch.architecture,
+        template.renders_tools(),
+    );
+    tracing::info!(
+        token_trie_seconds = started.elapsed().as_secs_f64(),
+        tool_call_parser = ?tool_call_parser,
+        "structured output ready"
+    );
 
     let served_name = config
         .model
@@ -310,62 +456,238 @@ pub fn prepare(
         index,
         registry: Arc::new(registry),
         max_seq_len,
+        block_tokens,
+        pool,
+        scheduler,
+        executor_options,
+        decode_graphs,
+        grammar,
+        structured_output: config.structured_output.clone(),
+        tool_call_parser,
         served_name,
         budget,
     })
 }
 
-/// The loaded, warmed-up executor.
+/// The implementation name the HIP shim reports for CK paged attention.
+const CK_PAGED_ATTENTION: &str = "ck_tile_fmha_pagedkv";
+
+/// The paged-attention implementation of the HIP backend when it is not Composable Kernel's
+/// `fmha_fwd_pagedkv` (CK serves only pages of a multiple of 128 tokens; other sizes run the
+/// slower Turbine kernel), else `None`. Other backends have no CK path to fall back from.
+fn paged_attention_fallback(backend: ExecutionBackend, selections: &[Selection]) -> Option<String> {
+    if backend != ExecutionBackend::Hip {
+        return None;
+    }
+    selections
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.op,
+                OpKind::AttentionPrefillPaged | OpKind::AttentionDecodePaged
+            )
+        })
+        .find(|s| s.implementation != CK_PAGED_ATTENTION)
+        .map(|s| s.implementation.clone())
+}
+
+/// The L0 pool: as many blocks as `max_bytes` (`kv.gpu.max_bytes`) holds, or, when it is null,
+/// as the budget `remainder` after weights, workspace and the emergency reserve holds. At least
+/// one block per running request.
+fn kv_pool_config(
+    arch: &ModelArchConfig,
+    block_tokens: u32,
+    max_bytes: Option<u64>,
+    remainder: u64,
+    max_running: u32,
+) -> Result<BlockPoolConfig, StartupError> {
+    let bytes = max_bytes.unwrap_or(remainder);
+    let pool = BlockPoolConfig::for_bytes(arch.kv_layout(block_tokens), bytes);
+    if pool.num_blocks < max_running {
+        return Err(StartupError::new(format!(
+            "kv.gpu.max_bytes: {bytes} B hold {} KV blocks of {} B; at least one block per \
+             running request (scheduler.max_running_requests = {max_running}) is required",
+            pool.num_blocks,
+            pool.layout.block_bytes()
+        )));
+    }
+    Ok(pool)
+}
+
+/// The weights `arch`'s executor takes.
+fn weight_slots(arch: &ModelArchConfig) -> Result<Vec<WeightSlot>, StartupError> {
+    match arch.architecture {
+        Architecture::Llama => Ok(llama_slots(arch)),
+        Architecture::Olmoe => Ok(olmoe_slots(arch)),
+        other => Err(StartupError::new(format!(
+            "no weight layout for architecture {}",
+            other.as_str()
+        ))),
+    }
+}
+
+/// The one place the server builds a model executor: the architecture's executor for ragged
+/// batches of up to `max_batch_tokens` tokens and `max_seqs` sequences over KV blocks of
+/// `block_tokens` tokens, running the op sequence `options` selects.
+#[allow(clippy::too_many_arguments)]
+pub fn build_executor(
+    arch: &ModelArchConfig,
+    weights: LoadedWeights,
+    registry: Arc<KernelRegistry>,
+    mem: Arc<dyn DeviceMemory>,
+    block_tokens: u32,
+    max_batch_tokens: u32,
+    max_seqs: u32,
+    options: ExecutorOptions,
+) -> Result<Box<dyn ModelExecutor>, ModelError> {
+    executor::build_executor(
+        arch,
+        weights,
+        registry,
+        mem,
+        block_tokens,
+        max_batch_tokens,
+        max_seqs,
+        options,
+    )
+}
+
+/// The loaded, warmed-up executor and the L0 block pool its requests run on.
 pub struct LoadedModel {
-    pub executor: LlamaExecutor,
+    pub executor: Box<dyn ModelExecutor>,
+    pub pool: BlockPool,
     pub weight_bytes: u64,
     pub load_seconds: f64,
 }
 
-/// Steps 8 and 10: upload the weights, build the executor (KV cache for `max_seq_len` tokens)
-/// and run one one-token forward. Records `turbine_model_load_seconds` and
-/// `turbine_model_weight_bytes{format="bf16"}`.
+/// Steps 8–10: upload the weights, build the executor for `prepared`'s scheduler bounds,
+/// allocate the KV block pool and run one one-token forward on a block of it. Records
+/// `turbine_model_load_seconds` and `turbine_model_weight_bytes{format="bf16"}`.
 pub fn load(
-    arch: &ModelArchConfig,
-    index: &SafetensorsIndex,
-    registry: Arc<KernelRegistry>,
-    mem: Arc<dyn DeviceMemory>,
-    max_seq_len: u32,
+    prepared: &PreparedModel,
     warmup_token: u32,
     metrics: &ModelMetrics,
 ) -> Result<LoadedModel, StartupError> {
     let started = Instant::now();
-    let weights = WeightLoader::load(index, &llama_slots(arch), &mem, MAX_STAGING_BYTES)
-        .map_err(|e| model_error("weight load", e))?;
+    let arch = &prepared.arch;
+    let mem = &prepared.provider.mem;
+    let weights = WeightLoader::load(
+        &prepared.index,
+        &weight_slots(arch)?,
+        mem,
+        MAX_STAGING_BYTES,
+    )
+    .map_err(|e| model_error("weight load", e))?;
     let weight_bytes = weights.weight_bytes;
-    let mut executor = LlamaExecutor::new(arch, weights, registry, mem, max_seq_len, max_seq_len)
-        .map_err(|e| model_error("executor", e))?;
-    let logits = executor
-        .forward(&BatchInput {
-            tokens: &[warmup_token],
+    let mut executor = build_executor(
+        arch,
+        weights,
+        Arc::clone(&prepared.registry),
+        Arc::clone(mem),
+        prepared.block_tokens,
+        prepared.scheduler.max_batch_tokens,
+        prepared.scheduler.max_running_requests,
+        prepared.executor_options,
+    )
+    .map_err(|e| model_error("executor", e))?;
+    if let Some(ctx) = prepared
+        .provider
+        .graphs
+        .as_ref()
+        .filter(|_| prepared.decode_graphs)
+    {
+        let backend: Arc<dyn GraphBackend<Graph = _>> = Arc::<ShimContext>::clone(ctx);
+        let capacity = graphs::capacity_for(prepared.scheduler.max_running_requests);
+        executor.set_decode_graphs(Some(DecodeGraphs::new(backend, capacity)));
+        tracing::info!(event = "decode_graphs", capacity, "decode graphs on");
+    }
+    let mut pool = BlockPool::new(prepared.pool, Arc::clone(mem))
+        .map_err(|e| StartupError::new(format!("KV block pool: {e}")))?;
+    log_pool_startup(&pool);
+    warm_up(executor.as_mut(), &mut pool, warmup_token)?;
+    let load_seconds = started.elapsed().as_secs_f64();
+    // Weights and KV are BF16 (`model.dtype`).
+    metrics.record_load(load_seconds, "bf16", weight_bytes);
+    tracing::info!(load_seconds, weight_bytes, "model loaded and warmed up");
+    Ok(LoadedModel {
+        executor,
+        pool,
+        weight_bytes,
+        load_seconds,
+    })
+}
+
+/// One one-token forward on a block borrowed from the pool, which gets it back.
+fn warm_up(
+    exec: &mut dyn ModelExecutor,
+    pool: &mut BlockPool,
+    token: u32,
+) -> Result<(), StartupError> {
+    let blocks = pool
+        .allocate(1)
+        .map_err(|e| StartupError::new(format!("warm-up: {e}")))?;
+    let result = {
+        let view = pool.view();
+        let seqs = [SeqSlice {
+            seq: SeqId(0),
+            q_start: 0,
+            q_len: 1,
+            kv_len: 1,
+            block_table: &blocks,
+            reduce: None,
+        }];
+        exec.forward(&BatchInput {
+            tokens: &[token],
             positions: &[0],
+            seqs: &seqs,
+            kv: &view,
         })
-        .map_err(|e| model_error("warm-up forward", e))?;
+    };
+    pool.release(&blocks);
+    let logits = result.map_err(|e| model_error("warm-up forward", e))?;
     if logits.rows != 1 || logits.data.iter().any(|v| !v.is_finite()) {
         return Err(StartupError::new(format!(
             "warm-up forward: expected one finite logits row, got {} rows",
             logits.rows
         )));
     }
-    let load_seconds = started.elapsed().as_secs_f64();
-    // Weights and KV are BF16 in Phase 1 (`model.dtype`).
-    metrics.record_load(load_seconds, "bf16", weight_bytes);
-    tracing::info!(load_seconds, weight_bytes, "model loaded and warmed up");
-    Ok(LoadedModel {
-        executor,
-        weight_bytes,
-        load_seconds,
-    })
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paged_attention_fallback_only_off_ck_on_hip() {
+        let sel = |op, implementation: &str| Selection {
+            op,
+            config: String::new(),
+            provider: ProviderId("hip"),
+            implementation: implementation.to_string(),
+            reason: String::new(),
+        };
+        let on_ck = [
+            sel(OpKind::Gemm, "hipblaslt"),
+            sel(OpKind::AttentionPrefillPaged, "ck_tile_fmha_pagedkv"),
+            sel(OpKind::AttentionDecodePaged, "ck_tile_fmha_pagedkv"),
+        ];
+        assert_eq!(
+            paged_attention_fallback(ExecutionBackend::Hip, &on_ck),
+            None
+        );
+        let fallback = [
+            sel(OpKind::Gemm, "hipblaslt"),
+            sel(OpKind::AttentionPrefillPaged, "turbine_hip"),
+            sel(OpKind::AttentionDecodePaged, "turbine_hip"),
+        ];
+        assert_eq!(
+            paged_attention_fallback(ExecutionBackend::Hip, &fallback).as_deref(),
+            Some("turbine_hip")
+        );
+        let cpu = [sel(OpKind::AttentionPrefillPaged, "cpu_reference")];
+        assert_eq!(paged_attention_fallback(ExecutionBackend::Cpu, &cpu), None);
+    }
 
     #[test]
     fn served_name_from_hf_snapshot_or_last_component() {
@@ -396,5 +718,36 @@ mod tests {
         let err = resolve_max_seq_len(Some(513), 512).unwrap_err();
         assert!(err.contains("model.max_seq_len 513"), "{err}");
         assert!(resolve_max_seq_len(Some(0), 512).is_err());
+    }
+
+    #[test]
+    fn tool_call_parser_resolution() {
+        use ToolCallParserKind::{Llama3Json, None as NoParser};
+        // Null: llama3_json only for a Llama whose template renders tools.
+        assert_eq!(
+            resolve_tool_call_parser(None, Architecture::Llama, true),
+            Llama3Json
+        );
+        assert_eq!(
+            resolve_tool_call_parser(None, Architecture::Llama, false),
+            NoParser
+        );
+        assert_eq!(
+            resolve_tool_call_parser(None, Architecture::Olmoe, true),
+            NoParser
+        );
+        // Explicit values; a parser needs a template that renders tools.
+        assert_eq!(
+            resolve_tool_call_parser(Some(Llama3Json), Architecture::Olmoe, true),
+            Llama3Json
+        );
+        assert_eq!(
+            resolve_tool_call_parser(Some(Llama3Json), Architecture::Llama, false),
+            NoParser
+        );
+        assert_eq!(
+            resolve_tool_call_parser(Some(NoParser), Architecture::Llama, true),
+            NoParser
+        );
     }
 }

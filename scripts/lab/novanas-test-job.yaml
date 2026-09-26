@@ -7,6 +7,15 @@
 # (`cargo test --no-fail-fast …`, NUL-separated argv) to runs/<run id>/test-command;
 # runs/<run id>/hf-reference exists when --with-hf-reference was given (uv is installed then).
 #
+# Two phases, from this one template (the PHASE placeholder): the script first applies it as the
+# build Job turbine-lab-build-<run id> (phase build, `amd.com/gpu: 0`: no R9700 is claimed while
+# compiling), which syncs the slot, builds the kernels and runs the test command with `--no-run`,
+# records its slot in runs/<run id>/slot and exits; only then does it apply the GPU Job
+# turbine-lab-test-<run id> (phase test), which prefers that slot, so its sync, kernel build and
+# cargo test find everything built and start the tests at once. When another run took the slot in
+# between, the GPU Job simply builds in the slot it got: the build Job only warms a slot, it never
+# decides what the tests run on.
+#
 # Caches (hostPath, all under /home/piwi/turbine-ci/cache, kept between runs):
 #   cargo/{registry,git}  cargo downloads; cargo locks them itself, so all Jobs share them.
 #   apt/{archives,lists}  Debian packages; apt locks them itself.
@@ -14,7 +23,9 @@
 #   slots/test-<n>/{src,target,kernels}  one workspace per concurrent test Job.
 # Concurrency: a Job first takes the flock on slots/test-<n>.lock (n = 0 or 1, one per R9700)
 # and holds it until it exits, then syncs its upload into that slot's src with rsync (only
-# changed files; mtimes kept, so cargo and ninja rebuild only what changed), builds the kernels
+# changed files, found by checksum; those get a fresh mtime and unchanged files keep the slot's,
+# so cargo and ninja rebuild exactly what changed even when the slot's target was built from a
+# newer-dated tree of another checkout — source mtimes are never carried over), builds the kernels
 # in that slot's CMake build dir and runs cargo with that slot's CARGO_TARGET_DIR. Cargo's own
 # target-dir lock would stop two builds from corrupting one shared target, but it serialises the
 # builds and cannot protect a source tree that another run is re-syncing, so each slot has its
@@ -64,16 +75,26 @@ spec:
               # Keep downloaded packages in the shared apt cache; refresh the lists at most every 6 h.
               rm -f /etc/apt/apt.conf.d/docker-clean
               mkdir -p /var/cache/apt/archives/partial /var/lib/apt/lists/partial
-              if [[ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' -mmin -360 -print -quit)" ]]; then
-                apt-get update -qq >/dev/null
-              fi
-              apt-get install -y -qq cmake ninja-build python3 rsync >/dev/null
+              # Concurrent Jobs share the apt cache: one apt run at a time.
+              (
+                flock -w 900 9
+                if [[ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' -mmin -360 -print -quit)" ]]; then
+                  apt-get update -qq >/dev/null
+                fi
+                apt-get install -y -qq cmake ninja-build python3 rsync >/dev/null
+              ) 9>/var/cache/apt/archives/turbine-lab.flock
               cmake --version | head -n 1
 
+              PHASE="$TURBINE_LAB_PHASE"
+              [[ $PHASE == build || $PHASE == test ]]
+
               step "take a workspace slot"
+              # The GPU Job tries the slot its build Job warmed first.
+              PREFERRED=""
+              if [[ $PHASE == test && -f "$RUN_DIR/slot" ]]; then PREFERRED="$(cat "$RUN_DIR/slot")"; fi
               SLOT=""
               for ((waited = 0; waited < 1800; waited += 5)); do
-                for n in $(seq 0 $((TURBINE_LAB_SLOTS - 1))); do
+                for n in $PREFERRED $(seq 0 $((TURBINE_LAB_SLOTS - 1))); do
                   exec {LOCK_FD}>"$TURBINE_LAB_CACHE/slots/test-$n.lock"
                   if flock -n "$LOCK_FD"; then SLOT="test-$n"; break 2; fi
                   exec {LOCK_FD}>&-
@@ -89,12 +110,13 @@ spec:
               echo "lab-step: slot $SLOT (CARGO_TARGET_DIR=$CARGO_TARGET_DIR)"
 
               step "sync the uploaded tree into the slot"
-              rsync -a --delete "$RUN_DIR/src/" "$SLOT_DIR/src/"
+              rsync -rlpc --delete "$RUN_DIR/src/" "$SLOT_DIR/src/"
               mapfile -d '' TEST_CMD < "$RUN_DIR/test-command"
               [[ ${#TEST_CMD[@]} -gt 2 && "${TEST_CMD[0]} ${TEST_CMD[1]}" == "cargo test" ]]
               HF_REFERENCE=0
               [[ -e "$RUN_DIR/hf-reference" ]] && HF_REFERENCE=1
-              rm -rf "$RUN_DIR"
+              # The build Job leaves the upload for the GPU Job.
+              if [[ $PHASE == test ]]; then rm -rf "$RUN_DIR"; fi
               cd "$SLOT_DIR/src"
 
               step "build kernels/rocm"
@@ -116,6 +138,22 @@ spec:
               test -f "$TURBINE_KERNEL_LIBRARY"
               echo "lab-step: built $TURBINE_KERNEL_LIBRARY"
 
+              if [[ $PHASE == build ]]; then
+                # The test command up to its `--`, compiled but not run.
+                BUILD_CMD=()
+                for a in "${TEST_CMD[@]}"; do
+                  [[ "$a" == -- ]] && break
+                  BUILD_CMD+=("$a")
+                done
+                BUILD_CMD+=(--no-run)
+                step "cargo test --no-run"
+                echo "lab-step: ${BUILD_CMD[*]}"
+                "${BUILD_CMD[@]}"
+                echo "${SLOT#test-}" > "$RUN_DIR/slot"
+                echo "lab-step: built in slot $SLOT"
+                exit 0
+              fi
+
               if [[ $HF_REFERENCE -eq 1 ]]; then
                 step "install uv $UV_VERSION"
                 if [[ "$("$UV_INSTALL_DIR/uv" --version 2>/dev/null)" != "uv $UV_VERSION"* ]]; then
@@ -132,6 +170,9 @@ spec:
           env:
             - name: TURBINE_LAB_RUN_ID
               value: "__RUN_ID__"
+            # build: compile only, without a GPU; test: run the tests on the GPU(s).
+            - name: TURBINE_LAB_PHASE
+              value: "__PHASE__"
             - name: TURBINE_LAB_ROOT
               value: /home/piwi/turbine-ci
             - name: TURBINE_LAB_CACHE
@@ -156,6 +197,9 @@ spec:
               value: hip
             - name: TURBINE_TEST_MODEL_DIR
               value: /models/llama-3.2-3b-instruct
+            # OLMoE-1B-7B weights for the Phase 2 MoE tests.
+            - name: TURBINE_TEST_MOE_MODEL_DIR
+              value: /models/olmoe-1b-7b-0125-instruct
             - name: UV_VERSION
               value: 0.11.2
             - name: UV_INSTALL_DIR

@@ -17,6 +17,68 @@ enum Mode {
     FailHalf,
     /// Every completion request answers 500.
     FailAll,
+    /// Chunked SSE written in small TCP writes that split events, lines and multi-byte
+    /// characters (the content is "ü€𝄞" per chunk), then the terminating chunk.
+    Split,
+    /// Chunked SSE with two content chunks, then the connection closes before `[DONE]` and the
+    /// terminating chunk.
+    Truncate,
+}
+
+/// The chunked-encoding frame of `data`.
+fn chunk(data: &[u8]) -> Vec<u8> {
+    let mut out = format!("{:x}\r\n", data.len()).into_bytes();
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// Writes `bytes` in pieces of `step` bytes with a flush and a pause in between, so the client
+/// receives them in separate reads.
+async fn write_split(sock: &mut TcpStream, bytes: &[u8], step: usize) {
+    for piece in bytes.chunks(step) {
+        sock.write_all(piece).await.unwrap();
+        sock.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+async fn respond_chunked(mut sock: TcpStream, truncate: bool) {
+    sock.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let event = |v: &str| format!("data: {v}\n\n").into_bytes();
+    let mut events = vec![event(
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#,
+    )];
+    for _ in 0..3 {
+        events.push(event(
+            r#"{"choices":[{"index":0,"delta":{"content":"ü€𝄞"}}]}"#,
+        ));
+    }
+    if truncate {
+        let body: Vec<u8> = events[..3].concat();
+        sock.write_all(&chunk(&body)).await.unwrap();
+        sock.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Closed mid-body: no [DONE], no terminating chunk.
+        return;
+    }
+    events.push(event(
+        r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}"#,
+    ));
+    events.push(event("[DONE]"));
+    // One HTTP chunk per two events, each HTTP chunk cut in 3-byte TCP writes: events, lines,
+    // chunk-size lines and every multi-byte character get split between reads.
+    let mut wire = Vec::new();
+    for pair in events.chunks(2) {
+        wire.extend(chunk(&pair.concat()));
+    }
+    wire.extend_from_slice(b"0\r\n\r\n");
+    write_split(&mut sock, &wire, 3).await;
+    sock.shutdown().await.ok();
 }
 
 /// Read one request (headers + Content-Length body) and return its request line.
@@ -67,6 +129,8 @@ async fn respond(mut sock: TcpStream, mode: Mode, counter: Arc<AtomicUsize>) {
     let fail = match mode {
         Mode::FailAll => true,
         Mode::FailHalf => n.is_multiple_of(2),
+        Mode::Split => return respond_chunked(sock, false).await,
+        Mode::Truncate => return respond_chunked(sock, true).await,
         Mode::Stream { .. } => false,
     };
     if fail {
@@ -226,4 +290,55 @@ async fn failures_counted() {
     assert_eq!(code, Some(1));
     assert_eq!(r["requests_ok"], 0, "{r}");
     assert_eq!(r["requests_failed"], 3, "{r}");
+}
+
+/// Events, SSE lines, chunk-size lines and multi-byte characters split across TCP reads are
+/// reassembled: every request succeeds with its three content chunks.
+#[tokio::test(flavor = "multi_thread")]
+async fn split_events_and_multibyte_characters() {
+    let addr = mock_server(Mode::Split).await;
+    let (code, r, stderr) = run_bench(args(
+        addr,
+        &[
+            "--model",
+            "m",
+            "--concurrency",
+            "4",
+            "--requests",
+            "8",
+            "--endpoint",
+            "chat",
+        ],
+    ))
+    .await;
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(r["requests_ok"], 8, "{r}\n{stderr}");
+    assert_eq!(r["requests_failed"], 0, "{r}\n{stderr}");
+    let tokens =
+        r["output_token_throughput"].as_f64().unwrap() * r["wall_seconds"].as_f64().unwrap();
+    assert!((tokens - 24.0).abs() < 1e-6, "{r}");
+}
+
+/// A body cut off by the peer is a failed request whose message names the transport cause
+/// under reqwest's "error decoding response body", and how far the stream got.
+#[tokio::test(flavor = "multi_thread")]
+async fn truncated_stream_reports_the_transport_cause() {
+    let addr = mock_server(Mode::Truncate).await;
+    let (code, r, stderr) = run_bench(args(
+        addr,
+        &["--model", "m", "--requests", "1", "--endpoint", "chat"],
+    ))
+    .await;
+    assert_eq!(code, Some(1), "stderr: {stderr}");
+    assert_eq!(r["requests_failed"], 1, "{r}");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("request 0 failed"))
+        .unwrap_or_else(|| panic!("no failure line: {stderr}"));
+    let prefix = "reading stream after 2 content chunks: error decoding response body: ";
+    let cause = line
+        .split_once(prefix)
+        .unwrap_or_else(|| panic!("{prefix:?} missing: {line}"))
+        .1;
+    assert!(!cause.trim().is_empty(), "no transport cause: {line}");
 }

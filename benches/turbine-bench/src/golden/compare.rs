@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use super::fixture::{ReferenceRecord, Tolerance};
+use super::fixture::{LogprobBounds, ReferenceRecord, Tolerance};
 
 /// A reference top-k id absent from the candidate's top list at a compared position.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -136,16 +136,25 @@ pub struct CompareReport {
     pub prompts_passing: usize,
     pub prompts_total: usize,
     pub passed: bool,
+    /// The tolerance file as read (batched keys included when present).
     pub tolerance: Tolerance,
+    /// Prompts in flight at once during the run.
+    pub concurrency: usize,
+    /// The logprob bounds the prompts were judged by: strict at concurrency 1, the tolerance's
+    /// batched bounds above it (`batched` says whether one applied).
+    pub logprob_bounds: LogprobBounds,
 }
 
 impl CompareReport {
-    pub fn new(prompts: Vec<PromptVerdict>, tolerance: &Tolerance) -> Self {
+    /// `prompts` must have been judged with `tolerance.at_concurrency(concurrency)`.
+    pub fn new(prompts: Vec<PromptVerdict>, tolerance: &Tolerance, concurrency: usize) -> Self {
         Self {
             prompts_passing: prompts.iter().filter(|v| v.passed).count(),
             prompts_total: prompts.len(),
             passed: judge(&prompts, tolerance),
             tolerance: tolerance.clone(),
+            concurrency,
+            logprob_bounds: tolerance.logprob_bounds(concurrency),
             prompts,
         }
     }
@@ -179,15 +188,21 @@ impl CompareReport {
         }
         let bound_held = self.prompts.iter().all(|v| v.logprob_within_bound);
         out.push_str(&format!(
-            "{}: {}/{} prompts passing (need {}); |Δ logprob| over top-{} ≤ {} (reference logprob > {}) and ≤ {} (tail) on every prompt: {}\n",
+            "{}: {}/{} prompts passing (need {}); {} bounds (concurrency {}): |Δ logprob| over top-{} ≤ {} (reference logprob > {}) and ≤ {} (tail) on every prompt: {}\n",
             if self.passed { "PASS" } else { "FAIL" },
             self.prompts_passing,
             self.prompts_total,
             self.tolerance.min_prompts_passing,
+            if self.logprob_bounds.batched {
+                "batched"
+            } else {
+                "strict"
+            },
+            self.concurrency,
             self.tolerance.top_k,
-            self.tolerance.max_abs_logprob_diff_likely,
+            self.logprob_bounds.max_abs_logprob_diff_likely,
             self.tolerance.likely_logprob_floor,
-            self.tolerance.max_abs_logprob_diff_tail,
+            self.logprob_bounds.max_abs_logprob_diff_tail,
             if bound_held { "yes" } else { "no" },
         ));
         out
@@ -207,6 +222,8 @@ mod tests {
             max_abs_logprob_diff_tail: 0.55,
             likely_logprob_floor: -2.0,
             margin_nats: 0.5,
+            max_abs_logprob_diff_likely_batched: None,
+            max_abs_logprob_diff_tail_batched: None,
         }
     }
 

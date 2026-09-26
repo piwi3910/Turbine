@@ -296,3 +296,94 @@
 - Merge locally only, no push yet
 
 **Answer (2026-09-26):** merge and push — fast-forward main to phase-1-single-request and push main to origin.
+
+## Phase 2 lab work on novanas (standing approval), OLMoE weights, vLLM-ROCm baseline
+
+- Standing approval for Phase 2 novanas lab Jobs (HIP v2 build, GPU tests, serve Jobs, golden --concurrency 16, baseline, overload), same rules as Phase 1 (recommended)
+- Ask before each run
+- Download OLMoE-1B-7B-0125-Instruct to novanas with the user's logged-in hf CLI and build the OLMoE golden reference there on CPU (recommended)
+- The user downloads it
+- Record a vLLM-ROCm baseline Job on one R9700 alongside Turbine (recommended)
+- Turbine baseline only
+
+**Answers (2026-09-26):** standing approval for Phase 2 novanas lab Jobs while its R9700s are free (stop and ask if another workload holds `amd.com/gpu`; always `--stop` serve Jobs); Claude downloads `allenai/OLMoE-1B-7B-0125-Instruct` at revision `b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e` (ungated) into `/home/piwi/turbine-models/olmoe-1b-7b-0125-instruct` with the hf CLI the user logged in on novanas (the token is never read or passed); the vLLM-ROCm baseline Job runs.
+
+## Performance phase between Phase 2 and Phase 3
+
+**Answer (2026-09-26, user):** after Phase 2 is complete and before Phase 3, a performance-optimization phase runs. Turbine does not need to beat vLLM, but must reach at least 75% of vLLM-ROCm's performance on the same hardware. Recorded vLLM-ROCm reference (rocm/vllm rocm7.14.1 RDNA image, vLLM 0.23.0, one R9700, `turbine-bench --concurrency 16 --requests 200 --prompt-words 512 --max-tokens 256 --ignore-eos`): Llama-3.2-3B-Instruct 738 output tok/s (ITL p50 17 ms, TTFT p50 338 ms); OLMoE-1B-7B-0125-Instruct 535 output tok/s (ITL p50 27 ms, TTFT p50 201 ms). Targets: ≥ 553 and ≥ 401 output tok/s, golden correctness unchanged. Turbine Phase 2 engine at first measurement: Llama 92 tok/s (decode forward ~47 ms at batch 16, ~115 ms host overhead per iteration).
+
+## Phase 2c: lab approval, GEMM autotune default, GPU sampling
+
+- Standing approval for Phase 2c novanas lab Jobs, same rules as Phases 1–2 (recommended) / ask each time
+- `execution.gemm_autotune` on by default (recommended) / off by default
+- GPU sampling (`execution.device_sampling`) on by default (recommended) / host sampling only
+
+**Answers (2026-09-26):** standing approval for Phase 2c novanas lab Jobs (builds, GPU tests, serve Jobs, Turbine and vLLM benchmark runs; stop and ask if another workload holds `amd.com/gpu`; always stop serve Jobs); GEMM autotune on by default (outputs may differ across restarts at BF16 noise level, within golden tolerance; `false` restores restart-stable output); GPU sampling on by default (seeded sampling reproducible run to run, may differ from host sampling at rare probability boundaries; greedy/golden unaffected).
+
+## Default KV page size (kv.block_tokens): 16 or 128?
+
+- 128 tokens: both paged-attention paths run on Composable Kernel (`fmha_fwd_pagedkv`); measured decode forward at batch 16 ~33 ms → ~17 ms on the R9700; golden 16/16, tiny hip_matches_cpu 3.8e-6 (recommended)
+- Keep 16 and tune the Turbine paged kernel (no vendor kernel accepts pages < 128 on gfx1201: CK `fmha_batch_prefill` builds for gfx9 only; pagedkv/splitkv/appendkv need 128-aligned pages)
+
+**Answer (2026-09-26):** 128 tokens — reuse CK. The Turbine 16-token kernel stays only as the fallback for other page sizes. Applied in Phase 2c (after Phase 2 closes). Trade-offs accepted: ~64 tokens of KV wasted per sequence on average, prefix sharing (Phase 4) in 128-token units, larger `copy_blocks` forks.
+
+## Phase 3: RED pressure admission under sustained overload
+
+- Refill finished slots: RED blocks growth but queued requests may replace finished ones (running count never rises; KV bounded by reservation) (recommended)
+- Keep RED admit-nothing (as specified; simulator: 10× overload for 600 s served 16 requests, queue drained only by timeouts)
+- Refill at a reduced rate
+
+**Answer (2026-09-26):** refill finished slots — in RED, admission may replace completed requests from the queue (no net growth of running requests, KV within the worst-case reservation); Phase 3 spec/plan to be amended when Phase 3 opens (run-ahead branch `runahead/p3-reliability` implements admit-nothing today).
+
+## tool_choice "auto": constrained or free?
+
+- Constrain with an llguidance grammar `start: text | calls` — free text allowed, but once a call starts its name and arguments are schema-enforced (recommended)
+- Keep auto unconstrained (vLLM default); invalid arguments possible
+
+**Answer (2026-09-26):** constrain `auto` with the `text | calls` grammar (S-18 amended). Also accepted: constrained JSON allows natural whitespace bounded to 16 characters between tokens (S-17 amended; the compact-only rule degraded Llama's output, e.g. `{"name":": "}`).
+
+## OLMoE golden gate (5/16 with the Llama tolerance)
+
+- Match the router (BF16 router logits, torch top-k tie-breaking), then calibrate OLMoE's tolerance to transformers' own variant spread (sdpa/eager, BF16/FP32) over the 16 prompts (recommended)
+- Calibrate only
+- Looser fixed gate for MoE
+
+**Answer (2026-09-26):** match the router, then calibrate. Evidence: Turbine's OLMoE semantics match transformers 4.57.1 `modeling_olmoe.py`; the cpu-reference path drifts as far as HIP (p14 likely 0.368 / tail 0.906); transformers against its own reference exceeds 0.15/0.55 when only attention (eager) or precision (FP32) changes, because top-8-of-64 routing flips on BF16 rounding. OLMoE's `tolerance.json` becomes the measured transformers self-spread; the Llama tolerance is unchanged.
+
+## Golden at concurrency 16: strict or batched bound?
+
+- Concurrency 1 strict (full rule, 16/16 within bounds) + concurrency 16 token rule (≥ 14/16 identical prefixes) with a looser batched logprob bound, reported every run (recommended)
+- Concurrency 16 strict, best of 3
+- Keep concurrency 16 strict
+
+**Answer (2026-09-26):** concurrency 1 is the strict gate; concurrency 16 must pass the token rule with a looser batched logprob bound (batch composition changes GEMM rounding: p14 likely Δ ranged 0.066–0.178 across runs with identical tokens). Applies to Phase 2 acceptance and every later golden run.
+
+## Multi-model runtime (GPU-owning engine, models as workloads): write an analysis brief?
+
+- Yes: a procoder analysis brief with options, risks (failure isolation, noisy neighbours, fragmentation) and a proposed phase placement (control plane + multi-model after Phase 3; shared KV arena, fractional compute via CU masks, model tiering alongside Phases 4–6) (recommended)
+- Not now: finish Phase 2 / 2c integration first, revisit later
+- Go straight to a spec for a new phase
+
+**Answer (2026-09-26):** write a procoder analysis brief first (options, risks, proposed phase placement); decide placement before any spec.
+
+## Multi-model runtime: placement and first experiment
+
+- Option A, staged, with a control-plane process supervising one worker process per GPU: new Phase 3b (after Phase 3) for the /turbine/v1/models API, fit check, placement, several models per GPU with per-model KV pools and quotas, and a fair-share GPU scheduler; shared KV arena and weight tiering in Phase 4; CU-mask fractional compute and multi-model packing in Phase 5; cluster placement in Phase 6 (recommended)
+- Option B: one new phase after Phase 8
+- Option C: keep one model per process, orchestrate processes via a control plane only
+- First experiment: two turbine-server processes sharing one R9700 (needs lab approval beyond Phase 2c)
+
+**Answer (2026-09-26):** not decided yet — more research needed; continue the original phase plan for now. No experiment on novanas.
+
+## Closing Phase 2: macOS acceptance build and merge
+
+- Run the Phase 2 S-1 acceptance once on the Mac (cargo build/test/clippy/fmt on macOS arm64, ~12 GB target, deleted afterwards) (recommended)
+- Accept the novanas (Linux) workspace run instead and amend S-1
+- Merge `phase-2c-performance` (Phase 2 + the measured Phase 2c work) into main and push once Phase 2 criteria pass (recommended)
+- Merge only Phase 2 (`phase-2-serving-runtime` + its later fixes) and keep Phase 2c on its branch
+
+**Answers (2026-09-26):** S-1 is satisfied by the novanas (Linux) workspace run via scripts/remote-cargo.sh (spec amended; the Mac no longer builds). When Phase 2 passes, merge phase-2c-performance (Phase 2 + the measured Phase 2c work) into main and push; Phase 2c stays open for its remaining tasks.
+
+## NVIDIA (Phase 2b and every Spark / CUDA item) on hold
+
+**Decision (2026-09-26, user):** no NVIDIA work in the plan for now. Phase 2b and every CUDA / DGX Spark item in later phases (Spark lab runs, CUDA kernels, cross-host runs with the Sparks) are on hold, to be revisited after everything works well on novanas. Order after Phase 2 / 2c: Phase 3 next. The run-ahead branch `runahead/p2b-nvidia` is kept as is, not integrated.

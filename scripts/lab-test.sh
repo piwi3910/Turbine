@@ -21,7 +21,10 @@
 #   Phase 0 inventory check needs 2. The tree and the test command (NUL-separated argv) are
 #   uploaded to /home/piwi/turbine-ci/runs/<run id>; the Job syncs the tree into a cached
 #   workspace slot (see the template for the cache layout and the per-slot target dirs).
-#   Ctrl-C or a failed start deletes this run's Job and nothing else; `--stop <run-id>` does the
+#   The same template first runs GPU-less as turbine-lab-build-<run id>, which compiles the
+#   kernels and the test binaries (`--no-run`) into a slot, so the GPU Job holds its R9700 only
+#   for the tests themselves.
+#   Ctrl-C or a failed start deletes this run's Jobs and nothing else; `--stop <run-id>` does the
 #   same for a run started elsewhere.
 # --dry-run prints every command that would contact the host (and the rendered Job) instead of
 #   running it.
@@ -121,6 +124,8 @@ NS=turbine-ci
 RUN_ID="$(date -u +%m%d%H%M%S)-$(printf '%08x' $(((RANDOM << 15) | RANDOM)))"
 [[ $MODE == stop ]] && RUN_ID="$STOP_RUN"
 JOB="turbine-lab-test-${RUN_ID}"
+# The GPU-less build Job that compiles into a slot before the GPU Job runs.
+BUILD_JOB="turbine-lab-build-${RUN_ID}"
 RUN_DIR="${CI_ROOT}/runs/${RUN_ID}"
 
 fail() {
@@ -177,7 +182,7 @@ kube() {
 
 upload_tree() {
 	say "syncing working tree to ${1}"
-	run rsync -az --delete --exclude target/ --exclude .git/ --exclude .claude/ \
+	run rsync -rlpcz --delete --exclude target/ --exclude .git/ --exclude .claude/ \
 		-e "ssh ${SSH_OPTS[*]}" "${REPO_ROOT}/" "${REMOTE}:${1}/" ||
 		fail "rsync to ${REMOTE}:${1} failed"
 }
@@ -212,37 +217,45 @@ run_spark() {
 	esac
 }
 
-# Deletes this run's Job and upload, nothing else.
+# Deletes this run's Jobs and upload, nothing else.
 cleanup_novanas() {
-	kube "-n ${NS} delete job ${JOB} --ignore-not-found" >/dev/null || true
+	kube "-n ${NS} delete job ${BUILD_JOB} ${JOB} --ignore-not-found" >/dev/null || true
 	remote "rm -rf ${RUN_DIR}" || true
 }
 
 on_interrupt() {
 	trap - INT TERM
-	echo "lab-test: ${HOST}: interrupted; deleting job ${JOB}" >&2
+	echo "lab-test: ${HOST}: interrupted; deleting jobs ${BUILD_JOB} ${JOB}" >&2
 	cleanup_novanas
 	exit 130
 }
 
+# render_job build|test: the template as the GPU-less build Job or the GPU test Job.
 render_job() {
-	sed -e "s/__RUN_ID__/${RUN_ID}/g" -e "s/__GPUS__/${GPUS}/g" \
-		"${REPO_ROOT}/scripts/lab/novanas-test-job.yaml"
+	local gpus="$GPUS" rename=()
+	if [[ $1 == build ]]; then
+		gpus=0
+		rename=(-e "s/turbine-lab-test-__RUN_ID__/${BUILD_JOB}/" -e "s/turbine-lab-role: test/turbine-lab-role: build/")
+	fi
+	sed "${rename[@]+"${rename[@]}"}" -e "s/__RUN_ID__/${RUN_ID}/g" -e "s/__GPUS__/${gpus}/g" \
+		-e "s/__PHASE__/$1/g" "${REPO_ROOT}/scripts/lab/novanas-test-job.yaml"
 }
 
+# wait_for_pod <job> <gpus>: until its pod runs; an unschedulable GPU pod is given up after 120 s.
 wait_for_pod() {
+	local job="$1" gpus="$2"
 	if [[ $DRY_RUN -eq 1 ]]; then
-		echo "+ wait until pod job-name=${JOB} runs (unschedulable limit 120 s)"
+		echo "+ wait until pod job-name=${job} runs (unschedulable limit 120 s)"
 		return
 	fi
 	local waited=0 phase="" unschedulable=""
 	while :; do
-		phase="$(kube "-n ${NS} get pods -l job-name=${JOB} -o jsonpath='{.items[*].status.phase}'" || true)"
+		phase="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.phase}'" || true)"
 		[[ "$phase" == Running || "$phase" == Succeeded || "$phase" == Failed ]] && return 0
-		unschedulable="$(kube "-n ${NS} get pods -l job-name=${JOB} -o jsonpath='{.items[*].status.conditions[?(@.reason==\"Unschedulable\")].message}'" || true)"
+		unschedulable="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.conditions[?(@.reason==\"Unschedulable\")].message}'" || true)"
 		if [[ -n "$unschedulable" && $waited -ge 120 ]]; then
 			cleanup_novanas
-			fail "pod unschedulable for 120 s (${unschedulable}); ${GPUS} amd.com/gpu is not free — another workload holds it; ask the user"
+			fail "pod unschedulable for 120 s (${unschedulable}); ${gpus} amd.com/gpu is not free — another workload holds it; ask the user"
 		fi
 		if [[ $waited -ge 1800 ]]; then
 			cleanup_novanas
@@ -253,28 +266,40 @@ wait_for_pod() {
 	done
 }
 
+# wait_for_result <job> <what>: 0 when the Job succeeded; otherwise fails with its exit code.
 wait_for_result() {
+	local job="$1" what="$2"
 	if [[ $DRY_RUN -eq 1 ]]; then
-		echo "+ wait until job ${JOB} succeeds or fails; exit with the test exit code"
-		say "dry run: nothing contacted"
+		echo "+ wait until job ${job} succeeds or fails; a failure exits with its exit code"
 		return
 	fi
 	# The Job has activeDeadlineSeconds (5400), so it always reaches a terminal state.
 	local succeeded="" failed=""
 	while :; do
-		succeeded="$(kube "-n ${NS} get job ${JOB} -o jsonpath='{.status.succeeded}'" || true)"
-		failed="$(kube "-n ${NS} get job ${JOB} -o jsonpath='{.status.failed}'" || true)"
+		succeeded="$(kube "-n ${NS} get job ${job} -o jsonpath='{.status.succeeded}'" || true)"
+		failed="$(kube "-n ${NS} get job ${job} -o jsonpath='{.status.failed}'" || true)"
 		[[ "$succeeded" == 1 || -n "$failed" ]] && break
 		sleep 5
 	done
-	if [[ "$succeeded" == 1 ]]; then
-		say "PASS (job ${JOB})"
-		return 0
-	fi
+	[[ "$succeeded" == 1 ]] && return 0
 	local code
-	code="$(kube "-n ${NS} get pods -l job-name=${JOB} -o jsonpath='{.items[*].status.containerStatuses[0].state.terminated.exitCode}'" || true)"
+	code="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.containerStatuses[0].state.terminated.exitCode}'" || true)"
 	[[ "$code" =~ ^[0-9]+$ && "$code" -ne 0 ]] || code=1
-	fail "tests failed (exit ${code}, job ${JOB})" "$code"
+	[[ "$what" == build ]] && remote "rm -rf ${RUN_DIR}" || true
+	fail "${what} failed (exit ${code}, job ${job})" "$code"
+}
+
+# apply_and_follow build|test <job> <gpus>: applies the rendered Job, streams its log, waits.
+apply_and_follow() {
+	local phase="$1" job="$2" gpus="$3" what=tests
+	[[ $phase == build ]] && what=build
+	say "applying scripts/lab/novanas-test-job.yaml as ${job} (${gpus} GPU(s))"
+	render_job "$phase" | remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" ||
+		fail "kubectl apply failed"
+	wait_for_pod "$job" "$gpus"
+	say "streaming pod log of ${job}"
+	kube "-n ${NS} logs -f job/${job}" || echo "lab-test: ${HOST}: log stream ended with an error" >&2
+	wait_for_result "$job" "$what"
 }
 
 run_novanas() {
@@ -292,19 +317,19 @@ run_novanas() {
 	remote "command -v kubectl >/dev/null" || fail "kubectl is not available on ${HOST}"
 	kube "create namespace ${NS} --dry-run=client -o yaml | kubectl apply -f - >/dev/null" ||
 		fail "cannot create namespace ${NS}"
-	say "applying scripts/lab/novanas-test-job.yaml as ${JOB}"
-	render_job | remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" ||
-		fail "kubectl apply failed"
-
-	wait_for_pod
-	say "streaming pod log"
-	kube "-n ${NS} logs -f job/${JOB}" || echo "lab-test: ${HOST}: log stream ended with an error" >&2
-	wait_for_result
+	# Compile without a GPU claim, then hold the R9700(s) only while the tests run.
+	apply_and_follow build "$BUILD_JOB" 0
+	apply_and_follow test "$JOB" "$GPUS"
+	if [[ $DRY_RUN -eq 1 ]]; then
+		say "dry run: nothing contacted"
+	else
+		say "PASS (job ${JOB})"
+	fi
 }
 
 stop_novanas() {
-	say "deleting job ${JOB} in namespace ${NS}"
-	kube "-n ${NS} delete job ${JOB} --ignore-not-found --wait=true" || fail "cannot delete job ${JOB}"
+	say "deleting jobs ${BUILD_JOB} ${JOB} in namespace ${NS}"
+	kube "-n ${NS} delete job ${BUILD_JOB} ${JOB} --ignore-not-found --wait=true" || fail "cannot delete jobs ${BUILD_JOB} ${JOB}"
 	remote "rm -rf ${RUN_DIR}" || fail "cannot remove ${RUN_DIR}"
 	if [[ $DRY_RUN -eq 1 ]]; then say "dry run: nothing contacted"; else say "stopped"; fi
 }

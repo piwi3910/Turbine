@@ -1,16 +1,36 @@
-# Development configuration: the TS §15 example plus the Phase 0 logging/devices sections and
-# the Phase 1 execution section. From Phase 1 turbine-server loads model.path at startup (exit 1
-# unless it is a directory holding config.json); point it at real weights with
-# --set model.path=<dir>. --check-config validates this file without reading the model.
+# Development configuration: the TS §15 example plus the Phase 0 logging/devices sections, the
+# Phase 1 execution section, the Phase 2 timeout, scheduler, KV and structured-output keys and the
+# Phase 2c execution switches (spelled out at their defaults). From Phase 1 turbine-server loads
+# model.path at startup (exit 1 unless it is a directory holding config.json); point it at real
+# weights with --set model.path=<dir>. --check-config validates this file without reading the
+# model.
 server:
   listen: 127.0.0.1:8000
   max_request_bytes: 8MiB
+  # Durations are <integer><ms|s|m|h>. Total request deadline (504 request_timeout).
+  request_timeout: 600s
+  # How long a request may stay paused on a full output channel before it is cancelled.
+  slow_client_timeout: 30s
+  # Drain time for running requests after SIGINT/SIGTERM.
+  shutdown_grace: 30s
 model:
   path: /models/llama-3.2-3b-instruct
   dtype: bf16
+  # null: <org>/<name> for a Hugging Face snapshot path, else the last path component.
+  served_name: null
+  # null: min(32768, max_position_embeddings).
+  max_seq_len: null
+  # llama3_json or none; null: llama3_json for LlamaForCausalLM whose chat template renders
+  # tools, else none.
+  tool_call_parser: null
 kv:
-  block_tokens: 16
-  gpu: { enabled: true }
+  # Tokens per KV page. On HIP, a multiple of 128 runs paged attention on Composable Kernel
+  # fmha_fwd_pagedkv; any other size falls back to the slower Turbine kernel.
+  block_tokens: 128
+  gpu:
+    enabled: true
+    # L0 (GPU) block-pool size.
+    max_bytes: 8GiB
   cpu:
     enabled: true
     max_bytes: 64GiB
@@ -22,8 +42,23 @@ reliability:
   emergency_vram_reserve: 2GiB
   adaptive_admission: true
 scheduler:
+  # false forces one running request.
   continuous_batching: true
+  # false rejects prompts longer than max_batch_tokens at submission.
   chunked_prefill: true
+  max_running_requests: 64
+  # Per-iteration token budget (decodes + prefill chunks).
+  max_batch_tokens: 8192
+  prefill_chunk_tokens: 2048
+  # Waiting-queue bound (429 queue_full once full) and HTTP-to-engine submission-channel capacity.
+  max_queued_requests: 256
+  # Longest wait in the queue before 503 queue_timeout.
+  queue_timeout: 60s
+structured_output:
+  # Largest accepted response_format JSON schema or tool-definition JSON (1KiB..1MiB).
+  max_schema_bytes: 64KiB
+  # Longest grammar compilation before 400 invalid_json_schema.
+  compile_timeout: 5s
 distributed:
   enabled: false
 logging:
@@ -41,3 +76,18 @@ execution:
   # null: TURBINE_KERNEL_LIBRARY, then libturbine_hip.so beside the executable, then the loader
   # path.
   kernel_library: null
+  # Phase 2c switches: each defaults to the optimised path; false restores the Phase 2 one.
+  # Time the GEMM algorithm candidates per shape at first use and keep the fastest (false: the
+  # first heuristic answer, stable across restarts). Ignored by the cpu backend.
+  gemm_autotune: true
+  # Capture decode-only iterations into a graph per batch size and replay them. Ignored when the
+  # kernel library lacks the graph functions.
+  decode_graphs: true
+  # Reduce logits rows on the device (top-n, log-sum-exp, categorical draw) when the request
+  # allows it, instead of copying the full vocabulary row to the host.
+  device_sampling: true
+  # Fused QKV and gate/up projections and the fused residual add + RMSNorm.
+  fused_ops: true
+  # Threads sampling rows in parallel (1..=64; 1 is serial); the engine uses at most the host's
+  # available parallelism minus one.
+  sampler_threads: 4

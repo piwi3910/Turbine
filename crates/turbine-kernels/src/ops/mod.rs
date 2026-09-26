@@ -7,8 +7,8 @@
 //! context's compute stream (contract §9.2).
 use std::fmt;
 
-use turbine_core::types::DType;
-use turbine_tensor::TensorView;
+use turbine_core::types::{BlockId, DType};
+use turbine_tensor::{DeviceSlice, TensorView};
 
 use crate::KernelError;
 
@@ -25,10 +25,19 @@ pub enum OpKind {
     SiluMul,
     Embedding,
     Add,
+    AttentionPrefillPaged,
+    AttentionDecodePaged,
+    CopyBlocks,
+    MoeRoute,
+    MoeExperts,
+    /// ABI v2.1 (optional in a shim library).
+    AddRmsnorm,
+    /// ABI v2.1 (optional in a shim library).
+    LogitsReduce,
 }
 
 impl OpKind {
-    /// Every op of the current ABI version, in header order.
+    /// Every op of the current ABI version (v2.1 included), in header order.
     pub const ALL: &'static [OpKind] = &[
         OpKind::Gemm,
         OpKind::AttentionPrefill,
@@ -38,6 +47,13 @@ impl OpKind {
         OpKind::SiluMul,
         OpKind::Embedding,
         OpKind::Add,
+        OpKind::AttentionPrefillPaged,
+        OpKind::AttentionDecodePaged,
+        OpKind::CopyBlocks,
+        OpKind::MoeRoute,
+        OpKind::MoeExperts,
+        OpKind::AddRmsnorm,
+        OpKind::LogitsReduce,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -50,6 +66,13 @@ impl OpKind {
             OpKind::SiluMul => "silu_mul",
             OpKind::Embedding => "embedding",
             OpKind::Add => "add",
+            OpKind::AttentionPrefillPaged => "attention_prefill_paged",
+            OpKind::AttentionDecodePaged => "attention_decode_paged",
+            OpKind::CopyBlocks => "copy_blocks",
+            OpKind::MoeRoute => "moe_route",
+            OpKind::MoeExperts => "moe_experts",
+            OpKind::AddRmsnorm => "add_rmsnorm",
+            OpKind::LogitsReduce => "logits_reduce",
         }
     }
 }
@@ -105,8 +128,22 @@ impl fmt::Display for GemmConfig {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[non_exhaustive]
 pub enum AttentionKind {
+    /// Contiguous per-sequence KV (Phase 1).
     Prefill,
     Decode,
+    /// Ragged batch over the paged KV pool; the config carries `block_tokens`.
+    PrefillPaged,
+    DecodePaged,
+}
+
+impl AttentionKind {
+    /// True for the kinds that append to and read the paged KV pool.
+    pub fn is_paged(self) -> bool {
+        matches!(
+            self,
+            AttentionKind::PrefillPaged | AttentionKind::DecodePaged
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -128,6 +165,8 @@ impl AttentionConfig {
         match self.kind {
             AttentionKind::Prefill => OpKind::AttentionPrefill,
             AttentionKind::Decode => OpKind::AttentionDecode,
+            AttentionKind::PrefillPaged => OpKind::AttentionPrefillPaged,
+            AttentionKind::DecodePaged => OpKind::AttentionDecodePaged,
         }
     }
 }
@@ -232,6 +271,125 @@ impl fmt::Display for ElementwiseConfig {
     }
 }
 
+/// Block fork across every layer of the KV pool (`copy_blocks`, `n > 1`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct KvCopyConfig {
+    pub num_layers: u32,
+    /// Bytes of one block within one layer.
+    pub block_bytes: u64,
+}
+
+impl fmt::Display for KvCopyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "num_layers={} block_bytes={}",
+            self.num_layers, self.block_bytes
+        )
+    }
+}
+
+/// MoE router: softmax over `num_experts` F32 logits, top-`top_k` selected as PyTorch's CPU
+/// `torch.topk` selects ([`crate::torch_topk`]), optional renormalisation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct MoeRouteConfig {
+    pub num_experts: u32,
+    pub top_k: u32,
+    /// Divide the selected weights by their sum (`norm_topk_prob`; false for OLMoE-1B-7B).
+    pub renormalize: bool,
+    /// Round each logit to BF16 (round to nearest even) before the softmax: the router GEMM
+    /// output of a BF16 model in transformers (`self.gate(hidden_states)` is a BF16 linear).
+    /// Kernel ABI v2.2 (`TURBINE_MOE_ROUTE_BF16_LOGITS`).
+    pub bf16_logits: bool,
+}
+
+impl fmt::Display for MoeRouteConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "experts={} top_k={} renormalize={} bf16_logits={}",
+            self.num_experts,
+            self.top_k,
+            u8::from(self.renormalize),
+            u8::from(self.bf16_logits)
+        )
+    }
+}
+
+/// SwiGLU experts `down(silu(gate(x)) · up(x))` of width `inter` over the local expert range
+/// `[expert_begin, expert_end)` of `num_experts`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct MoeExpertsConfig {
+    pub hidden: u32,
+    pub inter: u32,
+    pub num_experts: u32,
+    pub top_k: u32,
+    pub expert_begin: u32,
+    pub expert_end: u32,
+    pub dtype: DType,
+}
+
+impl MoeExpertsConfig {
+    /// Experts whose weights one call holds (`expert_end − expert_begin`).
+    pub fn num_local_experts(&self) -> u32 {
+        self.expert_end.saturating_sub(self.expert_begin)
+    }
+
+    /// Routed rows (`tokens · top_k`) of a call over `tokens` tokens: the size a provider's
+    /// [`MoeKernel::needs_host_offsets`] answer depends on. Known on the host before routing.
+    pub fn routed_rows(&self, tokens: usize) -> usize {
+        tokens.saturating_mul(self.top_k as usize)
+    }
+}
+
+impl fmt::Display for MoeExpertsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "hidden={} inter={} experts={} top_k={} local={}..{} dtype={}",
+            self.hidden,
+            self.inter,
+            self.num_experts,
+            self.top_k,
+            self.expert_begin,
+            self.expert_end,
+            self.dtype.as_str()
+        )
+    }
+}
+
+/// Residual add fused with RMSNorm (ABI v2.1) over rows of `dim` elements.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AddRmsnormConfig {
+    pub dtype: DType,
+    pub dim: u32,
+}
+
+impl fmt::Display for AddRmsnormConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "dim={} dtype={}", self.dim, self.dtype.as_str())
+    }
+}
+
+/// Per-row reduction of F32 logits rows of `vocab` values to their log-sum-exp, their `top_n`
+/// (at most 64) largest values and, per row on request, one categorical draw (ABI v2.1).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct LogitsReduceConfig {
+    pub vocab: u32,
+    pub top_n: u32,
+}
+
+impl LogitsReduceConfig {
+    /// The largest `top_n` any provider must accept (the ABI bound).
+    pub const MAX_TOP_N: u32 = 64;
+}
+
+impl fmt::Display for LogitsReduceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "vocab={} top_n={}", self.vocab, self.top_n)
+    }
+}
+
 // --------------------------------------------------------------------------------- contexts
 
 /// `a`: `[m, k]`; `b`: `[n, k]` when `trans_b`, else `[k, n]`; `c`: `[m, n]`. Row strides are
@@ -243,6 +401,94 @@ pub struct GemmContext<'a> {
     pub trans_b: bool,
     pub alpha: f32,
     pub beta: f32,
+}
+
+/// A ragged batch of sequences over one layer of the paged KV pool. Sequence `s` owns query rows
+/// `q_indptr[s]..q_indptr[s + 1]` of `q`/`k_new`/`v_new`/`out` and, after this call's append,
+/// `kv_lens[s]` tokens of KV; its new tokens sit at positions `kv_lens[s] − q_len..kv_lens[s]`.
+/// Token `p` of sequence `s` lives in block `block_table[s][p / block_tokens]` at slot
+/// `p % block_tokens`. The op first writes `k_new`/`v_new` into their slots, then attends
+/// (causal: new token `i` sees keys `0..=kv_lens[s] − q_len + i`).
+///
+/// - `q`/`out`: `[total_q, num_q_heads, head_dim]`; `k_new`/`v_new`:
+///   `[total_q, num_kv_heads, head_dim]`
+/// - `kv_layer`: this layer's pool `[num_blocks, 2, block_tokens, num_kv_heads, head_dim]`
+///   (K then V within a block)
+/// - `block_table`: `[num_seqs, max_blocks_per_seq]` I32; `q_indptr`: `[num_seqs + 1]` I32;
+///   `kv_lens`: `[num_seqs]` I32
+/// - `max_q_len`, `max_kv_len`: upper bounds of the per-sequence query and KV lengths
+pub struct PagedAttentionContext<'a> {
+    pub cfg: AttentionConfig,
+    pub q: TensorView<'a>,
+    pub k_new: TensorView<'a>,
+    pub v_new: TensorView<'a>,
+    pub out: TensorView<'a>,
+    pub kv_layer: TensorView<'a>,
+    pub block_table: TensorView<'a>,
+    pub q_indptr: TensorView<'a>,
+    pub kv_lens: TensorView<'a>,
+    pub max_q_len: u32,
+    pub max_kv_len: u32,
+    pub max_blocks_per_seq: u32,
+    /// Usually `1 / sqrt(head_dim)`.
+    pub scale: f32,
+}
+
+/// Copies block `src` to block `dst` in every layer, for each `(src, dst)` of `pairs` in order.
+/// Layer `l`'s block `b` is the `block_bytes` bytes at `l · layer_stride_bytes + b · block_bytes`
+/// of `pool`.
+pub struct KvCopyContext<'a> {
+    pub pool: DeviceSlice<'a>,
+    pub layer_stride_bytes: u64,
+    pub block_bytes: u64,
+    pub num_layers: u32,
+    pub pairs: &'a [(BlockId, BlockId)],
+}
+
+/// MoE routing of `num_tokens` tokens.
+///
+/// - `router_logits`: `[num_tokens, num_experts]` F32
+/// - `topk_ids` (I32) / `topk_weights` (F32): `[num_tokens, top_k]`, the experts
+///   `torch.topk` selects (among tied weights not "the lower id first": see
+///   [`crate::torch_topk`]), per token in descending weight, ties to the lower expert id
+/// - `sorted_rows`: `[num_tokens · top_k]` I32, every row `token · top_k + slot` grouped by
+///   expert (ascending expert, ascending row within an expert)
+/// - `expert_offsets`: `[num_experts + 1]` I32; expert `e` owns
+///   `sorted_rows[expert_offsets[e]..expert_offsets[e + 1]]`
+pub struct MoeRouteContext<'a> {
+    pub cfg: MoeRouteConfig,
+    pub router_logits: TensorView<'a>,
+    pub topk_ids: TensorView<'a>,
+    pub topk_weights: TensorView<'a>,
+    pub sorted_rows: TensorView<'a>,
+    pub expert_offsets: TensorView<'a>,
+}
+
+/// `out[t] += Σ w[t, slot] · down(silu(gate(x[t])) · up(x[t]))` over the slots routed to a local
+/// expert, accumulated expert by expert in ascending id (and in `sorted_rows` order within an
+/// expert), so the result does not depend on how a provider batches the work.
+///
+/// - `x`/`out`: `[num_tokens, hidden]`
+/// - `w_gate`/`w_up`: `[num_local_experts, inter, hidden]`; `w_down`:
+///   `[num_local_experts, hidden, inter]`
+/// - `sorted_rows`, `expert_offsets`, `topk_weights`: the outputs of `moe_route`
+/// - `host_expert_offsets`: a host copy of `expert_offsets` (group sizes without a device read);
+///   empty when the provider's [`MoeKernel::needs_host_offsets`] is false for this call, so the
+///   caller skips the device-to-host read
+/// - `workspace`: provider scratch (gathered rows, intermediates); `None` when the provider needs
+///   none
+pub struct MoeExpertsContext<'a> {
+    pub cfg: MoeExpertsConfig,
+    pub x: TensorView<'a>,
+    pub w_gate: TensorView<'a>,
+    pub w_up: TensorView<'a>,
+    pub w_down: TensorView<'a>,
+    pub sorted_rows: TensorView<'a>,
+    pub expert_offsets: TensorView<'a>,
+    pub topk_weights: TensorView<'a>,
+    pub host_expert_offsets: &'a [i32],
+    pub out: TensorView<'a>,
+    pub workspace: Option<DeviceSlice<'a>>,
 }
 
 /// `q`/`out`: `[q_len, num_q_heads, head_dim]`; `k_cache`/`v_cache`:
@@ -300,6 +546,51 @@ pub struct ElementwiseContext<'a> {
     pub out: TensorView<'a>,
 }
 
+/// `residual = round(residual + x)` in place (rounded to the residual's dtype), then
+/// `out = rmsnorm(residual) · weight` — numerically `add` followed by `rmsnorm` on the rounded sum.
+/// `residual`/`x`/`out`: `[rows, dim]` (rows may be strided); `weight`: `[dim]`.
+pub struct AddRmsnormContext<'a> {
+    pub residual: TensorView<'a>,
+    pub x: TensorView<'a>,
+    pub weight: TensorView<'a>,
+    pub out: TensorView<'a>,
+    pub eps: f32,
+}
+
+/// Reduces the first `rows` rows of `logits` (every view may hold more rows, e.g. buffers sized
+/// for the largest batch). Per row `r`:
+///
+/// - `lse[r]`: log-sum-exp of the raw logits, NaN ignored;
+/// - `top_ids[r]`/`top_values[r]`: the `top_n` largest raw logits and their ids, descending, ties
+///   to the lower id, NaN last;
+/// - `mode[r]` = 1: `sampled[r]` is one categorical draw at `temperature[r]` with `uniform[r]`
+///   (the argmax when `temperature[r]` ≤ 0 or no logit is finite) and `sampled_logit[r]` its raw
+///   logit; `mode[r]` = 0: `sampled[r]` = −1 and `sampled_logit[r]` = NaN. With the weights
+///   `w = exp(logit / temperature[r] − max)` (NaN weighs 0) the draw is:
+///   - `top_p[r]` ≥ 1: the smallest id whose cumulative `w` in id order exceeds
+///     `uniform[r] · total`;
+///   - `top_p[r]` < 1 (nucleus): over the ids in descending logit order (ties to the lower id),
+///     the shortest prefix whose `w` reaches `top_p[r] · total` (at least one id), and in it the
+///     first id whose cumulative `w` exceeds `uniform[r]` × the prefix's sum — the host
+///     sampler's top-p draw.
+///
+/// Views: `logits` `[≥ rows, vocab]` F32 (row-strided); `temperature`, `uniform`, `top_p`, `lse`,
+/// `sampled_logit` `[≥ rows]` F32; `mode`, `sampled` `[≥ rows]` I32; `top_ids` I32 and
+/// `top_values` F32 `[≥ rows, top_n]`. All but `logits` are dense.
+pub struct LogitsReduceContext<'a> {
+    pub logits: TensorView<'a>,
+    pub temperature: TensorView<'a>,
+    pub uniform: TensorView<'a>,
+    pub top_p: TensorView<'a>,
+    pub mode: TensorView<'a>,
+    pub top_ids: TensorView<'a>,
+    pub top_values: TensorView<'a>,
+    pub lse: TensorView<'a>,
+    pub sampled: TensorView<'a>,
+    pub sampled_logit: TensorView<'a>,
+    pub rows: u32,
+}
+
 // ----------------------------------------------------------------------------------- traits
 // `supports` and `implementation` depend on the config only and are called at startup by the
 // registry; `execute` enqueues the op on the provider's compute stream.
@@ -310,11 +601,13 @@ pub trait GemmKernel: Send + Sync {
     fn execute(&self, ctx: &mut GemmContext<'_>) -> Result<(), KernelError>;
 }
 
-/// Prefill and decode attention (`cfg.kind` selects the entry point).
+/// Prefill and decode attention (`cfg.kind` selects the entry point): `execute` runs the
+/// contiguous kinds, `execute_paged` the paged kinds.
 pub trait AttentionKernel: Send + Sync {
     fn supports(&self, cfg: &AttentionConfig) -> bool;
     fn implementation(&self, cfg: &AttentionConfig) -> String;
     fn execute(&self, ctx: &mut AttentionContext<'_>) -> Result<(), KernelError>;
+    fn execute_paged(&self, ctx: &mut PagedAttentionContext<'_>) -> Result<(), KernelError>;
 }
 
 /// RMSNorm.
@@ -352,8 +645,50 @@ pub trait ElementwiseKernel: Send + Sync {
     fn execute(&self, ctx: &mut ElementwiseContext<'_>) -> Result<(), KernelError>;
 }
 
+/// KV block fork (`copy_blocks`).
+pub trait KvCopyKernel: Send + Sync {
+    fn supports(&self, cfg: &KvCopyConfig) -> bool;
+    fn implementation(&self, cfg: &KvCopyConfig) -> String;
+    fn execute(&self, ctx: &mut KvCopyContext<'_>) -> Result<(), KernelError>;
+}
+
+/// Mixture-of-experts routing (`moe_route`) and expert compute (`moe_experts`).
+pub trait MoeKernel: Send + Sync {
+    fn supports_route(&self, cfg: &MoeRouteConfig) -> bool;
+    fn supports_experts(&self, cfg: &MoeExpertsConfig) -> bool;
+    fn implementation_route(&self, cfg: &MoeRouteConfig) -> String;
+    fn implementation_experts(&self, cfg: &MoeExpertsConfig) -> String;
+    fn route(&self, ctx: &mut MoeRouteContext<'_>) -> Result<(), KernelError>;
+    fn experts(&self, ctx: &mut MoeExpertsContext<'_>) -> Result<(), KernelError>;
+
+    /// Whether `experts` needs `host_expert_offsets` for a call of `routed_rows` rows
+    /// ([`MoeExpertsConfig::routed_rows`]). When false the caller passes an empty slice and
+    /// reads nothing back from the device after routing. The answer depends only on host-known
+    /// sizes, never on routing results. Default true (the Phase 2 contract).
+    fn needs_host_offsets(&self, cfg: &MoeExpertsConfig, routed_rows: usize) -> bool {
+        let _ = (cfg, routed_rows);
+        true
+    }
+}
+
+/// Residual add fused with RMSNorm (ABI v2.1).
+pub trait AddRmsnormKernel: Send + Sync {
+    fn supports(&self, cfg: &AddRmsnormConfig) -> bool;
+    fn implementation(&self, cfg: &AddRmsnormConfig) -> String;
+    fn execute(&self, ctx: &mut AddRmsnormContext<'_>) -> Result<(), KernelError>;
+}
+
+/// Device-side logits reduction (ABI v2.1).
+pub trait LogitsReduceKernel: Send + Sync {
+    fn supports(&self, cfg: &LogitsReduceConfig) -> bool;
+    fn implementation(&self, cfg: &LogitsReduceConfig) -> String;
+    fn execute(&self, ctx: &mut LogitsReduceContext<'_>) -> Result<(), KernelError>;
+}
+
 /// One implementation source (`cpu-reference`, a loaded shim library). A family the provider
-/// does not implement at all returns `None`; per-config support is `supports`.
+/// does not implement at all returns `None`; per-config support is `supports`. The ABI v2.1
+/// families default to `None`, so a provider (or a shim library) without them is a fallback, not
+/// an error.
 pub trait KernelProvider: Send + Sync {
     fn id(&self) -> ProviderId;
     fn gemm(&self) -> Option<&dyn GemmKernel>;
@@ -363,6 +698,14 @@ pub trait KernelProvider: Send + Sync {
     fn activation(&self) -> Option<&dyn ActivationKernel>;
     fn embedding(&self) -> Option<&dyn EmbeddingKernel>;
     fn elementwise(&self) -> Option<&dyn ElementwiseKernel>;
+    fn kv_copy(&self) -> Option<&dyn KvCopyKernel>;
+    fn moe(&self) -> Option<&dyn MoeKernel>;
+    fn add_rmsnorm(&self) -> Option<&dyn AddRmsnormKernel> {
+        None
+    }
+    fn logits_reduce(&self) -> Option<&dyn LogitsReduceKernel> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -382,7 +725,14 @@ mod tests {
                 "rope",
                 "silu_mul",
                 "embedding",
-                "add"
+                "add",
+                "attention_prefill_paged",
+                "attention_decode_paged",
+                "copy_blocks",
+                "moe_route",
+                "moe_experts",
+                "add_rmsnorm",
+                "logits_reduce"
             ]
         );
         assert_eq!(OpKind::SiluMul.to_string(), "silu_mul");
@@ -409,6 +759,43 @@ mod tests {
         attn.block_tokens = Some(16);
         assert_eq!(attn.op(), OpKind::AttentionDecode);
         assert!(attn.to_string().ends_with(" block_tokens=16"));
+        attn.kind = AttentionKind::PrefillPaged;
+        assert_eq!(attn.op(), OpKind::AttentionPrefillPaged);
+        attn.kind = AttentionKind::DecodePaged;
+        assert_eq!(attn.op(), OpKind::AttentionDecodePaged);
+        assert!(attn.kind.is_paged() && !AttentionKind::Decode.is_paged());
+        assert_eq!(
+            KvCopyConfig {
+                num_layers: 16,
+                block_bytes: 65536
+            }
+            .to_string(),
+            "num_layers=16 block_bytes=65536"
+        );
+        assert_eq!(
+            MoeRouteConfig {
+                num_experts: 64,
+                top_k: 8,
+                renormalize: false,
+                bf16_logits: true
+            }
+            .to_string(),
+            "experts=64 top_k=8 renormalize=0 bf16_logits=1"
+        );
+        let experts = MoeExpertsConfig {
+            hidden: 2048,
+            inter: 1024,
+            num_experts: 64,
+            top_k: 8,
+            expert_begin: 0,
+            expert_end: 64,
+            dtype: DType::BF16,
+        };
+        assert_eq!(
+            experts.to_string(),
+            "hidden=2048 inter=1024 experts=64 top_k=8 local=0..64 dtype=bf16"
+        );
+        assert_eq!(experts.num_local_experts(), 64);
 
         let gemm = GemmConfig {
             n: 3072,
@@ -461,6 +848,22 @@ mod tests {
         assert_eq!(
             ElementwiseConfig { dtype: DType::F32 }.to_string(),
             "dtype=f32"
+        );
+        assert_eq!(
+            AddRmsnormConfig {
+                dtype: DType::BF16,
+                dim: 3072
+            }
+            .to_string(),
+            "dim=3072 dtype=bf16"
+        );
+        assert_eq!(
+            LogitsReduceConfig {
+                vocab: 128_256,
+                top_n: 20
+            }
+            .to_string(),
+            "vocab=128256 top_n=20"
         );
     }
 }
