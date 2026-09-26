@@ -69,7 +69,7 @@ struct turbine_ctx {
   void *workspace = nullptr;
   // Device int32[4]: seqstart_q {0, q_len} then seqstart_k {0, kv_len}.
   int32_t *seqstart = nullptr;
-  // Device architecture without target features, e.g. "gfx1201".
+  // Device architecture without target features, e.g. "gfx942".
   std::string arch;
   // Wavefront width of the device (hipDeviceProp_t::warpSize).
   int wave_size = 0;
@@ -157,12 +157,6 @@ int32_t launch_moe_scatter(turbine_ctx *ctx, const void *down,
 // Largest num_experts / top_k the Turbine MoE kernels handle.
 constexpr int32_t kMoeMaxExperts = 256;
 constexpr int32_t kMoeMaxTopK = 32;
-// Most routed rows (num_tokens * top_k) moe_experts runs through the small-m
-// kernels (moe_small_m.hip), which read the group sizes on the device; above it
-// the grouped WMMA kernels (moe_grouped.hip) do the same (hidden and inter
-// multiples of 64), and only a shape they do not cover takes the per-expert
-// hipBLASLt path, which needs host_expert_offsets.
-constexpr int64_t kMoeSmallMaxRows = 512;
 // The small-m path over d's rows: fills pos ([num_tokens * top_k]), act
 // ([num_tokens * top_k, inter] BF16) and down ([num_tokens * top_k, hidden]
 // BF16), rows indexed by their position in sorted_rows; the caller then
@@ -174,9 +168,10 @@ int32_t launch_moe_small_m(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
 // (moe_small_m.hip); both device-offset paths start with it.
 int32_t launch_moe_positions(turbine_ctx *ctx,
                              const turbine_moe_experts_desc *d, int32_t *pos);
-// The grouped WMMA path (moe_grouped.hip) for d's rows, above
-// kMoeSmallMaxRows: the same outputs as launch_moe_small_m (pos, act and down
-// indexed by position; the caller scatters). Needs moe_wmma_shape(d) and
+// The grouped WMMA path (moe_grouped.hip) for d's rows (any row count; the
+// default takes it above the profile's small-row tier): the same outputs as
+// launch_moe_small_m (pos, act and down indexed by position; the caller
+// scatters). Needs moe_wmma_shape(d) and
 // 16-byte aligned x and expert weights.
 int32_t launch_moe_wmma(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                         int32_t *pos, void *act, void *down);
@@ -184,10 +179,10 @@ int32_t launch_moe_wmma(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
 bool moe_wmma_shape(const turbine_moe_experts_desc *d);
 
 // Asks hipBLASLt for a grouped BF16 GEMM solution on ctx's device (moe.cpp);
-// false when there is none (ROCm 7.14.1 on gfx1201) or the query fails.
+// false when there is none (ROCm 7.14.1 on RDNA4) or the query fails.
 bool probe_grouped_gemm(turbine_ctx *ctx);
 
-// True when arch (e.g. "gfx1201" or "gfx1201:sramecc-:xnack-") names one of
+// True when arch (e.g. "gfx942" or "gfx942:sramecc+:xnack-") names one of
 // the build architectures (context.cpp).
 bool arch_is_built(const char *arch);
 
@@ -203,15 +198,32 @@ struct ImplEntry {
   const char *provider;
   // TURBINE_IMPL_* flags.
   uint32_t flags;
-  // moe_experts: serves the first row tier only (up to the profile's
-  // moe_small_max_rows routed rows) when the library chooses.
-  bool first_tier_only;
+  // When the library chooses (turbine_<op> without an index): whether the
+  // context's card profile lets this implementation serve desc (its
+  // thresholds: moe_experts' small-row tier, the paged page multiple);
+  // nullptr = always.
+  bool (*profile_allows)(const Profile &profile, const void *desc);
   bool (*supports)(const void *desc);
   int32_t (*run)(turbine_ctx *ctx, const void *desc);
 };
 // The implementations of op in library order; nullptr (count 0) for an
 // unknown op.
 const ImplEntry *impl_entries(int32_t op, int32_t *count);
+
+// The library's own choice for a caller that names no implementation (the
+// ABI v2 entry points): the first implementation of op, in library order,
+// that supports desc and that profile allows; nullptr when none does.
+const ImplEntry *default_entry(const Profile &profile, int32_t op,
+                               const void *desc);
+// Runs default_entry(ctx->profile, op, desc); when there is none the last
+// implementation of op runs, which refuses desc with the op's message.
+int32_t run_default(turbine_ctx *ctx, int32_t op, const void *desc);
+// The name turbine_<op>_impl reports (context-free, so under
+// kDefaultProfile): default_entry's, else the last implementation's.
+const char *default_name(int32_t op, const void *desc);
+// The TURBINE_IMPL_* flags of default_entry(kDefaultProfile, op, desc), or
+// fallback when there is none.
+uint32_t default_flags(int32_t op, const void *desc, uint32_t fallback);
 
 // Per-implementation pairs of the ops with more than one implementation.
 // rmsnorm.cpp: ck_tile rmsnorm2d (ck true) or the Turbine kernel.

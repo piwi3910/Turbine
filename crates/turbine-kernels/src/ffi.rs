@@ -399,10 +399,6 @@ pub(crate) struct ImplFns {
     pub count: unsafe extern "C" fn(i32) -> i32,
     pub info: unsafe extern "C" fn(i32, i32, *mut ImplEntry) -> i32,
     pub supports: unsafe extern "C" fn(i32, i32, *const c_void) -> i32,
-    #[expect(
-        dead_code,
-        reason = "the bound shim provider of Task 11 runs through it"
-    )]
     pub run: unsafe extern "C" fn(*mut TurbineCtx, i32, i32, *const c_void) -> i32,
     pub set_profile: unsafe extern "C" fn(*mut TurbineCtx, *const CardProfileDesc) -> i32,
 }

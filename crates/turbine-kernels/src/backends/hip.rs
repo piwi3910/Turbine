@@ -11,13 +11,10 @@ use turbine_core::types::Vendor;
 use turbine_device::{DeviceInfo, DeviceInventory};
 
 use super::{BackendError, BackendNote, BackendRequest, ExecutionBackend, OpenedBackend};
-use crate::cards;
+use crate::cards::{self, CardProfile};
 use crate::{
     KernelError, KernelProvider, OpKind, Selection, ShimContext, ShimLibrary, shim_provider,
 };
-
-/// The implementation name the HIP shim reports for Composable Kernel paged attention.
-const CK_PAGED_ATTENTION: &str = "ck_tile_fmha_pagedkv";
 
 pub struct HipBackend;
 
@@ -51,11 +48,17 @@ impl ExecutionBackend for HipBackend {
         let ctx: Arc<ShimContext> = lib
             .create_context(device)
             .map_err(|e| BackendError::Startup(format!("kernel library context: {e}")))?;
+        // The library's own defaults (callers that pass no implementation index) read the
+        // profile's thresholds; a library without the ABI v2.4 group ignores it.
+        ctx.set_profile(card)
+            .map_err(|e| BackendError::Startup(format!("kernel library card profile: {e}")))?;
         tracing::info!(
             event = "kernel_library_loaded",
             path = %lib.path().display(),
             backend = lib.backend_name(),
             abi_version = lib.abi_version(),
+            abi_minor = lib.abi_minor(),
+            enumerates_implementations = lib.enumerates_implementations(),
             build_archs = %lib.build_archs().join(","),
             device_arch = device.arch.as_deref().unwrap_or("unknown"),
             driver_version = device.driver_version.as_deref().unwrap_or("unknown"),
@@ -80,10 +83,18 @@ impl ExecutionBackend for HipBackend {
         Self::STICKY_ERRORS
     }
 
-    /// `paged_attention_fallback` when paged attention is not on Composable Kernel's
-    /// `fmha_fwd_pagedkv` (CK serves only pages of a multiple of 128 tokens; other sizes run the
-    /// slower Turbine kernel).
-    fn selection_notes(&self, selections: &[Selection]) -> Vec<BackendNote> {
+    /// `paged_attention_fallback` when paged attention does not run the card profile's first
+    /// preference (on gfx1201 Composable Kernel's `fmha_fwd_pagedkv`, which serves only pages of
+    /// a multiple of the profile's `paged_page_multiple` tokens; other sizes run the slower
+    /// Turbine kernel).
+    fn selection_notes(
+        &self,
+        card: Option<&CardProfile>,
+        selections: &[Selection],
+    ) -> Vec<BackendNote> {
+        let Some(card) = card else {
+            return Vec::new();
+        };
         selections
             .iter()
             .filter(|s| {
@@ -92,12 +103,23 @@ impl ExecutionBackend for HipBackend {
                     OpKind::AttentionPrefillPaged | OpKind::AttentionDecodePaged
                 )
             })
-            .find(|s| s.implementation != CK_PAGED_ATTENTION)
+            .find(|s| {
+                card.preference(s.op)
+                    .and_then(|p| p.order.first())
+                    .is_some_and(|preferred| s.implementation != *preferred)
+            })
             .map(|s| BackendNote {
                 event: "paged_attention_fallback",
-                fields: vec![("impl", s.implementation.clone())],
-                message: "paged attention is not on CK fmha_fwd_pagedkv: kv.block_tokens is not \
-                          a multiple of 128",
+                fields: vec![
+                    ("impl", s.implementation.clone()),
+                    (
+                        "page_multiple",
+                        card.thresholds.paged_page_multiple.to_string(),
+                    ),
+                ],
+                message: "paged attention is not on the card profile's preferred implementation \
+                          (CK fmha_fwd_pagedkv): kv.block_tokens is not a multiple of the \
+                          profile's page multiple",
             })
             .into_iter()
             .collect()
@@ -180,6 +202,9 @@ mod tests {
             provider: ProviderId("hip"),
             implementation: implementation.to_string(),
             reason: String::new(),
+            impl_provider: String::new(),
+            reason_code: "",
+            tiers: Vec::new(),
         }
     }
 
@@ -203,16 +228,25 @@ mod tests {
             sel(OpKind::AttentionPrefillPaged, "turbine_hip"),
             sel(OpKind::AttentionDecodePaged, "turbine_hip"),
         ];
-        let notes = HipBackend.selection_notes(&fallback);
+        let card = Some(&cards::GFX1201);
+        let notes = HipBackend.selection_notes(card, &fallback);
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].event, "paged_attention_fallback");
-        assert_eq!(notes[0].fields, [("impl", "turbine_hip".to_string())]);
+        assert_eq!(
+            notes[0].fields,
+            [
+                ("impl", "turbine_hip".to_string()),
+                ("page_multiple", "128".to_string())
+            ]
+        );
         let on_ck = [
             sel(OpKind::Gemm, "hipblaslt"),
-            sel(OpKind::AttentionPrefillPaged, CK_PAGED_ATTENTION),
-            sel(OpKind::AttentionDecodePaged, CK_PAGED_ATTENTION),
+            sel(OpKind::AttentionPrefillPaged, "ck_tile_fmha_pagedkv"),
+            sel(OpKind::AttentionDecodePaged, "ck_tile_fmha_pagedkv"),
         ];
-        assert!(HipBackend.selection_notes(&on_ck).is_empty());
+        assert!(HipBackend.selection_notes(card, &on_ck).is_empty());
+        // Without a card profile there is no preference to fall back from.
+        assert!(HipBackend.selection_notes(None, &fallback).is_empty());
     }
 
     #[test]

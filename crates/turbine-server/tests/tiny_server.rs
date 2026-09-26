@@ -727,6 +727,7 @@ fn status_reports_modules_and_kernels() {
         &order,
         &reqs,
         &KernelMetrics::register(&MetricsRegistry::new()),
+        None,
     )
     .unwrap();
     let expected: Vec<Value> = registry
@@ -734,7 +735,8 @@ fn status_reports_modules_and_kernels() {
         .iter()
         .map(|s| {
             json!({"op": s.op.as_str(), "config": s.config, "provider": "cpu-reference",
-                   "implementation": s.implementation, "reason": s.reason})
+                   "implementation": s.implementation, "impl_provider": "cpu-reference",
+                   "reason": s.reason, "reason_code": "provider_internal", "tiers": []})
         })
         .collect();
     assert!(!expected.is_empty());
@@ -777,6 +779,44 @@ fn status_reports_support_row() {
             })
         },
     );
+}
+
+/// Phase 2m S-5: on the CPU backend every `kernels` entry of `/turbine/v1/status` is served by
+/// `cpu-reference`, which chooses internally (`reason_code` `provider_internal`), with the
+/// implementation names main reports. Breaks if the registry's selection changes what a served
+/// model runs.
+#[test]
+fn status_reports_kernel_choices() {
+    let server = TinyServer::launch(&Setup::default());
+    let status = server.get("/turbine/v1/status").json();
+    let kernels = status["kernels"].as_array().expect("kernels array");
+    assert!(!kernels.is_empty(), "{status}");
+    let main_names: std::collections::HashMap<&str, &str> = [
+        ("embedding", "cpu_embedding"),
+        ("rmsnorm", "cpu_rmsnorm"),
+        ("gemm", "cpu_gemm_f32acc"),
+        ("rope", "cpu_rope_half_split"),
+        ("attention_prefill_paged", "cpu_attention_paged_f32acc"),
+        ("attention_decode_paged", "cpu_attention_paged_f32acc"),
+        ("add", "cpu_add"),
+        ("add_rmsnorm", "cpu_add_rmsnorm"),
+        ("silu_mul", "cpu_silu_mul"),
+        ("copy_blocks", "cpu_copy_blocks"),
+        ("logits_reduce", "cpu_logits_reduce"),
+    ]
+    .into_iter()
+    .collect();
+    for k in kernels {
+        let op = k["op"].as_str().expect("op");
+        assert_eq!(k["provider"], "cpu-reference", "{k}");
+        assert_eq!(k["impl_provider"], "cpu-reference", "{k}");
+        assert_eq!(k["reason_code"], "provider_internal", "{k}");
+        assert_eq!(k["tiers"], json!([]), "{k}");
+        let want = main_names
+            .get(op)
+            .unwrap_or_else(|| panic!("unexpected op {op} in {status}"));
+        assert_eq!(k["implementation"], *want, "{k}");
+    }
 }
 
 /// Contract §20.2 (rewritten for Phase 2): with one running request allowed
@@ -1480,6 +1520,7 @@ fn reference_tokens(prompt: &[u32], sampling: SamplingParams, max_tokens: u32) -
         &order,
         &executor::requirements(&spec.config, 16, ExecutorOptions::default()),
         &KernelMetrics::register(&MetricsRegistry::new()),
+        None,
     )
     .unwrap();
     let mut exec = executor::build_executor(

@@ -4,14 +4,16 @@
 // out[t] += sum_k w_k * down(silu(gate(x_t)) * up(x_t)) over the local experts
 // [expert_begin, expert_end).
 //
-// Up to kMoeSmallMaxRows routed rows (num_tokens * top_k; every decode step of
-// up to 64 OLMoE sequences) it runs the Turbine small-m kernels
-// (moe_small_m.hip, impl "turbine_hip_moe_small_m"), above it the Turbine
-// grouped WMMA kernels (moe_grouped.hip, impl "turbine_hip_moe_wmma") when
-// hidden and inter are multiples of 64. Both read the group sizes from
-// expert_offsets on the device: host_expert_offsets may be NULL, and
-// turbine_moe_experts_needs_host_offsets says so. Other shapes above
-// kMoeSmallMaxRows take the per-expert hipBLASLt path:
+// Four implementations (impl_table.cpp; the caller picks one with
+// turbine_impl_run, or turbine_moe_experts takes the first that supports the
+// descriptor within the context's card profile): the Turbine small-m kernels
+// (moe_small_m.hip, impl "turbine_hip_moe_small_m"; the default uses them up
+// to the profile's moe_small_max_rows routed rows, num_tokens * top_k), the
+// Turbine grouped WMMA kernels (moe_grouped.hip, impl "turbine_hip_moe_wmma";
+// hidden and inter multiples of 64), both reading the group sizes from
+// expert_offsets on the device (host_expert_offsets may be NULL, and
+// turbine_moe_experts_needs_host_offsets says so), and the hipBLASLt paths,
+// which read host_expert_offsets:
 //   1. gather: the rows routed to local experts are contiguous in sorted_rows
 //      (grouped by ascending expert), so one kernel copies their activations
 //      into xs in that order and records each row's position;
@@ -20,11 +22,11 @@
 //      down GEMM per expert;
 //   3. scatter: every token adds its experts' outputs in ascending expert
 //      order (moe.hip), so the result does not depend on the GEMM batching.
-// hipBLASLt ships no grouped-GEMM solution for gfx1201 in ROCm 7.14.1, so step
-// 2 issues one hipblasLtMatmul per expert and projection (impl
-// "hipblaslt_per_expert"). When a context finds a grouped solution at creation
-// (probe_grouped_gemm), each projection runs as one hipblaslt_ext::GroupedGemm
-// over the experts instead (impl "hipblaslt_grouped"), falling back to the
+// "hipblaslt_per_expert" issues one hipblasLtMatmul per expert and projection
+// in step 2 (hipBLASLt ships no grouped-GEMM solution for RDNA4 in ROCm
+// 7.14.1). When a context found a grouped solution at creation
+// (probe_grouped_gemm), "hipblaslt_grouped" runs each projection as one
+// hipblaslt_ext::GroupedGemm over the experts instead, falling back to the
 // per-expert calls for a batch the grouped heuristic rejects.
 //
 // Intermediates live in the caller's workspace when it is large enough,
@@ -90,20 +92,6 @@ bool experts_supported(const turbine_moe_experts_desc *d) {
     return false;
   }
   return static_cast<int64_t>(d->num_tokens) * d->top_k <= INT32_MAX;
-}
-
-// d runs through the small-m kernels (no host offsets needed). The operand
-// alignment is checked when the call runs.
-bool small_m(const turbine_moe_experts_desc *d) {
-  return static_cast<int64_t>(d->num_tokens) * d->top_k <=
-             turbine_hip::kMoeSmallMaxRows &&
-         d->hidden % 8 == 0 && d->inter % 8 == 0;
-}
-
-// d runs through the grouped WMMA kernels (no host offsets needed). The operand
-// alignment is checked when the call runs.
-bool wmma(const turbine_moe_experts_desc *d) {
-  return !small_m(d) && turbine_hip::moe_wmma_shape(d);
 }
 
 bool aligned16(const void *p) {
@@ -566,28 +554,21 @@ int32_t turbine_moe_experts_supported(const turbine_moe_experts_desc *d) {
 }
 
 const char *turbine_moe_experts_impl(const turbine_moe_experts_desc *d) {
-  if (d != nullptr && small_m(d))
-    return kImplSmallM;
-  if (d != nullptr && wmma(d))
-    return kImplWmma;
-  return g_grouped_available.load() ? kImplGrouped : kImplPerExpert;
+  return turbine_hip::default_name(TURBINE_OP_MOE_EXPERTS, d);
 }
 
 int32_t
 turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d) {
-  return d != nullptr && (small_m(d) || wmma(d)) ? 0 : 1;
+  return (turbine_hip::default_flags(TURBINE_OP_MOE_EXPERTS, d,
+                                     TURBINE_IMPL_NEEDS_HOST_OFFSETS) &
+          TURBINE_IMPL_NEEDS_HOST_OFFSETS) != 0
+             ? 1
+             : 0;
 }
 
 int32_t turbine_moe_experts(turbine_ctx *ctx,
                             const turbine_moe_experts_desc *d) {
-  using turbine_hip::MoePath;
-  MoePath path = ctx != nullptr && ctx->moe_grouped ? MoePath::Grouped
-                                                    : MoePath::PerExpert;
-  if (d != nullptr && small_m(d))
-    path = MoePath::SmallM;
-  else if (d != nullptr && wmma(d))
-    path = MoePath::Wmma;
-  return turbine_hip::moe_experts_run(ctx, d, path);
+  return turbine_hip::run_default(ctx, TURBINE_OP_MOE_EXPERTS, d);
 }
 
 } // extern "C"

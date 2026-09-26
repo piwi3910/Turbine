@@ -18,6 +18,8 @@
 //                                  host_expert_offsets
 //   rope, silu_mul, embedding,   0 turbine_hip [turbine_hip]
 //   add, moe_route, logits_reduce
+#include <string>
+
 #include "turbine_hip.hpp"
 
 namespace turbine_hip {
@@ -45,7 +47,7 @@ constexpr ImplEntry whole(const char *name, const char *provider) {
   return {name,
           provider,
           0,
-          false,
+          nullptr,
           &Whole<D, Supported, Run>::supports,
           &Whole<D, Supported, Run>::run};
 }
@@ -95,10 +97,27 @@ template <MoePath Path> struct Experts {
   }
 };
 
+// The profile's page multiple: the default runs CK paged attention only for
+// pages of a multiple of it (supports already requires the CK instance's own).
+bool page_multiple_allows(const Profile &profile, const void *d) {
+  const auto *desc = static_cast<const turbine_attention_paged_desc *>(d);
+  return profile.paged_page_multiple > 0 &&
+         desc->block_tokens % profile.paged_page_multiple == 0;
+}
+
+// The profile's first moe_experts row tier: the default runs the small-m
+// kernels up to moe_small_max_rows routed rows.
+bool small_rows_allows(const Profile &profile, const void *d) {
+  const auto *desc = static_cast<const turbine_moe_experts_desc *>(d);
+  return static_cast<int64_t>(desc->num_tokens) * desc->top_k <=
+         profile.moe_small_max_rows;
+}
+
 template <typename S>
-constexpr ImplEntry entry(const char *name, const char *provider,
-                          uint32_t flags = 0, bool first_tier_only = false) {
-  return {name, provider, flags, first_tier_only, &S::supports, &S::run};
+constexpr ImplEntry
+entry(const char *name, const char *provider, uint32_t flags = 0,
+      bool (*profile_allows)(const Profile &, const void *) = nullptr) {
+  return {name, provider, flags, profile_allows, &S::supports, &S::run};
 }
 
 const ImplEntry kGemm[] = {
@@ -134,11 +153,13 @@ const ImplEntry kAdd[] = {
                                                                 kTurbine),
 };
 const ImplEntry kPrefillPagedImpls[] = {
-    entry<Paged<kPrefillPaged, true>>("ck_tile_fmha_pagedkv", kCk),
+    entry<Paged<kPrefillPaged, true>>("ck_tile_fmha_pagedkv", kCk, 0,
+                                      page_multiple_allows),
     entry<Paged<kPrefillPaged, false>>("turbine_hip", kTurbine),
 };
 const ImplEntry kDecodePagedImpls[] = {
-    entry<Paged<kDecodePaged, true>>("ck_tile_fmha_pagedkv", kCk),
+    entry<Paged<kDecodePaged, true>>("ck_tile_fmha_pagedkv", kCk, 0,
+                                     page_multiple_allows),
     entry<Paged<kDecodePaged, false>>("turbine_hip", kTurbine),
 };
 const ImplEntry kCopyBlocks[] = {
@@ -151,7 +172,7 @@ const ImplEntry kMoeRoute[] = {
 };
 const ImplEntry kMoeExperts[] = {
     entry<Experts<MoePath::SmallM>>("turbine_hip_moe_small_m", kTurbine, 0,
-                                    /*first_tier_only=*/true),
+                                    small_rows_allows),
     entry<Experts<MoePath::Wmma>>("turbine_hip_moe_wmma", kTurbine),
     entry<Experts<MoePath::Grouped>>("hipblaslt_grouped", kHipblaslt,
                                      TURBINE_IMPL_NEEDS_HOST_OFFSETS),
@@ -206,6 +227,49 @@ const ImplEntry *impl_entries(int32_t op, int32_t *count) {
   }
   *count = kOps[op].count;
   return kOps[op].entries;
+}
+
+const ImplEntry *default_entry(const Profile &profile, int32_t op,
+                               const void *desc) {
+  int32_t count = 0;
+  const ImplEntry *entries = impl_entries(op, &count);
+  if (desc == nullptr)
+    return nullptr;
+  for (int32_t i = 0; i < count; ++i) {
+    const ImplEntry &e = entries[i];
+    if (e.supports(desc) &&
+        (e.profile_allows == nullptr || e.profile_allows(profile, desc))) {
+      return &e;
+    }
+  }
+  return nullptr;
+}
+
+int32_t run_default(turbine_ctx *ctx, int32_t op, const void *desc) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  int32_t count = 0;
+  const ImplEntry *entries = impl_entries(op, &count);
+  if (entries == nullptr)
+    return fail(ctx, TURBINE_E_ARGUMENT, "unknown op " + std::to_string(op));
+  const ImplEntry *e = default_entry(ctx->profile, op, desc);
+  // No implementation takes desc: the last one runs and refuses it with the
+  // op's message (a NULL descriptor or an unsupported configuration).
+  return (e != nullptr ? e : &entries[count - 1])->run(ctx, desc);
+}
+
+const char *default_name(int32_t op, const void *desc) {
+  int32_t count = 0;
+  const ImplEntry *entries = impl_entries(op, &count);
+  if (entries == nullptr)
+    return "";
+  const ImplEntry *e = default_entry(kDefaultProfile, op, desc);
+  return (e != nullptr ? e : &entries[count - 1])->name;
+}
+
+uint32_t default_flags(int32_t op, const void *desc, uint32_t fallback) {
+  const ImplEntry *e = default_entry(kDefaultProfile, op, desc);
+  return e != nullptr ? e->flags : fallback;
 }
 
 } // namespace turbine_hip

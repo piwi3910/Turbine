@@ -82,8 +82,13 @@ pub trait ExecutionBackend: Module {
     fn sticky_error_prefixes(&self) -> &'static [&'static str] {
         &[]
     }
-    /// Notes on the kernel selections made on this backend (e.g. a slower fallback path).
-    fn selection_notes(&self, _selections: &[Selection]) -> Vec<BackendNote> {
+    /// Notes on the kernel selections made on this backend with the opened `card` profile
+    /// (e.g. a slower fallback path than the profile prefers).
+    fn selection_notes(
+        &self,
+        _card: Option<&CardProfile>,
+        _selections: &[Selection],
+    ) -> Vec<BackendNote> {
         Vec::new()
     }
 }

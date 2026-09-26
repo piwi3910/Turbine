@@ -21,7 +21,7 @@ use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
     AttentionContext, AttentionKind, ElementwiseConfig, ElementwiseContext, EmbeddingConfig,
-    EmbeddingContext, GemmConfig, GemmContext, ImplInfo, KernelProvider, KvCopyConfig,
+    EmbeddingContext, GemmConfig, GemmContext, ImplChoice, ImplInfo, KernelProvider, KvCopyConfig,
     KvCopyContext, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
     MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, OpConfig, OpKind,
     PagedAttentionContext, RopeConfig, RopeContext, ShimLibrary, cpu_reference_provider,
@@ -53,6 +53,9 @@ struct Pair {
     cpu: Arc<dyn KernelProvider>,
     hip_mem: Arc<dyn DeviceMemory>,
     cpu_mem: Arc<dyn DeviceMemory>,
+    /// The HIP provider takes the library's own choice per call (`false`: bound to one
+    /// implementation by `every_implementation_matches_cpu`).
+    legacy: bool,
 }
 
 /// Serializes the tests of this binary: device discovery (amd-smi) runs once at a time per
@@ -93,6 +96,7 @@ fn setup() -> Pair {
         cpu: cpu_reference_provider(),
         hip_mem,
         cpu_mem,
+        legacy: true,
     }
 }
 
@@ -366,17 +370,8 @@ fn attention_matches_cpu() {
     attention_case(&p, &mut rng, AttentionKind::Prefill, 17, 100);
 }
 
-#[test]
-#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
-fn norm_rope_silu_embedding_add_match_cpu() {
-    if !require_backend("hip") {
-        return;
-    }
-    let _gpu = lock_gpu();
-    let p = setup();
-    let mut rng = Rng(3);
-    let t = 17usize;
-
+/// RMSNorm over `t` rows of Llama's hidden size.
+fn norm_case(p: &Pair, rng: &mut Rng, t: usize) {
     // RMSNorm
     let cfg = NormConfig {
         dim: HIDDEN as u64,
@@ -385,9 +380,9 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     let hip = p.hip.norm().expect("hip norm");
     assert!(hip.supports(&cfg), "hip must support rmsnorm {cfg}");
     let impl_name = hip.implementation(&cfg);
-    let (x_hip, x_cpu) = twin(&p, &[t, HIDDEN], DType::BF16, &rng.normal(t * HIDDEN, 1.0));
-    let (w_hip, w_cpu) = twin(&p, &[HIDDEN], DType::BF16, &rng.normal(HIDDEN, 1.0));
-    let (o_hip, o_cpu) = twin(&p, &[t, HIDDEN], DType::BF16, &vec![0.0; t * HIDDEN]);
+    let (x_hip, x_cpu) = twin(p, &[t, HIDDEN], DType::BF16, &rng.normal(t * HIDDEN, 1.0));
+    let (w_hip, w_cpu) = twin(p, &[HIDDEN], DType::BF16, &rng.normal(HIDDEN, 1.0));
+    let (o_hip, o_cpu) = twin(p, &[t, HIDDEN], DType::BF16, &vec![0.0; t * HIDDEN]);
     let runs = [
         (hip, &x_hip, &w_hip, &o_hip),
         (p.cpu.norm().expect("cpu norm"), &x_cpu, &w_cpu, &o_cpu),
@@ -403,7 +398,10 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     }
     let what = format!("rmsnorm rows={t} {cfg}");
     assert_close(&what, &impl_name, &read(&o_hip), &read(&o_cpu), DType::BF16);
+}
 
+/// RoPE over `t` tokens at the Llama head shapes.
+fn rope_case(p: &Pair, rng: &mut Rng, t: usize) {
     // RoPE (in place on q and k), Llama-3 theta, positions spread over [0, 4096).
     let cfg = RopeConfig {
         num_q_heads: Q_HEADS as u32,
@@ -423,19 +421,19 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     let q_n = t * Q_HEADS * HEAD_DIM;
     let k_n = t * KV_HEADS * HEAD_DIM;
     let (q_hip, q_cpu) = twin(
-        &p,
+        p,
         &[t, Q_HEADS, HEAD_DIM],
         DType::BF16,
         &rng.normal(q_n, 1.0),
     );
     let (k_hip, k_cpu) = twin(
-        &p,
+        p,
         &[t, KV_HEADS, HEAD_DIM],
         DType::BF16,
         &rng.normal(k_n, 1.0),
     );
-    let (pos_hip, pos_cpu) = twin(&p, &[t], DType::I32, &positions);
-    let (f_hip, f_cpu) = twin(&p, &[half], DType::F32, &inv_freq);
+    let (pos_hip, pos_cpu) = twin(p, &[t], DType::I32, &positions);
+    let (f_hip, f_cpu) = twin(p, &[half], DType::F32, &inv_freq);
     let runs = [
         (hip, &q_hip, &k_hip, &pos_hip, &f_hip),
         (
@@ -460,7 +458,10 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     assert_close(&what, &impl_name, &read(&q_hip), &read(&q_cpu), DType::BF16);
     let what = format!("rope k tokens={t} {cfg}");
     assert_close(&what, &impl_name, &read(&k_hip), &read(&k_cpu), DType::BF16);
+}
 
+/// SiLU · up over `t` rows of Llama's intermediate size.
+fn silu_mul_case(p: &Pair, rng: &mut Rng, t: usize) {
     // SiLU · up
     let cfg = ActivationConfig {
         cols: INTERMEDIATE as u64,
@@ -471,9 +472,9 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     let impl_name = hip.implementation(&cfg);
     let n = t * INTERMEDIATE;
     let shape = [t, INTERMEDIATE];
-    let (g_hip, g_cpu) = twin(&p, &shape, DType::BF16, &rng.normal(n, 1.0));
-    let (u_hip, u_cpu) = twin(&p, &shape, DType::BF16, &rng.normal(n, 1.0));
-    let (o_hip, o_cpu) = twin(&p, &shape, DType::BF16, &vec![0.0; n]);
+    let (g_hip, g_cpu) = twin(p, &shape, DType::BF16, &rng.normal(n, 1.0));
+    let (u_hip, u_cpu) = twin(p, &shape, DType::BF16, &rng.normal(n, 1.0));
+    let (o_hip, o_cpu) = twin(p, &shape, DType::BF16, &vec![0.0; n]);
     let runs = [
         (hip, &g_hip, &u_hip, &o_hip),
         (
@@ -493,7 +494,10 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     }
     let what = format!("silu_mul rows={t} {cfg}");
     assert_close(&what, &impl_name, &read(&o_hip), &read(&o_cpu), DType::BF16);
+}
 
+/// Embedding of `t` tokens from the full Llama vocabulary.
+fn embedding_case(p: &Pair, rng: &mut Rng, t: usize) {
     // Embedding over the full vocabulary, ids spread across it (last row included).
     let cfg = EmbeddingConfig {
         hidden: HIDDEN as u64,
@@ -506,9 +510,9 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     let mut ids: Vec<f32> = (0..t - 1).map(|i| ((i * 7919) % VOCAB) as f32).collect();
     ids.push((VOCAB - 1) as f32);
     let table = rng.normal(VOCAB * HIDDEN, 1.0);
-    let (tab_hip, tab_cpu) = twin(&p, &[VOCAB, HIDDEN], DType::BF16, &table);
-    let (id_hip, id_cpu) = twin(&p, &[t], DType::I32, &ids);
-    let (o_hip, o_cpu) = twin(&p, &[t, HIDDEN], DType::BF16, &vec![0.0; t * HIDDEN]);
+    let (tab_hip, tab_cpu) = twin(p, &[VOCAB, HIDDEN], DType::BF16, &table);
+    let (id_hip, id_cpu) = twin(p, &[t], DType::I32, &ids);
+    let (o_hip, o_cpu) = twin(p, &[t, HIDDEN], DType::BF16, &vec![0.0; t * HIDDEN]);
     let runs = [
         (hip, &id_hip, &tab_hip, &o_hip),
         (
@@ -529,16 +533,19 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     }
     let what = format!("embedding tokens={t} {cfg}");
     assert_close(&what, &impl_name, &read(&o_hip), &read(&o_cpu), DType::BF16);
+}
 
+/// Residual add of `t` rows of Llama's hidden size.
+fn add_case(p: &Pair, rng: &mut Rng, t: usize) {
     // Residual add
     let cfg = ElementwiseConfig { dtype: DType::BF16 };
     let hip = p.hip.elementwise().expect("hip add");
     assert!(hip.supports(&cfg), "hip must support add {cfg}");
     let impl_name = hip.implementation(&cfg);
     let n = t * HIDDEN;
-    let (a_hip, a_cpu) = twin(&p, &[n], DType::BF16, &rng.normal(n, 1.0));
-    let (b_hip, b_cpu) = twin(&p, &[n], DType::BF16, &rng.normal(n, 1.0));
-    let (o_hip, o_cpu) = twin(&p, &[n], DType::BF16, &vec![0.0; n]);
+    let (a_hip, a_cpu) = twin(p, &[n], DType::BF16, &rng.normal(n, 1.0));
+    let (b_hip, b_cpu) = twin(p, &[n], DType::BF16, &rng.normal(n, 1.0));
+    let (o_hip, o_cpu) = twin(p, &[n], DType::BF16, &vec![0.0; n]);
     let runs = [
         (hip, &a_hip, &b_hip, &o_hip),
         (
@@ -560,6 +567,23 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     assert_close(&what, &impl_name, &read(&o_hip), &read(&o_cpu), DType::BF16);
 }
 
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn norm_rope_silu_embedding_add_match_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(3);
+    let t = 17usize;
+    norm_case(&p, &mut rng, t);
+    rope_case(&p, &mut rng, t);
+    silu_mul_case(&p, &mut rng, t);
+    embedding_case(&p, &mut rng, t);
+    add_case(&p, &mut rng, t);
+}
+
 /// The first `cols` columns of the `[rows, stride]` tensor `t`, as a row-strided `[rows, cols]`
 /// view.
 fn column_prefix(t: &Tensor, cols: usize) -> TensorView<'_> {
@@ -570,6 +594,105 @@ fn column_prefix(t: &Tensor, cols: usize) -> TensorView<'_> {
         shape: (&[rows, cols][..]).into(),
         strides: (&[stride, 1][..]).into(),
         dtype: t.dtype,
+    }
+}
+
+/// One fused residual add + RMSNorm case of `add_rmsnorm_matches_cpu` (rows, dim, row stride
+/// of x).
+fn add_rmsnorm_case(p: &Pair, rng: &mut Rng, rows: usize, dim: usize, x_stride: usize) {
+    let hip = p
+        .hip
+        .add_rmsnorm()
+        .expect("libturbine_hip.so exports the ABI v2.1 add_rmsnorm trio");
+    let cpu = p.cpu.add_rmsnorm().expect("cpu add_rmsnorm");
+    let cfg = AddRmsnormConfig {
+        dtype: DType::BF16,
+        dim: dim as u32,
+    };
+    assert!(hip.supports(&cfg), "hip must support add_rmsnorm {cfg}");
+    let impl_name = hip.implementation(&cfg);
+    let n = rows * dim;
+    let before = rng.normal(n, 1.0);
+    let (r_hip, r_cpu) = twin(p, &[rows, dim], DType::BF16, &before);
+    let x = rng.normal(rows * x_stride, 1.0);
+    let (x_hip, x_cpu) = twin(p, &[rows, x_stride], DType::BF16, &x);
+    let (w_hip, w_cpu) = twin(p, &[dim], DType::BF16, &rng.normal(dim, 1.0));
+    let (o_hip, o_cpu) = twin(p, &[rows, dim], DType::BF16, &vec![0.0; n]);
+    let runs = [
+        (hip, &r_hip, &x_hip, &w_hip, &o_hip),
+        (cpu, &r_cpu, &x_cpu, &w_cpu, &o_cpu),
+    ];
+    for (kernel, r, x, w, o) in runs {
+        let mut ctx = AddRmsnormContext {
+            residual: r.view(),
+            x: column_prefix(x, dim),
+            weight: w.view(),
+            out: o.view(),
+            eps: 1e-5,
+        };
+        kernel.execute(&mut ctx).expect("add_rmsnorm");
+    }
+    let what = format!("add_rmsnorm rows={rows} x_stride={x_stride} {cfg}");
+    assert_exact(
+        &format!("{what} residual"),
+        &impl_name,
+        &read(&r_hip),
+        &read(&r_cpu),
+    );
+    let residual = read(&r_cpu);
+    let weight = read(&w_cpu);
+    let (out_hip, out_cpu) = (read(&o_hip), read(&o_cpu));
+    let mut flips = 0usize;
+    for (i, (&g, &w)) in out_hip.iter().zip(&out_cpu).enumerate() {
+        if bf16_close(g, w) {
+            continue;
+        }
+        let row = &residual[i / dim * dim..(i / dim + 1) * dim];
+        let normed = rms_normalised(row, 1e-5, i % dim);
+        let allowed = one_rounding_step(normed, weight[i % dim]);
+        assert!(
+            allowed.contains(&g),
+            "{what} out ({impl_name}): element {i}: hip {g} vs cpu {w}, not within one BF16 \
+             rounding step of x·inv_rms = {normed} (allowed {allowed:?})"
+        );
+        flips += 1;
+    }
+    // A rounding flip of x·inv_rms needs x·inv_rms within f32 noise of a BF16 midpoint: rare.
+    assert!(
+        flips * 1000 <= n,
+        "{what} out ({impl_name}): {flips} of {n} elements need a rounding flip"
+    );
+    println!(
+        "{what} out: impl={impl_name} {flips} of {n} elements one intermediate rounding \
+         step from cpu, the rest within the BF16 tolerance ok"
+    );
+
+    // At Llama's 3072, rmsnorm runs the same ck_tile pipeline without the fused add: the
+    // fused op is bitwise HIP add followed by HIP rmsnorm.
+    if p.legacy && dim == HIDDEN && x_stride == dim {
+        let (r2, _) = twin(p, &[rows, dim], DType::BF16, &before);
+        let (o2, _) = twin(p, &[rows, dim], DType::BF16, &vec![0.0; n]);
+        let add = p.hip.elementwise().expect("hip add");
+        add.execute(&mut ElementwiseContext {
+            a: r2.view(),
+            b: x_hip.view(),
+            out: r2.view(),
+        })
+        .expect("hip add");
+        let norm = p.hip.norm().expect("hip rmsnorm");
+        norm.execute(&mut NormContext {
+            x: r2.view(),
+            weight: w_hip.view(),
+            out: o2.view(),
+            eps: 1e-5,
+        })
+        .expect("hip rmsnorm");
+        assert_exact(
+            &format!("{what} vs hip add + rmsnorm"),
+            &impl_name,
+            &out_hip,
+            &read(&o2),
+        );
     }
 }
 
@@ -591,11 +714,6 @@ fn add_rmsnorm_matches_cpu() {
     }
     let _gpu = lock_gpu();
     let p = setup();
-    let hip = p
-        .hip
-        .add_rmsnorm()
-        .expect("libturbine_hip.so exports the ABI v2.1 add_rmsnorm trio");
-    let cpu = p.cpu.add_rmsnorm().expect("cpu add_rmsnorm");
     let mut rng = Rng(21);
     // (rows, dim, row stride of x).
     let cases = [
@@ -609,95 +727,7 @@ fn add_rmsnorm_matches_cpu() {
         (7, 64, 64),
     ];
     for (rows, dim, x_stride) in cases {
-        let cfg = AddRmsnormConfig {
-            dtype: DType::BF16,
-            dim: dim as u32,
-        };
-        assert!(hip.supports(&cfg), "hip must support add_rmsnorm {cfg}");
-        let impl_name = hip.implementation(&cfg);
-        let n = rows * dim;
-        let before = rng.normal(n, 1.0);
-        let (r_hip, r_cpu) = twin(&p, &[rows, dim], DType::BF16, &before);
-        let x = rng.normal(rows * x_stride, 1.0);
-        let (x_hip, x_cpu) = twin(&p, &[rows, x_stride], DType::BF16, &x);
-        let (w_hip, w_cpu) = twin(&p, &[dim], DType::BF16, &rng.normal(dim, 1.0));
-        let (o_hip, o_cpu) = twin(&p, &[rows, dim], DType::BF16, &vec![0.0; n]);
-        let runs = [
-            (hip, &r_hip, &x_hip, &w_hip, &o_hip),
-            (cpu, &r_cpu, &x_cpu, &w_cpu, &o_cpu),
-        ];
-        for (kernel, r, x, w, o) in runs {
-            let mut ctx = AddRmsnormContext {
-                residual: r.view(),
-                x: column_prefix(x, dim),
-                weight: w.view(),
-                out: o.view(),
-                eps: 1e-5,
-            };
-            kernel.execute(&mut ctx).expect("add_rmsnorm");
-        }
-        let what = format!("add_rmsnorm rows={rows} x_stride={x_stride} {cfg}");
-        assert_exact(
-            &format!("{what} residual"),
-            &impl_name,
-            &read(&r_hip),
-            &read(&r_cpu),
-        );
-        let residual = read(&r_cpu);
-        let weight = read(&w_cpu);
-        let (out_hip, out_cpu) = (read(&o_hip), read(&o_cpu));
-        let mut flips = 0usize;
-        for (i, (&g, &w)) in out_hip.iter().zip(&out_cpu).enumerate() {
-            if bf16_close(g, w) {
-                continue;
-            }
-            let row = &residual[i / dim * dim..(i / dim + 1) * dim];
-            let normed = rms_normalised(row, 1e-5, i % dim);
-            let allowed = one_rounding_step(normed, weight[i % dim]);
-            assert!(
-                allowed.contains(&g),
-                "{what} out ({impl_name}): element {i}: hip {g} vs cpu {w}, not within one BF16 \
-                 rounding step of x·inv_rms = {normed} (allowed {allowed:?})"
-            );
-            flips += 1;
-        }
-        // A rounding flip of x·inv_rms needs x·inv_rms within f32 noise of a BF16 midpoint: rare.
-        assert!(
-            flips * 1000 <= n,
-            "{what} out ({impl_name}): {flips} of {n} elements need a rounding flip"
-        );
-        println!(
-            "{what} out: impl={impl_name} {flips} of {n} elements one intermediate rounding \
-             step from cpu, the rest within the BF16 tolerance ok"
-        );
-
-        // At Llama's 3072, rmsnorm runs the same ck_tile pipeline without the fused add: the
-        // fused op is bitwise HIP add followed by HIP rmsnorm.
-        if dim == HIDDEN && x_stride == dim {
-            let (r2, _) = twin(&p, &[rows, dim], DType::BF16, &before);
-            let (o2, _) = twin(&p, &[rows, dim], DType::BF16, &vec![0.0; n]);
-            let add = p.hip.elementwise().expect("hip add");
-            add.execute(&mut ElementwiseContext {
-                a: r2.view(),
-                b: x_hip.view(),
-                out: r2.view(),
-            })
-            .expect("hip add");
-            let norm = p.hip.norm().expect("hip rmsnorm");
-            norm.execute(&mut NormContext {
-                x: r2.view(),
-                weight: w_hip.view(),
-                out: o2.view(),
-                eps: 1e-5,
-            })
-            .expect("hip rmsnorm");
-            assert_exact(
-                &format!("{what} vs hip add + rmsnorm"),
-                &impl_name,
-                &out_hip,
-                &read(&o2),
-            );
-        }
+        add_rmsnorm_case(&p, &mut rng, rows, dim, x_stride);
     }
 }
 
@@ -1027,11 +1057,13 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
     // P2c S-11: the HIP library reads the offsets on the device for up to 512 routed rows
     // (small-m) and, above, whenever hidden and inter are multiples of 64 (grouped WMMA).
     let needs_host = hip.needs_host_offsets(&cfg, rows);
-    assert_eq!(
-        needs_host,
-        rows > MOE_SMALL_M_MAX_ROWS && (hidden % 64 != 0 || inter % 64 != 0),
-        "needs_host_offsets for {rows} routed rows, hidden {hidden}, inter {inter}"
-    );
+    if p.legacy {
+        assert_eq!(
+            needs_host,
+            rows > MOE_SMALL_M_MAX_ROWS && (hidden % 64 != 0 || inter % 64 != 0),
+            "needs_host_offsets for {rows} routed rows, hidden {hidden}, inter {inter}"
+        );
+    }
     let impl_name = format!(
         "{} host_offsets={needs_host}",
         hip.implementation_experts(&cfg)
@@ -1185,6 +1217,55 @@ fn paged_prefill_ck_128_matches_cpu() {
     }
 }
 
+/// `copy_blocks` over 3 layers of 8 sixteen-token Llama blocks; the third pair reads a
+/// block the first pair wrote, so the copy order matters.
+fn copy_blocks_case(p: &Pair, rng: &mut Rng) {
+    let block_elems = 2 * 16 * KV_HEADS * HEAD_DIM;
+    let block_bytes = (block_elems * 2) as u64;
+    let (layers, per_layer) = (3usize, 8usize);
+    let copy_cfg = KvCopyConfig {
+        num_layers: layers as u32,
+        block_bytes,
+    };
+    let hip = p.hip.kv_copy().expect("hip copy_blocks");
+    assert!(
+        hip.supports(&copy_cfg),
+        "hip must support copy_blocks {copy_cfg}"
+    );
+    let impl_name = hip.implementation(&copy_cfg);
+    let (pool_hip, pool_cpu) = twin(
+        p,
+        &[layers, per_layer, block_elems],
+        DType::BF16,
+        &rng.normal(layers * per_layer * block_elems, 1.0),
+    );
+    let pairs = [
+        (BlockId(3), BlockId(7)),
+        (BlockId(0), BlockId(5)),
+        (BlockId(7), BlockId(1)),
+    ];
+    let runs = [
+        (hip, &pool_hip),
+        (p.cpu.kv_copy().expect("cpu copy_blocks"), &pool_cpu),
+    ];
+    for (kernel, pool) in runs {
+        let mut ctx = KvCopyContext {
+            pool: pool.view().slice,
+            layer_stride_bytes: per_layer as u64 * block_bytes,
+            block_bytes,
+            num_layers: layers as u32,
+            pairs: &pairs,
+        };
+        kernel.execute(&mut ctx).expect("copy_blocks");
+    }
+    assert_exact(
+        &format!("copy_blocks {copy_cfg} pairs={pairs:?}"),
+        &impl_name,
+        &read(&pool_hip),
+        &read(&pool_cpu),
+    );
+}
+
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn paged_and_moe_ops() {
@@ -1220,52 +1301,7 @@ fn paged_and_moe_ops() {
         );
     }
 
-    // copy_blocks over 3 layers of 8 sixteen-token Llama blocks; the third pair reads a block
-    // the first pair wrote, so the copy order matters.
-    let block_elems = 2 * 16 * KV_HEADS * HEAD_DIM;
-    let block_bytes = (block_elems * 2) as u64;
-    let (layers, per_layer) = (3usize, 8usize);
-    let copy_cfg = KvCopyConfig {
-        num_layers: layers as u32,
-        block_bytes,
-    };
-    let hip = p.hip.kv_copy().expect("hip copy_blocks");
-    assert!(
-        hip.supports(&copy_cfg),
-        "hip must support copy_blocks {copy_cfg}"
-    );
-    let impl_name = hip.implementation(&copy_cfg);
-    let (pool_hip, pool_cpu) = twin(
-        &p,
-        &[layers, per_layer, block_elems],
-        DType::BF16,
-        &rng.normal(layers * per_layer * block_elems, 1.0),
-    );
-    let pairs = [
-        (BlockId(3), BlockId(7)),
-        (BlockId(0), BlockId(5)),
-        (BlockId(7), BlockId(1)),
-    ];
-    let runs = [
-        (hip, &pool_hip),
-        (p.cpu.kv_copy().expect("cpu copy_blocks"), &pool_cpu),
-    ];
-    for (kernel, pool) in runs {
-        let mut ctx = KvCopyContext {
-            pool: pool.view().slice,
-            layer_stride_bytes: per_layer as u64 * block_bytes,
-            block_bytes,
-            num_layers: layers as u32,
-            pairs: &pairs,
-        };
-        kernel.execute(&mut ctx).expect("copy_blocks");
-    }
-    assert_exact(
-        &format!("copy_blocks {copy_cfg} pairs={pairs:?}"),
-        &impl_name,
-        &read(&pool_hip),
-        &read(&pool_cpu),
-    );
+    copy_blocks_case(&p, &mut rng);
 
     // moe_route: OLMoE (64 experts, top-8, no renormalisation, BF16 router logits) on random
     // logits; exact ties (the set torch.topk keeps, not always the lower ids); logits that
@@ -4139,5 +4175,273 @@ fn implementations_enumerated() {
             "{what}: first supporting implementation"
         );
         println!("{what}: {recorded} ok");
+    }
+}
+
+/// A copy of `p` whose HIP provider runs implementation `index` of `spec`'s op on every call
+/// (bound the way the kernel registry binds the implementation it chose).
+fn bound(p: &Pair, spec: &OpConfig, index: u32) -> Pair {
+    Pair {
+        hip: p
+            .hip
+            .bind(spec, &ImplChoice::Single(index))
+            .unwrap_or_else(|| panic!("bind {} implementation {index}", spec.op())),
+        cpu: Arc::clone(&p.cpu),
+        hip_mem: Arc::clone(&p.hip_mem),
+        cpu_mem: Arc::clone(&p.cpu_mem),
+        legacy: false,
+    }
+}
+
+/// One case of `every_implementation_matches_cpu`: the config an implementation must support
+/// (`moe_experts` at `rows` routed rows) and the existing `hip_ops` case that runs it against the
+/// CPU reference with that op's tolerance.
+/// A case body run with a (bound) pair.
+type CaseFn<'a> = Box<dyn Fn(&Pair, &mut Rng) + 'a>;
+
+struct ImplCase<'a> {
+    spec: OpConfig,
+    rows: Option<u32>,
+    run: CaseFn<'a>,
+}
+
+/// Phase 2m S-5 / S-13: every implementation the library enumerates for every op, run alone
+/// through `turbine_impl_run` (a provider bound to it) on the shapes of the existing `hip_ops`
+/// cases of that op it supports (`moe_experts` at 8 and 1,024 routed rows, paged attention at 16-
+/// and 128-token pages), matches the CPU reference under that op's tolerance. Every enumerated
+/// implementation runs at least once, except `hipblaslt_grouped` where hipBLASLt has no grouped
+/// solution. Breaks if an implementation the registry can choose disagrees with the reference.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn every_implementation_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(31);
+    let bf16 = DType::BF16;
+    let gemm = |n: usize, k: usize, c_dtype| {
+        OpConfig::Gemm(GemmConfig {
+            n: n as u64,
+            k: k as u64,
+            trans_b: true,
+            a_dtype: bf16,
+            b_dtype: bf16,
+            c_dtype,
+        })
+    };
+    let attention = |kind, block_tokens: Option<usize>, (q, kv): (usize, usize)| {
+        OpConfig::Attention(AttentionConfig {
+            kind,
+            num_q_heads: q as u32,
+            num_kv_heads: kv as u32,
+            head_dim: HEAD_DIM as u32,
+            dtype: bf16,
+            block_tokens: block_tokens.map(|b| b as u32),
+            causal: true,
+        })
+    };
+    let w = expert_weights(&p, &mut rng);
+    let experts_cfg = MoeExpertsConfig {
+        hidden: MOE_HIDDEN as u32,
+        inter: MOE_INTER as u32,
+        num_experts: MOE_EXPERTS as u32,
+        top_k: MOE_TOP_K as u32,
+        expert_begin: 0,
+        expert_end: MOE_EXPERTS as u32,
+        dtype: bf16,
+    };
+    let olmoe_route = MoeRouteConfig {
+        num_experts: MOE_EXPERTS as u32,
+        top_k: MOE_TOP_K as u32,
+        renormalize: false,
+        bf16_logits: true,
+    };
+    fn case<'a>(spec: OpConfig, run: CaseFn<'a>) -> ImplCase<'a> {
+        ImplCase {
+            spec,
+            rows: None,
+            run,
+        }
+    }
+
+    let mut cases: Vec<ImplCase<'_>> = vec![
+        case(
+            gemm(HIDDEN, HIDDEN, bf16),
+            Box::new(|p, rng| {
+                gemm_case(p, rng, 1, HIDDEN, HIDDEN, DType::BF16);
+                gemm_case(p, rng, 17, INTERMEDIATE, HIDDEN, DType::BF16);
+                gemm_case(p, rng, 17, 1024, HIDDEN, DType::F32);
+            }),
+        ),
+        case(
+            attention(AttentionKind::Prefill, None, (Q_HEADS, KV_HEADS)),
+            Box::new(|p, rng| {
+                attention_case(p, rng, AttentionKind::Prefill, 17, 0);
+                attention_case(p, rng, AttentionKind::Prefill, 17, 100);
+            }),
+        ),
+        case(
+            attention(AttentionKind::Decode, None, (Q_HEADS, KV_HEADS)),
+            Box::new(|p, rng| attention_case(p, rng, AttentionKind::Decode, 1, 511)),
+        ),
+        case(
+            OpConfig::Rmsnorm(NormConfig {
+                dim: HIDDEN as u64,
+                dtype: bf16,
+            }),
+            // The inputs of `norm_rope_silu_embedding_add_match_cpu` (seed 3): `norm_case`'s
+            // BF16 tolerance has no allowance for a rounding flip of `x·inv_rms`, which other
+            // seeds hit on the ck_tile pipeline (see `add_rmsnorm_matches_cpu`).
+            Box::new(|p, _rng| norm_case(p, &mut Rng(3), 17)),
+        ),
+        case(
+            OpConfig::Rope(RopeConfig {
+                num_q_heads: Q_HEADS as u32,
+                num_kv_heads: KV_HEADS as u32,
+                head_dim: HEAD_DIM as u32,
+                rotary_dim: HEAD_DIM as u32,
+                dtype: bf16,
+            }),
+            Box::new(|p, rng| rope_case(p, rng, 17)),
+        ),
+        case(
+            OpConfig::SiluMul(ActivationConfig {
+                cols: INTERMEDIATE as u64,
+                dtype: bf16,
+            }),
+            Box::new(|p, rng| silu_mul_case(p, rng, 17)),
+        ),
+        case(
+            OpConfig::Embedding(EmbeddingConfig {
+                hidden: HIDDEN as u64,
+                vocab_rows: VOCAB as u64,
+                dtype: bf16,
+            }),
+            Box::new(|p, rng| embedding_case(p, rng, 17)),
+        ),
+        case(
+            OpConfig::Add(ElementwiseConfig { dtype: bf16 }),
+            Box::new(|p, rng| add_case(p, rng, 17)),
+        ),
+        case(
+            OpConfig::CopyBlocks(KvCopyConfig {
+                num_layers: 3,
+                block_bytes: (2 * 16 * KV_HEADS * HEAD_DIM * 2) as u64,
+            }),
+            Box::new(copy_blocks_case),
+        ),
+        case(
+            OpConfig::MoeRoute(olmoe_route),
+            Box::new(move |p, rng| {
+                let logits = rng.normal(37 * MOE_EXPERTS, 2.0);
+                route_case(p, olmoe_route, 37, &logits);
+            }),
+        ),
+        case(
+            OpConfig::LogitsReduce(LogitsReduceConfig {
+                vocab: 50_304,
+                top_n: 64,
+            }),
+            Box::new(|p, rng| {
+                logits_reduce_case(p, rng, 64, 50_304, 64);
+                logits_reduce_case(p, rng, 7, 50_304, 5);
+            }),
+        ),
+    ];
+    for (rows, dim, x_stride) in [
+        (16, HIDDEN, HIDDEN),
+        (16, MOE_HIDDEN, MOE_HIDDEN),
+        (7, 64, 64),
+    ] {
+        // (The row-strided x case of `add_rmsnorm_matches_cpu` is left out: a stride is not
+        // part of the config an implementation is chosen for, and ck_tile refuses one that is
+        // not a multiple of 8 at run time rather than switching implementation.)
+        cases.push(case(
+            OpConfig::AddRmsnorm(AddRmsnormConfig {
+                dim: dim as u32,
+                dtype: bf16,
+            }),
+            Box::new(move |p, rng| add_rmsnorm_case(p, rng, rows, dim, x_stride)),
+        ));
+    }
+    for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
+        for block_tokens in [16, 128] {
+            cases.push(case(
+                attention(kind, Some(block_tokens), (Q_HEADS, KV_HEADS)),
+                Box::new(move |p, rng| {
+                    let (q_lens, kv_lens): (&[usize], &[usize]) = match kind {
+                        AttentionKind::PrefillPaged => (&[37, 1, 70], &[37, 300, 200]),
+                        _ => (&[1, 1, 1, 1], &[1, 17, 129, 513]),
+                    };
+                    paged_case(
+                        p,
+                        rng,
+                        kind,
+                        (Q_HEADS, KV_HEADS),
+                        block_tokens,
+                        q_lens,
+                        kv_lens,
+                    );
+                }),
+            ));
+        }
+    }
+    for tokens in [1usize, 128] {
+        let w = &w;
+        cases.push(ImplCase {
+            spec: OpConfig::MoeExperts(experts_cfg),
+            rows: Some((tokens * MOE_TOP_K) as u32),
+            run: Box::new(move |p, rng| {
+                let logits = rng.normal(tokens * MOE_EXPERTS, 1.0);
+                let case = ExpertsCase {
+                    tokens,
+                    logits: &logits,
+                    local: (0, MOE_EXPERTS),
+                    workspace: false,
+                    repeat: 0,
+                };
+                experts_case(p, rng, w, &case);
+            }),
+        });
+    }
+
+    let mut ran: Vec<(OpKind, String)> = Vec::new();
+    for c in &cases {
+        let op = c.spec.op();
+        let impls = p.hip.implementations(op);
+        assert!(!impls.is_empty(), "{op}: the library enumerates nothing");
+        for info in impls {
+            let what = format!(
+                "{op} {} rows={:?} impl={}",
+                c.spec.render(),
+                c.rows,
+                info.name
+            );
+            if !p.hip.implementation_supports(&c.spec, info.index, c.rows) {
+                println!("every_implementation {what}: not supported, skipped");
+                continue;
+            }
+            (c.run)(&bound(&p, &c.spec, info.index), &mut rng);
+            println!("every_implementation {what}: ok");
+            ran.push((op, info.name));
+        }
+    }
+    for &op in OpKind::ALL {
+        for info in p.hip.implementations(op) {
+            if ran.iter().any(|(o, n)| *o == op && *n == info.name) {
+                continue;
+            }
+            assert_eq!(
+                info.name, "hipblaslt_grouped",
+                "{op} implementation {} never ran",
+                info.name
+            );
+            println!(
+                "every_implementation {op} {}: no case supports it",
+                info.name
+            );
+        }
     }
 }

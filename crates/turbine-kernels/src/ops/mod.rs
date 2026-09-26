@@ -6,11 +6,13 @@
 //! The compute stream is implicit: every provider owns its context and enqueues on that
 //! context's compute stream (contract §9.2).
 use std::fmt;
+use std::sync::Arc;
 
 use turbine_core::types::{BlockId, DType};
 use turbine_tensor::{DeviceSlice, TensorView};
 
 use crate::KernelError;
+use crate::cards::CardProfile;
 use crate::registry::OpConfig;
 
 /// One entry point of the kernel C ABI; `as_str` is the `turbine_<op>` suffix and the `op`
@@ -109,6 +111,40 @@ pub struct ImplInfo {
     pub provider: String,
     /// `moe_experts`: the implementation reads `host_expert_offsets`.
     pub needs_host_offsets: bool,
+}
+
+/// The implementation(s) the kernel registry chose for one op config: one index, or one per
+/// routed-row tier (`moe_experts`), each an index into the provider's
+/// [`KernelProvider::implementations`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImplChoice {
+    Single(u32),
+    /// Tiers in ascending `max_rows`, the open tier (`max_rows: None`) last.
+    ByRows(Vec<RowTier>),
+}
+
+/// One routed-row tier of an [`ImplChoice::ByRows`]: up to `max_rows` rows (`None` = no upper
+/// bound) run implementation `index`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowTier {
+    pub max_rows: Option<u32>,
+    pub index: u32,
+}
+
+impl ImplChoice {
+    /// The implementation index a call of `rows` routed rows runs: the first tier whose bound
+    /// holds `rows` (the last tier when none does). One comparison per tier (at most two).
+    #[inline]
+    pub fn index_for(&self, rows: usize) -> u32 {
+        match self {
+            ImplChoice::Single(index) => *index,
+            ImplChoice::ByRows(tiers) => tiers
+                .iter()
+                .find(|t| t.max_rows.is_none_or(|max| rows <= max as usize))
+                .or(tiers.last())
+                .map_or(0, |t| t.index),
+        }
+    }
 }
 
 impl fmt::Display for OpKind {
@@ -754,6 +790,21 @@ pub trait KernelProvider: Send + Sync {
     fn implementation_supports(&self, spec: &OpConfig, index: u32, rows: Option<u32>) -> bool {
         let _ = (spec, index, rows);
         false
+    }
+
+    /// A provider that runs `choice` for `spec` on every call (the kernel registry binds one per
+    /// op config at startup); `None` (the default) runs this provider as it is, i.e. with its
+    /// own choice.
+    fn bind(&self, spec: &OpConfig, choice: &ImplChoice) -> Option<Arc<dyn KernelProvider>> {
+        let _ = (spec, choice);
+        None
+    }
+
+    /// The card profile the provider's device context runs with (a kernel library context after
+    /// `set_profile`), the `card` a caller passes to `KernelRegistry::build`; `None` (the
+    /// default) for a provider without one.
+    fn card_profile(&self) -> Option<&'static CardProfile> {
+        None
     }
 }
 

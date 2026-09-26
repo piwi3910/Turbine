@@ -263,13 +263,11 @@ int32_t turbine_rmsnorm_supported(const turbine_rmsnorm_desc *d) {
 }
 
 const char *turbine_rmsnorm_impl(const turbine_rmsnorm_desc *d) {
-  if (valid(d) && ck_bucket(d))
-    return kImplCk;
-  return kImplTurbine;
+  return turbine_hip::default_name(TURBINE_OP_RMSNORM, d);
 }
 
 int32_t turbine_rmsnorm(turbine_ctx *ctx, const turbine_rmsnorm_desc *d) {
-  return turbine_hip::rmsnorm_run(ctx, d, valid(d) && ck_bucket(d));
+  return turbine_hip::run_default(ctx, TURBINE_OP_RMSNORM, d);
 }
 
 int32_t turbine_add_rmsnorm_supported(const turbine_add_rmsnorm_desc *d) {
@@ -277,14 +275,12 @@ int32_t turbine_add_rmsnorm_supported(const turbine_add_rmsnorm_desc *d) {
 }
 
 const char *turbine_add_rmsnorm_impl(const turbine_add_rmsnorm_desc *d) {
-  if (add_valid(d) && add_ck_bucket(d))
-    return kImplCk;
-  return kImplTurbine;
+  return turbine_hip::default_name(TURBINE_OP_ADD_RMSNORM, d);
 }
 
 int32_t turbine_add_rmsnorm(turbine_ctx *ctx,
                             const turbine_add_rmsnorm_desc *d) {
-  return turbine_hip::add_rmsnorm_run(ctx, d, add_valid(d) && add_ck_bucket(d));
+  return turbine_hip::run_default(ctx, TURBINE_OP_ADD_RMSNORM, d);
 }
 
 } // extern "C"

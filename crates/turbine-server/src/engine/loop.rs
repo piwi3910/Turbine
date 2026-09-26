@@ -1610,6 +1610,7 @@ mod tests {
             &order,
             &executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default()),
             &KernelMetrics::register(&MetricsRegistry::new()),
+            None,
         )
         .unwrap();
         executor::build_executor(
@@ -1780,6 +1781,7 @@ mod tests {
             &order,
             &reqs,
             &KernelMetrics::register(&MetricsRegistry::new()),
+            None,
         )
         .unwrap();
         executor::build_executor(

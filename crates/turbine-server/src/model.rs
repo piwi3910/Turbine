@@ -279,9 +279,13 @@ pub fn prepare(
         &opened.order,
         &requirements,
         &KernelMetrics::register(metrics),
+        opened.card,
     )
     .map_err(|e| kernel_error("kernel selection", e))?;
-    for note in provider.backend.selection_notes(registry.selections()) {
+    for note in provider
+        .backend
+        .selection_notes(opened.card, registry.selections())
+    {
         log_backend_note(&note, block_tokens);
     }
 

@@ -635,11 +635,13 @@ fn build_executor(
         .expect("load weights");
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
     let order = [provider.id()];
+    let card = provider.card_profile();
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
         &executor::requirements(&cfg, BLOCK_TOKENS, ExecutorOptions::default()),
         &metrics,
+        card,
     )
     .expect("every op has a provider");
     let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
@@ -883,11 +885,13 @@ fn build_any_executor(
         WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("load weights");
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
     let order = [provider.id()];
+    let card = provider.card_profile();
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
         &executor::requirements(&cfg, BLOCK_TOKENS, ExecutorOptions::default()),
         &metrics,
+        card,
     )
     .expect("every op has a provider");
     let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");

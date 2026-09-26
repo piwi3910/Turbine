@@ -88,8 +88,23 @@ pub struct KernelChoiceView {
     pub op: String,
     pub config: String,
     pub provider: String,
+    /// The implementation that runs (for a tiered op, its first tier's).
     pub implementation: String,
+    /// The implementation's family (`hipblaslt`, `ck`, `turbine_hip`), or the provider for a
+    /// provider that chooses internally.
+    pub impl_provider: String,
     pub reason: String,
+    /// `profile_preferred`, `profile_fallback`, `library_order` or `provider_internal`.
+    pub reason_code: String,
+    /// Routed-row tiers of a tiered op (`moe_experts`), empty otherwise.
+    pub tiers: Vec<KernelTierView>,
+}
+
+/// One routed-row tier of a [`KernelChoiceView`]: up to `max_rows` rows (`null` = no bound).
+#[derive(Clone, Debug, Serialize)]
+pub struct KernelTierView {
+    pub max_rows: Option<u32>,
+    pub implementation: String,
 }
 
 impl From<&Selection> for KernelChoiceView {
@@ -99,7 +114,17 @@ impl From<&Selection> for KernelChoiceView {
             config: s.config.clone(),
             provider: s.provider.0.to_string(),
             implementation: s.implementation.clone(),
+            impl_provider: s.impl_provider.clone(),
             reason: s.reason.clone(),
+            reason_code: s.reason_code.to_string(),
+            tiers: s
+                .tiers
+                .iter()
+                .map(|(max_rows, implementation)| KernelTierView {
+                    max_rows: *max_rows,
+                    implementation: implementation.clone(),
+                })
+                .collect(),
         }
     }
 }

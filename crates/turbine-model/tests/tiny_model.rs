@@ -19,7 +19,7 @@ use turbine_kernels::{
     KernelRegistry, KvCopyConfig, KvCopyContext, KvCopyKernel, MoeExpertsConfig, MoeExpertsContext,
     MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel,
     PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel, ShimContext,
-    cpu_reference_provider, shim_provider,
+    ShimLibrary, cpu_reference_provider, shim_provider,
 };
 use turbine_model::config::{ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
@@ -125,11 +125,13 @@ fn paged_executor(
         WeightLoader::load(&index, &llama_slots(cfg), &mem, MAX_STAGING_BYTES).expect("load");
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
     let order = [provider.id()];
+    let card = provider.card_profile();
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
         &executor::requirements(cfg, BLOCK_TOKENS, ALL_FUSED),
         &metrics,
+        card,
     )
     .expect("every op has a provider");
     DecoderExecutor::new(
@@ -977,7 +979,8 @@ fn cpu_model_with(
     if reduce {
         reqs.push(executor::logits::reduce_requirement(cfg));
     }
-    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+    let card = provider.card_profile();
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
         .expect("every op has a provider");
     build_executor(
         cfg,
@@ -1667,7 +1670,8 @@ fn olmoe_decode_single_device_copy() {
             opts,
             std::slice::from_ref(&provider),
         );
-        let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+        let card = provider.card_profile();
+        let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
             .expect("every op has a provider");
         let mut exec = build_executor(
             cfg,
@@ -1989,7 +1993,8 @@ fn hip_graph_executor(
     reqs.push(executor::logits::reduce_requirement(cfg));
     let order = [provider.id()];
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
-    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+    let card = provider.card_profile();
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
         .expect("every op has a provider");
     build_executor(
         cfg,
@@ -2930,8 +2935,9 @@ fn cpu_profiled(
     let opts = ExecutorOptions::default();
     let reqs =
         executor::available_requirements(cfg, BLOCK_TOKENS, opts, std::slice::from_ref(&provider));
+    let card = provider.card_profile();
     let registry = Arc::new(
-        KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+        KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
             .expect("every op has a provider"),
     );
     let exec = DecoderExecutor::new(
@@ -3099,5 +3105,176 @@ fn op_profile_accounts_forward() {
         let again = exec.forward(&batch).expect("decode after profiling");
         assert_eq!(again, off, "{arch:?}");
         assert!(exec.take_profile().entries.is_empty(), "{arch:?}");
+    }
+}
+
+/// One sequence through `exec` on a pool of its own: the first `prompt_len` tokens of `feed` as
+/// one prefill, then one decode step per token. With `greedy` each step's token is the argmax of
+/// the previous row (for `steps` steps; `feed` holds only the prompt), else the next token of
+/// `feed`. Returns the tokens fed and every forward's logits row.
+fn single_sequence(
+    exec: &mut dyn ModelExecutor,
+    mem: &Arc<dyn DeviceMemory>,
+    feed: &[u32],
+    prompt_len: usize,
+    steps: usize,
+    greedy: bool,
+) -> (Vec<u32>, Vec<Vec<f32>>) {
+    let layout = *exec.kv_layout();
+    let blocks = ((prompt_len + steps) as u32).div_ceil(layout.block_tokens);
+    let storage = pool(mem, &layout, blocks);
+    let kv = pool_view(&storage, &layout, blocks);
+    let table: Vec<BlockId> = (0..blocks).map(BlockId).collect();
+    let run = |exec: &mut dyn ModelExecutor, tokens: &[u32], start: u32| {
+        let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
+        let seqs = [SeqSlice {
+            seq: SeqId(1),
+            q_start: 0,
+            q_len: tokens.len() as u32,
+            kv_len: start + tokens.len() as u32,
+            block_table: &table,
+            reduce: None,
+        }];
+        exec.forward(&BatchInput {
+            tokens,
+            positions: &positions,
+            seqs: &seqs,
+            kv: &kv,
+        })
+        .expect("forward")
+        .row(0)
+        .to_vec()
+    };
+    let mut tokens = feed[..prompt_len].to_vec();
+    let mut rows = vec![run(exec, &tokens, 0)];
+    for step in 0..steps {
+        let next = if greedy {
+            argmax(rows.last().expect("a row"))
+        } else {
+            feed[prompt_len + step]
+        };
+        let pos = tokens.len() as u32;
+        tokens.push(next);
+        rows.push(run(exec, &[next], pos));
+    }
+    (tokens, rows)
+}
+
+/// HIP vs CPU logit bound of the head_dim-128 tiny OLMoE: its expert GEMMs and weighted sum
+/// round to BF16 in another order than the reference; 3.7e-3 measured on the R9700 (lab run
+/// 0926202901-0eb0e349), where the tiny Llama stays within `HIP_MAX_ABS_LOGIT_DIFF`.
+const HIP_MAX_ABS_LOGIT_DIFF_MOE: f32 = 1e-2;
+
+/// Phase 2m S-5: a kernel library without the ABI v2.4 group still loads and serves.
+/// `libturbine_hip_v23.so` (the same kernels, minor 3, built beside `TURBINE_KERNEL_LIBRARY`)
+/// enumerates nothing, so every selection on it is the library's own (`provider_internal`); it
+/// chooses the implementations the Rust registry binds on `libturbine_hip.so`, and on the tiny
+/// Llama and OLMoE (head_dim 128) a greedy run on it, like one on the bound v2.4 library,
+/// matches the CPU reference greedily (every step's argmax) and within a logit bound: the
+/// `hip_matches_cpu` bound for Llama, [`HIP_MAX_ABS_LOGIT_DIFF_MOE`] for OLMoE (the two libraries
+/// tune their GEMMs per context, so they are compared through the reference, not bitwise). Breaks if an older library no longer loads
+/// or serves, or if the Rust selection departs from the library's own.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_v23_library_matches_cpu() {
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let opened = turbine_kernels::test_support::open_backend("hip");
+    let device = opened
+        .device
+        .clone()
+        .expect("the hip backend runs on a device");
+    let main_ctx = opened.context.clone().expect("a kernel library context");
+    assert!(main_ctx.library().enumerates_implementations());
+    let v23_path = main_ctx
+        .library()
+        .path()
+        .with_file_name("libturbine_hip_v23.so");
+    let lib = ShimLibrary::load(&v23_path, "hip")
+        .unwrap_or_else(|e| panic!("load {}: {e}", v23_path.display()));
+    assert_eq!(lib.abi_minor(), 3);
+    assert!(!lib.enumerates_implementations());
+    let ctx = lib.create_context(&device).expect("v2.3 context");
+    if let Some(card) = opened.card {
+        ctx.set_profile(card)
+            .expect("a v2.3 library ignores the card profile");
+    }
+    let old_mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let new_mem: Arc<dyn DeviceMemory> = main_ctx.clone();
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let tmp = TempDir::new("tiny-model-hip-v23");
+    let specs = [
+        write_gpu_tiny(&tmp.path().join("llama")),
+        write_tiny_olmoe_with_head_dim(&tmp.path().join("olmoe"), SEED, GPU_HEAD_DIM),
+    ];
+    let opts = ExecutorOptions::default();
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let selections = |provider: &Arc<dyn KernelProvider>, spec: &TinySpec| {
+        let reqs = executor::available_requirements(
+            &spec.config,
+            BLOCK_TOKENS,
+            opts,
+            std::slice::from_ref(provider),
+        );
+        KernelRegistry::build(
+            vec![Arc::clone(provider)],
+            &[provider.id()],
+            &reqs,
+            &metrics,
+            provider.card_profile(),
+        )
+        .expect("the library serves every op")
+        .selections()
+        .to_vec()
+    };
+    for (spec, bound_diff) in specs
+        .iter()
+        .zip([HIP_MAX_ABS_LOGIT_DIFF, HIP_MAX_ABS_LOGIT_DIFF_MOE])
+    {
+        let name = spec.dir.display().to_string();
+        let old = shim_provider(ctx.clone());
+        let new = shim_provider(main_ctx.clone());
+        let (old_sel, new_sel) = (selections(&old, spec), selections(&new, spec));
+        assert!(
+            old_sel.iter().all(|s| s.reason_code == "provider_internal"),
+            "{name}: {old_sel:?}"
+        );
+        assert!(
+            new_sel.iter().all(|s| s.reason_code != "provider_internal"),
+            "{name}: {new_sel:?}"
+        );
+        let chosen = |sel: &[turbine_kernels::Selection]| {
+            sel.iter()
+                .map(|s| (s.op, s.config.clone(), s.implementation.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(chosen(&old_sel), chosen(&new_sel), "{name}");
+
+        let prompt = prompt(spec.vocab);
+        let n = prompt.len();
+        let mut cpu = cpu_model_with(spec, &host, 128, opts, cpu_reference_provider(), false);
+        let (feed, want) = single_sequence(cpu.as_mut(), &host, &prompt, n, 16, true);
+        let mut v23 = cpu_model_with(spec, &old_mem, 128, opts, old, false);
+        let (_, got) = single_sequence(v23.as_mut(), &old_mem, &feed, n, 16, false);
+        let mut v24 = cpu_model_with(spec, &new_mem, 128, opts, new, false);
+        let (_, bound) = single_sequence(v24.as_mut(), &new_mem, &feed, n, 16, false);
+        for (lib, rows) in [("v2.3", &got), ("v2.4", &bound)] {
+            let mut worst = 0f32;
+            for (step, (g, w)) in rows.iter().zip(&want).enumerate() {
+                let diff = max_abs_diff(g, w);
+                worst = worst.max(diff);
+                assert!(
+                    diff <= bound_diff,
+                    "{name} {lib} step {step}: max abs diff {diff}"
+                );
+                assert_eq!(
+                    argmax(g),
+                    argmax(w),
+                    "{name} {lib}: greedy token {step} differs"
+                );
+            }
+            println!("hip_v23_library_matches_cpu {name} {lib}: max abs logit diff {worst}");
+        }
     }
 }

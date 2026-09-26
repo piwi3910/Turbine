@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use libloading::Library;
 use turbine_core::types::{DType, DeviceId};
@@ -48,11 +48,11 @@ use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
     ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
-    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplInfo, KernelProvider, KvCopyConfig,
-    KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
-    MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
-    NormContext, NormKernel, OpKind, PagedAttentionContext, ProviderId, RopeConfig, RopeContext,
-    RopeKernel,
+    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplChoice, ImplInfo, KernelProvider,
+    KvCopyConfig, KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext,
+    LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
+    MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
+    ProviderId, RopeConfig, RopeContext, RopeKernel,
 };
 use crate::registry::OpConfig;
 use crate::{KernelError, TURBINE_KERNELS_ABI_VERSION};
@@ -313,6 +313,7 @@ impl ShimLibrary {
             info,
             staging: Mutex::new(StagingTable::default()),
             self_ref: weak.clone(),
+            card: OnceLock::new(),
         }))
     }
 }
@@ -357,6 +358,8 @@ pub struct ShimContext {
     staging: Mutex<StagingTable>,
     /// Lets `compute_stream` hand out an owning `Arc` of this context.
     self_ref: Weak<ShimContext>,
+    /// The card profile of `set_profile` (ABI v2.4).
+    card: OnceLock<&'static CardProfile>,
 }
 
 /// The staging buffers of one context and the next id.
@@ -520,8 +523,10 @@ impl ShimContext {
     /// this context's device architecture; the defaults of the `turbine_<op>` entry points read
     /// them. A no-op `Ok` when the library does not enumerate implementations (it keeps its own
     /// choice); `Unsupported` when the library refuses the profile (wave size, LDS or arch).
-    pub fn set_profile(&self, profile: &CardProfile) -> Result<(), KernelError> {
+    /// The first profile set is the context's [`ShimContext::card_profile`].
+    pub fn set_profile(&self, profile: &'static CardProfile) -> Result<(), KernelError> {
         let Some(fns) = self.lib.syms.v21.impls else {
+            let _ = self.card.set(profile);
             return Ok(());
         };
         let arch = std::ffi::CString::new(self.info.device_arch.as_str()).map_err(|_| {
@@ -544,7 +549,14 @@ impl ShimContext {
         // SAFETY: `raw` is a live context of this library; `desc` and the string `arch` points
         // to live on this stack frame for the call, and the library copies what it keeps.
         let code = unsafe { (fns.set_profile)(self.raw, &desc) };
-        self.check(code)
+        self.check(code)?;
+        let _ = self.card.set(profile);
+        Ok(())
+    }
+
+    /// The card profile set on this context (`None` before [`ShimContext::set_profile`]).
+    pub fn card_profile(&self) -> Option<&'static CardProfile> {
+        self.card.get().copied()
     }
 
     fn graph_fns(&self) -> Result<ffi::GraphFns, KernelError> {
@@ -905,14 +917,34 @@ impl DeviceMemory for ShimContext {
 }
 
 /// The kernel provider of a shim context: `supports` → `turbine_<op>_supported` (null
-/// pointers), `implementation` → `turbine_<op>_impl`, `execute` → `turbine_<op>`.
+/// pointers), `implementation` → `turbine_<op>_impl`, `execute` → `turbine_<op>`, where the
+/// library chooses the implementation. A provider bound to one op config
+/// ([`KernelProvider::bind`], kernel ABI v2.4) runs that op through
+/// `turbine_impl_run(index)` with the index the kernel registry chose instead: one branch per
+/// call (plus one comparison per routed-row tier for `moe_experts`), no lookup by name.
 pub struct ShimProvider {
     ctx: Arc<ShimContext>,
+    bound: Option<Bound>,
+}
+
+/// What a bound provider runs for its op.
+struct Bound {
+    op: OpKind,
+    choice: ImplChoice,
+    /// The library's implementations of `op`, indexed as `choice` indexes them.
+    impls: Vec<ImplInfo>,
+}
+
+impl Bound {
+    /// The implementation a call of `rows` routed rows runs.
+    fn info(&self, rows: usize) -> &ImplInfo {
+        &self.impls[self.choice.index_for(rows) as usize]
+    }
 }
 
 /// The provider of `ctx`; its id is the library's backend name (`hip`, `cuda`).
 pub fn shim_provider(ctx: Arc<ShimContext>) -> Arc<dyn KernelProvider> {
-    Arc::new(ShimProvider { ctx })
+    Arc::new(ShimProvider { ctx, bound: None })
 }
 
 fn invalid(message: String) -> KernelError {
@@ -979,12 +1011,40 @@ impl ShimProvider {
         unsafe { (trio.supported)(d) == 1 }
     }
 
-    fn implementation_of<D>(trio: &OpTrio<D>, d: &D) -> String {
+    /// The implementation `op` runs at `d`: the bound one (its first tier's), else the
+    /// library's `turbine_<op>_impl`.
+    fn implementation_of<D>(&self, op: OpKind, trio: &OpTrio<D>, d: &D) -> String {
+        if let Some(bound) = self.bound.as_ref().filter(|b| b.op == op) {
+            return bound.info(1).name.clone();
+        }
         // SAFETY: as for `_supported`; the returned string is static and owned by the library.
         ffi::c_str(unsafe { (trio.implementation)(d) })
     }
 
-    fn run<D>(&self, trio: &OpTrio<D>, d: &D) -> Result<(), KernelError> {
+    /// Enqueues `op` with descriptor `d`: through `turbine_impl_run` with the bound index when
+    /// this provider is bound to `op` (`rows`: the routed rows of a `moe_experts` call, else
+    /// ignored), else through the library's entry point `trio.run`.
+    fn run<D>(&self, op: OpKind, trio: &OpTrio<D>, d: &D, rows: usize) -> Result<(), KernelError> {
+        if let Some(bound) = self.bound.as_ref().filter(|b| b.op == op) {
+            let fns = self
+                .syms()
+                .v21
+                .impls
+                .ok_or_else(|| self.ctx.lib.lacks("turbine_impl_run"))?;
+            let index = to_i32("implementation index", bound.choice.index_for(rows))?;
+            // SAFETY: as for the entry point below; `d` is `op`'s descriptor type, and `index`
+            // is one of the library's implementations of `op` (the registry chose it from
+            // `turbine_impl_info`). The library runs exactly that implementation.
+            let code = unsafe {
+                (fns.run)(
+                    self.ctx.raw,
+                    op.abi_code(),
+                    index,
+                    std::ptr::from_ref(d).cast(),
+                )
+            };
+            return self.ctx.check(code);
+        }
         // SAFETY: every pointer in `d` comes from `ShimContext::device_ptr`, so it is memory of
         // this context whose view covers the shape and strides encoded in `d` (the views were
         // bounds-checked when built). The shim enqueues on the context stream and keeps no
@@ -1331,7 +1391,7 @@ impl AddRmsnormKernel for ShimProvider {
 
     fn implementation(&self, cfg: &AddRmsnormConfig) -> String {
         self.add_rmsnorm_trio()
-            .map(|t| Self::implementation_of(t, &add_rmsnorm_probe(cfg)))
+            .map(|t| self.implementation_of(OpKind::AddRmsnorm, t, &add_rmsnorm_probe(cfg)))
             .unwrap_or_default()
     }
 
@@ -1363,7 +1423,7 @@ impl AddRmsnormKernel for ShimProvider {
             eps: ctx.eps,
             dtype: ctx.residual.dtype.abi_code(),
         };
-        self.run(trio, &d)
+        self.run(OpKind::AddRmsnorm, trio, &d, 0)
     }
 }
 
@@ -1377,7 +1437,7 @@ impl LogitsReduceKernel for ShimProvider {
 
     fn implementation(&self, cfg: &LogitsReduceConfig) -> String {
         self.logits_reduce_trio()
-            .map(|t| Self::implementation_of(t, &logits_reduce_probe(cfg)))
+            .map(|t| self.implementation_of(OpKind::LogitsReduce, t, &logits_reduce_probe(cfg)))
             .unwrap_or_default()
     }
 
@@ -1425,7 +1485,7 @@ impl LogitsReduceKernel for ShimProvider {
                 .cast(),
             top_p: self.ctx.device_ptr("top_p", &ctx.top_p)? as *const f32,
         };
-        self.run(trio, &d)
+        self.run(OpKind::LogitsReduce, trio, &d, 0)
     }
 }
 
@@ -1435,7 +1495,7 @@ impl GemmKernel for ShimProvider {
     }
 
     fn implementation(&self, cfg: &GemmConfig) -> String {
-        Self::implementation_of(&self.syms().gemm, &gemm_probe(cfg))
+        self.implementation_of(OpKind::Gemm, &self.syms().gemm, &gemm_probe(cfg))
     }
 
     fn execute(&self, ctx: &mut GemmContext<'_>) -> Result<(), KernelError> {
@@ -1456,7 +1516,7 @@ impl GemmKernel for ShimProvider {
             alpha: ctx.alpha,
             beta: ctx.beta,
         };
-        self.run(&self.syms().gemm, &d)
+        self.run(OpKind::Gemm, &self.syms().gemm, &d, 0)
     }
 }
 
@@ -1473,9 +1533,9 @@ impl AttentionKernel for ShimProvider {
 
     fn implementation(&self, cfg: &AttentionConfig) -> String {
         if let Some(trio) = self.paged_trio(cfg.kind) {
-            Self::implementation_of(trio, &paged_probe(cfg))
+            self.implementation_of(cfg.op(), trio, &paged_probe(cfg))
         } else if let Some(trio) = self.attention_trio(cfg.kind) {
-            Self::implementation_of(trio, &attention_probe(cfg))
+            self.implementation_of(cfg.op(), trio, &attention_probe(cfg))
         } else {
             format!("unsupported attention kind {:?}", cfg.kind)
         }
@@ -1511,7 +1571,7 @@ impl AttentionKernel for ShimProvider {
             causal: i32::from(ctx.cfg.causal),
             dtype: ctx.cfg.dtype.abi_code(),
         };
-        self.run(trio, &d)
+        self.run(ctx.cfg.op(), trio, &d, 0)
     }
 
     fn execute_paged(&self, ctx: &mut PagedAttentionContext<'_>) -> Result<(), KernelError> {
@@ -1573,7 +1633,7 @@ impl AttentionKernel for ShimProvider {
             causal: i32::from(cfg.causal),
             dtype: cfg.dtype.abi_code(),
         };
-        self.run(trio, &d)
+        self.run(cfg.op(), trio, &d, 0)
     }
 }
 
@@ -1583,7 +1643,11 @@ impl KvCopyKernel for ShimProvider {
     }
 
     fn implementation(&self, cfg: &KvCopyConfig) -> String {
-        Self::implementation_of(&self.syms().copy_blocks, &copy_blocks_probe(cfg))
+        self.implementation_of(
+            OpKind::CopyBlocks,
+            &self.syms().copy_blocks,
+            &copy_blocks_probe(cfg),
+        )
     }
 
     fn execute(&self, ctx: &mut KvCopyContext<'_>) -> Result<(), KernelError> {
@@ -1627,7 +1691,7 @@ impl KvCopyKernel for ShimProvider {
             dst_blocks: dst.as_ptr(),
             count: to_i32("count", ctx.pairs.len())?,
         };
-        self.run(&self.syms().copy_blocks, &d)
+        self.run(OpKind::CopyBlocks, &self.syms().copy_blocks, &d, 0)
     }
 }
 
@@ -1643,11 +1707,19 @@ impl MoeKernel for ShimProvider {
     }
 
     fn implementation_route(&self, cfg: &MoeRouteConfig) -> String {
-        Self::implementation_of(&self.syms().moe_route, &moe_route_probe(cfg))
+        self.implementation_of(
+            OpKind::MoeRoute,
+            &self.syms().moe_route,
+            &moe_route_probe(cfg),
+        )
     }
 
     fn implementation_experts(&self, cfg: &MoeExpertsConfig) -> String {
-        Self::implementation_of(&self.syms().moe_experts, &moe_experts_probe(cfg))
+        self.implementation_of(
+            OpKind::MoeExperts,
+            &self.syms().moe_experts,
+            &moe_experts_probe(cfg),
+        )
     }
 
     fn route(&self, ctx: &mut MoeRouteContext<'_>) -> Result<(), KernelError> {
@@ -1685,7 +1757,7 @@ impl MoeKernel for ShimProvider {
                 .device_ptr("expert_offsets", &ctx.expert_offsets)?
                 .cast(),
         };
-        self.run(&self.syms().moe_route, &d)
+        self.run(OpKind::MoeRoute, &self.syms().moe_route, &d, 0)
     }
 
     fn experts(&self, ctx: &mut MoeExpertsContext<'_>) -> Result<(), KernelError> {
@@ -1745,10 +1817,15 @@ impl MoeKernel for ShimProvider {
             expert_end: to_i32("expert_end", cfg.expert_end)?,
             dtype: cfg.dtype.abi_code(),
         };
-        self.run(&self.syms().moe_experts, &d)
+        self.run(OpKind::MoeExperts, &self.syms().moe_experts, &d, tokens * k)
     }
 
+    /// A provider bound to `moe_experts` answers with the flag of the implementation its tier
+    /// runs at `routed_rows`; otherwise the library's `turbine_moe_experts_needs_host_offsets`.
     fn needs_host_offsets(&self, cfg: &MoeExpertsConfig, routed_rows: usize) -> bool {
+        if let Some(bound) = self.bound.as_ref().filter(|b| b.op == OpKind::MoeExperts) {
+            return bound.info(routed_rows).needs_host_offsets;
+        }
         let Some(needs) = self.syms().moe_experts_needs_host_offsets else {
             return true;
         };
@@ -1768,7 +1845,7 @@ impl NormKernel for ShimProvider {
     }
 
     fn implementation(&self, cfg: &NormConfig) -> String {
-        Self::implementation_of(&self.syms().rmsnorm, &rmsnorm_probe(cfg))
+        self.implementation_of(OpKind::Rmsnorm, &self.syms().rmsnorm, &rmsnorm_probe(cfg))
     }
 
     fn execute(&self, ctx: &mut NormContext<'_>) -> Result<(), KernelError> {
@@ -1783,7 +1860,7 @@ impl NormKernel for ShimProvider {
             eps: ctx.eps,
             dtype: ctx.x.dtype.abi_code(),
         };
-        self.run(&self.syms().rmsnorm, &d)
+        self.run(OpKind::Rmsnorm, &self.syms().rmsnorm, &d, 0)
     }
 }
 
@@ -1793,7 +1870,7 @@ impl RopeKernel for ShimProvider {
     }
 
     fn implementation(&self, cfg: &RopeConfig) -> String {
-        Self::implementation_of(&self.syms().rope, &rope_probe(cfg))
+        self.implementation_of(OpKind::Rope, &self.syms().rope, &rope_probe(cfg))
     }
 
     fn execute(&self, ctx: &mut RopeContext<'_>) -> Result<(), KernelError> {
@@ -1805,7 +1882,7 @@ impl RopeKernel for ShimProvider {
         d.k = self.ctx.device_ptr("k", &ctx.k)?;
         d.positions = self.ctx.device_ptr("positions", &ctx.positions)? as *const i32;
         d.inv_freq = self.ctx.device_ptr("inv_freq", &ctx.inv_freq)? as *const f32;
-        self.run(&self.syms().rope, &d)
+        self.run(OpKind::Rope, &self.syms().rope, &d, 0)
     }
 }
 
@@ -1815,7 +1892,7 @@ impl ActivationKernel for ShimProvider {
     }
 
     fn implementation(&self, cfg: &ActivationConfig) -> String {
-        Self::implementation_of(&self.syms().silu_mul, &silu_mul_probe(cfg))
+        self.implementation_of(OpKind::SiluMul, &self.syms().silu_mul, &silu_mul_probe(cfg))
     }
 
     fn execute(&self, ctx: &mut ActivationContext<'_>) -> Result<(), KernelError> {
@@ -1830,7 +1907,7 @@ impl ActivationKernel for ShimProvider {
             cols: to_i64("cols", ctx.gate.shape[1])?,
             dtype: ctx.out.dtype.abi_code(),
         };
-        self.run(&self.syms().silu_mul, &d)
+        self.run(OpKind::SiluMul, &self.syms().silu_mul, &d, 0)
     }
 }
 
@@ -1840,7 +1917,11 @@ impl EmbeddingKernel for ShimProvider {
     }
 
     fn implementation(&self, cfg: &EmbeddingConfig) -> String {
-        Self::implementation_of(&self.syms().embedding, &embedding_probe(cfg))
+        self.implementation_of(
+            OpKind::Embedding,
+            &self.syms().embedding,
+            &embedding_probe(cfg),
+        )
     }
 
     fn execute(&self, ctx: &mut EmbeddingContext<'_>) -> Result<(), KernelError> {
@@ -1856,7 +1937,7 @@ impl EmbeddingKernel for ShimProvider {
             vocab_rows: to_i64("vocab_rows", ctx.table.shape[0])?,
             dtype: ctx.table.dtype.abi_code(),
         };
-        self.run(&self.syms().embedding, &d)
+        self.run(OpKind::Embedding, &self.syms().embedding, &d, 0)
     }
 }
 
@@ -1866,7 +1947,7 @@ impl ElementwiseKernel for ShimProvider {
     }
 
     fn implementation(&self, cfg: &ElementwiseConfig) -> String {
-        Self::implementation_of(&self.syms().add, &add_probe(cfg))
+        self.implementation_of(OpKind::Add, &self.syms().add, &add_probe(cfg))
     }
 
     fn execute(&self, ctx: &mut ElementwiseContext<'_>) -> Result<(), KernelError> {
@@ -1887,7 +1968,7 @@ impl ElementwiseKernel for ShimProvider {
             n: to_i64("n", n)?,
             dtype: ctx.out.dtype.abi_code(),
         };
-        self.run(&self.syms().add, &d)
+        self.run(OpKind::Add, &self.syms().add, &d, 0)
     }
 }
 
@@ -1939,6 +2020,35 @@ impl KernelProvider for ShimProvider {
 
     fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
         self.ctx.lib.implementations(op)
+    }
+
+    fn card_profile(&self) -> Option<&'static CardProfile> {
+        self.ctx.card_profile()
+    }
+
+    /// A provider on the same context bound to `choice` for `spec`'s op; `None` when the
+    /// library does not enumerate or `choice` names an index it does not have.
+    fn bind(&self, spec: &OpConfig, choice: &ImplChoice) -> Option<Arc<dyn KernelProvider>> {
+        let op = spec.op();
+        let impls = self.ctx.lib.implementations(op);
+        let indices: Vec<u32> = match choice {
+            ImplChoice::Single(index) => vec![*index],
+            ImplChoice::ByRows(tiers) => tiers.iter().map(|t| t.index).collect(),
+        };
+        if impls.is_empty()
+            || indices.is_empty()
+            || indices.iter().any(|&i| i as usize >= impls.len())
+        {
+            return None;
+        }
+        Some(Arc::new(ShimProvider {
+            ctx: Arc::clone(&self.ctx),
+            bound: Some(Bound {
+                op,
+                choice: choice.clone(),
+                impls,
+            }),
+        }))
     }
 
     /// `turbine_impl_supports` on the probe descriptor of `spec` (a `moe_experts` probe covers
@@ -2693,5 +2803,78 @@ mod tests {
             .expect("context");
         ctx.set_profile(&crate::cards::GFX1201)
             .expect("no v2.4 group: set_profile does nothing");
+    }
+
+    fn last_impl_run(lib: &ShimLibrary) -> i32 {
+        stub_hook(
+            lib,
+            "stub_last_impl_run",
+            |f: unsafe extern "C" fn() -> i32| {
+                // SAFETY: the stub defines `int32_t stub_last_impl_run(void)`; the library is
+                // loaded.
+                unsafe { f() }
+            },
+        )
+    }
+
+    /// Phase 2m S-5: a provider bound to an implementation runs the op through
+    /// `turbine_impl_run` with that index (the V24 stub records op · 100 + index), reports its
+    /// name, and leaves the unbound provider on the library's entry point (which the stub
+    /// refuses). A library without the v2.4 group, or an index it lacks, cannot be bound.
+    #[test]
+    fn bound_provider_runs_the_chosen_implementation() {
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V24")), "hip")
+            .expect("a v2.4 library loads");
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let provider = shim_provider(Arc::clone(&ctx));
+        let cfg = NormConfig {
+            dim: 2048,
+            dtype: DType::BF16,
+        };
+        let spec = OpConfig::Rmsnorm(cfg);
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let x = Tensor::empty(&mem, &[1, 2048], DType::BF16).expect("x");
+        let w = Tensor::empty(&mem, &[2048], DType::BF16).expect("w");
+        let out = Tensor::empty(&mem, &[1, 2048], DType::BF16).expect("out");
+        let run = |p: &dyn KernelProvider| {
+            p.norm().expect("rmsnorm family").execute(&mut NormContext {
+                x: x.view(),
+                weight: w.view(),
+                out: out.view(),
+                eps: 1e-5,
+            })
+        };
+
+        let err = run(provider.as_ref()).expect_err("the stub's turbine_rmsnorm refuses");
+        assert!(
+            err.to_string().contains("rmsnorm is not implemented"),
+            "{err}"
+        );
+        let bound = provider
+            .bind(&spec, &ImplChoice::Single(1))
+            .expect("an enumerating library binds");
+        assert_eq!(
+            bound.norm().expect("rmsnorm").implementation(&cfg),
+            "stub_b"
+        );
+        run(bound.as_ref()).expect("stub_b runs through turbine_impl_run");
+        assert_eq!(last_impl_run(&lib), OpKind::Rmsnorm.abi_code() * 100 + 1);
+        // Another op on the bound provider still takes the library's entry point.
+        let add = ElementwiseConfig { dtype: DType::BF16 };
+        assert_eq!(
+            bound.elementwise().expect("add").implementation(&add),
+            "stub_add"
+        );
+        assert!(provider.bind(&spec, &ImplChoice::Single(2)).is_none());
+
+        let v23 = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V21")), "hip")
+            .expect("a v2.3 library loads");
+        let old = shim_provider(
+            v23.create_context(&mocked_device("gfx942"))
+                .expect("context"),
+        );
+        assert!(old.bind(&spec, &ImplChoice::Single(0)).is_none());
     }
 }

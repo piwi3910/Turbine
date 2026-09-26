@@ -1,5 +1,6 @@
 // Turbine HIP kernels for moe_experts with few routed rows (impl
-// "turbine_hip_moe_small_m", at most kMoeSmallMaxRows = num_tokens * top_k):
+// "turbine_hip_moe_small_m"; the default takes them up to the card profile's
+// moe_small_max_rows routed rows, num_tokens * top_k):
 // every group size is read from expert_offsets on the device, so the caller
 // needs no host copy of the offsets and the step makes no device-to-host copy.
 //
@@ -138,7 +139,7 @@ __global__ __launch_bounds__(kThreads) void moe_small_proj_kernel(
   static_assert(kRows * kCols <= kLanes,
                 "every (row, column) result of a pass has its own writer lane");
   const int32_t local = active_expert(offsets, expert_begin, num_local,
-                                     static_cast<int32_t>(blockIdx.y));
+                                      static_cast<int32_t>(blockIdx.y));
   if (local < 0)
     return;
   const int32_t begin = offsets[expert_begin + local];
@@ -256,8 +257,7 @@ __global__ void moe_small_positions_kernel(const int32_t *sorted_rows,
                                            int32_t expert_begin,
                                            int32_t expert_end, int32_t rows,
                                            int32_t *pos) {
-  const int32_t i =
-      static_cast<int32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int32_t i = static_cast<int32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= rows)
     return;
   const int32_t first = offsets[expert_begin];

@@ -107,12 +107,14 @@ fn hip_executor(
     let provider = shim_provider(ctx.clone());
     let order = [provider.id()];
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let card = provider.card_profile();
     let registry = Arc::new(
         KernelRegistry::build(
             vec![provider],
             &order,
             &hip_requirements(cfg, ctx, opts),
             &metrics,
+            card,
         )
         .expect("every op has a provider"),
     );

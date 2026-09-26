@@ -682,6 +682,7 @@ mod tests {
             &order,
             &executor::requirements(cfg, 16, ExecutorOptions::default()),
             &KernelMetrics::register(&MetricsRegistry::new()),
+            None,
         )
         .expect("every op has a provider");
         let kv = SequenceKv::new(&mem, cfg.kv_layout(16), 64).expect("kv");

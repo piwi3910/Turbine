@@ -21,11 +21,11 @@ pub use ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
     ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
-    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplInfo, KernelProvider, KvCopyConfig,
-    KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
-    MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
-    NormContext, NormKernel, OpKind, PagedAttentionContext, ProviderId, RopeConfig, RopeContext,
-    RopeKernel,
+    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplChoice, ImplInfo, KernelProvider,
+    KvCopyConfig, KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext,
+    LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
+    MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
+    ProviderId, RopeConfig, RopeContext, RopeKernel, RowTier,
 };
 pub use registry::{KernelMetrics, KernelRegistry, OpConfig, OpRequirement, Selection};
 pub use shim::{
@@ -63,8 +63,23 @@ pub enum KernelError {
         device_arch: String,
         build_archs: String,
     },
-    #[error("no kernel provider supports {op} {config}")]
-    NoProvider { op: OpKind, config: String },
+    /// `detail` lists, per provider that enumerates its implementations, each implementation
+    /// and why it was refused (empty when no provider enumerates).
+    #[error("no kernel provider supports {op} {config}{}", detail_suffix(.detail))]
+    NoProvider {
+        op: OpKind,
+        config: String,
+        detail: String,
+    },
+}
+
+/// ` (<detail>)`, or nothing for an empty detail.
+fn detail_suffix(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({detail})")
+    }
 }
 
 impl KernelError {
@@ -148,8 +163,18 @@ mod tests {
                 KernelError::NoProvider {
                     op: OpKind::AttentionPrefill,
                     config: "head_dim=128 kv_heads=8".into(),
+                    detail: String::new(),
                 },
                 "no kernel provider supports attention_prefill head_dim=128 kv_heads=8",
+            ),
+            (
+                KernelError::NoProvider {
+                    op: OpKind::Rmsnorm,
+                    config: "dim=4096 dtype=bf16".into(),
+                    detail: "hip: stub_b unsupported, stub_a unsupported".into(),
+                },
+                "no kernel provider supports rmsnorm dim=4096 dtype=bf16 (hip: stub_b unsupported, \
+                 stub_a unsupported)",
             ),
             (
                 KernelError::Device {
