@@ -498,3 +498,50 @@ fn sticky_device_error_exits_3_on_cpu() {
                       "ignore_eos": true, "stream": true});
     assert_sticky_exit(server, body, Duration::from_secs(120));
 }
+
+/// P3 S-12, S-16 (lab, Task 17): the real Llama-3.2-3B on the GPU backend under test
+/// (`TURBINE_TEST_BACKEND`, kernel library from `TURBINE_KERNEL_LIBRARY`) with a sticky device
+/// error injected at iteration 3: the stream ends with an error event then `[DONE]`, `/ready`
+/// answers 503 `circuit_open`, and the process exits 3 within
+/// `reliability.circuit.drain_timeout` (120 s).
+#[cfg(feature = "fault-injection")]
+#[test]
+#[ignore = "lab: needs a GPU backend, its kernel library and the Llama-3.2-3B weights"]
+fn sticky_device_error_exits_3() {
+    use turbine_kernels::test_support::{require_backend, require_env_dir};
+    let backend = std::env::var("TURBINE_TEST_BACKEND")
+        .expect("TURBINE_TEST_BACKEND is not set; set it to the backend under test (hip or cuda)");
+    if !require_backend(&backend) {
+        return;
+    }
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let dir = TempDir::new("turbine-fault-lab");
+    let addr = free_addr();
+    let config = dir.path().join("config.yaml");
+    // The harness keeps TURBINE_KERNEL_LIBRARY from the server (the cpu tests stay
+    // hermetic), so the lab Job's library is named in the configuration.
+    let library = std::env::var("TURBINE_KERNEL_LIBRARY")
+        .map(|l| format!("  kernel_library: {l}\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        &config,
+        format!(
+            "model:\n  path: {}\n  served_name: lab-llama\nserver:\n  listen: {addr}\n\
+             execution:\n  backend: {backend}\n{library}reliability:\n  fault_injection:\n    \
+             kernel_error_at_iteration: 3\n    kernel_error_sticky: true\n",
+            model_dir.display()
+        ),
+    )
+    .unwrap();
+    // Weights load and warm-up of a debug build on the GPU.
+    let server = Server::launch(
+        &config,
+        addr,
+        "lab-llama",
+        Some(dir),
+        Duration::from_secs(900),
+    );
+    let body = json!({"model": "lab-llama", "prompt": "Once upon a time", "max_tokens": 64,
+                      "ignore_eos": true, "stream": true});
+    assert_sticky_exit(server, body, Duration::from_secs(120));
+}

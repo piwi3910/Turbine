@@ -506,6 +506,49 @@ fn lab_test_gpus_2_is_the_inventory_path() {
     assert_eq!(env(&jobs[1], "TURBINE_EXPECT_AMD"), "2");
 }
 
+/// P3 Task 17: `--features <list>` reaches the in-container `cargo test` (the fault-injection
+/// build of `tests/fault.rs`), before the harness arguments; `--stop` takes no features.
+#[test]
+fn lab_test_forwards_cargo_features() {
+    let text = dry_run(
+        "lab-test.sh",
+        "test-features",
+        &["--dry-run", "novanas", "--features", "fault-injection"],
+    );
+    let id = run_id(&text, "lab-test");
+    assert_eq!(
+        test_command(&text, &id),
+        [
+            "cargo",
+            "test",
+            "--no-fail-fast",
+            "--workspace",
+            "--features",
+            "fault-injection",
+            "--",
+            "--include-ignored",
+            "--show-output",
+            "--skip",
+            "hf_reference_matches_cpu",
+        ]
+    );
+    for args in [
+        &[
+            "novanas",
+            "--stop",
+            "0926-abc",
+            "--features",
+            "fault-injection",
+        ][..],
+        &["novanas", "--features"][..],
+        &["novanas", "--features", "bad feature"][..],
+    ] {
+        let (out, called) = lab_script("lab-test.sh", "features-usage", args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert_eq!(called, None, "{args:?} contacted a host");
+    }
+}
+
 #[test]
 fn lab_test_passes_a_subset_and_opts_into_the_hf_reference() {
     let text = dry_run(
