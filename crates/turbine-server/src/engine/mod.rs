@@ -8,6 +8,7 @@
 //! Diagnostics read the documents the engine publishes after every step ([`EngineShared`]).
 
 pub(crate) mod deadlines;
+pub(crate) mod grammar;
 mod r#loop;
 pub(crate) mod requests;
 
@@ -16,7 +17,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 use turbine_core::clock::{Clock, SystemClock};
-use turbine_core::request::{GenerationEvent, GenerationRequest};
+use turbine_core::request::GenerationEvent;
 use turbine_kv::{KvDocument, KvMetrics};
 use turbine_model::ModelMetrics;
 use turbine_scheduler::{Scheduler, SchedulerMetrics, SchedulerSnapshot, SubmitError};
@@ -27,6 +28,7 @@ use crate::model::{self, PreparedModel};
 
 pub(crate) use deadlines::Timeouts;
 pub(crate) use r#loop::{EngineLoop, EngineParts};
+pub(crate) use requests::{Submission, ToolOutput, ToolParser};
 
 /// Events buffered per request between the engine and the HTTP response (P2 S-7).
 pub const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -42,11 +44,7 @@ pub enum EngineCommand {
     /// A new request, its output channel (capacity [`EVENT_CHANNEL_CAPACITY`]) and where the
     /// admission decision goes. The decision arrives before any event, so a refused request is
     /// a plain HTTP error even when it asked for a stream.
-    Submit(
-        Box<GenerationRequest>,
-        mpsc::Sender<GenerationEvent>,
-        SubmitAck,
-    ),
+    Submit(Box<Submission>, mpsc::Sender<GenerationEvent>, SubmitAck),
     /// Refuse new submissions, cancel every request with reason `shutdown` and stop once the
     /// held events are delivered.
     Shutdown,

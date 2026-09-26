@@ -1,8 +1,9 @@
 //! Black-box tests of `turbine-server` serving the tiny synthetic checkpoint on the `cpu`
-//! reference backend (P1 S-10, S-14; P2 S-3, S-7, S-8, S-11): OpenAI shapes, queueing and
-//! cancellation, the queue bound, KV release on disconnect, the diagnostics documents, slow
-//! clients and the request and queue timeouts, request validation, startup failures and the
-//! Phase 1 metrics.
+//! reference backend (P1 S-10, S-14; P2 S-3, S-6, S-7, S-8, S-10, S-11, S-14, S-17, S-18):
+//! OpenAI shapes, queueing and cancellation, the queue bound, KV release on disconnect, the
+//! diagnostics documents, slow clients and the request and queue timeouts, request validation,
+//! startup failures, the Phase 1 metrics, the Phase 2 request fields, preemption, structured
+//! output, tool calls and the Phase 2 metrics and log reasons.
 //!
 //! Streams that must stay open are made to back-pressure the engine: large events (20 logprobs
 //! each), thousands of `max_tokens` on a checkpoint patched to 8192 positions, and a client that
@@ -15,11 +16,25 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use turbine_core::request::{GenerationEvent, GenerationRequest, SamplingParams, StopConditions};
+use turbine_core::types::{DeviceId, Priority, RequestId};
+use turbine_kernels::{KernelMetrics, KernelRegistry, cpu_reference_provider};
+use turbine_model::executor::{self, SequenceKv};
 use turbine_model::testing::TempDir;
-use turbine_model::testing::tiny::write_tiny_llama;
+use turbine_model::testing::tiny::{
+    TINY_EOS, TinyOptions, write_tiny_llama, write_tiny_llama_with,
+};
+use turbine_model::{
+    GenerateOptions, MAX_STAGING_BYTES, SafetensorsIndex, Tokenizer, WeightLoader, generate,
+    llama_slots,
+};
+use turbine_observability::MetricsRegistry;
+use turbine_tensor::DeviceMemory;
+use turbine_tensor::host::HostMemory;
 
 const POLL: Duration = Duration::from_millis(20);
 const READY_LIMIT: Duration = Duration::from_secs(60);
@@ -48,16 +63,57 @@ fn spawn(config: &Path) -> Child {
 /// Config for the cpu backend on `model_dir` with a 16 MiB KV pool (4096 tiny-model blocks of
 /// 4096 bytes); `extra` is appended verbatim and must not repeat the `kv` key.
 fn config_yaml(model_dir: &Path, addr: SocketAddr, extra: &str) -> String {
-    config_yaml_with(model_dir, addr, "", extra)
+    config_yaml_with(model_dir, addr, "", "", "16MiB", extra)
 }
 
-/// [`config_yaml`] with `server_extra` appended to the `server` section verbatim.
-fn config_yaml_with(model_dir: &Path, addr: SocketAddr, server_extra: &str, extra: &str) -> String {
+/// [`config_yaml`] with more `model` keys (`model_extra`) and `server` keys (`server_extra`),
+/// each verbatim with lines indented by two spaces, and a `kv.gpu.max_bytes` of `kv_bytes`.
+fn config_yaml_with(
+    model_dir: &Path,
+    addr: SocketAddr,
+    model_extra: &str,
+    server_extra: &str,
+    kv_bytes: &str,
+    extra: &str,
+) -> String {
     format!(
-        "model:\n  path: {}\nserver:\n  listen: {addr}\n{server_extra}execution:\n  backend: cpu\n\
-         reliability:\n  emergency_vram_reserve: 1MiB\nkv:\n  gpu:\n    max_bytes: 16MiB\n{extra}",
+        "model:\n  path: {}\n{model_extra}server:\n  listen: {addr}\n{server_extra}execution:\n  \
+         backend: cpu\nreliability:\n  emergency_vram_reserve: 1MiB\nkv:\n  gpu:\n    \
+         max_bytes: {kv_bytes}\n{extra}",
         model_dir.display()
     )
+}
+
+/// How [`TinyServer::launch`] sets up a server.
+struct Setup<'a> {
+    /// Extra `model` keys, e.g. `"  tool_call_parser: llama3_json\n"`.
+    model_extra: &'a str,
+    /// Extra `server` keys, e.g. `"  request_timeout: 1s\n"`.
+    server_extra: &'a str,
+    /// `kv.gpu.max_bytes`.
+    kv_bytes: &'a str,
+    /// Appended to the config.
+    extra: &'a str,
+    /// `max_position_embeddings` patched into the checkpoint.
+    max_positions: Option<u32>,
+    /// The checkpoint's chat template renders `tools`.
+    template_with_tools: bool,
+    /// Keep the server's stderr (its log) for [`TinyServer::logs`].
+    capture_logs: bool,
+}
+
+impl Default for Setup<'_> {
+    fn default() -> Self {
+        Setup {
+            model_extra: "",
+            server_extra: "",
+            kv_bytes: "16MiB",
+            extra: "",
+            max_positions: None,
+            template_with_tools: true,
+            capture_logs: false,
+        }
+    }
 }
 
 /// `max_position_embeddings` of the checkpoint `TinyServer::start_long` serves.
@@ -75,6 +131,8 @@ struct TinyServer {
     child: Child,
     addr: SocketAddr,
     model: String,
+    /// The server's stderr so far, when captured.
+    logs: Option<Arc<Mutex<String>>>,
     _dir: TempDir,
 }
 
@@ -94,10 +152,26 @@ impl TinyServer {
     }
 
     fn start_with(server_extra: &str, extra: &str, max_positions: Option<u32>) -> TinyServer {
+        TinyServer::launch(&Setup {
+            server_extra,
+            extra,
+            max_positions,
+            ..Setup::default()
+        })
+    }
+
+    fn launch(setup: &Setup<'_>) -> TinyServer {
         let dir = TempDir::new("turbine-tiny-server");
         let model_dir = dir.path().join("tiny-llama");
-        write_tiny_llama(&model_dir, 7);
-        if let Some(positions) = max_positions {
+        write_tiny_llama_with(
+            &model_dir,
+            7,
+            &TinyOptions {
+                template_with_tools: setup.template_with_tools,
+                ..TinyOptions::default()
+            },
+        );
+        if let Some(positions) = setup.max_positions {
             let path = model_dir.join("config.json");
             let mut cfg: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             cfg["max_position_embeddings"] = json!(positions);
@@ -105,19 +179,46 @@ impl TinyServer {
         }
         let addr = free_addr();
         let config = dir.path().join("config.yaml");
-        std::fs::write(
-            &config,
-            config_yaml_with(&model_dir, addr, server_extra, extra),
-        )
-        .unwrap();
+        let yaml = config_yaml_with(
+            &model_dir,
+            addr,
+            setup.model_extra,
+            setup.server_extra,
+            setup.kv_bytes,
+            setup.extra,
+        );
+        std::fs::write(&config, yaml).unwrap();
         let mut child = spawn(&config);
         wait_until_ready(&mut child, addr);
+        let logs = setup.capture_logs.then(|| {
+            let logs = Arc::new(Mutex::new(String::new()));
+            let mut stderr = BufReader::new(child.stderr.take().expect("stderr is piped"));
+            let sink = Arc::clone(&logs);
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                while stderr.read_line(&mut line).is_ok_and(|n| n > 0) {
+                    sink.lock().unwrap().push_str(&line);
+                    line.clear();
+                }
+            });
+            logs
+        });
         TinyServer {
             child,
             addr,
             model: "tiny-llama".into(),
+            logs,
             _dir: dir,
         }
+    }
+
+    /// The JSON log records written so far (the server must log with `format: json`).
+    fn log_records(&self) -> Vec<Value> {
+        let logs = self.logs.as_ref().expect("logs captured");
+        let text = logs.lock().unwrap().clone();
+        text.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
     }
 
     fn get(&self, path: &str) -> Response {
@@ -825,28 +926,32 @@ fn diagnostics_shapes() {
 fn request_validation() {
     let server = TinyServer::start("");
     let model = server.model.clone();
+    // Phase 2 serves n, penalties, logit_bias, response_format and tools; what stays
+    // unsupported is refused naming the field.
+    let tools = json!([{"type": "function", "function": {"name": "f"}}]);
     let unsupported = [
         (
             "/v1/chat/completions",
             json!({"model": model, "messages": [{"role": "user", "content": "x"}],
-                   "tools": [{"type": "function", "function": {"name": "f"}}]}),
-            "tools",
+                   "echo": true}),
+            "echo",
         ),
         (
             "/v1/chat/completions",
             json!({"model": model, "messages": [{"role": "user", "content": "x"}],
-                   "response_format": {"type": "json_object"}}),
+                   "response_format": {"type": "json_object"}, "tools": tools,
+                   "tool_choice": "required"}),
             "response_format",
         ),
         (
             "/v1/completions",
-            json!({"model": model, "prompt": "x", "n": 2}),
-            "n",
+            json!({"model": model, "prompt": "x", "best_of": 2}),
+            "best_of",
         ),
         (
             "/v1/completions",
-            json!({"model": model, "prompt": "x", "logit_bias": {"5": 1}}),
-            "logit_bias",
+            json!({"model": model, "prompt": "x", "suffix": "y"}),
+            "suffix",
         ),
         (
             "/v1/chat/completions",
@@ -897,6 +1002,15 @@ fn request_validation() {
     assert_eq!(resp.status, 400, "{}", resp.body);
     assert_eq!(resp.error_code(), "context_length_exceeded");
 
+    // Token ids are checked against the vocabulary (263 tiny-model tokens).
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": model, "prompt": "x", "logit_bias": {"263": 1}}),
+    );
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert_eq!(resp.error_code(), "invalid_request");
+    assert!(resp.body.contains("logit_bias"), "{}", resp.body);
+
     let resp = server.post(
         "/v1/completions",
         &json!({"model": model, "prompt": "x", "max_tokens": 2, "foo": {"bar": 1}}),
@@ -908,7 +1022,7 @@ fn request_validation() {
         &metrics,
         r#"turbine_requests_total{endpoint="/v1/completions",outcome="rejected"}"#,
     );
-    assert_eq!(rejected, Some(6.0), "{metrics}");
+    assert_eq!(rejected, Some(7.0), "{metrics}");
 }
 
 /// Writes the config, runs the server and returns its exit code and stderr; the port must still
@@ -1165,4 +1279,770 @@ fn request_and_queue_timeouts() {
         "{metrics}"
     );
     drop(held);
+}
+
+// ------------------------------------------------------------------ Phase 2 request features
+
+/// BOS then the bytes of "Hello": what the tiny tokenizer makes of the prompt "Hello".
+const HELLO: [u32; 6] = [256, 72, 101, 108, 108, 111];
+
+/// Tokens the Phase 1 single-request loop (host sampler, contiguous KV, cpu provider) generates
+/// for `prompt` on the same tiny checkpoint: the reference for the server's batched engine.
+fn reference_tokens(prompt: &[u32], sampling: SamplingParams, max_tokens: u32) -> Vec<u32> {
+    let dir = TempDir::new("turbine-tiny-reference");
+    let spec = write_tiny_llama(dir.path(), 7);
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let index = SafetensorsIndex::open(&spec.dir).unwrap();
+    let weights =
+        WeightLoader::load(&index, &llama_slots(&spec.config), &mem, MAX_STAGING_BYTES).unwrap();
+    let provider = cpu_reference_provider();
+    let order = [provider.id()];
+    let registry = KernelRegistry::build(
+        vec![provider],
+        &order,
+        &executor::requirements(&spec.config, 16),
+        &KernelMetrics::register(&MetricsRegistry::new()),
+    )
+    .unwrap();
+    let mut exec = executor::build_executor(
+        &spec.config,
+        weights,
+        Arc::new(registry),
+        Arc::clone(&mem),
+        16,
+        512,
+        1,
+    )
+    .unwrap();
+    let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), 512).unwrap();
+    let tokenizer = Arc::new(Tokenizer::from_file(&spec.dir.join("tokenizer.json")).unwrap());
+    let req = GenerationRequest {
+        id: RequestId::new_v4(),
+        endpoint: turbine_core::request::Endpoint::Completions,
+        http_request_id: "reference".into(),
+        prompt_tokens: prompt.to_vec(),
+        n: 1,
+        sampling,
+        stop: StopConditions {
+            eos_token_ids: TINY_EOS.iter().copied().collect(),
+            max_tokens,
+            ignore_eos: true,
+            ..StopConditions::default()
+        },
+        priority: Priority::default(),
+        echo: false,
+        constraint: None,
+        deadline_ms: u64::MAX,
+    };
+    let cancel = turbine_core::request::CancelFlag::default();
+    generate(
+        exec.as_mut(),
+        &mut kv,
+        tokenizer,
+        &req,
+        &cancel,
+        GenerateOptions {
+            max_seq_len: 512,
+            metrics: None,
+        },
+    )
+    .filter_map(|e| match e {
+        GenerationEvent::Token { token_id, .. } => Some(token_id),
+        _ => None,
+    })
+    .collect()
+}
+
+/// The token ids of a completions choice (`logprobs` with `return_tokens_as_token_ids`).
+fn choice_token_ids(choice: &Value) -> Vec<u32> {
+    choice["logprobs"]["tokens"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no logprobs.tokens: {choice}"))
+        .iter()
+        .map(|t| {
+            t.as_str()
+                .and_then(|s| s.strip_prefix("token_id:"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| panic!("bad token {t}"))
+        })
+        .collect()
+}
+
+/// The chunks of a streamed response (its data ends in `[DONE]`).
+fn stream_chunks(resp: &Response) -> Vec<Value> {
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let data = resp.sse_data();
+    assert_eq!(data.last().map(String::as_str), Some("[DONE]"), "{data:?}");
+    data[..data.len() - 1]
+        .iter()
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect()
+}
+
+fn prompt_tokens_total(server: &TinyServer) -> f64 {
+    sample(&server.metrics(), r#"turbine_tokens_total{kind="prompt"}"#).unwrap_or(0.0)
+}
+
+/// P2 S-10: `n`, penalties, `logit_bias`, `min_tokens`, `stop_token_ids`, `echo` and
+/// `priority` are served.
+#[test]
+fn openai_phase2_fields() {
+    let server = TinyServer::start("");
+    let model = server.model.clone();
+
+    // n: 3, not streaming: three choices from one prefill (the prompt is counted once).
+    let before = prompt_tokens_total(&server);
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": model, "prompt": "Hello", "max_tokens": 6, "ignore_eos": true,
+                "n": 3, "temperature": 1.0, "seed": 11}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let body = resp.json();
+    let choices = body["choices"].as_array().unwrap();
+    assert_eq!(choices.len(), 3, "{body}");
+    for (i, c) in choices.iter().enumerate() {
+        assert_eq!(c["index"], i, "{body}");
+        assert_eq!(c["finish_reason"], "length", "{body}");
+    }
+    assert_eq!(body["usage"]["prompt_tokens"], 6);
+    assert_eq!(body["usage"]["completion_tokens"], 18);
+    assert_eq!(prompt_tokens_total(&server) - before, 6.0);
+
+    // n: 3, streaming: every index streams and finishes once.
+    let before = prompt_tokens_total(&server);
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": model, "prompt": "Hello", "max_tokens": 5, "ignore_eos": true,
+                "n": 3, "stream": true}),
+    );
+    let mut finishes = [0; 3];
+    for chunk in stream_chunks(&resp) {
+        for c in chunk["choices"].as_array().unwrap() {
+            let i = c["index"].as_u64().unwrap() as usize;
+            if c["finish_reason"] == "length" {
+                finishes[i] += 1;
+            }
+        }
+    }
+    assert_eq!(finishes, [1, 1, 1]);
+    assert_eq!(prompt_tokens_total(&server) - before, 6.0);
+
+    // Penalties and logit_bias change greedy output exactly as the host sampler predicts.
+    let greedy = |extra: Value| -> Vec<u32> {
+        let mut body = json!({"model": model, "prompt": HELLO, "max_tokens": 16,
+                              "ignore_eos": true, "temperature": 0, "logprobs": 0,
+                              "return_tokens_as_token_ids": true});
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let resp = server.post("/v1/completions", &body);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        choice_token_ids(&resp.json()["choices"][0])
+    };
+    let plain = SamplingParams {
+        temperature: 0.0,
+        ..SamplingParams::default()
+    };
+    let baseline = greedy(json!({}));
+    assert_eq!(baseline, reference_tokens(&HELLO, plain.clone(), 16));
+    let cases = [
+        (
+            json!({"presence_penalty": 1.5, "frequency_penalty": 0.5}),
+            SamplingParams {
+                presence_penalty: 1.5,
+                frequency_penalty: 0.5,
+                ..plain.clone()
+            },
+        ),
+        (
+            json!({"repetition_penalty": 1.5}),
+            SamplingParams {
+                repetition_penalty: 1.5,
+                ..plain.clone()
+            },
+        ),
+        (
+            json!({"logit_bias": {"120": 100}}),
+            SamplingParams {
+                logit_bias: vec![(120, 100.0)],
+                ..plain.clone()
+            },
+        ),
+    ];
+    let mut changed = 0;
+    for (fields, params) in cases {
+        let got = greedy(fields.clone());
+        assert_eq!(got, reference_tokens(&HELLO, params, 16), "{fields}");
+        changed += usize::from(got != baseline);
+    }
+    assert_eq!(greedy(json!({"logit_bias": {"120": 100}})), vec![120; 16]);
+    assert!(changed >= 2, "penalties and bias change the greedy output");
+
+    // min_tokens holds EOS back: with EOS favoured, the output ends at token 1, or at 6.
+    let eos_favoured = |min_tokens: u32| {
+        let resp = server.post(
+            "/v1/completions",
+            &json!({"model": model, "prompt": "Hello", "max_tokens": 20, "temperature": 0,
+                    "logit_bias": {"260": 100}, "min_tokens": min_tokens}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body = resp.json();
+        assert_eq!(body["choices"][0]["finish_reason"], "stop", "{body}");
+        body["usage"]["completion_tokens"].as_u64().unwrap()
+    };
+    assert_eq!(eos_favoured(0), 1);
+    assert_eq!(eos_favoured(5), 6);
+
+    // stop_token_ids: the first occurrence of the id ends the choice with `stop`.
+    let stop_id = baseline[3];
+    let first = baseline.iter().position(|&t| t == stop_id).unwrap();
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": model, "prompt": HELLO, "max_tokens": 16, "ignore_eos": true,
+                "temperature": 0, "stop_token_ids": [stop_id], "logprobs": 0,
+                "return_tokens_as_token_ids": true}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let body = resp.json();
+    assert_eq!(body["choices"][0]["finish_reason"], "stop", "{body}");
+    assert_eq!(
+        choice_token_ids(&body["choices"][0]),
+        baseline[..=first].to_vec()
+    );
+
+    // echo: the prompt text prefixes the completion, streaming or not.
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": model, "prompt": "Hello", "max_tokens": 3, "ignore_eos": true,
+                "temperature": 0, "echo": true}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let text = resp.json()["choices"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text.starts_with("Hello") && text.len() > 5, "{text:?}");
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": model, "prompt": "Hello", "max_tokens": 3, "ignore_eos": true,
+                "temperature": 0, "echo": true, "stream": true}),
+    );
+    let streamed: String = stream_chunks(&resp)
+        .iter()
+        .filter_map(|c| c["choices"][0]["text"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(streamed, text);
+    drop(server);
+
+    // priority: of two queued requests the one with the lower value starts (and, with one
+    // running request allowed, finishes) first.
+    let server = TinyServer::start_long("scheduler:\n  max_running_requests: 1\n");
+    let held = server.hold_stream();
+    let queued = |priority: i32| {
+        let addr = server.addr;
+        let body = json!({"model": server.model, "prompt": "Hi", "max_tokens": 2,
+                          "ignore_eos": true, "priority": priority});
+        std::thread::spawn(move || {
+            let resp = request(addr, "POST", "/v1/completions", Some(&body.to_string()));
+            assert_eq!(resp.status, 200, "{}", resp.body);
+            Instant::now()
+        })
+    };
+    let low = queued(5);
+    wait_for(Duration::from_secs(10), "first request queued", || {
+        server.scheduler()["waiting"] == 1
+    });
+    let high = queued(-1);
+    wait_for(Duration::from_secs(10), "second request queued", || {
+        server.scheduler()["waiting"] == 2
+    });
+    drop(held);
+    let (low, high) = (low.join().unwrap(), high.join().unwrap());
+    assert!(high < low, "priority -1 must be served before priority 5");
+}
+
+/// The object schema of the structured-output tests: a boolean, an integer enum and a string
+/// enum, nothing else.
+fn small_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "flag": {"type": "boolean"},
+            "level": {"type": "integer", "enum": [1, 2, 3]},
+            "color": {"type": "string", "enum": ["red", "green", "blue"]}
+        },
+        "required": ["flag", "level", "color"],
+        "additionalProperties": false
+    })
+}
+
+/// True when `text` has whitespace outside JSON string literals.
+fn whitespace_outside_strings(text: &str) -> bool {
+    let (mut in_string, mut escaped) = (false, false);
+    for c in text.chars() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else if c.is_whitespace() {
+            return true;
+        }
+    }
+    false
+}
+
+/// P2 S-6, S-9: with a pool too small for the load, preemption by recompute does not change
+/// any request's tokens (seeded sampling and constrained requests included).
+#[test]
+fn preempted_output_unchanged() {
+    // 9 blocks of 16 tokens: 3 sequences of "Hello" + 40 tokens.
+    let server = TinyServer::launch(&Setup {
+        kv_bytes: "36KiB",
+        extra: "scheduler:\n  max_running_requests: 8\n",
+        ..Setup::default()
+    });
+    let bodies: Vec<Value> = (0..8)
+        .map(|i| {
+            let mut body = json!({"model": server.model, "prompt": "Hello", "max_tokens": 40,
+                                  "temperature": 1.0, "seed": 100 + i, "logprobs": 0,
+                                  "return_tokens_as_token_ids": true});
+            if i < 2 {
+                body["response_format"] = json!({"type": "json_schema",
+                    "json_schema": {"name": "small", "schema": small_schema()}});
+            } else {
+                body["ignore_eos"] = json!(true);
+            }
+            body
+        })
+        .collect();
+    let outcome = |resp: Response| {
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body = resp.json();
+        let c = &body["choices"][0];
+        (
+            choice_token_ids(c),
+            c["text"].as_str().unwrap().to_string(),
+            c["finish_reason"].as_str().unwrap().to_string(),
+        )
+    };
+    let concurrent: Vec<_> = bodies
+        .iter()
+        .map(|b| {
+            let (addr, b) = (server.addr, b.to_string());
+            std::thread::spawn(move || request(addr, "POST", "/v1/completions", Some(&b)))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| outcome(h.join().unwrap()))
+        .collect();
+    let metrics = server.metrics();
+    let preemptions = sample(
+        &metrics,
+        r#"turbine_preemptions_total{reason="kv_exhausted"}"#,
+    );
+    assert!(preemptions.is_some_and(|n| n > 0.0), "{metrics}");
+
+    for (i, body) in bodies.iter().enumerate() {
+        let alone = outcome(server.post("/v1/completions", body));
+        assert_eq!(concurrent[i], alone, "request {i}");
+    }
+    let validator = jsonschema::validator_for(&small_schema()).unwrap();
+    for (tokens, text, finish) in &concurrent[..2] {
+        assert_eq!(finish, "stop", "{text}");
+        let value: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert!(validator.is_valid(&value), "{text}");
+        assert!(!tokens.is_empty());
+    }
+    assert_eq!(server.blocks_used(), 0);
+}
+
+/// P2 S-17: `json_schema` and `json_object` outputs always parse, validate and are compact; a
+/// schema with an unsupported keyword or over `structured_output.max_schema_bytes` is refused.
+#[test]
+fn response_format_json_schema() {
+    let server = TinyServer::start("structured_output:\n  max_schema_bytes: 1KiB\n");
+    let chat = |response_format: Value, seed: u64, extra: Value| {
+        let mut body = json!({"model": server.model,
+                              "messages": [{"role": "user", "content": "Describe a thing."}],
+                              "max_tokens": 300, "temperature": 1.0, "seed": seed,
+                              "response_format": response_format});
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        server.post("/v1/chat/completions", &body)
+    };
+    let schema_format = json!({"type": "json_schema", "json_schema": {"name": "thing", "schema": small_schema(),
+                                                       "strict": true}});
+    let validator = jsonschema::validator_for(&small_schema()).unwrap();
+    let mut seen = std::collections::HashSet::new();
+    for seed in 0..20 {
+        let resp = chat(schema_format.clone(), seed, json!({}));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body = resp.json();
+        let choice = &body["choices"][0];
+        assert_eq!(choice["finish_reason"], "stop", "{body}");
+        let text = choice["message"]["content"].as_str().unwrap();
+        let value: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert!(validator.is_valid(&value), "seed {seed}: {text}");
+        assert!(!whitespace_outside_strings(text), "not compact: {text:?}");
+        seen.insert(text.to_string());
+    }
+    assert!(seen.len() > 1, "sampling varies the objects: {seen:?}");
+
+    // json_object: any object. The random-weight model would fill it with unbounded numbers
+    // and strings, so `}` is favoured to close it; the grammar still decides what is allowed.
+    for seed in 0..5 {
+        let resp = chat(
+            json!({"type": "json_object"}),
+            seed,
+            json!({"logit_bias": {"125": 50}}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body = resp.json();
+        let choice = &body["choices"][0];
+        assert_eq!(choice["finish_reason"], "stop", "{body}");
+        let text = choice["message"]["content"].as_str().unwrap();
+        let value: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert!(value.is_object(), "{text}");
+        assert!(!whitespace_outside_strings(text), "not compact: {text:?}");
+    }
+
+    // Refused before queueing.
+    let unsupported = json!({"type": "json_schema", "json_schema": {"name": "u",
+        "schema": {"type": "array", "uniqueItems": true}}});
+    let big = json!({"type": "json_schema", "json_schema": {"name": "b",
+        "schema": {"type": "string", "description": "x".repeat(2048)}}});
+    for (format, needle) in [(unsupported, "uniqueItems"), (big, "max_schema_bytes")] {
+        let resp = chat(format, 0, json!({}));
+        assert_eq!(resp.status, 400, "{}", resp.body);
+        assert_eq!(resp.error_code(), "invalid_json_schema", "{}", resp.body);
+        assert!(resp.body.contains(needle), "{}", resp.body);
+    }
+    let metrics = server.metrics();
+    assert_eq!(
+        sample(
+            &metrics,
+            r#"turbine_admission_total{outcome="rejected",reason="invalid_json_schema"}"#
+        ),
+        Some(2.0),
+        "{metrics}"
+    );
+}
+
+fn weather_tools() -> Value {
+    json!([
+        {"type": "function", "function": {
+            "name": "get_weather",
+            "description": "Weather in a city",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "enum": ["Paris", "Oslo"]},
+                    "unit": {"type": "string", "enum": ["c", "f"]}
+                },
+                "required": ["location"],
+                "additionalProperties": false
+            }
+        }},
+        {"type": "function", "function": {
+            "name": "get_time",
+            "parameters": {
+                "type": "object",
+                "properties": {"zone": {"type": "string", "enum": ["UTC", "CET"]}},
+                "required": ["zone"],
+                "additionalProperties": false
+            }
+        }}
+    ])
+}
+
+/// `call_` followed by 24 ASCII alphanumerics.
+fn is_call_id(id: &str) -> bool {
+    id.strip_prefix("call_")
+        .is_some_and(|r| r.len() == 24 && r.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// Checks one tool call object (`id`, `type`, `function.name`, `function.arguments`) against
+/// the tools' schemas; returns the function name.
+fn check_call(call: &Value, tools: &Value) -> String {
+    assert!(is_call_id(call["id"].as_str().unwrap()), "{call}");
+    assert_eq!(call["type"], "function", "{call}");
+    let name = call["function"]["name"].as_str().unwrap();
+    let tool = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["function"]["name"] == name)
+        .unwrap_or_else(|| panic!("{name} is not a listed tool"));
+    let arguments = call["function"]["arguments"].as_str().unwrap();
+    let args: Value = serde_json::from_str(arguments).unwrap();
+    let validator = jsonschema::validator_for(&tool["function"]["parameters"]).unwrap();
+    assert!(validator.is_valid(&args), "{name}: {arguments}");
+    name.to_string()
+}
+
+/// P2 S-18: named and `required` tool choices return exactly one valid call; `none` returns
+/// content; an unknown function and a template without tools are refused.
+#[test]
+fn tool_choice_modes() {
+    // The Llama-3.2 template renders the tools into the prompt: about 1600 byte tokens.
+    let server = TinyServer::launch(&Setup {
+        model_extra: "  tool_call_parser: llama3_json\n",
+        max_positions: Some(LONG_POSITIONS),
+        ..Setup::default()
+    });
+    let tools = weather_tools();
+    let chat = |extra: Value| {
+        let mut body = json!({"model": server.model,
+                              "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                              "tools": tools, "max_tokens": 120, "temperature": 1.0,
+                              "seed": 3, "chat_template_kwargs": {"date_string": "26 Jul 2024"}});
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        server.post("/v1/chat/completions", &body)
+    };
+    let named = json!({"type": "function", "function": {"name": "get_weather"}});
+
+    // Named, not streaming.
+    let resp = chat(json!({"tool_choice": named}));
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let body = resp.json();
+    let choice = &body["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls", "{body}");
+    assert!(choice["message"]["content"].is_null(), "{body}");
+    let calls = choice["message"]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1, "{body}");
+    assert_eq!(check_call(&calls[0], &tools), "get_weather");
+
+    // Named, streaming: one delta.tool_calls entry with the complete arguments.
+    let resp = chat(json!({"tool_choice": named, "stream": true}));
+    let mut entries = Vec::new();
+    let mut finish = None;
+    for chunk in stream_chunks(&resp) {
+        let c = &chunk["choices"][0];
+        if let Some(calls) = c["delta"]["tool_calls"].as_array() {
+            entries.extend(calls.iter().cloned());
+        }
+        if let Some(reason) = c["finish_reason"].as_str() {
+            finish = Some(reason.to_string());
+        }
+    }
+    assert_eq!(finish.as_deref(), Some("tool_calls"));
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["index"], 0);
+    assert_eq!(check_call(&entries[0], &tools), "get_weather");
+
+    // required without parallel calls: exactly one call to a listed tool.
+    for seed in 0..3 {
+        let resp = chat(
+            json!({"tool_choice": "required", "parallel_tool_calls": false,
+                               "seed": seed}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body = resp.json();
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls", "{body}");
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 1, "{body}");
+        check_call(&calls[0], &tools);
+    }
+
+    // none: content only.
+    let resp = chat(json!({"tool_choice": "none", "max_tokens": 8, "ignore_eos": true}));
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let body = resp.json();
+    let message = &body["choices"][0]["message"];
+    assert!(message["content"].is_string(), "{body}");
+    assert!(
+        message.get("tool_calls").is_none_or(Value::is_null),
+        "{body}"
+    );
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+
+    // A named function that is not listed.
+    let resp = chat(json!({"tool_choice": {"type": "function", "function": {"name": "nope"}}}));
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert_eq!(resp.error_code(), "unknown_tool");
+    drop(server);
+
+    // A checkpoint whose template does not render tools has no tool-call parser.
+    let plain = TinyServer::launch(&Setup {
+        template_with_tools: false,
+        ..Setup::default()
+    });
+    let resp = plain.post(
+        "/v1/chat/completions",
+        &json!({"model": plain.model, "messages": [{"role": "user", "content": "x"}],
+                "tools": tools}),
+    );
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert_eq!(resp.error_code(), "tools_not_supported");
+}
+
+/// P2 S-14: a run that queues, rejects, preempts, cancels and serves constrained requests
+/// leaves every Phase 2 metric family with the expected counts, and a JSON log record with a
+/// `reason` for each reject, preemption and cancellation.
+#[test]
+fn phase2_metrics_and_reasons() {
+    // 160 blocks of 16 tokens; the tool request's rendered prompt takes about 100.
+    let server = TinyServer::launch(&Setup {
+        kv_bytes: "640KiB",
+        max_positions: Some(LONG_POSITIONS),
+        extra: "scheduler:\n  max_running_requests: 6\nlogging:\n  format: json\n",
+        capture_logs: true,
+        ..Setup::default()
+    });
+    let model = server.model.clone();
+
+    // Six concurrent requests of 29 blocks each: queued, then preempted for KV.
+    let handles: Vec<_> = (0..6)
+        .map(|i| {
+            let addr = server.addr;
+            let body = json!({"model": model, "prompt": "Hello", "max_tokens": 450,
+                              "ignore_eos": true, "temperature": 1.0, "seed": i});
+            std::thread::spawn(move || {
+                request(addr, "POST", "/v1/completions", Some(&body.to_string()))
+            })
+        })
+        .collect();
+    for h in handles {
+        let resp = h.join().unwrap();
+        assert_eq!(resp.status, 200, "{}", resp.body);
+    }
+
+    // Rejected: a KV need beyond the pool, and a bad schema.
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": model, "prompt": "Hello", "max_tokens": 3000}),
+    );
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert_eq!(resp.error_code(), "context_exceeds_kv_capacity");
+    let resp = server.post(
+        "/v1/chat/completions",
+        &json!({"model": model, "messages": [{"role": "user", "content": "x"}],
+                "response_format": {"type": "json_schema", "json_schema": {"name": "u",
+                    "schema": {"type": "array", "uniqueItems": true}}}}),
+    );
+    assert_eq!(resp.error_code(), "invalid_json_schema", "{}", resp.body);
+
+    // Cancelled: a client that goes away after the first chunk.
+    let stream = OpenStream::open(
+        server.addr,
+        &json!({"model": model, "prompt": "Hello", "max_tokens": 250, "ignore_eos": true,
+                "stream": true, "logprobs": 20}),
+        true,
+    );
+    drop(stream);
+    wait_for(Duration::from_secs(5), "cancellation counted", || {
+        sample(
+            &server.metrics(),
+            r#"turbine_requests_cancelled_total{reason="client_disconnect"}"#,
+        ) == Some(1.0)
+    });
+
+    // Constrained: a json_schema answer and a named tool call.
+    let resp = server.post(
+        "/v1/chat/completions",
+        &json!({"model": model, "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 100, "response_format": {"type": "json_schema",
+                "json_schema": {"name": "small", "schema": small_schema()}}}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let resp = server.post(
+        "/v1/chat/completions",
+        &json!({"model": model, "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 100, "tools": weather_tools(),
+                "tool_choice": {"type": "function", "function": {"name": "get_time"}}}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    assert_eq!(resp.json()["choices"][0]["finish_reason"], "tool_calls");
+    wait_for(Duration::from_secs(1), "blocks released", || {
+        server.blocks_used() == 0
+    });
+
+    let metrics = server.metrics();
+    let exact = [
+        (
+            r#"turbine_admission_total{outcome="queued",reason="ok"}"#,
+            9.0,
+        ),
+        (
+            r#"turbine_admission_total{outcome="rejected",reason="context_exceeds_kv_capacity"}"#,
+            1.0,
+        ),
+        (
+            r#"turbine_admission_total{outcome="rejected",reason="invalid_json_schema"}"#,
+            1.0,
+        ),
+        ("turbine_queue_wait_seconds_count", 9.0),
+        (
+            r#"turbine_requests_cancelled_total{reason="client_disconnect"}"#,
+            1.0,
+        ),
+        (r#"turbine_requests_active{state="prefilling"}"#, 0.0),
+        (r#"turbine_requests_active{state="decoding"}"#, 0.0),
+        (r#"turbine_requests_active{state="paused"}"#, 0.0),
+        ("turbine_requests_queued", 0.0),
+        (r#"turbine_kv_blocks{tier="l0",state="used"}"#, 0.0),
+        (r#"turbine_kv_blocks{tier="l0",state="free"}"#, 160.0),
+        (
+            r#"turbine_grammar_compile_seconds_count{kind="json_schema"}"#,
+            2.0,
+        ),
+        (
+            r#"turbine_grammar_compile_seconds_count{kind="tool_call"}"#,
+            1.0,
+        ),
+        (
+            r#"turbine_tool_calls_total{parser="llama3_json",outcome="parsed"}"#,
+            1.0,
+        ),
+    ];
+    for (series, value) in exact {
+        assert_eq!(sample(&metrics, series), Some(value), "{series}\n{metrics}");
+    }
+    let positive = [
+        r#"turbine_preemptions_total{reason="kv_exhausted"}"#,
+        "turbine_iteration_seconds_count",
+        r#"turbine_iteration_tokens_count{phase="prefill"}"#,
+        r#"turbine_iteration_tokens_count{phase="decode"}"#,
+        "turbine_batch_requests_count",
+        "turbine_token_mask_seconds_count",
+    ];
+    for series in positive {
+        assert!(
+            sample(&metrics, series).is_some_and(|v| v > 0.0),
+            "{series}\n{metrics}"
+        );
+    }
+    assert!(
+        sample(&metrics, "turbine_stream_paused_total").is_some(),
+        "{metrics}"
+    );
+
+    // Every automatic decision is logged with its reason.
+    let records = server.log_records();
+    let reasons: Vec<&str> = records
+        .iter()
+        .filter_map(|r| r["fields"]["reason"].as_str())
+        .collect();
+    for reason in [
+        "context_exceeds_kv_capacity",
+        "invalid_json_schema",
+        "kv_exhausted",
+        "client_disconnect",
+    ] {
+        assert!(
+            reasons.contains(&reason),
+            "no log record with reason {reason}: {reasons:?}"
+        );
+    }
 }

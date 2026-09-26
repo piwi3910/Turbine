@@ -110,11 +110,7 @@ async fn serve(
         scheduler: SchedulerMetrics::register(&metrics),
         kv: KvMetrics::register(&metrics),
     };
-    let backend = Arc::new(ModelBackend::new(
-        &prepared,
-        &inventory,
-        engine_metrics.server.clone(),
-    ));
+    let backend = Arc::new(ModelBackend::new(&prepared, &inventory, &engine_metrics));
     let state = ApiState {
         inference: backend.clone(),
         diagnostics: backend.clone(),

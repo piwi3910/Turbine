@@ -190,12 +190,14 @@ struct FunctionTool<'a> {
     parameters: Option<&'a Map<String, Value>>,
 }
 
-fn unsupported(field: impl Into<String>, value: impl Into<String>, supported: &str) -> ModelError {
-    ModelError::Unsupported {
-        field: field.into(),
-        value: value.into(),
-        supported: supported.to_string(),
-    }
+/// A tool definition or `tool_choice` the grammar cannot be built from: a
+/// [`ModelError::Constraint`] (the server answers 400 `invalid_json_schema`) naming the field.
+fn invalid(field: impl Into<String>, value: impl Into<String>, supported: &str) -> ModelError {
+    ModelError::Constraint(format!(
+        "unsupported {} = {}; supported: {supported}",
+        field.into(),
+        value.into()
+    ))
 }
 
 /// OpenAI function names: 1–64 of `[A-Za-z0-9_-]`, so a name needs no escaping in JSON or Lark.
@@ -211,7 +213,7 @@ fn function_tools(tools: &[Value]) -> Result<Vec<FunctionTool<'_>>, ModelError> 
     for (i, tool) in tools.iter().enumerate() {
         let kind = tool.get("type").and_then(Value::as_str).unwrap_or("");
         if kind != "function" {
-            return Err(unsupported(format!("tools[{i}].type"), kind, "function"));
+            return Err(invalid(format!("tools[{i}].type"), kind, "function"));
         }
         let function = tool.get("function");
         let name = function
@@ -219,14 +221,14 @@ fn function_tools(tools: &[Value]) -> Result<Vec<FunctionTool<'_>>, ModelError> 
             .and_then(Value::as_str)
             .unwrap_or("");
         if !valid_function_name(name) {
-            return Err(unsupported(
+            return Err(invalid(
                 format!("tools[{i}].function.name"),
                 name,
                 "1 to 64 of [A-Za-z0-9_-]",
             ));
         }
         if out.iter().any(|t| t.name == name) {
-            return Err(unsupported(
+            return Err(invalid(
                 format!("tools[{i}].function.name"),
                 name,
                 "unique function names",
@@ -236,7 +238,7 @@ fn function_tools(tools: &[Value]) -> Result<Vec<FunctionTool<'_>>, ModelError> 
             None | Some(Value::Null) => None,
             Some(Value::Object(schema)) => Some(schema),
             Some(other) => {
-                return Err(unsupported(
+                return Err(invalid(
                     format!("tools[{i}].function.parameters"),
                     other.to_string(),
                     "a JSON schema object",
@@ -254,7 +256,8 @@ fn function_tools(tools: &[Value]) -> Result<Vec<FunctionTool<'_>>, ModelError> 
 /// separators when `parallel` (never for a named function: that is exactly one call). The
 /// parameters use Llama's own separators (`", "`, `": "`) with no free whitespace; a tool
 /// without `parameters` takes any object. `none` and `auto` are unconstrained and have no
-/// grammar; an unknown named function or a malformed tool is rejected naming the field.
+/// grammar; an unknown named function or a malformed tool is a [`ModelError::Constraint`]
+/// naming the field.
 pub fn tool_call_grammar(
     tools: &[Value],
     choice: &ToolChoice,
@@ -262,11 +265,11 @@ pub fn tool_call_grammar(
 ) -> Result<ConstraintSpec, ModelError> {
     let tools = function_tools(tools)?;
     if tools.is_empty() {
-        return Err(unsupported("tools", "[]", "at least one function tool"));
+        return Err(invalid("tools", "[]", "at least one function tool"));
     }
     let allowed: Vec<&FunctionTool<'_>> = match choice {
         ToolChoice::None | ToolChoice::Auto => {
-            return Err(unsupported(
+            return Err(invalid(
                 "tool_choice",
                 choice.as_str(),
                 "required, a named function",
@@ -276,7 +279,7 @@ pub fn tool_call_grammar(
         ToolChoice::Named(name) => {
             let Some(tool) = tools.iter().find(|t| t.name == name) else {
                 let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
-                return Err(unsupported(
+                return Err(invalid(
                     "tool_choice.function.name",
                     name.as_str(),
                     &names.join(", "),
@@ -496,7 +499,8 @@ mod tests {
 
         // Errors name the offending field.
         let err = |r: Result<ConstraintSpec, ModelError>| match r {
-            Err(e) => e.to_string(),
+            Err(e @ ModelError::Constraint(_)) => e.to_string(),
+            Err(e) => panic!("expected ModelError::Constraint, got {e:?}"),
             Ok(spec) => panic!("expected an error, got {spec:?}"),
         };
         let e = err(tool_call_grammar(

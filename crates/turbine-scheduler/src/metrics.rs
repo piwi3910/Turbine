@@ -120,6 +120,13 @@ impl SchedulerMetrics {
             .inc();
     }
 
+    /// A submission refused before it reaches the scheduler — `invalid_json_schema`, whose
+    /// grammar the HTTP side compiles before queueing — counted as
+    /// `turbine_admission_total{outcome="rejected",reason}`.
+    pub fn record_rejection(&self, reason: &'static str) {
+        self.admission("rejected", reason);
+    }
+
     pub(crate) fn queue_wait(&self, seconds: f64) {
         self.queue_wait_seconds.observe(seconds);
     }

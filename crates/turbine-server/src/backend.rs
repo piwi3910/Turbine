@@ -3,6 +3,11 @@
 //! (`crate::engine`), whose scheduler decides admission (P2 §Scheduling rules, submission
 //! checks): `context_length_exceeded`, `context_exceeds_kv_capacity`, `queue_full` (429,
 //! `retry-after: 1`) and `shutting_down` (503) are plain HTTP errors returned before any event.
+//!
+//! Before queueing, a `response_format` or a `required`/named `tool_choice` is compiled into one
+//! matcher per choice off the engine thread (`engine::grammar`); a grammar that fails, is too
+//! large or too slow is 400 `invalid_json_schema`. `tools` on a model without a tool-call parser
+//! is 400 `tools_not_supported`; `tool_choice: "none"` renders the template without tools.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -11,21 +16,27 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
-use turbine_api::openai::request::{OpenAiRequest, PromptInput, ResponseFormat, ToolChoiceMode};
+use turbine_api::openai::request::{PromptInput, ResponseFormat, ToolChoiceMode};
 use turbine_api::{
     ApiError, BoxFuture, Diagnostics, GenerationStream, InferenceBackend, InferenceRequest,
     ModelCard, NotReadyReason, Readiness, ReadyState,
 };
+use turbine_core::config::ToolCallParserKind;
 use turbine_core::request::{
-    Endpoint, ErrorCode, GenerationRequest, SamplingParams, StopConditions,
+    ConstraintSpec, Endpoint, ErrorCode, GenerationRequest, SamplingParams, StopConditions,
 };
 use turbine_core::types::Priority;
 use turbine_device::DeviceInventory;
 use turbine_kv::blocks_for_tokens;
-use turbine_model::{ChatTemplate, Tokenizer};
-use turbine_scheduler::SubmitError;
+use turbine_model::tools::{LLAMA3_JSON, PYTHON_TAG};
+use turbine_model::{ChatTemplate, Llama3JsonParser, Tokenizer, ToolChoice, tool_call_grammar};
+use turbine_scheduler::{SchedulerMetrics, SubmitError};
 
-use crate::engine::{EVENT_CHANNEL_CAPACITY, EngineCommand, EngineHandle, EngineShared, Fatal};
+use crate::engine::grammar::GrammarService;
+use crate::engine::{
+    EVENT_CHANNEL_CAPACITY, EngineCommand, EngineHandle, EngineMetrics, EngineShared, Fatal,
+    Submission, ToolOutput, ToolParser,
+};
 use crate::metrics::{Outcome, ServerMetrics};
 use crate::model::PreparedModel;
 
@@ -92,7 +103,13 @@ pub struct ModelBackend {
     defaults: SamplingDefaults,
     tokenizer: Arc<Tokenizer>,
     template: Arc<ChatTemplate>,
+    /// Compiles `response_format` and tool grammars before queueing.
+    grammars: GrammarService,
+    /// `model.tool_call_parser`; `None` when it resolved to `none`.
+    tool_parser: Option<ToolParser>,
     metrics: ServerMetrics,
+    /// `turbine_admission_total` for `invalid_json_schema` (refused before the scheduler).
+    admission: SchedulerMetrics,
     started: Instant,
     device_count: u64,
     devices: Value,
@@ -103,12 +120,18 @@ impl ModelBackend {
     pub fn new(
         model: &PreparedModel,
         inventory: &DeviceInventory,
-        metrics: ServerMetrics,
+        metrics: &EngineMetrics,
     ) -> ModelBackend {
-        let eos_token_ids = if model.arch.eos_token_ids.is_empty() {
-            model.generation.eos_token_ids.clone()
-        } else {
-            model.arch.eos_token_ids.clone()
+        let eos_token_ids = crate::model::eos_token_ids(&model.arch, &model.generation)
+            .into_iter()
+            .collect();
+        let tool_parser = match model.tool_call_parser {
+            ToolCallParserKind::Llama3Json => Some(ToolParser {
+                parser: Arc::new(Llama3JsonParser::new()),
+                label: LLAMA3_JSON,
+                python_tag: model.tokenizer.token_to_id(PYTHON_TAG),
+            }),
+            _ => None,
         };
         ModelBackend {
             state: AtomicU8::new(STATE_LOADING),
@@ -129,7 +152,14 @@ impl ModelBackend {
             },
             tokenizer: Arc::clone(&model.tokenizer),
             template: Arc::clone(&model.template),
-            metrics,
+            grammars: GrammarService::new(
+                Arc::clone(&model.grammar),
+                &model.structured_output,
+                metrics.model.clone(),
+            ),
+            tool_parser,
+            metrics: metrics.server.clone(),
+            admission: metrics.scheduler.clone(),
             started: Instant::now(),
             device_count: inventory.devices.len() as u64,
             devices: serde_json::to_value(inventory).unwrap_or(Value::Null),
@@ -238,16 +268,21 @@ impl ModelBackend {
         e
     }
 
-    /// Prompt token ids: the rendered chat template (its text carries the BOS token), the
-    /// tokenized prompt string (`add_special_tokens`), or the given ids.
-    fn prompt_tokens(&self, req: &InferenceRequest) -> Result<Vec<u32>, ApiError> {
+    /// Prompt token ids: the rendered chat template (its text carries the BOS token; `tools`
+    /// rendered when given), the tokenized prompt string (`add_special_tokens`), or the given
+    /// ids.
+    fn prompt_tokens(
+        &self,
+        req: &InferenceRequest,
+        tools: Option<&[Value]>,
+    ) -> Result<Vec<u32>, ApiError> {
         let tokens = match req.endpoint {
             Endpoint::ChatCompletions => {
                 let empty = serde_json::Map::new();
                 let kwargs = req.body.chat_template_kwargs.as_ref().unwrap_or(&empty);
                 let text = self
                     .template
-                    .render(&req.body.messages_json(), None, true, kwargs)
+                    .render(&req.body.messages_json(), tools, true, kwargs)
                     .map_err(|e| ApiError::template_error(e.to_string()))?;
                 self.tokenizer
                     .encode(&text, false)
@@ -278,24 +313,76 @@ impl ModelBackend {
         Ok(tokens)
     }
 
-    /// Builds the generation request: prompt tokens, `max_tokens` (default: the rest of the
-    /// context), sampling defaults and priority. The size checks are the scheduler's.
-    fn build(&self, req: &InferenceRequest) -> Result<GenerationRequest, ApiError> {
-        if let Some(field) = unserved_phase2_field(&req.body) {
-            return Err(ApiError::unsupported_parameter(field));
-        }
-        let prompt_tokens = self.prompt_tokens(req)?;
-        let prompt_len = u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX);
+    /// Builds the submission: prompt tokens (tools rendered unless `tool_choice` is `none`),
+    /// `max_tokens` (default: the rest of the context), sampling defaults and the Phase 2
+    /// fields, the constraint to compile and the tool-call handling. The size checks are the
+    /// scheduler's.
+    fn build(&self, req: &InferenceRequest) -> Result<Submission, ApiError> {
         let body = &req.body;
+        let mode = body.tool_choice_mode();
+        let tools = body.tools_json();
+        let parser = match (&self.tool_parser, tools.is_empty()) {
+            (_, true) => None,
+            (Some(p), false) => Some(p.clone()),
+            (None, false) => return Err(ApiError::tools_not_supported(&self.served_name)),
+        };
+        let render_tools = (mode != ToolChoiceMode::None).then_some(tools.as_slice());
+        let prompt_tokens = self.prompt_tokens(req, render_tools)?;
+        let prompt_len = u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX);
+        let logit_bias = body.logit_bias();
+        let stop_token_ids = body.stop_token_ids.clone().unwrap_or_default();
+        for (field, id) in logit_bias
+            .iter()
+            .map(|&(id, _)| ("logit_bias", id))
+            .chain(stop_token_ids.iter().map(|&id| ("stop_token_ids", id)))
+        {
+            if id >= self.vocab_size {
+                return Err(ApiError::invalid_request(format!(
+                    "{field}: token id {id} is outside the vocabulary (size {})",
+                    self.vocab_size
+                )));
+            }
+        }
+        let tool_choice = match &mode {
+            ToolChoiceMode::None => ToolChoice::None,
+            ToolChoiceMode::Auto => ToolChoice::Auto,
+            ToolChoiceMode::Required => ToolChoice::Required,
+            ToolChoiceMode::Named(name) => ToolChoice::Named(name.clone()),
+        };
+        let (constraint, tool_output) = match (&tool_choice, parser) {
+            (ToolChoice::Required | ToolChoice::Named(_), Some(p)) => {
+                let spec =
+                    tool_call_grammar(&tools, &tool_choice, body.parallel_tool_calls_enabled())
+                        .map_err(|e| ApiError::invalid_json_schema(e.to_string()))?;
+                (Some(spec), ToolOutput::Constrained(p))
+            }
+            (ToolChoice::Auto, Some(p)) => (None, ToolOutput::Auto(p)),
+            _ => (
+                response_constraint(body.response_format.as_ref()),
+                ToolOutput::None,
+            ),
+        };
+        let echo = req.endpoint == Endpoint::Completions && body.echo == Some(true);
+        let echo_text = if echo {
+            Some(match &body.prompt {
+                Some(PromptInput::Text(text)) => text.clone(),
+                _ => self
+                    .tokenizer
+                    .decode(&prompt_tokens, true)
+                    .map_err(|e| ApiError::invalid_request(e.to_string()))?,
+            })
+        } else {
+            None
+        };
         let max_tokens = body
             .max_tokens()
             .unwrap_or_else(|| self.max_seq_len.saturating_sub(prompt_len));
-        Ok(GenerationRequest {
+        let request = GenerationRequest {
             id: req.id,
-            n: 1,
+            n: body.n().max(1),
             priority: Priority(body.priority.unwrap_or(0)),
-            echo: false,
-            constraint: None,
+            echo,
+            constraint,
             deadline_ms: u64::MAX,
             endpoint: req.endpoint,
             http_request_id: req.http_request_id.clone(),
@@ -305,17 +392,48 @@ impl ModelBackend {
                 top_p: body.top_p.unwrap_or(self.defaults.top_p),
                 top_k: body.top_k.unwrap_or(self.defaults.top_k),
                 seed: body.seed,
+                presence_penalty: body.presence_penalty.unwrap_or(0.0),
+                frequency_penalty: body.frequency_penalty.unwrap_or(0.0),
+                repetition_penalty: body.repetition_penalty.unwrap_or(1.0),
+                logit_bias,
+                min_tokens: body.min_tokens.unwrap_or(0),
                 logprobs: body.logprobs_n(req.endpoint),
-                ..SamplingParams::default()
             },
             stop: StopConditions {
                 eos_token_ids: self.eos_token_ids.clone(),
                 stop_strings: body.stop_strings(),
+                stop_token_ids,
                 max_tokens,
                 ignore_eos: body.ignore_eos == Some(true),
-                ..StopConditions::default()
             },
+        };
+        Ok(Submission {
+            request,
+            matchers: Vec::new(),
+            tools: tool_output,
+            echo_text,
         })
+    }
+
+    /// Compiles the submission's constraint into one matcher per choice (off the engine
+    /// thread, bounded); a failure is 400 `invalid_json_schema`, counted as an admission
+    /// rejection.
+    async fn compile(&self, submission: &mut Submission) -> Result<(), ApiError> {
+        let Some(spec) = &submission.request.constraint else {
+            return Ok(());
+        };
+        match self.grammars.compile(spec, submission.request.n).await {
+            Ok(matchers) => {
+                submission.matchers = matchers;
+                Ok(())
+            }
+            Err(e) => {
+                if e.code == ErrorCode::InvalidJsonSchema {
+                    self.admission.record_rejection(e.code.as_str());
+                }
+                Err(e)
+            }
+        }
     }
 
     /// The HTTP error for a submission the scheduler refused.
@@ -356,16 +474,19 @@ impl ModelBackend {
         let Some(loaded) = self.loaded.get().filter(|_| self.is_ready()) else {
             return Err(self.reject(endpoint, ApiError::model_not_loaded()));
         };
-        let request = self.build(&req).map_err(|e| self.reject(endpoint, e))?;
-        let prompt_len = u32::try_from(request.prompt_tokens.len()).unwrap_or(u32::MAX);
-        let max_tokens = request.stop.max_tokens;
+        let mut submission = self.build(&req).map_err(|e| self.reject(endpoint, e))?;
+        self.compile(&mut submission)
+            .await
+            .map_err(|e| self.reject(endpoint, e))?;
+        let prompt_len = u32::try_from(submission.request.prompt_tokens.len()).unwrap_or(u32::MAX);
+        let max_tokens = submission.request.stop.max_tokens;
         let (events, stream) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (ack, admitted) = oneshot::channel();
         // Waits for room in the bounded command channel, which the engine drains every turn.
         let sent = loaded
             .engine
             .submit_tx
-            .send(EngineCommand::Submit(Box::new(request), events, ack))
+            .send(EngineCommand::Submit(Box::new(submission), events, ack))
             .await;
         let engine_gone = || {
             self.metrics.request(endpoint, Outcome::Failed);
@@ -469,48 +590,14 @@ impl ModelBackend {
     }
 }
 
-/// The first Phase 2 request field the API accepts but the engine does not honour yet, at a
-/// non-default value. Such requests are refused with 400 `unsupported_parameter` instead of
-/// having the field silently ignored (TS §21 rule 2); `priority` (served by the scheduler),
-/// `user` and `parallel_tool_calls` pass. Plan Task 17 serves the rest and removes this check.
-fn unserved_phase2_field(body: &OpenAiRequest) -> Option<&'static str> {
-    let unserved = [
-        ("n", body.n() > 1),
-        (
-            "presence_penalty",
-            body.presence_penalty.is_some_and(|p| p != 0.0),
-        ),
-        (
-            "frequency_penalty",
-            body.frequency_penalty.is_some_and(|p| p != 0.0),
-        ),
-        (
-            "repetition_penalty",
-            body.repetition_penalty.is_some_and(|p| p != 1.0),
-        ),
-        ("logit_bias", !body.logit_bias().is_empty()),
-        ("min_tokens", body.min_tokens.is_some_and(|m| m > 0)),
-        (
-            "stop_token_ids",
-            body.stop_token_ids.as_ref().is_some_and(|t| !t.is_empty()),
-        ),
-        ("echo", body.echo == Some(true)),
-        (
-            "response_format",
-            body.response_format
-                .as_ref()
-                .is_some_and(|f| *f != ResponseFormat::Text),
-        ),
-        ("tools", body.tool_choice_mode() != ToolChoiceMode::None),
-        (
-            "messages.tool_calls / tool messages",
-            body.messages
-                .iter()
-                .flatten()
-                .any(|m| m.role == "tool" || m.tool_calls.as_ref().is_some_and(|c| !c.is_empty())),
-        ),
-    ];
-    unserved
-        .into_iter()
-        .find_map(|(field, set)| set.then_some(field))
+/// The constraint of a `response_format` (`text` or none: unconstrained).
+fn response_constraint(format: Option<&ResponseFormat>) -> Option<ConstraintSpec> {
+    match format? {
+        ResponseFormat::Text => None,
+        ResponseFormat::JsonObject => Some(ConstraintSpec::JsonObject),
+        ResponseFormat::JsonSchema { json_schema } => Some(ConstraintSpec::JsonSchema {
+            // The API requires `schema`; a missing one constrains to any JSON value.
+            schema: json_schema.schema.clone().unwrap_or(Value::Bool(true)),
+        }),
+    }
 }

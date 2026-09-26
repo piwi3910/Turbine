@@ -34,3 +34,7 @@ turbine-scheduler.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[dev-dependencies]
+# Validating structured outputs and tool-call arguments in the tiny_server tests
+jsonschema.workspace = true

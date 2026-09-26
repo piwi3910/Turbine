@@ -1,8 +1,17 @@
-//! Per-request host state of the engine (P2 S-2, S-6, S-7): the request, its output channel and
-//! the events that did not fit it, and per choice the token history, sampler, detokenizer and
-//! stop state. Everything here lives on the engine thread and survives a preemption: a
-//! re-prefill replays the history from [`ActiveRequest::token_at`] and continues the same
-//! sampler, so no token is sent twice.
+//! Per-request host state of the engine (P2 S-2, S-6, S-7, S-10, S-17, S-18): the request, its
+//! output channel and the events that did not fit it, and per choice the token history, sampler
+//! (seeded with the request seed plus the choice index), detokenizer, stop state,
+//! constrained-decoding matcher and tool-call buffer. Everything here lives on the engine thread
+//! and survives a preemption: a re-prefill replays the history from
+//! [`ActiveRequest::token_at`] and continues the same sampler and matcher, so no token is sent
+//! twice and the matcher is never replayed.
+//!
+//! Tool calls (P2 §Structured output and tool-call rules): with a `required` or named
+//! `tool_choice` the whole output is held and parsed at the finish; with `auto` it streams
+//! unless its first non-whitespace output is `<|python_tag|>` or `{`, which holds the rest. A
+//! parsed output becomes one `ToolCalls` event and `finish_reason: "tool_calls"`; an output that
+//! does not parse is returned as content with its finish reason unchanged
+//! (`tool_call_parse_failed`).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -11,10 +20,67 @@ use std::time::Instant;
 use smallvec::SmallVec;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use turbine_core::request::{
-    ErrorCode, FinishReason, GenerationEvent, GenerationRequest, StopConditions, Usage,
+    ErrorCode, FinishReason, GenerationEvent, GenerationRequest, SamplingParams, StopConditions,
+    Usage,
 };
 use turbine_core::types::SeqId;
-use turbine_model::{IncrementalDetokenizer, Sampler, Tokenizer};
+use turbine_model::{
+    IncrementalDetokenizer, ModelError, ModelMetrics, Sampler, TokenMask, TokenMatcher, Tokenizer,
+    ToolCallOutcome, ToolCallParser, ToolParse, step_mask,
+};
+
+/// How a request's output is turned into tool calls.
+#[derive(Clone, Default)]
+pub(crate) enum ToolOutput {
+    /// Plain content (no tools, or `tool_choice: "none"`).
+    #[default]
+    None,
+    /// `tool_choice: "auto"`: unconstrained; held and parsed when it starts like a call.
+    Auto(ToolParser),
+    /// `required` or a named function: constrained by the tool grammar, always parsed.
+    Constrained(ToolParser),
+}
+
+/// The model's tool-call parser (`model.tool_call_parser`).
+#[derive(Clone)]
+pub(crate) struct ToolParser {
+    pub parser: Arc<dyn ToolCallParser>,
+    /// The `parser` label of `turbine_tool_calls_total`.
+    pub label: &'static str,
+    /// Token id of `<|python_tag|>`, which may open a call (it decodes to no text).
+    pub python_tag: Option<u32>,
+}
+
+/// What the HTTP side hands the engine for one request.
+pub(crate) struct Submission {
+    pub request: GenerationRequest,
+    /// One compiled matcher per choice when `request.constraint` is set (compiled off the
+    /// engine thread before queueing); empty otherwise.
+    pub matchers: Vec<Box<dyn TokenMatcher>>,
+    pub tools: ToolOutput,
+    /// Completions `echo`: the prompt text each choice's output starts with.
+    pub echo_text: Option<String>,
+}
+
+impl From<GenerationRequest> for Submission {
+    /// An unconstrained request without tools or echo.
+    fn from(request: GenerationRequest) -> Submission {
+        Submission {
+            request,
+            matchers: Vec::new(),
+            tools: ToolOutput::None,
+            echo_text: None,
+        }
+    }
+}
+
+/// The events one sampled token produces and whether it ended its choice.
+#[derive(Debug)]
+pub(crate) struct Step {
+    /// A `Token` event, then a `ToolCalls` event when the finished output parsed as calls.
+    pub events: SmallVec<[GenerationEvent; 2]>,
+    pub finish: Option<FinishReason>,
+}
 
 /// Where an event went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +112,9 @@ pub(crate) struct ActiveRequest {
     /// When the engine received it: the start of TTFT and end-to-end latency.
     pub arrived: Instant,
     pub choices: SmallVec<[Choice; 1]>,
+    tools: ToolOutput,
+    /// Scratch bitmask for the constrained choices' allowed tokens.
+    mask: Option<TokenMask>,
     /// Events the full channel did not take, oldest first. While any are held every new event
     /// queues behind them, so the client sees the stream in order.
     held: VecDeque<GenerationEvent>,
@@ -56,23 +125,41 @@ pub(crate) struct ActiveRequest {
 }
 
 impl ActiveRequest {
-    /// `seqs[i]` is choice `i`.
+    /// `seqs[i]` is choice `i`; choice `i` gets `submission.matchers[i]` when constrained.
     pub fn new(
-        request: GenerationRequest,
+        submission: Submission,
         events: mpsc::Sender<GenerationEvent>,
         seqs: &[SeqId],
         tokenizer: &Arc<Tokenizer>,
     ) -> ActiveRequest {
+        let Submission {
+            request,
+            matchers,
+            tools,
+            echo_text,
+        } = submission;
         let end_ids = end_ids(&request.stop);
+        let mut matchers = matchers.into_iter();
         let choices = seqs
             .iter()
             .zip(0u32..)
             .map(|(&seq, index)| Choice {
                 index,
                 seq,
-                sampler: Sampler::new(&request.sampling, &request.prompt_tokens, &end_ids),
+                sampler: Sampler::new(
+                    &choice_params(&request.sampling, index),
+                    &request.prompt_tokens,
+                    &end_ids,
+                ),
                 detok: IncrementalDetokenizer::new(Arc::clone(tokenizer)),
                 held_text: String::new(),
+                matcher: matchers.next(),
+                echo: echo_text.clone(),
+                tool_text: match tools {
+                    ToolOutput::None => ToolText::Streaming,
+                    ToolOutput::Auto(_) => ToolText::Undecided(String::new()),
+                    ToolOutput::Constrained(_) => ToolText::Holding(String::new()),
+                },
                 generated: Vec::new(),
                 finish: None,
                 last_token_at: None,
@@ -83,6 +170,8 @@ impl ActiveRequest {
             events,
             arrived: Instant::now(),
             choices,
+            tools,
+            mask: None,
             held: VecDeque::new(),
             done: false,
         }
@@ -119,6 +208,18 @@ impl ActiveRequest {
             .iter()
             .filter(|c| c.finish.is_none())
             .map(|c| c.seq)
+    }
+
+    /// Choices after the first that have not sampled a token yet: they fork from choice 0's
+    /// shared prefill (`n` > 1), whose last logits row gives each its first token.
+    pub fn forking_choices(&self) -> Vec<usize> {
+        self.choices
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, c)| c.generated.is_empty() && c.finish.is_none())
+            .map(|(i, _)| i)
+            .collect()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -187,42 +288,63 @@ impl ActiveRequest {
         }
     }
 
-    /// Samples the next token of choice `choice` from its logits row (adjusted in place) and
-    /// applies the stop conditions: returns the `Token` event and, when this token ends the
-    /// choice, its finish reason (also recorded on the choice).
+    /// Samples the next token of choice `choice` from its logits row (adjusted in place) —
+    /// through the choice's matcher mask when constrained — and applies the stop conditions,
+    /// `echo` and the tool-call rules. A matcher failure (llguidance step limit, a stuck
+    /// constraint) is [`ModelError::Constraint`] for this request alone.
     pub fn step(
         &mut self,
         choice: usize,
         logits: &mut [f32],
         max_seq_len: u32,
-    ) -> (GenerationEvent, Option<FinishReason>) {
+        metrics: Option<&ModelMetrics>,
+    ) -> Result<Step, ModelError> {
         let prompt_len = self.prompt_len();
         let with_logprobs = self.request.sampling.logprobs.is_some();
         let stop = &self.request.stop;
         let c = &mut self.choices[choice];
-        let sampled = c.sampler.sample(logits, None);
+        let mask = match c.matcher.as_mut() {
+            Some(matcher) => {
+                let started = Instant::now();
+                let mask = self
+                    .mask
+                    .get_or_insert_with(|| TokenMask::new_none(logits.len()));
+                step_mask(matcher.as_mut(), &stop.eos_token_ids, mask)?;
+                if let Some(m) = metrics {
+                    m.observe_token_mask(started.elapsed().as_secs_f64());
+                }
+                Some(&*mask)
+            }
+            None => None,
+        };
+        let sampled = c.sampler.sample(logits, mask);
         let token = sampled.token;
+        if let Some(matcher) = c.matcher.as_mut() {
+            matcher.commit(token)?;
+        }
         c.sampler.observe(token);
         c.generated.push(token);
         let generated = c.generated.len() as u32;
 
-        let is_eos = !stop.ignore_eos && stop.eos_token_ids.contains(&token);
-        if !is_eos && let Some(chunk) = c.detok.push(token) {
+        // EOS (unless ignored) and `stop_token_ids` end the choice; their text is not output.
+        let is_end = (!stop.ignore_eos && stop.eos_token_ids.contains(&token))
+            || stop.stop_token_ids.contains(&token);
+        if !is_end && let Some(chunk) = c.detok.push(token) {
             c.held_text.push_str(&chunk);
         }
         let length = generated >= stop.max_tokens || prompt_len + generated >= max_seq_len;
-        let (text, finish) = if let Some(cut) = find_stop(&c.held_text, &stop.stop_strings) {
+        let (text, mut finish) = if let Some(cut) = find_stop(&c.held_text, &stop.stop_strings) {
             // The stop string and everything after it are dropped.
             let text = c.held_text[..cut].to_string();
             c.held_text.clear();
             (text, Some(FinishReason::Stop))
-        } else if is_eos || length {
+        } else if is_end || length {
             // Last token: release everything still held, including bytes the detokenizer kept
             // back, unless that completes a stop string.
             let rest = c.drain_all();
             match find_stop(&rest, &stop.stop_strings) {
                 Some(cut) => (rest[..cut].to_string(), Some(FinishReason::Stop)),
-                None if is_eos => (rest, Some(FinishReason::Stop)),
+                None if is_end => (rest, Some(FinishReason::Stop)),
                 None => (rest, Some(FinishReason::Length)),
             }
         } else {
@@ -231,15 +353,117 @@ impl ActiveRequest {
             let text: String = c.held_text.drain(..emit).collect();
             (text, None)
         };
+
+        // Tool calls: hold what may be a call, parse it at the finish.
+        let parser = match &self.tools {
+            ToolOutput::None => None,
+            ToolOutput::Auto(p) | ToolOutput::Constrained(p) => Some(p),
+        };
+        if generated == 1
+            && let (ToolText::Undecided(_), Some(p)) = (&c.tool_text, parser)
+            && p.python_tag == Some(token)
+        {
+            c.tool_text = ToolText::Holding(String::new());
+        }
+        let mut text = c.tool_text.push(text);
+        let mut calls = None;
+        if finish.is_some() {
+            let (held, release) = c.tool_text.finish();
+            text.push_str(&release);
+            if let (Some(held), Some(p)) = (held, parser) {
+                match p.parser.parse(&held) {
+                    ToolParse::Calls(parsed) => {
+                        calls = Some(parsed);
+                        finish = Some(FinishReason::ToolCalls);
+                        if let Some(m) = metrics {
+                            m.record_tool_call(p.label, ToolCallOutcome::Parsed);
+                        }
+                    }
+                    ToolParse::Content(raw) => {
+                        if let Some(m) = metrics {
+                            m.record_tool_call(p.label, ToolCallOutcome::ParseFailed);
+                        }
+                        tracing::info!(
+                            event = "tool_call_parse_failed",
+                            request_id = %self.request.http_request_id,
+                            choice = c.index,
+                            parser = p.label,
+                            reason = "tool_call_parse_failed",
+                            "the output is returned as content"
+                        );
+                        text.push_str(&raw);
+                    }
+                }
+            }
+        }
+        if let Some(echo) = c.echo.take() {
+            text.insert_str(0, &echo);
+        }
         c.finish = finish;
-        let event = GenerationEvent::Token {
+        let mut events = SmallVec::new();
+        events.push(GenerationEvent::Token {
             choice: c.index,
             text,
             token_id: token,
             logprob: with_logprobs.then_some(sampled.logprob),
             top_logprobs: sampled.top_logprobs,
-        };
-        (event, finish)
+        });
+        if let Some(calls) = calls {
+            events.push(GenerationEvent::ToolCalls {
+                choice: c.index,
+                calls,
+            });
+        }
+        Ok(Step { events, finish })
+    }
+}
+
+/// Where a choice's output text goes (see the module comment on tool calls).
+#[derive(Debug)]
+enum ToolText {
+    /// Straight to the client.
+    Streaming,
+    /// `auto` before the first non-whitespace output: held until it shows whether a call
+    /// starts.
+    Undecided(String),
+    /// Held for the parser.
+    Holding(String),
+}
+
+impl ToolText {
+    /// Takes the next text chunk; returns what may be streamed now.
+    fn push(&mut self, text: String) -> String {
+        match self {
+            ToolText::Streaming => text,
+            ToolText::Holding(held) => {
+                held.push_str(&text);
+                String::new()
+            }
+            ToolText::Undecided(pending) => {
+                pending.push_str(&text);
+                let start = pending.trim_start();
+                if start.is_empty() {
+                    String::new()
+                } else if start.starts_with('{') {
+                    *self = ToolText::Holding(std::mem::take(pending));
+                    String::new()
+                } else {
+                    let out = std::mem::take(pending);
+                    *self = ToolText::Streaming;
+                    out
+                }
+            }
+        }
+    }
+
+    /// At the finish: the output held for the parser, if any, and text to release as
+    /// content (whitespace an `auto` output never got past).
+    fn finish(&mut self) -> (Option<String>, String) {
+        match std::mem::replace(self, ToolText::Streaming) {
+            ToolText::Holding(held) => (Some(held), String::new()),
+            ToolText::Undecided(pending) => (None, pending),
+            ToolText::Streaming => (None, String::new()),
+        }
     }
 }
 
@@ -251,6 +475,12 @@ pub(crate) struct Choice {
     detok: IncrementalDetokenizer,
     /// Decoded text not yet streamed because it may begin a stop string.
     held_text: String,
+    /// The constraint's matcher (`response_format` or the tool grammar), advanced by every
+    /// sampled token.
+    matcher: Option<Box<dyn TokenMatcher>>,
+    /// `echo` text not yet sent (it prefixes the choice's first token event).
+    echo: Option<String>,
+    tool_text: ToolText,
     /// Generated tokens in order, EOS included.
     pub generated: Vec<u32>,
     pub finish: Option<FinishReason>,
@@ -266,6 +496,15 @@ impl Choice {
             rest.push_str(&tail);
         }
         rest
+    }
+}
+
+/// Choice `index`'s sampling parameters: the request's, with the seed offset by the index so
+/// that the choices of a seeded `n` > 1 request differ and each is reproducible.
+fn choice_params(params: &SamplingParams, index: u32) -> SamplingParams {
+    SamplingParams {
+        seed: params.seed.map(|s| s.wrapping_add(u64::from(index))),
+        ..params.clone()
     }
 }
 
@@ -346,6 +585,250 @@ mod tests {
         r
     }
 
+    /// One sampled token of choice 0: its `Token` event and finish reason.
+    fn step(
+        r: &mut ActiveRequest,
+        mut logits: Vec<f32>,
+        max_seq_len: u32,
+    ) -> (GenerationEvent, Option<FinishReason>) {
+        let s = r.step(0, &mut logits, max_seq_len, None).expect("step");
+        (s.events[0].clone(), s.finish)
+    }
+
+    fn tiny_tokenizer(name: &str) -> (TempDir, Arc<Tokenizer>) {
+        let dir = TempDir::new(name);
+        let spec = write_tiny_llama(dir.path(), 7);
+        let tokenizer = Arc::new(Tokenizer::from_file(&spec.dir.join("tokenizer.json")).unwrap());
+        (dir, tokenizer)
+    }
+
+    fn token_text(event: &GenerationEvent) -> &str {
+        match event {
+            GenerationEvent::Token { text, .. } => text,
+            other => panic!("not a token event: {other:?}"),
+        }
+    }
+
+    /// Feeds `text` byte by byte (tiny tokenizer: byte `b` is token `b`), then `last`; returns
+    /// the streamed text and the final step.
+    fn feed(r: &mut ActiveRequest, vocab: usize, text: &str, last: u32) -> (String, Step) {
+        let mut streamed = String::new();
+        for b in text.bytes() {
+            let s = r
+                .step(0, &mut row(u32::from(b), vocab), 512, None)
+                .expect("step");
+            assert_eq!(s.finish, None, "{text:?} ended early");
+            streamed.push_str(token_text(&s.events[0]));
+        }
+        let s = r.step(0, &mut row(last, vocab), 512, None).expect("step");
+        streamed.push_str(token_text(&s.events[0]));
+        (streamed, s)
+    }
+
+    #[test]
+    fn stop_token_ids_echo_and_choice_seeds() {
+        let (_dir, tokenizer) = tiny_tokenizer("turbine-engine-requests-p2");
+        let vocab = tokenizer.vocab_size() as usize;
+
+        // A stop token id ends the choice like EOS; its text is not output.
+        let mut req = request(&[256], 10, &[]);
+        req.stop.stop_token_ids = vec![98];
+        let (tx, _rx) = mpsc::channel(8);
+        let mut r = ActiveRequest::new(req.into(), tx, &[SeqId(1)], &tokenizer);
+        let (ev, finish) = step(&mut r, row(97, vocab), 512);
+        assert_eq!((token_text(&ev), finish), ("a", None));
+        let (ev, finish) = step(&mut r, row(98, vocab), 512);
+        assert_eq!((token_text(&ev), finish), ("", Some(FinishReason::Stop)));
+
+        // `echo` prefixes the first token event only.
+        let (tx, _rx) = mpsc::channel(8);
+        let mut r = ActiveRequest::new(
+            Submission {
+                echo_text: Some("Hi".into()),
+                ..request(&[256, 72, 105], 10, &[]).into()
+            },
+            tx,
+            &[SeqId(1)],
+            &tokenizer,
+        );
+        assert_eq!(token_text(&step(&mut r, row(97, vocab), 512).0), "Hia");
+        assert_eq!(token_text(&step(&mut r, row(97, vocab), 512).0), "a");
+
+        // Seeded choices draw from the request seed plus their index: choice 0 matches a
+        // single-choice request with the same seed, choice 1 draws differently.
+        let mut req = request(&[256], 64, &[]);
+        req.n = 2;
+        req.sampling.temperature = 1.0;
+        req.sampling.seed = Some(5);
+        let single = {
+            let mut one = req.clone();
+            one.n = 1;
+            one
+        };
+        let flat = vec![0.0f32; vocab];
+        let (tx, _rx) = mpsc::channel(256);
+        let mut two = ActiveRequest::new(req.into(), tx, &[SeqId(1), SeqId(2)], &tokenizer);
+        let (tx, _rx1) = mpsc::channel(256);
+        let mut one = ActiveRequest::new(single.into(), tx, &[SeqId(3)], &tokenizer);
+        for _ in 0..20 {
+            for c in 0..2 {
+                two.step(c, &mut flat.clone(), 512, None).unwrap();
+            }
+            one.step(0, &mut flat.clone(), 512, None).unwrap();
+        }
+        assert_eq!(two.choices[0].generated, one.choices[0].generated);
+        assert_ne!(two.choices[0].generated, two.choices[1].generated);
+        assert_eq!(two.forking_choices(), Vec::<usize>::new());
+    }
+
+    fn tool_request(tools: ToolOutput, tokenizer: &Arc<Tokenizer>) -> ActiveRequest {
+        let mut req = request(&[256], 64, &[]);
+        req.endpoint = Endpoint::ChatCompletions;
+        req.stop.eos_token_ids = SmallVec::from_slice(&[260]);
+        let (tx, rx) = mpsc::channel(256);
+        // The receiver is dropped: these tests only look at the returned events.
+        drop(rx);
+        ActiveRequest::new(
+            Submission {
+                tools,
+                ..req.into()
+            },
+            tx,
+            &[SeqId(1)],
+            tokenizer,
+        )
+    }
+
+    fn parser() -> ToolParser {
+        ToolParser {
+            parser: Arc::new(turbine_model::Llama3JsonParser::seeded(1)),
+            label: turbine_model::tools::LLAMA3_JSON,
+            python_tag: Some(262),
+        }
+    }
+
+    #[test]
+    fn tool_calls_held_and_parsed() {
+        let (_dir, tokenizer) = tiny_tokenizer("turbine-engine-requests-tools");
+        let vocab = tokenizer.vocab_size() as usize;
+        let call = r#"{"name": "f", "parameters": {"x": 1}}"#;
+
+        // auto: a call is held, parsed at EOS and reported as tool calls.
+        let mut r = tool_request(ToolOutput::Auto(parser()), &tokenizer);
+        let (streamed, last) = feed(&mut r, vocab, &format!("  {call}"), 260);
+        assert_eq!(streamed, "");
+        assert_eq!(last.finish, Some(FinishReason::ToolCalls));
+        match &last.events[..] {
+            [
+                GenerationEvent::Token { text, .. },
+                GenerationEvent::ToolCalls { choice: 0, calls },
+            ] => {
+                assert!(text.is_empty());
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "f");
+                assert_eq!(calls[0].arguments, r#"{"x":1}"#);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // auto: `<|python_tag|>` (no text of its own) opens a call too.
+        let mut r = tool_request(ToolOutput::Auto(parser()), &tokenizer);
+        step(&mut r, row(262, vocab), 512);
+        let (streamed, last) = feed(&mut r, vocab, call, 260);
+        assert_eq!(streamed, "");
+        assert_eq!(last.finish, Some(FinishReason::ToolCalls));
+
+        // auto: plain text streams; JSON that is not a call comes back as content.
+        let mut r = tool_request(ToolOutput::Auto(parser()), &tokenizer);
+        let (streamed, last) = feed(&mut r, vocab, " hi", 260);
+        assert_eq!(streamed, " hi");
+        assert_eq!(
+            (last.finish, last.events.len()),
+            (Some(FinishReason::Stop), 1)
+        );
+        let mut r = tool_request(ToolOutput::Auto(parser()), &tokenizer);
+        let (streamed, last) = feed(&mut r, vocab, r#"{"a": 1}"#, 260);
+        assert_eq!(streamed, r#"{"a": 1}"#);
+        assert_eq!(
+            (last.finish, last.events.len()),
+            (Some(FinishReason::Stop), 1)
+        );
+
+        // Constrained: everything is held; an output cut by max_tokens is returned as content
+        // with finish `length`.
+        let mut r = tool_request(ToolOutput::Constrained(parser()), &tokenizer);
+        r.request.stop.max_tokens = 6;
+        let (streamed, last) = feed(&mut r, vocab, "{\"nam", u32::from(b'e'));
+        assert_eq!(streamed, "{\"name");
+        assert_eq!(last.finish, Some(FinishReason::Length));
+        // Without tools nothing is held.
+        let mut r = tool_request(ToolOutput::None, &tokenizer);
+        let (streamed, last) = feed(&mut r, vocab, call, 260);
+        assert_eq!(streamed, call);
+        assert_eq!(last.finish, Some(FinishReason::Stop));
+    }
+
+    /// Allows only `ids`; `fail` makes the mask computation fail.
+    struct Only {
+        ids: Vec<u32>,
+        fail: bool,
+    }
+
+    impl TokenMatcher for Only {
+        fn allowed(&mut self, mask: &mut TokenMask) -> Result<(), ModelError> {
+            if self.fail {
+                return Err(ModelError::Constraint("step limit exceeded".into()));
+            }
+            mask.clear();
+            for &id in &self.ids {
+                mask.allow(id);
+            }
+            Ok(())
+        }
+        fn commit(&mut self, token: u32) -> Result<(), ModelError> {
+            assert!(self.ids.contains(&token), "committed {token}");
+            Ok(())
+        }
+        fn accepts_eos(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn matcher_masks_each_choice_and_fails_alone() {
+        let (_dir, tokenizer) = tiny_tokenizer("turbine-engine-requests-matcher");
+        let vocab = tokenizer.vocab_size() as usize;
+        let mut req = request(&[256], 10, &[]);
+        req.n = 2;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut r = ActiveRequest::new(
+            Submission {
+                matchers: vec![
+                    Box::new(Only {
+                        ids: vec![120],
+                        fail: false,
+                    }),
+                    Box::new(Only {
+                        ids: vec![121],
+                        fail: true,
+                    }),
+                ],
+                ..req.into()
+            },
+            tx,
+            &[SeqId(1), SeqId(2)],
+            &tokenizer,
+        );
+        // Greedy would pick 97; the mask allows only 120.
+        let s = r.step(0, &mut row(97, vocab), 512, None).unwrap();
+        assert!(matches!(
+            s.events[0],
+            GenerationEvent::Token { token_id: 120, .. }
+        ));
+        let err = r.step(1, &mut row(97, vocab), 512, None).unwrap_err();
+        assert!(matches!(err, ModelError::Constraint(ref m) if m.contains("step limit")));
+    }
+
     #[test]
     fn history_stop_strings_and_held_events() {
         let dir = TempDir::new("turbine-engine-requests");
@@ -355,20 +838,20 @@ mod tests {
         // Byte tokens: "a" = 97, "b" = 98, "c" = 99; stop at "bc".
         let (tx, mut rx) = mpsc::channel(2);
         let mut r = ActiveRequest::new(
-            request(&[256, 97], 10, &["bc"]),
+            request(&[256, 97], 10, &["bc"]).into(),
             tx,
             &[SeqId(1)],
             &tokenizer,
         );
 
-        let (ev, finish) = r.step(0, &mut row(97, vocab), 512);
+        let (ev, finish) = step(&mut r, row(97, vocab), 512);
         assert_eq!(finish, None);
         assert!(matches!(&ev, GenerationEvent::Token { text, token_id: 97, .. } if text == "a"));
         // "b" may begin the stop string: held back.
-        let (ev, finish) = r.step(0, &mut row(98, vocab), 512);
+        let (ev, finish) = step(&mut r, row(98, vocab), 512);
         assert_eq!(finish, None);
         assert!(matches!(&ev, GenerationEvent::Token { text, .. } if text.is_empty()));
-        let (ev, finish) = r.step(0, &mut row(99, vocab), 512);
+        let (ev, finish) = step(&mut r, row(99, vocab), 512);
         assert_eq!(finish, Some(FinishReason::Stop));
         assert!(matches!(&ev, GenerationEvent::Token { text, .. } if text.is_empty()));
         assert!(r.all_finished());
@@ -422,17 +905,18 @@ mod tests {
         let tokenizer = Arc::new(Tokenizer::from_file(&spec.dir.join("tokenizer.json")).unwrap());
         let vocab = tokenizer.vocab_size() as usize;
         let (tx, _rx) = mpsc::channel(8);
-        let mut r = ActiveRequest::new(request(&[256], 2, &[]), tx, &[SeqId(1)], &tokenizer);
-        assert_eq!(r.step(0, &mut row(97, vocab), 512).1, None);
+        let mut r = ActiveRequest::new(request(&[256], 2, &[]).into(), tx, &[SeqId(1)], &tokenizer);
+        assert_eq!(step(&mut r, row(97, vocab), 512).1, None);
         assert_eq!(
-            r.step(0, &mut row(97, vocab), 512).1,
+            step(&mut r, row(97, vocab), 512).1,
             Some(FinishReason::Length)
         );
         // The context limit ends a choice before max_tokens: prompt 1 + 1 generated = 2.
         let (tx, _rx) = mpsc::channel(8);
-        let mut r = ActiveRequest::new(request(&[256], 10, &[]), tx, &[SeqId(2)], &tokenizer);
+        let mut r =
+            ActiveRequest::new(request(&[256], 10, &[]).into(), tx, &[SeqId(2)], &tokenizer);
         assert_eq!(
-            r.step(0, &mut row(97, vocab), 2).1,
+            step(&mut r, row(97, vocab), 2).1,
             Some(FinishReason::Length)
         );
     }

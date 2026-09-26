@@ -10,7 +10,7 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Instant;
 
-use turbine_core::config::Config;
+use turbine_core::config::{Config, StructuredOutputConfig, ToolCallParserKind};
 use turbine_core::types::SeqId;
 use turbine_core::types::{ExecutionBackend, MemoryKind, Vendor};
 use turbine_device::{DeviceInfo, DeviceInventory};
@@ -23,10 +23,10 @@ use turbine_kv::{BlockPool, BlockPoolConfig};
 use turbine_model::executor::{self, BatchInput, ModelExecutor, SeqSlice};
 use turbine_model::loader::LoadedWeights;
 use turbine_model::{
-    Architecture, BudgetTerms, ChatTemplate, GenerationConfig, MAX_STAGING_BYTES, ModelArchConfig,
-    ModelError, ModelMetrics, SafetensorsIndex, Tokenizer, WeightLoader, WeightSlot,
-    available_bytes, check_budget, host_mem_available, llama_slots, load_generation_config,
-    load_model_config, olmoe_slots,
+    Architecture, BudgetTerms, ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES,
+    ModelArchConfig, ModelError, ModelMetrics, SafetensorsIndex, Tokenizer, WeightLoader,
+    WeightSlot, available_bytes, check_budget, host_mem_available, llama_slots,
+    load_generation_config, load_model_config, olmoe_slots,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_scheduler::SchedulerParams;
@@ -95,6 +95,43 @@ pub fn resolve_max_seq_len(configured: Option<u32>, max_positions: u32) -> Resul
             "model.max_seq_len {n} is outside 1..={max_positions} (the model's \
              max_position_embeddings)"
         )),
+    }
+}
+
+/// `model.tool_call_parser`: `llama3_json` for a `LlamaForCausalLM` whose chat template renders
+/// `tools` when null. A parser is only usable with a template that renders `tools`: a
+/// configured `llama3_json` on any other template resolves to `none` (logged), so `tools`
+/// requests get 400 `tools_not_supported` instead of a prompt that silently lacks them.
+pub fn resolve_tool_call_parser(
+    configured: Option<ToolCallParserKind>,
+    architecture: Architecture,
+    renders_tools: bool,
+) -> ToolCallParserKind {
+    match configured {
+        Some(ToolCallParserKind::None) => ToolCallParserKind::None,
+        Some(kind) if renders_tools => kind,
+        Some(kind) => {
+            tracing::warn!(
+                parser = ?kind,
+                "model.tool_call_parser is set but the chat template does not render tools; \
+                 tool calling is disabled"
+            );
+            ToolCallParserKind::None
+        }
+        None if renders_tools && architecture == Architecture::Llama => {
+            ToolCallParserKind::Llama3Json
+        }
+        None => ToolCallParserKind::None,
+    }
+}
+
+/// The ids that end a generation: `config.json` `eos_token_id`, else
+/// `generation_config.json`'s.
+pub fn eos_token_ids(arch: &ModelArchConfig, generation: &GenerationConfig) -> Vec<u32> {
+    if arch.eos_token_ids.is_empty() {
+        generation.eos_token_ids.to_vec()
+    } else {
+        arch.eos_token_ids.to_vec()
     }
 }
 
@@ -231,6 +268,12 @@ pub struct PreparedModel {
     pub pool: BlockPoolConfig,
     /// Scheduler bounds; `max_batch_tokens` and `max_running_requests` also size the executor.
     pub scheduler: SchedulerParams,
+    /// Compiles `response_format` and tool grammars; its token trie is built once, here.
+    pub grammar: Arc<GrammarCompiler>,
+    /// `structured_output` bounds on those grammars.
+    pub structured_output: StructuredOutputConfig,
+    /// The resolved `model.tool_call_parser`.
+    pub tool_call_parser: ToolCallParserKind,
     pub served_name: String,
     pub budget: BudgetTerms,
 }
@@ -326,6 +369,21 @@ pub fn prepare(
     };
     check_budget(&budget).map_err(|e| model_error("startup", e))?;
 
+    let started = Instant::now();
+    let grammar = GrammarCompiler::new(&tokenizer, &eos_token_ids(&arch, &generation))
+        .map(Arc::new)
+        .map_err(|e| model_error("structured output", e))?;
+    let tool_call_parser = resolve_tool_call_parser(
+        config.model.tool_call_parser,
+        arch.architecture,
+        template.renders_tools(),
+    );
+    tracing::info!(
+        token_trie_seconds = started.elapsed().as_secs_f64(),
+        tool_call_parser = ?tool_call_parser,
+        "structured output ready"
+    );
+
     let served_name = config
         .model
         .served_name
@@ -350,6 +408,9 @@ pub fn prepare(
         block_tokens,
         pool,
         scheduler,
+        grammar,
+        structured_output: config.structured_output.clone(),
+        tool_call_parser,
         served_name,
         budget,
     })
@@ -535,5 +596,36 @@ mod tests {
         let err = resolve_max_seq_len(Some(513), 512).unwrap_err();
         assert!(err.contains("model.max_seq_len 513"), "{err}");
         assert!(resolve_max_seq_len(Some(0), 512).is_err());
+    }
+
+    #[test]
+    fn tool_call_parser_resolution() {
+        use ToolCallParserKind::{Llama3Json, None as NoParser};
+        // Null: llama3_json only for a Llama whose template renders tools.
+        assert_eq!(
+            resolve_tool_call_parser(None, Architecture::Llama, true),
+            Llama3Json
+        );
+        assert_eq!(
+            resolve_tool_call_parser(None, Architecture::Llama, false),
+            NoParser
+        );
+        assert_eq!(
+            resolve_tool_call_parser(None, Architecture::Olmoe, true),
+            NoParser
+        );
+        // Explicit values; a parser needs a template that renders tools.
+        assert_eq!(
+            resolve_tool_call_parser(Some(Llama3Json), Architecture::Olmoe, true),
+            Llama3Json
+        );
+        assert_eq!(
+            resolve_tool_call_parser(Some(Llama3Json), Architecture::Llama, false),
+            NoParser
+        );
+        assert_eq!(
+            resolve_tool_call_parser(Some(NoParser), Architecture::Llama, true),
+            NoParser
+        );
     }
 }

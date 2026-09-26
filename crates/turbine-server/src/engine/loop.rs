@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use smallvec::SmallVec;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 use turbine_core::clock::Clock;
-use turbine_core::request::{ErrorCode, FinishReason, GenerationEvent, GenerationRequest};
+use turbine_core::request::{ErrorCode, FinishReason, GenerationEvent};
 use turbine_core::types::{RequestId, SeqId};
 use turbine_kv::{BlockPool, KvDocument};
 use turbine_model::executor::{BatchInput, Logits, ModelExecutor, SeqSlice};
@@ -38,7 +38,7 @@ use turbine_scheduler::{
 };
 
 use super::deadlines::{Deadlines, Timeouts};
-use super::requests::{ActiveRequest, Delivery, Flush};
+use super::requests::{ActiveRequest, Delivery, Flush, Submission};
 use super::{
     EngineCommand, EngineDocs, EngineMetrics, EngineShared, MAX_CONSECUTIVE_FAILURES, SubmitAck,
 };
@@ -254,10 +254,11 @@ impl EngineLoop {
     /// Scheduler submission checks, then the request is queued and its choices start.
     fn submit(
         &mut self,
-        request: GenerationRequest,
+        submission: Submission,
         events: mpsc::Sender<GenerationEvent>,
         ack: SubmitAck,
     ) {
+        let request = &submission.request;
         let id = request.id;
         let prompt_len = u32::try_from(request.prompt_tokens.len()).unwrap_or(u32::MAX);
         let seqs: SmallVec<[SeqId; 1]> = (0..request.n.max(1))
@@ -294,7 +295,7 @@ impl EngineLoop {
         self.metrics
             .server
             .add_tokens(TokenKind::Prompt, u64::from(prompt_len));
-        let active = ActiveRequest::new(request, events, &seqs, &self.tokenizer);
+        let active = ActiveRequest::new(submission, events, &seqs, &self.tokenizer);
         for (i, &seq) in seqs.iter().enumerate() {
             self.seqs.insert(seq, (id, i));
         }
@@ -539,7 +540,9 @@ impl EngineLoop {
         Ok(logits)
     }
 
-    /// Samples every item whose step yields a token and emits its events.
+    /// Samples every item whose step yields a token and emits its events. The completed shared
+    /// prefill of an `n` > 1 request also gives every forking choice its first token, each
+    /// from its own copy of the prompt's last logits row.
     fn sample(&mut self, plan: &IterationPlan, mut logits: Logits, outcome: &mut IterationOutcome) {
         let vocab = logits.vocab;
         for (row, item) in plan.items.iter().enumerate() {
@@ -555,44 +558,115 @@ impl EngineLoop {
             let Some(&(id, choice)) = self.seqs.get(&item.seq) else {
                 continue;
             };
-            let Some(r) = self.requests.get_mut(&id) else {
+            let Some(r) = self.requests.get(&id) else {
                 continue;
             };
             if r.done {
                 continue;
             }
+            let forks = if choice == 0 && matches!(item.kind, BatchKind::Prefill { .. }) {
+                r.forking_choices()
+            } else {
+                Vec::new()
+            };
             let row_logits = &mut logits.data[row * vocab..(row + 1) * vocab];
-            let (token_event, finish) = r.step(choice, row_logits, self.max_seq_len);
-            let now = Instant::now();
-            let c = &mut r.choices[choice];
-            match c.last_token_at {
-                None => self
-                    .metrics
-                    .server
-                    .ttft
-                    .observe((now - r.arrived).as_secs_f64()),
-                Some(prev) => self.metrics.server.itl.observe((now - prev).as_secs_f64()),
+            let shared = (!forks.is_empty()).then(|| row_logits.to_vec());
+            if !self.sample_choice(id, choice, row_logits, outcome) {
+                continue;
             }
-            c.last_token_at = Some(now);
-            outcome.appended.push((item.seq, 1));
-            let finished_event = finish.map(|reason| r.finished_event(choice, reason));
-            let all_finished = r.all_finished();
-            if let Some(reason) = finish {
-                outcome.finished.push((item.seq, reason));
-            }
-            // The request is accounted before its last events go out, so a client that has
-            // read the whole response sees its metrics.
-            if all_finished {
-                self.account(id, Outcome::Ok, "");
-            }
-            self.deliver(id, token_event);
-            if let Some(event) = finished_event {
-                self.deliver(id, event);
-            }
-            if all_finished {
-                self.retire(id);
+            for fork in forks {
+                let mut own = shared.clone().unwrap_or_default();
+                if !self.sample_choice(id, fork, &mut own, outcome) {
+                    break;
+                }
             }
         }
+    }
+
+    /// Samples choice `choice` of request `id` from `row` and delivers its events. Returns
+    /// false when the request ended with a constraint failure.
+    fn sample_choice(
+        &mut self,
+        id: RequestId,
+        choice: usize,
+        row: &mut [f32],
+        outcome: &mut IterationOutcome,
+    ) -> bool {
+        let Some(r) = self.requests.get_mut(&id) else {
+            return false;
+        };
+        if r.done || r.choices[choice].finish.is_some() {
+            return true;
+        }
+        let seq = r.choices[choice].seq;
+        let step = match r.step(choice, row, self.max_seq_len, Some(&self.metrics.model)) {
+            Ok(step) => step,
+            Err(e) => {
+                self.constraint_failed(id, &e.to_string(), outcome);
+                return false;
+            }
+        };
+        let now = Instant::now();
+        let c = &mut r.choices[choice];
+        match c.last_token_at {
+            None => self
+                .metrics
+                .server
+                .ttft
+                .observe((now - r.arrived).as_secs_f64()),
+            Some(prev) => self.metrics.server.itl.observe((now - prev).as_secs_f64()),
+        }
+        c.last_token_at = Some(now);
+        outcome.appended.push((seq, 1));
+        let finished_event = step.finish.map(|reason| r.finished_event(choice, reason));
+        let all_finished = r.all_finished();
+        if let Some(reason) = step.finish {
+            outcome.finished.push((seq, reason));
+        }
+        // The request is accounted before its last events go out, so a client that has read
+        // the whole response sees its metrics.
+        if all_finished {
+            self.account(id, Outcome::Ok, "");
+        }
+        for event in step.events {
+            self.deliver(id, event);
+        }
+        if let Some(event) = finished_event {
+            self.deliver(id, event);
+        }
+        if all_finished {
+            self.retire(id);
+        }
+        true
+    }
+
+    /// A matcher failed mid-generation (llguidance step limit, a stuck constraint): that
+    /// request alone ends with `internal_error` (reason `constraint_error`) and every live
+    /// sequence of it is finished, so the scheduler frees its blocks; the batch continues.
+    fn constraint_failed(&mut self, id: RequestId, message: &str, outcome: &mut IterationOutcome) {
+        let Some(r) = self.requests.get_mut(&id) else {
+            return;
+        };
+        let live: Vec<SeqId> = r.live_seqs().collect();
+        for c in &mut r.choices {
+            c.finish.get_or_insert(FinishReason::Stop);
+        }
+        for seq in live {
+            outcome.finished.push((seq, FinishReason::Stop));
+        }
+        tracing::warn!(
+            event = "fail",
+            request_id = %r.request.http_request_id,
+            reason = "constraint_error",
+            error = %message,
+            "constrained decoding failed"
+        );
+        self.account(id, Outcome::Failed, &format!("constraint_error: {message}"));
+        self.deliver(
+            id,
+            ActiveRequest::error_event(ErrorCode::InternalError, message),
+        );
+        self.retire(id);
     }
 
     /// Every request of the iteration fails with `internal_error`; the scheduler frees them.
@@ -741,7 +815,9 @@ mod tests {
 
     use tokio::sync::oneshot;
     use turbine_core::clock::SystemClock;
-    use turbine_core::request::{CancelFlag, Endpoint, SamplingParams, StopConditions};
+    use turbine_core::request::{
+        CancelFlag, Endpoint, GenerationRequest, SamplingParams, StopConditions,
+    };
     use turbine_core::types::{BlockId, DeviceId, KvLayout, ModelShape, Priority};
     use turbine_kernels::{KernelError, KernelMetrics, KernelRegistry, cpu_reference_provider};
     use turbine_kv::{BlockPoolConfig, KvMetrics};
@@ -906,7 +982,7 @@ mod tests {
         let (events, rx) = mpsc::channel(capacity);
         let (ack, admitted) = oneshot::channel();
         if tx
-            .try_send(EngineCommand::Submit(Box::new(req), events, ack))
+            .try_send(EngineCommand::Submit(Box::new(req.into()), events, ack))
             .is_err()
         {
             panic!("command channel full");
@@ -1028,6 +1104,82 @@ mod tests {
             r#"turbine_tokens_total{kind="generated"} 36"#,
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+    }
+
+    /// P2 S-10: `n: 3` prefills the prompt once; the choices fork from it (the partial tail
+    /// block copied) and each continues exactly like a single greedy request.
+    #[test]
+    fn n_choices_fork_after_one_prefill() {
+        let (_dir, spec, tokenizer) = tiny();
+        // 20 tokens: one full block and a partial tail block that the forks copy.
+        let prompt: Vec<u32> = std::iter::once(256).chain(97..116).collect();
+        let max_tokens = 12;
+        let mut exec = tiny_executor(&spec, 1);
+        let mut kv = SequenceKv::new(&mem(), *exec.kv_layout(), 128).unwrap();
+        let single = request(&prompt, max_tokens);
+        let cancel = CancelFlag::default();
+        let reference: Vec<u32> = generate(
+            exec.as_mut(),
+            &mut kv,
+            Arc::clone(&tokenizer),
+            &single,
+            &cancel,
+            GenerateOptions {
+                max_seq_len: 128,
+                metrics: None,
+            },
+        )
+        .filter_map(|e| match e {
+            GenerationEvent::Token { token_id, .. } => Some(token_id),
+            _ => None,
+        })
+        .collect();
+
+        let t = engine(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 32),
+        );
+        let mut req = request(&prompt, max_tokens);
+        req.n = 3;
+        let (mut rx, admitted) = submit(&t.tx, req);
+        let engine = t.engine;
+        let handle = std::thread::spawn(move || engine.run());
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let mut tokens = vec![Vec::new(); 3];
+        let mut finished = 0;
+        while finished < 3 {
+            match rx.blocking_recv().expect("stream ended early") {
+                GenerationEvent::Token {
+                    choice, token_id, ..
+                } => tokens[choice as usize].push(token_id),
+                GenerationEvent::Finished { usage, .. } => {
+                    assert_eq!(usage.unwrap().prompt_tokens, 20);
+                    finished += 1;
+                }
+                GenerationEvent::Started { .. } => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        drop(t.tx);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+        for (choice, got) in tokens.iter().enumerate() {
+            assert_eq!(got, &reference, "choice {choice}");
+        }
+        let docs = t.shared.docs().unwrap();
+        assert_eq!(docs.kv.tiers[0].blocks_used, 0);
+        let text = t.reg.render().unwrap();
+        for line in [
+            r#"turbine_tokens_total{kind="prompt"} 20"#,
+            r#"turbine_tokens_total{kind="generated"} 36"#,
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 1"#,
+        ] {
+            assert!(
+                text.contains(line),
+                "missing {line:?} in
+{text}"
+            );
         }
     }
 
@@ -1182,7 +1334,7 @@ mod tests {
             if t.tx.try_send(EngineCommand::Shutdown).is_err()
                 || t.tx
                     .try_send(EngineCommand::Submit(
-                        Box::new(request(&[1, 2], 4)),
+                        Box::new(request(&[1, 2], 4).into()),
                         events,
                         ack,
                     ))
