@@ -22,9 +22,13 @@ prometheus-client.workspace = true
 tracing.workspace = true
 # Block and namespace keys (P4 S-1)
 blake3.workspace = true
+# Per-block checksum of L2 slots (P4 S-11)
+crc32c.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Temporary directories for the L2 slab-file tests
+tempfile.workspace = true
 # Captures logged events in unit tests (test_log)
 tracing-subscriber.workspace = true
 
