@@ -224,14 +224,22 @@ Interfaces:
 Lane: A. Depends on: Task 1.
 Covers: S-10 AC; S-1 AC (`registry_conformance::weight_formats`).
 
-- [ ] Write failing tests `turbine-model weights::tests::bf16_refusals_match_main` (a tiny `config.json` with `quantization_config: {"quant_method": "fp8"}` and one with `torch_dtype: "float16"`, and a safetensors entry of dtype F16: each error string equals the string main's `load_model_config` / `ModelArchConfig::check_supported_weights` produce, kept as literals in the test), `weights::tests::detect_picks_bf16` (no dtype key, `torch_dtype: bfloat16` and `dtype: bfloat16` all detect `bf16`) and `registry_conformance::weight_formats`. Run: `scripts/remote-cargo.sh test -p turbine-model weights:: registry_conformance` — expect FAIL (module `weights` missing)
-- [ ] Implement the module and replace every `DType::BF16` in `crates/turbine-model/src` and `crates/turbine-server/src` outside `weights/bf16.rs` and `#[cfg(test)]` code with the format's dtype.
-- [ ] Run: `git grep -n 'DType::BF16' crates/turbine-model/src crates/turbine-server/src` — expect matches only in `crates/turbine-model/src/weights/bf16.rs` and inside `#[cfg(test)]` modules
-- [ ] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS (config refusal tests `config::tests` unchanged)
-- [ ] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
-- [ ] Lab: `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden` — expect exit 0
+- [x] Write failing tests `turbine-model weights::tests::bf16_refusals_match_main` (a tiny `config.json` with `quantization_config: {"quant_method": "fp8"}` and one with `torch_dtype: "float16"`, and a safetensors entry of dtype F16: each error string equals the string main's `load_model_config` / `ModelArchConfig::check_supported_weights` produce, kept as literals in the test), `weights::tests::detect_picks_bf16` (no dtype key, `torch_dtype: bfloat16` and `dtype: bfloat16` all detect `bf16`) and `registry_conformance::weight_formats`. Run: `scripts/remote-cargo.sh test -p turbine-model weights:: registry_conformance` — expect FAIL (module `weights` missing)
+- [x] Implement the module and replace every `DType::BF16` in `crates/turbine-model/src` and `crates/turbine-server/src` outside `weights/bf16.rs` and `#[cfg(test)]` code with the format's dtype.
+- [x] Run: `git grep -n 'DType::BF16' crates/turbine-model/src crates/turbine-server/src` — expect matches only in `crates/turbine-model/src/weights/bf16.rs` and inside `#[cfg(test)]` modules
+- [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS (config refusal tests `config::tests` unchanged)
+- [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
+- [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden` — expect exit 0
 - [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 5 row to `.procoder/perf-log.md`
-- [ ] Commit: `refactor(model): bf16 weight-format module`
+- [x] Commit: `refactor(model): bf16 weight-format module`
+
+Build notes (Task 5, as built):
+
+- `WeightLoader::load(index, slots, mem, staging)` stays as the BF16 shorthand its many test callers use; `WeightLoader::load_format(format, …)` is the general form (`check_tensor`, parameters allocated as `weight_dtype`). The server loads with `arch.weight_format`, and `turbine_model_weight_bytes{format}` and `modules.weight_format` carry its name (`crates/turbine-server/src/model.rs`, `load` and `prepare`); the `module_selected` reason is `config.json dtype and quantization_config`.
+- The Llama and OLMoE executors stay BF16-only until Task 8 (`DecoderDims.act`): `ACT` is `Bf16::DTYPE`, and both constructors refuse a configuration whose format's weight, activation or KV dtype differs (`check_weight_format`). The trace reader's BF16 arm matches `Bf16::DTYPE`.
+- `ModelArchConfig::shape().weight_bytes` uses `bytes_per_param`, `kv_layout` the format's `kv_dtype`. `quantization_config`, `torch_dtype` and `dtype` left `RawConfig`; `Bf16::check_config` reads them from the top-level JSON, so a non-string `torch_dtype` is now refused as unsupported instead of failing JSON parsing.
+- `registry_conformance` lives in `crates/turbine-model/src/registries.rs` (private module; later lanes add their registries' tests there).
+- Lab (`scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden`): run `0926190447-11031953`, exit 0, golden Llama and OLMoE 16/16. The lab-bench row is left to the coordinator.
 
 ## Task 6: Model family registry; config and loader move into families
 

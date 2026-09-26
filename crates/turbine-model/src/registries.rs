@@ -77,4 +77,9 @@ mod registry_conformance {
         assert!(touched.originals().is_empty());
         assert!(chain.device_eligible(&neutral, &quiet));
     }
+
+    #[test]
+    fn weight_formats() {
+        conformance::check(crate::weights::registry()).unwrap();
+    }
 }

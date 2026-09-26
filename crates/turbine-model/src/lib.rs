@@ -20,6 +20,7 @@ pub mod structured;
 pub mod testing;
 pub mod tokenizer;
 pub mod tools;
+pub mod weights;
 
 /// The sampler at its Phase 1 path, so `turbine_model::sampler::…` keeps resolving.
 pub use sampling::sampler;

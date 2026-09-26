@@ -1,5 +1,6 @@
 //! Weight loader (P1 S-2): maps checkpoint tensor names to the executor's parameter slots,
-//! validates every slot (present, BF16, expected shape) before allocating anything, then uploads
+//! validates every slot (present, stored in the weight format, expected shape) before
+//! allocating anything, then uploads
 //! each tensor to the device through one bounded, reused host staging buffer filled with
 //! positioned reads (`read_exact_at`; no `mmap`, so this crate stays free of `unsafe`).
 //! Checkpoint tensors no slot names are reported by name (`unexpected`), and a tied model's
@@ -14,13 +15,13 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use turbine_core::types::DType;
 use turbine_kernels::KernelError;
 use turbine_tensor::{DeviceMemory, Tensor};
 
 use crate::ModelError;
 use crate::config::{Architecture, ModelArchConfig};
-use crate::safetensors::{Dtype, SafetensorsIndex, TensorEntry, io_err, open_regular};
+use crate::safetensors::{SafetensorsIndex, TensorEntry, io_err, open_regular};
+use crate::weights::{Bf16, WeightFormat};
 
 /// Upper bound of the host staging buffer (P1 bounded resources).
 pub const MAX_STAGING_BYTES: usize = 256 << 20;
@@ -225,19 +226,6 @@ pub(crate) fn weight_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
     }
 }
 
-/// Phase 1 loads BF16 weights only; anything else is refused naming the tensor.
-pub(crate) fn require_bf16(entry: &TensorEntry) -> Result<(), ModelError> {
-    if entry.dtype == Dtype::BF16 {
-        Ok(())
-    } else {
-        Err(ModelError::Unsupported {
-            field: "tensor dtype".to_string(),
-            value: format!("{} ({})", entry.dtype, entry.name),
-            supported: "BF16".to_string(),
-        })
-    }
-}
-
 /// The loaded parameters by checkpoint name (a stacked parameter by its [`StackPlace`] name),
 /// plus what the checkpoint held beyond them.
 #[derive(Debug)]
@@ -265,14 +253,27 @@ impl LoadedWeights {
 pub struct WeightLoader;
 
 impl WeightLoader {
-    /// Validates every slot against `index` (present, BF16, expected shape) and every stack
+    /// [`WeightLoader::load_format`] of a BF16 checkpoint.
+    pub fn load(
+        index: &SafetensorsIndex,
+        slots: &[WeightSlot],
+        mem: &Arc<dyn DeviceMemory>,
+        staging_bytes: usize,
+    ) -> Result<LoadedWeights, ModelError> {
+        WeightLoader::load_format(&Bf16, index, slots, mem, staging_bytes)
+    }
+
+    /// Validates every slot against `index` (present, stored in `format`
+    /// ([`WeightFormat::check_tensor`]), expected shape) and every stack
     /// (each index named once, slot shapes matching), then allocates each tensor on `mem` and
     /// uploads it through one host staging buffer of `min(staging_bytes, MAX_STAGING_BYTES)`
     /// bytes (at least 1, at most the largest tensor); a stacked slot's bytes go straight to its
     /// offset in the stacked tensor (host-to-device copies only). Nothing is allocated when
     /// validation fails. The staging buffer is reused only after the previous copy completed
-    /// (`synchronize`), since device copies are enqueued.
-    pub fn load(
+    /// (`synchronize`), since device copies are enqueued. Parameters are allocated as
+    /// [`WeightFormat::weight_dtype`].
+    pub fn load_format(
+        format: &dyn WeightFormat,
         index: &SafetensorsIndex,
         slots: &[WeightSlot],
         mem: &Arc<dyn DeviceMemory>,
@@ -283,7 +284,7 @@ impl WeightLoader {
             let entry = index
                 .get(&slot.name)
                 .ok_or_else(|| ModelError::MissingTensor(slot.name.clone()))?;
-            require_bf16(entry)?;
+            format.check_tensor(entry)?;
             if entry.shape != slot.shape {
                 return Err(ModelError::Safetensors {
                     file: entry.file.clone(),
@@ -329,18 +330,15 @@ impl WeightLoader {
         let mut files: HashMap<PathBuf, File> = HashMap::new();
         let mut tensors: HashMap<String, Tensor> = HashMap::with_capacity(planned.len());
         let mut weight_bytes = 0u64;
+        let dtype = format.weight_dtype();
         for (slot, entry) in planned {
             // The destination tensor and this slot's byte offset in it.
             let (key, shape, base) = match &slot.stack {
-                Some(place) => (
-                    &place.name,
-                    &place.shape,
-                    place.offset * DType::BF16.size_bytes(),
-                ),
+                Some(place) => (&place.name, &place.shape, place.offset * dtype.size_bytes()),
                 None => (&slot.name, &slot.shape, 0),
             };
             if !tensors.contains_key(key) {
-                tensors.insert(key.clone(), Tensor::empty(mem, shape, DType::BF16)?);
+                tensors.insert(key.clone(), Tensor::empty(mem, shape, dtype)?);
             }
             let tensor = tensors.get_mut(key).expect("inserted above");
             let file = match files.get(&entry.file) {
@@ -434,7 +432,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use turbine_core::types::DeviceId;
+    use turbine_core::types::{DType, DeviceId};
     use turbine_tensor::host::HostMemory;
     use turbine_tensor::{DevicePtr, MemInfo, MemoryError, StreamRef};
 

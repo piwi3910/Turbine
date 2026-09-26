@@ -62,9 +62,31 @@ use super::{
 use crate::ModelError;
 use crate::config::ModelArchConfig;
 use crate::loader::{LM_HEAD, LoadedWeights, gate_up_proj_name, qkv_proj_name};
+use crate::weights::Bf16;
 
-/// Weights, activations and KV are BF16; logits are F32.
-pub(super) const ACT: DType = DType::BF16;
+/// Weights, activations and KV are in the `bf16` weight format's dtype; logits are F32. The
+/// executor runs only configurations of that format ([`check_weight_format`]).
+pub(super) const ACT: DType = Bf16::DTYPE;
+
+/// Refuses a configuration whose weight format is not the executor's ([`ACT`] weights,
+/// activations and KV).
+pub(super) fn check_weight_format(cfg: &ModelArchConfig) -> Result<(), ModelError> {
+    let format = cfg.weight_format.0;
+    let dtypes = [
+        format.weight_dtype(),
+        format.activation_dtype(),
+        format.kv_dtype(),
+    ];
+    if dtypes.iter().all(|&d| d == ACT) {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "the executor runs {} weights, activations and KV; weight format {} is not supported",
+            ACT.as_str(),
+            format.name()
+        )))
+    }
+}
 
 /// Model dimensions in elements.
 #[derive(Clone, Copy)]
@@ -207,7 +229,7 @@ fn read_f32(view: &TensorView<'_>) -> Result<Vec<f32>, ModelError> {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        DType::BF16 => bytes
+        Bf16::DTYPE => bytes
             .chunks_exact(2)
             .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect(),
@@ -437,6 +459,7 @@ impl LlamaExecutor {
                  {max_seqs} must be positive"
             )));
         }
+        check_weight_format(cfg)?;
         let d = Dims::of(cfg);
         let mut layers = Vec::with_capacity(cfg.num_layers as usize);
         let qkv = Split {

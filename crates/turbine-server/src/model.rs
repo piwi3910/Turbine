@@ -456,8 +456,7 @@ pub fn prepare(
     let modules = ModuleChoices {
         family: arch.architecture.family_name().to_string(),
         tool_format: tool_call_parser.map(str::to_string),
-        // Weights and KV are BF16 (`model.dtype`, the only value).
-        weight_format: "bf16".to_string(),
+        weight_format: arch.weight_format.0.name().to_string(),
         backend: config.execution.backend.to_string(),
         card_profile: provider.card_profile.clone(),
         scheduling_policy: config.scheduler.policy.to_string(),
@@ -593,7 +592,7 @@ pub struct LoadedModel {
 
 /// Steps 8–10: upload the weights, build the executor for `prepared`'s scheduler bounds,
 /// allocate the KV block pool and run one one-token forward on a block of it. Records
-/// `turbine_model_load_seconds` and `turbine_model_weight_bytes{format="bf16"}`.
+/// `turbine_model_load_seconds` and `turbine_model_weight_bytes{format}` (the weight format).
 pub fn load(
     prepared: &PreparedModel,
     warmup_token: u32,
@@ -602,7 +601,8 @@ pub fn load(
     let started = Instant::now();
     let arch = &prepared.arch;
     let mem = &prepared.provider.mem;
-    let weights = WeightLoader::load(
+    let weights = WeightLoader::load_format(
+        arch.weight_format.0,
         &prepared.index,
         &weight_slots(arch)?,
         mem,
@@ -637,8 +637,7 @@ pub fn load(
     log_pool_startup(&pool);
     warm_up(executor.as_mut(), &mut pool, warmup_token)?;
     let load_seconds = started.elapsed().as_secs_f64();
-    // Weights and KV are BF16 (`model.dtype`).
-    metrics.record_load(load_seconds, "bf16", weight_bytes);
+    metrics.record_load(load_seconds, arch.weight_format.0.name(), weight_bytes);
     tracing::info!(load_seconds, weight_bytes, "model loaded and warmed up");
     Ok(LoadedModel {
         executor,

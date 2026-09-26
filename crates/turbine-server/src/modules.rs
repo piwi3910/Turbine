@@ -56,7 +56,11 @@ impl ModuleChoices {
             self.tool_format.as_deref().unwrap_or("none"),
             "model.tool_call_parser, else the family default",
         );
-        log_selected("weight_format", &self.weight_format, "model.dtype");
+        log_selected(
+            "weight_format",
+            &self.weight_format,
+            "config.json dtype and quantization_config",
+        );
         log_selected("execution_backend", &self.backend, "execution.backend");
         log_selected(
             "card_profile",

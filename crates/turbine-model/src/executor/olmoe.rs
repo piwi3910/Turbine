@@ -61,7 +61,8 @@ use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, Tensor, TensorView}
 use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
 use super::graphs::{self, DecodeGraphs, GraphCounters, PoolId};
 use super::llama::{
-    ACT, ADD_CFG, add_norm_cfg, attention_cfg, gemm_cfg, invalid, limits, rope_cfg, take_matrix,
+    ACT, ADD_CFG, add_norm_cfg, attention_cfg, check_weight_format, gemm_cfg, invalid, limits,
+    rope_cfg, take_matrix,
 };
 use super::logits::{self, LogitsHead};
 use super::profile::{self, OpProfile, Profiler};
@@ -143,7 +144,7 @@ fn route_cfg(moe: &MoeConfig) -> MoeRouteConfig {
         top_k: moe.experts_per_token,
         renormalize: moe.norm_topk_prob,
         // transformers' router is a BF16 linear: its logits are BF16 before the F32 softmax.
-        bf16_logits: ACT == DType::BF16,
+        bf16_logits: ACT == crate::weights::Bf16::DTYPE,
     }
 }
 
@@ -414,6 +415,7 @@ impl OlmoeExecutor {
                  {max_seqs} must be positive"
             )));
         }
+        check_weight_format(cfg)?;
         let d = Dims::of(cfg, &moe);
         let qkv = Split {
             cols: [d.q_dim, d.kv_dim, d.kv_dim],

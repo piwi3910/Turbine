@@ -2,19 +2,21 @@
 //! (P1 S-3): architecture `LlamaForCausalLM`, BF16, no `quantization_config`. Anything else is
 //! refused with the offending field named and the supported set listed.
 //!
-//! The weight-dtype part of the allowlist is `ModelArchConfig::check_supported_weights`: every
-//! tensor the architecture loads must be BF16.
+//! The weight-format part of the allowlist is the checkpoint's [`crate::weights::WeightFormat`] (Phase 2m S-10,
+//! `crate::weights`): `detect` picks it from `config.json`, and
+//! `ModelArchConfig::check_supported_weights` holds every tensor the architecture loads to it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use smallvec::SmallVec;
-use turbine_core::types::{DType, KvLayout, ModelShape};
+use turbine_core::types::{KvLayout, ModelShape};
 
 use crate::ModelError;
-use crate::loader::{require_bf16, weight_slots};
+use crate::loader::weight_slots;
 use crate::safetensors::SafetensorsIndex;
+use crate::weights::{WeightFormatRef, detect};
 
 /// Model architectures this build can execute (`config.json` `architectures[0]`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -93,6 +95,8 @@ pub struct ModelArchConfig {
     pub moe: Option<MoeConfig>,
     /// RMSNorm over the full Q and K projections before RoPE (`q_norm` / `k_norm`, OLMoE).
     pub qk_norm: bool,
+    /// How the weights are stored and which dtypes weights, activations and KV use.
+    pub weight_format: WeightFormatRef,
 }
 
 /// Per-layer mixture of experts: a router picks `experts_per_token` of `num_experts` SwiGLU
@@ -117,13 +121,11 @@ pub struct GenerationConfig {
     pub top_k: Option<i32>,
 }
 
-/// Weights and KV are BF16 in Phase 1 (`torch_dtype` must say so when present).
-const SUPPORTED_TORCH_DTYPE: &str = "bfloat16";
 const DEFAULT_ROPE_THETA: f64 = 10_000.0;
 
 impl ModelArchConfig {
-    /// The description budget and planners consume. `weight_bytes` is the BF16 size of every
-    /// parameter the executor loads (no `lm_head` when tied).
+    /// The description budget and planners consume. `weight_bytes` is the stored size (in the
+    /// weight format) of every parameter the executor loads (no `lm_head` when tied).
     pub fn shape(&self) -> ModelShape {
         ModelShape {
             architecture: self.architecture.as_str().to_string(),
@@ -137,29 +139,30 @@ impl ModelArchConfig {
             num_experts: self.moe.map_or(0, |m| m.num_experts),
             experts_per_token: self.moe.map_or(0, |m| m.experts_per_token),
             tied_embeddings: self.tie_word_embeddings,
-            weight_bytes: self.param_count() * DType::BF16.size_bytes() as u64,
+            weight_bytes: self.param_count() * self.weight_format.0.bytes_per_param(),
             max_position_embeddings: self.max_position_embeddings,
         }
     }
 
-    /// Per-token K and V of every layer, BF16, in blocks of `block_tokens` tokens.
+    /// Per-token K and V of every layer, in the weight format's KV dtype, in blocks of
+    /// `block_tokens` tokens.
     pub fn kv_layout(&self, block_tokens: u32) -> KvLayout {
         KvLayout {
             num_layers: self.num_layers,
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
-            dtype: DType::BF16,
+            dtype: self.weight_format.0.kv_dtype(),
             block_tokens,
         }
     }
 
     /// The dtype half of the allowlist: every checkpoint tensor this architecture loads must be
-    /// BF16 (`unsupported tensor dtype = F8_E4M3 (<tensor>); supported: BF16` otherwise). Missing
-    /// tensors are the loader's to report.
+    /// stored in the weight format (BF16: `unsupported tensor dtype = F8_E4M3 (<tensor>);
+    /// supported: BF16` otherwise). Missing tensors are the loader's to report.
     pub fn check_supported_weights(&self, index: &SafetensorsIndex) -> Result<(), ModelError> {
         for slot in &weight_slots(self) {
             if let Some(entry) = index.get(&slot.name) {
-                require_bf16(entry)?;
+                self.weight_format.0.check_tensor(entry)?;
             }
         }
         Ok(())
@@ -215,8 +218,6 @@ struct RawConfig {
     max_position_embeddings: u32,
     #[serde(default)]
     eos_token_id: Option<TokenIds>,
-    #[serde(default)]
-    quantization_config: Option<serde_json::Value>,
     /// Mixture-of-experts keys (OLMoE); `intermediate_size` is then each expert's width.
     #[serde(default)]
     num_experts: Option<u32>,
@@ -227,11 +228,6 @@ struct RawConfig {
     /// OLMoE clamps Q/K/V to ±`clip_qkv` when set; no executor implements that.
     #[serde(default)]
     clip_qkv: Option<serde_json::Value>,
-    #[serde(default)]
-    torch_dtype: Option<String>,
-    /// transformers ≥ 4.56 writes `dtype` instead of `torch_dtype`.
-    #[serde(default)]
-    dtype: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -256,7 +252,7 @@ struct RawLlama3Scaling {
     original_max_position_embeddings: u32,
 }
 
-fn unsupported(field: &str, value: impl Into<String>, supported: &str) -> ModelError {
+pub(crate) fn unsupported(field: &str, value: impl Into<String>, supported: &str) -> ModelError {
     ModelError::Unsupported {
         field: field.to_string(),
         value: value.into(),
@@ -286,10 +282,11 @@ pub fn load_generation_config(dir: &Path) -> Result<GenerationConfig, ModelError
 }
 
 /// Parses `config.json` (and `generation_config.json` for EOS ids) in `dir` and applies the
-/// architecture, dtype and quantization allowlist.
+/// architecture and weight-format allowlist.
 pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
     let config_path = dir.join("config.json");
     let raw: RawConfig = read_json(&config_path)?;
+    let top: serde_json::Value = read_json(&config_path)?;
     let invalid = |detail: String| ModelError::Io {
         path: config_path.clone(),
         detail,
@@ -309,14 +306,7 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
         unsupported("architectures", value, &Architecture::supported_list())
     })?;
 
-    if let Some(q) = raw.quantization_config.filter(|q| !q.is_null()) {
-        return Err(unsupported("quantization_config", q.to_string(), "none"));
-    }
-    for (field, value) in [("torch_dtype", &raw.torch_dtype), ("dtype", &raw.dtype)] {
-        if let Some(value) = value.as_deref().filter(|v| *v != SUPPORTED_TORCH_DTYPE) {
-            return Err(unsupported(field, value, SUPPORTED_TORCH_DTYPE));
-        }
-    }
+    let weight_format = WeightFormatRef(detect(&top)?);
 
     let heads = raw.num_attention_heads;
     let num_kv_heads = raw.num_key_value_heads.unwrap_or(heads);
@@ -403,6 +393,7 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
         eos_token_ids,
         moe,
         qk_norm,
+        weight_format,
     })
 }
 
