@@ -374,3 +374,10 @@
 - First experiment: two turbine-server processes sharing one R9700 (needs lab approval beyond Phase 2c)
 
 **Answer (2026-09-26):** not decided yet — more research needed; continue the original phase plan for now. No experiment on novanas.
+
+## Closing Phase 2: macOS acceptance build and merge
+
+- Run the Phase 2 S-1 acceptance once on the Mac (cargo build/test/clippy/fmt on macOS arm64, ~12 GB target, deleted afterwards) (recommended)
+- Accept the novanas (Linux) workspace run instead and amend S-1
+- Merge `phase-2c-performance` (Phase 2 + the measured Phase 2c work) into main and push once Phase 2 criteria pass (recommended)
+- Merge only Phase 2 (`phase-2-serving-runtime` + its later fixes) and keep Phase 2c on its branch
