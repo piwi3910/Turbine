@@ -445,3 +445,11 @@ Card profiles:
 - Profiles as data files (YAML/TOML) loaded at startup
 
 **Answers (2026-09-26):** kernel selection moves to Rust (the ABI lists each op's implementations and what they support, the Rust registry picks with reason codes, card profiles supply thresholds, one library per backend); families share one decoder skeleton with per-family attention/FFN hooks; the Phase 8 run-ahead registry, families (Qwen3, Qwen3-MoE, Mistral, Mixtral on CPU) and Hermes/Mistral tool parsers are merged in as part of this refactor; card profiles are declarative Rust profiles in turbine-kernels passed to the library at context creation, CMake builds the architectures the profiles list.
+
+## Phase 2m modularity: start implementation?
+
+- Yes: build the plan (17 tasks), parallel agents per lane (A model, B sampler, C scheduler, D kernels) in worktrees, landing one task at a time on `phase-2m-modularity` with gate, GPU suites, golden and lab-bench after each (recommended)
+- Yes, but serially (one task at a time, no parallel lanes)
+- Not yet — review the spec and plan first
+
+**Answer (2026-09-26):** yes, parallel lanes — agents build lanes A (model), B (sampler), C (scheduler), D (kernels) in worktrees; each task lands one at a time on `phase-2m-modularity` with gate, GPU suites, golden and lab-bench after it.
