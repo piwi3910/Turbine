@@ -1186,6 +1186,7 @@ mod tests {
             &order,
             &reqs,
             &KernelMetrics::register(&MetricsRegistry::new()),
+            None,
         )
         .expect("every op has a provider");
         let limits = ExecutorLimits {

@@ -58,7 +58,7 @@ fn cpu_model(
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
     let reqs =
         executor::available_requirements(cfg, BLOCK_TOKENS, opts, std::slice::from_ref(&provider));
-    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, None)
         .expect("every op has a provider");
     build_executor(
         cfg,
