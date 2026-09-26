@@ -8,6 +8,8 @@
 // TURBINE_MOE_ROUTE_BF16_LOGITS), the top-k set torch.topk selects,
 // and out[t] = round(out[t] + round(y * round(w))) applied expert by expert in
 // ascending id.
+#include <algorithm>
+
 #include "bf16.hpp"
 #include "turbine_hip.hpp"
 
@@ -23,8 +25,10 @@ namespace {
 
 constexpr int kBlock = 256;
 constexpr float kNegInf = -__builtin_huge_valf();
-// Expert ids staged in LDS per step of the grouping kernel.
-constexpr int kSortTile = 2048;
+// Lanes of the top-k kernel's one-wave blocks (one block per token).
+constexpr int kTopkLanes = 32;
+// Rows one block of the grouping kernel places.
+constexpr int kGroupTile = 256;
 
 static_assert(kMoeMaxExperts <= kBlock,
               "the grouping kernel uses one thread per expert");
@@ -187,31 +191,50 @@ __device__ void topk_nth_element(TopkElem *v, int32_t nth, int32_t n) {
   topk_insertion_sort(v, first, last);
 }
 
-// One thread per token: logits rounded to BF16 with
-// TURBINE_MOE_ROUTE_BF16_LOGITS, softmax over the experts (max-subtracted,
-// sequential sum), the set torch.topk selects, written in descending weight
-// with ties to the lower expert id.
-__global__ void moe_topk_kernel(const float *logits, int32_t num_tokens,
-                                int32_t num_experts, int32_t top_k,
-                                int32_t flags, int32_t *topk_ids,
-                                float *topk_weights) {
-  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (t >= num_tokens)
-    return;
+// One wave per token: the token's logits (rounded to BF16 with
+// TURBINE_MOE_ROUTE_BF16_LOGITS) are staged in LDS and the lanes compute their
+// max and each expert's exp in parallel; lane 0 sums the exps sequentially in
+// expert order, the lanes divide, and lane 0 runs the torch.topk selection on
+// the LDS copy and writes the chosen set in descending weight with ties to the
+// lower expert id. Every value is computed by the same f32 operations as a
+// one-thread-per-token softmax (max and division are exact to reorder; the sum
+// is not reordered), so the probabilities, the selection and its order are
+// those of the cpu reference.
+__global__ __launch_bounds__(kTopkLanes) void moe_topk_kernel(
+    const float *logits, int32_t num_experts, int32_t top_k, int32_t flags,
+    int32_t *topk_ids, float *topk_weights) {
+  __shared__ TopkElem v[kMoeMaxExperts];
+  __shared__ float total;
+  const int64_t t = blockIdx.x;
+  const int lane = static_cast<int>(threadIdx.x);
   const float *row = logits + t * num_experts;
   const bool bf16_logits = (flags & TURBINE_MOE_ROUTE_BF16_LOGITS) != 0;
-  TopkElem v[kMoeMaxExperts];
   float max = kNegInf;
-  for (int32_t e = 0; e < num_experts; ++e) {
-    v[e].v = bf16_logits ? round_bf16(row[e]) : row[e];
+  for (int32_t e = lane; e < num_experts; e += kTopkLanes) {
+    const float x = bf16_logits ? round_bf16(row[e]) : row[e];
+    v[e].v = x;
     v[e].i = e;
-    max = fmaxf(max, v[e].v);
+    max = fmaxf(max, x);
   }
-  float sum = 0.0f;
-  for (int32_t e = 0; e < num_experts; ++e)
-    sum += expf(v[e].v - max);
-  for (int32_t e = 0; e < num_experts; ++e)
-    v[e].v = expf(v[e].v - max) / sum;
+#pragma unroll
+  for (int off = kTopkLanes / 2; off > 0; off /= 2)
+    max = fmaxf(max, __shfl_xor(max, off, kTopkLanes));
+  for (int32_t e = lane; e < num_experts; e += kTopkLanes)
+    v[e].v = expf(v[e].v - max);
+  __syncthreads();
+  if (lane == 0) {
+    float sum = 0.0f;
+    for (int32_t e = 0; e < num_experts; ++e)
+      sum += v[e].v;
+    total = sum;
+  }
+  __syncthreads();
+  const float sum = total;
+  for (int32_t e = lane; e < num_experts; e += kTopkLanes)
+    v[e].v = v[e].v / sum;
+  __syncthreads();
+  if (lane != 0)
+    return;
 
   if (top_k * 64 <= num_experts)
     topk_heap_select(v, 0, top_k, num_experts);
@@ -242,54 +265,52 @@ __global__ void moe_topk_kernel(const float *logits, int32_t num_tokens,
   }
 }
 
-// One block: thread e counts the rows routed to expert e, thread 0 turns the
-// counts into offsets, then thread e writes its rows in ascending row order
-// (a stable counting sort). The ids are staged through LDS in tiles.
-__global__ void moe_group_kernel(const int32_t *topk_ids, int32_t rows,
-                                 int32_t num_experts, int32_t *sorted_rows,
-                                 int32_t *expert_offsets) {
-  __shared__ int32_t tile[kSortTile];
+// Grid: one block per tile of kGroupTile rows; a stable counting sort with no
+// scratch memory. Every block histograms all topk_ids (LDS atomics, split into
+// the rows before its tile and the others), which gives each expert's total
+// and, for its tile, the number of the expert's rows in earlier tiles; the
+// exclusive scan of the totals is the offsets (written by block 0). Thread e
+// then writes the tile's rows routed to expert e in ascending row order after
+// the earlier tiles' rows. The result equals a sequential stable counting sort
+// (the cpu-reference grouping) whatever the number of blocks.
+__global__ __launch_bounds__(kBlock) void moe_group_kernel(
+    const int32_t *topk_ids, int32_t rows, int32_t num_experts,
+    int32_t *sorted_rows, int32_t *expert_offsets) {
+  __shared__ int32_t before[kMoeMaxExperts];
+  __shared__ int32_t rest[kMoeMaxExperts];
   __shared__ int32_t offsets[kMoeMaxExperts + 1];
-  const int e = threadIdx.x;
-  const bool owner = e < num_experts;
-
-  int32_t count = 0;
-  for (int32_t t0 = 0; t0 < rows; t0 += kSortTile) {
-    const int32_t n = min(kSortTile, rows - t0);
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
-      tile[i] = topk_ids[t0 + i];
-    __syncthreads();
-    if (owner) {
-      for (int32_t i = 0; i < n; ++i)
-        count += tile[i] == e ? 1 : 0;
-    }
-    __syncthreads();
+  __shared__ int32_t tile[kGroupTile];
+  const int32_t t0 = static_cast<int32_t>(blockIdx.x) * kGroupTile;
+  const int32_t n = min(kGroupTile, rows - t0);
+  for (int x = threadIdx.x; x < num_experts; x += blockDim.x) {
+    before[x] = 0;
+    rest[x] = 0;
   }
-  if (owner)
-    offsets[e + 1] = count;
+  __syncthreads();
+  for (int32_t r = threadIdx.x; r < rows; r += blockDim.x) {
+    const int32_t e = topk_ids[r];
+    atomicAdd(r < t0 ? &before[e] : &rest[e], 1);
+  }
+  for (int i = threadIdx.x; i < n; i += blockDim.x)
+    tile[i] = topk_ids[t0 + i];
   __syncthreads();
   if (threadIdx.x == 0) {
     offsets[0] = 0;
     for (int32_t x = 0; x < num_experts; ++x)
-      offsets[x + 1] += offsets[x];
+      offsets[x + 1] = offsets[x] + before[x] + rest[x];
   }
   __syncthreads();
-  for (int x = threadIdx.x; x <= num_experts; x += blockDim.x)
-    expert_offsets[x] = offsets[x];
-
-  int32_t cursor = owner ? offsets[e] : 0;
-  for (int32_t t0 = 0; t0 < rows; t0 += kSortTile) {
-    const int32_t n = min(kSortTile, rows - t0);
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
-      tile[i] = topk_ids[t0 + i];
-    __syncthreads();
-    if (owner) {
-      for (int32_t i = 0; i < n; ++i) {
-        if (tile[i] == e)
-          sorted_rows[cursor++] = t0 + i;
-      }
+  if (blockIdx.x == 0) {
+    for (int x = threadIdx.x; x <= num_experts; x += blockDim.x)
+      expert_offsets[x] = offsets[x];
+  }
+  const int e = threadIdx.x;
+  if (e < num_experts) {
+    int32_t cursor = offsets[e] + before[e];
+    for (int32_t i = 0; i < n; ++i) {
+      if (tile[i] == e)
+        sorted_rows[cursor++] = t0 + i;
     }
-    __syncthreads();
   }
 }
 
@@ -377,11 +398,9 @@ namespace turbine_hip {
 int32_t launch_moe_route(turbine_ctx *ctx, const turbine_moe_route_desc *d) {
   if (d->num_tokens > 0) {
     hipLaunchKernelGGL(
-        moe_topk_kernel,
-        dim3(static_cast<unsigned>(
-            (static_cast<int64_t>(d->num_tokens) + kBlock - 1) / kBlock)),
-        dim3(kBlock), 0, ctx->stream, d->router_logits, d->num_tokens,
-        d->num_experts, d->top_k, d->flags, d->topk_ids, d->topk_weights);
+        moe_topk_kernel, dim3(static_cast<unsigned>(d->num_tokens)),
+        dim3(kTopkLanes), 0, ctx->stream, d->router_logits, d->num_experts,
+        d->top_k, d->flags, d->topk_ids, d->topk_weights);
     if (int32_t rc =
             check_hip(ctx, hipGetLastError(), "moe top-k kernel launch");
         rc != TURBINE_OK) {
@@ -389,9 +408,13 @@ int32_t launch_moe_route(turbine_ctx *ctx, const turbine_moe_route_desc *d) {
     }
   }
   const int64_t rows = static_cast<int64_t>(d->num_tokens) * d->top_k;
-  hipLaunchKernelGGL(moe_group_kernel, dim3(1), dim3(kBlock), 0, ctx->stream,
-                     d->topk_ids, static_cast<int32_t>(rows), d->num_experts,
-                     d->sorted_rows, d->expert_offsets);
+  // At least one block, so that the offsets are written for zero tokens too.
+  const int64_t tiles =
+      std::max<int64_t>(1, (rows + kGroupTile - 1) / kGroupTile);
+  hipLaunchKernelGGL(moe_group_kernel, dim3(static_cast<unsigned>(tiles)),
+                     dim3(kBlock), 0, ctx->stream, d->topk_ids,
+                     static_cast<int32_t>(rows), d->num_experts, d->sorted_rows,
+                     d->expert_offsets);
   return check_hip(ctx, hipGetLastError(), "moe grouping kernel launch");
 }
 
