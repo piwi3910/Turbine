@@ -74,3 +74,4 @@ Target order (user decisions): AMD first — Phases 1–2 run Llama-3.2-3B-Instr
 - Unsafe Rust and FFI stay isolated, with documented ownership/lifetime rules for GPU pointers and streams.
 - Scheduler logic must be testable as a deterministic simulation without GPUs (spec §17).
 - Build the smallest correct vertical slice first; avoid micro-crates without a real ownership/API boundary.
+- Pluggability is the architecture (user decision 2026-09-26): model families, prompt/tool-call formats, quantization formats (weights and KV), speculative-decoding proposers, logits processors, scheduling and eviction policies, backends, card families, kernel providers, collectives and transports each sit behind a trait with one file (or directory) per implementation and a static registry — adding one is additive, never conditionals spread across crates; only kernels load as runtime libraries. Unsupported combinations are refused at startup with a reason code. Tracking issues: #1–#6.

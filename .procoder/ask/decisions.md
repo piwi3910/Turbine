@@ -387,3 +387,11 @@
 ## NVIDIA (Phase 2b and every Spark / CUDA item) on hold
 
 **Decision (2026-09-26, user):** no NVIDIA work in the plan for now. Phase 2b and every CUDA / DGX Spark item in later phases (Spark lab runs, CUDA kernels, cross-host runs with the Sparks) are on hold, to be revisited after everything works well on novanas. Order after Phase 2 / 2c: Phase 3 next. The run-ahead branch `runahead/p2b-nvidia` is kept as is, not integrated.
+
+## Pluggability beyond models, tool formats and backends
+
+- File issues for quantization formats as modules (one file per weight format; KV formats as a separate registry), speculative decoding as a proposer trait with shared verification, and logits processors + scheduling policy behind traits; and add a "pluggability" engineering rule to AGENTS.md (recommended)
+- File the issues only, no AGENTS.md rule
+- Neither for now; revisit when Phase 8 track specs are written
+
+**Answer (2026-09-26):** issues + AGENTS.md rule. Filed piwi3910/Turbine #4 (quantization formats), #5 (speculative proposers), #6 (logits processors and scheduling policies), alongside #1 (model families), #2 (prompt/tool-call formats), #3 (backends, card families, kernel providers); AGENTS.md engineering rules gain the pluggability rule.
