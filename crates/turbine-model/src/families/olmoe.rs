@@ -14,12 +14,15 @@ use turbine_tensor::DeviceMemory;
 use super::{FamilyConfig, ModelFamily, invalid};
 use crate::ModelError;
 use crate::config::{ModelArchConfig, MoeConfig, unsupported};
-use crate::executor::{ExecutorLimits, ExecutorOptions, ModelExecutor, OlmoeExecutor};
+use crate::executor::decoder::{MOE, QK_NORM_FULL};
+use crate::executor::{
+    DecoderExecutor, DecoderSpec, ExecutorLimits, ExecutorOptions, ModelExecutor,
+};
 use crate::loader::{
     LM_HEAD, LoadedWeights, StackPlace, WeightSlot, qkv_slots, stacked_experts_name,
 };
 
-/// `OlmoeForCausalLM` on the [`OlmoeExecutor`].
+/// `OlmoeForCausalLM` on the shared [`DecoderExecutor`] with [`decoder_spec`].
 pub struct Olmoe;
 
 /// The HF class name, as error messages name it.
@@ -89,16 +92,11 @@ impl ModelFamily for Olmoe {
         block_tokens: u32,
         opts: ExecutorOptions,
     ) -> Vec<OpRequirement> {
-        OlmoeExecutor::requirements(cfg, block_tokens, opts)
+        DecoderExecutor::requirements(cfg, &decoder_spec(), block_tokens, opts)
     }
 
     fn workspace_bytes(&self, cfg: &ModelArchConfig, limits: ExecutorLimits) -> u64 {
-        OlmoeExecutor::workspace_bytes(
-            cfg,
-            limits.block_tokens,
-            limits.max_batch_tokens,
-            limits.max_seqs,
-        )
+        DecoderExecutor::workspace_bytes(cfg, &decoder_spec(), limits)
     }
 
     fn default_tool_format(&self) -> Option<&'static str> {
@@ -114,16 +112,23 @@ impl ModelFamily for Olmoe {
         limits: ExecutorLimits,
         opts: ExecutorOptions,
     ) -> Result<Box<dyn ModelExecutor>, ModelError> {
-        Ok(Box::new(OlmoeExecutor::new(
+        Ok(Box::new(DecoderExecutor::new(
             cfg,
+            decoder_spec(),
             weights,
             registry,
             mem,
-            limits.block_tokens,
-            limits.max_batch_tokens,
-            limits.max_seqs,
+            limits,
             opts,
         )?))
+    }
+}
+
+/// The OLMoE decoder: RMSNorm over the full Q and K projections and the mixture of experts.
+pub fn decoder_spec() -> DecoderSpec {
+    DecoderSpec {
+        attention: QK_NORM_FULL,
+        ffn: MOE,
     }
 }
 

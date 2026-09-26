@@ -283,7 +283,8 @@ mod tests {
     use turbine_tensor::KvPoolView;
 
     use crate::executor::{
-        BatchInput, ExecutorOptions, LlamaExecutor, Logits, ModelExecutor, SequenceKv,
+        self, BatchInput, DecoderExecutor, ExecutorLimits, ExecutorOptions, Logits, ModelExecutor,
+        SequenceKv,
     };
     use crate::metrics::ModelMetrics;
     use crate::sampler::argmax;
@@ -668,7 +669,7 @@ mod tests {
         );
     }
 
-    fn tiny_executor(spec: &TinySpec) -> (LlamaExecutor, SequenceKv) {
+    fn tiny_executor(spec: &TinySpec) -> (DecoderExecutor, SequenceKv) {
         let cfg = &spec.config;
         let mem = host_mem();
         let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
@@ -679,19 +680,22 @@ mod tests {
         let registry = KernelRegistry::build(
             vec![provider],
             &order,
-            &LlamaExecutor::requirements(cfg, 16, ExecutorOptions::default()),
+            &executor::requirements(cfg, 16, ExecutorOptions::default()),
             &KernelMetrics::register(&MetricsRegistry::new()),
         )
         .expect("every op has a provider");
         let kv = SequenceKv::new(&mem, cfg.kv_layout(16), 64).expect("kv");
-        let exec = LlamaExecutor::new(
+        let exec = DecoderExecutor::new(
             cfg,
+            crate::families::llama::decoder_spec(),
             weights,
             Arc::new(registry),
             mem,
-            16,
-            64,
-            1,
+            ExecutorLimits {
+                block_tokens: 16,
+                max_batch_tokens: 64,
+                max_seqs: 1,
+            },
             ExecutorOptions::default(),
         )
         .expect("executor");

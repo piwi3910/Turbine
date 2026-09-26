@@ -1,4 +1,4 @@
-//! Numerics diagnostics over [`TraceTensor`]s recorded by [`LlamaExecutor::set_trace`]:
+//! Numerics diagnostics over [`TraceTensor`]s recorded by [`DecoderExecutor::set_trace`]:
 //!
 //! - [`compare_traces`]: two providers run the same tokens; every recorded op output is compared
 //!   element-wise (accumulated divergence, layer by layer).
@@ -9,7 +9,7 @@
 //! Differences are reported in absolute terms and in BF16 ulps (`2^(floor(log2 |v|) − 7)`) of
 //! the larger of the two magnitudes, so a 1-ulp rounding flip reads as 1.0 at any magnitude.
 //!
-//! [`LlamaExecutor::set_trace`]: crate::executor::LlamaExecutor::set_trace
+//! [`DecoderExecutor::set_trace`]: crate::executor::DecoderExecutor::set_trace
 use std::io::{Read, Seek, SeekFrom};
 
 use half::bf16;

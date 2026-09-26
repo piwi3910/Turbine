@@ -40,6 +40,16 @@ fn result_words(top_n: usize) -> usize {
     2 * top_n + 3
 }
 
+/// Candidates a reduction of rows asking for `requests` returns per row: the most any row asked
+/// for (1 when none did).
+fn top_n_of(requests: &[RowReduce]) -> usize {
+    requests
+        .iter()
+        .map(|r| usize::from(r.top_n).clamp(1, MAX_TOP_N))
+        .max()
+        .unwrap_or(1)
+}
+
 /// The `logits_reduce` config an executor over `cfg` runs every reduction at: the whole
 /// vocabulary and [`MAX_TOP_N`] (a batch asking for fewer candidates passes fewer columns).
 pub fn reduce_config(cfg: &ModelArchConfig) -> LogitsReduceConfig {
@@ -243,11 +253,21 @@ impl LogitsHead {
 
     /// Candidates the current batch's reduction returns per row: the most any row asked for.
     fn batch_top_n(&self) -> usize {
-        self.requests
+        top_n_of(&self.requests)
+    }
+
+    /// [`LogitsHead::graph_top_n`] of the batch `seqs` as [`LogitsHead::plan`] would plan it,
+    /// without planning it.
+    pub fn graph_top_n_of(&self, seqs: &[SeqSlice<'_>]) -> Option<u8> {
+        let requests: Vec<RowReduce> = seqs
             .iter()
-            .map(|r| usize::from(r.top_n).clamp(1, MAX_TOP_N))
-            .max()
-            .unwrap_or(1)
+            .filter_map(|s| s.reduce.filter(|_| self.reduce.is_some()))
+            .collect();
+        match requests.len() {
+            0 => Some(0),
+            r if r == seqs.len() => Some(top_n_of(&requests) as u8),
+            _ => None,
+        }
     }
 
     /// The reduction's candidates per row when the planned batch can run as a decode graph

@@ -29,7 +29,10 @@ use turbine_core::types::RequestId;
 use turbine_kernels::{
     KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider, shim_provider,
 };
-use turbine_model::executor::{self, ExecutorOptions, LlamaExecutor, ModelExecutor, SequenceKv};
+use turbine_model::executor::{
+    self, DecoderExecutor, ExecutorLimits, ExecutorOptions, ModelExecutor, SequenceKv,
+};
+use turbine_model::families;
 use turbine_model::generate::{GenerateOptions, generate};
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::write_tiny_llama;
@@ -616,7 +619,7 @@ fn gpu_model_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// An executor and the single-sequence KV it generates on.
 struct Runner {
-    exec: LlamaExecutor,
+    exec: DecoderExecutor,
     kv: SequenceKv,
 }
 
@@ -635,19 +638,22 @@ fn build_executor(
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &LlamaExecutor::requirements(&cfg, BLOCK_TOKENS, ExecutorOptions::default()),
+        &executor::requirements(&cfg, BLOCK_TOKENS, ExecutorOptions::default()),
         &metrics,
     )
     .expect("every op has a provider");
     let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
-    let exec = LlamaExecutor::new(
+    let exec = DecoderExecutor::new(
         &cfg,
+        families::llama::decoder_spec(),
         weights,
         Arc::new(registry),
         mem,
-        BLOCK_TOKENS,
-        max_seq_len,
-        1,
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: max_seq_len,
+            max_seqs: 1,
+        },
         ExecutorOptions::default(),
     )
     .expect("executor");

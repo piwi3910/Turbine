@@ -23,9 +23,10 @@ use turbine_kernels::{
 };
 use turbine_model::config::ModelArchConfig;
 use turbine_model::executor::{
-    self, BatchInput, ExecutorOptions, LlamaExecutor, ModelExecutor, OlmoeExecutor, OpProfile,
+    self, BatchInput, DecoderExecutor, ExecutorLimits, ExecutorOptions, ModelExecutor, OpProfile,
     OpProfileEntry, SeqSlice,
 };
+use turbine_model::families;
 use turbine_model::{MAX_STAGING_BYTES, SafetensorsIndex, WeightLoader, load_model_config};
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView};
@@ -55,21 +56,12 @@ trait Profiled: ModelExecutor {
     fn take_profile(&mut self) -> OpProfile;
 }
 
-impl Profiled for LlamaExecutor {
+impl Profiled for DecoderExecutor {
     fn set_profile(&mut self, on: bool) {
-        LlamaExecutor::set_profile(self, on);
+        DecoderExecutor::set_profile(self, on);
     }
     fn take_profile(&mut self) -> OpProfile {
-        LlamaExecutor::take_profile(self)
-    }
-}
-
-impl Profiled for OlmoeExecutor {
-    fn set_profile(&mut self, on: bool) {
-        OlmoeExecutor::set_profile(self, on);
-    }
-    fn take_profile(&mut self) -> OpProfile {
-        OlmoeExecutor::take_profile(self)
+        DecoderExecutor::take_profile(self)
     }
 }
 
@@ -124,34 +116,19 @@ fn hip_executor(
         )
         .expect("every op has a provider"),
     );
-    match cfg.family.0.name() {
-        "llama" => Box::new(
-            LlamaExecutor::new(
-                cfg,
-                weights,
-                registry,
-                mem,
-                BLOCK_TOKENS,
-                max_batch_tokens,
-                MAX_SEQS,
-                opts,
-            )
-            .expect("llama executor"),
-        ),
-        _ => Box::new(
-            OlmoeExecutor::new(
-                cfg,
-                weights,
-                registry,
-                mem,
-                BLOCK_TOKENS,
-                max_batch_tokens,
-                MAX_SEQS,
-                opts,
-            )
-            .expect("olmoe executor"),
-        ),
-    }
+    let spec = match cfg.family.0.name() {
+        "llama" => families::llama::decoder_spec(),
+        _ => families::olmoe::decoder_spec(),
+    };
+    let limits = ExecutorLimits {
+        block_tokens: BLOCK_TOKENS,
+        max_batch_tokens,
+        max_seqs: MAX_SEQS,
+    };
+    Box::new(
+        DecoderExecutor::new(cfg, spec, weights, registry, mem, limits, opts)
+            .expect("decoder executor"),
+    )
 }
 
 fn pool_view<'a>(storage: &'a DeviceBuffer, layout: &KvLayout, blocks: u32) -> KvPoolView<'a> {

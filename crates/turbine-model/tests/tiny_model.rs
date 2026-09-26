@@ -23,10 +23,11 @@ use turbine_kernels::{
 };
 use turbine_model::config::{ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
-    self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, LlamaExecutor, Logits,
-    LogitsSlot, ModelExecutor, OlmoeExecutor, OpProfile, ReducedRow, RowReduce, SeqSlice,
-    SequenceKv, TokenFeed, TraceTensor, build_executor, graphs,
+    self, BatchInput, DecodeGraphs, DecoderExecutor, DecoderSpec, ExecutorLimits, ExecutorOptions,
+    GraphBackend, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice, SequenceKv,
+    TokenFeed, TraceTensor, build_executor, graphs,
 };
+use turbine_model::families;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
@@ -70,19 +71,19 @@ fn prompt(vocab: u32) -> Vec<u32> {
 
 /// An executor plus the Phase 1 single-sequence KV it runs on; derefs to the executor.
 struct Single {
-    exec: LlamaExecutor,
+    exec: DecoderExecutor,
     kv: SequenceKv,
 }
 
 impl std::ops::Deref for Single {
-    type Target = LlamaExecutor;
-    fn deref(&self) -> &LlamaExecutor {
+    type Target = DecoderExecutor;
+    fn deref(&self) -> &DecoderExecutor {
         &self.exec
     }
 }
 
 impl std::ops::DerefMut for Single {
-    fn deref_mut(&mut self) -> &mut LlamaExecutor {
+    fn deref_mut(&mut self) -> &mut DecoderExecutor {
         &mut self.exec
     }
 }
@@ -117,7 +118,7 @@ fn paged_executor(
     spec: &TinySpec,
     provider: Arc<dyn KernelProvider>,
     mem: Arc<dyn DeviceMemory>,
-) -> LlamaExecutor {
+) -> DecoderExecutor {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
     let weights =
@@ -127,18 +128,21 @@ fn paged_executor(
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &LlamaExecutor::requirements(cfg, BLOCK_TOKENS, ALL_FUSED),
+        &executor::requirements(cfg, BLOCK_TOKENS, ALL_FUSED),
         &metrics,
     )
     .expect("every op has a provider");
-    LlamaExecutor::new(
+    DecoderExecutor::new(
         cfg,
+        families::llama::decoder_spec(),
         weights,
         Arc::new(registry),
         mem,
-        BLOCK_TOKENS,
-        MAX_SEQ_LEN,
-        MAX_SEQS,
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: MAX_SEQ_LEN,
+            max_seqs: MAX_SEQS,
+        },
         ALL_FUSED,
     )
     .expect("executor")
@@ -646,7 +650,7 @@ fn forward_rejects_invalid_batches() {
 fn requirements_and_workspace() {
     let tmp = TempDir::new("tiny-model-reqs");
     let spec = write_tiny_llama(tmp.path(), SEED);
-    let reqs = LlamaExecutor::requirements(&spec.config, BLOCK_TOKENS, ALL_FUSED);
+    let reqs = executor::requirements(&spec.config, BLOCK_TOKENS, ALL_FUSED);
     let rendered: Vec<String> = reqs
         .iter()
         .map(|r| format!("{} {}", r.op, r.config))
@@ -683,7 +687,7 @@ fn requirements_and_workspace() {
     }
     assert_eq!(rendered.len(), 14, "{rendered:#?}");
     // Unfused: separate Q (n = 64, as O), K/V (n = 32) and gate/up (n = 128) GEMMs.
-    let unfused: Vec<String> = LlamaExecutor::requirements(
+    let unfused: Vec<String> = executor::requirements(
         &spec.config,
         BLOCK_TOKENS,
         ExecutorOptions::from_fused_ops(false),
@@ -705,7 +709,7 @@ fn requirements_and_workspace() {
     assert_eq!(unfused.len(), 13, "{unfused:#?}");
 
     // Workspace grows linearly in the batch token count and in the sequence count.
-    let ws = |t, n| LlamaExecutor::workspace_bytes(&spec.config, BLOCK_TOKENS, t, n);
+    let ws = |t, n| executor::workspace_bytes(&spec.config, BLOCK_TOKENS, t, n);
     let per_token = ws(2, 1) - ws(1, 1);
     assert_eq!(ws(64, 1) - ws(1, 1), 63 * per_token);
     // Per token: ids + positions (i32), x/h/proj [hidden], attn [q_dim], qkv [q_dim +
@@ -771,7 +775,7 @@ fn paged_llama_single_sequence() {
     storage.whole().write_bytes(&noise).expect("fill pool");
     let kv = pool_view(&storage, exec.kv_layout(), 12);
     let table = [BlockId(9), BlockId(2), BlockId(7), BlockId(4)];
-    let run = |exec: &mut LlamaExecutor, tokens: &[u32], start: u32| {
+    let run = |exec: &mut DecoderExecutor, tokens: &[u32], start: u32| {
         let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
         let seqs = [SeqSlice {
             seq: SeqId(42),
@@ -903,7 +907,7 @@ fn ragged_batch_rows_match_single_sequences() {
     exec.copy_blocks(&kv, &[BlockId(6)], &[BlockId(9)])
         .expect("copy_blocks");
     let fork = [BlockId(9)];
-    let decode = |exec: &mut LlamaExecutor, table: &[BlockId]| {
+    let decode = |exec: &mut DecoderExecutor, table: &[BlockId]| {
         let seqs = [SeqSlice {
             seq: SeqId(3),
             q_start: 0,
@@ -1217,11 +1221,10 @@ fn olmoe_cpu_forward_matches_naive() {
     assert_eq!((moe.num_experts, moe.experts_per_token), (8, 2));
     assert!(!moe.norm_topk_prob && cfg.qk_norm && cfg.rope_scaling.is_none());
 
-    let reqs: Vec<String> =
-        OlmoeExecutor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default())
-            .iter()
-            .map(|r| format!("{} {}", r.op, r.config))
-            .collect();
+    let reqs: Vec<String> = executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default())
+        .iter()
+        .map(|r| format!("{} {}", r.op, r.config))
+        .collect();
     for want in [
         "rmsnorm dim=64 dtype=bf16",
         "gemm n=8 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
@@ -2210,6 +2213,111 @@ fn cpu_trace_recomputes_exactly() {
     assert!(exec.take_trace().is_empty());
 }
 
+/// Tracing works for every family (Phase 2m S-3): the tiny OLMoE on the CPU provider with
+/// tracing on records, for one 5-token prefill, `embed`, then per layer the attention outputs
+/// with the full Q/K norms and the MoE block's router logits and output, then `final_norm` and
+/// `logits`, each shaped as the op wrote it; the traced logits are bitwise those of the same
+/// prefill untraced. Breaks if a family's executor loses tracing (OLMoE had none before the
+/// shared decoder skeleton), a hook skips a trace point or recording changes an op.
+#[test]
+fn olmoe_trace_records_every_layer() {
+    let tmp = TempDir::new("tiny-model-olmoe-trace");
+    let spec = write_tiny_olmoe(tmp.path(), SEED);
+    let cfg = &spec.config;
+    let moe = cfg.moe.expect("OLMoE has experts");
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = cpu_decoder(&spec, &mem);
+    let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv");
+    let tokens = prompt(spec.vocab)[..5].to_vec();
+    let positions: Vec<u32> = (0..5).collect();
+    let untraced = kv
+        .forward(&mut exec, &tokens, &positions)
+        .expect("untraced prefill")
+        .row(0)
+        .to_vec();
+    assert!(exec.take_trace().is_empty(), "tracing is off by default");
+
+    exec.set_trace(true);
+    // The same prefill again: it rewrites the same K/V slots.
+    let traced = kv
+        .forward(&mut exec, &tokens, &positions)
+        .expect("traced prefill")
+        .row(0)
+        .to_vec();
+    let trace = exec.take_trace();
+    let per_layer = [
+        "attn_norm",
+        "q",
+        "k",
+        "v",
+        "q_norm",
+        "k_norm",
+        "q_rope",
+        "k_rope",
+        "attn",
+        "o_proj",
+        "resid_attn",
+        "mlp_norm",
+        "router_logits",
+        "moe_out",
+        "resid_mlp",
+    ];
+    let layers = cfg.num_layers as usize;
+    let mut want: Vec<(Option<usize>, &str)> = vec![(None, "embed")];
+    for layer in 0..layers {
+        want.extend(per_layer.iter().map(|&name| (Some(layer), name)));
+    }
+    want.extend([(None, "final_norm"), (None, "logits")]);
+    let got: Vec<(Option<usize>, &str)> = trace.iter().map(|t| (t.layer, t.name)).collect();
+    assert_eq!(got, want);
+
+    let hidden = cfg.hidden as usize;
+    let q_dim = (cfg.num_attention_heads * cfg.head_dim) as usize;
+    let kv_dim = (cfg.num_kv_heads * cfg.head_dim) as usize;
+    for t in &trace {
+        let cols = match t.name {
+            "q" | "q_norm" | "q_rope" | "attn" => q_dim,
+            "k" | "v" | "k_norm" | "k_rope" => kv_dim,
+            "router_logits" => moe.num_experts as usize,
+            "logits" => spec.vocab as usize,
+            _ => hidden,
+        };
+        let rows = if matches!(t.name, "final_norm" | "logits") {
+            1
+        } else {
+            5
+        };
+        assert_eq!(t.shape, [rows, cols], "{:?} {}", t.layer, t.name);
+        assert_eq!(t.data.len(), rows * cols, "{:?} {}", t.layer, t.name);
+    }
+    // Q/K norm rewrote the projections in place: the recorded rows differ.
+    for (before, after) in [("q", "q_norm"), ("k", "k_norm")] {
+        let get = |name: &str| {
+            trace
+                .iter()
+                .find(|t| t.layer == Some(0) && t.name == name)
+                .map(|t| t.data.clone())
+                .expect("recorded")
+        };
+        assert_ne!(get(before), get(after), "{after} changed nothing");
+    }
+    let last = trace.last().expect("logits recorded");
+    assert_eq!(last.data, traced);
+    let bitwise = traced
+        .iter()
+        .zip(&untraced)
+        .all(|(a, b)| a.to_bits() == b.to_bits());
+    assert!(
+        bitwise,
+        "tracing changed the logits by up to {}",
+        max_abs_diff(&traced, &untraced)
+    );
+
+    exec.set_trace(false);
+    kv.forward(&mut exec, &tokens, &positions).expect("prefill");
+    assert!(exec.take_trace().is_empty());
+}
+
 /// Lab diagnostic (precision investigation): HIP vs cpu-reference on the head_dim-128 tiny
 /// checkpoint op by op for the prefill and 3 decode steps (accumulated divergence), then every
 /// HIP op recomputed on the host from the HIP trace's own inputs (the error each op adds).
@@ -2806,36 +2914,12 @@ fn check_launch_ahead(
 
 // ------------------------------------------------------------------------ op profile (P2c S-2)
 
-/// The profile switches both executors carry, so one test body drives either.
-trait Profiled: ModelExecutor {
-    fn set_profile(&mut self, on: bool);
-    fn take_profile(&mut self) -> OpProfile;
-}
-
-impl Profiled for LlamaExecutor {
-    fn set_profile(&mut self, on: bool) {
-        LlamaExecutor::set_profile(self, on);
-    }
-    fn take_profile(&mut self) -> OpProfile {
-        LlamaExecutor::take_profile(self)
-    }
-}
-
-impl Profiled for OlmoeExecutor {
-    fn set_profile(&mut self, on: bool) {
-        OlmoeExecutor::set_profile(self, on);
-    }
-    fn take_profile(&mut self) -> OpProfile {
-        OlmoeExecutor::take_profile(self)
-    }
-}
-
-/// A tiny checkpoint's concrete executor on the CPU provider (batches of up to
-/// [`MAX_SEQ_LEN`] tokens and [`MAX_SEQS`] sequences), and the registry it runs on.
+/// A tiny checkpoint's decoder executor on the CPU provider with the default options (batches
+/// of up to [`MAX_SEQ_LEN`] tokens and [`MAX_SEQS`] sequences), and the registry it runs on.
 fn cpu_profiled(
     spec: &TinySpec,
     mem: &Arc<dyn DeviceMemory>,
-) -> (Box<dyn Profiled>, Arc<KernelRegistry>) {
+) -> (DecoderExecutor, Arc<KernelRegistry>) {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
     let slots = cfg.family.0.weight_slots(cfg);
@@ -2850,36 +2934,35 @@ fn cpu_profiled(
         KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
             .expect("every op has a provider"),
     );
-    let mem = Arc::clone(mem);
-    let exec: Box<dyn Profiled> = match cfg.family.0.name() {
-        "llama" => Box::new(
-            LlamaExecutor::new(
-                cfg,
-                weights,
-                Arc::clone(&registry),
-                mem,
-                BLOCK_TOKENS,
-                MAX_SEQ_LEN,
-                MAX_SEQS,
-                opts,
-            )
-            .expect("llama executor"),
-        ),
-        _ => Box::new(
-            OlmoeExecutor::new(
-                cfg,
-                weights,
-                Arc::clone(&registry),
-                mem,
-                BLOCK_TOKENS,
-                MAX_SEQ_LEN,
-                MAX_SEQS,
-                opts,
-            )
-            .expect("olmoe executor"),
-        ),
-    };
+    let exec = DecoderExecutor::new(
+        cfg,
+        decoder_spec(cfg),
+        weights,
+        Arc::clone(&registry),
+        Arc::clone(mem),
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: MAX_SEQ_LEN,
+            max_seqs: MAX_SEQS,
+        },
+        opts,
+    )
+    .expect("decoder executor");
     (exec, registry)
+}
+
+/// [`cpu_profiled`]'s executor alone.
+fn cpu_decoder(spec: &TinySpec, mem: &Arc<dyn DeviceMemory>) -> DecoderExecutor {
+    cpu_profiled(spec, mem).0
+}
+
+/// The decoder spec of a tiny checkpoint's family.
+fn decoder_spec(cfg: &ModelArchConfig) -> DecoderSpec {
+    match cfg.family.0.name() {
+        "llama" => families::llama::decoder_spec(),
+        "olmoe" => families::olmoe::decoder_spec(),
+        other => panic!("no tiny decoder spec for family {other}"),
+    }
 }
 
 /// For both tiny checkpoints on the CPU provider, a decode forward of 3 sequences with profile
@@ -2908,7 +2991,7 @@ fn op_profile_accounts_forward() {
             let tokens: Vec<u32> = (0..PROMPT)
                 .map(|i| (i * 13 + 5 * s as u32 + 1) % spec.vocab)
                 .collect();
-            run_seq(exec.as_mut(), &kv, table, &tokens, 0);
+            run_seq(&mut exec, &kv, table, &tokens, 0);
         }
         // The same decode step twice (it rewrites the same K/V slot): profile off, then on.
         let tokens = [3u32, 7, 11];

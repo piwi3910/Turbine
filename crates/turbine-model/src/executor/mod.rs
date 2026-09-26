@@ -14,17 +14,18 @@ use crate::config::ModelArchConfig;
 use crate::loader::LoadedWeights;
 
 pub mod batch;
+pub mod decoder;
 pub mod graphs;
-pub mod llama;
 pub mod logits;
-pub mod olmoe;
 pub mod profile;
 pub mod rope;
 
 pub use batch::SequenceKv;
+pub use decoder::{
+    AttentionHook, DecoderDims, DecoderExecutor, DecoderSpec, FfnHook, HookBuffers, HookWeights,
+    LayerRun, TraceTensor,
+};
 pub use graphs::{DecodeGraphs, GraphBackend, GraphCache, GraphCounters, GraphKey, GraphStep};
-pub use llama::{LlamaExecutor, TraceTensor};
-pub use olmoe::OlmoeExecutor;
 pub use profile::{OpProfile, OpProfileEntry};
 
 /// How an executor runs its forward pass (Phase 2c). `Default` is what the server runs with
