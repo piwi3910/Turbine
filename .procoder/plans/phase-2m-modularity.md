@@ -640,12 +640,17 @@ Interfaces:
 Lane: —. Depends on: Task 15.
 Covers: S-12 AC.
 
-- [ ] Write failing test `turbine-model --test docs_extending docs_extending_pages_exist` (eight pages exist under `docs/extending/`, each with the four sections, each naming a registry file and a conformance test that exist). Run: `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect FAIL (no pages)
-- [ ] Write the eight pages and the index; update `AGENTS.md`.
-- [ ] Demonstrate: on a throwaway branch `p2m-demo`, follow only `scheduling-policy.md` and `logits-processor.md` to add a toy policy `fifo` (arrival order, no priority) and a toy processor `ban_token_zero`; run `scripts/remote-cargo.sh test -p turbine-scheduler registry_conformance && scripts/remote-cargo.sh test -p turbine-model registry_conformance` — expect PASS; record the commit hash in the PR description, then delete the branch.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect PASS
-- [ ] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
-- [ ] Commit: `docs: extending turbine, one page per extension point`
+- [x] Write failing test `turbine-model --test docs_extending docs_extending_pages_exist` (eight pages exist under `docs/extending/`, each with the four sections, each naming a registry file and a conformance test that exist). Run: `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect FAIL (no pages)
+- [x] Write the eight pages and the index; update `AGENTS.md`.
+- [x] Demonstrate: on a throwaway branch `p2m-demo`, follow only `scheduling-policy.md` and `logits-processor.md` to add a toy policy `fifo` (arrival order, no priority) and a toy processor `ban_token_zero`; run `scripts/remote-cargo.sh test -p turbine-scheduler registry_conformance && scripts/remote-cargo.sh test -p turbine-model registry_conformance` — expect PASS; record the commit hash in the PR description, then delete the branch.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect PASS
+- [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
+- [x] Commit: `docs: extending turbine, one page per extension point`
+
+Build notes (coordinator, 2026-09-27):
+
+- The pages, the index, `docs_extending_pages_exist` (plus `docs_checker_rejects_what_does_not_exist`) and the AGENTS.md pointer were written by the Task 16 agent, which stopped before committing; the coordinator ran the test (2 passed), the gate, and committed `0371634` (landed as `8649aaf`).
+- Demonstration: a fresh agent (no plan or spec, only `docs/extending/README.md`, `scheduling-policy.md`, `logits-processor.md`) added a toy `fifo` policy and a toy `ban_token_zero` processor on the throwaway branch `p2m-demo` (`0c98f5c`, deleted afterwards): `scripts/remote-cargo.sh test -p turbine-scheduler registry_conformance` 1 passed, `-p turbine-model registry_conformance` 4 passed. Gaps it reported and fixed in the pages: a dead `use std::time::Duration;` in the `fifo` skeleton, the `registries.rs` assertion update now a numbered step, and "run `cargo fmt --all`" after adding the file.
 
 ## Task 17: Final verification and acceptance evidence
 

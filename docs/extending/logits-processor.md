@@ -54,11 +54,16 @@ impl LogitsProcessor for BanTokenZero {
 
 2. The request field it reads, when no existing one fits: a field of `SamplingParams` in `crates/turbine-core/src/request.rs` (with its neutral value in `Default`), the same field on `ProcessorParams` and in `ProcessorParams::new` (`crates/turbine-model/src/sampling/mod.rs`), and — to expose it over HTTP — the request body field and its validation in `crates/turbine-api/src/openai/request.rs` plus the mapping into `SamplingParams` in `crates/turbine-server/src/backend.rs`. Struct literals that list every `SamplingParams` field fail to compile until you add yours (e.g. `device_eligibility_matches_main` in `crates/turbine-model/src/sampling/tests.rs`); give them the neutral value.
 
+Run `cargo fmt --all` after adding the file: the skeleton above is not rustfmt-formatted.
+
 ## Registry entry
 
 In `crates/turbine-model/src/sampling/mod.rs`: `mod <name>;` and `pub use <name>::<Type>;` inside `pub mod processors`, and `&processors::<Type>` in the `PROCESSORS` list **at its place in the chain** — the list order is the application order. Put a processor that removes candidates before `grammar_mask` (the mask must stay last so it wins over every bias).
 
-Then update the pinned chain in `crates/turbine-model/src/registries.rs` (`registry_conformance::logits_processors`: the names in chain order, and the assertion that today no processor is device-capable and each needs the full row — relax it to what is true with yours).
+Then update two assertions in `crates/turbine-model/src/registries.rs` (`registry_conformance::logits_processors`):
+
+1. the pinned list of names, in chain order, with yours at its position;
+2. the assertion that every processor is host-only and needs the full row — relax it to what is true once yours is registered (e.g. a processor with `needs_full_row() == false`).
 
 ## Conformance suite
 

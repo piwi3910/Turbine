@@ -22,7 +22,6 @@ One file: `crates/turbine-scheduler/src/policy/<name>.rs` (see `crates/turbine-s
 
 ```rust
 //! `fifo`: arrival order, priorities ignored; the latest admission is preempted first.
-use std::time::Duration;
 
 use turbine_core::registry::Module;
 use turbine_core::types::{Priority, RequestId};
@@ -54,6 +53,8 @@ impl SchedulingPolicy for FifoPolicy {
     }
 }
 ```
+
+Run `cargo fmt --all` after adding the file: the skeleton above is not rustfmt-formatted.
 
 ## Registry entry
 
