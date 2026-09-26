@@ -289,3 +289,10 @@
 - Raise the bound to 0.2
 
 **Answers (2026-09-26):** golden reference = FP32-final-logit HF reference; bound = 0.15 for candidates with reference logprob > −2 and 0.55 for tail candidates (< −2); CPU reference attention rounds softmax probabilities to BF16 like CK/HF sdpa, tiny HIP-vs-CPU test keeps a tight bound.
+
+## Merge Phase 1 into main and push main to github.com/piwi3910/Turbine (public)?
+
+- Yes: fast-forward main to phase-1-single-request and push main (recommended)
+- Merge locally only, no push yet
+
+**Answer (2026-09-26):** merge and push — fast-forward main to phase-1-single-request and push main to origin.
