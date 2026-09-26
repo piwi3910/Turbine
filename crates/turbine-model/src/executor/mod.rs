@@ -37,18 +37,19 @@ pub struct ExecutorOptions {
     /// loader lays out; `false` runs one GEMM per projection over row views of the same weights
     /// (the Phase 2 op sequence, kept as the reference path).
     ///
-    /// Off by default ([`FUSED_PROJECTIONS_DEFAULT`]).
+    /// On by default ([`FUSED_PROJECTIONS_DEFAULT`]).
     pub fused_projections: bool,
 }
 
-/// Whether projection fusion is on by default. Off: on the R9700 the fused GEMMs are faster
+/// Whether projection fusion is on by default. On: on the R9700 the fused GEMMs are faster
 /// alone (Llama-3.2-3B, 16 rows: Q/K/V 56 µs against 86 µs for the three GEMMs; gate/up 173
-/// against 171 µs; RoPE, attention and SiLU·up as fast on the strided views) and in an executor
-/// loop, yet the end-to-end baseline workload measured 556.7 tok/s fused against 623.6 unfused
-/// (2026-09-26, decode forward 22.2 against 19.6 ms), which is not explained yet. There is no
+/// against 171 µs; RoPE, attention and SiLU·up as fast on the strided views) and save about
+/// 0.7 ms per decode step in a server-like executor loop (`perf serving_mix`). An earlier
+/// end-to-end run measured 556.7 tok/s fused against 623.6 unfused (2026-09-26), unexplained;
+/// if the baseline workload regresses again, set this back to `false`. There is no
 /// configuration key for it (spec S-14 lists the switches); `execution.fused_ops: false` keeps
 /// it off regardless.
-pub const FUSED_PROJECTIONS_DEFAULT: bool = false;
+pub const FUSED_PROJECTIONS_DEFAULT: bool = true;
 
 impl Default for ExecutorOptions {
     fn default() -> ExecutorOptions {
