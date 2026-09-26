@@ -34,7 +34,7 @@ use crate::config::ModelArchConfig;
 use crate::loader::{LM_HEAD, LoadedWeights};
 
 /// Weights, activations and KV are BF16; logits are F32.
-const ACT: DType = DType::BF16;
+pub(super) const ACT: DType = DType::BF16;
 
 /// Model dimensions in elements.
 #[derive(Clone, Copy)]
@@ -66,7 +66,7 @@ impl Dims {
 }
 
 /// `c = a · wᵀ` for an HF Linear weight `w` of `[n, k]`.
-fn gemm_cfg(n: usize, k: usize, c_dtype: DType) -> GemmConfig {
+pub(super) fn gemm_cfg(n: usize, k: usize, c_dtype: DType) -> GemmConfig {
     GemmConfig {
         n: n as u64,
         k: k as u64,
@@ -78,7 +78,11 @@ fn gemm_cfg(n: usize, k: usize, c_dtype: DType) -> GemmConfig {
 }
 
 /// Paged causal GQA attention over blocks of `block_tokens` tokens.
-fn attention_cfg(cfg: &ModelArchConfig, kind: AttentionKind, block_tokens: u32) -> AttentionConfig {
+pub(super) fn attention_cfg(
+    cfg: &ModelArchConfig,
+    kind: AttentionKind,
+    block_tokens: u32,
+) -> AttentionConfig {
     AttentionConfig {
         kind,
         num_q_heads: cfg.num_attention_heads,
@@ -90,7 +94,7 @@ fn attention_cfg(cfg: &ModelArchConfig, kind: AttentionKind, block_tokens: u32) 
     }
 }
 
-fn rope_cfg(cfg: &ModelArchConfig) -> RopeConfig {
+pub(super) fn rope_cfg(cfg: &ModelArchConfig) -> RopeConfig {
     RopeConfig {
         num_q_heads: cfg.num_attention_heads,
         num_kv_heads: cfg.num_kv_heads,
@@ -122,9 +126,9 @@ fn activation_cfg(d: &Dims) -> ActivationConfig {
     }
 }
 
-const ADD_CFG: ElementwiseConfig = ElementwiseConfig { dtype: ACT };
+pub(super) const ADD_CFG: ElementwiseConfig = ElementwiseConfig { dtype: ACT };
 
-fn invalid(message: String) -> ModelError {
+pub(super) fn invalid(message: String) -> ModelError {
     ModelError::Kernel(KernelError::InvalidArgument { message })
 }
 
@@ -218,7 +222,7 @@ pub struct LlamaExecutor {
     trace: RefCell<Option<Vec<TraceTensor>>>,
 }
 
-fn limits(
+pub(super) fn limits(
     cfg: &ModelArchConfig,
     block_tokens: u32,
     max_batch_tokens: u32,

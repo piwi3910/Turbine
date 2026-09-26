@@ -1,17 +1,87 @@
 //! Model executors: the forward pass over kernel-registry ops (TS §6). Phase 2: ragged batches
 //! of sequences whose KV lives in the paged L0 block pool (`KvPoolView`), one FP32 logits row
 //! per sequence and one device-to-host copy per iteration (P2 S-5, S-9).
+use std::sync::Arc;
+
 use turbine_core::types::{BlockId, KvLayout, ModelShape, SeqId};
-use turbine_tensor::KvPoolView;
+use turbine_kernels::{KernelRegistry, OpRequirement};
+use turbine_tensor::{DeviceMemory, KvPoolView};
 
 use crate::ModelError;
+use crate::config::{Architecture, ModelArchConfig};
+use crate::loader::LoadedWeights;
 
 pub mod batch;
 pub mod llama;
+pub mod olmoe;
 pub mod rope;
 
 pub use batch::SequenceKv;
 pub use llama::{LlamaExecutor, TraceTensor};
+pub use olmoe::OlmoeExecutor;
+
+/// The op requirements of `cfg`'s architecture over KV blocks of `block_tokens` tokens
+/// ([`LlamaExecutor::requirements`] or [`OlmoeExecutor::requirements`]): the registry the
+/// executor runs on is built from this list.
+pub fn requirements(cfg: &ModelArchConfig, block_tokens: u32) -> Vec<OpRequirement> {
+    match cfg.architecture {
+        Architecture::Llama => LlamaExecutor::requirements(cfg, block_tokens),
+        Architecture::Olmoe => OlmoeExecutor::requirements(cfg, block_tokens),
+    }
+}
+
+/// Device bytes of the executor's buffers for `cfg`'s architecture (the budget's workspace
+/// term): [`LlamaExecutor::workspace_bytes`] or [`OlmoeExecutor::workspace_bytes`].
+pub fn workspace_bytes(
+    cfg: &ModelArchConfig,
+    block_tokens: u32,
+    max_batch_tokens: u32,
+    max_seqs: u32,
+) -> u64 {
+    match cfg.architecture {
+        Architecture::Llama => {
+            LlamaExecutor::workspace_bytes(cfg, block_tokens, max_batch_tokens, max_seqs)
+        }
+        Architecture::Olmoe => {
+            OlmoeExecutor::workspace_bytes(cfg, block_tokens, max_batch_tokens, max_seqs)
+        }
+    }
+}
+
+/// The executor of `cfg`'s architecture over `weights`, for ragged batches of up to
+/// `max_batch_tokens` tokens and `max_seqs` sequences whose KV pool is laid out as
+/// `cfg.kv_layout(block_tokens)`. `registry` must have been built from [`requirements`] of
+/// `cfg` and `block_tokens`.
+pub fn build_executor(
+    cfg: &ModelArchConfig,
+    weights: LoadedWeights,
+    registry: Arc<KernelRegistry>,
+    mem: Arc<dyn DeviceMemory>,
+    block_tokens: u32,
+    max_batch_tokens: u32,
+    max_seqs: u32,
+) -> Result<Box<dyn ModelExecutor>, ModelError> {
+    Ok(match cfg.architecture {
+        Architecture::Llama => Box::new(LlamaExecutor::new(
+            cfg,
+            weights,
+            registry,
+            mem,
+            block_tokens,
+            max_batch_tokens,
+            max_seqs,
+        )?),
+        Architecture::Olmoe => Box::new(OlmoeExecutor::new(
+            cfg,
+            weights,
+            registry,
+            mem,
+            block_tokens,
+            max_batch_tokens,
+            max_seqs,
+        )?),
+    })
+}
 
 /// One sequence of a ragged batch: its new tokens are `tokens[q_start..q_start + q_len]` of the
 /// [`BatchInput`], at positions `kv_len − q_len .. kv_len`.

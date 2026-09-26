@@ -1,27 +1,30 @@
-//! The Llama executor on the tiny synthetic checkpoint (P1 S-8, S-12): the `cpu-reference`
-//! provider against an independent naive implementation, and (lab only) the HIP provider
-//! against the CPU provider.
+//! The executors on the tiny synthetic checkpoints (P1 S-8, S-12; P2 S-4, S-5, S-9, S-16): the
+//! `cpu-reference` provider against an independent naive implementation (Llama and OLMoE),
+//! chunked prefill and batched paged decoding against unchunked single-sequence runs, and (lab
+//! only) the HIP provider against the CPU provider.
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use half::bf16;
-use turbine_core::types::{BlockId, SeqId};
-use turbine_core::types::{DeviceId, ExecutionBackend, Vendor};
+use turbine_core::types::{BlockId, DeviceId, ExecutionBackend, KvLayout, SeqId, Vendor};
 use turbine_kernels::{
     KernelError, KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider,
     shim_provider,
 };
-use turbine_model::config::{ModelArchConfig, RopeScaling};
+use turbine_model::config::{Architecture, ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
-    BatchInput, LlamaExecutor, Logits, ModelExecutor, SeqSlice, SequenceKv, TraceTensor,
+    self, BatchInput, LlamaExecutor, Logits, ModelExecutor, OlmoeExecutor, SeqSlice, SequenceKv,
+    TraceTensor, build_executor,
 };
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
-    TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with,
+    TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
 };
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
-use turbine_model::{MAX_STAGING_BYTES, ModelError, SafetensorsIndex, WeightLoader, llama_slots};
+use turbine_model::{
+    MAX_STAGING_BYTES, ModelError, SafetensorsIndex, WeightLoader, llama_slots, olmoe_slots,
+};
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView};
@@ -158,6 +161,12 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 // RoPE (cos, sin, each product and each sum), the unnormalised attention probabilities fed to
 // P·V (CK FMHA / PyTorch CPU flash attention), attention output, silu(gate) and silu·up, and
 // each residual sum. Logits stay f32.
+//
+// OLMoE (transformers `OlmoeSparseMoeBlock`): RMSNorm over the full Q and K projections before
+// RoPE; the router logits stay f32 (the executor's router GEMM has F32 output), softmax in f32,
+// top-k with ties to the lower expert id, weights renormalised only with `norm_topk_prob`, then
+// cast to BF16; each selected expert's SwiGLU output times its weight is rounded to BF16 and
+// added in ascending expert order into a BF16 zero accumulator (`index_add_`).
 
 fn bf(v: f32) -> f32 {
     bf16::from_f32(v).to_f32()
@@ -167,6 +176,10 @@ struct Naive {
     cfg: ModelArchConfig,
     w: HashMap<String, Vec<f32>>,
     inv_freq: Vec<f32>,
+    /// Q/K norm (OLMoE); from the config, flipped only by the mutation checks.
+    qk_norm: bool,
+    /// Renormalise the selected routing weights (`norm_topk_prob`); likewise.
+    renormalize: bool,
 }
 
 impl Naive {
@@ -187,6 +200,8 @@ impl Naive {
             cfg: cfg.clone(),
             w,
             inv_freq: naive_inv_freq(cfg),
+            qk_norm: cfg.qk_norm,
+            renormalize: cfg.moe.is_some_and(|m| m.norm_topk_prob),
         }
     }
 
@@ -290,12 +305,74 @@ impl Naive {
         out.into_iter().map(bf).collect()
     }
 
+    /// `down(silu(gate(h)) · up(h))` for rows `h` of `hidden`; `gate`/`up` are
+    /// `[inter, hidden]`, `down` is `[hidden, inter]`.
+    fn swiglu(&self, h: &[f32], gate: &[f32], up: &[f32], down: &[f32]) -> Vec<f32> {
+        let hidden = self.cfg.hidden as usize;
+        let inter = gate.len() / hidden;
+        let g = Naive::linear_bf(h, gate, hidden);
+        let u = Naive::linear_bf(h, up, hidden);
+        let act: Vec<f32> = g
+            .iter()
+            .zip(&u)
+            .map(|(g, u)| bf(bf(g / (1.0 + (-g).exp())) * u))
+            .collect();
+        Naive::linear_bf(&act, down, inter)
+    }
+
+    /// The sparse MoE block of layer prefix `p` over rows `h`.
+    fn moe(&self, h: &[f32], p: &str) -> Vec<f32> {
+        let hidden = self.cfg.hidden as usize;
+        let moe = self.cfg.moe.expect("an OLMoE config");
+        let (experts, top_k) = (moe.num_experts as usize, moe.experts_per_token as usize);
+        let router = self.get(&format!("{p}.mlp.gate.weight"));
+        let mut out = Vec::with_capacity(h.len());
+        for row in h.chunks_exact(hidden) {
+            let logits = Naive::linear(row, router, hidden);
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+            // Top-k by selection: the largest remaining probability, the lower id on ties.
+            let mut chosen: Vec<usize> = Vec::with_capacity(top_k);
+            for _ in 0..top_k {
+                let best = (0..experts)
+                    .filter(|e| !chosen.contains(e))
+                    .reduce(|a, b| if probs[b] > probs[a] { b } else { a })
+                    .expect("top_k <= experts");
+                chosen.push(best);
+            }
+            let total: f32 = chosen.iter().map(|&e| probs[e]).sum();
+            let mut acc = vec![0f32; hidden];
+            let mut by_expert = chosen.clone();
+            by_expert.sort_unstable();
+            for e in by_expert {
+                let weight = if self.renormalize {
+                    probs[e] / total
+                } else {
+                    probs[e]
+                };
+                let x = format!("{p}.mlp.experts.{e}");
+                let y = self.swiglu(
+                    row,
+                    self.get(&format!("{x}.gate_proj.weight")),
+                    self.get(&format!("{x}.up_proj.weight")),
+                    self.get(&format!("{x}.down_proj.weight")),
+                );
+                for (a, y) in acc.iter_mut().zip(y) {
+                    *a = bf(*a + bf(y * bf(weight)));
+                }
+            }
+            out.extend(acc);
+        }
+        out
+    }
+
     /// Logits of the last position of `tokens` (positions 0..len).
     fn logits(&self, tokens: &[u32]) -> Vec<f32> {
         let c = &self.cfg;
         let hidden = c.hidden as usize;
         let q_dim = c.num_attention_heads as usize * c.head_dim as usize;
-        let inter = c.intermediate as usize;
         let t = tokens.len();
         let embed = self.get("model.embed_tokens.weight");
         let mut x: Vec<f32> = tokens
@@ -309,20 +386,21 @@ impl Naive {
             let mut q = Naive::linear_bf(&h, w("self_attn.q_proj"), hidden);
             let mut k = Naive::linear_bf(&h, w("self_attn.k_proj"), hidden);
             let v = Naive::linear_bf(&h, w("self_attn.v_proj"), hidden);
+            if self.qk_norm {
+                q = self.rmsnorm(&q, w("self_attn.q_norm"));
+                k = self.rmsnorm(&k, w("self_attn.k_norm"));
+            }
             self.rope(&mut q, c.num_attention_heads as usize);
             self.rope(&mut k, c.num_kv_heads as usize);
             let attn = self.attention(&q, &k, &v, t);
             let o = Naive::linear_bf(&attn, w("self_attn.o_proj"), q_dim);
             x = x.iter().zip(&o).map(|(a, b)| bf(a + b)).collect();
             let h = self.rmsnorm(&x, w("post_attention_layernorm"));
-            let gate = Naive::linear_bf(&h, w("mlp.gate_proj"), hidden);
-            let up = Naive::linear_bf(&h, w("mlp.up_proj"), hidden);
-            let act: Vec<f32> = gate
-                .iter()
-                .zip(&up)
-                .map(|(g, u)| bf(bf(g / (1.0 + (-g).exp())) * u))
-                .collect();
-            let down = Naive::linear_bf(&act, w("mlp.down_proj"), inter);
+            let down = if c.moe.is_some() {
+                self.moe(&h, &p)
+            } else {
+                self.swiglu(&h, w("mlp.gate_proj"), w("mlp.up_proj"), w("mlp.down_proj"))
+            };
             x = x.iter().zip(&down).map(|(a, b)| bf(a + b)).collect();
         }
         let last = self.rmsnorm(&x[(t - 1) * hidden..], self.get("model.norm.weight"));
@@ -335,7 +413,8 @@ impl Naive {
     }
 }
 
-/// transformers `_compute_llama3_parameters`, written out independently in f64.
+/// transformers `_compute_llama3_parameters` (or the plain `theta^(-2i/d)` without scaling,
+/// OLMoE), written out independently in f64.
 fn naive_inv_freq(cfg: &ModelArchConfig) -> Vec<f32> {
     let d = f64::from(cfg.head_dim);
     let Some(RopeScaling::Llama3 {
@@ -345,7 +424,10 @@ fn naive_inv_freq(cfg: &ModelArchConfig) -> Vec<f32> {
         original_max_position_embeddings,
     }) = cfg.rope_scaling
     else {
-        panic!("the tiny checkpoint uses llama3 rope scaling");
+        assert!(cfg.rope_scaling.is_none(), "unknown rope scaling");
+        return (0..cfg.head_dim / 2)
+            .map(|i| cfg.rope_theta.powf(-(2.0 * f64::from(i)) / d) as f32)
+            .collect();
     };
     let old = f64::from(original_max_position_embeddings);
     (0..cfg.head_dim / 2)
@@ -590,15 +672,14 @@ fn requirements_and_workspace() {
     assert_eq!(ws(1, 1) - per_token - (ws(1, 2) - ws(1, 1)), 4 + 4 * 8);
 }
 
-/// One pool shared by the paged tests: `blocks` blocks of the executor's layout.
-fn pool(mem: &Arc<dyn DeviceMemory>, exec: &LlamaExecutor, blocks: u32) -> DeviceBuffer {
-    let layout = exec.kv_layout();
+/// One pool shared by the paged tests: `blocks` blocks of `layout`.
+fn pool(mem: &Arc<dyn DeviceMemory>, layout: &KvLayout, blocks: u32) -> DeviceBuffer {
     let bytes = layout.block_bytes() * u64::from(blocks);
     DeviceBuffer::alloc(mem, bytes as usize).expect("pool")
 }
 
-fn pool_view<'a>(storage: &'a DeviceBuffer, exec: &LlamaExecutor, blocks: u32) -> KvPoolView<'a> {
-    let layout = *exec.kv_layout();
+fn pool_view<'a>(storage: &'a DeviceBuffer, layout: &KvLayout, blocks: u32) -> KvPoolView<'a> {
+    let layout = *layout;
     KvPoolView {
         storage,
         layout,
@@ -633,10 +714,10 @@ fn paged_llama_single_sequence() {
     // The same executor on a 12-block pool; the sequence owns blocks 9, 2 and 7 then 4, in
     // that order, and the other blocks hold unrelated K/V that must not be read.
     let Single { exec, .. } = &mut single;
-    let storage = pool(&mem, exec, 12);
+    let storage = pool(&mem, exec.kv_layout(), 12);
     let noise: Vec<u8> = (0..storage.len()).map(|i| (i * 7 % 251) as u8).collect();
     storage.whole().write_bytes(&noise).expect("fill pool");
-    let kv = pool_view(&storage, exec, 12);
+    let kv = pool_view(&storage, exec.kv_layout(), 12);
     let table = [BlockId(9), BlockId(2), BlockId(7), BlockId(4)];
     let run = |exec: &mut LlamaExecutor, tokens: &[u32], start: u32| {
         let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
@@ -697,8 +778,8 @@ fn ragged_batch_rows_match_single_sequences() {
     );
 
     let Single { exec, .. } = &mut single;
-    let storage = pool(&mem, exec, 10);
-    let kv = pool_view(&storage, exec, 10);
+    let storage = pool(&mem, exec.kv_layout(), 10);
+    let kv = pool_view(&storage, exec.kv_layout(), 10);
     let (ta, tb, tc) = (
         [BlockId(3), BlockId(8)],
         [BlockId(0), BlockId(5)],
@@ -789,6 +870,309 @@ fn ragged_batch_rows_match_single_sequences() {
         original, forked,
         "the fork continues exactly like the original"
     );
+}
+
+// ------------------------------------------------------------- OLMoE and both architectures
+
+/// Any tiny checkpoint's executor on the CPU provider, through `build_executor` and the
+/// architecture's requirements, for batches of up to `max_batch_tokens` tokens and
+/// [`MAX_SEQS`] sequences.
+fn cpu_model(
+    spec: &TinySpec,
+    mem: &Arc<dyn DeviceMemory>,
+    max_batch_tokens: u32,
+) -> Box<dyn ModelExecutor> {
+    let cfg = &spec.config;
+    let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+    let slots = match cfg.architecture {
+        Architecture::Llama => llama_slots(cfg),
+        Architecture::Olmoe => olmoe_slots(cfg),
+        other => panic!("no tiny checkpoint for {other:?}"),
+    };
+    let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load");
+    let provider = cpu_reference_provider();
+    let order = [provider.id()];
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let registry = KernelRegistry::build(
+        vec![provider],
+        &order,
+        &executor::requirements(cfg, BLOCK_TOKENS),
+        &metrics,
+    )
+    .expect("every op has a provider");
+    build_executor(
+        cfg,
+        weights,
+        Arc::new(registry),
+        Arc::clone(mem),
+        BLOCK_TOKENS,
+        max_batch_tokens,
+        MAX_SEQS,
+    )
+    .expect("executor")
+}
+
+/// The tiny Llama and the tiny OLMoE checkpoint, in subdirectories of `tmp`.
+fn both_checkpoints(tmp: &TempDir) -> [TinySpec; 2] {
+    [
+        write_tiny_llama(&tmp.path().join("llama"), SEED),
+        write_tiny_olmoe(&tmp.path().join("olmoe"), SEED),
+    ]
+}
+
+/// Runs one sequence's step on `exec`: `tokens` at positions `start..`, K/V in `table`.
+fn run_seq(
+    exec: &mut dyn ModelExecutor,
+    kv: &KvPoolView<'_>,
+    table: &[BlockId],
+    tokens: &[u32],
+    start: u32,
+) -> Vec<f32> {
+    let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
+    let seqs = [SeqSlice {
+        seq: SeqId(1),
+        q_start: 0,
+        q_len: tokens.len() as u32,
+        kv_len: start + tokens.len() as u32,
+        block_table: table,
+    }];
+    let logits = exec
+        .forward(&BatchInput {
+            tokens,
+            positions: &positions,
+            seqs: &seqs,
+            kv,
+        })
+        .expect("forward");
+    assert_eq!(logits.rows, 1);
+    logits.row(0).to_vec()
+}
+
+/// The tiny OLMoE (8 experts, top-2, `norm_topk_prob: false`, Q/K norm) on the CPU provider:
+/// prefill and greedy decode logits within 1e-4 of the naive model, which in turn is far from
+/// the same model without Q/K norm or with renormalised routing weights (so neither can go
+/// missing unnoticed).
+#[test]
+fn olmoe_cpu_forward_matches_naive() {
+    let tmp = TempDir::new("tiny-model-olmoe-naive");
+    let spec = write_tiny_olmoe(tmp.path(), SEED);
+    let cfg = &spec.config;
+    let moe = cfg.moe.expect("OLMoE has experts");
+    assert_eq!((moe.num_experts, moe.experts_per_token), (8, 2));
+    assert!(!moe.norm_topk_prob && cfg.qk_norm && cfg.rope_scaling.is_none());
+
+    let reqs: Vec<String> = OlmoeExecutor::requirements(cfg, BLOCK_TOKENS)
+        .iter()
+        .map(|r| format!("{} {}", r.op, r.config))
+        .collect();
+    for want in [
+        "rmsnorm dim=64 dtype=bf16",
+        "gemm n=8 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
+        "moe_route experts=8 top_k=2 renormalize=0",
+        "moe_experts hidden=64 inter=32 experts=8 top_k=2 local=0..8 dtype=bf16",
+        "gemm n=263 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
+        "rope head_dim=16 rotary_dim=16 q_heads=4 kv_heads=4 dtype=bf16",
+    ] {
+        assert!(reqs.iter().any(|r| r == want), "missing {want}: {reqs:#?}");
+    }
+    assert!(
+        !reqs.iter().any(|r| r.starts_with("silu_mul")),
+        "OLMoE has no dense MLP: {reqs:#?}"
+    );
+
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = cpu_model(&spec, &mem, MAX_SEQ_LEN);
+    assert_eq!(exec.shape().num_experts, 8);
+    let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv");
+    let naive = Naive::load(&spec.dir, cfg);
+
+    let mut tokens = prompt(spec.vocab);
+    let positions: Vec<u32> = (0..tokens.len() as u32).collect();
+    let mut row = kv
+        .forward(exec.as_mut(), &tokens, &positions)
+        .expect("prefill")
+        .row(0)
+        .to_vec();
+    let diff = max_abs_diff(&row, &naive.logits(&tokens));
+    assert!(diff <= 1e-4, "prefill: max abs diff {diff}");
+    for step in 0..10 {
+        let next = argmax(&row);
+        let pos = tokens.len() as u32;
+        tokens.push(next);
+        row = kv
+            .forward(exec.as_mut(), &[next], &[pos])
+            .expect("decode")
+            .row(0)
+            .to_vec();
+        let diff = max_abs_diff(&row, &naive.logits(&tokens));
+        assert!(diff <= 1e-4, "decode step {step}: max abs diff {diff}");
+    }
+
+    let mut without_qk_norm = Naive::load(&spec.dir, cfg);
+    without_qk_norm.qk_norm = false;
+    let diff = max_abs_diff(&row, &without_qk_norm.logits(&tokens));
+    assert!(diff > 1e-3, "Q/K norm changes nothing: {diff}");
+    let mut renormalised = Naive::load(&spec.dir, cfg);
+    renormalised.renormalize = true;
+    let diff = max_abs_diff(&row, &renormalised.logits(&tokens));
+    assert!(diff > 1e-3, "renormalisation changes nothing: {diff}");
+}
+
+/// For both tiny checkpoints, a 300-token prompt prefilled in chunks of 64 (each chunk
+/// attending to the K/V the earlier chunks left in the pool) gives the last-position logits of
+/// a single-chunk prefill within 1e-4.
+#[test]
+fn chunked_prefill_matches_unchunked() {
+    const LONG: u32 = 300;
+    const CHUNK: u32 = 64;
+    let tmp = TempDir::new("tiny-model-chunked");
+    for spec in both_checkpoints(&tmp) {
+        let arch = spec.config.architecture;
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let mut exec = cpu_model(&spec, &mem, LONG);
+        let layout = *exec.kv_layout();
+        let blocks = LONG.div_ceil(BLOCK_TOKENS);
+        let storage = pool(&mem, &layout, 2 * blocks);
+        let kv = pool_view(&storage, &layout, 2 * blocks);
+        // The single chunk uses blocks 0.., the chunked run the other half in reverse order.
+        let whole_table: Vec<BlockId> = (0..blocks).map(BlockId).collect();
+        let chunk_table: Vec<BlockId> = (0..blocks).map(|b| BlockId(2 * blocks - 1 - b)).collect();
+        let prompt: Vec<u32> = (0..LONG).map(|i| (i * 41 + 7) % spec.vocab).collect();
+
+        let whole = run_seq(exec.as_mut(), &kv, &whole_table, &prompt, 0);
+        let mut last = Vec::new();
+        for start in (0..LONG).step_by(CHUNK as usize) {
+            let end = (start + CHUNK).min(LONG);
+            last = run_seq(
+                exec.as_mut(),
+                &kv,
+                &chunk_table,
+                &prompt[start as usize..end as usize],
+                start,
+            );
+        }
+        let diff = max_abs_diff(&last, &whole);
+        assert!(diff <= 1e-4, "{arch:?}: max abs diff {diff}");
+    }
+}
+
+/// For both tiny checkpoints, 4 sequences with prompts of 3, 17, 40 and 65 tokens prefilled as
+/// one ragged batch and decoded together over interleaved blocks of one pool (unused blocks
+/// hold noise) give, per sequence and step, the logits of that sequence run alone on its own
+/// contiguous Phase 1 KV within 1e-4.
+#[test]
+fn paged_matches_contiguous() {
+    const LENS: [u32; 4] = [3, 17, 40, 65];
+    const STEPS: u32 = 6;
+    const MAX_TOKENS: u32 = 128;
+    const POOL_BLOCKS: u32 = 16;
+    let tmp = TempDir::new("tiny-model-paged-contiguous");
+    for spec in both_checkpoints(&tmp) {
+        let arch = spec.config.architecture;
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let prompts: Vec<Vec<u32>> = LENS
+            .iter()
+            .enumerate()
+            .map(|(s, &len)| {
+                (0..len)
+                    .map(|i| (i * 29 + 13 * s as u32 + 1) % spec.vocab)
+                    .collect()
+            })
+            .collect();
+
+        // Reference: each sequence alone, greedy, on its own contiguous KV.
+        let mut single = cpu_model(&spec, &mem, MAX_TOKENS);
+        let mut want: Vec<Vec<Vec<f32>>> = Vec::new();
+        let mut seq_tokens: Vec<Vec<u32>> = Vec::new();
+        for p in &prompts {
+            let mut kv = SequenceKv::new(&mem, *single.kv_layout(), MAX_TOKENS).expect("kv");
+            let positions: Vec<u32> = (0..p.len() as u32).collect();
+            let mut rows = vec![
+                kv.forward(single.as_mut(), p, &positions)
+                    .expect("prefill")
+                    .row(0)
+                    .to_vec(),
+            ];
+            let mut tokens = p.clone();
+            for _ in 0..STEPS {
+                let next = argmax(rows.last().expect("row"));
+                let pos = tokens.len() as u32;
+                tokens.push(next);
+                rows.push(
+                    kv.forward(single.as_mut(), &[next], &[pos])
+                        .expect("decode")
+                        .row(0)
+                        .to_vec(),
+                );
+            }
+            want.push(rows);
+            seq_tokens.push(tokens);
+        }
+
+        // Batched: one pool, blocks handed out round-robin in a scattered order.
+        let mut exec = cpu_model(&spec, &mem, MAX_TOKENS);
+        let layout = *exec.kv_layout();
+        let storage = pool(&mem, &layout, POOL_BLOCKS);
+        let noise: Vec<u8> = (0..storage.len()).map(|i| (i * 13 % 239) as u8).collect();
+        storage.whole().write_bytes(&noise).expect("fill pool");
+        let kv = pool_view(&storage, &layout, POOL_BLOCKS);
+        let need: Vec<usize> = LENS
+            .iter()
+            .map(|&l| (l + STEPS).div_ceil(BLOCK_TOKENS) as usize)
+            .collect();
+        let mut free = (0..POOL_BLOCKS).map(|i| BlockId(i * 5 % POOL_BLOCKS));
+        let mut tables: Vec<Vec<BlockId>> = vec![Vec::new(); LENS.len()];
+        while tables.iter().zip(&need).any(|(t, &n)| t.len() < n) {
+            for (t, &n) in tables.iter_mut().zip(&need) {
+                if t.len() < n {
+                    t.push(free.next().expect("enough blocks"));
+                }
+            }
+        }
+
+        let step =
+            |exec: &mut dyn ModelExecutor, tokens: &[u32], q_lens: &[u32], kv_lens: &[u32]| {
+                let mut positions = Vec::new();
+                let mut seqs = Vec::new();
+                let mut q_start = 0;
+                for s in 0..LENS.len() {
+                    positions.extend(kv_lens[s] - q_lens[s]..kv_lens[s]);
+                    seqs.push(SeqSlice {
+                        seq: SeqId(100 + s as u64),
+                        q_start,
+                        q_len: q_lens[s],
+                        kv_len: kv_lens[s],
+                        block_table: &tables[s],
+                    });
+                    q_start += q_lens[s];
+                }
+                exec.forward(&BatchInput {
+                    tokens,
+                    positions: &positions,
+                    seqs: &seqs,
+                    kv: &kv,
+                })
+                .expect("batched forward")
+            };
+        let tokens: Vec<u32> = prompts.concat();
+        let logits = step(exec.as_mut(), &tokens, &LENS, &LENS);
+        assert_eq!(logits.rows, LENS.len());
+        for (s, rows) in want.iter().enumerate() {
+            let diff = max_abs_diff(logits.row(s), &rows[0]);
+            assert!(diff <= 1e-4, "{arch:?} prefill of sequence {s}: {diff}");
+        }
+        for i in 0..STEPS {
+            let tokens: Vec<u32> = (0..LENS.len())
+                .map(|s| seq_tokens[s][(LENS[s] + i) as usize])
+                .collect();
+            let kv_lens: Vec<u32> = LENS.iter().map(|&l| l + i + 1).collect();
+            let logits = step(exec.as_mut(), &tokens, &[1; 4], &kv_lens);
+            for (s, rows) in want.iter().enumerate() {
+                let diff = max_abs_diff(logits.row(s), &rows[i as usize + 1]);
+                assert!(diff <= 1e-4, "{arch:?} decode {i} of sequence {s}: {diff}");
+            }
+        }
+    }
 }
 
 /// Max |Δ logit| between the HIP and cpu-reference providers on the tiny checkpoint. With the
