@@ -38,3 +38,4 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 |---|---|---|---|---|---|---|---|---|
 | 2026-09-26 | vLLM-ROCm 0.23.0 | reference | 534.9 | 26.5 | 201 | – | – | – |
 | 2026-09-26 | e088bd7 | first OLMoE run on the perf branch: host sampler + 128-token pages (290/0); 200/200 streams ok (no SSE failures) | 290.3 | 52.3 | 407 | 45.5 | 5/16 (known: tolerance to be calibrated, decision 2026-09-26) | – |
+| 2026-09-26 | 870f842 | **OLMoE on GPU 0 at the Llama-parity tip: MoE small-m path, 128-token pages, GPU sampling, fused add+norm/QKV — 108% of vLLM (534.9)**; 200/200 streams ok | **575.4** | 25.1 | 401 | 22.3 | 5/16 (known; calibration pending) | +98% vs e088bd7 |
