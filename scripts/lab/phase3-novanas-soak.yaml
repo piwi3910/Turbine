@@ -1,0 +1,43 @@
+# turbine-server configuration for the Phase 3 overload soak on novanas:
+#   scripts/overload-soak.sh novanas [--duration <dur>] [--model <path>]
+# which serves it through scripts/lab-serve.sh (k3s Job, one R9700, host network, weights
+# mounted read-only at /models). The Phase 2c lab values with the Phase 3 reliability defaults
+# spelled out: the soak judges them, so every verdict records what it ran with. `--model`
+# replaces model.path with `--set`.
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/llama-3.2-3b-instruct
+  served_name: meta-llama/Llama-3.2-3B-Instruct
+execution:
+  backend: hip
+kv:
+  block_tokens: 128
+scheduler:
+  max_running_requests: 64
+  max_batch_tokens: 8192
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 1024
+reliability:
+  enabled: true
+  adaptive_admission: true
+  emergency_vram_reserve: 2GiB
+  memory:
+    workspace_bytes: 1GiB
+    runtime_overhead_bytes: 1GiB
+    host_reserve_bytes: 8GiB
+  telemetry:
+    interval: 100ms
+    vendor_interval: 1s
+  pressure:
+    escalate_samples: 2
+    deescalate_dwell: 10s
+  admission:
+    max_queue: 256
+    queue_timeout: 30s
+  recovery:
+    max_retries: 3
+    backoff: 50ms
+  circuit:
+    cooldown: 30s
+    drain_timeout: 120s

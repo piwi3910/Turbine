@@ -436,7 +436,7 @@ Depends on: Task 14; phase-1 plan (novanas GPU lab path), phase-2b plan (Spark C
 
 ## Task 18: Overload soak script and soak runs
 
-Files: `scripts/overload-soak.sh` (new: precondition → build/start → calibrate → overload → cool-down → verdict → cleanup), `scripts/lab/novanas-soak-job.yaml` (new: k3s Job `turbine-lab-soak`, namespace `turbine-ci`, `amd.com/gpu: 1`, ROCm hostPath `/opt/rocm/rocm`, model read-only), `benches/turbine-bench/tests/lab_scripts.rs` (test `soak_precondition_refuses_busy_gpu`)
+Files: `scripts/overload-soak.sh` (new: precondition → build/start → calibrate → overload → cool-down → verdict → cleanup), `scripts/lab/phase3-novanas-soak.yaml` (new, amended 2026-09-26: the server config the soak serves through `scripts/lab-serve.sh novanas`, whose k3s Job `turbine-lab-serve-<run id>` already is namespace `turbine-ci`, `amd.com/gpu: 1`, ROCm hostPath `/opt/rocm/rocm`, model read-only — instead of a second Job template; the trap stops only that run with `lab-serve.sh novanas --stop <run id>`; the novanas precondition reads amdgpu sysfs `mem_info_vram_used`), `benches/turbine-bench/tests/lab_scripts.rs` (test `soak_precondition_refuses_busy_gpu`)
 Interfaces:
 
 - `scripts/overload-soak.sh <novanas|dgx-spark|dgx-spark2> [--duration <dur>=10m] [--model <path>=/home/piwi/turbine-models/llama-3.2-3b-instruct]`
