@@ -536,7 +536,7 @@ impl EngineLoop {
                 Outcome::Rejected,
                 Some((
                     ErrorCode::QueueTimeout,
-                    "the request waited longer than scheduler.queue_timeout",
+                    "the request waited longer than reliability.admission.queue_timeout",
                 )),
             ),
             CancelReason::RequestTimeout => (

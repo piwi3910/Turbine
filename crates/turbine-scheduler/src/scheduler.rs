@@ -32,7 +32,8 @@ use crate::queue::WaitingQueue;
 use crate::request::{CancelReason, PreemptReason, RequestState, SchedRequest};
 
 /// Scheduler bounds (P2 §Configuration). `max_seq_len` and `queue_timeout` are contract
-/// additions used by the submission checks and rule 1.
+/// additions used by the submission checks and rule 1; from Phase 3 `queue_timeout` is
+/// `reliability.admission.queue_timeout` (CONFLICT C-1).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SchedulerParams {
     pub max_running_requests: u32,
@@ -59,7 +60,7 @@ impl SchedulerParams {
             block_tokens: cfg.kv.block_tokens,
             free_watermark: 0.01,
             max_seq_len,
-            queue_timeout: cfg.scheduler.queue_timeout.0,
+            queue_timeout: cfg.reliability.admission.queue_timeout.0,
         }
     }
 }

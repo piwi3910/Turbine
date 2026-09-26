@@ -33,4 +33,7 @@ scheduler:
   max_batch_tokens: 2048
   prefill_chunk_tokens: 2048
   max_queued_requests: 256
-  queue_timeout: 60s
+reliability:
+  admission:
+    # The Phase 2 scheduler.queue_timeout (CONFLICT C-1).
+    queue_timeout: 60s

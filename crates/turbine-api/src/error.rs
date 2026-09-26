@@ -176,11 +176,11 @@ impl ApiError {
         )
     }
 
-    /// 503 `service_unavailable`/`queue_timeout`: waited longer than `scheduler.queue_timeout`.
+    /// 503 `service_unavailable`/`queue_timeout`: waited longer than `reliability.admission.queue_timeout`.
     pub fn queue_timeout() -> Self {
         Self::from_code(
             ErrorCode::QueueTimeout,
-            "the request waited longer than scheduler.queue_timeout before it could start",
+            "the request waited longer than reliability.admission.queue_timeout before it could start",
         )
     }
 

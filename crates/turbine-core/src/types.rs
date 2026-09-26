@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::pressure::{CircuitState, PressureSignal, PressureState};
+
 /// Global device index: the Phase 0 inventory index, stable for the process lifetime.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 #[serde(transparent)]

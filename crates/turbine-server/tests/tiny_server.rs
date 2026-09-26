@@ -93,8 +93,8 @@ fn config_yaml_with(
 ) -> String {
     format!(
         "model:\n  path: {}\n{model_extra}server:\n  listen: {addr}\n{server_extra}execution:\n  \
-         backend: cpu\n{execution_extra}reliability:\n  emergency_vram_reserve: 1MiB\nkv:\n  \
-         gpu:\n    max_bytes: {kv_bytes}\n{extra}",
+         backend: cpu\n{execution_extra}kv:\n  gpu:\n    max_bytes: {kv_bytes}\nreliability:\n  \
+         emergency_vram_reserve: 1MiB\n{extra}",
         model_dir.display()
     )
 }
@@ -1475,9 +1475,12 @@ fn request_and_queue_timeouts() {
     );
     drop(server);
 
-    // scheduler.queue_timeout: behind the one running slot, a waiting request gets 503.
-    let server =
-        TinyServer::start_long("scheduler:\n  max_running_requests: 1\n  queue_timeout: 1s\n");
+    // reliability.admission.queue_timeout (P3 replaces scheduler.queue_timeout, C-1): behind
+    // the one running slot, a waiting request gets 503. (`extra` lines indented by two spaces
+    // continue the base config's `reliability` section.)
+    let server = TinyServer::start_long(
+        "  admission:\n    queue_timeout: 1s\nscheduler:\n  max_running_requests: 1\n",
+    );
     let held = server.hold_stream();
     let started = Instant::now();
     let resp = server.post(

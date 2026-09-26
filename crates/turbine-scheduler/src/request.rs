@@ -81,7 +81,7 @@ pub enum CancelReason {
     RequestTimeout,
     SlowClient,
     Shutdown,
-    /// Waited longer than `scheduler.queue_timeout` without being admitted (Phase 2 drops it).
+    /// Waited longer than `reliability.admission.queue_timeout` without being admitted (Phase 2 drops it).
     QueueTimeout,
 }
 

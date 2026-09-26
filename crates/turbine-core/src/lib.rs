@@ -2,7 +2,9 @@
 
 pub mod clock;
 pub mod config;
+pub mod pressure;
 pub mod registry;
 pub mod request;
 pub mod support;
+pub mod telemetry;
 pub mod types;
