@@ -150,6 +150,19 @@ fn chunk_content(chunk: &Value, endpoint: EndpointArg) -> Option<&str> {
     (!text.is_empty()).then_some(text)
 }
 
+/// `e` and every `source()` below it, joined by `: ` (reqwest's own message names only the
+/// error kind, e.g. "error decoding response body", and hides the transport cause).
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        text.push_str(": ");
+        text.push_str(&s.to_string());
+        source = s.source();
+    }
+    text
+}
+
 async fn one_request(
     client: &reqwest::Client,
     url: &str,
@@ -163,7 +176,7 @@ async fn one_request(
         .body(body.to_string())
         .send()
         .await
-        .map_err(|e| format!("POST {url}: {e}"))?;
+        .map_err(|e| format!("POST {url}: {}", error_chain(&e)))?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -177,10 +190,13 @@ async fn one_request(
     let mut token_times: Vec<Instant> = Vec::new();
     let mut usage_tokens: Option<u64> = None;
     loop {
-        let chunk = resp
-            .chunk()
-            .await
-            .map_err(|e| format!("reading stream: {e}"))?;
+        let chunk = resp.chunk().await.map_err(|e| {
+            format!(
+                "reading stream after {} content chunks: {}",
+                token_times.len(),
+                error_chain(&e)
+            )
+        })?;
         let Some(bytes) = chunk else {
             return Err("stream ended without [DONE]".to_string());
         };

@@ -2141,3 +2141,128 @@ fn phase2_metrics_and_reasons() {
         );
     }
 }
+
+/// Reads one chunked response body to its terminating chunk as raw bytes, checking the framing
+/// strictly (hex size line, CRLF after every chunk, the `0\r\n\r\n` terminator).
+fn read_chunked_bytes(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        let n = reader
+            .read_line(&mut size_line)
+            .map_err(|e| format!("reading a chunk size after {} bytes: {e}", body.len()))?;
+        if n == 0 {
+            return Err(format!(
+                "connection closed before the terminating chunk after {} bytes: {:?}",
+                body.len(),
+                String::from_utf8_lossy(&body[body.len().saturating_sub(300)..])
+            ));
+        }
+        let size = usize::from_str_radix(size_line.trim_end_matches("\r\n"), 16)
+            .map_err(|_| format!("bad chunk size line {size_line:?}"))?;
+        let mut data = vec![0u8; size + 2];
+        reader.read_exact(&mut data).map_err(|e| {
+            format!(
+                "reading a {size}-byte chunk after {} bytes: {e}",
+                body.len()
+            )
+        })?;
+        if &data[size..] != b"\r\n" {
+            return Err(format!("chunk of {size} bytes not followed by CRLF"));
+        }
+        if size == 0 {
+            return Ok(body);
+        }
+        body.extend_from_slice(&data[..size]);
+    }
+}
+
+/// One keep-alive client of [`concurrent_streams_are_well_framed`]: `requests` sampled chat
+/// streams in a row on one connection, each checked end to end.
+fn framed_client(
+    addr: SocketAddr,
+    model: &str,
+    client: usize,
+    requests: usize,
+    tokens: u64,
+) -> Result<(), String> {
+    let mut conn = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+    conn.set_read_timeout(Some(Duration::from_secs(120)))
+        .unwrap();
+    let mut reader = BufReader::new(conn.try_clone().unwrap());
+    for i in 0..requests {
+        let tag = format!("client {client} request {i}");
+        let body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": format!("{tag} ü € 𝄞")}],
+            "max_tokens": tokens, "ignore_eos": true, "stream": true,
+            "stream_options": {"include_usage": true},
+            "temperature": 1.0, "seed": client * 100 + i,
+        })
+        .to_string();
+        write!(
+            conn,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .map_err(|e| format!("{tag}: write: {e}"))?;
+        let (status, head) = read_head(&mut reader);
+        if status != 200 || !head.contains("transfer-encoding: chunked") {
+            return Err(format!("{tag}: {status} {head}"));
+        }
+        let bytes = read_chunked_bytes(&mut reader).map_err(|e| format!("{tag}: {e}"))?;
+        let text =
+            String::from_utf8(bytes).map_err(|e| format!("{tag}: SSE body is not UTF-8: {e}"))?;
+        let events: Vec<&str> = text.split("\n\n").filter(|e| !e.is_empty()).collect();
+        let Some((last, rest)) = events.split_last() else {
+            return Err(format!("{tag}: empty stream"));
+        };
+        if *last != "data: [DONE]" {
+            return Err(format!("{tag}: last event {last:?}"));
+        }
+        let mut completion = None;
+        for event in rest {
+            let data = event
+                .strip_prefix("data: ")
+                .ok_or_else(|| format!("{tag}: bad event {event:?}"))?;
+            let v: Value =
+                serde_json::from_str(data).map_err(|e| format!("{tag}: bad JSON {data:?}: {e}"))?;
+            if v.get("error").is_some() {
+                return Err(format!("{tag}: stream error {v}"));
+            }
+            if let Some(n) = v["usage"]["completion_tokens"].as_u64() {
+                completion = Some(n);
+            }
+        }
+        if completion != Some(tokens) {
+            return Err(format!("{tag}: usage completion_tokens {completion:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// Sixteen concurrent keep-alive clients, as `turbine-bench --concurrency 16` drives them, each
+/// streaming several sampled chat completions of byte-level tokens (random bytes: multi-byte
+/// characters split across tokens, invalid sequences): every stream is well-formed chunked SSE
+/// whose events are UTF-8 JSON, ends with the usage chunk, `[DONE]` and the terminating chunk,
+/// and leaves its connection usable for the next request.
+#[test]
+fn concurrent_streams_are_well_framed() {
+    let server = TinyServer::start_long("scheduler:\n  max_running_requests: 16\n");
+    let workers: Vec<_> = (0..16)
+        .map(|client| {
+            let (addr, model) = (server.addr, server.model.clone());
+            std::thread::spawn(move || framed_client(addr, &model, client, 4, 256))
+        })
+        .collect();
+    let failures: Vec<String> = workers
+        .into_iter()
+        .filter_map(|w| w.join().unwrap().err())
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of 16 clients failed: {failures:#?}",
+        failures.len()
+    );
+}
