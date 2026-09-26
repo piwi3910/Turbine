@@ -45,6 +45,8 @@ serde_norway = "0.9.42"
 smallvec = "1.16.2"
 # Socket buffer sizes: the server's test-only send-buffer cap and the held-stream test clients
 socket2 = "0.6.5"
+# Parses the core crates' sources in turbine-kernels tests/vendor_neutral_api.rs (dev only)
+syn = { version = "3.0.6", features = ["full", "visit"] }
 thiserror = "2.0.21"
 # Phase 2: builds the llguidance token trie from tokenizer.json; MIT license
 toktrie_hf_tokenizers = "=1.8.0"

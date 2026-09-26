@@ -24,6 +24,7 @@ use turbine_api::{
 use turbine_core::request::{
     ConstraintSpec, Endpoint, ErrorCode, GenerationRequest, SamplingParams, StopConditions,
 };
+use turbine_core::support::SupportRowView;
 use turbine_core::types::Priority;
 use turbine_device::DeviceInventory;
 use turbine_kernels::Selection;
@@ -76,6 +77,9 @@ struct StatusDocument<'a> {
     modules: &'a ModuleChoices,
     /// Per op config of the kernel registry, in requirement order: who serves it and why.
     kernels: &'a [KernelChoiceView],
+    /// The support-matrix row resolved at startup (Phase 2m S-11).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    support: Option<&'a SupportRowView>,
 }
 
 /// One entry of `kernels` in `GET /turbine/v1/status`: a `KernelRegistry` selection.
@@ -141,6 +145,8 @@ pub struct ModelBackend {
     devices: Value,
     modules: ModuleChoices,
     kernels: Vec<KernelChoiceView>,
+    /// The support-matrix row resolved at startup (`support` of the status document).
+    support: Option<SupportRowView>,
 }
 
 impl ModelBackend {
@@ -195,7 +201,14 @@ impl ModelBackend {
                 .iter()
                 .map(KernelChoiceView::from)
                 .collect(),
+            support: None,
         }
+    }
+
+    /// Reports `support` (the support-matrix row resolved at startup) in the status document.
+    pub fn with_support(mut self, support: SupportRowView) -> ModelBackend {
+        self.support = Some(support);
+        self
     }
 
     /// Weights loaded and warmed up: `/ready` turns 200 and requests are accepted.
@@ -601,6 +614,7 @@ impl Diagnostics for ModelBackend {
             },
             modules: &self.modules,
             kernels: &self.kernels,
+            support: self.support.as_ref(),
         })
         .unwrap_or(Value::Null)
     }

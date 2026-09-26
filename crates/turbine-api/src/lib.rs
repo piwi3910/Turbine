@@ -5,6 +5,7 @@ pub mod backend;
 pub mod error;
 pub mod openai;
 mod routes;
+pub mod support;
 
 pub use backend::{
     ApiLimits, ApiState, BoxFuture, Diagnostics, GenerationStream, InferenceBackend,

@@ -187,7 +187,11 @@ fn invalid_config_exits_2_before_bind() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "config ok");
+    // Phase 2m: the resolved support-matrix row comes first (no model files at /m).
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "support: supported (amd/*/*/bf16/bf16/none)\nconfig ok"
+    );
 }
 
 /// Phase 2m: a module key naming no registered module is a configuration error — exit 2 before
@@ -569,4 +573,182 @@ fn sigterm_drains_then_cancels() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Phase 2m S-11: `--support-matrix` prints every row without reading a configuration.
+#[test]
+fn support_matrix_output() {
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_turbine-server"))
+            .args(args)
+            .env_remove("TURBINE_AMD_SMI_LIBRARY")
+            .output()
+            .unwrap()
+    };
+    let out = run(&["--support-matrix", "--output", "json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = v["rows"].as_array().expect("rows array");
+    for key in [
+        "vendor",
+        "arch",
+        "architecture",
+        "weight_format",
+        "kv_format",
+        "speculative",
+        "status",
+        "reason",
+    ] {
+        assert!(rows[0].get(key).is_some(), "row lacks {key}: {}", rows[0]);
+    }
+    let has = |vendor: &str, arch: &str, architecture: &str, status: &str| {
+        rows.iter().any(|r| {
+            r["vendor"] == vendor
+                && r["arch"] == arch
+                && r["architecture"] == architecture
+                && r["status"] == status
+        })
+    };
+    // Every registered family has its supported rows, and the phase 8 families are refused on
+    // the GPU vendors.
+    for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
+        assert!(has("amd", "gfx1201", architecture, "supported"), "{v}");
+        assert!(has("nvidia", "sm_121", architecture, "supported"), "{v}");
+    }
+    for architecture in [
+        "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "MistralForCausalLM",
+        "MixtralForCausalLM",
+    ] {
+        assert!(has("amd", "*", architecture, "unsupported"), "{v}");
+        assert!(has("nvidia", "*", architecture, "unsupported"), "{v}");
+    }
+    assert!(has("cpu", "*", "*", "experimental"), "{v}");
+
+    let out = run(&["--support-matrix"]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("vendor "), "{text}");
+    assert_eq!(text.lines().count(), rows.len() + 1, "{text}");
+
+    // --support-matrix takes no configuration; --output needs --support-matrix.
+    let out = run(&["--support-matrix", "--config", "/nonexistent.yaml"]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = run(&["--config", "/nonexistent.yaml", "--output", "json"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// Phase 2m S-11: `--check-config` prints the resolved support row (device arch unknown: no
+/// discovery) before `config ok`, reading the model's architecture when `config.json` exists.
+#[test]
+fn check_config_reports_support_row() {
+    let dir = TempDir::new("turbine-server-check-support");
+    write_tiny_llama(dir.path(), 3);
+    let cfg = TempConfig::new(
+        "check-support",
+        &format!("model:\n  path: {}\n", dir.path().display()),
+    );
+    let check = |set: &[&str]| {
+        let mut args = vec!["--check-config"];
+        for s in set {
+            args.extend(["--set", s]);
+        }
+        wait_with_timeout(spawn_server(&args, &cfg.path), Duration::from_secs(20))
+    };
+    for (set, line) in [
+        (
+            &[][..],
+            "support: supported (amd/*/LlamaForCausalLM/bf16/bf16/none)",
+        ),
+        (
+            &["execution.backend=cpu"][..],
+            "support: experimental (cpu/cpu/LlamaForCausalLM/bf16/bf16/none)",
+        ),
+    ] {
+        let out = check(set);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{set:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines, [line, "config ok"], "{set:?}");
+    }
+
+    // A model directory without config.json leaves the architecture unknown.
+    let missing = TempConfig::new("check-support-missing", "model:\n  path: /m\n");
+    let out = wait_with_timeout(
+        spawn_server(&["--check-config"], &missing.path),
+        Duration::from_secs(20),
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().next(),
+        Some("support: supported (amd/*/*/bf16/bf16/none)")
+    );
+
+    // An unsupported row is a configuration error under --check-config too.
+    set_architecture(dir.path(), "Qwen3ForCausalLM");
+    let out = check(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("support matrix: amd/*/Qwen3ForCausalLM/bf16/bf16/none is unsupported"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("config ok"));
+}
+
+/// Rewrites `architectures` of the checkpoint's `config.json`.
+fn set_architecture(model_dir: &Path, architecture: &str) {
+    let path = model_dir.join("config.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    v["architectures"] = serde_json::json!([architecture]);
+    std::fs::write(&path, v.to_string()).unwrap();
+}
+
+/// Phase 2m S-11: a model whose architecture has an `unsupported` row on the configured
+/// backend's vendor is a configuration error — exit 2 before device discovery and before the
+/// port is bound (Phase 8 families stay refused on GPU vendors until their track closes).
+#[test]
+fn unsupported_row_exits_2_before_bind() {
+    let dir = TempDir::new("turbine-server-unsupported-row");
+    write_tiny_llama(dir.path(), 5);
+    set_architecture(dir.path(), "Qwen3ForCausalLM");
+    let port = free_port();
+    let cfg = TempConfig::new(
+        "unsupported-row",
+        &format!(
+            "model:\n  path: {}\nserver:\n  listen: 127.0.0.1:{port}\nexecution:\n  backend: hip\nlogging:\n  format: json\n",
+            dir.path().display()
+        ),
+    );
+    let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(20));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("support matrix"), "stderr: {stderr}");
+    assert!(stderr.contains("Qwen3ForCausalLM"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("phase-8c-model-families"),
+        "stderr: {stderr}"
+    );
+    let logs = format!("{stdout}\n{stderr}");
+    assert!(
+        !logs.contains("device_discovery"),
+        "device discovery ran:\n{logs}"
+    );
+    assert!(
+        logs.contains("event=\"support_matrix\"") || logs.contains("\"event\":\"support_matrix\""),
+        "no event=support_matrix line:\n{logs}"
+    );
+    TcpListener::bind(("127.0.0.1", port)).expect("the configured port must still be free");
 }

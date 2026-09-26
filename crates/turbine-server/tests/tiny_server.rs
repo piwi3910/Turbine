@@ -740,6 +740,44 @@ fn status_reports_modules_and_kernels() {
     assert_eq!(status["kernels"], Value::Array(expected), "{status}");
 }
 
+/// Phase 2m S-11: the support-matrix row resolved at startup is the `support` key of
+/// `/turbine/v1/status`, drives `turbine_support_matrix_status`, and is logged as
+/// `event="support_matrix"` (WARN for the CPU reference provider's experimental row).
+#[test]
+fn status_reports_support_row() {
+    let server = TinyServer::launch(&Setup {
+        capture_logs: true,
+        extra: "logging:\n  format: json\n",
+        ..Setup::default()
+    });
+    let status = server.get("/turbine/v1/status").json();
+    assert_eq!(
+        status["support"],
+        json!({"vendor": "cpu", "arch": "cpu", "architecture": "LlamaForCausalLM",
+               "weight_format": "bf16", "kv_format": "bf16", "speculative": "none",
+               "status": "experimental", "reason": null}),
+        "{status}"
+    );
+    let metrics = server.metrics();
+    for (label, value) in [("experimental", 1), ("supported", 0), ("unsupported", 0)] {
+        let line = format!("turbine_support_matrix_status{{status=\"{label}\"}} {value}");
+        assert!(metrics.lines().any(|l| l == line), "{line}:\n{metrics}");
+    }
+    let logs = server.logs.as_ref().expect("logs captured");
+    wait_for(
+        Duration::from_secs(10),
+        "the support-matrix log line",
+        || {
+            let text = logs.lock().unwrap();
+            text.lines().any(|l| {
+                l.contains(r#""event":"support_matrix""#)
+                    && l.contains("experimental")
+                    && l.contains("cpu/cpu/LlamaForCausalLM/bf16/bf16/none")
+            })
+        },
+    );
+}
+
 /// Contract §20.2 (rewritten for Phase 2): with one running request allowed
 /// (`continuous_batching: false`) a second concurrent request is queued — no more 429
 /// `engine_busy` — and completes once the first client goes away, whose blocks are freed.

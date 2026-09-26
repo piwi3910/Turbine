@@ -383,7 +383,7 @@ Complete key table (type → Rust field type; default; phase; validation and the
 | `quality.max_accuracy_drop`                                                                                                                                  | `f64`                                                                       | `0.01`                                                                                                               | P8                             | 0..0.1                                                                                                                                                                                     |
 | `speculative.{method, num_tokens, draft_model_path, min_acceptance}`                                                                                         | defined by P8b                                                              | —                                                                                                                    | P8b                            | names reserved (P8 §Interfaces); `method ∈ {none, draft}`, `num_tokens ≤ 8` (P8 Constraints)                                                                                               |
 
-Validation order (P0, P1, P3, P5): static `validate()` (exit 2) → device discovery → `validate_host` (P4 rules) → P5 parallel plan (exit 2, before bind) → P8 support-matrix resolution (exit 1 at startup / exit 2 under `--check-config`) → kernel library/model/budget (exit 1).
+Validation order (P0, P1, P3, P5, P2m): static `validate()` and `validate_modules` (exit 2) → support-matrix resolution with the device arch unknown (P2m: exit 2, also under `--check-config`) → device discovery → `validate_host` (P4 rules) → P5 parallel plan (exit 2, before bind) → support-matrix resolution with the device arch (P2m: exit 2; was exit 1 in the P8 run-ahead) → kernel library/model/budget (exit 1).
 
 ### 3.3 Cargo features
 
@@ -532,7 +532,18 @@ pub enum SpeculativeColumn { None, Draft }                                      
 pub struct SupportRow { pub key: SupportKeyPattern /* each column Option = "*" */, pub status: SupportStatus }
 pub static SUPPORT_MATRIX: &[SupportRow];
 pub fn resolve(key: &SupportKey) -> SupportStatus;             // most specific row wins; no row → Unsupported{"no support-matrix row"}
+pub const VENDORS: &[&str];      // "amd", "nvidia", "cpu" — every ExecutionBackend::vendor() is one of them
+pub const WILDCARD: &str;        // "*": any (row) / not known yet (key)
+pub const HOST_VENDOR: &str;     // "cpu": a host backend's arch column is the same word
+impl SupportKey {                // P2m: columns from the registries, formats fixed to bf16/bf16/none
+    pub fn before_discovery(vendor: &str, architecture: Option<&str>) -> SupportKey;  // arch "*" (HOST_VENDOR: "cpu")
+    pub fn bf16(vendor: &str, arch: &str, architecture: &str) -> SupportKey;
+}                                // Display: "<vendor>/<arch>/<architecture>/<weight>/<kv>/<speculative>"
+pub fn check(key: SupportKey) -> Result<SupportDecision, ConfigError>;  // partial keys: best compatible row; unsupported → ConfigError::Invalid
+pub struct SupportRowView { vendor, arch, architecture, weight_format, kv_format, speculative, status, reason: Option<String> }  // status `support`, --support-matrix rows
 ```
+
+Phase 2m (S-11): the server builds the key from `ExecutionBackend::vendor()` of `execution.backend`, the model's `config.json` `architectures[0]` (of `text_config` when the family registry resolves it there) and the discovered device arch, and resolves it twice (before discovery, after discovery); `turbine_api::support::SupportMetrics` registers `turbine_support_matrix_status`. The Phase 8 families (`Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`, `MistralForCausalLM`, `MixtralForCausalLM`) are `unsupported` on (`amd`, `*`) and (`nvidia`, `*`) until their track closes; `cpu` × `*` is `experimental`.
 
 Baseline rows (P8 AC): `supported` for (`amd`,`gfx1201`) and (`nvidia`,`sm_121`) × {`LlamaForCausalLM`, `OlmoeForCausalLM`} × `bf16` × `bf16` × `none`.
 
@@ -1908,16 +1919,16 @@ turbine-server --config <path> [--set <dotted.key>=<yaml value>]... [--check-con
 turbine-server --support-matrix [--output text|json]                                        # P8 (no config read)
 ```
 
-`--check-config`: validate (P8: + resolve support-matrix row), print `config ok`, exit 0; else stderr, exit 2 — no discovery, no bind.
+`--check-config`: validate (P8/P2m: + resolve the support-matrix row with the device arch unknown and print `support: <status> (<row>)`), print `config ok`, exit 0; else stderr, exit 2 — no discovery, no bind.
 
 ### 16.2 Exit codes
 
-| Code | Meaning                                                                                                                                                                                                                                                                                                                | Phase |
-| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
-| 0    | clean shutdown (SIGINT/SIGTERM; P2: after `server.shutdown_grace`)                                                                                                                                                                                                                                                     | P0    |
-| 1    | startup failure after config validation (bind, explicit GPU library, model files, architecture, kernel library/ABI/arch, budget, weights, warm-up, P5 collective library with tp > 1, P7 rdma), unsupported support-matrix row at startup (P8); runtime: 3 consecutive failed requests (P1) / iterations (P2) until P3 | P0    |
-| 2    | invalid configuration or CLI usage; P5 impossible parallel plan; P7 impossible placement; P8 unsupported row under `--check-config`                                                                                                                                                                                    | P0    |
-| 3    | sticky (context-corrupting) device error or controller panic after drain; external supervisor restarts (P3; P5 `local` mode: whole process)                                                                                                                                                                            | P3    |
+| Code | Meaning                                                                                                                                                                                                                                                                | Phase |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| 0    | clean shutdown (SIGINT/SIGTERM; P2: after `server.shutdown_grace`)                                                                                                                                                                                                     | P0    |
+| 1    | startup failure after config validation (bind, explicit GPU library, model files, architecture, kernel library/ABI/arch, budget, weights, warm-up, P5 collective library with tp > 1, P7 rdma); runtime: 3 consecutive failed requests (P1) / iterations (P2) until P3 | P0    |
+| 2    | invalid configuration or CLI usage; P5 impossible parallel plan; P7 impossible placement; P2m unregistered module name; P2m/P8 unsupported support-matrix row (at startup and under `--check-config`, before bind)                                                     | P0    |
+| 3    | sticky (context-corrupting) device error or controller panic after drain; external supervisor restarts (P3; P5 `local` mode: whole process)                                                                                                                            | P3    |
 
 ```rust
 pub enum ExitCode { Clean = 0, Startup = 1, Config = 2, DeviceFatal = 3 }   // (contract-chosen)

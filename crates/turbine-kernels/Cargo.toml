@@ -29,6 +29,8 @@ cc.workspace = true
 tracing-subscriber.workspace = true
 # The seeded uniform draws of the logits_reduce reference test (the sampler's ChaCha8 stream)
 rand_chacha.workspace = true
+# Parses the core crates' sources in tests/vendor_neutral_api.rs (vendor_types_in_core_signatures)
+syn.workspace = true
 
 # FFI to the kernel shim libraries; every `unsafe` block carries a `// SAFETY:` comment
 # (contract §1.3, checked by tests/unsafe_isolation.rs).

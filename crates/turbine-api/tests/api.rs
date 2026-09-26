@@ -295,3 +295,46 @@ async fn request_id_echoed_or_generated() {
         assert!(h.contains_key("x-request-id"), "{method} {path}");
     }
 }
+
+/// Phase 2m S-11 (from the Phase 8 run-ahead): `turbine_support_matrix_status` pre-creates all
+/// three statuses at 0 and sets the resolved one to 1.
+#[tokio::test]
+async fn support_matrix_status_gauge() {
+    use turbine_api::support::SupportMetrics;
+    use turbine_core::support::{self, SupportKey};
+
+    let decision = support::check(SupportKey::bf16("cpu", "cpu", "LlamaForCausalLM")).unwrap();
+    let metrics = MetricsRegistry::new();
+    let gauge = SupportMetrics::register(&metrics);
+    let app = router(ApiState {
+        inference: Arc::new(NoModel),
+        diagnostics: Arc::new(Phase0Diagnostics),
+        readiness: Arc::new(NotReady),
+        metrics: metrics.clone(),
+        limits: ApiLimits {
+            max_request_bytes: 1 << 20,
+        },
+    });
+    let status_lines = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.starts_with("turbine_support_matrix_status{"))
+            .map(str::to_string)
+            .collect()
+    };
+
+    let (code, _, body) = send(&app, "GET", "/metrics", Vec::new(), None).await;
+    assert_eq!(code, StatusCode::OK);
+    let lines = status_lines(&String::from_utf8(body).unwrap());
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines.iter().all(|l| l.ends_with(" 0")), "{lines:?}");
+
+    gauge.set(&decision.status);
+    let (_, _, body) = send(&app, "GET", "/metrics", Vec::new(), None).await;
+    let lines = status_lines(&String::from_utf8(body).unwrap());
+    let ones: Vec<&String> = lines.iter().filter(|l| l.ends_with(" 1")).collect();
+    assert_eq!(
+        ones,
+        ["turbine_support_matrix_status{status=\"experimental\"} 1"],
+        "{lines:?}"
+    );
+}

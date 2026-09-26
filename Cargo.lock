@@ -2219,6 +2219,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "prometheus-client",
  "serde",
  "serde_json",
  "tokio",
@@ -2283,6 +2284,7 @@ dependencies = [
  "libloading 0.9.0",
  "prometheus-client",
  "rand_chacha",
+ "syn 3.0.6",
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
