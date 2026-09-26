@@ -1,12 +1,15 @@
-//! Llama forward pass for one sequence (P1 S-8) over the kernel registry: embedding → per layer
-//! (RMSNorm → Q/K/V projections → Llama-3 RoPE on Q and the new K rows → causal GQA attention →
-//! O projection → residual add → RMSNorm → gate/up → SiLU·up → down → residual add) → final
-//! RMSNorm on the last row → LM head (`embed_tokens` when tied) with FP32 output.
+//! Llama forward pass over a ragged batch of sequences (P1 S-8, P2 S-5/S-9) on the kernel
+//! registry: embedding → per layer (RMSNorm → Q/K/V projections → Llama-3 RoPE on Q and the new
+//! K rows → paged causal GQA attention, which appends the new K/V rows into each sequence's pool
+//! blocks → O projection → residual add → RMSNorm → gate/up → SiLU·up → down → residual add) →
+//! final RMSNorm on each sequence's last row → LM head (`embed_tokens` when tied) with FP32
+//! output.
 //!
-//! K and V projections are written straight into the contiguous per-request cache
-//! `[layers, 2, max_seq_len, kv_heads, head_dim]` BF16; activations live in buffers allocated
-//! once for `max_forward_tokens` tokens. Every kernel lookup uses a config `requirements`
-//! lists, so the registry built from it at startup serves every call.
+//! Every token of every sequence goes through the GEMMs as one `[total_tokens, hidden]` batch;
+//! only attention looks at sequence boundaries (`q_indptr`, `kv_lens`, block tables). The KV
+//! lives in the caller's pool (`KvPoolView`); activations live in buffers allocated once for
+//! `max_batch_tokens` tokens and `max_seqs` sequences. Every kernel lookup uses a config
+//! `requirements` lists, so the registry built from it at startup serves every call.
 //!
 //! Diagnostics: [`LlamaExecutor::set_trace`] makes each forward record every intermediate
 //! tensor ([`TraceTensor`]) with a blocking device read after the op that wrote it; comparing
@@ -15,21 +18,22 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use turbine_core::types::{DType, KvLayout, ModelShape};
+use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
 use turbine_kernels::{
-    ActivationConfig, ActivationContext, AttentionConfig, AttentionContext, AttentionKind,
-    ElementwiseConfig, ElementwiseContext, EmbeddingConfig, EmbeddingContext, GemmConfig,
-    GemmContext, KernelError, KernelRegistry, NormConfig, NormContext, OpConfig, OpRequirement,
+    ActivationConfig, ActivationContext, AttentionConfig, AttentionKind, ElementwiseConfig,
+    ElementwiseContext, EmbeddingConfig, EmbeddingContext, GemmConfig, GemmContext, KernelError,
+    KernelRegistry, NormConfig, NormContext, OpConfig, OpRequirement, PagedAttentionContext,
     RopeConfig, RopeContext,
 };
-use turbine_tensor::{DeviceBuffer, DeviceMemory, Tensor, TensorView};
+use turbine_tensor::{DeviceMemory, KvPoolView, Tensor, TensorView};
 
+use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
 use super::{BatchInput, Logits, ModelExecutor, rope};
 use crate::ModelError;
 use crate::config::ModelArchConfig;
 use crate::loader::{LM_HEAD, LoadedWeights};
 
-/// Weights, activations and KV are BF16 in Phase 1; logits are F32.
+/// Weights, activations and KV are BF16; logits are F32.
 const ACT: DType = DType::BF16;
 
 /// Model dimensions in elements.
@@ -73,14 +77,15 @@ fn gemm_cfg(n: usize, k: usize, c_dtype: DType) -> GemmConfig {
     }
 }
 
-fn attention_cfg(cfg: &ModelArchConfig, kind: AttentionKind) -> AttentionConfig {
+/// Paged causal GQA attention over blocks of `block_tokens` tokens.
+fn attention_cfg(cfg: &ModelArchConfig, kind: AttentionKind, block_tokens: u32) -> AttentionConfig {
     AttentionConfig {
         kind,
         num_q_heads: cfg.num_attention_heads,
         num_kv_heads: cfg.num_kv_heads,
         head_dim: cfg.head_dim,
         dtype: ACT,
-        block_tokens: None,
+        block_tokens: Some(block_tokens),
         causal: true,
     }
 }
@@ -123,13 +128,6 @@ fn invalid(message: String) -> ModelError {
     ModelError::Kernel(KernelError::InvalidArgument { message })
 }
 
-/// Little-endian I32 bytes of `values` (token ids and positions, which fit: both are below the
-/// vocabulary size and `max_seq_len`, checked before the conversion).
-fn i32_bytes(values: &[u32], out: &mut Vec<u8>) {
-    out.clear();
-    out.extend(values.iter().flat_map(|&v| (v as i32).to_le_bytes()));
-}
-
 /// One intermediate tensor of a traced forward ([`LlamaExecutor::set_trace`]), widened to
 /// f32 from its stored dtype (BF16 activations, F32 logits).
 #[derive(Clone, Debug, PartialEq)]
@@ -138,9 +136,10 @@ pub struct TraceTensor {
     pub layer: Option<usize>,
     /// The op output: `embed`; per layer `attn_norm`, `q`, `k`, `v` (projections of the new
     /// rows), `q_rope`, `k_rope`, `attn`, `o_proj`, `resid_attn`, `mlp_norm`, `gate`, `up`,
-    /// `act`, `down`, `resid_mlp`; then `final_norm` (last row) and `logits`.
+    /// `act`, `down`, `resid_mlp`; then `final_norm` (each sequence's last row) and `logits`.
     pub name: &'static str,
-    /// `[rows, cols]`: rows are the forward's tokens (1 for `final_norm` and `logits`).
+    /// `[rows, cols]`: rows are the forward's tokens (one per sequence for `final_norm` and
+    /// `logits`).
     pub shape: [usize; 2],
     pub data: Vec<f32>,
 }
@@ -173,58 +172,72 @@ struct Layer {
     w_down: Tensor,
 }
 
-/// Activation buffers, allocated once for `max_forward_tokens` tokens (`[t, cols]` each).
+/// Activation buffers, allocated once: `[max_batch_tokens, cols]` per token row, `[max_seqs,
+/// cols]` per sequence row.
 struct Buffers {
-    ids: DeviceBuffer,
-    positions: DeviceBuffer,
     inv_freq: Tensor,
     /// Residual stream.
     x: Tensor,
     /// Normalised input of the attention and MLP blocks.
     h: Tensor,
     q: Tensor,
+    /// K and V projections of the new rows (K rotated in place), appended by attention.
+    k: Tensor,
+    v: Tensor,
     attn: Tensor,
     /// O and down projection outputs before the residual add.
     proj: Tensor,
     gate: Tensor,
     up: Tensor,
     act: Tensor,
-    /// Final-norm output of the last row.
+    /// Final-norm output of each sequence's last row.
     last: Tensor,
     logits: Tensor,
 }
 
-/// The Phase 1 Llama executor: one sequence at a time on one device.
+/// The Llama executor: ragged batches of up to `max_seqs` sequences and `max_batch_tokens`
+/// tokens over the paged KV pool, on one device.
 pub struct LlamaExecutor {
     cfg: ModelArchConfig,
     dims: Dims,
     shape: ModelShape,
     kv_layout: KvLayout,
+    limits: BatchLimits,
     registry: Arc<KernelRegistry>,
     embed: Tensor,
     layers: Vec<Layer>,
     final_norm: Tensor,
     /// `None` when the model ties its LM head to `embed`.
     lm_head: Option<Tensor>,
-    kv: DeviceBuffer,
     bufs: Buffers,
-    /// Host bytes of the last ids/positions upload; they stay valid until the next
-    /// synchronization, which the logits read performs (contract §9.2).
-    host_ids: Vec<u8>,
-    host_positions: Vec<u8>,
-    max_seq_len: u32,
-    max_forward_tokens: u32,
-    /// Positions `[0, cached_len)` of the current sequence hold valid K/V.
-    cached_len: u32,
+    meta: DeviceBatch,
+    /// Host bytes of the last upload; they stay valid until the next synchronization, which the
+    /// logits read performs (contract §9.2).
+    host: HostBatch,
     /// `Some` while tracing: the recorded tensors not yet taken.
     trace: RefCell<Option<Vec<TraceTensor>>>,
 }
 
+fn limits(
+    cfg: &ModelArchConfig,
+    block_tokens: u32,
+    max_batch_tokens: u32,
+    max_seqs: u32,
+) -> BatchLimits {
+    BatchLimits {
+        vocab: cfg.vocab_size,
+        max_batch_tokens,
+        max_seqs,
+        max_positions: cfg.max_position_embeddings,
+        layout: cfg.kv_layout(block_tokens),
+    }
+}
+
 impl LlamaExecutor {
-    /// Every distinct op config the forward pass executes, in first-use order. The registry is
-    /// built from this list at startup, so a config no provider supports fails before any
-    /// weight is read.
-    pub fn requirements(cfg: &ModelArchConfig) -> Vec<OpRequirement> {
+    /// Every distinct op config the forward pass executes, in first-use order, plus the
+    /// `copy_blocks` fork over KV blocks of `block_tokens` tokens. The registry is built from
+    /// this list at startup, so a config no provider supports fails before any weight is read.
+    pub fn requirements(cfg: &ModelArchConfig, block_tokens: u32) -> Vec<OpRequirement> {
         let d = Dims::of(cfg);
         let specs = [
             OpConfig::Embedding(embedding_cfg(&d)),
@@ -232,14 +245,19 @@ impl LlamaExecutor {
             OpConfig::Gemm(gemm_cfg(d.q_dim, d.hidden, ACT)),
             OpConfig::Gemm(gemm_cfg(d.kv_dim, d.hidden, ACT)),
             OpConfig::Rope(rope_cfg(cfg)),
-            OpConfig::Attention(attention_cfg(cfg, AttentionKind::Prefill)),
-            OpConfig::Attention(attention_cfg(cfg, AttentionKind::Decode)),
+            OpConfig::Attention(attention_cfg(
+                cfg,
+                AttentionKind::PrefillPaged,
+                block_tokens,
+            )),
+            OpConfig::Attention(attention_cfg(cfg, AttentionKind::DecodePaged, block_tokens)),
             OpConfig::Gemm(gemm_cfg(d.hidden, d.q_dim, ACT)),
             OpConfig::Add(ADD_CFG),
             OpConfig::Gemm(gemm_cfg(d.inter, d.hidden, ACT)),
             OpConfig::SiluMul(activation_cfg(&d)),
             OpConfig::Gemm(gemm_cfg(d.hidden, d.inter, ACT)),
             OpConfig::Gemm(gemm_cfg(d.vocab, d.hidden, DType::F32)),
+            OpConfig::CopyBlocks(batch::copy_config(&cfg.kv_layout(block_tokens))),
         ];
         let mut unique: Vec<OpConfig> = Vec::with_capacity(specs.len());
         for spec in specs {
@@ -250,36 +268,48 @@ impl LlamaExecutor {
         unique.into_iter().map(OpRequirement::from).collect()
     }
 
-    /// Bytes of the activation buffers for `max_tokens` tokens per forward (the budget's
-    /// workspace term): per token the I32 id and position and the BF16 rows of `x`, `h`, `proj`
-    /// (hidden), `q`, `attn` (heads · head_dim) and `gate`, `up`, `act` (intermediate); plus the
-    /// last normalised row (BF16), the F32 logits row and the F32 `inv_freq`.
-    pub fn workspace_bytes(cfg: &ModelArchConfig, max_tokens: u32) -> u64 {
+    /// Device bytes of the executor's buffers (the budget's workspace term): per token the
+    /// I32 id and position and the BF16 rows of `x`, `h`, `proj` (hidden), `q`, `attn`
+    /// (heads · head_dim), `k`, `v` (kv_heads · head_dim) and `gate`, `up`, `act`
+    /// (intermediate); per sequence its last normalised row (BF16), its F32 logits row, its
+    /// `q_indptr` and `kv_lens` entries and a block table for `max_position_embeddings` tokens
+    /// (I32); plus one `q_indptr` entry and the F32 `inv_freq`.
+    pub fn workspace_bytes(
+        cfg: &ModelArchConfig,
+        block_tokens: u32,
+        max_batch_tokens: u32,
+        max_seqs: u32,
+    ) -> u64 {
         let d = Dims::of(cfg);
         let bf16 = ACT.size_bytes() as u64;
         let f32 = DType::F32.size_bytes() as u64;
-        let i32 = DType::I32.size_bytes() as u64;
-        let per_token = 2 * i32 + bf16 * (3 * d.hidden + 2 * d.q_dim + 3 * d.inter) as u64;
-        let fixed = bf16 * d.hidden as u64 + f32 * d.vocab as u64 + f32 * (d.head_dim / 2) as u64;
-        u64::from(max_tokens) * per_token + fixed
+        let per_token = bf16 * (3 * d.hidden + 2 * d.q_dim + 2 * d.kv_dim + 3 * d.inter) as u64;
+        let per_seq = bf16 * d.hidden as u64 + f32 * d.vocab as u64;
+        let limits = limits(cfg, block_tokens, max_batch_tokens, max_seqs);
+        u64::from(max_batch_tokens) * per_token
+            + u64::from(max_seqs) * per_seq
+            + f32 * (d.head_dim / 2) as u64
+            + DeviceBatch::bytes(&limits)
     }
 
-    /// Takes the parameters out of `weights`, allocates the KV cache for `max_seq_len` tokens
-    /// and the activation buffers for `max_forward_tokens` tokens on `mem`, and uploads the
-    /// rotary inverse frequencies. `registry` must have been built from
-    /// [`LlamaExecutor::requirements`] of `cfg`.
+    /// Takes the parameters out of `weights`, allocates the activation and batch buffers for
+    /// `max_batch_tokens` tokens of up to `max_seqs` sequences on `mem`, and uploads the rotary
+    /// inverse frequencies. The KV is not the executor's: every forward names its pool, laid
+    /// out as `cfg.kv_layout(block_tokens)`. `registry` must have been built from
+    /// [`LlamaExecutor::requirements`] of `cfg` and `block_tokens`.
     pub fn new(
         cfg: &ModelArchConfig,
         mut weights: LoadedWeights,
         registry: Arc<KernelRegistry>,
         mem: Arc<dyn DeviceMemory>,
-        max_seq_len: u32,
-        max_forward_tokens: u32,
+        block_tokens: u32,
+        max_batch_tokens: u32,
+        max_seqs: u32,
     ) -> Result<LlamaExecutor, ModelError> {
-        if max_seq_len == 0 || max_forward_tokens == 0 {
+        if block_tokens == 0 || max_batch_tokens == 0 || max_seqs == 0 {
             return Err(invalid(format!(
-                "max_seq_len {max_seq_len} and max_forward_tokens {max_forward_tokens} must be \
-                 positive"
+                "block_tokens {block_tokens}, max_batch_tokens {max_batch_tokens} and max_seqs \
+                 {max_seqs} must be positive"
             )));
         }
         let d = Dims::of(cfg);
@@ -307,11 +337,9 @@ impl LlamaExecutor {
             Some(weights.take(LM_HEAD)?)
         };
 
-        // The contiguous cache is one "block" of max_seq_len tokens.
-        let kv_layout = cfg.kv_layout(max_seq_len);
-        let kv = DeviceBuffer::alloc(&mem, kv_layout.block_bytes() as usize)?;
-
-        let t = max_forward_tokens as usize;
+        let limits = limits(cfg, block_tokens, max_batch_tokens, max_seqs);
+        let t = max_batch_tokens as usize;
+        let n = max_seqs as usize;
         let act = |cols: usize| Tensor::empty(&mem, &[t, cols], ACT);
         let mut inv_freq = Tensor::empty(&mem, &[d.head_dim / 2], DType::F32)?;
         let freqs = rope::inv_freq(cfg.rope_theta, cfg.head_dim, cfg.rope_scaling.as_ref());
@@ -319,37 +347,35 @@ impl LlamaExecutor {
         inv_freq.storage.copy_from_host(0, &freq_bytes)?;
         mem.synchronize()?;
         let bufs = Buffers {
-            ids: DeviceBuffer::alloc(&mem, t * DType::I32.size_bytes())?,
-            positions: DeviceBuffer::alloc(&mem, t * DType::I32.size_bytes())?,
             inv_freq,
             x: act(d.hidden)?,
             h: act(d.hidden)?,
             q: act(d.q_dim)?,
+            k: act(d.kv_dim)?,
+            v: act(d.kv_dim)?,
             attn: act(d.q_dim)?,
             proj: act(d.hidden)?,
             gate: act(d.inter)?,
             up: act(d.inter)?,
             act: act(d.inter)?,
-            last: Tensor::empty(&mem, &[1, d.hidden], ACT)?,
-            logits: Tensor::empty(&mem, &[1, d.vocab], DType::F32)?,
+            last: Tensor::empty(&mem, &[n, d.hidden], ACT)?,
+            logits: Tensor::empty(&mem, &[n, d.vocab], DType::F32)?,
         };
+        let meta = DeviceBatch::alloc(&mem, &limits)?;
         Ok(LlamaExecutor {
             cfg: cfg.clone(),
             dims: d,
             shape: cfg.shape(),
-            kv_layout,
+            kv_layout: limits.layout,
+            limits,
             registry,
             embed,
             layers,
             final_norm,
             lm_head,
-            kv,
             bufs,
-            host_ids: Vec::with_capacity(t * 4),
-            host_positions: Vec::with_capacity(t * 4),
-            max_seq_len,
-            max_forward_tokens,
-            cached_len: 0,
+            meta,
+            host: HostBatch::default(),
             trace: RefCell::new(None),
         })
     }
@@ -394,77 +420,14 @@ impl LlamaExecutor {
         Ok(())
     }
 
-    /// Checks one Phase 1 batch; returns its first position.
-    fn validate(&self, batch: &BatchInput<'_>) -> Result<u32, ModelError> {
-        let t = batch.tokens.len();
-        if t == 0 {
-            return Err(invalid("empty batch: no tokens".into()));
-        }
-        if batch.positions.len() != t {
-            return Err(invalid(format!(
-                "{t} tokens but {} positions",
-                batch.positions.len()
-            )));
-        }
-        if t > self.max_forward_tokens as usize {
-            return Err(invalid(format!(
-                "{t} tokens exceed max_forward_tokens {}",
-                self.max_forward_tokens
-            )));
-        }
-        if let Some(&bad) = batch
-            .tokens
-            .iter()
-            .find(|&&id| id as usize >= self.dims.vocab)
-        {
-            return Err(invalid(format!(
-                "token id {bad} outside the vocabulary of {}",
-                self.dims.vocab
-            )));
-        }
-        let p0 = batch.positions[0];
-        if let Some(i) =
-            (1..t).find(|&i| batch.positions[i] != batch.positions[i - 1].wrapping_add(1))
-        {
-            return Err(invalid(format!(
-                "positions must be consecutive: {} follows {}",
-                batch.positions[i],
-                batch.positions[i - 1]
-            )));
-        }
-        if p0 > self.cached_len {
-            return Err(invalid(format!(
-                "batch starts at position {p0} but only {} positions are cached",
-                self.cached_len
-            )));
-        }
-        let last = u64::from(p0) + t as u64 - 1;
-        if last >= u64::from(self.max_seq_len) {
-            return Err(invalid(format!(
-                "position {last} is not below max_seq_len {}",
-                self.max_seq_len
-            )));
-        }
-        Ok(p0)
-    }
-
     /// Rows `[0, t)` of an activation buffer as `[t, cols]`.
     fn rows(buf: &Tensor, t: usize) -> TensorView<'_> {
         buf.view().rows(0, t)
     }
 
     /// Rows `[0, t)` of an activation buffer as `[t, heads, head_dim]`.
-    fn heads<'a>(&self, buf: &'a Tensor, t: usize) -> TensorView<'a> {
-        let d = &self.dims;
-        TensorView::contiguous(buf.storage.whole(), 0, &[t, d.heads, d.head_dim], ACT)
-    }
-
-    /// K (`which` = 0) or V (1) rows `[start, start + len)` of `layer`'s cache, as
-    /// `[len, kv_heads, head_dim]`.
-    fn cache(&self, layer: usize, which: usize, start: usize, len: usize) -> TensorView<'_> {
-        let d = &self.dims;
-        let offset = ((layer * 2 + which) * self.max_seq_len as usize + start) * d.kv_dim;
-        TensorView::contiguous(self.kv.whole(), offset, &[len, d.kv_heads, d.head_dim], ACT)
+    fn heads(buf: &Tensor, t: usize, heads: usize, head_dim: usize) -> TensorView<'_> {
+        TensorView::contiguous(buf.storage.whole(), 0, &[t, heads, head_dim], ACT)
     }
 
     /// `c = a · wᵀ`.
@@ -511,51 +474,55 @@ impl LlamaExecutor {
         Ok(())
     }
 
-    /// One decoder layer on rows `[0, t)` sitting at positions `p0..p0 + t`.
-    fn layer(&self, i: usize, t: usize, p0: usize) -> Result<(), ModelError> {
+    /// One decoder layer on the batch's `p.total_q` rows; attention appends to and reads
+    /// layer `i` of `kv`.
+    fn layer(&self, i: usize, p: &Packed, kv: &KvPoolView<'_>) -> Result<(), ModelError> {
         let l = &self.layers[i];
         let b = &self.bufs;
         let d = &self.dims;
+        let t = p.total_q;
 
         let li = Some(i);
-        // Attention block. K and V land in the cache rows of the new positions.
+        // Attention block.
         self.rmsnorm(Self::rows(&b.x, t), &l.input_norm, Self::rows(&b.h, t))?;
         self.record(li, "attn_norm", Self::rows(&b.h, t))?;
         self.linear(Self::rows(&b.h, t), &l.wq, Self::rows(&b.q, t))?;
         self.record(li, "q", Self::rows(&b.q, t))?;
-        let k_new = self.cache(i, 0, p0, t);
-        let v_new = self.cache(i, 1, p0, t);
-        let k_rows = TensorView::contiguous(k_new.slice, 0, &[t, d.kv_dim], ACT);
-        let v_rows = TensorView::contiguous(v_new.slice, 0, &[t, d.kv_dim], ACT);
-        self.linear(Self::rows(&b.h, t), &l.wk, k_rows.clone())?;
-        self.record(li, "k", k_rows.clone())?;
-        self.linear(Self::rows(&b.h, t), &l.wv, v_rows.clone())?;
-        self.record(li, "v", v_rows)?;
+        self.linear(Self::rows(&b.h, t), &l.wk, Self::rows(&b.k, t))?;
+        self.record(li, "k", Self::rows(&b.k, t))?;
+        self.linear(Self::rows(&b.h, t), &l.wv, Self::rows(&b.v, t))?;
+        self.record(li, "v", Self::rows(&b.v, t))?;
         let rope = rope_cfg(&self.cfg);
         self.registry.rope(&rope).execute(&mut RopeContext {
             cfg: rope,
-            q: self.heads(&b.q, t),
-            k: k_new,
-            positions: TensorView::contiguous(b.positions.whole(), 0, &[t], DType::I32),
+            q: Self::heads(&b.q, t, d.heads, d.head_dim),
+            k: Self::heads(&b.k, t, d.kv_heads, d.head_dim),
+            positions: self.meta.positions_view(p),
             inv_freq: b.inv_freq.view(),
         })?;
         self.record(li, "q_rope", Self::rows(&b.q, t))?;
-        self.record(li, "k_rope", k_rows)?;
-        let kind = if t == 1 {
-            AttentionKind::Decode
+        self.record(li, "k_rope", Self::rows(&b.k, t))?;
+        let kind = if p.is_decode() {
+            AttentionKind::DecodePaged
         } else {
-            AttentionKind::Prefill
+            AttentionKind::PrefillPaged
         };
-        let attn = attention_cfg(&self.cfg, kind);
+        let attn = attention_cfg(&self.cfg, kind, self.kv_layout.block_tokens);
         self.registry
             .attention(&attn)
-            .execute(&mut AttentionContext {
+            .execute_paged(&mut PagedAttentionContext {
                 cfg: attn,
-                q: self.heads(&b.q, t),
-                k_cache: self.cache(i, 0, 0, p0 + t),
-                v_cache: self.cache(i, 1, 0, p0 + t),
-                out: self.heads(&b.attn, t),
-                q_start: p0 as u32,
+                q: Self::heads(&b.q, t, d.heads, d.head_dim),
+                k_new: Self::heads(&b.k, t, d.kv_heads, d.head_dim),
+                v_new: Self::heads(&b.v, t, d.kv_heads, d.head_dim),
+                out: Self::heads(&b.attn, t, d.heads, d.head_dim),
+                kv_layer: batch::kv_layer(kv, i),
+                block_table: self.meta.block_table_view(p),
+                q_indptr: self.meta.q_indptr_view(p),
+                kv_lens: self.meta.kv_lens_view(p),
+                max_q_len: p.max_q_len,
+                max_kv_len: p.max_kv_len,
+                max_blocks_per_seq: p.max_blocks_per_seq,
                 scale: 1.0 / (d.head_dim as f32).sqrt(),
             })?;
         self.record(li, "attn", Self::rows(&b.attn, t))?;
@@ -584,6 +551,27 @@ impl LlamaExecutor {
         self.residual_add(t)?;
         self.record(li, "resid_mlp", Self::rows(&b.x, t))
     }
+
+    /// Final RMSNorm of each sequence's last row into `last[0..n]`: one call per run of
+    /// consecutive last rows (a decode-only batch is one call).
+    fn final_norm_last_rows(&self, p: &Packed) -> Result<(), ModelError> {
+        let b = &self.bufs;
+        let x = Self::rows(&b.x, p.total_q);
+        let mut s = 0;
+        while s < p.num_seqs {
+            let mut len = 1;
+            while s + len < p.num_seqs && p.last_rows[s + len] == p.last_rows[s] + len {
+                len += 1;
+            }
+            self.rmsnorm(
+                x.rows(p.last_rows[s], len),
+                &self.final_norm,
+                b.last.view().rows(s, len),
+            )?;
+            s += len;
+        }
+        Ok(())
+    }
 }
 
 impl ModelExecutor for LlamaExecutor {
@@ -596,51 +584,52 @@ impl ModelExecutor for LlamaExecutor {
     }
 
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
-        let p0 = self.validate(batch)?;
-        let t = batch.tokens.len();
-        i32_bytes(batch.tokens, &mut self.host_ids);
-        i32_bytes(batch.positions, &mut self.host_positions);
-        self.bufs.ids.copy_from_host(0, &self.host_ids)?;
-        self.bufs
-            .positions
-            .copy_from_host(0, &self.host_positions)?;
-        // Positions from p0 on are rewritten by this step; until it completes only the prefix
-        // before p0 is valid.
-        self.cached_len = p0;
+        let p = self.host.pack(batch, &self.limits)?;
+        self.meta.upload(&self.host)?;
 
         let b = &self.bufs;
         let d = &self.dims;
+        let (t, n) = (p.total_q, p.num_seqs);
         self.registry
             .embedding(&embedding_cfg(d))
             .execute(&mut EmbeddingContext {
-                ids: TensorView::contiguous(b.ids.whole(), 0, &[t], DType::I32),
+                ids: self.meta.ids_view(&p),
                 table: self.embed.view(),
                 out: Self::rows(&b.x, t),
                 vocab_offset: 0,
             })?;
         self.record(None, "embed", Self::rows(&b.x, t))?;
         for i in 0..self.layers.len() {
-            self.layer(i, t, p0 as usize)?;
+            self.layer(i, &p, batch.kv)?;
         }
-        self.rmsnorm(
-            Self::rows(&b.x, t).rows(t - 1, 1),
-            &self.final_norm,
-            b.last.view(),
-        )?;
-        self.record(None, "final_norm", b.last.view())?;
+        self.final_norm_last_rows(&p)?;
+        self.record(None, "final_norm", Self::rows(&b.last, n))?;
         let head = self.lm_head.as_ref().unwrap_or(&self.embed);
-        self.linear(b.last.view(), head, b.logits.view())?;
-        self.record(None, "logits", b.logits.view())?;
-        let raw = b.logits.storage.whole().read_bytes()?;
+        self.linear(Self::rows(&b.last, n), head, Self::rows(&b.logits, n))?;
+        self.record(None, "logits", Self::rows(&b.logits, n))?;
+        // The iteration's one device-to-host copy (it synchronizes the stream).
+        let raw = b
+            .logits
+            .storage
+            .slice(0, n * d.vocab * DType::F32.size_bytes())
+            .read_bytes()?;
         let data: Vec<f32> = raw
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        self.cached_len = p0 + t as u32;
         Ok(Logits {
-            rows: 1,
+            rows: n,
             vocab: d.vocab,
             data,
         })
+    }
+
+    fn copy_blocks(
+        &mut self,
+        kv: &KvPoolView<'_>,
+        src: &[BlockId],
+        dst: &[BlockId],
+    ) -> Result<(), ModelError> {
+        batch::copy_blocks(&self.registry, &self.kv_layout, kv, src, dst)
     }
 }

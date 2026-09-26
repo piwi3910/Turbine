@@ -23,7 +23,7 @@ use turbine_core::types::{ExecutionBackend, RequestId, Vendor};
 use turbine_kernels::{
     KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider, shim_provider,
 };
-use turbine_model::executor::{BatchInput, LlamaExecutor, ModelExecutor};
+use turbine_model::executor::{LlamaExecutor, SequenceKv};
 use turbine_model::generate::{GenerateOptions, generate};
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::write_tiny_llama;
@@ -417,7 +417,7 @@ fn prompt_token_ids(
 /// (`ignore_eos`, as `turbine-golden compare` requests), with the top-20 raw logprobs per
 /// position.
 fn greedy(
-    exec: &mut dyn ModelExecutor,
+    runner: &mut Runner,
     tokenizer: &Arc<Tokenizer>,
     prompt_tokens: Vec<u32>,
     max_tokens: u32,
@@ -457,7 +457,8 @@ fn greedy(
     let mut tokens = Vec::new();
     let mut tops = Vec::new();
     let mut finished = None;
-    for event in generate(exec, Arc::clone(tokenizer), &req, &cancel, opts) {
+    let Runner { exec, kv } = runner;
+    for event in generate(exec, kv, Arc::clone(tokenizer), &req, &cancel, opts) {
         match event {
             GenerationEvent::Token {
                 token_id,
@@ -485,7 +486,7 @@ fn greedy(
 /// Replays every prompt on `exec`, asserting Turbine's prompt ids equal the reference's, and
 /// returns one verdict per prompt.
 fn replay(
-    exec: &mut dyn ModelExecutor,
+    runner: &mut Runner,
     model_dir: &Path,
     prompts: &[PromptRecord],
     references: &[ReferenceRecord],
@@ -515,7 +516,7 @@ fn replay(
             "{}",
             prompt.id
         );
-        let (tokens, tops) = greedy(exec, &tokenizer, ids, prompt.max_tokens, max_seq_len);
+        let (tokens, tops) = greedy(runner, &tokenizer, ids, prompt.max_tokens, max_seq_len);
         if std::env::var_os("TURBINE_GOLDEN_DUMP").is_some() {
             // Diagnostics: the candidate in reference.jsonl shape, one line per prompt.
             let line = serde_json::json!({
@@ -539,12 +540,21 @@ fn needed_seq_len(references: &[ReferenceRecord]) -> u32 {
         .expect("at least one reference")
 }
 
+/// KV block size of the golden runs.
+const BLOCK_TOKENS: u32 = 16;
+
+/// An executor and the single-sequence KV it generates on.
+struct Runner {
+    exec: LlamaExecutor,
+    kv: SequenceKv,
+}
+
 fn build_executor(
     model_dir: &Path,
     provider: Arc<dyn KernelProvider>,
     mem: Arc<dyn DeviceMemory>,
     max_seq_len: u32,
-) -> LlamaExecutor {
+) -> Runner {
     let cfg = load_model_config(model_dir).expect("config.json");
     let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
     let weights = WeightLoader::load(&index, &llama_slots(&cfg), &mem, MAX_STAGING_BYTES)
@@ -554,19 +564,22 @@ fn build_executor(
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &LlamaExecutor::requirements(&cfg),
+        &LlamaExecutor::requirements(&cfg, BLOCK_TOKENS),
         &metrics,
     )
     .expect("every op has a provider");
-    LlamaExecutor::new(
+    let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
+    let exec = LlamaExecutor::new(
         &cfg,
         weights,
         Arc::new(registry),
         mem,
+        BLOCK_TOKENS,
         max_seq_len,
-        max_seq_len,
+        1,
     )
-    .expect("executor")
+    .expect("executor");
+    Runner { exec, kv }
 }
 
 // --------------------------------------------------------------------------------- tests
@@ -713,8 +726,8 @@ fn hip_trace_vs_cpu_3b() {
     let mut cpu = build_executor(&model_dir, cpu_reference_provider(), host, max_seq_len);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
     let mut hip = build_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
-    cpu.set_trace(true);
-    hip.set_trace(true);
+    cpu.exec.set_trace(true);
+    hip.exec.set_trace(true);
     let weights = |name: &str| read_bf16_weight(&index, name);
 
     for r in selected {
@@ -725,13 +738,11 @@ fn hip_trace_vs_cpu_3b() {
         let mut p0 = 0usize;
         for step in 0..=TRACE_DECODE {
             let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
-            let input = BatchInput {
-                tokens: &batch,
-                positions: &positions,
-            };
-            cpu.forward(&input).expect("cpu forward");
-            hip.forward(&input).expect("hip forward");
-            let (c, h) = (cpu.take_trace(), hip.take_trace());
+            for r in [&mut cpu, &mut hip] {
+                r.kv.forward(&mut r.exec, &batch, &positions)
+                    .expect("forward");
+            }
+            let (c, h) = (cpu.exec.take_trace(), hip.exec.take_trace());
             accumulated.extend(compare_traces(step, &c, &h));
             local.extend(checker.check_step(step, p0, &h));
             p0 += batch.len();

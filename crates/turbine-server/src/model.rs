@@ -15,7 +15,7 @@ use turbine_kernels::{
     KernelError, KernelMetrics, KernelProvider, KernelRegistry, ProviderId, ShimContext,
     ShimLibrary, cpu_reference_provider, shim_provider,
 };
-use turbine_model::executor::{BatchInput, LlamaExecutor, ModelExecutor};
+use turbine_model::executor::{LlamaExecutor, SequenceKv};
 
 use turbine_model::{
     BudgetTerms, ChatTemplate, GenerationConfig, MAX_STAGING_BYTES, ModelArchConfig, ModelError,
@@ -218,6 +218,8 @@ pub struct PreparedModel {
     pub index: SafetensorsIndex,
     pub registry: Arc<KernelRegistry>,
     pub max_seq_len: u32,
+    /// `kv.block_tokens`: the block size of the request's KV pool.
+    pub block_tokens: u32,
     pub served_name: String,
     pub budget: BudgetTerms,
 }
@@ -260,10 +262,11 @@ pub fn prepare(
     arch.check_supported_weights(&index)
         .map_err(|e| model_error("weights", e))?;
 
+    let block_tokens = config.kv.block_tokens;
     let registry = KernelRegistry::build(
         provider.providers.clone(),
         &provider.order,
-        &LlamaExecutor::requirements(&arch),
+        &LlamaExecutor::requirements(&arch, block_tokens),
         &KernelMetrics::register(metrics),
     )
     .map_err(|e| kernel_error("kernel selection", e))?;
@@ -275,11 +278,8 @@ pub fn prepare(
         .free_bytes;
     let budget = BudgetTerms {
         weights: arch.shape().weight_bytes,
-        kv_reservation: arch
-            .kv_layout(1)
-            .bytes_per_token()
-            .saturating_mul(u64::from(max_seq_len)),
-        workspace: LlamaExecutor::workspace_bytes(&arch, max_seq_len),
+        kv_reservation: SequenceKv::bytes(&arch.kv_layout(block_tokens), max_seq_len),
+        workspace: LlamaExecutor::workspace_bytes(&arch, block_tokens, max_seq_len, 1),
         emergency_reserve: config.reliability.emergency_vram_reserve.0,
         available: available_bytes(
             provider.memory_kind,
@@ -310,27 +310,29 @@ pub fn prepare(
         index,
         registry: Arc::new(registry),
         max_seq_len,
+        block_tokens,
         served_name,
         budget,
     })
 }
 
-/// The loaded, warmed-up executor.
+/// The loaded, warmed-up executor and the single-sequence KV its requests run on.
 pub struct LoadedModel {
     pub executor: LlamaExecutor,
+    pub kv: SequenceKv,
     pub weight_bytes: u64,
     pub load_seconds: f64,
 }
 
-/// Steps 8 and 10: upload the weights, build the executor (KV cache for `max_seq_len` tokens)
-/// and run one one-token forward. Records `turbine_model_load_seconds` and
-/// `turbine_model_weight_bytes{format="bf16"}`.
+/// Steps 8 and 10: upload the weights, build the executor for the single-sequence KV `kv` (its
+/// layout and `max_seq_len` size the executor) and run one one-token forward on it. Records
+/// `turbine_model_load_seconds` and `turbine_model_weight_bytes{format="bf16"}`.
 pub fn load(
     arch: &ModelArchConfig,
     index: &SafetensorsIndex,
     registry: Arc<KernelRegistry>,
     mem: Arc<dyn DeviceMemory>,
-    max_seq_len: u32,
+    mut kv: SequenceKv,
     warmup_token: u32,
     metrics: &ModelMetrics,
 ) -> Result<LoadedModel, StartupError> {
@@ -338,13 +340,13 @@ pub fn load(
     let weights = WeightLoader::load(index, &llama_slots(arch), &mem, MAX_STAGING_BYTES)
         .map_err(|e| model_error("weight load", e))?;
     let weight_bytes = weights.weight_bytes;
-    let mut executor = LlamaExecutor::new(arch, weights, registry, mem, max_seq_len, max_seq_len)
-        .map_err(|e| model_error("executor", e))?;
-    let logits = executor
-        .forward(&BatchInput {
-            tokens: &[warmup_token],
-            positions: &[0],
-        })
+    let block_tokens = kv.view().layout.block_tokens;
+    let max_seq_len = kv.max_seq_len();
+    let mut executor =
+        LlamaExecutor::new(arch, weights, registry, mem, block_tokens, max_seq_len, 1)
+            .map_err(|e| model_error("executor", e))?;
+    let logits = kv
+        .forward(&mut executor, &[warmup_token], &[0])
         .map_err(|e| model_error("warm-up forward", e))?;
     if logits.rows != 1 || logits.data.iter().any(|v| !v.is_finite()) {
         return Err(StartupError::new(format!(
@@ -358,6 +360,7 @@ pub fn load(
     tracing::info!(load_seconds, weight_bytes, "model loaded and warmed up");
     Ok(LoadedModel {
         executor,
+        kv,
         weight_bytes,
         load_seconds,
     })

@@ -6,13 +6,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use half::bf16;
+use turbine_core::types::{BlockId, SeqId};
 use turbine_core::types::{DeviceId, ExecutionBackend, Vendor};
 use turbine_kernels::{
     KernelError, KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider,
     shim_provider,
 };
 use turbine_model::config::{ModelArchConfig, RopeScaling};
-use turbine_model::executor::{BatchInput, LlamaExecutor, Logits, ModelExecutor, TraceTensor};
+use turbine_model::executor::{
+    BatchInput, LlamaExecutor, Logits, ModelExecutor, SeqSlice, SequenceKv, TraceTensor,
+};
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with,
@@ -20,13 +23,17 @@ use turbine_model::testing::tiny::{
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::{MAX_STAGING_BYTES, ModelError, SafetensorsIndex, WeightLoader, llama_slots};
 use turbine_observability::MetricsRegistry;
-use turbine_tensor::DeviceMemory;
 use turbine_tensor::host::HostMemory;
+use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView};
 
 const SEED: u64 = 7;
 const PROMPT_LEN: usize = 20;
 const DECODE_STEPS: usize = 30;
 const MAX_SEQ_LEN: u32 = 64;
+/// KV block size of every test pool.
+const BLOCK_TOKENS: u32 = 16;
+/// Sequences per batch the test executors accept.
+const MAX_SEQS: u32 = 4;
 /// The only head_dim the HIP attention (CK FMHA) supports (P1 S-7): GPU executor tests use a
 /// tiny checkpoint with this head_dim, hidden staying 64.
 const GPU_HEAD_DIM: u32 = 128;
@@ -45,7 +52,44 @@ fn prompt(vocab: u32) -> Vec<u32> {
         .collect()
 }
 
+/// An executor plus the Phase 1 single-sequence KV it runs on; derefs to the executor.
+struct Single {
+    exec: LlamaExecutor,
+    kv: SequenceKv,
+}
+
+impl std::ops::Deref for Single {
+    type Target = LlamaExecutor;
+    fn deref(&self) -> &LlamaExecutor {
+        &self.exec
+    }
+}
+
+impl std::ops::DerefMut for Single {
+    fn deref_mut(&mut self) -> &mut LlamaExecutor {
+        &mut self.exec
+    }
+}
+
+impl Single {
+    fn run(&mut self, tokens: &[u32], positions: &[u32]) -> Result<Logits, ModelError> {
+        self.kv.forward(&mut self.exec, tokens, positions)
+    }
+}
+
 fn executor(
+    spec: &TinySpec,
+    provider: Arc<dyn KernelProvider>,
+    mem: Arc<dyn DeviceMemory>,
+) -> Single {
+    let kv = SequenceKv::new(&mem, spec.config.kv_layout(BLOCK_TOKENS), MAX_SEQ_LEN).expect("kv");
+    Single {
+        exec: paged_executor(spec, provider, mem),
+        kv,
+    }
+}
+
+fn paged_executor(
     spec: &TinySpec,
     provider: Arc<dyn KernelProvider>,
     mem: Arc<dyn DeviceMemory>,
@@ -59,7 +103,7 @@ fn executor(
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &LlamaExecutor::requirements(cfg),
+        &LlamaExecutor::requirements(cfg, BLOCK_TOKENS),
         &metrics,
     )
     .expect("every op has a provider");
@@ -68,13 +112,14 @@ fn executor(
         weights,
         Arc::new(registry),
         mem,
+        BLOCK_TOKENS,
         MAX_SEQ_LEN,
-        MAX_SEQ_LEN,
+        MAX_SEQS,
     )
     .expect("executor")
 }
 
-fn cpu_executor(spec: &TinySpec) -> LlamaExecutor {
+fn cpu_executor(spec: &TinySpec) -> Single {
     executor(
         spec,
         cpu_reference_provider(),
@@ -82,13 +127,9 @@ fn cpu_executor(spec: &TinySpec) -> LlamaExecutor {
     )
 }
 
-fn forward(exec: &mut LlamaExecutor, tokens: &[u32], start: u32) -> Logits {
+fn forward(exec: &mut Single, tokens: &[u32], start: u32) -> Logits {
     let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
-    exec.forward(&BatchInput {
-        tokens,
-        positions: &positions,
-    })
-    .expect("forward")
+    exec.run(tokens, &positions).expect("forward")
 }
 
 /// Greedy argmax, ties to the lower id.
@@ -395,62 +436,123 @@ fn forward_rejects_invalid_batches() {
     let tmp = TempDir::new("tiny-model-invalid");
     let spec = write_tiny_llama(tmp.path(), SEED);
     let mut exec = cpu_executor(&spec);
-    let invalid = |r: Result<Logits, ModelError>| match r {
-        Err(ModelError::Kernel(KernelError::InvalidArgument { message })) => message,
-        Err(other) => panic!("expected InvalidArgument, got {other}"),
-        Ok(_) => panic!("expected InvalidArgument, got logits"),
-    };
+    fn invalid<T>(r: Result<T, ModelError>) -> String {
+        match r {
+            Err(ModelError::Kernel(KernelError::InvalidArgument { message })) => message,
+            Err(other) => panic!("expected InvalidArgument, got {other}"),
+            Ok(_) => panic!("expected InvalidArgument, got success"),
+        }
+    }
 
-    let empty = invalid(exec.forward(&BatchInput {
-        tokens: &[],
-        positions: &[],
-    }));
+    // The Phase 1 single-sequence rules (SequenceKv).
+    let empty = invalid(exec.run(&[], &[]));
     assert!(empty.contains("empty"), "{empty}");
-    let gap = invalid(exec.forward(&BatchInput {
-        tokens: &[1, 2],
-        positions: &[0, 2],
-    }));
+    let gap = invalid(exec.run(&[1, 2], &[0, 2]));
     assert!(gap.contains("consecutive"), "{gap}");
     // Nothing is cached yet: the batch cannot start past position 0.
-    let ahead = invalid(exec.forward(&BatchInput {
-        tokens: &[1],
-        positions: &[3],
-    }));
+    let ahead = invalid(exec.run(&[1], &[3]));
     assert!(ahead.contains("cached"), "{ahead}");
-    let mismatch = invalid(exec.forward(&BatchInput {
-        tokens: &[1, 2],
-        positions: &[0],
-    }));
+    let mismatch = invalid(exec.run(&[1, 2], &[0]));
     assert!(mismatch.contains("positions"), "{mismatch}");
-    let out_of_vocab = invalid(exec.forward(&BatchInput {
-        tokens: &[spec.vocab],
-        positions: &[0],
-    }));
+    let out_of_vocab = invalid(exec.run(&[spec.vocab], &[0]));
     assert!(out_of_vocab.contains("vocab"), "{out_of_vocab}");
 
     let full: Vec<u32> = (0..MAX_SEQ_LEN).map(|i| i % spec.vocab).collect();
     forward(&mut exec, &full, 0);
-    let beyond = invalid(exec.forward(&BatchInput {
-        tokens: &[1],
-        positions: &[MAX_SEQ_LEN],
-    }));
+    let beyond = invalid(exec.run(&[1], &[MAX_SEQ_LEN]));
     assert!(beyond.contains("max_seq_len"), "{beyond}");
+
+    // The ragged-batch rules of the executor itself.
+    let Single { exec, kv } = &mut exec;
+    let view = kv.view();
+    let table: Vec<BlockId> = (0..4).map(BlockId).collect();
+    let seq = |id, q_start, q_len, kv_len| SeqSlice {
+        seq: SeqId(id),
+        q_start,
+        q_len,
+        kv_len,
+        block_table: &table,
+    };
+    let mut run = |tokens: &[u32], positions: &[u32], seqs: &[SeqSlice<'_>]| {
+        invalid(exec.forward(&BatchInput {
+            tokens,
+            positions,
+            seqs,
+            kv: &view,
+        }))
+    };
+    let too_many: Vec<u32> = vec![1; MAX_SEQ_LEN as usize + 1];
+    let err = run(&too_many, &too_many, &[seq(0, 0, 65, 65)]);
+    assert!(err.contains("max_batch_tokens"), "{err}");
+    let err = run(&[1, 2], &[0, 1], &[]);
+    assert!(err.contains("no sequences"), "{err}");
+    let five: Vec<SeqSlice<'_>> = (0..5).map(|i| seq(i, i as u32, 1, 1)).collect();
+    let err = run(&[1; 5], &[0; 5], &five);
+    assert!(err.contains("max_seqs"), "{err}");
+    let err = run(&[1, 2], &[0, 1], &[seq(0, 0, 1, 1)]);
+    assert!(err.contains("cover 1"), "{err}");
+    let err = run(&[1, 2], &[5, 6], &[seq(0, 0, 2, 2)]);
+    assert!(err.contains("expected 0"), "{err}");
+    let err = run(&[1, 2], &[0, 0], &[seq(3, 0, 1, 1), seq(3, 1, 1, 1)]);
+    assert!(err.contains("twice"), "{err}");
+    let short = [BlockId(0)];
+    let err = run(
+        &[1],
+        &[16],
+        &[SeqSlice {
+            block_table: &short,
+            ..seq(0, 0, 1, 17)
+        }],
+    );
+    assert!(err.contains("needs 2 blocks"), "{err}");
+    let outside = [BlockId(4)];
+    let err = run(
+        &[1],
+        &[0],
+        &[SeqSlice {
+            block_table: &outside,
+            ..seq(0, 0, 1, 1)
+        }],
+    );
+    assert!(err.contains("outside the pool"), "{err}");
+    // A pool laid out for another block size.
+    let other = KvPoolView {
+        layout: turbine_core::types::KvLayout {
+            block_tokens: 8,
+            ..view.layout
+        },
+        ..view
+    };
+    let err = invalid(exec.forward(&BatchInput {
+        tokens: &[1],
+        positions: &[0],
+        seqs: &[seq(0, 0, 1, 1)],
+        kv: &other,
+    }));
+    assert!(err.contains("layout"), "{err}");
+    let err = invalid(exec.copy_blocks(&view, &[BlockId(0)], &[]));
+    assert!(err.contains("destinations"), "{err}");
+    let err = invalid(exec.copy_blocks(&view, &[BlockId(0)], &[BlockId(9)]));
+    assert!(err.contains("outside the pool"), "{err}");
 }
 
 #[test]
 fn requirements_and_workspace() {
     let tmp = TempDir::new("tiny-model-reqs");
     let spec = write_tiny_llama(tmp.path(), SEED);
-    let reqs = LlamaExecutor::requirements(&spec.config);
+    let reqs = LlamaExecutor::requirements(&spec.config, BLOCK_TOKENS);
     let rendered: Vec<String> = reqs
         .iter()
         .map(|r| format!("{} {}", r.op, r.config))
         .collect();
-    // Distinct configs only, every op family the forward pass runs.
+    // Distinct configs only, every op family the forward pass runs plus the block fork.
     let mut unique = rendered.clone();
     unique.sort();
     unique.dedup();
     assert_eq!(unique.len(), rendered.len(), "{rendered:#?}");
+    // One block of one layer: 2 × 16 tokens × 2 kv heads × 16 head_dim × 2 bytes.
+    let layer_block = 2 * 16 * 2 * 16 * 2;
+    let copy = format!("copy_blocks num_layers=2 block_bytes={layer_block}");
     for want in [
         "embedding hidden=64 vocab_rows=263 dtype=bf16",
         "rmsnorm dim=64 dtype=bf16",
@@ -460,26 +562,233 @@ fn requirements_and_workspace() {
         "gemm n=64 k=128 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
         "gemm n=263 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
         "rope head_dim=16 rotary_dim=16 q_heads=4 kv_heads=2 dtype=bf16",
-        "attention_prefill head_dim=16 kv_heads=2 dtype=bf16 q_heads=4 causal=1",
-        "attention_decode head_dim=16 kv_heads=2 dtype=bf16 q_heads=4 causal=1",
+        "attention_prefill_paged head_dim=16 kv_heads=2 dtype=bf16 q_heads=4 causal=1 block_tokens=16",
+        "attention_decode_paged head_dim=16 kv_heads=2 dtype=bf16 q_heads=4 causal=1 block_tokens=16",
         "silu_mul cols=128 dtype=bf16",
         "add dtype=bf16",
+        copy.as_str(),
     ] {
-        assert!(rendered.iter().any(|r| r == want), "missing {want}");
+        assert!(
+            rendered.iter().any(|r| r == want),
+            "missing {want}: {rendered:#?}"
+        );
     }
-    assert_eq!(rendered.len(), 12, "{rendered:#?}");
+    assert_eq!(rendered.len(), 13, "{rendered:#?}");
 
-    // Workspace grows linearly in the forward token count, with a fixed part for the last
-    // row, the logits and inv_freq.
-    let w1 = LlamaExecutor::workspace_bytes(&spec.config, 1);
-    let w2 = LlamaExecutor::workspace_bytes(&spec.config, 2);
-    let w64 = LlamaExecutor::workspace_bytes(&spec.config, 64);
-    assert_eq!(w64 - w1, 63 * (w2 - w1));
-    // Per token: ids + positions (i32), x/h/proj [hidden], q/attn [q_dim], gate/up/act
-    // [intermediate], all bf16.
-    assert_eq!(w2 - w1, 4 + 4 + 2 * (3 * 64 + 2 * 64 + 3 * 128));
-    // Fixed: last row [hidden] bf16, logits [vocab] f32, inv_freq [head_dim / 2] f32.
-    assert_eq!(w1 - (w2 - w1), 2 * 64 + 4 * 263 + 4 * 8);
+    // Workspace grows linearly in the batch token count and in the sequence count.
+    let ws = |t, n| LlamaExecutor::workspace_bytes(&spec.config, BLOCK_TOKENS, t, n);
+    let per_token = ws(2, 1) - ws(1, 1);
+    assert_eq!(ws(64, 1) - ws(1, 1), 63 * per_token);
+    // Per token: ids + positions (i32), x/h/proj [hidden], q/attn [q_dim], k/v [kv_dim],
+    // gate/up/act [intermediate], all bf16.
+    assert_eq!(per_token, 4 + 4 + 2 * (3 * 64 + 2 * 64 + 2 * 32 + 3 * 128));
+    // Per sequence: last row [hidden] bf16, logits [vocab] f32, q_indptr + kv_lens entries and
+    // a block table for max_position_embeddings tokens (i32).
+    let blocks = u64::from(spec.config.max_position_embeddings.div_ceil(BLOCK_TOKENS));
+    assert_eq!(ws(1, 2) - ws(1, 1), 2 * 64 + 4 * 263 + 4 * (2 + blocks));
+    // Fixed: the extra q_indptr entry and inv_freq [head_dim / 2] f32.
+    assert_eq!(ws(1, 1) - per_token - (ws(1, 2) - ws(1, 1)), 4 + 4 * 8);
+}
+
+/// One pool shared by the paged tests: `blocks` blocks of the executor's layout.
+fn pool(mem: &Arc<dyn DeviceMemory>, exec: &LlamaExecutor, blocks: u32) -> DeviceBuffer {
+    let layout = exec.kv_layout();
+    let bytes = layout.block_bytes() * u64::from(blocks);
+    DeviceBuffer::alloc(mem, bytes as usize).expect("pool")
+}
+
+fn pool_view<'a>(storage: &'a DeviceBuffer, exec: &LlamaExecutor, blocks: u32) -> KvPoolView<'a> {
+    let layout = *exec.kv_layout();
+    KvPoolView {
+        storage,
+        layout,
+        num_blocks: blocks,
+        layer_stride_bytes: layout.block_bytes() / u64::from(layout.num_layers) * u64::from(blocks),
+    }
+}
+
+/// A 40-token prompt prefilled into a shared pool through a scattered block table, then 10
+/// greedy decode steps, gives the logits of the Phase 1 single-sequence run (contiguous
+/// blocks, one sequence per batch) on the same executor.
+#[test]
+fn paged_llama_single_sequence() {
+    const PROMPT: u32 = 40;
+    const STEPS: usize = 10;
+    let tmp = TempDir::new("tiny-model-paged-single");
+    let spec = write_tiny_llama(tmp.path(), SEED);
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut single = executor(&spec, cpu_reference_provider(), Arc::clone(&mem));
+    let prompt: Vec<u32> = (0..PROMPT).map(|i| (i * 53 + 5) % spec.vocab).collect();
+
+    // Reference: the Phase 1 path, greedy tokens chosen by it.
+    let mut want = vec![forward(&mut single, &prompt, 0).row(0).to_vec()];
+    let mut tokens = prompt.clone();
+    for _ in 0..STEPS {
+        let next = argmax(want.last().expect("row"));
+        let pos = tokens.len() as u32;
+        tokens.push(next);
+        want.push(forward(&mut single, &[next], pos).row(0).to_vec());
+    }
+
+    // The same executor on a 12-block pool; the sequence owns blocks 9, 2 and 7 then 4, in
+    // that order, and the other blocks hold unrelated K/V that must not be read.
+    let Single { exec, .. } = &mut single;
+    let storage = pool(&mem, exec, 12);
+    let noise: Vec<u8> = (0..storage.len()).map(|i| (i * 7 % 251) as u8).collect();
+    storage.whole().write_bytes(&noise).expect("fill pool");
+    let kv = pool_view(&storage, exec, 12);
+    let table = [BlockId(9), BlockId(2), BlockId(7), BlockId(4)];
+    let run = |exec: &mut LlamaExecutor, tokens: &[u32], start: u32| {
+        let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
+        let seqs = [SeqSlice {
+            seq: SeqId(42),
+            q_start: 0,
+            q_len: tokens.len() as u32,
+            kv_len: start + tokens.len() as u32,
+            block_table: &table,
+        }];
+        exec.forward(&BatchInput {
+            tokens,
+            positions: &positions,
+            seqs: &seqs,
+            kv: &kv,
+        })
+        .expect("paged forward")
+    };
+    let logits = run(exec, &prompt, 0);
+    assert_eq!((logits.rows, logits.vocab), (1, spec.vocab as usize));
+    let mut got = vec![logits.row(0).to_vec()];
+    for step in 0..STEPS {
+        let pos = PROMPT + step as u32;
+        got.push(run(exec, &[tokens[pos as usize]], pos).row(0).to_vec());
+    }
+    // Both runs share the executor, so the reference itself is pinned to the naive model.
+    let naive = Naive::load(&spec.dir, &spec.config);
+    for (step, (g, w)) in got.iter().zip(&want).enumerate() {
+        let diff = max_abs_diff(g, w);
+        assert!(diff <= 1e-4, "step {step}: max abs diff {diff}");
+        let context = &tokens[..PROMPT as usize + step];
+        let diff = max_abs_diff(w, &naive.logits(context));
+        assert!(
+            diff <= 1e-4,
+            "step {step}: reference vs naive max abs diff {diff}"
+        );
+    }
+}
+
+/// One ragged batch mixing a decode and two prefills of different lengths in one pool returns,
+/// per sequence, the logits of that sequence run alone; `copy_blocks` forks a sequence whose
+/// continuation then matches the original's.
+#[test]
+fn ragged_batch_rows_match_single_sequences() {
+    let tmp = TempDir::new("tiny-model-ragged");
+    let spec = write_tiny_llama(tmp.path(), SEED);
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut single = executor(&spec, cpu_reference_provider(), Arc::clone(&mem));
+    let v = spec.vocab;
+    let a: Vec<u32> = (0..21).map(|i| (i * 31 + 3) % v).collect();
+    let b: Vec<u32> = (0..17).map(|i| (i * 17 + 9) % v).collect();
+    let c: Vec<u32> = (0..3).map(|i| (i * 11 + 1) % v).collect();
+    let alone = |single: &mut Single, tokens: &[u32]| forward(single, tokens, 0).row(0).to_vec();
+    let (want_a, want_b, want_c) = (
+        alone(&mut single, &a),
+        alone(&mut single, &b),
+        alone(&mut single, &c),
+    );
+
+    let Single { exec, .. } = &mut single;
+    let storage = pool(&mem, exec, 10);
+    let kv = pool_view(&storage, exec, 10);
+    let (ta, tb, tc) = (
+        [BlockId(3), BlockId(8)],
+        [BlockId(0), BlockId(5)],
+        [BlockId(6)],
+    );
+    // Sequence A's first 20 tokens are prefilled alone; its 21st arrives as a decode in the
+    // ragged batch, alongside B's and C's whole prompts.
+    let prefill_a = [SeqSlice {
+        seq: SeqId(1),
+        q_start: 0,
+        q_len: 20,
+        kv_len: 20,
+        block_table: &ta,
+    }];
+    let positions: Vec<u32> = (0..20).collect();
+    exec.forward(&BatchInput {
+        tokens: &a[..20],
+        positions: &positions,
+        seqs: &prefill_a,
+        kv: &kv,
+    })
+    .expect("prefill a");
+    let tokens: Vec<u32> = [&a[20..], &b[..], &c[..]].concat();
+    let positions: Vec<u32> = std::iter::once(20).chain(0..17).chain(0..3).collect();
+    let seqs = [
+        SeqSlice {
+            seq: SeqId(1),
+            q_start: 0,
+            q_len: 1,
+            kv_len: 21,
+            block_table: &ta,
+        },
+        SeqSlice {
+            seq: SeqId(2),
+            q_start: 1,
+            q_len: 17,
+            kv_len: 17,
+            block_table: &tb,
+        },
+        SeqSlice {
+            seq: SeqId(3),
+            q_start: 18,
+            q_len: 3,
+            kv_len: 3,
+            block_table: &tc,
+        },
+    ];
+    let logits = exec
+        .forward(&BatchInput {
+            tokens: &tokens,
+            positions: &positions,
+            seqs: &seqs,
+            kv: &kv,
+        })
+        .expect("ragged forward");
+    assert_eq!(logits.rows, 3);
+    for (s, want) in [&want_a, &want_b, &want_c].into_iter().enumerate() {
+        let diff = max_abs_diff(logits.row(s), want);
+        assert!(diff <= 1e-4, "sequence {s}: max abs diff {diff}");
+    }
+
+    // Fork C (3 tokens, one partial block) into block 9 and decode both copies with the same
+    // token: identical logits, and C's own blocks are untouched by the fork's append.
+    exec.copy_blocks(&kv, &[BlockId(6)], &[BlockId(9)])
+        .expect("copy_blocks");
+    let fork = [BlockId(9)];
+    let decode = |exec: &mut LlamaExecutor, table: &[BlockId]| {
+        let seqs = [SeqSlice {
+            seq: SeqId(3),
+            q_start: 0,
+            q_len: 1,
+            kv_len: 4,
+            block_table: table,
+        }];
+        exec.forward(&BatchInput {
+            tokens: &[7],
+            positions: &[3],
+            seqs: &seqs,
+            kv: &kv,
+        })
+        .expect("decode")
+        .row(0)
+        .to_vec()
+    };
+    let original = decode(exec, &tc);
+    let forked = decode(exec, &fork);
+    assert_eq!(
+        original, forked,
+        "the fork continues exactly like the original"
+    );
 }
 
 /// Max |Δ logit| between the HIP and cpu-reference providers on the tiny checkpoint. With the
@@ -544,7 +853,7 @@ fn hip_matches_cpu() {
 /// tracing each forward. Returns per executor the trace of every step, and each step's first
 /// position.
 fn traced_run(
-    execs: &mut [&mut LlamaExecutor],
+    execs: &mut [&mut Single],
     prompt: &[u32],
     decode: usize,
 ) -> (Vec<Vec<Vec<TraceTensor>>>, Vec<usize>) {

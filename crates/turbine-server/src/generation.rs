@@ -24,7 +24,7 @@ use turbine_core::request::{
     StopConditions,
 };
 use turbine_device::DeviceInventory;
-use turbine_model::executor::ModelExecutor;
+use turbine_model::executor::{ModelExecutor, SequenceKv};
 use turbine_model::{ChatTemplate, GenerateOptions, ModelMetrics, Tokenizer, generate};
 
 use crate::metrics::{Outcome, ServerMetrics, TokenKind};
@@ -408,10 +408,15 @@ pub struct Engine {
 impl Engine {
     /// Serves jobs until the sender is dropped. Returns early with the failure message once
     /// `MAX_CONSECUTIVE_FAILURES` requests in a row failed.
-    pub fn run(&self, exec: &mut dyn ModelExecutor, jobs: &Receiver<Job>) -> Result<(), String> {
+    pub fn run(
+        &self,
+        exec: &mut dyn ModelExecutor,
+        kv: &mut SequenceKv,
+        jobs: &Receiver<Job>,
+    ) -> Result<(), String> {
         let mut consecutive_failures = 0u32;
         while let Ok(job) = jobs.recv() {
-            let (outcome, detail) = self.serve(exec, job);
+            let (outcome, detail) = self.serve(exec, kv, job);
             match outcome {
                 Outcome::Failed => {
                     consecutive_failures += 1;
@@ -433,7 +438,12 @@ impl Engine {
     /// The request is accounted and the slot released *before* its final event is sent, so a
     /// client that has read the whole response can start the next request at once and sees
     /// its metrics.
-    fn serve(&self, exec: &mut dyn ModelExecutor, job: Job) -> (Outcome, String) {
+    fn serve(
+        &self,
+        exec: &mut dyn ModelExecutor,
+        kv: &mut SequenceKv,
+        job: Job,
+    ) -> (Outcome, String) {
         let Job {
             request,
             events,
@@ -450,7 +460,14 @@ impl Engine {
             max_seq_len: self.max_seq_len,
             metrics: Some(&self.model_metrics),
         };
-        for event in generate(exec, Arc::clone(&self.tokenizer), &request, &cancel, opts) {
+        for event in generate(
+            exec,
+            kv,
+            Arc::clone(&self.tokenizer),
+            &request,
+            &cancel,
+            opts,
+        ) {
             match &event {
                 GenerationEvent::Token { .. } => {
                     let now = Instant::now();
@@ -572,6 +589,7 @@ fn unserved_phase2_field(body: &OpenAiRequest) -> Option<&'static str> {
 mod tests {
     use std::sync::mpsc::sync_channel;
 
+    use turbine_core::types::{BlockId, DeviceId};
     use turbine_core::types::{KvLayout, ModelShape, RequestId};
     use turbine_kernels::KernelError;
     use turbine_model::ModelError;
@@ -579,6 +597,8 @@ mod tests {
     use turbine_model::testing::TempDir;
     use turbine_model::testing::tiny::write_tiny_llama;
     use turbine_observability::MetricsRegistry;
+    use turbine_tensor::KvPoolView;
+    use turbine_tensor::host::HostMemory;
 
     use super::*;
 
@@ -599,6 +619,14 @@ mod tests {
             Err(ModelError::Kernel(KernelError::Device {
                 message: "hipErrorOutOfMemory: injected".into(),
             }))
+        }
+        fn copy_blocks(
+            &mut self,
+            _kv: &KvPoolView<'_>,
+            _src: &[BlockId],
+            _dst: &[BlockId],
+        ) -> Result<(), ModelError> {
+            unreachable!("the Phase 1 engine never forks blocks")
         }
     }
 
@@ -641,8 +669,10 @@ mod tests {
         };
         let mut exec = FailingExecutor {
             shape: spec.config.shape(),
-            kv: spec.config.kv_layout(1),
+            kv: spec.config.kv_layout(16),
         };
+        let mem = HostMemory::new(DeviceId(0), 1 << 20) as Arc<dyn turbine_tensor::DeviceMemory>;
+        let mut kv = SequenceKv::new(&mem, exec.kv, 64).expect("kv");
         let (jobs_tx, jobs_rx) = sync_channel(4);
         let mut receivers = Vec::new();
         for _ in 0..4 {
@@ -652,7 +682,7 @@ mod tests {
         }
         slot.store(true, Ordering::Release);
 
-        let err = engine.run(&mut exec, &jobs_rx).unwrap_err();
+        let err = engine.run(&mut exec, &mut kv, &jobs_rx).unwrap_err();
         assert!(err.contains("3 consecutive requests failed"), "{err}");
         assert!(err.contains("hipErrorOutOfMemory"), "{err}");
         assert!(!slot.load(Ordering::Acquire), "the slot is released");

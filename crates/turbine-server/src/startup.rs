@@ -16,6 +16,7 @@ use turbine_api::{ApiLimits, ApiState};
 use turbine_core::config::{self, Config};
 use turbine_device::{DeviceInventory, DeviceMetrics, DiscoveryOptions};
 use turbine_model::ModelMetrics;
+use turbine_model::executor::SequenceKv;
 use turbine_observability::MetricsRegistry;
 
 use crate::cli::Cli;
@@ -171,15 +172,24 @@ fn spawn_engine(
                 index,
                 registry,
                 max_seq_len,
+                block_tokens,
                 ..
             } = prepared;
             let warmup_token = generation.bos_token_id.unwrap_or(0);
+            let kv = match SequenceKv::new(&provider.mem, arch.kv_layout(block_tokens), max_seq_len)
+            {
+                Ok(kv) => kv,
+                Err(e) => {
+                    let _ = fatal.send(Fatal::LoadFailed(format!("KV allocation: {e}")));
+                    return;
+                }
+            };
             let loaded = match model::load(
                 &arch,
                 &index,
                 registry,
                 provider.mem,
-                max_seq_len,
+                kv,
                 warmup_token,
                 &model_metrics,
             ) {
@@ -191,6 +201,7 @@ fn spawn_engine(
             };
             drop(index);
             let mut executor = loaded.executor;
+            let mut kv = loaded.kv;
             // Capacity 1: the slot admits one request, so at most one job is ever queued.
             let (jobs_tx, jobs_rx) = std::sync::mpsc::sync_channel::<Job>(1);
             backend.set_ready(jobs_tx, loaded.load_seconds, loaded.weight_bytes);
@@ -203,7 +214,7 @@ fn spawn_engine(
                 model_metrics,
             };
             drop(backend);
-            if let Err(message) = engine.run(&mut executor, &jobs_rx) {
+            if let Err(message) = engine.run(&mut executor, &mut kv, &jobs_rx) {
                 let _ = fatal.send(Fatal::DeviceError(message));
             }
         })

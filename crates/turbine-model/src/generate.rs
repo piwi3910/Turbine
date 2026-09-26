@@ -9,7 +9,7 @@ use turbine_core::request::{
     CancelFlag, ErrorCode, FinishReason, GenerationEvent, GenerationRequest, StopConditions, Usage,
 };
 
-use crate::executor::{BatchInput, ModelExecutor};
+use crate::executor::{ModelExecutor, SequenceKv};
 use crate::metrics::{ForwardPhase, ModelMetrics};
 use crate::sampler::Sampler;
 use crate::tokenizer::{IncrementalDetokenizer, Tokenizer};
@@ -29,9 +29,12 @@ pub struct GenerateOptions<'a> {
 /// `Error { code: InternalError }` when a forward pass fails. When `cancel` fires the stream
 /// ends without `Finished`; it is checked before every forward pass.
 ///
-/// Each `next` runs at most one forward pass, so dropping the iterator stops the work.
+/// The sequence's K/V lives in `kv` (a single-sequence pool; its length bounds the context
+/// together with `opts.max_seq_len`). Each `next` runs at most one forward pass, so dropping the
+/// iterator stops the work.
 pub fn generate<'a>(
     exec: &'a mut dyn ModelExecutor,
+    kv: &'a mut SequenceKv,
     tokenizer: Arc<Tokenizer>,
     req: &'a GenerationRequest,
     cancel: &'a CancelFlag,
@@ -39,6 +42,7 @@ pub fn generate<'a>(
 ) -> Generation<'a> {
     Generation {
         exec,
+        kv,
         req,
         cancel,
         opts,
@@ -72,6 +76,7 @@ fn end_ids(stop: &StopConditions) -> Vec<u32> {
 /// The event stream of one request; see [`generate`].
 pub struct Generation<'a> {
     exec: &'a mut dyn ModelExecutor,
+    kv: &'a mut SequenceKv,
     req: &'a GenerationRequest,
     cancel: &'a CancelFlag,
     opts: GenerateOptions<'a>,
@@ -139,10 +144,7 @@ impl Generation<'_> {
             ),
         };
         let started = Instant::now();
-        let result = self.exec.forward(&BatchInput {
-            tokens,
-            positions: &positions,
-        });
+        let result = self.kv.forward(self.exec, tokens, &positions);
         if let Some(m) = self.opts.metrics {
             m.observe_forward(phase, started.elapsed().as_secs_f64());
         }
@@ -278,7 +280,10 @@ mod tests {
     use turbine_tensor::host::HostMemory;
 
     use super::*;
-    use crate::executor::{BatchInput, LlamaExecutor, Logits, ModelExecutor};
+    use turbine_core::types::BlockId;
+    use turbine_tensor::KvPoolView;
+
+    use crate::executor::{BatchInput, LlamaExecutor, Logits, ModelExecutor, SequenceKv};
     use crate::metrics::ModelMetrics;
     use crate::sampler::argmax;
     use crate::testing::TempDir;
@@ -361,6 +366,18 @@ mod tests {
                 data,
             })
         }
+        fn copy_blocks(
+            &mut self,
+            _kv: &KvPoolView<'_>,
+            _src: &[BlockId],
+            _dst: &[BlockId],
+        ) -> Result<(), ModelError> {
+            unreachable!("generate never forks blocks")
+        }
+    }
+
+    fn host_mem() -> Arc<dyn DeviceMemory> {
+        HostMemory::new(DeviceId(0), 1 << 30)
     }
 
     fn tiny() -> (TempDir, TinySpec, Arc<Tokenizer>) {
@@ -425,7 +442,8 @@ mod tests {
             max_seq_len,
             metrics,
         };
-        generate(exec, Arc::clone(tokenizer), req, &cancel, opts).collect()
+        let mut kv = SequenceKv::new(&host_mem(), exec.kv, max_seq_len).expect("kv");
+        generate(exec, &mut kv, Arc::clone(tokenizer), req, &cancel, opts).collect()
     }
 
     /// Token ids, concatenated text, per-token texts and the finish of an event list.
@@ -653,9 +671,9 @@ mod tests {
         );
     }
 
-    fn tiny_executor(spec: &TinySpec) -> LlamaExecutor {
+    fn tiny_executor(spec: &TinySpec) -> (LlamaExecutor, SequenceKv) {
         let cfg = &spec.config;
-        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let mem = host_mem();
         let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
         let weights = WeightLoader::load(&index, &crate::llama_slots(cfg), &mem, MAX_STAGING_BYTES)
             .expect("load");
@@ -664,11 +682,14 @@ mod tests {
         let registry = KernelRegistry::build(
             vec![provider],
             &order,
-            &LlamaExecutor::requirements(cfg),
+            &LlamaExecutor::requirements(cfg, 16),
             &KernelMetrics::register(&MetricsRegistry::new()),
         )
         .expect("every op has a provider");
-        LlamaExecutor::new(cfg, weights, Arc::new(registry), mem, 64, 64).expect("executor")
+        let kv = SequenceKv::new(&mem, cfg.kv_layout(16), 64).expect("kv");
+        let exec =
+            LlamaExecutor::new(cfg, weights, Arc::new(registry), mem, 16, 64, 1).expect("executor");
+        (exec, kv)
     }
 
     fn tokens_of(events: &[GenerationEvent]) -> Vec<u32> {
@@ -684,7 +705,7 @@ mod tests {
     #[test]
     fn seeded_sampling_is_deterministic() {
         let (_dir, spec, tok) = tiny();
-        let mut exec = tiny_executor(&spec);
+        let (mut exec, mut kv) = tiny_executor(&spec);
         let prompt: Vec<u32> = std::iter::once(256)
             .chain("The tiny model".bytes().map(u32::from))
             .collect();
@@ -696,7 +717,7 @@ mod tests {
                 metrics: None,
             };
             let events: Vec<GenerationEvent> =
-                generate(&mut exec, Arc::clone(&tok), &req, &cancel, opts).collect();
+                generate(&mut exec, &mut kv, Arc::clone(&tok), &req, &cancel, opts).collect();
             assert!(
                 matches!(
                     events.last(),
@@ -734,15 +755,10 @@ mod tests {
         });
 
         // The argmax sequence, driven by hand.
-        let mut exec = tiny_executor(&spec);
+        let (mut exec, mut kv) = tiny_executor(&spec);
         let mut expected = Vec::new();
         let positions: Vec<u32> = (0..prompt.len() as u32).collect();
-        let mut logits = exec
-            .forward(&BatchInput {
-                tokens: &prompt,
-                positions: &positions,
-            })
-            .expect("prefill");
+        let mut logits = kv.forward(&mut exec, &prompt, &positions).expect("prefill");
         for step in 0..16u32 {
             let t = argmax(logits.row(0));
             expected.push(t);
@@ -750,12 +766,7 @@ mod tests {
                 break;
             }
             let pos = prompt.len() as u32 + step;
-            logits = exec
-                .forward(&BatchInput {
-                    tokens: &[t],
-                    positions: &[pos],
-                })
-                .expect("decode");
+            logits = kv.forward(&mut exec, &[t], &[pos]).expect("decode");
         }
         assert_eq!(greedy_tokens, expected, "temperature 0 is argmax");
     }
