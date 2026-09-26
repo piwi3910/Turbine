@@ -425,7 +425,7 @@ Interfaces:
 - `novanas-vllm-job.yaml`: namespace `turbine-ci`, image `rocm/vllm` at a tag pinned after checking `curl -s 'https://hub.docker.com/v2/repositories/rocm/vllm/tags?page_size=25'`, `amd.com/gpu: 1`, `hostNetwork: true`, port 18100, weights read-only, args `--dtype bfloat16 --kv-cache-dtype auto`; `scripts/lab-serve.sh novanas --vllm <slug>` waits for `/v1/models` or exits 1 printing the pod log
 - `tests/golden/tools/requests.jsonl`: chat requests with `tools` (`required`, named, `auto`) and `response_format` `json_schema`
 - `lab_openai tools_and_json_schema` (ignored): starts `turbine-server` on the real Llama-3.2-3B with the HIP backend, runs every request greedily, asserts constrained calls and JSON outputs parse and validate and `auto` results never leak raw call JSON into `content`
-- `tolerance.json` for OLMoE identical to Llama's
+- `tolerance.json` for OLMoE identical to Llama's (amended 2026-09-26: replaced by the calibrated self-spread tolerance, see `tests/golden/olmoe-1b-7b-0125-instruct/README.md`)
   Covers: S-15/S-17/S-18 AC `lab_openai tools_and_json_schema`; S-5/S-16/S-15 `hip_ops paged_and_moe_ops` (lab run); S-15 (lab configs and jobs)
   Depends on: Tasks 17, 18
 

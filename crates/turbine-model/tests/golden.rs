@@ -5,11 +5,14 @@
 //!   `cpu-reference` provider against a reference generated on the spot.
 //! - `logits_match_reference` (lab only, needs a HIP device and the weights): Llama-3.2-3B on the
 //!   HIP provider against the committed `tests/golden/llama-3.2-3b-instruct/reference.jsonl`.
+//! - `olmoe_logits_match_reference` (lab only, likewise): OLMoE-1B-7B on the HIP provider against
+//!   `tests/golden/olmoe-1b-7b-0125-instruct/reference.jsonl` under its own calibrated
+//!   `tolerance.json` (see the README beside it).
 //! - `hip_trace_vs_cpu_3b` and `olmoe_teacher_forced_vs_reference` (lab diagnostics, no-ops
 //!   unless their environment variable names prompts): op-by-op HIP-vs-CPU traces of the 3B,
 //!   and teacher-forced OLMoE log-probabilities of both providers against its reference.
 //!
-//! The first two judge with the committed `tolerance.json` and the same rule as `turbine-golden compare`,
+//! The first three judge with the committed `tolerance.json` and the same rule as `turbine-golden compare`,
 //! re-implemented in [`compare_prompt`] because this crate cannot depend on `turbine-bench`
 //! (contract §1.2).
 use std::path::{Path, PathBuf};
@@ -403,6 +406,50 @@ fn committed_tolerance_and_reference() {
     );
 }
 
+/// OLMoE's committed tolerance is transformers' own spread (decision "OLMoE golden gate",
+/// 2026-09-26; measurement in the README beside it): the same rule and floor as Llama, bounds
+/// 1.01 / 1.66 that every transformers variant (sdpa/eager × BF16/FP32 × incremental/full)
+/// meets against the reference, at least 14/16 prompts. Breaks if the OLMoE file drifts from
+/// the documented calibration or Llama's file is loosened with it.
+#[test]
+fn olmoe_tolerance_is_the_calibrated_self_spread() {
+    let fixture = golden_dir().join("olmoe-1b-7b-0125-instruct");
+    let tol = read_tolerance(&fixture.join("tolerance.json"));
+    assert_eq!(
+        (tol.min_identical_prefix, tol.min_prompts_passing, tol.top_k),
+        (32, 14, 5)
+    );
+    assert_eq!(
+        (
+            tol.max_abs_logprob_diff_likely,
+            tol.max_abs_logprob_diff_tail,
+            tol.likely_logprob_floor,
+            tol.margin_nats
+        ),
+        (1.01, 1.66, -2.0, 0.5)
+    );
+    // The spread already spans GEMM shapes and kernels, so concurrency 16 gets the same bounds.
+    assert_eq!(
+        (
+            tol.max_abs_logprob_diff_likely_batched,
+            tol.max_abs_logprob_diff_tail_batched
+        ),
+        (Some(1.01), Some(1.66))
+    );
+    let readme = std::fs::read_to_string(fixture.join("README.md")).expect("README.md");
+    for bound in ["1.01", "1.66", "1.0092", "1.6569"] {
+        assert!(readme.contains(bound), "README.md lacks {bound}");
+    }
+    let llama = read_tolerance(&golden_dir().join("llama-3.2-3b-instruct/tolerance.json"));
+    assert_eq!(
+        (
+            llama.max_abs_logprob_diff_likely,
+            llama.max_abs_logprob_diff_tail
+        ),
+        (0.15, 0.55)
+    );
+}
+
 // ------------------------------------------------------------------------ replay helpers
 
 /// Prompt token ids exactly as the server builds them: chat prompts through the model's chat
@@ -433,7 +480,8 @@ fn prompt_token_ids(
 /// (`ignore_eos`, as `turbine-golden compare` requests), with the top-20 raw logprobs per
 /// position.
 fn greedy(
-    runner: &mut Runner,
+    exec: &mut dyn ModelExecutor,
+    kv: &mut SequenceKv,
     tokenizer: &Arc<Tokenizer>,
     prompt_tokens: Vec<u32>,
     max_tokens: u32,
@@ -473,7 +521,6 @@ fn greedy(
     let mut tokens = Vec::new();
     let mut tops = Vec::new();
     let mut finished = None;
-    let Runner { exec, kv } = runner;
     for event in generate(exec, kv, Arc::clone(tokenizer), &req, &cancel, opts) {
         match event {
             GenerationEvent::Token {
@@ -502,7 +549,8 @@ fn greedy(
 /// Replays every prompt on `exec`, asserting Turbine's prompt ids equal the reference's, and
 /// returns one verdict per prompt.
 fn replay(
-    runner: &mut Runner,
+    exec: &mut dyn ModelExecutor,
+    kv: &mut SequenceKv,
     model_dir: &Path,
     prompts: &[PromptRecord],
     references: &[ReferenceRecord],
@@ -532,7 +580,7 @@ fn replay(
             "{}",
             prompt.id
         );
-        let (tokens, tops) = greedy(runner, &tokenizer, ids, prompt.max_tokens, max_seq_len);
+        let (tokens, tops) = greedy(exec, kv, &tokenizer, ids, prompt.max_tokens, max_seq_len);
         if std::env::var_os("TURBINE_GOLDEN_DUMP").is_some() {
             // Diagnostics: the candidate in reference.jsonl shape, one line per prompt.
             let line = serde_json::json!({
@@ -558,6 +606,14 @@ fn needed_seq_len(references: &[ReferenceRecord]) -> u32 {
 
 /// KV block size of the golden runs: the `kv.block_tokens` default (CK paged attention on HIP).
 const BLOCK_TOKENS: u32 = 128;
+
+/// Held by every test that loads a 3B-class model onto the GPU, so the test harness's threads
+/// never hold Llama-3.2-3B and OLMoE-1B-7B (and their KV) on one card at once.
+static GPU_MODEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu_model_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_MODEL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// An executor and the single-sequence KV it generates on.
 struct Runner {
@@ -632,9 +688,10 @@ fn hf_reference_matches_cpu() {
     let tol = read_tolerance(&golden_dir().join("llama-3.2-3b-instruct/tolerance.json"));
     let max_seq_len = needed_seq_len(&references);
     let mem = HostMemory::new(turbine_core::types::DeviceId(0), 1 << 30);
-    let mut exec = build_executor(&model_dir, cpu_reference_provider(), mem, max_seq_len);
+    let mut runner = build_executor(&model_dir, cpu_reference_provider(), mem, max_seq_len);
     let verdicts = replay(
-        &mut exec,
+        &mut runner.exec,
+        &mut runner.kv,
         &model_dir,
         &prompts,
         &references,
@@ -649,6 +706,7 @@ fn hf_reference_matches_cpu() {
 #[test]
 #[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY and TURBINE_TEST_MODEL_DIR"]
 fn logits_match_reference() {
+    let _gpu = gpu_model_lock();
     if !turbine_kernels::test_support::require_backend("hip") {
         return;
     }
@@ -673,15 +731,63 @@ fn logits_match_reference() {
     let tol = read_tolerance(&fixture.join("tolerance.json"));
     let max_seq_len = needed_seq_len(&references);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
-    let mut exec = build_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
+    let mut runner = build_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
     let verdicts = replay(
-        &mut exec,
+        &mut runner.exec,
+        &mut runner.kv,
         &model_dir,
         &prompts,
         &references,
         &tol,
         max_seq_len,
     );
+    assert_tolerance(&verdicts, &tol);
+}
+
+/// Lab only: OLMoE-1B-7B-0125-Instruct on the HIP provider against the committed transformers
+/// reference, judged with OLMoE's calibrated `tolerance.json` (transformers' own spread across
+/// attention kernel, compute precision and decode shape; README beside it).
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY and TURBINE_TEST_MOE_MODEL_DIR"]
+fn olmoe_logits_match_reference() {
+    let _gpu = gpu_model_lock();
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MOE_MODEL_DIR");
+    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
+        .filter(|v| !v.is_empty())
+        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+        .expect("load the HIP kernel library");
+    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
+        .expect("device discovery");
+    let device = inventory
+        .devices
+        .iter()
+        .find(|d| d.vendor == Vendor::Amd)
+        .expect("an AMD device");
+    let ctx = lib.create_context(device).expect("HIP context");
+
+    let fixture = golden_dir().join("olmoe-1b-7b-0125-instruct");
+    let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
+    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
+    let tol = read_tolerance(&fixture.join("tolerance.json"));
+    let max_seq_len = needed_seq_len(&references);
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut runner = build_any_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
+    let verdicts = replay(
+        runner.exec.as_mut(),
+        &mut runner.kv,
+        &model_dir,
+        &prompts,
+        &references,
+        &tol,
+        max_seq_len,
+    );
+    for v in &verdicts {
+        println!("olmoe_golden {v:?}");
+    }
     assert_tolerance(&verdicts, &tol);
 }
 
@@ -695,6 +801,7 @@ fn logits_match_reference() {
 #[test]
 #[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY, TURBINE_TEST_MODEL_DIR and TURBINE_GOLDEN_TRACE"]
 fn hip_trace_vs_cpu_3b() {
+    let _gpu = gpu_model_lock();
     const TRACE_DECODE: usize = 2;
     let Some(ids) = std::env::var("TURBINE_GOLDEN_TRACE")
         .ok()
@@ -905,6 +1012,7 @@ fn olmoe_teacher_forced_vs_reference() {
     if !turbine_kernels::test_support::require_backend("hip") {
         return;
     }
+    let _gpu = gpu_model_lock();
     let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MOE_MODEL_DIR");
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
