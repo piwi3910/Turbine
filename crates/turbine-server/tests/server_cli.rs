@@ -51,6 +51,19 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Kills the server process when a test ends early (a failed assertion panics before the test's
+/// own shutdown), so a failing run never leaves an orphaned `turbine-server` behind.
+struct KillOnDrop(u32);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-9", &self.0.to_string()])
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 fn spawn_server(args: &[&str], config: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_turbine-server"))
         .args(args)
@@ -246,6 +259,7 @@ fn sigterm_graceful_shutdown() {
     let (_model, yaml) = tiny_model_yaml(addr);
     let cfg = TempConfig::new("sigterm", &yaml);
     let mut child = spawn_server(&[], &cfg.path);
+    let _reaper = KillOnDrop(child.id());
     wait_until_serving(&mut child, addr);
     wait_until_ready(&mut child, addr);
 
@@ -442,6 +456,7 @@ fn sigterm_drains_then_cancels() {
         long_model_yaml(addr, &format!("  shutdown_grace: {}s\n", GRACE.as_secs()));
     let cfg = TempConfig::new("sigterm-drain", &yaml);
     let mut child = spawn_server(&[], &cfg.path);
+    let _reaper = KillOnDrop(child.id());
     wait_until_serving(&mut child, addr);
     wait_until_ready(&mut child, addr);
 
