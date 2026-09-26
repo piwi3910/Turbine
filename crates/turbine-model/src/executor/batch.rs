@@ -1,12 +1,16 @@
 //! Host-side preparation of a ragged batch (P2 S-9): validation of a [`BatchInput`] against the
 //! executor's limits and the pool, and packing of token ids, positions, `q_indptr`, `kv_lens`
-//! and the block tables into I32 device buffers allocated once. Also the block fork shared by
-//! the executors ([`copy_blocks`]) and the Phase 1 single-sequence KV ([`SequenceKv`]).
+//! and the block tables into one I32 device buffer allocated once, filled by one host-to-device
+//! copy per forward (P2c: through a double-buffered host staging buffer when the memory has
+//! one, so the copy never waits for the stream). Also the block fork shared by the executors
+//! ([`copy_blocks`]) and the Phase 1 single-sequence KV ([`SequenceKv`]).
 use std::sync::Arc;
 
 use turbine_core::types::{BlockId, DType, KvLayout, SeqId};
 use turbine_kernels::{KernelError, KernelRegistry, KvCopyConfig, KvCopyContext};
-use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, TensorView};
+use turbine_tensor::{
+    DeviceBuffer, DeviceMemory, HostStaging, KvPoolView, MemoryError, TensorView,
+};
 
 use super::{BatchInput, Logits, ModelExecutor, SeqSlice};
 use crate::ModelError;
@@ -157,8 +161,7 @@ impl Packed {
     }
 }
 
-/// Little-endian I32 bytes of every array a forward uploads. They stay valid until the next
-/// synchronization, which the logits read performs (contract §9.2).
+/// Little-endian I32 bytes of every array a forward uploads, in upload order.
 #[derive(Default)]
 pub(crate) struct HostBatch {
     pub ids: Vec<u8>,
@@ -364,17 +367,66 @@ impl HostBatch {
     }
 }
 
-/// Device copies of the packed arrays, sized once for the executor's limits.
+/// Two host staging buffers used in turn, so the buffer a forward fills was last used two
+/// forwards ago: with at most two forwards in flight (the executor's overlap bound) its copy
+/// has completed and writing it never waits. `None` when the memory has no staging (kernel ABI
+/// before v2.3): copies are then synchronous.
+pub(crate) struct StagingPair {
+    bufs: [HostStaging; 2],
+    next: usize,
+}
+
+impl StagingPair {
+    /// Two buffers of `bytes`; `Ok(None)` when `mem` has no staging.
+    pub fn alloc(
+        mem: &Arc<dyn DeviceMemory>,
+        bytes: usize,
+    ) -> Result<Option<StagingPair>, ModelError> {
+        let first = match HostStaging::alloc(mem, bytes) {
+            Ok(b) => b,
+            Err(MemoryError::Unsupported(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Some(StagingPair {
+            bufs: [first, HostStaging::alloc(mem, bytes)?],
+            next: 0,
+        }))
+    }
+
+    /// The index of the buffer for the next forward, grown to at least `bytes` (twice its size or
+    /// `bytes`, at most `cap`; a replaced buffer is freed once its copies complete).
+    pub fn next(
+        &mut self,
+        mem: &Arc<dyn DeviceMemory>,
+        bytes: usize,
+        cap: usize,
+    ) -> Result<usize, ModelError> {
+        let i = self.next;
+        self.next ^= 1;
+        let len = self.bufs[i].len();
+        if len < bytes {
+            self.bufs[i] = HostStaging::alloc(mem, bytes.max(2 * len).min(cap.max(bytes)))?;
+        }
+        Ok(i)
+    }
+
+    pub fn buf(&self, i: usize) -> &HostStaging {
+        &self.bufs[i]
+    }
+}
+
+/// Device copy of the packed arrays in one I32 buffer sized once for the executor's limits.
+/// A forward's arrays sit back to back from element 0: ids and positions (`t` each),
+/// `q_indptr` (`n + 1`), `kv_lens` (`n`), the block table (`n × max_blocks_per_seq`).
 pub(crate) struct DeviceBatch {
-    pub ids: DeviceBuffer,
-    pub positions: DeviceBuffer,
-    pub q_indptr: DeviceBuffer,
-    pub kv_lens: DeviceBuffer,
-    pub block_table: DeviceBuffer,
+    buf: DeviceBuffer,
+    staging: Option<StagingPair>,
+    /// The packed bytes of the synchronous path.
+    scratch: Vec<u8>,
 }
 
 impl DeviceBatch {
-    /// I32 bytes of the metadata buffers: ids and positions per token; `q_indptr`, `kv_lens` and
+    /// I32 bytes of the metadata buffer: ids and positions per token; `q_indptr`, `kv_lens` and
     /// a full-length block table per sequence, plus the extra `q_indptr` entry.
     pub fn bytes(limits: &BatchLimits) -> u64 {
         let t = u64::from(limits.max_batch_tokens);
@@ -382,56 +434,81 @@ impl DeviceBatch {
         (I32 as u64) * (2 * t + 2 * n + 1 + n * u64::from(limits.max_blocks_per_seq()))
     }
 
+    /// The device buffer and, when `mem` has staging, two host staging buffers of the same size.
     pub fn alloc(
         mem: &Arc<dyn DeviceMemory>,
         limits: &BatchLimits,
     ) -> Result<DeviceBatch, ModelError> {
-        let t = limits.max_batch_tokens as usize;
-        let n = limits.max_seqs as usize;
-        let table = n * limits.max_blocks_per_seq() as usize;
+        let bytes = Self::bytes(limits) as usize;
         Ok(DeviceBatch {
-            ids: DeviceBuffer::alloc(mem, t * I32)?,
-            positions: DeviceBuffer::alloc(mem, t * I32)?,
-            q_indptr: DeviceBuffer::alloc(mem, (n + 1) * I32)?,
-            kv_lens: DeviceBuffer::alloc(mem, n * I32)?,
-            block_table: DeviceBuffer::alloc(mem, table.max(1) * I32)?,
+            buf: DeviceBuffer::alloc(mem, bytes)?,
+            staging: StagingPair::alloc(mem, bytes)?,
+            scratch: Vec::new(),
         })
     }
 
-    /// Enqueues the host-to-device copies of `host` (asynchronous; `host` must stay unchanged
-    /// until the next synchronization).
+    /// The uploads never wait for the stream (staging present).
+    pub fn is_async(&self) -> bool {
+        self.staging.is_some()
+    }
+
+    /// Enqueues the one host-to-device copy of `host`: asynchronous through staging, else a
+    /// synchronous copy.
     pub fn upload(&mut self, host: &HostBatch) -> Result<(), ModelError> {
-        self.ids.copy_from_host(0, &host.ids)?;
-        self.positions.copy_from_host(0, &host.positions)?;
-        self.q_indptr.copy_from_host(0, &host.q_indptr)?;
-        self.kv_lens.copy_from_host(0, &host.kv_lens)?;
-        self.block_table.copy_from_host(0, &host.block_table)?;
+        let parts = [
+            &host.ids,
+            &host.positions,
+            &host.q_indptr,
+            &host.kv_lens,
+            &host.block_table,
+        ];
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let mem = Arc::clone(self.buf.memory());
+        match self.staging.as_mut() {
+            Some(pair) => {
+                let i = pair.next(&mem, total, self.buf.len())?;
+                let staging = pair.buf(i);
+                let mut at = 0;
+                for part in parts {
+                    staging.write(at, part)?;
+                    at += part.len();
+                }
+                staging.upload(0, self.buf.slice(0, total))?;
+            }
+            None => {
+                self.scratch.clear();
+                for part in parts {
+                    self.scratch.extend_from_slice(part);
+                }
+                self.buf.copy_from_host(0, &self.scratch)?;
+            }
+        }
         Ok(())
     }
 
-    fn view<'b>(buf: &'b DeviceBuffer, shape: &[usize]) -> TensorView<'b> {
-        TensorView::contiguous(buf.whole(), 0, shape, DType::I32)
+    fn view(&self, offset: usize, shape: &[usize]) -> TensorView<'_> {
+        TensorView::contiguous(self.buf.whole(), offset, shape, DType::I32)
     }
 
     pub fn ids_view(&self, p: &Packed) -> TensorView<'_> {
-        Self::view(&self.ids, &[p.total_q])
+        self.view(0, &[p.total_q])
     }
 
     pub fn positions_view(&self, p: &Packed) -> TensorView<'_> {
-        Self::view(&self.positions, &[p.total_q])
+        self.view(p.total_q, &[p.total_q])
     }
 
     pub fn q_indptr_view(&self, p: &Packed) -> TensorView<'_> {
-        Self::view(&self.q_indptr, &[p.num_seqs + 1])
+        self.view(2 * p.total_q, &[p.num_seqs + 1])
     }
 
     pub fn kv_lens_view(&self, p: &Packed) -> TensorView<'_> {
-        Self::view(&self.kv_lens, &[p.num_seqs])
+        self.view(2 * p.total_q + p.num_seqs + 1, &[p.num_seqs])
     }
 
     pub fn block_table_view(&self, p: &Packed) -> TensorView<'_> {
-        Self::view(
-            &self.block_table,
+        self.view(
+            2 * p.total_q + 2 * p.num_seqs + 1,
             &[p.num_seqs, p.max_blocks_per_seq as usize],
         )
     }
@@ -680,14 +757,24 @@ mod tests {
         // Sequence 11 needs 2 blocks; its third column is padding (block 0).
         assert_eq!(i32s(&host.block_table), [5, 2, 7, 0, 3, 0]);
 
-        let mut dev = DeviceBatch::alloc(&mem, &limits()).expect("alloc");
-        dev.upload(&host).expect("upload");
-        let table = dev.block_table_view(&packed);
-        assert_eq!(table.shape.as_slice(), [2, 3]);
-        assert_eq!(
-            i32s(&table.slice.read_bytes().expect("read")),
-            [5, 2, 7, 0, 3, 0]
-        );
+        // One upload, through staging (host memory has it) or synchronously (it has not): the
+        // views find every array where the packing put it.
+        let bare: Arc<dyn DeviceMemory> = Arc::new(NoStaging(mem.clone()));
+        for m in [&mem, &bare] {
+            let mut dev = DeviceBatch::alloc(m, &limits()).expect("alloc");
+            assert_eq!(dev.is_async(), Arc::ptr_eq(m, &mem));
+            for _ in 0..3 {
+                dev.upload(&host).expect("upload");
+            }
+            let read = |v: TensorView<'_>| i32s(&v.slice.read_bytes().expect("read"));
+            assert_eq!(read(dev.ids_view(&packed)), [7, 1, 2, 3, 4, 5]);
+            assert_eq!(read(dev.positions_view(&packed)), [9, 0, 1, 2, 3, 4]);
+            assert_eq!(read(dev.q_indptr_view(&packed)), [0, 1, 6]);
+            assert_eq!(read(dev.kv_lens_view(&packed)), [10, 5]);
+            let table = dev.block_table_view(&packed);
+            assert_eq!(table.shape.as_slice(), [2, 3]);
+            assert_eq!(read(table), [5, 2, 7, 0, 3, 0]);
+        }
 
         // Decode graph mode widens the table to 4 columns and the attention bound to 16.
         let mut wide = packed.clone();
@@ -699,6 +786,49 @@ mod tests {
             [10, 5],
             "only the table and bounds change"
         );
+    }
+
+    /// `HostMemory` without its staging: the synchronous path of a kernel library before ABI
+    /// v2.3.
+    struct NoStaging(Arc<dyn DeviceMemory>);
+
+    impl DeviceMemory for NoStaging {
+        fn device(&self) -> DeviceId {
+            self.0.device()
+        }
+        fn alloc(&self, bytes: usize) -> Result<turbine_tensor::DevicePtr, MemoryError> {
+            self.0.alloc(bytes)
+        }
+        fn free(&self, ptr: turbine_tensor::DevicePtr) {
+            self.0.free(ptr);
+        }
+        fn copy_h2d(&self, dst: turbine_tensor::DevicePtr, src: &[u8]) -> Result<(), MemoryError> {
+            self.0.copy_h2d(dst, src)
+        }
+        fn copy_d2h(
+            &self,
+            dst: &mut [u8],
+            src: turbine_tensor::DevicePtr,
+        ) -> Result<(), MemoryError> {
+            self.0.copy_d2h(dst, src)
+        }
+        fn copy_d2d(
+            &self,
+            dst: turbine_tensor::DevicePtr,
+            src: turbine_tensor::DevicePtr,
+            bytes: usize,
+        ) -> Result<(), MemoryError> {
+            self.0.copy_d2d(dst, src, bytes)
+        }
+        fn synchronize(&self) -> Result<(), MemoryError> {
+            self.0.synchronize()
+        }
+        fn mem_info(&self) -> Result<turbine_tensor::MemInfo, MemoryError> {
+            self.0.mem_info()
+        }
+        fn compute_stream(&self) -> turbine_tensor::StreamRef {
+            self.0.compute_stream()
+        }
     }
 
     #[test]

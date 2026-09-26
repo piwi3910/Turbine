@@ -25,7 +25,7 @@ use turbine_model::config::{Architecture, ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
     self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, LlamaExecutor, Logits,
     LogitsSlot, ModelExecutor, OlmoeExecutor, OpProfile, ReducedRow, RowReduce, SeqSlice,
-    SequenceKv, TraceTensor, build_executor, graphs,
+    SequenceKv, TokenFeed, TraceTensor, build_executor, graphs,
 };
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
@@ -2522,6 +2522,336 @@ fn check_reduced_rows(
             }
         }
     }
+}
+
+// --------------------------------------------------------- launch ahead with token feeds (P2c)
+
+/// P2c overlap scheduling: on both tiny checkpoints, steps launched ahead — each decode taking
+/// its tokens on the device from the previous step's choices through [`TokenFeed`]s, launched
+/// before the previous step is collected — return logits bitwise equal to the same steps run
+/// one at a time with the tokens on the host (greedy rows with 1 and 3 candidates, drawn rows,
+/// sequences reordered between steps). A third uncollected launch, a feed from a `top_k` row
+/// (whose token the host draws) and a feed outside the batch are refused.
+#[test]
+fn launch_ahead_feeds_match_serial() {
+    let tmp = TempDir::new("tiny-model-launch-ahead");
+    for spec in both_checkpoints(&tmp) {
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let opts = ExecutorOptions::default();
+        let serial = cpu_model_with(&spec, &mem, 16, opts, cpu_reference_provider(), true);
+        let ahead = cpu_model_with(&spec, &mem, 16, opts, cpu_reference_provider(), true);
+        check_launch_ahead(&spec, &mem, serial, ahead, false);
+        // Greedy rows only, in one order: every decode is fed as one run.
+        let serial = cpu_model_with(&spec, &mem, 16, opts, cpu_reference_provider(), true);
+        let ahead = cpu_model_with(&spec, &mem, 16, opts, cpu_reference_provider(), true);
+        check_launch_ahead(&spec, &mem, serial, ahead, true);
+    }
+}
+
+/// Lab only (P2c overlap scheduling): [`launch_ahead_feeds_match_serial`] on the HIP provider
+/// (the head_dim-128 tiny Llama): steps launched ahead through host staging (kernel ABI v2.3),
+/// fed on the device, match the steps run one at a time bitwise.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_launch_ahead_feeds_match_serial() {
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
+        .filter(|v| !v.is_empty())
+        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+        .expect("load the HIP kernel library");
+    assert!(lib.abi_minor() >= 3, "host staging needs kernel ABI v2.3");
+    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
+        .expect("device discovery");
+    let device = inventory
+        .devices
+        .iter()
+        .find(|d| d.vendor == Vendor::Amd)
+        .expect("an AMD device");
+    let ctx = lib.create_context(device).expect("HIP context");
+    let tmp = TempDir::new("tiny-model-hip-launch-ahead");
+    let spec = write_gpu_tiny(tmp.path());
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let opts = ExecutorOptions::default();
+    let serial = cpu_model_with(&spec, &mem, 16, opts, shim_provider(ctx.clone()), true);
+    let ahead = cpu_model_with(&spec, &mem, 16, opts, shim_provider(ctx.clone()), true);
+    check_launch_ahead(&spec, &mem, serial, ahead, false);
+    // Greedy rows fed as one run, with decode graphs on: the fed steps are captured (the feed's
+    // word in the key) and replayed.
+    let mut serial = cpu_model_with(&spec, &mem, 16, opts, shim_provider(ctx.clone()), true);
+    let mut ahead = cpu_model_with(&spec, &mem, 16, opts, shim_provider(ctx.clone()), true);
+    serial.set_decode_graphs(Some(hip_graphs(&ctx, MAX_SEQS)));
+    ahead.set_decode_graphs(Some(hip_graphs(&ctx, MAX_SEQS)));
+    let counters = check_launch_ahead(&spec, &mem, serial, ahead, true);
+    println!("hip_launch_ahead_feeds_match_serial: graphs {counters:?}");
+    assert!(
+        counters.replayed > 0,
+        "fed greedy steps replay a graph: {counters:?}"
+    );
+    println!("hip_launch_ahead_feeds_match_serial: ok");
+}
+
+/// The token the device chose for a reduced row asking for `r`: the draw, or the best
+/// candidate of a greedy row (the tiny models' logits are finite).
+fn device_choice(row: &ReducedRow, r: &RowReduce) -> u32 {
+    match r.uniform {
+        Some(_) => row.sampled.expect("a drawn row has its draw").0,
+        None => row.top[0].0,
+    }
+}
+
+/// Three sequences prefilled (5, 3 and 4 tokens), then decoded for six steps, the last three
+/// in rotated sequence orders: `serial` runs each step with the host's tokens; `ahead` launches
+/// each decode with feeds before collecting the previous step. Each on its own pool.
+fn check_launch_ahead(
+    spec: &TinySpec,
+    mem: &Arc<dyn DeviceMemory>,
+    mut serial: Box<dyn ModelExecutor>,
+    mut ahead: Box<dyn ModelExecutor>,
+    greedy: bool,
+) -> graphs::GraphCounters {
+    const LENS: [u32; 3] = [5, 3, 4];
+    const POOL_BLOCKS: u32 = 8;
+    let decodes: usize = if greedy { 10 } else { 6 };
+    let arch = spec.config.architecture;
+    assert!(ahead.overlaps() && ahead.reduces_logits(), "{arch:?}");
+    let layout = *serial.kv_layout();
+    let (a, b) = (
+        pool(mem, &layout, POOL_BLOCKS),
+        pool(mem, &layout, POOL_BLOCKS),
+    );
+    let (kv_a, kv_b) = (
+        pool_view(&a, &layout, POOL_BLOCKS),
+        pool_view(&b, &layout, POOL_BLOCKS),
+    );
+    let tables: Vec<Vec<BlockId>> = (0..3).map(|s| vec![BlockId(2 * s + 1)]).collect();
+    // Sequence 0 greedy with one candidate, 1 drawn (a fresh uniform each step), 2 greedy with
+    // three candidates (its choice words are not adjacent to the others').
+    let reduce = |s: usize, step: usize| match s {
+        _ if greedy => RowReduce {
+            top_n: 1,
+            temperature: 0.0,
+            uniform: None,
+            top_p: 1.0,
+        },
+        0 => RowReduce {
+            top_n: 1,
+            temperature: 0.0,
+            uniform: None,
+            top_p: 1.0,
+        },
+        1 => RowReduce {
+            top_n: 1,
+            temperature: 0.8,
+            uniform: Some(((step as f32) * 0.37 + 0.11).fract()),
+            top_p: if step.is_multiple_of(2) { 1.0 } else { 0.9 },
+        },
+        _ => RowReduce {
+            top_n: 3,
+            temperature: 0.0,
+            uniform: None,
+            top_p: 1.0,
+        },
+    };
+    // Sequence order of each step: prefill and the first decodes in order, then rotated.
+    let order = |step: usize| -> [usize; 3] {
+        match step {
+            _ if greedy => [0, 1, 2],
+            0..=3 => [0, 1, 2],
+            4 => [2, 0, 1],
+            5 => [1, 2, 0],
+            _ => [0, 1, 2],
+        }
+    };
+    let prompts: Vec<Vec<u32>> = (0..3)
+        .map(|s| {
+            (0..LENS[s])
+                .map(|p| (p * 31 + 7 * s as u32 + 1) % spec.vocab)
+                .collect()
+        })
+        .collect();
+    let mut kv_lens = LENS;
+    let mut last: [u32; 3] = [0; 3];
+    // Step `step` of the run: its tokens (placeholders where `fed`), positions and slices.
+    let batch = |step: usize, kv_lens: [u32; 3], last: [u32; 3], fed: bool| {
+        let mut tokens = Vec::new();
+        let mut positions = Vec::new();
+        let mut q_lens = [0u32; 3];
+        for &s in &order(step) {
+            if step == 0 {
+                tokens.extend_from_slice(&prompts[s]);
+                positions.extend(0..LENS[s]);
+                q_lens[s] = LENS[s];
+            } else {
+                tokens.push(if fed { 0 } else { last[s] });
+                positions.push(kv_lens[s] - 1);
+                q_lens[s] = 1;
+            }
+        }
+        (tokens, positions, q_lens)
+    };
+    let slices = |step: usize, kv_lens: [u32; 3], q_lens: [u32; 3]| -> Vec<SeqSlice<'_>> {
+        let mut q_start = 0;
+        order(step)
+            .iter()
+            .map(|&s| {
+                let slice = SeqSlice {
+                    seq: SeqId(s as u64 + 1),
+                    q_start,
+                    q_len: q_lens[s],
+                    kv_len: kv_lens[s],
+                    block_table: &tables[s],
+                    reduce: Some(reduce(s, step)),
+                };
+                q_start += q_lens[s];
+                slice
+            })
+            .collect()
+    };
+
+    // Serial: host tokens, one step at a time.
+    let mut want: Vec<Logits> = Vec::new();
+    for step in 0..=decodes {
+        if step > 0 {
+            for len in &mut kv_lens {
+                *len += 1;
+            }
+        }
+        let (tokens, positions, q_lens) = batch(step, kv_lens, last, false);
+        let seqs = slices(step, kv_lens, q_lens);
+        let logits = serial
+            .forward(&BatchInput {
+                tokens: &tokens,
+                positions: &positions,
+                seqs: &seqs,
+                kv: &kv_a,
+            })
+            .expect("serial forward");
+        for (slot, &s) in order(step).iter().enumerate() {
+            let LogitsSlot::Reduced(row) = logits.slot(slot) else {
+                panic!("{arch:?} step {step}: sequence {s} not reduced");
+            };
+            last[s] = device_choice(row, &reduce(s, step));
+        }
+        want.push(logits);
+    }
+
+    // Ahead: every decode launched with feeds before the previous step is collected.
+    let mut kv_lens = LENS;
+    let mut got: Vec<Logits> = Vec::new();
+    for step in 0..=decodes {
+        let mut feeds = Vec::new();
+        if step > 0 {
+            for len in &mut kv_lens {
+                *len += 1;
+            }
+            let prev = order(step - 1);
+            for (token, s) in order(step).iter().enumerate() {
+                let prev_slot = prev.iter().position(|p| p == s).expect("in both steps");
+                feeds.push(TokenFeed {
+                    token: token as u32,
+                    prev_slot: prev_slot as u32,
+                });
+            }
+        }
+        let (tokens, positions, q_lens) = batch(step, kv_lens, [0; 3], true);
+        let seqs = slices(step, kv_lens, q_lens);
+        let input = BatchInput {
+            tokens: &tokens,
+            positions: &positions,
+            seqs: &seqs,
+            kv: &kv_b,
+        };
+        ahead.launch(&input, &feeds).expect("launch ahead");
+        if step == 2 {
+            let third = ahead.launch(&input, &feeds).expect_err("a third launch");
+            assert!(
+                third.to_string().contains("not collected"),
+                "{arch:?}: {third}"
+            );
+        }
+        if step > 0 {
+            got.push(ahead.collect().expect("collect"));
+        }
+    }
+    got.push(ahead.collect().expect("collect the last step"));
+    assert_eq!(got.len(), want.len());
+    for (step, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(g, w, "{arch:?} step {step}: launched ahead vs serial");
+    }
+    assert!(
+        ahead.collect().is_err(),
+        "{arch:?}: nothing left to collect"
+    );
+
+    // A feed from a `top_k` row (host draw) or outside the batch is refused.
+    let top_k = RowReduce {
+        top_n: 4,
+        temperature: 0.8,
+        uniform: None,
+        top_p: 1.0,
+    };
+    for len in &mut kv_lens {
+        *len += 1;
+    }
+    let seqs: Vec<SeqSlice<'_>> = (0..3)
+        .map(|s| SeqSlice {
+            seq: SeqId(s as u64 + 1),
+            q_start: s as u32,
+            q_len: 1,
+            kv_len: kv_lens[s],
+            block_table: &tables[s],
+            reduce: Some(if s == 1 { top_k } else { reduce(s, 0) }),
+        })
+        .collect();
+    let positions: Vec<u32> = (0..3).map(|s| kv_lens[s] - 1).collect();
+    let input = BatchInput {
+        tokens: &[1, 2, 3],
+        positions: &positions,
+        seqs: &seqs,
+        kv: &kv_b,
+    };
+    ahead.launch(&input, &[]).expect("launch with a top_k row");
+    for len in &mut kv_lens {
+        *len += 1;
+    }
+    let seqs: Vec<SeqSlice<'_>> = seqs
+        .iter()
+        .map(|s| SeqSlice {
+            kv_len: s.kv_len + 1,
+            ..*s
+        })
+        .collect();
+    let positions: Vec<u32> = positions.iter().map(|p| p + 1).collect();
+    let input = BatchInput {
+        tokens: &[1, 2, 3],
+        positions: &positions,
+        seqs: &seqs,
+        kv: &kv_b,
+    };
+    for (feed, what) in [
+        (
+            TokenFeed {
+                token: 1,
+                prev_slot: 1,
+            },
+            "no device-chosen token",
+        ),
+        (
+            TokenFeed {
+                token: 3,
+                prev_slot: 0,
+            },
+            "3-token batch",
+        ),
+    ] {
+        let err = ahead.launch(&input, &[feed]).expect_err(what).to_string();
+        assert!(err.contains(what), "{arch:?}: {err}");
+    }
+    ahead.collect().expect("collect the top_k step");
+    ahead.graph_counters()
 }
 
 // ------------------------------------------------------------------------ op profile (P2c S-2)

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use turbine_core::types::{BlockId, KvLayout, ModelShape, SeqId};
-use turbine_kernels::{KernelProvider, KernelRegistry, OpConfig, OpRequirement};
+use turbine_kernels::{KernelError, KernelProvider, KernelRegistry, OpConfig, OpRequirement};
 use turbine_tensor::tensor::contiguous_strides;
 use turbine_tensor::{DeviceMemory, KvPoolView, Tensor, TensorView};
 
@@ -273,6 +273,59 @@ pub struct ReducedRow {
     pub sampled: Option<(u32, f32)>,
 }
 
+/// One token of a launched batch taken on the device from the previous launch (P2c overlap
+/// scheduling): batch token `token` becomes the token the device chose — its categorical draw,
+/// or its best candidate for a greedy row — for sequence `prev_slot` of the previous
+/// [`ModelExecutor::launch`], without a host round trip. That row must have been reduced with a
+/// draw or greedily (`RowReduce::uniform` set, or `temperature` ≤ 0). The batch's own id at
+/// `token` is ignored (any in-vocabulary placeholder).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenFeed {
+    pub token: u32,
+    pub prev_slot: u32,
+}
+
+/// Groups `feeds` into runs `(first batch token, first word, length)` over consecutive batch
+/// tokens whose device words (`word(prev_slot)`) are consecutive, after checking that every
+/// token is inside a batch of `tokens` tokens and fed once and that every slot has a device
+/// choice.
+pub(crate) fn feed_runs(
+    feeds: &[TokenFeed],
+    tokens: usize,
+    word: impl Fn(usize) -> Option<usize>,
+) -> Result<Vec<(usize, usize, usize)>, ModelError> {
+    let invalid = |message: String| ModelError::Kernel(KernelError::InvalidArgument { message });
+    let mut resolved: Vec<(usize, usize)> = Vec::with_capacity(feeds.len());
+    for f in feeds {
+        let token = f.token as usize;
+        if token >= tokens {
+            return Err(invalid(format!(
+                "token feed into token {token} of a {tokens}-token batch"
+            )));
+        }
+        let w = word(f.prev_slot as usize).ok_or_else(|| {
+            invalid(format!(
+                "token feed from sequence {} of the previous launch, which has no device-chosen \
+                 token",
+                f.prev_slot
+            ))
+        })?;
+        resolved.push((token, w));
+    }
+    resolved.sort_unstable();
+    if let Some(w) = resolved.windows(2).find(|w| w[0].0 == w[1].0) {
+        return Err(invalid(format!("token {} is fed twice", w[0].0)));
+    }
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    for (token, w) in resolved {
+        match runs.last_mut() {
+            Some((t0, w0, len)) if *t0 + *len == token && *w0 + *len == w => *len += 1,
+            _ => runs.push((token, w, 1)),
+        }
+    }
+    Ok(runs)
+}
+
 /// One forward step over a ragged batch: `tokens[i]` sits at absolute position `positions[i]`,
 /// `seqs` tile `tokens` in order (sequence `s + 1` starts where `s` ends), and every sequence's
 /// K/V lives in `kv`.
@@ -410,9 +463,33 @@ pub trait ModelExecutor: Send {
     /// its device reduction when the slice asks for one and the executor reduces — with one
     /// device-to-host copy.
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError>;
-    /// Timings of the last successful `forward`; zeros when the executor does not measure.
+    /// Timings of the last successful `forward` (or `collect`); zeros when the executor does not
+    /// measure.
     fn last_timings(&self) -> ForwardTimings {
         ForwardTimings::default()
+    }
+    /// True when [`ModelExecutor::launch`] can enqueue a step while the previous one is still
+    /// uncollected, with [`TokenFeed`]s from it (P2c overlap scheduling: the kernel library has
+    /// host staging, ABI v2.3).
+    fn overlaps(&self) -> bool {
+        false
+    }
+    /// Enqueues one step like [`ModelExecutor::forward`] without waiting for it; its logits come
+    /// from the matching [`ModelExecutor::collect`], in launch order. `feeds` take tokens the
+    /// previous launch chose on the device. At most two launches are uncollected when the
+    /// executor [`overlaps`](ModelExecutor::overlaps), one otherwise. Unsupported by default.
+    fn launch(&mut self, batch: &BatchInput<'_>, feeds: &[TokenFeed]) -> Result<(), ModelError> {
+        let _ = (batch, feeds);
+        Err(ModelError::Kernel(KernelError::Unsupported {
+            message: "this executor does not launch steps ahead".into(),
+        }))
+    }
+    /// The logits of the oldest uncollected [`ModelExecutor::launch`]; waits for that step
+    /// only. Unsupported by default.
+    fn collect(&mut self) -> Result<Logits, ModelError> {
+        Err(ModelError::Kernel(KernelError::Unsupported {
+            message: "this executor does not launch steps ahead".into(),
+        }))
     }
     /// Decode graphs (P2c S-10, [`graphs`]): with `Some`, decode-only iterations are captured
     /// into graphs and replayed through them; `None` (the default) launches every op. An
@@ -445,6 +522,44 @@ mod tests {
 
     /// `execution.fused_ops: true` runs the defaults (projection fusion only when
     /// [`FUSED_PROJECTIONS_DEFAULT`]); `false` turns every fusion off.
+    /// Feeds group into runs over consecutive tokens and words; a token outside the batch, a
+    /// token fed twice and a slot without a device choice are refused. Breaks if a run joins
+    /// non-adjacent words (the embedding would read the wrong ids).
+    #[test]
+    fn feed_runs_group_and_validate() {
+        let feed = |token, prev_slot| TokenFeed { token, prev_slot };
+        // Slot s's choice sits at word 100 + s, except slot 3 (a host draw).
+        let word = |s: usize| (s != 3).then_some(100 + s);
+        let runs = feed_runs(
+            &[
+                feed(2, 1),
+                feed(0, 0),
+                feed(1, 1 + 1),
+                feed(3, 5),
+                feed(4, 6),
+            ],
+            8,
+            word,
+        )
+        .expect("runs");
+        // Tokens 0..3 read words 100, 102, 101: 0 and 1 are adjacent, 2 starts a new run.
+        assert_eq!(
+            runs,
+            vec![(0, 100, 1), (1, 102, 1), (2, 101, 1), (3, 105, 2)]
+        );
+        let consecutive = feed_runs(&[feed(1, 0), feed(2, 1), feed(3, 2)], 4, word).expect("one");
+        assert_eq!(consecutive, vec![(1, 100, 3)]);
+        assert!(feed_runs(&[], 1, word).expect("none").is_empty());
+        for (feeds, what) in [
+            (vec![feed(8, 0)], "token 8 of a 8-token"),
+            (vec![feed(1, 0), feed(1, 1)], "fed twice"),
+            (vec![feed(0, 3)], "no device-chosen"),
+        ] {
+            let err = feed_runs(&feeds, 8, word).expect_err(what).to_string();
+            assert!(err.contains(what), "{err}");
+        }
+    }
+
     #[test]
     fn fused_ops_selects_defaults_or_nothing() {
         let on = ExecutorOptions::from_fused_ops(true);

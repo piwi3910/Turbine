@@ -44,8 +44,9 @@
 //! Diagnostics: [`OlmoeExecutor::set_profile`] times every op ([`OpProfile`]), the
 //! expert-offset read and the accumulator reset included; each goes through
 //! [`OlmoeExecutor::op`] or the profiler's transfer timer, one branch when profiling is off.
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
 use turbine_kernels::{
@@ -63,7 +64,10 @@ use super::llama::{
 };
 use super::logits::{self, LogitsHead};
 use super::profile::{self, OpProfile, Profiler};
-use super::{BatchInput, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, Split, rope};
+use super::{
+    BatchInput, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, Split, TokenFeed,
+    feed_runs, rope,
+};
 use crate::ModelError;
 use crate::config::{Architecture, ModelArchConfig, MoeConfig};
 use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name, stacked_experts_name};
@@ -248,9 +252,11 @@ pub struct OlmoeExecutor {
     /// The LM head output, its device reduction and the logits copy.
     head: LogitsHead,
     meta: DeviceBatch,
-    /// Host bytes of the last upload; valid until the next synchronization (contract §9.2).
+    /// Host bytes of the last packed batch.
     host: HostBatch,
-    /// Timings of the last forward ([`ModelExecutor::last_timings`]).
+    /// Host launch time of each uncollected launch, oldest first.
+    launches: VecDeque<Duration>,
+    /// Timings of the last collected step ([`ModelExecutor::last_timings`]).
     timings: ForwardTimings,
     profiler: Profiler,
 }
@@ -501,6 +507,7 @@ impl OlmoeExecutor {
             head,
             meta,
             host: HostBatch::default(),
+            launches: VecDeque::with_capacity(2),
             timings: ForwardTimings::default(),
             profiler: Profiler::default(),
         })
@@ -781,7 +788,13 @@ impl OlmoeExecutor {
     /// ([`LogitsHead::plan`]): embedding, the layers, the final norm, the LM head and the
     /// logits reduction. Without host expert offsets it makes no host copy or
     /// synchronisation, so a decode graph can capture it.
-    fn enqueue(&self, p: &Packed, kv: &KvPoolView<'_>, order: &[usize]) -> Result<(), ModelError> {
+    fn enqueue(
+        &self,
+        p: &Packed,
+        kv: &KvPoolView<'_>,
+        order: &[usize],
+        runs: &[(usize, usize, usize)],
+    ) -> Result<(), ModelError> {
         let b = &self.bufs;
         let d = &self.dims;
         let (t, n) = (p.total_q, p.num_seqs);
@@ -796,6 +809,18 @@ impl OlmoeExecutor {
                     vocab_offset: 0,
                 })
         })?;
+        for &(token, word, len) in runs {
+            self.op(OpConfig::Embedding(embedding), || {
+                self.registry
+                    .embedding(&embedding)
+                    .execute(&mut EmbeddingContext {
+                        ids: self.head.ids_at(word, len),
+                        table: self.embed.view(),
+                        out: Self::rows(&b.x, t).rows(token, len),
+                        vocab_offset: 0,
+                    })
+            })?;
+        }
         if let Some(first) = self.layers.first() {
             self.rmsnorm(Self::rows(&b.x, t), &first.input_norm, Self::rows(&b.h, t))?;
         }
@@ -824,6 +849,33 @@ impl ModelExecutor for OlmoeExecutor {
     }
 
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
+        if self.head.pending() > 0 {
+            return Err(invalid(
+                "forward while a launched step is not collected".into(),
+            ));
+        }
+        self.launch(batch, &[])?;
+        self.collect()
+    }
+
+    fn overlaps(&self) -> bool {
+        self.head.overlaps() && self.meta.is_async()
+    }
+
+    fn launch(&mut self, batch: &BatchInput<'_>, feeds: &[TokenFeed]) -> Result<(), ModelError> {
+        let in_flight = if self.overlaps() { 2 } else { 1 };
+        if self.head.pending() >= in_flight {
+            return Err(invalid(format!(
+                "{in_flight} launched steps are not collected yet"
+            )));
+        }
+        if !feeds.is_empty() && self.head.pending() == 0 && !self.overlaps() {
+            return Err(invalid(
+                "token feeds need an executor that overlaps steps".into(),
+            ));
+        }
+        // Feeds read the previous launch's choices: resolve them before this launch replans.
+        let runs = feed_runs(feeds, batch.tokens.len(), |slot| self.head.feed_word(slot))?;
         let order = self.head.plan(batch.seqs).to_vec();
         let experts = experts_cfg(&self.cfg, &self.moe);
         let graph_top_n = self
@@ -845,8 +897,8 @@ impl ModelExecutor for OlmoeExecutor {
             profile::HOST,
             || {
                 let mut p = host.pack(batch, limits)?;
-                let key =
-                    graph_top_n.and_then(|top_n| graphs::decode_key(&mut p, host, limits, top_n));
+                let key = graph_top_n
+                    .and_then(|top_n| graphs::decode_key(&mut p, host, limits, top_n, &runs));
                 meta.upload(host)?;
                 Ok((p, key))
             },
@@ -856,18 +908,25 @@ impl ModelExecutor for OlmoeExecutor {
         let mut graphs = self.graphs.take();
         let enqueued = match graphs.as_mut() {
             Some(g) => g.run(key, PoolId::of(batch.kv), || {
-                self.enqueue(&p, batch.kv, &order)
+                self.enqueue(&p, batch.kv, &order, &runs)
             }),
-            None => self.enqueue(&p, batch.kv, &order),
+            None => self.enqueue(&p, batch.kv, &order, &runs),
         };
         self.graphs = graphs;
         enqueued?;
+        // The step's one device-to-host read, after the device reduction of the rows that
+        // asked for one; collected by `collect`.
+        self.head.launch_read()?;
+        self.launches.push_back(launch_started.elapsed());
+        Ok(())
+    }
+
+    fn collect(&mut self) -> Result<Logits, ModelError> {
         let wait_started = Instant::now();
-        // The iteration's one device-to-host copy (it synchronizes the stream), after the
-        // device reduction of the rows that asked for one.
-        let logits = self.head.read(&self.profiler, self.mem.as_ref())?;
+        let launch = self.launches.pop_front().unwrap_or_default();
+        let logits = self.head.collect(&self.profiler, self.mem.as_ref())?;
         self.timings = ForwardTimings {
-            launch: wait_started - launch_started,
+            launch,
             device_wait: wait_started.elapsed(),
         };
         Ok(logits)

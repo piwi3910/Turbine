@@ -8,14 +8,17 @@
 //! the `n − r` full rows; the reduction writes its results right after row `n`, and one copy
 //! of the bytes from row `r` to the end of the results returns both. A 128k-entry F32 row is
 //! 512 KB; its reduction is at most 524 bytes.
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use turbine_core::types::DType;
 use turbine_kernels::{
-    KernelRegistry, LogitsReduceConfig, LogitsReduceContext, OpConfig, OpKind, OpRequirement,
+    KernelError, KernelRegistry, LogitsReduceConfig, LogitsReduceContext, OpConfig, OpKind,
+    OpRequirement,
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, TensorView};
 
+use super::batch::StagingPair;
 use super::profile::{self, Profiler};
 use super::{Logits, ReducedRow, RowReduce, SeqSlice};
 use crate::ModelError;
@@ -23,6 +26,10 @@ use crate::config::ModelArchConfig;
 
 /// The most candidates one reduced row returns (the ABI bound).
 pub const MAX_TOP_N: usize = LogitsReduceConfig::MAX_TOP_N as usize;
+
+fn invalid(message: String) -> ModelError {
+    ModelError::Kernel(KernelError::InvalidArgument { message })
+}
 
 /// 4-byte words per row of the reduction's inputs: temperature, uniform, top_p and mode.
 const INPUT_WORDS: usize = 4;
@@ -66,7 +73,15 @@ pub(super) fn norm_runs(last_rows: &[usize], order: &[usize]) -> Vec<(usize, usi
     runs
 }
 
-/// The LM head's output buffer, the reduction's inputs and the per-forward row order.
+/// The LM head's output buffer, the reduction's inputs, the per-forward row order and the
+/// logits reads not yet collected.
+///
+/// A forward's read is enqueued at the end of its launch ([`LogitsHead::launch_read`]) and
+/// taken by [`LogitsHead::collect`]. With host staging (kernel ABI v2.3) the reduction inputs and
+/// the read go through double-buffered staging and never wait for the stream, so up to two
+/// forwards may be in flight: the second launch's feeds read the first one's chosen tokens on
+/// the device ([`LogitsHead::feed_word`]). Without staging the read is a synchronous copy at
+/// collect time and one forward at a time is in flight.
 pub(super) struct LogitsHead {
     vocab: usize,
     /// `Some` when the registry selected `logits_reduce` for [`reduce_config`].
@@ -77,8 +92,11 @@ pub(super) struct LogitsHead {
     /// Per reduced row: temperature (F32), uniform (F32), top_p (F32), mode (I32), as four
     /// arrays.
     inputs: DeviceBuffer,
-    /// The bytes of the last `inputs` upload; valid until the logits copy synchronizes.
+    /// The bytes of the last `inputs` upload.
     host_inputs: Vec<u8>,
+    /// Staging for the `inputs` upload and for the reads; `None` without host staging.
+    input_staging: Option<StagingPair>,
+    read_staging: Option<StagingPair>,
     /// Destination row → sequence of the current forward: reduced sequences first.
     order: Vec<usize>,
     /// Sequences of the current forward, and how many of them are reduced.
@@ -86,6 +104,46 @@ pub(super) struct LogitsHead {
     reduced: usize,
     /// Per reduced row (in `order`), what it asked for.
     requests: Vec<RowReduce>,
+    /// Reads enqueued and not yet collected, oldest first.
+    pending: VecDeque<PendingRead>,
+    /// Per sequence of the last launched forward: the word of `out` holding the token the device
+    /// chose for it, when the device's choice is final ([`device_choice_word`]).
+    last_tokens: Vec<Option<usize>>,
+}
+
+/// One forward's logits read: what `collect` needs to decode it.
+struct PendingRead {
+    n: usize,
+    /// Reduced rows and the candidates each returns.
+    r: usize,
+    top_n: usize,
+    requests: Vec<RowReduce>,
+    is_reduced: Vec<bool>,
+    /// Words of `out` read, from row `r` on: the full rows, then the results.
+    words: usize,
+    /// The staging buffer holding the read; `None`: read synchronously at collect.
+    staged: Option<usize>,
+}
+
+/// The word of the result block (at word `base`, `r` rows of `top_n` candidates) holding the
+/// token the device chose for reduced row `k` asking for `q`, when that choice is final: the
+/// categorical draw when one was asked for, the best candidate for a greedy row. A `top_k` row
+/// (host draw over the candidates) has none. The host takes these same tokens
+/// ([`crate::Sampler::finish_reduced`]) unless no logit of the row is finite.
+fn device_choice_word(
+    base: usize,
+    r: usize,
+    top_n: usize,
+    k: usize,
+    q: &RowReduce,
+) -> Option<usize> {
+    if q.uniform.is_some() {
+        Some(base + 2 * r * top_n + r + k)
+    } else if q.temperature <= 0.0 {
+        Some(base + k * top_n)
+    } else {
+        None
+    }
 }
 
 impl LogitsHead {
@@ -95,9 +153,10 @@ impl LogitsHead {
         4 * (max_seqs * (vocab + result_words(MAX_TOP_N)) + INPUT_WORDS * max_seqs) as u64
     }
 
-    /// Allocates the buffers for `max_seqs` rows. Rows are reduced when `registry` selected
-    /// `logits_reduce` at [`reduce_config`] of `cfg` and the vocabulary is larger than
-    /// [`MAX_TOP_N`].
+    /// Allocates the buffers for `max_seqs` rows (and, when `mem` has staging, the staging for
+    /// the inputs and for reads of the result block; a read of full rows grows it). Rows are
+    /// reduced when `registry` selected `logits_reduce` at [`reduce_config`] of `cfg` and the
+    /// vocabulary is larger than [`MAX_TOP_N`].
     pub fn new(
         cfg: &ModelArchConfig,
         registry: &KernelRegistry,
@@ -112,21 +171,47 @@ impl LogitsHead {
             .iter()
             .any(|s| s.op == OpKind::LogitsReduce && s.config == rendered);
         let out_bytes = 4 * max_seqs * (vocab + result_words(MAX_TOP_N));
+        let input_bytes = 4 * INPUT_WORDS * max_seqs;
         Ok(LogitsHead {
             vocab,
             reduce: (selected && vocab > MAX_TOP_N).then_some(rc),
             out: DeviceBuffer::alloc(mem, out_bytes)?,
-            inputs: DeviceBuffer::alloc(mem, 4 * INPUT_WORDS * max_seqs)?,
-            host_inputs: Vec::with_capacity(4 * INPUT_WORDS * max_seqs),
+            inputs: DeviceBuffer::alloc(mem, input_bytes)?,
+            host_inputs: Vec::with_capacity(input_bytes),
+            input_staging: StagingPair::alloc(mem, input_bytes)?,
+            read_staging: StagingPair::alloc(mem, 4 * max_seqs * result_words(MAX_TOP_N))?,
             order: Vec::with_capacity(max_seqs),
             seqs: 0,
             reduced: 0,
             requests: Vec::with_capacity(max_seqs),
+            pending: VecDeque::with_capacity(2),
+            last_tokens: Vec::with_capacity(max_seqs),
         })
     }
 
     pub fn reduces(&self) -> bool {
         self.reduce.is_some()
+    }
+
+    /// The reads never wait for the stream, so two forwards may be in flight.
+    pub fn overlaps(&self) -> bool {
+        self.input_staging.is_some() && self.read_staging.is_some()
+    }
+
+    /// Reads enqueued and not collected.
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The word of `out` holding the token the device chose for sequence `slot` of the last
+    /// launched forward; `None` when that row was not reduced or its choice is the host's.
+    pub fn feed_word(&self, slot: usize) -> Option<usize> {
+        self.last_tokens.get(slot).copied().flatten()
+    }
+
+    /// `len` token ids from word `word` of `out`, as the embedding's I32 ids.
+    pub fn ids_at(&self, word: usize, len: usize) -> TensorView<'_> {
+        TensorView::contiguous(self.out.whole(), word, &[len], DType::I32)
     }
 
     /// Orders the batch's rows (reduced sequences first, each group in sequence order) and
@@ -177,9 +262,10 @@ impl LogitsHead {
         }
     }
 
-    /// Enqueues the upload of the planned rows' reduction inputs (when any row is reduced),
-    /// before the forward's ops: the reduction reads them from the same device buffer every
-    /// iteration, so a captured graph replays with this iteration's values.
+    /// Uploads the planned rows' reduction inputs (when any row is reduced), before the forward's
+    /// first kernel so that nothing after the last kernel waits for the host; the reduction
+    /// reads them from the same device buffer every iteration, so a captured decode graph
+    /// replays with this iteration's values.
     pub fn upload_inputs(&mut self) -> Result<(), ModelError> {
         if self.reduce.is_none() || self.reduced == 0 {
             return Ok(());
@@ -201,13 +287,22 @@ impl LogitsHead {
             let mode = i32::from(q.uniform.is_some());
             self.host_inputs.extend_from_slice(&mode.to_le_bytes());
         }
-        self.inputs.copy_from_host(0, &self.host_inputs)?;
+        let mem = Arc::clone(self.inputs.memory());
+        match self.input_staging.as_mut() {
+            Some(pair) => {
+                let i = pair.next(&mem, self.host_inputs.len(), self.inputs.len())?;
+                let staging = pair.buf(i);
+                staging.write(0, &self.host_inputs)?;
+                staging.upload(0, self.inputs.slice(0, self.host_inputs.len()))?;
+            }
+            None => self.inputs.copy_from_host(0, &self.host_inputs)?,
+        }
         Ok(())
     }
 
     /// Enqueues the reduction of the planned rows (when any), after the LM head, through
     /// `profiler` (`logits_reduce`) on `mem`; its inputs were uploaded by
-    /// [`LogitsHead::upload_inputs`].
+    /// [`LogitsHead::upload_inputs`]. Only an op call, so a decode graph can capture it.
     pub fn reduce(
         &self,
         registry: &KernelRegistry,
@@ -245,22 +340,72 @@ impl LogitsHead {
         Ok(())
     }
 
-    /// The iteration's one device-to-host copy (it synchronizes the stream), after
-    /// [`LogitsHead::reduce`]: the full rows and the reductions, timed through `profiler`
-    /// ([`profile::LOGITS_READ`]) on `mem`.
-    pub fn read(&self, profiler: &Profiler, mem: &dyn DeviceMemory) -> Result<Logits, ModelError> {
+    /// After [`LogitsHead::reduce`]: enqueues the forward's one device-to-host read of the full
+    /// rows and the reductions (through staging; without it the read happens at
+    /// [`LogitsHead::collect`]), and records which words hold the device's token choices for
+    /// the next forward's feeds.
+    pub fn launch_read(&mut self) -> Result<(), ModelError> {
         let (n, r, vocab) = (self.seqs, self.reduced, self.vocab);
         let top_n = self.batch_top_n();
         let base = n * vocab;
         let result = if r > 0 { r * result_words(top_n) } else { 0 };
-        let start = r * vocab;
+        let words = (n - r) * vocab + result;
+        let src = self.out.slice(4 * r * vocab, 4 * words);
+        let staged = match self.read_staging.as_mut() {
+            Some(pair) => {
+                let i = pair.next(self.out.memory(), 4 * words, self.out.len())?;
+                pair.buf(i).download(0, src)?;
+                Some(i)
+            }
+            None => None,
+        };
+        let mut is_reduced = vec![false; n];
+        for &s in &self.order[..r] {
+            is_reduced[s] = true;
+        }
+        self.last_tokens.clear();
+        self.last_tokens.resize(n, None);
+        if self.reduce.is_some() {
+            for (k, q) in self.requests.iter().enumerate() {
+                self.last_tokens[self.order[k]] = device_choice_word(base, r, top_n, k, q);
+            }
+        }
+        self.pending.push_back(PendingRead {
+            n,
+            r,
+            top_n,
+            requests: self.requests.clone(),
+            is_reduced,
+            words,
+            staged,
+        });
+        Ok(())
+    }
+
+    /// The oldest launched forward's logits: waits for its read (only its own; later forwards
+    /// keep running) and decodes the full rows and the reductions. The read is timed through
+    /// `profiler` ([`profile::LOGITS_READ`]) on `mem`.
+    pub fn collect(
+        &mut self,
+        profiler: &Profiler,
+        mem: &dyn DeviceMemory,
+    ) -> Result<Logits, ModelError> {
+        let p = self
+            .pending
+            .pop_front()
+            .ok_or_else(|| invalid("collect without a launched forward".into()))?;
+        let (n, r, top_n, vocab) = (p.n, p.r, p.top_n, self.vocab);
         let full = (n - r) * vocab;
-        // The copy and its decoding into host words and F32 rows, timed together.
+        // The read and its decoding into host words and F32 rows, timed together.
         let (words, data) = profiler.step(mem, profile::LOGITS_READ, profile::D2H, || {
-            let raw = self
-                .out
-                .slice(4 * start, 4 * (base + result - start))
-                .read_bytes()?;
+            let raw = match (p.staged, self.read_staging.as_ref()) {
+                (Some(i), Some(pair)) => {
+                    let mut raw = vec![0u8; 4 * p.words];
+                    pair.buf(i).read(0, &mut raw)?;
+                    raw
+                }
+                _ => self.out.slice(4 * r * vocab, 4 * p.words).read_bytes()?,
+            };
             let words: Vec<[u8; 4]> = raw
                 .chunks_exact(4)
                 .map(|c| [c[0], c[1], c[2], c[3]])
@@ -274,7 +419,7 @@ impl LogitsHead {
         let res = &words[full..];
         let f = |i: usize| f32::from_le_bytes(res[i]);
         let id = |i: usize| i32::from_le_bytes(res[i]);
-        let reduced: Vec<ReducedRow> = self
+        let reduced: Vec<ReducedRow> = p
             .requests
             .iter()
             .enumerate()
@@ -292,11 +437,7 @@ impl LogitsHead {
                 }
             })
             .collect();
-        let mut is_reduced = vec![false; n];
-        for &s in &self.order[..r] {
-            is_reduced[s] = true;
-        }
-        Ok(Logits::mixed(vocab, data, reduced, is_reduced))
+        Ok(Logits::mixed(vocab, data, reduced, p.is_reduced))
     }
 }
 
