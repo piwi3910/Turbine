@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 pub use turbine_core::request::{ConstraintSpec, ToolCallOut};
 
 use crate::ModelError;
+use crate::structured::{JSON_MAX_WHITESPACE, with_json_options};
 
 /// The Llama-3 special token that may open a tool call.
 pub const PYTHON_TAG: &str = "<|python_tag|>";
@@ -254,7 +255,8 @@ fn function_tools(tools: &[Value]) -> Result<Vec<FunctionTool<'_>>, ModelError> 
 /// `<|python_tag|>`, then `{"name": "<tool>", "parameters": <that tool's JSON schema>}` for one
 /// of the allowed tools (only the named one for [`ToolChoice::Named`]), repeated with `;`
 /// separators when `parallel` (never for a named function: that is exactly one call). The
-/// parameters use Llama's own separators (`", "`, `": "`) with no free whitespace; a tool
+/// call envelope is written the way Llama writes it (`", "`, `": "`); the parameters take the
+/// bounded natural JSON whitespace of [`crate::structured::json_options`]; a tool
 /// without `parameters` takes any object. `none` and `auto` are unconstrained and have no
 /// grammar; an unknown named function or a malformed tool is a [`ModelError::Constraint`]
 /// naming the field.
@@ -292,9 +294,15 @@ pub fn tool_call_grammar(
 
     let mut grammar = String::from("start: <|python_tag|>? call");
     if repeat {
-        grammar.push_str(" (\";\" call)*");
+        grammar.push_str(" (CALL_SEP call)*");
     }
     grammar.push('\n');
+    if repeat {
+        // `;` then the same bounded whitespace as inside the JSON (Llama writes `; `).
+        grammar.push_str(&format!(
+            "CALL_SEP: /;[\\x20\\x0A\\x0D\\x09]{{0,{JSON_MAX_WHITESPACE}}}/\n"
+        ));
+    }
     let alternatives: Vec<String> = (0..allowed.len()).map(|i| format!("call_{i}")).collect();
     grammar.push_str(&format!("call: {}\n", alternatives.join(" | ")));
     for (i, tool) in allowed.iter().enumerate() {
@@ -304,20 +312,13 @@ pub fn tool_call_grammar(
             "call_{i}: \"{{\\\"name\\\": \\\"{}\\\", \\\"parameters\\\": \" params_{i} \"}}\"\n",
             tool.name
         ));
-        let mut schema = tool.parameters.cloned().unwrap_or_else(|| {
+        let schema = tool.parameters.cloned().unwrap_or_else(|| {
             let mut any_object = Map::new();
             any_object.insert("type".into(), "object".into());
             any_object
         });
-        schema.insert(
-            "x-guidance".into(),
-            serde_json::json!({
-                "whitespace_flexible": false,
-                "item_separator": ", ",
-                "key_separator": ": ",
-            }),
-        );
-        grammar.push_str(&format!("params_{i}: %json {}\n", Value::Object(schema)));
+        let schema = with_json_options(&Value::Object(schema));
+        grammar.push_str(&format!("params_{i}: %json {schema}\n"));
     }
     Ok(ConstraintSpec::ToolCall {
         grammar_source: grammar,
@@ -461,7 +462,11 @@ mod tests {
         // `required`, parallel: every tool, `;`-separated repetition, optional python tag.
         let g = grammar(tool_call_grammar(&tools, &ToolChoice::Required, true).expect("grammar"));
         assert!(
-            g.contains("start: <|python_tag|>? call (\";\" call)*"),
+            g.contains("start: <|python_tag|>? call (CALL_SEP call)*\n"),
+            "{g}"
+        );
+        assert!(
+            g.contains("CALL_SEP: /;[\\x20\\x0A\\x0D\\x09]{0,16}/\n"),
             "{g}"
         );
         assert!(g.contains("call: call_0 | call_1\n"), "{g}");
@@ -470,14 +475,11 @@ mod tests {
             "{g}"
         );
         assert!(g.contains(r#"call_1: "{\"name\": \"get_time\", \"parameters\": " params_1 "}""#));
-        // Each tool's own schema, with Llama's separators and no free whitespace; a tool
+        // Each tool's own schema, with the bounded natural JSON whitespace; a tool
         // without `parameters` takes any object.
         let params0 = schema_of(&g, "params_0");
         assert_eq!(params0["required"], json!(["location"]));
-        assert_eq!(
-            params0["x-guidance"],
-            json!({"whitespace_flexible": false, "item_separator": ", ", "key_separator": ": "})
-        );
+        assert_eq!(params0["x-guidance"], crate::structured::json_options());
         assert_eq!(schema_of(&g, "params_1")["type"], "object");
 
         // `required` without parallel calls: exactly one call.
@@ -532,6 +534,46 @@ mod tests {
         let dup = [tools[1].clone(), tools[1].clone()];
         let e = err(tool_call_grammar(&dup, &ToolChoice::Required, false));
         assert!(e.contains("tools[1].function.name = get_time"), "{e}");
+    }
+
+    #[test]
+    fn tool_grammar_whitespace_on_llama_tokenizer() {
+        use crate::structured::tests::{LLAMA_EOS, feed_text, llama_compiler};
+
+        let (tokenizer, compiler) = llama_compiler();
+        let limits = crate::structured::GrammarLimits {
+            max_schema_bytes: 64 * 1024,
+        };
+        let spec =
+            tool_call_grammar(&weather_tools(), &ToolChoice::Required, true).expect("grammar");
+        let run = |text: &str| {
+            let mut matcher = compiler.compile(&spec, &limits).expect("compile");
+            feed_text(matcher.as_mut(), &tokenizer, &LLAMA_EOS, text)
+        };
+        let pad = " ".repeat(JSON_MAX_WHITESPACE);
+        // Llama's own spacing, compact and pretty-printed parameters, the python tag and a
+        // `;`-separated second call are complete outputs.
+        for text in [
+            r#"{"name": "get_weather", "parameters": {"location": "Paris", "unit": "celsius"}}"#
+                .to_string(),
+            r#"{"name": "get_weather", "parameters": {"location":"Paris"}}"#.to_string(),
+            "{\"name\": \"get_weather\", \"parameters\": {\n  \"location\": \"Oslo\"\n}}".to_string(),
+            format!(r#"<|python_tag|>{{"name": "get_time", "parameters": {{"zone":{pad}"UTC"}}}}"#),
+            r#"{"name": "get_time", "parameters": {}}; {"name": "get_weather", "parameters": {"location": "Rome"}}"#
+                .to_string(),
+        ] {
+            assert_eq!(run(&text), Ok(true), "{text:?}");
+        }
+        // Whitespace past the bound, an enum value the schema does not list and a call
+        // missing a required parameter are refused.
+        let over =
+            format!(r#"{{"name": "get_weather", "parameters": {{"location": {pad}"Paris"}}}}"#);
+        assert!(run(&over).is_err(), "{over:?} accepted");
+        let bad_enum =
+            r#"{"name": "get_weather", "parameters": {"location": "Paris", "unit": "kelvin"}}"#;
+        assert!(run(bad_enum).is_err(), "{bad_enum:?} accepted");
+        let missing = r#"{"name": "get_weather", "parameters": {"unit": "celsius"}}"#;
+        assert!(run(missing).is_err(), "{missing:?} accepted");
     }
 
     /// The JSON schema after `<rule>: %json ` on its own line of `grammar`.

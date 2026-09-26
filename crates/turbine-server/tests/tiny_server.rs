@@ -1577,9 +1577,10 @@ fn small_schema() -> Value {
     })
 }
 
-/// True when `text` has whitespace outside JSON string literals.
-fn whitespace_outside_strings(text: &str) -> bool {
+/// The longest run of whitespace outside JSON string literals in `text`.
+fn longest_whitespace_outside_strings(text: &str) -> usize {
     let (mut in_string, mut escaped) = (false, false);
+    let (mut run, mut longest) = (0, 0);
     for c in text.chars() {
         if in_string {
             match (escaped, c) {
@@ -1588,13 +1589,16 @@ fn whitespace_outside_strings(text: &str) -> bool {
                 (false, '"') => in_string = false,
                 _ => {}
             }
+        } else if c.is_whitespace() {
+            run += 1;
+            longest = longest.max(run);
+            continue;
         } else if c == '"' {
             in_string = true;
-        } else if c.is_whitespace() {
-            return true;
         }
+        run = 0;
     }
-    false
+    longest
 }
 
 /// P2 S-6, S-9: with a pool too small for the load, preemption by recompute does not change
@@ -1615,6 +1619,10 @@ fn preempted_output_unchanged() {
             if i < 2 {
                 body["response_format"] = json!({"type": "json_schema",
                     "json_schema": {"name": "small", "schema": small_schema()}});
+                // The random-weight model favours whitespace, which the grammar allows (up to
+                // JSON_MAX_WHITESPACE per gap); banning the whitespace bytes keeps the object
+                // within the 40 tokens this pool is sized for.
+                body["logit_bias"] = json!({"9": -100, "10": -100, "13": -100, "32": -100});
             } else {
                 body["ignore_eos"] = json!(true);
             }
@@ -1662,7 +1670,8 @@ fn preempted_output_unchanged() {
     assert_eq!(server.blocks_used(), 0);
 }
 
-/// P2 S-17: `json_schema` and `json_object` outputs always parse, validate and are compact; a
+/// P2 S-17: `json_schema` and `json_object` outputs always parse, validate and keep whitespace
+/// outside strings within `JSON_MAX_WHITESPACE` per gap; a
 /// schema with an unsupported keyword or over `structured_output.max_schema_bytes` is refused.
 #[test]
 fn response_format_json_schema() {
@@ -1690,7 +1699,10 @@ fn response_format_json_schema() {
         let text = choice["message"]["content"].as_str().unwrap();
         let value: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{text}: {e}"));
         assert!(validator.is_valid(&value), "seed {seed}: {text}");
-        assert!(!whitespace_outside_strings(text), "not compact: {text:?}");
+        assert!(
+            longest_whitespace_outside_strings(text) <= turbine_model::JSON_MAX_WHITESPACE,
+            "whitespace over the bound: {text:?}"
+        );
         seen.insert(text.to_string());
     }
     assert!(seen.len() > 1, "sampling varies the objects: {seen:?}");
@@ -1710,7 +1722,10 @@ fn response_format_json_schema() {
         let text = choice["message"]["content"].as_str().unwrap();
         let value: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{text}: {e}"));
         assert!(value.is_object(), "{text}");
-        assert!(!whitespace_outside_strings(text), "not compact: {text:?}");
+        assert!(
+            longest_whitespace_outside_strings(text) <= turbine_model::JSON_MAX_WHITESPACE,
+            "whitespace over the bound: {text:?}"
+        );
     }
 
     // Refused before queueing.

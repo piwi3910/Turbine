@@ -34,7 +34,8 @@ pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot, lla
 pub use metrics::{ForwardPhase, ModelMetrics, ToolCallOutcome};
 pub use sampler::{SampledToken, Sampler, SamplerState};
 pub use structured::{
-    GrammarCompiler, GrammarLimits, TokenMask, TokenMatcher, constraint_kind, step_mask,
+    GrammarCompiler, GrammarLimits, JSON_MAX_WHITESPACE, TokenMask, TokenMatcher, constraint_kind,
+    json_options, step_mask,
 };
 pub use tokenizer::{IncrementalDetokenizer, Tokenizer};
 pub use tools::{

@@ -167,22 +167,33 @@ pub fn constraint_kind(spec: &ConstraintSpec) -> &'static str {
     }
 }
 
-/// llguidance JSON options: compact separators and no free whitespace, so a bounded schema
-/// yields bounded output. Replaces any caller-supplied `x-guidance` options.
-fn compact(schema: &serde_json::Value) -> serde_json::Value {
+/// The longest run of whitespace a constrained JSON output may put between two tokens of JSON
+/// syntax (outside strings): room for a newline and an indentation four levels deep, never
+/// unbounded, so a bounded schema still yields bounded output.
+pub const JSON_MAX_WHITESPACE: usize = 16;
+
+/// The llguidance JSON options (`x-guidance`) of every JSON constraint (`json_object`,
+/// `json_schema` and tool-call parameters): the separators `,` and `:` with between any two
+/// JSON tokens at most [`JSON_MAX_WHITESPACE`] characters of JSON whitespace. The model writes
+/// JSON the way it learned it (`{"name": "John"}`, pretty-printed or compact); forcing compact
+/// JSON pushes it to put the spacing it wants inside strings instead (`{"name":": "}`).
+pub fn json_options() -> serde_json::Value {
+    serde_json::json!({
+        "item_separator": ",",
+        "key_separator": ":",
+        "whitespace_flexible": false,
+        "whitespace_pattern": format!("[\\x20\\x0A\\x0D\\x09]{{1,{JSON_MAX_WHITESPACE}}}")
+    })
+}
+
+/// `schema` with [`json_options`], replacing any caller-supplied `x-guidance` options.
+pub(crate) fn with_json_options(schema: &serde_json::Value) -> serde_json::Value {
     let mut schema = match schema {
         serde_json::Value::Bool(true) => serde_json::json!({}),
         other => other.clone(),
     };
     if let Some(obj) = schema.as_object_mut() {
-        obj.insert(
-            "x-guidance".to_string(),
-            serde_json::json!({
-                "item_separator": ",",
-                "key_separator": ":",
-                "whitespace_flexible": false
-            }),
-        );
+        obj.insert("x-guidance".to_string(), json_options());
     }
     schema
 }
@@ -257,15 +268,15 @@ impl GrammarCompiler {
             }
         };
         let grammar = match spec {
-            ConstraintSpec::JsonObject => {
-                TopLevelGrammar::from_json_schema(compact(&serde_json::json!({"type": "object"})))
-            }
+            ConstraintSpec::JsonObject => TopLevelGrammar::from_json_schema(with_json_options(
+                &serde_json::json!({"type": "object"}),
+            )),
             ConstraintSpec::JsonSchema { schema } => {
                 let bytes = serde_json::to_vec(schema)
                     .map_err(|e| ModelError::Constraint(format!("{kind}: {e}")))?
                     .len();
                 check_size(bytes)?;
-                TopLevelGrammar::from_json_schema(compact(schema))
+                TopLevelGrammar::from_json_schema(with_json_options(schema))
             }
             ConstraintSpec::ToolCall { grammar_source } => {
                 check_size(grammar_source.len())?;
@@ -360,7 +371,7 @@ impl TokenMatcher for LlguidanceMatcher {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
 
     use rand_chacha::ChaCha8Rng;
@@ -493,26 +504,108 @@ mod tests {
         Tokenizer::from_file(&path).expect("committed Llama tokenizer")
     }
 
-    /// True when `text` has whitespace outside JSON string literals.
-    fn whitespace_outside_strings(text: &str) -> bool {
-        let mut in_string = false;
-        let mut escaped = false;
+    /// Runs `text` (tokenized by `tokenizer`, special tokens such as `<|python_tag|>` included)
+    /// through `matcher`, checking each token against the step mask first. `Ok(accepting)` when
+    /// every token was allowed; `Err` names the first disallowed token.
+    pub(crate) fn feed_text(
+        matcher: &mut dyn TokenMatcher,
+        tokenizer: &Tokenizer,
+        eos: &[u32],
+        text: &str,
+    ) -> Result<bool, String> {
+        let ids = tokenizer.encode(text, false).expect("encode");
+        let mut mask = TokenMask::new_none(tokenizer.vocab_size() as usize);
+        for (i, &id) in ids.iter().enumerate() {
+            step_mask(matcher, eos, &mut mask).map_err(|e| format!("token {i}: {e}"))?;
+            if !mask.is_allowed(id) {
+                let done = tokenizer.decode(&ids[..i], false).expect("decode");
+                let piece = tokenizer.decode(&[id], false).expect("decode");
+                return Err(format!("token {i} {piece:?} disallowed after {done:?}"));
+            }
+            matcher.commit(id).map_err(|e| format!("token {i}: {e}"))?;
+        }
+        Ok(matcher.accepts_eos())
+    }
+
+    pub(crate) fn llama_compiler() -> (Tokenizer, GrammarCompiler) {
+        let tokenizer = llama_tokenizer();
+        let compiler = GrammarCompiler::new(&tokenizer, &LLAMA_EOS).expect("token trie");
+        (tokenizer, compiler)
+    }
+
+    pub(crate) const LLAMA_EOS: [u32; 3] = [128_001, 128_008, 128_009];
+
+    /// The longest run of whitespace outside JSON string literals in `text`.
+    pub(crate) fn longest_whitespace_outside_strings(text: &str) -> usize {
+        let (mut in_string, mut escaped) = (false, false);
+        let (mut run, mut longest) = (0, 0);
         for c in text.chars() {
             if in_string {
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    in_string = false;
+                match (escaped, c) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_string = false,
+                    _ => {}
                 }
+            } else if c.is_whitespace() {
+                run += 1;
+                longest = longest.max(run);
+                continue;
             } else if c == '"' {
                 in_string = true;
-            } else if c.is_whitespace() {
-                return true;
             }
+            run = 0;
         }
-        false
+        longest
+    }
+
+    #[test]
+    fn json_whitespace_natural_and_bounded() {
+        let (tokenizer, compiler) = llama_compiler();
+        let limits = GrammarLimits {
+            max_schema_bytes: 64 * 1024,
+        };
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+                "city": {"type": "string"}
+            },
+            "required": ["name", "age", "city"],
+            "additionalProperties": false
+        });
+        let run = |spec: &ConstraintSpec, text: &str| {
+            let mut matcher = compiler.compile(spec, &limits).expect("compile");
+            feed_text(matcher.as_mut(), &tokenizer, &LLAMA_EOS, text)
+        };
+        let person = ConstraintSpec::JsonSchema { schema };
+        let pad = " ".repeat(JSON_MAX_WHITESPACE);
+        // What Llama writes (`": "`, `", "`), compact JSON, pretty-printed JSON and a gap of
+        // exactly the bound are all complete outputs.
+        for text in [
+            r#"{"name": "John", "age": 30, "city": "Paris"}"#.to_string(),
+            r#"{"name":"John","age":30,"city":"Paris"}"#.to_string(),
+            "{\n  \"name\": \"John\",\n  \"age\": 30,\n  \"city\": \"Paris\"\n}".to_string(),
+            format!(r#"{{"name":{pad}"John", "age": 30, "city": "Paris"}}"#),
+        ] {
+            assert_eq!(run(&person, &text), Ok(true), "{text:?}");
+            assert!(longest_whitespace_outside_strings(&text) <= JSON_MAX_WHITESPACE);
+        }
+        // One whitespace character past the bound, and a string where the schema wants an
+        // integer, are refused.
+        let over = format!(r#"{{"name": {pad}"John", "age": 30, "city": "Paris"}}"#);
+        assert!(run(&person, &over).is_err(), "{over:?} accepted");
+        let wrong_type = r#"{"name": "John", "age": "30", "city": "Paris"}"#;
+        assert!(run(&person, wrong_type).is_err(), "{wrong_type:?} accepted");
+        // json_object takes the same natural whitespace.
+        assert_eq!(
+            run(
+                &ConstraintSpec::JsonObject,
+                r#"{"a": [1, 2], "b": {"c": true}}"#
+            ),
+            Ok(true)
+        );
     }
 
     #[test]
@@ -549,7 +642,7 @@ mod tests {
             let mut mask = TokenMask::new_none(vocab);
             let mut out = Vec::new();
             let mut ended = false;
-            for _ in 0..64 {
+            for _ in 0..256 {
                 step_mask(matcher.as_mut(), &EOS, &mut mask).expect("mask");
                 let mut logits: Vec<f32> = (0..vocab)
                     .map(|_| (rng.next_u32() >> 8) as f32 / (1u32 << 24) as f32)
@@ -566,13 +659,16 @@ mod tests {
             }
             assert!(
                 ended,
-                "seed {seed}: the grammar reached EOS within 64 tokens"
+                "seed {seed}: the grammar reached EOS within 256 tokens"
             );
             let text = tokenizer.decode(&out, false).expect("decode");
             let value: serde_json::Value =
                 serde_json::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
             assert!(validator.is_valid(&value), "seed {seed}: {text}");
-            assert!(!whitespace_outside_strings(&text), "not compact: {text:?}");
+            assert!(
+                longest_whitespace_outside_strings(&text) <= JSON_MAX_WHITESPACE,
+                "whitespace over the bound: {text:?}"
+            );
         }
 
         // An unsupported keyword is named; a schema over the byte bound is rejected.
