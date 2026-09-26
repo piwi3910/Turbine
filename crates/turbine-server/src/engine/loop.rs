@@ -804,7 +804,8 @@ impl EngineLoop {
     }
 
     /// The device reduction a yielding row of choice `choice` of request `id` asks for (P2c
-    /// S-4): only an unconstrained live choice whose sampler is eligible, and not the shared
+    /// S-4): only a live choice whose sampler finds the step eligible (a constrained choice's
+    /// grammar mask keeps it on the host), and not the shared
     /// prefill row that forks further choices (each fork samples its own copy of the whole
     /// row). `ahead` is 1 when the choice's previous token is still on the device (overlap
     /// scheduling): its sampler then asks for the step after the next one it observes.
@@ -822,10 +823,12 @@ impl EngineLoop {
         if choice == 0 && prefill && !r.forking_choices().is_empty() {
             return None;
         }
-        r.choices
-            .get_mut(choice)?
-            .unconstrained_sampler()?
-            .device_request_ahead(ahead)
+        let c = r.choices.get_mut(choice)?;
+        if c.finish.is_some() {
+            return None;
+        }
+        let constrained = c.is_constrained();
+        c.sampler_mut().device_request_ahead(ahead, constrained)
     }
 
     /// Samples every row whose step yields a token and emits its events. The completed shared

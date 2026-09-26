@@ -13,12 +13,16 @@ pub mod executor;
 pub mod generate;
 pub mod loader;
 pub mod metrics;
+pub mod registries;
 pub mod safetensors;
-pub mod sampler;
+pub mod sampling;
 pub mod structured;
 pub mod testing;
 pub mod tokenizer;
 pub mod tools;
+
+/// The sampler at its Phase 1 path, so `turbine_model::sampler::…` keeps resolving.
+pub use sampling::sampler;
 
 pub use crate::safetensors::{SafetensorsIndex, TensorEntry};
 pub use budget::{BudgetTerms, available_bytes, check_budget, host_mem_available};

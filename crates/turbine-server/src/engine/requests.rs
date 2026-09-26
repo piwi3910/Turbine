@@ -519,6 +519,17 @@ impl Choice {
         (self.matcher.is_none() && self.finish.is_none()).then_some(&mut self.sampler)
     }
 
+    /// The choice's sampler, constrained or not.
+    pub fn sampler_mut(&mut self) -> &mut Sampler {
+        &mut self.sampler
+    }
+
+    /// The choice samples under a constraint (`response_format` or the tool grammar): its
+    /// steps carry a token mask.
+    pub fn is_constrained(&self) -> bool {
+        self.matcher.is_some()
+    }
+
     /// The request carries a `seed` (its draws must stay reproducible).
     pub fn is_seeded(&self) -> bool {
         self.sampler.is_seeded()
