@@ -8,6 +8,8 @@ use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use turbine_core::request::Endpoint;
 use turbine_observability::MetricsRegistry;
 
+use crate::engine::stages::{IterationStages, Stage};
+
 /// `turbine_requests_total{outcome}` values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Outcome {
@@ -59,6 +61,16 @@ pub struct TokenLabels {
     pub kind: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct StageLabels {
+    pub stage: &'static str,
+}
+
+/// 50 µs doubling to ~0.82 s (15 buckets, then `+Inf`).
+fn stage_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(0.000_05, 2.0, 15))
+}
+
 /// Handles to the server's metrics; clones share the registered series.
 #[derive(Clone, Debug)]
 pub struct ServerMetrics {
@@ -74,6 +86,8 @@ pub struct ServerMetrics {
     pub tokens: Family<TokenLabels, Counter>,
     /// `turbine_stream_paused_total`: requests paused because their output channel was full.
     pub stream_paused: Counter,
+    /// `turbine_engine_iteration_seconds{stage}`: one engine iteration's time per stage.
+    pub engine_iteration: Family<StageLabels, Histogram, fn() -> Histogram>,
 }
 
 impl ServerMetrics {
@@ -110,6 +124,24 @@ impl ServerMetrics {
                 "Requests paused because their output channel was full",
                 Counter::default(),
             ),
+            engine_iteration: reg.register(
+                "turbine_engine_iteration_seconds",
+                "Time of one engine iteration spent in each stage",
+                Family::<StageLabels, Histogram, fn() -> Histogram>::new_with_constructor(
+                    stage_histogram,
+                ),
+            ),
+        }
+    }
+
+    /// Observes every stage of one executed iteration.
+    pub fn observe_stages(&self, stages: &IterationStages) {
+        for stage in Stage::ALL {
+            self.engine_iteration
+                .get_or_create(&StageLabels {
+                    stage: stage.as_str(),
+                })
+                .observe(stages.get(stage).as_secs_f64());
         }
     }
 
@@ -147,6 +179,9 @@ mod tests {
         m.itl.observe(0.001);
         m.e2e.observe(0.1);
         m.stream_paused.inc();
+        let mut stages = IterationStages::default();
+        stages.0[Stage::Launch as usize] = std::time::Duration::from_micros(70);
+        m.observe_stages(&stages);
         let text = reg.render().expect("render");
         for line in [
             r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 1"#,
@@ -157,6 +192,10 @@ mod tests {
             "turbine_request_itl_seconds_count 1",
             "turbine_request_e2e_seconds_count 1",
             "turbine_stream_paused_total 1",
+            r#"turbine_engine_iteration_seconds_count{stage="device_wait"} 1"#,
+            r#"turbine_engine_iteration_seconds_bucket{le="0.00005",stage="launch"} 0"#,
+            r#"turbine_engine_iteration_seconds_bucket{le="0.0001",stage="launch"} 1"#,
+            r#"turbine_engine_iteration_seconds_bucket{le="0.8192",stage="complete"} 1"#,
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");
         }

@@ -15,7 +15,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use smallvec::SmallVec;
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -81,6 +81,9 @@ pub(crate) struct Step {
     /// A `Token` event, then a `ToolCalls` event when the finished output parsed as calls.
     pub events: SmallVec<[GenerationEvent; 2]>,
     pub finish: Option<FinishReason>,
+    /// Time of the step after sampling: detokenisation, the stop-string search, tool-call
+    /// holding and parsing, and building the events (the engine's `detokenize` stage).
+    pub detokenize: Duration,
 }
 
 /// Where an event went.
@@ -341,6 +344,7 @@ impl ActiveRequest {
         c.sampler.observe(token);
         c.generated.push(token);
         let generated = c.generated.len() as u32;
+        let detokenize_started = Instant::now();
 
         // EOS (unless ignored) and `stop_token_ids` end the choice; their text is not output.
         let is_end = (!stop.ignore_eos && stop.eos_token_ids.contains(&token))
@@ -430,7 +434,11 @@ impl ActiveRequest {
                 calls,
             });
         }
-        Ok(Step { events, finish })
+        Ok(Step {
+            events,
+            finish,
+            detokenize: detokenize_started.elapsed(),
+        })
     }
 }
 

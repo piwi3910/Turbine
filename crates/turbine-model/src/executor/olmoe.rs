@@ -20,6 +20,7 @@
 //! `[experts + 1]` expert offsets back after routing (a small blocking copy); the batch's
 //! logits remain its only bulk device-to-host copy.
 use std::sync::Arc;
+use std::time::Instant;
 
 use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
 use turbine_kernels::{
@@ -31,7 +32,7 @@ use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, Tensor, TensorView}
 
 use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
 use super::llama::{ACT, ADD_CFG, attention_cfg, gemm_cfg, invalid, limits, rope_cfg};
-use super::{BatchInput, Logits, ModelExecutor, rope};
+use super::{BatchInput, ForwardTimings, Logits, ModelExecutor, rope};
 use crate::ModelError;
 use crate::config::{Architecture, ModelArchConfig, MoeConfig};
 use crate::loader::{LM_HEAD, LoadedWeights, stacked_experts_name};
@@ -208,6 +209,8 @@ pub struct OlmoeExecutor {
     meta: DeviceBatch,
     /// Host bytes of the last upload; valid until the next synchronization (contract §9.2).
     host: HostBatch,
+    /// Timings of the last forward ([`ModelExecutor::last_timings`]).
+    timings: ForwardTimings,
 }
 
 /// Layer `layer`'s stacked expert projection `proj`, as the loader filled it, checked to be
@@ -436,6 +439,7 @@ impl OlmoeExecutor {
             bufs,
             meta,
             host: HostBatch::default(),
+            timings: ForwardTimings::default(),
         })
     }
 
@@ -638,6 +642,7 @@ impl ModelExecutor for OlmoeExecutor {
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
         let p = self.host.pack(batch, &self.limits)?;
         self.meta.upload(&self.host)?;
+        let launch_started = Instant::now();
 
         let b = &self.bufs;
         let d = &self.dims;
@@ -660,6 +665,7 @@ impl ModelExecutor for OlmoeExecutor {
             &self.lm_head,
             Self::rows(&b.logits, n),
         )?;
+        let wait_started = Instant::now();
         // The iteration's logits copy (it synchronizes the stream).
         let raw = b
             .logits
@@ -670,11 +676,19 @@ impl ModelExecutor for OlmoeExecutor {
             .chunks_exact(F32)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        self.timings = ForwardTimings {
+            launch: wait_started - launch_started,
+            device_wait: wait_started.elapsed(),
+        };
         Ok(Logits {
             rows: n,
             vocab: d.vocab,
             data,
         })
+    }
+
+    fn last_timings(&self) -> ForwardTimings {
+        self.timings
     }
 
     fn copy_blocks(

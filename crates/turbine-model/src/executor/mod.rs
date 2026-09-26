@@ -2,6 +2,7 @@
 //! of sequences whose KV lives in the paged L0 block pool (`KvPoolView`), one FP32 logits row
 //! per sequence and one device-to-host copy per iteration (P2 S-5, S-9).
 use std::sync::Arc;
+use std::time::Duration;
 
 use turbine_core::types::{BlockId, KvLayout, ModelShape, SeqId};
 use turbine_kernels::{KernelRegistry, OpRequirement};
@@ -126,6 +127,17 @@ impl Logits {
     }
 }
 
+/// Where the host time of the last [`ModelExecutor::forward`] went (P2c S-1); the rest of the
+/// call (packing and uploading the batch metadata) is the engine's `prepare` stage.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ForwardTimings {
+    /// From the uploaded batch metadata until the last kernel of the pass is enqueued (the
+    /// op calls' host time; OLMoE's per-layer routing reads are included).
+    pub launch: Duration,
+    /// The synchronising device-to-host logits copy and its conversion into [`Logits`].
+    pub device_wait: Duration,
+}
+
 /// A model's forward pass over the kernel registry.
 pub trait ModelExecutor: Send {
     fn shape(&self) -> &ModelShape;
@@ -135,6 +147,10 @@ pub trait ModelExecutor: Send {
     /// FP32 logits row per sequence (its last position), in `seqs` order, with one
     /// device-to-host copy.
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError>;
+    /// Timings of the last successful `forward`; zeros when the executor does not measure.
+    fn last_timings(&self) -> ForwardTimings {
+        ForwardTimings::default()
+    }
     /// Copies block `src[i]` to `dst[i]` in every layer of `kv` (the `n > 1` fork), ordered
     /// before the next forward on the same stream.
     fn copy_blocks(

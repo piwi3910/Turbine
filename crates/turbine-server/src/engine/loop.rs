@@ -15,6 +15,10 @@
 //! 7. `Scheduler::complete`, then the diagnostics documents and `turbine_kv_blocks` are
 //!    published.
 //!
+//! Every turn is timed in the eight stages of [`Stage`] (P2c S-1) by marks around these steps;
+//! an executed iteration records them in `turbine_engine_iteration_seconds{stage}`, and every
+//! published scheduler document carries the last turn's `stages_ms`.
+//!
 //! A failed iteration fails every request in it with `internal_error`; three in a row stop the
 //! engine (CONFLICT C-25). A panic inside a turn is caught, logged with the iteration's request
 //! ids, and fails every request.
@@ -39,6 +43,7 @@ use turbine_scheduler::{
 
 use super::deadlines::{Deadlines, Timeouts};
 use super::requests::{ActiveRequest, Delivery, Flush, Submission};
+use super::stages::{Stage, StageClock};
 use super::{
     EngineCommand, EngineDocs, EngineMetrics, EngineShared, MAX_CONSECUTIVE_FAILURES, SubmitAck,
 };
@@ -88,12 +93,14 @@ pub(crate) struct EngineLoop {
     shutting_down: bool,
     /// The previous plan had nothing to execute.
     idle_turn: bool,
+    /// Times the current turn's stages.
+    stages: StageClock,
 }
 
 impl EngineLoop {
     /// The engine over `p`; its diagnostics documents are published at once.
     pub fn new(p: EngineParts) -> EngineLoop {
-        let engine = EngineLoop {
+        let mut engine = EngineLoop {
             deadlines: Deadlines::new(Arc::clone(&p.clock), p.timeouts),
             exec: p.executor,
             pool: p.pool,
@@ -111,8 +118,9 @@ impl EngineLoop {
             iteration_requests: Vec::new(),
             shutting_down: false,
             idle_turn: false,
+            stages: StageClock::start(),
         };
-        engine.publish();
+        engine.publish(false);
         engine
     }
 
@@ -154,7 +162,9 @@ impl EngineLoop {
         if !self.receive_commands() {
             return Ok(Turn::Stop);
         }
+        self.stages.mark(Stage::Schedule);
         self.flush_outputs();
+        self.stages.mark(Stage::Emit);
         self.detect_disconnects();
         self.expire_deadlines();
 
@@ -162,6 +172,7 @@ impl EngineLoop {
         for &(id, reason) in &plan.dropped {
             self.on_dropped(id, reason);
         }
+        self.stages.mark(Stage::Schedule);
         if plan.is_empty() {
             self.sched.complete(
                 &mut self.pool,
@@ -171,7 +182,7 @@ impl EngineLoop {
                 },
             );
             self.idle_turn = true;
-            self.publish();
+            self.publish(false);
             return Ok(Turn::Continue);
         }
         self.idle_turn = false;
@@ -179,7 +190,7 @@ impl EngineLoop {
         let outcome = self.execute(&plan);
         let failure = outcome.failed.clone();
         self.sched.complete(&mut self.pool, outcome);
-        self.publish();
+        self.publish(true);
         match failure {
             None => self.consecutive_failures = 0,
             Some(f) => {
@@ -200,18 +211,23 @@ impl EngineLoop {
         self.sched.is_idle() && self.requests.is_empty()
     }
 
-    /// Step 1. Returns false when the engine should stop.
+    /// Step 1. Returns false when the engine should stop. The turn's stage clock starts after
+    /// the wait for work.
     fn receive_commands(&mut self) -> bool {
         if self.quiet() {
             if self.shutting_down {
                 return false;
             }
-            match self.commands.blocking_recv() {
-                Some(cmd) => self.command(cmd),
-                None => return false,
+            let Some(cmd) = self.commands.blocking_recv() else {
+                return false;
+            };
+            self.stages = StageClock::start();
+            self.command(cmd);
+        } else {
+            if self.idle_turn {
+                std::thread::sleep(IDLE_POLL);
             }
-        } else if self.idle_turn {
-            std::thread::sleep(IDLE_POLL);
+            self.stages = StageClock::start();
         }
         loop {
             match self.commands.try_recv() {
@@ -457,6 +473,7 @@ impl EngineLoop {
             self.fail_iteration(format!("copy_blocks failed: {e}"), &mut outcome);
             return outcome;
         }
+        self.stages.mark(Stage::Prepare);
         if plan.items.is_empty() {
             return outcome;
         }
@@ -526,6 +543,12 @@ impl EngineLoop {
             seqs: &slices,
             kv: &view,
         });
+        if result.is_ok() {
+            let t = self.exec.last_timings();
+            self.stages.add(Stage::Launch, t.launch);
+            self.stages.add(Stage::DeviceWait, t.device_wait);
+        }
+        self.stages.mark(Stage::Prepare);
         self.metrics
             .model
             .observe_forward(phase, started.elapsed().as_secs_f64());
@@ -683,10 +706,13 @@ impl EngineLoop {
         if let Some(reason) = step.finish {
             outcome.finished.push((seq, reason));
         }
+        self.stages.add(Stage::Detokenize, step.detokenize);
+        self.stages.mark(Stage::Sample);
         // The request is accounted before its last events go out, so a client that has read
         // the whole response sees its metrics.
         if all_finished {
             self.account(id, Outcome::Ok, "");
+            self.stages.mark(Stage::Complete);
         }
         for event in step.events {
             self.deliver(id, event);
@@ -694,8 +720,10 @@ impl EngineLoop {
         if let Some(event) = finished_event {
             self.deliver(id, event);
         }
+        self.stages.mark(Stage::Emit);
         if all_finished {
             self.retire(id);
+            self.stages.mark(Stage::Complete);
         }
         true
     }
@@ -838,13 +866,23 @@ impl EngineLoop {
         }
     }
 
-    /// Step 7.
-    fn publish(&self) {
-        self.shared.publish(EngineDocs {
-            scheduler: self.sched.snapshot(),
-            kv: KvDocument::from_pool(&self.pool),
-        });
+    /// Step 7. Closes the turn's stage clock: the documents carry its `stages_ms`, and an
+    /// `executed` iteration (a non-empty plan) records its stages.
+    fn publish(&mut self, executed: bool) {
+        let mut scheduler = self.sched.snapshot();
+        let kv = KvDocument::from_pool(&self.pool);
         self.metrics.kv.record(&self.pool);
+        self.stages.mark(Stage::Complete);
+        let stages = std::mem::replace(&mut self.stages, StageClock::start()).finish();
+        if executed {
+            self.metrics.server.observe_stages(&stages);
+        }
+        scheduler.last_iteration.stages_ms = stages
+            .to_ms_map()
+            .into_iter()
+            .map(|(stage, ms)| (stage.to_string(), ms))
+            .collect();
+        self.shared.publish(EngineDocs { scheduler, kv });
     }
 }
 

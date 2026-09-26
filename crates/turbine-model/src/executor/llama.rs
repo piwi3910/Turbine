@@ -17,6 +17,7 @@
 //! free when off (one branch per op).
 use std::cell::RefCell;
 use std::sync::Arc;
+use std::time::Instant;
 
 use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
 use turbine_kernels::{
@@ -28,7 +29,7 @@ use turbine_kernels::{
 use turbine_tensor::{DeviceMemory, KvPoolView, Tensor, TensorView};
 
 use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
-use super::{BatchInput, Logits, ModelExecutor, rope};
+use super::{BatchInput, ForwardTimings, Logits, ModelExecutor, rope};
 use crate::ModelError;
 use crate::config::ModelArchConfig;
 use crate::loader::{LM_HEAD, LoadedWeights};
@@ -218,6 +219,8 @@ pub struct LlamaExecutor {
     /// Host bytes of the last upload; they stay valid until the next synchronization, which the
     /// logits read performs (contract §9.2).
     host: HostBatch,
+    /// Timings of the last forward ([`ModelExecutor::last_timings`]).
+    timings: ForwardTimings,
     /// `Some` while tracing: the recorded tensors not yet taken.
     trace: RefCell<Option<Vec<TraceTensor>>>,
 }
@@ -380,6 +383,7 @@ impl LlamaExecutor {
             bufs,
             meta,
             host: HostBatch::default(),
+            timings: ForwardTimings::default(),
             trace: RefCell::new(None),
         })
     }
@@ -590,6 +594,7 @@ impl ModelExecutor for LlamaExecutor {
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
         let p = self.host.pack(batch, &self.limits)?;
         self.meta.upload(&self.host)?;
+        let launch_started = Instant::now();
 
         let b = &self.bufs;
         let d = &self.dims;
@@ -611,6 +616,7 @@ impl ModelExecutor for LlamaExecutor {
         let head = self.lm_head.as_ref().unwrap_or(&self.embed);
         self.linear(Self::rows(&b.last, n), head, Self::rows(&b.logits, n))?;
         self.record(None, "logits", Self::rows(&b.logits, n))?;
+        let wait_started = Instant::now();
         // The iteration's one device-to-host copy (it synchronizes the stream).
         let raw = b
             .logits
@@ -621,11 +627,19 @@ impl ModelExecutor for LlamaExecutor {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        self.timings = ForwardTimings {
+            launch: wait_started - launch_started,
+            device_wait: wait_started.elapsed(),
+        };
         Ok(Logits {
             rows: n,
             vocab: d.vocab,
             data,
         })
+    }
+
+    fn last_timings(&self) -> ForwardTimings {
+        self.timings
     }
 
     fn copy_blocks(

@@ -3,7 +3,8 @@
 //! OpenAI shapes, queueing and cancellation, the queue bound, KV release on disconnect, the
 //! diagnostics documents, slow clients and the request and queue timeouts, request validation,
 //! startup failures, the Phase 1 metrics, the Phase 2 request fields, preemption, structured
-//! output, tool calls and the Phase 2 metrics and log reasons.
+//! output, tool calls and the Phase 2 metrics and log reasons; the Phase 2c iteration stage
+//! breakdown (P2c S-1).
 //!
 //! Streams that must stay open are made to back-pressure the engine: large events (20 logprobs
 //! each), more `max_tokens` than the path to the client buffers on a checkpoint patched to 8192
@@ -2264,5 +2265,76 @@ fn concurrent_streams_are_well_framed() {
         failures.is_empty(),
         "{} of 16 clients failed: {failures:#?}",
         failures.len()
+    );
+}
+
+/// The eight engine iteration stages (P2c S-1), in `IterationStages` order.
+const STAGES: [&str; 8] = [
+    "schedule",
+    "prepare",
+    "launch",
+    "device_wait",
+    "sample",
+    "detokenize",
+    "emit",
+    "complete",
+];
+
+/// P2c S-1: every iteration is timed in eight stages; `/metrics` has a histogram per stage and
+/// the scheduler document's `last_iteration.stages_ms` partitions its `duration_ms`.
+#[test]
+fn iteration_stage_breakdown() {
+    let server = TinyServer::start("");
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let (addr, model) = (server.addr, server.model.clone());
+            std::thread::spawn(move || {
+                let body = json!({"model": model, "prompt": format!("Hello {i}"),
+                                  "max_tokens": 12, "ignore_eos": true});
+                request(addr, "POST", "/v1/completions", Some(&body.to_string()))
+            })
+        })
+        .collect();
+    for h in handles {
+        let resp = h.join().unwrap();
+        assert_eq!(resp.status, 200, "{}", resp.body);
+    }
+
+    let metrics = server.metrics();
+    for stage in STAGES {
+        let series = format!(r#"turbine_engine_iteration_seconds_count{{stage="{stage}"}}"#);
+        assert!(
+            sample(&metrics, &series).is_some_and(|n| n > 0.0),
+            "{series}\n{metrics}"
+        );
+    }
+    // The executors measure their share of the forward pass.
+    for stage in ["launch", "device_wait"] {
+        let series = format!(r#"turbine_engine_iteration_seconds_sum{{stage="{stage}"}}"#);
+        assert!(
+            sample(&metrics, &series).is_some_and(|s| s > 0.0),
+            "{series}\n{metrics}"
+        );
+    }
+
+    let doc = server.scheduler();
+    let last = &doc["last_iteration"];
+    let stages = last["stages_ms"].as_object().expect("stages_ms object");
+    let mut keys: Vec<&str> = stages.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut want = STAGES.to_vec();
+    want.sort_unstable();
+    assert_eq!(keys, want, "{doc}");
+    let mut sum = 0.0;
+    for (stage, ms) in stages {
+        let ms = ms.as_f64().expect("a number");
+        assert!(ms >= 0.0, "{stage}: {ms} in {doc}");
+        sum += ms;
+    }
+    let duration = last["duration_ms"].as_f64().unwrap();
+    assert!(duration > 0.0, "{doc}");
+    assert!(
+        (sum - duration).abs() <= (0.05 * duration).max(0.5),
+        "stages sum to {sum} ms, the iteration took {duration} ms: {doc}"
     );
 }

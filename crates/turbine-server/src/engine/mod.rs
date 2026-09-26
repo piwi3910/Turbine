@@ -11,6 +11,7 @@ pub(crate) mod deadlines;
 pub(crate) mod grammar;
 mod r#loop;
 pub(crate) mod requests;
+pub(crate) mod stages;
 
 use std::sync::{Arc, Mutex, PoisonError};
 

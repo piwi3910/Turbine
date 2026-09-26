@@ -13,7 +13,7 @@
 //! progresses — no livelock while each request's full KV fits the empty pool (checked at
 //! submission).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -219,12 +219,16 @@ pub struct SnapshotConfig {
     pub chunked_prefill: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct LastIteration {
     pub prefill_tokens: u32,
     pub decode_tokens: u32,
     pub requests: u32,
     pub duration_ms: f64,
+    /// Milliseconds of the iteration per engine stage (P2c S-1: `schedule`, `prepare`,
+    /// `launch`, `device_wait`, `sample`, `detokenize`, `emit`, `complete`). The scheduler
+    /// leaves it empty; the engine fills it in the document it publishes.
+    pub stages_ms: BTreeMap<String, f64>,
 }
 
 struct ReqEntry {
@@ -559,6 +563,7 @@ impl Scheduler {
             decode_tokens,
             requests: plan.items.len() as u32,
             duration_ms: 0.0,
+            stages_ms: BTreeMap::new(),
         };
         self.publish_gauges();
         plan
@@ -668,7 +673,7 @@ impl Scheduler {
             constrained: self.requests.values().filter(|r| r.req.constrained).count() as u32,
             iterations_total: self.iteration,
             preemptions_total: self.preemptions_total,
-            last_iteration: self.last,
+            last_iteration: self.last.clone(),
         }
     }
 
