@@ -751,8 +751,8 @@ pub const TURBINE_KERNELS_ABI_VERSION: u32;          // P1 name; value per §9.1
 
 pub struct ShimLibrary { /* libloading::Library + resolved symbol table */ }   // P2b name: one type for hip and cuda, parameterised by expected backend
 impl ShimLibrary {
-    pub fn load(path: &Path, expected_backend: ExecutionBackend) -> Result<Arc<ShimLibrary>, KernelError>;   // checks abi_version, backend_name
-    pub fn search_paths(backend: ExecutionBackend, explicit: Option<&Path>) -> Vec<PathBuf>;              // P1/P2b search order, logged
+    pub fn load(path: &Path, expected_backend: &str) -> Result<Arc<ShimLibrary>, KernelError>;   // checks abi_version, backend_name (P2m: the backend name)
+    pub fn search_paths(backend: &str, explicit: Option<&Path>) -> Vec<PathBuf>;              // P1/P2b search order, logged; libturbine_<backend>.so
     pub fn abi_version(&self) -> u32; pub fn backend_name(&self) -> &str; pub fn build_archs(&self) -> &[String];
     pub fn create_context(self: &Arc<Self>, device: &DeviceInfo) -> Result<Arc<ShimContext>, KernelError>; // arch ∈ build_archs, ctx_create(vendor_index)
 }

@@ -688,6 +688,58 @@ fn completions_stream_and_non_stream() {
     assert!(status["model"]["load_seconds"].as_f64().is_some());
 }
 
+/// Phase 2m: `/turbine/v1/status` names the module chosen at each extension point and, per op
+/// config of the kernel registry, the provider and implementation that serve it.
+#[test]
+fn status_reports_modules_and_kernels() {
+    let server = TinyServer::launch(&Setup {
+        model_extra: "  tool_call_parser: llama3_json\n",
+        ..Setup::default()
+    });
+    let status = server.get("/turbine/v1/status").json();
+    assert_eq!(
+        status["modules"],
+        json!({"family": "llama", "tool_format": "llama3_json", "weight_format": "bf16",
+               "backend": "cpu", "card_profile": null, "scheduling_policy": "default"}),
+        "{status}"
+    );
+
+    // The registry the server builds for the tiny checkpoint: the executor's requirements with
+    // the default (fused) op sequence and the device logits reduction, on the cpu provider.
+    let dir = TempDir::new("turbine-tiny-kernels");
+    let spec = write_tiny_llama(dir.path(), 7);
+    let provider = cpu_reference_provider();
+    let order = [provider.id()];
+    let providers = vec![provider];
+    let mut reqs = executor::available_requirements(
+        &spec.config,
+        128,
+        ExecutorOptions::from_fused_ops(true),
+        &providers,
+    );
+    let reduce = executor::logits::reduce_requirement(&spec.config);
+    if reduce.spec.supported_by(providers[0].as_ref()) {
+        reqs.push(reduce);
+    }
+    let registry = KernelRegistry::build(
+        providers,
+        &order,
+        &reqs,
+        &KernelMetrics::register(&MetricsRegistry::new()),
+    )
+    .unwrap();
+    let expected: Vec<Value> = registry
+        .selections()
+        .iter()
+        .map(|s| {
+            json!({"op": s.op.as_str(), "config": s.config, "provider": "cpu-reference",
+                   "implementation": s.implementation, "reason": s.reason})
+        })
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(status["kernels"], Value::Array(expected), "{status}");
+}
+
 /// Contract §20.2 (rewritten for Phase 2): with one running request allowed
 /// (`continuous_batching: false`) a second concurrent request is queued — no more 429
 /// `engine_busy` — and completes once the first client goes away, whose blocks are freed.
@@ -1184,7 +1236,7 @@ fn startup_failures_exit_1() {
     );
     assert_exit_1(&yaml, addr, "/nonexistent/libturbine_hip.so");
 
-    // cuda is a configuration error until phase-2b-nvidia.
+    // cuda is a configuration error until a cuda backend is registered (phase-2b-nvidia).
     let addr = free_addr();
     let yaml = format!(
         "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cuda\n",
@@ -1192,7 +1244,10 @@ fn startup_failures_exit_1() {
     );
     let (code, stderr) = run_failing(&dir, &yaml);
     assert_eq!(code, Some(2), "stderr:\n{stderr}");
-    assert!(stderr.contains("phase-2b-nvidia"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("execution.backend: `cuda` is not registered (registered: cpu, hip)"),
+        "stderr:\n{stderr}"
+    );
 }
 
 #[test]

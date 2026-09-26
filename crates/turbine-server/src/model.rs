@@ -10,9 +10,9 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Instant;
 
-use turbine_core::config::{Config, StructuredOutputConfig, ToolCallParserKind};
+use turbine_core::config::{Config, StructuredOutputConfig};
 use turbine_core::types::SeqId;
-use turbine_core::types::{ExecutionBackend, MemoryKind, Vendor};
+use turbine_core::types::{MemoryKind, Vendor};
 use turbine_device::{DeviceInfo, DeviceInventory};
 use turbine_kernels::{
     KernelError, KernelMetrics, KernelProvider, KernelRegistry, OpKind, ProviderId, Selection,
@@ -24,6 +24,7 @@ use turbine_model::executor::{
     self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, ModelExecutor, SeqSlice, graphs,
 };
 use turbine_model::loader::LoadedWeights;
+use turbine_model::tools::LLAMA3_JSON;
 use turbine_model::{
     Architecture, BudgetTerms, ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES,
     ModelArchConfig, ModelError, ModelMetrics, SafetensorsIndex, Tokenizer, WeightLoader,
@@ -32,6 +33,8 @@ use turbine_model::{
 };
 use turbine_observability::MetricsRegistry;
 use turbine_scheduler::SchedulerParams;
+
+use crate::modules::{self, ModuleChoices};
 use turbine_tensor::DeviceMemory;
 use turbine_tensor::host::HostMemory;
 
@@ -100,30 +103,30 @@ pub fn resolve_max_seq_len(configured: Option<u32>, max_positions: u32) -> Resul
     }
 }
 
-/// `model.tool_call_parser`: `llama3_json` for a `LlamaForCausalLM` whose chat template renders
-/// `tools` when null. A parser is only usable with a template that renders `tools`: a
-/// configured `llama3_json` on any other template resolves to `none` (logged), so `tools`
-/// requests get 400 `tools_not_supported` instead of a prompt that silently lacks them.
+/// `model.tool_call_parser`, as the name of a registered tool format or `None` (tool calling
+/// off): `llama3_json` for a `LlamaForCausalLM` whose chat template renders `tools` when null.
+/// A format is only usable with a template that renders `tools`: a configured `llama3_json` on
+/// any other template resolves to none (logged), so `tools` requests get 400
+/// `tools_not_supported` instead of a prompt that silently lacks them. `none` and a name
+/// `Config::validate_modules` would have refused resolve to none.
 pub fn resolve_tool_call_parser(
-    configured: Option<ToolCallParserKind>,
+    configured: Option<&str>,
     architecture: Architecture,
     renders_tools: bool,
-) -> ToolCallParserKind {
+) -> Option<&'static str> {
     match configured {
-        Some(ToolCallParserKind::None) => ToolCallParserKind::None,
-        Some(kind) if renders_tools => kind,
-        Some(kind) => {
+        Some("none") => None,
+        Some(name) if renders_tools => modules::TOOL_FORMATS.iter().copied().find(|f| *f == name),
+        Some(name) => {
             tracing::warn!(
-                parser = ?kind,
+                parser = name,
                 "model.tool_call_parser is set but the chat template does not render tools; \
                  tool calling is disabled"
             );
-            ToolCallParserKind::None
+            None
         }
-        None if renders_tools && architecture == Architecture::Llama => {
-            ToolCallParserKind::Llama3Json
-        }
-        None => ToolCallParserKind::None,
+        None if renders_tools && architecture == Architecture::Llama => Some(LLAMA3_JSON),
+        None => None,
     }
 }
 
@@ -146,6 +149,9 @@ pub struct Provider {
     /// The context decode graphs capture on: `Some` on a backend whose kernel library exports
     /// the ABI v2.1 graph functions.
     pub graphs: Option<Arc<ShimContext>>,
+    /// The card profile in effect (`execution.card_profile`, `auto` → the device architecture's
+    /// profile); `None` on the cpu backend or a device no profile describes.
+    pub card_profile: Option<String>,
 }
 
 /// Step 4: load the kernel provider. `hip`: the first loadable library of
@@ -157,8 +163,8 @@ pub fn load_provider(
     inventory: &DeviceInventory,
 ) -> Result<Provider, StartupError> {
     let exec = &config.execution;
-    match exec.backend {
-        ExecutionBackend::Cpu => {
+    match exec.backend.as_str() {
+        "cpu" => {
             let device_total = inventory
                 .devices
                 .iter()
@@ -180,11 +186,13 @@ pub fn load_provider(
                 order: vec![ProviderId("cpu-reference")],
                 memory_kind: MemoryKind::Dedicated,
                 graphs: None,
+                card_profile: None,
             })
         }
-        ExecutionBackend::Hip => {
-            let lib = load_shim(ExecutionBackend::Hip, exec.kernel_library.as_deref())?;
+        "hip" => {
+            let lib = load_shim("hip", exec.kernel_library.as_deref())?;
             let device = amd_device(inventory, exec.device.0)?;
+            let card_profile = card_profile(exec.card_profile.as_str(), device.arch.as_deref());
             let ctx: Arc<ShimContext> = lib
                 .create_context(device)
                 .map_err(|e| kernel_error("kernel library context", e))?;
@@ -207,19 +215,26 @@ pub fn load_provider(
                 order: vec![id],
                 memory_kind: device.memory.kind,
                 graphs,
+                card_profile,
             })
         }
         other => Err(StartupError::new(format!(
-            "execution.backend {} is not available in this build",
-            other.as_str()
+            "execution.backend {other} is not available in this build"
         ))),
     }
 }
 
-fn load_shim(
-    backend: ExecutionBackend,
-    explicit: Option<&Path>,
-) -> Result<Arc<ShimLibrary>, StartupError> {
+/// `execution.card_profile` on a device of architecture `arch`: a configured name as is; `auto`
+/// → the profile named after `arch` when one is registered, else none.
+fn card_profile(configured: &str, arch: Option<&str>) -> Option<String> {
+    if configured != "auto" {
+        return Some(configured.to_string());
+    }
+    arch.filter(|a| modules::CARD_PROFILES.contains(a))
+        .map(str::to_string)
+}
+
+fn load_shim(backend: &str, explicit: Option<&Path>) -> Result<Arc<ShimLibrary>, StartupError> {
     let paths = ShimLibrary::search_paths(backend, explicit);
     if explicit.is_none() {
         let order: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
@@ -234,8 +249,7 @@ fn load_shim(
         }
     }
     Err(StartupError::new(format!(
-        "kernel library: no loadable libturbine_{}.so: {}",
-        backend.as_str(),
+        "kernel library: no loadable libturbine_{backend}.so: {}",
         misses.join("; ")
     )))
 }
@@ -287,8 +301,10 @@ pub struct PreparedModel {
     pub grammar: Arc<GrammarCompiler>,
     /// `structured_output` bounds on those grammars.
     pub structured_output: StructuredOutputConfig,
-    /// The resolved `model.tool_call_parser`.
-    pub tool_call_parser: ToolCallParserKind,
+    /// The resolved `model.tool_call_parser`: a registered tool format, or `None` (off).
+    pub tool_call_parser: Option<&'static str>,
+    /// The module picked at each extension point (`/turbine/v1/status` `modules`).
+    pub modules: ModuleChoices,
     pub served_name: String,
     pub budget: BudgetTerms,
 }
@@ -364,7 +380,7 @@ pub fn prepare(
     )
     .map_err(|e| kernel_error("kernel selection", e))?;
     if let Some(implementation) =
-        paged_attention_fallback(config.execution.backend, registry.selections())
+        paged_attention_fallback(config.execution.backend.as_str(), registry.selections())
     {
         tracing::info!(
             event = "paged_attention_fallback",
@@ -378,7 +394,7 @@ pub fn prepare(
     if config.execution.decode_graphs && !decode_graphs {
         tracing::warn!(
             event = "decode_graphs_unavailable",
-            backend = config.execution.backend.as_str(),
+            backend = %config.execution.backend,
             "execution.decode_graphs is on but the kernel provider cannot capture graphs \
              (kernel ABI v2.1 graph functions); decode iterations run eagerly"
         );
@@ -428,15 +444,25 @@ pub fn prepare(
         .map(Arc::new)
         .map_err(|e| model_error("structured output", e))?;
     let tool_call_parser = resolve_tool_call_parser(
-        config.model.tool_call_parser,
+        config.model.tool_call_parser.as_ref().map(|n| n.as_str()),
         arch.architecture,
         template.renders_tools(),
     );
     tracing::info!(
         token_trie_seconds = started.elapsed().as_secs_f64(),
-        tool_call_parser = ?tool_call_parser,
+        tool_call_parser = tool_call_parser.unwrap_or("none"),
         "structured output ready"
     );
+    let modules = ModuleChoices {
+        family: arch.architecture.family_name().to_string(),
+        tool_format: tool_call_parser.map(str::to_string),
+        // Weights and KV are BF16 (`model.dtype`, the only value).
+        weight_format: "bf16".to_string(),
+        backend: config.execution.backend.to_string(),
+        card_profile: provider.card_profile.clone(),
+        scheduling_policy: config.scheduler.policy.to_string(),
+    };
+    modules.log();
 
     let served_name = config
         .model
@@ -468,6 +494,7 @@ pub fn prepare(
         grammar,
         structured_output: config.structured_output.clone(),
         tool_call_parser,
+        modules,
         served_name,
         budget,
     })
@@ -479,8 +506,8 @@ const CK_PAGED_ATTENTION: &str = "ck_tile_fmha_pagedkv";
 /// The paged-attention implementation of the HIP backend when it is not Composable Kernel's
 /// `fmha_fwd_pagedkv` (CK serves only pages of a multiple of 128 tokens; other sizes run the
 /// slower Turbine kernel), else `None`. Other backends have no CK path to fall back from.
-fn paged_attention_fallback(backend: ExecutionBackend, selections: &[Selection]) -> Option<String> {
-    if backend != ExecutionBackend::Hip {
+fn paged_attention_fallback(backend: &str, selections: &[Selection]) -> Option<String> {
+    if backend != "hip" {
         return None;
     }
     selections
@@ -676,21 +703,32 @@ mod tests {
             sel(OpKind::AttentionPrefillPaged, "ck_tile_fmha_pagedkv"),
             sel(OpKind::AttentionDecodePaged, "ck_tile_fmha_pagedkv"),
         ];
-        assert_eq!(
-            paged_attention_fallback(ExecutionBackend::Hip, &on_ck),
-            None
-        );
+        assert_eq!(paged_attention_fallback("hip", &on_ck), None);
         let fallback = [
             sel(OpKind::Gemm, "hipblaslt"),
             sel(OpKind::AttentionPrefillPaged, "turbine_hip"),
             sel(OpKind::AttentionDecodePaged, "turbine_hip"),
         ];
         assert_eq!(
-            paged_attention_fallback(ExecutionBackend::Hip, &fallback).as_deref(),
+            paged_attention_fallback("hip", &fallback).as_deref(),
             Some("turbine_hip")
         );
         let cpu = [sel(OpKind::AttentionPrefillPaged, "cpu_reference")];
-        assert_eq!(paged_attention_fallback(ExecutionBackend::Cpu, &cpu), None);
+        assert_eq!(paged_attention_fallback("cpu", &cpu), None);
+    }
+
+    #[test]
+    fn card_profile_auto_follows_the_device() {
+        assert_eq!(
+            card_profile("auto", Some("gfx1201")).as_deref(),
+            Some("gfx1201")
+        );
+        assert_eq!(card_profile("auto", Some("gfx942")), None);
+        assert_eq!(card_profile("auto", None), None);
+        assert_eq!(
+            card_profile("gfx1201", Some("gfx942")).as_deref(),
+            Some("gfx1201")
+        );
     }
 
     #[test]
@@ -726,32 +764,33 @@ mod tests {
 
     #[test]
     fn tool_call_parser_resolution() {
-        use ToolCallParserKind::{Llama3Json, None as NoParser};
+        const LLAMA: Option<&str> = Some(LLAMA3_JSON);
+        const OFF: Option<&str> = None;
         // Null: llama3_json only for a Llama whose template renders tools.
         assert_eq!(
             resolve_tool_call_parser(None, Architecture::Llama, true),
-            Llama3Json
+            LLAMA
         );
         assert_eq!(
             resolve_tool_call_parser(None, Architecture::Llama, false),
-            NoParser
+            OFF
         );
         assert_eq!(
             resolve_tool_call_parser(None, Architecture::Olmoe, true),
-            NoParser
+            OFF
         );
         // Explicit values; a parser needs a template that renders tools.
         assert_eq!(
-            resolve_tool_call_parser(Some(Llama3Json), Architecture::Olmoe, true),
-            Llama3Json
+            resolve_tool_call_parser(LLAMA, Architecture::Olmoe, true),
+            LLAMA
         );
         assert_eq!(
-            resolve_tool_call_parser(Some(Llama3Json), Architecture::Llama, false),
-            NoParser
+            resolve_tool_call_parser(LLAMA, Architecture::Llama, false),
+            OFF
         );
         assert_eq!(
-            resolve_tool_call_parser(Some(NoParser), Architecture::Llama, true),
-            NoParser
+            resolve_tool_call_parser(Some("none"), Architecture::Llama, true),
+            OFF
         );
     }
 }

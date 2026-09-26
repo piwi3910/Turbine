@@ -190,6 +190,38 @@ fn invalid_config_exits_2_before_bind() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "config ok");
 }
 
+/// Phase 2m: a module key naming no registered module is a configuration error — exit 2 before
+/// device discovery and before the port is bound, the same under `--check-config`.
+#[test]
+fn unregistered_module_exits_2_before_bind() {
+    let port = free_port();
+    let cfg = TempConfig::new(
+        "unregistered",
+        &format!("model:\n  path: /m\nserver:\n  listen: 127.0.0.1:{port}\n"),
+    );
+    for (set, key) in [
+        ("scheduler.policy=fifo", "scheduler.policy"),
+        ("execution.backend=cuda", "execution.backend"),
+    ] {
+        for check in [false, true] {
+            let mut args = vec!["--set", set];
+            if check {
+                args.push("--check-config");
+            }
+            let out = wait_with_timeout(spawn_server(&args, &cfg.path), Duration::from_secs(20));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{set} {args:?}: {stderr}");
+            assert!(
+                stderr.contains("turbine-server: invalid configuration:"),
+                "{stderr}"
+            );
+            assert!(stderr.contains(key), "{stderr}");
+            assert!(stderr.contains("not registered"), "{stderr}");
+            TcpListener::bind(("127.0.0.1", port)).expect("the configured port must still be free");
+        }
+    }
+}
+
 /// A tiny synthetic checkpoint served as `m` on the cpu reference backend (Phase 1 needs a
 /// loadable model before the listener binds). The directory is removed on drop.
 fn tiny_model_yaml(addr: SocketAddr) -> (TempDir, String) {

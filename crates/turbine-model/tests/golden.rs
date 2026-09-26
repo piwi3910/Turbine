@@ -25,7 +25,7 @@ use turbine_core::request::{
     CancelFlag, Endpoint, FinishReason, GenerationEvent, GenerationRequest, SamplingParams,
     StopConditions,
 };
-use turbine_core::types::{ExecutionBackend, RequestId, Vendor};
+use turbine_core::types::{RequestId, Vendor};
 use turbine_kernels::{
     KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider, shim_provider,
 };
@@ -714,7 +714,7 @@ fn logits_match_reference() {
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
         .expect("load the HIP kernel library");
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
         .expect("device discovery");
@@ -758,7 +758,7 @@ fn olmoe_logits_match_reference() {
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
         .expect("load the HIP kernel library");
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
         .expect("device discovery");
@@ -817,7 +817,7 @@ fn hip_trace_vs_cpu_3b() {
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
         .expect("load the HIP kernel library");
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
         .expect("device discovery");
@@ -1017,7 +1017,7 @@ fn olmoe_teacher_forced_vs_reference() {
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
         .expect("load the HIP kernel library");
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
         .expect("device discovery");

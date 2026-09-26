@@ -34,6 +34,7 @@ use crate::engine::{self, EngineMetrics, Fatal, Timeouts};
 use crate::exit::ExitCode;
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
+use crate::modules::known_module_names;
 
 /// How long `/ready` reports the failure before the process exits 1 (P1: at most 1 s).
 const FAILURE_GRACE: Duration = Duration::from_millis(500);
@@ -63,7 +64,11 @@ fn send_buffer_cap(value: Option<&str>) -> Result<Option<usize>, String> {
 }
 
 pub fn run(cli: Cli) -> ExitCode {
-    let config = match config::load(&cli.config, &cli.set) {
+    // Module names are checked against the registries with the rest of the configuration:
+    // exit 2 before device discovery and before binding, also under --check-config.
+    let config = match config::load(&cli.config, &cli.set)
+        .and_then(|c| c.validate_modules(&known_module_names()).map(|()| c))
+    {
         Ok(c) => c,
         Err(e) => {
             eprintln!("turbine-server: invalid configuration: {e}");

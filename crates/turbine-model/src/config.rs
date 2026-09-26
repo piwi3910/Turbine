@@ -37,6 +37,15 @@ impl Architecture {
         }
     }
 
+    /// The `model_family` module name (`/turbine/v1/status` `modules.family`). Phase 2m Task 6
+    /// replaces this enum with the family registry.
+    pub fn family_name(self) -> &'static str {
+        match self {
+            Architecture::Llama => "llama",
+            Architecture::Olmoe => "olmoe",
+        }
+    }
+
     pub fn from_hf_name(name: &str) -> Option<Architecture> {
         Architecture::ALL
             .iter()

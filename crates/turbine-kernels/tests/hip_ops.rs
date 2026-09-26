@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use half::bf16;
 use turbine_core::config::DevicesConfig;
-use turbine_core::types::{BlockId, DType, DeviceId, ExecutionBackend, Vendor};
+use turbine_core::types::{BlockId, DType, DeviceId, Vendor};
 use turbine_device::{DiscoveryOptions, discover};
 use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
@@ -76,7 +76,7 @@ fn setup() -> Pair {
             .filter(|v| !v.is_empty())
             .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so"),
     );
-    let lib = ShimLibrary::load(&path, ExecutionBackend::Hip).expect("load libturbine_hip.so");
+    let lib = ShimLibrary::load(&path, "hip").expect("load libturbine_hip.so");
     println!(
         "loaded {} abi={} backend={} archs={}",
         path.display(),

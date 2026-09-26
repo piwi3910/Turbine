@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use libloading::Library;
-use turbine_core::types::{DType, DeviceId, ExecutionBackend};
+use turbine_core::types::{DType, DeviceId};
 use turbine_device::DeviceInfo;
 use turbine_tensor::tensor::contiguous_strides;
 use turbine_tensor::{
@@ -86,16 +86,30 @@ impl fmt::Debug for ShimLibrary {
     }
 }
 
+/// The `&'static` form of a backend name, the provider id of the library's kernels. Each
+/// distinct name is leaked once (there are as many as registered backends), however many
+/// libraries are loaded.
+fn intern_backend(name: &str) -> &'static str {
+    static NAMES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut names = NAMES.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(&known) = names.iter().find(|&&n| n == name) {
+        return known;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    names.push(leaked);
+    leaked
+}
+
 impl ShimLibrary {
     /// Candidate library paths in search order (P1 §Configuration): `explicit`
     /// (`execution.kernel_library`) alone when set; otherwise `TURBINE_KERNEL_LIBRARY`, then
     /// `libturbine_<backend>.so` beside the executable, then the bare file name (resolved by the
     /// dynamic loader's search path).
-    pub fn search_paths(backend: ExecutionBackend, explicit: Option<&Path>) -> Vec<PathBuf> {
+    pub fn search_paths(backend: &str, explicit: Option<&Path>) -> Vec<PathBuf> {
         if let Some(path) = explicit {
             return vec![path.to_path_buf()];
         }
-        let file_name = format!("libturbine_{}.so", backend.as_str());
+        let file_name = format!("libturbine_{backend}.so");
         let mut paths = Vec::with_capacity(3);
         if let Some(env) = std::env::var_os(KERNEL_LIBRARY_VAR).filter(|v| !v.is_empty()) {
             paths.push(PathBuf::from(env));
@@ -112,11 +126,8 @@ impl ShimLibrary {
 
     /// Loads the library at `path`. The ABI version is checked before any other symbol is
     /// resolved (a library of another ABI may lack them), then every ABI v2 symbol is resolved
-    /// and the backend name compared with `expected_backend`.
-    pub fn load(
-        path: &Path,
-        expected_backend: ExecutionBackend,
-    ) -> Result<Arc<ShimLibrary>, KernelError> {
+    /// and the backend name compared with `expected_backend` (the `execution.backend` name).
+    pub fn load(path: &Path, expected_backend: &str) -> Result<Arc<ShimLibrary>, KernelError> {
         // SAFETY: loading a shared library runs its initialisers. The kernel shim is Turbine's
         // own C ABI library (kernels/), whose initialisers only register device code; it stays
         // loaded for the lifetime of the returned `ShimLibrary`.
@@ -138,9 +149,9 @@ impl ShimLibrary {
         let syms = ShimSymbols::resolve_all(&lib, path)?;
         // SAFETY: identity function without arguments returning a static string (see c_str).
         let backend = ffi::c_str(unsafe { (syms.backend_name)() });
-        if backend != expected_backend.as_str() {
+        if backend != expected_backend {
             return Err(KernelError::BackendMismatch {
-                expected: expected_backend.as_str().to_string(),
+                expected: expected_backend.to_string(),
                 found: backend,
             });
         }
@@ -154,7 +165,7 @@ impl ShimLibrary {
         Ok(Arc::new(ShimLibrary {
             path: path.to_path_buf(),
             syms,
-            backend: expected_backend.as_str(),
+            backend: intern_backend(&backend),
             archs,
             _lib: lib,
         }))
@@ -1848,7 +1859,7 @@ impl KernelProvider for ShimProvider {
 mod tests {
     use std::path::Path;
 
-    use turbine_core::types::{BlockId, DType, DeviceId, ExecutionBackend, MemoryKind, Vendor};
+    use turbine_core::types::{BlockId, DType, DeviceId, MemoryKind, Vendor};
     use turbine_device::{DeviceInfo, DeviceMemoryInfo};
     use turbine_tensor::host::HostMemory;
     use turbine_tensor::{DeviceBuffer, HostStaging, Tensor};
@@ -1897,11 +1908,8 @@ mod tests {
 
     #[test]
     fn abi_and_arch_mismatch_are_fatal() {
-        let err = ShimLibrary::load(
-            Path::new(env!("TURBINE_STUB_ABI999")),
-            ExecutionBackend::Hip,
-        )
-        .expect_err("ABI 999 must be refused");
+        let err = ShimLibrary::load(Path::new(env!("TURBINE_STUB_ABI999")), "hip")
+            .expect_err("ABI 999 must be refused");
         assert!(
             matches!(
                 err,
@@ -1917,11 +1925,8 @@ mod tests {
             "kernel ABI version mismatch: library 999, expected 2"
         );
 
-        let lib = ShimLibrary::load(
-            Path::new(env!("TURBINE_STUB_GFX942")),
-            ExecutionBackend::Hip,
-        )
-        .expect("the gfx942 stub has the right ABI and backend");
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942")), "hip")
+            .expect("the gfx942 stub has the right ABI and backend");
         assert_eq!(lib.build_archs(), ["gfx942".to_string()]);
         let err = lib
             .create_context(&mocked_device("gfx1201"))
@@ -1931,11 +1936,8 @@ mod tests {
             "device arch gfx1201 not in library build archs gfx942"
         );
 
-        let err = ShimLibrary::load(
-            Path::new("/nonexistent/libturbine_hip.so"),
-            ExecutionBackend::Hip,
-        )
-        .expect_err("missing file");
+        let err = ShimLibrary::load(Path::new("/nonexistent/libturbine_hip.so"), "hip")
+            .expect_err("missing file");
         assert!(
             err.to_string()
                 .starts_with("cannot load /nonexistent/libturbine_hip.so"),
@@ -1945,11 +1947,7 @@ mod tests {
 
     #[test]
     fn last_error_with_null_buffer_only_returns_the_length() {
-        let lib = ShimLibrary::load(
-            Path::new(env!("TURBINE_STUB_GFX942")),
-            ExecutionBackend::Hip,
-        )
-        .expect("load");
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942")), "hip").expect("load");
         let mut buf = [0u8; 64];
         // SAFETY: a null context reads this thread's create message; `buf` is live and writable
         // for its full length.
@@ -1964,11 +1962,8 @@ mod tests {
 
     #[test]
     fn backend_mismatch_is_fatal() {
-        let err = ShimLibrary::load(
-            Path::new(env!("TURBINE_STUB_GFX942")),
-            ExecutionBackend::Cuda,
-        )
-        .expect_err("a hip library under backend cuda");
+        let err = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942")), "cuda")
+            .expect_err("a hip library under backend cuda");
         assert_eq!(
             err.to_string(),
             "kernel library backend hip, configured cuda"
@@ -1978,11 +1973,7 @@ mod tests {
     #[test]
     fn context_memory_provider_and_destroy_once() {
         let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
-        let lib = ShimLibrary::load(
-            Path::new(env!("TURBINE_STUB_GFX942")),
-            ExecutionBackend::Hip,
-        )
-        .expect("load");
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942")), "hip").expect("load");
         assert_eq!(lib.abi_version(), 2);
         assert_eq!(lib.backend_name(), "hip");
         let before = live_contexts(&lib);
@@ -2061,11 +2052,7 @@ mod tests {
     #[test]
     fn v2_ops_forward_through_the_abi() {
         let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
-        let lib = ShimLibrary::load(
-            Path::new(env!("TURBINE_STUB_GFX942")),
-            ExecutionBackend::Hip,
-        )
-        .expect("load");
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942")), "hip").expect("load");
         let ctx = lib
             .create_context(&mocked_device("gfx942"))
             .expect("context");
@@ -2197,11 +2184,8 @@ mod tests {
     #[test]
     fn v21_symbols_optional() {
         let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
-        let plain = ShimLibrary::load(
-            Path::new(env!("TURBINE_STUB_GFX942")),
-            ExecutionBackend::Hip,
-        )
-        .expect("a v2.0 library still loads");
+        let plain = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942")), "hip")
+            .expect("a v2.0 library still loads");
         assert_eq!(plain.abi_minor(), 0);
         let ctx = plain
             .create_context(&mocked_device("gfx942"))
@@ -2223,11 +2207,8 @@ mod tests {
         }
         drop((provider, ctx));
 
-        let v21 = ShimLibrary::load(
-            Path::new(env!("TURBINE_STUB_GFX942_V21")),
-            ExecutionBackend::Hip,
-        )
-        .expect("a v2.1 library loads");
+        let v21 = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V21")), "hip")
+            .expect("a v2.1 library loads");
         assert_eq!((v21.abi_version(), v21.abi_minor()), (2, 3));
         let ctx = v21
             .create_context(&mocked_device("gfx942"))
@@ -2336,11 +2317,8 @@ mod tests {
     #[test]
     fn v22_host_staging() {
         let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
-        let plain = ShimLibrary::load(
-            Path::new(env!("TURBINE_STUB_GFX942")),
-            ExecutionBackend::Hip,
-        )
-        .expect("load v2.0");
+        let plain =
+            ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942")), "hip").expect("load v2.0");
         let mem: Arc<dyn DeviceMemory> = plain
             .create_context(&mocked_device("gfx942"))
             .expect("context");
@@ -2350,11 +2328,8 @@ mod tests {
         ));
         drop(mem);
 
-        let lib = ShimLibrary::load(
-            Path::new(env!("TURBINE_STUB_GFX942_V21")),
-            ExecutionBackend::Hip,
-        )
-        .expect("load v2.3");
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V21")), "hip")
+            .expect("load v2.3");
         let hook = |name: &str| {
             stub_hook(&lib, name, |f: unsafe extern "C" fn() -> i32| {
                 // SAFETY: the v2.1 stub defines `int32_t <name>(void)` for the three v2.3
@@ -2414,11 +2389,7 @@ mod tests {
 
     #[test]
     fn descriptors_match_the_c_layout() {
-        let lib = ShimLibrary::load(
-            Path::new(env!("TURBINE_STUB_GFX942")),
-            ExecutionBackend::Hip,
-        )
-        .expect("load");
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942")), "hip").expect("load");
         let c_size = |which: i32| {
             stub_hook(
                 &lib,
@@ -2469,10 +2440,10 @@ mod tests {
     fn search_order() {
         let explicit = Path::new("/opt/k/libturbine_hip.so");
         assert_eq!(
-            ShimLibrary::search_paths(ExecutionBackend::Hip, Some(explicit)),
+            ShimLibrary::search_paths("hip", Some(explicit)),
             [explicit.to_path_buf()]
         );
-        let paths = ShimLibrary::search_paths(ExecutionBackend::Hip, None);
+        let paths = ShimLibrary::search_paths("hip", None);
         let exe_dir = std::env::current_exe()
             .expect("exe")
             .parent()
@@ -2488,7 +2459,7 @@ mod tests {
             ),
             None => assert_eq!(n, 2),
         }
-        let cuda = ShimLibrary::search_paths(ExecutionBackend::Cuda, None);
+        let cuda = ShimLibrary::search_paths("cuda", None);
         assert_eq!(cuda.last(), Some(&PathBuf::from("libturbine_cuda.so")));
     }
 }

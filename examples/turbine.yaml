@@ -20,8 +20,8 @@ model:
   served_name: null
   # null: min(32768, max_position_embeddings).
   max_seq_len: null
-  # llama3_json or none; null: llama3_json for LlamaForCausalLM whose chat template renders
-  # tools, else none.
+  # A registered tool-call format (llama3_json) or none; null: llama3_json for LlamaForCausalLM
+  # whose chat template renders tools, else none.
   tool_call_parser: null
 kv:
   # Tokens per KV page. On HIP, a multiple of 128 runs paged attention on Composable Kernel
@@ -54,6 +54,9 @@ scheduler:
   max_queued_requests: 256
   # Longest wait in the queue before 503 queue_timeout.
   queue_timeout: 60s
+  # Scheduling policy (admission order, preemption victim, chunk sizing): a registered policy
+  # name (default).
+  policy: default
 structured_output:
   # Largest accepted response_format JSON schema or tool-definition JSON (1KiB..1MiB).
   max_schema_bytes: 64KiB
@@ -68,11 +71,15 @@ devices:
   nvml_library: null
   amd_smi_library: null
 execution:
-  # Kernel backend: hip (AMD, Phase 1) or cpu (the reference provider; tests and tiny models
-  # only). cuda is rejected (exit 2) until phase-2b-nvidia.
+  # Kernel backend, a registered backend name: hip (AMD, Phase 1) or cpu (the reference
+  # provider; tests and tiny models only). An unregistered name (cuda until phase-2b-nvidia) is
+  # rejected (exit 2) before any port is bound.
   backend: hip
   # Global index from the device inventory (GET /turbine/v1/status); its vendor must match backend.
   device: 0
+  # Card profile (per-card thresholds and kernel preferences): auto picks the profile of the
+  # device's architecture; otherwise a registered profile name (gfx1201).
+  card_profile: auto
   # null: TURBINE_KERNEL_LIBRARY, then libturbine_hip.so beside the executable, then the loader
   # path.
   kernel_library: null

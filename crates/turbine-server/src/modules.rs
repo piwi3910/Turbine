@@ -1,0 +1,89 @@
+//! The module chosen at each extension point (Phase 2m S-1, contract §24): the names the
+//! configuration is checked against before any port is bound ([`known_module_names`]) and the
+//! choices `/turbine/v1/status` reports as `modules` ([`ModuleChoices`]).
+//!
+//! Every lane of Phase 2m moves one field of [`known_module_names`] from the fixed list below to
+//! its registry's `names()`.
+
+use serde::Serialize;
+use turbine_core::config::ModuleNames;
+use turbine_model::tools::LLAMA3_JSON;
+
+/// Tool-call formats (`tool_format`; `turbine_model::formats` from Phase 2m Task 9).
+pub const TOOL_FORMATS: &[&str] = &[LLAMA3_JSON];
+/// Execution backends (`execution_backend`; `turbine_kernels::backends` from Task 4).
+pub const BACKENDS: &[&str] = &["cpu", "hip"];
+/// Card profiles (`card_profile`; `turbine_kernels::cards` from Task 7).
+pub const CARD_PROFILES: &[&str] = &["gfx1201"];
+/// Scheduling policies (`scheduling_policy`; `turbine_scheduler::policy` from Task 2).
+pub const SCHEDULING_POLICIES: &[&str] = &["default"];
+
+/// The registered module names, per configuration key, for `Config::validate_modules`.
+pub fn known_module_names() -> ModuleNames<'static> {
+    ModuleNames {
+        tool_formats: TOOL_FORMATS,
+        backends: BACKENDS,
+        card_profiles: CARD_PROFILES,
+        scheduling_policies: SCHEDULING_POLICIES,
+    }
+}
+
+/// `modules` of `GET /turbine/v1/status`: the module picked at each extension point.
+#[derive(Clone, Debug, Serialize)]
+pub struct ModuleChoices {
+    pub family: String,
+    /// `None` when tool calling is off.
+    pub tool_format: Option<String>,
+    pub weight_format: String,
+    pub backend: String,
+    /// `None` on a backend without card profiles (`cpu`) or a device no profile describes.
+    pub card_profile: Option<String>,
+    pub scheduling_policy: String,
+}
+
+impl ModuleChoices {
+    /// Logs `event="module_selected"` for every extension point, once at startup.
+    pub fn log(&self) {
+        use turbine_core::registry::log_selected;
+        log_selected("model_family", &self.family, "config.json architectures");
+        log_selected(
+            "tool_format",
+            self.tool_format.as_deref().unwrap_or("none"),
+            "model.tool_call_parser, else the family default",
+        );
+        log_selected("weight_format", &self.weight_format, "model.dtype");
+        log_selected("execution_backend", &self.backend, "execution.backend");
+        log_selected(
+            "card_profile",
+            self.card_profile.as_deref().unwrap_or("none"),
+            "execution.card_profile",
+        );
+        log_selected(
+            "scheduling_policy",
+            &self.scheduling_policy,
+            "scheduler.policy",
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turbine_core::registry::valid_name;
+
+    #[test]
+    fn known_names_are_module_names() {
+        let known = known_module_names();
+        for names in [
+            known.tool_formats,
+            known.backends,
+            known.card_profiles,
+            known.scheduling_policies,
+        ] {
+            assert!(!names.is_empty());
+            for name in names {
+                assert!(valid_name(name), "{name}");
+            }
+        }
+    }
+}

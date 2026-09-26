@@ -21,12 +21,12 @@ use turbine_api::{
     ApiError, BoxFuture, Diagnostics, GenerationStream, InferenceBackend, InferenceRequest,
     ModelCard, NotReadyReason, Readiness, ReadyState,
 };
-use turbine_core::config::ToolCallParserKind;
 use turbine_core::request::{
     ConstraintSpec, Endpoint, ErrorCode, GenerationRequest, SamplingParams, StopConditions,
 };
 use turbine_core::types::Priority;
 use turbine_device::DeviceInventory;
+use turbine_kernels::Selection;
 use turbine_kv::blocks_for_tokens;
 use turbine_model::tools::{LLAMA3_JSON, PYTHON_TAG};
 use turbine_model::{ChatTemplate, Llama3JsonParser, Tokenizer, ToolChoice, tool_call_grammar};
@@ -39,6 +39,7 @@ use crate::engine::{
 };
 use crate::metrics::{Outcome, ServerMetrics};
 use crate::model::PreparedModel;
+use crate::modules::ModuleChoices;
 
 const STATE_LOADING: u8 = 0;
 const STATE_READY: u8 = 1;
@@ -72,6 +73,32 @@ struct StatusDocument<'a> {
     ready: bool,
     device_count: u64,
     model: ModelStatus<'a>,
+    /// The module picked at each extension point (Phase 2m).
+    modules: &'a ModuleChoices,
+    /// Per op config of the kernel registry, in requirement order: who serves it and why.
+    kernels: &'a [KernelChoiceView],
+}
+
+/// One entry of `kernels` in `GET /turbine/v1/status`: a `KernelRegistry` selection.
+#[derive(Clone, Debug, Serialize)]
+pub struct KernelChoiceView {
+    pub op: String,
+    pub config: String,
+    pub provider: String,
+    pub implementation: String,
+    pub reason: String,
+}
+
+impl From<&Selection> for KernelChoiceView {
+    fn from(s: &Selection) -> KernelChoiceView {
+        KernelChoiceView {
+            op: s.op.as_str().to_string(),
+            config: s.config.clone(),
+            provider: s.provider.0.to_string(),
+            implementation: s.implementation.clone(),
+            reason: s.reason.clone(),
+        }
+    }
 }
 
 /// Set once the model is loaded and warmed up.
@@ -113,6 +140,8 @@ pub struct ModelBackend {
     started: Instant,
     device_count: u64,
     devices: Value,
+    modules: ModuleChoices,
+    kernels: Vec<KernelChoiceView>,
 }
 
 impl ModelBackend {
@@ -126,9 +155,9 @@ impl ModelBackend {
             .into_iter()
             .collect();
         let tool_parser = match model.tool_call_parser {
-            ToolCallParserKind::Llama3Json => Some(ToolParser {
+            Some(name @ LLAMA3_JSON) => Some(ToolParser {
                 parser: Arc::new(Llama3JsonParser::new()),
-                label: LLAMA3_JSON,
+                label: name,
                 python_tag: model.tokenizer.token_to_id(PYTHON_TAG),
             }),
             _ => None,
@@ -163,6 +192,13 @@ impl ModelBackend {
             started: Instant::now(),
             device_count: inventory.devices.len() as u64,
             devices: serde_json::to_value(inventory).unwrap_or(Value::Null),
+            modules: model.modules.clone(),
+            kernels: model
+                .registry
+                .selections()
+                .iter()
+                .map(KernelChoiceView::from)
+                .collect(),
         }
     }
 
@@ -565,6 +601,8 @@ impl Diagnostics for ModelBackend {
                 weight_bytes: loaded.map_or(self.expected_weight_bytes, |l| l.weight_bytes),
                 load_seconds: loaded.map(|l| l.load_seconds),
             },
+            modules: &self.modules,
+            kernels: &self.kernels,
         })
         .unwrap_or(Value::Null)
     }

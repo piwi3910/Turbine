@@ -14,7 +14,8 @@ use serde_norway::{Mapping, Value};
 pub use byte_size::ByteSize;
 pub use duration::HumanDuration;
 
-use crate::types::{DeviceId, ExecutionBackend};
+use crate::registry::valid_name;
+use crate::types::DeviceId;
 pub use overrides::Override;
 
 /// Configuration errors. Every variant maps to exit code 2 in `turbine-server`.
@@ -50,6 +51,68 @@ fn invalid(key: &str, reason: impl Into<String>) -> ConfigError {
         key: key.to_string(),
         reason: reason.into(),
     }
+}
+
+/// The name of a module in a registry (Phase 2m S-1): `^[a-z0-9_]{1,64}$`. The configuration
+/// only checks the form; whether a module of that name exists is checked against the
+/// registries by [`Config::validate_modules`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ModuleName(String);
+
+impl ModuleName {
+    pub fn new(s: &str) -> Result<ModuleName, String> {
+        if valid_name(s) {
+            Ok(ModuleName(s.to_string()))
+        } else {
+            Err(format!(
+                "`{s}` is not a module name (lowercase letters, digits and `_`, 1 to 64 characters)"
+            ))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// A default name written in this file; always well-formed.
+    fn fixed(s: &'static str) -> ModuleName {
+        debug_assert!(valid_name(s), "{s}");
+        ModuleName(s.to_string())
+    }
+}
+
+impl TryFrom<String> for ModuleName {
+    type Error = String;
+    fn try_from(s: String) -> Result<ModuleName, String> {
+        ModuleName::new(&s)
+    }
+}
+
+impl From<ModuleName> for String {
+    fn from(name: ModuleName) -> String {
+        name.0
+    }
+}
+
+impl std::fmt::Display for ModuleName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The module names the registries hold, per configuration key, for
+/// [`Config::validate_modules`].
+#[derive(Clone, Copy, Debug)]
+pub struct ModuleNames<'a> {
+    /// `model.tool_call_parser` (`none` is always accepted).
+    pub tool_formats: &'a [&'a str],
+    /// `execution.backend`.
+    pub backends: &'a [&'a str],
+    /// `execution.card_profile` (`auto` is always accepted).
+    pub card_profiles: &'a [&'a str],
+    /// `scheduler.policy`.
+    pub scheduling_policies: &'a [&'a str],
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -106,19 +169,10 @@ pub struct ModelConfig {
     pub chat_template: Option<PathBuf>,
     /// Default: min(32768, max_position_embeddings); the upper bound is checked at startup.
     pub max_seq_len: Option<u32>,
-    /// Tool-call output parser (Phase 2). Null → `llama3_json` for `LlamaForCausalLM` whose
-    /// template renders `tools`, else `none` (resolved at startup).
-    pub tool_call_parser: Option<ToolCallParserKind>,
-}
-
-/// `model.tool_call_parser` values.
-#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum ToolCallParserKind {
-    /// Llama-3.x JSON calls: optional `<|python_tag|>`, then `;`-separated call objects.
-    Llama3Json,
-    None,
+    /// Tool-call format (Phase 2; a `tool_format` registry name from Phase 2m). Null →
+    /// `llama3_json` for `LlamaForCausalLM` whose template renders `tools`, else none (resolved
+    /// at startup); `none` turns tool calling off.
+    pub tool_call_parser: Option<ModuleName>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -232,6 +286,8 @@ pub struct SchedulerConfig {
     pub max_queued_requests: u32,
     /// Longest wait in the queue before 503 `queue_timeout` (Phase 2 only, C-1).
     pub queue_timeout: HumanDuration,
+    /// Scheduling policy (Phase 2m): a `scheduling_policy` registry name.
+    pub policy: ModuleName,
 }
 
 impl Default for SchedulerConfig {
@@ -244,6 +300,7 @@ impl Default for SchedulerConfig {
             prefill_chunk_tokens: 2048,
             max_queued_requests: 256,
             queue_timeout: HumanDuration::from_secs(60),
+            policy: ModuleName::fixed("default"),
         }
     }
 }
@@ -311,9 +368,13 @@ pub struct DevicesConfig {
 #[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields, default)]
 pub struct ExecutionConfig {
-    pub backend: ExecutionBackend,
+    /// An `execution_backend` registry name (`hip`, `cpu`).
+    pub backend: ModuleName,
     /// Global index from the device inventory.
     pub device: DeviceId,
+    /// Card profile (Phase 2m): a `card_profile` registry name, or `auto` for the profile of
+    /// the device's architecture.
+    pub card_profile: ModuleName,
     /// Explicit kernel shim path; null → TURBINE_KERNEL_LIBRARY, beside the executable, loader path.
     pub kernel_library: Option<PathBuf>,
     /// Tune the GEMM algorithm per shape at first use (false: the first heuristic answer).
@@ -337,8 +398,9 @@ pub struct ExecutionConfig {
 impl Default for ExecutionConfig {
     fn default() -> Self {
         ExecutionConfig {
-            backend: ExecutionBackend::Hip,
+            backend: ModuleName::fixed("hip"),
             device: DeviceId(0),
+            card_profile: ModuleName::fixed("auto"),
             kernel_library: None,
             gemm_autotune: true,
             decode_graphs: true,
@@ -467,12 +529,6 @@ impl Config {
         if self.model.max_seq_len == Some(0) {
             return Err(invalid("model.max_seq_len", "must be at least 1"));
         }
-        if self.execution.backend == ExecutionBackend::Cuda {
-            return Err(invalid(
-                "execution.backend",
-                "cuda is not available in this build; NVIDIA execution arrives with phase-2b-nvidia",
-            ));
-        }
         if let Err(e) = tracing_subscriber::EnvFilter::try_new(&self.logging.level) {
             return Err(invalid(
                 "logging.level",
@@ -480,6 +536,56 @@ impl Config {
             ));
         }
         self.validate_phase2()
+    }
+
+    /// Checks every module key against the registries' names (`known`): exit 2, before device
+    /// discovery and before binding. `none` (`model.tool_call_parser`) and `auto`
+    /// (`execution.card_profile`) are always accepted.
+    pub fn validate_modules(&self, known: &ModuleNames<'_>) -> Result<(), ConfigError> {
+        fn check(
+            key: &str,
+            name: &ModuleName,
+            registered: &[&str],
+            always: Option<&str>,
+        ) -> Result<(), ConfigError> {
+            let name = name.as_str();
+            if always == Some(name) || registered.contains(&name) {
+                return Ok(());
+            }
+            Err(invalid(
+                key,
+                format!(
+                    "`{name}` is not registered (registered: {})",
+                    registered.join(", ")
+                ),
+            ))
+        }
+        if let Some(parser) = &self.model.tool_call_parser {
+            check(
+                "model.tool_call_parser",
+                parser,
+                known.tool_formats,
+                Some("none"),
+            )?;
+        }
+        check(
+            "execution.backend",
+            &self.execution.backend,
+            known.backends,
+            None,
+        )?;
+        check(
+            "execution.card_profile",
+            &self.execution.card_profile,
+            known.card_profiles,
+            Some("auto"),
+        )?;
+        check(
+            "scheduler.policy",
+            &self.scheduler.policy,
+            known.scheduling_policies,
+            None,
+        )
     }
 
     /// Running-request bound actually applied: `scheduler.continuous_batching: false` forces 1.

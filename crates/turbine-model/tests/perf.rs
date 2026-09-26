@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use serde::Serialize;
-use turbine_core::types::{BlockId, ExecutionBackend, KvLayout, SeqId, Vendor};
+use turbine_core::types::{BlockId, KvLayout, SeqId, Vendor};
 use turbine_kernels::{
     KernelMetrics, KernelRegistry, OpKind, shim_provider, test_support::require_backend,
     test_support::require_env_dir,
@@ -354,7 +354,7 @@ fn forward_profile() {
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
         .expect("load the HIP kernel library");
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
         .expect("device discovery");
@@ -419,7 +419,7 @@ fn serving_mix() {
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
         .expect("load the HIP kernel library");
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
         .expect("device discovery");

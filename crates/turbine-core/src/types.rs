@@ -35,26 +35,6 @@ pub enum MemoryKind {
     Unified,
 }
 
-/// Kernel backend (`execution.backend`, Phase 1). Serialized as `"hip"` / `"cuda"` / `"cpu"`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum ExecutionBackend {
-    Hip,
-    Cuda,
-    Cpu,
-}
-
-impl ExecutionBackend {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ExecutionBackend::Hip => "hip",
-            ExecutionBackend::Cuda => "cuda",
-            ExecutionBackend::Cpu => "cpu",
-        }
-    }
-}
-
 /// Element type of a tensor (P1 S-5). `abi_code` equals the `TURBINE_DTYPE_*` C ABI codes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -236,7 +216,6 @@ mod tests {
         };
         assert_eq!(huge.bytes_per_token(), u64::MAX);
         assert_eq!(huge.block_bytes(), u64::MAX);
-        assert_eq!(ExecutionBackend::Cpu.as_str(), "cpu");
         assert_ne!(RequestId::new_v4(), RequestId::new_v4());
     }
 }

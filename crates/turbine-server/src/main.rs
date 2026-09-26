@@ -6,6 +6,7 @@ mod engine;
 mod exit;
 mod metrics;
 mod model;
+mod modules;
 mod startup;
 
 use clap::Parser;

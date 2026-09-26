@@ -2254,6 +2254,7 @@ dependencies = [
  "serde_norway",
  "smallvec",
  "thiserror 2.0.21",
+ "tracing",
  "tracing-subscriber",
  "uuid",
 ]

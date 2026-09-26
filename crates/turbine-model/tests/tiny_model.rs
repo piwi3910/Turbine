@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use half::bf16;
-use turbine_core::types::{BlockId, DeviceId, ExecutionBackend, KvLayout, SeqId, Vendor};
+use turbine_core::types::{BlockId, DeviceId, KvLayout, SeqId, Vendor};
 use turbine_kernels::torch_topk;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -1913,7 +1913,7 @@ fn hip_context() -> Arc<ShimContext> {
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
         .expect("load the HIP kernel library");
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
         .expect("device discovery");
@@ -2243,7 +2243,7 @@ fn hip_trace_vs_cpu() {
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
         .expect("load the HIP kernel library");
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
         .expect("device discovery");
@@ -2387,7 +2387,7 @@ fn hip_reduced_rows_match_full_rows() {
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
         .expect("load the HIP kernel library");
     assert!(lib.abi_minor() >= 1, "logits_reduce needs kernel ABI v2.1");
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
@@ -2560,7 +2560,7 @@ fn hip_launch_ahead_feeds_match_serial() {
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
         .expect("load the HIP kernel library");
     assert!(lib.abi_minor() >= 3, "host staging needs kernel ABI v2.3");
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
