@@ -2,24 +2,24 @@
 //! run-ahead's `tests/families.rs`) on their tiny synthetic checkpoints, through the family
 //! registry: the `cpu-reference` provider against the naive decoder
 //! ([`turbine_model::testing::naive`], which reads the checkpoint under its own tensor names),
-//! fused against unfused op sequences, ragged batches against single-sequence runs, and each
-//! family's weight slots and op lists.
+//! fused against unfused op sequences with the naive decoder's distinguishing features mutated
+//! away, and each family's weight slots and op lists. The checks every registered family must
+//! pass (naive decoder, ragged batch, chunked prefill, page size, fusion) are
+//! `turbine_model::conformance::families_suite`, run by `registry_conformance::families`.
 use std::sync::Arc;
 
-use turbine_core::types::{BlockId, DeviceId, KvLayout, SeqId};
+use turbine_core::types::DeviceId;
 use turbine_kernels::{KernelMetrics, KernelRegistry, cpu_reference_provider};
 use turbine_model::config::ModelArchConfig;
-use turbine_model::executor::{
-    self, BatchInput, ExecutorOptions, Logits, ModelExecutor, SeqSlice, SequenceKv, build_executor,
-};
+use turbine_model::executor::{self, ExecutorOptions, ModelExecutor, SequenceKv, build_executor};
 use turbine_model::families::{self, FamilyRef, Llama};
 use turbine_model::testing::TempDir;
 use turbine_model::testing::naive::Naive;
 use turbine_model::testing::tiny::{TINY_PHASE8_FAMILIES, TinySpec, write_tiny_family};
 use turbine_model::{MAX_STAGING_BYTES, SafetensorsIndex, WeightLoader};
 use turbine_observability::MetricsRegistry;
+use turbine_tensor::DeviceMemory;
 use turbine_tensor::host::HostMemory;
-use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView};
 
 const SEED: u64 = 11;
 const PROMPT_LEN: usize = 20;
@@ -290,95 +290,6 @@ fn mixtral_weight_map() {
     // The checkpoint the tiny writer made from these slots loads with nothing left over.
     let mem = host_mem();
     cpu_model(&spec, &mem, ExecutorOptions::default());
-}
-
-/// One pool of `blocks` blocks of `layout`.
-fn pool(mem: &Arc<dyn DeviceMemory>, layout: &KvLayout, blocks: u32) -> DeviceBuffer {
-    DeviceBuffer::alloc(mem, (layout.block_bytes() * u64::from(blocks)) as usize).expect("pool")
-}
-
-fn pool_view<'a>(storage: &'a DeviceBuffer, layout: &KvLayout, blocks: u32) -> KvPoolView<'a> {
-    let layout = *layout;
-    KvPoolView {
-        storage,
-        layout,
-        num_blocks: blocks,
-        layer_stride_bytes: layout.block_bytes() / u64::from(layout.num_layers) * u64::from(blocks),
-    }
-}
-
-fn forward(
-    exec: &mut dyn ModelExecutor,
-    kv: &KvPoolView<'_>,
-    seqs: &[(&[u32], u32, &[BlockId])],
-) -> Logits {
-    let mut tokens = Vec::new();
-    let mut positions = Vec::new();
-    let mut slices = Vec::new();
-    for (i, &(new, start, table)) in seqs.iter().enumerate() {
-        slices.push(SeqSlice {
-            seq: SeqId(i as u64 + 1),
-            q_start: tokens.len() as u32,
-            q_len: new.len() as u32,
-            kv_len: start + new.len() as u32,
-            block_table: table,
-            reduce: None,
-        });
-        tokens.extend_from_slice(new);
-        positions.extend(start..start + new.len() as u32);
-    }
-    exec.forward(&BatchInput {
-        tokens: &tokens,
-        positions: &positions,
-        seqs: &slices,
-        kv,
-    })
-    .expect("forward")
-}
-
-/// A ragged batch — two prompts of different lengths prefilled together, then decoded
-/// together — gives each sequence the logits of its own single-sequence run (within 1e-5: the
-/// per-head norm and every other op act on rows independently), so the per-head Q/K norm's
-/// `[tokens · heads, head_dim]` rows never mix sequences.
-#[test]
-fn families_ragged_batch_matches_single() {
-    let tmp = TempDir::new("families-ragged");
-    let mem = host_mem();
-    for family in TINY_PHASE8_FAMILIES {
-        let spec = tiny(&tmp, family);
-        let name = &spec.config.hf_architecture;
-        let mut exec = cpu_model(&spec, &mem, ExecutorOptions::default());
-        let layout = *exec.kv_layout();
-        let storage = pool(&mem, &layout, 4);
-        let kv = pool_view(&storage, &layout, 4);
-        let a = prompt(spec.vocab, 0);
-        let b: Vec<u32> = prompt(spec.vocab, 5)[..13].to_vec();
-        let (ta, tb) = ([BlockId(2)], [BlockId(0)]);
-
-        let batch = forward(exec.as_mut(), &kv, &[(&a, 0, &ta), (&b, 0, &tb)]);
-        let (na, nb) = (argmax(batch.row(0)), argmax(batch.row(1)));
-        let decode = forward(
-            exec.as_mut(),
-            &kv,
-            &[(&[na], a.len() as u32, &ta), (&[nb], b.len() as u32, &tb)],
-        );
-
-        for (i, (p, next, prefill_row, decode_row)) in [
-            (&a, na, batch.row(0), decode.row(0)),
-            (&b, nb, batch.row(1), decode.row(1)),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let table = [BlockId(3)];
-            let single = forward(exec.as_mut(), &kv, &[(p, 0, &table)]);
-            let diff = max_abs_diff(prefill_row, single.row(0));
-            assert!(diff <= 1e-5, "{name} seq {i} prefill: {diff}");
-            let single = forward(exec.as_mut(), &kv, &[(&[next], p.len() as u32, &table)]);
-            let diff = max_abs_diff(decode_row, single.row(0));
-            assert!(diff <= 1e-5, "{name} seq {i} decode: {diff}");
-        }
-    }
 }
 
 /// The naive decoder's per-position rows: row `i` of a whole-sequence forward equals the last

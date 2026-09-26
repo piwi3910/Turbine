@@ -10,6 +10,8 @@
 //! (`sim::tests`). Policies are consulted per decision, so they must be cheap and
 //! deterministic: no clock, no randomness, no state.
 
+#[cfg(test)]
+pub(crate) mod conformance;
 mod default;
 
 pub use default::DefaultPolicy;

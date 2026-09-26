@@ -155,6 +155,10 @@ impl ToolFormat for Llama3Json {
             Opening::Content
         }
     }
+
+    fn sample_call(&self) -> &'static str {
+        r#"{"name": "get_weather", "parameters": {"location": "Oslo", "unit": "celsius"}}"#
+    }
 }
 
 /// The `llama3_json` parser: an optional `<|python_tag|>`, then — from the first `{` — one or

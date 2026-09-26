@@ -4,6 +4,8 @@
 pub mod arrivals;
 pub mod digests;
 pub mod executor;
+#[cfg(test)]
+pub(crate) mod workloads;
 
 pub use arrivals::{ArrivalProcess, LengthMix, SimArrival};
 pub use executor::{CostModel, SimExecutor};
@@ -477,82 +479,16 @@ impl Simulation {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use turbine_core::registry::Module;
-    use turbine_core::types::{DType, DeviceId, KvLayout, Priority, SeqId};
-    use turbine_kv::{BlockPool, BlockPoolConfig};
-    use turbine_tensor::DeviceMemory;
-    use turbine_tensor::host::HostMemory;
+    use turbine_core::types::SeqId;
 
+    use super::workloads::*;
     use super::*;
-    use crate::policy::{self, DefaultPolicy, SchedulingPolicy};
+    use crate::policy::{self, DefaultPolicy};
     use crate::request::CancelReason;
     use crate::scheduler::{BatchKind, SchedulerParams, SubmitError};
-
-    /// Accounting-only pool of 16-token blocks: zero bytes per block.
-    fn pool(n: u32) -> BlockPool {
-        pool_of(n, 16)
-    }
-
-    /// Accounting-only pool of `n` blocks of `block_tokens` tokens.
-    fn pool_of(n: u32, block_tokens: u32) -> BlockPool {
-        let layout = KvLayout {
-            num_layers: 0,
-            num_kv_heads: 0,
-            head_dim: 0,
-            dtype: DType::BF16,
-            block_tokens,
-        };
-        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 0);
-        BlockPool::new(
-            BlockPoolConfig {
-                layout,
-                num_blocks: n,
-            },
-            mem,
-        )
-        .unwrap()
-    }
-
-    fn params() -> SchedulerParams {
-        SchedulerParams {
-            max_running_requests: 32,
-            max_batch_tokens: 512,
-            prefill_chunk_tokens: 128,
-            max_queued_requests: 1024,
-            chunked_prefill: true,
-            block_tokens: 16,
-            free_watermark: 0.01,
-            max_seq_len: 4096,
-            queue_timeout: Duration::from_secs(3600),
-        }
-    }
-
-    fn secs(s: f64) -> Duration {
-        Duration::from_secs_f64(s)
-    }
-
-    fn per_seq_cost() -> SimExecutor {
-        SimExecutor {
-            cost: CostModel {
-                per_prefill_token_s: 0.0,
-                per_decode_step_s: 0.0,
-                per_seq_s: 1.0,
-            },
-        }
-    }
-
-    fn realistic_cost() -> SimExecutor {
-        SimExecutor {
-            cost: CostModel {
-                per_prefill_token_s: 0.000_2,
-                per_decode_step_s: 0.02,
-                per_seq_s: 0.000_5,
-            },
-        }
-    }
 
     /// `(label, kind)` of an iteration's items, labels from arrival indices.
     fn composition(it: &IterationTrace, labels: &BTreeMap<u64, &str>) -> Vec<(String, BatchKind)> {
@@ -566,19 +502,6 @@ mod tests {
     }
 
     // ---- seeded workloads: shared by the invariant tests and the plan digests ------------
-
-    type Policy = &'static dyn SchedulingPolicy;
-
-    /// A simulation of the real scheduler under `policy`.
-    fn simulation(
-        policy: Policy,
-        p: SchedulerParams,
-        pool: BlockPool,
-        exec: SimExecutor,
-        arrivals: ArrivalProcess,
-    ) -> Simulation {
-        Simulation::new(p, pool, exec, arrivals).with_policy(policy)
-    }
 
     /// Every registered policy: each invariant test runs over all of them (Phase 2m S-9).
     fn policies() -> impl Iterator<Item = Policy> {
@@ -609,17 +532,6 @@ mod tests {
         sim.run(secs(12.0))
     }
 
-    /// 1,000 seeded Poisson arrivals; `paused` is paused for iterations 200..260.
-    fn poisson_run(policy: Policy, paused: Option<SeqId>) -> SimReport {
-        let arrivals = ArrivalProcess::poisson(4.0, 42).with_limit(1000);
-        let mut sim = simulation(policy, params(), pool(1024), realistic_cost(), arrivals);
-        if let Some(seq) = paused {
-            sim.pause_at(200, seq);
-            sim.resume_at(260, seq);
-        }
-        sim.run(secs(100_000.0))
-    }
-
     /// The Poisson run without a pause, a sequence that decodes in iterations 199, 200 and
     /// 201 there, and the run that pauses it for iterations 200..260.
     fn decode_never_starved_runs(policy: Policy) -> (SimReport, u64, SimReport) {
@@ -638,60 +550,6 @@ mod tests {
             .expect("a long-running decode around iteration 200");
         let paused = poisson_run(policy, Some(SeqId(victim)));
         (free_run, victim, paused)
-    }
-
-    /// The Poisson run with chunked prefill, and two scripted prompts without it (600 tokens:
-    /// over the budget; 300: fits).
-    fn chunk_budget_runs(policy: Policy) -> (SimReport, SimReport) {
-        let chunked = poisson_run(policy, None);
-        let p = SchedulerParams {
-            chunked_prefill: false,
-            ..params()
-        };
-        let arrivals = vec![
-            SimArrival::new(secs(0.0), 600, 4),
-            SimArrival::new(secs(0.0), 300, 4),
-        ];
-        let mut sim = simulation(
-            policy,
-            p,
-            pool(256),
-            realistic_cost(),
-            ArrivalProcess::scripted(arrivals),
-        );
-        (chunked, sim.run(secs(100.0)))
-    }
-
-    /// Two requests of `prompt` + `max_new` tokens on a pool of `pool_blocks` blocks of
-    /// `block_tokens`, too small for both to finish together. R1 has the lower priority (larger
-    /// value) and is the only victim; R2 arrives later and waits for a free running slot.
-    fn preemption_run(
-        policy: Policy,
-        block_tokens: u32,
-        pool_blocks: u32,
-        prompt: u32,
-        max_new: u32,
-    ) -> SimReport {
-        let mut r0 = SimArrival::new(secs(0.0), prompt, max_new);
-        r0.priority = Priority(0);
-        let mut r1 = SimArrival::new(secs(0.0), prompt, max_new);
-        r1.priority = Priority(1);
-        let r2 = SimArrival::new(secs(0.5), 20, 5);
-        let p = SchedulerParams {
-            max_running_requests: 2,
-            max_batch_tokens: 256,
-            prefill_chunk_tokens: 64,
-            block_tokens,
-            ..params()
-        };
-        let mut sim = simulation(
-            policy,
-            p,
-            pool_of(pool_blocks, block_tokens),
-            realistic_cost(),
-            ArrivalProcess::scripted(vec![r0, r1, r2]),
-        );
-        sim.run(secs(1000.0))
     }
 
     /// D and Z decode, P prefills 100 tokens in 16-token chunks, W waits for a slot; Z is
@@ -997,24 +855,17 @@ mod tests {
             .count()
     }
 
+    /// Pausing and resuming around the starvation run: a paused sequence is never decoded and
+    /// decodes again once resumed, and the run is deterministic. That no unpaused decode
+    /// starves is `policies_suite`'s `decode_never_starved` (`registry_conformance::policies`).
     #[test]
     fn decode_never_starved() {
         for policy in policies() {
             let name = policy.name();
             // A sequence that decodes in iterations 199, 200 and 201 when nobody pauses it.
             let (_, victim, report) = decode_never_starved_runs(policy);
-            // The simulator records a violation whenever a decoding, unpaused sequence that
-            // was neither preempted nor dropped gets no decode in an iteration.
-            assert!(
-                report.violations.is_empty(),
-                "{name}: {:?}",
-                &report.violations[..report.violations.len().min(5)]
-            );
-            assert_eq!(
-                report.completed as usize + report.rejected.len(),
-                1000,
-                "{name}"
-            );
+            // The pause starves nobody else either.
+            assert!(report.violations.is_empty(), "{name}");
             assert!(report.iterations.len() > 1000, "{name}");
             assert_eq!(
                 decodes_of(&report, victim, 200..260),
@@ -1034,69 +885,25 @@ mod tests {
         }
     }
 
+    /// The default policy chunks long prompts at exactly the chunk size. That every policy
+    /// keeps the chunk and batch budgets (and rejects an over-budget prompt without chunked
+    /// prefill) is `policies_suite`'s `chunk_budget` (`registry_conformance::policies`).
     #[test]
     fn chunk_budget_respected() {
-        for policy in policies() {
+        for policy in policies().filter(|p| orders_like_default(*p)) {
             let name = policy.name();
-            let (report, unchunked) = chunk_budget_runs(policy);
-            let p = params();
-            for it in &report.iterations {
-                let tokens: u32 = it
-                    .items
-                    .iter()
-                    .map(|i| match i.kind {
-                        BatchKind::Prefill { len, .. } => {
-                            assert!(
-                                len <= p.prefill_chunk_tokens,
-                                "{name}: chunk {len} in {}",
-                                it.iteration
-                            );
-                            len
-                        }
-                        BatchKind::Decode => 1,
-                    })
-                    .sum();
-                assert!(
-                    tokens <= p.max_batch_tokens,
-                    "{name}: {tokens} tokens in {}",
-                    it.iteration
-                );
-            }
+            let (report, _) = chunk_budget_runs(policy);
             assert!(
-                report.iterations.iter().any(|it| it
-                    .items
+                report
+                    .iterations
                     .iter()
-                    .any(|i| matches!(i.kind, BatchKind::Prefill { start, .. } if start > 0))),
-                "{name}: long prompts are chunked"
+                    .any(|it| it.items.iter().any(|i| i.kind
+                        == BatchKind::Prefill {
+                            start: 128,
+                            len: 128
+                        })),
+                "{name}: long prompts are chunked at the chunk size"
             );
-            if orders_like_default(policy) {
-                assert!(
-                    report
-                        .iterations
-                        .iter()
-                        .any(|it| it.items.iter().any(|i| i.kind
-                            == BatchKind::Prefill {
-                                start: 128,
-                                len: 128
-                            })),
-                    "{name}: long prompts are chunked at the chunk size"
-                );
-            }
-
-            // Without chunked prefill: an over-budget prompt is rejected at submission; one
-            // that fits runs whole.
-            let report = unchunked;
-            assert_eq!(
-                report.rejected,
-                [(Simulation::request_id(0), SubmitError::PromptTooLong)],
-                "{name}"
-            );
-            assert_eq!(
-                report.iterations[0].items[0].kind,
-                BatchKind::Prefill { start: 0, len: 300 },
-                "{name}"
-            );
-            assert_eq!(report.completed, 1, "{name}");
         }
     }
 
@@ -1105,7 +912,7 @@ mod tests {
         // 12 blocks of 16 tokens; each request needs up to 9 blocks, so both cannot finish
         // together.
         for policy in policies() {
-            preemption_case(policy, preemption_run(policy, 16, 12, 40, 100), 40);
+            preemption_case(policy, preemption_run(policy, 16, 12, 40, 100));
         }
     }
 
@@ -1113,24 +920,20 @@ mod tests {
     fn preemption_by_recompute_at_128_token_pages() {
         // The default page: 6 blocks of 128 tokens; each request needs up to 4 blocks.
         for policy in policies() {
-            preemption_case(policy, preemption_run(policy, 128, 6, 200, 300), 200);
+            preemption_case(policy, preemption_run(policy, 128, 6, 200, 300));
         }
     }
 
-    /// The checks of a [`preemption_run`] with `prompt`-token prompts under `policy`.
-    fn preemption_case(policy: Policy, report: SimReport, prompt: u32) {
+    /// The default policy's choices in a [`preemption_run`]: R1 (the lower priority) is the
+    /// only victim and is readmitted ahead of R2. That every policy preempts by recompute
+    /// (from position 0, over prompt + generated, nothing duplicated or skipped, everything
+    /// completing) is `policies_suite`'s `preemption_by_recompute`
+    /// (`registry_conformance::policies`).
+    fn preemption_case(policy: Policy, report: SimReport) {
+        if !orders_like_default(policy) {
+            return;
+        }
         let name = policy.name();
-        // Every sampled token sits at the next position: no duplicate or skipped token.
-        assert!(
-            report.violations.is_empty(),
-            "{name}: {:?}",
-            report.violations
-        );
-        assert_eq!(
-            report.completed, 3,
-            "{name}: every request whose KV fits the empty pool completes"
-        );
-
         let r1_seq = Simulation::seq_id(1, 0).0;
         let r2_seq = Simulation::seq_id(2, 0).0;
         let preempted: Vec<(u64, u64)> = report
@@ -1143,9 +946,6 @@ mod tests {
             "{name}: the pool is too small: someone is preempted"
         );
         let (first_preemption, victim) = preempted[0];
-
-        // The victim re-prefills from position 0 over prompt + generated tokens (more than
-        // its prompt).
         let re_prefill: Vec<(u64, u32, u32)> = report
             .iterations
             .iter()
@@ -1160,16 +960,6 @@ mod tests {
                     })
             })
             .collect();
-        assert_eq!(re_prefill[0].1, 0, "{name}: recompute starts at position 0");
-        let recomputed: u32 = re_prefill.iter().map(|x| x.2).sum();
-        assert!(
-            recomputed > prompt,
-            "{name}: recompute covers prompt + generated, got {recomputed}"
-        );
-
-        if !orders_like_default(policy) {
-            return;
-        }
         // R1 (the lower priority) is the only victim and is readmitted ahead of R2
         // (preempted requests go to the queue front).
         assert!(

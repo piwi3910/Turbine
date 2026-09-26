@@ -56,6 +56,11 @@ impl ModelFamily for Llama {
         Some(LLAMA3_JSON)
     }
 
+    /// The tied tiny Llama-3.2 checkpoint (`testing::tiny`).
+    fn write_tiny(&self, dir: &std::path::Path, seed: u64) -> crate::testing::tiny::TinySpec {
+        crate::testing::tiny::write_tiny_llama(dir, seed)
+    }
+
     fn build_executor(
         &self,
         cfg: &ModelArchConfig,

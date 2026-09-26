@@ -97,6 +97,10 @@ impl ToolFormat for Mistral {
             Opening::Content
         }
     }
+
+    fn sample_call(&self) -> &'static str {
+        r#"[{"name": "get_weather", "arguments": {"location": "Oslo", "unit": "celsius"}}]"#
+    }
 }
 
 /// The `mistral` parser: an optional `[TOOL_CALLS]`, then one JSON array of one or more

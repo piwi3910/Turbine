@@ -1,119 +1,94 @@
 //! Conformance tests over every registry of this crate (Phase 2m S-1, S-13): each registry
 //! passes `turbine_core::registry::conformance::check`, and each registered module passes its
-//! extension point's shared suite.
+//! extension point's shared suite ([`crate::conformance`]), run over the registry itself — a
+//! module added to a registry is checked without touching these tests.
 
 #[cfg(test)]
 mod registry_conformance {
-    use std::collections::HashMap;
+    use turbine_core::registry::Registry;
 
-    use turbine_core::registry::conformance::{self, check};
-    use turbine_core::request::SamplingParams;
+    use crate::conformance::{
+        ConformanceFailure, families_suite, formats_suite, processors_suite, weights_suite,
+    };
 
-    use crate::sampling::{self, ProcessorChain, ProcessorParams, ProcessorState, Touched};
-    use crate::structured::TokenMask;
+    /// Panics listing every failure of a suite.
+    fn passes(result: Result<(), Vec<ConformanceFailure>>) {
+        if let Err(failures) = result {
+            let lines: Vec<String> = failures.iter().map(ToString::to_string).collect();
+            panic!(
+                "{} conformance failures:\n{}",
+                lines.len(),
+                lines.join("\n")
+            );
+        }
+    }
 
-    /// The logits-processor registry is well formed, lists the chain in main's order, and every
-    /// registered processor passes the shared suite: it does not apply to a neutral request (so
-    /// the chain leaves such a row and the touched record alone), it applies when its request
-    /// field is set, and one that cannot run on the device keeps an applying step on the host.
-    /// Breaks if a processor is registered twice, out of order, or applies to requests that do
-    /// not ask for it.
+    /// The names every registry lists, in registration order (the chain order for the logits
+    /// processors, the error-message order for the families).
+    fn names_are<T: ?Sized + turbine_core::registry::Module>(
+        reg: &Registry<T>,
+        point: &str,
+        names: &[&str],
+    ) {
+        assert_eq!(reg.point(), point);
+        assert_eq!(reg.names(), names);
+        for name in names {
+            assert!(reg.get(name).is_some(), "{point}: {name}");
+        }
+    }
+
+    /// The logits-processor chain in main's order, and every processor passes
+    /// `processors_suite`. Breaks if a processor is registered twice, out of order, applies to
+    /// requests that do not ask for it, or claims the device without matching it.
     #[test]
     fn logits_processors() {
-        let reg = sampling::registry();
-        conformance::check(reg).expect("logits_processor registry");
-        assert_eq!(reg.point(), "logits_processor");
-        assert_eq!(
-            reg.names(),
-            [
+        let reg = crate::sampling::registry();
+        names_are(
+            reg,
+            "logits_processor",
+            &[
                 "logit_bias",
                 "repetition_penalty",
                 "presence_frequency_penalty",
                 "min_tokens",
-                "grammar_mask"
-            ]
+                "grammar_mask",
+            ],
         );
-        let neutral = ProcessorParams::new(&SamplingParams::default());
-        let counts: HashMap<u32, u32> = [(4, 2)].into_iter().collect();
-        let quiet = ProcessorState {
-            prompt_tokens: &[1, 2],
-            counts: &counts,
-            step: 3,
-            eos_token_ids: &[5],
-            mask: None,
-        };
-        let busy_params = ProcessorParams::new(&SamplingParams {
-            logit_bias: vec![(3, 1.0)],
-            repetition_penalty: 1.2,
-            presence_penalty: 0.5,
-            frequency_penalty: 0.5,
-            min_tokens: 8,
-            ..SamplingParams::default()
-        });
-        let mask = TokenMask::new_all(8);
-        let busy = ProcessorState {
-            mask: Some(&mask),
-            ..quiet
-        };
-        let chain = ProcessorChain::standard();
-        for m in reg.iter() {
-            let name = m.name();
-            assert!(
-                !m.applies(&neutral, &quiet),
-                "{name} applies to a neutral request"
-            );
-            assert!(m.applies(&busy_params, &busy), "{name} never applies");
-            if !m.device_capable() {
-                assert!(!chain.device_eligible(&busy_params, &busy), "{name}");
-            }
-            // As registered today: every processor needs the whole row on the host.
-            assert!(!m.device_capable() && m.needs_full_row(), "{name}");
-        }
-        let row: Vec<f32> = (0..8).map(|i| i as f32 - 3.5).collect();
-        let mut logits = row.clone();
-        let mut touched = Touched::default();
-        chain.apply(&mut logits, &mut touched, &neutral, &quiet);
-        assert_eq!(logits, row);
-        assert!(touched.originals().is_empty());
-        assert!(chain.device_eligible(&neutral, &quiet));
+        // As registered today: every processor needs the whole row on the host.
+        assert!(
+            reg.iter()
+                .all(|m| !m.device_capable() && m.needs_full_row())
+        );
+        passes(processors_suite(reg));
     }
 
+    /// Every family passes `families_suite` (tiny checkpoint vs the naive decoder, batching,
+    /// chunking, paging and fusion equivalences on the CPU provider).
     #[test]
     fn families() {
         let reg = crate::families::registry();
-        check(reg).unwrap();
-        // Every family serves at least one HF name, and no two families claim the same one.
-        let mut seen = std::collections::HashMap::new();
-        for family in reg.iter() {
-            assert!(!family.hf_architectures().is_empty(), "{}", family.name());
-            for hf in family.hf_architectures() {
-                if let Some(other) = seen.insert(*hf, family.name()) {
-                    panic!("{hf} is claimed by {other} and {}", family.name());
-                }
-            }
-        }
+        names_are(
+            reg,
+            "model_family",
+            &["llama", "olmoe", "qwen3", "qwen3_moe", "mistral", "mixtral"],
+        );
+        passes(families_suite(reg));
     }
 
+    /// Every tool format passes `formats_suite` (render, grammar, parse, round trip through the
+    /// constrained matcher on the tiny tokenizer, opening).
     #[test]
     fn tool_formats() {
         let reg = crate::formats::registry();
-        check(reg).unwrap();
-        // Every special token a format names is non-empty and named once.
-        for format in reg.iter() {
-            let texts: Vec<&str> = format.special_tokens().iter().map(|t| t.text).collect();
-            for (i, text) in texts.iter().enumerate() {
-                assert!(!text.is_empty(), "{}", format.name());
-                assert!(
-                    !texts[..i].contains(text),
-                    "{}: {text} twice",
-                    format.name()
-                );
-            }
-        }
+        names_are(reg, "tool_format", &["llama3_json", "hermes", "mistral"]);
+        passes(formats_suite(reg));
     }
 
+    /// Every weight format passes `weights_suite`.
     #[test]
     fn weight_formats() {
-        check(crate::weights::registry()).unwrap();
+        let reg = crate::weights::registry();
+        names_are(reg, "weight_format", &["bf16"]);
+        passes(weights_suite(reg));
     }
 }

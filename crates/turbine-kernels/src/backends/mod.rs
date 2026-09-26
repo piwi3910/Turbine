@@ -15,6 +15,7 @@ use turbine_tensor::DeviceMemory;
 use crate::cards::CardProfile;
 use crate::{KernelError, KernelProvider, ProviderId, Selection, ShimContext};
 
+pub mod conformance;
 pub mod cpu;
 pub mod hip;
 

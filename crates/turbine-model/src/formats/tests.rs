@@ -1,5 +1,7 @@
-//! Conformance of the registered tool formats (render, grammar, parse, round trip), the
-//! `auto`-mode opening rule and [`bind`].
+//! Each registered tool format's own cases (main's grammars and parser inputs for
+//! `llama3_json`, the run-ahead's for `hermes` and `mistral`), the `auto`-mode opening rules
+//! and [`bind`]. The checks every format must pass (render, grammar, parse, round trip,
+//! opening) are `crate::conformance::formats_suite`, run by `registry_conformance::tool_formats`.
 
 use std::sync::Arc;
 
@@ -87,8 +89,8 @@ fn llama3_json_conformance() {
         .expect("llama3_json is registered");
     let tools = weather_tools();
 
-    // Render: the chat template renders the tools; the format does not.
-    assert_eq!(format.render_tools(&tools), None);
+    // Render, refusals, the sample call's parse and round trip and its opening are
+    // `conformance::formats_suite`; these pin main's grammars and parser cases.
 
     // Grammar: main's `tool_call_grammar` output byte for byte, and `tool_call_grammar` still
     // equals the format's grammar.
@@ -105,10 +107,6 @@ fn llama3_json_conformance() {
         let legacy = grammar_source(tool_call_grammar(&tools, choice, parallel).unwrap());
         assert_eq!(legacy, g);
     }
-    assert!(matches!(
-        format.grammar(&tools, &ToolChoice::None, false),
-        Err(ModelError::Constraint(_))
-    ));
 
     // Parse: main's parser test inputs give main's results.
     let parser = format.parser();
@@ -277,6 +275,9 @@ impl ToolFormat for NeedsNone {
     fn opens_like_call(&self, _: &str, _: Option<u32>, _: &BoundTokens) -> Opening {
         Opening::Content
     }
+    fn sample_call(&self) -> &'static str {
+        Llama3Json.sample_call()
+    }
 }
 
 #[test]
@@ -329,26 +330,10 @@ struct Samples<'a> {
 
 /// Render, grammar, parse and round trip of the registered format `name` over `s`.
 fn enveloped_conformance(name: &str, s: &Samples<'_>) {
+    // Render, the refused choices (`none`, no tools, an unknown name), the sample call's parse
+    // and round trip and its opening are `conformance::formats_suite`
+    // (`registry_conformance::tool_formats`); these are the format's own cases.
     let format = registry().get(name).expect("registered");
-    let tools = weather_tools();
-
-    // Render: the chat template renders the tools; the format does not.
-    assert_eq!(format.render_tools(&tools), None);
-
-    // Grammar: refuses what llama3_json refuses.
-    for (tools, choice) in [
-        (&tools[..], ToolChoice::None),
-        (&[][..], ToolChoice::Required),
-        (&tools[..], ToolChoice::Named("get_stock".into())),
-    ] {
-        assert!(
-            matches!(
-                format.grammar(tools, &choice, false),
-                Err(ModelError::Constraint(_))
-            ),
-            "{name}: {choice:?}"
-        );
-    }
 
     // Parse: the sample calls give their names and compact arguments.
     let parser = format.parser();

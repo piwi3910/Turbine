@@ -102,6 +102,11 @@ impl ModelFamily for Mixtral {
         Some(MISTRAL)
     }
 
+    /// The family's tiny checkpoint (`testing::tiny`).
+    fn write_tiny(&self, dir: &std::path::Path, seed: u64) -> crate::testing::tiny::TinySpec {
+        crate::testing::tiny::write_tiny_family(dir, self.name(), seed)
+    }
+
     fn build_executor(
         &self,
         cfg: &ModelArchConfig,

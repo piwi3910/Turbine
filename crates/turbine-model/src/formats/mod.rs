@@ -60,6 +60,11 @@ pub trait ToolFormat: Module {
         first_token: Option<u32>,
         tokens: &BoundTokens,
     ) -> Opening;
+    /// One call as the model writes it in this format: `get_weather` with the arguments
+    /// `{"location": "Oslo", "unit": "celsius"}` (a tool of the conformance suite's fixture,
+    /// [`crate::conformance::fixture_tools`]). The format's conformance suite parses it,
+    /// feeds it through its compiled grammars and asks whether it opens like a call.
+    fn sample_call(&self) -> &'static str;
 }
 
 impl std::fmt::Debug for dyn ToolFormat {

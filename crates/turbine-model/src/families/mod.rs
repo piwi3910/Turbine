@@ -7,7 +7,7 @@
 //! The keys every decoder shares (layers, widths, heads, RoPE, EOS) are parsed by
 //! `crate::config`; [`ModelFamily::parse_config`] reads only the family's own keys.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use turbine_core::registry::{Module, Registry};
@@ -18,6 +18,7 @@ use crate::ModelError;
 use crate::config::{ModelArchConfig, MoeConfig, unsupported};
 use crate::executor::{ExecutorLimits, ExecutorOptions, ModelExecutor};
 use crate::loader::{LoadedWeights, WeightSlot};
+use crate::testing::tiny::TinySpec;
 
 pub mod llama;
 pub mod mistral;
@@ -66,6 +67,11 @@ pub trait ModelFamily: Module {
         limits: ExecutorLimits,
         opts: ExecutorOptions,
     ) -> Result<Box<dyn ModelExecutor>, ModelError>;
+    /// Writes a tiny synthetic checkpoint of this family into `dir` (weights from a ChaCha8
+    /// stream seeded by `seed`; the tiny tokenizer): the checkpoint the family's conformance
+    /// suite ([`crate::conformance::families_suite`]) runs on the CPU provider. A test
+    /// utility: panics on I/O errors.
+    fn write_tiny(&self, dir: &Path, seed: u64) -> TinySpec;
 }
 
 impl std::fmt::Debug for dyn ModelFamily {

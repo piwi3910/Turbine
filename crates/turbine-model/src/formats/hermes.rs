@@ -106,6 +106,10 @@ impl ToolFormat for Hermes {
             Opening::Content
         }
     }
+
+    fn sample_call(&self) -> &'static str {
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Oslo\", \"unit\": \"celsius\"}}\n</tool_call>"
+    }
 }
 
 /// The `hermes` parser: after an optional leading `<think>…</think>` block, one or more

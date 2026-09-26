@@ -11,6 +11,7 @@ use turbine_device::DeviceInfo;
 
 use crate::OpKind;
 
+pub mod conformance;
 mod gfx1201;
 
 pub use gfx1201::GFX1201;
@@ -130,8 +131,6 @@ pub fn profile_archs() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use turbine_core::types::{DeviceId, MemoryKind, Vendor};
     use turbine_device::DeviceMemoryInfo;
 
@@ -266,20 +265,8 @@ mod tests {
     /// registered profiles, so CMake builds every architecture a profile describes.
     #[test]
     fn cmake_lists_every_profile_arch() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../kernels/rocm/cmake/card_profiles.cmake");
-        let text = std::fs::read_to_string(&path).expect("card_profiles.cmake");
-        let body = text
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let start = body
-            .find("set(TURBINE_PROFILE_ARCHS")
-            .expect("set(TURBINE_PROFILE_ARCHS …)");
-        let rest = &body[start + "set(TURBINE_PROFILE_ARCHS".len()..];
-        let list = &rest[..rest.find(')').expect("closing parenthesis")];
-        let cmake: Vec<&str> = list.split_whitespace().collect();
+        let cmake = conformance::cmake_profile_archs("kernels/rocm/cmake/card_profiles.cmake")
+            .expect("card_profiles.cmake");
         assert_eq!(cmake, profile_archs());
     }
 }
