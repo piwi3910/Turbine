@@ -513,13 +513,19 @@ Interfaces:
 Lane: D. Depends on: Task 11.
 Covers: S-5 AC ("CPU reference provider split into one file per op family").
 
-- [ ] Write failing test `turbine-kernels --test cpu_layout every_op_family_has_its_file`: for each `KernelProvider` family accessor (`gemm`, `attention`, `norm`, `rope`, `activation`, `embedding`, `elementwise`, `kv_copy`, `moe`, `logits_reduce`) the file `src/cpu/<family>.rs` (`paged.rs` for the paged kinds, `norm.rs` for `add_rmsnorm`) exists and contains its `impl <Trait> for CpuReference` block, and `src/cpu/mod.rs` contains no `impl …Kernel for CpuReference` block. Run: `scripts/remote-cargo.sh test -p turbine-kernels --test cpu_layout` — expect FAIL
-- [ ] Move each op family and its tests into its file without changing any function body.
-- [ ] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS with the same number of `turbine-kernels` unit tests as before the move (compare the `test result:` lines)
-- [ ] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
-- [ ] Lab: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops` — expect exit 0
+- [x] Write failing test `turbine-kernels --test cpu_layout every_op_family_has_its_file`: for each `KernelProvider` family accessor (`gemm`, `attention`, `norm`, `rope`, `activation`, `embedding`, `elementwise`, `kv_copy`, `moe`, `logits_reduce`) the file `src/cpu/<family>.rs` (`paged.rs` for the paged kinds, `norm.rs` for `add_rmsnorm`) exists and contains its `impl <Trait> for CpuReference` block, and `src/cpu/mod.rs` contains no `impl …Kernel for CpuReference` block. Run: `scripts/remote-cargo.sh test -p turbine-kernels --test cpu_layout` — expect FAIL
+- [x] Move each op family and its tests into its file without changing any function body.
+- [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS with the same number of `turbine-kernels` unit tests as before the move (compare the `test result:` lines)
+- [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
+- [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops` — expect exit 0
 - [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 12 row to `.procoder/perf-log.md`
-- [ ] Commit: `refactor(kernels): one cpu-reference file per op family`
+- [x] Commit: `refactor(kernels): one cpu-reference file per op family`
+
+Build notes (Task 12, as built):
+
+- New files `cpu/{gemm,attention,norm,rope,activation,embedding,elementwise,kv_copy,logits_reduce}.rs`; `kv_copy.rs` takes the `KvCopyKernel` impl (and its `byte_offset` helper) out of `paged.rs`, which keeps the paged attention math; `leading_rows` moved to `logits_reduce.rs` (its only user). Function bodies are unchanged (checked by comparing the sorted non-blank lines of the old and new files: only imports, module docs and the test helpers' `pub(super)` differ).
+- Tests moved with their family (`gemm_and_causal_gqa_attention_reference`, `bf16_attention_…`, `decode_…` to attention.rs; `rmsnorm_…` and `add_rmsnorm_…` to norm.rs; `silu_mul_embedding_and_add` to activation.rs; `paged_attention_equals_contiguous_and_moe_route_ties` to paged.rs; `moe_experts_accumulate_weighted_expert_outputs` to moe.rs; the logits references to logits_reduce.rs); the view and dtype tests stay in mod.rs. Their shared helpers and imports sit in `cpu::test_util` (cfg(test)). `turbine-kernels` lib tests: 58 before and after.
+- Lab: `hip_ops` (run 0926204022-0f110fa4) exits 0 against the split reference; the lab-bench row is left to the coordinator.
 
 ## Task 13: Support matrix, `--support-matrix`, startup refusal, vendor-type guard
 

@@ -265,6 +265,7 @@ impl MoeKernel for CpuReference {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpu::test_util::*;
 
     /// Ties at the k-th place go where `torch.topk` puts them (here experts 2 and 3 of four
     /// equal weights, not the lower ids 0 and 1); the chosen set is listed by descending weight,
@@ -275,5 +276,128 @@ mod tests {
         assert_eq!(torch_topk(&[0.1, 0.3, 0.3, 0.3], 3), [1, 2, 3]);
         let p = softmax(&[0.0, 0.0]);
         assert_eq!(p, [0.5, 0.5]);
+    }
+
+    #[test]
+    fn moe_experts_accumulate_weighted_expert_outputs() {
+        let mem = host();
+        let moe = CpuReference.moe().expect("moe family");
+        let (h, inter, experts, top_k) = (3usize, 2usize, 3usize, 2usize);
+        // Two tokens: token 0 → experts (2, 0), token 1 → experts (0, 1); weights per slot.
+        let sorted = [1, 2, 3, 0]; // e0 {1, 2}, e1 {3}, e2 {0}
+        let offsets = [0, 2, 3, 4];
+        let weights = [0.5f32, 0.25, 0.75, 0.125];
+        let x_vals = [1.0f32, -2.0, 0.5, 0.25, 1.0, -1.0];
+        let wg = seeded(1, experts * inter * h);
+        let wu = seeded(2, experts * inter * h);
+        let wd = seeded(3, experts * h * inter);
+        let cfg = MoeExpertsConfig {
+            hidden: h as u32,
+            inter: inter as u32,
+            num_experts: experts as u32,
+            top_k: top_k as u32,
+            expert_begin: 0,
+            expert_end: experts as u32,
+            dtype: DType::F32,
+        };
+        assert!(moe.supports_experts(&cfg));
+        assert_eq!(moe.implementation_experts(&cfg), "cpu_moe_experts_f32acc");
+        let x = tensor(&mem, &[2, h], DType::F32, &x_vals);
+        let out = tensor(&mem, &[2, h], DType::F32, &[10.0; 6]);
+        let w_gate = tensor(&mem, &[experts, inter, h], DType::F32, &wg);
+        let w_up = tensor(&mem, &[experts, inter, h], DType::F32, &wu);
+        let w_down = tensor(&mem, &[experts, h, inter], DType::F32, &wd);
+        let sorted_rows = i32_tensor(&mem, &sorted);
+        let expert_offsets = i32_tensor(&mem, &offsets);
+        let topk_weights = tensor(&mem, &[2, top_k], DType::F32, &weights);
+        moe.experts(&mut MoeExpertsContext {
+            cfg,
+            x: x.view(),
+            w_gate: w_gate.view(),
+            w_up: w_up.view(),
+            w_down: w_down.view(),
+            sorted_rows: sorted_rows.view(),
+            expert_offsets: expert_offsets.view(),
+            topk_weights: topk_weights.view(),
+            host_expert_offsets: &offsets,
+            out: out.view(),
+            workspace: None,
+        })
+        .expect("experts");
+
+        // Naive: out[t] = 10 + Σ over experts in ascending id of w · expert_e(x[t]).
+        let expert = |e: usize, xt: &[f32]| -> Vec<f32> {
+            let act: Vec<f32> = (0..inter)
+                .map(|j| {
+                    let dot = |w: &[f32]| (0..h).map(|c| xt[c] * w[(e * inter + j) * h + c]).sum();
+                    let (g, u): (f32, f32) = (dot(&wg), dot(&wu));
+                    g / (1.0 + (-g).exp()) * u
+                })
+                .collect();
+            (0..h)
+                .map(|c| {
+                    (0..inter)
+                        .map(|j| act[j] * wd[(e * h + c) * inter + j])
+                        .sum()
+                })
+                .collect()
+        };
+        let routes = [[(2usize, 0.5f32), (0, 0.25)], [(0, 0.75), (1, 0.125)]];
+        let mut want = Vec::new();
+        for (t, route) in routes.iter().enumerate() {
+            let xt = &x_vals[t * h..(t + 1) * h];
+            let mut acc = [10.0f32; 3];
+            let mut by_expert = route.to_vec();
+            by_expert.sort_by_key(|&(e, _)| e);
+            for (e, w) in by_expert {
+                for (a, y) in acc.iter_mut().zip(expert(e, xt)) {
+                    *a += w * y;
+                }
+            }
+            want.extend_from_slice(&acc);
+        }
+        assert_close(&load(&out.view()).expect("out"), &want, 1e-5);
+
+        // The host copy of the offsets must agree with the device offsets.
+        let err = moe
+            .experts(&mut MoeExpertsContext {
+                cfg,
+                x: x.view(),
+                w_gate: w_gate.view(),
+                w_up: w_up.view(),
+                w_down: w_down.view(),
+                sorted_rows: sorted_rows.view(),
+                expert_offsets: expert_offsets.view(),
+                topk_weights: topk_weights.view(),
+                host_expert_offsets: &[0, 1, 3, 4],
+                out: out.view(),
+                workspace: None,
+            })
+            .expect_err("mismatched host offsets");
+        assert!(matches!(err, KernelError::InvalidArgument { .. }), "{err}");
+
+        // The reference reads the offsets from `expert_offsets` itself: it never needs the host
+        // copy, and an empty one gives the same result as the full one.
+        for rows in [0, 8, 512, 513, 1 << 20] {
+            assert!(!moe.needs_host_offsets(&cfg, rows), "{rows} routed rows");
+        }
+        assert_eq!(cfg.routed_rows(3), 3 * top_k);
+        let with_host = load(&out.view()).expect("out");
+        let again = tensor(&mem, &[2, h], DType::F32, &[10.0; 6]);
+        moe.experts(&mut MoeExpertsContext {
+            cfg,
+            x: x.view(),
+            w_gate: w_gate.view(),
+            w_up: w_up.view(),
+            w_down: w_down.view(),
+            sorted_rows: sorted_rows.view(),
+            expert_offsets: expert_offsets.view(),
+            topk_weights: topk_weights.view(),
+            host_expert_offsets: &[],
+            out: again.view(),
+            workspace: None,
+        })
+        .expect("experts without host offsets");
+        assert_eq!(load(&again.view()).expect("out"), with_host);
     }
 }
