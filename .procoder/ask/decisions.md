@@ -395,3 +395,53 @@
 - Neither for now; revisit when Phase 8 track specs are written
 
 **Answer (2026-09-26):** issues + AGENTS.md rule. Filed piwi3910/Turbine #4 (quantization formats), #5 (speculative proposers), #6 (logits processors and scheduling policies), alongside #1 (model families), #2 (prompt/tool-call formats), #3 (backends, card families, kernel providers); AGENTS.md engineering rules gain the pluggability rule.
+
+## Modularity refactor before Phase 3 (issues #1–#6)
+
+Scope:
+
+- Restructure what exists today: model families (#1), prompt/tool-call formats (#2), backends + card profiles + kernel providers (#3), logits processors + scheduling policy (#6); for #4/#5 only BF16 as the first weight-format module, no speculative seam yet (recommended)
+- All six issues, including empty seams for quantization and speculative decoding
+- Only #1 and #2 now
+
+Run-ahead branches (p3–p8):
+
+- Refactor main first; run-ahead branches are rebased/ported onto the new layout afterwards, each ported when its phase starts (recommended)
+- Merge the Phase 3 run-ahead first, then refactor
+
+Where the modules live:
+
+- As modules inside the existing crates (e.g. turbine-model/src/families/, turbine-model/src/formats/, turbine-kernels/src/providers/), no new crates unless a real ownership boundary appears (recommended)
+- New crates per extension area (turbine-families, turbine-formats, …)
+
+Process:
+
+- A procoder spec + plan ("phase-2m-modularity"), landed one slice at a time with host tests, lab golden and lab-bench after each slice proving no behaviour or throughput change (recommended)
+- Lighter: one agent per issue in parallel worktrees, verified at the end
+
+**Answers (2026-09-26):** scope = existing areas (#1 model families, #2 prompt/tool formats, #3 backends + card profiles + kernel providers, #6 logits processors + scheduling policy; BF16 as the first weight-format module; no speculative seam yet). Refactor main first; run-ahead branches are ported onto the new layout when their phase starts. Modules live inside the existing crates (no new crates without a real ownership boundary). Run as a procoder spec + plan (`phase-2m-modularity`), landed slice by slice with host tests, lab golden and lab-bench after each slice proving no behaviour or throughput change; parallel agents per independent slice.
+
+## Phase 2m modularity: design choices
+
+Kernel providers (today the HIP library chooses hipBLASLt / CK / Turbine kernels internally in C++):
+
+- Selection moves to Rust: the ABI lists each op's implementations (name, supported configs), the Rust registry picks one per op with reason codes, card profiles supply thresholds; one library per backend (recommended)
+- Split the HIP library into one shared library per provider (hipBLASLt, CK, Turbine kernels)
+- Keep selection in C++; only move thresholds into card profiles passed through the ABI
+
+Model family executors (llama.rs / olmoe.rs are ~55–60% duplicated):
+
+- One shared decoder skeleton with per-family hooks (attention variant such as Q/K norm, FFN variant: dense SwiGLU or MoE); a family file holds config parsing, weight slots and its hooks (recommended)
+- Family trait over two separate executors (no deduplication)
+
+Phase 8 run-ahead registry work (runahead/p8-umbrella: architecture registry, Hermes/Mistral tool parsers):
+
+- Use its registry design as input but ship only Llama, OLMoE and llama3_json now; the other families and formats stay on the branch for Phase 8 (recommended)
+- Merge its registry and parsers as part of this refactor
+
+Card profiles:
+
+- Declarative Rust profile per card family (gfx1201 first) in turbine-kernels, passed to the library at context creation; CMake builds the architectures the profiles list (recommended)
+- Profiles as data files (YAML/TOML) loaded at startup
+
+**Answers (2026-09-26):** kernel selection moves to Rust (the ABI lists each op's implementations and what they support, the Rust registry picks with reason codes, card profiles supply thresholds, one library per backend); families share one decoder skeleton with per-family attention/FFN hooks; the Phase 8 run-ahead registry, families (Qwen3, Qwen3-MoE, Mistral, Mixtral on CPU) and Hermes/Mistral tool parsers are merged in as part of this refactor; card profiles are declarative Rust profiles in turbine-kernels passed to the library at context creation, CMake builds the architectures the profiles list.
