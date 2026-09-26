@@ -1,10 +1,11 @@
-//! Non-streaming OpenAI responses (P1 S-10): the per-request rendering context shared with the
-//! SSE stream, logprob rendering, and [`collect`], which folds a generation into one body.
+//! Non-streaming OpenAI responses (P1 S-10, P2 S-10/S-18): the per-request rendering context
+//! shared with the SSE stream, logprob and tool-call rendering, per-choice accounting, and
+//! [`collect`], which folds a generation into one body with one choice per index.
 
 use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
-use turbine_core::request::{Endpoint, FinishReason, GenerationEvent, Usage};
+use turbine_core::request::{Endpoint, FinishReason, GenerationEvent, ToolCallOut, Usage};
 use turbine_core::types::RequestId;
 
 use crate::backend::{GenerationStream, InferenceBackend};
@@ -28,6 +29,8 @@ pub(crate) struct ResponseContext {
     pub token_ids_as_text: bool,
     /// `stream_options.include_usage`.
     pub include_usage: bool,
+    /// Choices requested (`n`, ≥ 1); the response is complete when every one has finished.
+    pub choices: u32,
     pub backend: Arc<dyn InferenceBackend>,
 }
 
@@ -146,11 +149,13 @@ pub(crate) fn usage_json(usage: Usage) -> Value {
     })
 }
 
-/// Usage reported by the engine, else the tokens counted by the API (prompt unknown: 0).
-pub(crate) fn usage_or_counted(usage: Option<Usage>, counted: u32) -> Usage {
-    usage.unwrap_or(Usage {
-        prompt_tokens: 0,
-        completion_tokens: counted,
+/// A tool call as OpenAI renders it in `message.tool_calls` (the streamed `delta.tool_calls`
+/// entry adds `index`).
+pub(crate) fn tool_call_json(call: &ToolCallOut) -> Value {
+    json!({
+        "id": call.id,
+        "type": "function",
+        "function": {"name": call.name, "arguments": call.arguments},
     })
 }
 
@@ -184,71 +189,158 @@ impl TokenAccumulator {
     }
 }
 
-/// Fold a generation into the non-streaming response body. An `Error` event (or a stream that
-/// ends without `Finished`) becomes the matching HTTP error.
+/// Per-choice accounting shared by the full body and the SSE stream.
+#[derive(Default)]
+pub(crate) struct ChoiceState {
+    pub acc: TokenAccumulator,
+    /// Logprob entries not rendered yet (the stream drains them into its next chunk).
+    pub entries: Vec<TokenLogprob>,
+    /// Set by the choice's `Finished` event.
+    pub finish: Option<FinishReason>,
+    /// The engine's usage for this choice, when reported.
+    pub usage: Option<Usage>,
+}
+
+impl ChoiceState {
+    /// One state per requested choice.
+    pub fn for_request(ctx: &ResponseContext) -> Vec<ChoiceState> {
+        (0..ctx.choices.max(1))
+            .map(|_| ChoiceState::default())
+            .collect()
+    }
+}
+
+/// The index of `choice` in a request with `len` choices, or the internal error an engine that
+/// names a choice it was not asked for deserves.
+pub(crate) fn choice_index(choice: u32, len: usize) -> Result<usize, ApiError> {
+    usize::try_from(choice)
+        .ok()
+        .filter(|&i| i < len)
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "generation event for choice {choice} of a request with {len} choices"
+            ))
+        })
+}
+
+/// Usage of the whole request: the prompt once (the largest count reported) and the completion
+/// tokens of every choice (the engine's count, else the tokens the API saw).
+pub(crate) fn total_usage<'a>(choices: impl IntoIterator<Item = &'a ChoiceState>) -> Usage {
+    let mut total = Usage::default();
+    for c in choices {
+        let (prompt, completion) = match c.usage {
+            Some(u) => (u.prompt_tokens, u.completion_tokens),
+            None => (0, c.acc.tokens),
+        };
+        total.prompt_tokens = total.prompt_tokens.max(prompt);
+        total.completion_tokens += completion;
+    }
+    total
+}
+
+/// One choice of a non-streaming response.
+#[derive(Default)]
+struct CollectedChoice {
+    state: ChoiceState,
+    text: String,
+    tool_calls: Vec<ToolCallOut>,
+}
+
+/// Fold a generation into the non-streaming response body; complete once every choice has
+/// finished. An `Error` event (or a stream that ends before every choice finished) becomes the
+/// matching HTTP error.
 pub(crate) async fn collect(
     mut stream: GenerationStream,
     ctx: ResponseContext,
 ) -> Result<Value, ApiError> {
-    let mut acc = TokenAccumulator::default();
-    let mut text = String::new();
-    let mut entries = Vec::new();
+    let mut choices: Vec<CollectedChoice> = ChoiceState::for_request(&ctx)
+        .into_iter()
+        .map(|state| CollectedChoice {
+            state,
+            ..CollectedChoice::default()
+        })
+        .collect();
+    let n = choices.len();
     while let Some(event) = stream.recv().await {
         match event {
             GenerationEvent::Token {
-                text: t,
+                choice,
+                text,
                 token_id,
                 logprob,
                 top_logprobs,
-                ..
             } => {
-                entries.extend(acc.token(&ctx, &t, token_id, logprob, top_logprobs));
-                text.push_str(&t);
+                let c = &mut choices[choice_index(choice, n)?];
+                let entry = c
+                    .state
+                    .acc
+                    .token(&ctx, &text, token_id, logprob, top_logprobs);
+                c.state.entries.extend(entry);
+                c.text.push_str(&text);
             }
-            GenerationEvent::Finished { reason, usage, .. } => {
-                let usage = usage_or_counted(usage, acc.tokens);
-                return Ok(full_body(&ctx, text, &entries, reason, usage));
+            GenerationEvent::ToolCalls { choice, calls } => {
+                choices[choice_index(choice, n)?].tool_calls.extend(calls);
+            }
+            GenerationEvent::Finished {
+                choice,
+                reason,
+                usage,
+            } => {
+                let c = &mut choices[choice_index(choice, n)?];
+                c.state.finish = Some(reason);
+                c.state.usage = usage;
+                if choices.iter().all(|c| c.state.finish.is_some()) {
+                    return Ok(full_body(&ctx, &mut choices));
+                }
             }
             GenerationEvent::Error { code, message } => {
                 return Err(ApiError::from_code(code, message));
             }
-            // `Started` carries nothing for a full body; later-phase events are not produced
-            // for Phase 1 requests.
+            // `Started` carries nothing for a full body.
             _ => {}
         }
     }
     Err(ApiError::internal(NO_FINISH))
 }
 
-fn full_body(
-    ctx: &ResponseContext,
-    text: String,
-    entries: &[TokenLogprob],
-    reason: FinishReason,
-    usage: Usage,
-) -> Value {
-    let logprobs = ctx.render_logprobs(entries);
-    let choice = if ctx.chat() {
-        json!({
-            "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "logprobs": logprobs,
-            "finish_reason": reason.as_str(),
+fn full_body(ctx: &ResponseContext, choices: &mut [CollectedChoice]) -> Value {
+    let rendered: Vec<Value> = choices
+        .iter_mut()
+        .zip(0u32..)
+        .map(|(c, index)| {
+            let logprobs = ctx.render_logprobs(&c.state.entries);
+            let finish_reason = c.state.finish.map_or(Value::Null, |r| r.as_str().into());
+            if ctx.chat() {
+                let mut message = json!({"role": "assistant", "content": c.text});
+                if !c.tool_calls.is_empty() {
+                    c.tool_calls.sort_by_key(|call| call.index);
+                    if c.text.is_empty() {
+                        message["content"] = Value::Null;
+                    }
+                    message["tool_calls"] = c.tool_calls.iter().map(tool_call_json).collect();
+                }
+                json!({
+                    "index": index,
+                    "message": message,
+                    "logprobs": logprobs,
+                    "finish_reason": finish_reason,
+                })
+            } else {
+                json!({
+                    "index": index,
+                    "text": c.text,
+                    "logprobs": logprobs,
+                    "finish_reason": finish_reason,
+                })
+            }
         })
-    } else {
-        json!({
-            "index": 0,
-            "text": text,
-            "logprobs": logprobs,
-            "finish_reason": reason.as_str(),
-        })
-    };
+        .collect();
     json!({
         "id": ctx.id,
         "object": ctx.object(false),
         "created": ctx.created,
         "model": ctx.model,
-        "choices": [choice],
-        "usage": usage_json(usage),
+        "choices": rendered,
+        "usage": usage_json(total_usage(choices.iter().map(|c| &c.state))),
     })
 }

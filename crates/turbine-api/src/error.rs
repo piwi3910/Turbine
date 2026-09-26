@@ -167,6 +167,67 @@ impl ApiError {
         )
     }
 
+    /// 429 `rate_limit_error`/`queue_full` with `retry-after: 1`: the waiting queue is at
+    /// `scheduler.max_queued_requests`.
+    pub fn queue_full() -> Self {
+        Self::from_code(
+            ErrorCode::QueueFull,
+            "the request queue is full; retry later",
+        )
+    }
+
+    /// 503 `service_unavailable`/`queue_timeout`: waited longer than `scheduler.queue_timeout`.
+    pub fn queue_timeout() -> Self {
+        Self::from_code(
+            ErrorCode::QueueTimeout,
+            "the request waited longer than scheduler.queue_timeout before it could start",
+        )
+    }
+
+    /// 400 `invalid_request_error`/`context_exceeds_kv_capacity`: the request's KV at completion
+    /// needs more blocks than the pool holds (CONFLICT C-2).
+    pub fn context_exceeds_kv_capacity(message: impl Into<String>) -> Self {
+        Self::from_code(ErrorCode::ContextExceedsKvCapacity, message)
+    }
+
+    /// 400 `invalid_request_error`/`invalid_json_schema`: the schema or tool grammar does not
+    /// compile within bounds; `message` names the llguidance error or the bound.
+    pub fn invalid_json_schema(message: impl Into<String>) -> Self {
+        Self::from_code(ErrorCode::InvalidJsonSchema, message)
+    }
+
+    /// 400 `invalid_request_error`/`tools_not_supported`: `tools` on a model with no tool-call parser.
+    pub fn tools_not_supported(model: &str) -> Self {
+        Self::from_code(
+            ErrorCode::ToolsNotSupported,
+            format!("the model `{model}` does not support tools (model.tool_call_parser is none)"),
+        )
+    }
+
+    /// 400 `invalid_request_error`/`unknown_tool`: `tool_choice` names a function not in `tools`.
+    pub fn unknown_tool(name: &str) -> Self {
+        Self::from_code(
+            ErrorCode::UnknownTool,
+            format!("tool_choice names the function `{name}`, which is not in tools"),
+        )
+    }
+
+    /// 503 `service_unavailable`/`shutting_down`: the server is draining for shutdown.
+    pub fn shutting_down() -> Self {
+        Self::from_code(
+            ErrorCode::ShuttingDown,
+            "the server is shutting down and accepts no new requests",
+        )
+    }
+
+    /// 504 `timeout`/`request_timeout`: the request ran past `server.request_timeout`.
+    pub fn request_timeout() -> Self {
+        Self::from_code(
+            ErrorCode::RequestTimeout,
+            "the request exceeded server.request_timeout",
+        )
+    }
+
     /// Status, `type` and `retry-after` for a code reported by the engine (contract §14.3 table).
     pub fn from_code(code: ErrorCode, message: impl Into<String>) -> Self {
         let (status, kind) = match code {
@@ -188,14 +249,24 @@ impl ApiError {
             ErrorCode::UnsupportedParameter
             | ErrorCode::ContextLengthExceeded
             | ErrorCode::TemplateError
-            | ErrorCode::InvalidRequest => {
-                (StatusCode::BAD_REQUEST, ErrorType::InvalidRequestError)
+            | ErrorCode::InvalidRequest
+            | ErrorCode::ContextExceedsKvCapacity
+            | ErrorCode::InvalidJsonSchema
+            | ErrorCode::ToolsNotSupported
+            | ErrorCode::UnknownTool => (StatusCode::BAD_REQUEST, ErrorType::InvalidRequestError),
+            ErrorCode::EngineBusy | ErrorCode::QueueFull => {
+                (StatusCode::TOO_MANY_REQUESTS, ErrorType::RateLimitError)
             }
-            ErrorCode::EngineBusy => (StatusCode::TOO_MANY_REQUESTS, ErrorType::RateLimitError),
+            ErrorCode::QueueTimeout | ErrorCode::ShuttingDown => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorType::ServiceUnavailable,
+            ),
+            ErrorCode::RequestTimeout => (StatusCode::GATEWAY_TIMEOUT, ErrorType::Timeout),
+            // `internal_error`, and `slow_client` (stream only, `server_error`).
             _ => (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::ServerError),
         };
         let mut e = Self::new(status, kind, code, message);
-        if code == ErrorCode::EngineBusy {
+        if matches!(code, ErrorCode::EngineBusy | ErrorCode::QueueFull) {
             e.retry_after = Some(1);
         }
         e

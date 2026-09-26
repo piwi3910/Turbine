@@ -14,7 +14,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use turbine_api::openai::request::PromptInput;
+use turbine_api::openai::request::{OpenAiRequest, PromptInput, ResponseFormat, ToolChoiceMode};
 use turbine_api::{
     ApiError, BoxFuture, Diagnostics, GenerationStream, InferenceBackend, InferenceRequest,
     ModelCard, NotReadyReason, Readiness, ReadyState,
@@ -243,6 +243,9 @@ impl ModelBackend {
 
     /// Builds the generation request: prompt tokens, context-length check, sampling defaults.
     fn build(&self, req: &InferenceRequest) -> Result<GenerationRequest, ApiError> {
+        if let Some(field) = unserved_phase2_field(&req.body) {
+            return Err(ApiError::unsupported_parameter(field));
+        }
         let prompt_tokens = self.prompt_tokens(req)?;
         let prompt_len = u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX);
         let remaining = self.max_seq_len.saturating_sub(prompt_len);
@@ -516,6 +519,53 @@ impl Engine {
         }
         self.slot.store(false, Ordering::Release);
     }
+}
+
+/// The first Phase 2 request field the API accepts but this single-slot engine does not honour
+/// yet, at a non-default value. Such requests are refused with 400 `unsupported_parameter`
+/// instead of having the field silently ignored (TS §21 rule 2); `priority`, `user` and
+/// `parallel_tool_calls` change nothing for one slot and pass. The Phase 2 engine (plan Tasks
+/// 15 and 17) serves them all and removes this check.
+fn unserved_phase2_field(body: &OpenAiRequest) -> Option<&'static str> {
+    let unserved = [
+        ("n", body.n() > 1),
+        (
+            "presence_penalty",
+            body.presence_penalty.is_some_and(|p| p != 0.0),
+        ),
+        (
+            "frequency_penalty",
+            body.frequency_penalty.is_some_and(|p| p != 0.0),
+        ),
+        (
+            "repetition_penalty",
+            body.repetition_penalty.is_some_and(|p| p != 1.0),
+        ),
+        ("logit_bias", !body.logit_bias().is_empty()),
+        ("min_tokens", body.min_tokens.is_some_and(|m| m > 0)),
+        (
+            "stop_token_ids",
+            body.stop_token_ids.as_ref().is_some_and(|t| !t.is_empty()),
+        ),
+        ("echo", body.echo == Some(true)),
+        (
+            "response_format",
+            body.response_format
+                .as_ref()
+                .is_some_and(|f| *f != ResponseFormat::Text),
+        ),
+        ("tools", body.tool_choice_mode() != ToolChoiceMode::None),
+        (
+            "messages.tool_calls / tool messages",
+            body.messages
+                .iter()
+                .flatten()
+                .any(|m| m.role == "tool" || m.tool_calls.as_ref().is_some_and(|c| !c.is_empty())),
+        ),
+    ];
+    unserved
+        .into_iter()
+        .find_map(|(field, set)| set.then_some(field))
 }
 
 #[cfg(test)]

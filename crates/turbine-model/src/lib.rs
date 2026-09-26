@@ -31,9 +31,7 @@ pub use config::{
 pub use generate::{GenerateOptions, Generation, generate};
 pub use loader::olmoe_slots;
 pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot, llama_slots};
-pub use metrics::{ForwardPhase, ModelMetrics};
 pub use metrics::{ForwardPhase, ModelMetrics, ToolCallOutcome};
-pub use sampler::{SampledToken, Sampler};
 pub use sampler::{SampledToken, Sampler, SamplerState};
 pub use structured::{
     GrammarCompiler, GrammarLimits, TokenMask, TokenMatcher, constraint_kind, step_mask,

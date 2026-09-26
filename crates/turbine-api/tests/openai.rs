@@ -1,4 +1,4 @@
-//! Phase 1 OpenAI surface (S-10): field validation, the `InferenceBackend::submit` seam, and the
+//! OpenAI surface (P1 S-10; P2 S-10, S-17, S-18): field validation, the `InferenceBackend::submit` seam, and the
 //! completion/chat response shapes with SSE streaming.
 
 use std::sync::{Arc, Mutex};
@@ -8,12 +8,12 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use turbine_api::backend::{BoxFuture, GenerationStream, InferenceRequest};
-use turbine_api::openai::request::{OpenAiRequest, PromptInput};
+use turbine_api::openai::request::{OpenAiRequest, PromptInput, ResponseFormat, ToolChoiceMode};
 use turbine_api::{
     ApiError, ApiLimits, ApiState, Diagnostics, ErrorCode, ErrorType, InferenceBackend, ModelCard,
     NotReadyReason, Readiness, ReadyState, router,
 };
-use turbine_core::request::{Endpoint, FinishReason, GenerationEvent, Usage};
+use turbine_core::request::{Endpoint, FinishReason, GenerationEvent, ToolCallOut, Usage};
 use turbine_core::types::RequestId;
 use turbine_observability::MetricsRegistry;
 
@@ -58,17 +58,8 @@ fn accepts(req: &OpenAiRequest, endpoint: Endpoint) {
 fn request_validation_rules() {
     // Known-but-unsupported fields at a non-default value: 400 unsupported_parameter naming the field.
     let unsupported = [
-        (
-            json!({"tools": [{"type": "function", "function": {"name": "f"}}]}),
-            "tools",
-        ),
-        (
-            json!({"response_format": {"type": "json_object"}}),
-            "response_format",
-        ),
-        (json!({"n": 2}), "n"),
-        (json!({"logit_bias": {"5": 1}}), "logit_bias"),
-        (json!({"presence_penalty": 0.5}), "presence_penalty"),
+        (json!({"best_of": 2}), "best_of"),
+        (json!({"suffix": "tail"}), "suffix"),
         (json!({"echo": true}), "echo"),
         (
             json!({"messages": [{"role": "user", "content": [
@@ -78,7 +69,7 @@ fn request_validation_rules() {
             "image_url",
         ),
         (
-            json!({"messages": [{"role": "tool", "content": "42"}]}),
+            json!({"messages": [{"role": "developer", "content": "42"}]}),
             "messages.role",
         ),
     ];
@@ -396,7 +387,7 @@ async fn backend_submit_seam() {
 
     let e = backend
         .submit(inference_request(
-            chat(json!({"n": 2})),
+            chat(json!({"best_of": 2})),
             Endpoint::ChatCompletions,
         ))
         .await
@@ -835,7 +826,7 @@ async fn handler_errors_before_the_stream() {
     let (s, _, body) = post(
         &app,
         "/v1/chat/completions",
-        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "n": 2}),
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "best_of": 2}),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
@@ -879,4 +870,520 @@ async fn handler_errors_before_the_stream() {
     );
     assert!(content_type(&headers).starts_with("application/json"));
     assert_eq!(json_body(&body)["error"]["code"], "engine_busy");
+}
+
+// Phase 2 (S-10, S-13, S-17, S-18): choices by index, tool calls, new errors and fields.
+
+fn token_at(choice: u32, text: &str, token_id: u32) -> GenerationEvent {
+    GenerationEvent::Token {
+        choice,
+        text: text.to_string(),
+        token_id,
+        logprob: None,
+        top_logprobs: Vec::new(),
+    }
+}
+
+fn finished(choice: u32, reason: FinishReason, completion_tokens: u32) -> GenerationEvent {
+    GenerationEvent::Finished {
+        choice,
+        reason,
+        usage: Some(Usage {
+            prompt_tokens: 3,
+            completion_tokens,
+        }),
+    }
+}
+
+/// Two interleaved choices: 0 says "Hi there" and stops, 1 says "Yo" and hits the length limit.
+fn two_choice_script() -> Vec<GenerationEvent> {
+    vec![
+        GenerationEvent::Started { choice: 0 },
+        GenerationEvent::Started { choice: 1 },
+        token_at(0, "Hi", 5),
+        token_at(1, "Yo", 6),
+        token_at(0, " there", 7),
+        finished(1, FinishReason::Length, 1),
+        finished(0, FinishReason::Stop, 2),
+    ]
+}
+
+const PARIS: &str = "{\"location\":\"Paris\"}";
+const CALL_ID: &str = "call_abcdefghijklmnopqrstuvwx";
+
+fn weather_tools() -> Value {
+    json!([{"type": "function", "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {"type": "object",
+                       "properties": {"location": {"type": "string"},
+                                      "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}},
+                       "required": ["location"]}
+    }}])
+}
+
+fn tool_call_script() -> Vec<GenerationEvent> {
+    vec![
+        GenerationEvent::Started { choice: 0 },
+        GenerationEvent::ToolCalls {
+            choice: 0,
+            calls: vec![ToolCallOut {
+                index: 0,
+                id: CALL_ID.to_string(),
+                name: "get_weather".to_string(),
+                arguments: PARIS.to_string(),
+            }],
+        },
+        finished(0, FinishReason::ToolCalls, 9),
+    ]
+}
+
+#[tokio::test]
+async fn phase2_shapes() {
+    // n = 2, non-streaming chat: one choice per index, each with its own text and finish reason;
+    // usage adds the completion tokens of every choice.
+    let app = served_app(Arc::new(ServedScript::new(two_choice_script())));
+    let (s, _, body) = post(
+        &app,
+        "/v1/chat/completions",
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "n": 2}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let v = json_body(&body);
+    let choices = v["choices"].as_array().expect("choices array");
+    assert_eq!(choices.len(), 2, "{v}");
+    assert_eq!(choices[0]["index"], 0);
+    assert_eq!(
+        choices[0]["message"],
+        json!({"role": "assistant", "content": "Hi there"})
+    );
+    assert_eq!(choices[0]["finish_reason"], "stop");
+    assert_eq!(choices[1]["index"], 1);
+    assert_eq!(
+        choices[1]["message"],
+        json!({"role": "assistant", "content": "Yo"})
+    );
+    assert_eq!(choices[1]["finish_reason"], "length");
+    assert_eq!(
+        v["usage"],
+        json!({"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6})
+    );
+
+    // n = 2, non-streaming completion.
+    let (s, _, body) = post(
+        &app,
+        "/v1/completions",
+        json!({"model": "m", "prompt": "hi", "n": 2}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let v = json_body(&body);
+    assert_eq!(v["choices"][0]["index"], 0);
+    assert_eq!(v["choices"][0]["text"], "Hi there");
+    assert_eq!(v["choices"][1]["index"], 1);
+    assert_eq!(v["choices"][1]["text"], "Yo");
+
+    // n = 2, streaming chat: every chunk names its choice; one usage chunk and [DONE] after the
+    // last choice finishes.
+    let (s, _, body) = post(
+        &app,
+        "/v1/chat/completions",
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "n": 2,
+               "stream": true, "stream_options": {"include_usage": true}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let chunks = sse_data(&body);
+    assert_eq!(chunks.len(), 9, "{body}");
+    let at = |i: usize| (&chunks[i]["choices"][0]["index"], &chunks[i]["choices"][0]);
+    assert_eq!(at(0).0, 0);
+    assert_eq!(
+        at(0).1["delta"],
+        json!({"role": "assistant", "content": ""})
+    );
+    assert_eq!(at(1).0, 1);
+    assert_eq!(
+        at(1).1["delta"],
+        json!({"role": "assistant", "content": ""})
+    );
+    assert_eq!(
+        (at(2).0, &at(2).1["delta"]),
+        (&json!(0), &json!({"content": "Hi"}))
+    );
+    assert_eq!(
+        (at(3).0, &at(3).1["delta"]),
+        (&json!(1), &json!({"content": "Yo"}))
+    );
+    assert_eq!(
+        (at(4).0, &at(4).1["delta"]),
+        (&json!(0), &json!({"content": " there"}))
+    );
+    assert_eq!(
+        (at(5).0, &at(5).1["finish_reason"]),
+        (&json!(1), &json!("length"))
+    );
+    assert_eq!(
+        (at(6).0, &at(6).1["finish_reason"]),
+        (&json!(0), &json!("stop"))
+    );
+    assert_eq!(chunks[7]["choices"], json!([]));
+    assert_eq!(chunks[7]["usage"]["completion_tokens"], 3);
+    assert_eq!(chunks[8], "[DONE]");
+
+    // A ToolCalls event: message.tool_calls with the complete arguments string and
+    // finish_reason tool_calls (content null when the model produced no text).
+    let app = served_app(Arc::new(ServedScript::new(tool_call_script())));
+    let tool_request = json!({"model": "m", "messages": [{"role": "user", "content": "Paris?"}],
+                              "tools": weather_tools(), "tool_choice": "required"});
+    let (s, _, body) = post(&app, "/v1/chat/completions", tool_request.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let v = json_body(&body);
+    let message = &v["choices"][0]["message"];
+    assert_eq!(message["role"], "assistant");
+    assert_eq!(message["content"], Value::Null, "{v}");
+    assert_eq!(
+        message["tool_calls"],
+        json!([{"id": CALL_ID, "type": "function",
+                "function": {"name": "get_weather", "arguments": PARIS}}])
+    );
+    assert_eq!(message["tool_calls"][0]["function"]["arguments"], PARIS);
+    assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+
+    // Streaming: one delta.tool_calls entry per call with index, id, type and the complete
+    // arguments, then the finish chunk with tool_calls.
+    let mut streaming = tool_request.clone();
+    streaming["stream"] = json!(true);
+    let (s, _, body) = post(&app, "/v1/chat/completions", streaming).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let chunks = sse_data(&body);
+    assert_eq!(chunks.len(), 4, "{body}");
+    assert_eq!(
+        chunks[1]["choices"][0]["delta"],
+        json!({"tool_calls": [{"index": 0, "id": CALL_ID, "type": "function",
+                               "function": {"name": "get_weather", "arguments": PARIS}}]})
+    );
+    assert_eq!(chunks[1]["choices"][0]["finish_reason"], Value::Null);
+    assert_eq!(chunks[2]["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(chunks[3], "[DONE]");
+
+    // response_format other than text with tool_choice other than none: 400 unsupported_parameter.
+    let mut conflicting = tool_request.clone();
+    conflicting["response_format"] = json!({"type": "json_object"});
+    let (s, _, body) = post(&app, "/v1/chat/completions", conflicting).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(json_body(&body)["error"]["code"], "unsupported_parameter");
+
+    // A server-side timeout mid-stream: error event (504 type timeout) followed by [DONE] (C-3);
+    // the same event on a non-streaming request is a plain 504.
+    let timed_out = vec![
+        GenerationEvent::Started { choice: 0 },
+        token_at(0, "Hel", 17),
+        GenerationEvent::Error {
+            code: ErrorCode::RequestTimeout,
+            message: "request exceeded server.request_timeout".to_string(),
+        },
+    ];
+    let app = served_app(Arc::new(ServedScript::new(timed_out)));
+    let (s, _, body) = post(
+        &app,
+        "/v1/chat/completions",
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": true}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let chunks = sse_data(&body);
+    assert_eq!(chunks.len(), 4, "{body}");
+    assert_eq!(chunks[2]["error"]["code"], "request_timeout");
+    assert_eq!(chunks[2]["error"]["type"], "timeout");
+    assert_eq!(chunks[3], "[DONE]");
+    let (s, _, body) = post(
+        &app,
+        "/v1/completions",
+        json!({"model": "m", "prompt": "hi"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(json_body(&body)["error"]["code"], "request_timeout");
+}
+
+#[test]
+fn phase2_request_fields() {
+    // Every Phase 2 field is accepted at a non-default value.
+    accepts(
+        &completion(json!({
+            "n": 3, "presence_penalty": 1.5, "frequency_penalty": -2, "repetition_penalty": 1.2,
+            "logit_bias": {"5": 100, "9": -100}, "min_tokens": 2, "max_tokens": 8,
+            "stop_token_ids": [7, 8], "priority": -5, "echo": true, "user": "alice",
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "answer", "schema": {"type": "object"}, "strict": true}}
+        })),
+        Endpoint::Completions,
+    );
+    let tool_chat = chat(json!({
+        "messages": [
+            {"role": "user", "content": "Weather in Paris?"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": CALL_ID, "type": "function",
+                "function": {"name": "get_weather", "arguments": PARIS}}]},
+            {"role": "tool", "tool_call_id": CALL_ID, "content": "{\"temperature\": 21}"}
+        ],
+        "tools": weather_tools(),
+        "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+        "parallel_tool_calls": false
+    }));
+    accepts(&tool_chat, Endpoint::ChatCompletions);
+    accepts(
+        &chat(
+            json!({"response_format": {"type": "json_object"}, "tools": weather_tools(),
+                     "tool_choice": "none"}),
+        ),
+        Endpoint::ChatCompletions,
+    );
+
+    // Helpers for the engine.
+    assert_eq!(
+        completion(json!({"logit_bias": {"9": -1.5, "5": 2}})).logit_bias(),
+        vec![(5, 2.0), (9, -1.5)]
+    );
+    assert_eq!(
+        tool_chat.tool_choice_mode(),
+        ToolChoiceMode::Named("get_weather".to_string())
+    );
+    assert!(!tool_chat.parallel_tool_calls_enabled());
+    assert_eq!(
+        tool_chat.tools_json(),
+        weather_tools().as_array().cloned().expect("tools array")
+    );
+    assert_eq!(
+        tool_chat.messages_json(),
+        vec![
+            json!({"role": "user", "content": "Weather in Paris?"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{"id": CALL_ID,
+                "type": "function", "function": {"name": "get_weather",
+                "arguments": {"location": "Paris"}}}]}),
+            json!({"role": "tool", "content": "{\"temperature\": 21}", "tool_call_id": CALL_ID}),
+        ]
+    );
+    let auto = chat(json!({"tools": weather_tools()}));
+    assert_eq!(auto.tool_choice_mode(), ToolChoiceMode::Auto);
+    assert!(auto.parallel_tool_calls_enabled());
+    assert_eq!(chat(json!({})).tool_choice_mode(), ToolChoiceMode::None);
+    assert_eq!(
+        chat(json!({"tools": weather_tools(), "tool_choice": "required"})).tool_choice_mode(),
+        ToolChoiceMode::Required
+    );
+    assert_eq!(
+        completion(json!({"response_format": {"type": "json_object"}})).response_format,
+        Some(ResponseFormat::JsonObject)
+    );
+
+    // Out of range or malformed: 400 invalid_request naming the field.
+    let invalid = [
+        (
+            completion(json!({"presence_penalty": 2.5})),
+            Endpoint::Completions,
+            "presence_penalty",
+        ),
+        (
+            completion(json!({"frequency_penalty": -3})),
+            Endpoint::Completions,
+            "frequency_penalty",
+        ),
+        (
+            completion(json!({"repetition_penalty": 0})),
+            Endpoint::Completions,
+            "repetition_penalty",
+        ),
+        (
+            completion(json!({"logit_bias": {"5": 101}})),
+            Endpoint::Completions,
+            "logit_bias",
+        ),
+        (
+            completion(json!({"logit_bias": {"x": 1}})),
+            Endpoint::Completions,
+            "logit_bias",
+        ),
+        (
+            completion(json!({"min_tokens": 9, "max_tokens": 8})),
+            Endpoint::Completions,
+            "min_tokens",
+        ),
+        (
+            completion(json!({"response_format": {"type": "json_schema",
+                                                  "json_schema": {"name": "a"}}})),
+            Endpoint::Completions,
+            "schema",
+        ),
+        (
+            chat(json!({"tools": weather_tools(), "tool_choice": "sometimes"})),
+            Endpoint::ChatCompletions,
+            "tool_choice",
+        ),
+        (
+            chat(json!({"tool_choice": "required"})),
+            Endpoint::ChatCompletions,
+            "tool_choice",
+        ),
+        (
+            chat(json!({"tools": [{"type": "function", "function": {"name": ""}}]})),
+            Endpoint::ChatCompletions,
+            "tools[0].function.name",
+        ),
+        (
+            chat(json!({"messages": [{"role": "tool", "content": "42"}]})),
+            Endpoint::ChatCompletions,
+            "tool_call_id",
+        ),
+        (
+            chat(json!({"messages": [{"role": "user", "content": "x", "tool_call_id": "c"}]})),
+            Endpoint::ChatCompletions,
+            "tool_call_id",
+        ),
+        (
+            chat(
+                json!({"messages": [{"role": "user", "content": "x", "tool_calls": [
+                {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}]}),
+            ),
+            Endpoint::ChatCompletions,
+            "tool_calls",
+        ),
+    ];
+    for (req, endpoint, field) in invalid {
+        let e = rejected(&req, endpoint);
+        assert_eq!(e.status.as_u16(), 400, "{field}: {}", e.message);
+        assert_eq!(e.code, ErrorCode::InvalidRequest, "{field}: {}", e.message);
+        assert!(e.message.contains(field), "{:?} lacks {field}", e.message);
+    }
+
+    // Not supported on this endpoint or in combination: 400 unsupported_parameter.
+    let unsupported = [
+        (
+            completion(json!({"tools": weather_tools()})),
+            Endpoint::Completions,
+            "tools",
+        ),
+        (
+            chat(json!({"echo": true})),
+            Endpoint::ChatCompletions,
+            "echo",
+        ),
+        (
+            chat(json!({"response_format": {"type": "json_object"}, "tools": weather_tools()})),
+            Endpoint::ChatCompletions,
+            "response_format",
+        ),
+        (
+            chat(json!({"tools": [{"type": "retrieval", "function": {"name": "f"}}]})),
+            Endpoint::ChatCompletions,
+            "tools[0].type",
+        ),
+        (
+            chat(json!({"best_of": 2})),
+            Endpoint::ChatCompletions,
+            "best_of",
+        ),
+    ];
+    for (req, endpoint, field) in unsupported {
+        let e = rejected(&req, endpoint);
+        assert_eq!(
+            e.code,
+            ErrorCode::UnsupportedParameter,
+            "{field}: {}",
+            e.message
+        );
+        assert!(e.message.contains(field), "{:?} lacks {field}", e.message);
+    }
+
+    // A named function that is not in `tools`: 400 unknown_tool naming it.
+    let e = rejected(
+        &chat(json!({"tools": weather_tools(),
+                     "tool_choice": {"type": "function", "function": {"name": "get_time"}}})),
+        Endpoint::ChatCompletions,
+    );
+    assert_eq!((e.status.as_u16(), e.code), (400, ErrorCode::UnknownTool));
+    assert!(e.message.contains("get_time"), "{}", e.message);
+}
+
+#[test]
+fn phase2_error_constructors() {
+    let cases = [
+        (
+            ApiError::queue_full(),
+            429,
+            ErrorType::RateLimitError,
+            ErrorCode::QueueFull,
+            Some(1),
+        ),
+        (
+            ApiError::queue_timeout(),
+            503,
+            ErrorType::ServiceUnavailable,
+            ErrorCode::QueueTimeout,
+            None,
+        ),
+        (
+            ApiError::context_exceeds_kv_capacity("needs 90 blocks, pool has 64"),
+            400,
+            ErrorType::InvalidRequestError,
+            ErrorCode::ContextExceedsKvCapacity,
+            None,
+        ),
+        (
+            ApiError::invalid_json_schema("unsupported keyword: patternProperties"),
+            400,
+            ErrorType::InvalidRequestError,
+            ErrorCode::InvalidJsonSchema,
+            None,
+        ),
+        (
+            ApiError::tools_not_supported("tiny-llama"),
+            400,
+            ErrorType::InvalidRequestError,
+            ErrorCode::ToolsNotSupported,
+            None,
+        ),
+        (
+            ApiError::unknown_tool("get_time"),
+            400,
+            ErrorType::InvalidRequestError,
+            ErrorCode::UnknownTool,
+            None,
+        ),
+        (
+            ApiError::shutting_down(),
+            503,
+            ErrorType::ServiceUnavailable,
+            ErrorCode::ShuttingDown,
+            None,
+        ),
+        (
+            ApiError::request_timeout(),
+            504,
+            ErrorType::Timeout,
+            ErrorCode::RequestTimeout,
+            None,
+        ),
+    ];
+    for (e, status, kind, code, retry_after) in cases {
+        assert_eq!(e.status.as_u16(), status, "{e:?}");
+        assert_eq!(e.kind, kind, "{e:?}");
+        assert_eq!(e.code, code, "{e:?}");
+        assert_eq!(e.retry_after, retry_after, "{e:?}");
+        // Engine-reported codes map to the same status, type and retry-after.
+        let from = ApiError::from_code(code, "x");
+        assert_eq!(
+            (from.status, from.kind, from.retry_after),
+            (e.status, e.kind, e.retry_after),
+            "{code:?}"
+        );
+    }
+    assert!(
+        ApiError::tools_not_supported("tiny-llama")
+            .message
+            .contains("tiny-llama")
+    );
+    let slow = ApiError::from_code(ErrorCode::SlowClient, "client too slow");
+    assert_eq!(slow.kind, ErrorType::ServerError);
+    assert_eq!(NotReadyReason::ShuttingDown.as_str(), "shutting_down");
 }
