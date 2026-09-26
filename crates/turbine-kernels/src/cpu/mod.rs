@@ -1443,6 +1443,30 @@ mod tests {
             })
             .expect_err("mismatched host offsets");
         assert!(matches!(err, KernelError::InvalidArgument { .. }), "{err}");
+
+        // The reference reads the offsets from `expert_offsets` itself: it never needs the host
+        // copy, and an empty one gives the same result as the full one.
+        for rows in [0, 8, 512, 513, 1 << 20] {
+            assert!(!moe.needs_host_offsets(&cfg, rows), "{rows} routed rows");
+        }
+        assert_eq!(cfg.routed_rows(3), 3 * top_k);
+        let with_host = load(&out.view()).expect("out");
+        let again = tensor(&mem, &[2, h], DType::F32, &[10.0; 6]);
+        moe.experts(&mut MoeExpertsContext {
+            cfg,
+            x: x.view(),
+            w_gate: w_gate.view(),
+            w_up: w_up.view(),
+            w_down: w_down.view(),
+            sorted_rows: sorted_rows.view(),
+            expert_offsets: expert_offsets.view(),
+            topk_weights: topk_weights.view(),
+            host_expert_offsets: &[],
+            out: again.view(),
+            workspace: None,
+        })
+        .expect("experts without host offsets");
+        assert_eq!(load(&again.view()).expect("out"), with_host);
     }
 
     /// The fused op leaves `residual` and `out` bitwise equal to `add` into the residual followed

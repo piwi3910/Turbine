@@ -402,6 +402,10 @@ pub(crate) struct ShimSymbols {
     pub copy_blocks: OpTrio<CopyBlocksDesc>,
     pub moe_route: OpTrio<MoeRouteDesc>,
     pub moe_experts: OpTrio<MoeExpertsDesc>,
+    /// Optional `turbine_moe_experts_needs_host_offsets` (same signature as `_supported`);
+    /// `None` when the library does not export it, and then `host_expert_offsets` is always
+    /// passed.
+    pub moe_experts_needs_host_offsets: Option<SupportedFn<MoeExpertsDesc>>,
     /// The optional v2.1 additions.
     pub v21: V21Symbols,
 }
@@ -479,6 +483,7 @@ impl ShimSymbols {
             copy_blocks: trio(lib, path, "copy_blocks")?,
             moe_route: trio(lib, path, "moe_route")?,
             moe_experts: trio(lib, path, "moe_experts")?,
+            moe_experts_needs_host_offsets: optional(lib, "turbine_moe_experts_needs_host_offsets"),
             v21: V21Symbols::resolve(lib),
         })
     }

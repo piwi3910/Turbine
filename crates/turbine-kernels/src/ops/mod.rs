@@ -328,6 +328,12 @@ impl MoeExpertsConfig {
     pub fn num_local_experts(&self) -> u32 {
         self.expert_end.saturating_sub(self.expert_begin)
     }
+
+    /// Routed rows (`tokens · top_k`) of a call over `tokens` tokens: the size a provider's
+    /// [`MoeKernel::needs_host_offsets`] answer depends on. Known on the host before routing.
+    pub fn routed_rows(&self, tokens: usize) -> usize {
+        tokens.saturating_mul(self.top_k as usize)
+    }
 }
 
 impl fmt::Display for MoeExpertsConfig {
@@ -459,7 +465,9 @@ pub struct MoeRouteContext<'a> {
 /// - `w_gate`/`w_up`: `[num_local_experts, inter, hidden]`; `w_down`:
 ///   `[num_local_experts, hidden, inter]`
 /// - `sorted_rows`, `expert_offsets`, `topk_weights`: the outputs of `moe_route`
-/// - `host_expert_offsets`: a host copy of `expert_offsets` (group sizes without a device read)
+/// - `host_expert_offsets`: a host copy of `expert_offsets` (group sizes without a device read);
+///   empty when the provider's [`MoeKernel::needs_host_offsets`] is false for this call, so the
+///   caller skips the device-to-host read
 /// - `workspace`: provider scratch (gathered rows, intermediates); `None` when the provider needs
 ///   none
 pub struct MoeExpertsContext<'a> {
@@ -638,6 +646,15 @@ pub trait MoeKernel: Send + Sync {
     fn implementation_experts(&self, cfg: &MoeExpertsConfig) -> String;
     fn route(&self, ctx: &mut MoeRouteContext<'_>) -> Result<(), KernelError>;
     fn experts(&self, ctx: &mut MoeExpertsContext<'_>) -> Result<(), KernelError>;
+
+    /// Whether `experts` needs `host_expert_offsets` for a call of `routed_rows` rows
+    /// ([`MoeExpertsConfig::routed_rows`]). When false the caller passes an empty slice and
+    /// reads nothing back from the device after routing. The answer depends only on host-known
+    /// sizes, never on routing results. Default true (the Phase 2 contract).
+    fn needs_host_offsets(&self, cfg: &MoeExpertsConfig, routed_rows: usize) -> bool {
+        let _ = (cfg, routed_rows);
+        true
+    }
 }
 
 /// Residual add fused with RMSNorm (ABI v2.1).

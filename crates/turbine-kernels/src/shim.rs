@@ -844,6 +844,11 @@ fn moe_route_probe(cfg: &MoeRouteConfig) -> MoeRouteDesc {
 }
 
 fn moe_experts_probe(cfg: &MoeExpertsConfig) -> MoeExpertsDesc {
+    moe_experts_probe_tokens(cfg, 1)
+}
+
+/// The probe of `moe_experts` for a call over `num_tokens` tokens.
+fn moe_experts_probe_tokens(cfg: &MoeExpertsConfig, num_tokens: i32) -> MoeExpertsDesc {
     MoeExpertsDesc {
         x: null(),
         w_gate: null(),
@@ -856,7 +861,7 @@ fn moe_experts_probe(cfg: &MoeExpertsConfig) -> MoeExpertsDesc {
         out: null(),
         workspace: null(),
         workspace_bytes: 0,
-        num_tokens: 1,
+        num_tokens,
         hidden: cfg.hidden as i32,
         inter: cfg.inter as i32,
         top_k: cfg.top_k as i32,
@@ -1342,13 +1347,18 @@ impl MoeKernel for ShimProvider {
             DType::I32,
         )?;
         dense("topk_weights", &ctx.topk_weights, &[tokens, k], DType::F32)?;
-        if ctx.host_expert_offsets.len() != experts + 1 {
-            return Err(invalid(format!(
-                "host_expert_offsets has {} entries, expected {}",
-                ctx.host_expert_offsets.len(),
-                experts + 1
-            )));
-        }
+        // Empty host offsets are passed as NULL: the caller asked `needs_host_offsets`, and the
+        // library rejects a NULL it needs.
+        let host_expert_offsets = match ctx.host_expert_offsets.len() {
+            0 => std::ptr::null(),
+            n if n == experts + 1 => ctx.host_expert_offsets.as_ptr(),
+            n => {
+                return Err(invalid(format!(
+                    "host_expert_offsets has {n} entries, expected {} (or none)",
+                    experts + 1
+                )));
+            }
+        };
         let (workspace, workspace_bytes) = match &ctx.workspace {
             Some(ws) => (self.ctx.slice_ptr("workspace", ws)?, ws.len()),
             None => (null(), 0),
@@ -1362,7 +1372,7 @@ impl MoeKernel for ShimProvider {
             expert_offsets: self.ctx.device_ptr("expert_offsets", &ctx.expert_offsets)?
                 as *const i32,
             topk_weights: self.ctx.device_ptr("topk_weights", &ctx.topk_weights)? as *const f32,
-            host_expert_offsets: ctx.host_expert_offsets.as_ptr(),
+            host_expert_offsets,
             out: self.ctx.device_ptr("out", &ctx.out)?,
             workspace,
             workspace_bytes,
@@ -1376,6 +1386,19 @@ impl MoeKernel for ShimProvider {
             dtype: cfg.dtype.abi_code(),
         };
         self.run(&self.syms().moe_experts, &d)
+    }
+
+    fn needs_host_offsets(&self, cfg: &MoeExpertsConfig, routed_rows: usize) -> bool {
+        let Some(needs) = self.syms().moe_experts_needs_host_offsets else {
+            return true;
+        };
+        let top_k = cfg.top_k.max(1) as usize;
+        let Ok(tokens) = i32::try_from(routed_rows.div_ceil(top_k)) else {
+            return true;
+        };
+        // SAFETY: the probe is a fully initialised descriptor with null pointers; the function
+        // reads only its shape fields and needs no context (header: like `_supported`).
+        unsafe { needs(&moe_experts_probe_tokens(cfg, tokens)) != 0 }
     }
 }
 
@@ -1872,6 +1895,11 @@ mod tests {
         };
         assert!(!moe.supports_experts(&experts));
         assert_eq!(moe.implementation_experts(&experts), "stub_moe_experts");
+        // The stub exports no `turbine_moe_experts_needs_host_offsets`: a library without it
+        // always gets the host offsets (the Phase 2 contract).
+        for rows in [8, 512, 4096] {
+            assert!(moe.needs_host_offsets(&experts, rows), "{rows} routed rows");
+        }
     }
 
     /// ABI v2.1 is optional. The plain (v2.0) stub loads with minor 0, its provider has no

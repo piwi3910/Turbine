@@ -16,9 +16,13 @@
 //! The loader uploads each expert's weights straight into its layer's stacked
 //! `[experts, inter, hidden]` (gate, up) and `[experts, hidden, inter]` (down) tensors
 //! ([`crate::loader::stacked_experts_name`]), the layout the `moe_experts` op takes, so loading
-//! needs no device-to-device copy. `moe_experts` needs the group sizes on the host, so every layer reads the
-//! `[experts + 1]` expert offsets back after routing (a small blocking copy); the batch's
-//! logits remain its only bulk device-to-host copy.
+//! needs no device-to-device copy. When the selected `moe_experts` provider needs the group
+//! sizes on the host for the batch's routed rows
+//! ([`turbine_kernels::MoeKernel::needs_host_offsets`], decided from the host-known row count),
+//! every layer reads the `[experts + 1]` expert offsets back after routing (a small blocking
+//! copy); otherwise (the HIP small-m path, up to 512 routed rows: every decode-only batch of up
+//! to 64 sequences) the forward makes no device-to-host copy until the logits, its only bulk
+//! device-to-host copy.
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -570,15 +574,22 @@ impl OlmoeExecutor {
                 sorted_rows: sorted_rows.clone(),
                 expert_offsets: b.expert_offsets.view(),
             })?;
-        // The group sizes `moe_experts` needs on the host (a blocking read of experts + 1 ints).
-        let host_offsets: Vec<i32> = b
-            .expert_offsets
-            .storage
-            .whole()
-            .read_bytes()?
-            .chunks_exact(I32)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let experts = experts_cfg(&self.cfg, &self.moe);
+        let kernel = self.registry.moe_experts(&experts);
+        // The group sizes on the host (a blocking read of experts + 1 ints), only when the
+        // provider needs them for this many routed rows.
+        let host_offsets: Vec<i32> = if kernel.needs_host_offsets(&experts, experts.routed_rows(t))
+        {
+            b.expert_offsets
+                .storage
+                .whole()
+                .read_bytes()?
+                .chunks_exact(I32)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // The accumulator starts at zero, as transformers' `final_hidden_states`: exactly
         // `0 + 0` in BF16 (no device-to-device copy under kernel ABI v2).
         self.registry
@@ -588,23 +599,20 @@ impl OlmoeExecutor {
                 b: Self::rows(&b.zeros, t),
                 out: Self::rows(&b.proj, t),
             })?;
-        let experts = experts_cfg(&self.cfg, &self.moe);
         let workspace_len = d.moe_workspace_bytes(t) as usize;
-        self.registry
-            .moe_experts(&experts)
-            .experts(&mut MoeExpertsContext {
-                cfg: experts,
-                x: Self::rows(&b.h, t),
-                w_gate: l.w_gate.view(),
-                w_up: l.w_up.view(),
-                w_down: l.w_down.view(),
-                sorted_rows,
-                expert_offsets: b.expert_offsets.view(),
-                topk_weights: Self::rows(&b.topk_weights, t),
-                host_expert_offsets: &host_offsets,
-                out: Self::rows(&b.proj, t),
-                workspace: Some(b.moe_workspace.slice(0, workspace_len)),
-            })?;
+        kernel.experts(&mut MoeExpertsContext {
+            cfg: experts,
+            x: Self::rows(&b.h, t),
+            w_gate: l.w_gate.view(),
+            w_up: l.w_up.view(),
+            w_down: l.w_down.view(),
+            sorted_rows,
+            expert_offsets: b.expert_offsets.view(),
+            topk_weights: Self::rows(&b.topk_weights, t),
+            host_expert_offsets: &host_offsets,
+            out: Self::rows(&b.proj, t),
+            workspace: Some(b.moe_workspace.slice(0, workspace_len)),
+        })?;
         self.residual_add(t)
     }
 

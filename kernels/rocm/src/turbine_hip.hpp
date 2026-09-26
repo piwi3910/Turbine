@@ -115,6 +115,17 @@ int32_t launch_moe_scatter(turbine_ctx *ctx, const void *down,
 // Largest num_experts / top_k the Turbine MoE kernels handle.
 constexpr int32_t kMoeMaxExperts = 256;
 constexpr int32_t kMoeMaxTopK = 32;
+// Most routed rows (num_tokens * top_k) moe_experts runs through the small-m
+// kernels (moe_small_m.hip), which read the group sizes on the device; above it
+// the per-expert hipBLASLt path needs host_expert_offsets.
+constexpr int64_t kMoeSmallMaxRows = 512;
+// The small-m path over d's rows: fills pos ([num_tokens * top_k]), act
+// ([num_tokens * top_k, inter] BF16) and down ([num_tokens * top_k, hidden]
+// BF16), rows indexed by their position in sorted_rows; the caller then
+// scatters down into out (launch_moe_scatter). Operands 16-byte aligned,
+// hidden and inter multiples of 8.
+int32_t launch_moe_small_m(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
+                           int32_t *pos, void *act, void *down);
 
 // Asks hipBLASLt for a grouped BF16 GEMM solution on ctx's device (moe.cpp);
 // false when there is none (ROCm 7.14.1 on gfx1201) or the query fails.

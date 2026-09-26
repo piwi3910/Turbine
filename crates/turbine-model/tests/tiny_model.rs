@@ -2,15 +2,22 @@
 //! `cpu-reference` provider against an independent naive implementation (Llama and OLMoE),
 //! chunked prefill and batched paged decoding against unchunked single-sequence runs, and (lab
 //! only) the HIP provider against the CPU provider.
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use half::bf16;
 use turbine_core::types::{BlockId, DeviceId, ExecutionBackend, KvLayout, SeqId, Vendor};
 use turbine_kernels::{
-    KernelError, KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider,
-    shim_provider,
+    ActivationConfig, ActivationContext, ActivationKernel, AttentionConfig, AttentionContext,
+    AttentionKernel, ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig,
+    EmbeddingContext, EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, KernelError,
+    KernelMetrics, KernelProvider, KernelRegistry, KvCopyConfig, KvCopyContext, KvCopyKernel,
+    MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
+    NormContext, NormKernel, PagedAttentionContext, ProviderId, RopeConfig, RopeContext,
+    RopeKernel, cpu_reference_provider, shim_provider,
 };
 use turbine_model::config::{Architecture, ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
@@ -1098,6 +1105,379 @@ fn executors_run_without_device_to_device_copies() {
         }
         assert_eq!(rows[0], rows[1], "{arch:?}: logits differ without copy_d2d");
     }
+}
+
+thread_local! {
+    /// Set while a [`DeviceOffsetsProvider`] kernel runs: the CPU reference ops read their
+    /// operands through the same memory, and those reads are not the executor's copies.
+    static IN_KERNEL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f` as kernel work: device-to-host copies it makes are not counted.
+fn in_kernel<R>(f: impl FnOnce() -> R) -> R {
+    IN_KERNEL.set(true);
+    let r = f();
+    IN_KERNEL.set(false);
+    r
+}
+
+/// Host memory that counts the device-to-host copies made outside kernels (the executor's own
+/// blocking reads).
+struct CountingMemory {
+    inner: Arc<HostMemory>,
+    d2h: AtomicUsize,
+}
+
+impl CountingMemory {
+    fn d2h_copies(&self) -> usize {
+        self.d2h.load(Ordering::SeqCst)
+    }
+}
+
+impl DeviceMemory for CountingMemory {
+    fn device(&self) -> DeviceId {
+        self.inner.device()
+    }
+    fn alloc(&self, bytes: usize) -> Result<DevicePtr, MemoryError> {
+        self.inner.alloc(bytes)
+    }
+    fn free(&self, ptr: DevicePtr) {
+        self.inner.free(ptr)
+    }
+    fn copy_h2d(&self, dst: DevicePtr, src: &[u8]) -> Result<(), MemoryError> {
+        self.inner.copy_h2d(dst, src)
+    }
+    fn copy_d2h(&self, dst: &mut [u8], src: DevicePtr) -> Result<(), MemoryError> {
+        if !IN_KERNEL.get() {
+            self.d2h.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.copy_d2h(dst, src)
+    }
+    fn copy_d2d(&self, dst: DevicePtr, src: DevicePtr, bytes: usize) -> Result<(), MemoryError> {
+        self.inner.copy_d2d(dst, src, bytes)
+    }
+    fn synchronize(&self) -> Result<(), MemoryError> {
+        self.inner.synchronize()
+    }
+    fn mem_info(&self) -> Result<MemInfo, MemoryError> {
+        self.inner.mem_info()
+    }
+    fn compute_stream(&self) -> StreamRef {
+        self.inner.compute_stream()
+    }
+    fn as_host(&self) -> Option<&HostMemory> {
+        Some(&self.inner)
+    }
+}
+
+/// A family wrapper of [`DeviceOffsetsProvider`]: delegates to the inner provider's family,
+/// running `execute` as kernel work.
+macro_rules! kernel_family {
+    ($name:ident, $family:ident, $kernel:ident, $cfg:ty, $ctx:ident) => {
+        struct $name(Arc<dyn KernelProvider>);
+
+        impl $name {
+            fn inner(&self) -> &dyn $kernel {
+                self.0.$family().expect(stringify!($family))
+            }
+        }
+
+        impl $kernel for $name {
+            fn supports(&self, cfg: &$cfg) -> bool {
+                self.inner().supports(cfg)
+            }
+            fn implementation(&self, cfg: &$cfg) -> String {
+                self.inner().implementation(cfg)
+            }
+            fn execute(&self, ctx: &mut $ctx<'_>) -> Result<(), KernelError> {
+                in_kernel(|| self.inner().execute(ctx))
+            }
+        }
+    };
+}
+
+kernel_family!(Gemm, gemm, GemmKernel, GemmConfig, GemmContext);
+kernel_family!(Norm, norm, NormKernel, NormConfig, NormContext);
+kernel_family!(Rope, rope, RopeKernel, RopeConfig, RopeContext);
+kernel_family!(
+    Activation,
+    activation,
+    ActivationKernel,
+    ActivationConfig,
+    ActivationContext
+);
+kernel_family!(
+    Embedding,
+    embedding,
+    EmbeddingKernel,
+    EmbeddingConfig,
+    EmbeddingContext
+);
+kernel_family!(
+    Elementwise,
+    elementwise,
+    ElementwiseKernel,
+    ElementwiseConfig,
+    ElementwiseContext
+);
+kernel_family!(KvCopy, kv_copy, KvCopyKernel, KvCopyConfig, KvCopyContext);
+
+struct Attention(Arc<dyn KernelProvider>);
+
+impl Attention {
+    fn inner(&self) -> &dyn AttentionKernel {
+        self.0.attention().expect("attention")
+    }
+}
+
+impl AttentionKernel for Attention {
+    fn supports(&self, cfg: &AttentionConfig) -> bool {
+        self.inner().supports(cfg)
+    }
+    fn implementation(&self, cfg: &AttentionConfig) -> String {
+        self.inner().implementation(cfg)
+    }
+    fn execute(&self, ctx: &mut AttentionContext<'_>) -> Result<(), KernelError> {
+        in_kernel(|| self.inner().execute(ctx))
+    }
+    fn execute_paged(&self, ctx: &mut PagedAttentionContext<'_>) -> Result<(), KernelError> {
+        in_kernel(|| self.inner().execute_paged(ctx))
+    }
+}
+
+/// Routed rows up to which [`DeviceOffsetsProvider`] reads the expert offsets on the device,
+/// like the HIP small-m path.
+const DEVICE_OFFSETS_MAX_ROWS: usize = 512;
+
+/// The CPU provider, except that `moe_experts` needs the host offsets above `max_rows` routed
+/// rows only ([`DEVICE_OFFSETS_MAX_ROWS`] is the HIP small-m contract; 0 is the Phase 2
+/// contract, always). It checks that the executor passes the host offsets exactly when they are
+/// needed, and runs every op as kernel work for [`CountingMemory`].
+struct DeviceOffsetsProvider {
+    inner: Arc<dyn KernelProvider>,
+    max_rows: usize,
+    gemm: Gemm,
+    attention: Attention,
+    norm: Norm,
+    rope: Rope,
+    activation: Activation,
+    embedding: Embedding,
+    elementwise: Elementwise,
+    kv_copy: KvCopy,
+}
+
+impl DeviceOffsetsProvider {
+    fn new(inner: Arc<dyn KernelProvider>, max_rows: usize) -> DeviceOffsetsProvider {
+        DeviceOffsetsProvider {
+            max_rows,
+            gemm: Gemm(Arc::clone(&inner)),
+            attention: Attention(Arc::clone(&inner)),
+            norm: Norm(Arc::clone(&inner)),
+            rope: Rope(Arc::clone(&inner)),
+            activation: Activation(Arc::clone(&inner)),
+            embedding: Embedding(Arc::clone(&inner)),
+            elementwise: Elementwise(Arc::clone(&inner)),
+            kv_copy: KvCopy(Arc::clone(&inner)),
+            inner,
+        }
+    }
+
+    fn inner(&self) -> &dyn MoeKernel {
+        self.inner.moe().expect("moe")
+    }
+}
+
+impl MoeKernel for DeviceOffsetsProvider {
+    fn supports_route(&self, cfg: &MoeRouteConfig) -> bool {
+        self.inner().supports_route(cfg)
+    }
+    fn supports_experts(&self, cfg: &MoeExpertsConfig) -> bool {
+        self.inner().supports_experts(cfg)
+    }
+    fn implementation_route(&self, cfg: &MoeRouteConfig) -> String {
+        self.inner().implementation_route(cfg)
+    }
+    fn implementation_experts(&self, cfg: &MoeExpertsConfig) -> String {
+        self.inner().implementation_experts(cfg)
+    }
+    fn route(&self, ctx: &mut MoeRouteContext<'_>) -> Result<(), KernelError> {
+        in_kernel(|| self.inner().route(ctx))
+    }
+    fn experts(&self, ctx: &mut MoeExpertsContext<'_>) -> Result<(), KernelError> {
+        let rows = ctx.cfg.routed_rows(ctx.x.shape[0]);
+        assert_eq!(
+            ctx.host_expert_offsets.is_empty(),
+            !self.needs_host_offsets(&ctx.cfg, rows),
+            "host offsets passed although not needed, or missing although needed ({rows} rows)"
+        );
+        in_kernel(|| self.inner().experts(ctx))
+    }
+    fn needs_host_offsets(&self, _cfg: &MoeExpertsConfig, routed_rows: usize) -> bool {
+        routed_rows > self.max_rows
+    }
+}
+
+impl KernelProvider for DeviceOffsetsProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId("cpu-device-offsets")
+    }
+    fn gemm(&self) -> Option<&dyn GemmKernel> {
+        Some(&self.gemm)
+    }
+    fn attention(&self) -> Option<&dyn AttentionKernel> {
+        Some(&self.attention)
+    }
+    fn norm(&self) -> Option<&dyn NormKernel> {
+        Some(&self.norm)
+    }
+    fn rope(&self) -> Option<&dyn RopeKernel> {
+        Some(&self.rope)
+    }
+    fn activation(&self) -> Option<&dyn ActivationKernel> {
+        Some(&self.activation)
+    }
+    fn embedding(&self) -> Option<&dyn EmbeddingKernel> {
+        Some(&self.embedding)
+    }
+    fn elementwise(&self) -> Option<&dyn ElementwiseKernel> {
+        Some(&self.elementwise)
+    }
+    fn kv_copy(&self) -> Option<&dyn KvCopyKernel> {
+        Some(&self.kv_copy)
+    }
+    fn moe(&self) -> Option<&dyn MoeKernel> {
+        Some(self)
+    }
+}
+
+/// One sequence's part of a test batch: its index, its new tokens and the position of the
+/// first of them.
+type Part = (usize, Vec<u32>, u32);
+
+/// P2c S-11: with a provider whose `moe_experts` reads the expert offsets on the device for up
+/// to 512 routed rows, an OLMoE decode-only forward of 8 sequences makes exactly one
+/// device-to-host copy (the logits), while a mixed forward of more than 512 routed rows reads
+/// the offsets back once per layer, plus the logits. A provider that always needs them (the
+/// Phase 2 contract) reads them in every forward; the logits of both are equal bit for bit.
+#[test]
+fn olmoe_decode_single_device_copy() {
+    const SEQS: usize = 8;
+    const PROMPT: u32 = 4;
+    const LONG: u32 = 296;
+    const MAX_TOKENS: u32 = 512;
+    let tmp = TempDir::new("tiny-model-olmoe-d2h");
+    let spec = write_tiny_olmoe(tmp.path(), SEED);
+    let cfg = &spec.config;
+    let top_k = cfg.moe.expect("tiny OLMoE has experts").experts_per_token as usize;
+    let layers = cfg.num_layers as usize;
+    let v = spec.vocab;
+
+    let prompt_of = |s: usize| -> Vec<u32> {
+        (0..PROMPT)
+            .map(|i| (i * 13 + s as u32 * 7 + 1) % v)
+            .collect()
+    };
+    let prefill: Vec<Part> = (0..SEQS).map(|s| (s, prompt_of(s), 0)).collect();
+    let decode: Vec<Part> = (0..SEQS)
+        .map(|s| (s, vec![(s as u32 * 5 + 2) % v], PROMPT))
+        .collect();
+    let long: Vec<u32> = (0..LONG).map(|i| (i * 31 + 3) % v).collect();
+    let mut mixed: Vec<Part> = vec![(SEQS, long, 0)];
+    mixed.extend((0..4).map(|s| (s, vec![(s as u32 * 3 + 5) % v], PROMPT + 1)));
+    let mixed_tokens: usize = mixed.iter().map(|(_, t, _)| t.len()).sum();
+    assert!(mixed_tokens * top_k > DEVICE_OFFSETS_MAX_ROWS);
+    assert!(SEQS * PROMPT as usize * top_k <= DEVICE_OFFSETS_MAX_ROWS);
+
+    let mut all_logits: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut counts: Vec<[usize; 3]> = Vec::new();
+    for max_rows in [DEVICE_OFFSETS_MAX_ROWS, 0] {
+        let counting = Arc::new(CountingMemory {
+            inner: HostMemory::new(DeviceId(0), 1 << 30),
+            d2h: AtomicUsize::new(0),
+        });
+        let mem: Arc<dyn DeviceMemory> = counting.clone();
+        let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+        let weights =
+            WeightLoader::load(&index, &olmoe_slots(cfg), &mem, MAX_STAGING_BYTES).expect("load");
+        let provider: Arc<dyn KernelProvider> = Arc::new(DeviceOffsetsProvider::new(
+            cpu_reference_provider(),
+            max_rows,
+        ));
+        let order = [provider.id()];
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        let registry = KernelRegistry::build(
+            vec![provider],
+            &order,
+            &executor::requirements(cfg, BLOCK_TOKENS),
+            &metrics,
+        )
+        .expect("every op has a provider");
+        let mut exec = build_executor(
+            cfg,
+            weights,
+            Arc::new(registry),
+            Arc::clone(&mem),
+            BLOCK_TOKENS,
+            MAX_TOKENS,
+            SEQS as u32,
+        )
+        .expect("executor");
+
+        // Sequences 0..8 hold PROMPT tokens and then decode; sequence 8 is the long prompt.
+        let per_seq = (LONG + 1).div_ceil(BLOCK_TOKENS);
+        let blocks = per_seq * (SEQS as u32 + 1);
+        let storage = pool(&mem, exec.kv_layout(), blocks);
+        let kv = pool_view(&storage, exec.kv_layout(), blocks);
+        let tables: Vec<Vec<BlockId>> = (0..=SEQS as u32)
+            .map(|s| (s * per_seq..(s + 1) * per_seq).map(BlockId).collect())
+            .collect();
+        let mut seen = Vec::new();
+        let mut step = |parts: &[Part]| -> usize {
+            let before = counting.d2h_copies();
+            let mut tokens = Vec::new();
+            let mut positions = Vec::new();
+            let mut seqs = Vec::new();
+            for (s, toks, start) in parts {
+                seqs.push(SeqSlice {
+                    seq: SeqId(*s as u64 + 1),
+                    q_start: tokens.len() as u32,
+                    q_len: toks.len() as u32,
+                    kv_len: start + toks.len() as u32,
+                    block_table: &tables[*s],
+                });
+                tokens.extend_from_slice(toks);
+                positions.extend(*start..start + toks.len() as u32);
+            }
+            let logits = exec
+                .forward(&BatchInput {
+                    tokens: &tokens,
+                    positions: &positions,
+                    seqs: &seqs,
+                    kv: &kv,
+                })
+                .expect("forward");
+            assert_eq!(logits.rows, parts.len());
+            seen.extend((0..logits.rows).map(|r| logits.row(r).to_vec()));
+            counting.d2h_copies() - before
+        };
+        let copies = [step(&prefill), step(&decode), step(&mixed)];
+        counts.push(copies);
+        all_logits.push(seen);
+    }
+    assert_eq!(
+        counts[0],
+        [1, 1, layers + 1],
+        "device offsets: copies of the prefill, decode and mixed forwards"
+    );
+    assert_eq!(
+        counts[1],
+        [layers + 1; 3],
+        "host offsets: copies of the prefill, decode and mixed forwards"
+    );
+    assert_eq!(
+        all_logits[0], all_logits[1],
+        "skipping the host offsets changes no logit"
+    );
 }
 
 /// For both tiny checkpoints, a 300-token prompt prefilled in chunks of 64 (each chunk

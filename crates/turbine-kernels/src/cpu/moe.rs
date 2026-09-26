@@ -163,6 +163,11 @@ impl MoeKernel for CpuReference {
         store_i32(&ctx.expert_offsets, &offsets)
     }
 
+    /// The reference reads the group sizes from `expert_offsets` itself.
+    fn needs_host_offsets(&self, _cfg: &MoeExpertsConfig, _routed_rows: usize) -> bool {
+        false
+    }
+
     fn experts(&self, ctx: &mut MoeExpertsContext<'_>) -> Result<(), KernelError> {
         let cfg = ctx.cfg;
         if !self.supports_experts(&cfg) {
@@ -192,7 +197,9 @@ impl MoeKernel for CpuReference {
 
         let offsets = load_i32(&ctx.expert_offsets)?;
         check_offsets(&offsets, tokens * k)?;
-        if ctx.host_expert_offsets != offsets.as_slice() {
+        // The host copy is optional here (`needs_host_offsets` is false); one that is passed
+        // must agree with the device offsets.
+        if !ctx.host_expert_offsets.is_empty() && ctx.host_expert_offsets != offsets.as_slice() {
             return Err(invalid(format!(
                 "host_expert_offsets {:?} differ from expert_offsets {offsets:?}",
                 ctx.host_expert_offsets

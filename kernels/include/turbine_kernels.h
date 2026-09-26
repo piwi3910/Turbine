@@ -357,6 +357,15 @@ int32_t turbine_moe_experts(turbine_ctx *ctx,
 int32_t turbine_moe_experts_supported(const turbine_moe_experts_desc *d);
 const char *turbine_moe_experts_impl(const turbine_moe_experts_desc *d);
 
+/* Optional (a library may omit the symbol; the caller then always passes
+ * host_expert_offsets): 1 when turbine_moe_experts reads host_expert_offsets
+ * for a descriptor of this shape and num_tokens, 0 when it reads the group
+ * sizes on the device only and host_expert_offsets may be NULL, so the caller
+ * needs no device-to-host copy after turbine_moe_route. Like _supported it
+ * ignores pointer fields and needs no context. */
+int32_t
+turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
+
 /* ======== v2.1 (additive, optional): minor version, context options, fused
  * ops, graphs ========
  * Every symbol below is optional: turbine-kernels resolves them only when
