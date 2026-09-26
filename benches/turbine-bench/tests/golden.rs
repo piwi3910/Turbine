@@ -583,3 +583,166 @@ async fn compare_concurrency_bounded() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Two prompts captured from the `Base` mock under `<dir>/mock/reference.jsonl`, judged by
+/// `tolerance` (written as `<dir>/mock/tolerance.json`).
+async fn captured_fixture(name: &str, tolerance: &str) -> (PathBuf, PathBuf) {
+    let dir = temp_dir(name);
+    std::fs::write(
+        dir.join("prompts.jsonl"),
+        concat!(
+            r#"{"id":"p01","kind":"completion","prompt":"alpha","max_tokens":10}"#,
+            "\n",
+            r#"{"id":"p02","kind":"completion","prompt":"beta","max_tokens":10}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("mock/tolerance.json"), tolerance).unwrap();
+    let reference = dir.join("mock/reference.jsonl");
+    let addr = mock_server(Variant::Base).await;
+    let run = golden(strings(&[
+        "capture",
+        "--url",
+        &format!("http://{addr}"),
+        "--prompts",
+        dir.join("prompts.jsonl").to_str().unwrap(),
+        "--out",
+        reference.to_str().unwrap(),
+        "--model",
+        "mock-model",
+    ]))
+    .await;
+    assert_eq!(run.code, Some(0), "capture failed: {}", run.stderr);
+    (dir, reference)
+}
+
+/// Compare `variant` against `reference` at `concurrency`: exit code, JSON report, text report.
+async fn compare_at(
+    variant: Variant,
+    reference: &Path,
+    concurrency: u32,
+) -> (Option<i32>, Value, String) {
+    let addr = mock_server(variant).await;
+    let mut args = compare_args(addr, reference, "json");
+    args.extend(strings(&["--concurrency", &concurrency.to_string()]));
+    let run = golden(args).await;
+    let report: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("report is not JSON ({e}): {}\n{}", run.stdout, run.stderr));
+    let mut args = compare_args(addr, reference, "text");
+    args.extend(strings(&["--concurrency", &concurrency.to_string()]));
+    let text = golden(args).await;
+    assert_eq!(text.code, run.code, "{}\n{}", text.stdout, text.stderr);
+    (run.code, report, text.stdout)
+}
+
+fn assert_close(v: &Value, expected: f64, report: &Value) {
+    let got = v
+        .as_f64()
+        .unwrap_or_else(|| panic!("{v} is not a number in {report}"));
+    assert!(
+        (got - expected).abs() < 1e-6,
+        "{got} != {expected}: {report}"
+    );
+}
+
+/// A likely logprob shifted by 0.2 nats (strict bound 0.15, batched bound 0.25) with every
+/// token identical: violated at `--concurrency 1`, holds at `--concurrency 2`, and the report
+/// says which bounds applied. Breaks if the batched bounds apply at concurrency 1, are ignored
+/// above it, relax the token rule, or are not reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_batched_bounds_apply_only_above_concurrency_1() {
+    let (dir, reference) = captured_fixture(
+        "batched",
+        r#"{"min_identical_prefix":8,"min_prompts_passing":2,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5,"max_abs_logprob_diff_likely_batched":0.25,"max_abs_logprob_diff_tail_batched":0.75}"#,
+    )
+    .await;
+
+    let (code, report, text) = compare_at(Variant::ShiftP01, &reference, 1).await;
+    assert_eq!(code, Some(1), "{report}");
+    assert_eq!(report["concurrency"], 1, "{report}");
+    assert_eq!(report["logprob_bounds"]["batched"], false, "{report}");
+    assert_close(
+        &report["logprob_bounds"]["max_abs_logprob_diff_likely"],
+        0.15,
+        &report,
+    );
+    assert_eq!(prompt_report(&report, "p01")["passed"], false, "{report}");
+    assert!(text.contains("strict bounds (concurrency 1)"), "{text}");
+    // The tolerance file is echoed as read, batched keys included.
+    assert_close(
+        &report["tolerance"]["max_abs_logprob_diff_likely_batched"],
+        0.25,
+        &report,
+    );
+
+    let (code, report, text) = compare_at(Variant::ShiftP01, &reference, 2).await;
+    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(report["passed"], true, "{report}");
+    assert_eq!(report["concurrency"], 2, "{report}");
+    assert_eq!(report["logprob_bounds"]["batched"], true, "{report}");
+    assert_close(
+        &report["logprob_bounds"]["max_abs_logprob_diff_likely"],
+        0.25,
+        &report,
+    );
+    assert_close(
+        &report["logprob_bounds"]["max_abs_logprob_diff_tail"],
+        0.75,
+        &report,
+    );
+    let p = prompt_report(&report, "p01");
+    assert_eq!(p["logprob_within_bound"], true, "{p}");
+    assert_eq!(p["passed"], true, "{p}");
+    assert!(
+        text.contains("batched bounds (concurrency 2)") && text.contains("≤ 0.25"),
+        "{text}"
+    );
+
+    // The token rule is unchanged under the batched bounds: a flip where the reference margin
+    // is 2 nats still fails.
+    let (code, report, _) = compare_at(Variant::FlipP01, &reference, 2).await;
+    assert_eq!(code, Some(1), "{report}");
+    assert_eq!(prompt_report(&report, "p01")["passed"], false, "{report}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A tolerance.json without the batched keys judges a concurrent run by the strict bounds.
+/// Breaks if a missing batched key is read as 0 or as unbounded, or if the file is rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn compare_without_batched_keys_falls_back_to_strict_bounds() {
+    let (dir, reference) = captured_fixture(
+        "batched-fallback",
+        r#"{"min_identical_prefix":8,"min_prompts_passing":2,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5}"#,
+    )
+    .await;
+
+    // Identical output passes at concurrency 2 (a missing key is not a zero bound) ...
+    let (code, report, text) = compare_at(Variant::Base, &reference, 2).await;
+    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(report["logprob_bounds"]["batched"], false, "{report}");
+    assert!(text.contains("strict bounds (concurrency 2)"), "{text}");
+    assert!(
+        report["tolerance"]
+            .get("max_abs_logprob_diff_likely_batched")
+            .is_none(),
+        "{report}"
+    );
+    // ... and the 0.2-nat shift is still judged against 0.15 (not unbounded).
+    let (code, report, _) = compare_at(Variant::ShiftP01, &reference, 2).await;
+    assert_eq!(code, Some(1), "{report}");
+    assert_close(
+        &report["logprob_bounds"]["max_abs_logprob_diff_likely"],
+        0.15,
+        &report,
+    );
+    assert_close(
+        &report["logprob_bounds"]["max_abs_logprob_diff_tail"],
+        0.55,
+        &report,
+    );
+    assert_eq!(prompt_report(&report, "p01")["passed"], false, "{report}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

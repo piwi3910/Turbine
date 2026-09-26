@@ -89,6 +89,56 @@ pub struct Tolerance {
     pub likely_logprob_floor: f32,
     /// A divergence is excused when the reference top-1/top-2 margin there is below this (nats).
     pub margin_nats: f32,
+    /// `max_abs_logprob_diff_likely` for runs with more than one prompt in flight (batch
+    /// composition changes GEMM rounding); absent → the strict bound applies there too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_abs_logprob_diff_likely_batched: Option<f32>,
+    /// `max_abs_logprob_diff_tail` for runs with more than one prompt in flight; absent → the
+    /// strict bound applies there too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_abs_logprob_diff_tail_batched: Option<f32>,
+}
+
+/// The logprob bounds one `compare` run is judged by (see [`Tolerance::logprob_bounds`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct LogprobBounds {
+    /// A `*_batched` bound from the tolerance file applies (concurrency > 1 and the key present).
+    pub batched: bool,
+    pub max_abs_logprob_diff_likely: f32,
+    pub max_abs_logprob_diff_tail: f32,
+}
+
+impl Tolerance {
+    /// The bounds for a run with `concurrency` prompts in flight: the strict ones at 1 (or 0);
+    /// above 1 each tier takes its `*_batched` bound, falling back to the strict one when the
+    /// key is absent. The token rule (`min_identical_prefix`, `min_prompts_passing`,
+    /// `margin_nats`) is the same at every concurrency.
+    pub fn logprob_bounds(&self, concurrency: usize) -> LogprobBounds {
+        let (likely, tail) = if concurrency > 1 {
+            (
+                self.max_abs_logprob_diff_likely_batched,
+                self.max_abs_logprob_diff_tail_batched,
+            )
+        } else {
+            (None, None)
+        };
+        LogprobBounds {
+            batched: likely.is_some() || tail.is_some(),
+            max_abs_logprob_diff_likely: likely.unwrap_or(self.max_abs_logprob_diff_likely),
+            max_abs_logprob_diff_tail: tail.unwrap_or(self.max_abs_logprob_diff_tail),
+        }
+    }
+
+    /// This tolerance with the strict bounds replaced by [`Self::logprob_bounds`] for
+    /// `concurrency`, the form [`super::compare_prompt`] judges a prompt with.
+    pub fn at_concurrency(&self, concurrency: usize) -> Tolerance {
+        let bounds = self.logprob_bounds(concurrency);
+        Tolerance {
+            max_abs_logprob_diff_likely: bounds.max_abs_logprob_diff_likely,
+            max_abs_logprob_diff_tail: bounds.max_abs_logprob_diff_tail,
+            ..self.clone()
+        }
+    }
 }
 
 /// Read a JSONL file (blank lines skipped); errors name the file and line.
@@ -247,8 +297,50 @@ mod tests {
         assert_eq!(t.max_abs_logprob_diff_likely, 0.15);
         assert_eq!(t.max_abs_logprob_diff_tail, 0.55);
         assert_eq!(t.likely_logprob_floor, -2.0);
+        assert_eq!(t.max_abs_logprob_diff_likely_batched, None);
+        assert_eq!(t.max_abs_logprob_diff_tail_batched, None);
         assert_eq!(t.margin_nats, 0.5);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Breaks if the batched bounds apply at concurrency 1, or if one absent batched key drops
+    /// the other tier's batched bound or its strict fallback.
+    #[test]
+    fn batched_bounds_fall_back_per_tier() {
+        let strict: Tolerance = serde_json::from_str(
+            r#"{"min_identical_prefix":32,"min_prompts_passing":14,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5}"#,
+        )
+        .unwrap();
+        let both = Tolerance {
+            max_abs_logprob_diff_likely_batched: Some(0.25),
+            max_abs_logprob_diff_tail_batched: Some(0.75),
+            ..strict.clone()
+        };
+        let likely_only = Tolerance {
+            max_abs_logprob_diff_likely_batched: Some(0.25),
+            ..strict.clone()
+        };
+        let b = |likely, tail, batched| LogprobBounds {
+            batched,
+            max_abs_logprob_diff_likely: likely,
+            max_abs_logprob_diff_tail: tail,
+        };
+        for c in [0, 1] {
+            assert_eq!(
+                both.logprob_bounds(c),
+                b(0.15, 0.55, false),
+                "concurrency {c}"
+            );
+        }
+        assert_eq!(both.logprob_bounds(16), b(0.25, 0.75, true));
+        assert_eq!(likely_only.logprob_bounds(2), b(0.25, 0.55, true));
+        assert_eq!(strict.logprob_bounds(16), b(0.15, 0.55, false));
+        let t = both.at_concurrency(16);
+        assert_eq!(
+            (t.max_abs_logprob_diff_likely, t.max_abs_logprob_diff_tail),
+            (0.25, 0.75)
+        );
+        assert_eq!(both.at_concurrency(1), both);
     }
 
     #[test]

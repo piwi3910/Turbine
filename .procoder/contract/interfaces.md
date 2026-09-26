@@ -1916,7 +1916,7 @@ pub mod report { pub struct RequestStats { pub ttft: Duration, pub itls: Vec<Dur
     impl Report { pub fn from_results(ok: &[RequestStats], failed: u64, wall: Duration) -> Report; pub fn to_text(&self) -> String; } }   // (added P0-T6)
 
 // turbine_bench::golden, P1 (added P1-T18). Root re-exports: Endpoint, Generation, capture, compare, CompareReport, MissingTopK,
-// PromptVerdict, compare_prompt, judge, GoldenError, PromptKind, PromptRecord, ReferenceRecord, Tolerance.
+// PromptVerdict, compare_prompt, judge, GoldenError, LogprobBounds (added 2026-09-26), PromptKind, PromptRecord, ReferenceRecord, Tolerance.
 pub mod fixture {
     pub enum GoldenError { Usage(String) /* exit 2 */, Io(String) /* exit 2 */, Endpoint(String) /* exit 1 */ }   impl GoldenError { pub fn exit_code(&self) -> u8; }
     pub enum PromptKind { Completion, Chat }   // serde lowercase
@@ -1925,7 +1925,11 @@ pub mod fixture {
     pub struct ReferenceRecord { pub id: String, pub engine: String, pub model: String, pub captured: String /* RFC 3339 UTC, whole seconds */,
         pub prompt_token_ids: Vec<u32>, pub tokens: Vec<u32>, pub top_logprobs: Vec<Vec<(u32, f32)>> /* highest first */ }
     #[serde(deny_unknown_fields)] pub struct Tolerance { pub min_identical_prefix: usize, pub min_prompts_passing: usize, pub top_k: usize,
-        pub max_abs_logprob_diff_likely: f32, pub max_abs_logprob_diff_tail: f32, pub likely_logprob_floor: f32, pub margin_nats: f32 }   // two-tier bound (user decision 2026-09-26): reference logprob > floor → likely, else tail
+        pub max_abs_logprob_diff_likely: f32, pub max_abs_logprob_diff_tail: f32, pub likely_logprob_floor: f32, pub margin_nats: f32,
+        pub max_abs_logprob_diff_likely_batched: Option<f32>, pub max_abs_logprob_diff_tail_batched: Option<f32> }   // two-tier bound (user decision 2026-09-26): reference logprob > floor → likely, else tail; *_batched: serde default, omitted when None (decision 2026-09-26 "Golden at concurrency 16")
+    pub struct LogprobBounds { pub batched: bool, pub max_abs_logprob_diff_likely: f32, pub max_abs_logprob_diff_tail: f32 }   // Serialize
+    impl Tolerance { pub fn logprob_bounds(&self, concurrency: usize) -> LogprobBounds;   // strict at ≤ 1; above 1 each tier's *_batched bound, else the strict one
+        pub fn at_concurrency(&self, concurrency: usize) -> Tolerance; }   // strict bounds replaced by logprob_bounds(concurrency); token rule unchanged
     pub fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, GoldenError>;   // blank lines skipped; no records → Usage
     pub fn read_prompts(path: &Path) -> Result<Vec<PromptRecord>, GoldenError>;   // unique ids; exactly one of prompt (completion) / messages (chat)
     pub fn read_tolerance(path: &Path) -> Result<Tolerance, GoldenError>;
@@ -1938,8 +1942,9 @@ pub mod compare {
         pub margin_at_divergence: Option<f32>, pub max_abs_logprob_diff_likely: f32, pub max_abs_logprob_diff_tail: f32, pub missing_top_k: Option<MissingTopK>, pub logprob_within_bound: bool, pub passed: bool }
     pub fn compare_prompt(reference: &ReferenceRecord, got_tokens: &[u32], got_top: &[Vec<(u32, f32)>], tol: &Tolerance) -> PromptVerdict;
     pub fn judge(verdicts: &[PromptVerdict], tol: &Tolerance) -> bool;   // non-empty, every logprob bound holds, ≥ min_prompts_passing passed
-    pub struct CompareReport { pub prompts: Vec<PromptVerdict>, pub prompts_passing: usize, pub prompts_total: usize, pub passed: bool, pub tolerance: Tolerance }
-    impl CompareReport { pub fn new(prompts: Vec<PromptVerdict>, tolerance: &Tolerance) -> Self; pub fn to_text(&self) -> String; }   // --output json = serde of CompareReport
+    pub struct CompareReport { pub prompts: Vec<PromptVerdict>, pub prompts_passing: usize, pub prompts_total: usize, pub passed: bool, pub tolerance: Tolerance,
+        pub concurrency: usize, pub logprob_bounds: LogprobBounds }   // concurrency, logprob_bounds added 2026-09-26
+    impl CompareReport { pub fn new(prompts: Vec<PromptVerdict>, tolerance: &Tolerance, concurrency: usize) -> Self; pub fn to_text(&self) -> String; }   // --output json = serde of CompareReport
 }
 pub mod client {
     pub const COMPARE_TOP_LOGPROBS: u32 = 20;
@@ -1950,7 +1955,7 @@ pub mod client {
         pub async fn generate(&self, model: &str, prompt: &PromptRecord, top_logprobs: u32) -> Result<Generation, GoldenError>; }
     pub fn request_body(model: &str, prompt: &PromptRecord, top_logprobs: u32) -> (&'static str, Value);   // temperature 0, ignore_eos, return_tokens_as_token_ids, return_token_ids, stream false
     pub fn parse_completion(v: &Value, k: usize) -> Result<Generation, String>;   pub fn parse_chat(v: &Value, k: usize) -> Result<Generation, String>;
-    pub async fn compare(endpoint: &Endpoint, model: &str, references: &[ReferenceRecord], prompts: &[PromptRecord], tol: &Tolerance) -> Result<CompareReport, GoldenError>;
+    pub async fn compare(endpoint: &Endpoint, model: &str, references: &[ReferenceRecord], prompts: &[PromptRecord], tol: &Tolerance, concurrency: usize) -> Result<CompareReport, GoldenError>;   // concurrency P2-T19; judged by tol.at_concurrency(concurrency)
     pub async fn capture(endpoint: &Endpoint, model: &str, prompts: &[PromptRecord], top_logprobs: u32) -> Result<Vec<ReferenceRecord>, GoldenError>;   // engine = system_fingerprint or "unknown"
     pub fn rfc3339_utc(t: SystemTime) -> String;
 }
@@ -2182,16 +2187,16 @@ All scripts: never stop/restart/reconfigure non-`turbine-lab-*` workloads; any r
 
 ### 21.4 Fixtures
 
-| Path                                                                                                                                     | Phase  | Format                                                                                                                                                                             |
-| ---------------------------------------------------------------------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tests/golden/prompts.jsonl`                                                                                                             | P1     | `{"id","kind":"completion"\|"chat","prompt"\|"messages","max_tokens":32,"chat_template_kwargs":{"date_string":"26 Jul 2024"}}`, 16 prompts                                         |
-| `tests/golden/<slug>/reference.jsonl`                                                                                                    | P1/P2  | `{"id","engine","model","captured","prompt_token_ids","tokens","top_logprobs":[[[id,lp]…]…]}`                                                                                      |
-| `tests/golden/<slug>/tolerance.json`                                                                                                     | P1/P2  | `{"min_identical_prefix":32,"min_prompts_passing":14,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5}` |
-| `tests/golden/tools/*.jsonl`                                                                                                             | P2     | chat requests with `tools` / `response_format`                                                                                                                                     |
-| `tests/eval/gsm8k-200.jsonl`, `tests/eval/NOTICE`, `tests/eval/<slug>/<engine>.json`                                                     | P8     | `{"id","prompt"\|"messages","answer","match":"exact"\|"number"}`                                                                                                                   |
-| `crates/turbine-model/tests/fixtures/<slug>/{config.json,generation_config.json,tokenizer.json,tokenizer_config.json, expected renders}` | P1, P2 | committed copies                                                                                                                                                                   |
-| `crates/turbine-device/tests/fixtures/{proc,topology}/…`                                                                                 | P3, P5 | captured `/proc` files; novanas / dgx-spark sysfs + vendor captures (contract-chosen paths)                                                                                        |
-| tiny synthetic checkpoints                                                                                                               | P1, P2 | generated per test into a temp dir from a fixed seed; never committed                                                                                                              |
+| Path                                                                                                                                     | Phase  | Format                                                                                                                                                                                                                                                                                                                          |
+| ---------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tests/golden/prompts.jsonl`                                                                                                             | P1     | `{"id","kind":"completion"\|"chat","prompt"\|"messages","max_tokens":32,"chat_template_kwargs":{"date_string":"26 Jul 2024"}}`, 16 prompts                                                                                                                                                                                      |
+| `tests/golden/<slug>/reference.jsonl`                                                                                                    | P1/P2  | `{"id","engine","model","captured","prompt_token_ids","tokens","top_logprobs":[[[id,lp]…]…]}`                                                                                                                                                                                                                                   |
+| `tests/golden/<slug>/tolerance.json`                                                                                                     | P1/P2  | `{"min_identical_prefix":32,"min_prompts_passing":14,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5,"max_abs_logprob_diff_likely_batched":0.25,"max_abs_logprob_diff_tail_batched":0.75}` (batched keys optional, applied above `--concurrency` 1) |
+| `tests/golden/tools/*.jsonl`                                                                                                             | P2     | chat requests with `tools` / `response_format`                                                                                                                                                                                                                                                                                  |
+| `tests/eval/gsm8k-200.jsonl`, `tests/eval/NOTICE`, `tests/eval/<slug>/<engine>.json`                                                     | P8     | `{"id","prompt"\|"messages","answer","match":"exact"\|"number"}`                                                                                                                                                                                                                                                                |
+| `crates/turbine-model/tests/fixtures/<slug>/{config.json,generation_config.json,tokenizer.json,tokenizer_config.json, expected renders}` | P1, P2 | committed copies                                                                                                                                                                                                                                                                                                                |
+| `crates/turbine-device/tests/fixtures/{proc,topology}/…`                                                                                 | P3, P5 | captured `/proc` files; novanas / dgx-spark sysfs + vendor captures (contract-chosen paths)                                                                                                                                                                                                                                     |
+| tiny synthetic checkpoints                                                                                                               | P1, P2 | generated per test into a temp dir from a fixed seed; never committed                                                                                                                                                                                                                                                           |
 
 ## 22. Core runtime types index (where each shared concept lives)
 

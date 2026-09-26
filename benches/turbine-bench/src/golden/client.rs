@@ -261,7 +261,8 @@ pub fn parse_chat(v: &Value, k: usize) -> Result<Generation, String> {
 /// Replay every reference prompt and judge it; `prompts` supplies the text by id. At most
 /// `concurrency` prompts are in flight at once (`0` counts as 1); verdicts are reported in
 /// reference order whatever order the replies arrive in, and the first endpoint error ends the
-/// run.
+/// run. Above concurrency 1 the prompts are judged by the tolerance's batched logprob bounds
+/// ([`Tolerance::logprob_bounds`]); the token rule is the same at every concurrency.
 pub async fn compare(
     endpoint: &Endpoint,
     model: &str,
@@ -286,6 +287,9 @@ pub async fn compare(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let concurrency = concurrency.max(1);
+    let judged_by = tol.at_concurrency(concurrency);
+    let judged_by = &judged_by;
     let mut replies = stream::iter(jobs.into_iter().enumerate())
         .map(|(index, (reference, prompt))| async move {
             let got = endpoint
@@ -293,10 +297,10 @@ pub async fn compare(
                 .await?;
             Ok::<_, GoldenError>((
                 index,
-                compare_prompt(reference, &got.tokens, &got.top_logprobs, tol),
+                compare_prompt(reference, &got.tokens, &got.top_logprobs, judged_by),
             ))
         })
-        .buffer_unordered(concurrency.max(1));
+        .buffer_unordered(concurrency);
     let mut verdicts = Vec::with_capacity(references.len());
     while let Some(reply) = replies.next().await {
         verdicts.push(reply?);
@@ -305,6 +309,7 @@ pub async fn compare(
     Ok(CompareReport::new(
         verdicts.into_iter().map(|(_, v)| v).collect(),
         tol,
+        concurrency,
     ))
 }
 

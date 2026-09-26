@@ -400,15 +400,18 @@ Interfaces:
 
 ## Task 19: `turbine-golden compare --concurrency`
 
-Files: `benches/turbine-bench/src/bin/turbine-golden.rs` (flag), `benches/turbine-bench/src/golden/client.rs` (bounded concurrent replay), `benches/turbine-bench/tests/golden.rs`
+Files: `benches/turbine-bench/src/bin/turbine-golden.rs` (flag), `benches/turbine-bench/src/golden/client.rs` (bounded concurrent replay), `benches/turbine-bench/tests/golden.rs`; amended 2026-09-26 (decision "Golden at concurrency 16"): `benches/turbine-bench/src/golden/{fixture,compare,mod}.rs` (batched bounds), `tests/golden/*/tolerance.json`, `crates/turbine-model/tests/golden.rs` (its `deny_unknown_fields` tolerance parser accepts the new keys)
 Interfaces:
 
 - `turbine-golden compare … [--concurrency <n>]` (default 1): at most `n` prompts in flight (`futures_util::stream::iter(..).buffer_unordered(n)`), results reported in prompt order; exit codes unchanged
-  Covers: §Interfaces `turbine-golden compare (change)`
+- `Tolerance { …, max_abs_logprob_diff_likely_batched: Option<f32>, max_abs_logprob_diff_tail_batched: Option<f32> }` (serde default, omitted when absent); `Tolerance::logprob_bounds(concurrency) -> LogprobBounds { batched, max_abs_logprob_diff_likely, max_abs_logprob_diff_tail }` (strict at 1; above 1 each tier's batched bound, else the strict one) and `Tolerance::at_concurrency(concurrency)`; `CompareReport` gains `concurrency` and `logprob_bounds`, `CompareReport::new(prompts, tolerance, concurrency)`; the token rule is unchanged
+  Covers: §Interfaces `turbine-golden compare (change)`; S-15 AC `cargo test -p turbine-bench --test golden batched`
   Depends on: Phase 1 plan Task 18
 
 - [ ] Write failing test `turbine-bench --test golden compare_concurrency_bounded`: against the mock endpoint that records its maximum simultaneous requests, `compare --concurrency 3` over 8 prompts exits 0 and the mock saw at most 3 and at least 2 concurrent requests. Run: `cargo test -p turbine-bench --test golden compare_concurrency_bounded` — expect FAIL
 - [ ] Implement the flag.
+- [ ] Write failing tests `turbine-bench --test golden compare_batched_bounds_apply_only_above_concurrency_1` (a likely logprob moved by 0.2 fails at `--concurrency 1`, passes at `--concurrency 2` with batched 0.25, report `logprob_bounds.batched` true; a 2-nat flip still fails) and `compare_without_batched_keys_falls_back_to_strict_bounds`. Run: `cargo test -p turbine-bench --test golden batched` — expect FAIL (unknown field `max_abs_logprob_diff_likely_batched`)
+- [ ] Implement the batched bounds; add `max_abs_logprob_diff_likely_batched` 0.25 and `max_abs_logprob_diff_tail_batched` 0.75 to both committed `tolerance.json` files.
 - [ ] Run: `cargo test -p turbine-bench` — expect PASS
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 - [ ] Commit: `feat(turbine-bench): concurrent golden comparison`
@@ -440,11 +443,11 @@ Files: `AGENTS.md` (Commands: `scripts/lab-serve.sh novanas --vllm <slug>`, `tur
 Interfaces:
 
 - Consumes `scripts/lab-serve.sh`, `turbine-golden`, `turbine-bench` (Phase 0/1)
-  Covers: S-1 AC (macOS build/test/clippy/fmt and `cargo tree -p turbine-scheduler`); S-15/S-16 AC manual golden runs with `--concurrency 16`; S-15 AC manual baseline run; S-15 AC manual overload run
+  Covers: S-1 AC (macOS build/test/clippy/fmt and `cargo tree -p turbine-scheduler`); S-15/S-16 AC manual golden runs at `--concurrency 1` (strict) and `--concurrency 16` (batched bounds); S-15 AC manual baseline run; S-15 AC manual overload run
   Depends on: Tasks 19, 20
 
 - [ ] Run on the macOS workstation: `cargo build --workspace && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check && ! cargo tree -p turbine-scheduler | grep -E 'turbine-(kernels|model)|hip|cuda|nvml'` — expect PASS
-- [ ] ASK THE USER FIRST that an R9700 is free. For each of `scripts/lab/phase2-novanas-llama.yaml` and `scripts/lab/phase2-novanas-olmoe.yaml`: `scripts/lab-serve.sh novanas <config>` (expect `/ready` 200), then `cargo run --release -p turbine-bench --bin turbine-golden -- compare --url http://192.168.10.203:18000 --reference tests/golden/<slug>/reference.jsonl --concurrency 16` — expect exit 0; paste both outputs into evidence; `scripts/lab-serve.sh novanas --stop`.
+- [ ] ASK THE USER FIRST that an R9700 is free. For each of `scripts/lab/phase2-novanas-llama.yaml` and `scripts/lab/phase2-novanas-olmoe.yaml`: `scripts/lab-serve.sh novanas <config>` (expect `/ready` 200), then `cargo run --release -p turbine-bench --bin turbine-golden -- compare --url http://192.168.10.203:18000 --reference tests/golden/<slug>/reference.jsonl` — expect exit 0 under the strict bounds (verdict line `strict bounds (concurrency 1)`), and the same with `--concurrency 16` — expect exit 0 under the token rule with the batched bounds (verdict line `batched bounds (concurrency 16)`); paste all four outputs into evidence; `scripts/lab-serve.sh novanas --stop`.
 - [ ] ASK THE USER FIRST. For each model: serve it, run `cargo run --release -p turbine-bench -- --url http://192.168.10.203:18000 --concurrency 16 --requests 200 --prompt-words 512 --max-tokens 256 --ignore-eos --output json` — expect exit 0 with `"requests_failed": 0`; stop; then `scripts/lab-serve.sh novanas --vllm <slug>` and the same command against `http://192.168.10.203:18100` — record the JSON or "vLLM-ROCm did not run" with the pod log excerpt, the ROCm version, image tag and card.
 - [ ] ASK THE USER FIRST. Serve the Llama config with `scheduler.max_queued_requests: 256`, run `cargo run --release -p turbine-bench -- --url http://192.168.10.203:18000 --concurrency 512 --requests 2000 --max-tokens 256 --ignore-eos --output json` — expect exit 0, some 429s in the report, the pod still `Running` with `/ready` 200, and `/turbine/v1/kv` `blocks_used: 0` once idle.
 - [ ] Implement the AGENTS.md and `examples/turbine.yaml` updates.
