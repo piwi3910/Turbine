@@ -1101,4 +1101,118 @@ mod tests {
             assert!(tuned.4 < base.4, "the worst decode stall shrinks");
         }
     }
+
+    /// P2c S-12: both Phase 2c lab configs run the tuned batch shape, and the scheduler keeps its
+    /// guarantees with it: 1,000 seeded Poisson arrivals with prompts up to 3,000 tokens (so
+    /// prompts are chunked) never starve a decode and never exceed the chunk or batch budget,
+    /// and 1,000 arrivals at ~10× the service rate stay within the running and queue bounds
+    /// (the overflow is rejected `queue_full`).
+    #[test]
+    fn phase2c_lab_configs_hold_invariants() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for file in [
+            "scripts/lab/phase2c-novanas-llama.yaml",
+            "scripts/lab/phase2c-novanas-olmoe.yaml",
+        ] {
+            let cfg = turbine_core::config::load(&root.join(file), &[])
+                .unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert_eq!(
+                (
+                    cfg.scheduler.max_batch_tokens,
+                    cfg.scheduler.prefill_chunk_tokens
+                ),
+                (PHASE2C_MAX_BATCH_TOKENS, PHASE2C_PREFILL_CHUNK_TOKENS),
+                "{file}"
+            );
+            let p = SchedulerParams::from_config(&cfg, 8192);
+            let blocks = 584;
+
+            // Starvation and budgets.
+            let mix = LengthMix {
+                short_prompt: (4, 256),
+                long_prompt: (257, 3000),
+                long_fraction: 0.3,
+                output: (1, 256),
+                max_new_tokens: 256,
+            };
+            let arrivals = ArrivalProcess::poisson(2.0, 11)
+                .with_mix(mix)
+                .with_limit(1000);
+            let mut sim = Simulation::new(
+                p,
+                pool_of(blocks, p.block_tokens),
+                llama_r9700_cost(66e-6),
+                arrivals,
+            );
+            let report = sim.run(secs(100_000.0));
+            assert!(
+                report.violations.is_empty(),
+                "{file}: {:?}",
+                &report.violations[..report.violations.len().min(5)]
+            );
+            assert_eq!(
+                report.completed as usize + report.rejected.len(),
+                1000,
+                "{file}"
+            );
+            let mut chunked = false;
+            for it in &report.iterations {
+                let mut tokens = 0;
+                for i in &it.items {
+                    tokens += match i.kind {
+                        BatchKind::Prefill { start, len } => {
+                            assert!(len <= p.prefill_chunk_tokens, "{file}: chunk {len}");
+                            chunked |= start > 0;
+                            len
+                        }
+                        BatchKind::Decode => 1,
+                    };
+                }
+                assert!(tokens <= p.max_batch_tokens, "{file}: {tokens} tokens");
+            }
+            assert!(chunked, "{file}: long prompts are chunked");
+
+            // Overload: ~10× the service rate.
+            let mix = LengthMix {
+                short_prompt: (4, 256),
+                long_prompt: (257, 2048),
+                long_fraction: 0.2,
+                output: (200, 256),
+                max_new_tokens: 256,
+            };
+            let arrivals = ArrivalProcess::poisson(200.0, 13)
+                .with_mix(mix)
+                .with_limit(1000);
+            let mut sim = Simulation::new(
+                p,
+                pool_of(blocks, p.block_tokens),
+                llama_r9700_cost(66e-6),
+                arrivals,
+            );
+            let report = sim.run(secs(100_000.0));
+            assert!(
+                report.violations.is_empty(),
+                "{file}: {:?}",
+                &report.violations[..report.violations.len().min(5)]
+            );
+            assert!(report.max_running <= p.max_running_requests, "{file}");
+            assert_eq!(
+                report.max_waiting, p.max_queued_requests,
+                "{file}: the queue fills"
+            );
+            assert!(!report.rejected.is_empty(), "{file}");
+            assert!(
+                report
+                    .rejected
+                    .iter()
+                    .all(|(_, e)| *e == SubmitError::QueueFull),
+                "{file}"
+            );
+            assert_eq!(
+                report.completed as usize + report.rejected.len(),
+                1000,
+                "{file}"
+            );
+        }
+    }
 }
