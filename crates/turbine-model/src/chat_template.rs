@@ -643,8 +643,8 @@ mod tests {
     // Expected renders of the Llama-3.2 template with `add_generation_prompt=True,
     // date_string="26 Jul 2024"`, produced by transformers `apply_chat_template(..., tokenize=False)`
     // and `encode(text, add_special_tokens=False)` during planning. The committed
-    // `expected_renders.json` (scripts/golden/render_fixture.py) carries the same cases and is
-    // cross-checked once that fixture is on this branch.
+    // `expected_renders.json` (scripts/golden/render_fixture.py) carries the same cases;
+    // `renders_llama_tools` cross-checks them.
     const SYSTEM_USER_TEXT: &str = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nYou are a helpful assistant. Réponds en français si on te le demande.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of Belgium? 🇧🇪<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
     const SYSTEM_USER_IDS: &[u32] = &[
         128_000, 128_006, 9_125, 128_007, 271, 38_766, 1_303, 33_025, 2_696, 25, 6_790, 220, 2_366,
@@ -887,5 +887,68 @@ mod tests {
             "config:<s>"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The committed transformers renders (`scripts/golden/render_fixture.py`).
+    fn expected_renders() -> Value {
+        let path = fixture_dir().join("expected_renders.json");
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        serde_json::from_str(&text).expect("expected_renders.json parses")
+    }
+
+    fn fixture_ids(case: &Value) -> Vec<u32> {
+        case["ids"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .map(|id| u32::try_from(id.as_u64().expect("id")).expect("u32 id"))
+            .collect()
+    }
+
+    #[test]
+    fn renders_llama_tools() {
+        let fixture = expected_renders();
+        assert_eq!(fixture["kwargs"], json!({"date_string": "26 Jul 2024"}));
+        let template = ChatTemplate::load(&fixture_dir().join("tokenizer_config.json"))
+            .expect("Llama-3.2 template loads");
+        let tokenizer =
+            Tokenizer::from_file(&fixture_dir().join("tokenizer.json")).expect("tokenizer");
+
+        let case = &fixture["tools"];
+        let messages = case["messages"].as_array().expect("messages");
+        let tools = case["tools"].as_array().expect("tools");
+        // The conversation the plan names: a get_weather tool (required `location`, optional
+        // `unit` enum), a user turn, an assistant tool call and a `tool` result.
+        assert_eq!(tools[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            tools[0]["function"]["parameters"]["required"],
+            json!(["location"])
+        );
+        assert!(tools[0]["function"]["parameters"]["properties"]["unit"]["enum"].is_array());
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().expect("role"))
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool"]);
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["arguments"],
+            json!({"location": "Paris"})
+        );
+        assert_eq!(messages[2]["content"], "{\"temperature\": 21}");
+
+        let rendered = template
+            .render(messages, Some(tools), true, &date_kwargs())
+            .expect("render");
+        let want = case["text"].as_str().expect("text");
+        assert_eq!(rendered, want);
+        let ids = tokenizer.encode(&rendered, false).expect("encode");
+        assert_eq!(ids, fixture_ids(case), "token ids for case tools");
+
+        // The same fixture carries the Phase 1 cases pinned inline above.
+        assert_eq!(fixture["system_user"]["text"], SYSTEM_USER_TEXT);
+        assert_eq!(fixture_ids(&fixture["system_user"]), SYSTEM_USER_IDS);
+        assert_eq!(fixture["user_only"]["text"], USER_ONLY_TEXT);
+        assert_eq!(fixture_ids(&fixture["user_only"]), USER_ONLY_IDS);
     }
 }

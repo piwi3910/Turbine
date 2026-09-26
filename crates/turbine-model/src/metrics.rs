@@ -1,8 +1,10 @@
-//! Model-layer metrics (P1 S-14, P2 S-17): load time and weight bytes of the served model, the
-//! duration of every forward pass by phase, grammar compilation and token-mask computation.
+//! Model-layer metrics (P1 S-14, P2 S-17, S-18): load time and weight bytes of the served model,
+//! the duration of every forward pass by phase, grammar compilation, token-mask computation and
+//! tool-call parser outcomes.
 use std::sync::atomic::AtomicU64;
 
 use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
@@ -49,6 +51,30 @@ fn grammar_compile_histogram() -> Histogram {
     Histogram::new(exponential_buckets(0.001, 2.0, 16))
 }
 
+/// Whether a tool-call parser turned a choice's output into calls (P2 S-18).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ToolCallOutcome {
+    Parsed,
+    ParseFailed,
+}
+
+impl ToolCallOutcome {
+    /// The metric label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToolCallOutcome::Parsed => "parsed",
+            ToolCallOutcome::ParseFailed => "parse_failed",
+        }
+    }
+}
+
+/// Labels of `turbine_tool_calls_total`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ToolCallLabels {
+    parser: &'static str,
+    outcome: &'static str,
+}
+
 /// 0.5 ms doubling to ~16 s: a tiny-model decode step up to a long prefill.
 fn forward_histogram() -> Histogram {
     Histogram::new(exponential_buckets(0.0005, 2.0, 16))
@@ -69,6 +95,8 @@ pub struct ModelMetrics {
     pub grammar_compile_seconds: Family<GrammarKindLabels, Histogram, fn() -> Histogram>,
     /// Duration of each per-step allowed-token mask computation.
     pub token_mask_seconds: Histogram,
+    /// Tool-call parser results by parser and outcome (P2 S-18).
+    pub tool_calls: Family<ToolCallLabels, Counter>,
 }
 
 impl ModelMetrics {
@@ -105,7 +133,23 @@ impl ModelMetrics {
                 // 10 µs doubling to ~0.3 s
                 Histogram::new(exponential_buckets(0.000_01, 2.0, 16)),
             ),
+            tool_calls: reg.register(
+                // prometheus-client appends `_total` to counters
+                "turbine_tool_calls",
+                "Tool-call parser results by parser and outcome",
+                Family::default(),
+            ),
         }
+    }
+
+    /// Counts one tool-call parse of a choice's output by `parser` (e.g. `llama3_json`).
+    pub fn record_tool_call(&self, parser: &'static str, outcome: ToolCallOutcome) {
+        self.tool_calls
+            .get_or_create(&ToolCallLabels {
+                parser,
+                outcome: outcome.as_str(),
+            })
+            .inc();
     }
 
     /// Records a finished model load: its duration and the weight bytes in `format`.
@@ -174,6 +218,26 @@ mod tests {
         );
         assert!(
             text.contains("turbine_token_mask_seconds_count 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn counts_tool_calls_by_parser_and_outcome() {
+        let reg = MetricsRegistry::new();
+        let m = ModelMetrics::register(&reg);
+        m.record_tool_call("llama3_json", ToolCallOutcome::Parsed);
+        m.record_tool_call("llama3_json", ToolCallOutcome::Parsed);
+        m.record_tool_call("llama3_json", ToolCallOutcome::ParseFailed);
+        let text = reg.render().expect("render");
+        assert!(
+            text.contains("turbine_tool_calls_total{parser=\"llama3_json\",outcome=\"parsed\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "turbine_tool_calls_total{parser=\"llama3_json\",outcome=\"parse_failed\"} 1"
+            ),
             "{text}"
         );
     }

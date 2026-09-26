@@ -5,22 +5,28 @@
 #     "jinja2==3.1.6",
 # ]
 # ///
-"""Chat-template render fixture generator for Turbine (P1 S-4).
+"""Chat-template render fixture generator for Turbine (P1 S-4, P2 S-18).
 
 Fixture generation only: never part of the build or the serving path.
 
-Renders two conversations with the tokenizer's chat template through
+Renders three conversations with the tokenizer's chat template through
 `AutoTokenizer.apply_chat_template(..., tokenize=False,
 add_generation_prompt=True, date_string="26 Jul 2024")` and writes, as
 `expected_renders.json`:
 
     {"transformers_version", "kwargs",
      "system_user": {"messages", "text", "ids"},
-     "user_only": {"messages", "text", "ids"}}
+     "user_only": {"messages", "text", "ids"},
+     "tools": {"messages", "tools", "text", "ids"}}
+
+`tools` renders a `get_weather` tool (required `location` string, optional
+`unit` enum), a user message, an assistant `tool_calls` message and a `tool`
+result, with the tool list passed as `apply_chat_template(..., tools=...)`.
 
 `ids` is `tokenizer.encode(text, add_special_tokens=False)` (the template emits
-BOS itself). The Rust test `chat_template::tests::renders_target_template`
-asserts Turbine renders and tokenizes both conversations identically.
+BOS itself). The Rust tests `chat_template::tests::renders_target_template` and
+`chat_template::tests::renders_llama_tools` assert Turbine renders and
+tokenizes the conversations identically.
 
 Usage:
     uv run scripts/golden/render_fixture.py <tokenizer-dir> [--out <file>]
@@ -50,6 +56,48 @@ CONVERSATIONS = {
         {"role": "user", "content": "What is the capital of Belgium? 🇧🇪"},
     ],
     "user_only": [{"role": "user", "content": "  Hello 世界!  "}],
+    "tools": [
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_abcdefghijklmnopqrstuvwx",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": {"location": "Paris"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_abcdefghijklmnopqrstuvwx",
+            "content": '{"temperature": 21}',
+        },
+    ],
+}
+
+# The tool list rendered with the conversation of the same name (OpenAI tool objects).
+TOOLS = {
+    "tools": [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather in a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string", "description": "City name"},
+                        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                    },
+                    "required": ["location"],
+                },
+            },
+        }
+    ]
 }
 
 
@@ -70,11 +118,20 @@ def run(tokenizer_dir: Path, out: Path) -> None:
         "kwargs": KWARGS,
     }
     for name, messages in CONVERSATIONS.items():
+        tools = TOOLS.get(name)
         text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, **KWARGS
+            messages,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+            **KWARGS,
         )
         ids = tokenizer.encode(text, add_special_tokens=False)
-        fixture[name] = {"messages": messages, "text": text, "ids": ids}
+        entry: dict = {"messages": messages}
+        if tools is not None:
+            entry["tools"] = tools
+        entry.update({"text": text, "ids": ids})
+        fixture[name] = entry
 
     tmp = out.with_name(out.name + ".tmp")
     try:

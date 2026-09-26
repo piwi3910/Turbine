@@ -18,6 +18,7 @@ pub mod sampler;
 pub mod structured;
 pub mod testing;
 pub mod tokenizer;
+pub mod tools;
 
 pub use crate::safetensors::{SafetensorsIndex, TensorEntry};
 pub use budget::{BudgetTerms, available_bytes, check_budget, host_mem_available};
@@ -31,11 +32,16 @@ pub use generate::{GenerateOptions, Generation, generate};
 pub use loader::olmoe_slots;
 pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot, llama_slots};
 pub use metrics::{ForwardPhase, ModelMetrics};
+pub use metrics::{ForwardPhase, ModelMetrics, ToolCallOutcome};
+pub use sampler::{SampledToken, Sampler};
 pub use sampler::{SampledToken, Sampler, SamplerState};
 pub use structured::{
     GrammarCompiler, GrammarLimits, TokenMask, TokenMatcher, constraint_kind, step_mask,
 };
 pub use tokenizer::{IncrementalDetokenizer, Tokenizer};
+pub use tools::{
+    Llama3JsonParser, ToolCallParser, ToolChoice, ToolParse, new_call_id, tool_call_grammar,
+};
 
 /// Every failure of the model layer (contract §10). Messages name the offending file, field or
 /// tensor so a startup failure is actionable from the log line alone.
