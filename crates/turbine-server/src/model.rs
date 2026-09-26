@@ -1,7 +1,9 @@
-//! Model startup (P1 §Interfaces, contract §16.3 steps 4–6, 8 and 10): the kernel provider for
+//! Model startup (P1 §Interfaces, contract §16.3 steps 4–6 and 8–10): the kernel provider for
 //! `execution.backend`, the model config, tokenizer and chat template, `model.max_seq_len`, the
-//! kernel registry, the memory budget (all before the listener binds), then the weight load and
-//! the one-token warm-up (after it binds).
+//! kernel registry, the memory budget — weights + the `kv.gpu.max_bytes` block pool + the
+//! executor workspace for `scheduler.max_batch_tokens` + the emergency reserve (P2
+//! Constraints) — all before the listener binds; then the weight load, the KV pool allocation
+//! and the one-token warm-up (after it binds).
 
 use std::fmt;
 use std::path::{Component, Path};
@@ -9,20 +11,25 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use turbine_core::config::Config;
+use turbine_core::types::SeqId;
 use turbine_core::types::{ExecutionBackend, MemoryKind, Vendor};
 use turbine_device::{DeviceInfo, DeviceInventory};
 use turbine_kernels::{
     KernelError, KernelMetrics, KernelProvider, KernelRegistry, ProviderId, ShimContext,
     ShimLibrary, cpu_reference_provider, shim_provider,
 };
-use turbine_model::executor::{LlamaExecutor, SequenceKv};
-
+use turbine_kv::metrics::log_pool_startup;
+use turbine_kv::{BlockPool, BlockPoolConfig};
+use turbine_model::executor::{self, BatchInput, ModelExecutor, SeqSlice};
+use turbine_model::loader::LoadedWeights;
 use turbine_model::{
-    BudgetTerms, ChatTemplate, GenerationConfig, MAX_STAGING_BYTES, ModelArchConfig, ModelError,
-    ModelMetrics, SafetensorsIndex, Tokenizer, WeightLoader, available_bytes, check_budget,
-    host_mem_available, llama_slots, load_generation_config, load_model_config,
+    Architecture, BudgetTerms, ChatTemplate, GenerationConfig, MAX_STAGING_BYTES, ModelArchConfig,
+    ModelError, ModelMetrics, SafetensorsIndex, Tokenizer, WeightLoader, WeightSlot,
+    available_bytes, check_budget, host_mem_available, llama_slots, load_generation_config,
+    load_model_config, olmoe_slots,
 };
 use turbine_observability::MetricsRegistry;
+use turbine_scheduler::SchedulerParams;
 use turbine_tensor::DeviceMemory;
 use turbine_tensor::host::HostMemory;
 
@@ -218,8 +225,12 @@ pub struct PreparedModel {
     pub index: SafetensorsIndex,
     pub registry: Arc<KernelRegistry>,
     pub max_seq_len: u32,
-    /// `kv.block_tokens`: the block size of the request's KV pool.
+    /// `kv.block_tokens`: the block size of the KV pool.
     pub block_tokens: u32,
+    /// The L0 block pool `kv.gpu.max_bytes` holds.
+    pub pool: BlockPoolConfig,
+    /// Scheduler bounds; `max_batch_tokens` and `max_running_requests` also size the executor.
+    pub scheduler: SchedulerParams,
     pub served_name: String,
     pub budget: BudgetTerms,
 }
@@ -262,30 +273,56 @@ pub fn prepare(
     arch.check_supported_weights(&index)
         .map_err(|e| model_error("weights", e))?;
 
+    if !config.kv.gpu.enabled {
+        return Err(StartupError::new(
+            "kv.gpu.enabled is false: the GPU KV tier (the L0 block pool) is required",
+        ));
+    }
     let block_tokens = config.kv.block_tokens;
     let registry = KernelRegistry::build(
         provider.providers.clone(),
         &provider.order,
-        &LlamaExecutor::requirements(&arch, block_tokens),
+        &executor::requirements(&arch, block_tokens),
         &KernelMetrics::register(metrics),
     )
     .map_err(|e| kernel_error("kernel selection", e))?;
 
+    let scheduler = SchedulerParams::from_config(config, max_seq_len);
     let device_free = provider
         .mem
         .mem_info()
         .map_err(|e| StartupError::new(format!("device memory info: {e}")))?
         .free_bytes;
-    let budget = BudgetTerms {
-        weights: arch.shape().weight_bytes,
-        kv_reservation: SequenceKv::bytes(&arch.kv_layout(block_tokens), max_seq_len),
-        workspace: LlamaExecutor::workspace_bytes(&arch, block_tokens, max_seq_len, 1),
-        emergency_reserve: config.reliability.emergency_vram_reserve.0,
-        available: available_bytes(
-            provider.memory_kind,
-            device_free,
-            host_mem_available(Path::new(MEMINFO)),
+    let available = available_bytes(
+        provider.memory_kind,
+        device_free,
+        host_mem_available(Path::new(MEMINFO)),
+    );
+    let weights = arch.shape().weight_bytes;
+    let workspace = executor::workspace_bytes(
+        &arch,
+        block_tokens,
+        scheduler.max_batch_tokens,
+        scheduler.max_running_requests,
+    );
+    let emergency_reserve = config.reliability.emergency_vram_reserve.0;
+    let pool = kv_pool_config(
+        &arch,
+        block_tokens,
+        config.kv.gpu.max_bytes.map(|b| b.0),
+        available.saturating_sub(
+            weights
+                .saturating_add(workspace)
+                .saturating_add(emergency_reserve),
         ),
+        scheduler.max_running_requests,
+    )?;
+    let budget = BudgetTerms {
+        weights,
+        kv_reservation: u64::from(pool.num_blocks) * pool.layout.block_bytes(),
+        workspace,
+        emergency_reserve,
+        available,
     };
     check_budget(&budget).map_err(|e| model_error("startup", e))?;
 
@@ -311,59 +348,158 @@ pub fn prepare(
         registry: Arc::new(registry),
         max_seq_len,
         block_tokens,
+        pool,
+        scheduler,
         served_name,
         budget,
     })
 }
 
-/// The loaded, warmed-up executor and the single-sequence KV its requests run on.
+/// The L0 pool: as many blocks as `max_bytes` (`kv.gpu.max_bytes`) holds, or, when it is null,
+/// as the budget `remainder` after weights, workspace and the emergency reserve holds. At least
+/// one block per running request.
+fn kv_pool_config(
+    arch: &ModelArchConfig,
+    block_tokens: u32,
+    max_bytes: Option<u64>,
+    remainder: u64,
+    max_running: u32,
+) -> Result<BlockPoolConfig, StartupError> {
+    let bytes = max_bytes.unwrap_or(remainder);
+    let pool = BlockPoolConfig::for_bytes(arch.kv_layout(block_tokens), bytes);
+    if pool.num_blocks < max_running {
+        return Err(StartupError::new(format!(
+            "kv.gpu.max_bytes: {bytes} B hold {} KV blocks of {} B; at least one block per \
+             running request (scheduler.max_running_requests = {max_running}) is required",
+            pool.num_blocks,
+            pool.layout.block_bytes()
+        )));
+    }
+    Ok(pool)
+}
+
+/// The weights `arch`'s executor takes.
+fn weight_slots(arch: &ModelArchConfig) -> Result<Vec<WeightSlot>, StartupError> {
+    match arch.architecture {
+        Architecture::Llama => Ok(llama_slots(arch)),
+        Architecture::Olmoe => Ok(olmoe_slots(arch)),
+        other => Err(StartupError::new(format!(
+            "no weight layout for architecture {}",
+            other.as_str()
+        ))),
+    }
+}
+
+/// The one place the server builds a model executor: the architecture's executor for ragged
+/// batches of up to `max_batch_tokens` tokens and `max_seqs` sequences over KV blocks of
+/// `block_tokens` tokens.
+pub fn build_executor(
+    arch: &ModelArchConfig,
+    weights: LoadedWeights,
+    registry: Arc<KernelRegistry>,
+    mem: Arc<dyn DeviceMemory>,
+    block_tokens: u32,
+    max_batch_tokens: u32,
+    max_seqs: u32,
+) -> Result<Box<dyn ModelExecutor>, ModelError> {
+    executor::build_executor(
+        arch,
+        weights,
+        registry,
+        mem,
+        block_tokens,
+        max_batch_tokens,
+        max_seqs,
+    )
+}
+
+/// The loaded, warmed-up executor and the L0 block pool its requests run on.
 pub struct LoadedModel {
-    pub executor: LlamaExecutor,
-    pub kv: SequenceKv,
+    pub executor: Box<dyn ModelExecutor>,
+    pub pool: BlockPool,
     pub weight_bytes: u64,
     pub load_seconds: f64,
 }
 
-/// Steps 8 and 10: upload the weights, build the executor for the single-sequence KV `kv` (its
-/// layout and `max_seq_len` size the executor) and run one one-token forward on it. Records
+/// Steps 8–10: upload the weights, build the executor for `prepared`'s scheduler bounds,
+/// allocate the KV block pool and run one one-token forward on a block of it. Records
 /// `turbine_model_load_seconds` and `turbine_model_weight_bytes{format="bf16"}`.
 pub fn load(
-    arch: &ModelArchConfig,
-    index: &SafetensorsIndex,
-    registry: Arc<KernelRegistry>,
-    mem: Arc<dyn DeviceMemory>,
-    mut kv: SequenceKv,
+    prepared: &PreparedModel,
     warmup_token: u32,
     metrics: &ModelMetrics,
 ) -> Result<LoadedModel, StartupError> {
     let started = Instant::now();
-    let weights = WeightLoader::load(index, &llama_slots(arch), &mem, MAX_STAGING_BYTES)
-        .map_err(|e| model_error("weight load", e))?;
+    let arch = &prepared.arch;
+    let mem = &prepared.provider.mem;
+    let weights = WeightLoader::load(
+        &prepared.index,
+        &weight_slots(arch)?,
+        mem,
+        MAX_STAGING_BYTES,
+    )
+    .map_err(|e| model_error("weight load", e))?;
     let weight_bytes = weights.weight_bytes;
-    let block_tokens = kv.view().layout.block_tokens;
-    let max_seq_len = kv.max_seq_len();
-    let mut executor =
-        LlamaExecutor::new(arch, weights, registry, mem, block_tokens, max_seq_len, 1)
-            .map_err(|e| model_error("executor", e))?;
-    let logits = kv
-        .forward(&mut executor, &[warmup_token], &[0])
-        .map_err(|e| model_error("warm-up forward", e))?;
+    let mut executor = build_executor(
+        arch,
+        weights,
+        Arc::clone(&prepared.registry),
+        Arc::clone(mem),
+        prepared.block_tokens,
+        prepared.scheduler.max_batch_tokens,
+        prepared.scheduler.max_running_requests,
+    )
+    .map_err(|e| model_error("executor", e))?;
+    let mut pool = BlockPool::new(prepared.pool, Arc::clone(mem))
+        .map_err(|e| StartupError::new(format!("KV block pool: {e}")))?;
+    log_pool_startup(&pool);
+    warm_up(executor.as_mut(), &mut pool, warmup_token)?;
+    let load_seconds = started.elapsed().as_secs_f64();
+    // Weights and KV are BF16 (`model.dtype`).
+    metrics.record_load(load_seconds, "bf16", weight_bytes);
+    tracing::info!(load_seconds, weight_bytes, "model loaded and warmed up");
+    Ok(LoadedModel {
+        executor,
+        pool,
+        weight_bytes,
+        load_seconds,
+    })
+}
+
+/// One one-token forward on a block borrowed from the pool, which gets it back.
+fn warm_up(
+    exec: &mut dyn ModelExecutor,
+    pool: &mut BlockPool,
+    token: u32,
+) -> Result<(), StartupError> {
+    let blocks = pool
+        .allocate(1)
+        .map_err(|e| StartupError::new(format!("warm-up: {e}")))?;
+    let result = {
+        let view = pool.view();
+        let seqs = [SeqSlice {
+            seq: SeqId(0),
+            q_start: 0,
+            q_len: 1,
+            kv_len: 1,
+            block_table: &blocks,
+        }];
+        exec.forward(&BatchInput {
+            tokens: &[token],
+            positions: &[0],
+            seqs: &seqs,
+            kv: &view,
+        })
+    };
+    pool.release(&blocks);
+    let logits = result.map_err(|e| model_error("warm-up forward", e))?;
     if logits.rows != 1 || logits.data.iter().any(|v| !v.is_finite()) {
         return Err(StartupError::new(format!(
             "warm-up forward: expected one finite logits row, got {} rows",
             logits.rows
         )));
     }
-    let load_seconds = started.elapsed().as_secs_f64();
-    // Weights and KV are BF16 in Phase 1 (`model.dtype`).
-    metrics.record_load(load_seconds, "bf16", weight_bytes);
-    tracing::info!(load_seconds, weight_bytes, "model loaded and warmed up");
-    Ok(LoadedModel {
-        executor,
-        kv,
-        weight_bytes,
-        load_seconds,
-    })
+    Ok(())
 }
 
 #[cfg(test)]

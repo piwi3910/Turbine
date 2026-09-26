@@ -1,6 +1,12 @@
 //! Black-box tests of `turbine-server` serving the tiny synthetic checkpoint on the `cpu`
-//! reference backend (P1 S-10, S-14): OpenAI shapes, the single slot and cancellation, request
+//! reference backend (P1 S-10, S-14; P2 S-3, S-7, S-8, S-11): OpenAI shapes, queueing and
+//! cancellation, the queue bound, KV release on disconnect, the diagnostics documents, request
 //! validation, startup failures and the Phase 1 metrics.
+//!
+//! Streams that must stay open are made to back-pressure the engine: large events (20 logprobs
+//! each), thousands of `max_tokens` on a checkpoint patched to 8192 positions, and a client that
+//! stops reading after the first chunk — the request's output channel fills and the engine
+//! pauses it, holding its KV blocks, until the client reads on or goes away.
 //!
 //! Every wait is bounded and polls; ports come from binding `127.0.0.1:0`.
 
@@ -38,14 +44,25 @@ fn spawn(config: &Path) -> Child {
         .expect("spawn turbine-server")
 }
 
-/// Config for the cpu backend on `model_dir`; `extra` is appended verbatim.
+/// Config for the cpu backend on `model_dir` with a 16 MiB KV pool (4096 tiny-model blocks of
+/// 4096 bytes); `extra` is appended verbatim and must not repeat the `kv` key.
 fn config_yaml(model_dir: &Path, addr: SocketAddr, extra: &str) -> String {
     format!(
         "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cpu\n\
-         reliability:\n  emergency_vram_reserve: 1MiB\n{extra}",
+         reliability:\n  emergency_vram_reserve: 1MiB\nkv:\n  gpu:\n    max_bytes: 16MiB\n{extra}",
         model_dir.display()
     )
 }
+
+/// `max_position_embeddings` of the checkpoint `TinyServer::start_long` serves.
+const LONG_POSITIONS: u32 = 8192;
+/// Tokens a held stream asks for: far more events than the output channel (256) and the socket
+/// buffers hold (a stream that stops reading pauses after about 1400 tokens on macOS loopback),
+/// so it pauses long before it could finish. Not more: debug-build attention cost grows with
+/// the context, and some tests read the streams to the end.
+const LONG_TOKENS: u32 = 3000;
+/// KV blocks of the 16 MiB test pool.
+const POOL_BLOCKS: u64 = 4096;
 
 /// A running server on the tiny checkpoint; killed on drop.
 struct TinyServer {
@@ -57,9 +74,24 @@ struct TinyServer {
 
 impl TinyServer {
     fn start(extra: &str) -> TinyServer {
+        TinyServer::start_with(extra, None)
+    }
+
+    /// The tiny checkpoint patched to `LONG_POSITIONS` positions, so streams can be held open.
+    fn start_long(extra: &str) -> TinyServer {
+        TinyServer::start_with(extra, Some(LONG_POSITIONS))
+    }
+
+    fn start_with(extra: &str, max_positions: Option<u32>) -> TinyServer {
         let dir = TempDir::new("turbine-tiny-server");
         let model_dir = dir.path().join("tiny-llama");
         write_tiny_llama(&model_dir, 7);
+        if let Some(positions) = max_positions {
+            let path = model_dir.join("config.json");
+            let mut cfg: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            cfg["max_position_embeddings"] = json!(positions);
+            std::fs::write(&path, cfg.to_string()).unwrap();
+        }
         let addr = free_addr();
         let config = dir.path().join("config.yaml");
         std::fs::write(&config, config_yaml(&model_dir, addr, extra)).unwrap();
@@ -84,6 +116,112 @@ impl TinyServer {
     fn metrics(&self) -> String {
         self.get("/metrics").body
     }
+
+    fn scheduler(&self) -> Value {
+        let resp = self.get("/turbine/v1/scheduler");
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        resp.json()
+    }
+
+    /// The `l0` tier object of `/turbine/v1/kv`.
+    fn kv_tier(&self) -> Value {
+        let resp = self.get("/turbine/v1/kv");
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let doc = resp.json();
+        assert_eq!(doc["tiers"].as_array().map(Vec::len), Some(1), "{doc}");
+        doc["tiers"][0].clone()
+    }
+
+    fn blocks_used(&self) -> u64 {
+        self.kv_tier()["blocks_used"].as_u64().unwrap()
+    }
+
+    /// A streaming completion that holds its KV (see the module comment).
+    fn long_stream_body(&self) -> Value {
+        json!({"model": self.model, "prompt": "Once upon a time", "max_tokens": LONG_TOKENS,
+               "ignore_eos": true, "stream": true, "logprobs": 20})
+    }
+
+    /// Opens a held stream and reads its first chunk.
+    fn hold_stream(&self) -> OpenStream {
+        OpenStream::open(self.addr, &self.long_stream_body(), true)
+    }
+}
+
+/// Running requests in a scheduler document.
+fn running(doc: &Value) -> u64 {
+    ["prefilling", "decoding", "paused"]
+        .iter()
+        .map(|k| doc[*k].as_u64().unwrap())
+        .sum()
+}
+
+/// Polls `cond` every `POLL` until it holds; panics naming `what` after `limit`.
+fn wait_for(limit: Duration, what: &str, mut cond: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !cond() {
+        assert!(
+            started.elapsed() < limit,
+            "{what}: not reached within {limit:?}"
+        );
+        std::thread::sleep(POLL);
+    }
+}
+
+/// A streaming completion whose body is read only on demand.
+struct OpenStream {
+    reader: BufReader<TcpStream>,
+}
+
+impl OpenStream {
+    /// Sends `body` to `/v1/completions` and reads the response head; with `first_chunk` also
+    /// the first SSE chunk (a queued request produces none until it runs).
+    fn open(addr: SocketAddr, body: &Value, first_chunk: bool) -> OpenStream {
+        let mut conn = TcpStream::connect(addr).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        write_request(
+            &mut conn,
+            "POST",
+            "/v1/completions",
+            Some(&body.to_string()),
+        );
+        let mut reader = BufReader::new(conn);
+        let (status, head) = read_head(&mut reader);
+        assert_eq!(status, 200, "{head}");
+        assert!(head.contains("transfer-encoding: chunked"), "{head}");
+        if first_chunk {
+            let first = read_chunk(&mut reader).expect("first SSE chunk");
+            assert!(first.starts_with("data: "), "{first}");
+        }
+        OpenStream { reader }
+    }
+
+    /// Reads the rest of the body and returns its `data:` payloads.
+    fn read_rest(mut self) -> Vec<String> {
+        let mut body = String::new();
+        while let Some(chunk) = read_chunk(&mut self.reader) {
+            body.push_str(&chunk);
+        }
+        body.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// The `finish_reason` of a completed stream's finish chunk (its data ends in `[DONE]`).
+fn stream_finish_reason(data: &[String]) -> String {
+    assert_eq!(data.last().map(String::as_str), Some("[DONE]"), "{data:?}");
+    data.iter()
+        .rev()
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .find_map(|c| {
+            c["choices"][0]["finish_reason"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("no finish_reason in {data:?}"))
 }
 
 impl Drop for TinyServer {
@@ -368,79 +506,64 @@ fn completions_stream_and_non_stream() {
     assert!(status["model"]["load_seconds"].as_f64().is_some());
 }
 
+/// Contract §20.2 (rewritten for Phase 2): with one running request allowed
+/// (`continuous_batching: false`) a second concurrent request is queued — no more 429
+/// `engine_busy` — and completes once the first client goes away, whose blocks are freed.
 #[test]
 fn single_slot_and_cancel() {
-    let server = TinyServer::start("");
+    let server = TinyServer::start_long("scheduler:\n  continuous_batching: false\n");
 
-    // A long streaming request holds the slot. Large events (20 logprobs each) and a client that
-    // reads only the first chunk make the stream back-pressure the generation thread, so the
-    // slot stays held until the client goes away.
-    let long = json!({"model": server.model, "prompt": "Once upon a time", "max_tokens": 400,
-                      "ignore_eos": true, "stream": true, "logprobs": 20});
-    let mut conn = TcpStream::connect(server.addr).unwrap();
-    conn.set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
-    write_request(
-        &mut conn,
-        "POST",
-        "/v1/completions",
-        Some(&long.to_string()),
-    );
-    let mut reader = BufReader::new(conn);
-    let (status, head) = read_head(&mut reader);
-    assert_eq!(status, 200, "{head}");
-    let first = read_chunk(&mut reader).expect("first SSE chunk");
-    assert!(first.starts_with("data: "), "{first}");
-
-    let busy = server.post(
-        "/v1/completions",
-        &json!({"model": server.model, "prompt": "Hi", "max_tokens": 1}),
-    );
-    assert_eq!(busy.status, 429, "{}", busy.body);
-    assert_eq!(busy.error_code(), "engine_busy");
-    assert!(busy.head.contains("retry-after: 1"), "{}", busy.head);
-
-    // Disconnect; the slot must be free again within 1 s.
-    drop(reader);
-    let dropped = Instant::now();
-    loop {
-        let resp = server.post(
+    let first = server.hold_stream();
+    let addr = server.addr;
+    let model = server.model.clone();
+    let second = std::thread::spawn(move || {
+        request(
+            addr,
+            "POST",
             "/v1/completions",
-            &json!({"model": server.model, "prompt": "Hi", "max_tokens": 1}),
-        );
-        if resp.status == 200 {
-            break;
-        }
-        assert_eq!(resp.status, 429, "{}", resp.body);
-        assert!(
-            dropped.elapsed() < Duration::from_secs(1),
-            "slot still held {:?} after the client disconnected",
-            dropped.elapsed()
-        );
-        std::thread::sleep(POLL);
-    }
-    assert!(dropped.elapsed() < Duration::from_secs(1));
+            Some(
+                &json!({"model": model, "prompt": "Hi", "max_tokens": 2, "ignore_eos": true})
+                    .to_string(),
+            ),
+        )
+    });
+    wait_for(Duration::from_secs(10), "second request queued", || {
+        server.scheduler()["waiting"] == 1
+    });
+    let doc = server.scheduler();
+    assert_eq!(doc["config"]["max_running_requests"], 1, "{doc}");
+    assert_eq!(running(&doc), 1, "{doc}");
+    assert!(server.blocks_used() > 0);
+    assert!(!second.is_finished(), "the queued request must wait");
+
+    // Disconnect: the queued request runs and completes; every block returns to the pool.
+    drop(first);
+    let second = second.join().unwrap();
+    assert_eq!(second.status, 200, "{}", second.body);
+    assert_eq!(second.json()["choices"][0]["finish_reason"], "length");
+    wait_for(Duration::from_secs(1), "blocks released", || {
+        server.blocks_used() == 0
+    });
 
     let metrics = server.metrics();
-    assert_eq!(
-        sample(
-            &metrics,
-            r#"turbine_requests_total{endpoint="/v1/completions",outcome="cancelled"}"#
+    for (series, value) in [
+        (
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="cancelled"}"#,
+            1.0,
         ),
-        Some(1.0),
-        "{metrics}"
-    );
-    assert_eq!(
-        sample(
-            &metrics,
-            r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"}"#
+        (
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"}"#,
+            1.0,
         ),
-        Some(1.0),
-        "{metrics}"
-    );
+        (
+            r#"turbine_requests_cancelled_total{reason="client_disconnect"}"#,
+            1.0,
+        ),
+    ] {
+        assert_eq!(sample(&metrics, series), Some(value), "{series}\n{metrics}");
+    }
 
-    // A client that has read a whole response may start the next request at once: the slot
-    // is free before the final event goes out.
+    // A client that has read a whole response may start the next request at once.
     for i in 0..20 {
         let resp = server.post(
             "/v1/completions",
@@ -450,6 +573,239 @@ fn single_slot_and_cancel() {
     }
 }
 
+/// P2 S-7: the waiting queue is bounded by `scheduler.max_queued_requests`; the excess gets 429
+/// `queue_full` with `retry-after`, counted by reason.
+#[test]
+fn queue_full_429() {
+    let server =
+        TinyServer::start_long("scheduler:\n  max_queued_requests: 2\n  max_running_requests: 1\n");
+    let held = server.hold_stream();
+    wait_for(Duration::from_secs(10), "first request running", || {
+        let doc = server.scheduler();
+        running(&doc) == 1 && doc["waiting"] == 0
+    });
+
+    // Five more at once: two fit the queue, three are refused.
+    let clients: Vec<_> = (0..5)
+        .map(|_| {
+            let addr = server.addr;
+            let model = server.model.clone();
+            std::thread::spawn(move || {
+                request(
+                    addr,
+                    "POST",
+                    "/v1/completions",
+                    Some(
+                        &json!({"model": model, "prompt": "Hi", "max_tokens": 4,
+                                "ignore_eos": true})
+                        .to_string(),
+                    ),
+                )
+            })
+        })
+        .collect();
+    wait_for(Duration::from_secs(10), "three rejections", || {
+        clients.iter().filter(|c| c.is_finished()).count() == 3
+    });
+    let (done, queued): (Vec<_>, Vec<_>) = clients.into_iter().partition(|c| c.is_finished());
+    for c in done {
+        let resp = c.join().unwrap();
+        assert_eq!(resp.status, 429, "{}", resp.body);
+        assert_eq!(resp.error_code(), "queue_full");
+        assert!(resp.head.contains("retry-after: 1"), "{}", resp.head);
+    }
+    let doc = server.scheduler();
+    assert_eq!(doc["waiting"], 2, "{doc}");
+    assert_eq!(running(&doc), 1, "{doc}");
+
+    // The held stream reads on and completes; then the two queued requests run.
+    assert_eq!(stream_finish_reason(&held.read_rest()), "length");
+    for c in queued {
+        let resp = c.join().unwrap();
+        assert_eq!(resp.status, 200, "{}", resp.body);
+    }
+    let metrics = server.metrics();
+    assert_eq!(
+        sample(
+            &metrics,
+            r#"turbine_admission_total{outcome="rejected",reason="queue_full"}"#
+        ),
+        Some(3.0),
+        "{metrics}"
+    );
+    assert_eq!(
+        sample(
+            &metrics,
+            r#"turbine_admission_total{outcome="queued",reason="ok"}"#
+        ),
+        Some(3.0),
+        "{metrics}"
+    );
+}
+
+/// P2 S-8: dropped clients free their KV blocks within 1 s; the others keep theirs and free
+/// them when they finish.
+#[test]
+fn disconnect_releases_kv() {
+    let server = TinyServer::start_long("");
+    let mut streams: Vec<OpenStream> = (0..8).map(|_| server.hold_stream()).collect();
+    wait_for(Duration::from_secs(60), "all 8 streams paused", || {
+        let doc = server.scheduler();
+        doc["paused"] == 8 && doc["waiting"] == 0
+    });
+    // Paused requests hold their blocks and grow no more.
+    let all8 = server.blocks_used();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(server.blocks_used(), all8);
+
+    let kept = streams.split_off(4);
+    drop(streams);
+    let dropped = Instant::now();
+    wait_for(
+        Duration::from_secs(1),
+        "dropped clients' blocks freed",
+        || {
+            let doc = server.scheduler();
+            doc["paused"] == 4 && running(&doc) == 4
+        },
+    );
+    let remaining = server.blocks_used();
+    assert!(dropped.elapsed() < Duration::from_secs(1));
+    // Every dropped request held at least its prompt block; the remaining four still hold
+    // exactly theirs (they stay paused, so their usage is stable).
+    assert!(remaining + 4 <= all8, "{remaining} of {all8}");
+    assert!(remaining >= 4, "{remaining}");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(server.blocks_used(), remaining);
+    let metrics = server.metrics();
+    assert_eq!(
+        sample(
+            &metrics,
+            r#"turbine_requests_cancelled_total{reason="client_disconnect"}"#
+        ),
+        Some(4.0),
+        "{metrics}"
+    );
+
+    for s in kept {
+        assert_eq!(stream_finish_reason(&s.read_rest()), "length");
+    }
+    wait_for(Duration::from_secs(1), "every block free", || {
+        server.blocks_used() == 0
+    });
+    let tier = server.kv_tier();
+    assert_eq!(tier["blocks_free"], POOL_BLOCKS, "{tier}");
+}
+
+/// P2 S-11: `/turbine/v1/scheduler` and `/turbine/v1/kv` have the Data shapes with counts that
+/// agree with the metrics; `/turbine/v1/pressure` stays 501.
+#[test]
+fn diagnostics_shapes() {
+    let server =
+        TinyServer::start_long("scheduler:\n  max_running_requests: 2\n  max_queued_requests: 4\n");
+    // Two paused streams run; two more wait behind them. The state is then stable.
+    let held: Vec<OpenStream> = (0..2).map(|_| server.hold_stream()).collect();
+    let waiting: Vec<OpenStream> = (0..2)
+        .map(|_| OpenStream::open(server.addr, &server.long_stream_body(), false))
+        .collect();
+    wait_for(Duration::from_secs(60), "2 paused and 2 waiting", || {
+        let doc = server.scheduler();
+        doc["paused"] == 2 && doc["waiting"] == 2
+    });
+
+    let doc = server.scheduler();
+    assert_eq!(
+        doc["config"],
+        json!({"max_running_requests": 2, "max_batch_tokens": 8192,
+               "prefill_chunk_tokens": 2048, "max_queued_requests": 4,
+               "chunked_prefill": true}),
+        "{doc}"
+    );
+    let keys = [
+        "config",
+        "waiting",
+        "prefilling",
+        "decoding",
+        "paused",
+        "constrained",
+        "iterations_total",
+        "preemptions_total",
+        "last_iteration",
+    ];
+    let mut got: Vec<&str> = doc
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    got.sort_unstable();
+    let mut want = keys.to_vec();
+    want.sort_unstable();
+    assert_eq!(got, want, "{doc}");
+    for k in ["prefill_tokens", "decode_tokens", "requests", "duration_ms"] {
+        assert!(doc["last_iteration"][k].is_number(), "{k}: {doc}");
+    }
+    assert_eq!(doc["constrained"], 0, "{doc}");
+    assert_eq!(doc["preemptions_total"], 0, "{doc}");
+    assert!(doc["iterations_total"].as_u64().unwrap() > 0, "{doc}");
+
+    // The documents and the metrics agree (read back to back until neither moved in between).
+    let mut agreed = false;
+    for _ in 0..50 {
+        let before = server.scheduler();
+        let tier = server.kv_tier();
+        let metrics = server.metrics();
+        let after = server.scheduler();
+        let counts = |d: &Value| {
+            ["waiting", "prefilling", "decoding", "paused"].map(|k| d[k].as_u64().unwrap())
+        };
+        if counts(&before) != counts(&after) {
+            continue;
+        }
+        let gauge = |series: &str| sample(&metrics, series).map(|v| v as u64);
+        let [waiting, prefilling, decoding, paused] = counts(&after);
+        assert_eq!(gauge("turbine_requests_queued"), Some(waiting), "{metrics}");
+        for (state, n) in [
+            ("prefilling", prefilling),
+            ("decoding", decoding),
+            ("paused", paused),
+        ] {
+            assert_eq!(
+                gauge(&format!(r#"turbine_requests_active{{state="{state}"}}"#)),
+                Some(n),
+                "{state}\n{metrics}"
+            );
+        }
+        assert_eq!(
+            gauge(r#"turbine_kv_blocks{tier="l0",state="used"}"#),
+            tier["blocks_used"].as_u64(),
+            "{metrics}"
+        );
+        agreed = true;
+        break;
+    }
+    assert!(agreed, "the scheduler document never held still");
+
+    let tier = server.kv_tier();
+    assert_eq!(tier["tier"], "l0", "{tier}");
+    assert_eq!(tier["dtype"], "bf16", "{tier}");
+    assert_eq!(tier["block_tokens"], 16, "{tier}");
+    // 2 layers × 2 × 16 tokens × 2 KV heads × 16 dims × 2 bytes.
+    assert_eq!(tier["block_bytes"], 4096, "{tier}");
+    assert_eq!(tier["blocks_total"], POOL_BLOCKS, "{tier}");
+    let used = tier["blocks_used"].as_u64().unwrap();
+    assert!(used > 0, "{tier}");
+    assert_eq!(
+        tier["blocks_free"].as_u64(),
+        Some(POOL_BLOCKS - used),
+        "{tier}"
+    );
+
+    let pressure = server.get("/turbine/v1/pressure");
+    assert_eq!(pressure.status, 501, "{}", pressure.body);
+    drop(held);
+    drop(waiting);
+}
 #[test]
 fn request_validation() {
     let server = TinyServer::start("");
@@ -511,6 +867,13 @@ fn request_validation() {
     );
     assert_eq!(resp.status, 400, "{}", resp.body);
     assert_eq!(resp.error_code(), "context_length_exceeded");
+    // The same prompt without max_tokens (whose default, the rest of the context, is 0).
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": model, "prompt": "a".repeat(600)}),
+    );
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert_eq!(resp.error_code(), "context_length_exceeded");
     // Prompt + max_tokens beyond the context, even with a short prompt.
     let resp = server.post(
         "/v1/completions",
@@ -530,7 +893,7 @@ fn request_validation() {
         &metrics,
         r#"turbine_requests_total{endpoint="/v1/completions",outcome="rejected"}"#,
     );
-    assert_eq!(rejected, Some(5.0), "{metrics}");
+    assert_eq!(rejected, Some(6.0), "{metrics}");
 }
 
 /// Writes the config, runs the server and returns its exit code and stderr; the port must still
@@ -587,6 +950,25 @@ fn startup_failures_exit_1() {
     // hip with a kernel library that does not exist.
     let tiny = dir.path().join("tiny");
     write_tiny_llama(&tiny, 7);
+
+    // The GPU KV tier is required (P2).
+    let addr = free_addr();
+    let yaml = format!(
+        "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cpu\n\
+         kv:\n  gpu:\n    enabled: false\n",
+        tiny.display()
+    );
+    assert_exit_1(&yaml, addr, "kv.gpu.enabled");
+
+    // A pool smaller than one block per running request.
+    let addr = free_addr();
+    let yaml = format!(
+        "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cpu\n\
+         kv:\n  gpu:\n    max_bytes: 16KiB\n",
+        tiny.display()
+    );
+    assert_exit_1(&yaml, addr, "kv.gpu.max_bytes");
+
     let addr = free_addr();
     let yaml = format!(
         "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: hip\n  \

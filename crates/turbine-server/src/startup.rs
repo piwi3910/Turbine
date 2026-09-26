@@ -1,27 +1,29 @@
 //! Startup order (P1 §Interfaces, contract §16.3): config (exit 2) → tracing → device discovery →
-//! kernel provider → model config, tokenizer, template → kernel registry → memory budget (each
-//! exit 1, nothing bound yet) → bind (`/health` 200, `/ready` 503 `loading_model`; exit 1) →
-//! weight load and one-token warm-up on the generation thread → `/ready` 200 → serve until
-//! SIGINT/SIGTERM (exit 0).
+//! kernel provider → model config, tokenizer, template → kernel registry → memory budget with
+//! the KV pool and the batch workspace (each exit 1, nothing bound yet) → bind (`/health` 200,
+//! `/ready` 503 `loading_model`; exit 1) → weight load, KV pool allocation and one-token warm-up
+//! on the engine thread → `/ready` 200 → serve until SIGINT/SIGTERM (exit 0).
 //!
 //! A load or warm-up failure after binding keeps `/ready` at 503 `model_load_failed` for
-//! [`FAILURE_GRACE`] and exits 1; so do three consecutive failed requests (`device_error`, C-25).
+//! [`FAILURE_GRACE`] and exits 1; so do three consecutive failed iterations or an engine panic
+//! (`device_error`, C-25).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc::UnboundedSender;
 use turbine_api::{ApiLimits, ApiState};
 use turbine_core::config::{self, Config};
 use turbine_device::{DeviceInventory, DeviceMetrics, DiscoveryOptions};
+use turbine_kv::KvMetrics;
 use turbine_model::ModelMetrics;
-use turbine_model::executor::SequenceKv;
 use turbine_observability::MetricsRegistry;
+use turbine_scheduler::SchedulerMetrics;
 
+use crate::backend::ModelBackend;
 use crate::cli::Cli;
+use crate::engine::{self, EngineMetrics, Fatal};
 use crate::exit::ExitCode;
-use crate::generation::{Engine, Fatal, Job, ModelBackend};
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
 
@@ -90,9 +92,17 @@ async fn serve(
     prepared: PreparedModel,
 ) -> ExitCode {
     let addr: SocketAddr = config.server.listen;
-    let server_metrics = ServerMetrics::register(&metrics);
-    let model_metrics = ModelMetrics::register(&metrics);
-    let backend = Arc::new(ModelBackend::new(&prepared, &inventory, server_metrics));
+    let engine_metrics = EngineMetrics {
+        server: ServerMetrics::register(&metrics),
+        model: ModelMetrics::register(&metrics),
+        scheduler: SchedulerMetrics::register(&metrics),
+        kv: KvMetrics::register(&metrics),
+    };
+    let backend = Arc::new(ModelBackend::new(
+        &prepared,
+        &inventory,
+        engine_metrics.server.clone(),
+    ));
     let state = ApiState {
         inference: backend.clone(),
         diagnostics: backend.clone(),
@@ -114,14 +124,16 @@ async fn serve(
     tracing::info!(%addr, devices = inventory.devices.len(), "listening; loading the model");
 
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
-    if let Err(e) = spawn_engine(
+    let queue_capacity = config.scheduler.max_queued_requests as usize;
+    if let Err(e) = engine::spawn(
         prepared,
         Arc::clone(&backend),
-        model_metrics,
+        engine_metrics,
+        queue_capacity,
         fatal_tx.clone(),
     ) {
         let _ = fatal_tx.send(Fatal::LoadFailed(format!(
-            "cannot start the generation thread: {e}"
+            "cannot start the engine thread: {e}"
         )));
     }
 
@@ -130,6 +142,8 @@ async fn serve(
     tokio::select! {
         served = async { server.await } => match served {
             Ok(()) => {
+                // Every connection has closed; the engine cancels anything left and stops.
+                backend.stop_engine();
                 tracing::info!("shutdown complete");
                 ExitCode::Clean
             }
@@ -151,74 +165,6 @@ async fn serve(
             ExitCode::Startup
         }
     }
-}
-
-/// Starts the generation thread: it loads the weights, warms up, marks the backend ready and
-/// then serves jobs. Failures are reported on `fatal`.
-fn spawn_engine(
-    prepared: PreparedModel,
-    backend: Arc<ModelBackend>,
-    model_metrics: ModelMetrics,
-    fatal: UnboundedSender<Fatal>,
-) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("turbine-generation".into())
-        .spawn(move || {
-            let PreparedModel {
-                provider,
-                arch,
-                generation,
-                tokenizer,
-                index,
-                registry,
-                max_seq_len,
-                block_tokens,
-                ..
-            } = prepared;
-            let warmup_token = generation.bos_token_id.unwrap_or(0);
-            let kv = match SequenceKv::new(&provider.mem, arch.kv_layout(block_tokens), max_seq_len)
-            {
-                Ok(kv) => kv,
-                Err(e) => {
-                    let _ = fatal.send(Fatal::LoadFailed(format!("KV allocation: {e}")));
-                    return;
-                }
-            };
-            let loaded = match model::load(
-                &arch,
-                &index,
-                registry,
-                provider.mem,
-                kv,
-                warmup_token,
-                &model_metrics,
-            ) {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
-                    return;
-                }
-            };
-            drop(index);
-            let mut executor = loaded.executor;
-            let mut kv = loaded.kv;
-            // Capacity 1: the slot admits one request, so at most one job is ever queued.
-            let (jobs_tx, jobs_rx) = std::sync::mpsc::sync_channel::<Job>(1);
-            backend.set_ready(jobs_tx, loaded.load_seconds, loaded.weight_bytes);
-            tracing::info!("ready");
-            let engine = Engine {
-                tokenizer,
-                max_seq_len,
-                slot: backend.slot(),
-                metrics: backend.metrics().clone(),
-                model_metrics,
-            };
-            drop(backend);
-            if let Err(message) = engine.run(&mut executor, &mut kv, &jobs_rx) {
-                let _ = fatal.send(Fatal::DeviceError(message));
-            }
-        })
-        .map(|_| ())
 }
 
 async fn shutdown_signal() {

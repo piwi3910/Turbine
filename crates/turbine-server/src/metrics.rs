@@ -1,4 +1,4 @@
-//! Server-owned Phase 1 metrics (contract §17): request outcomes, per-request latency and token
+//! Server-owned metrics (contract §17): request outcomes, per-request latency and token
 //! counts. Label values come from closed sets rendered by `as_str()`.
 
 use prometheus_client::encoding::EncodeLabelSet;
@@ -13,9 +13,9 @@ use turbine_observability::MetricsRegistry;
 pub enum Outcome {
     /// The request finished (`stop` or `length`).
     Ok,
-    /// The client went away before the request finished.
+    /// Cancelled before it finished: the client went away, a timeout fired or shutdown.
     Cancelled,
-    /// Refused before generation started (validation, context length, busy slot).
+    /// Refused before generation started (validation, context length, full queue, queue timeout).
     Rejected,
     /// Generation failed (kernel or device error).
     Failed,
@@ -72,6 +72,8 @@ pub struct ServerMetrics {
     pub e2e: Histogram,
     /// `turbine_tokens_total{kind}`.
     pub tokens: Family<TokenLabels, Counter>,
+    /// `turbine_stream_paused_total`: requests paused because their output channel was full.
+    pub stream_paused: Counter,
 }
 
 impl ServerMetrics {
@@ -102,6 +104,11 @@ impl ServerMetrics {
                 "turbine_tokens",
                 "Prompt and generated tokens",
                 Family::default(),
+            ),
+            stream_paused: reg.register(
+                "turbine_stream_paused",
+                "Requests paused because their output channel was full",
+                Counter::default(),
             ),
         }
     }
@@ -139,6 +146,7 @@ mod tests {
         m.ttft.observe(0.01);
         m.itl.observe(0.001);
         m.e2e.observe(0.1);
+        m.stream_paused.inc();
         let text = reg.render().expect("render");
         for line in [
             r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 1"#,
@@ -148,6 +156,7 @@ mod tests {
             "turbine_request_ttft_seconds_count 1",
             "turbine_request_itl_seconds_count 1",
             "turbine_request_e2e_seconds_count 1",
+            "turbine_stream_paused_total 1",
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");
         }
