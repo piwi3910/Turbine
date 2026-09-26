@@ -1737,6 +1737,19 @@ fn on_hip(p: &Pair, shape: &[usize], dtype: DType, data: &[f32]) -> Tensor {
     t
 }
 
+/// A HIP tensor holding the already encoded `raw` bytes.
+fn raw_on_hip(p: &Pair, shape: &[usize], dtype: DType, raw: &[u8]) -> Tensor {
+    let mut t = Tensor::empty(&p.hip_mem, shape, dtype).expect("HIP alloc");
+    t.storage.copy_from_host(0, raw).expect("copy to HIP");
+    t
+}
+
+/// A zeroed HIP tensor.
+fn zeros_on_hip(p: &Pair, shape: &[usize], dtype: DType) -> Tensor {
+    let n: usize = shape.iter().product();
+    raw_on_hip(p, shape, dtype, &vec![0u8; n * dtype.size_bytes()])
+}
+
 /// Mean wall time of `op` in microseconds over `iters` back-to-back calls after two warm-up
 /// calls, the stream drained before and after: the device time of the op, or its host launch
 /// time when that is longer (as in the executor, which enqueues without synchronizing).
@@ -1752,6 +1765,187 @@ fn time_us(p: &Pair, iters: u32, mut op: impl FnMut()) -> f64 {
     start.elapsed().as_secs_f64() * 1e6 / f64::from(iters)
 }
 
+// ------------------------------------------------------ decode timings (lab, P2c S-2)
+
+/// The MLP of a benchmarked model.
+#[derive(Clone, Copy)]
+enum Mlp {
+    Dense {
+        inter: usize,
+    },
+    Moe {
+        experts: usize,
+        top_k: usize,
+        inter: usize,
+    },
+}
+
+/// The decode shapes of one benchmarked model: BF16, head_dim 128, `q_heads · 128 = hidden`.
+#[derive(Clone, Copy)]
+struct BenchModel {
+    name: &'static str,
+    layers: usize,
+    hidden: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    vocab: usize,
+    rope_theta: f64,
+    /// OLMoE normalises the full Q and K projections before RoPE.
+    qk_norm: bool,
+    mlp: Mlp,
+}
+
+/// Llama-3.2-3B-Instruct and OLMoE-1B-7B-0125-Instruct (their `config.json`).
+const BENCH_MODELS: [BenchModel; 2] = [
+    BenchModel {
+        name: "llama-3.2-3b-instruct",
+        layers: 28,
+        hidden: HIDDEN,
+        q_heads: Q_HEADS,
+        kv_heads: KV_HEADS,
+        vocab: VOCAB,
+        rope_theta: ROPE_THETA,
+        qk_norm: false,
+        mlp: Mlp::Dense {
+            inter: INTERMEDIATE,
+        },
+    },
+    BenchModel {
+        name: "olmoe-1b-7b-0125-instruct",
+        layers: 16,
+        hidden: MOE_HIDDEN,
+        q_heads: 16,
+        kv_heads: 16,
+        vocab: 50304,
+        rope_theta: 10_000.0,
+        qk_norm: true,
+        mlp: Mlp::Moe {
+            experts: MOE_EXPERTS,
+            top_k: MOE_TOP_K,
+            inter: MOE_INTER,
+        },
+    },
+];
+
+/// Decode batch sizes of the timing benchmarks.
+const BENCH_BATCHES: [usize; 3] = [1, 16, 64];
+/// Mean context of every benchmarked sequence (the new token included).
+const BENCH_CTX: usize = 768;
+/// The Phase 2c default KV page size.
+const BENCH_BLOCK_TOKENS: usize = 128;
+
+impl BenchModel {
+    fn q_rows(&self) -> usize {
+        self.q_heads * HEAD_DIM
+    }
+
+    fn kv_rows(&self) -> usize {
+        self.kv_heads * HEAD_DIM
+    }
+
+    fn rope_cfg(&self) -> RopeConfig {
+        RopeConfig {
+            num_q_heads: self.q_heads as u32,
+            num_kv_heads: self.kv_heads as u32,
+            head_dim: HEAD_DIM as u32,
+            rotary_dim: HEAD_DIM as u32,
+            dtype: DType::BF16,
+        }
+    }
+
+    fn attention_cfg(&self, block_tokens: usize) -> AttentionConfig {
+        AttentionConfig {
+            kind: AttentionKind::DecodePaged,
+            num_q_heads: self.q_heads as u32,
+            num_kv_heads: self.kv_heads as u32,
+            head_dim: HEAD_DIM as u32,
+            dtype: DType::BF16,
+            block_tokens: Some(block_tokens as u32),
+            causal: true,
+        }
+    }
+
+    fn inv_freq(&self) -> Vec<f32> {
+        (0..HEAD_DIM / 2)
+            .map(|i| (1.0 / self.rope_theta.powf(2.0 * i as f64 / HEAD_DIM as f64)) as f32)
+            .collect()
+    }
+
+    /// RMSNorm calls per forward: two per layer (four with Q/K norm, whose dimension equals
+    /// `hidden` for OLMoE) plus the final norm.
+    fn norm_calls(&self) -> usize {
+        let per_layer = if self.qk_norm { 4 } else { 2 };
+        per_layer * self.layers + 1
+    }
+
+    /// The GEMMs of one decode forward, grouped by shape: (names, n, k, output dtype, calls
+    /// per forward).
+    fn gemms(&self) -> Vec<(String, usize, usize, DType, usize)> {
+        let (l, h) = (self.layers, self.hidden);
+        let mut all = vec![
+            ("q_proj", self.q_rows(), h, DType::BF16, l),
+            ("k_proj", self.kv_rows(), h, DType::BF16, l),
+            ("v_proj", self.kv_rows(), h, DType::BF16, l),
+            ("o_proj", h, self.q_rows(), DType::BF16, l),
+        ];
+        match self.mlp {
+            Mlp::Dense { inter } => all.extend([
+                ("gate_proj", inter, h, DType::BF16, l),
+                ("up_proj", inter, h, DType::BF16, l),
+                ("down_proj", h, inter, DType::BF16, l),
+            ]),
+            Mlp::Moe { experts, .. } => all.push(("router", experts, h, DType::F32, l)),
+        }
+        all.push(("lm_head", self.vocab, h, DType::F32, 1));
+        let mut grouped: Vec<(String, usize, usize, DType, usize)> = Vec::new();
+        for (name, n, k, dtype, calls) in all {
+            match grouped
+                .iter_mut()
+                .find(|g| (g.1, g.2, g.3) == (n, k, dtype))
+            {
+                Some(g) => {
+                    g.0 = format!("{}/{name}", g.0);
+                    g.4 += calls;
+                }
+                None => grouped.push((name.to_string(), n, k, dtype, calls)),
+            }
+        }
+        grouped
+    }
+}
+
+fn gemm_config(n: usize, k: usize, c_dtype: DType) -> GemmConfig {
+    GemmConfig {
+        n: n as u64,
+        k: k as u64,
+        trans_b: true,
+        a_dtype: DType::BF16,
+        b_dtype: DType::BF16,
+        c_dtype,
+    }
+}
+
+/// Context lengths of a benchmark batch: `m` sequences spread around `ctx` tokens.
+fn bench_kv_lens(m: usize, ctx: usize) -> Vec<usize> {
+    (0..m).map(|s| ctx - 28 + (5 * s) % 57).collect()
+}
+
+/// A JSON string literal.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Accumulates per-op timings into a decode-forward estimate.
 #[derive(Default)]
 struct Timings {
@@ -1760,19 +1954,23 @@ struct Timings {
 
 impl Timings {
     /// Prints one op's time per call and its share of a forward (`calls` per forward).
-    fn report(&mut self, name: &str, impl_name: &str, us: f64, calls: f64) {
-        self.per_forward_us += us * calls;
+    fn report(&mut self, label: &str, name: &str, impl_name: &str, us: f64, calls: usize) {
+        self.per_forward_us += us * calls as f64;
         println!(
-            "timing {name:<40} impl={impl_name:<22} {us:>9.1} us/call x{calls:>3} = {:>8.3} ms/forward",
-            us * calls / 1e3
+            "timing {label} {name:<44} impl={impl_name:<24} {us:>9.1} us/call x{calls:>3} = {:>8.3} ms/forward",
+            us * calls as f64 / 1e3
         );
     }
 }
 
-/// Lab microbenchmark (no assertion on speed): the time of every op of one Llama-3.2-3B decode
-/// step for a batch of 16 sequences with ~600 cached tokens each (16-token pages), per call and
-/// per forward (28 layers plus the embedding, the final norm and the LM head). Run with
-/// `scripts/lab-test.sh novanas -- --release -p turbine-kernels --test hip_ops -- decode_op_timings`.
+/// Lab microbenchmark (no assertion on speed): every op of one decode step of Llama-3.2-3B and
+/// OLMoE-1B-7B, each timed alone over back-to-back calls, for batches of 1, 16 and 64
+/// sequences with ~768 cached tokens each (128-token pages), per call and per forward (every
+/// layer plus the embedding, the final norm and the LM head). GEMM weights are cycled through
+/// enough copies that they never stay in the GPU caches, as in a forward where every layer has
+/// its own. Paged decode attention also runs at 16-token pages (the Turbine kernel, x0: for
+/// comparison) and, at batch 16, at 2,048- and 8,192-token contexts. Run with
+/// `scripts/lab-test.sh novanas -- --release -p turbine-kernels --test hip_ops -- decode_op_timings --nocapture`.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn decode_op_timings() {
@@ -1782,315 +1980,521 @@ fn decode_op_timings() {
     let _gpu = lock_gpu();
     let p = setup();
     let mut rng = Rng(5);
-    const LAYERS: f64 = 28.0;
     const ITERS: u32 = 50;
-    let m = 16usize;
-    let (q_rows, kv_rows) = (Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
-    let mut t = Timings::default();
-
-    // GEMMs: every projection of a layer, then the LM head (F32 logits).
-    let gemm = p.hip.gemm().expect("hip gemm");
-    let act = on_hip(
-        &p,
-        &[m, INTERMEDIATE],
-        DType::BF16,
-        &pattern(&mut rng, m * INTERMEDIATE, 1.0),
-    );
-    let gemms = [
-        ("q_proj/o_proj", HIDDEN, HIDDEN, DType::BF16, 2.0 * LAYERS),
-        ("k_proj/v_proj", 1024, HIDDEN, DType::BF16, 2.0 * LAYERS),
-        ("gate/up", INTERMEDIATE, HIDDEN, DType::BF16, 2.0 * LAYERS),
-        ("down", HIDDEN, INTERMEDIATE, DType::BF16, LAYERS),
-        ("lm_head", VOCAB, HIDDEN, DType::F32, 1.0),
-    ];
-    for (name, n, k, c_dtype, calls) in gemms {
-        let cfg = GemmConfig {
-            n: n as u64,
-            k: k as u64,
-            trans_b: true,
-            a_dtype: DType::BF16,
-            b_dtype: DType::BF16,
-            c_dtype,
+    let max_m = BENCH_BATCHES[BENCH_BATCHES.len() - 1];
+    for model in BENCH_MODELS {
+        let mut t: Vec<Timings> = BENCH_BATCHES.iter().map(|_| Timings::default()).collect();
+        let label = |m: usize| format!("{} b={m:<2}", model.name);
+        let (h, l) = (model.hidden, model.layers);
+        let widest = match model.mlp {
+            Mlp::Dense { inter } => inter.max(h),
+            Mlp::Moe { .. } => h,
         };
-        let scale = 1.0 / (k as f32).sqrt();
-        // Enough weight copies (cycled) that the weights never stay in the 64 MB L2/MALL
-        // caches between calls, as in a forward where every layer has its own weights.
-        let bytes = n * k * 2;
-        let raw = encode(DType::BF16, &pattern(&mut rng, n * k, scale));
-        let copies = (512usize << 20).div_ceil(bytes).max(1);
-        let ws: Vec<Tensor> = (0..copies)
-            .map(|_| raw_on_hip(&p, &[n, k], DType::BF16, &raw))
-            .collect();
-        let c = on_hip(&p, &[m, n], c_dtype, &vec![0.0; m * n]);
-        let a = TensorView::contiguous(act.storage.whole(), 0, &[m, k], DType::BF16);
-        let mut next = 0usize;
-        let us = time_us(&p, ITERS, || {
-            next = (next + 1) % copies;
-            gemm.execute(&mut GemmContext {
-                a: a.clone(),
-                b: ws[next].view(),
-                c: c.view(),
-                trans_b: true,
-                alpha: 1.0,
-                beta: 0.0,
-            })
-            .expect("gemm");
-        });
-        t.report(
-            &format!(
-                "gemm {name} m={m} n={n} k={k} ({:.0} GB/s)",
-                bytes as f64 / (us * 1e3)
-            ),
-            &gemm.implementation(&cfg),
-            us,
-            calls,
-        );
-    }
-
-    // RMSNorm (2 per layer + the final norm).
-    let cfg = NormConfig {
-        dim: HIDDEN as u64,
-        dtype: DType::BF16,
-    };
-    let norm = p.hip.norm().expect("hip norm");
-    let x = on_hip(
-        &p,
-        &[m, HIDDEN],
-        DType::BF16,
-        &pattern(&mut rng, m * HIDDEN, 1.0),
-    );
-    let w = on_hip(&p, &[HIDDEN], DType::BF16, &pattern(&mut rng, HIDDEN, 1.0));
-    let o = on_hip(&p, &[m, HIDDEN], DType::BF16, &vec![0.0; m * HIDDEN]);
-    let us = time_us(&p, ITERS, || {
-        norm.execute(&mut NormContext {
-            x: x.view(),
-            weight: w.view(),
-            out: o.view(),
-            eps: 1e-5,
-        })
-        .expect("rmsnorm");
-    });
-    t.report(
-        "rmsnorm",
-        &norm.implementation(&cfg),
-        us,
-        2.0 * LAYERS + 1.0,
-    );
-
-    // Residual add (2 per layer).
-    let cfg = ElementwiseConfig { dtype: DType::BF16 };
-    let add = p.hip.elementwise().expect("hip add");
-    let us = time_us(&p, ITERS, || {
-        add.execute(&mut ElementwiseContext {
-            a: x.view(),
-            b: o.view(),
-            out: x.view(),
-        })
-        .expect("add");
-    });
-    t.report("add", &add.implementation(&cfg), us, 2.0 * LAYERS);
-
-    // SiLU · up.
-    let cfg = ActivationConfig {
-        cols: INTERMEDIATE as u64,
-        dtype: DType::BF16,
-    };
-    let silu = p.hip.activation().expect("hip silu_mul");
-    let g = on_hip(
-        &p,
-        &[m, INTERMEDIATE],
-        DType::BF16,
-        &pattern(&mut rng, m * INTERMEDIATE, 1.0),
-    );
-    let u = on_hip(
-        &p,
-        &[m, INTERMEDIATE],
-        DType::BF16,
-        &pattern(&mut rng, m * INTERMEDIATE, 1.0),
-    );
-    let us = time_us(&p, ITERS, || {
-        silu.execute(&mut ActivationContext {
-            gate: g.view(),
-            up: u.view(),
-            out: act.view(),
-        })
-        .expect("silu_mul");
-    });
-    t.report("silu_mul", &silu.implementation(&cfg), us, LAYERS);
-
-    // RoPE on the batch's q and k rows.
-    let cfg = RopeConfig {
-        num_q_heads: Q_HEADS as u32,
-        num_kv_heads: KV_HEADS as u32,
-        head_dim: HEAD_DIM as u32,
-        rotary_dim: HEAD_DIM as u32,
-        dtype: DType::BF16,
-    };
-    let rope = p.hip.rope().expect("hip rope");
-    let half = HEAD_DIM / 2;
-    let inv_freq: Vec<f32> = (0..half)
-        .map(|i| (1.0 / ROPE_THETA.powf(2.0 * i as f64 / HEAD_DIM as f64)) as f32)
-        .collect();
-    let positions: Vec<f32> = (0..m).map(|i| (590 + i) as f32).collect();
-    let q_shape = [m, Q_HEADS, HEAD_DIM];
-    let kv_shape = [m, KV_HEADS, HEAD_DIM];
-    let q = on_hip(
-        &p,
-        &q_shape,
-        DType::BF16,
-        &pattern(&mut rng, m * q_rows, 1.0),
-    );
-    let k = on_hip(
-        &p,
-        &kv_shape,
-        DType::BF16,
-        &pattern(&mut rng, m * kv_rows, 1.0),
-    );
-    let v = on_hip(
-        &p,
-        &kv_shape,
-        DType::BF16,
-        &pattern(&mut rng, m * kv_rows, 1.0),
-    );
-    let pos = on_hip(&p, &[m], DType::I32, &positions);
-    let freq = on_hip(&p, &[half], DType::F32, &inv_freq);
-    let us = time_us(&p, ITERS, || {
-        rope.execute(&mut RopeContext {
-            cfg,
-            q: q.view(),
-            k: k.view(),
-            positions: pos.view(),
-            inv_freq: freq.view(),
-        })
-        .expect("rope");
-    });
-    t.report("rope", &rope.implementation(&cfg), us, LAYERS);
-
-    // Embedding of the batch's tokens.
-    let cfg = EmbeddingConfig {
-        hidden: HIDDEN as u64,
-        vocab_rows: VOCAB as u64,
-        dtype: DType::BF16,
-    };
-    let emb = p.hip.embedding().expect("hip embedding");
-    let table = on_hip(
-        &p,
-        &[VOCAB, HIDDEN],
-        DType::BF16,
-        &pattern(&mut rng, VOCAB * HIDDEN, 1.0),
-    );
-    let ids: Vec<f32> = (0..m).map(|i| ((i * 7919) % VOCAB) as f32).collect();
-    let ids = on_hip(&p, &[m], DType::I32, &ids);
-    let us = time_us(&p, ITERS, || {
-        emb.execute(&mut EmbeddingContext {
-            ids: ids.view(),
-            table: table.view(),
-            out: x.view(),
-            vocab_offset: 0,
-        })
-        .expect("embedding");
-    });
-    t.report("embedding", &emb.implementation(&cfg), us, 1.0);
-
-    // Paged decode attention (append + attend), 16 sequences: 16-token pages (the Turbine
-    // kernel, the default page) with ~600 cached tokens is the forward estimate; 128-token pages
-    // (Composable Kernel pagedkv) and the longer contexts are for comparison.
-    let attn = p.hip.attention().expect("hip attention");
-    let o = on_hip(&p, &q_shape, DType::BF16, &vec![0.0; m * q_rows]);
-    let cases = [
-        (16usize, 600usize, LAYERS),
-        (16, 2048, 0.0),
-        (16, 8192, 0.0),
-        (128, 600, 0.0),
-        (128, 2048, 0.0),
-        (128, 8192, 0.0),
-    ];
-    for (block_tokens, base, calls) in cases {
-        let cfg = AttentionConfig {
-            kind: AttentionKind::DecodePaged,
-            num_q_heads: Q_HEADS as u32,
-            num_kv_heads: KV_HEADS as u32,
-            head_dim: HEAD_DIM as u32,
-            dtype: DType::BF16,
-            block_tokens: Some(block_tokens as u32),
-            causal: true,
-        };
-        let kv_lens: Vec<usize> = (0..m).map(|s| base - 40 + 5 * s).collect();
-        let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
-        let max_blocks = max_kv.div_ceil(block_tokens);
-        let num_blocks = m * max_blocks;
-        let table: Vec<f32> = shuffled(&mut rng, num_blocks)
-            .iter()
-            .map(|&b| b as f32)
-            .collect();
-        let pool_len = num_blocks * 2 * block_tokens * kv_rows;
-        let pool = on_hip(
+        let act = on_hip(
             &p,
-            &[num_blocks, 2, block_tokens, KV_HEADS, HEAD_DIM],
+            &[max_m, widest],
             DType::BF16,
-            &pattern(&mut rng, pool_len, 1.0),
+            &pattern(&mut rng, max_m * widest, 1.0),
         );
-        let bt = on_hip(&p, &[m, max_blocks], DType::I32, &table);
-        let indptr: Vec<f32> = (0..=m).map(|i| i as f32).collect();
-        let ip = on_hip(&p, &[m + 1], DType::I32, &indptr);
-        let lens: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
-        let kl = on_hip(&p, &[m], DType::I32, &lens);
-        let us = time_us(&p, ITERS, || {
-            attn.execute_paged(&mut PagedAttentionContext {
-                cfg,
-                q: q.view(),
-                k_new: k.view(),
-                v_new: v.view(),
-                out: o.view(),
-                kv_layer: pool.view(),
-                block_table: bt.view(),
-                q_indptr: ip.view(),
-                kv_lens: kl.view(),
-                max_q_len: 1,
-                max_kv_len: max_kv as u32,
-                max_blocks_per_seq: max_blocks as u32,
-                scale: 1.0 / (HEAD_DIM as f32).sqrt(),
-            })
-            .expect("paged decode attention");
-        });
-        t.report(
-            &format!("attention_decode_paged bt={block_tokens} kv~{base}"),
-            &attn.implementation(&cfg),
-            us,
-            calls,
+
+        // GEMMs, one per distinct shape.
+        let gemm = p.hip.gemm().expect("hip gemm");
+        for (name, n, k, c_dtype, calls) in model.gemms() {
+            let cfg = gemm_config(n, k, c_dtype);
+            let bytes = n * k * 2;
+            let raw = encode(
+                DType::BF16,
+                &pattern(&mut rng, n * k, 1.0 / (k as f32).sqrt()),
+            );
+            // Enough weight copies (cycled) that the weights never stay in the 64 MB L2/MALL.
+            let copies = (512usize << 20).div_ceil(bytes).max(1);
+            let ws: Vec<Tensor> = (0..copies)
+                .map(|_| raw_on_hip(&p, &[n, k], DType::BF16, &raw))
+                .collect();
+            let c = zeros_on_hip(&p, &[max_m, n], c_dtype);
+            for (bi, &m) in BENCH_BATCHES.iter().enumerate() {
+                let a = TensorView::contiguous(act.storage.whole(), 0, &[m, k], DType::BF16);
+                let mut next = 0usize;
+                let us = time_us(&p, ITERS, || {
+                    next = (next + 1) % copies;
+                    gemm.execute(&mut GemmContext {
+                        a: a.clone(),
+                        b: ws[next].view(),
+                        c: c.view().rows(0, m),
+                        trans_b: true,
+                        alpha: 1.0,
+                        beta: 0.0,
+                    })
+                    .expect("gemm");
+                });
+                t[bi].report(
+                    &label(m),
+                    &format!(
+                        "gemm {name} n={n} k={k} ({:.0} GB/s)",
+                        bytes as f64 / (us * 1e3)
+                    ),
+                    &gemm.implementation(&cfg),
+                    us,
+                    calls,
+                );
+            }
+        }
+
+        // RMSNorm, residual add, SiLU · up, RoPE and the embedding.
+        let norm_cfg = NormConfig {
+            dim: h as u64,
+            dtype: DType::BF16,
+        };
+        let norm = p.hip.norm().expect("hip norm");
+        let add = p.hip.elementwise().expect("hip add");
+        let silu = p.hip.activation().expect("hip silu_mul");
+        let rope = p.hip.rope().expect("hip rope");
+        let emb = p.hip.embedding().expect("hip embedding");
+        let x = on_hip(
+            &p,
+            &[max_m, h],
+            DType::BF16,
+            &pattern(&mut rng, max_m * h, 1.0),
         );
+        let w = on_hip(&p, &[h], DType::BF16, &pattern(&mut rng, h, 1.0));
+        let o = zeros_on_hip(&p, &[max_m, h], DType::BF16);
+        let (q_rows, kv_rows) = (model.q_rows(), model.kv_rows());
+        let q = on_hip(
+            &p,
+            &[max_m, model.q_heads, HEAD_DIM],
+            DType::BF16,
+            &pattern(&mut rng, max_m * q_rows, 1.0),
+        );
+        let k = on_hip(
+            &p,
+            &[max_m, model.kv_heads, HEAD_DIM],
+            DType::BF16,
+            &pattern(&mut rng, max_m * kv_rows, 1.0),
+        );
+        let v = on_hip(
+            &p,
+            &[max_m, model.kv_heads, HEAD_DIM],
+            DType::BF16,
+            &pattern(&mut rng, max_m * kv_rows, 1.0),
+        );
+        let freq = on_hip(&p, &[HEAD_DIM / 2], DType::F32, &model.inv_freq());
+        let table = on_hip(
+            &p,
+            &[model.vocab, h],
+            DType::BF16,
+            &pattern(&mut rng, model.vocab * h, 1.0),
+        );
+        let ids: Vec<f32> = (0..max_m)
+            .map(|i| ((i * 7919) % model.vocab) as f32)
+            .collect();
+        let ids = on_hip(&p, &[max_m], DType::I32, &ids);
+        let dense = match model.mlp {
+            Mlp::Dense { inter } => Some((
+                inter,
+                on_hip(
+                    &p,
+                    &[max_m, inter],
+                    DType::BF16,
+                    &pattern(&mut rng, max_m * inter, 1.0),
+                ),
+                on_hip(
+                    &p,
+                    &[max_m, inter],
+                    DType::BF16,
+                    &pattern(&mut rng, max_m * inter, 1.0),
+                ),
+            )),
+            Mlp::Moe { .. } => None,
+        };
+        for (bi, &m) in BENCH_BATCHES.iter().enumerate() {
+            let us = time_us(&p, ITERS, || {
+                norm.execute(&mut NormContext {
+                    x: x.view().rows(0, m),
+                    weight: w.view(),
+                    out: o.view().rows(0, m),
+                    eps: 1e-5,
+                })
+                .expect("rmsnorm");
+            });
+            t[bi].report(
+                &label(m),
+                "rmsnorm",
+                &norm.implementation(&norm_cfg),
+                us,
+                model.norm_calls(),
+            );
+            let us = time_us(&p, ITERS, || {
+                add.execute(&mut ElementwiseContext {
+                    a: x.view().rows(0, m),
+                    b: o.view().rows(0, m),
+                    out: x.view().rows(0, m),
+                })
+                .expect("add");
+            });
+            let add_cfg = ElementwiseConfig { dtype: DType::BF16 };
+            t[bi].report(&label(m), "add", &add.implementation(&add_cfg), us, 2 * l);
+            if let Some((inter, g, u)) = &dense {
+                let cfg = ActivationConfig {
+                    cols: *inter as u64,
+                    dtype: DType::BF16,
+                };
+                let out = TensorView::contiguous(act.storage.whole(), 0, &[m, *inter], DType::BF16);
+                let us = time_us(&p, ITERS, || {
+                    silu.execute(&mut ActivationContext {
+                        gate: g.view().rows(0, m),
+                        up: u.view().rows(0, m),
+                        out: out.clone(),
+                    })
+                    .expect("silu_mul");
+                });
+                t[bi].report(&label(m), "silu_mul", &silu.implementation(&cfg), us, l);
+            }
+            let positions: Vec<f32> = bench_kv_lens(m, BENCH_CTX)
+                .iter()
+                .map(|&kl| (kl - 1) as f32)
+                .collect();
+            let pos = on_hip(&p, &[m], DType::I32, &positions);
+            let rope_cfg = model.rope_cfg();
+            let us = time_us(&p, ITERS, || {
+                rope.execute(&mut RopeContext {
+                    cfg: rope_cfg,
+                    q: q.view().rows(0, m),
+                    k: k.view().rows(0, m),
+                    positions: pos.view(),
+                    inv_freq: freq.view(),
+                })
+                .expect("rope");
+            });
+            t[bi].report(&label(m), "rope", &rope.implementation(&rope_cfg), us, l);
+            let emb_cfg = EmbeddingConfig {
+                hidden: h as u64,
+                vocab_rows: model.vocab as u64,
+                dtype: DType::BF16,
+            };
+            let us = time_us(&p, ITERS, || {
+                emb.execute(&mut EmbeddingContext {
+                    ids: ids.view().rows(0, m),
+                    table: table.view(),
+                    out: x.view().rows(0, m),
+                    vocab_offset: 0,
+                })
+                .expect("embedding");
+            });
+            t[bi].report(&label(m), "embedding", &emb.implementation(&emb_cfg), us, 1);
+        }
+        drop(table);
+
+        // Paged decode attention (append + attend): 128-token pages (CK pagedkv, the default)
+        // at ~768 tokens is the forward estimate; 16-token pages (the Turbine kernel) and the
+        // longer contexts at batch 16 are for comparison.
+        let attn = p.hip.attention().expect("hip attention");
+        let attn_out = zeros_on_hip(&p, &[max_m, model.q_heads, HEAD_DIM], DType::BF16);
+        for (bi, &m) in BENCH_BATCHES.iter().enumerate() {
+            let mut cases = vec![(BENCH_BLOCK_TOKENS, BENCH_CTX, l), (16, BENCH_CTX, 0)];
+            if m == 16 {
+                cases.extend([(16, 2048, 0), (16, 8192, 0), (128, 2048, 0), (128, 8192, 0)]);
+            }
+            for (block_tokens, ctx, calls) in cases {
+                let cfg = model.attention_cfg(block_tokens);
+                let kv_lens = bench_kv_lens(m, ctx);
+                let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
+                let max_blocks = max_kv.div_ceil(block_tokens);
+                let num_blocks = m * max_blocks;
+                let table: Vec<f32> = shuffled(&mut rng, num_blocks)
+                    .iter()
+                    .map(|&b| b as f32)
+                    .collect();
+                let pool = on_hip(
+                    &p,
+                    &[num_blocks, 2, block_tokens, model.kv_heads, HEAD_DIM],
+                    DType::BF16,
+                    &pattern(&mut rng, num_blocks * 2 * block_tokens * kv_rows, 1.0),
+                );
+                let bt = on_hip(&p, &[m, max_blocks], DType::I32, &table);
+                let indptr: Vec<f32> = (0..=m).map(|i| i as f32).collect();
+                let ip = on_hip(&p, &[m + 1], DType::I32, &indptr);
+                let lens: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
+                let kl = on_hip(&p, &[m], DType::I32, &lens);
+                let us = time_us(&p, ITERS, || {
+                    attn.execute_paged(&mut PagedAttentionContext {
+                        cfg,
+                        q: q.view().rows(0, m),
+                        k_new: k.view().rows(0, m),
+                        v_new: v.view().rows(0, m),
+                        out: attn_out.view().rows(0, m),
+                        kv_layer: pool.view(),
+                        block_table: bt.view(),
+                        q_indptr: ip.view(),
+                        kv_lens: kl.view(),
+                        max_q_len: 1,
+                        max_kv_len: max_kv as u32,
+                        max_blocks_per_seq: max_blocks as u32,
+                        scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                    })
+                    .expect("paged decode attention");
+                });
+                t[bi].report(
+                    &label(m),
+                    &format!("attention_decode_paged bt={block_tokens} kv~{ctx}"),
+                    &attn.implementation(&cfg),
+                    us,
+                    calls,
+                );
+            }
+        }
+
+        // The MoE block: routing, the expert-offset read-back `moe_experts` needs on the host,
+        // the accumulator reset and the grouped expert GEMMs (one layer's stacked experts,
+        // larger than the GPU caches).
+        if let Mlp::Moe {
+            experts,
+            top_k,
+            inter,
+        } = model.mlp
+        {
+            let moe = p.hip.moe().expect("hip moe");
+            let route_cfg = MoeRouteConfig {
+                num_experts: experts as u32,
+                top_k: top_k as u32,
+                renormalize: false,
+            };
+            let experts_cfg = MoeExpertsConfig {
+                hidden: h as u32,
+                inter: inter as u32,
+                num_experts: experts as u32,
+                top_k: top_k as u32,
+                expert_begin: 0,
+                expert_end: experts as u32,
+                dtype: DType::BF16,
+            };
+            let up_scale = 1.0 / (h as f32).sqrt();
+            let gate_raw = encode(
+                DType::BF16,
+                &pattern(&mut rng, experts * inter * h, up_scale),
+            );
+            let w_gate = raw_on_hip(&p, &[experts, inter, h], DType::BF16, &gate_raw);
+            let w_up = raw_on_hip(&p, &[experts, inter, h], DType::BF16, &gate_raw);
+            drop(gate_raw);
+            let w_down = on_hip(
+                &p,
+                &[experts, h, inter],
+                DType::BF16,
+                &pattern(&mut rng, experts * inter * h, 1.0 / (inter as f32).sqrt()),
+            );
+            let logits = on_hip(
+                &p,
+                &[max_m, experts],
+                DType::F32,
+                &rng.normal(max_m * experts, 1.0),
+            );
+            let topk_ids = zeros_on_hip(&p, &[max_m, top_k], DType::I32);
+            let topk_w = zeros_on_hip(&p, &[max_m, top_k], DType::F32);
+            let sorted = zeros_on_hip(&p, &[max_m * top_k], DType::I32);
+            let offsets = zeros_on_hip(&p, &[experts + 1], DType::I32);
+            let acc_zeros = zeros_on_hip(&p, &[max_m, h], DType::BF16);
+            let ws_bytes = max_m * top_k * ((2 * h + 3 * inter) * 2 + 8) + 5 * 256;
+            let workspace = zeros_on_hip(&p, &[ws_bytes.div_ceil(2)], DType::BF16);
+            for (bi, &m) in BENCH_BATCHES.iter().enumerate() {
+                let sorted_rows =
+                    TensorView::contiguous(sorted.storage.whole(), 0, &[m * top_k], DType::I32);
+                let route = || {
+                    moe.route(&mut MoeRouteContext {
+                        cfg: route_cfg,
+                        router_logits: logits.view().rows(0, m),
+                        topk_ids: topk_ids.view().rows(0, m),
+                        topk_weights: topk_w.view().rows(0, m),
+                        sorted_rows: sorted_rows.clone(),
+                        expert_offsets: offsets.view(),
+                    })
+                    .expect("moe_route");
+                };
+                let us = time_us(&p, ITERS, route);
+                t[bi].report(
+                    &label(m),
+                    "moe_route",
+                    &moe.implementation_route(&route_cfg),
+                    us,
+                    l,
+                );
+                let read_offsets = || -> Vec<i32> {
+                    offsets
+                        .storage
+                        .whole()
+                        .read_bytes()
+                        .expect("read offsets")
+                        .chunks_exact(4)
+                        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect()
+                };
+                let us = time_us(&p, ITERS, || {
+                    read_offsets();
+                });
+                t[bi].report(&label(m), "moe_offsets_read", "d2h", us, l);
+                // Kernel ABI v2 has no device-to-device copy or memset: `0 + 0` resets it.
+                let add_cfg = ElementwiseConfig { dtype: DType::BF16 };
+                let us = time_us(&p, ITERS, || {
+                    add.execute(&mut ElementwiseContext {
+                        a: acc_zeros.view().rows(0, m),
+                        b: acc_zeros.view().rows(0, m),
+                        out: o.view().rows(0, m),
+                    })
+                    .expect("zero the accumulator");
+                });
+                t[bi].report(
+                    &label(m),
+                    "moe_zero (add)",
+                    &add.implementation(&add_cfg),
+                    us,
+                    l,
+                );
+                let host_offsets = read_offsets();
+                let ws_len = m * top_k * ((2 * h + 3 * inter) * 2 + 8) + 5 * 256;
+                let us = time_us(&p, ITERS, || {
+                    moe.experts(&mut MoeExpertsContext {
+                        cfg: experts_cfg,
+                        x: x.view().rows(0, m),
+                        w_gate: w_gate.view(),
+                        w_up: w_up.view(),
+                        w_down: w_down.view(),
+                        sorted_rows: sorted_rows.clone(),
+                        expert_offsets: offsets.view(),
+                        topk_weights: topk_w.view().rows(0, m),
+                        host_expert_offsets: &host_offsets,
+                        out: o.view().rows(0, m),
+                        workspace: Some(workspace.storage.slice(0, ws_len)),
+                    })
+                    .expect("moe_experts");
+                });
+                let active = host_offsets.windows(2).filter(|w| w[1] > w[0]).count();
+                t[bi].report(
+                    &label(m),
+                    &format!("moe_experts ({active} active experts)"),
+                    &moe.implementation_experts(&experts_cfg),
+                    us,
+                    l,
+                );
+            }
+        }
+        for (bi, &m) in BENCH_BATCHES.iter().enumerate() {
+            println!(
+                "timing {} decode forward estimate (sum of the ops): {:.3} ms",
+                label(m),
+                t[bi].per_forward_us / 1e3
+            );
+        }
     }
-    println!(
-        "timing decode forward estimate (sum of the ops): {:.3} ms",
-        t.per_forward_us / 1e3
-    );
 }
 
-/// A HIP tensor holding the already encoded `raw` bytes.
-fn raw_on_hip(p: &Pair, shape: &[usize], dtype: DType, raw: &[u8]) -> Tensor {
-    let mut t = Tensor::empty(&p.hip_mem, shape, dtype).expect("HIP alloc");
-    t.storage.copy_from_host(0, raw).expect("copy to HIP");
-    t
+/// The MLP weights of one synthetic decoder layer.
+enum BenchMlp {
+    Dense {
+        w_gate: Tensor,
+        w_up: Tensor,
+        w_down: Tensor,
+    },
+    Moe {
+        router: Tensor,
+        /// `[experts, inter, hidden]`, `[experts, inter, hidden]`, `[experts, hidden, inter]`.
+        w_gate: Tensor,
+        w_up: Tensor,
+        w_down: Tensor,
+    },
 }
 
-/// One synthetic Llama-3.2-3B decoder layer: its own weights and its own KV pool.
+/// One synthetic decoder layer: its own weights (its KV pool lives beside it).
 struct BenchLayer {
     norm: Tensor,
     wq: Tensor,
     wk: Tensor,
     wv: Tensor,
     wo: Tensor,
-    w_gate: Tensor,
-    w_up: Tensor,
-    w_down: Tensor,
-    pool: Tensor,
+    mlp: BenchMlp,
 }
 
-/// Lab microbenchmark (no assertion on speed): one whole synthetic Llama-3.2-3B decode forward
-/// (28 layers with distinct weights and KV pools, so nothing stays in the GPU caches between
-/// layers) for 16 sequences with ~600 cached tokens each, with 16- and 128-token pages. Prints
-/// the host enqueue time and the time until the stream drains. Run with
-/// `scripts/lab-test.sh novanas -- --release -p turbine-kernels --test hip_ops -- decode_forward_timing`.
+/// One op of a profiled synthetic forward.
+struct OpTiming {
+    op: &'static str,
+    name: &'static str,
+    imp: String,
+    calls: usize,
+    total_us: f64,
+}
+
+/// Times each op of a synthetic forward from its launch until the stream drains (as the
+/// executors' profile mode does) while `on`; runs it untimed otherwise.
+struct OpClock<'a> {
+    mem: &'a dyn DeviceMemory,
+    on: bool,
+    ops: Vec<OpTiming>,
+}
+
+impl OpClock<'_> {
+    fn op<R>(
+        &mut self,
+        op: &'static str,
+        name: &'static str,
+        imp: &str,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        if !self.on {
+            return f();
+        }
+        let start = std::time::Instant::now();
+        let out = f();
+        self.mem.synchronize().expect("synchronize");
+        let us = start.elapsed().as_secs_f64() * 1e6;
+        match self.ops.iter_mut().find(|o| o.op == op && o.name == name) {
+            Some(o) => {
+                o.calls += 1;
+                o.total_us += us;
+            }
+            None => self.ops.push(OpTiming {
+                op,
+                name,
+                imp: imp.to_string(),
+                calls: 1,
+                total_us: us,
+            }),
+        }
+        out
+    }
+}
+
+/// The implementation name of every op of a synthetic forward.
+struct BenchImpls {
+    gemm: [String; 4],
+    router: String,
+    lm_head: String,
+    mlp: [String; 3],
+    norm: String,
+    add: String,
+    silu: String,
+    rope: String,
+    embedding: String,
+    route: String,
+    experts: String,
+}
+
+/// Rows `[0, m)` of `t`.
+fn rows(t: &Tensor, m: usize) -> TensorView<'_> {
+    t.view().rows(0, m)
+}
+
+/// Rows `[0, m)` of a `[rows, n · 128]` activation as `[m, n, 128]`.
+fn heads(t: &Tensor, m: usize, n: usize) -> TensorView<'_> {
+    TensorView::contiguous(t.storage.whole(), 0, &[m, n, HEAD_DIM], DType::BF16)
+}
+
+/// Lab microbenchmark (no assertion on speed): one whole synthetic decode forward of
+/// Llama-3.2-3B and of OLMoE-1B-7B (every layer with its own weights and KV pool, so nothing
+/// stays in the GPU caches between layers) for batches of 1, 16 and 64 sequences with ~768
+/// cached tokens each. At 128-token pages (the default) it prints one line per model and batch,
+/// `op_timings: {"model","batch","block_tokens","forward_ms","host_enqueue_ms","ops":[{"op",
+/// "name","impl","calls","us_per_call"}]}`: the forward time (mean of 5 unprofiled runs) and
+/// each op's time per call and calls per forward, measured from its launch until the stream
+/// drained (the executors' profile mode, so `perf forward_profile` compares like with like).
+/// At 16-token pages it prints the forward time only. Run with
+/// `scripts/lab-test.sh novanas -- --release -p turbine-kernels --test hip_ops -- decode_forward_timing --nocapture`.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn decode_forward_timing() {
@@ -2100,54 +2504,9 @@ fn decode_forward_timing() {
     let _gpu = lock_gpu();
     let p = setup();
     let mut rng = Rng(6);
-    const LAYERS: usize = 28;
-    let m = 16usize;
-    let (q_rows, kv_rows) = (Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
-    let kv_lens: Vec<usize> = (0..m).map(|s| 560 + 5 * s).collect();
-    let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
-
-    let weight = |rng: &mut Rng, n: usize, k: usize| {
-        encode(DType::BF16, &pattern(rng, n * k, 1.0 / (k as f32).sqrt()))
-    };
-    let (w_qo, w_kv) = (
-        weight(&mut rng, HIDDEN, HIDDEN),
-        weight(&mut rng, 1024, HIDDEN),
-    );
-    let (w_gu, w_d) = (
-        weight(&mut rng, INTERMEDIATE, HIDDEN),
-        weight(&mut rng, HIDDEN, INTERMEDIATE),
-    );
-    let norm_raw = encode(DType::BF16, &pattern(&mut rng, HIDDEN, 1.0));
-    let table_raw = encode(DType::BF16, &pattern(&mut rng, VOCAB * HIDDEN, 1.0));
-    let embed = raw_on_hip(&p, &[VOCAB, HIDDEN], DType::BF16, &table_raw);
-    drop(table_raw);
-    let final_norm = raw_on_hip(&p, &[HIDDEN], DType::BF16, &norm_raw);
-
-    // Activations.
-    let zeros = |cols: usize| on_hip(&p, &[m, cols], DType::BF16, &vec![0.0; m * cols]);
-    let (x, h, proj) = (zeros(HIDDEN), zeros(HIDDEN), zeros(HIDDEN));
-    let (q, attn_out) = (zeros(q_rows), zeros(q_rows));
-    let (k, v) = (zeros(kv_rows), zeros(kv_rows));
-    let (gate, up, act) = (
-        zeros(INTERMEDIATE),
-        zeros(INTERMEDIATE),
-        zeros(INTERMEDIATE),
-    );
-    let logits = on_hip(&p, &[m, VOCAB], DType::F32, &vec![0.0; m * VOCAB]);
-    let ids: Vec<f32> = (0..m).map(|i| ((i * 7919) % VOCAB) as f32).collect();
-    let ids = on_hip(&p, &[m], DType::I32, &ids);
-    let positions: Vec<f32> = kv_lens.iter().map(|&k| (k - 1) as f32).collect();
-    let positions = on_hip(&p, &[m], DType::I32, &positions);
-    let half = HEAD_DIM / 2;
-    let inv_freq: Vec<f32> = (0..half)
-        .map(|i| (1.0 / ROPE_THETA.powf(2.0 * i as f64 / HEAD_DIM as f64)) as f32)
-        .collect();
-    let inv_freq = on_hip(&p, &[half], DType::F32, &inv_freq);
-    let indptr: Vec<f32> = (0..=m).map(|i| i as f32).collect();
-    let q_indptr = on_hip(&p, &[m + 1], DType::I32, &indptr);
-    let lens: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
-    let kv_lens_t = on_hip(&p, &[m], DType::I32, &lens);
-
+    const RUNS: u32 = 5;
+    const PROFILED_RUNS: usize = 3;
+    let max_m = BENCH_BATCHES[BENCH_BATCHES.len() - 1];
     let gemm = p.hip.gemm().expect("hip gemm");
     let norm = p.hip.norm().expect("hip norm");
     let add = p.hip.elementwise().expect("hip add");
@@ -2155,152 +2514,423 @@ fn decode_forward_timing() {
     let rope = p.hip.rope().expect("hip rope");
     let emb = p.hip.embedding().expect("hip embedding");
     let attn = p.hip.attention().expect("hip attention");
-    let rope_cfg = RopeConfig {
-        num_q_heads: Q_HEADS as u32,
-        num_kv_heads: KV_HEADS as u32,
-        head_dim: HEAD_DIM as u32,
-        rotary_dim: HEAD_DIM as u32,
-        dtype: DType::BF16,
-    };
-    let linear = |a: &Tensor, w: &Tensor, c: &Tensor| {
-        gemm.execute(&mut GemmContext {
-            a: a.view(),
-            b: w.view(),
-            c: c.view(),
-            trans_b: true,
-            alpha: 1.0,
-            beta: 0.0,
-        })
-        .expect("gemm");
-    };
-    let rmsnorm = |x: &Tensor, w: &Tensor, out: &Tensor| {
-        norm.execute(&mut NormContext {
-            x: x.view(),
-            weight: w.view(),
-            out: out.view(),
-            eps: 1e-5,
-        })
-        .expect("rmsnorm");
-    };
-    let residual = || {
-        add.execute(&mut ElementwiseContext {
-            a: x.view(),
-            b: proj.view(),
-            out: x.view(),
-        })
-        .expect("add");
-    };
-    fn heads(t: &Tensor, n: usize) -> TensorView<'_> {
-        let rows = t.shape[0];
-        TensorView::contiguous(t.storage.whole(), 0, &[rows, n, HEAD_DIM], DType::BF16)
-    }
-
-    for block_tokens in [16usize, 128] {
-        let max_blocks = max_kv.div_ceil(block_tokens);
-        let num_blocks = m * max_blocks;
-        let table: Vec<f32> = shuffled(&mut rng, num_blocks)
-            .iter()
-            .map(|&b| b as f32)
-            .collect();
-        let block_table = on_hip(&p, &[m, max_blocks], DType::I32, &table);
-        let pool_shape = [num_blocks, 2, block_tokens, KV_HEADS, HEAD_DIM];
-        let pool_raw = encode(
-            DType::BF16,
-            &pattern(&mut rng, num_blocks * 2 * block_tokens * kv_rows, 1.0),
+    let moe = p.hip.moe().expect("hip moe");
+    for model in BENCH_MODELS {
+        let (h, layers) = (model.hidden, model.layers);
+        let (q_rows, kv_rows) = (model.q_rows(), model.kv_rows());
+        let weight = |rng: &mut Rng, n: usize, k: usize| {
+            encode(DType::BF16, &pattern(rng, n * k, 1.0 / (k as f32).sqrt()))
+        };
+        let (w_q, w_kv, w_o) = (
+            weight(&mut rng, q_rows, h),
+            weight(&mut rng, kv_rows, h),
+            weight(&mut rng, h, q_rows),
         );
-        let layers: Vec<BenchLayer> = (0..LAYERS)
+        let norm_raw = encode(DType::BF16, &pattern(&mut rng, h, 1.0));
+        let mlp_raw: [Vec<u8>; 2] = match model.mlp {
+            Mlp::Dense { inter } => [weight(&mut rng, inter, h), weight(&mut rng, h, inter)],
+            Mlp::Moe { experts, inter, .. } => [
+                weight(&mut rng, experts * inter, h),
+                encode(
+                    DType::BF16,
+                    &pattern(&mut rng, experts * h * inter, 1.0 / (inter as f32).sqrt()),
+                ),
+            ],
+        };
+        let router_raw = match model.mlp {
+            Mlp::Moe { experts, .. } => weight(&mut rng, experts, h),
+            Mlp::Dense { .. } => Vec::new(),
+        };
+        let layer_weights: Vec<BenchLayer> = (0..layers)
             .map(|_| BenchLayer {
-                norm: raw_on_hip(&p, &[HIDDEN], DType::BF16, &norm_raw),
-                wq: raw_on_hip(&p, &[HIDDEN, HIDDEN], DType::BF16, &w_qo),
-                wk: raw_on_hip(&p, &[1024, HIDDEN], DType::BF16, &w_kv),
-                wv: raw_on_hip(&p, &[1024, HIDDEN], DType::BF16, &w_kv),
-                wo: raw_on_hip(&p, &[HIDDEN, HIDDEN], DType::BF16, &w_qo),
-                w_gate: raw_on_hip(&p, &[INTERMEDIATE, HIDDEN], DType::BF16, &w_gu),
-                w_up: raw_on_hip(&p, &[INTERMEDIATE, HIDDEN], DType::BF16, &w_gu),
-                w_down: raw_on_hip(&p, &[HIDDEN, INTERMEDIATE], DType::BF16, &w_d),
-                pool: raw_on_hip(&p, &pool_shape, DType::BF16, &pool_raw),
+                norm: raw_on_hip(&p, &[h], DType::BF16, &norm_raw),
+                wq: raw_on_hip(&p, &[q_rows, h], DType::BF16, &w_q),
+                wk: raw_on_hip(&p, &[kv_rows, h], DType::BF16, &w_kv),
+                wv: raw_on_hip(&p, &[kv_rows, h], DType::BF16, &w_kv),
+                wo: raw_on_hip(&p, &[h, q_rows], DType::BF16, &w_o),
+                mlp: match model.mlp {
+                    Mlp::Dense { inter } => BenchMlp::Dense {
+                        w_gate: raw_on_hip(&p, &[inter, h], DType::BF16, &mlp_raw[0]),
+                        w_up: raw_on_hip(&p, &[inter, h], DType::BF16, &mlp_raw[0]),
+                        w_down: raw_on_hip(&p, &[h, inter], DType::BF16, &mlp_raw[1]),
+                    },
+                    Mlp::Moe { experts, inter, .. } => BenchMlp::Moe {
+                        router: raw_on_hip(&p, &[experts, h], DType::BF16, &router_raw),
+                        w_gate: raw_on_hip(&p, &[experts, inter, h], DType::BF16, &mlp_raw[0]),
+                        w_up: raw_on_hip(&p, &[experts, inter, h], DType::BF16, &mlp_raw[0]),
+                        w_down: raw_on_hip(&p, &[experts, h, inter], DType::BF16, &mlp_raw[1]),
+                    },
+                },
             })
             .collect();
-        let attn_cfg = AttentionConfig {
-            kind: AttentionKind::DecodePaged,
-            num_q_heads: Q_HEADS as u32,
-            num_kv_heads: KV_HEADS as u32,
-            head_dim: HEAD_DIM as u32,
+        drop(mlp_raw);
+        let table_raw = encode(DType::BF16, &pattern(&mut rng, model.vocab * h, 1.0));
+        let embed = raw_on_hip(&p, &[model.vocab, h], DType::BF16, &table_raw);
+        let lm_head = raw_on_hip(&p, &[model.vocab, h], DType::BF16, &table_raw);
+        drop(table_raw);
+        let final_norm = raw_on_hip(&p, &[h], DType::BF16, &norm_raw);
+
+        // Activations and routing buffers for the largest batch.
+        let zeros = |cols: usize| zeros_on_hip(&p, &[max_m, cols], DType::BF16);
+        let (x, hn, proj, acc_zeros) = (zeros(h), zeros(h), zeros(h), zeros(h));
+        let (q, q_raw, attn_out) = (zeros(q_rows), zeros(q_rows), zeros(q_rows));
+        let (k, k_raw, v) = (zeros(kv_rows), zeros(kv_rows), zeros(kv_rows));
+        let dense_inter = match model.mlp {
+            Mlp::Dense { inter } => inter,
+            Mlp::Moe { .. } => 1,
+        };
+        let (gate, up, act) = (zeros(dense_inter), zeros(dense_inter), zeros(dense_inter));
+        let (experts, top_k, moe_inter) = match model.mlp {
+            Mlp::Moe {
+                experts,
+                top_k,
+                inter,
+            } => (experts, top_k, inter),
+            Mlp::Dense { .. } => (1, 1, 1),
+        };
+        let router_logits = zeros_on_hip(&p, &[max_m, experts], DType::F32);
+        let topk_ids = zeros_on_hip(&p, &[max_m, top_k], DType::I32);
+        let topk_w = zeros_on_hip(&p, &[max_m, top_k], DType::F32);
+        let sorted = zeros_on_hip(&p, &[max_m * top_k], DType::I32);
+        let offsets = zeros_on_hip(&p, &[experts + 1], DType::I32);
+        let moe_ws_len = |m: usize| m * top_k * ((2 * h + 3 * moe_inter) * 2 + 8) + 5 * 256;
+        let workspace = zeros_on_hip(&p, &[moe_ws_len(max_m).div_ceil(2)], DType::BF16);
+        let logits = zeros_on_hip(&p, &[max_m, model.vocab], DType::F32);
+        let inv_freq = on_hip(&p, &[HEAD_DIM / 2], DType::F32, &model.inv_freq());
+
+        let kv_lens = bench_kv_lens(max_m, BENCH_CTX);
+        let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
+        let ids: Vec<f32> = (0..max_m)
+            .map(|i| ((i * 7919) % model.vocab) as f32)
+            .collect();
+        let ids = on_hip(&p, &[max_m], DType::I32, &ids);
+        let positions: Vec<f32> = kv_lens.iter().map(|&k| (k - 1) as f32).collect();
+        let positions = on_hip(&p, &[max_m], DType::I32, &positions);
+        let indptr: Vec<f32> = (0..=max_m).map(|i| i as f32).collect();
+        let q_indptr = on_hip(&p, &[max_m + 1], DType::I32, &indptr);
+        let lens: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
+        let kv_lens_t = on_hip(&p, &[max_m], DType::I32, &lens);
+
+        let rope_cfg = model.rope_cfg();
+        let norm_cfg = NormConfig {
+            dim: h as u64,
             dtype: DType::BF16,
-            block_tokens: Some(block_tokens as u32),
-            causal: true,
         };
-        let attn_impl = attn.implementation(&attn_cfg);
-        let forward = || {
-            emb.execute(&mut EmbeddingContext {
-                ids: ids.view(),
-                table: embed.view(),
-                out: x.view(),
-                vocab_offset: 0,
-            })
-            .expect("embedding");
-            for l in &layers {
-                rmsnorm(&x, &l.norm, &h);
-                linear(&h, &l.wq, &q);
-                linear(&h, &l.wk, &k);
-                linear(&h, &l.wv, &v);
-                rope.execute(&mut RopeContext {
-                    cfg: rope_cfg,
-                    q: heads(&q, Q_HEADS),
-                    k: heads(&k, KV_HEADS),
-                    positions: positions.view(),
-                    inv_freq: inv_freq.view(),
-                })
-                .expect("rope");
-                attn.execute_paged(&mut PagedAttentionContext {
-                    cfg: attn_cfg,
-                    q: heads(&q, Q_HEADS),
-                    k_new: heads(&k, KV_HEADS),
-                    v_new: heads(&v, KV_HEADS),
-                    out: heads(&attn_out, Q_HEADS),
-                    kv_layer: l.pool.view(),
-                    block_table: block_table.view(),
-                    q_indptr: q_indptr.view(),
-                    kv_lens: kv_lens_t.view(),
-                    max_q_len: 1,
-                    max_kv_len: max_kv as u32,
-                    max_blocks_per_seq: max_blocks as u32,
-                    scale: 1.0 / (HEAD_DIM as f32).sqrt(),
-                })
-                .expect("paged decode attention");
-                linear(&attn_out, &l.wo, &proj);
-                residual();
-                rmsnorm(&x, &l.norm, &h);
-                linear(&h, &l.w_gate, &gate);
-                linear(&h, &l.w_up, &up);
-                silu.execute(&mut ActivationContext {
-                    gate: gate.view(),
-                    up: up.view(),
-                    out: act.view(),
-                })
-                .expect("silu_mul");
-                linear(&act, &l.w_down, &proj);
-                residual();
+        let route_cfg = MoeRouteConfig {
+            num_experts: experts as u32,
+            top_k: top_k as u32,
+            renormalize: false,
+        };
+        let experts_cfg = MoeExpertsConfig {
+            hidden: h as u32,
+            inter: moe_inter as u32,
+            num_experts: experts as u32,
+            top_k: top_k as u32,
+            expert_begin: 0,
+            expert_end: experts as u32,
+            dtype: DType::BF16,
+        };
+        let gi = |n: usize, k: usize, c: DType| gemm.implementation(&gemm_config(n, k, c));
+        let impls = BenchImpls {
+            gemm: [
+                gi(q_rows, h, DType::BF16),
+                gi(kv_rows, h, DType::BF16),
+                gi(kv_rows, h, DType::BF16),
+                gi(h, q_rows, DType::BF16),
+            ],
+            router: gi(experts, h, DType::F32),
+            lm_head: gi(model.vocab, h, DType::F32),
+            mlp: [
+                gi(dense_inter, h, DType::BF16),
+                gi(dense_inter, h, DType::BF16),
+                gi(h, dense_inter, DType::BF16),
+            ],
+            norm: norm.implementation(&norm_cfg),
+            add: add.implementation(&ElementwiseConfig { dtype: DType::BF16 }),
+            silu: silu.implementation(&ActivationConfig {
+                cols: dense_inter as u64,
+                dtype: DType::BF16,
+            }),
+            rope: rope.implementation(&rope_cfg),
+            embedding: emb.implementation(&EmbeddingConfig {
+                hidden: h as u64,
+                vocab_rows: model.vocab as u64,
+                dtype: DType::BF16,
+            }),
+            route: moe.implementation_route(&route_cfg),
+            experts: moe.implementation_experts(&experts_cfg),
+        };
+
+        for block_tokens in [BENCH_BLOCK_TOKENS, 16] {
+            let max_blocks = max_kv.div_ceil(block_tokens);
+            let num_blocks = max_m * max_blocks;
+            let table: Vec<f32> = shuffled(&mut rng, num_blocks)
+                .iter()
+                .map(|&b| b as f32)
+                .collect();
+            let block_table = on_hip(&p, &[max_m, max_blocks], DType::I32, &table);
+            let pool_shape = [num_blocks, 2, block_tokens, model.kv_heads, HEAD_DIM];
+            let pool_raw = encode(
+                DType::BF16,
+                &pattern(&mut rng, num_blocks * 2 * block_tokens * kv_rows, 1.0),
+            );
+            let pools: Vec<Tensor> = (0..layers)
+                .map(|_| raw_on_hip(&p, &pool_shape, DType::BF16, &pool_raw))
+                .collect();
+            drop(pool_raw);
+            let attn_cfg = model.attention_cfg(block_tokens);
+            let attn_impl = attn.implementation(&attn_cfg);
+            let ip = &impls;
+            let forward = |m: usize, clock: &mut OpClock<'_>| {
+                let linear = |a: TensorView<'_>, w: &Tensor, c: TensorView<'_>| {
+                    gemm.execute(&mut GemmContext {
+                        a,
+                        b: w.view(),
+                        c,
+                        trans_b: true,
+                        alpha: 1.0,
+                        beta: 0.0,
+                    })
+                    .expect("gemm");
+                };
+                let rmsnorm = |x: TensorView<'_>, w: &Tensor, out: TensorView<'_>| {
+                    norm.execute(&mut NormContext {
+                        x,
+                        weight: w.view(),
+                        out,
+                        eps: 1e-5,
+                    })
+                    .expect("rmsnorm");
+                };
+                let residual = || {
+                    add.execute(&mut ElementwiseContext {
+                        a: rows(&x, m),
+                        b: rows(&proj, m),
+                        out: rows(&x, m),
+                    })
+                    .expect("add");
+                };
+                clock.op("embedding", "embedding", &ip.embedding, || {
+                    emb.execute(&mut EmbeddingContext {
+                        ids: rows(&ids, m),
+                        table: embed.view(),
+                        out: rows(&x, m),
+                        vocab_offset: 0,
+                    })
+                    .expect("embedding")
+                });
+                for (l, pool) in layer_weights.iter().zip(&pools) {
+                    clock.op("rmsnorm", "input_norm", &ip.norm, || {
+                        rmsnorm(rows(&x, m), &l.norm, rows(&hn, m))
+                    });
+                    // OLMoE projects Q and K into raw buffers and normalises them into q, k.
+                    let (q_dst, k_dst) = if model.qk_norm {
+                        (&q_raw, &k_raw)
+                    } else {
+                        (&q, &k)
+                    };
+                    clock.op("gemm", "q_proj", &ip.gemm[0], || {
+                        linear(rows(&hn, m), &l.wq, rows(q_dst, m))
+                    });
+                    clock.op("gemm", "k_proj", &ip.gemm[1], || {
+                        linear(rows(&hn, m), &l.wk, rows(k_dst, m))
+                    });
+                    clock.op("gemm", "v_proj", &ip.gemm[2], || {
+                        linear(rows(&hn, m), &l.wv, rows(&v, m))
+                    });
+                    if model.qk_norm {
+                        clock.op("rmsnorm", "q_norm", &ip.norm, || {
+                            rmsnorm(rows(&q_raw, m), &l.norm, rows(&q, m))
+                        });
+                        clock.op("rmsnorm", "k_norm", &ip.norm, || {
+                            rmsnorm(rows(&k_raw, m), &l.norm, rows(&k, m))
+                        });
+                    }
+                    clock.op("rope", "rope", &ip.rope, || {
+                        rope.execute(&mut RopeContext {
+                            cfg: rope_cfg,
+                            q: heads(&q, m, model.q_heads),
+                            k: heads(&k, m, model.kv_heads),
+                            positions: rows(&positions, m),
+                            inv_freq: inv_freq.view(),
+                        })
+                        .expect("rope")
+                    });
+                    clock.op("attention_decode_paged", "attention", &attn_impl, || {
+                        attn.execute_paged(&mut PagedAttentionContext {
+                            cfg: attn_cfg,
+                            q: heads(&q, m, model.q_heads),
+                            k_new: heads(&k, m, model.kv_heads),
+                            v_new: heads(&v, m, model.kv_heads),
+                            out: heads(&attn_out, m, model.q_heads),
+                            kv_layer: pool.view(),
+                            block_table: rows(&block_table, m),
+                            q_indptr: q_indptr.view().rows(0, m + 1),
+                            kv_lens: rows(&kv_lens_t, m),
+                            max_q_len: 1,
+                            max_kv_len: max_kv as u32,
+                            max_blocks_per_seq: max_blocks as u32,
+                            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                        })
+                        .expect("paged decode attention")
+                    });
+                    clock.op("gemm", "o_proj", &ip.gemm[3], || {
+                        linear(rows(&attn_out, m), &l.wo, rows(&proj, m))
+                    });
+                    clock.op("add", "residual", &ip.add, residual);
+                    clock.op("rmsnorm", "post_norm", &ip.norm, || {
+                        rmsnorm(rows(&x, m), &l.norm, rows(&hn, m))
+                    });
+                    match &l.mlp {
+                        BenchMlp::Dense {
+                            w_gate,
+                            w_up,
+                            w_down,
+                        } => {
+                            clock.op("gemm", "gate_proj", &ip.mlp[0], || {
+                                linear(rows(&hn, m), w_gate, rows(&gate, m))
+                            });
+                            clock.op("gemm", "up_proj", &ip.mlp[1], || {
+                                linear(rows(&hn, m), w_up, rows(&up, m))
+                            });
+                            clock.op("silu_mul", "silu_mul", &ip.silu, || {
+                                silu.execute(&mut ActivationContext {
+                                    gate: rows(&gate, m),
+                                    up: rows(&up, m),
+                                    out: rows(&act, m),
+                                })
+                                .expect("silu_mul")
+                            });
+                            clock.op("gemm", "down_proj", &ip.mlp[2], || {
+                                linear(rows(&act, m), w_down, rows(&proj, m))
+                            });
+                        }
+                        BenchMlp::Moe {
+                            router,
+                            w_gate,
+                            w_up,
+                            w_down,
+                        } => {
+                            clock.op("gemm", "router", &ip.router, || {
+                                linear(rows(&hn, m), router, rows(&router_logits, m))
+                            });
+                            let sorted_rows = TensorView::contiguous(
+                                sorted.storage.whole(),
+                                0,
+                                &[m * top_k],
+                                DType::I32,
+                            );
+                            clock.op("moe_route", "moe_route", &ip.route, || {
+                                moe.route(&mut MoeRouteContext {
+                                    cfg: route_cfg,
+                                    router_logits: rows(&router_logits, m),
+                                    topk_ids: rows(&topk_ids, m),
+                                    topk_weights: rows(&topk_w, m),
+                                    sorted_rows: sorted_rows.clone(),
+                                    expert_offsets: offsets.view(),
+                                })
+                                .expect("moe_route")
+                            });
+                            let host_offsets: Vec<i32> =
+                                clock.op("moe_offsets_read", "moe_offsets_read", "d2h", || {
+                                    offsets
+                                        .storage
+                                        .whole()
+                                        .read_bytes()
+                                        .expect("read the expert offsets")
+                                        .chunks_exact(4)
+                                        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                        .collect()
+                                });
+                            // `0 + 0`: kernel ABI v2 has no device-to-device copy or memset.
+                            clock.op("add", "moe_zero", &ip.add, || {
+                                add.execute(&mut ElementwiseContext {
+                                    a: rows(&acc_zeros, m),
+                                    b: rows(&acc_zeros, m),
+                                    out: rows(&proj, m),
+                                })
+                                .expect("zero the accumulator")
+                            });
+                            clock.op("moe_experts", "moe_experts", &ip.experts, || {
+                                moe.experts(&mut MoeExpertsContext {
+                                    cfg: experts_cfg,
+                                    x: rows(&hn, m),
+                                    w_gate: w_gate.view(),
+                                    w_up: w_up.view(),
+                                    w_down: w_down.view(),
+                                    sorted_rows: sorted_rows.clone(),
+                                    expert_offsets: offsets.view(),
+                                    topk_weights: rows(&topk_w, m),
+                                    host_expert_offsets: &host_offsets,
+                                    out: rows(&proj, m),
+                                    workspace: Some(workspace.storage.slice(0, moe_ws_len(m))),
+                                })
+                                .expect("moe_experts")
+                            });
+                        }
+                    }
+                    clock.op("add", "residual", &ip.add, residual);
+                }
+                clock.op("rmsnorm", "final_norm", &ip.norm, || {
+                    rmsnorm(rows(&x, m), &final_norm, rows(&hn, m))
+                });
+                clock.op("gemm", "lm_head", &ip.lm_head, || {
+                    linear(rows(&hn, m), &lm_head, rows(&logits, m))
+                });
+            };
+
+            for &m in &BENCH_BATCHES {
+                let mut clock = OpClock {
+                    mem: p.hip_mem.as_ref(),
+                    on: false,
+                    ops: Vec::new(),
+                };
+                forward(m, &mut clock);
+                p.hip_mem.synchronize().expect("synchronize");
+                let (mut host, mut total) = (0.0f64, 0.0f64);
+                for _ in 0..RUNS {
+                    let start = std::time::Instant::now();
+                    forward(m, &mut clock);
+                    host += start.elapsed().as_secs_f64();
+                    p.hip_mem.synchronize().expect("synchronize");
+                    total += start.elapsed().as_secs_f64();
+                }
+                let forward_ms = total * 1e3 / f64::from(RUNS);
+                let host_ms = host * 1e3 / f64::from(RUNS);
+                println!(
+                    "timing decode forward {} b={m} kv~{BENCH_CTX} block_tokens={block_tokens} attention={}: \
+                     {forward_ms:.3} ms (host enqueue {host_ms:.3} ms)",
+                    model.name, attn_impl
+                );
+                if block_tokens != BENCH_BLOCK_TOKENS {
+                    continue;
+                }
+                clock.on = true;
+                for _ in 0..PROFILED_RUNS {
+                    forward(m, &mut clock);
+                }
+                let ops: Vec<String> = clock
+                    .ops
+                    .iter()
+                    .map(|o| {
+                        format!(
+                            "{{\"op\":{},\"name\":{},\"impl\":{},\"calls\":{},\"us_per_call\":{:.1}}}",
+                            json_str(o.op),
+                            json_str(o.name),
+                            json_str(&o.imp),
+                            o.calls / PROFILED_RUNS,
+                            o.total_us / o.calls as f64
+                        )
+                    })
+                    .collect();
+                let profiled_ms: f64 =
+                    clock.ops.iter().map(|o| o.total_us).sum::<f64>() / 1e3 / PROFILED_RUNS as f64;
+                println!(
+                    "op_timings: {{\"model\":{},\"batch\":{m},\"block_tokens\":{block_tokens},\"forward_ms\":{forward_ms:.3},\"host_enqueue_ms\":{host_ms:.3},\"profiled_ms\":{profiled_ms:.3},\"ops\":[{}]}}",
+                    json_str(model.name),
+                    ops.join(",")
+                );
             }
-            rmsnorm(&x, &final_norm, &h);
-            linear(&h, &embed, &logits);
-        };
-        forward();
-        p.hip_mem.synchronize().expect("synchronize");
-        let runs = 5u32;
-        let (mut host, mut total) = (0.0f64, 0.0f64);
-        for _ in 0..runs {
-            let start = std::time::Instant::now();
-            forward();
-            host += start.elapsed().as_secs_f64();
-            p.hip_mem.synchronize().expect("synchronize");
-            total += start.elapsed().as_secs_f64();
         }
-        println!(
-            "timing decode forward m={m} kv~{max_kv} block_tokens={block_tokens} attention={attn_impl}: \
-             {:.3} ms (host enqueue {:.3} ms)",
-            total * 1e3 / f64::from(runs),
-            host * 1e3 / f64::from(runs)
-        );
     }
 }

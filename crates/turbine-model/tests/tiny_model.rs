@@ -23,7 +23,8 @@ use turbine_kernels::{
 use turbine_model::config::{Architecture, ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
     self, BatchInput, ExecutorOptions, LlamaExecutor, Logits, LogitsSlot, ModelExecutor,
-    OlmoeExecutor, ReducedRow, RowReduce, SeqSlice, SequenceKv, TraceTensor, build_executor,
+    OlmoeExecutor, OpProfile, ReducedRow, RowReduce, SeqSlice, SequenceKv, TraceTensor,
+    build_executor,
 };
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
@@ -2316,5 +2317,224 @@ fn check_reduced_rows(
                 }
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------------ op profile (P2c S-2)
+
+/// The profile switches both executors carry, so one test body drives either.
+trait Profiled: ModelExecutor {
+    fn set_profile(&mut self, on: bool);
+    fn take_profile(&mut self) -> OpProfile;
+}
+
+impl Profiled for LlamaExecutor {
+    fn set_profile(&mut self, on: bool) {
+        LlamaExecutor::set_profile(self, on);
+    }
+    fn take_profile(&mut self) -> OpProfile {
+        LlamaExecutor::take_profile(self)
+    }
+}
+
+impl Profiled for OlmoeExecutor {
+    fn set_profile(&mut self, on: bool) {
+        OlmoeExecutor::set_profile(self, on);
+    }
+    fn take_profile(&mut self) -> OpProfile {
+        OlmoeExecutor::take_profile(self)
+    }
+}
+
+/// A tiny checkpoint's concrete executor on the CPU provider (batches of up to
+/// [`MAX_SEQ_LEN`] tokens and [`MAX_SEQS`] sequences), and the registry it runs on.
+fn cpu_profiled(
+    spec: &TinySpec,
+    mem: &Arc<dyn DeviceMemory>,
+) -> (Box<dyn Profiled>, Arc<KernelRegistry>) {
+    let cfg = &spec.config;
+    let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+    let slots = match cfg.architecture {
+        Architecture::Llama => llama_slots(cfg),
+        Architecture::Olmoe => olmoe_slots(cfg),
+        other => panic!("no tiny checkpoint for {other:?}"),
+    };
+    let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load");
+    let provider = cpu_reference_provider();
+    let order = [provider.id()];
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let opts = ExecutorOptions::default();
+    let reqs =
+        executor::available_requirements(cfg, BLOCK_TOKENS, opts, std::slice::from_ref(&provider));
+    let registry = Arc::new(
+        KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+            .expect("every op has a provider"),
+    );
+    let mem = Arc::clone(mem);
+    let exec: Box<dyn Profiled> = match cfg.architecture {
+        Architecture::Llama => Box::new(
+            LlamaExecutor::new(
+                cfg,
+                weights,
+                Arc::clone(&registry),
+                mem,
+                BLOCK_TOKENS,
+                MAX_SEQ_LEN,
+                MAX_SEQS,
+                opts,
+            )
+            .expect("llama executor"),
+        ),
+        _ => Box::new(
+            OlmoeExecutor::new(
+                cfg,
+                weights,
+                Arc::clone(&registry),
+                mem,
+                BLOCK_TOKENS,
+                MAX_SEQ_LEN,
+                MAX_SEQS,
+                opts,
+            )
+            .expect("olmoe executor"),
+        ),
+    };
+    (exec, registry)
+}
+
+/// For both tiny checkpoints on the CPU provider, a decode forward of 3 sequences with profile
+/// mode on yields one entry per op kind the forward runs (each at its selected implementation)
+/// with the per-layer call pattern × layers, plus the batch upload and the logits read (and
+/// OLMoE's expert-offset read and accumulator reset once per layer); the profile's total is
+/// within the forward's wall time, the logits are bitwise those of the same forward with
+/// profile mode off, and a profile-off forward records nothing.
+#[test]
+fn op_profile_accounts_forward() {
+    const PROMPT: u32 = 20;
+    let tmp = TempDir::new("tiny-model-op-profile");
+    for spec in both_checkpoints(&tmp) {
+        let arch = spec.config.architecture;
+        let layers = spec.config.num_layers;
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let (mut exec, registry) = cpu_profiled(&spec, &mem);
+        let layout = *exec.kv_layout();
+        let per_seq = (PROMPT + 1).div_ceil(BLOCK_TOKENS);
+        let storage = pool(&mem, &layout, 3 * per_seq);
+        let kv = pool_view(&storage, &layout, 3 * per_seq);
+        let tables: Vec<Vec<BlockId>> = (0..3)
+            .map(|s| (0..per_seq).map(|b| BlockId(s * per_seq + b)).collect())
+            .collect();
+        for (s, table) in tables.iter().enumerate() {
+            let tokens: Vec<u32> = (0..PROMPT)
+                .map(|i| (i * 13 + 5 * s as u32 + 1) % spec.vocab)
+                .collect();
+            run_seq(exec.as_mut(), &kv, table, &tokens, 0);
+        }
+        // The same decode step twice (it rewrites the same K/V slot): profile off, then on.
+        let tokens = [3u32, 7, 11];
+        let positions = [PROMPT; 3];
+        let seqs: Vec<SeqSlice<'_>> = tables
+            .iter()
+            .enumerate()
+            .map(|(s, table)| SeqSlice {
+                seq: SeqId(s as u64 + 1),
+                q_start: s as u32,
+                q_len: 1,
+                kv_len: PROMPT + 1,
+                block_table: table,
+                reduce: None,
+            })
+            .collect();
+        let batch = BatchInput {
+            tokens: &tokens,
+            positions: &positions,
+            seqs: &seqs,
+            kv: &kv,
+        };
+        let off = exec.forward(&batch).expect("profile-off decode");
+        assert!(
+            exec.take_profile().entries.is_empty(),
+            "{arch:?}: profile-off forward recorded ops"
+        );
+        exec.set_profile(true);
+        let start = std::time::Instant::now();
+        let on = exec.forward(&batch).expect("profiled decode");
+        let wall_ms = start.elapsed().as_secs_f64() * 1e3;
+        let profile = exec.take_profile();
+        assert_eq!(on, off, "{arch:?}: profiling changed the logits");
+
+        // Each op kind runs one implementation on the CPU provider: the one selected for it.
+        let cpu = |op: &str| -> &str {
+            let impls: Vec<&str> = registry
+                .selections()
+                .iter()
+                .filter(|s| s.op.as_str() == op)
+                .map(|s| s.implementation.as_str())
+                .collect();
+            assert!(!impls.is_empty(), "{op} was never selected");
+            assert!(impls.iter().all(|i| *i == impls[0]), "{op}: {impls:?}");
+            impls[0]
+        };
+        let mut want: Vec<(&str, &str, u32)> = vec![
+            ("batch_upload", "host", 1),
+            ("embedding", cpu("embedding"), 1),
+            ("rope", cpu("rope"), layers),
+            (
+                "attention_decode_paged",
+                cpu("attention_decode_paged"),
+                layers,
+            ),
+            // Fused ops: every residual add a norm follows is one add_rmsnorm (the post-attention
+            // norm, the next layer's input norm); the last layer's last residual is a plain add.
+            ("add_rmsnorm", cpu("add_rmsnorm"), 2 * layers - 1),
+            ("add", cpu("add"), 1),
+            ("logits_read", "d2h", 1),
+        ];
+        // The default options: Q/K/V (and Llama's gate/up) one GEMM each when the projections are
+        // fused, one per projection otherwise.
+        let fused = ExecutorOptions::default().fused_projections;
+        let (qkv, gate_up) = if fused { (1, 1) } else { (3, 2) };
+        match arch {
+            Architecture::Llama => want.extend([
+                // The first input norm and the final norm of the (consecutive) last rows.
+                ("rmsnorm", cpu("rmsnorm"), 2),
+                // Q/K/V, O, gate/up and down per layer plus the LM head.
+                ("gemm", cpu("gemm"), (qkv + gate_up + 2) * layers + 1),
+                ("silu_mul", cpu("silu_mul"), layers),
+            ]),
+            _ => want.extend([
+                // The first input norm, Q and K norms per layer and the final norm.
+                ("rmsnorm", cpu("rmsnorm"), 2 * layers + 2),
+                // Q/K/V, O and the router per layer plus the LM head.
+                ("gemm", cpu("gemm"), (qkv + 2) * layers + 1),
+                ("moe_route", cpu("moe_route"), layers),
+                // The CPU provider reads the group sizes on the device: no offsets read.
+                ("moe_zero", "add", layers),
+                ("moe_experts", cpu("moe_experts"), layers),
+            ]),
+        }
+        let mut got: Vec<(&str, &str, u32)> = profile
+            .entries
+            .iter()
+            .map(|e| (e.op.as_str(), e.r#impl.as_str(), e.calls))
+            .collect();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want, "{arch:?}: profile entries");
+        assert!(
+            profile.entries.iter().all(|e| e.total_ms >= 0.0),
+            "{arch:?}: negative time"
+        );
+        let total = profile.total_ms();
+        assert!(
+            total > 0.0 && total <= wall_ms,
+            "{arch:?}: profiled {total} ms against a {wall_ms} ms forward"
+        );
+
+        // Profiling off again: nothing is recorded and nothing is left over.
+        exec.set_profile(false);
+        let again = exec.forward(&batch).expect("decode after profiling");
+        assert_eq!(again, off, "{arch:?}");
+        assert!(exec.take_profile().entries.is_empty(), "{arch:?}");
     }
 }

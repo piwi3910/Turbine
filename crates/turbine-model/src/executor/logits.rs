@@ -16,6 +16,7 @@ use turbine_kernels::{
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, TensorView};
 
+use super::profile::{self, Profiler};
 use super::{Logits, ReducedRow, RowReduce, SeqSlice};
 use crate::ModelError;
 use crate::config::ModelArchConfig;
@@ -165,8 +166,14 @@ impl LogitsHead {
     }
 
     /// Enqueues the reduction of the planned rows (when any) and makes the iteration's one
-    /// device-to-host copy (it synchronizes the stream): the full rows and the reductions.
-    pub fn finish(&mut self, registry: &KernelRegistry) -> Result<Logits, ModelError> {
+    /// device-to-host copy (it synchronizes the stream): the full rows and the reductions. Both
+    /// go through `profiler` (`logits_reduce`, then [`profile::LOGITS_READ`]) on `mem`.
+    pub fn finish(
+        &mut self,
+        registry: &KernelRegistry,
+        profiler: &Profiler,
+        mem: &dyn DeviceMemory,
+    ) -> Result<Logits, ModelError> {
         let (n, r, vocab) = (self.seqs, self.reduced, self.vocab);
         let top_n = self.batch_top_n();
         let base = n * vocab;
@@ -194,37 +201,44 @@ impl LogitsHead {
             let block = |off: usize, shape: &[usize], dtype| {
                 TensorView::contiguous(out, base + off, shape, dtype)
             };
-            registry
-                .logits_reduce(&cfg)
-                .execute(&mut LogitsReduceContext {
-                    logits: TensorView::contiguous(out, 0, &[r, vocab], DType::F32),
-                    temperature: rows_f32(0),
-                    uniform: rows_f32(r),
-                    top_p: rows_f32(2 * r),
-                    mode: TensorView::contiguous(inp, 3 * r, &[r], DType::I32),
-                    top_ids: block(0, &[r, top_n], DType::I32),
-                    top_values: block(r * top_n, &[r, top_n], DType::F32),
-                    lse: block(2 * r * top_n, &[r], DType::F32),
-                    sampled: block(2 * r * top_n + r, &[r], DType::I32),
-                    sampled_logit: block(2 * r * top_n + 2 * r, &[r], DType::F32),
-                    rows: r as u32,
-                })?;
+            profiler.op(mem, OpConfig::LogitsReduce(cfg), || {
+                registry
+                    .logits_reduce(&cfg)
+                    .execute(&mut LogitsReduceContext {
+                        logits: TensorView::contiguous(out, 0, &[r, vocab], DType::F32),
+                        temperature: rows_f32(0),
+                        uniform: rows_f32(r),
+                        top_p: rows_f32(2 * r),
+                        mode: TensorView::contiguous(inp, 3 * r, &[r], DType::I32),
+                        top_ids: block(0, &[r, top_n], DType::I32),
+                        top_values: block(r * top_n, &[r, top_n], DType::F32),
+                        lse: block(2 * r * top_n, &[r], DType::F32),
+                        sampled: block(2 * r * top_n + r, &[r], DType::I32),
+                        sampled_logit: block(2 * r * top_n + 2 * r, &[r], DType::F32),
+                        rows: r as u32,
+                    })
+                    .map_err(ModelError::from)
+            })?;
         }
         let result = if r > 0 { r * result_words(top_n) } else { 0 };
         let start = r * vocab;
-        let raw = self
-            .out
-            .slice(4 * start, 4 * (base + result - start))
-            .read_bytes()?;
-        let words: Vec<[u8; 4]> = raw
-            .chunks_exact(4)
-            .map(|c| [c[0], c[1], c[2], c[3]])
-            .collect();
         let full = (n - r) * vocab;
-        let data: Vec<f32> = words[..full]
-            .iter()
-            .map(|&w| f32::from_le_bytes(w))
-            .collect();
+        // The copy and its decoding into host words and F32 rows, timed together.
+        let (words, data) = profiler.step(mem, profile::LOGITS_READ, profile::D2H, || {
+            let raw = self
+                .out
+                .slice(4 * start, 4 * (base + result - start))
+                .read_bytes()?;
+            let words: Vec<[u8; 4]> = raw
+                .chunks_exact(4)
+                .map(|c| [c[0], c[1], c[2], c[3]])
+                .collect();
+            let data: Vec<f32> = words[..full]
+                .iter()
+                .map(|&w| f32::from_le_bytes(w))
+                .collect();
+            Ok((words, data))
+        })?;
         let res = &words[full..];
         let f = |i: usize| f32::from_le_bytes(res[i]);
         let id = |i: usize| i32::from_le_bytes(res[i]);

@@ -28,7 +28,9 @@
 //! Diagnostics: [`LlamaExecutor::set_trace`] makes each forward record every intermediate
 //! tensor ([`TraceTensor`]) with a blocking device read after the op that wrote it; comparing
 //! two providers' traces locates the first op where their numerics part. Off by default and
-//! free when off (one branch per op).
+//! free when off (one branch per op). [`LlamaExecutor::set_profile`] times every op instead
+//! ([`OpProfile`]): each op goes through [`LlamaExecutor::op`], which synchronises the stream
+//! after it while profiling and costs one branch otherwise.
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
@@ -44,6 +46,7 @@ use turbine_tensor::{DeviceMemory, KvPoolView, Tensor, TensorView};
 
 use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
 use super::logits::{self, LogitsHead};
+use super::profile::{self, OpProfile, Profiler};
 use super::{BatchInput, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, Split, rope};
 use crate::ModelError;
 use crate::config::ModelArchConfig;
@@ -260,6 +263,9 @@ pub struct LlamaExecutor {
     kv_layout: KvLayout,
     limits: BatchLimits,
     registry: Arc<KernelRegistry>,
+    mem: Arc<dyn DeviceMemory>,
+    /// The op sequence ([`LlamaExecutor::requirements`] of these options).
+    opts: ExecutorOptions,
     /// Q/K/V (`[q_dim, kv_dim, kv_dim]`) and gate/up (`[inter, inter]`) in their buffers, fused
     /// or not per [`ExecutorOptions::fused_projections`].
     qkv: Split<3>,
@@ -283,6 +289,7 @@ pub struct LlamaExecutor {
     timings: ForwardTimings,
     /// `Some` while tracing: the recorded tensors not yet taken.
     trace: RefCell<Option<Vec<TraceTensor>>>,
+    profiler: Profiler,
 }
 
 pub(super) fn limits(
@@ -482,6 +489,8 @@ impl LlamaExecutor {
             kv_layout: limits.layout,
             limits,
             registry,
+            mem,
+            opts,
             qkv,
             gate_up,
             add_norm,
@@ -495,6 +504,7 @@ impl LlamaExecutor {
             host: HostBatch::default(),
             timings: ForwardTimings::default(),
             trace: RefCell::new(None),
+            profiler: Profiler::default(),
         })
     }
 
@@ -512,6 +522,31 @@ impl LlamaExecutor {
             .as_mut()
             .map(std::mem::take)
             .unwrap_or_default()
+    }
+
+    /// Diagnostics: while enabled every op of every forward is followed by a stream
+    /// synchronisation and timed into the profile returned by [`LlamaExecutor::take_profile`].
+    /// Disabling drops what was recorded. Off by default.
+    pub fn set_profile(&mut self, on: bool) {
+        let mut reqs = Self::requirements(&self.cfg, self.kv_layout.block_tokens, self.opts);
+        reqs.push(logits::reduce_requirement(&self.cfg));
+        self.profiler.set(on, &self.registry, &reqs);
+    }
+
+    /// The op profile recorded since profiling was enabled or last taken; empty when it is off.
+    pub fn take_profile(&mut self) -> OpProfile {
+        self.profiler.take()
+    }
+
+    /// Runs the registry op `spec` through `f`: every op of the forward goes through here, so
+    /// profile mode times each one.
+    fn op(
+        &self,
+        spec: OpConfig,
+        f: impl FnOnce() -> Result<(), KernelError>,
+    ) -> Result<(), ModelError> {
+        self.profiler
+            .op(self.mem.as_ref(), spec, || f().map_err(ModelError::from))
     }
 
     /// Records `view` (`[rows, cols]` contiguous) under `name` when tracing.
@@ -556,15 +591,16 @@ impl LlamaExecutor {
         c: TensorView<'_>,
     ) -> Result<(), ModelError> {
         let cfg = gemm_cfg(w.shape[0], w.shape[1], c.dtype);
-        self.registry.gemm(&cfg).execute(&mut GemmContext {
-            a,
-            b: w,
-            c,
-            trans_b: true,
-            alpha: 1.0,
-            beta: 0.0,
-        })?;
-        Ok(())
+        self.op(OpConfig::Gemm(cfg), || {
+            self.registry.gemm(&cfg).execute(&mut GemmContext {
+                a,
+                b: w,
+                c,
+                trans_b: true,
+                alpha: 1.0,
+                beta: 0.0,
+            })
+        })
     }
 
     fn rmsnorm(
@@ -573,15 +609,15 @@ impl LlamaExecutor {
         w: &Tensor,
         out: TensorView<'_>,
     ) -> Result<(), ModelError> {
-        self.registry
-            .norm(&norm_cfg(&self.dims))
-            .execute(&mut NormContext {
+        let cfg = norm_cfg(&self.dims);
+        self.op(OpConfig::Rmsnorm(cfg), || {
+            self.registry.norm(&cfg).execute(&mut NormContext {
                 x,
                 weight: w.view(),
                 out,
                 eps: self.cfg.rms_norm_eps,
-            })?;
-        Ok(())
+            })
+        })
     }
 
     /// `x[0..t] += proj[0..t]` (the residual add), then with `norm`
@@ -596,24 +632,29 @@ impl LlamaExecutor {
         );
         match norm {
             Some(w) if self.add_norm => {
-                self.registry
-                    .add_rmsnorm(&add_norm_cfg(self.dims.hidden))
-                    .execute(&mut AddRmsnormContext {
-                        residual: x,
-                        x: proj,
-                        weight: w.view(),
-                        out: h,
-                        eps: self.cfg.rms_norm_eps,
-                    })?;
+                let cfg = add_norm_cfg(self.dims.hidden);
+                self.op(OpConfig::AddRmsnorm(cfg), || {
+                    self.registry
+                        .add_rmsnorm(&cfg)
+                        .execute(&mut AddRmsnormContext {
+                            residual: x,
+                            x: proj,
+                            weight: w.view(),
+                            out: h,
+                            eps: self.cfg.rms_norm_eps,
+                        })
+                })?;
             }
             _ => {
-                self.registry
-                    .elementwise(&ADD_CFG)
-                    .execute(&mut ElementwiseContext {
-                        a: x.clone(),
-                        b: proj,
-                        out: x.clone(),
-                    })?;
+                self.op(OpConfig::Add(ADD_CFG), || {
+                    self.registry
+                        .elementwise(&ADD_CFG)
+                        .execute(&mut ElementwiseContext {
+                            a: x.clone(),
+                            b: proj,
+                            out: x.clone(),
+                        })
+                })?;
                 if let Some(w) = norm {
                     self.rmsnorm(x, w, h)?;
                 }
@@ -657,12 +698,14 @@ impl LlamaExecutor {
         let k_heads = |t| self.qkv.part(&b.qkv, 1, t, &[d.kv_heads, d.head_dim]);
         let v_heads = |t| self.qkv.part(&b.qkv, 2, t, &[d.kv_heads, d.head_dim]);
         let rope = rope_cfg(&self.cfg);
-        self.registry.rope(&rope).execute(&mut RopeContext {
-            cfg: rope,
-            q: q_heads(t),
-            k: k_heads(t),
-            positions: self.meta.positions_view(p),
-            inv_freq: b.inv_freq.view(),
+        self.op(OpConfig::Rope(rope), || {
+            self.registry.rope(&rope).execute(&mut RopeContext {
+                cfg: rope,
+                q: q_heads(t),
+                k: k_heads(t),
+                positions: self.meta.positions_view(p),
+                inv_freq: b.inv_freq.view(),
+            })
         })?;
         self.record(li, "q_rope", q(t))?;
         self.record(li, "k_rope", k(t))?;
@@ -672,23 +715,25 @@ impl LlamaExecutor {
             AttentionKind::PrefillPaged
         };
         let attn = attention_cfg(&self.cfg, kind, self.kv_layout.block_tokens);
-        self.registry
-            .attention(&attn)
-            .execute_paged(&mut PagedAttentionContext {
-                cfg: attn,
-                q: q_heads(t),
-                k_new: k_heads(t),
-                v_new: v_heads(t),
-                out: Self::heads(&b.attn, t, d.heads, d.head_dim),
-                kv_layer: batch::kv_layer(kv, i),
-                block_table: self.meta.block_table_view(p),
-                q_indptr: self.meta.q_indptr_view(p),
-                kv_lens: self.meta.kv_lens_view(p),
-                max_q_len: p.max_q_len,
-                max_kv_len: p.max_kv_len,
-                max_blocks_per_seq: p.max_blocks_per_seq,
-                scale: 1.0 / (d.head_dim as f32).sqrt(),
-            })?;
+        self.op(OpConfig::Attention(attn), || {
+            self.registry
+                .attention(&attn)
+                .execute_paged(&mut PagedAttentionContext {
+                    cfg: attn,
+                    q: q_heads(t),
+                    k_new: k_heads(t),
+                    v_new: v_heads(t),
+                    out: Self::heads(&b.attn, t, d.heads, d.head_dim),
+                    kv_layer: batch::kv_layer(kv, i),
+                    block_table: self.meta.block_table_view(p),
+                    q_indptr: self.meta.q_indptr_view(p),
+                    kv_lens: self.meta.kv_lens_view(p),
+                    max_q_len: p.max_q_len,
+                    max_kv_len: p.max_kv_len,
+                    max_blocks_per_seq: p.max_blocks_per_seq,
+                    scale: 1.0 / (d.head_dim as f32).sqrt(),
+                })
+        })?;
         self.record(li, "attn", Self::rows(&b.attn, t))?;
         self.linear(Self::rows(&b.attn, t), l.wo.view(), Self::rows(&b.proj, t))?;
         self.record(li, "o_proj", Self::rows(&b.proj, t))?;
@@ -709,13 +754,16 @@ impl LlamaExecutor {
         }
         self.record(li, "gate", gate(t))?;
         self.record(li, "up", up(t))?;
-        self.registry
-            .activation(&activation_cfg(d))
-            .execute(&mut ActivationContext {
-                gate: gate(t),
-                up: up(t),
-                out: Self::rows(&b.act, t),
-            })?;
+        let silu = activation_cfg(d);
+        self.op(OpConfig::SiluMul(silu), || {
+            self.registry
+                .activation(&silu)
+                .execute(&mut ActivationContext {
+                    gate: gate(t),
+                    up: up(t),
+                    out: Self::rows(&b.act, t),
+                })
+        })?;
         self.record(li, "act", Self::rows(&b.act, t))?;
         self.linear(
             Self::rows(&b.act, t),
@@ -755,21 +803,33 @@ impl ModelExecutor for LlamaExecutor {
     }
 
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
-        let p = self.host.pack(batch, &self.limits)?;
-        self.meta.upload(&self.host)?;
+        let (host, meta, limits) = (&mut self.host, &mut self.meta, &self.limits);
+        let p = self.profiler.step(
+            self.mem.as_ref(),
+            profile::BATCH_UPLOAD,
+            profile::HOST,
+            || {
+                let p = host.pack(batch, limits)?;
+                meta.upload(host)?;
+                Ok(p)
+            },
+        )?;
         let launch_started = Instant::now();
 
         let b = &self.bufs;
         let d = &self.dims;
         let (t, n) = (p.total_q, p.num_seqs);
-        self.registry
-            .embedding(&embedding_cfg(d))
-            .execute(&mut EmbeddingContext {
-                ids: self.meta.ids_view(&p),
-                table: self.embed.view(),
-                out: Self::rows(&b.x, t),
-                vocab_offset: 0,
-            })?;
+        let embedding = embedding_cfg(d);
+        self.op(OpConfig::Embedding(embedding), || {
+            self.registry
+                .embedding(&embedding)
+                .execute(&mut EmbeddingContext {
+                    ids: self.meta.ids_view(&p),
+                    table: self.embed.view(),
+                    out: Self::rows(&b.x, t),
+                    vocab_offset: 0,
+                })
+        })?;
         self.record(None, "embed", Self::rows(&b.x, t))?;
         if let Some(first) = self.layers.first() {
             self.rmsnorm(Self::rows(&b.x, t), &first.input_norm, Self::rows(&b.h, t))?;
@@ -786,7 +846,9 @@ impl ModelExecutor for LlamaExecutor {
         let wait_started = Instant::now();
         // The iteration's one device-to-host copy (it synchronizes the stream), after the
         // device reduction of the rows that asked for one.
-        let logits = self.head.finish(&self.registry)?;
+        let logits = self
+            .head
+            .finish(&self.registry, &self.profiler, self.mem.as_ref())?;
         self.timings = ForwardTimings {
             launch: wait_started - launch_started,
             device_wait: wait_started.elapsed(),

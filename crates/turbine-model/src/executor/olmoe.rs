@@ -34,13 +34,17 @@
 //! copy); otherwise (the HIP small-m path, up to 512 routed rows: every decode-only batch of up
 //! to 64 sequences) the forward makes no device-to-host copy until the logits, its only bulk
 //! device-to-host copy.
+//!
+//! Diagnostics: [`OlmoeExecutor::set_profile`] times every op ([`OpProfile`]), the
+//! expert-offset read and the accumulator reset included; each goes through
+//! [`OlmoeExecutor::op`] or the profiler's transfer timer, one branch when profiling is off.
 use std::sync::Arc;
 use std::time::Instant;
 
 use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
 use turbine_kernels::{
     AddRmsnormContext, AttentionKind, ElementwiseContext, EmbeddingConfig, EmbeddingContext,
-    GemmContext, KernelRegistry, MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig,
+    GemmContext, KernelError, KernelRegistry, MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig,
     MoeRouteContext, NormConfig, NormContext, OpConfig, OpRequirement, PagedAttentionContext,
     RopeContext,
 };
@@ -51,6 +55,7 @@ use super::llama::{
     ACT, ADD_CFG, add_norm_cfg, attention_cfg, gemm_cfg, invalid, limits, rope_cfg, take_matrix,
 };
 use super::logits::{self, LogitsHead};
+use super::profile::{self, OpProfile, Profiler};
 use super::{BatchInput, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, Split, rope};
 use crate::ModelError;
 use crate::config::{Architecture, ModelArchConfig, MoeConfig};
@@ -214,6 +219,9 @@ pub struct OlmoeExecutor {
     kv_layout: KvLayout,
     limits: BatchLimits,
     registry: Arc<KernelRegistry>,
+    mem: Arc<dyn DeviceMemory>,
+    /// The op sequence ([`OlmoeExecutor::requirements`] of these options).
+    opts: ExecutorOptions,
     /// Q/K/V (`[q_dim, kv_dim, kv_dim]`) in `qkv`, fused or not per
     /// [`ExecutorOptions::fused_projections`].
     qkv: Split<3>,
@@ -232,6 +240,7 @@ pub struct OlmoeExecutor {
     host: HostBatch,
     /// Timings of the last forward ([`ModelExecutor::last_timings`]).
     timings: ForwardTimings,
+    profiler: Profiler,
 }
 
 /// Layer `layer`'s stacked expert projection `proj`, as the loader filled it, checked to be
@@ -467,6 +476,8 @@ impl OlmoeExecutor {
             kv_layout: limits.layout,
             limits,
             registry,
+            mem,
+            opts,
             qkv,
             add_norm,
             embed,
@@ -478,7 +489,33 @@ impl OlmoeExecutor {
             meta,
             host: HostBatch::default(),
             timings: ForwardTimings::default(),
+            profiler: Profiler::default(),
         })
+    }
+
+    /// Diagnostics: while enabled every op of every forward is followed by a stream
+    /// synchronisation and timed into the profile returned by [`OlmoeExecutor::take_profile`].
+    /// Disabling drops what was recorded. Off by default.
+    pub fn set_profile(&mut self, on: bool) {
+        let mut reqs = Self::requirements(&self.cfg, self.kv_layout.block_tokens, self.opts);
+        reqs.push(logits::reduce_requirement(&self.cfg));
+        self.profiler.set(on, &self.registry, &reqs);
+    }
+
+    /// The op profile recorded since profiling was enabled or last taken; empty when it is off.
+    pub fn take_profile(&mut self) -> OpProfile {
+        self.profiler.take()
+    }
+
+    /// Runs the registry op `spec` through `f`: every op of the forward goes through here, so
+    /// profile mode times each one.
+    fn op(
+        &self,
+        spec: OpConfig,
+        f: impl FnOnce() -> Result<(), KernelError>,
+    ) -> Result<(), ModelError> {
+        self.profiler
+            .op(self.mem.as_ref(), spec, || f().map_err(ModelError::from))
     }
 
     /// Rows `[0, t)` of a per-token buffer as `[t, cols]`.
@@ -499,15 +536,16 @@ impl OlmoeExecutor {
         c: TensorView<'_>,
     ) -> Result<(), ModelError> {
         let cfg = gemm_cfg(w.shape[0], w.shape[1], c.dtype);
-        self.registry.gemm(&cfg).execute(&mut GemmContext {
-            a,
-            b: w,
-            c,
-            trans_b: true,
-            alpha: 1.0,
-            beta: 0.0,
-        })?;
-        Ok(())
+        self.op(OpConfig::Gemm(cfg), || {
+            self.registry.gemm(&cfg).execute(&mut GemmContext {
+                a,
+                b: w,
+                c,
+                trans_b: true,
+                alpha: 1.0,
+                beta: 0.0,
+            })
+        })
     }
 
     /// RMSNorm over rows of `w.len()` elements.
@@ -517,15 +555,15 @@ impl OlmoeExecutor {
         w: &Tensor,
         out: TensorView<'_>,
     ) -> Result<(), ModelError> {
-        self.registry
-            .norm(&norm_cfg(w.numel()))
-            .execute(&mut NormContext {
+        let cfg = norm_cfg(w.numel());
+        self.op(OpConfig::Rmsnorm(cfg), || {
+            self.registry.norm(&cfg).execute(&mut NormContext {
                 x,
                 weight: w.view(),
                 out,
                 eps: self.cfg.rms_norm_eps,
-            })?;
-        Ok(())
+            })
+        })
     }
 
     /// `x[0..t] += proj[0..t]` (the residual add), then with `norm`
@@ -540,24 +578,29 @@ impl OlmoeExecutor {
         );
         match norm {
             Some(w) if self.add_norm => {
-                self.registry
-                    .add_rmsnorm(&add_norm_cfg(self.dims.hidden))
-                    .execute(&mut AddRmsnormContext {
-                        residual: x,
-                        x: proj,
-                        weight: w.view(),
-                        out: h,
-                        eps: self.cfg.rms_norm_eps,
-                    })?;
+                let cfg = add_norm_cfg(self.dims.hidden);
+                self.op(OpConfig::AddRmsnorm(cfg), || {
+                    self.registry
+                        .add_rmsnorm(&cfg)
+                        .execute(&mut AddRmsnormContext {
+                            residual: x,
+                            x: proj,
+                            weight: w.view(),
+                            out: h,
+                            eps: self.cfg.rms_norm_eps,
+                        })
+                })?;
             }
             _ => {
-                self.registry
-                    .elementwise(&ADD_CFG)
-                    .execute(&mut ElementwiseContext {
-                        a: x.clone(),
-                        b: proj,
-                        out: x.clone(),
-                    })?;
+                self.op(OpConfig::Add(ADD_CFG), || {
+                    self.registry
+                        .elementwise(&ADD_CFG)
+                        .execute(&mut ElementwiseContext {
+                            a: x.clone(),
+                            b: proj,
+                            out: x.clone(),
+                        })
+                })?;
                 if let Some(w) = norm {
                     self.rmsnorm(x, w, h)?;
                 }
@@ -590,12 +633,14 @@ impl OlmoeExecutor {
         let q_heads = || part(0, &[d.heads, d.head_dim]);
         let k_heads = || part(1, &[d.kv_heads, d.head_dim]);
         let rope = rope_cfg(&self.cfg);
-        self.registry.rope(&rope).execute(&mut RopeContext {
-            cfg: rope,
-            q: q_heads(),
-            k: k_heads(),
-            positions: self.meta.positions_view(p),
-            inv_freq: b.inv_freq.view(),
+        self.op(OpConfig::Rope(rope), || {
+            self.registry.rope(&rope).execute(&mut RopeContext {
+                cfg: rope,
+                q: q_heads(),
+                k: k_heads(),
+                positions: self.meta.positions_view(p),
+                inv_freq: b.inv_freq.view(),
+            })
         })?;
         let kind = if p.is_decode() {
             AttentionKind::DecodePaged
@@ -603,23 +648,25 @@ impl OlmoeExecutor {
             AttentionKind::PrefillPaged
         };
         let attn = attention_cfg(&self.cfg, kind, self.kv_layout.block_tokens);
-        self.registry
-            .attention(&attn)
-            .execute_paged(&mut PagedAttentionContext {
-                cfg: attn,
-                q: q_heads(),
-                k_new: k_heads(),
-                v_new: part(2, &[d.kv_heads, d.head_dim]),
-                out: Self::heads(&b.attn, t, d.heads, d.head_dim),
-                kv_layer: batch::kv_layer(kv, i),
-                block_table: self.meta.block_table_view(p),
-                q_indptr: self.meta.q_indptr_view(p),
-                kv_lens: self.meta.kv_lens_view(p),
-                max_q_len: p.max_q_len,
-                max_kv_len: p.max_kv_len,
-                max_blocks_per_seq: p.max_blocks_per_seq,
-                scale: 1.0 / (d.head_dim as f32).sqrt(),
-            })?;
+        self.op(OpConfig::Attention(attn), || {
+            self.registry
+                .attention(&attn)
+                .execute_paged(&mut PagedAttentionContext {
+                    cfg: attn,
+                    q: q_heads(),
+                    k_new: k_heads(),
+                    v_new: part(2, &[d.kv_heads, d.head_dim]),
+                    out: Self::heads(&b.attn, t, d.heads, d.head_dim),
+                    kv_layer: batch::kv_layer(kv, i),
+                    block_table: self.meta.block_table_view(p),
+                    q_indptr: self.meta.q_indptr_view(p),
+                    kv_lens: self.meta.kv_lens_view(p),
+                    max_q_len: p.max_q_len,
+                    max_kv_len: p.max_kv_len,
+                    max_blocks_per_seq: p.max_blocks_per_seq,
+                    scale: 1.0 / (d.head_dim as f32).sqrt(),
+                })
+        })?;
         self.linear(Self::rows(&b.attn, t), l.wo.view(), Self::rows(&b.proj, t))?;
         self.residual_add_norm(t, Some(&l.post_norm))
     }
@@ -638,54 +685,64 @@ impl OlmoeExecutor {
         let route = route_cfg(&self.moe);
         let sorted_rows =
             TensorView::contiguous(b.sorted_rows.storage.whole(), 0, &[t * d.top_k], DType::I32);
-        self.registry
-            .moe_route(&route)
-            .route(&mut MoeRouteContext {
+        self.op(OpConfig::MoeRoute(route), || {
+            self.registry.moe_route(&route).route(&mut MoeRouteContext {
                 cfg: route,
                 router_logits: Self::rows(&b.router_logits, t),
                 topk_ids: Self::rows(&b.topk_ids, t),
                 topk_weights: Self::rows(&b.topk_weights, t),
                 sorted_rows: sorted_rows.clone(),
                 expert_offsets: b.expert_offsets.view(),
-            })?;
+            })
+        })?;
+        let mem = self.mem.as_ref();
         let experts = experts_cfg(&self.cfg, &self.moe);
         let kernel = self.registry.moe_experts(&experts);
         // The group sizes on the host (a blocking read of experts + 1 ints), only when the
         // provider needs them for this many routed rows.
         let host_offsets: Vec<i32> = if kernel.needs_host_offsets(&experts, experts.routed_rows(t))
         {
-            b.expert_offsets
-                .storage
-                .whole()
-                .read_bytes()?
-                .chunks_exact(I32)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
+            self.profiler
+                .step(mem, profile::MOE_OFFSETS_READ, profile::D2H, || {
+                    Ok(b.expert_offsets
+                        .storage
+                        .whole()
+                        .read_bytes()?
+                        .chunks_exact(I32)
+                        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect())
+                })?
         } else {
             Vec::new()
         };
         // The accumulator starts at zero, as transformers' `final_hidden_states`: exactly
         // `0 + 0` in BF16 (no device-to-device copy under kernel ABI v2).
-        self.registry
-            .elementwise(&ADD_CFG)
-            .execute(&mut ElementwiseContext {
-                a: Self::rows(&b.zeros, t),
-                b: Self::rows(&b.zeros, t),
-                out: Self::rows(&b.proj, t),
+        self.profiler
+            .step(mem, profile::MOE_ZERO, profile::ZERO_ADD, || {
+                Ok(self
+                    .registry
+                    .elementwise(&ADD_CFG)
+                    .execute(&mut ElementwiseContext {
+                        a: Self::rows(&b.zeros, t),
+                        b: Self::rows(&b.zeros, t),
+                        out: Self::rows(&b.proj, t),
+                    })?)
             })?;
         let workspace_len = d.moe_workspace_bytes(t) as usize;
-        kernel.experts(&mut MoeExpertsContext {
-            cfg: experts,
-            x: Self::rows(&b.h, t),
-            w_gate: l.w_gate.view(),
-            w_up: l.w_up.view(),
-            w_down: l.w_down.view(),
-            sorted_rows,
-            expert_offsets: b.expert_offsets.view(),
-            topk_weights: Self::rows(&b.topk_weights, t),
-            host_expert_offsets: &host_offsets,
-            out: Self::rows(&b.proj, t),
-            workspace: Some(b.moe_workspace.slice(0, workspace_len)),
+        self.op(OpConfig::MoeExperts(experts), || {
+            kernel.experts(&mut MoeExpertsContext {
+                cfg: experts,
+                x: Self::rows(&b.h, t),
+                w_gate: l.w_gate.view(),
+                w_up: l.w_up.view(),
+                w_down: l.w_down.view(),
+                sorted_rows,
+                expert_offsets: b.expert_offsets.view(),
+                topk_weights: Self::rows(&b.topk_weights, t),
+                host_expert_offsets: &host_offsets,
+                out: Self::rows(&b.proj, t),
+                workspace: Some(b.moe_workspace.slice(0, workspace_len)),
+            })
         })?;
         let next_norm = self.layers.get(i + 1).map(|next| &next.input_norm);
         self.residual_add_norm(t, next_norm)
@@ -718,21 +775,33 @@ impl ModelExecutor for OlmoeExecutor {
     }
 
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
-        let p = self.host.pack(batch, &self.limits)?;
-        self.meta.upload(&self.host)?;
+        let (host, meta, limits) = (&mut self.host, &mut self.meta, &self.limits);
+        let p = self.profiler.step(
+            self.mem.as_ref(),
+            profile::BATCH_UPLOAD,
+            profile::HOST,
+            || {
+                let p = host.pack(batch, limits)?;
+                meta.upload(host)?;
+                Ok(p)
+            },
+        )?;
         let launch_started = Instant::now();
 
         let b = &self.bufs;
         let d = &self.dims;
         let (t, n) = (p.total_q, p.num_seqs);
-        self.registry
-            .embedding(&embedding_cfg(d))
-            .execute(&mut EmbeddingContext {
-                ids: self.meta.ids_view(&p),
-                table: self.embed.view(),
-                out: Self::rows(&b.x, t),
-                vocab_offset: 0,
-            })?;
+        let embedding = embedding_cfg(d);
+        self.op(OpConfig::Embedding(embedding), || {
+            self.registry
+                .embedding(&embedding)
+                .execute(&mut EmbeddingContext {
+                    ids: self.meta.ids_view(&p),
+                    table: self.embed.view(),
+                    out: Self::rows(&b.x, t),
+                    vocab_offset: 0,
+                })
+        })?;
         if let Some(first) = self.layers.first() {
             self.rmsnorm(Self::rows(&b.x, t), &first.input_norm, Self::rows(&b.h, t))?;
         }
@@ -750,7 +819,9 @@ impl ModelExecutor for OlmoeExecutor {
         let wait_started = Instant::now();
         // The iteration's logits copy (it synchronizes the stream), after the device reduction
         // of the rows that asked for one.
-        let logits = self.head.finish(&self.registry)?;
+        let logits = self
+            .head
+            .finish(&self.registry, &self.profiler, self.mem.as_ref())?;
         self.timings = ForwardTimings {
             launch: wait_started - launch_started,
             device_wait: wait_started.elapsed(),

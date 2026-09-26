@@ -17,11 +17,13 @@ pub mod batch;
 pub mod llama;
 pub mod logits;
 pub mod olmoe;
+pub mod profile;
 pub mod rope;
 
 pub use batch::SequenceKv;
 pub use llama::{LlamaExecutor, TraceTensor};
 pub use olmoe::OlmoeExecutor;
+pub use profile::{OpProfile, OpProfileEntry};
 
 /// How an executor runs its forward pass (Phase 2c). `Default` is what the server runs with
 /// `execution.fused_ops: true` ([`ExecutorOptions::from_fused_ops`]).
