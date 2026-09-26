@@ -20,6 +20,10 @@
 //! their operands from it. The expert gate/up weights stay separate stacks: the `moe_experts`
 //! ABI takes them as two dense `[experts, inter, hidden]` tensors.
 //!
+//! Residual add + RMSNorm (Phase 2c): as in the Llama executor, with `fused_ops` and a provider
+//! for `add_rmsnorm` each residual add a norm follows (the post-attention norm, the next layer's
+//! input norm) is one fused op; otherwise `add` then `rmsnorm`.
+//!
 //! The loader uploads each expert's weights straight into its layer's stacked
 //! `[experts, inter, hidden]` (gate, up) and `[experts, hidden, inter]` (down) tensors
 //! ([`crate::loader::stacked_experts_name`]), the layout the `moe_experts` op takes, so loading
@@ -35,14 +39,17 @@ use std::time::Instant;
 
 use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
 use turbine_kernels::{
-    AttentionKind, ElementwiseContext, EmbeddingConfig, EmbeddingContext, GemmContext,
-    KernelRegistry, MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig, MoeRouteContext,
-    NormConfig, NormContext, OpConfig, OpRequirement, PagedAttentionContext, RopeContext,
+    AddRmsnormContext, AttentionKind, ElementwiseContext, EmbeddingConfig, EmbeddingContext,
+    GemmContext, KernelRegistry, MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig,
+    MoeRouteContext, NormConfig, NormContext, OpConfig, OpRequirement, PagedAttentionContext,
+    RopeContext,
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, Tensor, TensorView};
 
 use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
-use super::llama::{ACT, ADD_CFG, attention_cfg, gemm_cfg, invalid, limits, rope_cfg, take_matrix};
+use super::llama::{
+    ACT, ADD_CFG, add_norm_cfg, attention_cfg, gemm_cfg, invalid, limits, rope_cfg, take_matrix,
+};
 use super::{BatchInput, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, Split, rope};
 use crate::ModelError;
 use crate::config::{Architecture, ModelArchConfig, MoeConfig};
@@ -210,6 +217,9 @@ pub struct OlmoeExecutor {
     /// Q/K/V (`[q_dim, kv_dim, kv_dim]`) in `qkv`, fused or not per
     /// [`ExecutorOptions::fused_projections`].
     qkv: Split<3>,
+    /// Residual adds followed by a norm run as one `add_rmsnorm` (`fused_ops` and a provider
+    /// selected for it).
+    add_norm: bool,
     embed: Tensor,
     layers: Vec<Layer>,
     final_norm: Tensor,
@@ -288,6 +298,9 @@ impl OlmoeExecutor {
             OpConfig::Gemm(gemm_cfg(hidden, q_dim, ACT)),
             OpConfig::Add(ADD_CFG),
         ]);
+        if opts.fused_ops {
+            specs.push(OpConfig::AddRmsnorm(add_norm_cfg(hidden)));
+        }
         if let Some(moe) = cfg.moe {
             specs.extend([
                 OpConfig::Gemm(gemm_cfg(moe.num_experts as usize, hidden, DType::F32)),
@@ -409,6 +422,8 @@ impl OlmoeExecutor {
         let embed = weights.take("model.embed_tokens.weight")?;
         let final_norm = weights.take("model.norm.weight")?;
         let lm_head = weights.take(LM_HEAD)?;
+        let add_norm =
+            opts.fused_ops && registry.is_selected(&OpConfig::AddRmsnorm(add_norm_cfg(d.hidden)));
 
         let limits = limits(cfg, block_tokens, max_batch_tokens, max_seqs);
         let t = max_batch_tokens as usize;
@@ -450,6 +465,7 @@ impl OlmoeExecutor {
             limits,
             registry,
             qkv,
+            add_norm,
             embed,
             layers,
             final_norm,
@@ -508,16 +524,41 @@ impl OlmoeExecutor {
         Ok(())
     }
 
-    /// `x[0..t] += proj[0..t]` (the residual add).
-    fn residual_add(&self, t: usize) -> Result<(), ModelError> {
-        let x = Self::rows(&self.bufs.x, t);
-        self.registry
-            .elementwise(&ADD_CFG)
-            .execute(&mut ElementwiseContext {
-                a: x.clone(),
-                b: Self::rows(&self.bufs.proj, t),
-                out: x,
-            })?;
+    /// `x[0..t] += proj[0..t]` (the residual add), then with `norm`
+    /// `h[0..t] = rmsnorm(x[0..t]) · norm`: one `add_rmsnorm` when `add_norm`, else `add` and
+    /// `rmsnorm`.
+    fn residual_add_norm(&self, t: usize, norm: Option<&Tensor>) -> Result<(), ModelError> {
+        let b = &self.bufs;
+        let (x, h, proj) = (
+            Self::rows(&b.x, t),
+            Self::rows(&b.h, t),
+            Self::rows(&b.proj, t),
+        );
+        match norm {
+            Some(w) if self.add_norm => {
+                self.registry
+                    .add_rmsnorm(&add_norm_cfg(self.dims.hidden))
+                    .execute(&mut AddRmsnormContext {
+                        residual: x,
+                        x: proj,
+                        weight: w.view(),
+                        out: h,
+                        eps: self.cfg.rms_norm_eps,
+                    })?;
+            }
+            _ => {
+                self.registry
+                    .elementwise(&ADD_CFG)
+                    .execute(&mut ElementwiseContext {
+                        a: x.clone(),
+                        b: proj,
+                        out: x.clone(),
+                    })?;
+                if let Some(w) = norm {
+                    self.rmsnorm(x, w, h)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -529,7 +570,6 @@ impl OlmoeExecutor {
         let d = &self.dims;
         let t = p.total_q;
         let part = |i, inner: &[usize]| self.qkv.part(&b.qkv, i, t, inner);
-        self.rmsnorm(Self::rows(&b.x, t), &l.input_norm, Self::rows(&b.h, t))?;
         if self.qkv.fused {
             let w = l.w_qkv.view();
             self.linear(Self::rows(&b.h, t), w, self.qkv.whole(&b.qkv, t))?;
@@ -577,15 +617,15 @@ impl OlmoeExecutor {
                 scale: 1.0 / (d.head_dim as f32).sqrt(),
             })?;
         self.linear(Self::rows(&b.attn, t), l.wo.view(), Self::rows(&b.proj, t))?;
-        self.residual_add(t)
+        self.residual_add_norm(t, Some(&l.post_norm))
     }
 
-    /// The sparse MoE block of layer `i` on `t` rows.
+    /// The sparse MoE block of layer `i` on `t` rows, whose normalised input is already in `h`;
+    /// ends with the next layer's input norm in `h`, if there is a next layer.
     fn moe_block(&self, i: usize, t: usize) -> Result<(), ModelError> {
         let l = &self.layers[i];
         let b = &self.bufs;
         let d = &self.dims;
-        self.rmsnorm(Self::rows(&b.x, t), &l.post_norm, Self::rows(&b.h, t))?;
         self.linear(
             Self::rows(&b.h, t),
             l.router.view(),
@@ -643,7 +683,8 @@ impl OlmoeExecutor {
             out: Self::rows(&b.proj, t),
             workspace: Some(b.moe_workspace.slice(0, workspace_len)),
         })?;
-        self.residual_add(t)
+        let next_norm = self.layers.get(i + 1).map(|next| &next.input_norm);
+        self.residual_add_norm(t, next_norm)
     }
 
     /// Final RMSNorm of each sequence's last row into `last[0..n]`: one call per run of
@@ -693,6 +734,9 @@ impl ModelExecutor for OlmoeExecutor {
                 out: Self::rows(&b.x, t),
                 vocab_offset: 0,
             })?;
+        if let Some(first) = self.layers.first() {
+            self.rmsnorm(Self::rows(&b.x, t), &first.input_norm, Self::rows(&b.h, t))?;
+        }
         for i in 0..self.layers.len() {
             self.attention(i, &p, batch.kv)?;
             self.moe_block(i, t)?;

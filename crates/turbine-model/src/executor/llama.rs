@@ -13,6 +13,12 @@
 //! regions of the same buffer: the Phase 2 op sequence, bit for bit (every output element is the
 //! same dot product either way).
 //!
+//! Residual add + RMSNorm (Phase 2c): with `fused_ops` and a provider for the kernel ABI v2.1
+//! `add_rmsnorm`, each residual add that a norm follows (after attention: the MLP norm; after the
+//! MLP: the next layer's input norm) is one fused op, so layer `i + 1`'s input norm runs at the
+//! end of layer `i`; otherwise `add` then `rmsnorm`, in the same stream order. The fused op
+//! rounds the sum to BF16 and normalises that, so both paths give the same numbers.
+//!
 //! Every token of every sequence goes through the GEMMs as one `[total_tokens, hidden]` batch;
 //! only attention looks at sequence boundaries (`q_indptr`, `kv_lens`, block tables). The KV
 //! lives in the caller's pool (`KvPoolView`); activations live in buffers allocated once for
@@ -29,10 +35,10 @@ use std::time::Instant;
 
 use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
 use turbine_kernels::{
-    ActivationConfig, ActivationContext, AttentionConfig, AttentionKind, ElementwiseConfig,
-    ElementwiseContext, EmbeddingConfig, EmbeddingContext, GemmConfig, GemmContext, KernelError,
-    KernelRegistry, NormConfig, NormContext, OpConfig, OpRequirement, PagedAttentionContext,
-    RopeConfig, RopeContext,
+    ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
+    AttentionKind, ElementwiseConfig, ElementwiseContext, EmbeddingConfig, EmbeddingContext,
+    GemmConfig, GemmContext, KernelError, KernelRegistry, NormConfig, NormContext, OpConfig,
+    OpRequirement, PagedAttentionContext, RopeConfig, RopeContext,
 };
 use turbine_tensor::{DeviceMemory, KvPoolView, Tensor, TensorView};
 
@@ -117,6 +123,14 @@ fn norm_cfg(d: &Dims) -> NormConfig {
     NormConfig {
         dim: d.hidden as u64,
         dtype: ACT,
+    }
+}
+
+/// The residual add fused with the RMSNorm over `hidden` that follows it (kernel ABI v2.1).
+pub(super) fn add_norm_cfg(hidden: usize) -> AddRmsnormConfig {
+    AddRmsnormConfig {
+        dtype: ACT,
+        dim: hidden as u32,
     }
 }
 
@@ -250,6 +264,9 @@ pub struct LlamaExecutor {
     /// or not per [`ExecutorOptions::fused_projections`].
     qkv: Split<3>,
     gate_up: Split<2>,
+    /// Residual adds followed by a norm run as one `add_rmsnorm` (`fused_ops` and a provider
+    /// selected for it).
+    add_norm: bool,
     embed: Tensor,
     layers: Vec<Layer>,
     final_norm: Tensor,
@@ -285,6 +302,8 @@ impl LlamaExecutor {
     /// Every distinct op config the forward pass executes with `opts`, in first-use order, plus
     /// the `copy_blocks` fork over KV blocks of `block_tokens` tokens. The registry is built from
     /// this list at startup, so a config no provider supports fails before any weight is read.
+    /// With `fused_ops` the list has the optional `add_rmsnorm`, which
+    /// [`super::available_requirements`] drops when no provider has it.
     pub fn requirements(
         cfg: &ModelArchConfig,
         block_tokens: u32,
@@ -317,6 +336,11 @@ impl LlamaExecutor {
             OpConfig::Attention(attention_cfg(cfg, AttentionKind::DecodePaged, block_tokens)),
             OpConfig::Gemm(gemm_cfg(d.hidden, d.q_dim, ACT)),
             OpConfig::Add(ADD_CFG),
+        ]);
+        if opts.fused_ops {
+            specs.push(OpConfig::AddRmsnorm(add_norm_cfg(d.hidden)));
+        }
+        specs.extend([
             OpConfig::Gemm(gemm_cfg(
                 if opts.fused_projections {
                     2 * d.inter
@@ -423,6 +447,8 @@ impl LlamaExecutor {
             Some(weights.take(LM_HEAD)?)
         };
 
+        let add_norm =
+            opts.fused_ops && registry.is_selected(&OpConfig::AddRmsnorm(add_norm_cfg(d.hidden)));
         let limits = limits(cfg, block_tokens, max_batch_tokens, max_seqs);
         let t = max_batch_tokens as usize;
         let n = max_seqs as usize;
@@ -454,6 +480,7 @@ impl LlamaExecutor {
             registry,
             qkv,
             gate_up,
+            add_norm,
             embed,
             layers,
             final_norm,
@@ -552,21 +579,48 @@ impl LlamaExecutor {
         Ok(())
     }
 
-    /// `x[0..t] += proj[0..t]` (the residual add).
-    fn residual_add(&self, t: usize) -> Result<(), ModelError> {
-        let x = Self::rows(&self.bufs.x, t);
-        self.registry
-            .elementwise(&ADD_CFG)
-            .execute(&mut ElementwiseContext {
-                a: x.clone(),
-                b: Self::rows(&self.bufs.proj, t),
-                out: x,
-            })?;
+    /// `x[0..t] += proj[0..t]` (the residual add), then with `norm`
+    /// `h[0..t] = rmsnorm(x[0..t]) · norm`: one `add_rmsnorm` when `add_norm`, else `add` and
+    /// `rmsnorm`.
+    fn residual_add_norm(&self, t: usize, norm: Option<&Tensor>) -> Result<(), ModelError> {
+        let b = &self.bufs;
+        let (x, h, proj) = (
+            Self::rows(&b.x, t),
+            Self::rows(&b.h, t),
+            Self::rows(&b.proj, t),
+        );
+        match norm {
+            Some(w) if self.add_norm => {
+                self.registry
+                    .add_rmsnorm(&add_norm_cfg(self.dims.hidden))
+                    .execute(&mut AddRmsnormContext {
+                        residual: x,
+                        x: proj,
+                        weight: w.view(),
+                        out: h,
+                        eps: self.cfg.rms_norm_eps,
+                    })?;
+            }
+            _ => {
+                self.registry
+                    .elementwise(&ADD_CFG)
+                    .execute(&mut ElementwiseContext {
+                        a: x.clone(),
+                        b: proj,
+                        out: x.clone(),
+                    })?;
+                if let Some(w) = norm {
+                    self.rmsnorm(x, w, h)?;
+                }
+            }
+        }
         Ok(())
     }
 
-    /// One decoder layer on the batch's `p.total_q` rows; attention appends to and reads
-    /// layer `i` of `kv`.
+    /// One decoder layer on the batch's `p.total_q` rows, whose normalised input is already in
+    /// `h` (the embedding's norm, or the previous layer's last op); ends with the next layer's
+    /// input norm in `h`, if there is a next layer. Attention appends to and reads layer `i` of
+    /// `kv`.
     fn layer(&self, i: usize, p: &Packed, kv: &KvPoolView<'_>) -> Result<(), ModelError> {
         let l = &self.layers[i];
         let b = &self.bufs;
@@ -580,7 +634,6 @@ impl LlamaExecutor {
             |t| self.qkv.part(&b.qkv, 2, t, &[d.kv_dim]),
         );
         // Attention block.
-        self.rmsnorm(Self::rows(&b.x, t), &l.input_norm, Self::rows(&b.h, t))?;
         self.record(li, "attn_norm", Self::rows(&b.h, t))?;
         if self.qkv.fused {
             let w = l.w_qkv.view();
@@ -634,11 +687,10 @@ impl LlamaExecutor {
         self.record(li, "attn", Self::rows(&b.attn, t))?;
         self.linear(Self::rows(&b.attn, t), l.wo.view(), Self::rows(&b.proj, t))?;
         self.record(li, "o_proj", Self::rows(&b.proj, t))?;
-        self.residual_add(t)?;
+        self.residual_add_norm(t, Some(&l.post_norm))?;
         self.record(li, "resid_attn", Self::rows(&b.x, t))?;
 
         // MLP block.
-        self.rmsnorm(Self::rows(&b.x, t), &l.post_norm, Self::rows(&b.h, t))?;
         self.record(li, "mlp_norm", Self::rows(&b.h, t))?;
         let gate = |t| self.gate_up.part(&b.gate_up, 0, t, &[d.inter]);
         let up = |t| self.gate_up.part(&b.gate_up, 1, t, &[d.inter]);
@@ -666,7 +718,8 @@ impl LlamaExecutor {
             Self::rows(&b.proj, t),
         )?;
         self.record(li, "down", Self::rows(&b.proj, t))?;
-        self.residual_add(t)?;
+        let next_norm = self.layers.get(i + 1).map(|next| &next.input_norm);
+        self.residual_add_norm(t, next_norm)?;
         self.record(li, "resid_mlp", Self::rows(&b.x, t))
     }
 
@@ -718,6 +771,9 @@ impl ModelExecutor for LlamaExecutor {
                 vocab_offset: 0,
             })?;
         self.record(None, "embed", Self::rows(&b.x, t))?;
+        if let Some(first) = self.layers.first() {
+            self.rmsnorm(Self::rows(&b.x, t), &first.input_norm, Self::rows(&b.h, t))?;
+        }
         for i in 0..self.layers.len() {
             self.layer(i, &p, batch.kv)?;
         }

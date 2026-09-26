@@ -11,13 +11,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use half::bf16;
 use turbine_core::types::{BlockId, DeviceId, ExecutionBackend, KvLayout, SeqId, Vendor};
 use turbine_kernels::{
-    ActivationConfig, ActivationContext, ActivationKernel, AttentionConfig, AttentionContext,
-    AttentionKernel, ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig,
-    EmbeddingContext, EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, KernelError,
-    KernelMetrics, KernelProvider, KernelRegistry, KvCopyConfig, KvCopyContext, KvCopyKernel,
-    MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
-    NormContext, NormKernel, PagedAttentionContext, ProviderId, RopeConfig, RopeContext,
-    RopeKernel, cpu_reference_provider, shim_provider,
+    ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
+    AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, ElementwiseConfig,
+    ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext, EmbeddingKernel,
+    GemmConfig, GemmContext, GemmKernel, KernelError, KernelMetrics, KernelProvider,
+    KernelRegistry, KvCopyConfig, KvCopyContext, KvCopyKernel, MoeExpertsConfig, MoeExpertsContext,
+    MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel,
+    PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel, cpu_reference_provider,
+    shim_provider,
 };
 use turbine_model::config::{Architecture, ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
@@ -105,6 +106,7 @@ fn executor(
 /// `hip_matches_cpu` and the trace comparisons exercise the fused path on HIP (the golden test
 /// runs the default options).
 const ALL_FUSED: ExecutorOptions = ExecutorOptions {
+    fused_ops: true,
     fused_projections: true,
 };
 
@@ -666,6 +668,7 @@ fn requirements_and_workspace() {
         "attention_decode_paged head_dim=16 kv_heads=2 dtype=bf16 q_heads=4 causal=1 block_tokens=128",
         "silu_mul cols=128 dtype=bf16",
         "add dtype=bf16",
+        "add_rmsnorm dim=64 dtype=bf16",
         copy.as_str(),
     ] {
         assert!(
@@ -673,7 +676,7 @@ fn requirements_and_workspace() {
             "missing {want}: {rendered:#?}"
         );
     }
-    assert_eq!(rendered.len(), 13, "{rendered:#?}");
+    assert_eq!(rendered.len(), 14, "{rendered:#?}");
     // Unfused: separate Q (n = 64, as O), K/V (n = 32) and gate/up (n = 128) GEMMs.
     let unfused: Vec<String> = LlamaExecutor::requirements(
         &spec.config,
@@ -921,15 +924,23 @@ fn cpu_model(
     mem: &Arc<dyn DeviceMemory>,
     max_batch_tokens: u32,
 ) -> Box<dyn ModelExecutor> {
-    cpu_model_with(spec, mem, max_batch_tokens, ExecutorOptions::default())
+    cpu_model_with(
+        spec,
+        mem,
+        max_batch_tokens,
+        ExecutorOptions::default(),
+        cpu_reference_provider(),
+    )
 }
 
-/// [`cpu_model`] run with `opts`.
+/// [`cpu_model`] run with `opts` on `provider` alone, whose registry is built from the
+/// requirements it can serve ([`executor::available_requirements`]).
 fn cpu_model_with(
     spec: &TinySpec,
     mem: &Arc<dyn DeviceMemory>,
     max_batch_tokens: u32,
     opts: ExecutorOptions,
+    provider: Arc<dyn KernelProvider>,
 ) -> Box<dyn ModelExecutor> {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
@@ -939,16 +950,12 @@ fn cpu_model_with(
         other => panic!("no tiny checkpoint for {other:?}"),
     };
     let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load");
-    let provider = cpu_reference_provider();
     let order = [provider.id()];
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
-    let registry = KernelRegistry::build(
-        vec![provider],
-        &order,
-        &executor::requirements(cfg, BLOCK_TOKENS, opts),
-        &metrics,
-    )
-    .expect("every op has a provider");
+    let reqs =
+        executor::available_requirements(cfg, BLOCK_TOKENS, opts, std::slice::from_ref(&provider));
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+        .expect("every op has a provider");
     build_executor(
         cfg,
         weights,
@@ -998,13 +1005,96 @@ fn run_seq(
     logits.row(0).to_vec()
 }
 
-/// Phase 2c S-8: on both tiny checkpoints (CPU provider) the fused projections (one Q/K/V GEMM
-/// and, for Llama, one gate/up GEMM into row-strided views) give bitwise the logits of one GEMM
-/// per projection, for a 40-token prefill and 10 greedy decode steps. The two runs really take
-/// different op sequences: only the fused one needs the `[q + 2·kv, hidden]` GEMM.
+/// The cpu-reference provider under its own id, with or without the kernel ABI v2.1
+/// `add_rmsnorm` family (a v2.0 library's shape), counting `add_rmsnorm` launches.
+struct Probe {
+    inner: Arc<dyn KernelProvider>,
+    add_rmsnorm: bool,
+    calls: AtomicUsize,
+}
+
+impl Probe {
+    fn new(add_rmsnorm: bool) -> Arc<Probe> {
+        Arc::new(Probe {
+            inner: cpu_reference_provider(),
+            add_rmsnorm,
+            calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl KernelProvider for Probe {
+    fn id(&self) -> ProviderId {
+        ProviderId("probe")
+    }
+    fn gemm(&self) -> Option<&dyn GemmKernel> {
+        self.inner.gemm()
+    }
+    fn attention(&self) -> Option<&dyn AttentionKernel> {
+        self.inner.attention()
+    }
+    fn norm(&self) -> Option<&dyn NormKernel> {
+        self.inner.norm()
+    }
+    fn rope(&self) -> Option<&dyn RopeKernel> {
+        self.inner.rope()
+    }
+    fn activation(&self) -> Option<&dyn ActivationKernel> {
+        self.inner.activation()
+    }
+    fn embedding(&self) -> Option<&dyn EmbeddingKernel> {
+        self.inner.embedding()
+    }
+    fn elementwise(&self) -> Option<&dyn ElementwiseKernel> {
+        self.inner.elementwise()
+    }
+    fn kv_copy(&self) -> Option<&dyn KvCopyKernel> {
+        self.inner.kv_copy()
+    }
+    fn moe(&self) -> Option<&dyn MoeKernel> {
+        self.inner.moe()
+    }
+    fn add_rmsnorm(&self) -> Option<&dyn AddRmsnormKernel> {
+        self.add_rmsnorm.then_some(self as &dyn AddRmsnormKernel)
+    }
+}
+
+impl AddRmsnormKernel for Probe {
+    fn supports(&self, cfg: &AddRmsnormConfig) -> bool {
+        self.inner.add_rmsnorm().is_some_and(|k| k.supports(cfg))
+    }
+    fn implementation(&self, _: &AddRmsnormConfig) -> String {
+        "probe".into()
+    }
+    fn execute(&self, ctx: &mut AddRmsnormContext<'_>) -> Result<(), KernelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .add_rmsnorm()
+            .expect("cpu-reference add_rmsnorm")
+            .execute(ctx)
+    }
+}
+
+/// Phase 2c S-8/S-9: on both tiny checkpoints (CPU provider) every combination of the fusions
+/// (projections: one Q/K/V GEMM and, for Llama, one gate/up GEMM into row-strided views;
+/// `fused_ops`: each residual add a norm follows as one `add_rmsnorm`) gives bitwise the logits
+/// of the unfused op sequence, for a 40-token prefill and 10 greedy decode steps; so does the
+/// fused path on a provider without `add_rmsnorm` (the ABI v2 fallback: `add` then `rmsnorm`).
+/// The runs really take different op sequences: only fused projections need the
+/// `[q + 2·kv, hidden]` GEMM, and `fused_ops` launches `add_rmsnorm` 2·layers − 1 times per
+/// forward, the fallback never.
 #[test]
 fn fused_ops_match_unfused() {
     const PROMPT: usize = 40;
+    const DECODE: usize = 10;
+    // (fused_ops, fused_projections, provider has add_rmsnorm); the first is the reference.
+    const CASES: [(bool, bool, bool); 5] = [
+        (true, true, true),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+        (false, true, true),
+    ];
     let tmp = TempDir::new("tiny-model-fused");
     for spec in both_checkpoints(&tmp) {
         let cfg = &spec.config;
@@ -1016,56 +1106,80 @@ fn fused_ops_match_unfused() {
             )
         };
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
-        let rendered = |fused_projections| -> Vec<String> {
-            executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions { fused_projections })
+        let rendered = |opts, provider: Arc<dyn KernelProvider>| -> Vec<String> {
+            executor::available_requirements(cfg, BLOCK_TOKENS, opts, &[provider])
                 .iter()
                 .map(|r| format!("{} {}", r.op, r.config))
                 .collect()
         };
-        let (fused, unfused) = (rendered(true), rendered(false));
+        let fused = rendered(ALL_FUSED, Probe::new(true));
+        let fallback = rendered(ALL_FUSED, Probe::new(false));
+        let unfused = rendered(ExecutorOptions::from_fused_ops(false), Probe::new(true));
+        let norm_only = ExecutorOptions {
+            fused_ops: true,
+            fused_projections: false,
+        };
+        let norm_only = rendered(norm_only, Probe::new(true));
         let qkv = gemm(cfg.num_attention_heads * cfg.head_dim + 2 * kv_dim);
+        let add_norm = format!("add_rmsnorm dim={} dtype=bf16", cfg.hidden);
         assert!(fused.contains(&qkv), "{name}: {fused:#?}");
+        assert!(fused.contains(&add_norm), "{name}: {fused:#?}");
+        assert!(fallback.contains(&qkv), "{name}: {fallback:#?}");
+        assert!(!fallback.contains(&add_norm), "{name}: {fallback:#?}");
         assert!(unfused.contains(&gemm(kv_dim)), "{name}: {unfused:#?}");
+        assert!(!unfused.contains(&add_norm), "{name}: {unfused:#?}");
+        assert!(norm_only.contains(&add_norm), "{name}: {norm_only:#?}");
+        assert!(norm_only.contains(&gemm(kv_dim)), "{name}: {norm_only:#?}");
+        assert_ne!(norm_only, fused, "{name}");
         assert_ne!(fused, unfused, "{name}");
 
         let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
         let mut runs = Vec::new();
-        for fused_projections in [true, false] {
-            let opts = ExecutorOptions { fused_projections };
-            let mut exec = cpu_model_with(&spec, &mem, MAX_SEQ_LEN, opts);
+        for (i, &(fused_ops, fused_projections, with_add_norm)) in CASES.iter().enumerate() {
+            let probe = Probe::new(with_add_norm);
+            let opts = ExecutorOptions {
+                fused_ops,
+                fused_projections,
+            };
+            let mut exec = cpu_model_with(&spec, &mem, MAX_SEQ_LEN, opts, probe.clone());
             let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv");
             let mut tokens: Vec<u32> = (0..PROMPT as u32)
                 .map(|i| (i * 53 + 5) % spec.vocab)
                 .collect();
             let positions: Vec<u32> = (0..PROMPT as u32).collect();
-            let mut rows = vec![
-                kv.forward(exec.as_mut(), &tokens, &positions)
-                    .expect("prefill")
-                    .data,
-            ];
-            for _ in 0..10 {
+            let prefill = kv.forward(exec.as_mut(), &tokens, &positions);
+            let mut rows = vec![prefill.expect("prefill").data];
+            for _ in 0..DECODE {
                 let next = argmax(rows.last().expect("prefill row"));
                 let pos = tokens.len() as u32;
                 tokens.push(next);
-                rows.push(
-                    kv.forward(exec.as_mut(), &[next], &[pos])
-                        .expect("decode")
-                        .data,
-                );
+                let decode = kv.forward(exec.as_mut(), &[next], &[pos]);
+                rows.push(decode.expect("decode").data);
             }
+            let per_forward = 2 * cfg.num_layers as usize - 1;
+            let want = if fused_ops && with_add_norm {
+                (1 + DECODE) * per_forward
+            } else {
+                0
+            };
+            let calls = probe.calls.load(Ordering::SeqCst);
+            assert_eq!(calls, want, "{name} case {i}: {:?}", CASES[i]);
             runs.push(rows);
         }
-        for (step, (fused, unfused)) in runs[0].iter().zip(&runs[1]).enumerate() {
-            let same = fused.len() == unfused.len()
-                && fused
-                    .iter()
-                    .zip(unfused)
-                    .all(|(a, b)| a.to_bits() == b.to_bits());
-            assert!(
-                same,
-                "{name} step {step}: fused differs from unfused by up to {}",
-                max_abs_diff(fused, unfused)
-            );
+        for (i, other) in runs.iter().enumerate().skip(1) {
+            let label = format!("case {i} {:?}", CASES[i]);
+            for (step, (fused, other)) in runs[0].iter().zip(other).enumerate() {
+                let same = fused.len() == other.len()
+                    && fused
+                        .iter()
+                        .zip(other)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(
+                    same,
+                    "{name} step {step}: fused differs from {label} by up to {}",
+                    max_abs_diff(fused, other)
+                );
+            }
         }
     }
 }
@@ -1519,13 +1633,15 @@ fn olmoe_decode_single_device_copy() {
         ));
         let order = [provider.id()];
         let metrics = KernelMetrics::register(&MetricsRegistry::new());
-        let registry = KernelRegistry::build(
-            vec![provider],
-            &order,
-            &executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default()),
-            &metrics,
-        )
-        .expect("every op has a provider");
+        let opts = ExecutorOptions::default();
+        let reqs = executor::available_requirements(
+            cfg,
+            BLOCK_TOKENS,
+            opts,
+            std::slice::from_ref(&provider),
+        );
+        let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+            .expect("every op has a provider");
         let mut exec = build_executor(
             cfg,
             weights,
@@ -1534,7 +1650,7 @@ fn olmoe_decode_single_device_copy() {
             BLOCK_TOKENS,
             MAX_TOKENS,
             SEQS as u32,
-            ExecutorOptions::default(),
+            opts,
         )
         .expect("executor");
 

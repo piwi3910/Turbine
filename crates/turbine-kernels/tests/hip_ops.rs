@@ -16,11 +16,12 @@ use turbine_core::types::{BlockId, DType, DeviceId, ExecutionBackend, Vendor};
 use turbine_device::{DiscoveryOptions, discover};
 use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
-    ActivationConfig, ActivationContext, AttentionConfig, AttentionContext, AttentionKind,
-    ElementwiseConfig, ElementwiseContext, EmbeddingConfig, EmbeddingContext, GemmConfig,
-    GemmContext, KernelProvider, KvCopyConfig, KvCopyContext, MoeExpertsConfig, MoeExpertsContext,
-    MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, PagedAttentionContext, RopeConfig,
-    RopeContext, ShimLibrary, cpu_reference_provider, shim_provider,
+    ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
+    AttentionContext, AttentionKind, ElementwiseConfig, ElementwiseContext, EmbeddingConfig,
+    EmbeddingContext, GemmConfig, GemmContext, KernelProvider, KvCopyConfig, KvCopyContext,
+    MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
+    PagedAttentionContext, RopeConfig, RopeContext, ShimLibrary, cpu_reference_provider,
+    shim_provider,
 };
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceMemory, Tensor, TensorView};
@@ -553,6 +554,165 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     }
     let what = format!("add n={n} {cfg}");
     assert_close(&what, &impl_name, &read(&o_hip), &read(&o_cpu), DType::BF16);
+}
+
+/// The first `cols` columns of the `[rows, stride]` tensor `t`, as a row-strided `[rows, cols]`
+/// view.
+fn column_prefix(t: &Tensor, cols: usize) -> TensorView<'_> {
+    let (rows, stride) = (t.shape[0], t.shape[1]);
+    let es = t.dtype.size_bytes();
+    TensorView {
+        slice: t.storage.whole().sub(0, ((rows - 1) * stride + cols) * es),
+        shape: (&[rows, cols][..]).into(),
+        strides: (&[stride, 1][..]).into(),
+        dtype: t.dtype,
+    }
+}
+
+/// Phase 2c S-9: the fused residual add + RMSNorm of kernel ABI v2.1 (`turbine_add_rmsnorm`)
+/// matches the cpu-reference `add` then `rmsnorm`: the updated residual exactly (the same
+/// round-to-nearest-even BF16 sum); the normalised output within the RMSNorm tolerance, except
+/// that on 2048-row cases (4–6 M elements) a few elements may sit one BF16 rounding step of the
+/// intermediate `x·inv_rms` away (a different f32 reduction order crossing a BF16 midpoint,
+/// then multiplied by γ): those must be exactly such a step, and at most 1 in 1,000. At
+/// Llama's 3072 the fused op is also bitwise HIP `add` then HIP `rmsnorm` (the same ck_tile
+/// pipeline). Rows 1/16/2048 at OLMoE's 2048 and Llama's 3072 (the two ck_tile buckets), plus
+/// the Turbine kernel for a row stride CK's 8-wide loads cannot take and for a dimension outside
+/// the buckets.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn add_rmsnorm_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let hip = p
+        .hip
+        .add_rmsnorm()
+        .expect("libturbine_hip.so exports the ABI v2.1 add_rmsnorm trio");
+    let cpu = p.cpu.add_rmsnorm().expect("cpu add_rmsnorm");
+    let mut rng = Rng(21);
+    // (rows, dim, row stride of x).
+    let cases = [
+        (1, MOE_HIDDEN, MOE_HIDDEN),
+        (16, MOE_HIDDEN, MOE_HIDDEN),
+        (2048, MOE_HIDDEN, MOE_HIDDEN),
+        (1, HIDDEN, HIDDEN),
+        (16, HIDDEN, HIDDEN),
+        (2048, HIDDEN, HIDDEN),
+        (16, HIDDEN, HIDDEN + 4),
+        (7, 64, 64),
+    ];
+    for (rows, dim, x_stride) in cases {
+        let cfg = AddRmsnormConfig {
+            dtype: DType::BF16,
+            dim: dim as u32,
+        };
+        assert!(hip.supports(&cfg), "hip must support add_rmsnorm {cfg}");
+        let impl_name = hip.implementation(&cfg);
+        let n = rows * dim;
+        let before = rng.normal(n, 1.0);
+        let (r_hip, r_cpu) = twin(&p, &[rows, dim], DType::BF16, &before);
+        let x = rng.normal(rows * x_stride, 1.0);
+        let (x_hip, x_cpu) = twin(&p, &[rows, x_stride], DType::BF16, &x);
+        let (w_hip, w_cpu) = twin(&p, &[dim], DType::BF16, &rng.normal(dim, 1.0));
+        let (o_hip, o_cpu) = twin(&p, &[rows, dim], DType::BF16, &vec![0.0; n]);
+        let runs = [
+            (hip, &r_hip, &x_hip, &w_hip, &o_hip),
+            (cpu, &r_cpu, &x_cpu, &w_cpu, &o_cpu),
+        ];
+        for (kernel, r, x, w, o) in runs {
+            let mut ctx = AddRmsnormContext {
+                residual: r.view(),
+                x: column_prefix(x, dim),
+                weight: w.view(),
+                out: o.view(),
+                eps: 1e-5,
+            };
+            kernel.execute(&mut ctx).expect("add_rmsnorm");
+        }
+        let what = format!("add_rmsnorm rows={rows} x_stride={x_stride} {cfg}");
+        assert_exact(
+            &format!("{what} residual"),
+            &impl_name,
+            &read(&r_hip),
+            &read(&r_cpu),
+        );
+        let residual = read(&r_cpu);
+        let weight = read(&w_cpu);
+        let (out_hip, out_cpu) = (read(&o_hip), read(&o_cpu));
+        let mut flips = 0usize;
+        for (i, (&g, &w)) in out_hip.iter().zip(&out_cpu).enumerate() {
+            if bf16_close(g, w) {
+                continue;
+            }
+            let row = &residual[i / dim * dim..(i / dim + 1) * dim];
+            let normed = rms_normalised(row, 1e-5, i % dim);
+            let allowed = one_rounding_step(normed, weight[i % dim]);
+            assert!(
+                allowed.contains(&g),
+                "{what} out ({impl_name}): element {i}: hip {g} vs cpu {w}, not within one BF16 \
+                 rounding step of x·inv_rms = {normed} (allowed {allowed:?})"
+            );
+            flips += 1;
+        }
+        // A rounding flip of x·inv_rms needs x·inv_rms within f32 noise of a BF16 midpoint: rare.
+        assert!(
+            flips * 1000 <= n,
+            "{what} out ({impl_name}): {flips} of {n} elements need a rounding flip"
+        );
+        println!(
+            "{what} out: impl={impl_name} {flips} of {n} elements one intermediate rounding \
+             step from cpu, the rest within the BF16 tolerance ok"
+        );
+
+        // At Llama's 3072, rmsnorm runs the same ck_tile pipeline without the fused add: the
+        // fused op is bitwise HIP add followed by HIP rmsnorm.
+        if dim == HIDDEN && x_stride == dim {
+            let (r2, _) = twin(&p, &[rows, dim], DType::BF16, &before);
+            let (o2, _) = twin(&p, &[rows, dim], DType::BF16, &vec![0.0; n]);
+            let add = p.hip.elementwise().expect("hip add");
+            add.execute(&mut ElementwiseContext {
+                a: r2.view(),
+                b: x_hip.view(),
+                out: r2.view(),
+            })
+            .expect("hip add");
+            let norm = p.hip.norm().expect("hip rmsnorm");
+            norm.execute(&mut NormContext {
+                x: r2.view(),
+                weight: w_hip.view(),
+                out: o2.view(),
+                eps: 1e-5,
+            })
+            .expect("hip rmsnorm");
+            assert_exact(
+                &format!("{what} vs hip add + rmsnorm"),
+                &impl_name,
+                &out_hip,
+                &read(&o2),
+            );
+        }
+    }
+}
+
+/// `x[j] · inv_rms(x)` computed exactly enough (f64) to bracket any f32 implementation's value.
+fn rms_normalised(x: &[f32], eps: f64, j: usize) -> f64 {
+    let ss: f64 = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+    f64::from(x[j]) / (ss / x.len() as f64 + eps).sqrt()
+}
+
+/// The BF16 outputs `round(round(t) · γ)` an RMSNorm may give when its f32 `t = x · inv_rms`
+/// rounds to the BF16 value nearest `normed` or to either neighbour of it (a different f32
+/// summation order moves `t` by a few f32 ulps, which can cross a BF16 midpoint); the product
+/// with `γ` is f32 and rounded to nearest even, as every provider does.
+fn one_rounding_step(normed: f64, gamma: f32) -> Vec<f32> {
+    let nearest = bf16::from_f64(normed).to_bits();
+    [nearest.wrapping_sub(1), nearest, nearest.wrapping_add(1)]
+        .into_iter()
+        .map(|bits| bf16::from_f32(bf16::from_bits(bits).to_f32() * gamma).to_f32())
+        .collect()
 }
 
 /// `0..n` in a seeded random order (Fisher–Yates).

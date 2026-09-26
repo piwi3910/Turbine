@@ -325,10 +325,18 @@ pub fn prepare(
     }
     let block_tokens = config.kv.block_tokens;
     let executor_options = ExecutorOptions::from_fused_ops(config.execution.fused_ops);
+    // Optional ops (kernel ABI v2.1) join the requirements only when a provider in the
+    // selection order has them; otherwise the executor runs their ABI v2 equivalent.
+    let ordered: Vec<Arc<dyn KernelProvider>> = provider
+        .providers
+        .iter()
+        .filter(|p| provider.order.contains(&p.id()))
+        .cloned()
+        .collect();
     let registry = KernelRegistry::build(
         provider.providers.clone(),
         &provider.order,
-        &executor::requirements(&arch, block_tokens, executor_options),
+        &executor::available_requirements(&arch, block_tokens, executor_options, &ordered),
         &KernelMetrics::register(metrics),
     )
     .map_err(|e| kernel_error("kernel selection", e))?;

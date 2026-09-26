@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use turbine_core::types::{BlockId, KvLayout, ModelShape, SeqId};
-use turbine_kernels::{KernelRegistry, OpRequirement};
+use turbine_kernels::{KernelProvider, KernelRegistry, OpConfig, OpRequirement};
 use turbine_tensor::tensor::contiguous_strides;
 use turbine_tensor::{DeviceMemory, KvPoolView, Tensor, TensorView};
 
@@ -26,6 +26,10 @@ pub use olmoe::OlmoeExecutor;
 /// `execution.fused_ops: true` ([`ExecutorOptions::from_fused_ops`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutorOptions {
+    /// Each residual add a norm follows runs as one `add_rmsnorm` (kernel ABI v2.1) when a
+    /// provider has it; `false` runs `add` then `rmsnorm` (the Phase 2 op sequence). On by
+    /// default.
+    pub fused_ops: bool,
     /// One GEMM for the Q/K/V projections and (Llama) one for gate/up, over the fused weights the
     /// loader lays out; `false` runs one GEMM per projection over row views of the same weights
     /// (the Phase 2 op sequence, kept as the reference path).
@@ -46,6 +50,7 @@ pub const FUSED_PROJECTIONS_DEFAULT: bool = false;
 impl Default for ExecutorOptions {
     fn default() -> ExecutorOptions {
         ExecutorOptions {
+            fused_ops: true,
             fused_projections: FUSED_PROJECTIONS_DEFAULT,
         }
     }
@@ -59,6 +64,7 @@ impl ExecutorOptions {
             ExecutorOptions::default()
         } else {
             ExecutorOptions {
+                fused_ops: false,
                 fused_projections: false,
             }
         }
@@ -77,6 +83,24 @@ pub fn requirements(
         Architecture::Llama => LlamaExecutor::requirements(cfg, block_tokens, opts),
         Architecture::Olmoe => OlmoeExecutor::requirements(cfg, block_tokens, opts),
     }
+}
+
+/// [`requirements`] without the optional ops (kernel ABI v2.1 `add_rmsnorm`) that none of
+/// `providers` supports: the executor then runs their ABI v2 equivalent (`add`, then `rmsnorm`),
+/// so a kernel library without them (minor 0, e.g. the Phase 2b CUDA shim) still serves the model.
+pub fn available_requirements(
+    cfg: &ModelArchConfig,
+    block_tokens: u32,
+    opts: ExecutorOptions,
+    providers: &[Arc<dyn KernelProvider>],
+) -> Vec<OpRequirement> {
+    requirements(cfg, block_tokens, opts)
+        .into_iter()
+        .filter(|r| {
+            !matches!(r.spec, OpConfig::AddRmsnorm(_))
+                || providers.iter().any(|p| r.spec.supported_by(p.as_ref()))
+        })
+        .collect()
 }
 
 /// Where the outputs of projections of one input live in their shared buffer `[rows, Σ cols]`:
@@ -285,7 +309,9 @@ mod tests {
     fn fused_ops_selects_defaults_or_nothing() {
         let on = ExecutorOptions::from_fused_ops(true);
         assert_eq!(on, ExecutorOptions::default());
+        assert!(on.fused_ops);
         assert_eq!(on.fused_projections, FUSED_PROJECTIONS_DEFAULT);
-        assert!(!ExecutorOptions::from_fused_ops(false).fused_projections);
+        let off = ExecutorOptions::from_fused_ops(false);
+        assert!(!off.fused_ops && !off.fused_projections);
     }
 }

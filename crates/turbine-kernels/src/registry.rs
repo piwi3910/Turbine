@@ -275,6 +275,13 @@ impl KernelRegistry {
         Ok(KernelRegistry { chosen, selections })
     }
 
+    /// True when `spec` was among the startup requirements and a provider was selected for it:
+    /// how an executor learns whether an optional op (the v2.1 `add_rmsnorm`) it listed survived
+    /// [`OpConfig::supported_by`] filtering, before calling its accessor.
+    pub fn is_selected(&self, spec: &OpConfig) -> bool {
+        self.chosen.contains_key(spec)
+    }
+
     /// Every selection made at startup, in requirement order.
     pub fn selections(&self) -> &[Selection] {
         &self.selections
@@ -717,6 +724,12 @@ mod tests {
             registry.add_rmsnorm(&fused).implementation(&fused),
             "cpu_add_rmsnorm"
         );
+        assert!(registry.is_selected(&OpConfig::AddRmsnorm(fused)));
+        let other = AddRmsnormConfig {
+            dtype: DType::BF16,
+            dim: 2048,
+        };
+        assert!(!registry.is_selected(&OpConfig::AddRmsnorm(other)));
         assert_eq!(
             registry.logits_reduce(&reduce).implementation(&reduce),
             "cpu_logits_reduce"

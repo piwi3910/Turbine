@@ -1,5 +1,5 @@
 // Turbine HIP kernels: embedding gather, half-split RoPE, SiLU-and-multiply,
-// residual add and the RMSNorm fallback. No ROCm library ships these as
+// residual add and the RMSNorm and add+RMSNorm fallbacks. No ROCm library ships these as
 // standalone kernels (spec S-7). Numerics follow the cpu-reference provider:
 // f32 compute, rounding to the activation dtype at the points where the
 // Hugging Face BF16 forward materialises a tensor in that dtype.
@@ -328,6 +328,54 @@ template <typename T> struct RmsnormLaunch {
   }
 };
 
+// ---- add_rmsnorm fallback (ABI v2.1) ----
+
+// residual = round(residual + x) in place, then out = rmsnorm(residual): the
+// rmsnorm_kernel above on the rounded sum, each thread re-reading only the
+// elements it stored itself.
+template <typename T>
+__global__ void add_rmsnorm_kernel(T *residual, const T *x, const T *weight,
+                                   T *out, int64_t dim, int64_t residual_stride,
+                                   int64_t x_stride, int64_t out_stride,
+                                   float eps) {
+  __shared__ float partial[kBlock];
+  const int64_t r = blockIdx.x;
+  T *r_row = residual + r * residual_stride;
+  const T *x_row = x + r * x_stride;
+  T *o_row = out + r * out_stride;
+  float sum = 0.0f;
+  for (int64_t j = threadIdx.x; j < dim; j += blockDim.x) {
+    const float v = round_to<T>(to_f32<T>(r_row[j]) + to_f32<T>(x_row[j]));
+    r_row[j] = from_f32<T>(v);
+    sum += v * v;
+  }
+  partial[threadIdx.x] = sum;
+  __syncthreads();
+  for (int offset = kBlock / 2; offset > 0; offset /= 2) {
+    if (static_cast<int>(threadIdx.x) < offset) {
+      partial[threadIdx.x] += partial[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(dim) + eps);
+  for (int64_t j = threadIdx.x; j < dim; j += blockDim.x) {
+    const float normed = round_to<T>(to_f32<T>(r_row[j]) * inv);
+    o_row[j] = from_f32<T>(normed * to_f32<T>(weight[j]));
+  }
+}
+
+template <typename T> struct AddRmsnormLaunch {
+  static void run(hipStream_t s, const turbine_add_rmsnorm_desc *d) {
+    hipLaunchKernelGGL(add_rmsnorm_kernel<T>,
+                       dim3(static_cast<unsigned>(d->rows)), dim3(kBlock), 0, s,
+                       static_cast<T *>(d->residual),
+                       static_cast<const T *>(d->x),
+                       static_cast<const T *>(d->weight),
+                       static_cast<T *>(d->out), d->dim, d->residual_stride_row,
+                       d->x_stride_row, d->out_stride_row, d->eps);
+  }
+};
+
 std::string unsupported(const char *op, int32_t dtype) {
   return std::string(op) +
          ": unsupported configuration (dtype=" + std::to_string(dtype) + ")";
@@ -346,6 +394,19 @@ bool rmsnorm_fallback_supported(const turbine_rmsnorm_desc *d) {
 int32_t launch_rmsnorm(turbine_ctx *ctx, const turbine_rmsnorm_desc *d) {
   dispatch<RmsnormLaunch>(d->dtype, ctx->stream, d);
   return check_hip(ctx, hipGetLastError(), "rmsnorm kernel launch");
+}
+
+bool add_rmsnorm_fallback_supported(const turbine_add_rmsnorm_desc *d) {
+  return d != nullptr && float_dtype(d->dtype) && d->rows >= 1 &&
+         d->rows <= INT32_MAX && d->dim >= 1 &&
+         d->residual_stride_row >= d->dim && d->x_stride_row >= d->dim &&
+         d->out_stride_row >= d->dim;
+}
+
+int32_t launch_add_rmsnorm(turbine_ctx *ctx,
+                           const turbine_add_rmsnorm_desc *d) {
+  dispatch<AddRmsnormLaunch>(d->dtype, ctx->stream, d);
+  return check_hip(ctx, hipGetLastError(), "add_rmsnorm kernel launch");
 }
 
 } // namespace turbine_hip

@@ -82,6 +82,8 @@ const char *blaslt_status_name(hipblasStatus_t status);
 // returns a TURBINE_* code; the descriptor was validated by the caller.
 int32_t launch_rmsnorm(turbine_ctx *ctx, const turbine_rmsnorm_desc *d);
 bool rmsnorm_fallback_supported(const turbine_rmsnorm_desc *d);
+int32_t launch_add_rmsnorm(turbine_ctx *ctx, const turbine_add_rmsnorm_desc *d);
+bool add_rmsnorm_fallback_supported(const turbine_add_rmsnorm_desc *d);
 
 // Paged-KV kernels (paged_attention.hip); the descriptor was validated by the
 // caller (paged_attention.cpp) and has total_q > 0.
