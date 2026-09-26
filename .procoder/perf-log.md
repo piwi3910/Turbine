@@ -19,6 +19,8 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 | 2026-09-26 | 6fc9854 | engine stage breakdown metric (279/0) | 261.6 | 47.6 | 1553 | 42.1 | c1 16/16; c16 16/16 | −2.5% (within noise) |
 | 2026-09-26 | 551c3db | execution.* config keys, no runtime change (280/0) — shows run-to-run noise ≈ ±5% | 286.0 | 46.5 | 1558 | 40.7 | c1 16/16; c16 16/16 | +9.3% (noise) |
 | 2026-09-26 | 006cec7 | rope/silu_mul spread over the device (280/0) | 285.5 | 45.9 | 1512 | 40.3 | c1 16/16; c16 16/16 | −0.2% |
+| 2026-09-26 | 288dbc2 | kernel ABI v2.1 (optional symbols; no runtime change) (285/0) | 292.1 | 45.6 | 1509 | 39.9 | c1 16/16; c16 16/16 | +2.3% |
+| 2026-09-26 | 750872c | **KV pages 128 → CK fmha_fwd_pagedkv for prefill and decode (290/0) — passes the 553 target (84% of vLLM)** | **623.6** | 21.9 | 575 | 19.6 | c1 16/16; c16 16/16 | +113% |
 
 ## OLMoE-1B-7B-0125-Instruct (BF16)
 
