@@ -14,6 +14,8 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 | 2026-09-26 | 462f068 | host: logprobs only when requested (269/0) | 99.9 | 150 | 1519 | 47.3 | 16/16 | +8.7% |
 | 2026-09-26 | 156681b | host: sampler reuses vocab-sized buffers — REGRESSION (re-measured 91.6); perf profile: full candidate sort hot | 91.9 | 154 | 1528 | 47.4 | 16/16 | −8.0% |
 | 2026-09-26 | 8bcf398 | host: integer sort keys — fixes 156681b's regression (270/0) | 146.1 | 99 | 1428 | 51.1 | c1 16/16 (repeatable); c16 15/16 once, 16/16 on two reruns | +46% vs 462f068 |
+| 2026-09-26 | 744fe8c | host: vectorised draw for unseeded requests (276/0) | 250.7 | 54.5 | 1543 | 44.8 | c1 16/16; c16 16/16 | +72% |
+| 2026-09-26 | 85ed316 | host: decode rows sampled in parallel (277/0) | 268.3 | 50.2 | 1536 | 43.9 | c1 16/16; c16 16/16 | +7.0% |
 
 ## OLMoE-1B-7B-0125-Instruct (BF16)
 
