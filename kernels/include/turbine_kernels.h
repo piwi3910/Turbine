@@ -40,8 +40,9 @@
  * Errors. turbine_last_error(ctx, buf, len) copies the NUL-terminated message
  * of the most recent failure on ctx (with ctx == NULL: of the most recent
  * failed turbine_ctx_create on the calling thread) into the host buffer buf and
- * returns the full message length excluding the NUL. Device runtime messages
- * start with the runtime's own error name. */
+ * returns the full message length excluding the NUL; with buf == NULL or
+ * len == 0 it writes nothing and only returns the length. Device runtime
+ * messages start with the runtime's own error name. */
 #ifndef TURBINE_KERNELS_H
 #define TURBINE_KERNELS_H
 #include <stddef.h>

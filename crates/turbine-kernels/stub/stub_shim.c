@@ -178,7 +178,7 @@ int32_t turbine_ctx_get_info(turbine_ctx *ctx, turbine_ctx_info *out) {
 size_t turbine_last_error(turbine_ctx *ctx, char *buf, size_t len) {
   const char *msg = ctx != NULL ? ctx->last_error : create_error;
   size_t n = strlen(msg);
-  if (len > 0) {
+  if (buf != NULL && len > 0) {
     size_t copy = n < len - 1 ? n : len - 1;
     memcpy(buf, msg, copy);
     buf[copy] = '\0';

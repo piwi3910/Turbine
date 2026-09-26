@@ -1702,6 +1702,25 @@ mod tests {
     }
 
     #[test]
+    fn last_error_with_null_buffer_only_returns_the_length() {
+        let lib = ShimLibrary::load(
+            Path::new(env!("TURBINE_STUB_GFX942")),
+            ExecutionBackend::Hip,
+        )
+        .expect("load");
+        let mut buf = [0u8; 64];
+        // SAFETY: a null context reads this thread's create message; `buf` is live and writable
+        // for its full length.
+        let with_buf =
+            unsafe { (lib.syms.last_error)(std::ptr::null_mut(), buf.as_mut_ptr().cast(), 64) };
+        // SAFETY: the header allows a null buffer: the library writes nothing and returns the
+        // length.
+        let without_buf =
+            unsafe { (lib.syms.last_error)(std::ptr::null_mut(), std::ptr::null_mut(), buf.len()) };
+        assert_eq!(without_buf, with_buf);
+    }
+
+    #[test]
     fn backend_mismatch_is_fatal() {
         let err = ShimLibrary::load(
             Path::new(env!("TURBINE_STUB_GFX942")),

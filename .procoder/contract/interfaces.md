@@ -1027,7 +1027,7 @@ Minor revisions (`TURBINE_ABI_MINOR` / `turbine_abi_minor()`, optional symbol; P
 - Row-major everywhere; strides are in elements; "leading dimension" = row stride in elements.
 - Only `turbine_*` symbols are exported (`-fvisibility=hidden`; P2b).
 - The shim never retains a caller pointer beyond the call; the context owns its streams, library handles and workspace (P1).
-- Error message: `turbine_last_error(ctx, buf, len)` copies the NUL-terminated message of the most recent failure on `ctx` (or, with `ctx == NULL`, of the most recent failed `turbine_ctx_create` on the calling thread — contract-chosen), returns the full message length (excluding NUL). CUDA/HIP messages start with the vendor error name, e.g. `cudaErrorIllegalAddress: …` (P2b S-5).
+- Error message: `turbine_last_error(ctx, buf, len)` copies the NUL-terminated message of the most recent failure on `ctx` (or, with `ctx == NULL`, of the most recent failed `turbine_ctx_create` on the calling thread — contract-chosen), returns the full message length (excluding NUL); with `buf == NULL` or `len == 0` it writes nothing and only returns the length. CUDA/HIP messages start with the vendor error name, e.g. `cudaErrorIllegalAddress: …` (P2b S-5).
 
 ### 9.3 Header (normative)
 
