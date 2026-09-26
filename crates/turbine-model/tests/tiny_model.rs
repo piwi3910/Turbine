@@ -114,7 +114,8 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 // Plain f32 loops over the checkpoint read straight from `model.safetensors`, recomputing the
 // whole sequence each step (no KV cache). Values are rounded to BF16 where the HF BF16 forward
 // materialises a BF16 tensor: every projection output, RMSNorm (normalised x, then · weight),
-// RoPE (cos, sin, each product and each sum), attention output, silu(gate) and silu·up, and
+// RoPE (cos, sin, each product and each sum), the unnormalised attention probabilities fed to
+// P·V (CK FMHA / PyTorch CPU flash attention), attention output, silu(gate) and silu·up, and
 // each residual sum. Logits stay f32.
 
 fn bf(v: f32) -> f32 {
@@ -230,13 +231,18 @@ impl Naive {
                     *s = (*s - max).exp();
                     sum += *s;
                 }
+                // CK FMHA / PyTorch CPU flash order: the f32 sum above is of the unrounded
+                // exponentials, P·V uses them rounded to BF16, the row is normalised last.
                 let o = &mut out[(i * hq + h) * d..][..d];
                 for (j, s) in scores.iter().enumerate() {
-                    let p = s / sum;
+                    let p = bf(*s);
                     let vv = &v[(j * hkv + kvh) * d..][..d];
                     for (acc, x) in o.iter_mut().zip(vv) {
                         *acc += p * x;
                     }
+                }
+                for acc in o.iter_mut() {
+                    *acc /= sum;
                 }
             }
         }
@@ -476,8 +482,15 @@ fn requirements_and_workspace() {
     assert_eq!(w1 - (w2 - w1), 2 * 64 + 4 * 263 + 4 * 8);
 }
 
+/// Max |Δ logit| between the HIP and cpu-reference providers on the tiny checkpoint. With the
+/// cpu-reference attention in CK's order (BF16 unnormalised probabilities for P·V, f32 row
+/// sum), every op models the HIP numerics and the measured worst case over 32 steps on an R9700
+/// is 3.8e-6 (0.097 while the cpu-reference kept f32 probabilities). 1e-4 leaves a 25× margin
+/// for f32 accumulation order and is ~1000× below the error one numerics-model mismatch caused.
+const HIP_MAX_ABS_LOGIT_DIFF: f32 = 1e-4;
+
 /// Lab only (Task 21): HIP provider logits on the head_dim-128 tiny checkpoint match the CPU
-/// provider within 2e-2 and 32 greedy tokens are identical.
+/// provider within [`HIP_MAX_ABS_LOGIT_DIFF`] and 32 greedy tokens are identical.
 #[test]
 #[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
 fn hip_matches_cpu() {
@@ -507,9 +520,14 @@ fn hip_matches_cpu() {
     let mut tokens = prompt(spec.vocab);
     let mut cpu_row = forward(&mut cpu, &tokens, 0).row(0).to_vec();
     let mut hip_row = forward(&mut hip, &tokens, 0).row(0).to_vec();
+    let mut worst = 0f32;
     for step in 0..32 {
         let diff = max_abs_diff(&hip_row, &cpu_row);
-        assert!(diff <= 2e-2, "step {step}: max abs diff {diff}");
+        worst = worst.max(diff);
+        assert!(
+            diff <= HIP_MAX_ABS_LOGIT_DIFF,
+            "step {step}: max abs diff {diff}"
+        );
         let (c, h) = (argmax(&cpu_row), argmax(&hip_row));
         assert_eq!(h, c, "greedy token {step} differs");
         let pos = tokens.len() as u32;
@@ -517,6 +535,7 @@ fn hip_matches_cpu() {
         cpu_row = forward(&mut cpu, &[c], pos).row(0).to_vec();
         hip_row = forward(&mut hip, &[c], pos).row(0).to_vec();
     }
+    println!("hip_matches_cpu: max abs logit diff over 32 steps {worst}");
 }
 
 // ------------------------------------------------------------------------ trace diagnostics
@@ -570,19 +589,19 @@ fn cpu_trace_recomputes_exactly() {
     }
     let weights = |name: &str| read_bf16_weight(&index, name);
     let mut checker = LocalChecker::new(&spec.config, &weights);
-    let mut attn_p_bf16_differs = false;
+    let mut attn_p_f32_differs = false;
     for (step, trace) in traces[0].iter().enumerate() {
         for row in checker.check_step(step, starts[step], trace) {
-            if row.name == "attn_p_bf16" {
-                attn_p_bf16_differs |= row.stats.differing > 0;
+            if row.name == "attn_p_f32" {
+                attn_p_f32_differs |= row.stats.differing > 0;
                 continue;
             }
             assert_eq!(row.stats.differing, 0, "{row:?}");
         }
     }
     assert!(
-        attn_p_bf16_differs,
-        "BF16 probabilities must be a different numerics model"
+        attn_p_f32_differs,
+        "f32 probabilities must be a different numerics model"
     );
 
     // The recorded logits are the returned ones; disabling drops the trace.

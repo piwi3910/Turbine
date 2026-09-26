@@ -298,7 +298,11 @@ impl AttentionKernel for CpuReference {
             d,
             causal: ctx.cfg.causal,
         };
-        store(&ctx.out, &math::attention(&q, &k, &v, &shape, ctx.scale))
+        let dt = ctx.cfg.dtype;
+        store(
+            &ctx.out,
+            &math::attention(&q, &k, &v, &shape, ctx.scale, |p| round_to(dt, p)),
+        )
     }
 }
 
@@ -607,6 +611,50 @@ mod tests {
             ],
             1e-5,
         );
+    }
+
+    /// BF16 attention follows CK FMHA (and PyTorch's CPU flash attention): the unnormalised
+    /// `exp(s − max)` feeds the row sum in f32, is rounded to BF16 for P·V (accumulated in f32),
+    /// and the output is divided by the f32 sum. Breaks if P stays f32, if the sum is taken over
+    /// the rounded values, or if P is normalised before rounding.
+    #[test]
+    fn bf16_attention_rounds_unnormalised_probabilities_like_ck() {
+        let mem = host();
+        let run = |dtype: DType| {
+            let cfg = AttentionConfig {
+                kind: AttentionKind::Decode,
+                num_q_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 1,
+                dtype,
+                block_tokens: None,
+                causal: true,
+            };
+            // Scores [0, −0.25] (all inputs exact in BF16); v = [0, 1].
+            let q = tensor(&mem, &[1, 1, 1], dtype, &[-0.25]);
+            let k = tensor(&mem, &[2, 1, 1], dtype, &[0.0, 1.0]);
+            let v = tensor(&mem, &[2, 1, 1], dtype, &[0.0, 1.0]);
+            let out = Tensor::empty(&mem, &[1, 1, 1], DType::F32).expect("alloc");
+            CpuReference
+                .attention()
+                .expect("attention family")
+                .execute(&mut AttentionContext {
+                    cfg,
+                    q: q.view(),
+                    k_cache: k.view(),
+                    v_cache: v.view(),
+                    out: out.view(),
+                    q_start: 1,
+                    scale: 1.0,
+                })
+                .expect("attention");
+            load(&out.view()).expect("load")[0]
+        };
+        let p = (-0.25f32).exp();
+        let p_bf16 = bf16::from_f32(p).to_f32();
+        assert_ne!(p_bf16, p, "the probability must not be exact in BF16");
+        assert_eq!(run(DType::BF16), p_bf16 / (1.0 + p));
+        assert_eq!(run(DType::F32), p / (1.0 + p));
     }
 
     #[test]

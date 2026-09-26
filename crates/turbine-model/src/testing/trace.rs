@@ -176,10 +176,11 @@ fn linear(x: &[f32], w: &[f32], k: usize) -> Vec<f32> {
 /// How the local attention recomputation treats the softmax probabilities before P·V.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttnProbs {
-    /// f32 probabilities (the cpu-reference provider).
+    /// Normalised f32 probabilities, never rounded (an exact-softmax alternative).
     F32,
-    /// Unnormalised `exp(s − max)` rounded to BF16 before P·V, the sum of the rounded values
-    /// in f32, normalised after (flash-attention style kernels: CK FMHA, PyTorch CPU flash).
+    /// Unnormalised `exp(s − max)` summed in f32, rounded to BF16 before P·V, the row divided
+    /// by the f32 sum after (CK FMHA, PyTorch CPU flash attention and the cpu-reference
+    /// provider).
     Bf16Unnormalised,
 }
 
@@ -267,9 +268,6 @@ impl<'a> LocalChecker<'a> {
                 let mut sum = 0f32;
                 for s in &mut scores {
                     *s = (*s - max).exp();
-                    if probs == AttnProbs::Bf16Unnormalised {
-                        *s = bf(*s);
-                    }
                     sum += *s;
                 }
                 let o = &mut out[(i * hq + h) * d..][..d];
@@ -283,8 +281,9 @@ impl<'a> LocalChecker<'a> {
                             }
                         }
                         AttnProbs::Bf16Unnormalised => {
+                            let p = bf(*s);
                             for (acc, x) in o.iter_mut().zip(vr) {
-                                *acc += s * x;
+                                *acc += p * x;
                             }
                         }
                     }
@@ -302,7 +301,8 @@ impl<'a> LocalChecker<'a> {
     /// Recomputes every op of one forward step (`trace` from a provider that ran positions
     /// `p0..p0 + t`) from the step's own recorded inputs; steps must be fed in order so the
     /// attention sees the K/V rows of earlier steps. The attention row is reported for each
-    /// [`AttnProbs`] model (`attn` = f32 probabilities, `attn_p_bf16` = BF16 probabilities).
+    /// [`AttnProbs`] model (`attn` = BF16 unnormalised probabilities, the cpu-reference and CK
+    /// numerics; `attn_p_f32` = exact f32 probabilities).
     pub fn check_step(&mut self, step: usize, p0: usize, trace: &[TraceTensor]) -> Vec<DiffRow> {
         let cfg = self.cfg;
         let hidden = cfg.hidden as usize;
@@ -371,13 +371,13 @@ impl<'a> LocalChecker<'a> {
             push(
                 l,
                 "attn",
-                &self.attention(q_rope, kc, vc, p0, AttnProbs::F32),
+                &self.attention(q_rope, kc, vc, p0, AttnProbs::Bf16Unnormalised),
                 attn,
             );
             push(
                 l,
-                "attn_p_bf16",
-                &self.attention(q_rope, kc, vc, p0, AttnProbs::Bf16Unnormalised),
+                "attn_p_f32",
+                &self.attention(q_rope, kc, vc, p0, AttnProbs::F32),
                 attn,
             );
             let o_proj = &get(l, "o_proj").data;

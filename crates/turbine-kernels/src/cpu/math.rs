@@ -56,10 +56,20 @@ pub(crate) struct AttnShape {
     pub causal: bool,
 }
 
-/// GQA attention with a max-subtracted softmax in f32. Query head `h` reads KV head
-/// `h / (hq / hkv)`; query `i` sits at absolute position `q_start + i` and, when causal, attends
-/// keys `0..=q_start + i` (otherwise all `q_start + q_len` keys).
-pub(crate) fn attention(q: &[f32], k: &[f32], v: &[f32], s: &AttnShape, scale: f32) -> Vec<f32> {
+/// GQA attention in the CK FMHA order (also PyTorch's CPU flash attention): scores and their
+/// row max in f32, the unnormalised `exp(s − max)` summed in f32, each of them passed through
+/// `round_p` (rounding to the activation dtype, as those kernels feed P to the P·V GEMM in that
+/// dtype), P·V accumulated in f32, and the row divided by the f32 sum at the end. Query head `h`
+/// reads KV head `h / (hq / hkv)`; query `i` sits at absolute position `q_start + i` and, when
+/// causal, attends keys `0..=q_start + i` (otherwise all `q_start + q_len` keys).
+pub(crate) fn attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    s: &AttnShape,
+    scale: f32,
+    round_p: impl Fn(f32) -> f32,
+) -> Vec<f32> {
     let group = s.hq / s.hkv;
     let kv_len = s.q_start + s.q_len;
     let mut out = vec![0f32; s.q_len * s.hq * s.d];
@@ -87,11 +97,14 @@ pub(crate) fn attention(q: &[f32], k: &[f32], v: &[f32], s: &AttnShape, scale: f
             }
             let o = &mut out[row..row + s.d];
             for (j, score) in scores[..visible].iter().enumerate() {
-                let w = score / sum;
+                let p = round_p(*score);
                 let vr = (j * s.hkv + kvh) * s.d;
                 for (acc, x) in o.iter_mut().zip(&v[vr..vr + s.d]) {
-                    *acc += w * x;
+                    *acc += p * x;
                 }
+            }
+            for acc in o.iter_mut() {
+                *acc /= sum;
             }
         }
     }
@@ -189,7 +202,7 @@ mod tests {
             causal: false,
         };
         // Equal scores: the output is the mean of the values.
-        let out = attention(&[0.0], &[1.0, 2.0], &[4.0, 8.0], &s, 1.0);
+        let out = attention(&[0.0], &[1.0, 2.0], &[4.0, 8.0], &s, 1.0, |p| p);
         assert_eq!(out, [6.0]);
     }
 
