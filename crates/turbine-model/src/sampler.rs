@@ -1,7 +1,8 @@
 //! Host-side token sampling from FP32 logits (P1 S-9, P2 S-10/S-17): logit bias, penalties,
 //! `min_tokens` and the constrained-decoding token mask adjust the logits in place, then greedy
 //! argmax at temperature 0, otherwise temperature → top-k → top-p over a seeded ChaCha8 stream,
-//! so an identical `seed` gives identical tokens.
+//! so an identical `seed` gives identical tokens (seeded draws keep a fixed f64 arithmetic;
+//! unseeded ones use a vectorised f32 `exp`).
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -64,6 +65,10 @@ pub struct Sampler {
     /// Occurrences of each generated id (the presence/frequency/repetition history).
     counts: HashMap<u32, u32>,
     rng: ChaCha8Rng,
+    /// The request carries a `seed`: draws use the fixed f64 arithmetic of [`Sampler::draw_exact`]
+    /// so the tokens never change between releases. Unseeded requests promise no particular
+    /// tokens and take the vectorised [`Sampler::draw_fast`].
+    exact: bool,
     /// Raw values of the ids this step changed before sampling (reused across steps).
     originals: HashMap<u32, f32>,
     /// Buffers reused across steps, so a step allocates nothing vocabulary-sized.
@@ -79,6 +84,77 @@ struct Scratch {
     candidates: Vec<(u32, f32)>,
     /// Unnormalised probabilities of the candidates (of every id when nothing is cut).
     weights: Vec<f64>,
+    /// [`Sampler::draw_fast`]: f32 weights of every id (or of the top-k candidates).
+    fast: Vec<f32>,
+    /// [`Sampler::draw_fast`]: f64 sums of `fast` per [`FAST_BLOCK`] ids.
+    blocks: Vec<f64>,
+}
+
+/// Ids per partial sum of the fast draw: the draw finds its block from the sums, then scans
+/// only that block.
+const FAST_BLOCK: usize = 1024;
+
+/// `e^d` for `d ≤ 0` in f32 without a libm call, so a loop over the vocabulary vectorises:
+/// Cody–Waite reduction `d = n·ln 2 + r`, `|r| ≤ ln 2 / 2`, a degree-6 Taylor polynomial for
+/// `e^r` (relative error below 3e-7) and `2^n` from the exponent bits. `d` below −87 (the
+/// weight is under 2e-38), −∞ (a masked id) and NaN give exactly 0.
+#[inline(always)]
+fn exp_fast(d: f32) -> f32 {
+    const ROUND: f32 = 12_582_912.0; // 1.5 · 2^23: adding it rounds to an integer
+    const LN2_HI: f32 = 0.693_359_4; // 0.693359375, exact in few bits
+    const LN2_LO: f32 = -2.121_944_4e-4;
+    let x = d.max(-87.0);
+    let t = x * std::f32::consts::LOG2_E + ROUND;
+    let n = t - ROUND;
+    let r = x - n * LN2_HI - n * LN2_LO;
+    let p = 1.0
+        + r * (1.0
+            + r * (0.5
+                + r * (1.0 / 6.0 + r * (1.0 / 24.0 + r * (1.0 / 120.0 + r * (1.0 / 720.0))))));
+    // t's low mantissa bits hold n + 2^22 + 2^23; n ≥ −126 keeps 2^n a normal float.
+    let n_int = t.to_bits() as i32 - ROUND.to_bits() as i32;
+    let scale = f32::from_bits(((n_int + 127) << 23) as u32);
+    if d >= -87.0 { p * scale } else { 0.0 }
+}
+
+/// The largest non-NaN `v · scale` of `values` in eight independent lanes (so it vectorises);
+/// `None` when there is none or it is not finite — [`finite_max`] of the scaled values.
+fn scaled_max(values: &[f32], scale: f32) -> Option<f32> {
+    let mut lanes = [f32::NEG_INFINITY; 8];
+    let chunks = values.chunks_exact(8);
+    let rest = chunks.remainder();
+    for c in chunks {
+        for i in 0..8 {
+            let x = c[i] * scale;
+            // NaN compares false and is skipped.
+            if x > lanes[i] {
+                lanes[i] = x;
+            }
+        }
+    }
+    let mut max = f32::NEG_INFINITY;
+    for x in lanes.into_iter().chain(rest.iter().map(|&v| v * scale)) {
+        if x > max {
+            max = x;
+        }
+    }
+    max.is_finite().then_some(max)
+}
+
+/// Sum of `w` in f64 with four interleaved accumulators (a fixed order, so repeatable).
+fn block_sum(w: &[f32]) -> f64 {
+    let mut acc = [0.0f64; 4];
+    let chunks = w.chunks_exact(4);
+    let rest = chunks.remainder();
+    for c in chunks {
+        for i in 0..4 {
+            acc[i] += f64::from(c[i]);
+        }
+    }
+    rest.iter()
+        .fold((acc[0] + acc[1]) + (acc[2] + acc[3]), |s, &x| {
+            s + f64::from(x)
+        })
 }
 
 /// Index of the largest value; ties go to the lower id and NaN never wins.
@@ -240,6 +316,7 @@ impl Sampler {
             generated: Vec::new(),
             counts: HashMap::new(),
             rng,
+            exact: params.seed.is_some(),
             originals: HashMap::new(),
             scratch: Scratch::default(),
         }
@@ -365,12 +442,20 @@ impl Sampler {
             .map(|(id, _)| id)
     }
 
-    /// Temperature → top-k → top-p, then one draw over the kept candidates.
-    ///
-    /// The arithmetic is fixed so seeded streams keep their tokens: candidates `logit · (1/T)`
-    /// in f32, weights `exp(c − max)` in f64 summed in candidate order, the top-p prefix and
-    /// the draw `u · total` over that same order.
+    /// Temperature → top-k → top-p, then one draw over the kept candidates: exact for a
+    /// seeded request, fast otherwise.
     fn draw(&mut self, logits: &[f32]) -> u32 {
+        if self.exact {
+            self.draw_exact(logits)
+        } else {
+            self.draw_fast(logits)
+        }
+    }
+
+    /// The seeded draw. Its arithmetic is fixed so seeded streams keep their tokens:
+    /// candidates `logit · (1/T)` in f32, weights `exp(c − max)` in f64 (libm) summed in
+    /// candidate order, the top-p prefix and the draw `u · total` over that same order.
+    fn draw_exact(&mut self, logits: &[f32]) -> u32 {
         let inv_t = 1.0 / self.temperature;
         let vocab = logits.len();
         let k = self.top_k.map_or(vocab, |k| k.min(vocab));
@@ -378,6 +463,7 @@ impl Sampler {
             keys,
             candidates,
             weights,
+            ..
         } = &mut self.scratch;
         weights.clear();
         if k < vocab || self.top_p < 1.0 {
@@ -433,6 +519,140 @@ impl Sampler {
         // Rounding left u at the total: the last kept candidate with non-zero weight.
         id_of(weights.iter().rposition(|&w| w > 0.0).unwrap_or(0))
     }
+
+    /// The unseeded draw: the same distribution as [`Sampler::draw_exact`] (temperature →
+    /// top-k → top-p over candidates in descending logit order, ties by id), with weights from
+    /// the vectorised [`exp_fast`] instead of a libm call per id. Without truncation the draw
+    /// finds its [`FAST_BLOCK`] from partial sums and scans that block only; top-p without
+    /// top-k sorts only the ids above a weight floor that already holds `top_p` of the mass.
+    fn draw_fast(&mut self, logits: &[f32]) -> u32 {
+        let inv_t = 1.0 / self.temperature;
+        let vocab = logits.len();
+        let k = self.top_k.map_or(vocab, |k| k.min(vocab));
+        let Scratch {
+            keys,
+            candidates,
+            fast,
+            blocks,
+            ..
+        } = &mut self.scratch;
+        if k < vocab {
+            // Top-k candidates, highest first, then top-p over them in that order.
+            top_n_into(logits, k, keys, candidates);
+            let Some(max) = finite_max(candidates.iter().map(|c| c.1 * inv_t)) else {
+                return argmax(logits);
+            };
+            fast.clear();
+            fast.extend(candidates.iter().map(|c| exp_fast(c.1 * inv_t - max)));
+            let total = block_sum(fast);
+            let keep = top_p_prefix(fast.iter().copied(), self.top_p, total);
+            let u = f64::from(uniform(&mut self.rng)) * keep.1;
+            let i = scan(&fast[..keep.0], u);
+            return candidates[i].0;
+        }
+        let Some(max) = scaled_max(logits, inv_t) else {
+            return argmax(logits);
+        };
+        fast.clear();
+        fast.resize(vocab, 0.0);
+        blocks.clear();
+        // Each block's weights are summed while they are still in L1.
+        for (ws, vs) in fast.chunks_mut(FAST_BLOCK).zip(logits.chunks(FAST_BLOCK)) {
+            for (w, &v) in ws.iter_mut().zip(vs) {
+                *w = exp_fast(v * inv_t - max);
+            }
+            blocks.push(block_sum(ws));
+        }
+        let total: f64 = blocks.iter().sum();
+        if self.top_p < 1.0 {
+            let target = f64::from(self.top_p) * total;
+            // Ids whose weight reaches a floor, lowered until they hold the target mass (the
+            // max has weight 1, so the first floor usually keeps a few hundred ids).
+            for floor in [-8.0f32, -16.0, -32.0, f32::NEG_INFINITY] {
+                let min_weight = exp_fast(floor);
+                keys.clear();
+                keys.extend(
+                    fast.iter()
+                        .enumerate()
+                        .filter(|&(_, &w)| w > 0.0 && w >= min_weight)
+                        .map(|(i, _)| desc_key(i as u32, logits[i])),
+                );
+                let mass: f64 = keys
+                    .iter()
+                    .map(|&key| f64::from(fast[key as u32 as usize]))
+                    .sum();
+                if mass >= target {
+                    break;
+                }
+            }
+            keys.sort_unstable();
+            let weight_of = |key: u64| fast[key as u32 as usize];
+            let keep = top_p_prefix(keys.iter().map(|&key| weight_of(key)), self.top_p, total);
+            let u = f64::from(uniform(&mut self.rng)) * keep.1;
+            let mut cum = 0.0;
+            for &key in &keys[..keep.0] {
+                cum += f64::from(weight_of(key));
+                if u < cum {
+                    return key as u32;
+                }
+            }
+            return keys[..keep.0]
+                .iter()
+                .rev()
+                .find(|&&key| weight_of(key) > 0.0)
+                .map_or_else(|| argmax(logits), |&key| key as u32);
+        }
+        let u = f64::from(uniform(&mut self.rng)) * total;
+        let mut cum = 0.0;
+        for (b, &sum) in blocks.iter().enumerate() {
+            if u < cum + sum {
+                let start = b * FAST_BLOCK;
+                let block = &fast[start..(start + FAST_BLOCK).min(vocab)];
+                let mut c = cum;
+                for (i, &w) in block.iter().enumerate() {
+                    c += f64::from(w);
+                    if u < c {
+                        return (start + i) as u32;
+                    }
+                }
+                // Rounding inside the block: its last id with weight.
+                let last = block.iter().rposition(|&w| w > 0.0).unwrap_or(0);
+                return (start + last) as u32;
+            }
+            cum += sum;
+        }
+        // Rounding left u at the total: the last id with weight.
+        fast.iter().rposition(|&w| w > 0.0).unwrap_or(0) as u32
+    }
+}
+
+/// Length and mass of the smallest prefix of `weights` (in candidate order) whose mass
+/// reaches `top_p · total` (at least one candidate); everything when `top_p` ≥ 1.
+fn top_p_prefix(weights: impl Iterator<Item = f32>, top_p: f32, total: f64) -> (usize, f64) {
+    let target = f64::from(top_p) * total;
+    let mut cum = 0.0;
+    let mut n = 0;
+    for w in weights {
+        cum += f64::from(w);
+        n += 1;
+        if top_p < 1.0 && cum >= target {
+            break;
+        }
+    }
+    (n, cum)
+}
+
+/// Index of the candidate the draw `u` (in `[0, Σ weights)`) falls on, scanning in order;
+/// rounding at the end gives the last candidate with weight.
+fn scan(weights: &[f32], u: f64) -> usize {
+    let mut cum = 0.0;
+    for (i, &w) in weights.iter().enumerate() {
+        cum += f64::from(w);
+        if u < cum {
+            return i;
+        }
+    }
+    weights.iter().rposition(|&w| w > 0.0).unwrap_or(0)
 }
 
 /// The largest non-NaN value; `None` when there is none or it is not finite.
@@ -759,6 +979,168 @@ mod tests {
                     "logprobs 0 lists no alternatives"
                 );
             }
+        }
+    }
+
+    /// A sampler on the unseeded (fast) path with a repeatable stream.
+    fn fast(p: &SamplingParams) -> Sampler {
+        let mut s = plain(p);
+        s.exact = false;
+        s
+    }
+
+    #[test]
+    fn only_seeded_requests_take_the_exact_draw() {
+        assert!(plain(&params(1.0, 1.0, -1, 1)).exact);
+        let unseeded = SamplingParams {
+            seed: None,
+            ..params(1.0, 1.0, -1, 1)
+        };
+        assert!(!Sampler::new(&unseeded, &[], &[]).exact);
+    }
+
+    #[test]
+    fn scaled_max_matches_finite_max() {
+        let mut rng = ChaCha8Rng::seed_from_u64(8);
+        for len in [0usize, 1, 7, 8, 9, 63, 1000] {
+            for special in [
+                None,
+                Some(f32::NAN),
+                Some(f32::INFINITY),
+                Some(f32::NEG_INFINITY),
+            ] {
+                let mut v: Vec<f32> = (0..len).map(|_| uniform(&mut rng) * 20.0 - 10.0).collect();
+                if let (Some(x), true) = (special, len > 0) {
+                    v[len / 2] = x;
+                }
+                for scale in [1.0f32, 1.0 / 0.7] {
+                    let want = finite_max(v.iter().map(|&x| x * scale));
+                    assert_eq!(scaled_max(&v, scale), want, "len {len} {special:?}");
+                }
+            }
+        }
+        assert_eq!(scaled_max(&[f32::NAN; 20], 1.0), None);
+    }
+
+    #[test]
+    fn exp_fast_is_accurate_and_zero_below_the_floor() {
+        let mut d = 0.0f32;
+        while d > -87.0 {
+            let (got, want) = (f64::from(exp_fast(d)), f64::from(d).exp());
+            assert!(((got - want) / want).abs() < 5e-7, "e^{d}: {got} vs {want}");
+            d -= 0.0137;
+        }
+        assert_eq!(exp_fast(0.0), 1.0);
+        for zero in [-87.5, -1000.0, f32::NEG_INFINITY, f32::NAN] {
+            assert_eq!(exp_fast(zero), 0.0, "{zero}");
+        }
+    }
+
+    /// Unseeded draws follow softmax(logits / T) within sampling noise.
+    #[test]
+    fn fast_draw_follows_the_distribution() {
+        // weights 1:1:2:3 at T = 1, and the same at T = 0.5 on halved logits.
+        let raw = vec![0.0f32, 0.0, 2.0f32.ln(), 3.0f32.ln()];
+        let half: Vec<f32> = raw.iter().map(|v| v * 0.5).collect();
+        for (t, row) in [(1.0, &raw), (0.5, &half)] {
+            let mut s = fast(&params(t, 1.0, -1, 5));
+            let n = 14_000;
+            let mut counts = [0usize; 4];
+            for _ in 0..n {
+                counts[s.sample(&mut row.clone(), None).token as usize] += 1;
+            }
+            let expected = [1.0 / 7.0, 1.0 / 7.0, 2.0 / 7.0, 3.0 / 7.0];
+            for (c, e) in counts.iter().zip(expected) {
+                let f = *c as f64 / f64::from(n);
+                assert!((f - e).abs() < 0.02, "T {t}: {counts:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn fast_top_k_and_top_p_restrict_the_support() {
+        // probabilities ≈ [0.64, 0.24, 0.09, 0.03]; spread over a large vocabulary so the
+        // full-vocabulary top-p path (weight floors) is the one exercised.
+        let mut raw = vec![f32::NEG_INFINITY; 5000];
+        for (id, v) in [(4000usize, 3.0f32), (17, 2.0), (2500, 1.0), (3, 0.0)] {
+            raw[id] = v;
+        }
+        let mut k2 = fast(&params(1.0, 1.0, 2, 11));
+        let mut p8 = fast(&params(1.0, 0.8, -1, 12));
+        let mut all = fast(&params(1.0, 1.0, -1, 13));
+        let (mut seen_k, mut seen_p, mut seen_all) =
+            (HashMap::<u32, usize>::new(), HashMap::new(), HashMap::new());
+        for _ in 0..3000 {
+            *seen_k
+                .entry(k2.sample(&mut raw.clone(), None).token)
+                .or_default() += 1;
+            *seen_p
+                .entry(p8.sample(&mut raw.clone(), None).token)
+                .or_default() += 1;
+            *seen_all
+                .entry(all.sample(&mut raw.clone(), None).token)
+                .or_default() += 1;
+        }
+        let ids = |m: &HashMap<u32, usize>| {
+            let mut v: Vec<u32> = m.keys().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(ids(&seen_k), vec![17, 4000], "top_k 2");
+        assert_eq!(ids(&seen_p), vec![17, 4000], "top_p 0.8");
+        assert_eq!(
+            ids(&seen_all),
+            vec![3, 17, 2500, 4000],
+            "-inf ids are never drawn"
+        );
+    }
+
+    /// On Llama-sized rows the fast top-p keeps exactly the candidates the exact draw keeps
+    /// (the same prefix of the descending order), and masked ids are never drawn.
+    #[test]
+    fn fast_top_p_keeps_the_exact_prefix_on_big_rows() {
+        let rows = big_rows(2, 5);
+        let vocab = rows[0].len();
+        for (row, top_p, t) in [
+            (&rows[0], 0.9f32, 1.0f32),
+            (&rows[1], 0.5, 0.7),
+            (&rows[0], 0.99, 1.3),
+        ] {
+            // The exact prefix, computed independently.
+            let scaled: Vec<f64> = row.iter().map(|&v| f64::from(v * (1.0 / t))).collect();
+            let max = scaled.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut order: Vec<usize> = (0..vocab).collect();
+            order.sort_by(|&a, &b| scaled[b].total_cmp(&scaled[a]).then(a.cmp(&b)));
+            let total: f64 = scaled.iter().map(|c| (c - max).exp()).sum();
+            let mut cum = 0.0;
+            let mut allowed = std::collections::HashSet::new();
+            for &i in &order {
+                cum += (scaled[i] - max).exp();
+                allowed.insert(i as u32);
+                if cum >= f64::from(top_p) * total {
+                    break;
+                }
+            }
+            let mut s = fast(&params(t, top_p, -1, 3));
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..40 {
+                let token = s.sample(&mut row.clone(), None).token;
+                assert!(
+                    allowed.contains(&token),
+                    "{token} outside the top-p {top_p} prefix"
+                );
+                seen.insert(token);
+            }
+            assert!(seen.len() > 1, "top_p {top_p} draws vary");
+        }
+        let mut mask = TokenMask::new_none(vocab);
+        for id in (0..vocab as u32).step_by(7) {
+            mask.allow(id);
+        }
+        let mut s = fast(&params(1.0, 1.0, -1, 4));
+        for _ in 0..100 {
+            let token = s.sample(&mut rows[0].clone(), Some(&mask)).token;
+            assert_eq!(token % 7, 0, "masked id {token} drawn");
         }
     }
 
