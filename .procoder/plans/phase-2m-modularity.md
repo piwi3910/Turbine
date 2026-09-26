@@ -339,7 +339,7 @@ Covers: S-3 AC; spec edge cases (tied / untied `lm_head`, decode-graph keys unch
 - [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS with every existing `tiny_model` assertion unchanged (only constructors changed), including `op_profile_accounts_forward`, `fused_ops_match_unfused` host cases and `launch_ahead_feeds_match_serial`
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
 - [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden` — expect exit 0 with `hip_matches_cpu`, `hip_decode_graph_matches_eager`, `fused_ops_match_unfused`, `hip_launch_ahead_feeds_match_serial` and `logits_match_reference` ok
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 8 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 8 row to `.procoder/perf-log.md`
 - [x] Commit: `refactor(model): shared decoder skeleton with attention and FFN hooks`
 
 Build notes (Task 8, as built):
@@ -519,7 +519,7 @@ Covers: S-11 AC (matrix, `--support-matrix`, `--check-config`, refusal, `vendor_
 - [x] Implement the reshaped startup decision and wire the flag, status field and metric.
 - [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row, and the server log shows `event="support_matrix"` with status `supported`; append the Task 13 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row, and the server log shows `event="support_matrix"` with status `supported`; append the Task 13 row to `.procoder/perf-log.md`
 - [x] Commit: `feat(core): phase 8 support matrix on the module registries`
 
 Build notes (Task 13, as built):
