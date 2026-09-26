@@ -441,14 +441,19 @@ mod tests {
     use crate::request::CancelReason;
     use crate::scheduler::{BatchKind, SchedulerParams, SubmitError};
 
-    /// Accounting-only pool: zero bytes per block.
+    /// Accounting-only pool of 16-token blocks: zero bytes per block.
     fn pool(n: u32) -> BlockPool {
+        pool_of(n, 16)
+    }
+
+    /// Accounting-only pool of `n` blocks of `block_tokens` tokens.
+    fn pool_of(n: u32, block_tokens: u32) -> BlockPool {
         let layout = KvLayout {
             num_layers: 0,
             num_kv_heads: 0,
             head_dim: 0,
             dtype: DType::BF16,
-            block_tokens: 16,
+            block_tokens,
         };
         let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 0);
         BlockPool::new(
@@ -712,22 +717,35 @@ mod tests {
     #[test]
     fn preemption_by_recompute() {
         // 12 blocks of 16 tokens; each request needs up to 9 blocks, so both cannot finish
-        // together. R1 has the lower priority (larger value); R2 arrives later and waits for
-        // a free running slot.
-        let mut r0 = SimArrival::new(secs(0.0), 40, 100);
+        // together.
+        preemption_case(16, 12, 40, 100);
+    }
+
+    #[test]
+    fn preemption_by_recompute_at_128_token_pages() {
+        // The default page: 6 blocks of 128 tokens; each request needs up to 4 blocks.
+        preemption_case(128, 6, 200, 300);
+    }
+
+    /// Two requests of `prompt` + `max_new` tokens on a pool of `pool_blocks` blocks of
+    /// `block_tokens`, too small for both to finish together. R1 has the lower priority (larger
+    /// value) and is the only victim; R2 arrives later and waits for a free running slot.
+    fn preemption_case(block_tokens: u32, pool_blocks: u32, prompt: u32, max_new: u32) {
+        let mut r0 = SimArrival::new(secs(0.0), prompt, max_new);
         r0.priority = Priority(0);
-        let mut r1 = SimArrival::new(secs(0.0), 40, 100);
+        let mut r1 = SimArrival::new(secs(0.0), prompt, max_new);
         r1.priority = Priority(1);
         let r2 = SimArrival::new(secs(0.5), 20, 5);
         let p = SchedulerParams {
             max_running_requests: 2,
             max_batch_tokens: 256,
             prefill_chunk_tokens: 64,
+            block_tokens,
             ..params()
         };
         let mut sim = Simulation::new(
             p,
-            pool(12),
+            pool_of(pool_blocks, block_tokens),
             realistic_cost(),
             ArrivalProcess::scripted(vec![r0, r1, r2]),
         );
@@ -775,7 +793,7 @@ mod tests {
         assert_eq!(re_prefill[0].1, 0, "recompute starts at position 0");
         let recomputed: u32 = re_prefill.iter().map(|x| x.2).sum();
         assert!(
-            recomputed > 40,
+            recomputed > prompt,
             "recompute covers prompt + generated, got {recomputed}"
         );
         let r2_first = report

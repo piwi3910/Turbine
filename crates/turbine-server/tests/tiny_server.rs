@@ -70,8 +70,8 @@ fn spawn(config: &Path) -> Child {
         .expect("spawn turbine-server")
 }
 
-/// Config for the cpu backend on `model_dir` with a 16 MiB KV pool (4096 tiny-model blocks of
-/// 4096 bytes); `extra` is appended verbatim and must not repeat the `kv` key.
+/// Config for the cpu backend on `model_dir` with a 16 MiB KV pool (512 tiny-model blocks of
+/// 128 tokens, 32 KiB each); `extra` is appended verbatim and must not repeat the `kv` key.
 fn config_yaml(model_dir: &Path, addr: SocketAddr, extra: &str) -> String {
     config_yaml_with(model_dir, addr, "", "", "16MiB", extra)
 }
@@ -138,8 +138,8 @@ const LONG_TOKENS: u32 = 1500;
 /// `server` keys for tests whose streams must stay paused longer than the default 30 s
 /// `server.slow_client_timeout` might allow on a loaded host.
 const HOLD_PAUSED: &str = "  slow_client_timeout: 10m\n";
-/// KV blocks of the 16 MiB test pool.
-const POOL_BLOCKS: u64 = 4096;
+/// KV blocks of the 16 MiB test pool (the default 128-token page, 32 KiB per tiny block).
+const POOL_BLOCKS: u64 = 512;
 
 /// A running server on the tiny checkpoint; killed on drop.
 struct TinyServer {
@@ -947,9 +947,9 @@ fn diagnostics_shapes() {
     let tier = server.kv_tier();
     assert_eq!(tier["tier"], "l0", "{tier}");
     assert_eq!(tier["dtype"], "bf16", "{tier}");
-    assert_eq!(tier["block_tokens"], 16, "{tier}");
-    // 2 layers × 2 × 16 tokens × 2 KV heads × 16 dims × 2 bytes.
-    assert_eq!(tier["block_bytes"], 4096, "{tier}");
+    assert_eq!(tier["block_tokens"], 128, "{tier}");
+    // 2 layers × 2 × 128 tokens × 2 KV heads × 16 dims × 2 bytes.
+    assert_eq!(tier["block_bytes"], 32768, "{tier}");
     assert_eq!(tier["blocks_total"], POOL_BLOCKS, "{tier}");
     let used = tier["blocks_used"].as_u64().unwrap();
     assert!(used > 0, "{tier}");
@@ -1653,9 +1653,10 @@ fn longest_whitespace_outside_strings(text: &str) -> usize {
 /// any request's tokens (seeded sampling and constrained requests included).
 #[test]
 fn preempted_output_unchanged() {
-    // 9 blocks of 16 tokens: 3 sequences of "Hello" + 40 tokens.
+    // 8 blocks of 128 tokens, one per running request: the six unconstrained requests (up to
+    // "Hello" + 200 tokens) each outgrow their first block, so not all of them fit together.
     let server = TinyServer::launch(&Setup {
-        kv_bytes: "36KiB",
+        kv_bytes: "256KiB",
         extra: "scheduler:\n  max_running_requests: 8\n",
         ..Setup::default()
     });
@@ -1669,10 +1670,11 @@ fn preempted_output_unchanged() {
                     "json_schema": {"name": "small", "schema": small_schema()}});
                 // The random-weight model favours whitespace, which the grammar allows (up to
                 // JSON_MAX_WHITESPACE per gap); banning the whitespace bytes keeps the object
-                // within the 40 tokens this pool is sized for.
+                // within its 40 tokens.
                 body["logit_bias"] = json!({"9": -100, "10": -100, "13": -100, "32": -100});
             } else {
                 body["ignore_eos"] = json!(true);
+                body["max_tokens"] = json!(200);
             }
             body
         })
@@ -1988,7 +1990,7 @@ fn tool_choice_modes() {
 /// `reason` for each reject, preemption and cancellation.
 #[test]
 fn phase2_metrics_and_reasons() {
-    // 160 blocks of 16 tokens; the tool request's rendered prompt takes about 100.
+    // 20 blocks of 128 tokens; the tool request's rendered prompt takes about 100 tokens.
     let server = TinyServer::launch(&Setup {
         kv_bytes: "640KiB",
         max_positions: Some(LONG_POSITIONS),
@@ -1998,7 +2000,7 @@ fn phase2_metrics_and_reasons() {
     });
     let model = server.model.clone();
 
-    // Six concurrent requests of 29 blocks each: queued, then preempted for KV.
+    // Six concurrent requests of 4 blocks each: queued, then preempted for KV.
     let handles: Vec<_> = (0..6)
         .map(|i| {
             let addr = server.addr;
@@ -2088,7 +2090,7 @@ fn phase2_metrics_and_reasons() {
         (r#"turbine_requests_active{state="paused"}"#, 0.0),
         ("turbine_requests_queued", 0.0),
         (r#"turbine_kv_blocks{tier="l0",state="used"}"#, 0.0),
-        (r#"turbine_kv_blocks{tier="l0",state="free"}"#, 160.0),
+        (r#"turbine_kv_blocks{tier="l0",state="free"}"#, 20.0),
         (
             r#"turbine_grammar_compile_seconds_count{kind="json_schema"}"#,
             2.0,

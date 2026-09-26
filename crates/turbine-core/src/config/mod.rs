@@ -141,7 +141,7 @@ pub struct KvConfig {
 impl Default for KvConfig {
     fn default() -> Self {
         KvConfig {
-            block_tokens: 16,
+            block_tokens: 128,
             gpu: KvGpuConfig::default(),
             cpu: KvCpuConfig::default(),
             nvme: KvNvmeConfig::default(),

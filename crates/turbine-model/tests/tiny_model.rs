@@ -35,8 +35,8 @@ const SEED: u64 = 7;
 const PROMPT_LEN: usize = 20;
 const DECODE_STEPS: usize = 30;
 const MAX_SEQ_LEN: u32 = 64;
-/// KV block size of every test pool.
-const BLOCK_TOKENS: u32 = 16;
+/// KV block size of every test pool: the `kv.block_tokens` default.
+const BLOCK_TOKENS: u32 = 128;
 /// Sequences per batch the test executors accept.
 const MAX_SEQS: u32 = 4;
 /// The only head_dim the HIP attention (CK FMHA) supports (P1 S-7): GPU executor tests use a
@@ -579,16 +579,16 @@ fn forward_rejects_invalid_batches() {
     assert!(err.contains("expected 0"), "{err}");
     let err = run(&[1, 2], &[0, 0], &[seq(3, 0, 1, 1), seq(3, 1, 1, 1)]);
     assert!(err.contains("twice"), "{err}");
-    let short = [BlockId(0)];
+    // One token needs one block; the table has none.
     let err = run(
         &[1],
-        &[16],
+        &[0],
         &[SeqSlice {
-            block_table: &short,
-            ..seq(0, 0, 1, 17)
+            block_table: &[],
+            ..seq(0, 0, 1, 1)
         }],
     );
-    assert!(err.contains("needs 2 blocks"), "{err}");
+    assert!(err.contains("needs 1 blocks"), "{err}");
     let outside = [BlockId(4)];
     let err = run(
         &[1],
@@ -602,7 +602,7 @@ fn forward_rejects_invalid_batches() {
     // A pool laid out for another block size.
     let other = KvPoolView {
         layout: turbine_core::types::KvLayout {
-            block_tokens: 8,
+            block_tokens: 64,
             ..view.layout
         },
         ..view
@@ -634,8 +634,8 @@ fn requirements_and_workspace() {
     unique.sort();
     unique.dedup();
     assert_eq!(unique.len(), rendered.len(), "{rendered:#?}");
-    // One block of one layer: 2 × 16 tokens × 2 kv heads × 16 head_dim × 2 bytes.
-    let layer_block = 2 * 16 * 2 * 16 * 2;
+    // One block of one layer: 2 × 128 tokens × 2 kv heads × 16 head_dim × 2 bytes.
+    let layer_block = 2 * 128 * 2 * 16 * 2;
     let copy = format!("copy_blocks num_layers=2 block_bytes={layer_block}");
     for want in [
         "embedding hidden=64 vocab_rows=263 dtype=bf16",
@@ -646,8 +646,8 @@ fn requirements_and_workspace() {
         "gemm n=64 k=128 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
         "gemm n=263 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
         "rope head_dim=16 rotary_dim=16 q_heads=4 kv_heads=2 dtype=bf16",
-        "attention_prefill_paged head_dim=16 kv_heads=2 dtype=bf16 q_heads=4 causal=1 block_tokens=16",
-        "attention_decode_paged head_dim=16 kv_heads=2 dtype=bf16 q_heads=4 causal=1 block_tokens=16",
+        "attention_prefill_paged head_dim=16 kv_heads=2 dtype=bf16 q_heads=4 causal=1 block_tokens=128",
+        "attention_decode_paged head_dim=16 kv_heads=2 dtype=bf16 q_heads=4 causal=1 block_tokens=128",
         "silu_mul cols=128 dtype=bf16",
         "add dtype=bf16",
         copy.as_str(),
@@ -1147,7 +1147,10 @@ fn paged_matches_contiguous() {
     const LENS: [u32; 4] = [3, 17, 40, 65];
     const STEPS: u32 = 6;
     const MAX_TOKENS: u32 = 128;
-    const POOL_BLOCKS: u32 = 16;
+    // Twice the blocks the sequences can need, a power of two so `i * 5 % POOL_BLOCKS` below
+    // visits every block.
+    const POOL_BLOCKS: u32 =
+        (2 * LENS.len() as u32 * MAX_TOKENS.div_ceil(BLOCK_TOKENS)).next_power_of_two();
     let tmp = TempDir::new("tiny-model-paged-contiguous");
     for spec in both_checkpoints(&tmp) {
         let arch = spec.config.architecture;

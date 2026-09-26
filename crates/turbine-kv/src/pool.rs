@@ -205,20 +205,29 @@ mod tests {
 
     /// A small real layout (2 layers, 2 KV heads, head_dim 4, BF16): 512 bytes per block.
     fn small_layout() -> KvLayout {
+        layout_of(BLOCK_TOKENS)
+    }
+
+    /// [`small_layout`] with `block_tokens` tokens per block.
+    fn layout_of(block_tokens: u32) -> KvLayout {
         KvLayout {
             num_layers: 2,
             num_kv_heads: 2,
             head_dim: 4,
             dtype: DType::BF16,
-            block_tokens: BLOCK_TOKENS,
+            block_tokens,
         }
     }
 
     fn pool(num_blocks: u32) -> BlockPool {
+        pool_of(num_blocks, BLOCK_TOKENS)
+    }
+
+    fn pool_of(num_blocks: u32, block_tokens: u32) -> BlockPool {
         let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 20);
         BlockPool::new(
             BlockPoolConfig {
-                layout: small_layout(),
+                layout: layout_of(block_tokens),
                 num_blocks,
             },
             mem,
@@ -253,6 +262,7 @@ mod tests {
 
     /// Every invariant of the pool against the tables that hold its blocks.
     fn check(p: &BlockPool, tables: &[BlockTable]) {
+        let bt = p.layout().block_tokens;
         assert_eq!(p.used_blocks() + p.free_blocks(), p.total_blocks());
         let free = free_set(p);
         assert_eq!(
@@ -286,23 +296,23 @@ mod tests {
                 t.blocks.len(),
                 "a table holds a block twice"
             );
-            assert_eq!(
-                t.blocks.len() as u32,
-                blocks_for_tokens(t.tokens, BLOCK_TOKENS)
-            );
+            assert_eq!(t.blocks.len() as u32, blocks_for_tokens(t.tokens, bt));
         }
     }
 
     proptest! {
         #[test]
-        fn blocks_conserved(ops in proptest::collection::vec(op(), 1..200)) {
-            let mut p = pool(64);
+        fn blocks_conserved(
+            ops in proptest::collection::vec(op(), 1..200),
+            bt in prop_oneof![Just(BLOCK_TOKENS), Just(128u32)],
+        ) {
+            let mut p = pool_of(64, bt);
             let mut tables: Vec<BlockTable> = Vec::new();
             check(&p, &tables);
             for op in ops {
                 match op {
                     Op::Allocate(tokens) => {
-                        let need = blocks_for_tokens(tokens, BLOCK_TOKENS);
+                        let need = blocks_for_tokens(tokens, bt);
                         let before = p.free_blocks();
                         match p.allocate(need) {
                             Ok(blocks) => {
@@ -320,7 +330,7 @@ mod tests {
                     }
                     Op::Append(i, extra) if !tables.is_empty() => {
                         let i = i % tables.len();
-                        let need = tables[i].blocks_needed(extra, BLOCK_TOKENS);
+                        let need = tables[i].blocks_needed(extra, bt);
                         if let Ok(blocks) = p.allocate(need) {
                             tables[i].blocks.extend(blocks);
                             tables[i].tokens += extra;
@@ -352,7 +362,7 @@ mod tests {
                             Ok((child, copy)) => {
                                 prop_assert_eq!(child.tokens, src.tokens);
                                 prop_assert_eq!(child.blocks.len(), src.blocks.len());
-                                let partial = !src.tokens.is_multiple_of(BLOCK_TOKENS);
+                                let partial = !src.tokens.is_multiple_of(bt);
                                 prop_assert_eq!(copy.is_some(), partial);
                                 if let Some((from, to)) = copy {
                                     prop_assert_eq!(Some(&from), src.blocks.last());

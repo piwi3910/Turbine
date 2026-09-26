@@ -467,3 +467,29 @@ fn phase2c_execution_keys() {
         assert!(example.contains(key), "examples/turbine.yaml lacks {key}");
     }
 }
+
+/// The default KV page is 128 tokens, the page size CK's `fmha_fwd_pagedkv` requires, so paged
+/// attention on HIP runs on CK unless a config asks for another size.
+#[test]
+fn default_block_tokens_is_128() {
+    let base = "model:\n  path: /m\n";
+    assert_eq!(KvConfig::default().block_tokens, 128);
+    assert_eq!(parse(base, &[]).unwrap().kv.block_tokens, 128);
+    for n in [16, 1024] {
+        let c = parse(base, &[&format!("kv.block_tokens={n}")]).unwrap();
+        assert_eq!(c.kv.block_tokens, n);
+    }
+    for n in [0, 1025] {
+        assert_rejected(base, &[&format!("kv.block_tokens={n}")], "kv.block_tokens");
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for file in [
+        "examples/turbine.yaml",
+        "scripts/lab/phase2-novanas-llama.yaml",
+        "scripts/lab/phase2-novanas-olmoe.yaml",
+    ] {
+        let c = load(&root.join(file), &[]).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert_eq!(c.kv.block_tokens, 128, "{file}");
+    }
+}

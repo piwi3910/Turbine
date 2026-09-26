@@ -575,22 +575,25 @@ fn assert_exact(what: &str, impl_name: &str, got: &[f32], want: &[f32]) {
     println!("{what}: impl={impl_name} exact ok");
 }
 
-/// One ragged batch through `attention_{prefill,decode}_paged` on both providers: sequence `s`
-/// has `q_lens[s]` new tokens and `kv_lens[s]` tokens after the append, its pages spread over a
-/// shuffled block table of a pool with two blocks nobody owns. Compares the outputs and the pool
-/// after the append.
+/// One ragged batch through `attention_{prefill,decode}_paged` on both providers with
+/// `heads = (q_heads, kv_heads)` of `HEAD_DIM`: sequence `s` has `q_lens[s]` new tokens and
+/// `kv_lens[s]` tokens after the append, its pages spread over a shuffled block table of a pool
+/// with two blocks nobody owns. Compares the outputs and the pool after the append; returns the
+/// HIP implementation that ran.
 fn paged_case(
     p: &Pair,
     rng: &mut Rng,
     kind: AttentionKind,
+    heads: (usize, usize),
     block_tokens: usize,
     q_lens: &[usize],
     kv_lens: &[usize],
-) {
+) -> String {
+    let (q_heads, kv_heads) = heads;
     let cfg = AttentionConfig {
         kind,
-        num_q_heads: Q_HEADS as u32,
-        num_kv_heads: KV_HEADS as u32,
+        num_q_heads: q_heads as u32,
+        num_kv_heads: kv_heads as u32,
         head_dim: HEAD_DIM as u32,
         dtype: DType::BF16,
         block_tokens: Some(block_tokens as u32),
@@ -622,14 +625,14 @@ fn paged_case(
     }
     let kv: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
     let total_q: usize = q_lens.iter().sum();
-    let (q_rows, kv_rows) = (Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
-    let pool_shape = [num_blocks, 2, block_tokens, KV_HEADS, HEAD_DIM];
+    let (q_rows, kv_rows) = (q_heads * HEAD_DIM, kv_heads * HEAD_DIM);
+    let pool_shape = [num_blocks, 2, block_tokens, kv_heads, HEAD_DIM];
     let pool_len = num_blocks * 2 * block_tokens * kv_rows;
 
     // The pool starts with random history in every slot, including the unowned blocks.
     let (pool_hip, pool_cpu) = twin(p, &pool_shape, DType::BF16, &rng.normal(pool_len, 1.0));
-    let q_shape = [total_q, Q_HEADS, HEAD_DIM];
-    let new_shape = [total_q, KV_HEADS, HEAD_DIM];
+    let q_shape = [total_q, q_heads, HEAD_DIM];
+    let new_shape = [total_q, kv_heads, HEAD_DIM];
     let (q_hip, q_cpu) = twin(p, &q_shape, DType::BF16, &rng.normal(total_q * q_rows, 1.0));
     let (k_hip, k_cpu) = twin(
         p,
@@ -679,7 +682,8 @@ fn paged_case(
         kernel.execute_paged(&mut ctx).expect("paged attention");
     }
     let what = format!(
-        "{} block_tokens={block_tokens} q_lens={q_lens:?} kv_lens={kv_lens:?}",
+        "{} heads={q_heads}/{kv_heads} block_tokens={block_tokens} q_lens={q_lens:?} \
+         kv_lens={kv_lens:?}",
         cfg.op()
     );
     assert_close(
@@ -695,6 +699,7 @@ fn paged_case(
         &read(&pool_hip),
         &read(&pool_cpu),
     );
+    impl_name
 }
 
 /// The CPU outputs of one `moe_route` call.
@@ -902,6 +907,62 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
     );
 }
 
+/// The default 128-token page runs paged attention on CK `fmha_fwd_pagedkv`, a 16-token page on
+/// the Turbine kernel, both against the CPU reference: ragged prefill batches of 1-, 17-, 512-
+/// and 2,048-token chunks after 0, 100 and 1,000 cached tokens with three decode rows riding
+/// along, then a decode batch, at the Llama-3.2-3B (24/8) and OLMoE (16/16) head shapes.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn paged_prefill_ck_128_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(12);
+
+    // (new tokens, cached tokens before them) per sequence.
+    let prefill_batches: [&[(usize, usize)]; 2] = [
+        &[(2048, 0), (17, 100), (1, 1000), (1, 1), (1, 130), (1, 700)],
+        &[(512, 1000), (1, 0), (17, 0), (2048, 100), (1, 255), (1, 1)],
+    ];
+    let decode_lens = [1, 128, 129, 1001];
+    for heads in [(Q_HEADS, KV_HEADS), (16, 16)] {
+        for (block_tokens, want) in [(128, "ck_tile_fmha_pagedkv"), (16, "turbine_hip")] {
+            for batch in prefill_batches {
+                let q_lens: Vec<usize> = batch.iter().map(|&(q, _)| q).collect();
+                let kv_lens: Vec<usize> = batch.iter().map(|&(q, c)| q + c).collect();
+                let got = paged_case(
+                    &p,
+                    &mut rng,
+                    AttentionKind::PrefillPaged,
+                    heads,
+                    block_tokens,
+                    &q_lens,
+                    &kv_lens,
+                );
+                assert_eq!(
+                    got, want,
+                    "prefill heads={heads:?} block_tokens={block_tokens}"
+                );
+            }
+            let got = paged_case(
+                &p,
+                &mut rng,
+                AttentionKind::DecodePaged,
+                heads,
+                block_tokens,
+                &[1; 4],
+                &decode_lens,
+            );
+            assert_eq!(
+                got, want,
+                "decode heads={heads:?} block_tokens={block_tokens}"
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn paged_and_moe_ops() {
@@ -912,8 +973,8 @@ fn paged_and_moe_ops() {
     let p = setup();
     let mut rng = Rng(4);
 
-    // Paged attention at the Llama-3.2-3B shapes: the 16-token default page (Turbine kernel)
-    // and a 128-token page (Composable Kernel pagedkv). A prefill batch mixing a fresh prompt,
+    // Paged attention at the Llama-3.2-3B shapes: a 16-token page (Turbine kernel) and the
+    // 128-token default page (Composable Kernel pagedkv). A prefill batch mixing a fresh prompt,
     // a single-token row and a chunk after cached context (more than one query tile), then a
     // decode batch.
     for block_tokens in [16, 128] {
@@ -921,6 +982,7 @@ fn paged_and_moe_ops() {
             &p,
             &mut rng,
             AttentionKind::PrefillPaged,
+            (Q_HEADS, KV_HEADS),
             block_tokens,
             &[37, 1, 70],
             &[37, 300, 200],
@@ -929,6 +991,7 @@ fn paged_and_moe_ops() {
             &p,
             &mut rng,
             AttentionKind::DecodePaged,
+            (Q_HEADS, KV_HEADS),
             block_tokens,
             &[1, 1, 1, 1],
             &[1, 17, 129, 513],

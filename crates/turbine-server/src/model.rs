@@ -15,8 +15,8 @@ use turbine_core::types::SeqId;
 use turbine_core::types::{ExecutionBackend, MemoryKind, Vendor};
 use turbine_device::{DeviceInfo, DeviceInventory};
 use turbine_kernels::{
-    KernelError, KernelMetrics, KernelProvider, KernelRegistry, ProviderId, ShimContext,
-    ShimLibrary, cpu_reference_provider, shim_provider,
+    KernelError, KernelMetrics, KernelProvider, KernelRegistry, OpKind, ProviderId, Selection,
+    ShimContext, ShimLibrary, cpu_reference_provider, shim_provider,
 };
 use turbine_kv::metrics::log_pool_startup;
 use turbine_kv::{BlockPool, BlockPoolConfig};
@@ -329,6 +329,16 @@ pub fn prepare(
         &KernelMetrics::register(metrics),
     )
     .map_err(|e| kernel_error("kernel selection", e))?;
+    if let Some(implementation) =
+        paged_attention_fallback(config.execution.backend, registry.selections())
+    {
+        tracing::info!(
+            event = "paged_attention_fallback",
+            block_tokens,
+            "impl" = %implementation,
+            "paged attention is not on CK fmha_fwd_pagedkv: kv.block_tokens is not a multiple of 128"
+        );
+    }
 
     let scheduler = SchedulerParams::from_config(config, max_seq_len);
     let device_free = provider
@@ -414,6 +424,28 @@ pub fn prepare(
         served_name,
         budget,
     })
+}
+
+/// The implementation name the HIP shim reports for CK paged attention.
+const CK_PAGED_ATTENTION: &str = "ck_tile_fmha_pagedkv";
+
+/// The paged-attention implementation of the HIP backend when it is not Composable Kernel's
+/// `fmha_fwd_pagedkv` (CK serves only pages of a multiple of 128 tokens; other sizes run the
+/// slower Turbine kernel), else `None`. Other backends have no CK path to fall back from.
+fn paged_attention_fallback(backend: ExecutionBackend, selections: &[Selection]) -> Option<String> {
+    if backend != ExecutionBackend::Hip {
+        return None;
+    }
+    selections
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.op,
+                OpKind::AttentionPrefillPaged | OpKind::AttentionDecodePaged
+            )
+        })
+        .find(|s| s.implementation != CK_PAGED_ATTENTION)
+        .map(|s| s.implementation.clone())
 }
 
 /// The L0 pool: as many blocks as `max_bytes` (`kv.gpu.max_bytes`) holds, or, when it is null,
@@ -566,6 +598,37 @@ fn warm_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paged_attention_fallback_only_off_ck_on_hip() {
+        let sel = |op, implementation: &str| Selection {
+            op,
+            config: String::new(),
+            provider: ProviderId("hip"),
+            implementation: implementation.to_string(),
+            reason: String::new(),
+        };
+        let on_ck = [
+            sel(OpKind::Gemm, "hipblaslt"),
+            sel(OpKind::AttentionPrefillPaged, "ck_tile_fmha_pagedkv"),
+            sel(OpKind::AttentionDecodePaged, "ck_tile_fmha_pagedkv"),
+        ];
+        assert_eq!(
+            paged_attention_fallback(ExecutionBackend::Hip, &on_ck),
+            None
+        );
+        let fallback = [
+            sel(OpKind::Gemm, "hipblaslt"),
+            sel(OpKind::AttentionPrefillPaged, "turbine_hip"),
+            sel(OpKind::AttentionDecodePaged, "turbine_hip"),
+        ];
+        assert_eq!(
+            paged_attention_fallback(ExecutionBackend::Hip, &fallback).as_deref(),
+            Some("turbine_hip")
+        );
+        let cpu = [sel(OpKind::AttentionPrefillPaged, "cpu_reference")];
+        assert_eq!(paged_attention_fallback(ExecutionBackend::Cpu, &cpu), None);
+    }
 
     #[test]
     fn served_name_from_hf_snapshot_or_last_component() {

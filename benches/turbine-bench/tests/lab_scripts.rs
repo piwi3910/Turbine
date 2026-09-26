@@ -302,7 +302,7 @@ fn phase2_novanas_configs_load_with_the_scheduler_defaults() {
             "{file}"
         );
         assert_eq!(c.kv.gpu.max_bytes.map(|b| b.0), Some(8 << 30), "{file}");
-        assert_eq!(c.kv.block_tokens, 16, "{file}");
+        assert_eq!(c.kv.block_tokens, 128, "{file}");
     }
 }
 

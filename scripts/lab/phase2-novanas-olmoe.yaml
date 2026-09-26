@@ -11,7 +11,7 @@ model:
 execution:
   backend: hip
 kv:
-  block_tokens: 16
+  block_tokens: 128
   gpu:
     max_bytes: 8GiB
 scheduler:

@@ -544,8 +544,8 @@ fn needed_seq_len(references: &[ReferenceRecord]) -> u32 {
         .expect("at least one reference")
 }
 
-/// KV block size of the golden runs.
-const BLOCK_TOKENS: u32 = 16;
+/// KV block size of the golden runs: the `kv.block_tokens` default (CK paged attention on HIP).
+const BLOCK_TOKENS: u32 = 128;
 
 /// An executor and the single-sequence KV it generates on.
 struct Runner {

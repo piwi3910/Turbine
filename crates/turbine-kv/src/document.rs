@@ -120,4 +120,49 @@ mod tests {
             4096
         );
     }
+
+    #[test]
+    fn default_page_document() {
+        // Llama-3.2-3B BF16 at the default 128-token page: 585 blocks of 14 680 064 bytes in
+        // 8 GiB (the remainder is left unused); OLMoE-1B-7B: 512 of 16 777 216.
+        let layout = KvLayout {
+            num_layers: 28,
+            num_kv_heads: 8,
+            head_dim: 128,
+            dtype: DType::BF16,
+            block_tokens: 128,
+        };
+        let cfg = BlockPoolConfig::for_bytes(layout, ByteSize::gib(8).0);
+        assert_eq!(cfg.num_blocks, 585);
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), ByteSize::gib(9).0);
+        let mut pool = BlockPool::new(cfg, mem).unwrap();
+        let _held = pool.allocate(100).unwrap();
+        assert_eq!(
+            serde_json::to_value(KvDocument::from_pool(&pool)).unwrap(),
+            serde_json::json!({
+                "tiers": [{
+                    "tier": "l0",
+                    "dtype": "bf16",
+                    "block_tokens": 128,
+                    "block_bytes": 14_680_064,
+                    "blocks_total": 585,
+                    "blocks_used": 100,
+                    "blocks_free": 485
+                }]
+            })
+        );
+
+        let olmoe = KvLayout {
+            num_layers: 16,
+            num_kv_heads: 16,
+            head_dim: 128,
+            dtype: DType::BF16,
+            block_tokens: 128,
+        };
+        assert_eq!(olmoe.block_bytes(), 16_777_216);
+        assert_eq!(
+            BlockPoolConfig::for_bytes(olmoe, ByteSize::gib(8).0).num_blocks,
+            512
+        );
+    }
 }

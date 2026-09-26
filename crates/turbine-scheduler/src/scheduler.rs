@@ -1164,14 +1164,19 @@ mod tests {
         }
     }
 
-    /// A pool of `n` accounting-only blocks (zero bytes per block).
+    /// A pool of `n` accounting-only 16-token blocks (zero bytes per block).
     fn pool(n: u32) -> BlockPool {
+        pool_of(n, 16)
+    }
+
+    /// A pool of `n` accounting-only blocks of `block_tokens` tokens.
+    fn pool_of(n: u32, block_tokens: u32) -> BlockPool {
         let layout = KvLayout {
             num_layers: 0,
             num_kv_heads: 0,
             head_dim: 0,
             dtype: DType::BF16,
-            block_tokens: 16,
+            block_tokens,
         };
         let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 0);
         BlockPool::new(
@@ -1302,6 +1307,97 @@ mod tests {
             s.submit(request(10, 10, 10, 10), p.total_blocks()),
             Err(SubmitError::ShuttingDown)
         ));
+    }
+
+    /// At the default 128-token page: completion KV is counted in whole pages, decodes fill a
+    /// prefill's partial last page before taking another, and admission keeps the free-block
+    /// watermark.
+    #[test]
+    fn default_page_block_accounting() {
+        const BT: u32 = 128;
+        let clock = FakeClock::new(Duration::ZERO);
+        let params = SchedulerParams {
+            max_batch_tokens: 512,
+            prefill_chunk_tokens: 256,
+            max_queued_requests: 8,
+            block_tokens: BT,
+            ..params()
+        };
+        let mut s = Scheduler::new(params, Arc::new(clock));
+        // 5 blocks of 128 tokens; the 1 % watermark rounds up to 1 block.
+        let mut p = pool_of(5, BT);
+        let req = |n: u64, prompt, max_new| {
+            SchedRequest::new(
+                RequestId(uuid::Uuid::from_u128(u128::from(n))),
+                smallvec![SeqId(n)],
+                prompt,
+                max_new,
+                BT,
+            )
+        };
+
+        // 700 tokens at completion need 6 pages of the 5; 640 fill exactly 5.
+        assert!(matches!(
+            s.submit(req(9, 600, 100), p.total_blocks()),
+            Err(SubmitError::ContextExceedsKvCapacity)
+        ));
+        s.submit(req(1, 200, 440), p.total_blocks()).unwrap();
+        s.submit(req(2, 100, 300), p.total_blocks()).unwrap();
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(
+            kinds(&plan),
+            [
+                (1, BatchKind::Prefill { start: 0, len: 200 }),
+                (2, BatchKind::Prefill { start: 0, len: 100 })
+            ]
+        );
+        assert_eq!(plan.items[0].block_table.blocks.len(), 2);
+        assert_eq!(plan.items[1].block_table.blocks.len(), 1);
+        assert_eq!(p.used_blocks(), 3);
+        complete_all(&mut s, &mut p, &plan, &[]);
+
+        // Positions 100..=127 of request 2 and 200..=227 of request 1 land in the partial
+        // last pages: 28 decode steps take no block.
+        for _ in 0..28 {
+            let plan = s.plan(&mut p, &IterationLimits::default());
+            assert_eq!(
+                kinds(&plan),
+                [(1, BatchKind::Decode), (2, BatchKind::Decode)]
+            );
+            assert_eq!(p.used_blocks(), 3);
+            complete_all(&mut s, &mut p, &plan, &[]);
+        }
+        // Position 128 opens request 2's second page.
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(plan.items[0].block_table.blocks.len(), 2);
+        assert_eq!(plan.items[0].block_table.tokens, 229);
+        assert_eq!(plan.items[1].block_table.blocks.len(), 2);
+        assert_eq!(plan.items[1].block_table.tokens, 129);
+        assert_eq!(p.used_blocks(), 4);
+        complete_all(&mut s, &mut p, &plan, &[]);
+
+        // One free page covers a 100-token prompt but not the watermark on top: it waits.
+        s.submit(req(4, 100, 10), p.total_blocks()).unwrap();
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(
+            kinds(&plan),
+            [(1, BatchKind::Decode), (2, BatchKind::Decode)]
+        );
+        assert_eq!(s.snapshot().waiting, 1);
+        complete_all(&mut s, &mut p, &plan, &[2]);
+        assert_eq!(p.used_blocks(), 2, "finished request 2 freed both pages");
+
+        // Three free pages: admitted into one page.
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(
+            kinds(&plan),
+            [
+                (1, BatchKind::Decode),
+                (4, BatchKind::Prefill { start: 0, len: 100 })
+            ]
+        );
+        assert_eq!(plan.items[1].block_table.blocks.len(), 1);
+        assert_eq!(p.used_blocks(), 3);
     }
 
     #[test]

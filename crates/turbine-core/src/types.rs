@@ -123,7 +123,8 @@ impl KvLayout {
             * u64::from(self.head_dim)
             * self.dtype.size_bytes() as u64
     }
-    /// One block of `block_tokens` tokens (Llama-3.2-3B, 16 tokens: 1 835 008).
+    /// One block of `block_tokens` tokens (Llama-3.2-3B: 1 835 008 at 16 tokens, 14 680 064 at
+    /// the default 128).
     pub fn block_bytes(&self) -> u64 {
         self.bytes_per_token() * u64::from(self.block_tokens)
     }
@@ -217,6 +218,11 @@ mod tests {
         };
         assert_eq!(layout.bytes_per_token(), 114_688);
         assert_eq!(layout.block_bytes(), 1_835_008);
+        let default_page = KvLayout {
+            block_tokens: 128,
+            ..layout
+        };
+        assert_eq!(default_page.block_bytes(), 14_680_064);
         assert_eq!(ExecutionBackend::Cpu.as_str(), "cpu");
         assert_ne!(RequestId::new_v4(), RequestId::new_v4());
     }
