@@ -1,6 +1,6 @@
 # P1-T21 Lab scripts, weights, GPU op tests and golden reference on novanas
 
-Status: open
+Status: closed 2026-09-26
 Created: 2026-09-25
 
 ## Description
