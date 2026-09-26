@@ -363,3 +363,5 @@
 - Yes: a procoder analysis brief with options, risks (failure isolation, noisy neighbours, fragmentation) and a proposed phase placement (control plane + multi-model after Phase 3; shared KV arena, fractional compute via CU masks, model tiering alongside Phases 4–6) (recommended)
 - Not now: finish Phase 2 / 2c integration first, revisit later
 - Go straight to a spec for a new phase
+
+**Answer (2026-09-26):** write a procoder analysis brief first (options, risks, proposed phase placement); decide placement before any spec.
