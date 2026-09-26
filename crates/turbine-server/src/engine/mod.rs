@@ -127,6 +127,7 @@ pub fn spawn(
                 tokenizer,
                 max_seq_len,
                 scheduler: params,
+                overlap_scheduling,
                 ..
             } = prepared;
             let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
@@ -145,6 +146,7 @@ pub fn spawn(
                 max_seq_len,
                 metrics,
                 timeouts,
+                overlap: overlap_scheduling,
             });
             backend.set_ready(
                 EngineHandle { submit_tx },

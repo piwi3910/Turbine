@@ -15,6 +15,22 @@
 //! 7. `Scheduler::complete`, then the diagnostics documents and `turbine_kv_blocks` are
 //!    published.
 //!
+//! Overlap scheduling (P2c, `execution.overlap_scheduling`, [`EngineLoop::turn_overlap`]): when
+//! the executor can launch a step without waiting for it (host staging, kernel ABI v2.3) and
+//! reduces logits on the device, steps 5–7 are split around the device: the iteration launched
+//! last turn is completed in the scheduler before its tokens are known (each yielding row
+//! appends one token; `max_tokens` and context finishes follow from counts), the next plan is
+//! launched at once — each decode whose newest token the device chose (greedy, or an unseeded
+//! draw) takes it on the device ([`TokenFeed`]) — and only then is the previous iteration
+//! waited for and sampled, detokenised and emitted, while the next one runs. Token-dependent
+//! finishes (EOS, stop ids and strings, grammars, failures) reach the scheduler one iteration
+//! late; the finished sequence's extra row is computed and dropped. A batch that needs a token
+//! the device did not choose (a constraint, a seeded draw, `top_k`, a full row, a fork's first
+//! token) first finishes the iteration in flight, as the serial loop would. Sampling, stop and
+//! length semantics are those of the serial loop: on the CPU reference every request gets the
+//! same tokens either way; on a GPU the dropped extra rows change batch compositions, whose
+//! BF16 rounding may differ as with any other batch.
+//!
 //! Every turn is timed in the eight stages of [`Stage`] (P2c S-1) by marks around these steps;
 //! an executed iteration records them in `turbine_engine_iteration_seconds{stage}`, and every
 //! published scheduler document carries the last turn's `stages_ms`.
@@ -23,7 +39,7 @@
 //! engine (CONFLICT C-25). A panic inside a turn is caught, logged with the iteration's request
 //! ids, and fails every request.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,12 +51,13 @@ use turbine_core::request::{ErrorCode, FinishReason, GenerationEvent};
 use turbine_core::types::{RequestId, SeqId};
 use turbine_kv::{BlockPool, KvDocument};
 use turbine_model::executor::{
-    BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, RowReduce, SeqSlice,
+    BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice,
+    TokenFeed,
 };
 use turbine_model::{ForwardPhase, SampleJob, SampledToken, Tokenizer, sample_rows};
 use turbine_scheduler::{
-    BatchItem, BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome,
-    IterationPlan, SchedRequest, Scheduler, SubmitError,
+    BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome, IterationPlan,
+    SchedRequest, Scheduler, SubmitError,
 };
 
 use super::deadlines::{Deadlines, Timeouts};
@@ -67,6 +84,10 @@ pub(crate) struct EngineParts {
     pub metrics: EngineMetrics,
     /// `server.request_timeout` and `server.slow_client_timeout`.
     pub timeouts: Timeouts,
+    /// `execution.overlap_scheduling`: launch each iteration before the host work of the one
+    /// before it (P2c), when the executor can ([`ModelExecutor::overlaps`] and a device logits
+    /// reduction); otherwise the serial loop.
+    pub overlap: bool,
 }
 
 enum Turn {
@@ -100,11 +121,86 @@ pub(crate) struct EngineLoop {
     /// The executor's decode graph counters at the last forward
     /// (`turbine_decode_graph_total{outcome}` adds what changed since).
     graph_counters: GraphCounters,
+    /// Overlap scheduling is on (see [`EngineParts::overlap`]).
+    overlap: bool,
+    /// Overlap scheduling: the iteration launched last turn, completed in the scheduler ahead of
+    /// its tokens, whose host work is still to do.
+    in_flight: Option<InFlight>,
+    /// Overlap scheduling: finishes the host learned (EOS, stop strings, failures) that the
+    /// scheduler gets at its next completion.
+    late_finished: Vec<(SeqId, FinishReason)>,
+    /// Iterations launched while the previous one was still in flight.
+    overlapped: u64,
+}
+
+/// What `sample` needs of one launched row, fixed when its batch is built (under overlap
+/// scheduling the scheduler has moved on by the time the row is sampled).
+#[derive(Clone, Copy, Debug)]
+struct RowInfo {
+    seq: SeqId,
+    /// A prefill chunk (else a decode).
+    prefill: bool,
+    /// The step yields a token: a decode, or the chunk that completes a prefill.
+    yields: bool,
+    /// What the row asked the device for.
+    reduce: Option<RowReduce>,
+    /// The device's choice for this row is its token (greedy, or an unseeded draw over the
+    /// vocabulary), so the next launch may take it on the device.
+    feedable: bool,
+    /// The next launch took this row's token on the device: the host's token must match it.
+    fed_next: bool,
+}
+
+/// One batch built from a plan: token ids (placeholders where fed), positions, the plan item
+/// and `(q_start, q_len, kv_len)` of each row, what `sample` needs per row, and the feeds.
+struct Built {
+    tokens: Vec<u32>,
+    positions: Vec<u32>,
+    slices: Vec<(usize, u32, u32, u32)>,
+    rows: Vec<RowInfo>,
+    feeds: Vec<TokenFeed>,
+}
+
+enum Build {
+    Ready(Built),
+    /// A token is neither on the host nor chosen on the device by the launch in flight: that
+    /// launch must be finished first.
+    NeedsHost,
+}
+
+/// An iteration launched ahead of the host work of the one before it (overlap scheduling).
+struct InFlight {
+    plan: IterationPlan,
+    rows: Vec<RowInfo>,
+    /// Sequences that get a token once `rows` are sampled.
+    yielders: HashSet<SeqId>,
+    /// Requests of the plan, failed together if its step fails.
+    requests: Vec<RequestId>,
+    /// The forward was launched; false when nothing ran or the launch failed.
+    launched: bool,
+    phase: ForwardPhase,
+    /// Host time of the launch call.
+    launch_time: Duration,
 }
 
 impl EngineLoop {
     /// The engine over `p`; its diagnostics documents are published at once.
     pub fn new(p: EngineParts) -> EngineLoop {
+        let overlap = p.overlap && p.executor.overlaps() && p.executor.reduces_logits();
+        tracing::info!(
+            event = "overlap_scheduling",
+            enabled = overlap,
+            reason = if overlap {
+                "enabled"
+            } else if !p.overlap {
+                "disabled_by_config"
+            } else if !p.executor.overlaps() {
+                "kernel_library_without_host_staging"
+            } else {
+                "no_device_logits_reduction"
+            },
+            "overlap scheduling"
+        );
         let mut engine = EngineLoop {
             deadlines: Deadlines::new(Arc::clone(&p.clock), p.timeouts),
             exec: p.executor,
@@ -125,6 +221,10 @@ impl EngineLoop {
             idle_turn: false,
             stages: StageClock::start(),
             graph_counters: GraphCounters::default(),
+            overlap,
+            in_flight: None,
+            late_finished: Vec::new(),
+            overlapped: 0,
         };
         engine.publish(false);
         engine
@@ -134,7 +234,13 @@ impl EngineLoop {
     /// reason the server must exit 1: consecutive failed iterations or a panic.
     pub fn run(mut self) -> Result<(), String> {
         loop {
-            let turn = catch_unwind(AssertUnwindSafe(|| self.turn()));
+            let turn = catch_unwind(AssertUnwindSafe(|| {
+                if self.overlap {
+                    self.turn_overlap()
+                } else {
+                    self.turn()
+                }
+            }));
             let message = match turn {
                 Ok(Ok(Turn::Continue)) => continue,
                 Ok(Ok(Turn::Stop)) => return Ok(()),
@@ -212,9 +318,9 @@ impl EngineLoop {
         Ok(Turn::Continue)
     }
 
-    /// Nothing queued, running or waiting to be delivered.
+    /// Nothing queued, running, in flight or waiting to be delivered.
     fn quiet(&self) -> bool {
-        self.sched.is_idle() && self.requests.is_empty()
+        self.sched.is_idle() && self.requests.is_empty() && self.in_flight.is_none()
     }
 
     /// Step 1. Returns false when the engine should stop. The turn's stage clock starts after
@@ -472,87 +578,189 @@ impl EngineLoop {
             iteration: plan.iteration,
             ..IterationOutcome::default()
         };
-        let (src, dst): (Vec<_>, Vec<_>) = plan.forks.iter().filter_map(|f| f.copy).unzip();
-        if !src.is_empty()
-            && let Err(e) = self.exec.copy_blocks(&self.pool.view(), &src, &dst)
-        {
-            self.fail_iteration(format!("copy_blocks failed: {e}"), &mut outcome);
+        if let Err(message) = self.fork_copies(plan) {
+            self.fail_iteration(message, &mut outcome);
             return outcome;
         }
         self.stages.mark(Stage::Prepare);
         if plan.items.is_empty() {
             return outcome;
         }
-        let logits = match self.forward(plan) {
+        let built = match self.build_batch(plan, None) {
+            Ok(Build::Ready(built)) => built,
+            Ok(Build::NeedsHost) => {
+                // Unreachable: without a launch in flight every token is on the host.
+                self.fail_iteration("a batch token is not on the host".into(), &mut outcome);
+                return outcome;
+            }
+            Err(message) => {
+                self.fail_iteration(message, &mut outcome);
+                return outcome;
+            }
+        };
+        let logits = match self.forward(plan, &built) {
             Ok(logits) => logits,
             Err(message) => {
                 self.fail_iteration(message, &mut outcome);
                 return outcome;
             }
         };
-        self.sample(plan, logits, &mut outcome);
+        self.sample(&built.rows, logits, &mut outcome);
         outcome
     }
 
-    /// Packs the plan's items into one ragged batch and runs the forward pass.
-    fn forward(&mut self, plan: &IterationPlan) -> Result<Logits, String> {
-        let total: usize = plan
-            .items
-            .iter()
-            .map(|i| match i.kind {
-                BatchKind::Prefill { len, .. } => len as usize,
-                BatchKind::Decode => 1,
+    /// The `n` > 1 fork copies of `plan` (`ModelExecutor::copy_blocks`), ordered before its
+    /// forward on the stream.
+    fn fork_copies(&mut self, plan: &IterationPlan) -> Result<(), String> {
+        let (src, dst): (Vec<_>, Vec<_>) = plan.forks.iter().filter_map(|f| f.copy).unzip();
+        if src.is_empty() {
+            return Ok(());
+        }
+        self.exec
+            .copy_blocks(&self.pool.view(), &src, &dst)
+            .map_err(|e| format!("copy_blocks failed: {e}"))
+    }
+
+    /// Packs `plan` into one ragged batch. Each item's tokens come from its request's history;
+    /// with `prev` (a launch whose host work is not done: overlap scheduling), a decode's newest
+    /// token that is not on the host yet is taken on the device from `prev`'s row of that
+    /// sequence when that row's device choice is its token ([`TokenFeed`]) — otherwise the batch
+    /// is `NeedsHost` and `prev` must be finished first. Under overlap scheduling an item whose
+    /// choice already ended (the scheduler learns an EOS or stop-string finish one iteration
+    /// late) is left out. Samplers are only touched once the batch is known to be buildable,
+    /// so a `NeedsHost` build changes nothing.
+    fn build_batch(
+        &mut self,
+        plan: &IterationPlan,
+        prev: Option<&InFlight>,
+    ) -> Result<Build, String> {
+        struct Item {
+            index: usize,
+            id: RequestId,
+            choice: usize,
+            start: u32,
+            len: u32,
+            kv_len: u32,
+            prefill: bool,
+            yields: bool,
+            /// `prev`'s slot whose device choice is this item's newest token.
+            feed: Option<usize>,
+        }
+        let feedable: HashMap<SeqId, usize> = prev
+            .map(|p| {
+                p.rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.feedable)
+                    .map(|(slot, r)| (r.seq, slot))
+                    .collect()
             })
-            .sum();
-        let mut tokens = Vec::with_capacity(total);
-        let mut positions = Vec::with_capacity(total);
-        let mut slices = Vec::with_capacity(plan.items.len());
-        let reduces = self.exec.reduces_logits();
-        for item in &plan.items {
+            .unwrap_or_default();
+        let mut items = Vec::with_capacity(plan.items.len());
+        for (index, item) in plan.items.iter().enumerate() {
             let kv_len = item.block_table.tokens;
-            let (start, len) = match item.kind {
-                BatchKind::Prefill { start, len } => (start, len),
-                BatchKind::Decode => (kv_len.saturating_sub(1), 1),
+            let (start, len, prefill) = match item.kind {
+                BatchKind::Prefill { start, len } => (start, len, true),
+                BatchKind::Decode => (kv_len.saturating_sub(1), 1, false),
             };
-            let (id, choice) = *self
-                .seqs
-                .get(&item.seq)
-                .ok_or_else(|| format!("sequence {} has no request", item.seq.0))?;
-            let reduce = if reduces {
-                self.device_reduce(item, id, choice)
-            } else {
-                None
+            let Some(&(id, choice)) = self.seqs.get(&item.seq) else {
+                if self.overlap {
+                    continue;
+                }
+                return Err(format!("sequence {} has no request", item.seq.0));
             };
             let r = self
                 .requests
                 .get(&id)
                 .ok_or_else(|| format!("request {} is not tracked", id.0))?;
-            let q_start = tokens.len() as u32;
-            for p in start..start + len {
-                tokens.push(r.token_at(choice, p).ok_or_else(|| {
-                    format!("sequence {} has no token at position {p}", item.seq.0)
-                })?);
-                positions.push(p);
+            if self.overlap && (r.done || r.choices[choice].finish.is_some()) {
+                continue;
             }
-            slices.push(SeqSlice {
-                seq: item.seq,
-                q_start,
-                q_len: len,
+            let yields = !prefill || self.sched.prefill_target(item.seq) == Some(start + len);
+            let mut feed = None;
+            for p in start..start + len {
+                if r.token_at(choice, p).is_some() {
+                    continue;
+                }
+                match feedable.get(&item.seq) {
+                    Some(&slot) if !prefill && p + 1 == kv_len => feed = Some(slot),
+                    _ if prev.is_some() => return Ok(Build::NeedsHost),
+                    _ => {
+                        return Err(format!(
+                            "sequence {} has no token at position {p}",
+                            item.seq.0
+                        ));
+                    }
+                }
+            }
+            items.push(Item {
+                index,
+                id,
+                choice,
+                start,
+                len,
                 kv_len,
-                block_table: &item.block_table.blocks,
-                reduce,
+                prefill,
+                yields,
+                feed,
             });
         }
-        let phase = if plan.prefill_tokens() > 0 {
-            ForwardPhase::Prefill
-        } else {
-            ForwardPhase::Decode
+
+        let total: usize = items.iter().map(|i| i.len as usize).sum();
+        let mut built = Built {
+            tokens: Vec::with_capacity(total),
+            positions: Vec::with_capacity(total),
+            slices: Vec::with_capacity(items.len()),
+            rows: Vec::with_capacity(items.len()),
+            feeds: Vec::new(),
         };
+        let reduces = self.exec.reduces_logits();
+        for it in items {
+            let seq = plan.items[it.index].seq;
+            // A token of `prev` for this choice is not observed yet: its sampler asks one ahead.
+            let ahead = usize::from(prev.is_some_and(|p| p.yielders.contains(&seq)));
+            let reduce = if reduces && it.yields {
+                self.device_reduce(it.prefill, it.id, it.choice, ahead)
+            } else {
+                None
+            };
+            let r = &self.requests[&it.id];
+            let q_start = built.tokens.len() as u32;
+            for p in it.start..it.start + it.len {
+                built.tokens.push(r.token_at(it.choice, p).unwrap_or(0));
+                built.positions.push(p);
+            }
+            if let Some(slot) = it.feed {
+                built.feeds.push(TokenFeed {
+                    token: q_start + it.len - 1,
+                    prev_slot: slot as u32,
+                });
+            }
+            let seeded = r.choices[it.choice].is_seeded();
+            let feedable =
+                reduce.is_some_and(|q| q.temperature <= 0.0 || (q.uniform.is_some() && !seeded));
+            built.slices.push((it.index, q_start, it.len, it.kv_len));
+            built.rows.push(RowInfo {
+                seq,
+                prefill: it.prefill,
+                yields: it.yields,
+                reduce,
+                feedable,
+                fed_next: false,
+            });
+        }
+        Ok(Build::Ready(built))
+    }
+
+    /// Runs the forward pass over `built` (one ragged batch of `plan`'s items).
+    fn forward(&mut self, plan: &IterationPlan, built: &Built) -> Result<Logits, String> {
+        let slices = seq_slices(plan, built);
+        let phase = phase_of(plan);
         let started = Instant::now();
         let view = self.pool.view();
         let result = self.exec.forward(&BatchInput {
-            tokens: &tokens,
-            positions: &positions,
+            tokens: &built.tokens,
+            positions: &built.positions,
             seqs: &slices,
             kv: &view,
         });
@@ -561,78 +769,80 @@ impl EngineLoop {
             self.stages.add(Stage::Launch, t.launch);
             self.stages.add(Stage::DeviceWait, t.device_wait);
         }
-        let graphs = self.exec.graph_counters();
-        self.metrics
-            .server
-            .decode_graphs(&graphs.since(&self.graph_counters));
-        self.graph_counters = graphs;
+        self.record_graph_counters();
         self.stages.mark(Stage::Prepare);
         self.metrics
             .model
             .observe_forward(phase, started.elapsed().as_secs_f64());
         let logits = result.map_err(|e| format!("{} forward pass failed: {e}", phase.as_str()))?;
-        if logits.slots() != slices.len() {
+        self.check_logits(&logits, slices.len())?;
+        Ok(logits)
+    }
+
+    /// Adds the executor's decode graph outcomes since the last call to
+    /// `turbine_decode_graph_total{outcome}`.
+    fn record_graph_counters(&mut self) {
+        let graphs = self.exec.graph_counters();
+        self.metrics
+            .server
+            .decode_graphs(&graphs.since(&self.graph_counters));
+        self.graph_counters = graphs;
+    }
+
+    /// The forward returned one logits slot per sequence; records the rows' paths.
+    fn check_logits(&self, logits: &Logits, seqs: usize) -> Result<(), String> {
+        if logits.slots() != seqs {
             return Err(format!(
-                "forward returned logits for {} of {} sequences",
+                "forward returned logits for {} of {seqs} sequences",
                 logits.slots(),
-                slices.len()
             ));
         }
         self.metrics
             .server
             .logits_rows(logits.reduced.len(), logits.rows);
-        Ok(logits)
+        Ok(())
     }
 
-    /// The device reduction item `item` (choice `choice` of request `id`) asks for (P2c S-4):
-    /// only a row that yields a token for an unconstrained live choice whose sampler is
-    /// eligible, and not the shared prefill row that forks further choices (each fork samples
-    /// its own copy of the whole row).
+    /// The device reduction a yielding row of choice `choice` of request `id` asks for (P2c
+    /// S-4): only an unconstrained live choice whose sampler is eligible, and not the shared
+    /// prefill row that forks further choices (each fork samples its own copy of the whole
+    /// row). `ahead` is 1 when the choice's previous token is still on the device (overlap
+    /// scheduling): its sampler then asks for the step after the next one it observes.
     fn device_reduce(
         &mut self,
-        item: &BatchItem,
+        prefill: bool,
         id: RequestId,
         choice: usize,
+        ahead: usize,
     ) -> Option<RowReduce> {
-        let yields = match item.kind {
-            BatchKind::Decode => true,
-            BatchKind::Prefill { start, len } => {
-                self.sched.prefill_target(item.seq) == Some(start + len)
-            }
-        };
         let r = self.requests.get_mut(&id)?;
-        if !yields || r.done {
+        if r.done {
             return None;
         }
-        if choice == 0
-            && matches!(item.kind, BatchKind::Prefill { .. })
-            && !r.forking_choices().is_empty()
-        {
+        if choice == 0 && prefill && !r.forking_choices().is_empty() {
             return None;
         }
         r.choices
             .get_mut(choice)?
             .unconstrained_sampler()?
-            .device_request()
+            .device_request_ahead(ahead)
     }
 
-    /// Samples every item whose step yields a token and emits its events. The completed shared
+    /// Samples every row whose step yields a token and emits its events. The completed shared
     /// prefill of an `n` > 1 request also gives every forking choice its first token, each
-    /// from its own copy of the prompt's last logits row.
-    fn sample(&mut self, plan: &IterationPlan, mut logits: Logits, outcome: &mut IterationOutcome) {
-        let mut drawn = self.draw_decode_tokens(plan, &mut logits);
+    /// from its own copy of the prompt's last logits row. A request whose token the next launch
+    /// took on the device but the host chose differently (a row without a finite logit) fails.
+    fn sample(&mut self, rows: &[RowInfo], mut logits: Logits, outcome: &mut IterationOutcome) {
+        let (mut drawn, diverged) = self.draw_decode_tokens(rows, &mut logits);
+        for id in diverged {
+            self.token_diverged(id, outcome);
+        }
         let vocab = logits.vocab;
-        for (row, item) in plan.items.iter().enumerate() {
-            let yields = match item.kind {
-                BatchKind::Decode => true,
-                BatchKind::Prefill { start, len } => {
-                    self.sched.prefill_target(item.seq) == Some(start + len)
-                }
-            };
-            if !yields {
+        for (slot, row) in rows.iter().enumerate() {
+            if !row.yields {
                 continue;
             }
-            let Some(&(id, choice)) = self.seqs.get(&item.seq) else {
+            let Some(&(id, choice)) = self.seqs.get(&row.seq) else {
                 continue;
             };
             let Some(r) = self.requests.get(&id) else {
@@ -641,18 +851,18 @@ impl EngineLoop {
             if r.done {
                 continue;
             }
-            let forks = if choice == 0 && matches!(item.kind, BatchKind::Prefill { .. }) {
+            let forks = if choice == 0 && row.prefill {
                 r.forking_choices()
             } else {
                 Vec::new()
             };
-            let row_logits = match logits.full_row_index(row) {
+            let row_logits = match logits.full_row_index(slot) {
                 Some(i) => &mut logits.data[i * vocab..(i + 1) * vocab],
                 // A reduced row: its token was drawn from the reduction.
                 None => &mut [][..],
             };
             let shared = (!forks.is_empty()).then(|| row_logits.to_vec());
-            let token = drawn[row].take();
+            let token = drawn[slot].take();
             if !self.sample_choice(id, choice, row_logits, token, outcome) {
                 continue;
             }
@@ -667,21 +877,23 @@ impl EngineLoop {
 
     /// Draws the tokens of every decode row of an unconstrained live choice at once, across
     /// threads (`turbine_model::sample_rows`: each sampler only touches its own row, so the
-    /// tokens are those of sampling row by row). Indexed by plan row; `None` rows (prefill
+    /// tokens are those of sampling row by row). Indexed by row; `None` rows (prefill
     /// completions with their forks, constrained choices) are sampled by
-    /// [`ActiveRequest::step`] on the engine thread.
+    /// [`ActiveRequest::step`] on the engine thread. Also returns the requests whose token the
+    /// next launch took on the device although the host drew another.
     fn draw_decode_tokens(
         &mut self,
-        plan: &IterationPlan,
+        rows: &[RowInfo],
         logits: &mut Logits,
-    ) -> Vec<Option<SampledToken>> {
-        let mut drawn: Vec<Option<SampledToken>> = vec![None; plan.items.len()];
+    ) -> (Vec<Option<SampledToken>>, Vec<RequestId>) {
+        let mut drawn: Vec<Option<SampledToken>> = vec![None; rows.len()];
+        let mut diverged = Vec::new();
         // Reduced rows (decode or the last prefill chunk) finish from their reduction.
-        for (row, item) in plan.items.iter().enumerate() {
-            let LogitsSlot::Reduced(reduced) = logits.slot(row) else {
+        for (slot, row) in rows.iter().enumerate() {
+            let LogitsSlot::Reduced(reduced) = logits.slot(slot) else {
                 continue;
             };
-            let Some(&(id, choice)) = self.seqs.get(&item.seq) else {
+            let Some(&(id, choice)) = self.seqs.get(&row.seq) else {
                 continue;
             };
             if let Some(sampler) = self
@@ -691,25 +903,26 @@ impl EngineLoop {
                 .and_then(|r| r.choices.get_mut(choice))
                 .and_then(|c| c.unconstrained_sampler())
             {
-                drawn[row] = Some(sampler.finish_reduced(reduced));
+                let token = sampler.finish_reduced(reduced);
+                if row.fed_next && device_choice(reduced, row.reduce) != Some(token.token) {
+                    diverged.push(id);
+                }
+                drawn[slot] = Some(token);
             }
         }
-        let decode_rows: HashMap<SeqId, usize> = plan
-            .items
+        let decode_rows: HashMap<SeqId, usize> = rows
             .iter()
             .enumerate()
-            .filter(|&(row, item)| {
-                matches!(item.kind, BatchKind::Decode) && logits.full_row_index(row).is_some()
-            })
-            .map(|(row, item)| (item.seq, row))
+            .filter(|&(slot, row)| !row.prefill && logits.full_row_index(slot).is_some())
+            .map(|(slot, row)| (row.seq, slot))
             .collect();
         if decode_rows.is_empty() {
-            return drawn;
+            return (drawn, diverged);
         }
         let full_index: Vec<Option<usize>> = (0..logits.slots())
             .map(|row| logits.full_row_index(row))
             .collect();
-        let mut rows: Vec<Option<&mut [f32]>> = logits
+        let mut full_rows: Vec<Option<&mut [f32]>> = logits
             .data
             .chunks_exact_mut(logits.vocab)
             .map(Some)
@@ -723,7 +936,7 @@ impl EngineLoop {
                 };
                 if let Some(sampler) = c.unconstrained_sampler()
                     && let Some(row_logits) = full_index[row]
-                        .and_then(|i| rows.get_mut(i))
+                        .and_then(|i| full_rows.get_mut(i))
                         .and_then(Option::take)
                 {
                     job_rows.push(row);
@@ -738,7 +951,304 @@ impl EngineLoop {
         for (row, token) in job_rows.into_iter().zip(sample_rows(jobs)) {
             drawn[row] = Some(token);
         }
-        drawn
+        (drawn, diverged)
+    }
+
+    /// One turn under overlap scheduling (P2c): the iteration launched last turn (`in_flight`)
+    /// runs on the device while this turn takes commands, completes it in the scheduler from
+    /// what is known before its tokens (the tokens it appends, and `max_tokens` and context
+    /// finishes, which depend only on counts), plans and launches the next iteration — its
+    /// decodes taking their newest tokens on the device from the one in flight — and only then
+    /// waits for the one in flight and does its host work (sampling, detokenisation, events),
+    /// while the next runs. Finishes that depend on the tokens (EOS, stop ids and strings,
+    /// grammars) reach the scheduler one iteration late: such a sequence's row in the next
+    /// iteration is computed and dropped. A batch that needs a token the device did not choose
+    /// (a constrained, seeded-draw, `top_k` or full-row choice, a fork's first token) waits for
+    /// the iteration in flight first, so it runs as the serial loop does.
+    fn turn_overlap(&mut self) -> Result<Turn, String> {
+        if !self.receive_commands() {
+            return Ok(Turn::Stop);
+        }
+        self.stages.mark(Stage::Schedule);
+        self.flush_outputs();
+        self.stages.mark(Stage::Emit);
+        self.detect_disconnects();
+        self.expire_deadlines();
+        if let Some(prev) = self.in_flight.take() {
+            let outcome = self.ahead_outcome(&prev);
+            self.sched.complete(&mut self.pool, outcome);
+            self.in_flight = Some(prev);
+        }
+        let plan = self.sched.plan(&mut self.pool, &IterationLimits::default());
+        for &(id, reason) in &plan.dropped {
+            self.on_dropped(id, reason);
+        }
+        self.stages.mark(Stage::Schedule);
+        let mut prev = self.in_flight.take();
+        if plan.is_empty() {
+            let executed = prev.is_some();
+            if let Some(p) = prev {
+                self.finish(p)?;
+            }
+            let finished = std::mem::take(&mut self.late_finished);
+            self.sched.complete(
+                &mut self.pool,
+                IterationOutcome {
+                    iteration: plan.iteration,
+                    finished,
+                    ..IterationOutcome::default()
+                },
+            );
+            self.idle_turn = !executed;
+            self.publish(executed);
+            return Ok(Turn::Continue);
+        }
+        self.idle_turn = false;
+        self.iteration_requests = plan_requests(&plan, &self.seqs);
+        let next = self.launch_next(plan, &mut prev)?;
+        if let Some(p) = prev {
+            self.finish(p)?;
+        }
+        self.in_flight = Some(next);
+        self.publish(true);
+        Ok(Turn::Continue)
+    }
+
+    /// The outcome of the launched iteration `f` before its tokens are known: one token per
+    /// yielding row of a live choice (and per forking choice at a completed shared prefill),
+    /// the `length` finishes those tokens cause (`max_tokens`, the context), and the finishes
+    /// the host learned since the last completion.
+    fn ahead_outcome(&mut self, f: &InFlight) -> IterationOutcome {
+        let mut outcome = IterationOutcome {
+            iteration: f.plan.iteration,
+            finished: std::mem::take(&mut self.late_finished),
+            ..IterationOutcome::default()
+        };
+        if !f.launched {
+            return outcome;
+        }
+        for row in f.rows.iter().filter(|r| r.yields) {
+            let Some(&(id, choice)) = self.seqs.get(&row.seq) else {
+                continue;
+            };
+            let Some(r) = self.requests.get(&id).filter(|r| !r.done) else {
+                continue;
+            };
+            let mut choices = vec![choice];
+            if choice == 0 && row.prefill {
+                choices.extend(r.forking_choices());
+            }
+            for c in choices {
+                let ch = &r.choices[c];
+                if ch.finish.is_some() {
+                    continue;
+                }
+                outcome.appended.push((ch.seq, 1));
+                let generated = ch.generated.len() as u32 + 1;
+                if generated >= r.request.stop.max_tokens
+                    || r.prompt_len() + generated >= self.max_seq_len
+                {
+                    outcome.finished.push((ch.seq, FinishReason::Length));
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Launches `plan` (overlap scheduling): with the iteration in flight `prev` still on the
+    /// device when every token not on the host is one it chose, else after finishing `prev`.
+    /// A failed launch fails the plan's requests (their sequences are reported finished at the
+    /// next completion) and counts as a failed iteration.
+    fn launch_next(
+        &mut self,
+        plan: IterationPlan,
+        prev: &mut Option<InFlight>,
+    ) -> Result<InFlight, String> {
+        let requests = plan_requests(&plan, &self.seqs);
+        let mut next = InFlight {
+            plan,
+            rows: Vec::new(),
+            yielders: HashSet::new(),
+            requests,
+            launched: false,
+            phase: ForwardPhase::Decode,
+            launch_time: Duration::ZERO,
+        };
+        next.phase = phase_of(&next.plan);
+        if let Err(message) = self.fork_copies(&next.plan) {
+            return self.launch_failed(next, &message);
+        }
+        let built = match self.build_batch(&next.plan, prev.as_ref()) {
+            Ok(Build::Ready(built)) => built,
+            Ok(Build::NeedsHost) => {
+                if let Some(p) = prev.take() {
+                    self.finish(p)?;
+                }
+                match self.build_batch(&next.plan, None) {
+                    Ok(Build::Ready(built)) => built,
+                    Ok(Build::NeedsHost) => {
+                        return self.launch_failed(next, "a batch token is not on the host");
+                    }
+                    Err(message) => return self.launch_failed(next, &message),
+                }
+            }
+            Err(message) => return self.launch_failed(next, &message),
+        };
+        self.stages.mark(Stage::Prepare);
+        if built.rows.is_empty() {
+            return Ok(next);
+        }
+        if let Some(p) = prev.as_mut() {
+            for f in &built.feeds {
+                p.rows[f.prev_slot as usize].fed_next = true;
+            }
+        }
+        let (launched, launch_time) = {
+            let slices = seq_slices(&next.plan, &built);
+            let view = self.pool.view();
+            let started = Instant::now();
+            let launched = self.exec.launch(
+                &BatchInput {
+                    tokens: &built.tokens,
+                    positions: &built.positions,
+                    seqs: &slices,
+                    kv: &view,
+                },
+                &built.feeds,
+            );
+            (launched, started.elapsed())
+        };
+        next.launch_time = launch_time;
+        self.record_graph_counters();
+        self.stages.mark(Stage::Launch);
+        if let Err(e) = launched {
+            let message = format!("{} forward pass failed: {e}", next.phase.as_str());
+            return self.launch_failed(next, &message);
+        }
+        if prev.as_ref().is_some_and(|p| p.launched) {
+            self.overlapped += 1;
+        }
+        next.yielders = self.yielders(&built.rows);
+        next.rows = built.rows;
+        next.launched = true;
+        Ok(next)
+    }
+
+    /// Sequences that get a token from `rows` once they are sampled: each yielding row's own,
+    /// and the forking choices of a completed shared prefill.
+    fn yielders(&self, rows: &[RowInfo]) -> HashSet<SeqId> {
+        let mut out = HashSet::new();
+        for row in rows.iter().filter(|r| r.yields) {
+            out.insert(row.seq);
+            if !row.prefill {
+                continue;
+            }
+            if let Some(&(id, 0)) = self.seqs.get(&row.seq)
+                && let Some(r) = self.requests.get(&id)
+            {
+                out.extend(r.forking_choices().into_iter().map(|c| r.choices[c].seq));
+            }
+        }
+        out
+    }
+
+    /// `next` could not be launched: its requests fail and the failure counts.
+    fn launch_failed(&mut self, next: InFlight, message: &str) -> Result<InFlight, String> {
+        self.fail_requests(&next.requests, next.plan.iteration, message);
+        self.count_failure(message)?;
+        Ok(next)
+    }
+
+    /// One more failed iteration; `Err` once [`MAX_CONSECUTIVE_FAILURES`] failed in a row.
+    fn count_failure(&mut self, message: &str) -> Result<(), String> {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            return Err(format!(
+                "{} consecutive iterations failed; last error: {message}",
+                self.consecutive_failures
+            ));
+        }
+        Ok(())
+    }
+
+    /// Waits for the launched iteration `p` (only it; the next keeps running) and does its host
+    /// work: sampling, detokenisation, events. Finishes it learns go to the next completion.
+    fn finish(&mut self, p: InFlight) -> Result<(), String> {
+        if !p.launched {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let collected = self.exec.collect();
+        let waited = started.elapsed();
+        self.stages.mark(Stage::DeviceWait);
+        self.metrics
+            .model
+            .observe_forward(p.phase, (p.launch_time + waited).as_secs_f64());
+        let logits = collected
+            .map_err(|e| format!("{} forward pass failed: {e}", p.phase.as_str()))
+            .and_then(|logits| self.check_logits(&logits, p.rows.len()).map(|()| logits));
+        match logits {
+            Ok(logits) => {
+                self.consecutive_failures = 0;
+                let mut outcome = IterationOutcome::default();
+                self.sample(&p.rows, logits, &mut outcome);
+                self.late_finished.extend(outcome.finished);
+                Ok(())
+            }
+            Err(message) => {
+                self.fail_requests(&p.requests, p.plan.iteration, &message);
+                self.count_failure(&message)
+            }
+        }
+    }
+
+    /// Every live request of `ids` (iteration `iteration`) fails with `internal_error`; its
+    /// live sequences are reported finished at the next completion (overlap scheduling).
+    fn fail_requests(&mut self, ids: &[RequestId], iteration: u64, message: &str) {
+        tracing::error!(event = "iteration_failed", iteration, error = %message, "iteration failed");
+        for &id in ids {
+            let Some(r) = self.requests.get(&id).filter(|r| !r.done) else {
+                continue;
+            };
+            let live: Vec<SeqId> = r.live_seqs().collect();
+            self.late_finished
+                .extend(live.into_iter().map(|s| (s, FinishReason::Stop)));
+            self.account(id, Outcome::Failed, message);
+            self.deliver(
+                id,
+                ActiveRequest::error_event(ErrorCode::InternalError, message),
+            );
+            self.retire(id);
+        }
+    }
+
+    /// The next launch took request `id`'s token on the device, but the host chose another (a
+    /// row without a finite logit): its KV no longer matches its tokens, so it ends with
+    /// `internal_error`; every live sequence of it is finished.
+    fn token_diverged(&mut self, id: RequestId, outcome: &mut IterationOutcome) {
+        let Some(r) = self.requests.get_mut(&id).filter(|r| !r.done) else {
+            return;
+        };
+        let live: Vec<SeqId> = r.live_seqs().collect();
+        for c in &mut r.choices {
+            c.finish.get_or_insert(FinishReason::Stop);
+        }
+        outcome
+            .finished
+            .extend(live.into_iter().map(|s| (s, FinishReason::Stop)));
+        let message = "the device's token choice differs from the host's (non-finite logits)";
+        tracing::warn!(
+            event = "fail",
+            request_id = %r.request.http_request_id,
+            reason = "token_diverged",
+            "overlap scheduling: {message}"
+        );
+        self.account(id, Outcome::Failed, &format!("token_diverged: {message}"));
+        self.deliver(
+            id,
+            ActiveRequest::error_event(ErrorCode::InternalError, message),
+        );
+        self.retire(id);
     }
 
     /// Samples choice `choice` of request `id` from `row` — or takes `drawn`, the token its
@@ -968,6 +1478,42 @@ impl EngineLoop {
     }
 }
 
+/// The [`SeqSlice`] of each row of `built`, a batch of `plan`.
+fn seq_slices<'a>(plan: &'a IterationPlan, built: &Built) -> Vec<SeqSlice<'a>> {
+    built
+        .slices
+        .iter()
+        .zip(&built.rows)
+        .map(|(&(index, q_start, q_len, kv_len), row)| SeqSlice {
+            seq: row.seq,
+            q_start,
+            q_len,
+            kv_len,
+            block_table: &plan.items[index].block_table.blocks,
+            reduce: row.reduce,
+        })
+        .collect()
+}
+
+/// `prefill` when the plan writes any prefill chunk, else `decode`.
+fn phase_of(plan: &IterationPlan) -> ForwardPhase {
+    if plan.prefill_tokens() > 0 {
+        ForwardPhase::Prefill
+    } else {
+        ForwardPhase::Decode
+    }
+}
+
+/// The token the device chose for a row reduced as `reduce` asked (the one a launch fed on
+/// the device takes): its draw, or its best candidate for a greedy row.
+fn device_choice(reduced: &ReducedRow, reduce: Option<RowReduce>) -> Option<u32> {
+    match reduce? {
+        q if q.uniform.is_some() => reduced.sampled.map(|(id, _)| id),
+        q if q.temperature <= 0.0 => reduced.top.first().map(|&(id, _)| id),
+        _ => None,
+    }
+}
+
 /// Distinct requests of the plan's items and forks, in plan order.
 fn plan_requests(
     plan: &IterationPlan,
@@ -1105,11 +1651,21 @@ mod tests {
         reg: MetricsRegistry,
     }
 
-    /// An engine over `exec` with a 64-block pool.
+    /// An engine over `exec` with a 64-block pool, overlap scheduling off.
     fn engine(
         exec: Box<dyn ModelExecutor>,
         tokenizer: Arc<Tokenizer>,
         params: SchedulerParams,
+    ) -> TestEngine {
+        engine_with(exec, tokenizer, params, false)
+    }
+
+    /// [`engine`] with `execution.overlap_scheduling` = `overlap`.
+    fn engine_with(
+        exec: Box<dyn ModelExecutor>,
+        tokenizer: Arc<Tokenizer>,
+        params: SchedulerParams,
+        overlap: bool,
     ) -> TestEngine {
         let reg = MetricsRegistry::new();
         let metrics = EngineMetrics {
@@ -1145,6 +1701,7 @@ mod tests {
                 request: Duration::from_secs(600),
                 slow_client: Duration::from_secs(30),
             },
+            overlap,
         });
         TestEngine {
             engine,
@@ -1200,6 +1757,197 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, GenerationEvent::Token { .. }))
             .count()
+    }
+
+    /// The tiny Llama on the cpu reference provider with the device logits reduction (the
+    /// executor overlap scheduling needs), for batches of `max_seqs` sequences.
+    fn tiny_reducing_executor(spec: &TinySpec, max_seqs: u32) -> Box<dyn ModelExecutor> {
+        let cfg = &spec.config;
+        let mem = mem();
+        let index = SafetensorsIndex::open(&spec.dir).unwrap();
+        let weights =
+            WeightLoader::load(&index, &llama_slots(cfg), &mem, MAX_STAGING_BYTES).expect("load");
+        let provider = cpu_reference_provider();
+        let order = [provider.id()];
+        let mut reqs = executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default());
+        reqs.push(executor::logits::reduce_requirement(cfg));
+        let registry = KernelRegistry::build(
+            vec![provider],
+            &order,
+            &reqs,
+            &KernelMetrics::register(&MetricsRegistry::new()),
+        )
+        .unwrap();
+        executor::build_executor(
+            cfg,
+            weights,
+            Arc::new(registry),
+            mem,
+            BLOCK_TOKENS,
+            64,
+            max_seqs,
+            ExecutorOptions::default(),
+        )
+        .expect("executor")
+    }
+
+    /// One choice's stream: its tokens, its text and how it ended.
+    #[derive(Debug, Default, PartialEq)]
+    struct ChoiceStream {
+        tokens: Vec<u32>,
+        logprobs: Vec<Option<f32>>,
+        text: String,
+        finish: Option<(FinishReason, u32)>,
+    }
+
+    /// Runs `requests` (all queued before the engine starts) on a fresh engine over the tiny
+    /// Llama with the device reduction, with overlap scheduling on or off, and returns every
+    /// request's choices and how many iterations launched ahead of one in flight.
+    fn run_streams(
+        spec: &TinySpec,
+        tokenizer: &Arc<Tokenizer>,
+        requests: &[GenerationRequest],
+        overlap: bool,
+    ) -> (Vec<Vec<ChoiceStream>>, u64) {
+        let t = engine_with(
+            tiny_reducing_executor(spec, 8),
+            Arc::clone(tokenizer),
+            params(4, 8),
+            overlap,
+        );
+        assert_eq!(
+            t.engine.overlap, overlap,
+            "the reducing CPU executor can overlap"
+        );
+        let streams: Vec<_> = requests.iter().map(|r| submit(&t.tx, r.clone())).collect();
+        let engine = t.engine;
+        let handle = std::thread::spawn(move || {
+            let mut engine = engine;
+            let result = loop {
+                let turn = if engine.overlap {
+                    engine.turn_overlap()
+                } else {
+                    engine.turn()
+                };
+                match turn {
+                    Ok(Turn::Continue) => {}
+                    Ok(Turn::Stop) => break Ok(()),
+                    Err(e) => break Err(e),
+                }
+            };
+            (result, engine.overlapped)
+        });
+        let mut out = Vec::new();
+        for ((mut rx, admitted), req) in streams.into_iter().zip(requests) {
+            assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+            let mut choices: Vec<ChoiceStream> =
+                (0..req.n).map(|_| ChoiceStream::default()).collect();
+            let mut finished = 0;
+            while finished < req.n {
+                match rx.blocking_recv().expect("stream ended early") {
+                    GenerationEvent::Token {
+                        choice,
+                        token_id,
+                        text,
+                        logprob,
+                        ..
+                    } => {
+                        let c = &mut choices[choice as usize];
+                        c.tokens.push(token_id);
+                        c.logprobs.push(logprob);
+                        c.text.push_str(&text);
+                    }
+                    GenerationEvent::Finished {
+                        choice,
+                        reason,
+                        usage,
+                    } => {
+                        choices[choice as usize].finish =
+                            Some((reason, usage.unwrap().completion_tokens));
+                        finished += 1;
+                    }
+                    GenerationEvent::Started { .. } => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            out.push(choices);
+        }
+        drop(t.tx);
+        let (result, overlapped) = handle.join().unwrap();
+        assert_eq!(result, Ok(()));
+        let docs = t.shared.docs().unwrap();
+        assert_eq!(docs.kv.tiers[0].blocks_used, 0, "overlap {overlap}");
+        assert_eq!(docs.scheduler.waiting, 0);
+        (out, overlapped)
+    }
+
+    /// P2c overlap scheduling: with overlap on, every request gets exactly the stream it gets
+    /// with overlap off — greedy requests (their decodes fed on the device), greedy with
+    /// logprobs, a seeded draw (its token is the host's: those iterations wait), an `n` = 2
+    /// request (its forks' first tokens are the host's), a chunked 20-token prompt, a stop
+    /// string, an EOS the scheduler learns one iteration late and `max_tokens` from 1 to 12 —
+    /// and iterations did launch ahead. Breaks if a fed token, a late finish, the sampler's
+    /// uniform order or the scheduler's token accounting differs from the serial loop.
+    #[test]
+    fn overlap_scheduling_matches_serial() {
+        let (_dir, spec, tokenizer) = tiny();
+        let prompts: [Vec<u32>; 4] = [
+            vec![256, 72, 101, 108, 108, 111],
+            // 20 tokens: prefilled in chunks of 8.
+            std::iter::once(256).chain(97..116).collect(),
+            vec![256, 79],
+            vec![256, 1, 2, 3],
+        ];
+        // A greedy run of prompt 0 alone, to pick a stop string and an EOS id it will meet.
+        let (probe, _) = run_streams(&spec, &tokenizer, &[request(&prompts[0], 12)], false);
+        let probe = &probe[0][0];
+        assert_eq!(probe.tokens.len(), 12);
+        let stop: String = probe.text.chars().skip(4).take(2).collect();
+        assert!(
+            !stop.is_empty(),
+            "the probe produced text: {:?}",
+            probe.text
+        );
+        let eos = probe.tokens[5];
+
+        let mut requests = Vec::new();
+        requests.push(request(&prompts[0], 12));
+        let mut with_stop = request(&prompts[0], 12);
+        with_stop.stop.stop_strings = vec![stop.clone()];
+        requests.push(with_stop);
+        let mut with_eos = request(&prompts[0], 12);
+        with_eos.stop.eos_token_ids = [eos].into_iter().collect();
+        with_eos.stop.ignore_eos = false;
+        requests.push(with_eos);
+        let mut logprobs = request(&prompts[1], 9);
+        logprobs.sampling.logprobs = Some(3);
+        requests.push(logprobs);
+        let mut seeded = request(&prompts[2], 7);
+        seeded.sampling = SamplingParams {
+            temperature: 0.8,
+            seed: Some(42),
+            ..SamplingParams::default()
+        };
+        requests.push(seeded);
+        let mut forked = request(&prompts[3], 5);
+        forked.n = 2;
+        requests.push(forked);
+        requests.push(request(&prompts[2], 1));
+        requests.push(request(&prompts[3], 10));
+
+        let (serial, none) = run_streams(&spec, &tokenizer, &requests, false);
+        assert_eq!(none, 0);
+        let (overlapped, ahead) = run_streams(&spec, &tokenizer, &requests, true);
+        assert!(ahead > 0, "no iteration launched ahead");
+        assert_eq!(overlapped, serial);
+        // The cases did what they are here for.
+        assert_eq!(serial[1][0].finish.map(|f| f.0), Some(FinishReason::Stop));
+        assert!(!serial[1][0].text.contains(&stop));
+        let eos_at = probe.tokens.iter().position(|&t| t == eos).unwrap() as u32 + 1;
+        assert_eq!(serial[2][0].finish, Some((FinishReason::Stop, eos_at)));
+        assert!(serial[3][0].logprobs.iter().all(Option::is_some));
+        assert_eq!(serial[5].len(), 2);
+        assert_eq!(serial[6][0].finish, Some((FinishReason::Length, 1)));
     }
 
     /// Continuous batching with chunked prefill gives every request exactly the greedy tokens
@@ -1361,6 +2109,154 @@ mod tests {
                 "missing {line:?} in
 {text}"
             );
+        }
+    }
+
+    /// A working executor whose `fail_launches`-th launches and `fail_collects`-th collects
+    /// (1-based) fail like a device error.
+    struct Flaky {
+        inner: Box<dyn ModelExecutor>,
+        launches: usize,
+        collects: usize,
+        fail_launches: Vec<usize>,
+        fail_collects: Vec<usize>,
+    }
+
+    impl Flaky {
+        fn device_error() -> ModelError {
+            ModelError::Kernel(KernelError::Device {
+                message: "hipErrorLaunchFailure: injected".into(),
+            })
+        }
+    }
+
+    impl ModelExecutor for Flaky {
+        fn shape(&self) -> &ModelShape {
+            self.inner.shape()
+        }
+        fn kv_layout(&self) -> &KvLayout {
+            self.inner.kv_layout()
+        }
+        fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
+            self.inner.forward(batch)
+        }
+        fn reduces_logits(&self) -> bool {
+            self.inner.reduces_logits()
+        }
+        fn overlaps(&self) -> bool {
+            self.inner.overlaps()
+        }
+        fn launch(
+            &mut self,
+            batch: &BatchInput<'_>,
+            feeds: &[TokenFeed],
+        ) -> Result<(), ModelError> {
+            self.launches += 1;
+            if self.fail_launches.contains(&self.launches) {
+                return Err(Flaky::device_error());
+            }
+            self.inner.launch(batch, feeds)
+        }
+        fn collect(&mut self) -> Result<Logits, ModelError> {
+            self.collects += 1;
+            let logits = self.inner.collect();
+            if self.fail_collects.contains(&self.collects) {
+                return Err(Flaky::device_error());
+            }
+            logits
+        }
+        fn copy_blocks(
+            &mut self,
+            kv: &KvPoolView<'_>,
+            src: &[BlockId],
+            dst: &[BlockId],
+        ) -> Result<(), ModelError> {
+            self.inner.copy_blocks(kv, src, dst)
+        }
+    }
+
+    /// Overlap scheduling after failed steps: a request in a step whose launch or whose collect
+    /// fails ends with `internal_error`, the requests outside it finish normally with the tokens
+    /// they get when nothing fails, and no block stays used; three failed steps in a row stop
+    /// the engine. Breaks if a failed step's sequences are never reported finished to the
+    /// scheduler (their blocks leak, or the engine never idles).
+    #[test]
+    fn overlap_failed_steps_fail_their_requests_only() {
+        let (_dir, spec, tokenizer) = tiny();
+        // One running request at a time: every step holds exactly one request.
+        let prompts: Vec<Vec<u32>> = (0..4).map(|i| vec![256, 40 + i, 41 + i]).collect();
+        let (want, _) = run_streams(
+            &spec,
+            &tokenizer,
+            &prompts.iter().map(|p| request(p, 6)).collect::<Vec<_>>(),
+            false,
+        );
+        let flaky = Flaky {
+            inner: tiny_reducing_executor(&spec, 8),
+            launches: 0,
+            collects: 0,
+            // Each request is one prefill and five decodes: request 0 runs launches 1–6, request
+            // 1 launches 7–12 and fails at its third (launch 9, never collected); request 2
+            // starts at launch 10 (collect 9) and fails at its third step, collect 11 (launch
+            // 12; launch 13, fed from it, is already in flight and dropped with the request).
+            fail_launches: vec![9],
+            fail_collects: vec![11],
+        };
+        let t = engine_with(Box::new(flaky), Arc::clone(&tokenizer), params(1, 8), true);
+        assert!(t.engine.overlap);
+        let streams: Vec<_> = prompts
+            .iter()
+            .map(|p| submit(&t.tx, request(p, 6)))
+            .collect();
+        let (shared, engine) = (Arc::clone(&t.shared), t.engine);
+        let handle = std::thread::spawn(move || engine.run());
+        let mut outcomes = Vec::new();
+        for (mut rx, admitted) in streams {
+            assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+            let events: Vec<_> = std::iter::from_fn(|| rx.blocking_recv()).collect();
+            outcomes.push(events);
+        }
+        drop(t.tx);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+        let tokens = |events: &[GenerationEvent]| -> Vec<u32> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    GenerationEvent::Token { token_id, .. } => Some(*token_id),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(tokens(&outcomes[0]), want[0][0].tokens);
+        assert!(internal_error(&outcomes[1]), "{:?}", outcomes[1]);
+        assert!(internal_error(&outcomes[2]), "{:?}", outcomes[2]);
+        assert_eq!(tokens(&outcomes[3]), want[3][0].tokens);
+        assert_eq!(shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
+        let text = t.reg.render().unwrap();
+        for line in [
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="failed"} 2"#,
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 2"#,
+        ] {
+            assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+
+        // Every launch failing: three failed steps in a row stop the engine.
+        let flaky = Flaky {
+            inner: tiny_reducing_executor(&spec, 8),
+            launches: 0,
+            collects: 0,
+            fail_launches: (1..100).collect(),
+            fail_collects: Vec::new(),
+        };
+        let t = engine_with(Box::new(flaky), tokenizer, params(1, 8), true);
+        let mut streams: Vec<_> = prompts
+            .iter()
+            .map(|p| submit(&t.tx, request(p, 6)))
+            .collect();
+        let err = t.engine.run().unwrap_err();
+        assert!(err.contains("3 consecutive iterations failed"), "{err}");
+        for (rx, _) in &mut streams {
+            assert!(internal_error(&drain(rx)));
         }
     }
 

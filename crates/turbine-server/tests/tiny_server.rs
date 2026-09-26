@@ -2378,6 +2378,77 @@ fn iteration_stage_breakdown() {
     );
 }
 
+/// P2c overlap scheduling end to end: `execution.overlap_scheduling` true (the default) and
+/// false give every request of a concurrent mix the same completion — greedy with and without
+/// logprobs, a stop string, EOS honoured, a seeded draw, `n` = 2, a JSON schema — and the server
+/// logs whether overlap scheduling is on (`overlap_scheduling`, `enabled`). Breaks if the key is
+/// not wired to the engine or overlap scheduling changes an output.
+#[test]
+fn overlap_scheduling_matches_serial() {
+    let bodies = [
+        json!({"prompt": "Hello", "max_tokens": 12, "temperature": 0.0, "ignore_eos": true}),
+        json!({"prompt": "Hello", "max_tokens": 12, "temperature": 0.0, "logprobs": 3,
+               "ignore_eos": true}),
+        json!({"prompt": "Once upon a time", "max_tokens": 16, "temperature": 0.0,
+               "stop": ["e", "o"]}),
+        json!({"prompt": "Hi there", "max_tokens": 20, "temperature": 0.0}),
+        json!({"prompt": "Yes", "max_tokens": 10, "temperature": 0.9, "seed": 3,
+               "ignore_eos": true}),
+        json!({"prompt": "Bye", "max_tokens": 6, "temperature": 0.0, "n": 2,
+               "ignore_eos": true}),
+        json!({"prompt": "Data:", "max_tokens": 40, "temperature": 0.0,
+               "response_format": {"type": "json_schema",
+                   "json_schema": {"name": "small", "schema": small_schema()}}}),
+        json!({"prompt": "A", "max_tokens": 1, "temperature": 0.0, "ignore_eos": true}),
+    ];
+    let run = |overlap: bool| -> Vec<Value> {
+        let execution_extra = format!("  overlap_scheduling: {overlap}\n");
+        let server = TinyServer::launch(&Setup {
+            execution_extra: &execution_extra,
+            extra: "logging:\n  format: json\n",
+            capture_logs: true,
+            ..Setup::default()
+        });
+        let outputs: Vec<Value> = std::thread::scope(|s| {
+            let handles: Vec<_> = bodies
+                .iter()
+                .map(|b| {
+                    let mut body = b.clone();
+                    body["model"] = json!(server.model);
+                    let server = &server;
+                    s.spawn(move || {
+                        let resp = server.post("/v1/completions", &body);
+                        assert_eq!(resp.status, 200, "{body}: {}", resp.body);
+                        let doc = resp.json();
+                        json!({"choices": doc["choices"], "usage": doc["usage"]})
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let logged = || {
+            server
+                .log_records()
+                .into_iter()
+                .find(|r| r["fields"]["event"] == "overlap_scheduling")
+        };
+        wait_for(
+            Duration::from_secs(10),
+            "the overlap_scheduling log",
+            || logged().is_some(),
+        );
+        let logged = logged().unwrap();
+        assert_eq!(logged["fields"]["enabled"], json!(overlap), "{logged}");
+        outputs
+    };
+    let overlapped = run(true);
+    let serial = run(false);
+    for (i, (o, s)) in overlapped.iter().zip(&serial).enumerate() {
+        assert_eq!(o, s, "request {i}: {}", bodies[i]);
+    }
+    assert_eq!(serial[5]["choices"].as_array().map(Vec::len), Some(2));
+}
+
 /// One request of [`device_sampling_matches_host`]: its body and how many of its yielding rows
 /// qualify for the device reduction.
 struct DeviceCase {

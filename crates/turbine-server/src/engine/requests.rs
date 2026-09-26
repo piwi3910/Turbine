@@ -519,6 +519,11 @@ impl Choice {
         (self.matcher.is_none() && self.finish.is_none()).then_some(&mut self.sampler)
     }
 
+    /// The request carries a `seed` (its draws must stay reproducible).
+    pub fn is_seeded(&self) -> bool {
+        self.sampler.is_seeded()
+    }
+
     /// Held text plus whatever the detokenizer still holds.
     fn drain_all(&mut self) -> String {
         let mut rest = std::mem::take(&mut self.held_text);

@@ -2,7 +2,7 @@
 #   scripts/lab-perf.sh novanas olmoe
 #   scripts/lab-serve.sh novanas scripts/lab/phase2c-novanas-olmoe.yaml [--set <k>=<v>]...
 # Weights: /home/piwi/turbine-models/olmoe-1b-7b-0125-instruct on the host, mounted read-only at
-# /models by scripts/lab/novanas-serve-job.yaml. The Phase 2 lab values plus the five Phase 2c
+# /models by scripts/lab/novanas-serve-job.yaml. The Phase 2 lab values plus the six Phase 2c
 # execution switches spelled out, so every lab-perf summary records what it ran with. The
 # scheduler pair is tuned by the Phase 2c sweep (spec S-12).
 server:
@@ -17,6 +17,7 @@ execution:
   device_sampling: true
   fused_ops: true
   sampler_threads: 4
+  overlap_scheduling: true
 kv:
   block_tokens: 128
   gpu:

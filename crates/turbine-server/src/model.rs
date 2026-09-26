@@ -280,6 +280,9 @@ pub struct PreparedModel {
     pub executor_options: ExecutorOptions,
     /// `execution.decode_graphs`, and the provider can capture graphs.
     pub decode_graphs: bool,
+    /// `execution.overlap_scheduling` (P2c): the engine launches each iteration before the host
+    /// work of the previous one, when the executor can.
+    pub overlap_scheduling: bool,
     /// Compiles `response_format` and tool grammars; its token trie is built once, here.
     pub grammar: Arc<GrammarCompiler>,
     /// `structured_output` bounds on those grammars.
@@ -461,6 +464,7 @@ pub fn prepare(
         scheduler,
         executor_options,
         decode_graphs,
+        overlap_scheduling: config.execution.overlap_scheduling,
         grammar,
         structured_output: config.structured_output.clone(),
         tool_call_parser,
