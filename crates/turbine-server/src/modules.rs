@@ -5,7 +5,7 @@
 //! Every lane of Phase 2m moves one field of [`known_module_names`] from the fixed list below to
 //! its registry's `names()`.
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use serde::Serialize;
 use turbine_core::config::ModuleNames;
@@ -13,8 +13,11 @@ use turbine_model::tools::LLAMA3_JSON;
 
 /// Tool-call formats (`tool_format`; `turbine_model::formats` from Phase 2m Task 9).
 pub const TOOL_FORMATS: &[&str] = &[LLAMA3_JSON];
-/// Execution backends (`execution_backend`; `turbine_kernels::backends` from Task 4).
-pub const BACKENDS: &[&str] = &["cpu", "hip"];
+/// Execution backends (`execution_backend`): the names of `turbine_kernels::backends::registry()`.
+pub fn backends() -> &'static [&'static str] {
+    static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+    NAMES.get_or_init(|| turbine_kernels::backends::registry().names())
+}
 /// Card profiles (`card_profile`; `turbine_kernels::cards` from Task 7).
 pub const CARD_PROFILES: &[&str] = &["gfx1201"];
 /// Scheduling policies (`scheduling_policy`): the names of `turbine_scheduler::policy::registry`.
@@ -25,7 +28,7 @@ pub static SCHEDULING_POLICIES: LazyLock<Vec<&'static str>> =
 pub fn known_module_names() -> ModuleNames<'static> {
     ModuleNames {
         tool_formats: TOOL_FORMATS,
-        backends: BACKENDS,
+        backends: backends(),
         card_profiles: CARD_PROFILES,
         scheduling_policies: &SCHEDULING_POLICIES,
     }
@@ -47,7 +50,8 @@ pub struct ModuleChoices {
 impl ModuleChoices {
     /// Logs `event="module_selected"` for every extension point whose registry does not log
     /// its own selection, once at startup. `scheduling_policy` is logged by
-    /// `turbine_scheduler::policy::registry().select` when the engine starts.
+    /// `turbine_scheduler::policy::registry().select` when the engine starts, `execution_backend`
+    /// by `turbine_kernels::backends::registry().select`.
     pub fn log(&self) {
         use turbine_core::registry::log_selected;
         log_selected("model_family", &self.family, "config.json architectures");
@@ -61,7 +65,6 @@ impl ModuleChoices {
             &self.weight_format,
             "config.json dtype and quantization_config",
         );
-        log_selected("execution_backend", &self.backend, "execution.backend");
         log_selected(
             "card_profile",
             self.card_profile.as_deref().unwrap_or("none"),

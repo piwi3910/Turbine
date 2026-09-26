@@ -1548,7 +1548,8 @@ mod tests {
         CancelFlag, Endpoint, GenerationRequest, SamplingParams, StopConditions,
     };
     use turbine_core::types::{BlockId, DeviceId, KvLayout, ModelShape, Priority};
-    use turbine_kernels::{KernelError, KernelMetrics, KernelRegistry, cpu_reference_provider};
+    use turbine_kernels::test_support::{plain_device_error, sticky_device_error};
+    use turbine_kernels::{KernelMetrics, KernelRegistry, cpu_reference_provider};
     use turbine_kv::{BlockPoolConfig, KvMetrics};
     use turbine_model::executor::{self, ExecutorOptions, SequenceKv};
     use turbine_model::testing::TempDir;
@@ -2127,9 +2128,7 @@ mod tests {
 
     impl Flaky {
         fn device_error() -> ModelError {
-            ModelError::Kernel(KernelError::Device {
-                message: "hipErrorLaunchFailure: injected".into(),
-            })
+            ModelError::Kernel(sticky_device_error("injected"))
         }
     }
 
@@ -2279,9 +2278,7 @@ mod tests {
         }
         fn forward(&mut self, _batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
             assert!(!self.panic, "injected engine panic");
-            Err(ModelError::Kernel(KernelError::Device {
-                message: "hipErrorOutOfMemory: injected".into(),
-            }))
+            Err(ModelError::Kernel(plain_device_error("injected")))
         }
         fn copy_blocks(
             &mut self,
@@ -2313,7 +2310,7 @@ mod tests {
             .collect();
         let err = t.engine.run().unwrap_err();
         assert!(err.contains("3 consecutive iterations failed"), "{err}");
-        assert!(err.contains("hipErrorOutOfMemory"), "{err}");
+        assert!(err.contains("device error: injected"), "{err}");
         for (rx, admitted) in &mut streams {
             assert_eq!(admitted.try_recv().unwrap(), Ok(()));
             assert!(internal_error(&drain(rx)));

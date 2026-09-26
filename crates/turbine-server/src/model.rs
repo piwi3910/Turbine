@@ -12,12 +12,11 @@ use std::time::Instant;
 
 use turbine_core::config::{Config, StructuredOutputConfig};
 use turbine_core::types::SeqId;
-use turbine_core::types::{MemoryKind, Vendor};
-use turbine_device::{DeviceInfo, DeviceInventory};
-use turbine_kernels::{
-    KernelError, KernelMetrics, KernelProvider, KernelRegistry, OpKind, ProviderId, Selection,
-    ShimContext, ShimLibrary, cpu_reference_provider, shim_provider,
+use turbine_device::DeviceInventory;
+use turbine_kernels::backends::{
+    self, BackendNote, BackendRequest, ExecutionBackend, OpenedBackend,
 };
+use turbine_kernels::{KernelError, KernelMetrics, KernelProvider, KernelRegistry, ShimContext};
 use turbine_kv::metrics::log_pool_startup;
 use turbine_kv::{BlockPool, BlockPoolConfig};
 use turbine_model::executor::{
@@ -35,7 +34,6 @@ use turbine_scheduler::SchedulerParams;
 
 use crate::modules::{self, ModuleChoices};
 use turbine_tensor::DeviceMemory;
-use turbine_tensor::host::HostMemory;
 
 /// Linux host memory figures (`MemAvailable`); absent elsewhere.
 const MEMINFO: &str = "/proc/meminfo";
@@ -142,88 +140,44 @@ pub fn eos_token_ids(arch: &ModelArchConfig, generation: &GenerationConfig) -> V
     }
 }
 
-/// The device-memory backend and kernel providers of `execution.backend`.
+/// The opened `execution.backend`: device memory, kernel providers and the card profile.
 pub struct Provider {
-    pub mem: Arc<dyn DeviceMemory>,
-    pub providers: Vec<Arc<dyn KernelProvider>>,
-    pub order: Vec<ProviderId>,
-    pub memory_kind: MemoryKind,
-    /// The context decode graphs capture on: `Some` on a backend whose kernel library exports
-    /// the ABI v2.1 graph functions.
-    pub graphs: Option<Arc<ShimContext>>,
+    /// The registered backend (`execution_backend`), for its notes on the kernel selections.
+    pub backend: &'static dyn ExecutionBackend,
+    pub opened: OpenedBackend,
     /// The card profile in effect (`execution.card_profile`, `auto` → the device architecture's
     /// profile); `None` on the cpu backend or a device no profile describes.
     pub card_profile: Option<String>,
 }
 
-/// Step 4: load the kernel provider. `hip`: the first loadable library of
-/// `ShimLibrary::search_paths` (an ABI, backend or architecture mismatch is fatal, a missing file
-/// moves on), then a context on the configured AMD device. `cpu`: the reference provider on host
-/// memory sized to host `MemAvailable`, else the configured device's total memory.
+/// Step 4: open the registered backend `execution.backend` names (logged as `module_selected`)
+/// on `execution.device`. An unregistered name was refused with exit 2 before this point; a
+/// backend that cannot open is exit 1.
 pub fn load_provider(
     config: &Config,
     inventory: &DeviceInventory,
 ) -> Result<Provider, StartupError> {
     let exec = &config.execution;
-    match exec.backend.as_str() {
-        "cpu" => {
-            let device_total = inventory
-                .devices
-                .iter()
-                .find(|d| d.index == exec.device)
-                .map(|d| d.memory.total_bytes);
-            let host = host_mem_available(Path::new(MEMINFO));
-            let capacity = host.or(device_total).unwrap_or_else(|| {
-                tracing::warn!(
-                    event = "memory_budget",
-                    "host MemAvailable and device memory unknown; the cpu backend is unbounded"
-                );
-                u64::MAX
-            });
-            let mem: Arc<dyn DeviceMemory> = HostMemory::new(exec.device, capacity);
-            tracing::info!(backend = "cpu", capacity, "kernel provider: cpu-reference");
-            Ok(Provider {
-                mem,
-                providers: vec![cpu_reference_provider()],
-                order: vec![ProviderId("cpu-reference")],
-                memory_kind: MemoryKind::Dedicated,
-                graphs: None,
-                card_profile: None,
-            })
-        }
-        "hip" => {
-            let lib = load_shim("hip", exec.kernel_library.as_deref())?;
-            let device = amd_device(inventory, exec.device.0)?;
-            let card_profile = card_profile(exec.card_profile.as_str(), device.arch.as_deref());
-            let ctx: Arc<ShimContext> = lib
-                .create_context(device)
-                .map_err(|e| kernel_error("kernel library context", e))?;
-            tracing::info!(
-                event = "kernel_library_loaded",
-                path = %lib.path().display(),
-                backend = lib.backend_name(),
-                abi_version = lib.abi_version(),
-                build_archs = %lib.build_archs().join(","),
-                device_arch = device.arch.as_deref().unwrap_or("unknown"),
-                driver_version = device.driver_version.as_deref().unwrap_or("unknown"),
-                "kernel library loaded"
-            );
-            let provider = shim_provider(Arc::clone(&ctx));
-            let id = provider.id();
-            let graphs = lib.supports_graphs().then(|| Arc::clone(&ctx));
-            Ok(Provider {
-                mem: ctx,
-                providers: vec![provider],
-                order: vec![id],
-                memory_kind: device.memory.kind,
-                graphs,
-                card_profile,
-            })
-        }
-        other => Err(StartupError::new(format!(
-            "execution.backend {other} is not available in this build"
-        ))),
-    }
+    let backend = backends::registry()
+        .select(exec.backend.as_str(), "execution.backend")
+        .map_err(|e| StartupError::new(e.to_string()))?;
+    let opened = backend
+        .open(&BackendRequest {
+            device: exec.device,
+            kernel_library: exec.kernel_library.as_deref(),
+            inventory,
+            meminfo: Path::new(MEMINFO),
+        })
+        .map_err(|e| StartupError::new(e.to_string()))?;
+    let card_profile = opened
+        .device
+        .as_ref()
+        .and_then(|device| card_profile(exec.card_profile.as_str(), device.arch.as_deref()));
+    Ok(Provider {
+        backend,
+        opened,
+        card_profile,
+    })
 }
 
 /// `execution.card_profile` on a device of architecture `arch`: a configured name as is; `auto`
@@ -234,46 +188,6 @@ fn card_profile(configured: &str, arch: Option<&str>) -> Option<String> {
     }
     arch.filter(|a| modules::CARD_PROFILES.contains(a))
         .map(str::to_string)
-}
-
-fn load_shim(backend: &str, explicit: Option<&Path>) -> Result<Arc<ShimLibrary>, StartupError> {
-    let paths = ShimLibrary::search_paths(backend, explicit);
-    if explicit.is_none() {
-        let order: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-        tracing::info!(search_order = %order.join(", "), "kernel library search order");
-    }
-    let mut misses = Vec::new();
-    for path in &paths {
-        match ShimLibrary::load(path, backend) {
-            Ok(lib) => return Ok(lib),
-            Err(e @ KernelError::Load { .. }) => misses.push(e.to_string()),
-            Err(e) => return Err(kernel_error("kernel library", e)),
-        }
-    }
-    Err(StartupError::new(format!(
-        "kernel library: no loadable libturbine_{backend}.so: {}",
-        misses.join("; ")
-    )))
-}
-
-fn amd_device(inventory: &DeviceInventory, index: u32) -> Result<&DeviceInfo, StartupError> {
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.index.0 == index)
-        .ok_or_else(|| {
-            StartupError::new(format!(
-                "execution.device {index} is not in the device inventory ({} devices)",
-                inventory.devices.len()
-            ))
-        })?;
-    if device.vendor != Vendor::Amd {
-        return Err(StartupError::new(format!(
-            "execution.device {index} is a {} device; backend hip needs an AMD device",
-            device.vendor.as_str()
-        )));
-    }
-    Ok(device)
 }
 
 /// Everything resolved before the listener binds: the model is known to be loadable and to fit.
@@ -358,10 +272,11 @@ pub fn prepare(
     let executor_options = ExecutorOptions::from_fused_ops(config.execution.fused_ops);
     // Optional ops (kernel ABI v2.1) join the requirements only when a provider in the
     // selection order has them; otherwise the executor runs their ABI v2 equivalent.
-    let ordered: Vec<Arc<dyn KernelProvider>> = provider
+    let opened = &provider.opened;
+    let ordered: Vec<Arc<dyn KernelProvider>> = opened
         .providers
         .iter()
-        .filter(|p| provider.order.contains(&p.id()))
+        .filter(|p| opened.order.contains(&p.id()))
         .cloned()
         .collect();
     let mut requirements =
@@ -375,24 +290,17 @@ pub fn prepare(
         requirements.push(reduce);
     }
     let registry = KernelRegistry::build(
-        provider.providers.clone(),
-        &provider.order,
+        opened.providers.clone(),
+        &opened.order,
         &requirements,
         &KernelMetrics::register(metrics),
     )
     .map_err(|e| kernel_error("kernel selection", e))?;
-    if let Some(implementation) =
-        paged_attention_fallback(config.execution.backend.as_str(), registry.selections())
-    {
-        tracing::info!(
-            event = "paged_attention_fallback",
-            block_tokens,
-            "impl" = %implementation,
-            "paged attention is not on CK fmha_fwd_pagedkv: kv.block_tokens is not a multiple of 128"
-        );
+    for note in provider.backend.selection_notes(registry.selections()) {
+        log_backend_note(&note, block_tokens);
     }
 
-    let decode_graphs = config.execution.decode_graphs && provider.graphs.is_some();
+    let decode_graphs = config.execution.decode_graphs && opened.graphs.is_some();
     if config.execution.decode_graphs && !decode_graphs {
         tracing::warn!(
             event = "decode_graphs_unavailable",
@@ -403,13 +311,13 @@ pub fn prepare(
     }
 
     let scheduler = SchedulerParams::from_config(config, max_seq_len);
-    let device_free = provider
+    let device_free = opened
         .mem
         .mem_info()
         .map_err(|e| StartupError::new(format!("device memory info: {e}")))?
         .free_bytes;
     let available = available_bytes(
-        provider.memory_kind,
+        opened.memory_kind,
         device_free,
         host_mem_available(Path::new(MEMINFO)),
     );
@@ -501,26 +409,21 @@ pub fn prepare(
     })
 }
 
-/// The implementation name the HIP shim reports for CK paged attention.
-const CK_PAGED_ATTENTION: &str = "ck_tile_fmha_pagedkv";
-
-/// The paged-attention implementation of the HIP backend when it is not Composable Kernel's
-/// `fmha_fwd_pagedkv` (CK serves only pages of a multiple of 128 tokens; other sizes run the
-/// slower Turbine kernel), else `None`. Other backends have no CK path to fall back from.
-fn paged_attention_fallback(backend: &str, selections: &[Selection]) -> Option<String> {
-    if backend != "hip" {
-        return None;
-    }
-    selections
+/// Logs a backend's note on the kernel selections at INFO: `event=<note.event>`, `block_tokens`
+/// (`kv.block_tokens`) and the note's fields (e.g. `impl` of `paged_attention_fallback`).
+fn log_backend_note(note: &BackendNote, block_tokens: u32) {
+    let fields: Vec<String> = note
+        .fields
         .iter()
-        .filter(|s| {
-            matches!(
-                s.op,
-                OpKind::AttentionPrefillPaged | OpKind::AttentionDecodePaged
-            )
-        })
-        .find(|s| s.implementation != CK_PAGED_ATTENTION)
-        .map(|s| s.implementation.clone())
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    tracing::info!(
+        event = note.event,
+        block_tokens,
+        fields = %fields.join(" "),
+        "{}",
+        note.message
+    );
 }
 
 /// The L0 pool: as many blocks as `max_bytes` (`kv.gpu.max_bytes`) holds, or, when it is null,
@@ -590,7 +493,7 @@ pub fn load(
 ) -> Result<LoadedModel, StartupError> {
     let started = Instant::now();
     let arch = &prepared.arch;
-    let mem = &prepared.provider.mem;
+    let mem = &prepared.provider.opened.mem;
     let weights = WeightLoader::load_format(
         arch.weight_format.0,
         &prepared.index,
@@ -613,6 +516,7 @@ pub fn load(
     .map_err(|e| model_error("executor", e))?;
     if let Some(ctx) = prepared
         .provider
+        .opened
         .graphs
         .as_ref()
         .filter(|_| prepared.decode_graphs)
@@ -679,34 +583,6 @@ mod tests {
     use super::*;
     use turbine_model::families::{Llama, Olmoe};
     use turbine_model::tools::LLAMA3_JSON;
-
-    #[test]
-    fn paged_attention_fallback_only_off_ck_on_hip() {
-        let sel = |op, implementation: &str| Selection {
-            op,
-            config: String::new(),
-            provider: ProviderId("hip"),
-            implementation: implementation.to_string(),
-            reason: String::new(),
-        };
-        let on_ck = [
-            sel(OpKind::Gemm, "hipblaslt"),
-            sel(OpKind::AttentionPrefillPaged, "ck_tile_fmha_pagedkv"),
-            sel(OpKind::AttentionDecodePaged, "ck_tile_fmha_pagedkv"),
-        ];
-        assert_eq!(paged_attention_fallback("hip", &on_ck), None);
-        let fallback = [
-            sel(OpKind::Gemm, "hipblaslt"),
-            sel(OpKind::AttentionPrefillPaged, "turbine_hip"),
-            sel(OpKind::AttentionDecodePaged, "turbine_hip"),
-        ];
-        assert_eq!(
-            paged_attention_fallback("hip", &fallback).as_deref(),
-            Some("turbine_hip")
-        );
-        let cpu = [sel(OpKind::AttentionPrefillPaged, "cpu_reference")];
-        assert_eq!(paged_attention_fallback("cpu", &cpu), None);
-    }
 
     #[test]
     fn card_profile_auto_follows_the_device() {

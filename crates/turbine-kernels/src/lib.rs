@@ -6,9 +6,11 @@ use std::path::PathBuf;
 
 use turbine_tensor::MemoryError;
 
+pub mod backends;
 pub mod cpu;
 pub(crate) mod ffi;
 pub mod ops;
+mod registries;
 pub mod registry;
 pub mod shim;
 pub mod test_support;
@@ -33,14 +35,6 @@ pub use shim::{
 /// The kernel C ABI version this crate speaks; must equal `turbine_abi_version()` of the loaded
 /// shim library and `TURBINE_ABI_VERSION` in the header exactly (contract §9.1).
 pub const TURBINE_KERNELS_ABI_VERSION: u32 = 2;
-
-/// Device error names after which the context is corrupted and every later call fails
-/// (P3 "sticky" errors). Device messages start with the runtime's own error name (contract §9.2).
-const STICKY_DEVICE_ERRORS: &[&str] = &[
-    "hipErrorIllegalAddress",
-    "hipErrorLaunchFailure",
-    "hipErrorAssert",
-];
 
 /// Every failure of a kernel provider, the shim library or kernel selection (contract §7.1).
 /// Codes −1…−5 of the C ABI map to the first five variants.
@@ -74,10 +68,10 @@ pub enum KernelError {
 
 impl KernelError {
     /// A device error that leaves the context unusable (illegal address, launch failure, device
-    /// assert).
+    /// assert): its message starts with a sticky error name of a registered backend
+    /// ([`backends::ExecutionBackend::sticky_error_prefixes`]).
     pub fn is_sticky(&self) -> bool {
-        matches!(self, KernelError::Device { message }
-            if STICKY_DEVICE_ERRORS.iter().any(|name| message.starts_with(name)))
+        matches!(self, KernelError::Device { message } if backends::is_sticky_message(message))
     }
 
     pub fn is_oom(&self) -> bool {

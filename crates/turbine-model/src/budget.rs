@@ -2,8 +2,6 @@
 //! workspace + `reliability.emergency_vram_reserve` must fit in the available memory, checked
 //! before any weight byte is read. Pure functions: nothing here touches weight files or devices;
 //! the caller supplies the device's free memory and, on unified devices, host `MemAvailable`.
-use std::path::Path;
-
 use turbine_core::types::MemoryKind;
 
 use crate::ModelError;
@@ -68,18 +66,8 @@ pub fn check_budget(terms: &BudgetTerms) -> Result<(), ModelError> {
     )))
 }
 
-/// Host `MemAvailable` in bytes from a `/proc/meminfo`-format file (`MemAvailable: <n> kB`);
-/// `None` when the file or the line is missing or malformed.
-pub fn host_mem_available(meminfo_path: &Path) -> Option<u64> {
-    let text = std::fs::read_to_string(meminfo_path).ok()?;
-    let line = text.lines().find_map(|l| l.strip_prefix("MemAvailable:"))?;
-    let mut parts = line.split_whitespace();
-    let kib: u64 = parts.next()?.parse().ok()?;
-    match parts.next() {
-        Some("kB") => kib.checked_mul(1024),
-        _ => None,
-    }
-}
+/// Host `MemAvailable` (moved to `turbine_device` in Phase 2m Task 4, re-exported here).
+pub use turbine_device::host_mem_available;
 
 #[cfg(test)]
 mod tests {

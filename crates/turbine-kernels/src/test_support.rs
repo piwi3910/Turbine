@@ -5,10 +5,68 @@
 //! if !turbine_kernels::test_support::require_backend("hip") { return; }
 //! let dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MODEL_DIR");
 //! ```
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use turbine_core::types::DeviceId;
+
+use crate::backends::{self, BackendRequest, OpenedBackend};
+use crate::{KernelError, ShimContext};
 
 /// The variable naming the backend a lab run tests (`hip` or `cuda`).
 const BACKEND_VAR: &str = "TURBINE_TEST_BACKEND";
+
+/// Opens the registered execution backend `name` on the first discovered device of its vendor
+/// (device 0 when there is none), with the kernel library `TURBINE_KERNEL_LIBRARY` names (else
+/// the backend's own search order). Panics when the backend is not registered or cannot open.
+pub fn open_backend(name: &str) -> OpenedBackend {
+    let backend = backends::registry()
+        .get(name)
+        .unwrap_or_else(|| panic!("{}", backends::registry().unknown(name)));
+    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
+        .expect("device discovery");
+    let device = inventory
+        .devices
+        .iter()
+        .find(|d| d.vendor.as_str() == backend.vendor())
+        .map_or(DeviceId(0), |d| d.index);
+    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    backend
+        .open(&BackendRequest {
+            device,
+            kernel_library: library.as_deref(),
+            inventory: &inventory,
+            meminfo: Path::new("/proc/meminfo"),
+        })
+        .unwrap_or_else(|e| panic!("open execution backend {name}: {e}"))
+}
+
+/// The kernel-library context of [`open_backend`]`(name)`; panics on a backend without one.
+pub fn open_context(name: &str) -> Arc<ShimContext> {
+    open_backend(name)
+        .context
+        .unwrap_or_else(|| panic!("execution backend {name} has no kernel-library context"))
+}
+
+/// A device error a registered backend classifies as sticky (the context is corrupted).
+pub fn sticky_device_error(detail: &str) -> KernelError {
+    let name = backends::registry()
+        .iter()
+        .find_map(|b| b.sticky_error_prefixes().first())
+        .expect("a registered backend with sticky device errors");
+    KernelError::Device {
+        message: format!("{name}: {detail}"),
+    }
+}
+
+/// A device error no registered backend classifies as sticky.
+pub fn plain_device_error(detail: &str) -> KernelError {
+    KernelError::Device {
+        message: format!("device error: {detail}"),
+    }
+}
 
 /// `TURBINE_TEST_BACKEND` equal to `backend` → true; a different value → prints
 /// `SKIP backend=<value>` and returns false; unset → panics naming the variable (a lab run must

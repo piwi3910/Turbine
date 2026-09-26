@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use half::bf16;
-use turbine_core::types::{BlockId, DeviceId, KvLayout, SeqId, Vendor};
+use turbine_core::types::{BlockId, DeviceId, KvLayout, SeqId};
 use turbine_kernels::torch_topk;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -1906,19 +1906,7 @@ const HIP_MAX_ABS_LOGIT_DIFF: f32 = 1e-4;
 
 /// A context on the first AMD device through the library `TURBINE_KERNEL_LIBRARY` names.
 fn hip_context() -> Arc<ShimContext> {
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    lib.create_context(device).expect("HIP context")
+    turbine_kernels::test_support::open_context("hip")
 }
 
 /// Decode graphs on `ctx` for an executor of up to `max_seqs` sequences.
@@ -2232,19 +2220,7 @@ fn hip_trace_vs_cpu() {
     if !turbine_kernels::test_support::require_backend("hip") {
         return;
     }
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
 
     let tmp = TempDir::new("tiny-model-hip-trace");
     let spec = write_gpu_tiny(tmp.path());
@@ -2376,20 +2352,11 @@ fn hip_reduced_rows_match_full_rows() {
     if !turbine_kernels::test_support::require_backend("hip") {
         return;
     }
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
-        .expect("load the HIP kernel library");
-    assert!(lib.abi_minor() >= 1, "logits_reduce needs kernel ABI v2.1");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+    assert!(
+        ctx.library().abi_minor() >= 1,
+        "logits_reduce needs kernel ABI v2.1"
+    );
     let tmp = TempDir::new("tiny-model-hip-reduced-rows");
     let spec = write_gpu_tiny(tmp.path());
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
@@ -2549,20 +2516,11 @@ fn hip_launch_ahead_feeds_match_serial() {
     if !turbine_kernels::test_support::require_backend("hip") {
         return;
     }
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
-        .expect("load the HIP kernel library");
-    assert!(lib.abi_minor() >= 3, "host staging needs kernel ABI v2.3");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+    assert!(
+        ctx.library().abi_minor() >= 3,
+        "host staging needs kernel ABI v2.3"
+    );
     let tmp = TempDir::new("tiny-model-hip-launch-ahead");
     let spec = write_gpu_tiny(tmp.path());
     let mem: Arc<dyn DeviceMemory> = ctx.clone();

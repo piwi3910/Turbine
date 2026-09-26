@@ -25,7 +25,7 @@ use turbine_core::request::{
     CancelFlag, Endpoint, FinishReason, GenerationEvent, GenerationRequest, SamplingParams,
     StopConditions,
 };
-use turbine_core::types::{RequestId, Vendor};
+use turbine_core::types::RequestId;
 use turbine_kernels::{
     KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider, shim_provider,
 };
@@ -710,19 +710,7 @@ fn logits_match_reference() {
         return;
     }
     let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MODEL_DIR");
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
 
     let fixture = golden_dir().join("llama-3.2-3b-instruct");
     let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
@@ -754,19 +742,7 @@ fn olmoe_logits_match_reference() {
         return;
     }
     let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MOE_MODEL_DIR");
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
 
     let fixture = golden_dir().join("olmoe-1b-7b-0125-instruct");
     let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
@@ -813,19 +789,7 @@ fn hip_trace_vs_cpu_3b() {
         return;
     }
     let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MODEL_DIR");
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
 
     let fixture = golden_dir().join("llama-3.2-3b-instruct");
     let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
@@ -1009,19 +973,7 @@ fn olmoe_teacher_forced_vs_reference() {
     }
     let _gpu = gpu_model_lock();
     let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MOE_MODEL_DIR");
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), "hip")
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
 
     let fixture = golden_dir().join("olmoe-1b-7b-0125-instruct");
     let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
