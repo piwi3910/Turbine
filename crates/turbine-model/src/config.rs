@@ -412,6 +412,26 @@ fn parse_rope_scaling(
                     path: config_path.to_path_buf(),
                     detail: format!("rope_scaling: {e}"),
                 })?;
+            // The interpolated band divides by `high − low`: equal factors give NaN frequencies.
+            let valid = raw.factor > 0.0
+                && raw.low_freq_factor > 0.0
+                && raw.high_freq_factor > raw.low_freq_factor
+                && raw.original_max_position_embeddings > 0;
+            if !valid {
+                return Err(ModelError::Io {
+                    path: config_path.to_path_buf(),
+                    detail: format!(
+                        "rope_scaling: llama3 requires factor > 0, 0 < low_freq_factor < \
+                         high_freq_factor and original_max_position_embeddings > 0 (got factor \
+                         {}, low_freq_factor {}, high_freq_factor {}, \
+                         original_max_position_embeddings {})",
+                        raw.factor,
+                        raw.low_freq_factor,
+                        raw.high_freq_factor,
+                        raw.original_max_position_embeddings
+                    ),
+                });
+            }
             Ok(Some(RopeScaling::Llama3 {
                 factor: raw.factor,
                 low_freq_factor: raw.low_freq_factor,
@@ -604,6 +624,43 @@ mod tests {
         let llama = load_model_config(&fixture_dir()).unwrap();
         assert_eq!(llama.moe, None);
         assert!(!llama.qk_norm);
+    }
+
+    #[test]
+    fn rejects_degenerate_llama3_rope_scaling() {
+        let detail = |dir: &Path| match load_model_config(dir).unwrap_err() {
+            ModelError::Io { detail, .. } => detail,
+            other => panic!("expected Io, got {other:?}"),
+        };
+        // Equal band factors would divide by zero in the interpolated band (a NaN frequency);
+        // inverted ones, a zero factor or a zero original length make no valid band either.
+        for (name, key, value) in [
+            (
+                "rope-equal-bands",
+                "high_freq_factor",
+                serde_json::json!(1.0),
+            ),
+            (
+                "rope-inverted-bands",
+                "high_freq_factor",
+                serde_json::json!(0.5),
+            ),
+            ("rope-zero-low", "low_freq_factor", serde_json::json!(0.0)),
+            ("rope-zero-factor", "factor", serde_json::json!(0.0)),
+            (
+                "rope-zero-original",
+                "original_max_position_embeddings",
+                serde_json::json!(0),
+            ),
+        ] {
+            let dir = edited_config(name, |v| v["rope_scaling"][key] = value.clone());
+            let detail = detail(&dir);
+            assert!(
+                detail.starts_with("rope_scaling: llama3 requires factor > 0, 0 < low_freq_factor < high_freq_factor and original_max_position_embeddings > 0"),
+                "{name}: {detail}"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
