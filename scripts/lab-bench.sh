@@ -73,7 +73,7 @@ url=http://192.168.10.203:18000
 
 # 1. build (server + kernels) and tests in parallel on novanas
 (
-	scripts/remote-cargo.sh build -q --release -p turbine-server &&
+	scripts/remote-cargo.sh build -q --release -p turbine-server -p turbine-bench &&
 		ssh -o BatchMode=yes "$host" "cd '$remote/src' && flock -s /home/piwi/turbine-ci/bench.lock \
       cmake -S kernels/rocm -B '$remote/kbuild' -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 >/dev/null &&
@@ -121,11 +121,13 @@ fi
 
 # 3. measure under the exclusive lock
 bench_bin="$root/target/release/turbine-bench"
-golden_bin="$root/target/release/turbine-golden"
+# The golden check runs on the build host with the freshly built Linux binary (current rules);
+# the throughput client stays on the workstation so rows stay comparable with earlier ones.
+golden="ssh -o BatchMode=yes $host cd '$remote/src' \\&\\& '$remote/target/release/turbine-golden'"
 ref="tests/golden/$slug/reference.jsonl"
 scripts/bench-lock.sh sh -c "
-  '$golden_bin' compare --url $url --reference $ref --concurrency 1 > '$out/golden1.txt' 2>&1
-  '$golden_bin' compare --url $url --reference $ref --concurrency 16 > '$out/golden16.txt' 2>&1
+  $golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 1 > '$out/golden1.txt' 2>&1
+  $golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 16 > '$out/golden16.txt' 2>&1
   '$bench_bin' --url $url --concurrency 16 --requests 200 --prompt-words 512 --max-tokens 256 \
     --ignore-eos --output json > '$out/bench.json' 2> '$out/bench.err'
 " 2>/dev/null
