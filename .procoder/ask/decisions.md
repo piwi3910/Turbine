@@ -296,3 +296,14 @@
 - Merge locally only, no push yet
 
 **Answer (2026-09-26):** merge and push — fast-forward main to phase-1-single-request and push main to origin.
+
+## Phase 2 lab work on novanas (standing approval), OLMoE weights, vLLM-ROCm baseline
+
+- Standing approval for Phase 2 novanas lab Jobs (HIP v2 build, GPU tests, serve Jobs, golden --concurrency 16, baseline, overload), same rules as Phase 1 (recommended)
+- Ask before each run
+- Download OLMoE-1B-7B-0125-Instruct to novanas with the user's logged-in hf CLI and build the OLMoE golden reference there on CPU (recommended)
+- The user downloads it
+- Record a vLLM-ROCm baseline Job on one R9700 alongside Turbine (recommended)
+- Turbine baseline only
+
+**Answers (2026-09-26):** standing approval for Phase 2 novanas lab Jobs while its R9700s are free (stop and ask if another workload holds `amd.com/gpu`; always `--stop` serve Jobs); Claude downloads `allenai/OLMoE-1B-7B-0125-Instruct` at revision `b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e` (ungated) into `/home/piwi/turbine-models/olmoe-1b-7b-0125-instruct` with the hf CLI the user logged in on novanas (the token is never read or passed); the vLLM-ROCm baseline Job runs.
