@@ -365,3 +365,10 @@
 - Go straight to a spec for a new phase
 
 **Answer (2026-09-26):** write a procoder analysis brief first (options, risks, proposed phase placement); decide placement before any spec.
+
+## Multi-model runtime: placement and first experiment
+
+- Option A, staged, with a control-plane process supervising one worker process per GPU: new Phase 3b (after Phase 3) for the /turbine/v1/models API, fit check, placement, several models per GPU with per-model KV pools and quotas, and a fair-share GPU scheduler; shared KV arena and weight tiering in Phase 4; CU-mask fractional compute and multi-model packing in Phase 5; cluster placement in Phase 6 (recommended)
+- Option B: one new phase after Phase 8
+- Option C: keep one model per process, orchestrate processes via a control plane only
+- First experiment: two turbine-server processes sharing one R9700 (needs lab approval beyond Phase 2c)
