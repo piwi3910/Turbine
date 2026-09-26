@@ -10,6 +10,7 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 |---|---|---|---|---|---|---|---|---|
 | 2026-09-26 | vLLM-ROCm 0.23.0 | reference | 738.0 | 17.0 | 338 | – | – | – |
 | 2026-09-26 | 7850162 | Phase 2 engine baseline (16-token pages) | 92.2 | 164 | 1528 | 47 | 16/16 | – |
+| 2026-09-26 | da01324 | Phase 2c start: all Phase 2 fixes, clean run under bench-lock (host tests 267/0) | 91.9 | 164 | 1533 | 47.4 | 16/16 | ±0 |
 
 ## OLMoE-1B-7B-0125-Instruct (BF16)
 
