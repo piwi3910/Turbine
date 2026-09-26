@@ -5,11 +5,14 @@
 pub mod admission;
 pub mod budget;
 pub mod circuit;
+pub mod controller;
+pub mod document;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
 pub mod horizon;
 pub mod ledger;
 pub mod metrics;
+pub mod recovery;
 pub mod reserve;
 pub mod signals;
 pub mod state;
