@@ -263,12 +263,16 @@ wait_for_pod() {
 		phase="$(kube "-n ${NS} get pods -l job-name=${JOB} -o jsonpath='{.items[*].status.phase}'" || true)"
 		[[ "$phase" == Running ]] && return 0
 		if [[ "$phase" == Succeeded || "$phase" == Failed ]]; then
+			# The reason is read from the Job's log, so before the Job is deleted.
+			local reason
 			if [[ "$MODE" == vllm ]]; then
-				fail "job ${JOB} ended (${phase}) before serving: $(ended_reason)"
+				reason="$(ended_reason)"
+				cleanup
+				fail "job ${JOB} ended (${phase}) before serving: ${reason}; job deleted"
 			fi
-			local step
-			step="$(failed_step)"
-			fail "job ${JOB} ended (${phase}) before turbine-server started${step:+; failed step: ${step}}"
+			reason="$(failed_step)"
+			cleanup
+			fail "job ${JOB} ended (${phase}) before turbine-server started${reason:+; failed step: ${reason}}; job deleted"
 		fi
 		if [[ "$MODE" == vllm && $waited -ge 300 ]]; then
 			# An image that cannot be pulled keeps the pod Pending forever.
@@ -311,7 +315,8 @@ wait_for_ready() {
 		if [[ -n "$failed" && "$failed" != 0 ]]; then
 			stop_log_stream
 			step="$(ended_reason)"
-			fail "job ${JOB} failed at step: ${step}"
+			cleanup
+			fail "job ${JOB} failed at step: ${step}; job deleted"
 		fi
 		if [[ $waited -ge $TIMEOUT ]]; then
 			stop_log_stream
