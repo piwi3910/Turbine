@@ -319,3 +319,10 @@
 - GPU sampling (`execution.device_sampling`) on by default (recommended) / host sampling only
 
 **Answers (2026-09-26):** standing approval for Phase 2c novanas lab Jobs (builds, GPU tests, serve Jobs, Turbine and vLLM benchmark runs; stop and ask if another workload holds `amd.com/gpu`; always stop serve Jobs); GEMM autotune on by default (outputs may differ across restarts at BF16 noise level, within golden tolerance; `false` restores restart-stable output); GPU sampling on by default (seeded sampling reproducible run to run, may differ from host sampling at rare probability boundaries; greedy/golden unaffected).
+
+## Default KV page size (kv.block_tokens): 16 or 128?
+
+- 128 tokens: both paged-attention paths run on Composable Kernel (`fmha_fwd_pagedkv`); measured decode forward at batch 16 ~33 ms → ~17 ms on the R9700; golden 16/16, tiny hip_matches_cpu 3.8e-6 (recommended)
+- Keep 16 and tune the Turbine paged kernel (no vendor kernel accepts pages < 128 on gfx1201: CK `fmha_batch_prefill` builds for gfx9 only; pagedkv/splitkv/appendkv need 128-aligned pages)
+
+**Answer (2026-09-26):** 128 tokens — reuse CK. The Turbine 16-token kernel stays only as the fallback for other page sizes. Applied in Phase 2c (after Phase 2 closes). Trade-offs accepted: ~64 tokens of KV wasted per sequence on average, prefix sharing (Phase 4) in 128-token units, larger `copy_blocks` forks.
