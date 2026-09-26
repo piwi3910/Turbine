@@ -19,7 +19,6 @@ use turbine_kernels::KernelError;
 use turbine_tensor::{DeviceMemory, Tensor};
 
 use crate::ModelError;
-use crate::config::{Architecture, ModelArchConfig};
 use crate::safetensors::{SafetensorsIndex, TensorEntry, io_err, open_regular};
 use crate::weights::{Bf16, WeightFormat};
 
@@ -52,20 +51,21 @@ pub struct StackPlace {
 }
 
 /// The fused `[q_dim + 2·kv_dim, hidden]` Q/K/V projection of layer `layer` (rows Q, then K,
-/// then V), as [`llama_slots`] and [`olmoe_slots`] load it.
+/// then V), as [`crate::families::llama_slots`] and
+/// [`crate::families::olmoe_slots`] load it.
 pub fn qkv_proj_name(layer: u32) -> String {
     format!("model.layers.{layer}.self_attn.qkv_proj.weight")
 }
 
 /// The fused `[2·intermediate, hidden]` gate/up projection of Llama layer `layer` (gate rows,
-/// then up rows), as [`llama_slots`] loads it.
+/// then up rows), as [`crate::families::llama_slots`] loads it.
 pub fn gate_up_proj_name(layer: u32) -> String {
     format!("model.layers.{layer}.mlp.gate_up_proj.weight")
 }
 
 /// Slots for the `[rows, cols]` checkpoint tensors `parts` concatenated along their rows, in
 /// order, into the stacked parameter `stack` of `[Σ rows, cols]`.
-fn row_concat(stack: String, parts: &[(String, usize)], cols: usize) -> Vec<WeightSlot> {
+pub(crate) fn row_concat(stack: String, parts: &[(String, usize)], cols: usize) -> Vec<WeightSlot> {
     let total: usize = parts.iter().map(|(_, rows)| rows).sum();
     let mut offset = 0;
     parts
@@ -87,7 +87,7 @@ fn row_concat(stack: String, parts: &[(String, usize)], cols: usize) -> Vec<Weig
 }
 
 /// Layer `i`'s Q, K and V projections as rows of its fused [`qkv_proj_name`] parameter.
-fn qkv_slots(i: u32, q: usize, kv: usize, hidden: usize) -> Vec<WeightSlot> {
+pub(crate) fn qkv_slots(i: u32, q: usize, kv: usize, hidden: usize) -> Vec<WeightSlot> {
     let p = format!("model.layers.{i}.self_attn");
     row_concat(
         qkv_proj_name(i),
@@ -101,129 +101,9 @@ fn qkv_slots(i: u32, q: usize, kv: usize, hidden: usize) -> Vec<WeightSlot> {
 }
 
 /// The stacked `[experts, rows, cols]` parameter of layer `layer`'s expert projection `proj`
-/// (`gate_proj`, `up_proj`, `down_proj`), as [`olmoe_slots`] loads it.
+/// (`gate_proj`, `up_proj`, `down_proj`), as [`crate::families::olmoe_slots`] loads it.
 pub fn stacked_experts_name(layer: u32, proj: &str) -> String {
     format!("model.layers.{layer}.mlp.experts.{proj}.weight")
-}
-
-/// Every parameter slot of a Llama model, in load order: embedding, per layer the attention
-/// and MLP weights with their norms, the final norm, and `lm_head.weight` only when untied.
-/// Q/K/V land as rows of the layer's fused [`qkv_proj_name`] parameter and gate/up as rows of
-/// its [`gate_up_proj_name`] parameter, so the executor runs one GEMM for each (or one per
-/// projection over row views of the same memory).
-pub fn llama_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
-    let hidden = cfg.hidden as usize;
-    let q = cfg.num_attention_heads as usize * cfg.head_dim as usize;
-    let kv = cfg.num_kv_heads as usize * cfg.head_dim as usize;
-    let inter = cfg.intermediate as usize;
-    let vocab = cfg.vocab_size as usize;
-    let slot = |name: String, shape: Vec<usize>| WeightSlot {
-        name,
-        shape,
-        stack: None,
-    };
-
-    let mut slots = vec![slot(
-        "model.embed_tokens.weight".into(),
-        vec![vocab, hidden],
-    )];
-    for i in 0..cfg.num_layers {
-        let p = format!("model.layers.{i}");
-        slots.push(slot(format!("{p}.input_layernorm.weight"), vec![hidden]));
-        slots.extend(qkv_slots(i, q, kv, hidden));
-        slots.extend([
-            slot(format!("{p}.self_attn.o_proj.weight"), vec![hidden, q]),
-            slot(format!("{p}.post_attention_layernorm.weight"), vec![hidden]),
-        ]);
-        slots.extend(row_concat(
-            gate_up_proj_name(i),
-            &[
-                (format!("{p}.mlp.gate_proj.weight"), inter),
-                (format!("{p}.mlp.up_proj.weight"), inter),
-            ],
-            hidden,
-        ));
-        slots.push(slot(
-            format!("{p}.mlp.down_proj.weight"),
-            vec![hidden, inter],
-        ));
-    }
-    slots.push(slot("model.norm.weight".into(), vec![hidden]));
-    if !cfg.tie_word_embeddings {
-        slots.push(slot(LM_HEAD.into(), vec![vocab, hidden]));
-    }
-    slots
-}
-
-/// Every parameter slot of an OLMoE model, in load order: embedding, per layer the attention
-/// weights (Q/K/V as rows of the fused [`qkv_proj_name`] parameter) with the Q/K norms (over the
-/// full `heads·head_dim` and `kv_heads·head_dim` projections), the router `mlp.gate.weight` `[experts, hidden]`, every expert's SwiGLU
-/// weights, the two layer norms, then the final norm and `lm_head.weight` only when untied.
-/// Each expert projection is entry `e` of the layer's stacked `[experts, rows, cols]` parameter
-/// [`stacked_experts_name`] (the `moe_experts` layout). A dense config (`moe: None`) has no
-/// experts and yields only the non-MLP slots.
-pub fn olmoe_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
-    let hidden = cfg.hidden as usize;
-    let q = cfg.num_attention_heads as usize * cfg.head_dim as usize;
-    let kv = cfg.num_kv_heads as usize * cfg.head_dim as usize;
-    let vocab = cfg.vocab_size as usize;
-    let (experts, inter) = cfg.moe.map_or((0, 0), |m| {
-        (m.num_experts as usize, m.expert_intermediate as usize)
-    });
-    let slot = |name: String, shape: Vec<usize>| WeightSlot {
-        name,
-        shape,
-        stack: None,
-    };
-
-    let mut slots = vec![slot(
-        "model.embed_tokens.weight".into(),
-        vec![vocab, hidden],
-    )];
-    for i in 0..cfg.num_layers {
-        let p = format!("model.layers.{i}");
-        slots.push(slot(format!("{p}.input_layernorm.weight"), vec![hidden]));
-        slots.extend(qkv_slots(i, q, kv, hidden));
-        slots.extend([
-            slot(format!("{p}.self_attn.o_proj.weight"), vec![hidden, q]),
-            slot(format!("{p}.self_attn.q_norm.weight"), vec![q]),
-            slot(format!("{p}.self_attn.k_norm.weight"), vec![kv]),
-            slot(format!("{p}.post_attention_layernorm.weight"), vec![hidden]),
-            slot(format!("{p}.mlp.gate.weight"), vec![experts, hidden]),
-        ]);
-        let expert = |e: usize, proj: &str, shape: Vec<usize>| {
-            let stack = StackPlace {
-                name: stacked_experts_name(i, proj),
-                shape: [vec![experts], shape.clone()].concat(),
-                offset: e * shape.iter().product::<usize>(),
-            };
-            WeightSlot {
-                name: format!("{p}.mlp.experts.{e}.{proj}.weight"),
-                shape,
-                stack: Some(stack),
-            }
-        };
-        for e in 0..experts {
-            slots.extend([
-                expert(e, "gate_proj", vec![inter, hidden]),
-                expert(e, "up_proj", vec![inter, hidden]),
-                expert(e, "down_proj", vec![hidden, inter]),
-            ]);
-        }
-    }
-    slots.push(slot("model.norm.weight".into(), vec![hidden]));
-    if !cfg.tie_word_embeddings {
-        slots.push(slot(LM_HEAD.into(), vec![vocab, hidden]));
-    }
-    slots
-}
-
-/// The parameter slots of `cfg`'s architecture.
-pub(crate) fn weight_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
-    match cfg.architecture {
-        Architecture::Llama => llama_slots(cfg),
-        Architecture::Olmoe => olmoe_slots(cfg),
-    }
 }
 
 /// The loaded parameters by checkpoint name (a stacked parameter by its [`StackPlace`] name),
@@ -438,6 +318,7 @@ mod tests {
 
     use super::*;
     use crate::config::load_model_config;
+    use crate::families::{llama_slots, olmoe_slots};
     use crate::testing::TempDir;
     use crate::testing::tiny::{
         TinyOptions, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,

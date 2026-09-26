@@ -6,7 +6,7 @@
 mod registry_conformance {
     use std::collections::HashMap;
 
-    use turbine_core::registry::conformance;
+    use turbine_core::registry::conformance::{self, check};
     use turbine_core::request::SamplingParams;
 
     use crate::sampling::{self, ProcessorChain, ProcessorParams, ProcessorState, Touched};
@@ -79,7 +79,23 @@ mod registry_conformance {
     }
 
     #[test]
+    fn families() {
+        let reg = crate::families::registry();
+        check(reg).unwrap();
+        // Every family serves at least one HF name, and no two families claim the same one.
+        let mut seen = std::collections::HashMap::new();
+        for family in reg.iter() {
+            assert!(!family.hf_architectures().is_empty(), "{}", family.name());
+            for hf in family.hf_architectures() {
+                if let Some(other) = seen.insert(*hf, family.name()) {
+                    panic!("{hf} is claimed by {other} and {}", family.name());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn weight_formats() {
-        conformance::check(crate::weights::registry()).unwrap();
+        check(crate::weights::registry()).unwrap();
     }
 }

@@ -24,12 +24,11 @@ use turbine_model::executor::{
     self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, ModelExecutor, SeqSlice, graphs,
 };
 use turbine_model::loader::LoadedWeights;
-use turbine_model::tools::LLAMA3_JSON;
 use turbine_model::{
-    Architecture, BudgetTerms, ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES,
-    ModelArchConfig, ModelError, ModelMetrics, SafetensorsIndex, Tokenizer, WeightLoader,
-    WeightSlot, available_bytes, check_budget, host_mem_available, llama_slots,
-    load_generation_config, load_model_config, olmoe_slots,
+    BudgetTerms, ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES,
+    ModelArchConfig, ModelError, ModelFamily, ModelMetrics, SafetensorsIndex, Tokenizer,
+    WeightLoader, available_bytes, check_budget, host_mem_available, load_generation_config,
+    load_model_config,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_scheduler::SchedulerParams;
@@ -104,14 +103,15 @@ pub fn resolve_max_seq_len(configured: Option<u32>, max_positions: u32) -> Resul
 }
 
 /// `model.tool_call_parser`, as the name of a registered tool format or `None` (tool calling
-/// off): `llama3_json` for a `LlamaForCausalLM` whose chat template renders `tools` when null.
+/// off): when null, the family's default format ([`ModelFamily::default_tool_format`], e.g.
+/// `llama3_json` for `llama`) if the chat template renders `tools`.
 /// A format is only usable with a template that renders `tools`: a configured `llama3_json` on
 /// any other template resolves to none (logged), so `tools` requests get 400
 /// `tools_not_supported` instead of a prompt that silently lacks them. `none` and a name
 /// `Config::validate_modules` would have refused resolve to none.
 pub fn resolve_tool_call_parser(
     configured: Option<&str>,
-    architecture: Architecture,
+    family: &dyn ModelFamily,
     renders_tools: bool,
 ) -> Option<&'static str> {
     match configured {
@@ -125,7 +125,9 @@ pub fn resolve_tool_call_parser(
             );
             None
         }
-        None if renders_tools && architecture == Architecture::Llama => Some(LLAMA3_JSON),
+        None if renders_tools => family
+            .default_tool_format()
+            .and_then(|d| modules::TOOL_FORMATS.iter().copied().find(|f| *f == d)),
         None => None,
     }
 }
@@ -445,7 +447,7 @@ pub fn prepare(
         .map_err(|e| model_error("structured output", e))?;
     let tool_call_parser = resolve_tool_call_parser(
         config.model.tool_call_parser.as_ref().map(|n| n.as_str()),
-        arch.architecture,
+        arch.family.0,
         template.renders_tools(),
     );
     tracing::info!(
@@ -454,7 +456,7 @@ pub fn prepare(
         "structured output ready"
     );
     let modules = ModuleChoices {
-        family: arch.architecture.family_name().to_string(),
+        family: arch.family.0.name().to_string(),
         tool_format: tool_call_parser.map(str::to_string),
         weight_format: arch.weight_format.0.name().to_string(),
         backend: config.execution.backend.to_string(),
@@ -470,7 +472,7 @@ pub fn prepare(
         .unwrap_or_else(|| default_served_name(dir));
     tracing::info!(
         served_name = %served_name,
-        architecture = arch.architecture.as_str(),
+        architecture = %arch.hf_architecture,
         max_seq_len,
         weight_bytes = budget.weights,
         "model prepared"
@@ -544,19 +546,7 @@ fn kv_pool_config(
     Ok(pool)
 }
 
-/// The weights `arch`'s executor takes.
-fn weight_slots(arch: &ModelArchConfig) -> Result<Vec<WeightSlot>, StartupError> {
-    match arch.architecture {
-        Architecture::Llama => Ok(llama_slots(arch)),
-        Architecture::Olmoe => Ok(olmoe_slots(arch)),
-        other => Err(StartupError::new(format!(
-            "no weight layout for architecture {}",
-            other.as_str()
-        ))),
-    }
-}
-
-/// The one place the server builds a model executor: the architecture's executor for ragged
+/// The one place the server builds a model executor: the family's executor for ragged
 /// batches of up to `max_batch_tokens` tokens and `max_seqs` sequences over KV blocks of
 /// `block_tokens` tokens, running the op sequence `options` selects.
 #[allow(clippy::too_many_arguments)]
@@ -604,7 +594,7 @@ pub fn load(
     let weights = WeightLoader::load_format(
         arch.weight_format.0,
         &prepared.index,
-        &weight_slots(arch)?,
+        &arch.family.0.weight_slots(arch),
         mem,
         MAX_STAGING_BYTES,
     )
@@ -687,6 +677,8 @@ fn warm_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turbine_model::families::{Llama, Olmoe};
+    use turbine_model::tools::LLAMA3_JSON;
 
     #[test]
     fn paged_attention_fallback_only_off_ck_on_hip() {
@@ -765,31 +757,14 @@ mod tests {
     fn tool_call_parser_resolution() {
         const LLAMA: Option<&str> = Some(LLAMA3_JSON);
         const OFF: Option<&str> = None;
-        // Null: llama3_json only for a Llama whose template renders tools.
-        assert_eq!(
-            resolve_tool_call_parser(None, Architecture::Llama, true),
-            LLAMA
-        );
-        assert_eq!(
-            resolve_tool_call_parser(None, Architecture::Llama, false),
-            OFF
-        );
-        assert_eq!(
-            resolve_tool_call_parser(None, Architecture::Olmoe, true),
-            OFF
-        );
+        // Null: the family default (llama3_json for llama, none for olmoe) when the template
+        // renders tools.
+        assert_eq!(resolve_tool_call_parser(None, &Llama, true), LLAMA);
+        assert_eq!(resolve_tool_call_parser(None, &Llama, false), OFF);
+        assert_eq!(resolve_tool_call_parser(None, &Olmoe, true), OFF);
         // Explicit values; a parser needs a template that renders tools.
-        assert_eq!(
-            resolve_tool_call_parser(LLAMA, Architecture::Olmoe, true),
-            LLAMA
-        );
-        assert_eq!(
-            resolve_tool_call_parser(LLAMA, Architecture::Llama, false),
-            OFF
-        );
-        assert_eq!(
-            resolve_tool_call_parser(Some("none"), Architecture::Llama, true),
-            OFF
-        );
+        assert_eq!(resolve_tool_call_parser(LLAMA, &Olmoe, true), LLAMA);
+        assert_eq!(resolve_tool_call_parser(LLAMA, &Llama, false), OFF);
+        assert_eq!(resolve_tool_call_parser(Some("none"), &Llama, true), OFF);
     }
 }

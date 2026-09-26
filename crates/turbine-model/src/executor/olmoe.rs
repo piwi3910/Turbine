@@ -71,7 +71,7 @@ use super::{
     feed_runs, rope,
 };
 use crate::ModelError;
-use crate::config::{Architecture, ModelArchConfig, MoeConfig};
+use crate::config::{ModelArchConfig, MoeConfig};
 use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name, stacked_experts_name};
 
 const I32: usize = 4;
@@ -163,12 +163,12 @@ fn experts_cfg(cfg: &ModelArchConfig, moe: &MoeConfig) -> MoeExpertsConfig {
 
 /// The MoE settings of an OLMoE config, or why it is not one.
 fn moe_of(cfg: &ModelArchConfig) -> Result<MoeConfig, ModelError> {
-    match (cfg.architecture, cfg.moe) {
-        (Architecture::Olmoe, Some(moe)) if cfg.qk_norm => Ok(moe),
+    match cfg.moe {
+        Some(moe) if cfg.qk_norm => Ok(moe),
         _ => Err(invalid(format!(
-            "the OLMoE executor needs an OlmoeForCausalLM config with experts and Q/K norm, got \
-             {} (experts: {}, qk_norm: {})",
-            cfg.architecture.as_str(),
+            "the OLMoE executor needs a config with experts and Q/K norm, got {} (experts: {}, \
+             qk_norm: {})",
+            cfg.hf_architecture,
             cfg.moe.is_some(),
             cfg.qk_norm
         ))),

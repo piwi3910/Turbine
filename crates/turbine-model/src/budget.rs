@@ -91,7 +91,8 @@ mod tests {
 
     use super::*;
     use crate::ModelError;
-    use crate::loader::{WeightLoader, llama_slots};
+    use crate::families::llama_slots;
+    use crate::loader::WeightLoader;
     use crate::safetensors::SafetensorsIndex;
     use crate::testing::TempDir;
     use crate::testing::tiny::write_tiny_llama;

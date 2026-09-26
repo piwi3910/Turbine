@@ -1,6 +1,7 @@
-//! Hugging Face `config.json` / `generation_config.json` parsing and the Phase 1 allowlist
-//! (P1 S-3): architecture `LlamaForCausalLM`, BF16, no `quantization_config`. Anything else is
-//! refused with the offending field named and the supported set listed.
+//! Hugging Face `config.json` / `generation_config.json` parsing and the allowlist (P1 S-3):
+//! `architectures[0]` must name a registered model family (`crate::families::resolve`, Phase 2m
+//! S-2), whose own keys it parses; the keys every decoder shares are parsed here. Anything else
+//! is refused with the offending field named and the supported set listed.
 //!
 //! The weight-format part of the allowlist is the checkpoint's [`crate::weights::WeightFormat`] (Phase 2m S-10,
 //! `crate::weights`): `detect` picks it from `config.json`, and
@@ -14,52 +15,9 @@ use smallvec::SmallVec;
 use turbine_core::types::{KvLayout, ModelShape};
 
 use crate::ModelError;
-use crate::loader::weight_slots;
+use crate::families::{FamilyRef, resolve};
 use crate::safetensors::SafetensorsIndex;
 use crate::weights::{WeightFormatRef, detect};
-
-/// Model architectures this build can execute (`config.json` `architectures[0]`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[non_exhaustive]
-pub enum Architecture {
-    Llama,
-    /// Mixture of experts with RMSNorm over the full Q and K projections (P2 S-16).
-    Olmoe,
-}
-
-impl Architecture {
-    /// Every supported architecture, in the order error messages list them.
-    pub const ALL: &'static [Architecture] = &[Architecture::Llama, Architecture::Olmoe];
-
-    /// The Hugging Face class name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Architecture::Llama => "LlamaForCausalLM",
-            Architecture::Olmoe => "OlmoeForCausalLM",
-        }
-    }
-
-    /// The `model_family` module name (`/turbine/v1/status` `modules.family`). Phase 2m Task 6
-    /// replaces this enum with the family registry.
-    pub fn family_name(self) -> &'static str {
-        match self {
-            Architecture::Llama => "llama",
-            Architecture::Olmoe => "olmoe",
-        }
-    }
-
-    pub fn from_hf_name(name: &str) -> Option<Architecture> {
-        Architecture::ALL
-            .iter()
-            .copied()
-            .find(|a| a.as_str() == name)
-    }
-
-    fn supported_list() -> String {
-        let names: Vec<&str> = Architecture::ALL.iter().map(|a| a.as_str()).collect();
-        names.join(", ")
-    }
-}
 
 /// `config.json` `rope_scaling` (absent or `rope_type: default` → `None`).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -76,7 +34,10 @@ pub enum RopeScaling {
 /// The architecture description of a checkpoint, as far as Turbine uses it.
 #[derive(Clone, PartialEq, Debug)]
 pub struct ModelArchConfig {
-    pub architecture: Architecture,
+    /// The model family `config.json` `architectures[0]` resolved to.
+    pub family: FamilyRef,
+    /// `architectures[0]` as `config.json` spells it (one of the family's HF names).
+    pub hf_architecture: String,
     pub num_layers: u32,
     pub hidden: u32,
     pub num_attention_heads: u32,
@@ -128,7 +89,7 @@ impl ModelArchConfig {
     /// weight format) of every parameter the executor loads (no `lm_head` when tied).
     pub fn shape(&self) -> ModelShape {
         ModelShape {
-            architecture: self.architecture.as_str().to_string(),
+            architecture: self.hf_architecture.clone(),
             num_layers: self.num_layers,
             hidden: self.hidden,
             num_attention_heads: self.num_attention_heads,
@@ -160,7 +121,7 @@ impl ModelArchConfig {
     /// stored in the weight format (BF16: `unsupported tensor dtype = F8_E4M3 (<tensor>);
     /// supported: BF16` otherwise). Missing tensors are the loader's to report.
     pub fn check_supported_weights(&self, index: &SafetensorsIndex) -> Result<(), ModelError> {
-        for slot in &weight_slots(self) {
+        for slot in &self.family.0.weight_slots(self) {
             if let Some(entry) = index.get(&slot.name) {
                 self.weight_format.0.check_tensor(entry)?;
             }
@@ -170,7 +131,9 @@ impl ModelArchConfig {
 
     /// Parameters of every slot the executor loads, so the count cannot drift from the loader.
     fn param_count(&self) -> u64 {
-        weight_slots(self)
+        self.family
+            .0
+            .weight_slots(self)
             .iter()
             .map(|s| s.shape.iter().map(|&d| d as u64).product::<u64>())
             .sum()
@@ -197,8 +160,6 @@ impl TokenIds {
 /// The subset of `config.json` Turbine reads; other keys are ignored (HF configs carry many).
 #[derive(Deserialize)]
 struct RawConfig {
-    #[serde(default)]
-    architectures: Option<Vec<String>>,
     num_hidden_layers: u32,
     hidden_size: u32,
     num_attention_heads: u32,
@@ -218,16 +179,6 @@ struct RawConfig {
     max_position_embeddings: u32,
     #[serde(default)]
     eos_token_id: Option<TokenIds>,
-    /// Mixture-of-experts keys (OLMoE); `intermediate_size` is then each expert's width.
-    #[serde(default)]
-    num_experts: Option<u32>,
-    #[serde(default)]
-    num_experts_per_tok: Option<u32>,
-    #[serde(default)]
-    norm_topk_prob: Option<bool>,
-    /// OLMoE clamps Q/K/V to ±`clip_qkv` when set; no executor implements that.
-    #[serde(default)]
-    clip_qkv: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -282,30 +233,21 @@ pub fn load_generation_config(dir: &Path) -> Result<GenerationConfig, ModelError
 }
 
 /// Parses `config.json` (and `generation_config.json` for EOS ids) in `dir` and applies the
-/// architecture and weight-format allowlist.
+/// model-family and weight-format allowlist.
 pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
     let config_path = dir.join("config.json");
-    let raw: RawConfig = read_json(&config_path)?;
     let top: serde_json::Value = read_json(&config_path)?;
     let invalid = |detail: String| ModelError::Io {
         path: config_path.clone(),
         detail,
     };
 
-    let architectures = raw.architectures.unwrap_or_default();
-    let architecture = match architectures.as_slice() {
-        [one] => Architecture::from_hf_name(one),
-        _ => None,
-    }
-    .ok_or_else(|| {
-        let value = if architectures.is_empty() {
-            "<missing>".to_string()
-        } else {
-            architectures.join(", ")
-        };
-        unsupported("architectures", value, &Architecture::supported_list())
-    })?;
-
+    let (family, text) = resolve(&top)?;
+    let hf_architecture = text["architectures"][0]
+        .as_str()
+        .expect("resolve matched a string")
+        .to_string();
+    let raw = RawConfig::deserialize(text).map_err(|e| invalid(format!("invalid JSON: {e}")))?;
     let weight_format = WeightFormatRef(detect(&top)?);
 
     let heads = raw.num_attention_heads;
@@ -346,38 +288,18 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
         )));
     }
 
-    let (moe, qk_norm) = match architecture {
-        Architecture::Llama => (None, false),
-        Architecture::Olmoe => {
-            if let Some(clip) = raw.clip_qkv.as_ref().filter(|c| !c.is_null()) {
-                return Err(unsupported("clip_qkv", clip.to_string(), "null"));
-            }
-            let required = |name: &str, value: Option<u32>| {
-                value.ok_or_else(|| invalid(format!("{} requires {name}", architecture.as_str())))
-            };
-            let num_experts = required("num_experts", raw.num_experts)?;
-            let experts_per_token = required("num_experts_per_tok", raw.num_experts_per_tok)?;
-            if experts_per_token == 0 || experts_per_token > num_experts {
-                return Err(invalid(format!(
-                    "num_experts_per_tok {experts_per_token} must be between 1 and num_experts \
-                     {num_experts}"
-                )));
-            }
-            let moe = MoeConfig {
-                num_experts,
-                experts_per_token,
-                expert_intermediate: raw.intermediate_size,
-                norm_topk_prob: raw.norm_topk_prob.unwrap_or(false),
-            };
-            (Some(moe), true)
-        }
-    };
+    // The family's own keys; a malformed value names this file.
+    let family_cfg = family.parse_config(text).map_err(|e| match e {
+        ModelError::Io { detail, .. } => invalid(detail),
+        other => other,
+    })?;
 
     let rope_scaling = parse_rope_scaling(raw.rope_scaling, &config_path)?;
     let eos_token_ids = load_eos(dir, raw.eos_token_id, &config_path)?;
 
     Ok(ModelArchConfig {
-        architecture,
+        family: FamilyRef(family),
+        hf_architecture,
         num_layers: raw.num_hidden_layers,
         hidden: raw.hidden_size,
         num_attention_heads: heads,
@@ -391,8 +313,8 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
         vocab_size: raw.vocab_size,
         max_position_embeddings: raw.max_position_embeddings,
         eos_token_ids,
-        moe,
-        qk_norm,
+        moe: family_cfg.moe,
+        qk_norm: family_cfg.qk_norm,
         weight_format,
     })
 }
@@ -533,8 +455,8 @@ mod tests {
     #[test]
     fn parses_target_config() {
         let cfg = load_model_config(&fixture_dir()).unwrap();
-        assert_eq!(cfg.architecture, Architecture::Llama);
-        assert_eq!(cfg.architecture.as_str(), "LlamaForCausalLM");
+        assert_eq!(cfg.family.0.name(), "llama");
+        assert_eq!(cfg.hf_architecture, "LlamaForCausalLM");
         assert_eq!(cfg.num_layers, 28);
         assert_eq!(cfg.hidden, 3072);
         assert_eq!(cfg.num_attention_heads, 24);
@@ -592,8 +514,8 @@ mod tests {
     #[test]
     fn parses_olmoe_config() {
         let cfg = load_model_config(&olmoe_fixture_dir()).unwrap();
-        assert_eq!(cfg.architecture, Architecture::Olmoe);
-        assert_eq!(cfg.architecture.as_str(), "OlmoeForCausalLM");
+        assert_eq!(cfg.family.0.name(), "olmoe");
+        assert_eq!(cfg.hf_architecture, "OlmoeForCausalLM");
         assert_eq!(cfg.num_layers, 16);
         assert_eq!(cfg.hidden, 2048);
         assert_eq!((cfg.num_attention_heads, cfg.num_kv_heads), (16, 16));
@@ -791,8 +713,8 @@ mod tests {
         let err = load_model_config(&dir).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unsupported architectures = Qwen3MoeForCausalLM; supported: LlamaForCausalLM, \
-             OlmoeForCausalLM"
+            "unsupported architectures = Qwen3MoeForCausalLM; supported: registered families: \
+             llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM)"
         );
         fs::remove_dir_all(dir).unwrap();
 

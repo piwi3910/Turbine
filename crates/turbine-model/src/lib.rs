@@ -10,6 +10,7 @@ pub mod budget;
 pub mod chat_template;
 pub mod config;
 pub mod executor;
+pub mod families;
 pub mod generate;
 pub mod loader;
 pub mod metrics;
@@ -30,12 +31,12 @@ pub use budget::{BudgetTerms, available_bytes, check_budget, host_mem_available}
 pub use chat_template::ChatTemplate;
 pub use config::MoeConfig;
 pub use config::{
-    Architecture, GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config,
-    load_model_config,
+    GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config, load_model_config,
 };
+pub use families::{FamilyConfig, FamilyRef, ModelFamily, llama_slots, olmoe_slots};
 pub use generate::{GenerateOptions, Generation, generate};
-pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot, llama_slots};
-pub use loader::{StackPlace, gate_up_proj_name, olmoe_slots, qkv_proj_name, stacked_experts_name};
+pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot};
+pub use loader::{StackPlace, gate_up_proj_name, qkv_proj_name, stacked_experts_name};
 pub use metrics::{ForwardPhase, ModelMetrics, ToolCallOutcome};
 pub use sampler::{SampleJob, SampledToken, Sampler, SamplerState, sample_rows};
 pub use structured::{

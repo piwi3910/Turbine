@@ -21,14 +21,12 @@ use turbine_kernels::{
     KernelMetrics, KernelRegistry, OpKind, shim_provider, test_support::require_backend,
     test_support::require_env_dir,
 };
-use turbine_model::config::{Architecture, ModelArchConfig};
+use turbine_model::config::ModelArchConfig;
 use turbine_model::executor::{
     self, BatchInput, ExecutorOptions, LlamaExecutor, ModelExecutor, OlmoeExecutor, OpProfile,
     OpProfileEntry, SeqSlice,
 };
-use turbine_model::{
-    MAX_STAGING_BYTES, SafetensorsIndex, WeightLoader, llama_slots, load_model_config, olmoe_slots,
-};
+use turbine_model::{MAX_STAGING_BYTES, SafetensorsIndex, WeightLoader, load_model_config};
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView};
 
@@ -112,11 +110,7 @@ fn hip_executor(
 ) -> Box<dyn Profiled> {
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
     let index = SafetensorsIndex::open(dir).expect("open safetensors");
-    let slots = match cfg.architecture {
-        Architecture::Llama => llama_slots(cfg),
-        Architecture::Olmoe => olmoe_slots(cfg),
-        other => panic!("no profile for {other:?}"),
-    };
+    let slots = cfg.family.0.weight_slots(cfg);
     let weights = WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("weights");
     let provider = shim_provider(ctx.clone());
     let order = [provider.id()];
@@ -130,8 +124,8 @@ fn hip_executor(
         )
         .expect("every op has a provider"),
     );
-    match cfg.architecture {
-        Architecture::Llama => Box::new(
+    match cfg.family.0.name() {
+        "llama" => Box::new(
             LlamaExecutor::new(
                 cfg,
                 weights,

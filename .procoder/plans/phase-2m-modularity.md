@@ -257,14 +257,23 @@ Interfaces:
 Lane: A. Depends on: Task 5.
 Covers: S-2 AC; S-1 AC (`registry_conformance::families`).
 
-- [ ] Write failing tests `turbine-model families::tests::resolve_by_hf_name_and_refuse_unknown` (the tiny Llama and OLMoE `config.json` resolve to `llama` / `olmoe`; a config whose `architectures[0]` is `LlamaForCausalLM` only under `text_config` resolves to `llama` and returns the nested object; `MistralForCausalLM` is refused with a message containing `registered families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM)`), `families::tests::slots_match_main` (for the tiny Llama and OLMoE configs, `family.weight_slots(cfg)` equals main's `llama_slots` / `olmoe_slots` output, recorded as a `Vec<(String, Vec<usize>)>` literal in the test before the move) and `registry_conformance::families`. Run: `scripts/remote-cargo.sh test -p turbine-model families:: registry_conformance` — expect FAIL (module `families` missing)
-- [ ] Implement the family registry and the moves; `crates/turbine-server/src/model.rs` uses `cfg.family.0.weight_slots(cfg)` and `cfg.family.0.default_tool_format()`.
-- [ ] Run: `git grep -nE 'Architecture::(Llama|Olmoe)|match .*architecture' crates/ -- ':!crates/turbine-model/src/families'` — expect no output
-- [ ] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS (`tiny_model`, `tiny_server`, `server_cli`, `config::tests` unchanged in their assertions)
-- [ ] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
-- [ ] Lab: `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden` — expect exit 0
+- [x] Write failing tests `turbine-model families::tests::resolve_by_hf_name_and_refuse_unknown` (the tiny Llama and OLMoE `config.json` resolve to `llama` / `olmoe`; a config whose `architectures[0]` is `LlamaForCausalLM` only under `text_config` resolves to `llama` and returns the nested object; `MistralForCausalLM` is refused with a message containing `registered families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM)`), `families::tests::slots_match_main` (for the tiny Llama and OLMoE configs, `family.weight_slots(cfg)` equals main's `llama_slots` / `olmoe_slots` output, recorded as a `Vec<(String, Vec<usize>)>` literal in the test before the move) and `registry_conformance::families`. Run: `scripts/remote-cargo.sh test -p turbine-model families:: registry_conformance` — expect FAIL (module `families` missing)
+- [x] Implement the family registry and the moves; `crates/turbine-server/src/model.rs` uses `cfg.family.0.weight_slots(cfg)` and `cfg.family.0.default_tool_format()`.
+- [x] Run: `git grep -nE 'Architecture::(Llama|Olmoe)|match .*architecture' -- crates/ ':!crates/turbine-model/src/families'` — expect no output
+- [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS (`tiny_model`, `tiny_server`, `server_cli`, `config::tests` unchanged in their assertions)
+- [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
+- [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden` — expect exit 0
 - [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 6 row to `.procoder/perf-log.md`
-- [ ] Commit: `refactor(model): model family registry`
+- [x] Commit: `refactor(model): model family registry`
+
+Build notes (Task 6, as built):
+
+- The unknown-architecture refusal is `unsupported architectures = <value>; supported: registered families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM)`; `config::tests::rejects_unsupported` asserted main's `supported: LlamaForCausalLM, OlmoeForCausalLM` and was updated to it (the only `config::tests` assertion changed). `resolve` requires exactly one `architectures` entry, as main did; two families claiming one HF name are refused too, and `registry_conformance::families` also checks that no HF name is claimed twice.
+- `ModelFamily::parse_config` reports a malformed value as `ModelError::Io` naming `config.json`; `load_model_config` puts the real path in. `load_model_config` now resolves the family before reading the shared keys (from the resolved object, so a `text_config` wrapper is read from there), then detects the weight format on the top level; OLMoE's keys and refusals moved to `families/olmoe.rs` with their messages unchanged.
+- `llama_slots` / `olmoe_slots` live in `families/{llama,olmoe}.rs` and stay re-exported at the crate root (`turbine_model::llama_slots`), so their many test callers are unchanged; the loader's `row_concat` / `qkv_slots` became `pub(crate)`. Test code that matched on the enum (`tiny_model`, `perf`, `golden`) uses `cfg.family.0.weight_slots(cfg)`, and picks the concrete executor type by `cfg.family.0.name()` until Task 8.
+- `OlmoeExecutor` checks its config structurally (experts and Q/K norm) instead of by architecture; its message names `hf_architecture`.
+- Server (`crates/turbine-server/src/model.rs`): `resolve_tool_call_parser(configured, family: &dyn ModelFamily, renders_tools)` resolves null to `family.default_tool_format()` when the template renders tools; the `weight_slots` match is gone (`arch.family.0.weight_slots(arch)`); `modules.family` is the family name. `backend.rs` keeps the status `architecture` as an owned `String` (`hf_architecture`).
+- Lab (`scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden`): run `0926191741-032a0d6f`, exit 0, golden Llama and OLMoE 16/16. The lab-bench row is left to the coordinator.
 
 ## Task 7: Card profiles and the CMake architecture list
 

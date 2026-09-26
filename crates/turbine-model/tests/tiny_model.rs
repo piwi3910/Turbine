@@ -21,7 +21,7 @@ use turbine_kernels::{
     PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel, ShimContext,
     cpu_reference_provider, shim_provider,
 };
-use turbine_model::config::{Architecture, ModelArchConfig, RopeScaling};
+use turbine_model::config::{ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
     self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, LlamaExecutor, Logits,
     LogitsSlot, ModelExecutor, OlmoeExecutor, OpProfile, ReducedRow, RowReduce, SeqSlice,
@@ -964,11 +964,7 @@ fn cpu_model_with(
 ) -> Box<dyn ModelExecutor> {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
-    let slots = match cfg.architecture {
-        Architecture::Llama => llama_slots(cfg),
-        Architecture::Olmoe => olmoe_slots(cfg),
-        other => panic!("no tiny checkpoint for {other:?}"),
-    };
+    let slots = cfg.family.0.weight_slots(cfg);
     let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load");
     let order = [provider.id()];
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
@@ -1122,7 +1118,7 @@ fn fused_ops_match_unfused() {
     let tmp = TempDir::new("tiny-model-fused");
     for spec in both_checkpoints(&tmp) {
         let cfg = &spec.config;
-        let name = cfg.architecture.as_str();
+        let name = cfg.hf_architecture.as_str();
         let gemm = |n: u32| {
             format!(
                 "gemm n={n} k={} trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
@@ -1330,7 +1326,7 @@ fn executors_run_without_device_to_device_copies() {
     const STEPS: usize = 4;
     let tmp = TempDir::new("tiny-model-no-d2d");
     for spec in both_checkpoints(&tmp) {
-        let arch = spec.config.architecture;
+        let arch = spec.config.family;
         let mut rows: Vec<Vec<Vec<f32>>> = Vec::new();
         let plain: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
         let no_d2d: Arc<dyn DeviceMemory> =
@@ -1749,7 +1745,7 @@ fn chunked_prefill_matches_unchunked() {
     const CHUNK: u32 = 64;
     let tmp = TempDir::new("tiny-model-chunked");
     for spec in both_checkpoints(&tmp) {
-        let arch = spec.config.architecture;
+        let arch = spec.config.family;
         let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
         let mut exec = cpu_model(&spec, &mem, LONG);
         let layout = *exec.kv_layout();
@@ -1793,7 +1789,7 @@ fn paged_matches_contiguous() {
         (2 * LENS.len() as u32 * MAX_TOKENS.div_ceil(BLOCK_TOKENS)).next_power_of_two();
     let tmp = TempDir::new("tiny-model-paged-contiguous");
     for spec in both_checkpoints(&tmp) {
-        let arch = spec.config.architecture;
+        let arch = spec.config.family;
         let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
         let prompts: Vec<Vec<u32>> = LENS
             .iter()
@@ -1994,11 +1990,7 @@ fn hip_graph_executor(
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
     let provider = shim_provider(ctx.clone());
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
-    let slots = match cfg.architecture {
-        Architecture::Llama => llama_slots(cfg),
-        Architecture::Olmoe => olmoe_slots(cfg),
-        other => panic!("no tiny checkpoint for {other:?}"),
-    };
+    let slots = cfg.family.0.weight_slots(cfg);
     let weights = WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("load");
     let opts = ExecutorOptions::default();
     let mut reqs =
@@ -2122,7 +2114,7 @@ fn hip_decode_graph_matches_eager() {
     ];
     for spec in &specs {
         for block_tokens in [16, 128] {
-            let arch = spec.config.architecture;
+            let arch = spec.config.family;
             let mut exec = hip_graph_executor(spec, &ctx, block_tokens);
             assert!(exec.reduces_logits(), "{arch:?}");
             let layout = *exec.kv_layout();
@@ -2418,7 +2410,7 @@ fn check_reduced_rows(
 ) {
     const LENS: [u32; 3] = [5, 3, 4];
     const POOL_BLOCKS: u32 = 8;
-    let arch = spec.config.architecture;
+    let arch = spec.config.family;
     let mem = Arc::clone(mem);
     {
         assert!(
@@ -2615,7 +2607,7 @@ fn check_launch_ahead(
     const LENS: [u32; 3] = [5, 3, 4];
     const POOL_BLOCKS: u32 = 8;
     let decodes: usize = if greedy { 10 } else { 6 };
-    let arch = spec.config.architecture;
+    let arch = spec.config.family;
     assert!(ahead.overlaps() && ahead.reduces_logits(), "{arch:?}");
     let layout = *serial.kv_layout();
     let (a, b) = (
@@ -2888,11 +2880,7 @@ fn cpu_profiled(
 ) -> (Box<dyn Profiled>, Arc<KernelRegistry>) {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
-    let slots = match cfg.architecture {
-        Architecture::Llama => llama_slots(cfg),
-        Architecture::Olmoe => olmoe_slots(cfg),
-        other => panic!("no tiny checkpoint for {other:?}"),
-    };
+    let slots = cfg.family.0.weight_slots(cfg);
     let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load");
     let provider = cpu_reference_provider();
     let order = [provider.id()];
@@ -2905,8 +2893,8 @@ fn cpu_profiled(
             .expect("every op has a provider"),
     );
     let mem = Arc::clone(mem);
-    let exec: Box<dyn Profiled> = match cfg.architecture {
-        Architecture::Llama => Box::new(
+    let exec: Box<dyn Profiled> = match cfg.family.0.name() {
+        "llama" => Box::new(
             LlamaExecutor::new(
                 cfg,
                 weights,
@@ -2947,7 +2935,7 @@ fn op_profile_accounts_forward() {
     const PROMPT: u32 = 20;
     let tmp = TempDir::new("tiny-model-op-profile");
     for spec in both_checkpoints(&tmp) {
-        let arch = spec.config.architecture;
+        let arch = spec.config.family;
         let layers = spec.config.num_layers;
         let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
         let (mut exec, registry) = cpu_profiled(&spec, &mem);
@@ -3028,8 +3016,8 @@ fn op_profile_accounts_forward() {
         // fused, one per projection otherwise.
         let fused = ExecutorOptions::default().fused_projections;
         let (qkv, gate_up) = if fused { (1, 1) } else { (3, 2) };
-        match arch {
-            Architecture::Llama => want.extend([
+        match arch.0.name() {
+            "llama" => want.extend([
                 // The first input norm and the final norm of the (consecutive) last rows.
                 ("rmsnorm", cpu("rmsnorm"), 2),
                 // Q/K/V, O, gate/up and down per layer plus the LM head.

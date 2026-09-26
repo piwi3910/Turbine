@@ -17,7 +17,6 @@ use safetensors::tensor::TensorView;
 use serde_json::json;
 
 use crate::config::{ModelArchConfig, load_model_config};
-use crate::loader::weight_slots;
 
 /// Byte symbols take ids 0..=255; the specials follow.
 pub const BOS: (&str, u32) = ("<|begin_of_text|>", 256);
@@ -462,7 +461,7 @@ fn random_bf16(rng: &mut ChaCha8Rng, name: &str, shape: &[usize]) -> Vec<u8> {
 fn write_weights(path: &Path, config: &ModelArchConfig, seed: u64, opts: &TinyOptions) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
-    for slot in weight_slots(config) {
+    for slot in config.family.0.weight_slots(config) {
         let data = random_bf16(&mut rng, &slot.name, &slot.shape);
         tensors.push((slot.name, slot.shape, data));
     }
@@ -492,7 +491,7 @@ fn write_weights(path: &Path, config: &ModelArchConfig, seed: u64, opts: &TinyOp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Architecture, MoeConfig, RopeScaling};
+    use crate::config::{MoeConfig, RopeScaling};
     use crate::testing::TempDir;
 
     #[test]
@@ -508,7 +507,7 @@ mod tests {
         assert_ne!(weights(&a), weights(&c));
 
         let cfg = &spec.config;
-        assert_eq!(cfg.architecture, Architecture::Llama);
+        assert_eq!(cfg.family.0.name(), "llama");
         assert_eq!(
             (
                 cfg.num_layers,
@@ -581,7 +580,7 @@ mod tests {
         }
 
         let cfg = &spec.config;
-        assert_eq!(cfg.architecture, Architecture::Olmoe);
+        assert_eq!(cfg.family.0.name(), "olmoe");
         assert_eq!(
             (
                 cfg.num_layers,
@@ -610,7 +609,7 @@ mod tests {
 
         // Every OLMoE slot is in the file with its shape, BF16, and nothing else is.
         let index = crate::SafetensorsIndex::open(a.path()).unwrap();
-        let slots = crate::loader::olmoe_slots(cfg);
+        let slots = cfg.family.0.weight_slots(cfg);
         assert_eq!(slots.len(), 1 + 2 * (9 + 8 * 3) + 2);
         assert_eq!(index.entries().count(), slots.len());
         for slot in &slots {

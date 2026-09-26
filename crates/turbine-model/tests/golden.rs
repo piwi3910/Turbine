@@ -29,7 +29,6 @@ use turbine_core::types::{RequestId, Vendor};
 use turbine_kernels::{
     KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider, shim_provider,
 };
-use turbine_model::config::Architecture;
 use turbine_model::executor::{self, ExecutorOptions, LlamaExecutor, ModelExecutor, SequenceKv};
 use turbine_model::generate::{GenerateOptions, generate};
 use turbine_model::testing::TempDir;
@@ -37,7 +36,7 @@ use turbine_model::testing::tiny::write_tiny_llama;
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::{
     ChatTemplate, MAX_STAGING_BYTES, SafetensorsIndex, Tokenizer, WeightLoader, llama_slots,
-    load_model_config, olmoe_slots,
+    load_model_config,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::DeviceMemory;
@@ -909,11 +908,7 @@ fn build_any_executor(
 ) -> AnyRunner {
     let cfg = load_model_config(model_dir).expect("config.json");
     let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
-    let slots = if cfg.architecture == Architecture::Olmoe {
-        olmoe_slots(&cfg)
-    } else {
-        llama_slots(&cfg)
-    };
+    let slots = cfg.family.0.weight_slots(&cfg);
     let weights =
         WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("load weights");
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
