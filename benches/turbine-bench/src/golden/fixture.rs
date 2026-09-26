@@ -78,8 +78,15 @@ pub struct Tolerance {
     pub min_prompts_passing: usize,
     /// Reference top-k entries whose logprobs are compared.
     pub top_k: usize,
-    /// Max |Δ logprob| (nats) over the reference top-k before the first divergence.
-    pub max_abs_logprob_diff: f32,
+    /// Max |Δ logprob| (nats) before the first divergence for reference top-k candidates whose
+    /// reference logprob is above `likely_logprob_floor`.
+    pub max_abs_logprob_diff_likely: f32,
+    /// Max |Δ logprob| (nats) before the first divergence for the other (tail) reference top-k
+    /// candidates, whose logprob is at or below `likely_logprob_floor`.
+    pub max_abs_logprob_diff_tail: f32,
+    /// Reference logprob (nats) splitting likely from tail candidates; a candidate exactly at
+    /// the floor is a tail candidate.
+    pub likely_logprob_floor: f32,
     /// A divergence is excused when the reference top-1/top-2 margin there is below this (nats).
     pub margin_nats: f32,
 }
@@ -230,14 +237,16 @@ mod tests {
         let tol = dir.join("tolerance.json");
         fs::write(
             &tol,
-            r#"{"min_identical_prefix":32,"min_prompts_passing":14,"top_k":5,"max_abs_logprob_diff":0.15,"margin_nats":0.5}"#,
+            r#"{"min_identical_prefix":32,"min_prompts_passing":14,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5}"#,
         )
         .unwrap();
         let t = read_tolerance(&tol).unwrap();
         assert_eq!(t.min_identical_prefix, 32);
         assert_eq!(t.min_prompts_passing, 14);
         assert_eq!(t.top_k, 5);
-        assert_eq!(t.max_abs_logprob_diff, 0.15);
+        assert_eq!(t.max_abs_logprob_diff_likely, 0.15);
+        assert_eq!(t.max_abs_logprob_diff_tail, 0.55);
+        assert_eq!(t.likely_logprob_floor, -2.0);
         assert_eq!(t.margin_nats, 0.5);
         fs::remove_dir_all(&dir).unwrap();
     }

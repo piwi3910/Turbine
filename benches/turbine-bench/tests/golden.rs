@@ -34,8 +34,12 @@ enum Variant {
     FlipP01,
     /// p02 emits its second choice at position 5 (reference margin there: 0.3 nats).
     FlipP02,
-    /// p01's third-ranked logprob at position 2 moves by 0.2 nats.
+    /// p01's runner-up logprob at position 2 (reference −1.5, a likely candidate) moves by
+    /// 0.2 nats.
     ShiftP01,
+    /// p01's third-ranked logprob at position 2 (reference −3.0, a tail candidate) moves by
+    /// 0.5 nats.
+    ShiftTailP01,
     /// Every generation request answers 500.
     Fail,
 }
@@ -64,7 +68,8 @@ fn script(variant: Variant) -> Script {
         Variant::Base | Variant::Fail => {}
         Variant::FlipP01 => p01.tokens[5] = p01.top[5][1].0,
         Variant::FlipP02 => p02.tokens[5] = p02.top[5][1].0,
-        Variant::ShiftP01 => p01.top[2][2].1 -= 0.2,
+        Variant::ShiftP01 => p01.top[2][1].1 -= 0.2,
+        Variant::ShiftTailP01 => p01.top[2][2].1 -= 0.5,
     }
     HashMap::from([("alpha".to_string(), p01), ("beta".to_string(), p02)])
 }
@@ -305,7 +310,7 @@ async fn capture_and_compare_roundtrip() {
     .unwrap();
     std::fs::write(
         dir.join("mock/tolerance.json"),
-        r#"{"min_identical_prefix":8,"min_prompts_passing":2,"top_k":5,"max_abs_logprob_diff":0.15,"margin_nats":0.5}"#,
+        r#"{"min_identical_prefix":8,"min_prompts_passing":2,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5}"#,
     )
     .unwrap();
     let reference = dir.join("mock/reference.jsonl");
@@ -366,7 +371,12 @@ async fn capture_and_compare_roundtrip() {
         let p = prompt_report(&report, id);
         assert_eq!(p["identical_prefix"], 10, "{p}");
         assert_eq!(p["first_divergence"], Value::Null, "{p}");
-        assert_eq!(p["max_abs_logprob_diff"].as_f64().unwrap(), 0.0, "{p}");
+        assert_eq!(
+            p["max_abs_logprob_diff_likely"].as_f64().unwrap(),
+            0.0,
+            "{p}"
+        );
+        assert_eq!(p["max_abs_logprob_diff_tail"].as_f64().unwrap(), 0.0, "{p}");
     }
 
     // A flip at position 5 where the reference margin is 2 nats: violated, located, margin given.
@@ -402,17 +412,33 @@ async fn capture_and_compare_roundtrip() {
     assert_eq!(p["passed"], true, "{p}");
     assert_eq!(report["prompts_passing"], 2, "{report}");
 
-    // One top-5 logprob shifted by 0.2 nats (> 0.15): violated even though every token matches.
+    // A likely top-5 logprob (reference > −2) shifted by 0.2 nats (> 0.15): violated even
+    // though every token matches.
     let (code, report, stderr) = compare_json(Variant::ShiftP01, &reference).await;
     assert_eq!(code, Some(1), "{report}\n{stderr}");
     let p = prompt_report(&report, "p01");
     assert_eq!(p["identical_prefix"], 10, "{p}");
     assert!(
-        (p["max_abs_logprob_diff"].as_f64().unwrap() - 0.2).abs() < 1e-5,
+        (p["max_abs_logprob_diff_likely"].as_f64().unwrap() - 0.2).abs() < 1e-5,
         "{p}"
     );
     assert_eq!(p["logprob_within_bound"], false, "{p}");
     assert_eq!(p["passed"], false, "{p}");
+
+    // A tail top-5 logprob (reference ≤ −2) shifted by 0.5 nats (≤ 0.55): holds.
+    let (code, report, stderr) = compare_json(Variant::ShiftTailP01, &reference).await;
+    assert_eq!(code, Some(0), "{report}\n{stderr}");
+    let p = prompt_report(&report, "p01");
+    assert!(
+        (p["max_abs_logprob_diff_tail"].as_f64().unwrap() - 0.5).abs() < 1e-5,
+        "{p}"
+    );
+    assert_eq!(
+        p["max_abs_logprob_diff_likely"].as_f64().unwrap(),
+        0.0,
+        "{p}"
+    );
+    assert_eq!(p["passed"], true, "{p}");
 
     // An endpoint failing during capture: exit 1 and no fixture (not even the temp file).
     let failed_out = dir.join("mock/failed.jsonl");

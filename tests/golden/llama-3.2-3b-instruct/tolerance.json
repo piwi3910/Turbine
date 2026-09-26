@@ -1,1 +1,1 @@
-{"min_identical_prefix":32,"min_prompts_passing":14,"top_k":5,"max_abs_logprob_diff":0.15,"margin_nats":0.5}
+{"min_identical_prefix":32,"min_prompts_passing":14,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5}

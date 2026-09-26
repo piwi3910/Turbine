@@ -23,11 +23,14 @@ pub struct PromptVerdict {
     pub first_divergence: Option<usize>,
     /// Reference top-1 minus top-2 logprob (nats) at `first_divergence`.
     pub margin_at_divergence: Option<f32>,
-    /// Max |Δ logprob| over the reference top-k at every position before the divergence.
-    pub max_abs_logprob_diff: f32,
+    /// Max |Δ logprob| before the divergence over the reference top-k candidates above the
+    /// tolerance's `likely_logprob_floor`.
+    pub max_abs_logprob_diff_likely: f32,
+    /// Max |Δ logprob| before the divergence over the other (tail) reference top-k candidates.
+    pub max_abs_logprob_diff_tail: f32,
     /// First reference top-k id the candidate's top list did not contain, if any.
     pub missing_top_k: Option<MissingTopK>,
-    /// No missing id and `max_abs_logprob_diff` ≤ the tolerance.
+    /// No missing id and both tiers within their tolerance bound.
     pub logprob_within_bound: bool,
     /// The prefix rule (or a small-margin excuse) holds and the logprob bound holds.
     pub passed: bool,
@@ -51,7 +54,9 @@ fn top_k(row: &[(u32, f32)], k: usize) -> Vec<(u32, f32)> {
 /// Compare a candidate's greedy tokens and top logprobs with one reference record.
 ///
 /// A candidate that stops early diverges at its length; a reference top-k id missing from the
-/// candidate's top list at a compared position violates the logprob bound.
+/// candidate's top list at a compared position violates the logprob bound. Each reference
+/// top-k candidate is judged by its reference logprob: above `likely_logprob_floor` against
+/// `max_abs_logprob_diff_likely`, at or below it against `max_abs_logprob_diff_tail`.
 pub fn compare_prompt(
     reference: &ReferenceRecord,
     got_tokens: &[u32],
@@ -70,7 +75,8 @@ pub fn compare_prompt(
         .and_then(|d| reference.top_logprobs.get(d))
         .and_then(|row| margin(row));
 
-    let mut max_abs_logprob_diff = 0.0f32;
+    let mut max_abs_logprob_diff_likely = 0.0f32;
+    let mut max_abs_logprob_diff_tail = 0.0f32;
     let mut missing_top_k = None;
     for pos in 0..first_divergence.unwrap_or(n) {
         let Some(ref_row) = reference.top_logprobs.get(pos) else {
@@ -80,7 +86,12 @@ pub fn compare_prompt(
         for (id, lp) in top_k(ref_row, tol.top_k) {
             match got_row.iter().find(|e| e.0 == id) {
                 Some(&(_, got_lp)) => {
-                    max_abs_logprob_diff = max_abs_logprob_diff.max((got_lp - lp).abs())
+                    let tier = if lp > tol.likely_logprob_floor {
+                        &mut max_abs_logprob_diff_likely
+                    } else {
+                        &mut max_abs_logprob_diff_tail
+                    };
+                    *tier = tier.max((got_lp - lp).abs());
                 }
                 None => {
                     missing_top_k.get_or_insert(MissingTopK {
@@ -91,8 +102,9 @@ pub fn compare_prompt(
             }
         }
     }
-    let logprob_within_bound =
-        missing_top_k.is_none() && max_abs_logprob_diff <= tol.max_abs_logprob_diff;
+    let logprob_within_bound = missing_top_k.is_none()
+        && max_abs_logprob_diff_likely <= tol.max_abs_logprob_diff_likely
+        && max_abs_logprob_diff_tail <= tol.max_abs_logprob_diff_tail;
     let prefix_ok = identical_prefix >= tol.min_identical_prefix.min(n);
     let excused = margin_at_divergence.is_some_and(|m| m < tol.margin_nats);
 
@@ -102,7 +114,8 @@ pub fn compare_prompt(
         identical_prefix,
         first_divergence,
         margin_at_divergence,
-        max_abs_logprob_diff,
+        max_abs_logprob_diff_likely,
+        max_abs_logprob_diff_tail,
         missing_top_k,
         logprob_within_bound,
         passed: (prefix_ok || excused) && logprob_within_bound,
@@ -148,12 +161,13 @@ impl CompareReport {
                 .margin_at_divergence
                 .map_or_else(|| "-".to_string(), |m| format!("{m:.3}"));
             out.push_str(&format!(
-                "{} {} identical_prefix={}/{} first_divergence={divergence} margin={margin} max_abs_logprob_diff={:.4}",
+                "{} {} identical_prefix={}/{} first_divergence={divergence} margin={margin} max_abs_logprob_diff_likely={:.4} max_abs_logprob_diff_tail={:.4}",
                 if v.passed { "PASS" } else { "FAIL" },
                 v.id,
                 v.identical_prefix,
                 v.reference_len,
-                v.max_abs_logprob_diff,
+                v.max_abs_logprob_diff_likely,
+                v.max_abs_logprob_diff_tail,
             ));
             if let Some(m) = v.missing_top_k {
                 out.push_str(&format!(
@@ -165,13 +179,15 @@ impl CompareReport {
         }
         let bound_held = self.prompts.iter().all(|v| v.logprob_within_bound);
         out.push_str(&format!(
-            "{}: {}/{} prompts passing (need {}); |Δ logprob| over top-{} ≤ {} on every prompt: {}\n",
+            "{}: {}/{} prompts passing (need {}); |Δ logprob| over top-{} ≤ {} (reference logprob > {}) and ≤ {} (tail) on every prompt: {}\n",
             if self.passed { "PASS" } else { "FAIL" },
             self.prompts_passing,
             self.prompts_total,
             self.tolerance.min_prompts_passing,
             self.tolerance.top_k,
-            self.tolerance.max_abs_logprob_diff,
+            self.tolerance.max_abs_logprob_diff_likely,
+            self.tolerance.likely_logprob_floor,
+            self.tolerance.max_abs_logprob_diff_tail,
             if bound_held { "yes" } else { "no" },
         ));
         out
@@ -187,7 +203,9 @@ mod tests {
             min_identical_prefix: 4,
             min_prompts_passing: 1,
             top_k: 2,
-            max_abs_logprob_diff: 0.15,
+            max_abs_logprob_diff_likely: 0.15,
+            max_abs_logprob_diff_tail: 0.55,
+            likely_logprob_floor: -2.0,
             margin_nats: 0.5,
         }
     }
@@ -248,7 +266,8 @@ mod tests {
         let mut top = r.top_logprobs.clone();
         top[3][0].1 = -5.0;
         let v = compare_prompt(&r, &tokens, &top, &tol());
-        assert_eq!(v.max_abs_logprob_diff, 0.0);
+        assert_eq!(v.max_abs_logprob_diff_likely, 0.0);
+        assert_eq!(v.max_abs_logprob_diff_tail, 0.0);
         assert!(v.logprob_within_bound);
         assert!(!v.passed, "margin 1.0 is not excused");
         // The prefix requirement is capped at the reference length.
@@ -257,6 +276,49 @@ mod tests {
             ..tol()
         };
         assert!(compare_prompt(&r, &r.tokens, &r.top_logprobs, &t).passed);
+    }
+
+    /// The bound a top-k candidate gets depends on its reference logprob: above the floor (−2)
+    /// it is likely (0.15), at the floor exactly or below it is tail (0.55). Breaks if the
+    /// tier is chosen by the candidate's logprob, if −2 counts as likely, or if one bound
+    /// applies to both tiers.
+    #[test]
+    fn logprob_bound_has_a_likely_and_a_tail_tier() {
+        let t = tol();
+        // One position: top-1 token 10, runner-up 20 at `ref_lp`; the candidate moves the
+        // runner-up by `delta`.
+        let check = |ref_lp: f32, delta: f32| {
+            let r = ReferenceRecord {
+                tokens: vec![10],
+                top_logprobs: vec![vec![(10, -0.1), (20, ref_lp)]],
+                ..reference([1.0; 4])
+            };
+            let mut top = r.top_logprobs.clone();
+            top[0][1].1 += delta;
+            compare_prompt(&r, &r.tokens, &top, &t)
+        };
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-5;
+
+        // Just above the floor: the likely bound.
+        let v = check(-1.99, 0.1);
+        assert!(v.logprob_within_bound && v.passed, "{v:?}");
+        assert!(close(v.max_abs_logprob_diff_likely, 0.1), "{v:?}");
+        assert_eq!(v.max_abs_logprob_diff_tail, 0.0);
+        let v = check(-1.99, 0.5);
+        assert!(!v.logprob_within_bound && !v.passed, "{v:?}");
+
+        // Exactly at the floor and below it: the tail bound.
+        for ref_lp in [-2.0, -2.01] {
+            let v = check(ref_lp, 0.5);
+            assert!(v.logprob_within_bound && v.passed, "{ref_lp}: {v:?}");
+            assert!(close(v.max_abs_logprob_diff_tail, 0.5), "{v:?}");
+            assert_eq!(v.max_abs_logprob_diff_likely, 0.0);
+            let v = check(ref_lp, 0.6);
+            assert!(!v.logprob_within_bound && !v.passed, "{ref_lp}: {v:?}");
+        }
+        // A candidate dropping below the floor keeps its reference (likely) tier.
+        let v = check(-1.99, -0.5);
+        assert!(!v.logprob_within_bound, "{v:?}");
     }
 
     #[test]

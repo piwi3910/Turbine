@@ -40,16 +40,6 @@ use turbine_tensor::host::HostMemory;
 /// the most `turbine-golden compare` asks for.
 const TOP_LOGPROBS: u32 = 20;
 
-/// The logprob bound of the tiny-checkpoint test (the committed Llama-3.2 tolerance otherwise
-/// applies unchanged). The random tiny weights give logits of magnitude 16–32 with top-1 to
-/// top-5 gaps of 6–10 nats, where one BF16 ulp is 0.125: the reference log-softmaxes BF16
-/// logits and differs from Turbine's F32 LM head by up to half an ulp per logit, and BF16
-/// rounding differences inside the forward pass are amplified by the same scale. Measured
-/// against transformers 4.57.1 on CPU: all 512 greedy tokens and every prompt id identical,
-/// max |Δ logprob| 0.21 over the top 5; 0.3 keeps that property meaningful (a wrong layer,
-/// template or tokenization breaks the tokens or moves logprobs by whole nats).
-const TINY_MAX_ABS_LOGPROB_DIFF: f32 = 0.3;
-
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -83,11 +73,16 @@ struct ReferenceRecord {
 
 /// `tolerance.json`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Tolerance {
     min_identical_prefix: usize,
     min_prompts_passing: usize,
     top_k: usize,
-    max_abs_logprob_diff: f32,
+    /// Bound for reference top-k candidates with reference logprob > `likely_logprob_floor`.
+    max_abs_logprob_diff_likely: f32,
+    /// Bound for the other (tail) reference top-k candidates.
+    max_abs_logprob_diff_tail: f32,
+    likely_logprob_floor: f32,
     margin_nats: f32,
 }
 
@@ -120,7 +115,8 @@ struct Verdict {
     identical_prefix: usize,
     first_divergence: Option<usize>,
     margin_at_divergence: Option<f32>,
-    max_abs_logprob_diff: f32,
+    max_abs_logprob_diff_likely: f32,
+    max_abs_logprob_diff_tail: f32,
     /// `(position, token id)` of the first reference top-k id missing from Turbine's top list.
     missing_top_k: Option<(usize, u32)>,
     logprob_within_bound: bool,
@@ -130,8 +126,10 @@ struct Verdict {
 /// The `turbine-golden compare` rule for one prompt: the greedy prefix must be at least
 /// `min_identical_prefix` long unless the reference margin (top-1 minus top-2) at the first
 /// divergence is below `margin_nats`; at every position before the divergence each reference
-/// top-k id must appear in Turbine's top list within `max_abs_logprob_diff`. A candidate that
-/// stops early diverges at its length.
+/// top-k id must appear in Turbine's top list, within `max_abs_logprob_diff_likely` when its
+/// reference logprob is above `likely_logprob_floor` and within `max_abs_logprob_diff_tail`
+/// otherwise (at the floor exactly counts as tail). A candidate that stops early diverges at its
+/// length.
 fn compare_prompt(
     reference: &ReferenceRecord,
     got_tokens: &[u32],
@@ -157,7 +155,8 @@ fn compare_prompt(
         .filter(|row| row.len() >= 2)
         .map(|row| row[0].1 - row[1].1);
 
-    let mut max_abs_logprob_diff = 0f32;
+    let mut max_abs_logprob_diff_likely = 0f32;
+    let mut max_abs_logprob_diff_tail = 0f32;
     let mut missing_top_k = None;
     for pos in 0..first_divergence.unwrap_or(n) {
         let Some(ref_row) = reference.top_logprobs.get(pos) else {
@@ -167,7 +166,12 @@ fn compare_prompt(
         for &(id, lp) in sorted(ref_row).iter().take(tol.top_k) {
             match got_row.iter().find(|e| e.0 == id) {
                 Some(&(_, got_lp)) => {
-                    max_abs_logprob_diff = max_abs_logprob_diff.max((got_lp - lp).abs());
+                    let tier = if lp > tol.likely_logprob_floor {
+                        &mut max_abs_logprob_diff_likely
+                    } else {
+                        &mut max_abs_logprob_diff_tail
+                    };
+                    *tier = tier.max((got_lp - lp).abs());
                 }
                 None => {
                     missing_top_k.get_or_insert((pos, id));
@@ -175,8 +179,9 @@ fn compare_prompt(
             }
         }
     }
-    let logprob_within_bound =
-        missing_top_k.is_none() && max_abs_logprob_diff <= tol.max_abs_logprob_diff;
+    let logprob_within_bound = missing_top_k.is_none()
+        && max_abs_logprob_diff_likely <= tol.max_abs_logprob_diff_likely
+        && max_abs_logprob_diff_tail <= tol.max_abs_logprob_diff_tail;
     let prefix_ok = identical_prefix >= tol.min_identical_prefix.min(n);
     let excused = margin_at_divergence.is_some_and(|m| m < tol.margin_nats);
     Verdict {
@@ -185,7 +190,8 @@ fn compare_prompt(
         identical_prefix,
         first_divergence,
         margin_at_divergence,
-        max_abs_logprob_diff,
+        max_abs_logprob_diff_likely,
+        max_abs_logprob_diff_tail,
         missing_top_k,
         logprob_within_bound,
         passed: (prefix_ok || excused) && logprob_within_bound,
@@ -198,14 +204,16 @@ fn assert_tolerance(verdicts: &[Verdict], tol: &Tolerance) {
     for v in verdicts {
         report.push_str(&format!(
             "{} {} identical_prefix={}/{} first_divergence={:?} margin={:?} \
-             max_abs_logprob_diff={:.4} missing_top_k={:?}\n",
+             max_abs_logprob_diff_likely={:.4} max_abs_logprob_diff_tail={:.4} \
+             missing_top_k={:?}\n",
             if v.passed { "PASS" } else { "FAIL" },
             v.id,
             v.identical_prefix,
             v.reference_len,
             v.first_divergence,
             v.margin_at_divergence,
-            v.max_abs_logprob_diff,
+            v.max_abs_logprob_diff_likely,
+            v.max_abs_logprob_diff_tail,
             v.missing_top_k,
         ));
     }
@@ -214,9 +222,17 @@ fn assert_tolerance(verdicts: &[Verdict], tol: &Tolerance) {
     assert!(!verdicts.is_empty(), "no prompts compared");
     assert!(
         verdicts.iter().all(|v| v.logprob_within_bound),
-        "|Δ logprob| over the reference top-{} exceeds {} (or an id is missing):\n{report}",
+        "|Δ logprob| over the reference top-{} exceeds {} (reference logprob > {}) or {} \
+         (tail), or an id is missing:\n{report}",
         tol.top_k,
-        tol.max_abs_logprob_diff,
+        tol.max_abs_logprob_diff_likely,
+        tol.likely_logprob_floor,
+        tol.max_abs_logprob_diff_tail,
+    );
+    println!(
+        "golden verdict: {passing}/{} prompts passing (need {}); logprob bound held on every prompt",
+        verdicts.len(),
+        tol.min_prompts_passing,
     );
     assert!(
         passing >= tol.min_prompts_passing,
@@ -232,7 +248,9 @@ fn compare_prompt_applies_the_tolerance_rule() {
         min_identical_prefix: 4,
         min_prompts_passing: 1,
         top_k: 2,
-        max_abs_logprob_diff: 0.15,
+        max_abs_logprob_diff_likely: 0.15,
+        max_abs_logprob_diff_tail: 0.55,
+        likely_logprob_floor: -2.0,
         margin_nats: 0.5,
     };
     // Four positions: token 10+i with runner-up 20+i at the given margin.
@@ -269,11 +287,19 @@ fn compare_prompt_applies_the_tolerance_rule() {
     assert_eq!(v.first_divergence, Some(3));
     assert!(!v.passed);
 
-    // A shifted top-k logprob or a missing top-k id violates the bound; rank 3 is not checked.
+    // A shifted likely top-k logprob (reference −1.0) or a missing top-k id violates the bound;
+    // the tail runner-up (reference −3.0) gets 0.55; rank 3 is not checked.
     let mut shifted = top(&exact);
-    shifted[1][0].1 += 0.2;
+    shifted[1][1].1 += 0.2;
     let v = compare_prompt(&exact, &exact.tokens, &shifted, &tol);
     assert!(!v.logprob_within_bound && !v.passed, "{v:?}");
+    let mut tail = top(&exact);
+    tail[1][0].1 += 0.5;
+    let v = compare_prompt(&exact, &exact.tokens, &tail, &tol);
+    assert!(v.passed, "{v:?}");
+    tail[1][0].1 += 0.1;
+    let v = compare_prompt(&exact, &exact.tokens, &tail, &tol);
+    assert!(!v.logprob_within_bound, "{v:?}");
     let mut missing = top(&exact);
     missing[3].retain(|e| e.0 != 23);
     let v = compare_prompt(&exact, &exact.tokens, &missing, &tol);
@@ -282,6 +308,83 @@ fn compare_prompt_applies_the_tolerance_rule() {
     rank3[0][2].1 += 5.0;
     let v = compare_prompt(&exact, &exact.tokens, &rank3, &tol);
     assert!(v.passed, "{v:?}");
+}
+
+/// The same boundary test as `turbine-golden compare`: the tier is chosen by the reference
+/// logprob; just above −2 is likely (0.15), −2 exactly and below are tail (0.55). Breaks if −2
+/// counts as likely, if the candidate's logprob picks the tier, or if one bound covers both.
+#[test]
+fn logprob_bound_has_a_likely_and_a_tail_tier() {
+    let tol = Tolerance {
+        min_identical_prefix: 1,
+        min_prompts_passing: 1,
+        top_k: 2,
+        max_abs_logprob_diff_likely: 0.15,
+        max_abs_logprob_diff_tail: 0.55,
+        likely_logprob_floor: -2.0,
+        margin_nats: 0.5,
+    };
+    // One position: top-1 token 10, runner-up 20 at `ref_lp`, moved by `delta` in the candidate.
+    let check = |ref_lp: f32, delta: f32| {
+        let r = ReferenceRecord {
+            id: "p".into(),
+            prompt_token_ids: vec![1],
+            tokens: vec![10],
+            top_logprobs: vec![vec![(10, -0.1), (20, ref_lp)]],
+        };
+        let mut top = r.top_logprobs.clone();
+        top[0][1].1 += delta;
+        compare_prompt(&r, &r.tokens, &top, &tol)
+    };
+    let close = |a: f32, b: f32| (a - b).abs() < 1e-5;
+
+    let v = check(-1.99, 0.1);
+    assert!(v.logprob_within_bound && v.passed, "{v:?}");
+    assert!(close(v.max_abs_logprob_diff_likely, 0.1), "{v:?}");
+    assert_eq!(v.max_abs_logprob_diff_tail, 0.0);
+    let v = check(-1.99, 0.5);
+    assert!(!v.logprob_within_bound && !v.passed, "{v:?}");
+    for ref_lp in [-2.0, -2.01] {
+        let v = check(ref_lp, 0.5);
+        assert!(v.logprob_within_bound && v.passed, "{ref_lp}: {v:?}");
+        assert!(close(v.max_abs_logprob_diff_tail, 0.5), "{v:?}");
+        assert_eq!(v.max_abs_logprob_diff_likely, 0.0);
+        let v = check(ref_lp, 0.6);
+        assert!(!v.logprob_within_bound && !v.passed, "{ref_lp}: {v:?}");
+    }
+    let v = check(-1.99, -0.5);
+    assert!(!v.logprob_within_bound, "{v:?}");
+}
+
+/// The committed tolerance is the two-tier rule of the user decision 2026-09-26 and the
+/// committed reference is the FP32-final-logit transformers reference.
+#[test]
+fn committed_tolerance_and_reference() {
+    let fixture = golden_dir().join("llama-3.2-3b-instruct");
+    let tol = read_tolerance(&fixture.join("tolerance.json"));
+    assert_eq!(
+        (tol.min_identical_prefix, tol.min_prompts_passing, tol.top_k),
+        (32, 14, 5)
+    );
+    assert_eq!(
+        (
+            tol.max_abs_logprob_diff_likely,
+            tol.max_abs_logprob_diff_tail,
+            tol.likely_logprob_floor,
+            tol.margin_nats
+        ),
+        (0.15, 0.55, -2.0, 0.5)
+    );
+    let text = std::fs::read_to_string(fixture.join("reference.jsonl")).expect("reference");
+    let engines: Vec<String> = text
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("json")["engine"].to_string())
+        .collect();
+    assert_eq!(engines.len(), 16);
+    assert!(
+        engines.iter().all(|e| e.ends_with("-fp32-logits\"")),
+        "{engines:?}"
+    );
 }
 
 // ------------------------------------------------------------------------ replay helpers
@@ -485,10 +588,11 @@ fn hf_reference_matches_cpu() {
 
     let prompts: Vec<PromptRecord> = read_jsonl(&prompts_path);
     let references: Vec<ReferenceRecord> = read_jsonl(&reference_path);
-    let tol = Tolerance {
-        max_abs_logprob_diff: TINY_MAX_ABS_LOGPROB_DIFF,
-        ..read_tolerance(&golden_dir().join("llama-3.2-3b-instruct/tolerance.json"))
-    };
+    // The committed Llama tolerance applies unchanged. Measured (transformers 4.57.1 CPU,
+    // FP32-logit reference, CK-order BF16 attention probabilities in the cpu-reference
+    // provider): 16/16 prompts with all 32 greedy tokens identical, max |Δ logprob| 0.0041 on
+    // likely and 0.1154 on tail candidates.
+    let tol = read_tolerance(&golden_dir().join("llama-3.2-3b-instruct/tolerance.json"));
     let max_seq_len = needed_seq_len(&references);
     let mem = HostMemory::new(turbine_core::types::DeviceId(0), 1 << 30);
     let mut exec = build_executor(&model_dir, cpu_reference_provider(), mem, max_seq_len);
@@ -528,12 +632,7 @@ fn logits_match_reference() {
 
     let fixture = golden_dir().join("llama-3.2-3b-instruct");
     let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
-    // Diagnostics: TURBINE_GOLDEN_REFERENCE names another reference file in the fixture
-    // directory (e.g. one generated with `hf_reference.py --fp32-logits`).
-    let reference_file =
-        std::env::var("TURBINE_GOLDEN_REFERENCE").unwrap_or_else(|_| "reference.jsonl".into());
-    println!("reference: {reference_file}");
-    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join(&reference_file));
+    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
     let tol = read_tolerance(&fixture.join("tolerance.json"));
     let max_seq_len = needed_seq_len(&references);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();

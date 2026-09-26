@@ -32,12 +32,13 @@ Rules:
   `turbine-golden compare` requests `ignore_eos: true` and treats a candidate
   that stops early as diverging at the position where it stopped.
 - Per generated position the script records the chosen token and the top-N
-  `log_softmax` values of the BF16 logits upcast to FP32.
-- `--fp32-logits` (opt-in) instead computes the LM head in FP32: the final-norm
-  output (BF16, as the model produces it) and the LM head weight are upcast to
-  FP32 and multiplied there, so the logits are not rounded to BF16 (whose
-  spacing is 0.125 at |logit| in [16, 32)). Every other op stays BF16. The
-  engine string then ends in `-fp32-logits`.
+  FP32 `log_softmax` values of FP32 logits: the LM head runs in FP32 on the
+  final-norm output (BF16, as the model produces it) and the LM head weight,
+  both upcast, so the logits are not rounded to BF16 (whose spacing is 0.125 at
+  |logit| in [16, 32)); every other op stays BF16. The engine string ends in
+  `-fp32-logits`. This is the golden reference form (user decision 2026-09-26).
+- `--bf16-logits` (diagnostics only) instead log-softmaxes the model's own BF16
+  logits upcast to FP32; the engine string then has no `-fp32-logits` suffix.
 - Output goes to `<out>.tmp`, renamed over `<out>` only when every prompt
   succeeded. Any failure (including usage errors) exits 1 and leaves no file.
 
@@ -45,7 +46,7 @@ Usage:
     uv run scripts/golden/hf_reference.py --model-dir <dir> \
         --prompts tests/golden/prompts.jsonl \
         --out tests/golden/<model-slug>/reference.jsonl \
-        [--top-logprobs 20] [--device cpu|cuda] [--model-name <hub-id>] [--fp32-logits]
+        [--top-logprobs 20] [--device cpu|cuda] [--model-name <hub-id>] [--bf16-logits]
 """
 
 from __future__ import annotations
@@ -79,9 +80,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Hub id recorded as `model` (default: config.json _name_or_path or the directory name)",
     )
     p.add_argument(
-        "--fp32-logits",
+        "--bf16-logits",
         action="store_true",
-        help="compute the LM head in FP32 from the BF16 final-norm output (default: BF16 logits)",
+        help="log-softmax the model's BF16 logits (default: FP32 LM head on the BF16 final-norm output)",
     )
     args = p.parse_args(argv)
     if not 1 <= args.top_logprobs <= 20:
@@ -169,7 +170,7 @@ def generate(
     max_tokens: int,
     top_n: int,
     device: str,
-    fp32_logits: bool = False,
+    fp32_logits: bool = True,
 ):
     tokens: list[int] = []
     tops: list[list[list[float]]] = []
@@ -192,7 +193,7 @@ def generate(
     with torch.inference_mode():
         logits, past = forward(torch.tensor([ids], device=device), None)
         for step in range(max_tokens):
-            # FP32 log_softmax of the last position's logits (BF16 upcast, or FP32 LM head).
+            # FP32 log_softmax of the last position's logits (FP32 LM head, or BF16 upcast).
             logprobs = torch.log_softmax(logits, dim=-1)
             chosen = int(torch.argmax(logprobs))
             # torch.topk orders exact ties arbitrarily; argmax (like HF greedy)
@@ -224,7 +225,7 @@ def run(args: argparse.Namespace) -> None:
     model.to(args.device)
     model.eval()
     engine = f"transformers-{transformers.__version__}-bf16-{args.device}"
-    if args.fp32_logits:
+    if not args.bf16_logits:
         engine += "-fp32-logits"
     name = args.model_name or model_name(args.model_dir)
     revision = model_revision(args.model_dir)
@@ -246,7 +247,7 @@ def run(args: argparse.Namespace) -> None:
                     rec["max_tokens"],
                     args.top_logprobs,
                     args.device,
-                    args.fp32_logits,
+                    not args.bf16_logits,
                 )
                 captured = (
                     datetime.datetime.now(datetime.UTC)
