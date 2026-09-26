@@ -21,9 +21,13 @@
 
 #include "turbine_hip.hpp"
 
+using turbine_hip::add_rmsnorm_fallback_supported;
 using turbine_hip::check_hip;
 using turbine_hip::enter;
 using turbine_hip::fail;
+using turbine_hip::launch_add_rmsnorm;
+using turbine_hip::launch_rmsnorm;
+using turbine_hip::rmsnorm_fallback_supported;
 
 namespace {
 
@@ -103,7 +107,7 @@ bool valid(const turbine_rmsnorm_desc *d) {
 bool supported(const turbine_rmsnorm_desc *d) {
   if (!valid(d))
     return false;
-  return ck_bucket(d) || turbine_hip::rmsnorm_fallback_supported(d);
+  return ck_bucket(d) || rmsnorm_fallback_supported(d);
 }
 
 int32_t launch_ck(turbine_ctx *ctx, const turbine_rmsnorm_desc *d) {
@@ -147,7 +151,7 @@ bool add_valid(const turbine_add_rmsnorm_desc *d) {
 bool add_supported(const turbine_add_rmsnorm_desc *d) {
   if (!add_valid(d))
     return false;
-  return add_ck_bucket(d) || turbine_hip::add_rmsnorm_fallback_supported(d);
+  return add_ck_bucket(d) || add_rmsnorm_fallback_supported(d);
 }
 
 int32_t launch_add_ck(turbine_ctx *ctx, const turbine_add_rmsnorm_desc *d) {
@@ -184,6 +188,74 @@ std::string describe(const turbine_add_rmsnorm_desc *d) {
 
 } // namespace
 
+namespace turbine_hip {
+
+bool rmsnorm_supports(const turbine_rmsnorm_desc *d, bool ck) {
+  if (!valid(d))
+    return false;
+  return ck ? ck_bucket(d) : rmsnorm_fallback_supported(d);
+}
+
+int32_t rmsnorm_run(turbine_ctx *ctx, const turbine_rmsnorm_desc *d, bool ck) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (d == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_rmsnorm: descriptor is NULL");
+  }
+  if (!rmsnorm_supports(d, ck)) {
+    return fail(ctx, TURBINE_E_UNSUPPORTED,
+                "turbine_rmsnorm: unsupported configuration rows=" +
+                    std::to_string(d->rows) + " dim=" + std::to_string(d->dim) +
+                    " dtype=" + std::to_string(d->dtype) +
+                    (supported(d)
+                         ? std::string(" for ") + (ck ? kImplCk : kImplTurbine)
+                         : std::string()));
+  }
+  if (d->x == nullptr || d->weight == nullptr || d->out == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_rmsnorm: NULL operand");
+  }
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  if (ck)
+    return launch_ck(ctx, d);
+  return launch_rmsnorm(ctx, d);
+}
+
+bool add_rmsnorm_supports(const turbine_add_rmsnorm_desc *d, bool ck) {
+  if (!add_valid(d))
+    return false;
+  return ck ? add_ck_bucket(d) : add_rmsnorm_fallback_supported(d);
+}
+
+int32_t add_rmsnorm_run(turbine_ctx *ctx, const turbine_add_rmsnorm_desc *d,
+                        bool ck) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (d == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_add_rmsnorm: descriptor is NULL");
+  }
+  if (!add_rmsnorm_supports(d, ck)) {
+    return fail(ctx, TURBINE_E_UNSUPPORTED,
+                "turbine_add_rmsnorm: unsupported configuration " +
+                    describe(d) +
+                    (add_supported(d)
+                         ? std::string(" for ") + (ck ? kImplCk : kImplTurbine)
+                         : std::string()));
+  }
+  if (d->residual == nullptr || d->x == nullptr || d->weight == nullptr ||
+      d->out == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_add_rmsnorm: NULL operand");
+  }
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  if (ck)
+    return launch_add_ck(ctx, d);
+  return launch_add_rmsnorm(ctx, d);
+}
+
+} // namespace turbine_hip
+
 extern "C" {
 
 int32_t turbine_rmsnorm_supported(const turbine_rmsnorm_desc *d) {
@@ -197,25 +269,7 @@ const char *turbine_rmsnorm_impl(const turbine_rmsnorm_desc *d) {
 }
 
 int32_t turbine_rmsnorm(turbine_ctx *ctx, const turbine_rmsnorm_desc *d) {
-  if (ctx == nullptr)
-    return TURBINE_E_ARGUMENT;
-  if (d == nullptr) {
-    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_rmsnorm: descriptor is NULL");
-  }
-  if (!supported(d)) {
-    return fail(ctx, TURBINE_E_UNSUPPORTED,
-                "turbine_rmsnorm: unsupported configuration rows=" +
-                    std::to_string(d->rows) + " dim=" + std::to_string(d->dim) +
-                    " dtype=" + std::to_string(d->dtype));
-  }
-  if (d->x == nullptr || d->weight == nullptr || d->out == nullptr) {
-    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_rmsnorm: NULL operand");
-  }
-  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
-    return rc;
-  if (ck_bucket(d))
-    return launch_ck(ctx, d);
-  return turbine_hip::launch_rmsnorm(ctx, d);
+  return turbine_hip::rmsnorm_run(ctx, d, valid(d) && ck_bucket(d));
 }
 
 int32_t turbine_add_rmsnorm_supported(const turbine_add_rmsnorm_desc *d) {
@@ -230,26 +284,7 @@ const char *turbine_add_rmsnorm_impl(const turbine_add_rmsnorm_desc *d) {
 
 int32_t turbine_add_rmsnorm(turbine_ctx *ctx,
                             const turbine_add_rmsnorm_desc *d) {
-  if (ctx == nullptr)
-    return TURBINE_E_ARGUMENT;
-  if (d == nullptr) {
-    return fail(ctx, TURBINE_E_ARGUMENT,
-                "turbine_add_rmsnorm: descriptor is NULL");
-  }
-  if (!add_supported(d)) {
-    return fail(ctx, TURBINE_E_UNSUPPORTED,
-                "turbine_add_rmsnorm: unsupported configuration " +
-                    describe(d));
-  }
-  if (d->residual == nullptr || d->x == nullptr || d->weight == nullptr ||
-      d->out == nullptr) {
-    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_add_rmsnorm: NULL operand");
-  }
-  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
-    return rc;
-  if (add_ck_bucket(d))
-    return launch_add_ck(ctx, d);
-  return turbine_hip::launch_add_rmsnorm(ctx, d);
+  return turbine_hip::add_rmsnorm_run(ctx, d, add_valid(d) && add_ck_bucket(d));
 }
 
 } // extern "C"

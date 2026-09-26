@@ -5,14 +5,16 @@
  * always idle, and every op reports TURBINE_E_UNSUPPORTED. build.rs compiles
  * it with the host C compiler once per variant:
  *   -DSTUB_ABI=<n>u  -DSTUB_BACKEND="<name>"  -DSTUB_ARCHS="<a,b>"
- *   [-DTURBINE_STUB_V21]
+ *   [-DTURBINE_STUB_V21] [-DTURBINE_STUB_V24]
  * With TURBINE_STUB_V21 it also exports the optional ABI v2.1 and v2.3
- * symbols: turbine_abi_minor (TURBINE_ABI_MINOR), context options
+ * symbols: turbine_abi_minor (3, a v2.3 library), context options
  * (TURBINE_OPTION_GEMM_AUTOTUNE kept per context,
  * TURBINE_OPTION_GEMM_TUNED_SHAPES always 0), the add_rmsnorm and
  * logits_reduce trios (unsupported like every op), graphs that record
  * nothing (stub_live_graphs() counts graphs not yet destroyed), and host
- * staging memory and events (see the v2.3 section below).
+ * staging memory and events (see the v2.3 section below). With
+ * TURBINE_STUB_V24 as well it reports minor TURBINE_ABI_MINOR and exports the
+ * v2.4 implementation group (see the v2.4 section at the end).
  *
  * stub_live_contexts() is a test hook (not part of the ABI): the number of
  * contexts created and not yet destroyed, so tests can prove the Rust side
@@ -32,6 +34,9 @@ struct turbine_ctx {
   /* v2.1 */
   int64_t gemm_autotune;
   int32_t capturing;
+  /* v2.4: the moe_small_max_rows of the last turbine_ctx_set_profile, -1
+   * before one */
+  int64_t profile_small_rows;
 };
 
 static atomic_int live_contexts;
@@ -100,6 +105,7 @@ int32_t turbine_ctx_create(int32_t device_ordinal, turbine_ctx **out) {
   }
   ctx->ordinal = device_ordinal;
   ctx->gemm_autotune = 1;
+  ctx->profile_small_rows = -1;
   atomic_fetch_add(&live_contexts, 1);
   *out = ctx;
   return TURBINE_OK;
@@ -221,7 +227,11 @@ STUB_OP(moe_experts, turbine_moe_experts_desc)
 STUB_OP(add_rmsnorm, turbine_add_rmsnorm_desc)
 STUB_OP(logits_reduce, turbine_logits_reduce_desc)
 
+#ifdef TURBINE_STUB_V24
 uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
+#else
+uint32_t turbine_abi_minor(void) { return 3u; }
+#endif
 
 int32_t turbine_ctx_set_option(turbine_ctx *ctx, int32_t option,
                                int64_t value) {
@@ -395,3 +405,111 @@ int32_t turbine_event_destroy(turbine_ctx *ctx, turbine_event *e) {
   return TURBINE_OK;
 }
 #endif /* TURBINE_STUB_V21 */
+
+#ifdef TURBINE_STUB_V24
+/* v2.4: rmsnorm has two implementations, "stub_a" (provider "stub",
+ * supports every descriptor) and "stub_b" (provider "stub_alt", refuses dim
+ * 4096); every other op has one implementation "stub_<op>" (provider "stub")
+ * that supports nothing, like its turbine_<op>_supported. turbine_impl_run
+ * records op * 100 + index for stub_last_impl_run() and does nothing else.
+ * turbine_ctx_set_profile accepts a profile of a build arch and keeps its
+ * moe_small_max_rows for stub_profile_small_rows(). */
+static const char *const stub_op_names[] = {
+    "stub_gemm",
+    "stub_attention_prefill",
+    "stub_attention_decode",
+    "stub_rmsnorm",
+    "stub_rope",
+    "stub_silu_mul",
+    "stub_embedding",
+    "stub_add",
+    "stub_attention_prefill_paged",
+    "stub_attention_decode_paged",
+    "stub_copy_blocks",
+    "stub_moe_route",
+    "stub_moe_experts",
+    "stub_add_rmsnorm",
+    "stub_logits_reduce",
+};
+#define STUB_OPS ((int32_t)(sizeof stub_op_names / sizeof stub_op_names[0]))
+
+static atomic_int last_impl_run = -1;
+
+int32_t stub_last_impl_run(void) { return atomic_load(&last_impl_run); }
+
+int64_t stub_profile_small_rows(const turbine_ctx *ctx) {
+  return ctx->profile_small_rows;
+}
+
+int32_t turbine_impl_count(int32_t op) {
+  if (op < 0 || op >= STUB_OPS) {
+    return TURBINE_E_ARGUMENT;
+  }
+  return op == TURBINE_OP_RMSNORM ? 2 : 1;
+}
+
+int32_t turbine_impl_info(int32_t op, int32_t index, turbine_impl_entry *out) {
+  if (out == NULL || index < 0 || index >= turbine_impl_count(op)) {
+    return TURBINE_E_ARGUMENT;
+  }
+  if (op == TURBINE_OP_RMSNORM) {
+    out->name = index == 0 ? "stub_a" : "stub_b";
+    out->provider = index == 0 ? "stub" : "stub_alt";
+  } else {
+    out->name = stub_op_names[op];
+    out->provider = "stub";
+  }
+  out->flags = 0;
+  return TURBINE_OK;
+}
+
+int32_t turbine_impl_supports(int32_t op, int32_t index, const void *desc) {
+  if (desc == NULL || index < 0 || index >= turbine_impl_count(op)) {
+    return TURBINE_E_ARGUMENT;
+  }
+  if (op != TURBINE_OP_RMSNORM) {
+    return 0;
+  }
+  const turbine_rmsnorm_desc *d = desc;
+  return index == 0 || d->dim != 4096 ? 1 : 0;
+}
+
+int32_t turbine_impl_run(turbine_ctx *ctx, int32_t op, int32_t index,
+                         const void *desc) {
+  int32_t supported = turbine_impl_supports(op, index, desc);
+  if (supported < 0) {
+    set_error(ctx->last_error, "stub: unknown implementation");
+    return supported;
+  }
+  if (supported == 0) {
+    set_error(ctx->last_error, "stub: implementation does not support desc");
+    return TURBINE_E_UNSUPPORTED;
+  }
+  atomic_store(&last_impl_run, op * 100 + index);
+  return TURBINE_OK;
+}
+
+int32_t turbine_ctx_set_profile(turbine_ctx *ctx,
+                                const turbine_card_profile *p) {
+  if (p == NULL || p->struct_bytes < sizeof *p || p->arch == NULL) {
+    set_error(ctx->last_error, "stub: invalid card profile");
+    return TURBINE_E_ARGUMENT;
+  }
+  /* The arch must be one of the comma-separated build archs. */
+  const char *archs = STUB_ARCHS;
+  size_t len = strlen(p->arch);
+  for (const char *a = archs; *a != '\0';) {
+    size_t n = strcspn(a, ",");
+    if (n == len && strncmp(a, p->arch, n) == 0) {
+      ctx->profile_small_rows = p->moe_small_max_rows;
+      return TURBINE_OK;
+    }
+    a += n;
+    if (*a == ',') {
+      a++;
+    }
+  }
+  set_error(ctx->last_error, "stub: profile arch is not a build arch");
+  return TURBINE_E_UNSUPPORTED;
+}
+#endif /* TURBINE_STUB_V24 */

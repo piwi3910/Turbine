@@ -177,15 +177,17 @@ int32_t run_ck(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
 }
 
 int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
-            const char *entry_name) {
+            const char *entry_name, bool ck) {
   const std::string entry(entry_name);
   if (ctx == nullptr)
     return TURBINE_E_ARGUMENT;
   if (d == nullptr)
     return fail(ctx, TURBINE_E_ARGUMENT, entry + ": descriptor is NULL");
-  if (!supported(d)) {
-    return fail(ctx, TURBINE_E_UNSUPPORTED,
-                entry + ": unsupported configuration " + describe(d));
+  if (!supported(d) || (ck && !use_ck(d))) {
+    return fail(
+        ctx, TURBINE_E_UNSUPPORTED,
+        entry + ": unsupported configuration " + describe(d) +
+            (supported(d) ? std::string(" for ") + kImplCk : std::string()));
   }
   if (d->num_seqs == 0 || d->total_q == 0)
     return TURBINE_OK;
@@ -206,7 +208,7 @@ int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
     return rc;
   if (int32_t rc = turbine_hip::launch_paged_append(ctx, d); rc != TURBINE_OK)
     return rc;
-  if (use_ck(d))
+  if (ck)
     return run_ck(ctx, d, entry);
   return turbine_hip::launch_paged_attention(ctx, d);
 }
@@ -217,12 +219,26 @@ const char *impl_of(const turbine_attention_paged_desc *d) {
 
 } // namespace
 
+namespace turbine_hip {
+
+bool paged_supports(const turbine_attention_paged_desc *d, bool ck) {
+  return supported(d) && (!ck || use_ck(d));
+}
+
+int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
+                  const char *entry, bool ck) {
+  return run(ctx, d, entry, ck);
+}
+
+} // namespace turbine_hip
+
 extern "C" {
 
 int32_t
 turbine_attention_prefill_paged(turbine_ctx *ctx,
                                 const turbine_attention_prefill_paged_desc *d) {
-  return run(ctx, d, "turbine_attention_prefill_paged");
+  return run(ctx, d, "turbine_attention_prefill_paged",
+             d != nullptr && use_ck(d));
 }
 
 int32_t turbine_attention_prefill_paged_supported(
@@ -238,7 +254,8 @@ const char *turbine_attention_prefill_paged_impl(
 int32_t
 turbine_attention_decode_paged(turbine_ctx *ctx,
                                const turbine_attention_decode_paged_desc *d) {
-  return run(ctx, d, "turbine_attention_decode_paged");
+  return run(ctx, d, "turbine_attention_decode_paged",
+             d != nullptr && use_ck(d));
 }
 
 int32_t turbine_attention_decode_paged_supported(

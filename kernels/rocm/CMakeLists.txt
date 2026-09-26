@@ -3,7 +3,9 @@
 # FMHA (contiguous and, for 128-multiple pages, paged), RMSNorm through ck_tile
 # rmsnorm2d where an instance exists, MoE expert GEMMs through hipBLASLt, and
 # Turbine HIP kernels for the rest (16-token paged attention, MoE routing,
-# elementwise ops). Loaded at run time by turbine-kernels.
+# elementwise ops). Loaded at run time by turbine-kernels. The same build also
+# produces libturbine_hip_v23.so: the same kernels without the optional ABI
+# v2.4 implementation group (minor 3), for the v2.3 fallback test.
 #
 #   cmake -S kernels/rocm -B <build> -DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc \
 #         -DGPU_TARGETS=gfx1201 && cmake --build <build>
@@ -119,7 +121,13 @@ add_custom_command(
   DEPENDS "${CK_FMHA_DIR}/generate.py" ${FMHA_CODEGEN_SCRIPTS}
   COMMENT "Generating CK FMHA forward and pagedkv instances for ${GPU_TARGETS}")
 
-# ---- the shared library ----
+# ---- the shared libraries ----
+# Every kernel source is compiled once into an OBJECT library. libturbine_hip.so
+# links it with the ABI v2.4 exports (impl_exports.cpp) and abi_minor.cpp;
+# libturbine_hip_v23.so links the same objects with abi_minor.cpp compiled
+# with TURBINE_V23_BUILD and without the v2.4 exports: a real v2.3 library
+# (minor 3, no implementation group) for the fallback test
+# (turbine-model tiny_model hip_v23_library_matches_cpu).
 set(TURBINE_SOURCES
   src/context.cpp
   src/memory.cpp
@@ -135,39 +143,60 @@ set(TURBINE_SOURCES
   src/moe.hip
   src/moe_small_m.hip
   src/moe_grouped.hip
-  src/logits_reduce.hip)
+  src/logits_reduce.hip
+  src/impl_table.cpp)
 set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/rmsnorm.cpp ${FMHA_BLOBS})
-
-add_library(turbine_hip SHARED ${TURBINE_SOURCES} ${FMHA_BLOBS})
-set_source_files_properties(${TURBINE_SOURCES} ${FMHA_BLOBS} PROPERTIES LANGUAGE HIP)
-set_target_properties(turbine_hip PROPERTIES
-  HIP_ARCHITECTURES "${GPU_TARGETS}"
-  CXX_VISIBILITY_PRESET hidden
-  HIP_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-  LINKER_LANGUAGE HIP)
-target_include_directories(turbine_hip PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/../include"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src"
-  "${CK_ROOT}/include"
-  "${CK_FMHA_DIR}"
-  "${FMHA_GEN_DIR}")
+set(TURBINE_LIBRARY_SOURCES src/impl_exports.cpp src/abi_minor.cpp)
+set_source_files_properties(${TURBINE_SOURCES} ${FMHA_BLOBS} ${TURBINE_LIBRARY_SOURCES}
+  PROPERTIES LANGUAGE HIP)
 string(REPLACE ";" "," TURBINE_BUILD_ARCHS "${GPU_TARGETS}")
-target_compile_definitions(turbine_hip PRIVATE
-  TURBINE_CK_COMMIT="${TURBINE_CK_COMMIT}"
-  TURBINE_BUILD_ARCHS="${TURBINE_BUILD_ARCHS}")
 # Composable Kernel's own flags for its RDNA FMHA build (01_fmha/CMakeLists.txt);
 # the BF16 conversion mode (round to nearest even, canonical NaN) also applies to
 # the rmsnorm2d instance, whose CK default would truncate.
 set_source_files_properties(${CK_SOURCES} PROPERTIES COMPILE_OPTIONS
   "-DCK_TILE_FMHA_FWD_FAST_EXP2=1;-fgpu-flush-denormals-to-zero;-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=5;-Wno-undefined-func-template;-Wno-float-equal;-Wno-unknown-warning-option")
-target_link_libraries(turbine_hip PRIVATE hip::host roc::hipblaslt)
+
+# Compile settings shared by the object library and the two shared libraries.
+function(turbine_hip_settings target)
+  set_target_properties(${target} PROPERTIES
+    HIP_ARCHITECTURES "${GPU_TARGETS}"
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    HIP_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
+  target_include_directories(${target} PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CK_ROOT}/include"
+    "${CK_FMHA_DIR}"
+    "${FMHA_GEN_DIR}")
+  target_compile_definitions(${target} PRIVATE
+    TURBINE_CK_COMMIT="${TURBINE_CK_COMMIT}"
+    TURBINE_BUILD_ARCHS="${TURBINE_BUILD_ARCHS}")
+  target_link_libraries(${target} PRIVATE hip::host roc::hipblaslt)
+endfunction()
+
+add_library(turbine_hip_objects OBJECT ${TURBINE_SOURCES} ${FMHA_BLOBS})
+turbine_hip_settings(turbine_hip_objects)
 
 # Export exactly the ABI: everything else stays local even if a dependency's
 # header forces default visibility.
 set(TURBINE_EXPORTS "${CMAKE_BINARY_DIR}/turbine_hip.exports")
 file(WRITE "${TURBINE_EXPORTS}" "{\n  global: turbine_*;\n  local: *;\n};\n")
-target_link_options(turbine_hip PRIVATE
-  "LINKER:--version-script=${TURBINE_EXPORTS}"
-  "LINKER:--no-undefined")
-set_property(TARGET turbine_hip APPEND PROPERTY LINK_DEPENDS "${TURBINE_EXPORTS}")
+
+# One shared library of the kernel objects plus extra sources.
+function(turbine_hip_library target)
+  add_library(${target} SHARED $<TARGET_OBJECTS:turbine_hip_objects> ${ARGN})
+  turbine_hip_settings(${target})
+  set_target_properties(${target} PROPERTIES LINKER_LANGUAGE HIP)
+  target_link_options(${target} PRIVATE
+    "LINKER:--version-script=${TURBINE_EXPORTS}"
+    "LINKER:--no-undefined")
+  set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${TURBINE_EXPORTS}")
+endfunction()
+
+turbine_hip_library(turbine_hip ${TURBINE_LIBRARY_SOURCES})
+
+# abi_minor.cpp is compiled once more for the v2.3 build, with its define.
+turbine_hip_library(turbine_hip_v23 src/abi_minor.cpp)
+target_compile_definitions(turbine_hip_v23 PRIVATE TURBINE_V23_BUILD)

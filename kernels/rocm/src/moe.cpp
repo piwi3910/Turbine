@@ -207,10 +207,13 @@ int32_t run_grouped(turbine_ctx *ctx, const std::vector<Projection> &ps) {
   }
 }
 
-int32_t run_projections(turbine_ctx *ctx, const std::vector<Projection> &ps) {
+// grouped: try one grouped GEMM per projection first (hipblaslt_grouped), else
+// one GEMM per expert (hipblaslt_per_expert).
+int32_t run_projections(turbine_ctx *ctx, const std::vector<Projection> &ps,
+                        bool grouped) {
   if (ps.empty())
     return TURBINE_OK;
-  if (ctx->moe_grouped && ps.size() > 1) {
+  if (grouped && ps.size() > 1) {
     const int32_t rc = run_grouped(ctx, ps);
     if (rc != TURBINE_E_UNSUPPORTED)
       return rc;
@@ -260,7 +263,8 @@ int32_t scratch(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
   return TURBINE_OK;
 }
 
-int32_t run_experts(turbine_ctx *ctx, const turbine_moe_experts_desc *d) {
+int32_t run_experts(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
+                    bool grouped) {
   const int32_t *host = d->host_expert_offsets;
   const int64_t all_rows = static_cast<int64_t>(d->num_tokens) * d->top_k;
   if (host[0] != 0 || host[d->num_experts] != all_rows) {
@@ -333,9 +337,9 @@ int32_t run_experts(turbine_ctx *ctx, const turbine_moe_experts_desc *d) {
     down_ps.push_back({gate_e, w_down + local * expert_weight_bytes,
                        down + off * h * 2, count, d->hidden, d->inter});
   }
-  if (rc = run_projections(ctx, gate_ps); rc != TURBINE_OK)
+  if (rc = run_projections(ctx, gate_ps, grouped); rc != TURBINE_OK)
     return rc;
-  if (rc = run_projections(ctx, up_ps); rc != TURBINE_OK)
+  if (rc = run_projections(ctx, up_ps, grouped); rc != TURBINE_OK)
     return rc;
 
   // silu(gate) * up, written over gate (each element reads then writes the
@@ -353,7 +357,7 @@ int32_t run_experts(turbine_ctx *ctx, const turbine_moe_experts_desc *d) {
   if (rc = turbine_silu_mul(ctx, &act); rc != TURBINE_OK)
     return rc;
 
-  if (rc = run_projections(ctx, down_ps); rc != TURBINE_OK)
+  if (rc = run_projections(ctx, down_ps, grouped); rc != TURBINE_OK)
     return rc;
   return turbine_hip::launch_moe_scatter(ctx, down, pos, d->topk_weights,
                                          d->num_tokens, d->hidden, d->top_k,
@@ -445,6 +449,79 @@ bool probe_grouped_gemm(turbine_ctx *ctx) {
   }
 }
 
+const char *moe_path_name(MoePath path) {
+  switch (path) {
+  case MoePath::SmallM:
+    return kImplSmallM;
+  case MoePath::Wmma:
+    return kImplWmma;
+  case MoePath::Grouped:
+    return kImplGrouped;
+  case MoePath::PerExpert:
+    return kImplPerExpert;
+  }
+  return kImplPerExpert;
+}
+
+bool moe_experts_supports(const turbine_moe_experts_desc *d, MoePath path) {
+  if (!experts_supported(d))
+    return false;
+  switch (path) {
+  case MoePath::SmallM:
+    return d->hidden % 8 == 0 && d->inter % 8 == 0;
+  case MoePath::Wmma:
+    return moe_wmma_shape(d);
+  case MoePath::Grouped:
+    return g_grouped_available.load();
+  case MoePath::PerExpert:
+    return true;
+  }
+  return false;
+}
+
+int32_t moe_experts_run(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
+                        MoePath path) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (d == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_moe_experts: descriptor is NULL");
+  }
+  if (!moe_experts_supports(d, path)) {
+    return fail(
+        ctx, TURBINE_E_UNSUPPORTED,
+        "turbine_moe_experts: unsupported configuration " + describe(d) +
+            (experts_supported(d) ? std::string(" for ") + moe_path_name(path)
+                                  : std::string()));
+  }
+  const bool device_offsets = path == MoePath::SmallM || path == MoePath::Wmma;
+  if (!device_offsets && d->host_expert_offsets == nullptr) {
+    return fail(
+        ctx, TURBINE_E_ARGUMENT,
+        "turbine_moe_experts: host_expert_offsets is NULL for " +
+            std::to_string(static_cast<int64_t>(d->num_tokens) * d->top_k) +
+            " routed rows and hidden=" + std::to_string(d->hidden) +
+            " inter=" + std::to_string(d->inter) + " (implementation " +
+            moe_path_name(path) + " reads the group sizes on the host)");
+  }
+  if (d->num_tokens == 0)
+    return TURBINE_OK;
+  if (d->x == nullptr || d->w_gate == nullptr || d->w_up == nullptr ||
+      d->w_down == nullptr || d->sorted_rows == nullptr ||
+      d->topk_weights == nullptr || d->out == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_moe_experts: NULL operand");
+  }
+  if (device_offsets && d->expert_offsets == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_moe_experts: expert_offsets is NULL");
+  }
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  if (device_offsets)
+    return run_device_offsets(ctx, d, path == MoePath::SmallM);
+  return run_experts(ctx, d, path == MoePath::Grouped);
+}
+
 } // namespace turbine_hip
 
 extern "C" {
@@ -503,45 +580,14 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d) {
 
 int32_t turbine_moe_experts(turbine_ctx *ctx,
                             const turbine_moe_experts_desc *d) {
-  if (ctx == nullptr)
-    return TURBINE_E_ARGUMENT;
-  if (d == nullptr) {
-    return fail(ctx, TURBINE_E_ARGUMENT,
-                "turbine_moe_experts: descriptor is NULL");
-  }
-  if (!experts_supported(d)) {
-    return fail(ctx, TURBINE_E_UNSUPPORTED,
-                "turbine_moe_experts: unsupported configuration " +
-                    describe(d));
-  }
-  const bool small = small_m(d);
-  const bool device_offsets = small || wmma(d);
-  if (!device_offsets && d->host_expert_offsets == nullptr) {
-    return fail(
-        ctx, TURBINE_E_ARGUMENT,
-        "turbine_moe_experts: host_expert_offsets is NULL for " +
-            std::to_string(static_cast<int64_t>(d->num_tokens) * d->top_k) +
-            " routed rows and hidden=" + std::to_string(d->hidden) +
-            " inter=" + std::to_string(d->inter) +
-            " (the device-offset paths need at most " +
-            std::to_string(turbine_hip::kMoeSmallMaxRows) +
-            " rows or hidden and inter multiples of 64)");
-  }
-  if (d->num_tokens == 0)
-    return TURBINE_OK;
-  if (d->x == nullptr || d->w_gate == nullptr || d->w_up == nullptr ||
-      d->w_down == nullptr || d->sorted_rows == nullptr ||
-      d->topk_weights == nullptr || d->out == nullptr) {
-    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_moe_experts: NULL operand");
-  }
-  if (device_offsets && d->expert_offsets == nullptr) {
-    return fail(ctx, TURBINE_E_ARGUMENT,
-                "turbine_moe_experts: expert_offsets is NULL");
-  }
-  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
-    return rc;
-  return device_offsets ? run_device_offsets(ctx, d, small)
-                        : run_experts(ctx, d);
+  using turbine_hip::MoePath;
+  MoePath path = ctx != nullptr && ctx->moe_grouped ? MoePath::Grouped
+                                                    : MoePath::PerExpert;
+  if (d != nullptr && small_m(d))
+    path = MoePath::SmallM;
+  else if (d != nullptr && wmma(d))
+    path = MoePath::Wmma;
+  return turbine_hip::moe_experts_run(ctx, d, path);
 }
 
 } // extern "C"

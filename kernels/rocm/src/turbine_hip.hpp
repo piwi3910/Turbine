@@ -37,6 +37,29 @@ constexpr size_t kGemmAlgoCacheEntries = 1024;
 using GemmKey = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                            int32_t, int32_t>;
 
+// The card profile a context holds (ABI v2.4 turbine_card_profile, copied by
+// turbine_ctx_set_profile). The turbine_<op> entry points read their
+// thresholds from it; the library itself names no card.
+struct Profile {
+  // A build architecture; empty = the device's own.
+  std::string arch;
+  int32_t wave_size;
+  int32_t lds_bytes;
+  // Routed rows of the first moe_experts tier.
+  int64_t moe_small_max_rows;
+  int32_t paged_page_multiple;
+};
+
+// The profile of a context until turbine_ctx_set_profile (a caller of ABI
+// v2.3 or earlier never sets one): the values of the first card profile of
+// crates/turbine-kernels/src/cards/, so such a caller keeps today's choices.
+inline const Profile kDefaultProfile{"", 32, 65536, 512, 128};
+
+// The most LDS one workgroup of this library's kernels is built to use (the
+// CK FMHA and grouped WMMA MoE tiles assume 64 KiB); a profile describing less
+// is refused.
+constexpr int32_t kBuiltLdsBytes = 65536;
+
 } // namespace turbine_hip
 
 struct turbine_ctx {
@@ -48,6 +71,11 @@ struct turbine_ctx {
   int32_t *seqstart = nullptr;
   // Device architecture without target features, e.g. "gfx1201".
   std::string arch;
+  // Wavefront width of the device (hipDeviceProp_t::warpSize).
+  int wave_size = 0;
+  // Card profile thresholds (v2.4); kDefaultProfile until
+  // turbine_ctx_set_profile.
+  turbine_hip::Profile profile = turbine_hip::kDefaultProfile;
   // MoE intermediates when the caller passes no (or too small a) workspace;
   // grown on demand, never shrunk.
   void *moe_scratch = nullptr;
@@ -158,5 +186,49 @@ bool moe_wmma_shape(const turbine_moe_experts_desc *d);
 // Asks hipBLASLt for a grouped BF16 GEMM solution on ctx's device (moe.cpp);
 // false when there is none (ROCm 7.14.1 on gfx1201) or the query fails.
 bool probe_grouped_gemm(turbine_ctx *ctx);
+
+// True when arch (e.g. "gfx1201" or "gfx1201:sramecc-:xnack-") names one of
+// the build architectures (context.cpp).
+bool arch_is_built(const char *arch);
+
+// ---- implementations (ABI v2.4, impl_table.cpp) ----
+// Each implementation of an op is a supports / run pair. supports takes the
+// op's descriptor (NULL allowed, pointer fields ignored, no context); run
+// validates the descriptor and its operands like the op's entry point and
+// enqueues exactly that implementation, failing with TURBINE_E_UNSUPPORTED
+// when it does not support the descriptor.
+struct ImplEntry {
+  const char *name;
+  // Implementation family: "hipblaslt", "ck" or "turbine_hip".
+  const char *provider;
+  // TURBINE_IMPL_* flags.
+  uint32_t flags;
+  // moe_experts: serves the first row tier only (up to the profile's
+  // moe_small_max_rows routed rows) when the library chooses.
+  bool first_tier_only;
+  bool (*supports)(const void *desc);
+  int32_t (*run)(turbine_ctx *ctx, const void *desc);
+};
+// The implementations of op in library order; nullptr (count 0) for an
+// unknown op.
+const ImplEntry *impl_entries(int32_t op, int32_t *count);
+
+// Per-implementation pairs of the ops with more than one implementation.
+// rmsnorm.cpp: ck_tile rmsnorm2d (ck true) or the Turbine kernel.
+bool rmsnorm_supports(const turbine_rmsnorm_desc *d, bool ck);
+int32_t rmsnorm_run(turbine_ctx *ctx, const turbine_rmsnorm_desc *d, bool ck);
+bool add_rmsnorm_supports(const turbine_add_rmsnorm_desc *d, bool ck);
+int32_t add_rmsnorm_run(turbine_ctx *ctx, const turbine_add_rmsnorm_desc *d,
+                        bool ck);
+// paged_attention.cpp: CK fmha_fwd_pagedkv (ck true) or the Turbine kernel;
+// entry names the op in error messages.
+bool paged_supports(const turbine_attention_paged_desc *d, bool ck);
+int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
+                  const char *entry, bool ck);
+// moe.cpp: the four moe_experts paths.
+enum class MoePath { SmallM, Wmma, Grouped, PerExpert };
+bool moe_experts_supports(const turbine_moe_experts_desc *d, MoePath path);
+int32_t moe_experts_run(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
+                        MoePath path);
 
 } // namespace turbine_hip

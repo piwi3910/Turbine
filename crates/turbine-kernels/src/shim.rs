@@ -37,6 +37,7 @@ use turbine_tensor::{
     DeviceMemory, DevicePtr, DeviceSlice, MemInfo, MemoryError, StagingId, StreamRef, TensorView,
 };
 
+use crate::cards::CardProfile;
 use crate::ffi::{
     self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo,
     EmbeddingDesc, GemmDesc, LogitsReduceDesc, MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE,
@@ -47,12 +48,13 @@ use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
     ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
-    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, KernelProvider, KvCopyConfig,
+    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplInfo, KernelProvider, KvCopyConfig,
     KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
     MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
-    NormContext, NormKernel, PagedAttentionContext, ProviderId, RopeConfig, RopeContext,
+    NormContext, NormKernel, OpKind, PagedAttentionContext, ProviderId, RopeConfig, RopeContext,
     RopeKernel,
 };
+use crate::registry::OpConfig;
 use crate::{KernelError, TURBINE_KERNELS_ABI_VERSION};
 
 /// Environment variable naming the shim library when `execution.kernel_library` is null.
@@ -210,6 +212,56 @@ impl ShimLibrary {
     /// The device architectures the library was compiled for (`turbine_build_archs`).
     pub fn build_archs(&self) -> &[String] {
         &self.archs
+    }
+
+    /// True when the library exports the ABI v2.4 group (implementation enumeration, explicit
+    /// runs and the card profile); otherwise it chooses the implementation of every call itself.
+    pub fn enumerates_implementations(&self) -> bool {
+        self.syms.v21.impls.is_some()
+    }
+
+    /// The implementations of `op` the library contains, in its order (ABI v2.4
+    /// `turbine_impl_count` / `turbine_impl_info`); empty when it does not enumerate or reports
+    /// an error for `op`.
+    pub fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
+        let Some(fns) = self.syms.v21.impls else {
+            return Vec::new();
+        };
+        let code = op.abi_code();
+        // SAFETY: `turbine_impl_count` takes an integer and returns one; no pointer is involved.
+        let count = unsafe { (fns.count)(code) };
+        let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        for index in 0..count.max(0) {
+            let mut entry = ffi::ImplEntry::zeroed();
+            // SAFETY: `entry` is a live, writable `turbine_impl_entry` on this stack frame; the
+            // library fills it with pointers to static strings and keeps no pointer to it.
+            let rc = unsafe { (fns.info)(code, index, &mut entry) };
+            if rc != 0 {
+                return Vec::new();
+            }
+            out.push(ImplInfo {
+                index: index as u32,
+                name: ffi::c_str(entry.name),
+                provider: ffi::c_str(entry.provider),
+                needs_host_offsets: entry.flags & ffi::IMPL_NEEDS_HOST_OFFSETS != 0,
+            });
+        }
+        out
+    }
+
+    /// `turbine_impl_supports(op, index, desc)` (ABI v2.4): false when the library does not
+    /// enumerate. `desc` must be `op`'s descriptor type.
+    fn impl_supports<D>(&self, op: OpKind, index: u32, desc: &D) -> bool {
+        let Some(fns) = self.syms.v21.impls else {
+            return false;
+        };
+        let Ok(index) = i32::try_from(index) else {
+            return false;
+        };
+        // SAFETY: `desc` is a fully initialised descriptor of `op`'s type (the caller's
+        // contract); the library reads only its shape and dtype fields, ignores its pointers and
+        // needs no context (header v2.4, like `_supported`).
+        unsafe { (fns.supports)(op.abi_code(), index, std::ptr::from_ref(desc).cast()) == 1 }
     }
 
     /// Creates a context on `device`. A device whose architecture is not in `build_archs` is
@@ -462,6 +514,37 @@ impl ShimContext {
         let code = unsafe { (options.get)(self.raw, option, &mut value) };
         self.check(code)?;
         Ok(value)
+    }
+
+    /// Hands `profile`'s thresholds to the library (ABI v2.4 `turbine_ctx_set_profile`), with
+    /// this context's device architecture; the defaults of the `turbine_<op>` entry points read
+    /// them. A no-op `Ok` when the library does not enumerate implementations (it keeps its own
+    /// choice); `Unsupported` when the library refuses the profile (wave size, LDS or arch).
+    pub fn set_profile(&self, profile: &CardProfile) -> Result<(), KernelError> {
+        let Some(fns) = self.lib.syms.v21.impls else {
+            return Ok(());
+        };
+        let arch = std::ffi::CString::new(self.info.device_arch.as_str()).map_err(|_| {
+            invalid(format!(
+                "device arch {:?} contains a NUL byte",
+                self.info.device_arch
+            ))
+        })?;
+        let desc = ffi::CardProfileDesc {
+            struct_bytes: std::mem::size_of::<ffi::CardProfileDesc>() as u32,
+            arch: arch.as_ptr(),
+            wave_size: to_i32("wave_size", profile.capabilities.wave_size)?,
+            lds_bytes: to_i32("lds_bytes", profile.capabilities.lds_bytes)?,
+            moe_small_max_rows: i64::from(profile.thresholds.moe_small_max_rows),
+            paged_page_multiple: to_i32(
+                "paged_page_multiple",
+                profile.thresholds.paged_page_multiple,
+            )?,
+        };
+        // SAFETY: `raw` is a live context of this library; `desc` and the string `arch` points
+        // to live on this stack frame for the call, and the library copies what it keeps.
+        let code = unsafe { (fns.set_profile)(self.raw, &desc) };
+        self.check(code)
     }
 
     fn graph_fns(&self) -> Result<ffi::GraphFns, KernelError> {
@@ -1853,6 +1936,64 @@ impl KernelProvider for ShimProvider {
             .is_some()
             .then_some(self as &dyn LogitsReduceKernel)
     }
+
+    fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
+        self.ctx.lib.implementations(op)
+    }
+
+    /// `turbine_impl_supports` on the probe descriptor of `spec` (a `moe_experts` probe covers
+    /// `rows` routed rows), after the same config checks as the family's `supports`.
+    fn implementation_supports(&self, spec: &OpConfig, index: u32, rows: Option<u32>) -> bool {
+        let lib = &self.ctx.lib;
+        match spec {
+            OpConfig::Gemm(cfg) => lib.impl_supports(OpKind::Gemm, index, &gemm_probe(cfg)),
+            OpConfig::Attention(cfg) if cfg.kind.is_paged() => {
+                cfg.block_tokens.is_some_and(|b| b > 0)
+                    && lib.impl_supports(cfg.op(), index, &paged_probe(cfg))
+            }
+            OpConfig::Attention(cfg) => {
+                cfg.block_tokens.is_none()
+                    && lib.impl_supports(cfg.op(), index, &attention_probe(cfg))
+            }
+            OpConfig::Rmsnorm(cfg) => {
+                lib.impl_supports(OpKind::Rmsnorm, index, &rmsnorm_probe(cfg))
+            }
+            OpConfig::Rope(cfg) => lib.impl_supports(OpKind::Rope, index, &rope_probe(cfg)),
+            OpConfig::SiluMul(cfg) => {
+                lib.impl_supports(OpKind::SiluMul, index, &silu_mul_probe(cfg))
+            }
+            OpConfig::Embedding(cfg) => {
+                lib.impl_supports(OpKind::Embedding, index, &embedding_probe(cfg))
+            }
+            OpConfig::Add(cfg) => lib.impl_supports(OpKind::Add, index, &add_probe(cfg)),
+            OpConfig::CopyBlocks(cfg) => {
+                lib.impl_supports(OpKind::CopyBlocks, index, &copy_blocks_probe(cfg))
+            }
+            OpConfig::MoeRoute(cfg) => {
+                (!cfg.bf16_logits || self.syms().v21.minor >= 2)
+                    && lib.impl_supports(OpKind::MoeRoute, index, &moe_route_probe(cfg))
+            }
+            OpConfig::MoeExperts(cfg) => {
+                let top_k = cfg.top_k.max(1);
+                let tokens = rows.map_or(1, |r| r.div_ceil(top_k));
+                let Ok(tokens) = i32::try_from(tokens) else {
+                    return false;
+                };
+                lib.impl_supports(
+                    OpKind::MoeExperts,
+                    index,
+                    &moe_experts_probe_tokens(cfg, tokens),
+                )
+            }
+            OpConfig::AddRmsnorm(cfg) => {
+                lib.impl_supports(OpKind::AddRmsnorm, index, &add_rmsnorm_probe(cfg))
+            }
+            OpConfig::LogitsReduce(cfg) => {
+                cfg.top_n <= LogitsReduceConfig::MAX_TOP_N
+                    && lib.impl_supports(OpKind::LogitsReduce, index, &logits_reduce_probe(cfg))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2461,5 +2602,96 @@ mod tests {
         }
         let cuda = ShimLibrary::search_paths("cuda", None);
         assert_eq!(cuda.last(), Some(&PathBuf::from("libturbine_cuda.so")));
+    }
+
+    fn profile_small_rows(lib: &ShimLibrary, ctx: &ShimContext) -> i64 {
+        stub_hook(
+            lib,
+            "stub_profile_small_rows",
+            |f: unsafe extern "C" fn(*const TurbineCtx) -> i64| {
+                // SAFETY: the stub defines `int64_t stub_profile_small_rows(const turbine_ctx *)`;
+                // `ctx.raw` is a live context of this library, only read by the hook.
+                unsafe { f(ctx.raw) }
+            },
+        )
+    }
+
+    /// ABI v2.4: the V24 stub (minor 4) enumerates two `rmsnorm` implementations with their
+    /// providers and one for every other op, and accepts the card profile with its device arch
+    /// (the thresholds reach the context). Breaks if the group is not resolved on a minor-4
+    /// library, if the enumeration drops or reorders an implementation, or if `set_profile` does
+    /// not reach the library.
+    #[test]
+    fn v24_enumeration_resolved() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V24")), "hip")
+            .expect("a v2.4 library loads");
+        assert_eq!((lib.abi_version(), lib.abi_minor()), (2, 4));
+        assert!(lib.enumerates_implementations());
+        assert_eq!(
+            lib.implementations(OpKind::Rmsnorm),
+            [
+                ImplInfo {
+                    index: 0,
+                    name: "stub_a".into(),
+                    provider: "stub".into(),
+                    needs_host_offsets: false,
+                },
+                ImplInfo {
+                    index: 1,
+                    name: "stub_b".into(),
+                    provider: "stub_alt".into(),
+                    needs_host_offsets: false,
+                },
+            ]
+        );
+        for &op in OpKind::ALL {
+            let impls = lib.implementations(op);
+            if op != OpKind::Rmsnorm {
+                let names: Vec<&str> = impls.iter().map(|i| i.name.as_str()).collect();
+                assert_eq!(names, [format!("stub_{op}")], "{op}");
+            }
+        }
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        assert_eq!(profile_small_rows(&lib, &ctx), -1);
+        ctx.set_profile(&crate::cards::GFX1201)
+            .expect("the stub accepts a profile on its build arch");
+        assert_eq!(profile_small_rows(&lib, &ctx), 512);
+
+        // The provider asks `turbine_impl_supports` per implementation: stub_b refuses dim 4096.
+        let provider = shim_provider(Arc::clone(&ctx));
+        assert_eq!(provider.implementations(OpKind::Rmsnorm).len(), 2);
+        let norm = |dim| {
+            OpConfig::Rmsnorm(NormConfig {
+                dim,
+                dtype: DType::BF16,
+            })
+        };
+        assert!(provider.implementation_supports(&norm(2048), 0, None));
+        assert!(provider.implementation_supports(&norm(2048), 1, None));
+        assert!(provider.implementation_supports(&norm(4096), 0, None));
+        assert!(!provider.implementation_supports(&norm(4096), 1, None));
+        assert!(!provider.implementation_supports(&norm(2048), 2, None));
+    }
+
+    /// A v2.3 library (the V21 stub, minor 3) has no v2.4 group: nothing is enumerated and
+    /// `set_profile` is a no-op, so the library keeps choosing its implementations itself.
+    #[test]
+    fn v23_library_has_no_enumeration() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V21")), "hip")
+            .expect("a v2.3 library loads");
+        assert_eq!(lib.abi_minor(), 3);
+        assert!(!lib.enumerates_implementations());
+        for &op in OpKind::ALL {
+            assert!(lib.implementations(op).is_empty(), "{op}");
+        }
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        ctx.set_profile(&crate::cards::GFX1201)
+            .expect("no v2.4 group: set_profile does nothing");
     }
 }

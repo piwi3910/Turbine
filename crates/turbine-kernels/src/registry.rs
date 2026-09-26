@@ -104,8 +104,9 @@ impl OpConfig {
     }
 
     /// The implementation name `provider` would run for this config, or `None` when it lacks
-    /// the op family or its `supports()` is false.
-    fn probe(&self, provider: &dyn KernelProvider) -> Option<String> {
+    /// the op family or its `supports()` is false: the provider's own choice (for a shim
+    /// library, `turbine_<op>_impl`).
+    pub fn probe(&self, provider: &dyn KernelProvider) -> Option<String> {
         match self {
             OpConfig::Gemm(cfg) => provider
                 .gemm()

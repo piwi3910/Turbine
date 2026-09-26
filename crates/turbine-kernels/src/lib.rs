@@ -21,7 +21,7 @@ pub use ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
     ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
-    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, KernelProvider, KvCopyConfig,
+    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplInfo, KernelProvider, KvCopyConfig,
     KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
     MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
     NormContext, NormKernel, OpKind, PagedAttentionContext, ProviderId, RopeConfig, RopeContext,

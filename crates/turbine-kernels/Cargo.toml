@@ -31,6 +31,8 @@ tracing-subscriber.workspace = true
 rand_chacha.workspace = true
 # Parses the core crates' sources in tests/vendor_neutral_api.rs (vendor_types_in_core_signatures)
 syn.workspace = true
+# Reads the recorded kernel choices (tests/lab/kernel-choices-*.json) in the hip_ops lab tests
+serde_json.workspace = true
 
 # FFI to the kernel shim libraries; every `unsafe` block carries a `// SAFETY:` comment
 # (contract §1.3, checked by tests/unsafe_isolation.rs).

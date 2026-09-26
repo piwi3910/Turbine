@@ -11,6 +11,7 @@ use turbine_core::types::{BlockId, DType};
 use turbine_tensor::{DeviceSlice, TensorView};
 
 use crate::KernelError;
+use crate::registry::OpConfig;
 
 /// One entry point of the kernel C ABI; `as_str` is the `turbine_<op>` suffix and the `op`
 /// metric label.
@@ -75,6 +76,39 @@ impl OpKind {
             OpKind::LogitsReduce => "logits_reduce",
         }
     }
+
+    /// The `TURBINE_OP_*` code of kernel ABI v2.4: the op's position in [`OpKind::ALL`].
+    pub fn abi_code(self) -> i32 {
+        match self {
+            OpKind::Gemm => 0,
+            OpKind::AttentionPrefill => 1,
+            OpKind::AttentionDecode => 2,
+            OpKind::Rmsnorm => 3,
+            OpKind::Rope => 4,
+            OpKind::SiluMul => 5,
+            OpKind::Embedding => 6,
+            OpKind::Add => 7,
+            OpKind::AttentionPrefillPaged => 8,
+            OpKind::AttentionDecodePaged => 9,
+            OpKind::CopyBlocks => 10,
+            OpKind::MoeRoute => 11,
+            OpKind::MoeExperts => 12,
+            OpKind::AddRmsnorm => 13,
+            OpKind::LogitsReduce => 14,
+        }
+    }
+}
+
+/// One implementation of an op a provider enumerates (kernel ABI v2.4 `turbine_impl_info`):
+/// `index` is its position in the provider's order, `name` the name `implementation()` reports
+/// when it runs, `provider` its family (`hipblaslt`, `ck`, `turbine_hip`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImplInfo {
+    pub index: u32,
+    pub name: String,
+    pub provider: String,
+    /// `moe_experts`: the implementation reads `host_expert_offsets`.
+    pub needs_host_offsets: bool,
 }
 
 impl fmt::Display for OpKind {
@@ -705,6 +739,21 @@ pub trait KernelProvider: Send + Sync {
     }
     fn logits_reduce(&self) -> Option<&dyn LogitsReduceKernel> {
         None
+    }
+
+    /// The implementations of `op` the provider enumerates (kernel ABI v2.4), in its own order.
+    /// Empty (the default) when the provider chooses the implementation of every call itself.
+    fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
+        let _ = op;
+        Vec::new()
+    }
+
+    /// Whether implementation `index` of [`KernelProvider::implementations`] supports `spec`;
+    /// `rows` is the routed-row count a `moe_experts` call is sized for (`None` for other ops).
+    /// False (the default) for a provider that does not enumerate.
+    fn implementation_supports(&self, spec: &OpConfig, index: u32, rows: Option<u32>) -> bool {
+        let _ = (spec, index, rows);
+        false
     }
 }
 

@@ -16,13 +16,14 @@ use half::bf16;
 use turbine_core::config::DevicesConfig;
 use turbine_core::types::{BlockId, DType, DeviceId, Vendor};
 use turbine_device::{DiscoveryOptions, discover};
+use turbine_kernels::cards::GFX1201;
 use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
     AttentionContext, AttentionKind, ElementwiseConfig, ElementwiseContext, EmbeddingConfig,
-    EmbeddingContext, GemmConfig, GemmContext, KernelProvider, KvCopyConfig, KvCopyContext,
-    LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
-    MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
+    EmbeddingContext, GemmConfig, GemmContext, ImplInfo, KernelProvider, KvCopyConfig,
+    KvCopyContext, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
+    MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, OpConfig, OpKind,
     PagedAttentionContext, RopeConfig, RopeContext, ShimLibrary, cpu_reference_provider,
     shim_provider,
 };
@@ -3914,5 +3915,229 @@ fn prefill_op_timings() {
                 }
             }
         }
+    }
+}
+
+// ------------------------------------------ implementation enumeration (lab, Phase 2m S-5)
+
+/// The `dtype=` value of a rendered config.
+fn parse_dtype(v: &str) -> DType {
+    match v {
+        "bf16" => DType::BF16,
+        "f16" => DType::F16,
+        "f32" => DType::F32,
+        other => panic!("unknown dtype {other}"),
+    }
+}
+
+/// The `OpConfig` of one recorded kernel choice (`op` and its rendered `config`), which must
+/// render back to `config`.
+fn parse_choice(op: &str, config: &str) -> OpConfig {
+    let kv: std::collections::HashMap<&str, &str> = config
+        .split_whitespace()
+        .map(|p| p.split_once('=').expect("key=value"))
+        .collect();
+    let num = |k: &str| -> u64 {
+        kv.get(k)
+            .unwrap_or_else(|| panic!("{op} {config}: no {k}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("{op} {config}: {k}: {e}"))
+    };
+    let flag = |k: &str| num(k) == 1;
+    let dtype = |k: &str| parse_dtype(kv[k]);
+    let attention = |kind| {
+        OpConfig::Attention(AttentionConfig {
+            kind,
+            num_q_heads: num("q_heads") as u32,
+            num_kv_heads: num("kv_heads") as u32,
+            head_dim: num("head_dim") as u32,
+            dtype: dtype("dtype"),
+            block_tokens: kv
+                .get("block_tokens")
+                .map(|b| b.parse().expect("block_tokens")),
+            causal: flag("causal"),
+        })
+    };
+    let spec = match op {
+        "gemm" => OpConfig::Gemm(GemmConfig {
+            n: num("n"),
+            k: num("k"),
+            trans_b: flag("trans_b"),
+            a_dtype: dtype("a_dtype"),
+            b_dtype: dtype("b_dtype"),
+            c_dtype: dtype("c_dtype"),
+        }),
+        "attention_prefill" => attention(AttentionKind::Prefill),
+        "attention_decode" => attention(AttentionKind::Decode),
+        "attention_prefill_paged" => attention(AttentionKind::PrefillPaged),
+        "attention_decode_paged" => attention(AttentionKind::DecodePaged),
+        "rmsnorm" => OpConfig::Rmsnorm(NormConfig {
+            dim: num("dim"),
+            dtype: dtype("dtype"),
+        }),
+        "add_rmsnorm" => OpConfig::AddRmsnorm(AddRmsnormConfig {
+            dim: num("dim") as u32,
+            dtype: dtype("dtype"),
+        }),
+        "rope" => OpConfig::Rope(RopeConfig {
+            num_q_heads: num("q_heads") as u32,
+            num_kv_heads: num("kv_heads") as u32,
+            head_dim: num("head_dim") as u32,
+            rotary_dim: num("rotary_dim") as u32,
+            dtype: dtype("dtype"),
+        }),
+        "silu_mul" => OpConfig::SiluMul(ActivationConfig {
+            cols: num("cols"),
+            dtype: dtype("dtype"),
+        }),
+        "embedding" => OpConfig::Embedding(EmbeddingConfig {
+            hidden: num("hidden"),
+            vocab_rows: num("vocab_rows"),
+            dtype: dtype("dtype"),
+        }),
+        "add" => OpConfig::Add(ElementwiseConfig {
+            dtype: dtype("dtype"),
+        }),
+        "copy_blocks" => OpConfig::CopyBlocks(KvCopyConfig {
+            num_layers: num("num_layers") as u32,
+            block_bytes: num("block_bytes"),
+        }),
+        "moe_route" => OpConfig::MoeRoute(MoeRouteConfig {
+            num_experts: num("experts") as u32,
+            top_k: num("top_k") as u32,
+            renormalize: flag("renormalize"),
+            bf16_logits: flag("bf16_logits"),
+        }),
+        "moe_experts" => {
+            let (begin, end) = kv["local"].split_once("..").expect("local=a..b");
+            OpConfig::MoeExperts(MoeExpertsConfig {
+                hidden: num("hidden") as u32,
+                inter: num("inter") as u32,
+                num_experts: num("experts") as u32,
+                top_k: num("top_k") as u32,
+                expert_begin: begin.parse().expect("expert_begin"),
+                expert_end: end.parse().expect("expert_end"),
+                dtype: dtype("dtype"),
+            })
+        }
+        "logits_reduce" => OpConfig::LogitsReduce(LogitsReduceConfig {
+            vocab: num("vocab") as u32,
+            top_n: num("top_n") as u32,
+        }),
+        other => panic!("unknown op {other}"),
+    };
+    assert_eq!(spec.op().as_str(), op);
+    assert_eq!(spec.render(), config, "{op} config round trip");
+    spec
+}
+
+/// `(model, spec, implementation)` of every entry of
+/// `tests/lab/kernel-choices-{llama,olmoe}.json`: the implementations the served models ran on
+/// main (recorded from `/turbine/v1/status`).
+fn recorded_choices() -> Vec<(&'static str, OpConfig, String)> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/lab");
+    let mut out = Vec::new();
+    for model in ["llama", "olmoe"] {
+        let path = dir.join(format!("kernel-choices-{model}.json"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let entries: serde_json::Value = serde_json::from_str(&text).expect("kernel choices JSON");
+        for e in entries.as_array().expect("an array of choices") {
+            let field = |k: &str| e[k].as_str().unwrap_or_else(|| panic!("{k} in {e}"));
+            let spec = parse_choice(field("op"), field("config"));
+            out.push((model, spec, field("implementation").to_string()));
+        }
+    }
+    out
+}
+
+/// Phase 2m Task 10 (kernel ABI v2.4): `libturbine_hip.so` enumerates exactly its implementation
+/// table per op (names, provider families, the host-offsets flag), and for every op config the
+/// served Llama and OLMoE models use (`tests/lab/kernel-choices-*.json`) the first
+/// implementation in library order that `turbine_impl_supports` accepts (for `moe_experts` at
+/// the first row tier of the gfx1201 profile) is the one the library's own `turbine_<op>_impl`
+/// names and the one main served. Breaks if the table drifts from the contract (§9.1) or if
+/// enumeration and the library's own choice disagree.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn implementations_enumerated() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    const HOST: bool = true;
+    let one = |name: &'static str, provider: &'static str| vec![(name, provider, false)];
+    let norm = vec![
+        ("ck_tile_rmsnorm2d", "ck", false),
+        ("turbine_hip", "turbine_hip", false),
+    ];
+    let paged = vec![
+        ("ck_tile_fmha_pagedkv", "ck", false),
+        ("turbine_hip", "turbine_hip", false),
+    ];
+    // (name, provider, needs host offsets) in library order.
+    type Impls = Vec<(&'static str, &'static str, bool)>;
+    let table: Vec<(OpKind, Impls)> = vec![
+        (OpKind::Gemm, one("hipblaslt", "hipblaslt")),
+        (OpKind::AttentionPrefill, one("ck_tile_fmha_fwd", "ck")),
+        (OpKind::AttentionDecode, one("ck_tile_fmha_fwd", "ck")),
+        (OpKind::Rmsnorm, norm.clone()),
+        (OpKind::Rope, one("turbine_hip", "turbine_hip")),
+        (OpKind::SiluMul, one("turbine_hip", "turbine_hip")),
+        (OpKind::Embedding, one("turbine_hip", "turbine_hip")),
+        (OpKind::Add, one("turbine_hip", "turbine_hip")),
+        (OpKind::AttentionPrefillPaged, paged.clone()),
+        (OpKind::AttentionDecodePaged, paged),
+        (OpKind::CopyBlocks, one("hip_memcpy_d2d", "turbine_hip")),
+        (OpKind::MoeRoute, one("turbine_hip", "turbine_hip")),
+        (
+            OpKind::MoeExperts,
+            vec![
+                ("turbine_hip_moe_small_m", "turbine_hip", false),
+                ("turbine_hip_moe_wmma", "turbine_hip", false),
+                ("hipblaslt_grouped", "hipblaslt", HOST),
+                ("hipblaslt_per_expert", "hipblaslt", HOST),
+            ],
+        ),
+        (OpKind::AddRmsnorm, norm),
+        (OpKind::LogitsReduce, one("turbine_hip", "turbine_hip")),
+    ];
+    assert_eq!(table.len(), OpKind::ALL.len());
+    for (op, want) in &table {
+        let want: Vec<ImplInfo> = want
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, provider, host))| ImplInfo {
+                index: i as u32,
+                name: name.into(),
+                provider: provider.into(),
+                needs_host_offsets: host,
+            })
+            .collect();
+        assert_eq!(p.hip.implementations(*op), want, "{op}");
+        let names: Vec<&str> = want.iter().map(|i| i.name.as_str()).collect();
+        println!("implementations {op}: {}", names.join(", "));
+    }
+
+    let first_tier = GFX1201.thresholds.moe_small_max_rows;
+    for (model, spec, recorded) in recorded_choices() {
+        let what = format!("{model} {} {}", spec.op(), spec.render());
+        let legacy = spec
+            .probe(p.hip.as_ref())
+            .unwrap_or_else(|| panic!("{what}: unsupported"));
+        let rows = matches!(spec, OpConfig::MoeExperts(_)).then_some(first_tier);
+        let enumerated = p
+            .hip
+            .implementations(spec.op())
+            .into_iter()
+            .find(|i| p.hip.implementation_supports(&spec, i.index, rows))
+            .unwrap_or_else(|| panic!("{what}: no implementation supports it"));
+        assert_eq!(legacy, recorded, "{what}: the library's own choice");
+        assert_eq!(
+            enumerated.name, recorded,
+            "{what}: first supporting implementation"
+        );
+        println!("{what}: {recorded} ok");
     }
 }

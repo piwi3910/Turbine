@@ -1,4 +1,4 @@
-/* Turbine vendor-neutral kernel C ABI, version 2.3 (contract section 9).
+/* Turbine vendor-neutral kernel C ABI, version 2.4 (contract section 9).
  *
  * Every backend shim library implements this header and is loaded by
  * turbine-kernels at run time. No vendor type, identifier or name appears here,
@@ -387,8 +387,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * turbine_abi_minor() >= 1, and a library without them runs the ABI v2 paths
  * (add then rmsnorm, whole logits rows, eager launches). */
 /* v2.2 adds TURBINE_MOE_ROUTE_BF16_LOGITS (a flag bit, no new symbol); v2.3
- * adds pinned host memory and events (below). */
-#define TURBINE_ABI_MINOR 3u
+ * adds pinned host memory and events; v2.4 implementation enumeration and the
+ * card profile (both below). */
+#define TURBINE_ABI_MINOR 4u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -507,6 +508,76 @@ int32_t turbine_event_destroy(turbine_ctx *ctx, turbine_event *e);
 int32_t turbine_event_record(turbine_ctx *ctx, turbine_event *e,
                              turbine_stream *s);
 int32_t turbine_event_synchronize(turbine_ctx *ctx, turbine_event *e);
+
+/* ======== v2.4 (additive, optional): implementation enumeration and card
+ * profile ========
+ * Resolved only when turbine_abi_minor() >= 4 and all five functions exist; a
+ * library without them keeps choosing the implementation of every
+ * turbine_<op> call itself.
+ *
+ * Each op has one or more implementations, indexed 0..turbine_impl_count(op)
+ * in the library's order. The caller asks which of them supports a descriptor
+ * (turbine_impl_supports: like turbine_<op>_supported, it ignores pointer
+ * fields and needs no context), picks one, and runs exactly that one with
+ * turbine_impl_run. The turbine_<op> entry points stay: they run the first
+ * implementation, in library order, that supports the descriptor, within the
+ * row tiers of the context's card profile (moe_experts: the implementations
+ * marked for small row counts serve up to moe_small_max_rows routed rows).
+ * Op codes follow the order of the op trios in this header. */
+#define TURBINE_OP_GEMM 0
+#define TURBINE_OP_ATTENTION_PREFILL 1
+#define TURBINE_OP_ATTENTION_DECODE 2
+#define TURBINE_OP_RMSNORM 3
+#define TURBINE_OP_ROPE 4
+#define TURBINE_OP_SILU_MUL 5
+#define TURBINE_OP_EMBEDDING 6
+#define TURBINE_OP_ADD 7
+#define TURBINE_OP_ATTENTION_PREFILL_PAGED 8
+#define TURBINE_OP_ATTENTION_DECODE_PAGED 9
+#define TURBINE_OP_COPY_BLOCKS 10
+#define TURBINE_OP_MOE_ROUTE 11
+#define TURBINE_OP_MOE_EXPERTS 12
+#define TURBINE_OP_ADD_RMSNORM 13
+#define TURBINE_OP_LOGITS_REDUCE 14
+/* the implementation reads host_expert_offsets (moe_experts) */
+#define TURBINE_IMPL_NEEDS_HOST_OFFSETS 1u
+typedef struct turbine_impl_entry {
+  /* static storage, e.g. the names turbine_<op>_impl returns */
+  const char *name;
+  /* implementation family, static storage */
+  const char *provider;
+  /* TURBINE_IMPL_* */
+  uint32_t flags;
+} turbine_impl_entry;
+typedef struct turbine_card_profile {
+  /* sizeof(turbine_card_profile) */
+  uint32_t struct_bytes;
+  /* host string; one of turbine_build_archs() */
+  const char *arch;
+  int32_t wave_size;
+  int32_t lds_bytes;
+  /* routed rows of the first moe_experts tier */
+  int64_t moe_small_max_rows;
+  int32_t paged_page_multiple;
+} turbine_card_profile;
+/* Number of implementations of op (>= 1), or TURBINE_E_ARGUMENT for an unknown
+ * op. */
+int32_t turbine_impl_count(int32_t op);
+/* out is a host struct; TURBINE_E_ARGUMENT for an unknown op or index. */
+int32_t turbine_impl_info(int32_t op, int32_t index, turbine_impl_entry *out);
+/* 1 supported, 0 not, < 0 error; desc is the op's descriptor; pointer fields
+ * ignored; no context. */
+int32_t turbine_impl_supports(int32_t op, int32_t index, const void *desc);
+/* Runs implementation index of op on ctx's compute stream;
+ * TURBINE_E_UNSUPPORTED when it does not support desc. */
+int32_t turbine_impl_run(turbine_ctx *ctx, int32_t op, int32_t index,
+                         const void *desc);
+/* Copies *p into the context (the defaults of turbine_<op> read it);
+ * TURBINE_E_UNSUPPORTED when wave_size differs from the compiled wave size,
+ * lds_bytes is below the library's largest static LDS use, or arch is not a
+ * build arch. */
+int32_t turbine_ctx_set_profile(turbine_ctx *ctx,
+                                const turbine_card_profile *p);
 
 #ifdef __cplusplus
 }
