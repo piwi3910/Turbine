@@ -12,13 +12,14 @@ use turbine_core::request::SamplingParams;
 
 use crate::structured::TokenMask;
 
-/// One sampled token with its log-probability under the raw (temperature 1, untruncated,
-/// unbiased, unmasked) distribution and, when requested, the most likely raw alternatives
-/// (highest first, ties by id).
+/// One sampled token and, when the request asked for logprobs, its log-probability under the
+/// raw (temperature 1, untruncated, unbiased, unmasked) distribution and the most likely raw
+/// alternatives (highest first, ties by id). Without logprobs `logprob` is `None` and nothing
+/// normalises the row (a full-vocabulary pass the draw does not need).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SampledToken {
     pub token: u32,
-    pub logprob: f32,
+    pub logprob: Option<f32>,
     pub top_logprobs: Vec<(u32, f32)>,
 }
 
@@ -46,6 +47,8 @@ pub struct Sampler {
     top_p: f32,
     /// `None` = disabled (request `top_k` −1 or 0).
     top_k: Option<usize>,
+    /// The request asked for logprobs (`logprobs` present, even 0).
+    logprobs: bool,
     /// Alternatives reported per token (0 = none).
     top_logprobs: usize,
     presence_penalty: f32,
@@ -189,6 +192,7 @@ impl Sampler {
             temperature: params.temperature,
             top_p: params.top_p,
             top_k: usize::try_from(params.top_k).ok().filter(|&k| k > 0),
+            logprobs: params.logprobs.is_some(),
             top_logprobs: params.logprobs.map_or(0, |n| n as usize),
             presence_penalty: params.presence_penalty,
             frequency_penalty: params.frequency_penalty,
@@ -222,16 +226,16 @@ impl Sampler {
 
     /// Picks the next token from one vocabulary row. `logits` is adjusted in place (bias,
     /// penalties, `min_tokens`, `mask`); with none of them active it is left unchanged. The
-    /// reported logprobs are the log-softmax of `logits` as passed in (before temperature).
+    /// reported logprobs (only when requested) are the log-softmax of `logits` as passed in
+    /// (before temperature).
     pub fn sample(&mut self, logits: &mut [f32], mask: Option<&TokenMask>) -> SampledToken {
-        let lse = log_sum_exp(logits);
-        let top_logprobs = if self.top_logprobs > 0 {
-            top_n(logits, self.top_logprobs)
+        let lse = self.logprobs.then(|| log_sum_exp(logits));
+        let top_logprobs = match lse {
+            Some(lse) if self.top_logprobs > 0 => top_n(logits, self.top_logprobs)
                 .into_iter()
                 .map(|(id, v)| (id, v - lse))
-                .collect()
-        } else {
-            Vec::new()
+                .collect(),
+            _ => Vec::new(),
         };
         self.adjust(logits, mask);
         let token = if !logits.iter().any(|&v| v > f32::NEG_INFINITY) {
@@ -243,14 +247,17 @@ impl Sampler {
         } else {
             self.draw(logits)
         };
-        let raw = self
-            .originals
-            .get(&token)
-            .copied()
-            .unwrap_or(logits[token as usize]);
+        let logprob = lse.map(|lse| {
+            let raw = self
+                .originals
+                .get(&token)
+                .copied()
+                .unwrap_or(logits[token as usize]);
+            raw - lse
+        });
         SampledToken {
             token,
-            logprob: raw - lse,
+            logprob,
             top_logprobs,
         }
     }
@@ -414,12 +421,13 @@ mod tests {
         let raw = vec![1.0f32, 3.0, 2.0, 0.0];
         let mut p = greedy();
         p.logit_bias = vec![(2, 1.5), (99, 5.0)]; // out-of-vocab ids are ignored
+        p.logprobs = Some(0);
         let mut s = plain(&p);
         let mut logits = raw.clone();
         let t = s.sample(&mut logits, None);
         assert_eq!(t.token, 2);
         assert!(
-            (t.logprob - log_softmax(&raw)[2]).abs() < 1e-6,
+            (t.logprob.unwrap() - log_softmax(&raw)[2]).abs() < 1e-6,
             "raw logprob"
         );
         assert_eq!(logits[2], 3.5, "the bias is applied in place");
@@ -481,12 +489,13 @@ mod tests {
         let raw = vec![0.0f32, 1.0, 5.0, 4.0];
         let mut p = greedy();
         p.min_tokens = 10;
+        p.logprobs = Some(0);
         let mut s = Sampler::new(&p, &[], &[2, 3]);
         let mut mask = TokenMask::new_none(4);
         mask.allow(3);
         let t = s.sample(&mut raw.clone(), Some(&mask));
         assert_eq!(t.token, 3, "the grammar only allows ending");
-        assert!((t.logprob - log_softmax(&raw)[3]).abs() < 1e-6);
+        assert!((t.logprob.unwrap() - log_softmax(&raw)[3]).abs() < 1e-6);
     }
 
     #[test]
@@ -544,7 +553,7 @@ mod tests {
         let s = sampler.sample(&mut logits, None);
         let lp = log_softmax(&raw);
         assert_eq!(s.token, 1, "greedy ties to the lower id");
-        assert!((s.logprob - lp[1]).abs() < 1e-6);
+        assert!((s.logprob.unwrap() - lp[1]).abs() < 1e-6);
         let ids: Vec<u32> = s.top_logprobs.iter().map(|t| t.0).collect();
         assert_eq!(ids, vec![1, 2, 4]);
         assert!((s.top_logprobs[2].1 - lp[4]).abs() < 1e-6);
@@ -554,11 +563,13 @@ mod tests {
     #[test]
     fn logprob_is_untempered() {
         let raw = vec![1.0, 2.0, 3.0];
-        let mut sampler = plain(&params(0.5, 1.0, -1, 3));
+        let mut p = params(0.5, 1.0, -1, 3);
+        p.logprobs = Some(0);
+        let mut sampler = plain(&p);
         let s = sampler.sample(&mut raw.clone(), None);
         let lp = log_softmax(&raw);
-        assert!((s.logprob - lp[s.token as usize]).abs() < 1e-6);
-        assert!(s.top_logprobs.is_empty(), "no logprobs requested");
+        assert!((s.logprob.unwrap() - lp[s.token as usize]).abs() < 1e-6);
+        assert!(s.top_logprobs.is_empty(), "no alternatives requested");
     }
 
     #[test]
@@ -614,6 +625,172 @@ mod tests {
         for (c, e) in counts.iter().zip(expected) {
             let f = *c as f64 / f64::from(n);
             assert!((f - e).abs() < 0.02, "{counts:?}");
+        }
+    }
+
+    /// The raw log-softmax costs a full pass over the vocabulary: it is computed only when the
+    /// request asked for logprobs, and the draw is the same either way.
+    #[test]
+    fn logprob_only_when_requested() {
+        let raw: Vec<f32> = (0..300).map(|i| (i as f32 * 0.13).sin() * 4.0).collect();
+        for temperature in [0.0, 1.0] {
+            let without = params(temperature, 1.0, -1, 9);
+            let mut with = without.clone();
+            with.logprobs = Some(0);
+            let (mut a, mut b) = (plain(&without), plain(&with));
+            for _ in 0..20 {
+                let (x, y) = (
+                    a.sample(&mut raw.clone(), None),
+                    b.sample(&mut raw.clone(), None),
+                );
+                assert_eq!(x.token, y.token);
+                assert_eq!(x.logprob, None, "not requested");
+                let lp = y.logprob.expect("requested");
+                assert!((lp - log_softmax(&raw)[y.token as usize]).abs() < 1e-6);
+                assert!(
+                    y.top_logprobs.is_empty(),
+                    "logprobs 0 lists no alternatives"
+                );
+            }
+        }
+    }
+
+    /// Llama-3-sized rows: a broad bulk and a few confident candidates, deterministic.
+    fn big_rows(n: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        (0..n)
+            .map(|_| {
+                let mut u = || uniform(&mut rng);
+                let mut row: Vec<f32> = (0..128_256)
+                    .map(|_| (u() + u() + u() + u() - 2.0) * 3.0)
+                    .collect();
+                for k in 0..8 {
+                    let id = (u() * 128_256.0) as usize % 128_256;
+                    row[id] = 12.0 - k as f32 * 0.5;
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// Tokens the sampler drew before the host-overhead rework (commit 3e43675): seeded
+    /// sampling must keep giving exactly these, whatever the implementation does inside.
+    #[test]
+    fn seeded_tokens_are_pinned() {
+        let rows = big_rows(4, 99);
+        let mut small: Vec<f32> = (0..64).map(|i| ((i * 5) % 7) as f32 * 0.5).collect();
+        small[3] = f32::NAN;
+        small[10] = -0.0;
+        small[11] = 0.0;
+        let run = |p: &SamplingParams, rows: &[Vec<f32>], steps: usize| -> Vec<u32> {
+            let mut s = Sampler::new(p, &[1, 2, 3, 500], &[7]);
+            (0..steps)
+                .map(|i| {
+                    let t = s.sample(&mut rows[i % rows.len()].clone(), None).token;
+                    s.observe(t);
+                    t
+                })
+                .collect()
+        };
+        let mut penalised = params(0.8, 1.0, -1, 5);
+        penalised.frequency_penalty = 0.4;
+        penalised.repetition_penalty = 1.3;
+        penalised.logit_bias = vec![(9, 2.0)];
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, SamplingParams, Vec<Vec<f32>>, usize, Vec<u32>)> = vec![
+            (
+                "t1",
+                params(1.0, 1.0, -1, 1),
+                rows.clone(),
+                24,
+                vec![
+                    45042, 26804, 124538, 8354, 18760, 55854, 61148, 9877, 97167, 24856, 121233,
+                    70773, 34701, 28032, 101990, 8354, 9053, 99716, 27164, 69803, 5887, 30124,
+                    121233, 51127,
+                ],
+            ),
+            (
+                "t0.7 p0.9",
+                params(0.7, 0.9, -1, 2),
+                rows.clone(),
+                24,
+                vec![
+                    18760, 28032, 121233, 19279, 18760, 26804, 121233, 31116, 18760, 5934, 44015,
+                    19279, 18760, 28032, 121233, 8354, 18760, 5934, 121233, 8354, 34701, 26804,
+                    121233, 53372,
+                ],
+            ),
+            (
+                "t1.3 k50",
+                params(1.3, 1.0, 50, 3),
+                rows.clone(),
+                24,
+                vec![
+                    18760, 28032, 44015, 8354, 83676, 26804, 83007, 8354, 100211, 28032, 121233,
+                    86922, 34701, 5934, 3204, 8354, 26046, 5934, 83007, 8354, 77812, 99634, 121233,
+                    59009,
+                ],
+            ),
+            (
+                "t1 k40 p0.95",
+                params(1.0, 0.95, 40, 4),
+                rows.clone(),
+                24,
+                vec![
+                    97167, 28032, 61148, 8354, 34701, 83282, 3204, 31116, 18760, 5934, 121233,
+                    53372, 18760, 5934, 3204, 19279, 77812, 26804, 121233, 86922, 18760, 83282,
+                    3204, 19279,
+                ],
+            ),
+            (
+                "penalised",
+                penalised,
+                rows.clone(),
+                24,
+                vec![
+                    18760, 5934, 61148, 31116, 34701, 83282, 44015, 64337, 97167, 26804, 83007,
+                    8354, 2448, 124166, 121233, 53372, 77812, 55219, 20480, 86922, 100211, 101931,
+                    28707, 19279,
+                ],
+            ),
+            (
+                "small t1",
+                params(1.0, 1.0, -1, 6),
+                vec![small.clone()],
+                64,
+                vec![
+                    22, 29, 34, 32, 12, 22, 22, 50, 19, 39, 5, 43, 57, 4, 13, 6, 4, 61, 4, 15, 4,
+                    23, 16, 54, 25, 57, 41, 4, 25, 25, 55, 12, 43, 50, 1, 8, 25, 57, 50, 32, 22,
+                    12, 25, 39, 24, 59, 60, 37, 22, 22, 18, 25, 22, 32, 39, 25, 53, 15, 32, 36, 6,
+                    45, 39, 4,
+                ],
+            ),
+            (
+                "small p0.8",
+                params(1.0, 0.8, -1, 7),
+                vec![small.clone()],
+                64,
+                vec![
+                    25, 25, 32, 25, 39, 43, 4, 50, 18, 22, 5, 53, 39, 18, 39, 19, 53, 53, 1, 2, 60,
+                    32, 50, 53, 15, 8, 33, 39, 53, 60, 39, 8, 5, 46, 61, 18, 36, 46, 4, 32, 39, 60,
+                    39, 12, 53, 4, 18, 18, 1, 39, 15, 1, 32, 33, 57, 18, 25, 25, 15, 61, 25, 43,
+                    60, 60,
+                ],
+            ),
+            (
+                "small k3",
+                params(2.0, 1.0, 3, 8),
+                vec![small],
+                64,
+                vec![
+                    4, 4, 4, 25, 25, 25, 4, 18, 4, 18, 25, 25, 18, 25, 4, 25, 18, 18, 18, 25, 4, 4,
+                    4, 4, 4, 18, 18, 4, 4, 18, 18, 18, 4, 4, 18, 18, 4, 25, 18, 25, 18, 18, 18, 25,
+                    18, 25, 25, 18, 4, 4, 25, 18, 18, 18, 4, 25, 25, 18, 4, 4, 4, 25, 25, 25,
+                ],
+            ),
+        ];
+        for (name, p, rows, steps, expected) in cases {
+            assert_eq!(run(&p, &rows, steps), expected, "{name}");
         }
     }
 

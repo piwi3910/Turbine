@@ -301,7 +301,6 @@ impl ActiveRequest {
         metrics: Option<&ModelMetrics>,
     ) -> Result<Step, ModelError> {
         let prompt_len = self.prompt_len();
-        let with_logprobs = self.request.sampling.logprobs.is_some();
         let stop = &self.request.stop;
         let c = &mut self.choices[choice];
         let mask = match c.matcher.as_mut() {
@@ -406,7 +405,7 @@ impl ActiveRequest {
             choice: c.index,
             text,
             token_id: token,
-            logprob: with_logprobs.then_some(sampled.logprob),
+            logprob: sampled.logprob,
             top_logprobs: sampled.top_logprobs,
         });
         if let Some(calls) = calls {

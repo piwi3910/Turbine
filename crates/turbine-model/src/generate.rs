@@ -194,12 +194,11 @@ impl Generation<'_> {
             let text: String = self.held.drain(..emit).collect();
             (text, None)
         };
-        let with_logprobs = self.req.sampling.logprobs.is_some();
         self.pending.push_back(GenerationEvent::Token {
             choice: 0,
             text,
             token_id: token,
-            logprob: with_logprobs.then_some(sampled.logprob),
+            logprob: sampled.logprob,
             top_logprobs: sampled.top_logprobs,
         });
         if let Some(reason) = finish {
