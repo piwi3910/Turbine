@@ -28,8 +28,7 @@ use turbine_core::types::Priority;
 use turbine_device::DeviceInventory;
 use turbine_kernels::Selection;
 use turbine_kv::blocks_for_tokens;
-use turbine_model::tools::{LLAMA3_JSON, PYTHON_TAG};
-use turbine_model::{ChatTemplate, Llama3JsonParser, Tokenizer, ToolChoice, tool_call_grammar};
+use turbine_model::{ChatTemplate, Tokenizer, ToolChoice};
 use turbine_scheduler::{SchedulerMetrics, SubmitError};
 
 use crate::engine::grammar::GrammarService;
@@ -132,7 +131,7 @@ pub struct ModelBackend {
     template: Arc<ChatTemplate>,
     /// Compiles `response_format` and tool grammars before queueing.
     grammars: GrammarService,
-    /// `model.tool_call_parser`; `None` when it resolved to `none`.
+    /// The format of `model.tool_call_parser`; `None` when it resolved to `none`.
     tool_parser: Option<ToolParser>,
     metrics: ServerMetrics,
     /// `turbine_admission_total` for `invalid_json_schema` (refused before the scheduler).
@@ -154,14 +153,11 @@ impl ModelBackend {
         let eos_token_ids = crate::model::eos_token_ids(&model.arch, &model.generation)
             .into_iter()
             .collect();
-        let tool_parser = match model.tool_call_parser {
-            Some(name @ LLAMA3_JSON) => Some(ToolParser {
-                parser: Arc::new(Llama3JsonParser::new()),
-                label: name,
-                python_tag: model.tokenizer.token_to_id(PYTHON_TAG),
-            }),
-            _ => None,
-        };
+        let tool_parser = model.tool_format.as_ref().map(|bound| ToolParser {
+            format: Arc::clone(bound),
+            parser: Arc::from(bound.format.parser()),
+            label: bound.format.name(),
+        });
         ModelBackend {
             state: AtomicU8::new(STATE_LOADING),
             loaded: OnceLock::new(),
@@ -389,9 +385,11 @@ impl ModelBackend {
             (ToolChoice::Auto | ToolChoice::Required | ToolChoice::Named(_), Some(p)) => {
                 // `auto` is held to free text or schema-valid calls; it is still held and
                 // parsed only when it opens like a call.
-                let spec =
-                    tool_call_grammar(&tools, &tool_choice, body.parallel_tool_calls_enabled())
-                        .map_err(|e| ApiError::invalid_json_schema(e.to_string()))?;
+                let spec = p
+                    .format
+                    .format
+                    .grammar(&tools, &tool_choice, body.parallel_tool_calls_enabled())
+                    .map_err(|e| ApiError::invalid_json_schema(e.to_string()))?;
                 let output = match tool_choice {
                     ToolChoice::Auto => ToolOutput::Auto(p),
                     _ => ToolOutput::Constrained(p),

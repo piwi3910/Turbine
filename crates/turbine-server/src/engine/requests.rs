@@ -8,7 +8,8 @@
 //!
 //! Tool calls (P2 §Structured output and tool-call rules): with a `required` or named
 //! `tool_choice` the whole output is held and parsed at the finish; with `auto` it streams
-//! unless its first non-whitespace output is `<|python_tag|>` or `{`, which holds the rest. A
+//! unless the model's tool format says it opens like a call
+//! ([`turbine_model::formats::ToolFormat::opens_like_call`]), which holds the rest. A
 //! parsed output becomes one `ToolCalls` event and `finish_reason: "tool_calls"`; an output that
 //! does not parse is returned as content with its finish reason unchanged
 //! (`tool_call_parse_failed`).
@@ -24,6 +25,7 @@ use turbine_core::request::{
     Usage,
 };
 use turbine_core::types::SeqId;
+use turbine_model::formats::{BoundToolFormat, Opening};
 use turbine_model::{
     IncrementalDetokenizer, ModelError, ModelMetrics, SampledToken, Sampler, TokenMask,
     TokenMatcher, Tokenizer, ToolCallOutcome, ToolCallParser, ToolParse, step_mask,
@@ -42,14 +44,14 @@ pub(crate) enum ToolOutput {
     Constrained(ToolParser),
 }
 
-/// The model's tool-call parser (`model.tool_call_parser`).
+/// The model's tool-call format (`model.tool_call_parser`) and its parser.
 #[derive(Clone)]
 pub(crate) struct ToolParser {
+    /// The format bound to the tokenizer: decides whether an `auto` output opens like a call.
+    pub format: Arc<BoundToolFormat>,
     pub parser: Arc<dyn ToolCallParser>,
-    /// The `parser` label of `turbine_tool_calls_total`.
+    /// The `parser` label of `turbine_tool_calls_total` (the format's name).
     pub label: &'static str,
-    /// Token id of `<|python_tag|>`, which may open a call (it decodes to no text).
-    pub python_tag: Option<u32>,
 }
 
 /// What the HTTP side hands the engine for one request.
@@ -379,13 +381,11 @@ impl ActiveRequest {
             ToolOutput::None => None,
             ToolOutput::Auto(p) | ToolOutput::Constrained(p) => Some(p),
         };
-        if generated == 1
-            && let (ToolText::Undecided(_), Some(p)) = (&c.tool_text, parser)
-            && p.python_tag == Some(token)
-        {
-            c.tool_text = ToolText::Holding(String::new());
-        }
-        let mut text = c.tool_text.push(text);
+        let first_token = c.generated.first().copied();
+        let mut text = c.tool_text.push(text, |pending| match parser {
+            Some(p) => p.format.opens_like_call(pending, first_token),
+            None => Opening::Content,
+        });
         let mut calls = None;
         if finish.is_some() {
             let (held, release) = c.tool_text.finish();
@@ -447,16 +447,17 @@ impl ActiveRequest {
 enum ToolText {
     /// Straight to the client.
     Streaming,
-    /// `auto` before the first non-whitespace output: held until it shows whether a call
-    /// starts.
+    /// `auto` before the output shows whether it opens like a call: held until the format
+    /// decides.
     Undecided(String),
     /// Held for the parser.
     Holding(String),
 }
 
 impl ToolText {
-    /// Takes the next text chunk; returns what may be streamed now.
-    fn push(&mut self, text: String) -> String {
+    /// Takes the next text chunk; returns what may be streamed now. `opening` decides an
+    /// undecided `auto` output from its pending text.
+    fn push(&mut self, text: String, opening: impl FnOnce(&str) -> Opening) -> String {
         match self {
             ToolText::Streaming => text,
             ToolText::Holding(held) => {
@@ -465,16 +466,17 @@ impl ToolText {
             }
             ToolText::Undecided(pending) => {
                 pending.push_str(&text);
-                let start = pending.trim_start();
-                if start.is_empty() {
-                    String::new()
-                } else if start.starts_with('{') {
-                    *self = ToolText::Holding(std::mem::take(pending));
-                    String::new()
-                } else {
-                    let out = std::mem::take(pending);
-                    *self = ToolText::Streaming;
-                    out
+                match opening(pending) {
+                    Opening::Undecided => String::new(),
+                    Opening::Call => {
+                        *self = ToolText::Holding(std::mem::take(pending));
+                        String::new()
+                    }
+                    Opening::Content => {
+                        let out = std::mem::take(pending);
+                        *self = ToolText::Streaming;
+                        out
+                    }
                 }
             }
         }
@@ -745,11 +747,14 @@ mod tests {
         )
     }
 
-    fn parser() -> ToolParser {
+    fn parser(tokenizer: &Tokenizer) -> ToolParser {
+        let format = turbine_model::formats::registry()
+            .get("llama3_json")
+            .expect("registered");
         ToolParser {
+            format: Arc::new(turbine_model::formats::bind(format, tokenizer).expect("bind")),
             parser: Arc::new(turbine_model::Llama3JsonParser::seeded(1)),
-            label: turbine_model::tools::LLAMA3_JSON,
-            python_tag: Some(262),
+            label: format.name(),
         }
     }
 
@@ -760,7 +765,7 @@ mod tests {
         let call = r#"{"name": "f", "parameters": {"x": 1}}"#;
 
         // auto: a call is held, parsed at EOS and reported as tool calls.
-        let mut r = tool_request(ToolOutput::Auto(parser()), &tokenizer);
+        let mut r = tool_request(ToolOutput::Auto(parser(&tokenizer)), &tokenizer);
         let (streamed, last) = feed(&mut r, vocab, &format!("  {call}"), 260);
         assert_eq!(streamed, "");
         assert_eq!(last.finish, Some(FinishReason::ToolCalls));
@@ -777,22 +782,23 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        // auto: `<|python_tag|>` (no text of its own) opens a call too.
-        let mut r = tool_request(ToolOutput::Auto(parser()), &tokenizer);
+        // auto: the format's call-opening special token (262, no text of its own) opens a
+        // call too.
+        let mut r = tool_request(ToolOutput::Auto(parser(&tokenizer)), &tokenizer);
         step(&mut r, row(262, vocab), 512);
         let (streamed, last) = feed(&mut r, vocab, call, 260);
         assert_eq!(streamed, "");
         assert_eq!(last.finish, Some(FinishReason::ToolCalls));
 
         // auto: plain text streams; JSON that is not a call comes back as content.
-        let mut r = tool_request(ToolOutput::Auto(parser()), &tokenizer);
+        let mut r = tool_request(ToolOutput::Auto(parser(&tokenizer)), &tokenizer);
         let (streamed, last) = feed(&mut r, vocab, " hi", 260);
         assert_eq!(streamed, " hi");
         assert_eq!(
             (last.finish, last.events.len()),
             (Some(FinishReason::Stop), 1)
         );
-        let mut r = tool_request(ToolOutput::Auto(parser()), &tokenizer);
+        let mut r = tool_request(ToolOutput::Auto(parser(&tokenizer)), &tokenizer);
         let (streamed, last) = feed(&mut r, vocab, r#"{"a": 1}"#, 260);
         assert_eq!(streamed, r#"{"a": 1}"#);
         assert_eq!(
@@ -802,7 +808,7 @@ mod tests {
 
         // Constrained: everything is held; an output cut by max_tokens is returned as content
         // with finish `length`.
-        let mut r = tool_request(ToolOutput::Constrained(parser()), &tokenizer);
+        let mut r = tool_request(ToolOutput::Constrained(parser(&tokenizer)), &tokenizer);
         r.request.stop.max_tokens = 6;
         let (streamed, last) = feed(&mut r, vocab, "{\"nam", u32::from(b'e'));
         assert_eq!(streamed, "{\"name");

@@ -9,10 +9,10 @@ use std::sync::{LazyLock, OnceLock};
 
 use serde::Serialize;
 use turbine_core::config::ModuleNames;
-use turbine_model::tools::LLAMA3_JSON;
 
-/// Tool-call formats (`tool_format`; `turbine_model::formats` from Phase 2m Task 9).
-pub const TOOL_FORMATS: &[&str] = &[LLAMA3_JSON];
+/// Tool-call formats (`tool_format`): the names of `turbine_model::formats::registry`.
+pub static TOOL_FORMATS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| turbine_model::formats::registry().names());
 /// Execution backends (`execution_backend`): the names of `turbine_kernels::backends::registry()`.
 pub fn backends() -> &'static [&'static str] {
     static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
@@ -30,7 +30,7 @@ pub static SCHEDULING_POLICIES: LazyLock<Vec<&'static str>> =
 /// The registered module names, per configuration key, for `Config::validate_modules`.
 pub fn known_module_names() -> ModuleNames<'static> {
     ModuleNames {
-        tool_formats: TOOL_FORMATS,
+        tool_formats: &TOOL_FORMATS,
         backends: backends(),
         card_profiles: card_profiles(),
         scheduling_policies: &SCHEDULING_POLICIES,

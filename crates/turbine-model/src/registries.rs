@@ -95,6 +95,24 @@ mod registry_conformance {
     }
 
     #[test]
+    fn tool_formats() {
+        let reg = crate::formats::registry();
+        check(reg).unwrap();
+        // Every special token a format names is non-empty and named once.
+        for format in reg.iter() {
+            let texts: Vec<&str> = format.special_tokens().iter().map(|t| t.text).collect();
+            for (i, text) in texts.iter().enumerate() {
+                assert!(!text.is_empty(), "{}", format.name());
+                assert!(
+                    !texts[..i].contains(text),
+                    "{}: {text} twice",
+                    format.name()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn weight_formats() {
         check(crate::weights::registry()).unwrap();
     }

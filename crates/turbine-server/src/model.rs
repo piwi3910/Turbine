@@ -22,6 +22,7 @@ use turbine_kv::{BlockPool, BlockPoolConfig};
 use turbine_model::executor::{
     self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, ModelExecutor, SeqSlice, graphs,
 };
+use turbine_model::formats::{self, BoundToolFormat, ToolFormat};
 use turbine_model::loader::LoadedWeights;
 use turbine_model::{
     BudgetTerms, ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES,
@@ -32,7 +33,7 @@ use turbine_model::{
 use turbine_observability::MetricsRegistry;
 use turbine_scheduler::SchedulerParams;
 
-use crate::modules::{self, ModuleChoices};
+use crate::modules::ModuleChoices;
 use turbine_tensor::DeviceMemory;
 
 /// Linux host memory figures (`MemAvailable`); absent elsewhere.
@@ -100,9 +101,10 @@ pub fn resolve_max_seq_len(configured: Option<u32>, max_positions: u32) -> Resul
     }
 }
 
-/// `model.tool_call_parser`, as the name of a registered tool format or `None` (tool calling
-/// off): when null, the family's default format ([`ModelFamily::default_tool_format`], e.g.
-/// `llama3_json` for `llama`) if the chat template renders `tools`.
+/// `model.tool_call_parser`, as a format of the tool-format registry
+/// ([`turbine_model::formats::registry`]) or `None` (tool calling off): when null, the family's
+/// default format ([`ModelFamily::default_tool_format`], e.g. `llama3_json` for `llama`) if the
+/// chat template renders `tools`.
 /// A format is only usable with a template that renders `tools`: a configured `llama3_json` on
 /// any other template resolves to none (logged), so `tools` requests get 400
 /// `tools_not_supported` instead of a prompt that silently lacks them. `none` and a name
@@ -111,10 +113,10 @@ pub fn resolve_tool_call_parser(
     configured: Option<&str>,
     family: &dyn ModelFamily,
     renders_tools: bool,
-) -> Option<&'static str> {
+) -> Option<&'static dyn ToolFormat> {
     match configured {
         Some("none") => None,
-        Some(name) if renders_tools => modules::TOOL_FORMATS.iter().copied().find(|f| *f == name),
+        Some(name) if renders_tools => formats::registry().get(name),
         Some(name) => {
             tracing::warn!(
                 parser = name,
@@ -125,7 +127,7 @@ pub fn resolve_tool_call_parser(
         }
         None if renders_tools => family
             .default_tool_format()
-            .and_then(|d| modules::TOOL_FORMATS.iter().copied().find(|f| *f == d)),
+            .and_then(|d| formats::registry().get(d)),
         None => None,
     }
 }
@@ -199,8 +201,9 @@ pub struct PreparedModel {
     pub grammar: Arc<GrammarCompiler>,
     /// `structured_output` bounds on those grammars.
     pub structured_output: StructuredOutputConfig,
-    /// The resolved `model.tool_call_parser`: a registered tool format, or `None` (off).
-    pub tool_call_parser: Option<&'static str>,
+    /// The resolved `model.tool_call_parser`: a registered tool format bound to the tokenizer,
+    /// or `None` (off).
+    pub tool_format: Option<Arc<BoundToolFormat>>,
     /// The module picked at each extension point (`/turbine/v1/status` `modules`).
     pub modules: ModuleChoices,
     pub served_name: String,
@@ -335,19 +338,24 @@ pub fn prepare(
     let grammar = GrammarCompiler::new(&tokenizer, &eos_token_ids(&arch, &generation))
         .map(Arc::new)
         .map_err(|e| model_error("structured output", e))?;
-    let tool_call_parser = resolve_tool_call_parser(
+    // A format whose required special tokens the tokenizer lacks is refused here (exit 1).
+    let tool_format = resolve_tool_call_parser(
         config.model.tool_call_parser.as_ref().map(|n| n.as_str()),
         arch.family.0,
         template.renders_tools(),
-    );
+    )
+    .map(|format| formats::bind(format, &tokenizer).map(Arc::new))
+    .transpose()
+    .map_err(|e| model_error("model.tool_call_parser", e))?;
+    let tool_format_name = tool_format.as_ref().map(|f| f.format.name());
     tracing::info!(
         token_trie_seconds = started.elapsed().as_secs_f64(),
-        tool_call_parser = tool_call_parser.unwrap_or("none"),
+        tool_call_parser = tool_format_name.unwrap_or("none"),
         "structured output ready"
     );
     let modules = ModuleChoices {
         family: arch.family.0.name().to_string(),
-        tool_format: tool_call_parser.map(str::to_string),
+        tool_format: tool_format_name.map(str::to_string),
         weight_format: arch.weight_format.0.name().to_string(),
         backend: config.execution.backend.to_string(),
         card_profile: provider.opened.card.map(|card| card.name.to_string()),
@@ -384,7 +392,7 @@ pub fn prepare(
         overlap_scheduling: config.execution.overlap_scheduling,
         grammar,
         structured_output: config.structured_output.clone(),
-        tool_call_parser,
+        tool_format,
         modules,
         served_name,
         budget,
@@ -564,7 +572,7 @@ fn warm_up(
 mod tests {
     use super::*;
     use turbine_model::families::{Llama, Olmoe};
-    use turbine_model::tools::LLAMA3_JSON;
+    use turbine_model::formats::llama3_json::LLAMA3_JSON;
 
     #[test]
     fn served_name_from_hf_snapshot_or_last_component() {
@@ -601,6 +609,9 @@ mod tests {
     fn tool_call_parser_resolution() {
         const LLAMA: Option<&str> = Some(LLAMA3_JSON);
         const OFF: Option<&str> = None;
+        let resolve_tool_call_parser = |configured, family: &dyn ModelFamily, renders| {
+            resolve_tool_call_parser(configured, family, renders).map(|f| f.name())
+        };
         // Null: the family default (llama3_json for llama, none for olmoe) when the template
         // renders tools.
         assert_eq!(resolve_tool_call_parser(None, &Llama, true), LLAMA);

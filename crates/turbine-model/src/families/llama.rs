@@ -11,8 +11,8 @@ use super::{FamilyConfig, ModelFamily};
 use crate::ModelError;
 use crate::config::ModelArchConfig;
 use crate::executor::{ExecutorLimits, ExecutorOptions, LlamaExecutor, ModelExecutor};
+use crate::formats::llama3_json::LLAMA3_JSON;
 use crate::loader::{LM_HEAD, LoadedWeights, WeightSlot, gate_up_proj_name, qkv_slots, row_concat};
-use crate::tools::LLAMA3_JSON;
 
 /// `LlamaForCausalLM` on the [`LlamaExecutor`].
 pub struct Llama;

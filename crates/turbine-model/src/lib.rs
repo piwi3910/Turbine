@@ -11,6 +11,7 @@ pub mod chat_template;
 pub mod config;
 pub mod executor;
 pub mod families;
+pub mod formats;
 pub mod generate;
 pub mod loader;
 pub mod metrics;
@@ -34,6 +35,7 @@ pub use config::{
     GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config, load_model_config,
 };
 pub use families::{FamilyConfig, FamilyRef, ModelFamily, llama_slots, olmoe_slots};
+pub use formats::{BoundToolFormat, Llama3JsonParser, ToolFormat};
 pub use generate::{GenerateOptions, Generation, generate};
 pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot};
 pub use loader::{StackPlace, gate_up_proj_name, qkv_proj_name, stacked_experts_name};
@@ -44,9 +46,7 @@ pub use structured::{
     json_options, step_mask,
 };
 pub use tokenizer::{IncrementalDetokenizer, Tokenizer};
-pub use tools::{
-    Llama3JsonParser, ToolCallParser, ToolChoice, ToolParse, new_call_id, tool_call_grammar,
-};
+pub use tools::{ToolCallParser, ToolChoice, ToolParse, new_call_id, tool_call_grammar};
 
 /// Every failure of the model layer (contract §10). Messages name the offending file, field or
 /// tensor so a startup failure is actionable from the log line alone.
