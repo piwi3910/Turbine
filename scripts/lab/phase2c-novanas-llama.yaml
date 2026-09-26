@@ -2,9 +2,13 @@
 #   scripts/lab-perf.sh novanas llama
 #   scripts/lab-serve.sh novanas scripts/lab/phase2c-novanas-llama.yaml [--set <k>=<v>]...
 # Weights: /home/piwi/turbine-models/llama-3.2-3b-instruct on the host, mounted read-only at
-# /models by scripts/lab/novanas-serve-job.yaml. The Phase 2 lab values plus the five Phase 2c
+# /models by scripts/lab/novanas-serve-job.yaml. The Phase 2 lab values plus the six Phase 2c
 # execution switches spelled out, so every lab-perf summary records what it ran with. The
-# scheduler pair is tuned by the Phase 2c sweep (spec S-12).
+# scheduler pair is tuned by the Phase 2c sweep (spec S-12): 2,048 batch tokens let an iteration
+# prefill about three ~680-token prompts instead of twelve, which the simulator
+# (turbine-scheduler sim::tests::phase2c_batch_shape_ttft) puts at a fifth of the median TTFT
+# for the same throughput. Measured on GPU 0 (scripts/lab-bench.sh, 2026-09-26): TTFT p50
+# 497 -> 195 ms (Llama) and 272 -> 134 ms (OLMoE) against 8,192, throughput unchanged.
 server:
   listen: 0.0.0.0:18000
 model:
@@ -17,6 +21,7 @@ execution:
   device_sampling: true
   fused_ops: true
   sampler_threads: 4
+  overlap_scheduling: false
 kv:
   block_tokens: 128
   gpu:
@@ -25,7 +30,7 @@ scheduler:
   continuous_batching: true
   chunked_prefill: true
   max_running_requests: 64
-  max_batch_tokens: 8192
+  max_batch_tokens: 2048
   prefill_chunk_tokens: 2048
   max_queued_requests: 256
   queue_timeout: 60s

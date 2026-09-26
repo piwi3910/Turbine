@@ -33,6 +33,17 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 | 2026-09-26 | 936d1ce | lab diagnostics tests only (301/0) | 697.3 | 19.1 | 575 | 18.3 | c1 16/16; c16 15/16 flake | −1.3% (noise) |
 | 2026-09-26 | bd99d87 | **fused QKV + gate/up projections on by default (301/0) — parity with vLLM-ROCm (738.0)** | **739.4** | 18.0 | 572 | 17.2 | c1 16/16; c16 16/16 | +6.0% |
 
+| 2026-09-26 | 8acce3e | Phase 2 final (merged to main 72504ad): decode graphs, GPU 0, `scripts/lab-bench.sh` (phase2-novanas config, 8,192 batch tokens) | 745.0 | 17.8 | 573 | 17.0 | c1 16/16; c16 16/16 | – |
+| 2026-09-26 | 958ea68 | Scout pass-2 fixes (7 commits) (315/0) | 748.4 | 17.7 | 566 | 17.0 | c1 16/16; c16 16/16 | +0.5% |
+| 2026-09-26 | 6121a86 | kernel ABI v2.3 pinned host staging + events (317/0) | 746.4 | 17.8 | 591 | 17.0 | c1 16/16; c16 16/16 | −0.3% |
+| 2026-09-26 | f5d0c41 | launch-ahead executors with device token feeds (319/1: tiny_server port-race flake, fixed in 728649b) | 752.3 | 17.6 | 571 | 16.9 | c1 16/16; c16 16/16 | +0.8% |
+| 2026-09-26 | 1b9730c | overlap scheduling, on (323/0) | 753.3 | 17.5 | 580 | 16.8 | c1 16/16; c16 16/16 | +0.1% (no gain → default off, 19f67b1) |
+| 2026-09-26 | 62a8fc2 | overlap off by default + prefill lab tests (323/0) | 753.5 | 17.6 | 566 | 16.8 | c1 16/16; c16 16/16 | 0.0% |
+| 2026-09-26 | a39f859 | whole-token vectorised RoPE (323/0) | 765.4 | 17.6 | 510 | 16.8 | c1 16/16; c16 16/16 | +1.6% |
+| 2026-09-26 | f105923 | 16-byte SiLU·up (323/0) | 765.7 | 17.7 | 501 | 16.9 | c1 16/16; c16 16/16 | 0.0% |
+| 2026-09-26 | a25a6d2 | tip after MoE port + sim (326/0), phase2 config | 768.4 | 17.6 | 497 | 16.8 | c1 16/16; c16 16/16 | +0.4% |
+| 2026-09-26 | a25a6d2 | **`scheduler.max_batch_tokens` 2,048 (phase2c config) — TTFT −61%, below vLLM's 339** | **770.4** | 17.7 | **195** | 16.9 | c1 16/16; c16 16/16 | +0.3% tok/s |
+
 ## OLMoE-1B-7B-0125-Instruct (BF16)
 
 | Date | Commit | Change | tok/s | ITL p50 ms | TTFT p50 ms | decode fwd ms | Golden | vs previous |
@@ -41,3 +52,13 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 | 2026-09-26 | vLLM-ROCm 0.23.0 | **reference pinned to GPU 0**; 200/200 ok | 535.5 | 26.6 | 200 | – | – | Turbine 870f842 = **107%** |
 | 2026-09-26 | e088bd7 | first OLMoE run on the perf branch: host sampler + 128-token pages (290/0); 200/200 streams ok (no SSE failures) | 290.3 | 52.3 | 407 | 45.5 | 5/16 (known: tolerance to be calibrated, decision 2026-09-26) | – |
 | 2026-09-26 | 870f842 | **OLMoE on GPU 0 at the Llama-parity tip: MoE small-m path, 128-token pages, GPU sampling, fused add+norm/QKV — 108% of vLLM (534.9)**; 200/200 streams ok | **575.4** | 25.1 | 401 | 22.3 | 5/16 (known; calibration pending) | +98% vs e088bd7 |
+| 2026-09-26 | c5c0d3b | Phase 2 final: BF16 router + torch.topk ties, calibrated tolerance (310/0) | 567.1 | 25.5 | 405 | 22.6 | c1 16/16; c16 16/16 | – |
+| 2026-09-26 | 728649b | launch-ahead + device token feeds (320/0) | 569.1 | 25.4 | 403 | 22.5 | c1 PASS; c16 14/16 + p14 likely Δ 1.041 (pre-existing batch-composition flip: 3/3 fail at 6121a86); reruns 16/16, 14/16 | +0.4% |
+| 2026-09-26 | 1b9730c | overlap scheduling, on | 570.5 | 25.3 | 635 | 22.4 | c1 PASS; c16 PASS | +0.0%, TTFT +57% → default off |
+| 2026-09-26 | 62a8fc2 | overlap off by default | 571.4 | 25.3 | 402 | 22.5 | c1 PASS; c16 PASS | +0.2% |
+| 2026-09-26 | 5505299 | whole-token vectorised RoPE | 575.5 | 25.3 | 371 | 22.4 | c1 PASS; c16 PASS | +0.7% |
+| 2026-09-26 | f105923 | 16-byte SiLU·up | 574.7 | 25.3 | 370 | 22.5 | c1 PASS; c16 PASS | −0.1% |
+| 2026-09-26 | 2454bb3 | **parallel MoE routing (ported onto the BF16/torch.topk router)** (323/0) | **613.1** | 24.0 | 314 | 21.2 | c1 PASS; c16 retry PASS (first: known p10/p14 flip) | **+6.7%** |
+| 2026-09-26 | a42c961 | grouped WMMA MoE experts above 512 rows (323/0) | 619.5 | 23.9 | 273 | 21.2 | c1 PASS; c16 PASS | +1.0% |
+| 2026-09-26 | a25a6d2 | tip after sim (326/0), phase2 config | 618.4 | 24.0 | 272 | 21.2 | c1 PASS; c16 retry PASS | −0.2% |
+| 2026-09-26 | a25a6d2 | **`scheduler.max_batch_tokens` 2,048 (phase2c config) — 116% of vLLM, TTFT −51%, below vLLM's 200** | **619.8** | 23.9 | **134** | 21.1 | c1 PASS; c16 PASS | +0.2% tok/s |

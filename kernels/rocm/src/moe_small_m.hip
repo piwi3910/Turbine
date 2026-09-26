@@ -300,22 +300,25 @@ int32_t launch_proj(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
 
 namespace turbine_hip {
 
+int32_t launch_moe_positions(turbine_ctx *ctx,
+                             const turbine_moe_experts_desc *d, int32_t *pos) {
+  const int32_t rows = d->num_tokens * d->top_k;
+  hipLaunchKernelGGL(moe_small_positions_kernel,
+                     dim3(static_cast<unsigned>((rows + kBlock - 1) / kBlock)),
+                     dim3(kBlock), 0, ctx->stream, d->sorted_rows,
+                     d->expert_offsets, d->expert_begin, d->expert_end, rows,
+                     pos);
+  return check_hip(ctx, hipGetLastError(), "moe positions kernel launch");
+}
+
 int32_t launch_moe_small_m(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                            int32_t *pos, void *act, void *down) {
   const int32_t rows = d->num_tokens * d->top_k;
   const int32_t num_local = d->expert_end - d->expert_begin;
   // At most one expert slot per routed row.
   const unsigned slots = static_cast<unsigned>(std::min(num_local, rows));
-  hipLaunchKernelGGL(moe_small_positions_kernel,
-                     dim3(static_cast<unsigned>((rows + kBlock - 1) / kBlock)),
-                     dim3(kBlock), 0, ctx->stream, d->sorted_rows,
-                     d->expert_offsets, d->expert_begin, d->expert_end, rows,
-                     pos);
-  if (int32_t rc = check_hip(ctx, hipGetLastError(),
-                             "moe small-m positions kernel launch");
-      rc != TURBINE_OK) {
+  if (int32_t rc = launch_moe_positions(ctx, d, pos); rc != TURBINE_OK)
     return rc;
-  }
   return launch_proj<kTileCols, kTileRows>(ctx, d, act, down, slots);
 }
 

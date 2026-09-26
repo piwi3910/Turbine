@@ -120,19 +120,22 @@ fn element_offsets(v: &TensorView<'_>) -> Result<Vec<usize>, KernelError> {
     if numel == 0 {
         return Ok(Vec::new());
     }
-    let last: usize = v
+    // Bytes the view addresses, (Σ (d − 1)·stride + 1)·es; None when that overflows usize.
+    let span = v
         .shape
         .iter()
         .zip(&v.strides)
-        .map(|(&d, &s)| (d - 1) * s)
-        .sum();
-    if (last + 1) * es > v.slice.len() {
+        .try_fold(0usize, |acc, (&d, &s)| {
+            acc.checked_add((d - 1).checked_mul(s)?)
+        })
+        .and_then(|last| last.checked_add(1)?.checked_mul(es));
+    if span.is_none_or(|bytes| bytes > v.slice.len()) {
         return Err(invalid(format!(
             "view of shape {:?} strides {:?} ({}) addresses {} bytes but its slice holds {}",
             v.shape.as_slice(),
             v.strides.as_slice(),
             v.dtype.as_str(),
-            (last + 1) * es,
+            span.map_or_else(|| "more than usize::MAX".to_string(), |b| b.to_string()),
             v.slice.len()
         )));
     }
@@ -142,14 +145,16 @@ fn element_offsets(v: &TensorView<'_>) -> Result<Vec<usize>, KernelError> {
     let mut elem = 0usize;
     for _ in 0..numel {
         offsets.push(elem * es);
-        // Odometer increment of the multi-index, keeping `elem` = Σ idx·stride.
+        // Odometer increment of the multi-index, keeping `elem` = Σ idx·stride. The carry step
+        // may pass through values above the checked span (a size-1 dimension with a huge stride),
+        // so it wraps; every pushed `elem` is within the span.
         for dim in (0..rank).rev() {
             idx[dim] += 1;
-            elem += v.strides[dim];
+            elem = elem.wrapping_add(v.strides[dim]);
             if idx[dim] < v.shape[dim] {
                 break;
             }
-            elem -= v.shape[dim] * v.strides[dim];
+            elem = elem.wrapping_sub(v.shape[dim].wrapping_mul(v.strides[dim]));
             idx[dim] = 0;
         }
     }
@@ -1078,6 +1083,35 @@ mod tests {
             }
             assert_eq!(chunk, [0xAB; 4], "row {row} col {col} was overwritten");
         }
+    }
+
+    /// Catches: `(d - 1) * stride` summed without overflow checks, so a huge stride wrapped
+    /// the bounds check (a debug-build panic, an out-of-range index in release).
+    #[test]
+    fn overflowing_strides_are_an_error_and_unit_dims_ignore_their_stride() {
+        let mem = host();
+        let buf = DeviceBuffer::alloc(&mem, 4 * 4).expect("alloc");
+        let view = |shape: &[usize], strides: &[usize]| TensorView {
+            slice: buf.whole(),
+            shape: shape.into(),
+            strides: strides.into(),
+            dtype: DType::F32,
+        };
+        let err = element_offsets(&view(&[2, 2], &[usize::MAX, 1])).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidArgument { .. }),
+            "got {err:?}"
+        );
+        let err = element_offsets(&view(&[2], &[usize::MAX / 4 + 1])).unwrap_err();
+        assert!(
+            matches!(err, KernelError::InvalidArgument { .. }),
+            "got {err:?}"
+        );
+        // A size-1 dimension never advances by its stride, however large.
+        assert_eq!(
+            element_offsets(&view(&[1, 4], &[usize::MAX, 1])).expect("offsets"),
+            [0, 4, 8, 12]
+        );
     }
 
     #[test]

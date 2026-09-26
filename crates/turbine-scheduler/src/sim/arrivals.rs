@@ -1,5 +1,6 @@
 //! Arrival processes for the simulator: seeded Poisson arrivals with a mixed length
-//! distribution (ChaCha8, byte-identical for equal seeds) or a fixed script.
+//! distribution (ChaCha8, byte-identical for equal seeds), a fixed script, or a closed loop that
+//! keeps a fixed number of requests in flight (as `turbine-bench --concurrency <n>` does).
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -70,6 +71,13 @@ enum Source {
         clock: f64,
     },
     Scripted(VecDeque<SimArrival>),
+    ClosedLoop {
+        template: SimArrival,
+        /// Arrivals due (submitted at the next opportunity).
+        due: VecDeque<SimArrival>,
+        /// Arrivals not yet issued.
+        remaining: u64,
+    },
 }
 
 /// A deterministic stream of arrivals in time order.
@@ -116,12 +124,45 @@ impl ArrivalProcess {
         }
     }
 
+    /// A closed loop of `total` copies of `template`: `concurrency` arrive at time zero, then
+    /// one more each time a request finishes, is rejected or is dropped
+    /// ([`ArrivalProcess::on_done`]), at that time. `template.at` is ignored.
+    pub fn closed_loop(template: SimArrival, concurrency: u32, total: u64) -> ArrivalProcess {
+        let first = u64::from(concurrency).min(total);
+        let at_zero = SimArrival {
+            at: Duration::ZERO,
+            ..template
+        };
+        ArrivalProcess {
+            source: Source::ClosedLoop {
+                template,
+                due: (0..first).map(|_| at_zero).collect(),
+                remaining: total - first,
+            },
+        }
+    }
+
+    /// `count` requests finished, were rejected or were dropped at `at`: a closed loop issues as
+    /// many new arrivals at `at` (while any remain); the other processes ignore it.
+    pub fn on_done(&mut self, count: u64, at: Duration) {
+        if let Source::ClosedLoop {
+            template,
+            due,
+            remaining,
+        } = &mut self.source
+        {
+            let n = count.min(*remaining);
+            *remaining -= n;
+            due.extend((0..n).map(|_| SimArrival { at, ..*template }));
+        }
+    }
+
     /// Time of the next arrival, if any.
     pub fn peek_time(&mut self) -> Option<Duration> {
         self.refill();
         match &self.source {
             Source::Poisson { next, .. } => next.map(|a| a.at),
-            Source::Scripted(q) => q.front().map(|a| a.at),
+            Source::Scripted(q) | Source::ClosedLoop { due: q, .. } => q.front().map(|a| a.at),
         }
     }
 
@@ -132,7 +173,7 @@ impl ArrivalProcess {
         }
         match &mut self.source {
             Source::Poisson { next, .. } => next.take(),
-            Source::Scripted(q) => q.pop_front(),
+            Source::Scripted(q) | Source::ClosedLoop { due: q, .. } => q.pop_front(),
         }
     }
 

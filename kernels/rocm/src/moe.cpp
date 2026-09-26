@@ -6,9 +6,12 @@
 //
 // Up to kMoeSmallMaxRows routed rows (num_tokens * top_k; every decode step of
 // up to 64 OLMoE sequences) it runs the Turbine small-m kernels
-// (moe_small_m.hip, impl "turbine_hip_moe_small_m"), which read the group sizes
-// from expert_offsets on the device: host_expert_offsets may be NULL, and
-// turbine_moe_experts_needs_host_offsets says so. Above that:
+// (moe_small_m.hip, impl "turbine_hip_moe_small_m"), above it the Turbine
+// grouped WMMA kernels (moe_grouped.hip, impl "turbine_hip_moe_wmma") when
+// hidden and inter are multiples of 64. Both read the group sizes from
+// expert_offsets on the device: host_expert_offsets may be NULL, and
+// turbine_moe_experts_needs_host_offsets says so. Other shapes above
+// kMoeSmallMaxRows take the per-expert hipBLASLt path:
 //   1. gather: the rows routed to local experts are contiguous in sorted_rows
 //      (grouped by ascending expert), so one kernel copies their activations
 //      into xs in that order and records each row's position;
@@ -46,6 +49,7 @@ namespace {
 
 constexpr const char *kImplRoute = "turbine_hip";
 constexpr const char *kImplSmallM = "turbine_hip_moe_small_m";
+constexpr const char *kImplWmma = "turbine_hip_moe_wmma";
 constexpr const char *kImplPerExpert = "hipblaslt_per_expert";
 constexpr const char *kImplGrouped = "hipblaslt_grouped";
 constexpr size_t kAlign = 256;
@@ -94,6 +98,12 @@ bool small_m(const turbine_moe_experts_desc *d) {
   return static_cast<int64_t>(d->num_tokens) * d->top_k <=
              turbine_hip::kMoeSmallMaxRows &&
          d->hidden % 8 == 0 && d->inter % 8 == 0;
+}
+
+// d runs through the grouped WMMA kernels (no host offsets needed). The operand
+// alignment is checked when the call runs.
+bool wmma(const turbine_moe_experts_desc *d) {
+  return !small_m(d) && turbine_hip::moe_wmma_shape(d);
 }
 
 bool aligned16(const void *p) {
@@ -350,14 +360,16 @@ int32_t run_experts(turbine_ctx *ctx, const turbine_moe_experts_desc *d) {
                                          d->out);
 }
 
-// The small-m path: positions, fused gate-up with SiLU, down, then the
-// ordered scatter; no host data.
-int32_t run_small_m(turbine_ctx *ctx, const turbine_moe_experts_desc *d) {
+// The device-offset paths (small-m, grouped WMMA): positions, fused gate-up
+// with SiLU, down, then the ordered scatter; no host data.
+int32_t run_device_offsets(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
+                           bool small) {
   if (!aligned16(d->x) || !aligned16(d->w_gate) || !aligned16(d->w_up) ||
       !aligned16(d->w_down)) {
     return fail(ctx, TURBINE_E_ARGUMENT,
-                "turbine_moe_experts: the small-m path needs 16-byte aligned "
-                "x and expert weights");
+                std::string("turbine_moe_experts: the ") +
+                    (small ? "small-m" : "grouped WMMA") +
+                    " path needs 16-byte aligned x and expert weights");
   }
   const size_t rows = static_cast<size_t>(d->num_tokens) * d->top_k;
   const size_t pos_bytes = align_up(rows * 4);
@@ -371,7 +383,9 @@ int32_t run_small_m(turbine_ctx *ctx, const turbine_moe_experts_desc *d) {
   auto *pos = reinterpret_cast<int32_t *>(ws);
   char *act = ws + pos_bytes;
   char *down = act + act_bytes;
-  if (int32_t rc = turbine_hip::launch_moe_small_m(ctx, d, pos, act, down);
+  if (int32_t rc = small
+                       ? turbine_hip::launch_moe_small_m(ctx, d, pos, act, down)
+                       : turbine_hip::launch_moe_wmma(ctx, d, pos, act, down);
       rc != TURBINE_OK) {
     return rc;
   }
@@ -477,12 +491,14 @@ int32_t turbine_moe_experts_supported(const turbine_moe_experts_desc *d) {
 const char *turbine_moe_experts_impl(const turbine_moe_experts_desc *d) {
   if (d != nullptr && small_m(d))
     return kImplSmallM;
+  if (d != nullptr && wmma(d))
+    return kImplWmma;
   return g_grouped_available.load() ? kImplGrouped : kImplPerExpert;
 }
 
 int32_t
 turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d) {
-  return d != nullptr && small_m(d) ? 0 : 1;
+  return d != nullptr && (small_m(d) || wmma(d)) ? 0 : 1;
 }
 
 int32_t turbine_moe_experts(turbine_ctx *ctx,
@@ -499,13 +515,17 @@ int32_t turbine_moe_experts(turbine_ctx *ctx,
                     describe(d));
   }
   const bool small = small_m(d);
-  if (!small && d->host_expert_offsets == nullptr) {
+  const bool device_offsets = small || wmma(d);
+  if (!device_offsets && d->host_expert_offsets == nullptr) {
     return fail(
         ctx, TURBINE_E_ARGUMENT,
         "turbine_moe_experts: host_expert_offsets is NULL for " +
             std::to_string(static_cast<int64_t>(d->num_tokens) * d->top_k) +
-            " routed rows (the device-offset path takes at most " +
-            std::to_string(turbine_hip::kMoeSmallMaxRows) + ")");
+            " routed rows and hidden=" + std::to_string(d->hidden) +
+            " inter=" + std::to_string(d->inter) +
+            " (the device-offset paths need at most " +
+            std::to_string(turbine_hip::kMoeSmallMaxRows) +
+            " rows or hidden and inter multiples of 64)");
   }
   if (d->num_tokens == 0)
     return TURBINE_OK;
@@ -514,13 +534,14 @@ int32_t turbine_moe_experts(turbine_ctx *ctx,
       d->topk_weights == nullptr || d->out == nullptr) {
     return fail(ctx, TURBINE_E_ARGUMENT, "turbine_moe_experts: NULL operand");
   }
-  if (small && d->expert_offsets == nullptr) {
+  if (device_offsets && d->expert_offsets == nullptr) {
     return fail(ctx, TURBINE_E_ARGUMENT,
                 "turbine_moe_experts: expert_offsets is NULL");
   }
   if (int32_t rc = enter(ctx); rc != TURBINE_OK)
     return rc;
-  return small ? run_small_m(ctx, d) : run_experts(ctx, d);
+  return device_offsets ? run_device_offsets(ctx, d, small)
+                        : run_experts(ctx, d);
 }
 
 } // extern "C"

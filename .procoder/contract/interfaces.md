@@ -1019,6 +1019,8 @@ The Rust constant `TURBINE_KERNELS_ABI_VERSION` must equal the library's value e
 
 Minor revisions (`TURBINE_ABI_MINOR` / `turbine_abi_minor()`, optional symbol; P2c) are additive within a major: 2.1 adds the optional `add_rmsnorm`, `logits_reduce`, context options and graphs; 2.2 renames `turbine_moe_route_desc.renormalize` to `flags` (same slot, 1 still renormalises) and adds `TURBINE_MOE_ROUTE_BF16_LOGITS` (decision "OLMoE golden gate", 2026-09-26). A library of an earlier minor rejects an unknown flag bit in `_supported`, and turbine-kernels only asks for BF16 logits from a library reporting minor ≥ 2. `moe_route` selects the top-k set PyTorch's CPU `torch.topk` selects (libstdc++ introselect, or heap select when `top_k · 64 ≤ num_experts`), so a tie at the k-th place does not always keep the lower id (`turbine_kernels::torch_topk`, pinned by a torch fixture).
 
+v2.3 (P2c S-16; optional symbols, resolved only when the minor is ≥ 3 and the whole group exists) adds the compute-stream subset of the v3 memory functions with the v3 names and signatures (`turbine_host_alloc_pinned`, `turbine_host_free_pinned`, `turbine_event_create`, `turbine_event_destroy`, `turbine_event_record` with `s` NULL only, `turbine_event_synchronize`), used by the executors' staged copies and the engine's overlap scheduling (P2c S-16). v3 (P4) makes them required and adds the rest of its row.
+
 ### 9.2 Conventions
 
 - No vendor type or identifier in the header (P1 AC `abi_header_neutral`: no identifier starting with `hip`, `cuda`, `rocm`, `nv`, case-insensitive — contract-chosen reading of the rule; therefore no code is named `…INVALID…`).
@@ -1027,7 +1029,7 @@ Minor revisions (`TURBINE_ABI_MINOR` / `turbine_abi_minor()`, optional symbol; P
 - Row-major everywhere; strides are in elements; "leading dimension" = row stride in elements.
 - Only `turbine_*` symbols are exported (`-fvisibility=hidden`; P2b).
 - The shim never retains a caller pointer beyond the call; the context owns its streams, library handles and workspace (P1).
-- Error message: `turbine_last_error(ctx, buf, len)` copies the NUL-terminated message of the most recent failure on `ctx` (or, with `ctx == NULL`, of the most recent failed `turbine_ctx_create` on the calling thread — contract-chosen), returns the full message length (excluding NUL). CUDA/HIP messages start with the vendor error name, e.g. `cudaErrorIllegalAddress: …` (P2b S-5).
+- Error message: `turbine_last_error(ctx, buf, len)` copies the NUL-terminated message of the most recent failure on `ctx` (or, with `ctx == NULL`, of the most recent failed `turbine_ctx_create` on the calling thread — contract-chosen), returns the full message length (excluding NUL); with `buf == NULL` or `len == 0` it writes nothing and only returns the length. CUDA/HIP messages start with the vendor error name, e.g. `cudaErrorIllegalAddress: …` (P2b S-5).
 
 ### 9.3 Header (normative)
 
@@ -1059,8 +1061,8 @@ extern "C" {
 /* 16..63 reserved for phase-8a quantized formats */
 
 typedef struct turbine_ctx    turbine_ctx;
-typedef struct turbine_stream turbine_stream;   /* v3 */
-typedef struct turbine_event  turbine_event;    /* v3 */
+typedef struct turbine_stream turbine_stream;   /* v2.3 (NULL = compute stream only), v3 */
+typedef struct turbine_event  turbine_event;    /* v2.3, v3 */
 
 /* ======== v1 (P1): identity, context, memory ======== */
 uint32_t    turbine_abi_version(void);
@@ -1192,7 +1194,10 @@ typedef struct turbine_moe_experts_desc {    /* out += Σ_k w_k · down(silu(gat
    CUDA impl names (P2b S-14): "cublaslt","flashinfer_prefill","flashinfer_decode","flashinfer_batch_prefill_paged",
    "flashinfer_batch_decode_paged","flashinfer_rmsnorm","cublas_grouped_batched","cublaslt_per_expert","turbine_cuda" */
 
-/* ======== v3 (P4): pinned host memory, copy streams, events ======== */
+/* ======== v3 (P4): pinned host memory, copy streams, events ========
+   (v2.3, P2c: turbine_host_alloc_pinned, turbine_host_free_pinned, turbine_event_create,
+   turbine_event_destroy, turbine_event_record with s == NULL and turbine_event_synchronize
+   already exist, optional, with these signatures) */
 #define TURBINE_COPY_H2D 0
 #define TURBINE_COPY_D2H 1
 #define TURBINE_COPY_D2D 2

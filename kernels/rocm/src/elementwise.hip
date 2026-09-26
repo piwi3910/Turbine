@@ -170,8 +170,78 @@ __global__ void silu_mul_kernel(const T *gate, const T *up, T *out,
   }
 }
 
+// ---- silu_mul for many rows (BF16) ----
+
+// BF16 elements per 16-byte load of silu_mul_vec_kernel.
+constexpr int64_t kSiluVec = 8;
+// Rows from which a BF16 silu_mul runs through silu_mul_vec_kernel; below it
+// (a decode batch) silu_mul_kernel's finer column chunks keep the whole device
+// busy.
+constexpr int64_t kSiluVecMinRows = 64;
+
+// silu_mul_kernel's arithmetic on 8 BF16 at a time: grid (rows, column chunks
+// of kBlock * kSiluVec), each thread one 16-byte slice of gate, up and out.
+// Launched only when silu_vec_eligible holds.
+__global__ __launch_bounds__(kBlock) void silu_mul_vec_kernel(
+    const Bf16 *gate, const Bf16 *up, Bf16 *out, int64_t cols,
+    int64_t gate_stride, int64_t up_stride, int64_t out_stride) {
+  const int64_t r = blockIdx.x;
+  const int64_t j =
+      (static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x) * kSiluVec;
+  if (j >= cols)
+    return;
+  const uint4 g4 = *reinterpret_cast<const uint4 *>(gate + r * gate_stride + j);
+  const uint4 u4 = *reinterpret_cast<const uint4 *>(up + r * up_stride + j);
+  const uint32_t gw[4] = {g4.x, g4.y, g4.z, g4.w};
+  const uint32_t uw[4] = {u4.x, u4.y, u4.z, u4.w};
+  uint32_t ow[4];
+#pragma unroll
+  for (int w = 0; w < 4; ++w) {
+    uint32_t packed = 0;
+#pragma unroll
+    for (int part = 0; part < 2; ++part) {
+      const int shift = part * 16;
+      const float g =
+          to_f32<Bf16>(Bf16{static_cast<uint16_t>((gw[w] >> shift) & 0xffffu)});
+      const float u =
+          to_f32<Bf16>(Bf16{static_cast<uint16_t>((uw[w] >> shift) & 0xffffu)});
+      const float silu = g / (1.0f + expf(-g));
+      packed |=
+          static_cast<uint32_t>(from_f32<Bf16>(round_to<Bf16>(silu) * u).bits)
+          << shift;
+    }
+    ow[w] = packed;
+  }
+  *reinterpret_cast<uint4 *>(out + r * out_stride + j) =
+      make_uint4(ow[0], ow[1], ow[2], ow[3]);
+}
+
+// d runs through silu_mul_vec_kernel: BF16, enough rows, and every 8-element
+// slice of every row 16-byte aligned.
+bool silu_vec_eligible(const turbine_silu_mul_desc *d) {
+  const auto aligned16 = [](const void *p) {
+    return reinterpret_cast<uintptr_t>(p) % 16 == 0;
+  };
+  return d->dtype == TURBINE_DTYPE_BF16 && d->rows >= kSiluVecMinRows &&
+         d->cols % kSiluVec == 0 && d->gate_stride_row % kSiluVec == 0 &&
+         d->up_stride_row % kSiluVec == 0 &&
+         d->out_stride_row % kSiluVec == 0 && aligned16(d->gate) &&
+         aligned16(d->up) && aligned16(d->out) &&
+         (d->cols / kSiluVec + kBlock - 1) / kBlock <= 65535;
+}
+
 template <typename T> struct SiluMulLaunch {
   static void run(hipStream_t s, const turbine_silu_mul_desc *d) {
+    if (silu_vec_eligible(d)) {
+      const int64_t chunks = (d->cols / kSiluVec + kBlock - 1) / kBlock;
+      hipLaunchKernelGGL(
+          silu_mul_vec_kernel,
+          dim3(static_cast<unsigned>(d->rows), static_cast<unsigned>(chunks)),
+          dim3(kBlock), 0, s, static_cast<const Bf16 *>(d->gate),
+          static_cast<const Bf16 *>(d->up), static_cast<Bf16 *>(d->out),
+          d->cols, d->gate_stride_row, d->up_stride_row, d->out_stride_row);
+      return;
+    }
     hipLaunchKernelGGL(
         silu_mul_kernel<T>,
         dim3(static_cast<unsigned>(d->rows), silu_chunks(d->cols)),
@@ -259,8 +329,111 @@ __global__ void rope_kernel(T *q, T *k, const int32_t *positions,
   }
 }
 
+// ---- rope for many tokens (BF16) ----
+
+// Rotary pairs one thread rotates per step of rope_token_kernel (one 8-byte
+// load of each half).
+constexpr int32_t kRopeVec = 4;
+// Tokens from which a BF16 rope runs through rope_token_kernel. Below it (a
+// decode batch) rope_kernel spreads each token's heads over several blocks so
+// that a few tokens still use the whole device.
+constexpr int64_t kRopeTokenKernelMin = 128;
+
+// Grid: (tokens). One block rotates every q and k head of its token: the
+// token's cos/sin are evaluated once (cos by one half of the pair threads, sin
+// by the other, the same f64-evaluated values as rope_kernel) into LDS, then
+// each thread rotates kRopeVec consecutive pairs of a head per step with
+// 8-byte loads. rope_kernel evaluates cos/sin once per block of heads, so a
+// prefill token costs it (heads / heads_per_block) times the trigonometry.
+// Launched only when rope_token_eligible holds.
+__global__ __launch_bounds__(kBlock) void rope_token_kernel(
+    Bf16 *q, Bf16 *k, const int32_t *positions, const float *inv_freq,
+    int32_t num_q_heads, int32_t num_kv_heads, int32_t head_dim,
+    int32_t rotary_dim, int64_t q_stride, int64_t k_stride) {
+  __shared__ float cos_s[kRopeMaxHalf];
+  __shared__ float sin_s[kRopeMaxHalf];
+  const int64_t t = blockIdx.x;
+  const int32_t half = rotary_dim / 2;
+  const float pos = static_cast<float>(positions[t]);
+  for (int32_t w = threadIdx.x; w < 2 * half; w += blockDim.x) {
+    const int32_t i = w < half ? w : w - half;
+    const float f = pos * inv_freq[i];
+    if (w < half) {
+      cos_s[i] = rope_cos<Bf16>(f);
+    } else {
+      sin_s[i] = rope_sin<Bf16>(f);
+    }
+  }
+  __syncthreads();
+  const int32_t steps = half / kRopeVec;
+  const int32_t heads = num_q_heads + num_kv_heads;
+  for (int32_t w = threadIdx.x; w < heads * steps; w += blockDim.x) {
+    const int32_t h = w / steps;
+    const int32_t i = (w % steps) * kRopeVec;
+    Bf16 *x = h < num_q_heads
+                  ? q + t * q_stride + static_cast<int64_t>(h) * head_dim
+                  : k + t * k_stride +
+                        static_cast<int64_t>(h - num_q_heads) * head_dim;
+    const uint2 lo = *reinterpret_cast<const uint2 *>(x + i);
+    const uint2 hi = *reinterpret_cast<const uint2 *>(x + i + half);
+    const uint32_t lw[2] = {lo.x, lo.y};
+    const uint32_t hw[2] = {hi.x, hi.y};
+    uint32_t lo_out[2];
+    uint32_t hi_out[2];
+#pragma unroll
+    for (int v = 0; v < kRopeVec; ++v) {
+      const int word = v / 2;
+      const int shift = (v % 2) * 16;
+      const float x1 = to_f32<Bf16>(
+          Bf16{static_cast<uint16_t>((lw[word] >> shift) & 0xffffu)});
+      const float x2 = to_f32<Bf16>(
+          Bf16{static_cast<uint16_t>((hw[word] >> shift) & 0xffffu)});
+      const float c = cos_s[i + v];
+      const float s = sin_s[i + v];
+      const uint32_t r1 =
+          from_f32<Bf16>(round_to<Bf16>(x1 * c) + round_to<Bf16>(-x2 * s)).bits;
+      const uint32_t r2 =
+          from_f32<Bf16>(round_to<Bf16>(x2 * c) + round_to<Bf16>(x1 * s)).bits;
+      if (shift == 0) {
+        lo_out[word] = r1;
+        hi_out[word] = r2;
+      } else {
+        lo_out[word] |= r1 << 16;
+        hi_out[word] |= r2 << 16;
+      }
+    }
+    *reinterpret_cast<uint2 *>(x + i) = make_uint2(lo_out[0], lo_out[1]);
+    *reinterpret_cast<uint2 *>(x + i + half) = make_uint2(hi_out[0], hi_out[1]);
+  }
+}
+
+// d runs through rope_token_kernel: BF16, enough tokens, cos/sin fit the LDS
+// stage, and every rotated group of kRopeVec elements (both halves) is 8-byte
+// aligned.
+bool rope_token_eligible(const turbine_rope_desc *d) {
+  const int32_t half = d->rotary_dim / 2;
+  const auto aligned8 = [](const void *p) {
+    return reinterpret_cast<uintptr_t>(p) % 8 == 0;
+  };
+  return d->dtype == TURBINE_DTYPE_BF16 &&
+         d->num_tokens >= kRopeTokenKernelMin && half <= kRopeMaxHalf &&
+         half % kRopeVec == 0 && d->head_dim % kRopeVec == 0 &&
+         d->q_stride_token % kRopeVec == 0 &&
+         (d->num_kv_heads == 0 || d->k_stride_token % kRopeVec == 0) &&
+         aligned8(d->q) && (d->num_kv_heads == 0 || aligned8(d->k));
+}
+
 template <typename T> struct RopeLaunch {
   static void run(hipStream_t s, const turbine_rope_desc *d) {
+    if (rope_token_eligible(d)) {
+      hipLaunchKernelGGL(rope_token_kernel,
+                         dim3(static_cast<unsigned>(d->num_tokens)),
+                         dim3(kBlock), 0, s, static_cast<Bf16 *>(d->q),
+                         static_cast<Bf16 *>(d->k), d->positions, d->inv_freq,
+                         d->num_q_heads, d->num_kv_heads, d->head_dim,
+                         d->rotary_dim, d->q_stride_token, d->k_stride_token);
+      return;
+    }
     const int32_t per_block = rope_heads_per_block(d->rotary_dim / 2);
     const int32_t heads = d->num_q_heads + d->num_kv_heads;
     const int32_t groups = (heads + per_block - 1) / per_block;

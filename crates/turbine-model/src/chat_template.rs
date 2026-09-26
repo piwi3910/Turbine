@@ -686,6 +686,28 @@ mod tests {
     }
 
     #[test]
+    fn floats_render_like_python_repr() {
+        // Python's repr(float): shortest round-trip digits, never padded; scientific below 1e-4
+        // and from 1e16, with a sign and at least two exponent digits.
+        for (value, python) in [
+            (1.0, "1.0"),
+            (0.1, "0.1"),
+            (1.23456789, "1.23456789"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (-2.5, "-2.5"),
+            (123456.0, "123456.0"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (1.5e-7, "1.5e-07"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1.2345e20, "1.2345e+20"),
+        ] {
+            assert_eq!(py_float_repr(value), python, "{value}");
+        }
+    }
+
+    #[test]
     fn renders_target_template() {
         let template = ChatTemplate::load(&fixture_dir().join("tokenizer_config.json"))
             .expect("Llama-3.2 template loads");

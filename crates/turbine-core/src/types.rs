@@ -115,18 +115,20 @@ pub struct KvLayout {
 }
 
 impl KvLayout {
-    /// K and V of every layer for one token (Llama-3.2-3B BF16: 114 688).
+    /// K and V of every layer for one token (Llama-3.2-3B BF16: 114 688). Saturates at
+    /// `u64::MAX` for dimensions no device could hold, so a budget refuses it.
     pub fn bytes_per_token(&self) -> u64 {
         u64::from(self.num_layers)
-            * 2
-            * u64::from(self.num_kv_heads)
-            * u64::from(self.head_dim)
-            * self.dtype.size_bytes() as u64
+            .saturating_mul(2)
+            .saturating_mul(u64::from(self.num_kv_heads))
+            .saturating_mul(u64::from(self.head_dim))
+            .saturating_mul(self.dtype.size_bytes() as u64)
     }
     /// One block of `block_tokens` tokens (Llama-3.2-3B: 1 835 008 at 16 tokens, 14 680 064 at
-    /// the default 128).
+    /// the default 128). Saturates like [`KvLayout::bytes_per_token`].
     pub fn block_bytes(&self) -> u64 {
-        self.bytes_per_token() * u64::from(self.block_tokens)
+        self.bytes_per_token()
+            .saturating_mul(u64::from(self.block_tokens))
     }
 }
 
@@ -223,6 +225,17 @@ mod tests {
             ..layout
         };
         assert_eq!(default_page.block_bytes(), 14_680_064);
+        // A config whose dimensions overflow u64 saturates (and so fails any budget) instead of
+        // wrapping to a small size.
+        let huge = KvLayout {
+            num_layers: u32::MAX,
+            num_kv_heads: u32::MAX,
+            head_dim: u32::MAX,
+            dtype: DType::BF16,
+            block_tokens: u32::MAX,
+        };
+        assert_eq!(huge.bytes_per_token(), u64::MAX);
+        assert_eq!(huge.block_bytes(), u64::MAX);
         assert_eq!(ExecutionBackend::Cpu.as_str(), "cpu");
         assert_ne!(RequestId::new_v4(), RequestId::new_v4());
     }

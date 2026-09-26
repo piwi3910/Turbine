@@ -12,29 +12,36 @@
 //!   outlives it, and the context holds an `Arc` of its `ShimLibrary`, so the code stays loaded;
 //! - a captured graph (ABI v2.1) records the device pointers of the ops captured into it: the
 //!   caller keeps those buffers alive while the `GraphHandle` lives, and the handle (which holds
-//!   an `Arc` of its context) destroys the graph exactly once, in `GraphHandle::drop`.
+//!   an `Arc` of its context) destroys the graph exactly once, in `GraphHandle::drop`;
+//! - a host staging buffer (ABI v2.3) is page-locked memory from `turbine_host_alloc_pinned` plus one
+//!   event, both owned by the context's staging table and released exactly once, in
+//!   `staging_free` (called by `HostStaging::drop`, which holds an `Arc` of the context). Every
+//!   staged copy re-records the buffer's event after it is enqueued; every host access to the
+//!   buffer, and its release, first waits on that event, so the host never touches bytes a copy
+//!   in flight reads or writes. The table's lock serialises those accesses.
 //!
 //! ABI v2.1 is optional: `ShimLibrary::abi_minor` is 0 for a v2.0 library, whose provider then
 //! has no `add_rmsnorm`/`logits_reduce` family and whose context answers the option and graph
 //! calls with `KernelError::Unsupported`.
+use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use libloading::Library;
 use turbine_core::types::{DType, DeviceId, ExecutionBackend};
 use turbine_device::DeviceInfo;
 use turbine_tensor::tensor::contiguous_strides;
 use turbine_tensor::{
-    DeviceMemory, DevicePtr, DeviceSlice, MemInfo, MemoryError, StreamRef, TensorView,
+    DeviceMemory, DevicePtr, DeviceSlice, MemInfo, MemoryError, StagingId, StreamRef, TensorView,
 };
 
 use crate::ffi::{
     self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo,
     EmbeddingDesc, GemmDesc, LogitsReduceDesc, MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE,
     MoeExpertsDesc, MoeRouteDesc, OpTrio, RmsnormDesc, RopeDesc, ShimSymbols, SiluMulDesc,
-    TurbineCtx, TurbineGraph,
+    StagingFns, TurbineCtx, TurbineEvent, TurbineGraph,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -241,6 +248,7 @@ impl ShimLibrary {
             lib: Arc::clone(self),
             device: device.index,
             info,
+            staging: Mutex::new(StagingTable::default()),
             self_ref: weak.clone(),
         }))
     }
@@ -282,8 +290,26 @@ pub struct ShimContext {
     lib: Arc<ShimLibrary>,
     device: DeviceId,
     info: ContextInfo,
+    /// Host staging buffers (ABI v2.3) by id; see the module's ownership rules.
+    staging: Mutex<StagingTable>,
     /// Lets `compute_stream` hand out an owning `Arc` of this context.
     self_ref: Weak<ShimContext>,
+}
+
+/// The staging buffers of one context and the next id.
+#[derive(Default)]
+struct StagingTable {
+    next: u64,
+    bufs: HashMap<u64, Staged>,
+}
+
+/// One page-locked host buffer and the event recorded after its latest staged copy.
+struct Staged {
+    host: *mut u8,
+    len: usize,
+    event: *mut TurbineEvent,
+    /// A staged copy was enqueued since the host last waited on `event`.
+    pending: bool,
 }
 
 impl fmt::Debug for ShimContext {
@@ -324,6 +350,61 @@ impl ShimContext {
 
     fn check(&self, code: i32) -> Result<(), KernelError> {
         ffi::check(code, &self.lib.syms, self.raw)
+    }
+
+    /// The v2.3 staging functions, or `Unsupported` naming the library.
+    fn staging_fns(&self) -> Result<StagingFns, MemoryError> {
+        self.lib.syms.v21.staging.ok_or_else(|| {
+            MemoryError::Unsupported(format!(
+                "{} does not export the kernel ABI v2.3 staging functions (minor {})",
+                self.lib.path.display(),
+                self.lib.syms.v21.minor
+            ))
+        })
+    }
+
+    /// Runs `f` on staging buffer `id` after checking `[offset, offset + len)` lies inside it,
+    /// holding the table lock throughout.
+    fn with_staged<R>(
+        &self,
+        id: StagingId,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce(&mut Staged) -> Result<R, MemoryError>,
+    ) -> Result<R, MemoryError> {
+        let mut table = self.staging.lock().unwrap_or_else(PoisonError::into_inner);
+        let staged = table.bufs.get_mut(&id.0).ok_or_else(|| {
+            MemoryError::InvalidArgument(format!("staging buffer {} is not allocated", id.0))
+        })?;
+        if offset.checked_add(len).is_none_or(|end| end > staged.len) {
+            return Err(MemoryError::InvalidArgument(format!(
+                "range {offset}+{len} outside staging buffer of {} bytes",
+                staged.len
+            )));
+        }
+        f(staged)
+    }
+
+    /// Waits until every staged copy of `staged` has completed (the event recorded after the
+    /// latest one), and no longer.
+    fn wait_staged(&self, fns: &StagingFns, staged: &mut Staged) -> Result<(), MemoryError> {
+        if staged.pending {
+            // SAFETY: `event` came from `turbine_event_create` on this context and lives until
+            // `staging_free`; `raw` is a live context.
+            let code = unsafe { (fns.event_synchronize)(self.raw, staged.event) };
+            self.check(code)?;
+            staged.pending = false;
+        }
+        Ok(())
+    }
+
+    /// Re-records `staged`'s event after the staged copy just enqueued.
+    fn mark_staged(&self, fns: &StagingFns, staged: &mut Staged) -> Result<(), MemoryError> {
+        // SAFETY: as in `wait_staged`; a null stream is the compute stream the copy went to.
+        let code = unsafe { (fns.event_record)(self.raw, staged.event, std::ptr::null_mut()) };
+        self.check(code)?;
+        staged.pending = true;
+        Ok(())
     }
 
     /// The device address of `v` for a descriptor, after checking the view's memory is this
@@ -565,6 +646,167 @@ impl DeviceMemory for ShimContext {
             .upgrade()
             .expect("a ShimContext only exists inside the Arc create_context returns");
         StreamRef::new(0, self.device, owner)
+    }
+
+    fn staging_alloc(&self, bytes: usize) -> Result<StagingId, MemoryError> {
+        let fns = self.staging_fns()?;
+        let mut host: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `host` is a live out-pointer; on success the shim stores page-locked memory it
+        // allocated, owned from here by this context's staging table.
+        let code = unsafe { (fns.host_alloc)(self.raw, bytes, &mut host) };
+        self.check(code)?;
+        let mut event: *mut TurbineEvent = std::ptr::null_mut();
+        // SAFETY: `event` is a live out-pointer; on success the shim stores an event it created,
+        // owned from here by the staging table together with `host`.
+        let code = unsafe { (fns.event_create)(self.raw, &mut event) };
+        if let Err(e) = self.check(code).and_then(|()| {
+            if host.is_null() || event.is_null() {
+                Err(KernelError::Library {
+                    message: "turbine_host_alloc_pinned or turbine_event_create returned null"
+                        .into(),
+                })
+            } else {
+                Ok(())
+            }
+        }) {
+            // SAFETY: `host` (when not null) came from `turbine_host_alloc_pinned` above, no copy used
+            // it, and it is freed exactly once, here, because no table entry took it; likewise
+            // `event` from `turbine_event_create`.
+            unsafe {
+                if !event.is_null() {
+                    (fns.event_destroy)(self.raw, event);
+                }
+                (fns.host_free)(self.raw, host);
+            }
+            return Err(e.into());
+        }
+        let mut table = self.staging.lock().unwrap_or_else(PoisonError::into_inner);
+        table.next += 1;
+        let id = table.next;
+        table.bufs.insert(
+            id,
+            Staged {
+                host: host.cast(),
+                len: bytes,
+                event,
+                pending: false,
+            },
+        );
+        Ok(StagingId(id))
+    }
+
+    fn staging_free(&self, id: StagingId) {
+        let Ok(fns) = self.staging_fns() else {
+            return;
+        };
+        let removed = self
+            .staging
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .bufs
+            .remove(&id.0);
+        let Some(mut staged) = removed else {
+            return;
+        };
+        if let Err(e) = self.wait_staged(&fns, &mut staged) {
+            tracing::warn!(event = "staging_free_failed", device = self.device.0, error = %e, "waiting for a staging buffer's copies failed");
+        }
+        // SAFETY: `host` and `event` came from `turbine_host_alloc_pinned` / `turbine_event_create` on
+        // this context, were removed from the table above (so this is their only release), and
+        // no staged copy still uses them (waited above; after a device error the context is
+        // unusable and the stream no longer runs).
+        let codes = unsafe {
+            [
+                (fns.event_destroy)(self.raw, staged.event),
+                (fns.host_free)(self.raw, staged.host.cast()),
+            ]
+        };
+        for code in codes {
+            if let Err(e) = self.check(code) {
+                tracing::warn!(event = "staging_free_failed", device = self.device.0, error = %e, "releasing a staging buffer failed");
+            }
+        }
+    }
+
+    fn staging_write(&self, id: StagingId, offset: usize, src: &[u8]) -> Result<(), MemoryError> {
+        let fns = self.staging_fns()?;
+        self.with_staged(id, offset, src.len(), |staged| {
+            self.wait_staged(&fns, staged)?;
+            // SAFETY: `staged.host` is a live allocation of `staged.len` bytes and
+            // `[offset, offset + src.len())` lies inside it (checked by `with_staged`); no staged
+            // copy uses it (waited above) and the table lock excludes every other host access.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), staged.host.add(offset), src.len());
+            }
+            Ok(())
+        })
+    }
+
+    fn staging_read(
+        &self,
+        id: StagingId,
+        offset: usize,
+        dst: &mut [u8],
+    ) -> Result<(), MemoryError> {
+        let fns = self.staging_fns()?;
+        self.with_staged(id, offset, dst.len(), |staged| {
+            self.wait_staged(&fns, staged)?;
+            // SAFETY: as in `staging_write`, reading into the exclusively borrowed `dst`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(staged.host.add(offset), dst.as_mut_ptr(), dst.len());
+            }
+            Ok(())
+        })
+    }
+
+    fn copy_h2d_staged(
+        &self,
+        dst: DevicePtr,
+        id: StagingId,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
+        let fns = self.staging_fns()?;
+        self.with_staged(id, offset, bytes, |staged| {
+            // SAFETY: the source range lies inside the live page-locked buffer (checked by
+            // `with_staged`) and `dst` is a device range the caller (`HostStaging::upload`)
+            // bounds-checked. The copy runs asynchronously: the event recorded next marks its
+            // completion, and every host access to the buffer waits on it first.
+            let code = unsafe {
+                (self.lib.syms.memcpy_h2d)(
+                    self.raw,
+                    dst.addr() as *mut c_void,
+                    staged.host.add(offset).cast(),
+                    bytes,
+                )
+            };
+            self.check(code)?;
+            self.mark_staged(&fns, staged)
+        })
+    }
+
+    fn copy_d2h_staged(
+        &self,
+        id: StagingId,
+        offset: usize,
+        src: DevicePtr,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
+        let fns = self.staging_fns()?;
+        self.with_staged(id, offset, bytes, |staged| {
+            // SAFETY: as in `copy_h2d_staged`, with the buffer as the destination: no host access
+            // reads it before the event recorded next has completed.
+            let code = unsafe {
+                (self.lib.syms.memcpy_d2h)(
+                    self.raw,
+                    staged.host.add(offset).cast(),
+                    src.addr() as *const c_void,
+                    bytes,
+                )
+            };
+            self.check(code)?;
+            self.mark_staged(&fns, staged)
+        })
     }
 }
 
@@ -1609,7 +1851,7 @@ mod tests {
     use turbine_core::types::{BlockId, DType, DeviceId, ExecutionBackend, MemoryKind, Vendor};
     use turbine_device::{DeviceInfo, DeviceMemoryInfo};
     use turbine_tensor::host::HostMemory;
-    use turbine_tensor::{DeviceBuffer, Tensor};
+    use turbine_tensor::{DeviceBuffer, HostStaging, Tensor};
 
     use super::*;
     use crate::KernelError;
@@ -1699,6 +1941,25 @@ mod tests {
                 .starts_with("cannot load /nonexistent/libturbine_hip.so"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn last_error_with_null_buffer_only_returns_the_length() {
+        let lib = ShimLibrary::load(
+            Path::new(env!("TURBINE_STUB_GFX942")),
+            ExecutionBackend::Hip,
+        )
+        .expect("load");
+        let mut buf = [0u8; 64];
+        // SAFETY: a null context reads this thread's create message; `buf` is live and writable
+        // for its full length.
+        let with_buf =
+            unsafe { (lib.syms.last_error)(std::ptr::null_mut(), buf.as_mut_ptr().cast(), 64) };
+        // SAFETY: the header allows a null buffer: the library writes nothing and returns the
+        // length.
+        let without_buf =
+            unsafe { (lib.syms.last_error)(std::ptr::null_mut(), std::ptr::null_mut(), buf.len()) };
+        assert_eq!(without_buf, with_buf);
     }
 
     #[test]
@@ -1929,7 +2190,7 @@ mod tests {
 
     /// ABI v2.1 is optional. The plain (v2.0) stub loads with minor 0, its provider has no
     /// `add_rmsnorm`/`logits_reduce` family and its context answers the option and graph calls
-    /// with `Unsupported`; the `TURBINE_STUB_V21` stub reports the header's minor (2), exposes both op families
+    /// with `Unsupported`; the `TURBINE_STUB_V21` stub reports the header's minor (3), exposes both op families
     /// through the ABI, keeps options, and captures, launches and destroys graphs. Breaks if a
     /// v2.1 symbol becomes required, if a v2.0 library reports v2.1 support, or if a graph is not
     /// destroyed exactly once.
@@ -1967,7 +2228,7 @@ mod tests {
             ExecutionBackend::Hip,
         )
         .expect("a v2.1 library loads");
-        assert_eq!((v21.abi_version(), v21.abi_minor()), (2, 2));
+        assert_eq!((v21.abi_version(), v21.abi_minor()), (2, 3));
         let ctx = v21
             .create_context(&mocked_device("gfx942"))
             .expect("context");
@@ -2064,6 +2325,91 @@ mod tests {
         assert_eq!(live_graphs(), 1);
         drop(graph);
         assert_eq!(live_graphs(), 0, "the graph is destroyed exactly once");
+    }
+
+    /// ABI v2.3 host staging: a v2.0 library has none (`Unsupported`, so the executor keeps the
+    /// synchronous copies); the stub's staged copies round-trip through page-locked memory, every
+    /// host access after a staged copy waits on the buffer's event (and one without a pending
+    /// copy does not), and dropping the handle frees the memory and the event exactly once.
+    /// Breaks if staging is reported without the symbols, if a host access skips the wait, or
+    /// if a buffer or event leaks.
+    #[test]
+    fn v22_host_staging() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let plain = ShimLibrary::load(
+            Path::new(env!("TURBINE_STUB_GFX942")),
+            ExecutionBackend::Hip,
+        )
+        .expect("load v2.0");
+        let mem: Arc<dyn DeviceMemory> = plain
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        assert!(matches!(
+            HostStaging::alloc(&mem, 16),
+            Err(MemoryError::Unsupported(message)) if message.contains("v2.3")
+        ));
+        drop(mem);
+
+        let lib = ShimLibrary::load(
+            Path::new(env!("TURBINE_STUB_GFX942_V21")),
+            ExecutionBackend::Hip,
+        )
+        .expect("load v2.3");
+        let hook = |name: &str| {
+            stub_hook(&lib, name, |f: unsafe extern "C" fn() -> i32| {
+                // SAFETY: the v2.1 stub defines `int32_t <name>(void)` for the three v2.3
+                // counters; the library is loaded.
+                unsafe { f() }
+            })
+        };
+        let (buffers, events) = (hook("stub_live_host_buffers"), hook("stub_live_events"));
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let staging = HostStaging::alloc(&mem, 8).expect("staging");
+        assert_eq!(hook("stub_live_host_buffers"), buffers + 1);
+        assert_eq!(hook("stub_live_events"), events + 1);
+        let dev = DeviceBuffer::alloc(&mem, 8).expect("device buffer");
+
+        let syncs = hook("stub_event_syncs");
+        staging.write(0, &[1, 2, 3, 4]).expect("write");
+        assert_eq!(hook("stub_event_syncs"), syncs, "no copy pending: no wait");
+        staging.upload(0, dev.slice(4, 4)).expect("upload");
+        staging.download(4, dev.slice(4, 4)).expect("download");
+        let mut out = [0u8; 8];
+        staging.read(0, &mut out).expect("read");
+        assert_eq!(out, [1, 2, 3, 4, 1, 2, 3, 4]);
+        assert_eq!(
+            hook("stub_event_syncs"),
+            syncs + 1,
+            "one wait covers both copies"
+        );
+        staging.read(0, &mut out).expect("read again");
+        assert_eq!(hook("stub_event_syncs"), syncs + 1);
+        assert!(matches!(
+            staging.upload(6, dev.slice(0, 4)),
+            Err(MemoryError::InvalidArgument(_))
+        ));
+        let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 10);
+        let foreign = DeviceBuffer::alloc(&host, 4).expect("host buffer");
+        assert!(matches!(
+            staging.upload(0, foreign.whole()),
+            Err(MemoryError::InvalidArgument(_))
+        ));
+
+        staging
+            .upload(0, dev.slice(0, 4))
+            .expect("upload before drop");
+        let syncs = hook("stub_event_syncs");
+        drop((staging, dev, mem, ctx));
+        assert_eq!(
+            hook("stub_event_syncs"),
+            syncs + 1,
+            "freeing waits for the copy"
+        );
+        assert_eq!(hook("stub_live_host_buffers"), buffers);
+        assert_eq!(hook("stub_live_events"), events);
     }
 
     #[test]

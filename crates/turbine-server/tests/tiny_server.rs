@@ -43,6 +43,8 @@ use turbine_tensor::host::HostMemory;
 
 const POLL: Duration = Duration::from_millis(20);
 const READY_LIMIT: Duration = Duration::from_secs(60);
+/// Launches of one test server before a lost port race fails the test.
+const LAUNCH_ATTEMPTS: usize = 5;
 /// The server's test-only cap on each accepted connection's kernel send buffer.
 const SEND_BUFFER_ENV: &str = "TURBINE_TEST_SOCKET_SEND_BUFFER";
 /// Kernel buffer bytes on each end of a held stream (Linux doubles and floors them).
@@ -197,40 +199,40 @@ impl TinyServer {
             cfg["max_position_embeddings"] = json!(positions);
             std::fs::write(&path, cfg.to_string()).unwrap();
         }
-        let addr = free_addr();
         let config = dir.path().join("config.yaml");
-        let yaml = config_yaml_with(
-            &model_dir,
-            addr,
-            setup.model_extra,
-            setup.server_extra,
-            setup.execution_extra,
-            setup.kv_bytes,
-            setup.extra,
-        );
-        std::fs::write(&config, yaml).unwrap();
-        let mut child = spawn(&config);
-        wait_until_ready(&mut child, addr);
-        let logs = setup.capture_logs.then(|| {
-            let logs = Arc::new(Mutex::new(String::new()));
-            let mut stderr = BufReader::new(child.stderr.take().expect("stderr is piped"));
-            let sink = Arc::clone(&logs);
-            std::thread::spawn(move || {
-                let mut line = String::new();
-                while stderr.read_line(&mut line).is_ok_and(|n| n > 0) {
-                    sink.lock().unwrap().push_str(&line);
-                    line.clear();
+        // A port from `free_addr` is free only until something else binds it, and tests start
+        // servers in parallel: when this server loses its port to another test's server, it
+        // exits without logging `listening` and the launch retries on a fresh port. Readiness
+        // is only trusted after this server logged `listening`, so another test's server
+        // answering `/ready` on the same port is never mistaken for this one.
+        for _ in 0..LAUNCH_ATTEMPTS {
+            let addr = free_addr();
+            let yaml = config_yaml_with(
+                &model_dir,
+                addr,
+                setup.model_extra,
+                setup.server_extra,
+                setup.execution_extra,
+                setup.kv_bytes,
+                setup.extra,
+            );
+            std::fs::write(&config, yaml).unwrap();
+            let mut child = spawn(&config);
+            let logs = drain_stderr(&mut child);
+            match wait_until_ready(&mut child, addr, &logs) {
+                Ready::Serving => {
+                    return TinyServer {
+                        child,
+                        addr,
+                        model: "tiny-llama".into(),
+                        logs: setup.capture_logs.then_some(logs),
+                        _dir: dir,
+                    };
                 }
-            });
-            logs
-        });
-        TinyServer {
-            child,
-            addr,
-            model: "tiny-llama".into(),
-            logs,
-            _dir: dir,
+                Ready::PortTaken => continue,
+            }
         }
+        panic!("turbine-server lost its port {LAUNCH_ATTEMPTS} times in a row");
     }
 
     /// The JSON log records written so far (the server must log with `format: json`).
@@ -383,18 +385,46 @@ impl Drop for TinyServer {
     }
 }
 
-fn wait_until_ready(child: &mut Child, addr: SocketAddr) {
+/// Collects `child`'s stderr on a thread, so the server never blocks on a full pipe.
+fn drain_stderr(child: &mut Child) -> Arc<Mutex<String>> {
+    let logs = Arc::new(Mutex::new(String::new()));
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr is piped"));
+    let sink = Arc::clone(&logs);
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        while stderr.read_line(&mut line).is_ok_and(|n| n > 0) {
+            sink.lock().unwrap().push_str(&line);
+            line.clear();
+        }
+    });
+    logs
+}
+
+/// How [`wait_until_ready`] ended.
+enum Ready {
+    /// This server bound its port and answers `/ready` 200.
+    Serving,
+    /// Another process took the port first; this server exited.
+    PortTaken,
+}
+
+fn wait_until_ready(child: &mut Child, addr: SocketAddr, logs: &Mutex<String>) -> Ready {
     let started = Instant::now();
     while started.elapsed() < READY_LIMIT {
         if let Some(status) = child.try_wait().unwrap() {
-            let mut stderr = String::new();
-            if let Some(mut e) = child.stderr.take() {
-                e.read_to_string(&mut stderr).ok();
+            // Give the drain thread a moment to read the last lines.
+            std::thread::sleep(POLL);
+            let stderr = logs.lock().unwrap().clone();
+            if stderr.contains("cannot bind") {
+                return Ready::PortTaken;
             }
             panic!("turbine-server exited early ({status}); stderr:\n{stderr}");
         }
-        if TcpStream::connect(addr).is_ok() && request(addr, "GET", "/ready", None).status == 200 {
-            return;
+        if logs.lock().unwrap().contains("listening")
+            && TcpStream::connect(addr).is_ok()
+            && request(addr, "GET", "/ready", None).status == 200
+        {
+            return Ready::Serving;
         }
         std::thread::sleep(POLL);
     }
@@ -2346,6 +2376,77 @@ fn iteration_stage_breakdown() {
         (sum - duration).abs() <= (0.05 * duration).max(0.5),
         "stages sum to {sum} ms, the iteration took {duration} ms: {doc}"
     );
+}
+
+/// P2c overlap scheduling end to end: `execution.overlap_scheduling` true and false (the default)
+/// give every request of a concurrent mix the same completion — greedy with and without
+/// logprobs, a stop string, EOS honoured, a seeded draw, `n` = 2, a JSON schema — and the server
+/// logs whether overlap scheduling is on (`overlap_scheduling`, `enabled`). Breaks if the key is
+/// not wired to the engine or overlap scheduling changes an output.
+#[test]
+fn overlap_scheduling_matches_serial() {
+    let bodies = [
+        json!({"prompt": "Hello", "max_tokens": 12, "temperature": 0.0, "ignore_eos": true}),
+        json!({"prompt": "Hello", "max_tokens": 12, "temperature": 0.0, "logprobs": 3,
+               "ignore_eos": true}),
+        json!({"prompt": "Once upon a time", "max_tokens": 16, "temperature": 0.0,
+               "stop": ["e", "o"]}),
+        json!({"prompt": "Hi there", "max_tokens": 20, "temperature": 0.0}),
+        json!({"prompt": "Yes", "max_tokens": 10, "temperature": 0.9, "seed": 3,
+               "ignore_eos": true}),
+        json!({"prompt": "Bye", "max_tokens": 6, "temperature": 0.0, "n": 2,
+               "ignore_eos": true}),
+        json!({"prompt": "Data:", "max_tokens": 40, "temperature": 0.0,
+               "response_format": {"type": "json_schema",
+                   "json_schema": {"name": "small", "schema": small_schema()}}}),
+        json!({"prompt": "A", "max_tokens": 1, "temperature": 0.0, "ignore_eos": true}),
+    ];
+    let run = |overlap: bool| -> Vec<Value> {
+        let execution_extra = format!("  overlap_scheduling: {overlap}\n");
+        let server = TinyServer::launch(&Setup {
+            execution_extra: &execution_extra,
+            extra: "logging:\n  format: json\n",
+            capture_logs: true,
+            ..Setup::default()
+        });
+        let outputs: Vec<Value> = std::thread::scope(|s| {
+            let handles: Vec<_> = bodies
+                .iter()
+                .map(|b| {
+                    let mut body = b.clone();
+                    body["model"] = json!(server.model);
+                    let server = &server;
+                    s.spawn(move || {
+                        let resp = server.post("/v1/completions", &body);
+                        assert_eq!(resp.status, 200, "{body}: {}", resp.body);
+                        let doc = resp.json();
+                        json!({"choices": doc["choices"], "usage": doc["usage"]})
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let logged = || {
+            server
+                .log_records()
+                .into_iter()
+                .find(|r| r["fields"]["event"] == "overlap_scheduling")
+        };
+        wait_for(
+            Duration::from_secs(10),
+            "the overlap_scheduling log",
+            || logged().is_some(),
+        );
+        let logged = logged().unwrap();
+        assert_eq!(logged["fields"]["enabled"], json!(overlap), "{logged}");
+        outputs
+    };
+    let overlapped = run(true);
+    let serial = run(false);
+    for (i, (o, s)) in overlapped.iter().zip(&serial).enumerate() {
+        assert_eq!(o, s, "request {i}: {}", bodies[i]);
+    }
+    assert_eq!(serial[5]["choices"].as_array().map(Vec::len), Some(2));
 }
 
 /// One request of [`device_sampling_matches_host`]: its body and how many of its yielding rows

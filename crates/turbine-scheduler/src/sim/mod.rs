@@ -64,6 +64,11 @@ pub struct SimReport {
     /// Broken invariants: starved decodes, exceeded budgets or bounds, tokens sampled at the
     /// wrong position (duplicated or skipped after a recompute).
     pub violations: Vec<String>,
+    /// Time to first token of every request that got one, in virtual seconds from its arrival
+    /// to the end of the iteration that sampled it, in the order the first tokens came.
+    pub ttft_s: Vec<f64>,
+    /// Tokens sampled over the run (every choice counted).
+    pub generated_tokens: u64,
 }
 
 struct SimSeq {
@@ -78,6 +83,8 @@ struct SimSeq {
 struct SimReq {
     seqs: SmallVec<[SeqId; 1]>,
     shared_done: bool,
+    arrival: Duration,
+    first_token: bool,
 }
 
 enum Hook {
@@ -200,6 +207,7 @@ impl Simulation {
                 self.forget(*id);
             }
             if plan.is_empty() {
+                self.arrivals.on_done(plan.dropped.len() as u64, now);
                 self.sched.complete(
                     &mut self.pool,
                     IterationOutcome {
@@ -219,10 +227,13 @@ impl Simulation {
                 continue;
             }
             let duration = self.exec.duration(&plan);
-            let outcome = self.execute(&plan);
+            let completed = self.report.completed;
+            let outcome = self.execute(&plan, now + duration);
             self.record(&plan, now, duration);
             self.clock.advance(duration);
             self.sched.complete(&mut self.pool, outcome);
+            let done = u64::from(self.report.completed - completed) + plan.dropped.len() as u64;
+            self.arrivals.on_done(done, now + duration);
         }
         std::mem::take(&mut self.report)
     }
@@ -258,17 +269,23 @@ impl Simulation {
                         SimReq {
                             seqs,
                             shared_done: false,
+                            arrival: a.at,
+                            first_token: false,
                         },
                     );
                 }
-                Err(e) => self.report.rejected.push((id, e)),
+                Err(e) => {
+                    self.report.rejected.push((id, e));
+                    self.arrivals.on_done(1, now);
+                }
             }
         }
     }
 
     /// The "model": completed prefills and decodes sample one token each (the shared prefill
-    /// of `n > 1` one per choice); a sequence stops after `output_len` tokens.
-    fn execute(&mut self, plan: &IterationPlan) -> IterationOutcome {
+    /// of `n > 1` one per choice); a sequence stops after `output_len` tokens. `end` is the
+    /// virtual time the iteration finishes.
+    fn execute(&mut self, plan: &IterationPlan, end: Duration) -> IterationOutcome {
         let mut appended = Vec::new();
         let mut finished = Vec::new();
         for item in &plan.items {
@@ -294,6 +311,12 @@ impl Simulation {
             }
             let id = s.request;
             let r = self.reqs.get_mut(&id).expect("tracked request");
+            if !r.first_token {
+                r.first_token = true;
+                self.report
+                    .ttft_s
+                    .push(end.saturating_sub(r.arrival).as_secs_f64());
+            }
             let targets: Vec<SeqId> = if matches!(item.kind, BatchKind::Prefill { .. })
                 && !r.shared_done
                 && r.seqs[0] == item.seq
@@ -309,6 +332,7 @@ impl Simulation {
                     continue;
                 }
                 s.generated += 1;
+                self.report.generated_tokens += 1;
                 appended.push((t, 1));
                 if s.generated >= s.output_len {
                     s.finished = true;
@@ -925,5 +949,270 @@ mod tests {
         );
         assert!(report.completed > 500, "{} completed", report.completed);
         assert!(sim.now() >= secs(10_000.0));
+    }
+
+    /// The tuned batch shape (P2c S-12) the Phase 2c lab configs run
+    /// (`scripts/lab/phase2c-novanas-*.yaml`).
+    const PHASE2C_MAX_BATCH_TOKENS: u32 = 2048;
+    const PHASE2C_PREFILL_CHUNK_TOKENS: u32 = 2048;
+
+    #[test]
+    fn closed_loop_keeps_concurrency() {
+        let template = SimArrival::new(secs(0.0), 100, 20);
+        let arrivals = ArrivalProcess::closed_loop(template, 4, 10);
+        let mut sim = Simulation::new(params(), pool(1024), realistic_cost(), arrivals);
+        let report = sim.run(secs(1_000.0));
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+        assert_eq!(report.completed, 10);
+        assert_eq!(report.max_running, 4, "four requests in flight at once");
+        assert_eq!(report.ttft_s.len(), 10);
+        assert_eq!(report.generated_tokens, 200);
+        // The first four arrive at zero and prefill together (4 × 100 tokens ≤ 512).
+        let first = report.iterations[0].duration_s;
+        for t in &report.ttft_s[..4] {
+            assert!((t - first).abs() < 1e-9, "ttft {t} vs {first}");
+        }
+        // Each later arrival comes when a request finishes, never before.
+        assert!(report.ttft_s.iter().all(|&t| t > 0.0));
+    }
+
+    /// Iteration cost of Llama-3.2-3B on one R9700 (Phase 2c, fused projections, 128-token
+    /// pages): a decode step of 16 sequences takes 17.2 ms (perf log, `decode fwd ms`) and a
+    /// 2,048-token prefill chunk 135 ms (`forward_profile` prefill_2048), i.e. 66 µs a token.
+    fn llama_r9700_cost(per_prefill_token_s: f64) -> SimExecutor {
+        SimExecutor {
+            cost: CostModel {
+                per_prefill_token_s,
+                per_decode_step_s: 0.0172,
+                per_seq_s: 0.000_05,
+            },
+        }
+    }
+
+    /// The Phase 2c scheduler parameters with the given batch shape (the lab configs' other
+    /// values: 64 running, 256 queued, 128-token pages).
+    fn phase2c_params(max_batch_tokens: u32, prefill_chunk_tokens: u32) -> SchedulerParams {
+        SchedulerParams {
+            max_running_requests: 64,
+            max_batch_tokens,
+            prefill_chunk_tokens,
+            max_queued_requests: 256,
+            chunked_prefill: true,
+            block_tokens: 128,
+            free_watermark: 0.01,
+            max_seq_len: 8192,
+            queue_timeout: Duration::from_secs(60),
+        }
+    }
+
+    /// The `p`-quantile (0..=1, nearest rank) of `v`.
+    fn quantile(v: &[f64], p: f64) -> f64 {
+        let mut s = v.to_vec();
+        s.sort_by(f64::total_cmp);
+        s[((s.len() as f64 * p).ceil() as usize).clamp(1, s.len()) - 1]
+    }
+
+    /// One closed-loop run of the Phase 2c benchmark workload (`turbine-bench --concurrency 16
+    /// --requests 200 --prompt-words 512 --max-tokens 256 --ignore-eos`: ~680-token prompts):
+    /// (TTFT p50 s, TTFT p90 s, output tok/s, ITL p50 s, worst decode stall s).
+    fn bench_workload(p: SchedulerParams, exec: SimExecutor) -> (f64, f64, f64, f64, f64) {
+        let template = SimArrival::new(secs(0.0), 680, 256);
+        let arrivals = ArrivalProcess::closed_loop(template, 16, 200);
+        // 8 GiB of Llama KV at 128-token pages (28 layers × 2 × 8 heads × 128 × BF16).
+        let mut sim = Simulation::new(p, pool_of(584, 128), exec, arrivals);
+        let report = sim.run(secs(100_000.0));
+        assert!(
+            report.violations.is_empty(),
+            "{:?}",
+            &report.violations[..report.violations.len().min(5)]
+        );
+        assert_eq!(report.completed, 200);
+        assert_eq!(report.ttft_s.len(), 200);
+        // Every decoded token waits for its iteration: token-weighted iteration durations.
+        let mut itl = Vec::new();
+        for it in &report.iterations {
+            let decodes = it
+                .items
+                .iter()
+                .filter(|i| i.kind == BatchKind::Decode)
+                .count();
+            itl.extend(std::iter::repeat_n(it.duration_s, decodes));
+        }
+        (
+            quantile(&report.ttft_s, 0.5),
+            quantile(&report.ttft_s, 0.9),
+            report.generated_tokens as f64 / sim.now().as_secs_f64(),
+            quantile(&itl, 0.5),
+            itl.iter().copied().fold(0.0, f64::max),
+        )
+    }
+
+    /// P2c S-12 (simulator part of the batch-shape sweep): the benchmark workload under the
+    /// R9700 Llama cost model for every (`max_batch_tokens`, `prefill_chunk_tokens`) pair of the
+    /// lab sweep. With 8,192 batch tokens the first wave admits 12 prompts into one ~0.55 s
+    /// iteration, so the median request waits for the whole wave; a 2,048-token batch prefills
+    /// about three prompts per iteration and interleaves the decodes, which roughly halves the
+    /// median TTFT and the worst decode stall for the same throughput (the prefill work does not
+    /// change, only its order). Prints one `sim_batch_shape` line per pair.
+    #[test]
+    fn phase2c_batch_shape_ttft() {
+        let mut rows = Vec::new();
+        for per_token in [66e-6, 57e-6] {
+            for b in [1024, 2048, 4096, 8192] {
+                for c in [512, 1024, 2048] {
+                    if c > b {
+                        continue;
+                    }
+                    let r = bench_workload(phase2c_params(b, c), llama_r9700_cost(per_token));
+                    println!(
+                        "sim_batch_shape prefill_us_per_token={:.0} max_batch_tokens={b} prefill_chunk_tokens={c} ttft_p50_ms={:.0} ttft_p90_ms={:.0} tok_s={:.1} itl_p50_ms={:.1} itl_max_ms={:.0}",
+                        per_token * 1e6,
+                        r.0 * 1e3,
+                        r.1 * 1e3,
+                        r.2,
+                        r.3 * 1e3,
+                        r.4 * 1e3
+                    );
+                    rows.push(((per_token * 1e6).round() as u32, b, c, r));
+                }
+            }
+        }
+        let get = |t: u32, b: u32, c: u32| {
+            rows.iter()
+                .find(|r| (r.0, r.1, r.2) == (t, b, c))
+                .map(|r| r.3)
+                .expect("simulated pair")
+        };
+        for t in [66, 57] {
+            let base = get(t, 8192, 2048);
+            let tuned = get(t, PHASE2C_MAX_BATCH_TOKENS, PHASE2C_PREFILL_CHUNK_TOKENS);
+            assert!(
+                tuned.0 <= 0.75 * base.0,
+                "{t} µs/token: TTFT p50 {:.3} s vs {:.3} s at 8192/2048",
+                tuned.0,
+                base.0
+            );
+            assert!(
+                tuned.2 >= 0.98 * base.2,
+                "{t} µs/token: {:.1} tok/s vs {:.1} at 8192/2048",
+                tuned.2,
+                base.2
+            );
+            assert!(tuned.4 < base.4, "the worst decode stall shrinks");
+        }
+    }
+
+    /// P2c S-12: both Phase 2c lab configs run the tuned batch shape, and the scheduler keeps its
+    /// guarantees with it: 1,000 seeded Poisson arrivals with prompts up to 3,000 tokens (so
+    /// prompts are chunked) never starve a decode and never exceed the chunk or batch budget,
+    /// and 1,000 arrivals at ~10× the service rate stay within the running and queue bounds
+    /// (the overflow is rejected `queue_full`).
+    #[test]
+    fn phase2c_lab_configs_hold_invariants() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for file in [
+            "scripts/lab/phase2c-novanas-llama.yaml",
+            "scripts/lab/phase2c-novanas-olmoe.yaml",
+        ] {
+            let cfg = turbine_core::config::load(&root.join(file), &[])
+                .unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert_eq!(
+                (
+                    cfg.scheduler.max_batch_tokens,
+                    cfg.scheduler.prefill_chunk_tokens
+                ),
+                (PHASE2C_MAX_BATCH_TOKENS, PHASE2C_PREFILL_CHUNK_TOKENS),
+                "{file}"
+            );
+            let p = SchedulerParams::from_config(&cfg, 8192);
+            let blocks = 584;
+
+            // Starvation and budgets.
+            let mix = LengthMix {
+                short_prompt: (4, 256),
+                long_prompt: (257, 3000),
+                long_fraction: 0.3,
+                output: (1, 256),
+                max_new_tokens: 256,
+            };
+            let arrivals = ArrivalProcess::poisson(2.0, 11)
+                .with_mix(mix)
+                .with_limit(1000);
+            let mut sim = Simulation::new(
+                p,
+                pool_of(blocks, p.block_tokens),
+                llama_r9700_cost(66e-6),
+                arrivals,
+            );
+            let report = sim.run(secs(100_000.0));
+            assert!(
+                report.violations.is_empty(),
+                "{file}: {:?}",
+                &report.violations[..report.violations.len().min(5)]
+            );
+            assert_eq!(
+                report.completed as usize + report.rejected.len(),
+                1000,
+                "{file}"
+            );
+            let mut chunked = false;
+            for it in &report.iterations {
+                let mut tokens = 0;
+                for i in &it.items {
+                    tokens += match i.kind {
+                        BatchKind::Prefill { start, len } => {
+                            assert!(len <= p.prefill_chunk_tokens, "{file}: chunk {len}");
+                            chunked |= start > 0;
+                            len
+                        }
+                        BatchKind::Decode => 1,
+                    };
+                }
+                assert!(tokens <= p.max_batch_tokens, "{file}: {tokens} tokens");
+            }
+            assert!(chunked, "{file}: long prompts are chunked");
+
+            // Overload: ~10× the service rate.
+            let mix = LengthMix {
+                short_prompt: (4, 256),
+                long_prompt: (257, 2048),
+                long_fraction: 0.2,
+                output: (200, 256),
+                max_new_tokens: 256,
+            };
+            let arrivals = ArrivalProcess::poisson(200.0, 13)
+                .with_mix(mix)
+                .with_limit(1000);
+            let mut sim = Simulation::new(
+                p,
+                pool_of(blocks, p.block_tokens),
+                llama_r9700_cost(66e-6),
+                arrivals,
+            );
+            let report = sim.run(secs(100_000.0));
+            assert!(
+                report.violations.is_empty(),
+                "{file}: {:?}",
+                &report.violations[..report.violations.len().min(5)]
+            );
+            assert!(report.max_running <= p.max_running_requests, "{file}");
+            assert_eq!(
+                report.max_waiting, p.max_queued_requests,
+                "{file}: the queue fills"
+            );
+            assert!(!report.rejected.is_empty(), "{file}");
+            assert!(
+                report
+                    .rejected
+                    .iter()
+                    .all(|(_, e)| *e == SubmitError::QueueFull),
+                "{file}"
+            );
+            assert_eq!(
+                report.completed as usize + report.rejected.len(),
+                1000,
+                "{file}"
+            );
+        }
     }
 }

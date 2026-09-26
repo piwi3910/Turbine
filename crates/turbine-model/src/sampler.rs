@@ -4,7 +4,7 @@
 //! so an identical `seed` gives identical tokens (seeded draws keep a fixed f64 arithmetic;
 //! unseeded ones use a vectorised f32 `exp`).
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
@@ -75,15 +75,18 @@ pub struct Sampler {
     originals: HashMap<u32, f32>,
     /// Buffers reused across steps, so a step allocates nothing vocabulary-sized.
     scratch: Scratch,
-    /// The step [`Sampler::device_request`] handed to the device, until
-    /// [`Sampler::finish_reduced`] completes it.
-    pending: Option<Pending>,
+    /// The steps [`Sampler::device_request`] handed to the device, oldest first, until
+    /// [`Sampler::finish_reduced`] completes them: one, or two while the engine launches the next
+    /// step before finishing this one (P2c overlap scheduling).
+    pending: VecDeque<Pending>,
 }
 
-/// A sampling step whose row is reduced on the device: the uniform drawn for it and the stream
-/// position before that draw (restored when the row turns out to need no draw).
+/// A sampling step whose row is reduced on the device: which generated token it draws (the
+/// index in `generated`), the uniform drawn for it and the stream position before that draw
+/// (restored when the row turns out to need no draw).
 #[derive(Clone, Copy, Debug)]
 struct Pending {
+    step: usize,
     uniform: f32,
     word_pos: u128,
 }
@@ -335,8 +338,14 @@ impl Sampler {
             exact: params.seed.is_some(),
             originals: HashMap::new(),
             scratch: Scratch::default(),
-            pending: None,
+            pending: VecDeque::new(),
         }
+    }
+
+    /// The request carries a `seed`: its tokens are reproducible, so the engine never lets the
+    /// device's choice stand in for a host draw it has not checked (P2c overlap scheduling).
+    pub fn is_seeded(&self) -> bool {
+        self.exact
     }
 
     /// The state that [`Sampler::from_state`] resumes from.
@@ -360,7 +369,8 @@ impl Sampler {
     /// reported logprobs (only when requested) are the log-softmax of `logits` as passed in
     /// (before temperature).
     pub fn sample(&mut self, logits: &mut [f32], mask: Option<&TokenMask>) -> SampledToken {
-        self.pending = None;
+        let step = self.generated.len();
+        self.pending.retain(|p| p.step > step);
         let lse = self.logprobs.then(|| log_sum_exp(logits));
         let top_logprobs = match lse {
             Some(lse) if self.top_logprobs > 0 => {
@@ -408,12 +418,22 @@ impl Sampler {
     /// below 1) happens on the device, a `top_k` draw (then `top_p` over the `top_k`) in
     /// [`Sampler::finish_reduced`] over the returned candidates.
     pub fn device_request(&mut self) -> Option<RowReduce> {
-        self.pending = None;
+        self.device_request_ahead(0)
+    }
+
+    /// [`Sampler::device_request`] for the step `ahead` tokens after the next one to observe:
+    /// with `ahead` = 1 the engine launches a step before it has finished the previous one
+    /// (P2c overlap scheduling), whose token is not yet observed. The uniforms are drawn in step
+    /// order either way, so a seeded stream is the same as one step at a time.
+    pub fn device_request_ahead(&mut self, ahead: usize) -> Option<RowReduce> {
+        let step = self.generated.len() + ahead;
+        // A step asked for again (its earlier row was never finished) starts over.
+        self.pending.retain(|p| p.step < step);
         let eligible = self.logit_bias.is_empty()
             && self.presence_penalty == 0.0
             && self.frequency_penalty == 0.0
             && self.repetition_penalty == 1.0
-            && self.generated.len() as u64 >= u64::from(self.min_tokens)
+            && step as u64 >= u64::from(self.min_tokens)
             && self.top_logprobs <= DEVICE_MAX_TOP_LOGPROBS;
         let greedy = self.temperature <= 0.0;
         if !eligible || !greedy && self.top_k.is_some_and(|k| k > MAX_TOP_N) {
@@ -429,7 +449,8 @@ impl Sampler {
         }
         let word_pos = self.rng.get_word_pos();
         let u = uniform(&mut self.rng);
-        self.pending = Some(Pending {
+        self.pending.push_back(Pending {
+            step,
             uniform: u,
             word_pos,
         });
@@ -450,7 +471,16 @@ impl Sampler {
     /// without a finite (scaled) maximum gives the argmax and, like the host path, consumes no
     /// uniform.
     pub fn finish_reduced(&mut self, r: &ReducedRow) -> SampledToken {
-        let pending = self.pending.take();
+        let step = self.generated.len();
+        while self.pending.front().is_some_and(|p| p.step < step) {
+            self.pending.pop_front();
+        }
+        let pending = self
+            .pending
+            .front()
+            .is_some_and(|p| p.step == step)
+            .then(|| self.pending.pop_front())
+            .flatten();
         let first = r.top.first().copied();
         // `argmax` of the row: the best candidate unless nothing exceeds −∞.
         let argmax = match first {
@@ -463,7 +493,9 @@ impl Sampler {
             let inv_t = 1.0 / self.temperature;
             let finite = first.is_some_and(|(_, v)| (v * inv_t).is_finite());
             if !finite {
-                if let Some(p) = pending {
+                // Give the uniform back, unless a later step already drew after it (a step
+                // launched ahead): the stream then moves on, as an unseeded draw may.
+                if let Some(p) = pending.filter(|_| self.pending.is_empty()) {
                     self.rng.set_word_pos(p.word_pos);
                 }
                 argmax
@@ -1473,6 +1505,79 @@ mod tests {
         row[(uniform(rng) * 300.0) as usize] = f32::NAN;
         row[(uniform(rng) * 300.0) as usize] = f32::NEG_INFINITY;
         row
+    }
+
+    /// P2c overlap scheduling: asking for step `g + 1` before step `g` is finished
+    /// ([`Sampler::device_request_ahead`]) draws the same uniforms in the same order as one
+    /// step at a time, so a seeded stream gives the same tokens and ends at the same stream
+    /// position; `min_tokens` counts the step ahead; a step asked for again replaces its stale
+    /// request; host sampling drops the requests of its own step but keeps the one ahead.
+    /// Breaks if the steps' uniforms swap or a stale request is finished.
+    #[test]
+    fn requests_ahead_keep_the_stream() {
+        let mut rows = ChaCha8Rng::seed_from_u64(17);
+        let rows: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..300).map(|_| uniform(&mut rows) * 8.0 - 4.0).collect())
+            .collect();
+        for p in [params(0.8, 1.0, -1, 3), params(0.8, 0.9, -1, 4), greedy()] {
+            let (mut one, mut ahead) = (plain(&p), plain(&p));
+            let mut tokens = Vec::new();
+            for row in &rows {
+                let rr = one.device_request().expect("eligible");
+                let t = one.finish_reduced(&reduce_row(row, &rr)).token;
+                one.observe(t);
+                tokens.push(t);
+            }
+            // Step 0 asked for, then each step g + 1 asked for before step g is finished.
+            let mut asked = vec![ahead.device_request().expect("eligible")];
+            let mut got = Vec::new();
+            for g in 0..rows.len() {
+                if g + 1 < rows.len() {
+                    asked.push(ahead.device_request_ahead(1).expect("eligible"));
+                }
+                let t = ahead.finish_reduced(&reduce_row(&rows[g], &asked[g])).token;
+                ahead.observe(t);
+                got.push(t);
+            }
+            assert_eq!(got, tokens, "{p:?}");
+            assert_eq!(ahead.state(), one.state(), "{p:?}");
+            assert_eq!(ahead.is_seeded(), p.seed.is_some());
+        }
+
+        // `min_tokens` 2: steps 0 and 1 need the whole row; asked ahead from step 1, step 2 is
+        // eligible.
+        let mut s = Sampler::new(
+            &SamplingParams {
+                min_tokens: 2,
+                ..params(0.8, 1.0, -1, 9)
+            },
+            &[],
+            &[7],
+        );
+        assert_eq!(s.device_request_ahead(1), None);
+        s.observe(1);
+        assert!(s.device_request_ahead(1).is_some());
+
+        // A step asked for twice keeps only its latest uniform; host sampling of step g drops
+        // g's request and keeps g + 1's.
+        let p = params(0.8, 1.0, -1, 11);
+        let (mut a, mut b) = (plain(&p), plain(&p));
+        a.device_request().expect("eligible");
+        let again = a.device_request().expect("eligible");
+        let first = b.device_request().expect("eligible");
+        assert_ne!(
+            again.uniform, first.uniform,
+            "a fresh uniform for the retry"
+        );
+        let ta = a.finish_reduced(&reduce_row(&rows[0], &again)).token;
+        assert_eq!(ta, reduce_row(&rows[0], &again).sampled.expect("draw").0);
+        let mut c = plain(&p);
+        c.device_request().expect("eligible");
+        let next = c.device_request_ahead(1).expect("eligible");
+        let t0 = c.sample(&mut rows[1].clone(), None).token;
+        c.observe(t0);
+        let t1 = c.finish_reduced(&reduce_row(&rows[2], &next)).token;
+        assert_eq!(t1, reduce_row(&rows[2], &next).sampled.expect("draw").0);
     }
 
     /// P2c S-4: for every eligible seeded configuration (`top_p` 1 and below, with and without

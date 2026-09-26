@@ -68,8 +68,10 @@ pub fn table_width(blocks: u32, max_blocks: u32) -> u32 {
 }
 
 /// The graph key of the batch `pack` just wrote into `host` as `p`, when it can run as a decode
-/// graph: every sequence decodes one token and `reduce_top_n` says the rows are all reduced or
-/// all full ([`super::logits::LogitsHead::graph_top_n`]). The block table is then widened to
+/// graph: every sequence decodes one token, `reduce_top_n` says the rows are all reduced or
+/// all full ([`super::logits::LogitsHead::graph_top_n`]) and `feeds` (the step's
+/// [`super::TokenFeed`] runs, P2c overlap scheduling) are none or one run over every token (its
+/// word is part of the key; other feed shapes run eagerly). The block table is then widened to
 /// [`table_width`] columns and `max_kv_len` to the tokens they cover (at most the executor's
 /// `max_positions`), so every step of the key has the same launch shape. `None` leaves `p`
 /// as packed.
@@ -78,10 +80,16 @@ pub(super) fn decode_key(
     host: &mut HostBatch,
     limits: &BatchLimits,
     reduce_top_n: u8,
+    feeds: &[(usize, usize, usize)],
 ) -> Option<GraphKey> {
     if !p.is_decode() {
         return None;
     }
+    let feed_word = match feeds {
+        [] => None,
+        [(0, word, len)] if *len == p.total_q => Some(*word as u64),
+        _ => return None,
+    };
     let width = table_width(p.max_blocks_per_seq, limits.max_blocks_per_seq());
     let covered = u64::from(width) * u64::from(limits.layout.block_tokens);
     let max_kv_len = covered.min(u64::from(limits.max_positions)) as u32;
@@ -90,6 +98,7 @@ pub(super) fn decode_key(
         seqs: p.num_seqs as u32,
         reduce_top_n,
         table_width: width,
+        feed_word,
     })
 }
 
@@ -103,6 +112,9 @@ pub struct GraphKey {
     pub reduce_top_n: u8,
     /// Block-table columns ([`table_width`]).
     pub table_width: u32,
+    /// The word of the previous step's logits buffer the step's tokens are fed from on the
+    /// device, when they are (P2c overlap scheduling): the feed's embedding reads it.
+    pub feed_word: Option<u64>,
 }
 
 /// What an iteration does with its device work.
@@ -402,6 +414,7 @@ mod tests {
             seqs,
             reduce_top_n: 0,
             table_width: 1,
+            feed_word: None,
         }
     }
 
@@ -425,6 +438,15 @@ mod tests {
             ..key(4)
         };
         assert_eq!(c.plan(wide, true), GraphStep::Eager);
+        let fed = GraphKey {
+            feed_word: Some(4 * 263),
+            ..key(4)
+        };
+        assert_eq!(
+            c.plan(fed, true),
+            GraphStep::Eager,
+            "another feed is another shape"
+        );
 
         // Sizes 4, 1 and 2 fill the cache of 3; replaying 4 leaves 1 the least recently used,
         // so capturing a fourth size (3) evicts it.

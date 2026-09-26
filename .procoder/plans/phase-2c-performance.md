@@ -328,3 +328,20 @@ Interfaces:
 - [ ] Update `AGENTS.md` and `examples/turbine.yaml`.
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 - [ ] Commit: `docs: phase 2c performance commands and acceptance evidence`
+
+## Task 17: Overlap scheduling (amendment 2026-09-26)
+
+Files: `kernels/include/turbine_kernels.h` (v2.3), `kernels/rocm/src/memory.cpp`, `kernels/rocm/src/context.cpp`, `crates/turbine-kernels/src/ffi.rs`, `crates/turbine-kernels/src/shim.rs` (staging table, tests), `crates/turbine-kernels/stub/stub_shim.c`, `crates/turbine-kernels/tests/abi_header_neutral.rs`, `crates/turbine-kernels/tests/hip_ops.rs` (`host_staging_does_not_wait_for_the_stream`), `crates/turbine-tensor/src/buffer.rs` (`HostStaging`, `StagingId`, the staging methods), `crates/turbine-tensor/src/host.rs`, `crates/turbine-tensor/src/lib.rs`, `crates/turbine-model/src/executor/{mod,batch,logits,llama,olmoe,graphs}.rs` (`GraphKey::feed_word`, `TokenFeed`, `launch`/`collect`/`overlaps`, one staged metadata upload, staged reduction inputs and reads), `crates/turbine-model/src/sampler.rs` (`device_request_ahead`, `is_seeded`), `crates/turbine-model/tests/tiny_model.rs` (`launch_ahead_feeds_match_serial`, `hip_launch_ahead_feeds_match_serial`), `crates/turbine-core/src/config/{mod,tests}.rs` (`execution.overlap_scheduling`), `crates/turbine-server/src/engine/{loop,mod,requests}.rs`, `crates/turbine-server/src/model.rs`, `crates/turbine-server/tests/tiny_server.rs`, `examples/turbine.yaml`, `scripts/lab/phase2c-novanas-{llama,olmoe}.yaml`, `AGENTS.md`, this plan, the spec (S-16), `.procoder/contract/interfaces.md` (§9.1, §9.3)
+Interfaces:
+
+- The spec's S-16 names: ABI v2.3 (`turbine_host_alloc_pinned`, `turbine_host_free_pinned`, `turbine_event_create/destroy/record/synchronize`, the v3 signatures), `HostStaging`, `TokenFeed`, `ModelExecutor::{overlaps, launch, collect}`, `Sampler::{device_request_ahead, is_seeded}`, _execution.overlap_scheduling_
+  Covers: the S-16 ACs
+  Depends on: Tasks 7, 9 (device reduction), 8 (ABI minor revisions)
+
+- [x] Write failing tests: `turbine-tensor host::tests::staged_copies_round_trip`, `turbine-kernels shim::tests::v22_host_staging`, `turbine-model sampler::tests::requests_ahead_keep_the_stream`, `tiny_model launch_ahead_feeds_match_serial`, `turbine-server engine::r#loop::tests::overlap_scheduling_matches_serial`, `engine::r#loop::tests::overlap_failed_steps_fail_their_requests_only`, `tiny_server overlap_scheduling_matches_serial`, and the ignored lab tests `hip_ops host_staging_does_not_wait_for_the_stream`, `tiny_model hip_launch_ahead_feeds_match_serial`
+- [x] Implement v2.3 (header, HIP, stub, Rust shim), host staging, the executors' `launch`/`collect` with feeds, the sampler's requests ahead and the engine's overlapped turn behind the key
+- [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS
+- [ ] Run: `scripts/bench-lock.sh --shared scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops -- host_staging_does_not_wait_for_the_stream` and `… -- -p turbine-model --test tiny_model -- hip_launch_ahead_feeds_match_serial hip_reduced_rows_match_full_rows hip_matches_cpu` — expect exit 0
+- [ ] Coordinator: A/B throughput with `--set execution.overlap_scheduling=true|false`; keep the default on only if faster
+- [x] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+- [x] Commit: `feat(kernels): kernel ABI v2.3 pinned host memory and events`, `perf(turbine-model): launch steps ahead with device token feeds`, `perf(turbine-server): overlap scheduling`
