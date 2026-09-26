@@ -372,3 +372,5 @@
 - Option B: one new phase after Phase 8
 - Option C: keep one model per process, orchestrate processes via a control plane only
 - First experiment: two turbine-server processes sharing one R9700 (needs lab approval beyond Phase 2c)
+
+**Answer (2026-09-26):** not decided yet — more research needed; continue the original phase plan for now. No experiment on novanas.
