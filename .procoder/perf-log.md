@@ -8,7 +8,8 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 
 | Date | Commit | Change | tok/s | ITL p50 ms | TTFT p50 ms | decode fwd ms | Golden | vs previous |
 |---|---|---|---|---|---|---|---|---|
-| 2026-09-26 | vLLM-ROCm 0.23.0 | reference | 738.0 | 17.0 | 338 | – | – | – |
+| 2026-09-26 | vLLM-ROCm 0.23.0 | reference (k8s-scheduled card, unknown) | 738.0 | 17.0 | 338 | – | – | – |
+| 2026-09-26 | vLLM-ROCm 0.23.0 | **reference pinned to GPU 0** (placeholder pod on GPU 1); 199/200 ok | 715.1 | 17.0 | 339 | – | – | Turbine bd99d87 = **103%** |
 | 2026-09-26 | 7850162 | Phase 2 engine baseline (16-token pages) | 92.2 | 164 | 1528 | 47 | 16/16 | – |
 | 2026-09-26 | da01324 | Phase 2c start: all Phase 2 fixes, clean run under bench-lock (host tests 267/0) | 91.9 | 164 | 1533 | 47.4 | 16/16 | ±0 |
 | 2026-09-26 | 462f068 | host: logprobs only when requested (269/0) | 99.9 | 150 | 1519 | 47.3 | 16/16 | +8.7% |
@@ -36,6 +37,7 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 
 | Date | Commit | Change | tok/s | ITL p50 ms | TTFT p50 ms | decode fwd ms | Golden | vs previous |
 |---|---|---|---|---|---|---|---|---|
-| 2026-09-26 | vLLM-ROCm 0.23.0 | reference | 534.9 | 26.5 | 201 | – | – | – |
+| 2026-09-26 | vLLM-ROCm 0.23.0 | reference (k8s-scheduled card, unknown) | 534.9 | 26.5 | 201 | – | – | – |
+| 2026-09-26 | vLLM-ROCm 0.23.0 | **reference pinned to GPU 0**; 200/200 ok | 535.5 | 26.6 | 200 | – | – | Turbine 870f842 = **107%** |
 | 2026-09-26 | e088bd7 | first OLMoE run on the perf branch: host sampler + 128-token pages (290/0); 200/200 streams ok (no SSE failures) | 290.3 | 52.3 | 407 | 45.5 | 5/16 (known: tolerance to be calibrated, decision 2026-09-26) | – |
 | 2026-09-26 | 870f842 | **OLMoE on GPU 0 at the Llama-parity tip: MoE small-m path, 128-token pages, GPU sampling, fused add+norm/QKV — 108% of vLLM (534.9)**; 200/200 streams ok | **575.4** | 25.1 | 401 | 22.3 | 5/16 (known; calibration pending) | +98% vs e088bd7 |
