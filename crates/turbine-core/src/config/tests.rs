@@ -406,3 +406,64 @@ fn phase2_keys() {
     let four = parse(base, &["kv.gpu.max_bytes=4GiB"]).unwrap();
     assert_eq!(four.kv.gpu.max_bytes, Some(ByteSize::gib(4)));
 }
+
+#[test]
+fn phase2c_execution_keys() {
+    let base = "model:\n  path: /m\n";
+    // Defaults: every optimised path on, four sampler threads (P2c §Configuration additions).
+    let d = parse(base, &[]).unwrap();
+    assert!(d.execution.gemm_autotune);
+    assert!(d.execution.decode_graphs);
+    assert!(d.execution.device_sampling);
+    assert!(d.execution.fused_ops);
+    assert_eq!(d.execution.sampler_threads, 4);
+
+    for bad in ["0", "65"] {
+        assert_rejected(
+            base,
+            &[&format!("execution.sampler_threads={bad}")],
+            "execution.sampler_threads",
+        );
+    }
+    for ok in ["1", "64"] {
+        assert!(parse(base, &[&format!("execution.sampler_threads={ok}")]).is_ok());
+    }
+
+    let c = parse(
+        base,
+        &[
+            "execution.decode_graphs=false",
+            "execution.gemm_autotune=false",
+            "execution.device_sampling=false",
+            "execution.fused_ops=false",
+        ],
+    )
+    .unwrap();
+    assert!(!c.execution.decode_graphs);
+    assert!(!c.execution.gemm_autotune);
+    assert!(!c.execution.device_sampling);
+    assert!(!c.execution.fused_ops);
+
+    // min(sampler_threads, available parallelism − 1), at least 1.
+    assert_eq!(d.execution.effective_sampler_threads(2), 1);
+    assert_eq!(d.execution.effective_sampler_threads(16), 4);
+    assert_eq!(d.execution.effective_sampler_threads(1), 1);
+    assert_eq!(d.execution.effective_sampler_threads(0), 1);
+    assert_eq!(d.execution.effective_sampler_threads(4), 3);
+
+    // The shipped example spells the keys out at their defaults and still loads.
+    let example = include_str!("../../../../examples/turbine.yaml");
+    let e = parse(example, &[]).expect("examples/turbine.yaml must load");
+    assert!(e.execution.gemm_autotune && e.execution.decode_graphs);
+    assert!(e.execution.device_sampling && e.execution.fused_ops);
+    assert_eq!(e.execution.sampler_threads, 4);
+    for key in [
+        "gemm_autotune:",
+        "decode_graphs:",
+        "device_sampling:",
+        "fused_ops:",
+        "sampler_threads:",
+    ] {
+        assert!(example.contains(key), "examples/turbine.yaml lacks {key}");
+    }
+}

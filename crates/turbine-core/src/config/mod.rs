@@ -305,7 +305,9 @@ pub struct DevicesConfig {
     pub amd_smi_library: Option<PathBuf>,
 }
 
-/// `execution` section (Phase 1): which kernel backend runs the model, on which device.
+/// `execution` section (Phase 1): which kernel backend runs the model, on which device; the
+/// Phase 2c switches, each defaulting to the optimised path and each able to restore the
+/// Phase 2 one (P2c S-14).
 #[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields, default)]
 pub struct ExecutionConfig {
@@ -314,6 +316,17 @@ pub struct ExecutionConfig {
     pub device: DeviceId,
     /// Explicit kernel shim path; null → TURBINE_KERNEL_LIBRARY, beside the executable, loader path.
     pub kernel_library: Option<PathBuf>,
+    /// Tune the GEMM algorithm per shape at first use (false: the first heuristic answer).
+    pub gemm_autotune: bool,
+    /// Capture decode-only iterations into graphs and replay them (false: always eager).
+    pub decode_graphs: bool,
+    /// Reduce eligible logits rows on the device (false: every row copied to the host).
+    pub device_sampling: bool,
+    /// Fused QKV and gate/up projections and `add_rmsnorm` (false: separate ops).
+    pub fused_ops: bool,
+    /// Threads sampling rows in parallel, 1..=64 (1: serial);
+    /// see [`ExecutionConfig::effective_sampler_threads`].
+    pub sampler_threads: u32,
 }
 
 impl Default for ExecutionConfig {
@@ -322,7 +335,22 @@ impl Default for ExecutionConfig {
             backend: ExecutionBackend::Hip,
             device: DeviceId(0),
             kernel_library: None,
+            gemm_autotune: true,
+            decode_graphs: true,
+            device_sampling: true,
+            fused_ops: true,
+            sampler_threads: 4,
         }
+    }
+}
+
+impl ExecutionConfig {
+    /// Sampler threads on a host with `available` parallelism: `sampler_threads`, at most
+    /// `available − 1` (the engine thread keeps a core), at least 1.
+    pub fn effective_sampler_threads(&self, available: usize) -> usize {
+        (self.sampler_threads as usize)
+            .min(available.saturating_sub(1))
+            .max(1)
     }
 }
 
@@ -513,6 +541,15 @@ impl Config {
             return Err(invalid(
                 "scheduler.max_queued_requests",
                 format!("must be between 1 and 65536, got {}", s.max_queued_requests),
+            ));
+        }
+        if !(1..=64).contains(&self.execution.sampler_threads) {
+            return Err(invalid(
+                "execution.sampler_threads",
+                format!(
+                    "must be between 1 and 64, got {}",
+                    self.execution.sampler_threads
+                ),
             ));
         }
         let msb = self.structured_output.max_schema_bytes;

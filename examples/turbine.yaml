@@ -1,8 +1,9 @@
 # Development configuration: the TS §15 example plus the Phase 0 logging/devices sections, the
-# Phase 1 execution section and the Phase 2 timeout, scheduler, KV and structured-output keys
-# (spelled out at their defaults). From Phase 1 turbine-server loads model.path at startup (exit 1
-# unless it is a directory holding config.json); point it at real weights with
-# --set model.path=<dir>. --check-config validates this file without reading the model.
+# Phase 1 execution section, the Phase 2 timeout, scheduler, KV and structured-output keys and the
+# Phase 2c execution switches (spelled out at their defaults). From Phase 1 turbine-server loads
+# model.path at startup (exit 1 unless it is a directory holding config.json); point it at real
+# weights with --set model.path=<dir>. --check-config validates this file without reading the
+# model.
 server:
   listen: 127.0.0.1:8000
   max_request_bytes: 8MiB
@@ -73,3 +74,18 @@ execution:
   # null: TURBINE_KERNEL_LIBRARY, then libturbine_hip.so beside the executable, then the loader
   # path.
   kernel_library: null
+  # Phase 2c switches: each defaults to the optimised path; false restores the Phase 2 one.
+  # Time the GEMM algorithm candidates per shape at first use and keep the fastest (false: the
+  # first heuristic answer, stable across restarts). Ignored by the cpu backend.
+  gemm_autotune: true
+  # Capture decode-only iterations into a graph per batch size and replay them. Ignored when the
+  # kernel library lacks the graph functions.
+  decode_graphs: true
+  # Reduce logits rows on the device (top-n, log-sum-exp, categorical draw) when the request
+  # allows it, instead of copying the full vocabulary row to the host.
+  device_sampling: true
+  # Fused QKV and gate/up projections and the fused residual add + RMSNorm.
+  fused_ops: true
+  # Threads sampling rows in parallel (1..=64; 1 is serial); the engine uses at most the host's
+  # available parallelism minus one.
+  sampler_threads: 4
