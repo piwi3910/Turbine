@@ -1,0 +1,235 @@
+# phase-2c-performance
+
+Status: complete
+
+Source: `turbine-spec.md` §19 (between Phase 2 and Phase 3), with §6, §7, §14, §17, §18 and §21. Sections of that document are cited as "TS §N". Builds on `.procoder/specs/phase-1-single-request.md` (kernel registry, vendor-neutral C ABI, _libturbine_hip.so_, HF golden fixtures, `turbine-golden`) and `.procoder/specs/phase-2-serving-runtime.md` (engine thread, continuous batching, paged KV, OLMoE, ABI v2, `turbine-bench` baseline, vLLM-ROCm baseline Job). Decisions are recorded in `.procoder/ask/decisions.md`; this phase exists because of the entry "Performance phase between Phase 2 and Phase 3" (2026-09-26): Turbine need not beat vLLM but must reach at least 75% of vLLM-ROCm's output token throughput on the same hardware, with golden correctness unchanged.
+
+Amendments to earlier specs made by this phase:
+
+- Amends Phase 2 Out of scope ("device-side sampling, HIP graphs, kernel fusion, custom kernels replacing library kernels … before a benchmark shows the need"): Phase 2's baseline is that benchmark (Turbine 92 output tok/s against vLLM-ROCm 738 on Llama-3.2-3B), so each of these is now in scope, each behind its own correctness test and its own configuration switch.
+- Amends Phase 2 S-9 ("one device-to-host copy of the batch's FP32 last-position logits"): rows whose sampling the device can finish are reduced on the device and only the reduction is copied (S-4); the remaining rows are still copied whole, and there is still exactly one device-to-host copy per iteration.
+- Amends contract §9.1: ABI v2 gains an additive minor revision v2.1 (S-5) with optional symbols; `TURBINE_ABI_VERSION` stays `2u`, so the later majors v3 (P4), v4 (P5) and v5 (P7) keep their numbers.
+
+## Problem
+
+Phase 2 made Turbine a correct serving runtime but not a fast one. On one R9700 in novanas, with the Phase 2 baseline workload (`turbine-bench --concurrency 16 --requests 200 --prompt-words 512 --max-tokens 256 --ignore-eos`), Turbine delivers 92 output tokens/s on Llama-3.2-3B-Instruct (ITL p50 164 ms, TTFT p50 1.53 s) while vLLM-ROCm 0.23.0 (image `rocm/vllm:rocm7.14.1_rdna_ubuntu24.04_py3.14_pytorch_2.11_vllm_0.23.0`) delivers 738 (ITL p50 17 ms, TTFT p50 338 ms) on Llama-3.2-3B and 535 (ITL p50 27 ms, TTFT p50 201 ms) on OLMoE-1B-7B-0125-Instruct. The engine's own metrics show where the 164 ms per decode step go: `turbine_forward_seconds{phase="decode"}` ≈ 47 ms at batch 16 — against a weight-streaming floor of ≈ 10 ms for 6.4 GB of BF16 weights at the R9700's ≈ 640 GB/s — and ≈ 115 ms of host work per engine iteration outside the forward pass (host sampling and log-softmax over a 128,256-entry vocabulary per sequence, full-vocabulary sorts, per-step heap allocations, detokenisation, the FP32 logits copy). The GPU side has three known weaknesses: the Turbine HIP paged-attention kernel that serves the default 16-token pages (CK's paged FMHA needs pages that are multiples of 128 tokens) is a correctness-first two-pass kernel; hipBLASLt's first heuristic answer is taken for every GEMM, including the small-m decode shapes where it is known to be poor; and a decode step launches several hundred small kernels (separate Q/K/V and gate/up GEMMs, separate residual-add and RMSNorm). OLMoE adds a host synchronisation per layer: the per-expert hipBLASLt loop needs the expert offsets on the host. The user has set the bar: at least 75% of vLLM-ROCm on the same card — Llama-3.2-3B ≥ 553 and OLMoE-1B-7B ≥ 401 output tokens/s — before Phase 3 builds pressure control on top of this engine, because every later phase's benchmarks inherit the engine's per-token cost.
+
+## Users
+
+- **Operators and benchmark runners:** need Turbine's throughput within 25% of vLLM-ROCm on the same R9700 for the same workload, a single reproducible command that measures both engines on the same day and states the verdict, and a per-stage breakdown of every engine iteration in metrics and `/turbine/v1/scheduler` to see where time goes in production.
+- **API clients:** need the same outputs as before (greedy output within the golden tolerance, seeded sampling reproducible run to run) with lower inter-token latency and time to first token.
+- **Turbine developers:** need an op-level GPU profile of one forward pass, a host-side stage profile, a correctness/reference test for every optimised path (TS §21 rule 1), and a configuration switch per optimisation so a regression can be bisected on the lab host without rebuilding.
+- **Phase 2b and later phases:** need the ABI additions to be additive and optional, so the CUDA shim (Phase 2b) and the v3–v5 ABI majors (Phases 4, 5, 7) are not disturbed.
+
+## In scope
+
+- [S-1] Iteration stage breakdown: the engine thread times every iteration in the stages `schedule`, `prepare`, `launch`, `device_wait`, `sample`, `detokenize`, `emit` and `complete` (definitions in Interfaces), records them in a new histogram `turbine_engine_iteration_seconds{stage}` and publishes the last iteration's stages as `stages_ms` in `GET /turbine/v1/scheduler`. The executor reports `launch` (host time until the last kernel of the forward pass is enqueued) and `device_wait` (stream synchronisation plus the logits copy) through a new `ForwardTimings` value.
+- [S-2] Op-level forward profile: `LlamaExecutor` and `OlmoeExecutor` gain a profile mode that synchronises the stream after every registry op and accumulates wall time per op kind and implementation (`OpProfile`); an ignored lab test `turbine-model --test perf forward_profile` loads each real model on the R9700 and prints, as one JSON document per model, the profile of a decode step at batch 1, 16 and 64 (context 768 tokens) and of one 2,048-token prefill chunk, plus the unprofiled forward time of each case. Profile mode is off in serving and costs nothing when off.
+- [S-3] Host overhead removal: (a) sampler fast paths — greedy without logprobs is a single argmax pass; the row log-sum-exp is computed only when a logprob is reported; top-k, top-p and `top_logprobs` use partial selection (`select_nth_unstable_by`) instead of a full-vocabulary sort; per-step scratch buffers are reused, so steady-state sampling allocates nothing on the heap except the returned `top_logprobs` vector; (b) the engine reuses its per-iteration packing buffers and uploads all batch metadata (token ids, positions, `q_indptr`, `kv_lens`, block tables) in one host-to-device copy from one reused staging buffer; (c) rows are sampled in parallel on up to _execution.sampler_threads_ scoped threads, each request's sampler staying on one thread per step so results are identical to serial sampling; (d) the final RMSNorm, LM head and logits row are computed only for sequences whose step yields a token (a non-final prefill chunk produces no row).
+- [S-4] Device-side logits reduction: a new registry op `logits_reduce` (ABI v2.1) computes per logits row the raw log-sum-exp, the top-n raw logits with their ids (n ≤ 64, sorted descending, ties to the lower id) and, for rows in categorical mode, the token drawn by inverse CDF in id order at the row's temperature with a uniform supplied by the host. A request's row is reduced on the device when its sampler is eligible (no penalties, no `logit_bias`, no token mask, `min_tokens` already reached, `top_p` = 1, `top_k` = −1 or 1…64, `top_logprobs` ≤ 20); its sampler draws the uniform from its own ChaCha stream exactly where the host path draws it and finishes the step on the host from the reduction. Ineligible rows are copied whole as before. The single device-to-host copy of the iteration carries both.
+- [S-5] Kernel ABI v2.1 (additive, optional): `TURBINE_ABI_VERSION` stays `2u`; the header adds `TURBINE_ABI_MINOR 1u` and `turbine_abi_minor()`, context options (`turbine_ctx_set_option`, `turbine_ctx_get_option`), the op trios `add_rmsnorm` and `logits_reduce`, and the graph functions `turbine_graph_begin`, `turbine_graph_end`, `turbine_graph_launch`, `turbine_graph_destroy`. `turbine-kernels` resolves every v2.1 symbol optionally: a library without them (the Phase 2 HIP build, the Phase 2b CUDA shim) loads as before and the registry falls back — `add` then `rmsnorm`, whole-row logits, eager execution. The CPU reference provider implements `add_rmsnorm` and `logits_reduce`.
+- [S-6] Paged decode attention for 16-token pages: a Turbine HIP split-KV decode kernel (`_impl` `turbine_hip_splitkv`) for `attention_decode_paged` — one workgroup per (sequence, KV head, KV split) serving all query heads of the GQA group, 16-byte vector loads of K/V rows, online softmax in F32 per split and a fixed-order combine kernel — whose launch shape depends only on the number of sequences, head counts and the descriptor's `max_kv_len` (so it can be captured in a graph, S-10). It replaces the two-pass `turbine_hip` kernel for decode whenever `block_tokens` is not a multiple of 128; the two-pass kernel stays as the registry fallback and the CPU op stays the reference.
+- [S-7] Paged prefill attention: for `attention_prefill_paged` with `block_tokens % 128 != 0`, the shim appends the chunk's K/V into the pages (existing Turbine append kernel), gathers each sequence's visible K/V into a contiguous workspace region with one gather kernel, and runs Composable Kernel `fmha_fwd` in group mode — the same CK instance family the Phase 1 contiguous attention uses (`_impl` `ck_tile_fmha_fwd_gathered`); when the workspace cannot hold the gather, it falls back to the Turbine kernel.
+- [S-8] GEMM tuning and projection fusion: (a) the HIP shim tunes hipBLASLt per GEMM shape at first use — up to 8 heuristic candidates from `hipblasLtMatmulAlgoGetHeuristic`, each timed over 3 runs with HIP events inside the shim after one warm-up, the fastest cached per (m, n, k, dtypes, transposes) for the context's lifetime and logged once per shape on stderr (`gemm_tuned`); controlled by _execution.gemm_autotune_, passed to the context through the v2.1 option `TURBINE_OPTION_GEMM_AUTOTUNE` (off, or a library without options → first heuristic answer, as in Phase 2); (b) at weight load the executors concatenate Q/K/V into one `[q+2·kv, hidden]` weight and gate/up into one `[2·inter, hidden]` weight (OLMoE: per expert, stacked `[experts, 2·inter, hidden]`), so each layer runs one QKV GEMM and one gate-up GEMM, and `silu_mul` reads the two halves of the gate-up output through its row strides. A SiLU-and-multiply GEMM epilogue is not used: hipBLASLt's epilogues (bias, ReLU, GELU, Swish) act on one operand, while SwiGLU needs two column halves.
+- [S-9] Residual-add + RMSNorm fusion: a new registry op `add_rmsnorm` (ABI v2.1; HIP `_impl` `turbine_hip`) updates the residual stream in place (`residual += x`, rounded to BF16) and writes `rmsnorm(residual) · weight`, replacing the separate `add` and `rmsnorm` launches between attention and MLP and between layers in both executors; numerically it equals `add` followed by `rmsnorm` on the rounded sum.
+- [S-10] Decode graphs: for iterations that contain only decodes, the executor captures the forward pass (embedding through LM head and, when used, `logits_reduce`) into a HIP graph per decode batch size through the v2.1 graph functions and replays it on later iterations with the same batch size, after uploading that step's metadata into the same device buffers. Capture happens on the second iteration seen with a batch size (the first runs eagerly, so GEMM tuning never runs under capture); graph mode passes _model.max_seq_len_ as the paged decode `max_kv_len` so the launch shape is step-invariant, and every per-step value (positions, `kv_lens`, block tables, token ids) is read from device memory. The graph cache holds at most min(_scheduler.max_running_requests_, 64) graphs, least recently used evicted. Controlled by _execution.decode_graphs_; a capture failure logs `event="decode_graphs_unavailable"` once and the executor stays eager.
+- [S-11] MoE expert path without host synchronisation: when the routed rows of an iteration (tokens × top-k) are at most 512 — every decode-only OLMoE iteration with up to 64 sequences — `moe_experts` runs as Turbine HIP kernels (`_impl` `turbine_hip_moe_small_m`) that read `sorted_rows` and `expert_offsets` on the device (fused gate-up per selected expert, SiLU·up, down projection, weighted scatter-add in fixed order), so a decode step makes no device-to-host copy until the logits; above 512 rows the Phase 2 per-expert hipBLASLt path with its host copy of the offsets stays (`hipblaslt_per_expert`). The executor decides from the host-known row count, never from device data.
+- [S-12] Scheduler batch shaping: a lab sweep of _scheduler.max_batch_tokens_ ∈ {2048, 4096, 8192} × _scheduler.prefill_chunk_tokens_ ∈ {512, 1024, 2048} on the baseline workload for both models; the best pair by output throughput (ties: lower ITL p95) is written into new lab configs `scripts/lab/phase2c-novanas-llama.yaml` and `scripts/lab/phase2c-novanas-olmoe.yaml`; the code defaults change only if the same pair wins for both models, and every Phase 2 scheduler invariant test still passes with the tuned values.
+- [S-13] Measurement tooling in the lab: a script `scripts/lab-perf.sh novanas <llama|olmoe>` that serves Turbine with the model's Phase 2c lab config, runs a warm-up and then `--runs` (default 3) baseline-workload benchmarks, stops it, does the same for vLLM-ROCm with the pinned Phase 2 image, and prints both reports, the medians, the ratio and a verdict line; `scripts/lab-serve.sh` gains a repeatable `--set <dotted.key>=<value>` passthrough to `turbine-server` so sweeps need no config edits.
+- [S-14] Configuration switches: _execution.gemm_autotune_, _execution.decode_graphs_, _execution.device_sampling_, _execution.fused_ops_ (projection fusion and `add_rmsnorm`) and _execution.sampler_threads_, each defaulting to the optimised behaviour and each able to restore the Phase 2 path, validated at startup.
+- [S-15] Acceptance on novanas: same-day runs on one R9700 in which Turbine's median output token throughput on the baseline workload is at least 75% of vLLM-ROCm's median and at least the recorded targets (Llama-3.2-3B ≥ 553, OLMoE-1B-7B ≥ 401 tok/s); `turbine-golden compare --concurrency 16` passes for both models; the GPU test suites (`hip_ops`, `tiny_model hip_matches_cpu`, `golden logits_match_reference` and this phase's new ignored tests) pass through `scripts/lab-test.sh novanas`; ITL and TTFT percentiles are recorded alongside.
+
+## Out of scope
+
+- Beating vLLM, or throughput targets for workloads other than the Phase 2 baseline workload; latency (ITL/TTFT) targets — they are recorded, not gated.
+- Asynchronous (overlapped) scheduling that plans iteration i+1 before iteration i's tokens are sampled; speculative decoding (Phase 8b).
+- Quantized weights or KV (FP8 and others: Phase 8a); prefix caching and KV tiers (Phase 4); multi-GPU (Phase 5).
+- NVIDIA/GB10 performance work: the CUDA shim (Phase 2b) implements ABI v2; it may implement v2.1 symbols later, but this phase does not require it and Phase 2b's acceptance is unchanged.
+- Pinned host memory and asynchronous copies (ABI v3, Phase 4): the one remaining logits copy stays a synchronous copy into pageable memory.
+- Custom dense GEMM kernels replacing hipBLASLt; a persistent on-disk GEMM tuning cache; `fmha_fwd_splitkv` from CK (the Turbine split-KV kernel serves 16-token pages; CK split-KV needs 128-token pages on this tag).
+- Changing the default _kv.block_tokens_ (16): the CUDA paged kernels are instantiated for 16 only (contract §3.2), and vLLM-ROCm's default block size is also 16, so the comparison stays like for like.
+- Pressure-driven batch shaping, adaptive chunk sizing and admission from telemetry (Phase 3).
+
+## Constraints
+
+- TS §21 is binding: every optimised path in this phase has a correctness/reference test (CPU reference or the existing path) that runs before the path is enabled by default; a path is specialised only after the S-1/S-2 measurements show it matters; no Python in the serving path.
+- Correctness bar unchanged: the golden tolerance of `tests/golden/<slug>/tolerance.json` (|Δ logprob| ≤ 0.15 for reference candidates with logprob > −2, ≤ 0.55 below) for both models under `--concurrency 16`; the Phase 1/2 HIP-vs-CPU op tolerances of `hip_ops`; the tiny-model HIP-vs-CPU bound of `hip_matches_cpu`. No tolerance file or bound is loosened in this phase.
+- Determinism: within one process, identical inputs (same batch composition and seeds) give bitwise-identical outputs, with or without decode graphs. GEMM tuning picks algorithms by timing, so the algorithm choice — and outputs at BF16 noise level — may differ between server restarts; _execution.gemm_autotune_ false restores restart-stable choices. Seeded sampling with device reduction is reproducible run to run; it may differ from the host path only where the drawn uniform falls within float rounding of a CDF boundary (the device sums in a fixed parallel order).
+- ABI rules (contract §9.2) hold for every v2.1 addition: no vendor identifiers in the header, all work on the context's compute stream, `turbine_stream_sync` the only blocking call besides the graph functions' capture boundaries, and no caller pointer retained beyond the call — except that a captured graph records the device pointers it was captured with; the executor owns those buffers for the graph's lifetime and destroys the graph before freeing them.
+- Unsafe Rust and FFI stay in `crates/turbine-kernels/src` (contract §1.3); `turbine-scheduler` and `turbine-kv` gain no GPU or model dependency; no vendor GPU crate enters the dependency tree; no new external Rust dependency.
+- Bounded resources (TS §21 rule 8): the graph cache (≤ 64 graphs), the GEMM tuning cache (one entry per distinct shape seen; ≤ 4,096 entries, then the heuristic answer without caching), the sampler thread count (≤ 64) and the prefill gather workspace (inside the startup workspace budget) are all bounded; the startup budget of Phase 2 includes the gather workspace and the decode-graph device buffers.
+- Lab: novanas (192.168.10.203), one R9700 (`gfx1201`, 32 GB) per k3s Job, ROCm 7.14.1, weights under `/home/piwi/turbine-models/<slug>`; lab Jobs of this phase run under the standing novanas approval (decisions 2026-09-25 and 2026-09-26: while its R9700s are free; stop and ask the user if another workload holds `amd.com/gpu`; never evict another workload; always stop serve Jobs when done). The vLLM-ROCm comparison uses the Phase 2 Job `scripts/lab/novanas-vllm-job.yaml` with its pinned image digest, unchanged.
+- Measurement discipline: throughput numbers compare the median of 3 runs per engine, measured the same day on the same card with the same `turbine-bench` binary and flags, each engine warmed up first with 16 requests of the same shape.
+
+## Interfaces
+
+### Configuration additions
+
+| Key                         | Type    | Default | Validation                                                                                               |
+| --------------------------- | ------- | ------- | -------------------------------------------------------------------------------------------------------- |
+| _execution.gemm_autotune_   | bool    | `true`  | —; ignored (with one INFO) by the CPU provider                                                           |
+| _execution.decode_graphs_   | bool    | `true`  | —; ignored when the kernel library lacks the v2.1 graph functions (one WARN `decode_graphs_unavailable`) |
+| _execution.device_sampling_ | bool    | `true`  | —; ignored when no provider supports `logits_reduce`                                                     |
+| _execution.fused_ops_       | bool    | `true`  | —; false restores separate Q/K/V and gate/up GEMMs and separate `add` + `rmsnorm`                        |
+| _execution.sampler_threads_ | integer | `4`     | 1 ≤ value ≤ 64; the engine uses min(value, available parallelism − 1, rows yielding a token), at least 1 |
+
+All five are exposed through `--set` and `--check-config` like every other key; `GET /turbine/v1/status` is unchanged.
+
+### Engine iteration stages
+
+| Stage         | Covers                                                                                                     |
+| ------------- | ---------------------------------------------------------------------------------------------------------- |
+| `schedule`    | taking commands, cancellations, disconnect and deadline checks, `Scheduler::plan`                          |
+| `prepare`     | fork copies, packing tokens/positions/metadata into the staging buffer and its host-to-device copy         |
+| `launch`      | host time inside `ModelExecutor::forward` until the last kernel (or graph launch) is enqueued              |
+| `device_wait` | stream synchronisation and the iteration's device-to-host copy (full rows and reductions)                  |
+| `sample`      | host sampling, including finishing device-reduced rows and applying token masks                            |
+| `detokenize`  | incremental detokenisation and stop-string search                                                          |
+| `emit`        | `try_send` of events, pausing and cancelling on full or closed channels                                    |
+| `complete`    | `Scheduler::complete`, request accounting and publishing the diagnostics documents and `turbine_kv_blocks` |
+
+The stages partition the iteration: their sum equals the iteration duration observed by `turbine_iteration_seconds` within 5% (timer overhead). An iteration that fails records the stages reached.
+
+### Metrics (added)
+
+- `turbine_engine_iteration_seconds{stage}` histogram — `stage` ∈ the eight stage names above; buckets from 50 µs to 1 s (exponential, factor 2).
+- `turbine_decode_graph_total{outcome}` counter — `outcome` ∈ `captured`, `replayed`, `evicted`, `capture_failed`.
+- `turbine_logits_rows_total{path}` counter — `path` ∈ `device_reduced`, `full_row`.
+
+The existing `turbine_forward_seconds{phase}` and `turbine_kernel_selected{op,provider,impl}` keep their meaning; the latter now also lists `add_rmsnorm` and `logits_reduce` selections and the new `_impl` names.
+
+### Kernel ABI v2.1 (additive to `kernels/include/turbine_kernels.h`)
+
+- `#define TURBINE_ABI_MINOR 1u`; `uint32_t turbine_abi_minor(void);` — absent in a v2.0 library (read as minor 0).
+- `add_rmsnorm` trio with descriptor `turbine_add_rmsnorm_desc { void *residual; const void *x; const void *weight; void *out; int64_t rows, dim, residual_stride_row, x_stride_row, out_stride_row; float eps; int32_t dtype; }` — `residual[r] = bf16(residual[r] + x[r])`, then `out[r] = rmsnorm(residual[r]) · weight`.
+- `logits_reduce` trio with descriptor `turbine_logits_reduce_desc { const float *logits; int64_t rows, vocab, stride_row; const float *temperature; const float *uniform; const int32_t *mode; int32_t top_n; int32_t *top_ids; float *top_values; float *lse; int32_t *sampled; float *sampled_logit; }` — per row: `lse` of the raw logits; the `top_n` (≤ 64) largest raw logits and ids, descending, ties to the lower id, NaN last; when `mode[r]` = 1, `sampled[r]` = the smallest id whose cumulative sum of exp((logit − max)/T) in id order reaches `uniform[r]` × total, and `sampled_logit[r]` its raw logit; `mode[r]` = 0 leaves `sampled[r]` = −1. All outputs are device buffers.
+- `typedef struct turbine_graph turbine_graph;` `int32_t turbine_graph_begin(turbine_ctx *ctx);` (start capturing the compute stream), `int32_t turbine_graph_end(turbine_ctx *ctx, turbine_graph **out);` (stop and instantiate), `int32_t turbine_graph_launch(turbine_ctx *ctx, turbine_graph *g);` (enqueue on the compute stream), `int32_t turbine_graph_destroy(turbine_ctx *ctx, turbine_graph *g);`. Between begin and end only op calls are allowed; `turbine_memcpy_*`, `turbine_stream_sync`, `turbine_malloc` and `turbine_free` return `TURBINE_E_ARGUMENT` while capturing. A failed capture leaves the context usable.
+- Context options: `#define TURBINE_OPTION_GEMM_AUTOTUNE 1` (read/write, 0 or 1; default 0 so a context behaves as v2.0 until told otherwise) and `#define TURBINE_OPTION_GEMM_TUNED_SHAPES 2` (read-only: number of shapes tuned so far); `int32_t turbine_ctx_set_option(turbine_ctx *ctx, int32_t option, int64_t value);` and `int32_t turbine_ctx_get_option(turbine_ctx *ctx, int32_t option, int64_t *out);` — an unknown option returns `TURBINE_E_ARGUMENT`.
+- New HIP `_impl` names: `turbine_hip_splitkv` (paged decode), `ck_tile_fmha_fwd_gathered` (paged prefill), `turbine_hip_moe_small_m` (MoE experts); `add_rmsnorm` and `logits_reduce` report `turbine_hip`; GEMM keeps `hipblaslt`.
+
+### Rust interfaces (contract additions)
+
+- `turbine_kernels`: `OpKind::AddRmsnorm`, `OpKind::LogitsReduce`; traits `AddRmsnormKernel` and `LogitsReduceKernel` (`supports`, `implementation`, `execute`) reached through `KernelProvider::add_rmsnorm()` and `KernelProvider::logits_reduce()` (default `None`); `ShimContext::graph_begin`, `graph_end -> GraphHandle`, `graph_launch`, and `Drop for GraphHandle` destroying the graph; `ShimLibrary::abi_minor() -> u32`; `ShimContext::set_option(option: i32, value: i64)` and `ShimContext::get_option(option: i32) -> i64` (both `KernelError::Unsupported` without the symbols).
+- `turbine_model`: `ForwardTimings { launch: Duration, device_wait: Duration }` returned by `ModelExecutor::last_timings(&self)` (default zeros); `OpProfile` with `set_profile(bool)` / `take_profile()` on both executors; `SeqSlice` gains `wants_logits: bool` and `reduce: Option<RowReduce>`; `RowReduce { top_n: u8, temperature: f32, uniform: Option<f32> }`; `Logits` gains `reduced: Vec<ReducedRow>` (`ReducedRow { lse: f32, top: Vec<(u32, f32)>, sampled: Option<(u32, f32)> }`) and maps each yielding sequence to either a full row or a reduced row; `Sampler::device_request(&mut self) -> Option<RowReduce>` and `Sampler::finish_reduced(&mut self, r: &ReducedRow) -> SampledToken`; the Phase 2 sampler kept verbatim as `turbine_model::testing::reference_sampler::ReferenceSampler` for equivalence tests.
+
+### Lab scripts and configs
+
+- `scripts/lab-perf.sh [--dry-run] novanas <llama|olmoe> [--runs <n>=3] [--skip-vllm] [--config <yaml>] [--set <dotted.key>=<value>]…` — for each engine: serve (Turbine: `scripts/lab-serve.sh novanas <config>`; vLLM: `scripts/lab-serve.sh novanas --vllm <slug>`), warm up with `turbine-bench --concurrency 16 --requests 16 --prompt-words 512 --max-tokens 256 --ignore-eos`, then `--runs` times the baseline command, then stop. Writes every report and _summary.json_ under `target/lab-perf/<run-id>/` and prints `lab-perf: <model> turbine=<tok/s> vllm=<tok/s> ratio=<r> target=<553|401> verdict=<PASS|FAIL>`. Exit 0 PASS, 1 FAIL or a serve/bench failure, 2 usage. With `--skip-vllm` it compares against the recorded vLLM number (738 / 535) and says so in the line.
+- `scripts/lab-serve.sh novanas <config.yaml> [--set <dotted.key>=<value>]…` — each `--set` is appended to the `turbine-server` command line in the serve Job.
+- `scripts/lab/phase2c-novanas-llama.yaml`, `scripts/lab/phase2c-novanas-olmoe.yaml` — the Phase 2 lab configs plus the tuned scheduler pair (S-12) and the five execution keys spelled out.
+- Performance planning budgets (targets that guide the tasks; not acceptance gates): Llama decode forward at batch 16 ≤ 16 ms, OLMoE ≤ 20 ms; host stages other than `launch` and `device_wait` ≤ 2 ms p50 at batch 16 decode.
+
+## Data
+
+- Nothing new is persisted by the server. Tuned GEMM algorithms, captured graphs and sampler scratch live in process memory for the context's or engine's lifetime.
+- `GET /turbine/v1/scheduler` `last_iteration` gains `stages_ms`:
+
+```json
+{
+  "last_iteration": {
+    "prefill_tokens": 0,
+    "decode_tokens": 16,
+    "requests": 16,
+    "duration_ms": 18.4,
+    "stages_ms": {
+      "schedule": 0.05,
+      "prepare": 0.11,
+      "launch": 0.9,
+      "device_wait": 16.2,
+      "sample": 0.6,
+      "detokenize": 0.2,
+      "emit": 0.1,
+      "complete": 0.2
+    }
+  }
+}
+```
+
+- `perf forward_profile` output (one line per model, prefixed `forward_profile: `):
+
+```json
+{
+  "model": "llama-3.2-3b-instruct",
+  "cases": [
+    {
+      "case": "decode_b16_ctx768",
+      "forward_ms": 15.8,
+      "profiled_ms": 17.1,
+      "ops": [
+        {
+          "op": "gemm",
+          "impl": "hipblaslt",
+          "calls": 113,
+          "total_ms": 11.2
+        },
+        {
+          "op": "attention_decode_paged",
+          "impl": "turbine_hip_splitkv",
+          "calls": 28,
+          "total_ms": 2.1
+        }
+      ]
+    }
+  ]
+}
+```
+
+- `target/lab-perf/<run-id>/summary.json` (workstation side, not committed): `{"model","date","card","rocm","vllm_image","workload","turbine":{"runs":[<bench report>…],"median_output_token_throughput","median_itl_p50_ms","median_ttft_p50_ms"},"vllm":{…same…},"ratio","target","verdict"}`. The acceptance summaries are pasted into task evidence.
+
+## Edge cases
+
+- Decode batch size changing every iteration (requests finishing one by one): each new size runs eagerly once, is captured on its second occurrence, and the cache evicts least recently used sizes beyond its bound; a batch of 1 and a batch of `max_running_requests`.
+- A decode step whose appended token opens a new block (block table grows) or whose context reaches _model.max_seq_len_ during graph replay: the graph reads the new block table and `kv_lens` from device memory; nothing is re-captured.
+- A mixed iteration (prefill chunk plus decodes) never uses a graph; an OLMoE mixed iteration with more than 512 routed rows uses the hipBLASLt expert path and its host copy.
+- Device reduction with vocabularies that are not multiples of the workgroup size (50,304 and 128,256); a row containing NaN or all −∞ (a row whose sampler is eligible never has a mask, so all −∞ cannot occur on the device path; NaN sorts last and never becomes a candidate); `temperature` near 0 (the host treats 0 as greedy; a positive tiny temperature subtracts the row maximum first so nothing overflows); `top_logprobs` 20 with `top_k` 64.
+- A request switching from ineligible to eligible mid-generation (its `min_tokens` reached): the next step uses the device path; its PRNG stream is unchanged because both paths draw one uniform per sampled token at the same point.
+- Preemption and re-prefill of a request whose earlier tokens were sampled on the device: the sampler state on the host is the only state, as in Phase 2.
+- GEMM tuning at the first 2,048-token prefill: a one-off latency spike bounded by 8 candidates × 4 runs per new shape; later iterations use the cached choice. A heuristic returning fewer than 8 candidates or none (the Phase 2 error path).
+- Prefill gather when a sequence's visible KV exceeds the gather workspace: that call falls back to the Turbine prefill kernel and logs once.
+- `sampler_threads` greater than the rows of an iteration, or 1 (serial); a panic inside a sampling thread is propagated to the engine thread and handled as a Phase 2 engine panic.
+- A v2.0 kernel library (no v2.1 symbols) with all switches on: every optimisation that needs v2.1 silently falls back with one log line each; the server still serves.
+
+## Failure modes
+
+- **Kernel library without v2.1 symbols:** `turbine_abi_minor` absent → minor 0; the registry never selects `add_rmsnorm` or `logits_reduce` from it, decode graphs are unavailable (`decode_graphs_unavailable` WARN); throughput falls back to the Phase 2 paths, correctness is unaffected.
+- **Graph capture or instantiation fails (e.g. a library call that is not capturable on `gfx1201`):** the capture is abandoned, `turbine_decode_graph_total{outcome="capture_failed"}` increments, graphs are disabled for the process with one WARN naming the shim error, and the iteration re-runs eagerly; no request fails.
+- **Graph replay returns an error:** handled as a Phase 2 failed iteration (every request in it fails with `internal_error`; three in a row stop the engine, CONFLICT C-25).
+- **GEMM tuning finds no algorithm or a candidate fails to run:** that candidate is skipped; with none left the Phase 2 heuristic error path applies (`TURBINE_E_UNSUPPORTED` naming m, n, k).
+- **Device reduction op fails:** a failed iteration as above; setting _execution.device_sampling_ false restores the full-row path.
+- **Sampling thread panics:** caught and handled like an engine-thread panic in Phase 2 (`/ready` 503, exit 1).
+- **vLLM-ROCm does not start on the day of the acceptance run:** `lab-perf.sh` exits 1 naming the vLLM failure; the acceptance run is repeated after the cause is fixed, or with `--skip-vllm` against the recorded 738 / 535 if the user agrees (asked at that time).
+- **Throughput target missed:** the acceptance criterion fails; the stage and op profiles of that run are attached to the task evidence to direct the next change.
+
+## Acceptance criteria
+
+- [ ] [S-1] `cargo test -p turbine-server --test tiny_server iteration_stage_breakdown` exits 0; after serving 8 concurrent tiny-model requests it asserts `/metrics` has `turbine_engine_iteration_seconds_count{stage=…}` > 0 for all eight stages, that `/turbine/v1/scheduler` `last_iteration.stages_ms` has exactly the eight keys with non-negative values summing to within 5% (or 0.5 ms) of `duration_ms`; fails if a stage is missing, double-counted or the sum disagrees.
+- [ ] [S-2] `cargo test -p turbine-model --test tiny_model op_profile_accounts_forward` exits 0; on the tiny Llama and tiny OLMoE checkpoints with the CPU provider and profile mode on, it asserts one `OpProfile` entry per op kind the executor uses, call counts equal to the per-layer call pattern × layers (e.g. one `attention_decode_paged` per layer), a total no greater than the forward's wall time, identical logits with profile mode on and off, and an empty profile when profile mode is off; fails if an op is unaccounted or profiling changes numerics.
+- [ ] [S-2] [S-15] `cargo test -p turbine-model --test perf forward_profile -- --ignored` passes inside `scripts/lab-test.sh novanas -- -p turbine-model --test perf -- forward_profile --nocapture` (which exits 0) for both real models; it prints one `forward_profile: ` JSON line per model with the four cases and asserts each case lists every op kind and a profiled total ≥ 0.8 × the unprofiled forward time; fails if the profile is missing or accounts for less than 80% of the forward.
+- [ ] [S-3] `cargo test -p turbine-model sampler::tests::fast_paths_match_reference` exits 0; a `proptest` of 2,000 cases (vocabulary 1–5,000 with ties, NaN and −∞, temperature 0–2, `top_k` −1…70, `top_p` 0.05–1, `top_logprobs` 0–20, penalties, `logit_bias`, token masks, seeds) asserts the Phase 2c `Sampler` returns the same token ids as `ReferenceSampler` and logprobs within 1e-6 over 8 consecutive steps; fails if any fast path changes a token or a logprob.
+- [ ] [S-3] `cargo test -p turbine-model --test sampler_alloc steady_state_sampling_does_not_allocate` exits 0; with a counting global allocator it asserts that after one warm-up step a greedy step without logprobs and a `temperature` 1.0 `top_p` 0.9 step over a 128,256-entry row allocate 0 times, and a step with `top_logprobs` 5 allocates exactly once (the returned vector); fails if steady-state sampling allocates.
+- [ ] [S-3] `cargo test -p turbine-model --test tiny_model one_metadata_upload_per_forward` exits 0; with a `DeviceMemory` wrapper that counts copies it asserts a mixed forward (2 prefill chunks, 5 decodes) on both tiny checkpoints makes exactly one host-to-device copy for batch metadata and one device-to-host copy, and that a non-final prefill chunk produces no logits row; fails if metadata is uploaded piecemeal or unneeded rows are computed.
+- [ ] [S-3] [S-14] `cargo test -p turbine-server --test tiny_server parallel_sampling_matches_serial` exits 0; 16 concurrent seeded requests (8 greedy with `top_logprobs` 3, 8 at `temperature` 0.8 with `top_p` 0.9) produce identical tokens and logprobs with _execution.sampler_threads_ 4 and 1; fails if parallel sampling changes any output.
+- [ ] [S-4] `cargo test -p turbine-kernels cpu::tests::logits_reduce_matches_sampler` exits 0; on seeded rows (vocabulary 50,304 and 128,256, ties, NaN) the CPU `logits_reduce` returns the reference sampler's top-n (order and ties), log-sum-exp within 1e-6 and, in categorical mode, the same token as the reference sampler's inverse-CDF draw with the same uniform; fails if the reference op disagrees with the host sampler.
+- [ ] [S-4] [S-14] `cargo test -p turbine-server --test tiny_server device_sampling_matches_host` exits 0; with the CPU provider it runs 12 seeded requests (greedy with and without `top_logprobs`, `temperature` 1.0 with `top_k` −1 and 40, plus ineligible ones with `logit_bias`, a JSON schema and `min_tokens`) with _execution.device_sampling_ true and false and asserts identical tokens and logprobs, and that `turbine_logits_rows_total{path="device_reduced"}` counts exactly the eligible rows; fails if eligibility is wrong or the device path changes output.
+- [ ] [S-5] `cargo test -p turbine-kernels --test abi_header_neutral` and `cargo test -p turbine-kernels shim::tests::v21_symbols_optional` exit 0; the header declares `TURBINE_ABI_VERSION 2u`, `TURBINE_ABI_MINOR 1u` and the v2.1 names with no vendor identifier; a stub library without v2.1 symbols loads with `abi_minor() == 0` and no `add_rmsnorm`/`logits_reduce`/graph support, and a stub exporting them reports minor 1 and supports all three; fails if a v2.0 library is refused or a v2.1 symbol is required.
+- [ ] [S-6] `cargo test -p turbine-kernels --test hip_ops paged_decode_splitkv_matches_cpu -- --ignored` passes inside `scripts/lab-test.sh novanas` (which exits 0); it compares `attention_decode_paged` (`_impl` `turbine_hip_splitkv`) with the CPU reference for Llama (24/8 heads) and OLMoE (16/16) shapes, `kv_len` 1, 15, 16, 17, 768, 4,095 and 8,192, batch 1, 16 and 64, shuffled block tables, within the Phase 2 paged tolerance, and asserts two runs are bitwise identical; fails if any case diverges or the kernel is nondeterministic.
+- [ ] [S-7] `cargo test -p turbine-kernels --test hip_ops paged_prefill_gathered_matches_cpu -- --ignored` passes inside `scripts/lab-test.sh novanas` (which exits 0); ragged prefill batches (chunks of 1, 17, 512 and 2,048 tokens after 0, 16 and 1,000 cached tokens, both head shapes) through `ck_tile_fmha_fwd_gathered` match the CPU reference within the Phase 2 paged tolerance and the appended KV equals the CPU pages exactly; fails if the gather, the append or the CK call is wrong.
+- [ ] [S-8] `cargo test -p turbine-kernels --test hip_ops gemm_autotune_matches_cpu -- --ignored` passes inside `scripts/lab-test.sh novanas` (which exits 0); with tuning on it checks m ∈ {1, 2, 3, 8, 16, 17, 64, 256, 2,048} for the Llama and OLMoE projection shapes (BF16 and F32 outputs) against the CPU reference within the Phase 1 GEMM tolerance, asserts the context's `TURBINE_OPTION_GEMM_TUNED_SHAPES` count grows by exactly one per new shape and not on a repeated call (the cached choice is reused); fails if a tuned algorithm is wrong or tuning repeats.
+- [ ] [S-8] [S-9] [S-14] `cargo test -p turbine-model --test tiny_model fused_ops_match_unfused` exits 0; on both tiny checkpoints with the CPU provider, prefill plus 10 decode steps with _execution.fused_ops_ true give logits bitwise equal to false (fused QKV/gate-up GEMMs and `add_rmsnorm` versus separate ops); fails if fusion changes numerics on the reference provider.
+- [ ] [S-9] `cargo test -p turbine-kernels cpu::tests::add_rmsnorm_equals_add_then_rmsnorm` exits 0 (bitwise on the CPU provider for rows 1, 7 and 64, dims 64 and 3,072), and `cargo test -p turbine-kernels --test hip_ops fused_ops_match_cpu -- --ignored` passes inside `scripts/lab-test.sh novanas` (HIP `add_rmsnorm` and `logits_reduce` against the CPU reference: residual exact, output within the Phase 1 RMSNorm tolerance, top-n ids identical, lse within 1e-5 relative, categorical ids identical except where the uniform is within 1e-6 of a CDF boundary); fails if either fused op diverges.
+- [ ] [S-10] `cargo test -p turbine-model executor::graphs::tests::cache_bounded_and_fallback` exits 0; with a mock graph backend it asserts capture on the second occurrence of a batch size, replay afterwards, LRU eviction at the bound, no capture for mixed iterations, and permanent eager fallback plus `capture_failed` after a failed capture; fails if the cache grows past its bound or a failed capture breaks the iteration.
+- [ ] [S-10] `cargo test -p turbine-model --test tiny_model hip_decode_graph_matches_eager -- --ignored` passes inside `scripts/lab-test.sh novanas` (which exits 0); on the tiny head_dim-128 checkpoints and the HIP backend, 40 decode steps of batches 1, 5 and 16 (including block-boundary crossings) give logits bitwise equal with _execution.decode_graphs_ true and false, and `turbine_decode_graph_total{outcome="replayed"}` > 0; fails if replay differs from eager or graphs are never used.
+- [ ] [S-11] `cargo test -p turbine-kernels --test hip_ops moe_experts_small_m_matches_cpu -- --ignored` passes inside `scripts/lab-test.sh novanas` (which exits 0); `moe_experts` with 1, 16 and 64 tokens × top-8 over 64 experts (including all rows on one expert and experts with no rows) through `turbine_hip_moe_small_m` matches the CPU reference within the Phase 2 MoE tolerance and is bitwise identical across two runs; fails if the device-offset path diverges.
+- [ ] [S-11] `cargo test -p turbine-model --test tiny_model olmoe_decode_single_device_copy` exits 0; with the copy-counting `DeviceMemory` wrapper and a provider whose small-m path reads offsets on the device, an OLMoE decode-only forward of 8 sequences makes exactly one device-to-host copy, and a mixed forward with more than 512 routed rows makes one per layer plus one; fails if a decode step synchronises per layer.
+- [ ] [S-12] `cargo test -p turbine-scheduler sim::tests::phase2c_lab_configs_hold_invariants` exits 0; it loads the scheduler section of `scripts/lab/phase2c-novanas-llama.yaml` and `scripts/lab/phase2c-novanas-olmoe.yaml` and runs the Phase 2 invariants (decode never starved, budgets respected, bounded under overload) with 1,000 seeded arrivals each; fails if a tuned pair breaks an invariant.
+- [ ] [S-12] [S-13] Manual lab sweep (standing novanas approval): for each model and each of the nine pairs, `scripts/lab-perf.sh novanas <llama|olmoe> --skip-vllm --runs 1 --set scheduler.max_batch_tokens=<b> --set scheduler.prefill_chunk_tokens=<c>` exits 0 or 1 with its `lab-perf:` line; the eighteen lines and the chosen pairs are pasted into task evidence and the pairs are the ones written into the Phase 2c lab configs; fails if a pair is skipped or the configs disagree with the evidence.
+- [ ] [S-13] `bash -n scripts/lab-perf.sh && shellcheck scripts/lab-perf.sh scripts/lab-serve.sh` exits 0, and `scripts/lab-perf.sh --dry-run novanas llama --set scheduler.max_batch_tokens=4096` exits 0 printing the serve, warm-up, three bench and stop commands for Turbine (with the `--set` on the `turbine-server` command line) and then for vLLM with the pinned image; fails if a step is missing or the passthrough is lost.
+- [ ] [S-14] `cargo test -p turbine-core config::tests::phase2c_execution_keys` exits 0; it asserts the five keys' defaults, that `execution.sampler_threads: 0` and `65` are rejected naming the key, that `--set execution.decode_graphs=false` applies, and that `examples/turbine.yaml` still loads; fails if a key is missing or unvalidated.
+- [ ] [S-15] `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` exit 0 on macOS arm64 with no ROCm, `! cargo tree --workspace | grep -Ei 'hip|rocm|cuda'` exits 0, and every Phase 2 acceptance test still passes; fails if an optimisation breaks a Phase 1/2 test or adds a vendor crate.
+- [ ] [S-15] `scripts/lab-test.sh novanas` exits 0 (whole workspace with `--include-ignored` on one R9700), including `hip_ops` (all tests), `tiny_model hip_matches_cpu`, `tiny_model hip_decode_graph_matches_eager`, `golden logits_match_reference` for both models and `hip_ops paged_and_moe_ops`, with every optimisation switch at its default; fails if any GPU correctness test regresses.
+- [ ] [S-15] Manual golden run (standing novanas approval): for each of `scripts/lab/phase2c-novanas-llama.yaml` and `scripts/lab/phase2c-novanas-olmoe.yaml`, `scripts/lab-serve.sh novanas <config>` reaches `/ready` 200 and `cargo run --release -p turbine-bench --bin turbine-golden -- compare --url http://192.168.10.203:18000 --reference tests/golden/<slug>/reference.jsonl --concurrency 16` exits 0 (16/16 prompts within tolerance); both outputs pasted into task evidence; `scripts/lab-serve.sh novanas --stop` afterwards; fails if any prompt violates the tolerance.
+- [ ] [S-15] [S-13] Manual acceptance run (standing novanas approval, one R9700 free): `scripts/lab-perf.sh novanas llama` and `scripts/lab-perf.sh novanas olmoe` each exit 0 with `verdict=PASS`, i.e. Turbine's median output token throughput over 3 runs is ≥ 0.75 × vLLM-ROCm's same-day median and ≥ 553 (Llama-3.2-3B) / ≥ 401 (OLMoE-1B-7B) tok/s, with `requests_failed: 0` in every Turbine report; both _summary.json_ files (including ITL and TTFT p50/p95/p99 for both engines) and the `perf forward_profile` output of the same build are pasted into task evidence; fails if either model misses either threshold or any Turbine request fails.
+
+## Open questions
+
+<!-- None: the target and the lab rules are decided in .procoder/ask/decisions.md ("Performance phase between Phase 2 and Phase 3", 2026-09-26); design choices are stated in the sections above. -->
