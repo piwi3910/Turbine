@@ -46,10 +46,14 @@ spec:
               # Keep downloaded packages in the shared apt cache; refresh the lists at most every 6 h.
               rm -f /etc/apt/apt.conf.d/docker-clean
               mkdir -p /var/cache/apt/archives/partial /var/lib/apt/lists/partial
-              if [[ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' -mmin -360 -print -quit)" ]]; then
-                apt-get update -qq >/dev/null
-              fi
-              apt-get install -y -qq cmake ninja-build python3 rsync >/dev/null
+              # Concurrent Jobs share the apt cache: one apt run at a time.
+              (
+                flock -w 900 9
+                if [[ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' -mmin -360 -print -quit)" ]]; then
+                  apt-get update -qq >/dev/null
+                fi
+                apt-get install -y -qq cmake ninja-build python3 rsync >/dev/null
+              ) 9>/var/cache/apt/archives/turbine-lab.flock
               cmake --version | head -n 1
 
               step "take the serve workspace slot"
