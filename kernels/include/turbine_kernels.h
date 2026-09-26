@@ -1,4 +1,4 @@
-/* Turbine vendor-neutral kernel C ABI, version 2 (contract section 9).
+/* Turbine vendor-neutral kernel C ABI, version 2.1 (contract section 9).
  *
  * Every backend shim library implements this header and is loaded by
  * turbine-kernels at run time. No vendor type, identifier or name appears here,
@@ -14,9 +14,14 @@
  * pointer fields (they may be NULL) and never need a context.
  *
  * Streams. All work is enqueued on the context's compute stream;
- * turbine_stream_sync is the only blocking call. Host buffers passed to
+ * turbine_stream_sync is the only blocking call (besides the capture
+ * boundaries of the v2.1 graph functions). Host buffers passed to
  * turbine_memcpy_h2d / turbine_memcpy_d2h must stay valid until the next
  * turbine_stream_sync.
+ *
+ * Versions. TURBINE_ABI_VERSION is the major version and must match exactly.
+ * A minor revision only adds optional symbols: a library without them (minor
+ * 0, no turbine_abi_minor) still loads, and the caller falls back.
  *
  * Layout. Row-major everywhere; strides are in elements; "leading dimension"
  * is the row stride in elements.
@@ -25,8 +30,10 @@
  *
  * Ownership. Every device pointer is allocated by the library (turbine_malloc)
  * and freed exactly once by its owner (turbine_free). The library never retains
- * a caller pointer beyond the call. The context owns its streams, library
- * handles and workspace and releases them in turbine_ctx_destroy.
+ * a caller pointer beyond the call, except that a captured graph (v2.1)
+ * records the device pointers of the ops captured into it. The context owns
+ * its streams, library handles and workspace and releases them in
+ * turbine_ctx_destroy.
  *
  * Errors. turbine_last_error(ctx, buf, len) copies the NUL-terminated message
  * of the most recent failure on ctx (with ctx == NULL: of the most recent
@@ -349,6 +356,93 @@ int32_t turbine_moe_experts(turbine_ctx *ctx,
                             const turbine_moe_experts_desc *d);
 int32_t turbine_moe_experts_supported(const turbine_moe_experts_desc *d);
 const char *turbine_moe_experts_impl(const turbine_moe_experts_desc *d);
+
+/* ======== v2.1 (additive, optional): minor version, context options, fused
+ * ops, graphs ========
+ * Every symbol below is optional: turbine-kernels resolves them only when
+ * turbine_abi_minor() >= 1, and a library without them runs the ABI v2 paths
+ * (add then rmsnorm, whole logits rows, eager launches). */
+#define TURBINE_ABI_MINOR 1u
+uint32_t turbine_abi_minor(void);
+
+/* Context options (int64 values). Unknown options return
+ * TURBINE_E_UNSUPPORTED. */
+/* 1 = time the GEMM algorithm candidates per shape at first use (default 1),
+ * 0 = take the first heuristic answer */
+#define TURBINE_OPTION_GEMM_AUTOTUNE 1
+/* read only: number of GEMM shapes tuned so far on this context */
+#define TURBINE_OPTION_GEMM_TUNED_SHAPES 2
+int32_t turbine_ctx_set_option(turbine_ctx *ctx, int32_t option, int64_t value);
+/* out is a host int64_t. */
+int32_t turbine_ctx_get_option(turbine_ctx *ctx, int32_t option, int64_t *out);
+
+/* Per row r: residual[r] = round(residual[r] + x[r]) to dtype, in place; then
+ * out[r] = rmsnorm(residual[r]) * weight, equal to add followed by rmsnorm on
+ * the rounded sum. */
+typedef struct turbine_add_rmsnorm_desc {
+  /* [rows, dim], updated in place */
+  void *residual;
+  /* [rows, dim] */
+  const void *x;
+  /* [dim] */
+  const void *weight;
+  /* [rows, dim] */
+  void *out;
+  int64_t rows, dim, residual_stride_row, x_stride_row, out_stride_row;
+  float eps;
+  int32_t dtype;
+} turbine_add_rmsnorm_desc;
+
+/* Per logits row r (F32 [rows, vocab], row stride stride_row): lse[r] = the
+ * log-sum-exp of the raw logits (NaN ignored); top_ids[r] / top_values[r] =
+ * the top_n (<= 64) largest raw logits and their ids, descending, ties to the
+ * lower id, NaN last; when mode[r] = 1, sampled[r] = the smallest id whose
+ * cumulative sum of exp(logit / temperature[r] - max) in id order exceeds
+ * uniform[r] * total (argmax when temperature[r] <= 0 or no logit is finite)
+ * and sampled_logit[r] its raw logit; mode[r] = 0 leaves sampled[r] = -1 and
+ * sampled_logit[r] = NaN. All buffers are device buffers; the per-row arrays
+ * are [rows], top_ids and top_values [rows, top_n]. */
+typedef struct turbine_logits_reduce_desc {
+  const float *logits;
+  int64_t rows, vocab, stride_row;
+  const float *temperature;
+  /* in [0, 1) */
+  const float *uniform;
+  /* 0 = reduce only, 1 = also draw a categorical sample */
+  const int32_t *mode;
+  int32_t top_n;
+  int32_t *top_ids;
+  float *top_values;
+  float *lse;
+  int32_t *sampled;
+  float *sampled_logit;
+} turbine_logits_reduce_desc;
+
+/* v2.1 trios: add_rmsnorm, logits_reduce. */
+int32_t turbine_add_rmsnorm(turbine_ctx *ctx,
+                            const turbine_add_rmsnorm_desc *d);
+int32_t turbine_add_rmsnorm_supported(const turbine_add_rmsnorm_desc *d);
+const char *turbine_add_rmsnorm_impl(const turbine_add_rmsnorm_desc *d);
+
+int32_t turbine_logits_reduce(turbine_ctx *ctx,
+                              const turbine_logits_reduce_desc *d);
+int32_t turbine_logits_reduce_supported(const turbine_logits_reduce_desc *d);
+const char *turbine_logits_reduce_impl(const turbine_logits_reduce_desc *d);
+
+/* Graphs: turbine_graph_begin starts capturing the compute stream;
+ * turbine_graph_end stops and instantiates the captured work into *out;
+ * turbine_graph_launch enqueues it on the compute stream;
+ * turbine_graph_destroy releases it. Between begin and end only op calls are
+ * allowed: turbine_memcpy_*, turbine_stream_sync, turbine_malloc and
+ * turbine_free return TURBINE_E_ARGUMENT while capturing. A failed capture
+ * leaves the context usable. A graph records the device pointers its ops were
+ * captured with: the caller keeps those buffers alive and destroys the graph
+ * before freeing them. */
+typedef struct turbine_graph turbine_graph;
+int32_t turbine_graph_begin(turbine_ctx *ctx);
+int32_t turbine_graph_end(turbine_ctx *ctx, turbine_graph **out);
+int32_t turbine_graph_launch(turbine_ctx *ctx, turbine_graph *g);
+int32_t turbine_graph_destroy(turbine_ctx *ctx, turbine_graph *g);
 
 #ifdef __cplusplus
 }

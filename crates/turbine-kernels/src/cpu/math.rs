@@ -2,6 +2,7 @@
 //! sequentially in index order, so results are deterministic and independent of threading.
 //! `round` rounds a value to the activation dtype at the points where the Hugging Face BF16
 //! forward materialises a tensor in that dtype.
+use std::cmp::Ordering;
 
 /// GEMM shape: `a` is `[m, k]`; `b` is `[n, k]` when `trans_b`, else `[k, n]`; `c` is `[m, n]`.
 pub(crate) struct GemmShape {
@@ -166,6 +167,117 @@ pub(crate) fn rope(
 /// `silu(g) = g · σ(g)`, in f32.
 pub(crate) fn silu(g: f32) -> f32 {
     g / (1.0 + (-g).exp())
+}
+
+// Logits reduction (ABI v2.1 `logits_reduce`). These mirror the host sampler of
+// `turbine-model` operation for operation — including its f64 sums, taken sequentially in id
+// order — so a row reduced here finishes on the host exactly as the whole row would.
+
+/// Descending by value, ties to the lower id; NaN sorts last.
+pub(crate) fn by_value_desc(a: &(u32, f32), b: &(u32, f32)) -> Ordering {
+    match (a.1.is_nan(), b.1.is_nan()) {
+        (true, true) => a.0.cmp(&b.0),
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)),
+    }
+}
+
+/// The `n` largest `(id, value)` pairs of `values`, in `by_value_desc` order.
+pub(crate) fn top_n(values: &[f32], n: usize) -> Vec<(u32, f32)> {
+    let mut pairs: Vec<(u32, f32)> = values
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as u32, v))
+        .collect();
+    let n = n.min(pairs.len());
+    if n == 0 {
+        return Vec::new();
+    }
+    if n < pairs.len() {
+        pairs.select_nth_unstable_by(n - 1, by_value_desc);
+        pairs.truncate(n);
+    }
+    pairs.sort_unstable_by(by_value_desc);
+    pairs
+}
+
+/// Index of the largest value; ties to the lower id, NaN never wins (0 when nothing exceeds −∞).
+pub(crate) fn argmax(values: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut best_value = f32::NEG_INFINITY;
+    for (i, &v) in values.iter().enumerate() {
+        if v > best_value {
+            best = i;
+            best_value = v;
+        }
+    }
+    best as u32
+}
+
+/// `log(Σ exp(v))` around the maximum, NaN ignored: the exponentials of `v − max` summed in f64
+/// in id order, `max + ln(sum)` rounded to f32. A row without a finite maximum returns it.
+pub(crate) fn log_sum_exp(values: &[f32]) -> f32 {
+    let max = values
+        .iter()
+        .copied()
+        .filter(|v| !v.is_nan())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return max;
+    }
+    let sum: f64 = values
+        .iter()
+        .filter(|v| !v.is_nan())
+        .map(|&v| f64::from(v - max).exp())
+        .sum();
+    max + sum.ln() as f32
+}
+
+/// One categorical draw over the whole row at `temperature` with the uniform `u` in `[0, 1)`:
+/// the weights `exp(v · (1/T) − max)` (NaN weighs 0) are summed in f64 in id order, and the draw
+/// is the first id whose cumulative weight exceeds `u · total` (the last id with a non-zero
+/// weight when rounding leaves `u · total` at the total). `temperature` ≤ 0 or a row without a
+/// finite scaled maximum gives the argmax.
+pub(crate) fn categorical(values: &[f32], temperature: f32, u: f32) -> u32 {
+    if temperature <= 0.0 {
+        return argmax(values);
+    }
+    let inv_t = 1.0 / temperature;
+    let max = values
+        .iter()
+        .map(|&v| v * inv_t)
+        .filter(|v| !v.is_nan())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return argmax(values);
+    }
+    let weight = |v: f32| {
+        let scaled = v * inv_t;
+        if scaled.is_nan() {
+            0.0
+        } else {
+            f64::from(scaled - max).exp()
+        }
+    };
+    let mut total = 0f64;
+    let mut last_positive = 0usize;
+    for (i, &v) in values.iter().enumerate() {
+        let w = weight(v);
+        total += w;
+        if w > 0.0 {
+            last_positive = i;
+        }
+    }
+    let target = f64::from(u) * total;
+    let mut cum = 0f64;
+    for (i, &v) in values.iter().enumerate() {
+        cum += weight(v);
+        if target < cum {
+            return i as u32;
+        }
+    }
+    last_positive as u32
 }
 
 #[cfg(test)]

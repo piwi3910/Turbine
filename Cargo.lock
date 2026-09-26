@@ -2281,6 +2281,7 @@ dependencies = [
  "half",
  "libloading 0.9.0",
  "prometheus-client",
+ "rand_chacha",
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",

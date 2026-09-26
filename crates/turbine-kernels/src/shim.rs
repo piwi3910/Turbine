@@ -9,7 +9,14 @@
 //!   functions are kept borrowed until the context stream is synchronized;
 //! - the context owns its streams and workspace and is destroyed exactly once, in
 //!   `ShimContext::drop`; every `DeviceBuffer` holds an `Arc` of its context, so no allocation
-//!   outlives it, and the context holds an `Arc` of its `ShimLibrary`, so the code stays loaded.
+//!   outlives it, and the context holds an `Arc` of its `ShimLibrary`, so the code stays loaded;
+//! - a captured graph (ABI v2.1) records the device pointers of the ops captured into it: the
+//!   caller keeps those buffers alive while the `GraphHandle` lives, and the handle (which holds
+//!   an `Arc` of its context) destroys the graph exactly once, in `GraphHandle::drop`.
+//!
+//! ABI v2.1 is optional: `ShimLibrary::abi_minor` is 0 for a v2.0 library, whose provider then
+//! has no `add_rmsnorm`/`logits_reduce` family and whose context answers the option and graph
+//! calls with `KernelError::Unsupported`.
 use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -24,22 +31,31 @@ use turbine_tensor::{
 };
 
 use crate::ffi::{
-    self, AddDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo, EmbeddingDesc,
-    GemmDesc, MoeExpertsDesc, MoeRouteDesc, OpTrio, RmsnormDesc, RopeDesc, ShimSymbols,
-    SiluMulDesc, TurbineCtx,
+    self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo,
+    EmbeddingDesc, GemmDesc, LogitsReduceDesc, MoeExpertsDesc, MoeRouteDesc, OpTrio, RmsnormDesc,
+    RopeDesc, ShimSymbols, SiluMulDesc, TurbineCtx, TurbineGraph,
 };
 use crate::ops::{
-    ActivationConfig, ActivationContext, ActivationKernel, AttentionConfig, AttentionContext,
-    AttentionKernel, AttentionKind, ElementwiseConfig, ElementwiseContext, ElementwiseKernel,
-    EmbeddingConfig, EmbeddingContext, EmbeddingKernel, GemmConfig, GemmContext, GemmKernel,
-    KernelProvider, KvCopyConfig, KvCopyContext, KvCopyKernel, MoeExpertsConfig, MoeExpertsContext,
-    MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel,
-    PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel,
+    ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
+    AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
+    ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
+    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, KernelProvider, KvCopyConfig,
+    KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
+    MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
+    NormContext, NormKernel, PagedAttentionContext, ProviderId, RopeConfig, RopeContext,
+    RopeKernel,
 };
 use crate::{KernelError, TURBINE_KERNELS_ABI_VERSION};
 
 /// Environment variable naming the shim library when `execution.kernel_library` is null.
 const KERNEL_LIBRARY_VAR: &str = "TURBINE_KERNEL_LIBRARY";
+
+/// Context option (ABI v2.1) `TURBINE_OPTION_GEMM_AUTOTUNE`: 1 times the GEMM algorithm
+/// candidates per shape at first use, 0 takes the first heuristic answer.
+pub const TURBINE_OPTION_GEMM_AUTOTUNE: i32 = 1;
+/// Read-only context option (ABI v2.1) `TURBINE_OPTION_GEMM_TUNED_SHAPES`: GEMM shapes tuned so
+/// far on the context.
+pub const TURBINE_OPTION_GEMM_TUNED_SHAPES: i32 = 2;
 
 /// A loaded kernel shim library whose ABI version and backend name have been checked.
 pub struct ShimLibrary {
@@ -143,6 +159,23 @@ impl ShimLibrary {
     pub fn abi_version(&self) -> u32 {
         // SAFETY: no arguments, returns an integer; the library is loaded while `self` lives.
         unsafe { (self.syms.abi_version)() }
+    }
+
+    /// The ABI minor revision (`turbine_abi_minor`); 0 when the library does not export it (a
+    /// v2.0 library such as the Phase 2 HIP build or the Phase 2b CUDA shim).
+    pub fn abi_minor(&self) -> u32 {
+        self.syms.v21.minor
+    }
+
+    /// The `KernelError::Unsupported` for a v2.1 function this library lacks.
+    fn lacks(&self, what: &str) -> KernelError {
+        KernelError::Unsupported {
+            message: format!(
+                "{} does not export {what} (kernel ABI minor {})",
+                self.path.display(),
+                self.syms.v21.minor
+            ),
+        }
     }
 
     pub fn backend_name(&self) -> &str {
@@ -304,6 +337,130 @@ impl ShimContext {
             });
         }
         Ok(s.ptr().addr() as *mut c_void)
+    }
+
+    /// Sets context option `option` (ABI v2.1 `turbine_ctx_set_option`, e.g.
+    /// `TURBINE_OPTION_GEMM_AUTOTUNE`). `Unsupported` when the library has no options or does
+    /// not know `option`.
+    pub fn set_option(&self, option: i32, value: i64) -> Result<(), KernelError> {
+        let Some(options) = self.lib.syms.v21.options else {
+            return Err(self.lib.lacks("turbine_ctx_set_option"));
+        };
+        // SAFETY: `raw` is a live context of this library; the call takes plain integers.
+        let code = unsafe { (options.set)(self.raw, option, value) };
+        self.check(code)
+    }
+
+    /// Reads context option `option` (ABI v2.1 `turbine_ctx_get_option`). `Unsupported` when the
+    /// library has no options or does not know `option`.
+    pub fn get_option(&self, option: i32) -> Result<i64, KernelError> {
+        let Some(options) = self.lib.syms.v21.options else {
+            return Err(self.lib.lacks("turbine_ctx_get_option"));
+        };
+        let mut value = 0i64;
+        // SAFETY: `raw` is a live context of this library and `value` a live, writable host
+        // integer on this stack frame; the shim writes it and keeps no pointer to it.
+        let code = unsafe { (options.get)(self.raw, option, &mut value) };
+        self.check(code)?;
+        Ok(value)
+    }
+
+    fn graph_fns(&self) -> Result<ffi::GraphFns, KernelError> {
+        self.lib
+            .syms
+            .v21
+            .graph
+            .ok_or_else(|| self.lib.lacks("the turbine_graph functions"))
+    }
+
+    /// Starts capturing this context's compute stream into a graph (ABI v2.1). Until
+    /// `graph_end`, only op calls may be issued: the shim refuses copies, syncs and allocations.
+    pub fn graph_begin(&self) -> Result<(), KernelError> {
+        let fns = self.graph_fns()?;
+        // SAFETY: `raw` is a live context of this library.
+        let code = unsafe { (fns.begin)(self.raw) };
+        self.check(code)
+    }
+
+    /// Stops the capture begun by `graph_begin` and instantiates it. The graph records the
+    /// device pointers of the captured ops: the caller keeps those buffers alive until the
+    /// returned handle is dropped.
+    pub fn graph_end(&self) -> Result<GraphHandle, KernelError> {
+        let fns = self.graph_fns()?;
+        let mut raw: *mut TurbineGraph = std::ptr::null_mut();
+        // SAFETY: `raw` is a live out-pointer on this stack frame and `self.raw` a live context.
+        // On success the shim stores a graph it allocated; ownership passes to the `GraphHandle`
+        // below, which destroys it exactly once.
+        let code = unsafe { (fns.end)(self.raw, &mut raw) };
+        self.check(code)?;
+        if raw.is_null() {
+            return Err(KernelError::Library {
+                message: "turbine_graph_end succeeded but returned a null graph".into(),
+            });
+        }
+        let ctx = self
+            .self_ref
+            .upgrade()
+            .expect("a ShimContext only exists inside the Arc create_context returns");
+        Ok(GraphHandle { raw, ctx })
+    }
+
+    /// Enqueues the captured graph `g` on this context's compute stream.
+    pub fn graph_launch(&self, g: &GraphHandle) -> Result<(), KernelError> {
+        let fns = self.graph_fns()?;
+        if !std::ptr::addr_eq(Arc::as_ptr(&g.ctx), std::ptr::from_ref(self)) {
+            return Err(KernelError::InvalidArgument {
+                message: format!(
+                    "graph was captured on another context than this {} context on device {}",
+                    self.lib.backend, self.device.0
+                ),
+            });
+        }
+        // SAFETY: `g.raw` was created by `turbine_graph_end` on this context (checked above) and
+        // is not destroyed while `g` is borrowed; `raw` is a live context.
+        let code = unsafe { (fns.launch)(self.raw, g.raw) };
+        self.check(code)
+    }
+}
+
+/// A graph captured on a shim context (ABI v2.1), destroyed through that context on drop.
+pub struct GraphHandle {
+    raw: *mut TurbineGraph,
+    /// Keeps the context (and its library) alive until the graph is destroyed.
+    ctx: Arc<ShimContext>,
+}
+
+impl fmt::Debug for GraphHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GraphHandle")
+            .field("device", &self.ctx.device)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: the graph pointer is never dereferenced on the Rust side; it is only passed to the shim
+// together with its context, whose entry points may be called from any thread (see `ShimContext`).
+unsafe impl Send for GraphHandle {}
+// SAFETY: no method mutates through `&self`; the pointer is only handed to the shim (see `Send`).
+unsafe impl Sync for GraphHandle {}
+
+impl Drop for GraphHandle {
+    fn drop(&mut self) {
+        let Some(fns) = self.ctx.lib.syms.v21.graph else {
+            // Unreachable: a handle only comes from `graph_end`, which needs the graph functions.
+            return;
+        };
+        // SAFETY: `raw` came from `turbine_graph_end` on `ctx` and is destroyed exactly once,
+        // here; `self.ctx` keeps the context and its library alive through the call.
+        let code = unsafe { (fns.destroy)(self.ctx.raw, self.raw) };
+        if let Err(e) = self.ctx.check(code) {
+            tracing::warn!(
+                event = "graph_destroy_failed",
+                device = self.ctx.device.0,
+                error = %e,
+                "turbine_graph_destroy failed"
+            );
+        }
     }
 }
 
@@ -717,6 +874,195 @@ fn add_probe(cfg: &ElementwiseConfig) -> AddDesc {
         out: null(),
         n: 1,
         dtype: cfg.dtype.abi_code(),
+    }
+}
+
+fn add_rmsnorm_probe(cfg: &AddRmsnormConfig) -> AddRmsnormDesc {
+    let dim = i64::from(cfg.dim);
+    AddRmsnormDesc {
+        residual: null(),
+        x: null(),
+        weight: null(),
+        out: null(),
+        rows: 1,
+        dim,
+        residual_stride_row: dim,
+        x_stride_row: dim,
+        out_stride_row: dim,
+        eps: 1e-5,
+        dtype: cfg.dtype.abi_code(),
+    }
+}
+
+fn logits_reduce_probe(cfg: &LogitsReduceConfig) -> LogitsReduceDesc {
+    let vocab = i64::from(cfg.vocab);
+    LogitsReduceDesc {
+        logits: std::ptr::null(),
+        rows: 1,
+        vocab,
+        stride_row: vocab,
+        temperature: std::ptr::null(),
+        uniform: std::ptr::null(),
+        mode: std::ptr::null(),
+        top_n: cfg.top_n as i32,
+        top_ids: std::ptr::null_mut(),
+        top_values: std::ptr::null_mut(),
+        lse: std::ptr::null_mut(),
+        sampled: std::ptr::null_mut(),
+        sampled_logit: std::ptr::null_mut(),
+    }
+}
+
+/// Checks that `v` is a dense `dtype` view of rank `1 + cols.is_some()` with at least `rows` rows
+/// (and exactly `cols` columns): the per-row arrays of `logits_reduce`, which may be sized for
+/// more rows than one call reduces.
+fn dense_rows(
+    name: &str,
+    v: &TensorView<'_>,
+    rows: usize,
+    cols: Option<usize>,
+    dtype: DType,
+) -> Result<(), KernelError> {
+    let rank = 1 + usize::from(cols.is_some());
+    if v.dtype != dtype
+        || v.shape.len() != rank
+        || v.shape[0] < rows
+        || cols.is_some_and(|c| v.shape[1] != c)
+        || v.strides != contiguous_strides(&v.shape)
+    {
+        return Err(invalid(format!(
+            "{name} must be a dense {} view of at least {rows} rows{}, has {} shape {:?} strides {:?}",
+            dtype.as_str(),
+            cols.map_or(String::new(), |c| format!(" of {c} columns")),
+            v.dtype.as_str(),
+            v.shape.as_slice(),
+            v.strides.as_slice()
+        )));
+    }
+    Ok(())
+}
+
+impl ShimProvider {
+    /// The `add_rmsnorm` trio; `KernelProvider::add_rmsnorm` is `Some` exactly when it exists.
+    fn add_rmsnorm_trio(&self) -> Result<&OpTrio<AddRmsnormDesc>, KernelError> {
+        self.syms()
+            .v21
+            .add_rmsnorm
+            .as_ref()
+            .ok_or_else(|| self.ctx.lib.lacks("turbine_add_rmsnorm"))
+    }
+
+    /// The `logits_reduce` trio; `KernelProvider::logits_reduce` is `Some` exactly when it exists.
+    fn logits_reduce_trio(&self) -> Result<&OpTrio<LogitsReduceDesc>, KernelError> {
+        self.syms()
+            .v21
+            .logits_reduce
+            .as_ref()
+            .ok_or_else(|| self.ctx.lib.lacks("turbine_logits_reduce"))
+    }
+}
+
+impl AddRmsnormKernel for ShimProvider {
+    fn supports(&self, cfg: &AddRmsnormConfig) -> bool {
+        self.add_rmsnorm_trio()
+            .is_ok_and(|t| Self::supported(t, &add_rmsnorm_probe(cfg)))
+    }
+
+    fn implementation(&self, cfg: &AddRmsnormConfig) -> String {
+        self.add_rmsnorm_trio()
+            .map(|t| Self::implementation_of(t, &add_rmsnorm_probe(cfg)))
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut AddRmsnormContext<'_>) -> Result<(), KernelError> {
+        let trio = self.add_rmsnorm_trio()?;
+        let residual_stride_row = row_stride("residual", &ctx.residual, 2)?;
+        let (rows, dim) = (ctx.residual.shape[0], ctx.residual.shape[1]);
+        for (name, v) in [("x", &ctx.x), ("out", &ctx.out)] {
+            if v.shape.as_slice() != [rows, dim] || v.dtype != ctx.residual.dtype {
+                return Err(invalid(format!(
+                    "{name} must be a {} view of shape [{rows}, {dim}], has {} shape {:?}",
+                    ctx.residual.dtype.as_str(),
+                    v.dtype.as_str(),
+                    v.shape.as_slice()
+                )));
+            }
+        }
+        dense("weight", &ctx.weight, &[dim], ctx.residual.dtype)?;
+        let d = AddRmsnormDesc {
+            residual_stride_row,
+            x_stride_row: row_stride("x", &ctx.x, 2)?,
+            out_stride_row: row_stride("out", &ctx.out, 2)?,
+            residual: self.ctx.device_ptr("residual", &ctx.residual)?,
+            x: self.ctx.device_ptr("x", &ctx.x)?,
+            weight: self.ctx.device_ptr("weight", &ctx.weight)?,
+            out: self.ctx.device_ptr("out", &ctx.out)?,
+            rows: to_i64("rows", rows)?,
+            dim: to_i64("dim", dim)?,
+            eps: ctx.eps,
+            dtype: ctx.residual.dtype.abi_code(),
+        };
+        self.run(trio, &d)
+    }
+}
+
+impl LogitsReduceKernel for ShimProvider {
+    fn supports(&self, cfg: &LogitsReduceConfig) -> bool {
+        cfg.top_n <= LogitsReduceConfig::MAX_TOP_N
+            && self
+                .logits_reduce_trio()
+                .is_ok_and(|t| Self::supported(t, &logits_reduce_probe(cfg)))
+    }
+
+    fn implementation(&self, cfg: &LogitsReduceConfig) -> String {
+        self.logits_reduce_trio()
+            .map(|t| Self::implementation_of(t, &logits_reduce_probe(cfg)))
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut LogitsReduceContext<'_>) -> Result<(), KernelError> {
+        let trio = self.logits_reduce_trio()?;
+        let rows = ctx.rows as usize;
+        let stride_row = row_stride("logits", &ctx.logits, 2)?;
+        if ctx.logits.dtype != DType::F32 || ctx.logits.shape[0] < rows {
+            return Err(invalid(format!(
+                "logits must be an f32 view of at least {rows} rows, has {} shape {:?}",
+                ctx.logits.dtype.as_str(),
+                ctx.logits.shape.as_slice()
+            )));
+        }
+        let top_n = ctx.top_ids.shape.get(1).copied().unwrap_or(0);
+        dense_rows("top_ids", &ctx.top_ids, rows, Some(top_n), DType::I32)?;
+        dense_rows("top_values", &ctx.top_values, rows, Some(top_n), DType::F32)?;
+        for (name, v, dtype) in [
+            ("temperature", &ctx.temperature, DType::F32),
+            ("uniform", &ctx.uniform, DType::F32),
+            ("mode", &ctx.mode, DType::I32),
+            ("lse", &ctx.lse, DType::F32),
+            ("sampled", &ctx.sampled, DType::I32),
+            ("sampled_logit", &ctx.sampled_logit, DType::F32),
+        ] {
+            dense_rows(name, v, rows, None, dtype)?;
+        }
+        let d = LogitsReduceDesc {
+            logits: self.ctx.device_ptr("logits", &ctx.logits)? as *const f32,
+            rows: to_i64("rows", rows)?,
+            vocab: to_i64("vocab", ctx.logits.shape[1])?,
+            stride_row,
+            temperature: self.ctx.device_ptr("temperature", &ctx.temperature)? as *const f32,
+            uniform: self.ctx.device_ptr("uniform", &ctx.uniform)? as *const f32,
+            mode: self.ctx.device_ptr("mode", &ctx.mode)? as *const i32,
+            top_n: to_i32("top_n", top_n)?,
+            top_ids: self.ctx.device_ptr("top_ids", &ctx.top_ids)?.cast(),
+            top_values: self.ctx.device_ptr("top_values", &ctx.top_values)?.cast(),
+            lse: self.ctx.device_ptr("lse", &ctx.lse)?.cast(),
+            sampled: self.ctx.device_ptr("sampled", &ctx.sampled)?.cast(),
+            sampled_logit: self
+                .ctx
+                .device_ptr("sampled_logit", &ctx.sampled_logit)?
+                .cast(),
+        };
+        self.run(trio, &d)
     }
 }
 
@@ -1193,6 +1539,20 @@ impl KernelProvider for ShimProvider {
     fn moe(&self) -> Option<&dyn MoeKernel> {
         Some(self)
     }
+    fn add_rmsnorm(&self) -> Option<&dyn AddRmsnormKernel> {
+        self.syms()
+            .v21
+            .add_rmsnorm
+            .is_some()
+            .then_some(self as &dyn AddRmsnormKernel)
+    }
+    fn logits_reduce(&self) -> Option<&dyn LogitsReduceKernel> {
+        self.syms()
+            .v21
+            .logits_reduce
+            .is_some()
+            .then_some(self as &dyn LogitsReduceKernel)
+    }
 }
 
 #[cfg(test)]
@@ -1514,6 +1874,145 @@ mod tests {
         assert_eq!(moe.implementation_experts(&experts), "stub_moe_experts");
     }
 
+    /// ABI v2.1 is optional. The plain (v2.0) stub loads with minor 0, its provider has no
+    /// `add_rmsnorm`/`logits_reduce` family and its context answers the option and graph calls
+    /// with `Unsupported`; the `TURBINE_STUB_V21` stub reports minor 1, exposes both op families
+    /// through the ABI, keeps options, and captures, launches and destroys graphs. Breaks if a
+    /// v2.1 symbol becomes required, if a v2.0 library reports v2.1 support, or if a graph is not
+    /// destroyed exactly once.
+    #[test]
+    fn v21_symbols_optional() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let plain = ShimLibrary::load(
+            Path::new(env!("TURBINE_STUB_GFX942")),
+            ExecutionBackend::Hip,
+        )
+        .expect("a v2.0 library still loads");
+        assert_eq!(plain.abi_minor(), 0);
+        let ctx = plain
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let provider = shim_provider(Arc::clone(&ctx));
+        assert!(provider.add_rmsnorm().is_none());
+        assert!(provider.logits_reduce().is_none());
+        for result in [
+            ctx.graph_begin(),
+            ctx.graph_end().map(drop),
+            ctx.set_option(TURBINE_OPTION_GEMM_AUTOTUNE, 1),
+            ctx.get_option(TURBINE_OPTION_GEMM_AUTOTUNE).map(drop),
+        ] {
+            let err = result.expect_err("a v2.0 library has no v2.1 functions");
+            assert!(
+                matches!(&err, KernelError::Unsupported { message } if message.contains("kernel ABI minor 0")),
+                "{err:?}"
+            );
+        }
+        drop((provider, ctx));
+
+        let v21 = ShimLibrary::load(
+            Path::new(env!("TURBINE_STUB_GFX942_V21")),
+            ExecutionBackend::Hip,
+        )
+        .expect("a v2.1 library loads");
+        assert_eq!((v21.abi_version(), v21.abi_minor()), (2, 1));
+        let ctx = v21
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let provider = shim_provider(Arc::clone(&ctx));
+        let fused_cfg = AddRmsnormConfig {
+            dtype: DType::BF16,
+            dim: 3072,
+        };
+        let fused = provider.add_rmsnorm().expect("v2.1 add_rmsnorm family");
+        assert!(!fused.supports(&fused_cfg), "the stub supports no config");
+        assert_eq!(fused.implementation(&fused_cfg), "stub_add_rmsnorm");
+        let reduce_cfg = LogitsReduceConfig {
+            vocab: 128_256,
+            top_n: 20,
+        };
+        let reduce = provider.logits_reduce().expect("v2.1 logits_reduce family");
+        assert!(!reduce.supports(&reduce_cfg));
+        assert_eq!(reduce.implementation(&reduce_cfg), "stub_logits_reduce");
+
+        // The op forwards through the ABI (the stub reports it unimplemented).
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let rows = Tensor::empty(&mem, &[2, 8], DType::BF16).expect("rows");
+        let weight = Tensor::empty(&mem, &[8], DType::BF16).expect("weight");
+        let err = fused
+            .execute(&mut AddRmsnormContext {
+                residual: rows.view(),
+                x: rows.view(),
+                weight: weight.view(),
+                out: rows.view(),
+                eps: 1e-5,
+            })
+            .expect_err("the stub implements no op");
+        assert!(
+            matches!(&err, KernelError::Unsupported { message } if message == "stub: add_rmsnorm is not implemented"),
+            "{err:?}"
+        );
+
+        ctx.set_option(TURBINE_OPTION_GEMM_AUTOTUNE, 1)
+            .expect("set autotune");
+        assert_eq!(
+            ctx.get_option(TURBINE_OPTION_GEMM_AUTOTUNE).expect("get"),
+            1
+        );
+        ctx.set_option(TURBINE_OPTION_GEMM_AUTOTUNE, 0)
+            .expect("clear autotune");
+        assert_eq!(
+            ctx.get_option(TURBINE_OPTION_GEMM_AUTOTUNE).expect("get"),
+            0
+        );
+        assert_eq!(
+            ctx.get_option(TURBINE_OPTION_GEMM_TUNED_SHAPES)
+                .expect("tuned shapes"),
+            0
+        );
+        assert!(matches!(
+            ctx.set_option(TURBINE_OPTION_GEMM_TUNED_SHAPES, 5),
+            Err(KernelError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            ctx.get_option(99),
+            Err(KernelError::Unsupported { .. })
+        ));
+
+        let live_graphs = || {
+            stub_hook(
+                &v21,
+                "stub_live_graphs",
+                |f: unsafe extern "C" fn() -> i32| {
+                    // SAFETY: the v2.1 stub defines `int32_t stub_live_graphs(void)`; the library
+                    // is loaded.
+                    unsafe { f() }
+                },
+            )
+        };
+        assert!(
+            matches!(ctx.graph_end(), Err(KernelError::InvalidArgument { .. })),
+            "graph_end without graph_begin"
+        );
+        ctx.graph_begin().expect("begin capture");
+        let graph = ctx.graph_end().expect("end capture");
+        assert_eq!(live_graphs(), 1);
+        ctx.graph_launch(&graph).expect("launch");
+        ctx.graph_launch(&graph).expect("replay");
+        // A graph only launches on the context it was captured on.
+        let other = v21
+            .create_context(&mocked_device("gfx942"))
+            .expect("second context");
+        assert!(matches!(
+            other.graph_launch(&graph),
+            Err(KernelError::InvalidArgument { .. })
+        ));
+        // The graph holds its context: dropping every other handle first is safe.
+        drop((provider, rows, weight, mem, ctx, other));
+        assert_eq!(live_graphs(), 1);
+        drop(graph);
+        assert_eq!(live_graphs(), 0, "the graph is destroyed exactly once");
+    }
+
     #[test]
     fn descriptors_match_the_c_layout() {
         let lib = ShimLibrary::load(
@@ -1544,6 +2043,8 @@ mod tests {
             size_of::<CopyBlocksDesc>(),
             size_of::<MoeRouteDesc>(),
             size_of::<MoeExpertsDesc>(),
+            size_of::<AddRmsnormDesc>(),
+            size_of::<LogitsReduceDesc>(),
         ];
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");

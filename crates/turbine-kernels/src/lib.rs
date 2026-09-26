@@ -15,15 +15,20 @@ pub mod test_support;
 
 pub use cpu::{cpu_reference_provider, round_to};
 pub use ops::{
-    ActivationConfig, ActivationContext, ActivationKernel, AttentionConfig, AttentionContext,
-    AttentionKernel, AttentionKind, ElementwiseConfig, ElementwiseContext, ElementwiseKernel,
-    EmbeddingConfig, EmbeddingContext, EmbeddingKernel, GemmConfig, GemmContext, GemmKernel,
-    KernelProvider, KvCopyConfig, KvCopyContext, KvCopyKernel, MoeExpertsConfig, MoeExpertsContext,
-    MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind,
-    PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel,
+    ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
+    AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
+    ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
+    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, KernelProvider, KvCopyConfig,
+    KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
+    MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
+    NormContext, NormKernel, OpKind, PagedAttentionContext, ProviderId, RopeConfig, RopeContext,
+    RopeKernel,
 };
 pub use registry::{KernelMetrics, KernelRegistry, OpConfig, OpRequirement, Selection};
-pub use shim::{ContextInfo, ShimContext, ShimLibrary, ShimProvider, shim_provider};
+pub use shim::{
+    ContextInfo, GraphHandle, ShimContext, ShimLibrary, ShimProvider, TURBINE_OPTION_GEMM_AUTOTUNE,
+    TURBINE_OPTION_GEMM_TUNED_SHAPES, shim_provider,
+};
 
 /// The kernel C ABI version this crate speaks; must equal `turbine_abi_version()` of the loaded
 /// shim library and `TURBINE_ABI_VERSION` in the header exactly (contract §9.1).

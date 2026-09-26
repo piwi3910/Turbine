@@ -1,5 +1,6 @@
-//! `#[repr(C)]` mirrors of `kernels/include/turbine_kernels.h` (ABI v2), the symbol table
-//! resolved once per loaded library, and the status-code mapping (contract §9.4).
+//! `#[repr(C)]` mirrors of `kernels/include/turbine_kernels.h` (ABI v2.1), the symbol table
+//! resolved once per loaded library (the v2.1 symbols optionally), and the status-code mapping
+//! (contract §9.4).
 //!
 //! Descriptor field order and types match the header field for field. Pointer fields carry
 //! device pointers (except where the header says "host"); the shim never retains them beyond
@@ -240,6 +241,48 @@ pub(crate) struct MoeExpertsDesc {
     pub dtype: i32,
 }
 
+/// Opaque `turbine_graph` (v2.1); only ever handled by pointer.
+#[repr(C)]
+pub(crate) struct TurbineGraph {
+    _private: [u8; 0],
+}
+
+/// `turbine_add_rmsnorm_desc` (v2.1).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AddRmsnormDesc {
+    pub residual: *mut c_void,
+    pub x: *const c_void,
+    pub weight: *const c_void,
+    pub out: *mut c_void,
+    pub rows: i64,
+    pub dim: i64,
+    pub residual_stride_row: i64,
+    pub x_stride_row: i64,
+    pub out_stride_row: i64,
+    pub eps: f32,
+    pub dtype: i32,
+}
+
+/// `turbine_logits_reduce_desc` (v2.1).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LogitsReduceDesc {
+    pub logits: *const f32,
+    pub rows: i64,
+    pub vocab: i64,
+    pub stride_row: i64,
+    pub temperature: *const f32,
+    pub uniform: *const f32,
+    pub mode: *const i32,
+    pub top_n: i32,
+    pub top_ids: *mut i32,
+    pub top_values: *mut f32,
+    pub lse: *mut f32,
+    pub sampled: *mut i32,
+    pub sampled_logit: *mut f32,
+}
+
 /// `turbine_<op>`: enqueue on the context's compute stream.
 pub(crate) type OpFn<D> = unsafe extern "C" fn(*mut TurbineCtx, *const D) -> i32;
 /// `turbine_<op>_supported`: 1 / 0 (negative on an internal error); pointers may be null.
@@ -262,6 +305,72 @@ impl<D> Clone for OpTrio<D> {
     }
 }
 impl<D> Copy for OpTrio<D> {}
+
+/// `turbine_ctx_set_option` / `turbine_ctx_get_option` (v2.1).
+#[derive(Clone, Copy)]
+pub(crate) struct OptionFns {
+    pub set: unsafe extern "C" fn(*mut TurbineCtx, i32, i64) -> i32,
+    pub get: unsafe extern "C" fn(*mut TurbineCtx, i32, *mut i64) -> i32,
+}
+
+/// `turbine_graph_{begin,end,launch,destroy}` (v2.1).
+#[derive(Clone, Copy)]
+pub(crate) struct GraphFns {
+    pub begin: unsafe extern "C" fn(*mut TurbineCtx) -> i32,
+    pub end: unsafe extern "C" fn(*mut TurbineCtx, *mut *mut TurbineGraph) -> i32,
+    pub launch: unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineGraph) -> i32,
+    pub destroy: unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineGraph) -> i32,
+}
+
+/// The optional ABI v2.1 functions. `minor` is `turbine_abi_minor()` (0 when the library lacks
+/// it); every group is `None` unless `minor` ≥ 1 and the library exports the whole group.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct V21Symbols {
+    pub minor: u32,
+    pub options: Option<OptionFns>,
+    pub add_rmsnorm: Option<OpTrio<AddRmsnormDesc>>,
+    pub logits_reduce: Option<OpTrio<LogitsReduceDesc>>,
+    pub graph: Option<GraphFns>,
+}
+
+impl V21Symbols {
+    /// Resolves the v2.1 functions of `lib`. Missing symbols are not errors: a v2.0 library (no
+    /// `turbine_abi_minor`, or minor 0) gets no v2.1 group at all, and a group the library exports
+    /// only in part is left out, so callers fall back to the ABI v2 paths.
+    pub(crate) fn resolve(lib: &Library) -> V21Symbols {
+        let Some(abi_minor) = optional::<unsafe extern "C" fn() -> u32>(lib, "turbine_abi_minor")
+        else {
+            return V21Symbols::default();
+        };
+        // SAFETY: `turbine_abi_minor` takes no arguments and returns an integer (header v2.1);
+        // `lib` is loaded for the duration of the call.
+        let minor = unsafe { abi_minor() };
+        if minor == 0 {
+            return V21Symbols::default();
+        }
+        let options = (|| {
+            Some(OptionFns {
+                set: optional(lib, "turbine_ctx_set_option")?,
+                get: optional(lib, "turbine_ctx_get_option")?,
+            })
+        })();
+        let graph = (|| {
+            Some(GraphFns {
+                begin: optional(lib, "turbine_graph_begin")?,
+                end: optional(lib, "turbine_graph_end")?,
+                launch: optional(lib, "turbine_graph_launch")?,
+                destroy: optional(lib, "turbine_graph_destroy")?,
+            })
+        })();
+        V21Symbols {
+            minor,
+            options,
+            add_rmsnorm: optional_trio(lib, "add_rmsnorm"),
+            logits_reduce: optional_trio(lib, "logits_reduce"),
+            graph,
+        }
+    }
+}
 
 /// Every function of ABI v2, resolved once in `ShimLibrary::load`. The pointers stay valid while
 /// the `libloading::Library` they came from is loaded; `ShimLibrary` owns both.
@@ -293,6 +402,8 @@ pub(crate) struct ShimSymbols {
     pub copy_blocks: OpTrio<CopyBlocksDesc>,
     pub moe_route: OpTrio<MoeRouteDesc>,
     pub moe_experts: OpTrio<MoeExpertsDesc>,
+    /// The optional v2.1 additions.
+    pub v21: V21Symbols,
 }
 
 /// Resolves the function `name` from `lib` as the fn-pointer type `T`; a missing symbol is a
@@ -310,6 +421,25 @@ pub(crate) fn resolve<T: Copy>(lib: &Library, path: &Path, name: &str) -> Result
     Ok(*symbol)
 }
 
+/// Resolves the function `name` from `lib` as `T`, or `None` when the library does not export
+/// it (an optional v2.1 symbol).
+///
+/// Callers must pick `T` as the `unsafe extern "C" fn` type the header declares for `name`.
+fn optional<T: Copy>(lib: &Library, name: &str) -> Option<T> {
+    // SAFETY: as in `resolve`: `T` matches the header's declaration of `name`, and the copied
+    // pointer stays valid while `lib` is loaded (`ShimLibrary` keeps it alive with the table).
+    unsafe { lib.get::<T>(name) }.ok().map(|symbol| *symbol)
+}
+
+/// The three entry points of the optional op `op`, or `None` unless all three are exported.
+fn optional_trio<D>(lib: &Library, op: &str) -> Option<OpTrio<D>> {
+    Some(OpTrio {
+        run: optional(lib, &format!("turbine_{op}"))?,
+        supported: optional(lib, &format!("turbine_{op}_supported"))?,
+        implementation: optional(lib, &format!("turbine_{op}_impl"))?,
+    })
+}
+
 fn trio<D>(lib: &Library, path: &Path, op: &str) -> Result<OpTrio<D>, KernelError> {
     Ok(OpTrio {
         run: resolve(lib, path, &format!("turbine_{op}"))?,
@@ -319,7 +449,8 @@ fn trio<D>(lib: &Library, path: &Path, op: &str) -> Result<OpTrio<D>, KernelErro
 }
 
 impl ShimSymbols {
-    /// Resolves every ABI v2 function; the first missing one fails the load.
+    /// Resolves every ABI v2 function (the first missing one fails the load) and the optional
+    /// v2.1 functions (never a failure).
     pub(crate) fn resolve_all(lib: &Library, path: &Path) -> Result<ShimSymbols, KernelError> {
         Ok(ShimSymbols {
             abi_version: resolve(lib, path, "turbine_abi_version")?,
@@ -348,6 +479,7 @@ impl ShimSymbols {
             copy_blocks: trio(lib, path, "copy_blocks")?,
             moe_route: trio(lib, path, "moe_route")?,
             moe_experts: trio(lib, path, "moe_experts")?,
+            v21: V21Symbols::resolve(lib),
         })
     }
 }

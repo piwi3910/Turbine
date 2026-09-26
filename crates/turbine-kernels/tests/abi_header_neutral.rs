@@ -1,5 +1,6 @@
 //! The kernel C ABI header names no vendor, declares the entry-point trio of every op the
-//! registry binds, and carries the ABI version the Rust side expects (P1 AC S-1/S-7, contract §9).
+//! registry binds, and carries the ABI version the Rust side expects (P1 AC S-1/S-7, contract §9)
+//! and the additive minor revision v2.1 (P2c AC S-5).
 use std::path::Path;
 
 use turbine_kernels::TURBINE_KERNELS_ABI_VERSION;
@@ -103,4 +104,61 @@ fn header_abi_version_matches_rust_constant() {
         .unwrap_or_else(|e| panic!("TURBINE_ABI_VERSION {}: {e}", defines[0]));
     assert_eq!(value, TURBINE_KERNELS_ABI_VERSION);
     assert_eq!(TURBINE_KERNELS_ABI_VERSION, 2, "Phase 2 ships ABI v2");
+}
+
+/// The single `#define <name> <value>` of the header, with its value trimmed.
+fn define(code: &str, name: &str) -> String {
+    let values: Vec<&str> = code
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("#define "))
+        .filter_map(|l| l.strip_prefix(name))
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .map(str::trim)
+        .collect();
+    assert_eq!(values.len(), 1, "expected exactly one {name} define");
+    values[0].to_string()
+}
+
+#[test]
+fn header_declares_the_v21_minor_revision() {
+    let code = strip_comments(&header());
+    assert_eq!(
+        define(&code, "TURBINE_ABI_VERSION"),
+        "2u",
+        "v2.1 keeps major 2"
+    );
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "1u");
+    assert_eq!(define(&code, "TURBINE_OPTION_GEMM_AUTOTUNE"), "1");
+    assert_eq!(define(&code, "TURBINE_OPTION_GEMM_TUNED_SHAPES"), "2");
+    // Declarations compared with whitespace collapsed, so line wrapping does not matter.
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for decl in [
+        "uint32_t turbine_abi_minor(void);",
+        "int32_t turbine_ctx_set_option(turbine_ctx *ctx, int32_t option, int64_t value);",
+        "int32_t turbine_ctx_get_option(turbine_ctx *ctx, int32_t option, int64_t *out);",
+        "} turbine_add_rmsnorm_desc;",
+        "} turbine_logits_reduce_desc;",
+        "int32_t turbine_add_rmsnorm(turbine_ctx *ctx, const turbine_add_rmsnorm_desc *d);",
+        "int32_t turbine_add_rmsnorm_supported(const turbine_add_rmsnorm_desc *d);",
+        "const char *turbine_add_rmsnorm_impl(const turbine_add_rmsnorm_desc *d);",
+        "int32_t turbine_logits_reduce(turbine_ctx *ctx, const turbine_logits_reduce_desc *d);",
+        "int32_t turbine_logits_reduce_supported(const turbine_logits_reduce_desc *d);",
+        "const char *turbine_logits_reduce_impl(const turbine_logits_reduce_desc *d);",
+        "typedef struct turbine_graph turbine_graph;",
+        "int32_t turbine_graph_begin(turbine_ctx *ctx);",
+        "int32_t turbine_graph_end(turbine_ctx *ctx, turbine_graph **out);",
+        "int32_t turbine_graph_launch(turbine_ctx *ctx, turbine_graph *g);",
+        "int32_t turbine_graph_destroy(turbine_ctx *ctx, turbine_graph *g);",
+    ] {
+        assert!(
+            flat.contains(decl),
+            "turbine_kernels.h lacks the v2.1 {decl}"
+        );
+    }
+    for op in [OpKind::AddRmsnorm, OpKind::LogitsReduce] {
+        assert!(
+            OpKind::ALL.contains(&op),
+            "{op} is a registry op, so header_declares_every_registry_op checks its trio"
+        );
+    }
 }

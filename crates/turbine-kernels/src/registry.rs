@@ -13,10 +13,11 @@ use turbine_observability::MetricsRegistry;
 
 use crate::KernelError;
 use crate::ops::{
-    ActivationConfig, ActivationKernel, AttentionConfig, AttentionKernel, ElementwiseConfig,
-    ElementwiseKernel, EmbeddingConfig, EmbeddingKernel, GemmConfig, GemmKernel, KernelProvider,
-    KvCopyConfig, KvCopyKernel, MoeExpertsConfig, MoeKernel, MoeRouteConfig, NormConfig,
-    NormKernel, OpKind, ProviderId, RopeConfig, RopeKernel,
+    ActivationConfig, ActivationKernel, AddRmsnormConfig, AddRmsnormKernel, AttentionConfig,
+    AttentionKernel, ElementwiseConfig, ElementwiseKernel, EmbeddingConfig, EmbeddingKernel,
+    GemmConfig, GemmKernel, KernelProvider, KvCopyConfig, KvCopyKernel, LogitsReduceConfig,
+    LogitsReduceKernel, MoeExpertsConfig, MoeKernel, MoeRouteConfig, NormConfig, NormKernel,
+    OpKind, ProviderId, RopeConfig, RopeKernel,
 };
 
 /// Labels of `turbine_kernel_provider_selected`.
@@ -60,6 +61,10 @@ pub enum OpConfig {
     CopyBlocks(KvCopyConfig),
     MoeRoute(MoeRouteConfig),
     MoeExperts(MoeExpertsConfig),
+    /// ABI v2.1; a shim library without the symbols has no provider for it.
+    AddRmsnorm(AddRmsnormConfig),
+    /// ABI v2.1; a shim library without the symbols has no provider for it.
+    LogitsReduce(LogitsReduceConfig),
 }
 
 impl OpConfig {
@@ -75,6 +80,8 @@ impl OpConfig {
             OpConfig::CopyBlocks(_) => OpKind::CopyBlocks,
             OpConfig::MoeRoute(_) => OpKind::MoeRoute,
             OpConfig::MoeExperts(_) => OpKind::MoeExperts,
+            OpConfig::AddRmsnorm(_) => OpKind::AddRmsnorm,
+            OpConfig::LogitsReduce(_) => OpKind::LogitsReduce,
         }
     }
 
@@ -91,6 +98,8 @@ impl OpConfig {
             OpConfig::CopyBlocks(cfg) => cfg.to_string(),
             OpConfig::MoeRoute(cfg) => cfg.to_string(),
             OpConfig::MoeExperts(cfg) => cfg.to_string(),
+            OpConfig::AddRmsnorm(cfg) => cfg.to_string(),
+            OpConfig::LogitsReduce(cfg) => cfg.to_string(),
         }
     }
 
@@ -138,7 +147,22 @@ impl OpConfig {
                 .moe()
                 .filter(|k| k.supports_experts(cfg))
                 .map(|k| k.implementation_experts(cfg)),
+            OpConfig::AddRmsnorm(cfg) => provider
+                .add_rmsnorm()
+                .filter(|k| k.supports(cfg))
+                .map(|k| k.implementation(cfg)),
+            OpConfig::LogitsReduce(cfg) => provider
+                .logits_reduce()
+                .filter(|k| k.supports(cfg))
+                .map(|k| k.implementation(cfg)),
         }
+    }
+
+    /// True when `provider` has the op family and supports this config. Callers use it before
+    /// `KernelRegistry::build` to decide whether an optional op (the v2.1 `add_rmsnorm` and
+    /// `logits_reduce`) joins the requirements or the model falls back to the v2 ops.
+    pub fn supported_by(&self, provider: &dyn KernelProvider) -> bool {
+        self.probe(provider).is_some()
     }
 }
 
@@ -330,6 +354,20 @@ impl KernelRegistry {
         self.provider(OpConfig::MoeExperts(*cfg))
             .moe()
             .expect("the selected provider implements moe_experts")
+    }
+
+    /// The fused residual-add + RMSNorm kernel selected for `cfg` (ABI v2.1).
+    pub fn add_rmsnorm(&self, cfg: &AddRmsnormConfig) -> &dyn AddRmsnormKernel {
+        self.provider(OpConfig::AddRmsnorm(*cfg))
+            .add_rmsnorm()
+            .expect("the selected provider implements add_rmsnorm")
+    }
+
+    /// The logits reduction kernel selected for `cfg` (ABI v2.1).
+    pub fn logits_reduce(&self, cfg: &LogitsReduceConfig) -> &dyn LogitsReduceKernel {
+        self.provider(OpConfig::LogitsReduce(*cfg))
+            .logits_reduce()
+            .expect("the selected provider implements logits_reduce")
     }
 }
 
@@ -612,6 +650,90 @@ mod tests {
         assert_eq!(
             registry.attention(&paged).implementation(&paged),
             "cpu_attention_paged_f32acc"
+        );
+    }
+
+    /// A provider without the v2.1 families (the trait defaults) is skipped for them and the
+    /// next provider in order serves them; with no other provider they are a startup error that
+    /// callers avoid by checking `OpConfig::supported_by` first.
+    #[test]
+    fn v21_ops_skip_providers_without_them() {
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        let fused = AddRmsnormConfig {
+            dtype: DType::BF16,
+            dim: 3072,
+        };
+        let reduce = LogitsReduceConfig {
+            vocab: 128_256,
+            top_n: 20,
+        };
+        let reqs: Vec<OpRequirement> =
+            [OpConfig::AddRmsnorm(fused), OpConfig::LogitsReduce(reduce)]
+                .into_iter()
+                .map(OpRequirement::from)
+                .collect();
+        let only_first = first();
+        for spec in [reqs[0].spec, reqs[1].spec] {
+            assert!(!spec.supported_by(only_first.as_ref()));
+            assert!(spec.supported_by(crate::cpu_reference_provider().as_ref()));
+        }
+        let registry = KernelRegistry::build(
+            vec![first(), crate::cpu_reference_provider()],
+            &[ProviderId("first"), ProviderId("cpu-reference")],
+            &reqs,
+            &metrics,
+        )
+        .expect("cpu-reference supports both v2.1 ops");
+        let picked: Vec<(OpKind, &str, &str, &str)> = registry
+            .selections()
+            .iter()
+            .map(|s| {
+                (
+                    s.op,
+                    s.provider.0,
+                    s.implementation.as_str(),
+                    s.config.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            picked,
+            [
+                (
+                    OpKind::AddRmsnorm,
+                    "cpu-reference",
+                    "cpu_add_rmsnorm",
+                    "dim=3072 dtype=bf16"
+                ),
+                (
+                    OpKind::LogitsReduce,
+                    "cpu-reference",
+                    "cpu_logits_reduce",
+                    "vocab=128256 top_n=20"
+                ),
+            ]
+        );
+        assert_eq!(
+            registry.add_rmsnorm(&fused).implementation(&fused),
+            "cpu_add_rmsnorm"
+        );
+        assert_eq!(
+            registry.logits_reduce(&reduce).implementation(&reduce),
+            "cpu_logits_reduce"
+        );
+
+        let err = match KernelRegistry::build(
+            vec![first()],
+            &[ProviderId("first")],
+            &reqs[..1],
+            &metrics,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a provider without add_rmsnorm cannot serve it"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "no kernel provider supports add_rmsnorm dim=3072 dtype=bf16"
         );
     }
 

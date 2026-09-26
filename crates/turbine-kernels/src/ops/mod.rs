@@ -30,10 +30,14 @@ pub enum OpKind {
     CopyBlocks,
     MoeRoute,
     MoeExperts,
+    /// ABI v2.1 (optional in a shim library).
+    AddRmsnorm,
+    /// ABI v2.1 (optional in a shim library).
+    LogitsReduce,
 }
 
 impl OpKind {
-    /// Every op of the current ABI version, in header order.
+    /// Every op of the current ABI version (v2.1 included), in header order.
     pub const ALL: &'static [OpKind] = &[
         OpKind::Gemm,
         OpKind::AttentionPrefill,
@@ -48,6 +52,8 @@ impl OpKind {
         OpKind::CopyBlocks,
         OpKind::MoeRoute,
         OpKind::MoeExperts,
+        OpKind::AddRmsnorm,
+        OpKind::LogitsReduce,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -65,6 +71,8 @@ impl OpKind {
             OpKind::CopyBlocks => "copy_blocks",
             OpKind::MoeRoute => "moe_route",
             OpKind::MoeExperts => "moe_experts",
+            OpKind::AddRmsnorm => "add_rmsnorm",
+            OpKind::LogitsReduce => "logits_reduce",
         }
     }
 }
@@ -338,6 +346,38 @@ impl fmt::Display for MoeExpertsConfig {
     }
 }
 
+/// Residual add fused with RMSNorm (ABI v2.1) over rows of `dim` elements.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AddRmsnormConfig {
+    pub dtype: DType,
+    pub dim: u32,
+}
+
+impl fmt::Display for AddRmsnormConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "dim={} dtype={}", self.dim, self.dtype.as_str())
+    }
+}
+
+/// Per-row reduction of F32 logits rows of `vocab` values to their log-sum-exp, their `top_n`
+/// (at most 64) largest values and, per row on request, one categorical draw (ABI v2.1).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct LogitsReduceConfig {
+    pub vocab: u32,
+    pub top_n: u32,
+}
+
+impl LogitsReduceConfig {
+    /// The largest `top_n` any provider must accept (the ABI bound).
+    pub const MAX_TOP_N: u32 = 64;
+}
+
+impl fmt::Display for LogitsReduceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "vocab={} top_n={}", self.vocab, self.top_n)
+    }
+}
+
 // --------------------------------------------------------------------------------- contexts
 
 /// `a`: `[m, k]`; `b`: `[n, k]` when `trans_b`, else `[k, n]`; `c`: `[m, n]`. Row strides are
@@ -491,6 +531,44 @@ pub struct ElementwiseContext<'a> {
     pub out: TensorView<'a>,
 }
 
+/// `residual = round(residual + x)` in place (rounded to the residual's dtype), then
+/// `out = rmsnorm(residual) · weight` — numerically `add` followed by `rmsnorm` on the rounded sum.
+/// `residual`/`x`/`out`: `[rows, dim]` (rows may be strided); `weight`: `[dim]`.
+pub struct AddRmsnormContext<'a> {
+    pub residual: TensorView<'a>,
+    pub x: TensorView<'a>,
+    pub weight: TensorView<'a>,
+    pub out: TensorView<'a>,
+    pub eps: f32,
+}
+
+/// Reduces the first `rows` rows of `logits` (every view may hold more rows, e.g. buffers sized
+/// for the largest batch). Per row `r`:
+///
+/// - `lse[r]`: log-sum-exp of the raw logits, NaN ignored;
+/// - `top_ids[r]`/`top_values[r]`: the `top_n` largest raw logits and their ids, descending, ties
+///   to the lower id, NaN last;
+/// - `mode[r]` = 1: `sampled[r]` is the smallest id whose cumulative sum of
+///   `exp(logit / temperature[r] − max)` in id order exceeds `uniform[r] · total` (the argmax when
+///   `temperature[r]` ≤ 0 or no logit is finite) and `sampled_logit[r]` its raw logit; `mode[r]` =
+///   0: `sampled[r]` = −1 and `sampled_logit[r]` = NaN.
+///
+/// Views: `logits` `[≥ rows, vocab]` F32 (row-strided); `temperature`, `uniform`, `lse`,
+/// `sampled_logit` `[≥ rows]` F32; `mode`, `sampled` `[≥ rows]` I32; `top_ids` I32 and
+/// `top_values` F32 `[≥ rows, top_n]`. All but `logits` are dense.
+pub struct LogitsReduceContext<'a> {
+    pub logits: TensorView<'a>,
+    pub temperature: TensorView<'a>,
+    pub uniform: TensorView<'a>,
+    pub mode: TensorView<'a>,
+    pub top_ids: TensorView<'a>,
+    pub top_values: TensorView<'a>,
+    pub lse: TensorView<'a>,
+    pub sampled: TensorView<'a>,
+    pub sampled_logit: TensorView<'a>,
+    pub rows: u32,
+}
+
 // ----------------------------------------------------------------------------------- traits
 // `supports` and `implementation` depend on the config only and are called at startup by the
 // registry; `execute` enqueues the op on the provider's compute stream.
@@ -562,8 +640,24 @@ pub trait MoeKernel: Send + Sync {
     fn experts(&self, ctx: &mut MoeExpertsContext<'_>) -> Result<(), KernelError>;
 }
 
+/// Residual add fused with RMSNorm (ABI v2.1).
+pub trait AddRmsnormKernel: Send + Sync {
+    fn supports(&self, cfg: &AddRmsnormConfig) -> bool;
+    fn implementation(&self, cfg: &AddRmsnormConfig) -> String;
+    fn execute(&self, ctx: &mut AddRmsnormContext<'_>) -> Result<(), KernelError>;
+}
+
+/// Device-side logits reduction (ABI v2.1).
+pub trait LogitsReduceKernel: Send + Sync {
+    fn supports(&self, cfg: &LogitsReduceConfig) -> bool;
+    fn implementation(&self, cfg: &LogitsReduceConfig) -> String;
+    fn execute(&self, ctx: &mut LogitsReduceContext<'_>) -> Result<(), KernelError>;
+}
+
 /// One implementation source (`cpu-reference`, a loaded shim library). A family the provider
-/// does not implement at all returns `None`; per-config support is `supports`.
+/// does not implement at all returns `None`; per-config support is `supports`. The ABI v2.1
+/// families default to `None`, so a provider (or a shim library) without them is a fallback, not
+/// an error.
 pub trait KernelProvider: Send + Sync {
     fn id(&self) -> ProviderId;
     fn gemm(&self) -> Option<&dyn GemmKernel>;
@@ -575,6 +669,12 @@ pub trait KernelProvider: Send + Sync {
     fn elementwise(&self) -> Option<&dyn ElementwiseKernel>;
     fn kv_copy(&self) -> Option<&dyn KvCopyKernel>;
     fn moe(&self) -> Option<&dyn MoeKernel>;
+    fn add_rmsnorm(&self) -> Option<&dyn AddRmsnormKernel> {
+        None
+    }
+    fn logits_reduce(&self) -> Option<&dyn LogitsReduceKernel> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -599,7 +699,9 @@ mod tests {
                 "attention_decode_paged",
                 "copy_blocks",
                 "moe_route",
-                "moe_experts"
+                "moe_experts",
+                "add_rmsnorm",
+                "logits_reduce"
             ]
         );
         assert_eq!(OpKind::SiluMul.to_string(), "silu_mul");
@@ -714,6 +816,22 @@ mod tests {
         assert_eq!(
             ElementwiseConfig { dtype: DType::F32 }.to_string(),
             "dtype=f32"
+        );
+        assert_eq!(
+            AddRmsnormConfig {
+                dtype: DType::BF16,
+                dim: 3072
+            }
+            .to_string(),
+            "dim=3072 dtype=bf16"
+        );
+        assert_eq!(
+            LogitsReduceConfig {
+                vocab: 128_256,
+                top_n: 20
+            }
+            .to_string(),
+            "vocab=128256 top_n=20"
         );
     }
 }
