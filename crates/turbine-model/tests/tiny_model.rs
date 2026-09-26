@@ -14,21 +14,22 @@ use turbine_kernels::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, ElementwiseConfig,
     ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext, EmbeddingKernel,
-    GemmConfig, GemmContext, GemmKernel, KernelError, KernelMetrics, KernelProvider,
+    GemmConfig, GemmContext, GemmKernel, GraphHandle, KernelError, KernelMetrics, KernelProvider,
     KernelRegistry, KvCopyConfig, KvCopyContext, KvCopyKernel, MoeExpertsConfig, MoeExpertsContext,
     MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel,
-    PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel, cpu_reference_provider,
-    shim_provider,
+    PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel, ShimContext,
+    cpu_reference_provider, shim_provider,
 };
 use turbine_model::config::{Architecture, ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
-    self, BatchInput, ExecutorOptions, LlamaExecutor, Logits, LogitsSlot, ModelExecutor,
-    OlmoeExecutor, OpProfile, ReducedRow, RowReduce, SeqSlice, SequenceKv, TraceTensor,
-    build_executor,
+    self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, LlamaExecutor, Logits,
+    LogitsSlot, ModelExecutor, OlmoeExecutor, OpProfile, ReducedRow, RowReduce, SeqSlice,
+    SequenceKv, TraceTensor, build_executor, graphs,
 };
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
+    write_tiny_olmoe_with_head_dim,
 };
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::{
@@ -1901,14 +1902,8 @@ fn paged_matches_contiguous() {
 /// for f32 accumulation order and is ~1000× below the error one numerics-model mismatch caused.
 const HIP_MAX_ABS_LOGIT_DIFF: f32 = 1e-4;
 
-/// Lab only (Task 21): HIP provider logits on the head_dim-128 tiny checkpoint match the CPU
-/// provider within [`HIP_MAX_ABS_LOGIT_DIFF`] and 32 greedy tokens are identical.
-#[test]
-#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
-fn hip_matches_cpu() {
-    if !turbine_kernels::test_support::require_backend("hip") {
-        return;
-    }
+/// A context on the first AMD device through the library `TURBINE_KERNEL_LIBRARY` names.
+fn hip_context() -> Arc<ShimContext> {
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
@@ -1921,13 +1916,37 @@ fn hip_matches_cpu() {
         .iter()
         .find(|d| d.vendor == Vendor::Amd)
         .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    lib.create_context(device).expect("HIP context")
+}
+
+/// Decode graphs on `ctx` for an executor of up to `max_seqs` sequences.
+fn hip_graphs(ctx: &Arc<ShimContext>, max_seqs: u32) -> DecodeGraphs {
+    assert!(
+        ctx.library().supports_graphs(),
+        "the HIP kernel library exports the ABI v2.1 graph functions"
+    );
+    let backend: Arc<dyn GraphBackend<Graph = GraphHandle>> = Arc::<ShimContext>::clone(ctx);
+    DecodeGraphs::new(backend, graphs::capacity_for(max_seqs))
+}
+
+/// Lab only (Task 21): HIP provider logits on the head_dim-128 tiny checkpoint match the CPU
+/// provider within [`HIP_MAX_ABS_LOGIT_DIFF`] and 32 greedy tokens are identical. The HIP
+/// executor runs with decode graphs on (P2c S-10), so the decode steps after the second replay
+/// a captured graph.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_matches_cpu() {
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let ctx = hip_context();
 
     let tmp = TempDir::new("tiny-model-hip");
     let spec = write_gpu_tiny(tmp.path());
     let mut cpu = cpu_executor(&spec);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
-    let mut hip = executor(&spec, shim_provider(ctx), mem);
+    let mut hip = executor(&spec, shim_provider(ctx.clone()), mem);
+    hip.set_decode_graphs(Some(hip_graphs(&ctx, MAX_SEQS)));
 
     let mut tokens = prompt(spec.vocab);
     let mut cpu_row = forward(&mut cpu, &tokens, 0).row(0).to_vec();
@@ -1947,7 +1966,186 @@ fn hip_matches_cpu() {
         cpu_row = forward(&mut cpu, &[c], pos).row(0).to_vec();
         hip_row = forward(&mut hip, &[c], pos).row(0).to_vec();
     }
-    println!("hip_matches_cpu: max abs logit diff over 32 steps {worst}");
+    let graphs = hip.graph_counters();
+    assert!(
+        graphs.replayed > 0 && graphs.capture_failed == 0,
+        "decode graphs were used: {graphs:?}"
+    );
+    println!("hip_matches_cpu: max abs logit diff over 32 steps {worst}; graphs {graphs:?}");
+}
+
+/// Decode steps of [`hip_decode_graph_matches_eager`] per batch.
+const GRAPH_DECODE_STEPS: u32 = 40;
+
+/// A tiny checkpoint's executor on the HIP provider for batches of up to 16 sequences of 128
+/// tokens over KV blocks of `block_tokens`, reducing logits rows on the device when asked.
+fn hip_graph_executor(
+    spec: &TinySpec,
+    ctx: &Arc<ShimContext>,
+    block_tokens: u32,
+) -> Box<dyn ModelExecutor> {
+    let cfg = &spec.config;
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let provider = shim_provider(ctx.clone());
+    let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+    let slots = match cfg.architecture {
+        Architecture::Llama => llama_slots(cfg),
+        Architecture::Olmoe => olmoe_slots(cfg),
+        other => panic!("no tiny checkpoint for {other:?}"),
+    };
+    let weights = WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("load");
+    let opts = ExecutorOptions::default();
+    let mut reqs =
+        executor::available_requirements(cfg, block_tokens, opts, std::slice::from_ref(&provider));
+    reqs.push(executor::logits::reduce_requirement(cfg));
+    let order = [provider.id()];
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+        .expect("every op has a provider");
+    build_executor(
+        cfg,
+        weights,
+        Arc::new(registry),
+        mem,
+        block_tokens,
+        128,
+        16,
+        opts,
+    )
+    .expect("executor")
+}
+
+/// `seqs` sequences prefilled one by one (prompts of 100 to 119 tokens), then
+/// [`GRAPH_DECODE_STEPS`] decode steps of all of them together, each sequence's blocks
+/// scattered through the pool; even steps reduce every row on the device (a draw at
+/// temperature 0.7, half the rows with a top-p nucleus), odd steps return full rows. Returns
+/// every decode step's logits.
+fn graph_decode_run(
+    exec: &mut dyn ModelExecutor,
+    kv: &KvPoolView<'_>,
+    vocab: u32,
+    seqs: usize,
+) -> Vec<Logits> {
+    let bt = kv.layout.block_tokens;
+    let prompt_len = |s: usize| 100 + (s as u32 * 7) % 20;
+    let per_seq = (119 + GRAPH_DECODE_STEPS).div_ceil(bt);
+    // Sequence s owns blocks s, s + seqs, s + 2·seqs, … (interleaved), in reverse order.
+    let tables: Vec<Vec<BlockId>> = (0..seqs)
+        .map(|s| {
+            (0..per_seq)
+                .rev()
+                .map(|j| BlockId(s as u32 + j * seqs as u32))
+                .collect()
+        })
+        .collect();
+    let token = |s: usize, p: u32| (p * 31 + 7 * s as u32 + 1) % vocab;
+    for (s, table) in tables.iter().enumerate() {
+        let len = prompt_len(s);
+        let tokens: Vec<u32> = (0..len).map(|p| token(s, p)).collect();
+        let positions: Vec<u32> = (0..len).collect();
+        let slice = [SeqSlice {
+            seq: SeqId(s as u64 + 1),
+            q_start: 0,
+            q_len: len,
+            kv_len: len,
+            block_table: table,
+            reduce: None,
+        }];
+        exec.forward(&BatchInput {
+            tokens: &tokens,
+            positions: &positions,
+            seqs: &slice,
+            kv,
+        })
+        .expect("prefill");
+    }
+    let mut out = Vec::new();
+    for step in 0..GRAPH_DECODE_STEPS {
+        let positions: Vec<u32> = (0..seqs).map(|s| prompt_len(s) + step).collect();
+        let tokens: Vec<u32> = (0..seqs).map(|s| token(s, positions[s])).collect();
+        let slices: Vec<SeqSlice<'_>> = (0..seqs)
+            .map(|s| SeqSlice {
+                seq: SeqId(s as u64 + 1),
+                q_start: s as u32,
+                q_len: 1,
+                kv_len: positions[s] + 1,
+                block_table: &tables[s],
+                reduce: (step % 2 == 0).then_some(RowReduce {
+                    top_n: 5,
+                    temperature: 0.7,
+                    uniform: Some(0.1 + 0.05 * s as f32),
+                    top_p: if s % 2 == 0 { 1.0 } else { 0.9 },
+                }),
+            })
+            .collect();
+        out.push(
+            exec.forward(&BatchInput {
+                tokens: &tokens,
+                positions: &positions,
+                seqs: &slices,
+                kv,
+            })
+            .expect("decode"),
+        );
+    }
+    out
+}
+
+/// Lab only (P2c S-10): on the head_dim-128 tiny Llama and OLMoE over KV blocks of 16 (the
+/// Turbine paged kernel) and 128 tokens (CK), 40 decode steps of batches of 1, 5 and 16
+/// sequences whose block tables grow across block boundaries give bitwise the logits (full
+/// rows and device reductions) with decode graphs on as with every op launched eagerly, and
+/// the graphs are replayed. Breaks if a replay reads stale metadata (tokens, positions,
+/// `kv_lens`, block tables, reduction inputs) or a graph is never used.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_decode_graph_matches_eager() {
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let ctx = hip_context();
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let tmp = TempDir::new("tiny-model-hip-graphs");
+    let opts = TinyOptions {
+        head_dim: GPU_HEAD_DIM,
+        ..TinyOptions::default()
+    };
+    let specs = [
+        write_tiny_llama_with(&tmp.path().join("llama"), SEED, &opts),
+        write_tiny_olmoe_with_head_dim(&tmp.path().join("olmoe"), SEED, GPU_HEAD_DIM),
+    ];
+    for spec in &specs {
+        for block_tokens in [16, 128] {
+            let arch = spec.config.architecture;
+            let mut exec = hip_graph_executor(spec, &ctx, block_tokens);
+            assert!(exec.reduces_logits(), "{arch:?}");
+            let layout = *exec.kv_layout();
+            for seqs in [1usize, 5, 16] {
+                let blocks = seqs as u32 * (119 + GRAPH_DECODE_STEPS).div_ceil(block_tokens);
+                let storage = pool(&mem, &layout, blocks);
+                let kv = pool_view(&storage, &layout, blocks);
+                exec.set_decode_graphs(None);
+                let eager = graph_decode_run(exec.as_mut(), &kv, spec.vocab, seqs);
+                exec.set_decode_graphs(Some(hip_graphs(&ctx, 16)));
+                let graphed = graph_decode_run(exec.as_mut(), &kv, spec.vocab, seqs);
+                for (step, (e, g)) in eager.iter().zip(&graphed).enumerate() {
+                    assert_eq!(
+                        e, g,
+                        "{arch:?} block_tokens {block_tokens} batch {seqs} step {step}"
+                    );
+                }
+                let c = exec.graph_counters();
+                assert!(
+                    c.replayed > 0 && c.captured > 0 && c.capture_failed == 0,
+                    "{arch:?} block_tokens {block_tokens} batch {seqs}: {c:?}"
+                );
+                println!(
+                    "hip_decode_graph_matches_eager: {arch:?} block_tokens {block_tokens} \
+                     batch {seqs}: {c:?}"
+                );
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------------ trace diagnostics

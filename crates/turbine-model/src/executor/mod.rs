@@ -14,6 +14,7 @@ use crate::config::{Architecture, ModelArchConfig};
 use crate::loader::LoadedWeights;
 
 pub mod batch;
+pub mod graphs;
 pub mod llama;
 pub mod logits;
 pub mod olmoe;
@@ -21,6 +22,7 @@ pub mod profile;
 pub mod rope;
 
 pub use batch::SequenceKv;
+pub use graphs::{DecodeGraphs, GraphBackend, GraphCache, GraphCounters, GraphKey, GraphStep};
 pub use llama::{LlamaExecutor, TraceTensor};
 pub use olmoe::OlmoeExecutor;
 pub use profile::{OpProfile, OpProfileEntry};
@@ -411,6 +413,16 @@ pub trait ModelExecutor: Send {
     /// Timings of the last successful `forward`; zeros when the executor does not measure.
     fn last_timings(&self) -> ForwardTimings {
         ForwardTimings::default()
+    }
+    /// Decode graphs (P2c S-10, [`graphs`]): with `Some`, decode-only iterations are captured
+    /// into graphs and replayed through them; `None` (the default) launches every op. An
+    /// executor that cannot run graphs ignores the call.
+    fn set_decode_graphs(&mut self, graphs: Option<DecodeGraphs>) {
+        let _ = graphs;
+    }
+    /// Decode graph outcomes since graphs were set; zeros without them.
+    fn graph_counters(&self) -> GraphCounters {
+        GraphCounters::default()
     }
     /// True when `forward` honours [`SeqSlice::reduce`] (a `logits_reduce` provider was
     /// selected at startup); otherwise every sequence gets its full row.

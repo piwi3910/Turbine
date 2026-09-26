@@ -273,6 +273,26 @@ impl HostBatch {
         Ok(packed)
     }
 
+    /// Re-lays the block table `pack` wrote for `p` out `width` (≥ `p.max_blocks_per_seq`)
+    /// columns wide, padding with block 0 (never read), and sets `p.max_kv_len` to
+    /// `max_kv_len` (≥ every sequence's `kv_len`): decode graph mode, whose launch shape must
+    /// not change while sequences grow ([`super::graphs::table_width`]). Attention reads
+    /// each sequence's own `kv_len` from the device, so the result is the same.
+    pub fn widen(&mut self, p: &mut Packed, width: u32, max_kv_len: u32) {
+        debug_assert!(width >= p.max_blocks_per_seq && max_kv_len >= p.max_kv_len);
+        let (old, new) = (p.max_blocks_per_seq as usize * I32, width as usize * I32);
+        if new != old {
+            let mut table = Vec::with_capacity(p.num_seqs * new);
+            for s in 0..p.num_seqs {
+                table.extend_from_slice(&self.block_table[s * old..(s + 1) * old]);
+                table.resize((s + 1) * new, 0);
+            }
+            self.block_table = table;
+        }
+        p.max_blocks_per_seq = width;
+        p.max_kv_len = max_kv_len;
+    }
+
     /// One sequence: it starts at `row`, its positions continue its cached prefix, and its
     /// block table covers `kv_len` tokens with blocks of the pool.
     fn check_seq(
@@ -666,6 +686,17 @@ mod tests {
         assert_eq!(
             i32s(&table.slice.read_bytes().expect("read")),
             [5, 2, 7, 0, 3, 0]
+        );
+
+        // Decode graph mode widens the table to 4 columns and the attention bound to 16.
+        let mut wide = packed.clone();
+        host.widen(&mut wide, 4, 16);
+        assert_eq!((wide.max_blocks_per_seq, wide.max_kv_len), (4, 16));
+        assert_eq!(i32s(&host.block_table), [5, 2, 7, 0, 0, 3, 0, 0]);
+        assert_eq!(
+            i32s(&host.kv_lens),
+            [10, 5],
+            "only the table and bounds change"
         );
     }
 

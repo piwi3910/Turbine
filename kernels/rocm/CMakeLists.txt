@@ -114,6 +114,7 @@ add_custom_command(
 set(TURBINE_SOURCES
   src/context.cpp
   src/memory.cpp
+  src/graph.cpp
   src/gemm.cpp
   src/attention.cpp
   src/rmsnorm.cpp

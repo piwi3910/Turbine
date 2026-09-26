@@ -117,6 +117,11 @@ struct Recording {
 }
 
 impl Profiler {
+    /// True while profiling (every op then synchronises the stream, so nothing may be captured).
+    pub(super) fn is_on(&self) -> bool {
+        self.state.borrow().is_some()
+    }
+
     /// Turns profiling on (keeping what was recorded if it already was) or off (dropping it).
     /// `reqs` are the executor's requirements, which `registry` was built from.
     pub(super) fn set(&self, on: bool, registry: &KernelRegistry, reqs: &[OpRequirement]) {

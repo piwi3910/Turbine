@@ -34,7 +34,9 @@ use turbine_core::clock::Clock;
 use turbine_core::request::{ErrorCode, FinishReason, GenerationEvent};
 use turbine_core::types::{RequestId, SeqId};
 use turbine_kv::{BlockPool, KvDocument};
-use turbine_model::executor::{BatchInput, Logits, LogitsSlot, ModelExecutor, RowReduce, SeqSlice};
+use turbine_model::executor::{
+    BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, RowReduce, SeqSlice,
+};
 use turbine_model::{ForwardPhase, SampleJob, SampledToken, Tokenizer, sample_rows};
 use turbine_scheduler::{
     BatchItem, BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome,
@@ -95,6 +97,9 @@ pub(crate) struct EngineLoop {
     idle_turn: bool,
     /// Times the current turn's stages.
     stages: StageClock,
+    /// The executor's decode graph counters at the last forward
+    /// (`turbine_decode_graph_total{outcome}` adds what changed since).
+    graph_counters: GraphCounters,
 }
 
 impl EngineLoop {
@@ -119,6 +124,7 @@ impl EngineLoop {
             shutting_down: false,
             idle_turn: false,
             stages: StageClock::start(),
+            graph_counters: GraphCounters::default(),
         };
         engine.publish(false);
         engine
@@ -555,6 +561,11 @@ impl EngineLoop {
             self.stages.add(Stage::Launch, t.launch);
             self.stages.add(Stage::DeviceWait, t.device_wait);
         }
+        let graphs = self.exec.graph_counters();
+        self.metrics
+            .server
+            .decode_graphs(&graphs.since(&self.graph_counters));
+        self.graph_counters = graphs;
         self.stages.mark(Stage::Prepare);
         self.metrics
             .model

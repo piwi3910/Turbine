@@ -35,6 +35,12 @@
 //! to 64 sequences) the forward makes no device-to-host copy until the logits, its only bulk
 //! device-to-host copy.
 //!
+//! Decode graphs (Phase 2c, [`super::graphs`]): as in the Llama executor, a decode-only
+//! iteration's ops are captured into a graph and replayed when
+//! [`ModelExecutor::set_decode_graphs`] turned them on, the provider needs no host expert
+//! offsets for the batch (the HIP small-m path: every decode batch of up to 64 sequences) and
+//! profiling is off.
+//!
 //! Diagnostics: [`OlmoeExecutor::set_profile`] times every op ([`OpProfile`]), the
 //! expert-offset read and the accumulator reset included; each goes through
 //! [`OlmoeExecutor::op`] or the profiler's transfer timer, one branch when profiling is off.
@@ -51,6 +57,7 @@ use turbine_kernels::{
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, Tensor, TensorView};
 
 use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
+use super::graphs::{self, DecodeGraphs, GraphCounters, PoolId};
 use super::llama::{
     ACT, ADD_CFG, add_norm_cfg, attention_cfg, gemm_cfg, invalid, limits, rope_cfg, take_matrix,
 };
@@ -212,6 +219,9 @@ struct Buffers {
 /// The OLMoE executor: ragged batches of up to `max_seqs` sequences and `max_batch_tokens`
 /// tokens over the paged KV pool, on one device.
 pub struct OlmoeExecutor {
+    /// Decode graphs, when on. First field: the graphs record pointers into the buffers below
+    /// and are destroyed before them.
+    graphs: Option<DecodeGraphs>,
     cfg: ModelArchConfig,
     moe: MoeConfig,
     dims: Dims,
@@ -469,6 +479,7 @@ impl OlmoeExecutor {
         let head = LogitsHead::new(cfg, &registry, &mem, n)?;
         let meta = DeviceBatch::alloc(&mem, &limits)?;
         Ok(OlmoeExecutor {
+            graphs: None,
             cfg: cfg.clone(),
             moe,
             dims: d,
@@ -763,6 +774,42 @@ impl OlmoeExecutor {
         }
         Ok(())
     }
+
+    /// Every op of a forward over the uploaded batch `p`, rows of the logits in `order`
+    /// ([`LogitsHead::plan`]): embedding, the layers, the final norm, the LM head and the
+    /// logits reduction. Without host expert offsets it makes no host copy or
+    /// synchronisation, so a decode graph can capture it.
+    fn enqueue(&self, p: &Packed, kv: &KvPoolView<'_>, order: &[usize]) -> Result<(), ModelError> {
+        let b = &self.bufs;
+        let d = &self.dims;
+        let (t, n) = (p.total_q, p.num_seqs);
+        let embedding = embedding_cfg(d);
+        self.op(OpConfig::Embedding(embedding), || {
+            self.registry
+                .embedding(&embedding)
+                .execute(&mut EmbeddingContext {
+                    ids: self.meta.ids_view(p),
+                    table: self.embed.view(),
+                    out: Self::rows(&b.x, t),
+                    vocab_offset: 0,
+                })
+        })?;
+        if let Some(first) = self.layers.first() {
+            self.rmsnorm(Self::rows(&b.x, t), &first.input_norm, Self::rows(&b.h, t))?;
+        }
+        for i in 0..self.layers.len() {
+            self.attention(i, p, kv)?;
+            self.moe_block(i, t)?;
+        }
+        self.final_norm_last_rows(p, order)?;
+        self.linear(
+            Self::rows(&b.last, n),
+            self.lm_head.view(),
+            self.head.rows(n),
+        )?;
+        self.head
+            .reduce(&self.registry, &self.profiler, self.mem.as_ref())
+    }
 }
 
 impl ModelExecutor for OlmoeExecutor {
@@ -775,58 +822,64 @@ impl ModelExecutor for OlmoeExecutor {
     }
 
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
+        let order = self.head.plan(batch.seqs).to_vec();
+        let experts = experts_cfg(&self.cfg, &self.moe);
+        let graph_top_n = self
+            .graphs
+            .as_ref()
+            .filter(|g| g.is_enabled() && !self.profiler.is_on())
+            // A provider reading the group sizes on the host copies them back mid-forward.
+            .filter(|_| {
+                !self
+                    .registry
+                    .moe_experts(&experts)
+                    .needs_host_offsets(&experts, experts.routed_rows(batch.tokens.len()))
+            })
+            .and_then(|_| self.head.graph_top_n());
         let (host, meta, limits) = (&mut self.host, &mut self.meta, &self.limits);
-        let p = self.profiler.step(
+        let (p, key) = self.profiler.step(
             self.mem.as_ref(),
             profile::BATCH_UPLOAD,
             profile::HOST,
             || {
-                let p = host.pack(batch, limits)?;
+                let mut p = host.pack(batch, limits)?;
+                let key =
+                    graph_top_n.and_then(|top_n| graphs::decode_key(&mut p, host, limits, top_n));
                 meta.upload(host)?;
-                Ok(p)
+                Ok((p, key))
             },
         )?;
+        self.head.upload_inputs()?;
         let launch_started = Instant::now();
-
-        let b = &self.bufs;
-        let d = &self.dims;
-        let (t, n) = (p.total_q, p.num_seqs);
-        let embedding = embedding_cfg(d);
-        self.op(OpConfig::Embedding(embedding), || {
-            self.registry
-                .embedding(&embedding)
-                .execute(&mut EmbeddingContext {
-                    ids: self.meta.ids_view(&p),
-                    table: self.embed.view(),
-                    out: Self::rows(&b.x, t),
-                    vocab_offset: 0,
-                })
-        })?;
-        if let Some(first) = self.layers.first() {
-            self.rmsnorm(Self::rows(&b.x, t), &first.input_norm, Self::rows(&b.h, t))?;
-        }
-        for i in 0..self.layers.len() {
-            self.attention(i, &p, batch.kv)?;
-            self.moe_block(i, t)?;
-        }
-        let order = self.head.plan(batch.seqs).to_vec();
-        self.final_norm_last_rows(&p, &order)?;
-        self.linear(
-            Self::rows(&b.last, n),
-            self.lm_head.view(),
-            self.head.rows(n),
-        )?;
+        let mut graphs = self.graphs.take();
+        let enqueued = match graphs.as_mut() {
+            Some(g) => g.run(key, PoolId::of(batch.kv), || {
+                self.enqueue(&p, batch.kv, &order)
+            }),
+            None => self.enqueue(&p, batch.kv, &order),
+        };
+        self.graphs = graphs;
+        enqueued?;
         let wait_started = Instant::now();
-        // The iteration's logits copy (it synchronizes the stream), after the device reduction
-        // of the rows that asked for one.
-        let logits = self
-            .head
-            .finish(&self.registry, &self.profiler, self.mem.as_ref())?;
+        // The iteration's one device-to-host copy (it synchronizes the stream), after the
+        // device reduction of the rows that asked for one.
+        let logits = self.head.read(&self.profiler, self.mem.as_ref())?;
         self.timings = ForwardTimings {
             launch: wait_started - launch_started,
             device_wait: wait_started.elapsed(),
         };
         Ok(logits)
+    }
+
+    fn set_decode_graphs(&mut self, graphs: Option<DecodeGraphs>) {
+        self.graphs = graphs;
+    }
+
+    fn graph_counters(&self) -> GraphCounters {
+        self.graphs
+            .as_ref()
+            .map(DecodeGraphs::counters)
+            .unwrap_or_default()
     }
 
     fn reduces_logits(&self) -> bool {

@@ -221,6 +221,10 @@ int32_t scratch(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
     return TURBINE_OK;
   }
   if (ctx->moe_scratch_bytes < bytes) {
+    if (ctx->capturing) {
+      return turbine_hip::refuse_while_capturing(
+          ctx, "turbine_moe_experts (growing the MoE scratch)");
+    }
     if (ctx->moe_scratch != nullptr) {
       if (int32_t rc = check_hip(ctx, hipStreamSynchronize(ctx->stream),
                                  "hipStreamSynchronize (MoE scratch)");

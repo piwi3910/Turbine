@@ -6,6 +6,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use turbine_core::request::Endpoint;
+use turbine_model::executor::GraphCounters;
 use turbine_observability::MetricsRegistry;
 
 use crate::engine::stages::{IterationStages, Stage};
@@ -67,6 +68,11 @@ pub struct LogitsPathLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct GraphOutcomeLabels {
+    pub outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct StageLabels {
     pub stage: &'static str,
 }
@@ -96,6 +102,9 @@ pub struct ServerMetrics {
     /// `turbine_logits_rows_total{path}`: logits rows reduced on the device
     /// (`device_reduced`) or copied whole to the host (`full_row`).
     pub logits_rows: Family<LogitsPathLabels, Counter>,
+    /// `turbine_decode_graph_total{outcome}`: decode graphs `captured`, `replayed`, `evicted`
+    /// and `capture_failed` (P2c S-10).
+    pub decode_graphs: Family<GraphOutcomeLabels, Counter>,
 }
 
 impl ServerMetrics {
@@ -144,6 +153,11 @@ impl ServerMetrics {
                 "Logits rows by path: reduced on the device or copied whole",
                 Family::default(),
             ),
+            decode_graphs: reg.register(
+                "turbine_decode_graph",
+                "Decode graphs captured, replayed, evicted and failed captures",
+                Family::default(),
+            ),
         }
     }
 
@@ -154,6 +168,22 @@ impl ServerMetrics {
                 self.logits_rows
                     .get_or_create(&LogitsPathLabels { path })
                     .inc_by(n as u64);
+            }
+        }
+    }
+
+    /// Adds the executor's decode graph outcomes since the last call (`delta`).
+    pub fn decode_graphs(&self, delta: &GraphCounters) {
+        for (outcome, n) in [
+            ("captured", delta.captured),
+            ("replayed", delta.replayed),
+            ("evicted", delta.evicted),
+            ("capture_failed", delta.capture_failed),
+        ] {
+            if n > 0 {
+                self.decode_graphs
+                    .get_or_create(&GraphOutcomeLabels { outcome })
+                    .inc_by(n);
             }
         }
     }
@@ -208,9 +238,22 @@ mod tests {
         m.observe_stages(&stages);
         m.logits_rows(3, 0);
         m.logits_rows(1, 2);
+        m.decode_graphs(&GraphCounters {
+            captured: 2,
+            replayed: 5,
+            evicted: 0,
+            capture_failed: 1,
+        });
+        m.decode_graphs(&GraphCounters {
+            replayed: 3,
+            ..GraphCounters::default()
+        });
         let text = reg.render().expect("render");
         for line in [
             r#"turbine_logits_rows_total{path="device_reduced"} 4"#,
+            r#"turbine_decode_graph_total{outcome="captured"} 2"#,
+            r#"turbine_decode_graph_total{outcome="replayed"} 8"#,
+            r#"turbine_decode_graph_total{outcome="capture_failed"} 1"#,
             r#"turbine_logits_rows_total{path="full_row"} 2"#,
             r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 1"#,
             r#"turbine_requests_total{endpoint="/v1/chat/completions",outcome="cancelled"} 1"#,

@@ -167,6 +167,12 @@ impl ShimLibrary {
         self.syms.v21.minor
     }
 
+    /// True when the library exports the ABI v2.1 graph functions (`turbine_graph_*`), so its
+    /// contexts can capture and replay graphs.
+    pub fn supports_graphs(&self) -> bool {
+        self.syms.v21.graph.is_some()
+    }
+
     /// The `KernelError::Unsupported` for a v2.1 function this library lacks.
     fn lacks(&self, what: &str) -> KernelError {
         KernelError::Unsupported {

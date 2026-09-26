@@ -207,12 +207,24 @@ pub fn write_tiny_llama_with(dir: &Path, seed: u64, opts: &TinyOptions) -> TinyS
 /// the tiny tokenizer and [`PLAIN_CHAT_TEMPLATE`] (OLMoE's template renders no tools). Same
 /// files and determinism as [`write_tiny_llama_with`].
 pub fn write_tiny_olmoe(dir: &Path, seed: u64) -> TinySpec {
+    write_tiny_olmoe_with_head_dim(dir, seed, 16)
+}
+
+/// [`write_tiny_olmoe`] with heads of dimension `head_dim` (an explicit `config.json`
+/// `head_dim` unless it is the derived 16; hidden stays 64): GPU executor tests use 128, the
+/// only head_dim the HIP attention supports.
+pub fn write_tiny_olmoe_with_head_dim(dir: &Path, seed: u64, head_dim: u32) -> TinySpec {
     let opts = TinyOptions {
         tied: false,
         template_with_tools: false,
+        head_dim,
         ..TinyOptions::default()
     };
-    write_tiny(dir, seed, &olmoe_config_json(), &opts)
+    let mut config = olmoe_config_json();
+    if head_dim != 16 {
+        config["head_dim"] = json!(head_dim);
+    }
+    write_tiny(dir, seed, &config, &opts)
 }
 
 fn write_tiny(

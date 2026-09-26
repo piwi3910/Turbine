@@ -20,7 +20,9 @@ use turbine_kernels::{
 };
 use turbine_kv::metrics::log_pool_startup;
 use turbine_kv::{BlockPool, BlockPoolConfig};
-use turbine_model::executor::{self, BatchInput, ExecutorOptions, ModelExecutor, SeqSlice};
+use turbine_model::executor::{
+    self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, ModelExecutor, SeqSlice, graphs,
+};
 use turbine_model::loader::LoadedWeights;
 use turbine_model::{
     Architecture, BudgetTerms, ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES,
@@ -141,6 +143,9 @@ pub struct Provider {
     pub providers: Vec<Arc<dyn KernelProvider>>,
     pub order: Vec<ProviderId>,
     pub memory_kind: MemoryKind,
+    /// The context decode graphs capture on: `Some` on a backend whose kernel library exports
+    /// the ABI v2.1 graph functions.
+    pub graphs: Option<Arc<ShimContext>>,
 }
 
 /// Step 4: load the kernel provider. `hip`: the first loadable library of
@@ -174,6 +179,7 @@ pub fn load_provider(
                 providers: vec![cpu_reference_provider()],
                 order: vec![ProviderId("cpu-reference")],
                 memory_kind: MemoryKind::Dedicated,
+                graphs: None,
             })
         }
         ExecutionBackend::Hip => {
@@ -194,11 +200,13 @@ pub fn load_provider(
             );
             let provider = shim_provider(Arc::clone(&ctx));
             let id = provider.id();
+            let graphs = lib.supports_graphs().then(|| Arc::clone(&ctx));
             Ok(Provider {
                 mem: ctx,
                 providers: vec![provider],
                 order: vec![id],
                 memory_kind: device.memory.kind,
+                graphs,
             })
         }
         other => Err(StartupError::new(format!(
@@ -270,6 +278,8 @@ pub struct PreparedModel {
     pub scheduler: SchedulerParams,
     /// The executor's op sequence (`execution.fused_ops`).
     pub executor_options: ExecutorOptions,
+    /// `execution.decode_graphs`, and the provider can capture graphs.
+    pub decode_graphs: bool,
     /// Compiles `response_format` and tool grammars; its token trie is built once, here.
     pub grammar: Arc<GrammarCompiler>,
     /// `structured_output` bounds on those grammars.
@@ -361,6 +371,16 @@ pub fn prepare(
         );
     }
 
+    let decode_graphs = config.execution.decode_graphs && provider.graphs.is_some();
+    if config.execution.decode_graphs && !decode_graphs {
+        tracing::warn!(
+            event = "decode_graphs_unavailable",
+            backend = config.execution.backend.as_str(),
+            "execution.decode_graphs is on but the kernel provider cannot capture graphs \
+             (kernel ABI v2.1 graph functions); decode iterations run eagerly"
+        );
+    }
+
     let scheduler = SchedulerParams::from_config(config, max_seq_len);
     let device_free = provider
         .mem
@@ -440,6 +460,7 @@ pub fn prepare(
         pool,
         scheduler,
         executor_options,
+        decode_graphs,
         grammar,
         structured_output: config.structured_output.clone(),
         tool_call_parser,
@@ -569,6 +590,17 @@ pub fn load(
         prepared.executor_options,
     )
     .map_err(|e| model_error("executor", e))?;
+    if let Some(ctx) = prepared
+        .provider
+        .graphs
+        .as_ref()
+        .filter(|_| prepared.decode_graphs)
+    {
+        let backend: Arc<dyn GraphBackend<Graph = _>> = Arc::<ShimContext>::clone(ctx);
+        let capacity = graphs::capacity_for(prepared.scheduler.max_running_requests);
+        executor.set_decode_graphs(Some(DecodeGraphs::new(backend, capacity)));
+        tracing::info!(event = "decode_graphs", capacity, "decode graphs on");
+    }
     let mut pool = BlockPool::new(prepared.pool, Arc::clone(mem))
         .map_err(|e| StartupError::new(format!("KV block pool: {e}")))?;
     log_pool_startup(&pool);

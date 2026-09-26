@@ -165,37 +165,59 @@ impl LogitsHead {
             .unwrap_or(1)
     }
 
-    /// Enqueues the reduction of the planned rows (when any) and makes the iteration's one
-    /// device-to-host copy (it synchronizes the stream): the full rows and the reductions. Both
-    /// go through `profiler` (`logits_reduce`, then [`profile::LOGITS_READ`]) on `mem`.
-    pub fn finish(
-        &mut self,
+    /// The reduction's candidates per row when the planned batch can run as a decode graph
+    /// ([`super::graphs::GraphKey::reduce_top_n`]): 0 when no row is reduced, the batch's
+    /// candidate count when every row is; `None` for a batch mixing both (its final norm runs
+    /// in several pieces, so it runs eagerly).
+    pub fn graph_top_n(&self) -> Option<u8> {
+        match self.reduced {
+            0 => Some(0),
+            r if r == self.seqs => Some(self.batch_top_n() as u8),
+            _ => None,
+        }
+    }
+
+    /// Enqueues the upload of the planned rows' reduction inputs (when any row is reduced),
+    /// before the forward's ops: the reduction reads them from the same device buffer every
+    /// iteration, so a captured graph replays with this iteration's values.
+    pub fn upload_inputs(&mut self) -> Result<(), ModelError> {
+        if self.reduce.is_none() || self.reduced == 0 {
+            return Ok(());
+        }
+        self.host_inputs.clear();
+        for q in &self.requests {
+            self.host_inputs
+                .extend_from_slice(&q.temperature.to_le_bytes());
+        }
+        for q in &self.requests {
+            let u = q.uniform.unwrap_or(0.0);
+            self.host_inputs.extend_from_slice(&u.to_le_bytes());
+        }
+        for q in &self.requests {
+            let top_p = if q.uniform.is_some() { q.top_p } else { 1.0 };
+            self.host_inputs.extend_from_slice(&top_p.to_le_bytes());
+        }
+        for q in &self.requests {
+            let mode = i32::from(q.uniform.is_some());
+            self.host_inputs.extend_from_slice(&mode.to_le_bytes());
+        }
+        self.inputs.copy_from_host(0, &self.host_inputs)?;
+        Ok(())
+    }
+
+    /// Enqueues the reduction of the planned rows (when any), after the LM head, through
+    /// `profiler` (`logits_reduce`) on `mem`; its inputs were uploaded by
+    /// [`LogitsHead::upload_inputs`].
+    pub fn reduce(
+        &self,
         registry: &KernelRegistry,
         profiler: &Profiler,
         mem: &dyn DeviceMemory,
-    ) -> Result<Logits, ModelError> {
+    ) -> Result<(), ModelError> {
         let (n, r, vocab) = (self.seqs, self.reduced, self.vocab);
         let top_n = self.batch_top_n();
         let base = n * vocab;
         if let (Some(cfg), true) = (self.reduce, r > 0) {
-            self.host_inputs.clear();
-            for q in &self.requests {
-                self.host_inputs
-                    .extend_from_slice(&q.temperature.to_le_bytes());
-            }
-            for q in &self.requests {
-                let u = q.uniform.unwrap_or(0.0);
-                self.host_inputs.extend_from_slice(&u.to_le_bytes());
-            }
-            for q in &self.requests {
-                let top_p = if q.uniform.is_some() { q.top_p } else { 1.0 };
-                self.host_inputs.extend_from_slice(&top_p.to_le_bytes());
-            }
-            for q in &self.requests {
-                let mode = i32::from(q.uniform.is_some());
-                self.host_inputs.extend_from_slice(&mode.to_le_bytes());
-            }
-            self.inputs.copy_from_host(0, &self.host_inputs)?;
             let (inp, out) = (self.inputs.whole(), self.out.whole());
             let rows_f32 = |off: usize| TensorView::contiguous(inp, off, &[r], DType::F32);
             let block = |off: usize, shape: &[usize], dtype| {
@@ -220,6 +242,16 @@ impl LogitsHead {
                     .map_err(ModelError::from)
             })?;
         }
+        Ok(())
+    }
+
+    /// The iteration's one device-to-host copy (it synchronizes the stream), after
+    /// [`LogitsHead::reduce`]: the full rows and the reductions, timed through `profiler`
+    /// ([`profile::LOGITS_READ`]) on `mem`.
+    pub fn read(&self, profiler: &Profiler, mem: &dyn DeviceMemory) -> Result<Logits, ModelError> {
+        let (n, r, vocab) = (self.seqs, self.reduced, self.vocab);
+        let top_n = self.batch_top_n();
+        let base = n * vocab;
         let result = if r > 0 { r * result_words(top_n) } else { 0 };
         let start = r * vocab;
         let full = (n - r) * vocab;

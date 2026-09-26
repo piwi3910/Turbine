@@ -77,6 +77,7 @@ void log_banner() {
 
 // Releases whatever a (possibly partially built) context holds.
 void release(turbine_ctx *ctx) {
+  turbine_hip::abandon_capture(ctx);
   if (ctx->stream != nullptr)
     (void)hipStreamSynchronize(ctx->stream);
   if (ctx->blaslt != nullptr)
@@ -168,9 +169,9 @@ extern "C" {
 
 uint32_t turbine_abi_version(void) { return TURBINE_ABI_VERSION; }
 
-// ABI v2.1: this library exports the optional add_rmsnorm trio (rmsnorm.cpp)
-// and logits_reduce (logits_reduce.hip); the other v2.1 groups (options,
-// graphs) are resolved only where their symbols exist.
+// ABI v2.1: this library exports the optional add_rmsnorm trio (rmsnorm.cpp),
+// logits_reduce (logits_reduce.hip) and the graph functions (graph.cpp); the
+// other v2.1 group (options) is resolved only where its symbols exist.
 uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
 
 const char *turbine_backend_name(void) { return "hip"; }

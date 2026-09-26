@@ -4,7 +4,8 @@
 // GEMM workspace, the attention seqstart scratch and the MoE scratch;
 // turbine_ctx_destroy releases all of them after draining the stream. Device
 // pointers passed in descriptors belong to the caller and are never retained
-// beyond the call.
+// beyond the call, except by a captured graph (graph.cpp), which records the
+// pointers of its ops until turbine_graph_destroy.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -54,6 +55,9 @@ struct turbine_ctx {
   // hipBLASLt returned a grouped-GEMM solution for this device at creation.
   bool moe_grouped = false;
   std::map<turbine_hip::GemmKey, hipblasLtMatmulAlgo_t> gemm_algos;
+  // True between turbine_graph_begin and turbine_graph_end (graph.cpp): the
+  // stream is being captured, so copies, syncs and allocations are refused.
+  bool capturing = false;
   std::mutex error_mutex;
   std::string last_error;
 };
@@ -74,6 +78,14 @@ int32_t check_blaslt(turbine_ctx *ctx, hipblasStatus_t status,
 
 // Makes ctx's device current on the calling thread.
 int32_t enter(turbine_ctx *ctx);
+
+// Records that `what` is not allowed while ctx->capturing and returns
+// TURBINE_E_ARGUMENT (graph.cpp).
+int32_t refuse_while_capturing(turbine_ctx *ctx, const char *what);
+
+// Ends and discards a capture in progress on ctx (no-op otherwise), e.g. before
+// the context is destroyed (graph.cpp).
+void abandon_capture(turbine_ctx *ctx);
 
 // hipGetErrorName-style name of a hipBLAS status.
 const char *blaslt_status_name(hipblasStatus_t status);
