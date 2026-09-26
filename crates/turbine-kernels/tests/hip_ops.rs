@@ -1,23 +1,26 @@
-//! Lab only (novanas R9700, P1 AC S-7/S-13): every op the Llama executor uses, run through
-//! `libturbine_hip.so` via the Rust shim bindings, matches the `cpu-reference` provider on seeded
-//! random inputs at the Llama-3.2-3B shapes. Run by `scripts/lab-test.sh novanas`, which sets
-//! `TURBINE_TEST_BACKEND=hip`, `TURBINE_KERNEL_LIBRARY` and `TURBINE_AMD_SMI_LIBRARY`.
+//! Lab only (novanas R9700, P1 AC S-7/S-13, P2 S-5/S-16): every op the Llama and OLMoE
+//! executors use, run through `libturbine_hip.so` via the Rust shim bindings, matches the
+//! `cpu-reference` provider on seeded random inputs at the Llama-3.2-3B and OLMoE-1B-7B shapes.
+//! Run by `scripts/lab-test.sh novanas`, which sets `TURBINE_TEST_BACKEND=hip`,
+//! `TURBINE_KERNEL_LIBRARY` and `TURBINE_AMD_SMI_LIBRARY`.
 //!
 //! Tolerance: BF16 outputs |Δ| ≤ 1e-2, or one BF16 ulp of the reference where its magnitude
-//! exceeds 2 (a rounding flip after a different f32 summation order); F32 outputs |Δ| ≤ 1e-4.
+//! exceeds 2 (a rounding flip after a different f32 summation order); F32 outputs |Δ| ≤ 1e-4;
+//! copies (the paged K/V append, `copy_blocks`) and `moe_route` selections are exact.
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use half::bf16;
 use turbine_core::config::DevicesConfig;
-use turbine_core::types::{DType, DeviceId, ExecutionBackend, Vendor};
+use turbine_core::types::{BlockId, DType, DeviceId, ExecutionBackend, Vendor};
 use turbine_device::{DiscoveryOptions, discover};
 use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, AttentionConfig, AttentionContext, AttentionKind,
     ElementwiseConfig, ElementwiseContext, EmbeddingConfig, EmbeddingContext, GemmConfig,
-    GemmContext, KernelProvider, NormConfig, NormContext, RopeConfig, RopeContext, ShimLibrary,
-    cpu_reference_provider, shim_provider,
+    GemmContext, KernelProvider, KvCopyConfig, KvCopyContext, MoeExpertsConfig, MoeExpertsContext,
+    MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, PagedAttentionContext, RopeConfig,
+    RopeContext, ShimLibrary, cpu_reference_provider, shim_provider,
 };
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceMemory, Tensor};
@@ -30,6 +33,12 @@ const KV_HEADS: usize = 8;
 const HEAD_DIM: usize = 128;
 const VOCAB: usize = 128256;
 const ROPE_THETA: f64 = 500_000.0;
+
+// OLMoE-1B-7B shapes.
+const MOE_HIDDEN: usize = 2048;
+const MOE_INTER: usize = 1024;
+const MOE_EXPERTS: usize = 64;
+const MOE_TOP_K: usize = 8;
 
 /// The HIP provider and the CPU reference, each with the memory its tensors live in.
 struct Pair {
@@ -123,6 +132,10 @@ fn encode(dtype: DType, v: &[f32]) -> Vec<u8> {
 
 fn decode(dtype: DType, b: &[u8]) -> Vec<f32> {
     match dtype {
+        DType::I32 => b
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+            .collect(),
         DType::BF16 => b
             .chunks_exact(2)
             .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
@@ -538,4 +551,492 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     }
     let what = format!("add n={n} {cfg}");
     assert_close(&what, &impl_name, &read(&o_hip), &read(&o_cpu), DType::BF16);
+}
+
+/// `0..n` in a seeded random order (Fisher–Yates).
+fn shuffled(rng: &mut Rng, n: usize) -> Vec<usize> {
+    let mut v: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+        v.swap(i, j);
+    }
+    v
+}
+
+/// Bit-for-bit equality (copies and integer outputs).
+fn assert_exact(what: &str, impl_name: &str, got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g.to_bits() == w.to_bits(),
+            "{what} ({impl_name}): element {i}: hip {g} vs cpu {w}"
+        );
+    }
+    println!("{what}: impl={impl_name} exact ok");
+}
+
+/// One ragged batch through `attention_{prefill,decode}_paged` on both providers: sequence `s`
+/// has `q_lens[s]` new tokens and `kv_lens[s]` tokens after the append, its pages spread over a
+/// shuffled block table of a pool with two blocks nobody owns. Compares the outputs and the pool
+/// after the append.
+fn paged_case(
+    p: &Pair,
+    rng: &mut Rng,
+    kind: AttentionKind,
+    block_tokens: usize,
+    q_lens: &[usize],
+    kv_lens: &[usize],
+) {
+    let cfg = AttentionConfig {
+        kind,
+        num_q_heads: Q_HEADS as u32,
+        num_kv_heads: KV_HEADS as u32,
+        head_dim: HEAD_DIM as u32,
+        dtype: DType::BF16,
+        block_tokens: Some(block_tokens as u32),
+        causal: true,
+    };
+    let hip = p.hip.attention().expect("hip attention");
+    assert!(hip.supports(&cfg), "hip must support {} {cfg}", cfg.op());
+    let impl_name = hip.implementation(&cfg);
+
+    let seqs = q_lens.len();
+    let blocks_of: Vec<usize> = kv_lens
+        .iter()
+        .map(|&kv| kv.div_ceil(block_tokens))
+        .collect();
+    let max_blocks = blocks_of.iter().copied().max().expect("a sequence");
+    let num_blocks = blocks_of.iter().sum::<usize>() + 2;
+    let order = shuffled(rng, num_blocks);
+    let mut table = vec![-1f32; seqs * max_blocks];
+    let mut next = 0;
+    for (s, &n) in blocks_of.iter().enumerate() {
+        for b in 0..n {
+            table[s * max_blocks + b] = order[next] as f32;
+            next += 1;
+        }
+    }
+    let mut indptr = vec![0f32];
+    for &q in q_lens {
+        indptr.push(indptr.last().copied().unwrap_or(0.0) + q as f32);
+    }
+    let kv: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
+    let total_q: usize = q_lens.iter().sum();
+    let (q_rows, kv_rows) = (Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
+    let pool_shape = [num_blocks, 2, block_tokens, KV_HEADS, HEAD_DIM];
+    let pool_len = num_blocks * 2 * block_tokens * kv_rows;
+
+    // The pool starts with random history in every slot, including the unowned blocks.
+    let (pool_hip, pool_cpu) = twin(p, &pool_shape, DType::BF16, &rng.normal(pool_len, 1.0));
+    let q_shape = [total_q, Q_HEADS, HEAD_DIM];
+    let new_shape = [total_q, KV_HEADS, HEAD_DIM];
+    let (q_hip, q_cpu) = twin(p, &q_shape, DType::BF16, &rng.normal(total_q * q_rows, 1.0));
+    let (k_hip, k_cpu) = twin(
+        p,
+        &new_shape,
+        DType::BF16,
+        &rng.normal(total_q * kv_rows, 1.0),
+    );
+    let (v_hip, v_cpu) = twin(
+        p,
+        &new_shape,
+        DType::BF16,
+        &rng.normal(total_q * kv_rows, 1.0),
+    );
+    let (o_hip, o_cpu) = twin(p, &q_shape, DType::BF16, &vec![0.0; total_q * q_rows]);
+    let (bt_hip, bt_cpu) = twin(p, &[seqs, max_blocks], DType::I32, &table);
+    let (ip_hip, ip_cpu) = twin(p, &[seqs + 1], DType::I32, &indptr);
+    let (kv_hip, kv_cpu) = twin(p, &[seqs], DType::I32, &kv);
+
+    let runs = [
+        (
+            hip,
+            [&q_hip, &k_hip, &v_hip, &o_hip, &pool_hip],
+            [&bt_hip, &ip_hip, &kv_hip],
+        ),
+        (
+            p.cpu.attention().expect("cpu attention"),
+            [&q_cpu, &k_cpu, &v_cpu, &o_cpu, &pool_cpu],
+            [&bt_cpu, &ip_cpu, &kv_cpu],
+        ),
+    ];
+    for (kernel, [q, k, v, o, pool], [bt, ip, kv]) in runs {
+        let mut ctx = PagedAttentionContext {
+            cfg,
+            q: q.view(),
+            k_new: k.view(),
+            v_new: v.view(),
+            out: o.view(),
+            kv_layer: pool.view(),
+            block_table: bt.view(),
+            q_indptr: ip.view(),
+            kv_lens: kv.view(),
+            max_q_len: q_lens.iter().copied().max().unwrap_or(0) as u32,
+            max_kv_len: kv_lens.iter().copied().max().unwrap_or(0) as u32,
+            max_blocks_per_seq: max_blocks as u32,
+            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+        };
+        kernel.execute_paged(&mut ctx).expect("paged attention");
+    }
+    let what = format!(
+        "{} block_tokens={block_tokens} q_lens={q_lens:?} kv_lens={kv_lens:?}",
+        cfg.op()
+    );
+    assert_close(
+        &format!("{what} out"),
+        &impl_name,
+        &read(&o_hip),
+        &read(&o_cpu),
+        DType::BF16,
+    );
+    assert_exact(
+        &format!("{what} pool after append"),
+        &impl_name,
+        &read(&pool_hip),
+        &read(&pool_cpu),
+    );
+}
+
+/// The CPU outputs of one `moe_route` call.
+struct Routing {
+    weights: Vec<f32>,
+    sorted_rows: Vec<f32>,
+    expert_offsets: Vec<f32>,
+}
+
+/// `moe_route` on both providers; the selections, grouping and offsets must be identical.
+fn route_case(p: &Pair, cfg: MoeRouteConfig, tokens: usize, logits: &[f32]) -> Routing {
+    let hip = p.hip.moe().expect("hip moe");
+    assert!(hip.supports_route(&cfg), "hip must support moe_route {cfg}");
+    let impl_name = hip.implementation_route(&cfg);
+    let (e, k) = (cfg.num_experts as usize, cfg.top_k as usize);
+    let (l_hip, l_cpu) = twin(p, &[tokens, e], DType::F32, logits);
+    let (id_hip, id_cpu) = twin(p, &[tokens, k], DType::I32, &vec![0.0; tokens * k]);
+    let (w_hip, w_cpu) = twin(p, &[tokens, k], DType::F32, &vec![0.0; tokens * k]);
+    let (s_hip, s_cpu) = twin(p, &[tokens * k], DType::I32, &vec![0.0; tokens * k]);
+    let (off_hip, off_cpu) = twin(p, &[e + 1], DType::I32, &vec![0.0; e + 1]);
+    let runs = [
+        (hip, [&l_hip, &id_hip, &w_hip, &s_hip, &off_hip]),
+        (
+            p.cpu.moe().expect("cpu moe"),
+            [&l_cpu, &id_cpu, &w_cpu, &s_cpu, &off_cpu],
+        ),
+    ];
+    for (kernel, [l, id, w, s, off]) in runs {
+        let mut ctx = MoeRouteContext {
+            cfg,
+            router_logits: l.view(),
+            topk_ids: id.view(),
+            topk_weights: w.view(),
+            sorted_rows: s.view(),
+            expert_offsets: off.view(),
+        };
+        kernel.route(&mut ctx).expect("moe_route");
+    }
+    let what = format!("moe_route tokens={tokens} {cfg}");
+    let routing = Routing {
+        weights: read(&w_cpu),
+        sorted_rows: read(&s_cpu),
+        expert_offsets: read(&off_cpu),
+    };
+    assert_exact(
+        &format!("{what} topk_ids"),
+        &impl_name,
+        &read(&id_hip),
+        &read(&id_cpu),
+    );
+    assert_exact(
+        &format!("{what} sorted_rows"),
+        &impl_name,
+        &read(&s_hip),
+        &routing.sorted_rows,
+    );
+    assert_exact(
+        &format!("{what} expert_offsets"),
+        &impl_name,
+        &read(&off_hip),
+        &routing.expert_offsets,
+    );
+    assert_close(
+        &format!("{what} topk_weights"),
+        &impl_name,
+        &read(&w_hip),
+        &routing.weights,
+        DType::F32,
+    );
+    routing
+}
+
+/// The OLMoE expert weights in both memories: gate/up `[E, inter, hidden]`, down
+/// `[E, hidden, inter]`.
+struct ExpertWeights {
+    hip: [Tensor; 3],
+    cpu: [Tensor; 3],
+}
+
+fn expert_weights(p: &Pair, rng: &mut Rng) -> ExpertWeights {
+    let n = MOE_EXPERTS * MOE_INTER * MOE_HIDDEN;
+    let up_scale = 1.0 / (MOE_HIDDEN as f32).sqrt();
+    let (g_hip, g_cpu) = twin(
+        p,
+        &[MOE_EXPERTS, MOE_INTER, MOE_HIDDEN],
+        DType::BF16,
+        &rng.normal(n, up_scale),
+    );
+    let (u_hip, u_cpu) = twin(
+        p,
+        &[MOE_EXPERTS, MOE_INTER, MOE_HIDDEN],
+        DType::BF16,
+        &rng.normal(n, up_scale),
+    );
+    let (d_hip, d_cpu) = twin(
+        p,
+        &[MOE_EXPERTS, MOE_HIDDEN, MOE_INTER],
+        DType::BF16,
+        &rng.normal(n, 1.0 / (MOE_INTER as f32).sqrt()),
+    );
+    ExpertWeights {
+        hip: [g_hip, u_hip, d_hip],
+        cpu: [g_cpu, u_cpu, d_cpu],
+    }
+}
+
+/// One `moe_experts` batch: `tokens` tokens routed by `logits` (on both providers, which must
+/// agree) over the local experts `local`; the HIP run uses a caller workspace when `workspace`.
+struct ExpertsCase<'a> {
+    tokens: usize,
+    logits: &'a [f32],
+    local: (usize, usize),
+    workspace: bool,
+}
+
+fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'_>) {
+    let (tokens, (begin, end)) = (case.tokens, case.local);
+    let route_cfg = MoeRouteConfig {
+        num_experts: MOE_EXPERTS as u32,
+        top_k: MOE_TOP_K as u32,
+        renormalize: false,
+    };
+    let routing = route_case(p, route_cfg, tokens, case.logits);
+    let host_offsets: Vec<i32> = routing.expert_offsets.iter().map(|&o| o as i32).collect();
+    let empty = (begin..end)
+        .filter(|&e| host_offsets[e] == host_offsets[e + 1])
+        .count();
+
+    let cfg = MoeExpertsConfig {
+        hidden: MOE_HIDDEN as u32,
+        inter: MOE_INTER as u32,
+        num_experts: MOE_EXPERTS as u32,
+        top_k: MOE_TOP_K as u32,
+        expert_begin: begin as u32,
+        expert_end: end as u32,
+        dtype: DType::BF16,
+    };
+    let hip = p.hip.moe().expect("hip moe");
+    assert!(
+        hip.supports_experts(&cfg),
+        "hip must support moe_experts {cfg}"
+    );
+    let impl_name = hip.implementation_experts(&cfg);
+    let rows = tokens * MOE_TOP_K;
+    let (x_hip, x_cpu) = twin(
+        p,
+        &[tokens, MOE_HIDDEN],
+        DType::BF16,
+        &rng.normal(tokens * MOE_HIDDEN, 1.0),
+    );
+    let (o_hip, o_cpu) = twin(
+        p,
+        &[tokens, MOE_HIDDEN],
+        DType::BF16,
+        &rng.normal(tokens * MOE_HIDDEN, 0.1),
+    );
+    let (s_hip, s_cpu) = twin(p, &[rows], DType::I32, &routing.sorted_rows);
+    let (off_hip, off_cpu) = twin(p, &[MOE_EXPERTS + 1], DType::I32, &routing.expert_offsets);
+    let (tw_hip, tw_cpu) = twin(p, &[tokens, MOE_TOP_K], DType::F32, &routing.weights);
+    // A generous caller workspace: row positions, gathered rows and the three intermediates.
+    let ws = case.workspace.then(|| {
+        let bytes = rows * 4 + rows * (2 * MOE_HIDDEN + 2 * MOE_INTER) * 2 + 4096;
+        Tensor::empty(&p.hip_mem, &[bytes.div_ceil(2)], DType::BF16).expect("workspace")
+    });
+    let local = end - begin;
+    let runs = [
+        (
+            hip,
+            &w.hip,
+            [&x_hip, &o_hip, &s_hip, &off_hip, &tw_hip],
+            ws.as_ref(),
+        ),
+        (
+            p.cpu.moe().expect("cpu moe"),
+            &w.cpu,
+            [&x_cpu, &o_cpu, &s_cpu, &off_cpu, &tw_cpu],
+            None,
+        ),
+    ];
+    for (kernel, [wg, wu, wd], [x, o, s, off, tw], ws) in runs {
+        let mut ctx = MoeExpertsContext {
+            cfg,
+            x: x.view(),
+            w_gate: wg.view().rows(begin, local),
+            w_up: wu.view().rows(begin, local),
+            w_down: wd.view().rows(begin, local),
+            sorted_rows: s.view(),
+            expert_offsets: off.view(),
+            topk_weights: tw.view(),
+            host_expert_offsets: &host_offsets,
+            out: o.view(),
+            workspace: ws.map(|t| t.view().slice),
+        };
+        kernel.experts(&mut ctx).expect("moe_experts");
+    }
+    assert_close(
+        &format!(
+            "moe_experts tokens={tokens} local=[{begin},{end}) empty_local_experts={empty} caller_workspace={} {cfg}",
+            case.workspace
+        ),
+        &impl_name,
+        &read(&o_hip),
+        &read(&o_cpu),
+        DType::BF16,
+    );
+}
+
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn paged_and_moe_ops() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(4);
+
+    // Paged attention at the Llama-3.2-3B shapes: the 16-token default page (Turbine kernel)
+    // and a 128-token page (Composable Kernel pagedkv). A prefill batch mixing a fresh prompt,
+    // a single-token row and a chunk after cached context (more than one query tile), then a
+    // decode batch.
+    for block_tokens in [16, 128] {
+        paged_case(
+            &p,
+            &mut rng,
+            AttentionKind::PrefillPaged,
+            block_tokens,
+            &[37, 1, 70],
+            &[37, 300, 200],
+        );
+        paged_case(
+            &p,
+            &mut rng,
+            AttentionKind::DecodePaged,
+            block_tokens,
+            &[1, 1, 1, 1],
+            &[1, 17, 129, 513],
+        );
+    }
+
+    // copy_blocks over 3 layers of 8 sixteen-token Llama blocks; the third pair reads a block
+    // the first pair wrote, so the copy order matters.
+    let block_elems = 2 * 16 * KV_HEADS * HEAD_DIM;
+    let block_bytes = (block_elems * 2) as u64;
+    let (layers, per_layer) = (3usize, 8usize);
+    let copy_cfg = KvCopyConfig {
+        num_layers: layers as u32,
+        block_bytes,
+    };
+    let hip = p.hip.kv_copy().expect("hip copy_blocks");
+    assert!(
+        hip.supports(&copy_cfg),
+        "hip must support copy_blocks {copy_cfg}"
+    );
+    let impl_name = hip.implementation(&copy_cfg);
+    let (pool_hip, pool_cpu) = twin(
+        &p,
+        &[layers, per_layer, block_elems],
+        DType::BF16,
+        &rng.normal(layers * per_layer * block_elems, 1.0),
+    );
+    let pairs = [
+        (BlockId(3), BlockId(7)),
+        (BlockId(0), BlockId(5)),
+        (BlockId(7), BlockId(1)),
+    ];
+    let runs = [
+        (hip, &pool_hip),
+        (p.cpu.kv_copy().expect("cpu copy_blocks"), &pool_cpu),
+    ];
+    for (kernel, pool) in runs {
+        let mut ctx = KvCopyContext {
+            pool: pool.view().slice,
+            layer_stride_bytes: per_layer as u64 * block_bytes,
+            block_bytes,
+            num_layers: layers as u32,
+            pairs: &pairs,
+        };
+        kernel.execute(&mut ctx).expect("copy_blocks");
+    }
+    assert_exact(
+        &format!("copy_blocks {copy_cfg} pairs={pairs:?}"),
+        &impl_name,
+        &read(&pool_hip),
+        &read(&pool_cpu),
+    );
+
+    // moe_route: OLMoE (64 experts, top-8, no renormalisation) on random logits; exact ties
+    // (they go to the lower expert id); a renormalising 8-expert top-2 router.
+    let olmoe = MoeRouteConfig {
+        num_experts: MOE_EXPERTS as u32,
+        top_k: MOE_TOP_K as u32,
+        renormalize: false,
+    };
+    route_case(&p, olmoe, 37, &rng.normal(37 * MOE_EXPERTS, 2.0));
+    let mut ties = vec![0f32; 3 * MOE_EXPERTS];
+    ties[0] = 1.0;
+    ties[1] = 1.0;
+    ties[MOE_EXPERTS + 40] = 2.0;
+    route_case(&p, olmoe, 3, &ties);
+    let small = MoeRouteConfig {
+        num_experts: 8,
+        top_k: 2,
+        renormalize: true,
+    };
+    route_case(&p, small, 13, &rng.normal(13 * 8, 1.0));
+
+    // moe_experts at the OLMoE shapes.
+    let w = expert_weights(&p, &mut rng);
+    // Random routing in which expert 63 never wins, so one expert receives no token.
+    let mut logits = rng.normal(37 * MOE_EXPERTS, 1.0);
+    for row in logits.chunks_exact_mut(MOE_EXPERTS) {
+        row[MOE_EXPERTS - 1] = -30.0;
+    }
+    let case = ExpertsCase {
+        tokens: 37,
+        logits: &logits,
+        local: (0, MOE_EXPERTS),
+        workspace: false,
+    };
+    experts_case(&p, &mut rng, &w, &case);
+    // Every token selects the same 8 experts (3..=10), through a caller workspace.
+    let mut logits = rng.normal(21 * MOE_EXPERTS, 0.1);
+    for row in logits.chunks_exact_mut(MOE_EXPERTS) {
+        for v in &mut row[3..11] {
+            *v += 10.0;
+        }
+    }
+    let case = ExpertsCase {
+        tokens: 21,
+        logits: &logits,
+        local: (0, MOE_EXPERTS),
+        workspace: true,
+    };
+    experts_case(&p, &mut rng, &w, &case);
+    // A shard of the experts: the local range [16, 48).
+    let logits = rng.normal(21 * MOE_EXPERTS, 1.0);
+    let case = ExpertsCase {
+        tokens: 21,
+        logits: &logits,
+        local: (16, 48),
+        workspace: false,
+    };
+    experts_case(&p, &mut rng, &w, &case);
 }
