@@ -334,3 +334,10 @@
 - Refill at a reduced rate
 
 **Answer (2026-09-26):** refill finished slots — in RED, admission may replace completed requests from the queue (no net growth of running requests, KV within the worst-case reservation); Phase 3 spec/plan to be amended when Phase 3 opens (run-ahead branch `runahead/p3-reliability` implements admit-nothing today).
+
+## tool_choice "auto": constrained or free?
+
+- Constrain with an llguidance grammar `start: text | calls` — free text allowed, but once a call starts its name and arguments are schema-enforced (recommended)
+- Keep auto unconstrained (vLLM default); invalid arguments possible
+
+**Answer (2026-09-26):** constrain `auto` with the `text | calls` grammar (S-18 amended). Also accepted: constrained JSON allows natural whitespace bounded to 16 characters between tokens (S-17 amended; the compact-only rule degraded Llama's output, e.g. `{"name":": "}`).
