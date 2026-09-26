@@ -1925,7 +1925,7 @@ pub mod fixture {
     pub struct ReferenceRecord { pub id: String, pub engine: String, pub model: String, pub captured: String /* RFC 3339 UTC, whole seconds */,
         pub prompt_token_ids: Vec<u32>, pub tokens: Vec<u32>, pub top_logprobs: Vec<Vec<(u32, f32)>> /* highest first */ }
     #[serde(deny_unknown_fields)] pub struct Tolerance { pub min_identical_prefix: usize, pub min_prompts_passing: usize, pub top_k: usize,
-        pub max_abs_logprob_diff: f32, pub margin_nats: f32 }
+        pub max_abs_logprob_diff_likely: f32, pub max_abs_logprob_diff_tail: f32, pub likely_logprob_floor: f32, pub margin_nats: f32 }   // two-tier bound (user decision 2026-09-26): reference logprob > floor → likely, else tail
     pub fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, GoldenError>;   // blank lines skipped; no records → Usage
     pub fn read_prompts(path: &Path) -> Result<Vec<PromptRecord>, GoldenError>;   // unique ids; exactly one of prompt (completion) / messages (chat)
     pub fn read_tolerance(path: &Path) -> Result<Tolerance, GoldenError>;
@@ -1935,7 +1935,7 @@ pub mod fixture {
 pub mod compare {
     pub struct MissingTopK { pub position: usize, pub token_id: u32 }
     pub struct PromptVerdict { pub id: String, pub reference_len: usize, pub identical_prefix: usize, pub first_divergence: Option<usize>,
-        pub margin_at_divergence: Option<f32>, pub max_abs_logprob_diff: f32, pub missing_top_k: Option<MissingTopK>, pub logprob_within_bound: bool, pub passed: bool }
+        pub margin_at_divergence: Option<f32>, pub max_abs_logprob_diff_likely: f32, pub max_abs_logprob_diff_tail: f32, pub missing_top_k: Option<MissingTopK>, pub logprob_within_bound: bool, pub passed: bool }
     pub fn compare_prompt(reference: &ReferenceRecord, got_tokens: &[u32], got_top: &[Vec<(u32, f32)>], tol: &Tolerance) -> PromptVerdict;
     pub fn judge(verdicts: &[PromptVerdict], tol: &Tolerance) -> bool;   // non-empty, every logprob bound holds, ≥ min_prompts_passing passed
     pub struct CompareReport { pub prompts: Vec<PromptVerdict>, pub prompts_passing: usize, pub prompts_total: usize, pub passed: bool, pub tolerance: Tolerance }
@@ -2182,16 +2182,16 @@ All scripts: never stop/restart/reconfigure non-`turbine-lab-*` workloads; any r
 
 ### 21.4 Fixtures
 
-| Path                                                                                                                                     | Phase  | Format                                                                                                                                     |
-| ---------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `tests/golden/prompts.jsonl`                                                                                                             | P1     | `{"id","kind":"completion"\|"chat","prompt"\|"messages","max_tokens":32,"chat_template_kwargs":{"date_string":"26 Jul 2024"}}`, 16 prompts |
-| `tests/golden/<slug>/reference.jsonl`                                                                                                    | P1/P2  | `{"id","engine","model","captured","prompt_token_ids","tokens","top_logprobs":[[[id,lp]…]…]}`                                              |
-| `tests/golden/<slug>/tolerance.json`                                                                                                     | P1/P2  | `{"min_identical_prefix":32,"min_prompts_passing":14,"top_k":5,"max_abs_logprob_diff":0.15,"margin_nats":0.5}`                             |
-| `tests/golden/tools/*.jsonl`                                                                                                             | P2     | chat requests with `tools` / `response_format`                                                                                             |
-| `tests/eval/gsm8k-200.jsonl`, `tests/eval/NOTICE`, `tests/eval/<slug>/<engine>.json`                                                     | P8     | `{"id","prompt"\|"messages","answer","match":"exact"\|"number"}`                                                                           |
-| `crates/turbine-model/tests/fixtures/<slug>/{config.json,generation_config.json,tokenizer.json,tokenizer_config.json, expected renders}` | P1, P2 | committed copies                                                                                                                           |
-| `crates/turbine-device/tests/fixtures/{proc,topology}/…`                                                                                 | P3, P5 | captured `/proc` files; novanas / dgx-spark sysfs + vendor captures (contract-chosen paths)                                                |
-| tiny synthetic checkpoints                                                                                                               | P1, P2 | generated per test into a temp dir from a fixed seed; never committed                                                                      |
+| Path                                                                                                                                     | Phase  | Format                                                                                                                                                                             |
+| ---------------------------------------------------------------------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tests/golden/prompts.jsonl`                                                                                                             | P1     | `{"id","kind":"completion"\|"chat","prompt"\|"messages","max_tokens":32,"chat_template_kwargs":{"date_string":"26 Jul 2024"}}`, 16 prompts                                         |
+| `tests/golden/<slug>/reference.jsonl`                                                                                                    | P1/P2  | `{"id","engine","model","captured","prompt_token_ids","tokens","top_logprobs":[[[id,lp]…]…]}`                                                                                      |
+| `tests/golden/<slug>/tolerance.json`                                                                                                     | P1/P2  | `{"min_identical_prefix":32,"min_prompts_passing":14,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5}` |
+| `tests/golden/tools/*.jsonl`                                                                                                             | P2     | chat requests with `tools` / `response_format`                                                                                                                                     |
+| `tests/eval/gsm8k-200.jsonl`, `tests/eval/NOTICE`, `tests/eval/<slug>/<engine>.json`                                                     | P8     | `{"id","prompt"\|"messages","answer","match":"exact"\|"number"}`                                                                                                                   |
+| `crates/turbine-model/tests/fixtures/<slug>/{config.json,generation_config.json,tokenizer.json,tokenizer_config.json, expected renders}` | P1, P2 | committed copies                                                                                                                                                                   |
+| `crates/turbine-device/tests/fixtures/{proc,topology}/…`                                                                                 | P3, P5 | captured `/proc` files; novanas / dgx-spark sysfs + vendor captures (contract-chosen paths)                                                                                        |
+| tiny synthetic checkpoints                                                                                                               | P1, P2 | generated per test into a temp dir from a fixed seed; never committed                                                                                                              |
 
 ## 22. Core runtime types index (where each shared concept lives)
 

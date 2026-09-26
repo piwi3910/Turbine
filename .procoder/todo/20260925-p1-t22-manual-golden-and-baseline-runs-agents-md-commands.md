@@ -12,7 +12,7 @@ Phase 1 plan Task 22 (`.procoder/plans/phase-1-single-request.md`, "## Task 22")
 - [x] Gate clean: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` exits 0
 - [x] Committed on branch phase-1-single-request with the plan's commit message
 - [x] `scripts/lab-serve.sh novanas scripts/lab/phase1-novanas.yaml` logs `listening` and reports `/ready` 200
-- [ ] `turbine-golden compare --url http://192.168.10.203:18000 --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl` exits 0 (≥ 14/16 prompts, max |Δ logprob| ≤ 0.15) — FAILS: 3/16 (see Evidence)
+- [x] `turbine-golden compare --url http://192.168.10.203:18000 --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl` exits 0 (≥ 14/16 prompts, max |Δ logprob| ≤ 0.15 on likely / ≤ 0.55 on tail candidates — two-tier bound and FP32-logit reference, user decisions 2026-09-26) — PASS 16/16 (see Evidence, "Golden rerun")
 - [x] Baseline `turbine-bench … --concurrency 1 --requests 10 --max-tokens 128 --ignore-eos --output json` exits 0 with `"requests_ok": 10`; JSON pasted as the Phase 1 single-request baseline
 - [x] Real-stream check `turbine-bench … --concurrency 1 --requests 10 --output json` exits 0 with `"requests_ok": 10`, `ttft_ms.p50` > 0, `output_token_throughput` > 0
 - [x] `scripts/lab-serve.sh novanas --stop` deletes the serve Job and nothing else
@@ -183,3 +183,44 @@ Real-stream check (natural EOS): `cargo run --release -p turbine-bench --bin tur
 ```
 
 `scripts/lab-serve.sh novanas --stop` → exit 0: `job.batch "turbine-lab-serve" deleted from turbine-ci namespace`, `lab-serve: novanas: stopped`; `/ready` then answers `000` (connection refused). A `turbine-lab-test-0925212027-24a30632` Job that another agent started during the runs was left untouched.
+
+### Golden rerun (2026-09-26, after the user decisions of 2026-09-26)
+
+The diagnosis above led to three user decisions (`.procoder/ask/decisions.md`, end): the committed
+reference is the FP32-final-logit transformers reference, the logprob bound is 0.15 for reference
+top-5 candidates with reference logprob > −2 and 0.55 for the tail, and the cpu-reference attention
+rounds its probabilities to BF16 like CK. Applied in `2793c23` and `7399e97` (spec, plan, contract
+and AGENTS.md updated in the docs commit).
+
+`scripts/lab-serve.sh novanas scripts/lab/phase1-novanas.yaml` → exit 0 (second attempt; the first
+Job failed at `install cmake ninja python3 rsync` while a `lab-test.sh` Job was installing packages
+at the same time): `ready`, `lab-serve: novanas: ready at http://192.168.10.203:18000`.
+
+`cargo run --release -p turbine-bench --bin turbine-golden -- compare --url http://192.168.10.203:18000 --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl` → **exit 0**:
+
+```
+PASS p01 identical_prefix=30/32 first_divergence=30 margin=0.009 max_abs_logprob_diff_likely=0.0537 max_abs_logprob_diff_tail=0.1232
+PASS p02 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0339 max_abs_logprob_diff_tail=0.0728
+PASS p03 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0322 max_abs_logprob_diff_tail=0.2359
+PASS p04 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0871 max_abs_logprob_diff_tail=0.1725
+PASS p05 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0599 max_abs_logprob_diff_tail=0.1197
+PASS p06 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0705 max_abs_logprob_diff_tail=0.1403
+PASS p07 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0555 max_abs_logprob_diff_tail=0.1105
+PASS p08 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0620 max_abs_logprob_diff_tail=0.1493
+PASS p09 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0430 max_abs_logprob_diff_tail=0.0988
+PASS p10 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0750 max_abs_logprob_diff_tail=0.3394
+PASS p11 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0407 max_abs_logprob_diff_tail=0.2563
+PASS p12 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0368 max_abs_logprob_diff_tail=0.2256
+PASS p13 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0643 max_abs_logprob_diff_tail=0.1454
+PASS p14 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0801 max_abs_logprob_diff_tail=0.1632
+PASS p15 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0393 max_abs_logprob_diff_tail=0.1416
+PASS p16 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0646 max_abs_logprob_diff_tail=0.5133
+PASS: 16/16 prompts passing (need 14); |Δ logprob| over top-5 ≤ 0.15 (reference logprob > -2) and ≤ 0.55 (tail) on every prompt: yes
+```
+
+The only divergence (p01 at 30) sits at a reference margin of 0.009 nats. Headroom: likely max
+0.0871 (p04) against 0.15; tail max 0.5133 (p16) against 0.55 — the closest margin. Identical to the
+in-process `golden logits_match_reference` verdicts in T21.
+
+`scripts/lab-serve.sh novanas --stop` → `job.batch "turbine-lab-serve-0926034958-36ce491f" deleted`,
+`job.batch "turbine-lab-serve-0926035115-021dd1f7" deleted`, `lab-serve: novanas: stopped`.

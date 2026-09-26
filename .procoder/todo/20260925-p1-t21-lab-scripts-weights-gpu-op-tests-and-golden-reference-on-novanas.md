@@ -13,7 +13,7 @@ Phase 1 plan Task 21 (`.procoder/plans/phase-1-single-request.md`, "## Task 21")
 - [x] Lab Job builds `libturbine_hip.so` for `gfx1201` with hipBLASLt 1.4.1 and CK `cd9574023093742434e8c992d13b89ab9a6c1cf8`
 - [x] `hip_ops` passes on the R9700: `test gemm_matches_cpu ... ok`, `test attention_matches_cpu ... ok`, `test norm_rope_silu_embedding_add_match_cpu ... ok`, each printing the `_impl` name
 - [x] Device inventory lab test passes on novanas (`test inventory_matches_expectation ... ok`, 2 × R9700 gfx1201)
-- [ ] `tiny_model hip_matches_cpu` passes on novanas (head_dim-128 tiny now selects every HIP op; fails the 2e-2 logit bound at step 0, see Evidence run 5)
+- [x] `tiny_model hip_matches_cpu` passes on novanas (head_dim-128 tiny selects every HIP op; bound tightened to 1e-4 after the cpu-reference attention adopted CK's BF16 probabilities, user decision 2026-09-26; measured 3.8e-6, see Evidence "Decisions 2026-09-26")
 - [x] Gate clean: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` exits 0
 - [x] Committed on branch phase-1-single-request with the plan's commit message
 
@@ -57,3 +57,20 @@ Run 5: same Job with a temporary, uncommitted `--no-fail-fast` in the Job's `car
 - `test cpu_forward_matches_naive_head_dim_128 ... ok` on the lab host
 - `test hip_matches_cpu ... FAILED`: `step 0: max abs diff 0.09702778` (bound 2e-2). The NoProvider failure is gone: every op, including `attention_prefill head_dim=128`, has a HIP provider. 0.097 on logits of magnitude ~14 is under 1 % relative, about one to two BF16 ulps at the logit scale; whether that is BF16 accumulation-order drift (hipBLASLt / CK vs sequential CPU) or a real defect, and whether the 2e-2 bound holds for a random-weight BF16 model, needs a decision.
 - `test logits_match_reference ... FAILED` (same verdicts as run 4); `error: 3 targets failed` (`lab_scripts` from the temporary edit, `golden`, `tiny_model`); `lab-test: novanas: tests failed (exit 101)`
+
+### Decisions 2026-09-26 applied (commits `2793c23`, `7399e97`)
+
+The run-5 failures were resolved by three user decisions: FP32-final-logit golden reference, two-tier logprob bound (0.15 for reference logprob > −2, 0.55 for the tail), and a cpu-reference attention that rounds the unnormalised softmax probabilities to BF16 for P·V like CK FMHA (f32 row max/sum, f32 P·V accumulation, normalised last). `hip_matches_cpu` bound: 2e-2 → 1e-4.
+
+`scripts/lab-test.sh novanas --gpus 1 -- -p turbine-model --test golden --test tiny_model -- --test-threads=1 --nocapture` → `exit 0` (run twice; second run with the 1e-4 bound):
+
+- `test logits_match_reference ... ok` — `golden verdict: 16/16 prompts passing (need 14); logprob bound held on every prompt` (max likely 0.0871 p04, max tail 0.5133 p16; only divergence p01@30 at margin 0.009)
+- `test hip_matches_cpu ... ok` — `hip_matches_cpu: max abs logit diff over 32 steps 0.0000038146973` (was `0.09702778` at step 0)
+- `test hip_trace_vs_cpu ... ok`, `test hip_trace_vs_cpu_3b ... ok` (no-op without `TURBINE_GOLDEN_TRACE`), `test cpu_forward_matches_naive ... ok`, `test cpu_forward_matches_naive_head_dim_128 ... ok`, `test cpu_trace_recomputes_exactly ... ok`
+- `test result: ok. 5 passed` (golden), `test result: ok. 7 passed` (tiny_model)
+
+Full run `scripts/lab-test.sh novanas --with-hf-reference` (Job `turbine-lab-test-0926035428-1222d686`, 1 GPU) → exit 101, so the first criterion stays open:
+
+- `test attention_matches_cpu ... ok` (CK FMHA vs the new cpu-reference: max |Δ| 3.906e-3 over all 13 cases, was up to 1.562e-2), `test gemm_matches_cpu ... ok`, `test norm_rope_silu_embedding_add_match_cpu ... ok`, `test inventory_matches_expectation ... ok`
+- `test hf_reference_matches_cpu ... ok` and `test logits_match_reference ... ok` (both `golden verdict: 16/16 prompts passing`)
+- `test hip_matches_cpu ... FAILED` and `test hip_trace_vs_cpu ... FAILED`, both `panicked at crates/turbine-model/tests/tiny_model.rs: an AMD device`: the two tiny_model HIP tests call `turbine_device::discover` concurrently under the default test threads and neither sees a device (the race `hip_ops.rs` avoids with its process-wide lock, run 2 above). Not a numerics failure — both pass with `--test-threads=1`. Needs the same lock in `tiny_model.rs` (or `--test-threads=1` in the Job) before the full-run criterion can pass.
