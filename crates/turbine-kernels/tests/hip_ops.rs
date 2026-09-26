@@ -2934,3 +2934,418 @@ fn decode_forward_timing() {
         }
     }
 }
+
+/// `m` rows of `inner` elements of `t`'s storage, starting `col` elements into each row of
+/// `row_stride` elements: a column block of a fused projection output, as the executors view it.
+fn column_block<'a>(
+    t: &'a Tensor,
+    col: usize,
+    row_stride: usize,
+    m: usize,
+    inner: &[usize],
+) -> TensorView<'a> {
+    let es = t.dtype.size_bytes();
+    let row: usize = inner.iter().product();
+    let mut shape = vec![m];
+    shape.extend_from_slice(inner);
+    let mut strides = vec![row_stride];
+    let mut s = row;
+    for &d in inner {
+        s /= d;
+        strides.push(s);
+    }
+    TensorView {
+        slice: t
+            .storage
+            .whole()
+            .sub(col * es, ((m - 1) * row_stride + row) * es),
+        shape: shape.as_slice().into(),
+        strides: strides.as_slice().into(),
+        dtype: t.dtype,
+    }
+}
+
+/// Lab microbenchmark (no assertion on speed, P2c Task 10): Llama-3.2-3B's projections run
+/// fused (one `[q+2kv]` and one `[2·inter]` GEMM) against separate (one GEMM per projection over
+/// row views of the same fused weight, as the unfused executor runs them), and RoPE, paged
+/// decode attention and SiLU·up on row-strided column blocks of the fused outputs against dense
+/// operands, for m ∈ {1, 16, 64} (cold-cache weights, ~768-token contexts, 128-token pages).
+/// The GEMMs are also timed for every m in 1..=24, 32, 48 and 64, on the first call at a new
+/// prefill-sized m (the shim's heuristic query included) and in steady state there; and the
+/// residual add + RMSNorm as `add` then `rmsnorm` against the ABI v2.1 `add_rmsnorm`.
+/// Prints `fused_timing` lines. Run with
+/// `scripts/lab-test.sh novanas -- --release -p turbine-kernels --test hip_ops -- fused_projection_timings --nocapture`.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn fused_projection_timings() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(7);
+    const ITERS: u32 = 100;
+    let model = BENCH_MODELS[0];
+    let (h, inter) = (model.hidden, INTERMEDIATE);
+    let (q_rows, kv_rows) = (model.q_rows(), model.kv_rows());
+    let qkv_w = q_rows + 2 * kv_rows;
+    let gu_w = 2 * inter;
+    let max_m = BENCH_BATCHES[BENCH_BATCHES.len() - 1];
+    let gemm = p.hip.gemm().expect("hip gemm");
+    let x = on_hip(
+        &p,
+        &[max_m, h],
+        DType::BF16,
+        &pattern(&mut rng, max_m * h, 1.0),
+    );
+    let report = |what: &str, m: usize, sep: f64, fused: f64| {
+        println!(
+            "fused_timing m={m:<2} {what:<40} separate {sep:>8.1} us  fused {fused:>8.1} us  delta {:>+8.1} us",
+            fused - sep
+        );
+    };
+
+    // GEMMs: separate row views of the fused weight vs one fused GEMM, cold-cache weights.
+    for (what, parts) in [
+        ("qkv", vec![q_rows, kv_rows, kv_rows]),
+        ("gate_up", vec![inter, inter]),
+    ] {
+        let n: usize = parts.iter().sum();
+        let raw = encode(
+            DType::BF16,
+            &pattern(&mut rng, n * h, 1.0 / (h as f32).sqrt()),
+        );
+        let copies = (512usize << 20).div_ceil(n * h * 2).max(1);
+        let ws: Vec<Tensor> = (0..copies)
+            .map(|_| raw_on_hip(&p, &[n, h], DType::BF16, &raw))
+            .collect();
+        let out = zeros_on_hip(&p, &[max_m, n], DType::BF16);
+        for m in (1..=24).chain([32, 48, 64]) {
+            let a = x.view().rows(0, m);
+            let mut next = 0usize;
+            let separate = time_us(&p, ITERS, || {
+                next = (next + 1) % copies;
+                let mut row = 0usize;
+                for &rows in &parts {
+                    let c = TensorView::contiguous(
+                        out.storage.whole(),
+                        max_m * row,
+                        &[m, rows],
+                        DType::BF16,
+                    );
+                    gemm.execute(&mut GemmContext {
+                        a: a.clone(),
+                        b: ws[next].view().rows(row, rows),
+                        c,
+                        trans_b: true,
+                        alpha: 1.0,
+                        beta: 0.0,
+                    })
+                    .expect("separate gemm");
+                    row += rows;
+                }
+            });
+            let fused = time_us(&p, ITERS, || {
+                next = (next + 1) % copies;
+                gemm.execute(&mut GemmContext {
+                    a: a.clone(),
+                    b: ws[next].view(),
+                    c: out.view().rows(0, m),
+                    trans_b: true,
+                    alpha: 1.0,
+                    beta: 0.0,
+                })
+                .expect("fused gemm");
+            });
+            report(&format!("gemm {what} n={n} k={h}"), m, separate, fused);
+            // Each part alone, for the per-shape bandwidth.
+            let mut row = 0usize;
+            for &rows in &parts {
+                let us = time_us(&p, ITERS, || {
+                    next = (next + 1) % copies;
+                    gemm.execute(&mut GemmContext {
+                        a: a.clone(),
+                        b: ws[next].view().rows(row, rows),
+                        c: TensorView::contiguous(out.storage.whole(), 0, &[m, rows], DType::BF16),
+                        trans_b: true,
+                        alpha: 1.0,
+                        beta: 0.0,
+                    })
+                    .expect("part gemm");
+                });
+                println!(
+                    "fused_timing m={m:<2} gemm part n={rows} k={h}: {us:.1} us ({:.0} GB/s); fused n={n}: {:.0} GB/s",
+                    (rows * h * 2) as f64 / (us * 1e3),
+                    (n * h * 2) as f64 / (fused * 1e3)
+                );
+                row += rows;
+            }
+        }
+        // First call at a new m (the shim's heuristic query and algorithm cache miss), and the
+        // steady state at prefill-sized m.
+        let big = zeros_on_hip(&p, &[2100, n], DType::BF16);
+        let xa = zeros_on_hip(&p, &[2100, h], DType::BF16);
+        for m in [101usize, 257, 700, 1403, 2048, 2071] {
+            let a = xa.view().rows(0, m);
+            let once = |fused: bool| {
+                p.hip_mem.synchronize().expect("synchronize");
+                let start = std::time::Instant::now();
+                if fused {
+                    gemm.execute(&mut GemmContext {
+                        a: a.clone(),
+                        b: ws[0].view(),
+                        c: big.view().rows(0, m),
+                        trans_b: true,
+                        alpha: 1.0,
+                        beta: 0.0,
+                    })
+                    .expect("fused gemm");
+                } else {
+                    let mut row = 0usize;
+                    for &rows in &parts {
+                        gemm.execute(&mut GemmContext {
+                            a: a.clone(),
+                            b: ws[0].view().rows(row, rows),
+                            c: TensorView::contiguous(
+                                big.storage.whole(),
+                                2100 * row,
+                                &[m, rows],
+                                DType::BF16,
+                            ),
+                            trans_b: true,
+                            alpha: 1.0,
+                            beta: 0.0,
+                        })
+                        .expect("separate gemm");
+                        row += rows;
+                    }
+                }
+                p.hip_mem.synchronize().expect("synchronize");
+                start.elapsed().as_secs_f64() * 1e6
+            };
+            let first_sep = once(false);
+            let first_fused = once(true);
+            let sep = time_us(&p, 10, || {
+                once(false);
+            });
+            let fused = time_us(&p, 10, || {
+                once(true);
+            });
+            report(
+                &format!("gemm {what} first call (new m)"),
+                m,
+                first_sep,
+                first_fused,
+            );
+            report(&format!("gemm {what} steady (warm weights)"), m, sep, fused);
+        }
+    }
+
+    // Consumers: dense operands vs column blocks of the fused outputs.
+    let rope = p.hip.rope().expect("hip rope");
+    let attn = p.hip.attention().expect("hip attention");
+    let silu = p.hip.activation().expect("hip silu_mul");
+    let qkv = on_hip(
+        &p,
+        &[max_m, qkv_w],
+        DType::BF16,
+        &pattern(&mut rng, max_m * qkv_w, 1.0),
+    );
+    let dense_q = on_hip(
+        &p,
+        &[max_m, q_rows],
+        DType::BF16,
+        &pattern(&mut rng, max_m * q_rows, 1.0),
+    );
+    let dense_k = on_hip(
+        &p,
+        &[max_m, kv_rows],
+        DType::BF16,
+        &pattern(&mut rng, max_m * kv_rows, 1.0),
+    );
+    let dense_v = on_hip(
+        &p,
+        &[max_m, kv_rows],
+        DType::BF16,
+        &pattern(&mut rng, max_m * kv_rows, 1.0),
+    );
+    let gu = on_hip(
+        &p,
+        &[max_m, gu_w],
+        DType::BF16,
+        &pattern(&mut rng, max_m * gu_w, 1.0),
+    );
+    let dense_g = on_hip(
+        &p,
+        &[max_m, inter],
+        DType::BF16,
+        &pattern(&mut rng, max_m * inter, 1.0),
+    );
+    let dense_u = on_hip(
+        &p,
+        &[max_m, inter],
+        DType::BF16,
+        &pattern(&mut rng, max_m * inter, 1.0),
+    );
+    let act_out = zeros_on_hip(&p, &[max_m, inter], DType::BF16);
+    let attn_out = zeros_on_hip(&p, &[max_m, model.q_heads, HEAD_DIM], DType::BF16);
+    let freq = on_hip(&p, &[HEAD_DIM / 2], DType::F32, &model.inv_freq());
+    let rope_cfg = model.rope_cfg();
+    let (qh, kh) = (model.q_heads, model.kv_heads);
+    for &m in &BENCH_BATCHES {
+        let dq = || column_block(&dense_q, 0, q_rows, m, &[qh, HEAD_DIM]);
+        let dk = || column_block(&dense_k, 0, kv_rows, m, &[kh, HEAD_DIM]);
+        let dv = || column_block(&dense_v, 0, kv_rows, m, &[kh, HEAD_DIM]);
+        let fq = || column_block(&qkv, 0, qkv_w, m, &[qh, HEAD_DIM]);
+        let fk = || column_block(&qkv, q_rows, qkv_w, m, &[kh, HEAD_DIM]);
+        let fv = || column_block(&qkv, q_rows + kv_rows, qkv_w, m, &[kh, HEAD_DIM]);
+        let positions: Vec<f32> = bench_kv_lens(m, BENCH_CTX)
+            .iter()
+            .map(|&kl| (kl - 1) as f32)
+            .collect();
+        let pos = on_hip(&p, &[m], DType::I32, &positions);
+        let run_rope = |q: TensorView<'_>, k: TensorView<'_>| {
+            rope.execute(&mut RopeContext {
+                cfg: rope_cfg,
+                q,
+                k,
+                positions: pos.view(),
+                inv_freq: freq.view(),
+            })
+            .expect("rope");
+        };
+        let sep = time_us(&p, ITERS, || run_rope(dq(), dk()));
+        let fused = time_us(&p, ITERS, || run_rope(fq(), fk()));
+        report(
+            &format!("rope impl={}", rope.implementation(&rope_cfg)),
+            m,
+            sep,
+            fused,
+        );
+
+        let cfg = model.attention_cfg(BENCH_BLOCK_TOKENS);
+        let kv_lens = bench_kv_lens(m, BENCH_CTX);
+        let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
+        let max_blocks = max_kv.div_ceil(BENCH_BLOCK_TOKENS);
+        let num_blocks = m * max_blocks;
+        let table: Vec<f32> = shuffled(&mut rng, num_blocks)
+            .iter()
+            .map(|&b| b as f32)
+            .collect();
+        let pool = on_hip(
+            &p,
+            &[num_blocks, 2, BENCH_BLOCK_TOKENS, kh, HEAD_DIM],
+            DType::BF16,
+            &pattern(&mut rng, num_blocks * 2 * BENCH_BLOCK_TOKENS * kv_rows, 1.0),
+        );
+        let bt = on_hip(&p, &[m, max_blocks], DType::I32, &table);
+        let indptr: Vec<f32> = (0..=m).map(|i| i as f32).collect();
+        let ip = on_hip(&p, &[m + 1], DType::I32, &indptr);
+        let lens: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
+        let kl = on_hip(&p, &[m], DType::I32, &lens);
+        let run_attn = |q: TensorView<'_>, k: TensorView<'_>, v: TensorView<'_>| {
+            attn.execute_paged(&mut PagedAttentionContext {
+                cfg,
+                q,
+                k_new: k,
+                v_new: v,
+                out: attn_out.view().rows(0, m),
+                kv_layer: pool.view(),
+                block_table: bt.view(),
+                q_indptr: ip.view(),
+                kv_lens: kl.view(),
+                max_q_len: 1,
+                max_kv_len: max_kv as u32,
+                max_blocks_per_seq: max_blocks as u32,
+                scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+            })
+            .expect("paged decode attention");
+        };
+        let sep = time_us(&p, ITERS, || run_attn(dq(), dk(), dv()));
+        let fused = time_us(&p, ITERS, || run_attn(fq(), fk(), fv()));
+        report(
+            &format!("attention_decode_paged impl={}", attn.implementation(&cfg)),
+            m,
+            sep,
+            fused,
+        );
+
+        let act_cfg = ActivationConfig {
+            cols: inter as u64,
+            dtype: DType::BF16,
+        };
+        let run_silu = |gate: TensorView<'_>, up: TensorView<'_>| {
+            silu.execute(&mut ActivationContext {
+                gate,
+                up,
+                out: act_out.view().rows(0, m),
+            })
+            .expect("silu_mul");
+        };
+        let sep = time_us(&p, ITERS, || {
+            run_silu(dense_g.view().rows(0, m), dense_u.view().rows(0, m))
+        });
+        let fused = time_us(&p, ITERS, || {
+            run_silu(
+                column_block(&gu, 0, gu_w, m, &[inter]),
+                column_block(&gu, inter, gu_w, m, &[inter]),
+            )
+        });
+        report(
+            &format!("silu_mul impl={}", silu.implementation(&act_cfg)),
+            m,
+            sep,
+            fused,
+        );
+
+        // Residual add + RMSNorm: `add` then `rmsnorm` against the ABI v2.1 `add_rmsnorm`.
+        if let Some(add_norm) = p.hip.add_rmsnorm() {
+            let add = p.hip.elementwise().expect("hip add");
+            let norm = p.hip.norm().expect("hip norm");
+            let an_cfg = AddRmsnormConfig {
+                dtype: DType::BF16,
+                dim: h as u32,
+            };
+            let resid = on_hip(
+                &p,
+                &[max_m, h],
+                DType::BF16,
+                &pattern(&mut rng, max_m * h, 1.0),
+            );
+            let w = on_hip(&p, &[h], DType::BF16, &pattern(&mut rng, h, 1.0));
+            let normed = zeros_on_hip(&p, &[max_m, h], DType::BF16);
+            let sep = time_us(&p, ITERS, || {
+                add.execute(&mut ElementwiseContext {
+                    a: rows(&resid, m),
+                    b: rows(&x, m),
+                    out: rows(&resid, m),
+                })
+                .expect("add");
+                norm.execute(&mut NormContext {
+                    x: rows(&resid, m),
+                    weight: w.view(),
+                    out: rows(&normed, m),
+                    eps: 1e-5,
+                })
+                .expect("rmsnorm");
+            });
+            let fused = time_us(&p, ITERS, || {
+                add_norm
+                    .execute(&mut AddRmsnormContext {
+                        residual: rows(&resid, m),
+                        x: rows(&x, m),
+                        weight: w.view(),
+                        out: rows(&normed, m),
+                        eps: 1e-5,
+                    })
+                    .expect("add_rmsnorm");
+            });
+            report(
+                &format!("add+rmsnorm impl={}", add_norm.implementation(&an_cfg)),
+                m,
+                sep,
+                fused,
+            );
+        }
+    }
+}
