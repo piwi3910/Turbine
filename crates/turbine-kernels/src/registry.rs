@@ -497,6 +497,9 @@ mod tests {
             .finish();
         let cfg = prefill_128_8();
         let registry = tracing::subscriber::with_default(subscriber, || {
+            // Another test thread may have cached this callsite as disabled (no subscriber
+            // there); recompute interest now that the capture subscriber is registered.
+            tracing::callsite::rebuild_interest_cache();
             KernelRegistry::build(
                 vec![first(), second()],
                 &[ProviderId("first"), ProviderId("second")],
