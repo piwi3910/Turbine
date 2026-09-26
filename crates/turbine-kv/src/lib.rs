@@ -1,7 +1,8 @@
-//! Turbine KV cache (contract §11). Each module is a separate boundary — there is no
-//! catch-all "KV manager" (TS §21 rule 6).
+//! Turbine KV cache (contract §11, TS §8). Each module is a separate boundary with its own
+//! public API — there is no catch-all "KV manager" (TS §21 rule 6).
 
 pub mod document;
+pub mod identity;
 pub mod metrics;
 pub mod pool;
 pub mod reclaim;

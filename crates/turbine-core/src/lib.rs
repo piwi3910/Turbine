@@ -2,6 +2,7 @@
 
 pub mod clock;
 pub mod config;
+mod model_identity;
 pub mod pressure;
 pub mod registry;
 pub mod request;

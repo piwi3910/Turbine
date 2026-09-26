@@ -1,6 +1,6 @@
 [package]
 name = "turbine-kv"
-description = "Turbine KV cache: L0 block pool, block tables, KV accounting and diagnostics"
+description = "Turbine KV cache: L0 block pool, block tables, identity, directory, tiers, eviction policy, planner, sessions"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,16 +13,20 @@ turbine-tensor.workspace = true
 # P3: every KV block is paid from a reservation-ledger `kv` pool reservation.
 turbine-reliability.workspace = true
 serde.workspace = true
+# Canonical namespace JSON (P4 §Data)
+serde_json.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 # KvMetrics gauge family and the startup `kv_pool` log line
 prometheus-client.workspace = true
 tracing.workspace = true
+# Block and namespace keys (P4 S-1)
+blake3.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-serde_json.workspace = true
 
-# Device memory is reached only through turbine-tensor's safe `DeviceMemory` trait.
+# Device memory is reached only through turbine-tensor's safe traits (`DeviceMemory`,
+# `PinnedMemory`), injected by turbine-server.
 [lints.rust]
 unsafe_code = "forbid"

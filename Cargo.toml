@@ -22,6 +22,8 @@ turbine-reliability = { path = "crates/turbine-reliability" }
 # P3: lock-free snapshot the engine reads once per iteration (decision: arc-swap 1.x).
 arc-swap = "1.9"
 axum = "0.8.9"
+# P4 KV identity: block and namespace keys, model fingerprint
+blake3 = "1.8"
 cc = "1.5.1"
 clap = { version = "4.6.7", features = ["derive"] }
 futures-util = "0.3.34"
