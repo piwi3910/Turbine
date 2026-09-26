@@ -465,7 +465,8 @@ impl std::fmt::Debug for SequenceKv {
 impl SequenceKv {
     /// Device bytes of the pool for `max_seq_len` tokens (the budget's KV reservation).
     pub fn bytes(layout: &KvLayout, max_seq_len: u32) -> u64 {
-        u64::from(max_seq_len.div_ceil(layout.block_tokens.max(1))) * layout.block_bytes()
+        u64::from(max_seq_len.div_ceil(layout.block_tokens.max(1)))
+            .saturating_mul(layout.block_bytes())
     }
 
     /// Allocates the pool for `max_seq_len` tokens of `layout` on `mem`.
