@@ -357,3 +357,9 @@
 - Keep concurrency 16 strict
 
 **Answer (2026-09-26):** concurrency 1 is the strict gate; concurrency 16 must pass the token rule with a looser batched logprob bound (batch composition changes GEMM rounding: p14 likely Δ ranged 0.066–0.178 across runs with identical tokens). Applies to Phase 2 acceptance and every later golden run.
+
+## Multi-model runtime (GPU-owning engine, models as workloads): write an analysis brief?
+
+- Yes: a procoder analysis brief with options, risks (failure isolation, noisy neighbours, fragmentation) and a proposed phase placement (control plane + multi-model after Phase 3; shared KV arena, fractional compute via CU masks, model tiering alongside Phases 4–6) (recommended)
+- Not now: finish Phase 2 / 2c integration first, revisit later
+- Go straight to a spec for a new phase
