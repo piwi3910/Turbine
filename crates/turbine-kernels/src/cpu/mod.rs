@@ -604,6 +604,7 @@ impl LogitsReduceKernel for CpuReference {
         let f32_rows = |name, v| leading_rows(name, v, rows, None, DType::F32);
         let temperature = load(&f32_rows("temperature", &ctx.temperature)?)?;
         let uniform = load(&f32_rows("uniform", &ctx.uniform)?)?;
+        let top_p = load(&f32_rows("top_p", &ctx.top_p)?)?;
         let mode = load_i32(&leading_rows("mode", &ctx.mode, rows, None, DType::I32)?)?;
         let top_ids_view = leading_rows("top_ids", &ctx.top_ids, rows, Some(top_n), DType::I32)?;
         let top_values_view =
@@ -630,7 +631,11 @@ impl LogitsReduceKernel for CpuReference {
                     sampled_logit.push(f32::NAN);
                 }
                 1 => {
-                    let id = math::categorical(row, temperature[r], uniform[r]);
+                    let id = if top_p[r] < 1.0 {
+                        math::nucleus(row, temperature[r], top_p[r], uniform[r])
+                    } else {
+                        math::categorical(row, temperature[r], uniform[r])
+                    };
                     sampled.push(id as i32);
                     sampled_logit.push(row[id as usize]);
                 }
@@ -1601,9 +1606,11 @@ mod tests {
     /// On seeded rows of both model vocabularies (tied maxima, a tied run inside the top-20, NaN
     /// and −∞ entries, a padded row stride) the reference `logits_reduce` returns the sampler's
     /// top-20 in order with the raw values, its log-sum-exp within 1e-6 (relative) and, in
-    /// categorical mode at temperature 0.7 with ChaCha8 uniforms, the sampler's inverse-CDF token.
-    /// Breaks if ties go to the higher id, NaN ranks first, the lse ignores part of the row, or the
-    /// draw is taken in another order or at another temperature.
+    /// categorical mode at temperature 0.7 with ChaCha8 uniforms, the sampler's inverse-CDF token;
+    /// rows with `top_p` < 1 (a broad row at 0.9 and 0.5, a peaked one whose nucleus ends inside
+    /// the tied run) return the sampler's top-p token. Breaks if ties go to the higher id, NaN
+    /// ranks first, the lse ignores part of the row, the draw is taken in another order or at
+    /// another temperature, or the nucleus is cut at another mass or drawn in id order.
     #[test]
     fn logits_reduce_matches_sampler() {
         use rand_chacha::ChaCha8Rng;
@@ -1613,11 +1620,14 @@ mod tests {
         let reduce = CpuReference.logits_reduce().expect("logits_reduce family");
         let mut rng = ChaCha8Rng::seed_from_u64(2026);
         let mut uniform = || (rng.next_u32() >> 8) as f32 / (1u32 << 24) as f32;
-        let (rows, top_n, pad) = (4usize, 20usize, 5usize);
-        // Row 0 reduces only; rows 1..4 also draw at temperature 0.7.
-        let modes = [0, 1, 1, 1];
-        let temperatures = [0.0f32, 0.7, 0.7, 0.7];
+        let (rows, top_n, pad) = (7usize, 20usize, 5usize);
+        // Row 0 reduces only; rows 1..7 also draw at temperature 0.7 (row 6 at 0.4), rows 4..7
+        // from a nucleus.
+        let modes = [0, 1, 1, 1, 1, 1, 1];
+        let temperatures = [0.0f32, 0.7, 0.7, 0.7, 0.7, 0.7, 0.4];
+        let top_ps = [1.0f32, 1.0, 1.0, 1.0, 0.9, 0.5, 0.8];
         let mut draws_below_the_top = 0;
+        let mut nucleus_draws_below_the_top = 0;
         for vocab in [50_304usize, 128_256] {
             let cfg = LogitsReduceConfig {
                 vocab: vocab as u32,
@@ -1632,9 +1642,11 @@ mod tests {
 
             let mut logits = Vec::with_capacity(rows);
             for r in 0..rows {
+                // Row 6's bulk is narrow (±2), the others' ±8.
+                let spread = if r == 6 { 2.0 } else { 8.0 };
                 let mut row: Vec<f32> = seeded((vocab + r) as u64, vocab)
                     .iter()
-                    .map(|v| v * 8.0)
+                    .map(|v| v * spread)
                     .collect();
                 // Three tied maxima, a tied run just below them, NaN and −∞ entries.
                 for id in [7, 1000 + r, vocab - 3] {
@@ -1646,6 +1658,13 @@ mod tests {
                 row[3] = f32::NAN;
                 row[vocab / 2] = f32::NAN;
                 row[11] = f32::NEG_INFINITY;
+                if r == 6 {
+                    // Peaked: the three maxima and the tied run hold nearly all the mass at
+                    // T = 0.4, so the 0.8 nucleus ends inside the run (at its eighth id).
+                    for value in &mut row[100..110] {
+                        *value = 8.9;
+                    }
+                }
                 logits.push(row);
             }
             // Logits rows padded to a stride of vocab + pad elements; the padding must never
@@ -1667,6 +1686,7 @@ mod tests {
             let spare = rows + 1;
             let temperature = tensor(&mem, &[rows], DType::F32, &temperatures);
             let uniform_t = tensor(&mem, &[rows], DType::F32, &uniforms);
+            let top_p = tensor(&mem, &[rows], DType::F32, &top_ps);
             let mode = i32_tensor(&mem, &modes);
             let top_ids = i32_tensor_2d(&mem, spare, &vec![-7; spare * top_n]);
             let top_values = Tensor::empty(&mem, &[spare, top_n], DType::F32).expect("values");
@@ -1678,6 +1698,7 @@ mod tests {
                     logits: logits_view,
                     temperature: temperature.view(),
                     uniform: uniform_t.view(),
+                    top_p: top_p.view(),
                     mode: mode.view(),
                     top_ids: top_ids.view(),
                     top_values: top_values.view(),
@@ -1718,6 +1739,13 @@ mod tests {
                 if modes[r] == 0 {
                     assert_eq!(got_sampled[r], -1);
                     assert!(got_logit[r].is_nan());
+                } else if top_ps[r] < 1.0 {
+                    let want = reference_nucleus(row, temperatures[r], top_ps[r], uniforms[r]);
+                    assert_eq!(got_sampled[r], want as i32, "vocab {vocab} row {r} (top_p)");
+                    assert_eq!(got_logit[r].to_bits(), row[want as usize].to_bits());
+                    if !maxima.contains(&want) {
+                        nucleus_draws_below_the_top += 1;
+                    }
                 } else {
                     let want = reference_draw(row, temperatures[r], uniforms[r]);
                     assert_eq!(got_sampled[r], want as i32, "vocab {vocab} row {r}");
@@ -1734,6 +1762,53 @@ mod tests {
             draws_below_the_top > 0,
             "every draw returned the argmax: the categorical path is not exercised"
         );
+        assert!(
+            nucleus_draws_below_the_top > 0,
+            "every nucleus draw returned a maximum: the top-p path is not exercised"
+        );
+    }
+
+    /// The host sampler's seeded top-p draw (`top_k` −1, `top_p` < 1), written out: all ids
+    /// sorted descending (ties by id, NaN last), f64 weights summed in that order, the shortest
+    /// prefix reaching `top_p · total`, then `u` × the prefix's sum scanned in the same order.
+    fn reference_nucleus(row: &[f32], temperature: f32, top_p: f32, u: f32) -> u32 {
+        let inv_t = 1.0 / temperature;
+        let sorted = reference_top(row, row.len());
+        let max = sorted
+            .iter()
+            .map(|c| c.1 * inv_t)
+            .filter(|v| !v.is_nan())
+            .fold(f32::NEG_INFINITY, f32::max);
+        let weights: Vec<f64> = sorted
+            .iter()
+            .map(|c| {
+                let s = c.1 * inv_t;
+                if s.is_nan() {
+                    0.0
+                } else {
+                    f64::from(s - max).exp()
+                }
+            })
+            .collect();
+        let target = f64::from(top_p) * weights.iter().sum::<f64>();
+        let mut cum = 0.0;
+        let keep = weights
+            .iter()
+            .position(|w| {
+                cum += w;
+                cum >= target
+            })
+            .map_or(weights.len(), |i| i + 1);
+        let target = f64::from(u) * weights[..keep].iter().sum::<f64>();
+        let mut cum = 0.0;
+        let i = weights[..keep]
+            .iter()
+            .position(|w| {
+                cum += w;
+                target < cum
+            })
+            .expect("u < 1 falls inside the nucleus");
+        sorted[i].0
     }
 
     #[test]

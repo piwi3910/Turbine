@@ -280,6 +280,63 @@ pub(crate) fn categorical(values: &[f32], temperature: f32, u: f32) -> u32 {
     last_positive as u32
 }
 
+/// The top-p draw over the whole row at `temperature` with nucleus mass `top_p` < 1 and the
+/// uniform `u`, in the host sampler's seeded arithmetic: every id in descending order (ties to
+/// the lower id, NaN last), weights `exp(v · (1/T) − max)` in f64 (NaN weighs 0) summed in that
+/// order, the shortest prefix whose sum reaches `top_p · total` (at least one id; all of them
+/// when rounding never reaches it), then the first id of the prefix whose cumulative weight
+/// exceeds `u` × the prefix's sum (its last id with a non-zero weight when rounding leaves the
+/// target at the sum). `temperature` ≤ 0 or a row without a finite scaled maximum gives the
+/// argmax.
+pub(crate) fn nucleus(values: &[f32], temperature: f32, top_p: f32, u: f32) -> u32 {
+    if temperature <= 0.0 {
+        return argmax(values);
+    }
+    let inv_t = 1.0 / temperature;
+    let candidates = top_n(values, values.len());
+    let max = candidates
+        .iter()
+        .map(|c| c.1 * inv_t)
+        .filter(|v| !v.is_nan())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return argmax(values);
+    }
+    let mut weights: Vec<f64> = candidates
+        .iter()
+        .map(|c| {
+            let scaled = c.1 * inv_t;
+            if scaled.is_nan() {
+                0.0
+            } else {
+                f64::from(scaled - max).exp()
+            }
+        })
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let target = f64::from(top_p) * total;
+    let mut cum = 0.0;
+    let mut keep = weights.len();
+    for (i, w) in weights.iter().enumerate() {
+        cum += w;
+        if cum >= target {
+            keep = i + 1;
+            break;
+        }
+    }
+    weights.truncate(keep);
+    let kept: f64 = weights.iter().sum();
+    let target = f64::from(u) * kept;
+    let mut cum = 0.0;
+    for (i, w) in weights.iter().enumerate() {
+        cum += w;
+        if target < cum {
+            return candidates[i].0;
+        }
+    }
+    candidates[weights.iter().rposition(|&w| w > 0.0).unwrap_or(0)].0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

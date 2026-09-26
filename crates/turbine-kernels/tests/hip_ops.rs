@@ -1417,9 +1417,59 @@ fn cdf_boundary_distance(row: &[f32], temperature: f32, u: f32) -> f64 {
     best / total
 }
 
+/// Distance of the nucleus draw's two targets from the nearest prefix boundary, as a fraction
+/// of the mass they are taken of: `top_p · total` against the prefix sums of all ids in
+/// descending order (where the cut falls), and `u · kept` against the kept prefix's sums
+/// (where the draw falls), in the cpu-reference arithmetic.
+fn nucleus_boundary_distance(row: &[f32], temperature: f32, top_p: f32, u: f32) -> f64 {
+    let inv_t = 1.0 / temperature;
+    let mut ids: Vec<usize> = (0..row.len()).collect();
+    let key = |v: f32| if v.is_nan() { f32::NEG_INFINITY } else { v };
+    ids.sort_by(|&a, &b| key(row[b]).total_cmp(&key(row[a])).then(a.cmp(&b)));
+    let max = row
+        .iter()
+        .map(|&v| v * inv_t)
+        .filter(|v| !v.is_nan())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let weights: Vec<f64> = ids
+        .iter()
+        .map(|&i| {
+            let s = row[i] * inv_t;
+            if s.is_nan() {
+                0.0
+            } else {
+                f64::from(s - max).exp()
+            }
+        })
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let cut = f64::from(top_p) * total;
+    let mut cum = 0.0;
+    let mut keep = weights.len();
+    let mut d_cut = f64::INFINITY;
+    for (i, w) in weights.iter().enumerate() {
+        cum += w;
+        d_cut = d_cut.min((cum - cut).abs() / total);
+        if cum >= cut && keep == weights.len() {
+            keep = i + 1;
+        }
+    }
+    let kept: f64 = weights[..keep].iter().sum();
+    let target = f64::from(u) * kept;
+    let mut cum = 0.0;
+    let mut d_draw = f64::INFINITY;
+    for w in &weights[..keep] {
+        cum += w;
+        d_draw = d_draw.min((cum - target).abs() / kept);
+    }
+    d_cut.min(d_draw)
+}
+
 /// One `logits_reduce` comparison: `rows` rows of `vocab` logits (row stride `vocab + 5`),
 /// seeded normal values with planted ties, NaN and −∞ entries, an all-NaN and an all-−∞ row,
-/// mixed modes and temperatures.
+/// every fifth row quantized to steps of 0.25 (long runs of tied values), mixed modes,
+/// temperatures and `top_p` (1, 0.9, 0.5, 0.2, 0.95: nuclei inside the planted ties, inside
+/// the sorted candidates and far past them).
 fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n: usize) {
     let stride = vocab + 5;
     let mut logits = rng.normal(rows * stride, 3.0);
@@ -1429,6 +1479,11 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
             0 => row.fill(f32::NAN),
             1 => row.fill(f32::NEG_INFINITY),
             _ => {
+                if r % 5 == 4 {
+                    for v in row.iter_mut() {
+                        *v = (*v * 4.0).round() / 4.0;
+                    }
+                }
                 // Ties at the top (a value repeated at spread-out ids), a NaN and a −∞.
                 let peak = 14.0 + (r % 3) as f32;
                 for i in 0..6 {
@@ -1442,6 +1497,9 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
     let temperatures: Vec<f32> = (0..rows).map(|r| [0.7, 1.0, 1.3, 0.0][r % 4]).collect();
     let uniforms: Vec<f32> = (0..rows).map(|_| rng.unit() as f32).collect();
     let modes: Vec<f32> = (0..rows).map(|r| (r % 3 != 2) as i32 as f32).collect();
+    let top_ps: Vec<f32> = (0..rows)
+        .map(|r| [1.0, 0.9, 0.5, 0.2, 0.95][(r / 2) % 5])
+        .collect();
     let cfg = LogitsReduceConfig {
         vocab: vocab as u32,
         top_n: top_n as u32,
@@ -1453,6 +1511,7 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
     let (l_hip, l_cpu) = twin(p, &[rows, stride], DType::F32, &logits);
     let (t_hip, t_cpu) = twin(p, &[rows], DType::F32, &temperatures);
     let (u_hip, u_cpu) = twin(p, &[rows], DType::F32, &uniforms);
+    let (tp_hip, tp_cpu) = twin(p, &[rows], DType::F32, &top_ps);
     let (m_hip, m_cpu) = twin(p, &[rows], DType::I32, &modes);
     let outputs = |mem: &Arc<dyn DeviceMemory>| {
         (
@@ -1468,7 +1527,7 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
     let run = |kernel: &dyn LogitsReduceKernel,
                l: &Tensor,
                t: &Tensor,
-               u: &Tensor,
+               (u, tp): (&Tensor, &Tensor),
                m: &Tensor,
                o: &(Tensor, Tensor, Tensor, Tensor, Tensor)| {
         let logits_view = TensorView {
@@ -1481,6 +1540,7 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
                 logits: logits_view,
                 temperature: t.view(),
                 uniform: u.view(),
+                top_p: tp.view(),
                 mode: m.view(),
                 top_ids: o.0.view(),
                 top_values: o.1.view(),
@@ -1491,8 +1551,8 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
             })
             .expect("logits_reduce");
     };
-    run(hip, &l_hip, &t_hip, &u_hip, &m_hip, &o_hip);
-    run(cpu, &l_cpu, &t_cpu, &u_cpu, &m_cpu, &o_cpu);
+    run(hip, &l_hip, &t_hip, (&u_hip, &tp_hip), &m_hip, &o_hip);
+    run(cpu, &l_cpu, &t_cpu, (&u_cpu, &tp_cpu), &m_cpu, &o_cpu);
     let what = format!("logits_reduce {cfg} rows={rows}");
     let (ids_h, ids_c) = (read(&o_hip.0), read(&o_cpu.0));
     assert_eq!(ids_h, ids_c, "{what} ({impl_name}): top ids");
@@ -1518,6 +1578,7 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
     let (s_h, s_c) = (read(&o_hip.3), read(&o_cpu.3));
     let (sl_h, sl_c) = (read(&o_hip.4), read(&o_cpu.4));
     let mut boundary = 0;
+    let mut nucleus_rows = 0;
     for r in 0..rows {
         if modes[r] == 0.0 {
             assert_eq!((s_h[r], s_c[r]), (-1.0, -1.0), "{what}: row {r} mode 0");
@@ -1530,8 +1591,14 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
             sl_h[r].to_bits() == row[id].to_bits() || (sl_h[r].is_nan() && row[id].is_nan()),
             "{what}: row {r} sampled_logit"
         );
+        let nucleus = temperatures[r] > 0.0 && top_ps[r] < 1.0 && row.iter().any(|v| v.is_finite());
+        nucleus_rows += usize::from(nucleus);
         if s_h[r] != s_c[r] {
-            let d = cdf_boundary_distance(row, temperatures[r], uniforms[r]);
+            let d = if nucleus {
+                nucleus_boundary_distance(row, temperatures[r], top_ps[r], uniforms[r])
+            } else {
+                cdf_boundary_distance(row, temperatures[r], uniforms[r])
+            };
             assert!(
                 temperatures[r] > 0.0 && d <= 1e-6,
                 "{what}: row {r} drew {} (cpu {}), {d:e} from a CDF boundary",
@@ -1545,15 +1612,17 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
     }
     println!(
         "{what}: impl={impl_name} top ids exact, max lse rel |Δ| {worst_lse:.3e}, \
-         draws identical but {boundary} at a CDF boundary ok"
+         draws identical ({nucleus_rows} from a top_p nucleus) but {boundary} at a CDF \
+         boundary ok"
     );
 }
 
 /// Lab only (P2c S-4/S-9): the HIP `logits_reduce` (ABI v2.1) matches the cpu reference over
 /// 64 rows of the OLMoE (50,304) and Llama-3 (128,256) vocabularies: top-n ids identical, lse
-/// within 1e-5 relative, categorical draws identical except within 1e-6 of a CDF boundary. Also
-/// prints the device time of a 16-row decode batch's reduction against the full-row copy it
-/// replaces.
+/// within 1e-5 relative, categorical draws — id order and `top_p` nucleus — identical except
+/// within 1e-6 of a CDF or nucleus boundary. Also prints the device time of a 16-row decode
+/// batch's reduction (id-order draws, and nuclei at the Llama defaults T 0.6 / top_p 0.9 over
+/// peaked and over broad rows) against the full-row copy it replaces.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn logits_reduce_matches_cpu() {
@@ -1580,6 +1649,7 @@ fn logits_reduce_matches_cpu() {
         .expect("upload");
     let (t, _) = twin(&p, &[rows], DType::F32, &[1.0; 16]);
     let (u, _) = twin(&p, &[rows], DType::F32, &[0.5; 16]);
+    let (no_nucleus, _) = twin(&p, &[rows], DType::F32, &[1.0; 16]);
     let (m, _) = twin(&p, &[rows], DType::I32, &[1.0; 16]);
     let ids = Tensor::empty(&p.hip_mem, &[rows, 20], DType::I32).expect("alloc");
     let vals = Tensor::empty(&p.hip_mem, &[rows, 20], DType::F32).expect("alloc");
@@ -1587,11 +1657,12 @@ fn logits_reduce_matches_cpu() {
         .into_iter()
         .map(|d| Tensor::empty(&p.hip_mem, &[rows], d).expect("alloc"))
         .collect();
-    let reduce = || {
+    let reduce_with = |logits: &Tensor, t: &Tensor, tp: &Tensor| {
         hip.execute(&mut LogitsReduceContext {
             logits: logits.view(),
             temperature: t.view(),
             uniform: u.view(),
+            top_p: tp.view(),
             mode: m.view(),
             top_ids: ids.view(),
             top_values: vals.view(),
@@ -1602,15 +1673,36 @@ fn logits_reduce_matches_cpu() {
         })
         .expect("logits_reduce");
     };
-    reduce();
-    p.hip_mem.synchronize().expect("sync");
     const ITERS: u32 = 50;
-    let started = std::time::Instant::now();
-    for _ in 0..ITERS {
-        reduce();
+    let time = |logits: &Tensor, t: &Tensor, tp: &Tensor| {
+        reduce_with(logits, t, tp);
+        p.hip_mem.synchronize().expect("sync");
+        let started = std::time::Instant::now();
+        for _ in 0..ITERS {
+            reduce_with(logits, t, tp);
+        }
+        p.hip_mem.synchronize().expect("sync");
+        started.elapsed().as_secs_f64() * 1e6 / f64::from(ITERS)
+    };
+    let reduce_us = time(&logits, &t, &no_nucleus);
+    // Nuclei at the Llama-3.2 generation defaults: over the broad rows (a nucleus of tens of
+    // thousands of ids: the mass searches) and over peaked rows (a few confident ids over a
+    // bulk far below: the nucleus is inside the sorted candidates).
+    let (t_llama, _) = twin(&p, &[rows], DType::F32, &[0.6; 16]);
+    let (tp_llama, _) = twin(&p, &[rows], DType::F32, &[0.9; 16]);
+    let broad_us = time(&logits, &t_llama, &tp_llama);
+    let mut peaked_data = data.clone();
+    for (r, row) in peaked_data.chunks_exact_mut(VOCAB).enumerate() {
+        for (i, v) in [(r * 11, 24.0), (r * 11 + 5000, 23.0), (r * 11 + 9000, 22.5)] {
+            row[i] = v;
+        }
     }
-    p.hip_mem.synchronize().expect("sync");
-    let reduce_us = started.elapsed().as_secs_f64() * 1e6 / f64::from(ITERS);
+    let mut peaked = Tensor::empty(&p.hip_mem, &[rows, VOCAB], DType::F32).expect("alloc");
+    peaked
+        .storage
+        .copy_from_host(0, &encode(DType::F32, &peaked_data))
+        .expect("upload");
+    let peaked_us = time(&peaked, &t_llama, &tp_llama);
     let started = std::time::Instant::now();
     for _ in 0..ITERS {
         let _ = read(&ids);
@@ -1622,7 +1714,8 @@ fn logits_reduce_matches_cpu() {
     }
     let full_us = started.elapsed().as_secs_f64() * 1e6 / 10.0;
     println!(
-        "logits_reduce timing: 16 x {VOCAB} rows reduce {reduce_us:.1} us, read of the \
+        "logits_reduce timing: 16 x {VOCAB} rows reduce {reduce_us:.1} us (T 0.6 top_p 0.9 \
+         nucleus: peaked rows {peaked_us:.1} us, broad rows {broad_us:.1} us), read of the \
          reduction {small_us:.1} us, full-row copy {full_us:.1} us ({} bytes)",
         rows * VOCAB * 4
     );

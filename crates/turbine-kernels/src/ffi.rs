@@ -281,6 +281,8 @@ pub(crate) struct LogitsReduceDesc {
     pub lse: *mut f32,
     pub sampled: *mut i32,
     pub sampled_logit: *mut f32,
+    /// `[rows]`, or null for 1 on every row.
+    pub top_p: *const f32,
 }
 
 /// `turbine_<op>`: enqueue on the context's compute stream.

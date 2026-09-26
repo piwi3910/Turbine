@@ -708,10 +708,10 @@ fn requirements_and_workspace() {
     // 2·kv_dim], gate_up [2·intermediate] and act [intermediate], all bf16.
     assert_eq!(per_token, 4 + 4 + 2 * (3 * 64 + 2 * 64 + 2 * 32 + 3 * 128));
     // Per sequence: last row [hidden] bf16, logits [vocab] f32, the logits_reduce results (64
-    // ids and values, lse, sampled id and logit) and inputs (temperature, uniform, mode),
+    // ids and values, lse, sampled id and logit) and inputs (temperature, uniform, top_p, mode),
     // q_indptr + kv_lens entries and a block table for max_position_embeddings tokens (i32).
     let blocks = u64::from(spec.config.max_position_embeddings.div_ceil(BLOCK_TOKENS));
-    let reduce = 4 * (2 * 64 + 3) + 4 * 3;
+    let reduce = 4 * (2 * 64 + 3) + 4 * 4;
     assert_eq!(
         ws(1, 2) - ws(1, 1),
         2 * 64 + 4 * 263 + reduce + 4 * (2 + blocks)
@@ -2101,20 +2101,37 @@ fn expected_reduction(row: &[f32], r: &RowReduce) -> ReducedRow {
             .iter()
             .map(|&v| v * inv_t)
             .fold(f32::NEG_INFINITY, f32::max);
-        let w: Vec<f64> = row
+        // Id order, or descending (ties by id) for a top-p nucleus.
+        let mut order: Vec<usize> = (0..row.len()).collect();
+        if r.top_p < 1.0 {
+            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+        }
+        let mut w: Vec<f64> = order
             .iter()
-            .map(|&v| f64::from(v * inv_t - smax).exp())
+            .map(|&id| f64::from(row[id] * inv_t - smax).exp())
             .collect();
+        if r.top_p < 1.0 {
+            let target = f64::from(r.top_p) * w.iter().sum::<f64>();
+            let mut cum = 0.0;
+            let keep = w
+                .iter()
+                .position(|x| {
+                    cum += x;
+                    cum >= target
+                })
+                .expect("a nucleus below the total");
+            w.truncate(keep + 1);
+        }
         let target = f64::from(u) * w.iter().sum::<f64>();
         let mut cum = 0.0;
-        let id = w
+        let i = w
             .iter()
             .position(|x| {
                 cum += x;
                 target < cum
             })
             .expect("a draw below the total");
-        (id as u32, row[id])
+        (order[i] as u32, row[order[i]])
     });
     ReducedRow {
         lse: max + sum.ln() as f32,
@@ -2217,16 +2234,24 @@ fn check_reduced_rows(
             top_n,
             temperature: 0.0,
             uniform: None,
+            top_p: 1.0,
         };
         let draw = RowReduce {
             top_n: 3,
             temperature: 0.8,
             uniform: Some(0.37),
+            top_p: 1.0,
+        };
+        let nucleus = RowReduce {
+            top_n: 2,
+            temperature: 0.6,
+            uniform: Some(0.81),
+            top_p: 0.9,
         };
         let steps: [(&[u32], [Option<RowReduce>; 3]); 3] = [
             (&LENS, [Some(greedy(5)), None, Some(draw)]),
             (&[1, 1, 1], [None, Some(greedy(1)), Some(draw)]),
-            (&[1, 1, 1], [Some(greedy(20)), None, None]),
+            (&[1, 1, 1], [Some(greedy(20)), Some(nucleus), None]),
         ];
         let mut kv_lens = [0u32; 3];
         for (step, (q_lens, reduce)) in steps.iter().enumerate() {

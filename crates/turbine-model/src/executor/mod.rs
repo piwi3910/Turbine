@@ -245,7 +245,8 @@ pub struct SeqSlice<'a> {
 
 /// What the device reduction of one logits row computes (P2c S-4): the `top_n` largest raw
 /// logits with their ids and the row's log-sum-exp, and, when `uniform` is set, one
-/// categorical draw at `temperature` by inverse CDF in id order.
+/// categorical draw at `temperature`: by inverse CDF in id order when `top_p` is 1, else over
+/// the `top_p` nucleus in descending logit order (the host sampler's top-p draw).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowReduce {
     /// Candidates to return, 1..=[`logits::MAX_TOP_N`].
@@ -253,6 +254,8 @@ pub struct RowReduce {
     pub temperature: f32,
     /// The draw's uniform in `[0, 1)`; `None` = no draw on the device.
     pub uniform: Option<f32>,
+    /// The draw's nucleus mass in `(0, 1]` (1 = the whole vocabulary); unused without a draw.
+    pub top_p: f32,
 }
 
 /// One logits row reduced on the device: its raw log-sum-exp, its `top_n` largest raw logits

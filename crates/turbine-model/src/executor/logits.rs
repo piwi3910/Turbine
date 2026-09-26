@@ -23,6 +23,9 @@ use crate::config::ModelArchConfig;
 /// The most candidates one reduced row returns (the ABI bound).
 pub const MAX_TOP_N: usize = LogitsReduceConfig::MAX_TOP_N as usize;
 
+/// 4-byte words per row of the reduction's inputs: temperature, uniform, top_p and mode.
+const INPUT_WORDS: usize = 4;
+
 /// 4-byte words per row of the result block at `top_n`: ids and values, then lse, sampled id
 /// and sampled logit.
 fn result_words(top_n: usize) -> usize {
@@ -70,7 +73,8 @@ pub(super) struct LogitsHead {
     /// F32 `[max_seqs, vocab]` rows, then the result block for `max_seqs` rows at
     /// [`MAX_TOP_N`].
     out: DeviceBuffer,
-    /// Per reduced row: temperature (F32), uniform (F32), mode (I32), as three arrays.
+    /// Per reduced row: temperature (F32), uniform (F32), top_p (F32), mode (I32), as four
+    /// arrays.
     inputs: DeviceBuffer,
     /// The bytes of the last `inputs` upload; valid until the logits copy synchronizes.
     host_inputs: Vec<u8>,
@@ -87,7 +91,7 @@ impl LogitsHead {
     /// Device bytes for `max_seqs` rows of `vocab` logits plus the reduction's inputs and
     /// results.
     pub fn bytes(vocab: usize, max_seqs: usize) -> u64 {
-        4 * (max_seqs * (vocab + result_words(MAX_TOP_N)) + 3 * max_seqs) as u64
+        4 * (max_seqs * (vocab + result_words(MAX_TOP_N)) + INPUT_WORDS * max_seqs) as u64
     }
 
     /// Allocates the buffers for `max_seqs` rows. Rows are reduced when `registry` selected
@@ -111,8 +115,8 @@ impl LogitsHead {
             vocab,
             reduce: (selected && vocab > MAX_TOP_N).then_some(rc),
             out: DeviceBuffer::alloc(mem, out_bytes)?,
-            inputs: DeviceBuffer::alloc(mem, 12 * max_seqs)?,
-            host_inputs: Vec::with_capacity(12 * max_seqs),
+            inputs: DeviceBuffer::alloc(mem, 4 * INPUT_WORDS * max_seqs)?,
+            host_inputs: Vec::with_capacity(4 * INPUT_WORDS * max_seqs),
             order: Vec::with_capacity(max_seqs),
             seqs: 0,
             reduced: 0,
@@ -177,6 +181,10 @@ impl LogitsHead {
                 self.host_inputs.extend_from_slice(&u.to_le_bytes());
             }
             for q in &self.requests {
+                let top_p = if q.uniform.is_some() { q.top_p } else { 1.0 };
+                self.host_inputs.extend_from_slice(&top_p.to_le_bytes());
+            }
+            for q in &self.requests {
                 let mode = i32::from(q.uniform.is_some());
                 self.host_inputs.extend_from_slice(&mode.to_le_bytes());
             }
@@ -192,7 +200,8 @@ impl LogitsHead {
                     logits: TensorView::contiguous(out, 0, &[r, vocab], DType::F32),
                     temperature: rows_f32(0),
                     uniform: rows_f32(r),
-                    mode: TensorView::contiguous(inp, 2 * r, &[r], DType::I32),
+                    top_p: rows_f32(2 * r),
+                    mode: TensorView::contiguous(inp, 3 * r, &[r], DType::I32),
                     top_ids: block(0, &[r, top_n], DType::I32),
                     top_values: block(r * top_n, &[r, top_n], DType::F32),
                     lse: block(2 * r * top_n, &[r], DType::F32),

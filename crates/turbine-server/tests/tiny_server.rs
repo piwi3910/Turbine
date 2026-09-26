@@ -2358,9 +2358,9 @@ struct DeviceCase {
 /// P2c S-4/S-14: seeded requests give identical tokens and logprobs whether their rows are
 /// reduced on the device (`logits_reduce` of the CPU provider) or copied whole to the host
 /// sampler, and `turbine_logits_rows_total{path="device_reduced"}` counts exactly the eligible
-/// rows: none of a request with `logit_bias`, a JSON schema or (sampling) the checkpoint's
-/// `top_p` 0.9 default, those of a `min_tokens` 4 request from its fifth token on; greedy rows
-/// qualify whatever `top_p` is.
+/// rows: none of a request with `logit_bias` or a JSON schema, those of a `min_tokens` 4
+/// request from its fifth token on, and every row of greedy requests and of sampled ones with
+/// `top_p` 1 or below (the checkpoint's 0.9 default, 0.3, and 0.5 under `top_k` 40).
 #[test]
 fn device_sampling_matches_host() {
     const TOKENS: u64 = 8;
@@ -2404,7 +2404,19 @@ fn device_sampling_matches_host() {
             json!({"temperature": 1.0, "top_p": 1.0, "top_k": 40, "seed": 10}),
             TOKENS,
         ),
-        case(json!({"temperature": 1.0, "seed": 13, "logprobs": 2}), 0),
+        case(
+            json!({"temperature": 1.0, "seed": 13, "logprobs": 2}),
+            TOKENS,
+        ),
+        case(json!({"temperature": 0.6, "seed": 14}), TOKENS),
+        case(
+            json!({"temperature": 1.3, "top_p": 0.3, "top_k": -1, "seed": 15, "logprobs": 1}),
+            TOKENS,
+        ),
+        case(
+            json!({"temperature": 0.8, "top_p": 0.5, "top_k": 40, "seed": 16, "logprobs": 3}),
+            TOKENS,
+        ),
         case(
             json!({"temperature": 1.0, "top_p": 1.0, "seed": 11, "logit_bias": {"120": 2}, "logprobs": 1}),
             0,

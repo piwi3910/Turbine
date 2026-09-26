@@ -915,6 +915,7 @@ fn logits_reduce_probe(cfg: &LogitsReduceConfig) -> LogitsReduceDesc {
         lse: std::ptr::null_mut(),
         sampled: std::ptr::null_mut(),
         sampled_logit: std::ptr::null_mut(),
+        top_p: std::ptr::null(),
     }
 }
 
@@ -1042,6 +1043,7 @@ impl LogitsReduceKernel for ShimProvider {
         for (name, v, dtype) in [
             ("temperature", &ctx.temperature, DType::F32),
             ("uniform", &ctx.uniform, DType::F32),
+            ("top_p", &ctx.top_p, DType::F32),
             ("mode", &ctx.mode, DType::I32),
             ("lse", &ctx.lse, DType::F32),
             ("sampled", &ctx.sampled, DType::I32),
@@ -1066,6 +1068,7 @@ impl LogitsReduceKernel for ShimProvider {
                 .ctx
                 .device_ptr("sampled_logit", &ctx.sampled_logit)?
                 .cast(),
+            top_p: self.ctx.device_ptr("top_p", &ctx.top_p)? as *const f32,
         };
         self.run(trio, &d)
     }

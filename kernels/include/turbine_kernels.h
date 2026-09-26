@@ -405,12 +405,19 @@ typedef struct turbine_add_rmsnorm_desc {
 /* Per logits row r (F32 [rows, vocab], row stride stride_row): lse[r] = the
  * log-sum-exp of the raw logits (NaN ignored); top_ids[r] / top_values[r] =
  * the top_n (<= 64) largest raw logits and their ids, descending, ties to the
- * lower id, NaN last; when mode[r] = 1, sampled[r] = the smallest id whose
- * cumulative sum of exp(logit / temperature[r] - max) in id order exceeds
- * uniform[r] * total (argmax when temperature[r] <= 0 or no logit is finite)
- * and sampled_logit[r] its raw logit; mode[r] = 0 leaves sampled[r] = -1 and
- * sampled_logit[r] = NaN. All buffers are device buffers; the per-row arrays
- * are [rows], top_ids and top_values [rows, top_n]. */
+ * lower id, NaN last; when mode[r] = 1, sampled[r] is one categorical draw at
+ * temperature[r] with the uniform[r] (argmax when temperature[r] <= 0 or no
+ * logit is finite) and sampled_logit[r] its raw logit; mode[r] = 0 leaves
+ * sampled[r] = -1 and sampled_logit[r] = NaN. The draw's weights are
+ * w = exp(logit / temperature[r] - max) (NaN weighs 0):
+ *   - top_p[r] >= 1 (or top_p NULL): the smallest id whose cumulative sum of w
+ *     in id order exceeds uniform[r] * total;
+ *   - top_p[r] < 1 (nucleus): over the ids in descending logit order (ties to
+ *     the lower id), keep the shortest prefix whose sum of w reaches
+ *     top_p[r] * total (at least one id), then take the first id of that
+ *     prefix whose cumulative sum exceeds uniform[r] * the prefix's sum.
+ * All buffers are device buffers; the per-row arrays are [rows], top_ids and
+ * top_values [rows, top_n]. */
 typedef struct turbine_logits_reduce_desc {
   const float *logits;
   int64_t rows, vocab, stride_row;
@@ -425,6 +432,8 @@ typedef struct turbine_logits_reduce_desc {
   float *lse;
   int32_t *sampled;
   float *sampled_logit;
+  /* [rows] in (0, 1], or NULL for 1 on every row: the draw's nucleus mass */
+  const float *top_p;
 } turbine_logits_reduce_desc;
 
 /* v2.1 trios: add_rmsnorm, logits_reduce. */

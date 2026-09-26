@@ -137,7 +137,8 @@ fn header_declares_the_v21_minor_revision() {
         "int32_t turbine_ctx_set_option(turbine_ctx *ctx, int32_t option, int64_t value);",
         "int32_t turbine_ctx_get_option(turbine_ctx *ctx, int32_t option, int64_t *out);",
         "} turbine_add_rmsnorm_desc;",
-        "} turbine_logits_reduce_desc;",
+        // The nucleus mass is the descriptor's last member (added after the Task 9 fields).
+        "float *sampled_logit; const float *top_p; } turbine_logits_reduce_desc;",
         "int32_t turbine_add_rmsnorm(turbine_ctx *ctx, const turbine_add_rmsnorm_desc *d);",
         "int32_t turbine_add_rmsnorm_supported(const turbine_add_rmsnorm_desc *d);",
         "const char *turbine_add_rmsnorm_impl(const turbine_add_rmsnorm_desc *d);",

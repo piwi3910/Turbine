@@ -192,10 +192,10 @@ Interfaces:
 Files: `crates/turbine-model/src/executor/mod.rs` (`RowReduce`, `ReducedRow`, `SeqSlice::reduce`, `Logits::reduced`), `crates/turbine-model/src/executor/logits.rs` (new: runs `logits_reduce` over the reduced rows and packs both outputs into the one D2H copy), `crates/turbine-model/src/executor/llama.rs` and `crates/turbine-model/src/executor/olmoe.rs` (call it after the LM head), `crates/turbine-model/src/sampler.rs` (`device_request`, `finish_reduced`, eligibility), `crates/turbine-server/src/engine/loop.rs` (ask each yielding sampler, route rows, `turbine_logits_rows_total{path}`), `crates/turbine-server/src/metrics.rs`, `crates/turbine-server/tests/tiny_server.rs` (`device_sampling_matches_host`)
 Interfaces:
 
-- `#[derive(Clone, Copy)] pub struct RowReduce { pub top_n: u8, pub temperature: f32, pub uniform: Option<f32> }`; `pub struct ReducedRow { pub lse: f32, pub top: Vec<(u32, f32)>, pub sampled: Option<(u32, f32)> }`
+- `#[derive(Clone, Copy)] pub struct RowReduce { pub top_n: u8, pub temperature: f32, pub uniform: Option<f32>, pub top_p: f32 }` (`top_p`: the device draw's nucleus mass, 1 = none); `pub struct ReducedRow { pub lse: f32, pub top: Vec<(u32, f32)>, pub sampled: Option<(u32, f32)> }`
 - `SeqSlice` gains `pub reduce: Option<RowReduce>`; `Logits` gains `pub reduced: Vec<ReducedRow>` and `pub fn slot(&self, i: usize) -> LogitsSlot<'_>` with `pub enum LogitsSlot<'a> { Full(&'a [f32]), Reduced(&'a ReducedRow) }`
-- `Sampler::device_request(&mut self) -> Option<RowReduce>` — `None` unless eligible (no penalties, no `logit_bias`, no mask, `min_tokens` reached, `top_p` ≥ 1, `top_k` −1 or 1..=64, `top_logprobs` ≤ 20); draws the step's uniform from the ChaCha stream when the step samples
-- `Sampler::finish_reduced(&mut self, r: &ReducedRow) -> SampledToken` — greedy: top[0]; `top_k` ≤ 64: the reference sorted-candidate draw over `top`; categorical: `sampled`; logprobs = raw logit − lse
+- `Sampler::device_request(&mut self) -> Option<RowReduce>` — `None` unless eligible (no penalties, no `logit_bias`, no mask, `min_tokens` reached, `top_k` −1 or 1..=64, `top_logprobs` ≤ 20; any `top_p`); draws the step's uniform from the ChaCha stream when the step samples
+- `Sampler::finish_reduced(&mut self, r: &ReducedRow) -> SampledToken` — greedy: top[0]; `top_k` ≤ 64: the reference sorted-candidate draw over `top` (then `top_p` over them); categorical: `sampled` (id order, or the device's `top_p` nucleus draw); logprobs = raw logit − lse
 - `turbine_logits_rows_total{path="device_reduced"|"full_row"}` on `ServerMetrics`; with `execution.device_sampling` false or no provider for `logits_reduce`, every row is `full_row`
   Covers: S-4/S-14 AC `tiny_server device_sampling_matches_host`
   Depends on: Tasks 7, 8

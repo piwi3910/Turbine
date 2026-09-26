@@ -556,18 +556,25 @@ pub struct AddRmsnormContext<'a> {
 /// - `lse[r]`: log-sum-exp of the raw logits, NaN ignored;
 /// - `top_ids[r]`/`top_values[r]`: the `top_n` largest raw logits and their ids, descending, ties
 ///   to the lower id, NaN last;
-/// - `mode[r]` = 1: `sampled[r]` is the smallest id whose cumulative sum of
-///   `exp(logit / temperature[r] − max)` in id order exceeds `uniform[r] · total` (the argmax when
-///   `temperature[r]` ≤ 0 or no logit is finite) and `sampled_logit[r]` its raw logit; `mode[r]` =
-///   0: `sampled[r]` = −1 and `sampled_logit[r]` = NaN.
+/// - `mode[r]` = 1: `sampled[r]` is one categorical draw at `temperature[r]` with `uniform[r]`
+///   (the argmax when `temperature[r]` ≤ 0 or no logit is finite) and `sampled_logit[r]` its raw
+///   logit; `mode[r]` = 0: `sampled[r]` = −1 and `sampled_logit[r]` = NaN. With the weights
+///   `w = exp(logit / temperature[r] − max)` (NaN weighs 0) the draw is:
+///   - `top_p[r]` ≥ 1: the smallest id whose cumulative `w` in id order exceeds
+///     `uniform[r] · total`;
+///   - `top_p[r]` < 1 (nucleus): over the ids in descending logit order (ties to the lower id),
+///     the shortest prefix whose `w` reaches `top_p[r] · total` (at least one id), and in it the
+///     first id whose cumulative `w` exceeds `uniform[r]` × the prefix's sum — the host
+///     sampler's top-p draw.
 ///
-/// Views: `logits` `[≥ rows, vocab]` F32 (row-strided); `temperature`, `uniform`, `lse`,
+/// Views: `logits` `[≥ rows, vocab]` F32 (row-strided); `temperature`, `uniform`, `top_p`, `lse`,
 /// `sampled_logit` `[≥ rows]` F32; `mode`, `sampled` `[≥ rows]` I32; `top_ids` I32 and
 /// `top_values` F32 `[≥ rows, top_n]`. All but `logits` are dense.
 pub struct LogitsReduceContext<'a> {
     pub logits: TensorView<'a>,
     pub temperature: TensorView<'a>,
     pub uniform: TensorView<'a>,
+    pub top_p: TensorView<'a>,
     pub mode: TensorView<'a>,
     pub top_ids: TensorView<'a>,
     pub top_values: TensorView<'a>,

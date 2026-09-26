@@ -401,11 +401,12 @@ impl Sampler {
     /// Whether this step's row can be reduced on the device (P2c S-4), and how. `None` when the
     /// step needs the whole row: a `logit_bias`, a penalty, `min_tokens` not yet reached, more
     /// than [`DEVICE_MAX_TOP_LOGPROBS`] alternatives or, when it samples (temperature > 0),
-    /// `top_p` < 1 or `top_k` above [`MAX_TOP_N`] (greedy ignores both, so it is eligible
+    /// `top_k` above [`MAX_TOP_N`] (greedy ignores `top_k` and `top_p`, so it is eligible
     /// whatever they are). The caller also keeps the whole row for a step with a token mask. When
     /// the step samples, its uniform is drawn here, exactly where [`Sampler::sample`] would
-    /// draw it; a categorical draw over the whole vocabulary (no `top_k`) happens on the
-    /// device, a `top_k` draw in [`Sampler::finish_reduced`] over the returned candidates.
+    /// draw it; a draw over the whole vocabulary (no `top_k`; the `top_p` nucleus when it is
+    /// below 1) happens on the device, a `top_k` draw (then `top_p` over the `top_k`) in
+    /// [`Sampler::finish_reduced`] over the returned candidates.
     pub fn device_request(&mut self) -> Option<RowReduce> {
         self.pending = None;
         let eligible = self.logit_bias.is_empty()
@@ -415,7 +416,7 @@ impl Sampler {
             && self.generated.len() as u64 >= u64::from(self.min_tokens)
             && self.top_logprobs <= DEVICE_MAX_TOP_LOGPROBS;
         let greedy = self.temperature <= 0.0;
-        if !eligible || !greedy && (self.top_p < 1.0 || self.top_k.is_some_and(|k| k > MAX_TOP_N)) {
+        if !eligible || !greedy && self.top_k.is_some_and(|k| k > MAX_TOP_N) {
             return None;
         }
         if greedy {
@@ -423,6 +424,7 @@ impl Sampler {
                 top_n: self.top_logprobs.max(1) as u8,
                 temperature: 0.0,
                 uniform: None,
+                top_p: 1.0,
             });
         }
         let word_pos = self.rng.get_word_pos();
@@ -431,16 +433,19 @@ impl Sampler {
             uniform: u,
             word_pos,
         });
+        let device_draw = self.top_k.is_none();
         Some(RowReduce {
             top_n: self.top_k.unwrap_or(1).max(self.top_logprobs).max(1) as u8,
             temperature: self.temperature,
-            uniform: self.top_k.is_none().then_some(u),
+            uniform: device_draw.then_some(u),
+            top_p: if device_draw { self.top_p } else { 1.0 },
         })
     }
 
     /// Completes the step [`Sampler::device_request`] asked the device for, from its
-    /// reduction: greedy takes the best candidate; `top_k` draws over the candidates in the
-    /// seeded draw's arithmetic; a whole-vocabulary draw takes the device's sample. Logprobs are
+    /// reduction: greedy takes the best candidate; `top_k` (then `top_p`) draws over the
+    /// candidates in the seeded draw's arithmetic; a whole-vocabulary draw (id order, or the
+    /// `top_p` nucleus) takes the device's sample. Logprobs are
     /// the raw logits less the row's log-sum-exp, as [`Sampler::sample`] reports them. A row
     /// without a finite (scaled) maximum gives the argmax and, like the host path, consumes no
     /// uniform.
@@ -468,7 +473,7 @@ impl Sampler {
                     None => uniform(&mut self.rng),
                 };
                 match self.top_k {
-                    Some(k) => draw_candidates(&r.top[..k.min(r.top.len())], inv_t, u),
+                    Some(k) => draw_candidates(&r.top[..k.min(r.top.len())], inv_t, self.top_p, u),
                     None => r.sampled.map_or(argmax, |(id, _)| id),
                 }
             }
@@ -745,15 +750,27 @@ impl Sampler {
     }
 }
 
-/// The seeded `top_k` draw ([`Sampler::draw_exact`] with `top_p` 1) over `candidates`
-/// (descending, ties by id) at `1/T` = `inv_t` with the uniform `u`.
-fn draw_candidates(candidates: &[(u32, f32)], inv_t: f32, u: f32) -> u32 {
+/// The seeded `top_k` draw ([`Sampler::draw_exact`]) over `candidates` (the top-k,
+/// descending, ties by id) at `1/T` = `inv_t`, then `top_p` over them, with the uniform `u`.
+fn draw_candidates(candidates: &[(u32, f32)], inv_t: f32, top_p: f32, u: f32) -> u32 {
     let scaled = || candidates.iter().map(|c| c.1 * inv_t);
     let Some(max) = finite_max(scaled()) else {
         return candidates.first().map_or(0, |c| c.0);
     };
-    let weights: Vec<f64> = scaled().map(|c| weight(c, max)).collect();
-    let total: f64 = weights.iter().sum();
+    let mut weights: Vec<f64> = scaled().map(|c| weight(c, max)).collect();
+    let mut total: f64 = weights.iter().sum();
+    if top_p < 1.0 {
+        // The shortest prefix whose mass reaches top_p (at least one candidate).
+        let target = f64::from(top_p) * total;
+        let mut cum = 0.0;
+        if let Some(i) = weights.iter().position(|w| {
+            cum += w;
+            cum >= target
+        }) {
+            weights.truncate(i + 1);
+        }
+        total = weights.iter().sum();
+    }
     let u = f64::from(u) * total;
     let mut cum = 0.0;
     for (i, w) in weights.iter().enumerate() {
@@ -1398,9 +1415,9 @@ mod tests {
         }
     }
 
-    /// Llama-3-sized rows: a broad bulk and a few confident candidates, deterministic.
     /// The device reduction of `row` for `rr`, as `logits_reduce` defines it: the top-n in
-    /// sampler order, the log-sum-exp, and the id-order inverse-CDF draw in f64.
+    /// sampler order, the log-sum-exp, and the draw in f64 — inverse CDF in id order, or over
+    /// the `top_p` nucleus in descending order.
     fn reduce_row(row: &[f32], rr: &RowReduce) -> ReducedRow {
         let mut keys = Vec::new();
         let mut top = Vec::new();
@@ -1408,16 +1425,37 @@ mod tests {
         let sampled = rr.uniform.map(|u| {
             let inv_t = 1.0 / rr.temperature;
             let max = finite_max(row.iter().map(|&v| v * inv_t)).expect("finite row");
-            let w: Vec<f64> = row.iter().map(|&v| weight(v * inv_t, max)).collect();
+            // Candidate order: id order, or descending for a nucleus.
+            let order: Vec<u32> = if rr.top_p < 1.0 {
+                let mut all = Vec::new();
+                top_n_into(row, row.len(), &mut keys, &mut all);
+                all.iter().map(|c| c.0).collect()
+            } else {
+                (0..row.len() as u32).collect()
+            };
+            let mut w: Vec<f64> = order
+                .iter()
+                .map(|&id| weight(row[id as usize] * inv_t, max))
+                .collect();
+            if rr.top_p < 1.0 {
+                let target = f64::from(rr.top_p) * w.iter().sum::<f64>();
+                let mut cum = 0.0;
+                let keep = w.iter().position(|x| {
+                    cum += x;
+                    cum >= target
+                });
+                w.truncate(keep.map_or(w.len(), |i| i + 1));
+            }
             let target = f64::from(u) * w.iter().sum::<f64>();
             let mut cum = 0.0;
-            let id = w
+            let i = w
                 .iter()
                 .position(|x| {
                     cum += x;
                     target < cum
                 })
                 .unwrap_or_else(|| w.iter().rposition(|&x| x > 0.0).unwrap());
+            let id = order[i] as usize;
             (id as u32, row[id])
         });
         ReducedRow {
@@ -1437,19 +1475,23 @@ mod tests {
         row
     }
 
-    /// P2c S-4: for every eligible seeded configuration, finishing a step from its device
-    /// reduction gives the token, logprob and alternatives the host sampler gives on the whole
-    /// row, and leaves the ChaCha stream where the host sampler leaves it.
+    /// P2c S-4: for every eligible seeded configuration (`top_p` 1 and below, with and without
+    /// `top_k`), finishing a step from its device reduction gives the token, logprob and
+    /// alternatives the host sampler gives on the whole row, and leaves the ChaCha stream where
+    /// the host sampler leaves it.
     #[test]
     fn device_steps_match_host_steps() {
         let mut rows = ChaCha8Rng::seed_from_u64(99);
         let mut configs = 0;
         for temperature in [0.0, 0.7, 1.0] {
-            for top_k in [-1, 1, 5, 40, 64] {
+            for (top_k, top_p) in [-1, 1, 5, 40, 64]
+                .into_iter()
+                .flat_map(|k| [(k, 1.0), (k, 0.9), (k, 0.3)])
+            {
                 for logprobs in [None, Some(0), Some(3), Some(20)] {
                     let p = SamplingParams {
                         logprobs,
-                        ..params(temperature, 1.0, top_k, 5 + configs)
+                        ..params(temperature, top_p, top_k, 5 + configs)
                     };
                     configs += 1;
                     let (mut host, mut device) = (plain(&p), plain(&p));
@@ -1458,6 +1500,8 @@ mod tests {
                         let want = host.sample(&mut row.clone(), None);
                         let rr = device.device_request().expect("eligible");
                         assert_eq!(rr.uniform.is_some(), temperature > 0.0 && top_k == -1);
+                        let nucleus = temperature > 0.0 && top_k == -1 && top_p < 1.0;
+                        assert_eq!(rr.top_p < 1.0, nucleus, "{p:?}");
                         let got = device.finish_reduced(&reduce_row(&row, &rr));
                         assert_eq!(got, want, "{p:?} step {step}");
                         assert_eq!(device.state(), host.state(), "{p:?} step {step}");
@@ -1483,11 +1527,8 @@ mod tests {
     fn device_request_eligibility() {
         let base = params(1.0, 1.0, -1, 1);
         let ineligible = [
-            SamplingParams {
-                top_p: 0.9,
-                ..base.clone()
-            },
             params(1.0, 1.0, 65, 1),
+            params(1.0, 0.9, 65, 1),
             SamplingParams {
                 logprobs: Some(21),
                 ..base.clone()
@@ -1540,15 +1581,98 @@ mod tests {
             Some(RowReduce {
                 top_n: 7,
                 temperature: 0.0,
-                uniform: None
+                uniform: None,
+                top_p: 1.0,
             })
         );
+        // top_k draws on the host (its top_p too); a top_p nucleus without top_k on the device.
         let mut k = plain(&SamplingParams {
             logprobs: Some(3),
-            ..params(0.8, 1.0, 40, 1)
+            ..params(0.8, 0.9, 40, 1)
         });
         let r = k.device_request().expect("eligible");
-        assert_eq!((r.top_n, r.uniform), (40, None));
+        assert_eq!((r.top_n, r.uniform, r.top_p), (40, None, 1.0));
+        let mut n = plain(&params(0.6, 0.9, -1, 1));
+        let r = n.device_request().expect("eligible");
+        assert_eq!((r.top_n, r.temperature, r.top_p), (1, 0.6, 0.9));
+        assert!(r.uniform.is_some());
+    }
+
+    /// P2c S-4, unseeded: the device's top-p draw (the reduction's nucleus with the uniform
+    /// drawn in `device_request`) and the host's fast draw both follow the exact top-p
+    /// distribution — same support (the nucleus) and total variation below 0.03 over 20,000
+    /// draws each. Breaks if either path cuts the nucleus at another mass, draws outside it, or
+    /// weights it at another temperature.
+    #[test]
+    fn unseeded_device_top_p_follows_the_distribution() {
+        let (temperature, top_p) = (0.6f32, 0.9f32);
+        // A peaked 2,000-entry row: a few confident candidates over a broad bulk.
+        let mut rng = ChaCha8Rng::seed_from_u64(4242);
+        let mut row: Vec<f32> = (0..2000).map(|_| uniform(&mut rng) * 6.0 - 4.0).collect();
+        for (i, v) in [(17, 6.0), (400, 5.5), (401, 5.5), (1999, 5.0), (3, 4.2)] {
+            row[i] = v;
+        }
+        // The exact distribution: descending order, the shortest prefix reaching top_p.
+        let mut keys = Vec::new();
+        let mut sorted = Vec::new();
+        top_n_into(&row, row.len(), &mut keys, &mut sorted);
+        let inv_t = 1.0 / temperature;
+        let max = sorted[0].1 * inv_t;
+        let w: Vec<f64> = sorted.iter().map(|c| weight(c.1 * inv_t, max)).collect();
+        let target = f64::from(top_p) * w.iter().sum::<f64>();
+        let mut cum = 0.0;
+        let keep = w
+            .iter()
+            .position(|x| {
+                cum += x;
+                cum >= target
+            })
+            .expect("nucleus")
+            + 1;
+        assert!(
+            keep > 5 && keep < 100,
+            "a nucleus of {keep} exercises the cut"
+        );
+        let mass: f64 = w[..keep].iter().sum();
+        let mut exact = vec![0.0f64; row.len()];
+        for (c, x) in sorted[..keep].iter().zip(&w) {
+            exact[c.0 as usize] = x / mass;
+        }
+        let p = SamplingParams {
+            seed: None,
+            ..params(temperature, top_p, -1, 0)
+        };
+        const DRAWS: usize = 20_000;
+        let tv = |counts: &[u32]| -> f64 {
+            0.5 * counts
+                .iter()
+                .zip(&exact)
+                .map(|(&c, &e)| (f64::from(c) / DRAWS as f64 - e).abs())
+                .sum::<f64>()
+        };
+        let mut host = Sampler::new(&p, &[], &[]);
+        let mut device = Sampler::new(&p, &[], &[]);
+        let (mut host_counts, mut device_counts) = (vec![0u32; row.len()], vec![0u32; row.len()]);
+        for _ in 0..DRAWS {
+            host_counts[host.sample(&mut row.clone(), None).token as usize] += 1;
+            let rr = device.device_request().expect("eligible");
+            assert_eq!(rr.top_p, top_p);
+            let t = device.finish_reduced(&reduce_row(&row, &rr)).token as usize;
+            device_counts[t] += 1;
+        }
+        for (name, counts) in [("host", &host_counts), ("device", &device_counts)] {
+            let outside = counts
+                .iter()
+                .zip(&exact)
+                .filter(|&(&c, &e)| c > 0 && e == 0.0)
+                .count();
+            assert_eq!(outside, 0, "{name}: draws outside the nucleus");
+            let d = tv(counts);
+            assert!(
+                d < 0.03,
+                "{name}: total variation {d} from the top-p distribution"
+            );
+        }
     }
 
     fn big_rows(n: usize, seed: u64) -> Vec<Vec<f32>> {
