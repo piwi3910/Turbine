@@ -1343,14 +1343,21 @@ fn startup_failures_exit_1() {
     let tiny = dir.path().join("tiny");
     write_tiny_llama(&tiny, 7);
 
-    // The GPU KV tier is required (P2).
+    // The GPU KV tier is required: from Phase 4 the config itself rejects `kv.gpu.enabled:
+    // false` ("L0 is required"), so this is exit 2 before any port is bound.
     let addr = free_addr();
     let yaml = format!(
         "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cpu\n\
          kv:\n  gpu:\n    enabled: false\n",
         tiny.display()
     );
-    assert_exit_1(&yaml, addr, "kv.gpu.enabled");
+    let (code, stderr) = run_failing(&dir, &yaml);
+    assert_eq!(code, Some(2), "kv.gpu.enabled: stderr:\n{stderr}");
+    assert!(
+        stderr.contains("kv.gpu.enabled: L0 is required"),
+        "stderr:\n{stderr}"
+    );
+    TcpListener::bind(addr).expect("the configured port must still be free");
 
     // A kv pool (capped by kv.gpu.max_bytes) below one full-context sequence (P3 S-2: the
     // message names every pool and its bytes).

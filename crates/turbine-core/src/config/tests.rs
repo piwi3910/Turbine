@@ -769,3 +769,124 @@ fn reliability_config_validation() {
         assert_eq!(fi.alloc_fail_every, Some(5));
     }
 }
+
+#[test]
+fn kv_config_validation() {
+    const GIB: u64 = 1 << 30;
+    // Defaults equal the P4 §Configuration table (kv.gpu.max_bytes null from Phase 3, C-8).
+    let d = KvConfig::default();
+    assert!(d.gpu.enabled);
+    assert_eq!(d.gpu.max_bytes, None);
+    assert!(d.cpu.enabled);
+    assert_eq!(d.cpu.max_bytes, ByteSize::gib(64));
+    assert!(!d.nvme.enabled);
+    assert_eq!(d.nvme.path, PathBuf::from("/var/lib/turbine/kv"));
+    assert_eq!(d.nvme.max_bytes, ByteSize::gib(64));
+    assert_eq!(d.nvme.slab_bytes, ByteSize::gib(1));
+    assert_eq!((d.nvme.max_queue_depth, d.nvme.io_threads), (64, 4));
+    assert_eq!(d.policy, KvPolicyKind::CostAware);
+    assert_eq!(d.policy.as_str(), "cost_aware");
+    assert_eq!(d.demote_min_value, 0.0);
+    assert!(d.prefix_sharing);
+    assert_eq!(d.transfer.max_inflight_bytes, ByteSize::gib(1));
+    assert_eq!(d.session.max_sessions, 10_000);
+    assert_eq!(d.session.hot_ttl, HumanDuration::from_secs(60));
+    assert_eq!(d.session.warm_ttl, HumanDuration::from_secs(600));
+    assert_eq!(d.session.max_idle, HumanDuration::from_secs(3600));
+    assert_eq!(d.prefetch.lead_time, HumanDuration::from_secs(2));
+    assert_eq!(d.prefetch.max_queue, 256);
+    assert_eq!(d.policy_weights.session_active, 0.5);
+    assert_eq!(d.policy_weights.hit_half_life, HumanDuration::from_secs(60));
+
+    let base = "model:\n  path: /m\n";
+    let lru = parse(&format!("{base}kv:\n  policy: lru\n"), &[]).expect("lru is valid");
+    assert_eq!(lru.kv.policy, KvPolicyKind::Lru);
+    for (yaml, key) in [
+        ("kv:\n  gpu:\n    enabled: false\n", "kv.gpu.enabled"),
+        ("kv:\n  policy: lfu\n", "kv.policy"),
+        ("kv:\n  nvme:\n    max_bytes: 0\n", "kv.nvme.max_bytes"),
+        (
+            "kv:\n  session:\n    hot_ttl: 60s\n    warm_ttl: 30s\n",
+            "kv.session.warm_ttl",
+        ),
+        (
+            "kv:\n  nvme:\n    enabled: true\n    path: rel/kv\n",
+            "kv.nvme.path",
+        ),
+        (
+            "kv:\n  transfer:\n    max_inflight_bytes: 1\n",
+            "kv.transfer.max_inflight_bytes",
+        ),
+        ("kv:\n  nvme:\n    slab_bytes: 5000\n", "kv.nvme.slab_bytes"),
+        (
+            "kv:\n  nvme:\n    max_queue_depth: 0\n",
+            "kv.nvme.max_queue_depth",
+        ),
+        ("kv:\n  nvme:\n    io_threads: 65\n", "kv.nvme.io_threads"),
+        (
+            "kv:\n  session:\n    max_sessions: 0\n",
+            "kv.session.max_sessions",
+        ),
+        (
+            "kv:\n  policy_weights:\n    session_active: 1.5\n",
+            "kv.policy_weights.session_active",
+        ),
+        ("kv:\n  demote_min_value: -1.0\n", "kv.demote_min_value"),
+    ] {
+        assert_rejected(&format!("{base}{yaml}"), &[], key);
+    }
+
+    // Host facts: 32 GiB of RAM with an 8 GiB reserve cannot hold a 64 GiB L1; 50 GiB of free
+    // disk cannot hold a 64 GiB L2 (free space minus 10 %), and the error names the free space.
+    let small_host = HostFacts {
+        mem_total_bytes: Some(32 * GIB),
+        disk_free_bytes: Some(50 * GIB),
+    };
+    let err = KvConfig::default()
+        .validate_host(&small_host, ByteSize::gib(8))
+        .unwrap_err();
+    assert_eq!(err.key(), Some("kv.cpu.max_bytes"));
+    // Config::validate_host passes reliability.memory.host_reserve_bytes (contract §3.2).
+    let cfg = parse(base, &[]).expect("valid");
+    let err = cfg.validate_host(&small_host).unwrap_err();
+    assert_eq!(err.key(), Some("kv.cpu.max_bytes"));
+    let roomy = HostFacts {
+        mem_total_bytes: Some(125 * GIB),
+        disk_free_bytes: None,
+    };
+    cfg.validate_host(&roomy)
+        .expect("64 GiB L1 fits 125 GiB minus an 8 GiB reserve");
+    let mut nvme = KvConfig::default();
+    nvme.cpu.max_bytes = ByteSize::gib(8);
+    nvme.nvme.enabled = true;
+    let err = nvme
+        .validate_host(&small_host, ByteSize::gib(8))
+        .unwrap_err();
+    assert_eq!(err.key(), Some("kv.nvme.max_bytes"));
+    assert!(
+        err.to_string().contains(&(50 * GIB).to_string()),
+        "names the free space: {err}"
+    );
+    let unknown = HostFacts {
+        mem_total_bytes: None,
+        disk_free_bytes: None,
+    };
+    nvme.validate_host(&unknown, ByteSize::gib(8))
+        .expect("unknown host facts are not checked");
+
+    // Once the model layout is known: in-flight bytes hold one block, a slab holds one slot.
+    let block = 1_835_008;
+    KvConfig::default()
+        .validate_block_bytes(block)
+        .expect("defaults fit a Llama-3.2-3B block");
+    let err = KvConfig::default()
+        .validate_block_bytes(2 * GIB)
+        .unwrap_err();
+    assert_eq!(err.key(), Some("kv.transfer.max_inflight_bytes"));
+    let mut small_slab = KvConfig::default();
+    small_slab.nvme.enabled = true;
+    small_slab.nvme.slab_bytes = ByteSize::mib(1);
+    let err = small_slab.validate_block_bytes(block).unwrap_err();
+    assert_eq!(err.key(), Some("kv.nvme.slab_bytes"));
+    assert_eq!(KV_IO_ALIGN, 4096);
+}
