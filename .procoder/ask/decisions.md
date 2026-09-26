@@ -464,3 +464,15 @@ Card profiles:
 - B) Let in-flight prefills continue in SURVIVAL (changes the spec's SURVIVAL row)
 
 **Answer (2026-09-27): provisional (coordinator default, pending user review) — A.** Implemented behind the recovery controller so B can be switched in; the overload simulation seeds that exposed the gap (seed 6 stuck in SURVIVAL, seed 1 recovering in 64 s against the 60 s criterion) become regression tests.
+
+**Implemented (2026-09-27, branch `phase-3-reliability`, Task 12a):** `reliability.recovery.survival_liveness: requeue_unstarted` (A, default) | `continue_prefills` (B). A requeues at the request's original turn and queue-wait start (`survival_requeue` queue decision; `503 overloaded` if the queue is full). Regression tests `overload_sim survival_liveness_seed_6`, `survival_liveness_seed_1`, `survival_liveness_option_b`, `survival_requeues_unstarted_admitted`. Seed 6 recovers in 42.9 s under A (46.9 s under B); disabling the requeue brings back the stuck state (0.934 of the pool held, never GREEN). Seed 1 never entered SURVIVAL: its 64 s came from the backlog re-escalating YELLOW → RED, fixed by the KV headroom rule below.
+
+## Phase 3: KV headroom in admission (seed 1 recovery)
+
+The overload simulation's seed 1 recovered 64 s after the load stopped (criterion 60 s) without ever reaching SURVIVAL: de-escalating through YELLOW, its growth limit (+1 admitted request per iteration) admitted the queued backlog within seconds, the worst-case reservations lifted `kv_utilization` to 0.92 and the state went back to RED.
+
+- A) KV headroom: with adaptive admission, in YELLOW, ORANGE and RED an admission or refill waits (`kv_reservation`) when its reservation would lift `kv_utilization` past the next state's threshold; GREEN unchanged (recommended)
+- B) Slow YELLOW's batch growth (e.g. +1 per second instead of per iteration)
+- C) Relax the 60 s recovery criterion
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Seeds 1–12 all recover in 42–49 s; completions change from 137–548 to 247–581 per seed (seed 8: 408 → 346, seeds 10–12 up to 2×); GREEN admission, and so the Phase 2c throughput path below pressure, is unchanged. Spec S-9 amended; test `admission::tests::kv_headroom`.

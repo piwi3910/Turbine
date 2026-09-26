@@ -20,7 +20,8 @@ use turbine_core::telemetry::{
     DeviceSample, HostSample, LedgerSample, SourceStatus, TelemetrySample,
 };
 use turbine_core::types::{
-    CircuitState, DType, DeviceId, KvLayout, MemoryKind, PressureState, RequestId, SeqId,
+    CircuitState, DType, DeviceId, KvLayout, MemoryKind, PressureSignal, PressureState, RequestId,
+    SeqId,
 };
 use turbine_kv::{BlockPool, BlockPoolConfig, L0Reclaimer};
 use turbine_reliability::admission::{Admission, AdmissionParams, AdmissionQueue, Calibration};
@@ -31,6 +32,7 @@ use turbine_reliability::ledger::{Ledger, PoolUsage};
 use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_reliability::recovery::{RecoveryController, RecoveryOutcome, RecoveryStep};
 use turbine_reliability::reserve::{EmergencyReserve, ReserveAllocator};
+use turbine_reliability::signals::effective_thresholds;
 use turbine_reliability::throttle::SchedulerLimits;
 use turbine_tensor::DeviceMemory;
 use turbine_tensor::host::HostMemory;
@@ -298,7 +300,8 @@ impl OverloadSim {
             },
             Arc::clone(&ledger),
             metrics.clone(),
-        );
+        )
+        .with_kv_headroom(effective_thresholds(&rel.pressure)[&PressureSignal::KvUtilization]);
         let queue = AdmissionQueue::new(
             rel.admission.max_queue,
             rel.admission.queue_timeout.0,
@@ -434,6 +437,7 @@ impl OverloadSim {
             let outcome = match reason {
                 CancelReason::QueueTimeout => Outcome::Rejected("queue_timeout".into()),
                 CancelReason::CircuitOpen => Outcome::Rejected("circuit_open".into()),
+                CancelReason::Overloaded => Outcome::Rejected("overloaded".into()),
                 _ => Outcome::Cancelled,
             };
             self.finish(id, outcome);

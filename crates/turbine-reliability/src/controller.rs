@@ -16,7 +16,7 @@ use crate::signals::{
 };
 use crate::state::{Gates, MachineConfig, PressureMachine, Transition};
 use crate::throttle::{
-    KvReclaimer, SchedulerLimits, ThrottlePlan, apply_reclaim, plan_for, publish_plan,
+    KvReclaimer, SchedulerLimits, ThrottlePlan, apply_reclaim, plan_with, publish_plan,
 };
 use arc_swap::ArcSwap;
 use std::sync::Arc;
@@ -131,7 +131,8 @@ impl PressureController {
             Arc::clone(&clock),
         );
         let circuit = CircuitBreaker::new(&cfg.circuit, metrics.clone(), clock.now_mono());
-        let plan = plan_for(PressureState::Green, &limits);
+        let survival = cfg.recovery.survival_liveness;
+        let plan = plan_with(PressureState::Green, &limits, survival);
         publish_plan(&plan, &metrics);
         let placeholder = Snapshot {
             state: PressureState::Green,
@@ -321,7 +322,11 @@ impl PressureController {
     }
 
     fn apply_plan(&mut self) {
-        let plan = plan_for(self.machine.state(), &self.limits);
+        let plan = plan_with(
+            self.machine.state(),
+            &self.limits,
+            self.cfg.recovery.survival_liveness,
+        );
         if plan != self.plan {
             tracing::info!(
                 event = "throttle_plan_changed",

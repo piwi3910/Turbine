@@ -3,6 +3,7 @@
 //! one plan per pressure state, read by the scheduler once per iteration.
 
 use serde::Serialize;
+use turbine_core::config::SurvivalLiveness;
 use turbine_core::types::PressureState;
 
 use crate::metrics::{ActionLabel, FieldLabel, ReliabilityMetrics};
@@ -65,6 +66,9 @@ pub struct ThrottlePlan {
     pub start_new_prefills: bool,
     pub admission: AdmissionMode,
     pub reclaim: ReclaimAction,
+    /// SURVIVAL under `survival_liveness: requeue_unstarted` (option A): admitted requests that
+    /// have not started go back to the admission queue and drop their KV reservations.
+    pub requeue_unstarted: bool,
 }
 
 /// The scheduler configuration the plan scales.
@@ -88,6 +92,7 @@ pub fn plan_for(state: PressureState, cfg: &SchedulerLimits) -> ThrottlePlan {
         start_new_prefills: true,
         admission: AdmissionMode::Open,
         reclaim: ReclaimAction::None,
+        requeue_unstarted: false,
     };
     match state {
         PressureState::Green => open,
@@ -122,9 +127,20 @@ pub fn plan_for(state: PressureState, cfg: &SchedulerLimits) -> ThrottlePlan {
             start_new_prefills: false,
             admission: AdmissionMode::Stopped,
             reclaim: ReclaimAction::ReleaseReserveAndPreemptIfNeeded,
+            requeue_unstarted: true,
             ..open
         },
     }
+}
+
+/// [`plan_for`] with the SURVIVAL row of `survival` (`reliability.recovery.survival_liveness`,
+/// [`crate::recovery::survival_plan`]); every other state is the table's.
+pub fn plan_with(
+    state: PressureState,
+    cfg: &SchedulerLimits,
+    survival: SurvivalLiveness,
+) -> ThrottlePlan {
+    crate::recovery::survival_plan(plan_for(state, cfg), cfg, survival)
 }
 
 /// Reclaim hook. Phase 3 frees unreferenced cached GPU blocks; phase 4 implements demotion.

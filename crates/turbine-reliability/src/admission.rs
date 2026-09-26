@@ -3,6 +3,7 @@
 use crate::budget::PoolKind;
 use crate::ledger::{Ledger, LedgerError, Reservation};
 use crate::metrics::{DecisionLabels, ReliabilityMetrics};
+use crate::signals::SignalThresholds;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,14 +19,19 @@ pub enum PressureReason {
     PressureRed,
     CircuitDegraded,
     PrefillBudget,
+    /// An admitted request that had not started went back to the queue on entering SURVIVAL
+    /// (`reliability.recovery.survival_liveness: requeue_unstarted`), dropping its KV
+    /// reservation.
+    SurvivalRequeue,
 }
 impl PressureReason {
-    pub const ALL: [PressureReason; 5] = [
+    pub const ALL: [PressureReason; 6] = [
         PressureReason::KvReservation,
         PressureReason::PressureOrange,
         PressureReason::PressureRed,
         PressureReason::CircuitDegraded,
         PressureReason::PrefillBudget,
+        PressureReason::SurvivalRequeue,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -34,6 +40,7 @@ impl PressureReason {
             PressureReason::PressureRed => "pressure_red",
             PressureReason::CircuitDegraded => "circuit_degraded",
             PressureReason::PrefillBudget => "prefill_budget",
+            PressureReason::SurvivalRequeue => "survival_requeue",
         }
     }
 }
@@ -128,6 +135,8 @@ pub struct Admission {
     seed_prefill: (f64, f64),
     seed_decode: (f64, u32),
     expensive_in_flight: u32,
+    /// `kv_utilization` thresholds for the KV headroom rule; `None` = no headroom rule.
+    kv_headroom: Option<SignalThresholds>,
 }
 
 impl Admission {
@@ -142,7 +151,20 @@ impl Admission {
             seed_prefill: (0.0, 0.0),
             seed_decode: (0.0, 0),
             expensive_in_flight: 0,
+            kv_headroom: None,
         }
+    }
+
+    /// The KV headroom rule (P3 S-9, amendment 2026-09-27): with adaptive admission, in
+    /// YELLOW, ORANGE and RED an admission (or a queued request's refill) waits
+    /// (`kv_reservation`) when its worst-case reservation would lift `kv_utilization` (used +
+    /// reserved) past the `kv` threshold of the next state up — so admissions alone never
+    /// escalate the state, and after a load stops the queued backlog cannot push a
+    /// de-escalating engine back up (the overload simulation's seed 1 went YELLOW → RED on its
+    /// backlog and recovered 64 s after the load stopped). GREEN has no headroom rule.
+    pub fn with_kv_headroom(mut self, kv: SignalThresholds) -> Self {
+        self.kv_headroom = Some(kv);
+        self
     }
 
     pub fn params(&self) -> &AdmissionParams {
@@ -201,7 +223,7 @@ impl Admission {
         circuit: CircuitState,
         queue_len: usize,
     ) -> AdmissionDecision {
-        self.decide_inner(est, state, circuit, queue_len)
+        self.decide_inner(est, state, state, circuit, queue_len)
     }
 
     /// The decision for a queued request offered a running slot the throttle plan opened (the
@@ -216,15 +238,37 @@ impl Admission {
         state: PressureState,
         circuit: CircuitState,
     ) -> AdmissionDecision {
-        let state = match state {
+        let rules = match state {
             PressureState::Red => PressureState::Orange,
             other => other,
         };
-        self.decide_inner(est, state, circuit, 0)
+        self.decide_inner(est, rules, state, circuit, 0)
     }
 
     fn kv_bytes(&self, est: &ResourceEstimate) -> u64 {
         est.projected_kv_blocks as u64 * self.params.block_bytes
+    }
+
+    /// An admitted request that had not started goes back to the queue (SURVIVAL, option A):
+    /// a `queue` decision with reason `survival_requeue` in `turbine_admission_decisions_total`
+    /// and an `admission_decision` INFO event.
+    pub fn record_requeue(&self, request_id: RequestId, est: &ResourceEstimate) {
+        let (decision, reason) = AdmissionDecision::Queue {
+            reason: PressureReason::SurvivalRequeue,
+        }
+        .labels();
+        self.metrics
+            .admission_decisions
+            .get_or_create(&DecisionLabels { decision, reason })
+            .inc();
+        tracing::info!(
+            event = "admission_decision",
+            request_id = %request_id.0,
+            decision,
+            reason,
+            released_kv_blocks = est.projected_kv_blocks,
+            "admitted request returned to the queue in SURVIVAL"
+        );
     }
 
     /// Pure decision; records `turbine_admission_decisions_total` and an `admission_decision` log event.
@@ -235,7 +279,7 @@ impl Admission {
         circuit: CircuitState,
         queue_len: usize,
     ) -> AdmissionDecision {
-        let d = self.decide_inner(est, state, circuit, queue_len);
+        let d = self.decide_inner(est, state, state, circuit, queue_len);
         let (decision, reason) = d.labels();
         self.metrics
             .admission_decisions
@@ -263,10 +307,12 @@ impl Admission {
         d
     }
 
+    /// `state` selects the pressure rules, `actual` (the controller's state) the headroom.
     fn decide_inner(
         &self,
         est: &ResourceEstimate,
         state: PressureState,
+        actual: PressureState,
         circuit: CircuitState,
         queue_len: usize,
     ) -> AdmissionDecision {
@@ -303,7 +349,9 @@ impl Admission {
                 _ => None,
             }
         };
-        let reason = pressure.or((need > kv.available()).then_some(PressureReason::KvReservation));
+        let short =
+            need > kv.available() || (self.params.adaptive && !self.within_headroom(need, actual));
+        let reason = pressure.or(short.then_some(PressureReason::KvReservation));
         match reason {
             None => AdmissionDecision::Admit,
             Some(_) if queue_len >= self.params.max_queue as usize => AdmissionDecision::Reject {
@@ -311,6 +359,32 @@ impl Admission {
             },
             Some(reason) => AdmissionDecision::Queue { reason },
         }
+    }
+
+    /// Whether `need` more reserved bytes keep `kv_utilization` at or below the `kv` threshold
+    /// of the state above `state` (the headroom rule of [`Admission::with_kv_headroom`]).
+    fn within_headroom(&self, need: u64, state: PressureState) -> bool {
+        let Some(kv) = &self.kv_headroom else {
+            return true;
+        };
+        let next = match state {
+            PressureState::Yellow => PressureState::Orange,
+            PressureState::Orange => PressureState::Red,
+            PressureState::Red => PressureState::Survival,
+            _ => return true,
+        };
+        let Some(limit) = kv.threshold(next) else {
+            return true;
+        };
+        let usage = self.ledger.usage(self.params.device, PoolKind::Kv);
+        if usage.capacity == 0 {
+            return true;
+        }
+        let after = usage
+            .used
+            .saturating_add(usage.reserved)
+            .saturating_add(need);
+        (after as f64 / usage.capacity as f64) <= limit
     }
 
     /// Takes the worst-case KV reservation of an admitted request.
@@ -526,7 +600,7 @@ impl<T, K: Ord + Copy> AdmissionQueue<T, K> {
 mod tests {
     use super::*;
     use crate::budget::DeviceBudget;
-    use turbine_core::types::{DType, MemoryKind};
+    use turbine_core::types::{DType, MemoryKind, PressureSignal};
 
     const BLOCK_BYTES: u64 = 1_835_008; // Llama-3.2-3B, 16-token blocks
     const LAYOUT: KvLayout = KvLayout {
@@ -781,6 +855,74 @@ mod tests {
             projected_kv_blocks: blocks,
             ..ResourceEstimate::default()
         }
+    }
+
+    /// P3 S-9 amendment 2026-09-27 (KV headroom): in YELLOW, ORANGE and RED an admission or a
+    /// refill waits (`kv_reservation`) when its worst-case reservation would lift
+    /// `kv_utilization` past the next state's `kv` threshold (0.82 / 0.90 / 0.97 by default);
+    /// GREEN has no headroom rule, and without adaptive admission it never applies. Breaks if
+    /// admissions alone can escalate the pressure state.
+    #[test]
+    fn kv_headroom() {
+        let (a, ledger) = setup(1024, true);
+        let thresholds = crate::signals::default_thresholds()[&PressureSignal::KvUtilization];
+        let a = a.with_kv_headroom(thresholds);
+        let h = CircuitState::Healthy;
+        // 800 of 1,024 blocks held (0.781); a 40-block request would reach 0.820.
+        let _held = ledger
+            .reserve(DeviceId(0), PoolKind::Kv, 800 * BLOCK_BYTES)
+            .unwrap();
+        let est40 = est(40);
+        let est20 = est(20);
+        assert_eq!(
+            a.evaluate(&est40, PressureState::Green, h, 0),
+            AdmissionDecision::Admit
+        );
+        assert_eq!(
+            a.evaluate(&est40, PressureState::Yellow, h, 0),
+            AdmissionDecision::Queue {
+                reason: PressureReason::KvReservation
+            },
+            "0.820 > ORANGE 0.82"
+        );
+        assert_eq!(
+            a.evaluate(&est20, PressureState::Yellow, h, 0),
+            AdmissionDecision::Admit
+        );
+        // ORANGE admits up to RED's 0.90 (921 blocks), a RED refill up to SURVIVAL's 0.97.
+        assert_eq!(
+            a.evaluate(&est40, PressureState::Orange, h, 0),
+            AdmissionDecision::Admit
+        );
+        let est130 = est(130);
+        assert_eq!(
+            a.evaluate(&est130, PressureState::Orange, h, 0),
+            AdmissionDecision::Queue {
+                reason: PressureReason::KvReservation
+            }
+        );
+        assert_eq!(
+            a.evaluate_refill(&est130, PressureState::Red, h),
+            AdmissionDecision::Admit,
+            "0.908 <= SURVIVAL 0.97"
+        );
+        assert_eq!(
+            a.evaluate_refill(&est(200), PressureState::Red, h),
+            AdmissionDecision::Queue {
+                reason: PressureReason::KvReservation
+            },
+            "0.977 > SURVIVAL 0.97"
+        );
+        // Without adaptive admission only hard capacity counts.
+        let (plain, ledger2) = setup(1024, false);
+        let plain = plain.with_kv_headroom(thresholds);
+        let _held2 = ledger2
+            .reserve(DeviceId(0), PoolKind::Kv, 800 * BLOCK_BYTES)
+            .unwrap();
+        assert_eq!(
+            plain.evaluate(&est40, PressureState::Yellow, h, 0),
+            AdmissionDecision::Admit
+        );
     }
 
     #[test]

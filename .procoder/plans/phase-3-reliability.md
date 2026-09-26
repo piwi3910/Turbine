@@ -40,6 +40,15 @@ Inherited from the contract (`.procoder/contract/interfaces.md`, binding):
 - Gate for every task: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`; tasks touching the `fault-injection` feature also run `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 - prometheus-client appends `_total` to counters: counter families are registered through `MetricsRegistry::register` without the suffix (e.g. `turbine_pressure_transitions`, rendered `turbine_pressure_transitions_total`).
 
+## Port onto the Phase 2m layout (2026-09-27)
+
+Tasks 1–18 were first built on the pre-refactor tree (branch `runahead/p3-reliability`) and ported onto main after Phase 2m (registries for families, tool formats, weight formats, backends, card profiles, kernel implementations, logits processors and scheduling policies). Where Phase 3 touches an extension point it goes through the registry; no family, backend or vendor branch was added:
+
+- Task 11: the vendor telemetry backends are one file each (`crates/turbine-device/src/telemetry/{nvml.rs, amd_smi.rs}`) and are opened through the `device_discovery` registry: `DiscoveryKind::telemetry(&DiscoveryOptions)`; `telemetry::vendor::vendor_backends(opts: &DiscoveryOptions)` iterates the registry (was `vendor_backends(nvml, amd_smi)`); `docs/extending/backend.md` names the new method.
+- Task 12: the admission gate's queue is ordered by the scheduling policy's `AdmissionKey` (`AdmissionQueue<T, K>`, `push_keyed`; the gate keeps each request's `submit_no` so an admitted request keeps its order), `Scheduler::with_policy` applies to gated requests, `OverloadConfig::policy` names a registered policy and `ten_x_overload` runs over every registered policy; `docs/extending/scheduling-policy.md` notes that the key also orders the gate.
+- Task 14: error classification comes from the backend registry (`KernelError::is_oom`, `is_sticky` over `ExecutionBackend::sticky_error_prefixes`); `FaultyExecutor::new(inner, injector, sticky_name)` names an injected sticky error with the opened backend's first sticky prefix (the first registered backend's when the backend has none, e.g. `cpu`) instead of a hard-coded HIP name, and forwards the Phase 2c `launch` / `collect` / decode-graph methods. The Phase 2c overlap loop (`execution.overlap_scheduling`) got the same reliability rules: an out-of-memory launch finishes the iteration in flight and runs the plan through the serial recovery path; any other launch error, or an error collecting an iteration the scheduler already completed ahead, fails its requests and goes to the circuit breaker (`engine::loop::tests::{overlap_failed_steps_fail_their_requests_only, overlap_oom_launch_recovers_serially}`). `model::load` reads the weight format from the family registry (`turbine_model_weight_bytes{format}`), decode graphs stay wired, and `PreparedModel` keeps `tool_format` / `modules` next to the P3 budget fields.
+- Task 18: `lab_scripts phase3_soak_config_loads` compares the module name (`execution.backend` is an open `ModuleName` since Phase 2m).
+
 ## Task 1: Reliability configuration, pressure vocabulary and telemetry types in turbine-core
 
 Files: `crates/turbine-core/src/config/reliability.rs` (new: `reliability` section structs + static validation), `crates/turbine-core/src/config/mod.rs` (re-export, `Config::validate` hook, `scheduler.queue_timeout` removed-key, test), `crates/turbine-core/src/types.rs` (`PressureSignal`; helpers on `PressureState`/`CircuitState`), `crates/turbine-core/src/telemetry.rs` (new: telemetry vocabulary), `crates/turbine-core/src/lib.rs` (module), `crates/turbine-core/Cargo.toml` (feature `fault-injection = []`)
@@ -287,7 +296,7 @@ Interfaces:
 - `pub fn TelemetrySampler::spawn(cfg, inventory, vendor, proc, ledger, clock) -> (TelemetrySampler, LatestSample)`; `pub fn spawn_core(core: SamplerCore) -> (TelemetrySampler, LatestSample)` (stops and joins on `Drop`)
 - `pub fn TelemetryMetrics::register(reg: &MetricsRegistry) -> Self`; `pub fn record_device(&self, d: &DeviceSample, kind: MemoryKind)`
 - `proc::{ProcFile::{Meminfo, Vmstat, PressureMemory}, trait ProcSource { fn read(&self, file: ProcFile) -> std::io::Result<String>; }, FsProc { root: PathBuf }, parse_meminfo(&str) -> Result<MemInfo, ParseError>, parse_vmstat(&str) -> Result<VmStat, ParseError>, parse_psi(&str) -> Result<PsiMemory, ParseError>}`
-- `vendor::{NvmlTelemetry::open(path: Option<&Path>) -> Result<Self, String>, AmdSmiTelemetry::open(path: Option<&Path>) -> Result<Self, String>, vendor_backends(nvml: Option<&Path>, amd_smi: Option<&Path>) -> Vec<Box<dyn VendorTelemetry>>}`
+- `vendor::{NvmlTelemetry::open(path: Option<&Path>) -> Result<Self, String>, AmdSmiTelemetry::open(path: Option<&Path>) -> Result<Self, String>, vendor_backends(opts: &DiscoveryOptions) -> Vec<Box<dyn VendorTelemetry>>}` (Phase 2m port: one per registered `DiscoveryKind`, whose `telemetry(&DiscoveryOptions)` opens `nvml::NvmlTelemetry` / `amd_smi::AmdSmiTelemetry`)
 
 Covers: S-5, S-14 (GPU/host/telemetry gauges); `telemetry::tests::proc_parsers`, `telemetry::tests::two_cadences`, `telemetry::tests::hung_call_marks_stale`.
 Depends on: Task 1; phase-0 plan (`DeviceInfo`, `DeviceInventory`, `nvml-wrapper` 0.13, `libloading` 0.9, `DevicesConfig.{nvml_library, amd_smi_library}`).
@@ -329,6 +338,27 @@ Depends on: Tasks 3, 7, 8, 10; phase-2 plan (`Scheduler`, `BlockPool`, `sim::{Si
 - [ ] Run: `cargo test -p turbine-scheduler --test overload_sim && cargo test -p turbine-scheduler && cargo tree -p turbine-scheduler | grep -E 'turbine-kernels|turbine-model'; test $? -eq 1` — expect PASS
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 - [ ] Commit: `feat(scheduler): admission gate, throttle overlay, ledger-backed KV and overload simulation`
+
+## Task 12a: SURVIVAL liveness and KV headroom (amendment 2026-09-27)
+
+Files: `crates/turbine-core/src/config/reliability.rs` (`SurvivalLiveness`, `reliability.recovery.survival_liveness`), `crates/turbine-core/src/config/tests.rs`, `crates/turbine-reliability/src/{throttle.rs, recovery.rs, controller.rs, admission.rs}`, `crates/turbine-scheduler/src/{scheduler.rs, gate.rs, request.rs, sim/overload.rs}`, `crates/turbine-scheduler/tests/overload_sim.rs`, `crates/turbine-server/src/{engine/loop.rs, reliability.rs}`, `crates/turbine-api/tests/api.rs`, `scripts/lab/phase3-novanas-soak.yaml`
+Interfaces:
+
+- `pub enum SurvivalLiveness { RequeueUnstarted /* default, option A */, ContinuePrefills /* option B */ }` (`turbine_core::config`, serde snake_case)
+- `ThrottlePlan.requeue_unstarted: bool`; `pub fn throttle::plan_with(state, &SchedulerLimits, SurvivalLiveness) -> ThrottlePlan`; `pub fn recovery::survival_plan(plan, &SchedulerLimits, SurvivalLiveness) -> ThrottlePlan`
+- `IterationLimits.requeue_unstarted: bool`; `CancelReason::Overloaded` (`"overloaded"`); `PressureReason::SurvivalRequeue` (`"survival_requeue"`)
+- `pub fn AdmissionGate::requeue(&mut self, r: SchedRequest, key: AdmissionKey, submit_no: u64) -> bool`; `pub fn Admission::record_requeue(&self, id: RequestId, est: &ResourceEstimate)`; `pub fn Admission::with_kv_headroom(self, kv: SignalThresholds) -> Self`
+
+Covers: S-9 (KV headroom), S-11 (SURVIVAL liveness); `overload_sim survival_liveness_seed_6`, `survival_liveness_seed_1`, `survival_liveness_option_b`, `survival_requeues_unstarted_admitted`, `admission::tests::kv_headroom`, `recovery::tests::survival_plan_switch`.
+Depends on: Tasks 7, 8, 10, 12, 14; decision "Phase 3: SURVIVAL liveness fix" (provisional A, pending user review).
+
+- [ ] Write failing tests `overload_sim survival_liveness_seed_6` (the `ten_x_overload` workload, seed 6, passes through SURVIVAL and is GREEN + HEALTHY within 60 s of the load stopping with every overload invariant) and `survival_liveness_seed_1` (seed 1, same criterion), `survival_liveness_option_b` (both seeds under `continue_prefills`), `survival_requeues_unstarted_admitted` (an OOM-triggered SURVIVAL requeues exactly the admitted requests that had not started and releases their reservations; all complete afterwards).
+- [ ] Run: `cargo test -p turbine-scheduler --test overload_sim survival_` — expect FAIL (seed 6 stays in SURVIVAL with 0.934 of the pool reserved; seed 1 recovers in 64 s: its end-of-load backlog re-escalates YELLOW → RED).
+- [ ] Implement option A behind `reliability.recovery.survival_liveness` (default `requeue_unstarted`): the SURVIVAL throttle plan sets `requeue_unstarted`; `Scheduler::plan` then returns each admitted request that was never given a running slot to the gate's queue at its policy key and original arrival, dropping its reservation (`survival_requeue` queue decision, INFO `survival_requeue`), or answers it `overloaded` when the queue is full; option B (`continue_prefills`) instead gives SURVIVAL RED's prefill budget and chunk floor with no new starts.
+- [ ] Implement the KV headroom rule: with adaptive admission, in YELLOW, ORANGE and RED `decide`, `evaluate` and `evaluate_refill` answer `Queue(kv_reservation)` when the worst-case reservation would lift `kv_utilization` past the next state's `kv_utilization` threshold (`with_kv_headroom(effective_thresholds(..)[KvUtilization])` in the server and the simulator).
+- [ ] Run: `cargo test -p turbine-scheduler --test overload_sim && cargo test -p turbine-reliability && cargo test -p turbine-core config::tests::reliability_config_validation` — expect PASS; `cargo test --release -p turbine-scheduler --test overload_sim survival_liveness_sweep -- --ignored --nocapture` prints seeds 1–12 under both options (measured: every seed GREEN + HEALTHY 42–49 s after the load stops; seed 6: 42.9 s under A, 46.9 s under B).
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus `--all-features`)
+- [ ] Commit: `fix(reliability): SURVIVAL requeues unstarted admitted requests; admissions keep KV headroom`
 
 ## Task 13: Pressure route, readiness, admission errors and metrics in turbine-api
 

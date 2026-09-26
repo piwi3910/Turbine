@@ -38,6 +38,7 @@ reliability:
   recovery:
     max_retries: 3
     backoff: 50ms
+    survival_liveness: requeue_unstarted
   circuit:
     cooldown: 30s
     drain_timeout: 120s

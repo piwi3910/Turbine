@@ -24,7 +24,7 @@ use turbine_core::clock::Clock;
 use turbine_core::config::ReliabilityConfig;
 use turbine_core::request::ErrorCode;
 use turbine_core::telemetry::LedgerProbe;
-use turbine_core::types::DeviceId;
+use turbine_core::types::{DeviceId, PressureSignal};
 use turbine_device::telemetry::LatestSample;
 use turbine_kv::L0Reclaimer;
 use turbine_reliability::admission::{
@@ -37,6 +37,7 @@ use turbine_reliability::ledger::{Ledger, Reservation};
 use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_reliability::recovery::{RecoveryController, RecoveryOutcome, RecoveryStep};
 use turbine_reliability::reserve::{EmergencyReserve, ReserveAllocator};
+use turbine_reliability::signals::effective_thresholds;
 use turbine_reliability::throttle::SchedulerLimits;
 use turbine_scheduler::{AdmissionGate, SchedulerParams};
 use turbine_tensor::{DeviceBuffer, DeviceMemory};
@@ -238,7 +239,8 @@ pub(crate) fn build(inp: ReliabilityInputs<'_>) -> ReliabilityParts {
         },
         Arc::clone(&inp.ledger),
         inp.metrics.clone(),
-    );
+    )
+    .with_kv_headroom(effective_thresholds(&cfg.pressure)[&PressureSignal::KvUtilization]);
     let queue = AdmissionQueue::new(
         cfg.admission.max_queue,
         cfg.admission.queue_timeout.0,

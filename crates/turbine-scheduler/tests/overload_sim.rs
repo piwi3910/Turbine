@@ -4,9 +4,10 @@
 
 use std::time::Duration;
 
+use turbine_core::config::SurvivalLiveness;
 use turbine_core::types::{CircuitState, PressureState, RequestId};
 use turbine_reliability::recovery::RecoveryOutcome;
-use turbine_scheduler::sim::overload::{Outcome, OverloadConfig, OverloadSim};
+use turbine_scheduler::sim::overload::{Outcome, OverloadConfig, OverloadReport, OverloadSim};
 
 fn secs(s: u64) -> Duration {
     Duration::from_secs(s)
@@ -281,49 +282,188 @@ fn oom_recovery_bounded() {
     assert_eq!(sim.handle().circuit(), CircuitState::Healthy);
 }
 
-/// OPEN (P3 SURVIVAL liveness gap, reported 2026-09-26; the fix is the user's decision): the
-/// ten-times overload of `ten_x_overload` with seed 6 enters SURVIVAL and never leaves it. In
-/// SURVIVAL the prefill budget is 0, so prefills already in progress cannot finish, while the
-/// worst-case KV reservations they hold keep `kv_utilization` above SURVIVAL's exit threshold
-/// (0.97 − 5 %); nothing else releases KV, so the state is stuck even after every arrival has
-/// stopped. Ignored until a fix is chosen; `--ignored` reproduces the failure.
+/// P3 SURVIVAL, option A (`survival_liveness: requeue_unstarted`): admitted requests that
+/// have not started go back to the admission queue on entering SURVIVAL and give back their
+/// worst-case KV reservations; the running ones keep theirs and finish; out of SURVIVAL the
+/// requeued ones are admitted again and complete. Breaks if SURVIVAL keeps a reservation of a
+/// request that wrote no KV, or loses a requeued request.
 #[test]
-#[ignore = "SURVIVAL liveness gap: reproduces an open defect until a fix is chosen"]
-fn survival_liveness_gap_seed_6() {
-    let cfg = OverloadConfig {
-        seed: 6,
+fn survival_requeues_unstarted_admitted() {
+    let mut cfg = OverloadConfig::default();
+    // SURVIVAL after an OOM lasts two dwells; the requeued requests wait through it.
+    cfg.reliability.admission.queue_timeout = turbine_core::config::HumanDuration::from_secs(120);
+    let mut sim = OverloadSim::new(cfg);
+    // 16 requests of 2,000 + 100 tokens (132 blocks each, 2,112 of 4,096 reserved): all are
+    // admitted at once, but the 8,192-token budget starts only four prefills per iteration.
+    let ids: Vec<RequestId> = (0..16).map(|_| sim.submit_now(2000, Some(100))).collect();
+    sim.step_iteration();
+    let started = sim.running_ids();
+    assert!(
+        !started.is_empty() && started.len() < ids.len(),
+        "{started:?}"
+    );
+    let before = sim.kv_usage();
+    assert_eq!(before.used + before.reserved, 16 * 132 * 16_384);
+
+    // A device OOM (recovered on the retry) enters SURVIVAL: the next plan requeues.
+    sim.inject_oom_attempts(1);
+    sim.step_iteration();
+    assert_eq!(sim.handle().state(), PressureState::Survival);
+    // The recovered iteration may have started more prefills before SURVIVAL.
+    let started = sim.running_ids();
+    assert!(started.len() < ids.len(), "{started:?}");
+    sim.step_iteration();
+    let unstarted: Vec<RequestId> = ids
+        .iter()
+        .copied()
+        .filter(|id| !started.contains(id))
+        .collect();
+    for id in &unstarted {
+        assert!(sim.is_queued(*id), "{id:?} is back in the admission queue");
+    }
+    let after = sim.kv_usage();
+    assert_eq!(
+        after.used + after.reserved,
+        started.len() as u64 * 132 * 16_384,
+        "only the started requests hold KV: {after:?}"
+    );
+
+    // SURVIVAL descends once the pool drains; every request completes.
+    sim.run_until_done(secs(300));
+    for id in &ids {
+        assert_eq!(sim.outcome(*id), Some(&Outcome::Completed), "{id:?}");
+    }
+    assert!(sim.ledger_idle());
+}
+
+/// One `ten_x_overload`-shaped run (10 × the service rate, prompts 64–6000, max tokens
+/// 16–1024, 600 s of load then 120 s of silence) with `seed` under `survival`, and its
+/// completions; checks every overload invariant of `ten_x_overload` except the goodput floor
+/// and the RED requirement (both seed-dependent), plus the spec's recovery criterion: GREEN
+/// and HEALTHY within 60 s of the load stopping.
+fn survival_case(seed: u64, survival: SurvivalLiveness) -> (OverloadReport, usize) {
+    let mut cfg = OverloadConfig {
+        seed,
         rate_multiple: 10.0,
         prompt_range: (64, 6000),
         max_tokens_range: (16, 1024),
         ..OverloadConfig::default()
     };
+    cfg.reliability.recovery.survival_liveness = survival;
     let mut sim = OverloadSim::new(cfg);
     let r = sim.run_load(secs(600), secs(120));
+    let completed = r
+        .outcomes
+        .iter()
+        .filter(|o| **o == Outcome::Completed)
+        .count();
     let kv = sim.kv_usage();
     eprintln!(
-        "seed 6: states {:?}, final {:?}/{:?}, kv used {} + reserved {} of {} ({:.3}), running {}, queued {}, unfinished {}",
+        "survival {} seed {seed}: {} requests, {completed} completed, states {:?}, GREEN+HEALTHY {:?} after stop, final {:?}/{:?}, kv used {} + reserved {} of {}",
+        survival.as_str(),
+        r.outcomes.len(),
         r.states,
+        r.green_after_stop,
         sim.handle().state(),
         r.final_circuit,
         kv.used,
         kv.reserved,
         kv.capacity,
-        kv.utilization(),
-        sim.running_ids().len(),
-        sim.queued_ids().len(),
-        r.unfinished,
     );
+    (r, completed)
+}
+
+/// The invariants every SURVIVAL liveness case must keep.
+fn assert_survival_case(seed: u64, survival: SurvivalLiveness, r: &OverloadReport) {
+    let label = format!("seed {seed}, {}", survival.as_str());
+    assert!(
+        r.max_kv_committed_plus_reserved <= r.kv_capacity_bytes,
+        "{label}: KV {} > capacity {}",
+        r.max_kv_committed_plus_reserved,
+        r.kv_capacity_bytes
+    );
+    assert_eq!(r.preempted_below_survival, 0, "{label}");
+    assert_eq!(r.red_growth, 0, "{label}: the admitted count grew in RED");
+    assert_eq!(r.unfinished, 0, "{label}: every request reached an outcome");
+    assert!(r.max_queue_len <= 256, "{label}: queue {}", r.max_queue_len);
+    for o in &r.outcomes {
+        match o {
+            Outcome::Completed | Outcome::Cancelled => {}
+            Outcome::Rejected(code) => {
+                assert!(
+                    REJECT_CODES.contains(&code.as_str()),
+                    "{label}: code {code}"
+                )
+            }
+            Outcome::Failed(code) => panic!("{label}: a request failed with {code}"),
+        }
+    }
+    let back = r
+        .green_after_stop
+        .unwrap_or_else(|| panic!("{label}: never GREEN + HEALTHY after the load stopped"));
+    assert!(
+        back <= secs(60),
+        "{label}: GREEN + HEALTHY {back:?} after the load stopped (criterion: 60 s)"
+    );
+    assert_eq!(r.final_circuit, CircuitState::Healthy, "{label}");
+}
+
+/// P3 SURVIVAL liveness regression (decision "Phase 3: SURVIVAL liveness fix", provisional A:
+/// `survival_liveness: requeue_unstarted`). With seed 6 the ten-times overload jumps to
+/// SURVIVAL during the ramp; before the fix it never left it: SURVIVAL runs no prefill, so the
+/// 18 admitted requests that had not started and the 3 prefills in progress held their
+/// worst-case KV reservations and kept `kv_utilization` at 0.934, above SURVIVAL's exit
+/// threshold (0.97 − 5 %), with nothing left to release them. Option A returns the unstarted
+/// requests to the admission queue without their reservations, so the pool drains and the
+/// state descends. Breaks if SURVIVAL can hold reservations that nothing releases.
+#[test]
+fn survival_liveness_seed_6() {
+    let (r, _) = survival_case(6, SurvivalLiveness::RequeueUnstarted);
     assert!(
         r.states.contains(&PressureState::Survival),
         "seed 6 reaches SURVIVAL: {:?}",
         r.states
     );
-    // Liveness: the load stopped 120 s ago; the state must have returned to GREEN.
-    assert_eq!(
-        sim.handle().state(),
-        PressureState::Green,
-        "still {:?} 120 s after the load stopped",
-        sim.handle().state()
-    );
-    assert!(r.green_after_stop.is_some_and(|t| t <= secs(60)));
+    assert_survival_case(6, SurvivalLiveness::RequeueUnstarted, &r);
+}
+
+/// P3 SURVIVAL liveness regression, seed 1 (provisional A): before the fix this run recovered
+/// only 64 s after the load stopped, past the spec's 60 s criterion. Breaks if recovery from
+/// the overload is slower than GREEN + HEALTHY within 60 s.
+#[test]
+fn survival_liveness_seed_1() {
+    let (r, _) = survival_case(1, SurvivalLiveness::RequeueUnstarted);
+    assert_survival_case(1, SurvivalLiveness::RequeueUnstarted, &r);
+}
+
+/// The switch to option B (`survival_liveness: continue_prefills`, prefills in progress
+/// continue in SURVIVAL) is live: the same two seeds keep every overload invariant and recover
+/// within the criterion. Breaks if B cannot be switched in.
+#[test]
+fn survival_liveness_option_b() {
+    for seed in [6, 1] {
+        let (r, _) = survival_case(seed, SurvivalLiveness::ContinuePrefills);
+        assert_survival_case(seed, SurvivalLiveness::ContinuePrefills, &r);
+    }
+}
+
+/// Measurement, not a gate: seeds 1–12 under both SURVIVAL liveness options, printed per seed
+/// (`-- --ignored --nocapture`).
+#[test]
+#[ignore = "measurement: prints the SURVIVAL liveness sweep"]
+fn survival_liveness_sweep() {
+    for survival in [
+        SurvivalLiveness::RequeueUnstarted,
+        SurvivalLiveness::ContinuePrefills,
+    ] {
+        for seed in 1..=12 {
+            let (r, completed) = survival_case(seed, survival);
+            eprintln!(
+                "sweep {} seed {seed}: completed {completed}, survival {}, back {:?}",
+                survival.as_str(),
+                r.states.contains(&PressureState::Survival),
+                r.green_after_stop
+            );
+        }
+    }
 }

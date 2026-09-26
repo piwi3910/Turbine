@@ -86,6 +86,9 @@ pub enum CancelReason {
     QueueTimeout,
     /// Still queued when the circuit opened (P3): answered `503 circuit_open`.
     CircuitOpen,
+    /// Admitted but not started when SURVIVAL requeued it, with the admission queue full
+    /// (P3, `survival_liveness: requeue_unstarted`): answered `503 overloaded`.
+    Overloaded,
 }
 
 impl CancelReason {
@@ -97,6 +100,7 @@ impl CancelReason {
             CancelReason::Shutdown => "shutdown",
             CancelReason::QueueTimeout => "queue_timeout",
             CancelReason::CircuitOpen => "circuit_open",
+            CancelReason::Overloaded => "overloaded",
         }
     }
 }
@@ -243,6 +247,7 @@ mod tests {
         assert_eq!(CancelReason::Shutdown.as_str(), "shutdown");
         assert_eq!(CancelReason::QueueTimeout.as_str(), "queue_timeout");
         assert_eq!(CancelReason::CircuitOpen.as_str(), "circuit_open");
+        assert_eq!(CancelReason::Overloaded.as_str(), "overloaded");
         assert_eq!(PreemptReason::KvExhausted.as_str(), "kv_exhausted");
         assert_eq!(
             PreemptReason::SurvivalDecodeAlloc.as_str(),

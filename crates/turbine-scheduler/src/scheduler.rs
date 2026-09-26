@@ -89,6 +89,10 @@ pub struct IterationLimits {
     /// Running requests may be preempted to make room. Phase 2: always; with an admission gate
     /// (Phase 3) only in SURVIVAL, and only when the next decode step cannot allocate.
     pub allow_preempt: bool,
+    /// SURVIVAL, `survival_liveness: requeue_unstarted` (P3 decision "SURVIVAL liveness fix",
+    /// option A): admitted requests that have not started return to the admission gate's
+    /// queue and drop their KV reservations.
+    pub requeue_unstarted: bool,
 }
 
 impl Default for IterationLimits {
@@ -101,6 +105,7 @@ impl Default for IterationLimits {
             admit_new: true,
             start_new_prefills: true,
             allow_preempt: true,
+            requeue_unstarted: false,
         }
     }
 }
@@ -118,6 +123,7 @@ impl From<&ThrottlePlan> for IterationLimits {
             admit_new: p.admission != AdmissionMode::Stopped,
             start_new_prefills: p.start_new_prefills,
             allow_preempt: p.state == PressureState::Survival,
+            requeue_unstarted: p.requeue_unstarted,
         }
     }
 }
@@ -777,6 +783,11 @@ impl Scheduler {
 
         // (1) Drop cancelled and queue-timed-out requests; their blocks return first.
         self.drop_cancelled(pool, now, &mut plan);
+        // SURVIVAL, option A: admitted requests that have not started give their KV
+        // reservations back and wait in the admission queue again.
+        if limits.requeue_unstarted {
+            self.requeue_unstarted(&mut plan);
+        }
 
         // (2) Every decodable sequence decodes; preempt until the pool covers them.
         self.plan_decodes(pool, limits, &mut plan, &mut in_plan, &mut preempted_now);
@@ -1043,6 +1054,70 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// SURVIVAL under `survival_liveness: requeue_unstarted` (P3 decision "SURVIVAL liveness
+    /// fix", option A). SURVIVAL starts no prefill, so an admitted request that has not started
+    /// (never given a running slot: no KV written) only holds its worst-case KV reservation;
+    /// held by many such requests, those reservations can keep `kv_utilization` above
+    /// SURVIVAL's exit threshold with nothing left to release them. Each goes back to the
+    /// admission gate's queue at its original turn and drops its reservation, so the running
+    /// requests drain the pool; when the queue is full it is answered `overloaded`. Requests
+    /// that started (running, or preempted with KV to recompute) keep theirs.
+    fn requeue_unstarted(&mut self, plan: &mut IterationPlan) {
+        let Some(gate) = self.gate.as_mut() else {
+            return;
+        };
+        let unstarted: Vec<RequestId> = self
+            .queue
+            .iter()
+            .filter(|id| {
+                self.requests
+                    .get(id)
+                    .is_some_and(|r| !r.ever_admitted && r.reservation.is_some())
+            })
+            .collect();
+        for id in unstarted {
+            self.queue.remove(id);
+            let Some(entry) = self.requests.remove(&id) else {
+                continue;
+            };
+            for seq in &entry.req.seqs {
+                self.seqs.remove(seq);
+            }
+            if entry.expensive {
+                gate.admission_mut().expensive_prefill_finished();
+            }
+            let ReqEntry {
+                req,
+                submit_no,
+                reservation,
+                ..
+            } = entry;
+            // The worst-case KV reservation goes back to the pool now.
+            drop(reservation);
+            let key = self.policy.admission_key(&AdmissionInfo {
+                priority: req.priority,
+                arrival: req.arrival,
+                submit_no,
+                preempted: false,
+                push_no: submit_no,
+            });
+            if gate.requeue(req, key, submit_no) {
+                tracing::info!(event = "survival_requeue", request_id = %id.0, "admitted request returned to the admission queue");
+                if let Some(m) = &self.metrics {
+                    m.admission("queued", "survival_requeue");
+                }
+            } else {
+                let reason = CancelReason::Overloaded;
+                plan.dropped.push((id, reason));
+                tracing::info!(event = "reject", request_id = %id.0, reason = reason.as_str(), "admitted request rejected: the admission queue is full in SURVIVAL");
+                if let Some(m) = &self.metrics {
+                    m.admission("rejected", reason.as_str());
+                }
+            }
+        }
+        self.publish_gauges();
     }
 
     /// Requests leaving the gate's queue: cancelled while queued, timed out, or rejected

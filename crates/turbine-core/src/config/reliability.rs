@@ -180,6 +180,9 @@ pub struct RecoveryConfig {
     pub max_retries: u32,
     /// Doubled per retry.
     pub backoff: HumanDuration,
+    /// How SURVIVAL keeps the engine live (decision "Phase 3: SURVIVAL liveness fix",
+    /// provisional A pending user review).
+    pub survival_liveness: SurvivalLiveness,
 }
 
 impl Default for RecoveryConfig {
@@ -187,6 +190,34 @@ impl Default for RecoveryConfig {
         RecoveryConfig {
             max_retries: 3,
             backoff: HumanDuration::from_millis(50),
+            survival_liveness: SurvivalLiveness::RequeueUnstarted,
+        }
+    }
+}
+
+/// `reliability.recovery.survival_liveness`: what SURVIVAL does with admitted work so that KV
+/// keeps draining. SURVIVAL runs no new prefill; without one of these, prefills in progress
+/// and admitted requests that have not started hold their worst-case KV reservations, which
+/// can keep `kv_utilization` above SURVIVAL's exit threshold forever (the liveness gap found by
+/// the overload simulation, seed 6).
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SurvivalLiveness {
+    /// Option A (default): on entering SURVIVAL, admitted requests that have not started (no
+    /// KV written) go back to the admission queue and drop their reservations; prefills in
+    /// progress wait, decodes run, and the pool drains.
+    #[default]
+    RequeueUnstarted,
+    /// Option B: prefills already in progress continue in SURVIVAL (half the prefill budget,
+    /// the chunk floor); nothing new starts and admitted requests keep their reservations.
+    ContinuePrefills,
+}
+
+impl SurvivalLiveness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SurvivalLiveness::RequeueUnstarted => "requeue_unstarted",
+            SurvivalLiveness::ContinuePrefills => "continue_prefills",
         }
     }
 }

@@ -648,6 +648,10 @@ fn reliability_config_validation() {
     assert_eq!(r.admission.max_bypass, 8);
     assert_eq!(r.recovery.max_retries, 3);
     assert_eq!(r.recovery.backoff, HumanDuration::from_millis(50));
+    assert_eq!(
+        r.recovery.survival_liveness,
+        SurvivalLiveness::RequeueUnstarted
+    );
     let c = &r.circuit;
     assert_eq!(
         (
@@ -681,6 +685,21 @@ fn reliability_config_validation() {
     )
     .expect("valid overrides accepted");
     let rel = &ok.reliability;
+    let b = parse(
+        &format!("{base}reliability:\n  recovery:\n    survival_liveness: continue_prefills\n"),
+        &[],
+    )
+    .expect("option B is a valid choice");
+    assert_eq!(
+        b.reliability.recovery.survival_liveness,
+        SurvivalLiveness::ContinuePrefills
+    );
+    assert_eq!(
+        rejected_key(&format!(
+            "{base}reliability:\n  recovery:\n    survival_liveness: sometimes\n"
+        )),
+        "reliability.recovery.survival_liveness"
+    );
     assert_eq!(rel.telemetry.vendor_interval, HumanDuration::from_secs(10));
     assert_eq!(rel.telemetry.stale_after, HumanDuration::from_secs(3600));
     assert_eq!(rel.admission.queue_timeout, HumanDuration::from_secs(3600));

@@ -185,6 +185,45 @@ impl AdmissionGate {
         out
     }
 
+    /// SURVIVAL, option A: an admitted request that had not started comes back without its
+    /// KV reservation (the caller dropped it), at the policy's `key` for its original
+    /// `submit_no` and with its original arrival as the start of its queue wait — so it keeps
+    /// its turn and its `queue_timeout` bound. Recorded as a `queue` decision with reason
+    /// `survival_requeue`. Returns false when the queue is full: the request is then recorded
+    /// as rejected `survival` and the caller answers it `overloaded`.
+    pub fn requeue(&mut self, r: SchedRequest, key: AdmissionKey, submit_no: u64) -> bool {
+        let (id, priority, estimate, arrival) = (r.id, r.priority, r.estimate, r.arrival);
+        match self.queue.push_keyed(
+            id,
+            priority,
+            key,
+            estimate,
+            PressureReason::SurvivalRequeue,
+            arrival,
+            Waiting { req: r, submit_no },
+        ) {
+            Ok(()) => {
+                self.admission.record_requeue(id, &estimate);
+                self.publish_depth();
+                true
+            }
+            Err(w) => {
+                let waiting = Queued {
+                    id,
+                    priority,
+                    estimate,
+                    reason: PressureReason::SurvivalRequeue,
+                    enqueued_at: arrival,
+                    bypassed: 0,
+                    key,
+                    payload: w,
+                };
+                self.finish_waits(vec![waiting], RejectionReason::Survival);
+                false
+            }
+        }
+    }
+
     /// Take `id` out of the queue (client disconnect): it never took a reservation.
     pub fn remove(&mut self, id: RequestId) -> Option<SchedRequest> {
         let q = self.queue.remove(id)?;

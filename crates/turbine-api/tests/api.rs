@@ -1073,6 +1073,8 @@ mod p3 {
         a.decide(&cheap, PressureState::Survival, h, 0);
         a.decide(&cheap, PressureState::Green, CircuitState::CircuitOpen, 0);
         a.decide(&huge, PressureState::Green, h, 0);
+        // SURVIVAL (option A) returns an admitted request that had not started to the queue.
+        a.record_requeue(turbine_core::types::RequestId::new_v4(), &cheap);
         let held = ledger
             .reserve(DeviceId(0), PoolKind::Kv, 20 * GIB - GIB / 1024)
             .unwrap();

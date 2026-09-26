@@ -2,7 +2,10 @@
 //! exponential backoff up to `max_retries`, then give up (the batch's requests fail `resource_exhausted`).
 use crate::metrics::{OutcomeLabel, ReliabilityMetrics};
 use std::time::Duration;
-use turbine_core::config::RecoveryConfig;
+use turbine_core::config::{RecoveryConfig, SurvivalLiveness};
+use turbine_core::types::PressureState;
+
+use crate::throttle::{SchedulerLimits, ThrottlePlan};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryOutcome {
@@ -105,9 +108,97 @@ impl RecoveryController {
     }
 }
 
+/// The SURVIVAL row of the throttle plan under `survival_liveness` (decision "Phase 3:
+/// SURVIVAL liveness fix", provisional A pending user review). `plan` is [`plan_for`]'s; other
+/// states pass through unchanged.
+///
+/// - `requeue_unstarted` (A, default): the table's row — no prefill at all — with
+///   `requeue_unstarted` set, so the scheduler returns admitted requests that have not started
+///   to the admission queue and drops their KV reservations.
+/// - `continue_prefills` (B): prefills already in progress continue with RED's budget (half the
+///   batch) and chunk floor; nothing new starts, nothing is requeued.
+///
+/// [`plan_for`]: crate::throttle::plan_for
+pub fn survival_plan(
+    plan: ThrottlePlan,
+    cfg: &SchedulerLimits,
+    survival: SurvivalLiveness,
+) -> ThrottlePlan {
+    if plan.state != PressureState::Survival {
+        return plan;
+    }
+    match survival {
+        SurvivalLiveness::RequeueUnstarted => ThrottlePlan {
+            requeue_unstarted: true,
+            ..plan
+        },
+        SurvivalLiveness::ContinuePrefills => ThrottlePlan {
+            prefill_budget_fraction: 0.5,
+            prefill_chunk_tokens: Some(
+                cfg.block_tokens
+                    .saturating_mul(4)
+                    .min(cfg.prefill_chunk_tokens),
+            ),
+            start_new_prefills: false,
+            requeue_unstarted: false,
+            ..plan
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decision "Phase 3: SURVIVAL liveness fix" (provisional A, switchable to B): A keeps the
+    /// table's SURVIVAL row (no prefill) and requeues admitted requests that have not started;
+    /// B lets prefills in progress continue at RED's budget and chunk floor and requeues
+    /// nothing; no other state changes. Breaks if the switch does not reach the plan.
+    #[test]
+    fn survival_plan_switch() {
+        use crate::throttle::{plan_for, plan_with};
+        let limits = SchedulerLimits {
+            prefill_chunk_tokens: 2048,
+            block_tokens: 16,
+        };
+        let a = plan_with(
+            PressureState::Survival,
+            &limits,
+            SurvivalLiveness::RequeueUnstarted,
+        );
+        assert_eq!(a, plan_for(PressureState::Survival, &limits));
+        assert!(a.requeue_unstarted && a.shrink_only && !a.start_new_prefills);
+        assert_eq!(
+            (a.prefill_budget_fraction, a.prefill_chunk_tokens),
+            (0.0, None)
+        );
+        let b = plan_with(
+            PressureState::Survival,
+            &limits,
+            SurvivalLiveness::ContinuePrefills,
+        );
+        assert!(!b.requeue_unstarted && b.shrink_only && !b.start_new_prefills);
+        assert_eq!(
+            (b.prefill_budget_fraction, b.prefill_chunk_tokens),
+            (0.5, Some(64))
+        );
+        assert_eq!(b.admission, a.admission);
+        for state in [
+            PressureState::Green,
+            PressureState::Yellow,
+            PressureState::Orange,
+            PressureState::Red,
+        ] {
+            for mode in [
+                SurvivalLiveness::RequeueUnstarted,
+                SurvivalLiveness::ContinuePrefills,
+            ] {
+                let p = plan_with(state, &limits, mode);
+                assert_eq!(p, plan_for(state, &limits), "{state:?}");
+                assert!(!p.requeue_unstarted);
+            }
+        }
+    }
 
     #[test]
     fn retries_are_bounded_and_back_off() {

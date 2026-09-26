@@ -814,6 +814,14 @@ impl EngineLoop {
                     "the circuit breaker opened while the request was queued",
                 )),
             ),
+            CancelReason::Overloaded => (
+                Outcome::Rejected,
+                Some((
+                    ErrorCode::Overloaded,
+                    "the engine entered SURVIVAL before the request started and the admission \
+                     queue is full",
+                )),
+            ),
             CancelReason::RequestTimeout => (
                 Outcome::Cancelled,
                 Some((
