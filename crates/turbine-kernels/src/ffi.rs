@@ -357,9 +357,55 @@ pub(crate) struct StagingFns {
     pub event_destroy: unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineEvent) -> i32,
 }
 
+/// `TURBINE_IMPL_NEEDS_HOST_OFFSETS` (v2.4): the implementation reads `host_expert_offsets`.
+pub(crate) const IMPL_NEEDS_HOST_OFFSETS: u32 = 1;
+
+/// `turbine_impl_entry` (v2.4): one implementation of an op; both strings are static storage
+/// owned by the library.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImplEntry {
+    pub name: *const c_char,
+    pub provider: *const c_char,
+    pub flags: u32,
+}
+
+impl ImplEntry {
+    pub(crate) fn zeroed() -> ImplEntry {
+        ImplEntry {
+            name: std::ptr::null(),
+            provider: std::ptr::null(),
+            flags: 0,
+        }
+    }
+}
+
+/// `turbine_card_profile` (v2.4): the card profile's thresholds, copied into the context by
+/// `turbine_ctx_set_profile`. `arch` is a host string the library does not retain.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CardProfileDesc {
+    pub struct_bytes: u32,
+    pub arch: *const c_char,
+    pub wave_size: i32,
+    pub lds_bytes: i32,
+    pub moe_small_max_rows: i64,
+    pub paged_page_multiple: i32,
+}
+
+/// The five v2.4 functions: implementation enumeration, explicit runs and the card profile.
+#[derive(Clone, Copy)]
+pub(crate) struct ImplFns {
+    pub count: unsafe extern "C" fn(i32) -> i32,
+    pub info: unsafe extern "C" fn(i32, i32, *mut ImplEntry) -> i32,
+    pub supports: unsafe extern "C" fn(i32, i32, *const c_void) -> i32,
+    pub run: unsafe extern "C" fn(*mut TurbineCtx, i32, i32, *const c_void) -> i32,
+    pub set_profile: unsafe extern "C" fn(*mut TurbineCtx, *const CardProfileDesc) -> i32,
+}
+
 /// The optional ABI v2.1 and v2.3 functions. `minor` is `turbine_abi_minor()` (0 when the
 /// library lacks it); every v2.1 group is `None` unless `minor` ≥ 1, `staging` unless `minor`
-/// ≥ 2, and each only when the library exports the whole group.
+/// ≥ 3, `impls` unless `minor` ≥ 4, and each only when the library exports the whole group.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct V21Symbols {
     pub minor: u32,
@@ -369,6 +415,8 @@ pub(crate) struct V21Symbols {
     pub graph: Option<GraphFns>,
     /// v2.3 host staging memory and events.
     pub staging: Option<StagingFns>,
+    /// v2.4 implementation enumeration and the card profile.
+    pub impls: Option<ImplFns>,
 }
 
 impl V21Symbols {
@@ -413,6 +461,18 @@ impl V21Symbols {
                 event_destroy: optional(lib, "turbine_event_destroy")?,
             })
         })();
+        let impls = (|| {
+            if minor < 4 {
+                return None;
+            }
+            Some(ImplFns {
+                count: optional(lib, "turbine_impl_count")?,
+                info: optional(lib, "turbine_impl_info")?,
+                supports: optional(lib, "turbine_impl_supports")?,
+                run: optional(lib, "turbine_impl_run")?,
+                set_profile: optional(lib, "turbine_ctx_set_profile")?,
+            })
+        })();
         V21Symbols {
             minor,
             options,
@@ -420,6 +480,7 @@ impl V21Symbols {
             logits_reduce: optional_trio(lib, "logits_reduce"),
             graph,
             staging,
+            impls,
         }
     }
 }

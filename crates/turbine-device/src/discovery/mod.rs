@@ -1,5 +1,6 @@
-//! Discovery orchestration: every backend runs on its own thread with a deadline, results
-//! are merged into one inventory with a stable global index, and each outcome is logged.
+//! Discovery orchestration: every registered [`DiscoveryKind`] builds a backend that runs on
+//! its own thread with a deadline, results are merged into one inventory with a stable global
+//! index, and each outcome is logged.
 
 mod amd_smi;
 mod nvml;
@@ -9,6 +10,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use turbine_core::config::DevicesConfig;
+use turbine_core::registry::{Module, Registry};
 use turbine_core::types::{DeviceId, Vendor};
 
 use crate::inventory::{BackendReport, BackendStatus, DeviceInfo, DeviceInventory, DiscoveryError};
@@ -63,34 +65,94 @@ pub trait DiscoveryBackend: Send {
     fn discover(&mut self) -> Result<Vec<DeviceInfo>, String>;
 }
 
-/// Discover NVIDIA then AMD devices. `Err` only when an explicitly configured library cannot be loaded.
+/// One vendor's discovery as a registered module (`device_discovery`, contract §24): which
+/// library it loads and how it builds the [`DiscoveryBackend`] that runs it. Every registered
+/// kind runs, in registration order (which fixes the global device index order).
+pub trait DiscoveryKind: Module {
+    fn vendor(&self) -> Vendor;
+    /// The operator-configured library path in `opts` (fatal when it cannot be loaded).
+    fn configured_library<'a>(&self, opts: &'a DiscoveryOptions) -> Option<&'a Path>;
+    /// The library name the platform loader searches when none is configured.
+    fn default_library(&self) -> &'static str;
+    fn build(&self, library: PathBuf, opts: &DiscoveryOptions) -> Box<dyn DiscoveryBackend>;
+}
+
+struct NvmlKind;
+
+impl Module for NvmlKind {
+    fn name(&self) -> &'static str {
+        "nvml"
+    }
+}
+
+impl DiscoveryKind for NvmlKind {
+    fn vendor(&self) -> Vendor {
+        Vendor::Nvidia
+    }
+    fn configured_library<'a>(&self, opts: &'a DiscoveryOptions) -> Option<&'a Path> {
+        opts.nvml_library.as_deref()
+    }
+    fn default_library(&self) -> &'static str {
+        NVML_DEFAULT_LIBRARY
+    }
+    fn build(&self, library: PathBuf, opts: &DiscoveryOptions) -> Box<dyn DiscoveryBackend> {
+        Box::new(nvml::NvmlBackend::new(library, opts.meminfo_path.clone()))
+    }
+}
+
+struct AmdSmiKind;
+
+impl Module for AmdSmiKind {
+    fn name(&self) -> &'static str {
+        "amd_smi"
+    }
+}
+
+impl DiscoveryKind for AmdSmiKind {
+    fn vendor(&self) -> Vendor {
+        Vendor::Amd
+    }
+    fn configured_library<'a>(&self, opts: &'a DiscoveryOptions) -> Option<&'a Path> {
+        opts.amd_smi_library.as_deref()
+    }
+    fn default_library(&self) -> &'static str {
+        AMD_SMI_DEFAULT_LIBRARY
+    }
+    fn build(&self, library: PathBuf, _opts: &DiscoveryOptions) -> Box<dyn DiscoveryBackend> {
+        Box::new(amd_smi::AmdSmiBackend::new(library))
+    }
+}
+
+static DISCOVERY: Registry<dyn DiscoveryKind> =
+    Registry::new("device_discovery", &[&NvmlKind, &AmdSmiKind]);
+
+/// The registered discovery kinds: `nvml`, then `amd_smi`.
+pub fn registry() -> &'static Registry<dyn DiscoveryKind> {
+    &DISCOVERY
+}
+
+/// Discover the devices of every registered kind (NVIDIA then AMD). `Err` only when an
+/// explicitly configured library cannot be loaded.
 pub fn discover(opts: &DiscoveryOptions) -> Result<DeviceInventory, DiscoveryError> {
-    discover_with_defaults(opts, NVML_DEFAULT_LIBRARY, AMD_SMI_DEFAULT_LIBRARY)
+    discover_with_defaults(opts, |kind| PathBuf::from(kind.default_library()))
 }
 
 fn discover_with_defaults(
     opts: &DiscoveryOptions,
-    nvml_default: &str,
-    amd_smi_default: &str,
+    default_library: impl Fn(&dyn DiscoveryKind) -> PathBuf,
 ) -> Result<DeviceInventory, DiscoveryError> {
-    for explicit in [&opts.nvml_library, &opts.amd_smi_library]
-        .into_iter()
-        .flatten()
-    {
+    for explicit in registry().iter().filter_map(|k| k.configured_library(opts)) {
         check_loadable(explicit)?;
     }
-    let nvml_lib = opts
-        .nvml_library
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(nvml_default));
-    let amd_lib = opts
-        .amd_smi_library
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(amd_smi_default));
-    let backends: Vec<Box<dyn DiscoveryBackend>> = vec![
-        Box::new(nvml::NvmlBackend::new(nvml_lib, opts.meminfo_path.clone())),
-        Box::new(amd_smi::AmdSmiBackend::new(amd_lib)),
-    ];
+    let backends: Vec<Box<dyn DiscoveryBackend>> = registry()
+        .iter()
+        .map(|kind| {
+            let library = kind
+                .configured_library(opts)
+                .map_or_else(|| default_library(kind), Path::to_path_buf);
+            kind.build(library, opts)
+        })
+        .collect();
     Ok(run_backends(backends, opts.deadline))
 }
 

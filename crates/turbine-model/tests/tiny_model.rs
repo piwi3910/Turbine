@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use half::bf16;
-use turbine_core::types::{BlockId, DeviceId, ExecutionBackend, KvLayout, SeqId, Vendor};
+use turbine_core::types::{BlockId, DeviceId, KvLayout, SeqId};
 use turbine_kernels::torch_topk;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -19,14 +19,15 @@ use turbine_kernels::{
     KernelRegistry, KvCopyConfig, KvCopyContext, KvCopyKernel, MoeExpertsConfig, MoeExpertsContext,
     MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel,
     PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel, ShimContext,
-    cpu_reference_provider, shim_provider,
+    ShimLibrary, cpu_reference_provider, shim_provider,
 };
-use turbine_model::config::{Architecture, ModelArchConfig, RopeScaling};
+use turbine_model::config::{ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
-    self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, LlamaExecutor, Logits,
-    LogitsSlot, ModelExecutor, OlmoeExecutor, OpProfile, ReducedRow, RowReduce, SeqSlice,
-    SequenceKv, TokenFeed, TraceTensor, build_executor, graphs,
+    self, BatchInput, DecodeGraphs, DecoderExecutor, DecoderSpec, ExecutorLimits, ExecutorOptions,
+    GraphBackend, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice, SequenceKv,
+    TokenFeed, TraceTensor, build_executor, graphs,
 };
+use turbine_model::families;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
@@ -70,19 +71,19 @@ fn prompt(vocab: u32) -> Vec<u32> {
 
 /// An executor plus the Phase 1 single-sequence KV it runs on; derefs to the executor.
 struct Single {
-    exec: LlamaExecutor,
+    exec: DecoderExecutor,
     kv: SequenceKv,
 }
 
 impl std::ops::Deref for Single {
-    type Target = LlamaExecutor;
-    fn deref(&self) -> &LlamaExecutor {
+    type Target = DecoderExecutor;
+    fn deref(&self) -> &DecoderExecutor {
         &self.exec
     }
 }
 
 impl std::ops::DerefMut for Single {
-    fn deref_mut(&mut self) -> &mut LlamaExecutor {
+    fn deref_mut(&mut self) -> &mut DecoderExecutor {
         &mut self.exec
     }
 }
@@ -117,28 +118,33 @@ fn paged_executor(
     spec: &TinySpec,
     provider: Arc<dyn KernelProvider>,
     mem: Arc<dyn DeviceMemory>,
-) -> LlamaExecutor {
+) -> DecoderExecutor {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
     let weights =
         WeightLoader::load(&index, &llama_slots(cfg), &mem, MAX_STAGING_BYTES).expect("load");
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
     let order = [provider.id()];
+    let card = provider.card_profile();
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &LlamaExecutor::requirements(cfg, BLOCK_TOKENS, ALL_FUSED),
+        &executor::requirements(cfg, BLOCK_TOKENS, ALL_FUSED),
         &metrics,
+        card,
     )
     .expect("every op has a provider");
-    LlamaExecutor::new(
+    DecoderExecutor::new(
         cfg,
+        families::llama::decoder_spec(),
         weights,
         Arc::new(registry),
         mem,
-        BLOCK_TOKENS,
-        MAX_SEQ_LEN,
-        MAX_SEQS,
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: MAX_SEQ_LEN,
+            max_seqs: MAX_SEQS,
+        },
         ALL_FUSED,
     )
     .expect("executor")
@@ -646,7 +652,7 @@ fn forward_rejects_invalid_batches() {
 fn requirements_and_workspace() {
     let tmp = TempDir::new("tiny-model-reqs");
     let spec = write_tiny_llama(tmp.path(), SEED);
-    let reqs = LlamaExecutor::requirements(&spec.config, BLOCK_TOKENS, ALL_FUSED);
+    let reqs = executor::requirements(&spec.config, BLOCK_TOKENS, ALL_FUSED);
     let rendered: Vec<String> = reqs
         .iter()
         .map(|r| format!("{} {}", r.op, r.config))
@@ -683,7 +689,7 @@ fn requirements_and_workspace() {
     }
     assert_eq!(rendered.len(), 14, "{rendered:#?}");
     // Unfused: separate Q (n = 64, as O), K/V (n = 32) and gate/up (n = 128) GEMMs.
-    let unfused: Vec<String> = LlamaExecutor::requirements(
+    let unfused: Vec<String> = executor::requirements(
         &spec.config,
         BLOCK_TOKENS,
         ExecutorOptions::from_fused_ops(false),
@@ -705,7 +711,7 @@ fn requirements_and_workspace() {
     assert_eq!(unfused.len(), 13, "{unfused:#?}");
 
     // Workspace grows linearly in the batch token count and in the sequence count.
-    let ws = |t, n| LlamaExecutor::workspace_bytes(&spec.config, BLOCK_TOKENS, t, n);
+    let ws = |t, n| executor::workspace_bytes(&spec.config, BLOCK_TOKENS, t, n);
     let per_token = ws(2, 1) - ws(1, 1);
     assert_eq!(ws(64, 1) - ws(1, 1), 63 * per_token);
     // Per token: ids + positions (i32), x/h/proj [hidden], attn [q_dim], qkv [q_dim +
@@ -771,7 +777,7 @@ fn paged_llama_single_sequence() {
     storage.whole().write_bytes(&noise).expect("fill pool");
     let kv = pool_view(&storage, exec.kv_layout(), 12);
     let table = [BlockId(9), BlockId(2), BlockId(7), BlockId(4)];
-    let run = |exec: &mut LlamaExecutor, tokens: &[u32], start: u32| {
+    let run = |exec: &mut DecoderExecutor, tokens: &[u32], start: u32| {
         let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
         let seqs = [SeqSlice {
             seq: SeqId(42),
@@ -903,7 +909,7 @@ fn ragged_batch_rows_match_single_sequences() {
     exec.copy_blocks(&kv, &[BlockId(6)], &[BlockId(9)])
         .expect("copy_blocks");
     let fork = [BlockId(9)];
-    let decode = |exec: &mut LlamaExecutor, table: &[BlockId]| {
+    let decode = |exec: &mut DecoderExecutor, table: &[BlockId]| {
         let seqs = [SeqSlice {
             seq: SeqId(3),
             q_start: 0,
@@ -964,11 +970,7 @@ fn cpu_model_with(
 ) -> Box<dyn ModelExecutor> {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
-    let slots = match cfg.architecture {
-        Architecture::Llama => llama_slots(cfg),
-        Architecture::Olmoe => olmoe_slots(cfg),
-        other => panic!("no tiny checkpoint for {other:?}"),
-    };
+    let slots = cfg.family.0.weight_slots(cfg);
     let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load");
     let order = [provider.id()];
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
@@ -977,7 +979,8 @@ fn cpu_model_with(
     if reduce {
         reqs.push(executor::logits::reduce_requirement(cfg));
     }
-    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+    let card = provider.card_profile();
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
         .expect("every op has a provider");
     build_executor(
         cfg,
@@ -1122,7 +1125,7 @@ fn fused_ops_match_unfused() {
     let tmp = TempDir::new("tiny-model-fused");
     for spec in both_checkpoints(&tmp) {
         let cfg = &spec.config;
-        let name = cfg.architecture.as_str();
+        let name = cfg.hf_architecture.as_str();
         let gemm = |n: u32| {
             format!(
                 "gemm n={n} k={} trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
@@ -1221,11 +1224,10 @@ fn olmoe_cpu_forward_matches_naive() {
     assert_eq!((moe.num_experts, moe.experts_per_token), (8, 2));
     assert!(!moe.norm_topk_prob && cfg.qk_norm && cfg.rope_scaling.is_none());
 
-    let reqs: Vec<String> =
-        OlmoeExecutor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default())
-            .iter()
-            .map(|r| format!("{} {}", r.op, r.config))
-            .collect();
+    let reqs: Vec<String> = executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default())
+        .iter()
+        .map(|r| format!("{} {}", r.op, r.config))
+        .collect();
     for want in [
         "rmsnorm dim=64 dtype=bf16",
         "gemm n=8 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
@@ -1330,7 +1332,7 @@ fn executors_run_without_device_to_device_copies() {
     const STEPS: usize = 4;
     let tmp = TempDir::new("tiny-model-no-d2d");
     for spec in both_checkpoints(&tmp) {
-        let arch = spec.config.architecture;
+        let arch = spec.config.family;
         let mut rows: Vec<Vec<Vec<f32>>> = Vec::new();
         let plain: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
         let no_d2d: Arc<dyn DeviceMemory> =
@@ -1668,7 +1670,8 @@ fn olmoe_decode_single_device_copy() {
             opts,
             std::slice::from_ref(&provider),
         );
-        let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+        let card = provider.card_profile();
+        let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
             .expect("every op has a provider");
         let mut exec = build_executor(
             cfg,
@@ -1749,7 +1752,7 @@ fn chunked_prefill_matches_unchunked() {
     const CHUNK: u32 = 64;
     let tmp = TempDir::new("tiny-model-chunked");
     for spec in both_checkpoints(&tmp) {
-        let arch = spec.config.architecture;
+        let arch = spec.config.family;
         let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
         let mut exec = cpu_model(&spec, &mem, LONG);
         let layout = *exec.kv_layout();
@@ -1793,7 +1796,7 @@ fn paged_matches_contiguous() {
         (2 * LENS.len() as u32 * MAX_TOKENS.div_ceil(BLOCK_TOKENS)).next_power_of_two();
     let tmp = TempDir::new("tiny-model-paged-contiguous");
     for spec in both_checkpoints(&tmp) {
-        let arch = spec.config.architecture;
+        let arch = spec.config.family;
         let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
         let prompts: Vec<Vec<u32>> = LENS
             .iter()
@@ -1910,19 +1913,7 @@ const HIP_MAX_ABS_LOGIT_DIFF: f32 = 1e-4;
 
 /// A context on the first AMD device through the library `TURBINE_KERNEL_LIBRARY` names.
 fn hip_context() -> Arc<ShimContext> {
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    lib.create_context(device).expect("HIP context")
+    turbine_kernels::test_support::open_context("hip")
 }
 
 /// Decode graphs on `ctx` for an executor of up to `max_seqs` sequences.
@@ -1994,11 +1985,7 @@ fn hip_graph_executor(
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
     let provider = shim_provider(ctx.clone());
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
-    let slots = match cfg.architecture {
-        Architecture::Llama => llama_slots(cfg),
-        Architecture::Olmoe => olmoe_slots(cfg),
-        other => panic!("no tiny checkpoint for {other:?}"),
-    };
+    let slots = cfg.family.0.weight_slots(cfg);
     let weights = WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("load");
     let opts = ExecutorOptions::default();
     let mut reqs =
@@ -2006,7 +1993,8 @@ fn hip_graph_executor(
     reqs.push(executor::logits::reduce_requirement(cfg));
     let order = [provider.id()];
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
-    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+    let card = provider.card_profile();
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
         .expect("every op has a provider");
     build_executor(
         cfg,
@@ -2122,7 +2110,7 @@ fn hip_decode_graph_matches_eager() {
     ];
     for spec in &specs {
         for block_tokens in [16, 128] {
-            let arch = spec.config.architecture;
+            let arch = spec.config.family;
             let mut exec = hip_graph_executor(spec, &ctx, block_tokens);
             assert!(exec.reduces_logits(), "{arch:?}");
             let layout = *exec.kv_layout();
@@ -2230,6 +2218,111 @@ fn cpu_trace_recomputes_exactly() {
     assert!(exec.take_trace().is_empty());
 }
 
+/// Tracing works for every family (Phase 2m S-3): the tiny OLMoE on the CPU provider with
+/// tracing on records, for one 5-token prefill, `embed`, then per layer the attention outputs
+/// with the full Q/K norms and the MoE block's router logits and output, then `final_norm` and
+/// `logits`, each shaped as the op wrote it; the traced logits are bitwise those of the same
+/// prefill untraced. Breaks if a family's executor loses tracing (OLMoE had none before the
+/// shared decoder skeleton), a hook skips a trace point or recording changes an op.
+#[test]
+fn olmoe_trace_records_every_layer() {
+    let tmp = TempDir::new("tiny-model-olmoe-trace");
+    let spec = write_tiny_olmoe(tmp.path(), SEED);
+    let cfg = &spec.config;
+    let moe = cfg.moe.expect("OLMoE has experts");
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = cpu_decoder(&spec, &mem);
+    let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv");
+    let tokens = prompt(spec.vocab)[..5].to_vec();
+    let positions: Vec<u32> = (0..5).collect();
+    let untraced = kv
+        .forward(&mut exec, &tokens, &positions)
+        .expect("untraced prefill")
+        .row(0)
+        .to_vec();
+    assert!(exec.take_trace().is_empty(), "tracing is off by default");
+
+    exec.set_trace(true);
+    // The same prefill again: it rewrites the same K/V slots.
+    let traced = kv
+        .forward(&mut exec, &tokens, &positions)
+        .expect("traced prefill")
+        .row(0)
+        .to_vec();
+    let trace = exec.take_trace();
+    let per_layer = [
+        "attn_norm",
+        "q",
+        "k",
+        "v",
+        "q_norm",
+        "k_norm",
+        "q_rope",
+        "k_rope",
+        "attn",
+        "o_proj",
+        "resid_attn",
+        "mlp_norm",
+        "router_logits",
+        "moe_out",
+        "resid_mlp",
+    ];
+    let layers = cfg.num_layers as usize;
+    let mut want: Vec<(Option<usize>, &str)> = vec![(None, "embed")];
+    for layer in 0..layers {
+        want.extend(per_layer.iter().map(|&name| (Some(layer), name)));
+    }
+    want.extend([(None, "final_norm"), (None, "logits")]);
+    let got: Vec<(Option<usize>, &str)> = trace.iter().map(|t| (t.layer, t.name)).collect();
+    assert_eq!(got, want);
+
+    let hidden = cfg.hidden as usize;
+    let q_dim = (cfg.num_attention_heads * cfg.head_dim) as usize;
+    let kv_dim = (cfg.num_kv_heads * cfg.head_dim) as usize;
+    for t in &trace {
+        let cols = match t.name {
+            "q" | "q_norm" | "q_rope" | "attn" => q_dim,
+            "k" | "v" | "k_norm" | "k_rope" => kv_dim,
+            "router_logits" => moe.num_experts as usize,
+            "logits" => spec.vocab as usize,
+            _ => hidden,
+        };
+        let rows = if matches!(t.name, "final_norm" | "logits") {
+            1
+        } else {
+            5
+        };
+        assert_eq!(t.shape, [rows, cols], "{:?} {}", t.layer, t.name);
+        assert_eq!(t.data.len(), rows * cols, "{:?} {}", t.layer, t.name);
+    }
+    // Q/K norm rewrote the projections in place: the recorded rows differ.
+    for (before, after) in [("q", "q_norm"), ("k", "k_norm")] {
+        let get = |name: &str| {
+            trace
+                .iter()
+                .find(|t| t.layer == Some(0) && t.name == name)
+                .map(|t| t.data.clone())
+                .expect("recorded")
+        };
+        assert_ne!(get(before), get(after), "{after} changed nothing");
+    }
+    let last = trace.last().expect("logits recorded");
+    assert_eq!(last.data, traced);
+    let bitwise = traced
+        .iter()
+        .zip(&untraced)
+        .all(|(a, b)| a.to_bits() == b.to_bits());
+    assert!(
+        bitwise,
+        "tracing changed the logits by up to {}",
+        max_abs_diff(&traced, &untraced)
+    );
+
+    exec.set_trace(false);
+    kv.forward(&mut exec, &tokens, &positions).expect("prefill");
+    assert!(exec.take_trace().is_empty());
+}
+
 /// Lab diagnostic (precision investigation): HIP vs cpu-reference on the head_dim-128 tiny
 /// checkpoint op by op for the prefill and 3 decode steps (accumulated divergence), then every
 /// HIP op recomputed on the host from the HIP trace's own inputs (the error each op adds).
@@ -2240,19 +2333,7 @@ fn hip_trace_vs_cpu() {
     if !turbine_kernels::test_support::require_backend("hip") {
         return;
     }
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
 
     let tmp = TempDir::new("tiny-model-hip-trace");
     let spec = write_gpu_tiny(tmp.path());
@@ -2384,20 +2465,11 @@ fn hip_reduced_rows_match_full_rows() {
     if !turbine_kernels::test_support::require_backend("hip") {
         return;
     }
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
-        .expect("load the HIP kernel library");
-    assert!(lib.abi_minor() >= 1, "logits_reduce needs kernel ABI v2.1");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+    assert!(
+        ctx.library().abi_minor() >= 1,
+        "logits_reduce needs kernel ABI v2.1"
+    );
     let tmp = TempDir::new("tiny-model-hip-reduced-rows");
     let spec = write_gpu_tiny(tmp.path());
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
@@ -2418,7 +2490,7 @@ fn check_reduced_rows(
 ) {
     const LENS: [u32; 3] = [5, 3, 4];
     const POOL_BLOCKS: u32 = 8;
-    let arch = spec.config.architecture;
+    let arch = spec.config.family;
     let mem = Arc::clone(mem);
     {
         assert!(
@@ -2557,20 +2629,11 @@ fn hip_launch_ahead_feeds_match_serial() {
     if !turbine_kernels::test_support::require_backend("hip") {
         return;
     }
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
-        .expect("load the HIP kernel library");
-    assert!(lib.abi_minor() >= 3, "host staging needs kernel ABI v2.3");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+    assert!(
+        ctx.library().abi_minor() >= 3,
+        "host staging needs kernel ABI v2.3"
+    );
     let tmp = TempDir::new("tiny-model-hip-launch-ahead");
     let spec = write_gpu_tiny(tmp.path());
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
@@ -2615,7 +2678,7 @@ fn check_launch_ahead(
     const LENS: [u32; 3] = [5, 3, 4];
     const POOL_BLOCKS: u32 = 8;
     let decodes: usize = if greedy { 10 } else { 6 };
-    let arch = spec.config.architecture;
+    let arch = spec.config.family;
     assert!(ahead.overlaps() && ahead.reduces_logits(), "{arch:?}");
     let layout = *serial.kv_layout();
     let (a, b) = (
@@ -2856,43 +2919,15 @@ fn check_launch_ahead(
 
 // ------------------------------------------------------------------------ op profile (P2c S-2)
 
-/// The profile switches both executors carry, so one test body drives either.
-trait Profiled: ModelExecutor {
-    fn set_profile(&mut self, on: bool);
-    fn take_profile(&mut self) -> OpProfile;
-}
-
-impl Profiled for LlamaExecutor {
-    fn set_profile(&mut self, on: bool) {
-        LlamaExecutor::set_profile(self, on);
-    }
-    fn take_profile(&mut self) -> OpProfile {
-        LlamaExecutor::take_profile(self)
-    }
-}
-
-impl Profiled for OlmoeExecutor {
-    fn set_profile(&mut self, on: bool) {
-        OlmoeExecutor::set_profile(self, on);
-    }
-    fn take_profile(&mut self) -> OpProfile {
-        OlmoeExecutor::take_profile(self)
-    }
-}
-
-/// A tiny checkpoint's concrete executor on the CPU provider (batches of up to
-/// [`MAX_SEQ_LEN`] tokens and [`MAX_SEQS`] sequences), and the registry it runs on.
+/// A tiny checkpoint's decoder executor on the CPU provider with the default options (batches
+/// of up to [`MAX_SEQ_LEN`] tokens and [`MAX_SEQS`] sequences), and the registry it runs on.
 fn cpu_profiled(
     spec: &TinySpec,
     mem: &Arc<dyn DeviceMemory>,
-) -> (Box<dyn Profiled>, Arc<KernelRegistry>) {
+) -> (DecoderExecutor, Arc<KernelRegistry>) {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
-    let slots = match cfg.architecture {
-        Architecture::Llama => llama_slots(cfg),
-        Architecture::Olmoe => olmoe_slots(cfg),
-        other => panic!("no tiny checkpoint for {other:?}"),
-    };
+    let slots = cfg.family.0.weight_slots(cfg);
     let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load");
     let provider = cpu_reference_provider();
     let order = [provider.id()];
@@ -2900,40 +2935,40 @@ fn cpu_profiled(
     let opts = ExecutorOptions::default();
     let reqs =
         executor::available_requirements(cfg, BLOCK_TOKENS, opts, std::slice::from_ref(&provider));
+    let card = provider.card_profile();
     let registry = Arc::new(
-        KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
+        KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
             .expect("every op has a provider"),
     );
-    let mem = Arc::clone(mem);
-    let exec: Box<dyn Profiled> = match cfg.architecture {
-        Architecture::Llama => Box::new(
-            LlamaExecutor::new(
-                cfg,
-                weights,
-                Arc::clone(&registry),
-                mem,
-                BLOCK_TOKENS,
-                MAX_SEQ_LEN,
-                MAX_SEQS,
-                opts,
-            )
-            .expect("llama executor"),
-        ),
-        _ => Box::new(
-            OlmoeExecutor::new(
-                cfg,
-                weights,
-                Arc::clone(&registry),
-                mem,
-                BLOCK_TOKENS,
-                MAX_SEQ_LEN,
-                MAX_SEQS,
-                opts,
-            )
-            .expect("olmoe executor"),
-        ),
-    };
+    let exec = DecoderExecutor::new(
+        cfg,
+        decoder_spec(cfg),
+        weights,
+        Arc::clone(&registry),
+        Arc::clone(mem),
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: MAX_SEQ_LEN,
+            max_seqs: MAX_SEQS,
+        },
+        opts,
+    )
+    .expect("decoder executor");
     (exec, registry)
+}
+
+/// [`cpu_profiled`]'s executor alone.
+fn cpu_decoder(spec: &TinySpec, mem: &Arc<dyn DeviceMemory>) -> DecoderExecutor {
+    cpu_profiled(spec, mem).0
+}
+
+/// The decoder spec of a tiny checkpoint's family.
+fn decoder_spec(cfg: &ModelArchConfig) -> DecoderSpec {
+    match cfg.family.0.name() {
+        "llama" => families::llama::decoder_spec(),
+        "olmoe" => families::olmoe::decoder_spec(),
+        other => panic!("no tiny decoder spec for family {other}"),
+    }
 }
 
 /// For both tiny checkpoints on the CPU provider, a decode forward of 3 sequences with profile
@@ -2947,7 +2982,7 @@ fn op_profile_accounts_forward() {
     const PROMPT: u32 = 20;
     let tmp = TempDir::new("tiny-model-op-profile");
     for spec in both_checkpoints(&tmp) {
-        let arch = spec.config.architecture;
+        let arch = spec.config.family;
         let layers = spec.config.num_layers;
         let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
         let (mut exec, registry) = cpu_profiled(&spec, &mem);
@@ -2962,7 +2997,7 @@ fn op_profile_accounts_forward() {
             let tokens: Vec<u32> = (0..PROMPT)
                 .map(|i| (i * 13 + 5 * s as u32 + 1) % spec.vocab)
                 .collect();
-            run_seq(exec.as_mut(), &kv, table, &tokens, 0);
+            run_seq(&mut exec, &kv, table, &tokens, 0);
         }
         // The same decode step twice (it rewrites the same K/V slot): profile off, then on.
         let tokens = [3u32, 7, 11];
@@ -3028,8 +3063,8 @@ fn op_profile_accounts_forward() {
         // fused, one per projection otherwise.
         let fused = ExecutorOptions::default().fused_projections;
         let (qkv, gate_up) = if fused { (1, 1) } else { (3, 2) };
-        match arch {
-            Architecture::Llama => want.extend([
+        match arch.0.name() {
+            "llama" => want.extend([
                 // The first input norm and the final norm of the (consecutive) last rows.
                 ("rmsnorm", cpu("rmsnorm"), 2),
                 // Q/K/V, O, gate/up and down per layer plus the LM head.
@@ -3070,5 +3105,176 @@ fn op_profile_accounts_forward() {
         let again = exec.forward(&batch).expect("decode after profiling");
         assert_eq!(again, off, "{arch:?}");
         assert!(exec.take_profile().entries.is_empty(), "{arch:?}");
+    }
+}
+
+/// One sequence through `exec` on a pool of its own: the first `prompt_len` tokens of `feed` as
+/// one prefill, then one decode step per token. With `greedy` each step's token is the argmax of
+/// the previous row (for `steps` steps; `feed` holds only the prompt), else the next token of
+/// `feed`. Returns the tokens fed and every forward's logits row.
+fn single_sequence(
+    exec: &mut dyn ModelExecutor,
+    mem: &Arc<dyn DeviceMemory>,
+    feed: &[u32],
+    prompt_len: usize,
+    steps: usize,
+    greedy: bool,
+) -> (Vec<u32>, Vec<Vec<f32>>) {
+    let layout = *exec.kv_layout();
+    let blocks = ((prompt_len + steps) as u32).div_ceil(layout.block_tokens);
+    let storage = pool(mem, &layout, blocks);
+    let kv = pool_view(&storage, &layout, blocks);
+    let table: Vec<BlockId> = (0..blocks).map(BlockId).collect();
+    let run = |exec: &mut dyn ModelExecutor, tokens: &[u32], start: u32| {
+        let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
+        let seqs = [SeqSlice {
+            seq: SeqId(1),
+            q_start: 0,
+            q_len: tokens.len() as u32,
+            kv_len: start + tokens.len() as u32,
+            block_table: &table,
+            reduce: None,
+        }];
+        exec.forward(&BatchInput {
+            tokens,
+            positions: &positions,
+            seqs: &seqs,
+            kv: &kv,
+        })
+        .expect("forward")
+        .row(0)
+        .to_vec()
+    };
+    let mut tokens = feed[..prompt_len].to_vec();
+    let mut rows = vec![run(exec, &tokens, 0)];
+    for step in 0..steps {
+        let next = if greedy {
+            argmax(rows.last().expect("a row"))
+        } else {
+            feed[prompt_len + step]
+        };
+        let pos = tokens.len() as u32;
+        tokens.push(next);
+        rows.push(run(exec, &[next], pos));
+    }
+    (tokens, rows)
+}
+
+/// HIP vs CPU logit bound of the head_dim-128 tiny OLMoE: its expert GEMMs and weighted sum
+/// round to BF16 in another order than the reference; 3.7e-3 measured on the R9700 (lab run
+/// 0926202901-0eb0e349), where the tiny Llama stays within `HIP_MAX_ABS_LOGIT_DIFF`.
+const HIP_MAX_ABS_LOGIT_DIFF_MOE: f32 = 1e-2;
+
+/// Phase 2m S-5: a kernel library without the ABI v2.4 group still loads and serves.
+/// `libturbine_hip_v23.so` (the same kernels, minor 3, built beside `TURBINE_KERNEL_LIBRARY`)
+/// enumerates nothing, so every selection on it is the library's own (`provider_internal`); it
+/// chooses the implementations the Rust registry binds on `libturbine_hip.so`, and on the tiny
+/// Llama and OLMoE (head_dim 128) a greedy run on it, like one on the bound v2.4 library,
+/// matches the CPU reference greedily (every step's argmax) and within a logit bound: the
+/// `hip_matches_cpu` bound for Llama, [`HIP_MAX_ABS_LOGIT_DIFF_MOE`] for OLMoE (the two libraries
+/// tune their GEMMs per context, so they are compared through the reference, not bitwise). Breaks if an older library no longer loads
+/// or serves, or if the Rust selection departs from the library's own.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_v23_library_matches_cpu() {
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let opened = turbine_kernels::test_support::open_backend("hip");
+    let device = opened
+        .device
+        .clone()
+        .expect("the hip backend runs on a device");
+    let main_ctx = opened.context.clone().expect("a kernel library context");
+    assert!(main_ctx.library().enumerates_implementations());
+    let v23_path = main_ctx
+        .library()
+        .path()
+        .with_file_name("libturbine_hip_v23.so");
+    let lib = ShimLibrary::load(&v23_path, "hip")
+        .unwrap_or_else(|e| panic!("load {}: {e}", v23_path.display()));
+    assert_eq!(lib.abi_minor(), 3);
+    assert!(!lib.enumerates_implementations());
+    let ctx = lib.create_context(&device).expect("v2.3 context");
+    if let Some(card) = opened.card {
+        ctx.set_profile(card)
+            .expect("a v2.3 library ignores the card profile");
+    }
+    let old_mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let new_mem: Arc<dyn DeviceMemory> = main_ctx.clone();
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let tmp = TempDir::new("tiny-model-hip-v23");
+    let specs = [
+        write_gpu_tiny(&tmp.path().join("llama")),
+        write_tiny_olmoe_with_head_dim(&tmp.path().join("olmoe"), SEED, GPU_HEAD_DIM),
+    ];
+    let opts = ExecutorOptions::default();
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let selections = |provider: &Arc<dyn KernelProvider>, spec: &TinySpec| {
+        let reqs = executor::available_requirements(
+            &spec.config,
+            BLOCK_TOKENS,
+            opts,
+            std::slice::from_ref(provider),
+        );
+        KernelRegistry::build(
+            vec![Arc::clone(provider)],
+            &[provider.id()],
+            &reqs,
+            &metrics,
+            provider.card_profile(),
+        )
+        .expect("the library serves every op")
+        .selections()
+        .to_vec()
+    };
+    for (spec, bound_diff) in specs
+        .iter()
+        .zip([HIP_MAX_ABS_LOGIT_DIFF, HIP_MAX_ABS_LOGIT_DIFF_MOE])
+    {
+        let name = spec.dir.display().to_string();
+        let old = shim_provider(ctx.clone());
+        let new = shim_provider(main_ctx.clone());
+        let (old_sel, new_sel) = (selections(&old, spec), selections(&new, spec));
+        assert!(
+            old_sel.iter().all(|s| s.reason_code == "provider_internal"),
+            "{name}: {old_sel:?}"
+        );
+        assert!(
+            new_sel.iter().all(|s| s.reason_code != "provider_internal"),
+            "{name}: {new_sel:?}"
+        );
+        let chosen = |sel: &[turbine_kernels::Selection]| {
+            sel.iter()
+                .map(|s| (s.op, s.config.clone(), s.implementation.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(chosen(&old_sel), chosen(&new_sel), "{name}");
+
+        let prompt = prompt(spec.vocab);
+        let n = prompt.len();
+        let mut cpu = cpu_model_with(spec, &host, 128, opts, cpu_reference_provider(), false);
+        let (feed, want) = single_sequence(cpu.as_mut(), &host, &prompt, n, 16, true);
+        let mut v23 = cpu_model_with(spec, &old_mem, 128, opts, old, false);
+        let (_, got) = single_sequence(v23.as_mut(), &old_mem, &feed, n, 16, false);
+        let mut v24 = cpu_model_with(spec, &new_mem, 128, opts, new, false);
+        let (_, bound) = single_sequence(v24.as_mut(), &new_mem, &feed, n, 16, false);
+        for (lib, rows) in [("v2.3", &got), ("v2.4", &bound)] {
+            let mut worst = 0f32;
+            for (step, (g, w)) in rows.iter().zip(&want).enumerate() {
+                let diff = max_abs_diff(g, w);
+                worst = worst.max(diff);
+                assert!(
+                    diff <= bound_diff,
+                    "{name} {lib} step {step}: max abs diff {diff}"
+                );
+                assert_eq!(
+                    argmax(g),
+                    argmax(w),
+                    "{name} {lib}: greedy token {step} differs"
+                );
+            }
+            println!("hip_v23_library_matches_cpu {name} {lib}: max abs logit diff {worst}");
+        }
     }
 }

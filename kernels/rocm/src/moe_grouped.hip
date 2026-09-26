@@ -1,9 +1,10 @@
 // Turbine HIP kernels for moe_experts with many routed rows (impl
-// "turbine_hip_moe_wmma", above kMoeSmallMaxRows = num_tokens * top_k): a
+// "turbine_hip_moe_wmma"; the default takes it above the card profile's
+// moe_small_max_rows routed rows, num_tokens * top_k): a
 // grouped GEMM on the RDNA4 matrix cores (v_wmma_f32_16x16x16_bf16) that reads
 // every group size from expert_offsets on the device, so, like the small-m
 // path, the caller needs no host copy of the offsets and the step makes no
-// device-to-host copy. hipBLASLt has no grouped GEMM for gfx1201 in ROCm
+// device-to-host copy. hipBLASLt has no grouped GEMM for RDNA4 in ROCm
 // 7.14.1, and one hipBLASLt call per expert and projection costs ~3.6 ms of
 // host time per layer (192 calls for OLMoE) whatever the row count.
 //

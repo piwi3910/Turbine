@@ -804,7 +804,8 @@ impl EngineLoop {
     }
 
     /// The device reduction a yielding row of choice `choice` of request `id` asks for (P2c
-    /// S-4): only an unconstrained live choice whose sampler is eligible, and not the shared
+    /// S-4): only a live choice whose sampler finds the step eligible (a constrained choice's
+    /// grammar mask keeps it on the host), and not the shared
     /// prefill row that forks further choices (each fork samples its own copy of the whole
     /// row). `ahead` is 1 when the choice's previous token is still on the device (overlap
     /// scheduling): its sampler then asks for the step after the next one it observes.
@@ -822,10 +823,12 @@ impl EngineLoop {
         if choice == 0 && prefill && !r.forking_choices().is_empty() {
             return None;
         }
-        r.choices
-            .get_mut(choice)?
-            .unconstrained_sampler()?
-            .device_request_ahead(ahead)
+        let c = r.choices.get_mut(choice)?;
+        if c.finish.is_some() {
+            return None;
+        }
+        let constrained = c.is_constrained();
+        c.sampler_mut().device_request_ahead(ahead, constrained)
     }
 
     /// Samples every row whose step yields a token and emits its events. The completed shared
@@ -1545,7 +1548,8 @@ mod tests {
         CancelFlag, Endpoint, GenerationRequest, SamplingParams, StopConditions,
     };
     use turbine_core::types::{BlockId, DeviceId, KvLayout, ModelShape, Priority};
-    use turbine_kernels::{KernelError, KernelMetrics, KernelRegistry, cpu_reference_provider};
+    use turbine_kernels::test_support::{plain_device_error, sticky_device_error};
+    use turbine_kernels::{KernelMetrics, KernelRegistry, cpu_reference_provider};
     use turbine_kv::{BlockPoolConfig, KvMetrics};
     use turbine_model::executor::{self, ExecutorOptions, SequenceKv};
     use turbine_model::testing::TempDir;
@@ -1606,6 +1610,7 @@ mod tests {
             &order,
             &executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default()),
             &KernelMetrics::register(&MetricsRegistry::new()),
+            None,
         )
         .unwrap();
         executor::build_executor(
@@ -1776,6 +1781,7 @@ mod tests {
             &order,
             &reqs,
             &KernelMetrics::register(&MetricsRegistry::new()),
+            None,
         )
         .unwrap();
         executor::build_executor(
@@ -2124,9 +2130,7 @@ mod tests {
 
     impl Flaky {
         fn device_error() -> ModelError {
-            ModelError::Kernel(KernelError::Device {
-                message: "hipErrorLaunchFailure: injected".into(),
-            })
+            ModelError::Kernel(sticky_device_error("injected"))
         }
     }
 
@@ -2276,9 +2280,7 @@ mod tests {
         }
         fn forward(&mut self, _batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
             assert!(!self.panic, "injected engine panic");
-            Err(ModelError::Kernel(KernelError::Device {
-                message: "hipErrorOutOfMemory: injected".into(),
-            }))
+            Err(ModelError::Kernel(plain_device_error("injected")))
         }
         fn copy_blocks(
             &mut self,
@@ -2310,7 +2312,7 @@ mod tests {
             .collect();
         let err = t.engine.run().unwrap_err();
         assert!(err.contains("3 consecutive iterations failed"), "{err}");
-        assert!(err.contains("hipErrorOutOfMemory"), "{err}");
+        assert!(err.contains("device error: injected"), "{err}");
         for (rx, admitted) in &mut streams {
             assert_eq!(admitted.try_recv().unwrap(), Ok(()));
             assert!(internal_error(&drain(rx)));

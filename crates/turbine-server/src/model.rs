@@ -10,30 +10,31 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Instant;
 
-use turbine_core::config::{Config, StructuredOutputConfig, ToolCallParserKind};
+use turbine_core::config::{Config, StructuredOutputConfig};
 use turbine_core::types::SeqId;
-use turbine_core::types::{ExecutionBackend, MemoryKind, Vendor};
-use turbine_device::{DeviceInfo, DeviceInventory};
-use turbine_kernels::{
-    KernelError, KernelMetrics, KernelProvider, KernelRegistry, OpKind, ProviderId, Selection,
-    ShimContext, ShimLibrary, cpu_reference_provider, shim_provider,
+use turbine_device::DeviceInventory;
+use turbine_kernels::backends::{
+    self, BackendNote, BackendRequest, ExecutionBackend, OpenedBackend,
 };
+use turbine_kernels::{KernelError, KernelMetrics, KernelProvider, KernelRegistry, ShimContext};
 use turbine_kv::metrics::log_pool_startup;
 use turbine_kv::{BlockPool, BlockPoolConfig};
 use turbine_model::executor::{
     self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, ModelExecutor, SeqSlice, graphs,
 };
+use turbine_model::formats::{self, BoundToolFormat, ToolFormat};
 use turbine_model::loader::LoadedWeights;
 use turbine_model::{
-    Architecture, BudgetTerms, ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES,
-    ModelArchConfig, ModelError, ModelMetrics, SafetensorsIndex, Tokenizer, WeightLoader,
-    WeightSlot, available_bytes, check_budget, host_mem_available, llama_slots,
-    load_generation_config, load_model_config, olmoe_slots,
+    BudgetTerms, ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES,
+    ModelArchConfig, ModelError, ModelFamily, ModelMetrics, SafetensorsIndex, Tokenizer,
+    WeightLoader, available_bytes, check_budget, host_mem_available, load_generation_config,
+    load_model_config,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_scheduler::SchedulerParams;
+
+use crate::modules::ModuleChoices;
 use turbine_tensor::DeviceMemory;
-use turbine_tensor::host::HostMemory;
 
 /// Linux host memory figures (`MemAvailable`); absent elsewhere.
 const MEMINFO: &str = "/proc/meminfo";
@@ -100,30 +101,34 @@ pub fn resolve_max_seq_len(configured: Option<u32>, max_positions: u32) -> Resul
     }
 }
 
-/// `model.tool_call_parser`: `llama3_json` for a `LlamaForCausalLM` whose chat template renders
-/// `tools` when null. A parser is only usable with a template that renders `tools`: a
-/// configured `llama3_json` on any other template resolves to `none` (logged), so `tools`
-/// requests get 400 `tools_not_supported` instead of a prompt that silently lacks them.
+/// `model.tool_call_parser`, as a format of the tool-format registry
+/// ([`turbine_model::formats::registry`]) or `None` (tool calling off): when null, the family's
+/// default format ([`ModelFamily::default_tool_format`], e.g. `llama3_json` for `llama`) if the
+/// chat template renders `tools`.
+/// A format is only usable with a template that renders `tools`: a configured `llama3_json` on
+/// any other template resolves to none (logged), so `tools` requests get 400
+/// `tools_not_supported` instead of a prompt that silently lacks them. `none` and a name
+/// `Config::validate_modules` would have refused resolve to none.
 pub fn resolve_tool_call_parser(
-    configured: Option<ToolCallParserKind>,
-    architecture: Architecture,
+    configured: Option<&str>,
+    family: &dyn ModelFamily,
     renders_tools: bool,
-) -> ToolCallParserKind {
+) -> Option<&'static dyn ToolFormat> {
     match configured {
-        Some(ToolCallParserKind::None) => ToolCallParserKind::None,
-        Some(kind) if renders_tools => kind,
-        Some(kind) => {
+        Some("none") => None,
+        Some(name) if renders_tools => formats::registry().get(name),
+        Some(name) => {
             tracing::warn!(
-                parser = ?kind,
+                parser = name,
                 "model.tool_call_parser is set but the chat template does not render tools; \
                  tool calling is disabled"
             );
-            ToolCallParserKind::None
+            None
         }
-        None if renders_tools && architecture == Architecture::Llama => {
-            ToolCallParserKind::Llama3Json
-        }
-        None => ToolCallParserKind::None,
+        None if renders_tools => family
+            .default_tool_format()
+            .and_then(|d| formats::registry().get(d)),
+        None => None,
     }
 }
 
@@ -137,127 +142,36 @@ pub fn eos_token_ids(arch: &ModelArchConfig, generation: &GenerationConfig) -> V
     }
 }
 
-/// The device-memory backend and kernel providers of `execution.backend`.
+/// The opened `execution.backend`: device memory, kernel providers and the card profile
+/// (`opened.card`).
 pub struct Provider {
-    pub mem: Arc<dyn DeviceMemory>,
-    pub providers: Vec<Arc<dyn KernelProvider>>,
-    pub order: Vec<ProviderId>,
-    pub memory_kind: MemoryKind,
-    /// The context decode graphs capture on: `Some` on a backend whose kernel library exports
-    /// the ABI v2.1 graph functions.
-    pub graphs: Option<Arc<ShimContext>>,
+    /// The registered backend (`execution_backend`), for its notes on the kernel selections.
+    pub backend: &'static dyn ExecutionBackend,
+    pub opened: OpenedBackend,
 }
 
-/// Step 4: load the kernel provider. `hip`: the first loadable library of
-/// `ShimLibrary::search_paths` (an ABI, backend or architecture mismatch is fatal, a missing file
-/// moves on), then a context on the configured AMD device. `cpu`: the reference provider on host
-/// memory sized to host `MemAvailable`, else the configured device's total memory.
+/// Step 4: open the registered backend `execution.backend` names (logged as `module_selected`)
+/// on `execution.device` with `execution.card_profile`. An unregistered name was refused with
+/// exit 2 before this point; a backend that cannot open (including a device no card profile
+/// describes) is exit 1.
 pub fn load_provider(
     config: &Config,
     inventory: &DeviceInventory,
 ) -> Result<Provider, StartupError> {
     let exec = &config.execution;
-    match exec.backend {
-        ExecutionBackend::Cpu => {
-            let device_total = inventory
-                .devices
-                .iter()
-                .find(|d| d.index == exec.device)
-                .map(|d| d.memory.total_bytes);
-            let host = host_mem_available(Path::new(MEMINFO));
-            let capacity = host.or(device_total).unwrap_or_else(|| {
-                tracing::warn!(
-                    event = "memory_budget",
-                    "host MemAvailable and device memory unknown; the cpu backend is unbounded"
-                );
-                u64::MAX
-            });
-            let mem: Arc<dyn DeviceMemory> = HostMemory::new(exec.device, capacity);
-            tracing::info!(backend = "cpu", capacity, "kernel provider: cpu-reference");
-            Ok(Provider {
-                mem,
-                providers: vec![cpu_reference_provider()],
-                order: vec![ProviderId("cpu-reference")],
-                memory_kind: MemoryKind::Dedicated,
-                graphs: None,
-            })
-        }
-        ExecutionBackend::Hip => {
-            let lib = load_shim(ExecutionBackend::Hip, exec.kernel_library.as_deref())?;
-            let device = amd_device(inventory, exec.device.0)?;
-            let ctx: Arc<ShimContext> = lib
-                .create_context(device)
-                .map_err(|e| kernel_error("kernel library context", e))?;
-            tracing::info!(
-                event = "kernel_library_loaded",
-                path = %lib.path().display(),
-                backend = lib.backend_name(),
-                abi_version = lib.abi_version(),
-                build_archs = %lib.build_archs().join(","),
-                device_arch = device.arch.as_deref().unwrap_or("unknown"),
-                driver_version = device.driver_version.as_deref().unwrap_or("unknown"),
-                "kernel library loaded"
-            );
-            let provider = shim_provider(Arc::clone(&ctx));
-            let id = provider.id();
-            let graphs = lib.supports_graphs().then(|| Arc::clone(&ctx));
-            Ok(Provider {
-                mem: ctx,
-                providers: vec![provider],
-                order: vec![id],
-                memory_kind: device.memory.kind,
-                graphs,
-            })
-        }
-        other => Err(StartupError::new(format!(
-            "execution.backend {} is not available in this build",
-            other.as_str()
-        ))),
-    }
-}
-
-fn load_shim(
-    backend: ExecutionBackend,
-    explicit: Option<&Path>,
-) -> Result<Arc<ShimLibrary>, StartupError> {
-    let paths = ShimLibrary::search_paths(backend, explicit);
-    if explicit.is_none() {
-        let order: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-        tracing::info!(search_order = %order.join(", "), "kernel library search order");
-    }
-    let mut misses = Vec::new();
-    for path in &paths {
-        match ShimLibrary::load(path, backend) {
-            Ok(lib) => return Ok(lib),
-            Err(e @ KernelError::Load { .. }) => misses.push(e.to_string()),
-            Err(e) => return Err(kernel_error("kernel library", e)),
-        }
-    }
-    Err(StartupError::new(format!(
-        "kernel library: no loadable libturbine_{}.so: {}",
-        backend.as_str(),
-        misses.join("; ")
-    )))
-}
-
-fn amd_device(inventory: &DeviceInventory, index: u32) -> Result<&DeviceInfo, StartupError> {
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.index.0 == index)
-        .ok_or_else(|| {
-            StartupError::new(format!(
-                "execution.device {index} is not in the device inventory ({} devices)",
-                inventory.devices.len()
-            ))
-        })?;
-    if device.vendor != Vendor::Amd {
-        return Err(StartupError::new(format!(
-            "execution.device {index} is a {} device; backend hip needs an AMD device",
-            device.vendor.as_str()
-        )));
-    }
-    Ok(device)
+    let backend = backends::registry()
+        .select(exec.backend.as_str(), "execution.backend")
+        .map_err(|e| StartupError::new(e.to_string()))?;
+    let opened = backend
+        .open(&BackendRequest {
+            device: exec.device,
+            kernel_library: exec.kernel_library.as_deref(),
+            inventory,
+            meminfo: Path::new(MEMINFO),
+            card_profile: exec.card_profile.as_str(),
+        })
+        .map_err(|e| StartupError::new(e.to_string()))?;
+    Ok(Provider { backend, opened })
 }
 
 /// Everything resolved before the listener binds: the model is known to be loadable and to fit.
@@ -287,8 +201,11 @@ pub struct PreparedModel {
     pub grammar: Arc<GrammarCompiler>,
     /// `structured_output` bounds on those grammars.
     pub structured_output: StructuredOutputConfig,
-    /// The resolved `model.tool_call_parser`.
-    pub tool_call_parser: ToolCallParserKind,
+    /// The resolved `model.tool_call_parser`: a registered tool format bound to the tokenizer,
+    /// or `None` (off).
+    pub tool_format: Option<Arc<BoundToolFormat>>,
+    /// The module picked at each extension point (`/turbine/v1/status` `modules`).
+    pub modules: ModuleChoices,
     pub served_name: String,
     pub budget: BudgetTerms,
 }
@@ -340,10 +257,11 @@ pub fn prepare(
     let executor_options = ExecutorOptions::from_fused_ops(config.execution.fused_ops);
     // Optional ops (kernel ABI v2.1) join the requirements only when a provider in the
     // selection order has them; otherwise the executor runs their ABI v2 equivalent.
-    let ordered: Vec<Arc<dyn KernelProvider>> = provider
+    let opened = &provider.opened;
+    let ordered: Vec<Arc<dyn KernelProvider>> = opened
         .providers
         .iter()
-        .filter(|p| provider.order.contains(&p.id()))
+        .filter(|p| opened.order.contains(&p.id()))
         .cloned()
         .collect();
     let mut requirements =
@@ -357,41 +275,38 @@ pub fn prepare(
         requirements.push(reduce);
     }
     let registry = KernelRegistry::build(
-        provider.providers.clone(),
-        &provider.order,
+        opened.providers.clone(),
+        &opened.order,
         &requirements,
         &KernelMetrics::register(metrics),
+        opened.card,
     )
     .map_err(|e| kernel_error("kernel selection", e))?;
-    if let Some(implementation) =
-        paged_attention_fallback(config.execution.backend, registry.selections())
+    for note in provider
+        .backend
+        .selection_notes(opened.card, registry.selections())
     {
-        tracing::info!(
-            event = "paged_attention_fallback",
-            block_tokens,
-            "impl" = %implementation,
-            "paged attention is not on CK fmha_fwd_pagedkv: kv.block_tokens is not a multiple of 128"
-        );
+        log_backend_note(&note, block_tokens);
     }
 
-    let decode_graphs = config.execution.decode_graphs && provider.graphs.is_some();
+    let decode_graphs = config.execution.decode_graphs && opened.graphs.is_some();
     if config.execution.decode_graphs && !decode_graphs {
         tracing::warn!(
             event = "decode_graphs_unavailable",
-            backend = config.execution.backend.as_str(),
+            backend = %config.execution.backend,
             "execution.decode_graphs is on but the kernel provider cannot capture graphs \
              (kernel ABI v2.1 graph functions); decode iterations run eagerly"
         );
     }
 
     let scheduler = SchedulerParams::from_config(config, max_seq_len);
-    let device_free = provider
+    let device_free = opened
         .mem
         .mem_info()
         .map_err(|e| StartupError::new(format!("device memory info: {e}")))?
         .free_bytes;
     let available = available_bytes(
-        provider.memory_kind,
+        opened.memory_kind,
         device_free,
         host_mem_available(Path::new(MEMINFO)),
     );
@@ -427,16 +342,30 @@ pub fn prepare(
     let grammar = GrammarCompiler::new(&tokenizer, &eos_token_ids(&arch, &generation))
         .map(Arc::new)
         .map_err(|e| model_error("structured output", e))?;
-    let tool_call_parser = resolve_tool_call_parser(
-        config.model.tool_call_parser,
-        arch.architecture,
+    // A format whose required special tokens the tokenizer lacks is refused here (exit 1).
+    let tool_format = resolve_tool_call_parser(
+        config.model.tool_call_parser.as_ref().map(|n| n.as_str()),
+        arch.family.0,
         template.renders_tools(),
-    );
+    )
+    .map(|format| formats::bind(format, &tokenizer).map(Arc::new))
+    .transpose()
+    .map_err(|e| model_error("model.tool_call_parser", e))?;
+    let tool_format_name = tool_format.as_ref().map(|f| f.format.name());
     tracing::info!(
         token_trie_seconds = started.elapsed().as_secs_f64(),
-        tool_call_parser = ?tool_call_parser,
+        tool_call_parser = tool_format_name.unwrap_or("none"),
         "structured output ready"
     );
+    let modules = ModuleChoices {
+        family: arch.family.0.name().to_string(),
+        tool_format: tool_format_name.map(str::to_string),
+        weight_format: arch.weight_format.0.name().to_string(),
+        backend: config.execution.backend.to_string(),
+        card_profile: provider.opened.card.map(|card| card.name.to_string()),
+        scheduling_policy: config.scheduler.policy.to_string(),
+    };
+    modules.log();
 
     let served_name = config
         .model
@@ -445,7 +374,7 @@ pub fn prepare(
         .unwrap_or_else(|| default_served_name(dir));
     tracing::info!(
         served_name = %served_name,
-        architecture = arch.architecture.as_str(),
+        architecture = %arch.hf_architecture,
         max_seq_len,
         weight_bytes = budget.weights,
         "model prepared"
@@ -467,32 +396,28 @@ pub fn prepare(
         overlap_scheduling: config.execution.overlap_scheduling,
         grammar,
         structured_output: config.structured_output.clone(),
-        tool_call_parser,
+        tool_format,
+        modules,
         served_name,
         budget,
     })
 }
 
-/// The implementation name the HIP shim reports for CK paged attention.
-const CK_PAGED_ATTENTION: &str = "ck_tile_fmha_pagedkv";
-
-/// The paged-attention implementation of the HIP backend when it is not Composable Kernel's
-/// `fmha_fwd_pagedkv` (CK serves only pages of a multiple of 128 tokens; other sizes run the
-/// slower Turbine kernel), else `None`. Other backends have no CK path to fall back from.
-fn paged_attention_fallback(backend: ExecutionBackend, selections: &[Selection]) -> Option<String> {
-    if backend != ExecutionBackend::Hip {
-        return None;
-    }
-    selections
+/// Logs a backend's note on the kernel selections at INFO: `event=<note.event>`, `block_tokens`
+/// (`kv.block_tokens`) and the note's fields (e.g. `impl` of `paged_attention_fallback`).
+fn log_backend_note(note: &BackendNote, block_tokens: u32) {
+    let fields: Vec<String> = note
+        .fields
         .iter()
-        .filter(|s| {
-            matches!(
-                s.op,
-                OpKind::AttentionPrefillPaged | OpKind::AttentionDecodePaged
-            )
-        })
-        .find(|s| s.implementation != CK_PAGED_ATTENTION)
-        .map(|s| s.implementation.clone())
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    tracing::info!(
+        event = note.event,
+        block_tokens,
+        fields = %fields.join(" "),
+        "{}",
+        note.message
+    );
 }
 
 /// The L0 pool: as many blocks as `max_bytes` (`kv.gpu.max_bytes`) holds, or, when it is null,
@@ -518,19 +443,7 @@ fn kv_pool_config(
     Ok(pool)
 }
 
-/// The weights `arch`'s executor takes.
-fn weight_slots(arch: &ModelArchConfig) -> Result<Vec<WeightSlot>, StartupError> {
-    match arch.architecture {
-        Architecture::Llama => Ok(llama_slots(arch)),
-        Architecture::Olmoe => Ok(olmoe_slots(arch)),
-        other => Err(StartupError::new(format!(
-            "no weight layout for architecture {}",
-            other.as_str()
-        ))),
-    }
-}
-
-/// The one place the server builds a model executor: the architecture's executor for ragged
+/// The one place the server builds a model executor: the family's executor for ragged
 /// batches of up to `max_batch_tokens` tokens and `max_seqs` sequences over KV blocks of
 /// `block_tokens` tokens, running the op sequence `options` selects.
 #[allow(clippy::too_many_arguments)]
@@ -566,7 +479,7 @@ pub struct LoadedModel {
 
 /// Steps 8–10: upload the weights, build the executor for `prepared`'s scheduler bounds,
 /// allocate the KV block pool and run one one-token forward on a block of it. Records
-/// `turbine_model_load_seconds` and `turbine_model_weight_bytes{format="bf16"}`.
+/// `turbine_model_load_seconds` and `turbine_model_weight_bytes{format}` (the weight format).
 pub fn load(
     prepared: &PreparedModel,
     warmup_token: u32,
@@ -574,10 +487,11 @@ pub fn load(
 ) -> Result<LoadedModel, StartupError> {
     let started = Instant::now();
     let arch = &prepared.arch;
-    let mem = &prepared.provider.mem;
-    let weights = WeightLoader::load(
+    let mem = &prepared.provider.opened.mem;
+    let weights = WeightLoader::load_format(
+        arch.weight_format.0,
         &prepared.index,
-        &weight_slots(arch)?,
+        &arch.family.0.weight_slots(arch),
         mem,
         MAX_STAGING_BYTES,
     )
@@ -596,6 +510,7 @@ pub fn load(
     .map_err(|e| model_error("executor", e))?;
     if let Some(ctx) = prepared
         .provider
+        .opened
         .graphs
         .as_ref()
         .filter(|_| prepared.decode_graphs)
@@ -610,8 +525,7 @@ pub fn load(
     log_pool_startup(&pool);
     warm_up(executor.as_mut(), &mut pool, warmup_token)?;
     let load_seconds = started.elapsed().as_secs_f64();
-    // Weights and KV are BF16 (`model.dtype`).
-    metrics.record_load(load_seconds, "bf16", weight_bytes);
+    metrics.record_load(load_seconds, arch.weight_format.0.name(), weight_bytes);
     tracing::info!(load_seconds, weight_bytes, "model loaded and warmed up");
     Ok(LoadedModel {
         executor,
@@ -661,37 +575,8 @@ fn warm_up(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn paged_attention_fallback_only_off_ck_on_hip() {
-        let sel = |op, implementation: &str| Selection {
-            op,
-            config: String::new(),
-            provider: ProviderId("hip"),
-            implementation: implementation.to_string(),
-            reason: String::new(),
-        };
-        let on_ck = [
-            sel(OpKind::Gemm, "hipblaslt"),
-            sel(OpKind::AttentionPrefillPaged, "ck_tile_fmha_pagedkv"),
-            sel(OpKind::AttentionDecodePaged, "ck_tile_fmha_pagedkv"),
-        ];
-        assert_eq!(
-            paged_attention_fallback(ExecutionBackend::Hip, &on_ck),
-            None
-        );
-        let fallback = [
-            sel(OpKind::Gemm, "hipblaslt"),
-            sel(OpKind::AttentionPrefillPaged, "turbine_hip"),
-            sel(OpKind::AttentionDecodePaged, "turbine_hip"),
-        ];
-        assert_eq!(
-            paged_attention_fallback(ExecutionBackend::Hip, &fallback).as_deref(),
-            Some("turbine_hip")
-        );
-        let cpu = [sel(OpKind::AttentionPrefillPaged, "cpu_reference")];
-        assert_eq!(paged_attention_fallback(ExecutionBackend::Cpu, &cpu), None);
-    }
+    use turbine_model::families::{Llama, Mistral, Mixtral, Olmoe, Qwen3, Qwen3Moe};
+    use turbine_model::formats::llama3_json::LLAMA3_JSON;
 
     #[test]
     fn served_name_from_hf_snapshot_or_last_component() {
@@ -726,32 +611,29 @@ mod tests {
 
     #[test]
     fn tool_call_parser_resolution() {
-        use ToolCallParserKind::{Llama3Json, None as NoParser};
-        // Null: llama3_json only for a Llama whose template renders tools.
-        assert_eq!(
-            resolve_tool_call_parser(None, Architecture::Llama, true),
-            Llama3Json
-        );
-        assert_eq!(
-            resolve_tool_call_parser(None, Architecture::Llama, false),
-            NoParser
-        );
-        assert_eq!(
-            resolve_tool_call_parser(None, Architecture::Olmoe, true),
-            NoParser
-        );
+        const LLAMA: Option<&str> = Some(LLAMA3_JSON);
+        const OFF: Option<&str> = None;
+        let resolve_tool_call_parser = |configured, family: &dyn ModelFamily, renders| {
+            resolve_tool_call_parser(configured, family, renders).map(|f| f.name())
+        };
+        // Null: the family default (llama3_json for llama, none for olmoe) when the template
+        // renders tools.
+        assert_eq!(resolve_tool_call_parser(None, &Llama, true), LLAMA);
+        assert_eq!(resolve_tool_call_parser(None, &Llama, false), OFF);
+        assert_eq!(resolve_tool_call_parser(None, &Olmoe, true), OFF);
         // Explicit values; a parser needs a template that renders tools.
-        assert_eq!(
-            resolve_tool_call_parser(Some(Llama3Json), Architecture::Olmoe, true),
-            Llama3Json
-        );
-        assert_eq!(
-            resolve_tool_call_parser(Some(Llama3Json), Architecture::Llama, false),
-            NoParser
-        );
-        assert_eq!(
-            resolve_tool_call_parser(Some(NoParser), Architecture::Llama, true),
-            NoParser
-        );
+        assert_eq!(resolve_tool_call_parser(LLAMA, &Olmoe, true), LLAMA);
+        assert_eq!(resolve_tool_call_parser(LLAMA, &Llama, false), OFF);
+        assert_eq!(resolve_tool_call_parser(Some("none"), &Llama, true), OFF);
+        // The Phase 8 families' defaults (Phase 2m S-11), and explicit Phase 8 formats.
+        let hermes = Some("hermes");
+        let mistral = Some("mistral");
+        assert_eq!(resolve_tool_call_parser(None, &Qwen3, true), hermes);
+        assert_eq!(resolve_tool_call_parser(None, &Qwen3Moe, true), hermes);
+        assert_eq!(resolve_tool_call_parser(None, &Mistral, true), mistral);
+        assert_eq!(resolve_tool_call_parser(None, &Mixtral, true), mistral);
+        assert_eq!(resolve_tool_call_parser(None, &Qwen3, false), OFF);
+        assert_eq!(resolve_tool_call_parser(hermes, &Llama, true), hermes);
+        assert_eq!(resolve_tool_call_parser(mistral, &Qwen3, true), mistral);
     }
 }

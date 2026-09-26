@@ -10,21 +10,22 @@ use turbine_tensor::tensor::contiguous_strides;
 use turbine_tensor::{DeviceMemory, KvPoolView, Tensor, TensorView};
 
 use crate::ModelError;
-use crate::config::{Architecture, ModelArchConfig};
+use crate::config::ModelArchConfig;
 use crate::loader::LoadedWeights;
 
 pub mod batch;
+pub mod decoder;
 pub mod graphs;
-pub mod llama;
 pub mod logits;
-pub mod olmoe;
 pub mod profile;
 pub mod rope;
 
 pub use batch::SequenceKv;
+pub use decoder::{
+    AttentionHook, DecoderDims, DecoderExecutor, DecoderSpec, FfnHook, HookBuffers, HookWeights,
+    LayerRun, TraceTensor,
+};
 pub use graphs::{DecodeGraphs, GraphBackend, GraphCache, GraphCounters, GraphKey, GraphStep};
-pub use llama::{LlamaExecutor, TraceTensor};
-pub use olmoe::OlmoeExecutor;
 pub use profile::{OpProfile, OpProfileEntry};
 
 /// How an executor runs its forward pass (Phase 2c). `Default` is what the server runs with
@@ -77,18 +78,24 @@ impl ExecutorOptions {
     }
 }
 
-/// The op requirements of `cfg`'s architecture over KV blocks of `block_tokens` tokens run with
-/// `opts` ([`LlamaExecutor::requirements`] or [`OlmoeExecutor::requirements`]): the registry the
-/// executor runs on is built from this list.
+/// The batch bounds an executor is built for: KV blocks of `block_tokens` tokens, ragged
+/// batches of up to `max_batch_tokens` tokens and `max_seqs` sequences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutorLimits {
+    pub block_tokens: u32,
+    pub max_batch_tokens: u32,
+    pub max_seqs: u32,
+}
+
+/// The op requirements of `cfg`'s family over KV blocks of `block_tokens` tokens run with
+/// `opts` ([`crate::families::ModelFamily::requirements`]): the registry the executor runs on
+/// is built from this list.
 pub fn requirements(
     cfg: &ModelArchConfig,
     block_tokens: u32,
     opts: ExecutorOptions,
 ) -> Vec<OpRequirement> {
-    match cfg.architecture {
-        Architecture::Llama => LlamaExecutor::requirements(cfg, block_tokens, opts),
-        Architecture::Olmoe => OlmoeExecutor::requirements(cfg, block_tokens, opts),
-    }
+    cfg.family.0.requirements(cfg, block_tokens, opts)
 }
 
 /// [`requirements`] without the optional ops (kernel ABI v2.1 `add_rmsnorm`) that none of
@@ -171,25 +178,26 @@ fn strided_rows<'a>(
     }
 }
 
-/// Device bytes of the executor's buffers for `cfg`'s architecture (the budget's workspace
-/// term): [`LlamaExecutor::workspace_bytes`] or [`OlmoeExecutor::workspace_bytes`].
+/// Device bytes of the executor's buffers for `cfg`'s family (the budget's workspace term):
+/// [`crate::families::ModelFamily::workspace_bytes`].
 pub fn workspace_bytes(
     cfg: &ModelArchConfig,
     block_tokens: u32,
     max_batch_tokens: u32,
     max_seqs: u32,
 ) -> u64 {
-    match cfg.architecture {
-        Architecture::Llama => {
-            LlamaExecutor::workspace_bytes(cfg, block_tokens, max_batch_tokens, max_seqs)
-        }
-        Architecture::Olmoe => {
-            OlmoeExecutor::workspace_bytes(cfg, block_tokens, max_batch_tokens, max_seqs)
-        }
-    }
+    cfg.family.0.workspace_bytes(
+        cfg,
+        ExecutorLimits {
+            block_tokens,
+            max_batch_tokens,
+            max_seqs,
+        },
+    )
 }
 
-/// The executor of `cfg`'s architecture over `weights`, for ragged batches of up to
+/// The executor of `cfg`'s family ([`crate::families::ModelFamily::build_executor`]) over
+/// `weights`, for ragged batches of up to
 /// `max_batch_tokens` tokens and `max_seqs` sequences whose KV pool is laid out as
 /// `cfg.kv_layout(block_tokens)`, run with `opts`. `registry` must have been built from
 /// [`requirements`] of `cfg`, `block_tokens` and `opts`.
@@ -204,28 +212,14 @@ pub fn build_executor(
     max_seqs: u32,
     opts: ExecutorOptions,
 ) -> Result<Box<dyn ModelExecutor>, ModelError> {
-    Ok(match cfg.architecture {
-        Architecture::Llama => Box::new(LlamaExecutor::new(
-            cfg,
-            weights,
-            registry,
-            mem,
-            block_tokens,
-            max_batch_tokens,
-            max_seqs,
-            opts,
-        )?),
-        Architecture::Olmoe => Box::new(OlmoeExecutor::new(
-            cfg,
-            weights,
-            registry,
-            mem,
-            block_tokens,
-            max_batch_tokens,
-            max_seqs,
-            opts,
-        )?),
-    })
+    let limits = ExecutorLimits {
+        block_tokens,
+        max_batch_tokens,
+        max_seqs,
+    };
+    cfg.family
+        .0
+        .build_executor(cfg, weights, registry, mem, limits, opts)
 }
 
 /// One sequence of a ragged batch: its new tokens are `tokens[q_start..q_start + q_len]` of the

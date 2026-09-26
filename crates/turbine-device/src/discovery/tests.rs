@@ -7,19 +7,15 @@ use turbine_core::types::{MemoryKind, Vendor};
 use super::*;
 use crate::inventory::BackendStatus;
 
-fn missing_defaults() -> (&'static str, &'static str) {
-    // Names no loader search can satisfy, so the test behaves the same on lab hosts that do
-    // have NVML / amd-smi installed.
-    (
-        "libturbine-test-missing-nvml.so",
-        "libturbine-test-missing-amd-smi.so",
-    )
+/// A library name no loader search can satisfy, so the test behaves the same on lab hosts that
+/// do have NVML / amd-smi installed.
+fn missing_default(kind: &dyn DiscoveryKind) -> PathBuf {
+    PathBuf::from(format!("libturbine-test-missing-{}.so", kind.name()))
 }
 
 #[test]
 fn no_libraries_means_empty_inventory() {
-    let (nvml, amd) = missing_defaults();
-    let inv = discover_with_defaults(&DiscoveryOptions::default(), nvml, amd)
+    let inv = discover_with_defaults(&DiscoveryOptions::default(), missing_default)
         .expect("default search must never be fatal");
     assert!(inv.devices.is_empty());
     assert_eq!(inv.backends.len(), 2);
@@ -125,4 +121,25 @@ fn unified_memory_uses_host_total() {
     let json = serde_json::to_value(&mem).unwrap();
     assert_eq!(json["kind"], "unified");
     assert_eq!(nvml::normalize_bus_id("00000000:0F:01.0"), "0000:0f:01.0");
+}
+
+#[test]
+fn registry_lists_nvml_then_amd_smi() {
+    let reg = registry();
+    assert_eq!(reg.point(), "device_discovery");
+    assert_eq!(reg.names(), ["nvml", "amd_smi"]);
+    let vendors: Vec<Vendor> = reg.iter().map(|k| k.vendor()).collect();
+    assert_eq!(vendors, [Vendor::Nvidia, Vendor::Amd]);
+    let defaults: Vec<&str> = reg.iter().map(|k| k.default_library()).collect();
+    assert_eq!(defaults, ["libnvidia-ml.so.1", "libamd_smi.so"]);
+    let opts = DiscoveryOptions {
+        amd_smi_library: Some(PathBuf::from("/x/libamd_smi.so")),
+        ..DiscoveryOptions::default()
+    };
+    let configured: Vec<Option<&std::path::Path>> =
+        reg.iter().map(|k| k.configured_library(&opts)).collect();
+    assert_eq!(
+        configured,
+        [None, Some(std::path::Path::new("/x/libamd_smi.so"))]
+    );
 }

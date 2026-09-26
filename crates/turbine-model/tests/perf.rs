@@ -16,19 +16,18 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use serde::Serialize;
-use turbine_core::types::{BlockId, ExecutionBackend, KvLayout, SeqId, Vendor};
+use turbine_core::types::{BlockId, KvLayout, SeqId};
 use turbine_kernels::{
     KernelMetrics, KernelRegistry, OpKind, shim_provider, test_support::require_backend,
     test_support::require_env_dir,
 };
-use turbine_model::config::{Architecture, ModelArchConfig};
+use turbine_model::config::ModelArchConfig;
 use turbine_model::executor::{
-    self, BatchInput, ExecutorOptions, LlamaExecutor, ModelExecutor, OlmoeExecutor, OpProfile,
+    self, BatchInput, DecoderExecutor, ExecutorLimits, ExecutorOptions, ModelExecutor, OpProfile,
     OpProfileEntry, SeqSlice,
 };
-use turbine_model::{
-    MAX_STAGING_BYTES, SafetensorsIndex, WeightLoader, llama_slots, load_model_config, olmoe_slots,
-};
+use turbine_model::families;
+use turbine_model::{MAX_STAGING_BYTES, SafetensorsIndex, WeightLoader, load_model_config};
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView};
 
@@ -57,21 +56,12 @@ trait Profiled: ModelExecutor {
     fn take_profile(&mut self) -> OpProfile;
 }
 
-impl Profiled for LlamaExecutor {
+impl Profiled for DecoderExecutor {
     fn set_profile(&mut self, on: bool) {
-        LlamaExecutor::set_profile(self, on);
+        DecoderExecutor::set_profile(self, on);
     }
     fn take_profile(&mut self) -> OpProfile {
-        LlamaExecutor::take_profile(self)
-    }
-}
-
-impl Profiled for OlmoeExecutor {
-    fn set_profile(&mut self, on: bool) {
-        OlmoeExecutor::set_profile(self, on);
-    }
-    fn take_profile(&mut self) -> OpProfile {
-        OlmoeExecutor::take_profile(self)
+        DecoderExecutor::take_profile(self)
     }
 }
 
@@ -112,52 +102,35 @@ fn hip_executor(
 ) -> Box<dyn Profiled> {
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
     let index = SafetensorsIndex::open(dir).expect("open safetensors");
-    let slots = match cfg.architecture {
-        Architecture::Llama => llama_slots(cfg),
-        Architecture::Olmoe => olmoe_slots(cfg),
-        other => panic!("no profile for {other:?}"),
-    };
+    let slots = cfg.family.0.weight_slots(cfg);
     let weights = WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("weights");
     let provider = shim_provider(ctx.clone());
     let order = [provider.id()];
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let card = provider.card_profile();
     let registry = Arc::new(
         KernelRegistry::build(
             vec![provider],
             &order,
             &hip_requirements(cfg, ctx, opts),
             &metrics,
+            card,
         )
         .expect("every op has a provider"),
     );
-    match cfg.architecture {
-        Architecture::Llama => Box::new(
-            LlamaExecutor::new(
-                cfg,
-                weights,
-                registry,
-                mem,
-                BLOCK_TOKENS,
-                max_batch_tokens,
-                MAX_SEQS,
-                opts,
-            )
-            .expect("llama executor"),
-        ),
-        _ => Box::new(
-            OlmoeExecutor::new(
-                cfg,
-                weights,
-                registry,
-                mem,
-                BLOCK_TOKENS,
-                max_batch_tokens,
-                MAX_SEQS,
-                opts,
-            )
-            .expect("olmoe executor"),
-        ),
-    }
+    let spec = match cfg.family.0.name() {
+        "llama" => families::llama::decoder_spec(),
+        _ => families::olmoe::decoder_spec(),
+    };
+    let limits = ExecutorLimits {
+        block_tokens: BLOCK_TOKENS,
+        max_batch_tokens,
+        max_seqs: MAX_SEQS,
+    };
+    Box::new(
+        DecoderExecutor::new(cfg, spec, weights, registry, mem, limits, opts)
+            .expect("decoder executor"),
+    )
 }
 
 fn pool_view<'a>(storage: &'a DeviceBuffer, layout: &KvLayout, blocks: u32) -> KvPoolView<'a> {
@@ -351,19 +324,7 @@ fn forward_profile() {
         require_env_dir("TURBINE_TEST_MODEL_DIR"),
         require_env_dir("TURBINE_TEST_MOE_MODEL_DIR"),
     ];
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
     // Llama also with the opt-in projection fusion, for the side-by-side profile.
     let all_fused = ExecutorOptions {
         fused_ops: true,
@@ -416,19 +377,7 @@ fn serving_mix() {
     }
     let _gpu = lock_gpu();
     let dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
     let cfg = load_model_config(&dir).expect("config.json");
     const RUNNING: u32 = 16;
     const OUTPUT: u32 = 256;

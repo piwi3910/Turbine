@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::types::{DeviceId, ExecutionBackend};
+use crate::types::DeviceId;
 
 /// TS §15 example, verbatim.
 const TS15_EXAMPLE: &str = r#"server:
@@ -205,7 +205,7 @@ fn execution_and_model_keys() {
         Some("meta-llama/Llama-3.2-3B-Instruct")
     );
     assert_eq!(c.model.max_seq_len, Some(4096));
-    assert_eq!(c.execution.backend, ExecutionBackend::Cpu);
+    assert_eq!(c.execution.backend.as_str(), "cpu");
     assert_eq!(c.execution.device, DeviceId(1));
     assert_eq!(
         c.execution.kernel_library,
@@ -214,7 +214,7 @@ fn execution_and_model_keys() {
 
     // Defaults: hip on device 0, no explicit shim, every new model key unset.
     let d = parse("model:\n  path: /m\n", &[]).unwrap();
-    assert_eq!(d.execution.backend, ExecutionBackend::Hip);
+    assert_eq!(d.execution.backend.as_str(), "hip");
     assert_eq!(d.execution.device, DeviceId(0));
     assert_eq!(d.execution.kernel_library, None);
     assert_eq!(d.model.served_name, None);
@@ -223,11 +223,6 @@ fn execution_and_model_keys() {
     assert_eq!(d.model.max_seq_len, None);
 
     let base = "model:\n  path: /m\n";
-    assert_rejected(base, &["execution.backend=cuda"], "execution.backend");
-    let err = parse(base, &["execution.backend=cuda"]).unwrap_err();
-    assert_eq!(err.key(), Some("execution.backend"));
-    assert!(err.to_string().contains("phase-2b-nvidia"), "{err}");
-
     assert_rejected(base, &["model.served_name=\"\""], "model.served_name");
     let long = "x".repeat(257);
     assert_rejected(
@@ -237,7 +232,6 @@ fn execution_and_model_keys() {
     );
     assert!(parse(base, &[&format!("model.served_name={}", "x".repeat(256))]).is_ok());
     assert_rejected(base, &["model.max_seq_len=0"], "model.max_seq_len");
-    assert_rejected(base, &["execution.backend=rocm"], "execution.backend");
 }
 
 #[test]
@@ -389,15 +383,17 @@ fn phase2_keys() {
 
     let tools = parse(base, &["model.tool_call_parser=llama3_json"]).unwrap();
     assert_eq!(
-        tools.model.tool_call_parser,
-        Some(ToolCallParserKind::Llama3Json)
+        tools
+            .model
+            .tool_call_parser
+            .as_ref()
+            .map(ModuleName::as_str),
+        Some("llama3_json")
     );
     let none = parse(base, &["model.tool_call_parser=none"]).unwrap();
-    assert_eq!(none.model.tool_call_parser, Some(ToolCallParserKind::None));
-    assert_rejected(
-        base,
-        &["model.tool_call_parser=hermes"],
-        "model.tool_call_parser",
+    assert_eq!(
+        none.model.tool_call_parser.as_ref().map(ModuleName::as_str),
+        Some("none")
     );
 
     // kv.gpu.max_bytes is optional (C-8).
@@ -497,4 +493,124 @@ fn default_block_tokens_is_128() {
         let c = load(&root.join(file), &[]).unwrap_or_else(|e| panic!("{file}: {e}"));
         assert_eq!(c.kv.block_tokens, 128, "{file}");
     }
+}
+
+/// Phase 2m: the module keys take any well-formed name; which names exist is the registries'
+/// business (`Config::validate_modules`, run by the server before any port is bound).
+#[test]
+fn module_names_are_open() {
+    let base = "model:\n  path: /m\n";
+    let c = parse(
+        base,
+        &[
+            "model.tool_call_parser=hermes",
+            "execution.backend=cuda",
+            "scheduler.policy=fifo",
+            "execution.card_profile=gfx942",
+        ],
+    )
+    .expect("well-formed module names parse");
+    assert_eq!(
+        c.model.tool_call_parser.as_ref().map(ModuleName::as_str),
+        Some("hermes")
+    );
+    assert_eq!(c.execution.backend.as_str(), "cuda");
+    assert_eq!(c.scheduler.policy.as_str(), "fifo");
+    assert_eq!(c.execution.card_profile.as_str(), "gfx942");
+
+    assert_rejected(base, &["execution.backend=Hip!"], "execution.backend");
+    assert_rejected(base, &["scheduler.policy=\"\""], "scheduler.policy");
+    assert_rejected(
+        base,
+        &[&format!("execution.card_profile={}", "x".repeat(65))],
+        "execution.card_profile",
+    );
+
+    let d = parse(base, &[]).unwrap();
+    assert_eq!(d.execution.backend.as_str(), "hip");
+    assert_eq!(d.execution.card_profile.as_str(), "auto");
+    assert_eq!(d.scheduler.policy.as_str(), "default");
+    assert_eq!(d.model.tool_call_parser, None);
+
+    assert!(ModuleName::new("llama3_json").is_ok());
+    assert!(ModuleName::new("Hip").is_err());
+    assert!(ModuleName::new("").is_err());
+    assert_eq!(
+        serde_norway::to_value(ModuleName::new("hip").unwrap()).unwrap(),
+        serde_norway::Value::String("hip".into())
+    );
+
+    // The shipped example spells the new keys out at their defaults.
+    let example = include_str!("../../../../examples/turbine.yaml");
+    assert!(example.contains("  policy: default\n"));
+    assert!(example.contains("  card_profile: auto\n"));
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = vec![root.join("examples/turbine.yaml")];
+    for entry in std::fs::read_dir(root.join("scripts/lab")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        // The k3s Job templates in the same directory are not Turbine configurations.
+        if name.ends_with(".yaml") && !name.ends_with("-job.yaml") {
+            files.push(path);
+        }
+    }
+    assert!(files.len() > 1, "{files:?}");
+    for file in files {
+        load(&file, &[]).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+    }
+}
+
+/// The names the server's registries hold in Phase 2m Task 1.
+fn task1_modules() -> ModuleNames<'static> {
+    ModuleNames {
+        tool_formats: &["llama3_json"],
+        backends: &["cpu", "hip"],
+        card_profiles: &["gfx1201"],
+        scheduling_policies: &["default"],
+    }
+}
+
+#[test]
+fn validate_modules_names_registries() {
+    let base = "model:\n  path: /m\n";
+    let known = task1_modules();
+    for (set, key, registered) in [
+        (
+            "model.tool_call_parser=hermes",
+            "model.tool_call_parser",
+            "llama3_json",
+        ),
+        ("execution.backend=cuda", "execution.backend", "cpu, hip"),
+        ("scheduler.policy=fifo", "scheduler.policy", "default"),
+        (
+            "execution.card_profile=gfx942",
+            "execution.card_profile",
+            "gfx1201",
+        ),
+    ] {
+        let c = parse(base, &[set]).unwrap();
+        let err = c.validate_modules(&known).unwrap_err();
+        assert_eq!(err.key(), Some(key), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("is not registered"), "{msg}");
+        assert!(
+            msg.contains(&format!("(registered: {registered})")),
+            "{msg}"
+        );
+    }
+    for set in [
+        "model.tool_call_parser=none",
+        "model.tool_call_parser=llama3_json",
+        "execution.backend=cpu",
+        "execution.backend=hip",
+        "execution.card_profile=auto",
+        "execution.card_profile=gfx1201",
+        "scheduler.policy=default",
+    ] {
+        let c = parse(base, &[set]).unwrap();
+        c.validate_modules(&known)
+            .unwrap_or_else(|e| panic!("{set}: {e}"));
+    }
+    parse(base, &[]).unwrap().validate_modules(&known).unwrap();
 }

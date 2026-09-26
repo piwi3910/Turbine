@@ -504,28 +504,9 @@ pub(crate) mod tests {
         Tokenizer::from_file(&path).expect("committed Llama tokenizer")
     }
 
-    /// Runs `text` (tokenized by `tokenizer`, special tokens such as `<|python_tag|>` included)
-    /// through `matcher`, checking each token against the step mask first. `Ok(accepting)` when
-    /// every token was allowed; `Err` names the first disallowed token.
-    pub(crate) fn feed_text(
-        matcher: &mut dyn TokenMatcher,
-        tokenizer: &Tokenizer,
-        eos: &[u32],
-        text: &str,
-    ) -> Result<bool, String> {
-        let ids = tokenizer.encode(text, false).expect("encode");
-        let mut mask = TokenMask::new_none(tokenizer.vocab_size() as usize);
-        for (i, &id) in ids.iter().enumerate() {
-            step_mask(matcher, eos, &mut mask).map_err(|e| format!("token {i}: {e}"))?;
-            if !mask.is_allowed(id) {
-                let done = tokenizer.decode(&ids[..i], false).expect("decode");
-                let piece = tokenizer.decode(&[id], false).expect("decode");
-                return Err(format!("token {i} {piece:?} disallowed after {done:?}"));
-            }
-            matcher.commit(id).map_err(|e| format!("token {i}: {e}"))?;
-        }
-        Ok(matcher.accepts_eos())
-    }
+    /// The conformance suites' token-by-token feed (special tokens such as `<|python_tag|>`
+    /// included), shared with these tests.
+    pub(crate) use crate::conformance::feed_text;
 
     pub(crate) fn llama_compiler() -> (Tokenizer, GrammarCompiler) {
         let tokenizer = llama_tokenizer();

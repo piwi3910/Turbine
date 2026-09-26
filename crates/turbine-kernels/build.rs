@@ -3,8 +3,9 @@
 //!
 //! Each variant's path is exported to the crate as a compile-time environment variable:
 //! `TURBINE_STUB_ABI999` (ABI version 999), `TURBINE_STUB_GFX942` (ABI 2.0, backend `hip`, build
-//! archs `gfx942`) and `TURBINE_STUB_GFX942_V21` (the same with the optional ABI v2.1 symbols,
-//! compiled with `-DTURBINE_STUB_V21`).
+//! archs `gfx942`), `TURBINE_STUB_GFX942_V21` (the same with the optional ABI v2.1 and v2.3
+//! symbols, compiled with `-DTURBINE_STUB_V21`; it reports minor 3) and `TURBINE_STUB_GFX942_V24`
+//! (also the v2.4 implementation group, `-DTURBINE_STUB_V24`; minor 4).
 use std::path::{Path, PathBuf};
 
 fn build_stub(
@@ -54,11 +55,23 @@ fn main() {
         "gfx942",
         &["TURBINE_STUB_V21"],
     );
+    let gfx942_v24 = build_stub(
+        &out_dir,
+        "turbine_stub_gfx942_v24",
+        2,
+        "hip",
+        "gfx942",
+        &["TURBINE_STUB_V21", "TURBINE_STUB_V24"],
+    );
     println!("cargo:rustc-env=TURBINE_STUB_ABI999={}", abi999.display());
     println!("cargo:rustc-env=TURBINE_STUB_GFX942={}", gfx942.display());
     println!(
         "cargo:rustc-env=TURBINE_STUB_GFX942_V21={}",
         gfx942_v21.display()
+    );
+    println!(
+        "cargo:rustc-env=TURBINE_STUB_GFX942_V24={}",
+        gfx942_v24.display()
     );
     println!("cargo:rerun-if-changed=stub/stub_shim.c");
     println!("cargo:rerun-if-changed=../../kernels/include/turbine_kernels.h");

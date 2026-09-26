@@ -4,7 +4,8 @@
 //! with a byte-level BPE tokenizer and the Llama-3.2 chat template, written in the Hugging Face
 //! layout so the loader, executor, server and `hf_reference.py` all run on it without weights.
 //! [`write_tiny_olmoe`] writes the mixture-of-experts sibling (`OlmoeForCausalLM`, P2 S-16) with
-//! the same tokenizer.
+//! the same tokenizer, and [`write_tiny_family`] the Phase 8 families (Qwen3, Qwen3-MoE,
+//! Mistral, Mixtral; Phase 2m S-11) with their own config keys and checkpoint names.
 //!
 //! Every function here panics on I/O failure: it is a test utility.
 use std::path::{Path, PathBuf};
@@ -17,7 +18,6 @@ use safetensors::tensor::TensorView;
 use serde_json::json;
 
 use crate::config::{ModelArchConfig, load_model_config};
-use crate::loader::weight_slots;
 
 /// Byte symbols take ids 0..=255; the specials follow.
 pub const BOS: (&str, u32) = ("<|begin_of_text|>", 256);
@@ -225,6 +225,89 @@ pub fn write_tiny_olmoe_with_head_dim(dir: &Path, seed: u64, head_dim: u32) -> T
         config["head_dim"] = json!(head_dim);
     }
     write_tiny(dir, seed, &config, &opts)
+}
+
+/// The families [`write_tiny_family`] writes, by registry name.
+pub const TINY_PHASE8_FAMILIES: [&str; 4] = ["qwen3", "qwen3_moe", "mistral", "mixtral"];
+
+/// Writes the tiny checkpoint of the Phase 8 family `family` (a registry name of
+/// [`TINY_PHASE8_FAMILIES`]) into `dir`, with the tiny tokenizer and [`PLAIN_CHAT_TEMPLATE`]:
+/// 2 layers, hidden 64, 4 query / 2 KV heads of dimension 16, rope theta 1e6 without scaling,
+/// keys as in the family's `config.json` (`tests/fixtures/<slug>/config.json`):
+///
+/// - `qwen3`: per-head Q/K norm, explicit `head_dim`, tied embeddings, MLP 128.
+/// - `qwen3_moe`: per-head Q/K norm, 8 experts of `moe_intermediate_size` 32, top-2 with
+///   `norm_topk_prob: true`, untied.
+/// - `mistral`: the Llama layer, `sliding_window: null`, untied, MLP 128.
+/// - `mixtral`: 8 `num_local_experts` of `intermediate_size` 32, top-2, untied,
+///   `block_sparse_moe` names.
+///
+/// Same files and determinism as [`write_tiny_llama_with`]. Panics for another family.
+pub fn write_tiny_family(dir: &Path, family: &str, seed: u64) -> TinySpec {
+    let opts = TinyOptions {
+        tied: family == "qwen3",
+        template_with_tools: false,
+        ..TinyOptions::default()
+    };
+    write_tiny(dir, seed, &family_config_json(family), &opts)
+}
+
+/// `config.json` of [`write_tiny_family`].
+fn family_config_json(family: &str) -> serde_json::Value {
+    let (architecture, extra) = match family {
+        "qwen3" => (
+            "Qwen3ForCausalLM",
+            json!({
+                "attention_bias": false, "head_dim": 16, "rope_scaling": null,
+                "tie_word_embeddings": true, "use_sliding_window": false, "max_window_layers": 2,
+            }),
+        ),
+        "qwen3_moe" => (
+            "Qwen3MoeForCausalLM",
+            json!({
+                "attention_bias": false, "head_dim": 16, "rope_scaling": null,
+                "use_sliding_window": false, "max_window_layers": 2, "decoder_sparse_step": 1,
+                "mlp_only_layers": [], "moe_intermediate_size": 32, "norm_topk_prob": true,
+                "num_experts": 8, "num_experts_per_tok": 2, "output_router_logits": false,
+                "router_aux_loss_coef": 0.001,
+            }),
+        ),
+        "mistral" => ("MistralForCausalLM", json!({})),
+        "mixtral" => (
+            "MixtralForCausalLM",
+            json!({
+                "intermediate_size": 32, "num_local_experts": 8, "num_experts_per_tok": 2,
+                "output_router_logits": false, "router_aux_loss_coef": 0.02,
+            }),
+        ),
+        other => panic!("no tiny checkpoint for family {other}"),
+    };
+    let mut cfg = json!({
+        "architectures": [architecture],
+        "model_type": family,
+        "attention_dropout": 0.0,
+        "bos_token_id": BOS.1,
+        "eos_token_id": TINY_EOS,
+        "hidden_act": "silu",
+        "hidden_size": 64,
+        "initializer_range": 0.02,
+        "intermediate_size": 128,
+        "max_position_embeddings": TINY_MAX_POSITIONS,
+        "num_attention_heads": 4,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1_000_000.0,
+        "sliding_window": null,
+        "tie_word_embeddings": false,
+        "torch_dtype": "bfloat16",
+        "use_cache": true,
+        "vocab_size": TINY_VOCAB,
+    });
+    for (key, value) in extra.as_object().expect("object") {
+        cfg[key] = value.clone();
+    }
+    cfg
 }
 
 fn write_tiny(
@@ -462,7 +545,7 @@ fn random_bf16(rng: &mut ChaCha8Rng, name: &str, shape: &[usize]) -> Vec<u8> {
 fn write_weights(path: &Path, config: &ModelArchConfig, seed: u64, opts: &TinyOptions) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
-    for slot in weight_slots(config) {
+    for slot in config.family.0.weight_slots(config) {
         let data = random_bf16(&mut rng, &slot.name, &slot.shape);
         tensors.push((slot.name, slot.shape, data));
     }
@@ -492,7 +575,7 @@ fn write_weights(path: &Path, config: &ModelArchConfig, seed: u64, opts: &TinyOp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Architecture, MoeConfig, RopeScaling};
+    use crate::config::{MoeConfig, RopeScaling};
     use crate::testing::TempDir;
 
     #[test]
@@ -508,7 +591,7 @@ mod tests {
         assert_ne!(weights(&a), weights(&c));
 
         let cfg = &spec.config;
-        assert_eq!(cfg.architecture, Architecture::Llama);
+        assert_eq!(cfg.family.0.name(), "llama");
         assert_eq!(
             (
                 cfg.num_layers,
@@ -581,7 +664,7 @@ mod tests {
         }
 
         let cfg = &spec.config;
-        assert_eq!(cfg.architecture, Architecture::Olmoe);
+        assert_eq!(cfg.family.0.name(), "olmoe");
         assert_eq!(
             (
                 cfg.num_layers,
@@ -610,7 +693,7 @@ mod tests {
 
         // Every OLMoE slot is in the file with its shape, BF16, and nothing else is.
         let index = crate::SafetensorsIndex::open(a.path()).unwrap();
-        let slots = crate::loader::olmoe_slots(cfg);
+        let slots = cfg.family.0.weight_slots(cfg);
         assert_eq!(slots.len(), 1 + 2 * (9 + 8 * 3) + 2);
         assert_eq!(index.entries().count(), slots.len());
         for slot in &slots {

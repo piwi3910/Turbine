@@ -25,19 +25,21 @@ use turbine_core::request::{
     CancelFlag, Endpoint, FinishReason, GenerationEvent, GenerationRequest, SamplingParams,
     StopConditions,
 };
-use turbine_core::types::{ExecutionBackend, RequestId, Vendor};
+use turbine_core::types::RequestId;
 use turbine_kernels::{
     KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider, shim_provider,
 };
-use turbine_model::config::Architecture;
-use turbine_model::executor::{self, ExecutorOptions, LlamaExecutor, ModelExecutor, SequenceKv};
+use turbine_model::executor::{
+    self, DecoderExecutor, ExecutorLimits, ExecutorOptions, ModelExecutor, SequenceKv,
+};
+use turbine_model::families;
 use turbine_model::generate::{GenerateOptions, generate};
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::write_tiny_llama;
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::{
     ChatTemplate, MAX_STAGING_BYTES, SafetensorsIndex, Tokenizer, WeightLoader, llama_slots,
-    load_model_config, olmoe_slots,
+    load_model_config,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::DeviceMemory;
@@ -617,7 +619,7 @@ fn gpu_model_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// An executor and the single-sequence KV it generates on.
 struct Runner {
-    exec: LlamaExecutor,
+    exec: DecoderExecutor,
     kv: SequenceKv,
 }
 
@@ -633,22 +635,27 @@ fn build_executor(
         .expect("load weights");
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
     let order = [provider.id()];
+    let card = provider.card_profile();
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &LlamaExecutor::requirements(&cfg, BLOCK_TOKENS, ExecutorOptions::default()),
+        &executor::requirements(&cfg, BLOCK_TOKENS, ExecutorOptions::default()),
         &metrics,
+        card,
     )
     .expect("every op has a provider");
     let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
-    let exec = LlamaExecutor::new(
+    let exec = DecoderExecutor::new(
         &cfg,
+        families::llama::decoder_spec(),
         weights,
         Arc::new(registry),
         mem,
-        BLOCK_TOKENS,
-        max_seq_len,
-        1,
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: max_seq_len,
+            max_seqs: 1,
+        },
         ExecutorOptions::default(),
     )
     .expect("executor");
@@ -711,19 +718,7 @@ fn logits_match_reference() {
         return;
     }
     let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MODEL_DIR");
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
 
     let fixture = golden_dir().join("llama-3.2-3b-instruct");
     let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
@@ -755,19 +750,7 @@ fn olmoe_logits_match_reference() {
         return;
     }
     let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MOE_MODEL_DIR");
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
 
     let fixture = golden_dir().join("olmoe-1b-7b-0125-instruct");
     let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
@@ -814,19 +797,7 @@ fn hip_trace_vs_cpu_3b() {
         return;
     }
     let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MODEL_DIR");
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
 
     let fixture = golden_dir().join("llama-3.2-3b-instruct");
     let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
@@ -909,20 +880,18 @@ fn build_any_executor(
 ) -> AnyRunner {
     let cfg = load_model_config(model_dir).expect("config.json");
     let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
-    let slots = if cfg.architecture == Architecture::Olmoe {
-        olmoe_slots(&cfg)
-    } else {
-        llama_slots(&cfg)
-    };
+    let slots = cfg.family.0.weight_slots(&cfg);
     let weights =
         WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("load weights");
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
     let order = [provider.id()];
+    let card = provider.card_profile();
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
         &executor::requirements(&cfg, BLOCK_TOKENS, ExecutorOptions::default()),
         &metrics,
+        card,
     )
     .expect("every op has a provider");
     let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
@@ -1014,19 +983,7 @@ fn olmoe_teacher_forced_vs_reference() {
     }
     let _gpu = gpu_model_lock();
     let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MOE_MODEL_DIR");
-    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
-        .filter(|v| !v.is_empty())
-        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
-    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
-        .expect("load the HIP kernel library");
-    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
-        .expect("device discovery");
-    let device = inventory
-        .devices
-        .iter()
-        .find(|d| d.vendor == Vendor::Amd)
-        .expect("an AMD device");
-    let ctx = lib.create_context(device).expect("HIP context");
+    let ctx = turbine_kernels::test_support::open_context("hip");
 
     let fixture = golden_dir().join("olmoe-1b-7b-0125-instruct");
     let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));

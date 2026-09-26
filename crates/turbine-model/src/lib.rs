@@ -9,28 +9,37 @@ use turbine_tensor::MemoryError;
 pub mod budget;
 pub mod chat_template;
 pub mod config;
+pub mod conformance;
 pub mod executor;
+pub mod families;
+pub mod formats;
 pub mod generate;
 pub mod loader;
 pub mod metrics;
+pub mod registries;
 pub mod safetensors;
-pub mod sampler;
+pub mod sampling;
 pub mod structured;
 pub mod testing;
 pub mod tokenizer;
 pub mod tools;
+pub mod weights;
+
+/// The sampler at its Phase 1 path, so `turbine_model::sampler::…` keeps resolving.
+pub use sampling::sampler;
 
 pub use crate::safetensors::{SafetensorsIndex, TensorEntry};
 pub use budget::{BudgetTerms, available_bytes, check_budget, host_mem_available};
 pub use chat_template::ChatTemplate;
 pub use config::MoeConfig;
 pub use config::{
-    Architecture, GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config,
-    load_model_config,
+    GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config, load_model_config,
 };
+pub use families::{FamilyConfig, FamilyRef, ModelFamily, llama_slots, mixtral_slots, olmoe_slots};
+pub use formats::{BoundToolFormat, HermesParser, Llama3JsonParser, MistralParser, ToolFormat};
 pub use generate::{GenerateOptions, Generation, generate};
-pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot, llama_slots};
-pub use loader::{StackPlace, gate_up_proj_name, olmoe_slots, qkv_proj_name, stacked_experts_name};
+pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot};
+pub use loader::{StackPlace, gate_up_proj_name, qkv_proj_name, stacked_experts_name};
 pub use metrics::{ForwardPhase, ModelMetrics, ToolCallOutcome};
 pub use sampler::{SampleJob, SampledToken, Sampler, SamplerState, sample_rows};
 pub use structured::{
@@ -38,9 +47,7 @@ pub use structured::{
     json_options, step_mask,
 };
 pub use tokenizer::{IncrementalDetokenizer, Tokenizer};
-pub use tools::{
-    Llama3JsonParser, ToolCallParser, ToolChoice, ToolParse, new_call_id, tool_call_grammar,
-};
+pub use tools::{ToolCallParser, ToolChoice, ToolParse, new_call_id, tool_call_grammar};
 
 /// Every failure of the model layer (contract §10). Messages name the offending file, field or
 /// tensor so a startup failure is actionable from the log line alone.

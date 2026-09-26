@@ -1,4 +1,7 @@
-//! Startup order (P1 §Interfaces, contract §16.3): config (exit 2) → tracing → device discovery →
+//! Startup order (P1 §Interfaces, contract §16.3): config and module names (exit 2) →
+//! support-matrix row with the device arch unknown (exit 2 when unsupported; also under
+//! `--check-config`) → tracing → device discovery → support-matrix row with the device arch
+//! (exit 2 when unsupported; `event="support_matrix"`, WARN when experimental) →
 //! kernel provider → model config, tokenizer, template → kernel registry → memory budget with
 //! the KV pool and the batch workspace (each exit 1, nothing bound yet) → bind (`/health` 200,
 //! `/ready` 503 `loading_model`; exit 1) → weight load, KV pool allocation and one-token warm-up
@@ -20,8 +23,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::serve::ListenerExt;
+use turbine_api::support::SupportMetrics;
 use turbine_api::{ApiLimits, ApiState};
-use turbine_core::config::{self, Config};
+use turbine_core::config::{self, Config, ConfigError};
+use turbine_core::support::SupportRowView;
 use turbine_device::{DeviceInventory, DeviceMetrics, DiscoveryOptions};
 use turbine_kv::KvMetrics;
 use turbine_model::ModelMetrics;
@@ -34,6 +39,8 @@ use crate::engine::{self, EngineMetrics, Fatal, Timeouts};
 use crate::exit::ExitCode;
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
+use crate::modules::known_module_names;
+use crate::{support_matrix, support_startup};
 
 /// How long `/ready` reports the failure before the process exits 1 (P1: at most 1 s).
 const FAILURE_GRACE: Duration = Duration::from_millis(500);
@@ -63,22 +70,47 @@ fn send_buffer_cap(value: Option<&str>) -> Result<Option<usize>, String> {
 }
 
 pub fn run(cli: Cli) -> ExitCode {
-    let config = match config::load(&cli.config, &cli.set) {
+    // clap requires --config unless --support-matrix, which `main` handles before this.
+    let Some(config_path) = cli.config.as_deref() else {
+        eprintln!("turbine-server: --config is required");
+        return ExitCode::Config;
+    };
+    // Module names are checked against the registries with the rest of the configuration:
+    // exit 2 before device discovery and before binding, also under --check-config.
+    let config = match config::load(config_path, &cli.set)
+        .and_then(|c| c.validate_modules(&known_module_names()).map(|()| c))
+    {
         Ok(c) => c,
         Err(e) => {
             eprintln!("turbine-server: invalid configuration: {e}");
             return ExitCode::Config;
         }
     };
+    // The support-matrix row before discovery (device arch unknown): an unsupported row is a
+    // configuration error, exit 2, also under --check-config.
+    let support = support_startup::before_discovery(&config);
     if cli.check_config {
-        println!("config ok");
-        return ExitCode::Clean;
+        return match support {
+            Ok(decision) => {
+                println!("{}", support_matrix::check_config_line(&decision));
+                println!("config ok");
+                ExitCode::Clean
+            }
+            Err(e) => {
+                eprintln!("turbine-server: invalid configuration: {e}");
+                ExitCode::Config
+            }
+        };
     }
     if let Err(e) = turbine_observability::init_tracing(&config.logging) {
         eprintln!("turbine-server: {e}");
         return ExitCode::Startup;
     }
-    tracing::info!(config = %cli.config.display(), listen = %config.server.listen, "configuration loaded");
+    tracing::info!(config = %config_path.display(), listen = %config.server.listen, "configuration loaded");
+    let support = match support {
+        Ok(decision) => decision,
+        Err(e) => return refuse_support(&e),
+    };
 
     let inventory = match turbine_device::discover(&DiscoveryOptions::from_config(&config.devices))
     {
@@ -89,9 +121,16 @@ pub fn run(cli: Cli) -> ExitCode {
             return ExitCode::Startup;
         }
     };
+    // Again with the discovered device architecture, before the kernel library and the model.
+    let support = match support_startup::after_discovery(&config, &inventory, support) {
+        Ok(decision) => decision,
+        Err(e) => return refuse_support(&e),
+    };
+    support_startup::log(&support);
 
     let metrics = MetricsRegistry::new();
     DeviceMetrics::register(&metrics).record(&inventory);
+    SupportMetrics::register(&metrics).set(&support.status);
     let prepared = match model::prepare(&config, &inventory, &metrics) {
         Ok(p) => p,
         Err(e) => {
@@ -111,10 +150,18 @@ pub fn run(cli: Cli) -> ExitCode {
             return ExitCode::Startup;
         }
     };
-    let code = runtime.block_on(serve(config, inventory, metrics, prepared));
+    let code = runtime.block_on(serve(config, inventory, metrics, prepared, support.view()));
     // Never wait for the generation thread or in-flight blocking work on the way out.
     runtime.shutdown_background();
     code
+}
+
+/// An unsupported support-matrix row: logged as `event="support_matrix"`, exit 2 (a
+/// configuration error, before any port is bound).
+fn refuse_support(error: &ConfigError) -> ExitCode {
+    support_startup::log_refusal(error);
+    eprintln!("turbine-server: invalid configuration: {error}");
+    ExitCode::Config
 }
 
 async fn serve(
@@ -122,6 +169,7 @@ async fn serve(
     inventory: DeviceInventory,
     metrics: MetricsRegistry,
     prepared: PreparedModel,
+    support: SupportRowView,
 ) -> ExitCode {
     let addr: SocketAddr = config.server.listen;
     let engine_metrics = EngineMetrics {
@@ -130,7 +178,8 @@ async fn serve(
         scheduler: SchedulerMetrics::register(&metrics),
         kv: KvMetrics::register(&metrics),
     };
-    let backend = Arc::new(ModelBackend::new(&prepared, &inventory, &engine_metrics));
+    let backend =
+        Arc::new(ModelBackend::new(&prepared, &inventory, &engine_metrics).with_support(support));
     let state = ApiState {
         inference: backend.clone(),
         diagnostics: backend.clone(),

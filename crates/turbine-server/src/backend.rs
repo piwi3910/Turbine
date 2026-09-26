@@ -21,15 +21,15 @@ use turbine_api::{
     ApiError, BoxFuture, Diagnostics, GenerationStream, InferenceBackend, InferenceRequest,
     ModelCard, NotReadyReason, Readiness, ReadyState,
 };
-use turbine_core::config::ToolCallParserKind;
 use turbine_core::request::{
     ConstraintSpec, Endpoint, ErrorCode, GenerationRequest, SamplingParams, StopConditions,
 };
+use turbine_core::support::SupportRowView;
 use turbine_core::types::Priority;
 use turbine_device::DeviceInventory;
+use turbine_kernels::Selection;
 use turbine_kv::blocks_for_tokens;
-use turbine_model::tools::{LLAMA3_JSON, PYTHON_TAG};
-use turbine_model::{ChatTemplate, Llama3JsonParser, Tokenizer, ToolChoice, tool_call_grammar};
+use turbine_model::{ChatTemplate, Tokenizer, ToolChoice};
 use turbine_scheduler::{SchedulerMetrics, SubmitError};
 
 use crate::engine::grammar::GrammarService;
@@ -39,6 +39,7 @@ use crate::engine::{
 };
 use crate::metrics::{Outcome, ServerMetrics};
 use crate::model::PreparedModel;
+use crate::modules::ModuleChoices;
 
 const STATE_LOADING: u8 = 0;
 const STATE_READY: u8 = 1;
@@ -72,6 +73,60 @@ struct StatusDocument<'a> {
     ready: bool,
     device_count: u64,
     model: ModelStatus<'a>,
+    /// The module picked at each extension point (Phase 2m).
+    modules: &'a ModuleChoices,
+    /// Per op config of the kernel registry, in requirement order: who serves it and why.
+    kernels: &'a [KernelChoiceView],
+    /// The support-matrix row resolved at startup (Phase 2m S-11).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    support: Option<&'a SupportRowView>,
+}
+
+/// One entry of `kernels` in `GET /turbine/v1/status`: a `KernelRegistry` selection.
+#[derive(Clone, Debug, Serialize)]
+pub struct KernelChoiceView {
+    pub op: String,
+    pub config: String,
+    pub provider: String,
+    /// The implementation that runs (for a tiered op, its first tier's).
+    pub implementation: String,
+    /// The implementation's family (`hipblaslt`, `ck`, `turbine_hip`), or the provider for a
+    /// provider that chooses internally.
+    pub impl_provider: String,
+    pub reason: String,
+    /// `profile_preferred`, `profile_fallback`, `library_order` or `provider_internal`.
+    pub reason_code: String,
+    /// Routed-row tiers of a tiered op (`moe_experts`), empty otherwise.
+    pub tiers: Vec<KernelTierView>,
+}
+
+/// One routed-row tier of a [`KernelChoiceView`]: up to `max_rows` rows (`null` = no bound).
+#[derive(Clone, Debug, Serialize)]
+pub struct KernelTierView {
+    pub max_rows: Option<u32>,
+    pub implementation: String,
+}
+
+impl From<&Selection> for KernelChoiceView {
+    fn from(s: &Selection) -> KernelChoiceView {
+        KernelChoiceView {
+            op: s.op.as_str().to_string(),
+            config: s.config.clone(),
+            provider: s.provider.0.to_string(),
+            implementation: s.implementation.clone(),
+            impl_provider: s.impl_provider.clone(),
+            reason: s.reason.clone(),
+            reason_code: s.reason_code.to_string(),
+            tiers: s
+                .tiers
+                .iter()
+                .map(|(max_rows, implementation)| KernelTierView {
+                    max_rows: *max_rows,
+                    implementation: implementation.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Set once the model is loaded and warmed up.
@@ -88,7 +143,7 @@ pub struct ModelBackend {
     state: AtomicU8,
     loaded: OnceLock<Loaded>,
     served_name: String,
-    architecture: &'static str,
+    architecture: String,
     expected_weight_bytes: u64,
     max_seq_len: u32,
     vocab_size: u32,
@@ -105,7 +160,7 @@ pub struct ModelBackend {
     template: Arc<ChatTemplate>,
     /// Compiles `response_format` and tool grammars before queueing.
     grammars: GrammarService,
-    /// `model.tool_call_parser`; `None` when it resolved to `none`.
+    /// The format of `model.tool_call_parser`; `None` when it resolved to `none`.
     tool_parser: Option<ToolParser>,
     metrics: ServerMetrics,
     /// `turbine_admission_total` for `invalid_json_schema` (refused before the scheduler).
@@ -113,6 +168,10 @@ pub struct ModelBackend {
     started: Instant,
     device_count: u64,
     devices: Value,
+    modules: ModuleChoices,
+    kernels: Vec<KernelChoiceView>,
+    /// The support-matrix row resolved at startup (`support` of the status document).
+    support: Option<SupportRowView>,
 }
 
 impl ModelBackend {
@@ -125,19 +184,16 @@ impl ModelBackend {
         let eos_token_ids = crate::model::eos_token_ids(&model.arch, &model.generation)
             .into_iter()
             .collect();
-        let tool_parser = match model.tool_call_parser {
-            ToolCallParserKind::Llama3Json => Some(ToolParser {
-                parser: Arc::new(Llama3JsonParser::new()),
-                label: LLAMA3_JSON,
-                python_tag: model.tokenizer.token_to_id(PYTHON_TAG),
-            }),
-            _ => None,
-        };
+        let tool_parser = model.tool_format.as_ref().map(|bound| ToolParser {
+            format: Arc::clone(bound),
+            parser: Arc::from(bound.format.parser()),
+            label: bound.format.name(),
+        });
         ModelBackend {
             state: AtomicU8::new(STATE_LOADING),
             loaded: OnceLock::new(),
             served_name: model.served_name.clone(),
-            architecture: model.arch.architecture.as_str(),
+            architecture: model.arch.hf_architecture.clone(),
             expected_weight_bytes: model.budget.weights,
             max_seq_len: model.max_seq_len,
             vocab_size: model.arch.vocab_size,
@@ -163,7 +219,21 @@ impl ModelBackend {
             started: Instant::now(),
             device_count: inventory.devices.len() as u64,
             devices: serde_json::to_value(inventory).unwrap_or(Value::Null),
+            modules: model.modules.clone(),
+            kernels: model
+                .registry
+                .selections()
+                .iter()
+                .map(KernelChoiceView::from)
+                .collect(),
+            support: None,
         }
+    }
+
+    /// Reports `support` (the support-matrix row resolved at startup) in the status document.
+    pub fn with_support(mut self, support: SupportRowView) -> ModelBackend {
+        self.support = Some(support);
+        self
     }
 
     /// Weights loaded and warmed up: `/ready` turns 200 and requests are accepted.
@@ -353,9 +423,11 @@ impl ModelBackend {
             (ToolChoice::Auto | ToolChoice::Required | ToolChoice::Named(_), Some(p)) => {
                 // `auto` is held to free text or schema-valid calls; it is still held and
                 // parsed only when it opens like a call.
-                let spec =
-                    tool_call_grammar(&tools, &tool_choice, body.parallel_tool_calls_enabled())
-                        .map_err(|e| ApiError::invalid_json_schema(e.to_string()))?;
+                let spec = p
+                    .format
+                    .format
+                    .grammar(&tools, &tool_choice, body.parallel_tool_calls_enabled())
+                    .map_err(|e| ApiError::invalid_json_schema(e.to_string()))?;
                 let output = match tool_choice {
                     ToolChoice::Auto => ToolOutput::Auto(p),
                     _ => ToolOutput::Constrained(p),
@@ -561,10 +633,13 @@ impl Diagnostics for ModelBackend {
             device_count: self.device_count,
             model: ModelStatus {
                 served_name: &self.served_name,
-                architecture: self.architecture,
+                architecture: &self.architecture,
                 weight_bytes: loaded.map_or(self.expected_weight_bytes, |l| l.weight_bytes),
                 load_seconds: loaded.map(|l| l.load_seconds),
             },
+            modules: &self.modules,
+            kernels: &self.kernels,
+            support: self.support.as_ref(),
         })
         .unwrap_or(Value::Null)
     }

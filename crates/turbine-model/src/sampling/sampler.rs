@@ -1,5 +1,6 @@
-//! Host-side token sampling from FP32 logits (P1 S-9, P2 S-10/S-17): logit bias, penalties,
-//! `min_tokens` and the constrained-decoding token mask adjust the logits in place, then greedy
+//! Host-side token sampling from FP32 logits (P1 S-9, P2 S-10/S-17): the logits-processor chain
+//! (Phase 2m S-8, [`crate::sampling`]: logit bias, penalties, `min_tokens` and the
+//! constrained-decoding token mask) adjusts the logits in place, then greedy
 //! argmax at temperature 0, otherwise temperature → top-k → top-p over a seeded ChaCha8 stream,
 //! so an identical `seed` gives identical tokens (seeded draws keep a fixed f64 arithmetic;
 //! unseeded ones use a vectorised f32 `exp`).
@@ -13,6 +14,7 @@ use turbine_core::request::SamplingParams;
 
 use crate::executor::logits::MAX_TOP_N;
 use crate::executor::{ReducedRow, RowReduce};
+use crate::sampling::{ProcessorChain, ProcessorParams, ProcessorState, Touched};
 use crate::structured::TokenMask;
 
 /// One sampled token and, when the request asked for logprobs, its log-probability under the
@@ -38,8 +40,8 @@ pub struct SamplerState {
 
 /// Samples one token per step for one request.
 ///
-/// Order of operations on the logits: `logit_bias` → repetition (HF, over prompt and generated
-/// tokens) then presence/frequency (OpenAI, over generated tokens) penalties → EOS and stop ids
+/// Order of operations on the logits (the [`ProcessorChain`], in registry order): `logit_bias`
+/// → repetition (HF, over prompt and generated tokens) then presence/frequency (OpenAI, over generated tokens) penalties → EOS and stop ids
 /// suppressed while fewer than `min_tokens` were generated → the token mask (disallowed → −∞; the
 /// mask wins over `logit_bias`) → greedy, or temperature → top-k → top-p over the candidates
 /// sorted descending (ties by the lower id) and one 24-bit uniform draw. Reported logprobs are
@@ -54,11 +56,10 @@ pub struct Sampler {
     logprobs: bool,
     /// Alternatives reported per token (0 = none).
     top_logprobs: usize,
-    presence_penalty: f32,
-    frequency_penalty: f32,
-    repetition_penalty: f32,
-    logit_bias: Vec<(u32, f32)>,
-    min_tokens: u32,
+    /// The request fields the logits processors read.
+    processors: ProcessorParams,
+    /// The logits processors, in chain order.
+    chain: ProcessorChain,
     /// EOS and stop token ids (sorted, distinct): suppressed until `min_tokens` were generated.
     eos_token_ids: Vec<u32>,
     /// Distinct prompt ids (sorted), kept only when the repetition penalty is active.
@@ -72,7 +73,7 @@ pub struct Sampler {
     /// tokens and take the vectorised [`Sampler::draw_fast`].
     exact: bool,
     /// Raw values of the ids this step changed before sampling (reused across steps).
-    originals: HashMap<u32, f32>,
+    touched: Touched,
     /// Buffers reused across steps, so a step allocates nothing vocabulary-sized.
     scratch: Scratch,
     /// The steps [`Sampler::device_request`] handed to the device, oldest first, until
@@ -325,18 +326,15 @@ impl Sampler {
             top_k: usize::try_from(params.top_k).ok().filter(|&k| k > 0),
             logprobs: params.logprobs.is_some(),
             top_logprobs: params.logprobs.map_or(0, |n| n as usize),
-            presence_penalty: params.presence_penalty,
-            frequency_penalty: params.frequency_penalty,
-            repetition_penalty: params.repetition_penalty,
-            logit_bias: params.logit_bias.clone(),
-            min_tokens: params.min_tokens,
+            processors: ProcessorParams::new(params),
+            chain: ProcessorChain::standard(),
             eos_token_ids: sorted_distinct(eos_token_ids),
             prompt_tokens,
             generated: Vec::new(),
             counts: HashMap::new(),
             rng,
             exact: params.seed.is_some(),
-            originals: HashMap::new(),
+            touched: Touched::default(),
             scratch: Scratch::default(),
             pending: VecDeque::new(),
         }
@@ -395,7 +393,8 @@ impl Sampler {
         };
         let logprob = lse.map(|lse| {
             let raw = self
-                .originals
+                .touched
+                .originals()
                 .get(&token)
                 .copied()
                 .unwrap_or(logits[token as usize]);
@@ -409,31 +408,39 @@ impl Sampler {
     }
 
     /// Whether this step's row can be reduced on the device (P2c S-4), and how. `None` when the
-    /// step needs the whole row: a `logit_bias`, a penalty, `min_tokens` not yet reached, more
-    /// than [`DEVICE_MAX_TOP_LOGPROBS`] alternatives or, when it samples (temperature > 0),
+    /// step needs the whole row: a logits processor that cannot run on the device applies to it
+    /// (today every one: a `logit_bias`, a penalty, `min_tokens` not yet reached, a token mask),
+    /// more than [`DEVICE_MAX_TOP_LOGPROBS`] alternatives or, when it samples (temperature > 0),
     /// `top_k` above [`MAX_TOP_N`] (greedy ignores `top_k` and `top_p`, so it is eligible
-    /// whatever they are). The caller also keeps the whole row for a step with a token mask. When
+    /// whatever they are). When
     /// the step samples, its uniform is drawn here, exactly where [`Sampler::sample`] would
     /// draw it; a draw over the whole vocabulary (no `top_k`; the `top_p` nucleus when it is
     /// below 1) happens on the device, a `top_k` draw (then `top_p` over the `top_k`) in
     /// [`Sampler::finish_reduced`] over the returned candidates.
     pub fn device_request(&mut self) -> Option<RowReduce> {
-        self.device_request_ahead(0)
+        self.device_request_ahead(0, false)
     }
 
     /// [`Sampler::device_request`] for the step `ahead` tokens after the next one to observe:
     /// with `ahead` = 1 the engine launches a step before it has finished the previous one
     /// (P2c overlap scheduling), whose token is not yet observed. The uniforms are drawn in step
-    /// order either way, so a seeded stream is the same as one step at a time.
-    pub fn device_request_ahead(&mut self, ahead: usize) -> Option<RowReduce> {
+    /// order either way, so a seeded stream is the same as one step at a time. `constrained`:
+    /// the step carries a token mask (its choice has a matcher), which the grammar mask
+    /// processor applies.
+    pub fn device_request_ahead(&mut self, ahead: usize, constrained: bool) -> Option<RowReduce> {
         let step = self.generated.len() + ahead;
         // A step asked for again (its earlier row was never finished) starts over.
         self.pending.retain(|p| p.step < step);
-        let eligible = self.logit_bias.is_empty()
-            && self.presence_penalty == 0.0
-            && self.frequency_penalty == 0.0
-            && self.repetition_penalty == 1.0
-            && step as u64 >= u64::from(self.min_tokens)
+        // Only the mask's presence matters to eligibility: an empty one stands in for it.
+        let mask = constrained.then(|| TokenMask::new_none(0));
+        let state = ProcessorState {
+            prompt_tokens: &self.prompt_tokens,
+            counts: &self.counts,
+            step,
+            eos_token_ids: &self.eos_token_ids,
+            mask: mask.as_ref(),
+        };
+        let eligible = self.chain.device_eligible(&self.processors, &state)
             && self.top_logprobs <= DEVICE_MAX_TOP_LOGPROBS;
         let greedy = self.temperature <= 0.0;
         if !eligible || !greedy && self.top_k.is_some_and(|k| k > MAX_TOP_N) {
@@ -536,55 +543,20 @@ impl Sampler {
         }
     }
 
-    /// Applies bias, penalties, `min_tokens` and the mask to `logits`, remembering the raw value
-    /// of every id it changes before the mask (an id the mask disallows is never sampled).
+    /// Runs the logits-processor chain (bias, penalties, `min_tokens`, the mask) over `logits`,
+    /// remembering the raw value of every id it changes before the mask (an id the mask
+    /// disallows is never sampled).
     fn adjust(&mut self, logits: &mut [f32], mask: Option<&TokenMask>) {
-        self.originals.clear();
-        let originals = &mut self.originals;
-        let mut touch = |logits: &[f32], id: u32| -> Option<usize> {
-            let i = id as usize;
-            let v = *logits.get(i)?;
-            originals.entry(id).or_insert(v);
-            Some(i)
+        self.touched.clear();
+        let state = ProcessorState {
+            prompt_tokens: &self.prompt_tokens,
+            counts: &self.counts,
+            step: self.generated.len(),
+            eos_token_ids: &self.eos_token_ids,
+            mask,
         };
-        for &(id, bias) in &self.logit_bias {
-            if let Some(i) = touch(logits, id) {
-                logits[i] += bias;
-            }
-        }
-        if self.repetition_penalty != 1.0 {
-            let p = self.repetition_penalty;
-            let prompt = &self.prompt_tokens;
-            let seen = prompt.iter().copied().chain(
-                self.counts
-                    .keys()
-                    .copied()
-                    .filter(|id| prompt.binary_search(id).is_err()),
-            );
-            for id in seen {
-                if let Some(i) = touch(logits, id) {
-                    let v = logits[i];
-                    logits[i] = if v > 0.0 { v / p } else { v * p };
-                }
-            }
-        }
-        if self.presence_penalty != 0.0 || self.frequency_penalty != 0.0 {
-            for (&id, &count) in &self.counts {
-                if let Some(i) = touch(logits, id) {
-                    logits[i] -= self.frequency_penalty * count as f32 + self.presence_penalty;
-                }
-            }
-        }
-        if (self.generated.len() as u64) < u64::from(self.min_tokens) {
-            for &id in &self.eos_token_ids {
-                if let Some(i) = touch(logits, id) {
-                    logits[i] = f32::NEG_INFINITY;
-                }
-            }
-        }
-        if let Some(mask) = mask {
-            mask.apply(logits);
-        }
+        self.chain
+            .apply(logits, &mut self.touched, &self.processors, &state);
     }
 
     /// The mask-allowed EOS or stop id with the highest raw logit (ties by the lower id).
@@ -593,7 +565,7 @@ impl Sampler {
         self.eos_token_ids
             .iter()
             .filter(|&&id| mask.is_allowed(id))
-            .filter_map(|&id| self.originals.get(&id).map(|&v| (id, v)))
+            .filter_map(|&id| self.touched.originals().get(&id).map(|&v| (id, v)))
             .min_by(by_value_desc)
             .map(|(id, _)| id)
     }
@@ -1533,7 +1505,7 @@ mod tests {
             let mut got = Vec::new();
             for g in 0..rows.len() {
                 if g + 1 < rows.len() {
-                    asked.push(ahead.device_request_ahead(1).expect("eligible"));
+                    asked.push(ahead.device_request_ahead(1, false).expect("eligible"));
                 }
                 let t = ahead.finish_reduced(&reduce_row(&rows[g], &asked[g])).token;
                 ahead.observe(t);
@@ -1554,9 +1526,9 @@ mod tests {
             &[],
             &[7],
         );
-        assert_eq!(s.device_request_ahead(1), None);
+        assert_eq!(s.device_request_ahead(1, false), None);
         s.observe(1);
-        assert!(s.device_request_ahead(1).is_some());
+        assert!(s.device_request_ahead(1, false).is_some());
 
         // A step asked for twice keeps only its latest uniform; host sampling of step g drops
         // g's request and keeps g + 1's.
@@ -1573,7 +1545,7 @@ mod tests {
         assert_eq!(ta, reduce_row(&rows[0], &again).sampled.expect("draw").0);
         let mut c = plain(&p);
         c.device_request().expect("eligible");
-        let next = c.device_request_ahead(1).expect("eligible");
+        let next = c.device_request_ahead(1, false).expect("eligible");
         let t0 = c.sample(&mut rows[1].clone(), None).token;
         c.observe(t0);
         let t1 = c.finish_reduced(&reduce_row(&rows[2], &next)).token;

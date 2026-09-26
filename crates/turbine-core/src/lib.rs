@@ -2,5 +2,7 @@
 
 pub mod clock;
 pub mod config;
+pub mod registry;
 pub mod request;
+pub mod support;
 pub mod types;

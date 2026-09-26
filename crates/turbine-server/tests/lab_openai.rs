@@ -11,7 +11,8 @@
 //!   only), every `arguments` string a JSON object valid against that tool's `parameters`, and no
 //!   call JSON in `content`;
 //! - `auto` (explicit, or implied by `tools`): either tool calls valid as above, or `content`
-//!   with no raw call JSON (`<|python_tag|>` or a `{"name": …, "parameters": …}` object);
+//!   with no raw call JSON (a special token of the `llama3_json` format or a
+//!   `{"name": …, "parameters": …}` object);
 //! - `response_format` `json_schema`: `finish_reason` `stop` and `content` valid against the
 //!   schema; `json_object`: `content` is a JSON object.
 //!
@@ -30,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use turbine_kernels::test_support::{require_backend, require_env_dir};
+use turbine_model::formats::{self, ToolFormat};
 
 /// The model id `turbine-server` serves the weights under (as in the lab configs).
 const SERVED_NAME: &str = "meta-llama/Llama-3.2-3B-Instruct";
@@ -279,11 +281,22 @@ fn validate(schema: &Value, v: &Value, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The first call-shaped JSON object in `content` (`<|python_tag|>` or an object with a string
-/// `name` and object `parameters`/`arguments`), if any.
+/// The Llama model's tool format (the lab serves Llama-3.2-3B-Instruct).
+fn llama_format() -> &'static dyn ToolFormat {
+    formats::registry()
+        .get("llama3_json")
+        .expect("llama3_json is registered")
+}
+
+/// The first call-shaped JSON object in `content` (a special token of the served tool format,
+/// or an object with a string `name` and object `parameters`/`arguments`), if any.
 fn leaked_call(content: &str) -> Option<String> {
-    if content.contains("<|python_tag|>") {
-        return Some("<|python_tag|>".into());
+    if let Some(token) = llama_format()
+        .special_tokens()
+        .iter()
+        .find(|t| content.contains(t.text))
+    {
+        return Some(token.text.into());
     }
     for (i, _) in content.match_indices('{') {
         let mut stream = serde_json::Deserializer::from_str(&content[i..]).into_iter::<Value>();
@@ -797,10 +810,14 @@ fn response_checks_reject_malformed_answers() {
     };
     check_response(&auto, &chat(json!("The sea is calm."), Value::Null, "stop")).unwrap();
     check_response(&auto, &chat(Value::Null, json!([good_call]), "tool_calls")).unwrap();
+    let tag_leak = format!(
+        "{}get_weather(city='Paris')",
+        llama_format().special_tokens()[0].text
+    );
     for leak in [
         r#"{"name": "get_weather", "parameters": {"city": "Paris", "unit": "celsius"}}"#,
         r#"Sure: {"name":"get_weather","parameters":{"city":"Paris"}}"#,
-        "<|python_tag|>get_weather(city='Paris')",
+        tag_leak.as_str(),
     ] {
         assert!(
             check_response(&auto, &chat(json!(leak), Value::Null, "stop")).is_err(),

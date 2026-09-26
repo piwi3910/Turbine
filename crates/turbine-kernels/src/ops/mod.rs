@@ -6,11 +6,14 @@
 //! The compute stream is implicit: every provider owns its context and enqueues on that
 //! context's compute stream (contract §9.2).
 use std::fmt;
+use std::sync::Arc;
 
 use turbine_core::types::{BlockId, DType};
 use turbine_tensor::{DeviceSlice, TensorView};
 
 use crate::KernelError;
+use crate::cards::CardProfile;
+use crate::registry::OpConfig;
 
 /// One entry point of the kernel C ABI; `as_str` is the `turbine_<op>` suffix and the `op`
 /// metric label.
@@ -73,6 +76,73 @@ impl OpKind {
             OpKind::MoeExperts => "moe_experts",
             OpKind::AddRmsnorm => "add_rmsnorm",
             OpKind::LogitsReduce => "logits_reduce",
+        }
+    }
+
+    /// The `TURBINE_OP_*` code of kernel ABI v2.4: the op's position in [`OpKind::ALL`].
+    pub fn abi_code(self) -> i32 {
+        match self {
+            OpKind::Gemm => 0,
+            OpKind::AttentionPrefill => 1,
+            OpKind::AttentionDecode => 2,
+            OpKind::Rmsnorm => 3,
+            OpKind::Rope => 4,
+            OpKind::SiluMul => 5,
+            OpKind::Embedding => 6,
+            OpKind::Add => 7,
+            OpKind::AttentionPrefillPaged => 8,
+            OpKind::AttentionDecodePaged => 9,
+            OpKind::CopyBlocks => 10,
+            OpKind::MoeRoute => 11,
+            OpKind::MoeExperts => 12,
+            OpKind::AddRmsnorm => 13,
+            OpKind::LogitsReduce => 14,
+        }
+    }
+}
+
+/// One implementation of an op a provider enumerates (kernel ABI v2.4 `turbine_impl_info`):
+/// `index` is its position in the provider's order, `name` the name `implementation()` reports
+/// when it runs, `provider` its family (`hipblaslt`, `ck`, `turbine_hip`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImplInfo {
+    pub index: u32,
+    pub name: String,
+    pub provider: String,
+    /// `moe_experts`: the implementation reads `host_expert_offsets`.
+    pub needs_host_offsets: bool,
+}
+
+/// The implementation(s) the kernel registry chose for one op config: one index, or one per
+/// routed-row tier (`moe_experts`), each an index into the provider's
+/// [`KernelProvider::implementations`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImplChoice {
+    Single(u32),
+    /// Tiers in ascending `max_rows`, the open tier (`max_rows: None`) last.
+    ByRows(Vec<RowTier>),
+}
+
+/// One routed-row tier of an [`ImplChoice::ByRows`]: up to `max_rows` rows (`None` = no upper
+/// bound) run implementation `index`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowTier {
+    pub max_rows: Option<u32>,
+    pub index: u32,
+}
+
+impl ImplChoice {
+    /// The implementation index a call of `rows` routed rows runs: the first tier whose bound
+    /// holds `rows` (the last tier when none does). One comparison per tier (at most two).
+    #[inline]
+    pub fn index_for(&self, rows: usize) -> u32 {
+        match self {
+            ImplChoice::Single(index) => *index,
+            ImplChoice::ByRows(tiers) => tiers
+                .iter()
+                .find(|t| t.max_rows.is_none_or(|max| rows <= max as usize))
+                .or(tiers.last())
+                .map_or(0, |t| t.index),
         }
     }
 }
@@ -704,6 +774,36 @@ pub trait KernelProvider: Send + Sync {
         None
     }
     fn logits_reduce(&self) -> Option<&dyn LogitsReduceKernel> {
+        None
+    }
+
+    /// The implementations of `op` the provider enumerates (kernel ABI v2.4), in its own order.
+    /// Empty (the default) when the provider chooses the implementation of every call itself.
+    fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
+        let _ = op;
+        Vec::new()
+    }
+
+    /// Whether implementation `index` of [`KernelProvider::implementations`] supports `spec`;
+    /// `rows` is the routed-row count a `moe_experts` call is sized for (`None` for other ops).
+    /// False (the default) for a provider that does not enumerate.
+    fn implementation_supports(&self, spec: &OpConfig, index: u32, rows: Option<u32>) -> bool {
+        let _ = (spec, index, rows);
+        false
+    }
+
+    /// A provider that runs `choice` for `spec` on every call (the kernel registry binds one per
+    /// op config at startup); `None` (the default) runs this provider as it is, i.e. with its
+    /// own choice.
+    fn bind(&self, spec: &OpConfig, choice: &ImplChoice) -> Option<Arc<dyn KernelProvider>> {
+        let _ = (spec, choice);
+        None
+    }
+
+    /// The card profile the provider's device context runs with (a kernel library context after
+    /// `set_profile`), the `card` a caller passes to `KernelRegistry::build`; `None` (the
+    /// default) for a provider without one.
+    fn card_profile(&self) -> Option<&'static CardProfile> {
         None
     }
 }

@@ -30,8 +30,9 @@ use turbine_core::types::{DeviceId, Priority, RequestId};
 use turbine_kernels::{KernelMetrics, KernelRegistry, cpu_reference_provider};
 use turbine_model::executor::{self, ExecutorOptions, SequenceKv};
 use turbine_model::testing::TempDir;
+use turbine_model::testing::naive;
 use turbine_model::testing::tiny::{
-    TINY_EOS, TinyOptions, write_tiny_llama, write_tiny_llama_with,
+    TINY_EOS, TinyOptions, write_tiny_family, write_tiny_llama, write_tiny_llama_with,
 };
 use turbine_model::{
     GenerateOptions, MAX_STAGING_BYTES, SafetensorsIndex, Tokenizer, WeightLoader, generate,
@@ -688,6 +689,136 @@ fn completions_stream_and_non_stream() {
     assert!(status["model"]["load_seconds"].as_f64().is_some());
 }
 
+/// Phase 2m: `/turbine/v1/status` names the module chosen at each extension point and, per op
+/// config of the kernel registry, the provider and implementation that serve it.
+#[test]
+fn status_reports_modules_and_kernels() {
+    let server = TinyServer::launch(&Setup {
+        model_extra: "  tool_call_parser: llama3_json\n",
+        ..Setup::default()
+    });
+    let status = server.get("/turbine/v1/status").json();
+    assert_eq!(
+        status["modules"],
+        json!({"family": "llama", "tool_format": "llama3_json", "weight_format": "bf16",
+               "backend": "cpu", "card_profile": null, "scheduling_policy": "default"}),
+        "{status}"
+    );
+
+    // The registry the server builds for the tiny checkpoint: the executor's requirements with
+    // the default (fused) op sequence and the device logits reduction, on the cpu provider.
+    let dir = TempDir::new("turbine-tiny-kernels");
+    let spec = write_tiny_llama(dir.path(), 7);
+    let provider = cpu_reference_provider();
+    let order = [provider.id()];
+    let providers = vec![provider];
+    let mut reqs = executor::available_requirements(
+        &spec.config,
+        128,
+        ExecutorOptions::from_fused_ops(true),
+        &providers,
+    );
+    let reduce = executor::logits::reduce_requirement(&spec.config);
+    if reduce.spec.supported_by(providers[0].as_ref()) {
+        reqs.push(reduce);
+    }
+    let registry = KernelRegistry::build(
+        providers,
+        &order,
+        &reqs,
+        &KernelMetrics::register(&MetricsRegistry::new()),
+        None,
+    )
+    .unwrap();
+    let expected: Vec<Value> = registry
+        .selections()
+        .iter()
+        .map(|s| {
+            json!({"op": s.op.as_str(), "config": s.config, "provider": "cpu-reference",
+                   "implementation": s.implementation, "impl_provider": "cpu-reference",
+                   "reason": s.reason, "reason_code": "provider_internal", "tiers": []})
+        })
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(status["kernels"], Value::Array(expected), "{status}");
+}
+
+/// Phase 2m S-11: the support-matrix row resolved at startup is the `support` key of
+/// `/turbine/v1/status`, drives `turbine_support_matrix_status`, and is logged as
+/// `event="support_matrix"` (WARN for the CPU reference provider's experimental row).
+#[test]
+fn status_reports_support_row() {
+    let server = TinyServer::launch(&Setup {
+        capture_logs: true,
+        extra: "logging:\n  format: json\n",
+        ..Setup::default()
+    });
+    let status = server.get("/turbine/v1/status").json();
+    assert_eq!(
+        status["support"],
+        json!({"vendor": "cpu", "arch": "cpu", "architecture": "LlamaForCausalLM",
+               "weight_format": "bf16", "kv_format": "bf16", "speculative": "none",
+               "status": "experimental", "reason": null}),
+        "{status}"
+    );
+    let metrics = server.metrics();
+    for (label, value) in [("experimental", 1), ("supported", 0), ("unsupported", 0)] {
+        let line = format!("turbine_support_matrix_status{{status=\"{label}\"}} {value}");
+        assert!(metrics.lines().any(|l| l == line), "{line}:\n{metrics}");
+    }
+    let logs = server.logs.as_ref().expect("logs captured");
+    wait_for(
+        Duration::from_secs(10),
+        "the support-matrix log line",
+        || {
+            let text = logs.lock().unwrap();
+            text.lines().any(|l| {
+                l.contains(r#""event":"support_matrix""#)
+                    && l.contains("experimental")
+                    && l.contains("cpu/cpu/LlamaForCausalLM/bf16/bf16/none")
+            })
+        },
+    );
+}
+
+/// Phase 2m S-5: on the CPU backend every `kernels` entry of `/turbine/v1/status` is served by
+/// `cpu-reference`, which chooses internally (`reason_code` `provider_internal`), with the
+/// implementation names main reports. Breaks if the registry's selection changes what a served
+/// model runs.
+#[test]
+fn status_reports_kernel_choices() {
+    let server = TinyServer::launch(&Setup::default());
+    let status = server.get("/turbine/v1/status").json();
+    let kernels = status["kernels"].as_array().expect("kernels array");
+    assert!(!kernels.is_empty(), "{status}");
+    let main_names: std::collections::HashMap<&str, &str> = [
+        ("embedding", "cpu_embedding"),
+        ("rmsnorm", "cpu_rmsnorm"),
+        ("gemm", "cpu_gemm_f32acc"),
+        ("rope", "cpu_rope_half_split"),
+        ("attention_prefill_paged", "cpu_attention_paged_f32acc"),
+        ("attention_decode_paged", "cpu_attention_paged_f32acc"),
+        ("add", "cpu_add"),
+        ("add_rmsnorm", "cpu_add_rmsnorm"),
+        ("silu_mul", "cpu_silu_mul"),
+        ("copy_blocks", "cpu_copy_blocks"),
+        ("logits_reduce", "cpu_logits_reduce"),
+    ]
+    .into_iter()
+    .collect();
+    for k in kernels {
+        let op = k["op"].as_str().expect("op");
+        assert_eq!(k["provider"], "cpu-reference", "{k}");
+        assert_eq!(k["impl_provider"], "cpu-reference", "{k}");
+        assert_eq!(k["reason_code"], "provider_internal", "{k}");
+        assert_eq!(k["tiers"], json!([]), "{k}");
+        let want = main_names
+            .get(op)
+            .unwrap_or_else(|| panic!("unexpected op {op} in {status}"));
+        assert_eq!(k["implementation"], *want, "{k}");
+    }
+}
+
 /// Contract §20.2 (rewritten for Phase 2): with one running request allowed
 /// (`continuous_batching: false`) a second concurrent request is queued — no more 429
 /// `engine_busy` — and completes once the first client goes away, whose blocks are freed.
@@ -1144,15 +1275,15 @@ fn startup_failures_exit_1() {
     let addr = free_addr();
     assert_exit_1(&config_yaml(&pickle, addr, ""), addr, "pickle");
 
-    // Unsupported architecture.
-    let qwen = dir.path().join("qwen");
-    write_tiny_llama(&qwen, 7);
+    // Unsupported architecture (no registered family).
+    let unknown = dir.path().join("gpt-oss");
+    write_tiny_llama(&unknown, 7);
     let mut cfg: Value =
-        serde_json::from_slice(&std::fs::read(qwen.join("config.json")).unwrap()).unwrap();
-    cfg["architectures"] = json!(["Qwen3MoeForCausalLM"]);
-    std::fs::write(qwen.join("config.json"), cfg.to_string()).unwrap();
+        serde_json::from_slice(&std::fs::read(unknown.join("config.json")).unwrap()).unwrap();
+    cfg["architectures"] = json!(["GptOssForCausalLM"]);
+    std::fs::write(unknown.join("config.json"), cfg.to_string()).unwrap();
     let addr = free_addr();
-    assert_exit_1(&config_yaml(&qwen, addr, ""), addr, "Qwen3MoeForCausalLM");
+    assert_exit_1(&config_yaml(&unknown, addr, ""), addr, "GptOssForCausalLM");
 
     // hip with a kernel library that does not exist.
     let tiny = dir.path().join("tiny");
@@ -1184,7 +1315,7 @@ fn startup_failures_exit_1() {
     );
     assert_exit_1(&yaml, addr, "/nonexistent/libturbine_hip.so");
 
-    // cuda is a configuration error until phase-2b-nvidia.
+    // cuda is a configuration error until a cuda backend is registered (phase-2b-nvidia).
     let addr = free_addr();
     let yaml = format!(
         "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cuda\n",
@@ -1192,7 +1323,10 @@ fn startup_failures_exit_1() {
     );
     let (code, stderr) = run_failing(&dir, &yaml);
     assert_eq!(code, Some(2), "stderr:\n{stderr}");
-    assert!(stderr.contains("phase-2b-nvidia"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("execution.backend: `cuda` is not registered (registered: cpu, hip)"),
+        "stderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -1386,6 +1520,7 @@ fn reference_tokens(prompt: &[u32], sampling: SamplingParams, max_tokens: u32) -
         &order,
         &executor::requirements(&spec.config, 16, ExecutorOptions::default()),
         &KernelMetrics::register(&MetricsRegistry::new()),
+        None,
     )
     .unwrap();
     let mut exec = executor::build_executor(
@@ -2571,4 +2706,57 @@ fn device_sampling_matches_host() {
         .is_some_and(|n| n > 0.0),
         "{host_metrics}"
     );
+}
+
+/// Phase 2m S-11: a tiny Qwen3 checkpoint starts through the family registry on the `cpu`
+/// backend (its support row is `experimental`) and answers a 4-token greedy completion equal
+/// to the naive decoder's argmax chain (`turbine_model::testing::naive`).
+#[test]
+fn qwen3_tiny_generates_on_cpu() {
+    const TOKENS: usize = 4;
+    let dir = TempDir::new("turbine-tiny-qwen3");
+    let model_dir = dir.path().join("tiny-qwen3");
+    let spec = write_tiny_family(&model_dir, "qwen3", 3);
+
+    // The naive argmax chain from the prompt.
+    let mut tokens = HELLO.to_vec();
+    let mut expected = Vec::new();
+    for _ in 0..TOKENS {
+        let rows = naive::forward(&spec.config, &spec.dir, &tokens);
+        let last = rows.last().expect("a row");
+        let mut best = 0;
+        for (i, &v) in last.iter().enumerate() {
+            if v > last[best] {
+                best = i;
+            }
+        }
+        expected.push(best as u32);
+        tokens.push(best as u32);
+    }
+
+    let config = dir.path().join("config.yaml");
+    for _ in 0..LAUNCH_ATTEMPTS {
+        let addr = free_addr();
+        std::fs::write(&config, config_yaml(&model_dir, addr, "")).unwrap();
+        let mut child = spawn(&config);
+        let logs = drain_stderr(&mut child);
+        match wait_until_ready(&mut child, addr, &logs) {
+            Ready::PortTaken => continue,
+            Ready::Serving => {}
+        }
+        let status = request(addr, "GET", "/turbine/v1/status", None).json();
+        assert_eq!(status["modules"]["family"], "qwen3", "{status}");
+        assert_eq!(status["support"]["architecture"], "Qwen3ForCausalLM");
+        assert_eq!(status["support"]["status"], "experimental", "{status}");
+        let body = json!({"model": "tiny-qwen3", "prompt": HELLO, "max_tokens": TOKENS,
+                          "ignore_eos": true, "temperature": 0, "logprobs": 0,
+                          "return_tokens_as_token_ids": true});
+        let resp = request(addr, "POST", "/v1/completions", Some(&body.to_string()));
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(choice_token_ids(&resp.json()["choices"][0]), expected);
+        return;
+    }
+    panic!("turbine-server lost its port {LAUNCH_ATTEMPTS} times in a row");
 }

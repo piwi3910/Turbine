@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 turbine-core.workspace = true
+# host_mem_available (re-exported for the startup budget)
+turbine-device.workspace = true
 turbine-kernels.workspace = true
 turbine-observability.workspace = true
 turbine-tensor.workspace = true
@@ -49,7 +51,5 @@ toktrie_hf_tokenizers.workspace = true
 unsafe_code = "forbid"
 
 [dev-dependencies]
-# hip_matches_cpu (lab only): the AMD device the HIP context is created on
-turbine-device.workspace = true
 # structured::tests: constrained outputs validate against their schema
 jsonschema.workspace = true

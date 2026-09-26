@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_norway::Value;
-use turbine_core::types::ExecutionBackend;
 
 const CI_ROOT: &str = "/home/piwi/turbine-ci";
 const CACHE: &str = "/home/piwi/turbine-ci/cache";
@@ -264,7 +263,7 @@ fn phase1_novanas_config_loads() {
         c.model.served_name.as_deref(),
         Some("meta-llama/Llama-3.2-3B-Instruct")
     );
-    assert_eq!(c.execution.backend, ExecutionBackend::Hip);
+    assert_eq!(c.execution.backend.as_str(), "hip");
 }
 
 #[test]
@@ -287,7 +286,7 @@ fn phase2_novanas_configs_load_with_the_scheduler_defaults() {
         assert_eq!(c.server.listen.to_string(), "0.0.0.0:18000", "{file}");
         assert_eq!(c.model.path, Path::new(dir), "{file}");
         assert_eq!(c.model.served_name.as_deref(), Some(name), "{file}");
-        assert_eq!(c.execution.backend, ExecutionBackend::Hip, "{file}");
+        assert_eq!(c.execution.backend.as_str(), "hip", "{file}");
         // The spec's Phase 2 defaults, spelled out in the file.
         let s = &c.scheduler;
         assert!(s.continuous_batching && s.chunked_prefill, "{file}");

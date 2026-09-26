@@ -6,9 +6,12 @@ use std::path::PathBuf;
 
 use turbine_tensor::MemoryError;
 
+pub mod backends;
+pub mod cards;
 pub mod cpu;
 pub(crate) mod ffi;
 pub mod ops;
+mod registries;
 pub mod registry;
 pub mod shim;
 pub mod test_support;
@@ -18,11 +21,11 @@ pub use ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
     ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
-    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, KernelProvider, KvCopyConfig,
-    KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
-    MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
-    NormContext, NormKernel, OpKind, PagedAttentionContext, ProviderId, RopeConfig, RopeContext,
-    RopeKernel,
+    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplChoice, ImplInfo, KernelProvider,
+    KvCopyConfig, KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext,
+    LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
+    MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
+    ProviderId, RopeConfig, RopeContext, RopeKernel, RowTier,
 };
 pub use registry::{KernelMetrics, KernelRegistry, OpConfig, OpRequirement, Selection};
 pub use shim::{
@@ -33,14 +36,6 @@ pub use shim::{
 /// The kernel C ABI version this crate speaks; must equal `turbine_abi_version()` of the loaded
 /// shim library and `TURBINE_ABI_VERSION` in the header exactly (contract §9.1).
 pub const TURBINE_KERNELS_ABI_VERSION: u32 = 2;
-
-/// Device error names after which the context is corrupted and every later call fails
-/// (P3 "sticky" errors). Device messages start with the runtime's own error name (contract §9.2).
-const STICKY_DEVICE_ERRORS: &[&str] = &[
-    "hipErrorIllegalAddress",
-    "hipErrorLaunchFailure",
-    "hipErrorAssert",
-];
 
 /// Every failure of a kernel provider, the shim library or kernel selection (contract §7.1).
 /// Codes −1…−5 of the C ABI map to the first five variants.
@@ -68,16 +63,31 @@ pub enum KernelError {
         device_arch: String,
         build_archs: String,
     },
-    #[error("no kernel provider supports {op} {config}")]
-    NoProvider { op: OpKind, config: String },
+    /// `detail` lists, per provider that enumerates its implementations, each implementation
+    /// and why it was refused (empty when no provider enumerates).
+    #[error("no kernel provider supports {op} {config}{}", detail_suffix(.detail))]
+    NoProvider {
+        op: OpKind,
+        config: String,
+        detail: String,
+    },
+}
+
+/// ` (<detail>)`, or nothing for an empty detail.
+fn detail_suffix(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({detail})")
+    }
 }
 
 impl KernelError {
     /// A device error that leaves the context unusable (illegal address, launch failure, device
-    /// assert).
+    /// assert): its message starts with a sticky error name of a registered backend
+    /// ([`backends::ExecutionBackend::sticky_error_prefixes`]).
     pub fn is_sticky(&self) -> bool {
-        matches!(self, KernelError::Device { message }
-            if STICKY_DEVICE_ERRORS.iter().any(|name| message.starts_with(name)))
+        matches!(self, KernelError::Device { message } if backends::is_sticky_message(message))
     }
 
     pub fn is_oom(&self) -> bool {
@@ -153,8 +163,18 @@ mod tests {
                 KernelError::NoProvider {
                     op: OpKind::AttentionPrefill,
                     config: "head_dim=128 kv_heads=8".into(),
+                    detail: String::new(),
                 },
                 "no kernel provider supports attention_prefill head_dim=128 kv_heads=8",
+            ),
+            (
+                KernelError::NoProvider {
+                    op: OpKind::Rmsnorm,
+                    config: "dim=4096 dtype=bf16".into(),
+                    detail: "hip: stub_b unsupported, stub_a unsupported".into(),
+                },
+                "no kernel provider supports rmsnorm dim=4096 dtype=bf16 (hip: stub_b unsupported, \
+                 stub_a unsupported)",
             ),
             (
                 KernelError::Device {

@@ -21,7 +21,7 @@ use turbine_core::clock::{Clock, SystemClock};
 use turbine_core::request::GenerationEvent;
 use turbine_kv::{KvDocument, KvMetrics};
 use turbine_model::ModelMetrics;
-use turbine_scheduler::{Scheduler, SchedulerMetrics, SchedulerSnapshot, SubmitError};
+use turbine_scheduler::{Scheduler, SchedulerMetrics, SchedulerSnapshot, SubmitError, policy};
 
 use crate::backend::ModelBackend;
 use crate::metrics::ServerMetrics;
@@ -115,6 +115,17 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("turbine-engine".into())
         .spawn(move || {
+            // `scheduler.policy` was checked against the registry before any port was bound
+            // (`Config::validate_modules`); `select` logs `module_selected`.
+            let policy = match policy::registry()
+                .select(&prepared.modules.scheduling_policy, "scheduler.policy")
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
+                    return;
+                }
+            };
             let warmup_token = prepared.generation.bos_token_id.unwrap_or(0);
             let loaded = match model::load(&prepared, warmup_token, &metrics.model) {
                 Ok(l) => l,
@@ -131,8 +142,9 @@ pub fn spawn(
                 ..
             } = prepared;
             let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
-            let scheduler =
-                Scheduler::new(params, Arc::clone(&clock)).with_metrics(metrics.scheduler.clone());
+            let scheduler = Scheduler::new(params, Arc::clone(&clock))
+                .with_policy(policy)
+                .with_metrics(metrics.scheduler.clone());
             let (submit_tx, commands) = mpsc::channel(queue_capacity.max(1));
             let shared = Arc::new(EngineShared::default());
             let engine = EngineLoop::new(EngineParts {

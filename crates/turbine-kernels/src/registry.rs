@@ -1,6 +1,10 @@
-//! Per-op provider selection at startup (P1 S-6): for every distinct op config the model needs,
-//! the first provider in the configured order whose family trait `supports()` it wins. Every
-//! choice is logged (`event="kernel_selected"`) with its reason and exported as
+//! Per-op provider and implementation selection at startup (P1 S-6, Phase 2m S-5): for every
+//! distinct op config the model needs, the first provider in the configured order that supports
+//! it wins. A provider that enumerates its implementations (kernel ABI v2.4) gets one chosen from
+//! the card profile's preference order (per routed-row tier for `moe_experts`) and is bound to
+//! it, so every call runs exactly that implementation; any other provider keeps its own choice
+//! (`reason_code` `provider_internal`). Every choice is logged (`event="kernel_selected"`) with
+//! its reason and reason code and exported as
 //! `turbine_kernel_provider_selected{op,provider,impl} 1`; a config no provider supports fails
 //! startup, never first use.
 use std::collections::HashMap;
@@ -12,13 +16,27 @@ use prometheus_client::metrics::gauge::Gauge;
 use turbine_observability::MetricsRegistry;
 
 use crate::KernelError;
+use crate::cards::CardProfile;
 use crate::ops::{
     ActivationConfig, ActivationKernel, AddRmsnormConfig, AddRmsnormKernel, AttentionConfig,
     AttentionKernel, ElementwiseConfig, ElementwiseKernel, EmbeddingConfig, EmbeddingKernel,
-    GemmConfig, GemmKernel, KernelProvider, KvCopyConfig, KvCopyKernel, LogitsReduceConfig,
-    LogitsReduceKernel, MoeExpertsConfig, MoeKernel, MoeRouteConfig, NormConfig, NormKernel,
-    OpKind, ProviderId, RopeConfig, RopeKernel,
+    GemmConfig, GemmKernel, ImplChoice, ImplInfo, KernelProvider, KvCopyConfig, KvCopyKernel,
+    LogitsReduceConfig, LogitsReduceKernel, MoeExpertsConfig, MoeKernel, MoeRouteConfig,
+    NormConfig, NormKernel, OpKind, ProviderId, RopeConfig, RopeKernel, RowTier,
 };
+
+/// `reason_code` of a selection: the card profile's first listed implementation (that the
+/// library has) supports the config.
+pub const PROFILE_PREFERRED: &str = "profile_preferred";
+/// `reason_code`: a later implementation of the profile's order (or one it does not list) runs,
+/// because the preferred ones are missing from the library or refuse the config.
+pub const PROFILE_FALLBACK: &str = "profile_fallback";
+/// `reason_code`: the card profile lists no order for the op; the first supporting implementation
+/// in library order runs.
+pub const LIBRARY_ORDER: &str = "library_order";
+/// `reason_code`: the provider does not enumerate implementations (the CPU reference, a kernel
+/// library of ABI minor 3 or earlier) or there is no card profile; it chooses per call itself.
+pub const PROVIDER_INTERNAL: &str = "provider_internal";
 
 /// Labels of `turbine_kernel_provider_selected`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -104,8 +122,9 @@ impl OpConfig {
     }
 
     /// The implementation name `provider` would run for this config, or `None` when it lacks
-    /// the op family or its `supports()` is false.
-    fn probe(&self, provider: &dyn KernelProvider) -> Option<String> {
+    /// the op family or its `supports()` is false: the provider's own choice (for a shim
+    /// library, `turbine_<op>_impl`).
+    pub fn probe(&self, provider: &dyn KernelProvider) -> Option<String> {
         match self {
             OpConfig::Gemm(cfg) => provider
                 .gemm()
@@ -190,26 +209,219 @@ pub struct Selection {
     pub op: OpKind,
     pub config: String,
     pub provider: ProviderId,
+    /// The implementation that runs (the first tier's for a tiered op).
     pub implementation: String,
     pub reason: String,
+    /// The implementation's family (`hipblaslt`, `ck`, `turbine_hip`); the provider id for a
+    /// provider that chooses internally.
+    pub impl_provider: String,
+    /// [`PROFILE_PREFERRED`], [`PROFILE_FALLBACK`], [`LIBRARY_ORDER`] or [`PROVIDER_INTERNAL`].
+    pub reason_code: &'static str,
+    /// Per routed-row tier `(max_rows, implementation)` of a tiered op (`moe_experts`); empty
+    /// otherwise.
+    pub tiers: Vec<(Option<u32>, String)>,
 }
 
-/// The startup-resolved map from op config to the provider that runs it.
+/// The implementation(s) chosen on one provider.
+struct Chosen {
+    choice: ImplChoice,
+    implementation: String,
+    impl_provider: String,
+    reason_code: &'static str,
+    reason: String,
+    tiers: Vec<(Option<u32>, String)>,
+}
+
+/// One candidate of a preference order: an implementation of the library, or a listed name the
+/// library lacks.
+enum Candidate<'a> {
+    Present(&'a ImplInfo),
+    Missing(&'a str),
+}
+
+/// `impls` in the order `order` lists them (names the library lacks kept as missing), then the
+/// implementations `order` does not list, in library order.
+fn ordered<'a>(order: &'a [&'a str], impls: &'a [ImplInfo]) -> Vec<Candidate<'a>> {
+    let mut out: Vec<Candidate<'a>> = order
+        .iter()
+        .map(|name| match impls.iter().find(|i| i.name == *name) {
+            Some(info) => Candidate::Present(info),
+            None => Candidate::Missing(name),
+        })
+        .collect();
+    out.extend(
+        impls
+            .iter()
+            .filter(|i| !order.contains(&i.name.as_str()))
+            .map(Candidate::Present),
+    );
+    out
+}
+
+/// The first candidate of `order` (then library order) `provider` supports `spec` with, and the
+/// candidates refused before it (`<name> (not in library)` / `<name> (unsupported)`). `Err`
+/// lists every refusal.
+fn first_supporting<'a>(
+    provider: &dyn KernelProvider,
+    spec: &OpConfig,
+    order: &'a [&'a str],
+    impls: &'a [ImplInfo],
+    rows: Option<u32>,
+) -> Result<(&'a ImplInfo, Vec<String>), Vec<String>> {
+    let mut refused = Vec::new();
+    for candidate in ordered(order, impls) {
+        match candidate {
+            Candidate::Missing(name) => refused.push(format!("{name} (not in library)")),
+            Candidate::Present(info) => {
+                if provider.implementation_supports(spec, info.index, rows) {
+                    return Ok((info, refused));
+                }
+                refused.push(format!("{} (unsupported)", info.name));
+            }
+        }
+    }
+    Err(refused)
+}
+
+/// Chooses among the implementations `provider` enumerates for `spec` by `card`'s preference:
+/// one per routed-row tier when the profile has row tiers for the op, else one. `Err` names
+/// every implementation and its refusal.
+fn choose(
+    provider: &dyn KernelProvider,
+    spec: &OpConfig,
+    impls: &[ImplInfo],
+    card: &CardProfile,
+) -> Result<Chosen, String> {
+    let pref = card.preference(spec.op());
+    let row_tiers = pref.map_or(&[][..], |p| p.row_tiers);
+    if row_tiers.is_empty() {
+        let order = pref.map_or(&[][..], |p| p.order);
+        let (info, refused) = first_supporting(provider, spec, order, impls, None)
+            .map_err(|refused| refused.join(", "))?;
+        let (reason_code, reason) = if order.is_empty() {
+            (
+                LIBRARY_ORDER,
+                format!(
+                    "card profile {} lists no order for {}: first supporting implementation in \
+                     library order",
+                    card.name,
+                    spec.op()
+                ),
+            )
+        } else if refused.is_empty() {
+            (
+                PROFILE_PREFERRED,
+                format!("card profile {} prefers {}", card.name, info.name),
+            )
+        } else {
+            (
+                PROFILE_FALLBACK,
+                format!(
+                    "card profile {} order; refused: {}",
+                    card.name,
+                    refused.join(", ")
+                ),
+            )
+        };
+        return Ok(Chosen {
+            choice: ImplChoice::Single(info.index),
+            implementation: info.name.clone(),
+            impl_provider: info.provider.clone(),
+            reason_code,
+            reason,
+            tiers: Vec::new(),
+        });
+    }
+    // One implementation per tier, probed at the tier's bound (the open tier at 4 × the largest
+    // bound).
+    let open_rows = row_tiers
+        .iter()
+        .filter_map(|t| t.max_rows)
+        .max()
+        .map(|m| m.saturating_mul(4));
+    let mut tiers = Vec::with_capacity(row_tiers.len());
+    let mut picked: Vec<&ImplInfo> = Vec::with_capacity(row_tiers.len());
+    let mut notes = Vec::new();
+    for tier in row_tiers {
+        let rows = tier.max_rows.or(open_rows);
+        let bound = tier
+            .max_rows
+            .map_or_else(|| "open tier".to_string(), |m| format!("<= {m} rows"));
+        let (info, refused) = first_supporting(provider, spec, tier.order, impls, rows)
+            .map_err(|refused| format!("{bound}: {}", refused.join(", ")))?;
+        if !refused.is_empty() {
+            notes.push(format!("{bound}: refused {}", refused.join(", ")));
+        }
+        tiers.push(RowTier {
+            max_rows: tier.max_rows,
+            index: info.index,
+        });
+        picked.push(info);
+    }
+    let named: Vec<(Option<u32>, String)> = row_tiers
+        .iter()
+        .zip(&picked)
+        .map(|(t, info)| (t.max_rows, info.name.clone()))
+        .collect();
+    let listing: Vec<String> = named
+        .iter()
+        .map(|(max, name)| match max {
+            Some(m) => format!("<= {m} rows {name}"),
+            None => format!("above {name}"),
+        })
+        .collect();
+    let (reason_code, reason) = if notes.is_empty() {
+        (
+            PROFILE_PREFERRED,
+            format!(
+                "card profile {} row tiers: {}",
+                card.name,
+                listing.join(", ")
+            ),
+        )
+    } else {
+        (
+            PROFILE_FALLBACK,
+            format!(
+                "card profile {} row tiers: {}; {}",
+                card.name,
+                listing.join(", "),
+                notes.join("; ")
+            ),
+        )
+    };
+    Ok(Chosen {
+        choice: ImplChoice::ByRows(tiers),
+        implementation: picked[0].name.clone(),
+        impl_provider: picked[0].provider.clone(),
+        reason_code,
+        reason,
+        tiers: named,
+    })
+}
+
+/// The startup-resolved map from op config to the provider that runs it (bound to the chosen
+/// implementation when the provider enumerates them).
 pub struct KernelRegistry {
     chosen: HashMap<OpConfig, Arc<dyn KernelProvider>>,
     selections: Vec<Selection>,
 }
 
 impl KernelRegistry {
-    /// Picks, per distinct requirement, the first provider in `order` whose `supports()` is true;
-    /// logs op, config, provider, implementation and reason and sets the selection gauge.
-    /// Returns [`KernelError::NoProvider`] for the first requirement nothing supports. An id in
-    /// `order` with no registered provider is skipped.
+    /// Picks, per distinct requirement, the first provider in `order` that supports it: with a
+    /// `card`, a provider that enumerates its implementations through
+    /// [`KernelProvider::implementation_supports`] in the profile's preference order, bound to
+    /// the choice with [`KernelProvider::bind`]; any other provider (and every provider without
+    /// a card) through its family's `supports()`, keeping its own choice. Logs op, config,
+    /// provider, implementation, reason and reason code and sets the selection gauge. Returns
+    /// [`KernelError::NoProvider`] (with each enumerated implementation's refusal) for the first
+    /// requirement nothing supports. An id in `order` with no registered provider is skipped.
     pub fn build(
         providers: Vec<Arc<dyn KernelProvider>>,
         order: &[ProviderId],
         reqs: &[OpRequirement],
         metrics: &KernelMetrics,
+        card: Option<&CardProfile>,
     ) -> Result<KernelRegistry, KernelError> {
         let mut chosen: HashMap<OpConfig, Arc<dyn KernelProvider>> = HashMap::new();
         let mut selections = Vec::new();
@@ -218,26 +430,53 @@ impl KernelRegistry {
                 continue;
             }
             let mut unsupported: Vec<&'static str> = Vec::new();
+            let mut refusals: Vec<String> = Vec::new();
             let mut picked = None;
             for id in order {
                 let Some(provider) = providers.iter().find(|p| p.id() == *id) else {
                     continue;
                 };
+                let impls = card.map_or_else(Vec::new, |_| provider.implementations(req.op));
+                if let (Some(card), false) = (card, impls.is_empty()) {
+                    match choose(provider.as_ref(), &req.spec, &impls, card) {
+                        Ok(c) => {
+                            let run = provider
+                                .bind(&req.spec, &c.choice)
+                                .unwrap_or_else(|| Arc::clone(provider));
+                            picked = Some((provider.id(), run, c));
+                            break;
+                        }
+                        Err(detail) => {
+                            unsupported.push(id.0);
+                            refusals.push(format!("{}: {detail}", id.0));
+                        }
+                    }
+                    continue;
+                }
                 match req.spec.probe(provider.as_ref()) {
                     Some(implementation) => {
-                        picked = Some((Arc::clone(provider), implementation));
+                        let c = Chosen {
+                            choice: ImplChoice::Single(0),
+                            implementation,
+                            impl_provider: id.0.to_string(),
+                            reason_code: PROVIDER_INTERNAL,
+                            reason: String::new(),
+                            tiers: Vec::new(),
+                        };
+                        picked = Some((provider.id(), Arc::clone(provider), c));
                         break;
                     }
                     None => unsupported.push(id.0),
                 }
             }
-            let Some((provider, implementation)) = picked else {
+            let Some((provider_id, run, mut c)) = picked else {
                 return Err(KernelError::NoProvider {
                     op: req.op,
                     config: req.config.clone(),
+                    detail: refusals.join("; "),
                 });
             };
-            let reason = if unsupported.is_empty() {
+            let order_note = if unsupported.is_empty() {
                 "first provider in order supports config".to_string()
             } else {
                 format!(
@@ -245,14 +484,30 @@ impl KernelRegistry {
                     unsupported.join(", ")
                 )
             };
-            let provider_id = provider.id();
+            c.reason = if c.reason.is_empty() {
+                order_note
+            } else {
+                format!("{}; {order_note}", c.reason)
+            };
+            let tiers = c
+                .tiers
+                .iter()
+                .map(|(max, name)| match max {
+                    Some(m) => format!("<={m}:{name}"),
+                    None => format!("open:{name}"),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             tracing::info!(
                 event = "kernel_selected",
                 op = req.op.as_str(),
                 config = %req.config,
                 provider = provider_id.0,
-                "impl" = %implementation,
-                reason = %reason,
+                "impl" = %c.implementation,
+                impl_provider = %c.impl_provider,
+                reason_code = c.reason_code,
+                tiers = %tiers,
+                reason = %c.reason,
                 "kernel provider selected"
             );
             metrics
@@ -260,17 +515,20 @@ impl KernelRegistry {
                 .get_or_create(&SelectedLabels {
                     op: req.op.as_str().to_string(),
                     provider: provider_id.0.to_string(),
-                    r#impl: implementation.clone(),
+                    r#impl: c.implementation.clone(),
                 })
                 .set(1);
             selections.push(Selection {
                 op: req.op,
                 config: req.config.clone(),
                 provider: provider_id,
-                implementation,
-                reason,
+                implementation: c.implementation,
+                reason: c.reason,
+                impl_provider: c.impl_provider,
+                reason_code: c.reason_code,
+                tiers: c.tiers,
             });
-            chosen.insert(req.spec, provider);
+            chosen.insert(req.spec, run);
         }
         Ok(KernelRegistry { chosen, selections })
     }
@@ -385,8 +643,19 @@ mod tests {
 
     use turbine_core::types::DType;
 
+    use std::path::Path;
+
+    use turbine_core::types::{DeviceId, MemoryKind, Vendor};
+    use turbine_device::{DeviceInfo, DeviceMemoryInfo};
+    use turbine_tensor::host::HostMemory;
+    use turbine_tensor::{DeviceMemory, Tensor};
+
     use super::*;
-    use crate::ops::{AttentionContext, AttentionKind, PagedAttentionContext};
+    use crate::cards::{CardCapabilities, CardThresholds, OpPreference, RowTierSpec};
+    use crate::ops::{
+        AttentionContext, AttentionKind, MoeExpertsContext, MoeRouteContext, PagedAttentionContext,
+    };
+    use crate::{ShimLibrary, shim_provider};
 
     /// A provider implementing only attention, supporting the configs `accepts` admits.
     struct FakeProvider {
@@ -505,6 +774,7 @@ mod tests {
                 &[ProviderId("first"), ProviderId("second")],
                 &[OpConfig::Attention(cfg).into()],
                 &metrics,
+                None,
             )
         })
         .expect("second provider supports the config");
@@ -518,6 +788,9 @@ mod tests {
                 provider: ProviderId("second"),
                 implementation: "second_fmha".into(),
                 reason: reason.into(),
+                impl_provider: "second".into(),
+                reason_code: PROVIDER_INTERNAL,
+                tiers: Vec::new(),
             }]
         );
         // The accessor hands out the selected provider's kernel.
@@ -553,6 +826,7 @@ mod tests {
             &[ProviderId("first")],
             &[OpConfig::Attention(prefill_128_8()).into()],
             &metrics,
+            None,
         );
         let err = match result {
             Err(e) => e,
@@ -613,6 +887,7 @@ mod tests {
             &[ProviderId("first"), ProviderId("cpu-reference")],
             &reqs,
             &metrics,
+            None,
         )
         .expect("cpu-reference supports every phase 2 op");
         let picked: Vec<(OpKind, &str, &str)> = registry
@@ -693,6 +968,7 @@ mod tests {
             &[ProviderId("first"), ProviderId("cpu-reference")],
             &reqs,
             &metrics,
+            None,
         )
         .expect("cpu-reference supports both v2.1 ops");
         let picked: Vec<(OpKind, &str, &str, &str)> = registry
@@ -744,6 +1020,7 @@ mod tests {
             &[ProviderId("first")],
             &reqs[..1],
             &metrics,
+            None,
         ) {
             Err(e) => e,
             Ok(_) => panic!("a provider without add_rmsnorm cannot serve it"),
@@ -763,6 +1040,7 @@ mod tests {
             &[ProviderId("second")],
             &[req.clone(), req],
             &metrics,
+            None,
         )
         .expect("second supports the config");
         assert_eq!(registry.selections().len(), 1);
@@ -783,6 +1061,7 @@ mod tests {
             &[ProviderId("second")],
             &[OpConfig::Attention(prefill_128_8()).into()],
             &metrics,
+            None,
         )
         .expect("second supports the config");
         let other = AttentionConfig {
@@ -790,5 +1069,441 @@ mod tests {
             ..prefill_128_8()
         };
         registry.attention(&other);
+    }
+
+    const TOY_CAPABILITIES: CardCapabilities = CardCapabilities {
+        matrix_instructions: &[],
+        bf16: true,
+        wave_size: 32,
+        lds_bytes: 65536,
+    };
+    const TOY_THRESHOLDS: CardThresholds = CardThresholds {
+        moe_small_max_rows: 8,
+        paged_page_multiple: 16,
+    };
+
+    /// A toy profile preferring `stub_b`, then `stub_a` for `rmsnorm`.
+    static PREFER_B: CardProfile = CardProfile {
+        name: "toy_b",
+        vendor: "amd",
+        archs: &["gfx942"],
+        capabilities: TOY_CAPABILITIES,
+        thresholds: TOY_THRESHOLDS,
+        preferences: &[OpPreference {
+            op: OpKind::Rmsnorm,
+            order: &["stub_b", "stub_a"],
+            row_tiers: &[],
+        }],
+    };
+
+    /// A toy profile whose preferred `rmsnorm` implementation the library does not have.
+    static PREFER_MISSING: CardProfile = CardProfile {
+        name: "toy_missing",
+        vendor: "amd",
+        archs: &["gfx942"],
+        capabilities: TOY_CAPABILITIES,
+        thresholds: TOY_THRESHOLDS,
+        preferences: &[OpPreference {
+            op: OpKind::Rmsnorm,
+            order: &["stub_x", "stub_b"],
+            row_tiers: &[],
+        }],
+    };
+
+    /// A toy profile listing no order for any op.
+    static LISTS_NOTHING: CardProfile = CardProfile {
+        name: "toy_none",
+        vendor: "amd",
+        archs: &["gfx942"],
+        capabilities: TOY_CAPABILITIES,
+        thresholds: TOY_THRESHOLDS,
+        preferences: &[],
+    };
+
+    fn gfx942_device() -> DeviceInfo {
+        DeviceInfo {
+            index: DeviceId(0),
+            vendor: Vendor::Amd,
+            vendor_index: 0,
+            name: "stub device".into(),
+            uuid: None,
+            pci_bus_id: None,
+            arch: Some("gfx942".into()),
+            driver_version: None,
+            memory: DeviceMemoryInfo {
+                kind: MemoryKind::Dedicated,
+                total_bytes: 1 << 30,
+                shared_with_host: false,
+            },
+        }
+    }
+
+    /// The shim provider of a stub library (`hip`, built for gfx942).
+    fn stub_provider(path: &str) -> Arc<dyn KernelProvider> {
+        let lib = ShimLibrary::load(Path::new(path), "hip").expect("stub library");
+        shim_provider(lib.create_context(&gfx942_device()).expect("context"))
+    }
+
+    fn norm(dim: u64) -> OpRequirement {
+        OpConfig::Rmsnorm(NormConfig {
+            dim,
+            dtype: DType::BF16,
+        })
+        .into()
+    }
+
+    /// The (implementation, impl_provider, reason_code) of each selection.
+    fn picks(registry: &KernelRegistry) -> Vec<(String, String, &'static str)> {
+        registry
+            .selections()
+            .iter()
+            .map(|s| {
+                (
+                    s.implementation.clone(),
+                    s.impl_provider.clone(),
+                    s.reason_code,
+                )
+            })
+            .collect()
+    }
+
+    /// Phase 2m S-5: with an enumerating library (the V24 stub: `stub_a` supports every
+    /// `rmsnorm`, `stub_b` refuses dim 4096) the registry follows the card profile's order:
+    /// `stub_b` where it supports the config (`profile_preferred`), else `stub_a`
+    /// (`profile_fallback`, naming the refusal), a listed name the library lacks is skipped
+    /// (`profile_fallback`), and a profile listing nothing takes library order
+    /// (`library_order`). A config no implementation supports fails naming each refusal.
+    #[test]
+    fn profile_order_picks_and_falls_back() {
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        let provider = stub_provider(env!("TURBINE_STUB_GFX942_V24"));
+        let order = [provider.id()];
+        let build = |card: &CardProfile, reqs: &[OpRequirement]| {
+            KernelRegistry::build(
+                vec![Arc::clone(&provider)],
+                &order,
+                reqs,
+                &metrics,
+                Some(card),
+            )
+        };
+        let registry = build(&PREFER_B, &[norm(2048), norm(4096)]).expect("stub rmsnorm");
+        assert_eq!(
+            picks(&registry),
+            [
+                ("stub_b".into(), "stub_alt".into(), PROFILE_PREFERRED),
+                ("stub_a".into(), "stub".into(), PROFILE_FALLBACK),
+            ]
+        );
+        assert_eq!(
+            registry.selections()[1].reason,
+            "card profile toy_b order; refused: stub_b (unsupported); first provider in order \
+             supports config"
+        );
+        // The accessor hands out the provider bound to the choice.
+        let cfg = NormConfig {
+            dim: 2048,
+            dtype: DType::BF16,
+        };
+        assert_eq!(registry.norm(&cfg).implementation(&cfg), "stub_b");
+
+        let registry = build(&PREFER_MISSING, &[norm(2048)]).expect("stub rmsnorm");
+        assert_eq!(
+            picks(&registry),
+            [("stub_b".into(), "stub_alt".into(), PROFILE_FALLBACK)]
+        );
+        assert!(
+            registry.selections()[0]
+                .reason
+                .contains("stub_x (not in library)"),
+            "{}",
+            registry.selections()[0].reason
+        );
+
+        let registry = build(&LISTS_NOTHING, &[norm(4096)]).expect("stub rmsnorm");
+        assert_eq!(
+            picks(&registry),
+            [("stub_a".into(), "stub".into(), LIBRARY_ORDER)]
+        );
+
+        let gemm: OpRequirement = OpConfig::Gemm(GemmConfig {
+            n: 64,
+            k: 64,
+            trans_b: true,
+            a_dtype: DType::BF16,
+            b_dtype: DType::BF16,
+            c_dtype: DType::BF16,
+        })
+        .into();
+        let err = match build(&PREFER_B, &[gemm]) {
+            Err(e) => e,
+            Ok(_) => panic!("the stub supports no gemm"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "no kernel provider supports gemm n=64 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 \
+             c_dtype=bf16 (hip: stub_gemm (unsupported))"
+        );
+    }
+
+    /// A kernel library without the v2.4 group (the V21 stub, minor 3) keeps main's selection
+    /// with or without a card profile (`provider_internal`, the next provider in order when it
+    /// refuses), and so does an enumerating library without a card profile.
+    #[test]
+    fn v23_library_uses_library_internal_choice() {
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        for (path, card) in [
+            (
+                env!("TURBINE_STUB_GFX942_V21"),
+                Some(&crate::cards::GFX1201),
+            ),
+            (env!("TURBINE_STUB_GFX942_V21"), None),
+            (env!("TURBINE_STUB_GFX942_V24"), None),
+        ] {
+            let stub = stub_provider(path);
+            let order = [stub.id(), ProviderId("cpu-reference")];
+            let registry = KernelRegistry::build(
+                vec![stub, crate::cpu_reference_provider()],
+                &order,
+                &[norm(2048)],
+                &metrics,
+                card,
+            )
+            .expect("cpu-reference serves rmsnorm");
+            assert_eq!(
+                registry.selections(),
+                [Selection {
+                    op: OpKind::Rmsnorm,
+                    config: "dim=2048 dtype=bf16".into(),
+                    provider: ProviderId("cpu-reference"),
+                    implementation: "cpu_rmsnorm".into(),
+                    reason: "first provider in order supporting config; unsupported by: hip".into(),
+                    impl_provider: "cpu-reference".into(),
+                    reason_code: PROVIDER_INTERNAL,
+                    tiers: Vec::new(),
+                }],
+                "{path} card {:?}",
+                card.map(|c| c.name)
+            );
+        }
+    }
+
+    /// A fake enumerating MoE provider: two `moe_experts` implementations, `fast` (device
+    /// offsets) and `host` (reads host offsets); a bound copy records the index each
+    /// `experts` call runs.
+    struct FakeMoe {
+        choice: Option<ImplChoice>,
+        runs: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl FakeMoe {
+        fn impls() -> Vec<ImplInfo> {
+            [("fast", false), ("host", true)]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (name, host))| ImplInfo {
+                    index: i as u32,
+                    name: name.into(),
+                    provider: "fake".into(),
+                    needs_host_offsets: host,
+                })
+                .collect()
+        }
+
+        fn index(&self, rows: usize) -> usize {
+            self.choice.as_ref().map_or(0, |c| c.index_for(rows)) as usize
+        }
+    }
+
+    impl MoeKernel for FakeMoe {
+        fn supports_route(&self, _cfg: &MoeRouteConfig) -> bool {
+            false
+        }
+        fn supports_experts(&self, _cfg: &MoeExpertsConfig) -> bool {
+            true
+        }
+        fn implementation_route(&self, _cfg: &MoeRouteConfig) -> String {
+            String::new()
+        }
+        fn implementation_experts(&self, _cfg: &MoeExpertsConfig) -> String {
+            Self::impls()[self.index(1)].name.clone()
+        }
+        fn route(&self, _ctx: &mut MoeRouteContext<'_>) -> Result<(), KernelError> {
+            Ok(())
+        }
+        fn experts(&self, ctx: &mut MoeExpertsContext<'_>) -> Result<(), KernelError> {
+            let rows = ctx.cfg.routed_rows(ctx.x.shape[0]);
+            self.runs
+                .lock()
+                .expect("runs")
+                .push(self.index(rows) as u32);
+            Ok(())
+        }
+        fn needs_host_offsets(&self, _cfg: &MoeExpertsConfig, routed_rows: usize) -> bool {
+            Self::impls()[self.index(routed_rows)].needs_host_offsets
+        }
+    }
+
+    impl KernelProvider for FakeMoe {
+        fn id(&self) -> ProviderId {
+            ProviderId("fake")
+        }
+        fn gemm(&self) -> Option<&dyn GemmKernel> {
+            None
+        }
+        fn attention(&self) -> Option<&dyn AttentionKernel> {
+            None
+        }
+        fn norm(&self) -> Option<&dyn NormKernel> {
+            None
+        }
+        fn rope(&self) -> Option<&dyn RopeKernel> {
+            None
+        }
+        fn activation(&self) -> Option<&dyn ActivationKernel> {
+            None
+        }
+        fn embedding(&self) -> Option<&dyn EmbeddingKernel> {
+            None
+        }
+        fn elementwise(&self) -> Option<&dyn ElementwiseKernel> {
+            None
+        }
+        fn kv_copy(&self) -> Option<&dyn KvCopyKernel> {
+            None
+        }
+        fn moe(&self) -> Option<&dyn MoeKernel> {
+            Some(self)
+        }
+        fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
+            if op == OpKind::MoeExperts {
+                Self::impls()
+            } else {
+                Vec::new()
+            }
+        }
+        fn implementation_supports(
+            &self,
+            _spec: &OpConfig,
+            _index: u32,
+            _rows: Option<u32>,
+        ) -> bool {
+            true
+        }
+        fn bind(&self, _spec: &OpConfig, choice: &ImplChoice) -> Option<Arc<dyn KernelProvider>> {
+            Some(Arc::new(FakeMoe {
+                choice: Some(choice.clone()),
+                runs: Arc::clone(&self.runs),
+            }))
+        }
+    }
+
+    /// A toy profile with `moe_experts` row tiers: up to 8 routed rows `fast` (then `host`),
+    /// above only `host`.
+    static MOE_TIERS: CardProfile = CardProfile {
+        name: "toy_moe",
+        vendor: "amd",
+        archs: &["gfx942"],
+        capabilities: TOY_CAPABILITIES,
+        thresholds: TOY_THRESHOLDS,
+        preferences: &[OpPreference {
+            op: OpKind::MoeExperts,
+            order: &["host"],
+            row_tiers: &[
+                RowTierSpec {
+                    max_rows: Some(8),
+                    order: &["fast", "host"],
+                },
+                RowTierSpec {
+                    max_rows: None,
+                    order: &["host"],
+                },
+            ],
+        }],
+    };
+
+    /// Phase 2m S-5: a tiered op resolves one implementation per routed-row tier into
+    /// `ImplChoice::ByRows`; the bound provider runs index 0 for 8 routed rows and 1 for 9, and
+    /// `needs_host_offsets` follows the flag of the index a call runs. Breaks if the tier bound
+    /// is off by one or the per-call choice ignores the rows.
+    #[test]
+    fn row_tiers_bind_per_call() {
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let fake: Arc<dyn KernelProvider> = Arc::new(FakeMoe {
+            choice: None,
+            runs: Arc::clone(&runs),
+        });
+        let cfg = MoeExpertsConfig {
+            hidden: 8,
+            inter: 8,
+            num_experts: 2,
+            top_k: 1,
+            expert_begin: 0,
+            expert_end: 2,
+            dtype: DType::BF16,
+        };
+        let registry = KernelRegistry::build(
+            vec![fake],
+            &[ProviderId("fake")],
+            &[OpConfig::MoeExperts(cfg).into()],
+            &metrics,
+            Some(&MOE_TIERS),
+        )
+        .expect("fake moe_experts");
+        let s = &registry.selections()[0];
+        assert_eq!(
+            (s.implementation.as_str(), s.reason_code),
+            ("fast", PROFILE_PREFERRED)
+        );
+        assert_eq!(
+            s.tiers,
+            [(Some(8), "fast".to_string()), (None, "host".to_string())]
+        );
+        let moe = registry.moe_experts(&cfg);
+        assert!(!moe.needs_host_offsets(&cfg, 8));
+        assert!(moe.needs_host_offsets(&cfg, 9));
+
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 20);
+        let t = |shape: &[usize], dtype| Tensor::empty(&mem, shape, dtype).expect("tensor");
+        let (w_gate, w_up, w_down) = (
+            t(&[2, 8, 8], DType::BF16),
+            t(&[2, 8, 8], DType::BF16),
+            t(&[2, 8, 8], DType::BF16),
+        );
+        let offsets = t(&[3], DType::I32);
+        for tokens in [8usize, 9] {
+            let (x, out) = (t(&[tokens, 8], DType::BF16), t(&[tokens, 8], DType::BF16));
+            let (rows, weights) = (t(&[tokens], DType::I32), t(&[tokens, 1], DType::F32));
+            moe.experts(&mut MoeExpertsContext {
+                cfg,
+                x: x.view(),
+                w_gate: w_gate.view(),
+                w_up: w_up.view(),
+                w_down: w_down.view(),
+                sorted_rows: rows.view(),
+                expert_offsets: offsets.view(),
+                topk_weights: weights.view(),
+                host_expert_offsets: &[],
+                out: out.view(),
+                workspace: None,
+            })
+            .expect("fake experts");
+        }
+        assert_eq!(*runs.lock().expect("runs"), [0, 1]);
+        assert_eq!(
+            ImplChoice::ByRows(vec![
+                RowTier {
+                    max_rows: Some(8),
+                    index: 0
+                },
+                RowTier {
+                    max_rows: None,
+                    index: 1
+                },
+            ])
+            .index_for(9),
+            1
+        );
     }
 }

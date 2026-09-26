@@ -43,26 +43,6 @@ int32_t hip_code(hipError_t err) {
                                     : TURBINE_E_DEVICE;
 }
 
-// True when arch (e.g. "gfx1201" or "gfx1201:sramecc-:xnack-") names one of
-// the comma-separated build architectures.
-bool arch_is_built(const char *arch) {
-  const std::string full(arch);
-  const std::string base = full.substr(0, full.find(':'));
-  const std::string archs = TURBINE_BUILD_ARCHS;
-  size_t start = 0;
-  while (start <= archs.size()) {
-    const size_t end = archs.find(',', start);
-    const std::string item = archs.substr(
-        start, end == std::string::npos ? std::string::npos : end - start);
-    if (item == base)
-      return true;
-    if (end == std::string::npos)
-      break;
-    start = end + 1;
-  }
-  return false;
-}
-
 void log_banner() {
   std::call_once(g_banner_once, [] {
     std::fprintf(stderr,
@@ -156,6 +136,24 @@ int32_t check_blaslt(turbine_ctx *ctx, hipblasStatus_t status,
               msg);
 }
 
+bool arch_is_built(const char *arch) {
+  const std::string full(arch);
+  const std::string base = full.substr(0, full.find(':'));
+  const std::string archs = TURBINE_BUILD_ARCHS;
+  size_t start = 0;
+  while (start <= archs.size()) {
+    const size_t end = archs.find(',', start);
+    const std::string item = archs.substr(
+        start, end == std::string::npos ? std::string::npos : end - start);
+    if (item == base)
+      return true;
+    if (end == std::string::npos)
+      break;
+    start = end + 1;
+  }
+  return false;
+}
+
 int32_t enter(turbine_ctx *ctx) {
   // Clear a stale last error left by a runtime call outside this library, so
   // the launch checks that follow only see errors of this call.
@@ -168,12 +166,6 @@ int32_t enter(turbine_ctx *ctx) {
 extern "C" {
 
 uint32_t turbine_abi_version(void) { return TURBINE_ABI_VERSION; }
-
-// ABI v2.3: this library exports the optional add_rmsnorm trio (rmsnorm.cpp),
-// logits_reduce (logits_reduce.hip), the graph functions (graph.cpp) and the
-// v2.3 pinned host memory and event functions (memory.cpp); the other v2.1
-// group (options) is resolved only where its symbols exist.
-uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
 
 const char *turbine_backend_name(void) { return "hip"; }
 
@@ -201,7 +193,7 @@ int32_t turbine_ctx_create(int32_t device_ordinal, turbine_ctx **out) {
     return create_fail(hip_code(err),
                        hip_message(err, "hipGetDeviceProperties"));
   }
-  if (!arch_is_built(props.gcnArchName)) {
+  if (!turbine_hip::arch_is_built(props.gcnArchName)) {
     return create_fail(
         TURBINE_E_UNSUPPORTED,
         std::string("turbine_ctx_create: device ") +
@@ -219,6 +211,7 @@ int32_t turbine_ctx_create(int32_t device_ordinal, turbine_ctx **out) {
     const std::string full(props.gcnArchName);
     ctx->arch = full.substr(0, full.find(':'));
   }
+  ctx->wave_size = props.warpSize;
   err = hipStreamCreateWithFlags(&ctx->stream, hipStreamNonBlocking);
   if (err != hipSuccess) {
     ctx->stream = nullptr;

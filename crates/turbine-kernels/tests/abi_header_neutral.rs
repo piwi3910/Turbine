@@ -1,7 +1,7 @@
 //! The kernel C ABI header names no vendor, declares the entry-point trio of every op the
 //! registry binds, and carries the ABI version the Rust side expects (P1 AC S-1/S-7, contract §9)
-//! and the additive minor revisions v2.1 (P2c AC S-5) and v2.2 (the `moe_route` BF16-logits
-//! flag).
+//! and the additive minor revisions v2.1 (P2c AC S-5), v2.2 (the `moe_route` BF16-logits
+//! flag) and v2.4 (Phase 2m: implementation enumeration and the card profile).
 use std::path::Path;
 
 use turbine_kernels::TURBINE_KERNELS_ABI_VERSION;
@@ -128,7 +128,6 @@ fn header_declares_the_v21_minor_revision() {
         "2u",
         "v2.1 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "3u");
     assert_eq!(define(&code, "TURBINE_OPTION_GEMM_AUTOTUNE"), "1");
     assert_eq!(define(&code, "TURBINE_OPTION_GEMM_TUNED_SHAPES"), "2");
     // Declarations compared with whitespace collapsed, so line wrapping does not matter.
@@ -190,4 +189,43 @@ fn header_declares_the_v22_moe_route_flags() {
         ),
         "turbine_moe_route_desc changed shape"
     );
+}
+
+/// v2.4 (Phase 2m S-5/S-6): the minor becomes 4; the 15 op codes are the order of
+/// `OpKind::ALL` (`OpKind::abi_code`); the five optional functions and the two structs are
+/// declared. Breaks if an op code moves (a library would run another op's implementation) or a
+/// struct member moves.
+#[test]
+fn header_declares_the_v24_minor_revision() {
+    let code = strip_comments(&header());
+    assert_eq!(
+        define(&code, "TURBINE_ABI_VERSION"),
+        "2u",
+        "v2.4 keeps major 2"
+    );
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "4u");
+    for (i, op) in OpKind::ALL.iter().enumerate() {
+        let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
+        assert_eq!(define(&code, &name), i.to_string(), "{name}");
+        assert_eq!(op.abi_code(), i as i32, "{op}");
+    }
+    assert_eq!(define(&code, "TURBINE_IMPL_NEEDS_HOST_OFFSETS"), "1u");
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for decl in [
+        "typedef struct turbine_impl_entry { const char *name; const char *provider; \
+         uint32_t flags; } turbine_impl_entry;",
+        "typedef struct turbine_card_profile { uint32_t struct_bytes; const char *arch; \
+         int32_t wave_size; int32_t lds_bytes; int64_t moe_small_max_rows; \
+         int32_t paged_page_multiple; } turbine_card_profile;",
+        "int32_t turbine_impl_count(int32_t op);",
+        "int32_t turbine_impl_info(int32_t op, int32_t index, turbine_impl_entry *out);",
+        "int32_t turbine_impl_supports(int32_t op, int32_t index, const void *desc);",
+        "int32_t turbine_impl_run(turbine_ctx *ctx, int32_t op, int32_t index, const void *desc);",
+        "int32_t turbine_ctx_set_profile(turbine_ctx *ctx, const turbine_card_profile *p);",
+    ] {
+        assert!(
+            flat.contains(decl),
+            "turbine_kernels.h lacks the v2.4 {decl}"
+        );
+    }
 }
