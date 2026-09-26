@@ -182,7 +182,10 @@ pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelErr
             causal: ctx.cfg.causal,
         };
         let rows = seq.row * hq * d..(seq.row + seq.q_len) * hq * d;
-        let o = math::attention(&q[rows.clone()], &k, &v, &shape, ctx.scale);
+        let dt = ctx.cfg.dtype;
+        let o = math::attention(&q[rows.clone()], &k, &v, &shape, ctx.scale, |p| {
+            super::round_to(dt, p)
+        });
         out[rows].copy_from_slice(&o);
     }
     store(&ctx.out, &out)

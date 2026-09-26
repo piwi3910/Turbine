@@ -257,6 +257,11 @@ impl ModelBackend {
         let body = &req.body;
         Ok(GenerationRequest {
             id: req.id,
+            n: 1,
+            priority: turbine_core::types::Priority::default(),
+            echo: false,
+            constraint: None,
+            deadline_ms: u64::MAX,
             endpoint: req.endpoint,
             http_request_id: req.http_request_id.clone(),
             prompt_tokens,
@@ -266,12 +271,14 @@ impl ModelBackend {
                 top_k: body.top_k.unwrap_or(self.defaults.top_k),
                 seed: body.seed,
                 logprobs: body.logprobs_n(req.endpoint),
+                ..SamplingParams::default()
             },
             stop: StopConditions {
                 eos_token_ids: self.eos_token_ids.clone(),
                 stop_strings: body.stop_strings(),
                 max_tokens,
                 ignore_eos: body.ignore_eos == Some(true),
+                ..StopConditions::default()
             },
         })
     }
@@ -549,6 +556,11 @@ mod tests {
         Job {
             request: GenerationRequest {
                 id: RequestId::new_v4(),
+                n: 1,
+                priority: turbine_core::types::Priority::default(),
+                echo: false,
+                constraint: None,
+                deadline_ms: u64::MAX,
                 endpoint: Endpoint::Completions,
                 http_request_id: "test".into(),
                 prompt_tokens: vec![1, 2, 3],

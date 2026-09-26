@@ -425,6 +425,11 @@ fn greedy(
 ) -> (Vec<u32>, Vec<Vec<(u32, f32)>>) {
     let req = GenerationRequest {
         id: RequestId::new_v4(),
+        n: 1,
+        priority: turbine_core::types::Priority::default(),
+        echo: false,
+        constraint: None,
+        deadline_ms: u64::MAX,
         endpoint: Endpoint::Completions,
         http_request_id: "golden".into(),
         prompt_tokens,
@@ -434,12 +439,14 @@ fn greedy(
             top_k: -1,
             seed: Some(0),
             logprobs: Some(TOP_LOGPROBS),
+            ..SamplingParams::default()
         },
         stop: StopConditions {
             eos_token_ids: SmallVec::new(),
             stop_strings: Vec::new(),
             max_tokens,
             ignore_eos: true,
+            ..StopConditions::default()
         },
     };
     let cancel = CancelFlag::default();

@@ -535,7 +535,7 @@ async fn compare_concurrency_bounded() {
     std::fs::write(&prompts, lines).unwrap();
     std::fs::write(
         dir.join("mock/tolerance.json"),
-        r#"{"min_identical_prefix":8,"min_prompts_passing":8,"top_k":5,"max_abs_logprob_diff":0.15,"margin_nats":0.5}"#,
+        r#"{"min_identical_prefix":8,"min_prompts_passing":8,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5}"#,
     )
     .unwrap();
     let reference = dir.join("mock/reference.jsonl");

@@ -367,6 +367,11 @@ mod tests {
     ) -> GenerationRequest {
         GenerationRequest {
             id: RequestId::new_v4(),
+            n: 1,
+            priority: turbine_core::types::Priority::default(),
+            echo: false,
+            constraint: None,
+            deadline_ms: u64::MAX,
             endpoint: Endpoint::Completions,
             http_request_id: "test".into(),
             prompt_tokens: prompt.to_vec(),
@@ -388,6 +393,7 @@ mod tests {
             stop_strings: stop_strings.iter().map(|s| s.to_string()).collect(),
             max_tokens,
             ignore_eos,
+            ..StopConditions::default()
         }
     }
 
@@ -698,6 +704,7 @@ mod tests {
             top_k: 50,
             seed: Some(seed),
             logprobs: None,
+            ..SamplingParams::default()
         };
         let a = sample(seeded(7));
         let b = sample(seeded(7));
@@ -712,6 +719,7 @@ mod tests {
             top_k: 3,
             seed: None,
             logprobs: None,
+            ..SamplingParams::default()
         });
 
         // The argmax sequence, driven by hand.

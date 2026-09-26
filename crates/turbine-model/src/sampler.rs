@@ -222,6 +222,7 @@ mod tests {
             top_k,
             seed: Some(seed),
             logprobs: None,
+            ..SamplingParams::default()
         }
     }
 
