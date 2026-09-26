@@ -1,6 +1,6 @@
 # P1-T13 Llama executor on the kernel registry
 
-Status: open
+Status: closed 2026-09-26
 Created: 2026-09-25
 
 ## Description

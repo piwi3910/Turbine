@@ -1,6 +1,6 @@
 # P1-T9 Weight loader and the tiny synthetic checkpoint
 
-Status: open
+Status: closed 2026-09-26
 Created: 2026-09-25
 
 ## Description

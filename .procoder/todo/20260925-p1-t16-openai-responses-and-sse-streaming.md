@@ -1,6 +1,6 @@
 # P1-T16 OpenAI responses and SSE streaming
 
-Status: open
+Status: closed 2026-09-26
 Created: 2026-09-25
 
 ## Description

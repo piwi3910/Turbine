@@ -1,6 +1,6 @@
 # P1-T10 Startup memory budget
 
-Status: open
+Status: closed 2026-09-26
 Created: 2026-09-25
 
 ## Description

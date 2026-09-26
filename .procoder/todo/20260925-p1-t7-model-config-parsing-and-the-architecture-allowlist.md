@@ -1,6 +1,6 @@
 # P1-T7 Model config parsing and the architecture allowlist
 
-Status: open
+Status: closed 2026-09-26
 Created: 2026-09-25
 
 ## Description

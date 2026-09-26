@@ -1,6 +1,6 @@
 # P1-T22 Manual golden and baseline runs, AGENTS.md commands
 
-Status: open
+Status: closed 2026-09-26
 Created: 2026-09-25
 
 ## Description

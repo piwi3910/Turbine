@@ -1,6 +1,6 @@
 # P1-T11 Tokenizer and incremental detokenization
 
-Status: open
+Status: closed 2026-09-26
 Created: 2026-09-25
 
 ## Description

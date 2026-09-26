@@ -1,6 +1,6 @@
 # P1-T19 HF reference script, committed prompts, tolerance and in-process golden tests
 
-Status: open
+Status: closed 2026-09-26
 Created: 2026-09-25
 
 ## Description

@@ -1,6 +1,6 @@
 # P1-T8 Safetensors index with header validation
 
-Status: open
+Status: closed 2026-09-26
 Created: 2026-09-25
 
 ## Description

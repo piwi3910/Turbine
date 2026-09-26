@@ -1,6 +1,6 @@
 # P1-T12 Chat template rendering (minijinja + pycompat)
 
-Status: open
+Status: closed 2026-09-26
 Created: 2026-09-25
 
 ## Description
