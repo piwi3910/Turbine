@@ -90,3 +90,48 @@ fn inventory_matches_expectation() {
         }
     }
 }
+
+/// Discovery is called from several threads of one process (parallel tests, a server probing
+/// devices while a test discovers): every concurrent call must see the full inventory.
+#[test]
+#[ignore = "needs lab GPUs; run via scripts/lab-test.sh"]
+fn concurrent_discovery_sees_every_device() {
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 4;
+    let Some(want) = expected_count("TURBINE_EXPECT_AMD") else {
+        return;
+    };
+    let opts = DiscoveryOptions::from_config(&DevicesConfig::default());
+    for round in 0..ROUNDS {
+        let barrier = std::sync::Barrier::new(THREADS);
+        let seen: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        discover(&opts).expect("discovery")
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("discovery thread"))
+                .collect()
+        });
+        for (thread, inv) in seen.iter().enumerate() {
+            println!(
+                "lab-concurrent-discovery: round={round} thread={thread} amd={} backends={:?}",
+                inv.count(Vendor::Amd),
+                inv.backends
+            );
+        }
+        for inv in &seen {
+            assert_eq!(
+                inv.count(Vendor::Amd),
+                want,
+                "AMD device count under {THREADS} concurrent discoveries; backends: {:?}",
+                inv.backends
+            );
+        }
+    }
+}

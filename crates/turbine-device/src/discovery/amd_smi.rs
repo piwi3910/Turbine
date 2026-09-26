@@ -6,6 +6,7 @@
 use std::ffi::{c_char, c_uint, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::{Mutex, PoisonError};
 
 use libloading::Library;
 use turbine_core::types::{DeviceId, MemoryKind, Vendor};
@@ -266,6 +267,56 @@ impl AmdSmiBackend {
     }
 }
 
+/// One amd-smi session: `init`, the device queries, `shut_down`. A seam so the session
+/// discipline in [`run_session`] is testable without the library.
+trait Session {
+    fn init(&self) -> AmdsmiStatus;
+    fn devices(&self) -> Result<Vec<DeviceInfo>, String>;
+    fn shut_down(&self) -> AmdsmiStatus;
+}
+
+impl Session for Api {
+    fn init(&self) -> AmdsmiStatus {
+        // SAFETY: amdsmi_init has no pointer arguments; run_session pairs it with amdsmi_shut_down.
+        unsafe { (self.init)(AMDSMI_INIT_AMD_GPUS) }
+    }
+
+    fn devices(&self) -> Result<Vec<DeviceInfo>, String> {
+        self.gpu_handles().map(|handles| {
+            handles
+                .into_iter()
+                .enumerate()
+                .map(|(i, h)| self.device_info(h, u32::try_from(i).unwrap_or(u32::MAX)))
+                .collect()
+        })
+    }
+
+    fn shut_down(&self) -> AmdsmiStatus {
+        // SAFETY: run_session calls this once after a successful amdsmi_init; no handle from
+        // the session is used afterwards.
+        unsafe { (self.shut_down)() }
+    }
+}
+
+/// amd-smi keeps one process-wide session ("singleton design": inits and shut-downs are
+/// reference counted), but overlapping sessions are not safe: an `amdsmi_init` that finds the
+/// library already initialising returns success before the first caller has enumerated the
+/// sockets, and the first `amdsmi_shut_down` tears the shared state down under the others. On
+/// novanas, 8 concurrent discoveries all reported `Ok` with 0 devices (2 × R9700 present).
+/// Every session in this process therefore runs under this lock. A session stuck inside
+/// amd-smi keeps it held; later discoveries then block too and report `timeout` at their
+/// deadline instead of an empty inventory.
+static SESSION: Mutex<()> = Mutex::new(());
+
+/// Run one complete init → query → shut_down session, serialised process-wide.
+fn run_session(session: &impl Session) -> Result<Vec<DeviceInfo>, String> {
+    let _guard = SESSION.lock().unwrap_or_else(PoisonError::into_inner);
+    check(session.init(), "amdsmi_init")?;
+    let result = session.devices();
+    let _ = session.shut_down();
+    result
+}
+
 impl DiscoveryBackend for AmdSmiBackend {
     fn vendor(&self) -> Vendor {
         Vendor::Amd
@@ -273,17 +324,7 @@ impl DiscoveryBackend for AmdSmiBackend {
 
     fn discover(&mut self) -> Result<Vec<DeviceInfo>, String> {
         let api = Api::load(&self.library)?;
-        // SAFETY: amdsmi_init has no pointer arguments; it is paired with amdsmi_shut_down below.
-        check(unsafe { (api.init)(AMDSMI_INIT_AMD_GPUS) }, "amdsmi_init")?;
-        let result = api.gpu_handles().map(|handles| {
-            handles
-                .into_iter()
-                .enumerate()
-                .map(|(i, h)| api.device_info(h, u32::try_from(i).unwrap_or(u32::MAX)))
-                .collect()
-        });
-        // SAFETY: called once after a successful amdsmi_init; no handle is used afterwards.
-        let _ = unsafe { (api.shut_down)() };
+        let result = run_session(&api);
         // Keep the library mapped for the process lifetime: unloading ROCm libraries that
         // started helper threads is unsafe, and Phase 3 telemetry reloads it anyway.
         std::mem::forget(api);
@@ -317,5 +358,122 @@ mod tests {
         );
         assert_eq!(gfx_arch(0x1201).as_deref(), Some("gfx1201"));
         assert_eq!(gfx_arch(u64::MAX), None);
+    }
+
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    /// The process-wide amd-smi state as the real library behaves: inits and shut-downs are
+    /// reference counted, only the first init enumerates the sockets (slowly), a nested init
+    /// returns success at once, and the last shut-down clears the sockets.
+    #[derive(Default)]
+    struct FakeLibrary {
+        refs: Mutex<u32>,
+        enumerated: AtomicBool,
+    }
+
+    struct FakeSession(Arc<FakeLibrary>);
+
+    const FAKE_GPUS: u32 = 2;
+
+    impl Session for FakeSession {
+        fn init(&self) -> AmdsmiStatus {
+            let first = {
+                let mut refs = self.0.refs.lock().unwrap();
+                *refs += 1;
+                *refs == 1
+            };
+            if first {
+                std::thread::sleep(Duration::from_millis(20));
+                self.0.enumerated.store(true, Ordering::SeqCst);
+            }
+            AMDSMI_STATUS_SUCCESS
+        }
+
+        fn devices(&self) -> Result<Vec<DeviceInfo>, String> {
+            let n = if self.0.enumerated.load(Ordering::SeqCst) {
+                FAKE_GPUS
+            } else {
+                0
+            };
+            std::thread::sleep(Duration::from_millis(5));
+            Ok((0..n)
+                .map(|i| DeviceInfo {
+                    index: DeviceId(0),
+                    vendor: Vendor::Amd,
+                    vendor_index: i,
+                    name: "fake R9700".into(),
+                    uuid: None,
+                    pci_bus_id: None,
+                    arch: Some("gfx1201".into()),
+                    driver_version: None,
+                    memory: DeviceMemoryInfo {
+                        kind: MemoryKind::Dedicated,
+                        total_bytes: 1,
+                        shared_with_host: false,
+                    },
+                })
+                .collect())
+        }
+
+        fn shut_down(&self) -> AmdsmiStatus {
+            let mut refs = self.0.refs.lock().unwrap();
+            *refs -= 1;
+            if *refs == 0 {
+                self.0.enumerated.store(false, Ordering::SeqCst);
+            }
+            AMDSMI_STATUS_SUCCESS
+        }
+    }
+
+    /// Catches: concurrent discoveries overlapping amd-smi sessions, so a nested init sees no
+    /// sockets or a shut-down clears them under another thread (novanas: 0 of 2 R9700s).
+    #[test]
+    fn concurrent_sessions_each_see_every_device() {
+        const THREADS: usize = 8;
+        let lib = Arc::new(FakeLibrary::default());
+        let barrier = Barrier::new(THREADS);
+        let short = AtomicU32::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    let session = FakeSession(Arc::clone(&lib));
+                    barrier.wait();
+                    let found = run_session(&session).expect("session");
+                    if found.len() != FAKE_GPUS as usize {
+                        short.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            short.load(Ordering::SeqCst),
+            0,
+            "discoveries that saw fewer than {FAKE_GPUS} devices"
+        );
+        assert_eq!(*lib.refs.lock().unwrap(), 0, "every init is shut down");
+    }
+
+    /// Catches: a failed init still being shut down (amd-smi's reference count would underflow).
+    #[test]
+    fn failed_init_is_not_shut_down() {
+        struct Failing(AtomicU32);
+        impl Session for Failing {
+            fn init(&self) -> AmdsmiStatus {
+                8
+            }
+            fn devices(&self) -> Result<Vec<DeviceInfo>, String> {
+                panic!("queried without a session")
+            }
+            fn shut_down(&self) -> AmdsmiStatus {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                AMDSMI_STATUS_SUCCESS
+            }
+        }
+        let failing = Failing(AtomicU32::new(0));
+        let err = run_session(&failing).expect_err("init failure is reported");
+        assert!(err.contains("amdsmi_init"), "{err}");
+        assert_eq!(failing.0.load(Ordering::SeqCst), 0);
     }
 }
