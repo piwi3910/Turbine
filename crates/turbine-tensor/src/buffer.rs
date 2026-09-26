@@ -113,6 +113,170 @@ pub trait DeviceMemory: Send + Sync {
     fn as_host(&self) -> Option<&HostMemory> {
         None
     }
+
+    /// Allocates `bytes` of host staging memory (page-locked on a GPU backend, kernel ABI v2.3)
+    /// for the asynchronous copies [`DeviceMemory::copy_h2d_staged`] and
+    /// [`DeviceMemory::copy_d2h_staged`]. `Unsupported` when the backend has none; callers then
+    /// use the synchronous `copy_h2d`/`copy_d2h`. Owned by exactly one [`HostStaging`].
+    fn staging_alloc(&self, bytes: usize) -> Result<StagingId, MemoryError> {
+        let _ = bytes;
+        Err(no_staging())
+    }
+
+    /// Releases a staging buffer once the staged copies still using it are done. Called only by
+    /// `HostStaging::drop`.
+    fn staging_free(&self, id: StagingId) {
+        let _ = id;
+    }
+
+    /// Writes `src` at `offset` of staging buffer `id`, first waiting for the staged copies that
+    /// use this buffer (and only those) to complete.
+    fn staging_write(&self, id: StagingId, offset: usize, src: &[u8]) -> Result<(), MemoryError> {
+        let _ = (id, offset, src);
+        Err(no_staging())
+    }
+
+    /// Reads `dst.len()` bytes at `offset` of staging buffer `id`, first waiting for the staged
+    /// copies that use this buffer (and only those) to complete.
+    fn staging_read(
+        &self,
+        id: StagingId,
+        offset: usize,
+        dst: &mut [u8],
+    ) -> Result<(), MemoryError> {
+        let _ = (id, offset, dst);
+        Err(no_staging())
+    }
+
+    /// Enqueues the copy of `bytes` bytes at `offset` of staging buffer `id` to `dst` on the
+    /// compute stream and returns at once: it waits neither for earlier work on the stream nor
+    /// for the copy.
+    fn copy_h2d_staged(
+        &self,
+        dst: DevicePtr,
+        id: StagingId,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
+        let _ = (dst, id, offset, bytes);
+        Err(no_staging())
+    }
+
+    /// Enqueues the copy of the `bytes` bytes at `src` to `offset` of staging buffer `id` on the
+    /// compute stream and returns at once; `staging_read` of that buffer waits for it.
+    fn copy_d2h_staged(
+        &self,
+        id: StagingId,
+        offset: usize,
+        src: DevicePtr,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
+        let _ = (id, offset, src, bytes);
+        Err(no_staging())
+    }
+}
+
+fn no_staging() -> MemoryError {
+    MemoryError::Unsupported("host staging needs kernel ABI v2.3".into())
+}
+
+/// A staging buffer of one backend ([`DeviceMemory::staging_alloc`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct StagingId(pub u64);
+
+/// Owns one host staging buffer (kernel ABI v2.3), freed on `Drop`: host bytes the device copies
+/// to and from asynchronously. Every host access first waits for the staged copies that use this
+/// buffer, so a copy is never overwritten or read before it completes, while copies of other
+/// buffers and the rest of the stream keep running. Holds an `Arc` of its memory, like
+/// `DeviceBuffer`, so the backend context outlives it.
+pub struct HostStaging {
+    id: StagingId,
+    len: usize,
+    mem: Arc<dyn DeviceMemory>,
+}
+
+impl fmt::Debug for HostStaging {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostStaging")
+            .field("id", &self.id)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostStaging {
+    /// `Unsupported` when `mem` has no staging (see [`DeviceMemory::staging_alloc`]).
+    pub fn alloc(mem: &Arc<dyn DeviceMemory>, bytes: usize) -> Result<HostStaging, MemoryError> {
+        let id = mem.staging_alloc(bytes)?;
+        Ok(HostStaging {
+            id,
+            len: bytes,
+            mem: Arc::clone(mem),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Writes `src` at `offset` once this buffer's staged copies are done.
+    pub fn write(&self, offset: usize, src: &[u8]) -> Result<(), MemoryError> {
+        self.check(offset, src.len())?;
+        self.mem.staging_write(self.id, offset, src)
+    }
+
+    /// Reads `dst.len()` bytes at `offset` once this buffer's staged copies are done.
+    pub fn read(&self, offset: usize, dst: &mut [u8]) -> Result<(), MemoryError> {
+        self.check(offset, dst.len())?;
+        self.mem.staging_read(self.id, offset, dst)
+    }
+
+    /// Enqueues the copy of `dst.len()` bytes at `offset` into `dst` (asynchronous).
+    pub fn upload(&self, offset: usize, dst: DeviceSlice<'_>) -> Result<(), MemoryError> {
+        self.check(offset, dst.len())?;
+        self.same_memory(dst.memory())?;
+        self.mem
+            .copy_h2d_staged(dst.ptr(), self.id, offset, dst.len())
+    }
+
+    /// Enqueues the copy of `src` into the bytes at `offset` (asynchronous).
+    pub fn download(&self, offset: usize, src: DeviceSlice<'_>) -> Result<(), MemoryError> {
+        self.check(offset, src.len())?;
+        self.same_memory(src.memory())?;
+        self.mem
+            .copy_d2h_staged(self.id, offset, src.ptr(), src.len())
+    }
+
+    fn check(&self, offset: usize, len: usize) -> Result<(), MemoryError> {
+        if in_bounds(offset, len, self.len) {
+            Ok(())
+        } else {
+            Err(MemoryError::InvalidArgument(format!(
+                "range {offset}+{len} outside staging buffer of {} bytes",
+                self.len
+            )))
+        }
+    }
+
+    fn same_memory(&self, other: &Arc<dyn DeviceMemory>) -> Result<(), MemoryError> {
+        if std::ptr::addr_eq(Arc::as_ptr(other), Arc::as_ptr(&self.mem)) {
+            Ok(())
+        } else {
+            Err(MemoryError::InvalidArgument(
+                "staged copy between different device memories".into(),
+            ))
+        }
+    }
+}
+
+impl Drop for HostStaging {
+    fn drop(&mut self) {
+        self.mem.staging_free(self.id);
+    }
 }
 
 /// Owns exactly one device allocation; freed on `Drop`. Holds an `Arc` of its memory

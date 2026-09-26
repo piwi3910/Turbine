@@ -1,11 +1,13 @@
 //! Host-memory backend: "device" allocations are plain heap buffers addressed by synthetic
-//! device pointers. Used by the CPU reference provider and by tests.
-use std::collections::BTreeMap;
+//! device pointers. Used by the CPU reference provider and by tests. Its staging buffers (the
+//! kernel ABI v2.3 surface) are heap buffers too, and a staged copy completes when it is issued,
+//! as every CPU op does.
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use turbine_core::types::DeviceId;
 
-use crate::buffer::{DeviceMemory, DevicePtr, MemInfo, MemoryError, StreamRef};
+use crate::buffer::{DeviceMemory, DevicePtr, MemInfo, MemoryError, StagingId, StreamRef};
 
 /// Synthetic addresses start above zero so `DevicePtr::NULL` is never a valid allocation.
 const BASE_ADDR: u64 = 0x1000_0000;
@@ -26,6 +28,8 @@ pub struct HostMemory {
     capacity: u64,
     state: Mutex<HostState>,
     blocks: RwLock<BTreeMap<u64, Block>>,
+    /// Staging buffers by id, and the next id.
+    staging: Mutex<(HashMap<u64, Vec<u8>>, u64)>,
     self_ref: Weak<HostMemory>,
 }
 
@@ -45,6 +49,7 @@ impl HostMemory {
                 used: 0,
             }),
             blocks: RwLock::new(BTreeMap::new()),
+            staging: Mutex::new((HashMap::new(), 1)),
             self_ref: weak.clone(),
         })
     }
@@ -76,6 +81,36 @@ impl HostMemory {
             .unwrap_or_else(|e| panic!("host memory: {e}"));
         let guard = block.read().expect("host block lock");
         f(&guard[off..off + len])
+    }
+
+    /// Runs `f` on staging buffer `id`'s bytes `[offset, offset + len)`.
+    fn with_staging<R>(
+        &self,
+        id: StagingId,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, MemoryError> {
+        let mut staging = self.staging.lock().expect("host staging lock");
+        let buf = staging.0.get_mut(&id.0).ok_or_else(|| {
+            MemoryError::InvalidArgument(format!("staging buffer {} is not allocated", id.0))
+        })?;
+        let size = buf.len();
+        let range = offset
+            .checked_add(len)
+            .filter(|&end| end <= size)
+            .map(|end| offset..end)
+            .ok_or_else(|| {
+                MemoryError::InvalidArgument(format!(
+                    "range {offset}+{len} outside staging buffer of {size} bytes"
+                ))
+            })?;
+        Ok(f(&mut buf[range]))
+    }
+
+    /// Staging buffers currently allocated (tests check that every one is freed).
+    pub fn live_staging(&self) -> usize {
+        self.staging.lock().expect("host staging lock").0.len()
     }
 
     /// Calls `f` with the `len` bytes at `p`, mutably. Panics when the range is not allocated.
@@ -171,12 +206,67 @@ impl DeviceMemory for HostMemory {
     fn as_host(&self) -> Option<&HostMemory> {
         Some(self)
     }
+
+    fn staging_alloc(&self, bytes: usize) -> Result<StagingId, MemoryError> {
+        let mut staging = self.staging.lock().expect("host staging lock");
+        let id = staging.1;
+        staging.1 += 1;
+        staging.0.insert(id, vec![0u8; bytes]);
+        Ok(StagingId(id))
+    }
+
+    fn staging_free(&self, id: StagingId) {
+        self.staging
+            .lock()
+            .expect("host staging lock")
+            .0
+            .remove(&id.0);
+    }
+
+    fn staging_write(&self, id: StagingId, offset: usize, src: &[u8]) -> Result<(), MemoryError> {
+        self.with_staging(id, offset, src.len(), |b| b.copy_from_slice(src))
+    }
+
+    fn staging_read(
+        &self,
+        id: StagingId,
+        offset: usize,
+        dst: &mut [u8],
+    ) -> Result<(), MemoryError> {
+        self.with_staging(id, offset, dst.len(), |b| dst.copy_from_slice(b))
+    }
+
+    fn copy_h2d_staged(
+        &self,
+        dst: DevicePtr,
+        id: StagingId,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
+        let (block, off) = self.find(dst, bytes)?;
+        self.with_staging(id, offset, bytes, |b| {
+            block.write().expect("host block lock")[off..off + bytes].copy_from_slice(b);
+        })
+    }
+
+    fn copy_d2h_staged(
+        &self,
+        id: StagingId,
+        offset: usize,
+        src: DevicePtr,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
+        let (block, off) = self.find(src, bytes)?;
+        self.with_staging(id, offset, bytes, |b| {
+            b.copy_from_slice(&block.read().expect("host block lock")[off..off + bytes]);
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::DeviceBuffer;
+    use crate::buffer::{DeviceBuffer, HostStaging};
 
     #[test]
     fn alloc_copy_free_round_trip() {
@@ -256,6 +346,41 @@ mod tests {
             dst.slice(1, 2).write_bytes(&[1, 1, 1]),
             Err(MemoryError::InvalidArgument(_))
         ));
+    }
+
+    /// Staged copies (kernel ABI v2.3 surface) round-trip through a staging buffer, stay inside
+    /// it and inside the device allocation, and the buffer is freed with its handle. Breaks if a
+    /// staged copy lands at the wrong offset or a range check is missing.
+    #[test]
+    fn staged_copies_round_trip() {
+        let host = HostMemory::new(DeviceId(0), 1 << 20);
+        let mem: Arc<dyn DeviceMemory> = host.clone();
+        let staging = HostStaging::alloc(&mem, 8).expect("staging");
+        let dev = DeviceBuffer::alloc(&mem, 6).expect("dev");
+        staging.write(2, &[1, 2, 3, 4]).expect("write");
+        staging.upload(2, dev.slice(1, 4)).expect("upload");
+        assert_eq!(dev.whole().read_bytes().expect("read"), [0, 1, 2, 3, 4, 0]);
+        staging.download(0, dev.slice(2, 3)).expect("download");
+        let mut out = [0u8; 8];
+        staging.read(0, &mut out).expect("read");
+        assert_eq!(out, [2, 3, 4, 2, 3, 4, 0, 0]);
+        assert!(matches!(
+            staging.write(6, &[1, 2, 3]),
+            Err(MemoryError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            staging.upload(6, dev.slice(0, 3)),
+            Err(MemoryError::InvalidArgument(_))
+        ));
+        let other: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(1), 1 << 10);
+        let foreign = DeviceBuffer::alloc(&other, 4).expect("foreign");
+        assert!(matches!(
+            staging.upload(0, foreign.whole()),
+            Err(MemoryError::InvalidArgument(_))
+        ));
+        assert_eq!(host.live_staging(), 1);
+        drop(staging);
+        assert_eq!(host.live_staging(), 0);
     }
 
     #[test]

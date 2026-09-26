@@ -27,7 +27,7 @@ use turbine_kernels::{
     shim_provider,
 };
 use turbine_tensor::host::HostMemory;
-use turbine_tensor::{DeviceMemory, Tensor, TensorView};
+use turbine_tensor::{DeviceMemory, HostStaging, Tensor, TensorView};
 
 // Llama-3.2-3B shapes.
 const HIDDEN: usize = 3072;
@@ -3380,4 +3380,90 @@ fn fused_projection_timings() {
             );
         }
     }
+}
+
+/// Kernel ABI v2.3 on the R9700: staged copies through page-locked memory round-trip exactly,
+/// and they do not wait for earlier work on the stream — with ≈ 100 ms of GEMMs queued, writing
+/// and uploading a second staging buffer and enqueueing a download behind the GEMMs take a
+/// fraction of that, while reading the download back waits for the GEMMs. Breaks if a staged copy
+/// synchronizes the stream (the engine could not overlap host work with the forward pass) or if
+/// a read does not wait for its copy.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn host_staging_does_not_wait_for_the_stream() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let staging = HostStaging::alloc(&p.hip_mem, 1 << 20)
+        .expect("libturbine_hip.so exports the v2.3 staging functions");
+    let dev = Tensor::empty(&p.hip_mem, &[1 << 18], DType::I32).expect("device buffer");
+    let pattern: Vec<u8> = (0..1u32 << 18)
+        .flat_map(|i| (i * 7 + 3).to_le_bytes())
+        .collect();
+    staging.write(0, &pattern).expect("write");
+    staging.upload(0, dev.storage.whole()).expect("upload");
+    assert_eq!(dev.view().slice.read_bytes().expect("read back"), pattern);
+
+    // Queue ≈ 100 ms of GEMMs, then time host work on a second staging buffer.
+    let (m, n, k) = (4096usize, 4096usize, 4096usize);
+    let gemm = p.hip.gemm().expect("hip gemm");
+    let a = zeros_on_hip(&p, &[m, k], DType::BF16);
+    let b = zeros_on_hip(&p, &[n, k], DType::BF16);
+    let c = zeros_on_hip(&p, &[m, n], DType::BF16);
+    let run = || {
+        gemm.execute(&mut GemmContext {
+            a: a.view(),
+            b: b.view(),
+            c: c.view(),
+            trans_b: true,
+            alpha: 1.0,
+            beta: 0.0,
+        })
+        .expect("gemm");
+    };
+    let one = time_us(&p, 3, run);
+    let queued = ((100_000.0 / one).ceil() as u32).clamp(4, 400);
+    let other = HostStaging::alloc(&p.hip_mem, 4096).expect("second staging");
+    let small = Tensor::empty(&p.hip_mem, &[1024], DType::I32).expect("small");
+    let started = std::time::Instant::now();
+    for _ in 0..queued {
+        run();
+    }
+    let enqueued = started.elapsed();
+    other.write(0, &[5u8; 4096]).expect("write while busy");
+    other
+        .upload(0, small.storage.whole())
+        .expect("upload while busy");
+    staging
+        .download(0, dev.storage.whole())
+        .expect("download behind the GEMMs");
+    let host_side = started.elapsed() - enqueued;
+    let mut back = vec![0u8; pattern.len()];
+    staging
+        .read(0, &mut back)
+        .expect("read waits for the download");
+    let total = started.elapsed();
+    println!(
+        "host staging: {queued} GEMMs of {one:.0} us queued in {enqueued:?}; the staged write \
+         and copies took {host_side:?}; the read returned after {total:?}"
+    );
+    assert_eq!(
+        back, pattern,
+        "the staged download reads the uploaded bytes"
+    );
+    assert!(
+        host_side.as_secs_f64() * 4.0 < total.as_secs_f64(),
+        "staged copies waited for the queued work: {host_side:?} of {total:?}"
+    );
+    let expected = f64::from(queued) * one * 1e-6;
+    assert!(
+        total.as_secs_f64() >= 0.5 * expected,
+        "the read did not wait for the queued GEMMs: {total:?} < half of {expected} s"
+    );
+    assert_eq!(
+        small.view().slice.read_bytes().expect("small"),
+        vec![5u8; 4096]
+    );
 }

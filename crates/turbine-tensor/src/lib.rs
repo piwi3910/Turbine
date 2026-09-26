@@ -7,7 +7,8 @@ pub mod kv_view;
 pub mod tensor;
 
 pub use buffer::{
-    DeviceBuffer, DeviceMemory, DevicePtr, DeviceSlice, MemInfo, MemoryError, StreamRef,
+    DeviceBuffer, DeviceMemory, DevicePtr, DeviceSlice, HostStaging, MemInfo, MemoryError,
+    StagingId, StreamRef,
 };
 pub use dtype::DType;
 pub use kv_view::KvPoolView;

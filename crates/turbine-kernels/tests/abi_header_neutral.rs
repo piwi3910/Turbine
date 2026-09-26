@@ -128,7 +128,7 @@ fn header_declares_the_v21_minor_revision() {
         "2u",
         "v2.1 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "2u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "3u");
     assert_eq!(define(&code, "TURBINE_OPTION_GEMM_AUTOTUNE"), "1");
     assert_eq!(define(&code, "TURBINE_OPTION_GEMM_TUNED_SHAPES"), "2");
     // Declarations compared with whitespace collapsed, so line wrapping does not matter.
@@ -151,6 +151,15 @@ fn header_declares_the_v21_minor_revision() {
         "int32_t turbine_graph_end(turbine_ctx *ctx, turbine_graph **out);",
         "int32_t turbine_graph_launch(turbine_ctx *ctx, turbine_graph *g);",
         "int32_t turbine_graph_destroy(turbine_ctx *ctx, turbine_graph *g);",
+        // v2.3
+        "typedef struct turbine_event turbine_event;",
+        "int32_t turbine_host_alloc_pinned(turbine_ctx *ctx, size_t bytes, void **out);",
+        "int32_t turbine_host_free_pinned(turbine_ctx *ctx, void *ptr);",
+        "int32_t turbine_event_create(turbine_ctx *ctx, turbine_event **out);",
+        "typedef struct turbine_stream turbine_stream;",
+        "int32_t turbine_event_record(turbine_ctx *ctx, turbine_event *e, turbine_stream *s);",
+        "int32_t turbine_event_synchronize(turbine_ctx *ctx, turbine_event *e);",
+        "int32_t turbine_event_destroy(turbine_ctx *ctx, turbine_event *e);",
     ] {
         assert!(
             flat.contains(decl),

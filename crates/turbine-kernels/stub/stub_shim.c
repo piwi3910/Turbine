@@ -6,11 +6,13 @@
  * it with the host C compiler once per variant:
  *   -DSTUB_ABI=<n>u  -DSTUB_BACKEND="<name>"  -DSTUB_ARCHS="<a,b>"
  *   [-DTURBINE_STUB_V21]
- * With TURBINE_STUB_V21 it also exports the optional ABI v2.1 symbols:
- * turbine_abi_minor (1), context options (TURBINE_OPTION_GEMM_AUTOTUNE kept
- * per context, TURBINE_OPTION_GEMM_TUNED_SHAPES always 0), the add_rmsnorm and
- * logits_reduce trios (unsupported like every op) and graphs that record
- * nothing; stub_live_graphs() counts graphs not yet destroyed.
+ * With TURBINE_STUB_V21 it also exports the optional ABI v2.1 and v2.3
+ * symbols: turbine_abi_minor (TURBINE_ABI_MINOR), context options
+ * (TURBINE_OPTION_GEMM_AUTOTUNE kept per context,
+ * TURBINE_OPTION_GEMM_TUNED_SHAPES always 0), the add_rmsnorm and
+ * logits_reduce trios (unsupported like every op), graphs that record
+ * nothing (stub_live_graphs() counts graphs not yet destroyed), and host
+ * staging memory and events (see the v2.3 section below).
  *
  * stub_live_contexts() is a test hook (not part of the ABI): the number of
  * contexts created and not yet destroyed, so tests can prove the Rust side
@@ -307,6 +309,89 @@ int32_t turbine_graph_destroy(turbine_ctx *ctx, turbine_graph *g) {
   }
   atomic_fetch_sub(&live_graphs, 1);
   free(g);
+  return TURBINE_OK;
+}
+
+/* v2.3: host staging memory is heap memory and events record nothing (the
+ * stream is always idle). stub_live_host_buffers() and stub_live_events()
+ * count what is not yet freed or destroyed; stub_event_syncs() counts
+ * turbine_event_synchronize calls. */
+struct turbine_event {
+  turbine_ctx *ctx;
+};
+
+static atomic_int live_host_buffers;
+static atomic_int live_events;
+static atomic_int event_syncs;
+
+int32_t stub_live_host_buffers(void) { return atomic_load(&live_host_buffers); }
+int32_t stub_live_events(void) { return atomic_load(&live_events); }
+int32_t stub_event_syncs(void) { return atomic_load(&event_syncs); }
+
+int32_t turbine_host_alloc_pinned(turbine_ctx *ctx, size_t bytes, void **out) {
+  if (out == NULL) {
+    set_error(ctx->last_error, "stub: null host pointer");
+    return TURBINE_E_ARGUMENT;
+  }
+  *out = malloc(bytes == 0 ? 1 : bytes);
+  if (*out == NULL) {
+    set_error(ctx->last_error, "stub: out of host memory");
+    return TURBINE_E_OUT_OF_MEMORY;
+  }
+  atomic_fetch_add(&live_host_buffers, 1);
+  return TURBINE_OK;
+}
+
+int32_t turbine_host_free_pinned(turbine_ctx *ctx, void *ptr) {
+  (void)ctx;
+  if (ptr != NULL) {
+    atomic_fetch_sub(&live_host_buffers, 1);
+    free(ptr);
+  }
+  return TURBINE_OK;
+}
+
+int32_t turbine_event_create(turbine_ctx *ctx, turbine_event **out) {
+  if (out == NULL) {
+    set_error(ctx->last_error, "stub: null event pointer");
+    return TURBINE_E_ARGUMENT;
+  }
+  turbine_event *e = calloc(1, sizeof *e);
+  if (e == NULL) {
+    set_error(ctx->last_error, "stub: out of host memory");
+    return TURBINE_E_OUT_OF_MEMORY;
+  }
+  e->ctx = ctx;
+  atomic_fetch_add(&live_events, 1);
+  *out = e;
+  return TURBINE_OK;
+}
+
+int32_t turbine_event_record(turbine_ctx *ctx, turbine_event *e,
+                             turbine_stream *s) {
+  if (e == NULL || e->ctx != ctx || s != NULL) {
+    set_error(ctx->last_error, "stub: event of another context");
+    return TURBINE_E_ARGUMENT;
+  }
+  return TURBINE_OK;
+}
+
+int32_t turbine_event_synchronize(turbine_ctx *ctx, turbine_event *e) {
+  if (e == NULL || e->ctx != ctx) {
+    set_error(ctx->last_error, "stub: event of another context");
+    return TURBINE_E_ARGUMENT;
+  }
+  atomic_fetch_add(&event_syncs, 1);
+  return TURBINE_OK;
+}
+
+int32_t turbine_event_destroy(turbine_ctx *ctx, turbine_event *e) {
+  if (e == NULL || e->ctx != ctx) {
+    set_error(ctx->last_error, "stub: event of another context");
+    return TURBINE_E_ARGUMENT;
+  }
+  atomic_fetch_sub(&live_events, 1);
+  free(e);
   return TURBINE_OK;
 }
 #endif /* TURBINE_STUB_V21 */

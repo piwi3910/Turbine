@@ -255,6 +255,18 @@ pub(crate) struct TurbineGraph {
     _private: [u8; 0],
 }
 
+/// Opaque `turbine_event` (v2.3); only ever handled by pointer.
+#[repr(C)]
+pub(crate) struct TurbineEvent {
+    _private: [u8; 0],
+}
+
+/// Opaque `turbine_stream` (v2.3: only null, the compute stream, is passed).
+#[repr(C)]
+pub(crate) struct TurbineStream {
+    _private: [u8; 0],
+}
+
 /// `turbine_add_rmsnorm_desc` (v2.1).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -332,8 +344,22 @@ pub(crate) struct GraphFns {
     pub destroy: unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineGraph) -> i32,
 }
 
-/// The optional ABI v2.1 functions. `minor` is `turbine_abi_minor()` (0 when the library lacks
-/// it); every group is `None` unless `minor` ≥ 1 and the library exports the whole group.
+/// `turbine_host_{alloc,free}_pinned` and `turbine_event_{create,record,synchronize,destroy}`
+/// (v2.3, the compute-stream subset of the v3 functions).
+#[derive(Clone, Copy)]
+pub(crate) struct StagingFns {
+    pub host_alloc: unsafe extern "C" fn(*mut TurbineCtx, usize, *mut *mut c_void) -> i32,
+    pub host_free: unsafe extern "C" fn(*mut TurbineCtx, *mut c_void) -> i32,
+    pub event_create: unsafe extern "C" fn(*mut TurbineCtx, *mut *mut TurbineEvent) -> i32,
+    pub event_record:
+        unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineEvent, *mut TurbineStream) -> i32,
+    pub event_synchronize: unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineEvent) -> i32,
+    pub event_destroy: unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineEvent) -> i32,
+}
+
+/// The optional ABI v2.1 and v2.3 functions. `minor` is `turbine_abi_minor()` (0 when the
+/// library lacks it); every v2.1 group is `None` unless `minor` ≥ 1, `staging` unless `minor`
+/// ≥ 2, and each only when the library exports the whole group.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct V21Symbols {
     pub minor: u32,
@@ -341,6 +367,8 @@ pub(crate) struct V21Symbols {
     pub add_rmsnorm: Option<OpTrio<AddRmsnormDesc>>,
     pub logits_reduce: Option<OpTrio<LogitsReduceDesc>>,
     pub graph: Option<GraphFns>,
+    /// v2.3 host staging memory and events.
+    pub staging: Option<StagingFns>,
 }
 
 impl V21Symbols {
@@ -372,12 +400,26 @@ impl V21Symbols {
                 destroy: optional(lib, "turbine_graph_destroy")?,
             })
         })();
+        let staging = (|| {
+            if minor < 3 {
+                return None;
+            }
+            Some(StagingFns {
+                host_alloc: optional(lib, "turbine_host_alloc_pinned")?,
+                host_free: optional(lib, "turbine_host_free_pinned")?,
+                event_create: optional(lib, "turbine_event_create")?,
+                event_record: optional(lib, "turbine_event_record")?,
+                event_synchronize: optional(lib, "turbine_event_synchronize")?,
+                event_destroy: optional(lib, "turbine_event_destroy")?,
+            })
+        })();
         V21Symbols {
             minor,
             options,
             add_rmsnorm: optional_trio(lib, "add_rmsnorm"),
             logits_reduce: optional_trio(lib, "logits_reduce"),
             graph,
+            staging,
         }
     }
 }

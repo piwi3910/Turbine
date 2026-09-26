@@ -1,4 +1,4 @@
-/* Turbine vendor-neutral kernel C ABI, version 2.2 (contract section 9).
+/* Turbine vendor-neutral kernel C ABI, version 2.3 (contract section 9).
  *
  * Every backend shim library implements this header and is loaded by
  * turbine-kernels at run time. No vendor type, identifier or name appears here,
@@ -17,7 +17,8 @@
  * turbine_stream_sync is the only blocking call (besides the capture
  * boundaries of the v2.1 graph functions). Host buffers passed to
  * turbine_memcpy_h2d / turbine_memcpy_d2h must stay valid until the next
- * turbine_stream_sync.
+ * turbine_stream_sync (for v2.3 pinned host memory: until an event recorded
+ * after the copy has completed).
  *
  * Versions. TURBINE_ABI_VERSION is the major version and must match exactly.
  * A minor revision only adds optional symbols or descriptor flag bits: a
@@ -385,8 +386,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * Every symbol below is optional: turbine-kernels resolves them only when
  * turbine_abi_minor() >= 1, and a library without them runs the ABI v2 paths
  * (add then rmsnorm, whole logits rows, eager launches). */
-/* v2.2 adds TURBINE_MOE_ROUTE_BF16_LOGITS (a flag bit, no new symbol). */
-#define TURBINE_ABI_MINOR 2u
+/* v2.2 adds TURBINE_MOE_ROUTE_BF16_LOGITS (a flag bit, no new symbol); v2.3
+ * adds pinned host memory and events (below). */
+#define TURBINE_ABI_MINOR 3u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -476,6 +478,35 @@ int32_t turbine_graph_begin(turbine_ctx *ctx);
 int32_t turbine_graph_end(turbine_ctx *ctx, turbine_graph **out);
 int32_t turbine_graph_launch(turbine_ctx *ctx, turbine_graph *g);
 int32_t turbine_graph_destroy(turbine_ctx *ctx, turbine_graph *g);
+
+/* ======== v2.3 (additive, optional): pinned host memory and events ========
+ * The compute-stream subset of the v3 (Phase 4) memory functions, with the v3
+ * names and signatures. Resolved only when turbine_abi_minor() >= 3 and all
+ * six symbols exist; a library without them keeps the ABI v2 copies, which
+ * turbine-kernels follows with turbine_stream_sync.
+ *
+ * turbine_host_alloc_pinned returns bytes of page-locked host memory (a host
+ * pointer, never NULL on success): turbine_memcpy_h2d / turbine_memcpy_d2h
+ * with it as the host side are enqueued on the compute stream and return
+ * without waiting for earlier work or for the copy. The caller keeps the bytes
+ * unchanged (h2d) or unread (d2h) until an event recorded after the copy has
+ * completed, and frees the memory with turbine_host_free_pinned only after
+ * that.
+ *
+ * An event marks a point of a stream: turbine_event_record captures the work
+ * enqueued on stream s so far (s NULL = the compute stream, the only stream
+ * before v3; re-recording moves the mark); turbine_event_synchronize blocks
+ * the calling thread until that work has completed, not later work; an event
+ * never recorded is complete. */
+typedef struct turbine_stream turbine_stream;
+typedef struct turbine_event turbine_event;
+int32_t turbine_host_alloc_pinned(turbine_ctx *ctx, size_t bytes, void **out);
+int32_t turbine_host_free_pinned(turbine_ctx *ctx, void *ptr);
+int32_t turbine_event_create(turbine_ctx *ctx, turbine_event **out);
+int32_t turbine_event_destroy(turbine_ctx *ctx, turbine_event *e);
+int32_t turbine_event_record(turbine_ctx *ctx, turbine_event *e,
+                             turbine_stream *s);
+int32_t turbine_event_synchronize(turbine_ctx *ctx, turbine_event *e);
 
 #ifdef __cplusplus
 }
