@@ -1,0 +1,77 @@
+[
+  {
+    "op": "embedding",
+    "config": "hidden=3072 vocab_rows=128256 dtype=bf16",
+    "implementation": "turbine_hip"
+  },
+  {
+    "op": "rmsnorm",
+    "config": "dim=3072 dtype=bf16",
+    "implementation": "ck_tile_rmsnorm2d"
+  },
+  {
+    "op": "gemm",
+    "config": "n=5120 k=3072 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
+    "implementation": "hipblaslt"
+  },
+  {
+    "op": "rope",
+    "config": "head_dim=128 rotary_dim=128 q_heads=24 kv_heads=8 dtype=bf16",
+    "implementation": "turbine_hip"
+  },
+  {
+    "op": "attention_prefill_paged",
+    "config": "head_dim=128 kv_heads=8 dtype=bf16 q_heads=24 causal=1 block_tokens=128",
+    "implementation": "ck_tile_fmha_pagedkv"
+  },
+  {
+    "op": "attention_decode_paged",
+    "config": "head_dim=128 kv_heads=8 dtype=bf16 q_heads=24 causal=1 block_tokens=128",
+    "implementation": "ck_tile_fmha_pagedkv"
+  },
+  {
+    "op": "gemm",
+    "config": "n=3072 k=3072 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
+    "implementation": "hipblaslt"
+  },
+  {
+    "op": "add",
+    "config": "dtype=bf16",
+    "implementation": "turbine_hip"
+  },
+  {
+    "op": "add_rmsnorm",
+    "config": "dim=3072 dtype=bf16",
+    "implementation": "ck_tile_rmsnorm2d"
+  },
+  {
+    "op": "gemm",
+    "config": "n=16384 k=3072 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
+    "implementation": "hipblaslt"
+  },
+  {
+    "op": "silu_mul",
+    "config": "cols=8192 dtype=bf16",
+    "implementation": "turbine_hip"
+  },
+  {
+    "op": "gemm",
+    "config": "n=3072 k=8192 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
+    "implementation": "hipblaslt"
+  },
+  {
+    "op": "gemm",
+    "config": "n=128256 k=3072 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
+    "implementation": "hipblaslt"
+  },
+  {
+    "op": "copy_blocks",
+    "config": "num_layers=28 block_bytes=524288",
+    "implementation": "hip_memcpy_d2d"
+  },
+  {
+    "op": "logits_reduce",
+    "config": "vocab=128256 top_n=64",
+    "implementation": "turbine_hip"
+  }
+]

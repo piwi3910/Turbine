@@ -1,0 +1,77 @@
+[
+  {
+    "op": "embedding",
+    "config": "hidden=2048 vocab_rows=50304 dtype=bf16",
+    "implementation": "turbine_hip"
+  },
+  {
+    "op": "rmsnorm",
+    "config": "dim=2048 dtype=bf16",
+    "implementation": "turbine_hip"
+  },
+  {
+    "op": "gemm",
+    "config": "n=6144 k=2048 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
+    "implementation": "hipblaslt"
+  },
+  {
+    "op": "rope",
+    "config": "head_dim=128 rotary_dim=128 q_heads=16 kv_heads=16 dtype=bf16",
+    "implementation": "turbine_hip"
+  },
+  {
+    "op": "attention_prefill_paged",
+    "config": "head_dim=128 kv_heads=16 dtype=bf16 q_heads=16 causal=1 block_tokens=128",
+    "implementation": "ck_tile_fmha_pagedkv"
+  },
+  {
+    "op": "attention_decode_paged",
+    "config": "head_dim=128 kv_heads=16 dtype=bf16 q_heads=16 causal=1 block_tokens=128",
+    "implementation": "ck_tile_fmha_pagedkv"
+  },
+  {
+    "op": "gemm",
+    "config": "n=2048 k=2048 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
+    "implementation": "hipblaslt"
+  },
+  {
+    "op": "add",
+    "config": "dtype=bf16",
+    "implementation": "turbine_hip"
+  },
+  {
+    "op": "add_rmsnorm",
+    "config": "dim=2048 dtype=bf16",
+    "implementation": "ck_tile_rmsnorm2d"
+  },
+  {
+    "op": "gemm",
+    "config": "n=64 k=2048 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
+    "implementation": "hipblaslt"
+  },
+  {
+    "op": "moe_route",
+    "config": "experts=64 top_k=8 renormalize=0 bf16_logits=1",
+    "implementation": "turbine_hip"
+  },
+  {
+    "op": "moe_experts",
+    "config": "hidden=2048 inter=1024 experts=64 top_k=8 local=0..64 dtype=bf16",
+    "implementation": "turbine_hip_moe_small_m"
+  },
+  {
+    "op": "gemm",
+    "config": "n=50304 k=2048 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
+    "implementation": "hipblaslt"
+  },
+  {
+    "op": "copy_blocks",
+    "config": "num_layers=16 block_bytes=1048576",
+    "implementation": "hip_memcpy_d2d"
+  },
+  {
+    "op": "logits_reduce",
+    "config": "vocab=50304 top_n=64",
+    "implementation": "turbine_hip"
+  }
+]

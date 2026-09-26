@@ -132,6 +132,7 @@ scripts/bench-lock.sh sh -c "
     --ignore-eos --output json > '$out/bench.json' 2> '$out/bench.err'
 " 2>/dev/null
 curl -s "$url/metrics" >"$out/metrics.txt"
+curl -s "$url/turbine/v1/status" >"$out/status.json"
 ssh -o BatchMode=yes "$host" "cp /tmp/lab-bench-server.log /tmp/lab-bench-server.last.log; pkill -u piwi -x turbine-server"
 
 # 4. summary
