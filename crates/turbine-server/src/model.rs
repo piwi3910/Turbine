@@ -333,10 +333,20 @@ pub fn prepare(
         .filter(|p| provider.order.contains(&p.id()))
         .cloned()
         .collect();
+    let mut requirements =
+        executor::available_requirements(&arch, block_tokens, executor_options, &ordered);
+    // Device-side logits reduction (P2c S-4) is optional: only when enabled and a provider
+    // implements it; otherwise the executor copies every row whole.
+    let reduce = executor::logits::reduce_requirement(&arch);
+    if config.execution.device_sampling
+        && ordered.iter().any(|p| reduce.spec.supported_by(p.as_ref()))
+    {
+        requirements.push(reduce);
+    }
     let registry = KernelRegistry::build(
         provider.providers.clone(),
         &provider.order,
-        &executor::available_requirements(&arch, block_tokens, executor_options, &ordered),
+        &requirements,
         &KernelMetrics::register(metrics),
     )
     .map_err(|e| kernel_error("kernel selection", e))?;
@@ -592,6 +602,7 @@ fn warm_up(
             q_len: 1,
             kv_len: 1,
             block_table: &blocks,
+            reduce: None,
         }];
         exec.forward(&BatchInput {
             tokens: &[token],

@@ -22,8 +22,8 @@ use turbine_kernels::{
 };
 use turbine_model::config::{Architecture, ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
-    self, BatchInput, ExecutorOptions, LlamaExecutor, Logits, ModelExecutor, OlmoeExecutor,
-    SeqSlice, SequenceKv, TraceTensor, build_executor,
+    self, BatchInput, ExecutorOptions, LlamaExecutor, Logits, LogitsSlot, ModelExecutor,
+    OlmoeExecutor, ReducedRow, RowReduce, SeqSlice, SequenceKv, TraceTensor, build_executor,
 };
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
@@ -573,6 +573,7 @@ fn forward_rejects_invalid_batches() {
         q_len,
         kv_len,
         block_table: &table,
+        reduce: None,
     };
     let mut run = |tokens: &[u32], positions: &[u32], seqs: &[SeqSlice<'_>]| {
         invalid(exec.forward(&BatchInput {
@@ -706,10 +707,15 @@ fn requirements_and_workspace() {
     // Per token: ids + positions (i32), x/h/proj [hidden], attn [q_dim], qkv [q_dim +
     // 2·kv_dim], gate_up [2·intermediate] and act [intermediate], all bf16.
     assert_eq!(per_token, 4 + 4 + 2 * (3 * 64 + 2 * 64 + 2 * 32 + 3 * 128));
-    // Per sequence: last row [hidden] bf16, logits [vocab] f32, q_indptr + kv_lens entries and
-    // a block table for max_position_embeddings tokens (i32).
+    // Per sequence: last row [hidden] bf16, logits [vocab] f32, the logits_reduce results (64
+    // ids and values, lse, sampled id and logit) and inputs (temperature, uniform, mode),
+    // q_indptr + kv_lens entries and a block table for max_position_embeddings tokens (i32).
     let blocks = u64::from(spec.config.max_position_embeddings.div_ceil(BLOCK_TOKENS));
-    assert_eq!(ws(1, 2) - ws(1, 1), 2 * 64 + 4 * 263 + 4 * (2 + blocks));
+    let reduce = 4 * (2 * 64 + 3) + 4 * 3;
+    assert_eq!(
+        ws(1, 2) - ws(1, 1),
+        2 * 64 + 4 * 263 + reduce + 4 * (2 + blocks)
+    );
     // Fixed: the extra q_indptr entry and inv_freq [head_dim / 2] f32.
     assert_eq!(ws(1, 1) - per_token - (ws(1, 2) - ws(1, 1)), 4 + 4 * 8);
 }
@@ -769,6 +775,7 @@ fn paged_llama_single_sequence() {
             q_len: tokens.len() as u32,
             kv_len: start + tokens.len() as u32,
             block_table: &table,
+            reduce: None,
         }];
         exec.forward(&BatchInput {
             tokens,
@@ -835,6 +842,7 @@ fn ragged_batch_rows_match_single_sequences() {
         q_len: 20,
         kv_len: 20,
         block_table: &ta,
+        reduce: None,
     }];
     let positions: Vec<u32> = (0..20).collect();
     exec.forward(&BatchInput {
@@ -853,6 +861,7 @@ fn ragged_batch_rows_match_single_sequences() {
             q_len: 1,
             kv_len: 21,
             block_table: &ta,
+            reduce: None,
         },
         SeqSlice {
             seq: SeqId(2),
@@ -860,6 +869,7 @@ fn ragged_batch_rows_match_single_sequences() {
             q_len: 17,
             kv_len: 17,
             block_table: &tb,
+            reduce: None,
         },
         SeqSlice {
             seq: SeqId(3),
@@ -867,6 +877,7 @@ fn ragged_batch_rows_match_single_sequences() {
             q_len: 3,
             kv_len: 3,
             block_table: &tc,
+            reduce: None,
         },
     ];
     let logits = exec
@@ -895,6 +906,7 @@ fn ragged_batch_rows_match_single_sequences() {
             q_len: 1,
             kv_len: 4,
             block_table: table,
+            reduce: None,
         }];
         exec.forward(&BatchInput {
             tokens: &[7],
@@ -930,17 +942,20 @@ fn cpu_model(
         max_batch_tokens,
         ExecutorOptions::default(),
         cpu_reference_provider(),
+        false,
     )
 }
 
 /// [`cpu_model`] run with `opts` on `provider` alone, whose registry is built from the
-/// requirements it can serve ([`executor::available_requirements`]).
+/// requirements it can serve ([`executor::available_requirements`]), plus the optional
+/// `logits_reduce` requirement when `reduce` is set.
 fn cpu_model_with(
     spec: &TinySpec,
     mem: &Arc<dyn DeviceMemory>,
     max_batch_tokens: u32,
     opts: ExecutorOptions,
     provider: Arc<dyn KernelProvider>,
+    reduce: bool,
 ) -> Box<dyn ModelExecutor> {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
@@ -952,8 +967,11 @@ fn cpu_model_with(
     let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load");
     let order = [provider.id()];
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
-    let reqs =
+    let mut reqs =
         executor::available_requirements(cfg, BLOCK_TOKENS, opts, std::slice::from_ref(&provider));
+    if reduce {
+        reqs.push(executor::logits::reduce_requirement(cfg));
+    }
     let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics)
         .expect("every op has a provider");
     build_executor(
@@ -992,6 +1010,7 @@ fn run_seq(
         q_len: tokens.len() as u32,
         kv_len: start + tokens.len() as u32,
         block_table: table,
+        reduce: None,
     }];
     let logits = exec
         .forward(&BatchInput {
@@ -1141,7 +1160,7 @@ fn fused_ops_match_unfused() {
                 fused_ops,
                 fused_projections,
             };
-            let mut exec = cpu_model_with(&spec, &mem, MAX_SEQ_LEN, opts, probe.clone());
+            let mut exec = cpu_model_with(&spec, &mem, MAX_SEQ_LEN, opts, probe.clone(), false);
             let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv");
             let mut tokens: Vec<u32> = (0..PROMPT as u32)
                 .map(|i| (i * 53 + 5) % spec.vocab)
@@ -1675,6 +1694,7 @@ fn olmoe_decode_single_device_copy() {
                     q_len: toks.len() as u32,
                     kv_len: start + toks.len() as u32,
                     block_table: &tables[*s],
+                    reduce: None,
                 });
                 tokens.extend_from_slice(toks);
                 positions.extend(*start..start + toks.len() as u32);
@@ -1839,6 +1859,7 @@ fn paged_matches_contiguous() {
                         q_len: q_lens[s],
                         kv_len: kv_lens[s],
                         block_table: &tables[s],
+                        reduce: None,
                     });
                     q_start += q_lens[s];
                 }
@@ -2059,4 +2080,167 @@ fn hip_trace_vs_cpu() {
             &local
         )
     );
+}
+
+/// The reduction `logits_reduce` defines for `row`: top-n by value (ties to the lower id),
+/// log-sum-exp and the id-order inverse-CDF draw, sums in f64 in id order.
+fn expected_reduction(row: &[f32], r: &RowReduce) -> ReducedRow {
+    let mut pairs: Vec<(u32, f32)> = row
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as u32, v))
+        .collect();
+    pairs.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    pairs.truncate(usize::from(r.top_n));
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f64 = row.iter().map(|&v| f64::from(v - max).exp()).sum();
+    let sampled = r.uniform.map(|u| {
+        let inv_t = 1.0 / r.temperature;
+        let smax = row
+            .iter()
+            .map(|&v| v * inv_t)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let w: Vec<f64> = row
+            .iter()
+            .map(|&v| f64::from(v * inv_t - smax).exp())
+            .collect();
+        let target = f64::from(u) * w.iter().sum::<f64>();
+        let mut cum = 0.0;
+        let id = w
+            .iter()
+            .position(|x| {
+                cum += x;
+                target < cum
+            })
+            .expect("a draw below the total");
+        (id as u32, row[id])
+    });
+    ReducedRow {
+        lse: max + sum.ln() as f32,
+        top: pairs,
+        sampled,
+    }
+}
+
+/// P2c S-4: on both tiny checkpoints, a batch mixing reduced and full rows (prefill chunks,
+/// then decodes, with the reduced sequences not contiguous) returns the full rows bitwise equal
+/// to the executor that copies every row, and each reduced row as the reduction of that row;
+/// an executor whose registry lacks `logits_reduce` ignores `reduce` and copies every row.
+#[test]
+fn device_reduced_rows_match_full_rows() {
+    const LENS: [u32; 3] = [5, 3, 4];
+    const POOL_BLOCKS: u32 = 8;
+    let tmp = TempDir::new("tiny-model-reduced-rows");
+    for spec in both_checkpoints(&tmp) {
+        let arch = spec.config.architecture;
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let mut plain = cpu_model_with(
+            &spec,
+            &mem,
+            16,
+            ExecutorOptions::default(),
+            cpu_reference_provider(),
+            false,
+        );
+        let mut reducing = cpu_model_with(
+            &spec,
+            &mem,
+            16,
+            ExecutorOptions::default(),
+            cpu_reference_provider(),
+            true,
+        );
+        assert!(
+            !plain.reduces_logits() && reducing.reduces_logits(),
+            "{arch:?}"
+        );
+        let layout = *plain.kv_layout();
+        let (a, b) = (
+            pool(&mem, &layout, POOL_BLOCKS),
+            pool(&mem, &layout, POOL_BLOCKS),
+        );
+        let (kv_a, kv_b) = (
+            pool_view(&a, &layout, POOL_BLOCKS),
+            pool_view(&b, &layout, POOL_BLOCKS),
+        );
+        let tables: Vec<Vec<BlockId>> = (0..3).map(|s| vec![BlockId(s)]).collect();
+        let greedy = |top_n| RowReduce {
+            top_n,
+            temperature: 0.0,
+            uniform: None,
+        };
+        let draw = RowReduce {
+            top_n: 3,
+            temperature: 0.8,
+            uniform: Some(0.37),
+        };
+        let steps: [(&[u32], [Option<RowReduce>; 3]); 3] = [
+            (&LENS, [Some(greedy(5)), None, Some(draw)]),
+            (&[1, 1, 1], [None, Some(greedy(1)), Some(draw)]),
+            (&[1, 1, 1], [Some(greedy(20)), None, None]),
+        ];
+        let mut kv_lens = [0u32; 3];
+        for (step, (q_lens, reduce)) in steps.iter().enumerate() {
+            let mut tokens = Vec::new();
+            let mut positions = Vec::new();
+            for s in 0..3 {
+                let start = kv_lens[s];
+                kv_lens[s] += q_lens[s];
+                for p in start..kv_lens[s] {
+                    tokens.push((p * 31 + 7 * s as u32 + 1) % spec.vocab);
+                    positions.push(p);
+                }
+            }
+            let run = |exec: &mut dyn ModelExecutor,
+                       kv: &KvPoolView<'_>,
+                       reduce: [Option<RowReduce>; 3]| {
+                let mut q_start = 0;
+                let seqs: Vec<SeqSlice<'_>> = (0..3)
+                    .map(|s| {
+                        let slice = SeqSlice {
+                            seq: SeqId(s as u64 + 1),
+                            q_start,
+                            q_len: q_lens[s],
+                            kv_len: kv_lens[s],
+                            block_table: &tables[s],
+                            reduce: reduce[s],
+                        };
+                        q_start += q_lens[s];
+                        slice
+                    })
+                    .collect();
+                exec.forward(&BatchInput {
+                    tokens: &tokens,
+                    positions: &positions,
+                    seqs: &seqs,
+                    kv,
+                })
+                .expect("forward")
+            };
+            // The plain executor ignores `reduce`.
+            let full = run(plain.as_mut(), &kv_a, *reduce);
+            assert_eq!((full.rows, full.slots()), (3, 3), "{arch:?}");
+            let mixed = run(reducing.as_mut(), &kv_b, *reduce);
+            assert_eq!(mixed.slots(), 3);
+            for (s, want_reduce) in reduce.iter().enumerate() {
+                match (mixed.slot(s), *want_reduce) {
+                    (LogitsSlot::Full(row), None) => {
+                        assert_eq!(row, full.row(s), "{arch:?} step {step} seq {s}");
+                    }
+                    (LogitsSlot::Reduced(got), Some(r)) => {
+                        let want = expected_reduction(full.row(s), &r);
+                        assert_eq!(got.top, want.top, "{arch:?} step {step} seq {s}");
+                        assert_eq!(got.sampled, want.sampled, "{arch:?} step {step} seq {s}");
+                        assert!(
+                            (got.lse - want.lse).abs() <= 1e-6 * want.lse.abs().max(1.0),
+                            "{arch:?} step {step} seq {s}: lse {} vs {}",
+                            got.lse,
+                            want.lse
+                        );
+                    }
+                    (slot, r) => panic!("{arch:?} step {step} seq {s}: {slot:?} for {r:?}"),
+                }
+            }
+        }
+    }
 }

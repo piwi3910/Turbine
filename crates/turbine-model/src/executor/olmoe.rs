@@ -50,6 +50,7 @@ use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
 use super::llama::{
     ACT, ADD_CFG, add_norm_cfg, attention_cfg, gemm_cfg, invalid, limits, rope_cfg, take_matrix,
 };
+use super::logits::{self, LogitsHead};
 use super::{BatchInput, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, Split, rope};
 use crate::ModelError;
 use crate::config::{Architecture, ModelArchConfig, MoeConfig};
@@ -201,7 +202,6 @@ struct Buffers {
     moe_workspace: DeviceBuffer,
     /// Final-norm output of each sequence's last row.
     last: Tensor,
-    logits: Tensor,
 }
 
 /// The OLMoE executor: ragged batches of up to `max_seqs` sequences and `max_batch_tokens`
@@ -225,6 +225,8 @@ pub struct OlmoeExecutor {
     final_norm: Tensor,
     lm_head: Tensor,
     bufs: Buffers,
+    /// The LM head output, its device reduction and the logits copy.
+    head: LogitsHead,
     meta: DeviceBatch,
     /// Host bytes of the last upload; valid until the next synchronization (contract §9.2).
     host: HostBatch,
@@ -326,7 +328,7 @@ impl OlmoeExecutor {
     /// `proj`, `zeros` (hidden), `attn` (heads · head_dim) and `qkv` (heads · head_dim +
     /// 2 · kv_heads · head_dim), the F32 router logits (experts) and top-k weights, the I32 top-k
     /// ids and sorted rows (top_k each) and the `moe_experts` workspace share; per sequence its
-    /// last normalised row (BF16), its F32 logits row, its `q_indptr` and `kv_lens` entries and a
+    /// last normalised row (BF16), its F32 logits row and reduction, its `q_indptr` and `kv_lens` entries and a
     /// block table for `max_position_embeddings` tokens (I32); plus one `q_indptr` entry, the
     /// I32 expert offsets, the F32 `inv_freq` and the workspace alignment slack. Zero for a
     /// config without experts.
@@ -345,11 +347,12 @@ impl OlmoeExecutor {
         let per_token = bf16 * (4 * d.hidden + 2 * d.q_dim + 2 * d.kv_dim) as u64
             + (F32 * (d.experts + d.top_k)) as u64
             + (I32 * 2 * d.top_k) as u64;
-        let per_seq = bf16 * d.hidden as u64 + (F32 * d.vocab) as u64;
+        let per_seq = bf16 * d.hidden as u64;
         let limits = limits(cfg, block_tokens, max_batch_tokens, max_seqs);
         t as u64 * per_token
             + d.moe_workspace_bytes(t)
             + u64::from(max_seqs) * per_seq
+            + LogitsHead::bytes(d.vocab, max_seqs as usize)
             + (I32 * (d.experts + 1)) as u64
             + (F32 * (d.head_dim / 2)) as u64
             + DeviceBatch::bytes(&limits)
@@ -453,8 +456,8 @@ impl OlmoeExecutor {
             expert_offsets: Tensor::empty(&mem, &[d.experts + 1], DType::I32)?,
             moe_workspace: DeviceBuffer::alloc(&mem, d.moe_workspace_bytes(t) as usize)?,
             last: Tensor::empty(&mem, &[n, d.hidden], ACT)?,
-            logits: Tensor::empty(&mem, &[n, d.vocab], DType::F32)?,
         };
+        let head = LogitsHead::new(cfg, &registry, &mem, n)?;
         let meta = DeviceBatch::alloc(&mem, &limits)?;
         Ok(OlmoeExecutor {
             cfg: cfg.clone(),
@@ -471,6 +474,7 @@ impl OlmoeExecutor {
             final_norm,
             lm_head,
             bufs,
+            head,
             meta,
             host: HostBatch::default(),
             timings: ForwardTimings::default(),
@@ -687,23 +691,18 @@ impl OlmoeExecutor {
         self.residual_add_norm(t, next_norm)
     }
 
-    /// Final RMSNorm of each sequence's last row into `last[0..n]`: one call per run of
-    /// consecutive last rows (a decode-only batch is one call).
-    fn final_norm_last_rows(&self, p: &Packed) -> Result<(), ModelError> {
+    /// Final RMSNorm of each sequence's last row into `last[0..n]`, destination row `p` holding
+    /// sequence `order[p]` (`LogitsHead::plan`): one call per run of consecutive rows (a
+    /// decode-only batch is one call).
+    fn final_norm_last_rows(&self, p: &Packed, order: &[usize]) -> Result<(), ModelError> {
         let b = &self.bufs;
         let x = Self::rows(&b.x, p.total_q);
-        let mut s = 0;
-        while s < p.num_seqs {
-            let mut len = 1;
-            while s + len < p.num_seqs && p.last_rows[s + len] == p.last_rows[s] + len {
-                len += 1;
-            }
+        for (src, dst, len) in logits::norm_runs(&p.last_rows, order) {
             self.rmsnorm(
-                x.rows(p.last_rows[s], len),
+                x.rows(src, len),
                 &self.final_norm,
-                b.last.view().rows(s, len),
+                b.last.view().rows(dst, len),
             )?;
-            s += len;
         }
         Ok(())
     }
@@ -741,32 +740,26 @@ impl ModelExecutor for OlmoeExecutor {
             self.attention(i, &p, batch.kv)?;
             self.moe_block(i, t)?;
         }
-        self.final_norm_last_rows(&p)?;
+        let order = self.head.plan(batch.seqs).to_vec();
+        self.final_norm_last_rows(&p, &order)?;
         self.linear(
             Self::rows(&b.last, n),
             self.lm_head.view(),
-            Self::rows(&b.logits, n),
+            self.head.rows(n),
         )?;
         let wait_started = Instant::now();
-        // The iteration's logits copy (it synchronizes the stream).
-        let raw = b
-            .logits
-            .storage
-            .slice(0, n * d.vocab * DType::F32.size_bytes())
-            .read_bytes()?;
-        let data: Vec<f32> = raw
-            .chunks_exact(F32)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        // The iteration's logits copy (it synchronizes the stream), after the device reduction
+        // of the rows that asked for one.
+        let logits = self.head.finish(&self.registry)?;
         self.timings = ForwardTimings {
             launch: wait_started - launch_started,
             device_wait: wait_started.elapsed(),
         };
-        Ok(Logits {
-            rows: n,
-            vocab: d.vocab,
-            data,
-        })
+        Ok(logits)
+    }
+
+    fn reduces_logits(&self) -> bool {
+        self.head.reduces()
     }
 
     fn last_timings(&self) -> ForwardTimings {

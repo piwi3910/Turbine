@@ -15,6 +15,7 @@ use crate::loader::LoadedWeights;
 
 pub mod batch;
 pub mod llama;
+pub mod logits;
 pub mod olmoe;
 pub mod rope;
 
@@ -236,6 +237,32 @@ pub struct SeqSlice<'a> {
     /// The pool blocks holding tokens `0..kv_len` in token order: token `p` lives in
     /// `block_table[p / block_tokens]` at slot `p % block_tokens`. May be longer than needed.
     pub block_table: &'a [BlockId],
+    /// Reduce this sequence's logits row on the device (`logits_reduce`, P2c S-4) instead of
+    /// copying it whole; ignored when the executor does not reduce
+    /// ([`ModelExecutor::reduces_logits`]).
+    pub reduce: Option<RowReduce>,
+}
+
+/// What the device reduction of one logits row computes (P2c S-4): the `top_n` largest raw
+/// logits with their ids and the row's log-sum-exp, and, when `uniform` is set, one
+/// categorical draw at `temperature` by inverse CDF in id order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowReduce {
+    /// Candidates to return, 1..=[`logits::MAX_TOP_N`].
+    pub top_n: u8,
+    pub temperature: f32,
+    /// The draw's uniform in `[0, 1)`; `None` = no draw on the device.
+    pub uniform: Option<f32>,
+}
+
+/// One logits row reduced on the device: its raw log-sum-exp, its `top_n` largest raw logits
+/// (descending, ties to the lower id, NaN last) and the categorical draw `(id, raw logit)` when
+/// one was asked for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReducedRow {
+    pub lse: f32,
+    pub top: Vec<(u32, f32)>,
+    pub sampled: Option<(u32, f32)>,
 }
 
 /// One forward step over a ragged batch: `tokens[i]` sits at absolute position `positions[i]`,
@@ -249,19 +276,108 @@ pub struct BatchInput<'a> {
     pub kv: &'a KvPoolView<'a>,
 }
 
-/// FP32 logits, `rows × vocab`, row-major: one row per sequence (its last position).
+/// The logits of one forward, one slot per sequence (its last position) in `seqs` order: a full
+/// FP32 row of `data` (`rows × vocab`, row-major, in sequence order) or, for a sequence whose
+/// row was reduced on the device, an entry of `reduced` (in sequence order).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Logits {
+    /// Full rows in `data`.
     pub rows: usize,
     pub vocab: usize,
     pub data: Vec<f32>,
+    pub reduced: Vec<ReducedRow>,
+    /// Per sequence: its full row (`Full(i)`: row `i` of `data`) or reduced row.
+    slots: Vec<SlotIndex>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotIndex {
+    Full(usize),
+    Reduced(usize),
+}
+
+/// One sequence's logits: its full row or its device reduction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LogitsSlot<'a> {
+    Full(&'a [f32]),
+    Reduced(&'a ReducedRow),
 }
 
 impl Logits {
-    /// Row `r`; panics when `r >= rows`.
+    /// `rows` full rows, one per sequence.
+    pub fn full(rows: usize, vocab: usize, data: Vec<f32>) -> Logits {
+        assert_eq!(data.len(), rows * vocab, "{rows} logits rows of {vocab}");
+        Logits {
+            rows,
+            vocab,
+            data,
+            reduced: Vec::new(),
+            slots: (0..rows).map(SlotIndex::Full).collect(),
+        }
+    }
+
+    /// Full rows `data` and `reduced` rows interleaved as `is_reduced` says, one flag per
+    /// sequence: the full rows belong to the sequences with `false` in order, the reduced rows
+    /// to those with `true`.
+    pub fn mixed(
+        vocab: usize,
+        data: Vec<f32>,
+        reduced: Vec<ReducedRow>,
+        is_reduced: impl IntoIterator<Item = bool>,
+    ) -> Logits {
+        let (mut full, mut red) = (0, 0);
+        let slots: Vec<SlotIndex> = is_reduced
+            .into_iter()
+            .map(|r| {
+                if r {
+                    red += 1;
+                    SlotIndex::Reduced(red - 1)
+                } else {
+                    full += 1;
+                    SlotIndex::Full(full - 1)
+                }
+            })
+            .collect();
+        assert_eq!(
+            data.len(),
+            full * vocab,
+            "{full} full logits rows of {vocab}"
+        );
+        assert_eq!(reduced.len(), red, "{red} reduced rows");
+        Logits {
+            rows: full,
+            vocab,
+            data,
+            reduced,
+            slots,
+        }
+    }
+
+    /// Full row `r` of `data`; panics when `r >= rows`.
     pub fn row(&self, r: usize) -> &[f32] {
         assert!(r < self.rows, "logits row {r} of {}", self.rows);
         &self.data[r * self.vocab..(r + 1) * self.vocab]
+    }
+
+    /// Sequences covered (full plus reduced rows).
+    pub fn slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Sequence `i`'s logits; panics when `i >= slots()`.
+    pub fn slot(&self, i: usize) -> LogitsSlot<'_> {
+        match self.slots[i] {
+            SlotIndex::Full(r) => LogitsSlot::Full(self.row(r)),
+            SlotIndex::Reduced(r) => LogitsSlot::Reduced(&self.reduced[r]),
+        }
+    }
+
+    /// The row of `data` holding sequence `i`'s full logits; `None` when it was reduced.
+    pub fn full_row_index(&self, i: usize) -> Option<usize> {
+        match self.slots[i] {
+            SlotIndex::Full(r) => Some(r),
+            SlotIndex::Reduced(_) => None,
+        }
     }
 }
 
@@ -282,12 +398,18 @@ pub trait ModelExecutor: Send {
     /// The KV layout the executor reads and writes; the pool of every batch must match it.
     fn kv_layout(&self) -> &KvLayout;
     /// Runs one step: appends every sequence's new K/V into its pool blocks and returns one
-    /// FP32 logits row per sequence (its last position), in `seqs` order, with one
+    /// logits slot per sequence (its last position), in `seqs` order — the full FP32 row, or
+    /// its device reduction when the slice asks for one and the executor reduces — with one
     /// device-to-host copy.
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError>;
     /// Timings of the last successful `forward`; zeros when the executor does not measure.
     fn last_timings(&self) -> ForwardTimings {
         ForwardTimings::default()
+    }
+    /// True when `forward` honours [`SeqSlice::reduce`] (a `logits_reduce` provider was
+    /// selected at startup); otherwise every sequence gets its full row.
+    fn reduces_logits(&self) -> bool {
+        false
     }
     /// Copies block `src[i]` to `dst[i]` in every layer of `kv` (the `n > 1` fork), ordered
     /// before the next forward on the same stream.

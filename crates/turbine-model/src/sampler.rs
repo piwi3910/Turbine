@@ -11,6 +11,8 @@ use rand_core::{RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
 use turbine_core::request::SamplingParams;
 
+use crate::executor::logits::MAX_TOP_N;
+use crate::executor::{ReducedRow, RowReduce};
 use crate::structured::TokenMask;
 
 /// One sampled token and, when the request asked for logprobs, its log-probability under the
@@ -73,7 +75,21 @@ pub struct Sampler {
     originals: HashMap<u32, f32>,
     /// Buffers reused across steps, so a step allocates nothing vocabulary-sized.
     scratch: Scratch,
+    /// The step [`Sampler::device_request`] handed to the device, until
+    /// [`Sampler::finish_reduced`] completes it.
+    pending: Option<Pending>,
 }
+
+/// A sampling step whose row is reduced on the device: the uniform drawn for it and the stream
+/// position before that draw (restored when the row turns out to need no draw).
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    uniform: f32,
+    word_pos: u128,
+}
+
+/// Most `top_logprobs` a device-reduced step serves (P2c S-4).
+pub const DEVICE_MAX_TOP_LOGPROBS: usize = 20;
 
 /// Vocabulary-sized buffers of one sampler, kept between steps.
 #[derive(Clone, Debug, Default)]
@@ -319,6 +335,7 @@ impl Sampler {
             exact: params.seed.is_some(),
             originals: HashMap::new(),
             scratch: Scratch::default(),
+            pending: None,
         }
     }
 
@@ -343,6 +360,7 @@ impl Sampler {
     /// reported logprobs (only when requested) are the log-softmax of `logits` as passed in
     /// (before temperature).
     pub fn sample(&mut self, logits: &mut [f32], mask: Option<&TokenMask>) -> SampledToken {
+        self.pending = None;
         let lse = self.logprobs.then(|| log_sum_exp(logits));
         let top_logprobs = match lse {
             Some(lse) if self.top_logprobs > 0 => {
@@ -371,6 +389,107 @@ impl Sampler {
                 .get(&token)
                 .copied()
                 .unwrap_or(logits[token as usize]);
+            raw - lse
+        });
+        SampledToken {
+            token,
+            logprob,
+            top_logprobs,
+        }
+    }
+
+    /// Whether this step's row can be reduced on the device (P2c S-4), and how. `None` when the
+    /// step needs the whole row: a `logit_bias`, a penalty, `min_tokens` not yet reached, more
+    /// than [`DEVICE_MAX_TOP_LOGPROBS`] alternatives or, when it samples (temperature > 0),
+    /// `top_p` < 1 or `top_k` above [`MAX_TOP_N`] (greedy ignores both, so it is eligible
+    /// whatever they are). The caller also keeps the whole row for a step with a token mask. When
+    /// the step samples, its uniform is drawn here, exactly where [`Sampler::sample`] would
+    /// draw it; a categorical draw over the whole vocabulary (no `top_k`) happens on the
+    /// device, a `top_k` draw in [`Sampler::finish_reduced`] over the returned candidates.
+    pub fn device_request(&mut self) -> Option<RowReduce> {
+        self.pending = None;
+        let eligible = self.logit_bias.is_empty()
+            && self.presence_penalty == 0.0
+            && self.frequency_penalty == 0.0
+            && self.repetition_penalty == 1.0
+            && self.generated.len() as u64 >= u64::from(self.min_tokens)
+            && self.top_logprobs <= DEVICE_MAX_TOP_LOGPROBS;
+        let greedy = self.temperature <= 0.0;
+        if !eligible || !greedy && (self.top_p < 1.0 || self.top_k.is_some_and(|k| k > MAX_TOP_N)) {
+            return None;
+        }
+        if greedy {
+            return Some(RowReduce {
+                top_n: self.top_logprobs.max(1) as u8,
+                temperature: 0.0,
+                uniform: None,
+            });
+        }
+        let word_pos = self.rng.get_word_pos();
+        let u = uniform(&mut self.rng);
+        self.pending = Some(Pending {
+            uniform: u,
+            word_pos,
+        });
+        Some(RowReduce {
+            top_n: self.top_k.unwrap_or(1).max(self.top_logprobs).max(1) as u8,
+            temperature: self.temperature,
+            uniform: self.top_k.is_none().then_some(u),
+        })
+    }
+
+    /// Completes the step [`Sampler::device_request`] asked the device for, from its
+    /// reduction: greedy takes the best candidate; `top_k` draws over the candidates in the
+    /// seeded draw's arithmetic; a whole-vocabulary draw takes the device's sample. Logprobs are
+    /// the raw logits less the row's log-sum-exp, as [`Sampler::sample`] reports them. A row
+    /// without a finite (scaled) maximum gives the argmax and, like the host path, consumes no
+    /// uniform.
+    pub fn finish_reduced(&mut self, r: &ReducedRow) -> SampledToken {
+        let pending = self.pending.take();
+        let first = r.top.first().copied();
+        // `argmax` of the row: the best candidate unless nothing exceeds −∞.
+        let argmax = match first {
+            Some((id, v)) if v > f32::NEG_INFINITY => id,
+            _ => 0,
+        };
+        let token = if self.temperature <= 0.0 {
+            argmax
+        } else {
+            let inv_t = 1.0 / self.temperature;
+            let finite = first.is_some_and(|(_, v)| (v * inv_t).is_finite());
+            if !finite {
+                if let Some(p) = pending {
+                    self.rng.set_word_pos(p.word_pos);
+                }
+                argmax
+            } else {
+                let u = match pending {
+                    Some(p) => p.uniform,
+                    None => uniform(&mut self.rng),
+                };
+                match self.top_k {
+                    Some(k) => draw_candidates(&r.top[..k.min(r.top.len())], inv_t, u),
+                    None => r.sampled.map_or(argmax, |(id, _)| id),
+                }
+            }
+        };
+        let lse = self.logprobs.then_some(r.lse);
+        let top_logprobs = match lse {
+            Some(lse) if self.top_logprobs > 0 => r
+                .top
+                .iter()
+                .take(self.top_logprobs)
+                .map(|&(id, v)| (id, v - lse))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let logprob = lse.map(|lse| {
+            let raw = r
+                .top
+                .iter()
+                .chain(r.sampled.iter())
+                .find(|c| c.0 == token)
+                .map_or(f32::NEG_INFINITY, |c| c.1);
             raw - lse
         });
         SampledToken {
@@ -624,6 +743,26 @@ impl Sampler {
         // Rounding left u at the total: the last id with weight.
         fast.iter().rposition(|&w| w > 0.0).unwrap_or(0) as u32
     }
+}
+
+/// The seeded `top_k` draw ([`Sampler::draw_exact`] with `top_p` 1) over `candidates`
+/// (descending, ties by id) at `1/T` = `inv_t` with the uniform `u`.
+fn draw_candidates(candidates: &[(u32, f32)], inv_t: f32, u: f32) -> u32 {
+    let scaled = || candidates.iter().map(|c| c.1 * inv_t);
+    let Some(max) = finite_max(scaled()) else {
+        return candidates.first().map_or(0, |c| c.0);
+    };
+    let weights: Vec<f64> = scaled().map(|c| weight(c, max)).collect();
+    let total: f64 = weights.iter().sum();
+    let u = f64::from(u) * total;
+    let mut cum = 0.0;
+    for (i, w) in weights.iter().enumerate() {
+        cum += w;
+        if u < cum {
+            return candidates[i].0;
+        }
+    }
+    candidates[weights.iter().rposition(|&w| w > 0.0).unwrap_or(0)].0
 }
 
 /// Length and mass of the smallest prefix of `weights` (in candidate order) whose mass
@@ -1260,6 +1399,158 @@ mod tests {
     }
 
     /// Llama-3-sized rows: a broad bulk and a few confident candidates, deterministic.
+    /// The device reduction of `row` for `rr`, as `logits_reduce` defines it: the top-n in
+    /// sampler order, the log-sum-exp, and the id-order inverse-CDF draw in f64.
+    fn reduce_row(row: &[f32], rr: &RowReduce) -> ReducedRow {
+        let mut keys = Vec::new();
+        let mut top = Vec::new();
+        top_n_into(row, usize::from(rr.top_n), &mut keys, &mut top);
+        let sampled = rr.uniform.map(|u| {
+            let inv_t = 1.0 / rr.temperature;
+            let max = finite_max(row.iter().map(|&v| v * inv_t)).expect("finite row");
+            let w: Vec<f64> = row.iter().map(|&v| weight(v * inv_t, max)).collect();
+            let target = f64::from(u) * w.iter().sum::<f64>();
+            let mut cum = 0.0;
+            let id = w
+                .iter()
+                .position(|x| {
+                    cum += x;
+                    target < cum
+                })
+                .unwrap_or_else(|| w.iter().rposition(|&x| x > 0.0).unwrap());
+            (id as u32, row[id])
+        });
+        ReducedRow {
+            lse: log_sum_exp(row),
+            top,
+            sampled,
+        }
+    }
+
+    /// A 300-entry row with ties, a NaN and a −∞.
+    fn device_row(rng: &mut ChaCha8Rng) -> Vec<f32> {
+        let mut row: Vec<f32> = (0..300)
+            .map(|_| ((uniform(rng) * 16.0).floor() - 8.0) * 0.5)
+            .collect();
+        row[(uniform(rng) * 300.0) as usize] = f32::NAN;
+        row[(uniform(rng) * 300.0) as usize] = f32::NEG_INFINITY;
+        row
+    }
+
+    /// P2c S-4: for every eligible seeded configuration, finishing a step from its device
+    /// reduction gives the token, logprob and alternatives the host sampler gives on the whole
+    /// row, and leaves the ChaCha stream where the host sampler leaves it.
+    #[test]
+    fn device_steps_match_host_steps() {
+        let mut rows = ChaCha8Rng::seed_from_u64(99);
+        let mut configs = 0;
+        for temperature in [0.0, 0.7, 1.0] {
+            for top_k in [-1, 1, 5, 40, 64] {
+                for logprobs in [None, Some(0), Some(3), Some(20)] {
+                    let p = SamplingParams {
+                        logprobs,
+                        ..params(temperature, 1.0, top_k, 5 + configs)
+                    };
+                    configs += 1;
+                    let (mut host, mut device) = (plain(&p), plain(&p));
+                    for step in 0..6 {
+                        let row = device_row(&mut rows);
+                        let want = host.sample(&mut row.clone(), None);
+                        let rr = device.device_request().expect("eligible");
+                        assert_eq!(rr.uniform.is_some(), temperature > 0.0 && top_k == -1);
+                        let got = device.finish_reduced(&reduce_row(&row, &rr));
+                        assert_eq!(got, want, "{p:?} step {step}");
+                        assert_eq!(device.state(), host.state(), "{p:?} step {step}");
+                        host.observe(want.token);
+                        device.observe(got.token);
+                    }
+                }
+            }
+        }
+        // A row without a finite maximum draws nothing, on either path.
+        let p = params(1.0, 1.0, 40, 3);
+        let (mut host, mut device) = (plain(&p), plain(&p));
+        let dead = vec![f32::NEG_INFINITY; 300];
+        let want = host.sample(&mut dead.clone(), None);
+        let rr = device.device_request().expect("eligible");
+        assert_eq!(device.finish_reduced(&reduce_row(&dead, &rr)), want);
+        assert_eq!(device.state(), host.state());
+    }
+
+    /// Steps that need the whole row are not reduced on the device, and `min_tokens` keeps a
+    /// request on the host only until it is reached.
+    #[test]
+    fn device_request_eligibility() {
+        let base = params(1.0, 1.0, -1, 1);
+        let ineligible = [
+            SamplingParams {
+                top_p: 0.9,
+                ..base.clone()
+            },
+            params(1.0, 1.0, 65, 1),
+            SamplingParams {
+                logprobs: Some(21),
+                ..base.clone()
+            },
+            SamplingParams {
+                logit_bias: vec![(3, 1.0)],
+                ..base.clone()
+            },
+            SamplingParams {
+                presence_penalty: 0.5,
+                ..base.clone()
+            },
+            SamplingParams {
+                frequency_penalty: 0.5,
+                ..base.clone()
+            },
+            SamplingParams {
+                repetition_penalty: 1.1,
+                ..base.clone()
+            },
+        ];
+        for p in &ineligible {
+            let mut s = plain(p);
+            let before = s.state();
+            assert_eq!(s.device_request(), None, "{p:?}");
+            assert_eq!(s.state(), before, "an ineligible step draws nothing");
+        }
+        let mut s = Sampler::new(
+            &SamplingParams {
+                min_tokens: 2,
+                ..base.clone()
+            },
+            &[],
+            &[7],
+        );
+        assert_eq!(s.device_request(), None);
+        s.observe(1);
+        assert_eq!(s.device_request(), None);
+        s.observe(2);
+        assert_eq!(
+            s.device_request().map(|r| (r.top_n, r.temperature)),
+            Some((1, 1.0))
+        );
+        let mut g = plain(&SamplingParams {
+            logprobs: Some(7),
+            ..params(0.0, 0.9, 400, 1)
+        });
+        assert_eq!(
+            g.device_request(),
+            Some(RowReduce {
+                top_n: 7,
+                temperature: 0.0,
+                uniform: None
+            })
+        );
+        let mut k = plain(&SamplingParams {
+            logprobs: Some(3),
+            ..params(0.8, 1.0, 40, 1)
+        });
+        let r = k.device_request().expect("eligible");
+        assert_eq!((r.top_n, r.uniform), (40, None));
+    }
+
     fn big_rows(n: usize, seed: u64) -> Vec<Vec<f32>> {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         (0..n)

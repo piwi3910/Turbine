@@ -361,11 +361,7 @@ mod tests {
             }
             let mut data = vec![-10.0f32; TINY_VOCAB as usize];
             data[self.script[step] as usize] = 10.0;
-            Ok(Logits {
-                rows: 1,
-                vocab: TINY_VOCAB as usize,
-                data,
-            })
+            Ok(Logits::full(1, TINY_VOCAB as usize, data))
         }
         fn copy_blocks(
             &mut self,

@@ -536,6 +536,7 @@ impl SequenceKv {
             q_len: t as u32,
             kv_len,
             block_table: &self.table,
+            reduce: None,
         }];
         let logits = exec.forward(&BatchInput {
             tokens,
@@ -620,6 +621,7 @@ mod tests {
                 q_len: 1,
                 kv_len: 10,
                 block_table: &a,
+                reduce: None,
             },
             SeqSlice {
                 seq: SeqId(11),
@@ -627,6 +629,7 @@ mod tests {
                 q_len: 5,
                 kv_len: 5,
                 block_table: &b,
+                reduce: None,
             },
         ];
         let batch = BatchInput {
@@ -678,6 +681,7 @@ mod tests {
             q_len,
             kv_len,
             block_table,
+            reduce: None,
         };
         let mut host = HostBatch::default();
         let mut pack = |tokens: &[u32], positions: &[u32], seqs: &[SeqSlice<'_>]| {

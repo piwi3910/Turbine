@@ -62,6 +62,11 @@ pub struct TokenLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct LogitsPathLabels {
+    pub path: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct StageLabels {
     pub stage: &'static str,
 }
@@ -88,6 +93,9 @@ pub struct ServerMetrics {
     pub stream_paused: Counter,
     /// `turbine_engine_iteration_seconds{stage}`: one engine iteration's time per stage.
     pub engine_iteration: Family<StageLabels, Histogram, fn() -> Histogram>,
+    /// `turbine_logits_rows_total{path}`: logits rows reduced on the device
+    /// (`device_reduced`) or copied whole to the host (`full_row`).
+    pub logits_rows: Family<LogitsPathLabels, Counter>,
 }
 
 impl ServerMetrics {
@@ -131,6 +139,22 @@ impl ServerMetrics {
                     stage_histogram,
                 ),
             ),
+            logits_rows: reg.register(
+                "turbine_logits_rows",
+                "Logits rows by path: reduced on the device or copied whole",
+                Family::default(),
+            ),
+        }
+    }
+
+    /// Counts one forward's logits rows: `reduced` reduced on the device, `full` copied whole.
+    pub fn logits_rows(&self, reduced: usize, full: usize) {
+        for (path, n) in [("device_reduced", reduced), ("full_row", full)] {
+            if n > 0 {
+                self.logits_rows
+                    .get_or_create(&LogitsPathLabels { path })
+                    .inc_by(n as u64);
+            }
         }
     }
 
@@ -182,8 +206,12 @@ mod tests {
         let mut stages = IterationStages::default();
         stages.0[Stage::Launch as usize] = std::time::Duration::from_micros(70);
         m.observe_stages(&stages);
+        m.logits_rows(3, 0);
+        m.logits_rows(1, 2);
         let text = reg.render().expect("render");
         for line in [
+            r#"turbine_logits_rows_total{path="device_reduced"} 4"#,
+            r#"turbine_logits_rows_total{path="full_row"} 2"#,
             r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 1"#,
             r#"turbine_requests_total{endpoint="/v1/chat/completions",outcome="cancelled"} 1"#,
             r#"turbine_tokens_total{kind="prompt"} 7"#,

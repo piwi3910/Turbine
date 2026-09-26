@@ -73,23 +73,25 @@ fn spawn(config: &Path) -> Child {
 /// Config for the cpu backend on `model_dir` with a 16 MiB KV pool (512 tiny-model blocks of
 /// 128 tokens, 32 KiB each); `extra` is appended verbatim and must not repeat the `kv` key.
 fn config_yaml(model_dir: &Path, addr: SocketAddr, extra: &str) -> String {
-    config_yaml_with(model_dir, addr, "", "", "16MiB", extra)
+    config_yaml_with(model_dir, addr, "", "", "", "16MiB", extra)
 }
 
-/// [`config_yaml`] with more `model` keys (`model_extra`) and `server` keys (`server_extra`),
-/// each verbatim with lines indented by two spaces, and a `kv.gpu.max_bytes` of `kv_bytes`.
+/// [`config_yaml`] with more `model`, `server` and `execution` keys (`model_extra`,
+/// `server_extra`, `execution_extra`), each verbatim with lines indented by two spaces, and a
+/// `kv.gpu.max_bytes` of `kv_bytes`.
 fn config_yaml_with(
     model_dir: &Path,
     addr: SocketAddr,
     model_extra: &str,
     server_extra: &str,
+    execution_extra: &str,
     kv_bytes: &str,
     extra: &str,
 ) -> String {
     format!(
         "model:\n  path: {}\n{model_extra}server:\n  listen: {addr}\n{server_extra}execution:\n  \
-         backend: cpu\nreliability:\n  emergency_vram_reserve: 1MiB\nkv:\n  gpu:\n    \
-         max_bytes: {kv_bytes}\n{extra}",
+         backend: cpu\n{execution_extra}reliability:\n  emergency_vram_reserve: 1MiB\nkv:\n  \
+         gpu:\n    max_bytes: {kv_bytes}\n{extra}",
         model_dir.display()
     )
 }
@@ -100,6 +102,8 @@ struct Setup<'a> {
     model_extra: &'a str,
     /// Extra `server` keys, e.g. `"  request_timeout: 1s\n"`.
     server_extra: &'a str,
+    /// Extra `execution` keys, e.g. `"  device_sampling: false\n"`.
+    execution_extra: &'a str,
     /// `kv.gpu.max_bytes`.
     kv_bytes: &'a str,
     /// Appended to the config.
@@ -117,6 +121,7 @@ impl Default for Setup<'_> {
         Setup {
             model_extra: "",
             server_extra: "",
+            execution_extra: "",
             kv_bytes: "16MiB",
             extra: "",
             max_positions: None,
@@ -199,6 +204,7 @@ impl TinyServer {
             addr,
             setup.model_extra,
             setup.server_extra,
+            setup.execution_extra,
             setup.kv_bytes,
             setup.extra,
         );
@@ -2339,5 +2345,117 @@ fn iteration_stage_breakdown() {
     assert!(
         (sum - duration).abs() <= (0.05 * duration).max(0.5),
         "stages sum to {sum} ms, the iteration took {duration} ms: {doc}"
+    );
+}
+
+/// One request of [`device_sampling_matches_host`]: its body and how many of its yielding rows
+/// qualify for the device reduction.
+struct DeviceCase {
+    body: Value,
+    eligible_rows: u64,
+}
+
+/// P2c S-4/S-14: seeded requests give identical tokens and logprobs whether their rows are
+/// reduced on the device (`logits_reduce` of the CPU provider) or copied whole to the host
+/// sampler, and `turbine_logits_rows_total{path="device_reduced"}` counts exactly the eligible
+/// rows: none of a request with `logit_bias`, a JSON schema or (sampling) the checkpoint's
+/// `top_p` 0.9 default, those of a `min_tokens` 4 request from its fifth token on; greedy rows
+/// qualify whatever `top_p` is.
+#[test]
+fn device_sampling_matches_host() {
+    const TOKENS: u64 = 8;
+    let case = |extra: Value, eligible_rows: u64| {
+        let mut body = json!({"prompt": "Hello", "max_tokens": TOKENS, "ignore_eos": true,
+                              "return_tokens_as_token_ids": true});
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        DeviceCase {
+            body,
+            eligible_rows,
+        }
+    };
+    let cases = [
+        case(json!({"temperature": 0.0, "logprobs": 0}), TOKENS),
+        case(json!({"temperature": 0.0, "prompt": "Hi there"}), TOKENS),
+        case(json!({"temperature": 0.0, "min_tokens": 4}), TOKENS - 4),
+        case(json!({"temperature": 0.0, "logprobs": 5}), TOKENS),
+        case(
+            json!({"temperature": 0.0, "logprobs": 5, "prompt": "Bye"}),
+            TOKENS,
+        ),
+        case(
+            json!({"temperature": 0.0, "logprobs": 5, "prompt": "Yes"}),
+            TOKENS,
+        ),
+        case(
+            json!({"temperature": 1.0, "top_p": 1.0, "top_k": -1, "seed": 7, "logprobs": 2}),
+            TOKENS,
+        ),
+        case(
+            json!({"temperature": 1.0, "top_p": 1.0, "top_k": -1, "seed": 8}),
+            TOKENS,
+        ),
+        case(
+            json!({"temperature": 1.0, "top_p": 1.0, "top_k": 40, "seed": 9, "logprobs": 3}),
+            TOKENS,
+        ),
+        case(
+            json!({"temperature": 1.0, "top_p": 1.0, "top_k": 40, "seed": 10}),
+            TOKENS,
+        ),
+        case(json!({"temperature": 1.0, "seed": 13, "logprobs": 2}), 0),
+        case(
+            json!({"temperature": 1.0, "top_p": 1.0, "seed": 11, "logit_bias": {"120": 2}, "logprobs": 1}),
+            0,
+        ),
+        case(
+            json!({"temperature": 1.0, "top_p": 1.0, "seed": 12, "max_tokens": 40, "ignore_eos": false,
+                   "response_format": {"type": "json_schema",
+                       "json_schema": {"name": "small", "schema": small_schema()}},
+                   "logit_bias": {"9": -100, "10": -100, "13": -100, "32": -100}}),
+            0,
+        ),
+    ];
+    let run = |device: bool| -> (Vec<Value>, String) {
+        let execution_extra = format!("  device_sampling: {device}\n");
+        let server = TinyServer::launch(&Setup {
+            execution_extra: &execution_extra,
+            ..Setup::default()
+        });
+        let outputs = cases
+            .iter()
+            .map(|c| {
+                let mut body = c.body.clone();
+                body["model"] = json!(server.model);
+                let resp = server.post("/v1/completions", &body);
+                assert_eq!(resp.status, 200, "{body}: {}", resp.body);
+                let choice = resp.json()["choices"][0].clone();
+                json!({"text": choice["text"], "logprobs": choice["logprobs"],
+                       "finish_reason": choice["finish_reason"]})
+            })
+            .collect();
+        (outputs, server.metrics())
+    };
+    let (device, device_metrics) = run(true);
+    let (host, host_metrics) = run(false);
+    for (i, (d, h)) in device.iter().zip(&host).enumerate() {
+        assert_eq!(d, h, "request {i}: {}", cases[i].body);
+    }
+    let reduced = |m: &str| sample(m, r#"turbine_logits_rows_total{path="device_reduced"}"#);
+    let expected: u64 = cases.iter().map(|c| c.eligible_rows).sum();
+    assert_eq!(
+        reduced(&device_metrics),
+        Some(expected as f64),
+        "{device_metrics}"
+    );
+    assert_eq!(reduced(&host_metrics), None, "{host_metrics}");
+    assert!(
+        sample(
+            &host_metrics,
+            r#"turbine_logits_rows_total{path="full_row"}"#
+        )
+        .is_some_and(|n| n > 0.0),
+        "{host_metrics}"
     );
 }

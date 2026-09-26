@@ -43,6 +43,7 @@ use turbine_kernels::{
 use turbine_tensor::{DeviceMemory, KvPoolView, Tensor, TensorView};
 
 use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
+use super::logits::{self, LogitsHead};
 use super::{BatchInput, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, Split, rope};
 use crate::ModelError;
 use crate::config::ModelArchConfig;
@@ -248,7 +249,6 @@ struct Buffers {
     act: Tensor,
     /// Final-norm output of each sequence's last row.
     last: Tensor,
-    logits: Tensor,
 }
 
 /// The Llama executor: ragged batches of up to `max_seqs` sequences and `max_batch_tokens`
@@ -273,6 +273,8 @@ pub struct LlamaExecutor {
     /// `None` when the model ties its LM head to `embed`.
     lm_head: Option<Tensor>,
     bufs: Buffers,
+    /// The LM head output, its device reduction and the logits copy.
+    head: LogitsHead,
     meta: DeviceBatch,
     /// Host bytes of the last upload; they stay valid until the next synchronization, which the
     /// logits read performs (contract §9.2).
@@ -367,9 +369,10 @@ impl LlamaExecutor {
     /// Device bytes of the executor's buffers (the budget's workspace term): per token the
     /// I32 id and position and the BF16 rows of `x`, `h`, `proj` (hidden), `q`, `attn`
     /// (heads · head_dim), `k`, `v` (kv_heads · head_dim) and `gate`, `up`, `act`
-    /// (intermediate); per sequence its last normalised row (BF16), its F32 logits row, its
-    /// `q_indptr` and `kv_lens` entries and a block table for `max_position_embeddings` tokens
-    /// (I32); plus one `q_indptr` entry and the F32 `inv_freq`.
+    /// (intermediate); per sequence its last normalised row (BF16), its F32 logits row and
+    /// reduction ([`LogitsHead::bytes`]), its `q_indptr` and `kv_lens` entries and a block
+    /// table for `max_position_embeddings` tokens (I32); plus one `q_indptr` entry and the F32
+    /// `inv_freq`.
     pub fn workspace_bytes(
         cfg: &ModelArchConfig,
         block_tokens: u32,
@@ -380,10 +383,11 @@ impl LlamaExecutor {
         let bf16 = ACT.size_bytes() as u64;
         let f32 = DType::F32.size_bytes() as u64;
         let per_token = bf16 * (3 * d.hidden + 2 * d.q_dim + 2 * d.kv_dim + 3 * d.inter) as u64;
-        let per_seq = bf16 * d.hidden as u64 + f32 * d.vocab as u64;
+        let per_seq = bf16 * d.hidden as u64;
         let limits = limits(cfg, block_tokens, max_batch_tokens, max_seqs);
         u64::from(max_batch_tokens) * per_token
             + u64::from(max_seqs) * per_seq
+            + LogitsHead::bytes(d.vocab, max_seqs as usize)
             + f32 * (d.head_dim / 2) as u64
             + DeviceBatch::bytes(&limits)
     }
@@ -468,8 +472,8 @@ impl LlamaExecutor {
             gate_up: act(gate_up.width())?,
             act: act(d.inter)?,
             last: Tensor::empty(&mem, &[n, d.hidden], ACT)?,
-            logits: Tensor::empty(&mem, &[n, d.vocab], DType::F32)?,
         };
+        let head = LogitsHead::new(cfg, &registry, &mem, n)?;
         let meta = DeviceBatch::alloc(&mem, &limits)?;
         Ok(LlamaExecutor {
             cfg: cfg.clone(),
@@ -486,6 +490,7 @@ impl LlamaExecutor {
             final_norm,
             lm_head,
             bufs,
+            head,
             meta,
             host: HostBatch::default(),
             timings: ForwardTimings::default(),
@@ -723,23 +728,18 @@ impl LlamaExecutor {
         self.record(li, "resid_mlp", Self::rows(&b.x, t))
     }
 
-    /// Final RMSNorm of each sequence's last row into `last[0..n]`: one call per run of
-    /// consecutive last rows (a decode-only batch is one call).
-    fn final_norm_last_rows(&self, p: &Packed) -> Result<(), ModelError> {
+    /// Final RMSNorm of each sequence's last row into `last[0..n]`, destination row `p` holding
+    /// sequence `order[p]` ([`LogitsHead::plan`]): one call per run of consecutive rows (a
+    /// decode-only batch is one call).
+    fn final_norm_last_rows(&self, p: &Packed, order: &[usize]) -> Result<(), ModelError> {
         let b = &self.bufs;
         let x = Self::rows(&b.x, p.total_q);
-        let mut s = 0;
-        while s < p.num_seqs {
-            let mut len = 1;
-            while s + len < p.num_seqs && p.last_rows[s + len] == p.last_rows[s] + len {
-                len += 1;
-            }
+        for (src, dst, len) in logits::norm_runs(&p.last_rows, order) {
             self.rmsnorm(
-                x.rows(p.last_rows[s], len),
+                x.rows(src, len),
                 &self.final_norm,
-                b.last.view().rows(s, len),
+                b.last.view().rows(dst, len),
             )?;
-            s += len;
         }
         Ok(())
     }
@@ -777,35 +777,25 @@ impl ModelExecutor for LlamaExecutor {
         for i in 0..self.layers.len() {
             self.layer(i, &p, batch.kv)?;
         }
-        self.final_norm_last_rows(&p)?;
+        let order = self.head.plan(batch.seqs).to_vec();
+        self.final_norm_last_rows(&p, &order)?;
         self.record(None, "final_norm", Self::rows(&b.last, n))?;
         let head = self.lm_head.as_ref().unwrap_or(&self.embed);
-        self.linear(
-            Self::rows(&b.last, n),
-            head.view(),
-            Self::rows(&b.logits, n),
-        )?;
-        self.record(None, "logits", Self::rows(&b.logits, n))?;
+        self.linear(Self::rows(&b.last, n), head.view(), self.head.rows(n))?;
+        self.record(None, "logits", self.head.rows(n))?;
         let wait_started = Instant::now();
-        // The iteration's one device-to-host copy (it synchronizes the stream).
-        let raw = b
-            .logits
-            .storage
-            .slice(0, n * d.vocab * DType::F32.size_bytes())
-            .read_bytes()?;
-        let data: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        // The iteration's one device-to-host copy (it synchronizes the stream), after the
+        // device reduction of the rows that asked for one.
+        let logits = self.head.finish(&self.registry)?;
         self.timings = ForwardTimings {
             launch: wait_started - launch_started,
             device_wait: wait_started.elapsed(),
         };
-        Ok(Logits {
-            rows: n,
-            vocab: d.vocab,
-            data,
-        })
+        Ok(logits)
+    }
+
+    fn reduces_logits(&self) -> bool {
+        self.head.reduces()
     }
 
     fn last_timings(&self) -> ForwardTimings {

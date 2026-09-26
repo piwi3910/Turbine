@@ -34,11 +34,11 @@ use turbine_core::clock::Clock;
 use turbine_core::request::{ErrorCode, FinishReason, GenerationEvent};
 use turbine_core::types::{RequestId, SeqId};
 use turbine_kv::{BlockPool, KvDocument};
-use turbine_model::executor::{BatchInput, Logits, ModelExecutor, SeqSlice};
+use turbine_model::executor::{BatchInput, Logits, LogitsSlot, ModelExecutor, RowReduce, SeqSlice};
 use turbine_model::{ForwardPhase, SampleJob, SampledToken, Tokenizer, sample_rows};
 use turbine_scheduler::{
-    BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome, IterationPlan,
-    SchedRequest, Scheduler, SubmitError,
+    BatchItem, BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome,
+    IterationPlan, SchedRequest, Scheduler, SubmitError,
 };
 
 use super::deadlines::{Deadlines, Timeouts};
@@ -501,6 +501,7 @@ impl EngineLoop {
         let mut tokens = Vec::with_capacity(total);
         let mut positions = Vec::with_capacity(total);
         let mut slices = Vec::with_capacity(plan.items.len());
+        let reduces = self.exec.reduces_logits();
         for item in &plan.items {
             let kv_len = item.block_table.tokens;
             let (start, len) = match item.kind {
@@ -511,6 +512,11 @@ impl EngineLoop {
                 .seqs
                 .get(&item.seq)
                 .ok_or_else(|| format!("sequence {} has no request", item.seq.0))?;
+            let reduce = if reduces {
+                self.device_reduce(item, id, choice)
+            } else {
+                None
+            };
             let r = self
                 .requests
                 .get(&id)
@@ -528,6 +534,7 @@ impl EngineLoop {
                 q_len: len,
                 kv_len,
                 block_table: &item.block_table.blocks,
+                reduce,
             });
         }
         let phase = if plan.prefill_tokens() > 0 {
@@ -553,14 +560,49 @@ impl EngineLoop {
             .model
             .observe_forward(phase, started.elapsed().as_secs_f64());
         let logits = result.map_err(|e| format!("{} forward pass failed: {e}", phase.as_str()))?;
-        if logits.rows != slices.len() {
+        if logits.slots() != slices.len() {
             return Err(format!(
-                "forward returned {} logits rows for {} sequences",
-                logits.rows,
+                "forward returned logits for {} of {} sequences",
+                logits.slots(),
                 slices.len()
             ));
         }
+        self.metrics
+            .server
+            .logits_rows(logits.reduced.len(), logits.rows);
         Ok(logits)
+    }
+
+    /// The device reduction item `item` (choice `choice` of request `id`) asks for (P2c S-4):
+    /// only a row that yields a token for an unconstrained live choice whose sampler is
+    /// eligible, and not the shared prefill row that forks further choices (each fork samples
+    /// its own copy of the whole row).
+    fn device_reduce(
+        &mut self,
+        item: &BatchItem,
+        id: RequestId,
+        choice: usize,
+    ) -> Option<RowReduce> {
+        let yields = match item.kind {
+            BatchKind::Decode => true,
+            BatchKind::Prefill { start, len } => {
+                self.sched.prefill_target(item.seq) == Some(start + len)
+            }
+        };
+        let r = self.requests.get_mut(&id)?;
+        if !yields || r.done {
+            return None;
+        }
+        if choice == 0
+            && matches!(item.kind, BatchKind::Prefill { .. })
+            && !r.forking_choices().is_empty()
+        {
+            return None;
+        }
+        r.choices
+            .get_mut(choice)?
+            .unconstrained_sampler()?
+            .device_request()
     }
 
     /// Samples every item whose step yields a token and emits its events. The completed shared
@@ -593,7 +635,11 @@ impl EngineLoop {
             } else {
                 Vec::new()
             };
-            let row_logits = &mut logits.data[row * vocab..(row + 1) * vocab];
+            let row_logits = match logits.full_row_index(row) {
+                Some(i) => &mut logits.data[i * vocab..(i + 1) * vocab],
+                // A reduced row: its token was drawn from the reduction.
+                None => &mut [][..],
+            };
             let shared = (!forks.is_empty()).then(|| row_logits.to_vec());
             let token = drawn[row].take();
             if !self.sample_choice(id, choice, row_logits, token, outcome) {
@@ -619,16 +665,39 @@ impl EngineLoop {
         logits: &mut Logits,
     ) -> Vec<Option<SampledToken>> {
         let mut drawn: Vec<Option<SampledToken>> = vec![None; plan.items.len()];
+        // Reduced rows (decode or the last prefill chunk) finish from their reduction.
+        for (row, item) in plan.items.iter().enumerate() {
+            let LogitsSlot::Reduced(reduced) = logits.slot(row) else {
+                continue;
+            };
+            let Some(&(id, choice)) = self.seqs.get(&item.seq) else {
+                continue;
+            };
+            if let Some(sampler) = self
+                .requests
+                .get_mut(&id)
+                .filter(|r| !r.done)
+                .and_then(|r| r.choices.get_mut(choice))
+                .and_then(|c| c.unconstrained_sampler())
+            {
+                drawn[row] = Some(sampler.finish_reduced(reduced));
+            }
+        }
         let decode_rows: HashMap<SeqId, usize> = plan
             .items
             .iter()
             .enumerate()
-            .filter(|(_, item)| matches!(item.kind, BatchKind::Decode))
+            .filter(|&(row, item)| {
+                matches!(item.kind, BatchKind::Decode) && logits.full_row_index(row).is_some()
+            })
             .map(|(row, item)| (item.seq, row))
             .collect();
         if decode_rows.is_empty() {
             return drawn;
         }
+        let full_index: Vec<Option<usize>> = (0..logits.slots())
+            .map(|row| logits.full_row_index(row))
+            .collect();
         let mut rows: Vec<Option<&mut [f32]>> = logits
             .data
             .chunks_exact_mut(logits.vocab)
@@ -642,7 +711,9 @@ impl EngineLoop {
                     continue;
                 };
                 if let Some(sampler) = c.unconstrained_sampler()
-                    && let Some(row_logits) = rows.get_mut(row).and_then(Option::take)
+                    && let Some(row_logits) = full_index[row]
+                        .and_then(|i| rows.get_mut(i))
+                        .and_then(Option::take)
                 {
                     job_rows.push(row);
                     jobs.push(SampleJob {
