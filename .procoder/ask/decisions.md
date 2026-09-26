@@ -311,3 +311,11 @@
 ## Performance phase between Phase 2 and Phase 3
 
 **Answer (2026-09-26, user):** after Phase 2 is complete and before Phase 3, a performance-optimization phase runs. Turbine does not need to beat vLLM, but must reach at least 75% of vLLM-ROCm's performance on the same hardware. Recorded vLLM-ROCm reference (rocm/vllm rocm7.14.1 RDNA image, vLLM 0.23.0, one R9700, `turbine-bench --concurrency 16 --requests 200 --prompt-words 512 --max-tokens 256 --ignore-eos`): Llama-3.2-3B-Instruct 738 output tok/s (ITL p50 17 ms, TTFT p50 338 ms); OLMoE-1B-7B-0125-Instruct 535 output tok/s (ITL p50 27 ms, TTFT p50 201 ms). Targets: ≥ 553 and ≥ 401 output tok/s, golden correctness unchanged. Turbine Phase 2 engine at first measurement: Llama 92 tok/s (decode forward ~47 ms at batch 16, ~115 ms host overhead per iteration).
+
+## Phase 2c: lab approval, GEMM autotune default, GPU sampling
+
+- Standing approval for Phase 2c novanas lab Jobs, same rules as Phases 1–2 (recommended) / ask each time
+- `execution.gemm_autotune` on by default (recommended) / off by default
+- GPU sampling (`execution.device_sampling`) on by default (recommended) / host sampling only
+
+**Answers (2026-09-26):** standing approval for Phase 2c novanas lab Jobs (builds, GPU tests, serve Jobs, Turbine and vLLM benchmark runs; stop and ask if another workload holds `amd.com/gpu`; always stop serve Jobs); GEMM autotune on by default (outputs may differ across restarts at BF16 noise level, within golden tolerance; `false` restores restart-stable output); GPU sampling on by default (seeded sampling reproducible run to run, may differ from host sampling at rare probability boundaries; greedy/golden unaffected).
