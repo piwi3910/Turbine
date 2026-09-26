@@ -133,7 +133,7 @@ Covers: S-9 AC; S-1 AC `-p turbine-scheduler registry_conformance`; S-13 schedul
 - [x] Implement the policy module, the keyed queue, the scheduler's use of the policy (stage order of `plan()` unchanged: drop cancelled → decode → forks → continuing prefills → admit) and `scheduler.policy` in the engine via `policy::registry().select(name, "scheduler.policy")`.
 - [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS, including `default_policy_plan_digests_match_main`
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 2 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 2 row to `.procoder/perf-log.md`
 - [x] Commit: `refactor(scheduler): scheduling policy registry with the default policy`
 
 Build notes (Task 2, as built):
@@ -169,7 +169,7 @@ Covers: S-8 AC; S-1 AC (`registry_conformance::logits_processors`); S-13 logits-
 - [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS, including `tiny_server device_sampling_matches_host`
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
 - [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model -- hip_reduced_rows_match_full_rows hip_launch_ahead_feeds_match_serial` — expect exit 0
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 3 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 3 row to `.procoder/perf-log.md`
 - [x] Commit: `refactor(model): logits processors as an ordered registry chain`
 
 Build notes (Task 3, as built):
@@ -207,7 +207,7 @@ Covers: S-7 AC; S-1 AC (`-p turbine-kernels registry_conformance`); spec Diagnos
 - [x] Run: `git grep -nE 'ExecutionBackend::(Cpu|Hip)|Vendor::Amd|hipError' crates/turbine-server crates/turbine-model crates/turbine-scheduler crates/turbine-kv crates/turbine-core -- ':!crates/turbine-core/src/types.rs'` — expect no output
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
 - [ ] Lab: `scripts/lab-test.sh novanas --gpus 2 -- -p turbine-device` then `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops` and `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden` — expect exit 0 each
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 4 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 4 row to `.procoder/perf-log.md`
 - [x] Commit: `refactor(kernels): execution backends and device discovery as registries`
 
 Build notes (Task 4, as built):
@@ -238,7 +238,7 @@ Covers: S-10 AC; S-1 AC (`registry_conformance::weight_formats`).
 - [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS (config refusal tests `config::tests` unchanged)
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
 - [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden` — expect exit 0
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 5 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 5 row to `.procoder/perf-log.md`
 - [x] Commit: `refactor(model): bf16 weight-format module`
 
 Build notes (Task 5, as built):
@@ -271,7 +271,7 @@ Covers: S-2 AC; S-1 AC (`registry_conformance::families`).
 - [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS (`tiny_model`, `tiny_server`, `server_cli`, `config::tests` unchanged in their assertions)
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
 - [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model --test golden` — expect exit 0
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 6 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 6 row to `.procoder/perf-log.md`
 - [x] Commit: `refactor(model): model family registry`
 
 Build notes (Task 6, as built):
@@ -304,7 +304,7 @@ Covers: S-6 AC (profile, CMake); S-1 AC (`registry_conformance::card_profiles`);
 - [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
 - [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops` — expect exit 0 (the Job's CMake build with the default `GPU_TARGETS` from `card_profiles.cmake`)
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row, and the server log line `event="module_selected" point="card_profile" name="gfx1201"`; append the Task 7 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row, and the server log line `event="module_selected" point="card_profile" name="gfx1201"`; append the Task 7 row to `.procoder/perf-log.md`
 - [x] Commit: `feat(kernels): declarative card profiles, gfx1201 first`
 
 Build notes (Task 7, as built):
@@ -366,7 +366,7 @@ Covers: S-4 AC (`llama3_json`); S-1 AC (`registry_conformance::tool_formats`); s
 - [x] Run: `scripts/remote-cargo.sh test --workspace --no-fail-fast` — expect PASS including `tiny_server tool_choice_modes` and the `engine::requests` tool tests
 - [x] Gate: `cargo fmt --all --check && scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings`
 - [x] Lab: `scripts/lab-test.sh novanas -- -p turbine-server --test lab_openai` — expect exit 0 (`tools_and_json_schema` starts its own `turbine-server` on the Job's GPU; no serve Job is needed)
-- [ ] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 9 row to `.procoder/perf-log.md`
+- [x] Lab: `scripts/lab-bench.sh --gpu 0 --model llama` then `scripts/lab-bench.sh --gpu 0 --model olmoe` — expect exit 0, golden c1 and c16 PASS, tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; append the Task 9 row to `.procoder/perf-log.md`
 - [x] Commit: `refactor(model): tool-call format registry with llama3_json`
 
 Build notes (Task 9, as built):
