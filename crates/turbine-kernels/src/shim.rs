@@ -493,19 +493,22 @@ impl ShimProvider {
         self.ctx.check(code)
     }
 
-    /// The contiguous entry point for `kind` (`Prefill`/`Decode`).
-    fn attention_trio(&self, kind: AttentionKind) -> &OpTrio<AttentionDesc> {
+    /// The contiguous entry point for `kind`; `None` for the paged kinds. The match lists every
+    /// kind so a new one cannot silently fall into another kind's entry point.
+    fn attention_trio(&self, kind: AttentionKind) -> Option<&OpTrio<AttentionDesc>> {
         match kind {
-            AttentionKind::Decode => &self.syms().attention_decode,
-            _ => &self.syms().attention_prefill,
+            AttentionKind::Prefill => Some(&self.syms().attention_prefill),
+            AttentionKind::Decode => Some(&self.syms().attention_decode),
+            AttentionKind::PrefillPaged | AttentionKind::DecodePaged => None,
         }
     }
 
-    /// The paged entry point for `kind` (`PrefillPaged`/`DecodePaged`).
-    fn paged_trio(&self, kind: AttentionKind) -> &OpTrio<AttentionPagedDesc> {
+    /// The paged entry point for `kind`; `None` for the contiguous kinds.
+    fn paged_trio(&self, kind: AttentionKind) -> Option<&OpTrio<AttentionPagedDesc>> {
         match kind {
-            AttentionKind::DecodePaged => &self.syms().attention_decode_paged,
-            _ => &self.syms().attention_prefill_paged,
+            AttentionKind::PrefillPaged => Some(&self.syms().attention_prefill_paged),
+            AttentionKind::DecodePaged => Some(&self.syms().attention_decode_paged),
+            AttentionKind::Prefill | AttentionKind::Decode => None,
         }
     }
 }
@@ -750,30 +753,32 @@ impl GemmKernel for ShimProvider {
 
 impl AttentionKernel for ShimProvider {
     fn supports(&self, cfg: &AttentionConfig) -> bool {
-        if cfg.kind.is_paged() {
-            cfg.block_tokens.is_some_and(|b| b > 0)
-                && Self::supported(self.paged_trio(cfg.kind), &paged_probe(cfg))
+        if let Some(trio) = self.paged_trio(cfg.kind) {
+            cfg.block_tokens.is_some_and(|b| b > 0) && Self::supported(trio, &paged_probe(cfg))
+        } else if let Some(trio) = self.attention_trio(cfg.kind) {
+            cfg.block_tokens.is_none() && Self::supported(trio, &attention_probe(cfg))
         } else {
-            cfg.block_tokens.is_none()
-                && Self::supported(self.attention_trio(cfg.kind), &attention_probe(cfg))
+            false
         }
     }
 
     fn implementation(&self, cfg: &AttentionConfig) -> String {
-        if cfg.kind.is_paged() {
-            Self::implementation_of(self.paged_trio(cfg.kind), &paged_probe(cfg))
+        if let Some(trio) = self.paged_trio(cfg.kind) {
+            Self::implementation_of(trio, &paged_probe(cfg))
+        } else if let Some(trio) = self.attention_trio(cfg.kind) {
+            Self::implementation_of(trio, &attention_probe(cfg))
         } else {
-            Self::implementation_of(self.attention_trio(cfg.kind), &attention_probe(cfg))
+            format!("unsupported attention kind {:?}", cfg.kind)
         }
     }
 
     fn execute(&self, ctx: &mut AttentionContext<'_>) -> Result<(), KernelError> {
-        if ctx.cfg.kind.is_paged() {
+        let Some(trio) = self.attention_trio(ctx.cfg.kind) else {
             return Err(invalid(format!(
                 "{} attention runs through execute_paged",
                 ctx.cfg.op()
             )));
-        }
+        };
         let kv_stride_token = row_stride("k_cache", &ctx.k_cache, 3)?;
         if row_stride("v_cache", &ctx.v_cache, 3)? != kv_stride_token {
             return Err(invalid(
@@ -797,12 +802,12 @@ impl AttentionKernel for ShimProvider {
             causal: i32::from(ctx.cfg.causal),
             dtype: ctx.cfg.dtype.abi_code(),
         };
-        self.run(self.attention_trio(ctx.cfg.kind), &d)
+        self.run(trio, &d)
     }
 
     fn execute_paged(&self, ctx: &mut PagedAttentionContext<'_>) -> Result<(), KernelError> {
         let cfg = ctx.cfg;
-        let Some(block_tokens) = cfg.block_tokens.filter(|_| cfg.kind.is_paged()) else {
+        let (Some(trio), Some(block_tokens)) = (self.paged_trio(cfg.kind), cfg.block_tokens) else {
             return Err(invalid(format!(
                 "{} attention with block_tokens {:?} is not paged",
                 cfg.op(),
@@ -859,7 +864,7 @@ impl AttentionKernel for ShimProvider {
             causal: i32::from(cfg.causal),
             dtype: cfg.dtype.abi_code(),
         };
-        self.run(self.paged_trio(cfg.kind), &d)
+        self.run(trio, &d)
     }
 }
 
@@ -1424,6 +1429,38 @@ mod tests {
             block_tokens: None,
             ..paged
         }));
+        // Every kind binds its own entry point; none falls through to another kind's.
+        for (kind, entry) in [
+            (AttentionKind::Prefill, "stub_attention_prefill"),
+            (AttentionKind::Decode, "stub_attention_decode"),
+            (AttentionKind::PrefillPaged, "stub_attention_prefill_paged"),
+            (AttentionKind::DecodePaged, "stub_attention_decode_paged"),
+        ] {
+            let block_tokens = kind.is_paged().then_some(16);
+            let cfg = AttentionConfig {
+                kind,
+                block_tokens,
+                ..paged
+            };
+            assert_eq!(attn.implementation(&cfg), entry, "{kind:?}");
+        }
+        // A paged config handed to the contiguous entry point is refused before any FFI call.
+        let t = Tensor::empty(&mem, &[1, 16, 128], DType::BF16).expect("q");
+        let err = attn
+            .execute(&mut AttentionContext {
+                cfg: paged,
+                q: t.view(),
+                k_cache: t.view(),
+                v_cache: t.view(),
+                out: t.view(),
+                q_start: 0,
+                scale: 1.0,
+            })
+            .expect_err("paged kind on the contiguous path");
+        assert!(
+            matches!(&err, KernelError::InvalidArgument { message } if message.contains("execute_paged")),
+            "{err:?}"
+        );
 
         let copy = KvCopyConfig {
             num_layers: 2,
