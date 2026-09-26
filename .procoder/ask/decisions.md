@@ -453,3 +453,14 @@ Card profiles:
 - Not yet — review the spec and plan first
 
 **Answer (2026-09-26):** yes, parallel lanes — agents build lanes A (model), B (sampler), C (scheduler), D (kernels) in worktrees; each task lands one at a time on `phase-2m-modularity` with gate, GPU suites, golden and lab-bench after it.
+
+## Continue through the phases unattended (2026-09-27)
+
+**Decision (user, 2026-09-27):** "continue through the phases, keeping nvidia out of it" while the user is away. Coordinator rules for the unattended run: Phase 2m merges into main and is pushed (approved); Phases 3 onward proceed in order on novanas only (lab Jobs, serve and bench runs under the same rules as the Phase 2 standing approval: novanas only, stop and wait if `amd.com/gpu` is held by another workload); NVIDIA / DGX Spark / CUDA work stays on hold; open design decisions take the recommended option, recorded here as "provisional (coordinator default, pending user review)" and implemented so they can be switched; later phases merge into main locally but are not pushed to the public repository until the user reviews them.
+
+## Phase 3: SURVIVAL liveness fix
+
+- A) On entering SURVIVAL, requeue admitted requests that have not started (no KV written) and drop their reservations, so in-flight work can finish and the pool drains (recommended)
+- B) Let in-flight prefills continue in SURVIVAL (changes the spec's SURVIVAL row)
+
+**Answer (2026-09-27): provisional (coordinator default, pending user review) — A.** Implemented behind the recovery controller so B can be switched in; the overload simulation seeds that exposed the gap (seed 6 stuck in SURVIVAL, seed 1 recovering in 64 s against the 60 s criterion) become regression tests.
