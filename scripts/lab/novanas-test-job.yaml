@@ -156,6 +156,9 @@ spec:
               value: hip
             - name: TURBINE_TEST_MODEL_DIR
               value: /models/llama-3.2-3b-instruct
+            # OLMoE-1B-7B weights for the Phase 2 MoE tests.
+            - name: TURBINE_TEST_MOE_MODEL_DIR
+              value: /models/olmoe-1b-7b-0125-instruct
             - name: UV_VERSION
               value: 0.11.2
             - name: UV_INSTALL_DIR

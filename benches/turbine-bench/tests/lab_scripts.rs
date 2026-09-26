@@ -17,6 +17,9 @@ use turbine_core::types::ExecutionBackend;
 const CI_ROOT: &str = "/home/piwi/turbine-ci";
 const CACHE: &str = "/home/piwi/turbine-ci/cache";
 const MODEL_DIR: &str = "/models/llama-3.2-3b-instruct";
+const MOE_MODEL_DIR: &str = "/models/olmoe-1b-7b-0125-instruct";
+/// The vLLM-ROCm image the baseline Job pins (tag and digest, checked on Docker Hub).
+const VLLM_IMAGE: &str = "rocm/vllm:rocm7.14.1_rdna_ubuntu24.04_py3.14_pytorch_2.11_vllm_0.23.0@sha256:19ad8dc5fb3012f2d5810995f73e8bf069302056d2b4aa6fdf2d2ae5fa9a68ab";
 const SSH: &str = "ssh -o BatchMode=yes -o ConnectTimeout=10 piwi@192.168.10.203";
 
 fn repo_root() -> PathBuf {
@@ -251,6 +254,45 @@ fn phase1_novanas_config_loads() {
 }
 
 #[test]
+fn phase2_novanas_configs_load_with_the_scheduler_defaults() {
+    for (file, dir, name) in [
+        (
+            "phase2-novanas-llama.yaml",
+            MODEL_DIR,
+            "meta-llama/Llama-3.2-3B-Instruct",
+        ),
+        (
+            "phase2-novanas-olmoe.yaml",
+            MOE_MODEL_DIR,
+            "allenai/OLMoE-1B-7B-0125-Instruct",
+        ),
+    ] {
+        let path = repo_root().join("scripts/lab").join(file);
+        let c = turbine_core::config::load(&path, &[])
+            .unwrap_or_else(|e| panic!("{file} does not load: {e}"));
+        assert_eq!(c.server.listen.to_string(), "0.0.0.0:18000", "{file}");
+        assert_eq!(c.model.path, Path::new(dir), "{file}");
+        assert_eq!(c.model.served_name.as_deref(), Some(name), "{file}");
+        assert_eq!(c.execution.backend, ExecutionBackend::Hip, "{file}");
+        // The spec's Phase 2 defaults, spelled out in the file.
+        let s = &c.scheduler;
+        assert!(s.continuous_batching && s.chunked_prefill, "{file}");
+        assert_eq!(
+            (
+                s.max_running_requests,
+                s.max_batch_tokens,
+                s.prefill_chunk_tokens,
+                s.max_queued_requests
+            ),
+            (64, 8192, 2048, 256),
+            "{file}"
+        );
+        assert_eq!(c.kv.gpu.max_bytes.map(|b| b.0), Some(8 << 30), "{file}");
+        assert_eq!(c.kv.block_tokens, 16, "{file}");
+    }
+}
+
+#[test]
 fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
     let text = dry_run("lab-test.sh", "test-default", &["--dry-run", "novanas"]);
     let id = run_id(&text, "lab-test");
@@ -287,6 +329,7 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
     assert_eq!(env(&job, "TURBINE_LAB_SLOTS"), "2");
     assert_eq!(env(&job, "TURBINE_TEST_BACKEND"), "hip");
     assert_eq!(env(&job, "TURBINE_TEST_MODEL_DIR"), MODEL_DIR);
+    assert_eq!(env(&job, "TURBINE_TEST_MOE_MODEL_DIR"), MOE_MODEL_DIR);
     assert_eq!(env(&job, "TURBINE_ROCM_PATH"), "/opt/rocm/rocm/core-7.14");
     assert_eq!(env(&job, "UV_CACHE_DIR"), format!("{CACHE}/uv"));
     // The slot, not the manifest, picks the target and kernel build dirs.
@@ -637,6 +680,130 @@ fn lab_serve_usage_errors_exit_2_without_contacting_a_host() {
         ),
         ("extra", &["novanas", "--stop", "x"][..], "usage:"),
         ("missing", &["novanas", missing][..], missing),
+    ] {
+        let (out, called) = lab_script("lab-serve.sh", tag, args);
+        assert_eq!(called, None, "{tag}: contacted a host");
+        assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
+        assert!(stderr(&out).contains(expect), "{tag}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn lab_serve_vllm_dry_run_applies_the_pinned_baseline_job() {
+    for (slug, name, max_len) in [
+        (
+            "llama-3.2-3b-instruct",
+            "meta-llama/Llama-3.2-3B-Instruct",
+            "32768",
+        ),
+        (
+            "olmoe-1b-7b-0125-instruct",
+            "allenai/OLMoE-1B-7B-0125-Instruct",
+            "4096",
+        ),
+    ] {
+        let text = dry_run(
+            "lab-serve.sh",
+            &format!("vllm-{slug}"),
+            &["--dry-run", "novanas", "--vllm", slug],
+        );
+        let id = run_id(&text, "lab-serve");
+        let job_name = format!("turbine-lab-vllm-{id}");
+        let models = "curl -s -o /dev/null -w %{http_code} --max-time 5 \
+                      http://192.168.10.203:18100/v1/models";
+        assert_in_order(
+            &text,
+            &[
+                models,
+                "refuse to start unless that fails to connect",
+                &format!("{SSH} 'test -d /home/piwi/turbine-models/{slug}'"),
+                "kubectl apply -f -",
+                &format!("kubectl -n turbine-ci logs -f job/{job_name}"),
+                models,
+            ],
+        );
+        // Nothing is uploaded, nothing deleted, and Turbine's port is not probed.
+        for absent in ["rsync", " delete ", ":18000"] {
+            assert!(!text.contains(absent), "{slug}: {absent} in:\n{text}");
+        }
+
+        let job = applied_job(&text);
+        assert_eq!(str_at(&job, "metadata.name"), job_name);
+        assert_eq!(str_at(&job, "metadata.namespace"), "turbine-ci");
+        // Role serve: `lab-serve.sh novanas --stop` removes it with the Turbine serve Job.
+        assert_eq!(str_at(&job, "metadata.labels.turbine-lab-role"), "serve");
+        assert_eq!(str_at(&job, "metadata.labels.turbine-lab-kind"), "vllm");
+        assert_eq!(str_at(&job, "metadata.labels.turbine-lab-run"), id);
+        assert_eq!(
+            at(&job, "spec.template.spec.hostNetwork").as_bool(),
+            Some(true)
+        );
+        assert_eq!(amd_gpus(&job), 1);
+        let c = container(&job);
+        assert_eq!(str_at(c, "image"), VLLM_IMAGE);
+        let words = |key: &str| -> Vec<String> {
+            at(c, key)
+                .as_sequence()
+                .expect("list")
+                .iter()
+                .map(|v| v.as_str().expect("string entry").to_string())
+                .collect()
+        };
+        assert_eq!(words("command"), ["vllm", "serve"]);
+        assert_eq!(
+            words("args").join(" "),
+            format!(
+                "/models/{slug} --served-model-name {name} --host 0.0.0.0 --port 18100 \
+                 --dtype bfloat16 --kv-cache-dtype auto --max-model-len {max_len}"
+            )
+        );
+        assert_eq!(env(&job, "HF_HUB_OFFLINE"), "1", "vLLM never downloads");
+
+        // The weights read-only from the same host directory as the Turbine Jobs.
+        let model_mount = at(c, "volumeMounts")
+            .as_sequence()
+            .expect("volumeMounts")
+            .iter()
+            .find(|m| str_at(m, "mountPath") == "/models")
+            .expect("/models mount");
+        assert_eq!(
+            model_mount.get("readOnly").and_then(Value::as_bool),
+            Some(true)
+        );
+        let volume = at(&job, "spec.template.spec.volumes")
+            .as_sequence()
+            .expect("volumes")
+            .iter()
+            .find(|v| str_at(v, "name") == str_at(model_mount, "name"))
+            .expect("models volume");
+        assert_eq!(str_at(volume, "hostPath.path"), "/home/piwi/turbine-models");
+    }
+}
+
+#[test]
+fn lab_serve_vllm_usage_errors_exit_2_without_contacting_a_host() {
+    for (tag, args, expect) in [
+        ("vllm-noslug", &["novanas", "--vllm"][..], "usage:"),
+        (
+            "vllm-badslug",
+            &["novanas", "--vllm", "qwen3-moe"][..],
+            "unknown model slug for --vllm: qwen3-moe",
+        ),
+        (
+            "vllm-path",
+            &["novanas", "--vllm", "../llama-3.2-3b-instruct"][..],
+            "unknown model slug",
+        ),
+        (
+            "vllm-extra",
+            &["novanas", "--vllm", "llama-3.2-3b-instruct", "x"][..],
+            "usage:",
+        ),
+        (
+            "vllm-spark",
+            &["dgx-spark", "--vllm", "llama-3.2-3b-instruct"][..],
+            "usage:",
+        ),
     ] {
         let (out, called) = lab_script("lab-serve.sh", tag, args);
         assert_eq!(called, None, "{tag}: contacted a host");

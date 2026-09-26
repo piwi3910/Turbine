@@ -1,0 +1,85 @@
+# k3s Job template run by scripts/lab-serve.sh novanas --vllm <slug>: the upstream vLLM-ROCm
+# image serving the same read-only weights as Turbine on one R9700, for the Phase 2 baseline
+# benchmark on the host network at http://192.168.10.203:18100 (Turbine keeps 18000).
+#
+# The script renders the placeholders before applying it: RUN_ID (a unique Job name), SLUG (the
+# weights directory under /home/piwi/turbine-models, mounted at /models), SERVED_NAME (the model
+# id Turbine's lab config serves for that slug) and MAX_MODEL_LEN (Turbine's default
+# model.max_seq_len for that model: min(32768, max_position_embeddings)).
+#
+# Image: rocm/vllm, the ROCm 7.14.1 RDNA build (the host's ROCm version; RDNA covers gfx1201),
+# pinned by tag and digest as listed by
+#   curl -s 'https://hub.docker.com/v2/repositories/rocm/vllm/tags?page_size=25'
+# on 2026-09-26 (tag pushed 2026-09-01, amd64).
+#
+# The Job is labelled turbine-lab-role=serve, so `scripts/lab-serve.sh novanas --stop` deletes it
+# together with the Turbine serve Job and nothing else. HF_HUB_OFFLINE keeps vLLM from
+# downloading anything: it serves only the mounted weights.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: turbine-lab-vllm-__RUN_ID__
+  namespace: turbine-ci
+  labels:
+    turbine-lab: "true"
+    turbine-lab-role: serve
+    turbine-lab-kind: vllm
+    turbine-lab-run: "__RUN_ID__"
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        turbine-lab: "true"
+        turbine-lab-role: serve
+        turbine-lab-kind: vllm
+        turbine-lab-run: "__RUN_ID__"
+    spec:
+      restartPolicy: Never
+      hostNetwork: true
+      containers:
+        - name: vllm
+          image: rocm/vllm:rocm7.14.1_rdna_ubuntu24.04_py3.14_pytorch_2.11_vllm_0.23.0@sha256:19ad8dc5fb3012f2d5810995f73e8bf069302056d2b4aa6fdf2d2ae5fa9a68ab
+          command: ["vllm", "serve"]
+          args:
+            - /models/__SLUG__
+            - --served-model-name
+            - __SERVED_NAME__
+            - --host
+            - 0.0.0.0
+            - --port
+            - "18100"
+            - --dtype
+            - bfloat16
+            - --kv-cache-dtype
+            - auto
+            - --max-model-len
+            - "__MAX_MODEL_LEN__"
+          env:
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: VLLM_NO_USAGE_STATS
+              value: "1"
+            - name: DO_NOT_TRACK
+              value: "1"
+          resources:
+            limits:
+              amd.com/gpu: 1
+          volumeMounts:
+            # Weights provisioned once over SSH; vLLM never downloads.
+            - name: models
+              mountPath: /models
+              readOnly: true
+            # vLLM's worker processes exchange tensors through /dev/shm (64 MiB by default).
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: models
+          hostPath:
+            path: /home/piwi/turbine-models
+            type: Directory
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
