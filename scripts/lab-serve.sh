@@ -317,7 +317,7 @@ start() {
 	[[ $DRY_RUN -eq 1 ]] || trap on_interrupt INT TERM
 
 	say "syncing working tree to ${RUN_DIR}/src"
-	run rsync -az --delete --exclude target/ --exclude .git/ --exclude .claude/ \
+	run rsync -rlpcz --delete --exclude target/ --exclude .git/ --exclude .claude/ \
 		-e "ssh ${SSH_OPTS[*]}" "${REPO_ROOT}/" "${REMOTE}:${RUN_DIR}/src/" ||
 		fail "rsync to ${REMOTE}:${RUN_DIR}/src failed"
 

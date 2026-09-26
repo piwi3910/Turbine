@@ -177,7 +177,7 @@ kube() {
 
 upload_tree() {
 	say "syncing working tree to ${1}"
-	run rsync -az --delete --exclude target/ --exclude .git/ --exclude .claude/ \
+	run rsync -rlpcz --delete --exclude target/ --exclude .git/ --exclude .claude/ \
 		-e "ssh ${SSH_OPTS[*]}" "${REPO_ROOT}/" "${REMOTE}:${1}/" ||
 		fail "rsync to ${REMOTE}:${1} failed"
 }

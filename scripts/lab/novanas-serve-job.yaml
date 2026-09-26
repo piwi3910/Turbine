@@ -68,7 +68,7 @@ spec:
               echo "lab-step: slot $SLOT (CARGO_TARGET_DIR=$CARGO_TARGET_DIR)"
 
               step "sync the uploaded tree into the slot"
-              rsync -a --delete "$RUN_DIR/src/" "$SLOT_DIR/src/"
+              rsync -rlpc --delete "$RUN_DIR/src/" "$SLOT_DIR/src/"
               cp "$RUN_DIR/config.yaml" "$SLOT_DIR/config.yaml"
               rm -rf "$RUN_DIR"
               cd "$SLOT_DIR/src"

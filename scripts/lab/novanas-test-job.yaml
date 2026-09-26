@@ -14,7 +14,9 @@
 #   slots/test-<n>/{src,target,kernels}  one workspace per concurrent test Job.
 # Concurrency: a Job first takes the flock on slots/test-<n>.lock (n = 0 or 1, one per R9700)
 # and holds it until it exits, then syncs its upload into that slot's src with rsync (only
-# changed files; mtimes kept, so cargo and ninja rebuild only what changed), builds the kernels
+# changed files, found by checksum; those get a fresh mtime and unchanged files keep the slot's,
+# so cargo and ninja rebuild exactly what changed even when the slot's target was built from a
+# newer-dated tree of another checkout — source mtimes are never carried over), builds the kernels
 # in that slot's CMake build dir and runs cargo with that slot's CARGO_TARGET_DIR. Cargo's own
 # target-dir lock would stop two builds from corrupting one shared target, but it serialises the
 # builds and cannot protect a source tree that another run is re-syncing, so each slot has its
@@ -93,7 +95,7 @@ spec:
               echo "lab-step: slot $SLOT (CARGO_TARGET_DIR=$CARGO_TARGET_DIR)"
 
               step "sync the uploaded tree into the slot"
-              rsync -a --delete "$RUN_DIR/src/" "$SLOT_DIR/src/"
+              rsync -rlpc --delete "$RUN_DIR/src/" "$SLOT_DIR/src/"
               mapfile -d '' TEST_CMD < "$RUN_DIR/test-command"
               [[ ${#TEST_CMD[@]} -gt 2 && "${TEST_CMD[0]} ${TEST_CMD[1]}" == "cargo test" ]]
               HF_REFERENCE=0

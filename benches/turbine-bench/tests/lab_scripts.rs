@@ -292,6 +292,45 @@ fn phase2_novanas_configs_load_with_the_scheduler_defaults() {
     }
 }
 
+/// Every tree sync into a cached build workspace compares by checksum and never carries source
+/// mtimes over (no `-a`, no `-t`): a changed file must get a fresh mtime, or cargo's mtime
+/// fingerprints reuse artifacts that a newer-dated tree of another checkout left in the slot.
+#[test]
+fn lab_tree_syncs_never_preserve_source_mtimes() {
+    let root = repo_root();
+    for file in [
+        "scripts/lab-test.sh",
+        "scripts/lab-serve.sh",
+        "scripts/lab/novanas-test-job.yaml",
+        "scripts/lab/novanas-serve-job.yaml",
+        "scripts/remote-cargo.sh",
+    ] {
+        let text = fs::read_to_string(root.join(file)).expect(file);
+        let syncs: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("rsync -") && l.contains("--delete"))
+            .collect();
+        assert!(!syncs.is_empty(), "{file} has no tree sync");
+        for line in syncs {
+            let flags = line
+                .split_whitespace()
+                .skip_while(|w| *w != "rsync")
+                .nth(1)
+                .expect("rsync flags");
+            assert!(
+                flags.starts_with('-') && !flags.starts_with("--"),
+                "{file}: {line}"
+            );
+            assert!(flags.contains('c'), "{file}: no checksum compare: {line}");
+            assert!(
+                !flags.contains('a') && !flags.contains('t'),
+                "{file}: preserves mtimes: {line}"
+            );
+        }
+    }
+}
+
 #[test]
 fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
     let text = dry_run("lab-test.sh", "test-default", &["--dry-run", "novanas"]);
@@ -302,7 +341,7 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
         &text,
         &[
             &format!("{SSH} 'mkdir -p {run_dir}/src {CACHE}/slots"),
-            "rsync -az --delete --exclude target/ --exclude .git/ --exclude .claude/",
+            "rsync -rlpcz --delete --exclude target/ --exclude .git/ --exclude .claude/",
             &format!("piwi@192.168.10.203:{run_dir}/src/"),
             &format!("cat > {run_dir}/test-command"),
             "kubectl apply -f -",
@@ -381,7 +420,7 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
             "export CARGO_TARGET_DIR=\"$SLOT_DIR/target\"",
             "export KERNEL_BUILD_DIR=\"$SLOT_DIR/kernels\"",
             "export TURBINE_KERNEL_LIBRARY=\"$KERNEL_BUILD_DIR/libturbine_hip.so\"",
-            "rsync -a --delete \"$RUN_DIR/src/\" \"$SLOT_DIR/src/\"",
+            "rsync -rlpc --delete \"$RUN_DIR/src/\" \"$SLOT_DIR/src/\"",
             "mapfile -d '' TEST_CMD < \"$RUN_DIR/test-command\"",
             "rm -rf \"$RUN_DIR\"",
             "cd \"$SLOT_DIR/src\"",
@@ -608,7 +647,7 @@ fn novanas_serve_job_matches_the_test_job() {
             "SLOT=serve-0",
             "flock -w 1800 \"$LOCK_FD\"",
             "export CARGO_TARGET_DIR=\"$SLOT_DIR/target\"",
-            "rsync -a --delete \"$RUN_DIR/src/\" \"$SLOT_DIR/src/\"",
+            "rsync -rlpc --delete \"$RUN_DIR/src/\" \"$SLOT_DIR/src/\"",
             "cp \"$RUN_DIR/config.yaml\" \"$SLOT_DIR/config.yaml\"",
             "cmake -S kernels/rocm -B \"$KERNEL_BUILD_DIR\" -G Ninja",
             "cmake --build \"$KERNEL_BUILD_DIR\"",
@@ -635,7 +674,7 @@ fn lab_serve_dry_run_prints_the_start_sequence() {
             ready,
             "refuse to start unless that fails to connect",
             &format!("{SSH} 'mkdir -p {run_dir}/src {CACHE}/slots"),
-            "rsync -az --delete --exclude target/ --exclude .git/ --exclude .claude/",
+            "rsync -rlpcz --delete --exclude target/ --exclude .git/ --exclude .claude/",
             &format!("piwi@192.168.10.203:{run_dir}/src/"),
             &format!("phase1-novanas.yaml piwi@192.168.10.203:{run_dir}/config.yaml"),
             "kubectl apply -f -",
