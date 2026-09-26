@@ -1,6 +1,6 @@
 # Questions procoder cannot answer for you
 
-Written 2026-09-25 19:33 UTC.
+Written 2026-09-26 04:03 UTC.
 
 Answer each one by writing a line beginning `Answer: ` under it, then
 hand the file back with `procoder ask --file .procoder/ask/QA.md`.
@@ -8,60 +8,48 @@ Leave the `Key:` lines alone — they are what ties an answer to its question.
 
 ## Q1: [decision] decisions.md
 
-Key: a0b3fe55d987
-Question: P1: 16 MB Llama tokenizer.json fixture vs the gate's 5 MB file limit
+Key: 46deae046b91
+Question: Focus: Phase 1 first, or keep running later phases ahead in parallel?
 
-- Commit it gzip-compressed (2.5 MB, `tokenizer.json.gz`), decompress in tests via a `flate2` dev-dependency; sha256 of the decompressed file checked against the pinned revision (recommended)
-- Git LFS for large fixtures
-- Raise the gate limit to 20 MB in .procoder/config.toml
+- Phase 1 first: start T14 (sampler) and T17 (server wiring) now against T13's interfaces; let the running run-ahead agents finish but start no new later-phase work until Phase 1 is merged and pushed (recommended)
+- Phase 1 only: also stop the running later-phase agents now
+- Keep going as now: Phase 1 plus run-ahead in parallel
 
-**Answer (2026-09-25):** raise the gate limit — `.procoder/config.toml` `max_file_mb = 20`; raw tokenizer.json committed. `.prettierignore` keeps downloaded fixtures and golden files byte-identical.
+**Answer (2026-09-26):** Phase 1 first — T14 and T17 start now in parallel with T13; running run-ahead agents finish, no new later-phase work until Phase 1 is merged to main and pushed.
 
-Answer: Raise the gate limit to 20 MB (user).
+**Applied (2026-09-26):** the user's P2b decision "tiny test checkpoints head_dim 128 only" is applied to the AMD/HIP GPU executor test too (`hip_matches_cpu` failed with NoProvider for head_dim 16; CK FMHA supports head_dim 128 per spec S-7). CPU-only tiny tests keep head_dim 16.
+
+Answer: Phase 1 first (user chose the recommended option).
 
 ## Q2: [decision] decisions.md
 
-Key: 0d4ca0aa885e
-Question: Phase 1 model source while Meta's gate approval is pending
+Key: 47684a7c4dcf
+Question: Golden logprob bound (0.15 on all top-5 candidates is below the BF16 noise floor: HF-vs-HF BF16 variants differ up to 0.38)
 
-- unsloth/Llama-3.2-3B-Instruct (ungated re-upload, identical weights/architecture/tokenizer, same Llama 3.2 license) — no plan or spec change beyond the repo id; switch back to meta-llama later only if wanted (recommended)
-- A different ungated model family (e.g. Qwen2.5-3B-Instruct, Apache-2.0) — re-plan Phase 1 model code (bias terms, template), redo fixtures
-- Wait for Meta's approval
+- Keep 0.15 but only for candidates with logprob > −2; tail candidates (< −2) get a looser bound of 0.55 (Turbine max: 0.087 likely / 0.513 tail) (recommended)
+- Raise the bound to 0.55 for all top-5 candidates
+- Full-FP32 HF reference with a 0.3 bound
 
-**Answer (2026-09-25):** use unsloth/Llama-3.2-3B-Instruct at the plan-pinned revision 006f5dcd1393c3add266de40994ba96225e9689d (ungated; identical weights/architecture/tokenizer) for Phase 1 weights; meta-llama gate request is pending and may replace it later.
-
-Answer: unsloth/Llama-3.2-3B-Instruct ungated mirror at the pinned revision (user chose the recommended option).
+Answer: 0.15 on candidates with reference logprob > −2, 0.55 on tail (user chose the recommended option).
 
 ## Q3: [decision] decisions.md
 
-Key: 6ce559b7a0ed
-Question: Phase 1: how the Hugging Face token reaches novanas for the gated Llama download
+Key: 3aa51b8da042
+Question: Golden reference: regenerate the committed Llama reference with FP32 final logits?
 
-- User writes the token to /home/piwi/.cache/huggingface/token on novanas (chmod 600) after accepting Meta's license; Claude uses it over SSH without seeing it (recommended)
-- User pastes the token in chat for this one download
+- Yes — commit reference.fp32-logits.jsonl as the golden reference (removes BF16 tie-induced token splits; 3/16 → 9/16 pass at 0.15) (recommended)
+- No — keep the BF16-logit reference
 
-**Answers (2026-09-25):** standing approval for Phase 1 lab Jobs on novanas while its GPUs are free. HF token: the user logs in on novanas themselves (`hf auth login`) after Claude installed uv 0.12.19 + hf CLI (huggingface_hub 2.0.0) for piwi in ~/.local/bin; Claude never sees the token.
-
-Answer: User logged in on novanas with `hf auth login` after Claude installed uv + hf; Claude never sees the token (user).
+Answer: Use the FP32-logit reference (user chose the recommended option).
 
 ## Q4: [decision] decisions.md
 
-Key: d91bfbe4dfcf
-Question: Phase 1: standing approval for novanas lab Jobs (HIP library build, GPU op tests, golden runs, serve Job)?
+Key: 4b0c4027dbba
+Question: Tiny-model HIP-vs-CPU bound (2e-2) vs CK's BF16 softmax probabilities (measured 0.097)
 
-- Yes for all Phase 1 lab Jobs on novanas while its GPUs are free; ask again if anything else holds them (recommended)
-- Ask before each Job
+- Make the CPU reference attention round softmax probabilities to BF16 like CK and HF sdpa, then keep a tight bound (recommended)
+- Raise the bound to 0.2
 
-Answer: Yes — standing approval for Phase 1 lab Jobs on novanas while GPUs are free (user).
+**Answers (2026-09-26):** golden reference = FP32-final-logit HF reference; bound = 0.15 for candidates with reference logprob > −2 and 0.55 for tail candidates (< −2); CPU reference attention rounds softmax probabilities to BF16 like CK/HF sdpa, tiny HIP-vs-CPU test keeps a tight bound.
 
-## Q5: [decision] decisions.md
-
-Key: 02a4fc4d7fb7
-Question: Start pure-Rust parts of later phases now, ahead of phase order?
-
-- Yes: run independent, GPU-free pieces of Phases 3/4/6 (state machines, policies, simulators, transport/protocol) on their own branches in parallel with Phase 1; merged when their phase opens, adjusted to any Phase 1–2 type changes (recommended for throughput)
-- No: keep strict phase order
-
-**Answer (2026-09-25):** Yes — run GPU-free parts of later phases ahead on their own branches (runahead/*), merged when their phase opens.
-
-Answer: Yes, run ahead on runahead branches (user chose the recommended option).
+Answer: Make the CPU reference attention round probabilities to BF16 like CK (user chose the recommended option).
