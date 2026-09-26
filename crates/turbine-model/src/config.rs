@@ -1,7 +1,8 @@
 //! Hugging Face `config.json` / `generation_config.json` parsing and the allowlist (P1 S-3):
 //! `architectures[0]` must name a registered model family (`crate::families::resolve`, Phase 2m
-//! S-2), whose own keys it parses; the keys every decoder shares are parsed here. Anything else
-//! is refused with the offending field named and the supported set listed.
+//! S-2), whose own keys it parses; the keys every decoder shares are parsed here (and
+//! `attention_bias: true`, which no executor implements, is refused for every family). Anything
+//! else is refused with the offending field named and the supported set listed.
 //!
 //! The weight-format part of the allowlist is the checkpoint's [`crate::weights::WeightFormat`] (Phase 2m S-10,
 //! `crate::weights`): `detect` picks it from `config.json`, and
@@ -56,6 +57,9 @@ pub struct ModelArchConfig {
     pub moe: Option<MoeConfig>,
     /// RMSNorm over the full Q and K projections before RoPE (`q_norm` / `k_norm`, OLMoE).
     pub qk_norm: bool,
+    /// RMSNorm over each Q and K head (`q_norm` / `k_norm` of `[head_dim]`) before RoPE
+    /// (Qwen3, Qwen3-MoE); never together with `qk_norm`.
+    pub qk_norm_per_head: bool,
     /// How the weights are stored and which dtypes weights, activations and KV use.
     pub weight_format: WeightFormatRef,
 }
@@ -179,6 +183,9 @@ struct RawConfig {
     max_position_embeddings: u32,
     #[serde(default)]
     eos_token_id: Option<TokenIds>,
+    /// Biased Q/K/V/O projections; no executor implements them (refused for every family).
+    #[serde(default)]
+    attention_bias: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -288,12 +295,21 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
         )));
     }
 
+    if raw.attention_bias == Some(true) {
+        return Err(unsupported("attention_bias", "true", "false"));
+    }
+
     // The family's own keys; a malformed value names this file.
     let family_cfg = family.parse_config(text).map_err(|e| match e {
         ModelError::Io { detail, .. } => invalid(detail),
         other => other,
     })?;
 
+    // A mixture of experts reports its experts' width as the model's intermediate size
+    // (Qwen3-MoE's dense `intermediate_size` is unused; OLMoE's and Mixtral's are the experts').
+    let intermediate = family_cfg
+        .moe
+        .map_or(raw.intermediate_size, |m| m.expert_intermediate);
     let rope_scaling = parse_rope_scaling(raw.rope_scaling, &config_path)?;
     let eos_token_ids = load_eos(dir, raw.eos_token_id, &config_path)?;
 
@@ -305,7 +321,7 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
         num_attention_heads: heads,
         num_kv_heads,
         head_dim,
-        intermediate: raw.intermediate_size,
+        intermediate,
         rms_norm_eps: raw.rms_norm_eps,
         rope_theta,
         rope_scaling,
@@ -315,6 +331,7 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
         eos_token_ids,
         moe: family_cfg.moe,
         qk_norm: family_cfg.qk_norm,
+        qk_norm_per_head: family_cfg.qk_norm_per_head,
         weight_format,
     })
 }
@@ -707,14 +724,27 @@ mod tests {
 
     #[test]
     fn rejects_unsupported() {
-        let dir = edited_config("qwen", |v| {
-            v["architectures"] = serde_json::json!(["Qwen3MoeForCausalLM"]);
+        let dir = edited_config("gpt-oss", |v| {
+            v["architectures"] = serde_json::json!(["GptOssForCausalLM"]);
         });
         let err = load_model_config(&dir).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unsupported architectures = Qwen3MoeForCausalLM; supported: registered families: \
-             llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM)"
+            "unsupported architectures = GptOssForCausalLM; supported: registered families: \
+             llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 (Qwen3ForCausalLM), \
+             qwen3_moe (Qwen3MoeForCausalLM), mistral (MistralForCausalLM), mixtral \
+             (MixtralForCausalLM)"
+        );
+        fs::remove_dir_all(dir).unwrap();
+
+        // Biased projections: no executor implements them, for any family.
+        let dir = edited_config("bias", |v| {
+            v["attention_bias"] = serde_json::json!(true);
+        });
+        let (field, value, supported) = unsupported(load_model_config(&dir).unwrap_err());
+        assert_eq!(
+            (field.as_str(), value.as_str(), supported.as_str()),
+            ("attention_bias", "true", "false")
         );
         fs::remove_dir_all(dir).unwrap();
 
@@ -764,6 +794,162 @@ mod tests {
             (field.as_str(), value.as_str(), supported.as_str()),
             ("rope_scaling.rope_type", "yarn", "default, llama3")
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The `config.json` / `generation_config.json` of the Phase 8 checkpoints, copied verbatim
+    /// from Hugging Face (`tests/fixtures/<slug>/`).
+    fn family_fixture(slug: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(slug)
+    }
+
+    /// The four Phase 8 families parse from their real configs, with the parameter counts the
+    /// model cards state (Qwen3-0.6B 0.6B, Qwen3-30B-A3B 30.5B, Mistral-7B 7.25B, Mixtral-8x7B
+    /// 46.7B).
+    #[test]
+    fn parses_family_configs() {
+        let qwen3 = load_model_config(&family_fixture("qwen3-0.6b")).unwrap();
+        assert_eq!(qwen3.family.0.name(), "qwen3");
+        assert_eq!(qwen3.hf_architecture, "Qwen3ForCausalLM");
+        assert_eq!((qwen3.num_layers, qwen3.hidden), (28, 1024));
+        assert_eq!((qwen3.num_attention_heads, qwen3.num_kv_heads), (16, 8));
+        // head_dim is explicit: 128, not 1024 / 16.
+        assert_eq!(qwen3.head_dim, 128);
+        assert!(qwen3.qk_norm_per_head && !qwen3.qk_norm);
+        assert_eq!(qwen3.moe, None);
+        assert!(qwen3.tie_word_embeddings);
+        assert_eq!(qwen3.rope_theta, 1_000_000.0);
+        assert_eq!(qwen3.rope_scaling, None);
+        assert_eq!(qwen3.rms_norm_eps, 1e-6);
+        assert_eq!(qwen3.eos_token_ids.as_slice(), &[151_645, 151_643]);
+        assert_eq!(qwen3.shape().weight_bytes, 2 * 596_049_920);
+
+        let qwen3_moe = load_model_config(&family_fixture("qwen3-30b-a3b")).unwrap();
+        assert_eq!(qwen3_moe.family.0.name(), "qwen3_moe");
+        assert_eq!(
+            qwen3_moe.moe,
+            Some(MoeConfig {
+                num_experts: 128,
+                experts_per_token: 8,
+                expert_intermediate: 768,
+                norm_topk_prob: true,
+            })
+        );
+        // The experts' width, not the unused dense intermediate_size (6144).
+        assert_eq!(qwen3_moe.intermediate, 768);
+        assert!(qwen3_moe.qk_norm_per_head && !qwen3_moe.qk_norm);
+        assert!(!qwen3_moe.tie_word_embeddings);
+        assert_eq!(
+            (qwen3_moe.num_attention_heads, qwen3_moe.num_kv_heads),
+            (32, 4)
+        );
+        assert_eq!(qwen3_moe.shape().weight_bytes, 2 * 30_532_122_624);
+
+        let mistral = load_model_config(&family_fixture("mistral-7b-instruct-v0.3")).unwrap();
+        assert_eq!(mistral.family.0.name(), "mistral");
+        assert_eq!((mistral.head_dim, mistral.vocab_size), (128, 32_768));
+        assert!(!mistral.qk_norm_per_head && !mistral.qk_norm && mistral.moe.is_none());
+        assert_eq!(mistral.eos_token_ids.as_slice(), &[2]);
+        assert_eq!(mistral.shape().weight_bytes, 2 * 7_248_023_552);
+
+        let mixtral = load_model_config(&family_fixture("mixtral-8x7b-instruct-v0.1")).unwrap();
+        assert_eq!(mixtral.family.0.name(), "mixtral");
+        assert_eq!(
+            mixtral.moe,
+            Some(MoeConfig {
+                num_experts: 8,
+                experts_per_token: 2,
+                expert_intermediate: 14_336,
+                norm_topk_prob: true,
+            })
+        );
+        assert!(!mixtral.qk_norm_per_head && !mixtral.qk_norm);
+        assert_eq!(mixtral.shape().weight_bytes, 2 * 46_702_792_704);
+        assert_eq!(
+            mixtral.kv_layout(128).block_bytes(),
+            128 * 2 * 8 * 128 * 2 * 32
+        );
+    }
+
+    /// Features no executor implements are refused naming the key (open Phase 8 decisions,
+    /// kept as the run-ahead has them): sliding windows (Mistral, Mixtral, Qwen3), partially
+    /// dense Qwen3-MoE layers; missing expert keys are malformed.
+    #[test]
+    fn rejects_unsupported_family_features() {
+        let edited = |slug: &str, name: &str, edit: &dyn Fn(&mut serde_json::Value)| {
+            let fixture = family_fixture(slug);
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&fs::read(fixture.join("config.json")).unwrap()).unwrap();
+            edit(&mut v);
+            let dir = scratch(name);
+            fs::write(dir.join("config.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+            dir
+        };
+        let refused = |dir: PathBuf| {
+            let got = unsupported(load_model_config(&dir).unwrap_err());
+            fs::remove_dir_all(dir).unwrap();
+            got
+        };
+
+        // Mistral-7B-v0.1's 4096-token window is refused; a window covering every position is
+        // no window at all.
+        let (field, value, _) = refused(edited("mistral-7b-instruct-v0.3", "mistral-sw", &|v| {
+            v["sliding_window"] = serde_json::json!(4096);
+        }));
+        assert_eq!((field.as_str(), value.as_str()), ("sliding_window", "4096"));
+        let dir = edited("mistral-7b-instruct-v0.3", "mistral-sw-wide", &|v| {
+            v["sliding_window"] = serde_json::json!(32768);
+        });
+        assert_eq!(load_model_config(&dir).unwrap().family.0.name(), "mistral");
+        fs::remove_dir_all(dir).unwrap();
+        let (field, _, _) = refused(edited("mixtral-8x7b-instruct-v0.1", "mixtral-sw", &|v| {
+            v["sliding_window"] = serde_json::json!(4096);
+        }));
+        assert_eq!(field, "sliding_window");
+        let (field, value, supported) = refused(edited("qwen3-0.6b", "qwen3-sw", &|v| {
+            v["use_sliding_window"] = serde_json::json!(true);
+        }));
+        assert_eq!(
+            (field.as_str(), value.as_str(), supported.as_str()),
+            ("use_sliding_window", "true", "false")
+        );
+        let (field, value, _) = refused(edited("qwen3-30b-a3b", "qwen3-moe-dense", &|v| {
+            v["mlp_only_layers"] = serde_json::json!([0, 47]);
+        }));
+        assert_eq!(
+            (field.as_str(), value.as_str()),
+            ("mlp_only_layers", "[0, 47]")
+        );
+        let (field, value, _) = refused(edited("qwen3-30b-a3b", "qwen3-moe-step", &|v| {
+            v["decoder_sparse_step"] = serde_json::json!(2);
+        }));
+        assert_eq!(
+            (field.as_str(), value.as_str()),
+            ("decoder_sparse_step", "2")
+        );
+
+        let dir = edited("qwen3-30b-a3b", "qwen3-moe-no-inter", &|v| {
+            v.as_object_mut().unwrap().remove("moe_intermediate_size");
+        });
+        match load_model_config(&dir).unwrap_err() {
+            ModelError::Io { detail, .. } => {
+                assert_eq!(detail, "Qwen3MoeForCausalLM requires moe_intermediate_size")
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+        fs::remove_dir_all(dir).unwrap();
+        let dir = edited("mixtral-8x7b-instruct-v0.1", "mixtral-topk", &|v| {
+            v["num_experts_per_tok"] = serde_json::json!(9);
+        });
+        match load_model_config(&dir).unwrap_err() {
+            ModelError::Io { detail, .. } => assert_eq!(
+                detail,
+                "num_experts_per_tok 9 must be between 1 and num_local_experts 8"
+            ),
+            other => panic!("expected Io, got {other:?}"),
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 }

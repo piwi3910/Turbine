@@ -30,8 +30,9 @@ use turbine_core::types::{DeviceId, Priority, RequestId};
 use turbine_kernels::{KernelMetrics, KernelRegistry, cpu_reference_provider};
 use turbine_model::executor::{self, ExecutorOptions, SequenceKv};
 use turbine_model::testing::TempDir;
+use turbine_model::testing::naive;
 use turbine_model::testing::tiny::{
-    TINY_EOS, TinyOptions, write_tiny_llama, write_tiny_llama_with,
+    TINY_EOS, TinyOptions, write_tiny_family, write_tiny_llama, write_tiny_llama_with,
 };
 use turbine_model::{
     GenerateOptions, MAX_STAGING_BYTES, SafetensorsIndex, Tokenizer, WeightLoader, generate,
@@ -1234,15 +1235,15 @@ fn startup_failures_exit_1() {
     let addr = free_addr();
     assert_exit_1(&config_yaml(&pickle, addr, ""), addr, "pickle");
 
-    // Unsupported architecture.
-    let qwen = dir.path().join("qwen");
-    write_tiny_llama(&qwen, 7);
+    // Unsupported architecture (no registered family).
+    let unknown = dir.path().join("gpt-oss");
+    write_tiny_llama(&unknown, 7);
     let mut cfg: Value =
-        serde_json::from_slice(&std::fs::read(qwen.join("config.json")).unwrap()).unwrap();
-    cfg["architectures"] = json!(["Qwen3MoeForCausalLM"]);
-    std::fs::write(qwen.join("config.json"), cfg.to_string()).unwrap();
+        serde_json::from_slice(&std::fs::read(unknown.join("config.json")).unwrap()).unwrap();
+    cfg["architectures"] = json!(["GptOssForCausalLM"]);
+    std::fs::write(unknown.join("config.json"), cfg.to_string()).unwrap();
     let addr = free_addr();
-    assert_exit_1(&config_yaml(&qwen, addr, ""), addr, "Qwen3MoeForCausalLM");
+    assert_exit_1(&config_yaml(&unknown, addr, ""), addr, "GptOssForCausalLM");
 
     // hip with a kernel library that does not exist.
     let tiny = dir.path().join("tiny");
@@ -2664,4 +2665,57 @@ fn device_sampling_matches_host() {
         .is_some_and(|n| n > 0.0),
         "{host_metrics}"
     );
+}
+
+/// Phase 2m S-11: a tiny Qwen3 checkpoint starts through the family registry on the `cpu`
+/// backend (its support row is `experimental`) and answers a 4-token greedy completion equal
+/// to the naive decoder's argmax chain (`turbine_model::testing::naive`).
+#[test]
+fn qwen3_tiny_generates_on_cpu() {
+    const TOKENS: usize = 4;
+    let dir = TempDir::new("turbine-tiny-qwen3");
+    let model_dir = dir.path().join("tiny-qwen3");
+    let spec = write_tiny_family(&model_dir, "qwen3", 3);
+
+    // The naive argmax chain from the prompt.
+    let mut tokens = HELLO.to_vec();
+    let mut expected = Vec::new();
+    for _ in 0..TOKENS {
+        let rows = naive::forward(&spec.config, &spec.dir, &tokens);
+        let last = rows.last().expect("a row");
+        let mut best = 0;
+        for (i, &v) in last.iter().enumerate() {
+            if v > last[best] {
+                best = i;
+            }
+        }
+        expected.push(best as u32);
+        tokens.push(best as u32);
+    }
+
+    let config = dir.path().join("config.yaml");
+    for _ in 0..LAUNCH_ATTEMPTS {
+        let addr = free_addr();
+        std::fs::write(&config, config_yaml(&model_dir, addr, "")).unwrap();
+        let mut child = spawn(&config);
+        let logs = drain_stderr(&mut child);
+        match wait_until_ready(&mut child, addr, &logs) {
+            Ready::PortTaken => continue,
+            Ready::Serving => {}
+        }
+        let status = request(addr, "GET", "/turbine/v1/status", None).json();
+        assert_eq!(status["modules"]["family"], "qwen3", "{status}");
+        assert_eq!(status["support"]["architecture"], "Qwen3ForCausalLM");
+        assert_eq!(status["support"]["status"], "experimental", "{status}");
+        let body = json!({"model": "tiny-qwen3", "prompt": HELLO, "max_tokens": TOKENS,
+                          "ignore_eos": true, "temperature": 0, "logprobs": 0,
+                          "return_tokens_as_token_ids": true});
+        let resp = request(addr, "POST", "/v1/completions", Some(&body.to_string()));
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(choice_token_ids(&resp.json()["choices"][0]), expected);
+        return;
+    }
+    panic!("turbine-server lost its port {LAUNCH_ATTEMPTS} times in a row");
 }

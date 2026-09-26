@@ -34,8 +34,8 @@ pub use config::MoeConfig;
 pub use config::{
     GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config, load_model_config,
 };
-pub use families::{FamilyConfig, FamilyRef, ModelFamily, llama_slots, olmoe_slots};
-pub use formats::{BoundToolFormat, Llama3JsonParser, ToolFormat};
+pub use families::{FamilyConfig, FamilyRef, ModelFamily, llama_slots, mixtral_slots, olmoe_slots};
+pub use formats::{BoundToolFormat, HermesParser, Llama3JsonParser, MistralParser, ToolFormat};
 pub use generate::{GenerateOptions, Generation, generate};
 pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot};
 pub use loader::{StackPlace, gate_up_proj_name, qkv_proj_name, stacked_experts_name};

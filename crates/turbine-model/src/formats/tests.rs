@@ -291,3 +291,289 @@ fn bind_refuses_missing_required_token() {
     let bound = bind(&Llama3Json, &tokenizer).expect("bind");
     assert_eq!(bound.format.name(), "llama3_json");
 }
+
+/// Compiles `format`'s grammar for `choice` / `parallel` over [`weather_tools`] on `compiler`
+/// and feeds `text`: `Ok(true)` when the grammar accepts the whole text and may end there.
+fn accepts(
+    compiler: &GrammarCompiler,
+    tokenizer: &Tokenizer,
+    eos: &[u32],
+    format: &dyn ToolFormat,
+    choice: &ToolChoice,
+    parallel: bool,
+    text: &str,
+) -> Result<bool, String> {
+    let limits = GrammarLimits {
+        max_schema_bytes: 64 * 1024,
+    };
+    let spec = format
+        .grammar(&weather_tools(), choice, parallel)
+        .expect("grammar");
+    let mut matcher = compiler.compile(&spec, &limits).expect("compile");
+    feed_text(matcher.as_mut(), tokenizer, eos, text)
+}
+
+/// An enveloped format's sample outputs over [`weather_tools`]: `one` a single `get_weather`
+/// call, `two` a `get_weather` then a `get_time` call (parallel), `time` a single `get_time`
+/// call, `bad` a `get_weather` call whose arguments break the schema, `unknown` a call of an
+/// unlisted tool, `texts` free text the `auto` grammar lets through and the parser leaves as
+/// content.
+struct Samples<'a> {
+    one: &'a str,
+    two: &'a str,
+    time: &'a str,
+    bad: &'a str,
+    unknown: &'a str,
+    texts: &'a [&'a str],
+}
+
+/// Render, grammar, parse and round trip of the registered format `name` over `s`.
+fn enveloped_conformance(name: &str, s: &Samples<'_>) {
+    let format = registry().get(name).expect("registered");
+    let tools = weather_tools();
+
+    // Render: the chat template renders the tools; the format does not.
+    assert_eq!(format.render_tools(&tools), None);
+
+    // Grammar: refuses what llama3_json refuses.
+    for (tools, choice) in [
+        (&tools[..], ToolChoice::None),
+        (&[][..], ToolChoice::Required),
+        (&tools[..], ToolChoice::Named("get_stock".into())),
+    ] {
+        assert!(
+            matches!(
+                format.grammar(tools, &choice, false),
+                Err(ModelError::Constraint(_))
+            ),
+            "{name}: {choice:?}"
+        );
+    }
+
+    // Parse: the sample calls give their names and compact arguments.
+    let parser = format.parser();
+    let weather = (
+        "get_weather".to_string(),
+        r#"{"location":"Oslo","unit":"celsius"}"#.to_string(),
+    );
+    let time = ("get_time".to_string(), "{}".to_string());
+    assert_eq!(
+        names_and_args(parser.parse(s.one)),
+        std::slice::from_ref(&weather)
+    );
+    assert_eq!(names_and_args(parser.parse(s.two)), [weather, time.clone()]);
+    assert_eq!(names_and_args(parser.parse(s.time)), [time]);
+    for text in s.texts {
+        assert_eq!(
+            parser.parse(text),
+            ToolParse::Content(text.to_string()),
+            "{name}: {text:?}"
+        );
+    }
+
+    // Round trip on the tiny tokenizer: what the grammar accepts, the parser turned into calls
+    // above; a broken schema, an unlisted tool or a second call where one is allowed is
+    // refused.
+    let (_dir, tokenizer) = tiny_tokenizer(&format!("turbine-formats-{name}"));
+    let compiler = GrammarCompiler::new(&tokenizer, &TINY_EOS).expect("token trie");
+    let ok = |choice: &ToolChoice, parallel, text: &str| {
+        accepts(
+            &compiler, &tokenizer, &TINY_EOS, format, choice, parallel, text,
+        )
+    };
+    let named = ToolChoice::Named("get_time".into());
+    assert_eq!(ok(&ToolChoice::Required, false, s.one), Ok(true), "{name}");
+    assert_eq!(ok(&ToolChoice::Required, true, s.two), Ok(true), "{name}");
+    assert!(ok(&ToolChoice::Required, false, s.two).is_err(), "{name}");
+    assert!(ok(&ToolChoice::Required, false, s.bad).is_err(), "{name}");
+    assert!(ok(&ToolChoice::Auto, true, s.unknown).is_err(), "{name}");
+    assert!(
+        ok(&ToolChoice::Required, false, "No call.").is_err(),
+        "{name}"
+    );
+    assert_eq!(ok(&named, true, s.time), Ok(true), "{name}");
+    assert!(ok(&named, true, s.one).is_err(), "{name}");
+    assert_eq!(ok(&ToolChoice::Auto, true, s.two), Ok(true), "{name}");
+    for text in s.texts {
+        assert_eq!(
+            ok(&ToolChoice::Auto, true, text),
+            Ok(true),
+            "{name}: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn hermes_conformance() {
+    let one = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Oslo\", \"unit\": \"celsius\"}}\n</tool_call>";
+    let time = "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {}}\n</tool_call>";
+    let two = format!("{one}\n{time}");
+    enveloped_conformance(
+        "hermes",
+        &Samples {
+            one,
+            two: &two,
+            time,
+            bad: "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"unit\": \"kelvin\"}}\n</tool_call>",
+            unknown: "<tool_call>\n{\"name\": \"get_stock\", \"arguments\": {}}\n</tool_call>",
+            texts: &[
+                "The sea is calm.",
+                "<think>\nhmm\n</think>\n\nIt is sunny.",
+                "<",
+                "  <b>bold</b>",
+            ],
+        },
+    );
+    // A leading reasoning block is dropped from a tool-call answer.
+    let parser = registry().get("hermes").unwrap().parser();
+    assert_eq!(
+        names_and_args(parser.parse(&format!("<think>\nweather\n</think>\n\n{time}"))),
+        [("get_time".to_string(), "{}".to_string())]
+    );
+    // The special tokens are optional: hermes binds on the tiny tokenizer, which lacks them.
+    let (_dir, tokenizer) = tiny_tokenizer("turbine-formats-hermes-bind");
+    let bound = bind(&Hermes, &tokenizer).expect("bind");
+    assert_eq!(bound.tokens.id("<tool_call>"), None);
+}
+
+#[test]
+fn mistral_conformance() {
+    let one = r#"[{"name": "get_weather", "arguments": {"location": "Oslo", "unit": "celsius"}}]"#;
+    let two = r#"[{"name": "get_weather", "arguments": {"location": "Oslo", "unit": "celsius"}}, {"name": "get_time", "arguments": {}}]"#;
+    let time = r#"[{"name": "get_time", "arguments": {}}]"#;
+    enveloped_conformance(
+        "mistral",
+        &Samples {
+            one,
+            two,
+            time,
+            bad: r#"[{"name": "get_weather", "arguments": {"unit": "kelvin"}}]"#,
+            unknown: r#"[{"name": "get_stock", "arguments": {}}]"#,
+            texts: &["It rains [sometimes].", "Plain answer."],
+        },
+    );
+    // `[TOOL_CALLS]` before the array (it decodes to no text on Mistral's tokenizer) parses.
+    let parser = registry().get("mistral").unwrap().parser();
+    assert_eq!(
+        names_and_args(parser.parse(&format!("[TOOL_CALLS] {time}"))),
+        [("get_time".to_string(), "{}".to_string())]
+    );
+    // The `auto` grammar refuses an array that is not a call.
+    let (_dir, tokenizer) = tiny_tokenizer("turbine-formats-mistral-array");
+    let compiler = GrammarCompiler::new(&tokenizer, &TINY_EOS).expect("token trie");
+    let array = accepts(
+        &compiler,
+        &tokenizer,
+        &TINY_EOS,
+        &Mistral,
+        &ToolChoice::Auto,
+        true,
+        "[1, 2]",
+    );
+    assert!(array.is_err(), "{array:?}");
+}
+
+/// The run-ahead's grammar cases on the real Llama-3.2 tokenizer (multi-byte tokens across the
+/// envelope and the JSON).
+#[test]
+fn hermes_and_mistral_grammars_on_llama_tokenizer() {
+    use crate::structured::tests::{LLAMA_EOS, llama_compiler};
+
+    let (tokenizer, compiler) = llama_compiler();
+    let ok = |format: &dyn ToolFormat, choice: &ToolChoice, parallel, text: &str| {
+        accepts(
+            &compiler, &tokenizer, &LLAMA_EOS, format, choice, parallel, text,
+        )
+    };
+    let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Oslo\"}}\n</tool_call>";
+    let time = "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {}}\n</tool_call>";
+    let two = format!("{call}\n{time}");
+    assert_eq!(ok(&Hermes, &ToolChoice::Required, false, call), Ok(true));
+    assert_eq!(ok(&Hermes, &ToolChoice::Required, true, &two), Ok(true));
+    assert!(ok(&Hermes, &ToolChoice::Required, false, &two).is_err());
+    for text in [
+        "The sea is calm.",
+        "<think>\nhmm\n</think>\n\nIt is sunny.",
+        "<",
+        call,
+    ] {
+        assert_eq!(
+            ok(&Hermes, &ToolChoice::Auto, true, text),
+            Ok(true),
+            "{text:?}"
+        );
+    }
+    let m_two = r#"[{"name": "get_weather", "arguments": {"location": "Rome"}}, {"name": "get_time", "arguments": {}}]"#;
+    let m_one = r#"[{"name": "get_time", "arguments": {}}]"#;
+    assert_eq!(ok(&Mistral, &ToolChoice::Required, true, m_two), Ok(true));
+    assert_eq!(ok(&Mistral, &ToolChoice::Required, false, m_one), Ok(true));
+    assert!(ok(&Mistral, &ToolChoice::Required, false, m_two).is_err());
+    for text in ["It rains [sometimes].", m_one] {
+        assert_eq!(
+            ok(&Mistral, &ToolChoice::Auto, true, text),
+            Ok(true),
+            "{text:?}"
+        );
+    }
+    assert!(ok(&Mistral, &ToolChoice::Auto, true, "[1, 2]").is_err());
+}
+
+/// The `auto` opening rules: Hermes holds an output whose text (after whitespace) starts with
+/// `<tool_call>` or whose first token is `<tool_call>`, waits while the text is still a prefix
+/// of it, and streams anything else — a leading `<think>` block included (calls after thinking
+/// are not parsed in `auto` mode, as the run-ahead has it). Mistral holds on a leading `[` or
+/// the `[TOOL_CALLS]` token and waits only on empty text.
+#[test]
+fn openings_of_hermes_and_mistral() {
+    const OPEN: u32 = 900;
+    const TOOL_CALLS: u32 = 901;
+    let hermes = BoundToolFormat {
+        format: &Hermes,
+        tokens: BoundTokens {
+            ids: vec![("<tool_call>", Some(OPEN)), ("</tool_call>", None)],
+        },
+    };
+    let a = Some(u32::from(b'a'));
+    for (text, first, expected) in [
+        ("", None, Opening::Undecided),
+        ("  \n", Some(u32::from(b' ')), Opening::Undecided),
+        ("<", Some(u32::from(b'<')), Opening::Undecided),
+        (" <tool_ca", Some(u32::from(b' ')), Opening::Undecided),
+        ("<tool_call>", Some(u32::from(b'<')), Opening::Call),
+        ("\n<tool_call>\n{", Some(u32::from(b'\n')), Opening::Call),
+        ("<tool_call>", Some(OPEN), Opening::Call),
+        ("<think>\nhmm", Some(u32::from(b'<')), Opening::Content),
+        ("<b>bold", Some(u32::from(b'<')), Opening::Content),
+        ("Sure", a, Opening::Content),
+    ] {
+        assert_eq!(
+            hermes.opens_like_call(text, first),
+            expected,
+            "hermes {text:?} first={first:?}"
+        );
+    }
+    let mistral = BoundToolFormat {
+        format: &Mistral,
+        tokens: BoundTokens {
+            ids: vec![("[TOOL_CALLS]", Some(TOOL_CALLS))],
+        },
+    };
+    for (text, first, expected) in [
+        ("", None, Opening::Undecided),
+        ("  ", Some(u32::from(b' ')), Opening::Undecided),
+        ("", Some(TOOL_CALLS), Opening::Call),
+        (" [", Some(TOOL_CALLS), Opening::Call),
+        ("[", Some(u32::from(b'[')), Opening::Call),
+        ("\n[{\"name\"", Some(u32::from(b'\n')), Opening::Call),
+        ("It", Some(u32::from(b'I')), Opening::Content),
+        ("{\"name\"", Some(u32::from(b'{')), Opening::Content),
+        ("<", Some(u32::from(b'<')), Opening::Content),
+        ("a[", a, Opening::Content),
+    ] {
+        assert_eq!(
+            mistral.opens_like_call(text, first),
+            expected,
+            "mistral {text:?} first={first:?}"
+        );
+    }
+}

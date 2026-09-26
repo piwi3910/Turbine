@@ -18,9 +18,14 @@ use crate::ModelError;
 use crate::tokenizer::Tokenizer;
 use crate::tools::{ToolCallParser, ToolChoice};
 
+mod envelope;
+pub mod hermes;
 pub mod llama3_json;
+pub mod mistral;
 
+pub use hermes::{Hermes, HermesParser};
 pub use llama3_json::{Llama3Json, Llama3JsonParser};
+pub use mistral::{Mistral, MistralParser};
 
 /// One way of writing tool calls.
 pub trait ToolFormat: Module {
@@ -138,7 +143,8 @@ pub fn bind(
     })
 }
 
-static TOOL_FORMATS: Registry<dyn ToolFormat> = Registry::new("tool_format", &[&Llama3Json]);
+static TOOL_FORMATS: Registry<dyn ToolFormat> =
+    Registry::new("tool_format", &[&Llama3Json, &Hermes, &Mistral]);
 
 /// Every tool-call format, in registration order.
 pub fn registry() -> &'static Registry<dyn ToolFormat> {

@@ -752,3 +752,37 @@ fn unsupported_row_exits_2_before_bind() {
     );
     TcpListener::bind(("127.0.0.1", port)).expect("the configured port must still be free");
 }
+
+/// Phase 2m S-4 / S-11: `model.tool_call_parser: hermes` (and `mistral`) names a registered
+/// tool format, so `--check-config` accepts it (main refused it); an unregistered format is
+/// still exit 2 naming the registered ones.
+#[test]
+fn hermes_config_loads() {
+    let cfg = TempConfig::new("hermes", "model:\n  path: /m\n");
+    for format in ["hermes", "mistral"] {
+        let set = format!("model.tool_call_parser={format}");
+        let out = wait_with_timeout(
+            spawn_server(&["--check-config", "--set", &set], &cfg.path),
+            Duration::from_secs(20),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{format}: {stderr}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("config ok"),
+            "{format}"
+        );
+    }
+    let out = wait_with_timeout(
+        spawn_server(
+            &["--check-config", "--set", "model.tool_call_parser=pythonic"],
+            &cfg.path,
+        ),
+        Duration::from_secs(20),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("(registered: llama3_json, hermes, mistral)"),
+        "{stderr}"
+    );
+}

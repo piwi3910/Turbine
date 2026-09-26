@@ -72,7 +72,7 @@ use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name};
 pub mod hooks;
 mod trace;
 
-pub use hooks::{MOE, PLAIN_ATTENTION, QK_NORM_FULL, SWIGLU};
+pub use hooks::{MOE, PLAIN_ATTENTION, QK_NORM_FULL, QK_NORM_PER_HEAD, SWIGLU};
 pub use trace::TraceTensor;
 use trace::Tracer;
 

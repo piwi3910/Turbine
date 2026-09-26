@@ -91,6 +91,15 @@ pub fn decoder_spec() -> DecoderSpec {
 /// gate/up as rows of its [`gate_up_proj_name`] parameter, so the executor runs one GEMM for each (or one per
 /// projection over row views of the same memory).
 pub fn llama_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
+    dense_slots(cfg, None)
+}
+
+/// [`llama_slots`] with Q and K norm weights of `qk_norm` elements each after the O projection
+/// (Qwen3: `[head_dim]` per head); `None` is exactly [`llama_slots`].
+pub(crate) fn dense_slots(
+    cfg: &ModelArchConfig,
+    qk_norm: Option<(usize, usize)>,
+) -> Vec<WeightSlot> {
     let hidden = cfg.hidden as usize;
     let q = cfg.num_attention_heads as usize * cfg.head_dim as usize;
     let kv = cfg.num_kv_heads as usize * cfg.head_dim as usize;
@@ -110,10 +119,20 @@ pub fn llama_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
         let p = format!("model.layers.{i}");
         slots.push(slot(format!("{p}.input_layernorm.weight"), vec![hidden]));
         slots.extend(qkv_slots(i, q, kv, hidden));
-        slots.extend([
-            slot(format!("{p}.self_attn.o_proj.weight"), vec![hidden, q]),
-            slot(format!("{p}.post_attention_layernorm.weight"), vec![hidden]),
-        ]);
+        slots.push(slot(
+            format!("{p}.self_attn.o_proj.weight"),
+            vec![hidden, q],
+        ));
+        if let Some((qn, kn)) = qk_norm {
+            slots.extend([
+                slot(format!("{p}.self_attn.q_norm.weight"), vec![qn]),
+                slot(format!("{p}.self_attn.k_norm.weight"), vec![kn]),
+            ]);
+        }
+        slots.push(slot(
+            format!("{p}.post_attention_layernorm.weight"),
+            vec![hidden],
+        ));
         slots.extend(row_concat(
             gate_up_proj_name(i),
             &[

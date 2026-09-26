@@ -571,7 +571,7 @@ fn warm_up(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turbine_model::families::{Llama, Olmoe};
+    use turbine_model::families::{Llama, Mistral, Mixtral, Olmoe, Qwen3, Qwen3Moe};
     use turbine_model::formats::llama3_json::LLAMA3_JSON;
 
     #[test]
@@ -621,5 +621,15 @@ mod tests {
         assert_eq!(resolve_tool_call_parser(LLAMA, &Olmoe, true), LLAMA);
         assert_eq!(resolve_tool_call_parser(LLAMA, &Llama, false), OFF);
         assert_eq!(resolve_tool_call_parser(Some("none"), &Llama, true), OFF);
+        // The Phase 8 families' defaults (Phase 2m S-11), and explicit Phase 8 formats.
+        let hermes = Some("hermes");
+        let mistral = Some("mistral");
+        assert_eq!(resolve_tool_call_parser(None, &Qwen3, true), hermes);
+        assert_eq!(resolve_tool_call_parser(None, &Qwen3Moe, true), hermes);
+        assert_eq!(resolve_tool_call_parser(None, &Mistral, true), mistral);
+        assert_eq!(resolve_tool_call_parser(None, &Mixtral, true), mistral);
+        assert_eq!(resolve_tool_call_parser(None, &Qwen3, false), OFF);
+        assert_eq!(resolve_tool_call_parser(hermes, &Llama, true), hermes);
+        assert_eq!(resolve_tool_call_parser(mistral, &Qwen3, true), mistral);
     }
 }

@@ -20,10 +20,18 @@ use crate::executor::{ExecutorLimits, ExecutorOptions, ModelExecutor};
 use crate::loader::{LoadedWeights, WeightSlot};
 
 pub mod llama;
+pub mod mistral;
+pub mod mixtral;
 pub mod olmoe;
+pub mod qwen3;
+pub mod qwen3_moe;
 
 pub use llama::{Llama, llama_slots};
+pub use mistral::Mistral;
+pub use mixtral::{Mixtral, mixtral_slots};
 pub use olmoe::{Olmoe, olmoe_slots};
+pub use qwen3::Qwen3;
+pub use qwen3_moe::Qwen3Moe;
 
 /// One decoder family.
 pub trait ModelFamily: Module {
@@ -73,6 +81,8 @@ pub struct FamilyConfig {
     pub moe: Option<MoeConfig>,
     /// RMSNorm over the full Q and K projections before RoPE (OLMoE).
     pub qk_norm: bool,
+    /// RMSNorm over each Q and K head before RoPE (Qwen3, Qwen3-MoE).
+    pub qk_norm_per_head: bool,
 }
 
 /// A registered family as a value of `ModelArchConfig`: equal by name, printed as its name.
@@ -93,7 +103,10 @@ impl std::fmt::Debug for FamilyRef {
     }
 }
 
-static FAMILIES: Registry<dyn ModelFamily> = Registry::new("model_family", &[&Llama, &Olmoe]);
+static FAMILIES: Registry<dyn ModelFamily> = Registry::new(
+    "model_family",
+    &[&Llama, &Olmoe, &Qwen3, &Qwen3Moe, &Mistral, &Mixtral],
+);
 
 /// Every model family, in the order error messages list them.
 pub fn registry() -> &'static Registry<dyn ModelFamily> {
@@ -106,6 +119,39 @@ pub(crate) fn invalid(detail: String) -> ModelError {
         path: PathBuf::from("config.json"),
         detail,
     }
+}
+
+/// The expert layout of a mixture-of-experts family's keys: `num_experts` (under the key
+/// `experts.0`) of width `inter` (under `inter.0`), `per_token` of them per token, each value
+/// required (`<hf> requires <key>`: [`invalid`]) and in range.
+pub(crate) fn experts(
+    hf: &str,
+    experts: (&str, Option<u32>),
+    per_token: Option<u32>,
+    inter: (&str, Option<u32>),
+    norm_topk_prob: bool,
+) -> Result<MoeConfig, ModelError> {
+    let required = |name: &str, value: Option<u32>| {
+        value.ok_or_else(|| invalid(format!("{hf} requires {name}")))
+    };
+    let num_experts = required(experts.0, experts.1)?;
+    let experts_per_token = required("num_experts_per_tok", per_token)?;
+    if experts_per_token == 0 || experts_per_token > num_experts {
+        return Err(invalid(format!(
+            "num_experts_per_tok {experts_per_token} must be between 1 and {} {num_experts}",
+            experts.0
+        )));
+    }
+    let expert_intermediate = required(inter.0, inter.1)?;
+    if expert_intermediate == 0 {
+        return Err(invalid(format!("{} must be non-zero", inter.0)));
+    }
+    Ok(MoeConfig {
+        num_experts,
+        experts_per_token,
+        expert_intermediate,
+        norm_topk_prob,
+    })
 }
 
 /// `name (HfName), …` for every registered family.
@@ -220,14 +266,35 @@ mod tests {
         let nested_only = json!({"text_config": {"architectures": ["LlamaForCausalLM"]}});
         assert_eq!(resolve(&nested_only).unwrap().0.name(), "llama");
 
-        let err = resolve(&json!({"architectures": ["MistralForCausalLM"]}))
+        // Every registered family resolves by its HF name, top level or nested.
+        for (name, hf) in [
+            ("llama", "LlamaForCausalLM"),
+            ("olmoe", "OlmoeForCausalLM"),
+            ("qwen3", "Qwen3ForCausalLM"),
+            ("qwen3_moe", "Qwen3MoeForCausalLM"),
+            ("mistral", "MistralForCausalLM"),
+            ("mixtral", "MixtralForCausalLM"),
+        ] {
+            assert_eq!(
+                resolve(&json!({"architectures": [hf]})).unwrap().0.name(),
+                name
+            );
+            let nested = json!({"architectures": ["W"], "text_config": {"architectures": [hf]}});
+            assert_eq!(resolve(&nested).unwrap().0.name(), name);
+        }
+
+        let err = resolve(&json!({"architectures": ["GptOssForCausalLM"]}))
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("registered families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM)"),
+            err.contains(
+                "registered families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 \
+                 (Qwen3ForCausalLM), qwen3_moe (Qwen3MoeForCausalLM), mistral \
+                 (MistralForCausalLM), mixtral (MixtralForCausalLM)"
+            ),
             "{err}"
         );
-        assert!(err.contains("MistralForCausalLM"), "{err}");
+        assert!(err.contains("GptOssForCausalLM"), "{err}");
         let err = resolve(&json!({})).unwrap_err().to_string();
         assert!(
             err.starts_with("unsupported architectures = <missing>;"),
