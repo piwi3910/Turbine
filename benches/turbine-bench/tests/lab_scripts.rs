@@ -200,14 +200,28 @@ fn heredoc<'a>(text: &'a str, cmd: &str) -> &'a str {
     &text[start..start + len]
 }
 
-/// The Job a dry run applies (the rendered template), parsed.
+/// The Job a dry run applies (the rendered template), parsed; the first one when it applies
+/// several.
 fn applied_job(text: &str) -> Value {
-    let manifest = heredoc(text, "export KUBECTL_KUBERC=false; kubectl apply -f -");
-    assert!(
-        !manifest.contains("__"),
-        "unrendered placeholder:\n{manifest}"
-    );
-    serde_norway::from_str(manifest).unwrap_or_else(|e| panic!("{e}:\n{manifest}"))
+    applied_jobs(text).remove(0)
+}
+
+/// Every Job a dry run applies, in order, parsed.
+fn applied_jobs(text: &str) -> Vec<Value> {
+    let open = format!("{SSH} 'export KUBECTL_KUBERC=false; kubectl apply -f -' <<'EOF'\n");
+    let mut jobs = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(&open) {
+        let manifest = heredoc(rest, "export KUBECTL_KUBERC=false; kubectl apply -f -");
+        assert!(
+            !manifest.contains("__"),
+            "unrendered placeholder:\n{manifest}"
+        );
+        jobs.push(serde_norway::from_str(manifest).unwrap_or_else(|e| panic!("{e}:\n{manifest}")));
+        rest = &rest[i + open.len() + manifest.len()..];
+    }
+    assert!(!jobs.is_empty(), "no kubectl apply in:\n{text}");
+    jobs
 }
 
 /// The run id a dry run announces (`run <id>: job ...`).
@@ -336,7 +350,9 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
     let text = dry_run("lab-test.sh", "test-default", &["--dry-run", "novanas"]);
     let id = run_id(&text, "lab-test");
     let job_name = format!("turbine-lab-test-{id}");
+    let build_name = format!("turbine-lab-build-{id}");
     let run_dir = format!("{CI_ROOT}/runs/{id}");
+    // The GPU-less build Job runs to completion before the GPU Job is applied.
     assert_in_order(
         &text,
         &[
@@ -345,17 +361,34 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
             &format!("piwi@192.168.10.203:{run_dir}/src/"),
             &format!("cat > {run_dir}/test-command"),
             "kubectl apply -f -",
+            &format!("kubectl -n turbine-ci logs -f job/{build_name}"),
+            &format!("wait until job {build_name} succeeds or fails"),
+            "kubectl apply -f -",
             &format!("kubectl -n turbine-ci logs -f job/{job_name}"),
+            &format!("wait until job {job_name} succeeds or fails"),
         ],
     );
-    // A run never deletes anything; cleanup (interrupt, unschedulable) names only its own Job.
+    // A run never deletes anything; cleanup (interrupt, unschedulable) names only its own Jobs.
     assert!(!text.contains(" delete "), "{text}");
     assert!(
         text.contains("-exec rm -rf {} +"),
         "stale uploads are pruned: {text}"
     );
 
-    let job = applied_job(&text);
+    let jobs = applied_jobs(&text);
+    assert_eq!(jobs.len(), 2, "a build Job and a GPU Job");
+    let (build, job) = (&jobs[0], &jobs[1]);
+    assert_eq!(str_at(build, "metadata.name"), build_name);
+    assert_eq!(str_at(build, "metadata.labels.turbine-lab-role"), "build");
+    assert_eq!(str_at(build, "metadata.labels.turbine-lab-run"), id);
+    assert_eq!(amd_gpus(build), 0, "the build claims no R9700");
+    assert_eq!(env(build, "TURBINE_LAB_PHASE"), "build");
+    assert_eq!(env(job, "TURBINE_LAB_PHASE"), "test");
+    // Same template otherwise: same mounts, and the slot handling is shared.
+    assert_eq!(mounts(build), mounts(job));
+    assert_eq!(script(build), script(job));
+
+    let job = job.clone();
     assert_eq!(str_at(&job, "metadata.name"), job_name);
     assert_eq!(str_at(&job, "metadata.namespace"), "turbine-ci");
     assert_eq!(str_at(&job, "metadata.labels.turbine-lab-role"), "test");
@@ -415,6 +448,8 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
         &s,
         &[
             "apt-get install -y -qq cmake ninja-build python3 rsync",
+            "if [[ $PHASE == test && -f \"$RUN_DIR/slot\" ]]; then PREFERRED=\"$(cat \"$RUN_DIR/slot\")\"; fi",
+            "for n in $PREFERRED $(seq 0 $((TURBINE_LAB_SLOTS - 1)))",
             "exec {LOCK_FD}>\"$TURBINE_LAB_CACHE/slots/test-$n.lock\"",
             "flock -n \"$LOCK_FD\"",
             "export CARGO_TARGET_DIR=\"$SLOT_DIR/target\"",
@@ -422,7 +457,7 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
             "export TURBINE_KERNEL_LIBRARY=\"$KERNEL_BUILD_DIR/libturbine_hip.so\"",
             "rsync -rlpc --delete \"$RUN_DIR/src/\" \"$SLOT_DIR/src/\"",
             "mapfile -d '' TEST_CMD < \"$RUN_DIR/test-command\"",
-            "rm -rf \"$RUN_DIR\"",
+            "if [[ $PHASE == test ]]; then rm -rf \"$RUN_DIR\"; fi",
             "cd \"$SLOT_DIR/src\"",
             "CMAKE_HOME_DIRECTORY:INTERNAL=$PWD/kernels/rocm",
             "if [[ ! -f \"$KERNEL_BUILD_DIR/CMakeCache.txt\" ]]",
@@ -430,6 +465,11 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
             "-DGPU_TARGETS=gfx1201",
             "cmake --build \"$KERNEL_BUILD_DIR\"",
             "test -f \"$TURBINE_KERNEL_LIBRARY\"",
+            "if [[ $PHASE == build ]]; then",
+            "BUILD_CMD+=(--no-run)",
+            "\"${BUILD_CMD[@]}\"",
+            "echo \"${SLOT#test-}\" > \"$RUN_DIR/slot\"",
+            "exit 0",
             "if [[ $HF_REFERENCE -eq 1 ]]",
             "https://astral.sh/uv/",
             "exec \"${TEST_CMD[@]}\"",
@@ -461,9 +501,10 @@ fn lab_test_gpus_2_is_the_inventory_path() {
         "test-gpus2",
         &["--dry-run", "novanas", "--gpus", "2"],
     );
-    let job = applied_job(&text);
-    assert_eq!(amd_gpus(&job), 2);
-    assert_eq!(env(&job, "TURBINE_EXPECT_AMD"), "2");
+    let jobs = applied_jobs(&text);
+    assert_eq!(amd_gpus(&jobs[0]), 0, "the build claims no R9700");
+    assert_eq!(amd_gpus(&jobs[1]), 2);
+    assert_eq!(env(&jobs[1], "TURBINE_EXPECT_AMD"), "2");
 }
 
 #[test]
@@ -559,7 +600,7 @@ fn lab_test_runs_get_unique_jobs_and_stop_touches_only_its_own() {
     assert_eq!(text.matches(" delete ").count(), 1, "one delete: {text}");
     assert!(
         text.contains(&format!(
-            "kubectl -n turbine-ci delete job turbine-lab-test-{ida} --ignore-not-found"
+            "kubectl -n turbine-ci delete job turbine-lab-build-{ida} turbine-lab-test-{ida} --ignore-not-found"
         )),
         "{text}"
     );

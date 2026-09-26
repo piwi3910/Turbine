@@ -7,6 +7,15 @@
 # (`cargo test --no-fail-fast …`, NUL-separated argv) to runs/<run id>/test-command;
 # runs/<run id>/hf-reference exists when --with-hf-reference was given (uv is installed then).
 #
+# Two phases, from this one template (the PHASE placeholder): the script first applies it as the
+# build Job turbine-lab-build-<run id> (phase build, `amd.com/gpu: 0`: no R9700 is claimed while
+# compiling), which syncs the slot, builds the kernels and runs the test command with `--no-run`,
+# records its slot in runs/<run id>/slot and exits; only then does it apply the GPU Job
+# turbine-lab-test-<run id> (phase test), which prefers that slot, so its sync, kernel build and
+# cargo test find everything built and start the tests at once. When another run took the slot in
+# between, the GPU Job simply builds in the slot it got: the build Job only warms a slot, it never
+# decides what the tests run on.
+#
 # Caches (hostPath, all under /home/piwi/turbine-ci/cache, kept between runs):
 #   cargo/{registry,git}  cargo downloads; cargo locks them itself, so all Jobs share them.
 #   apt/{archives,lists}  Debian packages; apt locks them itself.
@@ -76,10 +85,16 @@ spec:
               ) 9>/var/cache/apt/archives/turbine-lab.flock
               cmake --version | head -n 1
 
+              PHASE="$TURBINE_LAB_PHASE"
+              [[ $PHASE == build || $PHASE == test ]]
+
               step "take a workspace slot"
+              # The GPU Job tries the slot its build Job warmed first.
+              PREFERRED=""
+              if [[ $PHASE == test && -f "$RUN_DIR/slot" ]]; then PREFERRED="$(cat "$RUN_DIR/slot")"; fi
               SLOT=""
               for ((waited = 0; waited < 1800; waited += 5)); do
-                for n in $(seq 0 $((TURBINE_LAB_SLOTS - 1))); do
+                for n in $PREFERRED $(seq 0 $((TURBINE_LAB_SLOTS - 1))); do
                   exec {LOCK_FD}>"$TURBINE_LAB_CACHE/slots/test-$n.lock"
                   if flock -n "$LOCK_FD"; then SLOT="test-$n"; break 2; fi
                   exec {LOCK_FD}>&-
@@ -100,7 +115,8 @@ spec:
               [[ ${#TEST_CMD[@]} -gt 2 && "${TEST_CMD[0]} ${TEST_CMD[1]}" == "cargo test" ]]
               HF_REFERENCE=0
               [[ -e "$RUN_DIR/hf-reference" ]] && HF_REFERENCE=1
-              rm -rf "$RUN_DIR"
+              # The build Job leaves the upload for the GPU Job.
+              if [[ $PHASE == test ]]; then rm -rf "$RUN_DIR"; fi
               cd "$SLOT_DIR/src"
 
               step "build kernels/rocm"
@@ -122,6 +138,22 @@ spec:
               test -f "$TURBINE_KERNEL_LIBRARY"
               echo "lab-step: built $TURBINE_KERNEL_LIBRARY"
 
+              if [[ $PHASE == build ]]; then
+                # The test command up to its `--`, compiled but not run.
+                BUILD_CMD=()
+                for a in "${TEST_CMD[@]}"; do
+                  [[ "$a" == -- ]] && break
+                  BUILD_CMD+=("$a")
+                done
+                BUILD_CMD+=(--no-run)
+                step "cargo test --no-run"
+                echo "lab-step: ${BUILD_CMD[*]}"
+                "${BUILD_CMD[@]}"
+                echo "${SLOT#test-}" > "$RUN_DIR/slot"
+                echo "lab-step: built in slot $SLOT"
+                exit 0
+              fi
+
               if [[ $HF_REFERENCE -eq 1 ]]; then
                 step "install uv $UV_VERSION"
                 if [[ "$("$UV_INSTALL_DIR/uv" --version 2>/dev/null)" != "uv $UV_VERSION"* ]]; then
@@ -138,6 +170,9 @@ spec:
           env:
             - name: TURBINE_LAB_RUN_ID
               value: "__RUN_ID__"
+            # build: compile only, without a GPU; test: run the tests on the GPU(s).
+            - name: TURBINE_LAB_PHASE
+              value: "__PHASE__"
             - name: TURBINE_LAB_ROOT
               value: /home/piwi/turbine-ci
             - name: TURBINE_LAB_CACHE
