@@ -21,6 +21,7 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 | 2026-09-26 | 006cec7 | rope/silu_mul spread over the device (280/0) | 285.5 | 45.9 | 1512 | 40.3 | c1 16/16; c16 16/16 | −0.2% |
 | 2026-09-26 | 288dbc2 | kernel ABI v2.1 (optional symbols; no runtime change) (285/0) | 292.1 | 45.6 | 1509 | 39.9 | c1 16/16; c16 16/16 | +2.3% |
 | 2026-09-26 | 750872c | **KV pages 128 → CK fmha_fwd_pagedkv for prefill and decode (290/0) — passes the 553 target (84% of vLLM)** | **623.6** | 21.9 | 575 | 19.6 | c1 16/16; c16 16/16 | +113% |
+| 2026-09-26 | (06f87c1, reverted) | fused QKV + gate/up GEMMs — REGRESSION; same build with execution.fused_ops=false: 624.6 tok/s, fwd 19.6 ms → the fused path itself is slower; reverted pending diagnosis | 556.7 | 25.1 | 572 | 22.2 | c1 16/16; c16 16/16 | −10.7% |
 
 ## OLMoE-1B-7B-0125-Instruct (BF16)
 
