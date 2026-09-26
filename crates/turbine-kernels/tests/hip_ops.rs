@@ -3571,6 +3571,7 @@ fn prefill_shapes_match_cpu() {
         num_experts: MOE_EXPERTS as u32,
         top_k: MOE_TOP_K as u32,
         renormalize: false,
+        bf16_logits: true,
     };
     for tokens in [680, 2048] {
         route_case(&p, olmoe, tokens, &rng.normal(tokens * MOE_EXPERTS, 2.0));
@@ -3745,6 +3746,7 @@ fn prefill_op_timings() {
                     num_experts: experts as u32,
                     top_k: top_k as u32,
                     renormalize: false,
+                    bf16_logits: true,
                 };
                 let experts_cfg = MoeExpertsConfig {
                     hidden: h as u32,
