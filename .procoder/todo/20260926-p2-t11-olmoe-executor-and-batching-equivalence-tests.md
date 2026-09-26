@@ -1,6 +1,6 @@
 # P2-T11 OLMoE executor and batching equivalence tests
 
-Status: open
+Status: done
 Created: 2026-09-26
 
 ## Description

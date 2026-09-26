@@ -1,6 +1,6 @@
 # P2-T15 Engine thread with continuous batching, bounded channels and diagnostics
 
-Status: open
+Status: done
 Created: 2026-09-26
 
 ## Description

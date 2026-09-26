@@ -1,6 +1,6 @@
 # P2-T16 Timeouts, slow clients and graceful shutdown
 
-Status: open
+Status: done
 Created: 2026-09-26
 
 ## Description

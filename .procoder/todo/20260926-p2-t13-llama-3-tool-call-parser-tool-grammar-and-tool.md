@@ -1,6 +1,6 @@
 # P2-T13 Llama-3 tool-call parser, tool grammar and tool rendering
 
-Status: open
+Status: done
 Created: 2026-09-26
 
 ## Description

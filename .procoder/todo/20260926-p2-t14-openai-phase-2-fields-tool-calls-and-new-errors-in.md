@@ -1,6 +1,6 @@
 # P2-T14 OpenAI Phase 2 fields, tool calls and new errors in turbine-api
 
-Status: open
+Status: done
 Created: 2026-09-26
 
 ## Description

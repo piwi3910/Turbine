@@ -1,6 +1,6 @@
 # P2-T20 Lab configs, OLMoE weights and fixtures, tool/JSON lab test on novanas
 
-Status: open
+Status: done
 Created: 2026-09-26
 
 ## Description
@@ -9,7 +9,7 @@ Phase 2 plan Task 20 (`.procoder/plans/phase-2-serving-runtime.md`, "## Task 20"
 
 ## Acceptance criteria
 
-- [ ] `scripts/lab-test.sh novanas` passes (expect PASS)
+- [x] `scripts/lab-test.sh novanas` passes (expect PASS)
 - [x] Gate clean: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings` exits 0
 - [x] Committed on branch phase-2-serving-runtime with the plan's commit message (`test(lab): phase 2 configs, OLMoE reference and tool/JSON lab test`)
 
@@ -33,3 +33,8 @@ Remaining (need the user's approval and the engine of Tasks 15–18):
 2. Ask the user, then generate `tests/golden/olmoe-1b-7b-0125-instruct/reference.jsonl` with `scripts/golden/hf_reference.py` on novanas and commit it.
 3. After Tasks 17 and 18 land and an R9700 is free: `scripts/lab-test.sh novanas` → expect `test paged_and_moe_ops ... ok`, `test tools_and_json_schema ... ok`, Job exit 0.
 
+Lab (2026-09-26, `phase-2c-performance` at 8acce3e, one R9700):
+
+- Full suite `scripts/lab-test.sh novanas` (job `turbine-lab-test-0926145924-0b19b6df`): `test paged_and_moe_ops ... ok`, `test tools_and_json_schema ... ok` (12/12 fixture requests: required, named, auto, json_schema, json_object), `test logits_match_reference ... ok`; 318 passed, 2 failed — `forward_profile` (OOM: a stray native server held GPU 0) and `registry::tests::selection_order_and_reason` (tracing interest-cache flake, fixed in 8acce3e).
+- `scripts/lab-test.sh novanas -- -p turbine-model -p turbine-kernels` (job `turbine-lab-test-0926153446-352ee5a9`): 167 passed; `paged_and_moe_ops ... ok`, `logits_match_reference` 16/16; 4 OOM failures because the job shared GPU 0 with a benchmark server started outside k8s.
+- Rerun of those four on a free card (job `turbine-lab-test-0926155359-0351abe4`), exit 0: `decode_forward_timing ... ok`, `olmoe_logits_match_reference ... ok` (16/16 prompts, need 14, calibrated OLMoE tolerance), `forward_profile ... ok`, `serving_mix ... ok`.

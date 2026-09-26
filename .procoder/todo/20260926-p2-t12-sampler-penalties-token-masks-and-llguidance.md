@@ -1,6 +1,6 @@
 # P2-T12 Sampler penalties, token masks and llguidance structured output
 
-Status: open
+Status: done
 Created: 2026-09-26
 
 ## Description

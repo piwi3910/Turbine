@@ -1,6 +1,6 @@
 # P2-T17 Phase 2 OpenAI fields, preemption, structured output and tools in the engine
 
-Status: open
+Status: done
 Created: 2026-09-26
 
 ## Description

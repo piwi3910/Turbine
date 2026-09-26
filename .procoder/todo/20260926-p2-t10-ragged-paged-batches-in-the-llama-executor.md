@@ -1,6 +1,6 @@
 # P2-T10 Ragged paged batches in the Llama executor
 
-Status: open
+Status: done
 Created: 2026-09-26
 
 ## Description
