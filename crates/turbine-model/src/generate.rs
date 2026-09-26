@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use turbine_core::request::{
-    CancelFlag, ErrorCode, FinishReason, GenerationEvent, GenerationRequest, Usage,
+    CancelFlag, ErrorCode, FinishReason, GenerationEvent, GenerationRequest, StopConditions, Usage,
 };
 
 use crate::executor::{BatchInput, ModelExecutor};
@@ -42,7 +42,7 @@ pub fn generate<'a>(
         req,
         cancel,
         opts,
-        sampler: Sampler::new(&req.sampling),
+        sampler: Sampler::new(&req.sampling, &req.prompt_tokens, &end_ids(&req.stop)),
         detok: IncrementalDetokenizer::new(tokenizer),
         held: String::new(),
         generated: 0,
@@ -57,6 +57,16 @@ enum State {
     Running,
     /// Finished, failed or cancelled: only queued events remain.
     Done,
+}
+
+/// The ids `min_tokens` holds back: EOS (unless ignored) and the request's stop token ids.
+fn end_ids(stop: &StopConditions) -> Vec<u32> {
+    let eos = if stop.ignore_eos {
+        &[][..]
+    } else {
+        &stop.eos_token_ids[..]
+    };
+    eos.iter().chain(&stop.stop_token_ids).copied().collect()
 }
 
 /// The event stream of one request; see [`generate`].
@@ -149,8 +159,9 @@ impl Generation<'_> {
             }
         };
         let vocab = logits.vocab;
-        let sampled = self.sampler.sample(&mut logits.data[..vocab]);
+        let sampled = self.sampler.sample(&mut logits.data[..vocab], None);
         let token = sampled.token;
+        self.sampler.observe(token);
         self.generated += 1;
         self.last_token = Some(token);
 

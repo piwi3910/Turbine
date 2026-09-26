@@ -38,6 +38,12 @@ half.workspace = true
 rand_chacha.workspace = true
 # OS entropy seed (`os_rng`) when a request carries no `seed`
 rand_core.workspace = true
+# Structured output (P2 S-17/S-18): llguidance matchers over JSON schemas and Lark tool grammars;
+# MIT license, pinned =1.8.0 in the workspace manifest
+llguidance.workspace = true
+# The llguidance token trie, built once from the same tokenizers 0.21 `Tokenizer`; MIT license,
+# pinned =1.8.0
+toktrie_hf_tokenizers.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -45,3 +51,5 @@ unsafe_code = "forbid"
 [dev-dependencies]
 # hip_matches_cpu (lab only): the AMD device the HIP context is created on
 turbine-device.workspace = true
+# structured::tests: constrained outputs validate against their schema
+jsonschema.workspace = true

@@ -1,5 +1,5 @@
-//! Model-layer metrics (P1 S-14): load time and weight bytes of the served model, and the
-//! duration of every forward pass by phase.
+//! Model-layer metrics (P1 S-14, P2 S-17): load time and weight bytes of the served model, the
+//! duration of every forward pass by phase, grammar compilation and token-mask computation.
 use std::sync::atomic::AtomicU64;
 
 use prometheus_client::encoding::EncodeLabelSet;
@@ -38,13 +38,25 @@ pub struct WeightFormatLabels {
     pub format: String,
 }
 
+/// Labels of `turbine_grammar_compile_seconds`: `json_object`, `json_schema` or `tool_call`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct GrammarKindLabels {
+    kind: &'static str,
+}
+
+/// 1 ms doubling to ~33 s: a trivial grammar up to a compile hitting its timeout.
+fn grammar_compile_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(0.001, 2.0, 16))
+}
+
 /// 0.5 ms doubling to ~16 s: a tiny-model decode step up to a long prefill.
 fn forward_histogram() -> Histogram {
     Histogram::new(exponential_buckets(0.0005, 2.0, 16))
 }
 
-/// `turbine_model_load_seconds`, `turbine_model_weight_bytes{format}` and
-/// `turbine_forward_seconds{phase}`. Cloning shares the registered metrics.
+/// `turbine_model_load_seconds`, `turbine_model_weight_bytes{format}`,
+/// `turbine_forward_seconds{phase}`, `turbine_grammar_compile_seconds{kind}` and
+/// `turbine_token_mask_seconds`. Cloning shares the registered metrics.
 #[derive(Clone, Debug)]
 pub struct ModelMetrics {
     /// Wall time of the model load (weights to device, executor built).
@@ -53,10 +65,14 @@ pub struct ModelMetrics {
     pub weight_bytes: Family<WeightFormatLabels, Gauge>,
     /// Duration of each forward pass by phase.
     pub forward_seconds: Family<PhaseLabels, Histogram, fn() -> Histogram>,
+    /// Duration of each successful grammar compilation by constraint kind.
+    pub grammar_compile_seconds: Family<GrammarKindLabels, Histogram, fn() -> Histogram>,
+    /// Duration of each per-step allowed-token mask computation.
+    pub token_mask_seconds: Histogram,
 }
 
 impl ModelMetrics {
-    /// Registers the three model metric families in `reg`.
+    /// Registers the model metric families in `reg`.
     pub fn register(reg: &MetricsRegistry) -> ModelMetrics {
         ModelMetrics {
             load_seconds: reg.register(
@@ -75,6 +91,19 @@ impl ModelMetrics {
                 Family::<PhaseLabels, Histogram, fn() -> Histogram>::new_with_constructor(
                     forward_histogram,
                 ),
+            ),
+            grammar_compile_seconds: reg.register(
+                "turbine_grammar_compile_seconds",
+                "Duration of one constrained-decoding grammar compilation by kind",
+                Family::<GrammarKindLabels, Histogram, fn() -> Histogram>::new_with_constructor(
+                    grammar_compile_histogram,
+                ),
+            ),
+            token_mask_seconds: reg.register(
+                "turbine_token_mask_seconds",
+                "Duration of one allowed-token mask computation",
+                // 10 µs doubling to ~0.3 s
+                Histogram::new(exponential_buckets(0.000_01, 2.0, 16)),
             ),
         }
     }
@@ -97,6 +126,18 @@ impl ModelMetrics {
             })
             .observe(seconds);
     }
+
+    /// Adds one grammar compilation to `turbine_grammar_compile_seconds{kind}`.
+    pub fn observe_grammar_compile(&self, kind: &'static str, seconds: f64) {
+        self.grammar_compile_seconds
+            .get_or_create(&GrammarKindLabels { kind })
+            .observe(seconds);
+    }
+
+    /// Adds one mask computation to `turbine_token_mask_seconds`.
+    pub fn observe_token_mask(&self, seconds: f64) {
+        self.token_mask_seconds.observe(seconds);
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +152,8 @@ mod tests {
         m.observe_forward(ForwardPhase::Prefill, 0.25);
         m.observe_forward(ForwardPhase::Decode, 0.01);
         m.observe_forward(ForwardPhase::Decode, 0.02);
+        m.observe_grammar_compile("json_schema", 0.2);
+        m.observe_token_mask(0.0001);
         let text = reg.render().expect("render");
         assert!(text.contains("turbine_model_load_seconds 1.5"), "{text}");
         assert!(
@@ -123,6 +166,14 @@ mod tests {
         );
         assert!(
             text.contains("turbine_forward_seconds_count{phase=\"decode\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("turbine_grammar_compile_seconds_count{kind=\"json_schema\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("turbine_token_mask_seconds_count 1"),
             "{text}"
         );
     }

@@ -1,6 +1,6 @@
 //! Model layer (Phase 1): the Hugging Face config and its architecture allowlist, safetensors
 //! loading, tokenizer and chat template, the Llama executor, sampling and the single-request
-//! generation loop.
+//! generation loop; Phase 2 adds sampler penalties and constrained decoding (`structured`).
 use std::path::PathBuf;
 
 use turbine_kernels::KernelError;
@@ -15,6 +15,7 @@ pub mod loader;
 pub mod metrics;
 pub mod safetensors;
 pub mod sampler;
+pub mod structured;
 pub mod testing;
 pub mod tokenizer;
 
@@ -30,7 +31,10 @@ pub use generate::{GenerateOptions, Generation, generate};
 pub use loader::olmoe_slots;
 pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot, llama_slots};
 pub use metrics::{ForwardPhase, ModelMetrics};
-pub use sampler::{SampledToken, Sampler};
+pub use sampler::{SampledToken, Sampler, SamplerState};
+pub use structured::{
+    GrammarCompiler, GrammarLimits, TokenMask, TokenMatcher, constraint_kind, step_mask,
+};
 pub use tokenizer::{IncrementalDetokenizer, Tokenizer};
 
 /// Every failure of the model layer (contract §10). Messages name the offending file, field or
@@ -61,6 +65,10 @@ pub enum ModelError {
     Budget(String),
     #[error("template: {0}")]
     Template(String),
+    /// Constrained decoding (P2 S-17/S-18): a grammar that does not compile or exceeds its
+    /// bounds (naming the keyword or bound), or a matcher failing mid-generation.
+    #[error("constraint: {0}")]
+    Constraint(String),
     #[error(transparent)]
     Kernel(#[from] KernelError),
 }
