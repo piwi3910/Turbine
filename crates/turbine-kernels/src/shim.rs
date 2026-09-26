@@ -432,9 +432,10 @@ fn to_i32(name: &str, v: impl TryInto<i32> + Copy + fmt::Display) -> Result<i32,
 /// Checks that `v` has `rank` dimensions and that every dimension after the first is dense
 /// (the C ABI describes a view by its row stride only), and returns that row stride.
 fn row_stride(name: &str, v: &TensorView<'_>, rank: usize) -> Result<i64, KernelError> {
-    if v.shape.len() != rank || v.strides.len() != rank {
+    // A rank-0 view has no rows; reject it rather than index `strides[0]`.
+    if rank == 0 || v.shape.len() != rank || v.strides.len() != rank {
         return Err(invalid(format!(
-            "{name} has shape {:?}, expected rank {rank}",
+            "{name} has shape {:?}, expected rank {rank} (at least 1)",
             v.shape.as_slice()
         )));
     }
@@ -1510,6 +1511,21 @@ mod tests {
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");
         }
+    }
+
+    #[test]
+    fn row_stride_rejects_rank_zero() {
+        // A rank-0 view passes the shape/stride length check vacuously; it must be an error, not
+        // an out-of-bounds index on `strides[0]`.
+        let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 10);
+        let scalar = Tensor::empty(&host, &[], DType::BF16).expect("scalar tensor");
+        let err = row_stride("x", &scalar.view(), 0).expect_err("rank 0 has no row stride");
+        assert!(
+            matches!(&err, KernelError::InvalidArgument { message } if message.contains("rank")),
+            "{err:?}"
+        );
+        let matrix = Tensor::empty(&host, &[2, 3], DType::BF16).expect("matrix");
+        assert_eq!(row_stride("m", &matrix.view(), 2).expect("rank 2"), 3);
     }
 
     #[test]
