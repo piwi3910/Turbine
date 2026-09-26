@@ -27,7 +27,9 @@ use turbine_model::{
 };
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::host::HostMemory;
-use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView};
+use turbine_tensor::{
+    DeviceBuffer, DeviceMemory, DevicePtr, KvPoolView, MemInfo, MemoryError, StreamRef,
+};
 
 const SEED: u64 = 7;
 const PROMPT_LEN: usize = 20;
@@ -1016,6 +1018,86 @@ fn olmoe_cpu_forward_matches_naive() {
     renormalised.renormalize = true;
     let diff = max_abs_diff(&row, &renormalised.logits(&tokens));
     assert!(diff > 1e-3, "renormalisation changes nothing: {diff}");
+}
+
+/// Host memory without device-to-device copies, like the HIP shim under kernel ABI v2 (D2D
+/// arrives in v3): an executor that needs `copy_d2d` fails on it exactly as on the R9700.
+struct NoD2dMemory(Arc<HostMemory>);
+
+impl DeviceMemory for NoD2dMemory {
+    fn device(&self) -> DeviceId {
+        self.0.device()
+    }
+    fn alloc(&self, bytes: usize) -> Result<DevicePtr, MemoryError> {
+        self.0.alloc(bytes)
+    }
+    fn free(&self, ptr: DevicePtr) {
+        self.0.free(ptr)
+    }
+    fn copy_h2d(&self, dst: DevicePtr, src: &[u8]) -> Result<(), MemoryError> {
+        self.0.copy_h2d(dst, src)
+    }
+    fn copy_d2h(&self, dst: &mut [u8], src: DevicePtr) -> Result<(), MemoryError> {
+        self.0.copy_d2h(dst, src)
+    }
+    fn copy_d2d(&self, _: DevicePtr, _: DevicePtr, _: usize) -> Result<(), MemoryError> {
+        Err(MemoryError::Unsupported(
+            "device-to-device copy needs kernel ABI v3".into(),
+        ))
+    }
+    fn synchronize(&self) -> Result<(), MemoryError> {
+        self.0.synchronize()
+    }
+    fn mem_info(&self) -> Result<MemInfo, MemoryError> {
+        self.0.mem_info()
+    }
+    fn compute_stream(&self) -> StreamRef {
+        self.0.compute_stream()
+    }
+    fn as_host(&self) -> Option<&HostMemory> {
+        Some(&self.0)
+    }
+}
+
+/// Both executors load and serve (prefill, decode, block fork) on memory without
+/// device-to-device copies (kernel ABI v2 on the HIP shim), with the logits of the same model on
+/// plain host memory bit for bit.
+#[test]
+fn executors_run_without_device_to_device_copies() {
+    const STEPS: usize = 4;
+    let tmp = TempDir::new("tiny-model-no-d2d");
+    for spec in both_checkpoints(&tmp) {
+        let arch = spec.config.architecture;
+        let mut rows: Vec<Vec<Vec<f32>>> = Vec::new();
+        let plain: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let no_d2d: Arc<dyn DeviceMemory> =
+            Arc::new(NoD2dMemory(HostMemory::new(DeviceId(0), 1 << 30)));
+        for mem in [plain, no_d2d] {
+            let mut exec = cpu_model(&spec, &mem, MAX_SEQ_LEN);
+            let layout = *exec.kv_layout();
+            let blocks = MAX_SEQ_LEN.div_ceil(BLOCK_TOKENS);
+            let storage = pool(&mem, &layout, 2 * blocks);
+            let kv = pool_view(&storage, &layout, 2 * blocks);
+            let table: Vec<BlockId> = (0..blocks).map(BlockId).collect();
+            let fork: Vec<BlockId> = (blocks..2 * blocks).map(BlockId).collect();
+            let mut tokens = prompt(spec.vocab);
+            let mut row = run_seq(exec.as_mut(), &kv, &table, &tokens, 0);
+            let mut seen = vec![row.clone()];
+            for _ in 0..STEPS {
+                let next = argmax(&row);
+                let pos = tokens.len() as u32;
+                tokens.push(next);
+                row = run_seq(exec.as_mut(), &kv, &table, &[next], pos);
+                seen.push(row.clone());
+            }
+            exec.copy_blocks(&kv, &table, &fork).expect("fork");
+            let next = argmax(&row);
+            let pos = tokens.len() as u32;
+            seen.push(run_seq(exec.as_mut(), &kv, &fork, &[next], pos));
+            rows.push(seen);
+        }
+        assert_eq!(rows[0], rows[1], "{arch:?}: logits differ without copy_d2d");
+    }
 }
 
 /// For both tiny checkpoints, a 300-token prompt prefilled in chunks of 64 (each chunk

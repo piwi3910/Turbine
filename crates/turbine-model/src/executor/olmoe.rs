@@ -3,7 +3,9 @@
 //! K projections (`q_norm`, `k_norm`) → standard RoPE → paged causal attention, which appends
 //! the new K/V rows into each sequence's pool blocks → O projection → residual add → RMSNorm →
 //! router GEMM with F32 logits → `moe_route` (softmax, top-k, renormalised only with
-//! `norm_topk_prob`) → `moe_experts` into a zeroed BF16 accumulator → residual add) → final
+//! `norm_topk_prob`) → `moe_experts` into a BF16 accumulator zeroed by adding two zero buffers
+//! (one elementwise launch; kernel ABI v2 has no device-to-device copy or memset) → residual
+//! add) → final
 //! RMSNorm on each sequence's last row → untied LM head with FP32 output.
 //!
 //! This is transformers' `OlmoeSparseMoeBlock` numerics: the experts' weighted outputs are
@@ -11,10 +13,10 @@
 //! Batch packing, the KV pool and the block fork are shared with the Llama executor
 //! ([`super::batch`]).
 //!
-//! Expert weights are uploaded per expert by the loader and stacked here into
-//! `[experts, inter, hidden]` (gate, up) and `[experts, hidden, inter]` (down) tensors, the
-//! layout the `moe_experts` op takes; each per-expert tensor is freed once its layer's stack is
-//! complete. `moe_experts` needs the group sizes on the host, so every layer reads the
+//! The loader uploads each expert's weights straight into its layer's stacked
+//! `[experts, inter, hidden]` (gate, up) and `[experts, hidden, inter]` (down) tensors
+//! ([`crate::loader::stacked_experts_name`]), the layout the `moe_experts` op takes, so loading
+//! needs no device-to-device copy. `moe_experts` needs the group sizes on the host, so every layer reads the
 //! `[experts + 1]` expert offsets back after routing (a small blocking copy); the batch's
 //! logits remain its only bulk device-to-host copy.
 use std::sync::Arc;
@@ -32,7 +34,7 @@ use super::llama::{ACT, ADD_CFG, attention_cfg, gemm_cfg, invalid, limits, rope_
 use super::{BatchInput, Logits, ModelExecutor, rope};
 use crate::ModelError;
 use crate::config::{Architecture, ModelArchConfig, MoeConfig};
-use crate::loader::{LM_HEAD, LoadedWeights};
+use crate::loader::{LM_HEAD, LoadedWeights, stacked_experts_name};
 
 const I32: usize = 4;
 const F32: usize = 4;
@@ -170,7 +172,7 @@ struct Buffers {
     attn: Tensor,
     /// O projection output, then the MoE accumulator, before each residual add.
     proj: Tensor,
-    /// BF16 zeros that reset the MoE accumulator.
+    /// BF16 zeros; `zeros + zeros` resets the MoE accumulator.
     zeros: Tensor,
     /// `[tokens, experts]` F32.
     router_logits: Tensor,
@@ -198,7 +200,6 @@ pub struct OlmoeExecutor {
     kv_layout: KvLayout,
     limits: BatchLimits,
     registry: Arc<KernelRegistry>,
-    mem: Arc<dyn DeviceMemory>,
     embed: Tensor,
     layers: Vec<Layer>,
     final_norm: Tensor,
@@ -209,40 +210,24 @@ pub struct OlmoeExecutor {
     host: HostBatch,
 }
 
-/// Moves the per-expert tensors `{prefix}.{e}.{proj}.weight` of every expert into one stacked
-/// `[experts, rows, cols]` tensor (device-to-device copies), then frees them.
-fn stack_experts(
-    mem: &Arc<dyn DeviceMemory>,
+/// Layer `layer`'s stacked expert projection `proj`, as the loader filled it, checked to be
+/// `shape` BF16.
+fn stacked_experts(
     weights: &mut LoadedWeights,
-    prefix: &str,
+    layer: u32,
     proj: &str,
     shape: [usize; 3],
 ) -> Result<Tensor, ModelError> {
-    let stacked = Tensor::empty(mem, &shape, ACT)?;
-    let per_expert = shape[1] * shape[2] * ACT.size_bytes();
-    let mut parts = Vec::with_capacity(shape[0]);
-    for e in 0..shape[0] {
-        let name = format!("{prefix}.{e}.{proj}.weight");
-        let part = weights.take(&name)?;
-        if part.shape.as_slice() != &shape[1..] || part.dtype != ACT {
-            return Err(invalid(format!(
-                "{name} is {:?} {}, expected {:?} {}",
-                part.shape.as_slice(),
-                part.dtype.as_str(),
-                &shape[1..],
-                ACT.as_str()
-            )));
-        }
-        mem.copy_d2d(
-            stacked.storage.ptr().offset((e * per_expert) as u64),
-            part.storage.ptr(),
-            per_expert,
-        )?;
-        parts.push(part);
+    let name = stacked_experts_name(layer, proj);
+    let stacked = weights.take(&name)?;
+    if stacked.shape.as_slice() != shape || stacked.dtype != ACT {
+        return Err(invalid(format!(
+            "{name} is {:?} {}, expected {shape:?} {}",
+            stacked.shape.as_slice(),
+            stacked.dtype.as_str(),
+            ACT.as_str()
+        )));
     }
-    // The copies are enqueued: the sources are freed only once they completed.
-    mem.synchronize()?;
-    drop(parts);
     Ok(stacked)
 }
 
@@ -333,7 +318,7 @@ impl OlmoeExecutor {
             + DeviceBatch::bytes(&limits)
     }
 
-    /// Takes the parameters out of `weights` (stacking the per-expert tensors), allocates the
+    /// Takes the parameters out of `weights` (the expert weights stacked by the loader), allocates the
     /// activation, routing and batch buffers for `max_batch_tokens` tokens of up to `max_seqs`
     /// sequences on `mem`, and uploads the rotary inverse frequencies. Every forward names its
     /// KV pool, laid out as `cfg.kv_layout(block_tokens)`. `registry` must have been built from
@@ -377,7 +362,6 @@ impl OlmoeExecutor {
                 take("post_attention_layernorm")?,
                 take("mlp.gate")?,
             );
-            let experts = format!("{p}.mlp.experts");
             let gate_shape = [d.experts, d.inter, d.hidden];
             layers.push(Layer {
                 input_norm,
@@ -389,12 +373,11 @@ impl OlmoeExecutor {
                 k_norm,
                 post_norm,
                 router,
-                w_gate: stack_experts(&mem, &mut weights, &experts, "gate_proj", gate_shape)?,
-                w_up: stack_experts(&mem, &mut weights, &experts, "up_proj", gate_shape)?,
-                w_down: stack_experts(
-                    &mem,
+                w_gate: stacked_experts(&mut weights, i, "gate_proj", gate_shape)?,
+                w_up: stacked_experts(&mut weights, i, "up_proj", gate_shape)?,
+                w_down: stacked_experts(
                     &mut weights,
-                    &experts,
+                    i,
                     "down_proj",
                     [d.experts, d.hidden, d.inter],
                 )?,
@@ -446,7 +429,6 @@ impl OlmoeExecutor {
             kv_layout: limits.layout,
             limits,
             registry,
-            mem,
             embed,
             layers,
             final_norm,
@@ -593,10 +575,15 @@ impl OlmoeExecutor {
             .chunks_exact(I32)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        // The accumulator starts at zero, as transformers' `final_hidden_states`.
-        let bytes = t * d.hidden * ACT.size_bytes();
-        self.mem
-            .copy_d2d(b.proj.storage.ptr(), b.zeros.storage.ptr(), bytes)?;
+        // The accumulator starts at zero, as transformers' `final_hidden_states`: exactly
+        // `0 + 0` in BF16 (no device-to-device copy under kernel ABI v2).
+        self.registry
+            .elementwise(&ADD_CFG)
+            .execute(&mut ElementwiseContext {
+                a: Self::rows(&b.zeros, t),
+                b: Self::rows(&b.zeros, t),
+                out: Self::rows(&b.proj, t),
+            })?;
         let experts = experts_cfg(&self.cfg, &self.moe);
         let workspace_len = d.moe_workspace_bytes(t) as usize;
         self.registry

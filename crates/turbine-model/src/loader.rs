@@ -3,7 +3,10 @@
 //! each tensor to the device through one bounded, reused host staging buffer filled with
 //! positioned reads (`read_exact_at`; no `mmap`, so this crate stays free of `unsafe`).
 //! Checkpoint tensors no slot names are reported by name (`unexpected`), and a tied model's
-//! shipped `lm_head.weight` is `ignored`.
+//! shipped `lm_head.weight` is `ignored`. A slot may name a place in a stacked parameter
+//! ([`StackPlace`]): its bytes are uploaded straight into that parameter at the place's offset,
+//! so stacking (OLMoE's per-expert weights) needs no device-to-device copy, which the HIP shim
+//! lacks before kernel ABI v3.
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -11,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use turbine_core::types::DType;
+use turbine_kernels::KernelError;
 use turbine_tensor::{DeviceMemory, Tensor};
 
 use crate::ModelError;
@@ -22,11 +26,31 @@ pub const MAX_STAGING_BYTES: usize = 256 << 20;
 /// The untied output projection; ignored when the model ties it to the embedding.
 pub const LM_HEAD: &str = "lm_head.weight";
 
-/// One executor parameter: checkpoint tensor name and expected shape (row-major, elements).
+/// One executor parameter: checkpoint tensor name and expected shape (row-major, elements),
+/// and, for a slice of a stacked parameter, where it lands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WeightSlot {
     pub name: String,
     pub shape: Vec<usize>,
+    /// `Some`: the tensor is entry `index` of the stacked parameter `stack.name` and is loaded
+    /// only as part of it (`LoadedWeights` holds the stack, not the slot's own name).
+    pub stack: Option<StackPlace>,
+}
+
+/// Entry `index` along the first axis of the stacked parameter `name` of `shape`
+/// (`[count, slot shape…]`). Every index in `0..count` must be named by exactly one slot of the
+/// same slot shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackPlace {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub index: usize,
+}
+
+/// The stacked `[experts, rows, cols]` parameter of layer `layer`'s expert projection `proj`
+/// (`gate_proj`, `up_proj`, `down_proj`), as [`olmoe_slots`] loads it.
+pub fn stacked_experts_name(layer: u32, proj: &str) -> String {
+    format!("model.layers.{layer}.mlp.experts.{proj}.weight")
 }
 
 /// Every parameter slot of a Llama model, in load order: embedding, per layer the attention
@@ -37,7 +61,11 @@ pub fn llama_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
     let kv = cfg.num_kv_heads as usize * cfg.head_dim as usize;
     let inter = cfg.intermediate as usize;
     let vocab = cfg.vocab_size as usize;
-    let slot = |name: String, shape: Vec<usize>| WeightSlot { name, shape };
+    let slot = |name: String, shape: Vec<usize>| WeightSlot {
+        name,
+        shape,
+        stack: None,
+    };
 
     let mut slots = vec![slot(
         "model.embed_tokens.weight".into(),
@@ -68,7 +96,9 @@ pub fn llama_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
 /// weights with the Q/K norms (over the full `heads·head_dim` and `kv_heads·head_dim`
 /// projections), the router `mlp.gate.weight` `[experts, hidden]`, every expert's SwiGLU
 /// weights, the two layer norms, then the final norm and `lm_head.weight` only when untied.
-/// A dense config (`moe: None`) has no experts and yields only the non-MLP slots.
+/// Each expert projection is entry `e` of the layer's stacked `[experts, rows, cols]` parameter
+/// [`stacked_experts_name`] (the `moe_experts` layout). A dense config (`moe: None`) has no
+/// experts and yields only the non-MLP slots.
 pub fn olmoe_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
     let hidden = cfg.hidden as usize;
     let q = cfg.num_attention_heads as usize * cfg.head_dim as usize;
@@ -77,7 +107,11 @@ pub fn olmoe_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
     let (experts, inter) = cfg.moe.map_or((0, 0), |m| {
         (m.num_experts as usize, m.expert_intermediate as usize)
     });
-    let slot = |name: String, shape: Vec<usize>| WeightSlot { name, shape };
+    let slot = |name: String, shape: Vec<usize>| WeightSlot {
+        name,
+        shape,
+        stack: None,
+    };
 
     let mut slots = vec![slot(
         "model.embed_tokens.weight".into(),
@@ -96,12 +130,23 @@ pub fn olmoe_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
             slot(format!("{p}.post_attention_layernorm.weight"), vec![hidden]),
             slot(format!("{p}.mlp.gate.weight"), vec![experts, hidden]),
         ]);
+        let expert = |e: usize, proj: &str, shape: Vec<usize>| {
+            let stack = StackPlace {
+                name: stacked_experts_name(i, proj),
+                shape: [vec![experts], shape.clone()].concat(),
+                index: e,
+            };
+            WeightSlot {
+                name: format!("{p}.mlp.experts.{e}.{proj}.weight"),
+                shape,
+                stack: Some(stack),
+            }
+        };
         for e in 0..experts {
-            let x = format!("{p}.mlp.experts.{e}");
             slots.extend([
-                slot(format!("{x}.gate_proj.weight"), vec![inter, hidden]),
-                slot(format!("{x}.up_proj.weight"), vec![inter, hidden]),
-                slot(format!("{x}.down_proj.weight"), vec![hidden, inter]),
+                expert(e, "gate_proj", vec![inter, hidden]),
+                expert(e, "up_proj", vec![inter, hidden]),
+                expert(e, "down_proj", vec![hidden, inter]),
             ]);
         }
     }
@@ -133,7 +178,8 @@ pub(crate) fn require_bf16(entry: &TensorEntry) -> Result<(), ModelError> {
     }
 }
 
-/// The loaded parameters by checkpoint name, plus what the checkpoint held beyond them.
+/// The loaded parameters by checkpoint name (a stacked parameter by its [`StackPlace`] name),
+/// plus what the checkpoint held beyond them.
 #[derive(Debug)]
 pub struct LoadedWeights {
     pub tensors: HashMap<String, Tensor>,
@@ -159,11 +205,13 @@ impl LoadedWeights {
 pub struct WeightLoader;
 
 impl WeightLoader {
-    /// Validates every slot against `index` (present, BF16, expected shape), then allocates each
-    /// tensor on `mem` and uploads it through one host staging buffer of
-    /// `min(staging_bytes, MAX_STAGING_BYTES)` bytes (at least 1, at most the largest tensor).
-    /// Nothing is allocated when validation fails. The staging buffer is reused only after the
-    /// previous copy completed (`synchronize`), since device copies are enqueued.
+    /// Validates every slot against `index` (present, BF16, expected shape) and every stack
+    /// (each index named once, slot shapes matching), then allocates each tensor on `mem` and
+    /// uploads it through one host staging buffer of `min(staging_bytes, MAX_STAGING_BYTES)`
+    /// bytes (at least 1, at most the largest tensor); a stacked slot's bytes go straight to its
+    /// offset in the stacked tensor (host-to-device copies only). Nothing is allocated when
+    /// validation fails. The staging buffer is reused only after the previous copy completed
+    /// (`synchronize`), since device copies are enqueued.
     pub fn load(
         index: &SafetensorsIndex,
         slots: &[WeightSlot],
@@ -185,6 +233,7 @@ impl WeightLoader {
             }
             planned.push((slot, entry));
         }
+        check_stacks(slots)?;
 
         let wanted: HashSet<&str> = slots.iter().map(|s| s.name.as_str()).collect();
         let (mut unexpected, mut ignored) = (Vec::new(), Vec::new());
@@ -218,10 +267,18 @@ impl WeightLoader {
             .max(1);
         let mut staging = vec![0u8; staging_len];
         let mut files: HashMap<PathBuf, File> = HashMap::new();
-        let mut tensors = HashMap::with_capacity(planned.len());
+        let mut tensors: HashMap<String, Tensor> = HashMap::with_capacity(planned.len());
         let mut weight_bytes = 0u64;
         for (slot, entry) in planned {
-            let mut tensor = Tensor::empty(mem, &slot.shape, DType::BF16)?;
+            // The destination tensor and this slot's byte offset in it.
+            let (key, shape, base) = match &slot.stack {
+                Some(place) => (&place.name, &place.shape, place.index * slot_bytes(slot)),
+                None => (&slot.name, &slot.shape, 0),
+            };
+            if !tensors.contains_key(key) {
+                tensors.insert(key.clone(), Tensor::empty(mem, shape, DType::BF16)?);
+            }
+            let tensor = tensors.get_mut(key).expect("inserted above");
             let file = match files.get(&entry.file) {
                 Some(f) => f,
                 None => {
@@ -235,12 +292,11 @@ impl WeightLoader {
                 let chunk = &mut staging[..n];
                 file.read_exact_at(chunk, entry.range.start + done)
                     .map_err(|e| io_err(&entry.file, e))?;
-                tensor.storage.copy_from_host(done as usize, chunk)?;
+                tensor.storage.copy_from_host(base + done as usize, chunk)?;
                 mem.synchronize()?;
                 done += n as u64;
             }
             weight_bytes += entry.byte_len();
-            tensors.insert(slot.name.clone(), tensor);
         }
         tracing::debug!(
             event = "weights_loaded",
@@ -255,6 +311,46 @@ impl WeightLoader {
             ignored,
         })
     }
+}
+
+/// BF16 bytes of one slot's tensor.
+fn slot_bytes(slot: &WeightSlot) -> usize {
+    slot.shape.iter().product::<usize>() * DType::BF16.size_bytes()
+}
+
+/// Every stack is filled exactly: each index in `0..count` named by one slot whose shape is the
+/// stack's shape without its first axis.
+fn check_stacks(slots: &[WeightSlot]) -> Result<(), ModelError> {
+    let bad = |message: String| ModelError::Kernel(KernelError::InvalidArgument { message });
+    let mut stacks: HashMap<&str, (&[usize], Vec<bool>)> = HashMap::new();
+    for slot in slots {
+        let Some(place) = &slot.stack else { continue };
+        let count = place.shape.first().copied().unwrap_or(0);
+        let (shape, filled) = stacks
+            .entry(place.name.as_str())
+            .or_insert_with(|| (place.shape.as_slice(), vec![false; count]));
+        if place.shape.as_slice() != *shape || shape.get(1..) != Some(slot.shape.as_slice()) {
+            return Err(bad(format!(
+                "{} {:?} does not fit stack {} {:?}",
+                slot.name, slot.shape, place.name, place.shape
+            )));
+        }
+        match filled.get_mut(place.index) {
+            Some(f) if !*f => *f = true,
+            _ => {
+                return Err(bad(format!(
+                    "{} names index {} of stack {} twice or out of range",
+                    slot.name, place.index, place.name
+                )));
+            }
+        }
+    }
+    for (name, (_, filled)) in stacks {
+        if let Some(missing) = filled.iter().position(|f| !f) {
+            return Err(bad(format!("stack {name} has no slot for index {missing}")));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -273,7 +369,9 @@ mod tests {
         TinyOptions, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
     };
 
-    /// Host memory that counts allocations, to prove a failed validation allocates nothing.
+    /// Host memory that counts allocations, to prove a failed validation allocates nothing, and
+    /// has no device-to-device copy (as the HIP shim under kernel ABI v2), to prove loading
+    /// never needs one.
     struct CountingMemory {
         inner: Arc<HostMemory>,
         allocs: AtomicUsize,
@@ -296,13 +394,10 @@ mod tests {
         fn copy_d2h(&self, dst: &mut [u8], src: DevicePtr) -> Result<(), MemoryError> {
             self.inner.copy_d2h(dst, src)
         }
-        fn copy_d2d(
-            &self,
-            dst: DevicePtr,
-            src: DevicePtr,
-            bytes: usize,
-        ) -> Result<(), MemoryError> {
-            self.inner.copy_d2d(dst, src, bytes)
+        fn copy_d2d(&self, _: DevicePtr, _: DevicePtr, _: usize) -> Result<(), MemoryError> {
+            Err(MemoryError::Unsupported(
+                "device-to-device copy needs kernel ABI v3".into(),
+            ))
         }
         fn synchronize(&self) -> Result<(), MemoryError> {
             self.inner.synchronize()
@@ -471,29 +566,88 @@ mod tests {
         );
         assert_eq!(shape(LM_HEAD), [50_304, 2048]);
         assert!(!slots.iter().any(|s| s.name.contains("mlp.gate_proj")));
+        // Every expert projection is one entry of its layer's stacked parameter.
+        let place = |name: &str| slots.iter().find(|s| s.name == name).unwrap().stack.clone();
+        assert_eq!(
+            place("model.layers.3.mlp.experts.7.down_proj.weight"),
+            Some(StackPlace {
+                name: "model.layers.3.mlp.experts.down_proj.weight".into(),
+                shape: vec![64, 2048, 1024],
+                index: 7,
+            })
+        );
+        assert_eq!(
+            place("model.layers.0.mlp.experts.63.gate_proj.weight").map(|p| (p.shape, p.index)),
+            Some((vec![64, 1024, 2048], 63))
+        );
+        assert_eq!(place("model.layers.0.mlp.gate.weight"), None);
+        assert_eq!(
+            slots.iter().filter(|s| s.stack.is_some()).count(),
+            16 * 64 * 3
+        );
 
-        // The tiny OLMoE loads every slot with its exact bytes; nothing unexpected.
+        // The tiny OLMoE (2 layers, 8 experts) loads every slot with its exact bytes, each expert
+        // at its offset in the layer's stacked parameter (also through a 64-byte staging buffer,
+        // smaller than one expert); nothing unexpected, no device-to-device copy.
         let dir = TempDir::new("load-tiny-olmoe");
         let spec = write_tiny_olmoe(dir.path(), 4);
         let index = SafetensorsIndex::open(dir.path()).unwrap();
         let (_, mem) = counting();
         let slots = olmoe_slots(&spec.config);
-        let weights = WeightLoader::load(&index, &slots, &mem, 1 << 20).unwrap();
-        assert!(weights.unexpected.is_empty() && weights.ignored.is_empty());
-        assert_eq!(weights.tensors.len(), slots.len());
         let file = std::fs::read(dir.path().join("model.safetensors")).unwrap();
-        for slot in &slots {
-            let tensor = &weights.tensors[&slot.name];
-            let entry = index.get(&slot.name).unwrap();
-            let mut got = vec![0u8; tensor.storage.len()];
-            tensor.storage.copy_to_host(0, &mut got).unwrap();
-            assert!(
-                got == file[entry.range.start as usize..entry.range.end as usize],
-                "{}",
-                slot.name
+        for staging in [1 << 20, 64] {
+            let weights = WeightLoader::load(&index, &slots, &mem, staging).unwrap();
+            assert!(weights.unexpected.is_empty() && weights.ignored.is_empty());
+            let plain = slots.iter().filter(|s| s.stack.is_none()).count();
+            assert_eq!(
+                weights.tensors.len(),
+                plain + 2 * 3,
+                "one stack per layer and proj"
             );
+            assert!(
+                !weights
+                    .tensors
+                    .contains_key("model.layers.0.mlp.experts.0.up_proj.weight")
+            );
+            let stacked = &weights.tensors[&stacked_experts_name(1, "down_proj")];
+            assert_eq!(stacked.shape.as_slice(), &[8, 64, 32]);
+            for slot in &slots {
+                let entry = index.get(&slot.name).unwrap();
+                let len = entry.byte_len() as usize;
+                let (tensor, offset) = match &slot.stack {
+                    Some(place) => (&weights.tensors[&place.name], place.index * len),
+                    None => (&weights.tensors[&slot.name], 0),
+                };
+                let mut got = vec![0u8; len];
+                tensor.storage.copy_to_host(offset, &mut got).unwrap();
+                assert!(
+                    got == file[entry.range.start as usize..entry.range.end as usize],
+                    "{} (staging {staging})",
+                    slot.name
+                );
+            }
+            assert_eq!(weights.weight_bytes, spec.config.shape().weight_bytes);
         }
-        assert_eq!(weights.weight_bytes, spec.config.shape().weight_bytes);
+
+        // A stack with an index named twice, or one left unnamed, is refused before any
+        // allocation.
+        let (counter, fresh) = counting();
+        let mut twice = slots.clone();
+        let i = twice.iter().position(|s| s.stack.is_some()).unwrap();
+        twice[i + 3].stack.as_mut().unwrap().index = 0;
+        let err = WeightLoader::load(&index, &twice, &fresh, 1 << 20).expect_err("index twice");
+        assert!(err.to_string().contains("twice or out of range"), "{err}");
+        let mut gap = slots.clone();
+        gap.remove(i);
+        let err = WeightLoader::load(&index, &gap, &fresh, 1 << 20).expect_err("unfilled stack");
+        assert!(
+            err.to_string().contains(&format!(
+                "stack {} has no slot for index 0",
+                stacked_experts_name(0, "gate_proj")
+            )),
+            "{err}"
+        );
+        assert_eq!(counter.allocs.load(Ordering::SeqCst), 0);
 
         // The Llama slot set does not fit an OLMoE checkpoint: it is refused, naming a tensor.
         let err = WeightLoader::load(&index, &llama_slots(&spec.config), &mem, 1 << 20)
