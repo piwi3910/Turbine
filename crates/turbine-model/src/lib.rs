@@ -32,7 +32,7 @@ pub use generate::{GenerateOptions, Generation, generate};
 pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot, llama_slots};
 pub use loader::{StackPlace, olmoe_slots, stacked_experts_name};
 pub use metrics::{ForwardPhase, ModelMetrics, ToolCallOutcome};
-pub use sampler::{SampledToken, Sampler, SamplerState};
+pub use sampler::{SampleJob, SampledToken, Sampler, SamplerState, sample_rows};
 pub use structured::{
     GrammarCompiler, GrammarLimits, JSON_MAX_WHITESPACE, TokenMask, TokenMatcher, constraint_kind,
     json_options, step_mask,

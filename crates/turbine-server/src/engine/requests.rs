@@ -25,8 +25,8 @@ use turbine_core::request::{
 };
 use turbine_core::types::SeqId;
 use turbine_model::{
-    IncrementalDetokenizer, ModelError, ModelMetrics, Sampler, TokenMask, TokenMatcher, Tokenizer,
-    ToolCallOutcome, ToolCallParser, ToolParse, step_mask,
+    IncrementalDetokenizer, ModelError, ModelMetrics, SampledToken, Sampler, TokenMask,
+    TokenMatcher, Tokenizer, ToolCallOutcome, ToolCallParser, ToolParse, step_mask,
 };
 
 /// How a request's output is turned into tool calls.
@@ -300,7 +300,6 @@ impl ActiveRequest {
         max_seq_len: u32,
         metrics: Option<&ModelMetrics>,
     ) -> Result<Step, ModelError> {
-        let prompt_len = self.prompt_len();
         let stop = &self.request.stop;
         let c = &mut self.choices[choice];
         let mask = match c.matcher.as_mut() {
@@ -318,6 +317,23 @@ impl ActiveRequest {
             None => None,
         };
         let sampled = c.sampler.sample(logits, mask);
+        self.step_sampled(choice, sampled, max_seq_len, metrics)
+    }
+
+    /// [`ActiveRequest::step`] for a token already drawn by choice `choice`'s own sampler
+    /// (an unconstrained choice sampled on a worker thread, see
+    /// [`Choice::unconstrained_sampler`]): the matcher commit, the stop conditions, `echo` and
+    /// the tool-call rules.
+    pub fn step_sampled(
+        &mut self,
+        choice: usize,
+        sampled: SampledToken,
+        max_seq_len: u32,
+        metrics: Option<&ModelMetrics>,
+    ) -> Result<Step, ModelError> {
+        let prompt_len = self.prompt_len();
+        let stop = &self.request.stop;
+        let c = &mut self.choices[choice];
         let token = sampled.token;
         if let Some(matcher) = c.matcher.as_mut() {
             matcher.commit(token)?;
@@ -489,6 +505,12 @@ pub(crate) struct Choice {
 }
 
 impl Choice {
+    /// The sampler of a live choice without a constraint: its next token needs no matcher mask,
+    /// so it can be drawn away from the request (`turbine_model::sample_rows`).
+    pub fn unconstrained_sampler(&mut self) -> Option<&mut Sampler> {
+        (self.matcher.is_none() && self.finish.is_none()).then_some(&mut self.sampler)
+    }
+
     /// Held text plus whatever the detokenizer still holds.
     fn drain_all(&mut self) -> String {
         let mut rest = std::mem::take(&mut self.held_text);

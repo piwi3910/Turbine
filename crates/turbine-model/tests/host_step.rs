@@ -1,13 +1,15 @@
 //! Host-side cost of one engine decode iteration, without a GPU (`#[ignore]`d: a measurement,
 //! not a check to run on every build). Per batch row: the sampler over a full Llama-3
-//! vocabulary row, for a seeded and an unseeded request, and the incremental detokenizer step
+//! vocabulary row, for a seeded and an unseeded request (one after another, and unseeded
+//! through [`sample_rows`]), and the incremental detokenizer step
 //! with the real tokenizer; per batch the logits byte → f32 conversion the executor does after
 //! its device read. Prints median and minimum milliseconds per iteration.
 //!
 //! `cargo test --release -p turbine-model --test host_step -- --ignored --nocapture`, or on the
 //! lab host `scripts/lab-test.sh novanas -- --release -p turbine-model --test host_step`.
 //! `turbine-bench` sends no sampling parameters, so the server samples at temperature 1,
-//! top_p 1, without top_k, logprobs or seed: the `unseeded` column of each table's first row.
+//! top_p 1, without top_k, logprobs or seed: the `unseeded` columns of each table's first row
+//! (the engine samples a decode batch with `sample_rows`).
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,7 +18,7 @@ use std::time::Instant;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
 use turbine_core::request::SamplingParams;
-use turbine_model::{IncrementalDetokenizer, Sampler, Tokenizer};
+use turbine_model::{IncrementalDetokenizer, SampleJob, Sampler, Tokenizer, sample_rows};
 
 const VOCAB: usize = 128_256;
 const ITERATIONS: usize = 40;
@@ -69,6 +71,25 @@ fn serial(samplers: &mut [Sampler], mut logits: Vec<f32>) -> f64 {
     t.elapsed().as_secs_f64()
 }
 
+/// Samples every row through [`sample_rows`]; returns the seconds taken.
+fn batched(samplers: &mut [Sampler], mut logits: Vec<f32>) -> f64 {
+    let t = Instant::now();
+    let jobs: Vec<SampleJob<'_>> = samplers
+        .iter_mut()
+        .zip(logits.chunks_exact_mut(VOCAB))
+        .map(|(sampler, logits)| SampleJob {
+            sampler,
+            logits,
+            mask: None,
+        })
+        .collect();
+    let tokens: Vec<u32> = sample_rows(jobs).iter().map(|s| s.token).collect();
+    for (s, token) in samplers.iter_mut().zip(tokens) {
+        s.observe(token);
+    }
+    t.elapsed().as_secs_f64()
+}
+
 #[test]
 #[ignore = "measurement: run with --release -- --ignored --nocapture"]
 fn host_step_costs() {
@@ -87,8 +108,15 @@ fn host_step_costs() {
         std::thread::available_parallelism().map_or(1, |n| n.get())
     );
     println!(
-        "{:>5} {:>4} {:>5} | {:>18} | {:>18} | {:>18} | {:>18}",
-        "batch", "T", "top_p", "bytes->f32", "seeded serial", "unseeded serial", "detokenizer"
+        "{:>5} {:>4} {:>5} | {:>18} | {:>18} | {:>18} | {:>18} | {:>18}",
+        "batch",
+        "T",
+        "top_p",
+        "bytes->f32",
+        "seeded serial",
+        "unseeded serial",
+        "unseeded rows",
+        "detokenizer"
     );
     for batch in [16usize, 64] {
         let flat: Vec<f32> = (0..batch)
@@ -98,11 +126,12 @@ fn host_step_costs() {
         for (temperature, top_p) in [(1.0f32, 1.0f32), (0.0, 1.0), (0.7, 0.9)] {
             let mut seeded = samplers(batch, temperature, top_p, true);
             let mut unseeded = samplers(batch, temperature, top_p, false);
+            let mut rows_unseeded = samplers(batch, temperature, top_p, false);
             let mut detoks: Vec<IncrementalDetokenizer> = (0..batch)
                 .map(|_| IncrementalDetokenizer::new(Arc::clone(&tokenizer)))
                 .collect();
-            let (mut convert, mut t_seeded, mut t_unseeded, mut t_detok) =
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut convert, mut t_seeded, mut t_unseeded, mut t_rows, mut t_detok) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for it in 0..ITERATIONS {
                 let t = Instant::now();
                 let data: Vec<f32> = bytes
@@ -113,6 +142,7 @@ fn host_step_costs() {
                 convert.push(t.elapsed().as_secs_f64());
                 t_seeded.push(serial(&mut seeded, flat.clone()));
                 t_unseeded.push(serial(&mut unseeded, flat.clone()));
+                t_rows.push(batched(&mut rows_unseeded, flat.clone()));
                 let t = Instant::now();
                 for d in &mut detoks {
                     black_box(d.push(text_ids[it % text_ids.len()]));
@@ -120,10 +150,11 @@ fn host_step_costs() {
                 t_detok.push(t.elapsed().as_secs_f64());
             }
             println!(
-                "{batch:>5} {temperature:>4} {top_p:>5} | {} | {} | {} | {}",
+                "{batch:>5} {temperature:>4} {top_p:>5} | {} | {} | {} | {} | {}",
                 stat(&mut convert),
                 stat(&mut t_seeded),
                 stat(&mut t_unseeded),
+                stat(&mut t_rows),
                 stat(&mut t_detok)
             );
         }

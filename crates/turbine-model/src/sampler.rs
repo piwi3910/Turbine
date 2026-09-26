@@ -655,6 +655,58 @@ fn scan(weights: &[f32], u: f64) -> usize {
     weights.iter().rposition(|&w| w > 0.0).unwrap_or(0)
 }
 
+/// One row of a batch to sample: the row's sampler, its logits (adjusted in place) and its
+/// token mask.
+pub struct SampleJob<'a> {
+    pub sampler: &'a mut Sampler,
+    pub logits: &'a mut [f32],
+    pub mask: Option<&'a TokenMask>,
+}
+
+/// Most threads [`sample_rows`] uses: a Llama-3 row costs about a millisecond (one f64 `exp`
+/// per vocabulary id), so a decode batch of 16–64 rows is done in a few rounds while the
+/// HTTP runtime keeps cores of its own.
+pub const MAX_SAMPLER_THREADS: usize = 8;
+
+/// Samples every job, in parallel across rows (scoped threads, at most
+/// [`MAX_SAMPLER_THREADS`] and the host's parallelism). Each sampler only reads and adjusts its
+/// own row, so the tokens are exactly what calling [`Sampler::sample`] on the jobs one after
+/// another gives; results are in job order. The caller still `observe`s each accepted token.
+pub fn sample_rows(mut jobs: Vec<SampleJob<'_>>) -> Vec<SampledToken> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_SAMPLER_THREADS)
+        .min(jobs.len());
+    if threads <= 1 {
+        return jobs
+            .iter_mut()
+            .map(|j| j.sampler.sample(j.logits, j.mask))
+            .collect();
+    }
+    let per_thread = jobs.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .chunks_mut(per_thread)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter_mut()
+                        .map(|j| j.sampler.sample(j.logits, j.mask))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| match h.join() {
+                Ok(tokens) => tokens,
+                // A panicking sampler panics the caller, as the serial loop would.
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect()
+    })
+}
+
 /// The largest non-NaN value; `None` when there is none or it is not finite.
 fn finite_max(values: impl Iterator<Item = f32>) -> Option<f32> {
     let max = values
@@ -978,6 +1030,69 @@ mod tests {
                     y.top_logprobs.is_empty(),
                     "logprobs 0 lists no alternatives"
                 );
+            }
+        }
+    }
+
+    /// Sampling a batch across threads gives each row exactly what sampling the rows one after
+    /// another gives, and adjusts each row in place the same way.
+    #[test]
+    fn sample_rows_matches_one_by_one() {
+        let rows = big_rows(3, 17);
+        let vocab = rows[0].len();
+        let mut mask = TokenMask::new_none(vocab);
+        for id in (0..vocab as u32).step_by(3) {
+            mask.allow(id);
+        }
+        let configs = [
+            params(1.0, 1.0, -1, 1),
+            params(0.0, 1.0, -1, 2),
+            params(0.7, 0.9, 40, 3),
+            params(1.2, 0.95, -1, 4),
+            SamplingParams {
+                logprobs: Some(5),
+                frequency_penalty: 0.5,
+                ..params(1.0, 1.0, -1, 5)
+            },
+        ];
+        let fresh = || -> Vec<Sampler> {
+            configs
+                .iter()
+                .map(|p| Sampler::new(p, &[1, 2], &[7]))
+                .collect()
+        };
+        let (mut one, mut many) = (fresh(), fresh());
+        for step in 0..6 {
+            let batch: Vec<f32> = (0..configs.len())
+                .flat_map(|i| rows[(i + step) % rows.len()].clone())
+                .collect();
+            let masks: Vec<Option<&TokenMask>> = (0..configs.len())
+                .map(|i| (i == 3).then_some(&mask))
+                .collect();
+            let mut serial_logits = batch.clone();
+            let serial: Vec<SampledToken> = one
+                .iter_mut()
+                .zip(serial_logits.chunks_exact_mut(vocab))
+                .zip(&masks)
+                .map(|((s, row), m)| s.sample(row, *m))
+                .collect();
+            let mut batch_logits = batch;
+            let jobs: Vec<SampleJob<'_>> = many
+                .iter_mut()
+                .zip(batch_logits.chunks_exact_mut(vocab))
+                .zip(&masks)
+                .map(|((sampler, logits), &mask)| SampleJob {
+                    sampler,
+                    logits,
+                    mask,
+                })
+                .collect();
+            let parallel = sample_rows(jobs);
+            assert_eq!(parallel, serial, "step {step}");
+            assert!(serial_logits == batch_logits, "rows adjusted alike");
+            for ((a, b), t) in one.iter_mut().zip(many.iter_mut()).zip(&serial) {
+                a.observe(t.token);
+                b.observe(t.token);
             }
         }
     }

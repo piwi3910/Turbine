@@ -31,7 +31,7 @@ use turbine_core::request::{ErrorCode, FinishReason, GenerationEvent};
 use turbine_core::types::{RequestId, SeqId};
 use turbine_kv::{BlockPool, KvDocument};
 use turbine_model::executor::{BatchInput, Logits, ModelExecutor, SeqSlice};
-use turbine_model::{ForwardPhase, Tokenizer};
+use turbine_model::{ForwardPhase, SampleJob, SampledToken, Tokenizer, sample_rows};
 use turbine_scheduler::{
     BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome, IterationPlan,
     SchedRequest, Scheduler, SubmitError,
@@ -544,6 +544,7 @@ impl EngineLoop {
     /// prefill of an `n` > 1 request also gives every forking choice its first token, each
     /// from its own copy of the prompt's last logits row.
     fn sample(&mut self, plan: &IterationPlan, mut logits: Logits, outcome: &mut IterationOutcome) {
+        let mut drawn = self.draw_decode_tokens(plan, &mut logits);
         let vocab = logits.vocab;
         for (row, item) in plan.items.iter().enumerate() {
             let yields = match item.kind {
@@ -571,25 +572,79 @@ impl EngineLoop {
             };
             let row_logits = &mut logits.data[row * vocab..(row + 1) * vocab];
             let shared = (!forks.is_empty()).then(|| row_logits.to_vec());
-            if !self.sample_choice(id, choice, row_logits, outcome) {
+            let token = drawn[row].take();
+            if !self.sample_choice(id, choice, row_logits, token, outcome) {
                 continue;
             }
             for fork in forks {
                 let mut own = shared.clone().unwrap_or_default();
-                if !self.sample_choice(id, fork, &mut own, outcome) {
+                if !self.sample_choice(id, fork, &mut own, None, outcome) {
                     break;
                 }
             }
         }
     }
 
-    /// Samples choice `choice` of request `id` from `row` and delivers its events. Returns
-    /// false when the request ended with a constraint failure.
+    /// Draws the tokens of every decode row of an unconstrained live choice at once, across
+    /// threads (`turbine_model::sample_rows`: each sampler only touches its own row, so the
+    /// tokens are those of sampling row by row). Indexed by plan row; `None` rows (prefill
+    /// completions with their forks, constrained choices) are sampled by
+    /// [`ActiveRequest::step`] on the engine thread.
+    fn draw_decode_tokens(
+        &mut self,
+        plan: &IterationPlan,
+        logits: &mut Logits,
+    ) -> Vec<Option<SampledToken>> {
+        let mut drawn: Vec<Option<SampledToken>> = vec![None; plan.items.len()];
+        let decode_rows: HashMap<SeqId, usize> = plan
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| matches!(item.kind, BatchKind::Decode))
+            .map(|(row, item)| (item.seq, row))
+            .collect();
+        if decode_rows.is_empty() {
+            return drawn;
+        }
+        let mut rows: Vec<Option<&mut [f32]>> = logits
+            .data
+            .chunks_exact_mut(logits.vocab)
+            .map(Some)
+            .collect();
+        let mut job_rows = Vec::with_capacity(decode_rows.len());
+        let mut jobs = Vec::with_capacity(decode_rows.len());
+        for r in self.requests.values_mut().filter(|r| !r.done) {
+            for c in r.choices.iter_mut() {
+                let Some(&row) = decode_rows.get(&c.seq) else {
+                    continue;
+                };
+                if let Some(sampler) = c.unconstrained_sampler()
+                    && let Some(row_logits) = rows.get_mut(row).and_then(Option::take)
+                {
+                    job_rows.push(row);
+                    jobs.push(SampleJob {
+                        sampler,
+                        logits: row_logits,
+                        mask: None,
+                    });
+                }
+            }
+        }
+        for (row, token) in job_rows.into_iter().zip(sample_rows(jobs)) {
+            drawn[row] = Some(token);
+        }
+        drawn
+    }
+
+    /// Samples choice `choice` of request `id` from `row` — or takes `drawn`, the token its
+    /// sampler already drew from that row — and delivers its events. Returns false when the
+    /// request ended with a constraint failure.
     fn sample_choice(
         &mut self,
         id: RequestId,
         choice: usize,
         row: &mut [f32],
+        drawn: Option<SampledToken>,
         outcome: &mut IterationOutcome,
     ) -> bool {
         let Some(r) = self.requests.get_mut(&id) else {
@@ -599,7 +654,12 @@ impl EngineLoop {
             return true;
         }
         let seq = r.choices[choice].seq;
-        let step = match r.step(choice, row, self.max_seq_len, Some(&self.metrics.model)) {
+        let metrics = Some(&self.metrics.model);
+        let stepped = match drawn {
+            Some(token) => r.step_sampled(choice, token, self.max_seq_len, metrics),
+            None => r.step(choice, row, self.max_seq_len, metrics),
+        };
+        let step = match stepped {
             Ok(step) => step,
             Err(e) => {
                 self.constraint_failed(id, &e.to_string(), outcome);
