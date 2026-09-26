@@ -381,3 +381,5 @@
 - Accept the novanas (Linux) workspace run instead and amend S-1
 - Merge `phase-2c-performance` (Phase 2 + the measured Phase 2c work) into main and push once Phase 2 criteria pass (recommended)
 - Merge only Phase 2 (`phase-2-serving-runtime` + its later fixes) and keep Phase 2c on its branch
+
+**Answers (2026-09-26):** S-1 is satisfied by the novanas (Linux) workspace run via scripts/remote-cargo.sh (spec amended; the Mac no longer builds). When Phase 2 passes, merge phase-2c-performance (Phase 2 + the measured Phase 2c work) into main and push; Phase 2c stays open for its remaining tasks.
