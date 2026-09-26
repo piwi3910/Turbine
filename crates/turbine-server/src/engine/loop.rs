@@ -37,6 +37,7 @@ use turbine_scheduler::{
     SchedRequest, Scheduler, SubmitError,
 };
 
+use super::deadlines::{Deadlines, Timeouts};
 use super::requests::{ActiveRequest, Delivery, Flush};
 use super::{
     EngineCommand, EngineDocs, EngineMetrics, EngineShared, MAX_CONSECUTIVE_FAILURES, SubmitAck,
@@ -57,6 +58,8 @@ pub(crate) struct EngineParts {
     pub tokenizer: Arc<Tokenizer>,
     pub max_seq_len: u32,
     pub metrics: EngineMetrics,
+    /// `server.request_timeout` and `server.slow_client_timeout`.
+    pub timeouts: Timeouts,
 }
 
 enum Turn {
@@ -74,6 +77,7 @@ pub(crate) struct EngineLoop {
     tokenizer: Arc<Tokenizer>,
     max_seq_len: u32,
     metrics: EngineMetrics,
+    deadlines: Deadlines,
     requests: HashMap<RequestId, ActiveRequest>,
     /// Owner request and choice index of every sequence.
     seqs: HashMap<SeqId, (RequestId, usize)>,
@@ -90,6 +94,7 @@ impl EngineLoop {
     /// The engine over `p`; its diagnostics documents are published at once.
     pub fn new(p: EngineParts) -> EngineLoop {
         let engine = EngineLoop {
+            deadlines: Deadlines::new(Arc::clone(&p.clock), p.timeouts),
             exec: p.executor,
             pool: p.pool,
             sched: p.scheduler,
@@ -151,6 +156,7 @@ impl EngineLoop {
         }
         self.flush_outputs();
         self.detect_disconnects();
+        self.expire_deadlines();
 
         let plan = self.sched.plan(&mut self.pool, &IterationLimits::default());
         for &(id, reason) in &plan.dropped {
@@ -293,6 +299,8 @@ impl EngineLoop {
             self.seqs.insert(seq, (id, i));
         }
         self.requests.insert(id, active);
+        self.deadlines
+            .track(id, self.requests[&id].request.deadline_ms);
         for choice in 0..seqs.len() as u32 {
             self.deliver(id, GenerationEvent::Started { choice });
         }
@@ -335,6 +343,7 @@ impl EngineLoop {
                 Flush::Held => {}
                 Flush::Drained if r.done => self.forget(id),
                 Flush::Drained => {
+                    self.deadlines.resumed(id);
                     let seqs: Vec<SeqId> = r.live_seqs().collect();
                     for seq in seqs {
                         self.sched.resume(seq);
@@ -356,6 +365,24 @@ impl EngineLoop {
             .collect();
         for id in closed {
             self.client_gone(id);
+        }
+    }
+
+    /// Request deadlines and slow-client timers (P2 S-7, S-8): a live request is cancelled
+    /// (the next plan frees its blocks and sends the error event); a finished one whose final
+    /// events stay unread past `server.slow_client_timeout` is dropped, which closes its stream.
+    fn expire_deadlines(&mut self) {
+        for (id, reason) in self.deadlines.expired() {
+            match self.requests.get(&id) {
+                Some(r) if r.done => {
+                    if reason == CancelReason::SlowClient {
+                        tracing::info!(event = "cancel", request_id = %id.0, reason = reason.as_str(), "closing a stream whose final events stay unread");
+                        self.forget(id);
+                    }
+                }
+                Some(_) => self.sched.cancel(id, reason),
+                None => {}
+            }
         }
     }
 
@@ -610,6 +637,7 @@ impl EngineLoop {
         match r.emit(event) {
             Delivery::Sent => {}
             Delivery::Held { now_full } => {
+                self.deadlines.paused(id);
                 if now_full && !r.done {
                     let seqs: Vec<SeqId> = r.live_seqs().collect();
                     for seq in seqs {
@@ -668,6 +696,7 @@ impl EngineLoop {
 
     /// Drops the host state of request `id`.
     fn forget(&mut self, id: RequestId) {
+        self.deadlines.forget(id);
         if let Some(r) = self.requests.remove(&id) {
             for c in &r.choices {
                 self.seqs.remove(&c.seq);
@@ -855,6 +884,10 @@ mod tests {
             tokenizer,
             max_seq_len: 128,
             metrics,
+            timeouts: Timeouts {
+                request: Duration::from_secs(600),
+                slow_client: Duration::from_secs(30),
+            },
         });
         TestEngine {
             engine,

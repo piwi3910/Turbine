@@ -4,6 +4,13 @@
 //! `/ready` 503 `loading_model`; exit 1) → weight load, KV pool allocation and one-token warm-up
 //! on the engine thread → `/ready` 200 → serve until SIGINT/SIGTERM (exit 0).
 //!
+//! Shutdown (P2 S-13): on SIGINT/SIGTERM `/ready` and new requests answer 503 `shutting_down`
+//! while the listener stays open; running requests continue until none is left or
+//! `server.shutdown_grace` has passed; then `EngineCommand::Shutdown` cancels the rest with
+//! reason `shutdown` (their streams end with `shutting_down`), the engine delivers what it holds
+//! and stops, the listener closes, open connections finish (bounded by [`CLOSE_LIMIT`]) and the
+//! process exits 0.
+//!
 //! A load or warm-up failure after binding keeps `/ready` at 503 `model_load_failed` for
 //! [`FAILURE_GRACE`] and exits 1; so do three consecutive failed iterations or an engine panic
 //! (`device_error`, C-25).
@@ -22,13 +29,18 @@ use turbine_scheduler::SchedulerMetrics;
 
 use crate::backend::ModelBackend;
 use crate::cli::Cli;
-use crate::engine::{self, EngineMetrics, Fatal};
+use crate::engine::{self, EngineMetrics, Fatal, Timeouts};
 use crate::exit::ExitCode;
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
 
 /// How long `/ready` reports the failure before the process exits 1 (P1: at most 1 s).
 const FAILURE_GRACE: Duration = Duration::from_millis(500);
+/// How often the shutdown sequence looks at the engine.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
+/// After the grace: how long the engine may take to deliver the cancellations and stop, and
+/// then how long open connections may take to finish, before the process exits 0 regardless.
+const CLOSE_LIMIT: Duration = Duration::from_millis(500);
 
 pub fn run(cli: Cli) -> ExitCode {
     let config = match config::load(&cli.config, &cli.set) {
@@ -130,6 +142,7 @@ async fn serve(
         Arc::clone(&backend),
         engine_metrics,
         queue_capacity,
+        Timeouts::from_config(&config.server),
         fatal_tx.clone(),
     ) {
         let _ = fatal_tx.send(Fatal::LoadFailed(format!(
@@ -137,8 +150,19 @@ async fn serve(
         )));
     }
 
-    let server =
-        axum::serve(listener, turbine_api::router(state)).with_graceful_shutdown(shutdown_signal());
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+    let shutdown = drain_on_signal(
+        Arc::clone(&backend),
+        config.server.shutdown_grace.0,
+        drained_tx,
+    );
+    let server = axum::serve(listener, turbine_api::router(state)).with_graceful_shutdown(shutdown);
+    let connections_closed = async {
+        match drained_rx.await {
+            Ok(()) => tokio::time::sleep(CLOSE_LIMIT).await,
+            Err(_) => std::future::pending().await,
+        }
+    };
     tokio::select! {
         served = async { server.await } => match served {
             Ok(()) => {
@@ -153,6 +177,10 @@ async fn serve(
                 ExitCode::Startup
             }
         },
+        () = connections_closed => {
+            tracing::warn!(event = "shutdown_connections_open", "connections still open after shutdown; exiting");
+            ExitCode::Clean
+        }
         Some(fatal) = fatal_rx.recv() => {
             backend.set_failed(&fatal);
             let message = match &fatal {
@@ -165,6 +193,34 @@ async fn serve(
             ExitCode::Startup
         }
     }
+}
+
+/// Resolves when the listener should close: after a signal, the drain and the engine stop
+/// (module comment). `drained` fires at that point.
+async fn drain_on_signal(
+    backend: Arc<ModelBackend>,
+    grace: Duration,
+    drained: tokio::sync::oneshot::Sender<()>,
+) {
+    shutdown_signal().await;
+    backend.begin_shutdown();
+    let draining = tokio::time::Instant::now();
+    while !backend.engine_idle() && draining.elapsed() < grace {
+        tokio::time::sleep(SHUTDOWN_POLL).await;
+    }
+    let left = !backend.engine_idle();
+    tracing::info!(
+        event = "shutdown_drained",
+        drained_seconds = draining.elapsed().as_secs_f64(),
+        cancelling = left,
+        "shutdown grace over; stopping the engine"
+    );
+    backend.stop_engine();
+    let stopping = tokio::time::Instant::now();
+    while !backend.engine_stopped() && stopping.elapsed() < CLOSE_LIMIT {
+        tokio::time::sleep(SHUTDOWN_POLL).await;
+    }
+    let _ = drained.send(());
 }
 
 async fn shutdown_signal() {
@@ -186,7 +242,7 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! {
-        () = ctrl_c => tracing::info!(signal = "SIGINT", "shutdown requested; finishing in-flight requests"),
-        () = terminate => tracing::info!(signal = "SIGTERM", "shutdown requested; finishing in-flight requests"),
+        () = ctrl_c => tracing::info!(signal = "SIGINT", "shutdown requested; draining running requests"),
+        () = terminate => tracing::info!(signal = "SIGTERM", "shutdown requested; draining running requests"),
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Every wait is bounded and polls; ports come from binding `127.0.0.1:0`.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -222,6 +222,16 @@ fn port_in_use_exits_1() {
     drop(holder);
 }
 
+/// Sends SIGTERM to `child`.
+#[cfg(unix)]
+fn sigterm(child: &Child) {
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+}
+
 #[cfg(unix)]
 #[test]
 fn sigterm_graceful_shutdown() {
@@ -250,27 +260,238 @@ fn sigterm_graceful_shutdown() {
     assert!(interim.starts_with("HTTP/1.1 100"), "interim: {interim}");
     conn.write_all(&body[..10]).unwrap();
 
-    let killed = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(killed.success());
+    sigterm(&child);
     let signalled = Instant::now();
-    // Shutdown has begun once new connections are refused.
+    // No generation runs, so there is nothing to drain: the listener closes at once.
     wait_until_refusing(addr, Duration::from_secs(5));
 
-    // The in-flight request still completes.
+    // The open connection is still answered; its request arrived after shutdown began, so it
+    // is refused with 503 `shutting_down` (P2 S-13).
     conn.write_all(&body[10..]).unwrap();
     let mut resp = String::new();
     conn.read_to_string(&mut resp).unwrap();
-    assert!(resp.starts_with("HTTP/1.1 200"), "response: {resp}");
+    assert!(resp.starts_with("HTTP/1.1 503"), "response: {resp}");
     assert!(
-        resp.contains(r#""object":"text_completion""#),
+        resp.contains(r#""code":"shutting_down""#),
         "response: {resp}"
     );
 
     let out = wait_with_timeout(child, Duration::from_secs(5));
     assert!(signalled.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `max_position_embeddings` of the checkpoint `long_model_yaml` serves, so streams can be held.
+const LONG_POSITIONS: u32 = 8192;
+/// Tokens of a stream that must outlive the shutdown grace: far more events than the output
+/// channel (256) and the socket buffers hold, so a client that stops reading pauses it.
+const LONG_TOKENS: u32 = 4000;
+/// Tokens of a stream that is paused at the signal and completes within the grace once read.
+const SHORT_TOKENS: u32 = 1500;
+
+/// The tiny checkpoint patched to `LONG_POSITIONS` positions, served as `m` on the cpu backend
+/// with a 16 MiB KV pool; `server_extra` is appended to the `server` section verbatim.
+fn long_model_yaml(addr: SocketAddr, server_extra: &str) -> (TempDir, String) {
+    let dir = TempDir::new("turbine-server-cli-long-model");
+    write_tiny_llama(dir.path(), 7);
+    let path = dir.path().join("config.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    cfg["max_position_embeddings"] = serde_json::json!(LONG_POSITIONS);
+    std::fs::write(&path, cfg.to_string()).unwrap();
+    let yaml = format!(
+        "model:\n  path: {}\n  served_name: m\nserver:\n  listen: {addr}\n{server_extra}\
+         execution:\n  backend: cpu\nreliability:\n  emergency_vram_reserve: 1MiB\n\
+         kv:\n  gpu:\n    max_bytes: 16MiB\n",
+        dir.path().display()
+    );
+    (dir, yaml)
+}
+
+/// Writes one HTTP/1.1 request with `Connection: close`.
+fn write_request(conn: &mut TcpStream, method: &str, path: &str, body: &str) {
+    write!(
+        conn,
+        "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+}
+
+/// One request; returns the status and the whole response (head and body).
+fn http(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
+    let mut conn = TcpStream::connect(addr).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write_request(&mut conn, method, path, body);
+    let mut resp = String::new();
+    conn.read_to_string(&mut resp).ok();
+    let status = resp
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, resp)
+}
+
+/// A streaming completion whose body is read only on demand.
+struct HeldStream {
+    reader: BufReader<TcpStream>,
+}
+
+impl HeldStream {
+    /// Starts a stream of `max_tokens` large events (20 logprobs each) and reads its head and
+    /// first chunk; the client then stops reading, so the engine pauses the request.
+    fn open(addr: SocketAddr, max_tokens: u32) -> HeldStream {
+        let body = serde_json::json!({"model": "m", "prompt": "Once upon a time",
+            "max_tokens": max_tokens, "ignore_eos": true, "stream": true, "logprobs": 20});
+        let mut conn = TcpStream::connect(addr).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write_request(&mut conn, "POST", "/v1/completions", &body.to_string());
+        let mut reader = BufReader::new(conn);
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0, "closed: {head}");
+            if line == "\r\n" {
+                break;
+            }
+            head.push_str(&line.to_ascii_lowercase());
+        }
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(head.contains("transfer-encoding: chunked"), "{head}");
+        let mut stream = HeldStream { reader };
+        let first = stream.chunk().expect("first SSE chunk");
+        assert!(first.starts_with("data: "), "{first}");
+        stream
+    }
+
+    /// One chunk of the chunked body; `None` at the terminating chunk.
+    fn chunk(&mut self) -> Option<String> {
+        let mut size_line = String::new();
+        self.reader.read_line(&mut size_line).expect("chunk size");
+        let size = usize::from_str_radix(size_line.trim(), 16)
+            .unwrap_or_else(|_| panic!("bad chunk size line {size_line:?}"));
+        let mut data = vec![0u8; size + 2];
+        self.reader.read_exact(&mut data).expect("chunk data");
+        if size == 0 {
+            return None;
+        }
+        data.truncate(size);
+        Some(String::from_utf8(data).expect("UTF-8 chunk"))
+    }
+
+    /// Reads the rest of the stream and returns its `data:` payloads.
+    fn read_rest(mut self) -> Vec<String> {
+        let mut body = String::new();
+        while let Some(chunk) = self.chunk() {
+            body.push_str(&chunk);
+        }
+        body.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// Paused requests in `/turbine/v1/scheduler`.
+fn paused_requests(addr: SocketAddr) -> u64 {
+    let (status, resp) = http(addr, "GET", "/turbine/v1/scheduler", "");
+    assert_eq!(status, 200, "{resp}");
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+    let doc: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    doc["paused"].as_u64().unwrap_or(0)
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_drains_then_cancels() {
+    const GRACE: Duration = Duration::from_secs(2);
+    let addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
+    let (_model, yaml) = long_model_yaml(addr, "  shutdown_grace: 2s\n");
+    let cfg = TempConfig::new("sigterm-drain", &yaml);
+    let mut child = spawn_server(&[], &cfg.path);
+    wait_until_serving(&mut child, addr);
+    wait_until_ready(&mut child, addr);
+
+    // Both generations are running, paused on their unread streams, when the signal arrives.
+    let short = HeldStream::open(addr, SHORT_TOKENS);
+    let long = HeldStream::open(addr, LONG_TOKENS);
+    let started = Instant::now();
+    while paused_requests(addr) < 2 {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "both streams should be paused"
+        );
+        std::thread::sleep(POLL);
+    }
+
+    sigterm(&child);
+    let signalled = Instant::now();
+
+    // Draining: `/ready` and new requests answer 503 `shutting_down`; the listener stays open.
+    loop {
+        let (status, resp) = http(addr, "GET", "/ready", "");
+        if status == 503 && resp.contains(r#""reason":"shutting_down""#) {
+            break;
+        }
+        assert!(
+            signalled.elapsed() < Duration::from_secs(1),
+            "/ready: {resp}"
+        );
+        std::thread::sleep(POLL);
+    }
+    let (status, resp) = http(
+        addr,
+        "POST",
+        "/v1/completions",
+        r#"{"model":"m","prompt":"hi","max_tokens":2}"#,
+    );
+    assert_eq!(status, 503, "{resp}");
+    assert!(resp.contains(r#""code":"shutting_down""#), "{resp}");
+
+    // The short generation completes within the grace.
+    let data = short.read_rest();
+    assert!(
+        signalled.elapsed() < GRACE,
+        "short stream took {:?}",
+        signalled.elapsed()
+    );
+    assert_eq!(data.last().map(String::as_str), Some("[DONE]"));
+    let finish = data
+        .iter()
+        .rev()
+        .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+        .find_map(|c| {
+            c["choices"][0]["finish_reason"]
+                .as_str()
+                .map(str::to_string)
+        });
+    assert_eq!(finish.as_deref(), Some("length"));
+
+    // The long one is still unread when the grace ends: it is cancelled with `shutting_down`.
+    std::thread::sleep((GRACE + Duration::from_millis(100)).saturating_sub(signalled.elapsed()));
+    let data = long.read_rest();
+    assert_eq!(data.last().map(String::as_str), Some("[DONE]"));
+    let error: serde_json::Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
+    assert_eq!(error["error"]["code"], "shutting_down", "{error}");
+
+    let out = wait_with_timeout(
+        child,
+        Duration::from_secs(3).saturating_sub(signalled.elapsed()),
+    );
+    assert!(
+        signalled.elapsed() < Duration::from_secs(3),
+        "exit took {:?}",
+        signalled.elapsed()
+    );
     assert_eq!(
         out.status.code(),
         Some(0),

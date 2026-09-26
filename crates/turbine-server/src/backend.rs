@@ -33,6 +33,8 @@ const STATE_LOADING: u8 = 0;
 const STATE_READY: u8 = 1;
 const STATE_LOAD_FAILED: u8 = 2;
 const STATE_DEVICE_ERROR: u8 = 3;
+/// SIGINT/SIGTERM received (P2 S-13): `/ready` and new requests answer 503 `shutting_down`.
+const STATE_SHUTTING_DOWN: u8 = 4;
 
 /// Sampling defaults from `generation_config.json` (request fields override them).
 #[derive(Clone, Copy, Debug)]
@@ -156,7 +158,13 @@ impl ModelBackend {
             })
             .is_ok()
         {
-            self.state.store(STATE_READY, Ordering::Release);
+            // A shutdown that began during the load keeps `shutting_down`.
+            let _ = self.state.compare_exchange(
+                STATE_LOADING,
+                STATE_READY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 
@@ -169,6 +177,35 @@ impl ModelBackend {
         self.state.store(state, Ordering::Release);
     }
 
+    /// Shutdown begins: `/ready` turns 503 `shutting_down` and new requests are refused with
+    /// 503 `shutting_down`, while the engine keeps serving what it holds. A failure state
+    /// stays.
+    pub fn begin_shutdown(&self) {
+        let _ = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                matches!(s, STATE_LOADING | STATE_READY).then_some(STATE_SHUTTING_DOWN)
+            });
+    }
+
+    /// No request is queued or running in the engine (true before it runs).
+    pub fn engine_idle(&self) -> bool {
+        self.loaded
+            .get()
+            .and_then(|l| l.shared.docs())
+            .is_none_or(|d| {
+                let s = &d.scheduler;
+                s.waiting + s.prefilling + s.decoding + s.paused == 0
+            })
+    }
+
+    /// The engine thread has stopped (its command receiver is gone), or never started.
+    pub fn engine_stopped(&self) -> bool {
+        self.loaded
+            .get()
+            .is_none_or(|l| l.engine.submit_tx.is_closed())
+    }
+
     /// Asks the engine to cancel what is left and stop (the server is exiting). Never waits.
     pub fn stop_engine(&self) {
         if let Some(loaded) = self.loaded.get() {
@@ -178,6 +215,15 @@ impl ModelBackend {
 
     fn is_ready(&self) -> bool {
         self.state.load(Ordering::Acquire) == STATE_READY
+    }
+
+    /// Ready, or draining for shutdown: the model is still listed, so a new request reaches
+    /// `start` and is refused with `shutting_down` rather than `model_not_loaded`.
+    fn is_serving(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            STATE_READY | STATE_SHUTTING_DOWN
+        )
     }
 
     fn reject(&self, endpoint: Endpoint, e: ApiError) -> ApiError {
@@ -304,6 +350,9 @@ impl ModelBackend {
     /// scheduler has queued it.
     async fn start(&self, req: InferenceRequest) -> Result<GenerationStream, ApiError> {
         let endpoint = req.endpoint;
+        if self.state.load(Ordering::Acquire) == STATE_SHUTTING_DOWN {
+            return Err(self.reject(endpoint, ApiError::shutting_down()));
+        }
         let Some(loaded) = self.loaded.get().filter(|_| self.is_ready()) else {
             return Err(self.reject(endpoint, ApiError::model_not_loaded()));
         };
@@ -335,7 +384,7 @@ impl ModelBackend {
 
 impl InferenceBackend for ModelBackend {
     fn models(&self) -> Vec<ModelCard> {
-        match self.loaded.get().filter(|_| self.is_ready()) {
+        match self.loaded.get().filter(|_| self.is_serving()) {
             Some(loaded) => vec![ModelCard {
                 id: self.served_name.clone(),
                 object: "model".into(),
@@ -369,6 +418,7 @@ impl Readiness for ModelBackend {
             STATE_READY => return ReadyState::Ready,
             STATE_LOADING => NotReadyReason::LoadingModel,
             STATE_LOAD_FAILED => NotReadyReason::ModelLoadFailed,
+            STATE_SHUTTING_DOWN => NotReadyReason::ShuttingDown,
             _ => NotReadyReason::DeviceError,
         };
         ReadyState::NotReady { reason }

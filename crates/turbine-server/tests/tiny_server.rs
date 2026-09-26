@@ -1,7 +1,8 @@
 //! Black-box tests of `turbine-server` serving the tiny synthetic checkpoint on the `cpu`
 //! reference backend (P1 S-10, S-14; P2 S-3, S-7, S-8, S-11): OpenAI shapes, queueing and
-//! cancellation, the queue bound, KV release on disconnect, the diagnostics documents, request
-//! validation, startup failures and the Phase 1 metrics.
+//! cancellation, the queue bound, KV release on disconnect, the diagnostics documents, slow
+//! clients and the request and queue timeouts, request validation, startup failures and the
+//! Phase 1 metrics.
 //!
 //! Streams that must stay open are made to back-pressure the engine: large events (20 logprobs
 //! each), thousands of `max_tokens` on a checkpoint patched to 8192 positions, and a client that
@@ -47,8 +48,13 @@ fn spawn(config: &Path) -> Child {
 /// Config for the cpu backend on `model_dir` with a 16 MiB KV pool (4096 tiny-model blocks of
 /// 4096 bytes); `extra` is appended verbatim and must not repeat the `kv` key.
 fn config_yaml(model_dir: &Path, addr: SocketAddr, extra: &str) -> String {
+    config_yaml_with(model_dir, addr, "", extra)
+}
+
+/// [`config_yaml`] with `server_extra` appended to the `server` section verbatim.
+fn config_yaml_with(model_dir: &Path, addr: SocketAddr, server_extra: &str, extra: &str) -> String {
     format!(
-        "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cpu\n\
+        "model:\n  path: {}\nserver:\n  listen: {addr}\n{server_extra}execution:\n  backend: cpu\n\
          reliability:\n  emergency_vram_reserve: 1MiB\nkv:\n  gpu:\n    max_bytes: 16MiB\n{extra}",
         model_dir.display()
     )
@@ -74,15 +80,20 @@ struct TinyServer {
 
 impl TinyServer {
     fn start(extra: &str) -> TinyServer {
-        TinyServer::start_with(extra, None)
+        TinyServer::start_with("", extra, None)
     }
 
     /// The tiny checkpoint patched to `LONG_POSITIONS` positions, so streams can be held open.
     fn start_long(extra: &str) -> TinyServer {
-        TinyServer::start_with(extra, Some(LONG_POSITIONS))
+        TinyServer::start_with("", extra, Some(LONG_POSITIONS))
     }
 
-    fn start_with(extra: &str, max_positions: Option<u32>) -> TinyServer {
+    /// [`TinyServer::start_long`] with `server_extra` in the `server` section.
+    fn start_long_with(server_extra: &str, extra: &str) -> TinyServer {
+        TinyServer::start_with(server_extra, extra, Some(LONG_POSITIONS))
+    }
+
+    fn start_with(server_extra: &str, extra: &str, max_positions: Option<u32>) -> TinyServer {
         let dir = TempDir::new("turbine-tiny-server");
         let model_dir = dir.path().join("tiny-llama");
         write_tiny_llama(&model_dir, 7);
@@ -94,7 +105,11 @@ impl TinyServer {
         }
         let addr = free_addr();
         let config = dir.path().join("config.yaml");
-        std::fs::write(&config, config_yaml(&model_dir, addr, extra)).unwrap();
+        std::fs::write(
+            &config,
+            config_yaml_with(&model_dir, addr, server_extra, extra),
+        )
+        .unwrap();
         let mut child = spawn(&config);
         wait_until_ready(&mut child, addr);
         TinyServer {
@@ -1035,4 +1050,119 @@ fn phase1_metrics() {
         metrics.contains(r#"turbine_forward_seconds_count{phase="prefill"} 1"#),
         "{metrics}"
     );
+}
+
+#[test]
+fn slow_client_paused_then_cancelled() {
+    let server = TinyServer::start_long_with("  slow_client_timeout: 1s\n", "");
+    let slow = server.hold_stream();
+    wait_for(Duration::from_secs(10), "the slow client is paused", || {
+        server.scheduler()["paused"] == 1
+    });
+    let paused_at = Instant::now();
+
+    // Another stream keeps progressing while the slow one is paused.
+    let other = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Hi", "max_tokens": 64, "ignore_eos": true,
+                "stream": true}),
+    );
+    assert_eq!(other.status, 200, "{}", other.body);
+    assert_eq!(stream_finish_reason(&other.sse_data()), "length");
+    assert_eq!(
+        server.scheduler()["paused"],
+        1,
+        "still paused before the timeout"
+    );
+
+    // After the timeout it is cancelled with `slow_client` and its blocks are free.
+    wait_for(
+        Duration::from_secs(5),
+        "the slow client is cancelled",
+        || {
+            let doc = server.scheduler();
+            running(&doc) == 0 && server.blocks_used() == 0
+        },
+    );
+    assert!(
+        paused_at.elapsed() >= Duration::from_millis(900),
+        "cancelled after {:?}",
+        paused_at.elapsed()
+    );
+    let metrics = server.metrics();
+    assert_eq!(
+        sample(
+            &metrics,
+            "turbine_requests_cancelled_total{reason=\"slow_client\"}"
+        ),
+        Some(1.0),
+        "{metrics}"
+    );
+    // Reading on shows what was buffered, then the error event and `[DONE]` (C-3).
+    let data = slow.read_rest();
+    assert_eq!(data.last().map(String::as_str), Some("[DONE]"));
+    let error: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
+    assert_eq!(error["error"]["code"], "slow_client", "{error}");
+}
+
+#[test]
+fn request_and_queue_timeouts() {
+    // server.request_timeout: a held stream ends with the error event, then `[DONE]` (C-3).
+    let server = TinyServer::start_long_with("  request_timeout: 1s\n", "");
+    let held = server.hold_stream();
+    let opened = Instant::now();
+    wait_for(
+        Duration::from_secs(5),
+        "the timed-out stream is dropped",
+        || running(&server.scheduler()) == 0,
+    );
+    assert!(opened.elapsed() >= Duration::from_millis(900));
+    assert_eq!(server.blocks_used(), 0);
+    let data = held.read_rest();
+    assert_eq!(data.last().map(String::as_str), Some("[DONE]"));
+    let error: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
+    assert_eq!(error["error"]["code"], "request_timeout", "{error}");
+    assert_eq!(error["error"]["type"], "timeout", "{error}");
+
+    // A non-streaming request past the deadline: 504 `request_timeout`.
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Once upon a time", "max_tokens": LONG_TOKENS,
+                "ignore_eos": true, "logprobs": 20}),
+    );
+    assert_eq!(resp.status, 504, "{}", resp.body);
+    assert_eq!(resp.error_code(), "request_timeout");
+    let metrics = server.metrics();
+    assert_eq!(
+        sample(
+            &metrics,
+            "turbine_requests_cancelled_total{reason=\"request_timeout\"}"
+        ),
+        Some(2.0),
+        "{metrics}"
+    );
+    drop(server);
+
+    // scheduler.queue_timeout: behind the one running slot, a waiting request gets 503.
+    let server =
+        TinyServer::start_long("scheduler:\n  max_running_requests: 1\n  queue_timeout: 1s\n");
+    let held = server.hold_stream();
+    let started = Instant::now();
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Hi", "max_tokens": 4}),
+    );
+    assert_eq!(resp.status, 503, "{}", resp.body);
+    assert_eq!(resp.error_code(), "queue_timeout");
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    let metrics = server.metrics();
+    assert_eq!(
+        sample(
+            &metrics,
+            "turbine_admission_total{outcome=\"rejected\",reason=\"queue_timeout\"}"
+        ),
+        Some(1.0),
+        "{metrics}"
+    );
+    drop(held);
 }

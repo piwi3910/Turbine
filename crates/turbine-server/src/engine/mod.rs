@@ -7,6 +7,7 @@
 //!
 //! Diagnostics read the documents the engine publishes after every step ([`EngineShared`]).
 
+pub(crate) mod deadlines;
 mod r#loop;
 pub(crate) mod requests;
 
@@ -24,6 +25,7 @@ use crate::backend::ModelBackend;
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
 
+pub(crate) use deadlines::Timeouts;
 pub(crate) use r#loop::{EngineLoop, EngineParts};
 
 /// Events buffered per request between the engine and the HTTP response (P2 S-7).
@@ -108,6 +110,7 @@ pub fn spawn(
     backend: Arc<ModelBackend>,
     metrics: EngineMetrics,
     queue_capacity: usize,
+    timeouts: Timeouts,
     fatal: UnboundedSender<Fatal>,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
@@ -142,6 +145,7 @@ pub fn spawn(
                 tokenizer,
                 max_seq_len,
                 metrics,
+                timeouts,
             });
             backend.set_ready(
                 EngineHandle { submit_tx },
