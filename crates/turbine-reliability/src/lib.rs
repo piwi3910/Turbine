@@ -2,6 +2,7 @@
 //! breaking (P3). No GPU, FFI or `unsafe`: every time-dependent component takes a
 //! [`Clock`] so tests drive time deterministically (P3 S-1).
 
+pub mod admission;
 pub mod budget;
 pub mod circuit;
 #[cfg(feature = "fault-injection")]
