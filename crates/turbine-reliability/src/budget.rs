@@ -170,9 +170,13 @@ pub fn compute_budget(
             .device_budget_bytes
             .map(|c| format!(", capped by device_budget_bytes={}", show(c.0)))
             .unwrap_or_default();
+        let kv_capped = kv_cap
+            .filter(|c| c.0 < remainder)
+            .map(|c| format!(", capped by kv.gpu.max_bytes={}", show(c.0)))
+            .unwrap_or_default();
         return Err(BudgetError {
             breakdown: format!(
-                "device {device} {}: budget={} ({source}{cap}); weights={}; workspace={}; runtime={}; reserve={}; kv={} (minimum {} for one {}-token sequence)",
+                "device {device} {}: budget={} ({source}{cap}); weights={}; workspace={}; runtime={}; reserve={}; kv={}{kv_capped} (minimum {} for one {}-token sequence)",
                 memory_kind_str(inp.memory_kind),
                 show(budget),
                 show(inp.weights_bytes),

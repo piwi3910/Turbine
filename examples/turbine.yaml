@@ -29,8 +29,9 @@ kv:
   block_tokens: 128
   gpu:
     enabled: true
-    # L0 (GPU) block-pool size.
-    max_bytes: 8GiB
+    # L0 (GPU) block-pool cap; null (Phase 3 default) = the kv pool of the memory budget:
+    # what remains after weights, workspace, runtime overhead and the emergency reserve.
+    max_bytes: null
   cpu:
     enabled: true
     max_bytes: 64GiB

@@ -209,7 +209,7 @@ impl Default for KvConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct KvGpuConfig {
     pub enabled: bool,
-    /// L0 block-pool size (Phase 2, default 8GiB). Null is allowed; from Phase 3 null means
+    /// L0 block-pool cap. Null (the default from Phase 3; Phase 2 defaulted to 8GiB) means
     /// the `kv` pool remainder of the budget (CONFLICT C-8).
     pub max_bytes: Option<ByteSize>,
 }
@@ -218,7 +218,7 @@ impl Default for KvGpuConfig {
     fn default() -> Self {
         KvGpuConfig {
             enabled: true,
-            max_bytes: Some(ByteSize::gib(8)),
+            max_bytes: None,
         }
     }
 }

@@ -33,6 +33,16 @@ turbine-kv.workspace = true
 socket2.workspace = true
 # Continuous-batching scheduler, its metrics and the /turbine/v1/scheduler document
 turbine-scheduler.workspace = true
+# P3: memory budget, reservation ledger, emergency reserve, pressure controller, admission,
+# recovery and circuit breaker
+turbine-reliability.workspace = true
+# P3: the per-iteration engine statistics the pressure controller reads without a lock
+arc-swap.workspace = true
+
+[features]
+# P3 S-16: `reliability.fault_injection` (failed pool reservations, injected device errors,
+# telemetry overrides). Never in a default build.
+fault-injection = ["turbine-core/fault-injection", "turbine-reliability/fault-injection"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -2,10 +2,12 @@
 //! support-matrix row with the device arch unknown (exit 2 when unsupported; also under
 //! `--check-config`) → tracing → device discovery → support-matrix row with the device arch
 //! (exit 2 when unsupported; `event="support_matrix"`, WARN when experimental) →
-//! kernel provider → model config, tokenizer, template → kernel registry → memory budget with
-//! the KV pool and the batch workspace (each exit 1, nothing bound yet) → bind (`/health` 200,
-//! `/ready` 503 `loading_model`; exit 1) → weight load, KV pool allocation and one-token warm-up
-//! on the engine thread → `/ready` 200 → serve until SIGINT/SIGTERM (exit 0).
+//! kernel provider → model config, tokenizer, template → kernel registry → pre-load memory
+//! budget (P3 S-2: the KV pool, the batch workspace and the emergency reserve; exit 1 naming
+//! every pool, nothing bound yet) → bind (`/health` 200, `/ready` 503 `loading_model`; exit 1)
+//! → on the engine thread: weight load, the budget re-measured, the reservation ledger, KV
+//! pool, emergency reserve and one-token warm-up, then the telemetry sampler and the pressure
+//! controller → `/ready` 200 → serve until SIGINT/SIGTERM (exit 0).
 //!
 //! Shutdown (P2 S-13): on SIGINT/SIGTERM `/ready` and new requests answer 503 `shutting_down`
 //! while the listener stays open; running requests continue until none is left or
@@ -15,8 +17,10 @@
 //! process exits 0.
 //!
 //! A load or warm-up failure after binding keeps `/ready` at 503 `model_load_failed` for
-//! [`FAILURE_GRACE`] and exits 1; so do three consecutive failed iterations or an engine panic
-//! (`device_error`, C-25).
+//! [`FAILURE_GRACE`] and exits 1. A fatal circuit (P3 S-12: a sticky device error, a pressure
+//! controller failure or an engine panic) keeps `/ready` at 503 `circuit_open` for
+//! [`FAILURE_GRACE`] and exits 3 (the Phase 2 exit after three failed iterations is retired,
+//! C-25).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,15 +31,17 @@ use turbine_api::support::SupportMetrics;
 use turbine_api::{ApiLimits, ApiState};
 use turbine_core::config::{self, Config, ConfigError};
 use turbine_core::support::SupportRowView;
+use turbine_device::telemetry::TelemetryMetrics;
 use turbine_device::{DeviceInventory, DeviceMetrics, DiscoveryOptions};
 use turbine_kv::KvMetrics;
 use turbine_model::ModelMetrics;
 use turbine_observability::MetricsRegistry;
+use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_scheduler::SchedulerMetrics;
 
 use crate::backend::ModelBackend;
 use crate::cli::Cli;
-use crate::engine::{self, EngineMetrics, Fatal, Timeouts};
+use crate::engine::{self, EngineMetrics, Fatal, ReliabilityStartup, Timeouts};
 use crate::exit::ExitCode;
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
@@ -209,10 +215,17 @@ async fn serve(
 
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let queue_capacity = config.scheduler.max_queued_requests as usize;
+    let startup = ReliabilityStartup {
+        inventory: inventory.clone(),
+        devices: config.devices.clone(),
+        metrics: ReliabilityMetrics::register(&state.metrics),
+        telemetry: TelemetryMetrics::register(&state.metrics),
+    };
     if let Err(e) = engine::spawn(
         prepared,
         Arc::clone(&backend),
         engine_metrics,
+        startup,
         queue_capacity,
         Timeouts::from_config(&config.server),
         fatal_tx.clone(),
@@ -262,14 +275,14 @@ async fn serve(
         }
         Some(fatal) = fatal_rx.recv() => {
             backend.set_failed(&fatal);
-            let message = match &fatal {
-                Fatal::LoadFailed(m) => format!("model load failed: {m}"),
-                Fatal::DeviceError(m) => format!("device error: {m}"),
+            let (message, code) = match &fatal {
+                Fatal::LoadFailed(m) => (format!("model load failed: {m}"), ExitCode::Startup),
+                Fatal::DeviceFatal(m) => (format!("device error: {m}"), ExitCode::DeviceFatal),
             };
             tracing::error!(error = %message, "exiting");
             eprintln!("turbine-server: {message}");
             tokio::time::sleep(FAILURE_GRACE).await;
-            ExitCode::Startup
+            code
         }
     }
 }

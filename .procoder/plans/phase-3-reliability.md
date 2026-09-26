@@ -361,7 +361,7 @@ Interfaces:
 - `pub struct DeviceReserve` (`ReserveAllocator` over `DeviceBuffer::alloc(&Arc<dyn DeviceMemory>, bytes)`; `free` drops the buffer)
 - `pub struct EngineLedgerProbe { ledger: Arc<Ledger>, device: DeviceId, queue_len: Arc<AtomicU32>, max_queue: u32 }` (`LedgerProbe`)
 - `pub fn api_error_for(reason: RejectionReason, retry_after_secs: u64) -> ApiError`
-- `pub fn spawn_controller(controller: PressureController, latest: LatestSample, stats: Arc<ArcSwap<EngineStats>>, interval: Duration) -> JoinHandle<()>` (runs `tick` per fast tick under `catch_unwind`; a panic calls `on_circuit_event(ControllerFailed)` → SURVIVAL + CIRCUIT_OPEN `controller_failed`)
+- `pub fn spawn_controller(controller: Arc<Mutex<PressureController>>, latest: LatestSample, stats: Arc<ArcSwap<EngineStats>>, interval: Duration, wake: WeakSender<EngineCommand>, stop: Arc<AtomicBool>) -> io::Result<JoinHandle<()>>` (amended 2026-09-26: the engine thread shares the controller behind one mutex for `on_oom` / `on_recovery` / circuit events — never per token — and the thread wakes the idle engine on a circuit change so PROBING starts its probes; runs `tick` per fast tick under `catch_unwind`, reporting new engine iterations as `CircuitEvent::Iteration`; a panic calls `on_circuit_event(ControllerFailed)` → CIRCUIT_OPEN `controller_failed`, fatal: the engine drains up to `drain_timeout` and the process exits 3)
 - `#[cfg(feature = "fault-injection")] pub struct FaultyVendor { inner: Box<dyn VendorTelemetry>, temperature_c: Option<f64>, delay: Option<Duration> }` and `FaultyExecutor` wrapping `ModelExecutor::forward` with `FaultInjector::iteration_fault`
 - `ExitCode::DeviceFatal = 3`; `KernelError::is_sticky()`, `KernelError::is_oom()` (P3 in turbine-kernels, contract §7.1)
 

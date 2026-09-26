@@ -259,7 +259,8 @@ fn phase2_keys() {
     assert_eq!(d.scheduler.max_queued_requests, 256);
     // Removed in Phase 3 (C-1): reliability.admission.queue_timeout bounds queue wait.
     assert!(d.scheduler.queue_timeout.is_none());
-    assert_eq!(d.kv.gpu.max_bytes, Some(ByteSize::gib(8)));
+    // Phase 3 (C-8): null, the kv pool is the remainder of the memory budget.
+    assert_eq!(d.kv.gpu.max_bytes, None);
     assert_eq!(d.model.tool_call_parser, None);
     assert_eq!(d.structured_output.max_schema_bytes, ByteSize::kib(64));
     assert_eq!(
@@ -482,6 +483,8 @@ fn default_block_tokens_is_128() {
         "examples/turbine.yaml",
         "scripts/lab/phase2-novanas-llama.yaml",
         "scripts/lab/phase2-novanas-olmoe.yaml",
+        "scripts/lab/phase2c-novanas-llama.yaml",
+        "scripts/lab/phase2c-novanas-olmoe.yaml",
     ] {
         let c = load(&root.join(file), &[]).unwrap_or_else(|e| panic!("{file}: {e}"));
         assert_eq!(c.kv.block_tokens, 128, "{file}");

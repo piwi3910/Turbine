@@ -2406,6 +2406,7 @@ dependencies = [
 name = "turbine-server"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "clap",
  "jsonschema",
@@ -2423,6 +2424,7 @@ dependencies = [
  "turbine-kv",
  "turbine-model",
  "turbine-observability",
+ "turbine-reliability",
  "turbine-scheduler",
  "turbine-tensor",
 ]

@@ -82,6 +82,13 @@ fn config_yaml(model_dir: &Path, addr: SocketAddr, extra: &str) -> String {
 /// [`config_yaml`] with more `model`, `server` and `execution` keys (`model_extra`,
 /// `server_extra`, `execution_extra`), each verbatim with lines indented by two spaces, and a
 /// `kv.gpu.max_bytes` of `kv_bytes`.
+///
+/// These are the Phase 1/2 serving tests: the pressure state machine is off
+/// (`reliability.enabled: false`, state fixed at GREEN; worst-case KV admission, the admission
+/// queue and the circuit breaker stay), and the latency-drift circuit triggers are out of reach
+/// — debug builds of the tests running side by side make step times swing far beyond any real
+/// drift. `tests/fault.rs` and the reliability crates test the pressure behaviour. The config
+/// ends with its `reliability` section, so `extra` lines indented by two spaces continue it.
 fn config_yaml_with(
     model_dir: &Path,
     addr: SocketAddr,
@@ -94,7 +101,8 @@ fn config_yaml_with(
     format!(
         "model:\n  path: {}\n{model_extra}server:\n  listen: {addr}\n{server_extra}execution:\n  \
          backend: cpu\n{execution_extra}kv:\n  gpu:\n    max_bytes: {kv_bytes}\nreliability:\n  \
-         emergency_vram_reserve: 1MiB\n{extra}",
+         enabled: false\n  emergency_vram_reserve: 1MiB\n  circuit:\n    \
+         latency_drift_degraded: 1000.0\n    latency_drift_open: 2000.0\n{extra}",
         model_dir.display()
     )
 }
@@ -886,13 +894,15 @@ fn single_slot_and_cancel() {
     }
 }
 
-/// P2 S-7: the waiting queue is bounded by `scheduler.max_queued_requests`; the excess gets 429
-/// `queue_full` with `retry-after`, counted by reason.
+/// P2 S-7, P3 S-9: the waiting queue — from Phase 3 the admission queue, bounded by
+/// `reliability.admission.max_queue` (C-1) — holds requests behind a full batch; the excess gets
+/// 429 `queue_full` with `retry-after`, counted by reason.
 #[test]
 fn queue_full_429() {
+    // `extra` lines indented by two spaces continue the base config's `reliability` section.
     let server = TinyServer::start_long_with(
         HOLD_PAUSED,
-        "scheduler:\n  max_queued_requests: 2\n  max_running_requests: 1\n",
+        "  admission:\n    max_queue: 2\nscheduler:\n  max_running_requests: 1\n",
     );
     let held = server.hold_stream();
     wait_for(Duration::from_secs(10), "first request running", || {
@@ -1021,7 +1031,9 @@ fn disconnect_releases_kv() {
 }
 
 /// P2 S-11: `/turbine/v1/scheduler` and `/turbine/v1/kv` have the Data shapes with counts that
-/// agree with the metrics; `/turbine/v1/pressure` stays 501.
+/// agree with the metrics; P3 S-13: `/turbine/v1/pressure` is the pressure document (its KV pool
+/// agreeing with the reservations of the four requests) and `/turbine/v1/status` names the
+/// pressure and circuit states.
 #[test]
 fn diagnostics_shapes() {
     let server = TinyServer::start_long_with(
@@ -1127,7 +1139,49 @@ fn diagnostics_shapes() {
     );
 
     let pressure = server.get("/turbine/v1/pressure");
-    assert_eq!(pressure.status, 501, "{}", pressure.body);
+    assert_eq!(pressure.status, 200, "{}", pressure.body);
+    let doc = pressure.json();
+    for key in [
+        "enabled",
+        "state",
+        "since",
+        "dominant_signal",
+        "exhaustion_horizon_seconds",
+        "signals",
+        "throttle",
+        "memory",
+        "admission",
+        "circuit",
+        "transitions",
+    ] {
+        assert!(doc.get(key).is_some(), "{key}: {doc}");
+    }
+    // The serving tests run with the pressure state machine off (see `config_yaml_with`).
+    assert_eq!(doc["enabled"], false, "{doc}");
+    assert_eq!(doc["state"], "GREEN", "{doc}");
+    assert_eq!(doc["circuit"]["state"], "HEALTHY", "{doc}");
+    let memory = &doc["memory"][0];
+    assert_eq!(memory["memory_kind"], "dedicated", "{doc}");
+    assert_eq!(memory["emergency_reserve_held"], true, "{doc}");
+    let pool = |name: &str| {
+        memory["pools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {name} pool: {doc}"))
+    };
+    assert_eq!(pool("kv")["capacity_bytes"], POOL_BLOCKS * 32768, "{doc}");
+    assert_eq!(pool("reserve")["used_bytes"], 1 << 20, "{doc}");
+    assert!(pool("weights")["used_bytes"].as_u64().unwrap() > 0, "{doc}");
+    // The two running requests hold worst-case reservations; the two queued ones hold none.
+    let kv = pool("kv");
+    let held_kv = kv["used_bytes"].as_u64().unwrap() + kv["reserved_bytes"].as_u64().unwrap();
+    assert!(held_kv >= used * 32768, "{doc}");
+    let status = server.get("/turbine/v1/status").json();
+    assert!(status["pressure_state"].is_string(), "{status}");
+    assert_eq!(status["circuit_state"], "HEALTHY", "{status}");
     drop(held);
     drop(waiting);
 }
@@ -1298,14 +1352,19 @@ fn startup_failures_exit_1() {
     );
     assert_exit_1(&yaml, addr, "kv.gpu.enabled");
 
-    // A pool smaller than one block per running request.
+    // A kv pool (capped by kv.gpu.max_bytes) below one full-context sequence (P3 S-2: the
+    // message names every pool and its bytes).
     let addr = free_addr();
     let yaml = format!(
         "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cpu\n\
          kv:\n  gpu:\n    max_bytes: 16KiB\n",
         tiny.display()
     );
-    assert_exit_1(&yaml, addr, "kv.gpu.max_bytes");
+    assert_exit_1(&yaml, addr, "capped by kv.gpu.max_bytes");
+    let (_, stderr) = run_failing(&dir, &yaml);
+    for pool in ["weights=", "workspace=", "runtime=", "reserve=", "kv="] {
+        assert!(stderr.contains(pool), "{pool}: stderr:\n{stderr}");
+    }
 
     let addr = free_addr();
     let yaml = format!(
@@ -1826,13 +1885,18 @@ fn longest_whitespace_outside_strings(text: &str) -> usize {
 
 /// P2 S-6, S-9: with a pool too small for the load, preemption by recompute does not change
 /// any request's tokens (seeded sampling and constrained requests included).
+/// P2 S-6 under P3 S-9: a request whose worst-case KV does not fit waits in the admission queue
+/// (`kv_reservation`) instead of preempting a running one below SURVIVAL, and every output is
+/// still exactly what the request produces alone.
 #[test]
 fn preempted_output_unchanged() {
-    // 8 blocks of 128 tokens, one per running request: the six unconstrained requests (up to
-    // "Hello" + 200 tokens) each outgrow their first block, so not all of them fit together.
+    // 8 blocks of 128 tokens: the six unconstrained requests ("Hello" + 200 tokens, 2 blocks
+    // each) and the two constrained ones (1 block each) do not all fit together.
     let server = TinyServer::launch(&Setup {
         kv_bytes: "256KiB",
-        extra: "scheduler:\n  max_running_requests: 8\n",
+        // Requests waiting for KV behind the running ones may wait longer than the default 30 s
+        // in a loaded debug build.
+        extra: "  admission:\n    queue_timeout: 10m\nscheduler:\n  max_running_requests: 8\n",
         ..Setup::default()
     });
     let bodies: Vec<Value> = (0..8)
@@ -1879,7 +1943,12 @@ fn preempted_output_unchanged() {
         &metrics,
         r#"turbine_preemptions_total{reason="kv_exhausted"}"#,
     );
-    assert!(preemptions.is_some_and(|n| n > 0.0), "{metrics}");
+    assert!(preemptions.is_none_or(|n| n == 0.0), "{metrics}");
+    let waited = sample(
+        &metrics,
+        r#"turbine_admission_decisions_total{decision="queue",reason="kv_reservation"}"#,
+    );
+    assert!(waited.is_some_and(|n| n > 0.0), "{metrics}");
 
     for (i, body) in bodies.iter().enumerate() {
         let alone = outcome(server.post("/v1/completions", body));
@@ -2165,17 +2234,22 @@ fn tool_choice_modes() {
 /// `reason` for each reject, preemption and cancellation.
 #[test]
 fn phase2_metrics_and_reasons() {
-    // 20 blocks of 128 tokens; the tool request's rendered prompt takes about 100 tokens.
+    // 20 blocks of 128 tokens; the tool request's rendered prompt takes about 100 tokens. The
+    // context is capped at 2,048 tokens (16 blocks) so the pool holds one full-context sequence
+    // (P3 S-2).
     let server = TinyServer::launch(&Setup {
         kv_bytes: "640KiB",
+        model_extra: "  max_seq_len: 2048\n",
         max_positions: Some(LONG_POSITIONS),
-        extra: "scheduler:\n  max_running_requests: 6\nlogging:\n  format: json\n",
+        extra: "  admission:\n    queue_timeout: 10m\nscheduler:\n  max_running_requests: 6\nlogging:\n  \
+                format: json\n",
         capture_logs: true,
         ..Setup::default()
     });
     let model = server.model.clone();
 
-    // Six concurrent requests of 4 blocks each: queued, then preempted for KV.
+    // Six concurrent requests of 4 blocks each (worst case): five hold the 20 blocks, the sixth
+    // waits for KV in the admission queue (P3: no preemption below SURVIVAL).
     let handles: Vec<_> = (0..6)
         .map(|i| {
             let addr = server.addr;
@@ -2191,10 +2265,11 @@ fn phase2_metrics_and_reasons() {
         assert_eq!(resp.status, 200, "{}", resp.body);
     }
 
-    // Rejected: a KV need beyond the pool, and a bad schema.
+    // Rejected: a KV need beyond the pool (two choices of 1,400 tokens: 22 blocks), and a bad
+    // schema.
     let resp = server.post(
         "/v1/completions",
-        &json!({"model": model, "prompt": "Hello", "max_tokens": 3000}),
+        &json!({"model": model, "prompt": "Hello", "max_tokens": 1400, "n": 2}),
     );
     assert_eq!(resp.status, 400, "{}", resp.body);
     assert_eq!(resp.error_code(), "context_exceeds_kv_capacity");
@@ -2283,7 +2358,7 @@ fn phase2_metrics_and_reasons() {
         assert_eq!(sample(&metrics, series), Some(value), "{series}\n{metrics}");
     }
     let positive = [
-        r#"turbine_preemptions_total{reason="kv_exhausted"}"#,
+        r#"turbine_admission_decisions_total{decision="queue",reason="kv_reservation"}"#,
         "turbine_iteration_seconds_count",
         r#"turbine_iteration_tokens_count{phase="prefill"}"#,
         r#"turbine_iteration_tokens_count{phase="decode"}"#,
@@ -2310,7 +2385,7 @@ fn phase2_metrics_and_reasons() {
     for reason in [
         "context_exceeds_kv_capacity",
         "invalid_json_schema",
-        "kv_exhausted",
+        "kv_reservation",
         "client_disconnect",
     ] {
         assert!(
