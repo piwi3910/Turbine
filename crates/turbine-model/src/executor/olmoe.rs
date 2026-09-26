@@ -32,7 +32,8 @@
 //! ([`turbine_kernels::MoeKernel::needs_host_offsets`], decided from the host-known row count),
 //! every layer reads the `[experts + 1]` expert offsets back after routing (a small blocking
 //! copy); otherwise (the HIP small-m path, up to 512 routed rows: every decode-only batch of up
-//! to 64 sequences) the forward makes no device-to-host copy until the logits, its only bulk
+//! to 64 sequences; above it the HIP grouped WMMA path when hidden and inter are multiples of
+//! 64, as for OLMoE) the forward makes no device-to-host copy until the logits, its only bulk
 //! device-to-host copy.
 //!
 //! Decode graphs (Phase 2c, [`super::graphs`]): as in the Llama executor, a decode-only

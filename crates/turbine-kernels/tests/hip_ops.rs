@@ -937,35 +937,44 @@ fn route_case(p: &Pair, cfg: MoeRouteConfig, tokens: usize, logits: &[f32]) -> R
     routing
 }
 
-/// The OLMoE expert weights in both memories: gate/up `[E, inter, hidden]`, down
-/// `[E, hidden, inter]`.
+/// Expert weights in both memories: gate/up `[E, inter, hidden]`, down `[E, hidden, inter]`.
 struct ExpertWeights {
+    hidden: usize,
+    inter: usize,
     hip: [Tensor; 3],
     cpu: [Tensor; 3],
 }
 
+/// The OLMoE expert weights (64 experts, hidden 2048, inter 1024).
 fn expert_weights(p: &Pair, rng: &mut Rng) -> ExpertWeights {
-    let n = MOE_EXPERTS * MOE_INTER * MOE_HIDDEN;
-    let up_scale = 1.0 / (MOE_HIDDEN as f32).sqrt();
+    expert_weights_of(p, rng, MOE_HIDDEN, MOE_INTER)
+}
+
+/// [`MOE_EXPERTS`] experts of the given hidden and intermediate sizes.
+fn expert_weights_of(p: &Pair, rng: &mut Rng, hidden: usize, inter: usize) -> ExpertWeights {
+    let n = MOE_EXPERTS * inter * hidden;
+    let up_scale = 1.0 / (hidden as f32).sqrt();
     let (g_hip, g_cpu) = twin(
         p,
-        &[MOE_EXPERTS, MOE_INTER, MOE_HIDDEN],
+        &[MOE_EXPERTS, inter, hidden],
         DType::BF16,
         &rng.normal(n, up_scale),
     );
     let (u_hip, u_cpu) = twin(
         p,
-        &[MOE_EXPERTS, MOE_INTER, MOE_HIDDEN],
+        &[MOE_EXPERTS, inter, hidden],
         DType::BF16,
         &rng.normal(n, up_scale),
     );
     let (d_hip, d_cpu) = twin(
         p,
-        &[MOE_EXPERTS, MOE_HIDDEN, MOE_INTER],
+        &[MOE_EXPERTS, hidden, inter],
         DType::BF16,
-        &rng.normal(n, 1.0 / (MOE_INTER as f32).sqrt()),
+        &rng.normal(n, 1.0 / (inter as f32).sqrt()),
     );
     ExpertWeights {
+        hidden,
+        inter,
         hip: [g_hip, u_hip, d_hip],
         cpu: [g_cpu, u_cpu, d_cpu],
     }
@@ -998,9 +1007,10 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
         .filter(|&e| host_offsets[e] == host_offsets[e + 1])
         .count();
 
+    let (hidden, inter) = (w.hidden, w.inter);
     let cfg = MoeExpertsConfig {
-        hidden: MOE_HIDDEN as u32,
-        inter: MOE_INTER as u32,
+        hidden: hidden as u32,
+        inter: inter as u32,
         num_experts: MOE_EXPERTS as u32,
         top_k: MOE_TOP_K as u32,
         expert_begin: begin as u32,
@@ -1013,12 +1023,13 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
         "hip must support moe_experts {cfg}"
     );
     let rows = cfg.routed_rows(tokens);
-    // P2c S-11: the HIP library reads the offsets on the device for up to 512 routed rows.
+    // P2c S-11: the HIP library reads the offsets on the device for up to 512 routed rows
+    // (small-m) and, above, whenever hidden and inter are multiples of 64 (grouped WMMA).
     let needs_host = hip.needs_host_offsets(&cfg, rows);
     assert_eq!(
         needs_host,
-        rows > MOE_SMALL_M_MAX_ROWS,
-        "needs_host_offsets for {rows} routed rows"
+        rows > MOE_SMALL_M_MAX_ROWS && (hidden % 64 != 0 || inter % 64 != 0),
+        "needs_host_offsets for {rows} routed rows, hidden {hidden}, inter {inter}"
     );
     let impl_name = format!(
         "{} host_offsets={needs_host}",
@@ -1027,18 +1038,18 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
     let hip_offsets: &[i32] = if needs_host { &host_offsets } else { &[] };
     let (x_hip, x_cpu) = twin(
         p,
-        &[tokens, MOE_HIDDEN],
+        &[tokens, hidden],
         DType::BF16,
-        &rng.normal(tokens * MOE_HIDDEN, 1.0),
+        &rng.normal(tokens * hidden, 1.0),
     );
-    let out0 = rng.normal(tokens * MOE_HIDDEN, 0.1);
-    let (o_hip, o_cpu) = twin(p, &[tokens, MOE_HIDDEN], DType::BF16, &out0);
+    let out0 = rng.normal(tokens * hidden, 0.1);
+    let (o_hip, o_cpu) = twin(p, &[tokens, hidden], DType::BF16, &out0);
     let (s_hip, s_cpu) = twin(p, &[rows], DType::I32, &routing.sorted_rows);
     let (off_hip, off_cpu) = twin(p, &[MOE_EXPERTS + 1], DType::I32, &routing.expert_offsets);
     let (tw_hip, tw_cpu) = twin(p, &[tokens, MOE_TOP_K], DType::F32, &routing.weights);
     // A generous caller workspace: row positions, gathered rows and the three intermediates.
     let ws = case.workspace.then(|| {
-        let bytes = rows * 4 + rows * (2 * MOE_HIDDEN + 2 * MOE_INTER) * 2 + 4096;
+        let bytes = rows * 4 + rows * (2 * hidden + 2 * inter) * 2 + 4096;
         Tensor::empty(&p.hip_mem, &[bytes.div_ceil(2)], DType::BF16).expect("workspace")
     });
     let local = end - begin;
@@ -1085,7 +1096,7 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
     }
 
     // The same inputs again: bitwise the same output. Then the mean time of one call.
-    let mut again = Tensor::empty(&p.hip_mem, &[tokens, MOE_HIDDEN], DType::BF16).expect("out");
+    let mut again = Tensor::empty(&p.hip_mem, &[tokens, hidden], DType::BF16).expect("out");
     let raw = encode(DType::BF16, &out0);
     let run = |out: &Tensor| {
         hip.experts(&mut MoeExpertsContext {
@@ -1351,7 +1362,7 @@ fn paged_and_moe_ops() {
 /// (`needs_host_offsets` false, `host_expert_offsets` empty) and matches the CPU reference,
 /// bitwise identical across two runs: random routing (experts without rows), every token on the
 /// same 8 experts (64 rows on one expert), a local shard and a caller workspace. Above 512 routed
-/// rows (65 tokens) the library asks for the host offsets and the hipBLASLt path still matches.
+/// rows see `moe_experts_grouped_matches_cpu`.
 /// Prints each case's mean time per call (`moe_experts_timing:`).
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
@@ -1403,14 +1414,70 @@ fn moe_experts_small_m_matches_cpu() {
         repeat: 1,
     };
     experts_case(&p, &mut rng, &w, &case);
-    // 65 tokens = 520 routed rows: the host-offset (hipBLASLt) path.
-    let logits = rng.normal(65 * MOE_EXPERTS, 1.0);
+}
+
+/// P2c (prefill): above 512 routed rows `moe_experts` at the OLMoE shapes runs the grouped WMMA
+/// path, also without host offsets, and matches the CPU reference, bitwise identical across two
+/// runs: 65 tokens (520 rows, the first size past small-m), 300 tokens through a caller
+/// workspace, 256 tokens all on experts 40..=47 (256 rows each: four full row tiles, 56 experts
+/// without rows) and a shard of the experts at 200 tokens. A shape whose hidden or intermediate
+/// size is not a multiple of 64 still takes the host-offset (hipBLASLt) path and matches.
+/// Prints each case's mean time per call (`moe_experts_timing:`).
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn moe_experts_grouped_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(19);
+    let w = expert_weights(&p, &mut rng);
+    for (tokens, workspace) in [(65, false), (300, true)] {
+        let logits = rng.normal(tokens * MOE_EXPERTS, 1.0);
+        let case = ExpertsCase {
+            tokens,
+            logits: &logits,
+            local: (0, MOE_EXPERTS),
+            workspace,
+            repeat: 20,
+        };
+        experts_case(&p, &mut rng, &w, &case);
+    }
+    let mut logits = rng.normal(256 * MOE_EXPERTS, 0.1);
+    for row in logits.chunks_exact_mut(MOE_EXPERTS) {
+        for v in &mut row[40..48] {
+            *v += 10.0;
+        }
+    }
     let case = ExpertsCase {
-        tokens: 65,
+        tokens: 256,
         logits: &logits,
         local: (0, MOE_EXPERTS),
         workspace: false,
-        repeat: 20,
+        repeat: 5,
+    };
+    experts_case(&p, &mut rng, &w, &case);
+    let logits = rng.normal(200 * MOE_EXPERTS, 1.0);
+    let case = ExpertsCase {
+        tokens: 200,
+        logits: &logits,
+        local: (16, 48),
+        workspace: false,
+        repeat: 1,
+    };
+    experts_case(&p, &mut rng, &w, &case);
+    drop(w);
+
+    // hidden 136 and inter 72 (multiples of 8, not of 64): the hipBLASLt path with host offsets.
+    let w = expert_weights_of(&p, &mut rng, 136, 72);
+    let logits = rng.normal(80 * MOE_EXPERTS, 1.0);
+    let case = ExpertsCase {
+        tokens: 80,
+        logits: &logits,
+        local: (0, MOE_EXPERTS),
+        workspace: false,
+        repeat: 1,
     };
     experts_case(&p, &mut rng, &w, &case);
 }

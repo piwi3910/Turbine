@@ -131,7 +131,9 @@ constexpr int32_t kMoeMaxExperts = 256;
 constexpr int32_t kMoeMaxTopK = 32;
 // Most routed rows (num_tokens * top_k) moe_experts runs through the small-m
 // kernels (moe_small_m.hip), which read the group sizes on the device; above it
-// the per-expert hipBLASLt path needs host_expert_offsets.
+// the grouped WMMA kernels (moe_grouped.hip) do the same (hidden and inter
+// multiples of 64), and only a shape they do not cover takes the per-expert
+// hipBLASLt path, which needs host_expert_offsets.
 constexpr int64_t kMoeSmallMaxRows = 512;
 // The small-m path over d's rows: fills pos ([num_tokens * top_k]), act
 // ([num_tokens * top_k, inter] BF16) and down ([num_tokens * top_k, hidden]
@@ -140,6 +142,18 @@ constexpr int64_t kMoeSmallMaxRows = 512;
 // hidden and inter multiples of 8.
 int32_t launch_moe_small_m(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                            int32_t *pos, void *act, void *down);
+// pos[sorted_rows[i]] = i for the local positions of d, -1 for the other rows
+// (moe_small_m.hip); both device-offset paths start with it.
+int32_t launch_moe_positions(turbine_ctx *ctx,
+                             const turbine_moe_experts_desc *d, int32_t *pos);
+// The grouped WMMA path (moe_grouped.hip) for d's rows, above
+// kMoeSmallMaxRows: the same outputs as launch_moe_small_m (pos, act and down
+// indexed by position; the caller scatters). Needs moe_wmma_shape(d) and
+// 16-byte aligned x and expert weights.
+int32_t launch_moe_wmma(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
+                        int32_t *pos, void *act, void *down);
+// hidden and inter are multiples of the grouped kernels' depth step (64).
+bool moe_wmma_shape(const turbine_moe_experts_desc *d);
 
 // Asks hipBLASLt for a grouped BF16 GEMM solution on ctx's device (moe.cpp);
 // false when there is none (ROCm 7.14.1 on gfx1201) or the query fails.

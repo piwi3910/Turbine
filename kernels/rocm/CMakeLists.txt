@@ -125,6 +125,7 @@ set(TURBINE_SOURCES
   src/moe.cpp
   src/moe.hip
   src/moe_small_m.hip
+  src/moe_grouped.hip
   src/logits_reduce.hip)
 set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/rmsnorm.cpp ${FMHA_BLOBS})
 
