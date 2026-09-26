@@ -8,6 +8,8 @@ use super::*;
 use crate::identity::{KvKey, NamespaceKey};
 use crate::metrics::{EvictReason, KvMetrics};
 use crate::test_log;
+use turbine_core::types::MemoryKind;
+use turbine_tensor::host::HostPinned;
 
 /// Deliberately not 4 KiB-aligned: L2 slots round it up to 8 KiB.
 const BLOCK: u64 = 6000;
@@ -337,4 +339,172 @@ fn l0_tier_is_an_accounting_view() {
     l0.refresh(&pool);
     assert_eq!(l0.used_bytes(), 0);
     assert_eq!(l0.pressure(), PressureState::Green);
+}
+
+/// An L1 tier of 2-block slabs over the host fake allocator.
+fn l1_cfg(max_slabs: u64, memory_kind: MemoryKind) -> L1Config {
+    L1Config {
+        enabled: true,
+        max_bytes: max_slabs * 2 * BLOCK,
+        slab_bytes: 2 * BLOCK,
+        block_bytes: BLOCK,
+        memory_kind,
+    }
+}
+
+#[test]
+fn l1_grows_and_shrinks() {
+    let alloc = Arc::new(HostPinned::new(u64::MAX));
+    let l1 = L1PinnedTier::new(l1_cfg(3, MemoryKind::Dedicated), alloc.clone(), clock());
+    assert!(l1.enabled());
+    assert_eq!(l1.id(), TierId::L1);
+    assert_eq!(l1.capacity_bytes(), 6 * BLOCK);
+    assert_eq!(alloc.live_buffers(), 0, "no preallocation");
+    assert_eq!(l1.slab_count(), 0);
+
+    for i in 0..3u8 {
+        l1.put(key(i), TierBlockRef::Host(&bytes(i))).unwrap();
+    }
+    assert_eq!(l1.slab_count(), 2, "slabs allocated on demand");
+    assert_eq!(alloc.allocated_bytes(), 4 * BLOCK);
+    // Fills the free slot of slab 1 without allocating.
+    l1.put(key(3), TierBlockRef::Host(&bytes(3))).unwrap();
+    assert_eq!(l1.slab_count(), 2);
+
+    alloc.fail_next(1);
+    let (res, logs) = test_log::capture(|| l1.put(key(9), TierBlockRef::Host(&bytes(9))));
+    assert_eq!(
+        res,
+        Err(TierError::Full),
+        "failed slab allocation leaves L1 at its size"
+    );
+    assert!(logs.contains("kv_l1_slab_alloc_failed"), "{logs}");
+    assert!(logs.contains("WARN"), "{logs}");
+    assert_eq!(l1.slab_count(), 2);
+    let mut out = vec![0u8; BLOCK as usize];
+    for i in 0..4u8 {
+        l1.get(&key(i), TierBlockMut::Host(&mut out)).unwrap();
+        assert_eq!(
+            out,
+            bytes(i),
+            "L1 stays usable after a failed slab allocation"
+        );
+    }
+
+    l1.put(key(9), TierBlockRef::Host(&bytes(9))).unwrap();
+    assert_eq!(l1.slab_count(), 3, "grows again after the failure");
+    l1.put(key(10), TierBlockRef::Host(&bytes(10))).unwrap();
+    assert_eq!(
+        l1.put(key(11), TierBlockRef::Host(&bytes(11))),
+        Err(TierError::Full),
+        "never beyond kv.cpu.max_bytes"
+    );
+    assert_eq!(l1.slab_count(), 3);
+    assert_eq!(alloc.live_buffers(), 3);
+    assert_eq!(l1.used_bytes(), 6 * BLOCK);
+
+    // Slab 0 holds blocks 0 and 1; emptying it keeps it while host pressure is below RED.
+    for i in [0u8, 1] {
+        l1.evict(&key(i)).unwrap();
+    }
+    l1.set_host_pressure(PressureState::Orange);
+    assert_eq!(l1.slab_count(), 3, "empty slabs kept below RED");
+    l1.set_host_pressure(PressureState::Red);
+    assert_eq!(l1.slab_count(), 2, "the empty slab is released at host RED");
+    assert_eq!(alloc.live_buffers(), 2);
+    assert_eq!(
+        l1.pressure(),
+        PressureState::Red,
+        "host pressure bounds the tier's pressure"
+    );
+    assert_eq!(
+        l1.put(key(12), TierBlockRef::Host(&bytes(12))),
+        Err(TierError::Full),
+        "no slab is allocated at host RED"
+    );
+    l1.set_host_pressure(PressureState::Green);
+    l1.put(key(12), TierBlockRef::Host(&bytes(12))).unwrap();
+    assert_eq!(l1.slab_count(), 3, "grows again once host pressure falls");
+    for i in [2u8, 3, 9, 10, 12] {
+        l1.get(&key(i), TierBlockMut::Host(&mut out)).unwrap();
+        assert_eq!(out, bytes(i));
+    }
+    assert_eq!(l1.used_bytes(), 5 * BLOCK);
+
+    // A reserved slot is written by the copy stream before it becomes visible.
+    let (buffer_id, offset) = l1.reserve(key(13)).unwrap();
+    assert!(!l1.contains(&key(13)), "a reservation is invisible");
+    assert_eq!(l1.locate(&key(13)), None);
+    assert_eq!(
+        l1.used_bytes(),
+        6 * BLOCK,
+        "a reservation occupies its slot"
+    );
+    assert_eq!(l1.reserve(key(14)), Err(TierError::Full));
+    let slot = l1.commit(&key(13));
+    assert!(l1.contains(&key(13)));
+    assert_eq!(l1.locate(&key(13)), Some((buffer_id, offset)));
+    assert_eq!(offset % BLOCK as usize, 0);
+    assert_eq!(
+        slot.0 & 0xffff_ffff,
+        (offset / BLOCK as usize) as u64,
+        "slot encodes slab << 32 | slot"
+    );
+    l1.evict(&key(13)).unwrap();
+    l1.reserve(key(14)).unwrap();
+    assert!(
+        l1.abort_reservation(&key(14)),
+        "a failed copy frees its slot"
+    );
+    assert!(!l1.abort_reservation(&key(14)));
+    assert!(!l1.contains(&key(14)));
+    assert_eq!(l1.used_bytes(), 5 * BLOCK);
+
+    // Three copy errors within 60 s degrade the tier.
+    assert!(!l1.record_copy_error());
+    assert!(!l1.record_copy_error());
+    assert!(l1.record_copy_error());
+    assert!(l1.degraded());
+    assert_eq!(
+        l1.get(&key(3), TierBlockMut::Host(&mut out)),
+        Err(TierError::Degraded)
+    );
+
+    let (tier, logs) = test_log::capture(|| {
+        L1PinnedTier::new(l1_cfg(3, MemoryKind::Unified), alloc.clone(), clock())
+    });
+    assert!(!tier.enabled());
+    assert_eq!(tier.capacity_bytes(), 0);
+    assert_eq!(
+        logs.matches("kv_l1_disabled_unified").count(),
+        1,
+        "exactly one WARN: {logs}"
+    );
+    assert!(logs.contains("WARN"), "{logs}");
+    assert_eq!(
+        tier.put(key(1), TierBlockRef::Host(&bytes(1))),
+        Err(TierError::Full)
+    );
+    assert_eq!(
+        alloc.live_buffers(),
+        3,
+        "a unified device never allocates L1"
+    );
+    assert_eq!(
+        demotion_target(TierId::L0, tier.enabled(), true),
+        Some(TierId::L2),
+        "L0 demotes straight to L2"
+    );
+    assert_eq!(
+        demotion_target(TierId::L0, tier.enabled(), false),
+        None,
+        "or drops without L2"
+    );
+}
+
+#[test]
+fn l1_passes_the_contract_suite() {
+    let alloc = Arc::new(HostPinned::new(u64::MAX));
+    let l1 = L1PinnedTier::new(l1_cfg(2, MemoryKind::Dedicated), alloc, clock());
+    suite(&l1, 4);
 }

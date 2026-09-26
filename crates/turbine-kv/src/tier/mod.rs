@@ -14,10 +14,12 @@ use turbine_reliability::signals::{SignalThresholds, default_thresholds};
 use crate::identity::KvKey;
 
 mod l0;
+mod l1;
 mod l2;
 mod mem;
 
 pub use l0::L0Tier;
+pub use l1::{L1Config, L1PinnedTier};
 pub use l2::{L2Config, L2NvmeTier, SLAB_MAGIC};
 pub use mem::MemTier;
 

@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 turbine-core.workspace = true
 turbine-observability.workspace = true
+# The L0 pool's device memory and the L1 slabs' page-locked host buffers (P4 S-5)
 turbine-tensor.workspace = true
 # P3: every KV block is paid from a reservation-ledger `kv` pool reservation.
 turbine-reliability.workspace = true
