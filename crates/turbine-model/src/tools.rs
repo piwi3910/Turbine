@@ -1,5 +1,5 @@
 //! Tool calling for Llama-3.x (P2 S-18): the `llama3_json` tool-call parser, the llguidance
-//! grammar that constrains `tool_choice` `required` / named output, and call ids.
+//! grammar that constrains `tool_choice` `auto` / `required` / named output, and call ids.
 //!
 //! Llama-3.x emits a call as an optional `<|python_tag|>` followed by one or more
 //! `{"name": …, "parameters": {…}}` objects separated by `;`. The parser turns that into
@@ -251,13 +251,16 @@ fn function_tools(tools: &[Value]) -> Result<Vec<FunctionTool<'_>>, ModelError> 
     Ok(out)
 }
 
-/// The llguidance Lark grammar that constrains a `required` or named `tool_choice`: an optional
+/// The llguidance Lark grammar that constrains an `auto`, `required` or named `tool_choice`: an optional
 /// `<|python_tag|>`, then `{"name": "<tool>", "parameters": <that tool's JSON schema>}` for one
 /// of the allowed tools (only the named one for [`ToolChoice::Named`]), repeated with `;`
 /// separators when `parallel` (never for a named function: that is exactly one call). The
 /// call envelope is written the way Llama writes it (`", "`, `": "`); the parameters take the
 /// bounded natural JSON whitespace of [`crate::structured::json_options`]; a tool
-/// without `parameters` takes any object. `none` and `auto` are unconstrained and have no
+/// without `parameters` takes any object. `auto` is `start: text | calls`: free text whose
+/// first non-whitespace character (after at most [`JSON_MAX_WHITESPACE`]) is not `{` and that
+/// does not open with `<|python_tag|>`, or the `required` calls, so a call the model starts
+/// always names a listed tool and satisfies its schema. `none` is unconstrained and has no
 /// grammar; an unknown named function or a malformed tool is a [`ModelError::Constraint`]
 /// naming the field.
 pub fn tool_call_grammar(
@@ -270,14 +273,14 @@ pub fn tool_call_grammar(
         return Err(invalid("tools", "[]", "at least one function tool"));
     }
     let allowed: Vec<&FunctionTool<'_>> = match choice {
-        ToolChoice::None | ToolChoice::Auto => {
+        ToolChoice::None => {
             return Err(invalid(
                 "tool_choice",
                 choice.as_str(),
-                "required, a named function",
+                "auto, required, a named function",
             ));
         }
-        ToolChoice::Required => tools.iter().collect(),
+        ToolChoice::Auto | ToolChoice::Required => tools.iter().collect(),
         ToolChoice::Named(name) => {
             let Some(tool) = tools.iter().find(|t| t.name == name) else {
                 let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
@@ -290,9 +293,19 @@ pub fn tool_call_grammar(
             vec![tool]
         }
     };
-    let repeat = parallel && matches!(choice, ToolChoice::Required);
+    let repeat = parallel && matches!(choice, ToolChoice::Auto | ToolChoice::Required);
 
-    let mut grammar = String::from("start: <|python_tag|>? call");
+    let mut grammar = match choice {
+        // Free text (first non-whitespace character not `{`; the python tag is a special
+        // token, never text) or the calls of `required`.
+        ToolChoice::Auto => format!(
+            "start: text | calls\n\
+             text: /[\\x20\\x0A\\x0D\\x09]{{0,{JSON_MAX_WHITESPACE}}}\
+             [^{{\\x20\\x0A\\x0D\\x09](?s:.)*/\n\
+             calls: <|python_tag|>? call"
+        ),
+        _ => String::from("start: <|python_tag|>? call"),
+    };
     if repeat {
         grammar.push_str(" (CALL_SEP call)*");
     }
@@ -499,6 +512,22 @@ mod tests {
         );
         assert!(!g.contains("get_weather"), "{g}");
 
+        // Auto: free text or the `required` calls, parallel as asked.
+        let g = grammar(tool_call_grammar(&tools, &ToolChoice::Auto, true).expect("grammar"));
+        assert!(g.starts_with("start: text | calls\n"), "{g}");
+        assert!(
+            g.contains("text: /[\\x20\\x0A\\x0D\\x09]{0,16}[^{\\x20\\x0A\\x0D\\x09](?s:.)*/\n"),
+            "{g}"
+        );
+        assert!(
+            g.contains("calls: <|python_tag|>? call (CALL_SEP call)*\n"),
+            "{g}"
+        );
+        assert!(g.contains("call: call_0 | call_1\n"), "{g}");
+        let g = grammar(tool_call_grammar(&tools, &ToolChoice::Auto, false).expect("grammar"));
+        assert!(g.contains("calls: <|python_tag|>? call\n"), "{g}");
+        assert!(!g.contains("CALL_SEP"), "{g}");
+
         // Errors name the offending field.
         let err = |r: Result<ConstraintSpec, ModelError>| match r {
             Err(e @ ModelError::Constraint(_)) => e.to_string(),
@@ -512,10 +541,8 @@ mod tests {
         ));
         assert!(e.contains("tool_choice.function.name = nope"), "{e}");
         assert!(e.contains("get_weather, get_time"), "{e}");
-        for choice in [ToolChoice::None, ToolChoice::Auto] {
-            let e = err(tool_call_grammar(&tools, &choice, false));
-            assert!(e.contains("tool_choice"), "{e}");
-        }
+        let e = err(tool_call_grammar(&tools, &ToolChoice::None, false));
+        assert!(e.contains("tool_choice = none"), "{e}");
         let e = err(tool_call_grammar(&[], &ToolChoice::Required, false));
         assert!(e.contains("tools"), "{e}");
         let bad_name = [json!({"type": "function", "function": {"name": "a b\"c"}})];
@@ -574,6 +601,55 @@ mod tests {
         assert!(run(bad_enum).is_err(), "{bad_enum:?} accepted");
         let missing = r#"{"name": "get_weather", "parameters": {"unit": "celsius"}}"#;
         assert!(run(missing).is_err(), "{missing:?} accepted");
+    }
+
+    #[test]
+    fn auto_grammar_on_llama_tokenizer() {
+        use crate::structured::tests::{LLAMA_EOS, feed_text, llama_compiler};
+
+        let (tokenizer, compiler) = llama_compiler();
+        let limits = crate::structured::GrammarLimits {
+            max_schema_bytes: 64 * 1024,
+        };
+        let mut tools = weather_tools();
+        tools.push(json!({"type": "function", "function": {
+            "name": "convert_currency",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number"},
+                    "from": {"type": "string"},
+                    "to": {"type": "string"}
+                },
+                "required": ["amount", "from", "to"]
+            }
+        }}));
+        let spec = tool_call_grammar(&tools, &ToolChoice::Auto, true).expect("grammar");
+        let run = |text: &str| {
+            let mut matcher = compiler.compile(&spec, &limits).expect("compile");
+            feed_text(matcher.as_mut(), &tokenizer, &LLAMA_EOS, text)
+        };
+        // Free text, including `{` after its first character and leading whitespace, and
+        // valid calls with and without the python tag are complete outputs.
+        for text in [
+            "The sea is calm today.",
+            "Use {curly} braces in the template, like {\"a\": 1}.",
+            "\n  Sure: here is {x}",
+            r#"{"name": "convert_currency", "parameters": {"amount": 100, "from": "GBP", "to": "JPY"}}"#,
+            r#"<|python_tag|>{"name": "get_weather", "parameters": {"location": "London", "unit": "celsius"}}"#,
+            r#"{"name": "get_time", "parameters": {}}; {"name": "get_weather", "parameters": {"location": "Rome"}}"#,
+        ] {
+            assert_eq!(run(text), Ok(true), "{text:?}");
+        }
+        // Output that opens like JSON must be a call: a non-call object, an unlisted function
+        // and a string where the schema wants a number are refused.
+        for text in [
+            r#"{"a": 1}"#,
+            r#"{"name": "get_stock", "parameters": {}}"#,
+            r#"{"name": "convert_currency", "parameters": {"amount": "100", "from": "GBP", "to": "JPY"}}"#,
+        ] {
+            assert!(run(text).is_err(), "{text:?} accepted");
+        }
     }
 
     /// The JSON schema after `<rule>: %json ` on its own line of `grammar`.

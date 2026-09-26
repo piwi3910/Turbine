@@ -350,13 +350,18 @@ impl ModelBackend {
             ToolChoiceMode::Named(name) => ToolChoice::Named(name.clone()),
         };
         let (constraint, tool_output) = match (&tool_choice, parser) {
-            (ToolChoice::Required | ToolChoice::Named(_), Some(p)) => {
+            (ToolChoice::Auto | ToolChoice::Required | ToolChoice::Named(_), Some(p)) => {
+                // `auto` is held to free text or schema-valid calls; it is still held and
+                // parsed only when it opens like a call.
                 let spec =
                     tool_call_grammar(&tools, &tool_choice, body.parallel_tool_calls_enabled())
                         .map_err(|e| ApiError::invalid_json_schema(e.to_string()))?;
-                (Some(spec), ToolOutput::Constrained(p))
+                let output = match tool_choice {
+                    ToolChoice::Auto => ToolOutput::Auto(p),
+                    _ => ToolOutput::Constrained(p),
+                };
+                (Some(spec), output)
             }
-            (ToolChoice::Auto, Some(p)) => (None, ToolOutput::Auto(p)),
             _ => (
                 response_constraint(body.response_format.as_ref()),
                 ToolOutput::None,

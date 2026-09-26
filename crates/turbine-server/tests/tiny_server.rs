@@ -1870,6 +1870,39 @@ fn tool_choice_modes() {
         check_call(&calls[0], &tools);
     }
 
+    // auto: free text that does not open with `{`, or exactly one schema-valid call. The
+    // random-weight model's text is favoured to open with `{` (token 123); the grammar only
+    // lets that be a call.
+    for seed in 0..3 {
+        let resp = chat(json!({"tool_choice": "auto", "parallel_tool_calls": false,
+                               "seed": seed, "max_tokens": 40}));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body = resp.json();
+        let choice = &body["choices"][0];
+        match choice["message"]["tool_calls"].as_array() {
+            Some(calls) => {
+                assert_eq!(choice["finish_reason"], "tool_calls", "{body}");
+                assert_eq!(calls.len(), 1, "{body}");
+                check_call(&calls[0], &tools);
+            }
+            None => {
+                let text = choice["message"]["content"].as_str().unwrap();
+                assert!(!text.trim_start().starts_with('{'), "{body}");
+            }
+        }
+    }
+    for seed in 0..3 {
+        let resp = chat(json!({"tool_choice": "auto", "parallel_tool_calls": false,
+                               "seed": seed, "logit_bias": {"123": 100}}));
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body = resp.json();
+        let choice = &body["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{body}");
+        let calls = choice["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "{body}");
+        check_call(&calls[0], &tools);
+    }
+
     // none: content only.
     let resp = chat(json!({"tool_choice": "none", "max_tokens": 8, "ignore_eos": true}));
     assert_eq!(resp.status, 200, "{}", resp.body);

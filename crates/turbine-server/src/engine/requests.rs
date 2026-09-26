@@ -35,7 +35,8 @@ pub(crate) enum ToolOutput {
     /// Plain content (no tools, or `tool_choice: "none"`).
     #[default]
     None,
-    /// `tool_choice: "auto"`: unconstrained; held and parsed when it starts like a call.
+    /// `tool_choice: "auto"`: constrained to text or calls; held and parsed when it starts
+    /// like a call.
     Auto(ToolParser),
     /// `required` or a named function: constrained by the tool grammar, always parsed.
     Constrained(ToolParser),
