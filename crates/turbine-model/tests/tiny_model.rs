@@ -21,8 +21,8 @@ use turbine_kernels::{
 };
 use turbine_model::config::{Architecture, ModelArchConfig, RopeScaling};
 use turbine_model::executor::{
-    self, BatchInput, LlamaExecutor, Logits, ModelExecutor, OlmoeExecutor, SeqSlice, SequenceKv,
-    TraceTensor, build_executor,
+    self, BatchInput, ExecutorOptions, LlamaExecutor, Logits, ModelExecutor, OlmoeExecutor,
+    SeqSlice, SequenceKv, TraceTensor, build_executor,
 };
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
@@ -101,6 +101,13 @@ fn executor(
     }
 }
 
+/// Every fusion on, the opt-in projection fusion included: the Llama helpers below run it, so
+/// `hip_matches_cpu` and the trace comparisons exercise the fused path on HIP (the golden test
+/// runs the default options).
+const ALL_FUSED: ExecutorOptions = ExecutorOptions {
+    fused_projections: true,
+};
+
 fn paged_executor(
     spec: &TinySpec,
     provider: Arc<dyn KernelProvider>,
@@ -115,7 +122,7 @@ fn paged_executor(
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &LlamaExecutor::requirements(cfg, BLOCK_TOKENS),
+        &LlamaExecutor::requirements(cfg, BLOCK_TOKENS, ALL_FUSED),
         &metrics,
     )
     .expect("every op has a provider");
@@ -127,6 +134,7 @@ fn paged_executor(
         BLOCK_TOKENS,
         MAX_SEQ_LEN,
         MAX_SEQS,
+        ALL_FUSED,
     )
     .expect("executor")
 }
@@ -631,7 +639,7 @@ fn forward_rejects_invalid_batches() {
 fn requirements_and_workspace() {
     let tmp = TempDir::new("tiny-model-reqs");
     let spec = write_tiny_llama(tmp.path(), SEED);
-    let reqs = LlamaExecutor::requirements(&spec.config, BLOCK_TOKENS);
+    let reqs = LlamaExecutor::requirements(&spec.config, BLOCK_TOKENS, ALL_FUSED);
     let rendered: Vec<String> = reqs
         .iter()
         .map(|r| format!("{} {}", r.op, r.config))
@@ -644,12 +652,13 @@ fn requirements_and_workspace() {
     // One block of one layer: 2 × 128 tokens × 2 kv heads × 16 head_dim × 2 bytes.
     let layer_block = 2 * 128 * 2 * 16 * 2;
     let copy = format!("copy_blocks num_layers=2 block_bytes={layer_block}");
+    // Fused: Q/K/V is one n = 64 + 2·32 GEMM, gate/up one n = 2·128 GEMM.
     for want in [
         "embedding hidden=64 vocab_rows=263 dtype=bf16",
         "rmsnorm dim=64 dtype=bf16",
         "gemm n=64 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
-        "gemm n=32 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
         "gemm n=128 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
+        "gemm n=256 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
         "gemm n=64 k=128 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
         "gemm n=263 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
         "rope head_dim=16 rotary_dim=16 q_heads=4 kv_heads=2 dtype=bf16",
@@ -665,13 +674,34 @@ fn requirements_and_workspace() {
         );
     }
     assert_eq!(rendered.len(), 13, "{rendered:#?}");
+    // Unfused: separate Q (n = 64, as O), K/V (n = 32) and gate/up (n = 128) GEMMs.
+    let unfused: Vec<String> = LlamaExecutor::requirements(
+        &spec.config,
+        BLOCK_TOKENS,
+        ExecutorOptions::from_fused_ops(false),
+    )
+    .iter()
+    .map(|r| format!("{} {}", r.op, r.config))
+    .collect();
+    for (want, present) in [
+        ("gemm n=32 k=64", true),
+        ("gemm n=128 k=64", true),
+        ("gemm n=256 k=64", false),
+    ] {
+        assert_eq!(
+            unfused.iter().any(|r| r.starts_with(want)),
+            present,
+            "{want}: {unfused:#?}"
+        );
+    }
+    assert_eq!(unfused.len(), 13, "{unfused:#?}");
 
     // Workspace grows linearly in the batch token count and in the sequence count.
     let ws = |t, n| LlamaExecutor::workspace_bytes(&spec.config, BLOCK_TOKENS, t, n);
     let per_token = ws(2, 1) - ws(1, 1);
     assert_eq!(ws(64, 1) - ws(1, 1), 63 * per_token);
-    // Per token: ids + positions (i32), x/h/proj [hidden], q/attn [q_dim], k/v [kv_dim],
-    // gate/up/act [intermediate], all bf16.
+    // Per token: ids + positions (i32), x/h/proj [hidden], attn [q_dim], qkv [q_dim +
+    // 2·kv_dim], gate_up [2·intermediate] and act [intermediate], all bf16.
     assert_eq!(per_token, 4 + 4 + 2 * (3 * 64 + 2 * 64 + 2 * 32 + 3 * 128));
     // Per sequence: last row [hidden] bf16, logits [vocab] f32, q_indptr + kv_lens entries and
     // a block table for max_position_embeddings tokens (i32).
@@ -891,6 +921,16 @@ fn cpu_model(
     mem: &Arc<dyn DeviceMemory>,
     max_batch_tokens: u32,
 ) -> Box<dyn ModelExecutor> {
+    cpu_model_with(spec, mem, max_batch_tokens, ExecutorOptions::default())
+}
+
+/// [`cpu_model`] run with `opts`.
+fn cpu_model_with(
+    spec: &TinySpec,
+    mem: &Arc<dyn DeviceMemory>,
+    max_batch_tokens: u32,
+    opts: ExecutorOptions,
+) -> Box<dyn ModelExecutor> {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
     let slots = match cfg.architecture {
@@ -905,7 +945,7 @@ fn cpu_model(
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &executor::requirements(cfg, BLOCK_TOKENS),
+        &executor::requirements(cfg, BLOCK_TOKENS, opts),
         &metrics,
     )
     .expect("every op has a provider");
@@ -917,6 +957,7 @@ fn cpu_model(
         BLOCK_TOKENS,
         max_batch_tokens,
         MAX_SEQS,
+        opts,
     )
     .expect("executor")
 }
@@ -957,6 +998,78 @@ fn run_seq(
     logits.row(0).to_vec()
 }
 
+/// Phase 2c S-8: on both tiny checkpoints (CPU provider) the fused projections (one Q/K/V GEMM
+/// and, for Llama, one gate/up GEMM into row-strided views) give bitwise the logits of one GEMM
+/// per projection, for a 40-token prefill and 10 greedy decode steps. The two runs really take
+/// different op sequences: only the fused one needs the `[q + 2·kv, hidden]` GEMM.
+#[test]
+fn fused_ops_match_unfused() {
+    const PROMPT: usize = 40;
+    let tmp = TempDir::new("tiny-model-fused");
+    for spec in both_checkpoints(&tmp) {
+        let cfg = &spec.config;
+        let name = cfg.architecture.as_str();
+        let gemm = |n: u32| {
+            format!(
+                "gemm n={n} k={} trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=bf16",
+                cfg.hidden
+            )
+        };
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let rendered = |fused_projections| -> Vec<String> {
+            executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions { fused_projections })
+                .iter()
+                .map(|r| format!("{} {}", r.op, r.config))
+                .collect()
+        };
+        let (fused, unfused) = (rendered(true), rendered(false));
+        let qkv = gemm(cfg.num_attention_heads * cfg.head_dim + 2 * kv_dim);
+        assert!(fused.contains(&qkv), "{name}: {fused:#?}");
+        assert!(unfused.contains(&gemm(kv_dim)), "{name}: {unfused:#?}");
+        assert_ne!(fused, unfused, "{name}");
+
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let mut runs = Vec::new();
+        for fused_projections in [true, false] {
+            let opts = ExecutorOptions { fused_projections };
+            let mut exec = cpu_model_with(&spec, &mem, MAX_SEQ_LEN, opts);
+            let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv");
+            let mut tokens: Vec<u32> = (0..PROMPT as u32)
+                .map(|i| (i * 53 + 5) % spec.vocab)
+                .collect();
+            let positions: Vec<u32> = (0..PROMPT as u32).collect();
+            let mut rows = vec![
+                kv.forward(exec.as_mut(), &tokens, &positions)
+                    .expect("prefill")
+                    .data,
+            ];
+            for _ in 0..10 {
+                let next = argmax(rows.last().expect("prefill row"));
+                let pos = tokens.len() as u32;
+                tokens.push(next);
+                rows.push(
+                    kv.forward(exec.as_mut(), &[next], &[pos])
+                        .expect("decode")
+                        .data,
+                );
+            }
+            runs.push(rows);
+        }
+        for (step, (fused, unfused)) in runs[0].iter().zip(&runs[1]).enumerate() {
+            let same = fused.len() == unfused.len()
+                && fused
+                    .iter()
+                    .zip(unfused)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(
+                same,
+                "{name} step {step}: fused differs from unfused by up to {}",
+                max_abs_diff(fused, unfused)
+            );
+        }
+    }
+}
+
 /// The tiny OLMoE (8 experts, top-2, `norm_topk_prob: false`, Q/K norm) on the CPU provider:
 /// prefill and greedy decode logits within 1e-4 of the naive model, which in turn is far from
 /// the same model without Q/K norm or with renormalised routing weights (so neither can go
@@ -970,10 +1083,11 @@ fn olmoe_cpu_forward_matches_naive() {
     assert_eq!((moe.num_experts, moe.experts_per_token), (8, 2));
     assert!(!moe.norm_topk_prob && cfg.qk_norm && cfg.rope_scaling.is_none());
 
-    let reqs: Vec<String> = OlmoeExecutor::requirements(cfg, BLOCK_TOKENS)
-        .iter()
-        .map(|r| format!("{} {}", r.op, r.config))
-        .collect();
+    let reqs: Vec<String> =
+        OlmoeExecutor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default())
+            .iter()
+            .map(|r| format!("{} {}", r.op, r.config))
+            .collect();
     for want in [
         "rmsnorm dim=64 dtype=bf16",
         "gemm n=8 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
@@ -1408,7 +1522,7 @@ fn olmoe_decode_single_device_copy() {
         let registry = KernelRegistry::build(
             vec![provider],
             &order,
-            &executor::requirements(cfg, BLOCK_TOKENS),
+            &executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default()),
             &metrics,
         )
         .expect("every op has a provider");
@@ -1420,6 +1534,7 @@ fn olmoe_decode_single_device_copy() {
             BLOCK_TOKENS,
             MAX_TOKENS,
             SEQS as u32,
+            ExecutorOptions::default(),
         )
         .expect("executor");
 

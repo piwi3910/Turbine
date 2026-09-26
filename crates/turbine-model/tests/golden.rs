@@ -27,7 +27,7 @@ use turbine_kernels::{
     KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider, shim_provider,
 };
 use turbine_model::config::Architecture;
-use turbine_model::executor::{self, LlamaExecutor, ModelExecutor, SequenceKv};
+use turbine_model::executor::{self, ExecutorOptions, LlamaExecutor, ModelExecutor, SequenceKv};
 use turbine_model::generate::{GenerateOptions, generate};
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::write_tiny_llama;
@@ -568,7 +568,7 @@ fn build_executor(
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &LlamaExecutor::requirements(&cfg, BLOCK_TOKENS),
+        &LlamaExecutor::requirements(&cfg, BLOCK_TOKENS, ExecutorOptions::default()),
         &metrics,
     )
     .expect("every op has a provider");
@@ -581,6 +581,7 @@ fn build_executor(
         BLOCK_TOKENS,
         max_seq_len,
         1,
+        ExecutorOptions::default(),
     )
     .expect("executor");
     Runner { exec, kv }
@@ -801,7 +802,7 @@ fn build_any_executor(
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &executor::requirements(&cfg, BLOCK_TOKENS),
+        &executor::requirements(&cfg, BLOCK_TOKENS, ExecutorOptions::default()),
         &metrics,
     )
     .expect("every op has a provider");
@@ -814,6 +815,7 @@ fn build_any_executor(
         BLOCK_TOKENS,
         max_seq_len,
         1,
+        ExecutorOptions::default(),
     )
     .expect("executor");
     AnyRunner { exec, kv }

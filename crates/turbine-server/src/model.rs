@@ -20,7 +20,7 @@ use turbine_kernels::{
 };
 use turbine_kv::metrics::log_pool_startup;
 use turbine_kv::{BlockPool, BlockPoolConfig};
-use turbine_model::executor::{self, BatchInput, ModelExecutor, SeqSlice};
+use turbine_model::executor::{self, BatchInput, ExecutorOptions, ModelExecutor, SeqSlice};
 use turbine_model::loader::LoadedWeights;
 use turbine_model::{
     Architecture, BudgetTerms, ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES,
@@ -268,6 +268,8 @@ pub struct PreparedModel {
     pub pool: BlockPoolConfig,
     /// Scheduler bounds; `max_batch_tokens` and `max_running_requests` also size the executor.
     pub scheduler: SchedulerParams,
+    /// The executor's op sequence (`execution.fused_ops`).
+    pub executor_options: ExecutorOptions,
     /// Compiles `response_format` and tool grammars; its token trie is built once, here.
     pub grammar: Arc<GrammarCompiler>,
     /// `structured_output` bounds on those grammars.
@@ -322,10 +324,11 @@ pub fn prepare(
         ));
     }
     let block_tokens = config.kv.block_tokens;
+    let executor_options = ExecutorOptions::from_fused_ops(config.execution.fused_ops);
     let registry = KernelRegistry::build(
         provider.providers.clone(),
         &provider.order,
-        &executor::requirements(&arch, block_tokens),
+        &executor::requirements(&arch, block_tokens, executor_options),
         &KernelMetrics::register(metrics),
     )
     .map_err(|e| kernel_error("kernel selection", e))?;
@@ -418,6 +421,7 @@ pub fn prepare(
         block_tokens,
         pool,
         scheduler,
+        executor_options,
         grammar,
         structured_output: config.structured_output.clone(),
         tool_call_parser,
@@ -485,7 +489,8 @@ fn weight_slots(arch: &ModelArchConfig) -> Result<Vec<WeightSlot>, StartupError>
 
 /// The one place the server builds a model executor: the architecture's executor for ragged
 /// batches of up to `max_batch_tokens` tokens and `max_seqs` sequences over KV blocks of
-/// `block_tokens` tokens.
+/// `block_tokens` tokens, running the op sequence `options` selects.
+#[allow(clippy::too_many_arguments)]
 pub fn build_executor(
     arch: &ModelArchConfig,
     weights: LoadedWeights,
@@ -494,6 +499,7 @@ pub fn build_executor(
     block_tokens: u32,
     max_batch_tokens: u32,
     max_seqs: u32,
+    options: ExecutorOptions,
 ) -> Result<Box<dyn ModelExecutor>, ModelError> {
     executor::build_executor(
         arch,
@@ -503,6 +509,7 @@ pub fn build_executor(
         block_tokens,
         max_batch_tokens,
         max_seqs,
+        options,
     )
 }
 
@@ -541,6 +548,7 @@ pub fn load(
         prepared.block_tokens,
         prepared.scheduler.max_batch_tokens,
         prepared.scheduler.max_running_requests,
+        prepared.executor_options,
     )
     .map_err(|e| model_error("executor", e))?;
     let mut pool = BlockPool::new(prepared.pool, Arc::clone(mem))

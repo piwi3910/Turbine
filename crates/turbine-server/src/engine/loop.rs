@@ -919,7 +919,7 @@ mod tests {
     use turbine_core::types::{BlockId, DeviceId, KvLayout, ModelShape, Priority};
     use turbine_kernels::{KernelError, KernelMetrics, KernelRegistry, cpu_reference_provider};
     use turbine_kv::{BlockPoolConfig, KvMetrics};
-    use turbine_model::executor::{self, SequenceKv};
+    use turbine_model::executor::{self, ExecutorOptions, SequenceKv};
     use turbine_model::testing::TempDir;
     use turbine_model::testing::tiny::{TinySpec, write_tiny_llama};
     use turbine_model::{
@@ -976,7 +976,7 @@ mod tests {
         let registry = KernelRegistry::build(
             vec![provider],
             &order,
-            &executor::requirements(cfg, BLOCK_TOKENS),
+            &executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default()),
             &KernelMetrics::register(&MetricsRegistry::new()),
         )
         .unwrap();
@@ -988,6 +988,7 @@ mod tests {
             BLOCK_TOKENS,
             64,
             max_seqs,
+            ExecutorOptions::default(),
         )
         .expect("executor")
     }

@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use turbine_core::request::{GenerationEvent, GenerationRequest, SamplingParams, StopConditions};
 use turbine_core::types::{DeviceId, Priority, RequestId};
 use turbine_kernels::{KernelMetrics, KernelRegistry, cpu_reference_provider};
-use turbine_model::executor::{self, SequenceKv};
+use turbine_model::executor::{self, ExecutorOptions, SequenceKv};
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
     TINY_EOS, TinyOptions, write_tiny_llama, write_tiny_llama_with,
@@ -1348,7 +1348,7 @@ fn reference_tokens(prompt: &[u32], sampling: SamplingParams, max_tokens: u32) -
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
-        &executor::requirements(&spec.config, 16),
+        &executor::requirements(&spec.config, 16, ExecutorOptions::default()),
         &KernelMetrics::register(&MetricsRegistry::new()),
     )
     .unwrap();
@@ -1360,6 +1360,7 @@ fn reference_tokens(prompt: &[u32], sampling: SamplingParams, max_tokens: u32) -
         16,
         512,
         1,
+        ExecutorOptions::default(),
     )
     .unwrap();
     let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), 512).unwrap();

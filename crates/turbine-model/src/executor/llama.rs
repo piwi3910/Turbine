@@ -5,6 +5,14 @@
 //! final RMSNorm on each sequence's last row → LM head (`embed_tokens` when tied) with FP32
 //! output.
 //!
+//! Fused projections (Phase 2c, [`ExecutorOptions::fused_projections`]): the loader lays each layer's
+//! Q/K/V and gate/up weights out as one `[q; k; v]` and one `[gate; up]` matrix, so one GEMM
+//! computes all three (two) projections into one `[tokens, q + 2·kv]` (`[tokens, 2·inter]`)
+//! buffer, and RoPE, attention and SiLU·up read their operands as row-strided column blocks of
+//! it. Unfused, one GEMM per projection runs over row views of the same weights into dense
+//! regions of the same buffer: the Phase 2 op sequence, bit for bit (every output element is the
+//! same dot product either way).
+//!
 //! Every token of every sequence goes through the GEMMs as one `[total_tokens, hidden]` batch;
 //! only attention looks at sequence boundaries (`q_indptr`, `kv_lens`, block tables). The KV
 //! lives in the caller's pool (`KvPoolView`); activations live in buffers allocated once for
@@ -29,10 +37,10 @@ use turbine_kernels::{
 use turbine_tensor::{DeviceMemory, KvPoolView, Tensor, TensorView};
 
 use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
-use super::{BatchInput, ForwardTimings, Logits, ModelExecutor, rope};
+use super::{BatchInput, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, Split, rope};
 use crate::ModelError;
 use crate::config::ModelArchConfig;
-use crate::loader::{LM_HEAD, LoadedWeights};
+use crate::loader::{LM_HEAD, LoadedWeights, gate_up_proj_name, qkv_proj_name};
 
 /// Weights, activations and KV are BF16; logits are F32.
 pub(super) const ACT: DType = DType::BF16;
@@ -149,9 +157,22 @@ pub struct TraceTensor {
     pub data: Vec<f32>,
 }
 
-/// Decodes a contiguous BF16 or F32 view read from the device into f32 values.
+/// Decodes a BF16 or F32 view read from the device into f32 values, row-major (a row-strided
+/// view's rows are gathered; its other dimensions must be dense).
 fn read_f32(view: &TensorView<'_>) -> Result<Vec<f32>, ModelError> {
-    let bytes = view.slice.read_bytes()?;
+    let raw = view.slice.read_bytes()?;
+    let es = view.dtype.size_bytes();
+    let rows = view.shape.first().copied().unwrap_or(1);
+    let row_bytes = view.numel() / rows.max(1) * es;
+    let stride_bytes = view.strides.first().map_or(row_bytes, |s| s * es);
+    let bytes: Vec<u8> = if stride_bytes == row_bytes {
+        raw
+    } else {
+        (0..rows)
+            .flat_map(|r| &raw[r * stride_bytes..r * stride_bytes + row_bytes])
+            .copied()
+            .collect()
+    };
     Ok(match view.dtype {
         DType::F32 => bytes
             .chunks_exact(4)
@@ -167,14 +188,31 @@ fn read_f32(view: &TensorView<'_>) -> Result<Vec<f32>, ModelError> {
 
 struct Layer {
     input_norm: Tensor,
-    wq: Tensor,
-    wk: Tensor,
-    wv: Tensor,
+    /// `[q_dim + 2·kv_dim, hidden]`: Q rows, then K, then V.
+    w_qkv: Tensor,
     wo: Tensor,
     post_norm: Tensor,
-    w_gate: Tensor,
-    w_up: Tensor,
+    /// `[2·inter, hidden]`: gate rows, then up.
+    w_gate_up: Tensor,
     w_down: Tensor,
+}
+
+/// Parameter `name` taken from `weights`, checked to be the `shape` BF16 matrix.
+pub(super) fn take_matrix(
+    weights: &mut LoadedWeights,
+    name: &str,
+    shape: [usize; 2],
+) -> Result<Tensor, ModelError> {
+    let w = weights.take(name)?;
+    if w.shape.as_slice() != shape || w.dtype != ACT {
+        return Err(invalid(format!(
+            "{name} is {:?} {}, expected {shape:?} {}",
+            w.shape.as_slice(),
+            w.dtype.as_str(),
+            ACT.as_str()
+        )));
+    }
+    Ok(w)
 }
 
 /// Activation buffers, allocated once: `[max_batch_tokens, cols]` per token row, `[max_seqs,
@@ -185,15 +223,14 @@ struct Buffers {
     x: Tensor,
     /// Normalised input of the attention and MLP blocks.
     h: Tensor,
-    q: Tensor,
-    /// K and V projections of the new rows (K rotated in place), appended by attention.
-    k: Tensor,
-    v: Tensor,
+    /// Q, K and V projections of the new rows (Q and K rotated in place; K and V appended by
+    /// attention), laid out by `LlamaExecutor::qkv`.
+    qkv: Tensor,
     attn: Tensor,
     /// O and down projection outputs before the residual add.
     proj: Tensor,
-    gate: Tensor,
-    up: Tensor,
+    /// Gate and up projections, laid out by `LlamaExecutor::gate_up`.
+    gate_up: Tensor,
     act: Tensor,
     /// Final-norm output of each sequence's last row.
     last: Tensor,
@@ -209,6 +246,10 @@ pub struct LlamaExecutor {
     kv_layout: KvLayout,
     limits: BatchLimits,
     registry: Arc<KernelRegistry>,
+    /// Q/K/V (`[q_dim, kv_dim, kv_dim]`) and gate/up (`[inter, inter]`) in their buffers, fused
+    /// or not per [`ExecutorOptions::fused_projections`].
+    qkv: Split<3>,
+    gate_up: Split<2>,
     embed: Tensor,
     layers: Vec<Layer>,
     final_norm: Tensor,
@@ -241,16 +282,32 @@ pub(super) fn limits(
 }
 
 impl LlamaExecutor {
-    /// Every distinct op config the forward pass executes, in first-use order, plus the
-    /// `copy_blocks` fork over KV blocks of `block_tokens` tokens. The registry is built from
+    /// Every distinct op config the forward pass executes with `opts`, in first-use order, plus
+    /// the `copy_blocks` fork over KV blocks of `block_tokens` tokens. The registry is built from
     /// this list at startup, so a config no provider supports fails before any weight is read.
-    pub fn requirements(cfg: &ModelArchConfig, block_tokens: u32) -> Vec<OpRequirement> {
+    pub fn requirements(
+        cfg: &ModelArchConfig,
+        block_tokens: u32,
+        opts: ExecutorOptions,
+    ) -> Vec<OpRequirement> {
         let d = Dims::of(cfg);
-        let specs = [
+        let mut specs = vec![
             OpConfig::Embedding(embedding_cfg(&d)),
             OpConfig::Rmsnorm(norm_cfg(&d)),
-            OpConfig::Gemm(gemm_cfg(d.q_dim, d.hidden, ACT)),
-            OpConfig::Gemm(gemm_cfg(d.kv_dim, d.hidden, ACT)),
+        ];
+        if opts.fused_projections {
+            specs.push(OpConfig::Gemm(gemm_cfg(
+                d.q_dim + 2 * d.kv_dim,
+                d.hidden,
+                ACT,
+            )));
+        } else {
+            specs.extend([
+                OpConfig::Gemm(gemm_cfg(d.q_dim, d.hidden, ACT)),
+                OpConfig::Gemm(gemm_cfg(d.kv_dim, d.hidden, ACT)),
+            ]);
+        }
+        specs.extend([
             OpConfig::Rope(rope_cfg(cfg)),
             OpConfig::Attention(attention_cfg(
                 cfg,
@@ -260,12 +317,20 @@ impl LlamaExecutor {
             OpConfig::Attention(attention_cfg(cfg, AttentionKind::DecodePaged, block_tokens)),
             OpConfig::Gemm(gemm_cfg(d.hidden, d.q_dim, ACT)),
             OpConfig::Add(ADD_CFG),
-            OpConfig::Gemm(gemm_cfg(d.inter, d.hidden, ACT)),
+            OpConfig::Gemm(gemm_cfg(
+                if opts.fused_projections {
+                    2 * d.inter
+                } else {
+                    d.inter
+                },
+                d.hidden,
+                ACT,
+            )),
             OpConfig::SiluMul(activation_cfg(&d)),
             OpConfig::Gemm(gemm_cfg(d.hidden, d.inter, ACT)),
             OpConfig::Gemm(gemm_cfg(d.vocab, d.hidden, DType::F32)),
             OpConfig::CopyBlocks(batch::copy_config(&cfg.kv_layout(block_tokens))),
-        ];
+        ]);
         let mut unique: Vec<OpConfig> = Vec::with_capacity(specs.len());
         for spec in specs {
             if !unique.contains(&spec) {
@@ -299,11 +364,13 @@ impl LlamaExecutor {
             + DeviceBatch::bytes(&limits)
     }
 
-    /// Takes the parameters out of `weights`, allocates the activation and batch buffers for
-    /// `max_batch_tokens` tokens of up to `max_seqs` sequences on `mem`, and uploads the rotary
-    /// inverse frequencies. The KV is not the executor's: every forward names its pool, laid
-    /// out as `cfg.kv_layout(block_tokens)`. `registry` must have been built from
-    /// [`LlamaExecutor::requirements`] of `cfg` and `block_tokens`.
+    /// Takes the parameters out of `weights` (Q/K/V and gate/up fused by the loader), allocates
+    /// the activation and batch buffers for `max_batch_tokens` tokens of up to `max_seqs`
+    /// sequences on `mem`, and uploads the rotary inverse frequencies. The KV is not the
+    /// executor's: every forward names its pool, laid out as `cfg.kv_layout(block_tokens)`.
+    /// `registry` must have been built from [`LlamaExecutor::requirements`] of `cfg`,
+    /// `block_tokens` and `opts`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: &ModelArchConfig,
         mut weights: LoadedWeights,
@@ -312,6 +379,7 @@ impl LlamaExecutor {
         block_tokens: u32,
         max_batch_tokens: u32,
         max_seqs: u32,
+        opts: ExecutorOptions,
     ) -> Result<LlamaExecutor, ModelError> {
         if block_tokens == 0 || max_batch_tokens == 0 || max_seqs == 0 {
             return Err(invalid(format!(
@@ -321,18 +389,29 @@ impl LlamaExecutor {
         }
         let d = Dims::of(cfg);
         let mut layers = Vec::with_capacity(cfg.num_layers as usize);
+        let qkv = Split {
+            cols: [d.q_dim, d.kv_dim, d.kv_dim],
+            fused: opts.fused_projections,
+        };
+        let gate_up = Split {
+            cols: [d.inter, d.inter],
+            fused: opts.fused_projections,
+        };
         for i in 0..cfg.num_layers {
             let p = format!("model.layers.{i}");
+            let w_qkv = take_matrix(&mut weights, &qkv_proj_name(i), [qkv.width(), d.hidden])?;
+            let w_gate_up = take_matrix(
+                &mut weights,
+                &gate_up_proj_name(i),
+                [gate_up.width(), d.hidden],
+            )?;
             let mut take = |s: &str| weights.take(&format!("{p}.{s}.weight"));
             layers.push(Layer {
                 input_norm: take("input_layernorm")?,
-                wq: take("self_attn.q_proj")?,
-                wk: take("self_attn.k_proj")?,
-                wv: take("self_attn.v_proj")?,
+                w_qkv,
                 wo: take("self_attn.o_proj")?,
                 post_norm: take("post_attention_layernorm")?,
-                w_gate: take("mlp.gate_proj")?,
-                w_up: take("mlp.up_proj")?,
+                w_gate_up,
                 w_down: take("mlp.down_proj")?,
             });
         }
@@ -357,13 +436,10 @@ impl LlamaExecutor {
             inv_freq,
             x: act(d.hidden)?,
             h: act(d.hidden)?,
-            q: act(d.q_dim)?,
-            k: act(d.kv_dim)?,
-            v: act(d.kv_dim)?,
+            qkv: act(qkv.width())?,
             attn: act(d.q_dim)?,
             proj: act(d.hidden)?,
-            gate: act(d.inter)?,
-            up: act(d.inter)?,
+            gate_up: act(gate_up.width())?,
             act: act(d.inter)?,
             last: Tensor::empty(&mem, &[n, d.hidden], ACT)?,
             logits: Tensor::empty(&mem, &[n, d.vocab], DType::F32)?,
@@ -376,6 +452,8 @@ impl LlamaExecutor {
             kv_layout: limits.layout,
             limits,
             registry,
+            qkv,
+            gate_up,
             embed,
             layers,
             final_norm,
@@ -438,12 +516,17 @@ impl LlamaExecutor {
         TensorView::contiguous(buf.storage.whole(), 0, &[t, heads, head_dim], ACT)
     }
 
-    /// `c = a · wᵀ`.
-    fn linear(&self, a: TensorView<'_>, w: &Tensor, c: TensorView<'_>) -> Result<(), ModelError> {
+    /// `c = a · wᵀ` for a `[n, k]` weight view `w`.
+    fn linear(
+        &self,
+        a: TensorView<'_>,
+        w: TensorView<'_>,
+        c: TensorView<'_>,
+    ) -> Result<(), ModelError> {
         let cfg = gemm_cfg(w.shape[0], w.shape[1], c.dtype);
         self.registry.gemm(&cfg).execute(&mut GemmContext {
             a,
-            b: w.view(),
+            b: w,
             c,
             trans_b: true,
             alpha: 1.0,
@@ -491,25 +574,40 @@ impl LlamaExecutor {
         let t = p.total_q;
 
         let li = Some(i);
+        let (q, k, v) = (
+            |t| self.qkv.part(&b.qkv, 0, t, &[d.q_dim]),
+            |t| self.qkv.part(&b.qkv, 1, t, &[d.kv_dim]),
+            |t| self.qkv.part(&b.qkv, 2, t, &[d.kv_dim]),
+        );
         // Attention block.
         self.rmsnorm(Self::rows(&b.x, t), &l.input_norm, Self::rows(&b.h, t))?;
         self.record(li, "attn_norm", Self::rows(&b.h, t))?;
-        self.linear(Self::rows(&b.h, t), &l.wq, Self::rows(&b.q, t))?;
-        self.record(li, "q", Self::rows(&b.q, t))?;
-        self.linear(Self::rows(&b.h, t), &l.wk, Self::rows(&b.k, t))?;
-        self.record(li, "k", Self::rows(&b.k, t))?;
-        self.linear(Self::rows(&b.h, t), &l.wv, Self::rows(&b.v, t))?;
-        self.record(li, "v", Self::rows(&b.v, t))?;
+        if self.qkv.fused {
+            let w = l.w_qkv.view();
+            self.linear(Self::rows(&b.h, t), w, self.qkv.whole(&b.qkv, t))?;
+        } else {
+            let w = |r, n| l.w_qkv.view().rows(r, n);
+            let h = || Self::rows(&b.h, t);
+            self.linear(h(), w(0, d.q_dim), q(t))?;
+            self.linear(h(), w(d.q_dim, d.kv_dim), k(t))?;
+            self.linear(h(), w(d.q_dim + d.kv_dim, d.kv_dim), v(t))?;
+        }
+        self.record(li, "q", q(t))?;
+        self.record(li, "k", k(t))?;
+        self.record(li, "v", v(t))?;
+        let q_heads = |t| self.qkv.part(&b.qkv, 0, t, &[d.heads, d.head_dim]);
+        let k_heads = |t| self.qkv.part(&b.qkv, 1, t, &[d.kv_heads, d.head_dim]);
+        let v_heads = |t| self.qkv.part(&b.qkv, 2, t, &[d.kv_heads, d.head_dim]);
         let rope = rope_cfg(&self.cfg);
         self.registry.rope(&rope).execute(&mut RopeContext {
             cfg: rope,
-            q: Self::heads(&b.q, t, d.heads, d.head_dim),
-            k: Self::heads(&b.k, t, d.kv_heads, d.head_dim),
+            q: q_heads(t),
+            k: k_heads(t),
             positions: self.meta.positions_view(p),
             inv_freq: b.inv_freq.view(),
         })?;
-        self.record(li, "q_rope", Self::rows(&b.q, t))?;
-        self.record(li, "k_rope", Self::rows(&b.k, t))?;
+        self.record(li, "q_rope", q(t))?;
+        self.record(li, "k_rope", k(t))?;
         let kind = if p.is_decode() {
             AttentionKind::DecodePaged
         } else {
@@ -520,9 +618,9 @@ impl LlamaExecutor {
             .attention(&attn)
             .execute_paged(&mut PagedAttentionContext {
                 cfg: attn,
-                q: Self::heads(&b.q, t, d.heads, d.head_dim),
-                k_new: Self::heads(&b.k, t, d.kv_heads, d.head_dim),
-                v_new: Self::heads(&b.v, t, d.kv_heads, d.head_dim),
+                q: q_heads(t),
+                k_new: k_heads(t),
+                v_new: v_heads(t),
                 out: Self::heads(&b.attn, t, d.heads, d.head_dim),
                 kv_layer: batch::kv_layer(kv, i),
                 block_table: self.meta.block_table_view(p),
@@ -534,7 +632,7 @@ impl LlamaExecutor {
                 scale: 1.0 / (d.head_dim as f32).sqrt(),
             })?;
         self.record(li, "attn", Self::rows(&b.attn, t))?;
-        self.linear(Self::rows(&b.attn, t), &l.wo, Self::rows(&b.proj, t))?;
+        self.linear(Self::rows(&b.attn, t), l.wo.view(), Self::rows(&b.proj, t))?;
         self.record(li, "o_proj", Self::rows(&b.proj, t))?;
         self.residual_add(t)?;
         self.record(li, "resid_attn", Self::rows(&b.x, t))?;
@@ -542,19 +640,31 @@ impl LlamaExecutor {
         // MLP block.
         self.rmsnorm(Self::rows(&b.x, t), &l.post_norm, Self::rows(&b.h, t))?;
         self.record(li, "mlp_norm", Self::rows(&b.h, t))?;
-        self.linear(Self::rows(&b.h, t), &l.w_gate, Self::rows(&b.gate, t))?;
-        self.record(li, "gate", Self::rows(&b.gate, t))?;
-        self.linear(Self::rows(&b.h, t), &l.w_up, Self::rows(&b.up, t))?;
-        self.record(li, "up", Self::rows(&b.up, t))?;
+        let gate = |t| self.gate_up.part(&b.gate_up, 0, t, &[d.inter]);
+        let up = |t| self.gate_up.part(&b.gate_up, 1, t, &[d.inter]);
+        if self.gate_up.fused {
+            let w = l.w_gate_up.view();
+            self.linear(Self::rows(&b.h, t), w, self.gate_up.whole(&b.gate_up, t))?;
+        } else {
+            let w = |r| l.w_gate_up.view().rows(r, d.inter);
+            self.linear(Self::rows(&b.h, t), w(0), gate(t))?;
+            self.linear(Self::rows(&b.h, t), w(d.inter), up(t))?;
+        }
+        self.record(li, "gate", gate(t))?;
+        self.record(li, "up", up(t))?;
         self.registry
             .activation(&activation_cfg(d))
             .execute(&mut ActivationContext {
-                gate: Self::rows(&b.gate, t),
-                up: Self::rows(&b.up, t),
+                gate: gate(t),
+                up: up(t),
                 out: Self::rows(&b.act, t),
             })?;
         self.record(li, "act", Self::rows(&b.act, t))?;
-        self.linear(Self::rows(&b.act, t), &l.w_down, Self::rows(&b.proj, t))?;
+        self.linear(
+            Self::rows(&b.act, t),
+            l.w_down.view(),
+            Self::rows(&b.proj, t),
+        )?;
         self.record(li, "down", Self::rows(&b.proj, t))?;
         self.residual_add(t)?;
         self.record(li, "resid_mlp", Self::rows(&b.x, t))
@@ -614,7 +724,11 @@ impl ModelExecutor for LlamaExecutor {
         self.final_norm_last_rows(&p)?;
         self.record(None, "final_norm", Self::rows(&b.last, n))?;
         let head = self.lm_head.as_ref().unwrap_or(&self.embed);
-        self.linear(Self::rows(&b.last, n), head, Self::rows(&b.logits, n))?;
+        self.linear(
+            Self::rows(&b.last, n),
+            head.view(),
+            Self::rows(&b.logits, n),
+        )?;
         self.record(None, "logits", Self::rows(&b.logits, n))?;
         let wait_started = Instant::now();
         // The iteration's one device-to-host copy (it synchronizes the stream).

@@ -213,6 +213,7 @@ Interfaces:
 
 - `#[derive(Clone, Copy)] pub struct ExecutorOptions { pub fused_ops: bool, pub decode_graphs: bool, pub device_sampling: bool }` passed to `LlamaExecutor::new`, `OlmoeExecutor::new` and `build_executor` as a new last argument (contract addition; `Default` = all true)
 - Fused weights: `layers.<i>.qkv_proj` `[q_dim + 2·kv_dim, hidden]` (rows Q, then K, then V) and `layers.<i>.gate_up_proj` `[2·inter, hidden]` (gate rows then up rows); the separate tensors are not kept when fused, so weight memory is unchanged
+- Amendment (2026-09-26): projection fusion is its own field, `ExecutorOptions::fused_projections`, default `executor::FUSED_PROJECTIONS_DEFAULT` (off, spec S-8 amendment); `fused_ops` selects `add_rmsnorm`; the server maps _execution.fused_ops_ through `ExecutorOptions::from_fused_ops` (true: the defaults, false: every fusion off)
 - `requirements()` lists `add_rmsnorm` only when `fused_ops` is true and falls back to `add` + `rmsnorm` when the registry has no provider for it
   Covers: S-8/S-9/S-14 AC `tiny_model fused_ops_match_unfused`
   Depends on: Tasks 2, 8

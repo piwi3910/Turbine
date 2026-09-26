@@ -30,7 +30,7 @@ pub use config::{
 };
 pub use generate::{GenerateOptions, Generation, generate};
 pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot, llama_slots};
-pub use loader::{StackPlace, olmoe_slots, stacked_experts_name};
+pub use loader::{StackPlace, gate_up_proj_name, olmoe_slots, qkv_proj_name, stacked_experts_name};
 pub use metrics::{ForwardPhase, ModelMetrics, ToolCallOutcome};
 pub use sampler::{SampleJob, SampledToken, Sampler, SamplerState, sample_rows};
 pub use structured::{

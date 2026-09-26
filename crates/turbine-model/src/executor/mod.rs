@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use turbine_core::types::{BlockId, KvLayout, ModelShape, SeqId};
 use turbine_kernels::{KernelRegistry, OpRequirement};
-use turbine_tensor::{DeviceMemory, KvPoolView};
+use turbine_tensor::tensor::contiguous_strides;
+use turbine_tensor::{DeviceMemory, KvPoolView, Tensor, TensorView};
 
 use crate::ModelError;
 use crate::config::{Architecture, ModelArchConfig};
@@ -21,13 +22,122 @@ pub use batch::SequenceKv;
 pub use llama::{LlamaExecutor, TraceTensor};
 pub use olmoe::OlmoeExecutor;
 
-/// The op requirements of `cfg`'s architecture over KV blocks of `block_tokens` tokens
-/// ([`LlamaExecutor::requirements`] or [`OlmoeExecutor::requirements`]): the registry the
+/// How an executor runs its forward pass (Phase 2c). `Default` is what the server runs with
+/// `execution.fused_ops: true` ([`ExecutorOptions::from_fused_ops`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutorOptions {
+    /// One GEMM for the Q/K/V projections and (Llama) one for gate/up, over the fused weights the
+    /// loader lays out; `false` runs one GEMM per projection over row views of the same weights
+    /// (the Phase 2 op sequence, kept as the reference path).
+    ///
+    /// Off by default ([`FUSED_PROJECTIONS_DEFAULT`]).
+    pub fused_projections: bool,
+}
+
+/// Whether projection fusion is on by default. Off: on the R9700 the fused GEMMs are faster
+/// alone (Llama-3.2-3B, 16 rows: Q/K/V 56 µs against 86 µs for the three GEMMs; gate/up 173
+/// against 171 µs; RoPE, attention and SiLU·up as fast on the strided views) and in an executor
+/// loop, yet the end-to-end baseline workload measured 556.7 tok/s fused against 623.6 unfused
+/// (2026-09-26, decode forward 22.2 against 19.6 ms), which is not explained yet. There is no
+/// configuration key for it (spec S-14 lists the switches); `execution.fused_ops: false` keeps
+/// it off regardless.
+pub const FUSED_PROJECTIONS_DEFAULT: bool = false;
+
+impl Default for ExecutorOptions {
+    fn default() -> ExecutorOptions {
+        ExecutorOptions {
+            fused_projections: FUSED_PROJECTIONS_DEFAULT,
+        }
+    }
+}
+
+impl ExecutorOptions {
+    /// The options `execution.fused_ops` selects: `true` the defaults, `false` every fusion off
+    /// (the Phase 2 op sequence).
+    pub fn from_fused_ops(fused_ops: bool) -> ExecutorOptions {
+        if fused_ops {
+            ExecutorOptions::default()
+        } else {
+            ExecutorOptions {
+                fused_projections: false,
+            }
+        }
+    }
+}
+
+/// The op requirements of `cfg`'s architecture over KV blocks of `block_tokens` tokens run with
+/// `opts` ([`LlamaExecutor::requirements`] or [`OlmoeExecutor::requirements`]): the registry the
 /// executor runs on is built from this list.
-pub fn requirements(cfg: &ModelArchConfig, block_tokens: u32) -> Vec<OpRequirement> {
+pub fn requirements(
+    cfg: &ModelArchConfig,
+    block_tokens: u32,
+    opts: ExecutorOptions,
+) -> Vec<OpRequirement> {
     match cfg.architecture {
-        Architecture::Llama => LlamaExecutor::requirements(cfg, block_tokens),
-        Architecture::Olmoe => OlmoeExecutor::requirements(cfg, block_tokens),
+        Architecture::Llama => LlamaExecutor::requirements(cfg, block_tokens, opts),
+        Architecture::Olmoe => OlmoeExecutor::requirements(cfg, block_tokens, opts),
+    }
+}
+
+/// Where the outputs of projections of one input live in their shared buffer `[rows, Σ cols]`:
+/// side by side in each row (`fused`: one GEMM writes them all; each part is a row-strided view)
+/// or as consecutive dense `[rows, cols_i]` matrices (one GEMM per projection). Either way the
+/// buffer holds the same bytes, so the workspace does not depend on the choice.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Split<const N: usize> {
+    pub cols: [usize; N],
+    pub fused: bool,
+}
+
+impl<const N: usize> Split<N> {
+    pub fn width(&self) -> usize {
+        self.cols.iter().sum()
+    }
+
+    /// Part `i` of the first `t` rows of `buf` (a `[rows, width]` buffer), as `[t, inner…]` with
+    /// `inner` multiplying to `cols[i]`.
+    pub fn part<'a>(&self, buf: &'a Tensor, i: usize, t: usize, inner: &[usize]) -> TensorView<'a> {
+        debug_assert_eq!(inner.iter().product::<usize>(), self.cols[i]);
+        let before: usize = self.cols[..i].iter().sum();
+        let (offset, row_stride) = if self.fused {
+            (before, self.width())
+        } else {
+            (buf.shape[0] * before, self.cols[i])
+        };
+        strided_rows(buf, offset, row_stride, t, inner)
+    }
+
+    /// The first `t` rows of the whole fused buffer as `[t, width]` (the fused GEMM's output).
+    pub fn whole<'a>(&self, buf: &'a Tensor, t: usize) -> TensorView<'a> {
+        debug_assert!(self.fused);
+        strided_rows(buf, 0, self.width(), t, &[self.width()])
+    }
+}
+
+/// `t` rows of `[inner…]` elements of `buf`'s storage, the first at element `offset` and each
+/// `row_stride` elements after the previous one.
+fn strided_rows<'a>(
+    buf: &'a Tensor,
+    offset: usize,
+    row_stride: usize,
+    t: usize,
+    inner: &[usize],
+) -> TensorView<'a> {
+    let es = buf.dtype.size_bytes();
+    let row: usize = inner.iter().product();
+    let len = if t == 0 {
+        0
+    } else {
+        (t - 1) * row_stride + row
+    };
+    let shape: Vec<usize> = std::iter::once(t).chain(inner.iter().copied()).collect();
+    let mut strides = contiguous_strides(&shape);
+    strides[0] = row_stride;
+    TensorView {
+        slice: buf.storage.whole().sub(offset * es, len * es),
+        shape: shape.as_slice().into(),
+        strides,
+        dtype: buf.dtype,
     }
 }
 
@@ -51,8 +161,9 @@ pub fn workspace_bytes(
 
 /// The executor of `cfg`'s architecture over `weights`, for ragged batches of up to
 /// `max_batch_tokens` tokens and `max_seqs` sequences whose KV pool is laid out as
-/// `cfg.kv_layout(block_tokens)`. `registry` must have been built from [`requirements`] of
-/// `cfg` and `block_tokens`.
+/// `cfg.kv_layout(block_tokens)`, run with `opts`. `registry` must have been built from
+/// [`requirements`] of `cfg`, `block_tokens` and `opts`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_executor(
     cfg: &ModelArchConfig,
     weights: LoadedWeights,
@@ -61,6 +172,7 @@ pub fn build_executor(
     block_tokens: u32,
     max_batch_tokens: u32,
     max_seqs: u32,
+    opts: ExecutorOptions,
 ) -> Result<Box<dyn ModelExecutor>, ModelError> {
     Ok(match cfg.architecture {
         Architecture::Llama => Box::new(LlamaExecutor::new(
@@ -71,6 +183,7 @@ pub fn build_executor(
             block_tokens,
             max_batch_tokens,
             max_seqs,
+            opts,
         )?),
         Architecture::Olmoe => Box::new(OlmoeExecutor::new(
             cfg,
@@ -80,6 +193,7 @@ pub fn build_executor(
             block_tokens,
             max_batch_tokens,
             max_seqs,
+            opts,
         )?),
     })
 }
@@ -159,4 +273,19 @@ pub trait ModelExecutor: Send {
         src: &[BlockId],
         dst: &[BlockId],
     ) -> Result<(), ModelError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `execution.fused_ops: true` runs the defaults (projection fusion only when
+    /// [`FUSED_PROJECTIONS_DEFAULT`]); `false` turns every fusion off.
+    #[test]
+    fn fused_ops_selects_defaults_or_nothing() {
+        let on = ExecutorOptions::from_fused_ops(true);
+        assert_eq!(on, ExecutorOptions::default());
+        assert_eq!(on.fused_projections, FUSED_PROJECTIONS_DEFAULT);
+        assert!(!ExecutorOptions::from_fused_ops(false).fused_projections);
+    }
 }

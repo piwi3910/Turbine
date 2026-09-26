@@ -13,6 +13,13 @@
 //! Batch packing, the KV pool and the block fork are shared with the Llama executor
 //! ([`super::batch`]).
 //!
+//! Q/K/V (Phase 2c): the loader lays each layer's Q/K/V weights out as one `[q; k; v]` matrix;
+//! with [`ExecutorOptions::fused_projections`] one GEMM writes all three projections side by side into
+//! one `[tokens, q + 2·kv]` buffer, otherwise one GEMM per projection over row views of the same
+//! weights writes dense regions of it. Q/K norm run in place there, and RoPE and attention read
+//! their operands from it. The expert gate/up weights stay separate stacks: the `moe_experts`
+//! ABI takes them as two dense `[experts, inter, hidden]` tensors.
+//!
 //! The loader uploads each expert's weights straight into its layer's stacked
 //! `[experts, inter, hidden]` (gate, up) and `[experts, hidden, inter]` (down) tensors
 //! ([`crate::loader::stacked_experts_name`]), the layout the `moe_experts` op takes, so loading
@@ -35,11 +42,11 @@ use turbine_kernels::{
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, Tensor, TensorView};
 
 use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
-use super::llama::{ACT, ADD_CFG, attention_cfg, gemm_cfg, invalid, limits, rope_cfg};
-use super::{BatchInput, ForwardTimings, Logits, ModelExecutor, rope};
+use super::llama::{ACT, ADD_CFG, attention_cfg, gemm_cfg, invalid, limits, rope_cfg, take_matrix};
+use super::{BatchInput, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, Split, rope};
 use crate::ModelError;
 use crate::config::{Architecture, ModelArchConfig, MoeConfig};
-use crate::loader::{LM_HEAD, LoadedWeights, stacked_experts_name};
+use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name, stacked_experts_name};
 
 const I32: usize = 4;
 const F32: usize = 4;
@@ -142,9 +149,8 @@ fn moe_of(cfg: &ModelArchConfig) -> Result<MoeConfig, ModelError> {
 
 struct Layer {
     input_norm: Tensor,
-    wq: Tensor,
-    wk: Tensor,
-    wv: Tensor,
+    /// `[q_dim + 2·kv_dim, hidden]`: Q rows, then K, then V.
+    w_qkv: Tensor,
     wo: Tensor,
     q_norm: Tensor,
     k_norm: Tensor,
@@ -166,14 +172,10 @@ struct Buffers {
     x: Tensor,
     /// Normalised input of the attention and MoE blocks.
     h: Tensor,
-    /// Q after its norm (rotated in place); the raw Q projection goes through `attn`.
-    q: Tensor,
-    /// K and V of the new rows (K normalised, then rotated in place), appended by attention.
-    k: Tensor,
-    v: Tensor,
-    /// The raw K projection before its norm.
-    k_raw: Tensor,
-    /// The raw Q projection, then the attention output.
+    /// Q, K and V of the new rows (Q and K normalised, then rotated, in place; K and V appended
+    /// by attention), laid out by `OlmoeExecutor::qkv`.
+    qkv: Tensor,
+    /// The attention output.
     attn: Tensor,
     /// O projection output, then the MoE accumulator, before each residual add.
     proj: Tensor,
@@ -205,6 +207,9 @@ pub struct OlmoeExecutor {
     kv_layout: KvLayout,
     limits: BatchLimits,
     registry: Arc<KernelRegistry>,
+    /// Q/K/V (`[q_dim, kv_dim, kv_dim]`) in `qkv`, fused or not per
+    /// [`ExecutorOptions::fused_projections`].
+    qkv: Split<3>,
     embed: Tensor,
     layers: Vec<Layer>,
     final_norm: Tensor,
@@ -239,12 +244,16 @@ fn stacked_experts(
 }
 
 impl OlmoeExecutor {
-    /// Every distinct op config the forward pass executes, in first-use order, plus the
-    /// `copy_blocks` fork over KV blocks of `block_tokens` tokens: the Llama attention ops, RMSNorm
-    /// over `hidden`, `heads·head_dim` and `kv_heads·head_dim` (Q/K norm), the F32-output router
-    /// GEMM, `moe_route` and `moe_experts`, and no dense MLP. A config without experts lists no
-    /// MoE ops ([`OlmoeExecutor::new`] refuses it).
-    pub fn requirements(cfg: &ModelArchConfig, block_tokens: u32) -> Vec<OpRequirement> {
+    /// Every distinct op config the forward pass executes with `opts`, in first-use order, plus
+    /// the `copy_blocks` fork over KV blocks of `block_tokens` tokens: the Llama attention ops,
+    /// RMSNorm over `hidden`, `heads·head_dim` and `kv_heads·head_dim` (Q/K norm), the
+    /// F32-output router GEMM, `moe_route` and `moe_experts`, and no dense MLP. A config without
+    /// experts lists no MoE ops ([`OlmoeExecutor::new`] refuses it).
+    pub fn requirements(
+        cfg: &ModelArchConfig,
+        block_tokens: u32,
+        opts: ExecutorOptions,
+    ) -> Vec<OpRequirement> {
         let head_dim = cfg.head_dim as usize;
         let hidden = cfg.hidden as usize;
         let q_dim = cfg.num_attention_heads as usize * head_dim;
@@ -257,8 +266,16 @@ impl OlmoeExecutor {
                 dtype: ACT,
             }),
             OpConfig::Rmsnorm(norm_cfg(hidden)),
-            OpConfig::Gemm(gemm_cfg(q_dim, hidden, ACT)),
-            OpConfig::Gemm(gemm_cfg(kv_dim, hidden, ACT)),
+        ];
+        if opts.fused_projections {
+            specs.push(OpConfig::Gemm(gemm_cfg(q_dim + 2 * kv_dim, hidden, ACT)));
+        } else {
+            specs.extend([
+                OpConfig::Gemm(gemm_cfg(q_dim, hidden, ACT)),
+                OpConfig::Gemm(gemm_cfg(kv_dim, hidden, ACT)),
+            ]);
+        }
+        specs.extend([
             OpConfig::Rmsnorm(norm_cfg(q_dim)),
             OpConfig::Rmsnorm(norm_cfg(kv_dim)),
             OpConfig::Rope(rope_cfg(cfg)),
@@ -270,7 +287,7 @@ impl OlmoeExecutor {
             OpConfig::Attention(attention_cfg(cfg, AttentionKind::DecodePaged, block_tokens)),
             OpConfig::Gemm(gemm_cfg(hidden, q_dim, ACT)),
             OpConfig::Add(ADD_CFG),
-        ];
+        ]);
         if let Some(moe) = cfg.moe {
             specs.extend([
                 OpConfig::Gemm(gemm_cfg(moe.num_experts as usize, hidden, DType::F32)),
@@ -293,8 +310,8 @@ impl OlmoeExecutor {
 
     /// Device bytes of the executor's buffers (the budget's workspace term), including the MoE
     /// permutation buffers: per token the I32 id and position, the BF16 rows of `x`, `h`,
-    /// `proj`, `zeros` (hidden), `q`, `attn` (heads · head_dim), `k`, `v`, `k_raw`
-    /// (kv_heads · head_dim), the F32 router logits (experts) and top-k weights, the I32 top-k
+    /// `proj`, `zeros` (hidden), `attn` (heads · head_dim) and `qkv` (heads · head_dim +
+    /// 2 · kv_heads · head_dim), the F32 router logits (experts) and top-k weights, the I32 top-k
     /// ids and sorted rows (top_k each) and the `moe_experts` workspace share; per sequence its
     /// last normalised row (BF16), its F32 logits row, its `q_indptr` and `kv_lens` entries and a
     /// block table for `max_position_embeddings` tokens (I32); plus one `q_indptr` entry, the
@@ -312,7 +329,7 @@ impl OlmoeExecutor {
         let d = Dims::of(cfg, &moe);
         let t = max_batch_tokens as usize;
         let bf16 = ACT.size_bytes() as u64;
-        let per_token = bf16 * (4 * d.hidden + 2 * d.q_dim + 3 * d.kv_dim) as u64
+        let per_token = bf16 * (4 * d.hidden + 2 * d.q_dim + 2 * d.kv_dim) as u64
             + (F32 * (d.experts + d.top_k)) as u64
             + (I32 * 2 * d.top_k) as u64;
         let per_seq = bf16 * d.hidden as u64 + (F32 * d.vocab) as u64;
@@ -329,7 +346,8 @@ impl OlmoeExecutor {
     /// activation, routing and batch buffers for `max_batch_tokens` tokens of up to `max_seqs`
     /// sequences on `mem`, and uploads the rotary inverse frequencies. Every forward names its
     /// KV pool, laid out as `cfg.kv_layout(block_tokens)`. `registry` must have been built from
-    /// [`OlmoeExecutor::requirements`] of `cfg` and `block_tokens`.
+    /// [`OlmoeExecutor::requirements`] of `cfg`, `block_tokens` and `opts`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: &ModelArchConfig,
         mut weights: LoadedWeights,
@@ -338,6 +356,7 @@ impl OlmoeExecutor {
         block_tokens: u32,
         max_batch_tokens: u32,
         max_seqs: u32,
+        opts: ExecutorOptions,
     ) -> Result<OlmoeExecutor, ModelError> {
         let moe = moe_of(cfg)?;
         if cfg.tie_word_embeddings {
@@ -352,17 +371,16 @@ impl OlmoeExecutor {
             )));
         }
         let d = Dims::of(cfg, &moe);
+        let qkv = Split {
+            cols: [d.q_dim, d.kv_dim, d.kv_dim],
+            fused: opts.fused_projections,
+        };
         let mut layers = Vec::with_capacity(cfg.num_layers as usize);
         for i in 0..cfg.num_layers {
             let p = format!("model.layers.{i}");
+            let w_qkv = take_matrix(&mut weights, &qkv_proj_name(i), [qkv.width(), d.hidden])?;
             let mut take = |s: &str| weights.take(&format!("{p}.{s}.weight"));
-            let (input_norm, wq, wk, wv, wo) = (
-                take("input_layernorm")?,
-                take("self_attn.q_proj")?,
-                take("self_attn.k_proj")?,
-                take("self_attn.v_proj")?,
-                take("self_attn.o_proj")?,
-            );
+            let (input_norm, wo) = (take("input_layernorm")?, take("self_attn.o_proj")?);
             let (q_norm, k_norm, post_norm, router) = (
                 take("self_attn.q_norm")?,
                 take("self_attn.k_norm")?,
@@ -372,9 +390,7 @@ impl OlmoeExecutor {
             let gate_shape = [d.experts, d.inter, d.hidden];
             layers.push(Layer {
                 input_norm,
-                wq,
-                wk,
-                wv,
+                w_qkv,
                 wo,
                 q_norm,
                 k_norm,
@@ -411,10 +427,7 @@ impl OlmoeExecutor {
             inv_freq,
             x: act(d.hidden)?,
             h: act(d.hidden)?,
-            q: act(d.q_dim)?,
-            k: act(d.kv_dim)?,
-            v: act(d.kv_dim)?,
-            k_raw: act(d.kv_dim)?,
+            qkv: act(qkv.width())?,
             attn: act(d.q_dim)?,
             proj: act(d.hidden)?,
             zeros,
@@ -436,6 +449,7 @@ impl OlmoeExecutor {
             kv_layout: limits.layout,
             limits,
             registry,
+            qkv,
             embed,
             layers,
             final_norm,
@@ -457,12 +471,17 @@ impl OlmoeExecutor {
         TensorView::contiguous(buf.storage.whole(), 0, &[t, heads, head_dim], ACT)
     }
 
-    /// `c = a · wᵀ`.
-    fn linear(&self, a: TensorView<'_>, w: &Tensor, c: TensorView<'_>) -> Result<(), ModelError> {
+    /// `c = a · wᵀ` for a `[n, k]` weight view `w`.
+    fn linear(
+        &self,
+        a: TensorView<'_>,
+        w: TensorView<'_>,
+        c: TensorView<'_>,
+    ) -> Result<(), ModelError> {
         let cfg = gemm_cfg(w.shape[0], w.shape[1], c.dtype);
         self.registry.gemm(&cfg).execute(&mut GemmContext {
             a,
-            b: w.view(),
+            b: w,
             c,
             trans_b: true,
             alpha: 1.0,
@@ -509,17 +528,28 @@ impl OlmoeExecutor {
         let b = &self.bufs;
         let d = &self.dims;
         let t = p.total_q;
+        let part = |i, inner: &[usize]| self.qkv.part(&b.qkv, i, t, inner);
         self.rmsnorm(Self::rows(&b.x, t), &l.input_norm, Self::rows(&b.h, t))?;
-        self.linear(Self::rows(&b.h, t), &l.wq, Self::rows(&b.attn, t))?;
-        self.linear(Self::rows(&b.h, t), &l.wk, Self::rows(&b.k_raw, t))?;
-        self.linear(Self::rows(&b.h, t), &l.wv, Self::rows(&b.v, t))?;
-        self.rmsnorm(Self::rows(&b.attn, t), &l.q_norm, Self::rows(&b.q, t))?;
-        self.rmsnorm(Self::rows(&b.k_raw, t), &l.k_norm, Self::rows(&b.k, t))?;
+        if self.qkv.fused {
+            let w = l.w_qkv.view();
+            self.linear(Self::rows(&b.h, t), w, self.qkv.whole(&b.qkv, t))?;
+        } else {
+            let w = |r, n| l.w_qkv.view().rows(r, n);
+            let h = || Self::rows(&b.h, t);
+            self.linear(h(), w(0, d.q_dim), part(0, &[d.q_dim]))?;
+            self.linear(h(), w(d.q_dim, d.kv_dim), part(1, &[d.kv_dim]))?;
+            self.linear(h(), w(d.q_dim + d.kv_dim, d.kv_dim), part(2, &[d.kv_dim]))?;
+        }
+        // Q/K norm in place (each row is read whole before it is written).
+        self.rmsnorm(part(0, &[d.q_dim]), &l.q_norm, part(0, &[d.q_dim]))?;
+        self.rmsnorm(part(1, &[d.kv_dim]), &l.k_norm, part(1, &[d.kv_dim]))?;
+        let q_heads = || part(0, &[d.heads, d.head_dim]);
+        let k_heads = || part(1, &[d.kv_heads, d.head_dim]);
         let rope = rope_cfg(&self.cfg);
         self.registry.rope(&rope).execute(&mut RopeContext {
             cfg: rope,
-            q: Self::heads(&b.q, t, d.heads, d.head_dim),
-            k: Self::heads(&b.k, t, d.kv_heads, d.head_dim),
+            q: q_heads(),
+            k: k_heads(),
             positions: self.meta.positions_view(p),
             inv_freq: b.inv_freq.view(),
         })?;
@@ -533,9 +563,9 @@ impl OlmoeExecutor {
             .attention(&attn)
             .execute_paged(&mut PagedAttentionContext {
                 cfg: attn,
-                q: Self::heads(&b.q, t, d.heads, d.head_dim),
-                k_new: Self::heads(&b.k, t, d.kv_heads, d.head_dim),
-                v_new: Self::heads(&b.v, t, d.kv_heads, d.head_dim),
+                q: q_heads(),
+                k_new: k_heads(),
+                v_new: part(2, &[d.kv_heads, d.head_dim]),
                 out: Self::heads(&b.attn, t, d.heads, d.head_dim),
                 kv_layer: batch::kv_layer(kv, i),
                 block_table: self.meta.block_table_view(p),
@@ -546,7 +576,7 @@ impl OlmoeExecutor {
                 max_blocks_per_seq: p.max_blocks_per_seq,
                 scale: 1.0 / (d.head_dim as f32).sqrt(),
             })?;
-        self.linear(Self::rows(&b.attn, t), &l.wo, Self::rows(&b.proj, t))?;
+        self.linear(Self::rows(&b.attn, t), l.wo.view(), Self::rows(&b.proj, t))?;
         self.residual_add(t)
     }
 
@@ -558,7 +588,7 @@ impl OlmoeExecutor {
         self.rmsnorm(Self::rows(&b.x, t), &l.post_norm, Self::rows(&b.h, t))?;
         self.linear(
             Self::rows(&b.h, t),
-            &l.router,
+            l.router.view(),
             Self::rows(&b.router_logits, t),
         )?;
         let route = route_cfg(&self.moe);
@@ -670,7 +700,7 @@ impl ModelExecutor for OlmoeExecutor {
         self.final_norm_last_rows(&p)?;
         self.linear(
             Self::rows(&b.last, n),
-            &self.lm_head,
+            self.lm_head.view(),
             Self::rows(&b.logits, n),
         )?;
         let wait_started = Instant::now();

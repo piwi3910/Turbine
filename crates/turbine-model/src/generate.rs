@@ -282,7 +282,9 @@ mod tests {
     use turbine_core::types::BlockId;
     use turbine_tensor::KvPoolView;
 
-    use crate::executor::{BatchInput, LlamaExecutor, Logits, ModelExecutor, SequenceKv};
+    use crate::executor::{
+        BatchInput, ExecutorOptions, LlamaExecutor, Logits, ModelExecutor, SequenceKv,
+    };
     use crate::metrics::ModelMetrics;
     use crate::sampler::argmax;
     use crate::testing::TempDir;
@@ -681,13 +683,22 @@ mod tests {
         let registry = KernelRegistry::build(
             vec![provider],
             &order,
-            &LlamaExecutor::requirements(cfg, 16),
+            &LlamaExecutor::requirements(cfg, 16, ExecutorOptions::default()),
             &KernelMetrics::register(&MetricsRegistry::new()),
         )
         .expect("every op has a provider");
         let kv = SequenceKv::new(&mem, cfg.kv_layout(16), 64).expect("kv");
-        let exec =
-            LlamaExecutor::new(cfg, weights, Arc::new(registry), mem, 16, 64, 1).expect("executor");
+        let exec = LlamaExecutor::new(
+            cfg,
+            weights,
+            Arc::new(registry),
+            mem,
+            16,
+            64,
+            1,
+            ExecutorOptions::default(),
+        )
+        .expect("executor");
         (exec, kv)
     }
 
