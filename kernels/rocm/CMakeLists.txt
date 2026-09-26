@@ -123,7 +123,8 @@ set(TURBINE_SOURCES
   src/copy_blocks.cpp
   src/moe.cpp
   src/moe.hip
-  src/moe_small_m.hip)
+  src/moe_small_m.hip
+  src/logits_reduce.hip)
 set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/rmsnorm.cpp ${FMHA_BLOBS})
 
 add_library(turbine_hip SHARED ${TURBINE_SOURCES} ${FMHA_BLOBS})

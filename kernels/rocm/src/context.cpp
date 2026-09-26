@@ -168,7 +168,9 @@ extern "C" {
 
 uint32_t turbine_abi_version(void) { return TURBINE_ABI_VERSION; }
 
-// ABI v2.1: this library exports the optional add_rmsnorm trio (rmsnorm.cpp).
+// ABI v2.1: this library exports the optional add_rmsnorm trio (rmsnorm.cpp)
+// and logits_reduce (logits_reduce.hip); the other v2.1 groups (options,
+// graphs) are resolved only where their symbols exist.
 uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
 
 const char *turbine_backend_name(void) { return "hip"; }

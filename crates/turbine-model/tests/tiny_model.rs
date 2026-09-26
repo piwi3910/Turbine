@@ -946,7 +946,8 @@ fn cpu_model(
     )
 }
 
-/// [`cpu_model`] run with `opts` on `provider` alone, whose registry is built from the
+/// [`cpu_model`] run with `opts` on `provider` (the CPU reference, or the HIP provider in lab
+/// tests) alone, whose registry is built from the
 /// requirements it can serve ([`executor::available_requirements`]), plus the optional
 /// `logits_reduce` requirement when `reduce` is set.
 fn cpu_model_with(
@@ -2128,13 +2129,10 @@ fn expected_reduction(row: &[f32], r: &RowReduce) -> ReducedRow {
 /// an executor whose registry lacks `logits_reduce` ignores `reduce` and copies every row.
 #[test]
 fn device_reduced_rows_match_full_rows() {
-    const LENS: [u32; 3] = [5, 3, 4];
-    const POOL_BLOCKS: u32 = 8;
     let tmp = TempDir::new("tiny-model-reduced-rows");
     for spec in both_checkpoints(&tmp) {
-        let arch = spec.config.architecture;
         let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
-        let mut plain = cpu_model_with(
+        let plain = cpu_model_with(
             &spec,
             &mem,
             16,
@@ -2142,7 +2140,7 @@ fn device_reduced_rows_match_full_rows() {
             cpu_reference_provider(),
             false,
         );
-        let mut reducing = cpu_model_with(
+        let reducing = cpu_model_with(
             &spec,
             &mem,
             16,
@@ -2150,6 +2148,57 @@ fn device_reduced_rows_match_full_rows() {
             cpu_reference_provider(),
             true,
         );
+        check_reduced_rows(&spec, &mem, plain, reducing);
+    }
+}
+
+/// Lab only (P2c S-4): [`device_reduced_rows_match_full_rows`] on the HIP provider (the
+/// head_dim-128 tiny Llama): the executor reducing on the device through the HIP
+/// `logits_reduce` returns the full rows of the executor that copies every row, and each
+/// reduced row as the reduction of that row.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_reduced_rows_match_full_rows() {
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
+        .filter(|v| !v.is_empty())
+        .expect("TURBINE_KERNEL_LIBRARY is not set; point it at libturbine_hip.so");
+    let lib = turbine_kernels::ShimLibrary::load(Path::new(&library), ExecutionBackend::Hip)
+        .expect("load the HIP kernel library");
+    assert!(lib.abi_minor() >= 1, "logits_reduce needs kernel ABI v2.1");
+    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
+        .expect("device discovery");
+    let device = inventory
+        .devices
+        .iter()
+        .find(|d| d.vendor == Vendor::Amd)
+        .expect("an AMD device");
+    let ctx = lib.create_context(device).expect("HIP context");
+    let tmp = TempDir::new("tiny-model-hip-reduced-rows");
+    let spec = write_gpu_tiny(tmp.path());
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let opts = ExecutorOptions::default();
+    let plain = cpu_model_with(&spec, &mem, 16, opts, shim_provider(ctx.clone()), false);
+    let reducing = cpu_model_with(&spec, &mem, 16, opts, shim_provider(ctx), true);
+    check_reduced_rows(&spec, &mem, plain, reducing);
+    println!("hip_reduced_rows_match_full_rows: ok");
+}
+
+/// Three steps of three sequences (prefill chunks, then decodes; reduced and full rows
+/// interleaved) on `plain` (no `logits_reduce`) and `reducing`, each on its own pool.
+fn check_reduced_rows(
+    spec: &TinySpec,
+    mem: &Arc<dyn DeviceMemory>,
+    mut plain: Box<dyn ModelExecutor>,
+    mut reducing: Box<dyn ModelExecutor>,
+) {
+    const LENS: [u32; 3] = [5, 3, 4];
+    const POOL_BLOCKS: u32 = 8;
+    let arch = spec.config.architecture;
+    let mem = Arc::clone(mem);
+    {
         assert!(
             !plain.reduces_logits() && reducing.reduces_logits(),
             "{arch:?}"

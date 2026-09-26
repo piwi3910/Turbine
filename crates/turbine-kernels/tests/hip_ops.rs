@@ -6,7 +6,9 @@
 //!
 //! Tolerance: BF16 outputs |Δ| ≤ 1e-2, or one BF16 ulp of the reference where its magnitude
 //! exceeds 2 (a rounding flip after a different f32 summation order); F32 outputs |Δ| ≤ 1e-4;
-//! copies (the paged K/V append, `copy_blocks`) and `moe_route` selections are exact.
+//! copies (the paged K/V append, `copy_blocks`) and `moe_route` selections are exact;
+//! `logits_reduce` (ABI v2.1) top-n ids are exact, its lse within 1e-5 relative and its draws
+//! identical except within 1e-6 of a CDF boundary.
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -19,7 +21,8 @@ use turbine_kernels::{
     ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
     AttentionContext, AttentionKind, ElementwiseConfig, ElementwiseContext, EmbeddingConfig,
     EmbeddingContext, GemmConfig, GemmContext, KernelProvider, KvCopyConfig, KvCopyContext,
-    MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
+    LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
+    MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
     PagedAttentionContext, RopeConfig, RopeContext, ShimLibrary, cpu_reference_provider,
     shim_provider,
 };
@@ -1380,6 +1383,249 @@ fn moe_experts_small_m_matches_cpu() {
         repeat: 20,
     };
     experts_case(&p, &mut rng, &w, &case);
+}
+
+/// Distance of `u · total` from the nearest CDF boundary of the id-order draw at `temperature`
+/// over `row`, as a fraction of the total (the cpu-reference arithmetic: f32 scaled logits,
+/// f64 exponentials summed in id order).
+fn cdf_boundary_distance(row: &[f32], temperature: f32, u: f32) -> f64 {
+    let inv_t = 1.0 / temperature;
+    let max = row
+        .iter()
+        .map(|&v| v * inv_t)
+        .filter(|v| !v.is_nan())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let weights: Vec<f64> = row
+        .iter()
+        .map(|&v| {
+            let s = v * inv_t;
+            if s.is_nan() {
+                0.0
+            } else {
+                f64::from(s - max).exp()
+            }
+        })
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let target = f64::from(u) * total;
+    let mut cum = 0.0;
+    let mut best = f64::INFINITY;
+    for w in weights {
+        cum += w;
+        best = best.min((cum - target).abs());
+    }
+    best / total
+}
+
+/// One `logits_reduce` comparison: `rows` rows of `vocab` logits (row stride `vocab + 5`),
+/// seeded normal values with planted ties, NaN and −∞ entries, an all-NaN and an all-−∞ row,
+/// mixed modes and temperatures.
+fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n: usize) {
+    let stride = vocab + 5;
+    let mut logits = rng.normal(rows * stride, 3.0);
+    for r in 0..rows {
+        let row = &mut logits[r * stride..r * stride + vocab];
+        match r {
+            0 => row.fill(f32::NAN),
+            1 => row.fill(f32::NEG_INFINITY),
+            _ => {
+                // Ties at the top (a value repeated at spread-out ids), a NaN and a −∞.
+                let peak = 14.0 + (r % 3) as f32;
+                for i in 0..6 {
+                    row[(i * 7919 + r * 131) % vocab] = peak;
+                }
+                row[(r * 977) % vocab] = f32::NAN;
+                row[(r * 1543 + 11) % vocab] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    let temperatures: Vec<f32> = (0..rows).map(|r| [0.7, 1.0, 1.3, 0.0][r % 4]).collect();
+    let uniforms: Vec<f32> = (0..rows).map(|_| rng.unit() as f32).collect();
+    let modes: Vec<f32> = (0..rows).map(|r| (r % 3 != 2) as i32 as f32).collect();
+    let cfg = LogitsReduceConfig {
+        vocab: vocab as u32,
+        top_n: top_n as u32,
+    };
+    let hip = p.hip.logits_reduce().expect("hip logits_reduce (ABI v2.1)");
+    assert!(hip.supports(&cfg), "hip must support logits_reduce {cfg}");
+    let impl_name = hip.implementation(&cfg);
+    let cpu = p.cpu.logits_reduce().expect("cpu logits_reduce");
+    let (l_hip, l_cpu) = twin(p, &[rows, stride], DType::F32, &logits);
+    let (t_hip, t_cpu) = twin(p, &[rows], DType::F32, &temperatures);
+    let (u_hip, u_cpu) = twin(p, &[rows], DType::F32, &uniforms);
+    let (m_hip, m_cpu) = twin(p, &[rows], DType::I32, &modes);
+    let outputs = |mem: &Arc<dyn DeviceMemory>| {
+        (
+            Tensor::empty(mem, &[rows, top_n], DType::I32).expect("alloc"),
+            Tensor::empty(mem, &[rows, top_n], DType::F32).expect("alloc"),
+            Tensor::empty(mem, &[rows], DType::F32).expect("alloc"),
+            Tensor::empty(mem, &[rows], DType::I32).expect("alloc"),
+            Tensor::empty(mem, &[rows], DType::F32).expect("alloc"),
+        )
+    };
+    let o_hip = outputs(&p.hip_mem);
+    let o_cpu = outputs(&p.cpu_mem);
+    let run = |kernel: &dyn LogitsReduceKernel,
+               l: &Tensor,
+               t: &Tensor,
+               u: &Tensor,
+               m: &Tensor,
+               o: &(Tensor, Tensor, Tensor, Tensor, Tensor)| {
+        let logits_view = TensorView {
+            shape: [rows, vocab].into_iter().collect(),
+            strides: [stride, 1].into_iter().collect(),
+            ..l.view()
+        };
+        kernel
+            .execute(&mut LogitsReduceContext {
+                logits: logits_view,
+                temperature: t.view(),
+                uniform: u.view(),
+                mode: m.view(),
+                top_ids: o.0.view(),
+                top_values: o.1.view(),
+                lse: o.2.view(),
+                sampled: o.3.view(),
+                sampled_logit: o.4.view(),
+                rows: rows as u32,
+            })
+            .expect("logits_reduce");
+    };
+    run(hip, &l_hip, &t_hip, &u_hip, &m_hip, &o_hip);
+    run(cpu, &l_cpu, &t_cpu, &u_cpu, &m_cpu, &o_cpu);
+    let what = format!("logits_reduce {cfg} rows={rows}");
+    let (ids_h, ids_c) = (read(&o_hip.0), read(&o_cpu.0));
+    assert_eq!(ids_h, ids_c, "{what} ({impl_name}): top ids");
+    let (vals_h, vals_c) = (read(&o_hip.1), read(&o_cpu.1));
+    for (i, (h, c)) in vals_h.iter().zip(&vals_c).enumerate() {
+        assert!(
+            h.to_bits() == c.to_bits() || (h.is_nan() && c.is_nan()),
+            "{what}: top value {i}: hip {h} vs cpu {c}"
+        );
+    }
+    let (lse_h, lse_c) = (read(&o_hip.2), read(&o_cpu.2));
+    let mut worst_lse = 0f32;
+    for r in 0..rows {
+        let (h, c) = (lse_h[r], lse_c[r]);
+        if c.is_finite() {
+            let rel = (h - c).abs() / c.abs().max(1.0);
+            assert!(rel <= 1e-5, "{what}: row {r} lse hip {h} vs cpu {c}");
+            worst_lse = worst_lse.max(rel);
+        } else {
+            assert_eq!(h, c, "{what}: row {r} lse");
+        }
+    }
+    let (s_h, s_c) = (read(&o_hip.3), read(&o_cpu.3));
+    let (sl_h, sl_c) = (read(&o_hip.4), read(&o_cpu.4));
+    let mut boundary = 0;
+    for r in 0..rows {
+        if modes[r] == 0.0 {
+            assert_eq!((s_h[r], s_c[r]), (-1.0, -1.0), "{what}: row {r} mode 0");
+            assert!(sl_h[r].is_nan(), "{what}: row {r} mode 0 sampled_logit");
+            continue;
+        }
+        let row = &logits[r * stride..r * stride + vocab];
+        let id = s_h[r] as usize;
+        assert!(
+            sl_h[r].to_bits() == row[id].to_bits() || (sl_h[r].is_nan() && row[id].is_nan()),
+            "{what}: row {r} sampled_logit"
+        );
+        if s_h[r] != s_c[r] {
+            let d = cdf_boundary_distance(row, temperatures[r], uniforms[r]);
+            assert!(
+                temperatures[r] > 0.0 && d <= 1e-6,
+                "{what}: row {r} drew {} (cpu {}), {d:e} from a CDF boundary",
+                s_h[r],
+                s_c[r]
+            );
+            boundary += 1;
+        } else {
+            assert_eq!(sl_h[r].to_bits(), sl_c[r].to_bits(), "{what}: row {r}");
+        }
+    }
+    println!(
+        "{what}: impl={impl_name} top ids exact, max lse rel |Δ| {worst_lse:.3e}, \
+         draws identical but {boundary} at a CDF boundary ok"
+    );
+}
+
+/// Lab only (P2c S-4/S-9): the HIP `logits_reduce` (ABI v2.1) matches the cpu reference over
+/// 64 rows of the OLMoE (50,304) and Llama-3 (128,256) vocabularies: top-n ids identical, lse
+/// within 1e-5 relative, categorical draws identical except within 1e-6 of a CDF boundary. Also
+/// prints the device time of a 16-row decode batch's reduction against the full-row copy it
+/// replaces.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn logits_reduce_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(21);
+    for vocab in [50_304, VOCAB] {
+        logits_reduce_case(&p, &mut rng, 64, vocab, 64);
+        logits_reduce_case(&p, &mut rng, 7, vocab, 5);
+    }
+
+    // Timing at the Llama decode shape: 16 rows reduced to top-20 and a draw, versus copying
+    // the 16 full rows to the host (what the device reduction removes).
+    let rows = 16;
+    let hip = p.hip.logits_reduce().expect("hip logits_reduce");
+    let mut logits = Tensor::empty(&p.hip_mem, &[rows, VOCAB], DType::F32).expect("alloc");
+    let data = rng.normal(rows * VOCAB, 3.0);
+    logits
+        .storage
+        .copy_from_host(0, &encode(DType::F32, &data))
+        .expect("upload");
+    let (t, _) = twin(&p, &[rows], DType::F32, &[1.0; 16]);
+    let (u, _) = twin(&p, &[rows], DType::F32, &[0.5; 16]);
+    let (m, _) = twin(&p, &[rows], DType::I32, &[1.0; 16]);
+    let ids = Tensor::empty(&p.hip_mem, &[rows, 20], DType::I32).expect("alloc");
+    let vals = Tensor::empty(&p.hip_mem, &[rows, 20], DType::F32).expect("alloc");
+    let small: Vec<Tensor> = [DType::F32, DType::I32, DType::F32]
+        .into_iter()
+        .map(|d| Tensor::empty(&p.hip_mem, &[rows], d).expect("alloc"))
+        .collect();
+    let reduce = || {
+        hip.execute(&mut LogitsReduceContext {
+            logits: logits.view(),
+            temperature: t.view(),
+            uniform: u.view(),
+            mode: m.view(),
+            top_ids: ids.view(),
+            top_values: vals.view(),
+            lse: small[0].view(),
+            sampled: small[1].view(),
+            sampled_logit: small[2].view(),
+            rows: rows as u32,
+        })
+        .expect("logits_reduce");
+    };
+    reduce();
+    p.hip_mem.synchronize().expect("sync");
+    const ITERS: u32 = 50;
+    let started = std::time::Instant::now();
+    for _ in 0..ITERS {
+        reduce();
+    }
+    p.hip_mem.synchronize().expect("sync");
+    let reduce_us = started.elapsed().as_secs_f64() * 1e6 / f64::from(ITERS);
+    let started = std::time::Instant::now();
+    for _ in 0..ITERS {
+        let _ = read(&ids);
+    }
+    let small_us = started.elapsed().as_secs_f64() * 1e6 / f64::from(ITERS);
+    let started = std::time::Instant::now();
+    for _ in 0..10 {
+        let _ = logits.view().slice.read_bytes().expect("read");
+    }
+    let full_us = started.elapsed().as_secs_f64() * 1e6 / 10.0;
+    println!(
+        "logits_reduce timing: 16 x {VOCAB} rows reduce {reduce_us:.1} us, read of the \
+         reduction {small_us:.1} us, full-row copy {full_us:.1} us ({} bytes)",
+        rows * VOCAB * 4
+    );
 }
 
 /// `n` copies of a short seeded random pattern (the timing inputs only need realistic values,
