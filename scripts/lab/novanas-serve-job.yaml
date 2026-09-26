@@ -1,7 +1,8 @@
 # k3s Job template run by scripts/lab-serve.sh novanas <config.yaml>: turbine-server on one R9700
 # for manual golden and benchmark runs, listening on the host network (server.listen of the
 # config, 0.0.0.0:18000 in scripts/lab/phase1-novanas.yaml). The script renders the RUN_ID
-# placeholder (a unique Job name) and uploads the tree to /home/piwi/turbine-ci/runs/<run id>/src and the config
+# placeholder (a unique Job name) and the SERVER_ARGS placeholder (its `--set <k>=<v>` pairs,
+# empty without any) and uploads the tree to /home/piwi/turbine-ci/runs/<run id>/src and the config
 # to runs/<run id>/config.yaml before applying it. Caches and slot handling match
 # novanas-test-job.yaml, with the single release workspace slot cache/slots/serve-0 (one server
 # at a time: the port is fixed), so the release build never shares a target dir with the debug
@@ -96,8 +97,9 @@ spec:
               cargo build --release -p turbine-server
 
               step "turbine-server"
-              # exec keeps the slot lock (LOCK_FD is inherited) while the server runs.
-              exec "$CARGO_TARGET_DIR/release/turbine-server" --config "$SLOT_DIR/config.yaml"
+              # exec keeps the slot lock (LOCK_FD is inherited) while the server runs. The script
+              # renders the --set pairs of `lab-serve.sh ... --set <k>=<v>` after the config.
+              exec "$CARGO_TARGET_DIR/release/turbine-server" --config "$SLOT_DIR/config.yaml"__SERVER_ARGS__
           env:
             - name: TURBINE_LAB_RUN_ID
               value: "__RUN_ID__"

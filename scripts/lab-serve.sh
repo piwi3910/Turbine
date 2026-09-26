@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # Run turbine-server on a lab host for manual golden and benchmark runs.
 #
-#   scripts/lab-serve.sh [--dry-run] novanas <config.yaml>
+#   scripts/lab-serve.sh [--dry-run] novanas <config.yaml> [--set <dotted.key>=<value>]...
 #   scripts/lab-serve.sh [--dry-run] novanas --vllm <slug>
-#   scripts/lab-serve.sh [--dry-run] novanas --stop
+#   scripts/lab-serve.sh [--dry-run] novanas --stop [<run-id>]
 #
 # novanas: uploads the tree and <config.yaml> to /home/piwi/turbine-ci/runs/<run id> and applies
 #   the k3s Job template scripts/lab/novanas-serve-job.yaml as turbine-lab-serve-<run id>
 #   (namespace turbine-ci, one R9700, host network), which syncs them into the cached release
 #   workspace slot, builds libturbine_hip.so and the release turbine-server incrementally and
-#   runs it with that config. The script refuses to start while something already answers on
+#   runs it with that config. Each --set pair is appended as `--set <dotted.key>=<value>` to the
+#   turbine-server command line, so sweeps need no config edits; since the pairs are rendered
+#   into the Job's shell script, values are plain words (letters, digits and _ . : / @ + , -).
+#   The script refuses to start while something already answers on
 #   port 18000, streams the Job log until http://192.168.10.203:18000/ready answers 200, then
 #   exits 0 and leaves the server running. --stop deletes the serve Jobs (label
 #   turbine-lab-role=serve: the Turbine server and the vLLM baseline; one of each at a time, the
-#   ports are fixed) and nothing else; an interrupted or failed start deletes its own Job.
+#   ports are fixed) and nothing else; --stop <run-id> deletes only the serve Job of that run
+#   (the id a start prints as `run <run-id>: job ...`); an interrupted or failed start deletes
+#   its own Job.
 # novanas --vllm <slug>: the Phase 2 baseline. Applies scripts/lab/novanas-vllm-job.yaml as
 #   turbine-lab-vllm-<run id> (upstream rocm/vllm at a pinned tag, one R9700, host network)
 #   serving /home/piwi/turbine-models/<slug> read-only on port 18100 under the model id
@@ -29,9 +34,9 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/lab-serve.sh [--dry-run] novanas <config.yaml>" >&2
+	echo "usage: scripts/lab-serve.sh [--dry-run] novanas <config.yaml> [--set <dotted.key>=<value>]..." >&2
 	echo "       scripts/lab-serve.sh [--dry-run] novanas --vllm <slug>" >&2
-	echo "       scripts/lab-serve.sh [--dry-run] novanas --stop" >&2
+	echo "       scripts/lab-serve.sh [--dry-run] novanas --stop [<run-id>]" >&2
 	exit 2
 }
 
@@ -40,7 +45,7 @@ if [[ "${1:-}" == --dry-run ]]; then
 	DRY_RUN=1
 	shift
 fi
-[[ $# -eq 2 || ($# -eq 3 && "$2" == --vllm) ]] || usage
+[[ $# -ge 2 ]] || usage
 HOST="$1"
 case "$HOST" in
 novanas) ADDR=192.168.10.203 ;;
@@ -50,8 +55,21 @@ esac
 MODE=start
 CONFIG=""
 SLUG=""
+STOP_RUN=""
+# Rendered into the serve Job's turbine-server command line (scripts/lab/novanas-serve-job.yaml).
+SERVER_ARGS=""
 case "$2" in
---stop) MODE=stop ;;
+--stop)
+	[[ $# -le 3 ]] || usage
+	MODE=stop
+	if [[ $# -eq 3 ]]; then
+		STOP_RUN="$3"
+		if [[ ! "$STOP_RUN" =~ ^[0-9]{10}-[0-9a-f]{8}$ ]]; then
+			echo "lab-serve: ${HOST}: not a run id: ${STOP_RUN}" >&2
+			usage
+		fi
+	fi
+	;;
 --vllm)
 	[[ $# -eq 3 ]] || usage
 	MODE=vllm
@@ -76,6 +94,16 @@ case "$2" in
 -*) usage ;;
 *)
 	CONFIG="$2"
+	shift 2
+	while [[ $# -gt 0 ]]; do
+		[[ "$1" == --set && $# -ge 2 ]] || usage
+		if [[ ! "$2" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*=[A-Za-z0-9_.:/@+,-]*$ ]]; then
+			echo "lab-serve: ${HOST}: --set expects <dotted.key>=<value> with a plain-word value (letters, digits, _ . : / @ + , -), got: $2" >&2
+			exit 2
+		fi
+		SERVER_ARGS+=" --set $2"
+		shift 2
+	done
 	if [[ ! -f "$CONFIG" || ! -r "$CONFIG" ]]; then
 		echo "lab-serve: ${HOST}: config file not found or unreadable: ${CONFIG}" >&2
 		exit 2
@@ -157,8 +185,10 @@ kube() {
 }
 
 stop() {
-	say "deleting the serve jobs (label turbine-lab-role=serve) in namespace ${NS}"
-	kube "-n ${NS} delete job -l turbine-lab-role=serve --ignore-not-found --wait=true" ||
+	local selector=turbine-lab-role=serve
+	[[ -z "$STOP_RUN" ]] || selector+=",turbine-lab-run=${STOP_RUN}"
+	say "deleting the serve jobs (label ${selector}) in namespace ${NS}"
+	kube "-n ${NS} delete job -l ${selector} --ignore-not-found --wait=true" ||
 		fail "cannot delete the serve jobs"
 	if [[ $DRY_RUN -eq 1 ]]; then say "dry run: nothing contacted"; else say "stopped"; fi
 }
@@ -329,7 +359,8 @@ start() {
 	kube "create namespace ${NS} --dry-run=client -o yaml | kubectl apply -f - >/dev/null" ||
 		fail "cannot create namespace ${NS}"
 	say "applying scripts/lab/novanas-serve-job.yaml as ${JOB}"
-	sed -e "s/__RUN_ID__/${RUN_ID}/g" "${REPO_ROOT}/scripts/lab/novanas-serve-job.yaml" |
+	sed -e "s/__RUN_ID__/${RUN_ID}/g" -e "s|__SERVER_ARGS__|${SERVER_ARGS}|g" \
+		"${REPO_ROOT}/scripts/lab/novanas-serve-job.yaml" |
 		remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" || fail "kubectl apply failed"
 
 	say "waiting for the pod"

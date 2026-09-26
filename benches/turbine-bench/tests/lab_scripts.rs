@@ -891,3 +891,251 @@ fn lab_serve_vllm_usage_errors_exit_2_without_contacting_a_host() {
         assert!(stderr(&out).contains(expect), "{tag}: {}", stderr(&out));
     }
 }
+
+/// The `turbine-server` command line of a rendered serve Job.
+fn server_command(job: &Value) -> String {
+    let s = script(job);
+    s.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("exec \"$CARGO_TARGET_DIR/release/turbine-server\""))
+        .unwrap_or_else(|| panic!("no turbine-server exec line in:\n{s}"))
+        .to_string()
+}
+
+#[test]
+fn lab_serve_set_passthrough_reaches_the_server_command() {
+    let exec =
+        "exec \"$CARGO_TARGET_DIR/release/turbine-server\" --config \"$SLOT_DIR/config.yaml\"";
+    let plain = applied_job(&dry_run(
+        "lab-serve.sh",
+        "set-none",
+        &["--dry-run", "novanas", "scripts/lab/phase1-novanas.yaml"],
+    ));
+    assert_eq!(server_command(&plain), exec);
+
+    let text = dry_run(
+        "lab-serve.sh",
+        "set-two",
+        &[
+            "--dry-run",
+            "novanas",
+            "scripts/lab/phase1-novanas.yaml",
+            "--set",
+            "scheduler.max_batch_tokens=4096",
+            "--set",
+            "execution.kernel_library=/opt/lib/libturbine_hip.so",
+        ],
+    );
+    assert_eq!(
+        server_command(&applied_job(&text)),
+        format!(
+            "{exec} --set scheduler.max_batch_tokens=4096 \
+             --set execution.kernel_library=/opt/lib/libturbine_hip.so"
+        )
+    );
+}
+
+#[test]
+fn lab_serve_set_usage_errors_exit_2_without_contacting_a_host() {
+    let cfg = "scripts/lab/phase1-novanas.yaml";
+    for (tag, args, expect) in [
+        ("set-novalue", &["novanas", cfg, "--set"][..], "usage:"),
+        (
+            "set-noeq",
+            &["novanas", cfg, "--set", "scheduler"][..],
+            "--set",
+        ),
+        (
+            "set-nokey",
+            &["novanas", cfg, "--set", "=4096"][..],
+            "--set",
+        ),
+        (
+            "set-unsafe",
+            &["novanas", cfg, "--set", "model.path=/x; rm -rf /"][..],
+            "--set",
+        ),
+        ("set-other", &["novanas", cfg, "--runs", "3"][..], "usage:"),
+        (
+            "set-vllm",
+            &[
+                "novanas",
+                "--vllm",
+                "llama-3.2-3b-instruct",
+                "--set",
+                "a.b=1",
+            ][..],
+            "usage:",
+        ),
+        (
+            "set-stop",
+            &["novanas", "--stop", "--set", "a.b=1"][..],
+            "usage:",
+        ),
+    ] {
+        let (out, called) = lab_script("lab-serve.sh", tag, args);
+        assert_eq!(called, None, "{tag}: contacted a host");
+        assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
+        assert!(stderr(&out).contains(expect), "{tag}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn lab_serve_stop_with_a_run_id_deletes_only_that_run() {
+    let id = "0926120000-0123abcd";
+    let text = dry_run(
+        "lab-serve.sh",
+        "stop-id",
+        &["--dry-run", "novanas", "--stop", id],
+    );
+    assert!(
+        text.contains(&format!(
+            "kubectl -n turbine-ci delete job -l turbine-lab-role=serve,turbine-lab-run={id} \
+             --ignore-not-found"
+        )),
+        "{text}"
+    );
+    assert_eq!(text.matches(" delete ").count(), 1, "one delete: {text}");
+}
+
+#[test]
+fn lab_perf_dry_run_serves_benches_and_stops_both_engines() {
+    let text = dry_run(
+        "lab-perf.sh",
+        "perf-llama",
+        &[
+            "--dry-run",
+            "novanas",
+            "llama",
+            "--set",
+            "scheduler.max_batch_tokens=4096",
+        ],
+    );
+    let bench = |port: u16, requests: u32| {
+        format!(
+            "turbine-bench --url http://192.168.10.203:{port} --concurrency 16 \
+             --requests {requests} --prompt-words 512 --max-tokens 256 --ignore-eos --output json"
+        )
+    };
+    let (warm_t, run_t) = (bench(18000, 16), bench(18000, 200));
+    let (warm_v, run_v) = (bench(18100, 16), bench(18100, 200));
+    assert_in_order(
+        &text,
+        &[
+            "cargo build --release -p turbine-bench --bin turbine-bench",
+            "+ scripts/lab-serve.sh novanas scripts/lab/phase2c-novanas-llama.yaml \
+             --set scheduler.max_batch_tokens=4096",
+            "--config \"$SLOT_DIR/config.yaml\" --set scheduler.max_batch_tokens=4096",
+            &warm_t,
+            &run_t,
+            &run_t,
+            &run_t,
+            "+ scripts/lab-serve.sh novanas --stop ",
+            "delete job -l turbine-lab-role=serve,turbine-lab-run=",
+            "+ scripts/lab-serve.sh novanas --vllm llama-3.2-3b-instruct",
+            VLLM_IMAGE,
+            &warm_v,
+            &run_v,
+            &run_v,
+            &run_v,
+            "+ scripts/lab-serve.sh novanas --stop ",
+            "delete job -l turbine-lab-role=serve,turbine-lab-run=",
+            "lab-perf: dry run: nothing contacted",
+        ],
+    );
+    assert_eq!(text.matches(&run_t).count(), 3, "{text}");
+    assert_eq!(text.matches(&run_v).count(), 3, "{text}");
+    // Each engine is stopped by its own run id, never by the bare role label.
+    assert!(
+        !text.contains("delete job -l turbine-lab-role=serve --ignore-not-found"),
+        "{text}"
+    );
+
+    // --skip-vllm: Turbine only; the verdict compares with the recorded vLLM number.
+    let text = dry_run(
+        "lab-perf.sh",
+        "perf-olmoe-skip",
+        &[
+            "--dry-run",
+            "novanas",
+            "olmoe",
+            "--skip-vllm",
+            "--runs",
+            "1",
+        ],
+    );
+    assert_in_order(
+        &text,
+        &[
+            "+ scripts/lab-serve.sh novanas scripts/lab/phase2c-novanas-olmoe.yaml",
+            &warm_t,
+            &run_t,
+            "+ scripts/lab-serve.sh novanas --stop ",
+        ],
+    );
+    assert_eq!(text.matches(&run_t).count(), 1, "{text}");
+    assert!(
+        !text.contains("--vllm") && !text.contains(":18100"),
+        "{text}"
+    );
+    assert!(text.contains("vllm=535(recorded)"), "{text}");
+
+    // --config replaces the Phase 2c lab config.
+    let text = dry_run(
+        "lab-perf.sh",
+        "perf-config",
+        &[
+            "--dry-run",
+            "novanas",
+            "llama",
+            "--skip-vllm",
+            "--config",
+            "scripts/lab/phase2-novanas-llama.yaml",
+        ],
+    );
+    assert!(
+        text.contains("+ scripts/lab-serve.sh novanas scripts/lab/phase2-novanas-llama.yaml\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn lab_perf_usage_errors_exit_2_without_contacting_a_host() {
+    for (tag, args, expect) in [
+        ("perf-noargs", &[][..], "usage:"),
+        ("perf-host", &["dgx-spark", "llama"][..], "usage:"),
+        ("perf-model", &["novanas", "qwen"][..], "usage:"),
+        (
+            "perf-runs0",
+            &["novanas", "llama", "--runs", "0"][..],
+            "usage:",
+        ),
+        (
+            "perf-runsx",
+            &["novanas", "llama", "--runs", "x"][..],
+            "usage:",
+        ),
+        ("perf-runs", &["novanas", "llama", "--runs"][..], "usage:"),
+        ("perf-set", &["novanas", "llama", "--set"][..], "usage:"),
+        (
+            "perf-setbad",
+            &["novanas", "llama", "--set", "nokey"][..],
+            "--set",
+        ),
+        (
+            "perf-config",
+            &["novanas", "llama", "--config", "scripts/lab/missing.yaml"][..],
+            "scripts/lab/missing.yaml",
+        ),
+        (
+            "perf-unknown",
+            &["novanas", "llama", "--fast"][..],
+            "usage:",
+        ),
+    ] {
+        let (out, called) = lab_script("lab-perf.sh", tag, args);
+        assert_eq!(called, None, "{tag}: contacted a host");
+        assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
+        assert!(stderr(&out).contains(expect), "{tag}: {}", stderr(&out));
+    }
+}
