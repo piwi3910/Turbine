@@ -32,8 +32,9 @@ use turbine_tensor::{
 
 use crate::ffi::{
     self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo,
-    EmbeddingDesc, GemmDesc, LogitsReduceDesc, MoeExpertsDesc, MoeRouteDesc, OpTrio, RmsnormDesc,
-    RopeDesc, ShimSymbols, SiluMulDesc, TurbineCtx, TurbineGraph,
+    EmbeddingDesc, GemmDesc, LogitsReduceDesc, MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE,
+    MoeExpertsDesc, MoeRouteDesc, OpTrio, RmsnormDesc, RopeDesc, ShimSymbols, SiluMulDesc,
+    TurbineCtx, TurbineGraph,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -835,13 +836,25 @@ fn copy_blocks_probe(cfg: &KvCopyConfig) -> CopyBlocksDesc {
     }
 }
 
+/// The `turbine_moe_route_desc` `flags` of `cfg`.
+fn moe_route_flags(cfg: &MoeRouteConfig) -> i32 {
+    let mut flags = 0;
+    if cfg.renormalize {
+        flags |= MOE_ROUTE_RENORMALIZE;
+    }
+    if cfg.bf16_logits {
+        flags |= MOE_ROUTE_BF16_LOGITS;
+    }
+    flags
+}
+
 fn moe_route_probe(cfg: &MoeRouteConfig) -> MoeRouteDesc {
     MoeRouteDesc {
         router_logits: std::ptr::null(),
         num_tokens: 1,
         num_experts: cfg.num_experts as i32,
         top_k: cfg.top_k as i32,
-        renormalize: i32::from(cfg.renormalize),
+        flags: moe_route_flags(cfg),
         topk_ids: std::ptr::null_mut(),
         topk_weights: std::ptr::null_mut(),
         sorted_rows: std::ptr::null_mut(),
@@ -1283,8 +1296,10 @@ impl KvCopyKernel for ShimProvider {
 }
 
 impl MoeKernel for ShimProvider {
+    /// BF16 router logits need kernel ABI minor 2: an older library may not check `flags`.
     fn supports_route(&self, cfg: &MoeRouteConfig) -> bool {
-        Self::supported(&self.syms().moe_route, &moe_route_probe(cfg))
+        (!cfg.bf16_logits || self.syms().v21.minor >= 2)
+            && Self::supported(&self.syms().moe_route, &moe_route_probe(cfg))
     }
 
     fn supports_experts(&self, cfg: &MoeExpertsConfig) -> bool {
@@ -1322,7 +1337,7 @@ impl MoeKernel for ShimProvider {
             num_tokens: to_i32("num_tokens", tokens)?,
             num_experts: to_i32("num_experts", ctx.cfg.num_experts)?,
             top_k: to_i32("top_k", ctx.cfg.top_k)?,
-            renormalize: i32::from(ctx.cfg.renormalize),
+            flags: moe_route_flags(&ctx.cfg),
             topk_ids: self.ctx.device_ptr("topk_ids", &ctx.topk_ids)?.cast(),
             topk_weights: self
                 .ctx
@@ -1890,6 +1905,7 @@ mod tests {
             num_experts: 64,
             top_k: 8,
             renormalize: false,
+            bf16_logits: false,
         };
         assert!(!moe.supports_route(&route));
         assert_eq!(moe.implementation_route(&route), "stub_moe_route");
@@ -1913,7 +1929,7 @@ mod tests {
 
     /// ABI v2.1 is optional. The plain (v2.0) stub loads with minor 0, its provider has no
     /// `add_rmsnorm`/`logits_reduce` family and its context answers the option and graph calls
-    /// with `Unsupported`; the `TURBINE_STUB_V21` stub reports minor 1, exposes both op families
+    /// with `Unsupported`; the `TURBINE_STUB_V21` stub reports the header's minor (2), exposes both op families
     /// through the ABI, keeps options, and captures, launches and destroys graphs. Breaks if a
     /// v2.1 symbol becomes required, if a v2.0 library reports v2.1 support, or if a graph is not
     /// destroyed exactly once.
@@ -1951,7 +1967,7 @@ mod tests {
             ExecutionBackend::Hip,
         )
         .expect("a v2.1 library loads");
-        assert_eq!((v21.abi_version(), v21.abi_minor()), (2, 1));
+        assert_eq!((v21.abi_version(), v21.abi_minor()), (2, 2));
         let ctx = v21
             .create_context(&mocked_device("gfx942"))
             .expect("context");

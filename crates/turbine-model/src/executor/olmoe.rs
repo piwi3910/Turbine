@@ -2,11 +2,11 @@
 //! registry: embedding → per layer (RMSNorm → Q/K/V projections → RMSNorm over the full Q and
 //! K projections (`q_norm`, `k_norm`) → standard RoPE → paged causal attention, which appends
 //! the new K/V rows into each sequence's pool blocks → O projection → residual add → RMSNorm →
-//! router GEMM with F32 logits → `moe_route` (softmax, top-k, renormalised only with
-//! `norm_topk_prob`) → `moe_experts` into a BF16 accumulator zeroed by adding two zero buffers
-//! (one elementwise launch; kernel ABI v2 has no device-to-device copy or memset) → residual
-//! add) → final
-//! RMSNorm on each sequence's last row → untied LM head with FP32 output.
+//! router GEMM with F32 logits → `moe_route` (logits rounded to BF16 as transformers' BF16
+//! router linear leaves them, softmax, the top-k set `torch.topk` selects, renormalised only
+//! with `norm_topk_prob`) → `moe_experts` into a BF16 accumulator zeroed by adding two zero
+//! buffers (one elementwise launch; kernel ABI v2 has no device-to-device copy or memset) →
+//! residual add) → final RMSNorm on each sequence's last row → untied LM head with FP32 output.
 //!
 //! This is transformers' `OlmoeSparseMoeBlock` numerics: the experts' weighted outputs are
 //! summed in BF16 in ascending expert order starting from zero, then added to the residual.
@@ -137,6 +137,8 @@ fn route_cfg(moe: &MoeConfig) -> MoeRouteConfig {
         num_experts: moe.num_experts,
         top_k: moe.experts_per_token,
         renormalize: moe.norm_topk_prob,
+        // transformers' router is a BF16 linear: its logits are BF16 before the F32 softmax.
+        bf16_logits: ACT == DType::BF16,
     }
 }
 

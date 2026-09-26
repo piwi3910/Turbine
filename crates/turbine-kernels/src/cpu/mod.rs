@@ -29,6 +29,9 @@ use crate::ops::{
 mod math;
 mod moe;
 mod paged;
+mod topk;
+
+pub use topk::torch_topk;
 
 /// The `cpu-reference` provider; stateless, implements every op family.
 pub struct CpuReference;
@@ -1276,11 +1279,13 @@ mod tests {
         assert_eq!(k_slot(0, 0), rounded(&full_k[2][..token]));
 
         // moe_route: logits [1, 1, 0, 0] top-2 → experts 0 then 1 with unrenormalised softmax
-        // weights; [0, 0, 0, 2] → expert 3, then the lowest id of the tied rest (0).
+        // weights; [0, 0, 0, 2] → expert 3, then of the tied rest the one torch.topk keeps (2,
+        // not the lowest id 0).
         let route_cfg = MoeRouteConfig {
             num_experts: 4,
             top_k: 2,
             renormalize: false,
+            bf16_logits: false,
         };
         let moe = cpu.moe().expect("moe family");
         assert!(moe.supports_route(&route_cfg));
@@ -1304,7 +1309,7 @@ mod tests {
             expert_offsets: expert_offsets.view(),
         })
         .expect("route");
-        assert_eq!(load_i32(&topk_ids.view()).expect("ids"), [0, 1, 3, 0]);
+        assert_eq!(load_i32(&topk_ids.view()).expect("ids"), [0, 1, 3, 2]);
         let e = std::f32::consts::E;
         let (e2, sum1) = (e * e, 2.0 * e + 2.0);
         assert_close(
@@ -1312,12 +1317,40 @@ mod tests {
             &[e / sum1, e / sum1, e2 / (e2 + 3.0), 1.0 / (e2 + 3.0)],
             1e-6,
         );
-        // Rows token·top_k + slot grouped by expert: e0 {0, 3}, e1 {1}, e2 {}, e3 {2}.
-        assert_eq!(load_i32(&sorted_rows.view()).expect("rows"), [0, 3, 1, 2]);
+        // Rows token·top_k + slot grouped by expert: e0 {0}, e1 {1}, e2 {3}, e3 {2}.
+        assert_eq!(load_i32(&sorted_rows.view()).expect("rows"), [0, 1, 3, 2]);
         assert_eq!(
             load_i32(&expert_offsets.view()).expect("offsets"),
-            [0, 2, 3, 3, 4]
+            [0, 1, 2, 3, 4]
         );
+
+        // BF16 router logits: [1.001, 1, 1, 1.002] top-1 is expert 3 in F32, but all four
+        // round to 1.0 in BF16 and torch.topk keeps expert 2 of the four-way tie (weight 1/4).
+        let logits = tensor(&mem, &[1, 4], DType::F32, &[1.001, 1.0, 1.0, 1.002]);
+        let ids = Tensor::empty(&mem, &[1, 1], DType::I32).expect("ids");
+        let weights = Tensor::empty(&mem, &[1, 1], DType::F32).expect("weights");
+        let rows = Tensor::empty(&mem, &[1], DType::I32).expect("rows");
+        for (bf16_logits, want_id) in [(false, 3), (true, 2)] {
+            let cfg = MoeRouteConfig {
+                num_experts: 4,
+                top_k: 1,
+                renormalize: false,
+                bf16_logits,
+            };
+            moe.route(&mut MoeRouteContext {
+                cfg,
+                router_logits: logits.view(),
+                topk_ids: ids.view(),
+                topk_weights: weights.view(),
+                sorted_rows: rows.view(),
+                expert_offsets: expert_offsets.view(),
+            })
+            .expect("route");
+            assert_eq!(load_i32(&ids.view()).expect("ids"), [want_id], "{cfg}");
+            if bf16_logits {
+                assert_eq!(load(&weights.view()).expect("weights"), [0.25]);
+            }
+        }
 
         // copy_blocks duplicates block 3 into block 7 on every layer and nothing else.
         let (layers, blocks, block_bytes) = (3usize, 8usize, 24usize);

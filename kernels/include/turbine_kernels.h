@@ -1,4 +1,4 @@
-/* Turbine vendor-neutral kernel C ABI, version 2.1 (contract section 9).
+/* Turbine vendor-neutral kernel C ABI, version 2.2 (contract section 9).
  *
  * Every backend shim library implements this header and is loaded by
  * turbine-kernels at run time. No vendor type, identifier or name appears here,
@@ -20,8 +20,10 @@
  * turbine_stream_sync.
  *
  * Versions. TURBINE_ABI_VERSION is the major version and must match exactly.
- * A minor revision only adds optional symbols: a library without them (minor
- * 0, no turbine_abi_minor) still loads, and the caller falls back.
+ * A minor revision only adds optional symbols or descriptor flag bits: a
+ * library without the symbols (minor 0, no turbine_abi_minor) still loads, and
+ * the caller falls back; a library of an earlier minor reports a descriptor
+ * with a flag bit it does not know unsupported.
  *
  * Layout. Row-major everywhere; strides are in elements; "leading dimension"
  * is the row stride in elements.
@@ -285,13 +287,24 @@ typedef struct turbine_copy_blocks_desc {
   int32_t count;
 } turbine_copy_blocks_desc;
 
-/* Softmax in F32, top-k (ties to the lower expert id), permutation. */
+/* turbine_moe_route_desc flags. RENORMALIZE divides the selected weights by
+ * their sum (without it they stay the softmax weights). BF16_LOGITS (v2.2)
+ * rounds each logit to BF16 (round to nearest even) before the softmax. */
+#define TURBINE_MOE_ROUTE_RENORMALIZE 1
+#define TURBINE_MOE_ROUTE_BF16_LOGITS 2
+
+/* Softmax in F32, then the top_k experts PyTorch's CPU torch.topk selects:
+ * libstdc++ std::nth_element (introselect) at top_k - 1 over (weight, id) in
+ * id order, or std::partial_sort (heap select) when top_k * 64 <= num_experts,
+ * comparing weights only (NaN first), so a tie at the top_k-th place does not
+ * always keep the lower id; then the permutation. */
 typedef struct turbine_moe_route_desc {
   /* [num_tokens, num_experts] F32 */
   const float *router_logits;
-  /* renormalize = 0 keeps the softmax weights of the selected experts */
-  int32_t num_tokens, num_experts, top_k, renormalize;
-  /* [num_tokens, top_k], per token in descending weight */
+  /* flags: TURBINE_MOE_ROUTE_* bits (the field was named renormalize before
+   * v2.2; its values 0 and 1 keep their meaning) */
+  int32_t num_tokens, num_experts, top_k, flags;
+  /* [num_tokens, top_k], per token in descending weight (ties: lower id) */
   int32_t *topk_ids;
   float *topk_weights;
   /* [num_tokens * top_k]: rows (token * top_k + slot) grouped by expert */
@@ -371,7 +384,8 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * Every symbol below is optional: turbine-kernels resolves them only when
  * turbine_abi_minor() >= 1, and a library without them runs the ABI v2 paths
  * (add then rmsnorm, whole logits rows, eager launches). */
-#define TURBINE_ABI_MINOR 1u
+/* v2.2 adds TURBINE_MOE_ROUTE_BF16_LOGITS (a flag bit, no new symbol). */
+#define TURBINE_ABI_MINOR 2u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return

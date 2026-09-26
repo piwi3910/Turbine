@@ -1017,6 +1017,8 @@ Exhaustion horizon (P3 S-8): `ExhaustionHorizon::predict(running: &[(remaining_t
 
 The Rust constant `TURBINE_KERNELS_ABI_VERSION` must equal the library's value exactly; mismatch is fatal naming both numbers (P1). Both shims always implement the same version (P2b Constraints).
 
+Minor revisions (`TURBINE_ABI_MINOR` / `turbine_abi_minor()`, optional symbol; P2c) are additive within a major: 2.1 adds the optional `add_rmsnorm`, `logits_reduce`, context options and graphs; 2.2 renames `turbine_moe_route_desc.renormalize` to `flags` (same slot, 1 still renormalises) and adds `TURBINE_MOE_ROUTE_BF16_LOGITS` (decision "OLMoE golden gate", 2026-09-26). A library of an earlier minor rejects an unknown flag bit in `_supported`, and turbine-kernels only asks for BF16 logits from a library reporting minor ≥ 2. `moe_route` selects the top-k set PyTorch's CPU `torch.topk` selects (libstdc++ introselect, or heap select when `top_k · 64 ≤ num_experts`), so a tie at the k-th place does not always keep the lower id (`turbine_kernels::torch_topk`, pinned by a torch fixture).
+
 ### 9.2 Conventions
 
 - No vendor type or identifier in the header (P1 AC `abi_header_neutral`: no identifier starting with `hip`, `cuda`, `rocm`, `nv`, case-insensitive — contract-chosen reading of the rule; therefore no code is named `…INVALID…`).
@@ -1164,9 +1166,11 @@ typedef struct turbine_copy_blocks_desc {    /* fork blocks (n > 1) across all l
     int32_t count;
 } turbine_copy_blocks_desc;
 
-typedef struct turbine_moe_route_desc {      /* softmax, top-k (ties → lower expert id), permutation */
+#define TURBINE_MOE_ROUTE_RENORMALIZE 1        /* flags bits */
+#define TURBINE_MOE_ROUTE_BF16_LOGITS 2        /* v2.2: logits rounded to BF16 before the softmax */
+typedef struct turbine_moe_route_desc {      /* softmax, the top-k set torch.topk (CPU) selects, permutation */
     const float *router_logits;                /* [num_tokens, num_experts] F32 */
-    int32_t num_tokens, num_experts, top_k, renormalize;   /* OLMoE: renormalize = 0 */
+    int32_t num_tokens, num_experts, top_k, flags;   /* was renormalize; OLMoE: flags = BF16_LOGITS */
     int32_t *topk_ids; float *topk_weights;    /* [num_tokens, top_k] */
     int32_t *sorted_rows;                      /* [num_tokens*top_k] (token*top_k + slot) grouped by expert */
     int32_t *expert_offsets;                   /* [num_experts + 1] */

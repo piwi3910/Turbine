@@ -990,6 +990,7 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
         num_experts: MOE_EXPERTS as u32,
         top_k: MOE_TOP_K as u32,
         renormalize: false,
+        bf16_logits: true,
     };
     let routing = route_case(p, route_cfg, tokens, case.logits);
     let host_offsets: Vec<i32> = routing.expert_offsets.iter().map(|&o| o as i32).collect();
@@ -1254,12 +1255,15 @@ fn paged_and_moe_ops() {
         &read(&pool_cpu),
     );
 
-    // moe_route: OLMoE (64 experts, top-8, no renormalisation) on random logits; exact ties
-    // (they go to the lower expert id); a renormalising 8-expert top-2 router.
+    // moe_route: OLMoE (64 experts, top-8, no renormalisation, BF16 router logits) on random
+    // logits; exact ties (the set torch.topk keeps, not always the lower ids); logits that
+    // differ in F32 but tie in BF16 (with and without the BF16 rounding); a renormalising
+    // 8-expert top-2 router; a 256-expert top-4 router (the heap-select path).
     let olmoe = MoeRouteConfig {
         num_experts: MOE_EXPERTS as u32,
         top_k: MOE_TOP_K as u32,
         renormalize: false,
+        bf16_logits: true,
     };
     route_case(&p, olmoe, 37, &rng.normal(37 * MOE_EXPERTS, 2.0));
     let mut ties = vec![0f32; 3 * MOE_EXPERTS];
@@ -1267,12 +1271,38 @@ fn paged_and_moe_ops() {
     ties[1] = 1.0;
     ties[MOE_EXPERTS + 40] = 2.0;
     route_case(&p, olmoe, 3, &ties);
+    // Few distinct levels plus sub-BF16 jitter: ties at the 8th place in most rows.
+    let near_ties: Vec<f32> = rng
+        .normal(64 * MOE_EXPERTS, 1.0)
+        .iter()
+        .map(|v| (v * 2.0).round() / 2.0 + v * 1e-4)
+        .collect();
+    for bf16_logits in [true, false] {
+        let cfg = MoeRouteConfig {
+            bf16_logits,
+            ..olmoe
+        };
+        route_case(&p, cfg, 64, &near_ties);
+    }
     let small = MoeRouteConfig {
         num_experts: 8,
         top_k: 2,
         renormalize: true,
+        bf16_logits: false,
     };
     route_case(&p, small, 13, &rng.normal(13 * 8, 1.0));
+    let wide = MoeRouteConfig {
+        num_experts: 256,
+        top_k: 4,
+        renormalize: true,
+        bf16_logits: true,
+    };
+    let wide_ties: Vec<f32> = rng
+        .normal(9 * 256, 1.0)
+        .iter()
+        .map(|v| (v * 2.0).round() / 2.0)
+        .collect();
+    route_case(&p, wide, 9, &wide_ties);
 
     // moe_experts at the OLMoE shapes.
     let w = expert_weights(&p, &mut rng);
@@ -2257,6 +2287,7 @@ fn decode_op_timings() {
                 num_experts: experts as u32,
                 top_k: top_k as u32,
                 renormalize: false,
+                bf16_logits: true,
             };
             let experts_cfg = MoeExpertsConfig {
                 hidden: h as u32,
@@ -2620,6 +2651,7 @@ fn decode_forward_timing() {
             num_experts: experts as u32,
             top_k: top_k as u32,
             renormalize: false,
+            bf16_logits: true,
         };
         let experts_cfg = MoeExpertsConfig {
             hidden: h as u32,

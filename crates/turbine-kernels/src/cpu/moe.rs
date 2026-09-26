@@ -1,11 +1,12 @@
-//! Mixture-of-experts reference ops: `moe_route` (F32 softmax, top-k with ties to the lower
-//! expert id, optional renormalisation, rows grouped by expert) and `moe_experts` (per-expert
-//! SwiGLU with the Hugging Face BF16 roundings, weighted accumulation in ascending expert order).
+//! Mixture-of-experts reference ops: `moe_route` (logits optionally rounded to BF16, F32
+//! softmax, the top-k set `torch.topk` selects, optional renormalisation, rows grouped by
+//! expert) and `moe_experts` (per-expert SwiGLU with the Hugging Face BF16 roundings, weighted
+//! accumulation in ascending expert order).
 use turbine_core::types::DType;
 
 use super::{
     CpuReference, expect_rank, expect_shape, invalid, is_float, load, load_i32, math, round_to,
-    store, store_i32,
+    store, store_i32, torch_topk,
 };
 use crate::KernelError;
 use crate::ops::{MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext};
@@ -22,16 +23,6 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
         *v /= sum;
     }
     p
-}
-
-/// The `top_k` largest entries of `p` in descending order; among equal values the lower index
-/// comes first.
-fn top_k(p: &[f32], k: usize) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..p.len()).collect();
-    // Stable sort by descending value keeps ascending ids among ties.
-    order.sort_by(|&a, &b| p[b].total_cmp(&p[a]));
-    order.truncate(k);
-    order
 }
 
 /// Checks `v` is a dense I32 or F32 view of `want` shape.
@@ -119,8 +110,13 @@ impl MoeKernel for CpuReference {
         let mut ids = Vec::with_capacity(tokens * k);
         let mut weights = Vec::with_capacity(tokens * k);
         for row in logits.chunks_exact(experts) {
-            let p = softmax(row);
-            let chosen = top_k(&p, k);
+            let p = if ctx.cfg.bf16_logits {
+                let rounded: Vec<f32> = row.iter().map(|&l| round_to(DType::BF16, l)).collect();
+                softmax(&rounded)
+            } else {
+                softmax(row)
+            };
+            let chosen = torch_topk(&p, k);
             let mut sum = 0f32;
             for &e in &chosen {
                 sum += p[e];
@@ -270,10 +266,13 @@ impl MoeKernel for CpuReference {
 mod tests {
     use super::*;
 
+    /// Ties at the k-th place go where `torch.topk` puts them (here experts 2 and 3 of four
+    /// equal weights, not the lower ids 0 and 1); the chosen set is listed by descending weight,
+    /// lower id first among equals.
     #[test]
-    fn top_k_breaks_ties_toward_the_lower_id() {
-        assert_eq!(top_k(&[0.25, 0.25, 0.25, 0.25], 2), [0, 1]);
-        assert_eq!(top_k(&[0.1, 0.3, 0.3, 0.3], 3), [1, 2, 3]);
+    fn top_k_breaks_ties_as_torch() {
+        assert_eq!(torch_topk(&[0.25, 0.25, 0.25, 0.25], 2), [2, 3]);
+        assert_eq!(torch_topk(&[0.1, 0.3, 0.3, 0.3], 3), [1, 2, 3]);
         let p = softmax(&[0.0, 0.0]);
         assert_eq!(p, [0.5, 0.5]);
     }

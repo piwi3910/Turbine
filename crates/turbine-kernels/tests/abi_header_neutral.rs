@@ -1,6 +1,7 @@
 //! The kernel C ABI header names no vendor, declares the entry-point trio of every op the
 //! registry binds, and carries the ABI version the Rust side expects (P1 AC S-1/S-7, contract §9)
-//! and the additive minor revision v2.1 (P2c AC S-5).
+//! and the additive minor revisions v2.1 (P2c AC S-5) and v2.2 (the `moe_route` BF16-logits
+//! flag).
 use std::path::Path;
 
 use turbine_kernels::TURBINE_KERNELS_ABI_VERSION;
@@ -127,7 +128,7 @@ fn header_declares_the_v21_minor_revision() {
         "2u",
         "v2.1 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "1u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "2u");
     assert_eq!(define(&code, "TURBINE_OPTION_GEMM_AUTOTUNE"), "1");
     assert_eq!(define(&code, "TURBINE_OPTION_GEMM_TUNED_SHAPES"), "2");
     // Declarations compared with whitespace collapsed, so line wrapping does not matter.
@@ -162,4 +163,22 @@ fn header_declares_the_v21_minor_revision() {
             "{op} is a registry op, so header_declares_every_registry_op checks its trio"
         );
     }
+}
+
+/// v2.2 turns `turbine_moe_route_desc`'s `renormalize` into `flags` (same position and type, 1
+/// still renormalises) and adds the BF16-logits bit. Breaks if the member moves or a bit changes
+/// value (an older library would then misread a descriptor instead of rejecting it).
+#[test]
+fn header_declares_the_v22_moe_route_flags() {
+    let code = strip_comments(&header());
+    assert_eq!(define(&code, "TURBINE_MOE_ROUTE_RENORMALIZE"), "1");
+    assert_eq!(define(&code, "TURBINE_MOE_ROUTE_BF16_LOGITS"), "2");
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "typedef struct turbine_moe_route_desc { const float *router_logits; \
+             int32_t num_tokens, num_experts, top_k, flags; int32_t *topk_ids;"
+        ),
+        "turbine_moe_route_desc changed shape"
+    );
 }

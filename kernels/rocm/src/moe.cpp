@@ -65,7 +65,8 @@ bool route_supported(const turbine_moe_route_desc *d) {
       d->top_k > turbine_hip::kMoeMaxTopK) {
     return false;
   }
-  if (d->renormalize != 0 && d->renormalize != 1)
+  if ((d->flags &
+       ~(TURBINE_MOE_ROUTE_RENORMALIZE | TURBINE_MOE_ROUTE_BF16_LOGITS)) != 0)
     return false;
   return d->num_tokens >= 0 &&
          static_cast<int64_t>(d->num_tokens) * d->top_k <= INT32_MAX;
@@ -456,7 +457,7 @@ int32_t turbine_moe_route(turbine_ctx *ctx, const turbine_moe_route_desc *d) {
                     std::to_string(d->num_tokens) +
                     " experts=" + std::to_string(d->num_experts) +
                     " top_k=" + std::to_string(d->top_k) +
-                    " renormalize=" + std::to_string(d->renormalize));
+                    " flags=" + std::to_string(d->flags));
   }
   if (d->expert_offsets == nullptr ||
       (d->num_tokens > 0 &&

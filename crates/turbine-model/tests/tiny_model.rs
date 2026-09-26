@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use half::bf16;
 use turbine_core::types::{BlockId, DeviceId, ExecutionBackend, KvLayout, SeqId, Vendor};
+use turbine_kernels::torch_topk;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, ElementwiseConfig,
@@ -184,10 +185,12 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 // each residual sum. Logits stay f32.
 //
 // OLMoE (transformers `OlmoeSparseMoeBlock`): RMSNorm over the full Q and K projections before
-// RoPE; the router logits stay f32 (the executor's router GEMM has F32 output), softmax in f32,
-// top-k with ties to the lower expert id, weights renormalised only with `norm_topk_prob`, then
-// cast to BF16; each selected expert's SwiGLU output times its weight is rounded to BF16 and
-// added in ascending expert order into a BF16 zero accumulator (`index_add_`).
+// RoPE; the router logits are the BF16 output of the router linear, softmax in f32, the top-k
+// set PyTorch's CPU `torch.topk` selects (`turbine_kernels::torch_topk`, pinned to torch by its
+// own fixture; among tied weights not always the lower expert id), weights renormalised only
+// with `norm_topk_prob`, then cast to BF16; each selected expert's SwiGLU output times its
+// weight is rounded to BF16 and added in ascending expert order into a BF16 zero accumulator
+// (`index_add_`).
 
 fn bf(v: f32) -> f32 {
     bf16::from_f32(v).to_f32()
@@ -201,6 +204,8 @@ struct Naive {
     qk_norm: bool,
     /// Renormalise the selected routing weights (`norm_topk_prob`); likewise.
     renormalize: bool,
+    /// Round the router logits to BF16 (transformers' BF16 router linear); likewise.
+    bf16_router: bool,
 }
 
 impl Naive {
@@ -223,6 +228,7 @@ impl Naive {
             inv_freq: naive_inv_freq(cfg),
             qk_norm: cfg.qk_norm,
             renormalize: cfg.moe.is_some_and(|m| m.norm_topk_prob),
+            bf16_router: true,
         }
     }
 
@@ -345,24 +351,20 @@ impl Naive {
     fn moe(&self, h: &[f32], p: &str) -> Vec<f32> {
         let hidden = self.cfg.hidden as usize;
         let moe = self.cfg.moe.expect("an OLMoE config");
-        let (experts, top_k) = (moe.num_experts as usize, moe.experts_per_token as usize);
+        let top_k = moe.experts_per_token as usize;
         let router = self.get(&format!("{p}.mlp.gate.weight"));
         let mut out = Vec::with_capacity(h.len());
         for row in h.chunks_exact(hidden) {
-            let logits = Naive::linear(row, router, hidden);
+            let logits = if self.bf16_router {
+                Naive::linear_bf(row, router, hidden)
+            } else {
+                Naive::linear(row, router, hidden)
+            };
             let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
             let sum: f32 = exps.iter().sum();
             let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
-            // Top-k by selection: the largest remaining probability, the lower id on ties.
-            let mut chosen: Vec<usize> = Vec::with_capacity(top_k);
-            for _ in 0..top_k {
-                let best = (0..experts)
-                    .filter(|e| !chosen.contains(e))
-                    .reduce(|a, b| if probs[b] > probs[a] { b } else { a })
-                    .expect("top_k <= experts");
-                chosen.push(best);
-            }
+            let chosen = torch_topk(&probs, top_k);
             let total: f32 = chosen.iter().map(|&e| probs[e]).sum();
             let mut acc = vec![0f32; hidden];
             let mut by_expert = chosen.clone();
@@ -1207,9 +1209,9 @@ fn fused_ops_match_unfused() {
 }
 
 /// The tiny OLMoE (8 experts, top-2, `norm_topk_prob: false`, Q/K norm) on the CPU provider:
-/// prefill and greedy decode logits within 1e-4 of the naive model, which in turn is far from
-/// the same model without Q/K norm or with renormalised routing weights (so neither can go
-/// missing unnoticed).
+/// prefill and greedy decode logits within 1e-4 of the naive model (BF16 router logits,
+/// `torch.topk` selection), which in turn is far from the same model without Q/K norm, with
+/// renormalised routing weights or with F32 router logits (so none can go missing unnoticed).
 #[test]
 fn olmoe_cpu_forward_matches_naive() {
     let tmp = TempDir::new("tiny-model-olmoe-naive");
@@ -1227,7 +1229,7 @@ fn olmoe_cpu_forward_matches_naive() {
     for want in [
         "rmsnorm dim=64 dtype=bf16",
         "gemm n=8 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
-        "moe_route experts=8 top_k=2 renormalize=0",
+        "moe_route experts=8 top_k=2 renormalize=0 bf16_logits=1",
         "moe_experts hidden=64 inter=32 experts=8 top_k=2 local=0..8 dtype=bf16",
         "gemm n=263 k=64 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32",
         "rope head_dim=16 rotary_dim=16 q_heads=4 kv_heads=4 dtype=bf16",
@@ -1275,6 +1277,10 @@ fn olmoe_cpu_forward_matches_naive() {
     renormalised.renormalize = true;
     let diff = max_abs_diff(&row, &renormalised.logits(&tokens));
     assert!(diff > 1e-3, "renormalisation changes nothing: {diff}");
+    let mut f32_router = Naive::load(&spec.dir, cfg);
+    f32_router.bf16_router = false;
+    let diff = max_abs_diff(&row, &f32_router.logits(&tokens));
+    assert!(diff > 1e-4, "BF16 router logits change nothing: {diff}");
 }
 
 /// Host memory without device-to-device copies, like the HIP shim under kernel ABI v2 (D2D

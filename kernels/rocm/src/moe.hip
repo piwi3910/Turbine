@@ -4,7 +4,8 @@
 // hipBLASLt (moe.cpp).
 //
 // Numerics follow the cpu-reference moe ops: the router softmax in f32 with a
-// sequential sum, top-k in descending weight with ties to the lower expert id,
+// sequential sum (over logits rounded to BF16 first with
+// TURBINE_MOE_ROUTE_BF16_LOGITS), the top-k set torch.topk selects,
 // and out[t] = round(out[t] + round(y * round(w))) applied expert by expert in
 // ascending id.
 #include "bf16.hpp"
@@ -30,44 +31,209 @@ static_assert(kMoeMaxExperts <= kBlock,
 
 // ---- routing ----
 
-// One thread per token: softmax over the experts (max-subtracted, sequential
-// sum), then top_k selections of the largest remaining probability, scanning
-// experts in ascending id with a strict comparison so ties go to the lower id.
+// ---- torch.topk selection ----
+//
+// PyTorch's CPU torch.topk (largest) fills (value, index) pairs in index order
+// and selects with libstdc++ std::nth_element at k - 1 (introselect), or
+// std::partial_sort (heap select) when k * 64 <= n, comparing values only (NaN
+// first). Among tied values the selected set is whatever those algorithms
+// leave in front, so the functions below are line-by-line ports of the
+// libstdc++ ones (and of crates/turbine-kernels/src/cpu/topk.rs, which a
+// fixture pins to torch.topk itself).
+
+struct TopkElem {
+  float v;
+  int32_t i;
+};
+
+__device__ inline bool topk_greater(const TopkElem &x, const TopkElem &y) {
+  return (isnan(x.v) && !isnan(y.v)) || x.v > y.v;
+}
+
+__device__ inline void topk_swap(TopkElem *a, int32_t x, int32_t y) {
+  const TopkElem t = a[x];
+  a[x] = a[y];
+  a[y] = t;
+}
+
+// std::__move_median_to_first(result, a, b, c)
+__device__ void topk_median_to_first(TopkElem *v, int32_t result, int32_t a,
+                                     int32_t b, int32_t c) {
+  int32_t pick;
+  if (topk_greater(v[a], v[b])) {
+    if (topk_greater(v[b], v[c]))
+      pick = b;
+    else if (topk_greater(v[a], v[c]))
+      pick = c;
+    else
+      pick = a;
+  } else if (topk_greater(v[a], v[c])) {
+    pick = a;
+  } else if (topk_greater(v[b], v[c])) {
+    pick = c;
+  } else {
+    pick = b;
+  }
+  topk_swap(v, result, pick);
+}
+
+// std::__unguarded_partition_pivot(first, last)
+__device__ int32_t topk_partition_pivot(TopkElem *v, int32_t first,
+                                        int32_t last) {
+  const int32_t pivot = first;
+  topk_median_to_first(v, first, first + 1, first + (last - first) / 2,
+                       last - 1);
+  first += 1;
+  while (true) {
+    while (topk_greater(v[first], v[pivot]))
+      ++first;
+    --last;
+    while (topk_greater(v[pivot], v[last]))
+      --last;
+    if (!(first < last))
+      return first;
+    topk_swap(v, first, last);
+    ++first;
+  }
+}
+
+// std::__insertion_sort(first, last)
+__device__ void topk_insertion_sort(TopkElem *v, int32_t first, int32_t last) {
+  if (first == last)
+    return;
+  for (int32_t i = first + 1; i < last; ++i) {
+    const TopkElem val = v[i];
+    if (topk_greater(val, v[first])) {
+      for (int32_t j = i; j > first; --j)
+        v[j] = v[j - 1];
+      v[first] = val;
+    } else {
+      int32_t j = i;
+      while (topk_greater(val, v[j - 1])) {
+        v[j] = v[j - 1];
+        --j;
+      }
+      v[j] = val;
+    }
+  }
+}
+
+// std::__adjust_heap(first, hole, len, value) with its std::__push_heap.
+__device__ void topk_adjust_heap(TopkElem *v, int32_t first, int32_t hole,
+                                 int32_t len, TopkElem value) {
+  const int32_t top = hole;
+  int32_t child = hole;
+  while (child < (len - 1) / 2) {
+    child = 2 * (child + 1);
+    if (topk_greater(v[first + child], v[first + child - 1]))
+      --child;
+    v[first + hole] = v[first + child];
+    hole = child;
+  }
+  if ((len & 1) == 0 && child == (len - 2) / 2) {
+    child = 2 * (child + 1);
+    v[first + hole] = v[first + child - 1];
+    hole = child - 1;
+  }
+  int32_t parent = (hole - 1) / 2;
+  while (hole > top && topk_greater(v[first + parent], value)) {
+    v[first + hole] = v[first + parent];
+    hole = parent;
+    parent = (hole - 1) / 2;
+  }
+  v[first + hole] = value;
+}
+
+// std::__heap_select(first, middle, last), with std::__make_heap and
+// std::__pop_heap.
+__device__ void topk_heap_select(TopkElem *v, int32_t first, int32_t middle,
+                                 int32_t last) {
+  const int32_t len = middle - first;
+  if (len >= 2) {
+    for (int32_t parent = (len - 2) / 2;; --parent) {
+      topk_adjust_heap(v, first, parent, len, v[first + parent]);
+      if (parent == 0)
+        break;
+    }
+  }
+  for (int32_t i = middle; i < last; ++i) {
+    if (topk_greater(v[i], v[first])) {
+      const TopkElem value = v[i];
+      v[i] = v[first];
+      topk_adjust_heap(v, first, 0, len, value);
+    }
+  }
+}
+
+// std::nth_element(v, v + nth, v + n) (std::__introselect).
+__device__ void topk_nth_element(TopkElem *v, int32_t nth, int32_t n) {
+  int32_t first = 0, last = n;
+  if (first == last || nth == last)
+    return;
+  int32_t depth = 2 * (31 - __clz(n));
+  while (last - first > 3) {
+    if (depth == 0) {
+      topk_heap_select(v, first, nth + 1, last);
+      topk_swap(v, first, nth);
+      return;
+    }
+    --depth;
+    const int32_t cut = topk_partition_pivot(v, first, last);
+    if (cut <= nth)
+      first = cut;
+    else
+      last = cut;
+  }
+  topk_insertion_sort(v, first, last);
+}
+
+// One thread per token: logits rounded to BF16 with
+// TURBINE_MOE_ROUTE_BF16_LOGITS, softmax over the experts (max-subtracted,
+// sequential sum), the set torch.topk selects, written in descending weight
+// with ties to the lower expert id.
 __global__ void moe_topk_kernel(const float *logits, int32_t num_tokens,
                                 int32_t num_experts, int32_t top_k,
-                                int32_t renormalize, int32_t *topk_ids,
+                                int32_t flags, int32_t *topk_ids,
                                 float *topk_weights) {
   const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (t >= num_tokens)
     return;
   const float *row = logits + t * num_experts;
+  const bool bf16_logits = (flags & TURBINE_MOE_ROUTE_BF16_LOGITS) != 0;
+  TopkElem v[kMoeMaxExperts];
   float max = kNegInf;
-  for (int32_t e = 0; e < num_experts; ++e)
-    max = fmaxf(max, row[e]);
+  for (int32_t e = 0; e < num_experts; ++e) {
+    v[e].v = bf16_logits ? round_bf16(row[e]) : row[e];
+    v[e].i = e;
+    max = fmaxf(max, v[e].v);
+  }
   float sum = 0.0f;
   for (int32_t e = 0; e < num_experts; ++e)
-    sum += expf(row[e] - max);
+    sum += expf(v[e].v - max);
+  for (int32_t e = 0; e < num_experts; ++e)
+    v[e].v = expf(v[e].v - max) / sum;
 
-  uint32_t chosen[kMoeMaxExperts / 32] = {};
+  if (top_k * 64 <= num_experts)
+    topk_heap_select(v, 0, top_k, num_experts);
+  else
+    topk_nth_element(v, top_k - 1, num_experts);
+  // Descending weight, ties to the lower id (insertion sort of the k chosen).
+  for (int32_t a = 1; a < top_k; ++a) {
+    const TopkElem x = v[a];
+    int32_t b = a;
+    while (b > 0 && (v[b - 1].v < x.v || (v[b - 1].v == x.v && v[b - 1].i > x.i))) {
+      v[b] = v[b - 1];
+      --b;
+    }
+    v[b] = x;
+  }
   int32_t *ids = topk_ids + t * top_k;
   float *weights = topk_weights + t * top_k;
   for (int32_t slot = 0; slot < top_k; ++slot) {
-    int32_t best = -1;
-    float best_p = 0.0f;
-    for (int32_t e = 0; e < num_experts; ++e) {
-      if ((chosen[e / 32] >> (e % 32)) & 1u)
-        continue;
-      const float p = expf(row[e] - max) / sum;
-      if (best < 0 || p > best_p) {
-        best = e;
-        best_p = p;
-      }
-    }
-    chosen[best / 32] |= 1u << (best % 32);
-    ids[slot] = best;
-    weights[slot] = best_p;
+    ids[slot] = v[slot].i;
+    weights[slot] = v[slot].v;
   }
-  if (renormalize != 0) {
+  if ((flags & TURBINE_MOE_ROUTE_RENORMALIZE) != 0) {
     float chosen_sum = 0.0f;
     for (int32_t slot = 0; slot < top_k; ++slot)
       chosen_sum += weights[slot];
@@ -215,7 +381,7 @@ int32_t launch_moe_route(turbine_ctx *ctx, const turbine_moe_route_desc *d) {
         dim3(static_cast<unsigned>(
             (static_cast<int64_t>(d->num_tokens) + kBlock - 1) / kBlock)),
         dim3(kBlock), 0, ctx->stream, d->router_logits, d->num_tokens,
-        d->num_experts, d->top_k, d->renormalize, d->topk_ids, d->topk_weights);
+        d->num_experts, d->top_k, d->flags, d->topk_ids, d->topk_weights);
     if (int32_t rc =
             check_hip(ctx, hipGetLastError(), "moe top-k kernel launch");
         rc != TURBINE_OK) {

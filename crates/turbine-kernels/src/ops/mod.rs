@@ -289,23 +289,29 @@ impl fmt::Display for KvCopyConfig {
     }
 }
 
-/// MoE router: softmax over `num_experts` F32 logits, top-`top_k`, optional renormalisation.
+/// MoE router: softmax over `num_experts` F32 logits, top-`top_k` selected as PyTorch's CPU
+/// `torch.topk` selects ([`crate::torch_topk`]), optional renormalisation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct MoeRouteConfig {
     pub num_experts: u32,
     pub top_k: u32,
     /// Divide the selected weights by their sum (`norm_topk_prob`; false for OLMoE-1B-7B).
     pub renormalize: bool,
+    /// Round each logit to BF16 (round to nearest even) before the softmax: the router GEMM
+    /// output of a BF16 model in transformers (`self.gate(hidden_states)` is a BF16 linear).
+    /// Kernel ABI v2.2 (`TURBINE_MOE_ROUTE_BF16_LOGITS`).
+    pub bf16_logits: bool,
 }
 
 impl fmt::Display for MoeRouteConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "experts={} top_k={} renormalize={}",
+            "experts={} top_k={} renormalize={} bf16_logits={}",
             self.num_experts,
             self.top_k,
-            u8::from(self.renormalize)
+            u8::from(self.renormalize),
+            u8::from(self.bf16_logits)
         )
     }
 }
@@ -442,8 +448,9 @@ pub struct KvCopyContext<'a> {
 /// MoE routing of `num_tokens` tokens.
 ///
 /// - `router_logits`: `[num_tokens, num_experts]` F32
-/// - `topk_ids` (I32) / `topk_weights` (F32): `[num_tokens, top_k]`, per token in descending
-///   weight, ties to the lower expert id
+/// - `topk_ids` (I32) / `topk_weights` (F32): `[num_tokens, top_k]`, the experts
+///   `torch.topk` selects (among tied weights not "the lower id first": see
+///   [`crate::torch_topk`]), per token in descending weight, ties to the lower expert id
 /// - `sorted_rows`: `[num_tokens · top_k]` I32, every row `token · top_k + slot` grouped by
 ///   expert (ascending expert, ascending row within an expert)
 /// - `expert_offsets`: `[num_experts + 1]` I32; expert `e` owns
@@ -769,10 +776,11 @@ mod tests {
             MoeRouteConfig {
                 num_experts: 64,
                 top_k: 8,
-                renormalize: false
+                renormalize: false,
+                bf16_logits: true
             }
             .to_string(),
-            "experts=64 top_k=8 renormalize=0"
+            "experts=64 top_k=8 renormalize=0 bf16_logits=1"
         );
         let experts = MoeExpertsConfig {
             hidden: 2048,

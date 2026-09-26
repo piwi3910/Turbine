@@ -201,7 +201,15 @@ pub(crate) struct CopyBlocksDesc {
     pub count: i32,
 }
 
-/// `turbine_moe_route_desc` (v2).
+/// `TURBINE_MOE_ROUTE_RENORMALIZE`: `MoeRouteDesc::flags` bit dividing the selected weights by
+/// their sum (v2).
+pub(crate) const MOE_ROUTE_RENORMALIZE: i32 = 1;
+/// `TURBINE_MOE_ROUTE_BF16_LOGITS`: `MoeRouteDesc::flags` bit rounding each logit to BF16 before
+/// the softmax (v2.2; a library of an earlier minor reports such a descriptor unsupported).
+pub(crate) const MOE_ROUTE_BF16_LOGITS: i32 = 2;
+
+/// `turbine_moe_route_desc` (v2; `flags` was `renormalize`, whose values 0 and 1 keep their
+/// meaning).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MoeRouteDesc {
@@ -209,7 +217,7 @@ pub(crate) struct MoeRouteDesc {
     pub num_tokens: i32,
     pub num_experts: i32,
     pub top_k: i32,
-    pub renormalize: i32,
+    pub flags: i32,
     pub topk_ids: *mut i32,
     pub topk_weights: *mut f32,
     pub sorted_rows: *mut i32,

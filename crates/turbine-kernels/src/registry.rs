@@ -584,6 +584,7 @@ mod tests {
             num_experts: 64,
             top_k: 8,
             renormalize: false,
+            bf16_logits: true,
         };
         let experts = MoeExpertsConfig {
             hidden: 2048,
