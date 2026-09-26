@@ -1225,6 +1225,10 @@ mod tests {
         call(f)
     }
 
+    /// Serializes the tests that create contexts in the gfx942 stub: its live-context counter is
+    /// process-global, so a parallel test's context would shift `live_contexts`.
+    static STUB_CONTEXTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn live_contexts(lib: &ShimLibrary) -> i32 {
         stub_hook(
             lib,
@@ -1299,6 +1303,7 @@ mod tests {
 
     #[test]
     fn context_memory_provider_and_destroy_once() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
         let lib = ShimLibrary::load(
             Path::new(env!("TURBINE_STUB_GFX942")),
             ExecutionBackend::Hip,
@@ -1381,6 +1386,7 @@ mod tests {
 
     #[test]
     fn v2_ops_forward_through_the_abi() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
         let lib = ShimLibrary::load(
             Path::new(env!("TURBINE_STUB_GFX942")),
             ExecutionBackend::Hip,
