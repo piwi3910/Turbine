@@ -28,6 +28,9 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 | 2026-09-26 | 3f21ad7 | GPU sampling 1/3: device logits reduce, Rust side (no kernel yet) (298/0) | 594.3 | 22.9 | 575 | 20.6 | c1 16/16; c16 16/16 | −5.0% (judged as a unit with the next two) |
 | 2026-09-26 | 0f4bb8f | GPU sampling 2/3: HIP logits_reduce kernel — only greedy rows eligible (1,024 of 52,225) (298/0) | 603.8 | 22.8 | 574 | 20.3 | c1 16/16; c16 16/16 | −3.5% vs eaad734 |
 | 2026-09-26 | 09a41da | **GPU sampling 3/3: device top_p — 52,224 of 52,225 rows reduced on the GPU (299/0) — 96% of vLLM's 738** | **708.2** | 18.8 | 573 | 18.1 | c1 16/16; c16 16/16 | **+13.2% vs eaad734** |
+| 2026-09-26 | 5b653f6 | op-level forward profile hooks (off by default) (301/0) | 706.6 | 18.9 | 572 | 18.1 | c1 16/16; c16 16/16 | −0.2% |
+| 2026-09-26 | 936d1ce | lab diagnostics tests only (301/0) | 697.3 | 19.1 | 575 | 18.3 | c1 16/16; c16 15/16 flake | −1.3% (noise) |
+| 2026-09-26 | bd99d87 | **fused QKV + gate/up projections on by default (301/0) — parity with vLLM-ROCm (738.0)** | **739.4** | 18.0 | 572 | 17.2 | c1 16/16; c16 16/16 | +6.0% |
 
 ## OLMoE-1B-7B-0125-Instruct (BF16)
 
