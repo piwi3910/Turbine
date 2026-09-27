@@ -1,7 +1,8 @@
 //! The kernel C ABI header names no vendor, declares the entry-point trio of every op the
 //! registry binds, and carries the ABI version the Rust side expects (P1 AC S-1/S-7, contract §9)
 //! and the additive minor revisions v2.1 (P2c AC S-5), v2.2 (the `moe_route` BF16-logits
-//! flag) and v2.4 (Phase 2m: implementation enumeration and the card profile).
+//! flag), v2.4 (Phase 2m: implementation enumeration and the card profile) and v2.5 (Phase 4:
+//! copy streams and asynchronous copies).
 use std::path::Path;
 
 use turbine_kernels::TURBINE_KERNELS_ABI_VERSION;
@@ -203,7 +204,8 @@ fn header_declares_the_v24_minor_revision() {
         "2u",
         "v2.4 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "4u");
+    // v2.5 (Phase 4) raised the minor; the v2.4 group is unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "5u");
     for (i, op) in OpKind::ALL.iter().enumerate() {
         let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
         assert_eq!(define(&code, &name), i.to_string(), "{name}");
@@ -226,6 +228,38 @@ fn header_declares_the_v24_minor_revision() {
         assert!(
             flat.contains(decl),
             "turbine_kernels.h lacks the v2.4 {decl}"
+        );
+    }
+}
+
+/// v2.5 (Phase 4 S-5/S-6, provisional decision "Phase 4: kernel ABI v2.5 instead of v3"): the
+/// minor becomes 5 and the copy-stream group is declared with the Phase 4 names; the major stays
+/// 2 (additive). Breaks if a direction code moves (a library would copy the wrong way) or a
+/// signature changes.
+#[test]
+fn header_declares_the_v25_copy_streams() {
+    let code = strip_comments(&header());
+    assert_eq!(
+        define(&code, "TURBINE_ABI_VERSION"),
+        "2u",
+        "v2.5 keeps major 2"
+    );
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "5u");
+    assert_eq!(define(&code, "TURBINE_COPY_H2D"), "0");
+    assert_eq!(define(&code, "TURBINE_COPY_D2H"), "1");
+    assert_eq!(define(&code, "TURBINE_COPY_D2D"), "2");
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for decl in [
+        "int32_t turbine_copy_stream_create(turbine_ctx *ctx, turbine_stream **out);",
+        "int32_t turbine_copy_stream_destroy(turbine_ctx *ctx, turbine_stream *s);",
+        "int32_t turbine_memcpy_async(turbine_ctx *ctx, turbine_stream *s, void *dst, \
+         const void *src, size_t bytes, int32_t kind);",
+        "int32_t turbine_event_query(turbine_ctx *ctx, turbine_event *e);",
+        "int32_t turbine_stream_wait_event(turbine_ctx *ctx, turbine_stream *s, turbine_event *e);",
+    ] {
+        assert!(
+            flat.contains(decl),
+            "turbine_kernels.h lacks the v2.5 {decl}"
         );
     }
 }

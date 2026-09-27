@@ -261,7 +261,7 @@ pub(crate) struct TurbineEvent {
     _private: [u8; 0],
 }
 
-/// Opaque `turbine_stream` (v2.3: only null, the compute stream, is passed).
+/// Opaque `turbine_stream` (v2.3: only null, the compute stream, is passed; v2.5: copy streams).
 #[repr(C)]
 pub(crate) struct TurbineStream {
     _private: [u8; 0],
@@ -357,6 +357,30 @@ pub(crate) struct StagingFns {
     pub event_destroy: unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineEvent) -> i32,
 }
 
+/// `TURBINE_COPY_*` (v2.5): the direction of `turbine_memcpy_async`.
+pub(crate) const COPY_H2D: i32 = 0;
+pub(crate) const COPY_D2H: i32 = 1;
+pub(crate) const COPY_D2D: i32 = 2;
+
+/// The v2.5 copy-stream group: `turbine_copy_stream_{create,destroy}`, `turbine_memcpy_async`,
+/// `turbine_event_query` and `turbine_stream_wait_event` (used with the v2.3 staging group).
+#[derive(Clone, Copy)]
+pub(crate) struct CopyFns {
+    pub stream_create: unsafe extern "C" fn(*mut TurbineCtx, *mut *mut TurbineStream) -> i32,
+    pub stream_destroy: unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineStream) -> i32,
+    pub memcpy_async: unsafe extern "C" fn(
+        *mut TurbineCtx,
+        *mut TurbineStream,
+        *mut c_void,
+        *const c_void,
+        usize,
+        i32,
+    ) -> i32,
+    pub event_query: unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineEvent) -> i32,
+    pub stream_wait_event:
+        unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineStream, *mut TurbineEvent) -> i32,
+}
+
 /// `TURBINE_IMPL_NEEDS_HOST_OFFSETS` (v2.4): the implementation reads `host_expert_offsets`.
 pub(crate) const IMPL_NEEDS_HOST_OFFSETS: u32 = 1;
 
@@ -403,9 +427,10 @@ pub(crate) struct ImplFns {
     pub set_profile: unsafe extern "C" fn(*mut TurbineCtx, *const CardProfileDesc) -> i32,
 }
 
-/// The optional ABI v2.1 and v2.3 functions. `minor` is `turbine_abi_minor()` (0 when the
-/// library lacks it); every v2.1 group is `None` unless `minor` ≥ 1, `staging` unless `minor`
-/// ≥ 3, `impls` unless `minor` ≥ 4, and each only when the library exports the whole group.
+/// The optional ABI v2.1–v2.5 functions. `minor` is `turbine_abi_minor()` (0 when the library
+/// lacks it); every v2.1 group is `None` unless `minor` ≥ 1, `staging` unless `minor` ≥ 3,
+/// `impls` unless `minor` ≥ 4, `copies` unless `minor` ≥ 5 and `staging` is resolved, and each
+/// only when the library exports the whole group.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct V21Symbols {
     pub minor: u32,
@@ -417,6 +442,8 @@ pub(crate) struct V21Symbols {
     pub staging: Option<StagingFns>,
     /// v2.4 implementation enumeration and the card profile.
     pub impls: Option<ImplFns>,
+    /// v2.5 copy streams and asynchronous copies (Phase 4 KV tiers).
+    pub copies: Option<CopyFns>,
 }
 
 impl V21Symbols {
@@ -473,6 +500,18 @@ impl V21Symbols {
                 set_profile: optional(lib, "turbine_ctx_set_profile")?,
             })
         })();
+        let copies = (|| {
+            if minor < 5 || staging.is_none() {
+                return None;
+            }
+            Some(CopyFns {
+                stream_create: optional(lib, "turbine_copy_stream_create")?,
+                stream_destroy: optional(lib, "turbine_copy_stream_destroy")?,
+                memcpy_async: optional(lib, "turbine_memcpy_async")?,
+                event_query: optional(lib, "turbine_event_query")?,
+                stream_wait_event: optional(lib, "turbine_stream_wait_event")?,
+            })
+        })();
         V21Symbols {
             minor,
             options,
@@ -481,6 +520,7 @@ impl V21Symbols {
             graph,
             staging,
             impls,
+            copies,
         }
     }
 }

@@ -535,3 +535,12 @@ The Phase 4 plan (written before Phase 2m) made `kv.policy` a closed enum `cost_
 - B) Keep the closed enum and add the registry later
 
 **Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Contract §11/§24, spec S-7 and the configuration table, and plan Task 6 amended. KV tiers stay a fixed set (L0/L1/L2 are the spec's physical tiers, each with its own sizing keys and transfer paths), so they are not a registry point in Phase 4.
+
+## Phase 4: kernel ABI v2.5 instead of v3
+
+The Phase 4 spec and contract (CONFLICT C-6) planned a major bump, ABI v3, making pinned memory, copy streams, asynchronous copies and events required. Since then Phase 2c added the compute-stream subset of those functions as the optional v2.3 group and Phase 2m the optional v2.4 group, so what Phase 4 still needs is additive.
+
+- A) An optional minor group v2.5 (`turbine_copy_stream_create/destroy`, `turbine_memcpy_async`, `turbine_event_query`, `turbine_stream_wait_event`; `turbine_event_record` accepts a copy stream), resolved only with minor ≥ 5 and the v2.3 group; a library without it runs the KV cache on L0 only with a WARN; `TURBINE_ABI_VERSION` stays 2 (recommended)
+- B) The planned v3: every function required, a v2 library refused
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** No breaking change for existing libraries (`libturbine_hip_v23.so` still loads and serves), the names and signatures are the v3 ones so a later major bump only makes them required. Contract §9.1, spec S-5/S-6 and plan Task 13 amended; the CUDA shim's copy (pinned.cu) stays out while NVIDIA is on hold.
