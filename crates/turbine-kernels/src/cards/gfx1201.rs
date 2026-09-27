@@ -6,7 +6,10 @@
 use super::{CardCapabilities, CardProfile, CardThresholds, OpPreference, RowTierSpec};
 use crate::OpKind;
 
-/// Routed rows up to which the small-m MoE kernel is preferred.
+/// Routed rows up to which the small-m MoE kernel is preferred. For OLMoE-class shapes (hidden
+/// and inter multiples of 64) both tiers run the same WMMA chain, so this bound only moves work
+/// between tile shapes and never changes a row's bits (batch invariance, decision 2026-09-27);
+/// it was tuned on the scalar small-m kernels and is due a re-measure with the 16-row WMMA tiles.
 const MOE_SMALL_MAX_ROWS: u32 = 512;
 
 const RMSNORM_ORDER: &[&str] = &["ck_tile_rmsnorm2d", "turbine_hip"];

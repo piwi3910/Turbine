@@ -37,7 +37,9 @@
 // Numerics follow the cpu-reference moe_experts: F32 accumulation, gate and up
 // rounded to BF16, silu rounded, the product rounded, the down projection
 // rounded. The summation order is fixed by the kernel (16-wide WMMA steps in
-// ascending k), so two runs are bitwise identical.
+// ascending k), so two runs are bitwise identical, and so is a row computed by
+// the small-row blocks below (the small-m tier): the result of a row does not
+// depend on the batch it is in.
 #include "bf16.hpp"
 #include "turbine_hip.hpp"
 
@@ -147,6 +149,22 @@ struct Shape {
 // at ~70 TFLOPS, the others are bound by streaming the experts' weights), and
 // the larger tiles slower.
 using Block = Shape<4, 2, 1, 2, 1>;
+
+// The small-row blocks (the small-m implementation, launch_moe_small_m, for
+// shapes of multiples of 64): 4 waves over one 16-row WMMA tile of the rows and
+// 64 columns, so a decode batch with a few rows per expert computes 16 rows per
+// tile instead of 64 and spreads each expert's weights over more blocks. Loads
+// run two steps ahead where the depth allows it (multiples of 128).
+//
+// Batch invariance: every output element is the same WMMA chain in every block
+// shape -- a zero accumulator, then v_wmma over 16-wide k slices in ascending k
+// -- and a WMMA result element depends only on its row of A, its column of B
+// and its accumulator. So a row's gate, up, activation and down values are
+// bitwise the same whichever shape runs it, i.e. whatever the batch's routed
+// row count (hip_batch_invariance, moe_rows_are_batch_invariant). Tiling and
+// prefetch depth may change; the chain may not.
+using SmallBlock = Shape<1, 4, 1, 1, 2>;
+using SmallBlockK64 = Shape<1, 4, 1, 1, 1>;
 
 // One projection of a (row tile, column tile) of one expert.
 //   kGateUp: out[p, n] = bf16(round(silu(round(x_p . w0_n))) * round(x_p .
@@ -374,6 +392,17 @@ int32_t launch_moe_wmma(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
   if (int32_t rc = launch_moe_positions(ctx, d, pos); rc != TURBINE_OK)
     return rc;
   return launch_shape<Block>(ctx, d, act, down);
+}
+
+int32_t launch_moe_wmma_small(turbine_ctx *ctx,
+                              const turbine_moe_experts_desc *d, int32_t *pos,
+                              void *act, void *down) {
+  if (int32_t rc = launch_moe_positions(ctx, d, pos); rc != TURBINE_OK)
+    return rc;
+  constexpr int kDeep = SmallBlock::kPrefetch * kTileK;
+  if (d->hidden % kDeep == 0 && d->inter % kDeep == 0)
+    return launch_shape<SmallBlock>(ctx, d, act, down);
+  return launch_shape<SmallBlockK64>(ctx, d, act, down);
 }
 
 } // namespace turbine_hip

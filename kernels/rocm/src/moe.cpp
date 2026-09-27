@@ -8,7 +8,9 @@
 // turbine_impl_run, or turbine_moe_experts takes the first that supports the
 // descriptor within the context's card profile): the Turbine small-m kernels
 // (moe_small_m.hip, impl "turbine_hip_moe_small_m"; the default uses them up
-// to the profile's moe_small_max_rows routed rows, num_tokens * top_k), the
+// to the profile's moe_small_max_rows routed rows, num_tokens * top_k; for
+// hidden and inter multiples of 64 they are the grouped WMMA kernels with
+// 16-row tiles, bitwise equal to the next tier row by row), the
 // Turbine grouped WMMA kernels (moe_grouped.hip, impl "turbine_hip_moe_wmma";
 // hidden and inter multiples of 64), both reading the group sizes from
 // expert_offsets on the device (host_expert_offsets may be NULL, and

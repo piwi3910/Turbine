@@ -1,6 +1,18 @@
 // Turbine HIP kernels for moe_experts with few routed rows (impl
 // "turbine_hip_moe_small_m"; the default takes them up to the card profile's
-// moe_small_max_rows routed rows, num_tokens * top_k):
+// moe_small_max_rows routed rows, num_tokens * top_k).
+//
+// When hidden and inter are multiples of 64 (moe_wmma_shape, e.g. OLMoE) the
+// implementation runs the grouped WMMA kernels of moe_grouped.hip with 16-row
+// tiles (launch_moe_wmma_small): the same per-element WMMA chain as the tier
+// above it, so a row's output does not depend on how many rows share its batch
+// (decision 2026-09-27, the OLMoE concurrency-16 golden flip: these scalar
+// kernels sum in another order than the WMMA tier, and a decode row that shared
+// a batch with a prefill chunk crossed the tier boundary and changed its
+// rounding). The scalar kernels below serve the other shapes (multiples of 8);
+// for those the tiers are not bitwise equal.
+//
+// The scalar kernels:
 // every group size is read from expert_offsets on the device, so the caller
 // needs no host copy of the offsets and the step makes no device-to-host copy.
 //
@@ -313,6 +325,11 @@ int32_t launch_moe_positions(turbine_ctx *ctx,
 
 int32_t launch_moe_small_m(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                            int32_t *pos, void *act, void *down) {
+  // Batch invariance: where the grouped WMMA path serves the shape, the small-m
+  // tier runs its kernels with small row tiles, so a row gets the same bits
+  // whichever tier its batch's row count selects.
+  if (moe_wmma_shape(d))
+    return launch_moe_wmma_small(ctx, d, pos, act, down);
   const int32_t rows = d->num_tokens * d->top_k;
   const int32_t num_local = d->expert_end - d->expert_begin;
   // At most one expert slot per routed row.

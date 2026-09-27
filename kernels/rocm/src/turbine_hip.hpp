@@ -177,6 +177,12 @@ int32_t launch_moe_wmma(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                         int32_t *pos, void *act, void *down);
 // hidden and inter are multiples of the grouped kernels' depth step (64).
 bool moe_wmma_shape(const turbine_moe_experts_desc *d);
+// The same WMMA kernels with 16-row tiles (moe_grouped.hip), bitwise equal to
+// launch_moe_wmma row by row: the small-m path's kernels when
+// moe_wmma_shape(d).
+int32_t launch_moe_wmma_small(turbine_ctx *ctx,
+                              const turbine_moe_experts_desc *d, int32_t *pos,
+                              void *act, void *down);
 
 // Asks hipBLASLt for a grouped BF16 GEMM solution on ctx's device (moe.cpp);
 // false when there is none (ROCm 7.14.1 on RDNA4) or the query fails.
