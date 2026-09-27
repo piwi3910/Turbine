@@ -557,6 +557,7 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
     let slow = [
         "serving_mix",
         "forward_profile",
+        "moe_prefill_timings",
         "host_step_costs",
         "decode_forward_timing",
         "decode_op_timings",
@@ -575,6 +576,7 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "host_staging_does_not_wait_for_the_stream",
         "prefill_shapes_match_cpu",
         "moe_decode_tier_timings",
+        "decode_attention_timings",
     ];
 
     let text = dry_run(

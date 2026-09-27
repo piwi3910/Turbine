@@ -72,6 +72,8 @@ SLOW_TESTS=(
 	prefill_shapes_match_cpu
 	# crates/turbine-kernels/tests/hip_batch_invariance.rs
 	moe_decode_tier_timings
+	# crates/turbine-kernels/tests/hip_ops.rs (Pre-Phase-5 #3)
+	decode_attention_timings
 )
 
 DRY_RUN=0
