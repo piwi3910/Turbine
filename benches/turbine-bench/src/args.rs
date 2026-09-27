@@ -22,6 +22,63 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Which load to generate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Profile {
+    /// Independent requests at fixed concurrency.
+    Default,
+    /// Sessions of turns over a growing history (P4 S-16).
+    #[value(name = "multi-turn")]
+    MultiTurn,
+}
+
+/// `--think-time <min>..<max>`: seconds between the turns of a session, uniform in the range.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThinkTime {
+    min: f64,
+    max: f64,
+}
+
+impl ThinkTime {
+    /// `(min, max)` in seconds.
+    pub fn bounds(self) -> (f64, f64) {
+        (self.min, self.max)
+    }
+
+    /// `x-turbine-session-resume-within`: the maximum think time rounded up, within 1..=86400.
+    pub fn resume_within_secs(self) -> u32 {
+        self.max.ceil().clamp(1.0, 86_400.0) as u32
+    }
+}
+
+impl std::str::FromStr for ThinkTime {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (min, max) = s
+            .split_once("..")
+            .ok_or_else(|| format!("expected <min>..<max> seconds, got {s:?}"))?;
+        let parse = |v: &str| {
+            v.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|x| x.is_finite() && *x >= 0.0)
+                .ok_or_else(|| format!("{v:?} is not a non-negative number of seconds"))
+        };
+        let (min, max) = (parse(min)?, parse(max)?);
+        if min > max {
+            return Err(format!("the minimum {min} exceeds the maximum {max}"));
+        }
+        Ok(ThinkTime { min, max })
+    }
+}
+
+impl std::fmt::Display for ThinkTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}..{}", self.min, self.max)
+    }
+}
+
 /// `turbine-bench` flags (contract §19).
 #[derive(Clone, Debug, Parser)]
 #[command(
@@ -71,6 +128,24 @@ pub struct BenchArgs {
     /// Poll <url>/turbine/v1/pressure once per second into this JSON-lines file.
     #[arg(long)]
     pub pressure_timeline: Option<PathBuf>,
+    /// `multi-turn`: sessions of `--turns` requests over a growing history (P4).
+    #[arg(long, value_enum, default_value_t = Profile::Default)]
+    pub profile: Profile,
+    /// Multi-turn: sessions to run (at most `--concurrency` at once).
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..))]
+    pub sessions: u32,
+    /// Multi-turn: requests per session.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..))]
+    pub turns: u32,
+    /// Multi-turn: words of the prefix every session shares (the system message).
+    #[arg(long, default_value_t = 512)]
+    pub shared_prefix_words: u32,
+    /// Multi-turn: seconds between turns, `<min>..<max>` (default: back to back).
+    #[arg(long, default_value = "0..0")]
+    pub think_time: ThinkTime,
+    /// Multi-turn: send `prompt_cache_key` and the `x-turbine-session-*` headers.
+    #[arg(long)]
+    pub session_hints: bool,
 }
 
 /// `<integer><unit>` with unit `ms`, `s`, `m` or `h`, no space, case-sensitive, > 0 — parsed
