@@ -699,3 +699,13 @@ A kernel trace (rocprofv3) of the same test at 64 expert slots gives down 457 µ
 - B) Land per-projection constants anyway (no measured gain)
 
 **Chosen (2026-09-27): provisional (agent) — A.** The remaining OLMoE decode headroom is the weight-bandwidth ceiling both projections share (~550 of ~640 GB/s), not the down projection's tuning.
+
+## Pre-Phase-5 #1 follow-up: prefix reuse must stay bit-exact for Llama
+
+Found 2026-09-27: `kv_gpu prefix_reuse_matches_cold` passes at 92da19b and fails from 39916b3 (#1, option c). Llama's speed-tuned GEMMs round differently by m, so a warm request (prefill of the uncached suffix only) diverges from the cold one (whole-prompt prefill) at a near-tie. That breaks Phase 4's "outputs identical to a cold run".
+
+- A) Invariant Llama prefill: keep Llama's decode-sized buckets speed-tuned, and pin Llama's prefill-sized buckets to one batch-invariant algorithm group, so a suffix prefill gives the same rows as the cold prefill; also cover short suffixes that fall into decode-sized buckets (recommended)
+- B) Relax the check to the golden tolerance (identical tokens with the near-tie excuse), as for batch composition; amends the Phase 4 spec
+- C) Full Llama invariance (option b of #1): ~+25 % Llama TTFT, most of the +7.7 % gone
+
+**Answer (2026-09-27): A — invariant Llama prefill.** The prefix-reuse check stays bit-exact.
