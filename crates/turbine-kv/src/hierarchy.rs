@@ -1773,7 +1773,7 @@ pub(crate) mod tests {
         let bb = fmt16().layout.block_bytes();
         let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc));
         let mut r = rig_with(policy, 8, Some(l1.clone()), None, clock);
-        let prompt: Vec<u32> = (0..65).collect();
+        let prompt: Vec<u32> = (0..66).collect();
 
         let a = run(&mut r, &prompt);
         assert_eq!(a.cached_tokens, 0);
@@ -1838,7 +1838,7 @@ pub(crate) mod tests {
         let bb = fmt16().layout.block_bytes();
         let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc));
         let mut r = rig(8, Some(l1), None, clock);
-        let prompt: Vec<u32> = (0..65).collect();
+        let prompt: Vec<u32> = (0..66).collect();
         run(&mut r, &prompt);
         let handle = r.h.reclaimer();
         assert_eq!(handle.demote(0.0), 0, "nothing published yet");
@@ -1870,7 +1870,7 @@ pub(crate) mod tests {
         let mut r = rig(16, Some(l1.clone()), None, clock);
 
         // A one-off prompt: four cached blocks, none worth a copy.
-        let one_off: Vec<u32> = (0..65).collect();
+        let one_off: Vec<u32> = (0..66).collect();
         run(&mut r, &one_off);
         assert_eq!(r.pool.cached_unreferenced(), 4);
         assert_eq!(r.h.demote_to(&mut r.pool, 0.0, EvictReason::Capacity), 0);
@@ -1885,7 +1885,7 @@ pub(crate) mod tests {
             resume_within_secs: None,
             end: false,
         };
-        let session_prompt: Vec<u32> = (1000..1065).collect();
+        let session_prompt: Vec<u32> = (1000..1066).collect();
         let id = RequestId::new_v4();
         let req = AttachRequest {
             request: id,

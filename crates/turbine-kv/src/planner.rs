@@ -151,12 +151,24 @@ pub fn plan_cost(inp: &PlanInputs<'_>, k: usize) -> f64 {
     retrieve + f64::from(recompute_tokens) / inp.prefill_tps.max(1.0)
 }
 
-/// Chooses the cutoff minimising [`plan_cost`]. At least one prompt token is always recomputed
-/// (so the first output token has logits); blocks at or behind a degraded tier are never
+/// Prompt tokens a reuse plan always leaves to prefill. One would give the first output token its
+/// logits; two keep the warm prefill a prefill-shaped step (more than one query row), so it runs
+/// the same attention and GEMM paths as the cold whole-prompt prefill and reproduces its bits: a
+/// one-token step is indistinguishable from a decode step and runs decode attention and the
+/// decode GEMM rows (decision 2026-09-27, "Pre-Phase-5 #1 follow-up"). It costs one block of
+/// reuse for prompts one token past a block boundary.
+pub const MIN_RECOMPUTE_TOKENS: u32 = 2;
+
+/// The most leading blocks a plan may reuse: [`MIN_RECOMPUTE_TOKENS`] stay to prefill.
+pub fn reuse_cap(prompt_tokens: u32, block_tokens: u32) -> usize {
+    (prompt_tokens.saturating_sub(MIN_RECOMPUTE_TOKENS) / block_tokens.max(1)) as usize
+}
+
+/// Chooses the cutoff minimising [`plan_cost`]. At least [`MIN_RECOMPUTE_TOKENS`] prompt tokens
+/// are always recomputed; blocks at or behind a degraded tier are never
 /// retrieved; at L0 RED or above only the leading L0 blocks are reused (no promotion into L0).
 pub fn plan_prefix(inp: &PlanInputs<'_>) -> KvPlan {
-    let bt = inp.block_tokens.max(1) as usize;
-    let cap = ((inp.prompt_tokens as usize).saturating_sub(1) / bt).min(inp.matched.len());
+    let cap = reuse_cap(inp.prompt_tokens, inp.block_tokens).min(inp.matched.len());
     let matched = &inp.matched[..cap];
     if matched.is_empty() {
         return inp.plan(0, PlanReason::NoMatch);
@@ -221,10 +233,14 @@ mod tests {
     fn cutoff_minimises_cost() {
         use TierId::{L0, L1, L2};
         let l1 = vec![L1; 1000];
-        let p = plan_prefix(&inputs(&l1, 16_001));
+        let p = plan_prefix(&inputs(&l1, 16_002));
         assert_eq!(p.reason, PlanReason::RetrieveCheaper);
         assert_eq!((p.reuse_l0, p.promote.as_slice()), (0, &[(L1, 1000)][..]));
-        assert_eq!(p.recompute_tokens, 1);
+        assert_eq!(p.recompute_tokens, 2);
+        // One token past the last block: that block is recomputed too, so the warm prefill is
+        // never a one-row (decode-shaped) step.
+        let p = plan_prefix(&inputs(&l1, 16_001));
+        assert_eq!((p.cutoff_blocks(), p.recompute_tokens), (999, 17));
 
         let l2 = vec![L2; 4];
         let p = plan_prefix(&inputs(&l2, 65));
@@ -286,7 +302,7 @@ mod tests {
                 bandwidth_bps: 1e8 + (next(&mut seed) % 50) as f64 * 1e8,
             });
             let plan = plan_prefix(&inp);
-            let brute = (0..=n)
+            let brute = (0..=reuse_cap(prompt, 16).min(n))
                 .map(|k| plan_cost(&inp, k))
                 .fold(f64::INFINITY, f64::min);
             let chosen = plan_cost(&inp, plan.cutoff_blocks() as usize);

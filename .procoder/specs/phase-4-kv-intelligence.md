@@ -206,7 +206,7 @@ turbine-bench kv-sim --workload <multi-turn|shared-system|mixed> --policy <cost_
 
 ## Edge cases
 
-- Prompt exactly a multiple of block size and fully cached (the last block is recomputed so at least one token is prefilled); prompt shorter than one block (no sharing).
+- Prompt exactly a multiple of block size and fully cached (the last block is recomputed so at least one token is prefilled; amended 2026-09-27, decision "Pre-Phase-5 #1 follow-up": at least two tokens, so a warm prefill is never a one-row, decode-shaped step that runs decode attention and decode GEMMs and leaves the cold run's bits — a prompt one token past a block boundary recomputes that block); prompt shorter than one block (no sharing).
 - Two requests with the same new prefix arriving together: the second waits on the first's in-progress blocks (registered as pending in the directory) instead of computing them twice, bounded by a 2 s wait after which it computes its own.
 - Hash collision or corrupted directory entry: token ids mismatch → treated as miss, counted, logged.
 - Same prompt text under a different chat template, sampling seed or model revision: different tokens or different namespace → no sharing (sampling parameters do not affect KV and do not enter the key).
