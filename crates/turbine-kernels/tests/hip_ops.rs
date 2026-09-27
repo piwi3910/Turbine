@@ -1610,7 +1610,8 @@ fn nucleus_boundary_distance(row: &[f32], temperature: f32, top_p: f32, u: f32) 
 
 /// One `logits_reduce` comparison: `rows` rows of `vocab` logits (row stride `vocab + 5`),
 /// seeded normal values with planted ties, NaN and −∞ entries, an all-NaN and an all-−∞ row,
-/// every fifth row quantized to steps of 0.25 (long runs of tied values), mixed modes,
+/// every fifth row quantized to steps of 0.25 (long runs of tied values), every seventh flat
+/// (one value but the planted ones: the top bucket holds the whole row), mixed modes,
 /// temperatures and `top_p` (1, 0.9, 0.5, 0.2, 0.95: nuclei inside the planted ties, inside
 /// the sorted candidates and far past them).
 fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n: usize) {
@@ -1626,6 +1627,11 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
                     for v in row.iter_mut() {
                         *v = (*v * 4.0).round() / 4.0;
                     }
+                }
+                // A flat row: every key in round 0's top bucket, far more than the kernel
+                // gathers into shared memory (its radix-round path).
+                if r % 7 == 3 {
+                    row.fill(2.5);
                 }
                 // Ties at the top (a value repeated at spread-out ids), a NaN and a −∞.
                 let peak = 14.0 + (r % 3) as f32;
@@ -1778,6 +1784,8 @@ fn logits_reduce_matches_cpu() {
     for vocab in [50_304, VOCAB] {
         logits_reduce_case(&p, &mut rng, 64, vocab, 64);
         logits_reduce_case(&p, &mut rng, 7, vocab, 5);
+        // One candidate (the served default without logprobs): the argmax shortcut.
+        logits_reduce_case(&p, &mut rng, 16, vocab, 1);
     }
 
     // Timing at the Llama decode shape: 16 rows reduced to top-20 and a draw, versus copying

@@ -667,3 +667,18 @@ Batch invariance (coordinator requirement, 2026-09-27, after the OLMoE c16 flip 
 Options put to the user: (a) keep the invariant table with the TTFT guard; (b) pin Llama's decode-fast invariant classes and accept ~+25 % Llama TTFT for ~−7 % decode step; (c) require invariance only for the OLMoE shapes and pin Llama for speed (the pre-invariance table measured −5 % Llama decode forward).
 
 **Answer (2026-09-27, user): (c).** OLMoE shapes stay pinned batch-invariant (the c16 flip fix); Llama shapes are pinned purely for speed (fastest solution per bucket, split-K allowed, no invariance; Llama down and k/v included). Invariance is per shape, set per model in `kernels/rocm/tuning/gemm_shapes.txt` (`invariant` | `speed`) and recorded per table row (mode column), not a global switch; the library runs `invariant` rows with split-K off and `speed` rows through `hipblasLtMatmul`. The `gemm_table_fallback` reason codes are unchanged. The 5 % prefill guard applies to `invariant` shapes only (a `speed` bucket never pins anything slower than the heuristic).
+
+## Pre-Phase-5 #4: parallel `logits_reduce` — library evaluation (kernel reuse rule)
+
+Measured on the R9700 (novanas GPU 0, 16 rows × 128,256 F32 logits, 50 calls each, scratch program; `logits_reduce` today: 342 µs id-order draw at T 1, 318 µs nucleus at T 0.6 / top_p 0.9 over peaked rows, 620 µs over broad rows):
+
+- rocPRIM 4.5 `segmented_reduce` max: 13.6 µs; f64 sum of an `expf` transform: 39.3 µs; hipCUB `DeviceSegmentedReduce::ArgMax`: 17.3 µs. Fit for the max, argmax and lse sum, not for top-n, the id-order draw or the nucleus.
+- rocPRIM `topk` / `topk_pairs` (AIR radix top-k): no segmented form (one call per row: 1,020 µs for 16 rows at k = 64), and the radix algorithm refuses `Ordered` and `Deterministic` (static assertions), so ties at the threshold are not the lowest ids and repeated calls may differ: fails the exact top-n contract.
+- rocPRIM `segmented_radix_sort_pairs_desc` (the nucleus order by sorting): 847 µs.
+- Composable Kernel: `topk_softmax` is MoE routing (few experts), `ops/topk` a block-level streaming argmax; neither covers a 128k-wide row, a draw or a nucleus.
+
+- A) Keep the Turbine kernel and make it faster with the same outputs: argmax shortcut for one candidate, one gather sweep plus a shared-memory sort instead of radix rounds 1–3 and the collection, integer nucleus weights without f64, the id-order mass shared with the lse sum at T = 1 and skipped for nucleus rows (chosen)
+- B) Compose rocPRIM/hipCUB passes (max, argmax, lse sum) with the Turbine kernel for the rest: saves one sweep at most, adds launches and temporary storage, and top-n/draw/nucleus stay ours
+- C) rocPRIM top-k and sort for top-n and the nucleus: slower (≥ 850 µs) and not exact
+
+**Chosen (2026-09-27): provisional (agent, under the coordinator's brief) — A.** Outputs are bit-identical to the previous kernel (same top ids, lse and draws on the timing harness and in `hip_ops logits_reduce_matches_cpu`, which gains a top_n = 1 case and flat rows that exercise the radix-round path). The remaining time is dominated by the f64 lse sum (one f64 add per element; RDNA4's f64 rate); replacing it with exact integer masses changes lse and draws at the ~1e-9 level and is a separate step.

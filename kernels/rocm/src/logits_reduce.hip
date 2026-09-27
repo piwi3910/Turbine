@@ -13,10 +13,17 @@
 //   2. sum exp(v - M) for the lse and, in mode 1, sum exp(v / T - M / T) per
 //      wave (f32 exp, f64 sums), the argmax (smallest id holding M) and the
 //      first radix-select histogram;
-//   3. radix select of the top_n-th largest key, 8 bits per round (at most 3
-//      more sweeps), on 32-bit keys ordered like the logits (NaN lowest);
+//   3. radix select of the top_n-th largest key on 32-bit keys ordered like
+//      the logits (NaN lowest): round 0's histogram (of the top 8 bits) comes
+//      from sweep 2; when the keys at or above round 0's digit number at most
+//      kCandCap (the usual case), one sweep gathers them into shared memory and
+//      a bitonic sort there yields the top_n exactly (steps 3-4 in one sweep);
+//      otherwise 8 bits per round (at most 3 more sweeps), then
 //   4. the collection of the top_n candidates (ties at the threshold by id),
-//      sorted by (key descending, id ascending) in shared memory;
+//      sorted by (key descending, id ascending) in shared memory. A single
+//      candidate (top_n 1, no nucleus) of a row whose maximum is finite and
+//      non-zero is the argmax of step 2 (the smallest id holding the maximum:
+//      the same id as the key order's), with no further sweep;
 //   5. in mode 1, the draw: the wave whose cumulative sum passes u * total,
 //      then a scan of that wave's range in id order;
 //   6. in mode 1 with top_p < 1, the nucleus draw instead (below).
@@ -69,6 +76,9 @@ constexpr int kMaxTopN = 64;
 // Candidates a nucleus row selects and sorts in step 4: a nucleus inside them
 // is drawn from shared memory, a larger one by the mass searches.
 constexpr int kNucleusFast = kMaxTopN;
+// Keys step 3 gathers into shared memory (aliasing the per-wave histograms,
+// kWaves * 256 * 4 bytes) instead of running radix rounds 1-3.
+constexpr int kCandCap = kWaves * 256 * 4 / 8;
 
 // A 32-bit key whose unsigned order is the order of the float (IEEE total
 // order: -0 below +0), with every NaN mapped to 0, below everything else.
@@ -130,8 +140,8 @@ __device__ inline int64_t min64(int64_t a, int64_t b) { return a < b ? a : b; }
 // Adds the active lanes' bins to the wave's own histogram: one add per
 // distinct bin (logits share few exponents, so a step has few distinct top
 // bytes), by the lowest lane holding it; no other wave writes `hist`.
-__device__ inline void wave_count(unsigned int *hist, uint32_t bin,
-                                  bool active, int lane) {
+__device__ inline void wave_count(unsigned int *hist, uint32_t bin, bool active,
+                                  int lane) {
   unsigned long long pending = __ballot(active);
   while (pending != 0ull) {
     const int leader = __ffsll(static_cast<long long>(pending)) - 1;
@@ -162,14 +172,29 @@ __device__ inline float scaled_weight(float v, float inv_t, float big_t) {
   return expf(__fsub_rn(__fmul_rn(v, inv_t), big_t));
 }
 
+// w * 2^s truncated, for a finite w in [0, 1] and s < 64: the exact
+// product (a float times a power of two) truncated toward zero, computed on
+// the bits (equal to static_cast<unsigned long long>(double(w) * 2^s), without
+// f64 arithmetic).
+__device__ inline unsigned long long scale_trunc(float w, int s) {
+  const uint32_t bits = __float_as_uint(w) & 0x7fffffffu;
+  const int e = static_cast<int>(bits >> 23);
+  const unsigned long long m =
+      e == 0 ? (bits & 0x7fffffu) : ((bits & 0x7fffffu) | 0x800000u);
+  // w = m * 2^(max(e, 1) - 150).
+  const int shift = (e == 0 ? 1 : e) - 150 + s;
+  if (shift >= 0)
+    return m << shift;
+  return shift <= -64 ? 0ull : m >> (-shift);
+}
+
 // The integer nucleus weight of a raw logit: scaled_weight (<= 1, NaN 0)
 // times 2^S, truncated.
 __device__ inline unsigned long long qweight(float v, float inv_t, float big_t,
-                                             double scale) {
+                                             int scale_bits) {
   if (isnan(v))
     return 0ull;
-  const float w = scaled_weight(v, inv_t, big_t);
-  return static_cast<unsigned long long>(static_cast<double>(w) * scale);
+  return scale_trunc(scaled_weight(v, inv_t, big_t), scale_bits);
 }
 
 // Smallest integer mass >= top_p * total (the cut: cum >= top_p * total).
@@ -210,7 +235,7 @@ struct NucleusShared {
 __device__ void mass_histogram(const float *row, int64_t begin, int64_t end,
                                int tid, int lane, uint32_t prefix,
                                uint32_t mask, int shift, float inv_t,
-                               float big_t, double scale,
+                               float big_t, int scale_bits,
                                unsigned long long *hist) {
   if (tid < 256)
     hist[tid] = 0ull;
@@ -219,7 +244,7 @@ __device__ void mass_histogram(const float *row, int64_t begin, int64_t end,
     const float v = row[j];
     const uint32_t key = order_key(v);
     if ((key & mask) == prefix) {
-      const unsigned long long q = qweight(v, inv_t, big_t, scale);
+      const unsigned long long q = qweight(v, inv_t, big_t, scale_bits);
       if (q != 0ull)
         atomicAdd(&hist[(key >> shift) & 0xffu], q);
     }
@@ -233,7 +258,7 @@ __device__ void mass_histogram(const float *row, int64_t begin, int64_t end,
 // block calls it; `fallback` answers if rounding ever left no such id.
 __device__ void mass_search(const float *row, int64_t begin, int64_t end,
                             int tid, int wave, int lane, float inv_t,
-                            float big_t, double scale,
+                            float big_t, int scale_bits,
                             unsigned long long target, int fallback,
                             NucleusShared &sh) {
   if (tid == 0) {
@@ -248,7 +273,7 @@ __device__ void mass_search(const float *row, int64_t begin, int64_t end,
     const unsigned long long *h = sh.mass0;
     if (round > 0) {
       mass_histogram(row, begin, end, tid, lane, sh.prefix, sh.mask, shift,
-                     inv_t, big_t, scale, sh.mass);
+                     inv_t, big_t, scale_bits, sh.mass);
       h = sh.mass;
     }
     if (tid == 0) {
@@ -272,7 +297,7 @@ __device__ void mass_search(const float *row, int64_t begin, int64_t end,
   const uint32_t key = sh.prefix;
   if (tid == 0) {
     const unsigned long long q =
-        qweight(key_value(key), inv_t, big_t, scale);
+        qweight(key_value(key), inv_t, big_t, scale_bits);
     const unsigned long long rest = sh.target - sh.above;
     sh.tie_q = q;
     sh.need = q == 0ull ? 1 : static_cast<int>((rest + q - 1ull) / q);
@@ -376,13 +401,19 @@ __global__ void __launch_bounds__(kThreads)
   const float tp = draw && top_p != nullptr ? top_p[r] : 1.0f;
   const bool nucleus = draw_ok && tp < 1.0f;
   // Integer weight scale 2^S with vocab * 2^S < 2^64 (S = 46 at 128,256).
-  const int vocab_bits =
-      64 - __clzll(static_cast<unsigned long long>(vocab));
-  const double qscale = ldexp(1.0, 63 - vocab_bits);
+  const int vocab_bits = 64 - __clzll(static_cast<unsigned long long>(vocab));
+  const int qbits = 63 - vocab_bits;
 
   // ---- 2. sums, argmax, last positive weight, first histogram ----
   double sum = 0.0;
   double sum_t = 0.0;
+  const bool unit_t = inv_t == 1.0f && big_t == big;
+  // Round 0's histogram, unless step 3 needs no radix select (the argmax
+  // shortcut below, or no candidates at all).
+  const int64_t k_hist = nucleus ? kNucleusFast : top_n;
+  const bool need_hist =
+      min64(k_hist, vocab) > 1 ||
+      (min64(k_hist, vocab) == 1 && !(isfinite(big) && big != 0.0f));
   unsigned long long qsum = 0ull;
   int arg = INT_MAX;
   int last = -1;
@@ -390,7 +421,8 @@ __global__ void __launch_bounds__(kThreads)
     const int64_t j = base + lane;
     const bool in = j < end;
     const float v = in ? row[j] : 0.0f;
-    wave_count(hist, order_key(v) >> 24, in, lane);
+    if (need_hist)
+      wave_count(hist, order_key(v) >> 24, in, lane);
     if (in && !isnan(v)) {
       if (isfinite(big))
         sum += static_cast<double>(expf(v - big));
@@ -398,17 +430,20 @@ __global__ void __launch_bounds__(kThreads)
         arg = min(arg, static_cast<int>(j));
       if (draw_ok) {
         const float w = scaled_weight(v, inv_t, big_t);
-        sum_t += static_cast<double>(w);
+        // The id-order draw's mass: at T = 1 every weight equals the lse term
+        // (v * 1 is exact), so the lse sum serves (below); a nucleus row draws
+        // by integer masses and never reads it.
+        if (!nucleus && !unit_t)
+          sum_t += static_cast<double>(w);
         if (nucleus)
-          qsum += static_cast<unsigned long long>(static_cast<double>(w) *
-                                                  qscale);
+          qsum += scale_trunc(w, qbits);
         if (w > 0.0f)
           last = static_cast<int>(j);
       }
     }
   }
   sum = wave_sum(sum);
-  sum_t = wave_sum(sum_t);
+  sum_t = unit_t ? sum : wave_sum(sum_t);
   arg = wave_min(arg);
   last = wave_max_int(last);
   if (lane == 0) {
@@ -435,13 +470,25 @@ __global__ void __launch_bounds__(kThreads)
   // ---- 3. radix select of the top_n-th largest key ----
   const int k = static_cast<int>(min64(top_n, vocab));
   // A nucleus row selects kNucleusFast candidates (it returns top_n of them).
-  const int k_sel =
-      nucleus ? static_cast<int>(min64(kNucleusFast, vocab)) : k;
+  const int k_sel = nucleus ? static_cast<int>(min64(kNucleusFast, vocab)) : k;
+  __shared__ bool s_gather;
+  __shared__ bool s_selected;
+  __shared__ int s_ncand;
+  // A single candidate is the argmax: the smallest id holding the maximum.
+  // (Not at a zero maximum: -0 and +0 compare equal but order as keys.)
+  const bool argmax_only = k_sel == 1 && isfinite(big) && big != 0.0f;
   if (tid == 0) {
     s_prefix = 0u;
     s_mask = 0u;
     s_rem = k_sel;
-    s_done = k_sel == 0;
+    s_done = k_sel == 0 || argmax_only;
+    s_gather = false;
+    s_selected = argmax_only;
+    if (argmax_only) {
+      const int a = s_argmax[0];
+      s_sel[0] = candidate(order_key(row[a]), static_cast<int32_t>(a));
+      s_count = 1;
+    }
   }
   __syncthreads();
   for (int round = 0; round < 4; ++round) {
@@ -479,12 +526,68 @@ __global__ void __launch_bounds__(kThreads)
         }
         above += c;
       }
+      // Round 0: every key at or above the digit fits in shared memory
+      // (above keys taken outright plus the digit's): gather and sort them.
+      const int ncand = above + static_cast<int>(s_hist[digit]);
       rem -= above;
       s_prefix |= static_cast<uint32_t>(digit) << shift;
       s_mask |= 0xffu << shift;
       // Every key with this prefix is taken: no tie to break.
       s_done = static_cast<int>(s_hist[digit]) == rem;
       s_rem = rem;
+      if (round == 0 && !s_done && ncand <= kCandCap) {
+        s_gather = true;
+        s_ncand = ncand;
+        s_done = true;
+      }
+    }
+    __syncthreads();
+  }
+  if (s_gather) {
+    // ---- 3-4 in one sweep: gather every key >= the round-0 prefix ----
+    unsigned long long *cand =
+        reinterpret_cast<unsigned long long *>(s_wave_hist);
+    const uint32_t floor_key = s_prefix;
+    if (tid == 0)
+      s_count = 0;
+    __syncthreads();
+    for (int64_t j = begin + lane; j < end; j += kWave) {
+      const uint32_t key = order_key(row[j]);
+      if (key >= floor_key) {
+        const int slot = atomicAdd(&s_count, 1);
+        cand[slot] = candidate(key, static_cast<int32_t>(j));
+      }
+    }
+    __syncthreads();
+    const int n = s_count;
+    int size = kMaxTopN;
+    while (size < n)
+      size <<= 1;
+    for (int i = n + tid; i < size; i += kThreads)
+      cand[i] = 0ull;
+    __syncthreads();
+    // Bitonic sort, descending: (key descending, id ascending).
+    for (int width = 2; width <= size; width <<= 1) {
+      for (int stride = width / 2; stride > 0; stride >>= 1) {
+        for (int i = tid; i < size; i += kThreads) {
+          const int other = i ^ stride;
+          if (other > i) {
+            const bool descending = (i & width) == 0;
+            const unsigned long long a = cand[i], b = cand[other];
+            if ((a < b) == descending) {
+              cand[i] = b;
+              cand[other] = a;
+            }
+          }
+        }
+        __syncthreads();
+      }
+    }
+    if (tid < k_sel)
+      s_sel[tid] = cand[tid];
+    if (tid == 0) {
+      s_count = k_sel;
+      s_selected = true;
     }
     __syncthreads();
   }
@@ -494,7 +597,8 @@ __global__ void __launch_bounds__(kThreads)
   const int rem = s_rem;
   const bool take_all_ties = s_done;
   int ties = 0;
-  if (k_sel > 0) {
+  const bool selected = s_selected;
+  if (k_sel > 0 && !selected) {
     for (int64_t j = begin + lane; j < end; j += kWave) {
       const uint32_t key = order_key(row[j]);
       const uint32_t masked = key & mask;
@@ -506,7 +610,7 @@ __global__ void __launch_bounds__(kThreads)
       }
     }
   }
-  if (!take_all_ties) {
+  if (!take_all_ties && !selected) {
     // Ties at the threshold (the full key): the rem lowest ids, in id order.
     for (int o = kWave / 2; o > 0; o >>= 1)
       ties += __shfl_xor(ties, o, kWave);
@@ -556,7 +660,7 @@ __global__ void __launch_bounds__(kThreads)
       top_values[r * top_n + tid] = v;
     }
     if (nucleus)
-      s_sel_q[tid] = qweight(v, inv_t, big_t, qscale);
+      s_sel_q[tid] = qweight(v, inv_t, big_t, qbits);
   }
 
   // ---- 5. the categorical draw ----
@@ -609,12 +713,12 @@ __global__ void __launch_bounds__(kThreads)
     if (!s_fast) {
       // The nucleus reaches past the sorted candidates: the mass searches.
       mass_histogram(row, begin, end, tid, lane, 0u, 0u, 24, inv_t, big_t,
-                     qscale, s_nuc.mass0);
+                     qbits, s_nuc.mass0);
       const int fallback = s_argmax[0];
-      mass_search(row, begin, end, tid, wave, lane, inv_t, big_t, qscale,
+      mass_search(row, begin, end, tid, wave, lane, inv_t, big_t, qbits,
                   cut_target(tp, s_qtotal), fallback, s_nuc);
       const unsigned long long kept = s_nuc.found_mass;
-      mass_search(row, begin, end, tid, wave, lane, inv_t, big_t, qscale,
+      mass_search(row, begin, end, tid, wave, lane, inv_t, big_t, qbits,
                   draw_target(u, kept), fallback, s_nuc);
       if (tid == 0)
         s_drawn = s_nuc.found;
@@ -732,12 +836,11 @@ int32_t turbine_logits_reduce(turbine_ctx *ctx,
   }
   if (int32_t rc = enter(ctx); rc != TURBINE_OK)
     return rc;
-  hipLaunchKernelGGL(logits_reduce_kernel,
-                     dim3(static_cast<unsigned>(d->rows)), dim3(kThreads), 0,
-                     ctx->stream, d->logits, d->vocab, d->stride_row,
-                     d->temperature, d->uniform, d->mode, d->top_n, d->top_ids,
-                     d->top_values, d->lse, d->sampled, d->sampled_logit,
-                     d->top_p);
+  hipLaunchKernelGGL(logits_reduce_kernel, dim3(static_cast<unsigned>(d->rows)),
+                     dim3(kThreads), 0, ctx->stream, d->logits, d->vocab,
+                     d->stride_row, d->temperature, d->uniform, d->mode,
+                     d->top_n, d->top_ids, d->top_values, d->lse, d->sampled,
+                     d->sampled_logit, d->top_p);
   return check_hip(ctx, hipGetLastError(), "logits_reduce kernel launch");
 }
 
