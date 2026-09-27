@@ -611,3 +611,13 @@ Profile: branch `perf-profile` 5db197c, `.procoder/perf-profile-2026-09-27.md`. 
 - #2 Grouped MoE prefill kernel as a registered implementation: OLMoE TTFT −25–30 %
 
 **Answer (2026-09-27): all four**, landed one at a time in the order #1, #4, #5, #3, #2, each with `lab-bench --golden16` on both models before the next (bounds as in the Phase 2m chain). Phase 5 waits for the user.
+
+## Kernel reuse policy (2026-09-27)
+
+The user asked why we are writing our own kernels when the spec says Turbine reuses existing kernels (vLLM, SGLang and others). State then: GEMM on hipBLASLt, attention and RMSNorm on Composable Kernel. Own HIP kernels: the MoE grouped and small-m tiers (plus the WMMA decode kernels of the OLMoE flip fix), `logits_reduce`, elementwise ops and the fallback paged attention. Reason: vLLM's and SGLang's fast AMD kernels (AITER, CK fused MoE) target CDNA (gfx942/gfx950); on RDNA4 (gfx1201) vLLM falls back to Triton, which JIT-compiles through Python.
+
+- A) Reuse first, own last: before writing any kernel, evaluate CK, vLLM/SGLang kernels and llama.cpp's HIP kernels on gfx1201 as registered implementations; write our own only if none works or all are clearly slower, and record the evaluation (recommended)
+- B) As A, plus vLLM Triton kernels compiled ahead of time to HSACO (Triton/Python in the build only), loaded through the shim
+- C) Own kernels are fine where the profile points
+
+**Answer (2026-09-27): A — reuse first, own last.** No Python in the build (B not taken). Applies to perf items #2 (MoE prefill: CK `ck_tile` fused MoE, vLLM/SGLang kernels, llama.cpp `mul_mat_id`) and #3 (decode attention: CK split-KV / paged decode FMHA, llama.cpp flash attention) before any own kernel, and to every new kernel gap. The existing own kernels (MoE tiers, `logits_reduce`, elementwise, fallback paged attention) get the same evaluation when their area is next touched.
