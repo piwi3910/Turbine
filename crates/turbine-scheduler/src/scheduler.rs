@@ -181,15 +181,6 @@ impl IterationPlan {
             .sum()
     }
 
-    /// Context tokens the decode items attend over (their context lengths after the step).
-    pub fn decode_context_tokens(&self) -> u64 {
-        self.items
-            .iter()
-            .filter(|i| i.kind == BatchKind::Decode)
-            .map(|i| u64::from(i.block_table.tokens))
-            .sum()
-    }
-
     pub fn decode_tokens(&self) -> u32 {
         self.items
             .iter()

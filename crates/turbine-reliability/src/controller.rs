@@ -36,9 +36,8 @@ pub struct EngineStats {
     pub block_tokens: u32,
     /// Observed per-sequence decode rate (tokens/s).
     pub decode_tokens_per_s: f64,
-    /// Windowed p95 decode step time relative to the work-cost model's prediction
-    /// ([`crate::step_window::DecodeStepWindow`]); `None` until the model is ready.
-    pub step_time_p95: Option<f64>,
+    /// Windowed p95 decode step time per sequence (seconds).
+    pub step_time_p95_s: Option<f64>,
     pub queue_len: u32,
     pub iterations: u64,
 }
@@ -189,12 +188,12 @@ impl PressureController {
         // Drift describes the decoding that is happening: while nothing runs the window only
         // holds finished work, and its last value would latch a level through the hysteresis.
         let decoding = !stats.running_remaining_tokens.is_empty();
-        let drift = match (stats.step_time_p95, self.baseline_step_s) {
+        let drift = match (stats.step_time_p95_s, self.baseline_step_s) {
             (Some(p95), Some(base)) if base > 0.0 && decoding => Some(p95 / base),
             _ => None,
         };
         // Baseline only from GREEN + HEALTHY iterations (P3 edge case "baseline learned under pressure").
-        if let Some(p95) = stats.step_time_p95
+        if let Some(p95) = stats.step_time_p95_s
             && decoding
             && self.machine.state() == PressureState::Green
             && self.circuit.state() == CircuitState::Healthy
@@ -641,7 +640,7 @@ mod tests {
             running_remaining_tokens: vec![100; 4],
             block_tokens: 16,
             free_kv_blocks: 1000,
-            step_time_p95: Some(p95),
+            step_time_p95_s: Some(p95),
             ..EngineStats::default()
         };
         let mut run = |secs: u64, stats: &EngineStats| {
