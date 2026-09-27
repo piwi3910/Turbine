@@ -348,6 +348,17 @@ fn request_kv_blocks(r: &SchedRequest, block_tokens: u32) -> u64 {
     one + extra_choices * (one - shared.min(one))
 }
 
+/// The blocks a request's worst-case KV reservation covers: `request_kv_blocks` minus the full
+/// blocks of its attached cached prefix (P4 S-3: `cached_prefix_tokens` feeds the estimate), which
+/// other requests' reservations already paid for or which were cached unreferenced.
+fn reserved_kv_blocks(r: &SchedRequest, block_tokens: u32) -> u64 {
+    let cached = r
+        .cached_prefix
+        .as_ref()
+        .map_or(0, |a| a.blocks.len() as u64);
+    request_kv_blocks(r, block_tokens).saturating_sub(cached)
+}
+
 /// The Phase 2 continuous-batching scheduler. Single-threaded: owned by the engine thread.
 pub struct Scheduler {
     params: SchedulerParams,
@@ -372,6 +383,9 @@ pub struct Scheduler {
     gate: Option<AdmissionGate>,
     /// Requests that left the gate's queue on `cancel`, reported by the next plan.
     gate_dropped: Vec<(RequestId, CancelReason)>,
+    /// Phase 4: attached prefix blocks of requests that left the admission queue without a
+    /// pool at hand (`cancel`); released at the next `plan`.
+    prefix_release: Vec<SmallVec<[BlockId; 16]>>,
     /// Admitted requests (running + waiting with a reservation) after the previous plan: the
     /// reference for batch growth with a gate.
     prev_admitted: usize,
@@ -398,6 +412,7 @@ impl Scheduler {
             last: LastIteration::default(),
             gate: None,
             gate_dropped: Vec::new(),
+            prefix_release: Vec::new(),
             prev_admitted: 0,
         }
     }
@@ -470,9 +485,9 @@ impl Scheduler {
             self.enqueue(r, None, submit_no);
             return Ok(());
         };
-        // The reservation covers every choice's KV at completion.
+        // The reservation covers every choice's KV at completion, less the attached prefix.
         r.estimate.projected_kv_blocks =
-            u32::try_from(request_kv_blocks(&r, block_tokens)).unwrap_or(u32::MAX);
+            u32::try_from(reserved_kv_blocks(&r, block_tokens)).unwrap_or(u32::MAX);
         let id = r.id;
         // An immediate admission takes an admitted slot: within `max_running_requests` and the
         // throttle plan's batch growth over the previous plan's admitted count, like the pump.
@@ -492,7 +507,7 @@ impl Scheduler {
         });
         match gate.offer(r, key, submit_no, slot_free) {
             Ok(GateOutcome::Admitted(r, reservation)) => {
-                self.enqueue(r, Some(reservation), submit_no);
+                self.enqueue(*r, Some(reservation), submit_no);
                 Ok(())
             }
             Ok(GateOutcome::Queued) => {
@@ -521,7 +536,7 @@ impl Scheduler {
         let reservation = match self.gate.as_ref() {
             Some(gate) => {
                 r.estimate.projected_kv_blocks =
-                    u32::try_from(request_kv_blocks(&r, block_tokens)).unwrap_or(u32::MAX);
+                    u32::try_from(reserved_kv_blocks(&r, block_tokens)).unwrap_or(u32::MAX);
                 let res = gate
                     .reserve_direct(&r.estimate)
                     .map_err(|_| SubmitError::Rejected {
@@ -626,10 +641,13 @@ impl Scheduler {
         if let Some(e) = self.requests.get_mut(&id) {
             e.cancel.get_or_insert(reason);
         } else if let Some(gate) = self.gate.as_mut()
-            && gate.remove(id).is_some()
+            && let Some(r) = gate.remove(id)
         {
             // Still in the admission queue: it never took a reservation.
             self.gate_dropped.push((id, reason));
+            if let Some(a) = r.cached_prefix {
+                self.prefix_release.push(a.blocks);
+            }
         }
     }
 
@@ -795,7 +813,7 @@ impl Scheduler {
         // SURVIVAL, option A: admitted requests that have not started give their KV
         // reservations back and wait in the admission queue again.
         if limits.requeue_unstarted {
-            self.requeue_unstarted(&mut plan);
+            self.requeue_unstarted(pool, &mut plan);
         }
 
         // (2) Every decodable sequence decodes; preempt until the pool covers them.
@@ -1027,7 +1045,7 @@ impl Scheduler {
     // ---- rules -------------------------------------------------------------------------
 
     fn drop_cancelled(&mut self, pool: &mut BlockPool, now: Duration, plan: &mut IterationPlan) {
-        self.drop_gated(plan);
+        self.drop_gated(pool, plan);
         let candidates: Vec<RequestId> = self
             .running
             .iter()
@@ -1079,7 +1097,7 @@ impl Scheduler {
     /// admission gate's queue at its original turn and drops its reservation, so the running
     /// requests drain the pool; when the queue is full it is answered `overloaded`. Requests
     /// that started (running, or preempted with KV to recompute) keep theirs.
-    fn requeue_unstarted(&mut self, plan: &mut IterationPlan) {
+    fn requeue_unstarted(&mut self, pool: &mut BlockPool, plan: &mut IterationPlan) {
         let Some(gate) = self.gate.as_mut() else {
             return;
         };
@@ -1104,13 +1122,17 @@ impl Scheduler {
                 gate.admission_mut().expensive_prefill_finished();
             }
             let ReqEntry {
-                req,
+                mut req,
                 submit_no,
                 reservation,
                 ..
             } = entry;
-            // The worst-case KV reservation goes back to the pool now.
+            // The worst-case KV reservation goes back to the pool now, and so do the blocks of
+            // an attached prefix (P4): the request recomputes it, like after a preemption.
             drop(reservation);
+            if let Some(a) = req.cached_prefix.take() {
+                pool.release(&a.blocks);
+            }
             let key = self.policy.admission_key(&AdmissionInfo {
                 priority: req.priority,
                 arrival: req.arrival,
@@ -1136,28 +1158,38 @@ impl Scheduler {
     }
 
     /// Requests leaving the gate's queue: cancelled while queued, timed out, or rejected
-    /// because the circuit opened. None of them holds a reservation or a block.
-    fn drop_gated(&mut self, plan: &mut IterationPlan) {
+    /// because the circuit opened. None of them holds a reservation; the blocks of an attached
+    /// prefix (P4) are released here.
+    fn drop_gated(&mut self, pool: &mut BlockPool, plan: &mut IterationPlan) {
+        for blocks in std::mem::take(&mut self.prefix_release) {
+            pool.release(&blocks);
+        }
         let Some(gate) = self.gate.as_mut() else {
             return;
         };
         let mut gone: Vec<(RequestId, CancelReason)> = std::mem::take(&mut self.gate_dropped);
-        gone.extend(
-            gate.take_cancelled()
-                .into_iter()
-                .map(|r| (r.id, CancelReason::ClientDisconnect)),
-        );
-        gone.extend(
+        let mut left: Vec<(SchedRequest, CancelReason)> = gate
+            .take_cancelled()
+            .into_iter()
+            .map(|r| (r, CancelReason::ClientDisconnect))
+            .collect();
+        left.extend(
             gate.expire()
                 .into_iter()
-                .map(|r| (r.id, CancelReason::QueueTimeout)),
+                .map(|r| (r, CancelReason::QueueTimeout)),
         );
         if gate.controller().circuit().blocks_readiness() {
-            gone.extend(
+            left.extend(
                 gate.reject_all()
                     .into_iter()
-                    .map(|r| (r.id, CancelReason::CircuitOpen)),
+                    .map(|r| (r, CancelReason::CircuitOpen)),
             );
+        }
+        for (r, reason) in left {
+            if let Some(a) = &r.cached_prefix {
+                pool.release(&a.blocks);
+            }
+            gone.push((r.id, reason));
         }
         for (id, reason) in gone {
             plan.dropped.push((id, reason));
@@ -1188,7 +1220,7 @@ impl Scheduler {
     ) {
         let bt = self.params.block_tokens;
         // Preempt until the pool covers every decode (never, without allow_preempt).
-        while limits.allow_preempt && self.decode_blocks_needed() > pool.free_blocks() {
+        while limits.allow_preempt && self.decode_blocks_needed() > pool.available_blocks() {
             let Some(victim) = self.worst_running(|_| true) else {
                 break;
             };
@@ -1266,7 +1298,7 @@ impl Scheduler {
                         self.worst_running(|v| v.0 != id && !in_plan.contains(&v.0) && v.1 > rank)
                     {
                         self.preempt(pool, victim, plan, preempted_now);
-                        if pool.free_blocks() > 0 {
+                        if pool.available_blocks() > 0 {
                             break;
                         }
                     }
@@ -1334,9 +1366,9 @@ impl Scheduler {
         }
         let need = e.table.blocks_needed(len, bt);
         // With a gate every request's KV is reserved: prefills never preempt (P3 §Throttle).
-        if need > pool.free_blocks() && may_preempt && self.gate.is_none() {
+        if need > pool.available_blocks() && may_preempt && self.gate.is_none() {
             let rank = self.rank(id);
-            while need > pool.free_blocks() {
+            while need > pool.available_blocks() {
                 let Some(victim) =
                     self.worst_running(|v| v.0 != id && !in_plan.contains(&v.0) && v.1 > rank)
                 else {
@@ -1375,6 +1407,9 @@ impl Scheduler {
         let Some(target) = first else {
             return false;
         };
+        // A cached prefix is attached, not prefilled: the first chunk starts after it.
+        let cached = r.req.cached_prefix.as_ref().map_or(0, |a| a.cached_tokens);
+        let target = target.saturating_sub(cached);
         let len = target.min(chunk_cap).min(budget);
         if len == 0 || (self.whole_prefill_required(target) && len < target) {
             return false;
@@ -1385,7 +1420,7 @@ impl Scheduler {
         } else {
             (f64::from(pool.total_blocks()) * self.params.free_watermark).ceil() as u32
         };
-        pool.free_blocks() >= blocks_for_tokens(len, self.params.block_tokens) + watermark
+        pool.available_blocks() >= blocks_for_tokens(len, self.params.block_tokens) + watermark
     }
 
     fn admit(&mut self, id: RequestId, now: Duration) {
@@ -1404,6 +1439,10 @@ impl Scheduler {
         let shared_done = r.shared_prefill_done;
         let prompt = r.req.prompt_len;
         let seqs = r.req.seqs.clone();
+        // The first admission hands the attached prefix to the first sequence: its table
+        // starts with the shared blocks and prefill starts at `cached_tokens`, so no shared
+        // block is ever written. A preempted request recomputes from scratch.
+        let mut prefix = r.req.cached_prefix.take();
         for (i, seq) in seqs.iter().enumerate() {
             let e = self.seqs.get_mut(seq).expect("sequence tracked");
             if e.state != RequestState::Waiting {
@@ -1412,7 +1451,19 @@ impl Scheduler {
             e.set_state(RequestState::Prefilling, *seq);
             e.awaiting_fork = i > 0 && !shared_done;
             e.target = prompt + e.generated;
+            if i == 0
+                && let Some(a) = prefix.take()
+            {
+                e.table = BlockTable {
+                    blocks: a.blocks,
+                    tokens: a.cached_tokens,
+                };
+            }
         }
+        debug_assert!(
+            prefix.is_none(),
+            "an attached prefix outlived its admission"
+        );
     }
 
     fn preempt(
@@ -1523,6 +1574,9 @@ impl Scheduler {
             && let Some(g) = self.gate.as_mut()
         {
             g.admission_mut().expensive_prefill_finished();
+        }
+        if let Some(a) = &r.req.cached_prefix {
+            pool.release(&a.blocks);
         }
         for seq in &r.req.seqs {
             if let Some(mut e) = self.seqs.remove(seq) {

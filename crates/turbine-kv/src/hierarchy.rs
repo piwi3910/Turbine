@@ -327,7 +327,8 @@ impl KvHierarchy {
             cfg.block_tokens, format.layout.block_tokens,
             "HierarchyConfig.block_tokens must equal the KV layout's block_tokens"
         );
-        let l1 = l1.filter(|t| t.enabled());
+        // L1 exists only on discrete-VRAM devices (S-5): on unified memory L0 demotes to L2.
+        let l1 = l1.filter(|t| t.enabled() && cfg.memory_kind != MemoryKind::Unified);
         let l2 = l2.filter(|t| t.enabled());
         let blocks_of = |t: &Option<Arc<dyn KvTier>>| {
             t.as_ref().map_or(0, |t| {
@@ -427,6 +428,11 @@ impl KvHierarchy {
         self.clock.now_mono()
     }
 
+    /// A copy of `key` into L0 (promotion or prefetch) is queued or in flight.
+    fn incoming(&self, key: &KvKey) -> bool {
+        self.transfer.is_busy_with(key) && !self.demoting.contains_key(key)
+    }
+
     fn lookup_slot(tier: TierId) -> usize {
         match tier {
             TierId::L0 => 0,
@@ -472,7 +478,13 @@ impl KvHierarchy {
                 ..PrefixMatch::default()
             }
         };
-        if m.pending.is_some() {
+        // Wait while another request computes the next block, or while a matched block is
+        // already on its way into L0 (a second promotion would duplicate its L0 copy).
+        if m.pending.is_some()
+            || m.blocks
+                .iter()
+                .any(|b| b.tier != TierId::L0 && self.incoming(&b.key))
+        {
             return AttachOutcome::WaitForPrefix;
         }
         if let Some(r) = self.requests.get_mut(&req.request) {

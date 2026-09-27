@@ -7,6 +7,7 @@ use serde::Serialize;
 use smallvec::SmallVec;
 use turbine_core::request::{CancelFlag, ResourceEstimate};
 use turbine_core::types::{Priority, RequestId, SeqId};
+use turbine_kv::hierarchy::PrefixAttach;
 
 /// Lifecycle state of a sequence (and of a request, aggregated over its sequences).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize)]
@@ -141,6 +142,10 @@ pub struct SchedRequest {
     pub cancel: CancelFlag,
     /// Has a `response_format` or tool grammar (counted in the scheduler snapshot).
     pub constrained: bool,
+    /// Phase 4: the cached prefix `KvHierarchy::attach_prefix` attached. The request owns one
+    /// reference to each block until admission hands them to its first sequence's table, or
+    /// until it is dropped.
+    pub cached_prefix: Option<PrefixAttach>,
 }
 
 impl SchedRequest {
@@ -163,6 +168,7 @@ impl SchedRequest {
             arrival: Duration::ZERO,
             cancel: CancelFlag::default(),
             constrained: false,
+            cached_prefix: None,
         }
     }
 }
