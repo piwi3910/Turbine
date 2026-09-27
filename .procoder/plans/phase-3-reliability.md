@@ -417,6 +417,26 @@ Depends on: Task 12c; decision "Phase 3: soak config max_batch_tokens" (answer: 
 - [ ] Run: `scripts/bench-lock.sh scripts/overload-soak.sh novanas` — expect exit 0 and `"pass": true`.
 - [ ] Commit: `fix(reliability): latency drift feeds the circuit only in GREEN`
 
+## Task 12e: Per-shape drift baselines (amendment 2026-09-27)
+
+Files: `crates/turbine-reliability/src/{step_window.rs, controller.rs}`, `crates/turbine-scheduler/src/{scheduler.rs, sim/overload.rs}`, `crates/turbine-server/src/engine/loop.rs`
+Interfaces:
+
+- `pub struct step_window::StepSample { prefill_tokens: u32, rows: u32, context_tokens: u64, secs: f64 }`; `DecodeStepWindow::observe(&mut self, StepSample, calm: bool)`, `reset()`, `p95()` (ratio over the bucket baseline); `pub const MIN_BUCKET_SAMPLES: u32 = 8`
+- `EngineStats.step_time_p95` (was `step_time_p95_s`, seconds): the ratio; the controller keeps no baseline of its own. `pub fn IterationPlan::decode_context_tokens(&self) -> u64`
+- PROBING → HEALTHY resets the window (the engine on its next snapshot, the simulator on the probe's circuit transition)
+
+Covers: S-6 (`step_time_drift`), S-12; `step_window::tests::moe_full_batch_is_not_drift`, `same_bucket_slowdown_is_drift`, `unseen_shapes_and_prefills_are_not_judged`, `context_buckets`.
+Depends on: Tasks 12c, 12d; decision "Phase 3: per-shape drift baselines (OLMoE landing regression)" (provisional).
+
+- [ ] Write failing tests: an MoE-like step (time grows with rows) at a full batch of 16 reads 1.0 after a calm ramp over 1..16 rows; the same shape at twice the time reads 2.0; a shape without 8 calm steps, an unseen shape and a prefill are not judged.
+- [ ] Run: `cargo test -p turbine-reliability step_window` — expect FAIL.
+- [ ] Implement the buckets (exact rows × `floor(2 · log2(context/1024 + 1))`), an EWMA baseline per bucket (α 0.1) from calm steps, the ratio judged before the update; the controller's drift is the window's p95 while decoding.
+- [ ] Run: `cargo test --workspace`, `overload_sim -- --include-ignored` (sweep unchanged); mutation check: one bucket for every shape fails the MoE, unseen-shape and bucket tests.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus the `fault-injection` feature)
+- [ ] Run: `scripts/lab-bench.sh --gpu 1 --model olmoe` (≥ 599 tok/s, no `step_time_drift` transition in `metrics.txt`) and `--model llama`; then `scripts/bench-lock.sh scripts/overload-soak.sh novanas`.
+- [ ] Commit: `fix(reliability): drift baselines per step shape`
+
 ## Task 13: Pressure route, readiness, admission errors and metrics in turbine-api
 
 Files: `crates/turbine-api/src/routes/diagnostics.rs` (pressure route 200, status fields), `crates/turbine-api/src/routes/health.rs` (`circuit_open` readiness), `crates/turbine-api/src/error.rs` (overload `ApiError` constructors, `Retry-After`), `crates/turbine-api/src/backend.rs` (`NotReadyReason::CircuitOpen`, `readiness_for_circuit`), `crates/turbine-api/Cargo.toml` (dev-deps `turbine-reliability`, `turbine-device`), `crates/turbine-api/tests/api.rs` (four tests)

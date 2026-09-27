@@ -36,8 +36,9 @@ pub struct EngineStats {
     pub block_tokens: u32,
     /// Observed per-sequence decode rate (tokens/s).
     pub decode_tokens_per_s: f64,
-    /// Windowed p95 decode step time per sequence (seconds).
-    pub step_time_p95_s: Option<f64>,
+    /// Windowed p95 of decode step time over its shape bucket's calm baseline
+    /// ([`crate::step_window::DecodeStepWindow`]): about 1 on a healthy device.
+    pub step_time_p95: Option<f64>,
     pub queue_len: u32,
     pub iterations: u64,
 }
@@ -101,7 +102,6 @@ pub struct PressureController {
     reclaimer: Arc<dyn KvReclaimer>,
     plan: ThrottlePlan,
     last_oom: Option<Duration>,
-    baseline_step_s: Option<f64>,
     last_signals: Vec<SignalValue>,
     last_horizon: f64,
     handle: ControllerHandle,
@@ -161,7 +161,6 @@ impl PressureController {
             reclaimer,
             plan,
             last_oom: None,
-            baseline_step_s: None,
             last_signals: Vec::new(),
             last_horizon: f64::INFINITY,
             handle: ControllerHandle {
@@ -188,18 +187,9 @@ impl PressureController {
         // Drift describes the decoding that is happening: while nothing runs the window only
         // holds finished work, and its last value would latch a level through the hysteresis.
         let decoding = !stats.running_remaining_tokens.is_empty();
-        let drift = match (stats.step_time_p95_s, self.baseline_step_s) {
-            (Some(p95), Some(base)) if base > 0.0 && decoding => Some(p95 / base),
-            _ => None,
-        };
-        // Baseline only from GREEN + HEALTHY iterations (P3 edge case "baseline learned under pressure").
-        if let Some(p95) = stats.step_time_p95_s
-            && decoding
-            && self.machine.state() == PressureState::Green
-            && self.circuit.state() == CircuitState::Healthy
-        {
-            self.baseline_step_s = Some(self.baseline_step_s.map_or(p95, |b| 0.9 * b + 0.1 * p95));
-        }
+        // The engine's window judges each step against the calm baseline of its own shape
+        // (learned only in GREEN + HEALTHY, P3 edge case "baseline learned under pressure").
+        let drift = stats.step_time_p95.filter(|_| decoding);
         let dwell = self.cfg.pressure.deescalate_dwell.0;
         let kv = self.ledger.usage(self.budget.device, PoolKind::Kv);
         let reserve = self.ledger.usage(self.budget.device, PoolKind::Reserve);
@@ -319,19 +309,14 @@ impl PressureController {
     /// Any other circuit input (iterations, device errors, probe results, controller failure).
     pub fn on_circuit_event(&mut self, ev: CircuitEvent) -> Option<CircuitTransition> {
         let t = self.circuit.on_event(ev, self.clock.now_mono());
-        if t.is_some_and(|t| CircuitBreaker::baseline_reset_due(&t)) {
-            self.baseline_step_s = None;
-        }
         self.publish();
         t
     }
 
     fn circuit_event(&mut self, ev: CircuitEvent, now: Duration) {
-        if let Some(t) = self.circuit.on_event(ev, now)
-            && CircuitBreaker::baseline_reset_due(&t)
-        {
-            self.baseline_step_s = None;
-        }
+        // PROBING → HEALTHY resets the drift baselines; they live in the engine's
+        // `DecodeStepWindow`, which sees the transition in the next snapshot.
+        self.circuit.on_event(ev, now);
     }
 
     fn apply_plan(&mut self) {
@@ -645,7 +630,7 @@ mod tests {
             running_remaining_tokens: vec![100; 4],
             block_tokens: 16,
             free_kv_blocks: 1000,
-            step_time_p95_s: Some(p95),
+            step_time_p95: Some(p95),
             ..EngineStats::default()
         };
         let mut run = |secs: u64, stats: &EngineStats| {
@@ -654,13 +639,13 @@ mod tests {
                 c.tick(&sample(0.1, 0.0), stats);
             }
         };
-        run(5, &busy(0.02));
+        run(5, &busy(1.0));
         assert_eq!(h.state(), PressureState::Green);
-        run(2, &busy(0.039));
+        run(2, &busy(1.95));
         assert_eq!(h.state(), PressureState::Yellow, "1.95 × baseline is drift");
         let idle = EngineStats {
             running_remaining_tokens: Vec::new(),
-            ..busy(0.039)
+            ..busy(1.95)
         };
         run(15, &idle);
         assert_eq!(h.state(), PressureState::Green);
@@ -683,7 +668,7 @@ mod tests {
             running_remaining_tokens: vec![100; 23],
             block_tokens: 16,
             free_kv_blocks: 1000,
-            step_time_p95_s: Some(p95),
+            step_time_p95: Some(p95),
             ..EngineStats::default()
         };
         let run = |c: &mut PressureController, clock: &FakeClock, secs: u64, kv: f64, p95: f64| {
@@ -695,22 +680,22 @@ mod tests {
         };
         // Pressure ORANGE from KV, then a 2.5× drift spike: the circuit stays HEALTHY.
         let (mut c, h, clock) = controller(true);
-        run(&mut c, &clock, 5, 0.1, 0.02);
-        run(&mut c, &clock, 2, 0.85, 0.02);
+        run(&mut c, &clock, 5, 0.1, 1.0);
+        run(&mut c, &clock, 2, 0.85, 1.0);
         assert_eq!(h.state(), PressureState::Orange);
-        run(&mut c, &clock, 3, 0.85, 0.05);
+        run(&mut c, &clock, 3, 0.85, 2.5);
         assert_eq!(h.circuit(), CircuitState::Healthy, "drift under pressure");
         // Even 5× (past `latency_drift_open`) under pressure does not open it.
-        run(&mut c, &clock, 3, 0.85, 0.1);
+        run(&mut c, &clock, 3, 0.85, 5.0);
         assert_eq!(h.circuit(), CircuitState::Healthy);
 
         // The same 2.5× spike in GREEN degrades the circuit.
         let (mut c, h, clock) = controller(true);
-        run(&mut c, &clock, 5, 0.1, 0.02);
+        run(&mut c, &clock, 5, 0.1, 1.0);
         assert_eq!(h.state(), PressureState::Green);
         clock.advance(Duration::from_millis(100));
         c.on_circuit_event(CircuitEvent::Iteration);
-        c.tick(&sample(0.1, 0.0), &stats(0.05));
+        c.tick(&sample(0.1, 0.0), &stats(2.5));
         assert_eq!(h.circuit(), CircuitState::Degraded, "drift in GREEN");
     }
 
