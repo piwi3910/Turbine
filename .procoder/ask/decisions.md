@@ -684,3 +684,18 @@ Measured on the R9700 (novanas GPU 0, 16 rows × 128,256 F32 logits, 50 calls ea
 **Chosen (2026-09-27): provisional (agent, under the coordinator's brief) — A.** Outputs are bit-identical to the previous kernel (same top ids, lse and draws on the timing harness and in `hip_ops logits_reduce_matches_cpu`, which gains a top_n = 1 case and flat rows that exercise the radix-round path). The remaining time is dominated by the f64 lse sum (one f64 add per element; RDNA4's f64 rate); replacing it with exact integer masses changes lse and draws at the ~1e-9 level and is a separate step.
 
 Second step (2026-09-27, same provisional answer): the lse and id-order draw masses become integers (each f32 `expf` weight times 2^S truncated, the scheme the nucleus already used), so no per-element f64 arithmetic remains and no sum depends on an order; the id-order draw's final scan is split over all 32 waves; round 0 of the radix select counts the 8 top-byte bins below the maximum in registers instead of a per-wave shared histogram (a full histogram sweep only when the threshold lies below them). The lse moves by at most vocab · 2^-S (< 2e-9) of the row's mass; draws still equal the host's except within that of a CDF boundary (`logits_reduce_matches_cpu`: lse |Δ| 0, every draw identical). 16 × 128,256 rows: id-order draw 342 → 68 µs, nucleus over peaked rows 318 → 110 µs, over broad rows (mass searches) 620 → 333 µs.
+
+## Pre-Phase-5 #5: retune OLMoE's small-m down projection — measured, no change
+
+The profile's #5 (down projection at ~540 GB/s against gate/up's ~600 GB/s) measured the scalar small-m kernels. The small-m tier now runs the WMMA decode kernels (0652a00), so the sweep ran on those. The down projection's waves per block and k slices per load batch were made independent of gate/up; both only change how the work is spread, not any output's ascending-k WMMA chain, so batch invariance and the grouped tier's numerics are untouched. Results from `hip_batch_invariance moe_decode_tier_timings` on GPU 0 (OLMoE, uniform routing), µs per `moe_experts` call at 1 / 4 / 8 / 16 / 32 / 64 tokens:
+
+- k slices 4, waves 1 / 2 / 4 / 8: 278–281 / 735–740 / 1,034–1,035 / 1,218–1,221 / 1,474–1,480 / 1,496–1,505
+- k slices 8 (today's value), waves 1 / 2 / 4 / 8: 267–270 / 709–713 / 1,002–1,005 / 1,185–1,189 / 1,436–1,440 / 1,456–1,461
+- k slices 16, waves 1 / 2 / 4 / 8: 273–280 / 734–740 / 1,044–1,046 / 1,239–1,255 / 1,475–1,487 / 1,491–1,502
+
+A kernel trace (rocprofv3) of the same test at 64 expert slots gives down 457 µs against gate/up 949 µs for twice the bytes: the down projection already streams its weights as fast as gate/up.
+
+- A) No change: today's shared setting (8 k slices, 4 waves) is already the best for down, within 0.5 % of every waves value (chosen)
+- B) Land per-projection constants anyway (no measured gain)
+
+**Chosen (2026-09-27): provisional (agent) — A.** The remaining OLMoE decode headroom is the weight-bandwidth ceiling both projections share (~550 of ~640 GB/s), not the down projection's tuning.
