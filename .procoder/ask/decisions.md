@@ -600,3 +600,14 @@ The coordinator's bench of the Phase 4 tip (fbc9e1e) on GPU 0 showed an 8 % Llam
 - C) Change the cost-aware reuse term (e.g. count only branching prefixes): it only helps `cost_aware`, and it changes every policy test and the kv-sim margins
 
 **Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** `turbine_kv::hierarchy::{has_reuse_evidence, CAPACITY_BATCH}` and `turbine_server::kv_orchestrator::HOUSEKEEPING_INTERVAL`. Host profile (release, 372-block L0 holding 360 one-off cached blocks): the old full L0 victims scan cost 103 µs per call and the reclaim-order refresh 115 µs, both every turn and more with L1 in the directory. The gated capacity scan costs 22 µs per call and runs at most every 50 ms. Test `hierarchy::tests::capacity_demotion_needs_reuse_evidence` covers a one-off block (not copied by capacity), a session block (copied), a re-used block (copied) and pressure (ungated). Tests that force demotion and expect copies give their blocks evidence: a second run in the simulator, `hierarchy`, `api` and engine-loop tests, and session keys for A and the fillers in `kv_gpu`.
+
+## Pre-Phase-5 perf items (from the 2026-09-27 profile)
+
+Profile: branch `perf-profile` 5db197c, `.procoder/perf-profile-2026-09-27.md`. Options (multi-select):
+
+- #1 Per-card GEMM algorithm table (pin the best hipBLASLt algorithm per shape; `execution.gemm_autotune` is read by nothing today): ~+7 % Llama, ~+2 % OLMoE (recommended first: changes every GEMM's rounding)
+- #4 + #5: parallel `logits_reduce` (+1.4 % Llama); OLMoE small-m down-projection retune (~+2 % OLMoE, sweep first)
+- #3 GQA split-context decode attention as a registered kernel implementation: ~+4 % Llama, more at long context
+- #2 Grouped MoE prefill kernel as a registered implementation: OLMoE TTFT −25–30 %
+
+**Answer (2026-09-27): all four**, landed one at a time in the order #1, #4, #5, #3, #2, each with `lab-bench --golden16` on both models before the next (bounds as in the Phase 2m chain). Phase 5 waits for the user.
