@@ -10,34 +10,43 @@
 // row is swept a few times (it stays in L2 / Infinity Cache after the first):
 //
 //   1. the maximum M (NaN ignored);
-//   2. sum exp(v - M) for the lse and, in mode 1, sum exp(v / T - M / T) per
-//      wave (f32 exp, f64 sums), the argmax (smallest id holding M) and the
-//      first radix-select histogram;
+//   2. the integer masses (below) of exp(v - M) for the lse and, in mode 1,
+//      of exp(v / T - M / T) for the draw, the argmax (smallest id holding M)
+//      and per-lane counts of the kWin top-byte bins below M's (round 0 of
+//      the radix select; a full histogram sweep only when the threshold lies
+//      below them);
 //   3. radix select of the top_n-th largest key on 32-bit keys ordered like
-//      the logits (NaN lowest): round 0's histogram (of the top 8 bits) comes
-//      from sweep 2; when the keys at or above round 0's digit number at most
-//      kCandCap (the usual case), one sweep gathers them into shared memory and
-//      a bitonic sort there yields the top_n exactly (steps 3-4 in one sweep);
-//      otherwise 8 bits per round (at most 3 more sweeps), then
+//      the logits (NaN lowest): round 0 (the top 8 bits) comes from step 2's
+//      window counts, or a histogram sweep; when the keys at or above round 0's
+//      digit number at most kCandCap (the usual case), one sweep gathers them
+//      into shared memory and a bitonic sort there yields the top_n exactly
+//      (steps 3-4 in one sweep); otherwise 8 bits per round (at most 3 more
+//      sweeps), then
 //   4. the collection of the top_n candidates (ties at the threshold by id),
 //      sorted by (key descending, id ascending) in shared memory. A single
 //      candidate (top_n 1, no nucleus) of a row whose maximum is finite and
 //      non-zero is the argmax of step 2 (the smallest id holding the maximum:
 //      the same id as the key order's), with no further sweep;
-//   5. in mode 1, the draw: the wave whose cumulative sum passes u * total,
-//      then a scan of that wave's range in id order;
+//   5. in mode 1, the draw: the wave whose cumulative mass reaches the
+//      target (the smallest integer mass above u * total), then every wave
+//      sums a slice of that wave's range and the slice holding the target is
+//      scanned in id order;
 //   6. in mode 1 with top_p < 1, the nucleus draw instead (below).
 //
-// The cpu reference sums f64 exponentials sequentially; here each exponential
-// is an f32 expf and the sums are f64 in a fixed tree order, so the lse agrees
-// to ~1e-7 relative and the draw differs only where u lies within that
-// rounding of a CDF boundary.
+// Masses: each weight (<= 1: the maximum's is exactly 1) is an integer, the
+// f32 expf weight times 2^S truncated, with S chosen so vocab * 2^S < 2^64
+// (S = 46 at 128,256). Integer sums are exact in any order, so no result
+// depends on a summation order or on how the waves split the row, and no f64
+// arithmetic runs per element (slow on RDNA4). The cpu reference sums f64
+// exponentials sequentially; the truncation moves a row's mass by at most
+// vocab * 2^-S (< 2e-9) of its total, so the lse agrees to ~1e-7 relative (the
+// f32 expf) and the draw differs only where u lies within that rounding of a
+// CDF boundary.
 //
 // Nucleus (top_p < 1): the host sampler walks every id in descending order
 // (ties by id), cuts the shortest prefix holding top_p of the mass and draws u
-// times the prefix's mass along it. Here each weight is an integer, the f32
-// expf weight (<= 1) times 2^S truncated, with S chosen so vocab * 2^S < 2^64:
-// integer sums are exact in any order, so the cut and the draw are found by
+// times the prefix's mass along it. With the integer masses above the cut and
+// the draw are found by
 // two searches for "the first id, in descending order, whose inclusive prefix
 // mass reaches a target" and never depend on a summation order. A row selects
 // kNucleusFast (64) sorted candidates in step 4; when their prefix already
@@ -76,6 +85,9 @@ constexpr int kMaxTopN = 64;
 // Candidates a nucleus row selects and sorts in step 4: a nucleus inside them
 // is drawn from shared memory, a larger one by the mass searches.
 constexpr int kNucleusFast = kMaxTopN;
+// Top-byte bins below the maximum's that step 2 counts per lane for round
+// 0 of step 3 (each bin spans two binary exponents).
+constexpr int kWin = 8;
 // Keys step 3 gathers into shared memory (aliasing the per-wave histograms,
 // kWaves * 256 * 4 bytes) instead of running radix rounds 1-3.
 constexpr int kCandCap = kWaves * 256 * 4 / 8;
@@ -102,9 +114,20 @@ __device__ inline float wave_max(float v) {
   return v;
 }
 
-__device__ inline double wave_sum(double v) {
+__device__ inline unsigned long long wave_sum_u64(unsigned long long v) {
   for (int o = kWave / 2; o > 0; o >>= 1)
     v += __shfl_xor(v, o, kWave);
+  return v;
+}
+
+// Inclusive prefix sum of integer masses over the wave's lanes in lane order.
+__device__ inline unsigned long long wave_scan_u64(unsigned long long v,
+                                                   int lane) {
+  for (int o = 1; o < kWave; o <<= 1) {
+    const unsigned long long up = __shfl_up(v, o, kWave);
+    if (lane >= o)
+      v += up;
+  }
   return v;
 }
 
@@ -117,16 +140,6 @@ __device__ inline int wave_min(int v) {
 __device__ inline int wave_max_int(int v) {
   for (int o = kWave / 2; o > 0; o >>= 1)
     v = max(v, __shfl_xor(v, o, kWave));
-  return v;
-}
-
-// Inclusive prefix sum over the wave's lanes in lane order.
-__device__ inline double wave_scan(double v, int lane) {
-  for (int o = 1; o < kWave; o <<= 1) {
-    const double up = __shfl_up(v, o, kWave);
-    if (lane >= o)
-      v += up;
-  }
   return v;
 }
 
@@ -343,8 +356,9 @@ __global__ void __launch_bounds__(kThreads)
                          float *top_values, float *lse_out, int32_t *sampled,
                          float *sampled_logit, const float *top_p) {
   __shared__ float s_max[kWaves];
-  __shared__ double s_sum[kWaves];
-  __shared__ double s_sum_t[kWaves];
+  // Per wave: the integer lse mass and the integer draw mass.
+  __shared__ unsigned long long s_sum[kWaves];
+  __shared__ unsigned long long s_sum_t[kWaves];
   __shared__ int s_argmax[kWaves];
   __shared__ int s_last[kWaves];
   __shared__ int s_ties[kWaves];
@@ -405,66 +419,88 @@ __global__ void __launch_bounds__(kThreads)
   const int qbits = 63 - vocab_bits;
 
   // ---- 2. sums, argmax, last positive weight, first histogram ----
-  double sum = 0.0;
-  double sum_t = 0.0;
+  unsigned long long sum = 0ull;
+  unsigned long long sum_t = 0ull;
   const bool unit_t = inv_t == 1.0f && big_t == big;
-  // Round 0's histogram, unless step 3 needs no radix select (the argmax
-  // shortcut below, or no candidates at all).
+  // Round 0 of step 3 (unless it needs no radix select: the argmax shortcut
+  // below, or no candidates): per-lane counts of the kWin top-byte bins from
+  // the maximum's down, in registers. When the candidates' threshold lies in
+  // them, round 0 needs no histogram; otherwise it sweeps the row.
   const int64_t k_hist = nucleus ? kNucleusFast : top_n;
   const bool need_hist =
       min64(k_hist, vocab) > 1 ||
       (min64(k_hist, vocab) == 1 && !(isfinite(big) && big != 0.0f));
-  unsigned long long qsum = 0ull;
+  const bool use_window = need_hist && isfinite(big);
+  const uint32_t win_top = order_key(big) >> 24;
+  unsigned int win[kWin];
+#pragma unroll
+  for (int i = 0; i < kWin; ++i)
+    win[i] = 0u;
   int arg = INT_MAX;
   int last = -1;
   for (int64_t base = begin; base < end; base += kWave) {
     const int64_t j = base + lane;
     const bool in = j < end;
     const float v = in ? row[j] : 0.0f;
-    if (need_hist)
-      wave_count(hist, order_key(v) >> 24, in, lane);
+    if (use_window && in) {
+      const uint32_t bin = win_top - (order_key(v) >> 24);
+#pragma unroll
+      for (int i = 0; i < kWin; ++i)
+        win[i] += bin == static_cast<uint32_t>(i) ? 1u : 0u;
+    }
     if (in && !isnan(v)) {
       if (isfinite(big))
-        sum += static_cast<double>(expf(v - big));
+        sum += scale_trunc(expf(v - big), qbits);
       if (v == big && big > -INFINITY)
         arg = min(arg, static_cast<int>(j));
       if (draw_ok) {
         const float w = scaled_weight(v, inv_t, big_t);
-        // The id-order draw's mass: at T = 1 every weight equals the lse term
-        // (v * 1 is exact), so the lse sum serves (below); a nucleus row draws
-        // by integer masses and never reads it.
-        if (!nucleus && !unit_t)
-          sum_t += static_cast<double>(w);
-        if (nucleus)
-          qsum += scale_trunc(w, qbits);
+        // The draw's mass (id order and nucleus alike): at T = 1 every
+        // weight equals the lse term (v * 1 is exact), so the lse sum serves.
+        if (!unit_t)
+          sum_t += scale_trunc(w, qbits);
         if (w > 0.0f)
           last = static_cast<int>(j);
       }
     }
   }
-  sum = wave_sum(sum);
-  sum_t = unit_t ? sum : wave_sum(sum_t);
+  sum = wave_sum_u64(sum);
+  sum_t = unit_t ? sum : wave_sum_u64(sum_t);
   arg = wave_min(arg);
   last = wave_max_int(last);
+  __shared__ unsigned int s_win[kWaves * kWin];
+  if (use_window) {
+#pragma unroll
+    for (int i = 0; i < kWin; ++i) {
+      const int c = wave_sum_int(static_cast<int>(win[i]));
+      if (lane == 0)
+        s_win[wave * kWin + i] = static_cast<unsigned int>(c);
+    }
+  }
   if (lane == 0) {
     s_sum[wave] = sum;
     s_sum_t[wave] = sum_t;
     s_argmax[wave] = arg;
     s_last[wave] = last;
   }
-  if (nucleus && qsum != 0ull)
-    atomicAdd(&s_qtotal, qsum);
   __syncthreads();
 
   if (tid == 0) {
-    double total = 0.0;
+    unsigned long long total = 0ull, mass = 0ull;
     int a = INT_MAX;
     for (int w = 0; w < kWaves; ++w) {
       total += s_sum[w];
+      mass += s_sum_t[w];
       a = min(a, s_argmax[w]);
     }
-    lse_out[r] = isfinite(big) ? big + static_cast<float>(log(total)) : big;
+    // total / 2^S, exact to vocab * 2^-S (< 2e-9 at 128,256) of the row's
+    // sum (>= 1: the maximum's term).
+    lse_out[r] = isfinite(big)
+                     ? big + static_cast<float>(
+                                 log(ldexp(static_cast<double>(total), -qbits)))
+                     : big;
     s_argmax[0] = a == INT_MAX ? 0 : a;
+    s_qtotal = draw_ok ? mass : 0ull;
   }
 
   // ---- 3. radix select of the top_n-th largest key ----
@@ -474,6 +510,7 @@ __global__ void __launch_bounds__(kThreads)
   __shared__ bool s_gather;
   __shared__ bool s_selected;
   __shared__ int s_ncand;
+  __shared__ bool s_round0;
   // A single candidate is the argmax: the smallest id holding the maximum.
   // (Not at a zero maximum: -0 and +0 compare equal but order as keys.)
   const bool argmax_only = k_sel == 1 && isfinite(big) && big != 0.0f;
@@ -483,7 +520,33 @@ __global__ void __launch_bounds__(kThreads)
     s_rem = k_sel;
     s_done = k_sel == 0 || argmax_only;
     s_gather = false;
+    s_round0 = false;
     s_selected = argmax_only;
+    if (use_window && !s_done) {
+      // Round 0 from the window: the same digit, counts and decisions as a
+      // full histogram (no key lies above the maximum's bin).
+      int above = 0;
+      for (int i = 0; i < kWin; ++i) {
+        int c = 0;
+        for (int w = 0; w < kWaves; ++w)
+          c += static_cast<int>(s_win[w * kWin + i]);
+        if (above + c >= s_rem) {
+          const int rem = s_rem - above;
+          s_prefix = (win_top - static_cast<uint32_t>(i)) << 24;
+          s_mask = 0xffu << 24;
+          s_done = c == rem;
+          s_rem = rem;
+          s_round0 = true;
+          if (!s_done && above + c <= kCandCap) {
+            s_gather = true;
+            s_ncand = above + c;
+            s_done = true;
+          }
+          break;
+        }
+        above += c;
+      }
+    }
     if (argmax_only) {
       const int a = s_argmax[0];
       s_sel[0] = candidate(order_key(row[a]), static_cast<int32_t>(a));
@@ -491,11 +554,11 @@ __global__ void __launch_bounds__(kThreads)
     }
   }
   __syncthreads();
-  for (int round = 0; round < 4; ++round) {
+  for (int round = s_round0 ? 1 : 0; round < 4; ++round) {
     if (s_done)
       break;
     const int shift = 24 - 8 * round;
-    if (round > 0) {
+    {
       for (int b = lane; b < 256; b += kWave)
         hist[b] = 0u;
       const uint32_t prefix = s_prefix, mask = s_mask;
@@ -731,17 +794,16 @@ __global__ void __launch_bounds__(kThreads)
     }
     return;
   }
-  __shared__ double s_target;
-  __shared__ double s_before;
+  __shared__ unsigned long long s_target;
+  __shared__ unsigned long long s_before;
   if (tid == 0) {
-    double total = 0.0;
-    for (int w = 0; w < kWaves; ++w)
-      total += s_sum_t[w];
-    const double target = static_cast<double>(uniform[r]) * total;
-    double cum = 0.0;
+    // The first id, in id order, whose inclusive mass reaches the smallest
+    // integer mass above u * total.
+    const unsigned long long target = draw_target(uniform[r], s_qtotal);
+    unsigned long long cum = 0ull;
     int found = -1;
     for (int w = 0; w < kWaves; ++w) {
-      if (target < cum + s_sum_t[w]) {
+      if (cum + s_sum_t[w] >= target) {
         found = w;
         break;
       }
@@ -757,26 +819,57 @@ __global__ void __launch_bounds__(kThreads)
     s_drawn = found < 0 ? lastw : s_last[found];
   }
   __syncthreads();
-  if (wave == s_draw_wave) {
-    const double target = s_target;
-    double cum = s_before;
-    for (int64_t base = begin; base < end; base += kWave) {
-      const int64_t j = base + lane;
-      double w = 0.0;
-      if (j < end) {
-        const float v = row[j];
-        if (!isnan(v))
-          w = static_cast<double>(scaled_weight(v, inv_t, big_t));
+  // The drawn id lies in wave s_draw_wave's range: every wave takes a slice
+  // of it (integer masses: any order gives the same sums), then the slice
+  // holding the target is scanned in id order.
+  __shared__ unsigned long long s_slice[kWaves];
+  __shared__ int s_slice_wave;
+  const int dw = s_draw_wave;
+  if (dw >= 0) {
+    const int64_t d_begin = min64(vocab, dw * seg);
+    const int64_t d_end = min64(vocab, d_begin + seg);
+    const int64_t slice =
+        ((d_end - d_begin + kWaves - 1) / kWaves + kWave - 1) / kWave * kWave;
+    const int64_t s_begin = min64(d_end, d_begin + wave * slice);
+    const int64_t s_end = min64(d_end, s_begin + slice);
+    unsigned long long mass = 0ull;
+    for (int64_t j = s_begin + lane; j < s_end; j += kWave)
+      mass += qweight(row[j], inv_t, big_t, qbits);
+    mass = wave_sum_u64(mass);
+    if (lane == 0)
+      s_slice[wave] = mass;
+    __syncthreads();
+    if (tid == 0) {
+      unsigned long long cum = s_before;
+      int found = kWaves - 1;
+      for (int w = 0; w < kWaves; ++w) {
+        if (cum + s_slice[w] >= s_target) {
+          found = w;
+          break;
+        }
+        cum += s_slice[w];
       }
-      const double incl = wave_scan(w, lane);
-      const bool hit = target < cum + incl;
-      const unsigned long long ballot = __ballot(hit);
-      if (ballot != 0ull) {
-        if (lane == __ffsll(static_cast<long long>(ballot)) - 1)
-          s_drawn = static_cast<int>(j);
-        break;
+      s_slice_wave = found;
+      s_before = cum;
+    }
+    __syncthreads();
+    if (wave == s_slice_wave) {
+      const unsigned long long target = s_target;
+      unsigned long long cum = s_before;
+      for (int64_t base = s_begin; base < s_end; base += kWave) {
+        const int64_t j = base + lane;
+        const unsigned long long w =
+            j < s_end ? qweight(row[j], inv_t, big_t, qbits) : 0ull;
+        const unsigned long long incl = wave_scan_u64(w, lane);
+        const bool hit = cum + incl >= target;
+        const unsigned long long ballot = __ballot(hit);
+        if (ballot != 0ull) {
+          if (lane == __ffsll(static_cast<long long>(ballot)) - 1)
+            s_drawn = static_cast<int>(j);
+          break;
+        }
+        cum += __shfl(incl, kWave - 1, kWave);
       }
-      cum += __shfl(incl, kWave - 1, kWave);
     }
   }
   __syncthreads();
