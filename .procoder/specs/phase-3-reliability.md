@@ -108,19 +108,21 @@ Startup validation (exit 2, message naming the key): thresholds not monotonic; `
 
 Levels are YELLOW / ORANGE / RED / SURVIVAL; a signal below the YELLOW threshold is GREEN. The overall state is the maximum level over non-stale signals. These defaults are fixed and documented; each may be overridden per signal with `reliability.pressure.thresholds.<signal>`. Signals derived from `/proc` and the ledger update on the fast tick; `device_memory`, `thermal` and vendor staleness update on the vendor tick and hold their last level in between.
 
-| Signal                  | Definition                                                                             | Y     | O    | R    | S     |
-| ----------------------- | -------------------------------------------------------------------------------------- | ----- | ---- | ---- | ----- |
-| `kv_utilization`        | (used + reserved KV blocks) / KV pool capacity                                         | 0.70  | 0.82 | 0.90 | 0.97  |
-| `device_memory`         | device used / budgeted device bytes (dedicated devices only; not computed on unified)  | 0.85  | 0.90 | 0.95 | 0.98  |
-| `host_available`        | MemAvailable as a multiple of `host_reserve_bytes` (lower is worse)                    | 4.0   | 2.0  | 1.0  | 0.5   |
-| `psi_memory_some_avg10` | `/proc/pressure/memory` `some avg10`                                                   | 5     | 10   | 25   | 50    |
-| `swap_in_rate`          | pages/s swapped in, from `/proc/vmstat` deltas                                         | 1     | 100  | 1000 | 10000 |
-| `exhaustion_horizon`    | predicted seconds to KV exhaustion (lower is worse)                                    | 60    | 20   | 5    | 1     |
-| `queue_fill`            | admission queue length / `max_queue`                                                   | 0.50  | 0.80 | 0.95 | —     |
-| `step_time_drift`       | windowed p95 decode step time per sequence / baseline                                  | 1.5   | 2.0  | 3.0  | —     |
-| `thermal`               | 1 = within 5 °C of the vendor slowdown temperature, 2 = thermal throttle reason active | 1     | 2    | —    | —     |
-| `telemetry_stale`       | any source stale for longer than `stale_after`                                         | stale | —    | —    | —     |
-| `allocation_failure`    | a device OOM in the last `deescalate_dwell`                                            | —     | —    | —    | any   |
+| Signal                  | Definition                                                                                                                                                                                       | Y     | O    | R    | S     |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----- | ---- | ---- | ----- |
+| `kv_utilization`        | (used + reserved KV blocks) / KV pool capacity                                                                                                                                                   | 0.70  | 0.82 | 0.90 | 0.97  |
+| `device_memory`         | (device used − idle pre-allocated bytes) / budgeted device bytes (dedicated devices only; not computed on unified); idle pre-allocated = free `kv` pool bytes + the emergency reserve while held | 0.85  | 0.90 | 0.95 | 0.98  |
+| `host_available`        | MemAvailable as a multiple of `host_reserve_bytes` (lower is worse)                                                                                                                              | 4.0   | 2.0  | 1.0  | 0.5   |
+| `psi_memory_some_avg10` | `/proc/pressure/memory` `some avg10`                                                                                                                                                             | 5     | 10   | 25   | 50    |
+| `swap_in_rate`          | pages/s swapped in, from `/proc/vmstat` deltas                                                                                                                                                   | 1     | 100  | 1000 | 10000 |
+| `exhaustion_horizon`    | predicted seconds to KV exhaustion (lower is worse)                                                                                                                                              | 60    | 20   | 5    | 1     |
+| `queue_fill`            | admission queue length / `max_queue`                                                                                                                                                             | 0.50  | 0.80 | 0.95 | —     |
+| `step_time_drift`       | windowed p95 decode step time per sequence / baseline                                                                                                                                            | 1.5   | 2.0  | 3.0  | —     |
+| `thermal`               | 1 = within 5 °C of the vendor slowdown temperature, 2 = thermal throttle reason active                                                                                                           | 1     | 2    | —    | —     |
+| `telemetry_stale`       | any source stale for longer than `stale_after`                                                                                                                                                   | stale | —    | —    | —     |
+| `allocation_failure`    | a device OOM in the last `deescalate_dwell`                                                                                                                                                      | —     | —    | —    | any   |
+
+`device_memory` counts pre-allocated bytes that hold no data as free (decision "Phase 3: device_memory counts idle pre-allocated pools as free", 2026-09-27, provisional pending user review): the `kv` pool and the emergency reserve are allocated up front, so the device reports them as used from startup. With `kv.gpu.max_bytes` at its default (null) the `kv` pool is the rest of the budget and an idle R9700 measured 0.972 of its budget used, RED before the first request; admission then queued every request until `queue_timeout` (the first 10-minute soak on novanas failed its calibration this way). Occupied KV blocks (committed or reserved) still count as used, so a full pool reads as before; releasing or re-acquiring the reserve leaves the value unchanged.
 
 ### Throttle plan per state
 

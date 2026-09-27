@@ -995,7 +995,7 @@ Exhaustion horizon (P3 S-8): `ExhaustionHorizon::predict(running: &[(remaining_t
 | Signal                                                              | Y         | O    | R    | S       | Lower is worse                                                     |
 | ------------------------------------------------------------------- | --------- | ---- | ---- | ------- | ------------------------------------------------------------------ |
 | `kv_utilization`                                                    | 0.70      | 0.82 | 0.90 | 0.97    | no                                                                 |
-| `device_memory` (dedicated only)                                    | 0.85      | 0.90 | 0.95 | 0.98    | no                                                                 |
+| `device_memory` (dedicated only; free KV + held reserve count free) | 0.85      | 0.90 | 0.95 | 0.98    | no                                                                 |
 | `host_available` (× host_reserve_bytes)                             | 4.0       | 2.0  | 1.0  | 0.5     | yes                                                                |
 | `psi_memory_some_avg10`                                             | 5         | 10   | 25   | 50      | no                                                                 |
 | `swap_in_rate` (pages/s)                                            | 1         | 100  | 1000 | 10000   | no                                                                 |

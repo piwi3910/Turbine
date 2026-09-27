@@ -476,3 +476,13 @@ The overload simulation's seed 1 recovered 64 s after the load stopped (criterio
 - C) Relax the 60 s recovery criterion
 
 **Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Seeds 1–12 all recover in 42–49 s; completions change from 137–548 to 247–581 per seed (seed 8: 408 → 346, seeds 10–12 up to 2×); GREEN admission, and so the Phase 2c throughput path below pressure, is unchanged. Spec S-9 amended; test `admission::tests::kv_headroom`.
+
+## Phase 3: device_memory counts idle pre-allocated pools as free
+
+The first 10-minute soak on novanas (`scripts/overload-soak.sh novanas`, 2026-09-27) failed its calibration: every request answered `503 queue_timeout`. The soak config leaves `kv.gpu.max_bytes` at its default (null), so the `kv` pool is the rest of the budget and is allocated at startup. 200 ms after `/ready`, with no load, the log showed `pressure_transition GREEN → RED signal=device_memory value=0.972 threshold=0.95`, and RED admitted nothing. `device_memory` was device used / budget, and the device reports the pre-allocated KV pool and emergency reserve as used whether they hold data or not. The Phase 2c lab configs cap the pool at 8 GiB (about 0.54 at idle), which is why lab-bench never hit this, and the overload simulation never reported device memory.
+
+- A) `device_memory` = (device used − idle pre-allocated bytes) / budget, where idle pre-allocated = free `kv` pool bytes + the emergency reserve while held. Same denominator and thresholds; a full pool reads as before; releasing or re-acquiring the reserve does not move it (recommended)
+- B) Cap `kv.gpu.max_bytes` in the soak config (leaves the default config RED at idle)
+- C) Measure only the memory outside the pre-allocated pools (weights, workspace, runtime, co-tenants) against its own budget (about 2 GiB of slack on the R9700, so a few hundred MB of transient workspace would move it tens of percent)
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Idle novanas soak startup: 0.972 → about 0.22 (GREEN). Spec signal table amended, plan Task 12b, contract §8.3 row. Tests `signals::tests::device_memory_counts_idle_preallocated_bytes_as_free`, `controller::tests::idle_full_budget_kv_pool_stays_green`; the overload simulation now reports device memory (without A, `ten_x_overload` and the SURVIVAL liveness seeds never return to GREEN; with A, seeds 1–12 still recover in 42–49 s).

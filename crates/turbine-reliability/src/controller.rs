@@ -1,7 +1,7 @@
 //! Ties telemetry, signals, the state machine, the emergency reserve, the throttle plan and the circuit
 //! breaker together. Runs on the telemetry fast tick (never per token); the scheduler reads one atomic
 //! snapshot per iteration through `ControllerHandle`.
-use crate::budget::DeviceBudget;
+use crate::budget::{DeviceBudget, PoolKind};
 use crate::circuit::{CircuitBreaker, CircuitEvent, CircuitReason, CircuitTransition};
 use crate::document::{
     AdmissionDoc, CircuitDoc, PressureDocument, ThrottleDoc, TransitionDoc, decisions_doc,
@@ -12,7 +12,8 @@ use crate::ledger::Ledger;
 use crate::metrics::{ReliabilityMetrics, SignalLabel};
 use crate::reserve::EmergencyReserve;
 use crate::signals::{
-    PressureSignal, SignalEvaluator, SignalInputs, SignalValue, effective_thresholds,
+    DeviceMemoryInput, PressureSignal, SignalEvaluator, SignalInputs, SignalValue,
+    effective_thresholds,
 };
 use crate::state::{Gates, MachineConfig, PressureMachine, Transition};
 use crate::throttle::{
@@ -196,11 +197,14 @@ impl PressureController {
             self.baseline_step_s = Some(self.baseline_step_s.map_or(p95, |b| 0.9 * b + 0.1 * p95));
         }
         let dwell = self.cfg.pressure.deescalate_dwell.0;
-        let devices = [(
-            self.budget.device,
-            self.budget.memory_kind,
-            self.budget.budget_bytes,
-        )];
+        let kv = self.ledger.usage(self.budget.device, PoolKind::Kv);
+        let reserve = self.ledger.usage(self.budget.device, PoolKind::Reserve);
+        let devices = [DeviceMemoryInput {
+            device: self.budget.device,
+            memory_kind: self.budget.memory_kind,
+            budget_bytes: self.budget.budget_bytes,
+            idle_preallocated_bytes: kv.available().saturating_add(reserve.used),
+        }];
         let inputs = SignalInputs {
             sample,
             host_reserve_bytes: self.cfg.memory.host_reserve_bytes.0,
@@ -430,7 +434,7 @@ fn empty_document(enabled: bool, plan: &ThrottlePlan) -> PressureDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budget::{BudgetInputs, PoolKind, compute_budget};
+    use crate::budget::{BudgetInputs, compute_budget};
     use crate::reserve::ReserveAllocator;
     use turbine_core::clock::FakeClock;
     use turbine_core::telemetry::{DeviceSample, HostSample, LedgerSample, SourceStatus};
@@ -587,6 +591,38 @@ mod tests {
         }
         assert_eq!(doc["state"], "GREEN");
         assert!(doc["transitions"].as_array().unwrap().len() >= 6);
+    }
+
+    /// Catches: an idle server whose KV pool fills the rest of the budget (`kv.gpu.max_bytes`
+    /// null, the default) entering RED on `device_memory` and queueing every request (the
+    /// 2026-09-27 soak calibration: all requests `queue_timeout`).
+    #[test]
+    fn idle_full_budget_kv_pool_stays_green() {
+        let (mut c, h, clock) = controller(true);
+        // Budget 30 GiB: weights 6 + KV pool 20 + reserve 2 allocated, 0.7 GiB of runtime in use.
+        let mut s = sample(0.0, 0.0);
+        s.devices[0].memory_used_bytes = Some(28 * GIB + 7 * GIB / 10);
+        let stats = EngineStats {
+            block_tokens: 16,
+            free_kv_blocks: 1000,
+            ..EngineStats::default()
+        };
+        for _ in 0..30 {
+            clock.advance(Duration::from_millis(100));
+            c.tick(&s, &stats);
+        }
+        assert_eq!(h.state(), PressureState::Green);
+        let doc = h.document();
+        let mem = doc
+            .signals
+            .iter()
+            .find(|v| v.signal == PressureSignal::DeviceMemory)
+            .unwrap();
+        assert!(
+            (mem.value - 0.7 / 30.0 - 6.0 / 30.0).abs() < 1e-3,
+            "weights and runtime only: {}",
+            mem.value
+        );
     }
 
     #[test]

@@ -84,7 +84,8 @@ Interfaces:
 - `pub struct SignalThresholds { pub levels: [Option<f64>; 4], pub lower_is_worse: bool }` with `level(f64) -> PressureState`, `threshold(PressureState) -> Option<f64>`, `below_exit(f64, PressureState, margin: f64) -> bool`, `exit_threshold(PressureState, f64) -> Option<f64>`
 - `pub fn default_thresholds() -> BTreeMap<PressureSignal, SignalThresholds>`; `pub fn effective_thresholds(cfg: &PressureConfig) -> BTreeMap<PressureSignal, SignalThresholds>`; `pub fn active_signals(kind: MemoryKind) -> Vec<PressureSignal>`
 - `pub struct SignalValue { pub signal: PressureSignal /* serde "name" */, pub value: f64, pub level: PressureState, pub stale: bool }`
-- `pub struct SignalInputs<'a> { sample: &'a TelemetrySample, host_reserve_bytes: u64, devices: &'a [(DeviceId, MemoryKind, u64)], exhaustion_horizon_seconds: f64, step_time_drift: Option<f64>, allocation_failure_recent: bool }`
+- `pub struct SignalInputs<'a> { sample: &'a TelemetrySample, host_reserve_bytes: u64, devices: &'a [DeviceMemoryInput], exhaustion_horizon_seconds: f64, step_time_drift: Option<f64>, allocation_failure_recent: bool }`
+- `pub struct DeviceMemoryInput { device: DeviceId, memory_kind: MemoryKind, budget_bytes: u64, idle_preallocated_bytes: u64 }` (amended 2026-09-27, Task 12b)
 - `pub fn SignalEvaluator::new(thresholds, interval: Duration, stale_after: Duration) -> Self`; `pub fn evaluate(&mut self, inp: &SignalInputs<'_>, now: Duration) -> Vec<SignalValue>`
 - `pub enum PoolKind { Weights, Kv, Workspace, Runtime, Reserve }` + `ALL`, `as_str()`
 - `pub struct BudgetInputs { device, memory_kind, measured_free_bytes: Option<u64>, already_held_bytes: u64, host_mem_available_bytes: Option<u64>, weights_bytes, kv_bytes_per_token, max_seq_len: u32, block_bytes }`
@@ -359,6 +360,25 @@ Depends on: Tasks 7, 8, 10, 12, 14; decision "Phase 3: SURVIVAL liveness fix" (p
 - [ ] Run: `cargo test -p turbine-scheduler --test overload_sim && cargo test -p turbine-reliability && cargo test -p turbine-core config::tests::reliability_config_validation` — expect PASS; `cargo test --release -p turbine-scheduler --test overload_sim survival_liveness_sweep -- --ignored --nocapture` prints seeds 1–12 under both options (measured: every seed GREEN + HEALTHY 42–49 s after the load stops; seed 6: 42.9 s under A, 46.9 s under B).
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus `--all-features`)
 - [ ] Commit: `fix(reliability): SURVIVAL requeues unstarted admitted requests; admissions keep KV headroom`
+
+## Task 12b: device_memory counts idle pre-allocated pools as free (amendment 2026-09-27)
+
+Files: `crates/turbine-reliability/src/{signals.rs, controller.rs}`, `crates/turbine-scheduler/src/sim/overload.rs`
+Interfaces:
+
+- `pub struct DeviceMemoryInput { device: DeviceId, memory_kind: MemoryKind, budget_bytes: u64, idle_preallocated_bytes: u64 }` replaces the `(DeviceId, MemoryKind, u64)` tuple of `SignalInputs.devices`; `device_memory` = (used − `idle_preallocated_bytes`) / `budget_bytes`
+- `PressureController::tick` fills `idle_preallocated_bytes` from the ledger: `kv` pool `available()` + `reserve` pool `used`
+
+Covers: S-6 (`device_memory` definition), S-19 (the soak's calibration); `signals::tests::device_memory_counts_idle_preallocated_bytes_as_free`, `controller::tests::idle_full_budget_kv_pool_stays_green`, `overload_sim` with device memory reported.
+Depends on: Tasks 2, 10, 12, 12a; decision "Phase 3: device_memory counts idle pre-allocated pools as free" (provisional, pending user review).
+
+- [ ] Write failing tests `signals::tests::device_memory_counts_idle_preallocated_bytes_as_free` (the novanas soak startup figures: budget 33,908,850,688, KV pool 23,188,383,744, reserve 2 GiB, 0.972 of the budget measured used → GREEN when idle, 0.972 RED when nothing is idle), `controller::tests::idle_full_budget_kv_pool_stays_green` (30 GiB budget, KV pool the remainder, 28.7 GiB used at idle → GREEN, value = weights + runtime) and make the overload simulation's device sample report memory used (the whole KV pool, the reserve while held, half the workspace).
+- [ ] Run: `cargo test -p turbine-reliability && cargo test -p turbine-scheduler --test overload_sim` — expect FAIL (both unit tests; `ten_x_overload` and the three `survival_liveness_*` cases never return to GREEN).
+- [ ] Implement `DeviceMemoryInput` and the subtraction in `SignalEvaluator::evaluate`; the controller computes the idle bytes from the ledger each tick.
+- [ ] Run: the same — expect PASS; `survival_liveness_sweep -- --ignored --nocapture` unchanged (seeds 1–12 GREEN + HEALTHY 42–49 s after the load stops).
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus the `fault-injection` feature)
+- [ ] Run: `scripts/bench-lock.sh scripts/overload-soak.sh novanas` — expect exit 0 and `"pass": true`.
+- [ ] Commit: `fix(reliability): device_memory counts idle pre-allocated KV and reserve as free`
 
 ## Task 13: Pressure route, readiness, admission errors and metrics in turbine-api
 

@@ -147,13 +147,26 @@ pub struct SignalValue {
     pub stale: bool,
 }
 
+/// One device's memory figures for `device_memory`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceMemoryInput {
+    pub device: DeviceId,
+    pub memory_kind: MemoryKind,
+    /// The device budget (P3 S-2); `device_memory` is computed on dedicated devices only.
+    pub budget_bytes: u64,
+    /// Device memory Turbine allocated up front that holds no data: the free part of the `kv`
+    /// pool (neither committed nor reserved) and the emergency reserve while held. The device
+    /// reports it as used, but it is headroom that `kv_utilization` and the reserve account for.
+    pub idle_preallocated_bytes: u64,
+}
+
 /// Everything the evaluator needs besides the telemetry sample.
 #[derive(Clone, Debug)]
 pub struct SignalInputs<'a> {
     pub sample: &'a TelemetrySample,
     pub host_reserve_bytes: u64,
-    /// (device, memory kind, budgeted bytes): `device_memory` = used / budget on dedicated devices.
-    pub devices: &'a [(DeviceId, MemoryKind, u64)],
+    /// `device_memory` = (used − idle pre-allocated bytes) / budget on dedicated devices.
+    pub devices: &'a [DeviceMemoryInput],
     pub exhaustion_horizon_seconds: f64,
     /// Windowed p95 decode step time / GREEN baseline; `None` until a baseline exists.
     pub step_time_drift: Option<f64>,
@@ -274,12 +287,15 @@ impl SignalEvaluator {
                 continue;
             }
             let stale = d.status == SourceStatus::Stale;
-            let budget = inp.devices.iter().find(|(id, _, _)| *id == d.device);
-            if let (Some((_, MemoryKind::Dedicated, budget)), Some(used)) =
-                (budget, d.memory_used_bytes)
-                && *budget > 0
+            let input = inp.devices.iter().find(|i| i.device == d.device);
+            if let (Some(input), Some(used)) = (input, d.memory_used_bytes)
+                && input.memory_kind == MemoryKind::Dedicated
+                && input.budget_bytes > 0
             {
-                let v = used as f64 / *budget as f64;
+                // Pre-allocated bytes that hold no data are headroom, not use: without this an
+                // idle device whose KV pool fills the budget reads ~0.97 (RED).
+                let holding_data = used.saturating_sub(input.idle_preallocated_bytes);
+                let v = holding_data as f64 / input.budget_bytes as f64;
                 if device_memory.is_none_or(|(m, _)| v > m) {
                     device_memory = Some((v, stale));
                 }
@@ -370,11 +386,79 @@ mod tests {
         );
     }
 
+    /// The soak failure of 2026-09-27: with `kv.gpu.max_bytes` at its default the KV pool is the
+    /// remainder of the budget and is allocated up front, so an idle R9700 measured 0.972 of its
+    /// budget used and the server sat in RED (admission `all_queued`) before any request.
+    /// Catches: pre-allocated pool bytes that hold no data (free KV, the held emergency
+    /// reserve) counted as used device memory.
+    #[test]
+    fn device_memory_counts_idle_preallocated_bytes_as_free() {
+        let mut ev = SignalEvaluator::new(
+            default_thresholds(),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        );
+        // The novanas soak startup: budget 33,908,850,688; weights 6.0 GiB; KV pool
+        // 23,188,383,744; reserve 2 GiB; 32.96 GB measured used at idle.
+        let budget = 33_908_850_688u64;
+        let kv_pool = 23_188_383_744u64;
+        let reserve = 2 * GIB;
+        let used = (0.9719521765182774 * budget as f64) as u64;
+        let eval = |ev: &mut SignalEvaluator, idle: u64| {
+            let devices = [DeviceMemoryInput {
+                device: DeviceId(0),
+                memory_kind: MemoryKind::Dedicated,
+                budget_bytes: budget,
+                idle_preallocated_bytes: idle,
+            }];
+            let sample = TelemetrySample {
+                at_mono_ns: 0,
+                host: HostSample::default(),
+                devices: vec![DeviceSample {
+                    memory_used_bytes: Some(used),
+                    ..DeviceSample::empty(DeviceId(0), SourceStatus::Ok)
+                }],
+                ledger: LedgerSample::default(),
+                storage: None,
+            };
+            let values = ev.evaluate(
+                &SignalInputs {
+                    sample: &sample,
+                    host_reserve_bytes: 8 * GIB,
+                    devices: &devices,
+                    exhaustion_horizon_seconds: f64::INFINITY,
+                    step_time_drift: None,
+                    allocation_failure_recent: false,
+                },
+                Duration::ZERO,
+            );
+            find(&values, PressureSignal::DeviceMemory).unwrap()
+        };
+        // Idle: the whole KV pool is free and the reserve is held.
+        let idle = eval(&mut ev, kv_pool + reserve);
+        assert_eq!(
+            idle.level,
+            PressureState::Green,
+            "idle value {}",
+            idle.value
+        );
+        assert!((idle.value - (used - kv_pool - reserve) as f64 / budget as f64).abs() < 1e-12);
+        // KV pool fully occupied, reserve released: every byte holds data again.
+        let full = eval(&mut ev, 0);
+        assert!((full.value - 0.9719521765182774).abs() < 1e-6);
+        assert_eq!(full.level, PressureState::Red);
+    }
+
     #[test]
     fn evaluator_rates_staleness_and_devices() {
         let interval = Duration::from_millis(100);
         let mut ev = SignalEvaluator::new(default_thresholds(), interval, Duration::from_secs(5));
-        let devices = [(DeviceId(0), MemoryKind::Dedicated, 10 * GIB)];
+        let devices = [DeviceMemoryInput {
+            device: DeviceId(0),
+            memory_kind: MemoryKind::Dedicated,
+            budget_bytes: 10 * GIB,
+            idle_preallocated_bytes: 0,
+        }];
         let mut sample = TelemetrySample {
             at_mono_ns: 0,
             host: HostSample {

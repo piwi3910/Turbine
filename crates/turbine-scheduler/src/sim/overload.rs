@@ -863,9 +863,16 @@ impl OverloadSim {
     }
 
     /// Deterministic telemetry: a dedicated device at 40 °C of a 90 °C slowdown, 64 GiB
-    /// `MemAvailable`, no PSI or swap activity; the ledger and the admission queue.
+    /// `MemAvailable`, no PSI or swap activity; the ledger and the admission queue. Device
+    /// memory in use is what a real device reports: the whole KV pool (allocated up front and
+    /// filling the rest of the budget, as with `kv.gpu.max_bytes: null`), the emergency reserve
+    /// while held and half the workspace pool.
     fn sample(&self) -> TelemetrySample {
         let max_queue = self.sched.gate().map_or(1, AdmissionGate::max_queue).max(1);
+        let pool_bytes = |kind| self.ledger.usage(DEVICE, kind).capacity;
+        let memory_used = pool_bytes(PoolKind::Kv)
+            + self.ledger.usage(DEVICE, PoolKind::Reserve).used
+            + pool_bytes(PoolKind::Workspace) / 2;
         TelemetrySample {
             at_mono_ns: u64::try_from(self.next_tick.as_nanos()).unwrap_or(u64::MAX),
             host: HostSample {
@@ -880,6 +887,7 @@ impl OverloadSim {
                 temperature_c: Some(40.0),
                 slowdown_temperature_c: Some(90.0),
                 clock_mhz: Some(2350),
+                memory_used_bytes: Some(memory_used),
                 ..DeviceSample::empty(DEVICE, SourceStatus::Ok)
             }],
             ledger: LedgerSample {
