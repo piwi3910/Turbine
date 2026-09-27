@@ -534,3 +534,18 @@ Landing the soak fixes (branch `phase-3-reliability-land`, d6d5e1d), the coordin
 - Only drop the duplicate host-test run from lab-bench
 
 **Answer (2026-09-27):** tiered tests — affected-crate gate with nextest (full workspace at phase end / before merge); GPU suite split into `quick` and `perf` tiers; lab-bench without its duplicate host tests, golden c16 opt-in, `--quick` 64-request mode; soaks only at phase exit.
+
+## Before Phase 5: performance and the OLMoE c16 golden flip
+
+Asked 2026-09-27 (after Phase 4, before Phase 5).
+
+Flake (OLMoE golden `--concurrency 16`, prompts p10/p14 flip with batch composition):
+- A) Root-cause, then fix: trace p10/p14 alone vs batched, find the op whose result depends on batch composition, fix it (e.g. fixed reduction order); gate stays strict (recommended)
+- B) Batch-invariant mode: every op independent of batch composition, gate runs with it on (costs throughput)
+- C) Tolerate near-ties: excuse a flip when the top-2 margin is under a measured bound
+
+**Answer (2026-09-27): A — root-cause, then fix.** The one-retry allowance in the landing chain goes once the fix lands.
+
+Performance work before Phase 5 (multi-select): OLMoE decode host round trip per layer; TTFT / prefill; decode ITL; profile first.
+
+**Answer (2026-09-27): all four — profile first**, then land the top items one at a time (one change, then measure) across decode ITL, TTFT/prefill and the OLMoE decode round trip. Phase 5 starts only when the user says so.
