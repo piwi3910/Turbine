@@ -1513,12 +1513,14 @@ fn moe_experts_small_m_matches_cpu() {
     experts_case(&p, &mut rng, &w, &case);
 }
 
-/// P2c (prefill): above 512 routed rows `moe_experts` at the OLMoE shapes runs the grouped WMMA
-/// path, also without host offsets, and matches the CPU reference, bitwise identical across two
-/// runs: 65 tokens (520 rows, the first size past small-m), 300 tokens through a caller
-/// workspace, 256 tokens all on experts 40..=47 (256 rows each: four full row tiles, 56 experts
-/// without rows) and a shard of the experts at 200 tokens. A shape whose hidden or intermediate
-/// size is not a multiple of 64 still takes the host-offset (hipBLASLt) path and matches.
+/// P2c (prefill): above 512 routed rows `moe_experts` at the OLMoE shapes runs the prefill WMMA
+/// path (the grouped WMMA path in a library without it), also without host offsets, and matches
+/// the CPU reference, bitwise identical across two runs: 65 tokens (520 rows, the first size past
+/// small-m), 300 tokens through a caller workspace, 256 tokens all on experts 40..=47 (256 rows
+/// each: four full row tiles, 56 experts without rows) and a shard of the experts at 200 tokens.
+/// A shape whose hidden or intermediate size is not a multiple of 64 still takes the host-offset
+/// (hipBLASLt) path and matches; hidden and inter 256 at 1,536 tokens take the prefill kernels'
+/// wide down-projection tile.
 /// Prints each case's mean time per call (`moe_experts_timing:`).
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
@@ -1575,6 +1577,20 @@ fn moe_experts_grouped_matches_cpu() {
         local: (0, MOE_EXPERTS),
         workspace: false,
         repeat: 1,
+    };
+    experts_case(&p, &mut rng, &w, &case);
+    drop(w);
+
+    // hidden and inter 256 at 1,536 tokens (12,288 routed rows, the average expert filling three
+    // 64-row tiles): the prefill kernels' wide down-projection tile.
+    let w = expert_weights_of(&p, &mut rng, 256, 256);
+    let logits = rng.normal(1536 * MOE_EXPERTS, 1.0);
+    let case = ExpertsCase {
+        tokens: 1536,
+        logits: &logits,
+        local: (0, MOE_EXPERTS),
+        workspace: false,
+        repeat: 2,
     };
     experts_case(&p, &mut rng, &w, &case);
 }
@@ -4334,6 +4350,7 @@ fn implementations_enumerated() {
             OpKind::MoeExperts,
             vec![
                 ("turbine_hip_moe_small_m", "turbine_hip", false),
+                ("turbine_hip_moe_wmma_prefill", "turbine_hip", false),
                 ("turbine_hip_moe_wmma", "turbine_hip", false),
                 ("hipblaslt_grouped", "hipblaslt", HOST),
                 ("hipblaslt_per_expert", "hipblaslt", HOST),

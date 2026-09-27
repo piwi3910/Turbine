@@ -1,6 +1,9 @@
 //! `gfx1201`: AMD RDNA4 (Radeon AI PRO R9700). Wave32 with WMMA matrix instructions and native
 //! BF16; 64 KiB LDS per workgroup. The thresholds are the ones the HIP library tuned on the R9700:
-//! the small-m MoE kernel wins up to 512 routed rows, and Composable Kernel paged attention
+//! the small-m MoE kernel wins up to 512 routed rows, the prefill WMMA kernels (expert weights
+//! streamed into the WMMA registers, the same per-element chain) above them, 8-16 % faster than
+//! the grouped WMMA kernels with OLMoE's real routing (`perf moe_prefill_timings`), and
+//! Composable Kernel paged attention
 //! serves pages of a multiple of 128 tokens. Paged decode prefers CK's split-KV kernel, which
 //! merges the query heads of a KV head into one tile: 1.2-5x faster than `fmha_fwd_pagedkv` for
 //! Llama's 24/8 heads (`hip_ops decode_attention_timings`); it refuses equal head counts
@@ -78,6 +81,7 @@ pub static GFX1201: CardProfile = CardProfile {
         OpPreference {
             op: OpKind::MoeExperts,
             order: &[
+                "turbine_hip_moe_wmma_prefill",
                 "turbine_hip_moe_wmma",
                 "hipblaslt_grouped",
                 "hipblaslt_per_expert",
@@ -87,6 +91,7 @@ pub static GFX1201: CardProfile = CardProfile {
                     max_rows: Some(MOE_SMALL_MAX_ROWS),
                     order: &[
                         "turbine_hip_moe_small_m",
+                        "turbine_hip_moe_wmma_prefill",
                         "turbine_hip_moe_wmma",
                         "hipblaslt_grouped",
                         "hipblaslt_per_expert",
@@ -95,6 +100,7 @@ pub static GFX1201: CardProfile = CardProfile {
                 RowTierSpec {
                     max_rows: None,
                     order: &[
+                        "turbine_hip_moe_wmma_prefill",
                         "turbine_hip_moe_wmma",
                         "hipblaslt_grouped",
                         "hipblaslt_per_expert",

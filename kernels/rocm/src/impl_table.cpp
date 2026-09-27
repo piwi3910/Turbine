@@ -14,11 +14,12 @@
 //   copy_blocks                  0 hip_memcpy_d2d [turbine_hip]
 //   moe_experts                  0 turbine_hip_moe_small_m (hidden and inter
 //                                  multiples of 8; the first row tier),
-//                                  1 turbine_hip_moe_wmma (multiples of 64),
-//                                  2 hipblaslt_grouped (only when hipBLASLt
-//                                  has a grouped solution), 3
-//                                  hipblaslt_per_expert; 2 and 3 read
-//                                  host_expert_offsets
+//                                  1 turbine_hip_moe_wmma_prefill (multiples
+//                                  of 256), 2 turbine_hip_moe_wmma
+//                                  (multiples of 64), 3 hipblaslt_grouped
+//                                  (only when hipBLASLt has a grouped
+//                                  solution), 4 hipblaslt_per_expert; 3 and 4
+//                                  read host_expert_offsets
 //   rope, silu_mul, embedding,   0 turbine_hip [turbine_hip]
 //   add, moe_route, logits_reduce
 #include <string>
@@ -178,6 +179,8 @@ const ImplEntry kMoeRoute[] = {
 const ImplEntry kMoeExperts[] = {
     entry<Experts<MoePath::SmallM>>("turbine_hip_moe_small_m", kTurbine, 0,
                                     small_rows_allows),
+    entry<Experts<MoePath::WmmaPrefill>>("turbine_hip_moe_wmma_prefill",
+                                         kTurbine),
     entry<Experts<MoePath::Wmma>>("turbine_hip_moe_wmma", kTurbine),
     entry<Experts<MoePath::Grouped>>("hipblaslt_grouped", kHipblaslt,
                                      TURBINE_IMPL_NEEDS_HOST_OFFSETS),

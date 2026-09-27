@@ -415,10 +415,10 @@ fn heavy(mut x: Vec<f32>) -> Vec<f32> {
 }
 
 /// `moe_route` then `moe_experts` (through the registry the card profile builds, whose routed-row
-/// tiers switch from small-m to grouped WMMA above 512 rows, as the executor calls them) for one
+/// tiers switch from small-m to prefill WMMA above 512 rows, as the executor calls them) for one
 /// target token alone and at the first and last position of `tokens`-token batches; the target's
-/// routing and its output row must not change. Breaks if the two tiers stop computing a row with
-/// the same WMMA chain.
+/// routing and its output row must not change. Breaks if the tiers (or the prefill kernels' two
+/// down-projection tiles) stop computing a row with the same WMMA chain.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn moe_rows_are_batch_invariant() {
@@ -520,13 +520,14 @@ fn moe_rows_are_batch_invariant() {
         let (ids, w, o) = run_with(moe, x, logits, t, pos);
         (ids, w, row_slice(&o, HIDDEN, pos, 1).to_vec())
     };
-    // The device-offset moe_experts implementations (small-m and grouped WMMA, the two tiers
-    // the card profile picks between by routed rows) on the same 65-token batch with
-    // heavy-tailed activations: bitwise equal on every row. Before the small-m tier ran the
-    // WMMA chain, 426 of 133,120 outputs differed here (up to 0.125).
+    // The device-offset moe_experts implementations (small-m, prefill WMMA and grouped WMMA;
+    // the card profile picks between the first two by routed rows, and the prefill kernels
+    // change their down-projection tile at 12,288 rows) on the same batch with heavy-tailed
+    // activations: bitwise equal on every row, at 65 tokens and at 1,536 (12,288 routed rows).
+    // Before the small-m tier ran the WMMA chain, 426 of 133,120 outputs differed at 65 tokens
+    // (up to 0.125).
     let mut ab = Vec::new();
-    {
-        let (t, pos) = (65, 17);
+    for (t, pos) in [(65, 17), (1536, 700)] {
         let mut x = heavy(rng.normal(t * HIDDEN, 1.0));
         let mut logits = rng.normal(t * EXPERTS, 2.0);
         x[pos * HIDDEN..(pos + 1) * HIDDEN].copy_from_slice(&target_x);
@@ -557,7 +558,11 @@ fn moe_rows_are_batch_invariant() {
             }
         }
     }
-    assert_eq!(ab.len(), 1, "small-m and grouped WMMA both ran");
+    assert_eq!(
+        ab.len(),
+        4,
+        "small-m, prefill WMMA and grouped WMMA all ran at both sizes"
+    );
     let alone = run(&target_x, &target_logits, 1, 0);
     let mut out = ab;
     for t in [1usize, 2, 4, 8, 16, 32, 63, 64, 65, 66, 128, 256, 700, 2048] {
@@ -817,8 +822,9 @@ fn paged_attention_rows_are_batch_invariant() {
     assert_invariant(&out);
 }
 
-/// Lab timing (perf tier): the two device-offset `moe_experts` implementations (small-m and
-/// grouped WMMA, the card profile's two row tiers) bound one at a time, at 1–128 tokens with
+/// Lab timing (perf tier): the device-offset `moe_experts` implementations (small-m, prefill WMMA
+/// and grouped WMMA; the card profile's row tiers pick the first two) bound one at a time, at
+/// 1–128 tokens with
 /// uniform routing over 64 experts whose 805 MB of weights stream from memory: one line per
 /// implementation and size with the mean time per call and the weight bandwidth. No bound; the
 /// numbers compare kernel changes and place the tier boundary (`moe_small_max_rows`) on GPU 0.
@@ -858,7 +864,7 @@ fn moe_decode_tier_timings() {
             Some((i.name, p))
         })
         .collect();
-    assert_eq!(bound.len(), 2, "small-m and grouped WMMA");
+    assert_eq!(bound.len(), 3, "small-m, prefill WMMA and grouped WMMA");
     let n = EXPERTS * INTER * HIDDEN;
     let up = 1.0 / (HIDDEN as f32).sqrt();
     let w_gate = upload(

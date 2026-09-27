@@ -720,6 +720,8 @@ fn moe_prefill_timings() {
             let per_expert: Vec<i32> = host.windows(2).map(|w| w[1] - w[0]).collect();
             let active = per_expert.iter().filter(|&&c| c > 0).count();
             let largest = per_expert.iter().copied().max().unwrap_or(0);
+            // The routed rows per expert, for offline kernel work on the same distribution.
+            println!("moe_prefill_routing layer={layer} tokens={t} rows_per_expert={per_expert:?}");
             let zeros = vec![0u8; t * hidden * 2];
             let mut o = upload(&[t, hidden], DType::BF16, &zeros);
             let sorted_view =

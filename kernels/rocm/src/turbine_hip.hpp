@@ -225,6 +225,16 @@ int32_t launch_moe_wmma_gemv(turbine_ctx *ctx,
                              void *act, void *down);
 // hidden and inter are multiples of the decode kernels' load step (128).
 bool moe_gemv_shape(const turbine_moe_experts_desc *d);
+// The prefill kernels (moe_grouped.hip, impl "turbine_hip_moe_wmma_prefill"):
+// the same WMMA chain and outputs as launch_moe_wmma, with the expert weights
+// streamed from memory straight into the WMMA registers and only the gathered
+// activations staged in LDS. Needs moe_prefill_shape(d) and 16-byte aligned x
+// and expert weights.
+int32_t launch_moe_wmma_prefill(turbine_ctx *ctx,
+                                const turbine_moe_experts_desc *d, int32_t *pos,
+                                void *act, void *down);
+// hidden and inter are multiples of the prefill kernels' loop step (256).
+bool moe_prefill_shape(const turbine_moe_experts_desc *d);
 
 // Asks hipBLASLt for a grouped BF16 GEMM solution on ctx's device (moe.cpp);
 // false when there is none (ROCm 7.14.1 on RDNA4) or the query fails.
@@ -293,8 +303,10 @@ int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
 bool ck_splitkv_serves(const turbine_attention_paged_desc *d);
 int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                        const std::string &entry);
-// moe.cpp: the four moe_experts paths.
-enum class MoePath { SmallM, Wmma, Grouped, PerExpert };
+// moe.cpp: the five moe_experts paths.
+enum class MoePath { SmallM, WmmaPrefill, Wmma, Grouped, PerExpert };
+// The implementation name of path (impl_table.cpp's).
+const char *moe_path_name(MoePath path);
 bool moe_experts_supports(const turbine_moe_experts_desc *d, MoePath path);
 int32_t moe_experts_run(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                         MoePath path);

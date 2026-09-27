@@ -4,16 +4,19 @@
 // out[t] += sum_k w_k * down(silu(gate(x_t)) * up(x_t)) over the local experts
 // [expert_begin, expert_end).
 //
-// Four implementations (impl_table.cpp; the caller picks one with
+// Five implementations (impl_table.cpp; the caller picks one with
 // turbine_impl_run, or turbine_moe_experts takes the first that supports the
 // descriptor within the context's card profile): the Turbine small-m kernels
 // (moe_small_m.hip, impl "turbine_hip_moe_small_m"; the default uses them up
 // to the profile's moe_small_max_rows routed rows, num_tokens * top_k; for
-// hidden and inter multiples of 64 they are the grouped WMMA kernels with
-// 16-row tiles, bitwise equal to the next tier row by row), the
-// Turbine grouped WMMA kernels (moe_grouped.hip, impl "turbine_hip_moe_wmma";
-// hidden and inter multiples of 64), both reading the group sizes from
-// expert_offsets on the device (host_expert_offsets may be NULL, and
+// hidden and inter multiples of 64 they are WMMA kernels with the grouped
+// tier's per-element chain, bitwise equal to the next tiers row by row), the
+// Turbine prefill WMMA kernels (moe_grouped.hip, impl
+// "turbine_hip_moe_wmma_prefill"; hidden and inter multiples of 256; the
+// default's choice above the small-m tier), the Turbine grouped WMMA kernels
+// (moe_grouped.hip, impl "turbine_hip_moe_wmma"; hidden and inter multiples of
+// 64), all three reading the group sizes from expert_offsets on the device
+// (host_expert_offsets may be NULL, and
 // turbine_moe_experts_needs_host_offsets says so), and the hipBLASLt paths,
 // which read host_expert_offsets:
 //   1. gather: the rows routed to local experts are contiguous in sorted_rows
@@ -53,6 +56,7 @@ namespace {
 
 constexpr const char *kImplRoute = "turbine_hip";
 constexpr const char *kImplSmallM = "turbine_hip_moe_small_m";
+constexpr const char *kImplWmmaPrefill = "turbine_hip_moe_wmma_prefill";
 constexpr const char *kImplWmma = "turbine_hip_moe_wmma";
 constexpr const char *kImplPerExpert = "hipblaslt_per_expert";
 constexpr const char *kImplGrouped = "hipblaslt_grouped";
@@ -354,16 +358,17 @@ int32_t run_experts(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                                          d->out);
 }
 
-// The device-offset paths (small-m, grouped WMMA): positions, fused gate-up
-// with SiLU, down, then the ordered scatter; no host data.
+// The device-offset paths (small-m, prefill WMMA, grouped WMMA): positions,
+// fused gate-up with SiLU, down, then the ordered scatter; no host data.
 int32_t run_device_offsets(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
-                           bool small) {
+                           turbine_hip::MoePath path) {
+  using turbine_hip::MoePath;
   if (!aligned16(d->x) || !aligned16(d->w_gate) || !aligned16(d->w_up) ||
       !aligned16(d->w_down)) {
     return fail(ctx, TURBINE_E_ARGUMENT,
-                std::string("turbine_moe_experts: the ") +
-                    (small ? "small-m" : "grouped WMMA") +
-                    " path needs 16-byte aligned x and expert weights");
+                std::string("turbine_moe_experts: implementation ") +
+                    turbine_hip::moe_path_name(path) +
+                    " needs 16-byte aligned x and expert weights");
   }
   const size_t rows = static_cast<size_t>(d->num_tokens) * d->top_k;
   const size_t pos_bytes = align_up(rows * 4);
@@ -377,12 +382,20 @@ int32_t run_device_offsets(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
   auto *pos = reinterpret_cast<int32_t *>(ws);
   char *act = ws + pos_bytes;
   char *down = act + act_bytes;
-  if (int32_t rc = small
-                       ? turbine_hip::launch_moe_small_m(ctx, d, pos, act, down)
-                       : turbine_hip::launch_moe_wmma(ctx, d, pos, act, down);
-      rc != TURBINE_OK) {
-    return rc;
+  int32_t rc = TURBINE_OK;
+  switch (path) {
+  case MoePath::SmallM:
+    rc = turbine_hip::launch_moe_small_m(ctx, d, pos, act, down);
+    break;
+  case MoePath::WmmaPrefill:
+    rc = turbine_hip::launch_moe_wmma_prefill(ctx, d, pos, act, down);
+    break;
+  default:
+    rc = turbine_hip::launch_moe_wmma(ctx, d, pos, act, down);
+    break;
   }
+  if (rc != TURBINE_OK)
+    return rc;
   return turbine_hip::launch_moe_scatter(ctx, down, pos, d->topk_weights,
                                          d->num_tokens, d->hidden, d->top_k,
                                          d->out);
@@ -443,6 +456,8 @@ const char *moe_path_name(MoePath path) {
   switch (path) {
   case MoePath::SmallM:
     return kImplSmallM;
+  case MoePath::WmmaPrefill:
+    return kImplWmmaPrefill;
   case MoePath::Wmma:
     return kImplWmma;
   case MoePath::Grouped:
@@ -459,6 +474,8 @@ bool moe_experts_supports(const turbine_moe_experts_desc *d, MoePath path) {
   switch (path) {
   case MoePath::SmallM:
     return d->hidden % 8 == 0 && d->inter % 8 == 0;
+  case MoePath::WmmaPrefill:
+    return moe_prefill_shape(d);
   case MoePath::Wmma:
     return moe_wmma_shape(d);
   case MoePath::Grouped:
@@ -484,7 +501,9 @@ int32_t moe_experts_run(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
             (experts_supported(d) ? std::string(" for ") + moe_path_name(path)
                                   : std::string()));
   }
-  const bool device_offsets = path == MoePath::SmallM || path == MoePath::Wmma;
+  const bool device_offsets = path == MoePath::SmallM ||
+                              path == MoePath::WmmaPrefill ||
+                              path == MoePath::Wmma;
   if (!device_offsets && d->host_expert_offsets == nullptr) {
     return fail(
         ctx, TURBINE_E_ARGUMENT,
@@ -508,7 +527,7 @@ int32_t moe_experts_run(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
   if (int32_t rc = enter(ctx); rc != TURBINE_OK)
     return rc;
   if (device_offsets)
-    return run_device_offsets(ctx, d, path == MoePath::SmallM);
+    return run_device_offsets(ctx, d, path);
   return run_experts(ctx, d, path == MoePath::Grouped);
 }
 
