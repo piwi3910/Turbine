@@ -335,6 +335,12 @@ wait_for_result() {
 		[[ "$succeeded" == 1 || -n "$failed" ]] && break
 		sleep 5
 	done
+	# Keep the complete pod log before anything can delete the Job: the live stream above can
+	# drop mid-run, and the Job (with its log) goes away on cleanup.
+	local keep="${REPO_ROOT}/target/lab-test/${RUN_ID}"
+	mkdir -p "$keep" &&
+		kube "-n ${NS} logs job/${job}" >"${keep}/${what}.log" 2>&1 &&
+		say "full ${what} log kept at ${keep}/${what}.log"
 	[[ "$succeeded" == 1 ]] && return 0
 	local code
 	code="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.containerStatuses[0].state.terminated.exitCode}'" || true)"
