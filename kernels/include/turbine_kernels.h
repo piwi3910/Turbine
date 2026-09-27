@@ -394,10 +394,12 @@ uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
  * TURBINE_E_UNSUPPORTED. */
-/* 1 = time the GEMM algorithm candidates per shape at first use (default 1),
- * 0 = take the first heuristic answer */
+/* 1 = GEMM shapes the library's tuned algorithm table for the device's card
+ * has a row for run that row's pinned algorithm (default 1), 0 = the first
+ * heuristic answer for every shape */
 #define TURBINE_OPTION_GEMM_AUTOTUNE 1
-/* read only: number of GEMM shapes tuned so far on this context */
+/* read only: number of GEMM shapes run so far on this context that use a
+ * pinned algorithm of the tuned table */
 #define TURBINE_OPTION_GEMM_TUNED_SHAPES 2
 int32_t turbine_ctx_set_option(turbine_ctx *ctx, int32_t option, int64_t value);
 /* out is a host int64_t. */

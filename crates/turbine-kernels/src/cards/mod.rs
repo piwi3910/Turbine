@@ -131,6 +131,8 @@ pub fn profile_archs() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use turbine_core::types::{DeviceId, MemoryKind, Vendor};
     use turbine_device::DeviceMemoryInfo;
 
@@ -268,5 +270,72 @@ mod tests {
         let cmake = conformance::cmake_profile_archs("kernels/rocm/cmake/card_profiles.cmake")
             .expect("card_profiles.cmake");
         assert_eq!(cmake, profile_archs());
+    }
+
+    /// Every tuned GEMM table (`kernels/rocm/tuning/<arch>/gemm.tsv`, compiled into the HIP
+    /// library by `kernels/rocm/cmake/gemm_table.py`) belongs to a registered profile's
+    /// architecture, and its rows are well formed: positive n, k and m_max, trans_b 0 or 1, a
+    /// `bf16` / `f32` output, a solution index and name (or -1 and `heuristic`), m_max strictly
+    /// ascending per shape.
+    /// Breaks if a table is added for an architecture no profile describes (it would never be
+    /// built) or a hand edit leaves a row the build refuses.
+    #[test]
+    fn tuned_gemm_tables_are_card_data() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/rocm/tuning");
+        let archs = profile_archs();
+        for entry in std::fs::read_dir(&dir).expect("kernels/rocm/tuning") {
+            let entry = entry.expect("tuning entry");
+            if !entry.file_type().expect("file type").is_dir() {
+                continue;
+            }
+            let arch = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                archs.contains(&arch.as_str()),
+                "kernels/rocm/tuning/{arch}: no card profile lists {arch} ({archs:?})"
+            );
+            let Ok(text) = std::fs::read_to_string(entry.path().join("gemm.tsv")) else {
+                continue;
+            };
+            let mut last: Option<((i64, i64, i64, String), i64)> = None;
+            for (i, line) in text.lines().enumerate() {
+                if line.trim().is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let at = format!("{arch}/gemm.tsv:{}", i + 1);
+                let c: Vec<&str> = line.split('\t').collect();
+                assert!(c.len() >= 7, "{at}: {} columns", c.len());
+                let num = |j: usize| {
+                    c[j].parse::<i64>()
+                        .unwrap_or_else(|e| panic!("{at}: column {j}: {e}"))
+                };
+                let (n, k, trans_b, m_max, index) = (num(0), num(1), num(2), num(4), num(5));
+                assert_eq!(
+                    c[6] == "heuristic",
+                    index == -1,
+                    "{at}: index -1 goes with `heuristic`"
+                );
+                assert!(index >= -1, "{at}: solution index");
+                assert!(n > 0 && k > 0 && m_max > 0, "{at}: n, k, m_max positive");
+                assert!(trans_b <= 1, "{at}: trans_b");
+                assert!(matches!(c[3], "bf16" | "f32"), "{at}: c_dtype {}", c[3]);
+                assert!(
+                    !c[6].is_empty()
+                        && c[6]
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+                    "{at}: solution name"
+                );
+                let shape = (n, k, trans_b, c[3].to_string());
+                if let Some((prev, prev_m)) = &last
+                    && *prev == shape
+                {
+                    assert!(
+                        m_max > *prev_m,
+                        "{at}: m_max not ascending within the shape"
+                    );
+                }
+                last = Some((shape, m_max));
+            }
+        }
     }
 }

@@ -61,11 +61,12 @@ use crate::{KernelError, TURBINE_KERNELS_ABI_VERSION};
 /// Environment variable naming the shim library when `execution.kernel_library` is null.
 const KERNEL_LIBRARY_VAR: &str = "TURBINE_KERNEL_LIBRARY";
 
-/// Context option (ABI v2.1) `TURBINE_OPTION_GEMM_AUTOTUNE`: 1 times the GEMM algorithm
-/// candidates per shape at first use, 0 takes the first heuristic answer.
+/// Context option (ABI v2.1) `TURBINE_OPTION_GEMM_AUTOTUNE`: 1 (the library default) runs the
+/// pinned algorithm of the library's tuned GEMM table for the card wherever the table has a row
+/// for the shape, 0 takes the first heuristic answer for every shape (`execution.gemm_autotune`).
 pub const TURBINE_OPTION_GEMM_AUTOTUNE: i32 = 1;
-/// Read-only context option (ABI v2.1) `TURBINE_OPTION_GEMM_TUNED_SHAPES`: GEMM shapes tuned so
-/// far on the context.
+/// Read-only context option (ABI v2.1) `TURBINE_OPTION_GEMM_TUNED_SHAPES`: GEMM shapes run so far
+/// on the context that use a pinned algorithm of the tuned table.
 pub const TURBINE_OPTION_GEMM_TUNED_SHAPES: i32 = 2;
 
 /// A loaded kernel shim library whose ABI version and backend name have been checked.

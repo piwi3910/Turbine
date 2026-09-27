@@ -121,6 +121,27 @@ add_custom_command(
   DEPENDS "${CK_FMHA_DIR}/generate.py" ${FMHA_CODEGEN_SCRIPTS}
   COMMENT "Generating CK FMHA forward and pagedkv instances for ${GPU_TARGETS}")
 
+# ---- tuned GEMM tables: kernels/rocm/tuning/<arch>/gemm.tsv, compiled in ----
+# One row per GEMM shape and m bucket: the hipBLASLt solution the tuner
+# (turbine_gemm_tune below) measured fastest on that card. Editing a table re-runs
+# the configure step.
+set(TURBINE_TUNING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tuning")
+set(GEMM_TABLE_INC "${CMAKE_BINARY_DIR}/gemm_tuned_table.inc")
+set(gemm_table_sources "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gemm_table.py")
+foreach(arch IN LISTS GPU_TARGETS)
+  if(EXISTS "${TURBINE_TUNING_DIR}/${arch}/gemm.tsv")
+    list(APPEND gemm_table_sources "${TURBINE_TUNING_DIR}/${arch}/gemm.tsv")
+  endif()
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${gemm_table_sources})
+execute_process(
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gemm_table.py"
+    --tuning-dir "${TURBINE_TUNING_DIR}" --archs "${GPU_TARGETS}" --out "${GEMM_TABLE_INC}"
+  RESULT_VARIABLE gemm_table_rc)
+if(NOT gemm_table_rc EQUAL 0)
+  message(FATAL_ERROR "cmake/gemm_table.py failed (${gemm_table_rc}): a tuned GEMM table is malformed")
+endif()
+
 # ---- the shared libraries ----
 # Every kernel source is compiled once into an OBJECT library. libturbine_hip.so
 # links it with the ABI v2.4 exports (impl_exports.cpp) and abi_minor.cpp
@@ -135,6 +156,7 @@ set(TURBINE_SOURCES
   src/copy_stream.cpp
   src/graph.cpp
   src/gemm.cpp
+  src/gemm_table.cpp
   src/attention.cpp
   src/rmsnorm.cpp
   src/elementwise.hip
@@ -171,7 +193,8 @@ function(turbine_hip_settings target)
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CK_ROOT}/include"
     "${CK_FMHA_DIR}"
-    "${FMHA_GEN_DIR}")
+    "${FMHA_GEN_DIR}"
+    "${CMAKE_BINARY_DIR}")
   target_compile_definitions(${target} PRIVATE
     TURBINE_CK_COMMIT="${TURBINE_CK_COMMIT}"
     TURBINE_BUILD_ARCHS="${TURBINE_BUILD_ARCHS}")
@@ -202,3 +225,15 @@ turbine_hip_library(turbine_hip ${TURBINE_LIBRARY_SOURCES})
 # abi_minor.cpp is compiled once more for the v2.3 build, with its define.
 turbine_hip_library(turbine_hip_v23 src/abi_minor.cpp)
 target_compile_definitions(turbine_hip_v23 PRIVATE TURBINE_V23_BUILD)
+
+# The GEMM tuner: times every hipBLASLt solution for the shapes of
+# tuning/gemm_shapes.txt on the current device and writes tuning/<arch>/gemm.tsv
+# (docs/extending/card-family.md, "Tuned GEMM table"). A lab tool, not loaded by
+# the server.
+add_executable(turbine_gemm_tune tools/gemm_tune.cpp)
+set_source_files_properties(tools/gemm_tune.cpp PROPERTIES LANGUAGE HIP)
+set_target_properties(turbine_gemm_tune PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+target_include_directories(turbine_gemm_tune PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(turbine_gemm_tune PRIVATE hip::host roc::hipblaslt)

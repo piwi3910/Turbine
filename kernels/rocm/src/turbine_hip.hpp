@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <tuple>
 
@@ -36,6 +37,15 @@ constexpr size_t kGemmAlgoCacheEntries = 1024;
 // (m, n, k, lda, ldb, ldc, trans_b, c_dtype)
 using GemmKey = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                            int32_t, int32_t>;
+
+// The hipBLASLt algorithm a GEMM shape runs, and whether it came from the
+// tuned table (gemm_table.hpp) or the first heuristic answer.
+struct GemmChoice {
+  hipblasLtMatmulAlgo_t algo;
+  bool tuned;
+};
+
+struct TunedGemm;
 
 // The card profile a context holds (ABI v2.4 turbine_card_profile, copied by
 // turbine_ctx_set_profile). The turbine_<op> entry points read their
@@ -82,7 +92,16 @@ struct turbine_ctx {
   size_t moe_scratch_bytes = 0;
   // hipBLASLt returned a grouped-GEMM solution for this device at creation.
   bool moe_grouped = false;
-  std::map<turbine_hip::GemmKey, hipblasLtMatmulAlgo_t> gemm_algos;
+  std::map<turbine_hip::GemmKey, turbine_hip::GemmChoice> gemm_algos;
+  // TURBINE_OPTION_GEMM_AUTOTUNE: shapes the tuned table (gemm_table.hpp) has
+  // a row for run its pinned solution (default); false = the first heuristic
+  // answer for every shape.
+  bool gemm_table = true;
+  // hipBLASLt solution name -> index per output dtype, read once when a table
+  // row's pinned index does not carry its name (gemm_table.cpp).
+  std::map<int32_t, std::map<std::string, int>> gemm_solutions;
+  // Table rows whose fallback was logged (once per row and context).
+  std::set<const turbine_hip::TunedGemm *> gemm_table_logged;
   // True between turbine_graph_begin and turbine_graph_end (graph.cpp): the
   // stream is being captured, so copies, syncs and allocations are refused.
   bool capturing = false;

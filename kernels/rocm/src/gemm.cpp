@@ -1,12 +1,16 @@
 // GEMM through hipBLASLt.
 //
-// Row-major c[m,n] = alpha * a[m,k] . op(b) + beta * c is computed as the
-// column-major product c^T[n,m] = op(b)^T[n,k] . a^T[k,m]: hipBLASLt's A is
-// the weight (column-major k x n with ld ldb and HIPBLAS_OP_T when b is [n,k];
-// n x k with HIPBLAS_OP_N when b is [k,n]), its B the activation (k x m, ld
-// lda, HIPBLAS_OP_N), C and D the output (n x m, ld ldc). F32 accumulation.
-#include <string>
+// The problem (layouts, transposes, F32 accumulation) is gemm_problem.hpp's.
+// The algorithm per shape: the tuned table's pinned solution when the context
+// has the table on (TURBINE_OPTION_GEMM_AUTOTUNE, default) and the table has a
+// row for the shape on this card (gemm_table.hpp); otherwise, or when the
+// pinned solution is not available in this hipBLASLt or rejects the problem
+// (logged once per row with its reason code), hipBLASLt's first heuristic
+// answer. The choice is cached per exact shape for the context's lifetime.
+#include <cstdio>
 
+#include "gemm_problem.hpp"
+#include "gemm_table.hpp"
 #include "turbine_hip.hpp"
 
 using turbine_hip::check_blaslt;
@@ -16,33 +20,6 @@ using turbine_hip::fail;
 namespace {
 
 constexpr const char *kImpl = "hipblaslt";
-
-// Owns one hipBLASLt matrix layout.
-struct Layout {
-  hipblasLtMatrixLayout_t handle = nullptr;
-  ~Layout() {
-    if (handle != nullptr)
-      (void)hipblasLtMatrixLayoutDestroy(handle);
-  }
-};
-
-// Owns one hipBLASLt matmul descriptor.
-struct MatmulDesc {
-  hipblasLtMatmulDesc_t handle = nullptr;
-  ~MatmulDesc() {
-    if (handle != nullptr)
-      (void)hipblasLtMatmulDescDestroy(handle);
-  }
-};
-
-// Owns one hipBLASLt heuristic preference.
-struct Preference {
-  hipblasLtMatmulPreference_t handle = nullptr;
-  ~Preference() {
-    if (handle != nullptr)
-      (void)hipblasLtMatmulPreferenceDestroy(handle);
-  }
-};
 
 bool supported(const turbine_gemm_desc *d) {
   if (d == nullptr)
@@ -93,60 +70,16 @@ int32_t turbine_gemm(turbine_ctx *ctx, const turbine_gemm_desc *d) {
   if (d->a == nullptr || d->b == nullptr || d->c == nullptr) {
     return fail(ctx, TURBINE_E_ARGUMENT, "turbine_gemm: NULL operand");
   }
-  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
-    return rc;
-
-  const hipDataType c_type =
-      d->c_dtype == TURBINE_DTYPE_F32 ? HIP_R_32F : HIP_R_16BF;
-  const hipblasOperation_t op_weight =
-      d->trans_b == 1 ? HIPBLAS_OP_T : HIPBLAS_OP_N;
-  const hipblasOperation_t op_act = HIPBLAS_OP_N;
-
-  MatmulDesc desc;
-  int32_t rc = check_blaslt(
-      ctx,
-      hipblasLtMatmulDescCreate(&desc.handle, HIPBLAS_COMPUTE_32F, HIP_R_32F),
-      "hipblasLtMatmulDescCreate");
-  if (rc != TURBINE_OK)
-    return rc;
-  rc = check_blaslt(
-      ctx,
-      hipblasLtMatmulDescSetAttribute(desc.handle, HIPBLASLT_MATMUL_DESC_TRANSA,
-                                      &op_weight, sizeof(op_weight)),
-      "hipblasLtMatmulDescSetAttribute TRANSA");
-  if (rc != TURBINE_OK)
-    return rc;
-  rc = check_blaslt(
-      ctx,
-      hipblasLtMatmulDescSetAttribute(desc.handle, HIPBLASLT_MATMUL_DESC_TRANSB,
-                                      &op_act, sizeof(op_act)),
-      "hipblasLtMatmulDescSetAttribute TRANSB");
+  int32_t rc = enter(ctx);
   if (rc != TURBINE_OK)
     return rc;
 
-  const uint64_t m = static_cast<uint64_t>(d->m);
-  const uint64_t n = static_cast<uint64_t>(d->n);
-  const uint64_t k = static_cast<uint64_t>(d->k);
-  Layout weight;
-  Layout act;
-  Layout out;
-  rc = check_blaslt(ctx,
-                    d->trans_b == 1
-                        ? hipblasLtMatrixLayoutCreate(&weight.handle,
-                                                      HIP_R_16BF, k, n, d->ldb)
-                        : hipblasLtMatrixLayoutCreate(&weight.handle,
-                                                      HIP_R_16BF, n, k, d->ldb),
-                    "hipblasLtMatrixLayoutCreate weight");
-  if (rc != TURBINE_OK)
-    return rc;
+  const turbine_hip::GemmShape shape{d->m,   d->n,   d->k,       d->lda,
+                                     d->ldb, d->ldc, d->trans_b, d->c_dtype};
+  turbine_hip::GemmProblem problem;
+  const hipblasStatus_t made = problem.make(shape);
   rc = check_blaslt(
-      ctx, hipblasLtMatrixLayoutCreate(&act.handle, HIP_R_16BF, k, m, d->lda),
-      "hipblasLtMatrixLayoutCreate activation");
-  if (rc != TURBINE_OK)
-    return rc;
-  rc = check_blaslt(
-      ctx, hipblasLtMatrixLayoutCreate(&out.handle, c_type, n, m, d->ldc),
-      "hipblasLtMatrixLayoutCreate output");
+      ctx, made, problem.failed != nullptr ? problem.failed : "turbine_gemm");
   if (rc != TURBINE_OK)
     return rc;
 
@@ -154,47 +87,74 @@ int32_t turbine_gemm(turbine_ctx *ctx, const turbine_gemm_desc *d) {
                                  d->ldb, d->ldc, d->trans_b, d->c_dtype};
   auto found = ctx->gemm_algos.find(key);
   if (found == ctx->gemm_algos.end()) {
-    Preference pref;
-    rc = check_blaslt(ctx, hipblasLtMatmulPreferenceCreate(&pref.handle),
-                      "hipblasLtMatmulPreferenceCreate");
-    if (rc != TURBINE_OK)
-      return rc;
-    const uint64_t max_ws = turbine_hip::kGemmWorkspaceBytes;
-    rc =
-        check_blaslt(ctx,
-                     hipblasLtMatmulPreferenceSetAttribute(
-                         pref.handle, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                         &max_ws, sizeof(max_ws)),
-                     "hipblasLtMatmulPreferenceSetAttribute");
-    if (rc != TURBINE_OK)
-      return rc;
-    hipblasLtMatmulHeuristicResult_t result{};
-    int returned = 0;
-    rc = check_blaslt(
-        ctx,
-        hipblasLtMatmulAlgoGetHeuristic(ctx->blaslt, desc.handle, weight.handle,
-                                        act.handle, out.handle, out.handle,
-                                        pref.handle, 1, &result, &returned),
-        "hipblasLtMatmulAlgoGetHeuristic");
-    if (rc != TURBINE_OK)
-      return rc;
-    if (returned < 1 || result.state != HIPBLAS_STATUS_SUCCESS) {
-      return fail(ctx, TURBINE_E_UNSUPPORTED,
-                  "hipblasLtMatmulAlgoGetHeuristic: no algorithm for m=" +
-                      std::to_string(d->m) + " n=" + std::to_string(d->n) +
-                      " k=" + std::to_string(d->k));
+    turbine_hip::GemmChoice choice{};
+    bool chosen = false;
+    const std::string &arch =
+        ctx->profile.arch.empty() ? ctx->arch : ctx->profile.arch;
+    const turbine_hip::TunedGemm *row =
+        ctx->gemm_table ? turbine_hip::tuned_gemm(arch, shape) : nullptr;
+    if (row != nullptr && row->solution_index >= 0) {
+      turbine_hip::TunedGemmMiss miss{};
+      chosen = turbine_hip::resolve_tuned_gemm(ctx, *row, problem, &d->alpha,
+                                               &d->beta, &choice.algo, &miss);
+      choice.tuned = chosen;
+      if (!chosen && ctx->gemm_table_logged.insert(row).second) {
+        std::fprintf(stderr,
+                     "turbine_hip: event=gemm_table_fallback reason=%s "
+                     "arch=%s m=%lld n=%lld k=%lld c_dtype=%d solution=%s: "
+                     "running hipBLASLt's first heuristic answer\n",
+                     turbine_hip::tuned_gemm_miss_code(miss), arch.c_str(),
+                     static_cast<long long>(d->m), static_cast<long long>(d->n),
+                     static_cast<long long>(d->k), d->c_dtype,
+                     row->solution_name);
+      }
+    }
+    if (!chosen) {
+      turbine_hip::Preference pref;
+      rc = check_blaslt(ctx, hipblasLtMatmulPreferenceCreate(&pref.handle),
+                        "hipblasLtMatmulPreferenceCreate");
+      if (rc != TURBINE_OK)
+        return rc;
+      const uint64_t max_ws = turbine_hip::kGemmWorkspaceBytes;
+      rc = check_blaslt(ctx,
+                        hipblasLtMatmulPreferenceSetAttribute(
+                            pref.handle,
+                            HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws,
+                            sizeof(max_ws)),
+                        "hipblasLtMatmulPreferenceSetAttribute");
+      if (rc != TURBINE_OK)
+        return rc;
+      hipblasLtMatmulHeuristicResult_t result{};
+      int returned = 0;
+      rc = check_blaslt(ctx,
+                        hipblasLtMatmulAlgoGetHeuristic(
+                            ctx->blaslt, problem.desc.handle,
+                            problem.weight.handle, problem.act.handle,
+                            problem.out.handle, problem.out.handle, pref.handle,
+                            1, &result, &returned),
+                        "hipblasLtMatmulAlgoGetHeuristic");
+      if (rc != TURBINE_OK)
+        return rc;
+      if (returned < 1 || result.state != HIPBLAS_STATUS_SUCCESS) {
+        return fail(ctx, TURBINE_E_UNSUPPORTED,
+                    "hipblasLtMatmulAlgoGetHeuristic: no algorithm for m=" +
+                        std::to_string(d->m) + " n=" + std::to_string(d->n) +
+                        " k=" + std::to_string(d->k));
+      }
+      choice = turbine_hip::GemmChoice{result.algo, false};
     }
     if (ctx->gemm_algos.size() >= turbine_hip::kGemmAlgoCacheEntries) {
       ctx->gemm_algos.clear();
     }
-    found = ctx->gemm_algos.emplace(key, result.algo).first;
+    found = ctx->gemm_algos.emplace(key, choice).first;
   }
 
   return check_blaslt(
       ctx,
-      hipblasLtMatmul(ctx->blaslt, desc.handle, &d->alpha, d->b, weight.handle,
-                      d->a, act.handle, &d->beta, d->c, out.handle, d->c,
-                      out.handle, &found->second, ctx->workspace,
+      hipblasLtMatmul(ctx->blaslt, problem.desc.handle, &d->alpha, d->b,
+                      problem.weight.handle, d->a, problem.act.handle, &d->beta,
+                      d->c, problem.out.handle, d->c, problem.out.handle,
+                      &found->second.algo, ctx->workspace,
                       turbine_hip::kGemmWorkspaceBytes, ctx->stream),
       "hipblasLtMatmul");
 }

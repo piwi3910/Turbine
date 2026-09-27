@@ -60,6 +60,7 @@ SLOW_TESTS=(
 	every_implementation_matches_cpu
 	implementations_enumerated
 	gemm_matches_cpu
+	gemm_table_matches_cpu
 	norm_rope_silu_embedding_add_match_cpu
 	paged_prefill_ck_128_matches_cpu
 	paged_and_moe_ops

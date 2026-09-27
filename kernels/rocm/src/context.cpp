@@ -276,6 +276,64 @@ void turbine_ctx_destroy(turbine_ctx *ctx) {
   release(ctx);
 }
 
+// Context options (ABI v2.1). TURBINE_OPTION_GEMM_AUTOTUNE switches the tuned
+// GEMM table (gemm_table.hpp) on (1, the default) or off (0: hipBLASLt's first
+// heuristic answer for every shape); changing it drops the cached choices.
+// TURBINE_OPTION_GEMM_TUNED_SHAPES (read only) counts the cached GEMM shapes
+// that run a pinned solution of the table.
+int32_t turbine_ctx_set_option(turbine_ctx *ctx, int32_t option,
+                               int64_t value) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  switch (option) {
+  case TURBINE_OPTION_GEMM_AUTOTUNE:
+    if (value != 0 && value != 1) {
+      return turbine_hip::fail(ctx, TURBINE_E_ARGUMENT,
+                               "turbine_ctx_set_option: GEMM_AUTOTUNE takes 0 "
+                               "or 1, not " +
+                                   std::to_string(value));
+    }
+    if (ctx->gemm_table != (value == 1)) {
+      ctx->gemm_table = value == 1;
+      ctx->gemm_algos.clear();
+    }
+    return TURBINE_OK;
+  case TURBINE_OPTION_GEMM_TUNED_SHAPES:
+    return turbine_hip::fail(ctx, TURBINE_E_ARGUMENT,
+                             "turbine_ctx_set_option: GEMM_TUNED_SHAPES is "
+                             "read only");
+  default:
+    return turbine_hip::fail(ctx, TURBINE_E_UNSUPPORTED,
+                             "turbine_ctx_set_option: unknown option " +
+                                 std::to_string(option));
+  }
+}
+
+int32_t turbine_ctx_get_option(turbine_ctx *ctx, int32_t option, int64_t *out) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (out == nullptr) {
+    return turbine_hip::fail(ctx, TURBINE_E_ARGUMENT,
+                             "turbine_ctx_get_option: out is NULL");
+  }
+  switch (option) {
+  case TURBINE_OPTION_GEMM_AUTOTUNE:
+    *out = ctx->gemm_table ? 1 : 0;
+    return TURBINE_OK;
+  case TURBINE_OPTION_GEMM_TUNED_SHAPES: {
+    int64_t tuned = 0;
+    for (const auto &entry : ctx->gemm_algos)
+      tuned += entry.second.tuned ? 1 : 0;
+    *out = tuned;
+    return TURBINE_OK;
+  }
+  default:
+    return turbine_hip::fail(ctx, TURBINE_E_UNSUPPORTED,
+                             "turbine_ctx_get_option: unknown option " +
+                                 std::to_string(option));
+  }
+}
+
 size_t turbine_last_error(turbine_ctx *ctx, char *buf, size_t len) {
   std::string msg;
   if (ctx == nullptr) {

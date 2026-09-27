@@ -24,7 +24,8 @@ use turbine_kernels::{
     EmbeddingContext, GemmConfig, GemmContext, ImplChoice, ImplInfo, KernelProvider, KvCopyConfig,
     KvCopyContext, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
     MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, OpConfig, OpKind,
-    PagedAttentionContext, RopeConfig, RopeContext, ShimLibrary, cpu_reference_provider,
+    PagedAttentionContext, RopeConfig, RopeContext, ShimContext, ShimLibrary,
+    TURBINE_OPTION_GEMM_AUTOTUNE, TURBINE_OPTION_GEMM_TUNED_SHAPES, cpu_reference_provider,
     shim_provider,
 };
 use turbine_tensor::host::HostMemory;
@@ -56,6 +57,9 @@ struct Pair {
     /// The HIP provider takes the library's own choice per call (`false`: bound to one
     /// implementation by `every_implementation_matches_cpu`).
     legacy: bool,
+    /// The HIP context (its options) and the device architecture.
+    ctx: Arc<ShimContext>,
+    arch: String,
 }
 
 /// Serializes the tests of this binary: device discovery (amd-smi) runs once at a time per
@@ -92,11 +96,16 @@ fn setup() -> Pair {
     let hip_mem: Arc<dyn DeviceMemory> = ctx.clone();
     let cpu_mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(u32::MAX), 16 << 30);
     Pair {
-        hip: shim_provider(ctx),
+        hip: shim_provider(Arc::clone(&ctx)),
         cpu: cpu_reference_provider(),
         hip_mem,
         cpu_mem,
         legacy: true,
+        ctx,
+        arch: device
+            .arch
+            .clone()
+            .expect("the AMD device reports its architecture"),
     }
 }
 
@@ -4190,6 +4199,8 @@ fn bound(p: &Pair, spec: &OpConfig, index: u32) -> Pair {
         hip_mem: Arc::clone(&p.hip_mem),
         cpu_mem: Arc::clone(&p.cpu_mem),
         legacy: false,
+        ctx: Arc::clone(&p.ctx),
+        arch: p.arch.clone(),
     }
 }
 
@@ -4444,4 +4455,212 @@ fn every_implementation_matches_cpu() {
             );
         }
     }
+}
+
+/// One row of a tuned GEMM table (`kernels/rocm/tuning/<arch>/gemm.tsv`): the shape and the
+/// largest m it serves.
+struct TunedRow {
+    n: usize,
+    k: usize,
+    c_dtype: DType,
+    m_max: usize,
+    /// The row pins a solution (`false`: `heuristic`, hipBLASLt's own answer per call).
+    pinned: bool,
+}
+
+/// The rows of the tuned GEMM table of `arch`, in file order; empty when the card has none.
+fn tuned_rows(arch: &str) -> Vec<TunedRow> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../kernels/rocm/tuning")
+        .join(arch)
+        .join("gemm.tsv");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            let num = |i: usize| c[i].parse::<usize>().expect("numeric column");
+            TunedRow {
+                n: num(0),
+                k: num(1),
+                c_dtype: if c[3] == "f32" {
+                    DType::F32
+                } else {
+                    DType::BF16
+                },
+                m_max: num(4),
+                pinned: c[6] != "heuristic",
+            }
+        })
+        .collect()
+}
+
+/// A GEMM of `m` rows on HIP (the whole batch, through the library's own algorithm choice)
+/// checked against the CPU reference on a few of its rows: a row's result does not depend on the
+/// other rows, and the full reference of an 8,192-row prefill GEMM is too slow for a test.
+fn gemm_rows_case(
+    p: &Pair,
+    rng: &mut Rng,
+    m: usize,
+    (b_hip, b_cpu): (&Tensor, &Tensor),
+    c_dtype: DType,
+) {
+    let (n, k) = (b_hip.shape[0], b_hip.shape[1]);
+    let a = rng.normal(m * k, 1.0);
+    let a_hip = on_hip(p, &[m, k], DType::BF16, &a);
+    let c_hip = zeros_on_hip(p, &[m, n], c_dtype);
+    let hip = p.hip.gemm().expect("hip gemm");
+    let mut ctx = GemmContext {
+        a: a_hip.view(),
+        b: b_hip.view(),
+        c: c_hip.view(),
+        trans_b: true,
+        alpha: 1.0,
+        beta: 0.0,
+    };
+    hip.execute(&mut ctx).expect("hip gemm");
+    let mut sample = vec![0, m / 3, 2 * m / 3, m - 1];
+    sample.dedup();
+    let rows: Vec<f32> = sample
+        .iter()
+        .flat_map(|&r| a[r * k..(r + 1) * k].iter().copied())
+        .collect();
+    let (_, a_cpu) = twin(p, &[sample.len(), k], DType::BF16, &rows);
+    let (_, c_cpu) = twin(p, &[sample.len(), n], c_dtype, &vec![0.0; sample.len() * n]);
+    let mut ctx = GemmContext {
+        a: a_cpu.view(),
+        b: b_cpu.view(),
+        c: c_cpu.view(),
+        trans_b: true,
+        alpha: 1.0,
+        beta: 0.0,
+    };
+    p.cpu
+        .gemm()
+        .expect("cpu gemm")
+        .execute(&mut ctx)
+        .expect("cpu gemm");
+    let want = read(&c_cpu);
+    for (i, &r) in sample.iter().enumerate() {
+        let got = decode(
+            c_dtype,
+            &c_hip
+                .view()
+                .rows(r, 1)
+                .slice
+                .read_bytes()
+                .expect("read row"),
+        );
+        assert_close(
+            &format!("tuned gemm m={m} n={n} k={k} row {r}"),
+            "hipblaslt",
+            &got,
+            &want[i * n..(i + 1) * n],
+            c_dtype,
+        );
+    }
+}
+
+/// The card's tuned GEMM table (kernels/rocm/tuning/<arch>/gemm.tsv, compiled into the library):
+/// every row, at the smallest and the largest m it serves, runs as written — a pinned row's
+/// solution (the context's `TURBINE_OPTION_GEMM_TUNED_SHAPES` grows by one per new shape, so no
+/// row fell back with `gemm_table_unavailable` / `_unsupported`), a `heuristic` row hipBLASLt's
+/// own answer (the count stays) — and matches the CPU reference
+/// with the Phase 1 GEMM tolerance. With `TURBINE_OPTION_GEMM_AUTOTUNE` 0 the same shapes run the
+/// heuristic's choice (the count stays 0). Breaks if a pinned solution is missing from the
+/// installed hipBLASLt, rejects its shape, or computes a wrong result.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn gemm_table_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let rows = tuned_rows(&p.arch);
+    assert!(
+        !rows.is_empty(),
+        "no tuned GEMM table for {} (kernels/rocm/tuning/{}/gemm.tsv)",
+        p.arch,
+        p.arch
+    );
+    assert_eq!(
+        p.ctx
+            .get_option(TURBINE_OPTION_GEMM_AUTOTUNE)
+            .expect("option"),
+        1,
+        "the tuned table is on by default"
+    );
+    let tuned = || {
+        p.ctx
+            .get_option(TURBINE_OPTION_GEMM_TUNED_SHAPES)
+            .expect("option")
+    };
+    let mut rng = Rng(7);
+    let mut weights: Option<((usize, usize), Tensor, Tensor)> = None;
+    let mut prev: Option<(usize, usize, DType, usize)> = None;
+    let mut cases = 0;
+    for row in &rows {
+        let m_min = match prev {
+            Some((n, k, c, m)) if (n, k, c) == (row.n, row.k, row.c_dtype) => m + 1,
+            _ => 1,
+        };
+        prev = Some((row.n, row.k, row.c_dtype, row.m_max));
+        if weights.as_ref().is_none_or(|w| w.0 != (row.n, row.k)) {
+            let b_scale = 1.0 / (row.k as f32).sqrt();
+            let (b_hip, b_cpu) = twin(
+                &p,
+                &[row.n, row.k],
+                DType::BF16,
+                &rng.normal(row.n * row.k, b_scale),
+            );
+            weights = Some(((row.n, row.k), b_hip, b_cpu));
+        }
+        let (_, b_hip, b_cpu) = weights.as_ref().expect("weights");
+        let mut ms = vec![m_min, row.m_max];
+        ms.dedup();
+        for m in ms {
+            let before = tuned();
+            gemm_rows_case(&p, &mut rng, m, (b_hip, b_cpu), row.c_dtype);
+            assert_eq!(
+                tuned(),
+                before + i64::from(row.pinned),
+                "gemm m={m} n={} k={} {}: the tuned table's row did not run as written (see \
+                 the library's gemm_table_fallback line on stderr)",
+                row.n,
+                row.k,
+                row.c_dtype.as_str()
+            );
+            cases += usize::from(row.pinned);
+        }
+    }
+    println!(
+        "gemm_table_matches_cpu: {} rows, {cases} shapes on pinned algorithms",
+        rows.len()
+    );
+
+    // Off: the heuristic's first answer for the same shapes; the cached choices were dropped.
+    p.ctx
+        .set_option(TURBINE_OPTION_GEMM_AUTOTUNE, 0)
+        .expect("table off");
+    assert_eq!(tuned(), 0, "turning the table off drops the pinned choices");
+    let row = rows.iter().find(|r| r.pinned).expect("a pinned row");
+    let b_scale = 1.0 / (row.k as f32).sqrt();
+    let (b_hip, b_cpu) = twin(
+        &p,
+        &[row.n, row.k],
+        DType::BF16,
+        &rng.normal(row.n * row.k, b_scale),
+    );
+    gemm_rows_case(&p, &mut rng, row.m_max, (&b_hip, &b_cpu), row.c_dtype);
+    assert_eq!(
+        tuned(),
+        0,
+        "with the table off no shape runs a pinned algorithm"
+    );
+    p.ctx
+        .set_option(TURBINE_OPTION_GEMM_AUTOTUNE, 1)
+        .expect("table on");
 }
