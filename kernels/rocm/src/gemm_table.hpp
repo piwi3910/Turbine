@@ -18,7 +18,12 @@
 // for small problems, so the same solution would sum a row in another order at
 // m = 1 than inside a large batch; with split-K off its sums do not depend on m
 // (row invariance, the tuner's acceptance check). A row of mode `speed` runs
-// through hipblasLtMatmul as tuned (split-K allowed, batch-variant).
+// through hipblasLtMatmul as tuned (split-K allowed, batch-variant). A shape
+// of mode `prefix` has both: speed rows over the decode-sized buckets, run
+// by decode steps, and one invariant class over every bucket, run by the
+// steps that prefill prompt tokens, so a prefix-reused prefill of a prompt's
+// suffix computes each row exactly as the whole-prompt prefill does (Phase 4:
+// warm outputs identical to cold).
 #pragma once
 
 #include <cstdint>
@@ -43,8 +48,12 @@ struct TunedGemm {
   bool invariant;
 };
 
-// The table row serving s on arch, or nullptr when the table has none.
-const TunedGemm *tuned_gemm(const std::string &arch, const GemmShape &s);
+// The table row serving s on arch, or nullptr when the table has none. A shape
+// may have both kinds of rows (tuning mode `prefix`): a prefill step
+// (TURBINE_OPTION_GEMM_PREFILL) takes its invariant rows, a decode step its
+// speed rows; a shape with rows of one kind only uses them for both.
+const TunedGemm *tuned_gemm(const std::string &arch, const GemmShape &s,
+                            bool prefill);
 
 // Why a table row could not be used; the log's reason code.
 enum class TunedGemmMiss {

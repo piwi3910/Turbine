@@ -284,7 +284,9 @@ void turbine_ctx_destroy(turbine_ctx *ctx) {
 // GEMM table (gemm_table.hpp) on (1, the default) or off (0: hipBLASLt's first
 // heuristic answer for every shape); changing it drops the cached choices.
 // TURBINE_OPTION_GEMM_TUNED_SHAPES (read only) counts the cached GEMM shapes
-// that run a pinned solution of the table.
+// that run a pinned solution of the table. TURBINE_OPTION_GEMM_PREFILL marks
+// the following GEMMs as a prefill step's (the table's invariant rows) or a
+// decode step's (its speed rows); choices are cached per mode.
 int32_t turbine_ctx_set_option(turbine_ctx *ctx, int32_t option,
                                int64_t value) {
   if (ctx == nullptr)
@@ -301,6 +303,15 @@ int32_t turbine_ctx_set_option(turbine_ctx *ctx, int32_t option,
       ctx->gemm_table = value == 1;
       ctx->gemm_algos.clear();
     }
+    return TURBINE_OK;
+  case TURBINE_OPTION_GEMM_PREFILL:
+    if (value != 0 && value != 1) {
+      return turbine_hip::fail(ctx, TURBINE_E_ARGUMENT,
+                               "turbine_ctx_set_option: GEMM_PREFILL takes 0 "
+                               "or 1, not " +
+                                   std::to_string(value));
+    }
+    ctx->gemm_prefill = value == 1;
     return TURBINE_OK;
   case TURBINE_OPTION_GEMM_TUNED_SHAPES:
     return turbine_hip::fail(ctx, TURBINE_E_ARGUMENT,
@@ -323,6 +334,9 @@ int32_t turbine_ctx_get_option(turbine_ctx *ctx, int32_t option, int64_t *out) {
   switch (option) {
   case TURBINE_OPTION_GEMM_AUTOTUNE:
     *out = ctx->gemm_table ? 1 : 0;
+    return TURBINE_OK;
+  case TURBINE_OPTION_GEMM_PREFILL:
+    *out = ctx->gemm_prefill ? 1 : 0;
     return TURBINE_OK;
   case TURBINE_OPTION_GEMM_TUNED_SHAPES: {
     int64_t tuned = 0;

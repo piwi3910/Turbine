@@ -303,7 +303,10 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(entry.path().join("gemm.tsv")) else {
                 continue;
             };
-            let mut last: Option<((i64, i64, i64, String), i64)> = None;
+            // Buckets ascend per shape and mode (a `prefix` shape has speed and invariant rows).
+            // (n, k, trans_b, c_dtype, mode) and the previous row's m_max.
+            type ShapeMode = (i64, i64, i64, String, String);
+            let mut last: Option<(ShapeMode, i64)> = None;
             for (i, line) in text.lines().enumerate() {
                 if line.trim().is_empty() || line.starts_with('#') {
                     continue;
@@ -337,13 +340,13 @@ mod tests {
                             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
                     "{at}: solution name"
                 );
-                let shape = (n, k, trans_b, c[3].to_string());
+                let shape = (n, k, trans_b, c[3].to_string(), c[7].to_string());
                 if let Some((prev, prev_m)) = &last
                     && *prev == shape
                 {
                     assert!(
                         m_max > *prev_m,
-                        "{at}: m_max not ascending within the shape"
+                        "{at}: m_max not ascending within the shape and mode"
                     );
                 }
                 last = Some((shape, m_max));

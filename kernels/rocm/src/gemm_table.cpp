@@ -70,20 +70,28 @@ bool algo_at(turbine_ctx *ctx, int index, const char *name,
 
 namespace turbine_hip {
 
-const TunedGemm *tuned_gemm(const std::string &arch, const GemmShape &s) {
-  const TunedGemm *serving = nullptr;
-  const TunedGemm *largest = nullptr;
-  for (const TunedGemm *t = kTable; t->arch != nullptr; ++t) {
-    if (arch != t->arch || t->n != s.n || t->k != s.k ||
-        t->trans_b != s.trans_b || t->c_dtype != s.c_dtype) {
-      continue;
+const TunedGemm *tuned_gemm(const std::string &arch, const GemmShape &s,
+                            bool prefill) {
+  // Rows of the wanted kind (invariant for a prefill step, speed for a decode
+  // step) first; a shape without rows of that kind uses its other rows.
+  for (const bool invariant : {prefill, !prefill}) {
+    const TunedGemm *serving = nullptr;
+    const TunedGemm *largest = nullptr;
+    for (const TunedGemm *t = kTable; t->arch != nullptr; ++t) {
+      if (arch != t->arch || t->n != s.n || t->k != s.k ||
+          t->trans_b != s.trans_b || t->c_dtype != s.c_dtype ||
+          t->invariant != invariant) {
+        continue;
+      }
+      if (t->m_max >= s.m && (serving == nullptr || t->m_max < serving->m_max))
+        serving = t;
+      if (largest == nullptr || t->m_max > largest->m_max)
+        largest = t;
     }
-    if (t->m_max >= s.m && (serving == nullptr || t->m_max < serving->m_max))
-      serving = t;
-    if (largest == nullptr || t->m_max > largest->m_max)
-      largest = t;
+    if (largest != nullptr)
+      return serving != nullptr ? serving : largest;
   }
-  return serving != nullptr ? serving : largest;
+  return nullptr;
 }
 
 const char *tuned_gemm_miss_code(TunedGemmMiss miss) {

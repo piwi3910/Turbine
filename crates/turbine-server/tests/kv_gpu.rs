@@ -8,6 +8,14 @@
 //!   each, first with `kv.prefix_sharing: false` (cold), then on a fresh server with sharing on,
 //!   each sent twice: every answer equals the cold one, and the repeat reports
 //!   `cached_tokens` > 0.
+//! - `prefix_reuse_suffix_lengths_match_cold`: token-id prompts of whole 128-token blocks plus an
+//!   uncached suffix of 1 to 700 tokens (2 to 64 tokens make a step the size of a decode batch,
+//!   more a prefill-sized one), 64 greedy tokens with their logprobs: cold (sharing off), then warm
+//!   after a primer prompt that shares the whole blocks. The warm run reuses those blocks — all
+//!   but the last one when the suffix is a single token: the KV planner leaves at least two
+//!   tokens to prefill, since a one-token step is decode-shaped — and gives the cold answer bit
+//!   for bit (text and every token's logprob): Llama's prefill GEMMs must compute a row alike at
+//!   any row count (decision 2026-09-27, "Pre-Phase-5 #1 follow-up").
 //! - `nvme_round_trip_matches_cold`: with 1 GiB of L1 (L0 demotes by capacity past 70 %)
 //!   and the NVMe tier at `/home/piwi/turbine-kv`, prompt A runs cold, long filler prompts push
 //!   its blocks through L1 to L2 (L0 → L2 on unified memory), then A runs again: the same greedy
@@ -148,6 +156,44 @@ impl LabServer {
         )
     }
 
+    /// One greedy completion of the token-id prompt `ids` with each token's logprob.
+    fn complete_ids(&self, ids: &[u32], max_tokens: u32) -> IdAnswer {
+        let body = json!({
+            "model": SERVED_NAME,
+            "prompt": ids,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "ignore_eos": true,
+            "logprobs": 1,
+        });
+        let (status, text) = request(
+            self.addr,
+            "POST",
+            "/v1/completions",
+            Some(&body.to_string()),
+        );
+        assert_eq!(status, 200, "{text}");
+        let v: Value = serde_json::from_str(&text).expect("JSON response");
+        let usage = &v["usage"];
+        let choice = &v["choices"][0];
+        IdAnswer {
+            text: choice["text"].as_str().expect("text").to_string(),
+            completion_tokens: usage["completion_tokens"]
+                .as_u64()
+                .expect("completion_tokens"),
+            logprobs: choice["logprobs"]["token_logprobs"]
+                .as_array()
+                .expect("token_logprobs")
+                .iter()
+                .map(|l| l.as_f64().expect("logprob"))
+                .collect(),
+            prompt_tokens: usage["prompt_tokens"].as_u64().expect("prompt_tokens"),
+            cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+        }
+    }
+
     /// The value of one Prometheus series (0 when absent).
     fn metric(&self, series: &str) -> f64 {
         let (status, text) = request(self.addr, "GET", "/metrics", None);
@@ -155,6 +201,24 @@ impl LabServer {
         text.lines()
             .find_map(|l| l.strip_prefix(series)?.trim().parse().ok())
             .unwrap_or(0.0)
+    }
+}
+
+/// [`LabServer::complete_ids`]'s answer.
+#[derive(Debug)]
+struct IdAnswer {
+    text: String,
+    completion_tokens: u64,
+    /// Each generated token's logprob, as the server printed it (equal bits print alike).
+    logprobs: Vec<f64>,
+    prompt_tokens: u64,
+    cached_tokens: u64,
+}
+
+impl IdAnswer {
+    /// What must not change between a cold and a warm run.
+    fn output(&self) -> (&str, u64, &[f64]) {
+        (&self.text, self.completion_tokens, &self.logprobs)
     }
 }
 
@@ -233,6 +297,19 @@ fn prompt(seed: u32, words: u32) -> String {
     text
 }
 
+/// `len` token ids of ordinary (non-special) Llama-3 vocabulary, distinct per `seed`.
+fn token_ids(seed: u32, len: u32) -> Vec<u32> {
+    let mut x = seed.wrapping_mul(2_654_435_761) ^ 0x9E37_79B9;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            1_000 + x % 120_000
+        })
+        .collect()
+}
+
 /// Total bytes of the `turbine-kv-*.slab` files under `dir`.
 fn slab_bytes(dir: &Path) -> u64 {
     std::fs::read_dir(dir)
@@ -291,6 +368,75 @@ fn prefix_reuse_matches_cold() {
         assert!(warm.2 > 0, "prompt {i}: the warm run reused no prefix");
     }
     println!("prefix_reuse_matches_cold ok");
+}
+
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn prefix_reuse_suffix_lengths_match_cold() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    const BLOCK: u32 = 128;
+    // (whole blocks a primer shares with the target, uncached suffix tokens of the target)
+    const CASES: [(u32, u32); 7] = [
+        (3, 1),
+        (3, 2),
+        (3, 17),
+        (3, 64),
+        (2, 65),
+        (2, 100),
+        (1, 700),
+    ];
+    let prompts: Vec<(Vec<u32>, Vec<u32>)> = CASES
+        .iter()
+        .zip(1u32..)
+        .map(|(&(blocks, suffix), i)| {
+            let shared = token_ids(100 + i, blocks * BLOCK);
+            let primer = [shared.as_slice(), &token_ids(200 + i, 5)].concat();
+            let target = [shared.as_slice(), &token_ids(300 + i, suffix)].concat();
+            (primer, target)
+        })
+        .collect();
+
+    let cold: Vec<IdAnswer> = {
+        let server = LabServer::start(&model_dir, &["kv.prefix_sharing=false".into()]);
+        prompts
+            .iter()
+            .map(|(_, target)| server.complete_ids(target, ANSWER_TOKENS))
+            .collect()
+    };
+    let server = LabServer::start(&model_dir, &[]);
+    let mut failed = Vec::new();
+    for (((primer, target), &(blocks, suffix)), cold) in prompts.iter().zip(&CASES).zip(&cold) {
+        server.complete_ids(primer, ANSWER_TOKENS);
+        let warm = server.complete_ids(target, ANSWER_TOKENS);
+        println!(
+            "blocks {blocks} suffix {suffix}: prompt {} cached {} cold {:?} warm {:?}",
+            warm.prompt_tokens, warm.cached_tokens, cold.text, warm.text
+        );
+        assert_eq!(cold.completion_tokens, u64::from(ANSWER_TOKENS));
+        // At least two prompt tokens are prefilled (turbine_kv::planner::MIN_RECOMPUTE_TOKENS).
+        let reused = blocks.min((blocks * BLOCK + suffix - 2) / BLOCK);
+        assert_eq!(
+            warm.cached_tokens,
+            u64::from(reused * BLOCK),
+            "blocks {blocks} suffix {suffix}: the warm run reuses the shared blocks"
+        );
+        assert_eq!(warm.prompt_tokens, u64::from(blocks * BLOCK + suffix));
+        if warm.output() != cold.output() {
+            let first = cold
+                .logprobs
+                .iter()
+                .zip(&warm.logprobs)
+                .position(|(c, w)| c.to_bits() != w.to_bits());
+            println!("blocks {blocks} suffix {suffix}: warm differs from cold at token {first:?}");
+            failed.push(format!("blocks {blocks} suffix {suffix}"));
+        }
+    }
+    assert!(failed.is_empty(), "warm differs from cold: {failed:?}");
+    println!("prefix_reuse_suffix_lengths_match_cold ok");
 }
 
 #[test]

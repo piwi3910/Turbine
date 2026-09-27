@@ -113,6 +113,7 @@ mod tests {
             trans_b: true,
             alpha: 1.0,
             beta: 0.0,
+            prefill: false,
         })
         .expect("gemm");
         assert_eq!(load(&c.view()).expect("load"), [4.0, 4.0, 1.0, -1.5]);

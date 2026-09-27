@@ -7,7 +7,9 @@ tuner, tools/gemm_tune.cpp) and writes the rows as C++ initialisers of turbine_h
 (src/gemm_table.hpp). A malformed row fails the build. Columns (tab-separated, `#` comments):
 n, k, trans_b, c_dtype (bf16|f32), m_max, solution_index, solution_name (or -1 and `heuristic`:
 the bucket keeps hipBLASLt's first heuristic answer per call), mode (invariant|speed), then
-informational columns the library ignores.
+informational columns the library ignores. A shape may have rows of both modes (tuning mode
+`prefix`): its speed rows serve decode steps, its invariant rows the steps that prefill prompt
+tokens; buckets are per shape and mode.
 """
 
 import argparse
@@ -72,10 +74,11 @@ def main():
             continue
         seen = set()
         for n, k, trans_b, c_dtype, m_max, index, name, invariant in rows(path):
-            key = (n, k, trans_b, c_dtype, m_max)
+            key = (n, k, trans_b, c_dtype, m_max, invariant)
             if key in seen:
                 sys.exit(
-                    f"{path}: duplicate row for n={n} k={k} trans_b={trans_b} m_max={m_max}"
+                    f"{path}: duplicate row for n={n} k={k} trans_b={trans_b} m_max={m_max} "
+                    f"invariant={invariant}"
                 )
             seen.add(key)
             out.append(

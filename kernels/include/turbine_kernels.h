@@ -401,6 +401,13 @@ uint32_t turbine_abi_minor(void);
 /* read only: number of GEMM shapes run so far on this context that use a
  * pinned algorithm of the tuned table */
 #define TURBINE_OPTION_GEMM_TUNED_SHAPES 2
+/* 1 = the GEMMs that follow belong to a step that prefills prompt tokens: a
+ * shape whose tuned table has row-invariant rows runs them, so a row's bits do
+ * not depend on how many rows share the call (a prefix-reused prefill of a
+ * prompt's suffix gives the rows of the whole-prompt prefill); 0 (default) =
+ * a decode step: the table's speed rows where the shape has them. Additive in
+ * ABI v2.5 (a library without it answers TURBINE_E_UNSUPPORTED). */
+#define TURBINE_OPTION_GEMM_PREFILL 3
 int32_t turbine_ctx_set_option(turbine_ctx *ctx, int32_t option, int64_t value);
 /* out is a host int64_t. */
 int32_t turbine_ctx_get_option(turbine_ctx *ctx, int32_t option, int64_t *out);

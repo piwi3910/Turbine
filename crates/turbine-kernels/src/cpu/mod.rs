@@ -448,6 +448,7 @@ mod tests {
                 trans_b: false,
                 alpha: 1.0,
                 beta: 0.0,
+                prefill: false,
             })
             .expect_err("b must be [k, n]");
         assert!(matches!(err, KernelError::InvalidArgument { .. }), "{err}");

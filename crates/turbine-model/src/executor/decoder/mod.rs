@@ -46,6 +46,7 @@
 //! otherwise.
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
@@ -478,6 +479,10 @@ pub struct DecoderExecutor {
     timings: ForwardTimings,
     trace: Tracer,
     profiler: Profiler,
+    /// The batch being enqueued prefills prompt tokens (not decode-only): its GEMMs ask for
+    /// rows independent of the batch ([`GemmContext::prefill`]), so a prefix-reused prefill of a
+    /// suffix reproduces the whole-prompt prefill.
+    step_prefill: AtomicBool,
 }
 
 impl DecoderExecutor {
@@ -669,6 +674,7 @@ impl DecoderExecutor {
             timings: ForwardTimings::default(),
             trace: Tracer::default(),
             profiler: Profiler::default(),
+            step_prefill: AtomicBool::new(false),
         })
     }
 
@@ -771,6 +777,7 @@ impl DecoderExecutor {
                 trans_b: true,
                 alpha: 1.0,
                 beta: 0.0,
+                prefill: self.step_prefill.load(Ordering::Relaxed),
             })
         })
     }
@@ -959,6 +966,7 @@ impl DecoderExecutor {
     ) -> Result<(), ModelError> {
         let b = &self.bufs;
         let (t, n) = (p.total_q, p.num_seqs);
+        self.step_prefill.store(!p.is_decode(), Ordering::Relaxed);
         let embedding = self.dims.embedding();
         self.op(OpConfig::Embedding(embedding), || {
             self.registry

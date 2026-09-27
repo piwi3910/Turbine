@@ -36,9 +36,9 @@ constexpr size_t kGemmWorkspaceBytes = 32u << 20;
 // hipBLASLt algorithm cache bound; the cache is cleared when it fills.
 constexpr size_t kGemmAlgoCacheEntries = 1024;
 
-// (m, n, k, lda, ldb, ldc, trans_b, c_dtype)
+// (m, n, k, lda, ldb, ldc, trans_b, c_dtype, prefill step)
 using GemmKey = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                           int32_t, int32_t>;
+                           int32_t, int32_t, bool>;
 
 // The hipBLASLt algorithm a GEMM shape runs, and whether it came from the
 // tuned table (gemm_table.hpp) or the first heuristic answer.
@@ -108,6 +108,10 @@ struct turbine_ctx {
   // a row for run its pinned solution (default); false = the first heuristic
   // answer for every shape.
   bool gemm_table = true;
+  // TURBINE_OPTION_GEMM_PREFILL: the GEMMs belong to a step that prefills
+  // prompt tokens, so shapes with invariant table rows run those
+  // (gemm_table.hpp tuned_gemm).
+  bool gemm_prefill = false;
   // hipBLASLt solution name -> index per output dtype, read once when a table
   // row's pinned index does not carry its name (gemm_table.cpp).
   std::map<int32_t, std::map<std::string, int>> gemm_solutions;

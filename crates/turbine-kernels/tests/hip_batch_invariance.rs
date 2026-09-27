@@ -2,7 +2,9 @@
 //! target row (or sequence) is computed alone and then inside batches of other sizes, at other
 //! positions and next to other rows; its output bits must not change. A row's logits then do not
 //! depend on which requests share its batch, so greedy decoding is the same at any concurrency
-//! (decision 2026-09-27, "Before Phase 5": the OLMoE golden flip at concurrency 16).
+//! (decision 2026-09-27, "Before Phase 5": the OLMoE golden flip at concurrency 16). Llama's
+//! GEMMs are row-invariant in prefill steps only (`llama_prefill_gemm_rows_are_batch_invariant`):
+//! prefix reuse must reproduce the whole-prompt prefill, decode keeps its speed-tuned rows.
 //!
 //! Every case prints one line per batch shape (`invariance: <op> <shape> max_abs=<Δ>
 //! differing=<n>/<numel> impl=<name>`) before the test asserts, so one run reports every op.
@@ -193,6 +195,22 @@ fn positions(m: usize) -> Vec<usize> {
     v
 }
 
+/// How [`gemm_case`] calls the GEMM and builds its target row.
+#[derive(Clone, Copy)]
+struct GemmCall {
+    /// [`GemmContext::prefill`]: every call belongs to a prefill step.
+    prefill: bool,
+    /// A heavy-tailed target row (every 97th element 30× larger, as real hidden states have
+    /// outlier channels, so two summation orders part far more often than on normal data).
+    heavy_target: bool,
+}
+
+/// OLMoE: every step's rows are batch-invariant, decode steps included.
+const ANY_STEP: GemmCall = GemmCall {
+    prefill: false,
+    heavy_target: false,
+};
+
 /// `c = a · wᵀ` of one target row alone (m = 1) against the same row at [`positions`] of
 /// `m`-row batches.
 fn gemm_case(
@@ -202,6 +220,7 @@ fn gemm_case(
     k: usize,
     c_dtype: DType,
     ms: &[usize],
+    call: GemmCall,
 ) -> Vec<Outcome> {
     let cfg = GemmConfig {
         n: n as u64,
@@ -220,7 +239,12 @@ fn gemm_case(
         DType::BF16,
         &rng.normal(n * k, 1.0 / (k as f32).sqrt()),
     );
-    let target = rng.normal(k, 1.0);
+    let mut target = rng.normal(k, 1.0);
+    if call.heavy_target {
+        for v in target.iter_mut().step_by(97) {
+            *v *= 30.0;
+        }
+    }
     let run = |a: &[f32], m: usize| -> Vec<f32> {
         let a = upload(h, &[m, k], DType::BF16, a);
         let c = Tensor::empty(&h.mem, &[m, n], c_dtype).expect("c");
@@ -232,6 +256,7 @@ fn gemm_case(
                 trans_b: true,
                 alpha: 1.0,
                 beta: 0.0,
+                prefill: call.prefill,
             })
             .expect("gemm");
         read(&c)
@@ -277,6 +302,7 @@ fn gemm_rows_are_batch_invariant() {
         HIDDEN,
         DType::BF16,
         &tokens,
+        ANY_STEP,
     ));
     out.extend(gemm_case(
         &h,
@@ -285,6 +311,7 @@ fn gemm_rows_are_batch_invariant() {
         HIDDEN,
         DType::BF16,
         &tokens,
+        ANY_STEP,
     ));
     out.extend(gemm_case(
         &h,
@@ -293,8 +320,17 @@ fn gemm_rows_are_batch_invariant() {
         HIDDEN,
         DType::F32,
         &tokens,
+        ANY_STEP,
     ));
-    out.extend(gemm_case(&h, &mut rng, VOCAB, HIDDEN, DType::F32, &seqs));
+    out.extend(gemm_case(
+        &h,
+        &mut rng,
+        VOCAB,
+        HIDDEN,
+        DType::F32,
+        &seqs,
+        ANY_STEP,
+    ));
     let (pending, checked): (Vec<Outcome>, Vec<Outcome>) = out
         .into_iter()
         .partition(|o| PENDING_GEMM_TABLE.iter().any(|p| o.what.starts_with(p)));
@@ -302,6 +338,56 @@ fn gemm_rows_are_batch_invariant() {
         println!("invariance pending the per-card GEMM table: {}", o.what);
     }
     assert_invariant(&checked);
+}
+
+/// The Llama-3.2-3B GEMMs in steps that prefill prompt tokens ([`GemmContext::prefill`]): fused
+/// Q/K/V, Q or O projection, K or V, fused and unfused gate/up, down (all BF16 out) at 1 to
+/// 2,048 rows, and the LM head (F32 logits) at 1 to 64 sequences. Prefix reuse prefills only a
+/// prompt's uncached suffix, so a row must get the bits it gets inside the whole-prompt prefill
+/// at any row count (Phase 4 warm = cold; decision 2026-09-27, "Pre-Phase-5 #1 follow-up").
+/// Decode steps run the speed-tuned rows, which may depend on the batch (option (c) of #1). A
+/// heavy-tailed target row: hipBLASLt's summation orders often agree on normal data.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn llama_prefill_gemm_rows_are_batch_invariant() {
+    if !require_backend("hip") {
+        return;
+    }
+    const L_HIDDEN: usize = 3072;
+    const L_KV: usize = 1024;
+    const L_INTER: usize = 8192;
+    const L_VOCAB: usize = 128_256;
+    let h = setup();
+    let mut rng = Rng(13);
+    let tokens = [
+        1, 2, 3, 7, 16, 17, 33, 64, 65, 100, 128, 129, 256, 400, 700, 1024, 2048,
+    ];
+    let seqs = [1, 2, 3, 16, 17, 64];
+    let prefill = GemmCall {
+        prefill: true,
+        heavy_target: true,
+    };
+    let mut out = Vec::new();
+    for (n, k) in [
+        (L_HIDDEN + 2 * L_KV, L_HIDDEN),
+        (L_HIDDEN, L_HIDDEN),
+        (L_KV, L_HIDDEN),
+        (2 * L_INTER, L_HIDDEN),
+        (L_INTER, L_HIDDEN),
+        (L_HIDDEN, L_INTER),
+    ] {
+        out.extend(gemm_case(&h, &mut rng, n, k, DType::BF16, &tokens, prefill));
+    }
+    out.extend(gemm_case(
+        &h,
+        &mut rng,
+        L_VOCAB,
+        L_HIDDEN,
+        DType::F32,
+        &seqs,
+        prefill,
+    ));
+    assert_invariant(&out);
 }
 
 /// GEMM shapes whose rows hipBLASLt does not compute batch-invariantly today, reported but not

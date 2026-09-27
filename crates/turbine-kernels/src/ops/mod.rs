@@ -471,6 +471,12 @@ pub struct GemmContext<'a> {
     pub trans_b: bool,
     pub alpha: f32,
     pub beta: f32,
+    /// The call belongs to a step that prefills prompt tokens (every step but a decode-only
+    /// one). A provider whose fastest algorithms make a row's result depend on how many rows
+    /// share the call must then compute each row as any other prefill step would: prefix
+    /// reuse prefills only a prompt's uncached suffix and must reproduce the whole-prompt
+    /// prefill bit for bit (Phase 4). Decode steps (`false`) may run batch-dependent algorithms.
+    pub prefill: bool,
 }
 
 /// A ragged batch of sequences over one layer of the paged KV pool. Sequence `s` owns query rows

@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use libloading::Library;
@@ -68,6 +69,14 @@ pub const TURBINE_OPTION_GEMM_AUTOTUNE: i32 = 1;
 /// Read-only context option (ABI v2.1) `TURBINE_OPTION_GEMM_TUNED_SHAPES`: GEMM shapes run so far
 /// on the context that use a pinned algorithm of the tuned table.
 pub const TURBINE_OPTION_GEMM_TUNED_SHAPES: i32 = 2;
+/// Context option `TURBINE_OPTION_GEMM_PREFILL` (additive in ABI v2.5): 1 marks the following
+/// GEMMs as a prefill step's, so shapes with row-invariant table rows run them
+/// ([`crate::ops::GemmContext::prefill`]); 0 (the library default) a decode step's. The shim sets
+/// it when a GEMM's step kind differs from the previous one.
+pub const TURBINE_OPTION_GEMM_PREFILL: i32 = 3;
+/// `ShimContext::gemm_prefill` once the library refused `TURBINE_OPTION_GEMM_PREFILL` (a library
+/// older than the option: every GEMM runs as a decode step's).
+const GEMM_PREFILL_UNSUPPORTED: u8 = 2;
 
 /// A loaded kernel shim library whose ABI version and backend name have been checked.
 pub struct ShimLibrary {
@@ -322,6 +331,7 @@ impl ShimLibrary {
             self_ref: weak.clone(),
             card: OnceLock::new(),
             pinned: PinnedState::default(),
+            gemm_prefill: AtomicU8::new(0),
         }))
     }
 }
@@ -370,6 +380,9 @@ pub struct ShimContext {
     card: OnceLock<&'static CardProfile>,
     /// Phase 4 pinned buffers, the copy stream and copy events (ABI v2.3 + v2.5; `pinned`).
     pinned: PinnedState,
+    /// The step kind last handed to the library as `TURBINE_OPTION_GEMM_PREFILL` (0 decode, the
+    /// library default; 1 prefill), or `GEMM_PREFILL_UNSUPPORTED`.
+    gemm_prefill: AtomicU8,
 }
 
 /// The staging buffers of one context and the next id.
@@ -533,6 +546,25 @@ impl ShimContext {
         // SAFETY: `raw` is a live context of this library; the call takes plain integers.
         let code = unsafe { (options.set)(self.raw, option, value) };
         self.check(code)
+    }
+
+    /// Hands a GEMM's step kind to the library (`TURBINE_OPTION_GEMM_PREFILL`) when it differs
+    /// from the previous GEMM's. A library without the option (or without options) is told
+    /// nothing again: its GEMMs all run as decode steps'.
+    fn gemm_step(&self, prefill: bool) -> Result<(), KernelError> {
+        let want = u8::from(prefill);
+        let current = self.gemm_prefill.load(Ordering::Relaxed);
+        if current == want || current == GEMM_PREFILL_UNSUPPORTED {
+            return Ok(());
+        }
+        match self.set_option(TURBINE_OPTION_GEMM_PREFILL, i64::from(want)) {
+            Ok(()) => self.gemm_prefill.store(want, Ordering::Relaxed),
+            Err(KernelError::Unsupported { .. }) => self
+                .gemm_prefill
+                .store(GEMM_PREFILL_UNSUPPORTED, Ordering::Relaxed),
+            Err(e) => return Err(e),
+        }
+        Ok(())
     }
 
     /// Reads context option `option` (ABI v2.1 `turbine_ctx_get_option`). `Unsupported` when the
@@ -1546,6 +1578,7 @@ impl GemmKernel for ShimProvider {
             alpha: ctx.alpha,
             beta: ctx.beta,
         };
+        self.ctx.gemm_step(ctx.prefill)?;
         self.run(OpKind::Gemm, &self.syms().gemm, &d, 0)
     }
 }

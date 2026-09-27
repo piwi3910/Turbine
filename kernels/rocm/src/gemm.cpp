@@ -7,7 +7,10 @@
 // row for the shape on this card (gemm_table.hpp); otherwise, or when the
 // pinned solution is not available in this hipBLASLt or rejects the problem
 // (logged once per row with its reason code), hipBLASLt's first heuristic
-// answer. The choice is cached per exact shape for the context's lifetime.
+// answer. A shape with rows of both kinds runs its invariant rows in steps
+// that prefill prompt tokens (TURBINE_OPTION_GEMM_PREFILL) and its speed rows
+// in decode steps. The choice is cached per exact shape and step kind for the
+// context's lifetime.
 #include <cstdio>
 
 #include "gemm_problem.hpp"
@@ -84,8 +87,9 @@ int32_t turbine_gemm(turbine_ctx *ctx, const turbine_gemm_desc *d) {
   if (rc != TURBINE_OK)
     return rc;
 
-  const turbine_hip::GemmKey key{d->m,   d->n,   d->k,       d->lda,
-                                 d->ldb, d->ldc, d->trans_b, d->c_dtype};
+  const turbine_hip::GemmKey key{d->m,       d->n,       d->k,
+                                 d->lda,     d->ldb,     d->ldc,
+                                 d->trans_b, d->c_dtype, ctx->gemm_prefill};
   auto found = ctx->gemm_algos.find(key);
   if (found == ctx->gemm_algos.end()) {
     turbine_hip::GemmChoice choice{};
@@ -93,7 +97,9 @@ int32_t turbine_gemm(turbine_ctx *ctx, const turbine_gemm_desc *d) {
     const std::string &arch =
         ctx->profile.arch.empty() ? ctx->arch : ctx->profile.arch;
     const turbine_hip::TunedGemm *row =
-        ctx->gemm_table ? turbine_hip::tuned_gemm(arch, shape) : nullptr;
+        ctx->gemm_table
+            ? turbine_hip::tuned_gemm(arch, shape, ctx->gemm_prefill)
+            : nullptr;
     if (row != nullptr && row->solution_index >= 0) {
       turbine_hip::TunedGemmMiss miss{};
       chosen = turbine_hip::resolve_tuned_gemm(ctx, *row, problem, d,

@@ -248,6 +248,7 @@ fn gemm_case(p: &Pair, rng: &mut Rng, m: usize, n: usize, k: usize, c_dtype: DTy
             trans_b: true,
             alpha: 1.0,
             beta: 0.0,
+            prefill: false,
         };
         kernel.execute(&mut ctx).expect("gemm");
     }
@@ -2225,6 +2226,7 @@ fn decode_op_timings() {
                         trans_b: true,
                         alpha: 1.0,
                         beta: 0.0,
+                        prefill: false,
                     })
                     .expect("gemm");
                 });
@@ -2893,6 +2895,7 @@ fn decode_forward_timing() {
                         trans_b: true,
                         alpha: 1.0,
                         beta: 0.0,
+                        prefill: false,
                     })
                     .expect("gemm");
                 };
@@ -3364,6 +3367,7 @@ fn fused_projection_timings() {
                         trans_b: true,
                         alpha: 1.0,
                         beta: 0.0,
+                        prefill: false,
                     })
                     .expect("separate gemm");
                     row += rows;
@@ -3378,6 +3382,7 @@ fn fused_projection_timings() {
                     trans_b: true,
                     alpha: 1.0,
                     beta: 0.0,
+                    prefill: false,
                 })
                 .expect("fused gemm");
             });
@@ -3394,6 +3399,7 @@ fn fused_projection_timings() {
                         trans_b: true,
                         alpha: 1.0,
                         beta: 0.0,
+                        prefill: false,
                     })
                     .expect("part gemm");
                 });
@@ -3422,6 +3428,7 @@ fn fused_projection_timings() {
                         trans_b: true,
                         alpha: 1.0,
                         beta: 0.0,
+                        prefill: false,
                     })
                     .expect("fused gemm");
                 } else {
@@ -3439,6 +3446,7 @@ fn fused_projection_timings() {
                             trans_b: true,
                             alpha: 1.0,
                             beta: 0.0,
+                            prefill: false,
                         })
                         .expect("separate gemm");
                         row += rows;
@@ -3712,6 +3720,7 @@ fn host_staging_does_not_wait_for_the_stream() {
             trans_b: true,
             alpha: 1.0,
             beta: 0.0,
+            prefill: false,
         })
         .expect("gemm");
     };
@@ -3951,6 +3960,7 @@ fn prefill_op_timings() {
                         trans_b: true,
                         alpha: 1.0,
                         beta: 0.0,
+                        prefill: false,
                     })
                     .expect("gemm");
                 });
@@ -4650,6 +4660,8 @@ struct TunedRow {
     m_max: usize,
     /// The row pins a solution (`false`: `heuristic`, hipBLASLt's own answer per call).
     pinned: bool,
+    /// Mode `invariant` (prefill steps run it when the shape also has `speed` rows).
+    invariant: bool,
 }
 
 /// The rows of the tuned GEMM table of `arch`, in file order; empty when the card has none.
@@ -4676,20 +4688,23 @@ fn tuned_rows(arch: &str) -> Vec<TunedRow> {
                 },
                 m_max: num(4),
                 pinned: c[6] != "heuristic",
+                invariant: c[7] == "invariant",
             }
         })
         .collect()
 }
 
-/// A GEMM of `m` rows on HIP (the whole batch, through the library's own algorithm choice)
-/// checked against the CPU reference on a few of its rows: a row's result does not depend on the
-/// other rows, and the full reference of an 8,192-row prefill GEMM is too slow for a test.
+/// A GEMM of `m` rows on HIP (the whole batch, through the library's own algorithm choice for a
+/// prefill or a decode step) checked against the CPU reference on a few of its rows: a row's
+/// result does not depend on the other rows, and the full reference of an 8,192-row prefill GEMM
+/// is too slow for a test.
 fn gemm_rows_case(
     p: &Pair,
     rng: &mut Rng,
     m: usize,
     (b_hip, b_cpu): (&Tensor, &Tensor),
     c_dtype: DType,
+    prefill: bool,
 ) {
     let (n, k) = (b_hip.shape[0], b_hip.shape[1]);
     let a = rng.normal(m * k, 1.0);
@@ -4703,6 +4718,7 @@ fn gemm_rows_case(
         trans_b: true,
         alpha: 1.0,
         beta: 0.0,
+        prefill,
     };
     hip.execute(&mut ctx).expect("hip gemm");
     let mut sample = vec![0, m / 3, 2 * m / 3, m - 1];
@@ -4720,6 +4736,7 @@ fn gemm_rows_case(
         trans_b: true,
         alpha: 1.0,
         beta: 0.0,
+        prefill: false,
     };
     p.cpu
         .gemm()
@@ -4751,7 +4768,8 @@ fn gemm_rows_case(
 /// every row, at the smallest and the largest m it serves, runs as written — a pinned row's
 /// solution (the context's `TURBINE_OPTION_GEMM_TUNED_SHAPES` grows by one per new shape, so no
 /// row fell back with `gemm_table_unavailable` / `_unsupported`), a `heuristic` row hipBLASLt's
-/// own answer (the count stays) — and matches the CPU reference
+/// own answer (the count stays) — and matches the CPU reference; an `invariant` row runs as a
+/// prefill step's GEMM (`GemmContext::prefill`), a `speed` row as a decode step's,
 /// with the Phase 1 GEMM tolerance. With `TURBINE_OPTION_GEMM_AUTOTUNE` 0 the same shapes run the
 /// heuristic's choice (the count stays 0). Breaks if a pinned solution is missing from the
 /// installed hipBLASLt, rejects its shape, or computes a wrong result.
@@ -4784,14 +4802,15 @@ fn gemm_table_matches_cpu() {
     };
     let mut rng = Rng(7);
     let mut weights: Option<((usize, usize), Tensor, Tensor)> = None;
-    let mut prev: Option<(usize, usize, DType, usize)> = None;
+    let mut prev: Option<((usize, usize, DType, bool), usize)> = None;
     let mut cases = 0;
     for row in &rows {
+        let shape = (row.n, row.k, row.c_dtype, row.invariant);
         let m_min = match prev {
-            Some((n, k, c, m)) if (n, k, c) == (row.n, row.k, row.c_dtype) => m + 1,
+            Some((s, m)) if s == shape => m + 1,
             _ => 1,
         };
-        prev = Some((row.n, row.k, row.c_dtype, row.m_max));
+        prev = Some((shape, row.m_max));
         if weights.as_ref().is_none_or(|w| w.0 != (row.n, row.k)) {
             let b_scale = 1.0 / (row.k as f32).sqrt();
             let (b_hip, b_cpu) = twin(
@@ -4807,7 +4826,7 @@ fn gemm_table_matches_cpu() {
         ms.dedup();
         for m in ms {
             let before = tuned();
-            gemm_rows_case(&p, &mut rng, m, (b_hip, b_cpu), row.c_dtype);
+            gemm_rows_case(&p, &mut rng, m, (b_hip, b_cpu), row.c_dtype, row.invariant);
             assert_eq!(
                 tuned(),
                 before + i64::from(row.pinned),
@@ -4838,7 +4857,14 @@ fn gemm_table_matches_cpu() {
         DType::BF16,
         &rng.normal(row.n * row.k, b_scale),
     );
-    gemm_rows_case(&p, &mut rng, row.m_max, (&b_hip, &b_cpu), row.c_dtype);
+    gemm_rows_case(
+        &p,
+        &mut rng,
+        row.m_max,
+        (&b_hip, &b_cpu),
+        row.c_dtype,
+        row.invariant,
+    );
     assert_eq!(
         tuned(),
         0,

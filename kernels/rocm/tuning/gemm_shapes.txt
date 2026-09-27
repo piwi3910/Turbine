@@ -3,17 +3,19 @@
 # of a decode step: one per sequence), `prefill` = 128,256,...,8192 (tokens of a mixed or prefill
 # step), or plain numbers. mode `invariant`: the tuner pins one numerics class for every m (rows
 # bit-identical at every batch size and position, split-K off; the OLMoE shapes: the c16 golden
-# flip); `speed`: the fastest solution per bucket, split-K allowed, no invariance (the Llama shapes;
-# user decision 2026-09-27, option (c)). Every executor GEMM of the served models is listed, fused and
+# flip); `speed`: the fastest solution per bucket, split-K allowed, no invariance; `prefix`: speed
+# rows for the decode buckets (decode steps) plus one invariant class for every m (steps that
+# prefill prompt tokens: prefix reuse reproduces the cold prefill bit for bit; the Llama shapes, user
+# decisions 2026-09-27, option (c) and its follow-up A). Every executor GEMM of the served models is listed, fused and
 # unfused projections alike; a shape missing here runs hipBLASLt's first heuristic answer.
 # name          n       k     trans_b  c_dtype  m  mode
-llama.qkv       5120    3072  1        bf16     decode,prefill  speed
-llama.q_o       3072    3072  1        bf16     decode,prefill  speed
-llama.kv        1024    3072  1        bf16     decode,prefill  speed
-llama.gate_up   16384   3072  1        bf16     decode,prefill  speed
-llama.gate|up   8192    3072  1        bf16     decode,prefill  speed
-llama.down      3072    8192  1        bf16     decode,prefill  speed
-llama.lm_head   128256  3072  1        f32      decode,128,256  speed
+llama.qkv       5120    3072  1        bf16     decode,prefill  prefix
+llama.q_o       3072    3072  1        bf16     decode,prefill  prefix
+llama.kv        1024    3072  1        bf16     decode,prefill  prefix
+llama.gate_up   16384   3072  1        bf16     decode,prefill  prefix
+llama.gate|up   8192    3072  1        bf16     decode,prefill  prefix
+llama.down      3072    8192  1        bf16     decode,prefill  prefix
+llama.lm_head   128256  3072  1        f32      decode,128,256  prefix
 olmoe.qkv       6144    2048  1        bf16     decode,prefill  invariant
 olmoe.q|k|v|o   2048    2048  1        bf16     decode,prefill  invariant
 olmoe.router    64      2048  1        f32      decode,prefill  invariant

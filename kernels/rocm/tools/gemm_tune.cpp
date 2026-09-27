@@ -46,10 +46,17 @@
 // per bucket (`# cost` lines). A shape with no eligible invariant class gets a
 // `heuristic` row (index -1: not row-invariant) and is reported.
 //
+// Mode `prefix` (the Llama shapes): speed rows over the decode-sized buckets
+// (m <= 64), run by decode steps, and one invariant class over every bucket,
+// run by the steps that prefill prompt tokens (TURBINE_OPTION_GEMM_PREFILL),
+// so a prefix-reused prefill of a suffix reproduces the whole-prompt prefill.
+// The class is scored for prefill steps (prefix_weights) and pinned even over
+// the prefill guard: prefix reuse is exact only with one.
+//
 // Output rows: n, k, trans_b, c_dtype, m_max, solution_index, solution_name,
-// heuristic_us, tuned_us (tab-separated, `#` header lines name the device,
-// ROCm and hipBLASLt). Run it on an idle card: it needs the whole card for
-// stable timings (on novanas under scripts/bench-lock.sh, GPU 0).
+// mode, heuristic_us, tuned_us, shape (tab-separated, `#` header lines name the
+// device, ROCm and hipBLASLt). Run it on an idle card: it needs the whole card
+// for stable timings (on novanas under scripts/bench-lock.sh, GPU 0).
 // TURBINE_TUNE_DEBUG=1 prints, per rejected candidate, the m and position where
 // the target row first changed and the first differing byte.
 #include <hip/hip_runtime.h>
@@ -96,6 +103,9 @@ constexpr int64_t kPrefillGuardM = 1024;
 // (scheduler.max_batch_tokens 2,048); larger buckets are scored, not guarded.
 constexpr int64_t kPrefillGuardMaxM = 2048;
 double g_max_prefill_loss = 0.05;
+// Mode prefix: the share of the class score on the decode-sized buckets (a
+// prefill step that small is a short prompt or a prefix-reused suffix).
+constexpr double kPrefixShortWeight = 0.15;
 
 [[noreturn]] void die(const std::string &msg) {
   std::fprintf(stderr, "turbine_gemm_tune: %s\n", msg.c_str());
@@ -112,14 +122,18 @@ void blas_ok(hipblasStatus_t s, const char *what) {
     die(std::string(what) + ": hipBLAS status " + std::to_string(s));
 }
 
+// `invariant`: rows must not depend on the batch (the pinned class runs with
+// split-K off); `speed`: the fastest solution per bucket, split-K allowed;
+// `prefix`: both, speed rows for the decode-sized buckets (decode steps) and
+// one invariant class for every bucket (steps that prefill prompt tokens).
+enum class Mode { Invariant, Speed, Prefix };
+
 struct ShapeSpec {
   std::string name;
   int64_t n, k;
   int32_t trans_b, c_dtype;
   std::vector<int64_t> ms;
-  // `invariant`: rows must not depend on the batch (the pinned class runs with
-  // split-K off); `speed`: the fastest solution per bucket, split-K allowed.
-  bool invariant;
+  Mode mode;
 };
 
 const std::vector<int64_t> kDecodeM = {1, 2, 4, 8, 16, 32, 64};
@@ -141,10 +155,15 @@ std::vector<ShapeSpec> read_shapes(const std::string &path) {
     std::string dtype, ms, mode;
     if (!(cols >> s.name >> s.n >> s.k >> s.trans_b >> dtype >> ms >> mode))
       die(path + ":" + std::to_string(lineno) + ": expected 7 columns");
-    if (mode != "invariant" && mode != "speed")
+    if (mode == "invariant")
+      s.mode = Mode::Invariant;
+    else if (mode == "speed")
+      s.mode = Mode::Speed;
+    else if (mode == "prefix")
+      s.mode = Mode::Prefix;
+    else
       die(path + ":" + std::to_string(lineno) +
-          ": mode is invariant or speed, not " + mode);
-    s.invariant = mode == "invariant";
+          ": mode is invariant, speed or prefix, not " + mode);
     if (dtype == "bf16")
       s.c_dtype = TURBINE_DTYPE_BF16;
     else if (dtype == "f32")
@@ -349,6 +368,8 @@ struct Row {
   int index;
   std::string name;
   double heuristic_us, tuned_us;
+  // An invariant row (split-K off, row-invariant), else a speed row.
+  bool invariant;
 };
 
 // One timing point of a shape: a bucket's top m, its problem, the heuristic's
@@ -431,12 +452,37 @@ std::vector<int64_t> positions(int64_t m) {
 // Weight of bucket point i of points (ascending m) in a shape's score: the
 // decode weight spread evenly over the buckets up to kDecodeMaxM, the rest over
 // the larger ones.
-template <typename P> std::vector<double> bucket_weights(const P &points) {
+// Mode prefix: the decode-sized buckets (short prompts, prefix-reused
+// suffixes) share kPrefixShortWeight evenly; the larger ones share the rest in
+// proportion to their tokens, capped at kPrefillGuardMaxM (the served mixed
+// steps; a larger step runs at the capped bucket's rate), so the score is the
+// class's relative prefill time over a token-weighted mix of step sizes.
+template <typename P> std::vector<double> prefix_weights(const P &points) {
+  double decode = 0, tokens = 0;
+  for (const auto &pt : points) {
+    if (pt.m <= kDecodeMaxM)
+      decode += 1;
+    else
+      tokens += static_cast<double>(std::min(pt.m, kPrefillGuardMaxM));
+  }
+  const double wd = tokens == 0 ? 1.0 : decode == 0 ? 0.0 : kPrefixShortWeight;
+  std::vector<double> w;
+  for (const auto &pt : points)
+    w.push_back(pt.m <= kDecodeMaxM ? wd / decode
+                                    : (1.0 - wd) *
+                                          static_cast<double>(std::min(
+                                              pt.m, kPrefillGuardMaxM)) /
+                                          tokens);
+  return w;
+}
+
+template <typename P>
+std::vector<double> bucket_weights(const P &points, double decode_weight) {
   size_t decode = 0;
   for (const auto &pt : points)
     decode += pt.m <= kDecodeMaxM ? 1 : 0;
   const size_t other = points.size() - decode;
-  const double wd = other == 0 ? 1.0 : decode == 0 ? 0.0 : g_decode_weight;
+  const double wd = other == 0 ? 1.0 : decode == 0 ? 0.0 : decode_weight;
   std::vector<double> w;
   for (const auto &pt : points)
     w.push_back(pt.m <= kDecodeMaxM ? wd / static_cast<double>(decode)
@@ -444,7 +490,13 @@ template <typename P> std::vector<double> bucket_weights(const P &points) {
   return w;
 }
 
-std::vector<Row> tune_shape_invariant(Bench &b, const ShapeSpec &spec) {
+// prefix: the class serves only the steps that prefill prompt tokens (decode
+// steps run the shape's speed rows): its decode-sized buckets (short prompts
+// and prefix-reused suffixes) weigh kPrefixShortWeight in the score, and the
+// prefill guard does not apply: the shape must get a class (prefix reuse is
+// exact only with one), so the best one is pinned and its cost recorded.
+std::vector<Row> tune_shape_invariant(Bench &b, const ShapeSpec &spec,
+                                      bool prefix) {
   const int64_t m_top = spec.ms.back();
   const size_t elem = spec.c_dtype == TURBINE_DTYPE_F32 ? 4 : 2;
   Operands o;
@@ -714,7 +766,8 @@ std::vector<Row> tune_shape_invariant(Bench &b, const ShapeSpec &spec) {
   // shape may use any member of one class per bucket without a row's result
   // depending on its batch. Quick per-bucket times of every invariant
   // candidate, then per class the fastest member per bucket.
-  const std::vector<double> weight = bucket_weights(points);
+  const std::vector<double> weight =
+      prefix ? prefix_weights(points) : bucket_weights(points, g_decode_weight);
   std::vector<double> h_quick(points.size());
   for (size_t i = 0; i < points.size(); ++i) {
     Point &pt = points[i];
@@ -754,6 +807,8 @@ std::vector<Row> tune_shape_invariant(Bench &b, const ShapeSpec &spec) {
   // A class over the prefill guard at any prefill-sized bucket is scored
   // after every class within it.
   auto guarded = [&](const Class &k, auto time_of) {
+    if (prefix)
+      return true;
     for (size_t i = 0; i < points.size(); ++i)
       if (points[i].m >= kPrefillGuardM && points[i].m <= kPrefillGuardMaxM &&
           time_of(k, i) > 1.0 + g_max_prefill_loss)
@@ -823,6 +878,23 @@ std::vector<Row> tune_shape_invariant(Bench &b, const ShapeSpec &spec) {
     return median(cands[k.member[i]].rounds[i]) /
            median(points[i].heuristic_rounds);
   };
+  // Every refined class's per-bucket time relative to the heuristic's (the
+  // record of what the pinned class costs against the alternatives).
+  for (size_t ci = 0; ci < classes.size(); ++ci) {
+    std::string line;
+    double score = 0;
+    for (size_t i = 0; i < points.size(); ++i) {
+      char cell[32];
+      std::snprintf(cell, sizeof(cell), " %lld:%.3f",
+                    static_cast<long long>(points[i].m),
+                    refined_ratio(classes[ci], i));
+      line += cell;
+      score += weight[i] * refined_ratio(classes[ci], i);
+    }
+    std::fprintf(stderr,
+                 "turbine_gemm_tune: %-14s refined class %zu score %.3f:%s\n",
+                 spec.name.c_str(), ci, score, line.c_str());
+  }
   const Class *best = nullptr;
   bool guard_failed = false;
   for (auto &k : classes) {
@@ -875,8 +947,8 @@ std::vector<Row> tune_shape_invariant(Bench &b, const ShapeSpec &spec) {
                  100.0 * (t - h) / h, pt.best_any_us,
                  c != nullptr ? c->name.substr(0, 60).c_str() : "heuristic");
     rows.push_back(Row{&spec, pt.m, c != nullptr ? c->index : -1,
-                       c != nullptr ? c->name : std::string("heuristic"), h,
-                       t});
+                       c != nullptr ? c->name : std::string("heuristic"), h, t,
+                       true});
   }
 
   for (void *w : o.weights)
@@ -1083,7 +1155,7 @@ std::vector<Row> tune_shape_speed(Bench &b, const ShapeSpec &spec) {
                  static_cast<long long>(m_hi), pin ? "" : "(heuristic kept)");
     rows.push_back(Row{&spec, m_hi, pin ? best->index : -1,
                        pin ? best->name : std::string("heuristic"), h_top,
-                       t_top});
+                       t_top, false});
   }
   for (void *w : o.weights)
     (void)hipFree(w);
@@ -1136,8 +1208,28 @@ int main(int argc, char **argv) {
 
   std::vector<Row> rows;
   for (const auto &s : shapes) {
-    std::vector<Row> shape_rows =
-        s.invariant ? tune_shape_invariant(b, s) : tune_shape_speed(b, s);
+    std::vector<Row> shape_rows;
+    switch (s.mode) {
+    case Mode::Invariant:
+      shape_rows = tune_shape_invariant(b, s, false);
+      break;
+    case Mode::Speed:
+      shape_rows = tune_shape_speed(b, s);
+      break;
+    case Mode::Prefix: {
+      // Decode steps have at most kDecodeMaxM rows (one per sequence).
+      ShapeSpec decode = s;
+      decode.ms.erase(std::remove_if(decode.ms.begin(), decode.ms.end(),
+                                     [](int64_t m) { return m > kDecodeMaxM; }),
+                      decode.ms.end());
+      shape_rows = tune_shape_speed(b, decode);
+      for (Row &r : shape_rows)
+        r.spec = &s;
+      std::vector<Row> inv = tune_shape_invariant(b, s, true);
+      shape_rows.insert(shape_rows.end(), inv.begin(), inv.end());
+      break;
+    }
+    }
     rows.insert(rows.end(), shape_rows.begin(), shape_rows.end());
   }
 
@@ -1157,15 +1249,17 @@ int main(int argc, char **argv) {
          "regenerate with docs/extending/card-family.md (Tuned GEMM table).\n"
       << "# mode invariant: one numerics class per shape, row-invariant at "
          "every m, run with split-K off; mode speed: the fastest solution per "
-         "bucket, split-K allowed.\n"
+         "bucket, split-K allowed. A shape with both: decode steps run its "
+         "speed "
+         "rows, prefill steps its invariant rows.\n"
       << "# Cost per bucket top m, microseconds, heuristic's per-m answer -> "
          "pinned:\n";
   for (const Row &r : rows) {
     char line[160];
     std::snprintf(line, sizeof(line),
-                  "# cost %-14s m=%-5lld %9.1f -> %9.1f (%+.1f%%)\n",
-                  r.spec->name.c_str(), static_cast<long long>(r.m),
-                  r.heuristic_us, r.tuned_us,
+                  "# cost %-14s %-9s m=%-5lld %9.1f -> %9.1f (%+.1f%%)\n",
+                  r.spec->name.c_str(), r.invariant ? "invariant" : "speed",
+                  static_cast<long long>(r.m), r.heuristic_us, r.tuned_us,
                   r.heuristic_us > 0
                       ? 100.0 * (r.tuned_us - r.heuristic_us) / r.heuristic_us
                       : 0.0);
@@ -1178,14 +1272,14 @@ int main(int argc, char **argv) {
     // Merge into the next bucket of the same shape when it pins the same
     // solution: that row then serves this bucket too.
     if (i + 1 < rows.size() && rows[i + 1].spec == r.spec &&
-        rows[i + 1].name == r.name)
+        rows[i + 1].invariant == r.invariant && rows[i + 1].name == r.name)
       continue;
     char us[64];
     std::snprintf(us, sizeof(us), "%.1f\t%.1f", r.heuristic_us, r.tuned_us);
     out << r.spec->n << "\t" << r.spec->k << "\t" << r.spec->trans_b << "\t"
         << (r.spec->c_dtype == TURBINE_DTYPE_F32 ? "f32" : "bf16") << "\t"
         << r.m << "\t" << r.index << "\t" << r.name << "\t"
-        << (r.spec->invariant ? "invariant" : "speed") << "\t" << us << "\t"
+        << (r.invariant ? "invariant" : "speed") << "\t" << us << "\t"
         << r.spec->name << "\n";
   }
   std::fprintf(stderr, "turbine_gemm_tune: wrote %s\n", out_path.c_str());
