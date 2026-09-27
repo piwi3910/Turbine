@@ -549,6 +549,115 @@ fn lab_test_forwards_cargo_features() {
     }
 }
 
+/// Shorter test cycles (user decision 2026-09-27): `--tier quick` skips the slow perf/timing
+/// tests via `--skip`, `--tier perf` runs only those (as bare filters), `--tier full` (the
+/// default) changes nothing; `--stop` takes no tier.
+#[test]
+fn lab_test_tier_selects_or_skips_the_slow_tests() {
+    let slow = [
+        "serving_mix",
+        "forward_profile",
+        "host_step_costs",
+        "decode_forward_timing",
+        "decode_op_timings",
+        "fused_projection_timings",
+        "prefill_op_timings",
+        "every_implementation_matches_cpu",
+        "implementations_enumerated",
+        "gemm_matches_cpu",
+        "norm_rope_silu_embedding_add_match_cpu",
+        "paged_prefill_ck_128_matches_cpu",
+        "paged_and_moe_ops",
+        "moe_experts_small_m_matches_cpu",
+        "moe_experts_grouped_matches_cpu",
+        "logits_reduce_matches_cpu",
+        "host_staging_does_not_wait_for_the_stream",
+        "prefill_shapes_match_cpu",
+    ];
+
+    let text = dry_run(
+        "lab-test.sh",
+        "tier-quick",
+        &["--dry-run", "novanas", "--tier", "quick"],
+    );
+    let id = run_id(&text, "lab-test");
+    let cmd = test_command(&text, &id);
+    let mut want = vec![
+        "cargo".to_string(),
+        "test".to_string(),
+        "--no-fail-fast".to_string(),
+        "--workspace".to_string(),
+        "--".to_string(),
+        "--include-ignored".to_string(),
+        "--show-output".to_string(),
+        "--skip".to_string(),
+        "hf_reference_matches_cpu".to_string(),
+    ];
+    for t in slow {
+        want.push("--skip".to_string());
+        want.push(t.to_string());
+    }
+    assert_eq!(cmd, want);
+
+    let text = dry_run(
+        "lab-test.sh",
+        "tier-perf",
+        &["--dry-run", "novanas", "--tier", "perf"],
+    );
+    let id = run_id(&text, "lab-test");
+    let cmd = test_command(&text, &id);
+    let mut want = vec![
+        "cargo".to_string(),
+        "test".to_string(),
+        "--no-fail-fast".to_string(),
+        "--workspace".to_string(),
+        "--".to_string(),
+        "--include-ignored".to_string(),
+        "--show-output".to_string(),
+        "--skip".to_string(),
+        "hf_reference_matches_cpu".to_string(),
+    ];
+    for t in slow {
+        want.push(t.to_string());
+    }
+    assert_eq!(cmd, want);
+
+    // full (the default) is unchanged.
+    let text = dry_run(
+        "lab-test.sh",
+        "tier-full",
+        &["--dry-run", "novanas", "--tier", "full"],
+    );
+    let id = run_id(&text, "lab-test");
+    assert_eq!(
+        test_command(&text, &id),
+        [
+            "cargo",
+            "test",
+            "--no-fail-fast",
+            "--workspace",
+            "--",
+            "--include-ignored",
+            "--show-output",
+            "--skip",
+            "hf_reference_matches_cpu",
+        ]
+    );
+
+    for (tag, args) in [
+        ("tier-bad", &["novanas", "--tier", "bogus"][..]),
+        ("tier-missing", &["novanas", "--tier"][..]),
+        (
+            "tier-stop",
+            &["novanas", "--stop", "0926-abc", "--tier", "quick"][..],
+        ),
+    ] {
+        let (out, called) = lab_script("lab-test.sh", tag, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert_eq!(called, None, "{args:?} contacted a host");
+    }
+}
+
 #[test]
 fn lab_test_passes_a_subset_and_opts_into_the_hf_reference() {
     let text = dry_run(
@@ -1179,6 +1288,61 @@ fn lab_perf_usage_errors_exit_2_without_contacting_a_host() {
         assert_eq!(called, None, "{tag}: contacted a host");
         assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
         assert!(stderr(&out).contains(expect), "{tag}: {}", stderr(&out));
+    }
+}
+
+/// Shorter test cycles (user decision 2026-09-27): lab-bench.sh usage errors, including the new
+/// --with-tests / --skip-tests / --golden16 / --quick flags and the GPU-0-only guard (GPU 1's
+/// PCIe link is not throughput-comparable). lab-bench.sh has no --dry-run: a well-formed
+/// invocation immediately reaches for the host (rsync, then ssh, via scripts/remote-cargo.sh),
+/// so these usage cases only cover what must be rejected before any host contact.
+#[test]
+fn lab_bench_usage_errors_exit_2_without_contacting_a_host() {
+    for (tag, args) in [
+        ("bench-gpu1", &["--gpu", "1"][..]),
+        ("bench-gpu2", &["--gpu", "2"][..]),
+        ("bench-model", &["--model", "qwen"][..]),
+        ("bench-unknown", &["--fast"][..]),
+    ] {
+        let (out, called) = lab_script("lab-bench.sh", tag, args);
+        assert_eq!(called, None, "{tag}: contacted a host");
+        assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
+    }
+    let (out, _) = lab_script("lab-bench.sh", "bench-gpu1-message", &["--gpu", "1"]);
+    assert!(
+        stderr(&out).contains("GPU 0"),
+        "refusing GPU 1 should explain why: {}",
+        stderr(&out)
+    );
+}
+
+/// The new flags parse (they are not rejected the way an unknown flag or a bad --gpu/--model is
+/// in the test above) for --gpu 0 (the default, spelled out) and every combination of them.
+/// lab-bench.sh has no --dry-run and reaches for the host immediately after parsing, so this
+/// only checks that parsing succeeded (no "usage:" on stderr), not what happens next: what it
+/// reaches for after that (scripts/remote-cargo.sh, which resolves this checkout through `git`)
+/// is exercised for real by a human running it, not safe to assert on here since this same test
+/// binary also runs from a host-synced tree that excludes .git (scripts/remote-cargo.sh, every
+/// lab-*.sh upload).
+#[test]
+fn lab_bench_new_flags_are_not_usage_errors() {
+    for (tag, args) in [
+        ("flags-default", &["--gpu", "0"][..]),
+        ("flags-with-tests", &["--with-tests"][..]),
+        ("flags-skip-tests", &["--skip-tests"][..]),
+        ("flags-golden16", &["--golden16"][..]),
+        ("flags-quick", &["--quick"][..]),
+        (
+            "flags-all",
+            &["--gpu", "0", "--with-tests", "--golden16", "--quick"][..],
+        ),
+    ] {
+        let (out, _) = lab_script("lab-bench.sh", tag, args);
+        assert!(
+            !stderr(&out).contains("usage:"),
+            "{tag}: rejected as a usage error: {}",
+            stderr(&out)
+        );
     }
 }
 

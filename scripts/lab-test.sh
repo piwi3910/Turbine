@@ -2,7 +2,7 @@
 # Run the Turbine test suite, including #[ignore] GPU tests, on one lab host.
 #
 #   scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas> [--gpus 1|2] [--with-hf-reference]
-#                       [--features <list>] [-- <cargo test arguments>]
+#                       [--features <list>] [--tier quick|perf|full] [-- <cargo test arguments>]
 #   scripts/lab-test.sh [--dry-run] novanas --stop <run-id>
 #
 # Runs `cargo test --no-fail-fast <selection> -- --include-ignored --show-output`, so one run
@@ -13,6 +13,10 @@
 # the golden references are committed, it only matters when regenerating them);
 # --with-hf-reference runs it and installs uv for it. --features <list> is passed to that cargo test
 # (e.g. `--features fault-injection` for the P3 fault tests, `tests/fault.rs`).
+# --tier (default full, unchanged behaviour): `quick` skips the slow perf/timing tests listed in
+#   SLOW_TESTS below (a single data-driven list — see there for how it was measured) via libtest
+#   `--skip` filters, for a fast per-landing-step GPU pass; `perf` runs only those tests (the
+#   reverse selection, for a focused perf pass); `full` runs everything, unchanged.
 #
 # dgx-spark / dgx-spark2: `docker run --rm --gpus all` of rust:1.97-trixie (container
 #   turbine-lab-test only; production vLLM containers are never touched).
@@ -34,10 +38,37 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas> [--gpus 1|2] [--with-hf-reference] [--features <list>] [-- <cargo test args>]" >&2
+	echo "usage: scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas> [--gpus 1|2] [--with-hf-reference] [--features <list>] [--tier quick|perf|full] [-- <cargo test args>]" >&2
 	echo "       scripts/lab-test.sh [--dry-run] novanas --stop <run-id>" >&2
 	exit 2
 }
+
+# The turbine-model perf/timing tests and the turbine-kernels hip_ops timing/exhaustive-match
+# tests: > ~60 s each on novanas (nextest's "has been running for over 60 seconds" warning in
+# scripts/lab-test.sh full runs, e.g. target/lab-perf and lab-test logs from 2026-09-26/27).
+# One list, used both ways by --tier: skipped for `quick`, the only ones run for `perf`.
+SLOW_TESTS=(
+	# crates/turbine-model/tests/perf.rs, tests/host_step.rs
+	serving_mix
+	forward_profile
+	host_step_costs
+	# crates/turbine-kernels/tests/hip_ops.rs
+	decode_forward_timing
+	decode_op_timings
+	fused_projection_timings
+	prefill_op_timings
+	every_implementation_matches_cpu
+	implementations_enumerated
+	gemm_matches_cpu
+	norm_rope_silu_embedding_add_match_cpu
+	paged_prefill_ck_128_matches_cpu
+	paged_and_moe_ops
+	moe_experts_small_m_matches_cpu
+	moe_experts_grouped_matches_cpu
+	logits_reduce_matches_cpu
+	host_staging_does_not_wait_for_the_stream
+	prefill_shapes_match_cpu
+)
 
 DRY_RUN=0
 if [[ "${1:-}" == --dry-run ]]; then
@@ -59,6 +90,7 @@ GPUS=1
 GPUS_SET=0
 HF_REFERENCE=0
 FEATURES=""
+TIER=full
 STOP_RUN=""
 CARGO_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -78,6 +110,11 @@ while [[ $# -gt 0 ]]; do
 		FEATURES="$2"
 		shift 2
 		;;
+	--tier)
+		[[ $# -ge 2 && "$2" =~ ^(quick|perf|full)$ ]] || usage
+		TIER="$2"
+		shift 2
+		;;
 	--stop)
 		[[ $# -eq 2 && "$2" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || usage
 		MODE=stop
@@ -95,14 +132,14 @@ done
 if [[ "$HOST" != novanas && ($MODE == stop || $GPUS_SET -eq 1) ]]; then
 	usage
 fi
-if [[ $MODE == stop && ($GPUS_SET -eq 1 || $HF_REFERENCE -eq 1 || -n $FEATURES || ${#CARGO_ARGS[@]} -gt 0) ]]; then
+if [[ $MODE == stop && ($GPUS_SET -eq 1 || $HF_REFERENCE -eq 1 || -n $FEATURES || $TIER != full || ${#CARGO_ARGS[@]} -gt 0) ]]; then
 	usage
 fi
 
 # The test command, one argv: cargo test --no-fail-fast <selection> -- <harness args> [<extra>].
 TEST_CMD=(cargo test --no-fail-fast)
 build_test_command() {
-	local select=() extra=() seen=0 a
+	local select=() extra=() seen=0 a t
 	for a in ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}; do
 		if [[ $seen -eq 0 && "$a" == -- ]]; then
 			seen=1
@@ -118,6 +155,15 @@ build_test_command() {
 	# The golden references are committed; the Hugging Face transformers CPU reference is only
 	# needed to regenerate them.
 	[[ $HF_REFERENCE -eq 1 ]] || TEST_CMD+=(--skip hf_reference_matches_cpu)
+	# quick: skip the slow perf/timing tests (SLOW_TESTS above); perf: run only those (the same
+	# list as bare filter args, which libtest ORs by substring); full: neither, unchanged.
+	if [[ $TIER == quick ]]; then
+		for t in "${SLOW_TESTS[@]}"; do
+			TEST_CMD+=(--skip "$t")
+		done
+	elif [[ $TIER == perf ]]; then
+		TEST_CMD+=("${SLOW_TESTS[@]}")
+	fi
 	TEST_CMD+=(${extra[@]+"${extra[@]}"})
 }
 build_test_command
