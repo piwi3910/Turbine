@@ -327,7 +327,7 @@ wait_for_result() {
 		echo "+ wait until job ${job} succeeds or fails; a failure exits with its exit code"
 		return
 	fi
-	# The Job has activeDeadlineSeconds (5400), so it always reaches a terminal state.
+	# The Job has activeDeadlineSeconds (10800: a full-tier run on one card takes about 95 min), so it always reaches a terminal state.
 	local succeeded="" failed=""
 	while :; do
 		succeeded="$(kube "-n ${NS} get job ${job} -o jsonpath='{.status.succeeded}'" || true)"

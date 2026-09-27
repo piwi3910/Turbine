@@ -48,7 +48,7 @@ spec:
   ttlSecondsAfterFinished: 600
   # A cold slot fetches and compiles Composable Kernel and the whole workspace; later runs
   # rebuild only what changed.
-  activeDeadlineSeconds: 5400
+  activeDeadlineSeconds: 10800
   template:
     metadata:
       labels:
