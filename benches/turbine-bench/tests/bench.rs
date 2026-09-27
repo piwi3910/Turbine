@@ -529,3 +529,183 @@ async fn open_loop_rate_and_breakdown() {
     }
     let _ = std::fs::remove_file(&timeline);
 }
+
+/// One recorded request: lowercase header lines and the JSON body.
+struct Recorded {
+    headers: Vec<(String, String)>,
+    body: Value,
+}
+
+impl Recorded {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Reads one request fully: head and body.
+async fn read_full(sock: &mut TcpStream) -> (String, Recorded) {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = sock.read(&mut tmp).await.unwrap();
+        if n == 0 {
+            return (
+                String::new(),
+                Recorded {
+                    headers: Vec::new(),
+                    body: Value::Null,
+                },
+            );
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).to_string();
+            let headers: Vec<(String, String)> = head
+                .lines()
+                .skip(1)
+                .filter_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                })
+                .collect();
+            let len = headers
+                .iter()
+                .find(|(k, _)| k == "content-length")
+                .map_or(0, |(_, v)| v.parse::<usize>().unwrap());
+            while buf.len() < end + 4 + len {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let body = serde_json::from_slice(&buf[end + 4..end + 4 + len]).unwrap_or(Value::Null);
+            let line = head.lines().next().unwrap_or_default().to_string();
+            return (line, Recorded { headers, body });
+        }
+    }
+}
+
+/// Streams "reply-<n> " (two chunks) and usage with 100 prompt tokens, 40 of them cached;
+/// records every completion request.
+async fn recording_server() -> (SocketAddr, Arc<std::sync::Mutex<Vec<Recorded>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = log.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let (line, rec) = read_full(&mut sock).await;
+                if !line.starts_with("POST") {
+                    return;
+                }
+                let n = {
+                    let mut log = seen.lock().unwrap();
+                    log.push(rec);
+                    log.len()
+                };
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+                let event = |v: &str| format!("data: {v}\n\n");
+                for part in [format!("reply-{n}"), " ".to_string()] {
+                    let chunk =
+                        format!(r#"{{"choices":[{{"index":0,"delta":{{"content":"{part}"}}}}]}}"#);
+                    sock.write_all(event(&chunk).as_bytes()).await.unwrap();
+                }
+                let usage = r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":2,"total_tokens":102,"prompt_tokens_details":{"cached_tokens":40}}}"#;
+                sock.write_all(event(usage).as_bytes()).await.unwrap();
+                sock.write_all(event("[DONE]").as_bytes()).await.unwrap();
+                sock.shutdown().await.ok();
+            });
+        }
+    });
+    (addr, log)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_turn_profile() {
+    let (addr, log) = recording_server().await;
+    let (code, r, stderr) = run_bench(args(
+        addr,
+        &[
+            "--model",
+            "mock-model",
+            "--profile",
+            "multi-turn",
+            "--sessions",
+            "3",
+            "--turns",
+            "4",
+            "--shared-prefix-words",
+            "50",
+            "--prompt-words",
+            "8",
+            "--think-time",
+            "0..0.05",
+            "--concurrency",
+            "3",
+            "--session-hints",
+        ],
+    ))
+    .await;
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(r["requests_ok"], 12, "{r}");
+    assert_eq!(r["cached_tokens_ratio"], 0.4, "{r}");
+    for key in ["ttft_ms_first_turn", "ttft_ms_later_turns"] {
+        assert!(r[key]["p50"].is_number(), "{key} missing: {r}");
+    }
+
+    let log = log.lock().unwrap();
+    assert_eq!(log.len(), 12);
+    let mut sessions: std::collections::BTreeMap<String, Vec<&Recorded>> = Default::default();
+    for rec in log.iter() {
+        let key = rec.body["prompt_cache_key"]
+            .as_str()
+            .expect("session id sent");
+        sessions.entry(key.to_string()).or_default().push(rec);
+    }
+    assert_eq!(sessions.len(), 3, "three sessions");
+    for turns in sessions.values() {
+        assert_eq!(turns.len(), 4);
+        // Sequential: turn t carries the system prefix, then 2t history messages and a new
+        // user message, and extends turn t-1 with its reply.
+        let shared = turns[0].body["messages"][0].clone();
+        assert_eq!(shared["role"], "system");
+        assert_eq!(shared["content"].as_str().unwrap().split(' ').count(), 50);
+        let mut by_len: Vec<&&Recorded> = turns.iter().collect();
+        by_len.sort_by_key(|t| t.body["messages"].as_array().unwrap().len());
+        for (t, rec) in by_len.iter().enumerate() {
+            let messages = rec.body["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2 * t + 2, "turn {t}");
+            assert_eq!(messages[0], shared, "the shared prefix leads every turn");
+            assert_eq!(messages.last().unwrap()["role"], "user");
+            if t > 0 {
+                let prev = by_len[t - 1].body["messages"].as_array().unwrap();
+                assert_eq!(&messages[..prev.len()], prev.as_slice(), "full history");
+                let reply = &messages[prev.len()];
+                assert_eq!(reply["role"], "assistant");
+                assert!(reply["content"].as_str().unwrap().starts_with("reply-"));
+            }
+            assert_eq!(
+                rec.header("x-turbine-session-resume-within"),
+                Some("1"),
+                "the maximum think time, at least 1 s"
+            );
+            let last = t == 3;
+            assert_eq!(
+                rec.header("x-turbine-session-end"),
+                last.then_some("true"),
+                "turn {t}"
+            );
+        }
+    }
+}

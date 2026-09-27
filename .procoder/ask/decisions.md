@@ -540,6 +540,7 @@ Landing the soak fixes (branch `phase-3-reliability-land`, d6d5e1d), the coordin
 Asked 2026-09-27 (after Phase 4, before Phase 5).
 
 Flake (OLMoE golden `--concurrency 16`, prompts p10/p14 flip with batch composition):
+
 - A) Root-cause, then fix: trace p10/p14 alone vs batched, find the op whose result depends on batch composition, fix it (e.g. fixed reduction order); gate stays strict (recommended)
 - B) Batch-invariant mode: every op independent of batch composition, gate runs with it on (costs throughput)
 - C) Tolerate near-ties: excuse a flip when the top-2 margin is under a measured bound
@@ -549,3 +550,53 @@ Flake (OLMoE golden `--concurrency 16`, prompts p10/p14 flip with batch composit
 Performance work before Phase 5 (multi-select): OLMoE decode host round trip per layer; TTFT / prefill; decode ITL; profile first.
 
 **Answer (2026-09-27): all four — profile first**, then land the top items one at a time (one change, then measure) across decode ITL, TTFT/prefill and the OLMoE decode round trip. Phase 5 starts only when the user says so.
+
+## Phase 4: eviction policy as a registered extension point
+
+The Phase 4 plan (written before Phase 2m) made `kv.policy` a closed enum `cost_aware | lru` matched in `make_policy`; the pluggability rule (decision 2026-09-26) asks for a trait, one file per implementation and a static registry.
+
+- A) `EvictionPolicy: Module` with `cost_aware.rs` and `lru.rs` under `turbine_kv::policy`, a `static` registry (point `eviction_policy`), a conformance suite run by `registry_conformance`, `kv.policy` a `ModuleName` validated by `Config::validate_modules` (exit 2 naming the registered ones) and a `docs/extending/eviction-policy.md` page; weights (`kv.policy_weights`) are passed to `score` so policies stay stateless statics (recommended)
+- B) Keep the closed enum and add the registry later
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Contract §11/§24, spec S-7 and the configuration table, and plan Task 6 amended. KV tiers stay a fixed set (L0/L1/L2 are the spec's physical tiers, each with its own sizing keys and transfer paths), so they are not a registry point in Phase 4.
+
+## Phase 4: kernel ABI v2.5 instead of v3
+
+The Phase 4 spec and contract (CONFLICT C-6) planned a major bump, ABI v3, making pinned memory, copy streams, asynchronous copies and events required. Since then Phase 2c added the compute-stream subset of those functions as the optional v2.3 group and Phase 2m the optional v2.4 group, so what Phase 4 still needs is additive.
+
+- A) An optional minor group v2.5 (`turbine_copy_stream_create/destroy`, `turbine_memcpy_async`, `turbine_event_query`, `turbine_stream_wait_event`; `turbine_event_record` accepts a copy stream), resolved only with minor ≥ 5 and the v2.3 group; a library without it runs the KV cache on L0 only with a WARN; `TURBINE_ABI_VERSION` stays 2 (recommended)
+- B) The planned v3: every function required, a v2 library refused
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** No breaking change for existing libraries (`libturbine_hip_v23.so` still loads and serves), the names and signatures are the v3 ones so a later major bump only makes them required. Contract §9.1, spec S-5/S-6 and plan Task 13 amended; the CUDA shim's copy (pinned.cu) stays out while NVIDIA is on hold.
+
+## Phase 4: prefix attach before the admission gate, and the KV reservation of shared blocks
+
+Phase 3 puts an admission gate with worst-case KV reservations in front of the scheduler; the Phase 4 plan attaches a request's cached prefix at admission. Where the attach happens decides what the reservation covers and when the client hears the admission decision.
+
+- A) Attach before the gate: the reservation excludes the attached (already resident, shared) blocks, the attached blocks are released on every path that drops an unadmitted request (gate cancel, timeout, circuit rejection, SURVIVAL requeue — which also clears the prefix), and a request whose prefix is still being promoted or computed by another request is held on the engine thread with its admission answer pending (at most the directory's 2 s pending wait plus the copies), so the P3 rule "the decision arrives before any event" holds (recommended)
+- B) Attach after the gate admits: the reservation covers the whole prompt (sharers each reserve the shared prefix), no hold, but admission under-uses the pool when many requests share a prefix
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Known limit: blocks attached by requests still waiting in the gate's queue are referenced without a reservation of their own (they are shared prefixes, bounded by the distinct prefixes queued); the `kv_utilization` signal counts reservations, not these. Under overlap scheduling the blocks an in-flight iteration writes are held from its ahead completion until it is collected and committed only on success. Plan Tasks 11 and 15 amended.
+
+## Phase 4: L0 capacity demotion
+
+Phase 3's pressure controller measures `kv_utilization` over worst-case reservations, so a pool full of cached (finished, unreferenced) prefix blocks stays GREEN and the controller never asks for demotion; allocations then reclaim cached blocks by dropping them, and L1/L2 stay empty (seen on novanas: 400 filler requests, 0 demotions).
+
+- A) The orchestrator keeps headroom by capacity: while referenced plus cached blocks exceed 0.70 of the pool (the `kv_utilization` YELLOW threshold) and some are cached, it demotes the lowest-valued cached blocks down to 0.70 (reason `capacity`), before each plan; the controller's reclaim stays as is (recommended)
+- B) Count cached blocks in `kv_utilization` (the controller would throttle admissions for reusable cache)
+- C) Demote synchronously inside allocation (blocks the engine on copies)
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** `turbine_server::kv_orchestrator::CAPACITY_DEMOTE_AT`; spec S-8's "an allocation needing blocks" path.
+
+Free accounting with Phase 3's `device_memory` fix ("device_memory counts idle pre-allocated KV and reserve as free"): cached-but-unreferenced L0 blocks are not covered by any reservation, so they fall in the `kv` pool's available bytes that the controller subtracts from used device memory — they count as free, like `kv_utilization` counts them and like the next allocation treats them (it reclaims them). The engine's `free_kv_blocks` for the exhaustion horizon is `BlockPool::available_blocks()` (free plus cached unreferenced) for the same reason. Known skew: prefix blocks attached by running requests are referenced but not reserved (decision "Phase 4: prefix attach before the admission gate"), so they too read as free to `device_memory`; bounded by the distinct shared prefixes in use.
+
+## Phase 4: capacity demotion only for blocks with reuse evidence
+
+The coordinator's bench of the Phase 4 tip (fbc9e1e) on GPU 0 showed an 8 % Llama throughput regression on a no-reuse workload (200 random 512-word prompts, c16): 708.1 tok/s and TTFT p50 229 ms against Phase 3's 770.5 / 195; 1,214 L0→L1 demotions (129 s of copy time) for 1,920 cached prompt tokens in total, and the engine's `schedule` stage at 4.03 s against 0.03 s. With `kv.cpu.enabled=false` it was 768.0 / 196. The orchestrator's capacity demotion (decision "Phase 4: L0 capacity demotion") copied every finished one-off request's blocks: the cost-aware value of a never-hit block is still positive, since the prefix-popularity term counts the one child every chain block has. Each turn also scanned the whole directory, about 400 µs with L1 full, plus the reclaim-order refresh.
+
+- A) Reuse-evidence gate on capacity demotion: a block is copied down by capacity only if it was hit at least once since it was written, belongs to a session (`prompt_cache_key`), or is a shared prefix (≥ 2 cached children); others stay cached in L0 for allocation to reclaim at no cost. Capacity demotion and the reclaim-order refresh run at most every 50 ms, scan the L0 index rather than the whole directory, and move at most 32 blocks per run. Pressure reclaim (the Phase 3 controller) stays value-ordered and ungated. Policy-independent and deterministic (recommended)
+- A') The same gate on pressure reclaim too, freeing evidence-free blocks (`no_reuse`): tried, and `turbine-bench kv-sim` `mixed` went from 0.76 to 0.93 × LRU (fails the ≤ 0.9 acceptance), because first-use blocks (a system prompt's first computation, reused only after it was demoted) are lost
+- B) A `kv.demote_min_value` default > 0: the cost-aware value spans orders of magnitude with block size, depth, prefill rate and tier capacity, so no single threshold separates one-off blocks from reusable ones, and it would not apply to `lru`
+- C) Change the cost-aware reuse term (e.g. count only branching prefixes): it only helps `cost_aware`, and it changes every policy test and the kv-sim margins
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** `turbine_kv::hierarchy::{has_reuse_evidence, CAPACITY_BATCH}` and `turbine_server::kv_orchestrator::HOUSEKEEPING_INTERVAL`. Host profile (release, 372-block L0 holding 360 one-off cached blocks): the old full L0 victims scan cost 103 µs per call and the reclaim-order refresh 115 µs, both every turn and more with L1 in the directory. The gated capacity scan costs 22 µs per call and runs at most every 50 ms. Test `hierarchy::tests::capacity_demotion_needs_reuse_evidence` covers a one-off block (not copied by capacity), a session block (copied), a re-used block (copied) and pressure (ungated). Tests that force demotion and expect copies give their blocks evidence: a second run in the simulator, `hierarchy`, `api` and engine-loop tests, and session keys for A and the fillers in `kv_gpu`.

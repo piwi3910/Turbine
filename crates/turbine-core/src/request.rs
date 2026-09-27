@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
+pub use crate::session_hints::SessionHints;
 use crate::types::{Priority, RequestId};
 
 /// The OpenAI endpoint a request arrived on.
@@ -61,6 +62,13 @@ pub enum ErrorCode {
     CircuitOpen,
     /// Device OOM recovery retries exhausted (503; mid-stream a `server_error` event).
     ResourceExhausted,
+    // Phase 4
+    InvalidSessionId,
+    InvalidSessionHint,
+    InvalidCacheSalt,
+    SessionNotFound,
+    PrefetchQueueFull,
+    PressureTooHigh,
 }
 
 impl ErrorCode {
@@ -90,6 +98,12 @@ impl ErrorCode {
             ErrorCode::Overloaded => "overloaded",
             ErrorCode::CircuitOpen => "circuit_open",
             ErrorCode::ResourceExhausted => "resource_exhausted",
+            ErrorCode::InvalidSessionId => "invalid_session_id",
+            ErrorCode::InvalidSessionHint => "invalid_session_hint",
+            ErrorCode::InvalidCacheSalt => "invalid_cache_salt",
+            ErrorCode::SessionNotFound => "session_not_found",
+            ErrorCode::PrefetchQueueFull => "prefetch_queue_full",
+            ErrorCode::PressureTooHigh => "pressure_too_high",
         }
     }
 }
@@ -166,6 +180,9 @@ impl FinishReason {
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Prompt tokens served from a cached prefix (Phase 4; 0 before).
+    #[serde(default)]
+    pub cached_tokens: u32,
 }
 
 /// Built by `turbine-server` after templating and tokenization.
@@ -188,6 +205,10 @@ pub struct GenerationRequest {
     pub constraint: Option<ConstraintSpec>,
     /// Monotonic deadline in milliseconds on the engine clock (`server.request_timeout`).
     pub deadline_ms: u64,
+    /// Phase 4: `prompt_cache_key` and the `x-turbine-session-*` hints (P4 §Session hints).
+    pub session: Option<SessionHints>,
+    /// Phase 4: `x-turbine-cache-salt`; only requests with the same salt share prefixes.
+    pub cache_salt: Option<String>,
 }
 
 /// What constrains a request's output (P2 S-17, S-18).

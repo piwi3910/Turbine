@@ -21,19 +21,23 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
-use turbine_api::openai::request::{PromptInput, ResponseFormat, ToolChoiceMode};
+use turbine_api::kv::PrefetchTarget;
+use turbine_api::openai::request::{OpenAiRequest, PromptInput, ResponseFormat, ToolChoiceMode};
 use turbine_api::{
     ApiError, BoxFuture, Diagnostics, GenerationStream, InferenceBackend, InferenceRequest,
-    ModelCard, NotReadyReason, Readiness, ReadyState, readiness_for_circuit,
+    ModelCard, NotReadyReason, PrefetchAccepted, PrefetchRequest, Readiness, ReadyState,
+    readiness_for_circuit,
 };
 use turbine_core::request::{
-    ConstraintSpec, Endpoint, ErrorCode, GenerationRequest, SamplingParams, StopConditions,
+    ConstraintSpec, Endpoint, ErrorCode, GenerationRequest, SamplingParams, SessionHints,
+    StopConditions,
 };
 use turbine_core::support::SupportRowView;
 use turbine_core::types::{CircuitState, PressureState, Priority};
 use turbine_device::DeviceInventory;
 use turbine_kernels::Selection;
 use turbine_kv::blocks_for_tokens;
+use turbine_kv::hierarchy::PrefetchError;
 use turbine_model::{ChatTemplate, Tokenizer, ToolChoice};
 use turbine_reliability::budget::PoolKind;
 use turbine_reliability::controller::ControllerHandle;
@@ -44,6 +48,7 @@ use crate::engine::{
     EVENT_CHANNEL_CAPACITY, EngineCommand, EngineHandle, EngineMetrics, EngineShared, Fatal,
     Submission, ToolOutput, ToolParser,
 };
+use crate::kv_orchestrator::{PrefetchRefused, PrefetchTargetOwned};
 use crate::metrics::{Outcome, ServerMetrics};
 use crate::model::PreparedModel;
 use crate::modules::ModuleChoices;
@@ -477,6 +482,15 @@ impl ModelBackend {
             echo,
             constraint,
             deadline_ms: u64::MAX,
+            session: body
+                .prompt_cache_key
+                .clone()
+                .map(|session_id| SessionHints {
+                    session_id,
+                    resume_within_secs: req.hints.session_resume_within,
+                    end: req.hints.session_end,
+                }),
+            cache_salt: req.hints.cache_salt.clone(),
             endpoint: req.endpoint,
             http_request_id: req.http_request_id.clone(),
             prompt_tokens,
@@ -563,6 +577,61 @@ impl ModelBackend {
         }
     }
 
+    /// `POST /turbine/v1/kv/prefetch` (P4 S-10): a prompt or messages body is tokenized like
+    /// the OpenAI routes (the chat template with the generation prompt), then the engine queues
+    /// the promotions of its cached blocks.
+    async fn prefetch_blocks(&self, req: PrefetchRequest) -> Result<PrefetchAccepted, ApiError> {
+        let Some(loaded) = self.loaded.get().filter(|_| self.is_ready()) else {
+            return Err(ApiError::model_not_loaded());
+        };
+        let cache_salt = req.cache_salt.unwrap_or_default();
+        let target = match req.target {
+            PrefetchTarget::Session { session_id } => PrefetchTargetOwned::Session(session_id),
+            PrefetchTarget::Prompt { prompt } => PrefetchTargetOwned::Tokens {
+                prompt: self
+                    .tokenizer
+                    .encode(&prompt, true)
+                    .map_err(|e| ApiError::invalid_request(e.to_string()))?,
+                cache_salt,
+            },
+            PrefetchTarget::Messages { messages } => {
+                let body = OpenAiRequest {
+                    messages: Some(messages),
+                    ..OpenAiRequest::default()
+                };
+                let text = self
+                    .template
+                    .render(&body.messages_json(), None, true, &serde_json::Map::new())
+                    .map_err(|e| ApiError::template_error(e.to_string()))?;
+                PrefetchTargetOwned::Tokens {
+                    prompt: self
+                        .tokenizer
+                        .encode(&text, false)
+                        .map_err(|e| ApiError::invalid_request(e.to_string()))?,
+                    cache_salt,
+                }
+            }
+        };
+        match loaded.engine.kv.prefetch(target).await {
+            Ok(a) => Ok(PrefetchAccepted {
+                blocks_queued: a.blocks_queued,
+                blocks_resident: a.blocks_resident,
+            }),
+            Err(PrefetchRefused::Kv(PrefetchError::SessionNotFound)) => {
+                Err(ApiError::session_not_found())
+            }
+            Err(PrefetchRefused::Kv(PrefetchError::QueueFull)) => {
+                Err(ApiError::prefetch_queue_full())
+            }
+            Err(PrefetchRefused::Kv(PrefetchError::PressureTooHigh)) => {
+                Err(ApiError::pressure_too_high())
+            }
+            Err(PrefetchRefused::EngineGone) => {
+                Err(ApiError::internal("the engine thread has stopped"))
+            }
+        }
+    }
+
     /// Validates the request and hands it to the engine; returns its event stream once the
     /// scheduler has queued it.
     async fn start(&self, req: InferenceRequest) -> Result<GenerationStream, ApiError> {
@@ -630,6 +699,10 @@ impl InferenceBackend for ModelBackend {
         let _ = code;
         self.metrics.request(endpoint, Outcome::Rejected);
     }
+
+    fn prefetch(&self, req: PrefetchRequest) -> BoxFuture<'_, Result<PrefetchAccepted, ApiError>> {
+        Box::pin(self.prefetch_blocks(req))
+    }
 }
 
 impl Readiness for ModelBackend {
@@ -681,7 +754,8 @@ impl Diagnostics for ModelBackend {
         let docs = self.engine_docs()?;
         serde_json::to_value(docs.scheduler).map_err(|e| ApiError::internal(e.to_string()))
     }
-    /// `KvDocument::from_pool` as of the engine's last step; 503 until the engine runs.
+    /// The KV hierarchy's document (P4 §Data) as of the engine's last step; 503 until the
+    /// engine runs.
     fn kv(&self) -> Result<Value, ApiError> {
         let docs = self.engine_docs()?;
         serde_json::to_value(docs.kv).map_err(|e| ApiError::internal(e.to_string()))

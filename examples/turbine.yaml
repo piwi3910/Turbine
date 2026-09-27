@@ -31,13 +31,47 @@ kv:
     enabled: true
     # L0 (GPU) block-pool cap; null (Phase 3 default) = the kv pool of the memory budget:
     # what remains after weights, workspace, runtime overhead and the emergency reserve.
+    # false is rejected from Phase 4 (L0 is required).
     max_bytes: null
+  # L1 pinned host tier; ignored with a WARN on unified-memory devices (GB10).
   cpu:
     enabled: true
+    # At most host MemTotal minus reliability.memory.host_reserve_bytes.
     max_bytes: 64GiB
+  # L2 NVMe slab files; wiped at startup, nothing persists across restarts.
   nvme:
     enabled: false
+    # Absolute; created if absent, must be writable.
     path: /var/lib/turbine/kv
+    # At most the free space at startup minus 10 %.
+    max_bytes: 64GiB
+    # A non-zero multiple of 4KiB holding at least one 4KiB-rounded block slot.
+    slab_bytes: 1GiB
+    max_queue_depth: 64
+    io_threads: 4
+  # cost_aware or lru (the benchmark baseline).
+  policy: cost_aware
+  # Blocks scoring below this are dropped instead of demoted.
+  demote_min_value: 0.0
+  # false: no prefix lookup and no reuse (A/B switch).
+  prefix_sharing: true
+  transfer:
+    # At least one KV block.
+    max_inflight_bytes: 1GiB
+  session:
+    max_sessions: 10000
+    # Idle sessions demote L0 -> L1 after hot_ttl and L1 -> L2 after warm_ttl (> hot_ttl).
+    hot_ttl: 60s
+    warm_ttl: 10m
+    # Session metadata is dropped after this much idle time.
+    max_idle: 1h
+  prefetch:
+    lead_time: 2s
+    max_queue: 256
+  policy_weights:
+    # Reuse boost of a hot session's blocks, 0..1.
+    session_active: 0.5
+    hit_half_life: 60s
 reliability:
   enabled: true
   emergency_vram_reserve: 2GiB

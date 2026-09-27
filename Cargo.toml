@@ -22,8 +22,12 @@ turbine-reliability = { path = "crates/turbine-reliability" }
 # P3: lock-free snapshot the engine reads once per iteration (decision: arc-swap 1.x).
 arc-swap = "1.9"
 axum = "0.8.9"
+# P4 KV identity: block and namespace keys, model fingerprint
+blake3 = "1.8"
 cc = "1.5.1"
 clap = { version = "4.6.7", features = ["derive"] }
+# P4 L2 NVMe tier: per-block checksum
+crc32c = "0.6"
 futures-util = "0.3.34"
 half = "2.7.1"
 # Phase 2 dev-dependency: validating structured outputs against their JSON schema in tests
@@ -55,6 +59,8 @@ thiserror = "2.0.21"
 toktrie_hf_tokenizers = "=1.8.0"
 tokenizers = { version = "=0.21.4", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# P4 L2 tier tests: temporary slab directories
+tempfile = "3.27"
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
@@ -63,4 +69,12 @@ uuid = { version = "1.26.1", features = ["serde", "v4"] }
 # The CPU reference provider is the numerical oracle for GPU op tests on real shapes; optimise it
 # even in dev/test builds so those comparisons finish in seconds.
 [profile.dev.package.turbine-kernels]
+opt-level = 3
+
+# The KV hierarchy and the kv-sim replay run long deterministic simulations in tests (about
+# 17 s optimised versus minutes at opt-level 0, measured during P4 planning).
+[profile.dev.package.turbine-kv]
+opt-level = 3
+
+[profile.dev.package.turbine-bench]
 opt-level = 3

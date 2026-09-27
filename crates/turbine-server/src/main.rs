@@ -5,6 +5,8 @@ mod backend;
 mod cli;
 mod engine;
 mod exit;
+mod host;
+mod kv_orchestrator;
 mod metrics;
 mod model;
 mod modules;

@@ -140,12 +140,14 @@ pub(crate) struct TokenLogprob {
     pub text_offset: usize,
 }
 
-/// The OpenAI `usage` object.
+/// The OpenAI `usage` object; `prompt_tokens_details.cached_tokens` counts the prompt tokens
+/// served from a cached prefix (Phase 4).
 pub(crate) fn usage_json(usage: Usage) -> Value {
     json!({
         "prompt_tokens": usage.prompt_tokens,
         "completion_tokens": usage.completion_tokens,
         "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+        "prompt_tokens_details": {"cached_tokens": usage.cached_tokens},
     })
 }
 
@@ -223,16 +225,18 @@ pub(crate) fn choice_index(choice: u32, len: usize) -> Result<usize, ApiError> {
         })
 }
 
-/// Usage of the whole request: the prompt once (the largest count reported) and the completion
-/// tokens of every choice (the engine's count, else the tokens the API saw).
+/// Usage of the whole request: the prompt once (the largest count reported, likewise its
+/// cached tokens) and the completion tokens of every choice (the engine's count, else the tokens
+/// the API saw).
 pub(crate) fn total_usage<'a>(choices: impl IntoIterator<Item = &'a ChoiceState>) -> Usage {
     let mut total = Usage::default();
     for c in choices {
-        let (prompt, completion) = match c.usage {
-            Some(u) => (u.prompt_tokens, u.completion_tokens),
-            None => (0, c.acc.tokens),
+        let (prompt, cached, completion) = match c.usage {
+            Some(u) => (u.prompt_tokens, u.cached_tokens, u.completion_tokens),
+            None => (0, 0, c.acc.tokens),
         };
         total.prompt_tokens = total.prompt_tokens.max(prompt);
+        total.cached_tokens = total.cached_tokens.max(cached);
         total.completion_tokens += completion;
     }
     total

@@ -496,6 +496,8 @@ fn greedy(
         echo: false,
         constraint: None,
         deadline_ms: u64::MAX,
+        session: None,
+        cache_salt: None,
         endpoint: Endpoint::Completions,
         http_request_id: "golden".into(),
         prompt_tokens,

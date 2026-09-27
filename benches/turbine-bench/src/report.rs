@@ -18,6 +18,12 @@ pub struct RequestStats {
     pub e2e: Duration,
     /// Output tokens reported by the endpoint.
     pub output_tokens: u64,
+    /// The streamed content text (the assistant reply of a multi-turn history).
+    pub text: String,
+    /// `usage.prompt_tokens`, when the endpoint reported usage.
+    pub prompt_tokens: Option<u64>,
+    /// `usage.prompt_tokens_details.cached_tokens`, when reported.
+    pub cached_tokens: Option<u64>,
 }
 
 /// p50/p95/p99 of a latency distribution, in milliseconds.
@@ -42,6 +48,15 @@ pub struct Report {
     /// `by_status`, `by_error_code`, `client_dropped`, `streams_incomplete` (phase 3).
     #[serde(flatten)]
     pub breakdown: Breakdown,
+    /// Multi-turn (P4): cached / prompt tokens over every turn that reported both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens_ratio: Option<f64>,
+    /// Multi-turn: TTFT of each session's first turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms_first_turn: Option<Percentiles>,
+    /// Multi-turn: TTFT of the later turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms_later_turns: Option<Percentiles>,
 }
 
 /// Nearest-rank percentiles of `values`. Empty input gives zeros.
@@ -94,6 +109,9 @@ impl Report {
             ),
             e2e_ms: percentiles(ok.iter().map(|r| ms(r.e2e)).collect()),
             breakdown: Breakdown::default(),
+            cached_tokens_ratio: None,
+            ttft_ms_first_turn: None,
+            ttft_ms_later_turns: None,
         }
     }
 
@@ -101,6 +119,22 @@ impl Report {
     pub fn with_breakdown(mut self, breakdown: Breakdown) -> Report {
         self.breakdown = breakdown;
         self
+    }
+
+    /// The multi-turn additions: the cached-token ratio of every turn and the TTFT split
+    /// into first and later turns.
+    pub fn add_multi_turn(&mut self, first: &[&RequestStats], later: &[&RequestStats]) {
+        let (mut prompt, mut cached) = (0u64, 0u64);
+        for r in first.iter().chain(later) {
+            if let (Some(p), Some(c)) = (r.prompt_tokens, r.cached_tokens) {
+                prompt += p;
+                cached += c;
+            }
+        }
+        self.cached_tokens_ratio = (prompt > 0).then(|| cached as f64 / prompt as f64);
+        let ttft = |rs: &[&RequestStats]| percentiles(rs.iter().map(|r| ms(r.ttft)).collect());
+        self.ttft_ms_first_turn = Some(ttft(first));
+        self.ttft_ms_later_turns = Some(ttft(later));
     }
 
     /// Human-readable rendering: counts, wall time, throughputs and latency percentile rows.
@@ -180,12 +214,18 @@ mod tests {
                 itls: vec![ms(20), ms(30)],
                 e2e: ms(200),
                 output_tokens: 3,
+                text: String::new(),
+                prompt_tokens: Some(100),
+                cached_tokens: Some(60),
             },
             RequestStats {
                 ttft: ms(120),
                 itls: vec![ms(40)],
                 e2e: ms(220),
                 output_tokens: 2,
+                text: String::new(),
+                prompt_tokens: Some(300),
+                cached_tokens: None,
             },
         ];
         let mut breakdown = Breakdown::default();
@@ -226,6 +266,17 @@ mod tests {
         assert_eq!(json["client_dropped"], 1);
         assert_eq!(json["streams_incomplete"], 0);
         assert!(json["ttft_ms"].get("p95").is_some());
+        assert!(
+            json.get("cached_tokens_ratio").is_none(),
+            "multi-turn keys only in multi-turn reports"
+        );
+
+        // Multi-turn: only turns reporting both counts enter the ratio.
+        let mut m = r.clone();
+        m.add_multi_turn(&[&ok[0]], &[&ok[1]]);
+        assert_eq!(m.cached_tokens_ratio, Some(0.6));
+        assert_eq!(m.ttft_ms_first_turn.unwrap().p50, 100.0);
+        assert_eq!(m.ttft_ms_later_turns.unwrap().p50, 120.0);
 
         let text = r.to_text();
         assert!(text.contains("requests failed:         1"));

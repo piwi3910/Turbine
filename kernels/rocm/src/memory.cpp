@@ -1,5 +1,6 @@
 // Device allocation, host<->device copies, stream synchronisation and memory
-// info, and (ABI v2.3) pinned host memory and stream events. Copies are
+// info, and (ABI v2.3) pinned host memory and stream events (v2.5 copy streams:
+// copy_stream.cpp). Copies are
 // enqueued on the context's compute stream; host buffers must stay valid until
 // the next turbine_stream_sync, or for pinned memory until an event recorded
 // after the copy has completed (ABI contract). While the stream is captured
@@ -169,15 +170,12 @@ int32_t turbine_event_record(turbine_ctx *ctx, turbine_event *e,
   if (e == nullptr) {
     return fail(ctx, TURBINE_E_ARGUMENT, "turbine_event_record: NULL event");
   }
-  if (s != nullptr) {
-    return fail(ctx, TURBINE_E_ARGUMENT,
-                "turbine_event_record: only the compute stream (NULL) before "
-                "ABI v3");
-  }
   if (int32_t rc = enter(ctx); rc != TURBINE_OK)
     return rc;
-  return check_hip(ctx,
-                   hipEventRecord(reinterpret_cast<hipEvent_t>(e), ctx->stream),
+  // s NULL = the compute stream; from v2.5 a copy stream (copy_stream.cpp).
+  hipStream_t stream =
+      s != nullptr ? reinterpret_cast<hipStream_t>(s) : ctx->stream;
+  return check_hip(ctx, hipEventRecord(reinterpret_cast<hipEvent_t>(e), stream),
                    "hipEventRecord");
 }
 

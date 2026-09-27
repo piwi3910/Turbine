@@ -5,7 +5,7 @@
  * always idle, and every op reports TURBINE_E_UNSUPPORTED. build.rs compiles
  * it with the host C compiler once per variant:
  *   -DSTUB_ABI=<n>u  -DSTUB_BACKEND="<name>"  -DSTUB_ARCHS="<a,b>"
- *   [-DTURBINE_STUB_V21] [-DTURBINE_STUB_V24]
+ *   [-DTURBINE_STUB_V21] [-DTURBINE_STUB_V24] [-DTURBINE_STUB_V25]
  * With TURBINE_STUB_V21 it also exports the optional ABI v2.1 and v2.3
  * symbols: turbine_abi_minor (3, a v2.3 library), context options
  * (TURBINE_OPTION_GEMM_AUTOTUNE kept per context,
@@ -13,8 +13,10 @@
  * logits_reduce trios (unsupported like every op), graphs that record
  * nothing (stub_live_graphs() counts graphs not yet destroyed), and host
  * staging memory and events (see the v2.3 section below). With
- * TURBINE_STUB_V24 as well it reports minor TURBINE_ABI_MINOR and exports the
- * v2.4 implementation group (see the v2.4 section at the end).
+ * TURBINE_STUB_V24 as well it reports minor 4 and exports the v2.4
+ * implementation group (see the v2.4 section); with TURBINE_STUB_V25 as well
+ * it reports minor TURBINE_ABI_MINOR (5) and exports the v2.5 copy streams
+ * (see the v2.5 section at the end).
  *
  * stub_live_contexts() is a test hook (not part of the ABI): the number of
  * contexts created and not yet destroyed, so tests can prove the Rust side
@@ -227,8 +229,10 @@ STUB_OP(moe_experts, turbine_moe_experts_desc)
 STUB_OP(add_rmsnorm, turbine_add_rmsnorm_desc)
 STUB_OP(logits_reduce, turbine_logits_reduce_desc)
 
-#ifdef TURBINE_STUB_V24
+#if defined(TURBINE_STUB_V25)
 uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
+#elif defined(TURBINE_STUB_V24)
+uint32_t turbine_abi_minor(void) { return 4u; }
 #else
 uint32_t turbine_abi_minor(void) { return 3u; }
 #endif
@@ -328,6 +332,8 @@ int32_t turbine_graph_destroy(turbine_ctx *ctx, turbine_graph *g) {
  * turbine_event_synchronize calls. */
 struct turbine_event {
   turbine_ctx *ctx;
+  /* v2.5: recorded at least once */
+  int32_t recorded;
 };
 
 static atomic_int live_host_buffers;
@@ -343,7 +349,8 @@ int32_t turbine_host_alloc_pinned(turbine_ctx *ctx, size_t bytes, void **out) {
     set_error(ctx->last_error, "stub: null host pointer");
     return TURBINE_E_ARGUMENT;
   }
-  *out = malloc(bytes == 0 ? 1 : bytes);
+  /* Page-locked memory is limited like the stub's device (`ulimit -l`). */
+  *out = bytes > STUB_TOTAL_BYTES ? NULL : malloc(bytes == 0 ? 1 : bytes);
   if (*out == NULL) {
     set_error(ctx->last_error, "stub: out of host memory");
     return TURBINE_E_OUT_OF_MEMORY;
@@ -379,10 +386,16 @@ int32_t turbine_event_create(turbine_ctx *ctx, turbine_event **out) {
 
 int32_t turbine_event_record(turbine_ctx *ctx, turbine_event *e,
                              turbine_stream *s) {
-  if (e == NULL || e->ctx != ctx || s != NULL) {
+#ifdef TURBINE_STUB_V25
+  const int32_t stream_ok = 1; /* v2.5: copy streams may be named */
+#else
+  const int32_t stream_ok = s == NULL;
+#endif
+  if (e == NULL || e->ctx != ctx || !stream_ok) {
     set_error(ctx->last_error, "stub: event of another context");
     return TURBINE_E_ARGUMENT;
   }
+  e->recorded = 1;
   return TURBINE_OK;
 }
 
@@ -513,3 +526,90 @@ int32_t turbine_ctx_set_profile(turbine_ctx *ctx,
   return TURBINE_E_UNSUPPORTED;
 }
 #endif /* TURBINE_STUB_V24 */
+
+#ifdef TURBINE_STUB_V25
+/* v2.5: copy streams are bookkeeping only and asynchronous copies are memcpy
+ * (the stub has no device). stub_live_streams() counts streams not yet
+ * destroyed; stub_hold_events(1) makes turbine_event_query report pending
+ * until stub_hold_events(0); stub_stream_waits() counts
+ * turbine_stream_wait_event calls. */
+struct turbine_stream {
+  turbine_ctx *ctx;
+};
+
+static atomic_int live_streams;
+static atomic_int hold_events;
+static atomic_int stream_waits;
+
+int32_t stub_live_streams(void) { return atomic_load(&live_streams); }
+void stub_hold_events(int32_t hold) { atomic_store(&hold_events, hold); }
+int32_t stub_stream_waits(void) { return atomic_load(&stream_waits); }
+
+int32_t turbine_copy_stream_create(turbine_ctx *ctx, turbine_stream **out) {
+  if (out == NULL) {
+    set_error(ctx->last_error, "stub: null stream pointer");
+    return TURBINE_E_ARGUMENT;
+  }
+  turbine_stream *st = calloc(1, sizeof *st);
+  if (st == NULL) {
+    set_error(ctx->last_error, "stub: out of host memory");
+    return TURBINE_E_OUT_OF_MEMORY;
+  }
+  st->ctx = ctx;
+  atomic_fetch_add(&live_streams, 1);
+  *out = st;
+  return TURBINE_OK;
+}
+
+int32_t turbine_copy_stream_destroy(turbine_ctx *ctx, turbine_stream *st) {
+  if (st == NULL)
+    return TURBINE_OK;
+  if (st->ctx != ctx) {
+    set_error(ctx->last_error, "stub: stream of another context");
+    return TURBINE_E_ARGUMENT;
+  }
+  atomic_fetch_sub(&live_streams, 1);
+  free(st);
+  return TURBINE_OK;
+}
+
+int32_t turbine_memcpy_async(turbine_ctx *ctx, turbine_stream *st, void *dst,
+                             const void *src, size_t bytes, int32_t kind) {
+  if (st != NULL && st->ctx != ctx) {
+    set_error(ctx->last_error, "stub: stream of another context");
+    return TURBINE_E_ARGUMENT;
+  }
+  if (kind < TURBINE_COPY_H2D || kind > TURBINE_COPY_D2D) {
+    set_error(ctx->last_error, "stub: unknown copy kind");
+    return TURBINE_E_ARGUMENT;
+  }
+  if (bytes == 0)
+    return TURBINE_OK;
+  if (dst == NULL || src == NULL) {
+    set_error(ctx->last_error, "stub: null copy pointer");
+    return TURBINE_E_ARGUMENT;
+  }
+  memcpy(dst, src, bytes);
+  return TURBINE_OK;
+}
+
+int32_t turbine_event_query(turbine_ctx *ctx, turbine_event *e) {
+  if (e == NULL || e->ctx != ctx) {
+    set_error(ctx->last_error, "stub: event of another context");
+    return TURBINE_E_ARGUMENT;
+  }
+  if (!e->recorded)
+    return 1;
+  return atomic_load(&hold_events) ? 0 : 1;
+}
+
+int32_t turbine_stream_wait_event(turbine_ctx *ctx, turbine_stream *st,
+                                  turbine_event *e) {
+  if (e == NULL || e->ctx != ctx || (st != NULL && st->ctx != ctx)) {
+    set_error(ctx->last_error, "stub: object of another context");
+    return TURBINE_E_ARGUMENT;
+  }
+  atomic_fetch_add(&stream_waits, 1);
+  return TURBINE_OK;
+}
+#endif /* TURBINE_STUB_V25 */

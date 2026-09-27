@@ -1,13 +1,17 @@
 //! Startup order (P1 §Interfaces, contract §16.3): config and module names (exit 2) →
 //! support-matrix row with the device arch unknown (exit 2 when unsupported; also under
 //! `--check-config`) → tracing → device discovery → support-matrix row with the device arch
-//! (exit 2 when unsupported; `event="support_matrix"`, WARN when experimental) →
-//! kernel provider → model config, tokenizer, template → kernel registry → pre-load memory
-//! budget (P3 S-2: the KV pool, the batch workspace and the emergency reserve; exit 1 naming
-//! every pool, nothing bound yet) → bind (`/health` 200, `/ready` 503 `loading_model`; exit 1)
-//! → on the engine thread: weight load, the budget re-measured, the reservation ledger, KV
-//! pool, emergency reserve and one-token warm-up, then the telemetry sampler and the pressure
-//! controller → `/ready` 200 → serve until SIGINT/SIGTERM (exit 0).
+//! (exit 2 when unsupported; `event="support_matrix"`, WARN when experimental) → the P4 `kv`
+//! host rules (`kv.cpu.max_bytes` against MemTotal minus `reliability.memory.host_reserve_bytes`
+//! exit 2, `kv.nvme.max_bytes` against free disk exit 1) → kernel provider → model config,
+//! tokenizer, template → kernel registry → pre-load memory budget (P3 S-2: the KV pool, the
+//! batch workspace and the emergency reserve; exit 1 naming every pool, nothing bound yet) →
+//! the `kv` block-size rules (exit 2) and the L2 tier (`kv.nvme.path` created, wiped of old
+//! slab files and checked writable; exit 1) → bind (`/health` 200, `/ready` 503
+//! `loading_model`; exit 1) → on the engine thread: weight load, the budget re-measured, the
+//! reservation ledger, KV pool, the KV hierarchy (L1 tier and transfer calibration), emergency
+//! reserve and one-token warm-up, then the telemetry sampler and the pressure controller →
+//! `/ready` 200 → serve until SIGINT/SIGTERM (exit 0).
 //!
 //! Shutdown (P2 S-13): on SIGINT/SIGTERM `/ready` and new requests answer 503 `shutting_down`
 //! while the listener stays open; running requests continue until none is left or
@@ -29,11 +33,13 @@ use std::time::Duration;
 use axum::serve::ListenerExt;
 use turbine_api::support::SupportMetrics;
 use turbine_api::{ApiLimits, ApiState};
+use turbine_core::clock::SystemClock;
 use turbine_core::config::{self, Config, ConfigError};
 use turbine_core::support::SupportRowView;
 use turbine_device::telemetry::TelemetryMetrics;
 use turbine_device::{DeviceInventory, DeviceMetrics, DiscoveryOptions};
 use turbine_kv::KvMetrics;
+use turbine_kv::tier::L2NvmeTier;
 use turbine_model::ModelMetrics;
 use turbine_observability::MetricsRegistry;
 use turbine_reliability::metrics::ReliabilityMetrics;
@@ -41,8 +47,10 @@ use turbine_scheduler::SchedulerMetrics;
 
 use crate::backend::ModelBackend;
 use crate::cli::Cli;
-use crate::engine::{self, EngineMetrics, Fatal, ReliabilityStartup, Timeouts};
+use crate::engine::{self, EngineMetrics, Fatal, KvSetup, ReliabilityStartup, Timeouts};
 use crate::exit::ExitCode;
+use crate::host;
+use crate::kv_orchestrator::{self, kv_format};
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
 use crate::modules::known_module_names;
@@ -134,6 +142,18 @@ pub fn run(cli: Cli) -> ExitCode {
     };
     support_startup::log(&support);
 
+    // P4 host rules (contract §16.3): a `kv.nvme.*` violation is a runtime failure (exit 1),
+    // any other an invalid configuration (exit 2); both before anything is bound.
+    if let Err(e) = config.validate_host(&host::facts(&config.kv)) {
+        let nvme = e.key().is_some_and(|k| k.starts_with("kv.nvme."));
+        eprintln!("turbine-server: invalid configuration: {e}");
+        return if nvme {
+            ExitCode::Startup
+        } else {
+            ExitCode::Config
+        };
+    }
+
     let metrics = MetricsRegistry::new();
     DeviceMetrics::register(&metrics).record(&inventory);
     SupportMetrics::register(&metrics).set(&support.status);
@@ -141,6 +161,28 @@ pub fn run(cli: Cli) -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "model startup failed");
+            eprintln!("turbine-server: {e}");
+            return ExitCode::Startup;
+        }
+    };
+    // P4: the model's block size is known now (exit 2), and L2 opens before the listener binds
+    // (exit 1 naming the path).
+    let layout = prepared.pool.layout;
+    if let Err(e) = config.kv.validate_block_bytes(layout.block_bytes()) {
+        eprintln!("turbine-server: invalid configuration: {e}");
+        return ExitCode::Config;
+    }
+    let kv_metrics = KvMetrics::register(&metrics);
+    let l2 = match kv_orchestrator::open_l2(
+        &config.kv,
+        &kv_format(layout),
+        &prepared.identity,
+        Arc::new(SystemClock::new()),
+        kv_metrics.clone(),
+    ) {
+        Ok(l2) => l2,
+        Err(e) => {
+            tracing::error!(error = %e, "KV tier startup failed");
             eprintln!("turbine-server: {e}");
             return ExitCode::Startup;
         }
@@ -156,7 +198,18 @@ pub fn run(cli: Cli) -> ExitCode {
             return ExitCode::Startup;
         }
     };
-    let code = runtime.block_on(serve(config, inventory, metrics, prepared, support.view()));
+    let kv = ServeKv {
+        metrics: kv_metrics,
+        l2,
+    };
+    let code = runtime.block_on(serve(
+        config,
+        inventory,
+        metrics,
+        prepared,
+        support.view(),
+        kv,
+    ));
     // Never wait for the generation thread or in-flight blocking work on the way out.
     runtime.shutdown_background();
     code
@@ -170,19 +223,26 @@ fn refuse_support(error: &ConfigError) -> ExitCode {
     ExitCode::Config
 }
 
+/// The KV pieces built before the listener binds (Phase 4).
+struct ServeKv {
+    metrics: KvMetrics,
+    l2: Option<Arc<L2NvmeTier>>,
+}
+
 async fn serve(
     config: Config,
     inventory: DeviceInventory,
     metrics: MetricsRegistry,
     prepared: PreparedModel,
     support: SupportRowView,
+    kv: ServeKv,
 ) -> ExitCode {
     let addr: SocketAddr = config.server.listen;
     let engine_metrics = EngineMetrics {
         server: ServerMetrics::register(&metrics),
         model: ModelMetrics::register(&metrics),
         scheduler: SchedulerMetrics::register(&metrics),
-        kv: KvMetrics::register(&metrics),
+        kv: kv.metrics,
     };
     let backend =
         Arc::new(ModelBackend::new(&prepared, &inventory, &engine_metrics).with_support(support));
@@ -220,6 +280,10 @@ async fn serve(
         devices: config.devices.clone(),
         metrics: ReliabilityMetrics::register(&state.metrics),
         telemetry: TelemetryMetrics::register(&state.metrics),
+        kv: KvSetup {
+            cfg: config.kv.clone(),
+            l2: kv.l2,
+        },
     };
     if let Err(e) = engine::spawn(
         prepared,

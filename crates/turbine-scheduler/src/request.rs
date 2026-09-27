@@ -7,6 +7,7 @@ use serde::Serialize;
 use smallvec::SmallVec;
 use turbine_core::request::{CancelFlag, ResourceEstimate};
 use turbine_core::types::{Priority, RequestId, SeqId};
+use turbine_kv::hierarchy::PrefixAttach;
 
 /// Lifecycle state of a sequence (and of a request, aggregated over its sequences).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize)]
@@ -141,6 +142,10 @@ pub struct SchedRequest {
     pub cancel: CancelFlag,
     /// Has a `response_format` or tool grammar (counted in the scheduler snapshot).
     pub constrained: bool,
+    /// Phase 4: the cached prefix `KvHierarchy::attach_prefix` attached. The request owns one
+    /// reference to each block until admission hands them to its first sequence's table, or
+    /// until it is dropped.
+    pub cached_prefix: Option<PrefixAttach>,
 }
 
 impl SchedRequest {
@@ -163,7 +168,22 @@ impl SchedRequest {
             arrival: Duration::ZERO,
             cancel: CancelFlag::default(),
             constrained: false,
+            cached_prefix: None,
         }
+    }
+
+    /// Hands the request its attached cached prefix (P4 S-3) and sets the admission estimate
+    /// to match (Phase 3's `Admission::estimate` computes the same once Phase 3 is present):
+    /// cached tokens are not prefilled and their full blocks are already held.
+    pub fn attach_prefix(&mut self, attach: PrefixAttach, block_tokens: u32) {
+        let cached = attach.cached_tokens;
+        let e = &mut self.estimate;
+        e.cached_prefix_tokens = cached;
+        e.new_prefill_tokens = self.prompt_len - cached.min(self.prompt_len);
+        e.projected_kv_blocks = e
+            .projected_kv_blocks
+            .saturating_sub(cached / block_tokens.max(1));
+        self.cached_prefix = Some(attach);
     }
 }
 

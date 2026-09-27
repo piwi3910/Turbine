@@ -278,6 +278,50 @@ fn port_in_use_exits_1() {
     drop(holder);
 }
 
+/// The Phase 4 `kv` startup rules (P4 §Configuration, plan Task 15): an L2 path that cannot be
+/// created or written exits 1 naming the path, and an L1 larger than host memory minus the
+/// reserve exits 2 naming `kv.cpu.max_bytes` — both before the listener binds. Breaks if either
+/// rule is skipped, reported with the wrong exit code, or checked after binding.
+#[test]
+fn kv_startup_rules() {
+    let port = free_port();
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let (model, yaml) = tiny_model_yaml(addr);
+
+    // Below a regular file nothing can be created, not even by root.
+    let blocker = model.path().join("not-a-directory");
+    std::fs::write(&blocker, b"x").unwrap();
+    let nvme_path = blocker.join("kv");
+    let cfg = TempConfig::new(
+        "kv-nvme-path",
+        &format!(
+            "{yaml}kv:\n  nvme:\n    enabled: true\n    path: {}\n    max_bytes: 64MiB\n    \
+             slab_bytes: 1MiB\n",
+            nvme_path.display()
+        ),
+    );
+    let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(60));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&nvme_path.display().to_string()),
+        "names the path: {stderr}"
+    );
+    TcpListener::bind(addr).expect("the configured port must still be free");
+
+    // 1000 TiB of L1 exceeds any host's MemTotal minus the 8 GiB reserve.
+    let cfg = TempConfig::new(
+        "kv-cpu-max",
+        &format!("{yaml}kv:\n  cpu:\n    max_bytes: 1099511627776000\n"),
+    );
+    let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(60));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("kv.cpu.max_bytes"), "stderr: {stderr}");
+    assert!(stderr.contains("MemTotal"), "stderr: {stderr}");
+    TcpListener::bind(addr).expect("the configured port must still be free");
+}
+
 /// Sends SIGTERM to `child`.
 #[cfg(unix)]
 fn sigterm(child: &Child) {

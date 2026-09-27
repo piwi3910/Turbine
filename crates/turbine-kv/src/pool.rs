@@ -1,14 +1,21 @@
 //! The L0 (GPU) block pool: one preallocated device buffer, a free list and per-block
 //! reference counts. After construction the pool never calls the device allocator, so running
 //! out of blocks is `PoolError::Exhausted`, never an allocation failure.
+//!
+//! Phase 4 adds cached blocks: a block the KV directory has keyed (`set_keyed`) stays allocated
+//! when its reference count reaches 0, so a later request can attach it again. `allocate`
+//! reclaims such cached unreferenced blocks, lowest value first in the order the hierarchy
+//! published (`set_reclaim_order`), when the free list is short, and reports them through
+//! `take_reclaimed` so the directory forgets their L0 copies.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use smallvec::SmallVec;
 use turbine_core::types::{BlockId, DeviceId, KvLayout};
 use turbine_reliability::budget::PoolKind;
 use turbine_reliability::ledger::{Ledger, Reservation};
-use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, MemoryError};
+use turbine_tensor::{DeviceBuffer, DeviceMemory, DevicePtr, KvPoolView, MemoryError};
 
 use crate::table::BlockTable;
 
@@ -56,10 +63,19 @@ pub struct BlockPool {
     /// Free block ids; `allocate` pops from the end, so ids are handed out in ascending order
     /// from a fresh pool.
     free: Vec<BlockId>,
-    /// Reference count per block; 0 exactly when the block is on the free list.
+    /// Reference count per block; 0 exactly when the block is free or cached.
     refcounts: Vec<u32>,
     /// The reservation ledger whose `kv` pool pays for the blocks (P3), and its device.
     ledger: Option<(Arc<Ledger>, DeviceId)>,
+    /// Phase 4: the directory holds an L0 location for this block, so it stays cached at
+    /// reference count 0 instead of returning to the free list.
+    keyed: Vec<bool>,
+    /// Keyed blocks at reference count 0.
+    cached: u32,
+    /// Reclaim order hint (lowest value first); stale entries are skipped.
+    reclaim_order: VecDeque<BlockId>,
+    /// Cached blocks `allocate` reclaimed since the last `take_reclaimed`.
+    reclaimed: Vec<BlockId>,
 }
 
 impl std::fmt::Debug for BlockPool {
@@ -91,6 +107,10 @@ impl BlockPool {
             free: (0..cfg.num_blocks).rev().map(BlockId).collect(),
             refcounts: vec![0; cfg.num_blocks as usize],
             ledger: None,
+            keyed: vec![false; cfg.num_blocks as usize],
+            cached: 0,
+            reclaim_order: VecDeque::new(),
+            reclaimed: Vec::new(),
         })
     }
 
@@ -155,14 +175,24 @@ impl BlockPool {
         self.total_blocks() - self.free_blocks()
     }
 
-    /// `n` fresh blocks with refcount 1, or `Exhausted` with nothing allocated.
+    /// `n` fresh blocks with refcount 1, or `Exhausted` with nothing allocated. When the free
+    /// list is short, cached unreferenced blocks are reclaimed first (Phase 4).
     pub fn allocate(&mut self, n: u32) -> Result<SmallVec<[BlockId; 8]>, PoolError> {
-        let available = self.free_blocks();
+        let available = self.available_blocks();
         if n > available {
             return Err(PoolError::Exhausted {
                 requested: n,
                 available,
             });
+        }
+        while self.free_blocks() < n {
+            let victim = self
+                .next_reclaimable()
+                .expect("available_blocks counted a cached unreferenced block");
+            self.keyed[victim.0 as usize] = false;
+            self.cached -= 1;
+            self.reclaimed.push(victim);
+            self.free.push(victim);
         }
         let mut out = SmallVec::with_capacity(n as usize);
         for _ in 0..n {
@@ -173,25 +203,105 @@ impl BlockPool {
         Ok(out)
     }
 
-    /// One more holder of an allocated block. Panics on a free block (a caller bug: the block
-    /// could be handed out again).
+    fn is_cached(&self, b: BlockId) -> bool {
+        self.keyed[b.0 as usize] && self.refcounts[b.0 as usize] == 0
+    }
+
+    /// The next cached unreferenced block: first from the published order, then by id.
+    fn next_reclaimable(&mut self) -> Option<BlockId> {
+        while let Some(b) = self.reclaim_order.pop_front() {
+            if self.is_cached(b) {
+                return Some(b);
+            }
+        }
+        (0..self.total_blocks())
+            .map(BlockId)
+            .find(|&b| self.is_cached(b))
+    }
+
+    /// One more holder of an allocated block (referenced or cached). Panics on a free block (a
+    /// caller bug: the block could be handed out again).
     pub fn incref(&mut self, b: BlockId) {
+        let cached = self.is_cached(b);
         let rc = &mut self.refcounts[b.0 as usize];
-        assert!(*rc > 0, "incref of free KV block {b:?}");
+        assert!(*rc > 0 || cached, "incref of free KV block {b:?}");
+        if cached {
+            self.cached -= 1;
+        }
         *rc += 1;
     }
 
     /// Drops one reference to each block; a block whose count reaches 0 returns to the free
-    /// list. Panics on a block that is already free (a double release).
+    /// list, or stays cached when keyed. Panics on an unreferenced block (a double release).
     pub fn release(&mut self, blocks: &[BlockId]) {
         for &b in blocks {
             let rc = &mut self.refcounts[b.0 as usize];
-            assert!(*rc > 0, "release of free KV block {b:?}");
+            assert!(*rc > 0, "release of unreferenced KV block {b:?}");
             *rc -= 1;
             if *rc == 0 {
-                self.free.push(b);
+                if self.keyed[b.0 as usize] {
+                    self.cached += 1;
+                } else {
+                    self.free.push(b);
+                }
             }
         }
+    }
+
+    /// Holders of `b` (0 for a free or cached block).
+    pub fn refcount(&self, b: BlockId) -> u32 {
+        self.refcounts[b.0 as usize]
+    }
+
+    pub fn is_keyed(&self, b: BlockId) -> bool {
+        self.keyed[b.0 as usize]
+    }
+
+    /// Marks a referenced block as cached content: the directory now holds an L0 location for
+    /// it, so reference count 0 keeps it. Panics on an unreferenced block.
+    pub fn set_keyed(&mut self, b: BlockId) {
+        assert!(
+            self.refcounts[b.0 as usize] > 0 || self.keyed[b.0 as usize],
+            "set_keyed of unreferenced KV block {b:?}"
+        );
+        self.keyed[b.0 as usize] = true;
+    }
+
+    /// Frees a cached unreferenced block; false when it is referenced, free or not keyed.
+    pub fn evict_cached(&mut self, b: BlockId) -> bool {
+        if !self.is_cached(b) {
+            return false;
+        }
+        self.keyed[b.0 as usize] = false;
+        self.cached -= 1;
+        self.free.push(b);
+        true
+    }
+
+    /// Keyed blocks nobody references (reclaimable by `allocate`).
+    pub fn cached_unreferenced(&self) -> u32 {
+        self.cached
+    }
+
+    /// Blocks with at least one holder.
+    pub fn referenced_blocks(&self) -> u32 {
+        self.used_blocks() - self.cached
+    }
+
+    /// Free blocks plus cached unreferenced blocks: what `allocate` can hand out.
+    pub fn available_blocks(&self) -> u32 {
+        self.free_blocks() + self.cached
+    }
+
+    /// The order in which `allocate` reclaims cached blocks, lowest value first; blocks that are
+    /// no longer cached when their turn comes are skipped.
+    pub fn set_reclaim_order(&mut self, order: Vec<BlockId>) {
+        self.reclaim_order = order.into();
+    }
+
+    /// Cached blocks `allocate` reclaimed since the last call, oldest first.
+    pub fn take_reclaimed(&mut self) -> Vec<BlockId> {
+        std::mem::take(&mut self.reclaimed)
     }
 
     /// A table for a forked sequence (`n > 1`): full blocks are shared by reference count;
@@ -225,6 +335,20 @@ impl BlockPool {
             },
             copy,
         ))
+    }
+
+    /// The device bytes of block `b`: one `(address, length)` segment per layer, the block's K
+    /// and V of that layer (the [`KvPoolView`] layout). A block copy moves exactly these.
+    pub fn block_segments(&self, b: BlockId) -> SmallVec<[(DevicePtr, usize); 32]> {
+        let view = self.view();
+        let per_layer = self.layout.block_bytes() / u64::from(self.layout.num_layers.max(1));
+        let base = self.storage.ptr();
+        (0..u64::from(self.layout.num_layers))
+            .map(|l| {
+                let off = l * view.layer_stride_bytes + u64::from(b.0) * per_layer;
+                (base.offset(off), per_layer as usize)
+            })
+            .collect()
     }
 
     /// The device storage and layout for the executor.
@@ -289,6 +413,29 @@ mod tests {
             mem,
         )
         .expect("pool fits the host memory")
+    }
+
+    /// One segment per layer, each the block's K and V bytes of that layer at the offset the
+    /// executor's `KvPoolView` reads (P4 Task 15: the copy stream moves exactly these bytes).
+    /// Breaks if a segment is missed, overlaps another block, or is sized wrongly.
+    #[test]
+    fn block_segments_cover_the_block_per_layer() {
+        let p = pool(4);
+        let view = p.view();
+        let base = view.storage.ptr().addr();
+        let per_layer = small_layout().block_bytes() as usize / 2;
+        for b in 0..4u32 {
+            let segs = p.block_segments(BlockId(b));
+            assert_eq!(segs.len(), 2, "one segment per layer");
+            for (l, (ptr, len)) in segs.iter().enumerate() {
+                assert_eq!(*len, per_layer);
+                let expect =
+                    base + l as u64 * view.layer_stride_bytes + u64::from(b) * per_layer as u64;
+                assert_eq!(ptr.addr(), expect, "block {b} layer {l}");
+            }
+            let total: usize = segs.iter().map(|(_, n)| n).sum();
+            assert_eq!(total as u64, small_layout().block_bytes());
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -490,5 +637,71 @@ mod tests {
         assert_eq!(p.used_blocks(), 2);
         p.release(&[BlockId(0), BlockId(1)]);
         assert_eq!(p.used_blocks(), 0);
+    }
+
+    /// Phase 4: a keyed block stays cached at reference count 0; `allocate` reclaims cached
+    /// blocks in the published order (then by id) and reports them through `take_reclaimed`.
+    #[test]
+    fn keyed_blocks_stay_cached_and_reclaim_in_order() {
+        let mut p = pool(4);
+        let held = p.allocate(3).unwrap();
+        p.set_keyed(BlockId(0));
+        p.set_keyed(BlockId(1));
+        assert!(p.is_keyed(BlockId(0)) && !p.is_keyed(BlockId(2)));
+        p.release(&held);
+        assert_eq!(p.free_blocks(), 2, "the unkeyed block is free again");
+        assert_eq!(p.cached_unreferenced(), 2);
+        assert_eq!(p.available_blocks(), 4);
+        assert_eq!((p.used_blocks(), p.referenced_blocks()), (2, 0));
+        assert_eq!(p.refcount(BlockId(0)), 0);
+
+        // A cached block can be attached again by reference.
+        p.incref(BlockId(0));
+        assert_eq!((p.refcount(BlockId(0)), p.cached_unreferenced()), (1, 1));
+        assert_eq!(p.referenced_blocks(), 1);
+        p.release(&[BlockId(0)]);
+        assert_eq!(
+            p.cached_unreferenced(),
+            2,
+            "released back to cached, not free"
+        );
+
+        // Not enough free blocks: reclaim in the published order.
+        p.set_reclaim_order(vec![BlockId(1), BlockId(0)]);
+        let three = p.allocate(3).unwrap();
+        assert_eq!(p.take_reclaimed(), vec![BlockId(1)]);
+        assert!(p.take_reclaimed().is_empty());
+        assert!(three.contains(&BlockId(1)));
+        assert!(!p.is_keyed(BlockId(1)), "a reclaimed block is fresh");
+        assert_eq!(p.refcount(BlockId(1)), 1);
+        let err = p.allocate(2).unwrap_err();
+        assert!(matches!(
+            err,
+            PoolError::Exhausted {
+                requested: 2,
+                available: 1
+            }
+        ));
+        assert_eq!(p.allocate(1).unwrap().as_slice(), &[BlockId(0)]);
+        assert_eq!(p.take_reclaimed(), vec![BlockId(0)]);
+        assert_eq!(p.available_blocks(), 0);
+        p.release(&three);
+        p.release(&[BlockId(0)]);
+
+        // Without a published order the lowest cached id goes first; evict_cached frees only
+        // unreferenced cached blocks.
+        let all = p.allocate(4).unwrap();
+        for &b in &all {
+            p.set_keyed(b);
+        }
+        let rest: Vec<BlockId> = all.iter().copied().filter(|b| *b != BlockId(3)).collect();
+        p.release(&rest);
+        assert!(!p.evict_cached(BlockId(3)), "still referenced");
+        assert!(p.evict_cached(BlockId(2)));
+        assert!(!p.evict_cached(BlockId(2)), "already free");
+        assert_eq!((p.free_blocks(), p.cached_unreferenced()), (1, 2));
+        // The reclaimed block joins the free list last, so it is handed out first.
+        assert_eq!(p.allocate(2).unwrap().as_slice(), &[BlockId(0), BlockId(2)]);
+        assert_eq!(p.take_reclaimed(), vec![BlockId(0)]);
     }
 }

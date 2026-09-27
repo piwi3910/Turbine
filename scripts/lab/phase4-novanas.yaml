@@ -1,0 +1,47 @@
+# turbine-server configuration for the Phase 4 lab runs on novanas (KV tiers):
+#   scripts/lab-serve.sh novanas scripts/lab/phase4-novanas.yaml [--set <k>=<v>]...
+# and the base of the `kv_gpu` lab tests (crates/turbine-server/tests/kv_gpu.rs), which start
+# the server with it and override keys with --set. The Phase 2c Llama values
+# (scripts/lab/phase2c-novanas-llama.yaml) plus the Phase 4 `kv` keys spelled out.
+# Weights: /home/piwi/turbine-models/llama-3.2-3b-instruct on the host, mounted read-only at
+# /models. The NVMe tier lives at /home/piwi/turbine-kv on the host's root NVMe (mounted at the
+# same path by scripts/lab/novanas-test-job.yaml and novanas-serve-job.yaml), capped at 64 GiB
+# (P4 Constraints). L1 is at most 64 GiB of pinned host memory, grown in 1 GiB slabs on demand
+# (novanas has 125 GiB; the host reserve is 8 GiB).
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/llama-3.2-3b-instruct
+  served_name: meta-llama/Llama-3.2-3B-Instruct
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: false
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 8GiB
+  cpu:
+    enabled: true
+    max_bytes: 64GiB
+  nvme:
+    enabled: true
+    path: /home/piwi/turbine-kv
+    max_bytes: 64GiB
+  policy: cost_aware
+  prefix_sharing: true
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    # The Phase 2 scheduler.queue_timeout (CONFLICT C-1).
+    queue_timeout: 60s

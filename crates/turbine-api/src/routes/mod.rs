@@ -26,6 +26,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/turbine/v1/status", get(diagnostics::status))
         .route("/turbine/v1/devices", get(diagnostics::devices))
         .route("/turbine/v1/kv", get(diagnostics::kv))
+        .route("/turbine/v1/kv/prefetch", post(diagnostics::kv_prefetch))
         .route("/turbine/v1/pressure", get(diagnostics::pressure))
         .route("/turbine/v1/scheduler", get(diagnostics::scheduler))
         .fallback(not_found)

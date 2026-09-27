@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
-use crate::args::{BenchArgs, EndpointArg};
+use crate::args::{BenchArgs, EndpointArg, Profile};
 use crate::open_loop::{self, Breakdown, OpenLoopRng};
 use crate::prompt;
 use crate::report::{Report, RequestStats};
@@ -45,6 +45,23 @@ struct Target {
 
 /// Run the benchmark described by `args` and aggregate the report.
 pub async fn run(args: &BenchArgs) -> Result<Report, BenchError> {
+    if args.profile == Profile::MultiTurn {
+        return crate::multi_turn::run_multi_turn(args).await;
+    }
+    let (client, base, model) = prepare(args).await?;
+    let path = match args.endpoint {
+        EndpointArg::Chat => "/v1/chat/completions",
+        EndpointArg::Completions => "/v1/completions",
+    };
+    run_target(args, client, base, model, path).await
+}
+
+/// The HTTP client, the base URL and the model id a run targets (`--url`, `--model` or the
+/// first id of `GET /v1/models`); `--pressure-timeline` is created here, so a bad path is a
+/// usage error before anything is sent.
+pub(crate) async fn prepare(
+    args: &BenchArgs,
+) -> Result<(reqwest::Client, String, String), BenchError> {
     let base = args.url.trim_end_matches('/').to_string();
     if !base.starts_with("http://") {
         return Err(BenchError::Usage(format!(
@@ -67,10 +84,17 @@ pub async fn run(args: &BenchArgs) -> Result<Report, BenchError> {
         Some(m) => m.clone(),
         None => first_model(&client, &base).await?,
     };
-    let path = match args.endpoint {
-        EndpointArg::Chat => "/v1/chat/completions",
-        EndpointArg::Completions => "/v1/completions",
-    };
+    Ok((client, base, model))
+}
+
+/// The closed- or open-loop run against `base` + `path`.
+async fn run_target(
+    args: &BenchArgs,
+    client: reqwest::Client,
+    base: String,
+    model: String,
+    path: &str,
+) -> Result<Report, BenchError> {
     let target = Arc::new(Target {
         client: client.clone(),
         url: format!("{base}{path}"),
@@ -216,7 +240,14 @@ fn reap(done: Result<(u64, Outcome), tokio::task::JoinError>, tally: &mut Tally)
 
 async fn send(target: &Target, index: u64) -> Outcome {
     let body = request_body(&target.args, &target.model, index);
-    one_request(&target.client, &target.url, target.args.endpoint, &body).await
+    one_request(
+        &target.client,
+        &target.url,
+        target.args.endpoint,
+        &body,
+        &[],
+    )
+    .await
 }
 
 async fn first_model(client: &reqwest::Client, base: &str) -> Result<String, BenchError> {
@@ -300,11 +331,11 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 /// What happened to one request: the HTTP status (if a response arrived), the OpenAI error
 /// `code` (response body or in-stream error event), whether the stream reached `[DONE]`, and
 /// either the measurements or the failure message.
-struct Outcome {
+pub(crate) struct Outcome {
     status: Option<u16>,
     error_code: Option<String>,
     stream_done: bool,
-    result: Result<RequestStats, String>,
+    pub(crate) result: Result<RequestStats, String>,
 }
 
 impl Outcome {
@@ -318,20 +349,21 @@ impl Outcome {
     }
 }
 
-async fn one_request(
+/// One streamed request with extra `headers`; measures TTFT, ITL and E2E and keeps the
+/// content text and the usage counts (P4: `prompt_tokens_details.cached_tokens`).
+pub(crate) async fn one_request(
     client: &reqwest::Client,
     url: &str,
     endpoint: EndpointArg,
     body: &Value,
+    headers: &[(&str, String)],
 ) -> Outcome {
     let sent = Instant::now();
-    let mut resp = match client
-        .post(url)
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-    {
+    let mut req = client.post(url).header("content-type", "application/json");
+    for (name, value) in headers {
+        req = req.header(*name, value);
+    }
+    let mut resp = match req.body(body.to_string()).send().await {
         Ok(r) => r,
         Err(e) => return Outcome::failed(None, None, format!("POST {url}: {}", error_chain(&e))),
     };
@@ -352,6 +384,9 @@ async fn one_request(
     let mut buf: Vec<u8> = Vec::new();
     let mut token_times: Vec<Instant> = Vec::new();
     let mut usage_tokens: Option<u64> = None;
+    let mut prompt_tokens: Option<u64> = None;
+    let mut cached_tokens: Option<u64> = None;
+    let mut text = String::new();
     // An in-stream error event fails the request; the stream still runs to `[DONE]` (C-3).
     let mut stream_error: Option<(Option<String>, String)> = None;
     loop {
@@ -396,6 +431,9 @@ async fn one_request(
                             itls: token_times.windows(2).map(|w| w[1] - w[0]).collect(),
                             e2e: done - sent,
                             output_tokens: usage_tokens.unwrap_or(token_times.len() as u64),
+                            text,
+                            prompt_tokens,
+                            cached_tokens,
                         }),
                     ),
                 };
@@ -421,15 +459,19 @@ async fn one_request(
                 }
                 continue;
             }
-            if chunk_content(&value, endpoint).is_some() {
+            if let Some(content) = chunk_content(&value, endpoint) {
+                text.push_str(content);
                 token_times.push(Instant::now());
             }
-            if let Some(n) = value
-                .get("usage")
-                .and_then(|u| u.get("completion_tokens"))
-                .and_then(Value::as_u64)
-            {
-                usage_tokens = Some(n);
+            if let Some(usage) = value.get("usage") {
+                if let Some(n) = usage.get("completion_tokens").and_then(Value::as_u64) {
+                    usage_tokens = Some(n);
+                }
+                prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64);
+                cached_tokens = usage
+                    .get("prompt_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(Value::as_u64);
             }
         }
     }

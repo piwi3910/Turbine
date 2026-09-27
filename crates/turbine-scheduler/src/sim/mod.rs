@@ -1,5 +1,6 @@
 //! Deterministic scheduler simulator (P2 S-12): the real `Scheduler` and `BlockPool` driven by
-//! a cost-model executor on virtual time (`FakeClock`, no sleeps).
+//! a cost-model executor on virtual time (`FakeClock`, no sleeps). `KvSimDriver` (P4) adds the
+//! real `KvHierarchy` with simulated tiers and transfers.
 
 pub mod arrivals;
 pub mod digests;
@@ -18,9 +19,17 @@ use std::time::Duration;
 use serde::Serialize;
 use smallvec::SmallVec;
 use turbine_core::clock::{Clock, FakeClock};
-use turbine_core::request::FinishReason;
-use turbine_core::types::{RequestId, SeqId};
+use turbine_core::request::{FinishReason, ResourceEstimate};
+use turbine_core::types::{PressureSignal, PressureState, Priority, RequestId, SeqId};
 use turbine_kv::BlockPool;
+use turbine_kv::hierarchy::{
+    AttachOutcome, AttachRequest, KvHierarchy, PrefetchAccepted, PrefetchError, PrefetchTarget,
+    PrefixAttach,
+};
+use turbine_kv::transfer::SimTransferBackend;
+use turbine_reliability::metrics::ReliabilityMetrics;
+use turbine_reliability::signals::default_thresholds;
+use turbine_reliability::throttle::{SchedulerLimits, ThrottlePlan, apply_reclaim, plan_for};
 
 use crate::policy::SchedulingPolicy;
 use crate::request::{CancelReason, RequestState, SchedRequest};
@@ -474,6 +483,393 @@ impl Simulation {
             running: snap.prefilling + snap.decoding + snap.paused,
             used_blocks: self.pool.used_blocks(),
         });
+    }
+}
+
+// ---- Phase 4: the KV hierarchy in the loop ------------------------------------------------
+
+/// Virtual time an iteration with nothing to execute takes, so transfers keep progressing.
+const IDLE_TICK: Duration = Duration::from_millis(1);
+
+/// Where a driver request is: attaching (or waiting on a prefix another request computes),
+/// promoting its prefix into L0, or handed to the scheduler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KvStage {
+    Attaching,
+    Promoting,
+    Scheduled,
+}
+
+struct KvSimRequest {
+    seq: SeqId,
+    prompt: Vec<u32>,
+    max_tokens: u32,
+    /// Sampled tokens (deterministic stand-ins for the model's output).
+    generated: Vec<u32>,
+    stage: KvStage,
+}
+
+/// The real `Scheduler`, `BlockPool` and `KvHierarchy` against the simulated executor on
+/// virtual time (P4 Task 11). One iteration (`step`): transfer completions → attach retries →
+/// reclaim-order refresh → `Scheduler::plan` → `after_plan` → execution → `commit_progress` →
+/// `Scheduler::complete` → `request_done` → `apply_reclaim` and `tick`.
+pub struct KvSimDriver {
+    sched: Scheduler,
+    pool: BlockPool,
+    kv: KvHierarchy,
+    backend: SimTransferBackend,
+    clock: FakeClock,
+    exec: SimExecutor,
+    limits: IterationLimits,
+    pressure: PressureState,
+    /// Phase 3's reclaim step for `pressure` (`plan_for` + `apply_reclaim` on the documented
+    /// `kv_utilization` thresholds), as the pressure controller runs it every tick.
+    reclaim_plan: ThrottlePlan,
+    reclaim_metrics: ReliabilityMetrics,
+    next_seq: u64,
+    reqs: HashMap<RequestId, KvSimRequest>,
+    seq_request: HashMap<SeqId, RequestId>,
+    /// Requests waiting to attach, in arrival order.
+    attaching: Vec<RequestId>,
+    estimates: HashMap<RequestId, ResourceEstimate>,
+    prefilled: HashMap<RequestId, u32>,
+    violations: Vec<String>,
+}
+
+impl KvSimDriver {
+    /// The executor of the P4 simulations: 8,000 prefill tokens/s and 5 ms per decode step.
+    pub const EXECUTOR: SimExecutor = SimExecutor {
+        cost: CostModel {
+            per_prefill_token_s: 1.0 / 8_000.0,
+            per_decode_step_s: 0.005,
+            per_seq_s: 0.0,
+        },
+    };
+
+    pub fn new(
+        sched: Scheduler,
+        pool: BlockPool,
+        kv: KvHierarchy,
+        backend: SimTransferBackend,
+        clock: FakeClock,
+    ) -> KvSimDriver {
+        let mut kv = kv;
+        kv.set_prefill_tps(1.0 / Self::EXECUTOR.cost.per_prefill_token_s);
+        let sched_params = *sched.params();
+        KvSimDriver {
+            sched,
+            pool,
+            kv,
+            backend,
+            clock,
+            exec: Self::EXECUTOR,
+            limits: IterationLimits::default(),
+            pressure: PressureState::Green,
+            reclaim_plan: plan_for(PressureState::Green, &Self::limits_of(&sched_params)),
+            reclaim_metrics: ReliabilityMetrics::unregistered(),
+            next_seq: 0,
+            reqs: HashMap::new(),
+            seq_request: HashMap::new(),
+            attaching: Vec::new(),
+            estimates: HashMap::new(),
+            prefilled: HashMap::new(),
+            violations: Vec::new(),
+        }
+    }
+
+    /// A request arrives; it attaches its cached prefix on the next `step`.
+    pub fn submit(&mut self, id: RequestId, prompt: Vec<u32>, max_tokens: u32) {
+        let seq = SeqId(self.next_seq);
+        self.next_seq += 1;
+        self.seq_request.insert(seq, id);
+        self.reqs.insert(
+            id,
+            KvSimRequest {
+                seq,
+                prompt,
+                max_tokens: max_tokens.max(1),
+                generated: Vec::new(),
+                stage: KvStage::Attaching,
+            },
+        );
+        self.attaching.push(id);
+    }
+
+    /// The client went away. A request not yet handed to the scheduler releases its KV now;
+    /// a scheduled one is dropped by the next plan.
+    pub fn cancel(&mut self, id: RequestId) {
+        let Some(r) = self.reqs.get(&id) else {
+            return;
+        };
+        if r.stage == KvStage::Scheduled {
+            self.sched.cancel(id, CancelReason::ClientDisconnect);
+        } else {
+            self.kv.request_done(&mut self.pool, id, true);
+            self.forget(id);
+        }
+    }
+
+    /// L0 pressure as the Phase 3 controller would report it; reclaim follows Phase 3's
+    /// throttle plan for it every step (YELLOW demotes idle blocks to the YELLOW threshold,
+    /// ORANGE frees and demotes to ORANGE's, RED and above free every unreferenced cached
+    /// block — `turbine_reliability::throttle::plan_for`).
+    pub fn set_pressure(&mut self, s: PressureState) {
+        self.pressure = s;
+        self.kv.set_l0_state(s);
+        self.reclaim_plan = plan_for(s, &Self::limits_of(self.sched.params()));
+    }
+
+    fn limits_of(p: &SchedulerParams) -> SchedulerLimits {
+        SchedulerLimits {
+            prefill_chunk_tokens: p.prefill_chunk_tokens,
+            block_tokens: p.block_tokens,
+        }
+    }
+
+    /// `POST /turbine/v1/kv/prefetch` against the simulated tiers.
+    pub fn prefetch(
+        &mut self,
+        target: PrefetchTarget<'_>,
+    ) -> Result<PrefetchAccepted, PrefetchError> {
+        self.kv.prefetch(&mut self.pool, target)
+    }
+
+    /// One iteration; returns the executed plan.
+    pub fn step(&mut self) -> IterationPlan {
+        // Transfer completions: requests whose promotions landed go to the scheduler.
+        for (id, attach) in self.kv.poll(&mut self.pool, &mut self.backend) {
+            self.schedule(id, attach);
+        }
+        self.retry_attaches();
+        if self.pool.free_blocks() < self.pool.total_blocks().div_ceil(10) {
+            self.kv.refresh_reclaim_order(&mut self.pool);
+        }
+        let handle = self.kv.reclaimer();
+        let kv_thresholds = default_thresholds()[&PressureSignal::KvUtilization];
+        apply_reclaim(
+            &self.reclaim_plan,
+            handle.as_ref(),
+            &kv_thresholds,
+            &self.reclaim_metrics,
+        );
+
+        let plan = self.sched.plan(&mut self.pool, &self.limits);
+        self.kv.after_plan(&mut self.pool);
+        self.check_writes(&plan);
+        for (id, _) in &plan.dropped {
+            self.kv.request_done(&mut self.pool, *id, true);
+            self.forget(*id);
+        }
+        let duration = if plan.is_empty() {
+            IDLE_TICK
+        } else {
+            self.exec.duration(&plan)
+        };
+        let outcome = self.execute(&plan);
+        self.clock.advance(duration);
+        // The KV the plan wrote is committed before `complete` releases finished tables.
+        for item in &plan.items {
+            let Some(id) = self.seq_request.get(&item.seq).copied() else {
+                continue;
+            };
+            let Some(r) = self.reqs.get(&id) else {
+                continue;
+            };
+            let tokens: Vec<u32> = r
+                .prompt
+                .iter()
+                .chain(&r.generated)
+                .copied()
+                .take(item.block_table.tokens as usize)
+                .collect();
+            self.kv
+                .commit_progress(&mut self.pool, id, &item.block_table.blocks, &tokens);
+        }
+        let finished: Vec<SeqId> = outcome.finished.iter().map(|(s, _)| *s).collect();
+        self.record_samples(&outcome);
+        self.sched.complete(&mut self.pool, outcome);
+        for seq in finished {
+            if let Some(id) = self.seq_request.get(&seq).copied() {
+                self.kv.request_done(&mut self.pool, id, false);
+                self.forget(id);
+            }
+        }
+        self.kv.apply_reclaim(&mut self.pool);
+        self.kv.tick(&mut self.pool);
+        plan
+    }
+
+    pub fn pool(&self) -> &BlockPool {
+        &self.pool
+    }
+
+    pub fn kv(&self) -> &KvHierarchy {
+        &self.kv
+    }
+
+    pub fn scheduler(&self) -> &Scheduler {
+        &self.sched
+    }
+
+    /// No request is attaching, promoting, queued or running.
+    pub fn is_idle(&self) -> bool {
+        self.reqs.is_empty() && self.sched.is_idle()
+    }
+
+    /// Prompt tokens prefilled for `id` (recomputes after a preemption included).
+    pub fn prefilled_tokens(&self, id: RequestId) -> u32 {
+        self.prefilled.get(&id).copied().unwrap_or(0)
+    }
+
+    /// The estimate `id` was submitted to the scheduler with.
+    pub fn last_estimate(&self, id: RequestId) -> Option<ResourceEstimate> {
+        self.estimates.get(&id).copied()
+    }
+
+    /// The request a sequence belongs to (also after it finished).
+    pub fn request_of(&self, seq: SeqId) -> Option<RequestId> {
+        self.seq_request.get(&seq).copied()
+    }
+
+    /// Broken invariants: a batch item writing a block another holder references.
+    pub fn violations(&self) -> &[String] {
+        &self.violations
+    }
+
+    fn retry_attaches(&mut self) {
+        for id in std::mem::take(&mut self.attaching) {
+            let Some(r) = self.reqs.get(&id) else {
+                continue;
+            };
+            let req = AttachRequest {
+                request: id,
+                prompt: &r.prompt,
+                cache_salt: "",
+                session: None,
+                priority: Priority::default(),
+            };
+            match self.kv.attach_prefix(&mut self.pool, &req) {
+                AttachOutcome::Ready(a) => self.schedule(id, a),
+                AttachOutcome::Promoting => {
+                    if let Some(r) = self.reqs.get_mut(&id) {
+                        r.stage = KvStage::Promoting;
+                    }
+                }
+                AttachOutcome::WaitForPrefix => self.attaching.push(id),
+            }
+        }
+    }
+
+    /// Hands a request and its attached prefix to the scheduler.
+    fn schedule(&mut self, id: RequestId, attach: PrefixAttach) {
+        let Some(r) = self.reqs.get_mut(&id) else {
+            // Cancelled while its promotions were in flight.
+            self.pool.release(&attach.blocks);
+            return;
+        };
+        r.stage = KvStage::Scheduled;
+        let bt = self.sched.params().block_tokens;
+        let prompt = r.prompt.len() as u32;
+        let mut sr = SchedRequest::new(id, smallvec::smallvec![r.seq], prompt, r.max_tokens, bt);
+        sr.arrival = self.clock.now_mono();
+        sr.attach_prefix(attach, bt);
+        self.estimates.insert(id, sr.estimate);
+        let blocks = sr.cached_prefix.as_ref().map(|a| a.blocks.clone());
+        if let Err(e) = self.sched.submit(sr, self.pool.total_blocks()) {
+            self.violations
+                .push(format!("request {} rejected at submission: {e}", id.0));
+            if let Some(b) = blocks {
+                self.pool.release(&b);
+            }
+            self.kv.request_done(&mut self.pool, id, true);
+            self.forget(id);
+        }
+    }
+
+    /// Every block a batch item writes must be held by that sequence alone.
+    fn check_writes(&mut self, plan: &IterationPlan) {
+        let bt = self.sched.params().block_tokens.max(1);
+        for item in &plan.items {
+            let (start, len) = match item.kind {
+                BatchKind::Prefill { start, len } => (start, len),
+                BatchKind::Decode => (item.block_table.tokens - 1, 1),
+            };
+            if len == 0 {
+                continue;
+            }
+            for b in start / bt..=(start + len - 1) / bt {
+                let Some(block) = item.block_table.blocks.get(b as usize) else {
+                    continue;
+                };
+                let rc = self.pool.refcount(*block);
+                if rc != 1 {
+                    self.violations.push(format!(
+                        "iteration {}: seq {} writes block {:?} with {rc} holders",
+                        plan.iteration, item.seq.0, block
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The "model": a completed prefill or a decode samples one deterministic token.
+    fn execute(&mut self, plan: &IterationPlan) -> IterationOutcome {
+        let mut appended = Vec::new();
+        let mut finished = Vec::new();
+        for item in &plan.items {
+            let samples = match item.kind {
+                BatchKind::Decode => true,
+                BatchKind::Prefill { start, len } => {
+                    let id = self.seq_request.get(&item.seq).copied();
+                    if let Some(id) = id {
+                        *self.prefilled.entry(id).or_insert(0) += len;
+                    }
+                    self.sched.prefill_target(item.seq) == Some(start + len)
+                }
+            };
+            if !samples {
+                continue;
+            }
+            let Some(r) = self
+                .seq_request
+                .get(&item.seq)
+                .and_then(|id| self.reqs.get(id))
+            else {
+                continue;
+            };
+            appended.push((item.seq, 1));
+            if r.generated.len() as u32 + 1 >= r.max_tokens {
+                finished.push((item.seq, FinishReason::Length));
+            }
+        }
+        IterationOutcome {
+            iteration: plan.iteration,
+            finished,
+            appended,
+            failed: None,
+        }
+    }
+
+    fn record_samples(&mut self, outcome: &IterationOutcome) {
+        for (seq, n) in &outcome.appended {
+            let Some(r) = self
+                .seq_request
+                .get(seq)
+                .and_then(|id| self.reqs.get_mut(id))
+            else {
+                continue;
+            };
+            for _ in 0..*n {
+                let pos = (r.prompt.len() + r.generated.len()) as u32;
+                r.generated
+                    .push(seq.0 as u32 ^ pos.wrapping_mul(2_654_435_761));
+            }
+        }
+    }
+
+    fn forget(&mut self, id: RequestId) {
+        self.reqs.remove(&id);
+        self.attaching.retain(|x| *x != id);
     }
 }
 

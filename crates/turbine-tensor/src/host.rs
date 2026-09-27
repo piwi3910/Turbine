@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use turbine_core::types::DeviceId;
 
 use crate::buffer::{DeviceMemory, DevicePtr, MemInfo, MemoryError, StagingId, StreamRef};
+use crate::pinned::{PinnedBuffer, PinnedMemory, PinnedOwner};
 
 /// Synthetic addresses start above zero so `DevicePtr::NULL` is never a valid allocation.
 const BASE_ADDR: u64 = 0x1000_0000;
@@ -263,10 +264,133 @@ impl DeviceMemory for HostMemory {
     }
 }
 
+/// Host-only stand-in for page-locked memory: heap buffers under a byte limit (the `ulimit -l`
+/// stand-in) with injectable allocation failures. Used by tests and the offline simulator; real
+/// pinned memory comes from the kernel shim (kernel C ABI v3).
+pub struct HostPinned {
+    inner: Arc<HostPinnedInner>,
+}
+
+struct HostPinnedInner {
+    limit_bytes: u64,
+    state: Mutex<PinnedState>,
+}
+
+struct PinnedState {
+    buffers: HashMap<u64, Box<[u8]>>,
+    allocated: u64,
+    next_id: u64,
+    fail_next: u64,
+}
+
+impl HostPinned {
+    pub fn new(limit_bytes: u64) -> Self {
+        HostPinned {
+            inner: Arc::new(HostPinnedInner {
+                limit_bytes,
+                state: Mutex::new(PinnedState {
+                    buffers: HashMap::new(),
+                    allocated: 0,
+                    next_id: 1,
+                    fail_next: 0,
+                }),
+            }),
+        }
+    }
+
+    /// The next `n` allocations fail with `OutOfMemory`.
+    pub fn fail_next(&self, n: u64) {
+        self.inner.lock().fail_next = n;
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        self.inner.lock().allocated
+    }
+
+    pub fn live_buffers(&self) -> usize {
+        self.inner.lock().buffers.len()
+    }
+}
+
+impl HostPinnedInner {
+    // Every update leaves the state consistent, so a lock poisoned by a panicking test thread
+    // is safe to keep using.
+    fn lock(&self) -> std::sync::MutexGuard<'_, PinnedState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl PinnedMemory for HostPinned {
+    fn alloc_pinned(&self, bytes: usize) -> Result<PinnedBuffer, MemoryError> {
+        let requested = bytes as u64;
+        let id = {
+            let mut st = self.inner.lock();
+            if st.fail_next > 0 {
+                st.fail_next -= 1;
+                return Err(MemoryError::OutOfMemory { requested });
+            }
+            if st
+                .allocated
+                .checked_add(requested)
+                .is_none_or(|total| total > self.inner.limit_bytes)
+            {
+                return Err(MemoryError::OutOfMemory { requested });
+            }
+            let id = st.next_id;
+            st.next_id += 1;
+            st.allocated += requested;
+            st.buffers.insert(id, vec![0u8; bytes].into_boxed_slice());
+            id
+        };
+        let owner: Arc<dyn PinnedOwner> = self.inner.clone();
+        Ok(PinnedBuffer::new(id, bytes, owner))
+    }
+}
+
+impl PinnedOwner for HostPinnedInner {
+    fn with_bytes_dyn(&self, id: u64, f: &mut dyn FnMut(&mut [u8])) {
+        let mut st = self.lock();
+        let buf = st
+            .buffers
+            .get_mut(&id)
+            .expect("a pinned buffer id stays live while its PinnedBuffer exists");
+        f(buf);
+    }
+
+    fn free_pinned(&self, id: u64) {
+        let mut st = self.lock();
+        if let Some(buf) = st.buffers.remove(&id) {
+            st.allocated -= buf.len() as u64;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::{DeviceBuffer, HostStaging};
+
+    #[test]
+    fn host_pinned_limits_and_frees_on_drop() {
+        let pinned = HostPinned::new(100);
+        let a = pinned.alloc_pinned(60).expect("a");
+        assert_eq!((a.len(), pinned.allocated_bytes()), (60, 60));
+        assert!(matches!(
+            pinned.alloc_pinned(41),
+            Err(MemoryError::OutOfMemory { requested: 41 })
+        ));
+        pinned.fail_next(1);
+        assert!(pinned.alloc_pinned(1).is_err(), "injected failure");
+        let b = pinned.alloc_pinned(40).expect("b");
+        assert_ne!(a.id(), b.id());
+        a.with_bytes_mut(|x| x[59] = 7);
+        assert_eq!(a.with_bytes(|x| (x.len(), x[59])), (60, 7));
+        assert_eq!(b.with_bytes(|x| x[0]), 0, "buffers are distinct");
+        drop(a);
+        assert_eq!((pinned.live_buffers(), pinned.allocated_bytes()), (1, 40));
+        drop(b);
+        assert_eq!((pinned.live_buffers(), pinned.allocated_bytes()), (0, 0));
+    }
 
     #[test]
     fn alloc_copy_free_round_trip() {

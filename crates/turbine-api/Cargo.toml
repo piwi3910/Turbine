@@ -27,6 +27,9 @@ tower.workspace = true
 # P3 api tests: a real pressure controller document, reliability and telemetry metric families.
 turbine-reliability.workspace = true
 turbine-device.workspace = true
+# P4 KV route tests: a simulated backend over the real KV hierarchy
+turbine-kv.workspace = true
+turbine-tensor.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

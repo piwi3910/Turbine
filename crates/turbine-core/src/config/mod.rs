@@ -3,6 +3,7 @@
 
 mod byte_size;
 mod duration;
+mod kv;
 mod overrides;
 mod reliability;
 
@@ -14,6 +15,10 @@ use serde_norway::{Mapping, Value};
 
 pub use byte_size::ByteSize;
 pub use duration::HumanDuration;
+pub use kv::{
+    HostFacts, KV_IO_ALIGN, KvConfig, KvCpuConfig, KvGpuConfig, KvNvmeConfig, KvPolicyWeights,
+    KvPrefetchConfig, KvSessionConfig, KvTransferConfig,
+};
 pub use reliability::*;
 
 use crate::registry::valid_name;
@@ -78,7 +83,7 @@ impl ModuleName {
     }
 
     /// A default name written in this file; always well-formed.
-    fn fixed(s: &'static str) -> ModuleName {
+    pub(crate) fn fixed(s: &'static str) -> ModuleName {
         debug_assert!(valid_name(s), "{s}");
         ModuleName(s.to_string())
     }
@@ -115,6 +120,8 @@ pub struct ModuleNames<'a> {
     pub card_profiles: &'a [&'a str],
     /// `scheduler.policy`.
     pub scheduling_policies: &'a [&'a str],
+    /// `kv.policy` (Phase 4).
+    pub eviction_policies: &'a [&'a str],
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -183,76 +190,6 @@ pub struct ModelConfig {
 pub enum ModelDtype {
     #[default]
     Bf16,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug)]
-#[serde(deny_unknown_fields, default)]
-pub struct KvConfig {
-    pub block_tokens: u32,
-    pub gpu: KvGpuConfig,
-    pub cpu: KvCpuConfig,
-    pub nvme: KvNvmeConfig,
-}
-
-impl Default for KvConfig {
-    fn default() -> Self {
-        KvConfig {
-            block_tokens: 128,
-            gpu: KvGpuConfig::default(),
-            cpu: KvCpuConfig::default(),
-            nvme: KvNvmeConfig::default(),
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug)]
-#[serde(deny_unknown_fields, default)]
-pub struct KvGpuConfig {
-    pub enabled: bool,
-    /// L0 block-pool cap. Null (the default from Phase 3; Phase 2 defaulted to 8GiB) means
-    /// the `kv` pool remainder of the budget (CONFLICT C-8).
-    pub max_bytes: Option<ByteSize>,
-}
-
-impl Default for KvGpuConfig {
-    fn default() -> Self {
-        KvGpuConfig {
-            enabled: true,
-            max_bytes: None,
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug)]
-#[serde(deny_unknown_fields, default)]
-pub struct KvCpuConfig {
-    pub enabled: bool,
-    pub max_bytes: ByteSize,
-}
-
-impl Default for KvCpuConfig {
-    fn default() -> Self {
-        KvCpuConfig {
-            enabled: true,
-            max_bytes: ByteSize::gib(64),
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug)]
-#[serde(deny_unknown_fields, default)]
-pub struct KvNvmeConfig {
-    pub enabled: bool,
-    pub path: PathBuf,
-}
-
-impl Default for KvNvmeConfig {
-    fn default() -> Self {
-        KvNvmeConfig {
-            enabled: false,
-            path: PathBuf::from("/var/lib/turbine/kv"),
-        }
-    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -477,27 +414,7 @@ impl Config {
         if self.model.path.as_os_str().is_empty() {
             return Err(invalid("model.path", "is required and must be non-empty"));
         }
-        if !(1..=1024).contains(&self.kv.block_tokens) {
-            return Err(invalid(
-                "kv.block_tokens",
-                format!("must be between 1 and 1024, got {}", self.kv.block_tokens),
-            ));
-        }
-        if self.kv.cpu.enabled && self.kv.cpu.max_bytes.0 == 0 {
-            return Err(invalid(
-                "kv.cpu.max_bytes",
-                "must be greater than 0 when kv.cpu.enabled is true",
-            ));
-        }
-        if self.kv.nvme.enabled && !self.kv.nvme.path.is_absolute() {
-            return Err(invalid(
-                "kv.nvme.path",
-                format!(
-                    "must be an absolute path when kv.nvme.enabled is true, got {}",
-                    self.kv.nvme.path.display()
-                ),
-            ));
-        }
+        self.kv.validate()?;
         if self.distributed.enabled {
             return Err(invalid(
                 "distributed.enabled",
@@ -529,6 +446,14 @@ impl Config {
             ));
         }
         self.validate_phase2()
+    }
+
+    /// Rules that need host facts (contract §3.2): `kv.cpu.max_bytes` against `MemTotal` minus
+    /// `reliability.memory.host_reserve_bytes`, `kv.nvme.max_bytes` against free disk. The
+    /// server maps an error on a `kv.nvme.*` key to exit 1 and any other key to exit 2.
+    pub fn validate_host(&self, host: &HostFacts) -> Result<(), ConfigError> {
+        self.kv
+            .validate_host(host, self.reliability.memory.host_reserve_bytes)
     }
 
     /// Checks every module key against the registries' names (`known`): exit 2, before device
@@ -578,7 +503,8 @@ impl Config {
             &self.scheduler.policy,
             known.scheduling_policies,
             None,
-        )
+        )?;
+        check("kv.policy", &self.kv.policy, known.eviction_policies, None)
     }
 
     /// Running-request bound actually applied: `scheduler.continuous_batching: false` forces 1.

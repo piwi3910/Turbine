@@ -123,7 +123,8 @@ add_custom_command(
 
 # ---- the shared libraries ----
 # Every kernel source is compiled once into an OBJECT library. libturbine_hip.so
-# links it with the ABI v2.4 exports (impl_exports.cpp) and abi_minor.cpp;
+# links it with the ABI v2.4 exports (impl_exports.cpp) and abi_minor.cpp
+# (minor 5: the v2.5 copy streams, copy_stream.cpp, are in every build);
 # libturbine_hip_v23.so links the same objects with abi_minor.cpp compiled
 # with TURBINE_V23_BUILD and without the v2.4 exports: a real v2.3 library
 # (minor 3, no implementation group) for the fallback test
@@ -131,6 +132,7 @@ add_custom_command(
 set(TURBINE_SOURCES
   src/context.cpp
   src/memory.cpp
+  src/copy_stream.cpp
   src/graph.cpp
   src/gemm.cpp
   src/attention.cpp

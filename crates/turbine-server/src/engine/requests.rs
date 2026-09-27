@@ -128,6 +128,8 @@ pub(crate) struct ActiveRequest {
     /// A done request whose client never reads again keeps its (at most a few) held events
     /// until the client goes away; it holds no KV.
     pub done: bool,
+    /// Prompt tokens served from a cached prefix (Phase 4), reported in `usage`.
+    pub cached_tokens: u32,
 }
 
 impl ActiveRequest {
@@ -180,6 +182,7 @@ impl ActiveRequest {
             mask: None,
             held: VecDeque::new(),
             done: false,
+            cached_tokens: 0,
         }
     }
 
@@ -290,6 +293,7 @@ impl ActiveRequest {
             usage: Some(Usage {
                 prompt_tokens: self.prompt_len(),
                 completion_tokens: c.generated.len() as u32,
+                cached_tokens: self.cached_tokens,
             }),
         }
     }
@@ -611,6 +615,8 @@ mod tests {
             echo: false,
             constraint: None,
             deadline_ms: u64::MAX,
+            session: None,
+            cache_salt: None,
             endpoint: Endpoint::Completions,
             http_request_id: "t".into(),
             prompt_tokens: prompt.to_vec(),
@@ -941,7 +947,8 @@ mod tests {
                 reason: FinishReason::Stop,
                 usage: Some(Usage {
                     prompt_tokens: 2,
-                    completion_tokens: 3
+                    completion_tokens: 3,
+                    cached_tokens: 0
                 })
             }
         );

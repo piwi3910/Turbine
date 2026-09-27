@@ -54,6 +54,7 @@ use crate::ops::{
     MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
     ProviderId, RopeConfig, RopeContext, RopeKernel,
 };
+use crate::pinned::PinnedState;
 use crate::registry::OpConfig;
 use crate::{KernelError, TURBINE_KERNELS_ABI_VERSION};
 
@@ -171,6 +172,11 @@ impl ShimLibrary {
             archs,
             _lib: lib,
         }))
+    }
+
+    /// The resolved ABI symbols (crate-internal: `pinned` reads the optional groups).
+    pub(crate) fn syms(&self) -> &ShimSymbols {
+        &self.syms
     }
 
     pub fn path(&self) -> &Path {
@@ -314,6 +320,7 @@ impl ShimLibrary {
             staging: Mutex::new(StagingTable::default()),
             self_ref: weak.clone(),
             card: OnceLock::new(),
+            pinned: PinnedState::default(),
         }))
     }
 }
@@ -360,6 +367,8 @@ pub struct ShimContext {
     self_ref: Weak<ShimContext>,
     /// The card profile of `set_profile` (ABI v2.4).
     card: OnceLock<&'static CardProfile>,
+    /// Phase 4 pinned buffers, the copy stream and copy events (ABI v2.3 + v2.5; `pinned`).
+    pinned: PinnedState,
 }
 
 /// The staging buffers of one context and the next id.
@@ -397,6 +406,9 @@ unsafe impl Sync for ShimContext {}
 
 impl Drop for ShimContext {
     fn drop(&mut self) {
+        // The copy stream (waiting for its copies) and copy events go first: they belong to
+        // this context. No `PinnedBuffer` is alive: each holds an `Arc` of the context.
+        self.pinned.release();
         // SAFETY: `raw` came from `turbine_ctx_create` of this library and is destroyed exactly
         // once, here. No `DeviceBuffer` or `StreamRef` of this context is alive: each holds an
         // `Arc` of it. `self.lib` keeps the library loaded until after this call.
@@ -407,6 +419,23 @@ impl Drop for ShimContext {
 impl ShimContext {
     pub fn library(&self) -> &Arc<ShimLibrary> {
         &self.lib
+    }
+
+    /// The raw context pointer, for the crate's other FFI modules (`pinned`).
+    pub(crate) fn raw_ctx(&self) -> *mut TurbineCtx {
+        self.raw
+    }
+
+    pub(crate) fn pinned_state(&self) -> &PinnedState {
+        &self.pinned
+    }
+
+    /// An owning `Arc` of this context (every context lives in the `Arc` `create_context`
+    /// returns).
+    pub(crate) fn owning_arc(&self) -> Arc<ShimContext> {
+        self.self_ref
+            .upgrade()
+            .expect("a ShimContext only exists inside the Arc create_context returns")
     }
 
     /// Workspace size, compute capability and device arch of this context.
@@ -2876,5 +2905,124 @@ mod tests {
                 .expect("context"),
         );
         assert!(old.bind(&spec, &ImplChoice::Single(0)).is_none());
+    }
+
+    fn stub_count(lib: &ShimLibrary, name: &str) -> i32 {
+        stub_hook(lib, name, |f: unsafe extern "C" fn() -> i32| {
+            // SAFETY: every stub counter hook is `int32_t <name>(void)`; the library is loaded.
+            unsafe { f() }
+        })
+    }
+
+    /// ABI v2.5 (Phase 4): a v2.4 library has no copy engine (`Unsupported`, the server then
+    /// runs L0 only); the v2.5 stub allocates pinned buffers, copies through one copy stream,
+    /// reports a ticket complete only once its event signals, orders a device-source copy after
+    /// the compute stream, bounds-checks every end and frees everything with its owner. Breaks
+    /// if a copy completes before its event, a buffer or stream leaks, or a v2.4 library is
+    /// driven through missing symbols.
+    #[test]
+    fn pinned_memory_and_copies_through_the_abi() {
+        use turbine_tensor::{CopyEngine, CopyTarget, PinnedMemory};
+
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let v24 = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V24")), "hip")
+            .expect("load v2.4");
+        let old = v24
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        assert!(!old.has_copy_engine());
+        assert!(matches!(
+            old.alloc_pinned(64),
+            Err(MemoryError::Unsupported(message)) if message.contains("v2.5")
+        ));
+        drop(old);
+
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V25")), "hip")
+            .expect("load v2.5");
+        assert_eq!((lib.abi_version(), lib.abi_minor()), (2, 5));
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        assert!(ctx.has_copy_engine());
+        let pinned_before = stub_count(&lib, "stub_live_host_buffers");
+        let hold = |on: bool| {
+            stub_hook(&lib, "stub_hold_events", |f: unsafe extern "C" fn(i32)| {
+                // SAFETY: the stub defines `void stub_hold_events(int32_t)`; the library is
+                // loaded.
+                unsafe { f(i32::from(on)) }
+            })
+        };
+
+        let src = ctx.alloc_pinned(64).expect("pinned buffer");
+        assert_eq!(src.len(), 64);
+        assert_eq!(
+            stub_count(&lib, "stub_live_host_buffers"),
+            pinned_before + 1
+        );
+        let pattern: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(7)).collect();
+        src.with_bytes_mut(|b| b.copy_from_slice(&pattern));
+
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let dev = DeviceBuffer::alloc(&mem, 64).expect("device buffer");
+        let pinned = |b: &turbine_tensor::PinnedBuffer, offset| CopyTarget::Pinned {
+            buffer_id: b.id(),
+            offset,
+        };
+
+        // Host → device on the copy stream; a ticket is complete only once its event signals.
+        hold(true);
+        let t = ctx
+            .copy_async(CopyTarget::Device(dev.ptr()), pinned(&src, 0), 64)
+            .expect("h2d");
+        assert_eq!(t.bytes, 64);
+        assert!(!ctx.poll(&t).expect("poll"), "the event has not signalled");
+        hold(false);
+        assert!(ctx.poll(&t).expect("poll"));
+        assert!(ctx.poll(&t).expect("a finished ticket stays finished"));
+        assert_eq!(stub_count(&lib, "stub_live_streams"), 1, "one copy stream");
+        let waits = stub_count(&lib, "stub_stream_waits");
+
+        // Device → host into another buffer at an offset, waited on; the copy of a device
+        // source first waits for the compute stream.
+        let back = ctx.alloc_pinned(96).expect("pinned buffer");
+        let t = ctx
+            .copy_async(pinned(&back, 32), CopyTarget::Device(dev.ptr()), 64)
+            .expect("d2h");
+        assert_eq!(stub_count(&lib, "stub_stream_waits"), waits + 1);
+        ctx.wait(&t).expect("wait");
+        back.with_bytes(|b| assert_eq!(&b[32..], pattern.as_slice()));
+
+        // Bounds, unknown buffers and host-to-host copies are refused before the shim.
+        let err = ctx
+            .copy_async(pinned(&back, 64), CopyTarget::Device(dev.ptr()), 64)
+            .expect_err("past the end");
+        assert!(matches!(err, MemoryError::InvalidArgument(_)), "{err:?}");
+        let err = ctx
+            .copy_async(
+                CopyTarget::Pinned {
+                    buffer_id: 9999,
+                    offset: 0,
+                },
+                CopyTarget::Device(dev.ptr()),
+                1,
+            )
+            .expect_err("unknown buffer");
+        assert!(matches!(err, MemoryError::InvalidArgument(_)), "{err:?}");
+        let err = ctx
+            .copy_async(pinned(&back, 0), pinned(&src, 0), 8)
+            .expect_err("host to host");
+        assert!(matches!(err, MemoryError::Unsupported(_)), "{err:?}");
+        assert!(matches!(
+            ctx.alloc_pinned(2 << 30),
+            Err(MemoryError::OutOfMemory { requested }) if requested == 2 << 30
+        ));
+
+        // Buffers free on Drop; the copy stream and every copy event go with the context.
+        drop((src, back));
+        assert_eq!(stub_count(&lib, "stub_live_host_buffers"), pinned_before);
+        let contexts = live_contexts(&lib);
+        drop((dev, mem, ctx));
+        assert_eq!(live_contexts(&lib), contexts - 1);
+        assert_eq!(stub_count(&lib, "stub_live_streams"), 0);
     }
 }

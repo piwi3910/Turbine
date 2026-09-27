@@ -107,10 +107,14 @@ pub enum PressureSignal {
     Thermal,
     TelemetryStale,
     AllocationFailure,
+    /// P4: L2 NVMe queue depth / `kv.nvme.max_queue_depth`.
+    StorageQueueDepth,
+    /// P4: L2 p99 latency / the calibration p99.
+    StorageLatency,
 }
 
 impl PressureSignal {
-    pub const ALL: [PressureSignal; 11] = [
+    pub const ALL: [PressureSignal; 13] = [
         PressureSignal::KvUtilization,
         PressureSignal::DeviceMemory,
         PressureSignal::HostAvailable,
@@ -122,6 +126,8 @@ impl PressureSignal {
         PressureSignal::Thermal,
         PressureSignal::TelemetryStale,
         PressureSignal::AllocationFailure,
+        PressureSignal::StorageQueueDepth,
+        PressureSignal::StorageLatency,
     ];
 
     /// Metric label / config key / JSON name.
@@ -138,6 +144,8 @@ impl PressureSignal {
             PressureSignal::Thermal => "thermal",
             PressureSignal::TelemetryStale => "telemetry_stale",
             PressureSignal::AllocationFailure => "allocation_failure",
+            PressureSignal::StorageQueueDepth => "storage_queue_depth",
+            PressureSignal::StorageLatency => "storage_latency",
         }
     }
 

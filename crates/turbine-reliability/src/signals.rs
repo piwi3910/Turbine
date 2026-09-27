@@ -111,6 +111,13 @@ pub fn default_thresholds() -> BTreeMap<PressureSignal, SignalThresholds> {
         (Thermal, up([Some(1.0), Some(2.0), None, None])),
         (TelemetryStale, up([Some(1.0), None, None, None])),
         (AllocationFailure, up([None, None, None, Some(1.0)])),
+        // P4 (contract §8.3, contract-chosen values): the L2 tier's queue fill and its p99
+        // latency over the calibration p99 (10× = the tier's own "slow" degradation point).
+        (
+            StorageQueueDepth,
+            up([Some(0.50), Some(0.75), Some(0.90), None]),
+        ),
+        (StorageLatency, up([Some(2.0), Some(5.0), Some(10.0), None])),
     ])
 }
 
@@ -252,6 +259,18 @@ impl SignalEvaluator {
             0.0
         };
         out.push(self.value(AllocationFailure, oom, false));
+        // P4: the L2 tier, when one exists (signals omitted otherwise, like unavailable
+        // sources).
+        if let Some(st) = &s.storage {
+            if st.max_queue_depth > 0 {
+                let fill = f64::from(st.queue_depth) / f64::from(st.max_queue_depth);
+                out.push(self.value(StorageQueueDepth, fill, false));
+            }
+            if st.calibration_latency_s > 0.0 {
+                let ratio = st.p99_latency_s / st.calibration_latency_s;
+                out.push(self.value(StorageLatency, ratio, false));
+            }
+        }
 
         let mut any_stale_long = self.stale_too_long(Source::Host, s.host.status, now);
         if s.host.status != SourceStatus::Unavailable {

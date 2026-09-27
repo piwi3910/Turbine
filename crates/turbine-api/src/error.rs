@@ -257,6 +257,59 @@ impl ApiError {
         )
     }
 
+    /// 400 `invalid_request_error`/`invalid_session_id`: `prompt_cache_key` is not 1-128 visible
+    /// ASCII characters.
+    pub fn invalid_session_id() -> Self {
+        Self::from_code(
+            ErrorCode::InvalidSessionId,
+            "prompt_cache_key must be 1 to 128 visible ASCII characters",
+        )
+    }
+
+    /// 400 `invalid_request_error`/`invalid_session_hint`: a bad `x-turbine-session-*` header,
+    /// or one without `prompt_cache_key`.
+    pub fn invalid_session_hint() -> Self {
+        Self::from_code(
+            ErrorCode::InvalidSessionHint,
+            "x-turbine-session-resume-within must be an integer 1..86400 and \
+             x-turbine-session-end true or false; both need prompt_cache_key",
+        )
+    }
+
+    /// 400 `invalid_request_error`/`invalid_cache_salt`: `x-turbine-cache-salt` is not 1-128
+    /// visible ASCII characters.
+    pub fn invalid_cache_salt() -> Self {
+        Self::from_code(
+            ErrorCode::InvalidCacheSalt,
+            "x-turbine-cache-salt must be 1 to 128 visible ASCII characters",
+        )
+    }
+
+    /// 404 `not_found`/`session_not_found`: a prefetch names no known session.
+    pub fn session_not_found() -> Self {
+        Self::from_code(
+            ErrorCode::SessionNotFound,
+            "no KV session has this prompt_cache_key",
+        )
+    }
+
+    /// 429 `rate_limit_error`/`prefetch_queue_full`: the prefetch queue is at
+    /// `kv.prefetch.max_queue`.
+    pub fn prefetch_queue_full() -> Self {
+        Self::from_code(
+            ErrorCode::PrefetchQueueFull,
+            "the KV prefetch queue is full (kv.prefetch.max_queue)",
+        )
+    }
+
+    /// 409 `invalid_request_error`/`pressure_too_high`: no prefetch at ORANGE pressure or above.
+    pub fn pressure_too_high() -> Self {
+        Self::from_code(
+            ErrorCode::PressureTooHigh,
+            "KV memory pressure is ORANGE or above; prefetch refused",
+        )
+    }
+
     /// Status, `type` and `retry-after` for a code reported by the engine (contract §14.3 table).
     pub fn from_code(code: ErrorCode, message: impl Into<String>) -> Self {
         let (status, kind) = match code {
@@ -282,7 +335,17 @@ impl ApiError {
             | ErrorCode::ContextExceedsKvCapacity
             | ErrorCode::InvalidJsonSchema
             | ErrorCode::ToolsNotSupported
-            | ErrorCode::UnknownTool => (StatusCode::BAD_REQUEST, ErrorType::InvalidRequestError),
+            | ErrorCode::UnknownTool
+            | ErrorCode::InvalidSessionId
+            | ErrorCode::InvalidSessionHint
+            | ErrorCode::InvalidCacheSalt => {
+                (StatusCode::BAD_REQUEST, ErrorType::InvalidRequestError)
+            }
+            ErrorCode::SessionNotFound => (StatusCode::NOT_FOUND, ErrorType::NotFound),
+            ErrorCode::PrefetchQueueFull => {
+                (StatusCode::TOO_MANY_REQUESTS, ErrorType::RateLimitError)
+            }
+            ErrorCode::PressureTooHigh => (StatusCode::CONFLICT, ErrorType::InvalidRequestError),
             ErrorCode::EngineBusy | ErrorCode::QueueFull => {
                 (StatusCode::TOO_MANY_REQUESTS, ErrorType::RateLimitError)
             }

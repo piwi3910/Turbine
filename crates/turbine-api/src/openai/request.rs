@@ -77,6 +77,8 @@ pub struct OpenAiRequest {
     pub parallel_tool_calls: Option<bool>,
     pub best_of: Option<Value>,
     pub suffix: Option<Value>,
+    /// Phase 4 session id (`x-turbine-session-*` headers refer to it); 1-128 visible ASCII.
+    pub prompt_cache_key: Option<String>,
 }
 
 /// Completions `prompt`: text, or pre-tokenized ids.
@@ -248,7 +250,11 @@ impl OpenAiRequest {
         self.check_ranges()?;
         self.check_logprobs(chat)?;
         self.check_response_format()?;
-        self.check_tools()
+        self.check_tools()?;
+        match &self.prompt_cache_key {
+            Some(key) => crate::kv::validate_session_id(key),
+            None => Ok(()),
+        }
     }
 
     fn check_unsupported(&self, chat: bool) -> Result<(), ApiError> {

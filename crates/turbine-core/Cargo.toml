@@ -22,6 +22,8 @@ uuid.workspace = true
 smallvec.workspace = true
 # Phase 2: the JSON schema carried by ConstraintSpec::JsonSchema
 serde_json.workspace = true
+# P4: ModelIdentity::fingerprint (BLAKE3)
+blake3.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

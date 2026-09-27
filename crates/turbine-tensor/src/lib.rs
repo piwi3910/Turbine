@@ -4,6 +4,7 @@ pub mod buffer;
 pub mod dtype;
 pub mod host;
 pub mod kv_view;
+pub mod pinned;
 pub mod tensor;
 
 pub use buffer::{
@@ -12,5 +13,8 @@ pub use buffer::{
 };
 pub use dtype::DType;
 pub use kv_view::KvPoolView;
+pub use pinned::{
+    CopyEngine, CopySource, CopyTarget, CopyTicket, PinnedBuffer, PinnedMemory, PinnedOwner,
+};
 pub use tensor::{Tensor, TensorView};
 pub use turbine_core::types::DeviceId;

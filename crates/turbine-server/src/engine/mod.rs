@@ -13,6 +13,11 @@
 //! (`crate::reliability::build`), the telemetry sampler thread and the supervised controller
 //! thread; in the `fault-injection` build the fault injector on the ledger, the executor and
 //! the vendor telemetry.
+//!
+//! Phase 4 builds the KV hierarchy over the pool right after the weights load
+//! (`crate::kv_orchestrator`: tiers and transfer calibration) and before the reliability side,
+//! which drives it through the orchestrator's `KvReclaimer` and reads the L2 tier's storage
+//! signals through the telemetry sampler.
 
 pub(crate) mod deadlines;
 pub(crate) mod grammar;
@@ -26,7 +31,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 use turbine_core::clock::{Clock, SystemClock};
-use turbine_core::config::DevicesConfig;
+use turbine_core::config::{DevicesConfig, KvConfig};
 use turbine_core::request::GenerationEvent;
 use turbine_device::telemetry::proc::FsProc;
 use turbine_device::telemetry::vendor::vendor_backends;
@@ -34,6 +39,7 @@ use turbine_device::telemetry::{
     SamplerCore, TelemetryConfig, TelemetryMetrics, TelemetrySampler, VendorTelemetry,
 };
 use turbine_device::{DeviceInventory, DiscoveryOptions};
+use turbine_kv::tier::L2NvmeTier;
 use turbine_kv::{KvDocument, KvMetrics};
 use turbine_model::ModelMetrics;
 use turbine_model::executor::ModelExecutor;
@@ -41,6 +47,7 @@ use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_scheduler::{Scheduler, SchedulerMetrics, SchedulerSnapshot, SubmitError, policy};
 
 use crate::backend::ModelBackend;
+use crate::kv_orchestrator::{CopyDevice, KvHandle, KvOrchestrator, KvStart, L2StorageProbe};
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
 use crate::reliability::{self as rel, EngineLedgerProbe, ReliabilityInputs};
@@ -68,10 +75,19 @@ pub enum EngineCommand {
     Wake,
 }
 
-/// The HTTP side's end of the command channel.
+/// The HTTP side's end of the command channels.
 #[derive(Clone)]
 pub struct EngineHandle {
     pub submit_tx: mpsc::Sender<EngineCommand>,
+    /// `POST /turbine/v1/kv/prefetch` (Phase 4).
+    pub kv: KvHandle,
+}
+
+/// What the engine thread needs to build the KV hierarchy (Phase 4): the `kv` section and the
+/// L2 tier opened before the listener bound.
+pub struct KvSetup {
+    pub cfg: KvConfig,
+    pub l2: Option<Arc<L2NvmeTier>>,
 }
 
 /// Why the engine asks the server to exit.
@@ -127,6 +143,8 @@ pub struct ReliabilityStartup {
     pub devices: DevicesConfig,
     pub metrics: ReliabilityMetrics,
     pub telemetry: TelemetryMetrics,
+    /// The KV hierarchy's inputs (Phase 4).
+    pub kv: KvSetup,
 }
 
 /// Starts the engine thread: it loads the weights, measures the memory budget, allocates the KV
@@ -166,6 +184,50 @@ pub fn spawn(
                     }
                 };
             let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+            // Phase 4: the KV hierarchy over the pool, before the reliability side that drives
+            // it. L1 needs the kernel library's copy engine (ABI v2.3 + v2.5).
+            let mut pool = loaded.pool;
+            let device = match &prepared.provider.opened.context {
+                Some(ctx) if ctx.has_copy_engine() => CopyDevice::Stream {
+                    engine: Arc::clone(ctx) as _,
+                    pinned: Arc::clone(ctx) as _,
+                },
+                Some(ctx) => {
+                    tracing::warn!(
+                        event = "kv_copy_engine_unavailable",
+                        library = %ctx.library().path().display(),
+                        minor = ctx.library().abi_minor(),
+                        "the kernel library has no copy streams (ABI v2.5); KV copies are \
+                         synchronous and L1 is disabled"
+                    );
+                    CopyDevice::Sync {
+                        mem: Arc::clone(&prepared.provider.opened.mem),
+                    }
+                }
+                None => CopyDevice::Sync {
+                    mem: Arc::clone(&prepared.provider.opened.mem),
+                },
+            };
+            let l2 = startup.kv.l2.clone();
+            let started = KvOrchestrator::start(
+                KvStart {
+                    cfg: &startup.kv.cfg,
+                    memory_kind: prepared.provider.opened.memory_kind,
+                    identity: prepared.identity,
+                    device,
+                    l2: startup.kv.l2,
+                    clock: Arc::clone(&clock),
+                    metrics: metrics.kv.clone(),
+                },
+                &mut pool,
+            );
+            let (kv, kv_handle) = match started {
+                Ok(k) => k,
+                Err(e) => {
+                    let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
+                    return;
+                }
+            };
             let reliability = &prepared.reliability;
             #[cfg(feature = "fault-injection")]
             let injector = reliability.fault_injection.clone().map(|cfg| {
@@ -191,6 +253,7 @@ pub fn spawn(
                     / u64::from(prepared.scheduler.max_batch_tokens.max(1)),
                 metrics: startup.metrics.clone(),
                 clock: Arc::clone(&clock),
+                reclaimer: kv.reclaimer(),
             });
             #[allow(unused_mut)]
             let mut executor: Box<dyn ModelExecutor> = loaded.executor;
@@ -232,17 +295,22 @@ pub fn spawn(
                 Arc::clone(&parts.queue_len),
                 reliability.admission.max_queue,
             );
-            let (sampler, latest) = TelemetrySampler::spawn_core(
-                SamplerCore::new(
-                    TelemetryConfig::from_config(&reliability.telemetry),
-                    &startup.inventory,
-                    vendor,
-                    Box::new(FsProc::default()),
-                    Arc::new(probe),
-                    Arc::clone(&clock),
-                )
-                .with_metrics(startup.telemetry.clone()),
-            );
+            let mut core = SamplerCore::new(
+                TelemetryConfig::from_config(&reliability.telemetry),
+                &startup.inventory,
+                vendor,
+                Box::new(FsProc::default()),
+                Arc::new(probe),
+                Arc::clone(&clock),
+            )
+            .with_metrics(startup.telemetry.clone());
+            if let Some(l2) = l2 {
+                core = core.with_storage(Arc::new(L2StorageProbe {
+                    l2,
+                    max_queue_depth: startup.kv.cfg.nvme.max_queue_depth,
+                }));
+            }
+            let (sampler, latest) = TelemetrySampler::spawn_core(core);
 
             let PreparedModel {
                 tokenizer,
@@ -275,7 +343,8 @@ pub fn spawn(
             let shared = Arc::new(EngineShared::default());
             let engine = EngineLoop::new(EngineParts {
                 executor,
-                pool: loaded.pool,
+                pool,
+                kv,
                 scheduler,
                 clock,
                 commands,
@@ -288,7 +357,10 @@ pub fn spawn(
                 reliability: parts.engine,
             });
             backend.set_ready(
-                EngineHandle { submit_tx },
+                EngineHandle {
+                    submit_tx,
+                    kv: kv_handle,
+                },
                 shared,
                 controller,
                 loaded.load_seconds,

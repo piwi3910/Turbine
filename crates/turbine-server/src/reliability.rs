@@ -26,7 +26,6 @@ use turbine_core::request::ErrorCode;
 use turbine_core::telemetry::LedgerProbe;
 use turbine_core::types::{DeviceId, PressureSignal};
 use turbine_device::telemetry::LatestSample;
-use turbine_kv::L0Reclaimer;
 use turbine_reliability::admission::{
     Admission, AdmissionParams, AdmissionQueue, Calibration, RejectionReason,
 };
@@ -38,7 +37,7 @@ use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_reliability::recovery::{RecoveryController, RecoveryOutcome, RecoveryStep};
 use turbine_reliability::reserve::{EmergencyReserve, ReserveAllocator};
 use turbine_reliability::signals::effective_thresholds;
-use turbine_reliability::throttle::SchedulerLimits;
+use turbine_reliability::throttle::{KvReclaimer, SchedulerLimits};
 use turbine_scheduler::{AdmissionGate, SchedulerParams};
 use turbine_tensor::{DeviceBuffer, DeviceMemory};
 
@@ -196,6 +195,9 @@ pub(crate) struct ReliabilityInputs<'a> {
     pub workspace_bytes_per_token: u64,
     pub metrics: ReliabilityMetrics,
     pub clock: Arc<dyn Clock>,
+    /// What the controller's reclaim step drives (P3 S-10): the KV hierarchy's lock-free
+    /// `KvReclaimHandle` from Phase 4 (demotion to lower tiers, freeing cached blocks).
+    pub reclaimer: Arc<dyn KvReclaimer>,
 }
 
 /// The pieces [`build`] returns: the engine's end, the admission gate for its scheduler, and
@@ -222,7 +224,7 @@ pub(crate) fn build(inp: ReliabilityInputs<'_>) -> ReliabilityParts {
         inp.budget,
         Arc::clone(&inp.ledger),
         inp.reserve,
-        Arc::new(L0Reclaimer),
+        Arc::clone(&inp.reclaimer),
         inp.metrics.clone(),
         Arc::clone(&inp.clock),
     );

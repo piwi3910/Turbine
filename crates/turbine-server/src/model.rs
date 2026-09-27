@@ -7,12 +7,13 @@
 //! and the one-token warm-up (after it binds).
 
 use std::fmt;
+use std::io::Read;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Instant;
 
 use turbine_core::config::{ByteSize, Config, ReliabilityConfig, StructuredOutputConfig};
-use turbine_core::types::{DeviceId, KvLayout, MemoryKind, SeqId};
+use turbine_core::types::{DeviceId, KvLayout, MemoryKind, ModelIdentity, SeqId};
 use turbine_device::DeviceInventory;
 use turbine_device::telemetry::proc::FsProc;
 use turbine_device::telemetry::read_host;
@@ -52,7 +53,7 @@ const DEFAULT_MAX_SEQ_LEN: u32 = 32_768;
 pub struct StartupError(String);
 
 impl StartupError {
-    fn new(message: impl Into<String>) -> StartupError {
+    pub(crate) fn new(message: impl Into<String>) -> StartupError {
         StartupError(message.into())
     }
 }
@@ -225,6 +226,31 @@ pub struct PreparedModel {
     pub kv_cap: Option<ByteSize>,
     /// Bytes of the executor workspace for `scheduler.max_batch_tokens`.
     pub workspace_bytes: u64,
+    /// What the KV cache depends on: the namespace of every cached block (P4 S-1).
+    pub identity: ModelIdentity,
+}
+
+/// The model's identity (P4 §Data namespace key): BLAKE3 of `config.json` and of the
+/// safetensors index, or of the single file's header when there is no index.
+pub fn model_identity(dir: &Path) -> Result<ModelIdentity, StartupError> {
+    let read =
+        |p: &Path| std::fs::read(p).map_err(|e| StartupError::new(format!("{}: {e}", p.display())));
+    let config = read(&dir.join("config.json"))?;
+    let index_path = dir.join("model.safetensors.index.json");
+    let index = if index_path.is_file() {
+        read(&index_path)?
+    } else {
+        let path = dir.join("model.safetensors");
+        let io = |e: std::io::Error| StartupError::new(format!("{}: {e}", path.display()));
+        let mut f = std::fs::File::open(&path).map_err(io)?;
+        let mut len = [0u8; 8];
+        f.read_exact(&mut len).map_err(io)?;
+        let n = u64::from_le_bytes(len);
+        let mut header = Vec::new();
+        f.take(n).read_to_end(&mut header).map_err(io)?;
+        header
+    };
+    Ok(ModelIdentity::from_bytes(&config, &index))
 }
 
 /// Steps 4–6: provider, model config + tokenizer + template, registry, memory budget. No weight
@@ -391,6 +417,7 @@ pub fn prepare(
         backend: config.execution.backend.to_string(),
         card_profile: provider.opened.card.map(|card| card.name.to_string()),
         scheduling_policy: config.scheduler.policy.to_string(),
+        eviction_policy: config.kv.policy.to_string(),
     };
     modules.log();
 
@@ -431,6 +458,7 @@ pub fn prepare(
         reliability,
         kv_cap: config.kv.gpu.max_bytes,
         workspace_bytes: workspace,
+        identity: model_identity(dir)?,
     })
 }
 

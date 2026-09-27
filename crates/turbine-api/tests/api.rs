@@ -1293,3 +1293,710 @@ mod p3 {
         assert!(seen["outcome"].contains("recovered") && seen["outcome"].contains("failed"));
     }
 }
+
+// ---- Phase 4: session hints, cache salt, cached tokens and the KV routes -------------------
+
+mod kv_sim {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use serde_json::Value;
+    use turbine_api::backend::BoxFuture;
+    use turbine_api::kv::{PrefetchAccepted, PrefetchRequest, PrefetchTarget};
+    use turbine_api::openai::request::{MessageContent, PromptInput};
+    use turbine_api::{
+        ApiError, Diagnostics, GenerationStream, InferenceBackend, InferenceRequest, ModelCard,
+    };
+    use turbine_core::clock::{Clock, FakeClock};
+    use turbine_core::config::KvConfig;
+    use turbine_core::request::{FinishReason, GenerationEvent, SessionHints, Usage};
+    use turbine_core::types::{
+        DType, DeviceId, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, Priority,
+    };
+    use turbine_kv::hierarchy::{
+        AttachOutcome, AttachRequest, HierarchyConfig, KvHierarchy, PrefetchError,
+        PrefetchTarget as KvTarget, PrefixAttach,
+    };
+    use turbine_kv::identity::KvFormat;
+    use turbine_kv::metrics::{EvictReason, KvMetrics};
+    use turbine_kv::tier::{KvTier, MemTier, TierId};
+    use turbine_kv::transfer::SimTransferBackend;
+    use turbine_kv::{BlockPool, BlockPoolConfig};
+    use turbine_observability::MetricsRegistry;
+    use turbine_tensor::DeviceMemory;
+    use turbine_tensor::host::HostMemory;
+
+    pub const MODEL: &str = "sim";
+
+    struct Inner {
+        clock: FakeClock,
+        h: KvHierarchy,
+        pool: BlockPool,
+        backend: SimTransferBackend,
+    }
+
+    /// An inference backend whose only "model" is the real KV hierarchy: prompts are split
+    /// into word tokens, prefixes attach and commit, and each request samples one token.
+    pub struct KvSim {
+        inner: Mutex<Inner>,
+    }
+
+    /// Word tokens: FNV-1a of each whitespace-separated word.
+    fn tokenize(text: &str) -> Vec<u32> {
+        text.split_whitespace()
+            .map(|w| {
+                w.bytes().fold(0x811c_9dc5u32, |h, b| {
+                    (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+                })
+            })
+            .collect()
+    }
+
+    fn messages_text(messages: &[turbine_api::openai::request::ChatMessageIn]) -> String {
+        messages
+            .iter()
+            .filter_map(|m| match &m.content {
+                Some(MessageContent::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    impl KvSim {
+        /// L0 of 64 blocks, L1 and L2 of 64 blocks each, 16-token blocks, prefetch queue 2.
+        pub fn new(reg: &MetricsRegistry) -> Arc<KvSim> {
+            let clock = FakeClock::new(Duration::ZERO);
+            let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+            let layout = KvLayout {
+                num_layers: 2,
+                num_kv_heads: 2,
+                head_dim: 16,
+                dtype: DType::BF16,
+                block_tokens: 16,
+            };
+            let bb = layout.block_bytes();
+            let tier = |id| {
+                Arc::new(MemTier::payload_free(id, 64 * bb, bb, arc.clone())) as Arc<dyn KvTier>
+            };
+            let (l1, l2) = (tier(TierId::L1), tier(TierId::L2));
+            let mut kv = KvConfig {
+                block_tokens: layout.block_tokens,
+                ..KvConfig::default()
+            };
+            kv.prefetch.max_queue = 2;
+            let h = KvHierarchy::new(
+                HierarchyConfig::from_config(&kv, bb, MemoryKind::Dedicated)
+                    .expect("the default eviction policy is registered"),
+                ModelIdentity {
+                    config_hash: [5; 32],
+                    weights_index_hash: [6; 32],
+                },
+                KvFormat {
+                    dtype: KvDtype::Bf16,
+                    layout,
+                },
+                64,
+                Some(l1.clone()),
+                Some(l2.clone()),
+                arc.clone(),
+                KvMetrics::register(reg),
+            );
+            let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 20);
+            let pool = BlockPool::new(
+                BlockPoolConfig {
+                    layout,
+                    num_blocks: 64,
+                },
+                mem,
+            )
+            .unwrap();
+            let backend = SimTransferBackend::new(arc, Some(l1), Some(l2), bb as usize);
+            Arc::new(KvSim {
+                inner: Mutex::new(Inner {
+                    clock,
+                    h,
+                    pool,
+                    backend,
+                }),
+            })
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+            self.inner.lock().unwrap()
+        }
+
+        pub fn set_pressure(&self, s: PressureState) {
+            self.lock().h.set_l0_state(s);
+        }
+
+        /// Copies every unreferenced L0 block down (to L1, spilling to L2) and lets the copies
+        /// finish.
+        pub fn demote_all(&self) {
+            let g = &mut *self.lock();
+            for _ in 0..8 {
+                g.h.demote_to(&mut g.pool, 0.0, EvictReason::Pressure);
+                g.h.poll(&mut g.pool, &mut g.backend);
+                g.clock.advance(Duration::from_millis(10));
+                g.h.poll(&mut g.pool, &mut g.backend);
+            }
+        }
+
+        /// Pumps transfers without advancing past pending copies' due times.
+        pub fn settle(&self) {
+            let g = &mut *self.lock();
+            for _ in 0..4 {
+                g.clock.advance(Duration::from_millis(10));
+                g.h.poll(&mut g.pool, &mut g.backend);
+            }
+        }
+
+        fn run(&self, prompt: &[u32], salt: &str, session: Option<&SessionHints>) -> PrefixAttach {
+            let g = &mut *self.lock();
+            let id = turbine_core::types::RequestId::new_v4();
+            let req = AttachRequest {
+                request: id,
+                prompt,
+                cache_salt: salt,
+                session,
+                priority: Priority::default(),
+            };
+            let attach = 'attach: loop {
+                match g.h.attach_prefix(&mut g.pool, &req) {
+                    AttachOutcome::Ready(a) => break a,
+                    AttachOutcome::Promoting => loop {
+                        g.clock.advance(Duration::from_millis(1));
+                        let ready = g.h.poll(&mut g.pool, &mut g.backend);
+                        if let Some((_, a)) = ready.into_iter().find(|(r, _)| *r == id) {
+                            break 'attach a;
+                        }
+                    },
+                    AttachOutcome::WaitForPrefix => {
+                        g.clock.advance(Duration::from_millis(1));
+                        g.h.poll(&mut g.pool, &mut g.backend);
+                    }
+                }
+            };
+            let need = (prompt.len().div_ceil(16) - attach.blocks.len()) as u32;
+            let mut table = attach.blocks.to_vec();
+            table.extend(g.pool.allocate(need).expect("room in L0"));
+            g.h.after_plan(&mut g.pool);
+            g.h.commit_progress(&mut g.pool, id, &table, prompt);
+            g.pool.release(&table);
+            g.h.request_done(&mut g.pool, id, false);
+            g.h.poll(&mut g.pool, &mut g.backend);
+            attach
+        }
+    }
+
+    impl InferenceBackend for KvSim {
+        fn models(&self) -> Vec<ModelCard> {
+            vec![ModelCard {
+                id: MODEL.into(),
+                object: "model".into(),
+                created: 0,
+                owned_by: "turbine".into(),
+                max_model_len: 4096,
+            }]
+        }
+
+        fn submit(
+            &self,
+            req: InferenceRequest,
+        ) -> BoxFuture<'_, Result<GenerationStream, ApiError>> {
+            let text = match (&req.body.prompt, &req.body.messages) {
+                (Some(PromptInput::Text(t)), _) => t.clone(),
+                (_, Some(m)) => messages_text(m),
+                _ => String::new(),
+            };
+            let prompt = tokenize(&text);
+            let session = req.body.prompt_cache_key.clone().map(|id| SessionHints {
+                session_id: id,
+                resume_within_secs: req.hints.session_resume_within,
+                end: req.hints.session_end,
+            });
+            let salt = req.hints.cache_salt.clone().unwrap_or_default();
+            let attach = self.run(&prompt, &salt, session.as_ref());
+            Box::pin(async move {
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                let usage = Usage {
+                    prompt_tokens: prompt.len() as u32,
+                    completion_tokens: 1,
+                    cached_tokens: attach.cached_tokens,
+                };
+                for e in [
+                    GenerationEvent::Started { choice: 0 },
+                    GenerationEvent::Token {
+                        choice: 0,
+                        text: "ok".into(),
+                        token_id: 1,
+                        logprob: None,
+                        top_logprobs: Vec::new(),
+                    },
+                    GenerationEvent::Finished {
+                        choice: 0,
+                        reason: FinishReason::Length,
+                        usage: Some(usage),
+                    },
+                ] {
+                    tx.send(e).await.expect("the receiver is alive");
+                }
+                Ok(rx)
+            })
+        }
+
+        fn prefetch(
+            &self,
+            req: PrefetchRequest,
+        ) -> BoxFuture<'_, Result<PrefetchAccepted, ApiError>> {
+            let result = {
+                let g = &mut *self.lock();
+                let salt = req.cache_salt.clone().unwrap_or_default();
+                let tokens = match &req.target {
+                    PrefetchTarget::Session { .. } => Vec::new(),
+                    PrefetchTarget::Prompt { prompt } => tokenize(prompt),
+                    PrefetchTarget::Messages { messages } => tokenize(&messages_text(messages)),
+                };
+                let target = match &req.target {
+                    PrefetchTarget::Session { session_id } => KvTarget::Session(session_id),
+                    _ => KvTarget::Tokens {
+                        prompt: &tokens,
+                        cache_salt: &salt,
+                    },
+                };
+                g.h.prefetch(&mut g.pool, target)
+            };
+            Box::pin(async move {
+                match result {
+                    Ok(a) => Ok(PrefetchAccepted {
+                        blocks_queued: a.blocks_queued,
+                        blocks_resident: a.blocks_resident,
+                    }),
+                    Err(PrefetchError::SessionNotFound) => Err(ApiError::session_not_found()),
+                    Err(PrefetchError::QueueFull) => Err(ApiError::prefetch_queue_full()),
+                    Err(PrefetchError::PressureTooHigh) => Err(ApiError::pressure_too_high()),
+                }
+            })
+        }
+    }
+
+    /// Diagnostics serving the hierarchy's KV document.
+    pub struct KvDiag(pub Arc<KvSim>);
+
+    impl Diagnostics for KvDiag {
+        fn status(&self) -> Value {
+            serde_json::json!({})
+        }
+        fn devices(&self) -> Value {
+            serde_json::json!({})
+        }
+        fn scheduler(&self) -> Result<Value, ApiError> {
+            Err(ApiError::not_implemented())
+        }
+        fn kv(&self) -> Result<Value, ApiError> {
+            let g = self.0.lock();
+            serde_json::to_value(g.h.document(&g.pool, (0, 0)))
+                .map_err(|e| ApiError::internal(e.to_string()))
+        }
+        fn pressure(&self) -> Result<Value, ApiError> {
+            Err(ApiError::not_implemented())
+        }
+    }
+}
+
+struct Ready;
+impl Readiness for Ready {
+    fn ready(&self) -> ReadyState {
+        ReadyState::Ready
+    }
+}
+
+fn kv_app() -> (Router, Arc<kv_sim::KvSim>, MetricsRegistry) {
+    let metrics = MetricsRegistry::new();
+    let sim = kv_sim::KvSim::new(&metrics);
+    let app = router(ApiState {
+        inference: sim.clone(),
+        diagnostics: Arc::new(kv_sim::KvDiag(sim.clone())),
+        readiness: Arc::new(Ready),
+        metrics: metrics.clone(),
+        limits: ApiLimits {
+            max_request_bytes: 1 << 20,
+        },
+    });
+    (app, sim, metrics)
+}
+
+async fn post_json(
+    app: &Router,
+    path: &str,
+    body: Value,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn words(n: usize, base: usize) -> String {
+    (base..base + n)
+        .map(|i| format!("w{i}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn cached(app: &Router, prompt: &str, headers: &[(&str, &str)]) -> u64 {
+    let (s, v) = post_json(
+        app,
+        "/v1/completions",
+        json!({"model": kv_sim::MODEL, "prompt": prompt, "max_tokens": 1}),
+        headers,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    v["usage"]["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no cached_tokens in {v}"))
+}
+
+#[tokio::test]
+async fn cache_salt_isolates() {
+    let (app, _sim, _) = kv_app();
+    let prompt = words(40, 0);
+    assert_eq!(cached(&app, &prompt, &[]).await, 0);
+    assert!(
+        cached(&app, &prompt, &[]).await > 0,
+        "shared without a salt"
+    );
+    let a = [("x-turbine-cache-salt", "a")];
+    assert_eq!(
+        cached(&app, &prompt, &a).await,
+        0,
+        "a salt is its own namespace"
+    );
+    assert!(cached(&app, &prompt, &a).await > 0, "same salt shares");
+    let b = [("x-turbine-cache-salt", "b")];
+    assert_eq!(
+        cached(&app, &prompt, &b).await,
+        0,
+        "another salt does not share"
+    );
+    let long = "s".repeat(129);
+    let (s, v) = post_json(
+        &app,
+        "/v1/completions",
+        json!({"model": kv_sim::MODEL, "prompt": prompt, "max_tokens": 1}),
+        &[("x-turbine-cache-salt", &long)],
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_error(&v, "invalid_request_error", "invalid_cache_salt");
+}
+
+#[tokio::test]
+async fn kv_routes() {
+    let (app, sim, _) = kv_app();
+
+    // The P4 document: every key of the §Data example.
+    let (s, doc) = get_json(&app, "GET", "/turbine/v1/kv").await;
+    assert_eq!(s, StatusCode::OK);
+    for key in [
+        "policy",
+        "prefix_sharing",
+        "block_tokens",
+        "block_bytes",
+        "tiers",
+        "unified_memory",
+        "hit_rate",
+        "sessions",
+        "prefetch",
+        "transfers",
+    ] {
+        assert!(doc.get(key).is_some(), "{key} missing from {doc}");
+    }
+    for tier in doc["tiers"].as_array().unwrap() {
+        for key in [
+            "tier",
+            "enabled",
+            "capacity_bytes",
+            "used_bytes",
+            "blocks",
+            "referenced_blocks",
+            "pressure",
+            "degraded",
+            "est_latency_seconds",
+            "est_bandwidth_bytes_per_second",
+        ] {
+            assert!(tier.get(key).is_some(), "{key} missing from {tier}");
+        }
+    }
+    for (object, keys) in [
+        (
+            "hit_rate",
+            &["window_seconds", "prompt_tokens", "cached_tokens"][..],
+        ),
+        ("sessions", &["active", "max"][..]),
+        ("prefetch", &["queued", "used", "wasted", "cancelled"][..]),
+        ("transfers", &["inflight_bytes", "max_inflight_bytes"][..]),
+    ] {
+        for key in keys {
+            assert!(doc[object].get(*key).is_some(), "{object}.{key} missing");
+        }
+    }
+    assert_eq!(doc["sessions"]["active"], 0);
+
+    // A chat request with a session id opens a session.
+    let chat = |key: &str| {
+        json!({"model": kv_sim::MODEL, "max_tokens": 1, "prompt_cache_key": key,
+               "messages": [{"role": "user", "content": words(64, 100)}]})
+    };
+    let (s, v) = post_json(&app, "/v1/chat/completions", chat("s1"), &[]).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, doc) = get_json(&app, "GET", "/turbine/v1/kv").await;
+    assert_eq!(doc["sessions"]["active"], 1);
+
+    // Its blocks leave L0; a prefetch by session id queues their promotion.
+    sim.demote_all();
+    let (s, v) = post_json(
+        &app,
+        "/turbine/v1/kv/prefetch",
+        json!({"session_id": "s1"}),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    assert_eq!(v["blocks_queued"], 2, "the queue holds 2 prefetches: {v}");
+    assert!(v.get("blocks_resident").is_some());
+    let (s, v) = post_json(
+        &app,
+        "/turbine/v1/kv/prefetch",
+        json!({"session_id": "s1"}),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert_error(&v, "rate_limit_error", "prefetch_queue_full");
+    sim.settle();
+
+    let (s, v) = post_json(
+        &app,
+        "/turbine/v1/kv/prefetch",
+        json!({"session_id": "nope"}),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_error(&v, "not_found", "session_not_found");
+
+    sim.set_pressure(turbine_core::types::PressureState::Orange);
+    let (s, v) = post_json(
+        &app,
+        "/turbine/v1/kv/prefetch",
+        json!({"prompt": words(32, 100)}),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_error(&v, "invalid_request_error", "pressure_too_high");
+    sim.set_pressure(turbine_core::types::PressureState::Green);
+    let (s, v) = post_json(
+        &app,
+        "/turbine/v1/kv/prefetch",
+        json!({"messages": [{"role": "user", "content": words(32, 100)}]}),
+        &[("x-turbine-cache-salt", "zz")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    let (s, v) = post_json(&app, "/turbine/v1/kv/prefetch", json!({"other": 1}), &[]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_error(&v, "invalid_request_error", "invalid_request");
+
+    // Session hint validation.
+    let (s, v) = post_json(&app, "/v1/chat/completions", chat(&"k".repeat(129)), &[]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_error(&v, "invalid_request_error", "invalid_session_id");
+    let (s, v) = post_json(
+        &app,
+        "/v1/chat/completions",
+        chat("s2"),
+        &[("x-turbine-session-resume-within", "0")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_error(&v, "invalid_request_error", "invalid_session_hint");
+    let (s, v) = post_json(
+        &app,
+        "/v1/completions",
+        json!({"model": kv_sim::MODEL, "prompt": "hi", "max_tokens": 1}),
+        &[("x-turbine-session-end", "true")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_error(&v, "invalid_request_error", "invalid_session_hint");
+    let (s, _) = post_json(
+        &app,
+        "/v1/chat/completions",
+        chat("s2"),
+        &[
+            ("x-turbine-session-resume-within", "600"),
+            ("x-turbine-session-end", "false"),
+        ],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+/// Every label value of a KV metric series belongs to its documented closed set.
+fn check_labels(line: &str) {
+    const TIERS: &[&str] = &["l0", "l1", "l2"];
+    const PATHS: &[&str] = &[
+        "l0_to_l1", "l1_to_l0", "l1_to_l2", "l2_to_l1", "l0_to_l2", "l2_to_l0",
+    ];
+    const REASONS: &[&str] = &[
+        "capacity",
+        "pressure",
+        "session_expired",
+        "checksum",
+        "tier_degraded",
+        "below_min_value",
+        "no_room",
+        "all_l0",
+        "retrieve_cheaper",
+        "recompute_cheaper",
+        "l0_pressure",
+        "no_match",
+    ];
+    let Some(labels) = line.split_once('{').map(|(_, rest)| rest) else {
+        return;
+    };
+    let labels = labels.split_once('}').map_or(labels, |(l, _)| l);
+    for pair in labels.split(',').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or_else(|| panic!("{line}"));
+        let v = v.trim_matches('"');
+        let ok = match k {
+            "tier" | "from" | "to" => TIERS.contains(&v),
+            "state" => ["used", "free"].contains(&v),
+            "kind" => ["capacity", "used"].contains(&v),
+            "result" => TIERS.contains(&v) || v == "miss",
+            "reason" => REASONS.contains(&v),
+            "path" => PATHS.contains(&v),
+            "outcome" => ["used", "wasted", "cancelled", "rejected"].contains(&v),
+            "le" => true,
+            _ => false,
+        };
+        assert!(ok, "label {k}={v} outside its documented set: {line}");
+    }
+}
+
+#[tokio::test]
+async fn kv_metrics_bounded() {
+    let (app, sim, _) = kv_app();
+    let prompt = words(64, 1000);
+    // Miss, then an L0 hit.
+    cached(&app, &prompt, &[]).await;
+    assert!(cached(&app, &prompt, &[]).await > 0);
+    // Demotions and L1 hits (promotions), then a recompute of an unrelated prompt.
+    sim.demote_all();
+    assert!(cached(&app, &prompt, &[]).await > 0);
+    cached(&app, &words(48, 5000), &[]).await;
+    // A used prefetch, a wasted one (evicted from L0 before use) and a rejected one.
+    let other = words(64, 9000);
+    cached(&app, &other, &[]).await;
+    // A hit: the reuse evidence that makes its blocks worth demoting (not dropping).
+    assert!(cached(&app, &other, &[]).await > 0);
+    sim.demote_all();
+    let (s, _) = post_json(
+        &app,
+        "/turbine/v1/kv/prefetch",
+        json!({"prompt": other}),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let (s, _) = post_json(
+        &app,
+        "/turbine/v1/kv/prefetch",
+        json!({"prompt": prompt}),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::TOO_MANY_REQUESTS,
+        "rejected: the queue is full"
+    );
+    sim.settle();
+    cached(&app, &other, &[]).await;
+    let (s, _) = post_json(
+        &app,
+        "/turbine/v1/kv/prefetch",
+        json!({"prompt": prompt}),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    sim.settle();
+    sim.demote_all();
+
+    let (s, _, body) = send(&app, "GET", "/metrics", Vec::new(), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let text = String::from_utf8(body).unwrap();
+    for family in [
+        "turbine_kv_blocks{",
+        "turbine_kv_bytes{",
+        "turbine_kv_lookups_total{",
+        "turbine_kv_prefix_cached_tokens_total",
+        "turbine_kv_prompt_tokens_total",
+        "turbine_kv_promotions_total{",
+        "turbine_kv_demotions_total{",
+        "turbine_kv_evictions_total{",
+        "turbine_kv_drops_total{",
+        "turbine_kv_recompute_tokens_total{",
+        "turbine_kv_plans_total{",
+        "turbine_kv_transfer_seconds_bucket{",
+        "turbine_kv_transfer_bytes_total{",
+        "turbine_kv_transfer_bandwidth_bytes_per_second{",
+        "turbine_kv_prefetch_total{",
+        "turbine_kv_sessions ",
+        "turbine_kv_tier_degraded{",
+        "turbine_storage_queue_depth ",
+        "turbine_storage_latency_seconds_bucket{",
+    ] {
+        assert!(text.contains(family), "{family} missing");
+    }
+    let value = |series: &str| -> f64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(series)?.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{series} missing"))
+    };
+    assert!(value(r#"turbine_kv_lookups_total{result="l0"}"#) > 0.0);
+    assert!(value(r#"turbine_kv_lookups_total{result="l1"}"#) > 0.0);
+    assert!(value(r#"turbine_kv_lookups_total{result="miss"}"#) > 0.0);
+    assert!(value(r#"turbine_kv_demotions_total{from="l0",to="l1"}"#) > 0.0);
+    assert!(value(r#"turbine_kv_promotions_total{from="l1",to="l0"}"#) > 0.0);
+    assert!(value(r#"turbine_kv_evictions_total{tier="l0",reason="pressure"}"#) > 0.0);
+    assert!(value(r#"turbine_kv_recompute_tokens_total{reason="no_match"}"#) > 0.0);
+    assert!(value(r#"turbine_kv_prefetch_total{outcome="used"}"#) > 0.0);
+    assert!(value(r#"turbine_kv_prefetch_total{outcome="wasted"}"#) > 0.0);
+    assert!(value(r#"turbine_kv_prefetch_total{outcome="rejected"}"#) > 0.0);
+    for line in text
+        .lines()
+        .filter(|l| l.starts_with("turbine_kv_") || l.starts_with("turbine_storage_"))
+    {
+        check_labels(line);
+    }
+}

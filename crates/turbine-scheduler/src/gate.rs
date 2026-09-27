@@ -26,7 +26,7 @@ use crate::scheduler::SubmitError;
 #[derive(Debug)]
 pub enum GateOutcome {
     /// Admitted with its worst-case KV reservation; the scheduler may start it.
-    Admitted(SchedRequest, Reservation),
+    Admitted(Box<SchedRequest>, Reservation),
     /// Waiting in the admission queue.
     Queued,
 }
@@ -103,7 +103,7 @@ impl AdmissionGate {
                 match self.admission.reserve_kv(&r.estimate) {
                     Ok(reservation) => {
                         self.started(&r.estimate);
-                        return Ok(GateOutcome::Admitted(r, reservation));
+                        return Ok(GateOutcome::Admitted(Box::new(r), reservation));
                     }
                     // Only an injected allocation failure (or a racing reservation) gets here.
                     Err(LedgerError::Exhausted { .. } | LedgerError::Injected) => {

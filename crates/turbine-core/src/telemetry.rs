@@ -105,6 +105,12 @@ pub trait LedgerProbe: Send + Sync {
     fn queue_fill(&self) -> f64;
 }
 
+/// Read on the fast tick (P4): the L2 NVMe tier's queue depth and latency as the KV orchestrator
+/// last published them; `None` while no L2 tier exists.
+pub trait StorageProbe: Send + Sync {
+    fn storage(&self) -> Option<StorageSample>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

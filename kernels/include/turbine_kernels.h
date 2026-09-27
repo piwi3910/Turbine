@@ -388,8 +388,8 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * (add then rmsnorm, whole logits rows, eager launches). */
 /* v2.2 adds TURBINE_MOE_ROUTE_BF16_LOGITS (a flag bit, no new symbol); v2.3
  * adds pinned host memory and events; v2.4 implementation enumeration and the
- * card profile (both below). */
-#define TURBINE_ABI_MINOR 4u
+ * card profile; v2.5 copy streams and asynchronous copies (all below). */
+#define TURBINE_ABI_MINOR 5u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -481,9 +481,9 @@ int32_t turbine_graph_launch(turbine_ctx *ctx, turbine_graph *g);
 int32_t turbine_graph_destroy(turbine_ctx *ctx, turbine_graph *g);
 
 /* ======== v2.3 (additive, optional): pinned host memory and events ========
- * The compute-stream subset of the v3 (Phase 4) memory functions, with the v3
- * names and signatures. Resolved only when turbine_abi_minor() >= 3 and all
- * six symbols exist; a library without them keeps the ABI v2 copies, which
+ * The compute-stream subset of the Phase 4 memory functions (v2.5 adds the
+ * rest). Resolved only when turbine_abi_minor() >= 3 and all six symbols
+ * exist; a library without them keeps the ABI v2 copies, which
  * turbine-kernels follows with turbine_stream_sync.
  *
  * turbine_host_alloc_pinned returns bytes of page-locked host memory (a host
@@ -496,7 +496,7 @@ int32_t turbine_graph_destroy(turbine_ctx *ctx, turbine_graph *g);
  *
  * An event marks a point of a stream: turbine_event_record captures the work
  * enqueued on stream s so far (s NULL = the compute stream, the only stream
- * before v3; re-recording moves the mark); turbine_event_synchronize blocks
+ * before v2.5; re-recording moves the mark); turbine_event_synchronize blocks
  * the calling thread until that work has completed, not later work; an event
  * never recorded is complete. */
 typedef struct turbine_stream turbine_stream;
@@ -578,6 +578,37 @@ int32_t turbine_impl_run(turbine_ctx *ctx, int32_t op, int32_t index,
  * build arch. */
 int32_t turbine_ctx_set_profile(turbine_ctx *ctx,
                                 const turbine_card_profile *p);
+
+/* ======== v2.5 (additive, optional): copy streams and asynchronous copies
+ * ========
+ * The rest of the Phase 4 memory functions, as an optional group on top of
+ * v2.3 (the tiered KV cache moves blocks between device memory and pinned host
+ * memory without stalling the compute stream). Resolved only when
+ * turbine_abi_minor() >= 5, all five symbols exist and the v2.3 group is
+ * resolved; a library without them runs with the KV cache on the device only.
+ *
+ * A copy stream belongs to the caller from turbine_copy_stream_create until
+ * turbine_copy_stream_destroy, which waits for its copies and must come before
+ * turbine_ctx_destroy. turbine_memcpy_async enqueues one copy of kind
+ * TURBINE_COPY_* on stream s (NULL = the compute stream); the host side must be
+ * pinned memory of the same context. It only enqueues: neither buffer may be
+ * freed, and the pinned side may not be read or written by the host, until an
+ * event recorded on s after the copy has completed. From v2.5
+ * turbine_event_record accepts a copy stream as s. turbine_event_query returns
+ * 1 when the recorded work has completed (or the event was never recorded), 0
+ * while it is pending, < 0 on error, and never blocks.
+ * turbine_stream_wait_event makes work enqueued on s after the call wait until
+ * e's recorded work has completed, without blocking the host. */
+#define TURBINE_COPY_H2D 0
+#define TURBINE_COPY_D2H 1
+#define TURBINE_COPY_D2D 2
+int32_t turbine_copy_stream_create(turbine_ctx *ctx, turbine_stream **out);
+int32_t turbine_copy_stream_destroy(turbine_ctx *ctx, turbine_stream *s);
+int32_t turbine_memcpy_async(turbine_ctx *ctx, turbine_stream *s, void *dst,
+                             const void *src, size_t bytes, int32_t kind);
+int32_t turbine_event_query(turbine_ctx *ctx, turbine_event *e);
+int32_t turbine_stream_wait_event(turbine_ctx *ctx, turbine_stream *s,
+                                  turbine_event *e);
 
 #ifdef __cplusplus
 }
