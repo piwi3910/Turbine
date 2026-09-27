@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# P3 S-16: enables the reliability.fault_injection section.
+fault-injection = []
+
 [dependencies]
 serde.workspace = true
 serde_norway.workspace = true
@@ -17,6 +21,9 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 smallvec.workspace = true
 # Phase 2: the JSON schema carried by ConstraintSpec::JsonSchema
+serde_json.workspace = true
+
+[dev-dependencies]
 serde_json.workspace = true
 
 [lints.rust]

@@ -88,6 +88,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2226,7 +2235,9 @@ dependencies = [
  "tower",
  "tracing",
  "turbine-core",
+ "turbine-device",
  "turbine-observability",
+ "turbine-reliability",
  "uuid",
 ]
 
@@ -2237,6 +2248,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
+ "rand_chacha",
  "reqwest",
  "serde",
  "serde_json",
@@ -2264,6 +2276,7 @@ dependencies = [
 name = "turbine-device"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "libloading 0.9.0",
  "nvml-wrapper",
  "prometheus-client",
@@ -2308,6 +2321,7 @@ dependencies = [
  "tracing",
  "turbine-core",
  "turbine-observability",
+ "turbine-reliability",
  "turbine-tensor",
 ]
 
@@ -2353,6 +2367,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbine-reliability"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "prometheus-client",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+ "turbine-core",
+ "turbine-observability",
+]
+
+[[package]]
 name = "turbine-scheduler"
 version = "0.1.0"
 dependencies = [
@@ -2368,6 +2397,7 @@ dependencies = [
  "turbine-core",
  "turbine-kv",
  "turbine-observability",
+ "turbine-reliability",
  "turbine-tensor",
  "uuid",
 ]
@@ -2376,6 +2406,7 @@ dependencies = [
 name = "turbine-server"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "clap",
  "jsonschema",
@@ -2393,6 +2424,7 @@ dependencies = [
  "turbine-kv",
  "turbine-model",
  "turbine-observability",
+ "turbine-reliability",
  "turbine-scheduler",
  "turbine-tensor",
 ]

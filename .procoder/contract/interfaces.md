@@ -107,7 +107,7 @@ crates/
   turbine-core/src/{lib.rs, config/…, types.rs, clock.rs, request.rs, telemetry.rs, support.rs}
   turbine-observability/src/{lib.rs, tracing.rs, metrics.rs, http.rs}
   turbine-device/src/{lib.rs, discovery/{mod.rs,nvml.rs,amd_smi.rs}, inventory.rs,
-                      telemetry/{mod.rs,proc.rs,vendor.rs} (P3), topology/{mod.rs,sysfs.rs} (P5), capability.rs (P7)}
+                      telemetry/{mod.rs,proc.rs,vendor.rs,nvml.rs,amd_smi.rs} (P3), topology/{mod.rs,sysfs.rs} (P5), capability.rs (P7)}
   turbine-device/tests/{lab.rs, fixtures/{proc/…, topology/{novanas,dgx-spark,dgx-spark2}/…}}   (fixture dirs contract-chosen)
   turbine-tensor/src/{lib.rs, dtype.rs, tensor.rs, buffer.rs, host.rs}
   turbine-kernels/src/{lib.rs, ffi.rs, shim.rs, registry.rs, ops/…, cpu/…, pinned.rs (P4), test_support.rs}
@@ -294,6 +294,7 @@ Complete key table (type → Rust field type; default; phase; validation and the
 | `reliability.admission.kv_overcommit`                                                                                                                        | —                                                                           | —                                                                                                                                                                                     | P3                             | removed key: always rejected naming it (P3 AC S-15)                                                                                                                                        |
 | `reliability.recovery.max_retries`                                                                                                                           | `u32`                                                                       | `3`                                                                                                                                                                                   | P3                             | 0..10                                                                                                                                                                                      |
 | `reliability.recovery.backoff`                                                                                                                               | `HumanDuration`                                                             | `50ms`                                                                                                                                                                                | P3                             | doubled per retry                                                                                                                                                                          |
+| `reliability.recovery.survival_liveness`                                                                                                                     | `SurvivalLiveness`                                                          | `requeue_unstarted`                                                                                                                                                                   | P3                             | `requeue_unstarted` (A) or `continue_prefills` (B): the SURVIVAL liveness rule (decision 2026-09-27, provisional A)                                                                        |
 | `reliability.circuit.oom_recoveries_to_open`                                                                                                                 | `u32`                                                                       | `3`                                                                                                                                                                                   | P3                             | —                                                                                                                                                                                          |
 | `reliability.circuit.window`                                                                                                                                 | `HumanDuration`                                                             | `60s`                                                                                                                                                                                 | P3                             | —                                                                                                                                                                                          |
 | `reliability.circuit.latency_drift_degraded`                                                                                                                 | `f64`                                                                       | `2.0`                                                                                                                                                                                 | P3                             | > 1                                                                                                                                                                                        |
@@ -620,7 +621,8 @@ Ordering: NVIDIA first (NVML order) then AMD (amd-smi order); `index` stable for
 
 ```rust
 pub struct TelemetryConfig { pub interval: Duration, pub vendor_interval: Duration, pub call_timeout: Duration, pub stale_after: Duration }
-pub trait VendorTelemetry: Send { fn sample(&mut self, device: &DeviceInfo) -> Result<DeviceSample, String>; }   // NVML / amd-smi impls; fakes in tests
+pub trait VendorTelemetry: Send { fn vendor(&self) -> Vendor; fn sample(&mut self, device: &DeviceInfo) -> Result<DeviceSample, String>; }   // NVML / amd-smi impls; fakes in tests
+pub fn vendor::vendor_backends(opts: &DiscoveryOptions) -> Vec<Box<dyn VendorTelemetry>>;   // Phase 2m: one per registered `DiscoveryKind` (`DiscoveryKind::telemetry(&DiscoveryOptions)`), impls in telemetry/{nvml.rs, amd_smi.rs}
 pub trait ProcSource: Send { fn read(&self, file: ProcFile) -> std::io::Result<String>; }                           // ProcFile { Meminfo, Vmstat, PressureMemory }
 pub struct TelemetrySampler { /* two cadences, deadline per vendor call */ }
 impl TelemetrySampler {
@@ -937,21 +939,25 @@ pub struct SignalThresholds { pub levels: [Option<f64>; 4] /* Y,O,R,S */, pub lo
 
 // admission (TS §9 verbatim enum; P3 reasons)
 pub enum AdmissionDecision { Admit, Queue { reason: PressureReason }, Reject { reason: RejectionReason } }
-pub enum PressureReason { KvReservation, PressureOrange, PressureRed, CircuitDegraded, PrefillBudget }        // P3 Queue reasons (CONFLICT C-11: P5 "KvCapacity" = KvReservation)
+pub enum PressureReason { KvReservation, PressureOrange, PressureRed, CircuitDegraded, PrefillBudget, SurvivalRequeue /* P3 amendment 2026-09-27 */ }        // P3 Queue reasons (CONFLICT C-11: P5 "KvCapacity" = KvReservation)
 pub enum RejectionReason { ContextExceedsKvCapacity, QueueFull, QueueTimeout, Survival, CircuitOpen }        // P3 Reject reasons
 impl RejectionReason { pub fn http(&self) -> (u16, &'static str /*type*/, &'static str /*code*/); }       // §14.3 table
 pub struct Admission { /* estimator EWMAs α=0.1 seeded from first 32 iterations */ }
 impl Admission {
     pub fn estimate(&self, prompt_tokens: u32, cached_prefix_tokens: u32, max_tokens: Option<u32>, layout: &KvLayout, max_seq_len: u32) -> ResourceEstimate;
     pub fn decide(&mut self, est: &ResourceEstimate, state: PressureState, circuit: CircuitState, queue_len: usize) -> AdmissionDecision;
+    pub fn evaluate_refill(&self, est: &ResourceEstimate, state: PressureState, circuit: CircuitState) -> AdmissionDecision;   // RED refills finished slots (2026-09-26)
+    pub fn with_kv_headroom(self, kv: SignalThresholds) -> Self;   // amendment 2026-09-27: in YELLOW/ORANGE/RED an admission never lifts kv_utilization past the next state's threshold (Queue{KvReservation})
+    pub fn record_requeue(&self, id: RequestId, est: &ResourceEstimate);   // SURVIVAL option A: a `queue` / `survival_requeue` decision
 }
-pub struct AdmissionQueue { /* FIFO within Priority; max_queue; queue_timeout; max_bypass starvation guard */ }
+pub struct AdmissionQueue<T, K = (Priority, u64)> { /* ordered by K: (priority, arrival) by default; the scheduler's gate uses the scheduling policy's AdmissionKey (Phase 2m); max_queue; queue_timeout; max_bypass starvation guard */ }
 
 // throttle (P3 S-10)
 #[derive(Clone, Copy, Serialize)]
 pub struct ThrottlePlan { pub state: PressureState, pub batch_growth_limit: Option<u32> /* None = unlimited; Some(0) frozen */,
                           pub shrink_only: bool, pub prefill_budget_fraction: f64, pub prefill_chunk_tokens: Option<u32>,
-                          pub admission: AdmissionMode, pub reclaim: ReclaimAction }
+                          pub start_new_prefills: bool, pub admission: AdmissionMode, pub reclaim: ReclaimAction,
+                          pub requeue_unstarted: bool /* SURVIVAL, survival_liveness A */ }
 pub enum AdmissionMode { Open, ExpensiveQueued, AllQueued, Stopped }   // serde "open","expensive_queued" (P3 §Data),"all_queued","stopped" (contract-chosen except expensive_queued)
 pub enum ReclaimAction { None, DemoteIdle, FreeCachedToOrange, FreeAllCachedAndOptional, ReleaseReserveAndPreemptIfNeeded }  // (contract-chosen)
 pub trait KvReclaimer: Send + Sync {                    // P3 S-10 name; P4 implements it in turbine-kv
@@ -959,6 +965,7 @@ pub trait KvReclaimer: Send + Sync {                    // P3 S-10 name; P4 impl
     fn free_unreferenced(&self, target_utilization: f64) -> u64;   // P3 implementation frees unreferenced cached L0 blocks
 }
 pub fn plan_for(state: PressureState, cfg: &SchedulerLimits) -> ThrottlePlan;   // SchedulerLimits { prefill_chunk_tokens, block_tokens }; chunk floor 4 × block_tokens
+pub fn plan_with(state: PressureState, cfg: &SchedulerLimits, survival: SurvivalLiveness) -> ThrottlePlan;   // the SURVIVAL row per reliability.recovery.survival_liveness (recovery::survival_plan)
 
 // circuit (P3 S-12)
 pub enum CircuitReason { LatencyDrift, ThermalThrottle, OomRecovered, TelemetryStale, RepeatedOom, RecoveryFailed, DeviceError,
@@ -968,6 +975,8 @@ impl CircuitBreaker { pub fn on_event(&mut self, ev: CircuitEvent, now: Duration
 
 // recovery (P3 S-11)
 pub enum RecoveryOutcome { Recovered { retries: u32 }, Failed }   // label "recovered" | "failed"
+pub enum SurvivalLiveness { RequeueUnstarted /* A, default */, ContinuePrefills /* B */ }   // turbine_core::config; decision "Phase 3: SURVIVAL liveness fix"
+pub fn survival_plan(plan: ThrottlePlan, cfg: &SchedulerLimits, survival: SurvivalLiveness) -> ThrottlePlan;
 
 // controller
 pub struct PressureController { /* telemetry-tick evaluation; supervised task */ }
@@ -986,7 +995,7 @@ Exhaustion horizon (P3 S-8): `ExhaustionHorizon::predict(running: &[(remaining_t
 | Signal                                                              | Y         | O    | R    | S       | Lower is worse                                                     |
 | ------------------------------------------------------------------- | --------- | ---- | ---- | ------- | ------------------------------------------------------------------ |
 | `kv_utilization`                                                    | 0.70      | 0.82 | 0.90 | 0.97    | no                                                                 |
-| `device_memory` (dedicated only)                                    | 0.85      | 0.90 | 0.95 | 0.98    | no                                                                 |
+| `device_memory` (dedicated only; free KV + held reserve count free) | 0.85      | 0.90 | 0.95 | 0.98    | no                                                                 |
 | `host_available` (× host_reserve_bytes)                             | 4.0       | 2.0  | 1.0  | 0.5     | yes                                                                |
 | `psi_memory_some_avg10`                                             | 5         | 10   | 25   | 50      | no                                                                 |
 | `swap_in_rate` (pages/s)                                            | 1         | 100  | 1000 | 10000   | no                                                                 |
@@ -1001,13 +1010,15 @@ Exhaustion horizon (P3 S-8): `ExhaustionHorizon::predict(running: &[(remaining_t
 
 ### 8.4 Throttle plan per state (P3, verbatim summary)
 
-| State    | batch_growth_limit | prefill_budget_fraction | prefill_chunk_tokens  | admission                              | reclaim                                                                                       |
-| -------- | ------------------ | ----------------------- | --------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------- |
-| GREEN    | unlimited          | 1.0                     | configured            | open                                   | none                                                                                          |
-| YELLOW   | +1/iteration       | 1.0                     | configured            | open                                   | `KvReclaimer::demote` idle → YELLOW threshold                                                 |
-| ORANGE   | 0 (frozen)         | 0.5                     | halved, floor 4×block | expensive_queued (`pressure_orange`)   | free unreferenced cached to ORANGE; demote aggressively (P4)                                  |
-| RED      | shrink only        | no new prefill starts   | floor                 | all_queued (`pressure_red`)            | free all unreferenced cached + optional buffers                                               |
-| SURVIVAL | shrink only        | 0                       | —                     | stopped (`503 overloaded`), queue kept | release emergency reserve; preempt most recently admitted only if next decode cannot allocate |
+| State    | batch_growth_limit                                | prefill_budget_fraction                  | prefill_chunk_tokens  | admission                                                   | reclaim                                                                                       |
+| -------- | ------------------------------------------------- | ---------------------------------------- | --------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| GREEN    | unlimited                                         | 1.0                                      | configured            | open                                                        | none                                                                                          |
+| YELLOW   | +1/iteration                                      | 1.0                                      | configured            | open                                                        | `KvReclaimer::demote` idle → YELLOW threshold                                                 |
+| ORANGE   | 0 (frozen)                                        | 0.5                                      | halved, floor 4×block | expensive_queued (`pressure_orange`)                        | free unreferenced cached to ORANGE; demote aggressively (P4)                                  |
+| RED      | 0 (frozen; queued requests refill finished slots) | 0.5; new prefills only in refilled slots | floor                 | all_queued (`pressure_red`); refills judged by ORANGE rules | free all unreferenced cached + optional buffers                                               |
+| SURVIVAL | shrink only                                       | 0                                        | —                     | stopped (`503 overloaded`), queue kept                      | release emergency reserve; preempt most recently admitted only if next decode cannot allocate |
+
+Batch growth counts admitted requests (running + waiting with a worst-case KV reservation). RED refilling finished slots: DEC 2026-09-26 (`Admission::evaluate_refill`, `Scheduler::admitted_count`). Work-conserving floor while nothing is admitted: DEC 2026-09-27 (`Admission::evaluate_idle`, `AdmissionGate::pump(max_new, idle)`). `step_time_drift` is the p95 of pure-decode iteration time over its shape bucket's calm baseline (`turbine_reliability::step_window::{DecodeStepWindow, StepSample}`, `EngineStats.step_time_p95`, DEC 2026-09-27 per-shape baseline), omitted while nothing runs; it feeds the circuit's `latency_drift` only in GREEN (DEC 2026-09-27, option 2).
 
 ### 8.5 Pressure document (`GET /turbine/v1/pressure`)
 
@@ -1486,7 +1497,7 @@ pub use turbine_core::types::{RequestId, SeqId, BlockId, Priority};
 
 pub enum RequestState { Waiting, Prefilling, Decoding, Paused, Finished, Cancelled, Failed }   // P2 S-2 verbatim (serde lowercase)
 impl RequestState { pub fn can_transition(self, to: RequestState) -> bool; }                   // disallowed → SchedError::IllegalTransition
-pub enum CancelReason { ClientDisconnect, RequestTimeout, SlowClient, Shutdown, QueueTimeout /*P3*/, CircuitOpen /*P3*/ }  // labels verbatim (P2)
+pub enum CancelReason { ClientDisconnect, RequestTimeout, SlowClient, Shutdown, QueueTimeout /*P3*/, CircuitOpen /*P3*/, Overloaded /*P3, SURVIVAL requeue with a full queue*/ }  // labels verbatim (P2)
 pub enum PreemptReason { KvExhausted /* P2 */, SurvivalDecodeAlloc /* P3 SURVIVAL rule, contract-chosen */ }
 
 pub struct SchedRequest {                          // what the engine submits (contract-chosen)
@@ -1509,6 +1520,7 @@ impl Scheduler {
 #[derive(Clone, Copy)] pub struct IterationLimits {                // (contract-chosen) P2 passes Default (= GREEN); P3 adds `impl From<&ThrottlePlan> for IterationLimits`
     pub batch_growth_limit: Option<u32>, pub shrink_only: bool, pub prefill_budget_fraction: f64,
     pub prefill_chunk_tokens: Option<u32>, pub admit_new: bool, pub start_new_prefills: bool,
+    pub allow_preempt: bool /* P3: SURVIVAL only with a gate */, pub requeue_unstarted: bool /* P3 SURVIVAL option A */,
 }
 pub struct IterationPlan { pub iteration: u64, pub items: Vec<BatchItem>, pub preempted: Vec<(SeqId, PreemptReason)>, pub dropped: Vec<(RequestId, CancelReason)> }
 pub struct BatchItem { pub seq: SeqId, pub kind: BatchKind, pub block_table: BlockTable }

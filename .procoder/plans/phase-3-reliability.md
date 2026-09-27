@@ -40,6 +40,15 @@ Inherited from the contract (`.procoder/contract/interfaces.md`, binding):
 - Gate for every task: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`; tasks touching the `fault-injection` feature also run `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 - prometheus-client appends `_total` to counters: counter families are registered through `MetricsRegistry::register` without the suffix (e.g. `turbine_pressure_transitions`, rendered `turbine_pressure_transitions_total`).
 
+## Port onto the Phase 2m layout (2026-09-27)
+
+Tasks 1–18 were first built on the pre-refactor tree (branch `runahead/p3-reliability`) and ported onto main after Phase 2m (registries for families, tool formats, weight formats, backends, card profiles, kernel implementations, logits processors and scheduling policies). Where Phase 3 touches an extension point it goes through the registry; no family, backend or vendor branch was added:
+
+- Task 11: the vendor telemetry backends are one file each (`crates/turbine-device/src/telemetry/{nvml.rs, amd_smi.rs}`) and are opened through the `device_discovery` registry: `DiscoveryKind::telemetry(&DiscoveryOptions)`; `telemetry::vendor::vendor_backends(opts: &DiscoveryOptions)` iterates the registry (was `vendor_backends(nvml, amd_smi)`); `docs/extending/backend.md` names the new method.
+- Task 12: the admission gate's queue is ordered by the scheduling policy's `AdmissionKey` (`AdmissionQueue<T, K>`, `push_keyed`; the gate keeps each request's `submit_no` so an admitted request keeps its order), `Scheduler::with_policy` applies to gated requests, `OverloadConfig::policy` names a registered policy and `ten_x_overload` runs over every registered policy; `docs/extending/scheduling-policy.md` notes that the key also orders the gate.
+- Task 14: error classification comes from the backend registry (`KernelError::is_oom`, `is_sticky` over `ExecutionBackend::sticky_error_prefixes`); `FaultyExecutor::new(inner, injector, sticky_name)` names an injected sticky error with the opened backend's first sticky prefix (the first registered backend's when the backend has none, e.g. `cpu`) instead of a hard-coded HIP name, and forwards the Phase 2c `launch` / `collect` / decode-graph methods. The Phase 2c overlap loop (`execution.overlap_scheduling`) got the same reliability rules: an out-of-memory launch finishes the iteration in flight and runs the plan through the serial recovery path; any other launch error, or an error collecting an iteration the scheduler already completed ahead, fails its requests and goes to the circuit breaker (`engine::loop::tests::{overlap_failed_steps_fail_their_requests_only, overlap_oom_launch_recovers_serially}`). `model::load` reads the weight format from the family registry (`turbine_model_weight_bytes{format}`), decode graphs stay wired, and `PreparedModel` keeps `tool_format` / `modules` next to the P3 budget fields.
+- Task 18: `lab_scripts phase3_soak_config_loads` compares the module name (`execution.backend` is an open `ModuleName` since Phase 2m).
+
 ## Task 1: Reliability configuration, pressure vocabulary and telemetry types in turbine-core
 
 Files: `crates/turbine-core/src/config/reliability.rs` (new: `reliability` section structs + static validation), `crates/turbine-core/src/config/mod.rs` (re-export, `Config::validate` hook, `scheduler.queue_timeout` removed-key, test), `crates/turbine-core/src/types.rs` (`PressureSignal`; helpers on `PressureState`/`CircuitState`), `crates/turbine-core/src/telemetry.rs` (new: telemetry vocabulary), `crates/turbine-core/src/lib.rs` (module), `crates/turbine-core/Cargo.toml` (feature `fault-injection = []`)
@@ -75,7 +84,8 @@ Interfaces:
 - `pub struct SignalThresholds { pub levels: [Option<f64>; 4], pub lower_is_worse: bool }` with `level(f64) -> PressureState`, `threshold(PressureState) -> Option<f64>`, `below_exit(f64, PressureState, margin: f64) -> bool`, `exit_threshold(PressureState, f64) -> Option<f64>`
 - `pub fn default_thresholds() -> BTreeMap<PressureSignal, SignalThresholds>`; `pub fn effective_thresholds(cfg: &PressureConfig) -> BTreeMap<PressureSignal, SignalThresholds>`; `pub fn active_signals(kind: MemoryKind) -> Vec<PressureSignal>`
 - `pub struct SignalValue { pub signal: PressureSignal /* serde "name" */, pub value: f64, pub level: PressureState, pub stale: bool }`
-- `pub struct SignalInputs<'a> { sample: &'a TelemetrySample, host_reserve_bytes: u64, devices: &'a [(DeviceId, MemoryKind, u64)], exhaustion_horizon_seconds: f64, step_time_drift: Option<f64>, allocation_failure_recent: bool }`
+- `pub struct SignalInputs<'a> { sample: &'a TelemetrySample, host_reserve_bytes: u64, devices: &'a [DeviceMemoryInput], exhaustion_horizon_seconds: f64, step_time_drift: Option<f64>, allocation_failure_recent: bool }`
+- `pub struct DeviceMemoryInput { device: DeviceId, memory_kind: MemoryKind, budget_bytes: u64, idle_preallocated_bytes: u64 }` (amended 2026-09-27, Task 12b)
 - `pub fn SignalEvaluator::new(thresholds, interval: Duration, stale_after: Duration) -> Self`; `pub fn evaluate(&mut self, inp: &SignalInputs<'_>, now: Duration) -> Vec<SignalValue>`
 - `pub enum PoolKind { Weights, Kv, Workspace, Runtime, Reserve }` + `ALL`, `as_str()`
 - `pub struct BudgetInputs { device, memory_kind, measured_free_bytes: Option<u64>, already_held_bytes: u64, host_mem_available_bytes: Option<u64>, weights_bytes, kv_bytes_per_token, max_seq_len: u32, block_bytes }`
@@ -187,16 +197,18 @@ Interfaces:
 - `pub struct Calibration { prefill_tokens_per_s: f64, decode_step_s: f64 }`; `pub struct AdmissionParams { device, adaptive, max_queue, large_prefill_tokens, block_bytes, prefill_chunk_tokens, workspace_bytes_per_token, calibration }`
 - `pub fn Admission::new(params: AdmissionParams, ledger: Arc<Ledger>, metrics: ReliabilityMetrics) -> Self`
 - `pub fn estimate(&self, prompt_tokens: u32, cached_prefix_tokens: u32, max_tokens: Option<u32>, layout: &KvLayout, max_seq_len: u32) -> ResourceEstimate`
-- `pub fn decide(&mut self, est: &ResourceEstimate, state: PressureState, circuit: CircuitState, queue_len: usize) -> AdmissionDecision`
+- `pub fn decide(&mut self, est: &ResourceEstimate, state: PressureState, circuit: CircuitState, queue_len: usize) -> AdmissionDecision`; `pub fn evaluate(&self, …same…) -> AdmissionDecision` (records nothing)
+- `pub fn evaluate_refill(&self, est: &ResourceEstimate, state: PressureState, circuit: CircuitState) -> AdmissionDecision` — the decision for a queued request offered an admitted slot (gate pump): RED is judged by ORANGE's rules (`pressure_red` binds new arrivals only), never `queue_full`, records nothing (amendment 2026-09-26: RED refills finished slots)
 - `pub fn reserve_kv(&self, est: &ResourceEstimate) -> Result<Reservation, LedgerError>`; `expensive_prefill_started(&mut self)`, `expensive_prefill_finished(&mut self)`; `observe_iteration(&mut self, prefill_tokens: u32, prefill_seconds: f64, decode_step_seconds: Option<f64>)`
 - `pub struct Queued<T> { id, priority, estimate, reason, enqueued_at, bypassed, payload: T }`
 - `pub fn AdmissionQueue::<T>::new(max_queue: u32, queue_timeout: Duration, max_bypass: u32) -> Self`; `push(&mut self, id, priority, estimate, reason, now, payload: T) -> Result<(), T>`; `remove(&mut self, id) -> Option<Queued<T>>`; `expire(&mut self, now) -> Vec<Queued<T>>`; `drain_all(&mut self) -> Vec<Queued<T>>`; `pump(&mut self, try_admit: impl FnMut(&Queued<T>) -> bool) -> Vec<Queued<T>>`; `estimated_drain_seconds(&self, max_running: u32) -> u64`; `len`, `is_empty`, `iter`
 
-Covers: S-9; `admission::tests::decision_table`, `admission::tests::bypass_bounded`.
+Covers: S-9; `admission::tests::decision_table`, `admission::tests::bypass_bounded`, `admission::tests::red_refill_from_queue`.
 Depends on: Tasks 2–3; phase-2 plan (`ResourceEstimate`, `KvLayout`, `Priority`, `RequestId`).
 
 - [ ] Write failing test `admission::tests::decision_table`: with a 1,024-block Llama `kv` pool: prompt 4000 + `max_tokens` 13000 → `Reject(ContextExceedsKvCapacity)`; cheap (100 + 100) in GREEN → `Admit`; expensive prefill (4000 tokens) in ORANGE → `Queue(PressureOrange)` while cheap is admitted; any request in RED → `Queue(PressureRed)`, at `queue_len == max_queue` (4) → `Reject(QueueFull)`; SURVIVAL → `Reject(Survival)`; CIRCUIT_OPEN → `Reject(CircuitOpen)`; DEGRADED + expensive → `Queue(CircuitDegraded)`; YELLOW + expensive while one expensive prefill runs → `Queue(PrefillBudget)`; with 1,020 blocks held elsewhere → `Queue(KvReservation)`; `adaptive: false` admits in RED and SURVIVAL but still rejects the oversize request; no `max_tokens` with `max_seq_len` 8192 reserves 512 blocks; `max_tokens: 100` with a 100-token prompt reserves ceil(200/16) = 13 blocks; `http()` of the five reject reasons equals the P3 reject table.
 - [ ] Write failing test `admission::tests::bypass_bounded`: a head needing 1,000 blocks and 20 one-block requests with 10 free blocks → the first `pump` admits exactly requests 1–8 (`max_bypass` 8) in FIFO order, the second admits nothing, the head shows `bypassed == 8`, and once everything fits the head goes first; priority `-1` sorts before `0`, FIFO within a priority; `max_queue` bounds `push`; entries older than `queue_timeout` are returned by `expire`.
+- [ ] Write failing test `admission::tests::red_refill_from_queue` (amendment 2026-09-26): with the 1,024-block pool, cheap (100 + 100) in RED → `decide`/`evaluate` `Queue(PressureRed)` but `evaluate_refill` `Admit`; expensive (4000) in RED and ORANGE → `evaluate_refill` `Queue(PressureOrange)`; cheap in ORANGE and expensive in GREEN → `Admit`; SURVIVAL → `Reject(Survival)`; CIRCUIT_OPEN → `Reject(CircuitOpen)`; with 1,020 blocks held elsewhere → `Queue(KvReservation)`; `turbine_admission_decisions_total{decision="admit"}` unchanged by `evaluate_refill`.
 - [ ] Run: `cargo test -p turbine-reliability admission::tests` — expect FAIL
 - [ ] Implement admission: `projected_kv_blocks = ceil((prompt + max_output)/block_tokens) − cached_full_blocks` with `max_output = max_tokens` else remaining context (worst case, no overcommit); decision order hard capacity → circuit → (adaptive) SURVIVAL/RED/ORANGE-expensive/DEGRADED-expensive/YELLOW-prefill-budget → unreserved KV → `queue_full` at `max_queue`; each decision increments `turbine_admission_decisions_total{decision,reason}` (`reason="none"` for admit) and logs `admission_decision` (DEBUG for admit, INFO otherwise); EWMAs (α = 0.1) of prefill tokens/s and decode step time are seeded by the mean of the first 32 iterations and use `Calibration` before that (`estimated: false`); the queue is sorted by `(priority, arrival seq)` and `pump` counts bypasses only against the current head.
 - [ ] Run: `cargo test -p turbine-reliability admission::tests` — expect PASS
@@ -218,7 +230,7 @@ Interfaces:
 Covers: S-10; `throttle::tests::plan_per_state`.
 Depends on: Task 2.
 
-- [ ] Write failing test `throttle::tests::plan_per_state`: with chunk 2048 and 16-token blocks: GREEN (unlimited, 1.0, 2048, open, none); YELLOW (+1, 1.0, 2048, open, demote); ORANGE (0, 0.5, 1024, expensive_queued, free cached to ORANGE); RED (0, shrink-only, 0.5, 64, no new prefills, all_queued, free all cached + optional); SURVIVAL (0, shrink-only, 0.0, no chunk, stopped, release reserve); chunk 96 halves to the 64 floor; a recording `KvReclaimer` sees `demote(0.70)` in YELLOW, `free_unreferenced(0.82)` then `demote(0.82)` in ORANGE, `free_unreferenced(0.0)` + `free_optional()` in RED and nothing in GREEN/SURVIVAL; freed bytes land in `turbine_reclaim_bytes_total{action="free_cached"}`.
+- [ ] Write failing test `throttle::tests::plan_per_state`: with chunk 2048 and 16-token blocks: GREEN (unlimited, 1.0, 2048, open, none); YELLOW (+1, 1.0, 2048, open, demote); ORANGE (0, 0.5, 1024, expensive_queued, free cached to ORANGE); RED (0, not shrink-only — finished slots are refilled, 0.5, 64, new prefills start in refilled slots, all_queued, free all cached + optional); SURVIVAL (0, shrink-only, 0.0, no chunk, stopped, release reserve); chunk 96 halves to the 64 floor; a recording `KvReclaimer` sees `demote(0.70)` in YELLOW, `free_unreferenced(0.82)` then `demote(0.82)` in ORANGE, `free_unreferenced(0.0)` + `free_optional()` in RED and nothing in GREEN/SURVIVAL; freed bytes land in `turbine_reclaim_bytes_total{action="free_cached"}`.
 - [ ] Run: `cargo test -p turbine-reliability throttle::tests::plan_per_state` — expect FAIL
 - [ ] Implement `plan_for` from the P3 table (chunk floor 4 × block tokens), `apply_reclaim` with the `kv_utilization` YELLOW/ORANGE thresholds as targets (metric + `reclaim` INFO log per non-zero action), and `publish_plan` (`turbine_throttle_plan{field}`; unlimited growth published as −1).
 - [ ] Run: `cargo test -p turbine-reliability throttle::tests` — expect PASS
@@ -285,7 +297,7 @@ Interfaces:
 - `pub fn TelemetrySampler::spawn(cfg, inventory, vendor, proc, ledger, clock) -> (TelemetrySampler, LatestSample)`; `pub fn spawn_core(core: SamplerCore) -> (TelemetrySampler, LatestSample)` (stops and joins on `Drop`)
 - `pub fn TelemetryMetrics::register(reg: &MetricsRegistry) -> Self`; `pub fn record_device(&self, d: &DeviceSample, kind: MemoryKind)`
 - `proc::{ProcFile::{Meminfo, Vmstat, PressureMemory}, trait ProcSource { fn read(&self, file: ProcFile) -> std::io::Result<String>; }, FsProc { root: PathBuf }, parse_meminfo(&str) -> Result<MemInfo, ParseError>, parse_vmstat(&str) -> Result<VmStat, ParseError>, parse_psi(&str) -> Result<PsiMemory, ParseError>}`
-- `vendor::{NvmlTelemetry::open(path: Option<&Path>) -> Result<Self, String>, AmdSmiTelemetry::open(path: Option<&Path>) -> Result<Self, String>, vendor_backends(nvml: Option<&Path>, amd_smi: Option<&Path>) -> Vec<Box<dyn VendorTelemetry>>}`
+- `vendor::{NvmlTelemetry::open(path: Option<&Path>) -> Result<Self, String>, AmdSmiTelemetry::open(path: Option<&Path>) -> Result<Self, String>, vendor_backends(opts: &DiscoveryOptions) -> Vec<Box<dyn VendorTelemetry>>}` (Phase 2m port: one per registered `DiscoveryKind`, whose `telemetry(&DiscoveryOptions)` opens `nvml::NvmlTelemetry` / `amd_smi::AmdSmiTelemetry`)
 
 Covers: S-5, S-14 (GPU/host/telemetry gauges); `telemetry::tests::proc_parsers`, `telemetry::tests::two_cadences`, `telemetry::tests::hung_call_marks_stale`.
 Depends on: Task 1; phase-0 plan (`DeviceInfo`, `DeviceInventory`, `nvml-wrapper` 0.13, `libloading` 0.9, `DevicesConfig.{nvml_library, amd_smi_library}`).
@@ -309,24 +321,121 @@ Interfaces:
 - `pub struct turbine_kv::reclaim::L0Reclaimer` (`KvReclaimer`; returns 0 — the P2 pool keeps no unreferenced cached blocks; phase-4 replaces it)
 - `pub enum GateOutcome { Admitted(SchedRequest, Reservation), Queued }`
 - `pub fn AdmissionGate::new(admission: Admission, queue: AdmissionQueue<SchedRequest>, controller: ControllerHandle, clock: Arc<dyn Clock>, max_running: u32) -> Self`; `offer(&mut self, r: SchedRequest) -> Result<GateOutcome, SubmitError>`; `expire(&mut self) -> Vec<SchedRequest>`; `pump(&mut self, max_new: usize) -> Vec<(SchedRequest, Reservation)>`; `remove(&mut self, id: RequestId) -> Option<SchedRequest>`; `reject_all(&mut self) -> Vec<SchedRequest>`; `retry_after_secs(&self, reason: RejectionReason) -> u64`; `queue_len()`; `admission_mut()`
-- `SubmitError::Rejected { reason: RejectionReason, retry_after_secs: u64 }`; `IterationLimits { …, allow_preempt: bool }`; `impl From<&ThrottlePlan> for IterationLimits`; `pub fn Scheduler::with_gate(self, gate: AdmissionGate) -> Self`; `pub fn Scheduler::queue_len(&self) -> usize`
+- `SubmitError::Rejected { reason: RejectionReason, retry_after_secs: u64 }`; `IterationLimits { …, allow_preempt: bool }`; `impl From<&ThrottlePlan> for IterationLimits`; `pub fn Scheduler::with_gate(self, gate: AdmissionGate) -> Self`; `pub fn Scheduler::queue_len(&self) -> usize`; `pub fn Scheduler::admitted_count(&self) -> usize` (running + waiting with a reservation: the count batch growth limits)
 - `SchedulerSnapshot::{token_limit(&self, SeqId) -> Option<u32>, remaining_tokens(&self) -> Vec<u32>, running_ids(&self) -> Vec<RequestId>, queued_ids(&self) -> Vec<RequestId>, is_idle(&self) -> bool}`
-- `sim::overload::{OverloadConfig { seed, pool_blocks, max_seq_len, params: SchedulerParams, cost: CostModel, reliability: ReliabilityConfig, rate_multiple, prompt_range, max_tokens_range }, Outcome::{Completed, Cancelled, Rejected(String), Failed(String)}, OverloadReport { kv_capacity_bytes, max_kv_committed_plus_reserved, preempted_below_survival, outcomes, max_queue_len, states, green_after_stop, final_circuit }, IterationReport { recovery, attempt_batch_sizes, failed_requests }, OverloadSim::{new, submit_now(prompt, max_tokens: Option<u32>) -> RequestId, cancel, step_iteration() -> IterationReport, run_for, run_until_done, run_load(load, quiet) -> OverloadReport, inject_oom_attempts(u32), outcome, stream_tail, running_ids, queued_ids, is_queued, pool_used_blocks, ledger_idle, mean_step_time, report}}`
+- `sim::overload::{OverloadConfig { seed, pool_blocks, max_seq_len, params: SchedulerParams, cost: CostModel, reliability: ReliabilityConfig, rate_multiple, prompt_range, max_tokens_range }, Outcome::{Completed, Cancelled, Rejected(String), Failed(String)}, OverloadReport { kv_capacity_bytes, max_kv_committed_plus_reserved, preempted_below_survival, red_growth /* RED plans after a RED plan whose admitted count rose; must be 0 */, outcomes, max_queue_len, states, green_after_stop, final_circuit }, IterationReport { recovery, attempt_batch_sizes, failed_requests }, OverloadSim::{new, config() -> &OverloadConfig, submit_now(prompt, max_tokens: Option<u32>) -> RequestId, cancel, step_iteration() -> IterationReport, run_for, run_until_done, run_load(load, quiet) -> OverloadReport, inject_oom_attempts(u32), outcome, stream_tail, running_ids, queued_ids, is_queued, pool_used_blocks, ledger_idle, mean_step_time, report}}`
 
 Covers: S-3 (scheduler side), S-9 (engine admission), S-10, S-11, S-17; `overload_sim cancellation_releases_reservations`, `overload_sim ten_x_overload`, `overload_sim active_generations_protected`, `overload_sim oom_recovery_bounded`.
 Depends on: Tasks 3, 7, 8, 10; phase-2 plan (`Scheduler`, `BlockPool`, `sim::{SimExecutor, CostModel, ArrivalProcess}`, `CancelReason::{QueueTimeout, CircuitOpen}`, `PreemptReason::SurvivalDecodeAlloc`, `turbine_tensor::host::HostMemory`).
 
 - [ ] Write failing test `crates/turbine-scheduler/tests/overload_sim.rs` `cancellation_releases_reservations`: with a 1,024-block pool, 100 queued and 100 running simulated requests (plus 100 short ones) are cancelled; after one `step_iteration` the `kv` ledger `used + reserved == 0`, workspace reservations 0 and `pool_used_blocks() == 0`.
-- [ ] Write failing test `ten_x_overload`: arrivals at 10 × service rate (prompts 64–6000, max tokens 16–1024, seed 7) for 600 virtual seconds then 120 s silence: `max_kv_committed_plus_reserved ≤ kv_capacity_bytes`, `preempted_below_survival == 0`, every outcome is completed/cancelled/rejected with a reject-table code (at least one `queue_full`/`queue_timeout`/`overloaded`), `max_queue_len ≤ 256`, some state ≥ ORANGE, GREEN + HEALTHY within 60 s of the load stopping.
+- [ ] Write failing test `ten_x_overload`: arrivals at 10 × service rate (prompts 64–6000, max tokens 16–1024, seed 7) for 600 virtual seconds then 120 s silence: `max_kv_committed_plus_reserved ≤ kv_capacity_bytes`, `preempted_below_survival == 0`, every outcome is completed/cancelled/rejected with a reject-table code (at least one `queue_full`/`queue_timeout`/`overloaded`), `max_queue_len ≤ 256`, the state reaches RED, `red_growth == 0`, completions ≥ 50 % of the capacity bound `config().service_rate() × 600` (688; amendment 2026-09-26 — measured 491 = 71 % with RED refilling finished slots, 16 with admit-nothing RED, 166 when the freeze counts only running requests), GREEN + HEALTHY within 60 s of the load stopping; the test prints served / `queue_full` / `queue_timeout` / `overloaded` / recovery time.
 - [ ] Write failing test `active_generations_protected`: 8 decodes of 4,000 tokens run 5 s, then 2,000 prefills of 6,000 tokens flood in; the 8 decodes' mean step time stays ≤ 1.5 × the pre-flood value, all 8 complete, no preemption below SURVIVAL.
 - [ ] Write failing test `oom_recovery_bounded`: OOM on the next 2 attempts → one `step_iteration` reports `Recovered { retries: 2 }` with 3 strictly shrinking attempt batch sizes; persistent OOM → 4 attempts (original + `max_retries` 3), `Failed`, every batch request `Failed("resource_exhausted")` with stream tail `data: {"error":{…"type":"server_error","code":"resource_exhausted"}}` then `data: [DONE]`; a fresh request afterwards completes.
 - [ ] Run: `cargo test -p turbine-scheduler --test overload_sim` — expect FAIL
 - [ ] Implement the KV side: `with_ledger` asserts the L0 pool fits the `kv` pool capacity; `allocate_reserved` allocates via the P2 `allocate` and `commit_bytes(n × block_bytes)` on the request's worst-case reservation (saturating, so blocks re-allocated after a recompute are not paid twice); releasing blocks never touches the ledger — dropping the request's `Reservation` does.
-- [ ] Implement the scheduler side: `AdmissionGate::offer` decides with the controller snapshot, reserves KV for an immediate admit only when the queue is empty, otherwise enqueues (full → `Rejected(QueueFull)`); `plan` first turns `expire()` into `dropped` with `CancelReason::QueueTimeout` and, when the circuit blocks readiness, `reject_all()` into `CancelReason::CircuitOpen`; P2 rule (2) preempts only when `limits.allow_preempt` (SURVIVAL, reason `SurvivalDecodeAlloc`); rule (3) scales chunk and prefill budget by the plan and replaces "admit waiting" by `gate.pump(max_new)` with `max_new = 0` when `!admit_new || shrink_only`, else `batch_growth_limit.min(max_running − running)`; pumped requests start prefill only when `start_new_prefills`. Without a gate the P2 behaviour is unchanged (`IterationLimits::default().allow_preempt == true`).
+- [ ] Implement the scheduler side: `AdmissionGate::offer` decides with the controller snapshot, reserves KV for an immediate admit only when the queue is empty and an admitted slot is free (`admitted < max_running` and within the plan's batch growth over `prev_admitted`, amendment 2026-09-26 — otherwise requests behind a full batch were admitted with reservations that never time out), otherwise enqueues (full → `Rejected(QueueFull)`); `plan` first turns `expire()` into `dropped` with `CancelReason::QueueTimeout` and, when the circuit blocks readiness, `reject_all()` into `CancelReason::CircuitOpen`; P2 rule (2) preempts only when `limits.allow_preempt` (SURVIVAL, reason `SurvivalDecodeAlloc`); rule (3) scales chunk and prefill budget by the plan and replaces "admit waiting" by `gate.pump(max_new)` with `max_new = 0` when `!admit_new || !start_new_prefills || shrink_only` (SURVIVAL), else `(prev_admitted + batch_growth_limit − admitted).min(max_running − admitted)` where `admitted = running + waiting` (every waiting request holds its reservation) and `prev_admitted` is the admitted count after the previous plan — so `Some(0)` (ORANGE, RED) refills finished slots without growth; `admit_new` is false only for `AdmissionMode::Stopped`; admitted requests start prefill as the budget allows, without a further growth check. Without a gate the P2 behaviour is unchanged (`IterationLimits::default().allow_preempt == true`).
 - [ ] Implement `sim::overload`: the real `Scheduler` + `AdmissionGate` + `PressureController` + `RecoveryController` on a `FakeClock`, a `BlockPool` over `HostMemory` with a 2-layer 2-head 64-dim BF16 layout (16,384 B blocks) linked to the ledger, virtual time advanced by the P2 `CostModel`, seeded `ChaCha8Rng` Poisson arrivals, synthetic telemetry every 100 ms from the ledger (`kv_utilization`, `queue_fill`), OOM injection that walks the same `on_oom` → `RecoveryStep` → `on_recovery` path the engine uses (Task 14).
 - [ ] Run: `cargo test -p turbine-scheduler --test overload_sim && cargo test -p turbine-scheduler && cargo tree -p turbine-scheduler | grep -E 'turbine-kernels|turbine-model'; test $? -eq 1` — expect PASS
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 - [ ] Commit: `feat(scheduler): admission gate, throttle overlay, ledger-backed KV and overload simulation`
+
+## Task 12a: SURVIVAL liveness and KV headroom (amendment 2026-09-27)
+
+Files: `crates/turbine-core/src/config/reliability.rs` (`SurvivalLiveness`, `reliability.recovery.survival_liveness`), `crates/turbine-core/src/config/tests.rs`, `crates/turbine-reliability/src/{throttle.rs, recovery.rs, controller.rs, admission.rs}`, `crates/turbine-scheduler/src/{scheduler.rs, gate.rs, request.rs, sim/overload.rs}`, `crates/turbine-scheduler/tests/overload_sim.rs`, `crates/turbine-server/src/{engine/loop.rs, reliability.rs}`, `crates/turbine-api/tests/api.rs`, `scripts/lab/phase3-novanas-soak.yaml`
+Interfaces:
+
+- `pub enum SurvivalLiveness { RequeueUnstarted /* default, option A */, ContinuePrefills /* option B */ }` (`turbine_core::config`, serde snake_case)
+- `ThrottlePlan.requeue_unstarted: bool`; `pub fn throttle::plan_with(state, &SchedulerLimits, SurvivalLiveness) -> ThrottlePlan`; `pub fn recovery::survival_plan(plan, &SchedulerLimits, SurvivalLiveness) -> ThrottlePlan`
+- `IterationLimits.requeue_unstarted: bool`; `CancelReason::Overloaded` (`"overloaded"`); `PressureReason::SurvivalRequeue` (`"survival_requeue"`)
+- `pub fn AdmissionGate::requeue(&mut self, r: SchedRequest, key: AdmissionKey, submit_no: u64) -> bool`; `pub fn Admission::record_requeue(&self, id: RequestId, est: &ResourceEstimate)`; `pub fn Admission::with_kv_headroom(self, kv: SignalThresholds) -> Self`
+
+Covers: S-9 (KV headroom), S-11 (SURVIVAL liveness); `overload_sim survival_liveness_seed_6`, `survival_liveness_seed_1`, `survival_liveness_option_b`, `survival_requeues_unstarted_admitted`, `admission::tests::kv_headroom`, `recovery::tests::survival_plan_switch`.
+Depends on: Tasks 7, 8, 10, 12, 14; decision "Phase 3: SURVIVAL liveness fix" (provisional A, pending user review).
+
+- [ ] Write failing tests `overload_sim survival_liveness_seed_6` (the `ten_x_overload` workload, seed 6, passes through SURVIVAL and is GREEN + HEALTHY within 60 s of the load stopping with every overload invariant) and `survival_liveness_seed_1` (seed 1, same criterion), `survival_liveness_option_b` (both seeds under `continue_prefills`), `survival_requeues_unstarted_admitted` (an OOM-triggered SURVIVAL requeues exactly the admitted requests that had not started and releases their reservations; all complete afterwards).
+- [ ] Run: `cargo test -p turbine-scheduler --test overload_sim survival_` — expect FAIL (seed 6 stays in SURVIVAL with 0.934 of the pool reserved; seed 1 recovers in 64 s: its end-of-load backlog re-escalates YELLOW → RED).
+- [ ] Implement option A behind `reliability.recovery.survival_liveness` (default `requeue_unstarted`): the SURVIVAL throttle plan sets `requeue_unstarted`; `Scheduler::plan` then returns each admitted request that was never given a running slot to the gate's queue at its policy key and original arrival, dropping its reservation (`survival_requeue` queue decision, INFO `survival_requeue`), or answers it `overloaded` when the queue is full; option B (`continue_prefills`) instead gives SURVIVAL RED's prefill budget and chunk floor with no new starts.
+- [ ] Implement the KV headroom rule: with adaptive admission, in YELLOW, ORANGE and RED `decide`, `evaluate` and `evaluate_refill` answer `Queue(kv_reservation)` when the worst-case reservation would lift `kv_utilization` past the next state's `kv_utilization` threshold (`with_kv_headroom(effective_thresholds(..)[KvUtilization])` in the server and the simulator).
+- [ ] Run: `cargo test -p turbine-scheduler --test overload_sim && cargo test -p turbine-reliability && cargo test -p turbine-core config::tests::reliability_config_validation` — expect PASS; `cargo test --release -p turbine-scheduler --test overload_sim survival_liveness_sweep -- --ignored --nocapture` prints seeds 1–12 under both options (measured: every seed GREEN + HEALTHY 42–49 s after the load stops; seed 6: 42.9 s under A, 46.9 s under B).
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus `--all-features`)
+- [ ] Commit: `fix(reliability): SURVIVAL requeues unstarted admitted requests; admissions keep KV headroom`
+
+## Task 12b: device_memory counts idle pre-allocated pools as free (amendment 2026-09-27)
+
+Files: `crates/turbine-reliability/src/{signals.rs, controller.rs}`, `crates/turbine-scheduler/src/sim/overload.rs`
+Interfaces:
+
+- `pub struct DeviceMemoryInput { device: DeviceId, memory_kind: MemoryKind, budget_bytes: u64, idle_preallocated_bytes: u64 }` replaces the `(DeviceId, MemoryKind, u64)` tuple of `SignalInputs.devices`; `device_memory` = (used − `idle_preallocated_bytes`) / `budget_bytes`
+- `PressureController::tick` fills `idle_preallocated_bytes` from the ledger: `kv` pool `available()` + `reserve` pool `used`
+
+Covers: S-6 (`device_memory` definition), S-19 (the soak's calibration); `signals::tests::device_memory_counts_idle_preallocated_bytes_as_free`, `controller::tests::idle_full_budget_kv_pool_stays_green`, `overload_sim` with device memory reported.
+Depends on: Tasks 2, 10, 12, 12a; decision "Phase 3: device_memory counts idle pre-allocated pools as free" (provisional, pending user review).
+
+- [ ] Write failing tests `signals::tests::device_memory_counts_idle_preallocated_bytes_as_free` (the novanas soak startup figures: budget 33,908,850,688, KV pool 23,188,383,744, reserve 2 GiB, 0.972 of the budget measured used → GREEN when idle, 0.972 RED when nothing is idle), `controller::tests::idle_full_budget_kv_pool_stays_green` (30 GiB budget, KV pool the remainder, 28.7 GiB used at idle → GREEN, value = weights + runtime) and make the overload simulation's device sample report memory used (the whole KV pool, the reserve while held, half the workspace).
+- [ ] Run: `cargo test -p turbine-reliability && cargo test -p turbine-scheduler --test overload_sim` — expect FAIL (both unit tests; `ten_x_overload` and the three `survival_liveness_*` cases never return to GREEN).
+- [ ] Implement `DeviceMemoryInput` and the subtraction in `SignalEvaluator::evaluate`; the controller computes the idle bytes from the ledger each tick.
+- [ ] Run: the same — expect PASS; `survival_liveness_sweep -- --ignored --nocapture` unchanged (seeds 1–12 GREEN + HEALTHY 42–49 s after the load stops).
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus the `fault-injection` feature)
+- [ ] Run: `scripts/bench-lock.sh scripts/overload-soak.sh novanas` — expect exit 0 and `"pass": true`.
+- [ ] Commit: `fix(reliability): device_memory counts idle pre-allocated KV and reserve as free`
+
+## Task 12c: Soak stall — drift per iteration, stale drift, idle floor (amendment 2026-09-27)
+
+Files: `crates/turbine-reliability/src/{step_window.rs (new), controller.rs, admission.rs, lib.rs}`, `crates/turbine-scheduler/src/{gate.rs, scheduler.rs, sim/overload.rs}`, `crates/turbine-scheduler/tests/overload_sim.rs`, `crates/turbine-server/src/engine/loop.rs`
+Interfaces:
+
+- `pub struct step_window::DecodeStepWindow { fn new(), fn observe(prefill_tokens: u32, decode_tokens: u32, secs: f64), fn p95() -> Option<f64> }` (window of 64 pure decode iterations; the engine and the simulator both feed it)
+- `pub fn Admission::evaluate_idle(&self, est, state, circuit) -> AdmissionDecision`; `pub fn AdmissionGate::pump(&mut self, max_new: usize, idle: bool)`
+- `OverloadConfig.degraded_during_load: bool`; `OverloadReport.max_idle_with_queue: Duration`; the simulator sends `CircuitEvent::Iteration` like the server's pressure thread
+
+Covers: S-6 (`step_time_drift`), S-10 (work-conserving floor), S-12 (latency drift), S-19; `step_window::tests::batch_size_is_not_drift`, `controller::tests::drift_is_not_judged_while_idle`, `overload_sim soak_workload_keeps_serving`, `degraded_circuit_keeps_serving`, `ten_x_overload` (idle-with-queue bound).
+Depends on: Tasks 10, 12, 12a, 12b, 14; decision "Phase 3: soak stall — drift per iteration, idle floor" (provisional, pending user review).
+
+- [ ] Write failing tests `step_window::tests::batch_size_is_not_drift` (the same iteration time at batch 16 and batch 1 is the same step time), `controller::tests::drift_is_not_judged_while_idle` (YELLOW on 1.95 × baseline drift; with nothing running the state returns to GREEN and no drift signal is emitted), `overload_sim degraded_circuit_keeps_serving` (the soak workload at 4× with the circuit held DEGRADED: never idle > 1 s with requests queued) and `soak_workload_keeps_serving` (seeds 1 and 7); make the simulator send `CircuitEvent::Iteration` and feed `DecodeStepWindow`.
+- [ ] Run: `cargo test --release -p turbine-reliability -p turbine-scheduler` — expect FAIL (the window test; the circuit ends DEGRADED in the SURVIVAL liveness cases; `degraded_circuit_keeps_serving` idles 4.2 s with requests queued; the drift test stays YELLOW).
+- [ ] Implement: the window records the iteration time (not divided by the batch); the controller ignores drift and does not learn its baseline while nothing runs; the scheduler pumps at least one slot with `idle = true` while nothing is admitted, and the gate decides those with `evaluate_idle` (INFO `admission_decision` reason `idle_floor`); the simulator's RED-growth count exempts 0 → 1.
+- [ ] Run: the same — expect PASS; `survival_liveness_sweep` unchanged (42–49 s).
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus the `fault-injection` feature)
+- [ ] Run: `scripts/bench-lock.sh scripts/overload-soak.sh novanas` — expect exit 0 and `"pass": true`.
+- [ ] Commit: `fix(reliability): drift per decode iteration, none while idle; admission floor when nothing is admitted`
+- [ ] Soak config (decision "Phase 3: soak config max_batch_tokens"): `scripts/lab/phase3-novanas-soak.yaml` `scheduler.max_batch_tokens: 2048` (the Phase 2c value its header names); commit `fix(scripts): soak config uses the Phase 2c max_batch_tokens`.
+
+## Task 12d: Latency drift feeds the circuit only in GREEN (amendment 2026-09-27)
+
+Files: `crates/turbine-reliability/src/controller.rs`
+Interfaces: none changed; `PressureController::tick` sends `CircuitEvent::LatencyDrift` only while the pressure state is GREEN.
+
+Covers: S-12 (latency drift trigger), S-19; `controller::tests::drift_under_pressure_leaves_the_circuit`.
+Depends on: Task 12c; decision "Phase 3: soak config max_batch_tokens" (answer: option 1 tried and reverted, option 2 provisional).
+
+- [ ] Write failing test `controller::tests::drift_under_pressure_leaves_the_circuit`: with pressure ORANGE from KV, a 2.5× and then a 5× drift spike leave the circuit HEALTHY; the same 2.5× spike in GREEN makes it DEGRADED.
+- [ ] Run: `cargo test -p turbine-reliability controller::tests` — expect FAIL (the circuit goes DEGRADED under pressure).
+- [ ] Implement: `tick` gates the `LatencyDrift` circuit event on `machine.state() == Green`; the `step_time_drift` signal is unchanged.
+- [ ] Run: `cargo test --workspace` and `overload_sim -- --include-ignored` — expect PASS (sweep unchanged, 42–49 s).
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus the `fault-injection` feature)
+- [ ] Run: `scripts/bench-lock.sh scripts/overload-soak.sh novanas` — expect exit 0 and `"pass": true`.
+- [ ] Commit: `fix(reliability): latency drift feeds the circuit only in GREEN`
+
+## Task 12e: Per-shape drift baselines (amendment 2026-09-27)
+
+Files: `crates/turbine-reliability/src/{step_window.rs, controller.rs}`, `crates/turbine-scheduler/src/{scheduler.rs, sim/overload.rs}`, `crates/turbine-server/src/engine/loop.rs`
+Interfaces:
+
+- `pub struct step_window::StepSample { prefill_tokens: u32, rows: u32, context_tokens: u64, secs: f64 }`; `DecodeStepWindow::observe(&mut self, StepSample, calm: bool)`, `reset()`, `p95()` (ratio over the bucket baseline); `pub const MIN_BUCKET_SAMPLES: u32 = 8`
+- `EngineStats.step_time_p95` (was `step_time_p95_s`, seconds): the ratio; the controller keeps no baseline of its own. `pub fn IterationPlan::decode_context_tokens(&self) -> u64`
+- PROBING → HEALTHY resets the window (the engine on its next snapshot, the simulator on the probe's circuit transition)
+
+Covers: S-6 (`step_time_drift`), S-12; `step_window::tests::moe_full_batch_is_not_drift`, `same_bucket_slowdown_is_drift`, `unseen_shapes_and_prefills_are_not_judged`, `context_buckets`.
+Depends on: Tasks 12c, 12d; decision "Phase 3: per-shape drift baselines (OLMoE landing regression)" (provisional).
+
+- [ ] Write failing tests: an MoE-like step (time grows with rows) at a full batch of 16 reads 1.0 after a calm ramp over 1..16 rows; the same shape at twice the time reads 2.0; a shape without 8 calm steps, an unseen shape and a prefill are not judged.
+- [ ] Run: `cargo test -p turbine-reliability step_window` — expect FAIL.
+- [ ] Implement the buckets (exact rows × `floor(2 · log2(context/1024 + 1))`), an EWMA baseline per bucket (α 0.1) from calm steps, the ratio judged before the update; the controller's drift is the window's p95 while decoding.
+- [ ] Run: `cargo test --workspace`, `overload_sim -- --include-ignored` (sweep unchanged); mutation check: one bucket for every shape fails the MoE, unseen-shape and bucket tests.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus the `fault-injection` feature)
+- [ ] Run: `scripts/lab-bench.sh --gpu 1 --model olmoe` (≥ 599 tok/s, no `step_time_drift` transition in `metrics.txt`) and `--model llama`; then `scripts/bench-lock.sh scripts/overload-soak.sh novanas`.
+- [ ] Commit: `fix(reliability): drift baselines per step shape`
 
 ## Task 13: Pressure route, readiness, admission errors and metrics in turbine-api
 
@@ -359,7 +468,7 @@ Interfaces:
 - `pub struct DeviceReserve` (`ReserveAllocator` over `DeviceBuffer::alloc(&Arc<dyn DeviceMemory>, bytes)`; `free` drops the buffer)
 - `pub struct EngineLedgerProbe { ledger: Arc<Ledger>, device: DeviceId, queue_len: Arc<AtomicU32>, max_queue: u32 }` (`LedgerProbe`)
 - `pub fn api_error_for(reason: RejectionReason, retry_after_secs: u64) -> ApiError`
-- `pub fn spawn_controller(controller: PressureController, latest: LatestSample, stats: Arc<ArcSwap<EngineStats>>, interval: Duration) -> JoinHandle<()>` (runs `tick` per fast tick under `catch_unwind`; a panic calls `on_circuit_event(ControllerFailed)` → SURVIVAL + CIRCUIT_OPEN `controller_failed`)
+- `pub fn spawn_controller(controller: Arc<Mutex<PressureController>>, latest: LatestSample, stats: Arc<ArcSwap<EngineStats>>, interval: Duration, wake: WeakSender<EngineCommand>, stop: Arc<AtomicBool>) -> io::Result<JoinHandle<()>>` (amended 2026-09-26: the engine thread shares the controller behind one mutex for `on_oom` / `on_recovery` / circuit events — never per token — and the thread wakes the idle engine on a circuit change so PROBING starts its probes; runs `tick` per fast tick under `catch_unwind`, reporting new engine iterations as `CircuitEvent::Iteration`; a panic calls `on_circuit_event(ControllerFailed)` → CIRCUIT_OPEN `controller_failed`, fatal: the engine drains up to `drain_timeout` and the process exits 3)
 - `#[cfg(feature = "fault-injection")] pub struct FaultyVendor { inner: Box<dyn VendorTelemetry>, temperature_c: Option<f64>, delay: Option<Duration> }` and `FaultyExecutor` wrapping `ModelExecutor::forward` with `FaultInjector::iteration_fault`
 - `ExitCode::DeviceFatal = 3`; `KernelError::is_sticky()`, `KernelError::is_oom()` (P3 in turbine-kernels, contract §7.1)
 
@@ -434,7 +543,7 @@ Depends on: Task 14; phase-1 plan (novanas GPU lab path), phase-2b plan (Spark C
 
 ## Task 18: Overload soak script and soak runs
 
-Files: `scripts/overload-soak.sh` (new: precondition → build/start → calibrate → overload → cool-down → verdict → cleanup), `scripts/lab/novanas-soak-job.yaml` (new: k3s Job `turbine-lab-soak`, namespace `turbine-ci`, `amd.com/gpu: 1`, ROCm hostPath `/opt/rocm/rocm`, model read-only), `benches/turbine-bench/tests/lab_scripts.rs` (test `soak_precondition_refuses_busy_gpu`)
+Files: `scripts/overload-soak.sh` (new: precondition → build/start → calibrate → overload → cool-down → verdict → cleanup), `scripts/lab/phase3-novanas-soak.yaml` (new, amended 2026-09-26: the server config the soak serves through `scripts/lab-serve.sh novanas`, whose k3s Job `turbine-lab-serve-<run id>` already is namespace `turbine-ci`, `amd.com/gpu: 1`, ROCm hostPath `/opt/rocm/rocm`, model read-only — instead of a second Job template; the trap stops only that run with `lab-serve.sh novanas --stop <run id>`; the novanas precondition reads amdgpu sysfs `mem_info_vram_used`), `benches/turbine-bench/tests/lab_scripts.rs` (test `soak_precondition_refuses_busy_gpu`)
 Interfaces:
 
 - `scripts/overload-soak.sh <novanas|dgx-spark|dgx-spark2> [--duration <dur>=10m] [--model <path>=/home/piwi/turbine-models/llama-3.2-3b-instruct]`

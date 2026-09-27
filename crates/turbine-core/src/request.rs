@@ -54,6 +54,13 @@ pub enum ErrorCode {
     ShuttingDown,
     RequestTimeout,
     SlowClient,
+    // Phase 3
+    /// SURVIVAL: new requests are refused (503).
+    Overloaded,
+    /// The circuit breaker is open, draining or probing (503).
+    CircuitOpen,
+    /// Device OOM recovery retries exhausted (503; mid-stream a `server_error` event).
+    ResourceExhausted,
 }
 
 impl ErrorCode {
@@ -80,6 +87,9 @@ impl ErrorCode {
             ErrorCode::ShuttingDown => "shutting_down",
             ErrorCode::RequestTimeout => "request_timeout",
             ErrorCode::SlowClient => "slow_client",
+            ErrorCode::Overloaded => "overloaded",
+            ErrorCode::CircuitOpen => "circuit_open",
+            ErrorCode::ResourceExhausted => "resource_exhausted",
         }
     }
 }
@@ -328,6 +338,12 @@ mod tests {
             "context_exceeds_kv_capacity"
         );
         assert_eq!(ErrorCode::QueueFull.as_str(), "queue_full");
+        assert_eq!(ErrorCode::Overloaded.as_str(), "overloaded");
+        assert_eq!(ErrorCode::CircuitOpen.as_str(), "circuit_open");
+        assert_eq!(
+            serde_json::to_value(ErrorCode::ResourceExhausted).unwrap(),
+            serde_json::json!("resource_exhausted")
+        );
         assert_eq!(
             serde_json::to_value(ErrorCode::InvalidJsonSchema).unwrap(),
             "invalid_json_schema"

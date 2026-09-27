@@ -8,6 +8,9 @@ pub enum ExitCode {
     Startup = 1,
     /// Invalid configuration or CLI usage.
     Config = 2,
+    /// The circuit breaker saw a sticky (context-corrupting) device error or lost its
+    /// pressure controller (P3 S-12): drained, then exited for a supervisor to restart.
+    DeviceFatal = 3,
 }
 
 impl From<ExitCode> for std::process::ExitCode {

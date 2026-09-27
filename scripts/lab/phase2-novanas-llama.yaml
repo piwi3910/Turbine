@@ -21,4 +21,3 @@ scheduler:
   max_batch_tokens: 8192
   prefill_chunk_tokens: 2048
   max_queued_requests: 256
-  queue_timeout: 60s

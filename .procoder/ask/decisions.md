@@ -464,3 +464,65 @@ Card profiles:
 - B) Let in-flight prefills continue in SURVIVAL (changes the spec's SURVIVAL row)
 
 **Answer (2026-09-27): provisional (coordinator default, pending user review) — A.** Implemented behind the recovery controller so B can be switched in; the overload simulation seeds that exposed the gap (seed 6 stuck in SURVIVAL, seed 1 recovering in 64 s against the 60 s criterion) become regression tests.
+
+**Implemented (2026-09-27, branch `phase-3-reliability`, Task 12a):** `reliability.recovery.survival_liveness: requeue_unstarted` (A, default) | `continue_prefills` (B). A requeues at the request's original turn and queue-wait start (`survival_requeue` queue decision; `503 overloaded` if the queue is full). Regression tests `overload_sim survival_liveness_seed_6`, `survival_liveness_seed_1`, `survival_liveness_option_b`, `survival_requeues_unstarted_admitted`. Seed 6 recovers in 42.9 s under A (46.9 s under B); disabling the requeue brings back the stuck state (0.934 of the pool held, never GREEN). Seed 1 never entered SURVIVAL: its 64 s came from the backlog re-escalating YELLOW → RED, fixed by the KV headroom rule below.
+
+## Phase 3: KV headroom in admission (seed 1 recovery)
+
+The overload simulation's seed 1 recovered 64 s after the load stopped (criterion 60 s) without ever reaching SURVIVAL: de-escalating through YELLOW, its growth limit (+1 admitted request per iteration) admitted the queued backlog within seconds, the worst-case reservations lifted `kv_utilization` to 0.92 and the state went back to RED.
+
+- A) KV headroom: with adaptive admission, in YELLOW, ORANGE and RED an admission or refill waits (`kv_reservation`) when its reservation would lift `kv_utilization` past the next state's threshold; GREEN unchanged (recommended)
+- B) Slow YELLOW's batch growth (e.g. +1 per second instead of per iteration)
+- C) Relax the 60 s recovery criterion
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Seeds 1–12 all recover in 42–49 s; completions change from 137–548 to 247–581 per seed (seed 8: 408 → 346, seeds 10–12 up to 2×); GREEN admission, and so the Phase 2c throughput path below pressure, is unchanged. Spec S-9 amended; test `admission::tests::kv_headroom`.
+
+## Phase 3: device_memory counts idle pre-allocated pools as free
+
+The first 10-minute soak on novanas (`scripts/overload-soak.sh novanas`, 2026-09-27) failed its calibration: every request answered `503 queue_timeout`. The soak config leaves `kv.gpu.max_bytes` at its default (null), so the `kv` pool is the rest of the budget and is allocated at startup. 200 ms after `/ready`, with no load, the log showed `pressure_transition GREEN → RED signal=device_memory value=0.972 threshold=0.95`, and RED admitted nothing. `device_memory` was device used / budget, and the device reports the pre-allocated KV pool and emergency reserve as used whether they hold data or not. The Phase 2c lab configs cap the pool at 8 GiB (about 0.54 at idle), which is why lab-bench never hit this, and the overload simulation never reported device memory.
+
+- A) `device_memory` = (device used − idle pre-allocated bytes) / budget, where idle pre-allocated = free `kv` pool bytes + the emergency reserve while held. Same denominator and thresholds; a full pool reads as before; releasing or re-acquiring the reserve does not move it (recommended)
+- B) Cap `kv.gpu.max_bytes` in the soak config (leaves the default config RED at idle)
+- C) Measure only the memory outside the pre-allocated pools (weights, workspace, runtime, co-tenants) against its own budget (about 2 GiB of slack on the R9700, so a few hundred MB of transient workspace would move it tens of percent)
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Idle novanas soak startup: 0.972 → about 0.22 (GREEN). Spec signal table amended, plan Task 12b, contract §8.3 row. Tests `signals::tests::device_memory_counts_idle_preallocated_bytes_as_free`, `controller::tests::idle_full_budget_kv_pool_stays_green`; the overload simulation now reports device memory (without A, `ten_x_overload` and the SURVIVAL liveness seeds never return to GREEN; with A, seeds 1–12 still recover in 42–49 s).
+
+## Phase 3: soak stall — drift per iteration, idle floor
+
+With `device_memory` fixed, the second 10-minute soak on novanas (2026-09-27) calibrated (4R = 7.64 req/s) and then stalled. During the overload `/turbine/v1/scheduler` showed 222 waiting, 0 prefilling and 0 decoding. The circuit was DEGRADED (`latency_drift`) from the calibration, the state ORANGE on `queue_fill` 0.87, and the batch growth limit 0. Of the overload requests, 9 completed and 4,534 ended `queue_timeout`. In the cool-down the state stayed ORANGE for all 5 minutes. Three defects:
+
+1. `step_time_drift` divided the iteration time by the batch size. Decode is memory-bound (ITL p50 17.6 ms at concurrency 16, 20 ms at 4), so a batch shrinking from 4 to 1 read as a 4× slowdown and put the circuit in DEGRADED.
+2. DEGRADED and ORANGE queue prefills above `large_prefill_tokens` (three quarters of the soak's arrivals). A slot the blocked queue head could not refill was lost, because the next growth limit is measured from the lower admitted count. The count drained to 0, and ORANGE's freeze then held an idle engine behind a full queue whose `queue_fill` kept the state ORANGE.
+3. With nothing decoding, the drift window kept its last p95 (1.95 × baseline), above ORANGE's exit threshold (1.9), so the state never de-escalated.
+
+Options:
+
+- A) Drift is the p95 time of a pure decode iteration, not computed while nothing runs. Add a work-conserving floor: while nothing is admitted, below SURVIVAL, the gate admits the first queued request that passes the KV checks whatever its pressure reason (`idle_floor`) (recommended)
+- B) A, plus keep a frozen admitted target in ORANGE/RED so deferred refills are not lost (larger change; RED's "never rises between plans" rule, user decision 2026-09-26, would need rewording)
+- C) Drop `queue_fill` as a pressure signal (spec table change; does not fix the drain to 0)
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Spec signal table (`step_time_drift`) and batch-growth paragraph amended, plan Task 12c, contract §8.3 note. The simulator now sends the server's `Iteration` circuit events and uses the engine's drift window. With the old formula the three SURVIVAL liveness cases end DEGRADED; without the floor, `degraded_circuit_keeps_serving` idles 4.2 s with requests queued. With A: `ten_x_overload` is unchanged (493 completions, GREEN 42.7 s after the stop), the soak workload completes 842–844 requests (capacity bound 688) and is back to GREEN + HEALTHY in 40–42 s, and seeds 1–12 still recover in 42–49 s.
+
+## Phase 3: soak config max_batch_tokens
+
+With the `device_memory`, drift and idle-floor fixes, the third 10-minute soak on novanas (2026-09-27) served through the overload (1,933 completions; states YELLOW → SURVIVAL → back; GREEN + HEALTHY 59 s into the cool-down) but failed `itl_p99_within_2x`: overload ITL p50 163 ms and p99 545 ms, against a calibration p99 of 185 ms. `scripts/lab/phase3-novanas-soak.yaml` set `scheduler.max_batch_tokens: 8192` while its header says "the Phase 2c lab values", and Phase 2c uses 2,048 (spec S-12 of Phase 2c: 2,048 batch tokens put TTFT at a fifth for the same throughput). With 8,192, four 2,048-token prefill chunks join every overload iteration, and each running sequence waits for them.
+
+- A) Use the Phase 2c value, 2,048, in the soak config (recommended)
+- B) Keep 8,192 and relax the ITL criterion
+- C) Shrink the prefill budget further under pressure (a throttle-table change)
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Fourth soak: calibration 4R = 8.46 req/s; overload ITL p99 189 ms against 170 ms in calibration (passes); 4,826 × 200, 3,734 `queue_timeout`, 171 `queue_full`, 74 `overloaded`, no incomplete stream; KV idle and the reserve held after the cool-down; reached RED and SURVIVAL. It still failed `green_within_60s` (61 s). A `step_time_drift` spike (≥ 2.0 for two samples) 20 s after the queue emptied, while the last long-context sequences drained, put the circuit in DEGRADED (`latency_drift`). DEGRADED holds the floor at YELLOW until `reliability.circuit.window` (60 s) passes without a trigger, so any drift trigger in the last seconds of the load makes the 60 s criterion unreachable. Open question for the user, not decided here: `step_time_drift` compares raw decode-iteration time with a baseline learned under light load, so a full batch of long contexts (more KV read per step) reads as device degradation. Either normalise drift by the work of the step, or keep drift out of the circuit while pressure is above GREEN, or relax the criterion to `window` + dwell.
+
+**Answer to the open question (2026-09-27): provisional (coordinator, pending user review) — option 1, tried and reverted.** Implemented as b6a398f: drift = each pure decode step's time over a work-cost model's prediction, `a + b · rows + c · context tokens`, fitted by weighted least squares on GREEN + HEALTHY steps. The fifth soak (4R = 8.67 req/s, ITL p99 319 ms against 167 ms) never returned to GREEN in the 5-minute cool-down. During the overload the model predicted the heavy steps at a fifth to a seventh of their time, so the circuit was DEGRADED for 471 of 692 timeline samples (12 in the fourth soak) and opened on `latency_drift` (≥ 4.0). In the cool-down every 16-token circuit probe re-opened it: the 64-step window still held about 48 overload steps at 5–7× the prediction. The model is fitted on calibration steps (at most 4 rows, context growing with rows, heavy-tailed noise), which do not identify the rows and context terms well enough to extrapolate to 20+ long-context rows. Reverted (bf8afed), so the branch is back at the fourth soak's state (all checks but `green_within_60s`, 61 s). Still open for the user: whether to pursue option 1 with per-step telemetry to fit the model (and a window cleared when the circuit starts probing), keep drift out of the circuit while pressure is above GREEN (option 2), or relax the criterion to `window` + dwell (option 3).
+
+**Answer (2026-09-27): provisional (coordinator, under "Continue through the phases unattended", pending user review) — option 2.** Option 1 was tried and reverted (above). `latency_drift` feeds the circuit breaker only while the pressure state is GREEN: the pressure controller owns load and the circuit owns device health. Drift still raises the `step_time_drift` pressure signal in every state and still degrades or opens the circuit in GREEN; the probe and drain logic are unchanged. Spec (circuit transitions), plan Task 12d, contract §8.3 note; test `controller::tests::drift_under_pressure_leaves_the_circuit`. Note from the coordinator: GPU 1's PCIe root port 00:01.1 had fallen back to Gen1 (2.5 GT/s) during soaks 1–4; it was retrained to Gen5 x8 during soak 5.
+
+## Phase 3: per-shape drift baselines (OLMoE landing regression)
+
+Landing the soak fixes (branch `phase-3-reliability-land`, d6d5e1d), the coordinator's lab-bench on GPU 0 measured Llama at 771.9 tok/s (unchanged) but OLMoE at 545.6 tok/s against 617.4 (−12 %). `turbine_pressure_transitions_total` showed GREEN → ORANGE and YELLOW → ORANGE on `step_time_drift`, the circuit went HEALTHY → DEGRADED (`latency_drift`) and back, and admission queued. 915d30b's drift took the raw decode-iteration time against a single light-load baseline. That holds roughly for dense Llama but not for MoE, whose expert GEMMs grow with the rows, so a full batch read as drift.
+
+- A) One calm baseline per shape bucket (exact decoding rows × total context tokens in half-powers of two), judged only against its own bucket once it has enough calm samples; no extrapolation across buckets (recommended; coordinator default)
+- B) A work-cost model (option 1 of the soak question: tried and reverted)
+- C) Divide by the batch again (the calibration's shrinking batches then read as drift)
+
+**Answer (2026-09-27): provisional (coordinator default, pending user review) — A.** The idle rule, the admission floor and option 2 stay. Spec signal table, plan Task 12e, contract §8.3 note; tests `step_window::tests::moe_full_batch_is_not_drift`, `same_bucket_slowdown_is_drift`, `unseen_shapes_and_prefills_are_not_judged`, `context_buckets`.

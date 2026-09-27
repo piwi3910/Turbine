@@ -4,6 +4,7 @@
 mod byte_size;
 mod duration;
 mod overrides;
+mod reliability;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use serde_norway::{Mapping, Value};
 
 pub use byte_size::ByteSize;
 pub use duration::HumanDuration;
+pub use reliability::*;
 
 use crate::registry::valid_name;
 use crate::types::DeviceId;
@@ -207,7 +209,7 @@ impl Default for KvConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct KvGpuConfig {
     pub enabled: bool,
-    /// L0 block-pool size (Phase 2, default 8GiB). Null is allowed; from Phase 3 null means
+    /// L0 block-pool cap. Null (the default from Phase 3; Phase 2 defaulted to 8GiB) means
     /// the `kv` pool remainder of the budget (CONFLICT C-8).
     pub max_bytes: Option<ByteSize>,
 }
@@ -216,7 +218,7 @@ impl Default for KvGpuConfig {
     fn default() -> Self {
         KvGpuConfig {
             enabled: true,
-            max_bytes: Some(ByteSize::gib(8)),
+            max_bytes: None,
         }
     }
 }
@@ -255,24 +257,6 @@ impl Default for KvNvmeConfig {
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields, default)]
-pub struct ReliabilityConfig {
-    pub enabled: bool,
-    pub emergency_vram_reserve: ByteSize,
-    pub adaptive_admission: bool,
-}
-
-impl Default for ReliabilityConfig {
-    fn default() -> Self {
-        ReliabilityConfig {
-            enabled: true,
-            emergency_vram_reserve: ByteSize::gib(2),
-            adaptive_admission: true,
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug)]
-#[serde(deny_unknown_fields, default)]
 pub struct SchedulerConfig {
     /// `false` forces one running request (`Config::effective_max_running`).
     pub continuous_batching: bool,
@@ -282,10 +266,12 @@ pub struct SchedulerConfig {
     /// Per-iteration token budget (decodes + prefill chunks).
     pub max_batch_tokens: u32,
     pub prefill_chunk_tokens: u32,
-    /// Waiting-queue bound and HTTP→engine submission-channel capacity (Phase 2, C-1).
+    /// HTTP→engine submission-channel capacity (from Phase 3 only that, C-1).
     pub max_queued_requests: u32,
-    /// Longest wait in the queue before 503 `queue_timeout` (Phase 2 only, C-1).
-    pub queue_timeout: HumanDuration,
+    /// Removed in Phase 3 (CONFLICT C-1): the admission queue's
+    /// `reliability.admission.queue_timeout` bounds queue wait. Parsed only so `validate`
+    /// rejects it naming the key.
+    pub queue_timeout: Option<Value>,
     /// Scheduling policy (Phase 2m): a `scheduling_policy` registry name.
     pub policy: ModuleName,
 }
@@ -299,7 +285,7 @@ impl Default for SchedulerConfig {
             max_batch_tokens: 8192,
             prefill_chunk_tokens: 2048,
             max_queued_requests: 256,
-            queue_timeout: HumanDuration::from_secs(60),
+            queue_timeout: None,
             policy: ModuleName::fixed("default"),
         }
     }
@@ -529,6 +515,13 @@ impl Config {
         if self.model.max_seq_len == Some(0) {
             return Err(invalid("model.max_seq_len", "must be at least 1"));
         }
+        if self.scheduler.queue_timeout.is_some() {
+            return Err(invalid(
+                "scheduler.queue_timeout",
+                "removed in phase 3: use reliability.admission.queue_timeout",
+            ));
+        }
+        self.reliability.validate(self.kv.block_tokens)?;
         if let Err(e) = tracing_subscriber::EnvFilter::try_new(&self.logging.level) {
             return Err(invalid(
                 "logging.level",
@@ -605,7 +598,6 @@ impl Config {
                 "server.slow_client_timeout",
                 self.server.slow_client_timeout,
             ),
-            ("scheduler.queue_timeout", self.scheduler.queue_timeout),
             (
                 "structured_output.compile_timeout",
                 self.structured_output.compile_timeout,

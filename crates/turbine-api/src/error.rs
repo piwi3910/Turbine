@@ -167,8 +167,8 @@ impl ApiError {
         )
     }
 
-    /// 429 `rate_limit_error`/`queue_full` with `retry-after: 1`: the waiting queue is at
-    /// `scheduler.max_queued_requests`.
+    /// 429 `rate_limit_error`/`queue_full` with `retry-after: 1`: the waiting queue is full
+    /// (Phase 2 `scheduler.max_queued_requests`, from Phase 3 `reliability.admission.max_queue`).
     pub fn queue_full() -> Self {
         Self::from_code(
             ErrorCode::QueueFull,
@@ -176,12 +176,41 @@ impl ApiError {
         )
     }
 
-    /// 503 `service_unavailable`/`queue_timeout`: waited longer than `scheduler.queue_timeout`.
+    /// 503 `service_unavailable`/`queue_timeout`: waited longer than
+    /// `reliability.admission.queue_timeout` (CONFLICT C-1).
     pub fn queue_timeout() -> Self {
         Self::from_code(
             ErrorCode::QueueTimeout,
-            "the request waited longer than scheduler.queue_timeout before it could start",
+            "the request waited longer than reliability.admission.queue_timeout before it could start",
         )
+    }
+
+    /// An admission or recovery error (P3 reject table, contract §14.3): status and `type`
+    /// from the code — `context_exceeds_kv_capacity` 400 `invalid_request_error`, `queue_full`
+    /// 429 `rate_limit_error`, `queue_timeout` / `overloaded` / `circuit_open` 503
+    /// `service_unavailable`, `resource_exhausted` 503 `server_error` — with `Retry-After` set to
+    /// `retry_after` seconds (at least 1) when given and absent otherwise.
+    pub fn overload(code: ErrorCode, retry_after: Option<u64>) -> Self {
+        let message = match code {
+            ErrorCode::ContextExceedsKvCapacity => {
+                "the request's KV cache at completion exceeds the KV pool capacity"
+            }
+            ErrorCode::QueueFull => "the admission queue is full; retry later",
+            ErrorCode::QueueTimeout => {
+                "the request waited longer than reliability.admission.queue_timeout before it could start"
+            }
+            ErrorCode::Overloaded => "the server is overloaded; retry later",
+            ErrorCode::CircuitOpen => {
+                "the device circuit breaker is open; retry after the cooldown"
+            }
+            ErrorCode::ResourceExhausted => {
+                "device memory was exhausted and recovery retries failed"
+            }
+            _ => "the request could not be admitted",
+        };
+        let mut e = Self::from_code(code, message);
+        e.retry_after = retry_after.map(|s| s.max(1));
+        e
     }
 
     /// 400 `invalid_request_error`/`context_exceeds_kv_capacity`: the request's KV at completion
@@ -257,10 +286,17 @@ impl ApiError {
             ErrorCode::EngineBusy | ErrorCode::QueueFull => {
                 (StatusCode::TOO_MANY_REQUESTS, ErrorType::RateLimitError)
             }
-            ErrorCode::QueueTimeout | ErrorCode::ShuttingDown => (
+            ErrorCode::QueueTimeout
+            | ErrorCode::ShuttingDown
+            | ErrorCode::Overloaded
+            | ErrorCode::CircuitOpen => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorType::ServiceUnavailable,
             ),
+            // P3: 503 for a non-streaming request; the mid-stream event keeps `server_error`.
+            ErrorCode::ResourceExhausted => {
+                (StatusCode::SERVICE_UNAVAILABLE, ErrorType::ServerError)
+            }
             ErrorCode::RequestTimeout => (StatusCode::GATEWAY_TIMEOUT, ErrorType::Timeout),
             // `internal_error`, and `slow_client` (stream only, `server_error`).
             _ => (StatusCode::INTERNAL_SERVER_ERROR, ErrorType::ServerError),

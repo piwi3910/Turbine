@@ -1,12 +1,16 @@
-//! Streaming requests against an OpenAI-compatible endpoint and the fixed-concurrency driver.
+//! Streaming requests against an OpenAI-compatible endpoint, the closed-loop (fixed
+//! concurrency) driver and the open-loop (seeded Poisson arrivals) driver.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
 
 use crate::args::{BenchArgs, EndpointArg};
+use crate::open_loop::{self, Breakdown, OpenLoopRng};
 use crate::prompt;
 use crate::report::{Report, RequestStats};
 
@@ -31,6 +35,14 @@ impl BenchError {
     }
 }
 
+/// Everything a request task needs, shared by all of them.
+struct Target {
+    client: reqwest::Client,
+    url: String,
+    model: String,
+    args: BenchArgs,
+}
+
 /// Run the benchmark described by `args` and aggregate the report.
 pub async fn run(args: &BenchArgs) -> Result<Report, BenchError> {
     let base = args.url.trim_end_matches('/').to_string();
@@ -39,6 +51,14 @@ pub async fn run(args: &BenchArgs) -> Result<Report, BenchError> {
             "--url must be an http:// URL, got {}",
             args.url
         )));
+    }
+    if let Some(out) = &args.pressure_timeline {
+        std::fs::File::create(out).map_err(|e| {
+            BenchError::Usage(format!(
+                "cannot create --pressure-timeline {}: {e}",
+                out.display()
+            ))
+        })?;
     }
     let client = reqwest::Client::builder()
         .build()
@@ -51,52 +71,152 @@ pub async fn run(args: &BenchArgs) -> Result<Report, BenchError> {
         EndpointArg::Chat => "/v1/chat/completions",
         EndpointArg::Completions => "/v1/completions",
     };
-    let url = Arc::new(format!("{base}{path}"));
-    let model = Arc::new(model);
-    let next = Arc::new(AtomicU32::new(0));
+    let target = Arc::new(Target {
+        client: client.clone(),
+        url: format!("{base}{path}"),
+        model,
+        args: args.clone(),
+    });
+
+    let (stop, stop_rx) = watch::channel(false);
+    let timeline = args.pressure_timeline.clone().map(|out| {
+        tokio::spawn(open_loop::pressure_timeline(
+            client,
+            format!("{base}/turbine/v1/pressure"),
+            out,
+            stop_rx,
+        ))
+    });
 
     let started = Instant::now();
-    let mut workers = Vec::new();
-    for _ in 0..args.concurrency.min(args.requests) {
-        let (client, url, model, next, args) = (
-            client.clone(),
-            url.clone(),
-            model.clone(),
-            next.clone(),
-            args.clone(),
-        );
-        workers.push(tokio::spawn(async move {
-            let mut ok = Vec::new();
-            let mut failed = 0u64;
+    let mut tally = Tally::default();
+    match (args.rate, args.duration) {
+        (Some(rate), Some(duration)) => open_loop_run(&target, rate, duration, &mut tally).await,
+        _ => closed_loop_run(&target, &mut tally).await,
+    }
+    let wall = started.elapsed();
+
+    // The receiver is gone only if the timeline task already ended; its result is reported below.
+    let _ = stop.send(true);
+    if let Some(task) = timeline {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("turbine-bench: pressure timeline: {e}"),
+            Err(e) => eprintln!("turbine-bench: pressure timeline task failed: {e}"),
+        }
+    }
+    Ok(Report::from_results(&tally.ok, tally.failed, wall).with_breakdown(tally.breakdown))
+}
+
+/// Accumulated outcomes of a run.
+#[derive(Default)]
+struct Tally {
+    ok: Vec<RequestStats>,
+    failed: u64,
+    breakdown: Breakdown,
+}
+
+impl Tally {
+    fn add(&mut self, index: u64, outcome: Outcome) {
+        if let Some(status) = outcome.status {
+            self.breakdown
+                .record(status, outcome.error_code.as_deref(), outcome.stream_done);
+        }
+        match outcome.result {
+            Ok(stats) => self.ok.push(stats),
+            Err(e) => {
+                eprintln!("turbine-bench: request {index} failed: {e}");
+                self.failed += 1;
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Tally) {
+        self.ok.extend(other.ok);
+        self.failed += other.failed;
+        self.breakdown.merge(other.breakdown);
+    }
+}
+
+/// Closed loop: `--concurrency` workers each send their next request as soon as the previous
+/// one finishes, until `--requests` were taken or, with `--duration`, the duration elapsed.
+async fn closed_loop_run(target: &Arc<Target>, tally: &mut Tally) {
+    let args = &target.args;
+    let deadline = args.duration.map(|d| Instant::now() + d);
+    let workers = match deadline {
+        Some(_) => args.concurrency,
+        None => args.concurrency.min(args.requests),
+    };
+    let next = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..workers {
+        let (target, next) = (target.clone(), next.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut tally = Tally::default();
             loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                if index >= args.requests {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
                     break;
                 }
-                let body = request_body(&args, &model, index);
-                match one_request(&client, &url, args.endpoint, &body).await {
-                    Ok(stats) => ok.push(stats),
-                    Err(e) => {
-                        eprintln!("turbine-bench: request {index} failed: {e}");
-                        failed += 1;
-                    }
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if deadline.is_none() && index >= u64::from(target.args.requests) {
+                    break;
                 }
+                let outcome = send(&target, index).await;
+                tally.add(index, outcome);
             }
-            (ok, failed)
+            tally
         }));
     }
-    let mut ok = Vec::new();
-    let mut failed = 0u64;
-    for w in workers {
-        match w.await {
-            Ok((o, f)) => {
-                ok.extend(o);
-                failed += f;
-            }
+    for task in tasks {
+        match task.await {
+            Ok(t) => tally.merge(t),
             Err(e) => eprintln!("turbine-bench: worker panicked: {e}"),
         }
     }
-    Ok(Report::from_results(&ok, failed, started.elapsed()))
+}
+
+/// Open loop: requests start at the seeded Poisson arrival times however the endpoint keeps
+/// up; an arrival that finds `--concurrency` requests outstanding is dropped, not queued.
+async fn open_loop_run(target: &Arc<Target>, rate: f64, duration: Duration, tally: &mut Tally) {
+    let schedule = open_loop::arrival_schedule(rate, duration, target.args.seed);
+    let slots = Arc::new(Semaphore::new(target.args.concurrency as usize));
+    let started = tokio::time::Instant::now();
+    let mut running = JoinSet::new();
+    for (index, at) in (0u64..).zip(schedule) {
+        tokio::time::sleep_until(started + at).await;
+        while let Some(done) = running.try_join_next() {
+            reap(done, tally);
+        }
+        match slots.clone().try_acquire_owned() {
+            Ok(permit) => {
+                let target = target.clone();
+                running.spawn(async move {
+                    let outcome = send(&target, index).await;
+                    drop(permit);
+                    (index, outcome)
+                });
+            }
+            Err(_) => tally.breakdown.dropped(),
+        }
+    }
+    while let Some(done) = running.join_next().await {
+        reap(done, tally);
+    }
+}
+
+fn reap(done: Result<(u64, Outcome), tokio::task::JoinError>, tally: &mut Tally) {
+    match done {
+        Ok((index, outcome)) => tally.add(index, outcome),
+        Err(e) => {
+            eprintln!("turbine-bench: request task panicked: {e}");
+            tally.failed += 1;
+        }
+    }
+}
+
+async fn send(target: &Target, index: u64) -> Outcome {
+    let body = request_body(&target.args, &target.model, index);
+    one_request(&target.client, &target.url, target.args.endpoint, &body).await
 }
 
 async fn first_model(client: &reqwest::Client, base: &str) -> Result<String, BenchError> {
@@ -122,11 +242,25 @@ async fn first_model(client: &reqwest::Client, base: &str) -> Result<String, Ben
         .ok_or_else(|| BenchError::Usage(format!("GET {url} returned no models; pass --model")))
 }
 
-fn request_body(args: &BenchArgs, model: &str, index: u32) -> Value {
-    let text = prompt::prompt(args.seed, u64::from(index), args.prompt_words);
+/// Prompt words and max_tokens of request `index`: fixed, or drawn from the ranges by the
+/// request's own seeded stream.
+fn request_lengths(args: &BenchArgs, index: u64) -> (u32, u32) {
+    let mut rng = OpenLoopRng::for_request(args.seed, index);
+    let words = args
+        .prompt_words_range
+        .map_or(args.prompt_words, |r| rng.draw(r));
+    let max_tokens = args
+        .max_tokens_range
+        .map_or(args.max_tokens, |r| rng.draw(r));
+    (words, max_tokens)
+}
+
+fn request_body(args: &BenchArgs, model: &str, index: u64) -> Value {
+    let (words, max_tokens) = request_lengths(args, index);
+    let text = prompt::prompt(args.seed, index, words);
     let mut body = json!({
         "model": model,
-        "max_tokens": args.max_tokens,
+        "max_tokens": max_tokens,
         "stream": true,
         "stream_options": {"include_usage": true},
     });
@@ -163,42 +297,83 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     text
 }
 
+/// What happened to one request: the HTTP status (if a response arrived), the OpenAI error
+/// `code` (response body or in-stream error event), whether the stream reached `[DONE]`, and
+/// either the measurements or the failure message.
+struct Outcome {
+    status: Option<u16>,
+    error_code: Option<String>,
+    stream_done: bool,
+    result: Result<RequestStats, String>,
+}
+
+impl Outcome {
+    fn failed(status: Option<u16>, error_code: Option<String>, message: String) -> Outcome {
+        Outcome {
+            status,
+            error_code,
+            stream_done: false,
+            result: Err(message),
+        }
+    }
+}
+
 async fn one_request(
     client: &reqwest::Client,
     url: &str,
     endpoint: EndpointArg,
     body: &Value,
-) -> Result<RequestStats, String> {
+) -> Outcome {
     let sent = Instant::now();
-    let mut resp = client
+    let mut resp = match client
         .post(url)
         .header("content-type", "application/json")
         .body(body.to_string())
         .send()
         .await
-        .map_err(|e| format!("POST {url}: {}", error_chain(&e)))?;
+    {
+        Ok(r) => r,
+        Err(e) => return Outcome::failed(None, None, format!("POST {url}: {}", error_chain(&e))),
+    };
     let status = resp.status();
+    let code = Some(status.as_u16());
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "HTTP {status}: {}",
-            text.chars().take(200).collect::<String>()
-        ));
+        return Outcome::failed(
+            code,
+            open_loop::error_code(&text),
+            format!(
+                "HTTP {status}: {}",
+                text.chars().take(200).collect::<String>()
+            ),
+        );
     }
 
     let mut buf: Vec<u8> = Vec::new();
     let mut token_times: Vec<Instant> = Vec::new();
     let mut usage_tokens: Option<u64> = None;
+    // An in-stream error event fails the request; the stream still runs to `[DONE]` (C-3).
+    let mut stream_error: Option<(Option<String>, String)> = None;
     loop {
-        let chunk = resp.chunk().await.map_err(|e| {
-            format!(
-                "reading stream after {} content chunks: {}",
-                token_times.len(),
-                error_chain(&e)
-            )
-        })?;
-        let Some(bytes) = chunk else {
-            return Err("stream ended without [DONE]".to_string());
+        let bytes = match resp.chunk().await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                let (error_code, message) =
+                    stream_error.unwrap_or((None, "stream ended without [DONE]".to_string()));
+                return Outcome::failed(code, error_code, message);
+            }
+            Err(e) => {
+                let error_code = stream_error.and_then(|(c, _)| c);
+                return Outcome::failed(
+                    code,
+                    error_code,
+                    format!(
+                        "reading stream after {} content chunks: {}",
+                        token_times.len(),
+                        error_chain(&e)
+                    ),
+                );
+            }
         };
         buf.extend_from_slice(&bytes);
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -211,22 +386,40 @@ async fn one_request(
             let data = data.trim_start();
             if data == "[DONE]" {
                 let done = Instant::now();
-                let Some(first) = token_times.first() else {
-                    return Err("stream finished without content".to_string());
+                let (error_code, result) = match (stream_error, token_times.first()) {
+                    (Some((error_code, message)), _) => (error_code, Err(message)),
+                    (None, None) => (None, Err("stream finished without content".to_string())),
+                    (None, Some(first)) => (
+                        None,
+                        Ok(RequestStats {
+                            ttft: *first - sent,
+                            itls: token_times.windows(2).map(|w| w[1] - w[0]).collect(),
+                            e2e: done - sent,
+                            output_tokens: usage_tokens.unwrap_or(token_times.len() as u64),
+                        }),
+                    ),
                 };
-                let itls = token_times.windows(2).map(|w| w[1] - w[0]).collect();
-                let output_tokens = usage_tokens.unwrap_or(token_times.len() as u64);
-                return Ok(RequestStats {
-                    ttft: *first - sent,
-                    itls,
-                    e2e: done - sent,
-                    output_tokens,
-                });
+                return Outcome {
+                    status: code,
+                    error_code,
+                    stream_done: true,
+                    result,
+                };
             }
-            let value: Value =
-                serde_json::from_str(data).map_err(|e| format!("bad SSE JSON {data:?}: {e}"))?;
+            let value: Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Outcome::failed(code, None, format!("bad SSE JSON {data:?}: {e}"));
+                }
+            };
             if let Some(err) = value.get("error") {
-                return Err(format!("stream error: {err}"));
+                if stream_error.is_none() {
+                    stream_error = Some((
+                        open_loop::error_code_of(&value),
+                        format!("stream error: {err}"),
+                    ));
+                }
+                continue;
             }
             if chunk_content(&value, endpoint).is_some() {
                 token_times.push(Instant::now());

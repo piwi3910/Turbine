@@ -1,7 +1,8 @@
 //! Per-request timers on the engine clock (P2 S-7, S-8): the total request deadline
 //! (`server.request_timeout`) and the slow-client timer (`server.slow_client_timeout`, running
 //! while a request is paused on a full output channel). The queue wait limit
-//! (`scheduler.queue_timeout`) is enforced by `Scheduler::plan`, which drops a request that waited
+//! (`reliability.admission.queue_timeout`, C-1) is enforced by `Scheduler::plan` through the P3
+//! admission gate, which drops a request that waited
 //! too long with `CancelReason::QueueTimeout`; the engine plans at least every few milliseconds
 //! while any request exists, so that check runs while a request is queued.
 //!

@@ -257,11 +257,10 @@ fn phase2_keys() {
     assert_eq!(d.scheduler.max_batch_tokens, 8192);
     assert_eq!(d.scheduler.prefill_chunk_tokens, 2048);
     assert_eq!(d.scheduler.max_queued_requests, 256);
-    assert_eq!(
-        d.scheduler.queue_timeout,
-        HumanDuration(Duration::from_secs(60))
-    );
-    assert_eq!(d.kv.gpu.max_bytes, Some(ByteSize::gib(8)));
+    // Removed in Phase 3 (C-1): reliability.admission.queue_timeout bounds queue wait.
+    assert!(d.scheduler.queue_timeout.is_none());
+    // Phase 3 (C-8): null, the kv pool is the remainder of the memory budget.
+    assert_eq!(d.kv.gpu.max_bytes, None);
     assert_eq!(d.model.tool_call_parser, None);
     assert_eq!(d.structured_output.max_schema_bytes, ByteSize::kib(64));
     assert_eq!(
@@ -274,15 +273,15 @@ fn phase2_keys() {
     for bad in ["1.5s", "\"2 s\"", "10d", "5", "10S", "s", "-1s"] {
         assert_rejected(
             base,
-            &[&format!("scheduler.queue_timeout={bad}")],
-            "scheduler.queue_timeout",
+            &[&format!("server.request_timeout={bad}")],
+            "server.request_timeout",
         );
     }
     let t = |v: &str| {
-        parse(base, &[&format!("scheduler.queue_timeout={v}")])
+        parse(base, &[&format!("server.request_timeout={v}")])
             .unwrap()
-            .scheduler
-            .queue_timeout
+            .server
+            .request_timeout
             .0
     };
     assert_eq!(t("250ms"), Duration::from_millis(250));
@@ -293,11 +292,6 @@ fn phase2_keys() {
     assert_eq!(
         "1500ms".parse::<HumanDuration>().unwrap().to_string(),
         "1500ms"
-    );
-    assert_rejected(
-        base,
-        &["scheduler.queue_timeout=0s"],
-        "scheduler.queue_timeout",
     );
     assert_rejected(
         base,
@@ -489,6 +483,8 @@ fn default_block_tokens_is_128() {
         "examples/turbine.yaml",
         "scripts/lab/phase2-novanas-llama.yaml",
         "scripts/lab/phase2-novanas-olmoe.yaml",
+        "scripts/lab/phase2c-novanas-llama.yaml",
+        "scripts/lab/phase2c-novanas-olmoe.yaml",
     ] {
         let c = load(&root.join(file), &[]).unwrap_or_else(|e| panic!("{file}: {e}"));
         assert_eq!(c.kv.block_tokens, 128, "{file}");
@@ -613,4 +609,163 @@ fn validate_modules_names_registries() {
             .unwrap_or_else(|e| panic!("{set}: {e}"));
     }
     parse(base, &[]).unwrap().validate_modules(&known).unwrap();
+}
+
+/// The dotted key `load` names when rejecting `yaml`.
+fn rejected_key(yaml: &str) -> String {
+    match parse(yaml, &[]) {
+        Ok(cfg) => panic!("expected {yaml:?} to be rejected, got {cfg:?}"),
+        Err(e) => e
+            .key()
+            .unwrap_or_else(|| panic!("error {e} names no key"))
+            .to_string(),
+    }
+}
+
+#[test]
+fn reliability_config_validation() {
+    use crate::pressure::PressureSignal;
+
+    // Defaults: the P3 configuration table.
+    let r = ReliabilityConfig::default();
+    assert!(r.enabled && r.adaptive_admission);
+    assert_eq!(r.emergency_vram_reserve, ByteSize::gib(2));
+    assert_eq!(r.memory.workspace_bytes, ByteSize::gib(1));
+    assert_eq!(r.memory.runtime_overhead_bytes, ByteSize::gib(1));
+    assert_eq!(r.memory.device_budget_bytes, None);
+    assert_eq!(r.memory.host_reserve_bytes, ByteSize::gib(8));
+    assert_eq!(r.telemetry.interval, HumanDuration::from_millis(100));
+    assert_eq!(r.telemetry.vendor_interval, HumanDuration::from_secs(1));
+    assert_eq!(r.telemetry.call_timeout, HumanDuration::from_millis(500));
+    assert_eq!(r.telemetry.stale_after, HumanDuration::from_secs(5));
+    assert_eq!(r.pressure.escalate_samples, 2);
+    assert_eq!(r.pressure.deescalate_dwell, HumanDuration::from_secs(10));
+    assert_eq!(r.pressure.exit_margin, 0.05);
+    assert!(r.pressure.thresholds.is_empty(), "overrides only");
+    assert_eq!(r.admission.max_queue, 256);
+    assert_eq!(r.admission.queue_timeout, HumanDuration::from_secs(30));
+    assert_eq!(r.admission.large_prefill_tokens, 2048);
+    assert_eq!(r.admission.max_bypass, 8);
+    assert_eq!(r.recovery.max_retries, 3);
+    assert_eq!(r.recovery.backoff, HumanDuration::from_millis(50));
+    assert_eq!(
+        r.recovery.survival_liveness,
+        SurvivalLiveness::RequeueUnstarted
+    );
+    let c = &r.circuit;
+    assert_eq!(
+        (
+            c.oom_recoveries_to_open,
+            c.window,
+            c.latency_drift_degraded,
+            c.latency_drift_open,
+            c.cooldown,
+            c.drain_timeout,
+            c.probe_successes
+        ),
+        (
+            3,
+            HumanDuration::from_secs(60),
+            2.0,
+            4.0,
+            HumanDuration::from_secs(30),
+            HumanDuration::from_secs(120),
+            3
+        )
+    );
+    let base = "model:\n  path: /m\n";
+    parse(base, &[]).expect("defaults are valid");
+
+    // Durations in several units and a threshold override with an unused level parse.
+    let ok = parse(
+        &format!(
+            "{base}reliability:\n  telemetry:\n    interval: 100ms\n    vendor_interval: 10s\n    stale_after: 1h\n  admission:\n    queue_timeout: 1h\n  pressure:\n    thresholds:\n      kv_utilization: [0.6, 0.8, 0.9, null]\n      host_available: [8.0, 4.0, 2.0, 1.0]\n"
+        ),
+        &[],
+    )
+    .expect("valid overrides accepted");
+    let rel = &ok.reliability;
+    let b = parse(
+        &format!("{base}reliability:\n  recovery:\n    survival_liveness: continue_prefills\n"),
+        &[],
+    )
+    .expect("option B is a valid choice");
+    assert_eq!(
+        b.reliability.recovery.survival_liveness,
+        SurvivalLiveness::ContinuePrefills
+    );
+    assert_eq!(
+        rejected_key(&format!(
+            "{base}reliability:\n  recovery:\n    survival_liveness: sometimes\n"
+        )),
+        "reliability.recovery.survival_liveness"
+    );
+    assert_eq!(rel.telemetry.vendor_interval, HumanDuration::from_secs(10));
+    assert_eq!(rel.telemetry.stale_after, HumanDuration::from_secs(3600));
+    assert_eq!(rel.admission.queue_timeout, HumanDuration::from_secs(3600));
+    assert_eq!(
+        rel.pressure.thresholds[&PressureSignal::KvUtilization],
+        [Some(0.6), Some(0.8), Some(0.9), None]
+    );
+    assert_eq!(rel.pressure.thresholds.len(), 2);
+
+    // Every impossible configuration is rejected naming its full dotted key.
+    let cases = [
+        (
+            "reliability:\n  pressure:\n    thresholds:\n      kv_utilization: [0.9, 0.8, 0.95, 0.97]\n",
+            "reliability.pressure.thresholds.kv_utilization",
+        ),
+        (
+            "reliability:\n  pressure:\n    thresholds:\n      host_available: [1.0, 2.0, 4.0, 8.0]\n",
+            "reliability.pressure.thresholds.host_available",
+        ),
+        (
+            "reliability:\n  circuit:\n    latency_drift_open: 1.5\n    latency_drift_degraded: 2.0\n",
+            "reliability.circuit.latency_drift_open",
+        ),
+        (
+            "reliability:\n  pressure:\n    deescalate_dwell: 10ms\n",
+            "reliability.pressure.deescalate_dwell",
+        ),
+        (
+            "reliability:\n  telemetry:\n    vendor_interval: 50ms\n    interval: 100ms\n",
+            "reliability.telemetry.vendor_interval",
+        ),
+        (
+            "reliability:\n  telemetry:\n    stale_after: 1s\n    vendor_interval: 1s\n",
+            "reliability.telemetry.stale_after",
+        ),
+        (
+            "reliability:\n  admission:\n    max_queue: 0\n",
+            "reliability.admission.max_queue",
+        ),
+        (
+            "reliability:\n  admission:\n    kv_overcommit: 1.5\n",
+            "reliability.admission.kv_overcommit",
+        ),
+        (
+            "scheduler:\n  queue_timeout: 60s\n",
+            "scheduler.queue_timeout",
+        ),
+        (
+            "reliability:\n  telemetry:\n    interval: 1.5s\n",
+            "reliability.telemetry.interval",
+        ),
+        (
+            "reliability:\n  pressure:\n    thresholds:\n      no_such_signal: [1, 2, 3, 4]\n",
+            "reliability.pressure.thresholds.no_such_signal",
+        ),
+    ];
+    for (yaml, key) in cases {
+        assert_eq!(rejected_key(&format!("{base}{yaml}")), key, "for {yaml:?}");
+    }
+    let fault = format!("{base}reliability:\n  fault_injection:\n    alloc_fail_every: 5\n");
+    #[cfg(not(feature = "fault-injection"))]
+    assert_eq!(rejected_key(&fault), "reliability.fault_injection");
+    #[cfg(feature = "fault-injection")]
+    {
+        let cfg = parse(&fault, &[]).expect("the fault-injection build accepts the section");
+        let fi = cfg.reliability.fault_injection.expect("section present");
+        assert_eq!(fi.alloc_fail_every, Some(5));
+    }
 }

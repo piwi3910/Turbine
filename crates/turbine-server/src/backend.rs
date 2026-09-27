@@ -1,8 +1,13 @@
 //! [`ModelBackend`] answers the API (`InferenceBackend`, `Readiness`, `Diagnostics`): it renders
 //! and tokenizes a request, builds its [`GenerationRequest`] and forwards it to the engine thread
-//! (`crate::engine`), whose scheduler decides admission (P2 §Scheduling rules, submission
-//! checks): `context_length_exceeded`, `context_exceeds_kv_capacity`, `queue_full` (429,
-//! `retry-after: 1`) and `shutting_down` (503) are plain HTTP errors returned before any event.
+//! (`crate::engine`), whose scheduler checks it (P2 §Scheduling rules: `context_length_exceeded`,
+//! `context_exceeds_kv_capacity`, `shutting_down`) and whose admission gate decides it (P3 reject
+//! table: `queue_full` 429, `overloaded` / `circuit_open` 503, with `Retry-After`) — plain HTTP
+//! errors returned before any event.
+//!
+//! `/ready` follows the circuit breaker (503 `circuit_open` while it is CIRCUIT_OPEN, DRAINING
+//! or PROBING, and after a fatal circuit until the process exits); `/turbine/v1/pressure` is the
+//! pressure controller's document and `/turbine/v1/status` names its state and circuit.
 //!
 //! Before queueing, a `response_format` or a `required`/named `tool_choice` is compiled into one
 //! matcher per choice off the engine thread (`engine::grammar`); a grammar that fails, is too
@@ -19,17 +24,19 @@ use tokio::sync::{mpsc, oneshot};
 use turbine_api::openai::request::{PromptInput, ResponseFormat, ToolChoiceMode};
 use turbine_api::{
     ApiError, BoxFuture, Diagnostics, GenerationStream, InferenceBackend, InferenceRequest,
-    ModelCard, NotReadyReason, Readiness, ReadyState,
+    ModelCard, NotReadyReason, Readiness, ReadyState, readiness_for_circuit,
 };
 use turbine_core::request::{
     ConstraintSpec, Endpoint, ErrorCode, GenerationRequest, SamplingParams, StopConditions,
 };
 use turbine_core::support::SupportRowView;
-use turbine_core::types::Priority;
+use turbine_core::types::{CircuitState, PressureState, Priority};
 use turbine_device::DeviceInventory;
 use turbine_kernels::Selection;
 use turbine_kv::blocks_for_tokens;
 use turbine_model::{ChatTemplate, Tokenizer, ToolChoice};
+use turbine_reliability::budget::PoolKind;
+use turbine_reliability::controller::ControllerHandle;
 use turbine_scheduler::{SchedulerMetrics, SubmitError};
 
 use crate::engine::grammar::GrammarService;
@@ -40,11 +47,13 @@ use crate::engine::{
 use crate::metrics::{Outcome, ServerMetrics};
 use crate::model::PreparedModel;
 use crate::modules::ModuleChoices;
+use crate::reliability::api_error_for;
 
 const STATE_LOADING: u8 = 0;
 const STATE_READY: u8 = 1;
 const STATE_LOAD_FAILED: u8 = 2;
-const STATE_DEVICE_ERROR: u8 = 3;
+/// The circuit is fatal (P3 S-12): `/ready` answers `circuit_open` until the process exits 3.
+const STATE_DEVICE_FATAL: u8 = 3;
 /// SIGINT/SIGTERM received (P2 S-13): `/ready` and new requests answer 503 `shutting_down`.
 const STATE_SHUTTING_DOWN: u8 = 4;
 
@@ -80,6 +89,9 @@ struct StatusDocument<'a> {
     /// The support-matrix row resolved at startup (Phase 2m S-11).
     #[serde(skip_serializing_if = "Option::is_none")]
     support: Option<&'a SupportRowView>,
+    /// P3 S-13: the pressure state and the circuit state (GREEN / HEALTHY before the load).
+    pressure_state: PressureState,
+    circuit_state: CircuitState,
 }
 
 /// One entry of `kernels` in `GET /turbine/v1/status`: a `KernelRegistry` selection.
@@ -133,6 +145,8 @@ impl From<&Selection> for KernelChoiceView {
 struct Loaded {
     engine: EngineHandle,
     shared: Arc<EngineShared>,
+    /// The pressure controller's snapshot: circuit, state and the pressure document.
+    controller: ControllerHandle,
     load_seconds: f64,
     weight_bytes: u64,
     created: u64,
@@ -194,7 +208,7 @@ impl ModelBackend {
             loaded: OnceLock::new(),
             served_name: model.served_name.clone(),
             architecture: model.arch.hf_architecture.clone(),
-            expected_weight_bytes: model.budget.weights,
+            expected_weight_bytes: model.budget.pool(PoolKind::Weights),
             max_seq_len: model.max_seq_len,
             vocab_size: model.arch.vocab_size,
             block_tokens: model.block_tokens,
@@ -241,6 +255,7 @@ impl ModelBackend {
         &self,
         engine: EngineHandle,
         shared: Arc<EngineShared>,
+        controller: ControllerHandle,
         load_seconds: f64,
         weight_bytes: u64,
     ) {
@@ -252,6 +267,7 @@ impl ModelBackend {
             .set(Loaded {
                 engine,
                 shared,
+                controller,
                 load_seconds,
                 weight_bytes,
                 created,
@@ -272,7 +288,7 @@ impl ModelBackend {
     pub fn set_failed(&self, fatal: &Fatal) {
         let state = match fatal {
             Fatal::LoadFailed(_) => STATE_LOAD_FAILED,
-            Fatal::DeviceError(_) => STATE_DEVICE_ERROR,
+            Fatal::DeviceFatal(_) => STATE_DEVICE_FATAL,
         };
         self.state.store(state, Ordering::Release);
     }
@@ -538,6 +554,12 @@ impl ModelBackend {
                  must fit scheduler.max_batch_tokens ({})",
                 self.max_batch_tokens
             )),
+            // P3 admission gate: the reject table.
+            SubmitError::Rejected {
+                reason,
+                retry_after_secs,
+            } => api_error_for(reason, retry_after_secs),
+            _ => ApiError::internal(format!("submission refused: {e}")),
         }
     }
 
@@ -613,11 +635,17 @@ impl InferenceBackend for ModelBackend {
 impl Readiness for ModelBackend {
     fn ready(&self) -> ReadyState {
         let reason = match self.state.load(Ordering::Acquire) {
-            STATE_READY => return ReadyState::Ready,
+            STATE_READY => {
+                let circuit = self
+                    .loaded
+                    .get()
+                    .map_or(CircuitState::Healthy, |l| l.controller.circuit());
+                return readiness_for_circuit(circuit, ReadyState::Ready);
+            }
             STATE_LOADING => NotReadyReason::LoadingModel,
             STATE_LOAD_FAILED => NotReadyReason::ModelLoadFailed,
             STATE_SHUTTING_DOWN => NotReadyReason::ShuttingDown,
-            _ => NotReadyReason::DeviceError,
+            _ => NotReadyReason::CircuitOpen,
         };
         ReadyState::NotReady { reason }
     }
@@ -640,6 +668,8 @@ impl Diagnostics for ModelBackend {
             modules: &self.modules,
             kernels: &self.kernels,
             support: self.support.as_ref(),
+            pressure_state: loaded.map_or(PressureState::Green, |l| l.controller.state()),
+            circuit_state: loaded.map_or(CircuitState::Healthy, |l| l.controller.circuit()),
         })
         .unwrap_or(Value::Null)
     }
@@ -656,8 +686,11 @@ impl Diagnostics for ModelBackend {
         let docs = self.engine_docs()?;
         serde_json::to_value(docs.kv).map_err(|e| ApiError::internal(e.to_string()))
     }
+    /// The pressure controller's document (P3 §Data); 503 until the engine runs.
     fn pressure(&self) -> Result<Value, ApiError> {
-        Err(ApiError::not_implemented())
+        let loaded = self.loaded.get().ok_or_else(ApiError::model_not_loaded)?;
+        serde_json::to_value(loaded.controller.document())
+            .map_err(|e| ApiError::internal(e.to_string()))
     }
 }
 

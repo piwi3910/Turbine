@@ -4,6 +4,7 @@
 pub mod arrivals;
 pub mod digests;
 pub mod executor;
+pub mod overload;
 #[cfg(test)]
 pub(crate) mod workloads;
 

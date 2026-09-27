@@ -8,6 +8,7 @@ mod exit;
 mod metrics;
 mod model;
 mod modules;
+mod reliability;
 mod startup;
 mod support_matrix;
 mod support_startup;

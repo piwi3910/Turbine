@@ -29,8 +29,9 @@ kv:
   block_tokens: 128
   gpu:
     enabled: true
-    # L0 (GPU) block-pool size.
-    max_bytes: 8GiB
+    # L0 (GPU) block-pool cap; null (Phase 3 default) = the kv pool of the memory budget:
+    # what remains after weights, workspace, runtime overhead and the emergency reserve.
+    max_bytes: null
   cpu:
     enabled: true
     max_bytes: 64GiB
@@ -50,10 +51,8 @@ scheduler:
   # Per-iteration token budget (decodes + prefill chunks).
   max_batch_tokens: 8192
   prefill_chunk_tokens: 2048
-  # Waiting-queue bound (429 queue_full once full) and HTTP-to-engine submission-channel capacity.
+  # HTTP-to-engine submission-channel capacity (the waiting queue is reliability.admission, Phase 3).
   max_queued_requests: 256
-  # Longest wait in the queue before 503 queue_timeout.
-  queue_timeout: 60s
   # Scheduling policy (admission order, preemption victim, chunk sizing): a registered policy
   # name (default).
   policy: default

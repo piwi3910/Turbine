@@ -43,7 +43,7 @@ impl ExecutionBackend for CudaBackend {
 }
 ```
 
-2. For a new GPU vendor, the pieces the backend stands on: a kernel library implementing `kernels/include/turbine_kernels.h` (a `kernels/<vendor>/` directory beside `kernels/rocm/`, built by its own CMake), device discovery for the vendor (a `DiscoveryKind` in `crates/turbine-device/src/discovery/mod.rs`, registry point `device_discovery`), card profiles with `vendor` set to it (see [card-family.md](card-family.md)), and support-matrix rows.
+2. For a new GPU vendor, the pieces the backend stands on: a kernel library implementing `kernels/include/turbine_kernels.h` (a `kernels/<vendor>/` directory beside `kernels/rocm/`, built by its own CMake), device discovery for the vendor (a `DiscoveryKind` in `crates/turbine-device/src/discovery/mod.rs`, registry point `device_discovery`, whose `telemetry` method opens the vendor's live telemetry backend in `crates/turbine-device/src/telemetry/<vendor>.rs` for the Phase 3 pressure controller), card profiles with `vendor` set to it (see [card-family.md](card-family.md)), and support-matrix rows.
 
 ## Registry entry
 

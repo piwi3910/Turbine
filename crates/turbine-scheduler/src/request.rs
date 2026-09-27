@@ -81,8 +81,14 @@ pub enum CancelReason {
     RequestTimeout,
     SlowClient,
     Shutdown,
-    /// Waited longer than `scheduler.queue_timeout` without being admitted (Phase 2 drops it).
+    /// Waited longer than the queue timeout without being admitted (Phase 2
+    /// `scheduler.queue_timeout`, from Phase 3 `reliability.admission.queue_timeout`).
     QueueTimeout,
+    /// Still queued when the circuit opened (P3): answered `503 circuit_open`.
+    CircuitOpen,
+    /// Admitted but not started when SURVIVAL requeued it, with the admission queue full
+    /// (P3, `survival_liveness: requeue_unstarted`): answered `503 overloaded`.
+    Overloaded,
 }
 
 impl CancelReason {
@@ -93,6 +99,8 @@ impl CancelReason {
             CancelReason::SlowClient => "slow_client",
             CancelReason::Shutdown => "shutdown",
             CancelReason::QueueTimeout => "queue_timeout",
+            CancelReason::CircuitOpen => "circuit_open",
+            CancelReason::Overloaded => "overloaded",
         }
     }
 }
@@ -104,12 +112,16 @@ impl CancelReason {
 pub enum PreemptReason {
     /// The pool could not supply the blocks the next iteration needs.
     KvExhausted,
+    /// SURVIVAL only (P3): the next decode step could not allocate, so the most recently
+    /// admitted sequence is recomputed later.
+    SurvivalDecodeAlloc,
 }
 
 impl PreemptReason {
     pub fn as_str(self) -> &'static str {
         match self {
             PreemptReason::KvExhausted => "kv_exhausted",
+            PreemptReason::SurvivalDecodeAlloc => "survival_decode_alloc",
         }
     }
 }
@@ -234,6 +246,12 @@ mod tests {
         assert_eq!(CancelReason::SlowClient.as_str(), "slow_client");
         assert_eq!(CancelReason::Shutdown.as_str(), "shutdown");
         assert_eq!(CancelReason::QueueTimeout.as_str(), "queue_timeout");
+        assert_eq!(CancelReason::CircuitOpen.as_str(), "circuit_open");
+        assert_eq!(CancelReason::Overloaded.as_str(), "overloaded");
         assert_eq!(PreemptReason::KvExhausted.as_str(), "kv_exhausted");
+        assert_eq!(
+            PreemptReason::SurvivalDecodeAlloc.as_str(),
+            "survival_decode_alloc"
+        );
     }
 }

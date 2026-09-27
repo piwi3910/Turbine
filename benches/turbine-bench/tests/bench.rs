@@ -1,13 +1,22 @@
-//! `turbine-bench` against in-test SSE servers (raw HTTP/1.1 over tokio TCP).
+//! `turbine-bench` against in-test SSE servers (raw HTTP/1.1 over tokio TCP, and an axum mock
+//! for the open-loop overload mode).
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::Value;
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use turbine_bench::open_loop::arrival_schedule;
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -341,4 +350,182 @@ async fn truncated_stream_reports_the_transport_cause() {
         .unwrap_or_else(|| panic!("{prefix:?} missing: {line}"))
         .1;
     assert!(!cause.trim().is_empty(), "no transport cause: {line}");
+}
+
+/// Status and error-code counts of every chat completion the overload mock answered.
+#[derive(Default)]
+struct OverloadCounts {
+    by_status: BTreeMap<String, u64>,
+    by_error_code: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Default)]
+struct OverloadMock {
+    served: Arc<AtomicUsize>,
+    counts: Arc<Mutex<OverloadCounts>>,
+}
+
+/// Fixed 3-cycle pattern: 200 stream with `[DONE]`, 429 `queue_full`, 503 `overloaded`.
+async fn overload_chat(State(mock): State<OverloadMock>) -> Response {
+    let n = mock.served.fetch_add(1, Ordering::SeqCst);
+    let (status, code) = match n % 3 {
+        0 => (StatusCode::OK, None),
+        1 => (StatusCode::TOO_MANY_REQUESTS, Some("queue_full")),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, Some("overloaded")),
+    };
+    {
+        let mut c = mock.counts.lock().unwrap();
+        *c.by_status.entry(status.as_u16().to_string()).or_default() += 1;
+        if let Some(code) = code {
+            *c.by_error_code.entry(code.to_string()).or_default() += 1;
+        }
+    }
+    match code {
+        None => {
+            let body: String = [
+                r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{"content":"a "}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{"content":"b"}}]}"#,
+                r#"{"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}"#,
+                "[DONE]",
+            ]
+            .iter()
+            .map(|e| format!("data: {e}\n\n"))
+            .collect();
+            ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+        }
+        Some(code) => (
+            status,
+            Json(json!({
+                "error": {"message": "busy", "type": "service_unavailable", "code": code}
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn pressure_document() -> Json<Value> {
+    Json(json!({
+        "enabled": true,
+        "state": "ORANGE",
+        "since": "2026-09-25T18:02:11.482Z",
+        "dominant_signal": "kv_utilization",
+        "exhaustion_horizon_seconds": 14.2,
+        "signals": [
+            {"name": "host_available", "value": 3.1, "level": "YELLOW", "stale": false},
+            {"name": "kv_utilization", "value": 0.84, "level": "ORANGE", "stale": false}
+        ],
+        "admission": {"queued": 17, "max_queue": 256},
+        "circuit": {"state": "HEALTHY", "since": "2026-09-25T18:00:00.000Z", "last_reason": null}
+    }))
+}
+
+async fn overload_mock() -> (SocketAddr, OverloadMock) {
+    let mock = OverloadMock::default();
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"object": "list", "data": [{"id": "mock-model"}]})) }),
+        )
+        .route("/v1/chat/completions", post(overload_chat))
+        .route("/turbine/v1/pressure", get(pressure_document))
+        .with_state(mock.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (addr, mock)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_loop_rate_and_breakdown() {
+    let schedule = arrival_schedule(50.0, Duration::from_secs(4), 3);
+    assert_eq!(
+        schedule,
+        arrival_schedule(50.0, Duration::from_secs(4), 3),
+        "same seed must give the same arrival schedule"
+    );
+    assert_ne!(schedule, arrival_schedule(50.0, Duration::from_secs(4), 4));
+    assert!(
+        (170..=230).contains(&schedule.len()),
+        "Poisson(50/s x 4 s) gave {} arrivals",
+        schedule.len()
+    );
+    assert!(schedule.windows(2).all(|w| w[0] <= w[1]));
+    assert!(schedule.iter().all(|t| *t < Duration::from_secs(4)));
+
+    let (addr, mock) = overload_mock().await;
+    let timeline = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("open-loop-{}-t.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&timeline);
+    let (code, r, stderr) = run_bench(args(
+        addr,
+        &[
+            "--rate",
+            "50",
+            "--duration",
+            "4s",
+            "--seed",
+            "3",
+            "--concurrency",
+            "64",
+            "--prompt-words-range",
+            "4..32",
+            "--max-tokens-range",
+            "1..8",
+            "--pressure-timeline",
+            timeline.to_str().unwrap(),
+        ],
+    ))
+    .await;
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+
+    // Open loop: exactly the seeded schedule's arrivals, not a closed loop at concurrency 64.
+    let dropped = r["client_dropped"].as_u64().expect("client_dropped");
+    let sent = r["requests_ok"].as_u64().unwrap() + r["requests_failed"].as_u64().unwrap();
+    assert_eq!(sent + dropped, schedule.len() as u64, "{r}");
+    assert_eq!(sent, mock.served.load(Ordering::SeqCst) as u64, "{r}");
+
+    let counts = mock.counts.lock().unwrap();
+    let by_status: BTreeMap<String, u64> =
+        serde_json::from_value(r["by_status"].clone()).expect("by_status");
+    let by_error_code: BTreeMap<String, u64> =
+        serde_json::from_value(r["by_error_code"].clone()).expect("by_error_code");
+    assert_eq!(by_status, counts.by_status, "{r}");
+    assert_eq!(by_error_code, counts.by_error_code, "{r}");
+    assert_eq!(by_status.len(), 3, "{r}");
+    assert_eq!(
+        r["requests_ok"].as_u64(),
+        counts.by_status.get("200").copied(),
+        "{r}"
+    );
+    assert_eq!(r["streams_incomplete"], 0, "{r}");
+
+    let text = std::fs::read_to_string(&timeline).expect("timeline written");
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("timeline line is JSON"))
+        .collect();
+    assert!(
+        (3..=5).contains(&lines.len()),
+        "{} lines: {text}",
+        lines.len()
+    );
+    for line in &lines {
+        for key in [
+            "t",
+            "state",
+            "circuit",
+            "dominant_signal",
+            "queue",
+            "kv_utilization",
+        ] {
+            assert!(line.get(key).is_some(), "missing {key}: {line}");
+        }
+        assert_eq!(line["state"], "ORANGE");
+        assert_eq!(line["circuit"], "HEALTHY");
+        assert_eq!(line["dominant_signal"], "kv_utilization");
+        assert_eq!(line["queue"], 17);
+        assert_eq!(line["kv_utilization"], 0.84);
+    }
+    let _ = std::fs::remove_file(&timeline);
 }

@@ -17,17 +17,20 @@ path = "src/bin/turbine-golden.rs"
 [dependencies]
 clap.workspace = true
 futures-util.workspace = true
+# rand_chacha: seeded ChaCha8 PRNG for the open-loop Poisson arrivals and per-request length draws.
+rand_chacha.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+# HumanDuration: --duration uses the configuration duration grammar (CONFLICT C-14).
+turbine-core.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
 # lab_scripts: the lab configs and k3s manifests are checked against the real config model.
 serde_norway.workspace = true
-turbine-core.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

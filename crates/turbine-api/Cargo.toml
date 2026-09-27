@@ -24,6 +24,9 @@ uuid.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
+# P3 api tests: a real pressure controller document, reliability and telemetry metric families.
+turbine-reliability.workspace = true
+turbine-device.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

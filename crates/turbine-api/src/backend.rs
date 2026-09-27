@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use turbine_core::request::{Endpoint, ErrorCode, GenerationEvent};
-use turbine_core::types::RequestId;
+use turbine_core::types::{CircuitState, RequestId};
 use turbine_observability::MetricsRegistry;
 
 use crate::error::ApiError;
@@ -97,6 +97,8 @@ pub enum NotReadyReason {
     DeviceError,
     /// SIGINT/SIGTERM received: draining for up to `server.shutdown_grace` (Phase 2).
     ShuttingDown,
+    /// The circuit breaker is CIRCUIT_OPEN, DRAINING or PROBING (Phase 3).
+    CircuitOpen,
 }
 
 impl NotReadyReason {
@@ -108,7 +110,20 @@ impl NotReadyReason {
             NotReadyReason::ModelLoadFailed => "model_load_failed",
             NotReadyReason::DeviceError => "device_error",
             NotReadyReason::ShuttingDown => "shutting_down",
+            NotReadyReason::CircuitOpen => "circuit_open",
         }
+    }
+}
+
+/// `/ready` behind the circuit breaker (P3 S-12): not ready with `circuit_open` while the
+/// circuit blocks readiness (CIRCUIT_OPEN, DRAINING, PROBING); a `base` that is already not
+/// ready keeps its own reason.
+pub fn readiness_for_circuit(circuit: CircuitState, base: ReadyState) -> ReadyState {
+    match base {
+        ReadyState::Ready if circuit.blocks_readiness() => ReadyState::NotReady {
+            reason: NotReadyReason::CircuitOpen,
+        },
+        other => other,
     }
 }
 

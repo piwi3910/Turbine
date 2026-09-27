@@ -2,7 +2,7 @@
 # Run the Turbine test suite, including #[ignore] GPU tests, on one lab host.
 #
 #   scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas> [--gpus 1|2] [--with-hf-reference]
-#                       [-- <cargo test arguments>]
+#                       [--features <list>] [-- <cargo test arguments>]
 #   scripts/lab-test.sh [--dry-run] novanas --stop <run-id>
 #
 # Runs `cargo test --no-fail-fast <selection> -- --include-ignored --show-output`, so one run
@@ -11,7 +11,8 @@
 # to the test harness after ours (e.g. `-- -p turbine-model --test golden -- logits_match`).
 # The default run skips hf_reference_matches_cpu (the Hugging Face transformers CPU reference:
 # the golden references are committed, it only matters when regenerating them);
-# --with-hf-reference runs it and installs uv for it.
+# --with-hf-reference runs it and installs uv for it. --features <list> is passed to that cargo test
+# (e.g. `--features fault-injection` for the P3 fault tests, `tests/fault.rs`).
 #
 # dgx-spark / dgx-spark2: `docker run --rm --gpus all` of rust:1.97-trixie (container
 #   turbine-lab-test only; production vLLM containers are never touched).
@@ -33,7 +34,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas> [--gpus 1|2] [--with-hf-reference] [-- <cargo test args>]" >&2
+	echo "usage: scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas> [--gpus 1|2] [--with-hf-reference] [--features <list>] [-- <cargo test args>]" >&2
 	echo "       scripts/lab-test.sh [--dry-run] novanas --stop <run-id>" >&2
 	exit 2
 }
@@ -57,6 +58,7 @@ MODE=run
 GPUS=1
 GPUS_SET=0
 HF_REFERENCE=0
+FEATURES=""
 STOP_RUN=""
 CARGO_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -70,6 +72,11 @@ while [[ $# -gt 0 ]]; do
 	--with-hf-reference)
 		HF_REFERENCE=1
 		shift
+		;;
+	--features)
+		[[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9_/,-]+$ ]] || usage
+		FEATURES="$2"
+		shift 2
 		;;
 	--stop)
 		[[ $# -eq 2 && "$2" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || usage
@@ -88,7 +95,7 @@ done
 if [[ "$HOST" != novanas && ($MODE == stop || $GPUS_SET -eq 1) ]]; then
 	usage
 fi
-if [[ $MODE == stop && ($GPUS_SET -eq 1 || $HF_REFERENCE -eq 1 || ${#CARGO_ARGS[@]} -gt 0) ]]; then
+if [[ $MODE == stop && ($GPUS_SET -eq 1 || $HF_REFERENCE -eq 1 || -n $FEATURES || ${#CARGO_ARGS[@]} -gt 0) ]]; then
 	usage
 fi
 
@@ -106,6 +113,7 @@ build_test_command() {
 		fi
 	done
 	[[ ${#select[@]} -gt 0 ]] || select=(--workspace)
+	[[ -z $FEATURES ]] || select+=(--features "$FEATURES")
 	TEST_CMD+=("${select[@]}" -- --include-ignored --show-output)
 	# The golden references are committed; the Hugging Face transformers CPU reference is only
 	# needed to regenerate them.

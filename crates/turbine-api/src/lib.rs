@@ -9,7 +9,7 @@ pub mod support;
 
 pub use backend::{
     ApiLimits, ApiState, BoxFuture, Diagnostics, GenerationStream, InferenceBackend,
-    InferenceRequest, ModelCard, NotReadyReason, Readiness, ReadyState,
+    InferenceRequest, ModelCard, NotReadyReason, Readiness, ReadyState, readiness_for_circuit,
 };
 pub use error::{ApiError, ErrorType};
 pub use routes::router;

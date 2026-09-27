@@ -506,6 +506,49 @@ fn lab_test_gpus_2_is_the_inventory_path() {
     assert_eq!(env(&jobs[1], "TURBINE_EXPECT_AMD"), "2");
 }
 
+/// P3 Task 17: `--features <list>` reaches the in-container `cargo test` (the fault-injection
+/// build of `tests/fault.rs`), before the harness arguments; `--stop` takes no features.
+#[test]
+fn lab_test_forwards_cargo_features() {
+    let text = dry_run(
+        "lab-test.sh",
+        "test-features",
+        &["--dry-run", "novanas", "--features", "fault-injection"],
+    );
+    let id = run_id(&text, "lab-test");
+    assert_eq!(
+        test_command(&text, &id),
+        [
+            "cargo",
+            "test",
+            "--no-fail-fast",
+            "--workspace",
+            "--features",
+            "fault-injection",
+            "--",
+            "--include-ignored",
+            "--show-output",
+            "--skip",
+            "hf_reference_matches_cpu",
+        ]
+    );
+    for args in [
+        &[
+            "novanas",
+            "--stop",
+            "0926-abc",
+            "--features",
+            "fault-injection",
+        ][..],
+        &["novanas", "--features"][..],
+        &["novanas", "--features", "bad feature"][..],
+    ] {
+        let (out, called) = lab_script("lab-test.sh", "features-usage", args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert_eq!(called, None, "{args:?} contacted a host");
+    }
+}
+
 #[test]
 fn lab_test_passes_a_subset_and_opts_into_the_hf_reference() {
     let text = dry_run(
@@ -1137,4 +1180,110 @@ fn lab_perf_usage_errors_exit_2_without_contacting_a_host() {
         assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
         assert!(stderr(&out).contains(expect), "{tag}: {}", stderr(&out));
     }
+}
+
+/// Runs `bash <args>` with the host-contacting tools stubbed as in [`lab_script`]; returns the
+/// output and whether any stub was called.
+fn bash_with_stubs(args: &[&str], tag: &str) -> (Output, Option<String>) {
+    let stubs =
+        std::env::temp_dir().join(format!("turbine-lab-scripts-{}-{tag}", std::process::id()));
+    let _ = fs::remove_dir_all(&stubs);
+    fs::create_dir_all(&stubs).expect("stub dir");
+    let calls = stubs.join("calls.log");
+    for tool in ["ssh", "rsync", "scp", "curl", "kubectl", "docker"] {
+        let path = stubs.join(tool);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"{tool} $*\" >> '{}'\nexit 97\n",
+                calls.display()
+            ),
+        )
+        .expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        }
+    }
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .args(args)
+        .current_dir(repo_root())
+        .env("PATH", path)
+        .output()
+        .expect("run bash");
+    let called = fs::read_to_string(&calls).ok();
+    let _ = fs::remove_dir_all(&stubs);
+    (out, called)
+}
+
+/// `soak_precondition <host> <bytes>` from `scripts/overload-soak.sh` sourced with
+/// `SOAK_SOURCE_ONLY=1`.
+fn soak_precondition(host: &str, bytes: &str) -> (Output, Option<String>) {
+    let script = repo_root().join("scripts/overload-soak.sh");
+    let snippet = format!(
+        "SOAK_SOURCE_ONLY=1 source '{}' && soak_precondition {host} {bytes}",
+        script.display()
+    );
+    bash_with_stubs(&["-c", &snippet], "soak-precondition")
+}
+
+/// P3 S-19: the soak refuses a busy host (`precondition`, exit 1) and starts nothing: an R9700
+/// with 4 GiB VRAM in use is busy, 512 MiB is free; a Spark needs MemAvailable above the 24 GiB
+/// container cap plus the 8 GiB host reserve (25 GiB refused, 42 GiB accepted).
+#[test]
+fn soak_precondition_refuses_busy_gpu() {
+    for (host, bytes, ok) in [
+        ("novanas", "4294967296", false),
+        ("novanas", "536870912", true),
+        ("dgx-spark", "26843545600", false),
+        ("dgx-spark2", "45097156608", true),
+        ("novanas", "lots", false),
+    ] {
+        let (out, called) = soak_precondition(host, bytes);
+        assert_eq!(called, None, "{host} {bytes}: contacted a host");
+        assert_eq!(
+            out.status.success(),
+            ok,
+            "{host} {bytes}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        if !ok {
+            assert_eq!(out.status.code(), Some(1), "{host} {bytes}");
+            assert!(stderr(&out).contains("precondition"), "{}", stderr(&out));
+        }
+    }
+    // Usage errors exit 2 before anything is contacted.
+    for args in [
+        &[][..],
+        &["localhost"][..],
+        &["novanas", "--duration", "ten"][..],
+        &["novanas", "--model", "/etc"][..],
+    ] {
+        let (out, called) = lab_script("overload-soak.sh", "soak-usage", args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert_eq!(called, None, "{args:?}: contacted a host");
+    }
+}
+
+/// The soak's server configuration loads through the real configuration model, on the hip
+/// backend with the Phase 3 reliability keys it states.
+#[test]
+fn phase3_soak_config_loads() {
+    let path = repo_root().join("scripts/lab/phase3-novanas-soak.yaml");
+    let c = turbine_core::config::load(&path, &[]).expect("phase3-novanas-soak.yaml loads");
+    assert_eq!(c.execution.backend.as_str(), "hip");
+    assert_eq!(c.server.listen.port(), 18000);
+    assert!(c.reliability.enabled && c.reliability.adaptive_admission);
+    assert_eq!(c.reliability.admission.max_queue, 256);
+    assert_eq!(
+        c.kv.gpu.max_bytes, None,
+        "the kv pool is the budget remainder (C-8)"
+    );
 }

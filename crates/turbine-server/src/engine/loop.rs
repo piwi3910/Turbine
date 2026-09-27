@@ -35,9 +35,28 @@
 //! an executed iteration records them in `turbine_engine_iteration_seconds{stage}`, and every
 //! published scheduler document carries the last turn's `stages_ms`.
 //!
-//! A failed iteration fails every request in it with `internal_error`; three in a row stop the
-//! engine (CONFLICT C-25). A panic inside a turn is caught, logged with the iteration's request
-//! ids, and fails every request.
+//! Reliability (P3 S-9 … S-12; CONFLICT C-25 retires the Phase 2 exit after three failed
+//! iterations): each turn reads the pressure controller's snapshot once — its throttle plan
+//! becomes the iteration's `IterationLimits`, the admission gate in front of the scheduler
+//! decides against it — and publishes the engine's figures ([`EngineStats`]) for the
+//! controller. A device out-of-memory error enters SURVIVAL (the emergency reserve is released)
+//! and retries the iteration with a halved batch after a backoff, at most
+//! `reliability.recovery.max_retries` times; when the retries are exhausted the batch's
+//! requests fail `resource_exhausted` and the engine keeps serving. Errors are classified by
+//! the execution backend that raised them (`KernelError::is_oom` / `is_sticky`, whose sticky
+//! error names each registered backend declares). Any other device error fails the
+//! iteration's requests with `internal_error` and opens the circuit breaker: the admission
+//! queue is rejected `circuit_open`, running requests continue until they finish or
+//! `reliability.circuit.drain_timeout` passes (then they fail `circuit_open`), and after the
+//! cooldown internal 16-token greedy probes, which bypass the admission queue and are not
+//! client requests, decide whether the circuit closes. A sticky (context-corrupting) device
+//! error stops device work at once: every live request fails `resource_exhausted` and the
+//! engine ends so the server exits 3. A panic inside a turn is caught, logged with the
+//! iteration's request ids, fails every request with `internal_error` and is treated like a
+//! sticky device error. Under overlap scheduling an out-of-memory launch first finishes the
+//! iteration in flight, then runs the plan through the serial recovery path; an error when
+//! collecting an iteration that the scheduler already completed ahead cannot be retried, so
+//! its requests fail (`resource_exhausted` for out-of-memory, counted as a failed recovery).
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -47,14 +66,21 @@ use std::time::{Duration, Instant};
 use smallvec::SmallVec;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 use turbine_core::clock::Clock;
-use turbine_core::request::{ErrorCode, FinishReason, GenerationEvent};
-use turbine_core::types::{RequestId, SeqId};
+use turbine_core::request::{
+    Endpoint, ErrorCode, FinishReason, GenerationEvent, GenerationRequest, SamplingParams,
+    StopConditions,
+};
+use turbine_core::types::{CircuitState, PressureState, Priority, RequestId, SeqId};
 use turbine_kv::{BlockPool, KvDocument};
 use turbine_model::executor::{
     BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice,
     TokenFeed,
 };
-use turbine_model::{ForwardPhase, SampleJob, SampledToken, Tokenizer, sample_rows};
+use turbine_model::{ForwardPhase, ModelError, SampleJob, SampledToken, Tokenizer, sample_rows};
+use turbine_reliability::circuit::{CircuitEvent, CircuitReason};
+use turbine_reliability::controller::{EngineStats, Snapshot};
+use turbine_reliability::recovery::RecoveryStep;
+use turbine_reliability::step_window::{DecodeStepWindow, StepSample};
 use turbine_scheduler::{
     BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome, IterationPlan,
     SchedRequest, Scheduler, SubmitError,
@@ -64,12 +90,18 @@ use super::deadlines::{Deadlines, Timeouts};
 use super::requests::{ActiveRequest, Delivery, Flush, Submission};
 use super::stages::{Stage, StageClock};
 use super::{
-    EngineCommand, EngineDocs, EngineMetrics, EngineShared, MAX_CONSECUTIVE_FAILURES, SubmitAck,
+    EVENT_CHANNEL_CAPACITY, EngineCommand, EngineDocs, EngineMetrics, EngineShared, SubmitAck,
 };
 use crate::metrics::{Outcome, TokenKind};
+use crate::reliability::EngineReliability;
 
 /// Sleep between turns while requests exist but the last plan had nothing to run.
 const IDLE_POLL: Duration = Duration::from_millis(2);
+/// Smoothing of the decode step-time estimate and the GREEN baseline.
+const STEP_ALPHA: f64 = 0.1;
+/// Circuit probe (P3 S-12): a fixed prompt and 16 greedy tokens.
+const PROBE_TEXT: &str = "The quick brown fox jumps over the lazy dog.";
+const PROBE_TOKENS: u32 = 16;
 
 /// Everything the engine owns.
 pub(crate) struct EngineParts {
@@ -88,6 +120,8 @@ pub(crate) struct EngineParts {
     /// before it (P2c), when the executor can ([`ModelExecutor::overlaps`] and a device logits
     /// reduction); otherwise the serial loop.
     pub overlap: bool,
+    /// The pressure controller's snapshot, recovery and circuit inputs (P3).
+    pub reliability: EngineReliability,
 }
 
 enum Turn {
@@ -110,7 +144,23 @@ pub(crate) struct EngineLoop {
     /// Owner request and choice index of every sequence.
     seqs: HashMap<SeqId, (RequestId, usize)>,
     next_seq: u64,
-    consecutive_failures: u32,
+    rel: EngineReliability,
+    /// The controller snapshot read at the start of this turn.
+    snap: Arc<Snapshot>,
+    /// The circuit probe in flight and its (unread) event channel.
+    probe: Option<(RequestId, mpsc::Receiver<GenerationEvent>)>,
+    probe_prompt: Vec<u32>,
+    /// Pure decode step times behind `step_time_drift`.
+    decode_steps: DecodeStepWindow,
+    /// Smoothed decode step time (s); 0 before the first decode.
+    decode_step_s: f64,
+    /// Smoothed decode step time of GREEN + HEALTHY iterations without a probe: what a probe's
+    /// per-token latency is compared with.
+    baseline_step_s: Option<f64>,
+    /// Iterations executed (the circuit breaker's `Iteration` events).
+    iterations: u64,
+    /// When the engine first saw a fatal circuit (a controller failure drains from then on).
+    fatal_since: Option<Instant>,
     /// Requests of the iteration being executed (named in the log if it panics).
     iteration_requests: Vec<RequestId>,
     shutting_down: bool,
@@ -201,6 +251,13 @@ impl EngineLoop {
             },
             "overlap scheduling"
         );
+        let probe_prompt = p
+            .tokenizer
+            .encode(PROBE_TEXT, true)
+            .ok()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| vec![0]);
+        let snap = p.reliability.handle.snapshot();
         let mut engine = EngineLoop {
             deadlines: Deadlines::new(Arc::clone(&p.clock), p.timeouts),
             exec: p.executor,
@@ -215,7 +272,15 @@ impl EngineLoop {
             requests: HashMap::new(),
             seqs: HashMap::new(),
             next_seq: 1,
-            consecutive_failures: 0,
+            rel: p.reliability,
+            snap,
+            probe: None,
+            probe_prompt,
+            decode_steps: DecodeStepWindow::new(),
+            decode_step_s: 0.0,
+            baseline_step_s: None,
+            iterations: 0,
+            fatal_since: None,
             iteration_requests: Vec::new(),
             shutting_down: false,
             idle_turn: false,
@@ -227,11 +292,13 @@ impl EngineLoop {
             overlapped: 0,
         };
         engine.publish(false);
+        engine.publish_stats();
         engine
     }
 
     /// Serves until the command channel closes or `Shutdown` completes. `Err` carries the
-    /// reason the server must exit 1: consecutive failed iterations or a panic.
+    /// reason the server must exit 3: a fatal circuit (sticky device error, controller
+    /// failure) or a panic.
     pub fn run(mut self) -> Result<(), String> {
         loop {
             let turn = catch_unwind(AssertUnwindSafe(|| {
@@ -262,10 +329,14 @@ impl EngineLoop {
                         panic = %what,
                         "engine thread panicked"
                     );
-                    format!("engine thread panicked: {what}")
+                    let message = format!("engine thread panicked: {what}");
+                    // The device state is unknown: treat it like a sticky device error.
+                    self.rel
+                        .circuit_event(CircuitEvent::DeviceError { sticky: true });
+                    self.fail_all(ErrorCode::InternalError, &message);
+                    message
                 }
             };
-            self.fail_all(&message);
             return Err(message);
         }
     }
@@ -280,7 +351,8 @@ impl EngineLoop {
         self.detect_disconnects();
         self.expire_deadlines();
 
-        let plan = self.sched.plan(&mut self.pool, &IterationLimits::default());
+        let limits = self.read_snapshot()?;
+        let mut plan = self.sched.plan(&mut self.pool, &limits);
         for &(id, reason) in &plan.dropped {
             self.on_dropped(id, reason);
         }
@@ -295,32 +367,230 @@ impl EngineLoop {
             );
             self.idle_turn = true;
             self.publish(false);
+            self.publish_stats();
             return Ok(Turn::Continue);
         }
         self.idle_turn = false;
         self.iteration_requests = plan_requests(&plan, &self.seqs);
-        let outcome = self.execute(&plan);
-        let failure = outcome.failed.clone();
+        let started = Instant::now();
+        let outcome = self.execute(&mut plan);
+        let failed = outcome.failed.is_some();
         self.sched.complete(&mut self.pool, outcome);
-        self.publish(true);
-        match failure {
-            None => self.consecutive_failures = 0,
-            Some(f) => {
-                self.consecutive_failures += 1;
-                if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    return Err(format!(
-                        "{} consecutive iterations failed; last error: {}",
-                        self.consecutive_failures, f.message
-                    ));
-                }
-            }
+        if !failed {
+            self.observe(&plan, started.elapsed().as_secs_f64());
         }
+        self.publish(true);
+        self.publish_stats();
+        self.check_fatal()?;
         Ok(Turn::Continue)
     }
 
-    /// Nothing queued, running, in flight or waiting to be delivered.
+    /// Reads the controller's snapshot for this turn (P3): a fatal circuit ends the engine, an
+    /// expired drain fails the running requests, PROBING keeps a probe in flight, and the
+    /// throttle plan becomes the iteration's limits.
+    fn read_snapshot(&mut self) -> Result<IterationLimits, String> {
+        let before = self.snap.circuit;
+        self.snap = self.rel.handle.snapshot();
+        let snap = Arc::clone(&self.snap);
+        // Back from PROBING: the device may have changed, relearn the drift baselines (S-12).
+        if before == CircuitState::Probing && snap.circuit == CircuitState::Healthy {
+            self.decode_steps.reset();
+        }
+        if snap.fatal {
+            self.fatal(&snap)?;
+        }
+        if snap.drain_expired {
+            self.fail_running(
+                ErrorCode::CircuitOpen,
+                "the circuit breaker is open and reliability.circuit.drain_timeout has passed",
+            );
+        }
+        self.maybe_probe(snap.circuit);
+        Ok(IterationLimits::from(&snap.throttle))
+    }
+
+    /// After an executed iteration: a circuit that turned fatal ends the engine.
+    fn check_fatal(&mut self) -> Result<(), String> {
+        let snap = self.rel.handle.snapshot();
+        if snap.fatal {
+            self.fatal(&snap)?;
+        }
+        Ok(())
+    }
+
+    /// The circuit is fatal. A sticky device error (or a panic) stops device work at once:
+    /// every live request fails `resource_exhausted` and `Err` ends the engine (exit 3). A
+    /// controller failure first lets the running requests finish, up to `drain_timeout`
+    /// (admission already refuses everything with `circuit_open`).
+    fn fatal(&mut self, snap: &Snapshot) -> Result<(), String> {
+        let reason = snap.document.circuit.last_reason;
+        if reason == Some(CircuitReason::ControllerFailed) {
+            let since = *self.fatal_since.get_or_insert_with(Instant::now);
+            if !self.sched.running_ids().is_empty() && since.elapsed() < self.rel.drain_timeout {
+                return Ok(());
+            }
+        }
+        let reason = reason.map_or("device_fatal", CircuitReason::as_str);
+        let message = format!("circuit open ({reason}): no further device work; exiting");
+        tracing::error!(
+            event = "circuit_transition",
+            reason,
+            "fatal circuit: failing every request and exiting"
+        );
+        self.fail_all(ErrorCode::ResourceExhausted, &message);
+        Err(message)
+    }
+
+    /// Fails every running request with `code` (the circuit's drain timed out).
+    fn fail_running(&mut self, code: ErrorCode, message: &str) {
+        let running = self.sched.running_ids();
+        let failed = self.sched.fail_requests(&mut self.pool, &running);
+        self.fail_requests_with(&failed, code, message);
+    }
+
+    /// `ids` end with an error event carrying `code`, counted as failed.
+    fn fail_requests_with(&mut self, ids: &[RequestId], code: ErrorCode, message: &str) {
+        for &id in ids {
+            if self.requests.get(&id).is_some_and(|r| !r.done) {
+                self.account(id, Outcome::Failed, message);
+                self.deliver(id, ActiveRequest::error_event(code, message));
+                self.retire(id);
+            }
+        }
+    }
+
+    /// While the circuit is PROBING, keeps one internal probe in flight: a fixed prompt and
+    /// [`PROBE_TOKENS`] greedy tokens, bypassing the admission queue (with its worst-case KV
+    /// reservation), never counted as a client request. Its outcome goes to the circuit
+    /// breaker when it ends ([`EngineLoop::account`]).
+    fn maybe_probe(&mut self, circuit: CircuitState) {
+        if circuit != CircuitState::Probing || self.probe.is_some() || self.shutting_down {
+            return;
+        }
+        let id = RequestId::new_v4();
+        let seq = SeqId(self.next_seq);
+        self.next_seq += 1;
+        let prompt_len = u32::try_from(self.probe_prompt.len()).unwrap_or(u32::MAX);
+        let mut r = SchedRequest::new(
+            id,
+            smallvec::smallvec![seq],
+            prompt_len,
+            PROBE_TOKENS,
+            self.pool.layout().block_tokens,
+        );
+        r.arrival = self.clock.now_mono();
+        if let Err(e) = self.sched.submit_probe(r, self.pool.total_blocks()) {
+            tracing::warn!(
+                event = "circuit_probe",
+                reason = e.as_str(),
+                "circuit probe refused"
+            );
+            self.rel.circuit_event(CircuitEvent::ProbeFailed);
+            return;
+        }
+        let request = GenerationRequest {
+            id,
+            n: 1,
+            priority: Priority::default(),
+            echo: false,
+            constraint: None,
+            deadline_ms: u64::MAX,
+            endpoint: Endpoint::Completions,
+            http_request_id: "circuit-probe".into(),
+            prompt_tokens: self.probe_prompt.clone(),
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            stop: StopConditions {
+                max_tokens: PROBE_TOKENS,
+                ignore_eos: true,
+                ..StopConditions::default()
+            },
+        };
+        let (events, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let active = ActiveRequest::new(request.into(), events, &[seq], &self.tokenizer);
+        self.seqs.insert(seq, (id, 0));
+        self.requests.insert(id, active);
+        self.deadlines.track(id, u64::MAX);
+        self.probe = Some((id, rx));
+        tracing::info!(event = "circuit_probe", request_id = %id.0, "circuit probe started");
+    }
+
+    /// One executed iteration of `secs`: the decode step window and estimates, and the
+    /// admission throughput EWMAs.
+    fn observe(&mut self, plan: &IterationPlan, secs: f64) {
+        self.iterations += 1;
+        let prefill = plan.prefill_tokens();
+        let decodes = plan.decode_tokens();
+        let calm = self.snap.state == PressureState::Green
+            && self.snap.circuit == CircuitState::Healthy
+            && self.probe.is_none();
+        self.decode_steps.observe(
+            StepSample {
+                prefill_tokens: prefill,
+                rows: decodes,
+                context_tokens: plan.decode_context_tokens(),
+                secs,
+            },
+            calm,
+        );
+        if decodes > 0 {
+            self.decode_step_s = if self.decode_step_s > 0.0 {
+                STEP_ALPHA * secs + (1.0 - STEP_ALPHA) * self.decode_step_s
+            } else {
+                secs
+            };
+            if self.snap.state == PressureState::Green
+                && self.snap.circuit == CircuitState::Healthy
+                && self.probe.is_none()
+            {
+                self.baseline_step_s = Some(
+                    self.baseline_step_s
+                        .map_or(secs, |b| STEP_ALPHA * secs + (1.0 - STEP_ALPHA) * b),
+                );
+            }
+        }
+        // A mixed batch's time is split between prefill and decode by token count.
+        let prefill_s = if prefill > 0 {
+            secs * f64::from(prefill) / f64::from(prefill + decodes)
+        } else {
+            0.0
+        };
+        if let Some(g) = self.sched.gate_mut() {
+            g.admission_mut()
+                .observe_iteration(prefill, prefill_s, (decodes > 0).then_some(secs));
+        }
+    }
+
+    /// The figures the pressure controller reads on its next tick.
+    fn publish_stats(&self) {
+        let p95 = self.decode_steps.p95();
+        self.rel.publish(EngineStats {
+            running_remaining_tokens: self.sched.remaining_tokens(),
+            free_kv_blocks: self.pool.free_blocks(),
+            block_tokens: self.pool.layout().block_tokens,
+            decode_tokens_per_s: if self.decode_step_s > 0.0 {
+                1.0 / self.decode_step_s
+            } else {
+                0.0
+            },
+            step_time_p95: p95,
+            queue_len: self
+                .sched
+                .gate()
+                .map_or(0, |g| u32::try_from(g.queue_len()).unwrap_or(u32::MAX)),
+            iterations: self.iterations,
+        });
+    }
+
+    /// Nothing queued, running, in flight or waiting to be delivered, and no circuit probe to
+    /// start.
     fn quiet(&self) -> bool {
-        self.sched.is_idle() && self.requests.is_empty() && self.in_flight.is_none()
+        let probe_due = !self.shutting_down
+            && self.probe.is_none()
+            && self.rel.handle.circuit() == CircuitState::Probing;
+        self.sched.is_idle() && self.requests.is_empty() && self.in_flight.is_none() && !probe_due
     }
 
     /// Step 1. Returns false when the engine should stop. The turn's stage clock starts after
@@ -361,6 +631,8 @@ impl EngineLoop {
         match cmd {
             EngineCommand::Submit(request, events, ack) => self.submit(*request, events, ack),
             EngineCommand::Shutdown => self.begin_shutdown(),
+            // The pressure controller changed the circuit: the turn reads the new snapshot.
+            EngineCommand::Wake => {}
         }
     }
 
@@ -536,7 +808,22 @@ impl EngineLoop {
                 Outcome::Rejected,
                 Some((
                     ErrorCode::QueueTimeout,
-                    "the request waited longer than scheduler.queue_timeout",
+                    "the request waited longer than reliability.admission.queue_timeout",
+                )),
+            ),
+            CancelReason::CircuitOpen => (
+                Outcome::Rejected,
+                Some((
+                    ErrorCode::CircuitOpen,
+                    "the circuit breaker opened while the request was queued",
+                )),
+            ),
+            CancelReason::Overloaded => (
+                Outcome::Rejected,
+                Some((
+                    ErrorCode::Overloaded,
+                    "the engine entered SURVIVAL before the request started and the admission \
+                     queue is full",
                 )),
             ),
             CancelReason::RequestTimeout => (
@@ -572,53 +859,114 @@ impl EngineLoop {
         }
     }
 
-    /// Steps 5 and 6: returns the outcome for `Scheduler::complete`.
-    fn execute(&mut self, plan: &IterationPlan) -> IterationOutcome {
+    /// Steps 5 and 6 with bounded out-of-memory recovery (module comment): returns the outcome
+    /// for `Scheduler::complete`. `plan` shrinks when a retry runs a smaller batch.
+    fn execute(&mut self, plan: &mut IterationPlan) -> IterationOutcome {
         let mut outcome = IterationOutcome {
             iteration: plan.iteration,
             ..IterationOutcome::default()
         };
-        if let Err(message) = self.fork_copies(plan) {
-            self.fail_iteration(message, &mut outcome);
-            return outcome;
+        let batch = self.iteration_requests.clone();
+        loop {
+            let error = match self.attempt(plan) {
+                Ok(None) => return outcome,
+                Ok(Some((rows, logits))) => {
+                    self.sample(&rows, logits, &mut outcome);
+                    self.rel.recovery_succeeded();
+                    return outcome;
+                }
+                Err(e) => e,
+            };
+            if !error.oom {
+                if error.sticky {
+                    tracing::error!(event = "iteration_failed", reason = "device_fatal", iteration = plan.iteration, error = %error.message, "sticky device error");
+                    // The fatal path after `complete` fails every live request.
+                    self.rel
+                        .circuit_event(CircuitEvent::DeviceError { sticky: true });
+                    outcome.failed = Some(IterationFailure {
+                        message: error.message,
+                    });
+                } else {
+                    self.fail_iteration(error.message, &mut outcome);
+                    self.rel
+                        .circuit_event(CircuitEvent::DeviceError { sticky: false });
+                }
+                return outcome;
+            }
+            let released = self.rel.on_oom();
+            tracing::warn!(event = "allocation_failure", reason = "device_oom", iteration = plan.iteration, batch = plan.items.len(), reserve_released = released, error = %error.message, "device out of memory");
+            match self.rel.recovery_step(plan.items.len()) {
+                RecoveryStep::Retry {
+                    backoff,
+                    batch_limit,
+                    ..
+                } => {
+                    std::thread::sleep(backoff);
+                    self.sched.shrink_plan(&mut self.pool, plan, batch_limit);
+                    self.iteration_requests = plan_requests(plan, &self.seqs);
+                }
+                RecoveryStep::GiveUp => {
+                    self.rel.recovery_failed();
+                    // Requests shrunk out of the plan leave the scheduler here; the ones still
+                    // in flight fail with the iteration in `complete`.
+                    let in_plan = self.iteration_requests.clone();
+                    let rest: Vec<RequestId> = batch
+                        .iter()
+                        .filter(|id| !in_plan.contains(id))
+                        .copied()
+                        .collect();
+                    self.sched.fail_requests(&mut self.pool, &rest);
+                    self.fail_requests_with(
+                        &batch,
+                        ErrorCode::ResourceExhausted,
+                        "device memory was exhausted and recovery retries failed",
+                    );
+                    outcome.failed = Some(IterationFailure {
+                        message: error.message,
+                    });
+                    return outcome;
+                }
+            }
         }
+    }
+
+    /// One attempt at the plan: the fork copies, the batch, then the forward pass (`None` when
+    /// the plan has only forks).
+    fn attempt(
+        &mut self,
+        plan: &IterationPlan,
+    ) -> Result<Option<(Vec<RowInfo>, Logits)>, IterationError> {
+        self.fork_copies(plan)?;
         self.stages.mark(Stage::Prepare);
         if plan.items.is_empty() {
-            return outcome;
+            return Ok(None);
         }
-        let built = match self.build_batch(plan, None) {
-            Ok(Build::Ready(built)) => built,
-            Ok(Build::NeedsHost) => {
-                // Unreachable: without a launch in flight every token is on the host.
-                self.fail_iteration("a batch token is not on the host".into(), &mut outcome);
-                return outcome;
-            }
-            Err(message) => {
-                self.fail_iteration(message, &mut outcome);
-                return outcome;
-            }
-        };
-        let logits = match self.forward(plan, &built) {
-            Ok(logits) => logits,
-            Err(message) => {
-                self.fail_iteration(message, &mut outcome);
-                return outcome;
+        let built = match self
+            .build_batch(plan, None)
+            .map_err(IterationError::other)?
+        {
+            Build::Ready(built) => built,
+            // Unreachable: without a launch in flight every token is on the host.
+            Build::NeedsHost => {
+                return Err(IterationError::other(
+                    "a batch token is not on the host".into(),
+                ));
             }
         };
-        self.sample(&built.rows, logits, &mut outcome);
-        outcome
+        let logits = self.forward(plan, &built)?;
+        Ok(Some((built.rows, logits)))
     }
 
     /// The `n` > 1 fork copies of `plan` (`ModelExecutor::copy_blocks`), ordered before its
     /// forward on the stream.
-    fn fork_copies(&mut self, plan: &IterationPlan) -> Result<(), String> {
+    fn fork_copies(&mut self, plan: &IterationPlan) -> Result<(), IterationError> {
         let (src, dst): (Vec<_>, Vec<_>) = plan.forks.iter().filter_map(|f| f.copy).unzip();
         if src.is_empty() {
             return Ok(());
         }
         self.exec
             .copy_blocks(&self.pool.view(), &src, &dst)
-            .map_err(|e| format!("copy_blocks failed: {e}"))
+            .map_err(|e| IterationError::model("copy_blocks failed", e))
     }
 
     /// Packs `plan` into one ragged batch. Each item's tokens come from its request's history;
@@ -753,7 +1101,7 @@ impl EngineLoop {
     }
 
     /// Runs the forward pass over `built` (one ragged batch of `plan`'s items).
-    fn forward(&mut self, plan: &IterationPlan, built: &Built) -> Result<Logits, String> {
+    fn forward(&mut self, plan: &IterationPlan, built: &Built) -> Result<Logits, IterationError> {
         let slices = seq_slices(plan, built);
         let phase = phase_of(plan);
         let started = Instant::now();
@@ -774,8 +1122,11 @@ impl EngineLoop {
         self.metrics
             .model
             .observe_forward(phase, started.elapsed().as_secs_f64());
-        let logits = result.map_err(|e| format!("{} forward pass failed: {e}", phase.as_str()))?;
-        self.check_logits(&logits, slices.len())?;
+        let logits = result.map_err(|e| {
+            IterationError::model(&format!("{} forward pass failed", phase.as_str()), e)
+        })?;
+        self.check_logits(&logits, slices.len())
+            .map_err(IterationError::other)?;
         Ok(logits)
     }
 
@@ -982,7 +1333,8 @@ impl EngineLoop {
             self.sched.complete(&mut self.pool, outcome);
             self.in_flight = Some(prev);
         }
-        let plan = self.sched.plan(&mut self.pool, &IterationLimits::default());
+        let limits = self.read_snapshot()?;
+        let plan = self.sched.plan(&mut self.pool, &limits);
         for &(id, reason) in &plan.dropped {
             self.on_dropped(id, reason);
         }
@@ -1004,6 +1356,8 @@ impl EngineLoop {
             );
             self.idle_turn = !executed;
             self.publish(executed);
+            self.publish_stats();
+            self.check_fatal()?;
             return Ok(Turn::Continue);
         }
         self.idle_turn = false;
@@ -1012,8 +1366,10 @@ impl EngineLoop {
         if let Some(p) = prev {
             self.finish(p)?;
         }
-        self.in_flight = Some(next);
+        self.in_flight = next;
         self.publish(true);
+        self.publish_stats();
+        self.check_fatal()?;
         Ok(Turn::Continue)
     }
 
@@ -1060,13 +1416,15 @@ impl EngineLoop {
 
     /// Launches `plan` (overlap scheduling): with the iteration in flight `prev` still on the
     /// device when every token not on the host is one it chose, else after finishing `prev`.
-    /// A failed launch fails the plan's requests (their sequences are reported finished at the
-    /// next completion) and counts as a failed iteration.
+    /// A failed launch is classified ([`EngineLoop::launch_failed`]): out of memory runs the
+    /// plan through the serial recovery path (`None`: nothing left in flight), any other error
+    /// fails the plan's requests (their sequences are reported finished at the next
+    /// completion) and goes to the circuit breaker.
     fn launch_next(
         &mut self,
         plan: IterationPlan,
         prev: &mut Option<InFlight>,
-    ) -> Result<InFlight, String> {
+    ) -> Result<Option<InFlight>, String> {
         let requests = plan_requests(&plan, &self.seqs);
         let mut next = InFlight {
             plan,
@@ -1078,8 +1436,8 @@ impl EngineLoop {
             launch_time: Duration::ZERO,
         };
         next.phase = phase_of(&next.plan);
-        if let Err(message) = self.fork_copies(&next.plan) {
-            return self.launch_failed(next, &message);
+        if let Err(error) = self.fork_copies(&next.plan) {
+            return self.launch_failed(next, prev, error);
         }
         let built = match self.build_batch(&next.plan, prev.as_ref()) {
             Ok(Build::Ready(built)) => built,
@@ -1090,16 +1448,20 @@ impl EngineLoop {
                 match self.build_batch(&next.plan, None) {
                     Ok(Build::Ready(built)) => built,
                     Ok(Build::NeedsHost) => {
-                        return self.launch_failed(next, "a batch token is not on the host");
+                        let error =
+                            IterationError::other("a batch token is not on the host".into());
+                        return self.launch_failed(next, prev, error);
                     }
-                    Err(message) => return self.launch_failed(next, &message),
+                    Err(message) => {
+                        return self.launch_failed(next, prev, IterationError::other(message));
+                    }
                 }
             }
-            Err(message) => return self.launch_failed(next, &message),
+            Err(message) => return self.launch_failed(next, prev, IterationError::other(message)),
         };
         self.stages.mark(Stage::Prepare);
         if built.rows.is_empty() {
-            return Ok(next);
+            return Ok(Some(next));
         }
         if let Some(p) = prev.as_mut() {
             for f in &built.feeds {
@@ -1125,8 +1487,14 @@ impl EngineLoop {
         self.record_graph_counters();
         self.stages.mark(Stage::Launch);
         if let Err(e) = launched {
-            let message = format!("{} forward pass failed: {e}", next.phase.as_str());
-            return self.launch_failed(next, &message);
+            let error =
+                IterationError::model(&format!("{} forward pass failed", next.phase.as_str()), e);
+            if let Some(p) = prev.as_mut() {
+                for row in &mut p.rows {
+                    row.fed_next = false;
+                }
+            }
+            return self.launch_failed(next, prev, error);
         }
         if prev.as_ref().is_some_and(|p| p.launched) {
             self.overlapped += 1;
@@ -1134,7 +1502,7 @@ impl EngineLoop {
         next.yielders = self.yielders(&built.rows);
         next.rows = built.rows;
         next.launched = true;
-        Ok(next)
+        Ok(Some(next))
     }
 
     /// Sequences that get a token from `rows` once they are sampled: each yielding row's own,
@@ -1155,23 +1523,93 @@ impl EngineLoop {
         out
     }
 
-    /// `next` could not be launched: its requests fail and the failure counts.
-    fn launch_failed(&mut self, next: InFlight, message: &str) -> Result<InFlight, String> {
-        self.fail_requests(&next.requests, next.plan.iteration, message);
-        self.count_failure(message)?;
-        Ok(next)
+    /// `next` could not be launched. Out of memory: the iteration in flight `prev` is finished
+    /// first, then `next`'s plan runs through the serial recovery path ([`EngineLoop::execute`])
+    /// and is completed in the scheduler at once, so nothing is left in flight. Any other
+    /// error fails `next`'s requests and goes to the circuit breaker.
+    fn launch_failed(
+        &mut self,
+        next: InFlight,
+        prev: &mut Option<InFlight>,
+        error: IterationError,
+    ) -> Result<Option<InFlight>, String> {
+        if !error.oom {
+            self.device_failure(&next.requests, next.plan.iteration, error);
+            return Ok(Some(next));
+        }
+        if let Some(p) = prev.take() {
+            self.finish(p)?;
+        }
+        let mut plan = next.plan;
+        let started = Instant::now();
+        let mut outcome = self.recover_after(&mut plan, error);
+        outcome
+            .finished
+            .extend(std::mem::take(&mut self.late_finished));
+        let failed = outcome.failed.is_some();
+        self.sched.complete(&mut self.pool, outcome);
+        if !failed {
+            self.observe(&plan, started.elapsed().as_secs_f64());
+        }
+        Ok(None)
     }
 
-    /// One more failed iteration; `Err` once [`MAX_CONSECUTIVE_FAILURES`] failed in a row.
-    fn count_failure(&mut self, message: &str) -> Result<(), String> {
-        self.consecutive_failures += 1;
-        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-            return Err(format!(
-                "{} consecutive iterations failed; last error: {message}",
-                self.consecutive_failures
-            ));
+    /// The serial recovery loop of [`EngineLoop::execute`] for a plan whose first attempt
+    /// already failed with out-of-memory `error`.
+    fn recover_after(
+        &mut self,
+        plan: &mut IterationPlan,
+        error: IterationError,
+    ) -> IterationOutcome {
+        let released = self.rel.on_oom();
+        tracing::warn!(event = "allocation_failure", reason = "device_oom", iteration = plan.iteration, batch = plan.items.len(), reserve_released = released, error = %error.message, "device out of memory (overlap launch)");
+        self.iteration_requests = plan_requests(plan, &self.seqs);
+        match self.rel.recovery_step(plan.items.len()) {
+            RecoveryStep::Retry {
+                backoff,
+                batch_limit,
+                ..
+            } => {
+                std::thread::sleep(backoff);
+                self.sched.shrink_plan(&mut self.pool, plan, batch_limit);
+                self.iteration_requests = plan_requests(plan, &self.seqs);
+                self.execute(plan)
+            }
+            RecoveryStep::GiveUp => {
+                self.rel.recovery_failed();
+                let batch = self.iteration_requests.clone();
+                self.fail_requests_with(
+                    &batch,
+                    ErrorCode::ResourceExhausted,
+                    "device memory was exhausted and recovery retries failed",
+                );
+                IterationOutcome {
+                    iteration: plan.iteration,
+                    failed: Some(IterationFailure {
+                        message: error.message,
+                    }),
+                    ..IterationOutcome::default()
+                }
+            }
         }
-        Ok(())
+    }
+
+    /// A device error the overlap path cannot retry (a failed launch that is not out of
+    /// memory, or an error collecting an iteration the scheduler already completed ahead):
+    /// the requests fail — `resource_exhausted` for out of memory (a failed recovery),
+    /// `internal_error` otherwise — and the circuit breaker hears of it (a sticky error turns
+    /// it fatal).
+    fn device_failure(&mut self, ids: &[RequestId], iteration: u64, error: IterationError) {
+        if error.oom {
+            self.rel.on_oom();
+            self.rel.recovery_failed();
+            self.fail_requests(ids, iteration, ErrorCode::ResourceExhausted, &error.message);
+        } else {
+            self.fail_requests(ids, iteration, ErrorCode::InternalError, &error.message);
+            self.rel.circuit_event(CircuitEvent::DeviceError {
+                sticky: error.sticky,
+            });
+        }
     }
 
     /// Waits for the launched iteration `p` (only it; the next keeps running) and does its host
@@ -1188,26 +1626,32 @@ impl EngineLoop {
             .model
             .observe_forward(p.phase, (p.launch_time + waited).as_secs_f64());
         let logits = collected
-            .map_err(|e| format!("{} forward pass failed: {e}", p.phase.as_str()))
-            .and_then(|logits| self.check_logits(&logits, p.rows.len()).map(|()| logits));
+            .map_err(|e| {
+                IterationError::model(&format!("{} forward pass failed", p.phase.as_str()), e)
+            })
+            .and_then(|logits| {
+                self.check_logits(&logits, p.rows.len())
+                    .map(|()| logits)
+                    .map_err(IterationError::other)
+            });
         match logits {
             Ok(logits) => {
-                self.consecutive_failures = 0;
                 let mut outcome = IterationOutcome::default();
                 self.sample(&p.rows, logits, &mut outcome);
                 self.late_finished.extend(outcome.finished);
+                self.observe(&p.plan, (p.launch_time + waited).as_secs_f64());
                 Ok(())
             }
-            Err(message) => {
-                self.fail_requests(&p.requests, p.plan.iteration, &message);
-                self.count_failure(&message)
+            Err(error) => {
+                self.device_failure(&p.requests, p.plan.iteration, error);
+                Ok(())
             }
         }
     }
 
-    /// Every live request of `ids` (iteration `iteration`) fails with `internal_error`; its
-    /// live sequences are reported finished at the next completion (overlap scheduling).
-    fn fail_requests(&mut self, ids: &[RequestId], iteration: u64, message: &str) {
+    /// Every live request of `ids` (iteration `iteration`) fails with `code`; its live
+    /// sequences are reported finished at the next completion (overlap scheduling).
+    fn fail_requests(&mut self, ids: &[RequestId], iteration: u64, code: ErrorCode, message: &str) {
         tracing::error!(event = "iteration_failed", iteration, error = %message, "iteration failed");
         for &id in ids {
             let Some(r) = self.requests.get(&id).filter(|r| !r.done) else {
@@ -1217,10 +1661,7 @@ impl EngineLoop {
             self.late_finished
                 .extend(live.into_iter().map(|s| (s, FinishReason::Stop)));
             self.account(id, Outcome::Failed, message);
-            self.deliver(
-                id,
-                ActiveRequest::error_event(ErrorCode::InternalError, message),
-            );
+            self.deliver(id, ActiveRequest::error_event(code, message));
             self.retire(id);
         }
     }
@@ -1285,8 +1726,11 @@ impl EngineLoop {
             }
         };
         let now = Instant::now();
+        let probe = self.probe.as_ref().is_some_and(|(p, _)| *p == id);
         let c = &mut r.choices[choice];
         match c.last_token_at {
+            // A circuit probe is not a client request: no latency samples.
+            _ if probe => {}
             None => self
                 .metrics
                 .server
@@ -1368,8 +1812,8 @@ impl EngineLoop {
         outcome.failed = Some(IterationFailure { message });
     }
 
-    /// The engine stops: every request not yet accounted gets `internal_error`.
-    fn fail_all(&mut self, message: &str) {
+    /// The engine stops: every request not yet accounted gets `code`.
+    fn fail_all(&mut self, code: ErrorCode, message: &str) {
         let live: Vec<RequestId> = self
             .requests
             .iter()
@@ -1378,10 +1822,7 @@ impl EngineLoop {
             .collect();
         for id in live {
             self.account(id, Outcome::Failed, message);
-            self.deliver(
-                id,
-                ActiveRequest::error_event(ErrorCode::InternalError, message),
-            );
+            self.deliver(id, ActiveRequest::error_event(code, message));
             self.retire(id);
         }
     }
@@ -1407,7 +1848,10 @@ impl EngineLoop {
         }
     }
 
-    /// Records the end of request `id` once (tokens, latency, outcome, log line).
+    /// Records the end of request `id` once (tokens, latency, outcome, log line). The circuit
+    /// probe's end goes to the circuit breaker instead: `ProbeSucceeded` with its per-token
+    /// latency over the GREEN baseline decode step (1.0 before a baseline exists), else
+    /// `ProbeFailed`.
     fn account(&mut self, id: RequestId, outcome: Outcome, detail: &str) {
         let Some(r) = self.requests.get_mut(&id) else {
             return;
@@ -1416,6 +1860,22 @@ impl EngineLoop {
             return;
         }
         r.done = true;
+        if self.probe.as_ref().is_some_and(|(p, _)| *p == id) {
+            let per_token = r.arrived.elapsed().as_secs_f64() / r.generated_tokens().max(1) as f64;
+            self.probe = None;
+            let event = if outcome == Outcome::Ok {
+                let latency_ratio = self
+                    .baseline_step_s
+                    .filter(|b| *b > 0.0)
+                    .map_or(1.0, |b| per_token / b);
+                CircuitEvent::ProbeSucceeded { latency_ratio }
+            } else {
+                CircuitEvent::ProbeFailed
+            };
+            tracing::info!(event = "circuit_probe", request_id = %id.0, outcome = outcome.as_str(), per_token_seconds = per_token, reason = detail, "circuit probe finished");
+            self.rel.circuit_event(event);
+            return;
+        }
         let generated = r.generated_tokens();
         let m = &self.metrics.server;
         m.add_tokens(TokenKind::Generated, generated);
@@ -1517,6 +1977,38 @@ fn device_choice(reduced: &ReducedRow, reduce: Option<RowReduce>) -> Option<u32>
     }
 }
 
+/// Why an iteration attempt failed, as the execution backend classifies it
+/// (`KernelError::is_oom`, `KernelError::is_sticky`): out of memory is recovered from, a sticky
+/// device error is fatal, anything else opens the circuit.
+#[derive(Debug)]
+struct IterationError {
+    message: String,
+    oom: bool,
+    sticky: bool,
+}
+
+impl IterationError {
+    fn model(context: &str, e: ModelError) -> IterationError {
+        let (oom, sticky) = match &e {
+            ModelError::Kernel(k) => (k.is_oom(), k.is_sticky()),
+            _ => (false, false),
+        };
+        IterationError {
+            message: format!("{context}: {e}"),
+            oom,
+            sticky,
+        }
+    }
+
+    fn other(message: String) -> IterationError {
+        IterationError {
+            message,
+            oom: false,
+            sticky: false,
+        }
+    }
+}
+
 /// Distinct requests of the plan's items and forks, in plan order.
 fn plan_requests(
     plan: &IterationPlan,
@@ -1544,12 +2036,11 @@ mod tests {
 
     use tokio::sync::oneshot;
     use turbine_core::clock::SystemClock;
-    use turbine_core::request::{
-        CancelFlag, Endpoint, GenerationRequest, SamplingParams, StopConditions,
-    };
-    use turbine_core::types::{BlockId, DeviceId, KvLayout, ModelShape, Priority};
-    use turbine_kernels::test_support::{plain_device_error, sticky_device_error};
-    use turbine_kernels::{KernelMetrics, KernelRegistry, cpu_reference_provider};
+    use turbine_core::config::{ByteSize, ReliabilityConfig};
+    use turbine_core::request::CancelFlag;
+    use turbine_core::types::{BlockId, DeviceId, KvLayout, MemoryKind, ModelShape};
+    use turbine_kernels::test_support::plain_device_error;
+    use turbine_kernels::{KernelError, KernelMetrics, KernelRegistry, cpu_reference_provider};
     use turbine_kv::{BlockPoolConfig, KvMetrics};
     use turbine_model::executor::{self, ExecutorOptions, SequenceKv};
     use turbine_model::testing::TempDir;
@@ -1559,13 +2050,18 @@ mod tests {
         WeightLoader, generate, llama_slots,
     };
     use turbine_observability::MetricsRegistry;
+    use turbine_reliability::budget::{DeviceBudget, PoolKind};
+    use turbine_reliability::controller::ControllerHandle;
+    use turbine_reliability::ledger::Ledger;
+    use turbine_reliability::metrics::ReliabilityMetrics;
+    use turbine_reliability::reserve::EmergencyReserve;
     use turbine_scheduler::{SchedulerMetrics, SchedulerParams};
     use turbine_tensor::host::HostMemory;
     use turbine_tensor::{DeviceMemory, KvPoolView};
 
     use super::*;
-    use crate::engine::EVENT_CHANNEL_CAPACITY;
     use crate::metrics::ServerMetrics;
+    use crate::reliability::{DeviceReserve, ReliabilityInputs};
 
     const BLOCK_TOKENS: u32 = 16;
 
@@ -1654,6 +2150,7 @@ mod tests {
         tx: mpsc::Sender<EngineCommand>,
         shared: Arc<EngineShared>,
         reg: MetricsRegistry,
+        controller: ControllerHandle,
     }
 
     /// An engine over `exec` with a 64-block pool, overlap scheduling off.
@@ -1679,17 +2176,57 @@ mod tests {
             scheduler: SchedulerMetrics::register(&reg),
             kv: KvMetrics::register(&reg),
         };
+        let layout = *exec.kv_layout();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        // The P3 reliability side over a budget whose kv pool is exactly the 64 blocks, with
+        // no emergency reserve.
+        let kv_bytes = 64 * layout.block_bytes();
+        let budget = DeviceBudget {
+            device: DeviceId(0),
+            memory_kind: MemoryKind::Dedicated,
+            budget_bytes: kv_bytes,
+            pools: vec![(PoolKind::Kv, kv_bytes), (PoolKind::Reserve, 0)],
+        };
+        let reliability_metrics = ReliabilityMetrics::register(&reg);
+        let ledger = Ledger::new(&budget);
+        ledger.set_metrics(reliability_metrics.clone());
+        let reserve = EmergencyReserve::acquire(
+            DeviceId(0),
+            0,
+            &ledger,
+            Box::new(DeviceReserve::new(mem())),
+            reliability_metrics.clone(),
+        )
+        .unwrap();
+        let config = ReliabilityConfig {
+            emergency_vram_reserve: ByteSize(0),
+            ..ReliabilityConfig::default()
+        };
+        let parts = crate::reliability::build(ReliabilityInputs {
+            config: &config,
+            budget,
+            ledger: Arc::clone(&ledger),
+            reserve,
+            held: Vec::new(),
+            params: &params,
+            block_bytes: layout.block_bytes(),
+            workspace_bytes_per_token: 0,
+            metrics: reliability_metrics,
+            clock: Arc::clone(&clock),
+        });
         let pool = BlockPool::new(
             BlockPoolConfig {
-                layout: *exec.kv_layout(),
+                layout,
                 num_blocks: 64,
             },
             mem(),
         )
-        .unwrap();
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
-        let scheduler =
-            Scheduler::new(params, Arc::clone(&clock)).with_metrics(metrics.scheduler.clone());
+        .unwrap()
+        .with_ledger(ledger, DeviceId(0));
+        let scheduler = Scheduler::new(params, Arc::clone(&clock))
+            .with_metrics(metrics.scheduler.clone())
+            .with_gate(parts.gate);
+        let controller = parts.engine.handle.clone();
         let (tx, commands) = mpsc::channel(8);
         let shared = Arc::new(EngineShared::default());
         let engine = EngineLoop::new(EngineParts {
@@ -1707,12 +2244,14 @@ mod tests {
                 slow_client: Duration::from_secs(30),
             },
             overlap,
+            reliability: parts.engine,
         });
         TestEngine {
             engine,
             tx,
             shared,
             reg,
+            controller,
         }
     }
 
@@ -2119,18 +2658,20 @@ mod tests {
     }
 
     /// A working executor whose `fail_launches`-th launches and `fail_collects`-th collects
-    /// (1-based) fail like a device error.
+    /// (1-based) fail like a (non-sticky) device error, and whose `oom_launches`-th launches
+    /// fail with device out-of-memory.
     struct Flaky {
         inner: Box<dyn ModelExecutor>,
         launches: usize,
         collects: usize,
         fail_launches: Vec<usize>,
         fail_collects: Vec<usize>,
+        oom_launches: Vec<usize>,
     }
 
     impl Flaky {
         fn device_error() -> ModelError {
-            ModelError::Kernel(sticky_device_error("injected"))
+            ModelError::Kernel(plain_device_error("injected"))
         }
     }
 
@@ -2159,6 +2700,11 @@ mod tests {
             if self.fail_launches.contains(&self.launches) {
                 return Err(Flaky::device_error());
             }
+            if self.oom_launches.contains(&self.launches) {
+                return Err(ModelError::Kernel(KernelError::OutOfMemory {
+                    message: "injected".into(),
+                }));
+            }
             self.inner.launch(batch, feeds)
         }
         fn collect(&mut self) -> Result<Logits, ModelError> {
@@ -2179,34 +2725,14 @@ mod tests {
         }
     }
 
-    /// Overlap scheduling after failed steps: a request in a step whose launch or whose collect
-    /// fails ends with `internal_error`, the requests outside it finish normally with the tokens
-    /// they get when nothing fails, and no block stays used; three failed steps in a row stop
-    /// the engine. Breaks if a failed step's sequences are never reported finished to the
-    /// scheduler (their blocks leak, or the engine never idles).
-    #[test]
-    fn overlap_failed_steps_fail_their_requests_only() {
-        let (_dir, spec, tokenizer) = tiny();
-        // One running request at a time: every step holds exactly one request.
-        let prompts: Vec<Vec<u32>> = (0..4).map(|i| vec![256, 40 + i, 41 + i]).collect();
-        let (want, _) = run_streams(
-            &spec,
-            &tokenizer,
-            &prompts.iter().map(|p| request(p, 6)).collect::<Vec<_>>(),
-            false,
-        );
-        let flaky = Flaky {
-            inner: tiny_reducing_executor(&spec, 8),
-            launches: 0,
-            collects: 0,
-            // Each request is one prefill and five decodes: request 0 runs launches 1–6, request
-            // 1 launches 7–12 and fails at its third (launch 9, never collected); request 2
-            // starts at launch 10 (collect 9) and fails at its third step, collect 11 (launch
-            // 12; launch 13, fed from it, is already in flight and dropped with the request).
-            fail_launches: vec![9],
-            fail_collects: vec![11],
-        };
-        let t = engine_with(Box::new(flaky), Arc::clone(&tokenizer), params(1, 8), true);
+    /// Runs `prompts` (6 tokens each, one running request at a time) on an overlapping engine
+    /// over `flaky` until every stream ends; returns each stream's events and the engine.
+    fn run_flaky(
+        flaky: Flaky,
+        tokenizer: &Arc<Tokenizer>,
+        prompts: &[Vec<u32>],
+    ) -> (Vec<Vec<GenerationEvent>>, TestEngineDone) {
+        let t = engine_with(Box::new(flaky), Arc::clone(tokenizer), params(1, 8), true);
         assert!(t.engine.overlap);
         let streams: Vec<_> = prompts
             .iter()
@@ -2217,50 +2743,133 @@ mod tests {
         let mut outcomes = Vec::new();
         for (mut rx, admitted) in streams {
             assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
-            let events: Vec<_> = std::iter::from_fn(|| rx.blocking_recv()).collect();
-            outcomes.push(events);
+            outcomes.push(read_to_end(&mut rx));
         }
         drop(t.tx);
         assert_eq!(handle.join().unwrap(), Ok(()));
-        let tokens = |events: &[GenerationEvent]| -> Vec<u32> {
-            events
-                .iter()
-                .filter_map(|e| match e {
-                    GenerationEvent::Token { token_id, .. } => Some(*token_id),
-                    _ => None,
-                })
-                .collect()
-        };
-        assert_eq!(tokens(&outcomes[0]), want[0][0].tokens);
-        assert!(internal_error(&outcomes[1]), "{:?}", outcomes[1]);
-        assert!(internal_error(&outcomes[2]), "{:?}", outcomes[2]);
-        assert_eq!(tokens(&outcomes[3]), want[3][0].tokens);
-        assert_eq!(shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
-        let text = t.reg.render().unwrap();
-        for line in [
-            r#"turbine_requests_total{endpoint="/v1/completions",outcome="failed"} 2"#,
-            r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 2"#,
-        ] {
-            assert!(text.contains(line), "missing {line:?} in\n{text}");
-        }
+        (
+            outcomes,
+            TestEngineDone {
+                shared,
+                reg: t.reg,
+                controller: t.controller,
+            },
+        )
+    }
 
-        // Every launch failing: three failed steps in a row stop the engine.
+    /// What is left of a [`TestEngine`] after its engine ran.
+    struct TestEngineDone {
+        shared: Arc<EngineShared>,
+        reg: MetricsRegistry,
+        controller: ControllerHandle,
+    }
+
+    fn generated(events: &[GenerationEvent]) -> Vec<u32> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Token { token_id, .. } => Some(*token_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Overlap scheduling after failed steps (P3: the circuit breaker replaces the Phase 2 exit
+    /// after three failed iterations, CONFLICT C-25): a request in a step whose launch or whose
+    /// collect fails with a (non-sticky) device error ends with `internal_error`, the circuit
+    /// opens and the requests still in the admission queue are rejected `circuit_open`; a
+    /// request that finished before keeps the tokens it gets when nothing fails, the engine
+    /// keeps running, and no block stays used. Breaks if a failed step's sequences are never
+    /// reported finished to the scheduler (their blocks leak, or the engine never idles).
+    #[test]
+    fn overlap_failed_steps_fail_their_requests_only() {
+        let (_dir, spec, tokenizer) = tiny();
+        let prompts: Vec<Vec<u32>> = (0..4).map(|i| vec![256, 40 + i, 41 + i]).collect();
+        let (want, _) = run_streams(
+            &spec,
+            &tokenizer,
+            &prompts.iter().map(|p| request(p, 6)).collect::<Vec<_>>(),
+            false,
+        );
+        // Each request is one prefill and five decodes: request 0 runs launches 1–6, request 1
+        // launches 7–12 and fails at its third (launch 9, never collected).
         let flaky = Flaky {
             inner: tiny_reducing_executor(&spec, 8),
             launches: 0,
             collects: 0,
-            fail_launches: (1..100).collect(),
+            fail_launches: vec![9],
             fail_collects: Vec::new(),
+            oom_launches: Vec::new(),
         };
-        let t = engine_with(Box::new(flaky), tokenizer, params(1, 8), true);
-        let mut streams: Vec<_> = prompts
-            .iter()
-            .map(|p| submit(&t.tx, request(p, 6)))
-            .collect();
-        let err = t.engine.run().unwrap_err();
-        assert!(err.contains("3 consecutive iterations failed"), "{err}");
-        for (rx, _) in &mut streams {
-            assert!(internal_error(&drain(rx)));
+        let (outcomes, done) = run_flaky(flaky, &tokenizer, &prompts);
+        assert_eq!(generated(&outcomes[0]), want[0][0].tokens);
+        assert_eq!(error_code(&outcomes[1]), Some(ErrorCode::InternalError));
+        assert_eq!(error_code(&outcomes[2]), Some(ErrorCode::CircuitOpen));
+        assert_eq!(error_code(&outcomes[3]), Some(ErrorCode::CircuitOpen));
+        assert!(done.controller.circuit().blocks_readiness());
+        assert_eq!(done.shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
+        let text = done.reg.render().unwrap();
+        for line in [
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="failed"} 1"#,
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 1"#,
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="rejected"} 2"#,
+            r#"turbine_circuit_transitions_total{from="HEALTHY",to="CIRCUIT_OPEN",reason="device_error"} 1"#,
+        ] {
+            assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+
+        // A failed collect: request 0's third step (launch 4, fed from it, is dropped with it).
+        let flaky = Flaky {
+            inner: tiny_reducing_executor(&spec, 8),
+            launches: 0,
+            collects: 0,
+            fail_launches: Vec::new(),
+            fail_collects: vec![3],
+            oom_launches: Vec::new(),
+        };
+        let (outcomes, done) = run_flaky(flaky, &tokenizer, &prompts);
+        assert_eq!(error_code(&outcomes[0]), Some(ErrorCode::InternalError));
+        for events in &outcomes[1..] {
+            assert_eq!(error_code(events), Some(ErrorCode::CircuitOpen));
+        }
+        assert!(done.controller.circuit().blocks_readiness());
+        assert_eq!(done.shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
+    }
+
+    /// P3 S-11 under overlap scheduling: a launch that fails with device out-of-memory
+    /// finishes the iteration in flight, then runs the plan through the serial recovery path;
+    /// the request keeps every token it gets when nothing fails, the recovery is counted, and
+    /// the pressure state is SURVIVAL (the controller thread, absent here, de-escalates it).
+    /// Breaks if an out-of-memory launch fails its request or leaks the in-flight iteration.
+    #[test]
+    fn overlap_oom_launch_recovers_serially() {
+        let (_dir, spec, tokenizer) = tiny();
+        let prompts = vec![vec![256, 40, 41]];
+        let (want, _) = run_streams(
+            &spec,
+            &tokenizer,
+            &prompts.iter().map(|p| request(p, 6)).collect::<Vec<_>>(),
+            false,
+        );
+        let flaky = Flaky {
+            inner: tiny_reducing_executor(&spec, 8),
+            launches: 0,
+            collects: 0,
+            fail_launches: Vec::new(),
+            fail_collects: Vec::new(),
+            oom_launches: vec![3],
+        };
+        let (outcomes, done) = run_flaky(flaky, &tokenizer, &prompts);
+        assert_eq!(error_code(&outcomes[0]), None, "{:?}", outcomes[0]);
+        assert_eq!(generated(&outcomes[0]), want[0][0].tokens);
+        assert_eq!(done.controller.state(), PressureState::Survival);
+        assert_eq!(done.shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
+        let text = done.reg.render().unwrap();
+        for line in [
+            r#"turbine_recoveries_total{outcome="recovered"} 1"#,
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 1"#,
+        ] {
+            assert!(text.contains(line), "missing {line:?} in\n{text}");
         }
     }
 
@@ -2300,35 +2909,72 @@ mod tests {
         })
     }
 
-    /// CONFLICT C-25: three consecutive failed iterations stop the engine; every request in
-    /// them, and every request still queued, gets `internal_error`, and no block stays used.
-    #[test]
-    fn three_consecutive_failed_iterations_stop_the_engine() {
-        let (_dir, spec, tokenizer) = tiny();
-        // One running request at a time: each iteration fails exactly one request.
-        let t = engine(broken(&spec, false), tokenizer, params(1, 64));
-        let mut streams: Vec<_> = (0..4)
-            .map(|_| submit(&t.tx, request(&[256, 1, 2], 4)))
-            .collect();
-        let err = t.engine.run().unwrap_err();
-        assert!(err.contains("3 consecutive iterations failed"), "{err}");
-        assert!(err.contains("device error: injected"), "{err}");
-        for (rx, admitted) in &mut streams {
-            assert_eq!(admitted.try_recv().unwrap(), Ok(()));
-            assert!(internal_error(&drain(rx)));
+    /// The events a stream receives until it ends (its sender dropped or an end event read).
+    fn read_to_end(rx: &mut mpsc::Receiver<GenerationEvent>) -> Vec<GenerationEvent> {
+        let mut events = Vec::new();
+        while let Some(e) = rx.blocking_recv() {
+            let end = matches!(
+                e,
+                GenerationEvent::Error { .. } | GenerationEvent::Finished { .. }
+            );
+            events.push(e);
+            if end {
+                break;
+            }
         }
-        assert_eq!(t.shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
-        let text = t.reg.render().unwrap();
-        assert!(
-            text.contains(
-                r#"turbine_requests_total{endpoint="/v1/completions",outcome="failed"} 4"#
-            ),
-            "{text}"
-        );
+        events
     }
 
-    /// An engine panic is caught: every in-flight request gets `internal_error` and the engine
-    /// reports the panic (the server exits 1).
+    fn error_code(events: &[GenerationEvent]) -> Option<ErrorCode> {
+        events.iter().find_map(|e| match e {
+            GenerationEvent::Error { code, .. } => Some(*code),
+            _ => None,
+        })
+    }
+
+    /// P3 S-12 (CONFLICT C-25 retires the Phase 2 exit after three failed iterations): a
+    /// non-OOM device error fails the running request with `internal_error` and opens the
+    /// circuit; the requests waiting in the admission queue are rejected `circuit_open`; the
+    /// engine keeps running and no block stays used.
+    #[test]
+    fn device_error_opens_the_circuit() {
+        let (_dir, spec, tokenizer) = tiny();
+        // One running request at a time: the first runs, the other three wait in the queue.
+        let t = engine(broken(&spec, false), tokenizer, params(1, 64));
+        let streams: Vec<_> = (0..4)
+            .map(|_| submit(&t.tx, request(&[256, 1, 2], 4)))
+            .collect();
+        let engine = t.engine;
+        let handle = std::thread::spawn(move || engine.run());
+        for (i, (mut rx, admitted)) in streams.into_iter().enumerate() {
+            assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+            let expected = if i == 0 {
+                ErrorCode::InternalError
+            } else {
+                ErrorCode::CircuitOpen
+            };
+            assert_eq!(
+                error_code(&read_to_end(&mut rx)),
+                Some(expected),
+                "request {i}"
+            );
+        }
+        assert!(t.controller.circuit().blocks_readiness());
+        drop(t.tx);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+        assert_eq!(t.shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
+        let text = t.reg.render().unwrap();
+        for line in [
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="failed"} 1"#,
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="rejected"} 3"#,
+            r#"turbine_circuit_transitions_total{from="HEALTHY",to="CIRCUIT_OPEN",reason="device_error"} 1"#,
+        ] {
+            assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+    }
+
+    /// An engine panic is caught: every in-flight request gets `internal_error`, the circuit
+    /// turns fatal and the engine reports the panic (the server exits 3).
     #[test]
     fn engine_panic_fails_every_request() {
         let (_dir, spec, tokenizer) = tiny();
@@ -2344,6 +2990,7 @@ mod tests {
         for (rx, _) in &mut streams {
             assert!(internal_error(&drain(rx)));
         }
+        assert!(t.controller.snapshot().fatal);
     }
 
     /// A stream that stops reading pauses its request (events held, KV kept) without stalling
