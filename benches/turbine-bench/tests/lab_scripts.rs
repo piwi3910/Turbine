@@ -573,6 +573,7 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "logits_reduce_matches_cpu",
         "host_staging_does_not_wait_for_the_stream",
         "prefill_shapes_match_cpu",
+        "moe_decode_tier_timings",
     ];
 
     let text = dry_run(

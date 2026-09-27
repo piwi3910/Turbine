@@ -3,8 +3,10 @@
 // moe_small_max_rows routed rows, num_tokens * top_k).
 //
 // When hidden and inter are multiples of 64 (moe_wmma_shape, e.g. OLMoE) the
-// implementation runs the grouped WMMA kernels of moe_grouped.hip with 16-row
-// tiles (launch_moe_wmma_small): the same per-element WMMA chain as the tier
+// implementation runs WMMA kernels of moe_grouped.hip -- the decode kernels
+// (launch_moe_wmma_gemv, one wave per 16 columns, operands straight from
+// memory) for multiples of 128, else the grouped kernels with 16-row tiles
+// (launch_moe_wmma_small) -- with the same per-element WMMA chain as the tier
 // above it, so a row's output does not depend on how many rows share its batch
 // (decision 2026-09-27, the OLMoE concurrency-16 golden flip: these scalar
 // kernels sum in another order than the WMMA tier, and a decode row that shared
@@ -328,6 +330,8 @@ int32_t launch_moe_small_m(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
   // Batch invariance: where the grouped WMMA path serves the shape, the small-m
   // tier runs its kernels with small row tiles, so a row gets the same bits
   // whichever tier its batch's row count selects.
+  if (moe_gemv_shape(d))
+    return launch_moe_wmma_gemv(ctx, d, pos, act, down);
   if (moe_wmma_shape(d))
     return launch_moe_wmma_small(ctx, d, pos, act, down);
   const int32_t rows = d->num_tokens * d->top_k;

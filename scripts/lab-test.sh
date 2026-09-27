@@ -68,6 +68,8 @@ SLOW_TESTS=(
 	logits_reduce_matches_cpu
 	host_staging_does_not_wait_for_the_stream
 	prefill_shapes_match_cpu
+	# crates/turbine-kernels/tests/hip_batch_invariance.rs
+	moe_decode_tier_timings
 )
 
 DRY_RUN=0

@@ -730,3 +730,123 @@ fn paged_attention_rows_are_batch_invariant() {
     }
     assert_invariant(&out);
 }
+
+/// Lab timing (perf tier): the two device-offset `moe_experts` implementations (small-m and
+/// grouped WMMA, the card profile's two row tiers) bound one at a time, at 1–128 tokens with
+/// uniform routing over 64 experts whose 805 MB of weights stream from memory: one line per
+/// implementation and size with the mean time per call and the weight bandwidth. No bound; the
+/// numbers compare kernel changes and place the tier boundary (`moe_small_max_rows`) on GPU 0.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas --tier perf)"]
+fn moe_decode_tier_timings() {
+    if !require_backend("hip") {
+        return;
+    }
+    let h = setup();
+    let mut rng = Rng(21);
+    let route_cfg = MoeRouteConfig {
+        num_experts: EXPERTS as u32,
+        top_k: TOP_K as u32,
+        renormalize: false,
+        bf16_logits: true,
+    };
+    let cfg = MoeExpertsConfig {
+        hidden: HIDDEN as u32,
+        inter: INTER as u32,
+        num_experts: EXPERTS as u32,
+        top_k: TOP_K as u32,
+        expert_begin: 0,
+        expert_end: EXPERTS as u32,
+        dtype: DType::BF16,
+    };
+    let registry = h.registry(&[OpConfig::MoeRoute(route_cfg)]);
+    let router = registry.moe_route(&route_cfg);
+    let spec = OpConfig::MoeExperts(cfg);
+    let bound: Vec<(String, Arc<dyn KernelProvider>)> = h
+        .provider
+        .implementations(spec.op())
+        .into_iter()
+        .filter(|i| i.name.starts_with("turbine_hip_moe_"))
+        .filter_map(|i| {
+            let p = h.provider.bind(&spec, &ImplChoice::Single(i.index))?;
+            Some((i.name, p))
+        })
+        .collect();
+    assert_eq!(bound.len(), 2, "small-m and grouped WMMA");
+    let n = EXPERTS * INTER * HIDDEN;
+    let up = 1.0 / (HIDDEN as f32).sqrt();
+    let w_gate = upload(
+        &h,
+        &[EXPERTS, INTER, HIDDEN],
+        DType::BF16,
+        &rng.normal(n, up),
+    );
+    let w_up = upload(
+        &h,
+        &[EXPERTS, INTER, HIDDEN],
+        DType::BF16,
+        &rng.normal(n, up),
+    );
+    let w_down = upload(
+        &h,
+        &[EXPERTS, HIDDEN, INTER],
+        DType::BF16,
+        &rng.normal(n, 0.03),
+    );
+    for t in [1usize, 2, 4, 8, 16, 32, 48, 64, 96, 128] {
+        let rows = t * TOP_K;
+        let l = upload(&h, &[t, EXPERTS], DType::F32, &rng.normal(t * EXPERTS, 2.0));
+        let ids = Tensor::empty(&h.mem, &[t, TOP_K], DType::I32).expect("ids");
+        let tw = Tensor::empty(&h.mem, &[t, TOP_K], DType::F32).expect("weights");
+        let sorted = Tensor::empty(&h.mem, &[rows], DType::I32).expect("sorted");
+        let offsets = Tensor::empty(&h.mem, &[EXPERTS + 1], DType::I32).expect("offsets");
+        router
+            .route(&mut MoeRouteContext {
+                cfg: route_cfg,
+                router_logits: l.view(),
+                topk_ids: ids.view(),
+                topk_weights: tw.view(),
+                sorted_rows: sorted.view(),
+                expert_offsets: offsets.view(),
+            })
+            .expect("moe_route");
+        let off = read(&offsets);
+        let active = (0..EXPERTS).filter(|&e| off[e + 1] > off[e]).count();
+        let xs = upload(&h, &[t, HIDDEN], DType::BF16, &rng.normal(t * HIDDEN, 1.0));
+        let o = upload(&h, &[t, HIDDEN], DType::BF16, &vec![0.0; t * HIDDEN]);
+        for (name, provider) in &bound {
+            let moe = provider.moe().expect("moe");
+            let run = || {
+                moe.experts(&mut MoeExpertsContext {
+                    cfg,
+                    x: xs.view(),
+                    w_gate: w_gate.view(),
+                    w_up: w_up.view(),
+                    w_down: w_down.view(),
+                    sorted_rows: sorted.view(),
+                    expert_offsets: offsets.view(),
+                    topk_weights: tw.view(),
+                    host_expert_offsets: &[],
+                    out: o.view(),
+                    workspace: None,
+                })
+                .expect("moe_experts");
+            };
+            run();
+            run();
+            h.mem.synchronize().expect("synchronize");
+            let iters = 64;
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                run();
+            }
+            h.mem.synchronize().expect("synchronize");
+            let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+            let gb_s = (active * 3 * INTER * HIDDEN * 2) as f64 / us / 1e3;
+            println!(
+                "moe_decode_timing impl={name} tokens={t} rows={rows} active_experts={active} \
+                 us={us:.1} weight_gb_s={gb_s:.0}"
+            );
+        }
+    }
+}

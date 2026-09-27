@@ -40,6 +40,8 @@
 // ascending k), so two runs are bitwise identical, and so is a row computed by
 // the small-row blocks below (the small-m tier): the result of a row does not
 // depend on the batch it is in.
+#include <algorithm>
+
 #include "bf16.hpp"
 #include "turbine_hip.hpp"
 
@@ -378,6 +380,188 @@ int32_t launch_shape(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                                d->hidden, down);
 }
 
+// ---- the small-row (decode) WMMA kernels ----
+//
+// The small-m implementation's kernels for shapes of multiples of 64: the same
+// per-element WMMA chain as moe_wmma_kernel (a zero accumulator, then one
+// v_wmma per 16-wide k slice in ascending k, operands in the same lane layout,
+// the same epilogue), so a row's gate, up, activation and down values are
+// bitwise those of the grouped path whichever tier its batch selects. Built for
+// decode: a block holds kGemvWaves waves, each owning one 16-column WMMA tile of
+// one expert and walking the expert's rows 16 at a time; the operands come
+// straight from global memory into the WMMA registers (no LDS, no barriers),
+// kGemvUnroll k slices per batch of loads with the next batch in flight. A
+// decode step reads every active expert's weights once; the rows are few, so
+// the compute the 16-row tile wastes is free.
+//
+// Shape (moe_decode_tier_timings on the R9700, OLMoE, uniform routing): 8 k
+// slices per batch stream the weights at ~550 GB/s from 8 tokens up (4 slices:
+// ~480; 16 for the down projection: ~520; non-temporal loads: ~360); 1, 2 or 4
+// waves per block time the same. The scalar kernels this replaced reached ~575
+// GB/s at 4-16 tokens and fell to ~410 at 64; the 16-row LDS tiles of
+// moe_wmma_kernel (SmallBlock) ~455.
+constexpr int kGemvWaves = 4;
+constexpr int kGemvUnroll = 8;
+constexpr int kGemvStep = kGemvUnroll * kMma;
+
+
+// The local index of the slot-th local expert (ascending) that has rows, or -1
+// when fewer experts have rows. Called by every thread of the block.
+__device__ int32_t gemv_active_expert(const int32_t *offsets,
+                                      int32_t expert_begin, int32_t num_local,
+                                      int32_t slot) {
+  __shared__ uint8_t has_rows[kMoeMaxExperts];
+  __shared__ int32_t found;
+  for (int32_t t = static_cast<int32_t>(threadIdx.x); t < num_local;
+       t += static_cast<int32_t>(blockDim.x)) {
+    has_rows[t] =
+        offsets[expert_begin + t] < offsets[expert_begin + t + 1] ? 1 : 0;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int32_t e = -1;
+    int32_t seen = 0;
+    for (int32_t x = 0; x < num_local; ++x) {
+      if (has_rows[x] != 0) {
+        if (seen == slot) {
+          e = x;
+          break;
+        }
+        ++seen;
+      }
+    }
+    found = e;
+  }
+  __syncthreads();
+  return found;
+}
+
+__device__ inline v8s load8(const Bf16 *p) {
+  return *reinterpret_cast<const v8s *>(p);
+}
+
+// One projection of one expert's rows over the 16 columns of each wave.
+//   kGateUp: out[p, n] = bf16(round(silu(round(x_p . w0_n))) * round(x_p .
+//            w1_n)) with x_p = in[sorted_rows[p] / top_k], n < inter;
+//   else:    out[p, n] = bf16(in[p] . w0_n), n < hidden.
+// Grid: x = column groups of kGemvWaves * 16, y = expert slots. depth is a
+// multiple of kGemvStep (moe_gemv_shape).
+template <bool kGateUp>
+__global__ __launch_bounds__(kGemvWaves *kLanes) void moe_wmma_gemv_kernel(
+    const Bf16 *in, const Bf16 *w0, const Bf16 *w1, const int32_t *sorted_rows,
+    const int32_t *offsets, int32_t expert_begin, int32_t num_local,
+    int32_t top_k, int32_t depth, int32_t n_out, Bf16 *out) {
+  const int32_t local = gemv_active_expert(offsets, expert_begin, num_local,
+                                           static_cast<int32_t>(blockIdx.y));
+  if (local < 0)
+    return;
+  const int32_t begin = offsets[expert_begin + local];
+  const int32_t end = offsets[expert_begin + local + 1];
+  const int lane = static_cast<int>(threadIdx.x) % kLanes;
+  const int wave = static_cast<int>(threadIdx.x) / kLanes;
+  const int32_t n0 = (static_cast<int32_t>(blockIdx.x) * kGemvWaves + wave) * kMma;
+  if (n0 >= n_out)
+    return;
+  // The moe_wmma_kernel lane layout: A[l % 16][8 (l / 16) .. + 8),
+  // B[8 (l / 16) .. + 8)[l % 16], C[8 (l / 16) + v][l % 16].
+  const int frag = lane % kMma;
+  const int kh = (lane / kMma) * 8;
+  // Columns past n_out re-read the last one; their results are dropped.
+  const int32_t n = min(n0 + frag, n_out - 1);
+  const size_t expert_elems = static_cast<size_t>(n_out) * depth;
+  const Bf16 *b0 =
+      w0 + local * expert_elems + static_cast<size_t>(n) * depth + kh;
+  const Bf16 *b1 =
+      kGateUp ? w1 + local * expert_elems + static_cast<size_t>(n) * depth + kh
+              : b0;
+  for (int32_t r0 = begin; r0 < end; r0 += kMma) {
+    // Rows past the expert's last position re-read its first (moe_wmma_kernel
+    // does the same); their results are dropped.
+    int32_t p = r0 + frag;
+    if (p >= end)
+      p = begin;
+    const int64_t src = kGateUp ? sorted_rows[p] / top_k : p;
+    const Bf16 *a = in + src * depth + kh;
+    v8f acc0{};
+    v8f acc1{};
+    v8s ra[kGemvUnroll];
+    v8s rb0[kGemvUnroll];
+    v8s rb1[kGemvUnroll];
+#pragma unroll
+    for (int u = 0; u < kGemvUnroll; ++u) {
+      ra[u] = load8(a + u * kMma);
+      rb0[u] = load8(b0 + u * kMma);
+      if (kGateUp)
+        rb1[u] = load8(b1 + u * kMma);
+    }
+    for (int32_t k = 0; k < depth; k += kGemvStep) {
+      v8s ca[kGemvUnroll];
+      v8s cb0[kGemvUnroll];
+      v8s cb1[kGemvUnroll];
+#pragma unroll
+      for (int u = 0; u < kGemvUnroll; ++u) {
+        ca[u] = ra[u];
+        cb0[u] = rb0[u];
+        if (kGateUp)
+          cb1[u] = rb1[u];
+      }
+      const int32_t next = k + kGemvStep;
+      if (next < depth) {
+#pragma unroll
+        for (int u = 0; u < kGemvUnroll; ++u) {
+          ra[u] = load8(a + next + u * kMma);
+          rb0[u] = load8(b0 + next + u * kMma);
+          if (kGateUp)
+            rb1[u] = load8(b1 + next + u * kMma);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < kGemvUnroll; ++u) {
+        acc0 = mma(ca[u], cb0[u], acc0);
+        if (kGateUp)
+          acc1 = mma(ca[u], cb1[u], acc1);
+      }
+    }
+    const int32_t col = n0 + frag;
+    if (col >= n_out)
+      continue;
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+      const int32_t q = r0 + (lane / kMma) * 8 + v;
+      if (q >= end)
+        continue;
+      float value = acc0[v];
+      if (kGateUp) {
+        const float g = round_bf16(value);
+        const float u = round_bf16(acc1[v]);
+        value = round_bf16(g / (1.0f + expf(-g))) * u;
+      }
+      out[static_cast<size_t>(q) * n_out + col] = f32_to_bf16(value);
+    }
+  }
+}
+
+template <bool kGateUp>
+int32_t launch_gemv(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
+                    const void *in, const void *w0, const void *w1,
+                    int32_t depth, int32_t n_out, void *out) {
+  const int32_t rows = d->num_tokens * d->top_k;
+  const int32_t num_local = d->expert_end - d->expert_begin;
+  // At most one expert slot per routed row.
+  const unsigned slots = static_cast<unsigned>(std::min(num_local, rows));
+  const int32_t cols = kGemvWaves * kMma;
+  hipLaunchKernelGGL((moe_wmma_gemv_kernel<kGateUp>),
+                     dim3(static_cast<unsigned>((n_out + cols - 1) / cols), slots),
+                     dim3(kGemvWaves * kLanes), 0, ctx->stream,
+                     static_cast<const Bf16 *>(in), static_cast<const Bf16 *>(w0),
+                     static_cast<const Bf16 *>(w1), d->sorted_rows,
+                     d->expert_offsets, d->expert_begin, num_local, d->top_k,
+                     depth, n_out, static_cast<Bf16 *>(out));
+  return check_hip(ctx, hipGetLastError(),
+                   kGateUp ? "moe small wmma gate-up kernel launch"
+                           : "moe small wmma down kernel launch");
+}
+
 } // namespace
 
 namespace turbine_hip {
@@ -403,6 +587,24 @@ int32_t launch_moe_wmma_small(turbine_ctx *ctx,
   if (d->hidden % kDeep == 0 && d->inter % kDeep == 0)
     return launch_shape<SmallBlock>(ctx, d, act, down);
   return launch_shape<SmallBlockK64>(ctx, d, act, down);
+}
+
+bool moe_gemv_shape(const turbine_moe_experts_desc *d) {
+  return d->hidden % kGemvStep == 0 && d->inter % kGemvStep == 0;
+}
+
+int32_t launch_moe_wmma_gemv(turbine_ctx *ctx,
+                             const turbine_moe_experts_desc *d, int32_t *pos,
+                             void *act, void *down) {
+  if (int32_t rc = launch_moe_positions(ctx, d, pos); rc != TURBINE_OK)
+    return rc;
+  if (int32_t rc = launch_gemv<true>(ctx, d, d->x, d->w_gate, d->w_up,
+                                     d->hidden, d->inter, act);
+      rc != TURBINE_OK) {
+    return rc;
+  }
+  return launch_gemv<false>(ctx, d, act, d->w_down, nullptr, d->inter,
+                            d->hidden, down);
 }
 
 } // namespace turbine_hip

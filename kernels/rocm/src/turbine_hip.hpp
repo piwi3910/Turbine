@@ -183,6 +183,14 @@ bool moe_wmma_shape(const turbine_moe_experts_desc *d);
 int32_t launch_moe_wmma_small(turbine_ctx *ctx,
                               const turbine_moe_experts_desc *d, int32_t *pos,
                               void *act, void *down);
+// The decode kernels of the small-m path (moe_grouped.hip): the same WMMA chain
+// as launch_moe_wmma, one wave per 16 columns of an expert, operands straight
+// from global memory. Needs moe_gemv_shape(d).
+int32_t launch_moe_wmma_gemv(turbine_ctx *ctx,
+                             const turbine_moe_experts_desc *d, int32_t *pos,
+                             void *act, void *down);
+// hidden and inter are multiples of the decode kernels' load step (128).
+bool moe_gemv_shape(const turbine_moe_experts_desc *d);
 
 // Asks hipBLASLt for a grouped BF16 GEMM solution on ctx's device (moe.cpp);
 // false when there is none (ROCm 7.14.1 on RDNA4) or the query fails.
