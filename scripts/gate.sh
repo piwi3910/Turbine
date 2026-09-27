@@ -205,8 +205,11 @@ else
 	scripts/remote-cargo.sh test --no-fail-fast "${TEST_SELECT[@]}" 2>&1 | tee "$LOG" || RC=1
 fi
 
-PASSED="$(grep -oE '[0-9]+ passed' "$LOG" | awk '{s+=$1} END{print s+0}')"
-FAILED="$(grep -oE '[0-9]+ failed' "$LOG" | awk '{s+=$1} END{print s+0}')"
+# grep exits 1 with no match (e.g. nextest omits "N failed" from its summary when nothing failed),
+# which would abort the script right here under pipefail; each grep's own exit is masked before
+# piping to awk, which always prints a count (0 for no input).
+PASSED="$( (grep -oE '[0-9]+ passed' "$LOG" || true) | awk '{s+=$1} END{print s+0}')"
+FAILED="$( (grep -oE '[0-9]+ failed' "$LOG" || true) | awk '{s+=$1} END{print s+0}')"
 
 if [[ $RC -ne 0 || $FAILED -ne 0 ]]; then
 	finish FAIL "$CRATES_DISPLAY" "$PASSED" "$FAILED" 1
