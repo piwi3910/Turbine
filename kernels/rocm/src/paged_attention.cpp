@@ -2,7 +2,7 @@
 // attention_prefill_paged and attention_decode_paged.
 //
 // Every call first appends k_new/v_new into their page slots with the Turbine
-// append kernel (paged_attention.hip), then attends with one of two
+// append kernel (paged_attention.hip), then attends with one of the
 // implementations (impl_table.cpp; the caller picks one with
 // turbine_impl_run, or the entry points take the first that supports the
 // descriptor, CK only for pages of a multiple of the context's card-profile
@@ -15,9 +15,14 @@
 //   0..=kv_len - q_len + i). The pagedkv instances of the pinned CK commit
 //   serve only page sizes that are a multiple of kCkPagedkvPage, which its
 //   supports reports;
+// - Composable Kernel ck_tile fmha_fwd_splitkv in group mode (impl
+//   "ck_tile_fmha_splitkv", decode only; paged_attention_splitkv.cpp): the
+//   same page table, one query per sequence, the query heads of a KV head
+//   merged into one tile (grouped query heads only), one split, rounded by
+//   CK's split-KV combine kernel;
 // - the Turbine HIP paged kernel (impl "turbine_hip"), any page size.
 // Decode is the same computation with one query per sequence and runs the same
-// path.
+// paths.
 //
 // The device arrays (block_table, q_indptr, kv_lens) are trusted: the host
 // cannot read them without a synchronisation. The Turbine kernels skip pages
@@ -34,6 +39,7 @@ using turbine_hip::fail;
 namespace {
 
 constexpr const char *kImplCk = "ck_tile_fmha_pagedkv";
+constexpr const char *kImplCkSplitkv = "ck_tile_fmha_splitkv";
 constexpr const char *kImplTurbine = "turbine_hip";
 constexpr int32_t kHeadDim = 128;
 // Page sizes the CK pagedkv instances serve are multiples of this: a
@@ -183,18 +189,44 @@ int32_t run_ck(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   return check_hip(ctx, hipGetLastError(), "fmha_fwd_pagedkv launch");
 }
 
+// What path serves beyond the common checks of supported().
+bool path_serves(const turbine_attention_paged_desc *d,
+                 turbine_hip::PagedPath path) {
+  switch (path) {
+  case turbine_hip::PagedPath::CkPagedkv:
+    return ck_serves(d);
+  case turbine_hip::PagedPath::CkSplitkv:
+    return ck_serves(d) && turbine_hip::ck_splitkv_serves(d);
+  case turbine_hip::PagedPath::Turbine:
+    return true;
+  }
+  return false;
+}
+
+const char *path_name(turbine_hip::PagedPath path) {
+  switch (path) {
+  case turbine_hip::PagedPath::CkPagedkv:
+    return kImplCk;
+  case turbine_hip::PagedPath::CkSplitkv:
+    return kImplCkSplitkv;
+  case turbine_hip::PagedPath::Turbine:
+    break;
+  }
+  return kImplTurbine;
+}
+
 int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
-            const char *entry_name, bool ck) {
+            const char *entry_name, turbine_hip::PagedPath path) {
   const std::string entry(entry_name);
   if (ctx == nullptr)
     return TURBINE_E_ARGUMENT;
   if (d == nullptr)
     return fail(ctx, TURBINE_E_ARGUMENT, entry + ": descriptor is NULL");
-  if (!supported(d) || (ck && !ck_serves(d))) {
-    return fail(
-        ctx, TURBINE_E_UNSUPPORTED,
-        entry + ": unsupported configuration " + describe(d) +
-            (supported(d) ? std::string(" for ") + kImplCk : std::string()));
+  if (!supported(d) || !path_serves(d, path)) {
+    return fail(ctx, TURBINE_E_UNSUPPORTED,
+                entry + ": unsupported configuration " + describe(d) +
+                    (supported(d) ? std::string(" for ") + path_name(path)
+                                  : std::string()));
   }
   if (d->num_seqs == 0 || d->total_q == 0)
     return TURBINE_OK;
@@ -215,8 +247,14 @@ int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
     return rc;
   if (int32_t rc = turbine_hip::launch_paged_append(ctx, d); rc != TURBINE_OK)
     return rc;
-  if (ck)
+  switch (path) {
+  case turbine_hip::PagedPath::CkPagedkv:
     return run_ck(ctx, d, entry);
+  case turbine_hip::PagedPath::CkSplitkv:
+    return turbine_hip::run_ck_splitkv(ctx, d, entry);
+  case turbine_hip::PagedPath::Turbine:
+    break;
+  }
   return turbine_hip::launch_paged_attention(ctx, d);
 }
 
@@ -224,13 +262,13 @@ int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
 
 namespace turbine_hip {
 
-bool paged_supports(const turbine_attention_paged_desc *d, bool ck) {
-  return supported(d) && (!ck || ck_serves(d));
+bool paged_supports(const turbine_attention_paged_desc *d, PagedPath path) {
+  return supported(d) && path_serves(d, path);
 }
 
 int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
-                  const char *entry, bool ck) {
-  return run(ctx, d, entry, ck);
+                  const char *entry, PagedPath path) {
+  return run(ctx, d, entry, path);
 }
 
 } // namespace turbine_hip

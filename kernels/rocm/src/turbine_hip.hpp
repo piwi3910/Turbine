@@ -1,8 +1,9 @@
 // Internal definitions shared by the libturbine_hip.so translation units.
 //
 // Ownership: a turbine_ctx owns its compute stream, its hipBLASLt handle, the
-// GEMM workspace, the attention seqstart scratch and the MoE scratch;
-// turbine_ctx_destroy releases all of them after draining the stream. Device
+// GEMM workspace, the attention seqstart scratch, the MoE scratch and the
+// split-KV decode scratch (with its retired buffers); turbine_ctx_destroy
+// releases all of them after draining the stream. Device
 // pointers passed in descriptors belong to the caller and are never retained
 // beyond the call, except by a captured graph (graph.cpp), which records the
 // pointers of its ops until turbine_graph_destroy.
@@ -18,6 +19,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <vector>
 
 // Only the ABI symbols are exported: every declaration of turbine_kernels.h
 // gets default visibility, everything else in the library is hidden
@@ -92,6 +94,13 @@ struct turbine_ctx {
   // grown on demand, never shrunk.
   void *moe_scratch = nullptr;
   size_t moe_scratch_bytes = 0;
+  // CK split-KV decode accumulators (paged_attention_splitkv.cpp): grown on
+  // demand, never while capturing; a replaced buffer is kept in
+  // attn_split_retired until the context is destroyed, because a captured
+  // decode graph may still read it.
+  void *attn_split_scratch = nullptr;
+  size_t attn_split_scratch_bytes = 0;
+  std::vector<void *> attn_split_retired;
   // hipBLASLt returned a grouped-GEMM solution for this device at creation.
   bool moe_grouped = false;
   std::map<turbine_hip::GemmKey, turbine_hip::GemmChoice> gemm_algos;
@@ -267,11 +276,19 @@ int32_t rmsnorm_run(turbine_ctx *ctx, const turbine_rmsnorm_desc *d, bool ck);
 bool add_rmsnorm_supports(const turbine_add_rmsnorm_desc *d, bool ck);
 int32_t add_rmsnorm_run(turbine_ctx *ctx, const turbine_add_rmsnorm_desc *d,
                         bool ck);
-// paged_attention.cpp: CK fmha_fwd_pagedkv (ck true) or the Turbine kernel;
-// entry names the op in error messages.
-bool paged_supports(const turbine_attention_paged_desc *d, bool ck);
+// paged_attention.cpp: the paged attention implementations -- CK
+// fmha_fwd_pagedkv, CK fmha_fwd_splitkv (decode of grouped query heads only)
+// or the Turbine kernel; entry names the op in error messages.
+enum class PagedPath { CkPagedkv, CkSplitkv, Turbine };
+bool paged_supports(const turbine_attention_paged_desc *d, PagedPath path);
 int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
-                  const char *entry, bool ck);
+                  const char *entry, PagedPath path);
+// paged_attention_splitkv.cpp: what CK fmha_fwd_splitkv adds to the paged
+// checks (one query per sequence, grouped query heads), and its call (after
+// the append). kv_layer's page layout as for fmha_fwd_pagedkv.
+bool ck_splitkv_serves(const turbine_attention_paged_desc *d);
+int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
+                       const std::string &entry);
 // moe.cpp: the four moe_experts paths.
 enum class MoePath { SmallM, Wmma, Grouped, PerExpert };
 bool moe_experts_supports(const turbine_moe_experts_desc *d, MoePath path);

@@ -6,8 +6,11 @@
 //   attention_prefill / _decode  0 ck_tile_fmha_fwd [ck]
 //   rmsnorm, add_rmsnorm         0 ck_tile_rmsnorm2d [ck] (the instantiated
 //                                  BF16 buckets), 1 turbine_hip [turbine_hip]
-//   attention_*_paged            0 ck_tile_fmha_pagedkv [ck] (pages of a
+//   attention_prefill_paged      0 ck_tile_fmha_pagedkv [ck] (pages of a
 //                                  multiple of 128 tokens), 1 turbine_hip
+//   attention_decode_paged       0 ck_tile_fmha_splitkv [ck] (grouped query
+//                                  heads, pages of a multiple of 128 tokens),
+//                                  1 ck_tile_fmha_pagedkv [ck], 2 turbine_hip
 //   copy_blocks                  0 hip_memcpy_d2d [turbine_hip]
 //   moe_experts                  0 turbine_hip_moe_small_m (hidden and inter
 //                                  multiples of 8; the first row tier),
@@ -75,14 +78,14 @@ template <bool Ck> struct AddNorm {
 constexpr const char kPrefillPaged[] = "turbine_attention_prefill_paged";
 constexpr const char kDecodePaged[] = "turbine_attention_decode_paged";
 
-template <const char *Entry, bool Ck> struct Paged {
+template <const char *Entry, PagedPath Path> struct Paged {
   static bool supports(const void *d) {
     return paged_supports(static_cast<const turbine_attention_paged_desc *>(d),
-                          Ck);
+                          Path);
   }
   static int32_t run(turbine_ctx *ctx, const void *d) {
     return paged_run(ctx, static_cast<const turbine_attention_paged_desc *>(d),
-                     Entry, Ck);
+                     Entry, Path);
   }
 };
 
@@ -153,14 +156,16 @@ const ImplEntry kAdd[] = {
                                                                 kTurbine),
 };
 const ImplEntry kPrefillPagedImpls[] = {
-    entry<Paged<kPrefillPaged, true>>("ck_tile_fmha_pagedkv", kCk, 0,
-                                      page_multiple_allows),
-    entry<Paged<kPrefillPaged, false>>("turbine_hip", kTurbine),
+    entry<Paged<kPrefillPaged, PagedPath::CkPagedkv>>(
+        "ck_tile_fmha_pagedkv", kCk, 0, page_multiple_allows),
+    entry<Paged<kPrefillPaged, PagedPath::Turbine>>("turbine_hip", kTurbine),
 };
 const ImplEntry kDecodePagedImpls[] = {
-    entry<Paged<kDecodePaged, true>>("ck_tile_fmha_pagedkv", kCk, 0,
-                                     page_multiple_allows),
-    entry<Paged<kDecodePaged, false>>("turbine_hip", kTurbine),
+    entry<Paged<kDecodePaged, PagedPath::CkSplitkv>>(
+        "ck_tile_fmha_splitkv", kCk, 0, page_multiple_allows),
+    entry<Paged<kDecodePaged, PagedPath::CkPagedkv>>(
+        "ck_tile_fmha_pagedkv", kCk, 0, page_multiple_allows),
+    entry<Paged<kDecodePaged, PagedPath::Turbine>>("turbine_hip", kTurbine),
 };
 const ImplEntry kCopyBlocks[] = {
     whole<turbine_copy_blocks_desc, turbine_copy_blocks_supported,

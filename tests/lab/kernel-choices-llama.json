@@ -27,7 +27,7 @@
   {
     "op": "attention_decode_paged",
     "config": "head_dim=128 kv_heads=8 dtype=bf16 q_heads=24 causal=1 block_tokens=128",
-    "implementation": "ck_tile_fmha_pagedkv"
+    "implementation": "ck_tile_fmha_splitkv"
   },
   {
     "op": "gemm",

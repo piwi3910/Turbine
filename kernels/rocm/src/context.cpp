@@ -68,6 +68,10 @@ void release(turbine_ctx *ctx) {
     (void)hipFree(ctx->seqstart);
   if (ctx->moe_scratch != nullptr)
     (void)hipFree(ctx->moe_scratch);
+  if (ctx->attn_split_scratch != nullptr)
+    (void)hipFree(ctx->attn_split_scratch);
+  for (void *retired : ctx->attn_split_retired)
+    (void)hipFree(retired);
   if (ctx->stream != nullptr)
     (void)hipStreamDestroy(ctx->stream);
   delete ctx;

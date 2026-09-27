@@ -1,6 +1,7 @@
 # libturbine_hip.so: the Turbine kernel C ABI (kernels/include/turbine_kernels.h)
 # on ROCm. GEMM through hipBLASLt, attention through Composable Kernel ck_tile
-# FMHA (contiguous and, for 128-multiple pages, paged), RMSNorm through ck_tile
+# FMHA (contiguous and, for 128-multiple pages, paged; split-KV for paged decode
+# of grouped query heads), RMSNorm through ck_tile
 # rmsnorm2d where an instance exists, MoE expert GEMMs through hipBLASLt, and
 # Turbine HIP kernels for the rest (16-token paged attention, MoE routing,
 # elementwise ops). Loaded at run time by turbine-kernels. The same build also
@@ -87,15 +88,17 @@ endif()
 
 # ---- CK FMHA instances: head_dim 128, BF16, no bias/lse/dropout/sink ----
 # fwd: contiguous prefill/decode (ABI v1 attention). pagedkv_prefill: group-mode
-# paged attention for pages of a multiple of 128 tokens (ABI v2 paged attention);
-# one --filter pattern per --api entry, in order.
+# paged attention for pages of a multiple of 128 tokens (ABI v2 paged attention).
+# fwd_splitkv: group-mode split-KV paged decode without a mask (the
+# ck_tile_fmha_splitkv decode implementation) and its combine kernels
+# (filter "<combine>@<splitkv>"). One --filter pattern per --api entry, in order.
 set(FMHA_GEN_DIR "${CMAKE_BINARY_DIR}/fmha")
 file(MAKE_DIRECTORY "${FMHA_GEN_DIR}")
 set(FMHA_GEN_ARGS
   "${CK_FMHA_DIR}/generate.py"
   --targets ${GPU_TARGETS}
-  --api fwd,pagedkv_prefill
-  --filter "*d128_bf16*nlogits_nbias*nlse_ndropout_nskip_nqscale_ntrload_nsink*,*d128_bf16_group*nlogits_nbias*nlse_nskip_nsquant_pagedkv_nsink*")
+  --api fwd,pagedkv_prefill,fwd_splitkv
+  --filter "*d128_bf16*nlogits_nbias*nlse_ndropout_nskip_nqscale_ntrload_nsink*,*d128_bf16_group*nlogits_nbias*nlse_nskip_nsquant_pagedkv_nsink*,*d128_bf16_group*_nsquant*@*d128_bf16_group*nlogits_nbias_nmask_lse_nsquant_pagedkv_nsink*")
 file(REMOVE "${FMHA_GEN_DIR}/blobs.txt")
 execute_process(
   COMMAND "${Python3_EXECUTABLE}" ${FMHA_GEN_ARGS} --list_blobs "${FMHA_GEN_DIR}/blobs.txt"
@@ -112,6 +115,13 @@ set(fmha_pagedkv_blobs ${FMHA_BLOBS})
 list(FILTER fmha_pagedkv_blobs INCLUDE REGEX "fmha_fwd_pagedkv_d128_bf16_group")
 if(NOT fmha_pagedkv_blobs)
   message(FATAL_ERROR "CK FMHA generator listed no gfx1201 d128 bf16 group-mode pagedkv instance")
+endif()
+set(fmha_splitkv_blobs ${FMHA_BLOBS})
+list(FILTER fmha_splitkv_blobs INCLUDE REGEX "fmha_fwd_splitkv_d128_bf16_group.*_pagedkv_")
+set(fmha_combine_blobs ${FMHA_BLOBS})
+list(FILTER fmha_combine_blobs INCLUDE REGEX "fmha_fwd_splitkv_combine_d128_bf16_group")
+if(NOT fmha_splitkv_blobs OR NOT fmha_combine_blobs)
+  message(FATAL_ERROR "CK FMHA generator listed no gfx1201 d128 bf16 group-mode split-KV paged instance or combine kernel")
 endif()
 message(STATUS "CK FMHA: ${fmha_blob_count} generated sources")
 file(GLOB_RECURSE FMHA_CODEGEN_SCRIPTS "${CK_FMHA_DIR}/codegen/*.py")
@@ -162,6 +172,7 @@ set(TURBINE_SOURCES
   src/rmsnorm.cpp
   src/elementwise.hip
   src/paged_attention.cpp
+  src/paged_attention_splitkv.cpp
   src/paged_attention.hip
   src/copy_blocks.cpp
   src/moe.cpp
@@ -170,7 +181,8 @@ set(TURBINE_SOURCES
   src/moe_grouped.hip
   src/logits_reduce.hip
   src/impl_table.cpp)
-set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/rmsnorm.cpp ${FMHA_BLOBS})
+set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/paged_attention_splitkv.cpp
+  src/rmsnorm.cpp ${FMHA_BLOBS})
 set(TURBINE_LIBRARY_SOURCES src/impl_exports.cpp src/abi_minor.cpp)
 set_source_files_properties(${TURBINE_SOURCES} ${FMHA_BLOBS} ${TURBINE_LIBRARY_SOURCES}
   PROPERTIES LANGUAGE HIP)

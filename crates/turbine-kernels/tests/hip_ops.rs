@@ -1170,10 +1170,11 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
     );
 }
 
-/// The default 128-token page runs paged attention on CK `fmha_fwd_pagedkv`, a 16-token page on
-/// the Turbine kernel, both against the CPU reference: ragged prefill batches of 1-, 17-, 512-
-/// and 2,048-token chunks after 0, 100 and 1,000 cached tokens with three decode rows riding
-/// along, then a decode batch, at the Llama-3.2-3B (24/8) and OLMoE (16/16) head shapes.
+/// The default 128-token page runs paged attention on CK `fmha_fwd_pagedkv` (decode of grouped
+/// heads on CK `fmha_fwd_splitkv`), a 16-token page on the Turbine kernel, all against the CPU
+/// reference: ragged prefill batches of 1-, 17-, 512- and 2,048-token chunks after 0, 100 and
+/// 1,000 cached tokens with three decode rows riding along, then a decode batch, at the
+/// Llama-3.2-3B (24/8) and OLMoE (16/16) head shapes.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn paged_prefill_ck_128_matches_cpu() {
@@ -1218,9 +1219,58 @@ fn paged_prefill_ck_128_matches_cpu() {
                 &[1; 4],
                 &decode_lens,
             );
+            let want_decode = if block_tokens == 128 && heads.0 > heads.1 {
+                "ck_tile_fmha_splitkv"
+            } else {
+                want
+            };
             assert_eq!(
-                got, want,
+                got, want_decode,
                 "decode heads={heads:?} block_tokens={block_tokens}"
+            );
+        }
+    }
+}
+
+/// Perf item #3: paged decode of grouped query heads at 128-token pages runs CK
+/// `fmha_fwd_splitkv` (the query heads of a KV head merged into one tile) and matches the CPU
+/// reference: one sequence of ~8k tokens, sequences of 1-129 tokens around the page edge, a
+/// short and a long sequence together, a ragged batch of 16 around the served ~768 tokens, 64
+/// sequences, and the GQA ratios 3 (Llama 3.2 3B), 4 (Llama 3.1 8B) and 7 (Qwen2.5 7B). Breaks
+/// if the head merge maps a query head to the wrong KV head or row, or the combine loses a
+/// key.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn paged_decode_splitkv_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(13);
+    let ragged16: Vec<usize> = (0..16).map(|s| 740 + (37 * s) % 90).collect();
+    let many: Vec<usize> = (0..64).map(|s| 1 + (97 * s) % 1500).collect();
+    let batches: [&[usize]; 5] = [
+        &[8000],
+        &[1, 2, 127, 128, 129],
+        &[1, 3000, 5],
+        &ragged16,
+        &many,
+    ];
+    for heads in [(Q_HEADS, KV_HEADS), (32, 8), (28, 4)] {
+        for kv_lens in batches {
+            let got = paged_case(
+                &p,
+                &mut rng,
+                AttentionKind::DecodePaged,
+                heads,
+                128,
+                &vec![1; kv_lens.len()],
+                kv_lens,
+            );
+            assert_eq!(
+                got, "ck_tile_fmha_splitkv",
+                "heads={heads:?} kv_lens={kv_lens:?}"
             );
         }
     }
@@ -3121,7 +3171,8 @@ fn column_block<'a>(
 /// Lab microbenchmark (no assertion on speed; perf item #3): every enumerated implementation of
 /// `attention_decode_paged` (append + attend), bound through `turbine_impl_run` as the kernel
 /// registry binds it, for both served models' heads (Llama 24/8, OLMoE 16/16) at 128-token pages:
-/// batches 1, 16 and 64 at a ~768-token context and batch 16 at ~2,048 and ~8,192. The KV pool is
+/// batches 1, 4, 8, 16 and 64 at a ~768-token context, batch 16 at ~2,048 and ~8,192, and the
+/// small batches where splitting the context matters (1 at ~8,192, 4 at ~2,048). The KV pool is
 /// cycled through enough copies (≥ 512 MB) that it never stays in the 64 MB L2/MALL, as in a
 /// served step where every layer has its own pool (the single pool of `decode_op_timings` fits the
 /// cache at batch 16 and reads faster than served). Wall time per call, host launches included.
@@ -3138,7 +3189,17 @@ fn decode_attention_timings() {
     let mut rng = Rng(11);
     const ITERS: u32 = 50;
     const BLOCK_TOKENS: usize = 128;
-    let cases: [(usize, usize); 5] = [(1, 768), (16, 768), (64, 768), (16, 2048), (16, 8192)];
+    let cases: [(usize, usize); 9] = [
+        (1, 768),
+        (4, 768),
+        (8, 768),
+        (16, 768),
+        (64, 768),
+        (1, 8192),
+        (4, 2048),
+        (16, 2048),
+        (16, 8192),
+    ];
     for model in BENCH_MODELS {
         let cfg = model.attention_cfg(BLOCK_TOKENS);
         let spec = OpConfig::Attention(cfg);
@@ -4239,6 +4300,11 @@ fn implementations_enumerated() {
         ("ck_tile_fmha_pagedkv", "ck", false),
         ("turbine_hip", "turbine_hip", false),
     ];
+    let paged_decode = vec![
+        ("ck_tile_fmha_splitkv", "ck", false),
+        ("ck_tile_fmha_pagedkv", "ck", false),
+        ("turbine_hip", "turbine_hip", false),
+    ];
     // (name, provider, needs host offsets) in library order.
     type Impls = Vec<(&'static str, &'static str, bool)>;
     let table: Vec<(OpKind, Impls)> = vec![
@@ -4250,8 +4316,8 @@ fn implementations_enumerated() {
         (OpKind::SiluMul, one("turbine_hip", "turbine_hip")),
         (OpKind::Embedding, one("turbine_hip", "turbine_hip")),
         (OpKind::Add, one("turbine_hip", "turbine_hip")),
-        (OpKind::AttentionPrefillPaged, paged.clone()),
-        (OpKind::AttentionDecodePaged, paged),
+        (OpKind::AttentionPrefillPaged, paged),
+        (OpKind::AttentionDecodePaged, paged_decode),
         (OpKind::CopyBlocks, one("hip_memcpy_d2d", "turbine_hip")),
         (OpKind::MoeRoute, one("turbine_hip", "turbine_hip")),
         (

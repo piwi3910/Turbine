@@ -190,13 +190,20 @@ mod tests {
                 "{op}"
             );
         }
-        for op in [OpKind::AttentionPrefillPaged, OpKind::AttentionDecodePaged] {
-            assert_eq!(
-                order(op),
-                Some(&["ck_tile_fmha_pagedkv", "turbine_hip"][..]),
-                "{op}"
-            );
-        }
+        assert_eq!(
+            order(OpKind::AttentionPrefillPaged),
+            Some(&["ck_tile_fmha_pagedkv", "turbine_hip"][..])
+        );
+        assert_eq!(
+            order(OpKind::AttentionDecodePaged),
+            Some(
+                &[
+                    "ck_tile_fmha_splitkv",
+                    "ck_tile_fmha_pagedkv",
+                    "turbine_hip"
+                ][..]
+            )
+        );
         let moe = p.preference(OpKind::MoeExperts).expect("moe_experts tiers");
         assert_eq!(
             moe.row_tiers,

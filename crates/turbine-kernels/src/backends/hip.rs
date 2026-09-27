@@ -83,10 +83,12 @@ impl ExecutionBackend for HipBackend {
         Self::STICKY_ERRORS
     }
 
-    /// `paged_attention_fallback` when paged attention does not run the card profile's first
-    /// preference (on gfx1201 Composable Kernel's `fmha_fwd_pagedkv`, which serves only pages of
-    /// a multiple of the profile's `paged_page_multiple` tokens; other sizes run the slower
-    /// Turbine kernel).
+    /// `paged_attention_fallback` when paged attention runs the last implementation of the card
+    /// profile's order for its op, the any-page-size one (on gfx1201 the Turbine kernel: the
+    /// Composable Kernel implementations before it serve only pages of a multiple of the
+    /// profile's `paged_page_multiple` tokens). A later entry that is not the last is no
+    /// fallback: e.g. decode of equal query and KV head counts runs CK `fmha_fwd_pagedkv`
+    /// because CK split-KV serves only grouped heads.
     fn selection_notes(
         &self,
         card: Option<&CardProfile>,
@@ -104,9 +106,9 @@ impl ExecutionBackend for HipBackend {
                 )
             })
             .find(|s| {
-                card.preference(s.op)
-                    .and_then(|p| p.order.first())
-                    .is_some_and(|preferred| s.implementation != *preferred)
+                card.preference(s.op).is_some_and(|p| {
+                    p.order.len() > 1 && p.order.last() == Some(&s.implementation.as_str())
+                })
             })
             .map(|s| BackendNote {
                 event: "paged_attention_fallback",
@@ -117,9 +119,9 @@ impl ExecutionBackend for HipBackend {
                         card.thresholds.paged_page_multiple.to_string(),
                     ),
                 ],
-                message: "paged attention is not on the card profile's preferred implementation \
-                          (CK fmha_fwd_pagedkv): kv.block_tokens is not a multiple of the \
-                          profile's page multiple",
+                message: "paged attention runs the card profile's any-page-size fallback, not \
+                          a Composable Kernel implementation: kv.block_tokens is not a multiple \
+                          of the profile's page multiple",
             })
             .into_iter()
             .collect()
@@ -239,12 +241,21 @@ mod tests {
                 ("page_multiple", "128".to_string())
             ]
         );
-        let on_ck = [
-            sel(OpKind::Gemm, "hipblaslt"),
-            sel(OpKind::AttentionPrefillPaged, "ck_tile_fmha_pagedkv"),
-            sel(OpKind::AttentionDecodePaged, "ck_tile_fmha_pagedkv"),
-        ];
-        assert!(HipBackend.selection_notes(card, &on_ck).is_empty());
+        // Llama (grouped heads) decodes on CK split-KV, OLMoE (equal heads) on CK pagedkv, the
+        // profile's second choice: neither is the page-size fallback.
+        for decode in ["ck_tile_fmha_splitkv", "ck_tile_fmha_pagedkv"] {
+            let on_ck = [
+                sel(OpKind::Gemm, "hipblaslt"),
+                sel(OpKind::AttentionPrefillPaged, "ck_tile_fmha_pagedkv"),
+                sel(OpKind::AttentionDecodePaged, decode),
+            ];
+            assert!(
+                HipBackend.selection_notes(card, &on_ck).is_empty(),
+                "{decode}"
+            );
+        }
+        let decode_only = [sel(OpKind::AttentionDecodePaged, "turbine_hip")];
+        assert_eq!(HipBackend.selection_notes(card, &decode_only).len(), 1);
         // Without a card profile there is no preference to fall back from.
         assert!(HipBackend.selection_notes(None, &fallback).is_empty());
     }
