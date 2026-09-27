@@ -8,7 +8,9 @@
 //! between the two forward times is the executor's own overhead. Llama runs twice, with the
 //! default options and with every fusion on (the opt-in projection fusion included); each line
 //! names its `fused_ops` and `fused_projections`. `serving_mix` (below) times decode steps under
-//! a server-like continuous batch for every fusion combination.
+//! a server-like continuous batch for every fusion combination. `moe_prefill_timings` times every
+//! `moe_experts` implementation alone at the served prefill sizes with OLMoE's real routing and
+//! weights (perf item #2).
 //!
 //! Run with `scripts/lab-test.sh novanas -- --release -p turbine-model --test perf -- forward_profile --nocapture`.
 use std::path::Path;
@@ -100,6 +102,17 @@ fn hip_executor(
     opts: ExecutorOptions,
     max_batch_tokens: u32,
 ) -> Box<dyn Profiled> {
+    Box::new(hip_decoder(cfg, dir, ctx, opts, max_batch_tokens))
+}
+
+/// [`hip_executor`] unboxed (for tracing).
+fn hip_decoder(
+    cfg: &ModelArchConfig,
+    dir: &Path,
+    ctx: &Arc<turbine_kernels::ShimContext>,
+    opts: ExecutorOptions,
+    max_batch_tokens: u32,
+) -> DecoderExecutor {
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
     let index = SafetensorsIndex::open(dir).expect("open safetensors");
     let slots = cfg.family.0.weight_slots(cfg);
@@ -127,10 +140,7 @@ fn hip_executor(
         max_batch_tokens,
         max_seqs: MAX_SEQS,
     };
-    Box::new(
-        DecoderExecutor::new(cfg, spec, weights, registry, mem, limits, opts)
-            .expect("decoder executor"),
-    )
+    DecoderExecutor::new(cfg, spec, weights, registry, mem, limits, opts).expect("decoder executor")
 }
 
 fn pool_view<'a>(storage: &'a DeviceBuffer, layout: &KvLayout, blocks: u32) -> KvPoolView<'a> {
@@ -482,5 +492,300 @@ fn serving_mix() {
             prefill_ms.len(),
             mean(&prefill_ms)
         );
+    }
+}
+
+// ------------------------------------------------------------------ MoE prefill (perf item #2)
+
+/// Tokens (× top-8 = routed rows) `moe_prefill_timings` times: 512, 2,048 and 16,384 routed
+/// rows — the first grouped-tier size, a mid-sized chunk and a full 2,048-token chunk.
+const MOE_PREFILL_TOKENS: [usize; 3] = [64, 256, 2048];
+
+/// The prompt token ids of the committed OLMoE golden reference (real chat-formatted text),
+/// concatenated and cut to `n`.
+fn golden_prompt_tokens(n: usize) -> Vec<u32> {
+    #[derive(serde::Deserialize)]
+    struct Record {
+        prompt_token_ids: Vec<u32>,
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/olmoe-1b-7b-0125-instruct/reference.jsonl");
+    let text = std::fs::read_to_string(&path).expect("OLMoE reference.jsonl");
+    let mut tokens: Vec<u32> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .flat_map(|l| {
+            serde_json::from_str::<Record>(l)
+                .expect("reference line")
+                .prompt_token_ids
+        })
+        .collect();
+    assert!(
+        tokens.len() >= n,
+        "the golden prompts hold {} tokens",
+        tokens.len()
+    );
+    tokens.truncate(n);
+    tokens
+}
+
+/// The raw BF16 bytes of layer `layer`'s expert projection `proj`, stacked `[experts, rows,
+/// cols]` as the loader stacks them.
+fn stacked_expert_bytes(
+    index: &SafetensorsIndex,
+    layer: usize,
+    proj: &str,
+    experts: usize,
+) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut out = Vec::new();
+    for e in 0..experts {
+        let name = format!("model.layers.{layer}.mlp.experts.{e}.{proj}.weight");
+        let entry = index
+            .get(&name)
+            .unwrap_or_else(|| panic!("checkpoint lacks {name}"));
+        let mut f = std::fs::File::open(&entry.file).expect("open shard");
+        f.seek(SeekFrom::Start(entry.range.start)).expect("seek");
+        let start = out.len();
+        out.resize(start + entry.byte_len() as usize, 0);
+        f.read_exact(&mut out[start..]).expect("read expert weight");
+    }
+    out
+}
+
+/// Lab timing (perf tier, perf item #2): `moe_experts` at the served prefill shapes with **real
+/// routing**. One 2,048-token prefill of OLMoE-1B-7B over the golden prompts (real text) is
+/// traced; for the layers of `TURBINE_MOE_LAYERS` (default `0,5,10,15`) its `mlp_norm` rows (the
+/// MoE input) and `router_logits` are routed again by `moe_route`, and every enumerated
+/// `moe_experts` implementation that supports the shape runs alone on the layer's real expert
+/// weights over the first 64 / 256 / 2,048 tokens (512 / 2,048 / 16,384 routed rows: what a
+/// prefill of those tokens routes). One `moe_prefill_timing` line per (layer, size,
+/// implementation): mean time per call, TFLOPS, the routing skew (active experts, the largest
+/// expert's rows) and how many outputs differ from `turbine_hip_moe_wmma` (0: the same WMMA
+/// chain, so compatible with the small-m tier's batch invariance). No bound. Run natively on
+/// GPU 0 under `scripts/bench-lock.sh`; the expert weights (805 MB per layer) stream from memory.
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY and TURBINE_TEST_MOE_MODEL_DIR"]
+fn moe_prefill_timings() {
+    use turbine_core::types::DType;
+    use turbine_kernels::{
+        ImplChoice, KernelProvider, MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig,
+        MoeRouteContext, OpConfig, OpRequirement,
+    };
+    use turbine_tensor::{Tensor, TensorView};
+
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let dir = require_env_dir("TURBINE_TEST_MOE_MODEL_DIR");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let cfg = load_model_config(&dir).expect("config.json");
+    let moe = cfg.moe.expect("an MoE model");
+    let (experts, top_k, inter, hidden) = (
+        moe.num_experts as usize,
+        moe.experts_per_token as usize,
+        moe.expert_intermediate as usize,
+        cfg.hidden as usize,
+    );
+    let layers: Vec<usize> = std::env::var("TURBINE_MOE_LAYERS")
+        .unwrap_or_else(|_| "0,5,10,15".into())
+        .split(',')
+        .map(|s| s.trim().parse().expect("TURBINE_MOE_LAYERS: layer numbers"))
+        .collect();
+    let max_t = *MOE_PREFILL_TOKENS.iter().max().expect("sizes");
+
+    // 1. The real MoE inputs and router logits of one 2,048-token prefill.
+    let (norms, logits) = {
+        let mut exec = hip_decoder(&cfg, &dir, &ctx, ExecutorOptions::default(), max_t as u32);
+        let layout = *exec.kv_layout();
+        let blocks = (max_t as u32).div_ceil(BLOCK_TOKENS);
+        let storage =
+            DeviceBuffer::alloc(&mem, (layout.block_bytes() * u64::from(blocks)) as usize)
+                .expect("KV pool");
+        let kv = pool_view(&storage, &layout, blocks);
+        let table: Vec<BlockId> = (0..blocks).map(BlockId).collect();
+        let tokens = golden_prompt_tokens(max_t);
+        exec.set_trace(true);
+        step(&mut exec, &kv, &[(&table, &tokens, 0)]).expect("traced prefill");
+        let trace = exec.take_trace();
+        let pick = |name: &str, layer: usize| {
+            trace
+                .iter()
+                .find(|t| t.layer == Some(layer) && t.name == name)
+                .unwrap_or_else(|| panic!("trace lacks layer {layer} {name}"))
+                .data
+                .clone()
+        };
+        let norms: Vec<Vec<f32>> = layers.iter().map(|&l| pick("mlp_norm", l)).collect();
+        let logits: Vec<Vec<f32>> = layers.iter().map(|&l| pick("router_logits", l)).collect();
+        (norms, logits)
+    };
+
+    // 2. Every moe_experts implementation, bound alone.
+    let provider = shim_provider(ctx.clone());
+    let route_cfg = MoeRouteConfig {
+        num_experts: experts as u32,
+        top_k: top_k as u32,
+        renormalize: moe.norm_topk_prob,
+        bf16_logits: true,
+    };
+    let experts_cfg = MoeExpertsConfig {
+        hidden: hidden as u32,
+        inter: inter as u32,
+        num_experts: experts as u32,
+        top_k: top_k as u32,
+        expert_begin: 0,
+        expert_end: experts as u32,
+        dtype: DType::BF16,
+    };
+    let registry = KernelRegistry::build(
+        vec![Arc::clone(&provider)],
+        &[provider.id()],
+        &[OpRequirement::from(OpConfig::MoeRoute(route_cfg))],
+        &KernelMetrics::register(&MetricsRegistry::new()),
+        provider.card_profile(),
+    )
+    .expect("moe_route");
+    let router = registry.moe_route(&route_cfg);
+    let spec = OpConfig::MoeExperts(experts_cfg);
+    let reference = "turbine_hip_moe_wmma";
+    let mut impls: Vec<(String, Arc<dyn KernelProvider>)> = provider
+        .implementations(OpKind::MoeExperts)
+        .into_iter()
+        .filter_map(|i| Some((i.name, provider.bind(&spec, &ImplChoice::Single(i.index))?)))
+        .collect();
+    // The reference first: every other output is compared with it.
+    impls.sort_by_key(|(n, _)| n != reference);
+    assert_eq!(impls[0].0, reference, "the library enumerates {reference}");
+
+    let upload = |shape: &[usize], dtype: DType, bytes: &[u8]| {
+        let mut t = Tensor::empty(&mem, shape, dtype).expect("tensor");
+        t.storage.copy_from_host(0, bytes).expect("upload");
+        t
+    };
+    let index = SafetensorsIndex::open(&dir).expect("open safetensors");
+    for (li, &layer) in layers.iter().enumerate() {
+        let gate_shape = [experts, inter, hidden];
+        let w_gate = upload(
+            &gate_shape,
+            DType::BF16,
+            &stacked_expert_bytes(&index, layer, "gate_proj", experts),
+        );
+        let w_up = upload(
+            &gate_shape,
+            DType::BF16,
+            &stacked_expert_bytes(&index, layer, "up_proj", experts),
+        );
+        let w_down = upload(
+            &[experts, hidden, inter],
+            DType::BF16,
+            &stacked_expert_bytes(&index, layer, "down_proj", experts),
+        );
+        for t in MOE_PREFILL_TOKENS {
+            let rows = t * top_k;
+            let x_bytes: Vec<u8> = norms[li][..t * hidden]
+                .iter()
+                .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+                .collect();
+            let x = upload(&[t, hidden], DType::BF16, &x_bytes);
+            let l_bytes: Vec<u8> = logits[li][..t * experts]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let l = upload(&[t, experts], DType::F32, &l_bytes);
+            let ids = Tensor::empty(&mem, &[t, top_k], DType::I32).expect("ids");
+            let tw = Tensor::empty(&mem, &[t, top_k], DType::F32).expect("weights");
+            let sorted = Tensor::empty(&mem, &[rows], DType::I32).expect("sorted");
+            let offsets = Tensor::empty(&mem, &[experts + 1], DType::I32).expect("offsets");
+            router
+                .route(&mut MoeRouteContext {
+                    cfg: route_cfg,
+                    router_logits: l.view(),
+                    topk_ids: ids.view(),
+                    topk_weights: tw.view(),
+                    sorted_rows: sorted.view(),
+                    expert_offsets: offsets.view(),
+                })
+                .expect("moe_route");
+            let host: Vec<i32> = offsets
+                .storage
+                .whole()
+                .read_bytes()
+                .expect("offsets")
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let per_expert: Vec<i32> = host.windows(2).map(|w| w[1] - w[0]).collect();
+            let active = per_expert.iter().filter(|&&c| c > 0).count();
+            let largest = per_expert.iter().copied().max().unwrap_or(0);
+            let zeros = vec![0u8; t * hidden * 2];
+            let mut o = upload(&[t, hidden], DType::BF16, &zeros);
+            let sorted_view =
+                TensorView::contiguous(sorted.storage.whole(), 0, &[rows], DType::I32);
+            let mut want: Option<Vec<u8>> = None;
+            for (name, p) in &impls {
+                let kernel = p.moe().expect("moe");
+                if !kernel.supports_experts(&experts_cfg) {
+                    continue;
+                }
+                // One run into a zeroed output, compared with the reference implementation's.
+                o.storage.copy_from_host(0, &zeros).expect("zero out");
+                let run = || {
+                    kernel.experts(&mut MoeExpertsContext {
+                        cfg: experts_cfg,
+                        x: x.view(),
+                        w_gate: w_gate.view(),
+                        w_up: w_up.view(),
+                        w_down: w_down.view(),
+                        sorted_rows: sorted_view.clone(),
+                        expert_offsets: offsets.view(),
+                        topk_weights: tw.view(),
+                        host_expert_offsets: &host,
+                        out: o.view(),
+                        workspace: None,
+                    })
+                };
+                // A library may enumerate an implementation it cannot run on this device
+                // (hipblaslt_grouped without a grouped-GEMM solution): reported, not timed.
+                if let Err(e) = run() {
+                    println!(
+                        "moe_prefill_timing layer={layer} tokens={t} rows={rows} impl={name} \
+                         unsupported: {e}"
+                    );
+                    continue;
+                }
+                let run = || run().expect("moe_experts");
+                let got = o.storage.whole().read_bytes().expect("read out");
+                let differing = match &want {
+                    None => {
+                        want = Some(got);
+                        0
+                    }
+                    Some(w) => w
+                        .chunks_exact(2)
+                        .zip(got.chunks_exact(2))
+                        .filter(|(a, b)| a != b)
+                        .count(),
+                };
+                run();
+                mem.synchronize().expect("synchronize");
+                let iters: u32 = if t >= 1024 { 20 } else { 50 };
+                let start = Instant::now();
+                for _ in 0..iters {
+                    run();
+                }
+                mem.synchronize().expect("synchronize");
+                let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+                let tflops = 6.0 * (rows * hidden * inter) as f64 / (us * 1e6);
+                println!(
+                    "moe_prefill_timing layer={layer} tokens={t} rows={rows} \
+                     active_experts={active} largest_expert_rows={largest} impl={name} \
+                     us={us:.1} tflops={tflops:.1} differing_vs_{reference}={differing}/{}",
+                    t * hidden
+                );
+            }
+        }
     }
 }

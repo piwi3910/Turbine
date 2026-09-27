@@ -51,6 +51,7 @@ SLOW_TESTS=(
 	# crates/turbine-model/tests/perf.rs, tests/host_step.rs
 	serving_mix
 	forward_profile
+	moe_prefill_timings
 	host_step_costs
 	# crates/turbine-kernels/tests/hip_ops.rs
 	decode_forward_timing
