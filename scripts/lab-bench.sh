@@ -202,6 +202,14 @@ def avg(phase):
     s = val(after, "sum", phase) - val(before, "sum", phase)
     c = val(after, "count", phase) - val(before, "count", phase)
     return 1000 * s / c if c > 0 else float("nan")
+values = {"tok_s": round(d["output_token_throughput"], 1), "itl_p50_ms": round(d["itl_ms"]["p50"], 1),
+          "ttft_p50_ms": round(d["ttft_ms"]["p50"]), "ttft_p99_ms": round(d["ttft_ms"]["p99"]),
+          "itl_p99_ms": round(d["itl_ms"]["p99"], 1), "decode_fwd_ms": round(avg("decode"), 1),
+          "requests_ok": d["requests_ok"], "requests_failed": d["requests_failed"],
+          "golden_c1": g1.startswith("PASS")}
+if g16 != "SKIP":
+    values["golden_c16"] = g16.startswith("PASS")
+json.dump({k: v for k, v in values.items() if v == v}, open(f"{out}/labbook-values.json", "w"))
 print(f"BENCH {label} {model} commit={commit} gpu={gpu} tests={tests} golden1={g1} golden16={g16}{quick_field} "
       f"ok={d['requests_ok']} failed={d['requests_failed']} tok/s={d['output_token_throughput']:.1f} "
       f"itl_p50={d['itl_ms']['p50']:.1f} ttft_p50={d['ttft_ms']['p50']:.0f} decode_fwd_ms={avg('decode'):.1f}")
@@ -210,3 +218,30 @@ if model == "olmoe":
     bad = (tests != "skipped" and not tests.endswith("/0")) or d["requests_failed"] != 0
 sys.exit(1 if bad else 0)
 EOF
+rc=$?
+
+# 5. record the run in labbook (https://labbook.kw.watteel.lab) when the uploader and its token are
+# installed; LABBOOK_UPLOAD=0 skips it, LABBOOK_SET=<slug> adds the run to a set. An upload failure
+# only warns: the local files under $out stay the record of truth.
+uploader="$HOME/.local/bin/labbook-submit.mjs"
+if [[ $rc -eq 0 && "${LABBOOK_UPLOAD:-1}" != 0 && -f "$uploader" && -f "$HOME/.config/labbook/token" && -f "$out/labbook-values.json" ]]; then
+	set_args=()
+	[[ -n "${LABBOOK_SET:-}" ]] && set_args=(--set "$LABBOOK_SET")
+	attach=()
+	for f in bench.json golden1.txt golden16.txt metrics.txt status.json; do
+		[[ -s "$out/$f" ]] && attach+=(--attach "$out/$f")
+	done
+	branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+	config_param="$(printf '%s ' phase2c "$@" | sed 's/--set //g; s/ *$//')"
+	if LABBOOK_URL="${LABBOOK_URL:-https://labbook.kw.watteel.lab}" NODE_EXTRA_CA_CERTS="$HOME/.labbook/cluster-ca.crt" \
+		node "$uploader" run --type turbine-lab-bench --external-id "lab-bench:$label-$model:$commit" \
+		--param model="$slug" --param gpu="R9700 GPU$gpu" --param config="$config_param" \
+		--param engine=turbine --param commit="$commit" --param label="$label" \
+		--values-json "$out/labbook-values.json" --commit "$commit" --branch "$branch" \
+		${set_args[@]+"${set_args[@]}"} ${attach[@]+"${attach[@]}"} >"$out/labbook.log" 2>&1; then
+		echo "lab-bench: recorded in labbook ($(tail -1 "$out/labbook.log"))"
+	else
+		echo "lab-bench: labbook upload failed (see $out/labbook.log); results kept in $out" >&2
+	fi
+fi
+exit $rc
