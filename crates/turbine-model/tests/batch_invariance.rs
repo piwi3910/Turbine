@@ -10,7 +10,9 @@
 //!
 //! `olmoe_rows_are_batch_invariant` prints one line per (step, scenario) with the first differing
 //! op, then a per-scenario summary, then asserts the target's logits are bit-identical in every
-//! scenario. `TURBINE_BATCH_TARGETS` (default `p10,p14`) names the prompts and
+//! scenario, except the ones marked pending the per-card GEMM table (the prompt's prefill rows at
+//! the tail of a 2,048-row batch, where hipBLASLt's dense GEMMs change the rows' bits), which it
+//! only reports. `TURBINE_BATCH_TARGETS` (default `p10,p14`) names the prompts and
 //! `TURBINE_BATCH_STEPS` (default 32, the whole reference) the decode steps.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,11 +30,12 @@ use turbine_observability::MetricsRegistry;
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView};
 
 const BLOCK_TOKENS: u32 = 128;
-/// Blocks each sequence of the test owns (every prompt but p09 plus 32 tokens fits in 128; p09 is
-/// cut to its first 100 tokens as a companion).
-const BLOCKS_PER_SEQ: u32 = 2;
-const MAX_SEQS: u32 = 20;
-const MAX_BATCH_TOKENS: u32 = 1024;
+/// Blocks each sequence of the test owns (p09's 2,004-token prompt fits in 16).
+const BLOCKS_PER_SEQ: u32 = 17;
+const MAX_SEQS: u32 = 21;
+/// Sequence of the long companion prefill (p09 whole).
+const LONG_SEQ: u32 = 20;
+const MAX_BATCH_TOKENS: u32 = 2048;
 /// Companion prompts are cut to this many tokens.
 const COMPANION_MAX: usize = 100;
 
@@ -67,6 +70,9 @@ struct Part {
 /// A batched step: the parts in row order and which one is the target.
 struct Scenario {
     name: String,
+    /// Known to differ until the per-card GEMM table pins batch-invariant hipBLASLt algorithms
+    /// (dense GEMM rows at the tail of a 2,048-row batch): reported, not asserted.
+    pending_gemm_table: bool,
     parts: Vec<Part>,
     target: usize,
     /// The alone step's rows the target's rows correspond to (a chunk covers part of them).
@@ -342,8 +348,32 @@ fn olmoe_rows_are_batch_invariant() {
             if step == 0 {
                 let mut parts = vec![me.clone()];
                 parts.extend(prefill_companions.iter().cloned());
+                // The serving shape of concurrency 16: the prompt behind p09's long prefill in
+                // one 2,048-token batch, its rows past row 2,000.
+                let long: Vec<u32> = refs
+                    .iter()
+                    .find(|r| r.id == "p09")
+                    .map(|r| r.prompt_token_ids.clone())
+                    .expect("p09");
+                if long.len() + q_len <= MAX_BATCH_TOKENS as usize && target_id != "p09" {
+                    scenarios.push(Scenario {
+                        name: "prefill behind a 2004-token prefill".into(),
+                        pending_gemm_table: true,
+                        parts: vec![
+                            Part {
+                                seq: LONG_SEQ,
+                                tokens: long,
+                                start: 0,
+                            },
+                            me.clone(),
+                        ],
+                        target: 1,
+                        alone_rows: (0, q_len),
+                    });
+                }
                 scenarios.push(Scenario {
                     name: "prefill + 3 prefills".into(),
+                    pending_gemm_table: false,
                     parts,
                     target: 0,
                     alone_rows: (0, q_len),
@@ -352,6 +382,7 @@ fn olmoe_rows_are_batch_invariant() {
                 parts.push(me.clone());
                 scenarios.push(Scenario {
                     name: "15 decodes + prefill".into(),
+                    pending_gemm_table: false,
                     parts,
                     target: 15,
                     alone_rows: (0, q_len),
@@ -361,6 +392,7 @@ fn olmoe_rows_are_batch_invariant() {
                 let split = q_len * 2 / 3;
                 scenarios.push(Scenario {
                     name: "second chunk".into(),
+                    pending_gemm_table: false,
                     parts: vec![Part {
                         seq: 0,
                         tokens: tokens[split..].to_vec(),
@@ -374,6 +406,7 @@ fn olmoe_rows_are_batch_invariant() {
                 parts.extend((0..15).map(companion_decode));
                 scenarios.push(Scenario {
                     name: "16 decodes, first".into(),
+                    pending_gemm_table: false,
                     parts,
                     target: 0,
                     alone_rows: (0, 1),
@@ -382,6 +415,7 @@ fn olmoe_rows_are_batch_invariant() {
                 parts.push(me.clone());
                 scenarios.push(Scenario {
                     name: "16 decodes, last".into(),
+                    pending_gemm_table: false,
                     parts,
                     target: 15,
                     alone_rows: (0, 1),
@@ -390,12 +424,14 @@ fn olmoe_rows_are_batch_invariant() {
                 parts.extend((0..3).map(companion_decode));
                 scenarios.push(Scenario {
                     name: "4 decodes".into(),
+                    pending_gemm_table: false,
                     parts,
                     target: 0,
                     alone_rows: (0, 1),
                 });
                 scenarios.push(Scenario {
                     name: "decode + prefill chunk".into(),
+                    pending_gemm_table: false,
                     parts: vec![
                         me.clone(),
                         Part {
@@ -405,6 +441,34 @@ fn olmoe_rows_are_batch_invariant() {
                         },
                     ],
                     target: 0,
+                    alone_rows: (0, 1),
+                });
+                // Past the first 16 rows of a larger batch (a decode after 15 decodes and a
+                // prefill chunk, as the engine orders rows only by arrival).
+                let mut parts: Vec<Part> = (0..15).map(companion_decode).collect();
+                parts.push(Part {
+                    seq: chunk_seq,
+                    tokens: chunk_prompt.clone(),
+                    start: 0,
+                });
+                parts.push(me.clone());
+                scenarios.push(Scenario {
+                    name: "decode at row 85".into(),
+                    pending_gemm_table: false,
+                    parts,
+                    target: 16,
+                    alone_rows: (0, 1),
+                });
+                let mut extra = companion_decode(0);
+                extra.seq = chunk_seq;
+                let mut parts: Vec<Part> = (0..15).map(companion_decode).collect();
+                parts.push(extra);
+                parts.push(me.clone());
+                scenarios.push(Scenario {
+                    name: "17 decodes, last".into(),
+                    pending_gemm_table: false,
+                    parts,
+                    target: 16,
                     alone_rows: (0, 1),
                 });
             }
@@ -475,7 +539,14 @@ fn olmoe_rows_are_batch_invariant() {
                 s.steps += 1;
                 if nl > 0 {
                     s.logits_differ += 1;
-                    failures.push(format!("{target_id} step {step} [{}]", sc.name));
+                    if sc.pending_gemm_table {
+                        println!(
+                            "batch_invariance pending the per-card GEMM table: {target_id} step {step} [{}]",
+                            sc.name
+                        );
+                    } else {
+                        failures.push(format!("{target_id} step {step} [{}]", sc.name));
+                    }
                 }
                 s.argmax_differ += usize::from(flip);
                 s.max_logits_abs = s.max_logits_abs.max(dl);
