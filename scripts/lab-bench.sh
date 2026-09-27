@@ -164,6 +164,7 @@ golden16_cmd=""
 scripts/bench-lock.sh sh -c "
   $golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 1 > '$out/golden1.txt' 2>&1
   $golden16_cmd
+  curl -s '$url/metrics' > '$out/metrics-before.txt'
   '$bench_bin' --url $url --concurrency 16 --requests $requests --prompt-words 512 --max-tokens 256 \
     --ignore-eos --output json > '$out/bench.json' 2> '$out/bench.err'
 " 2>/dev/null
@@ -186,11 +187,21 @@ try:
 except Exception as e:
     print(f"BENCH {label} {model} commit={commit} gpu={gpu} tests={tests} golden1={g1}{quick_field} BENCH FAILED ({e})")
     sys.exit(1)
-m = open(f"{out}/metrics.txt").read()
+# Forward-time averages over the throughput run only: subtract the scrape taken after the golden
+# runs, whose batch-1 steps would otherwise pull the decode average down.
+def read(path):
+    try:
+        return open(path).read()
+    except OSError:
+        return ""
+after, before = read(f"{out}/metrics.txt"), read(f"{out}/metrics-before.txt")
+def val(m, kind, phase):
+    r = re.search(rf'turbine_forward_seconds_{kind}{{phase="{phase}"}} ([0-9.e+-]+)', m)
+    return float(r.group(1)) if r else 0.0
 def avg(phase):
-    s = re.search(rf'turbine_forward_seconds_sum{{phase="{phase}"}} ([0-9.e+-]+)', m)
-    c = re.search(rf'turbine_forward_seconds_count{{phase="{phase}"}} ([0-9.e+-]+)', m)
-    return 1000 * float(s.group(1)) / float(c.group(1)) if s and c and float(c.group(1)) else float("nan")
+    s = val(after, "sum", phase) - val(before, "sum", phase)
+    c = val(after, "count", phase) - val(before, "count", phase)
+    return 1000 * s / c if c > 0 else float("nan")
 print(f"BENCH {label} {model} commit={commit} gpu={gpu} tests={tests} golden1={g1} golden16={g16}{quick_field} "
       f"ok={d['requests_ok']} failed={d['requests_failed']} tok/s={d['output_token_throughput']:.1f} "
       f"itl_p50={d['itl_ms']['p50']:.1f} ttft_p50={d['ttft_ms']['p50']:.0f} decode_fwd_ms={avg('decode'):.1f}")
