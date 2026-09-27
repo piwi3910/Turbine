@@ -172,6 +172,8 @@ Decision reason codes (closed enums, used as metric labels):
 | PROBING      | HEALTHY      | `probe_successes` consecutive probe requests (internal 16-token greedy generation of a fixed prompt) succeed within 2 × baseline latency    |
 | PROBING      | CIRCUIT_OPEN | a probe fails or times out (`probe_failed`)                                                                                                 |
 
+`latency_drift` feeds the circuit only while the pressure state is GREEN (decision "Phase 3: soak config max_batch_tokens", answer option 2, 2026-09-27, provisional): the circuit owns device health and the pressure controller owns load, so above GREEN a slower step (bigger batches, longer contexts) raises only the `step_time_drift` pressure signal. The probe and drain logic are unchanged.
+
 DEGRADED raises the pressure floor to YELLOW. A sticky device error (HIP `hipErrorIllegalAddress` / `hipErrorLaunchFailure`, NVIDIA `cudaErrorIllegalAddress`-class — any error the vendor marks as context-corrupting) goes to CIRCUIT_OPEN with reason `device_fatal`, drains without running further device work (running sequences fail with `resource_exhausted`), and exits the process with code 3.
 
 ### HTTP routes (changes from Phase 2)

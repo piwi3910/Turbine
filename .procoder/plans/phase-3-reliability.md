@@ -401,6 +401,22 @@ Depends on: Tasks 10, 12, 12a, 12b, 14; decision "Phase 3: soak stall — drift 
 - [ ] Commit: `fix(reliability): drift per decode iteration, none while idle; admission floor when nothing is admitted`
 - [ ] Soak config (decision "Phase 3: soak config max_batch_tokens"): `scripts/lab/phase3-novanas-soak.yaml` `scheduler.max_batch_tokens: 2048` (the Phase 2c value its header names); commit `fix(scripts): soak config uses the Phase 2c max_batch_tokens`.
 
+## Task 12d: Latency drift feeds the circuit only in GREEN (amendment 2026-09-27)
+
+Files: `crates/turbine-reliability/src/controller.rs`
+Interfaces: none changed; `PressureController::tick` sends `CircuitEvent::LatencyDrift` only while the pressure state is GREEN.
+
+Covers: S-12 (latency drift trigger), S-19; `controller::tests::drift_under_pressure_leaves_the_circuit`.
+Depends on: Task 12c; decision "Phase 3: soak config max_batch_tokens" (answer: option 1 tried and reverted, option 2 provisional).
+
+- [ ] Write failing test `controller::tests::drift_under_pressure_leaves_the_circuit`: with pressure ORANGE from KV, a 2.5× and then a 5× drift spike leave the circuit HEALTHY; the same 2.5× spike in GREEN makes it DEGRADED.
+- [ ] Run: `cargo test -p turbine-reliability controller::tests` — expect FAIL (the circuit goes DEGRADED under pressure).
+- [ ] Implement: `tick` gates the `LatencyDrift` circuit event on `machine.state() == Green`; the `step_time_drift` signal is unchanged.
+- [ ] Run: `cargo test --workspace` and `overload_sim -- --include-ignored` — expect PASS (sweep unchanged, 42–49 s).
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus the `fault-injection` feature)
+- [ ] Run: `scripts/bench-lock.sh scripts/overload-soak.sh novanas` — expect exit 0 and `"pass": true`.
+- [ ] Commit: `fix(reliability): latency drift feeds the circuit only in GREEN`
+
 ## Task 13: Pressure route, readiness, admission errors and metrics in turbine-api
 
 Files: `crates/turbine-api/src/routes/diagnostics.rs` (pressure route 200, status fields), `crates/turbine-api/src/routes/health.rs` (`circuit_open` readiness), `crates/turbine-api/src/error.rs` (overload `ApiError` constructors, `Retry-After`), `crates/turbine-api/src/backend.rs` (`NotReadyReason::CircuitOpen`, `readiness_for_circuit`), `crates/turbine-api/Cargo.toml` (dev-deps `turbine-reliability`, `turbine-device`), `crates/turbine-api/tests/api.rs` (four tests)

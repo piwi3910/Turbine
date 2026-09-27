@@ -219,7 +219,12 @@ impl PressureController {
         };
         let signals = self.evaluator.evaluate(&inputs, now);
 
-        if let Some(ratio) = drift {
+        // The circuit owns device health, the pressure controller owns load: above GREEN a
+        // slower step is expected (bigger batches, longer contexts), so drift feeds only the
+        // `step_time_drift` pressure signal there, not the circuit.
+        if let Some(ratio) = drift
+            && self.machine.state() == PressureState::Green
+        {
             self.circuit_event(CircuitEvent::LatencyDrift { ratio }, now);
         }
         for s in &signals {
@@ -666,6 +671,47 @@ mod tests {
                 .all(|s| s.signal != PressureSignal::StepTimeDrift),
             "no drift signal while nothing runs"
         );
+    }
+
+    /// The fourth soak's end: with the queue empty but pressure still above GREEN, a full batch
+    /// of long contexts pushed drift past 2.0 and the circuit went DEGRADED for its 60 s window
+    /// (GREEN + HEALTHY at 61 s). Catches: load (the pressure controller's job) read by the
+    /// circuit as device degradation. The same spike in GREEN still degrades the circuit.
+    #[test]
+    fn drift_under_pressure_leaves_the_circuit() {
+        let stats = |p95: f64| EngineStats {
+            running_remaining_tokens: vec![100; 23],
+            block_tokens: 16,
+            free_kv_blocks: 1000,
+            step_time_p95_s: Some(p95),
+            ..EngineStats::default()
+        };
+        let run = |c: &mut PressureController, clock: &FakeClock, secs: u64, kv: f64, p95: f64| {
+            for _ in 0..secs * 10 {
+                clock.advance(Duration::from_millis(100));
+                c.on_circuit_event(CircuitEvent::Iteration);
+                c.tick(&sample(kv, 0.0), &stats(p95));
+            }
+        };
+        // Pressure ORANGE from KV, then a 2.5× drift spike: the circuit stays HEALTHY.
+        let (mut c, h, clock) = controller(true);
+        run(&mut c, &clock, 5, 0.1, 0.02);
+        run(&mut c, &clock, 2, 0.85, 0.02);
+        assert_eq!(h.state(), PressureState::Orange);
+        run(&mut c, &clock, 3, 0.85, 0.05);
+        assert_eq!(h.circuit(), CircuitState::Healthy, "drift under pressure");
+        // Even 5× (past `latency_drift_open`) under pressure does not open it.
+        run(&mut c, &clock, 3, 0.85, 0.1);
+        assert_eq!(h.circuit(), CircuitState::Healthy);
+
+        // The same 2.5× spike in GREEN degrades the circuit.
+        let (mut c, h, clock) = controller(true);
+        run(&mut c, &clock, 5, 0.1, 0.02);
+        assert_eq!(h.state(), PressureState::Green);
+        clock.advance(Duration::from_millis(100));
+        c.on_circuit_event(CircuitEvent::Iteration);
+        c.tick(&sample(0.1, 0.0), &stats(0.05));
+        assert_eq!(h.circuit(), CircuitState::Degraded, "drift in GREEN");
     }
 
     #[test]
