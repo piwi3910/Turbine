@@ -53,14 +53,18 @@ pub struct ModuleChoices {
     /// `None` on a backend without card profiles (`cpu`).
     pub card_profile: Option<String>,
     pub scheduling_policy: String,
+    /// `kv.policy` (Phase 4).
+    pub eviction_policy: String,
 }
 
 impl ModuleChoices {
     /// Logs `event="module_selected"` for every extension point whose registry does not log
     /// its own selection, once at startup. `scheduling_policy` is logged by
     /// `turbine_scheduler::policy::registry().select` when the engine starts, `execution_backend`
-    /// by `turbine_kernels::backends::registry().select`, and `card_profile` by
-    /// `turbine_kernels::cards::registry().select` when the backend has one.
+    /// by `turbine_kernels::backends::registry().select`, `card_profile` by
+    /// `turbine_kernels::cards::registry().select` when the backend has one, and
+    /// `eviction_policy` by `turbine_kv::policy::registry().select` when the KV hierarchy
+    /// starts.
     pub fn log(&self) {
         use turbine_core::registry::log_selected;
         log_selected("model_family", &self.family, "config.json architectures");

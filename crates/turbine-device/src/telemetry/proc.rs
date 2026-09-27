@@ -63,6 +63,8 @@ pub enum ParseError {
 /// `/proc/meminfo` fields the sampler uses, in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemInfo {
+    /// `MemTotal` (P4: `kv.cpu.max_bytes` is checked against it at startup).
+    pub mem_total_bytes: Option<u64>,
     pub mem_available_bytes: u64,
     /// Absent on kernels built without swap support.
     pub swap_total_bytes: Option<u64>,
@@ -107,6 +109,7 @@ pub fn parse_meminfo(s: &str) -> Result<MemInfo, ParseError> {
         }
     };
     Ok(MemInfo {
+        mem_total_bytes: field("MemTotal")?,
         mem_available_bytes: field("MemAvailable")?.ok_or(ParseError::Missing {
             file: "meminfo",
             field: "MemAvailable",
@@ -165,5 +168,41 @@ pub fn parse_psi(s: &str) -> Result<PsiMemory, ParseError> {
             field: "some",
         })?,
         full_avg10: avg10("full")?,
+    })
+}
+
+/// The "Available" column (1024-byte blocks) of `df -Pk` output, in bytes (P4: `kv.nvme.max_bytes`
+/// against free disk at startup).
+pub fn parse_df_available(output: &str) -> Option<u64> {
+    let line = output.lines().nth(1)?;
+    let kib: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
+/// Free bytes of the filesystem holding `path` (its nearest existing ancestor when `path` does
+/// not exist yet), from `df -Pk` (POSIX output: Linux and macOS alike, no new dependency).
+pub fn disk_free_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut probe: PathBuf = path.to_path_buf();
+    while !probe.exists() {
+        if !probe.pop() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no existing ancestor of {}", path.display()),
+            ));
+        }
+    }
+    let out = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(&probe)
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "df -Pk {}: {}",
+            probe.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    parse_df_available(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| {
+        std::io::Error::other(format!("df -Pk {}: unexpected output", probe.display()))
     })
 }

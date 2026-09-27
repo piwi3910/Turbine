@@ -171,6 +171,20 @@ impl SchedRequest {
             cached_prefix: None,
         }
     }
+
+    /// Hands the request its attached cached prefix (P4 S-3) and sets the admission estimate
+    /// to match (Phase 3's `Admission::estimate` computes the same once Phase 3 is present):
+    /// cached tokens are not prefilled and their full blocks are already held.
+    pub fn attach_prefix(&mut self, attach: PrefixAttach, block_tokens: u32) {
+        let cached = attach.cached_tokens;
+        let e = &mut self.estimate;
+        e.cached_prefix_tokens = cached;
+        e.new_prefill_tokens = self.prompt_len - cached.min(self.prompt_len);
+        e.projected_kv_blocks = e
+            .projected_kv_blocks
+            .saturating_sub(cached / block_tokens.max(1));
+        self.cached_prefix = Some(attach);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

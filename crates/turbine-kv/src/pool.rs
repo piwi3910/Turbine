@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 use turbine_core::types::{BlockId, DeviceId, KvLayout};
 use turbine_reliability::budget::PoolKind;
 use turbine_reliability::ledger::{Ledger, Reservation};
-use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, MemoryError};
+use turbine_tensor::{DeviceBuffer, DeviceMemory, DevicePtr, KvPoolView, MemoryError};
 
 use crate::table::BlockTable;
 
@@ -337,6 +337,20 @@ impl BlockPool {
         ))
     }
 
+    /// The device bytes of block `b`: one `(address, length)` segment per layer, the block's K
+    /// and V of that layer (the [`KvPoolView`] layout). A block copy moves exactly these.
+    pub fn block_segments(&self, b: BlockId) -> SmallVec<[(DevicePtr, usize); 32]> {
+        let view = self.view();
+        let per_layer = self.layout.block_bytes() / u64::from(self.layout.num_layers.max(1));
+        let base = self.storage.ptr();
+        (0..u64::from(self.layout.num_layers))
+            .map(|l| {
+                let off = l * view.layer_stride_bytes + u64::from(b.0) * per_layer;
+                (base.offset(off), per_layer as usize)
+            })
+            .collect()
+    }
+
     /// The device storage and layout for the executor.
     pub fn view(&self) -> KvPoolView<'_> {
         let num_blocks = self.total_blocks();
@@ -399,6 +413,29 @@ mod tests {
             mem,
         )
         .expect("pool fits the host memory")
+    }
+
+    /// One segment per layer, each the block's K and V bytes of that layer at the offset the
+    /// executor's `KvPoolView` reads (P4 Task 15: the copy stream moves exactly these bytes).
+    /// Breaks if a segment is missed, overlaps another block, or is sized wrongly.
+    #[test]
+    fn block_segments_cover_the_block_per_layer() {
+        let p = pool(4);
+        let view = p.view();
+        let base = view.storage.ptr().addr();
+        let per_layer = small_layout().block_bytes() as usize / 2;
+        for b in 0..4u32 {
+            let segs = p.block_segments(BlockId(b));
+            assert_eq!(segs.len(), 2, "one segment per layer");
+            for (l, (ptr, len)) in segs.iter().enumerate() {
+                assert_eq!(*len, per_layer);
+                let expect =
+                    base + l as u64 * view.layer_stride_bytes + u64::from(b) * per_layer as u64;
+                assert_eq!(ptr.addr(), expect, "block {b} layer {l}");
+            }
+            let total: usize = segs.iter().map(|(_, n)| n).sum();
+            assert_eq!(total as u64, small_layout().block_bytes());
+        }
     }
 
     #[derive(Clone, Debug)]

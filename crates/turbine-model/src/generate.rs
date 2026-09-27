@@ -400,6 +400,8 @@ mod tests {
             echo: false,
             constraint: None,
             deadline_ms: u64::MAX,
+            session: None,
+            cache_salt: None,
             endpoint: Endpoint::Completions,
             http_request_id: "test".into(),
             prompt_tokens: prompt.to_vec(),

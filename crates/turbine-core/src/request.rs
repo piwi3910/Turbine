@@ -205,6 +205,10 @@ pub struct GenerationRequest {
     pub constraint: Option<ConstraintSpec>,
     /// Monotonic deadline in milliseconds on the engine clock (`server.request_timeout`).
     pub deadline_ms: u64,
+    /// Phase 4: `prompt_cache_key` and the `x-turbine-session-*` hints (P4 §Session hints).
+    pub session: Option<SessionHints>,
+    /// Phase 4: `x-turbine-cache-salt`; only requests with the same salt share prefixes.
+    pub cache_salt: Option<String>,
 }
 
 /// What constrains a request's output (P2 S-17, S-18).

@@ -31,6 +31,18 @@
 //! same tokens either way; on a GPU the dropped extra rows change batch compositions, whose
 //! BF16 rounding may differ as with any other batch.
 //!
+//! Phase 4 threads the KV orchestrator through the turn (`crate::kv_orchestrator`): prefetch
+//! commands after step 1; before the plan, completed transfers admit the submissions whose
+//! prefixes were promoted, submissions waiting on a prefix another request computes attach
+//! again, and the reclaim order and the controller's pressure state reach the hierarchy;
+//! `after_plan` follows the plan; an iteration that ran successfully commits the full blocks
+//! it wrote (under overlap scheduling the blocks are held from the ahead completion until the
+//! iteration is collected, and committed only when it succeeded); finished and dropped requests
+//! are reported after `complete`; session TTLs run last. A new request attaches its cached
+//! prefix before the scheduler sees it: `Ready` enters the admission gate at once with the
+//! prefix; `Promoting` / `WaitForPrefix` hold the submission (and its admission answer) until
+//! the prefix is in L0 — at most the directory's pending wait plus the copies.
+//!
 //! Every turn is timed in the eight stages of [`Stage`] (P2c S-1) by marks around these steps;
 //! an executed iteration records them in `turbine_engine_iteration_seconds{stage}`, and every
 //! published scheduler document carries the last turn's `stages_ms`.
@@ -70,8 +82,9 @@ use turbine_core::request::{
     Endpoint, ErrorCode, FinishReason, GenerationEvent, GenerationRequest, SamplingParams,
     StopConditions,
 };
-use turbine_core::types::{CircuitState, PressureState, Priority, RequestId, SeqId};
-use turbine_kv::{BlockPool, KvDocument};
+use turbine_core::types::{BlockId, CircuitState, PressureState, Priority, RequestId, SeqId};
+use turbine_kv::BlockPool;
+use turbine_kv::hierarchy::{AttachOutcome, PrefixAttach};
 use turbine_model::executor::{
     BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice,
     TokenFeed,
@@ -92,6 +105,7 @@ use super::stages::{Stage, StageClock};
 use super::{
     EVENT_CHANNEL_CAPACITY, EngineCommand, EngineDocs, EngineMetrics, EngineShared, SubmitAck,
 };
+use crate::kv_orchestrator::KvOrchestrator;
 use crate::metrics::{Outcome, TokenKind};
 use crate::reliability::EngineReliability;
 
@@ -122,6 +136,8 @@ pub(crate) struct EngineParts {
     pub overlap: bool,
     /// The pressure controller's snapshot, recovery and circuit inputs (P3).
     pub reliability: EngineReliability,
+    /// The KV hierarchy over `pool` (Phase 4).
+    pub kv: KvOrchestrator,
 }
 
 enum Turn {
@@ -181,7 +197,27 @@ pub(crate) struct EngineLoop {
     late_finished: Vec<(SeqId, FinishReason)>,
     /// Iterations launched while the previous one was still in flight.
     overlapped: u64,
+    kv: KvOrchestrator,
+    /// Submissions waiting for their prefix (Phase 4): promotions in flight, or another request
+    /// computing it (`attach_again`). Their admission answer is sent once they enter the
+    /// scheduler.
+    held: HashMap<RequestId, HeldSubmission>,
+    /// Requests that ended this turn, reported to the KV hierarchy after `complete`
+    /// (`true`: cancelled or failed).
+    kv_done: Vec<(RequestId, bool)>,
 }
+
+/// A submission whose cached prefix is on its way to L0.
+struct HeldSubmission {
+    submission: Submission,
+    events: mpsc::Sender<GenerationEvent>,
+    ack: SubmitAck,
+    /// Another request computes the next prefix block: attach again next turn.
+    attach_again: bool,
+}
+
+/// The KV one plan item wrote, committed when the iteration succeeds: request, table, tokens.
+type KvCommit = (RequestId, SmallVec<[BlockId; 16]>, Vec<u32>);
 
 /// What `sample` needs of one launched row, fixed when its batch is built (under overlap
 /// scheduling the scheduler has moved on by the time the row is sampled).
@@ -231,6 +267,9 @@ struct InFlight {
     phase: ForwardPhase,
     /// Host time of the launch call.
     launch_time: Duration,
+    /// The full blocks the iteration writes (Phase 4), held (one pool reference each) from its
+    /// ahead completion until it is collected: committed on success, then released.
+    commits: Vec<KvCommit>,
 }
 
 impl EngineLoop {
@@ -290,6 +329,9 @@ impl EngineLoop {
             in_flight: None,
             late_finished: Vec::new(),
             overlapped: 0,
+            kv: p.kv,
+            held: HashMap::new(),
+            kv_done: Vec::new(),
         };
         engine.publish(false);
         engine.publish_stats();
@@ -345,6 +387,7 @@ impl EngineLoop {
         if !self.receive_commands() {
             return Ok(Turn::Stop);
         }
+        self.kv.serve_commands(&mut self.pool);
         self.stages.mark(Stage::Schedule);
         self.flush_outputs();
         self.stages.mark(Stage::Emit);
@@ -352,7 +395,9 @@ impl EngineLoop {
         self.expire_deadlines();
 
         let limits = self.read_snapshot()?;
+        self.kv_before_plan();
         let mut plan = self.sched.plan(&mut self.pool, &limits);
+        self.kv.after_plan(&mut self.pool);
         for &(id, reason) in &plan.dropped {
             self.on_dropped(id, reason);
         }
@@ -365,6 +410,7 @@ impl EngineLoop {
                     ..IterationOutcome::default()
                 },
             );
+            self.kv_end_turn();
             self.idle_turn = true;
             self.publish(false);
             self.publish_stats();
@@ -375,10 +421,19 @@ impl EngineLoop {
         let started = Instant::now();
         let outcome = self.execute(&mut plan);
         let failed = outcome.failed.is_some();
+        if !failed {
+            // Only KV the forward pass wrote successfully enters the cache; the tables are
+            // still held (before `complete` releases finished sequences). A recovery retry may
+            // have shrunk `plan`: what ran is what it holds now.
+            for (id, blocks, tokens) in self.kv_commits(&plan) {
+                self.kv.commit(&mut self.pool, id, &blocks, &tokens);
+            }
+        }
         self.sched.complete(&mut self.pool, outcome);
         if !failed {
             self.observe(&plan, started.elapsed().as_secs_f64());
         }
+        self.kv_end_turn();
         self.publish(true);
         self.publish_stats();
         self.check_fatal()?;
@@ -495,6 +550,8 @@ impl EngineLoop {
             echo: false,
             constraint: None,
             deadline_ms: u64::MAX,
+            session: None,
+            cache_salt: None,
             endpoint: Endpoint::Completions,
             http_request_id: "circuit-probe".into(),
             prompt_tokens: self.probe_prompt.clone(),
@@ -561,6 +618,8 @@ impl EngineLoop {
             g.admission_mut()
                 .observe_iteration(prefill, prefill_s, (decodes > 0).then_some(secs));
         }
+        // The planner's recompute cost follows the same prefill rate (P4 S-9).
+        self.kv.record_prefill(prefill, prefill_s);
     }
 
     /// The figures the pressure controller reads on its next tick.
@@ -568,7 +627,10 @@ impl EngineLoop {
         let p95 = self.decode_steps.p95();
         self.rel.publish(EngineStats {
             running_remaining_tokens: self.sched.remaining_tokens(),
-            free_kv_blocks: self.pool.free_blocks(),
+            // Phase 4: cached-but-unreferenced L0 blocks (finished prompts kept for prefix reuse)
+            // are handed out by the next allocation, so the exhaustion horizon counts them as
+            // free, as `kv_utilization` and `device_memory` do (no reservation covers them).
+            free_kv_blocks: self.pool.available_blocks(),
             block_tokens: self.pool.layout().block_tokens,
             decode_tokens_per_s: if self.decode_step_s > 0.0 {
                 1.0 / self.decode_step_s
@@ -590,7 +652,12 @@ impl EngineLoop {
         let probe_due = !self.shutting_down
             && self.probe.is_none()
             && self.rel.handle.circuit() == CircuitState::Probing;
-        self.sched.is_idle() && self.requests.is_empty() && self.in_flight.is_none() && !probe_due
+        self.sched.is_idle()
+            && self.requests.is_empty()
+            && self.in_flight.is_none()
+            && self.held.is_empty()
+            && self.kv.transfers_idle()
+            && !probe_due
     }
 
     /// Step 1. Returns false when the engine should stop. The turn's stage clock starts after
@@ -648,15 +715,66 @@ impl EngineLoop {
         for id in live {
             self.sched.cancel(id, CancelReason::Shutdown);
         }
+        // Held submissions were never admitted: they are refused like any new one.
+        for (id, h) in std::mem::take(&mut self.held) {
+            self.kv.request_done(&mut self.pool, id, true);
+            let _ = h.ack.send(Err(SubmitError::ShuttingDown));
+        }
         tracing::info!(event = "engine_shutdown", "engine shutting down");
     }
 
-    /// Scheduler submission checks, then the request is queued and its choices start.
+    /// A new request attaches its cached prefix (P4 S-3), then goes through the scheduler's
+    /// checks and admission ([`EngineLoop::admit_submission`]); one whose prefix is still on its
+    /// way to L0 is held, its admission answer pending, until it is there.
     fn submit(
         &mut self,
         submission: Submission,
         events: mpsc::Sender<GenerationEvent>,
         ack: SubmitAck,
+    ) {
+        let request = &submission.request;
+        let prompt_len = u32::try_from(request.prompt_tokens.len()).unwrap_or(u32::MAX);
+        let zero_tokens = request.stop.max_tokens == 0 && prompt_len <= self.max_seq_len;
+        if zero_tokens || self.shutting_down {
+            self.admit_submission(submission, events, ack, None);
+            return;
+        }
+        let id = request.id;
+        match self.attach(id, &submission.request) {
+            AttachOutcome::Ready(a) => self.admit_submission(submission, events, ack, Some(a)),
+            outcome => {
+                let held = HeldSubmission {
+                    submission,
+                    events,
+                    ack,
+                    attach_again: outcome == AttachOutcome::WaitForPrefix,
+                };
+                self.held.insert(id, held);
+            }
+        }
+    }
+
+    /// `KvHierarchy::attach_prefix` for `request` (P4 S-3).
+    fn attach(&mut self, id: RequestId, request: &GenerationRequest) -> AttachOutcome {
+        self.kv.attach(
+            &mut self.pool,
+            id,
+            &request.prompt_tokens,
+            request.cache_salt.as_deref().unwrap_or(""),
+            request.session.as_ref(),
+            request.priority,
+        )
+    }
+
+    /// Scheduler submission checks (with the attached prefix, whose blocks the admission
+    /// estimate and the KV reservation leave out), then the request is queued and its choices
+    /// start. A refused request gives its prefix back.
+    fn admit_submission(
+        &mut self,
+        submission: Submission,
+        events: mpsc::Sender<GenerationEvent>,
+        ack: SubmitAck,
+        attach: Option<PrefixAttach>,
     ) {
         let request = &submission.request;
         let id = request.id;
@@ -675,27 +793,36 @@ impl EngineLoop {
             let _ = ack.send(Err(SubmitError::ShuttingDown));
             return;
         }
+        let cached_tokens = attach.as_ref().map_or(0, |a| a.cached_tokens);
         if !zero_tokens {
-            let mut r = SchedRequest::new(
-                id,
-                seqs.clone(),
-                prompt_len,
-                request.stop.max_tokens,
-                self.pool.layout().block_tokens,
-            );
+            let bt = self.pool.layout().block_tokens;
+            let mut r =
+                SchedRequest::new(id, seqs.clone(), prompt_len, request.stop.max_tokens, bt);
             r.priority = request.priority;
             r.arrival = self.clock.now_mono();
             r.constrained = request.constraint.is_some();
+            let blocks = attach.as_ref().map(|a| a.blocks.clone());
+            if let Some(a) = attach {
+                r.attach_prefix(a, bt);
+            }
             if let Err(e) = self.sched.submit(r, self.pool.total_blocks()) {
+                if let Some(blocks) = blocks {
+                    self.pool.release(&blocks);
+                }
+                self.kv.request_done(&mut self.pool, id, true);
                 let _ = ack.send(Err(e));
                 return;
             }
+        } else if let Some(a) = attach {
+            self.pool.release(&a.blocks);
+            self.kv.request_done(&mut self.pool, id, true);
         }
         let submitter_gone = ack.send(Ok(())).is_err();
         self.metrics
             .server
             .add_tokens(TokenKind::Prompt, u64::from(prompt_len));
-        let active = ActiveRequest::new(submission, events, &seqs, &self.tokenizer);
+        let mut active = ActiveRequest::new(submission, events, &seqs, &self.tokenizer);
+        active.cached_tokens = cached_tokens;
         for (i, &seq) in seqs.iter().enumerate() {
             self.seqs.insert(seq, (id, i));
         }
@@ -726,6 +853,91 @@ impl EngineLoop {
         } else if submitter_gone {
             self.sched.cancel(id, CancelReason::ClientDisconnect);
         }
+    }
+
+    /// Before the plan (Phase 4): held submissions whose promotions landed are admitted, those
+    /// waiting on another request's prefix attach again, one whose client went away is dropped
+    /// (its KV released), then the reclaim order and the controller's pressure state.
+    fn kv_before_plan(&mut self) {
+        for (id, attach) in self.kv.poll(&mut self.pool) {
+            match self.held.remove(&id) {
+                Some(h) => self.admit_submission(h.submission, h.events, h.ack, Some(attach)),
+                None => {
+                    // Its submission is gone: the landed prefix goes back to the cache.
+                    self.pool.release(&attach.blocks);
+                    self.kv.request_done(&mut self.pool, id, true);
+                }
+            }
+        }
+        let gone: Vec<RequestId> = self
+            .held
+            .iter()
+            .filter(|(_, h)| h.events.is_closed() || h.ack.is_closed())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in gone {
+            self.held.remove(&id);
+            self.kv.request_done(&mut self.pool, id, true);
+        }
+        let again: Vec<RequestId> = self
+            .held
+            .iter()
+            .filter(|(_, h)| h.attach_again)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in again {
+            let Some(h) = self.held.remove(&id) else {
+                continue;
+            };
+            match self.attach(id, &h.submission.request) {
+                AttachOutcome::Ready(a) => {
+                    self.admit_submission(h.submission, h.events, h.ack, Some(a))
+                }
+                outcome => {
+                    let attach_again = outcome == AttachOutcome::WaitForPrefix;
+                    self.held.insert(id, HeldSubmission { attach_again, ..h });
+                }
+            }
+        }
+        self.kv.before_plan(&mut self.pool, self.snap.state);
+    }
+
+    /// The full blocks each item of `plan` completes, with their tokens (choice 0 of a request
+    /// holds its prompt blocks; forks share them). Every token whose KV the iteration writes is
+    /// on the host by the time its iteration is committed.
+    fn kv_commits(&self, plan: &IterationPlan) -> Vec<KvCommit> {
+        let bt = self.pool.layout().block_tokens.max(1);
+        let mut out = Vec::new();
+        for item in &plan.items {
+            let Some(&(id, 0)) = self.seqs.get(&item.seq) else {
+                continue;
+            };
+            let end = item.block_table.tokens;
+            let start = match item.kind {
+                BatchKind::Prefill { start, .. } => start,
+                BatchKind::Decode => end.saturating_sub(1),
+            };
+            if end / bt <= start / bt {
+                continue;
+            }
+            let Some(r) = self.requests.get(&id) else {
+                continue;
+            };
+            let tokens: Option<Vec<u32>> = (0..end).map(|p| r.token_at(0, p)).collect();
+            if let Some(tokens) = tokens {
+                out.push((id, item.block_table.blocks.clone(), tokens));
+            }
+        }
+        out
+    }
+
+    /// After `complete`: the requests that ended this turn, then pending reclaim requests and
+    /// session TTLs.
+    fn kv_end_turn(&mut self) {
+        for (id, cancelled) in std::mem::take(&mut self.kv_done) {
+            self.kv.request_done(&mut self.pool, id, cancelled);
+        }
+        self.kv.end_turn(&mut self.pool);
     }
 
     /// Step 2.
@@ -1323,18 +1535,32 @@ impl EngineLoop {
         if !self.receive_commands() {
             return Ok(Turn::Stop);
         }
+        self.kv.serve_commands(&mut self.pool);
         self.stages.mark(Stage::Schedule);
         self.flush_outputs();
         self.stages.mark(Stage::Emit);
         self.detect_disconnects();
         self.expire_deadlines();
-        if let Some(prev) = self.in_flight.take() {
+        if let Some(mut prev) = self.in_flight.take() {
+            // The KV the iteration writes is held until it is collected (Phase 4): the ahead
+            // completion may release a finished sequence's blocks before then. Its input tokens
+            // are all on the host now (the iteration before it was collected last turn).
+            if prev.launched {
+                prev.commits = self.kv_commits(&prev.plan);
+                for (_, blocks, _) in &prev.commits {
+                    for &b in blocks {
+                        self.pool.incref(b);
+                    }
+                }
+            }
             let outcome = self.ahead_outcome(&prev);
             self.sched.complete(&mut self.pool, outcome);
             self.in_flight = Some(prev);
         }
         let limits = self.read_snapshot()?;
+        self.kv_before_plan();
         let plan = self.sched.plan(&mut self.pool, &limits);
+        self.kv.after_plan(&mut self.pool);
         for &(id, reason) in &plan.dropped {
             self.on_dropped(id, reason);
         }
@@ -1354,6 +1580,7 @@ impl EngineLoop {
                     ..IterationOutcome::default()
                 },
             );
+            self.kv_end_turn();
             self.idle_turn = !executed;
             self.publish(executed);
             self.publish_stats();
@@ -1367,6 +1594,7 @@ impl EngineLoop {
             self.finish(p)?;
         }
         self.in_flight = next;
+        self.kv_end_turn();
         self.publish(true);
         self.publish_stats();
         self.check_fatal()?;
@@ -1434,6 +1662,7 @@ impl EngineLoop {
             launched: false,
             phase: ForwardPhase::Decode,
             launch_time: Duration::ZERO,
+            commits: Vec::new(),
         };
         next.phase = phase_of(&next.plan);
         if let Err(error) = self.fork_copies(&next.plan) {
@@ -1614,9 +1843,24 @@ impl EngineLoop {
 
     /// Waits for the launched iteration `p` (only it; the next keeps running) and does its host
     /// work: sampling, detokenisation, events. Finishes it learns go to the next completion.
-    fn finish(&mut self, p: InFlight) -> Result<(), String> {
+    fn finish(&mut self, mut p: InFlight) -> Result<(), String> {
+        let commits = std::mem::take(&mut p.commits);
+        let ok = self.collect_in_flight(p);
+        // The held KV enters the cache only when the iteration that wrote it succeeded; the
+        // hold is dropped either way.
+        for (id, blocks, tokens) in commits {
+            if ok {
+                self.kv.commit(&mut self.pool, id, &blocks, &tokens);
+            }
+            self.pool.release(&blocks);
+        }
+        Ok(())
+    }
+
+    /// [`EngineLoop::finish`]'s device wait and host work; true when the iteration succeeded.
+    fn collect_in_flight(&mut self, p: InFlight) -> bool {
         if !p.launched {
-            return Ok(());
+            return false;
         }
         let started = Instant::now();
         let collected = self.exec.collect();
@@ -1640,11 +1884,11 @@ impl EngineLoop {
                 self.sample(&p.rows, logits, &mut outcome);
                 self.late_finished.extend(outcome.finished);
                 self.observe(&p.plan, (p.launch_time + waited).as_secs_f64());
-                Ok(())
+                true
             }
             Err(error) => {
                 self.device_failure(&p.requests, p.plan.iteration, error);
-                Ok(())
+                false
             }
         }
     }
@@ -1876,6 +2120,7 @@ impl EngineLoop {
             self.rel.circuit_event(event);
             return;
         }
+        self.kv_done.push((id, outcome != Outcome::Ok));
         let generated = r.generated_tokens();
         let m = &self.metrics.server;
         m.add_tokens(TokenKind::Generated, generated);
@@ -1925,7 +2170,7 @@ impl EngineLoop {
     /// `executed` iteration (a non-empty plan) records its stages.
     fn publish(&mut self, executed: bool) {
         let mut scheduler = self.sched.snapshot();
-        let kv = KvDocument::from_pool(&self.pool);
+        let kv = self.kv.document(&self.pool);
         self.metrics.kv.record(&self.pool);
         self.stages.mark(Stage::Complete);
         let stages = std::mem::replace(&mut self.stages, StageClock::start()).finish();
@@ -2036,11 +2281,13 @@ mod tests {
 
     use tokio::sync::oneshot;
     use turbine_core::clock::SystemClock;
-    use turbine_core::config::{ByteSize, ReliabilityConfig};
+    use turbine_core::config::{ByteSize, KvConfig, ReliabilityConfig};
     use turbine_core::request::CancelFlag;
-    use turbine_core::types::{BlockId, DeviceId, KvLayout, MemoryKind, ModelShape};
+    use turbine_core::types::{DeviceId, KvLayout, MemoryKind, ModelIdentity, ModelShape};
     use turbine_kernels::test_support::plain_device_error;
     use turbine_kernels::{KernelError, KernelMetrics, KernelRegistry, cpu_reference_provider};
+    use turbine_kv::identity::KvFormat;
+    use turbine_kv::tier::L2NvmeTier;
     use turbine_kv::{BlockPoolConfig, KvMetrics};
     use turbine_model::executor::{self, ExecutorOptions, SequenceKv};
     use turbine_model::testing::TempDir;
@@ -2060,6 +2307,7 @@ mod tests {
     use turbine_tensor::{DeviceMemory, KvPoolView};
 
     use super::*;
+    use crate::kv_orchestrator::{CopyDevice, KvStart, kv_format};
     use crate::metrics::ServerMetrics;
     use crate::reliability::{DeviceReserve, ReliabilityInputs};
 
@@ -2130,6 +2378,8 @@ mod tests {
             echo: false,
             constraint: None,
             deadline_ms: u64::MAX,
+            session: None,
+            cache_salt: None,
             endpoint: Endpoint::Completions,
             http_request_id: "t".into(),
             prompt_tokens: prompt.to_vec(),
@@ -2162,12 +2412,33 @@ mod tests {
         engine_with(exec, tokenizer, params, false)
     }
 
-    /// [`engine`] with `execution.overlap_scheduling` = `overlap`.
+    /// [`engine`] with `execution.overlap_scheduling` = `overlap` and the default `kv` section
+    /// (L0 only: the cpu backend has no pinned memory and L2 is off).
     fn engine_with(
         exec: Box<dyn ModelExecutor>,
         tokenizer: Arc<Tokenizer>,
         params: SchedulerParams,
         overlap: bool,
+    ) -> TestEngine {
+        engine_with_kv(
+            exec,
+            tokenizer,
+            params,
+            overlap,
+            KvConfig::default(),
+            |_, _, _| None,
+        )
+    }
+
+    /// An engine over `exec` with a 64-block pool, the `kv` section `kv` (its block size set
+    /// to the executor's) and the L2 tier `l2` builds from the KV format and metrics.
+    fn engine_with_kv(
+        exec: Box<dyn ModelExecutor>,
+        tokenizer: Arc<Tokenizer>,
+        params: SchedulerParams,
+        overlap: bool,
+        mut kv: KvConfig,
+        l2: impl FnOnce(&KvConfig, &KvFormat, KvMetrics) -> Option<Arc<L2NvmeTier>>,
     ) -> TestEngine {
         let reg = MetricsRegistry::new();
         let metrics = EngineMetrics {
@@ -2202,6 +2473,32 @@ mod tests {
             emergency_vram_reserve: ByteSize(0),
             ..ReliabilityConfig::default()
         };
+        let mut pool = BlockPool::new(
+            BlockPoolConfig {
+                layout,
+                num_blocks: 64,
+            },
+            mem(),
+        )
+        .unwrap()
+        .with_ledger(Arc::clone(&ledger), DeviceId(0));
+        kv.block_tokens = layout.block_tokens;
+        let l2 = l2(&kv, &kv_format(layout), metrics.kv.clone());
+        let (kv, _handle) = KvOrchestrator::start(
+            KvStart {
+                cfg: &kv,
+                memory_kind: MemoryKind::Dedicated,
+                identity: ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                device: CopyDevice::Sync {
+                    mem: pool_mem(&pool),
+                },
+                l2,
+                clock: Arc::clone(&clock),
+                metrics: metrics.kv.clone(),
+            },
+            &mut pool,
+        )
+        .expect("the KV hierarchy starts");
         let parts = crate::reliability::build(ReliabilityInputs {
             config: &config,
             budget,
@@ -2213,16 +2510,8 @@ mod tests {
             workspace_bytes_per_token: 0,
             metrics: reliability_metrics,
             clock: Arc::clone(&clock),
+            reclaimer: kv.reclaimer(),
         });
-        let pool = BlockPool::new(
-            BlockPoolConfig {
-                layout,
-                num_blocks: 64,
-            },
-            mem(),
-        )
-        .unwrap()
-        .with_ledger(ledger, DeviceId(0));
         let scheduler = Scheduler::new(params, Arc::clone(&clock))
             .with_metrics(metrics.scheduler.clone())
             .with_gate(parts.gate);
@@ -2245,6 +2534,7 @@ mod tests {
             },
             overlap,
             reliability: parts.engine,
+            kv,
         });
         TestEngine {
             engine,
@@ -2253,6 +2543,168 @@ mod tests {
             reg,
             controller,
         }
+    }
+
+    /// L0 blocks requests hold (`referenced_blocks`): from Phase 4 finished requests leave their
+    /// full blocks cached, allocated but unreferenced.
+    fn held_blocks(docs: &EngineDocs) -> u64 {
+        docs.kv.tiers[0]
+            .state
+            .as_ref()
+            .expect("the hierarchy's document")
+            .referenced_blocks
+    }
+
+    /// The host memory the test pools live in.
+    fn pool_mem(pool: &BlockPool) -> Arc<dyn DeviceMemory> {
+        Arc::clone(pool.view().storage.memory())
+    }
+
+    /// Greedy tokens and `usage.cached_tokens` of one request run to completion.
+    fn run_one(tx: &mpsc::Sender<EngineCommand>, req: GenerationRequest) -> (Vec<u32>, u32) {
+        let (mut rx, admitted) = submit(tx, req);
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let mut tokens = Vec::new();
+        loop {
+            match rx.blocking_recv().expect("stream ended early") {
+                GenerationEvent::Token { token_id, .. } => tokens.push(token_id),
+                GenerationEvent::Finished { usage, .. } => {
+                    return (tokens, usage.expect("usage").cached_tokens);
+                }
+                GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// The value of the Prometheus series `series` (0 when absent).
+    fn metric(reg: &MetricsRegistry, series: &str) -> f64 {
+        reg.render()
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix(series)?.trim().parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Prefix sharing in the engine (P4 S-3, S-17 on the cpu backend), serial and overlapped:
+    /// a repeated prompt attaches its two full 16-token blocks instead of prefilling them,
+    /// reports 32 `cached_tokens` and yields exactly the cold run's greedy tokens; the same
+    /// prompt under a cache salt shares nothing. Breaks if reuse changes the output, is not
+    /// used, or crosses salts.
+    #[test]
+    fn prefix_reuse_reports_cached_tokens_and_matches_cold() {
+        for overlap in [false, true] {
+            let (_dir, spec, tokenizer) = tiny();
+            let exec = if overlap {
+                tiny_reducing_executor(&spec, 4)
+            } else {
+                tiny_executor(&spec, 4)
+            };
+            let t = engine_with(exec, Arc::clone(&tokenizer), params(4, 64), overlap);
+            let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
+            assert_eq!(prompt.len(), 40);
+            let TestEngine {
+                engine,
+                tx,
+                shared,
+                reg,
+                ..
+            } = t;
+            let handle = std::thread::spawn(move || engine.run());
+
+            let (cold, cached) = run_one(&tx, request(&prompt, 8));
+            assert_eq!(cached, 0, "nothing is cached before the first run");
+            let (warm, cached) = run_one(&tx, request(&prompt, 8));
+            assert_eq!(cached, 32, "two full blocks are reused (overlap {overlap})");
+            assert_eq!(
+                warm, cold,
+                "reused KV gives the cold run's tokens (overlap {overlap})"
+            );
+            let mut salted = request(&prompt, 8);
+            salted.cache_salt = Some("a".into());
+            let (tokens, cached) = run_one(&tx, salted);
+            assert_eq!(
+                cached, 0,
+                "a salted request shares nothing with unsalted ones"
+            );
+            assert_eq!(tokens, cold);
+
+            let kv = serde_json::to_value(shared.docs().unwrap().kv).unwrap();
+            assert_eq!(kv["hit_rate"]["prompt_tokens"], 120, "{kv}");
+            assert_eq!(kv["hit_rate"]["cached_tokens"], 32, "{kv}");
+            assert_eq!(kv["policy"], "cost_aware", "{kv}");
+            assert!(metric(&reg, "turbine_kv_prefix_cached_tokens_total") >= 32.0);
+            drop(tx);
+            handle.join().unwrap().unwrap();
+        }
+    }
+
+    /// L0 → L2 → L0 on the cpu backend (P4 S-8, S-11, S-17): after a demotion request every
+    /// cached block of a finished prompt leaves L0 for the NVMe tier; the prompt sent again
+    /// promotes them back before its prefill and yields the cold run's greedy tokens, with no
+    /// checksum eviction. Breaks if the round trip corrupts KV, the blocks never leave L0, or
+    /// the promotion is skipped.
+    #[test]
+    fn l2_round_trip_matches_cold() {
+        let (dir, spec, tokenizer) = tiny();
+        let mut kv = KvConfig::default();
+        kv.nvme.enabled = true;
+        kv.nvme.path = dir.path().join("kv");
+        kv.nvme.max_bytes = ByteSize(16 << 20);
+        kv.nvme.slab_bytes = ByteSize(1 << 20);
+        let t = engine_with_kv(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+            false,
+            kv,
+            |cfg, format, metrics| {
+                crate::kv_orchestrator::open_l2(
+                    cfg,
+                    format,
+                    &ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                    Arc::new(SystemClock::new()),
+                    metrics,
+                )
+                .expect("L2 opens in the temp directory")
+            },
+        );
+        let reclaim = t.engine.kv.reclaimer();
+        let TestEngine {
+            engine, tx, reg, ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+
+        let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
+        let (cold, _) = run_one(&tx, request(&prompt, 8));
+        // Everything unreferenced leaves L0 at the end of the next turn.
+        reclaim.demote(0.0);
+        let _ = run_one(&tx, request(&[256, 1, 2], 2));
+        let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
+        let started = Instant::now();
+        while metric(&reg, demoted) < 2.0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the prompt's blocks never reached L2"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (warm, cached) = run_one(&tx, request(&prompt, 8));
+        assert_eq!(cached, 32, "both blocks came back from L2");
+        assert_eq!(
+            warm, cold,
+            "KV that went through L2 gives the cold run's tokens"
+        );
+        assert!(metric(&reg, r#"turbine_kv_promotions_total{from="l2",to="l0"}"#) >= 2.0);
+        assert_eq!(
+            metric(
+                &reg,
+                r#"turbine_kv_evictions_total{tier="l2",reason="checksum"}"#
+            ),
+            0.0
+        );
+        drop(tx);
+        handle.join().unwrap().unwrap();
     }
 
     /// Queues `req` with an output channel of `capacity` events.
@@ -2421,7 +2873,7 @@ mod tests {
         let (result, overlapped) = handle.join().unwrap();
         assert_eq!(result, Ok(()));
         let docs = t.shared.docs().unwrap();
-        assert_eq!(docs.kv.tiers[0].blocks_used, 0, "overlap {overlap}");
+        assert_eq!(held_blocks(&docs), 0, "overlap {overlap}");
         assert_eq!(docs.scheduler.waiting, 0);
         (out, overlapped)
     }
@@ -2568,13 +3020,18 @@ mod tests {
         assert_eq!(got, reference);
 
         let docs = t.shared.docs().unwrap();
-        assert_eq!(docs.kv.tiers[0].blocks_used, 0);
+        assert_eq!(held_blocks(&docs), 0);
         assert_eq!(docs.scheduler.waiting, 0);
         assert!(docs.scheduler.iterations_total >= u64::from(max_tokens));
         let text = t.reg.render().unwrap();
+        // The used gauge counts the blocks left cached for prefix reuse, as the document does.
+        let used = format!(
+            r#"turbine_kv_blocks{{tier="l0",state="used"}} {}"#,
+            docs.kv.tiers[0].blocks_used
+        );
         for line in [
             r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 3"#,
-            r#"turbine_kv_blocks{tier="l0",state="used"} 0"#,
+            used.as_str(),
             r#"turbine_tokens_total{kind="generated"} 36"#,
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");
@@ -2642,7 +3099,7 @@ mod tests {
             assert_eq!(got, &reference, "choice {choice}");
         }
         let docs = t.shared.docs().unwrap();
-        assert_eq!(docs.kv.tiers[0].blocks_used, 0);
+        assert_eq!(held_blocks(&docs), 0);
         let text = t.reg.render().unwrap();
         for line in [
             r#"turbine_tokens_total{kind="prompt"} 20"#,
@@ -2807,7 +3264,7 @@ mod tests {
         assert_eq!(error_code(&outcomes[2]), Some(ErrorCode::CircuitOpen));
         assert_eq!(error_code(&outcomes[3]), Some(ErrorCode::CircuitOpen));
         assert!(done.controller.circuit().blocks_readiness());
-        assert_eq!(done.shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
+        assert_eq!(held_blocks(&done.shared.docs().unwrap()), 0);
         let text = done.reg.render().unwrap();
         for line in [
             r#"turbine_requests_total{endpoint="/v1/completions",outcome="failed"} 1"#,
@@ -2833,7 +3290,7 @@ mod tests {
             assert_eq!(error_code(events), Some(ErrorCode::CircuitOpen));
         }
         assert!(done.controller.circuit().blocks_readiness());
-        assert_eq!(done.shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
+        assert_eq!(held_blocks(&done.shared.docs().unwrap()), 0);
     }
 
     /// P3 S-11 under overlap scheduling: a launch that fails with device out-of-memory
@@ -2863,7 +3320,7 @@ mod tests {
         assert_eq!(error_code(&outcomes[0]), None, "{:?}", outcomes[0]);
         assert_eq!(generated(&outcomes[0]), want[0][0].tokens);
         assert_eq!(done.controller.state(), PressureState::Survival);
-        assert_eq!(done.shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
+        assert_eq!(held_blocks(&done.shared.docs().unwrap()), 0);
         let text = done.reg.render().unwrap();
         for line in [
             r#"turbine_recoveries_total{outcome="recovered"} 1"#,
@@ -2962,7 +3419,7 @@ mod tests {
         assert!(t.controller.circuit().blocks_readiness());
         drop(t.tx);
         assert_eq!(handle.join().unwrap(), Ok(()));
-        assert_eq!(t.shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
+        assert_eq!(held_blocks(&t.shared.docs().unwrap()), 0);
         let text = t.reg.render().unwrap();
         for line in [
             r#"turbine_requests_total{endpoint="/v1/completions",outcome="failed"} 1"#,
@@ -3020,7 +3477,7 @@ mod tests {
             assert!(Instant::now() < deadline, "the slow request never paused");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(shared.docs().unwrap().kv.tiers[0].blocks_used > 0);
+        assert!(held_blocks(&shared.docs().unwrap()) > 0);
         let text = reg.render().unwrap();
         assert!(text.contains("turbine_stream_paused_total 1"), "{text}");
 
@@ -3036,7 +3493,7 @@ mod tests {
         ));
         drop(t.tx);
         assert_eq!(handle.join().unwrap(), Ok(()));
-        assert_eq!(shared.docs().unwrap().kv.tiers[0].blocks_used, 0);
+        assert_eq!(held_blocks(&shared.docs().unwrap()), 0);
         let text = reg.render().unwrap();
         for line in [
             r#"turbine_requests_cancelled_total{reason="client_disconnect"} 1"#,

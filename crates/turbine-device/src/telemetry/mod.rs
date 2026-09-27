@@ -26,7 +26,8 @@ use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use turbine_core::clock::Clock;
 use turbine_core::config::ReliabilityTelemetryConfig;
 use turbine_core::telemetry::{
-    DeviceSample, HostSample, LedgerProbe, LedgerSample, SourceStatus, TelemetrySample,
+    DeviceSample, HostSample, LedgerProbe, LedgerSample, SourceStatus, StorageProbe,
+    TelemetrySample,
 };
 use turbine_core::types::{MemoryKind, Vendor};
 use turbine_observability::MetricsRegistry;
@@ -357,6 +358,8 @@ pub struct SamplerCore {
     clock: Arc<dyn Clock>,
     proc: Box<dyn ProcSource>,
     ledger: Arc<dyn LedgerProbe>,
+    /// P4: the L2 tier's readings (`TelemetrySample.storage`), when the engine has one.
+    storage: Option<Arc<dyn StorageProbe>>,
     workers: Vec<VendorWorker>,
     devices: Vec<DeviceSlot>,
     host_warned: bool,
@@ -410,6 +413,7 @@ impl SamplerCore {
             clock,
             proc,
             ledger,
+            storage: None,
             workers,
             devices,
             host_warned: false,
@@ -425,6 +429,12 @@ impl SamplerCore {
 
     pub fn with_metrics(mut self, metrics: TelemetryMetrics) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// P4: every fast tick reads the L2 tier's queue depth and latency from `probe`.
+    pub fn with_storage(mut self, probe: Arc<dyn StorageProbe>) -> Self {
+        self.storage = Some(probe);
         self
     }
 
@@ -479,7 +489,7 @@ impl SamplerCore {
                 kv_utilization: self.ledger.kv_utilization(),
                 queue_fill: self.ledger.queue_fill(),
             },
-            storage: None,
+            storage: self.storage.as_ref().and_then(|p| p.storage()),
         };
         if let Some(m) = &self.metrics {
             if let Some(avail) = sample.host.mem_available_bytes {
@@ -819,6 +829,7 @@ mod tests {
         assert_eq!(
             parse_meminfo(MEMINFO),
             Ok(MemInfo {
+                mem_total_bytes: Some(127_535_336 * 1024),
                 mem_available_bytes: 44_950_556 * 1024,
                 swap_total_bytes: Some(16_777_212 * 1024),
                 swap_free_bytes: Some(16_777_212 * 1024),
@@ -836,6 +847,18 @@ mod tests {
             parse_meminfo("MemAvailable: lots kB\n"),
             Err(ParseError::Malformed { .. })
         ));
+        // P4: the free space of the filesystem holding a path (df -Pk "Available"), also for a
+        // path that does not exist yet (its nearest existing ancestor).
+        let df = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n\
+                  /dev/nvme0n1p2  959786032 340231452 570737868      38% /\n";
+        assert_eq!(proc::parse_df_available(df), Some(570_737_868 * 1024));
+        assert_eq!(proc::parse_df_available("Filesystem\n"), None);
+        let tmp = std::env::temp_dir();
+        assert!(proc::disk_free_bytes(&tmp).expect("df on the temp directory") > 0);
+        assert!(
+            proc::disk_free_bytes(&tmp.join("turbine-no-such-dir/kv")).expect("nearest ancestor")
+                > 0
+        );
         let a = parse_vmstat(VMSTAT_A).unwrap();
         let b = parse_vmstat(VMSTAT_B).unwrap();
         assert_eq!(

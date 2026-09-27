@@ -13,6 +13,15 @@ pub struct ModelIdentity {
 }
 
 impl ModelIdentity {
+    /// The identity of a checkpoint from the bytes of its `config.json` and of its safetensors
+    /// index (`model.safetensors.index.json`, or a single file's header).
+    pub fn from_bytes(config_json: &[u8], weights_index: &[u8]) -> ModelIdentity {
+        ModelIdentity {
+            config_hash: *blake3::hash(config_json).as_bytes(),
+            weights_index_hash: *blake3::hash(weights_index).as_bytes(),
+        }
+    }
+
     /// BLAKE3(config_hash ‖ weights_index_hash).
     pub fn fingerprint(&self) -> ModelFingerprint {
         let mut h = blake3::Hasher::new();
@@ -83,6 +92,10 @@ mod tests {
         let mut concat = [1u8; 64];
         concat[32..].fill(7);
         assert_eq!(a.fingerprint().0, *blake3::hash(&concat).as_bytes());
+        let from = ModelIdentity::from_bytes(b"{}", b"index");
+        assert_eq!(from.config_hash, *blake3::hash(b"{}").as_bytes());
+        assert_eq!(from.weights_index_hash, *blake3::hash(b"index").as_bytes());
+        assert_ne!(from, ModelIdentity::from_bytes(b"{} ", b"index"));
         assert_eq!(
             [KvDtype::Bf16, KvDtype::Fp8E4m3PerBlockScale].map(|d| (d.as_str(), d.wire_code())),
             [("bf16", 0), ("fp8_e4m3_per_block_scale", 3)]

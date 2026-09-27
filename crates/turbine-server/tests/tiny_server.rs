@@ -271,17 +271,20 @@ impl TinyServer {
         resp.json()
     }
 
-    /// The `l0` tier object of `/turbine/v1/kv`.
+    /// The `l0` tier object of `/turbine/v1/kv` (Phase 4 lists `l0`, `l1`, `l2`).
     fn kv_tier(&self) -> Value {
         let resp = self.get("/turbine/v1/kv");
         assert_eq!(resp.status, 200, "{}", resp.body);
         let doc = resp.json();
-        assert_eq!(doc["tiers"].as_array().map(Vec::len), Some(1), "{doc}");
+        assert_eq!(doc["tiers"][0]["tier"], "l0", "{doc}");
         doc["tiers"][0].clone()
     }
 
+    /// L0 blocks requests hold. From Phase 4 a finished request's full prompt blocks stay
+    /// cached (allocated but unreferenced) for prefix reuse, so "the KV was released" means no
+    /// block is referenced any more.
     fn blocks_used(&self) -> u64 {
-        self.kv_tier()["blocks_used"].as_u64().unwrap()
+        self.kv_tier()["referenced_blocks"].as_u64().unwrap()
     }
 
     /// A streaming completion that holds its KV (see the module comment).
@@ -709,7 +712,8 @@ fn status_reports_modules_and_kernels() {
     assert_eq!(
         status["modules"],
         json!({"family": "llama", "tool_format": "llama3_json", "weight_format": "bf16",
-               "backend": "cpu", "card_profile": null, "scheduling_policy": "default"}),
+               "backend": "cpu", "card_profile": null, "scheduling_policy": "default",
+               "eviction_policy": "cost_aware"}),
         "{status}"
     );
 
@@ -1027,7 +1031,7 @@ fn disconnect_releases_kv() {
         server.blocks_used() == 0
     });
     let tier = server.kv_tier();
-    assert_eq!(tier["blocks_free"], POOL_BLOCKS, "{tier}");
+    assert_eq!(tier["referenced_blocks"], 0, "{tier}");
 }
 
 /// P2 S-11: `/turbine/v1/scheduler` and `/turbine/v1/kv` have the Data shapes with counts that
@@ -1622,6 +1626,8 @@ fn reference_tokens(prompt: &[u32], sampling: SamplingParams, max_tokens: u32) -
         echo: false,
         constraint: None,
         deadline_ms: u64::MAX,
+        session: None,
+        cache_salt: None,
     };
     let cancel = turbine_core::request::CancelFlag::default();
     generate(
@@ -2346,8 +2352,6 @@ fn phase2_metrics_and_reasons() {
         (r#"turbine_requests_active{state="decoding"}"#, 0.0),
         (r#"turbine_requests_active{state="paused"}"#, 0.0),
         ("turbine_requests_queued", 0.0),
-        (r#"turbine_kv_blocks{tier="l0",state="used"}"#, 0.0),
-        (r#"turbine_kv_blocks{tier="l0",state="free"}"#, 20.0),
         (
             r#"turbine_grammar_compile_seconds_count{kind="json_schema"}"#,
             2.0,
@@ -2364,6 +2368,11 @@ fn phase2_metrics_and_reasons() {
     for (series, value) in exact {
         assert_eq!(sample(&metrics, series), Some(value), "{series}\n{metrics}");
     }
+    // No block is referenced any more; the used ones are cached for prefix reuse (Phase 4).
+    let used = sample(&metrics, r#"turbine_kv_blocks{tier="l0",state="used"}"#).unwrap();
+    let free = sample(&metrics, r#"turbine_kv_blocks{tier="l0",state="free"}"#).unwrap();
+    assert_eq!(used + free, 20.0, "{metrics}");
+    assert_eq!(server.kv_tier()["blocks_used"].as_f64(), Some(used));
     let positive = [
         r#"turbine_admission_decisions_total{decision="queue",reason="kv_reservation"}"#,
         "turbine_iteration_seconds_count",

@@ -771,16 +771,8 @@ impl KvSimDriver {
         let bt = self.sched.params().block_tokens;
         let prompt = r.prompt.len() as u32;
         let mut sr = SchedRequest::new(id, smallvec::smallvec![r.seq], prompt, r.max_tokens, bt);
-        sr.estimate = estimate_with_prefix(prompt, attach.cached_tokens, r.max_tokens, bt);
-        debug_assert_eq!(
-            sr.estimate.projected_kv_blocks,
-            ResourceEstimate::for_request(prompt, r.max_tokens, bt)
-                .projected_kv_blocks
-                .saturating_sub(attach.blocks.len() as u32),
-            "the estimate subtracts the attached blocks, like the reservation"
-        );
         sr.arrival = self.clock.now_mono();
-        sr.cached_prefix = Some(attach);
+        sr.attach_prefix(attach, bt);
         self.estimates.insert(id, sr.estimate);
         let blocks = sr.cached_prefix.as_ref().map(|a| a.blocks.clone());
         if let Err(e) = self.sched.submit(sr, self.pool.total_blocks()) {
@@ -879,24 +871,6 @@ impl KvSimDriver {
         self.reqs.remove(&id);
         self.attaching.retain(|x| *x != id);
     }
-}
-
-/// The admission estimate of a request with a cached prefix, as Phase 3's
-/// `Admission::estimate` computes it (the driver has no admission gate to call it on): cached
-/// tokens are not prefilled and their full blocks are already held.
-fn estimate_with_prefix(
-    prompt: u32,
-    cached: u32,
-    max_tokens: u32,
-    block_tokens: u32,
-) -> ResourceEstimate {
-    let mut e = ResourceEstimate::for_request(prompt, max_tokens, block_tokens);
-    e.cached_prefix_tokens = cached;
-    e.new_prefill_tokens = prompt - cached.min(prompt);
-    e.projected_kv_blocks = e
-        .projected_kv_blocks
-        .saturating_sub(cached / block_tokens.max(1));
-    e
 }
 
 #[cfg(test)]

@@ -544,3 +544,24 @@ The Phase 4 spec and contract (CONFLICT C-6) planned a major bump, ABI v3, makin
 - B) The planned v3: every function required, a v2 library refused
 
 **Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** No breaking change for existing libraries (`libturbine_hip_v23.so` still loads and serves), the names and signatures are the v3 ones so a later major bump only makes them required. Contract §9.1, spec S-5/S-6 and plan Task 13 amended; the CUDA shim's copy (pinned.cu) stays out while NVIDIA is on hold.
+
+## Phase 4: prefix attach before the admission gate, and the KV reservation of shared blocks
+
+Phase 3 puts an admission gate with worst-case KV reservations in front of the scheduler; the Phase 4 plan attaches a request's cached prefix at admission. Where the attach happens decides what the reservation covers and when the client hears the admission decision.
+
+- A) Attach before the gate: the reservation excludes the attached (already resident, shared) blocks, the attached blocks are released on every path that drops an unadmitted request (gate cancel, timeout, circuit rejection, SURVIVAL requeue — which also clears the prefix), and a request whose prefix is still being promoted or computed by another request is held on the engine thread with its admission answer pending (at most the directory's 2 s pending wait plus the copies), so the P3 rule "the decision arrives before any event" holds (recommended)
+- B) Attach after the gate admits: the reservation covers the whole prompt (sharers each reserve the shared prefix), no hold, but admission under-uses the pool when many requests share a prefix
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Known limit: blocks attached by requests still waiting in the gate's queue are referenced without a reservation of their own (they are shared prefixes, bounded by the distinct prefixes queued); the `kv_utilization` signal counts reservations, not these. Under overlap scheduling the blocks an in-flight iteration writes are held from its ahead completion until it is collected and committed only on success. Plan Tasks 11 and 15 amended.
+
+## Phase 4: L0 capacity demotion
+
+Phase 3's pressure controller measures `kv_utilization` over worst-case reservations, so a pool full of cached (finished, unreferenced) prefix blocks stays GREEN and the controller never asks for demotion; allocations then reclaim cached blocks by dropping them, and L1/L2 stay empty (seen on novanas: 400 filler requests, 0 demotions).
+
+- A) The orchestrator keeps headroom by capacity: while referenced plus cached blocks exceed 0.70 of the pool (the `kv_utilization` YELLOW threshold) and some are cached, it demotes the lowest-valued cached blocks down to 0.70 (reason `capacity`), before each plan; the controller's reclaim stays as is (recommended)
+- B) Count cached blocks in `kv_utilization` (the controller would throttle admissions for reusable cache)
+- C) Demote synchronously inside allocation (blocks the engine on copies)
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** `turbine_server::kv_orchestrator::CAPACITY_DEMOTE_AT`; spec S-8's "an allocation needing blocks" path.
+
+Free accounting with Phase 3's `device_memory` fix ("device_memory counts idle pre-allocated KV and reserve as free"): cached-but-unreferenced L0 blocks are not covered by any reservation, so they fall in the `kv` pool's available bytes that the controller subtracts from used device memory — they count as free, like `kv_utilization` counts them and like the next allocation treats them (it reclaims them). The engine's `free_kv_blocks` for the exhaustion horizon is `BlockPool::available_blocks()` (free plus cached unreferenced) for the same reason. Known skew: prefix blocks attached by running requests are referenced but not reserved (decision "Phase 4: prefix attach before the admission gate"), so they too read as free to `device_memory`; bounded by the distinct shared prefixes in use.
