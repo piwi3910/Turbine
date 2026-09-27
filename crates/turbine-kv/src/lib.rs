@@ -3,6 +3,7 @@
 
 pub mod directory;
 pub mod document;
+pub mod hierarchy;
 pub mod identity;
 pub mod metrics;
 pub mod planner;

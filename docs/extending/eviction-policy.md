@@ -1,6 +1,6 @@
 # Adding an eviction policy
 
-An eviction policy values one cached copy of a KV block in one tier; the KV hierarchy demotes or drops the lowest-valued copies first when a tier needs room (Phase 4, TS §8). Everything else stays in the mechanism (the KV hierarchy and `KvDirectory` in `crates/turbine-kv/src/directory.rs`): which blocks may leave at all (never a referenced block, leaf-first: never a parent while a child is cached in the same or a faster tier), where a victim goes (L0 → L1 → L2, or dropped below `kv.demote_min_value`), the copy-then-free order and every bound. Point name `eviction_policy`; selected by `kv.policy` (default `cost_aware`).
+An eviction policy values one cached copy of a KV block in one tier; the KV hierarchy demotes or drops the lowest-valued copies first when a tier needs room (Phase 4, TS §8). Everything else stays in the mechanism (`KvHierarchy` in `crates/turbine-kv/src/hierarchy.rs` and `KvDirectory` in `crates/turbine-kv/src/directory.rs`): which blocks may leave at all (never a referenced block, leaf-first: never a parent while a child is cached in the same or a faster tier), where a victim goes (L0 → L1 → L2, or dropped below `kv.demote_min_value`), the copy-then-free order and every bound. Point name `eviction_policy`; selected by `kv.policy` (default `cost_aware`).
 
 ## The trait
 
@@ -55,9 +55,10 @@ Then add the name to the pinned list in `registry_conformance::eviction_policies
 
 ## Conformance suite
 
-`eviction_policies_suite` (`crates/turbine-kv/src/policy/conformance.rs`) runs every registered policy over 2,000 seeded random inputs with both weight extremes: `finite_non_negative` (every score finite and ≥ 0), `deterministic` (bit-identical scores on a second call and in reverse order) and `orders_every_candidate` (`order_victims` returns each candidate once, lowest first).
+`eviction_policies_suite` (`crates/turbine-kv/src/policy/conformance.rs`) runs every registered policy over 2,000 seeded random inputs with both weight extremes: `finite_non_negative` (every score finite and ≥ 0), `deterministic` (bit-identical scores on a second call and in reverse order) and `orders_every_candidate` (`order_victims` returns each candidate once, lowest first). `round_trip_under_every_policy` (in `crates/turbine-kv/src/hierarchy.rs`) also drives a demote/promote round trip through the real hierarchy with every registered policy.
 
 - `scripts/remote-cargo.sh test -p turbine-kv registry_conformance` — the suite over the registry.
+- `scripts/remote-cargo.sh test -p turbine-kv hierarchy::tests::round_trip_under_every_policy` — demotion and promotion under every policy.
 
 Compare a new policy offline before anything else: `cargo run -p turbine-bench --bin turbine-bench -- kv-sim --workload mixed --policy <name> --l0-blocks 256 --l1-blocks 1024 --seed 1 --output json` against `--policy cost_aware` (lower `simulated_prefill_seconds` is better).
 

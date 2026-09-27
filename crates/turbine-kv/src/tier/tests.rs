@@ -508,3 +508,67 @@ fn l1_passes_the_contract_suite() {
     let l1 = L1PinnedTier::new(l1_cfg(2, MemoryKind::Dedicated), alloc, clock());
     suite(&l1, 4);
 }
+
+/// A tier whose reads keep failing degrades, and every attach that needed it ends ready with
+/// reason `tier_degraded` (recompute), never failed or lost.
+#[test]
+fn faulty_tier_degrades_to_recompute() {
+    use crate::hierarchy::AttachOutcome;
+    use crate::hierarchy::tests::{Rig, attach, prefill_and_finish, rig};
+    use crate::planner::PlanReason;
+    use turbine_core::types::RequestId;
+
+    let fake = FakeClock::new(Duration::ZERO);
+    let arc: Arc<dyn Clock> = Arc::new(fake.clone());
+    let bb = crate::directory::tests::fmt16().layout.block_bytes();
+    let mem = Arc::new(MemTier::new(TierId::L1, 64 * bb, arc));
+    let mut r = rig(64, Some(mem.clone()), None, fake);
+    let tick = |r: &mut Rig| {
+        let mut ready = Vec::new();
+        for _ in 0..3 {
+            ready.extend(r.h.poll(&mut r.pool, &mut r.backend));
+            r.clock.advance(Duration::from_millis(5));
+        }
+        ready
+    };
+    let prompt = |p: u32| -> Vec<u32> { (p * 1000..p * 1000 + 33).collect() };
+    // Four prompts of 2 full blocks + 1 token, prefilled, committed, then demoted to L1.
+    for p in 0..4 {
+        let id = RequestId::new_v4();
+        let AttachOutcome::Ready(a) = attach(&mut r, id, &prompt(p)) else {
+            panic!("a cold prompt attaches at once");
+        };
+        prefill_and_finish(&mut r, id, &prompt(p), &a);
+    }
+    r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+    tick(&mut r);
+    assert_eq!(mem.len(), 8);
+    assert_eq!(r.pool.used_blocks(), 0);
+
+    // Three read errors within 60 s: promotions fail, the tier degrades, requests recompute.
+    mem.inject_read_errors(3);
+    let mut reasons = Vec::new();
+    for p in 0..4 {
+        let id = RequestId::new_v4();
+        let a = match attach(&mut r, id, &prompt(p)) {
+            AttachOutcome::Ready(a) => a,
+            AttachOutcome::Promoting => {
+                let (_, a) = tick(&mut r)
+                    .into_iter()
+                    .find(|(rid, _)| *rid == id)
+                    .expect("a request is never failed or lost");
+                a
+            }
+            AttachOutcome::WaitForPrefix => panic!("no concurrent prefix"),
+        };
+        reasons.push(a.plan.reason);
+        r.pool.release(&a.blocks);
+        r.h.request_done(&mut r.pool, id, false);
+    }
+    assert!(mem.degraded(), "3 errors in 60 s mark the tier degraded");
+    assert!(
+        reasons.iter().all(|r| *r == PlanReason::TierDegraded),
+        "{reasons:?}"
+    );
+    assert_eq!(r.pool.referenced_blocks(), 0, "no reference leaked");
+}
