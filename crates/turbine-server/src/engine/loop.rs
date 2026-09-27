@@ -2677,6 +2677,9 @@ mod tests {
 
         let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
         let (cold, _) = run_one(&tx, request(&prompt, 8));
+        // A second run hits the cached blocks: the reuse evidence demotion needs.
+        let (again, cached) = run_one(&tx, request(&prompt, 8));
+        assert_eq!((again.as_slice(), cached), (cold.as_slice(), 32));
         // Everything unreferenced leaves L0 at the end of the next turn.
         reclaim.demote(0.0);
         let _ = run_one(&tx, request(&[256, 1, 2], 2));

@@ -532,11 +532,12 @@ fn faulty_tier_degrades_to_recompute() {
         ready
     };
     let prompt = |p: u32| -> Vec<u32> { (p * 1000..p * 1000 + 33).collect() };
-    // Four prompts of 2 full blocks + 1 token, prefilled, committed, then demoted to L1.
-    for p in 0..4 {
+    // Four prompts of 2 full blocks + 1 token, each sent twice (the hit is the reuse evidence
+    // demotion needs), then demoted to L1.
+    for p in (0..4).chain(0..4) {
         let id = RequestId::new_v4();
         let AttachOutcome::Ready(a) = attach(&mut r, id, &prompt(p)) else {
-            panic!("a cold prompt attaches at once");
+            panic!("an L0-resident or cold prompt attaches at once");
         };
         prefill_and_finish(&mut r, id, &prompt(p), &a);
     }

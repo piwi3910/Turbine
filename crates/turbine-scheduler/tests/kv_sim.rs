@@ -199,7 +199,20 @@ fn prefix_reuse_refcounts() {
     assert_eq!(d.violations(), &[] as &[String]);
 }
 
-/// Five distinct 96-token prompts (6 full blocks each) run to completion: 30 cached blocks.
+/// Each prompt sent again with one more token: its full blocks are attached, a hit — the
+/// reuse evidence demotion needs (one-off blocks are never copied down).
+fn reuse(d: &mut KvSimDriver, prompts: &[Vec<u32>], first_id: u128) {
+    for (i, p) in prompts.iter().enumerate() {
+        let mut again = p.clone();
+        again.push(7);
+        // One at a time: the pool is nearly full of the cached blocks being re-used.
+        d.submit(rid(first_id + i as u128), again, 1);
+        drain(d);
+    }
+}
+
+/// Five distinct 96-token prompts (6 full blocks each) run to completion, each re-used once:
+/// 30 cached blocks with reuse evidence.
 fn fill_l0(d: &mut KvSimDriver) -> Vec<Vec<u32>> {
     let prompts: Vec<Vec<u32>> = (0..5u32)
         .map(|p| (p * 1000..p * 1000 + 96).collect())
@@ -208,6 +221,7 @@ fn fill_l0(d: &mut KvSimDriver) -> Vec<Vec<u32>> {
         d.submit(rid(i as u128 + 1), p.clone(), 1);
     }
     drain(d);
+    reuse(d, &prompts, 50);
     assert_eq!(d.pool().cached_unreferenced(), 30);
     prompts
 }
@@ -325,6 +339,7 @@ fn cancellation_releases_kv() {
         d.submit(rid(i as u128 + 1), prompt, 1);
     }
     drain(d);
+    reuse(d, &prefixes, 50);
     d.set_pressure(PressureState::Red);
     for _ in 0..20 {
         d.step();
@@ -384,6 +399,14 @@ fn cancellation_releases_kv() {
          prefetching, {copying} copying",
         d.pool().referenced_blocks()
     );
+    // The copies in flight land as cached blocks, never in a cancelled sequence (L2 copies
+    // take a few iterations of virtual time).
+    for _ in 0..10 {
+        if d.pool().cached_unreferenced() > 0 {
+            break;
+        }
+        scheduled.extend(d.step().items);
+    }
     assert!(
         d.pool().cached_unreferenced() > 0,
         "copies in flight at the cancellation land as cached blocks"

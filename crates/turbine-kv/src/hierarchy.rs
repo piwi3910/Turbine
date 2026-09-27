@@ -227,6 +227,17 @@ impl KvReclaimer for KvReclaimHandle {
     }
 }
 
+/// Blocks capacity demotion moves per call (P4: bounds the engine thread's work per turn).
+pub const CAPACITY_BATCH: usize = 32;
+
+/// Evidence that a cached block will be read again, the precondition for spending a copy on
+/// it: it was attached at least once since it was written (a hit), it belongs to a session
+/// (`prompt_cache_key`), or it is a shared prefix (two or more cached children). A block of a
+/// one-off request has none, however its cost terms score.
+pub fn has_reuse_evidence(b: &KvBlock) -> bool {
+    b.access_count > 0 || b.session.is_some() || b.child_count >= 2
+}
+
 /// Heap entry of `victims`: by value, then older last access, then the deeper block, then key.
 struct Victim {
     value: f64,
@@ -1031,6 +1042,18 @@ impl KvHierarchy {
     /// Leaf-first victims of `tier`, lowest value first, at most `limit`. Choosing a block
     /// makes its parent eligible, so a cold chain drains in one pass.
     fn victims(&self, pool: &BlockPool, tier: TierId, limit: usize) -> Vec<(KvKey, f64)> {
+        self.victims_where(pool, tier, limit, |_| true)
+    }
+
+    /// [`KvHierarchy::victims`] among the blocks `keep` accepts. L0 candidates come from the L0
+    /// index (the blocks resident there), not a scan of the whole directory.
+    fn victims_where(
+        &self,
+        pool: &BlockPool,
+        tier: TierId,
+        limit: usize,
+        keep: impl Fn(&KvBlock) -> bool,
+    ) -> Vec<(KvKey, f64)> {
         let now = self.now();
         let mut departing: HashSet<KvKey> = self.demoting.keys().copied().collect();
         let mut heap = BinaryHeap::new();
@@ -1043,9 +1066,20 @@ impl KvHierarchy {
                 key: b.key,
             }));
         };
-        for b in self.dir.candidates(tier, &departing) {
-            if self.eligible(b, tier, pool, &departing) {
-                push(&mut heap, b);
+        if tier == TierId::L0 {
+            for key in self.l0_keys.values() {
+                if let Some(b) = self.dir.get(key)
+                    && keep(b)
+                    && self.eligible(b, tier, pool, &departing)
+                {
+                    push(&mut heap, b);
+                }
+            }
+        } else {
+            for b in self.dir.candidates(tier, &departing) {
+                if keep(b) && self.eligible(b, tier, pool, &departing) {
+                    push(&mut heap, b);
+                }
             }
         }
         let mut out = Vec::new();
@@ -1056,6 +1090,7 @@ impl KvHierarchy {
             let parent = self.dir.get(&v.key).and_then(|b| b.parent);
             if let Some(pb) = parent.and_then(|p| self.dir.get(&p))
                 && !departing.contains(&pb.key)
+                && keep(pb)
                 && self.eligible(pb, tier, pool, &departing)
             {
                 push(&mut heap, pb);
@@ -1129,6 +1164,13 @@ impl KvHierarchy {
     /// Demotes (copy first, free on completion) the lowest-value unreferenced L0 blocks until
     /// L0 utilisation would be ≤ `target`. Blocks scoring below `kv.demote_min_value`, or with
     /// no lower tier, are dropped. Returns the bytes scheduled or freed.
+    ///
+    /// Under `capacity` (the orchestrator's continuous headroom keeping) only blocks with reuse
+    /// evidence ([`has_reuse_evidence`]) are worth a copy (provisional decision "Phase 4:
+    /// capacity demotion only for blocks with reuse evidence"): the others stay cached in L0
+    /// until an allocation reclaims them, at no cost, and at most [`CAPACITY_BATCH`] blocks move
+    /// per call. Pressure reclaim (the Phase 3 controller) takes every unreferenced block in
+    /// value order, as the eviction policy ranks them.
     pub fn demote_to(&mut self, pool: &mut BlockPool, target: f64, reason: EvictReason) -> u64 {
         let total = f64::from(pool.total_blocks());
         let leaving = self
@@ -1143,7 +1185,17 @@ impl KvHierarchy {
             return 0;
         }
         self.sync_l0_refs(pool);
-        let victims = self.victims(pool, TierId::L0, need);
+        let capacity = reason == EvictReason::Capacity;
+        let victims = if capacity {
+            self.victims_where(
+                pool,
+                TierId::L0,
+                need.min(CAPACITY_BATCH),
+                has_reuse_evidence,
+            )
+        } else {
+            self.victims(pool, TierId::L0, need)
+        };
         let to = self.l0_demotion_target();
         let mut room = to.map_or(0, |t| self.make_room(pool, t, victims.len()));
         let bb = self.cfg.block_bytes;
@@ -1803,5 +1855,85 @@ pub(crate) mod tests {
         r.h.poll(&mut r.pool, &mut r.backend);
         assert_eq!(r.pool.used_blocks(), 2);
         assert_eq!(handle.free_unreferenced(0.0), 2 * bb);
+    }
+
+    /// The Phase 4 bench regression (8 % Llama throughput on a no-reuse workload): capacity
+    /// demotion copied every finished one-off request's blocks to L1. Catches a copy spent on a
+    /// block without reuse evidence (no hit, no session, not a shared prefix), or a session
+    /// block / re-used block that capacity demotion fails to copy down.
+    #[test]
+    fn capacity_demotion_needs_reuse_evidence() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc));
+        let mut r = rig(16, Some(l1.clone()), None, clock);
+
+        // A one-off prompt: four cached blocks, none worth a copy.
+        let one_off: Vec<u32> = (0..65).collect();
+        run(&mut r, &one_off);
+        assert_eq!(r.pool.cached_unreferenced(), 4);
+        assert_eq!(r.h.demote_to(&mut r.pool, 0.0, EvictReason::Capacity), 0);
+        r.clock.advance(Duration::from_millis(10));
+        r.h.poll(&mut r.pool, &mut r.backend);
+        assert_eq!(l1.len(), 0, "no copy of a block without reuse evidence");
+        assert_eq!(r.pool.cached_unreferenced(), 4, "left cached in L0");
+
+        // A session's blocks carry evidence from the first turn: they are copied down.
+        let hints = SessionHints {
+            session_id: "s1".into(),
+            resume_within_secs: None,
+            end: false,
+        };
+        let session_prompt: Vec<u32> = (1000..1065).collect();
+        let id = RequestId::new_v4();
+        let req = AttachRequest {
+            request: id,
+            prompt: &session_prompt,
+            cache_salt: "",
+            session: Some(&hints),
+            priority: Priority(0),
+        };
+        let a = match r.h.attach_prefix(&mut r.pool, &req) {
+            AttachOutcome::Ready(a) => a,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        prefill_and_finish(&mut r, id, &session_prompt, &a);
+        assert_eq!(r.pool.cached_unreferenced(), 8);
+        assert_eq!(
+            r.h.demote_to(&mut r.pool, 0.0, EvictReason::Capacity),
+            4 * bb,
+            "only the session's four blocks move"
+        );
+        r.clock.advance(Duration::from_millis(10));
+        r.h.poll(&mut r.pool, &mut r.backend);
+        r.clock.advance(Duration::from_millis(10));
+        r.h.poll(&mut r.pool, &mut r.backend);
+        assert_eq!(l1.len(), 4);
+        assert_eq!(r.pool.cached_unreferenced(), 4, "the one-off blocks stay");
+
+        // A hit is evidence too: the one-off prompt sent again makes its blocks worth a copy.
+        let again = run(&mut r, &one_off);
+        assert_eq!(again.cached_tokens, 64);
+        assert_eq!(
+            r.h.demote_to(&mut r.pool, 0.0, EvictReason::Capacity),
+            4 * bb
+        );
+
+        // Pressure reclaim (the Phase 3 controller) is not gated: one-off blocks leave L0 too.
+        let other: Vec<u32> = (2000..2033).collect();
+        run(&mut r, &other);
+        let before = l1.len();
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        for _ in 0..3 {
+            r.clock.advance(Duration::from_millis(10));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+        assert_eq!(l1.len(), before + 6, "the re-used four and the one-off two");
+        assert_eq!(
+            r.pool.used_blocks(),
+            0,
+            "pressure empties L0 of unreferenced blocks"
+        );
     }
 }

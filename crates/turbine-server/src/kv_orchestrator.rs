@@ -70,6 +70,9 @@ pub const CALIBRATION_BYTES: u64 = 64 << 20;
 /// demoted by capacity, down to this fill: Phase 3's `kv_utilization` YELLOW threshold
 /// (provisional decision "Phase 4: L0 capacity demotion").
 pub const CAPACITY_DEMOTE_AT: f64 = 0.70;
+/// Capacity demotion and the reclaim-order refresh run at most this often (engine-thread
+/// work per turn stays bounded; the pool changes little within it).
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(50);
 /// Below this share of free L0 blocks the pool's reclaim order is refreshed before planning.
 const REFRESH_FREE_SHARE: u32 = 10;
 /// EWMA weight of one prefill-rate sample.
@@ -226,6 +229,8 @@ pub struct KvOrchestrator {
     commands: mpsc::Receiver<KvCommand>,
     hits: HitWindow,
     prefill_tps: Option<f64>,
+    /// When capacity demotion and the reclaim-order refresh last ran.
+    last_housekeeping: Option<Duration>,
 }
 
 impl KvOrchestrator {
@@ -302,6 +307,7 @@ impl KvOrchestrator {
             commands,
             hits: HitWindow::default(),
             prefill_tps: None,
+            last_housekeeping: None,
         };
         o.calibrate(
             pool,
@@ -396,11 +402,22 @@ impl KvOrchestrator {
     /// reclaims blocks that already have a lower-tier copy instead of dropping the valuable
     /// ones. The controller's own reclaim (reservation pressure) arrives through
     /// [`KvOrchestrator::reclaimer`].
+    ///
+    /// Both scans run at most every [`HOUSEKEEPING_INTERVAL`], and capacity demotion copies only
+    /// blocks with reuse evidence, at most `CAPACITY_BATCH` per run.
     pub fn before_plan(&mut self, pool: &mut BlockPool, state: PressureState) {
+        self.h.set_l0_state(state);
+        let now = self.clock.now_mono();
+        if self
+            .last_housekeeping
+            .is_some_and(|t| now.saturating_sub(t) < HOUSEKEEPING_INTERVAL)
+        {
+            return;
+        }
+        self.last_housekeeping = Some(now);
         if pool.free_blocks() < pool.total_blocks().div_ceil(REFRESH_FREE_SHARE) {
             self.h.refresh_reclaim_order(pool);
         }
-        self.h.set_l0_state(state);
         let total = f64::from(pool.total_blocks().max(1));
         if pool.cached_unreferenced() > 0
             && f64::from(pool.used_blocks()) / total >= CAPACITY_DEMOTE_AT

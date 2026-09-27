@@ -107,13 +107,27 @@ impl LabServer {
 
     /// One greedy completion: (text, completion tokens, cached prompt tokens).
     fn complete(&self, prompt: &str, max_tokens: u32) -> (String, u64, u64) {
-        let body = json!({
+        self.complete_in(prompt, max_tokens, None)
+    }
+
+    /// [`LabServer::complete`] as a turn of session `session` (`prompt_cache_key`): its blocks
+    /// carry the reuse evidence that makes them worth demoting to L1/L2.
+    fn complete_in(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+        session: Option<&str>,
+    ) -> (String, u64, u64) {
+        let mut body = json!({
             "model": SERVED_NAME,
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0.0,
             "ignore_eos": true,
         });
+        if let Some(key) = session {
+            body["prompt_cache_key"] = json!(key);
+        }
         let (status, text) = request(
             self.addr,
             "POST",
@@ -302,7 +316,8 @@ fn nvme_round_trip_matches_cold() {
         ],
     );
     let a = prompt(100, 350);
-    let cold = server.complete(&a, ANSWER_TOKENS);
+    // A and the fillers are session turns: blocks of one-off requests are never copied down.
+    let cold = server.complete_in(&a, ANSWER_TOKENS, Some("a"));
 
     // 1 GiB of L1 holds 73 blocks of 14,680,064 bytes: once twice that many have gone on to L2,
     // A's (the oldest, never touched again) are there.
@@ -318,7 +333,8 @@ fn nvme_round_trip_matches_cold() {
             "demotion to L2 never happened ({} blocks)",
             to_l2()
         );
-        server.complete(&prompt(1_000 + filler, 1_800), 1);
+        let key = format!("filler-{filler}");
+        server.complete_in(&prompt(1_000 + filler, 1_800), 1, Some(&key));
     }
     println!("{filler} filler prompts moved {} blocks to L2", to_l2());
 

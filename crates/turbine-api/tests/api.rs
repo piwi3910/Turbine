@@ -1916,6 +1916,8 @@ async fn kv_metrics_bounded() {
     // A used prefetch, a wasted one (evicted from L0 before use) and a rejected one.
     let other = words(64, 9000);
     cached(&app, &other, &[]).await;
+    // A hit: the reuse evidence that makes its blocks worth demoting (not dropping).
+    assert!(cached(&app, &other, &[]).await > 0);
     sim.demote_all();
     let (s, _) = post_json(
         &app,
