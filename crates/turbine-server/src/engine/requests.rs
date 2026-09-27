@@ -290,6 +290,7 @@ impl ActiveRequest {
             usage: Some(Usage {
                 prompt_tokens: self.prompt_len(),
                 completion_tokens: c.generated.len() as u32,
+                cached_tokens: 0,
             }),
         }
     }
@@ -941,7 +942,8 @@ mod tests {
                 reason: FinishReason::Stop,
                 usage: Some(Usage {
                     prompt_tokens: 2,
-                    completion_tokens: 3
+                    completion_tokens: 3,
+                    cached_tokens: 0
                 })
             }
         );

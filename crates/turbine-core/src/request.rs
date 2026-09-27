@@ -62,6 +62,13 @@ pub enum ErrorCode {
     CircuitOpen,
     /// Device OOM recovery retries exhausted (503; mid-stream a `server_error` event).
     ResourceExhausted,
+    // Phase 4
+    InvalidSessionId,
+    InvalidSessionHint,
+    InvalidCacheSalt,
+    SessionNotFound,
+    PrefetchQueueFull,
+    PressureTooHigh,
 }
 
 impl ErrorCode {
@@ -91,6 +98,12 @@ impl ErrorCode {
             ErrorCode::Overloaded => "overloaded",
             ErrorCode::CircuitOpen => "circuit_open",
             ErrorCode::ResourceExhausted => "resource_exhausted",
+            ErrorCode::InvalidSessionId => "invalid_session_id",
+            ErrorCode::InvalidSessionHint => "invalid_session_hint",
+            ErrorCode::InvalidCacheSalt => "invalid_cache_salt",
+            ErrorCode::SessionNotFound => "session_not_found",
+            ErrorCode::PrefetchQueueFull => "prefetch_queue_full",
+            ErrorCode::PressureTooHigh => "pressure_too_high",
         }
     }
 }
@@ -167,6 +180,9 @@ impl FinishReason {
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Prompt tokens served from a cached prefix (Phase 4; 0 before).
+    #[serde(default)]
+    pub cached_tokens: u32,
 }
 
 /// Built by `turbine-server` after templating and tokenization.

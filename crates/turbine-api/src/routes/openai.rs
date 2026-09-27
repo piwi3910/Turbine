@@ -6,7 +6,7 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Extension, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use turbine_core::request::Endpoint;
@@ -16,6 +16,7 @@ use turbine_observability::http::RequestIdExt;
 
 use crate::backend::{ApiState, InferenceRequest, ReadyState};
 use crate::error::ApiError;
+use crate::kv::parse_turbine_headers;
 use crate::openai::request::OpenAiRequest;
 use crate::openai::response::{ResponseContext, collect};
 use crate::openai::stream::sse;
@@ -52,17 +53,19 @@ pub(super) async fn models(State(state): State<ApiState>) -> Json<serde_json::Va
 pub(super) async fn chat_completions(
     State(state): State<ApiState>,
     request_id: Option<Extension<RequestIdExt>>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    generate(state, Endpoint::ChatCompletions, request_id, body).await
+    generate(state, Endpoint::ChatCompletions, request_id, headers, body).await
 }
 
 pub(super) async fn completions(
     State(state): State<ApiState>,
     request_id: Option<Extension<RequestIdExt>>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    generate(state, Endpoint::Completions, request_id, body).await
+    generate(state, Endpoint::Completions, request_id, headers, body).await
 }
 
 /// Shared completions/chat handler. Every error before `submit` returns a plain HTTP error and
@@ -72,6 +75,7 @@ async fn generate(
     state: ApiState,
     endpoint: Endpoint,
     request_id: Option<Extension<RequestIdExt>>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
     let created = unix_seconds();
@@ -80,6 +84,7 @@ async fn generate(
         e
     };
     let (body, model) = admit(&state, endpoint, body).map_err(reject)?;
+    let hints = parse_turbine_headers(&headers, body.prompt_cache_key.is_some()).map_err(reject)?;
 
     let id = RequestId::new_v4();
     let stream = body.stream == Some(true);
@@ -104,6 +109,7 @@ async fn generate(
             endpoint,
             body,
             http_request_id,
+            hints,
         })
         .await?;
     if stream {

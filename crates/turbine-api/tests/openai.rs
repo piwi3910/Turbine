@@ -355,6 +355,7 @@ fn inference_request(body: OpenAiRequest, endpoint: Endpoint) -> InferenceReques
         endpoint,
         body,
         http_request_id: "req-1".to_string(),
+        hints: turbine_api::TurbineHeaders::default(),
     }
 }
 
@@ -368,6 +369,7 @@ async fn backend_submit_seam() {
             usage: Some(Usage {
                 prompt_tokens: 1,
                 completion_tokens: 0,
+                cached_tokens: 0,
             }),
         },
     ];
@@ -570,6 +572,7 @@ fn hello_script() -> Vec<GenerationEvent> {
             usage: Some(Usage {
                 prompt_tokens: 3,
                 completion_tokens: 3,
+                cached_tokens: 0,
             }),
         },
     ]
@@ -609,7 +612,8 @@ async fn response_shapes_and_stream_order() {
     assert_eq!(v["choices"][0]["finish_reason"], "stop");
     assert_eq!(
         v["usage"],
-        json!({"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6})
+        json!({"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6,
+               "prompt_tokens_details": {"cached_tokens": 0}})
     );
 
     // Non-streaming chat.
@@ -672,7 +676,8 @@ async fn response_shapes_and_stream_order() {
     assert_eq!(chunks[4]["choices"], json!([]));
     assert_eq!(
         chunks[4]["usage"],
-        json!({"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6})
+        json!({"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6,
+               "prompt_tokens_details": {"cached_tokens": 0}})
     );
     assert_eq!(chunks[5], "[DONE]");
 
@@ -891,6 +896,7 @@ fn finished(choice: u32, reason: FinishReason, completion_tokens: u32) -> Genera
         usage: Some(Usage {
             prompt_tokens: 3,
             completion_tokens,
+            cached_tokens: 0,
         }),
     }
 }
@@ -967,7 +973,8 @@ async fn phase2_shapes() {
     assert_eq!(choices[1]["finish_reason"], "length");
     assert_eq!(
         v["usage"],
-        json!({"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6})
+        json!({"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6,
+               "prompt_tokens_details": {"cached_tokens": 0}})
     );
 
     // n = 2, non-streaming completion.

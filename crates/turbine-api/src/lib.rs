@@ -3,6 +3,7 @@
 
 pub mod backend;
 pub mod error;
+pub mod kv;
 pub mod openai;
 mod routes;
 pub mod support;
@@ -12,5 +13,6 @@ pub use backend::{
     InferenceRequest, ModelCard, NotReadyReason, Readiness, ReadyState, readiness_for_circuit,
 };
 pub use error::{ApiError, ErrorType};
+pub use kv::{PrefetchAccepted, PrefetchRequest, TurbineHeaders};
 pub use routes::router;
 pub use turbine_core::request::ErrorCode;

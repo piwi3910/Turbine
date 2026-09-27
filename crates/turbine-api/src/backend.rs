@@ -10,6 +10,7 @@ use turbine_core::types::{CircuitState, RequestId};
 use turbine_observability::MetricsRegistry;
 
 use crate::error::ApiError;
+use crate::kv::{PrefetchAccepted, PrefetchRequest, TurbineHeaders};
 use crate::openai::request::OpenAiRequest;
 
 /// A boxed, sendable future (keeps [`InferenceBackend`] object-safe).
@@ -28,6 +29,8 @@ pub struct InferenceRequest {
     pub body: OpenAiRequest,
     /// `x-request-id` of the HTTP request: a log field, never a metric label.
     pub http_request_id: String,
+    /// Validated `x-turbine-*` headers (Phase 4); the session id is `body.prompt_cache_key`.
+    pub hints: TurbineHeaders,
 }
 
 /// `GET /v1/models` entry (empty list in Phase 0).
@@ -61,6 +64,14 @@ pub trait InferenceBackend: Send + Sync {
     /// (`turbine_requests_total{outcome="rejected"}`). The default records nothing.
     fn record_rejection(&self, endpoint: Endpoint, code: ErrorCode) {
         let _ = (endpoint, code);
+    }
+
+    /// `POST /turbine/v1/kv/prefetch` (Phase 4): queue promotions of a session's or a
+    /// prompt's cached blocks. The default, for a build without the KV hierarchy, is 501
+    /// `not_implemented`.
+    fn prefetch(&self, req: PrefetchRequest) -> BoxFuture<'_, Result<PrefetchAccepted, ApiError>> {
+        drop(req);
+        Box::pin(async { Err(ApiError::not_implemented()) })
     }
 }
 

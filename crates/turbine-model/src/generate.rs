@@ -219,6 +219,8 @@ impl Generation<'_> {
         let usage = Usage {
             prompt_tokens: self.req.prompt_tokens.len() as u32,
             completion_tokens: self.generated,
+            // The single-request loop keeps no prefix cache.
+            cached_tokens: 0,
         };
         tracing::debug!(
             request_id = ?self.req.id,
@@ -509,7 +511,8 @@ mod tests {
                 usage,
                 Some(Usage {
                     prompt_tokens: 3,
-                    completion_tokens: 3
+                    completion_tokens: 3,
+                    cached_tokens: 0
                 })
             );
             // prefill of the prompt, then one decode per token except after the last
