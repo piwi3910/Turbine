@@ -65,7 +65,7 @@ Workload (fixed): one Radeon AI PRO R9700 on novanas, `turbine-bench --concurren
 
 ## Phase 2m modularity chain
 
-Novanas GPU 0, `scripts/lab-bench.sh` with the phase2c configs (2,048 batch tokens); bounds per slice: tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; OLMoE c16 gets one retry for the known p10/p14 batch-composition flip.
+Novanas GPU 0, `scripts/lab-bench.sh` with the phase2c configs (2,048 batch tokens); bounds per slice: tok/s ≥ 0.97 × and TTFT p50 ≤ 1.10 × the previous row; OLMoE c16 gets one retry for the known p10/p14 batch-composition flip (superseded 2026-09-27: the flip is fixed and c16 gets no retry; see the Pre-Phase-5 section below).
 
 | Date       | Commit  | Task                                                                                                                                                | Host tests | GPU suites                                                                                       | Llama tok/s | Llama TTFT p50 ms | OLMoE tok/s | OLMoE TTFT p50 ms | Golden (Llama c1/c16; OLMoE c1/c16)                     | vs previous                              |
 | ---------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------ | ----------- | ----------------- | ----------- | ----------------- | ------------------------------------------------------- | ---------------------------------------- |
