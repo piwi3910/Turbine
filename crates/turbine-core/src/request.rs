@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
+pub use crate::session_hints::SessionHints;
 use crate::types::{Priority, RequestId};
 
 /// The OpenAI endpoint a request arrived on.

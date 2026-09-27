@@ -6,6 +6,7 @@ mod model_identity;
 pub mod pressure;
 pub mod registry;
 pub mod request;
+mod session_hints;
 pub mod support;
 pub mod telemetry;
 pub mod types;

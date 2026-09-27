@@ -9,6 +9,7 @@ pub mod planner;
 pub mod policy;
 pub mod pool;
 pub mod reclaim;
+pub mod session;
 pub mod table;
 pub mod tier;
 pub mod transfer;
