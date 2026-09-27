@@ -145,8 +145,9 @@ impl AdmissionGate {
 
     /// Admit up to `max_new` queued requests in queue order (with the `max_bypass` starvation
     /// guard), each re-decided against the current snapshot with `Admission::evaluate_refill`
-    /// (in RED queued requests refill finished slots) and given its KV reservation.
-    pub fn pump(&mut self, max_new: usize) -> Vec<Pumped> {
+    /// (in RED queued requests refill finished slots) and given its KV reservation. `idle`:
+    /// nothing is admitted, so the work-conserving floor (`Admission::evaluate_idle`) decides.
+    pub fn pump(&mut self, max_new: usize, idle: bool) -> Vec<Pumped> {
         if max_new == 0 || self.queue.is_empty() {
             return Vec::new();
         }
@@ -154,10 +155,12 @@ impl AdmissionGate {
         let admission = &self.admission;
         let mut reservations: HashMap<RequestId, Reservation> = HashMap::new();
         let admitted = self.queue.pump(|q| {
-            if reservations.len() >= max_new
-                || admission.evaluate_refill(&q.estimate, snap.state, snap.circuit)
-                    != AdmissionDecision::Admit
-            {
+            let decision = if idle {
+                admission.evaluate_idle(&q.estimate, snap.state, snap.circuit)
+            } else {
+                admission.evaluate_refill(&q.estimate, snap.state, snap.circuit)
+            };
+            if reservations.len() >= max_new || decision != AdmissionDecision::Admit {
                 return false;
             }
             match admission.reserve_kv(&q.estimate) {
@@ -178,6 +181,16 @@ impl AdmissionGate {
             let reservation = reservations
                 .remove(&q.id)
                 .expect("every admitted entry took a reservation");
+            if idle {
+                tracing::info!(
+                    event = "admission_decision",
+                    request_id = %q.id.0,
+                    decision = "admit",
+                    reason = "idle_floor",
+                    state = snap.state.as_str(),
+                    "nothing admitted: the queue head is admitted despite pressure"
+                );
+            }
             self.started(&q.estimate);
             out.push((q.payload.req, reservation, q.payload.submit_no));
         }

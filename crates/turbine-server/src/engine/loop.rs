@@ -58,7 +58,7 @@
 //! collecting an iteration that the scheduler already completed ahead cannot be retried, so
 //! its requests fail (`resource_exhausted` for out-of-memory, counted as a failed recovery).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,6 +80,7 @@ use turbine_model::{ForwardPhase, ModelError, SampleJob, SampledToken, Tokenizer
 use turbine_reliability::circuit::{CircuitEvent, CircuitReason};
 use turbine_reliability::controller::{EngineStats, Snapshot};
 use turbine_reliability::recovery::RecoveryStep;
+use turbine_reliability::step_window::DecodeStepWindow;
 use turbine_scheduler::{
     BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome, IterationPlan,
     SchedRequest, Scheduler, SubmitError,
@@ -96,8 +97,6 @@ use crate::reliability::EngineReliability;
 
 /// Sleep between turns while requests exist but the last plan had nothing to run.
 const IDLE_POLL: Duration = Duration::from_millis(2);
-/// Decode step times the windowed p95 (`step_time_drift`) is taken over.
-const STEP_WINDOW: usize = 64;
 /// Smoothing of the decode step-time estimate and the GREEN baseline.
 const STEP_ALPHA: f64 = 0.1;
 /// Circuit probe (P3 S-12): a fixed prompt and 16 greedy tokens.
@@ -151,8 +150,8 @@ pub(crate) struct EngineLoop {
     /// The circuit probe in flight and its (unread) event channel.
     probe: Option<(RequestId, mpsc::Receiver<GenerationEvent>)>,
     probe_prompt: Vec<u32>,
-    /// Step time per sequence (s) of the last [`STEP_WINDOW`] pure decode iterations.
-    decode_steps: VecDeque<f64>,
+    /// Pure decode step times behind `step_time_drift`.
+    decode_steps: DecodeStepWindow,
     /// Smoothed decode step time (s); 0 before the first decode.
     decode_step_s: f64,
     /// Smoothed decode step time of GREEN + HEALTHY iterations without a probe: what a probe's
@@ -277,7 +276,7 @@ impl EngineLoop {
             snap,
             probe: None,
             probe_prompt,
-            decode_steps: VecDeque::with_capacity(STEP_WINDOW),
+            decode_steps: DecodeStepWindow::new(),
             decode_step_s: 0.0,
             baseline_step_s: None,
             iterations: 0,
@@ -519,14 +518,7 @@ impl EngineLoop {
         self.iterations += 1;
         let prefill = plan.prefill_tokens();
         let decodes = plan.decode_tokens();
-        // The drift window takes pure decode steps per sequence (P3 `step_time_drift`), so a
-        // growing batch or a prefill in the same iteration is not mistaken for slowing down.
-        if decodes > 0 && prefill == 0 {
-            if self.decode_steps.len() == STEP_WINDOW {
-                self.decode_steps.pop_front();
-            }
-            self.decode_steps.push_back(secs / f64::from(decodes));
-        }
+        self.decode_steps.observe(prefill, decodes, secs);
         if decodes > 0 {
             self.decode_step_s = if self.decode_step_s > 0.0 {
                 STEP_ALPHA * secs + (1.0 - STEP_ALPHA) * self.decode_step_s
@@ -557,11 +549,7 @@ impl EngineLoop {
 
     /// The figures the pressure controller reads on its next tick.
     fn publish_stats(&self) {
-        let p95 = (!self.decode_steps.is_empty()).then(|| {
-            let mut sorted: Vec<f64> = self.decode_steps.iter().copied().collect();
-            sorted.sort_by(f64::total_cmp);
-            sorted[((sorted.len() - 1) as f64 * 0.95).round() as usize]
-        });
+        let p95 = self.decode_steps.p95();
         self.rel.publish(EngineStats {
             running_remaining_tokens: self.sched.remaining_tokens(),
             free_kv_blocks: self.pool.free_blocks(),

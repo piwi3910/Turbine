@@ -380,6 +380,26 @@ Depends on: Tasks 2, 10, 12, 12a; decision "Phase 3: device_memory counts idle p
 - [ ] Run: `scripts/bench-lock.sh scripts/overload-soak.sh novanas` — expect exit 0 and `"pass": true`.
 - [ ] Commit: `fix(reliability): device_memory counts idle pre-allocated KV and reserve as free`
 
+## Task 12c: Soak stall — drift per iteration, stale drift, idle floor (amendment 2026-09-27)
+
+Files: `crates/turbine-reliability/src/{step_window.rs (new), controller.rs, admission.rs, lib.rs}`, `crates/turbine-scheduler/src/{gate.rs, scheduler.rs, sim/overload.rs}`, `crates/turbine-scheduler/tests/overload_sim.rs`, `crates/turbine-server/src/engine/loop.rs`
+Interfaces:
+
+- `pub struct step_window::DecodeStepWindow { fn new(), fn observe(prefill_tokens: u32, decode_tokens: u32, secs: f64), fn p95() -> Option<f64> }` (window of 64 pure decode iterations; the engine and the simulator both feed it)
+- `pub fn Admission::evaluate_idle(&self, est, state, circuit) -> AdmissionDecision`; `pub fn AdmissionGate::pump(&mut self, max_new: usize, idle: bool)`
+- `OverloadConfig.degraded_during_load: bool`; `OverloadReport.max_idle_with_queue: Duration`; the simulator sends `CircuitEvent::Iteration` like the server's pressure thread
+
+Covers: S-6 (`step_time_drift`), S-10 (work-conserving floor), S-12 (latency drift), S-19; `step_window::tests::batch_size_is_not_drift`, `controller::tests::drift_is_not_judged_while_idle`, `overload_sim soak_workload_keeps_serving`, `degraded_circuit_keeps_serving`, `ten_x_overload` (idle-with-queue bound).
+Depends on: Tasks 10, 12, 12a, 12b, 14; decision "Phase 3: soak stall — drift per iteration, idle floor" (provisional, pending user review).
+
+- [ ] Write failing tests `step_window::tests::batch_size_is_not_drift` (the same iteration time at batch 16 and batch 1 is the same step time), `controller::tests::drift_is_not_judged_while_idle` (YELLOW on 1.95 × baseline drift; with nothing running the state returns to GREEN and no drift signal is emitted), `overload_sim degraded_circuit_keeps_serving` (the soak workload at 4× with the circuit held DEGRADED: never idle > 1 s with requests queued) and `soak_workload_keeps_serving` (seeds 1 and 7); make the simulator send `CircuitEvent::Iteration` and feed `DecodeStepWindow`.
+- [ ] Run: `cargo test --release -p turbine-reliability -p turbine-scheduler` — expect FAIL (the window test; the circuit ends DEGRADED in the SURVIVAL liveness cases; `degraded_circuit_keeps_serving` idles 4.2 s with requests queued; the drift test stays YELLOW).
+- [ ] Implement: the window records the iteration time (not divided by the batch); the controller ignores drift and does not learn its baseline while nothing runs; the scheduler pumps at least one slot with `idle = true` while nothing is admitted, and the gate decides those with `evaluate_idle` (INFO `admission_decision` reason `idle_floor`); the simulator's RED-growth count exempts 0 → 1.
+- [ ] Run: the same — expect PASS; `survival_liveness_sweep` unchanged (42–49 s).
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus the `fault-injection` feature)
+- [ ] Run: `scripts/bench-lock.sh scripts/overload-soak.sh novanas` — expect exit 0 and `"pass": true`.
+- [ ] Commit: `fix(reliability): drift per decode iteration, none while idle; admission floor when nothing is admitted`
+
 ## Task 13: Pressure route, readiness, admission errors and metrics in turbine-api
 
 Files: `crates/turbine-api/src/routes/diagnostics.rs` (pressure route 200, status fields), `crates/turbine-api/src/routes/health.rs` (`circuit_open` readiness), `crates/turbine-api/src/error.rs` (overload `ApiError` constructors, `Retry-After`), `crates/turbine-api/src/backend.rs` (`NotReadyReason::CircuitOpen`, `readiness_for_circuit`), `crates/turbine-api/Cargo.toml` (dev-deps `turbine-reliability`, `turbine-device`), `crates/turbine-api/tests/api.rs` (four tests)

@@ -33,6 +33,7 @@ use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_reliability::recovery::{RecoveryController, RecoveryOutcome, RecoveryStep};
 use turbine_reliability::reserve::{EmergencyReserve, ReserveAllocator};
 use turbine_reliability::signals::effective_thresholds;
+use turbine_reliability::step_window::DecodeStepWindow;
 use turbine_reliability::throttle::SchedulerLimits;
 use turbine_tensor::DeviceMemory;
 use turbine_tensor::host::HostMemory;
@@ -79,6 +80,9 @@ pub struct OverloadConfig {
     /// A `scheduling_policy` registry name (Phase 2m), `default` by default: the overload tests
     /// run over every registered policy.
     pub policy: &'static str,
+    /// Hold the circuit in DEGRADED while `run_load` submits (a `telemetry_stale` event on every
+    /// tick, as a stale vendor library would).
+    pub degraded_during_load: bool,
 }
 
 impl Default for OverloadConfig {
@@ -109,6 +113,7 @@ impl Default for OverloadConfig {
             prompt_range: (64, 6000),
             max_tokens_range: (16, 1024),
             policy: "default",
+            degraded_during_load: false,
         }
     }
 }
@@ -175,6 +180,10 @@ pub struct OverloadReport {
     /// HEALTHY, relative to the stop.
     pub green_after_stop: Option<Duration>,
     pub final_circuit: CircuitState,
+    /// Longest stretch in which the engine ran nothing although requests waited in the
+    /// admission queue, below SURVIVAL and with the circuit admitting: the device idling on
+    /// queued work (the 2026-09-27 soak's stall).
+    pub max_idle_with_queue: Duration,
 }
 
 /// The emergency reserve of a simulated device: nothing to allocate.
@@ -226,6 +235,7 @@ pub struct OverloadSim {
     probe: Option<RequestId>,
     baseline_step_s: Option<f64>,
     decode_step_s: f64,
+    decode_steps: DecodeStepWindow,
     iterations: u64,
     load_stop: Option<Duration>,
     // report
@@ -237,6 +247,9 @@ pub struct OverloadSim {
     max_queue_len: usize,
     states: BTreeSet<PressureState>,
     green_after_stop: Option<Duration>,
+    idle_since: Option<Duration>,
+    max_idle_with_queue: Duration,
+    seen_iterations: u64,
 }
 
 impl OverloadSim {
@@ -340,6 +353,7 @@ impl OverloadSim {
             rng: ChaCha8Rng::seed_from_u64(cfg.seed),
             exec: SimExecutor { cost: cfg.cost },
             decode_step_s: cfg.cost.per_decode_step_s,
+            decode_steps: DecodeStepWindow::new(),
             cfg,
             clock,
             sched,
@@ -369,6 +383,9 @@ impl OverloadSim {
             max_queue_len: 0,
             states: BTreeSet::new(),
             green_after_stop: None,
+            idle_since: None,
+            max_idle_with_queue: Duration::ZERO,
+            seen_iterations: 0,
         }
     }
 
@@ -424,9 +441,10 @@ impl OverloadSim {
         // Arrivals between two RED plans all queue, so the admitted count may only return to
         // the previous plan's after completions.
         let admitted = self.sched.admitted_count();
+        // The work-conserving floor (0 → 1) is not growth.
         if state == PressureState::Red
             && self.last_plan_state == PressureState::Red
-            && admitted > self.last_admitted
+            && admitted > self.last_admitted.max(1)
         {
             self.red_growth += 1;
         }
@@ -443,6 +461,16 @@ impl OverloadSim {
             self.finish(id, outcome);
         }
         let mut report = IterationReport::default();
+        let idle_on_queue = plan.is_empty()
+            && self.gate_len() > 0
+            && state < PressureState::Survival
+            && !self.handle.circuit().blocks_readiness();
+        if idle_on_queue {
+            let since = *self.idle_since.get_or_insert(now);
+            self.max_idle_with_queue = self.max_idle_with_queue.max(now - since);
+        } else {
+            self.idle_since = None;
+        }
         if plan.is_empty() {
             self.sched.complete(
                 &mut self.pool,
@@ -626,6 +654,7 @@ impl OverloadSim {
             states: self.states.clone(),
             green_after_stop: self.green_after_stop,
             final_circuit: self.handle.circuit(),
+            max_idle_with_queue: self.max_idle_with_queue,
         }
     }
 
@@ -783,6 +812,8 @@ impl OverloadSim {
             return;
         }
         let secs = duration.as_secs_f64();
+        self.decode_steps
+            .observe(plan.prefill_tokens(), plan.decode_tokens(), secs);
         self.decode_step_s = STEP_ALPHA * secs + (1.0 - STEP_ALPHA) * self.decode_step_s;
         let calm = self.handle.state() == PressureState::Green
             && self.handle.circuit() == CircuitState::Healthy
@@ -843,10 +874,22 @@ impl OverloadSim {
                 free_kv_blocks: self.pool.free_blocks(),
                 block_tokens: self.cfg.params.block_tokens,
                 decode_tokens_per_s: 1.0 / self.decode_step_s.max(1e-9),
-                step_time_p95_s: None,
+                step_time_p95_s: self.decode_steps.p95(),
                 queue_len: self.gate_len() as u32,
                 iterations: self.iterations,
             };
+            // As the server's pressure thread: an iteration since the last tick marks the
+            // engine busy (drift and thermal count only then).
+            if self.iterations != self.seen_iterations {
+                self.controller.on_circuit_event(CircuitEvent::Iteration);
+                self.seen_iterations = self.iterations;
+            }
+            if self.cfg.degraded_during_load
+                && self.load_stop.is_some_and(|stop| self.next_tick < stop)
+            {
+                self.controller
+                    .on_circuit_event(CircuitEvent::TelemetryStale);
+            }
             self.controller.tick(&sample, &stats);
             let (state, circuit) = (self.handle.state(), self.handle.circuit());
             self.states.insert(state);

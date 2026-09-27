@@ -16,6 +16,7 @@ pub mod recovery;
 pub mod reserve;
 pub mod signals;
 pub mod state;
+pub mod step_window;
 pub mod throttle;
 
 pub use turbine_core::clock::Clock;

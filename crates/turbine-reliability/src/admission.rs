@@ -245,6 +245,30 @@ impl Admission {
         self.decide_inner(est, rules, state, circuit, 0)
     }
 
+    /// The work-conserving floor (P3 S-10): nothing is admitted, so the rules that protect
+    /// running work (`pressure_orange`, `pressure_red`, `circuit_degraded`, `prefill_budget`)
+    /// have nothing to protect, and an idle device relieves no pressure. Only the hard checks
+    /// apply: KV capacity, an open circuit, SURVIVAL, and the KV reservation with its headroom
+    /// below the next state's threshold.
+    pub fn evaluate_idle(
+        &self,
+        est: &ResourceEstimate,
+        state: PressureState,
+        circuit: CircuitState,
+    ) -> AdmissionDecision {
+        if state == PressureState::Survival {
+            return AdmissionDecision::Reject {
+                reason: RejectionReason::Survival,
+            };
+        }
+        let circuit = if circuit == CircuitState::Degraded {
+            CircuitState::Healthy
+        } else {
+            circuit
+        };
+        self.decide_inner(est, PressureState::Green, state, circuit, 0)
+    }
+
     fn kv_bytes(&self, est: &ResourceEstimate) -> u64 {
         est.projected_kv_blocks as u64 * self.params.block_bytes
     }

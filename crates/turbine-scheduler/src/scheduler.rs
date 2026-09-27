@@ -831,13 +831,19 @@ impl Scheduler {
             let allowance = limits.batch_growth_limit.map_or(usize::MAX, |g| {
                 (self.prev_admitted + g as usize).saturating_sub(admitted)
             });
-            let slots = (self.params.max_running_requests as usize)
+            let mut slots = (self.params.max_running_requests as usize)
                 .saturating_sub(admitted)
                 .min(allowance);
+            // Work-conserving floor (P3 S-10): a growth limit never holds the admitted count at
+            // 0 while requests wait, or ORANGE/RED freeze an idle engine behind a full queue.
+            let idle = admitted == 0;
+            if idle {
+                slots = slots.max(1);
+            }
             let pumped = self
                 .gate
                 .as_mut()
-                .map(|g| g.pump(slots))
+                .map(|g| g.pump(slots, idle))
                 .unwrap_or_default();
             for (r, reservation, submit_no) in pumped {
                 self.enqueue(r, Some(reservation), submit_no);

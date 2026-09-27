@@ -1018,7 +1018,7 @@ Exhaustion horizon (P3 S-8): `ExhaustionHorizon::predict(running: &[(remaining_t
 | RED      | 0 (frozen; queued requests refill finished slots) | 0.5; new prefills only in refilled slots | floor                 | all_queued (`pressure_red`); refills judged by ORANGE rules | free all unreferenced cached + optional buffers                                               |
 | SURVIVAL | shrink only                                       | 0                                        | —                     | stopped (`503 overloaded`), queue kept                      | release emergency reserve; preempt most recently admitted only if next decode cannot allocate |
 
-Batch growth counts admitted requests (running + waiting with a worst-case KV reservation). RED refilling finished slots: DEC 2026-09-26 (`Admission::evaluate_refill`, `Scheduler::admitted_count`).
+Batch growth counts admitted requests (running + waiting with a worst-case KV reservation). RED refilling finished slots: DEC 2026-09-26 (`Admission::evaluate_refill`, `Scheduler::admitted_count`). Work-conserving floor while nothing is admitted: DEC 2026-09-27 (`Admission::evaluate_idle`, `AdmissionGate::pump(max_new, idle)`). `step_time_drift` is the p95 pure-decode iteration time (`turbine_reliability::step_window::DecodeStepWindow`), omitted while nothing runs.
 
 ### 8.5 Pressure document (`GET /turbine/v1/pressure`)
 

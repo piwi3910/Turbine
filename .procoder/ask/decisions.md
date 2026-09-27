@@ -486,3 +486,19 @@ The first 10-minute soak on novanas (`scripts/overload-soak.sh novanas`, 2026-09
 - C) Measure only the memory outside the pre-allocated pools (weights, workspace, runtime, co-tenants) against its own budget (about 2 GiB of slack on the R9700, so a few hundred MB of transient workspace would move it tens of percent)
 
 **Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Idle novanas soak startup: 0.972 → about 0.22 (GREEN). Spec signal table amended, plan Task 12b, contract §8.3 row. Tests `signals::tests::device_memory_counts_idle_preallocated_bytes_as_free`, `controller::tests::idle_full_budget_kv_pool_stays_green`; the overload simulation now reports device memory (without A, `ten_x_overload` and the SURVIVAL liveness seeds never return to GREEN; with A, seeds 1–12 still recover in 42–49 s).
+
+## Phase 3: soak stall — drift per iteration, idle floor
+
+With `device_memory` fixed, the second 10-minute soak on novanas (2026-09-27) calibrated (4R = 7.64 req/s) and then stalled. During the overload `/turbine/v1/scheduler` showed 222 waiting, 0 prefilling and 0 decoding. The circuit was DEGRADED (`latency_drift`) from the calibration, the state ORANGE on `queue_fill` 0.87, and the batch growth limit 0. Of the overload requests, 9 completed and 4,534 ended `queue_timeout`. In the cool-down the state stayed ORANGE for all 5 minutes. Three defects:
+
+1. `step_time_drift` divided the iteration time by the batch size. Decode is memory-bound (ITL p50 17.6 ms at concurrency 16, 20 ms at 4), so a batch shrinking from 4 to 1 read as a 4× slowdown and put the circuit in DEGRADED.
+2. DEGRADED and ORANGE queue prefills above `large_prefill_tokens` (three quarters of the soak's arrivals). A slot the blocked queue head could not refill was lost, because the next growth limit is measured from the lower admitted count. The count drained to 0, and ORANGE's freeze then held an idle engine behind a full queue whose `queue_fill` kept the state ORANGE.
+3. With nothing decoding, the drift window kept its last p95 (1.95 × baseline), above ORANGE's exit threshold (1.9), so the state never de-escalated.
+
+Options:
+
+- A) Drift is the p95 time of a pure decode iteration, not computed while nothing runs. Add a work-conserving floor: while nothing is admitted, below SURVIVAL, the gate admits the first queued request that passes the KV checks whatever its pressure reason (`idle_floor`) (recommended)
+- B) A, plus keep a frozen admitted target in ORANGE/RED so deferred refills are not lost (larger change; RED's "never rises between plans" rule, user decision 2026-09-26, would need rewording)
+- C) Drop `queue_fill` as a pressure signal (spec table change; does not fix the drain to 0)
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Spec signal table (`step_time_drift`) and batch-growth paragraph amended, plan Task 12c, contract §8.3 note. The simulator now sends the server's `Iteration` circuit events and uses the engine's drift window. With the old formula the three SURVIVAL liveness cases end DEGRADED; without the floor, `degraded_circuit_keeps_serving` idles 4.2 s with requests queued. With A: `ten_x_overload` is unchanged (493 completions, GREEN 42.7 s after the stop), the soak workload completes 842–844 requests (capacity bound 688) and is back to GREEN + HEALTHY in 40–42 s, and seeds 1–12 still recover in 42–49 s.

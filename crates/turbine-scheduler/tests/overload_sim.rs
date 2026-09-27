@@ -193,6 +193,109 @@ fn ten_x_overload_under(policy: &'static str) {
         "GREEN + HEALTHY {back:?} after the load stopped"
     );
     assert_eq!(r.final_circuit, CircuitState::Healthy);
+    assert!(
+        r.max_idle_with_queue <= Duration::from_secs(1),
+        "idle {:?} with requests queued",
+        r.max_idle_with_queue
+    );
+}
+
+/// The soak's shape (`scripts/overload-soak.sh`): 4× the service rate, prompts of 64..6,000
+/// tokens (three quarters above `large_prefill_tokens`), 16..1,024 new tokens.
+fn soak_config(seed: u64) -> OverloadConfig {
+    OverloadConfig {
+        seed,
+        rate_multiple: 4.0,
+        prompt_range: (64, 6000),
+        max_tokens_range: (16, 1024),
+        ..OverloadConfig::default()
+    }
+}
+
+/// Serving continues through the overload and ends GREEN + HEALTHY; the device never idles
+/// while requests wait (below SURVIVAL, circuit admitting).
+fn assert_keeps_serving(name: &str, r: &OverloadReport, capacity: f64) {
+    let completed = r
+        .outcomes
+        .iter()
+        .filter(|o| **o == Outcome::Completed)
+        .count();
+    eprintln!(
+        "{name}: {} requests, {completed} completed (capacity bound {capacity:.0}), states {:?}, idle with queue {:?}, GREEN+HEALTHY {:?} after stop, final circuit {:?}",
+        r.outcomes.len(),
+        r.states,
+        r.max_idle_with_queue,
+        r.green_after_stop,
+        r.final_circuit
+    );
+    assert!(
+        r.max_idle_with_queue <= Duration::from_secs(1),
+        "{name}: idle {:?} with requests queued",
+        r.max_idle_with_queue
+    );
+    for o in &r.outcomes {
+        if let Outcome::Rejected(code) = o {
+            assert!(REJECT_CODES.contains(&code.as_str()), "{name}: code {code}");
+        }
+        assert!(!matches!(o, Outcome::Failed(_)), "{name}: {o:?}");
+    }
+    assert!(
+        completed as f64 >= 0.5 * capacity,
+        "{name}: {completed} completions < 50 % of the capacity bound {capacity:.0}"
+    );
+    let back = r
+        .green_after_stop
+        .expect("GREEN + HEALTHY after the load stopped");
+    assert!(
+        back <= secs(60),
+        "{name}: GREEN + HEALTHY {back:?} after stop"
+    );
+    assert_eq!(r.final_circuit, CircuitState::Healthy, "{name}");
+}
+
+/// The 2026-09-27 soak on novanas: the calibration's shrinking batches read as latency drift
+/// (step time divided by the batch), the circuit went DEGRADED, and the overload stalled with
+/// nothing running and the queue full. Catches: drift from batch size, and any path where
+/// pressure rules idle the device while requests wait.
+#[test]
+fn soak_workload_keeps_serving() {
+    for seed in [1, 7] {
+        let mut sim = OverloadSim::new(soak_config(seed));
+        let capacity = sim.config().service_rate() * 600.0;
+        let r = sim.run_load(secs(600), secs(120));
+        assert_keeps_serving(&format!("soak seed {seed}"), &r, capacity);
+    }
+}
+
+/// A DEGRADED circuit queues expensive prefills; with three quarters of the arrivals expensive
+/// the queue head blocks, the admitted count drains to 0 and `queue_fill` holds ORANGE, whose
+/// frozen batch then admits nothing. Catches: a pressure or circuit rule that leaves the engine
+/// idle with requests queued (P3 S-10: sustained overload keeps serving).
+#[test]
+fn degraded_circuit_keeps_serving() {
+    let mut sim = OverloadSim::new(OverloadConfig {
+        degraded_during_load: true,
+        ..soak_config(1)
+    });
+    let capacity = sim.config().service_rate() * 600.0;
+    let r = sim.run_load(secs(600), secs(120));
+    eprintln!(
+        "degraded: {} requests, capacity bound {capacity:.0}, states {:?}, idle with queue {:?}, GREEN+HEALTHY {:?} after stop",
+        r.outcomes.len(),
+        r.states,
+        r.max_idle_with_queue,
+        r.green_after_stop
+    );
+    assert!(r.states.contains(&PressureState::Yellow));
+    assert!(
+        r.max_idle_with_queue <= Duration::from_secs(1),
+        "idle {:?} with requests queued",
+        r.max_idle_with_queue
+    );
+    // DEGRADED lasts until `reliability.circuit.window` (60 s) passes without a trigger after
+    // the load stops, so only the end state is checked here.
+    assert_eq!(r.unfinished, 0);
+    assert_eq!(r.final_circuit, CircuitState::Healthy);
 }
 
 #[test]

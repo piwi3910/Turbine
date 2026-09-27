@@ -185,12 +185,16 @@ impl PressureController {
             stats.free_kv_blocks,
             stats.block_tokens.max(1),
         );
+        // Drift describes the decoding that is happening: while nothing runs the window only
+        // holds finished work, and its last value would latch a level through the hysteresis.
+        let decoding = !stats.running_remaining_tokens.is_empty();
         let drift = match (stats.step_time_p95_s, self.baseline_step_s) {
-            (Some(p95), Some(base)) if base > 0.0 => Some(p95 / base),
+            (Some(p95), Some(base)) if base > 0.0 && decoding => Some(p95 / base),
             _ => None,
         };
         // Baseline only from GREEN + HEALTHY iterations (P3 edge case "baseline learned under pressure").
         if let Some(p95) = stats.step_time_p95_s
+            && decoding
             && self.machine.state() == PressureState::Green
             && self.circuit.state() == CircuitState::Healthy
         {
@@ -622,6 +626,45 @@ mod tests {
             (mem.value - 0.7 / 30.0 - 6.0 / 30.0).abs() < 1e-3,
             "weights and runtime only: {}",
             mem.value
+        );
+    }
+
+    /// The 2026-09-27 soak's cool-down: the load stopped, nothing decoded any more, and the
+    /// window's last p95 (1.95 × baseline) stayed on `step_time_drift` for five minutes, above
+    /// ORANGE's exit threshold (2.0 × 0.95), so the state never left ORANGE. Catches: drift
+    /// judged from a window of finished work while no sequence runs.
+    #[test]
+    fn drift_is_not_judged_while_idle() {
+        let (mut c, h, clock) = controller(true);
+        let busy = |p95: f64| EngineStats {
+            running_remaining_tokens: vec![100; 4],
+            block_tokens: 16,
+            free_kv_blocks: 1000,
+            step_time_p95_s: Some(p95),
+            ..EngineStats::default()
+        };
+        let mut run = |secs: u64, stats: &EngineStats| {
+            for _ in 0..secs * 10 {
+                clock.advance(Duration::from_millis(100));
+                c.tick(&sample(0.1, 0.0), stats);
+            }
+        };
+        run(5, &busy(0.02));
+        assert_eq!(h.state(), PressureState::Green);
+        run(2, &busy(0.039));
+        assert_eq!(h.state(), PressureState::Yellow, "1.95 × baseline is drift");
+        let idle = EngineStats {
+            running_remaining_tokens: Vec::new(),
+            ..busy(0.039)
+        };
+        run(15, &idle);
+        assert_eq!(h.state(), PressureState::Green);
+        assert!(
+            h.document()
+                .signals
+                .iter()
+                .all(|s| s.signal != PressureSignal::StepTimeDrift),
+            "no drift signal while nothing runs"
         );
     }
 
