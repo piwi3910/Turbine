@@ -235,6 +235,9 @@ spec:
             - name: models
               mountPath: /models
               readOnly: true
+            # The Phase 4 NVMe KV tier (kv.nvme.path of scripts/lab/phase4-novanas.yaml).
+            - name: turbine-kv
+              mountPath: /home/piwi/turbine-kv
       volumes:
         - name: turbine-ci
           hostPath:
@@ -268,3 +271,7 @@ spec:
           hostPath:
             path: /home/piwi/turbine-models
             type: Directory
+        - name: turbine-kv
+          hostPath:
+            path: /home/piwi/turbine-kv
+            type: DirectoryOrCreate

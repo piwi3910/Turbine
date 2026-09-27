@@ -485,6 +485,7 @@ fn default_block_tokens_is_128() {
         "scripts/lab/phase2-novanas-olmoe.yaml",
         "scripts/lab/phase2c-novanas-llama.yaml",
         "scripts/lab/phase2c-novanas-olmoe.yaml",
+        "scripts/lab/phase4-novanas.yaml",
     ] {
         let c = load(&root.join(file), &[]).unwrap_or_else(|e| panic!("{file}: {e}"));
         assert_eq!(c.kv.block_tokens, 128, "{file}");
