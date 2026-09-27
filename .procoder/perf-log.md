@@ -119,3 +119,13 @@ Multi-turn (S-16), 1c4f92e code, Llama, native server on GPU 0 with `scripts/lab
 Criterion: ratio ≥ 0.6 and later-turn TTFT ≤ 0.5× off — met (0.906; 0.19×). Pinned L1 round trip (`turbine-kernels --test lab pinned_round_trip`, GPU 0, PCIe Gen5 x8 after the runtime-PM fix): d2h 8.34 GB/s, h2d 9.73 GB/s (Gen1: 1.65 / 1.57).
 
 Full GPU suite on the merge candidate (GPU 1): 395 passed / 0 failed before the old 90-minute Job deadline cut `serving_mix` short (run 0927065245), then the unfinished packages (`turbine-model` onward) 322 passed / 0 failed (run 0927153552, 3-hour deadline, log kept under `target/lab-test/`).
+
+## Pre-Phase-5: OLMoE c16 flip and perf items
+
+Novanas GPU 0, `scripts/lab-bench.sh --golden16` (decode_fwd_ms from 6bfb0c8 on counts the throughput run only); every row is also in labbook (set `olmoe-c16-flip`, later `pre-phase5-perf`).
+
+| Date       | Commit  | Change                                                                       | Host tests | GPU suites                        | OLMoE tok/s | OLMoE ITL p50 ms | OLMoE TTFT p50 ms | Golden OLMoE c1/c16 | vs previous                            |
+| ---------- | ------- | ---------------------------------------------------------------------------- | ---------- | --------------------------------- | ----------- | ---------------- | ----------------- | ------------------- | -------------------------------------- |
+| 2026-09-27 | 1c4f92e | baseline: Phase 4 merge candidate                                            | 544/0      | –                                 | 614.6       | 24.0             | 135               | pass/pass           | –                                      |
+| 2026-09-27 | 59a4e3c | flip root cause 1: small-m MoE tier on the grouped WMMA chain (16-row tiles) | 493/0      | batch_invariance, hip_ops, golden | 528.2       | 28.4             | 135               | pass (15/16)/pass   | **−14.1 %: rejected**                  |
+| 2026-09-27 | db26940 | + WMMA decode kernels for the small-m tier (same accumulation order)         | 544/0      | batch_invariance, hip_ops, golden | 600.9       | 24.7             | 136               | pass/pass           | −2.2 % (within 3 %): landed as e22c375 |
