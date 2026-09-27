@@ -24,7 +24,7 @@ set -uo pipefail
 host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
 gpu=0
 model=llama
-label="$(git rev-parse --short HEAD)"
+label="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 run_tests=0
 run_golden16=0
 quick=0
@@ -94,13 +94,15 @@ esac
 requests=200
 [[ $quick -eq 1 ]] && requests=64
 
-root="$(git rev-parse --show-toplevel)"
+# Path-based, like lab-test.sh/lab-serve.sh's REPO_ROOT: matches this checkout even when it has
+# no .git (e.g. run from a remote-cargo.sh-synced tree, which excludes .git).
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root" || exit 1
 name="$(basename "$root")"
 remote="/home/piwi/turbine-ci/remote/$name"
 out="$root/target/lab-bench/$label-$model"
 mkdir -p "$out"
-commit="$(git rev-parse --short HEAD)"
+commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 url=http://192.168.10.203:18000
 
 # 1. build (server + kernels) on novanas, tests alongside only with --with-tests

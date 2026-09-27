@@ -1316,11 +1316,16 @@ fn lab_bench_usage_errors_exit_2_without_contacting_a_host() {
     );
 }
 
-/// The new flags parse and reach the host-contacting build step (recorded by the stubbed rsync
-/// inside scripts/remote-cargo.sh) rather than being rejected as usage errors; --gpu 0 (the
-/// default, spelled out) and every combination of the new flags all get that far.
+/// The new flags parse (they are not rejected the way an unknown flag or a bad --gpu/--model is
+/// in the test above) for --gpu 0 (the default, spelled out) and every combination of them.
+/// lab-bench.sh has no --dry-run and reaches for the host immediately after parsing, so this
+/// only checks that parsing succeeded (no "usage:" on stderr), not what happens next: what it
+/// reaches for after that (scripts/remote-cargo.sh, which resolves this checkout through `git`)
+/// is exercised for real by a human running it, not safe to assert on here since this same test
+/// binary also runs from a host-synced tree that excludes .git (scripts/remote-cargo.sh, every
+/// lab-*.sh upload).
 #[test]
-fn lab_bench_new_flags_parse_and_reach_the_build_step() {
+fn lab_bench_new_flags_are_not_usage_errors() {
     for (tag, args) in [
         ("flags-default", &["--gpu", "0"][..]),
         ("flags-with-tests", &["--with-tests"][..]),
@@ -1332,10 +1337,10 @@ fn lab_bench_new_flags_parse_and_reach_the_build_step() {
             &["--gpu", "0", "--with-tests", "--golden16", "--quick"][..],
         ),
     ] {
-        let (out, called) = lab_script("lab-bench.sh", tag, args);
+        let (out, _) = lab_script("lab-bench.sh", tag, args);
         assert!(
-            called.is_some(),
-            "{tag}: never reached the host (stayed a usage error?): {}",
+            !stderr(&out).contains("usage:"),
+            "{tag}: rejected as a usage error: {}",
             stderr(&out)
         );
     }
