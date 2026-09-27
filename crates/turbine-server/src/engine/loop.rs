@@ -80,7 +80,7 @@ use turbine_model::{ForwardPhase, ModelError, SampleJob, SampledToken, Tokenizer
 use turbine_reliability::circuit::{CircuitEvent, CircuitReason};
 use turbine_reliability::controller::{EngineStats, Snapshot};
 use turbine_reliability::recovery::RecoveryStep;
-use turbine_reliability::step_window::DecodeStepWindow;
+use turbine_reliability::step_window::{DecodeStepWindow, StepSample};
 use turbine_scheduler::{
     BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome, IterationPlan,
     SchedRequest, Scheduler, SubmitError,
@@ -518,7 +518,18 @@ impl EngineLoop {
         self.iterations += 1;
         let prefill = plan.prefill_tokens();
         let decodes = plan.decode_tokens();
-        self.decode_steps.observe(prefill, decodes, secs);
+        let calm = self.snap.state == PressureState::Green
+            && self.snap.circuit == CircuitState::Healthy
+            && self.probe.is_none();
+        self.decode_steps.observe(
+            StepSample {
+                prefill_tokens: prefill,
+                rows: decodes,
+                context_tokens: plan.decode_context_tokens(),
+                secs,
+            },
+            calm,
+        );
         if decodes > 0 {
             self.decode_step_s = if self.decode_step_s > 0.0 {
                 STEP_ALPHA * secs + (1.0 - STEP_ALPHA) * self.decode_step_s
@@ -559,7 +570,7 @@ impl EngineLoop {
             } else {
                 0.0
             },
-            step_time_p95_s: p95,
+            step_time_p95: p95,
             queue_len: self
                 .sched
                 .gate()

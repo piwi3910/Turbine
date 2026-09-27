@@ -401,6 +401,25 @@ Depends on: Tasks 10, 12, 12a, 12b, 14; decision "Phase 3: soak stall — drift 
 - [ ] Commit: `fix(reliability): drift per decode iteration, none while idle; admission floor when nothing is admitted`
 - [ ] Soak config (decision "Phase 3: soak config max_batch_tokens"): `scripts/lab/phase3-novanas-soak.yaml` `scheduler.max_batch_tokens: 2048` (the Phase 2c value its header names); commit `fix(scripts): soak config uses the Phase 2c max_batch_tokens`.
 
+## Task 12d: Drift relative to the work of the step (amendment 2026-09-27)
+
+Files: `crates/turbine-reliability/src/{step_window.rs, controller.rs}`, `crates/turbine-scheduler/src/{scheduler.rs, sim/overload.rs}`, `crates/turbine-server/src/engine/loop.rs`
+Interfaces:
+
+- `pub struct step_window::StepSample { prefill_tokens: u32, rows: u32, context_tokens: u64, secs: f64 }`; `DecodeStepWindow::observe(&mut self, StepSample, calm: bool)`; `pub const MIN_CALM_STEPS: u32 = 32`
+- `EngineStats.step_time_p95` (was `step_time_p95_s`): p95 of step time relative to the cost model; `pub fn IterationPlan::decode_context_tokens(&self) -> u64`
+
+Covers: S-6 (`step_time_drift`), S-12 (latency drift), S-19; `step_window::tests::long_context_full_batch_is_not_drift`, `batch_size_is_not_drift`, `unidentified_coefficients_stay_sane`.
+Depends on: Task 12c; decision "Phase 3: soak config max_batch_tokens" (answer: option 1, provisional).
+
+- [ ] Write failing test `step_window::tests::long_context_full_batch_is_not_drift`: a window calibrated on up to 4 rows of up to 7,000 tokens (a memory-bound step: 11 ms + 0.2 ms/row + 0.19 ms per 1,024 context tokens) reads a healthy 23-row, 92,000-token step (raw time > 2 × calibration) below 1.1, and the same step at twice the time above 1.9.
+- [ ] Run: `cargo test -p turbine-reliability step_window` — expect FAIL.
+- [ ] Implement the cost model in `DecodeStepWindow` (features `1, rows, context/1024`; exponentially weighted least squares, decay 0.998, learning only on calm steps; ridge 1e-3 on rows and context; negative coefficients refitted at 0; prediction floored at a quarter of the mean calm step); the engine and the simulator pass the rows, `decode_context_tokens()` and `calm` (GREEN + HEALTHY, no probe).
+- [ ] Run: `cargo test --release -p turbine-reliability -p turbine-scheduler` and the sweep — expect PASS; mutation check: without the context feature both window tests fail.
+- [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus the `fault-injection` feature)
+- [ ] Run: `scripts/bench-lock.sh scripts/overload-soak.sh novanas` — expect exit 0 and `"pass": true`.
+- [ ] Commit: `fix(reliability): step-time drift relative to the work of the step`
+
 ## Task 13: Pressure route, readiness, admission errors and metrics in turbine-api
 
 Files: `crates/turbine-api/src/routes/diagnostics.rs` (pressure route 200, status fields), `crates/turbine-api/src/routes/health.rs` (`circuit_open` readiness), `crates/turbine-api/src/error.rs` (overload `ApiError` constructors, `Retry-After`), `crates/turbine-api/src/backend.rs` (`NotReadyReason::CircuitOpen`, `readiness_for_circuit`), `crates/turbine-api/Cargo.toml` (dev-deps `turbine-reliability`, `turbine-device`), `crates/turbine-api/tests/api.rs` (four tests)

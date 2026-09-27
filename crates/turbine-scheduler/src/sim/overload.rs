@@ -33,7 +33,7 @@ use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_reliability::recovery::{RecoveryController, RecoveryOutcome, RecoveryStep};
 use turbine_reliability::reserve::{EmergencyReserve, ReserveAllocator};
 use turbine_reliability::signals::effective_thresholds;
-use turbine_reliability::step_window::DecodeStepWindow;
+use turbine_reliability::step_window::{DecodeStepWindow, StepSample};
 use turbine_reliability::throttle::SchedulerLimits;
 use turbine_tensor::DeviceMemory;
 use turbine_tensor::host::HostMemory;
@@ -812,12 +812,19 @@ impl OverloadSim {
             return;
         }
         let secs = duration.as_secs_f64();
-        self.decode_steps
-            .observe(plan.prefill_tokens(), plan.decode_tokens(), secs);
         self.decode_step_s = STEP_ALPHA * secs + (1.0 - STEP_ALPHA) * self.decode_step_s;
         let calm = self.handle.state() == PressureState::Green
             && self.handle.circuit() == CircuitState::Healthy
             && self.probe.is_none();
+        self.decode_steps.observe(
+            StepSample {
+                prefill_tokens: plan.prefill_tokens(),
+                rows: plan.decode_tokens(),
+                context_tokens: plan.decode_context_tokens(),
+                secs,
+            },
+            calm,
+        );
         if calm {
             self.baseline_step_s = Some(
                 self.baseline_step_s
@@ -874,7 +881,7 @@ impl OverloadSim {
                 free_kv_blocks: self.pool.free_blocks(),
                 block_tokens: self.cfg.params.block_tokens,
                 decode_tokens_per_s: 1.0 / self.decode_step_s.max(1e-9),
-                step_time_p95_s: self.decode_steps.p95(),
+                step_time_p95: self.decode_steps.p95(),
                 queue_len: self.gate_len() as u32,
                 iterations: self.iterations,
             };
