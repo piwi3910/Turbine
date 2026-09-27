@@ -526,3 +526,11 @@ Landing the soak fixes (branch `phase-3-reliability-land`, d6d5e1d), the coordin
 - C) Divide by the batch again (the calibration's shrinking batches then read as drift)
 
 **Answer (2026-09-27): provisional (coordinator default, pending user review) — A.** The idle rule, the admission floor and option 2 stay. Spec signal table, plan Task 12e, contract §8.3 note; tests `step_window::tests::moe_full_batch_is_not_drift`, `same_bucket_slowdown_is_drift`, `unseen_shapes_and_prefills_are_not_judged`, `context_buckets`.
+
+## Shorter test cycles
+
+- Tiered: affected-crate gate with nextest (full workspace only at phase end / before merge); GPU suite split into `quick` (ops, tiny_model, golden) and `perf` (serving_mix, forward_profile, decode_forward_timing); lab-bench without its duplicate host-test run, golden c16 opt-in, `--quick` 64-request bench; soaks only at phase exit (recommended)
+- The above plus both models benched in parallel (Llama GPU 0, OLMoE GPU 1) — needs GPU 1's PCIe/ASPM fix first
+- Only drop the duplicate host-test run from lab-bench
+
+**Answer (2026-09-27):** tiered tests — affected-crate gate with nextest (full workspace at phase end / before merge); GPU suite split into `quick` and `perf` tiers; lab-bench without its duplicate host tests, golden c16 opt-in, `--quick` 64-request mode; soaks only at phase exit.
