@@ -27,6 +27,10 @@ pub fn card_profiles() -> &'static [&'static str] {
 pub static SCHEDULING_POLICIES: LazyLock<Vec<&'static str>> =
     LazyLock::new(|| turbine_scheduler::policy::registry().names());
 
+/// Eviction policies (`eviction_policy`): the names of `turbine_kv::policy::registry`.
+pub static EVICTION_POLICIES: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| turbine_kv::policy::registry().names());
+
 /// The registered module names, per configuration key, for `Config::validate_modules`.
 pub fn known_module_names() -> ModuleNames<'static> {
     ModuleNames {
@@ -34,6 +38,7 @@ pub fn known_module_names() -> ModuleNames<'static> {
         backends: backends(),
         card_profiles: card_profiles(),
         scheduling_policies: &SCHEDULING_POLICIES,
+        eviction_policies: &EVICTION_POLICIES,
     }
 }
 
@@ -88,6 +93,7 @@ mod tests {
             known.backends,
             known.card_profiles,
             known.scheduling_policies,
+            known.eviction_policies,
         ] {
             assert!(!names.is_empty());
             for name in names {
@@ -95,5 +101,6 @@ mod tests {
             }
         }
         assert!(known.scheduling_policies.contains(&"default"));
+        assert!(known.eviction_policies.contains(&"cost_aware"));
     }
 }

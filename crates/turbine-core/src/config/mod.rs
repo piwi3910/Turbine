@@ -16,8 +16,8 @@ use serde_norway::{Mapping, Value};
 pub use byte_size::ByteSize;
 pub use duration::HumanDuration;
 pub use kv::{
-    HostFacts, KV_IO_ALIGN, KvConfig, KvCpuConfig, KvGpuConfig, KvNvmeConfig, KvPolicyKind,
-    KvPolicyWeights, KvPrefetchConfig, KvSessionConfig, KvTransferConfig,
+    HostFacts, KV_IO_ALIGN, KvConfig, KvCpuConfig, KvGpuConfig, KvNvmeConfig, KvPolicyWeights,
+    KvPrefetchConfig, KvSessionConfig, KvTransferConfig,
 };
 pub use reliability::*;
 
@@ -83,7 +83,7 @@ impl ModuleName {
     }
 
     /// A default name written in this file; always well-formed.
-    fn fixed(s: &'static str) -> ModuleName {
+    pub(crate) fn fixed(s: &'static str) -> ModuleName {
         debug_assert!(valid_name(s), "{s}");
         ModuleName(s.to_string())
     }
@@ -120,6 +120,8 @@ pub struct ModuleNames<'a> {
     pub card_profiles: &'a [&'a str],
     /// `scheduler.policy`.
     pub scheduling_policies: &'a [&'a str],
+    /// `kv.policy` (Phase 4).
+    pub eviction_policies: &'a [&'a str],
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -501,7 +503,8 @@ impl Config {
             &self.scheduler.policy,
             known.scheduling_policies,
             None,
-        )
+        )?;
+        check("kv.policy", &self.kv.policy, known.eviction_policies, None)
     }
 
     /// Running-request bound actually applied: `scheduler.continuous_batching: false` forces 1.

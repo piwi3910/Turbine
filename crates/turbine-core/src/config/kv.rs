@@ -5,28 +5,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ByteSize, ConfigError, HumanDuration, invalid};
+use super::{ByteSize, ConfigError, HumanDuration, ModuleName, invalid};
 
 /// L2 slots and slab-file headers are aligned to this many bytes (P4 §Data).
 pub const KV_IO_ALIGN: u64 = 4096;
-
-/// `kv.policy`: the eviction policy. Serialized as `"cost_aware"` / `"lru"`.
-#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum KvPolicyKind {
-    CostAware,
-    Lru,
-}
-
-impl KvPolicyKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            KvPolicyKind::CostAware => "cost_aware",
-            KvPolicyKind::Lru => "lru",
-        }
-    }
-}
 
 /// Facts about the host that some `kv` rules need (contract §3.2); `None` skips the rule.
 #[derive(Clone, Copy, Debug, Default)]
@@ -44,7 +26,9 @@ pub struct KvConfig {
     pub gpu: KvGpuConfig,
     pub cpu: KvCpuConfig,
     pub nvme: KvNvmeConfig,
-    pub policy: KvPolicyKind,
+    /// Eviction policy (Phase 4; an `eviction_policy` registry name, validated with the other
+    /// module keys by `Config::validate_modules`).
+    pub policy: ModuleName,
     /// Blocks scoring below this are dropped instead of demoted.
     pub demote_min_value: f64,
     /// `false`: no prefix lookup and no reuse (A/B switch).
@@ -62,7 +46,7 @@ impl Default for KvConfig {
             gpu: KvGpuConfig::default(),
             cpu: KvCpuConfig::default(),
             nvme: KvNvmeConfig::default(),
-            policy: KvPolicyKind::CostAware,
+            policy: ModuleName::fixed("cost_aware"),
             demote_min_value: 0.0,
             prefix_sharing: true,
             transfer: KvTransferConfig::default(),

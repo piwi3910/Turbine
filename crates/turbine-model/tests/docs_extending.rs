@@ -10,8 +10,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// The eight extension points, one page each.
-const PAGES: [&str; 8] = [
+/// The nine extension points, one page each.
+const PAGES: [&str; 9] = [
     "model-family",
     "tool-format",
     "weight-format",
@@ -20,6 +20,7 @@ const PAGES: [&str; 8] = [
     "backend",
     "logits-processor",
     "scheduling-policy",
+    "eviction-policy",
 ];
 
 const SECTIONS: [&str; 4] = [

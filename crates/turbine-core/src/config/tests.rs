@@ -564,6 +564,7 @@ fn task1_modules() -> ModuleNames<'static> {
         backends: &["cpu", "hip"],
         card_profiles: &["gfx1201"],
         scheduling_policies: &["default"],
+        eviction_policies: &["cost_aware", "lru"],
     }
 }
 
@@ -579,6 +580,7 @@ fn validate_modules_names_registries() {
         ),
         ("execution.backend=cuda", "execution.backend", "cpu, hip"),
         ("scheduler.policy=fifo", "scheduler.policy", "default"),
+        ("kv.policy=lfu", "kv.policy", "cost_aware, lru"),
         (
             "execution.card_profile=gfx942",
             "execution.card_profile",
@@ -784,7 +786,6 @@ fn kv_config_validation() {
     assert_eq!(d.nvme.max_bytes, ByteSize::gib(64));
     assert_eq!(d.nvme.slab_bytes, ByteSize::gib(1));
     assert_eq!((d.nvme.max_queue_depth, d.nvme.io_threads), (64, 4));
-    assert_eq!(d.policy, KvPolicyKind::CostAware);
     assert_eq!(d.policy.as_str(), "cost_aware");
     assert_eq!(d.demote_min_value, 0.0);
     assert!(d.prefix_sharing);
@@ -800,10 +801,15 @@ fn kv_config_validation() {
 
     let base = "model:\n  path: /m\n";
     let lru = parse(&format!("{base}kv:\n  policy: lru\n"), &[]).expect("lru is valid");
-    assert_eq!(lru.kv.policy, KvPolicyKind::Lru);
+    assert_eq!(lru.kv.policy.as_str(), "lru");
+    // kv.policy names an `eviction_policy` registry module: an unregistered name is refused
+    // naming the key by Config::validate_modules (before any port is bound).
+    let lfu = parse(&format!("{base}kv:\n  policy: lfu\n"), &[]).expect("well-formed name");
+    let err = lfu.validate_modules(&task1_modules()).unwrap_err();
+    assert_eq!(err.key(), Some("kv.policy"), "{err}");
     for (yaml, key) in [
         ("kv:\n  gpu:\n    enabled: false\n", "kv.gpu.enabled"),
-        ("kv:\n  policy: lfu\n", "kv.policy"),
+        ("kv:\n  policy: LFU\n", "kv.policy"),
         ("kv:\n  nvme:\n    max_bytes: 0\n", "kv.nvme.max_bytes"),
         (
             "kv:\n  session:\n    hot_ttl: 60s\n    warm_ttl: 30s\n",

@@ -526,3 +526,12 @@ Landing the soak fixes (branch `phase-3-reliability-land`, d6d5e1d), the coordin
 - C) Divide by the batch again (the calibration's shrinking batches then read as drift)
 
 **Answer (2026-09-27): provisional (coordinator default, pending user review) — A.** The idle rule, the admission floor and option 2 stay. Spec signal table, plan Task 12e, contract §8.3 note; tests `step_window::tests::moe_full_batch_is_not_drift`, `same_bucket_slowdown_is_drift`, `unseen_shapes_and_prefills_are_not_judged`, `context_buckets`.
+
+## Phase 4: eviction policy as a registered extension point
+
+The Phase 4 plan (written before Phase 2m) made `kv.policy` a closed enum `cost_aware | lru` matched in `make_policy`; the pluggability rule (decision 2026-09-26) asks for a trait, one file per implementation and a static registry.
+
+- A) `EvictionPolicy: Module` with `cost_aware.rs` and `lru.rs` under `turbine_kv::policy`, a `static` registry (point `eviction_policy`), a conformance suite run by `registry_conformance`, `kv.policy` a `ModuleName` validated by `Config::validate_modules` (exit 2 naming the registered ones) and a `docs/extending/eviction-policy.md` page; weights (`kv.policy_weights`) are passed to `score` so policies stay stateless statics (recommended)
+- B) Keep the closed enum and add the registry later
+
+**Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Contract §11/§24, spec S-7 and the configuration table, and plan Task 6 amended. KV tiers stay a fixed set (L0/L1/L2 are the spec's physical tiers, each with its own sizing keys and transfer paths), so they are not a registry point in Phase 4.
