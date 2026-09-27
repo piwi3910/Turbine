@@ -2314,6 +2314,9 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "turbine-core",
+ "turbine-kv",
+ "turbine-tensor",
+ "uuid",
 ]
 
 [[package]]

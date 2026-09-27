@@ -24,8 +24,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-# HumanDuration: --duration uses the configuration duration grammar (CONFLICT C-14).
+# HumanDuration: --duration uses the configuration duration grammar (CONFLICT C-14);
+# kv-sim (P4): the real KV hierarchy on virtual time; deterministic request ids
 turbine-core.workspace = true
+turbine-kv.workspace = true
+turbine-tensor.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

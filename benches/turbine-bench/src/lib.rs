@@ -3,6 +3,7 @@
 pub mod args;
 pub mod client;
 pub mod golden;
+pub mod kv_sim;
 pub mod open_loop;
 pub mod prompt;
 pub mod report;
