@@ -243,6 +243,8 @@ Interfaces:
 
 ## Task 12: hipBLASLt autotuning per GEMM shape
 
+> Amendment (2026-09-27): never built as written. Superseded by pre-Phase-5 item #1, an offline per-card tuned GEMM table (`kernels/rocm/tuning/<arch>/gemm.tsv`, `turbine_gemm_tune`, `hip_ops gemm_table_matches_cpu`); `TURBINE_OPTION_GEMM_AUTOTUNE` / `execution.gemm_autotune` switch the table. See decisions.md "Pre-Phase-5 #1" and spec S-8's amendment.
+
 Files: `kernels/rocm/src/gemm.cpp` (tuning on first use, tuned-choice cache ≤ 4,096 entries, one `gemm_tuned` stderr line per shape), `kernels/rocm/src/context.cpp` (`turbine_ctx_set_option` / `turbine_ctx_get_option` for `TURBINE_OPTION_GEMM_AUTOTUNE` and `TURBINE_OPTION_GEMM_TUNED_SHAPES`), `crates/turbine-server/src/startup.rs` (after context creation: `ShimContext::set_option(TURBINE_OPTION_GEMM_AUTOTUNE, execution.gemm_autotune as i64)`, an `Unsupported` answer logged once at INFO), `crates/turbine-kernels/tests/hip_ops.rs` (`gemm_autotune_matches_cpu`)
 Interfaces:
 

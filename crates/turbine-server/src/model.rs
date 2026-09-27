@@ -20,7 +20,10 @@ use turbine_device::telemetry::read_host;
 use turbine_kernels::backends::{
     self, BackendNote, BackendRequest, ExecutionBackend, OpenedBackend,
 };
-use turbine_kernels::{KernelError, KernelMetrics, KernelProvider, KernelRegistry, ShimContext};
+use turbine_kernels::{
+    KernelError, KernelMetrics, KernelProvider, KernelRegistry, ShimContext,
+    TURBINE_OPTION_GEMM_AUTOTUNE,
+};
 use turbine_kv::metrics::log_pool_startup;
 use turbine_kv::{BlockPool, BlockPoolConfig};
 use turbine_model::executor::{
@@ -178,7 +181,33 @@ pub fn load_provider(
             card_profile: exec.card_profile.as_str(),
         })
         .map_err(|e| StartupError::new(e.to_string()))?;
+    if let Some(ctx) = &opened.context {
+        apply_gemm_autotune(ctx, exec.gemm_autotune);
+    }
     Ok(Provider { backend, opened })
+}
+
+/// `execution.gemm_autotune` → the kernel library's `TURBINE_OPTION_GEMM_AUTOTUNE` (the tuned
+/// GEMM table on or off), before any GEMM runs. A library without context options keeps its own
+/// choice: logged, not fatal.
+fn apply_gemm_autotune(ctx: &ShimContext, on: bool) {
+    match ctx.set_option(TURBINE_OPTION_GEMM_AUTOTUNE, i64::from(on)) {
+        Ok(()) => tracing::info!(
+            event = "gemm_tuning",
+            tuned_table = on,
+            "execution.gemm_autotune: {}",
+            if on {
+                "GEMM shapes the kernel library's tuned table covers run its pinned algorithms"
+            } else {
+                "every GEMM runs the first heuristic answer"
+            }
+        ),
+        Err(e) => tracing::info!(
+            event = "gemm_tuning_unavailable",
+            reason = %e,
+            "execution.gemm_autotune ignored: the kernel library has no context options"
+        ),
+    }
 }
 
 /// Everything resolved before the listener binds: the model is known to be loadable and to fit.

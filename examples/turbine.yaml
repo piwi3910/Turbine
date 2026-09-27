@@ -117,8 +117,9 @@ execution:
   # path.
   kernel_library: null
   # Phase 2c switches: each defaults to the optimised path; false restores the Phase 2 one.
-  # Time the GEMM algorithm candidates per shape at first use and keep the fastest (false: the
-  # first heuristic answer, stable across restarts). Ignored by the cpu backend.
+  # Run each GEMM shape on the algorithm the kernel library's tuned table pins for the card
+  # (kernels/rocm/tuning/<arch>/gemm.tsv, measured offline; restart-stable). false: hipBLASLt's
+  # first heuristic answer for every shape. Ignored by the cpu backend.
   gemm_autotune: true
   # Capture decode-only iterations into a graph per batch size and replay them. Ignored when the
   # kernel library lacks the graph functions.

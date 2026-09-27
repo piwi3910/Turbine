@@ -300,7 +300,9 @@ pub struct ExecutionConfig {
     pub card_profile: ModuleName,
     /// Explicit kernel shim path; null → TURBINE_KERNEL_LIBRARY, beside the executable, loader path.
     pub kernel_library: Option<PathBuf>,
-    /// Tune the GEMM algorithm per shape at first use (false: the first heuristic answer).
+    /// Run each GEMM shape on the algorithm the kernel library's tuned table for the card pins
+    /// (measured offline by the GEMM tuner); false: the first heuristic answer for every shape.
+    /// Shapes the table lacks always take the heuristic answer.
     pub gemm_autotune: bool,
     /// Capture decode-only iterations into graphs and replay them (false: always eager).
     pub decode_graphs: bool,
