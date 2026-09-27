@@ -399,6 +399,7 @@ Depends on: Tasks 10, 12, 12a, 12b, 14; decision "Phase 3: soak stall — drift 
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings (plus the `fault-injection` feature)
 - [ ] Run: `scripts/bench-lock.sh scripts/overload-soak.sh novanas` — expect exit 0 and `"pass": true`.
 - [ ] Commit: `fix(reliability): drift per decode iteration, none while idle; admission floor when nothing is admitted`
+- [ ] Soak config (decision "Phase 3: soak config max_batch_tokens"): `scripts/lab/phase3-novanas-soak.yaml` `scheduler.max_batch_tokens: 2048` (the Phase 2c value its header names); commit `fix(scripts): soak config uses the Phase 2c max_batch_tokens`.
 
 ## Task 13: Pressure route, readiness, admission errors and metrics in turbine-api
 

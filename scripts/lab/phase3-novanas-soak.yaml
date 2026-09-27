@@ -15,7 +15,11 @@ kv:
   block_tokens: 128
 scheduler:
   max_running_requests: 64
-  max_batch_tokens: 8192
+  # The Phase 2c value: an iteration carries at most one 2,048-token prefill chunk, so the
+  # overload's ITL is judged against calibration with the same per-iteration prefill bound
+  # (8,192 let four chunks join every overload iteration: ITL p50 163 ms, p99 545 ms against
+  # 185 ms in calibration; decision "Phase 3: soak config max_batch_tokens", 2026-09-27).
+  max_batch_tokens: 2048
   prefill_chunk_tokens: 2048
   max_queued_requests: 1024
 reliability:
