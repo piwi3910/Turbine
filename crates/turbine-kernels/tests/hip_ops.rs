@@ -3118,6 +3118,116 @@ fn column_block<'a>(
     }
 }
 
+/// Lab microbenchmark (no assertion on speed; perf item #3): every enumerated implementation of
+/// `attention_decode_paged` (append + attend), bound through `turbine_impl_run` as the kernel
+/// registry binds it, for both served models' heads (Llama 24/8, OLMoE 16/16) at 128-token pages:
+/// batches 1, 16 and 64 at a ~768-token context and batch 16 at ~2,048 and ~8,192. The KV pool is
+/// cycled through enough copies (≥ 512 MB) that it never stays in the 64 MB L2/MALL, as in a
+/// served step where every layer has its own pool (the single pool of `decode_op_timings` fits the
+/// cache at batch 16 and reads faster than served). Wall time per call, host launches included.
+/// Prints `decode_attention` lines with the achieved KV bandwidth. Run natively on GPU 0 with
+/// `cargo test --release -p turbine-kernels --test hip_ops -- --ignored decode_attention_timings --nocapture`.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn decode_attention_timings() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(11);
+    const ITERS: u32 = 50;
+    const BLOCK_TOKENS: usize = 128;
+    let cases: [(usize, usize); 5] = [(1, 768), (16, 768), (64, 768), (16, 2048), (16, 8192)];
+    for model in BENCH_MODELS {
+        let cfg = model.attention_cfg(BLOCK_TOKENS);
+        let spec = OpConfig::Attention(cfg);
+        let impls: Vec<ImplInfo> = p
+            .hip
+            .implementations(OpKind::AttentionDecodePaged)
+            .into_iter()
+            .filter(|i| p.hip.implementation_supports(&spec, i.index, None))
+            .collect();
+        let max_m = cases.iter().map(|&(m, _)| m).max().unwrap_or(1);
+        let q = on_hip(
+            &p,
+            &[max_m, model.q_heads, HEAD_DIM],
+            DType::BF16,
+            &rng.normal(max_m * model.q_rows(), 1.0),
+        );
+        let kv_new = on_hip(
+            &p,
+            &[max_m, model.kv_heads, HEAD_DIM],
+            DType::BF16,
+            &rng.normal(max_m * model.kv_rows(), 1.0),
+        );
+        let out = zeros_on_hip(&p, &[max_m, model.q_heads, HEAD_DIM], DType::BF16);
+        for &(m, ctx) in &cases {
+            let kv_lens = bench_kv_lens(m, ctx);
+            let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
+            let max_blocks = max_kv.div_ceil(BLOCK_TOKENS);
+            let num_blocks = m * max_blocks;
+            let pool_elems = num_blocks * 2 * BLOCK_TOKENS * model.kv_rows();
+            let copies = (512usize << 20).div_ceil(pool_elems * 2).max(1);
+            let raw = encode(DType::BF16, &pattern(&mut rng, pool_elems, 1.0));
+            let pools: Vec<Tensor> = (0..copies)
+                .map(|_| {
+                    raw_on_hip(
+                        &p,
+                        &[num_blocks, 2, BLOCK_TOKENS, model.kv_heads, HEAD_DIM],
+                        DType::BF16,
+                        &raw,
+                    )
+                })
+                .collect();
+            let table: Vec<f32> = shuffled(&mut rng, num_blocks)
+                .iter()
+                .map(|&b| b as f32)
+                .collect();
+            let bt = on_hip(&p, &[m, max_blocks], DType::I32, &table);
+            let indptr: Vec<f32> = (0..=m).map(|i| i as f32).collect();
+            let ip = on_hip(&p, &[m + 1], DType::I32, &indptr);
+            let lens: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
+            let kl = on_hip(&p, &[m], DType::I32, &lens);
+            // K and V bytes the attention reads (the appended token included).
+            let kv_bytes = kv_lens.iter().sum::<usize>() * model.kv_rows() * 2 * 2;
+            for info in &impls {
+                let b = bound(&p, &spec, info.index);
+                let attn = b.hip.attention().expect("hip attention");
+                let mut next = 0usize;
+                let us = time_us(&b, ITERS, || {
+                    next = (next + 1) % copies;
+                    attn.execute_paged(&mut PagedAttentionContext {
+                        cfg,
+                        q: q.view().rows(0, m),
+                        k_new: kv_new.view().rows(0, m),
+                        v_new: kv_new.view().rows(0, m),
+                        out: out.view().rows(0, m),
+                        kv_layer: pools[next].view(),
+                        block_table: bt.view(),
+                        q_indptr: ip.view(),
+                        kv_lens: kl.view(),
+                        max_q_len: 1,
+                        max_kv_len: max_kv as u32,
+                        max_blocks_per_seq: max_blocks as u32,
+                        scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                    })
+                    .expect("paged decode attention");
+                });
+                println!(
+                    "decode_attention {} heads={}/{} impl={} b={m} kv~{ctx}: {us:.1} us \
+                     ({:.0} GB/s of KV)",
+                    model.name,
+                    model.q_heads,
+                    model.kv_heads,
+                    info.name,
+                    kv_bytes as f64 / us / 1e3,
+                );
+            }
+        }
+    }
+}
+
 /// Lab microbenchmark (no assertion on speed, P2c Task 10): Llama-3.2-3B's projections run
 /// fused (one `[q+2kv]` and one `[2·inter]` GEMM) against separate (one GEMM per projection over
 /// row views of the same fused weight, as the unfused executor runs them), and RoPE, paged
