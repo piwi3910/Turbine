@@ -4,31 +4,45 @@
 //   turbine_gemm_tune --shapes kernels/rocm/tuning/gemm_shapes.txt \
 //                     --out kernels/rocm/tuning/<arch>/gemm.tsv [--device 0]
 //
-// For every shape of the shapes file and every bucket (previous m, m] of its
-// m list, it builds the exact hipBLASLt problems libturbine_hip.so runs
-// (src/gemm_problem.hpp, dense leading dimensions) at the bucket's sample m
-// values (its bounds and middle), takes as candidates up to 256 heuristic
-// solutions at the top m plus each sample's own first answer, and keeps those
-// that
-//   - support every sample within the library's GEMM workspace,
-//   - agree with the heuristic's first answer (what the library runs without a
-//     table) to 1/64 of the output's largest magnitude, and
-//   - are deterministic: three runs give bitwise-identical outputs (solutions
-//     that split K with atomics would make a decode graph replay or a golden
-//     run irreproducible).
-// Each survivor is timed with its weights cycled through >= 512 MB of copies
-// (a forward never finds a layer's weights in the caches), BF16 random data;
-// the 8 fastest at the top m are re-timed at every sample in 5 interleaved
-// rounds, the heuristic's own per-m answer alongside. The candidate with the
-// least total of medians is pinned only when it beats the heuristic's total by
-// more than 2 %; otherwise the bucket's row says `heuristic` (index -1): the
-// library then asks hipBLASLt per call, as without a table. Consecutive
-// buckets of a shape with the same outcome are merged.
+// For every shape of the shapes file it pins, per m bucket, a hipBLASLt
+// solution such that a row's output never depends on how many rows share its
+// batch (batch invariance: the OLMoE c16 golden flip, decisions.md). It builds
+// the exact problems libturbine_hip.so runs (src/gemm_problem.hpp, dense
+// leading dimensions); candidates are the heuristic's solutions (up to 256) at
+// every bucket's top m of the shape's m list, each run the way the library runs
+// a pinned row: fresh from its solution index, through the hipBLASLt ext API
+// with split-K off (by default hipBLASLt splits K for small problems, which
+// makes a row's sums depend on m). They are kept when they
+//   - support every tested m within the library's GEMM workspace,
+//   - agree with the heuristic's first answer at the largest m to 1/64 of the
+//     output's largest magnitude,
+//   - are deterministic: three runs give bitwise-identical outputs, and
+//   - are row-invariant: a heavy-tailed target row's output bits alone (m = 1)
+//     equal its bits at positions 0, 1, 15, 16, 17, m/2 and m-1 of batches at
+//     every bucket's bounds and middle.
+// Invariant solutions giving the target row the same bits sum in the same
+// order: they form a class, and the buckets of a shape may use different
+// members of ONE class (e.g. a small tile for decode and a large one for
+// prefill) while every row keeps its bits at every m. Members are timed with
+// weights cycled through >= 512 MB of copies (a forward never finds a layer's
+// weights in the caches) and BF16 random data at every bucket's top m; the
+// class whose fastest member per bucket has the least weighted mean time
+// relative to the heuristic's own per-m answer is pinned (5 interleaved rounds
+// for the best 8 classes): --decode-weight (default 0.85, the decode share of
+// the served engine time) spread over the buckets up to m = 64, the rest over
+// the larger ones. A class more than --max-prefill-loss (default 0.05) slower
+// than the heuristic at a bucket of m 1,024 to 2,048 (the served mixed steps)
+// is not pinned, so pinning
+// never trades prefill time (TTFT) for decode time. The file records the cost
+// per bucket (`# cost` lines). A shape with no eligible invariant class gets a
+// `heuristic` row (index -1: not row-invariant) and is reported.
 //
 // Output rows: n, k, trans_b, c_dtype, m_max, solution_index, solution_name,
 // heuristic_us, tuned_us (tab-separated, `#` header lines name the device,
 // ROCm and hipBLASLt). Run it on an idle card: it needs the whole card for
 // stable timings (on novanas under scripts/bench-lock.sh, GPU 0).
+// TURBINE_TUNE_DEBUG=1 prints, per rejected candidate, the m and position where
+// the target row first changed and the first differing byte.
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt-ext.hpp>
 #include <hipblaslt/hipblaslt-version.h>
@@ -41,6 +55,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -55,9 +70,23 @@ using turbine_hip::GemmShape;
 
 constexpr size_t kWorkspaceBytes = 32u << 20; // = kGemmWorkspaceBytes
 constexpr size_t kCycleBytes = 512u << 20;
-constexpr int kRefine = 8;
+// Classes of identical numerics re-timed in the interleaved rounds.
+constexpr size_t kRefineClasses = 8;
 constexpr int kRounds = 5;
-constexpr double kMinGain = 0.02;
+// Largest m of a decode step (one row per sequence: max_seqs 64).
+constexpr int64_t kDecodeMaxM = 64;
+// --decode-weight default: the share of the served engine time spent in
+// decode-only steps at the benchmark workload (profile 2026-09-27: Llama 85 %,
+// OLMoE 91 %); the rest is spread over the larger (mixed and prefill) buckets.
+double g_decode_weight = 0.85;
+// Buckets from this m on are prefill-sized: a pinned class may be at most
+// --max-prefill-loss slower than the heuristic's answer there (default 5 %),
+// so pinning does not trade the prefill time (TTFT) for decode time.
+constexpr int64_t kPrefillGuardM = 1024;
+// ... up to this m: the mixed steps of the served configurations
+// (scheduler.max_batch_tokens 2,048); larger buckets are scored, not guarded.
+constexpr int64_t kPrefillGuardMaxM = 2048;
+double g_max_prefill_loss = 0.05;
 
 [[noreturn]] void die(const std::string &msg) {
   std::fprintf(stderr, "turbine_gemm_tune: %s\n", msg.c_str());
@@ -79,8 +108,6 @@ struct ShapeSpec {
   int64_t n, k;
   int32_t trans_b, c_dtype;
   std::vector<int64_t> ms;
-  // Buckets up to this m keep the heuristic without being tuned (`keep:<m>`).
-  int64_t keep_to = 0;
 };
 
 const std::vector<int64_t> kDecodeM = {1, 2, 4, 8, 16, 32, 64};
@@ -115,13 +142,9 @@ std::vector<ShapeSpec> read_shapes(const std::string &path) {
         s.ms.insert(s.ms.end(), kDecodeM.begin(), kDecodeM.end());
       else if (item == "prefill")
         s.ms.insert(s.ms.end(), kPrefillM.begin(), kPrefillM.end());
-      else if (item.rfind("keep:", 0) == 0)
-        s.keep_to = std::stoll(item.substr(5));
       else
         s.ms.push_back(std::stoll(item));
     }
-    if (s.keep_to > 0)
-      s.ms.push_back(s.keep_to);
     std::sort(s.ms.begin(), s.ms.end());
     s.ms.erase(std::unique(s.ms.begin(), s.ms.end()), s.ms.end());
     out.push_back(s);
@@ -140,6 +163,23 @@ void fill_bf16(std::vector<uint16_t> &v, uint32_t seed, float scale) {
     uint32_t bits;
     std::memcpy(&bits, &f, 4);
     h = static_cast<uint16_t>((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
+  }
+}
+
+// Heavy-tailed BF16 values: fill_bf16, then every 97th element 30x larger.
+// Real hidden states have outlier channels; their large partial sums cancel,
+// so two summation orders round to different outputs far more often than on
+// uniform data (a BF16 output hides most F32 order differences otherwise, and
+// the invariance and class checks would be nearly blind).
+void fill_heavy_bf16(std::vector<uint16_t> &v, uint32_t seed) {
+  fill_bf16(v, seed, 1.0f);
+  for (size_t i = 0; i < v.size(); i += 97) {
+    uint32_t bits = static_cast<uint32_t>(v[i]) << 16;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    f *= 30.0f;
+    std::memcpy(&bits, &f, 4);
+    v[i] = static_cast<uint16_t>((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
   }
 }
 
@@ -230,32 +270,91 @@ double time_us(Bench &b, GemmProblem &p, const hipblasLtMatmulAlgo_t &algo,
   return 1000.0 * ms / iters;
 }
 
+// A candidate the way the library runs a pinned row (src/gemm_table.cpp
+// pinned_gemm): through the hipBLASLt ext API with split-K off, so its sums do
+// not depend on m. Checks the problem within the workspace; with run, also
+// enqueues it.
+hipblasStatus_t pinned(Bench &b, GemmProblem &p, hipblasLtMatmulAlgo_t &algo,
+                       const void *w, const void *a, void *c, bool run) {
+  const float alpha = 1.0f, beta = 0.0f;
+  hipblaslt_ext::Gemm g(b.lt, p.desc.handle, &alpha, w, p.weight.handle, a,
+                        p.act.handle, &beta, c, p.out.handle, c, p.out.handle);
+  hipblaslt_ext::GemmTuning tuning;
+  tuning.setSplitK(1);
+  g.setMaxWorkspaceBytes(kWorkspaceBytes);
+  size_t ws = 0;
+  hipblasStatus_t st = g.isAlgoSupported(algo, tuning, ws);
+  if (st != HIPBLAS_STATUS_SUCCESS || ws > kWorkspaceBytes)
+    return st != HIPBLAS_STATUS_SUCCESS ? st : HIPBLAS_STATUS_NOT_SUPPORTED;
+  if (!run)
+    return HIPBLAS_STATUS_SUCCESS;
+  st = g.initialize(algo, tuning, b.workspace, false, b.stream);
+  return st != HIPBLAS_STATUS_SUCCESS ? st : g.run(b.stream);
+}
+
+bool pinned_supports(Bench &b, GemmProblem &p, hipblasLtMatmulAlgo_t &algo,
+                     Operands &o) {
+  return pinned(b, p, algo, o.weights[0], o.act, o.out, false) ==
+         HIPBLAS_STATUS_SUCCESS;
+}
+
+// Mean microseconds per call of a pinned candidate over iters calls, weights
+// cycled; the ext GEMMs are initialized before the timed loop, so it times the
+// kernels, not the host.
+double pinned_time_us(Bench &b, GemmProblem &p, hipblasLtMatmulAlgo_t algo,
+                      Operands &o, int iters) {
+  const float alpha = 1.0f, beta = 0.0f;
+  hipblaslt_ext::GemmTuning tuning;
+  tuning.setSplitK(1);
+  std::vector<std::unique_ptr<hipblaslt_ext::Gemm>> gs;
+  const size_t n = std::min<size_t>(o.weights.size(), iters);
+  for (size_t i = 0; i < n; ++i) {
+    gs.push_back(std::make_unique<hipblaslt_ext::Gemm>(
+        b.lt, p.desc.handle, &alpha, o.weights[i], p.weight.handle, o.act,
+        p.act.handle, &beta, o.out, p.out.handle, o.out, p.out.handle));
+    gs.back()->setMaxWorkspaceBytes(kWorkspaceBytes);
+    blas_ok(gs.back()->initialize(algo, tuning, b.workspace, false, b.stream),
+            "pinned initialize");
+  }
+  hip_ok(hipEventRecord(b.e0, b.stream), "hipEventRecord");
+  for (int i = 0; i < iters; ++i)
+    blas_ok(gs[i % n]->run(b.stream), "pinned run");
+  hip_ok(hipEventRecord(b.e1, b.stream), "hipEventRecord");
+  hip_ok(hipEventSynchronize(b.e1), "hipEventSynchronize");
+  float ms = 0;
+  hip_ok(hipEventElapsedTime(&ms, b.e0, b.e1), "hipEventElapsedTime");
+  return 1000.0 * ms / iters;
+}
+
 struct Row {
   const ShapeSpec *spec;
   int64_t m;
-  // -1 and "heuristic": the bucket keeps hipBLASLt's first answer per call.
+  // -1 and "heuristic": no solution passed; hipBLASLt's first answer per call.
   int index;
   std::string name;
   double heuristic_us, tuned_us;
 };
 
-// One m the bucket is measured at: its problem and the heuristic's first
-// answer there (what the library runs without a table).
-struct Sample {
+// One timing point of a shape: a bucket's top m, its problem, the heuristic's
+// first answer there (what the library runs without a table) and the fastest
+// correct solution at that m, invariant or not (the cost of invariance).
+struct Point {
   int64_t m;
   std::unique_ptr<GemmProblem> p;
   hipblasLtMatmulAlgo_t heuristic;
-  std::string heuristic_name;
   std::vector<double> heuristic_rounds;
+  double best_any_us = 0;
 };
 
 struct Candidate {
   int index;
   std::string name;
-  // The algorithm checked against each sample's problem (matmulIsAlgoSupported
-  // records the problem in the algorithm), in sample order.
-  std::vector<hipblasLtMatmulAlgo_t> algos;
-  double quick_us = 0;
+  hipblasLtMatmulAlgo_t algo;
+  // Per point: the algorithm checked against that point's problem.
+  std::vector<hipblasLtMatmulAlgo_t> at;
+  // FNV-1a of the target row's output bits (equal at every tested m).
+  uint64_t sig = 0;
+  std::vector<double> quick;
   std::vector<std::vector<double>> rounds;
 };
 
@@ -277,12 +376,61 @@ hipblasLtMatmulAlgo_t heuristic_answer(Bench &b, GemmProblem &p,
   return first.algo;
 }
 
-// The rows of one shape: per bucket (previous m, m], the solution with the
-// least total time over the bucket's sample m values (its bounds and middle),
-// pinned when that total beats the heuristic's own per-m answers by more than
-// kMinGain; otherwise the bucket keeps the heuristic.
+std::unique_ptr<GemmProblem> problem(const ShapeSpec &spec, int64_t m) {
+  auto p = std::make_unique<GemmProblem>();
+  if (p->make(GemmShape{m, spec.n, spec.k, spec.k, spec.k, spec.n, spec.trans_b,
+                        spec.c_dtype}) != HIPBLAS_STATUS_SUCCESS)
+    die(std::string("problem: ") + p->failed);
+  return p;
+}
+
+bool supports(Bench &b, GemmProblem &p, hipblasLtMatmulAlgo_t &algo) {
+  size_t ws = 0;
+  const float alpha = 1.0f, beta = 0.0f;
+  return hipblaslt_ext::matmulIsAlgoSupported(
+             b.lt, p.desc.handle, &alpha, p.weight.handle, p.act.handle, &beta,
+             p.out.handle, p.out.handle, algo, ws) == HIPBLAS_STATUS_SUCCESS &&
+         ws <= kWorkspaceBytes;
+}
+
+// Positions of the target row in an m-row batch: first, second, around the
+// 16-row tile edge, middle, last (hip_batch_invariance's positions).
+std::vector<int64_t> positions(int64_t m) {
+  std::vector<int64_t> v;
+  for (int64_t p : {int64_t{0}, int64_t{1}, int64_t{15}, int64_t{16},
+                    int64_t{17}, m / 2, m - 1})
+    if (p < m)
+      v.push_back(p);
+  std::sort(v.begin(), v.end());
+  v.erase(std::unique(v.begin(), v.end()), v.end());
+  return v;
+}
+
+// The shape's one pinned solution: among the solutions that support every m of
+// the shape, agree with the heuristic, are deterministic and are row-invariant
+// (the target row's output bits are the same alone, m = 1, and at every
+// position of batches of every tested m), the one with the least weighted mean
+// time relative to the heuristic's own per-m answers over the shape's buckets.
+// One solution for every m, so a row's result never depends on its batch.
+// Weight of bucket point i of points (ascending m) in a shape's score: the
+// decode weight spread evenly over the buckets up to kDecodeMaxM, the rest over
+// the larger ones.
+template <typename P> std::vector<double> bucket_weights(const P &points) {
+  size_t decode = 0;
+  for (const auto &pt : points)
+    decode += pt.m <= kDecodeMaxM ? 1 : 0;
+  const size_t other = points.size() - decode;
+  const double wd = other == 0 ? 1.0 : decode == 0 ? 0.0 : g_decode_weight;
+  std::vector<double> w;
+  for (const auto &pt : points)
+    w.push_back(pt.m <= kDecodeMaxM ? wd / static_cast<double>(decode)
+                                    : (1.0 - wd) / static_cast<double>(other));
+  return w;
+}
+
 std::vector<Row> tune_shape(Bench &b, const ShapeSpec &spec) {
   const int64_t m_top = spec.ms.back();
+  const size_t elem = spec.c_dtype == TURBINE_DTYPE_F32 ? 4 : 2;
   Operands o;
   const size_t w_elems = static_cast<size_t>(spec.n) * spec.k;
   const size_t copies =
@@ -302,7 +450,11 @@ std::vector<Row> tune_shape(Bench &b, const ShapeSpec &spec) {
   hip_ok(hipMalloc(&o.act, act.size() * 2), "hipMalloc activations");
   hip_ok(hipMemcpy(o.act, act.data(), act.size() * 2, hipMemcpyHostToDevice),
          "upload activations");
-  const size_t elem = spec.c_dtype == TURBINE_DTYPE_F32 ? 4 : 2;
+  // The target row (distinct data) and a scratch copy of each row it
+  // overwrites.
+  std::vector<uint16_t> target(spec.k), target2(spec.k);
+  fill_heavy_bf16(target, 977u);
+  fill_heavy_bf16(target2, 1913u);
   o.out_bytes = static_cast<size_t>(m_top) * spec.n * elem;
   hip_ok(hipMalloc(&o.out, o.out_bytes), "hipMalloc output");
   hip_ok(hipMalloc(&o.out2, o.out_bytes), "hipMalloc output");
@@ -317,189 +469,398 @@ std::vector<Row> tune_shape(Bench &b, const ShapeSpec &spec) {
               sizeof(max_ws)),
           "preference workspace");
 
-  std::vector<Row> rows;
+  // Timing points: every bucket's top m. Invariance m values: every bucket's
+  // bounds and middle.
+  std::vector<Point> points;
+  std::vector<int64_t> inv_ms;
   int64_t prev = 0;
-  for (const int64_t m_hi : spec.ms) {
+  for (int64_t m_hi : spec.ms) {
+    Point pt{m_hi, problem(spec, m_hi)};
+    pt.heuristic = heuristic_answer(b, *pt.p, pref.handle);
+    points.push_back(std::move(pt));
     const int64_t lo = prev + 1;
-    prev = m_hi;
-    if (m_hi <= spec.keep_to) {
-      // Not tuned: one heuristic row covers every bucket up to keep_to.
-      if (m_hi == spec.keep_to) {
-        std::fprintf(stderr,
-                     "turbine_gemm_tune: %-14s m=(0,%lld] kept on the "
-                     "heuristic (keep:%lld)\n",
-                     spec.name.c_str(), static_cast<long long>(m_hi),
-                     static_cast<long long>(m_hi));
-        rows.push_back(Row{&spec, m_hi, -1, "heuristic", 0.0, 0.0});
-      }
-      continue;
-    }
-    std::vector<int64_t> ms{m_hi};
+    inv_ms.push_back(m_hi);
     if (lo < m_hi)
-      ms.push_back(lo);
+      inv_ms.push_back(lo);
     if (m_hi - lo >= 4)
-      ms.push_back((lo + m_hi) / 2);
-    std::vector<Sample> samples;
-    for (int64_t m : ms) {
-      Sample s{m, std::make_unique<GemmProblem>()};
-      if (s.p->make(GemmShape{m, spec.n, spec.k, spec.k, spec.k, spec.n,
-                              spec.trans_b, spec.c_dtype}) !=
-          HIPBLAS_STATUS_SUCCESS)
-        die(std::string("problem: ") + s.p->failed);
-      s.heuristic = heuristic_answer(b, *s.p, pref.handle);
-      s.heuristic_name =
-          hipblaslt_ext::getSolutionNameFromAlgo(b.lt, s.heuristic);
-      samples.push_back(std::move(s));
-    }
+      inv_ms.push_back((lo + m_hi) / 2);
+    prev = m_hi;
+  }
+  std::sort(inv_ms.begin(), inv_ms.end(), std::greater<>());
+  inv_ms.erase(std::unique(inv_ms.begin(), inv_ms.end()), inv_ms.end());
+  std::vector<std::unique_ptr<GemmProblem>> inv_p;
+  for (int64_t m : inv_ms)
+    inv_p.push_back(problem(spec, m));
 
-    // Candidates: the heuristic's list at the bucket's top m, plus each
-    // sample's own first answer.
+  // Candidates: the heuristic's lists at every point, deduplicated by name,
+  // supported at every point and every invariance m.
+  std::vector<Candidate> cands;
+  for (auto &pt : points) {
     std::vector<hipblasLtMatmulHeuristicResult_t> all(256);
     int returned = 0;
     blas_ok(hipblasLtMatmulAlgoGetHeuristic(
-                b.lt, samples[0].p->desc.handle, samples[0].p->weight.handle,
-                samples[0].p->act.handle, samples[0].p->out.handle,
-                samples[0].p->out.handle, pref.handle, 256, all.data(),
-                &returned),
+                b.lt, pt.p->desc.handle, pt.p->weight.handle, pt.p->act.handle,
+                pt.p->out.handle, pt.p->out.handle, pref.handle, 256,
+                all.data(), &returned),
             "heuristic list");
     all.resize(returned);
-    std::vector<hipblasLtMatmulAlgo_t> pool;
-    for (auto &r : all)
-      if (r.state == HIPBLAS_STATUS_SUCCESS)
-        pool.push_back(r.algo);
-    for (auto &s : samples)
-      pool.push_back(s.heuristic);
-    std::vector<Candidate> cands;
-    for (auto &a : pool) {
-      std::string name = hipblaslt_ext::getSolutionNameFromAlgo(b.lt, a);
+    for (auto &r : all) {
+      if (r.state != HIPBLAS_STATUS_SUCCESS)
+        continue;
+      std::string name = hipblaslt_ext::getSolutionNameFromAlgo(b.lt, r.algo);
       if (std::any_of(cands.begin(), cands.end(),
                       [&](const Candidate &c) { return c.name == name; }))
         continue;
-      Candidate c{hipblaslt_ext::getIndexFromAlgo(a), name};
-      bool supported = true;
-      for (auto &s : samples) {
-        hipblasLtMatmulAlgo_t copy = a;
-        size_t ws = 0;
-        const float alpha = 1.0f, beta = 0.0f;
-        if (hipblaslt_ext::matmulIsAlgoSupported(
-                b.lt, s.p->desc.handle, &alpha, s.p->weight.handle,
-                s.p->act.handle, &beta, s.p->out.handle, s.p->out.handle, copy,
-                ws) != HIPBLAS_STATUS_SUCCESS ||
-            ws > kWorkspaceBytes) {
-          supported = false;
-          break;
-        }
-        c.algos.push_back(copy);
-      }
-      if (supported)
-        cands.push_back(std::move(c));
+      // The algorithm exactly as the library obtains a pinned row's
+      // (gemm_table.cpp): fresh from its solution index, then checked per
+      // problem. A heuristic list's entry can carry settings the heuristic
+      // chose for that list's m, which the library never sees.
+      std::vector<int> index{hipblaslt_ext::getIndexFromAlgo(r.algo)};
+      std::vector<hipblasLtMatmulHeuristicResult_t> fresh;
+      if (hipblaslt_ext::getAlgosFromIndex(b.lt, index, fresh) !=
+              HIPBLAS_STATUS_SUCCESS ||
+          fresh.empty() ||
+          hipblaslt_ext::getSolutionNameFromAlgo(b.lt, fresh[0].algo) != name)
+        continue;
+      cands.push_back(Candidate{index[0], name, fresh[0].algo});
     }
-    const size_t offered = cands.size();
-
-    // Correctness against each sample's heuristic answer and determinism
-    // (three bitwise-identical runs), at every sample.
-    int wrong = 0, nondet = 0;
-    for (size_t si = 0; si < samples.size(); ++si) {
-      Sample &s = samples[si];
-      const size_t out_elems = static_cast<size_t>(s.m) * spec.n;
-      const size_t bytes = out_elems * elem;
-      blas_ok(run(b, *s.p, s.heuristic, o.weights[0], o.act, o.ref),
-              "reference");
-      const float tol = std::max(
-          compare(o.ref, o.ref, out_elems, spec.c_dtype, o.scratch, b.stream)
-                  .max_ref /
-              64.0f,
-          1e-6f);
-      std::vector<Candidate> kept;
-      for (auto &c : cands) {
-        hip_ok(hipMemsetAsync(o.out, 0, bytes, b.stream), "memset");
-        if (run(b, *s.p, c.algos[si], o.weights[0], o.act, o.out) !=
-                HIPBLAS_STATUS_SUCCESS ||
-            compare(o.out, o.ref, out_elems, spec.c_dtype, o.scratch, b.stream)
-                    .max_diff > tol) {
-          ++wrong;
-          continue;
-        }
-        bool same = true;
-        for (int rep = 0; rep < 2 && same; ++rep) {
-          hip_ok(hipMemsetAsync(o.out2, 0xff, bytes, b.stream), "memset");
-          blas_ok(run(b, *s.p, c.algos[si], o.weights[0], o.act, o.out2),
-                  "rerun");
-          same = compare(o.out2, o.out, out_elems, spec.c_dtype, o.scratch,
-                         b.stream)
-                     .differing == 0;
-        }
-        if (!same) {
-          ++nondet;
-          continue;
-        }
-        kept.push_back(std::move(c));
-      }
-      cands = std::move(kept);
-    }
-
-    // Quick pass at the bucket's top m: about 1 ms of work per candidate.
-    Sample &top = samples[0];
-    (void)time_us(b, *top.p, top.heuristic, o, 3);
-    const double h_est = time_us(b, *top.p, top.heuristic, o, 5);
-    const int quick_iters = std::clamp(static_cast<int>(1000.0 / h_est), 3, 50);
+  }
+  const size_t offered = cands.size();
+  int unsupported = 0, wrong = 0, nondet = 0, variant = 0;
+  {
+    std::vector<Candidate> kept;
     for (auto &c : cands) {
-      (void)time_us(b, *top.p, c.algos[0], o, 1);
-      c.quick_us = time_us(b, *top.p, c.algos[0], o, quick_iters);
+      bool ok = true;
+      for (auto &p : inv_p) {
+        hipblasLtMatmulAlgo_t a = c.algo;
+        ok = ok && pinned_supports(b, *p, a, o);
+      }
+      for (auto &pt : points) {
+        hipblasLtMatmulAlgo_t a = c.algo;
+        ok = ok && pinned_supports(b, *pt.p, a, o);
+        c.at.push_back(a);
+      }
+      if (ok)
+        kept.push_back(std::move(c));
+      else
+        ++unsupported;
     }
-    std::sort(cands.begin(), cands.end(),
-              [](const Candidate &x, const Candidate &y) {
-                return x.quick_us < y.quick_us;
-              });
-    if (cands.size() > kRefine)
-      cands.resize(kRefine);
+    cands = std::move(kept);
+  }
 
-    // Refinement: interleaved rounds of about 3 ms per candidate and sample,
-    // the heuristic's own answer timed alongside at each sample.
-    for (auto &c : cands)
-      c.rounds.resize(samples.size());
-    for (int round = 0; round < kRounds; ++round) {
-      for (size_t si = 0; si < samples.size(); ++si) {
-        Sample &s = samples[si];
-        const double est = time_us(b, *s.p, s.heuristic, o, 2);
-        const int iters = std::clamp(static_cast<int>(3000.0 / est), 5, 200);
-        s.heuristic_rounds.push_back(time_us(b, *s.p, s.heuristic, o, iters));
-        for (auto &c : cands)
-          c.rounds[si].push_back(time_us(b, *s.p, c.algos[si], o, iters));
+  // Correctness against the heuristic and determinism at the top m.
+  {
+    Point &top = points.back();
+    const size_t out_elems = static_cast<size_t>(top.m) * spec.n;
+    blas_ok(run(b, *top.p, top.heuristic, o.weights[0], o.act, o.ref),
+            "reference");
+    const float tol = std::max(
+        compare(o.ref, o.ref, out_elems, spec.c_dtype, o.scratch, b.stream)
+                .max_ref /
+            64.0f,
+        1e-6f);
+    std::vector<Candidate> kept;
+    for (auto &c : cands) {
+      hipblasLtMatmulAlgo_t a = c.at.back();
+      hip_ok(hipMemsetAsync(o.out, 0, o.out_bytes, b.stream), "memset");
+      if (pinned(b, *top.p, a, o.weights[0], o.act, o.out, true) !=
+              HIPBLAS_STATUS_SUCCESS ||
+          compare(o.out, o.ref, out_elems, spec.c_dtype, o.scratch, b.stream)
+                  .max_diff > tol) {
+        ++wrong;
+        continue;
+      }
+      bool same = true;
+      for (int rep = 0; rep < 2 && same; ++rep) {
+        hip_ok(hipMemsetAsync(o.out2, 0xff, o.out_bytes, b.stream), "memset");
+        blas_ok(pinned(b, *top.p, a, o.weights[0], o.act, o.out2, true),
+                "rerun");
+        same =
+            compare(o.out2, o.out, out_elems, spec.c_dtype, o.scratch, b.stream)
+                .differing == 0;
+      }
+      if (!same) {
+        ++nondet;
+        continue;
+      }
+      kept.push_back(std::move(c));
+    }
+    cands = std::move(kept);
+  }
+
+  // Row invariance: the target row's output bits alone (m = 1) must equal its
+  // bits at every position of every invariance m (largest first: the likeliest
+  // to differ).
+  {
+    const size_t row_bytes = static_cast<size_t>(spec.n) * elem;
+    std::vector<char> alone(row_bytes), got(row_bytes);
+    std::vector<uint16_t> saved(spec.k);
+    auto target_run = [&](GemmProblem &p, hipblasLtMatmulAlgo_t a, int64_t pos,
+                          std::vector<char> &row) {
+      char *arow = static_cast<char *>(o.act) + pos * spec.k * 2;
+      hip_ok(hipMemcpy(saved.data(), arow, spec.k * 2, hipMemcpyDeviceToHost),
+             "save row");
+      hip_ok(hipMemcpy(arow, target.data(), spec.k * 2, hipMemcpyHostToDevice),
+             "target row");
+      hip_ok(hipDeviceSynchronize(), "sync before the invariance run");
+      blas_ok(pinned(b, p, a, o.weights[0], o.act, o.out, true),
+              "invariance run");
+      hip_ok(hipStreamSynchronize(b.stream), "sync after the invariance run");
+      hip_ok(hipMemcpy(row.data(), static_cast<char *>(o.out) + pos * row_bytes,
+                       row_bytes, hipMemcpyDeviceToHost),
+             "read row");
+      hip_ok(hipMemcpy(arow, saved.data(), spec.k * 2, hipMemcpyHostToDevice),
+             "restore row");
+    };
+    std::unique_ptr<GemmProblem> one = problem(spec, 1);
+    std::vector<Candidate> kept;
+    for (auto &c : cands) {
+      hipblasLtMatmulAlgo_t a1 = c.algo;
+      if (!pinned_supports(b, *one, a1, o)) {
+        ++unsupported;
+        continue;
+      }
+      target_run(*one, a1, 0, alone);
+      // The class signature: the target row's bits and a second heavy-tailed
+      // row's, both alone.
+      c.sig = 1469598103934665603ull;
+      for (char ch : alone)
+        c.sig = (c.sig ^ static_cast<uint8_t>(ch)) * 1099511628211ull;
+      {
+        std::vector<char> second(row_bytes);
+        std::swap(target, target2);
+        target_run(*one, a1, 0, second);
+        std::swap(target, target2);
+        for (char ch : second)
+          c.sig = (c.sig ^ static_cast<uint8_t>(ch)) * 1099511628211ull;
+      }
+      bool invariant = true;
+      for (size_t i = 0; i < inv_ms.size() && invariant; ++i) {
+        hipblasLtMatmulAlgo_t a = c.algo;
+        (void)pinned_supports(b, *inv_p[i], a, o);
+        for (int64_t pos : positions(inv_ms[i])) {
+          target_run(*inv_p[i], a, pos, got);
+          if (std::memcmp(alone.data(), got.data(), row_bytes) != 0) {
+            if (std::getenv("TURBINE_TUNE_DEBUG") != nullptr) {
+              size_t diff = 0, first = 0;
+              for (size_t e = 0; e < row_bytes; ++e)
+                if (alone[e] != got[e] && diff++ == 0)
+                  first = e;
+              std::fprintf(stderr,
+                           "debug: first differing byte %zu: %02x vs %02x\n",
+                           first, static_cast<uint8_t>(alone[first]),
+                           static_cast<uint8_t>(got[first]));
+              std::fprintf(stderr,
+                           "debug: %s variant at m=%lld pos=%lld (%zu of %zu "
+                           "bytes)\n",
+                           c.name.substr(0, 70).c_str(),
+                           static_cast<long long>(inv_ms[i]),
+                           static_cast<long long>(pos), diff, row_bytes);
+            }
+            invariant = false;
+            break;
+          }
+        }
+      }
+      if (invariant)
+        kept.push_back(std::move(c));
+      else
+        ++variant;
+    }
+    cands = std::move(kept);
+  }
+
+  // Timing: the heuristic's own answer at every point, and the best solution
+  // there regardless of invariance (quick pass over the full candidate list is
+  // too slow; the heuristic's list at each point is timed briefly instead).
+  for (auto &pt : points) {
+    (void)time_us(b, *pt.p, pt.heuristic, o, 2);
+    const double h = time_us(b, *pt.p, pt.heuristic, o, 5);
+    const int iters = std::clamp(static_cast<int>(1000.0 / h), 3, 50);
+    std::vector<hipblasLtMatmulHeuristicResult_t> all(64);
+    int returned = 0;
+    blas_ok(hipblasLtMatmulAlgoGetHeuristic(
+                b.lt, pt.p->desc.handle, pt.p->weight.handle, pt.p->act.handle,
+                pt.p->out.handle, pt.p->out.handle, pref.handle, 64, all.data(),
+                &returned),
+            "heuristic list");
+    pt.best_any_us = time_us(b, *pt.p, pt.heuristic, o, iters);
+    for (int i = 0; i < returned; ++i) {
+      if (all[i].state != HIPBLAS_STATUS_SUCCESS ||
+          !supports(b, *pt.p, all[i].algo))
+        continue;
+      pt.best_any_us =
+          std::min(pt.best_any_us, time_us(b, *pt.p, all[i].algo, o, iters));
+    }
+  }
+  // Solutions whose target row has the same bits (the same signature) at every
+  // tested m sum every output in the same order: they form one class, and a
+  // shape may use any member of one class per bucket without a row's result
+  // depending on its batch. Quick per-bucket times of every invariant
+  // candidate, then per class the fastest member per bucket.
+  const std::vector<double> weight = bucket_weights(points);
+  std::vector<double> h_quick(points.size());
+  for (size_t i = 0; i < points.size(); ++i) {
+    Point &pt = points[i];
+    (void)time_us(b, *pt.p, pt.heuristic, o, 2);
+    h_quick[i] = time_us(b, *pt.p, pt.heuristic, o, 5);
+  }
+  for (auto &c : cands) {
+    c.quick.resize(points.size());
+    for (size_t i = 0; i < points.size(); ++i) {
+      Point &pt = points[i];
+      const int iters =
+          std::clamp(static_cast<int>(1000.0 / h_quick[i]), 3, 50);
+      (void)pinned_time_us(b, *pt.p, c.at[i], o, 1);
+      c.quick[i] = pinned_time_us(b, *pt.p, c.at[i], o, iters);
+    }
+  }
+  struct Class {
+    uint64_t sig;
+    // Per bucket: the index into cands of the member run there.
+    std::vector<size_t> member;
+    double score = 0;
+  };
+  std::vector<Class> classes;
+  for (size_t j = 0; j < cands.size(); ++j) {
+    auto it = std::find_if(classes.begin(), classes.end(), [&](const Class &k) {
+      return k.sig == cands[j].sig;
+    });
+    if (it == classes.end()) {
+      classes.push_back(
+          Class{cands[j].sig, std::vector<size_t>(points.size(), j)});
+      continue;
+    }
+    for (size_t i = 0; i < points.size(); ++i)
+      if (cands[j].quick[i] < cands[it->member[i]].quick[i])
+        it->member[i] = j;
+  }
+  // A class over the prefill guard at any prefill-sized bucket is scored
+  // after every class within it.
+  auto guarded = [&](const Class &k, auto time_of) {
+    for (size_t i = 0; i < points.size(); ++i)
+      if (points[i].m >= kPrefillGuardM && points[i].m <= kPrefillGuardMaxM &&
+          time_of(k, i) > 1.0 + g_max_prefill_loss)
+        return false;
+    return true;
+  };
+  auto quick_ratio = [&](const Class &k, size_t i) {
+    return cands[k.member[i]].quick[i] / h_quick[i];
+  };
+  for (auto &k : classes) {
+    k.score = 0;
+    for (size_t i = 0; i < points.size(); ++i)
+      k.score += weight[i] * quick_ratio(k, i);
+    // Quick timings are noisy: a small margin before the refined check.
+    if (!guarded(k, [&](const Class &c, size_t i) {
+          return quick_ratio(c, i) - 0.03;
+        }))
+      k.score += 1000.0;
+  }
+  std::sort(classes.begin(), classes.end(),
+            [](const Class &x, const Class &y) { return x.score < y.score; });
+  for (size_t ci = 0; ci < classes.size() && ci < 8; ++ci) {
+    double dec = 0, pre = 0, nd = 0, np = 0;
+    for (size_t i = 0; i < points.size(); ++i) {
+      const double r = cands[classes[ci].member[i]].quick[i] / h_quick[i];
+      if (points[i].m <= kDecodeMaxM) {
+        dec += r;
+        nd += 1;
+      } else {
+        pre += r;
+        np += 1;
       }
     }
-    double base = 0;
-    for (auto &s : samples)
-      base += median(s.heuristic_rounds);
-    const Candidate *best = nullptr;
-    double best_total = 0;
-    for (const auto &c : cands) {
-      double total = 0;
-      for (const auto &r : c.rounds)
-        total += median(r);
-      if (best == nullptr || total < best_total) {
-        best = &c;
-        best_total = total;
-      }
+    std::fprintf(stderr,
+                 "turbine_gemm_tune: %-14s class %zu: decode x%.3f prefill "
+                 "x%.3f (quick, vs heuristic)\n",
+                 spec.name.c_str(), ci, nd > 0 ? dec / nd : 0.0,
+                 np > 0 ? pre / np : 0.0);
+  }
+  if (classes.size() > kRefineClasses)
+    classes.resize(kRefineClasses);
+
+  // Refinement: 5 interleaved rounds per bucket of the heuristic's answer and
+  // every member the best classes run there; the class with the least
+  // weighted mean relative time is pinned.
+  std::vector<std::vector<size_t>> timed(points.size());
+  for (size_t i = 0; i < points.size(); ++i) {
+    for (const auto &k : classes)
+      if (std::find(timed[i].begin(), timed[i].end(), k.member[i]) ==
+          timed[i].end())
+        timed[i].push_back(k.member[i]);
+  }
+  for (auto &c : cands)
+    c.rounds.assign(points.size(), {});
+  for (int round = 0; round < kRounds; ++round) {
+    for (size_t i = 0; i < points.size(); ++i) {
+      Point &pt = points[i];
+      const int iters =
+          std::clamp(static_cast<int>(3000.0 / h_quick[i]), 5, 200);
+      pt.heuristic_rounds.push_back(time_us(b, *pt.p, pt.heuristic, o, iters));
+      for (size_t j : timed[i])
+        cands[j].rounds[i].push_back(
+            pinned_time_us(b, *pt.p, cands[j].at[i], o, iters));
     }
-    const bool pin = best != nullptr && best_total < (1.0 - kMinGain) * base;
-    std::string sample_list;
-    for (auto &s : samples)
-      sample_list += (sample_list.empty() ? "" : ",") + std::to_string(s.m);
+  }
+  auto refined_ratio = [&](const Class &k, size_t i) {
+    return median(cands[k.member[i]].rounds[i]) /
+           median(points[i].heuristic_rounds);
+  };
+  const Class *best = nullptr;
+  bool guard_failed = false;
+  for (auto &k : classes) {
+    k.score = 0;
+    for (size_t i = 0; i < points.size(); ++i)
+      k.score += weight[i] * refined_ratio(k, i);
+    if (!guarded(k, refined_ratio)) {
+      guard_failed = true;
+      continue;
+    }
+    if (best == nullptr || k.score < best->score)
+      best = &k;
+  }
+  if (best == nullptr && guard_failed)
     std::fprintf(
         stderr,
-        "turbine_gemm_tune: %-14s m=(%lld,%lld] at m=%s candidates=%zu "
-        "(rejected: %d wrong, %d nondeterministic) heuristic %.1f us "
-        "-> %.1f us (%+.1f%%) %s\n",
-        spec.name.c_str(), static_cast<long long>(lo - 1),
-        static_cast<long long>(m_hi), sample_list.c_str(), offered, wrong,
-        nondet, base, pin ? best_total : base,
-        pin ? 100.0 * (best_total - base) / base : 0.0,
-        pin ? best->name.c_str() : "(heuristic kept)");
-    const double h_top = median(samples[0].heuristic_rounds);
-    rows.push_back(Row{&spec, m_hi, pin ? best->index : -1,
-                       pin ? best->name : std::string("heuristic"), h_top,
-                       pin ? median(best->rounds[0]) : h_top});
+        "turbine_gemm_tune: %-14s every row-invariant class is more "
+        "than %.0f%% slower than the heuristic at m in [%lld, %lld]: the "
+        "shape keeps the heuristic (not row-invariant)\n",
+        spec.name.c_str(), 100.0 * g_max_prefill_loss,
+        static_cast<long long>(kPrefillGuardM),
+        static_cast<long long>(kPrefillGuardMaxM));
+
+  size_t members = 0;
+  if (best != nullptr) {
+    std::vector<size_t> distinct = best->member;
+    std::sort(distinct.begin(), distinct.end());
+    members = std::unique(distinct.begin(), distinct.end()) - distinct.begin();
+  }
+  std::fprintf(
+      stderr,
+      "turbine_gemm_tune: %-14s candidates=%zu (rejected: %d "
+      "unsupported, %d wrong, %d nondeterministic, %d not "
+      "row-invariant); %s\n",
+      spec.name.c_str(), offered, unsupported, wrong, nondet, variant,
+      best != nullptr
+          ? ("pinned class of " + std::to_string(members) + " solution(s)")
+                .c_str()
+          : "NONE invariant: heuristic kept, not row-invariant");
+  std::vector<Row> rows;
+  for (size_t i = 0; i < points.size(); ++i) {
+    const Point &pt = points[i];
+    const double h = median(pt.heuristic_rounds);
+    const Candidate *c = best != nullptr ? &cands[best->member[i]] : nullptr;
+    const double t = c != nullptr ? median(c->rounds[i]) : h;
+    std::fprintf(stderr,
+                 "turbine_gemm_tune: %-14s m=%-5lld heuristic %8.1f us  "
+                 "pinned %8.1f us (%+6.1f%%)  fastest any %8.1f us  %s\n",
+                 spec.name.c_str(), static_cast<long long>(pt.m), h, t,
+                 100.0 * (t - h) / h, pt.best_any_us,
+                 c != nullptr ? c->name.substr(0, 60).c_str() : "heuristic");
+    rows.push_back(Row{&spec, pt.m, c != nullptr ? c->index : -1,
+                       c != nullptr ? c->name : std::string("heuristic"), h,
+                       t});
   }
 
   for (void *w : o.weights)
@@ -525,9 +886,14 @@ int main(int argc, char **argv) {
       out_path = argv[++i];
     else if (a == "--device" && i + 1 < argc)
       device = std::atoi(argv[++i]);
+    else if (a == "--decode-weight" && i + 1 < argc)
+      g_decode_weight = std::atof(argv[++i]);
+    else if (a == "--max-prefill-loss" && i + 1 < argc)
+      g_max_prefill_loss = std::atof(argv[++i]);
     else
       die("usage: turbine_gemm_tune --shapes <gemm_shapes.txt> --out "
-          "<tuning/<arch>/gemm.tsv> [--device <n>]");
+          "<tuning/<arch>/gemm.tsv> [--device <n>] [--decode-weight <0..1>] "
+          "[--max-prefill-loss <fraction>]");
   }
   if (shapes_path.empty() || out_path.empty())
     die("--shapes and --out are required");
@@ -566,7 +932,21 @@ int main(int argc, char **argv) {
       << "; shapes " << shapes_path << "\n"
       << "# A row serves m in (previous row's m_max, m_max] of its shape; "
          "regenerate with docs/extending/card-family.md (Tuned GEMM table).\n"
-      << "# n\tk\ttrans_b\tc_dtype\tm_max\tsolution_index\tsolution_name\t"
+      << "# One pinned solution per shape (row-invariant for every m); cost "
+         "per "
+         "bucket top m, microseconds, heuristic's per-m answer -> pinned:\n";
+  for (const Row &r : rows) {
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "# cost %-14s m=%-5lld %9.1f -> %9.1f (%+.1f%%)\n",
+                  r.spec->name.c_str(), static_cast<long long>(r.m),
+                  r.heuristic_us, r.tuned_us,
+                  r.heuristic_us > 0
+                      ? 100.0 * (r.tuned_us - r.heuristic_us) / r.heuristic_us
+                      : 0.0);
+    out << line;
+  }
+  out << "# n\tk\ttrans_b\tc_dtype\tm_max\tsolution_index\tsolution_name\t"
          "heuristic_us\ttuned_us\tshape\n";
   for (size_t i = 0; i < rows.size(); ++i) {
     const Row &r = rows[i];

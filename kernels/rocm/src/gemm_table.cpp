@@ -1,6 +1,7 @@
 // The tuned GEMM algorithm table (gemm_table.hpp): lookup and resolution.
 #include <hipblaslt/hipblaslt-ext.hpp>
 
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -95,9 +96,37 @@ const char *tuned_gemm_miss_code(TunedGemmMiss miss) {
   return "gemm_table_unknown";
 }
 
+hipblasStatus_t pinned_gemm(turbine_ctx *ctx, GemmProblem &p,
+                            const turbine_gemm_desc *d,
+                            hipblasLtMatmulAlgo_t *algo, bool run) {
+  try {
+    hipblaslt_ext::Gemm gemm(ctx->blaslt, p.desc.handle, &d->alpha, d->b,
+                             p.weight.handle, d->a, p.act.handle, &d->beta,
+                             d->c, p.out.handle, d->c, p.out.handle);
+    hipblaslt_ext::GemmTuning tuning;
+    tuning.setSplitK(1);
+    gemm.setMaxWorkspaceBytes(kGemmWorkspaceBytes);
+    if (!run) {
+      size_t workspace = 0;
+      const hipblasStatus_t st = gemm.isAlgoSupported(*algo, tuning, workspace);
+      if (st != HIPBLAS_STATUS_SUCCESS)
+        return st;
+      return workspace > kGemmWorkspaceBytes ? HIPBLAS_STATUS_NOT_SUPPORTED
+                                             : HIPBLAS_STATUS_SUCCESS;
+    }
+    const hipblasStatus_t st =
+        gemm.initialize(*algo, tuning, ctx->workspace, false, ctx->stream);
+    if (st != HIPBLAS_STATUS_SUCCESS)
+      return st;
+    return gemm.run(ctx->stream);
+  } catch (const std::exception &) {
+    return HIPBLAS_STATUS_INTERNAL_ERROR;
+  }
+}
+
 bool resolve_tuned_gemm(turbine_ctx *ctx, const TunedGemm &t, GemmProblem &p,
-                        const float *alpha, const float *beta,
-                        hipblasLtMatmulAlgo_t *algo, TunedGemmMiss *miss) {
+                        const turbine_gemm_desc *d, hipblasLtMatmulAlgo_t *algo,
+                        TunedGemmMiss *miss) {
   // The pinned index first; when this hipBLASLt numbers its solutions
   // differently, the solution of the same name wherever it now is.
   if (!algo_at(ctx, t.solution_index, t.solution_name, algo) &&
@@ -106,12 +135,7 @@ bool resolve_tuned_gemm(turbine_ctx *ctx, const TunedGemm &t, GemmProblem &p,
     *miss = TunedGemmMiss::Unavailable;
     return false;
   }
-  size_t workspace = 0;
-  if (hipblaslt_ext::matmulIsAlgoSupported(
-          ctx->blaslt, p.desc.handle, alpha, p.weight.handle, p.act.handle,
-          beta, p.out.handle, p.out.handle, *algo,
-          workspace) != HIPBLAS_STATUS_SUCCESS ||
-      workspace > kGemmWorkspaceBytes) {
+  if (pinned_gemm(ctx, p, d, algo, false) != HIPBLAS_STATUS_SUCCESS) {
     *miss = TunedGemmMiss::Unsupported;
     return false;
   }

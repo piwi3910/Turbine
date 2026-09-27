@@ -1,7 +1,8 @@
 // GEMM through hipBLASLt.
 //
 // The problem (layouts, transposes, F32 accumulation) is gemm_problem.hpp's.
-// The algorithm per shape: the tuned table's pinned solution when the context
+// The algorithm per shape: the tuned table's pinned solution (run with split-K
+// off through the hipBLASLt ext API, gemm_table.hpp) when the context
 // has the table on (TURBINE_OPTION_GEMM_AUTOTUNE, default) and the table has a
 // row for the shape on this card (gemm_table.hpp); otherwise, or when the
 // pinned solution is not available in this hipBLASLt or rejects the problem
@@ -95,8 +96,8 @@ int32_t turbine_gemm(turbine_ctx *ctx, const turbine_gemm_desc *d) {
         ctx->gemm_table ? turbine_hip::tuned_gemm(arch, shape) : nullptr;
     if (row != nullptr && row->solution_index >= 0) {
       turbine_hip::TunedGemmMiss miss{};
-      chosen = turbine_hip::resolve_tuned_gemm(ctx, *row, problem, &d->alpha,
-                                               &d->beta, &choice.algo, &miss);
+      chosen = turbine_hip::resolve_tuned_gemm(ctx, *row, problem, d,
+                                               &choice.algo, &miss);
       choice.tuned = chosen;
       if (!chosen && ctx->gemm_table_logged.insert(row).second) {
         std::fprintf(stderr,
@@ -149,6 +150,12 @@ int32_t turbine_gemm(turbine_ctx *ctx, const turbine_gemm_desc *d) {
     found = ctx->gemm_algos.emplace(key, choice).first;
   }
 
+  if (found->second.tuned) {
+    return check_blaslt(
+        ctx,
+        turbine_hip::pinned_gemm(ctx, problem, d, &found->second.algo, true),
+        "hipblaslt_ext::Gemm (pinned, split-K off)");
+  }
   return check_blaslt(
       ctx,
       hipblasLtMatmul(ctx->blaslt, problem.desc.handle, &d->alpha, d->b,

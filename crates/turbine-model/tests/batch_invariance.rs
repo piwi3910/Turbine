@@ -358,7 +358,7 @@ fn olmoe_rows_are_batch_invariant() {
                 if long.len() + q_len <= MAX_BATCH_TOKENS as usize && target_id != "p09" {
                     scenarios.push(Scenario {
                         name: "prefill behind a 2004-token prefill".into(),
-                        pending_gemm_table: true,
+                        pending_gemm_table: false,
                         parts: vec![
                             Part {
                                 seq: LONG_SEQ,

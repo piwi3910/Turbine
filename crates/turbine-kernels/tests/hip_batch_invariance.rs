@@ -312,7 +312,7 @@ fn gemm_rows_are_batch_invariant() {
 /// outputs). The fix is the per-card GEMM table (one algorithm per shape for every m, a
 /// data-parallel one without split-k); when it lands, drop the entries it covers so the test
 /// asserts them.
-const PENDING_GEMM_TABLE: &[&str] = &["gemm n=64 k=2048 c=f32", "gemm n=2048 k=2048 c=bf16"];
+const PENDING_GEMM_TABLE: &[&str] = &[];
 
 // ------------------------------------------------------------------------------------- MoE
 

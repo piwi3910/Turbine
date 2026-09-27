@@ -12,6 +12,12 @@
 // solution_index -1 (name "heuristic") pins nothing: no solution beat
 // hipBLASLt's own per-call answer over that bucket, so the library asks the
 // heuristic, as for a shape without rows.
+//
+// A pinned solution always runs with split-K off (hipBLASLt ext GemmTuning
+// splitK = 1): by default hipBLASLt splits K across workgroups for small
+// problems, so the same solution would sum a row in another order at m = 1
+// than inside a large batch; with split-K off its sums do not depend on m
+// (row invariance, the tuner's acceptance check).
 #pragma once
 
 #include <cstdint>
@@ -46,10 +52,17 @@ enum class TunedGemmMiss {
 
 const char *tuned_gemm_miss_code(TunedGemmMiss miss);
 
-// Resolves row t for problem p (alpha, beta the call's scalars) on ctx's
-// hipBLASLt handle into *algo. On failure returns false and sets *miss.
+// Resolves row t for the call d (problem p) on ctx's hipBLASLt handle into
+// *algo, checked with split-K off. On failure returns false and sets *miss.
 bool resolve_tuned_gemm(turbine_ctx *ctx, const TunedGemm &t, GemmProblem &p,
-                        const float *alpha, const float *beta,
-                        hipblasLtMatmulAlgo_t *algo, TunedGemmMiss *miss);
+                        const turbine_gemm_desc *d, hipblasLtMatmulAlgo_t *algo,
+                        TunedGemmMiss *miss);
+
+// Enqueues the call d (problem p) on ctx's stream with a resolved pinned
+// algorithm, split-K off; with run false only checks that the algorithm takes
+// the problem within the context's workspace.
+hipblasStatus_t pinned_gemm(turbine_ctx *ctx, GemmProblem &p,
+                            const turbine_gemm_desc *d,
+                            hipblasLtMatmulAlgo_t *algo, bool run);
 
 } // namespace turbine_hip

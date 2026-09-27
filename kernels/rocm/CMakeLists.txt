@@ -125,7 +125,8 @@ add_custom_command(
 # One row per GEMM shape and m bucket: the hipBLASLt solution the tuner
 # (turbine_gemm_tune below) measured fastest on that card. Editing a table re-runs
 # the configure step.
-set(TURBINE_TUNING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tuning")
+set(TURBINE_TUNING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tuning" CACHE PATH
+  "Directory of the tuned GEMM tables (<arch>/gemm.tsv); an empty directory builds a library without them")
 set(GEMM_TABLE_INC "${CMAKE_BINARY_DIR}/gemm_tuned_table.inc")
 set(gemm_table_sources "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gemm_table.py")
 foreach(arch IN LISTS GPU_TARGETS)
