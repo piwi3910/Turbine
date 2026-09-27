@@ -601,6 +601,43 @@ The coordinator's bench of the Phase 4 tip (fbc9e1e) on GPU 0 showed an 8 % Llam
 
 **Answer (2026-09-27): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** `turbine_kv::hierarchy::{has_reuse_evidence, CAPACITY_BATCH}` and `turbine_server::kv_orchestrator::HOUSEKEEPING_INTERVAL`. Host profile (release, 372-block L0 holding 360 one-off cached blocks): the old full L0 victims scan cost 103 µs per call and the reclaim-order refresh 115 µs, both every turn and more with L1 in the directory. The gated capacity scan costs 22 µs per call and runs at most every 50 ms. Test `hierarchy::tests::capacity_demotion_needs_reuse_evidence` covers a one-off block (not copied by capacity), a session block (copied), a re-used block (copied) and pressure (ungated). Tests that force demotion and expect copies give their blocks evidence: a second run in the simulator, `hierarchy`, `api` and engine-loop tests, and session keys for A and the fillers in `kv_gpu`.
 
+## Phase 4: pressure reclaim copies only blocks with reuse evidence, bounded in flight
+
+The coordinator's 10-minute overload soak on main 186f439 (GPU 0, `scripts/lab/phase3-novanas-soak.yaml`, L1 on by default at 64 GiB) failed `itl_p99_within_2x`: calibration ITL p99 176 ms, overload 393 ms, 97.7 output tok/s, 1,010 requests ok. With `kv.cpu.enabled: false` it passed at 173 / 205 ms, 185.2 tok/s, 1,339 ok. The soak's prompts are all distinct (`--prompt-words-range 64..6000`, seeded per request), so no block is ever reused. Its timeline is driven by `queue_fill` in both runs (`kv_utilization` averages 0.02 at RED, since cached blocks count as free), but with L1 on the run spends 359 samples at RED against 196 without.
+
+Mechanism. On every 100 ms tick at ORANGE, the Phase 3 controller calls `free_unreferenced(0.82)` and `demote(0.82)`; at RED it calls `free_unreferenced(0.0)`. `KvHierarchy::apply_reclaim` mapped both calls to `demote_to(.., Pressure)`, which copies every unreferenced L0 block to L1 in value order, whether or not it has reuse evidence. A block is only freed once its copy completes. So at RED every finished request's blocks were copied down, each pinning its L0 block until the copy was done. Without L1 the same call drops them immediately. Evidence:
+
+- Host reproduction: `kv_sim one_off_overload_does_not_demote`, before the fix. Its workload is 360 one-off requests into a 64-block L0, with L1 copies costing about 3.9 ms against a 5 ms step, as on the R9700.
+  - RED: 2,186 L0→L1 copies (every full block written), up to 39 started in one iteration, and up to 57 of the 64 L0 blocks pinned by in-flight copies at once.
+  - ORANGE: 969 copies, up to 12 blocks pinned.
+  - Drain time: 6.39 s at RED and 6.30 s at ORANGE with L1, against 6.17 s without.
+- Lab measurement (`turbine-kernels --test lab demotion_host_cost`, novanas, 32 Llama blocks of 128 tokens = 14.7 MB). The orchestrator copies a block with one `copy_async` per layer; each copy carries a compute-stream fence, a wait and a completion event.
+  - Enqueuing one block costs 115–420 µs of host time on the engine thread; each `poll` costs 0.17 µs.
+  - The per-layer copies reach 5.3–6.2 GB/s. The same bytes as one copy per block enqueue in 5 µs and reach 12.0 GB/s.
+  - With `kv.transfer.max_inflight_bytes` at 1 GiB, up to 73 blocks start in one pump, which is 8–31 ms of host time in a single turn on an idle GPU. That turn's cost lands in the next turn's `schedule` stage (`turbine_engine_iteration_seconds{stage="schedule"}`). The copies also compete with the forward pass for PCIe and the device.
+
+Options:
+
+- A) Pressure reclaim follows the evidence gate, bounded in flight. `free_unreferenced` (ORANGE and above) drops blocks without reuse evidence immediately, exactly as without a lower tier. `demote` (YELLOW, and ORANGE's second call) leaves them cached in L0, where the next allocation takes them at no cost. Blocks with evidence are still copied down in value order. Any L0 copy, whether from capacity or pressure, starts only while fewer than 32 are in flight (`DEMOTION_INFLIGHT`), so the copy stream paces the work. The offline simulator's direct `demote_to(.., Pressure)` stays ungated, which keeps the kv-sim bounds (recommended)
+- B) Only pace the pressure path (a per-call or per-second cap) and keep copying one-off blocks: less engine time per turn, but every one-off block still costs a copy and pins its L0 block, and the PCIe traffic stays
+- C) Move copy submission and polling to a helper thread: removes the host time from the engine thread, but the copies, the pinned L0 blocks and the PCIe contention remain; a larger change to the copy-stream ownership (`ShimContext` is driven from the engine thread)
+- D) Gate all `Pressure` reclaim inside `demote_to` (A' of "capacity demotion only for blocks with reuse evidence"): fails kv-sim `mixed` (0.93 × LRU)
+
+**Answer (2026-09-28): provisional (coordinator default under "Continue through the phases unattended", pending user review) — A.** Code: `turbine_kv::hierarchy::{KvHierarchy::pressure_reclaim, DEMOTION_INFLIGHT}`. `apply_reclaim` now runs the free request before the demote request.
+
+What it gives up: at ORANGE and above, a block first computed without a session or a second sharer (a system prompt before its second use, turn 1 of a conversation without `prompt_cache_key`) is dropped rather than kept in L1. That is exactly what happens with L1 off. At YELLOW such blocks stay cached in L0. Session blocks, hit blocks and shared prefixes still move to L1.
+
+Tests:
+
+- `kv_sim one_off_overload_does_not_demote`: at ORANGE and RED with L1 on, 0 copies, 0 pinned blocks, the same drain time as with L1 off (6.17 s), and 2,229 blocks dropped for `pressure` at RED.
+- `hierarchy::tests::pressure_reclaim_drops_one_off_blocks_and_bounds_copies`:
+  - `demote` copies 36 re-used blocks at most 32 at a time and leaves the one-off blocks cached;
+  - `free_unreferenced` then drops the one-off blocks at once, with no copy.
+- `kv_sim demotion_under_pressure` and `cancellation_releases_kv` still pass. Their `reuse` helper now sends two extra tokens instead of one: since 3ff23c2, prefix reuse leaves two prompt tokens to prefill, so with one extra token the last full block was never hit and had no evidence.
+- The kv-sim bench tests (`cost_aware_beats_lru`, `mixed` ≤ 0.9 × LRU) are unchanged and pass.
+
+Follow-up, not in this change: copy a block with one `copy_async` per contiguous run instead of one per layer. That would need a block-contiguous L0 layout or a batched copy call in the ABI. The lab measurement shows about 2× the bandwidth and 20–80× less enqueue time per block.
+
 ## Pre-Phase-5 perf items (from the 2026-09-27 profile)
 
 Profile: branch `perf-profile` 5db197c, `.procoder/perf-profile-2026-09-27.md`. Options (multi-select):

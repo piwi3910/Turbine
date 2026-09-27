@@ -45,10 +45,23 @@ struct Setup {
     l1: Arc<MemTier>,
     l2: Arc<MemTier>,
     reg: MetricsRegistry,
+    clock: FakeClock,
 }
 
 /// L0 of `l0` blocks (accounting only), payload-free L1/L2 of `l1`/`l2` blocks.
-fn setup(l0: u32, l1: u64, l2: u64, mut kv: KvConfig, kind: MemoryKind) -> Setup {
+fn setup(l0: u32, l1: u64, l2: u64, kv: KvConfig, kind: MemoryKind) -> Setup {
+    setup_with(l0, l1, l2, kv, kind, |_| {})
+}
+
+/// [`setup`] with `tune` applied to the simulated copy backend (path costs).
+fn setup_with(
+    l0: u32,
+    l1: u64,
+    l2: u64,
+    mut kv: KvConfig,
+    kind: MemoryKind,
+    tune: impl FnOnce(&mut SimTransferBackend),
+) -> Setup {
     // These mechanism tests page at 16 tokens (`format()`), not the 128-token default.
     kv.block_tokens = format().layout.block_tokens;
     let clock = FakeClock::new(Duration::ZERO);
@@ -101,12 +114,14 @@ fn setup(l0: u32, l1: u64, l2: u64, mut kv: KvConfig, kind: MemoryKind) -> Setup
         queue_timeout: Duration::from_secs(3600),
     };
     let sched = Scheduler::new(params, arc.clone());
-    let backend = SimTransferBackend::new(arc, l1d, l2d, bb as usize);
+    let mut backend = SimTransferBackend::new(arc, l1d, l2d, bb as usize);
+    tune(&mut backend);
     Setup {
-        driver: KvSimDriver::new(sched, pool, kv, backend, clock),
+        driver: KvSimDriver::new(sched, pool, kv, backend, clock.clone()),
         l1: l1t,
         l2: l2t,
         reg,
+        clock,
     }
 }
 
@@ -199,12 +214,13 @@ fn prefix_reuse_refcounts() {
     assert_eq!(d.violations(), &[] as &[String]);
 }
 
-/// Each prompt sent again with one more token: its full blocks are attached, a hit — the
-/// reuse evidence demotion needs (one-off blocks are never copied down).
+/// Each prompt sent again with two more tokens (prefix reuse always leaves two prompt tokens
+/// to prefill): all its full blocks are attached, a hit — the reuse evidence demotion needs
+/// (one-off blocks are never copied down, and pressure reclaim drops them).
 fn reuse(d: &mut KvSimDriver, prompts: &[Vec<u32>], first_id: u128) {
     for (i, p) in prompts.iter().enumerate() {
         let mut again = p.clone();
-        again.push(7);
+        again.extend([7, 8]);
         // One at a time: the pool is nearly full of the cached blocks being re-used.
         d.submit(rid(first_id + i as u128), again, 1);
         drain(d);
@@ -429,4 +445,118 @@ fn cancellation_releases_kv() {
         "the prefetch completed"
     );
     assert_eq!(d.violations(), &[] as &[String]);
+}
+
+/// What one overload run of [`one_off_overload`] did.
+#[derive(Debug)]
+struct OverloadRun {
+    /// L0 → lower-tier copies started.
+    demotions: u64,
+    /// Blocks dropped outright by pressure reclaim.
+    pressure_drops: f64,
+    /// Most L0 blocks pinned by in-flight demotions at one iteration boundary.
+    peak_pinned: usize,
+    /// Iterations that submitted at least one demotion, and the most in one iteration.
+    demoting_turns: u32,
+    peak_demotions_per_turn: u64,
+    /// Virtual time until every request finished.
+    drain: Duration,
+}
+
+/// The overload soak's shape on the simulator: a stream of one-off prompts (every prompt
+/// distinct, as `turbine-bench --prompt-words-range` draws them) at a fixed pressure state,
+/// with L1 copies as slow relative to a decode step as on the R9700 (a 14.7 MB Llama block at
+/// ~3.8 GB/s ≈ 3.9 ms, against a 5 ms step here).
+fn one_off_overload(l1_blocks: u64, state: PressureState) -> OverloadRun {
+    let mut s = setup_with(
+        64,
+        l1_blocks,
+        0,
+        KvConfig::default(),
+        MemoryKind::Dedicated,
+        |b| {
+            b.set_cost(
+                turbine_kv::transfer::TransferPath::L0ToL1,
+                turbine_kv::planner::PathCost {
+                    latency_s: 20e-6,
+                    bandwidth_bps: block_bytes() as f64 / 3.9e-3,
+                },
+            )
+        },
+    );
+    let d = &mut s.driver;
+    d.set_pressure(state);
+    let start = s.clock.now_mono();
+    let mut run = OverloadRun {
+        demotions: 0,
+        pressure_drops: 0.0,
+        peak_pinned: 0,
+        demoting_turns: 0,
+        peak_demotions_per_turn: 0,
+        drain: Duration::ZERO,
+    };
+    let mut next = 1u128;
+    for step in 0..20_000 {
+        // Three arrivals every other step for 120 steps: more than the 64-block pool holds.
+        if step < 240 && step % 2 == 0 {
+            for _ in 0..3 {
+                let len = 40 + (next as u32 * 37) % 120;
+                let base = next as u32 * 1_000;
+                d.submit(rid(next), (base..base + len).collect(), 8);
+                next += 1;
+            }
+        }
+        if step >= 240 && d.is_idle() {
+            break;
+        }
+        let before = d.kv().stats().demotions;
+        d.step();
+        let submitted = d.kv().stats().demotions - before;
+        run.peak_pinned = run.peak_pinned.max(d.kv().l0_demotions_in_flight());
+        if submitted > 0 {
+            run.demoting_turns += 1;
+            run.peak_demotions_per_turn = run.peak_demotions_per_turn.max(submitted);
+        }
+    }
+    assert!(d.is_idle(), "the overload drains");
+    assert_eq!(d.violations(), &[] as &[String]);
+    run.demotions = d.kv().stats().demotions;
+    run.pressure_drops = metric(&s.reg, r#"turbine_kv_drops_total{reason="pressure"}"#);
+    run.drain = s.clock.now_mono() - start;
+    run
+}
+
+/// Overload soak regression (provisional decision "Phase 4: pressure reclaim copies only
+/// blocks with reuse evidence, bounded in flight"): at ORANGE and RED the Phase 3 controller
+/// asks for every unreferenced cached block on each tick. One-off blocks carry no reuse
+/// evidence, so they are dropped, as with L1 off, instead of each costing an L0 → L1 copy that
+/// pins its block until done; the run takes as long as without L1.
+#[test]
+fn one_off_overload_does_not_demote() {
+    let runs: Vec<_> = [PressureState::Orange, PressureState::Red]
+        .into_iter()
+        .map(|state| {
+            (
+                state,
+                one_off_overload(4_096, state),
+                one_off_overload(0, state),
+            )
+        })
+        .collect();
+    for (state, with_l1, without) in &runs {
+        eprintln!("{state:?} L1 on:  {with_l1:?}");
+        eprintln!("{state:?} L1 off: {without:?}");
+    }
+    for (state, with_l1, without) in &runs {
+        assert_eq!(
+            with_l1.demotions, 0,
+            "{state:?}: no copy for one-off blocks"
+        );
+        assert_eq!(with_l1.peak_pinned, 0);
+        assert_eq!(with_l1.drain, without.drain, "{state:?}: L1 costs nothing");
+    }
+    assert!(
+        runs[1].1.pressure_drops > 0.0,
+        "RED frees one-off blocks now"
+    );
 }

@@ -124,3 +124,92 @@ fn pinned_round_trip() {
         h2d_bytes as f64 / h2d_secs / 1e9
     );
 }
+
+/// Engine-thread cost of demoting Llama-3.2-3B blocks of the serving default (128 tokens,
+/// 14.7 MB) to pinned memory the way the KV orchestrator does: one `copy_async` per layer
+/// (28 per block, each with its compute-stream fence and completion event), then the per-turn
+/// `poll` sweep over every in-flight ticket until all are done. Reports the host time to
+/// enqueue a block, the host time of one `poll`, and the same enqueue as one copy per block
+/// for comparison (overload soak investigation, provisional decision "Phase 4: pressure
+/// reclaim copies only blocks with reuse evidence, bounded in flight").
+#[test]
+#[ignore = "needs a HIP device and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn demotion_host_cost() {
+    const LAYERS: usize = 28;
+    const LAYER_BYTES: usize = 524_288;
+    const BLOCK_128: usize = LAYERS * LAYER_BYTES;
+    const N: usize = 32;
+    if !require_backend("hip") {
+        return;
+    }
+    let ctx = open_context("hip");
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let host = ctx.alloc_pinned(N * BLOCK_128).expect("pinned slab");
+    let gpu = DeviceBuffer::alloc(&mem, N * BLOCK_128).expect("GPU blocks");
+    mem.synchronize().expect("allocated");
+
+    let per_layer = |round: usize| {
+        let started = Instant::now();
+        let mut tickets = Vec::with_capacity(N * LAYERS);
+        for b in 0..N {
+            for l in 0..LAYERS {
+                let off = b * BLOCK_128 + l * LAYER_BYTES;
+                tickets.push(
+                    ctx.copy_async(
+                        CopyTarget::Pinned {
+                            buffer_id: host.id(),
+                            offset: off,
+                        },
+                        CopyTarget::Device(gpu.ptr().offset(off as u64)),
+                        LAYER_BYTES,
+                    )
+                    .expect("d2h copy"),
+                );
+            }
+        }
+        let enqueue = started.elapsed().as_secs_f64();
+        let (mut polls, mut poll_secs) = (0u64, 0.0f64);
+        let mut pending = tickets;
+        while !pending.is_empty() {
+            let sweep = Instant::now();
+            let n = pending.len() as u64;
+            pending.retain(|t| !ctx.poll(t).expect("poll"));
+            poll_secs += sweep.elapsed().as_secs_f64();
+            polls += n;
+        }
+        let total = started.elapsed().as_secs_f64();
+        println!(
+            "demotion_host_cost round={round} per_layer_copies enqueue_us_per_block={:.0} \
+             poll_us={:.2} polls={polls} d2h_gbps={:.2}",
+            enqueue / N as f64 * 1e6,
+            poll_secs / polls as f64 * 1e6,
+            (N * BLOCK_128) as f64 / total / 1e9
+        );
+    };
+    per_layer(0);
+    per_layer(1);
+
+    let started = Instant::now();
+    let tickets: Vec<_> = (0..N)
+        .map(|b| {
+            ctx.copy_async(
+                CopyTarget::Pinned {
+                    buffer_id: host.id(),
+                    offset: b * BLOCK_128,
+                },
+                CopyTarget::Device(gpu.ptr().offset((b * BLOCK_128) as u64)),
+                BLOCK_128,
+            )
+            .expect("d2h copy")
+        })
+        .collect();
+    let enqueue = started.elapsed().as_secs_f64();
+    for t in &tickets {
+        ctx.wait(t).expect("wait");
+    }
+    println!(
+        "demotion_host_cost one_copy_per_block enqueue_us_per_block={:.0} d2h_gbps={:.2}",
+        enqueue / N as f64 * 1e6,
+        (N * BLOCK_128) as f64 / started.elapsed().as_secs_f64() / 1e9
+    );
+}

@@ -230,6 +230,11 @@ impl KvReclaimer for KvReclaimHandle {
 /// Blocks capacity demotion moves per call (P4: bounds the engine thread's work per turn).
 pub const CAPACITY_BATCH: usize = 32;
 
+/// Most L0 blocks copied down at once by capacity and pressure reclaim: each pins its L0 block
+/// until the copy completes, and each costs the engine thread one enqueue per layer and one
+/// poll per layer and turn, so new copies start only as earlier ones finish.
+pub const DEMOTION_INFLIGHT: usize = 32;
+
 /// Evidence that a cached block will be read again, the precondition for spending a copy on
 /// it: it was attached at least once since it was written (a hit), it belongs to a session
 /// (`prompt_cache_key`), or it is a shared prefix (two or more cached children). A block of a
@@ -395,6 +400,15 @@ impl KvHierarchy {
 
     pub fn transfer(&self) -> &TransferEngine {
         &self.transfer
+    }
+
+    /// L0 blocks being copied down: each stays referenced (unallocatable) until its copy
+    /// completes.
+    pub fn l0_demotions_in_flight(&self) -> usize {
+        self.demoting
+            .values()
+            .filter(|(from, _)| *from == TierId::L0)
+            .count()
     }
 
     /// Startup calibration seeds path estimates here.
@@ -1144,15 +1158,103 @@ impl KvHierarchy {
         }
     }
 
-    /// Carries out the reclaim requests the pressure controller stored in the handle; returns
-    /// the bytes scheduled or freed.
+    /// Carries out the reclaim requests the pressure controller stored in the handle (free
+    /// first: dropping is cheap and may already meet the demote target); returns the bytes
+    /// scheduled or freed. See [`KvHierarchy::pressure_reclaim`].
     pub fn apply_reclaim(&mut self, pool: &mut BlockPool) -> u64 {
         let mut bytes = 0;
-        if let Some(t) = KvReclaimHandle::take(&self.reclaim.demote_target) {
-            bytes += self.demote_to(pool, t, EvictReason::Pressure);
-        }
         if let Some(t) = KvReclaimHandle::take(&self.reclaim.free_target) {
-            bytes += self.demote_to(pool, t, EvictReason::Pressure);
+            bytes += self.pressure_reclaim(pool, t, true);
+        }
+        if let Some(t) = KvReclaimHandle::take(&self.reclaim.demote_target) {
+            bytes += self.pressure_reclaim(pool, t, false);
+        }
+        bytes
+    }
+
+    /// Room for more L0 demotions under [`DEMOTION_INFLIGHT`].
+    fn demotion_budget(&self) -> usize {
+        DEMOTION_INFLIGHT.saturating_sub(self.l0_demotions_in_flight())
+    }
+
+    /// The Phase 3 controller's reclaim toward L0 utilisation `target` (its `demote` when
+    /// `free` is false, `free_unreferenced` when true), lowest-value unreferenced blocks first
+    /// (provisional decision "Phase 4: pressure reclaim copies only blocks with reuse evidence,
+    /// bounded in flight"). The controller asks again on every tick while the state lasts, so
+    /// the work per call is bounded:
+    ///
+    /// - a block with reuse evidence ([`has_reuse_evidence`]) scoring at least
+    ///   `kv.demote_min_value` is copied down, while fewer than [`DEMOTION_INFLIGHT`] L0 copies
+    ///   are in flight (each pins its L0 block until done, so the copy stream paces the rest);
+    /// - any other block is dropped by `free`, exactly as without a lower tier, and left cached
+    ///   by `demote` (an allocation takes it at no cost; below-`demote_min_value` blocks are
+    ///   dropped by both, as before).
+    ///
+    /// Without a lower tier this is [`KvHierarchy::demote_to`]: every victim is dropped.
+    pub fn pressure_reclaim(&mut self, pool: &mut BlockPool, target: f64, free: bool) -> u64 {
+        let Some(to) = self.l0_demotion_target() else {
+            return self.demote_to(pool, target, EvictReason::Pressure);
+        };
+        let total = f64::from(pool.total_blocks());
+        let leaving = self.l0_demotions_in_flight() as f64;
+        let need = (f64::from(pool.used_blocks()) - leaving - target * total)
+            .ceil()
+            .max(0.0) as usize;
+        if need == 0 {
+            return 0;
+        }
+        self.sync_l0_refs(pool);
+        let victims = self.victims(pool, TierId::L0, need);
+        let mut budget = self.demotion_budget();
+        let mut room = 0;
+        if budget > 0 {
+            let copies = victims
+                .iter()
+                .filter(|(k, v)| {
+                    *v >= self.cfg.demote_min_value
+                        && self.dir.get(k).is_some_and(has_reuse_evidence)
+                })
+                .count();
+            room = self.make_room(pool, to, copies.min(budget));
+        }
+        // Victims are leaf-first on the assumption that each chosen child departs: a block
+        // whose child stays in L0 is kept.
+        let mut departing: HashSet<KvKey> = self.demoting.keys().copied().collect();
+        let bb = self.cfg.block_bytes;
+        let mut bytes = 0;
+        for (key, value) in victims {
+            let Some(b) = self.dir.get(&key) else {
+                continue;
+            };
+            if !self.dir.evictable(b, TierId::L0, &departing) {
+                continue;
+            }
+            let evidence = has_reuse_evidence(b);
+            let copied = b.location(to).is_some();
+            if value < self.cfg.demote_min_value || (!evidence && free) {
+                let why = if value < self.cfg.demote_min_value {
+                    EvictReason::BelowMinValue
+                } else {
+                    EvictReason::Pressure
+                };
+                self.drop_everywhere(pool, &key, why);
+                departing.insert(key);
+                bytes += bb;
+            } else if !evidence {
+                // `demote` leaves a one-off block cached in L0.
+            } else if copied {
+                // Already copied down: free the L0 copy now.
+                self.metrics.demotion(TierId::L0, to);
+                self.stats.demotions += 1;
+                self.remove_copy(pool, &key, TierId::L0, EvictReason::Pressure);
+                departing.insert(key);
+                bytes += bb;
+            } else if room > 0 && budget > 0 && self.submit_demotion(pool, key, TierId::L0, to) {
+                room -= 1;
+                budget -= 1;
+                departing.insert(key);
+                bytes += bb;
+            }
         }
         bytes
     }
@@ -1169,8 +1271,10 @@ impl KvHierarchy {
     /// evidence ([`has_reuse_evidence`]) are worth a copy (provisional decision "Phase 4:
     /// capacity demotion only for blocks with reuse evidence"): the others stay cached in L0
     /// until an allocation reclaims them, at no cost, and at most [`CAPACITY_BATCH`] blocks move
-    /// per call. Pressure reclaim (the Phase 3 controller) takes every unreferenced block in
-    /// value order, as the eviction policy ranks them.
+    /// per call, fewer when [`DEMOTION_INFLIGHT`] copies are already running. Under any other
+    /// reason every unreferenced block is taken in value order, as the eviction policy ranks
+    /// them (the offline simulator's reclaim); the Phase 3 controller's requests go through
+    /// [`KvHierarchy::pressure_reclaim`].
     pub fn demote_to(&mut self, pool: &mut BlockPool, target: f64, reason: EvictReason) -> u64 {
         let total = f64::from(pool.total_blocks());
         let leaving = self
@@ -1187,12 +1291,11 @@ impl KvHierarchy {
         self.sync_l0_refs(pool);
         let capacity = reason == EvictReason::Capacity;
         let victims = if capacity {
-            self.victims_where(
-                pool,
-                TierId::L0,
-                need.min(CAPACITY_BATCH),
-                has_reuse_evidence,
-            )
+            let batch = need.min(CAPACITY_BATCH).min(self.demotion_budget());
+            if batch == 0 {
+                return 0;
+            }
+            self.victims_where(pool, TierId::L0, batch, has_reuse_evidence)
         } else {
             self.victims(pool, TierId::L0, need)
         };
@@ -1840,6 +1943,8 @@ pub(crate) mod tests {
         let mut r = rig(8, Some(l1), None, clock);
         let prompt: Vec<u32> = (0..66).collect();
         run(&mut r, &prompt);
+        // Sent again: a hit, the reuse evidence pressure reclaim copies a block for.
+        run(&mut r, &prompt);
         let handle = r.h.reclaimer();
         assert_eq!(handle.demote(0.0), 0, "nothing published yet");
         r.h.poll(&mut r.pool, &mut r.backend);
@@ -1855,6 +1960,64 @@ pub(crate) mod tests {
         r.h.poll(&mut r.pool, &mut r.backend);
         assert_eq!(r.pool.used_blocks(), 2);
         assert_eq!(handle.free_unreferenced(0.0), 2 * bb);
+    }
+
+    /// The overload soak regression (ITL p99 393 ms with L1 against 205 ms without): at ORANGE
+    /// and RED the Phase 3 controller asks for every unreferenced block on each tick, and every
+    /// finished one-off request's blocks were copied to L1, each pinning its L0 block until
+    /// done. Catches a copy spent on a block without reuse evidence under controller reclaim,
+    /// a one-off block `free_unreferenced` fails to drop, a re-used block it fails to copy
+    /// down, or more than `DEMOTION_INFLIGHT` copies started at once.
+    #[test]
+    fn pressure_reclaim_drops_one_off_blocks_and_bounds_copies() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 64 * bb, arc));
+        let mut r = rig(48, Some(l1.clone()), None, clock);
+        let handle = r.h.reclaimer();
+        let settle = |r: &mut Rig| {
+            for _ in 0..4 {
+                r.clock.advance(Duration::from_millis(10));
+                r.h.poll(&mut r.pool, &mut r.backend);
+            }
+        };
+
+        // A one-off prompt (4 blocks) and a re-used one (36 blocks, sent twice).
+        let one_off: Vec<u32> = (0..66).collect();
+        run(&mut r, &one_off);
+        let reused: Vec<u32> = (1000..1578).collect();
+        run(&mut r, &reused);
+        assert_eq!(run(&mut r, &reused).cached_tokens, 576);
+        assert_eq!(r.pool.cached_unreferenced(), 40);
+
+        // `demote` (YELLOW): the re-used blocks go down, at most DEMOTION_INFLIGHT at once; the
+        // one-off blocks stay cached in L0.
+        handle.demote(0.0);
+        r.h.apply_reclaim(&mut r.pool);
+        assert_eq!(r.h.l0_demotions_in_flight(), DEMOTION_INFLIGHT);
+        handle.demote(0.0);
+        r.h.apply_reclaim(&mut r.pool);
+        assert_eq!(
+            r.h.l0_demotions_in_flight(),
+            DEMOTION_INFLIGHT,
+            "no new copy before earlier ones finish"
+        );
+        settle(&mut r);
+        handle.demote(0.0);
+        r.h.apply_reclaim(&mut r.pool);
+        settle(&mut r);
+        assert_eq!(l1.len(), 36, "every re-used block copied down");
+        assert_eq!(r.pool.cached_unreferenced(), 4, "the one-off blocks stay");
+
+        // `free_unreferenced` (ORANGE and above): the one-off blocks are dropped now, no copy.
+        let drops = r.h.stats().drops;
+        handle.free_unreferenced(0.0);
+        r.h.apply_reclaim(&mut r.pool);
+        assert_eq!(r.h.l0_demotions_in_flight(), 0);
+        assert_eq!(r.pool.used_blocks(), 0, "freed at once");
+        assert_eq!(r.h.stats().drops, drops + 4);
+        assert_eq!(l1.len(), 36);
     }
 
     /// The Phase 4 bench regression (8 % Llama throughput on a no-reuse workload): capacity
@@ -1920,7 +2083,8 @@ pub(crate) mod tests {
             4 * bb
         );
 
-        // Pressure reclaim (the Phase 3 controller) is not gated: one-off blocks leave L0 too.
+        // `demote_to` under `Pressure` (the offline simulator's reclaim) is not gated: one-off
+        // blocks leave L0 too. The controller's requests go through `pressure_reclaim`.
         let other: Vec<u32> = (2000..2033).collect();
         run(&mut r, &other);
         let before = l1.len();
