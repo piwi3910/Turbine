@@ -199,7 +199,7 @@ trap 'rm -f "$LOG"' EXIT
 RC=0
 if [[ $NEXTEST -eq 1 ]]; then
 	say "cargo nextest run ${TEST_SELECT[*]:-} (on ${HOST})"
-	scripts/remote-cargo.sh nextest run "${TEST_SELECT[@]}" 2>&1 | tee "$LOG" || RC=1
+	scripts/remote-cargo.sh nextest run --no-fail-fast "${TEST_SELECT[@]}" 2>&1 | tee "$LOG" || RC=1
 else
 	say "cargo test --no-fail-fast ${TEST_SELECT[*]:-} (on ${HOST})"
 	scripts/remote-cargo.sh test --no-fail-fast "${TEST_SELECT[@]}" 2>&1 | tee "$LOG" || RC=1

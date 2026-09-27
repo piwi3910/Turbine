@@ -1,0 +1,8 @@
+# cargo-nextest settings for scripts/gate.sh (nextest runs every test as its own process, all at
+# once, so wall-clock assertions see more contention than under `cargo test`).
+
+# server_cli asserts shutdown timings against real clocks (e.g. sigterm_drains_then_cancels:
+# a short stream must finish inside the 2 s grace); run each of its tests with the host to itself.
+[[profile.default.overrides]]
+filter = 'binary(server_cli)'
+threads-required = 'num-test-threads'
