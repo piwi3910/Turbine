@@ -5,7 +5,7 @@
 //! `TURBINE_KERNEL_LIBRARY` and `TURBINE_AMD_SMI_LIBRARY`.
 //!
 //! Tolerance: BF16 outputs |Δ| ≤ 1e-2, or one BF16 ulp of the reference where its magnitude
-//! exceeds 2 (a rounding flip after a different f32 summation order); F32 outputs |Δ| ≤ 1e-4;
+//! is 2 or more (a rounding flip after a different f32 summation order); F32 outputs |Δ| ≤ 1e-4;
 //! copies (the paged K/V append, `copy_blocks`) and `moe_route` selections are exact;
 //! `logits_reduce` (ABI v2.1) top-n ids are exact, its lse within 1e-5 relative and its draws
 //! identical except within 1e-6 of a CDF boundary.
@@ -183,13 +183,13 @@ fn read(t: &Tensor) -> Vec<f32> {
     decode(t.dtype, &t.view().slice.read_bytes().expect("read back"))
 }
 
-/// |Δ| ≤ 1e-2, or one BF16 ulp of `want` where |want| > 2.
+/// |Δ| ≤ 1e-2, or one BF16 ulp of `want` where |want| ≥ 2 (at exactly 2 the ulp above, 2^-6, exceeds 1e-2).
 fn bf16_close(got: f32, want: f32) -> bool {
     let d = (got - want).abs();
     if d <= 1e-2 {
         return true;
     }
-    if want.abs() > 2.0 {
+    if want.abs() >= 2.0 {
         let b = bf16::from_f32(want.abs());
         let ulp = bf16::from_bits(b.to_bits() + 1).to_f32() - b.to_f32();
         return d <= ulp;

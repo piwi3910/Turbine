@@ -6,8 +6,8 @@ Reads <tuning-dir>/<arch>/gemm.tsv for every build architecture that has one (wr
 tuner, tools/gemm_tune.cpp) and writes the rows as C++ initialisers of turbine_hip::TunedGemm
 (src/gemm_table.hpp). A malformed row fails the build. Columns (tab-separated, `#` comments):
 n, k, trans_b, c_dtype (bf16|f32), m_max, solution_index, solution_name (or -1 and `heuristic`:
-the bucket keeps hipBLASLt's first heuristic answer per call), then informational columns the
-library ignores.
+the bucket keeps hipBLASLt's first heuristic answer per call), mode (invariant|speed), then
+informational columns the library ignores.
 """
 
 import argparse
@@ -19,6 +19,8 @@ DTYPES = {"bf16": 0, "f32": 2}  # TURBINE_DTYPE_BF16, TURBINE_DTYPE_F32
 NAME = re.compile(r"^[A-Za-z0-9_]+$")
 # A bucket where no solution beat hipBLASLt's own per-call answer (index -1).
 HEURISTIC = "heuristic"
+# invariant: run with split-K off (rows do not depend on the batch); speed: as tuned.
+MODES = {"invariant": "true", "speed": "false"}
 
 
 def rows(path: pathlib.Path):
@@ -29,10 +31,12 @@ def rows(path: pathlib.Path):
                 continue
             cols = line.split("\t")
             where = f"{path}:{lineno}"
-            if len(cols) < 7:
+            if len(cols) < 8:
                 sys.exit(
-                    f"{where}: expected at least 7 tab-separated columns, got {len(cols)}"
+                    f"{where}: expected at least 8 tab-separated columns, got {len(cols)}"
                 )
+            if cols[7] not in MODES:
+                sys.exit(f"{where}: mode {cols[7]!r} is not one of {sorted(MODES)}")
             try:
                 n, k, trans_b, m_max, index = (int(cols[i]) for i in (0, 1, 2, 4, 5))
             except ValueError as e:
@@ -49,7 +53,7 @@ def rows(path: pathlib.Path):
                 sys.exit(
                     f"{where}: solution name {cols[6]!r} is not a hipBLASLt solution name"
                 )
-            yield n, k, trans_b, DTYPES[cols[3]], m_max, index, cols[6]
+            yield n, k, trans_b, DTYPES[cols[3]], m_max, index, cols[6], MODES[cols[7]]
 
 
 def main():
@@ -67,7 +71,7 @@ def main():
             )
             continue
         seen = set()
-        for n, k, trans_b, c_dtype, m_max, index, name in rows(path):
+        for n, k, trans_b, c_dtype, m_max, index, name, invariant in rows(path):
             key = (n, k, trans_b, c_dtype, m_max)
             if key in seen:
                 sys.exit(
@@ -75,7 +79,7 @@ def main():
                 )
             seen.add(key)
             out.append(
-                f'{{"{arch}", {n}, {k}, {trans_b}, {c_dtype}, {m_max}, {index}, "{name}"}},'
+                f'{{"{arch}", {n}, {k}, {trans_b}, {c_dtype}, {m_max}, {index}, "{name}", {invariant}}},'
             )
     text = "\n".join(out) + "\n"
     if not args.out.exists() or args.out.read_text() != text:

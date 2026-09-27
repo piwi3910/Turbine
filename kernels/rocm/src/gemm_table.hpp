@@ -13,11 +13,12 @@
 // hipBLASLt's own per-call answer over that bucket, so the library asks the
 // heuristic, as for a shape without rows.
 //
-// A pinned solution always runs with split-K off (hipBLASLt ext GemmTuning
-// splitK = 1): by default hipBLASLt splits K across workgroups for small
-// problems, so the same solution would sum a row in another order at m = 1
-// than inside a large batch; with split-K off its sums do not depend on m
-// (row invariance, the tuner's acceptance check).
+// A row of a shape tuned in mode `invariant` runs with split-K off (hipBLASLt
+// ext GemmTuning splitK = 1): by default hipBLASLt splits K across workgroups
+// for small problems, so the same solution would sum a row in another order at
+// m = 1 than inside a large batch; with split-K off its sums do not depend on m
+// (row invariance, the tuner's acceptance check). A row of mode `speed` runs
+// through hipblasLtMatmul as tuned (split-K allowed, batch-variant).
 #pragma once
 
 #include <cstdint>
@@ -36,6 +37,10 @@ struct TunedGemm {
   int64_t m_max;
   int32_t solution_index;
   const char *solution_name;
+  // Batch invariance required (the shape's tuning mode `invariant`): run with
+  // split-K off through pinned_gemm. false (`speed`): hipblasLtMatmul with the
+  // solution as tuned, split-K as hipBLASLt chooses.
+  bool invariant;
 };
 
 // The table row serving s on arch, or nullptr when the table has none.
@@ -53,7 +58,8 @@ enum class TunedGemmMiss {
 const char *tuned_gemm_miss_code(TunedGemmMiss miss);
 
 // Resolves row t for the call d (problem p) on ctx's hipBLASLt handle into
-// *algo, checked with split-K off. On failure returns false and sets *miss.
+// *algo, checked the way the row runs (split-K off when t.invariant). On
+// failure returns false and sets *miss.
 bool resolve_tuned_gemm(turbine_ctx *ctx, const TunedGemm &t, GemmProblem &p,
                         const turbine_gemm_desc *d, hipblasLtMatmulAlgo_t *algo,
                         TunedGemmMiss *miss);

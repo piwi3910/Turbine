@@ -14,7 +14,7 @@ namespace {
 // for every build architecture that has one.
 const turbine_hip::TunedGemm kTable[] = {
 #include "gemm_tuned_table.inc"
-    {nullptr, 0, 0, 0, 0, 0, 0, nullptr},
+    {nullptr, 0, 0, 0, 0, 0, 0, nullptr, false},
 };
 
 // The solution index of name for output type c_dtype in this hipBLASLt, or -1
@@ -135,7 +135,18 @@ bool resolve_tuned_gemm(turbine_ctx *ctx, const TunedGemm &t, GemmProblem &p,
     *miss = TunedGemmMiss::Unavailable;
     return false;
   }
-  if (pinned_gemm(ctx, p, d, algo, false) != HIPBLAS_STATUS_SUCCESS) {
+  bool ok;
+  if (t.invariant) {
+    ok = pinned_gemm(ctx, p, d, algo, false) == HIPBLAS_STATUS_SUCCESS;
+  } else {
+    size_t workspace = 0;
+    ok = hipblaslt_ext::matmulIsAlgoSupported(
+             ctx->blaslt, p.desc.handle, &d->alpha, p.weight.handle,
+             p.act.handle, &d->beta, p.out.handle, p.out.handle, *algo,
+             workspace) == HIPBLAS_STATUS_SUCCESS &&
+         workspace <= kGemmWorkspaceBytes;
+  }
+  if (!ok) {
     *miss = TunedGemmMiss::Unsupported;
     return false;
   }

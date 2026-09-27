@@ -275,8 +275,8 @@ mod tests {
     /// Every tuned GEMM table (`kernels/rocm/tuning/<arch>/gemm.tsv`, compiled into the HIP
     /// library by `kernels/rocm/cmake/gemm_table.py`) belongs to a registered profile's
     /// architecture, and its rows are well formed: positive n, k and m_max, trans_b 0 or 1, a
-    /// `bf16` / `f32` output, a solution index and name (or -1 and `heuristic`), m_max strictly
-    /// ascending per shape.
+    /// `bf16` / `f32` output, a solution index and name (or -1 and `heuristic`), a mode
+    /// (`invariant` or `speed`), m_max strictly ascending per shape.
     /// Breaks if a table is added for an architecture no profile describes (it would never be
     /// built) or a hand edit leaves a row the build refuses.
     #[test]
@@ -303,7 +303,12 @@ mod tests {
                 }
                 let at = format!("{arch}/gemm.tsv:{}", i + 1);
                 let c: Vec<&str> = line.split('\t').collect();
-                assert!(c.len() >= 7, "{at}: {} columns", c.len());
+                assert!(c.len() >= 8, "{at}: {} columns", c.len());
+                assert!(
+                    matches!(c[7], "invariant" | "speed"),
+                    "{at}: mode {} (invariant or speed)",
+                    c[7]
+                );
                 let num = |j: usize| {
                     c[j].parse::<i64>()
                         .unwrap_or_else(|e| panic!("{at}: column {j}: {e}"))

@@ -43,6 +43,8 @@ using GemmKey = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
 struct GemmChoice {
   hipblasLtMatmulAlgo_t algo;
   bool tuned;
+  // A pinned row of an `invariant` shape: run with split-K off.
+  bool split_k_off;
 };
 
 struct TunedGemm;

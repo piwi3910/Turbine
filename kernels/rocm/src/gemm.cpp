@@ -99,6 +99,7 @@ int32_t turbine_gemm(turbine_ctx *ctx, const turbine_gemm_desc *d) {
       chosen = turbine_hip::resolve_tuned_gemm(ctx, *row, problem, d,
                                                &choice.algo, &miss);
       choice.tuned = chosen;
+      choice.split_k_off = chosen && row->invariant;
       if (!chosen && ctx->gemm_table_logged.insert(row).second) {
         std::fprintf(stderr,
                      "turbine_hip: event=gemm_table_fallback reason=%s "
@@ -142,7 +143,7 @@ int32_t turbine_gemm(turbine_ctx *ctx, const turbine_gemm_desc *d) {
                         std::to_string(d->m) + " n=" + std::to_string(d->n) +
                         " k=" + std::to_string(d->k));
       }
-      choice = turbine_hip::GemmChoice{result.algo, false};
+      choice = turbine_hip::GemmChoice{result.algo, false, false};
     }
     if (ctx->gemm_algos.size() >= turbine_hip::kGemmAlgoCacheEntries) {
       ctx->gemm_algos.clear();
@@ -150,7 +151,7 @@ int32_t turbine_gemm(turbine_ctx *ctx, const turbine_gemm_desc *d) {
     found = ctx->gemm_algos.emplace(key, choice).first;
   }
 
-  if (found->second.tuned) {
+  if (found->second.split_k_off) {
     return check_blaslt(
         ctx,
         turbine_hip::pinned_gemm(ctx, problem, d, &found->second.algo, true),
