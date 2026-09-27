@@ -117,3 +117,5 @@ Multi-turn (S-16), 1c4f92e code, Llama, native server on GPU 0 with `scripts/lab
 | off            | 128/128     | 0                  | 468                   | 865                   | 309                    | 156          | 92     |
 
 Criterion: ratio ≥ 0.6 and later-turn TTFT ≤ 0.5× off — met (0.906; 0.19×). Pinned L1 round trip (`turbine-kernels --test lab pinned_round_trip`, GPU 0, PCIe Gen5 x8 after the runtime-PM fix): d2h 8.34 GB/s, h2d 9.73 GB/s (Gen1: 1.65 / 1.57).
+
+Full GPU suite on the merge candidate (GPU 1): 395 passed / 0 failed before the old 90-minute Job deadline cut `serving_mix` short (run 0927065245), then the unfinished packages (`turbine-model` onward) 322 passed / 0 failed (run 0927153552, 3-hour deadline, log kept under `target/lab-test/`).
