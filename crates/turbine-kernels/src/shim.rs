@@ -957,6 +957,11 @@ impl DeviceMemory for ShimContext {
         })? {
             return Ok(done);
         }
+        // The only pageable host-to-device copy: a library without pinned memory (counted).
+        debug_assert!(
+            self.lib.syms.v21.staging.is_none(),
+            "pageable host copy on a context with pinned memory"
+        );
         // SAFETY: `src` is a live host slice of `src.len()` bytes and `dst` a device range the
         // caller (`DeviceBuffer`/`DeviceSlice`) bounds-checked. The copy may be asynchronous, so
         // the stream is synchronized below before `src` stops being borrowed.
@@ -1002,6 +1007,11 @@ impl DeviceMemory for ShimContext {
         // Pageable fallback: touch the destination first (a mitigation: touched pageable
         // destinations were always read right, untouched ones not; see `bounce`).
         dst.fill(0);
+        // The only pageable device-to-host copy: a library without pinned memory (counted).
+        debug_assert!(
+            self.lib.syms.v21.staging.is_none(),
+            "pageable host copy on a context with pinned memory"
+        );
         // SAFETY: `dst` is a live, exclusively borrowed host slice of `dst.len()` bytes and `src`
         // a bounds-checked device range. The stream is synchronized below, so the write completes
         // while `dst` is still borrowed.
