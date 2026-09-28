@@ -1110,7 +1110,7 @@ pub(crate) fn load_weights(prepared: &PreparedModel) -> Result<LoadedWeights, St
     // Other expert ranks' and stages' tensors are skipped quietly (counted), not warned one
     // by one.
     WeightLoader::load_part(
-        arch.weight_format.0,
+        arch.weight_format.get(),
         &prepared.index,
         &slots,
         &arch.family.0.weight_slots(arch),

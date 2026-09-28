@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use half::bf16;
 use turbine_core::types::{BlockId, DType, DeviceId, KvLayout, SeqId};
 use turbine_distributed::collective::{Collective, HostCollective};
-use turbine_kernels::cpu::quant::{fp8_e4m3_round, fp8_e4m3_value};
+use turbine_kernels::cpu::quant::{
+    fp8_e4m3_round, fp8_e4m3_value, quantize_dequantize_activations,
+};
+use turbine_kernels::quant::ActQuantDesc;
 use turbine_kernels::torch_topk;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -19,7 +22,7 @@ use turbine_kernels::{
     ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext, EmbeddingKernel,
     GemmConfig, GemmContext, GemmKernel, GraphHandle, KernelError, KernelMetrics, KernelProvider,
     KernelRegistry, KvCopyConfig, KvCopyContext, KvCopyKernel, MoeExpertsConfig, MoeExpertsContext,
-    MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel,
+    MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel, OpConfig,
     PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel, ShimContext,
     ShimLibrary, cpu_reference_provider, shim_provider,
 };
@@ -36,7 +39,7 @@ use turbine_model::pp;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
-    write_tiny_olmoe_with_head_dim,
+    write_tiny_olmoe_with_head_dim, write_tiny_quantized,
 };
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::tp;
@@ -128,8 +131,14 @@ fn paged_executor(
 ) -> DecoderExecutor {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
-    let weights =
-        WeightLoader::load(&index, &llama_slots(cfg), &mem, MAX_STAGING_BYTES).expect("load");
+    let weights = WeightLoader::load_format(
+        cfg.weight_format.get(),
+        &index,
+        &llama_slots(cfg),
+        &mem,
+        MAX_STAGING_BYTES,
+    )
+    .expect("load");
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
     let order = [provider.id()];
     let card = provider.card_profile();
@@ -222,6 +231,12 @@ struct Naive {
     /// FP8 KV (Phase 6a S-13): K after RoPE and V quantize-dequantized with each layer's
     /// scales before attention; from the config's `kv_cache`.
     kv_fp8: Option<KvCache>,
+    /// Quantized activations (Phase 6a S-5): the input of every decoder linear layer is
+    /// quantize-dequantized in this mode before the projection, with the static scale of
+    /// [`Naive::input_scales`] (by the projection's module name).
+    act_quant: ActQuantDesc,
+    /// Static FP8 activation scales by module name (`model.layers.<i>.self_attn.q_proj`, …).
+    input_scales: HashMap<String, f32>,
 }
 
 impl Naive {
@@ -246,7 +261,24 @@ impl Naive {
             renormalize: cfg.moe.is_some_and(|m| m.norm_topk_prob),
             bf16_router: true,
             kv_fp8: cfg.kv_cache.is_fp8().then(|| cfg.kv_cache.clone()),
+            act_quant: ActQuantDesc::None,
+            input_scales: HashMap::new(),
         }
+    }
+
+    /// `x` (rows of `k`) as the quantized layers of `modules` read it: quantize-dequantized in
+    /// [`Naive::act_quant`] with the largest of the modules' static scales (a fused
+    /// projection's rule).
+    fn act_in(&self, x: &[f32], k: usize, modules: &[String]) -> Vec<f32> {
+        let mut y = x.to_vec();
+        if self.act_quant != ActQuantDesc::None {
+            let scale = modules
+                .iter()
+                .map(|m| self.input_scales.get(m).copied().unwrap_or(1.0))
+                .fold(f32::MIN, f32::max);
+            quantize_dequantize_activations(&mut y, x.len() / k, k, self.act_quant, scale);
+        }
+        y
     }
 
     fn get(&self, name: &str) -> &[f32] {
@@ -352,8 +384,17 @@ impl Naive {
     /// `down(silu(gate(h)) · up(h))` for rows `h` of `hidden`; `gate`/`up` are
     /// `[inter, hidden]`, `down` is `[hidden, inter]`.
     fn swiglu(&self, h: &[f32], gate: &[f32], up: &[f32], down: &[f32]) -> Vec<f32> {
+        self.swiglu_in(h, gate, up, down, "")
+    }
+
+    /// [`Naive::swiglu`] of the layer whose MLP module is `mlp` (`model.layers.<i>.mlp`, or ""
+    /// for experts): its inputs are quantized as [`Naive::act_in`] prescribes.
+    fn swiglu_in(&self, h: &[f32], gate: &[f32], up: &[f32], down: &[f32], mlp: &str) -> Vec<f32> {
         let hidden = self.cfg.hidden as usize;
         let inter = gate.len() / hidden;
+        let m = |p: &str| format!("{mlp}.{p}");
+        let h = self.act_in(h, hidden, &[m("gate_proj"), m("up_proj")]);
+        let h = h.as_slice();
         let g = Naive::linear_bf(h, gate, hidden);
         let u = Naive::linear_bf(h, up, hidden);
         let act: Vec<f32> = g
@@ -361,6 +402,7 @@ impl Naive {
             .zip(&u)
             .map(|(g, u)| bf(bf(g / (1.0 + (-g).exp())) * u))
             .collect();
+        let act = self.act_in(&act, inter, &[m("down_proj")]);
         Naive::linear_bf(&act, down, inter)
     }
 
@@ -423,6 +465,12 @@ impl Naive {
             let p = format!("model.layers.{layer}");
             let w = |s: &str| self.get(&format!("{p}.{s}.weight"));
             let h = self.rmsnorm(&x, w("input_layernorm"));
+            let attn_in = |proj: &str| format!("{p}.self_attn.{proj}");
+            let h = self.act_in(
+                &h,
+                hidden,
+                &[attn_in("q_proj"), attn_in("k_proj"), attn_in("v_proj")],
+            );
             let mut q = Naive::linear_bf(&h, w("self_attn.q_proj"), hidden);
             let mut k = Naive::linear_bf(&h, w("self_attn.k_proj"), hidden);
             let mut v = Naive::linear_bf(&h, w("self_attn.v_proj"), hidden);
@@ -438,13 +486,20 @@ impl Naive {
                 fp8_quantize_dequantize(&mut v, kv.v_scale(l));
             }
             let attn = self.attention(&q, &k, &v, t);
+            let attn = self.act_in(&attn, q_dim, &[attn_in("o_proj")]);
             let o = Naive::linear_bf(&attn, w("self_attn.o_proj"), q_dim);
             x = x.iter().zip(&o).map(|(a, b)| bf(a + b)).collect();
             let h = self.rmsnorm(&x, w("post_attention_layernorm"));
             let down = if c.moe.is_some() {
                 self.moe(&h, &p)
             } else {
-                self.swiglu(&h, w("mlp.gate_proj"), w("mlp.up_proj"), w("mlp.down_proj"))
+                self.swiglu_in(
+                    &h,
+                    w("mlp.gate_proj"),
+                    w("mlp.up_proj"),
+                    w("mlp.down_proj"),
+                    &format!("{p}.mlp"),
+                )
             };
             x = x.iter().zip(&down).map(|(a, b)| bf(a + b)).collect();
         }
@@ -864,6 +919,160 @@ fn fp8_kv_matches_reference() {
     }
 }
 
+/// The static activation scales (`<module>.input_scale`) of a quantized tiny checkpoint, by
+/// module name.
+fn input_scales(dir: &Path) -> HashMap<String, f32> {
+    let bytes = std::fs::read(dir.join("model.safetensors")).expect("read safetensors");
+    let st = safetensors::SafeTensors::deserialize(&bytes).expect("parse safetensors");
+    st.tensors()
+        .into_iter()
+        .filter_map(|(name, t)| {
+            let module = name.strip_suffix(".input_scale")?.to_string();
+            assert_eq!(t.dtype(), safetensors::Dtype::F32, "{name}");
+            let d = t.data();
+            Some((module, f32::from_le_bytes([d[0], d[1], d[2], d[3]])))
+        })
+        .collect()
+}
+
+/// Phase 6a S-5 (FP8 part): each FP8 tiny checkpoint on the CPU provider — prefill and greedy
+/// decode — gives logits within 1e-3 of the naive model over its dequantized BF16 twin with
+/// the checkpoint's activation quantization applied to every projection input (static scales:
+/// the largest part's for a fused projection); weight-only checkpoints equal the twin run on
+/// the same executor bit for bit. Breaks if a scale is applied per the wrong row or block, a
+/// fused stack mixes its parts' scales, the activation mode or static scale is wrong, or the
+/// decoder runs the BF16 GEMM on quantized bytes.
+#[test]
+fn quantized_matches_dequantized_bf16() {
+    let tmp = TempDir::new("tiny-model-quantized");
+    let ct = |strategy: &str, block: serde_json::Value, input: serde_json::Value| {
+        serde_json::json!({
+            "config_groups": {"group_0": {
+                "input_activations": input,
+                "targets": ["Linear"],
+                "weights": {"num_bits": 8, "type": "float", "strategy": strategy,
+                            "dynamic": false, "symmetric": true, "block_structure": block},
+            }},
+            "format": "float-quantized",
+            "ignore": ["lm_head"],
+            "quant_method": "compressed-tensors",
+        })
+    };
+    let act = |strategy: &str, dynamic: bool, group: serde_json::Value| {
+        serde_json::json!({"num_bits": 8, "type": "float", "strategy": strategy,
+                           "dynamic": dynamic, "group_size": group})
+    };
+    let null = serde_json::Value::Null;
+    let cases = [
+        (
+            "ct tensor static",
+            ct("tensor", null.clone(), act("tensor", false, null.clone())),
+            64,
+        ),
+        (
+            "ct channel token",
+            ct("channel", null.clone(), act("token", true, null.clone())),
+            64,
+        ),
+        (
+            "ct channel weight-only",
+            ct("channel", null.clone(), null.clone()),
+            64,
+        ),
+        (
+            "ct block group",
+            ct(
+                "block",
+                serde_json::json!([128, 128]),
+                act("group", true, serde_json::json!(128)),
+            ),
+            128,
+        ),
+        (
+            "hf block dynamic",
+            serde_json::json!({"quant_method": "fp8", "activation_scheme": "dynamic",
+                               "weight_block_size": [128, 128]}),
+            128,
+        ),
+        (
+            "hf tensor static",
+            serde_json::json!({"quant_method": "fp8", "activation_scheme": "static"}),
+            64,
+        ),
+    ];
+    for (i, (name, q, hidden)) in cases.into_iter().enumerate() {
+        let fixture = write_tiny_quantized(&tmp.path().join(i.to_string()), SEED, &q, hidden, 128);
+        let cfg = &fixture.quantized.config;
+        let format = cfg.weight_format.get();
+        let mode = format.activation().kernel();
+        let mut naive = Naive::load(&fixture.twin.dir, &fixture.twin.config);
+        naive.act_quant = mode;
+        naive.input_scales = input_scales(&fixture.quantized.dir);
+        let reqs = executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default());
+        assert!(
+            reqs.iter().any(|r| matches!(r.spec, OpConfig::QGemm(_))),
+            "{name}: no qgemm in the requirements"
+        );
+        // Fused projections run one qgemm per stack; unfused, one per part over row slices of
+        // the data and its scales.
+        for fused_projections in [true, false] {
+            let opts = ExecutorOptions {
+                fused_ops: true,
+                fused_projections,
+            };
+            let name = format!("{name} (fused projections {fused_projections})");
+            let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+            let model = |spec: &TinySpec| {
+                cpu_model_with(
+                    spec,
+                    &mem,
+                    MAX_SEQ_LEN,
+                    opts,
+                    cpu_reference_provider(),
+                    false,
+                )
+            };
+            let mut exec = model(&fixture.quantized);
+            let layout = *exec.kv_layout();
+            let mut kv = SequenceKv::new(&mem, layout, MAX_SEQ_LEN).expect("kv");
+            let mut twin = (mode == ActQuantDesc::None).then(|| {
+                let exec = model(&fixture.twin);
+                let kv = SequenceKv::new(&mem, layout, MAX_SEQ_LEN).expect("kv");
+                (exec, kv)
+            });
+
+            let mut tokens = prompt(fixture.quantized.vocab);
+            let mut feed = tokens.clone();
+            let mut start = 0u32;
+            for step in 0..=4 {
+                let positions: Vec<u32> = (start..start + feed.len() as u32).collect();
+                let row = kv
+                    .forward(exec.as_mut(), &feed, &positions)
+                    .expect("forward")
+                    .row(0)
+                    .to_vec();
+                let diff = max_abs_diff(&row, &naive.logits(&tokens));
+                assert!(diff <= 1e-3, "{name} step {step}: max abs diff {diff}");
+                if let Some((texec, tkv)) = twin.as_mut() {
+                    let want = tkv
+                        .forward(texec.as_mut(), &feed, &positions)
+                        .expect("twin forward")
+                        .row(0)
+                        .to_vec();
+                    assert_eq!(
+                        row, want,
+                        "{name} step {step}: weight-only differs from its twin"
+                    );
+                }
+                let next = argmax(&row);
+                start += feed.len() as u32;
+                tokens.push(next);
+                feed = vec![next];
+            }
+        }
+    }
+}
+
 /// One pool shared by the paged tests: `blocks` blocks of `layout`.
 fn pool(mem: &Arc<dyn DeviceMemory>, layout: &KvLayout, blocks: u32) -> DeviceBuffer {
     let bytes = layout.block_bytes() * u64::from(blocks);
@@ -1105,7 +1314,14 @@ fn cpu_model_with(
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
     let slots = cfg.family.0.weight_slots(cfg);
-    let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load");
+    let weights = WeightLoader::load_format(
+        cfg.weight_format.get(),
+        &index,
+        &slots,
+        mem,
+        MAX_STAGING_BYTES,
+    )
+    .expect("load");
     let order = [provider.id()];
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
     let mut reqs =

@@ -31,7 +31,7 @@ impl AttentionHook for PlainAttention {
         _prefix: &str,
         _weights: &mut LoadedWeights,
     ) -> Result<HookWeights, ModelError> {
-        Ok(HookWeights(Vec::new()))
+        Ok(HookWeights::tensors(Vec::new()))
     }
 
     fn after_projections(

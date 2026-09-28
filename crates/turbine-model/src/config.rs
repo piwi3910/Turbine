@@ -240,11 +240,15 @@ impl ModelArchConfig {
 
     /// The dtype half of the allowlist: every checkpoint tensor this architecture loads must be
     /// stored in the weight format (BF16: `unsupported tensor dtype = F8_E4M3 (<tensor>);
-    /// supported: BF16` otherwise). Missing tensors are the loader's to report.
+    /// supported: BF16` otherwise), a quantized layer's scales included
+    /// ([`crate::weights::WeightFormat::slots`]). Missing tensors are the loader's to report.
     pub fn check_supported_weights(&self, index: &SafetensorsIndex) -> Result<(), ModelError> {
-        for slot in &self.family.0.weight_slots(self) {
-            if let Some(entry) = index.get(&slot.name) {
-                self.weight_format.0.check_tensor(entry)?;
+        let format = self.weight_format.get();
+        for base in &self.family.0.weight_slots(self) {
+            for slot in format.slots(base) {
+                if let Some(entry) = index.get(&slot.name) {
+                    format.check_tensor(entry)?;
+                }
             }
         }
         Ok(())
@@ -1029,11 +1033,12 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
 
         let dir = edited_config("quantized", |v| {
-            v["quantization_config"] = serde_json::json!({"quant_method": "fp8"});
+            // A packaging no registered weight format claims (Phase 6a serves fp8 and others).
+            v["quantization_config"] = serde_json::json!({"quant_method": "gguf"});
         });
         let (field, value, supported) = unsupported(load_model_config(&dir).unwrap_err());
         assert_eq!(field, "quantization_config");
-        assert!(value.contains("fp8"), "{value}");
+        assert!(value.contains("gguf"), "{value}");
         assert_eq!(supported, "none");
         fs::remove_dir_all(dir).unwrap();
 

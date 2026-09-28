@@ -2,6 +2,9 @@
 //! `bfloat16`, and every tensor the executor loads stored as BF16. Every linear layer is
 //! [`super::QuantScheme::Bf16`] (the trait's defaults).
 
+use std::path::Path;
+use std::sync::Arc;
+
 use turbine_core::registry::Module;
 use turbine_core::support::WeightFormatColumn;
 use turbine_core::types::DType;
@@ -48,6 +51,10 @@ impl WeightFormat for Bf16 {
         Ok(())
     }
 
+    fn configure(&self, _top: &serde_json::Value) -> Result<Arc<dyn WeightFormat>, ModelError> {
+        Ok(Arc::new(Bf16))
+    }
+
     fn check_tensor(&self, entry: &TensorEntry) -> Result<(), ModelError> {
         if entry.dtype == Dtype::BF16 {
             Ok(())
@@ -62,5 +69,13 @@ impl WeightFormat for Bf16 {
 
     fn column(&self) -> WeightFormatColumn {
         WeightFormatColumn::Bf16
+    }
+
+    /// The tiny checkpoint is BF16 already; its twin is a copy.
+    fn write_tiny(&self, dir: &Path, twin: Option<&Path>) -> Result<bool, ModelError> {
+        if let Some(twin) = twin {
+            super::copy_checkpoint(dir, twin)?;
+        }
+        Ok(true)
     }
 }

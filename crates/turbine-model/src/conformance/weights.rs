@@ -1,6 +1,7 @@
-//! The `weight_format` suite: the tiny checkpoint of at least one registered model family is in
-//! the format, loads through it, and uploads exactly the bytes the format's `weight_bytes`
-//! (packed data plus scales) predicts for the memory budget.
+//! The `weight_format` suite: the format's tiny writer turns the tiny checkpoint of at least one
+//! registered model family into the format, which is detected as the format, loads through it,
+//! and uploads exactly the bytes the format's `weight_bytes` (packed data plus scales) predicts
+//! for the memory budget.
 
 use std::sync::Arc;
 
@@ -11,17 +12,18 @@ use turbine_tensor::host::HostMemory;
 
 use super::{ConformanceFailure, Report, ensure};
 use crate::testing::TempDir;
-use crate::weights::WeightFormat;
+use crate::weights::{WeightFormat, WeightFormatRef, detect};
 use crate::{MAX_STAGING_BYTES, SafetensorsIndex, WeightLoader, families};
 
 const SEED: u64 = 11;
 
 /// Runs every check over every format of `reg`; `Err` lists each broken check.
 ///
-/// Per format: `tiny` (the `config.json` of at least one registered family's tiny checkpoint
-/// declares the format, and every such checkpoint loads through [`WeightLoader::load_format`]
-/// with every tensor accepted and mapped to a slot) and `bytes` (for each of those checkpoints
-/// the uploaded bytes equal [`WeightFormat::weight_bytes`], packed data and scales included).
+/// Per format: `tiny` ([`WeightFormat::write_tiny`] rewrites at least one registered family's
+/// tiny checkpoint into the format; every such checkpoint's `config.json` is detected as the
+/// format ([`detect`]) and loads through [`WeightLoader::load_format`] with every tensor
+/// accepted and mapped to a slot) and `bytes` (for each of those checkpoints the uploaded bytes
+/// equal [`WeightFormat::weight_bytes`], packed data and scales included).
 pub fn weights_suite(reg: &Registry<dyn WeightFormat>) -> Result<(), Vec<ConformanceFailure>> {
     let mut report = Report::new(reg);
     let tmp = TempDir::new("turbine-conformance-weights");
@@ -34,14 +36,24 @@ pub fn weights_suite(reg: &Registry<dyn WeightFormat>) -> Result<(), Vec<Conform
             for family in families::registry().iter() {
                 let dir = tmp.path().join(format!("{name}-{}", family.name()));
                 let spec = family.write_tiny(&dir, SEED);
+                if !format
+                    .write_tiny(&dir, None)
+                    .map_err(|e| format!("{}: write_tiny: {e}", family.name()))?
+                {
+                    continue;
+                }
                 let text = std::fs::read(dir.join("config.json")).map_err(|e| e.to_string())?;
                 let top: serde_json::Value =
                     serde_json::from_slice(&text).map_err(|e| e.to_string())?;
-                if format.check_config(&top).is_err() {
-                    continue;
-                }
+                let detected = detect(&top).map_err(|e| format!("{}: {e}", family.name()))?;
+                ensure(detected.name() == name, || {
+                    format!("{}: detected as {}", family.name(), detected.name())
+                })?;
+                let mut config = spec.config.clone();
+                config.weight_format = WeightFormatRef(detected);
+                let format = config.weight_format.get();
                 let index = SafetensorsIndex::open(&dir).map_err(|e| e.to_string())?;
-                let slots = family.weight_slots(&spec.config);
+                let slots = family.weight_slots(&config);
                 let weights =
                     WeightLoader::load_format(format, &index, &slots, &mem, MAX_STAGING_BYTES)
                         .map_err(|e| format!("{}: {e}", family.name()))?;
@@ -50,7 +62,7 @@ pub fn weights_suite(reg: &Registry<dyn WeightFormat>) -> Result<(), Vec<Conform
                 })?;
                 byte_counts.push((
                     family.name(),
-                    format.weight_bytes(&spec.config),
+                    format.weight_bytes(&config),
                     weights.weight_bytes,
                 ));
                 loaded.push(family.name());

@@ -1117,7 +1117,7 @@ pub(crate) mod testing {
         let index = SafetensorsIndex::open(&spec.dir).unwrap();
         let slots = pp::weight_slots(cfg, &s).unwrap();
         let weights = WeightLoader::load_part(
-            cfg.weight_format.0,
+            cfg.weight_format.get(),
             &index,
             &slots,
             &llama_slots(cfg),

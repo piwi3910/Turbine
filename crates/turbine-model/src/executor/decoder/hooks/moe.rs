@@ -232,7 +232,7 @@ impl FfnHook for Moe {
             stacked("down_proj", &[experts, d.hidden, inter])?,
         );
         let router = weights.take(&format!("{prefix}.mlp.gate.weight"))?;
-        Ok(HookWeights(vec![router, w_gate, w_up, w_down]))
+        Ok(HookWeights::tensors(vec![router, w_gate, w_up, w_down]))
     }
 
     fn forward(&self, run: &LayerRun<'_>, w: &HookWeights) -> Result<(), ModelError> {

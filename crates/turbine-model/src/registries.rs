@@ -88,7 +88,7 @@ mod registry_conformance {
     #[test]
     fn weight_formats() {
         let reg = crate::weights::registry();
-        names_are(reg, "weight_format", &["bf16"]);
+        names_are(reg, "weight_format", &["bf16", "ct_fp8", "hf_fp8"]);
         passes(weights_suite(reg));
     }
 }

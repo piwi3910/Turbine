@@ -65,7 +65,7 @@ impl AttentionHook for QkNormFull {
         prefix: &str,
         weights: &mut LoadedWeights,
     ) -> Result<HookWeights, ModelError> {
-        Ok(HookWeights(vec![
+        Ok(HookWeights::tensors(vec![
             weights.take(&format!("{prefix}.self_attn.q_norm.weight"))?,
             weights.take(&format!("{prefix}.self_attn.k_norm.weight"))?,
         ]))
@@ -225,7 +225,7 @@ impl AttentionHook for QkNormPerHead {
                 &[d.head_dim],
             )
         };
-        Ok(HookWeights(vec![take("q_norm")?, take("k_norm")?]))
+        Ok(HookWeights::tensors(vec![take("q_norm")?, take("k_norm")?]))
     }
 
     fn after_projections(

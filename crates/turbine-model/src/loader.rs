@@ -220,6 +220,12 @@ impl WeightLoader {
     /// stage or rank and is skipped quietly (counted in [`LoadedWeights::elsewhere`], one
     /// `debug` line) instead of warning `unexpected_tensor`. Tensors neither list names still
     /// warn. An empty `whole` is [`WeightLoader::load_format`].
+    ///
+    /// Both lists are the family's slots: each is expanded by [`WeightFormat::slots`] (a
+    /// quantized layer's scales, zero points and activation scales). A slot the format
+    /// [`WeightFormat::repacks`] is read whole, rewritten by [`WeightFormat::repack`] and
+    /// uploaded (its checkpoint tensor's shape is the format's to check); every other slot is
+    /// copied as stored.
     pub fn load_part(
         format: &dyn WeightFormat,
         index: &SafetensorsIndex,
@@ -228,12 +234,26 @@ impl WeightLoader {
         mem: &Arc<dyn DeviceMemory>,
         staging_bytes: usize,
     ) -> Result<LoadedWeights, ModelError> {
+        let slots: Vec<WeightSlot> = slots.iter().flat_map(|s| format.slots(s)).collect();
+        let whole: Vec<WeightSlot> = whole.iter().flat_map(|s| format.slots(s)).collect();
+        let (slots, whole) = (slots.as_slice(), whole.as_slice());
         let mut planned: Vec<(&WeightSlot, &TensorEntry)> = Vec::with_capacity(slots.len());
         for slot in slots {
             let entry = index
                 .get(&slot.name)
                 .ok_or_else(|| ModelError::MissingTensor(slot.name.clone()))?;
             format.check_tensor(entry)?;
+            if format.repacks(slot) {
+                if slot.source.is_some() {
+                    return Err(ModelError::Safetensors {
+                        file: entry.file.clone(),
+                        tensor: entry.name.clone(),
+                        rule: "a repacked tensor cannot be sharded".to_string(),
+                    });
+                }
+                planned.push((slot, entry));
+                continue;
+            }
             let expected = slot.source.as_ref().map_or(&slot.shape, |src| &src.shape);
             if entry.shape != *expected {
                 return Err(ModelError::Safetensors {
@@ -296,6 +316,7 @@ impl WeightLoader {
 
         let largest = planned
             .iter()
+            .filter(|(slot, _)| !format.repacks(slot))
             .map(|(slot, e)| match slot.source {
                 None => e.byte_len(),
                 Some(_) => {
@@ -331,6 +352,29 @@ impl WeightLoader {
                     files.entry(entry.file.clone()).or_insert(f)
                 }
             };
+            if format.repacks(slot) {
+                let mut raw = vec![0u8; entry.byte_len() as usize];
+                file.read_exact_at(&mut raw, entry.range.start)
+                    .map_err(|e| io_err(&entry.file, e))?;
+                let bytes = format.repack(slot, entry, raw)?;
+                let want = slot.shape.iter().product::<usize>() * dtype.size_bytes();
+                if bytes.len() != want {
+                    return Err(ModelError::Safetensors {
+                        file: entry.file.clone(),
+                        tensor: entry.name.clone(),
+                        rule: format!(
+                            "repacked to {} bytes, slot {:?} {} needs {want}",
+                            bytes.len(),
+                            slot.shape,
+                            dtype.as_str()
+                        ),
+                    });
+                }
+                tensor.storage.copy_from_host(base, &bytes)?;
+                mem.synchronize()?;
+                weight_bytes += bytes.len() as u64;
+                continue;
+            }
             if let Some(src) = &slot.source {
                 weight_bytes += upload_shard(
                     file,

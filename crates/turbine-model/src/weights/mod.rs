@@ -4,7 +4,11 @@
 //! ([`ActivationQuant`]), which tensors a layer needs and how they are repacked into the layout
 //! the kernels consume. Activations always run in BF16 and the KV dtype is configured
 //! (`kv.dtype`), not a property of the checkpoint. One file per packaging and one entry in
-//! [`registry`]; [`detect`] picks the packaging of a `config.json`.
+//! [`registry`]; [`detect`] picks the packaging of a `config.json` and configures it from the
+//! `quantization_config` ([`WeightFormat::configure`]).
+
+use std::path::Path;
+use std::sync::Arc;
 
 use turbine_core::registry::{Module, Registry};
 use turbine_core::support::WeightFormatColumn;
@@ -17,6 +21,9 @@ use crate::loader::WeightSlot;
 use crate::safetensors::TensorEntry;
 
 pub mod bf16;
+pub mod ct_fp8;
+mod fp8;
+pub mod hf_fp8;
 
 pub use bf16::Bf16;
 
@@ -127,6 +134,16 @@ pub trait WeightFormat: Module {
     /// `Ok` when the top-level `config.json` declares this format; else the refusal naming the
     /// offending key.
     fn check_config(&self, top: &serde_json::Value) -> Result<(), ModelError>;
+    /// The format as the `config.json` `top` (which [`WeightFormat::check_config`] accepted)
+    /// configures it: which layers are quantized, the weight and activation schemes. Refuses a
+    /// declared variant this packaging does not serve (`quant_scheme_unsupported` naming the
+    /// field). A format without parameters returns itself.
+    fn configure(&self, top: &serde_json::Value) -> Result<Arc<dyn WeightFormat>, ModelError>;
+    /// The configured format in words (its name, plus the parameters for a configured format):
+    /// two formats are equal when their descriptions are.
+    fn describe(&self) -> String {
+        self.name().to_string()
+    }
     /// `Ok` when a checkpoint tensor is stored in this format; else the refusal naming it.
     fn check_tensor(&self, entry: &TensorEntry) -> Result<(), ModelError>;
     /// The support-matrix `weight_format` column of checkpoints in this packaging.
@@ -148,42 +165,65 @@ pub trait WeightFormat: Module {
     fn slot_dtype(&self, _slot: &WeightSlot) -> DType {
         Bf16::DTYPE
     }
-    /// Rewrites a slot's checkpoint bytes into the layout the kernels consume (identity unless
-    /// the packaging's layout differs, e.g. AWQ's nibble order).
-    fn repack(&self, _slot: &WeightSlot, bytes: Vec<u8>) -> Result<Vec<u8>, ModelError> {
+    /// Whether the loader passes `slot`'s checkpoint bytes through [`WeightFormat::repack`]
+    /// (read whole, rewritten, then uploaded) instead of copying them as they are. The shape of a
+    /// repacked slot is the loaded layout; its checkpoint tensor may differ in shape and dtype.
+    fn repacks(&self, _slot: &WeightSlot) -> bool {
+        false
+    }
+    /// Rewrites the checkpoint tensor `entry`'s bytes into the layout of `slot` the kernels
+    /// consume (e.g. AWQ's nibble order, scales to F32); the result must be exactly the slot's
+    /// bytes in [`WeightFormat::slot_dtype`]. Only called when [`WeightFormat::repacks`].
+    fn repack(
+        &self,
+        _slot: &WeightSlot,
+        _entry: &TensorEntry,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, ModelError> {
         Ok(bytes)
     }
-    /// Device bytes of every parameter `cfg` loads: each linear layer at its scheme's size,
-    /// everything else (embeddings, norms) in BF16. The memory budget's weight term.
+    /// Device bytes of every parameter `cfg` loads: every slot of [`WeightFormat::slots`] at
+    /// its shape and [`WeightFormat::slot_dtype`] (a quantized layer's packed data, scales, zero
+    /// points and activation scales; embeddings and norms in BF16). The memory budget's weight
+    /// term; exactly the bytes the loader uploads.
     fn weight_bytes(&self, cfg: &ModelArchConfig) -> u64 {
-        let linear: std::collections::HashMap<String, LinearSlot> = cfg
-            .linear_slots()
-            .into_iter()
-            .map(|l| (l.name.clone(), l))
-            .collect();
         cfg.family
             .0
             .weight_slots(cfg)
             .iter()
-            .map(|s| match linear.get(&s.name) {
-                Some(l) => self.scheme(l).bytes(u64::from(l.n), u64::from(l.k)),
-                None => {
-                    s.shape.iter().map(|&d| d as u64).product::<u64>()
-                        * DType::BF16.size_bytes() as u64
-                }
+            .flat_map(|s| self.slots(s))
+            .map(|s| {
+                s.shape.iter().map(|&d| d as u64).product::<u64>()
+                    * self.slot_dtype(&s).size_bytes() as u64
             })
             .sum()
     }
+    /// Test support (Phase 6a fixtures): rewrites the BF16 tiny checkpoint in `dir` (written by
+    /// a family's `write_tiny`) into this packaging as configured — every tensor it quantizes,
+    /// and `config.json`'s `quantization_config` — and, when `twin` is given, writes there the
+    /// same model in BF16 whose weights are the exact dequantized values (the reference the
+    /// quantized checkpoint is compared with). `Ok(false)`: the format has no tiny writer.
+    fn write_tiny(&self, dir: &Path, twin: Option<&Path>) -> Result<bool, ModelError> {
+        let _ = (dir, twin);
+        Ok(false)
+    }
 }
 
-/// A registered weight format as a value of `ModelArchConfig`: equal by name, printed as its
-/// name.
-#[derive(Clone, Copy)]
-pub struct WeightFormatRef(pub &'static dyn WeightFormat);
+/// A configured weight format as a value of `ModelArchConfig`: equal by
+/// [`WeightFormat::describe`], printed as its name.
+#[derive(Clone)]
+pub struct WeightFormatRef(pub Arc<dyn WeightFormat>);
+
+impl WeightFormatRef {
+    /// The format.
+    pub fn get(&self) -> &dyn WeightFormat {
+        self.0.as_ref()
+    }
+}
 
 impl PartialEq for WeightFormatRef {
     fn eq(&self, other: &WeightFormatRef) -> bool {
-        self.0.name() == other.0.name()
+        self.0.describe() == other.0.describe()
     }
 }
 
@@ -201,20 +241,39 @@ impl std::fmt::Debug for WeightFormatRef {
     }
 }
 
-static WEIGHT_FORMATS: Registry<dyn WeightFormat> = Registry::new("weight_format", &[&Bf16]);
+static WEIGHT_FORMATS: Registry<dyn WeightFormat> =
+    Registry::new("weight_format", &[&Bf16, &ct_fp8::CT_FP8, &hf_fp8::HF_FP8]);
 
 /// Every weight format, in detection order.
 pub fn registry() -> &'static Registry<dyn WeightFormat> {
     &WEIGHT_FORMATS
 }
 
+/// Test support: copies every file of the checkpoint directory `from` into `to` (created).
+pub(crate) fn copy_checkpoint(from: &Path, to: &Path) -> Result<(), ModelError> {
+    let io = |path: &Path, e: std::io::Error| ModelError::Io {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    };
+    std::fs::create_dir_all(to).map_err(|e| io(to, e))?;
+    for entry in std::fs::read_dir(from).map_err(|e| io(from, e))? {
+        let path = entry.map_err(|e| io(from, e))?.path();
+        if path.is_file() {
+            let dest = to.join(path.file_name().expect("a file has a name"));
+            std::fs::copy(&path, &dest).map_err(|e| io(&dest, e))?;
+        }
+    }
+    Ok(())
+}
+
 /// The format of a top-level `config.json`: the first registered format whose
-/// [`WeightFormat::check_config`] accepts it, else the first format's refusal.
-pub fn detect(top: &serde_json::Value) -> Result<&'static dyn WeightFormat, ModelError> {
+/// [`WeightFormat::check_config`] accepts it, configured from it
+/// ([`WeightFormat::configure`], whose refusal is returned), else the first format's refusal.
+pub fn detect(top: &serde_json::Value) -> Result<Arc<dyn WeightFormat>, ModelError> {
     let mut first_err = None;
     for format in registry().iter() {
         match format.check_config(top) {
-            Ok(()) => return Ok(format),
+            Ok(()) => return format.configure(top),
             Err(e) => {
                 first_err.get_or_insert(e);
             }
@@ -293,8 +352,150 @@ mod tests {
             assert_eq!(format.column(), WeightFormatColumn::Bf16);
         }
         let a = WeightFormatRef(detect(&json!({})).unwrap());
-        assert_eq!(a, WeightFormatRef(registry().get("bf16").unwrap()));
+        assert_eq!(a, WeightFormatRef(Arc::new(Bf16)));
         assert_eq!(format!("{a:?}"), "bf16");
+    }
+
+    /// A compressed-tensors FP8 `quantization_config` of weight strategy `strategy` and input
+    /// activations `input` (`null`: weight-only).
+    fn ct(strategy: &str, block: serde_json::Value, input: serde_json::Value) -> serde_json::Value {
+        json!({
+            "config_groups": {"group_0": {
+                "input_activations": input,
+                "targets": ["Linear"],
+                "weights": {"num_bits": 8, "type": "float", "strategy": strategy,
+                            "dynamic": false, "symmetric": true, "block_structure": block},
+            }},
+            "format": "float-quantized",
+            "ignore": ["lm_head"],
+            "kv_cache_scheme": null,
+            "quant_method": "compressed-tensors",
+        })
+    }
+
+    fn act(strategy: &str, dynamic: bool, group: serde_json::Value) -> serde_json::Value {
+        json!({"num_bits": 8, "type": "float", "strategy": strategy, "dynamic": dynamic,
+               "group_size": group, "symmetric": true})
+    }
+
+    /// The field and supported text of a `quant_scheme_unsupported` refusal.
+    fn refused(q: serde_json::Value) -> (String, String) {
+        match detect(&json!({ "quantization_config": q })) {
+            Err(ModelError::Unsupported {
+                field, supported, ..
+            }) => (field, supported),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// Phase 6a S-3 (FP8 part; INT4 and MXFP4 join with Tasks 9 and 10): tiny checkpoints
+    /// written in each FP8 variant are detected as the right packaging and column, with the
+    /// right scheme on a projection, `BF16` on the LM head, and the right activation mode;
+    /// unsupported variants are refused `quant_scheme_unsupported` naming the field. Breaks if
+    /// a container maps to the wrong column, scheme or activation, or a refusal loses its
+    /// reason.
+    #[test]
+    fn detect_every_packaging() {
+        use crate::testing::tiny::write_tiny_quantized;
+        let tmp = crate::testing::TempDir::new("turbine-detect-packaging");
+        let block = json!([128, 128]);
+        let cases = [
+            (
+                ct("tensor", json!(null), act("tensor", false, json!(null))),
+                "ct_fp8",
+                WeightFormatColumn::Fp8,
+                QuantScheme::Fp8Channel,
+                ActivationQuant::Fp8PerTensorStatic,
+            ),
+            (
+                ct("channel", json!(null), act("token", true, json!(null))),
+                "ct_fp8",
+                WeightFormatColumn::Fp8,
+                QuantScheme::Fp8Channel,
+                ActivationQuant::Fp8PerTokenDynamic,
+            ),
+            (
+                ct("channel", json!(null), json!(null)),
+                "ct_fp8",
+                WeightFormatColumn::Fp8,
+                QuantScheme::Fp8Channel,
+                ActivationQuant::None,
+            ),
+            (
+                ct("block", block.clone(), act("group", true, json!(128))),
+                "ct_fp8",
+                WeightFormatColumn::Fp8Block,
+                QuantScheme::Fp8Block { n: 128, k: 128 },
+                ActivationQuant::Fp8PerGroupDynamic { group: 128 },
+            ),
+            (
+                json!({"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+                       "weight_block_size": [128, 128]}),
+                "hf_fp8",
+                WeightFormatColumn::Fp8Block,
+                QuantScheme::Fp8Block { n: 128, k: 128 },
+                ActivationQuant::Fp8PerGroupDynamic { group: 128 },
+            ),
+            (
+                json!({"quant_method": "fp8", "activation_scheme": "static"}),
+                "hf_fp8",
+                WeightFormatColumn::Fp8,
+                QuantScheme::Fp8Channel,
+                ActivationQuant::Fp8PerTensorStatic,
+            ),
+        ];
+        for (i, (q, name, column, scheme, activation)) in cases.into_iter().enumerate() {
+            let fixture = write_tiny_quantized(&tmp.path().join(i.to_string()), 3, &q, 128, 128);
+            let cfg = &fixture.quantized.config;
+            let format = cfg.weight_format.get();
+            assert_eq!(
+                (format.name(), format.column(), format.activation()),
+                (name, column, activation),
+                "{q}"
+            );
+            let linear = cfg.linear_slots();
+            let q_proj = linear
+                .iter()
+                .find(|l| l.name.ends_with("layers.0.self_attn.q_proj.weight"))
+                .expect("q_proj");
+            assert_eq!(format.scheme(q_proj), scheme, "{q}");
+            let lm_head = crate::weights::LinearSlot {
+                name: crate::loader::LM_HEAD.into(),
+                n: cfg.vocab_size,
+                k: cfg.hidden,
+            };
+            assert_eq!(format.scheme(&lm_head), QuantScheme::Bf16, "{q}");
+            // The twin is plain BF16.
+            assert_eq!(fixture.twin.config.weight_format.get().name(), "bf16");
+            // Configured formats compare by their parameters.
+            assert_ne!(cfg.weight_format, WeightFormatRef(Arc::new(Bf16)), "{q}");
+        }
+
+        let mut four_bit = ct("channel", json!(null), json!(null));
+        four_bit["config_groups"]["group_0"]["weights"]["num_bits"] = json!(4);
+        let (field, supported) = refused(four_bit);
+        assert_eq!(field, "weights");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
+        let (field, supported) = refused(ct("block", json!([64, 64]), json!(null)));
+        assert_eq!(field, "weights.block_structure");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
+        let (field, supported) = refused(
+            json!({"quant_method": "fp8", "activation_scheme": "dynamic",
+                   "weight_block_size": [64, 64]}),
+        );
+        assert_eq!(field, "weight_block_size");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
+        let (field, _) = refused(ct("channel", json!(null), act("token", false, json!(null))));
+        assert_eq!(field, "input_activations");
     }
 
     /// Phase 6a S-3: the BF16 entry describes every linear layer of a tiny Llama as unquantized

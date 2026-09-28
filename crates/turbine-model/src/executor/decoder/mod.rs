@@ -60,7 +60,7 @@ use turbine_kernels::{
     AddRmsnormConfig, AddRmsnormContext, AttentionConfig, AttentionKind, ElementwiseConfig,
     ElementwiseContext, EmbeddingConfig, EmbeddingContext, GemmConfig, GemmContext, KernelError,
     KernelRegistry, NormConfig, NormContext, OpConfig, OpRequirement, PagedAttentionContext,
-    RopeConfig, RopeContext,
+    QGemmContext, QuantizeActContext, RopeConfig, RopeContext,
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, StreamRef, Tensor, TensorView};
 
@@ -80,7 +80,10 @@ use crate::pp::PpContext;
 use crate::tp::{TpContext, rank_config};
 
 pub mod hooks;
+mod linear;
 mod trace;
+
+pub use linear::{Linear, LinearQuant, LinearView, QuantParts, QuantView};
 
 pub use hooks::{MOE, PLAIN_ATTENTION, QK_NORM_FULL, QK_NORM_PER_HEAD, SWIGLU};
 pub use trace::TraceTensor;
@@ -143,6 +146,11 @@ pub struct DecoderDims {
     /// An expert-parallel rank's experts and counts ([`crate::ep`]); `None` without expert
     /// parallelism.
     pub ep: Option<Arc<EpDims>>,
+    /// The quantization of the decoder's quantized linear layers (Phase 6a); `None` when every
+    /// layer is BF16. The LM head is always BF16.
+    pub quant: Option<LinearQuant>,
+    /// Some decoder linear layers stay BF16 (the checkpoint's ignore list, or no quantization).
+    pub bf16_linears: bool,
 }
 
 /// What a tensor-parallel rank's dims add ([`DecoderDims::for_shard`]).
@@ -163,6 +171,8 @@ pub struct TpDims {
 impl DecoderDims {
     pub fn of(cfg: &ModelArchConfig) -> DecoderDims {
         let head_dim = cfg.head_dim as usize;
+        // Mixed schemes are refused by the executor's weight-format check.
+        let (quant, bf16_linears) = LinearQuant::of(cfg).unwrap_or((None, true));
         DecoderDims {
             hidden: cfg.hidden as usize,
             heads: cfg.num_attention_heads as usize,
@@ -181,6 +191,8 @@ impl DecoderDims {
             vocab_rows: cfg.vocab_size as usize,
             tp: None,
             ep: None,
+            quant,
+            bf16_linears,
         }
     }
 
@@ -302,8 +314,16 @@ impl DecoderDims {
     }
 }
 
-/// One layer's parameters of a hook, in the order the hook took them.
-pub struct HookWeights(pub Vec<Tensor>);
+/// One layer's parameters of a hook, in the order the hook took them: tensors, and linear
+/// layers that may be quantized ([`DecoderDims::take_linear`]).
+pub struct HookWeights(pub Vec<Tensor>, pub Vec<Linear>);
+
+impl HookWeights {
+    /// Tensors only.
+    pub fn tensors(tensors: Vec<Tensor>) -> HookWeights {
+        HookWeights(tensors, Vec::new())
+    }
+}
 
 /// A hook's activation buffers, allocated once for `max_batch_tokens` tokens
 /// ([`FfnHook::alloc`]): tensors and raw provider scratch, in the order the hook allocated them.
@@ -427,14 +447,15 @@ impl LayerRun<'_> {
         self.exec.profiler.step(self.exec.mem.as_ref(), op, imp, f)
     }
 
-    /// `c = a · wᵀ` for a `[n, k]` weight view `w`.
-    pub fn linear(
+    /// `c = a · wᵀ` for a `[n, k]` weight view `w` (a BF16 view, or a [`LinearView`] of a
+    /// possibly quantized layer).
+    pub fn linear<'w>(
         &self,
         a: TensorView<'_>,
-        w: TensorView<'_>,
+        w: impl Into<LinearView<'w>>,
         c: TensorView<'_>,
     ) -> Result<(), ModelError> {
-        self.exec.linear(a, w, c)
+        self.exec.linear(a, w.into(), c)
     }
 
     /// RMSNorm of `x` with weight `w` over rows of `w.len()` elements into `out` (may be `x`).
@@ -571,24 +592,75 @@ pub fn rows(buf: &Tensor, t: usize) -> TensorView<'_> {
     buf.view().rows(0, t)
 }
 
-/// Refuses a weight format whose linear layers are quantized or whose activations are
-/// quantized: the decoder runs every linear layer through the BF16 GEMM until the quantized
-/// GEMM is wired (Phase 6a Task 8).
-fn check_weight_format(cfg: &ModelArchConfig) -> Result<(), ModelError> {
-    let format = cfg.weight_format.0;
-    let quantized = cfg
-        .linear_slots()
-        .iter()
-        .find(|l| format.scheme(l) != crate::weights::QuantScheme::Bf16)
-        .map(|l| l.name.clone());
-    match quantized {
-        None if format.activation() == crate::weights::ActivationQuant::None => Ok(()),
-        _ => Err(invalid(format!(
-            "the decoder executor runs BF16 linear layers only; weight format {} quantizes {}",
-            format.name(),
-            quantized.as_deref().unwrap_or("activations")
-        ))),
+/// Refuses what the decoder cannot run of a quantized weight format (Phase 6a): layers of
+/// different quantized schemes, a stacked parameter (fused Q/K/V, gate/up) whose parts differ
+/// in scheme, block-scaled parts not on block boundaries, a quantized LM head, quantized
+/// experts (`quant_moe_phase7`: mixture-of-experts layers are Phase 7's) and tensor, expert or
+/// pipeline parallelism (Phase 6a Task 21).
+fn check_weight_format(cfg: &ModelArchConfig, parallel: bool) -> Result<(), ModelError> {
+    use crate::weights::QuantScheme;
+    let format = cfg.weight_format.get();
+    let (quant, _) = LinearQuant::of(cfg).map_err(|e| {
+        invalid(format!(
+            "quant_scheme_unsupported: weight format {} mixes schemes: {e}",
+            format.name()
+        ))
+    })?;
+    let Some(quant) = quant else {
+        return Ok(());
+    };
+    let refuse = |why: String| Err(invalid(format!("weight format {}: {why}", format.name())));
+    if cfg.moe.is_some() {
+        return refuse(
+            "quant_moe_phase7: quantized mixture-of-experts models arrive with Phase 7".into(),
+        );
     }
+    if parallel {
+        return refuse(
+            "quantized weights under tensor, expert or pipeline parallelism arrive with Phase 6a Task 21"
+                .into(),
+        );
+    }
+    let schemes: std::collections::HashMap<String, QuantScheme> = cfg
+        .linear_slots()
+        .into_iter()
+        .map(|l| (l.name.clone(), format.scheme(&l)))
+        .collect();
+    if schemes
+        .get(LM_HEAD)
+        .is_some_and(|s| *s != QuantScheme::Bf16)
+    {
+        return refuse("quant_scheme_unsupported: a quantized lm_head (it stays BF16)".into());
+    }
+    let block_n = match quant.scheme {
+        QuantScheme::Fp8Block { n, .. } => n as usize,
+        _ => 1,
+    };
+    let mut stacks: std::collections::HashMap<String, QuantScheme> =
+        std::collections::HashMap::new();
+    for slot in cfg.family.0.weight_slots(cfg) {
+        let (Some(place), Some(scheme)) = (&slot.stack, schemes.get(&slot.name)) else {
+            continue;
+        };
+        if let Some(other) = stacks.insert(place.name.clone(), *scheme)
+            && other != *scheme
+        {
+            return refuse(format!(
+                "quant_scheme_unsupported: the parts of {} differ in scheme ({other:?}, {scheme:?} for {})",
+                place.name, slot.name
+            ));
+        }
+        if *scheme != QuantScheme::Bf16
+            && !(slot.shape[0].is_multiple_of(block_n)
+                && (place.offset / slot.shape[1]).is_multiple_of(block_n))
+        {
+            return refuse(format!(
+                "quant_scheme_unsupported: {} rows are not on {block_n}-row block boundaries of {}",
+                slot.name, place.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn batch_limits(cfg: &ModelArchConfig, limits: ExecutorLimits) -> BatchLimits {
@@ -605,8 +677,8 @@ fn batch_limits(cfg: &ModelArchConfig, limits: ExecutorLimits) -> BatchLimits {
 struct Layer {
     input_norm: Tensor,
     /// `[q_dim + 2·kv_dim, hidden]`: Q rows, then K, then V.
-    w_qkv: Tensor,
-    wo: Tensor,
+    w_qkv: Linear,
+    wo: Linear,
     post_norm: Tensor,
     attention: HookWeights,
     ffn: HookWeights,
@@ -680,6 +752,9 @@ pub struct DecoderExecutor {
     lm_head: Option<Tensor>,
     bufs: Buffers,
     ffn_buffers: HookBuffers,
+    /// The activation-quantization scratch before a quantized layer: the quantized
+    /// `[tokens, k]` matrix and its scales, flat ([`DecoderDims::alloc_act_quant`]).
+    act_quant: Option<(Tensor, Tensor)>,
     /// The LM head output, its device reduction and the logits copy.
     head: LogitsHead,
     meta: DeviceBatch,
@@ -741,22 +816,15 @@ impl DecoderExecutor {
         block_tokens: u32,
         opts: ExecutorOptions,
     ) -> Vec<OpRequirement> {
-        let act = d.act;
         let mut specs = vec![
             OpConfig::Embedding(d.embedding()),
             OpConfig::Rmsnorm(d.norm(d.hidden)),
         ];
         if opts.fused_projections && spec.attention.fuses_qkv() {
-            specs.push(OpConfig::Gemm(d.gemm(
-                d.q_dim + 2 * d.kv_dim,
-                d.hidden,
-                act,
-            )));
+            specs.extend(d.linear_ops(d.q_dim + 2 * d.kv_dim, d.hidden));
         } else {
-            specs.extend([
-                OpConfig::Gemm(d.gemm(d.q_dim, d.hidden, act)),
-                OpConfig::Gemm(d.gemm(d.kv_dim, d.hidden, act)),
-            ]);
+            specs.extend(d.linear_ops(d.q_dim, d.hidden));
+            specs.extend(d.linear_ops(d.kv_dim, d.hidden));
         }
         specs.extend(spec.attention.requirements(d));
         specs.extend([
@@ -771,9 +839,9 @@ impl DecoderExecutor {
                 block_tokens,
                 cfg.kv_cache.dtype,
             )),
-            OpConfig::Gemm(d.gemm(d.hidden, d.q_dim, act)),
-            OpConfig::Add(d.add()),
         ]);
+        specs.extend(d.linear_ops(d.hidden, d.q_dim));
+        specs.push(OpConfig::Add(d.add()));
         if opts.fused_ops {
             specs.push(OpConfig::AddRmsnorm(d.add_norm()));
         }
@@ -863,6 +931,7 @@ impl DecoderExecutor {
         let per_seq = es * d.hidden as u64;
         let t = limits.max_batch_tokens;
         u64::from(t) * per_token
+            + d.act_quant_bytes(t as usize)
             + spec.ffn.workspace_bytes(d, t as usize)
             + u64::from(limits.max_seqs) * per_seq
             + LogitsHead::bytes(d.vocab, head_rows)
@@ -1042,7 +1111,7 @@ impl DecoderExecutor {
                  {max_seqs} must be positive"
             )));
         }
-        check_weight_format(cfg)?;
+        check_weight_format(cfg, tp.is_some() || ep.is_some() || pp.is_some())?;
         let d = match &ep {
             Some(e) => crate::ep::rank_dims(
                 cfg,
@@ -1071,13 +1140,15 @@ impl DecoderExecutor {
         for local in 0..cfg.num_layers {
             let i = first + local;
             let p = format!("model.layers.{i}");
-            let w_qkv = d.take_weight(&mut weights, &qkv_proj_name(i), &[qkv.width(), d.hidden])?;
+            let w_qkv = d.take_linear(&mut weights, &qkv_proj_name(i), &[qkv.width(), d.hidden])?;
+            let wo = d.take_linear(
+                &mut weights,
+                &format!("{p}.self_attn.o_proj.weight"),
+                &[d.hidden, d.q_dim],
+            )?;
             let mut take = |s: &str| weights.take(&format!("{p}.{s}.weight"));
-            let (input_norm, wo, post_norm) = (
-                take("input_layernorm")?,
-                take("self_attn.o_proj")?,
-                take("post_attention_layernorm")?,
-            );
+            let (input_norm, post_norm) =
+                (take("input_layernorm")?, take("post_attention_layernorm")?);
             let attention = spec.attention.load_layer(&d, &p, &mut weights)?;
             let ffn = spec.ffn.load_layer(&d, i, &p, &mut weights, opts)?;
             layers.push(Layer {
@@ -1118,6 +1189,7 @@ impl DecoderExecutor {
         let freq_bytes: Vec<u8> = freqs.iter().flat_map(|f| f.to_le_bytes()).collect();
         inv_freq.storage.copy_from_host(0, &freq_bytes)?;
         let ffn_buffers = spec.ffn.alloc(&d, t, &mem)?;
+        let act_quant = d.alloc_act_quant(t, &mem)?;
         mem.synchronize()?;
         let bufs = Buffers {
             inv_freq,
@@ -1162,6 +1234,7 @@ impl DecoderExecutor {
             lm_head,
             bufs,
             ffn_buffers,
+            act_quant,
             head,
             meta,
             host: HostBatch::default(),
@@ -1341,14 +1414,70 @@ impl DecoderExecutor {
         self.trace.record(layer, name, &view)
     }
 
-    /// `c = a · wᵀ` for a `[n, k]` weight view `w`.
+    /// `c = a · wᵀ` for a `[n, k]` layer `w`: the GEMM for a BF16 weight; for a quantized one
+    /// `quantize_act` into the scratch (when activations are quantized), then `qgemm`.
     fn linear(
+        &self,
+        a: TensorView<'_>,
+        w: LinearView<'_>,
+        c: TensorView<'_>,
+    ) -> Result<(), ModelError> {
+        let Some(q) = w.q else {
+            return self.gemm(a, w.w, c);
+        };
+        let (m, n, k) = (a.shape[0], w.w.shape[0], w.w.shape[1]);
+        let prefill = self.step_prefill.load(Ordering::Relaxed);
+        let (a, a_scales) = match (self.dims.quantize_act(k, q.quant), &self.act_quant) {
+            (None, _) => (a, None),
+            (Some(qa), Some((out, scales))) => {
+                let out = TensorView::contiguous(out.storage.whole(), 0, &[m, k], qa.out_dtype);
+                let count = qa.mode.scale_count(m, k).max(1);
+                let scales =
+                    TensorView::contiguous(scales.storage.whole(), 0, &[count], DType::F32);
+                self.op(OpConfig::QuantizeAct(qa), || {
+                    self.registry
+                        .quantize_act(&qa)
+                        .execute(&mut QuantizeActContext {
+                            cfg: qa,
+                            x: a,
+                            out: out.clone(),
+                            scales: scales.clone(),
+                            static_scale: q.input_scale,
+                        })
+                })?;
+                (out, qa.mode.is_fp8().then_some(scales))
+            }
+            (Some(_), None) => {
+                return Err(invalid(
+                    "quantized activations without the quantization scratch".into(),
+                ));
+            }
+        };
+        let cfg = self.dims.qgemm(n, k, q.quant);
+        self.op(OpConfig::QGemm(cfg), || {
+            self.registry.qgemm(&cfg).execute(&mut QGemmContext {
+                cfg,
+                a,
+                a_scales,
+                b: w.w,
+                b_scales: q.scales,
+                b_zeros: q.zeros,
+                c,
+                alpha: 1.0,
+                prefill,
+            })
+        })
+    }
+
+    /// `c = a · wᵀ` for a BF16 `[n, k]` weight view `w`.
+    fn gemm(
         &self,
         a: TensorView<'_>,
         w: TensorView<'_>,
         c: TensorView<'_>,
     ) -> Result<(), ModelError> {
         let cfg = self.dims.gemm(w.shape[0], w.shape[1], c.dtype);
+
         self.op(OpConfig::Gemm(cfg), || {
             self.registry.gemm(&cfg).execute(&mut GemmContext {
                 a,
@@ -1470,7 +1599,7 @@ impl DecoderExecutor {
         let f32 = DType::F32.size_bytes();
         let shard =
             TensorView::contiguous(bufs.shard_logits.storage.whole(), 0, &[n, vr], DType::F32);
-        self.linear(rows(&self.bufs.last, n), head.view(), shard.clone())?;
+        self.gemm(rows(&self.bufs.last, n), head.view(), shard.clone())?;
         let mut gathered = bufs.gathered.storage.whole().sub(0, world * n * vr * f32);
         self.profiler.step(
             self.mem.as_ref(),
@@ -1896,7 +2025,7 @@ impl DecoderExecutor {
             .ok_or_else(|| invalid("LM head on a stage without it".into()))?;
         match (&self.tp, &self.tp_bufs) {
             (Some(tp), Some(bufs)) => self.tp_lm_head(tp, bufs, head, n)?,
-            _ => self.linear(rows(&b.last, n), head.view(), self.head.rows(n))?,
+            _ => self.gemm(rows(&b.last, n), head.view(), self.head.rows(n))?,
         }
         self.record(None, "logits", self.head.rows(n))?;
         self.head
