@@ -149,6 +149,7 @@ impl NcclApi {
         flavor: &'static NcclFlavor,
         explicit: Option<&Path>,
     ) -> Result<Arc<NcclApi>, CollectiveError> {
+        apply_env_defaults(flavor);
         if let Some(path) = explicit {
             return NcclApi::load_from(path, flavor);
         }
@@ -248,6 +249,31 @@ impl CollectiveLibrary for NcclApi {
 }
 
 /// The flavor whose file-name prefix `path` carries (`librccl*` → rccl, `libnccl*` → nccl).
+/// Sets the flavor's library settings the operator did not set (`NcclFlavor::env_defaults`),
+/// before the library is loaded and reads them; each applied default is logged once.
+fn apply_env_defaults(flavor: &NcclFlavor) {
+    static APPLIED: std::sync::Once = std::sync::Once::new();
+    APPLIED.call_once(|| {
+        for &(key, value) in flavor.env_defaults {
+            if std::env::var_os(key).is_some() {
+                continue;
+            }
+            // SAFETY: called once, from startup (the parallel plan's collective setup or
+            // turbine-collbench's main) before any communicator exists and before the collective
+            // library is loaded, so no thread of that library reads the environment concurrently;
+            // no other Turbine code reads or writes this variable.
+            unsafe { std::env::set_var(key, value) };
+            tracing::info!(
+                event = "collective_env_default",
+                backend = flavor.name,
+                key,
+                value,
+                "collective library setting applied (set it in the environment to override)"
+            );
+        }
+    });
+}
+
 fn flavor_from_name(path: &Path) -> Option<&'static NcclFlavor> {
     let name = path.file_name()?.to_str()?;
     FLAVORS

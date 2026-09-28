@@ -28,6 +28,9 @@ pub struct NcclFlavor {
     /// `lib` (as the lab containers mount `/opt/rocm/rocm/lib`) finds no kernel for the GPU
     /// ("invalid device function").
     pub root_env: Option<(&'static str, &'static str)>,
+    /// Library settings applied before the library loads, each only when the operator has not set
+    /// it in the environment (the library reads them once, at its first call).
+    pub env_defaults: &'static [(&'static str, &'static str)],
     /// Default locations, searched in order after the root, when no explicit path is
     /// configured.
     pub defaults: &'static [&'static str],
@@ -51,6 +54,11 @@ pub static RCCL_FLAVOR: NcclFlavor = NcclFlavor {
     vendor: Vendor::Amd,
     file_prefix: "librccl",
     root_env: Some(("TURBINE_ROCM_PATH", "librccl.so.1")),
+    // The LL protocol RCCL picks for small messages costs about 1 ms per all-reduce on the
+    // host-staged path of GPUs without peer access (novanas: 8 B 1,034 µs, 64 KiB 1,409 µs);
+    // LL128 and Simple take 46–50 µs (`scripts/lab-cluster.sh collbench-sweep-novanas`,
+    // 2026-09-28). Excluding LL leaves RCCL the choice between the other two.
+    env_defaults: &[("NCCL_PROTO", "^LL")],
     defaults: &[
         "/opt/rocm/lib/librccl.so.1",
         "/opt/rocm/rocm/lib/librccl.so.1",
@@ -66,6 +74,7 @@ pub static NCCL_FLAVOR: NcclFlavor = NcclFlavor {
     vendor: Vendor::Nvidia,
     file_prefix: "libnccl",
     root_env: None,
+    env_defaults: &[],
     defaults: &["libnccl.so.2"],
     min_version: NCCL_MIN_VERSION,
     configured: |cfg| cfg.nccl_library.as_deref(),
