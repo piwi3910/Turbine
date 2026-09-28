@@ -184,24 +184,14 @@ pub fn run(cli: Cli) -> ExitCode {
         );
         config.execution.device = device;
     }
-    // P5 S-5 `static` rank mode: this process is one rank of the group, on its local device.
-    // Tier copies need every rank's pool in one process, so L1/L2 are off (WARN, reason code).
+    // P5 S-5 `static` rank mode: this process is one rank of the group, on its local device,
+    // with its own rank's share of the KV tiers (P5 Task 30, per replica below).
     let static_rank =
         (plan.tp > 1 && plan.mode == RankMode::Static).then_some(config.parallel.ranks.rank);
-    if static_rank.is_some() {
-        if let Some(&local) = config.parallel.ranks.local_devices.first() {
-            config.execution.device = local;
-        }
-        if config.kv.cpu.enabled || config.kv.nvme.enabled {
-            tracing::warn!(
-                event = "kv_tiers_unavailable",
-                reason = "static_ranks",
-                "kv.cpu and kv.nvme are off in static rank mode: a tier copy of a block needs \
-                 every rank's shard, and the other ranks' pools live in other processes"
-            );
-            config.kv.cpu.enabled = false;
-            config.kv.nvme.enabled = false;
-        }
+    if static_rank.is_some()
+        && let Some(&local) = config.parallel.ranks.local_devices.first()
+    {
+        config.execution.device = local;
     }
 
     // P4 host rules (contract §16.3): a `kv.nvme.*` violation is a runtime failure (exit 1),
@@ -290,7 +280,10 @@ pub fn run(cli: Cli) -> ExitCode {
             Some(rank) => (config.execution.device, rank),
             None => (parallel::leader_device(&plan, group), 0),
         };
-        let cfg = replica_config(&config, r, plan.groups.len(), device);
+        let mut cfg = replica_config(&config, r, plan.groups.len(), device);
+        if let Some(rank) = static_rank {
+            engine::tp_tiers::static_rank_kv(&mut cfg.kv, rank, tp);
+        }
         let experts = expert_metrics.as_ref().map(|m| {
             Arc::new(parallel::ExpertStats::new(
                 plan.ep,
@@ -372,13 +365,26 @@ pub fn run(cli: Cli) -> ExitCode {
         } else {
             kv_metrics.another_replica()
         };
-        let l2 = match kv_orchestrator::open_l2(
-            &cfg.kv,
-            &format,
-            &prepared.identity,
-            Arc::new(SystemClock::new()),
-            replica_kv_metrics.clone(),
-        ) {
+        let clock = Arc::new(SystemClock::new());
+        let l2 = match static_rank {
+            // This rank's shards only, under `kv.nvme.path/rank-<r>` (P5 Task 30).
+            Some(_) => engine::tp_tiers::open_rank_l2(
+                &cfg.kv,
+                prepared.pool.layout,
+                tp,
+                &prepared.identity,
+                clock,
+                replica_kv_metrics.clone(),
+            ),
+            None => kv_orchestrator::open_l2(
+                &cfg.kv,
+                &format,
+                &prepared.identity,
+                clock,
+                replica_kv_metrics.clone(),
+            ),
+        };
+        let l2 = match l2 {
             Ok(l2) => l2,
             Err(e) => {
                 tracing::error!(replica = r, error = %e, "KV tier startup failed");
@@ -398,7 +404,7 @@ pub fn run(cli: Cli) -> ExitCode {
                             mirror_check_steps: engine::tp::MIRROR_CHECK_STEPS,
                         })
                     } else {
-                        StaticRole::Worker(engine::tp::StaticWorker {
+                        StaticRole::Worker(Box::new(engine::tp::StaticWorker {
                             transport,
                             leader: config.parallel.ranks.leader.unwrap_or(config.server.listen),
                             hello,
@@ -409,7 +415,11 @@ pub fn run(cli: Cli) -> ExitCode {
                             metrics: cmetrics.clone(),
                             clock: Arc::new(SystemClock::new()),
                             wrap: std::convert::identity,
-                        })
+                            tiers: engine::tp_tiers::WorkerTierStart {
+                                kv: cfg.kv.clone(),
+                                l2: l2.clone(),
+                            },
+                        }))
                     }),
                     Err(e) => {
                         eprintln!("turbine-server: {e}");
@@ -421,7 +431,7 @@ pub fn run(cli: Cli) -> ExitCode {
         };
         let (remote, worker) = match statics {
             Some(StaticRole::Leader(l)) => (Some(l), None),
-            Some(StaticRole::Worker(w)) => (None, Some(w)),
+            Some(StaticRole::Worker(w)) => (None, Some(*w)),
             None => (None, None),
         };
         let group = collective
@@ -480,7 +490,7 @@ pub fn run(cli: Cli) -> ExitCode {
 /// This process's part of a `static` group.
 enum StaticRole {
     Leader(engine::tp::StaticLeader),
-    Worker(engine::tp::StaticWorker),
+    Worker(Box<engine::tp::StaticWorker>),
 }
 
 /// The rank transport (`parallel.ranks.transport`), what the leader expects of every rank and

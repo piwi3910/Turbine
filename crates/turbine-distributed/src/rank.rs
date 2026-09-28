@@ -35,8 +35,17 @@ use crate::collective::CollectiveError;
 use crate::transport::{RankStream, Transport};
 
 /// Static-mode protocol version carried in `Hello`. 2 adds [`StepPlan::copies`]; 3 adds the
-/// mirror ledgers ([`StepPlan::ledger`], [`RankMessage::Loaded`]).
+/// mirror ledgers ([`StepPlan::ledger`], [`RankMessage::Loaded`]), the group re-creation
+/// (`StepFailed`, `Reinit`, `ReinitDone`) and the KV tier copies ([`RankMessage::TierCopy`],
+/// [`RankMessage::TierAck`], [`RankMessage::TierReady`]).
 pub const PROTOCOL_VERSION: u16 = 3;
+/// Tier operations per [`RankMessage::TierCopy`] frame (a few dozen bytes each: far below
+/// [`MAX_FRAME_BYTES`]); a longer batch goes as several frames, in order.
+pub const MAX_TIER_BATCH: usize = 1024;
+/// Batches a worker's tier thread holds before its link stops reading (backpressure).
+const TIER_QUEUE: usize = 64;
+/// How often a worker's tier thread polls its copies in flight.
+const TIER_POLL: Duration = Duration::from_micros(250);
 /// Largest frame body accepted or sent (16 MiB).
 pub const MAX_FRAME_BYTES: usize = 16 << 20;
 /// Worker → leader messages the leader has not taken yet, per link; beyond this the oldest is
@@ -221,6 +230,74 @@ pub enum RankMessage {
         rank: u32,
         error: Option<String>,
     },
+    /// Leader → worker (v3, P5 Task 30): KV tier operations on the worker's own pool and its own
+    /// L1/L2, applied in order after every message before it; each copy is answered in a
+    /// [`RankMessage::TierAck`].
+    TierCopy {
+        copies: Vec<TierCopy>,
+    },
+    /// Worker → leader (v3): the outcome of copies of earlier `TierCopy` messages.
+    TierAck {
+        rank: u32,
+        acks: Vec<TierAck>,
+    },
+    /// Worker → leader (v3), after `Loaded`: which of its KV tiers are usable.
+    TierReady {
+        rank: u32,
+        l1: bool,
+        l2: bool,
+    },
+}
+
+/// A copy direction between one rank's KV tiers (`turbine_kv::transfer::TransferPath`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TierPath {
+    L0ToL1,
+    L1ToL0,
+    L1ToL2,
+    L2ToL1,
+    L0ToL2,
+    L2ToL0,
+}
+
+/// A lower KV tier of one rank.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TierLevel {
+    L1,
+    L2,
+}
+
+/// One KV tier operation a worker applies to its own shard of a block (v3).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum TierCopy {
+    /// Copies the rank's shard of `key` along `path`; `block` is the leader's logical L0 block
+    /// (the source of a copy out of L0, the destination of a copy into it; unused by L1 ↔ L2).
+    Copy {
+        id: u64,
+        path: TierPath,
+        key: [u8; 16],
+        block: BlockId,
+    },
+    /// Drops the rank's copy of `key` in `tier` (absent is not an error). Not acknowledged.
+    Evict { tier: TierLevel, key: [u8; 16] },
+}
+
+/// A worker's outcome of one [`TierCopy::Copy`]: `error` is `None` on success.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TierAck {
+    pub id: u64,
+    pub error: Option<String>,
+}
+
+/// A worker rank's end of the KV tier copies (implemented in `turbine-server` over its pool and
+/// tiers), driven by its link's tier thread.
+pub trait TierWorker: Send {
+    /// Starts `copies` in order (evictions apply at once, copies in flight until done).
+    fn submit(&mut self, copies: Vec<TierCopy>);
+    /// Outcomes of the copies finished since the last call (never blocks).
+    fn poll(&mut self) -> Vec<TierAck>;
+    /// Some copy is still in flight.
+    fn busy(&self) -> bool;
 }
 
 /// Writes one frame: u32 LE body length, then the postcard body (≤ [`MAX_FRAME_BYTES`]).
@@ -352,6 +429,94 @@ impl Inbox {
                 .0;
         }
     }
+
+    /// Every message `pick` accepts, without waiting.
+    fn drain(&self, mut pick: impl FnMut(&RankMessage) -> bool) -> Vec<(u32, RankMessage)> {
+        let mut q = lock(&self.queue);
+        let (taken, kept): (VecDeque<_>, VecDeque<_>) = q.drain(..).partition(|(_, m)| pick(m));
+        *q = kept;
+        taken.into_iter().collect()
+    }
+}
+
+/// The senders of a `static` group's links the KV tier copies use ([`TierLink`]), emptied when
+/// the runtime shuts down or drops so its writer threads can end.
+#[derive(Default)]
+struct TierSenders(Mutex<Vec<(u32, SyncSender<RankMessage>)>>);
+
+impl TierSenders {
+    fn close(&self) {
+        lock(&self.0).clear();
+    }
+}
+
+/// The leader's end of a `static` group's KV tier copies (P5 Task 30): sends
+/// [`RankMessage::TierCopy`] batches on the same links (and in the same order) as the step
+/// plans, and takes the workers' acknowledgements. Cloned out of the [`RankRuntime`] for the KV
+/// orchestrator; it stops working once the runtime shuts down.
+#[derive(Clone)]
+pub struct TierLink {
+    senders: Arc<TierSenders>,
+    ranks: Vec<u32>,
+    inbox: Arc<Inbox>,
+    failure: Arc<Failure>,
+}
+
+impl TierLink {
+    /// The worker ranks, in rank order.
+    pub fn ranks(&self) -> &[u32] {
+        &self.ranks
+    }
+
+    /// Sends `copies` to every worker, at most [`MAX_TIER_BATCH`] per frame, in order. Blocks
+    /// while a link's queue is full (backpressure); fails once a link closed or the runtime shut
+    /// down. A failed step does not stop it: the worker's tier thread keeps answering while the
+    /// rank waits for `Reinit`.
+    pub fn send(&self, copies: &[TierCopy]) -> Result<(), RankError> {
+        let senders = lock(&self.senders.0).clone();
+        if senders.len() != self.ranks.len() {
+            return Err(RankError::Io("the rank runtime shut down".into()));
+        }
+        for batch in copies.chunks(MAX_TIER_BATCH) {
+            for (rank, tx) in &senders {
+                let msg = RankMessage::TierCopy {
+                    copies: batch.to_vec(),
+                };
+                if tx.send(msg).is_err() {
+                    return Err(self
+                        .failure
+                        .get()
+                        .unwrap_or(RankError::Closed { rank: *rank }));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The acknowledgements received so far, by rank, without waiting.
+    pub fn acks(&self) -> Vec<(u32, Vec<TierAck>)> {
+        self.inbox
+            .drain(|m| matches!(m, RankMessage::TierAck { .. }))
+            .into_iter()
+            .filter_map(|(rank, m)| match m {
+                RankMessage::TierAck { acks, .. } => Some((rank, acks)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The group's failure, while it is failed (a `StepFailed`, a lost or silent worker) —
+    /// until the group is re-created.
+    pub fn failure(&self) -> Option<RankError> {
+        self.failure.get()
+    }
+
+    /// Marks the group failed (a worker that stopped answering): every later step and send
+    /// returns `e`.
+    pub fn fail(&self, e: RankError) {
+        self.failure.set(e);
+        self.inbox.cv.notify_all();
+    }
 }
 
 /// Outstanding plans of one local worker.
@@ -394,6 +559,7 @@ enum Mode {
         /// A worker's `StepFailed` for a plan below this step is stale: the group was
         /// re-created after it.
         stale_below: Arc<AtomicU64>,
+        tiers: Arc<TierSenders>,
     },
 }
 
@@ -601,6 +767,7 @@ impl RankRuntime {
         let closing = Arc::new(AtomicBool::new(false));
         let inbox = Arc::new(Inbox::default());
         let stale_below = Arc::new(AtomicU64::new(0));
+        let tiers = Arc::new(TierSenders::default());
         let mut links = Vec::with_capacity(joined.len());
         for (rank, mut stream) in joined {
             stream.set_read_timeout(None).map_err(io_err)?;
@@ -671,6 +838,7 @@ impl RankRuntime {
                     i.cv.notify_all();
                 })
                 .map_err(io_err)?;
+            lock(&tiers.0).push((rank, tx.clone()));
             links.push(StaticLink {
                 rank,
                 tx: Some(tx),
@@ -686,6 +854,7 @@ impl RankRuntime {
                 closing,
                 inbox,
                 stale_below,
+                tiers,
             },
             depth,
             failure,
@@ -836,6 +1005,55 @@ impl RankRuntime {
             }
         }
         Ok(got.into_iter().collect())
+    }
+
+    /// Static mode: the link the KV orchestrator's tier copies use (P5 Task 30); `None` in local
+    /// mode, where the leader copies on the workers' contexts itself.
+    pub fn tier_link(&self) -> Option<TierLink> {
+        let Mode::Static {
+            links,
+            inbox,
+            tiers,
+            ..
+        } = &self.mode
+        else {
+            return None;
+        };
+        Some(TierLink {
+            senders: Arc::clone(tiers),
+            ranks: links.iter().map(|l| l.rank).collect(),
+            inbox: Arc::clone(inbox),
+            failure: Arc::clone(&self.failure),
+        })
+    }
+
+    /// Static mode: every worker's `TierReady` as `(rank, l1, l2)`, in rank order, waiting until
+    /// `timeout` (`Timeout { missing }`) or the group fails. Local mode: none.
+    pub fn tier_ready(&self, timeout: Duration) -> Result<Vec<(u32, bool, bool)>, RankError> {
+        let Mode::Static { links, inbox, .. } = &self.mode else {
+            return Ok(Vec::new());
+        };
+        let deadline = Instant::now() + timeout;
+        let mut got: BTreeMap<u32, (bool, bool)> = BTreeMap::new();
+        while got.len() < links.len() {
+            let taken = inbox.take(deadline, &self.failure, |_, m| {
+                matches!(m, RankMessage::TierReady { .. })
+            })?;
+            match taken {
+                Some((rank, RankMessage::TierReady { l1, l2, .. })) => {
+                    got.insert(rank, (l1, l2));
+                }
+                _ => {
+                    let missing = links
+                        .iter()
+                        .map(|l| l.rank)
+                        .filter(|r| !got.contains_key(r))
+                        .collect();
+                    return Err(RankError::Timeout { missing });
+                }
+            }
+        }
+        Ok(got.into_iter().map(|(r, (l1, l2))| (r, l1, l2)).collect())
     }
 
     /// Static mode, ranks 1..: connects to `leader` over `transport` (retrying with 50 ms
@@ -990,8 +1208,14 @@ impl RankRuntime {
                     }
                 }
             }
-            Mode::Static { links, closing, .. } => {
+            Mode::Static {
+                links,
+                closing,
+                tiers,
+                ..
+            } => {
                 closing.store(true, Ordering::Release);
+                tiers.close();
                 for l in links.iter_mut() {
                     if let Some(tx) = l.tx.take() {
                         let _ = tx.send(RankMessage::Shutdown {
@@ -1021,8 +1245,14 @@ impl Drop for RankRuntime {
                     w.tx = None;
                 }
             }
-            Mode::Static { links, closing, .. } => {
+            Mode::Static {
+                links,
+                closing,
+                tiers,
+                ..
+            } => {
                 closing.store(true, Ordering::Release);
+                tiers.close();
                 for l in links.iter_mut() {
                     l.tx = None;
                     let _ = l.control.shutdown();
@@ -1061,27 +1291,66 @@ impl WorkerLink {
         .map_err(io_err)
     }
 
+    /// Tells the leader which of this rank's KV tiers are usable (`TierReady`, P5 Task 30).
+    pub fn tiers_ready(&mut self, l1: bool, l2: bool) -> Result<(), RankError> {
+        write_frame(
+            &mut self.stream,
+            &RankMessage::TierReady {
+                rank: self.rank,
+                l1,
+                l2,
+            },
+        )
+        .map_err(io_err)
+    }
+
     /// Executes every message the leader sends until `Shutdown` (`Ok`): step plans, and
     /// `Reinit` (answered `ReinitDone`). A failed step is reported `StepFailed` and the rank
     /// waits for the leader to re-create the group (P5 Task 28); a sticky device error sends
     /// `Shutdown` to the leader, aborts the executor's communicator and returns `Executor`. A
-    /// lost leader aborts it and returns `Closed { rank: 0 }`.
-    pub fn run(mut self, exec: &mut dyn StepExecutor) -> Result<(), RankError> {
+    /// lost leader aborts it and returns `Closed { rank: 0 }`. Tier copies are refused
+    /// (acknowledged with an error): see [`WorkerLink::run_with_tiers`].
+    pub fn run(self, exec: &mut dyn StepExecutor) -> Result<(), RankError> {
+        self.run_with_tiers(exec, None)
+    }
+
+    /// [`WorkerLink::run`], with `tiers` applying the leader's `TierCopy` messages (P5 Task 30)
+    /// on a thread of their own, so copies overlap the steps. Messages keep the link's order:
+    /// a copy out of a block starts after every step before it returned. The thread acknowledges
+    /// each copy once it finished (also while the rank waits for `Reinit`); before this returns,
+    /// it finishes the copies in flight (they read or write the rank's pool, which must outlive
+    /// this call).
+    pub fn run_with_tiers(
+        mut self,
+        exec: &mut dyn StepExecutor,
+        tiers: Option<Box<dyn TierWorker>>,
+    ) -> Result<(), RankError> {
+        let writer = Arc::new(Mutex::new(self.stream.try_clone().map_err(io_err)?));
         let rank = self.rank;
-        loop {
+        let (tier_tx, tier_thread) = match tiers {
+            Some(t) => {
+                let (tx, rx) = sync_channel::<Vec<TierCopy>>(TIER_QUEUE);
+                let w = Arc::clone(&writer);
+                let handle = std::thread::Builder::new()
+                    .name(format!("turbine-rank-{rank}-tiers"))
+                    .spawn(move || tier_loop(rank, t, rx, w))
+                    .map_err(io_err)?;
+                (Some(tx), Some(handle))
+            }
+            None => (None, None),
+        };
+        let send = |msg: &RankMessage| write_frame(&mut *lock(&writer), msg);
+        let result = loop {
             let reply = match read_frame(&mut self.stream) {
                 Ok(RankMessage::StepPlan(plan)) => match exec.execute(&plan) {
                     Ok(_) => None,
                     Err(e @ ExecError::DeviceFatal(_)) => {
                         let detail = e.to_string();
-                        let _ = write_frame(
-                            &mut self.stream,
-                            &RankMessage::Shutdown {
-                                reason: format!("rank {rank}: {detail}"),
-                            },
-                        );
+                        let _ = send(&RankMessage::Shutdown {
+                            reason: format!("rank {rank}: {detail}"),
+                        });
                         exec.abort();
-                        return Err(RankError::Executor { rank, detail });
+                        break Err(RankError::Executor { rank, detail });
                     }
                     Err(e) => Some(RankMessage::StepFailed {
                         rank,
@@ -1099,26 +1368,107 @@ impl WorkerLink {
                     );
                     Some(RankMessage::ReinitDone { rank, error })
                 }
+                Ok(RankMessage::TierCopy { copies }) => {
+                    let refused = match &tier_tx {
+                        Some(tx) => tx.send(copies).err().map(|e| e.0),
+                        None => Some(copies),
+                    };
+                    // No tier thread: every copy fails, so the leader's copy fails too.
+                    let acks: Vec<TierAck> = refused
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|c| match c {
+                            TierCopy::Copy { id, .. } => Some(TierAck {
+                                id,
+                                error: Some(format!("rank {rank} has no KV tiers")),
+                            }),
+                            TierCopy::Evict { .. } => None,
+                        })
+                        .collect();
+                    (!acks.is_empty()).then_some(RankMessage::TierAck { rank, acks })
+                }
                 Ok(RankMessage::Shutdown { reason }) => {
                     tracing::info!(event = "rank_shutdown", rank, %reason, "leader shut down");
-                    return Ok(());
+                    break Ok(());
                 }
                 Ok(other) => {
                     exec.abort();
-                    return Err(RankError::Io(format!("unexpected message {other:?}")));
+                    break Err(RankError::Io(format!("unexpected message {other:?}")));
                 }
                 Err(_) => {
                     tracing::warn!(event = "leader_lost", rank, "leader connection closed");
                     exec.abort();
-                    return Err(RankError::Closed { rank: 0 });
+                    break Err(RankError::Closed { rank: 0 });
                 }
             };
             if let Some(msg) = reply
-                && write_frame(&mut self.stream, &msg).is_err()
+                && send(&msg).is_err()
             {
                 tracing::warn!(event = "leader_lost", rank, "leader connection closed");
                 exec.abort();
-                return Err(RankError::Closed { rank: 0 });
+                break Err(RankError::Closed { rank: 0 });
+            }
+        };
+        // The tier thread finishes its copies in flight, then ends with its channel.
+        drop(tier_tx);
+        if let Some(h) = tier_thread {
+            let _ = h.join();
+        }
+        result
+    }
+}
+
+/// A worker's tier thread: starts the batches the link hands it, polls the copies in flight
+/// every [`TIER_POLL`] and sends their acknowledgements; once the link closed its channel it
+/// finishes the copies in flight and ends.
+fn tier_loop(
+    rank: u32,
+    mut tiers: Box<dyn TierWorker>,
+    rx: Receiver<Vec<TierCopy>>,
+    writer: Arc<Mutex<Box<dyn RankStream>>>,
+) {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    let mut open = true;
+    let mut writable = true;
+    while open || tiers.busy() {
+        if open {
+            let first = if tiers.busy() {
+                match rx.recv_timeout(TIER_POLL) {
+                    Ok(c) => Some(c),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        open = false;
+                        None
+                    }
+                }
+            } else {
+                match rx.recv() {
+                    Ok(c) => Some(c),
+                    Err(_) => {
+                        open = false;
+                        None
+                    }
+                }
+            };
+            if let Some(c) = first {
+                tiers.submit(c);
+            }
+            while open {
+                match rx.try_recv() {
+                    Ok(c) => tiers.submit(c),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => open = false,
+                }
+            }
+        } else {
+            std::thread::sleep(TIER_POLL);
+        }
+        let acks = tiers.poll();
+        if !acks.is_empty() && writable {
+            let msg = RankMessage::TierAck { rank, acks };
+            if write_frame(&mut *lock(&writer), &msg).is_err() {
+                // The leader is gone: the copies still finish, unacknowledged.
+                writable = false;
             }
         }
     }
@@ -1717,6 +2067,227 @@ mod tests {
         assert!(
             matches!(&err, RankError::Executor { rank: 1, detail } if detail.contains("boom")),
             "{err:?}"
+        );
+    }
+
+    fn tier_copies() -> Vec<TierCopy> {
+        vec![
+            TierCopy::Copy {
+                id: 7,
+                path: TierPath::L0ToL1,
+                key: [3; 16],
+                block: BlockId(5),
+            },
+            TierCopy::Evict {
+                tier: TierLevel::L2,
+                key: [4; 16],
+            },
+            TierCopy::Copy {
+                id: 8,
+                path: TierPath::L2ToL0,
+                key: [5; 16],
+                block: BlockId(9),
+            },
+        ]
+    }
+
+    /// P5 Task 30: the tier messages survive the frame codec unchanged. Breaks if a tier
+    /// variant or field is not carried on the wire.
+    #[test]
+    fn tier_frames_round_trip() {
+        let msgs = [
+            RankMessage::TierCopy {
+                copies: tier_copies(),
+            },
+            RankMessage::TierAck {
+                rank: 1,
+                acks: vec![
+                    TierAck { id: 7, error: None },
+                    TierAck {
+                        id: 8,
+                        error: Some("tier full".into()),
+                    },
+                ],
+            },
+            RankMessage::TierReady {
+                rank: 2,
+                l1: true,
+                l2: false,
+            },
+        ];
+        let mut wire = Vec::new();
+        for m in &msgs {
+            write_frame(&mut wire, m).expect("write");
+        }
+        let mut r = wire.as_slice();
+        for m in &msgs {
+            assert_eq!(&read_frame(&mut r).expect("read"), m);
+        }
+        // A full batch stays far below the frame bound.
+        let full = RankMessage::TierCopy {
+            copies: vec![tier_copies()[0].clone(); MAX_TIER_BATCH],
+        };
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &full).expect("a full batch fits one frame");
+        assert!(wire.len() < MAX_FRAME_BYTES / 64, "{}", wire.len());
+    }
+
+    /// Records every submitted operation; acknowledges each copy on the next poll, failing
+    /// the copies whose id is odd.
+    struct Recorder {
+        seen: Arc<Mutex<Vec<TierCopy>>>,
+        pending: Vec<u64>,
+    }
+
+    impl TierWorker for Recorder {
+        fn submit(&mut self, copies: Vec<TierCopy>) {
+            for c in copies {
+                if let TierCopy::Copy { id, .. } = &c {
+                    self.pending.push(*id);
+                }
+                self.seen.lock().unwrap().push(c);
+            }
+        }
+
+        fn poll(&mut self) -> Vec<TierAck> {
+            self.pending
+                .drain(..)
+                .map(|id| TierAck {
+                    id,
+                    error: (id % 2 == 1).then(|| format!("copy {id} failed")),
+                })
+                .collect()
+        }
+
+        fn busy(&self) -> bool {
+            !self.pending.is_empty()
+        }
+    }
+
+    /// Executes nothing.
+    struct Idle;
+    impl StepExecutor for Idle {
+        fn execute(&mut self, _plan: &StepPlan) -> Result<StepOutput, ExecError> {
+            Ok(StepOutput {
+                logits: None,
+                rows: 0,
+                vocab: 0,
+            })
+        }
+    }
+
+    /// Acknowledgements from every worker, gathered until `want` arrived (5 s at most).
+    fn gather(link: &TierLink, want: usize) -> Vec<(u32, TierAck)> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = Vec::new();
+        while got.len() < want {
+            assert!(Instant::now() < deadline, "acks so far: {got:?}");
+            for (rank, acks) in link.acks() {
+                got.extend(acks.into_iter().map(|a| (rank, a)));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        got.sort_by_key(|(r, a)| (*r, a.id));
+        got
+    }
+
+    /// P5 Task 30 over loopback `tcp`: the leader's `TierReady` wait returns every worker's
+    /// tiers in rank order; a `TierCopy` batch reaches every worker's tier thread in order (a
+    /// batch longer than `MAX_TIER_BATCH` as several frames) and each copy's outcome comes back
+    /// from each rank; a worker without tiers fails the copies it is sent. The leader's
+    /// shutdown ends the workers cleanly although the tier link is still held. Breaks if an
+    /// operation is lost, reordered or misattributed, or a held tier link keeps the runtime
+    /// from shutting down.
+    #[test]
+    fn tier_copies_reach_every_worker() {
+        let addr = free_addr();
+        let leader = thread::spawn(move || {
+            RankRuntime::static_leader(
+                tcp(),
+                addr,
+                expect(),
+                3,
+                Duration::from_secs(5),
+                unique_id(),
+                2,
+            )
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = mpsc::channel();
+        for rank in 1..3u32 {
+            let (done, seen) = (done_tx.clone(), Arc::clone(&seen));
+            thread::spawn(move || {
+                let mut link =
+                    RankRuntime::static_worker(tcp(), addr, hello(rank, 3), Duration::from_secs(5))
+                        .expect("welcome");
+                link.tiers_ready(rank == 1, true).expect("tiers ready");
+                let tiers: Option<Box<dyn TierWorker>> = (rank == 1).then(|| {
+                    Box::new(Recorder {
+                        seen,
+                        pending: Vec::new(),
+                    }) as _
+                });
+                let mut exec = Idle;
+                done.send(link.run_with_tiers(&mut exec, tiers)).unwrap();
+            });
+        }
+        let mut rt = leader.join().unwrap().expect("joined");
+        assert_eq!(
+            rt.tier_ready(Duration::from_secs(5)).expect("tier ready"),
+            vec![(1, true, true), (2, false, true)]
+        );
+        let link = rt.tier_link().expect("a static group has a tier link");
+        assert_eq!(link.ranks(), &[1, 2]);
+        rt.step(step_plan(1)).expect("step");
+        link.send(&tier_copies()).expect("send");
+        let got = gather(&link, 4);
+        let ok = |id| TierAck { id, error: None };
+        let failed = |id: u64| TierAck {
+            id,
+            error: Some(format!("copy {id} failed")),
+        };
+        let none = |id| TierAck {
+            id,
+            error: Some("rank 2 has no KV tiers".into()),
+        };
+        assert_eq!(
+            got,
+            vec![(1, failed(7)), (1, ok(8)), (2, none(7)), (2, none(8))]
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            tier_copies(),
+            "in order, evictions too"
+        );
+
+        // More than one frame's worth, in order.
+        let many: Vec<TierCopy> = (0..MAX_TIER_BATCH as u64 + 10)
+            .map(|i| TierCopy::Copy {
+                id: 100 + 2 * i,
+                path: TierPath::L1ToL2,
+                key: [1; 16],
+                block: BlockId(0),
+            })
+            .collect();
+        link.send(&many).expect("send many");
+        let got = gather(&link, 2 * many.len());
+        assert!(
+            got.iter()
+                .filter(|(r, _)| *r == 1)
+                .all(|(_, a)| a.error.is_none())
+        );
+        assert_eq!(seen.lock().unwrap()[3..], many[..]);
+
+        rt.shutdown("test done");
+        for _ in 0..2 {
+            let result = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker loop ends");
+            assert_eq!(result, Ok(()));
+        }
+        assert!(
+            link.send(&tier_copies()).is_err(),
+            "no sends after shutdown"
         );
     }
 }

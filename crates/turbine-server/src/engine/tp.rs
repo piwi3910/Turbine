@@ -38,9 +38,9 @@
 //! (`RankRuntime::static_leader`, `rank_missing` meanwhile), then loads like `local` mode with
 //! only its own rank, the pool agreement going through the communicator (an all-reduce); plans
 //! travel as frames. Each worker process ([`run_static_worker`]) joins, loads its rank and
-//! executes plans until the leader shuts it down or is lost (exit 1). There is no per-step
-//! acknowledgement across processes, so KV tiers (which copy every rank's shard from the
-//! leader) are off in static mode.
+//! executes plans until the leader shuts it down or is lost (exit 1). KV tiers: each process
+//! keeps its own rank's L1/L2 shards, the leader's orchestrator driving the workers' copies
+//! over the rank link (P5 Task 30, [`super::tp_tiers`]).
 //!
 //! Group admission in `static` mode (P5 Task 33, decision "P5: group KV admission in static
 //! rank mode" B): each worker reports its memory budget once it loaded (`Loaded`), and the
@@ -804,6 +804,8 @@ pub(crate) struct StaticWorker {
     /// Wraps the loaded executor (`std::convert::identity` in the server; tests inject
     /// failures).
     pub wrap: fn(Box<dyn ModelExecutor>) -> Box<dyn ModelExecutor>,
+    /// Its share of the KV tiers (P5 Task 30).
+    pub tiers: super::tp_tiers::WorkerTierStart,
 }
 
 /// A rank after its load, before the group's warm-up.
@@ -1235,6 +1237,13 @@ pub(crate) fn load_group(
             mirror_held.extend(held);
         }
     }
+    // `static` mode: the workers' own KV tiers, driven by the orchestrator (P5 Task 30).
+    let remote_tiers = match &remote {
+        Some(runtime) => {
+            super::tp_tiers::leader_driver(runtime, group.init_timeout, group.op_timeout)?
+        }
+        None => None,
+    };
     let runtime = match remote {
         Some(runtime) => runtime,
         None => RankRuntime::local(workers, group.depth),
@@ -1271,6 +1280,7 @@ pub(crate) fn load_group(
         reserve: rank0.reserve,
         held: rank0.held,
         shards,
+        remote_tiers,
         group: ledgers,
     })
 }
@@ -1319,6 +1329,7 @@ pub(crate) fn run_static_worker(
     // P5 Task 33: the leader mirrors this rank's ledger from the budget it reports now.
     link.loaded(rank_budget(&rank.budget, &rank.ledger, &rank.pool))
         .map_err(|e| format!("rank {}: reporting its budget: {e}", s.rank))?;
+    let tiers = super::tp_tiers::start_worker_tiers(prepared, start.tiers, &rank.pool, &mut link)?;
     let ledger = Arc::clone(&rank.ledger);
     let mut worker = WorkerRank::new(
         s.rank,
@@ -1339,7 +1350,7 @@ pub(crate) fn run_static_worker(
         "worker rank loaded; executing step plans"
     );
     ready(&ledger);
-    link.run(&mut worker)
+    link.run_with_tiers(&mut worker, tiers)
         .map_err(|e| format!("rank {}: {e}", s.rank))
 }
 
@@ -1616,13 +1627,15 @@ mod tests {
         metrics: MetricsRegistry,
     }
 
-    /// Starts a [`StaticRun`] over `spec` with `edit` on both ranks' configuration and a
-    /// mirror-ledger check every `check_steps` steps, the worker's executor wrapped by `wrap`.
+    /// Starts a [`StaticRun`] over `spec` with `edit` on both ranks' configuration, a
+    /// mirror-ledger check every `check_steps` steps, the worker's executor wrapped by `wrap`
+    /// and its KV tiers `tiers`.
     fn start_static(
         spec: &TinySpec,
         edit: impl Fn(&mut turbine_core::config::Config) + Copy,
         check_steps: u64,
         wrap: fn(Box<dyn ModelExecutor>) -> Box<dyn ModelExecutor>,
+        tiers: super::super::tp_tiers::WorkerTierStart,
     ) -> StaticRun {
         let (leader, worker) = (prepared_with(spec, 0, edit), prepared_with(spec, 1, edit));
         let library = turbine_distributed::collective::HostBackend
@@ -1665,6 +1678,7 @@ mod tests {
             metrics: CollectiveMetrics::register(&worker_reg),
             clock: Arc::clone(&clock),
             wrap,
+            tiers,
         };
         let worker_reliability = ReliabilityMetrics::register(&worker_reg);
         let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
@@ -1722,7 +1736,13 @@ mod tests {
         let (mut one, one_pool) = one_device(&spec);
         let want = greedy_with_fork(one.as_mut(), &one_pool, &prompt, 5);
 
-        let run = start_static(&spec, |_| {}, MIRROR_CHECK_STEPS, std::convert::identity);
+        let run = start_static(
+            &spec,
+            |_| {},
+            MIRROR_CHECK_STEPS,
+            std::convert::identity,
+            super::super::tp_tiers::WorkerTierStart::off(),
+        );
         assert!(
             run.loaded.shards.is_empty(),
             "no tier shards across processes"
@@ -1747,7 +1767,28 @@ mod tests {
     /// its command channel and published documents.
     fn engine_over(
         prepared: &PreparedModel,
+        loaded: LoadedModel,
+    ) -> (
+        crate::engine::EngineLoop,
+        tokio::sync::mpsc::Sender<crate::engine::EngineCommand>,
+        Arc<crate::engine::EngineShared>,
+        MetricsRegistry,
+    ) {
+        let kv_cfg = turbine_core::config::KvConfig {
+            block_tokens: loaded.pool.layout().block_tokens,
+            ..turbine_core::config::KvConfig::default()
+        };
+        engine_over_kv(prepared, loaded, &kv_cfg, |_| None, |_| {})
+    }
+
+    /// [`engine_over`] with the `kv` section `kv_cfg`, the L2 tier `open_l2` opens with the
+    /// engine's KV metrics, and `on_kv` shown the KV orchestrator before the engine takes it.
+    fn engine_over_kv(
+        prepared: &PreparedModel,
         mut loaded: LoadedModel,
+        kv_cfg: &turbine_core::config::KvConfig,
+        open_l2: impl FnOnce(turbine_kv::KvMetrics) -> Option<Arc<turbine_kv::tier::L2NvmeTier>>,
+        on_kv: impl FnOnce(&crate::kv_orchestrator::KvOrchestrator),
     ) -> (
         crate::engine::EngineLoop,
         tokio::sync::mpsc::Sender<crate::engine::EngineCommand>,
@@ -1761,26 +1802,25 @@ mod tests {
             scheduler: turbine_scheduler::SchedulerMetrics::register(&reg),
             kv: turbine_kv::KvMetrics::register(&reg),
         };
+        let l2 = open_l2(metrics.kv.clone());
         let clock: Arc<dyn Clock> = Arc::new(turbine_core::clock::SystemClock::new());
         let mut pool = loaded.pool;
-        let kv_cfg = turbine_core::config::KvConfig {
-            block_tokens: pool.layout().block_tokens,
-            ..turbine_core::config::KvConfig::default()
-        };
         let (kv, _handle) = crate::kv_orchestrator::KvOrchestrator::start(
             crate::kv_orchestrator::KvStart {
-                cfg: &kv_cfg,
+                cfg: kv_cfg,
                 memory_kind: MemoryKind::Dedicated,
                 identity: prepared.identity,
                 device: crate::engine::copy_device(prepared),
                 shards: std::mem::take(&mut loaded.shards),
-                l2: None,
+                l2,
                 clock: Arc::clone(&clock),
                 metrics: metrics.kv.clone(),
+                remote: loaded.remote_tiers.take(),
             },
             &mut pool,
         )
         .expect("the KV hierarchy starts");
+        on_kv(&kv);
         let parts = crate::reliability::build(crate::reliability::ReliabilityInputs {
             config: &prepared.reliability,
             budget: loaded.budget,
@@ -1935,7 +1975,13 @@ mod tests {
             c.scheduler.max_running_requests = 32;
             c.model.max_seq_len = Some(256);
         };
-        let run = start_static(&spec, edit, 1, std::convert::identity);
+        let run = start_static(
+            &spec,
+            edit,
+            1,
+            std::convert::identity,
+            super::super::tp_tiers::WorkerTierStart::off(),
+        );
         let StaticRun {
             leader,
             loaded,
@@ -2091,7 +2137,13 @@ mod tests {
             vec![t0, t1, t2]
         };
 
-        let run = start_static(&spec, |_| {}, MIRROR_CHECK_STEPS, fail_third);
+        let run = start_static(
+            &spec,
+            |_| {},
+            MIRROR_CHECK_STEPS,
+            fail_third,
+            super::super::tp_tiers::WorkerTierStart::off(),
+        );
         let LoadedModel {
             mut executor, pool, ..
         } = run.loaded;
@@ -2144,5 +2196,177 @@ mod tests {
             let again = step(&mut tp, &view, &[1], 3, &table).expect_err("stays failed");
             assert!(matches!(again, ModelError::Collective(_)), "{again}");
         }
+    }
+
+    /// A request's greedy tokens with their logprobs, and `usage.cached_tokens`, read to its
+    /// end.
+    fn tokens_and_cached(rx: &mut Events) -> (Vec<(u32, f32)>, u32) {
+        use turbine_core::request::GenerationEvent;
+        let mut tokens = Vec::new();
+        while let Some(e) = rx.blocking_recv() {
+            match e {
+                GenerationEvent::Token {
+                    token_id, logprob, ..
+                } => tokens.push((token_id, logprob.expect("logprobs requested"))),
+                GenerationEvent::Finished { usage, .. } => {
+                    return (tokens, usage.expect("usage").cached_tokens);
+                }
+                GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                _ => {}
+            }
+        }
+        panic!("stream closed without an end");
+    }
+
+    /// P5 Task 30 (decision "P5: KV tiers in static rank mode" B), the plan's tiny-server check
+    /// in one process (the host collective joins threads of one process only): a tp 2 `static`
+    /// group on the cpu backend over loopback `tcp`, each rank with its own L2 directory
+    /// (`rank-<r>`), serves a multi-turn session whose first turn's prefix went to L2 on both
+    /// ranks in between: the second turn reports the prefix's 32 `cached_tokens`, its blocks come
+    /// back from L2 (`promotions{l2,l0}`) and its greedy tokens and logprobs equal a cold run of
+    /// the same prompt (under a cache salt, so nothing is shared) bit for bit. Fillers run
+    /// through every block in between, so stale bytes cannot pass for restored ones. Breaks if a
+    /// rank's shard does not go to or come back from its own L2 (the worker would attend over
+    /// other bytes and the all-reduced logprobs would drift), or the leader reuses blocks the
+    /// worker never restored.
+    #[test]
+    fn static_tiers_serve_a_demoted_prefix() {
+        use super::super::tp_tiers::{self, WorkerTierStart};
+
+        let dir = TempDir::new("engine-tp-static-tiers");
+        let spec = write_tiny_llama(dir.path(), 11);
+        let edit = |c: &mut turbine_core::config::Config| {
+            c.kv.block_tokens = 16;
+            // 32 blocks of 2 KiB per rank: the fillers below overwrite every block.
+            c.kv.gpu.max_bytes = Some(turbine_core::config::ByteSize(64 << 10));
+            c.scheduler.max_running_requests = 32;
+            c.model.max_seq_len = Some(256);
+        };
+        let mut kv = turbine_core::config::KvConfig {
+            block_tokens: 16,
+            ..turbine_core::config::KvConfig::default()
+        };
+        // The cpu backend has no copy stream: L1 is off, L2 goes through synchronous copies.
+        kv.cpu.enabled = false;
+        kv.nvme.enabled = true;
+        kv.nvme.path = dir.path().join("kv");
+        kv.nvme.max_bytes = turbine_core::config::ByteSize(16 << 20);
+        kv.nvme.slab_bytes = turbine_core::config::ByteSize(1 << 20);
+        let (mut kv0, mut kv1) = (kv.clone(), kv);
+        tp_tiers::static_rank_kv(&mut kv0, 0, 2);
+        tp_tiers::static_rank_kv(&mut kv1, 1, 2);
+        let rank1 = prepared_with(&spec, 1, edit);
+        let clock: Arc<dyn Clock> = Arc::new(turbine_core::clock::SystemClock::new());
+        let worker_l2 = tp_tiers::open_rank_l2(
+            &kv1,
+            rank1.pool.layout,
+            2,
+            &rank1.identity,
+            Arc::clone(&clock),
+            turbine_kv::KvMetrics::register(&MetricsRegistry::new()),
+        )
+        .expect("the worker's L2 opens");
+        let run = start_static(
+            &spec,
+            edit,
+            MIRROR_CHECK_STEPS,
+            std::convert::identity,
+            WorkerTierStart {
+                kv: kv1,
+                l2: worker_l2,
+            },
+        );
+        let StaticRun {
+            leader,
+            loaded,
+            worker,
+            ..
+        } = run;
+        assert!(loaded.remote_tiers.is_some(), "the leader drives the tiers");
+        let mut reclaim = None;
+        let (engine, tx, _shared, reg) = engine_over_kv(
+            &leader,
+            loaded,
+            &kv0,
+            |metrics| {
+                tp_tiers::open_rank_l2(
+                    &kv0,
+                    leader.pool.layout,
+                    2,
+                    &leader.identity,
+                    Arc::clone(&clock),
+                    metrics,
+                )
+                .expect("the leader's L2 opens")
+            },
+            |kv| reclaim = Some(kv.reclaimer()),
+        );
+        let reclaim = reclaim.expect("the KV orchestrator started");
+        let engine = std::thread::spawn(move || engine.run());
+        let run_one = |prompt: &[u32], salt: Option<&str>| {
+            let mut req = greedy_request(prompt.to_vec(), 8, 1);
+            req.cache_salt = salt.map(str::to_string);
+            req.sampling.logprobs = Some(0);
+            tokens_and_cached(&mut submit(&tx, req, 64))
+        };
+
+        // Turn 1: 40 tokens (two full blocks), twice for the reuse evidence demotion needs.
+        let turn1: Vec<u32> = std::iter::once(256).chain(97..136).collect();
+        let (answer, cached) = run_one(&turn1, None);
+        assert_eq!(cached, 0);
+        let (again, cached) = run_one(&turn1, None);
+        assert_eq!((again.as_slice(), cached), (answer.as_slice(), 32));
+        // Turn 2 of the session: the whole conversation so far and a new user message; its cold
+        // tokens under a cache salt first.
+        let turn2: Vec<u32> = turn1
+            .iter()
+            .chain(answer.iter().map(|(t, _)| t))
+            .copied()
+            .chain(140..150)
+            .collect();
+        let (cold, cached) = run_one(&turn2, Some("cold"));
+        assert_eq!(cached, 0, "a salted run shares nothing");
+
+        // Every unreferenced block leaves L0 for each rank's own L2 at the end of a turn.
+        reclaim.demote(0.0);
+        let _ = run_one(&[256, 1, 2], None);
+        let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
+        wait_until(
+            Duration::from_secs(20),
+            "turn 1's blocks reached L2",
+            || sum_series(&reg, demoted) >= 2.0,
+        );
+        // Other prompts then run through every block of both pools, so a rank that did not
+        // restore turn 1's blocks from its L2 would attend over their bytes.
+        for i in 0..8u32 {
+            let filler: Vec<u32> = std::iter::once(256)
+                .chain((0..100).map(|t| 97 + (t * 7 + i * 3) % 26))
+                .collect();
+            let _ = run_one(&filler, None);
+        }
+        let promoted = r#"turbine_kv_promotions_total{from="l2",to="l0"}"#;
+        let before = sum_series(&reg, promoted);
+
+        let (warm, cached) = run_one(&turn2, None);
+        assert_eq!(cached, 32, "turn 1's prefix came back from L2");
+        assert!(
+            sum_series(&reg, promoted) >= before + 2.0,
+            "both blocks were promoted from L2"
+        );
+        // The cpu provider's rows are independent of the batch: the warm run's logprobs are the
+        // cold run's bit for bit (a worker attending over stale blocks drifts them by ~1e-3
+        // without changing a greedy token of the tiny model).
+        assert_eq!(
+            warm, cold,
+            "KV that went through both ranks' L2 gives the cold run's tokens and logprobs"
+        );
+
+        drop(tx);
+        assert_eq!(engine.join().expect("engine thread"), Ok(()));
+        assert_eq!(
+            worker.join().expect("worker thread"),
+            Ok(()),
+            "the leader's shutdown stops the worker cleanly"
+        );
     }
 }

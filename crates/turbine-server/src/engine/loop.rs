@@ -2795,6 +2795,7 @@ mod tests {
                 l2,
                 clock: Arc::clone(&clock),
                 metrics: metrics.kv.clone(),
+                remote: None,
             },
             &mut pool,
         )
