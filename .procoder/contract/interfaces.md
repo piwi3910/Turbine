@@ -1832,6 +1832,8 @@ NCCL-API symbols bound (P5, exactly 13): `ncclGetVersion`, `ncclGetUniqueId`, `n
 pub struct ParallelPlan { pub tp: u32, pub dp: u32, pub pp: u32, pub ep: u32 /* P5 amended 2026-09-28 */, pub backend: &'static str /* registered collective_backend */, pub mode: RankMode, pub vendor: Option<Vendor> /* None: cpu backend */,
                           pub excluded_devices: Vec<DeviceId>, pub groups: Vec<ReplicaGroup>, pub reasons: Vec<PlanReason>,
                           pub stages: Vec<StageSpec> /* pp > 1 */, pub experts: Option<Arc<ExpertPlacement>> /* ep > 1 */ }   // P5 §Data
+// P5 as built 2026-09-28 (Task 27): ParallelPlan so far carries ep, experts: Option<Arc<ExpertPlacement>> and fn group_size() -> u32 (= max(tp, ep)); pp and stages arrive with the PP engine task;
+//   PlanReason gains Configured, EpMoeOnly, Backend; pub fn expert_size(..), pub fn expert_placement(..); turbine-server check_executable(&mut ParallelPlan)
 pub struct ReplicaGroup { pub replica: ReplicaId, pub ranks: Vec<RankSlot> }
 pub struct RankSlot { pub rank: u32, pub device: DeviceId, pub host: String }
 pub enum PlanReason { FitsSingleDevice, TpRequiredForCapacity, GroupedByLink(PathClass), VendorHomogeneous, VendorExcluded(Vendor),

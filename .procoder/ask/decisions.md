@@ -1035,3 +1035,14 @@ Asked 2026-09-28 (Task 31 as built, branch p5-group-reservation 3d069c2). In `lo
 Recommendation: B — atomic in one process, no per-admission round trip; the worker's own ledger still guards its allocations. Pending the user's answer; `static` mode keeps A meanwhile.
 
 **Decision (user, 2026-09-28): B, mirror ledgers.** Each worker sends its budget in its join message and the leader keeps an exact mirror ledger per worker, reserving through `reserve_group` as in `local` mode. A host or simulator test shows that after a mixed workload with cancels and preemption, each mirror equals the worker's real ledger. Workers check that equality periodically: a ledger digest travels in the step acknowledgement, and a mismatch is logged with a reason code (plan Task 33).
+
+## P5: OLMoE golden tolerance under expert parallelism
+
+Found 2026-09-28 (ep2-novanas, run 0928064441-1e2319e6, branch p5-ep-server 3d1b8d8). OLMoE at ep 2 (tp 1) fails the committed golden reference on one prompt's logprob bound only: p14's likely |Δ logprob| is 1.0246 against the 1.01 bound, identically at c1 and c16, over RCCL and hostmem. One device (ep 1) passes 15/16 with p14 at 1.0003 — 0.007 under the bound — because it diverges from the reference at token 14 and its later positions are never scored, while ep 2 follows the reference to token 27 (an excused near-tie, margin 0.059) and is scored on positions 14–26. Against a capture of ep 1's own output, ep 2 passes 16/16 at the strict bounds (p14 |Δ| 0.107). OLMoE's 1.01 bound is transformers' own run-to-run spread (tests/golden/olmoe-1b-7b-0125-instruct/README.md). ep 2 with tp 2 fails p10 the same way plain tp 2 already does (Tasks 29 / 32).
+
+- A) first confirm per position that the violation lies in positions 14–26 of p14 (which only ep 2 reaches), then decide (recommended)
+- B) re-calibrate OLMoE's tolerance for the parallel modes (a wider likely bound, measured with the self-spread method over the parallel outputs)
+- C) gate EP on its one-device capture: ep N must match an ep 1 capture within the strict bounds, plus the committed-reference check with the margin excuse extended to positions one device never reaches
+- D) accept the failure as a known exception for p14
+
+Recommendation: A, then C if A confirms (EP changes no arithmetic beyond the fixed-order combine, so one device is the right reference; the committed reference stays the gate for one device). Pending the user's answer; the ep2-novanas scenario reports the committed-reference verdict and the ep 1 comparison side by side.
