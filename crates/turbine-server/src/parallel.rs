@@ -59,6 +59,19 @@ pub fn plan_for(
     let exec = &config.execution;
     let host = topology.node.hostname.as_str();
     let plan_error = |e: turbine_distributed::plan::PlanError| PlanFailure::Config(e.to_string());
+    // Pipeline and expert parallelism (P5 S-10, S-11) are configured and validated but not
+    // executable yet: refused before any port is bound, like any unusable configuration.
+    for (key, size) in [
+        ("parallel.pipeline_parallel_size", p.pipeline_parallel_size),
+        ("parallel.expert_parallel_size", p.expert_parallel_size),
+    ] {
+        if size != SizeOrAuto::Size(1) {
+            return Err(PlanFailure::Config(format!(
+                "{key}: {} is not executable in this build yet (only 1)",
+                size.fixed().map_or("auto".to_string(), |n| n.to_string())
+            )));
+        }
+    }
     let Some(vendor) = backend_vendor(exec.backend.as_str()) else {
         return plan_execution_device(p, exec.device, None, host).map_err(plan_error);
     };

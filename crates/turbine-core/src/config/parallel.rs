@@ -38,6 +38,87 @@ pub struct ParallelConfig {
     pub router: ModuleName,
     pub collective: CollectiveTimeouts,
     pub ranks: RanksConfig,
+    /// Pipeline stages (P5 S-10): contiguous layer ranges, one device each; > 1 needs
+    /// tensor_parallel_size 1, expert_parallel_size 1 and `local` ranks (S-12).
+    pub pipeline_parallel_size: SizeOrAuto,
+    /// Expert-parallel ranks (P5 S-11): routed experts split over the group; > 1 needs a MoE
+    /// model (the planner), tensor_parallel_size 1 or equal to it, no pipeline, `local` ranks.
+    pub expert_parallel_size: SizeOrAuto,
+    pub pipeline: PipelineConfig,
+    pub expert: ExpertConfig,
+    pub topology: TopologyConfig,
+}
+
+/// `parallel.pipeline`.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields, default)]
+pub struct PipelineConfig {
+    /// Layers per stage, in stage order; `None` balances by cost. Its sum is checked against
+    /// the model by the planner.
+    pub layer_split: Option<Vec<u32>>,
+    /// Micro-batches in flight; `auto` = the stage count.
+    pub micro_batches: SizeOrAuto,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        PipelineConfig {
+            layer_split: None,
+            micro_batches: SizeOrAuto::Auto,
+        }
+    }
+}
+
+/// `parallel.expert`.
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct ExpertConfig {
+    pub placement: ExpertPlacementChoice,
+}
+
+/// `parallel.expert.placement`: `contiguous`, or the path of a YAML `{layer: [rank per expert]}`
+/// file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ExpertPlacementChoice {
+    #[default]
+    Contiguous,
+    File(PathBuf),
+}
+
+impl Serialize for ExpertPlacementChoice {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ExpertPlacementChoice::Contiguous => s.serialize_str("contiguous"),
+            ExpertPlacementChoice::File(p) => p.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ExpertPlacementChoice {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "contiguous" => ExpertPlacementChoice::Contiguous,
+            "" => return Err(de::Error::custom("expected `contiguous` or a file path")),
+            _ => ExpertPlacementChoice::File(PathBuf::from(s)),
+        })
+    }
+}
+
+/// `parallel.topology`.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields, default)]
+pub struct TopologyConfig {
+    /// Measure each GPU's host link at startup (P5 S-13); `false` keeps nominal edges.
+    pub measure_links: bool,
+}
+
+impl Default for TopologyConfig {
+    fn default() -> Self {
+        TopologyConfig {
+            measure_links: true,
+        }
+    }
 }
 
 impl Default for ParallelConfig {
@@ -54,6 +135,11 @@ impl Default for ParallelConfig {
             router: ModuleName::fixed("prefix_affinity"),
             collective: CollectiveTimeouts::default(),
             ranks: RanksConfig::default(),
+            pipeline_parallel_size: SizeOrAuto::Size(1),
+            expert_parallel_size: SizeOrAuto::Size(1),
+            pipeline: PipelineConfig::default(),
+            expert: ExpertConfig::default(),
+            topology: TopologyConfig::default(),
         }
     }
 }
@@ -237,6 +323,105 @@ fn check_duration(
 }
 
 impl ParallelConfig {
+    /// Devices one model instance spans: pipeline stages × max(tensor, expert) ranks; `None`
+    /// while a size is `auto`.
+    pub fn group_size(&self) -> Option<u32> {
+        let tp = self.tensor_parallel_size.fixed()?;
+        let ep = self.expert_parallel_size.fixed()?;
+        let pp = self.pipeline_parallel_size.fixed()?;
+        Some(pp * tp.max(ep))
+    }
+
+    /// The pipeline and expert sizes and the combinations Phase 5 supports (S-12): tp × dp;
+    /// pp × dp with tp = ep = 1; ep × dp with tp ∈ {1, ep}; pp and ep in `local` ranks only.
+    /// Anything else is refused naming the key and `combination_unsupported:<modes>`.
+    fn validate_modes(&self) -> Result<(), ConfigError> {
+        const PP: &str = "parallel.pipeline_parallel_size";
+        const EP: &str = "parallel.expert_parallel_size";
+        if let SizeOrAuto::Size(n) = self.pipeline_parallel_size
+            && !(1..=64).contains(&n)
+        {
+            return Err(invalid(
+                PP,
+                format!("must be `auto` or between 1 and 64, got {n}"),
+            ));
+        }
+        if let SizeOrAuto::Size(n) = self.expert_parallel_size
+            && !(1..=64).contains(&n)
+        {
+            return Err(invalid(
+                EP,
+                format!("must be `auto` or between 1 and 64, got {n}"),
+            ));
+        }
+        let tp = self.tensor_parallel_size.fixed();
+        let pp = self.pipeline_parallel_size.fixed();
+        let ep = self.expert_parallel_size.fixed();
+        let unsupported = |key: &str, modes: &str, why: &str| {
+            Err(invalid(
+                key,
+                format!("combination_unsupported:{modes}: {why}"),
+            ))
+        };
+        if let Some(pp) = pp.filter(|&p| p > 1) {
+            if tp != Some(1) {
+                return unsupported(
+                    PP,
+                    "pp+tp",
+                    "pipeline stages run one device each in Phase 5; set \
+                     parallel.tensor_parallel_size: 1",
+                );
+            }
+            if ep != Some(1) {
+                return unsupported(
+                    PP,
+                    "pp+ep",
+                    "pipeline and expert parallelism do not combine in Phase 5",
+                );
+            }
+            if self.ranks.mode != RankMode::Local {
+                return unsupported(PP, "pp+static", "pipeline stages run in `local` ranks only");
+            }
+            if let Some(split) = &self.pipeline.layer_split
+                && split.len() != pp as usize
+            {
+                return Err(invalid(
+                    "parallel.pipeline.layer_split",
+                    format!("{} entries for {pp} pipeline stages", split.len()),
+                ));
+            }
+            if let SizeOrAuto::Size(m) = self.pipeline.micro_batches
+                && !(1..=4 * pp).contains(&m)
+            {
+                return Err(invalid(
+                    "parallel.pipeline.micro_batches",
+                    format!("must be `auto` or between 1 and {}, got {m}", 4 * pp),
+                ));
+            }
+        }
+        if let Some(split) = &self.pipeline.layer_split
+            && split.contains(&0)
+        {
+            return Err(invalid(
+                "parallel.pipeline.layer_split",
+                "every stage needs at least one layer",
+            ));
+        }
+        if let Some(ep) = ep.filter(|&e| e > 1) {
+            if tp.is_some_and(|tp| tp != 1 && tp != ep) {
+                return unsupported(
+                    EP,
+                    "ep+tp",
+                    "expert parallelism runs with tensor_parallel_size 1 or equal to it",
+                );
+            }
+            if self.ranks.mode != RankMode::Local {
+                return unsupported(EP, "ep+static", "expert ranks run in `local` ranks only");
+            }
+        }
+        Ok(())
+    }
+
     /// Static rules (exit 2 before device discovery).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if let SizeOrAuto::Size(n) = self.tensor_parallel_size
@@ -255,6 +440,7 @@ impl ParallelConfig {
                 format!("must be `auto` or between 1 and 64, got {n}"),
             ));
         }
+        self.validate_modes()?;
         if let DeviceSelection::List(list) = &self.devices {
             if list.is_empty() {
                 return Err(invalid("parallel.devices", "must not be an empty list"));
@@ -267,13 +453,14 @@ impl ParallelConfig {
                      parallel.allow_device_sharing: true",
                 ));
             }
-            if let Some(tp) = self.tensor_parallel_size.fixed()
-                && (distinct as u32) < tp
+            if let Some(group) = self.group_size()
+                && (distinct as u32) < group
             {
                 return Err(invalid(
                     "parallel.devices",
                     format!(
-                        "a TP group of {tp} needs {tp} distinct devices, the list has {distinct}"
+                        "a model group of {group} devices (pipeline stages × tensor or expert \
+                         ranks) needs {group} distinct devices, the list has {distinct}"
                     ),
                 ));
             }
@@ -371,16 +558,18 @@ impl ParallelConfig {
                          phase 7)",
                     ));
                 }
-                if let (Some(tp), Some(dp)) = (tp, self.data_parallel_size.fixed())
+                if let (Some(group), Some(dp)) =
+                    (self.group_size(), self.data_parallel_size.fixed())
                     && !self.allow_device_sharing
-                    && list.len() as u32 != tp * dp
+                    && list.len() as u32 != group * dp
                 {
                     return Err(invalid(
                         "parallel.devices",
                         format!(
-                            "lists {} devices, tensor_parallel_size × data_parallel_size = {}",
+                            "lists {} devices; the plan needs {} (pipeline stages × tensor or \
+                             expert ranks × data_parallel_size)",
                             list.len(),
-                            tp * dp
+                            group * dp
                         ),
                     ));
                 }

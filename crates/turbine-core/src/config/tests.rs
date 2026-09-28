@@ -1164,3 +1164,120 @@ fn parallel_rejections() {
     ]);
     assert!(sharing.validate_devices(&novanas, None).is_ok());
 }
+
+/// P5 S-10 to S-13 keys: defaults, accepted values and the Phase 5 combination rules (S-12),
+/// each refusal naming its key and, for a combination, `combination_unsupported:<modes>`.
+#[test]
+fn parallel_mode_rules() {
+    let base = "model:\n  path: /m\n";
+    let d = parse(base, &[]).unwrap().parallel;
+    assert_eq!(d.pipeline_parallel_size, SizeOrAuto::Size(1));
+    assert_eq!(d.expert_parallel_size, SizeOrAuto::Size(1));
+    assert_eq!(d.pipeline.layer_split, None);
+    assert_eq!(d.pipeline.micro_batches, SizeOrAuto::Auto);
+    assert_eq!(d.expert.placement, ExpertPlacementChoice::Contiguous);
+    assert!(d.topology.measure_links);
+    assert_eq!(d.group_size(), Some(1));
+
+    let pp = parse(
+        base,
+        &[
+            "parallel.pipeline_parallel_size=2",
+            "parallel.pipeline.layer_split=[14, 14]",
+            "parallel.pipeline.micro_batches=2",
+            "parallel.devices=[0, 1]",
+            "parallel.topology.measure_links=false",
+        ],
+    )
+    .unwrap()
+    .parallel;
+    assert_eq!(pp.group_size(), Some(2));
+    assert_eq!(pp.pipeline.layer_split, Some(vec![14, 14]));
+    assert!(!pp.topology.measure_links);
+    let ep = parse(
+        base,
+        &[
+            "parallel.expert_parallel_size=2",
+            "parallel.expert.placement=/etc/turbine/experts.yaml",
+            "parallel.devices=[0, 1]",
+        ],
+    )
+    .unwrap()
+    .parallel;
+    assert_eq!(ep.group_size(), Some(2));
+    assert_eq!(
+        ep.expert.placement,
+        ExpertPlacementChoice::File(PathBuf::from("/etc/turbine/experts.yaml"))
+    );
+    let ep_tp = parse(
+        base,
+        &[
+            "parallel.expert_parallel_size=2",
+            "parallel.tensor_parallel_size=2",
+        ],
+    )
+    .unwrap()
+    .parallel;
+    assert_eq!(ep_tp.group_size(), Some(2));
+
+    let pp_key = "parallel.pipeline_parallel_size";
+    let ep_key = "parallel.expert_parallel_size";
+    assert_rejected(base, &["parallel.pipeline_parallel_size=0"], pp_key);
+    assert_rejected(base, &["parallel.expert_parallel_size=65"], ep_key);
+    for (sets, key, modes) in [
+        (
+            &[
+                "parallel.pipeline_parallel_size=2",
+                "parallel.tensor_parallel_size=2",
+            ][..],
+            pp_key,
+            "pp+tp",
+        ),
+        (
+            &[
+                "parallel.pipeline_parallel_size=2",
+                "parallel.expert_parallel_size=2",
+            ][..],
+            pp_key,
+            "pp+ep",
+        ),
+        (
+            &[
+                "parallel.expert_parallel_size=2",
+                "parallel.tensor_parallel_size=4",
+            ][..],
+            ep_key,
+            "ep+tp",
+        ),
+    ] {
+        assert_rejected(base, sets, key);
+        assert_rejected(base, sets, &format!("combination_unsupported:{modes}"));
+    }
+    assert_rejected(
+        base,
+        &[
+            "parallel.pipeline_parallel_size=2",
+            "parallel.pipeline.layer_split=[10, 10, 8]",
+        ],
+        "parallel.pipeline.layer_split",
+    );
+    assert_rejected(
+        base,
+        &["parallel.pipeline.layer_split=[28, 0]"],
+        "parallel.pipeline.layer_split",
+    );
+    assert_rejected(
+        base,
+        &[
+            "parallel.pipeline_parallel_size=2",
+            "parallel.pipeline.micro_batches=9",
+        ],
+        "parallel.pipeline.micro_batches",
+    );
+    // Two stages need two devices; the list length is stages × ranks × replicas.
+    assert_rejected(
+        base,
+        &["parallel.pipeline_parallel_size=2", "parallel.devices=[0]"],
+        "parallel.devices",
+    );
+}
