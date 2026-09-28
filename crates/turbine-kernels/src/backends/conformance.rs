@@ -2,7 +2,7 @@
 //! hand-written list — by `registries::registry_conformance::backends`, so a backend registered
 //! without passing it fails `cargo test --workspace`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use turbine_core::registry::{Registry, conformance};
 use turbine_core::support::{HOST_VENDOR, VENDORS};
@@ -58,9 +58,12 @@ pub fn backends_suite(reg: &Registry<dyn ExecutionBackend>) -> Result<(), Vec<St
         if backend.vendor() != HOST_VENDOR {
             continue;
         }
-        let Some(meminfo) = meminfo.as_ref() else {
-            fail("host", "cannot write the meminfo fixture".into());
-            continue;
+        let meminfo = match &meminfo {
+            Ok(path) => path,
+            Err(e) => {
+                fail("host", format!("cannot write the meminfo fixture: {e}"));
+                continue;
+            }
         };
         let inventory = DeviceInventory {
             devices: Vec::new(),
@@ -96,20 +99,24 @@ pub fn backends_suite(reg: &Registry<dyn ExecutionBackend>) -> Result<(), Vec<St
     }
 }
 
-/// A `/proc/meminfo` fixture of 1 GiB available.
-fn meminfo_fixture() -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
+/// A `/proc/meminfo` fixture of 1 GiB available, or why it cannot be written.
+fn meminfo_fixture() -> Result<PathBuf, String> {
+    write_meminfo(&std::env::temp_dir().join(format!(
         "turbine-kernels-backends-conformance-{}",
         std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).ok()?;
+    )))
+}
+
+/// Writes the meminfo fixture into `dir`; the error names the path and the OS error.
+fn write_meminfo(dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join("meminfo");
     std::fs::write(
         &path,
         "MemTotal:       2097152 kB\nMemAvailable:   1048576 kB\n",
     )
-    .ok()?;
-    Some(path)
+    .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -152,5 +159,14 @@ mod tests {
         assert_eq!(failures.len(), 2, "{failures:#?}");
         assert!(failures[0].starts_with("broken: sticky:"), "{failures:#?}");
         assert!(failures[1].starts_with("broken: host:"), "{failures:#?}");
+    }
+
+    /// A fixture that cannot be written says where and why, not just that it failed
+    /// (Scout 0e78dae3).
+    #[test]
+    fn meminfo_fixture_error_names_path_and_cause() {
+        let err = write_meminfo(Path::new("/dev/null/turbine-meminfo")).unwrap_err();
+        assert!(err.starts_with("/dev/null/turbine-meminfo: "), "{err}");
+        assert!(err.len() > "/dev/null/turbine-meminfo: ".len(), "{err}");
     }
 }
