@@ -852,3 +852,31 @@ Local main e2f8178 holds Phase 3, Phase 4 and the pre-Phase-5 track, unpushed; `
 **Answer (2026-09-28): A — the user accepted all 19 ("all good").** Every item listed in `.procoder/review-2026-09-28.md` is now a confirmed decision; #18's parked `perf-gemm-stagger-wip` stays parked.
 
 **Answer (2026-09-28, after the review): push and start Phase 5.** main pushed to origin at 6545638; Phase 5 starts by porting the `p5-distributed` run-ahead onto main (novanas only, NVIDIA still on hold).
+
+## P5 T6: kernel ABI for tensor parallelism — major v4 or an optional minor group v2.6, and which new ops?
+
+Asked 2026-09-28 (Phase 5 port, branch `phase-5-multi-gpu`). The Phase 5 plan (Task 6) and contract §9.1 bump the kernel ABI to a major v4 that adds `turbine_stream_native_handle` and three ops (`row_sumsq`, `rmsnorm_sharded`, `fill`), and a major bump would also make the v2.3 / v2.5 groups required. Phase 4 took the other road (decision "Phase 4: kernel ABI v2.5 instead of v3", accepted): additive optional minor groups, `TURBINE_ABI_VERSION` stays 2.
+
+What tensor parallelism actually needs from the library, checked against main:
+
+- The vendor stream is required: the HIP shim's compute stream is created `hipStreamNonBlocking`, and `StreamRef::native_handle()` is 0 today, so RCCL on the null stream would not be ordered with the forward pass. `turbine_stream_native_handle(ctx, s, void**)` is the only way to get it.
+- The vocab-parallel embedding needs nothing new: the v1 `turbine_embedding_desc` already has `vocab_offset` / `vocab_rows` and writes zeros for ids outside the shard (then all-reduce).
+- `fill` (−∞ into padded vocab rows) is only needed when the vocabulary is not divisible by tp; Llama-3.2 (128,256) and OLMoE (50,304) divide by 2, 4 and 8. Where it is needed, an uploaded −∞ row copied with the existing `turbine_memcpy_*` does the same.
+- OLMoE's full-projection QK-norm has two correct forms: (a) the spec's sharded norm — `row_sumsq` of the rank's slice, FP32 all-reduce of the partial sums, `rmsnorm_sharded` (two new own kernels; the reduction order of the sum of squares then differs from tp = 1); or (b) all-gather Q and K (BF16, tokens × 2,048 each per layer), run the existing CK `rmsnorm2d` over the full width, keep the rank's heads (no new kernel; the norm itself is the tp = 1 computation; costs one extra all-gather per layer: ~16 KB per decode token, ~8 MB for a 2,048-token prefill chunk, host-staged on novanas).
+
+Options:
+
+- A) Optional minor group v2.6 with only `turbine_stream_native_handle` (resolved when minor ≥ 6; without it tp > 1 is refused at startup with a reason code, tp = 1 unaffected); OLMoE QK-norm by all-gather + the existing rmsnorm (b); vocab padding with the existing copies; contract §9.1 and plan Task 6 amended (recommended: follows the accepted v2.5 precedent and the kernel-reuse rule, no new kernels, no break for existing libraries)
+- B) As A, but add `row_sumsq` / `rmsnorm_sharded` in the v2.6 group for the sharded QK-norm (a): less PCIe traffic on OLMoE prefill, two own kernels (reuse evaluation first: CK has no sharded RMSNorm)
+- C) The planned major v4 (native handle + the three ops, v2.3 / v2.5 groups required, older libraries refused)
+
+Until answered: the Rust side of the stream handle (`StreamRef::native_handle()` filled when the library exports it) and the NCCL-API communicator (Task 7) proceed, since every option has the same `turbine_stream_native_handle(ctx, s, void**)` signature; no kernel or header change lands.
+
+## P5 T17: Phase 4 KV tiers (L1 pinned host, L2 NVMe) under tensor parallelism
+
+Asked 2026-09-28. Spec §Data: "Phase-4 tier copies (CPU, NVMe) of a TP block are stored per rank shard, keyed by (block key, tp size, rank)". Today the KV hierarchy and its orchestrator (`turbine_kv::hierarchy`, `turbine_server::kv_orchestrator`) drive one pool on one device: demotion, promotion, the copy streams, the L2 slab files and the transfer calibration are all per pool. With tp = 2 every block has one shard per rank, so every tier copy becomes one copy per rank that must all complete before the block counts as demoted or promoted.
+
+- A) First TP landing serves with L0 only when tp > 1: prefix sharing inside L0 works (block ids are logical and `copy_blocks` runs on every rank), `kv.cpu` / `kv.nvme` are refused with a reason code (`kv_tiers_unavailable_under_tp`, WARN, L0 only) and per-rank tier copies follow as their own task after the TP golden gate passes; spec §Data amended to say so (recommended: correctness of TP first, as the spec's own rule demands, and the tier fan-out is a separate change with its own tests)
+- B) Build per-rank tier copies in the same task: one copy per rank per block, the hierarchy tracks completion across ranks, L2 slab files keyed by (block key, tp, rank)
+
+DP replicas (tp = 1 each) are unaffected: each replica has its own pool and hierarchy.
