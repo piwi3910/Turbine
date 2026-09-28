@@ -1,0 +1,53 @@
+# turbine-server configuration for the Phase 5 pipeline-parallel lab run on novanas:
+#   scripts/lab-cluster.sh pp2-novanas
+# Both R9700s of the Job form one pipeline of 2 stages (pipeline_parallel_size 2, local rank
+# mode): the layers split by estimated cost, the last stage (the LM head) on the GPU with the
+# faster measured host link, the hidden state handed over by the collective backend's
+# send / recv (auto: hostmem in local mode), 2 micro-batches in flight (auto = the stage count).
+# The server listens on the pod's loopback only. Weights:
+# /home/piwi/turbine-models/llama-3.2-3b-instruct on the host, mounted read-only at /models by
+# scripts/lab/novanas-cluster-job.yaml. Execution, scheduler and KV keys as
+# scripts/lab/phase5-novanas-llama.yaml (tp 2) and phase5-novanas-dp2.yaml (dp 2), so the three
+# modes are compared on the same workload; decode graphs are forced off under pipelining (WARN,
+# reason pipeline_parallel), as under tensor parallelism.
+server:
+  listen: 127.0.0.1:18000
+model:
+  path: /models/llama-3.2-3b-instruct
+  served_name: meta-llama/Llama-3.2-3B-Instruct
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: false
+parallel:
+  tensor_parallel_size: 1
+  data_parallel_size: 1
+  pipeline_parallel_size: 2
+  devices: [0, 1]
+  collective_backend: auto
+  collective:
+    # Every stage hand-off stays on hostmem's point-to-point slots: RCCL's ncclSend / ncclRecv
+    # (auto routes sends above 32 KiB there) fail with "unhandled system error" on this
+    # peer-less board (first pp2-novanas run, 2026-09-28).
+    hostmem_max_bytes: 1TiB
+  pipeline:
+    micro_batches: auto
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 8GiB
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    # The Phase 2 scheduler.queue_timeout (CONFLICT C-1).
+    queue_timeout: 60s

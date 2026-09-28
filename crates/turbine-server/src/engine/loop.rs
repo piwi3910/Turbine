@@ -31,6 +31,13 @@
 //! same tokens either way; on a GPU the dropped extra rows change batch compositions, whose
 //! BF16 rounding may differ as with any other batch.
 //!
+//! Pipeline parallelism (P5 S-10, [`EngineLoop::turn_pipelined`]): with a pipeline's executor
+//! the scheduler keeps up to `parallel.pipeline.micro_batches` plans in flight (disjoint
+//! sequences). Each turn plans and launches micro-batches into the stages before the last until
+//! the pipeline is full, then completes the oldest: its last stage runs on the engine thread
+//! while the earlier stages run the next ones, and its tokens are sampled, emitted and
+//! completed as in the serial loop. Overlap scheduling is off under pipelining.
+//!
 //! Phase 4 threads the KV orchestrator through the turn (`crate::kv_orchestrator`): prefetch
 //! commands after step 1; before the plan, completed transfers admit the submissions whose
 //! prefixes were promoted, submissions waiting on a prefix another request computes attach
@@ -70,7 +77,7 @@
 //! collecting an iteration that the scheduler already completed ahead cannot be retried, so
 //! its requests fail (`resource_exhausted` for out-of-memory, counted as a failed recovery).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -100,6 +107,7 @@ use turbine_scheduler::{
 };
 
 use super::deadlines::{Deadlines, Timeouts};
+use super::pp::PipelineStats;
 use super::requests::{ActiveRequest, Delivery, Flush, Submission};
 use super::stages::{Stage, StageClock};
 use super::{
@@ -138,6 +146,10 @@ pub(crate) struct EngineParts {
     pub reliability: EngineReliability,
     /// The KV hierarchy over `pool` (Phase 4).
     pub kv: KvOrchestrator,
+    /// Pipeline parallelism (P5 S-10): `executor` is a pipeline's
+    /// ([`super::pp::PpExecutor`]) and the engine keeps up to its micro-batches in flight
+    /// ([`EngineLoop::turn_pipelined`]); `None` otherwise.
+    pub pipeline: Option<Arc<PipelineStats>>,
 }
 
 enum Turn {
@@ -205,6 +217,22 @@ pub(crate) struct EngineLoop {
     /// Requests that ended this turn, reported to the KV hierarchy after `complete`
     /// (`true`: cancelled or failed).
     kv_done: Vec<(RequestId, bool)>,
+    /// Pipeline parallelism: the stages' timing and placement, and the micro-batch count.
+    pipeline: Option<Arc<PipelineStats>>,
+    /// Pipeline parallelism: the micro-batches launched into the stages, oldest first.
+    pipe: VecDeque<PipeFlight>,
+    /// Pipeline parallelism: when the last micro-batch was collected (the step cadence).
+    last_collect: Option<Instant>,
+}
+
+/// A micro-batch launched into the pipeline's stages before the last, waiting for its last
+/// stage (and its host work) in a later turn.
+struct PipeFlight {
+    plan: IterationPlan,
+    built: Built,
+    /// Requests of the plan, failed together if its step fails.
+    requests: Vec<RequestId>,
+    launched: Instant,
 }
 
 /// A submission whose cached prefix is on its way to L0.
@@ -332,6 +360,9 @@ impl EngineLoop {
             kv: p.kv,
             held: HashMap::new(),
             kv_done: Vec::new(),
+            pipeline: p.pipeline,
+            pipe: VecDeque::new(),
+            last_collect: None,
         };
         engine.publish(false);
         engine.publish_stats();
@@ -346,6 +377,8 @@ impl EngineLoop {
             let turn = catch_unwind(AssertUnwindSafe(|| {
                 if self.overlap {
                     self.turn_overlap()
+                } else if self.pipeline.is_some() {
+                    self.turn_pipelined()
                 } else {
                     self.turn()
                 }
@@ -438,6 +471,211 @@ impl EngineLoop {
         self.publish_stats();
         self.check_fatal()?;
         Ok(Turn::Continue)
+    }
+
+    /// One turn with pipeline micro-batches (P5 S-10): the same steps as [`EngineLoop::turn`],
+    /// but while fewer than `parallel.pipeline.micro_batches` micro-batches are in the pipeline
+    /// the scheduler plans another (its plans in flight hold disjoint sequences, so a sequence
+    /// enters stage 0 again only after its token was sampled) and it is launched into the
+    /// stages before the last ([`EngineLoop::launch_pipe`]); then the oldest micro-batch is
+    /// completed: its last stage runs on this thread, its tokens are sampled and emitted, its
+    /// KV committed and the scheduler completes it ([`EngineLoop::collect_pipe`]), while the
+    /// earlier stages already run the next ones. A failed micro-batch fails only its own
+    /// requests; a stage failure fails every micro-batch in the pipeline (`replica_failed`).
+    fn turn_pipelined(&mut self) -> Result<Turn, String> {
+        if !self.receive_commands() {
+            return Ok(Turn::Stop);
+        }
+        self.kv.serve_commands(&mut self.pool);
+        self.stages.mark(Stage::Schedule);
+        self.flush_outputs();
+        self.stages.mark(Stage::Emit);
+        self.detect_disconnects();
+        self.expire_deadlines();
+
+        let limits = self.read_snapshot()?;
+        self.kv_before_plan();
+        let micro_batches = self.pipeline.as_ref().map_or(1, |p| p.micro_batches) as usize;
+        while self.pipe.len() < micro_batches {
+            let plan = self.sched.plan(&mut self.pool, &limits);
+            self.kv.after_plan(&mut self.pool);
+            for &(id, reason) in &plan.dropped {
+                self.on_dropped(id, reason);
+            }
+            if plan.is_empty() {
+                self.sched.complete(
+                    &mut self.pool,
+                    IterationOutcome {
+                        iteration: plan.iteration,
+                        ..IterationOutcome::default()
+                    },
+                );
+                break;
+            }
+            self.stages.mark(Stage::Schedule);
+            self.launch_pipe(plan);
+            self.stages.mark(Stage::Launch);
+        }
+        let executed = match self.pipe.pop_front() {
+            Some(flight) => {
+                self.collect_pipe(flight);
+                true
+            }
+            None => false,
+        };
+        self.idle_turn = !executed;
+        self.iteration_requests = self
+            .pipe
+            .iter()
+            .flat_map(|f| f.requests.iter().copied())
+            .collect();
+        self.kv_end_turn();
+        self.publish(executed);
+        self.publish_stats();
+        self.check_fatal()?;
+        Ok(Turn::Continue)
+    }
+
+    /// Fork copies, the batch and its launch into the pipeline's stages before the last; a
+    /// plan with forks only completes at once, a failed launch fails the plan's requests.
+    fn launch_pipe(&mut self, plan: IterationPlan) {
+        let requests = plan_requests(&plan, &self.seqs);
+        self.iteration_requests = requests.clone();
+        let launched = Instant::now();
+        match self.try_launch(&plan) {
+            Ok(Some(built)) => self.pipe.push_back(PipeFlight {
+                plan,
+                built,
+                requests,
+                launched,
+            }),
+            Ok(None) => self.sched.complete(
+                &mut self.pool,
+                IterationOutcome {
+                    iteration: plan.iteration,
+                    ..IterationOutcome::default()
+                },
+            ),
+            Err(error) => {
+                let outcome = self.pipe_failure(plan.iteration, error);
+                self.sched.complete(&mut self.pool, outcome);
+            }
+        }
+    }
+
+    /// [`EngineLoop::launch_pipe`]'s device work: `None` when the plan has only forks.
+    fn try_launch(&mut self, plan: &IterationPlan) -> Result<Option<Built>, IterationError> {
+        self.fork_copies(plan)?;
+        self.stages.mark(Stage::Prepare);
+        if plan.items.is_empty() {
+            return Ok(None);
+        }
+        let built = match self
+            .build_batch(plan, None)
+            .map_err(IterationError::other)?
+        {
+            Build::Ready(built) => built,
+            Build::NeedsHost => {
+                return Err(IterationError::other(
+                    "a batch token is not on the host".into(),
+                ));
+            }
+        };
+        let slices = seq_slices(plan, &built);
+        let view = self.pool.view();
+        self.exec
+            .launch(
+                &BatchInput {
+                    tokens: &built.tokens,
+                    positions: &built.positions,
+                    seqs: &slices,
+                    kv: &view,
+                },
+                &[],
+            )
+            .map_err(|e| IterationError::model("pipeline launch failed", e))?;
+        Ok(Some(built))
+    }
+
+    /// Completes the oldest micro-batch (see [`EngineLoop::turn_pipelined`]).
+    fn collect_pipe(&mut self, f: PipeFlight) {
+        self.iteration_requests = f.requests.clone();
+        let phase = phase_of(&f.plan);
+        let result = {
+            let slices = seq_slices(&f.plan, &f.built);
+            let view = self.pool.view();
+            self.exec.forward(&BatchInput {
+                tokens: &f.built.tokens,
+                positions: &f.built.positions,
+                seqs: &slices,
+                kv: &view,
+            })
+        };
+        self.stages.mark(Stage::DeviceWait);
+        let now = Instant::now();
+        // The pipeline completes one micro-batch per cadence: the step time the estimates see.
+        let cadence = self
+            .last_collect
+            .map_or(now - f.launched, |t| (now - t).min(now - f.launched));
+        self.last_collect = Some(now);
+        self.metrics
+            .model
+            .observe_forward(phase, (now - f.launched).as_secs_f64());
+        let logits = result
+            .map_err(|e| {
+                IterationError::model(&format!("{} forward pass failed", phase.as_str()), e)
+            })
+            .and_then(|logits| {
+                self.check_logits(&logits, f.built.rows.len())
+                    .map(|()| logits)
+                    .map_err(IterationError::other)
+            });
+        match logits {
+            Ok(logits) => {
+                let mut outcome = IterationOutcome {
+                    iteration: f.plan.iteration,
+                    ..IterationOutcome::default()
+                };
+                self.sample(&f.built.rows, logits, &mut outcome);
+                self.rel.recovery_succeeded();
+                for (id, blocks, tokens) in self.kv_commits(&f.plan) {
+                    self.kv.commit(&mut self.pool, id, &blocks, &tokens);
+                }
+                self.sched.complete(&mut self.pool, outcome);
+                self.observe(&f.plan, cadence.as_secs_f64());
+            }
+            Err(error) => {
+                let outcome = self.pipe_failure(f.plan.iteration, error);
+                self.sched.complete(&mut self.pool, outcome);
+            }
+        }
+    }
+
+    /// A micro-batch failed: its requests (`iteration_requests`) end — a sticky device error
+    /// turns the circuit fatal (exit 3), out of memory is `resource_exhausted`, a failed stage
+    /// or collective `replica_failed` with the circuit open (`collective_failed`).
+    fn pipe_failure(&mut self, iteration: u64, error: IterationError) -> IterationOutcome {
+        let mut outcome = IterationOutcome {
+            iteration,
+            ..IterationOutcome::default()
+        };
+        if error.sticky {
+            tracing::error!(event = "iteration_failed", reason = "device_fatal", iteration, error = %error.message, "sticky device error");
+            self.rel
+                .circuit_event(CircuitEvent::DeviceError { sticky: true });
+            outcome.failed = Some(IterationFailure {
+                message: error.message,
+            });
+        } else if error.oom {
+            self.rel.on_oom();
+            self.rel.recovery_failed();
+            self.fail_iteration(ErrorCode::ResourceExhausted, error.message, &mut outcome);
+        } else {
+            let (code, event) = error.failure();
+            self.fail_iteration(code, error.message, &mut outcome);
+            self.rel.circuit_event(event);
+        }
+        outcome
     }
 
     /// Reads the controller's snapshot for this turn (P3): a fatal circuit ends the engine, an
@@ -655,6 +893,7 @@ impl EngineLoop {
         self.sched.is_idle()
             && self.requests.is_empty()
             && self.in_flight.is_none()
+            && self.pipe.is_empty()
             && self.held.is_empty()
             && self.kv.transfers_idle()
             && !probe_due
@@ -2173,6 +2412,9 @@ impl EngineLoop {
     /// `executed` iteration (a non-empty plan) records its stages.
     fn publish(&mut self, executed: bool) {
         let mut scheduler = self.sched.snapshot();
+        if let Some(p) = &self.pipeline {
+            scheduler.pipeline = Some(p.snapshot(self.pipe.len() as u32));
+        }
         let kv = self.kv.document(&self.pool);
         self.metrics.kv.record(&self.pool);
         self.stages.mark(Stage::Complete);
@@ -2480,8 +2722,22 @@ mod tests {
         tokenizer: Arc<Tokenizer>,
         params: SchedulerParams,
         overlap: bool,
+        kv: KvConfig,
+        l2: impl FnOnce(&KvConfig, &KvFormat, KvMetrics) -> Option<Arc<L2NvmeTier>>,
+    ) -> TestEngine {
+        engine_with_pipeline(exec, tokenizer, params, overlap, kv, l2, None)
+    }
+
+    /// [`engine_with_kv`] with a pipeline's stats (`exec` a pipeline's executor; the scheduler
+    /// keeps its micro-batches in flight).
+    fn engine_with_pipeline(
+        exec: Box<dyn ModelExecutor>,
+        tokenizer: Arc<Tokenizer>,
+        params: SchedulerParams,
+        overlap: bool,
         mut kv: KvConfig,
         l2: impl FnOnce(&KvConfig, &KvFormat, KvMetrics) -> Option<Arc<L2NvmeTier>>,
+        pipeline: Option<Arc<PipelineStats>>,
     ) -> TestEngine {
         let reg = MetricsRegistry::new();
         let metrics = EngineMetrics {
@@ -2560,7 +2816,8 @@ mod tests {
         });
         let scheduler = Scheduler::new(params, Arc::clone(&clock))
             .with_metrics(metrics.scheduler.clone())
-            .with_gate(parts.gate);
+            .with_gate(parts.gate)
+            .with_micro_batches(pipeline.as_ref().map_or(1, |p| p.micro_batches));
         let controller = parts.engine.handle.clone();
         let (tx, commands) = mpsc::channel(8);
         let shared = Arc::new(EngineShared::default());
@@ -2581,6 +2838,7 @@ mod tests {
             overlap,
             reliability: parts.engine,
             kv,
+            pipeline,
         });
         TestEngine {
             engine,
@@ -3522,6 +3780,123 @@ mod tests {
         assert!(t.controller.circuit().blocks_readiness());
         drop(t.tx);
         assert_eq!(handle.join().unwrap(), Ok(()), "not fatal: no exit 3");
+        assert_eq!(held_blocks(&t.shared.docs().unwrap()), 0);
+        let text = t.reg.render().unwrap();
+        let line = r#"turbine_circuit_transitions_total{from="HEALTHY",to="CIRCUIT_OPEN",reason="collective_failed"} 1"#;
+        assert!(text.contains(line), "missing {line:?} in\n{text}");
+    }
+
+    /// Reads a stream to its end: its tokens, and whether it finished (else it failed).
+    fn tokens_of(rx: &mut mpsc::Receiver<GenerationEvent>) -> (Vec<u32>, Option<ErrorCode>) {
+        let events = read_to_end(rx);
+        (generated(&events), error_code(&events))
+    }
+
+    /// P5 S-10 in the engine loop (plan Task 24): the tiny Llama as a 2-stage pipeline (stage 0
+    /// on its own thread, the last on the engine thread, over the host collective) with 1 and
+    /// 2 micro-batches serves 4 concurrent greedy requests with exactly one device's tokens,
+    /// frees every block, and publishes the scheduler document's `pipeline` section (2 stages
+    /// with their layers, the micro-batch count). Breaks if a micro-batch reuses a sequence in
+    /// flight, a token is sampled from another micro-batch's logits or blocks leak.
+    #[test]
+    fn pipeline_micro_batches_serve_one_device_tokens() {
+        use super::super::pp::testing::{pipeline, stats};
+        let (_dir, spec, tokenizer) = tiny();
+        let prompts: [Vec<u32>; 4] = [
+            vec![256, 72, 101, 108, 108, 111],
+            std::iter::once(256).chain(97..116).collect(),
+            vec![256, 79],
+            vec![256, 1, 2, 3, 4],
+        ];
+        let run = |exec: Box<dyn ModelExecutor>, m: Option<Arc<PipelineStats>>| {
+            let t = engine_with_pipeline(
+                exec,
+                Arc::clone(&tokenizer),
+                params(4, 8),
+                false,
+                KvConfig::default(),
+                |_, _, _| None,
+                m,
+            );
+            let streams: Vec<_> = prompts
+                .iter()
+                .map(|p| submit(&t.tx, request(p, 10)))
+                .collect();
+            let engine = t.engine;
+            let handle = std::thread::spawn(move || engine.run());
+            let mut got = Vec::new();
+            for (mut rx, admitted) in streams {
+                assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+                let (tokens, error) = tokens_of(&mut rx);
+                assert_eq!(error, None);
+                got.push(tokens);
+            }
+            drop(t.tx);
+            assert_eq!(handle.join().unwrap(), Ok(()));
+            let docs = t.shared.docs().unwrap();
+            assert_eq!(held_blocks(&docs), 0, "every block freed");
+            (got, docs)
+        };
+        let (want, _) = run(tiny_executor(&spec, 4), None);
+        assert!(want.iter().all(|t| t.len() == 10));
+        for m in [1, 2] {
+            let s = stats(m);
+            let (exec, _pool) = pipeline(&spec, Arc::clone(&s), 64, |e| e);
+            let (got, docs) = run(Box::new(exec), Some(s));
+            assert_eq!(got, want, "micro-batches {m}");
+            let p = docs.scheduler.pipeline.expect("the pipeline section");
+            assert_eq!((p.micro_batches, p.stages.len()), (m, 2));
+            assert_eq!(p.stages[0].layers, [0, 0]);
+        }
+    }
+
+    /// P5 S-10 failure mode "pipeline stage fails": stage 0 fails, so every request with a
+    /// micro-batch in the pipeline ends with `replica_failed`, the circuit opens with reason
+    /// `collective_failed` (later requests are rejected `circuit_open`), the engine keeps
+    /// running and no block stays used. Breaks if a stage failure passes for a device error,
+    /// hangs the engine or leaks the micro-batches' blocks.
+    #[test]
+    fn pipeline_stage_failure_ends_requests_with_replica_failed() {
+        use super::super::pp::testing::{FailingStage, pipeline, stats};
+        let (_dir, spec, tokenizer) = tiny();
+        let s = stats(2);
+        let (exec, _pool) = pipeline(&spec, Arc::clone(&s), 64, |inner| {
+            Box::new(FailingStage {
+                inner,
+                sticky: false,
+            }) as Box<dyn ModelExecutor>
+        });
+        let t = engine_with_pipeline(
+            Box::new(exec),
+            tokenizer,
+            params(2, 64),
+            false,
+            KvConfig::default(),
+            |_, _, _| None,
+            Some(s),
+        );
+        let streams: Vec<_> = (0..3)
+            .map(|_| submit(&t.tx, request(&[256, 1, 2], 4)))
+            .collect();
+        let engine = t.engine;
+        let handle = std::thread::spawn(move || engine.run());
+        let mut codes = Vec::new();
+        for (mut rx, admitted) in streams {
+            assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+            codes.push(tokens_of(&mut rx).1);
+        }
+        // Both running requests were in the pipeline (one micro-batch each); the third waited.
+        assert_eq!(
+            codes,
+            [
+                Some(ErrorCode::ReplicaFailed),
+                Some(ErrorCode::ReplicaFailed),
+                Some(ErrorCode::CircuitOpen)
+            ]
+        );
+        assert!(t.controller.circuit().blocks_readiness());
+        drop(t.tx);
+        assert_eq!(handle.join().unwrap(), Ok(()), "not fatal");
         assert_eq!(held_blocks(&t.shared.docs().unwrap()), 0);
         let text = t.reg.render().unwrap();
         let line = r#"turbine_circuit_transitions_total{from="HEALTHY",to="CIRCUIT_OPEN",reason="collective_failed"} 1"#;

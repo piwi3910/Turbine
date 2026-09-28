@@ -3428,3 +3428,143 @@ fn ep2_serves_like_ep1() {
         });
     }
 }
+
+/// Pipeline parallelism of 2 on the cpu backend: two stage threads over the host collective
+/// (P5 S-10), one layer of the tiny checkpoints each.
+const PP2: &str = "parallel:\n  pipeline_parallel_size: 2\n  collective_backend: host\n";
+
+/// P5 S-10 (plan Task 24): the tiny Llama and the tiny OLMoE served at pp 2 — stage 0 on its
+/// own thread and host device 0, the last stage on the engine thread and host device 1, each
+/// its own KV pool of its layer — complete greedy prompts with exactly pp 1's tokens, alone and
+/// 8 at a time, with 1 and 2 micro-batches in flight; `/turbine/v1/status` shows `pp` 2 and the
+/// group's stages with their layers, `/turbine/v1/scheduler` the `pipeline` section, the
+/// pipeline metrics count both stages, and every block is free at the end. Breaks if a stage
+/// runs another stage's layers, a micro-batch's tokens go to another's requests, or blocks
+/// leak.
+#[test]
+fn pp2_serves_like_pp1() {
+    let prompts = [
+        "Hello",
+        "Once upon a time",
+        "The quick brown fox jumps",
+        "1 2 3 4",
+    ];
+    let body = |model: &str, prompt: &str| {
+        json!({"model": model, "prompt": prompt, "max_tokens": 16, "ignore_eos": true,
+               "temperature": 0, "logprobs": 0, "return_tokens_as_token_ids": true})
+    };
+    for olmoe in [false, true] {
+        let launch = |extra: &str| {
+            TinyServer::launch(&Setup {
+                extra,
+                olmoe,
+                ..Setup::default()
+            })
+        };
+        let greedy = |server: &TinyServer, prompt: &str| -> Vec<u32> {
+            let resp = server.post("/v1/completions", &body(&server.model, prompt));
+            assert_eq!(resp.status, 200, "{}", resp.body);
+            choice_token_ids(&resp.json()["choices"][0])
+        };
+        let one = launch("");
+        let want: Vec<Vec<u32>> = prompts.iter().map(|p| greedy(&one, p)).collect();
+        drop(one);
+        for m in [1, 2] {
+            let what = format!("olmoe {olmoe} micro-batches {m}");
+            let extra = format!("{PP2}  pipeline:\n    micro_batches: {m}\n");
+            let two = launch(&extra);
+            for (prompt, want) in prompts.iter().zip(&want) {
+                assert_eq!(&greedy(&two, prompt), want, "{what}: {prompt:?}");
+            }
+            let workers: Vec<_> = (0..8)
+                .map(|i| {
+                    let (addr, b) = (two.addr, body(&two.model, prompts[i % 4]).to_string());
+                    std::thread::spawn(move || request(addr, "POST", "/v1/completions", Some(&b)))
+                })
+                .collect();
+            for (i, w) in workers.into_iter().enumerate() {
+                let resp = w.join().unwrap();
+                assert_eq!(resp.status, 200, "{what} request {i}: {}", resp.body);
+                let got = choice_token_ids(&resp.json()["choices"][0]);
+                assert_eq!(got, want[i % 4], "{what} request {i}");
+            }
+
+            assert_eq!(two.get("/ready").status, 200);
+            let parallel = &two.get("/turbine/v1/status").json()["parallel"];
+            assert_eq!(
+                (&parallel["pp"], &parallel["tp"], &parallel["ep"]),
+                (&json!(2), &json!(1), &json!(1)),
+                "{parallel}"
+            );
+            let stages = &parallel["groups"][0]["stages"];
+            assert_eq!(stages[0]["device"], 0, "{parallel}");
+            assert_eq!(stages[0]["layers"], json!([0, 0]), "{parallel}");
+            assert_eq!(stages[1]["device"], 1, "{parallel}");
+            assert_eq!(stages[1]["layers"], json!([1, 1]), "{parallel}");
+            let reasons = parallel["plan_reasons"].as_array().unwrap();
+            for code in ["pp_partition_cost_balanced", "backend:host"] {
+                assert!(reasons.contains(&json!(code)), "{what}: {parallel}");
+            }
+            let pipeline = &two.scheduler()["pipeline"];
+            assert_eq!(pipeline["micro_batches"], m, "{pipeline}");
+            assert_eq!(
+                pipeline["stages"].as_array().unwrap().len(),
+                2,
+                "{pipeline}"
+            );
+            let metrics = two.metrics();
+            for stage in ["0", "1"] {
+                let series =
+                    format!("turbine_pipeline_stage_duration_seconds_count{{stage=\"{stage}\"}}");
+                assert!(
+                    sample(&metrics, &series).is_some_and(|n| n > 0.0),
+                    "{what} stage {stage}: {metrics}"
+                );
+            }
+            assert!(
+                sample(&metrics, "turbine_pipeline_bubble_ratio").is_some(),
+                "{metrics}"
+            );
+            wait_for(Duration::from_secs(10), "every block free", || {
+                two.blocks_used() == 0
+            });
+        }
+    }
+}
+
+/// P5 S-10, "cancellation frees blocks on every stage": at pp 2 with 2 micro-batches, dropping
+/// held streams frees their blocks promptly — the engine's pool (the last stage's) is the only
+/// block manager and every stage's pool is indexed by its block ids, so a freed block is free
+/// on both stages — and the surviving streams finish normally. Breaks if a cancelled sequence
+/// keeps its blocks or the pipeline stalls after the cancellation.
+#[test]
+fn pp2_cancellation_frees_blocks() {
+    let server = TinyServer::start_long_with(
+        HOLD_PAUSED,
+        &format!("{PP2}  pipeline:\n    micro_batches: 2\n"),
+    );
+    let mut streams: Vec<OpenStream> = (0..4).map(|_| server.hold_stream()).collect();
+    wait_for(Duration::from_secs(60), "all 4 streams paused", || {
+        let doc = server.scheduler();
+        doc["paused"] == 4 && doc["waiting"] == 0
+    });
+    let all4 = server.blocks_used();
+    let kept = streams.split_off(2);
+    drop(streams);
+    wait_for(
+        Duration::from_secs(5),
+        "dropped clients' blocks freed",
+        || {
+            let doc = server.scheduler();
+            doc["paused"] == 2 && running(&doc) == 2
+        },
+    );
+    let remaining = server.blocks_used();
+    assert!(remaining + 2 <= all4, "{remaining} of {all4}");
+    for s in kept {
+        assert_eq!(stream_finish_reason(&s.read_rest()), "length");
+    }
+    wait_for(Duration::from_secs(5), "every block free", || {
+        server.blocks_used() == 0
+    });
+}

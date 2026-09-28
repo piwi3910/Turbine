@@ -138,6 +138,14 @@ pub async fn positions_teacher_forced(
     reference: &ReferenceRecord,
     tol: &Tolerance,
 ) -> Result<Vec<PositionRow>, GoldenError> {
+    if reference.prompt_token_ids.is_empty() {
+        return Err(GoldenError::Usage(format!(
+            "{}: the record has no prompt_token_ids to teacher-force on (a turbine-golden \
+             capture of an engine that does not return them); use a transformers reference, or \
+             --candidate with the capture",
+            reference.id
+        )));
+    }
     let top = tol.top_k.max(5) as u32;
     let n = reference.tokens.len();
     let (mut tokens, mut rows) = (Vec::with_capacity(n), Vec::with_capacity(n));

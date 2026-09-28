@@ -350,6 +350,46 @@ fn ep_on_dense_model_exits_2() {
     }
 }
 
+/// P5 S-12 (plan Task 22): pipeline parallelism combined with tensor parallelism is refused
+/// before bind: the tiny Llama with `pipeline_parallel_size: 2` and `tensor_parallel_size: 2`
+/// exits 2 with stderr naming `parallel.pipeline_parallel_size` and
+/// `combination_unsupported:pp+tp`, and the port stays free; so do pp with ep and pp in static
+/// ranks. Breaks if an unsupported combination binds.
+#[test]
+fn unsupported_parallel_combination_exits_2() {
+    let port = free_port();
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let (_model, yaml) = tiny_model_yaml(addr);
+    for (tag, extra, code) in [
+        (
+            "pp-tp",
+            "parallel:\n  pipeline_parallel_size: 2\n  tensor_parallel_size: 2\n  \
+             collective_backend: host\n",
+            "combination_unsupported:pp+tp",
+        ),
+        (
+            "pp-ep",
+            "parallel:\n  pipeline_parallel_size: 2\n  expert_parallel_size: 2\n  \
+             collective_backend: host\n",
+            "combination_unsupported:pp+ep",
+        ),
+        (
+            "pp-static",
+            "parallel:\n  pipeline_parallel_size: 2\n  tensor_parallel_size: 1\n  \
+             collective_backend: host\n  ranks:\n    mode: static\n    leader: 127.0.0.1:9\n",
+            "combination_unsupported:pp+static",
+        ),
+    ] {
+        let cfg = TempConfig::new(tag, &(yaml.clone() + extra));
+        let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(30));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{tag}: stderr: {stderr}");
+        assert!(stderr.contains("parallel."), "{tag}: stderr: {stderr}");
+        assert!(stderr.contains(code), "{tag}: stderr: {stderr}");
+        TcpListener::bind(addr).expect("the configured port must still be free");
+    }
+}
+
 #[test]
 fn port_in_use_exits_1() {
     let holder = TcpListener::bind("127.0.0.1:0").unwrap();

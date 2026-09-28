@@ -1818,6 +1818,7 @@ mod tests {
             overlap: false,
             reliability: parts.engine,
             kv,
+            pipeline: None,
         });
         (engine, tx, shared, reg)
     }
