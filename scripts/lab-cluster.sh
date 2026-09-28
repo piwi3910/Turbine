@@ -31,8 +31,12 @@
 #                      p10 position by position), then Llama in static mode (ranks
 #                      0 and 1, leader 127.0.0.1:18100; golden c1 and c16). Prints one
 #                      `tp-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run.
-#                      2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
-#   dp2-novanas        Llama-3.2-3B-Instruct at tp 1 on the standard throughput workload
+#                      2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)". Every tp 2
+#                      golden is gated against a one-GPU capture of the same model taken in
+#                      the run (strict c1, batched c16; the one-GPU leg itself against the
+#                      committed reference), the committed reference printed for information;
+#                      a violation fails the scenario at its end, after every leg ran.
+#   dp2-novanas       Llama-3.2-3B-Instruct at tp 1 on the standard throughput workload
 #                      (512-word prompts, 256 tokens with --ignore-eos, 200 requests, after a
 #                      16-request warm-up): first a dp 1 baseline on device 0 at concurrency 16,
 #                      then dp 2 (one replica per R9700): golden at concurrency 1 and 16, the
@@ -289,6 +293,10 @@ scenario_tp2() {
 		--set "parallel.devices=[0]"
 	wait_ready "$URL" "${WORK}/tp1.log"
 	tp_prefix_check tp1
+	# The one-GPU capture every Llama tp 2 run is gated against (spec amendment 2026-09-28: a
+	# multi-GPU run is judged against a one-GPU capture of the same commit and lab run; the
+	# committed transformers reference is information only).
+	capture_one_gpu llama-3.2-3b-instruct "${WORK}/llama-tp1-capture.jsonl"
 	bench_ok 16 "${WORK}/tp1-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
 	bench_ok 200 "${WORK}/tp1-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
 		--requests 200
@@ -297,8 +305,7 @@ scenario_tp2() {
 	start_server "${WORK}/tp2-local.log" "$llama"
 	wait_ready "$URL" "${WORK}/tp2-local.log"
 	tp_prefix_check tp2-local
-	golden llama-3.2-3b-instruct "llama tp2 local c1"
-	golden llama-3.2-3b-instruct "llama tp2 local c16" --concurrency 16
+	gate_vs_capture llama-3.2-3b-instruct "${WORK}/llama-tp1-capture.jsonl" "llama tp2 local"
 	bench_ok 64 "${WORK}/tp2-bench.json" --concurrency 4 --requests 64
 	bench_ok 16 "${WORK}/tp2-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
 	bench_ok 200 "${WORK}/tp2-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
@@ -329,20 +336,13 @@ scenario_tp2() {
 	start_server "${WORK}/tp1-olmoe.log" "$olmoe" --set parallel.tensor_parallel_size=1 \
 		--set "parallel.devices=[0]"
 	wait_ready "$URL" "${WORK}/tp1-olmoe.log"
-	echo "lab-step: turbine-golden capture (olmoe tp1)"
-	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
-		--out "${WORK}/olmoe-tp1-capture.jsonl" || job_fail "turbine-golden capture failed"
+	capture_one_gpu "$slug" "${WORK}/olmoe-tp1-capture.jsonl"
 	positions_p "$slug" olmoe-tp1 p10
 	stop_servers
 
 	start_server "${WORK}/tp2-olmoe.log" "$olmoe"
 	wait_ready "$URL" "${WORK}/tp2-olmoe.log"
-	golden "$slug" "olmoe tp2 local c1"
-	golden "$slug" "olmoe tp2 local c16" --concurrency 16
-	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
-	golden_info "olmoe tp2 c1 vs 1 GPU" --reference "${WORK}/olmoe-tp1-capture.jsonl" "${tol[@]}"
-	golden_info "olmoe tp2 c16 vs 1 GPU" --reference "${WORK}/olmoe-tp1-capture.jsonl" "${tol[@]}" \
-		--concurrency 16
+	gate_vs_capture "$slug" "${WORK}/olmoe-tp1-capture.jsonl" "olmoe tp2 local"
 	positions_p "$slug" olmoe-tp2 p10
 	echo "lab-step: turbine-golden positions olmoe-tp2-vs-1gpu p10"
 	"${BIN}/turbine-golden" positions --url "$URL" --reference "${WORK}/olmoe-tp1-capture.jsonl" \
@@ -362,10 +362,37 @@ scenario_tp2() {
 		--set parallel.ranks.rank=0 --set "parallel.ranks.local_devices=[0]"
 	wait_ready "$URL" "${WORK}/tp2-static-rank0.log"
 	tp_prefix_check tp2-static
-	golden llama-3.2-3b-instruct "llama tp2 static c1"
-	golden llama-3.2-3b-instruct "llama tp2 static c16" --concurrency 16
+	gate_vs_capture llama-3.2-3b-instruct "${WORK}/llama-tp1-capture.jsonl" "llama tp2 static"
 	collective_report tp2-static
 	stop_servers
+	if [[ ${#GATE_FAILED[@]} -gt 0 ]]; then
+		job_fail "outside tolerance: ${GATE_FAILED[*]}"
+	fi
+}
+
+# capture_one_gpu <slug> <out>: the one-GPU server's golden c1 against the committed reference
+# (the one-GPU gate) and a capture of its greedy outputs, the reference of the multi-GPU runs.
+capture_one_gpu() {
+	local slug="$1" out="$2"
+	golden_gate "$slug" "${slug} 1 GPU c1"
+	echo "lab-step: turbine-golden capture (${slug} 1 GPU)"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
+		--out "$out" || job_fail "turbine-golden capture failed"
+}
+
+# gate_vs_capture <slug> <capture> <label>: the multi-GPU gate — strict at c1, batched at c16,
+# against the one-GPU capture (a violation is recorded in GATE_FAILED; the scenario goes on and
+# fails at its end); the committed transformers reference at c1 and c16 for information.
+gate_vs_capture() {
+	local slug="$1" capture="$2" label="$3" c
+	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
+	for c in 1 16; do
+		echo "lab-step: golden ${label} c${c} vs 1 GPU"
+		"${BIN}/turbine-golden" compare --url "$URL" --reference "$capture" "${tol[@]}" \
+			--concurrency "$c" || GATE_FAILED+=("golden ${label} c${c} vs 1 GPU")
+		golden_info "${label} c${c} vs HF" --reference "tests/golden/${slug}/reference.jsonl" \
+			--concurrency "$c"
+	done
 }
 
 scenario_dp2() {
