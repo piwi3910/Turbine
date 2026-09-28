@@ -1,7 +1,9 @@
 # phase-2b-nvidia — implementation plan
 
-Status: draft
+Status: deferred
 Spec: .procoder/specs/phase-2b-nvidia.md
+
+Deferred with its spec (on hold since 2026-09-26; decision "Roadmap reorganisation after Phase 5 (2026-09-28)" in `.procoder/ask/decisions.md`). The plan is rewritten from the re-specced spec when the hold is lifted; that spec also adds NVFP4 (modelopt NVFP4 / FP8 mixed precision and compressed-tensors `nvfp4-pack-quantized`), so the task list below is incomplete for it.
 
 ## Goal
 
