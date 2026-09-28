@@ -106,6 +106,9 @@ double g_max_prefill_loss = 0.05;
 // Mode prefix: the share of the class score on the decode-sized buckets (a
 // prefill step that small is a short prompt or a prefix-reused suffix).
 constexpr double kPrefixShortWeight = 0.15;
+// Rows besides the target in a solution's class signature (alternately plain
+// and heavy-tailed; see the invariance check).
+constexpr uint32_t kSignatureRows = 16;
 
 [[noreturn]] void die(const std::string &msg) {
   std::fprintf(stderr, "turbine_gemm_tune: %s\n", msg.c_str());
@@ -689,19 +692,30 @@ std::vector<Row> tune_shape_invariant(Bench &b, const ShapeSpec &spec,
         continue;
       }
       target_run(*one, a1, 0, alone);
-      // The class signature: the target row's bits and a second heavy-tailed
-      // row's, both alone.
+      // The class signature: the target row's bits and kSignatureRows more
+      // rows' (heavy-tailed and plain, distinct seeds), each alone. Two
+      // summation orders agree on a few rows by chance often enough that a
+      // two-row signature put solutions of different orders into one class
+      // (the tp 2 shapes, P5 Task 29: members of one "class" gave a row other
+      // bits at other m).
       c.sig = 1469598103934665603ull;
       for (char ch : alone)
         c.sig = (c.sig ^ static_cast<uint8_t>(ch)) * 1099511628211ull;
-      {
-        std::vector<char> second(row_bytes);
+      for (uint32_t s = 0; s < kSignatureRows; ++s) {
+        std::vector<char> extra(row_bytes);
+        // s = 0: target2 as filled above (seed 1913, the historical second
+        // row); it is refilled after the loop.
+        if (s > 0 && s % 2 == 1)
+          fill_bf16(target2, 4099u + s, 1.0f);
+        else if (s > 0)
+          fill_heavy_bf16(target2, 4099u + s);
         std::swap(target, target2);
-        target_run(*one, a1, 0, second);
+        target_run(*one, a1, 0, extra);
         std::swap(target, target2);
-        for (char ch : second)
+        for (char ch : extra)
           c.sig = (c.sig ^ static_cast<uint8_t>(ch)) * 1099511628211ull;
       }
+      fill_heavy_bf16(target2, 1913u);
       bool invariant = true;
       for (size_t i = 0; i < inv_ms.size() && invariant; ++i) {
         hipblasLtMatmulAlgo_t a = c.algo;
