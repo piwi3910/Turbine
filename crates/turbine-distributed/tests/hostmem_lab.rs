@@ -43,6 +43,15 @@ impl Drop for Watchdog {
     }
 }
 
+/// Serialises the tests that open RCCL communicators: RCCL's inits of several communicators at
+/// once in one process fail on novanas with "unhandled system error" (libtest runs tests on
+/// parallel threads). Held for the whole test, taken before its watchdog starts.
+static RCCL_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn rccl_serial() -> std::sync::MutexGuard<'static, ()> {
+    RCCL_TESTS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// The device memory (kernel-library context) of every AMD device, in index order.
 fn devices() -> Vec<Arc<dyn DeviceMemory>> {
     contexts().into_iter().map(|(mem, _)| mem).collect()
@@ -435,6 +444,7 @@ fn hostmem_delegate_init_with_a_missing_peer_fails_in_time() {
     if !require_backend("hip") {
         return;
     }
+    let _rccl = rccl_serial();
     let _watchdog = watchdog(
         "hostmem_delegate_init_with_a_missing_peer_fails_in_time",
         Duration::from_secs(60),
@@ -481,6 +491,7 @@ fn hostmem_routes_large_messages_to_rccl_on_two_gpus() {
     if !require_backend("hip") {
         return;
     }
+    let _rccl = rccl_serial();
     let _watchdog = watchdog(
         "hostmem_routes_large_messages_to_rccl_on_two_gpus",
         Duration::from_secs(120),
@@ -566,6 +577,7 @@ fn rccl_init_with_a_missing_peer_fails_in_time() {
     if !require_backend("hip") {
         return;
     }
+    let _rccl = rccl_serial();
     let _watchdog = watchdog(
         "rccl_init_with_a_missing_peer_fails_in_time",
         Duration::from_secs(60),
@@ -654,6 +666,8 @@ fn graph_replays(name: &'static str, gather: usize, route_max_bytes: Option<u64>
     if !require_backend("hip") {
         return;
     }
+    // Only the delegate route opens an RCCL communicator.
+    let _rccl = route_max_bytes.is_none().then(rccl_serial);
     let _watchdog = watchdog(name, Duration::from_secs(180));
     let ctxs = contexts();
     assert!(ctxs.len() >= 2, "two AMD devices, found {}", ctxs.len());
