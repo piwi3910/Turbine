@@ -1026,6 +1026,7 @@ pub(crate) fn load_pipeline(
         reserve: tail.reserve,
         held: tail.held,
         shards,
+        remote_tiers: None,
         group: Vec::new(),
     })
 }
