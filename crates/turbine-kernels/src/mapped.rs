@@ -1,4 +1,5 @@
-//! Kernel C ABI v2.7 (Phase 5, decision "P5: small-message all-reduce latency on novanas"):
+//! Kernel C ABI v2.7 (Phase 5, decision "P5: small-message all-reduce latency on novanas") and
+//! its v2.8 device-sequenced step (P5 Task 32, tensor-parallel decode graphs):
 //! host memory mapped into every device of the process and the one-shot collective steps over
 //! it, exposed as `turbine_tensor::MappedCollectives` on `ShimContext` (through
 //! `DeviceMemory::mapped_collectives`). A library without the group answers `None` there, and
@@ -21,11 +22,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use turbine_tensor::{
-    DevicePtr, MappedCollectives, MappedHost, MappedKind, MappedReduce, MappedRegion, MappedStep,
-    MemoryError,
+    DeviceMemory, DevicePtr, MappedCollectives, MappedDma, MappedHost, MappedKind, MappedReduce,
+    MappedRegion, MappedStep, MemoryError, StreamRef,
 };
 
-use crate::ffi::{MappedCollectiveDesc, MappedFns};
+use crate::ffi::{MappedCollectiveDesc, MappedDmaDesc, MappedFns};
 use crate::shim::ShimContext;
 
 /// One `turbine_host_alloc_mapped` allocation, freed on Drop through its context.
@@ -209,5 +210,133 @@ impl MappedCollectives for ShimContext {
         // keeps alive until then as well (see the module's ownership rules).
         let code = unsafe { (fns.collective.run)(self.raw_ctx(), &desc) };
         self.mapped_check(code)
+    }
+
+    fn mapped_dseq_supported(&self) -> bool {
+        self.library().syms().v21.mapped_dseq.is_some()
+    }
+
+    fn enqueue_mapped_step_dseq(
+        &self,
+        step: &MappedStep,
+        seq_counter: DevicePtr,
+    ) -> Result<(), MemoryError> {
+        let run = self.library().syms().v21.mapped_dseq.ok_or_else(|| {
+            MemoryError::Unsupported(format!(
+                "{} does not export the kernel ABI v2.8 device-sequenced collective step \
+                 (minor {})",
+                self.library().path().display(),
+                self.library().abi_minor()
+            ))
+        })?;
+        let mut desc = descriptor(step)?;
+        // Ignored by the library, but a valid descriptor has seq >= 1.
+        desc.seq = 1;
+        // SAFETY: as in `enqueue_mapped_step`; `seq_counter` is 16 bytes of this context's
+        // device memory that the caller keeps alive (and uses for this channel only) until the
+        // step completes, and every graph that captured it is destroyed (hostmem's rules).
+        let code = unsafe { run(self.raw_ctx(), &desc, seq_counter.addr() as *mut u64) };
+        self.mapped_check(code)
+    }
+
+    fn mapped_capturing(&self) -> bool {
+        self.is_capturing()
+    }
+
+    fn side_stream(&self) -> Result<StreamRef, MemoryError> {
+        let tp = self.library().syms().v21.tensor_parallel.ok_or_else(|| {
+            MemoryError::Unsupported("native stream handles (kernel ABI v2.6)".into())
+        })?;
+        let (stream, _) = self.collective_copy_resources()?;
+        let mut native: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `stream` is this context's live copy stream (owned by its pinned state until the
+        // context is destroyed); the shim only writes its handle into the live out-pointer.
+        let code = unsafe { (tp.stream_native_handle)(self.raw_ctx(), stream, &mut native) };
+        self.mapped_check(code)?;
+        let owner: Arc<dyn DeviceMemory> = self.owning_arc();
+        Ok(StreamRef::new(
+            native as u64,
+            DeviceMemory::device(self),
+            owner,
+        ))
+    }
+
+    fn side_after_compute(&self) -> Result<(), MemoryError> {
+        ShimContext::side_after_compute(self)
+    }
+
+    fn side_mark(&self) -> Result<u64, MemoryError> {
+        ShimContext::side_mark(self)
+    }
+
+    fn compute_after_mark(&self, mark: u64) -> Result<(), MemoryError> {
+        ShimContext::compute_after_mark(self, mark)
+    }
+
+    fn mapped_dma_supported(&self) -> bool {
+        self.library().syms().v21.mapped_dma.is_some()
+    }
+
+    fn enqueue_mapped_all_reduce_dma(
+        &self,
+        step: &MappedStep,
+        dma: &MappedDma,
+    ) -> Result<(), MemoryError> {
+        let fns = self.library().syms().v21.mapped_dma.ok_or_else(|| {
+            MemoryError::Unsupported(format!(
+                "{} does not export the kernel ABI v2.8 copy-engine all-reduce (minor {})",
+                self.library().path().display(),
+                self.library().abi_minor()
+            ))
+        })?;
+        let desc = descriptor(step)?;
+        let (copy, event) = self.collective_copy_resources()?;
+        let chunk_bytes = i64::try_from(dma.chunk_bytes).map_err(|_| {
+            MemoryError::InvalidArgument(format!("chunk_bytes {} overflows", dma.chunk_bytes))
+        })?;
+        let m = MappedDmaDesc {
+            copy,
+            event,
+            scratch: dma.scratch.addr() as *mut c_void,
+            chunk_bytes,
+            seq_counter: dma.seq_counter.addr() as *mut u64,
+            flags: i32::from(dma.peer_read),
+        };
+        // SAFETY: `desc` and `m` are live locals read during the call only. `copy` and `event`
+        // are this context's (owned by its pinned state until the context is destroyed, and
+        // destroying the stream waits for its copies); the device pointers follow
+        // `enqueue_mapped_step`'s rules, and `scratch` / `seq_counter` are this context's device
+        // memory the caller keeps alive until the step completes on the compute stream.
+        let code = unsafe { (fns.run)(self.raw_ctx(), &desc, &m) };
+        self.mapped_check(code)
+    }
+
+    fn alloc_dma_region(&self, bytes: usize) -> Result<MappedRegion, MemoryError> {
+        let (fns, mapped) = match (self.library().syms().v21.mapped_dma, self.mapped_fns()) {
+            (Some(fns), Ok(mapped)) => (fns, mapped),
+            _ => {
+                return Err(MemoryError::Unsupported(
+                    "copy-engine slots (kernel ABI v2.8)".into(),
+                ));
+            }
+        };
+        let mut host: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `host` is a live out-pointer; on success the shim stores a page-locked
+        // allocation of `bytes` bytes, owned from here by one `ShimMapped` (freed once through
+        // `turbine_host_free_mapped`, as the header says).
+        let code = unsafe { (fns.alloc)(self.raw_ctx(), bytes, &mut host) };
+        self.mapped_check(code)?;
+        if host.is_null() {
+            return Err(MemoryError::Device {
+                message: "turbine_host_alloc_dma succeeded but returned NULL".into(),
+                sticky: false,
+            });
+        }
+        Ok(MappedRegion::new(Arc::new(ShimMapped {
+            host: host.cast::<u8>(),
+            len: bytes,
+            ctx: self.owning_arc(),
+            free: mapped.free,
+        })))
     }
 }

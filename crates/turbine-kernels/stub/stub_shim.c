@@ -6,7 +6,7 @@
  * it with the host C compiler once per variant:
  *   -DSTUB_ABI=<n>u  -DSTUB_BACKEND="<name>"  -DSTUB_ARCHS="<a,b>"
  *   [-DTURBINE_STUB_V21] [-DTURBINE_STUB_V24] [-DTURBINE_STUB_V25]
- *   [-DTURBINE_STUB_V26] [-DTURBINE_STUB_V27]
+ *   [-DTURBINE_STUB_V26] [-DTURBINE_STUB_V27] [-DTURBINE_STUB_V28]
  * With TURBINE_STUB_V21 it also exports the optional ABI v2.1 and v2.3
  * symbols: turbine_abi_minor (3, a v2.3 library), context options
  * (TURBINE_OPTION_GEMM_AUTOTUNE kept per context,
@@ -19,9 +19,10 @@
  * it reports minor 5 and exports the v2.5 copy streams (see the v2.5
  * section); with TURBINE_STUB_V26 as well it reports minor 6 and exports the
  * v2.6 group (see the v2.6 section); with TURBINE_STUB_V27 as well it reports
- * minor TURBINE_ABI_MINOR (7) and exports the v2.7 host-mapped group, whose
- * collective runs the protocol on the calling thread (see the v2.7 section at
- * the end).
+ * minor 7 and exports the v2.7 host-mapped group, whose collective runs the
+ * protocol on the calling thread (see the v2.7 section); with
+ * TURBINE_STUB_V28 as well it reports minor TURBINE_ABI_MINOR (8) and exports
+ * the v2.8 device-sequenced step (see the v2.8 section at the end).
  *
  * stub_live_contexts() is a test hook (not part of the ABI): the number of
  * contexts created and not yet destroyed, so tests can prove the Rust side
@@ -245,8 +246,10 @@ STUB_OP(moe_experts, turbine_moe_experts_desc)
 STUB_OP(add_rmsnorm, turbine_add_rmsnorm_desc)
 STUB_OP(logits_reduce, turbine_logits_reduce_desc)
 
-#if defined(TURBINE_STUB_V27)
+#if defined(TURBINE_STUB_V28)
 uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
+#elif defined(TURBINE_STUB_V27)
+uint32_t turbine_abi_minor(void) { return 7u; }
 #elif defined(TURBINE_STUB_V26)
 uint32_t turbine_abi_minor(void) { return 6u; }
 #elif defined(TURBINE_STUB_V25)
@@ -903,3 +906,116 @@ int32_t turbine_mapped_collective(turbine_ctx *ctx,
   return TURBINE_OK;
 }
 #endif /* TURBINE_STUB_V27 */
+
+#ifdef TURBINE_STUB_V28
+/* v2.8: the step's seq is the counter word (the stub's "device" memory is host
+ * memory) plus one; a valid non-empty step stores it back, as the kernel's
+ * last block does. */
+int32_t turbine_mapped_collective_dseq(turbine_ctx *ctx,
+                                       const turbine_mapped_collective_desc *d,
+                                       uint64_t *seq_counter) {
+  if (d == NULL || seq_counter == NULL) {
+    set_error(ctx->last_error, "stub: mapped_collective_dseq null pointer");
+    return TURBINE_E_ARGUMENT;
+  }
+  turbine_mapped_collective_desc step = *d;
+  step.seq = seq_counter[0] + 1;
+  if (stub_mapped_ok(&step) && step.bytes > 0) {
+    seq_counter[0] = step.seq;
+  }
+  return turbine_mapped_collective(ctx, &step);
+}
+
+int32_t turbine_host_alloc_dma(turbine_ctx *ctx, size_t bytes, void **out) {
+  return turbine_host_alloc_mapped(ctx, bytes, out);
+}
+
+/* v2.8 copy-engine all-reduce, on the calling thread: every chunk into this
+ * rank's slot (parity d->seq & 1) with its flag word k, then per chunk a wait
+ * for every rank's flag word k and the rank-order reduction; the counter
+ * advances once. The copy stream and the event are not used. */
+int32_t turbine_mapped_all_reduce_dma(turbine_ctx *ctx,
+                                      const turbine_mapped_collective_desc *d,
+                                      const turbine_mapped_dma_desc *m) {
+  if (d == NULL || m == NULL || m->seq_counter == NULL || m->copy == NULL ||
+      (m->flags & ~TURBINE_MAPPED_DMA_PEER_READ) != 0 || m->event == NULL ||
+      m->chunk_bytes <= 0 || m->chunk_bytes % 16 != 0 || !stub_mapped_ok(d) ||
+      d->kind != TURBINE_MAPPED_ALL_REDUCE) {
+    set_error(ctx->last_error, "stub: mapped_all_reduce_dma refused");
+    return TURBINE_E_UNSUPPORTED;
+  }
+  if (d->bytes == 0) {
+    return TURBINE_OK;
+  }
+  const int64_t chunks = (d->bytes + m->chunk_bytes - 1) / m->chunk_bytes;
+  if (chunks > d->max_blocks) {
+    set_error(ctx->last_error, "stub: too many DMA chunks");
+    return TURBINE_E_UNSUPPORTED;
+  }
+  _Atomic uint32_t *abort_word = (_Atomic uint32_t *)d->abort_word;
+  const uint64_t seq = m->seq_counter[0] + 1;
+  m->seq_counter[0] = seq;
+  if (atomic_load(abort_word) != 0) {
+    return TURBINE_OK;
+  }
+  uint8_t *base = (uint8_t *)d->slots;
+  const int64_t parity = (int64_t)(d->seq & 1u);
+#define STUB_DSLOT(r) (base + (parity * d->world + (r)) * d->slot_bytes)
+  const uint8_t *send = (const uint8_t *)d->send;
+  uint8_t *recv = (uint8_t *)d->recv;
+  for (int64_t k = 0; k < chunks; ++k) {
+    const int64_t off = k * m->chunk_bytes;
+    const int64_t n =
+        d->bytes - off < m->chunk_bytes ? d->bytes - off : m->chunk_bytes;
+    memcpy(STUB_DSLOT(d->rank) + off, send + off, (size_t)n);
+    atomic_store_explicit(
+        (_Atomic uint64_t *)&d->flags[(int64_t)d->rank * d->max_blocks + k],
+        (seq << 24) | (uint64_t)(k + 1), memory_order_release);
+  }
+  const uint64_t deadline = stub_now_ns() + (uint64_t)d->timeout_ns;
+  const int64_t e = d->dtype == TURBINE_DTYPE_BF16 ? 2 : 4;
+  for (int64_t k = 0; k < chunks; ++k) {
+    const uint64_t tag = (seq << 24) | (uint64_t)(k + 1);
+    for (int32_t q = 0; q < d->world; ++q) {
+      _Atomic uint64_t *f =
+          (_Atomic uint64_t *)&d->flags[(int64_t)q * d->max_blocks + k];
+      while (atomic_load_explicit(f, memory_order_acquire) < tag) {
+        if (atomic_load(abort_word) != 0) {
+          return TURBINE_OK;
+        }
+        if (stub_now_ns() > deadline) {
+          uint32_t expected = 0;
+          atomic_compare_exchange_strong(
+              abort_word, &expected,
+              (TURBINE_MAPPED_ABORT_TIMEOUT << 24) |
+                  ((uint32_t)TURBINE_MAPPED_ALL_REDUCE << 16) |
+                  (uint32_t)d->rank);
+          return TURBINE_OK;
+        }
+        struct timespec nap = {0, 20000};
+        nanosleep(&nap, NULL);
+      }
+    }
+    const int64_t off = k * m->chunk_bytes;
+    const int64_t n =
+        d->bytes - off < m->chunk_bytes ? d->bytes - off : m->chunk_bytes;
+    for (int64_t i = off; i < off + n; i += e) {
+      float acc = 0.0f;
+      for (int32_t q = 0; q < d->world; ++q) {
+        const uint8_t *src = q == d->rank ? send : STUB_DSLOT(q);
+        const float x = stub_load(src + i, d->dtype);
+        if (q == 0) {
+          acc = x;
+        } else if (d->reduce_op == TURBINE_REDUCE_SUM) {
+          acc = acc + x;
+        } else {
+          acc = x > acc ? x : acc;
+        }
+      }
+      stub_store(recv + i, d->dtype, acc);
+    }
+  }
+#undef STUB_DSLOT
+  return TURBINE_OK;
+}
+#endif /* TURBINE_STUB_V28 */

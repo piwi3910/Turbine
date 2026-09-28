@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::buffer::{DevicePtr, MemoryError};
+use crate::buffer::{DevicePtr, MemoryError, StreamRef};
 use crate::dtype::DType;
 
 /// One mapped allocation, seen from the host. Implemented by the backend that allocated it;
@@ -154,6 +154,22 @@ pub struct MappedStep {
     pub timeout: Duration,
 }
 
+/// The extra operands of a copy-engine all-reduce step (kernel ABI v2.8
+/// `turbine_mapped_all_reduce_dma`): `step.slots` is a region only these steps use and
+/// `step.seq` the caller's count of them (slot parity); the tags come from the device counter.
+#[derive(Clone, Copy, Debug)]
+pub struct MappedDma {
+    /// `(world - 1) × chunk_bytes` of this device's memory.
+    pub scratch: DevicePtr,
+    /// Bytes per pipeline chunk (a multiple of 16; at most `max_blocks` chunks per step).
+    pub chunk_bytes: u64,
+    /// The channel's device step counter (as [`MappedCollectives::enqueue_mapped_step_dseq`]).
+    pub seq_counter: DevicePtr,
+    /// The reduction reads each peer's chunk from its slot (a region of
+    /// [`MappedCollectives::alloc_mapped`]) instead of copying it in first.
+    pub peer_read: bool,
+}
+
 /// Mapped host memory and the one-shot collective steps over it, on one device (kernel ABI
 /// v2.7). Steps are enqueued on the device's compute stream in order with its other work.
 pub trait MappedCollectives: Send + Sync {
@@ -166,6 +182,75 @@ pub trait MappedCollectives: Send + Sync {
     fn mapped_step_supported(&self, step: &MappedStep) -> bool;
     /// Enqueues `step` on the compute stream; returns without waiting for it or for the peers.
     fn enqueue_mapped_step(&self, step: &MappedStep) -> Result<(), MemoryError>;
+    /// Whether [`MappedCollectives::enqueue_mapped_step_dseq`] is available (kernel ABI v2.8).
+    fn mapped_dseq_supported(&self) -> bool {
+        false
+    }
+    /// [`MappedCollectives::enqueue_mapped_step`] with the step's sequence number read on the
+    /// device from `seq_counter` (16 bytes of this device's memory, zero before the channel's
+    /// first step; `step.seq` is ignored), so the step may be captured into a graph and replayed.
+    /// Every step of the channel must then be enqueued this way.
+    fn enqueue_mapped_step_dseq(
+        &self,
+        step: &MappedStep,
+        seq_counter: DevicePtr,
+    ) -> Result<(), MemoryError> {
+        let _ = (step, seq_counter);
+        Err(MemoryError::Unsupported(
+            "device-sequenced mapped collective steps (kernel ABI v2.8)".into(),
+        ))
+    }
+    /// A second stream of this device for collectives that overlap the compute stream's work
+    /// (tensor-parallel prefill overlap, P5 Task 32), with [`MappedCollectives::side_after_compute`],
+    /// [`MappedCollectives::side_mark`] and [`MappedCollectives::compute_after_mark`] ordering
+    /// the two. `Unsupported` without one.
+    fn side_stream(&self) -> Result<StreamRef, MemoryError> {
+        Err(MemoryError::Unsupported("a collective side stream".into()))
+    }
+    /// Work enqueued on the side stream from now on waits for the compute stream's work so far.
+    fn side_after_compute(&self) -> Result<(), MemoryError> {
+        Err(MemoryError::Unsupported("a collective side stream".into()))
+    }
+    /// A mark after the side stream's work so far.
+    fn side_mark(&self) -> Result<u64, MemoryError> {
+        Err(MemoryError::Unsupported("a collective side stream".into()))
+    }
+    /// Work enqueued on the compute stream from now on waits for the side stream up to `mark`.
+    fn compute_after_mark(&self, mark: u64) -> Result<(), MemoryError> {
+        let _ = mark;
+        Err(MemoryError::Unsupported("a collective side stream".into()))
+    }
+    /// True while the compute stream is being captured into a graph (only capturable steps may
+    /// be enqueued then: the device-sequenced ones).
+    fn mapped_capturing(&self) -> bool {
+        false
+    }
+    /// `bytes` of page-locked host memory for the copy-engine slots (kernel ABI v2.8): every
+    /// device's copy engines reach it at its host address ([`MappedRegion::host_addr`]); not
+    /// read by kernels.
+    fn alloc_dma_region(&self, bytes: usize) -> Result<MappedRegion, MemoryError> {
+        let _ = bytes;
+        Err(MemoryError::Unsupported(
+            "copy-engine slots (kernel ABI v2.8)".into(),
+        ))
+    }
+    /// Whether [`MappedCollectives::enqueue_mapped_all_reduce_dma`] is available (kernel ABI
+    /// v2.8 with the copy streams).
+    fn mapped_dma_supported(&self) -> bool {
+        false
+    }
+    /// Enqueues the all-reduce `step` with the copy engines moving its bytes (the header's
+    /// `turbine_mapped_all_reduce_dma`); bit for bit the one-shot step's result.
+    fn enqueue_mapped_all_reduce_dma(
+        &self,
+        step: &MappedStep,
+        dma: &MappedDma,
+    ) -> Result<(), MemoryError> {
+        let _ = (step, dma);
+        Err(MemoryError::Unsupported(
+            "copy-engine mapped all-reduce (kernel ABI v2.8)".into(),
+        ))
+    }
 }
 
 #[cfg(test)]

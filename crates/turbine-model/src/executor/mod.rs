@@ -491,6 +491,15 @@ pub trait ModelExecutor: Send {
     fn set_decode_graphs(&mut self, graphs: Option<DecodeGraphs>) {
         let _ = graphs;
     }
+    /// Tensor-parallel prefill overlap (P5 Task 32, `parallel.tp_prefill_overlap`): prefills of
+    /// at least `min_tokens` rows (`None`: off; the server passes
+    /// [`decoder::PREFILL_OVERLAP_MIN_TOKENS`]) split in two halves whose all-reduces overlap
+    /// the other half's work, with the same results. Returns whether it is on; executors
+    /// without it ignore the call.
+    fn set_prefill_overlap(&mut self, min_tokens: Option<usize>) -> bool {
+        let _ = min_tokens;
+        false
+    }
     /// Decode graph outcomes since graphs were set; zeros without them.
     fn graph_counters(&self) -> GraphCounters {
         GraphCounters::default()

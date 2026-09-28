@@ -1,14 +1,14 @@
 // turbine_abi_minor: the minor revision of the library it is linked into.
 //
-// libturbine_hip.so reports TURBINE_ABI_MINOR (7): besides the ABI v2 trios it
+// libturbine_hip.so reports TURBINE_ABI_MINOR (8): besides the ABI v2 trios it
 // exports the optional add_rmsnorm trio (rmsnorm.cpp), the v2.1 context
 // options (context.cpp: the tuned GEMM table switch), logits_reduce
 // (logits_reduce.hip), the graph functions (graph.cpp), the v2.3 pinned host
 // memory and event functions (memory.cpp), the v2.4 implementation group
 // (impl_exports.cpp), the v2.5 copy streams (copy_stream.cpp) and the v2.6
 // native stream handle (copy_stream.cpp) with the sharded RMSNorm trios
-// (sharded_norm.hip) and the v2.7 host-mapped memory and collectives
-// (hostmem.hip).
+// (sharded_norm.hip), the v2.7 host-mapped memory and collectives and the v2.8
+// device-sequenced collective step (hostmem.hip).
 // libturbine_hip_v23.so, compiled with TURBINE_V23_BUILD, is the same kernels
 // without impl_exports.cpp and reports 3, so a caller keeps the library's own
 // choice of implementation (the fallback the v2.4 group is optional against)

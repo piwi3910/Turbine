@@ -3611,6 +3611,229 @@ fn hip_tp2_matches_tp1() {
     println!("hip_tp2_matches_tp1: worst top-k |Δ logprob| / golden bound {worst:.3}");
 }
 
+/// Lab only, two GPUs (P5 Task 32, tensor-parallel decode graphs): the head_dim-128 tiny Llama
+/// at tp 2 over the `hostmem` collective on both R9700s, [`greedy_pair`] eagerly and then again
+/// with decode graphs on every rank (the second decode step captures its collectives, the rest
+/// replay): the greedy tokens and every logits row of the graph run are bitwise the eager run's
+/// on both ranks, and the graphs were replayed. Breaks if a replay reuses a captured sequence
+/// number (stale slots or an early wait), the logits reorder copies are not captured, or the
+/// ranks capture different keys.
+#[test]
+#[ignore = "needs two HIP devices and libturbine_hip.so (scripts/lab-test.sh novanas --gpus 2)"]
+fn hostmem_tp2_graphs_match_eager() {
+    use turbine_distributed::collective::{self as coll, CollectiveInit};
+
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let tmp = TempDir::new("tiny-model-hip-tp-graphs");
+    let spec = write_gpu_tiny(tmp.path());
+    let lib = coll::registry()
+        .get("hostmem")
+        .expect("registered")
+        .load(None)
+        .expect("load hostmem");
+    let id = lib.unique_id().expect("id");
+    let runs: Vec<(GreedyRun, GreedyRun, u64)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2u32)
+            .map(|rank| {
+                let (lib, spec) = (Arc::clone(&lib), &spec);
+                scope.spawn(move || {
+                    let ctx = turbine_kernels::test_support::open_context_nth("hip", rank as usize);
+                    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+                    let collective = lib
+                        .open(CollectiveInit {
+                            rank: rank as usize,
+                            world: 2,
+                            unique_id: id,
+                            init_timeout: std::time::Duration::from_secs(60),
+                            op_timeout: std::time::Duration::from_secs(60),
+                            clock: Arc::new(turbine_core::clock::SystemClock::new()),
+                            metrics: None,
+                            memory: Some(Arc::clone(&mem)),
+                            // hostmem's kernels for every message.
+                            route_max_bytes: Some(u64::MAX),
+                        })
+                        .expect("open hostmem");
+                    let s = tp::ShardSpec { rank, world: 2 };
+                    let layout = tp::kv_layout(&spec.config, s, BLOCK_TOKENS).expect("layout");
+                    let run = |graphs: bool| {
+                        let provider = shim_provider(ctx.clone());
+                        let mut exec = tp_rank(spec, s, Arc::clone(&collective), provider, &mem);
+                        if graphs {
+                            exec.set_decode_graphs(Some(hip_graphs(&ctx, MAX_SEQS)));
+                        }
+                        let storage = pool(&mem, &layout, 4);
+                        let got = greedy_pair(
+                            exec.as_mut(),
+                            &pool_view(&storage, &layout, 4),
+                            spec.vocab,
+                        );
+                        (got, exec.graph_counters().replayed)
+                    };
+                    let (eager, none) = run(false);
+                    assert_eq!(none, 0, "rank {rank}: no graphs in the eager run");
+                    let (graphed, replayed) = run(true);
+                    (eager, graphed, replayed)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("rank thread"))
+            .collect()
+    });
+    for (rank, (eager, graphed, replayed)) in runs.iter().enumerate() {
+        assert!(
+            *replayed >= (TP_STEPS - 2) as u64,
+            "rank {rank}: {replayed} replays"
+        );
+        assert_eq!(graphed.0, eager.0, "rank {rank}: greedy tokens differ");
+        assert!(
+            graphed.1 == eager.1,
+            "rank {rank}: graph logits differ from the eager run"
+        );
+        assert!(
+            graphed.1 == runs[0].1.1,
+            "rank {rank}: logits differ from rank 0"
+        );
+        println!("hostmem_tp2_graphs_match_eager rank {rank}: {replayed} replays, bitwise eager");
+    }
+}
+
+/// P5 Task 32 (tensor-parallel prefill overlap): the tiny Llama at tp 2 on the host collective
+/// (cpu-reference provider, no side stream, so the halves run one after the other), with the
+/// prefill split at row 16 of the ragged 20 + 13-token prefill — the first sequence continues in
+/// the second half after its first 16 rows' K/V — gives [`greedy_pair`]'s tokens and every
+/// logits row bitwise equal to the unsplit run on both ranks. Breaks if a half's attention
+/// metadata, its row window, the order of a half's norm and all-reduce, or the continuation of
+/// the straddling sequence is wrong.
+#[test]
+fn tp2_prefill_split_matches_unsplit_on_host() {
+    let tmp = TempDir::new("tiny-model-tp-split");
+    let spec = write_tiny_llama(tmp.path(), SEED);
+    let run = |split: bool| -> Vec<GreedyRun> {
+        let group = HostCollective::group(2, std::time::Duration::from_secs(60));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = group
+                .into_iter()
+                .enumerate()
+                .map(|(rank, collective)| {
+                    let spec = &spec;
+                    scope.spawn(move || {
+                        let s = tp::ShardSpec {
+                            rank: rank as u32,
+                            world: 2,
+                        };
+                        let mem: Arc<dyn DeviceMemory> =
+                            HostMemory::new(DeviceId(rank as u32), 1 << 30);
+                        let collective: Arc<dyn Collective> = Arc::new(collective);
+                        let mut exec = tp_decoder(spec, Some((s, collective)), &mem);
+                        if split {
+                            // Any prefill of 2 rows or more splits.
+                            assert!(exec.set_prefill_overlap(Some(2)), "rank {rank}: overlap on");
+                        }
+                        let layout = *exec.kv_layout();
+                        let storage = pool(&mem, &layout, 4);
+                        let got =
+                            greedy_pair(&mut exec, &pool_view(&storage, &layout, 4), spec.vocab);
+                        // The one prefill split; the decode steps never do.
+                        assert_eq!(exec.prefill_splits(), u64::from(split), "rank {rank}");
+                        got
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("rank thread"))
+                .collect()
+        })
+    };
+    let (serial, split) = (run(false), run(true));
+    for rank in 0..2 {
+        assert_eq!(split[rank].0, serial[rank].0, "rank {rank}: greedy tokens");
+        assert!(
+            split[rank].1 == serial[rank].1,
+            "rank {rank}: split prefill logits differ from the unsplit run"
+        );
+    }
+    assert!(split[0].1 == split[1].1, "both ranks hold the same logits");
+}
+
+/// Lab only, two GPUs (P5 Task 32): [`tp2_prefill_split_matches_unsplit_on_host`] on both
+/// R9700s over the `hostmem` collective with every message routed to its RCCL delegate
+/// (`route_max_bytes` 0), so the split prefill's all-reduces run on the collective side stream
+/// while the compute stream works on the other half (the real overlap): tokens and logits
+/// bitwise the unsplit run's on both ranks. Breaks if the side stream's fences let an all-reduce
+/// read rows before the compute stream wrote them, or the compute stream read them before the
+/// all-reduce finished.
+#[test]
+#[ignore = "needs two HIP devices, libturbine_hip.so and RCCL (scripts/lab-test.sh novanas --gpus 2)"]
+fn hostmem_tp2_prefill_overlap_matches_serial() {
+    use turbine_distributed::collective::{self as coll, CollectiveInit};
+
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let tmp = TempDir::new("tiny-model-hip-tp-overlap");
+    let spec = write_gpu_tiny(tmp.path());
+    let lib = coll::registry()
+        .get("hostmem")
+        .expect("registered")
+        .load(None)
+        .expect("load hostmem with its RCCL delegate");
+    let id = lib.unique_id().expect("id");
+    let runs: Vec<(GreedyRun, GreedyRun)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2u32)
+            .map(|rank| {
+                let (lib, spec) = (Arc::clone(&lib), &spec);
+                scope.spawn(move || {
+                    let ctx = turbine_kernels::test_support::open_context_nth("hip", rank as usize);
+                    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+                    let collective = lib
+                        .open(CollectiveInit {
+                            rank: rank as usize,
+                            world: 2,
+                            unique_id: id,
+                            init_timeout: std::time::Duration::from_secs(60),
+                            op_timeout: std::time::Duration::from_secs(60),
+                            clock: Arc::new(turbine_core::clock::SystemClock::new()),
+                            metrics: None,
+                            memory: Some(Arc::clone(&mem)),
+                            // Every message to RCCL, which runs on the stream it is given.
+                            route_max_bytes: Some(0),
+                        })
+                        .expect("open hostmem");
+                    let s = tp::ShardSpec { rank, world: 2 };
+                    let layout = tp::kv_layout(&spec.config, s, BLOCK_TOKENS).expect("layout");
+                    let run = |overlap: bool| {
+                        let provider = shim_provider(ctx.clone());
+                        let mut exec = tp_rank(spec, s, Arc::clone(&collective), provider, &mem);
+                        if overlap {
+                            assert!(exec.set_prefill_overlap(Some(2)), "rank {rank}: overlap on");
+                        }
+                        let storage = pool(&mem, &layout, 4);
+                        greedy_pair(exec.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab)
+                    };
+                    (run(false), run(true))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("rank thread"))
+            .collect()
+    });
+    for (rank, (serial, overlapped)) in runs.iter().enumerate() {
+        assert_eq!(overlapped.0, serial.0, "rank {rank}: greedy tokens differ");
+        assert!(
+            overlapped.1 == serial.1,
+            "rank {rank}: overlapped prefill logits differ from the serial run"
+        );
+    }
+    println!("hostmem_tp2_prefill_overlap_matches_serial: bitwise the serial run on both ranks");
+}
+
 /// `spec`'s decoder on the cpu-reference provider over `mem`: one device (`rank: None`) or rank
 /// `s` of a tensor-parallel group on `collective`.
 fn tp_decoder(

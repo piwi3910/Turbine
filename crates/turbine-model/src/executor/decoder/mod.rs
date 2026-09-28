@@ -36,6 +36,10 @@
 //! batch metadata and reduction inputs are uploaded into the same device buffers first. Never
 //! while tracing or profiling, nor when the FFN hook says the batch cannot be captured
 //! ([`FfnHook::graph_capturable`]: MoE with a provider reading the expert offsets on the host).
+//! A tensor-parallel rank captures its collectives into the graph too (P5 Task 32; the server
+//! gives it graphs only under `parallel.tp_decode_graphs`): every rank sees the same batches, so
+//! every rank captures and replays the same keys, and a collective that is captured must advance
+//! its own sequencing on replay (the `hostmem` backend's device step counter, kernel ABI v2.8).
 //!
 //! Diagnostics: [`DecoderExecutor::set_trace`] makes each forward record every intermediate
 //! tensor ([`TraceTensor`]) with a blocking device read after the op that wrote it; comparing
@@ -65,8 +69,8 @@ use super::graphs::{self, DecodeGraphs, GraphCounters, GraphKey, PoolId};
 use super::logits::{self, LogitsHead};
 use super::profile::{self, OpProfile, Profiler};
 use super::{
-    BatchInput, ExecutorLimits, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, Split,
-    TokenFeed, feed_runs, rope,
+    BatchInput, ExecutorLimits, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, SeqSlice,
+    Split, TokenFeed, feed_runs, rope,
 };
 use crate::ModelError;
 use crate::config::{ModelArchConfig, MoeConfig};
@@ -385,6 +389,9 @@ pub struct LayerRun<'a> {
     pub registry: &'a KernelRegistry,
     /// Rows of the batch (tokens).
     pub tokens: usize,
+    /// The first of those rows in the activation buffers (0 but for a half of a split prefill,
+    /// [`ModelExecutor::set_prefill_overlap`]).
+    pub row0: usize,
     pub opts: ExecutorOptions,
     /// The FFN hook's buffers ([`FfnHook::alloc`]).
     pub ffn_buffers: &'a HookBuffers,
@@ -435,12 +442,12 @@ impl LayerRun<'_> {
 
     /// The FFN input: the normalised rows `[tokens, hidden]`.
     pub fn normed(&self) -> TensorView<'_> {
-        rows(&self.exec.bufs.h, self.tokens)
+        self.exec.bufs.h.view().rows(self.row0, self.tokens)
     }
 
     /// The FFN output rows `[tokens, hidden]`, which the residual add reads.
     pub fn ffn_out(&self) -> TensorView<'_> {
-        rows(&self.exec.bufs.proj, self.tokens)
+        self.exec.bufs.proj.view().rows(self.row0, self.tokens)
     }
 
     /// Records `view` under the layer and `name` when tracing.
@@ -467,6 +474,32 @@ impl LayerRun<'_> {
     pub fn sumsq(&self) -> Option<&Tensor> {
         self.exec.tp_bufs.as_ref().map(|b| &b.sumsq)
     }
+}
+
+/// The rows a layer part runs on: `[r0, r0 + p.total_q)` of the activation buffers, with the
+/// attention metadata `meta` of those rows packed as the batch `p`.
+#[derive(Clone, Copy)]
+struct Part<'p> {
+    r0: usize,
+    p: &'p Packed,
+    meta: &'p DeviceBatch,
+}
+
+/// A prefill batch of at least this many rows is split in two for the overlap
+/// ([`ModelExecutor::set_prefill_overlap`]).
+pub const PREFILL_OVERLAP_MIN_TOKENS: usize = 256;
+
+/// The tensor-parallel prefill overlap's state: the collective side stream (`None`: the halves
+/// run one after the other on the compute stream, same results) and each half's host and device
+/// batch metadata.
+struct PrefillOverlap {
+    side: Option<StreamRef>,
+    /// The fewest rows a split prefill has ([`PREFILL_OVERLAP_MIN_TOKENS`]).
+    min_tokens: usize,
+    /// Prefills split so far.
+    splits: u64,
+    hosts: [HostBatch; 2],
+    metas: [DeviceBatch; 2],
 }
 
 /// Rows `[0, t)` of an activation buffer as `[t, cols]`.
@@ -594,6 +627,8 @@ pub struct DecoderExecutor {
     /// rows independent of the batch ([`GemmContext::prefill`]), so a prefix-reused prefill of a
     /// suffix reproduces the whole-prompt prefill.
     step_prefill: AtomicBool,
+    /// The tensor-parallel prefill overlap, when on (P5 Task 32).
+    overlap: Option<PrefillOverlap>,
 }
 
 impl DecoderExecutor {
@@ -781,7 +816,8 @@ impl DecoderExecutor {
     /// `registry` was built from [`DecoderExecutor::requirements_for`] of the same shard, and
     /// every forward's pool is laid out as the rank's KV layout ([`crate::tp::kv_layout`]).
     /// Every rank of the group must be fed the same batches in the same order; each returns
-    /// the full logits. Tensor-parallel ranks never capture decode graphs nor overlap launches.
+    /// the full logits. Tensor-parallel ranks never overlap launches; they capture decode graphs
+    /// only when given them ([`ModelExecutor::set_decode_graphs`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new_tp(
         cfg: &ModelArchConfig,
@@ -1058,6 +1094,7 @@ impl DecoderExecutor {
             trace: Tracer::default(),
             profiler: Profiler::default(),
             step_prefill: AtomicBool::new(false),
+            overlap: None,
         })
     }
 
@@ -1121,6 +1158,87 @@ impl DecoderExecutor {
 
     /// Runs the registry op `spec` through `f`: every op of the forward goes through here, so
     /// profile mode times each one.
+    /// Prefills split for the overlap so far ([`ModelExecutor::set_prefill_overlap`]).
+    pub fn prefill_splits(&self) -> u64 {
+        self.overlap.as_ref().map_or(0, |o| o.splits)
+    }
+
+    /// The two halves of `batch` (packed as `p`) for the prefill overlap, packed and uploaded
+    /// into the overlap's metadata: `None` when the overlap is off, for a decode batch, a batch
+    /// under the overlap's `min_tokens` rows, or while tracing or profiling. The split row is
+    /// the middle one; a sequence across it continues in the second half as a chunked prefill
+    /// does (its first rows' K/V appended by the first half).
+    fn split_prefill(
+        &mut self,
+        batch: &BatchInput<'_>,
+        p: &Packed,
+    ) -> Result<Option<[(usize, Packed); 2]>, ModelError> {
+        if self.overlap.is_none()
+            || p.is_decode()
+            || self
+                .overlap
+                .as_ref()
+                .is_some_and(|o| p.total_q < o.min_tokens.max(2))
+            || self.trace.is_on()
+            || self.profiler.is_on()
+        {
+            return Ok(None);
+        }
+        let split = p.total_q / 2;
+        let mut first: Vec<SeqSlice<'_>> = Vec::new();
+        let mut second: Vec<SeqSlice<'_>> = Vec::new();
+        for s in batch.seqs {
+            let (start, end) = (s.q_start as usize, (s.q_start + s.q_len) as usize);
+            if end <= split {
+                first.push(*s);
+            } else if start >= split {
+                second.push(SeqSlice {
+                    q_start: s.q_start - split as u32,
+                    ..*s
+                });
+            } else {
+                let head = (split - start) as u32;
+                first.push(SeqSlice {
+                    q_len: head,
+                    kv_len: s.kv_len - (s.q_len - head),
+                    reduce: None,
+                    ..*s
+                });
+                second.push(SeqSlice {
+                    q_start: 0,
+                    q_len: s.q_len - head,
+                    ..*s
+                });
+            }
+        }
+        let inputs = [
+            BatchInput {
+                tokens: &batch.tokens[..split],
+                positions: &batch.positions[..split],
+                seqs: &first,
+                kv: batch.kv,
+            },
+            BatchInput {
+                tokens: &batch.tokens[split..],
+                positions: &batch.positions[split..],
+                seqs: &second,
+                kv: batch.kv,
+            },
+        ];
+        let limits = self.limits;
+        let o = self.overlap.as_mut().expect("checked above");
+        let mut packed = Vec::with_capacity(2);
+        for (h, input) in inputs.iter().enumerate() {
+            let hp = o.hosts[h].pack(input, &limits)?;
+            o.metas[h].upload(&o.hosts[h])?;
+            packed.push(hp);
+        }
+        o.splits += 1;
+        let second_p = packed.pop().expect("two halves");
+        let first_p = packed.pop().expect("two halves");
+        Ok(Some([(0, first_p), (split, second_p)]))
+    }
+
     fn op(
         &self,
         spec: OpConfig,
@@ -1138,12 +1256,6 @@ impl DecoderExecutor {
         view: TensorView<'_>,
     ) -> Result<(), ModelError> {
         self.trace.record(layer, name, &view)
-    }
-
-    /// Rows `[0, t)` of an activation buffer as `[t, heads, head_dim]`.
-    fn heads<'b>(&self, buf: &'b Tensor, t: usize) -> TensorView<'b> {
-        let d = &self.dims;
-        TensorView::contiguous(buf.storage.whole(), 0, &[t, d.heads, d.head_dim], d.act)
     }
 
     /// `c = a · wᵀ` for a `[n, k]` weight view `w`.
@@ -1342,9 +1454,14 @@ impl DecoderExecutor {
     /// `x[0..t] += proj[0..t]` (the residual add), then with `norm`
     /// `h[0..t] = rmsnorm(x[0..t]) · norm`: one `add_rmsnorm` when `add_norm`, else `add` and
     /// `rmsnorm`.
-    fn residual_add_norm(&self, t: usize, norm: Option<&Tensor>) -> Result<(), ModelError> {
+    fn residual_add_norm_at(&self, w: &Part<'_>, norm: Option<&Tensor>) -> Result<(), ModelError> {
         let b = &self.bufs;
-        let (x, h, proj) = (rows(&b.x, t), rows(&b.h, t), rows(&b.proj, t));
+        let (r0, t) = (w.r0, w.p.total_q);
+        let (x, h, proj) = (
+            b.x.view().rows(r0, t),
+            b.h.view().rows(r0, t),
+            b.proj.view().rows(r0, t),
+        );
         match norm {
             Some(w) if self.add_norm => {
                 let cfg = self.dims.add_norm();
@@ -1384,37 +1501,62 @@ impl DecoderExecutor {
     /// input norm in `h`, if there is a next layer. Attention appends to and reads layer `i` of
     /// `kv`.
     fn layer(&self, i: usize, p: &Packed, kv: &KvPoolView<'_>) -> Result<(), ModelError> {
+        let w = Part {
+            r0: 0,
+            p,
+            meta: &self.meta,
+        };
+        let b = &self.bufs;
+        let t = p.total_q;
+        let li = Some(i);
+        self.attention_part(i, &w, kv)?;
+        self.all_reduce(&rows(&b.proj, t))?;
+        self.record(li, "o_proj", rows(&b.proj, t))?;
+        self.residual_add_norm_at(&w, Some(&self.layers[i].post_norm))?;
+        self.record(li, "resid_attn", rows(&b.x, t))?;
+
+        // FFN block.
+        self.record(li, "mlp_norm", rows(&b.h, t))?;
+        self.ffn_part(i, &w)?;
+        self.all_reduce(&rows(&b.proj, t))?;
+        let next_norm = self.layers.get(i + 1).map(|next| &next.input_norm);
+        self.residual_add_norm_at(&w, next_norm)?;
+        self.record(li, "resid_mlp", rows(&b.x, t))
+    }
+
+    /// The attention block of layer `i` on the rows of `w`, from their normalised input in `h`
+    /// to the O projection's (not yet all-reduced) output in `proj`.
+    fn attention_part<'s>(
+        &'s self,
+        i: usize,
+        w: &Part<'_>,
+        kv: &KvPoolView<'_>,
+    ) -> Result<(), ModelError> {
         let l = &self.layers[i];
         let b = &self.bufs;
         let d = &self.dims;
-        let t = p.total_q;
+        let (p, t) = (w.p, w.p.total_q);
         let li = Some(i);
-        let run = LayerRun {
-            layer: i,
-            dims: d,
-            registry: &self.registry,
-            tokens: t,
-            opts: self.opts,
-            ffn_buffers: &self.ffn_buffers,
-            exec: self,
-        };
+        let run = self.layer_run(i, w);
+        let at = |buf: &'s Tensor| -> TensorView<'s> { buf.view().rows(w.r0, t) };
+        let end = w.r0 + t;
+        let part = |i: usize, inner: &[usize]| self.qkv.part(&b.qkv, i, end, inner).rows(w.r0, t);
         let (q, k, v) = (
-            || self.qkv.part(&b.qkv, 0, t, &[d.q_dim]),
-            || self.qkv.part(&b.qkv, 1, t, &[d.kv_dim]),
-            || self.qkv.part(&b.qkv, 2, t, &[d.kv_dim]),
+            || part(0, &[d.q_dim]),
+            || part(1, &[d.kv_dim]),
+            || part(2, &[d.kv_dim]),
         );
 
-        // Attention block.
-        self.record(li, "attn_norm", rows(&b.h, t))?;
+        self.record(li, "attn_norm", at(&b.h))?;
         if self.qkv.fused {
-            let w = l.w_qkv.view();
-            self.linear(rows(&b.h, t), w, self.qkv.whole(&b.qkv, t))?;
+            let wq = l.w_qkv.view();
+            let whole = self.qkv.whole(&b.qkv, end).rows(w.r0, t);
+            self.linear(at(&b.h), wq, whole)?;
         } else {
-            let w = |r, n| l.w_qkv.view().rows(r, n);
-            let h = || rows(&b.h, t);
-            self.linear(h(), w(0, d.q_dim), q())?;
-            self.linear(h(), w(d.q_dim, d.kv_dim), k())?;
-            self.linear(h(), w(d.q_dim + d.kv_dim, d.kv_dim), v())?;
+            let wq = |r, n| l.w_qkv.view().rows(r, n);
+            self.linear(at(&b.h), wq(0, d.q_dim), q())?;
+            self.linear(at(&b.h), wq(d.q_dim, d.kv_dim), k())?;
+            self.linear(at(&b.h), wq(d.q_dim + d.kv_dim, d.kv_dim), v())?;
         }
         self.record(li, "q", q())?;
         self.record(li, "k", k())?;
@@ -1422,16 +1564,16 @@ impl DecoderExecutor {
         self.spec
             .attention
             .after_projections(&run, &l.attention, &q(), &k())?;
-        let q_heads = || self.qkv.part(&b.qkv, 0, t, &[d.heads, d.head_dim]);
-        let k_heads = || self.qkv.part(&b.qkv, 1, t, &[d.kv_heads, d.head_dim]);
-        let v_heads = || self.qkv.part(&b.qkv, 2, t, &[d.kv_heads, d.head_dim]);
+        let q_heads = || part(0, &[d.heads, d.head_dim]);
+        let k_heads = || part(1, &[d.kv_heads, d.head_dim]);
+        let v_heads = || part(2, &[d.kv_heads, d.head_dim]);
         let rope = d.rope();
         self.op(OpConfig::Rope(rope), || {
             self.registry.rope(&rope).execute(&mut RopeContext {
                 cfg: rope,
                 q: q_heads(),
                 k: k_heads(),
-                positions: self.meta.positions_view(p),
+                positions: w.meta.positions_view(p),
                 inv_freq: b.inv_freq.view(),
             })
         })?;
@@ -1443,6 +1585,12 @@ impl DecoderExecutor {
             AttentionKind::PrefillPaged
         };
         let attn = d.attention(kind, self.kv_layout.block_tokens);
+        let out = TensorView::contiguous(
+            b.attn.storage.whole(),
+            w.r0 * d.heads * d.head_dim,
+            &[t, d.heads, d.head_dim],
+            d.act,
+        );
         self.op(OpConfig::Attention(attn), || {
             self.registry
                 .attention(&attn)
@@ -1451,31 +1599,110 @@ impl DecoderExecutor {
                     q: q_heads(),
                     k_new: k_heads(),
                     v_new: v_heads(),
-                    out: self.heads(&b.attn, t),
+                    out: out.clone(),
                     kv_layer: batch::kv_layer(kv, i),
-                    block_table: self.meta.block_table_view(p),
-                    q_indptr: self.meta.q_indptr_view(p),
-                    kv_lens: self.meta.kv_lens_view(p),
+                    block_table: w.meta.block_table_view(p),
+                    q_indptr: w.meta.q_indptr_view(p),
+                    kv_lens: w.meta.kv_lens_view(p),
                     max_q_len: p.max_q_len,
                     max_kv_len: p.max_kv_len,
                     max_blocks_per_seq: p.max_blocks_per_seq,
                     scale: 1.0 / (d.head_dim as f32).sqrt(),
                 })
         })?;
-        self.record(li, "attn", rows(&b.attn, t))?;
-        self.linear(rows(&b.attn, t), l.wo.view(), rows(&b.proj, t))?;
-        self.all_reduce(&rows(&b.proj, t))?;
-        self.record(li, "o_proj", rows(&b.proj, t))?;
-        self.residual_add_norm(t, Some(&l.post_norm))?;
-        self.record(li, "resid_attn", rows(&b.x, t))?;
+        self.record(li, "attn", at(&b.attn))?;
+        self.linear(at(&b.attn), l.wo.view(), at(&b.proj))
+    }
 
-        // FFN block.
-        self.record(li, "mlp_norm", rows(&b.h, t))?;
-        self.spec.ffn.forward(&run, &l.ffn)?;
-        self.all_reduce(&rows(&b.proj, t))?;
-        let next_norm = self.layers.get(i + 1).map(|next| &next.input_norm);
-        self.residual_add_norm(t, next_norm)?;
-        self.record(li, "resid_mlp", rows(&b.x, t))
+    /// The FFN block of layer `i` on the rows of `w`, from their normalised input in `h` to the
+    /// (not yet all-reduced) output in `proj`.
+    fn ffn_part(&self, i: usize, w: &Part<'_>) -> Result<(), ModelError> {
+        let run = self.layer_run(i, w);
+        self.spec.ffn.forward(&run, &self.layers[i].ffn)
+    }
+
+    fn layer_run<'s>(&'s self, i: usize, w: &Part<'_>) -> LayerRun<'s> {
+        LayerRun {
+            layer: i,
+            dims: &self.dims,
+            registry: &self.registry,
+            tokens: w.p.total_q,
+            row0: w.r0,
+            opts: self.opts,
+            ffn_buffers: &self.ffn_buffers,
+            exec: self,
+        }
+    }
+
+    /// Every layer with the batch split in two halves `parts` whose all-reduces run on the
+    /// collective side stream `side` while the compute stream works on the other half (P5 Task
+    /// 32, [`ModelExecutor::set_prefill_overlap`]). Per layer and half, in stream order: the
+    /// half's next-layer input norm (after its FFN all-reduce), its attention block, the O
+    /// all-reduce on the side stream; then per half the post-attention norm (after that
+    /// all-reduce), the FFN and its all-reduce on the side stream. Each op computes what the
+    /// serial [`DecoderExecutor::layer`] computes for the half's rows: the halves split at a
+    /// row, attention of the second half reads the first half's K/V appended earlier on the
+    /// same stream, and every all-reduce is element-wise.
+    fn layers_overlapped(
+        &self,
+        parts: &[Part<'_>; 2],
+        side: Option<&StreamRef>,
+        kv: &KvPoolView<'_>,
+    ) -> Result<(), ModelError> {
+        let tp = self
+            .tp
+            .as_ref()
+            .ok_or_else(|| invalid("prefill overlap without tensor parallelism".into()))?;
+        // Without a side stream every all-reduce runs in place on the compute stream.
+        let fences = side.and_then(|_| self.mem.mapped_collectives());
+        let b = &self.bufs;
+        // Enqueues the all-reduce of `part`'s `proj` rows on the side stream after the compute
+        // stream's work so far; returns the mark the compute stream waits on before reading it.
+        let reduce = |w: &Part<'_>| -> Result<u64, ModelError> {
+            let view = b.proj.view().rows(w.r0, w.p.total_q);
+            match (fences, side) {
+                (Some(f), Some(side)) => {
+                    f.side_after_compute()?;
+                    self.reduce_on(profile::TP_ALL_REDUCE, &tp.collective, side, &view)?;
+                    Ok(f.side_mark()?)
+                }
+                _ => {
+                    self.reduce_on(profile::TP_ALL_REDUCE, &tp.collective, &tp.stream, &view)?;
+                    Ok(0)
+                }
+            }
+        };
+        let fence = |mark: u64| -> Result<(), ModelError> {
+            match fences {
+                Some(f) => Ok(f.compute_after_mark(mark)?),
+                None => Ok(()),
+            }
+        };
+        let mut ffn_marks: [Option<u64>; 2] = [None, None];
+        for i in 0..self.layers.len() {
+            let mut attn_marks = [0u64; 2];
+            for (h, w) in parts.iter().enumerate() {
+                if let Some(mark) = ffn_marks[h] {
+                    fence(mark)?;
+                    self.residual_add_norm_at(w, Some(&self.layers[i].input_norm))?;
+                }
+                self.attention_part(i, w, kv)?;
+                attn_marks[h] = reduce(w)?;
+            }
+            for (h, w) in parts.iter().enumerate() {
+                fence(attn_marks[h])?;
+                self.residual_add_norm_at(w, Some(&self.layers[i].post_norm))?;
+                self.ffn_part(i, w)?;
+                ffn_marks[h] = Some(reduce(w)?);
+            }
+        }
+        for (h, w) in parts.iter().enumerate() {
+            if let Some(mark) = ffn_marks[h] {
+                fence(mark)?;
+                self.residual_add_norm_at(w, None)?;
+            }
+        }
+        Ok(())
     }
 
     /// Final RMSNorm of each sequence's last row into `last[0..n]`, destination row `p` holding
@@ -1504,6 +1731,7 @@ impl DecoderExecutor {
         kv: &KvPoolView<'_>,
         order: &[usize],
         runs: &[(usize, usize, usize)],
+        halves: Option<&[(usize, Packed); 2]>,
     ) -> Result<(), ModelError> {
         let b = &self.bufs;
         let (t, n) = (p.total_q, p.num_seqs);
@@ -1548,8 +1776,20 @@ impl DecoderExecutor {
         if let Some(first) = self.layers.first() {
             self.rmsnorm(rows(&b.x, t), &first.input_norm, rows(&b.h, t))?;
         }
-        for i in 0..self.layers.len() {
-            self.layer(i, p, kv)?;
+        match (halves, self.overlap.as_ref()) {
+            (Some(halves), Some(o)) => {
+                let parts = [0, 1].map(|h| Part {
+                    r0: halves[h].0,
+                    p: &halves[h].1,
+                    meta: &o.metas[h],
+                });
+                self.layers_overlapped(&parts, o.side.as_ref(), kv)?;
+            }
+            _ => {
+                for i in 0..self.layers.len() {
+                    self.layer(i, p, kv)?;
+                }
+            }
         }
         if let Some(pp) = self.pp.as_ref().filter(|s| !s.is_last()) {
             // The next stage continues from the residual stream (its input norm comes first).
@@ -1664,6 +1904,9 @@ impl ModelExecutor for DecoderExecutor {
         if self.emits_logits() {
             self.head.upload_inputs()?;
         }
+        // P5 Task 32: a large prefill of a tensor-parallel rank splits in two halves whose
+        // all-reduces overlap the other half's work.
+        let halves = self.split_prefill(batch, &p)?;
         let launch_started = Instant::now();
         if let Some(group) = self.group() {
             // Bounds the step's collectives until `collect` has synchronised the stream.
@@ -1672,9 +1915,9 @@ impl ModelExecutor for DecoderExecutor {
         let mut graphs = self.graphs.take();
         let enqueued = match graphs.as_mut() {
             Some(g) => g.run(key, PoolId::of(batch.kv), || {
-                self.enqueue(&p, batch.kv, &order, &runs)
+                self.enqueue(&p, batch.kv, &order, &runs, halves.as_ref())
             }),
-            None => self.enqueue(&p, batch.kv, &order, &runs),
+            None => self.enqueue(&p, batch.kv, &order, &runs, halves.as_ref()),
         };
         self.graphs = graphs;
         if let (Err(_), Some(group)) = (&enqueued, self.group()) {
@@ -1723,8 +1966,8 @@ impl ModelExecutor for DecoderExecutor {
         Ok(logits)
     }
 
-    /// Ignored (graphs stay off) for a tensor- or expert-parallel rank or a pipeline stage: its
-    /// collectives are not captured.
+    /// Ignored (graphs stay off) for an expert-parallel rank or a pipeline stage. A
+    /// tensor-parallel rank captures its collectives with the rest of the step (module docs).
     fn set_decode_graphs(&mut self, graphs: Option<DecodeGraphs>) {
         if self.pp.is_some() && graphs.is_some() {
             tracing::warn!(
@@ -1734,19 +1977,81 @@ impl ModelExecutor for DecoderExecutor {
             );
             return;
         }
-        if self.group().is_some() && graphs.is_some() {
+        if self.ep.is_some() && graphs.is_some() {
             tracing::info!(
                 event = "decode_graphs_off",
-                reason = if self.tp.is_some() {
-                    "tensor_parallel"
-                } else {
-                    "expert_parallel"
-                },
-                "decode graphs are not captured under tensor or expert parallelism"
+                reason = "expert_parallel",
+                "decode graphs are not captured under expert parallelism"
             );
             return;
         }
         self.graphs = graphs;
+    }
+
+    /// On for a tensor-parallel rank with plain attention and a dense FFN (no expert or
+    /// pipeline parallelism): large prefills split in two halves whose all-reduces run on the
+    /// collective side stream while the other half computes (P5 Task 32). Without a side stream
+    /// the halves run one after the other (same results). Returns whether it is on.
+    fn set_prefill_overlap(&mut self, min_tokens: Option<usize>) -> bool {
+        let Some(min_tokens) = min_tokens else {
+            self.overlap = None;
+            return false;
+        };
+        let eligible = self.tp.is_some()
+            && self.ep.is_none()
+            && self.pp.is_none()
+            && self.spec.attention.name() == "plain_attention"
+            && self.spec.ffn.name() == "swiglu";
+        if !eligible {
+            tracing::info!(
+                event = "prefill_overlap_off",
+                reason = "unsupported_layout",
+                "tensor-parallel prefill overlap needs plain attention and a dense FFN on a \
+                 tensor-parallel rank"
+            );
+            return false;
+        }
+        let side = self
+            .mem
+            .mapped_collectives()
+            .map(|m| m.side_stream())
+            .transpose()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    event = "prefill_overlap_serial",
+                    error = %e,
+                    "no collective side stream: the prefill halves run one after the other"
+                );
+                None
+            });
+        let alloc = || -> Result<[DeviceBatch; 2], ModelError> {
+            Ok([
+                DeviceBatch::alloc(&self.mem, &self.limits)?,
+                DeviceBatch::alloc(&self.mem, &self.limits)?,
+            ])
+        };
+        match alloc() {
+            Ok(metas) => {
+                tracing::info!(
+                    event = "prefill_overlap_on",
+                    side_stream = side.is_some(),
+                    min_tokens,
+                    "tensor-parallel prefill overlap on"
+                );
+                self.overlap = Some(PrefillOverlap {
+                    side,
+                    min_tokens,
+                    splits: 0,
+                    hosts: [HostBatch::default(), HostBatch::default()],
+                    metas,
+                });
+                true
+            }
+            Err(e) => {
+                tracing::warn!(event = "prefill_overlap_off", error = %e, "prefill overlap off");
+                false
+            }
+        }
     }
 
     fn graph_counters(&self) -> GraphCounters {

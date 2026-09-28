@@ -26,9 +26,11 @@
 //! Numerics against one device: the BF16 all-reduces round each rank's partial sum before
 //! adding them (one device rounds once, after an F32 accumulation over the whole reduction
 //! dimension), the sharded norm adds per-rank F32 partial sums of squares, and every GEMM runs
-//! at the rank's (narrower) shape. Not captured into decode graphs, and no overlapped launches
-//! (the collectives are not graph-capturable on the host backend, and a launch runs its
-//! collectives before it returns).
+//! at the rank's (narrower) shape. No overlapped launches (a launch enqueues its collectives
+//! before it returns). Decode graphs capture the collectives too when the server gives the rank
+//! graphs (`parallel.tp_decode_graphs`, P5 Task 32): the `hostmem` backend's steps then read
+//! their sequence numbers from a device counter (kernel ABI v2.8), so a replay is bitwise the
+//! eager step; the host backend cannot be captured (it has no graph backend either).
 
 use std::sync::Arc;
 

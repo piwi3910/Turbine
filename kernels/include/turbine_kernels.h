@@ -390,8 +390,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * adds pinned host memory and events; v2.4 implementation enumeration and the
  * card profile; v2.5 copy streams and asynchronous copies; v2.6 the native
  * stream handle and the sharded RMSNorm ops; v2.7 host-mapped memory and the
- * one-shot collectives over it (all below). */
-#define TURBINE_ABI_MINOR 7u
+ * one-shot collectives over it; v2.8 the device-sequenced (graph-capturable)
+ * mapped collective step (all below). */
+#define TURBINE_ABI_MINOR 8u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -481,7 +482,9 @@ const char *turbine_logits_reduce_impl(const turbine_logits_reduce_desc *d);
  * turbine_graph_launch enqueues it on the compute stream;
  * turbine_graph_destroy releases it. Between begin and end only op calls are
  * allowed: turbine_memcpy_*, turbine_stream_sync, turbine_malloc and
- * turbine_free return TURBINE_E_ARGUMENT while capturing. A failed capture
+ * turbine_free return TURBINE_E_ARGUMENT while capturing (from v2.8 except a
+ * TURBINE_COPY_D2D turbine_memcpy_async on the compute stream, s = NULL,
+ * which is captured as a copy node). A failed capture
  * leaves the context usable. A graph records the device pointers its ops were
  * captured with: the caller keeps those buffers alive and destroys the graph
  * before freeing them. */
@@ -797,6 +800,73 @@ int32_t
 turbine_mapped_collective_supported(const turbine_mapped_collective_desc *d);
 const char *
 turbine_mapped_collective_impl(const turbine_mapped_collective_desc *d);
+
+/* ======== v2.8 (additive, optional): device-sequenced mapped collective
+ * steps ========
+ * Tensor-parallel decode graphs (P5 Task 32): a step of
+ * turbine_mapped_collective bakes its seq into the kernel, so a captured
+ * graph would replay stale sequence numbers. Resolved only when
+ * turbine_abi_minor() >= 8 and the symbol exists.
+ *
+ * turbine_mapped_collective_dseq enqueues the step d describes exactly as
+ * turbine_mapped_collective does, except that its sequence number is read on
+ * the device: seq_counter is this context's device memory of two words
+ * (uint64 counter, then a uint32 completion count; both zero before the
+ * first step of the channel) and the step runs with seq = counter + 1, then
+ * stores seq back into the counter (the last of the step's blocks to start
+ * does, so the next step on the stream reads it). d->seq is ignored (must
+ * still be >= 1 for the descriptor to be valid). Every step of a channel
+ * must then go through this function, on every rank, in the same order; the
+ * result is bit for bit the one turbine_mapped_collective computes. It may
+ * be called while the compute stream is captured into a graph (v2.1): each
+ * replay advances the counter. From v2.8, turbine_mapped_collective itself
+ * returns TURBINE_E_ARGUMENT while the stream is captured (its seq would not
+ * advance on replay). */
+int32_t turbine_mapped_collective_dseq(turbine_ctx *ctx,
+                                       const turbine_mapped_collective_desc *d,
+                                       uint64_t *seq_counter);
+
+/* turbine_mapped_all_reduce_dma (v2.8, P5 Task 32) enqueues one ALL_REDUCE
+ * step d whose bytes the copy engines move instead of the step kernel (whose
+ * reads of mapped host memory are the bottleneck of large messages). The
+ * message is split into chunks of m->chunk_bytes (at most d->max_blocks of
+ * them); per chunk k: on m->copy (a v2.5 copy stream of ctx) a copy of
+ * send[k] into this rank's slot and then flag word rank * max_blocks + k set
+ * to the step's tag for k; on the compute stream a wait until every rank's
+ * (this rank's included) flag word k carries that tag, a copy of each peer's
+ * slot chunk into m->scratch (device memory of ctx, (world - 1) *
+ * chunk_bytes, peer q at part q < rank ? q : q - 1) and the reduction into
+ * recv[k] in rank order 0 .. world - 1, bit for bit
+ * turbine_mapped_collective's result. m->event (a v2.3 event of ctx) is
+ * recorded on the compute stream first and waited on by m->copy. The tag's
+ * sequence number is m->seq_counter's (as turbine_mapped_collective_dseq;
+ * the counter advances once per call); the slot parity is d->seq & 1, which
+ * the caller counts per call of this function (>= 1, equal on every rank):
+ * d->slots must be a region used only by these calls (2 * world slots of
+ * slot_bytes >= bytes rounded up to 16). Waits are bounded by timeout_ns and
+ * the abort word as for turbine_mapped_collective. Not while capturing. */
+typedef struct turbine_mapped_dma_desc {
+  turbine_stream *copy;
+  turbine_event *event;
+  void *scratch;
+  int64_t chunk_bytes;
+  uint64_t *seq_counter;
+  /* TURBINE_MAPPED_DMA_*: PEER_READ = the reduction reads each peer's chunk
+   * from its slot directly (d->slots must then be a region of
+   * turbine_host_alloc_mapped, so kernels may read it; scratch is unused)
+   * instead of copying it in first */
+  int32_t flags;
+} turbine_mapped_dma_desc;
+#define TURBINE_MAPPED_DMA_PEER_READ 1
+int32_t turbine_mapped_all_reduce_dma(turbine_ctx *ctx,
+                                      const turbine_mapped_collective_desc *d,
+                                      const turbine_mapped_dma_desc *m);
+/* turbine_host_alloc_dma returns bytes of page-locked host memory that the
+ * copy engines of every device of the process can read and write (portable,
+ * not mapped into kernels and not fine-grained, so copies run at the copy
+ * engines' rate): the slots of turbine_mapped_all_reduce_dma, addressed by
+ * this host pointer. Freed with turbine_host_free_mapped. */
+int32_t turbine_host_alloc_dma(turbine_ctx *ctx, size_t bytes, void **out);
 
 #ifdef __cplusplus
 }

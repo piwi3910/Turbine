@@ -252,6 +252,14 @@ pub fn load_collective(
                 plan.backend
             )
         })?;
+    // P5 Task 32: the hostmem copy-engine threshold, read when its library loads.
+    turbine_distributed::collective::hostmem::set_dma_min_bytes(
+        config
+            .parallel
+            .collective
+            .hostmem_dma_min_bytes
+            .map(|b| b.0),
+    );
     let library = backend
         .load(backend.configured_library(&config.parallel))
         .map_err(|e| format!("collective backend `{}`: {e}", plan.backend))?;

@@ -95,6 +95,12 @@ struct PinnedInner {
     next_ticket: u64,
     /// Events of tickets not yet seen complete.
     tickets: HashMap<u64, ShimEvent>,
+    /// The hostmem copy-engine all-reduce's own copy stream and fence event (ABI v2.8), apart
+    /// from the KV copy stream so tier copies never delay a collective.
+    collective: Option<(ShimStream, ShimEvent)>,
+    /// The ring of side-stream marks (tensor-parallel prefill overlap, P5 Task 32).
+    side_events: Vec<ShimEvent>,
+    side_next: u64,
 }
 
 /// The Phase 4 pinned-memory state of one `ShimContext`.
@@ -116,6 +122,8 @@ impl PinnedState {
         let mut s = self.lock();
         s.tickets.clear();
         s.stream = None;
+        s.side_events.clear();
+        s.collective = None;
     }
 }
 
@@ -233,7 +241,84 @@ impl ShimContext {
     fn check_code(&self, code: i32) -> Result<(), KernelError> {
         ffi::check(code, self.library().syms(), self.raw_ctx())
     }
+
+    /// The copy stream and event of the hostmem copy-engine all-reduce (ABI v2.8), created on
+    /// first use and owned by this context (destroyed with its other copy resources).
+    pub(crate) fn collective_copy_resources(
+        &self,
+    ) -> Result<(*mut TurbineStream, *mut TurbineEvent), MemoryError> {
+        let (staging, copies) = self.copy_fns()?;
+        let mut s = self.pinned_state().lock();
+        if let Some((stream, event)) = &s.collective {
+            return Ok((stream.raw, event.raw));
+        }
+        let mut raw: *mut TurbineStream = std::ptr::null_mut();
+        // SAFETY: `raw` is a live out-pointer; on success the stream belongs to this context
+        // and is owned by the `ShimStream` stored below, destroyed before the context.
+        let code = unsafe { (copies.stream_create)(self.raw_ctx(), &mut raw) };
+        self.check_code(code)?;
+        let stream = ShimStream {
+            raw,
+            ctx: self.raw_ctx(),
+            destroy: copies.stream_destroy,
+        };
+        let event = self.new_event(&staging)?;
+        let out = (stream.raw, event.raw);
+        s.collective = Some((stream, event));
+        Ok(out)
+    }
+
+    /// Makes work enqueued on the collective side stream ([`Self::collective_copy_resources`])
+    /// from now on wait for everything already enqueued on the compute stream.
+    pub(crate) fn side_after_compute(&self) -> Result<(), MemoryError> {
+        let (staging, copies) = self.copy_fns()?;
+        let (stream, _) = self.collective_copy_resources()?;
+        Ok(self.order_after_compute(&staging, &copies, stream)?)
+    }
+
+    /// Records an event after everything enqueued on the side stream so far and returns its
+    /// mark for [`Self::compute_after_mark`]. The events come from a ring of
+    /// [`SIDE_MARKS`]: a mark older than that waits for a later point of the side stream (safe,
+    /// only later).
+    pub(crate) fn side_mark(&self) -> Result<u64, MemoryError> {
+        let (staging, _) = self.copy_fns()?;
+        let (stream, _) = self.collective_copy_resources()?;
+        let mut s = self.pinned_state().lock();
+        if s.side_events.len() < SIDE_MARKS {
+            let e = self.new_event(&staging)?;
+            s.side_events.push(e);
+        }
+        let mark = s.side_next;
+        s.side_next += 1;
+        let slot = (mark % SIDE_MARKS as u64) as usize;
+        let slot = slot.min(s.side_events.len() - 1);
+        // SAFETY: the event and the stream are this context's live objects (owned by its
+        // pinned state until the context is destroyed).
+        let code =
+            unsafe { (staging.event_record)(self.raw_ctx(), s.side_events[slot].raw, stream) };
+        self.check_code(code)?;
+        Ok(mark)
+    }
+
+    /// Makes work enqueued on the compute stream from now on wait for the side stream's work up
+    /// to `mark` ([`Self::side_mark`]).
+    pub(crate) fn compute_after_mark(&self, mark: u64) -> Result<(), MemoryError> {
+        let (_, copies) = self.copy_fns()?;
+        let s = self.pinned_state().lock();
+        let slot = ((mark % SIDE_MARKS as u64) as usize).min(s.side_events.len().saturating_sub(1));
+        let Some(event) = s.side_events.get(slot) else {
+            return Err(MemoryError::InvalidArgument(format!("no side mark {mark}")));
+        };
+        // SAFETY: a null stream is the compute stream; the event is this context's and was
+        // recorded by `side_mark`.
+        let code =
+            unsafe { (copies.stream_wait_event)(self.raw_ctx(), std::ptr::null_mut(), event.raw) };
+        Ok(self.check_code(code)?)
+    }
 }
+
+/// Events in the side-stream mark ring ([`ShimContext::side_mark`]).
+const SIDE_MARKS: usize = 16;
 
 impl PinnedMemory for ShimContext {
     fn alloc_pinned(&self, bytes: usize) -> Result<PinnedBuffer, MemoryError> {

@@ -284,6 +284,8 @@ pub enum RouteReason {
     /// Above the threshold, but the delegate cannot run the call between these devices
     /// (point-to-point without a peer path): the backend's own path.
     NoPeerAccess,
+    /// At least the backend's copy-engine threshold: its copy-engine path (`hostmem`).
+    CopyEngine,
 }
 
 impl RouteReason {
@@ -293,6 +295,7 @@ impl RouteReason {
             RouteReason::AboveThreshold => "above_threshold",
             RouteReason::OpUnsupported => "op_unsupported",
             RouteReason::NoPeerAccess => "no_peer_access",
+            RouteReason::CopyEngine => "copy_engine",
         }
     }
 }

@@ -282,6 +282,8 @@ pub struct PreparedModel {
     pub executor_options: ExecutorOptions,
     /// `execution.decode_graphs`, and the provider can capture graphs.
     pub decode_graphs: bool,
+    /// `parallel.tp_prefill_overlap` on a tensor-parallel rank (P5 Task 32).
+    pub tp_prefill_overlap: bool,
     /// `execution.overlap_scheduling` (P2c): the engine launches each iteration before the host
     /// work of the previous one, when the executor can.
     pub overlap_scheduling: bool,
@@ -550,7 +552,10 @@ fn prepare_with(
         rank: s.spec.stage,
         world: s.stages,
     }));
-    let decode_graphs = if decode_graphs && position.is_some_and(|s| s.world > 1) {
+    // P5 Task 32: tensor-parallel ranks capture graphs when asked to (not expert parallelism,
+    // not pipeline stages).
+    let tp_graphs = config.parallel.tp_decode_graphs && expert.is_none() && stage.is_none();
+    let decode_graphs = if decode_graphs && position.is_some_and(|s| s.world > 1) && !tp_graphs {
         // Decode graphs cannot capture the collectives or the stage hand-off (P5): forced
         // off, not refused.
         if position.is_some_and(|s| s.rank == 0) {
@@ -688,6 +693,7 @@ fn prepare_with(
         scheduler,
         executor_options,
         decode_graphs,
+        tp_prefill_overlap: config.parallel.tp_prefill_overlap && tensor_parallel,
         overlap_scheduling: config.execution.overlap_scheduling && !tensor_parallel,
         grammar,
         structured_output: config.structured_output.clone(),
@@ -903,6 +909,28 @@ pub struct LoadedModel {
     pub group: Vec<(DeviceBudget, Arc<Ledger>)>,
 }
 
+/// Gives `executor` decode graphs on the prepared provider's graph backend when
+/// `prepared.decode_graphs` (also each tensor-parallel rank's, P5 Task 32).
+pub(crate) fn install_decode_graphs(prepared: &PreparedModel, executor: &mut dyn ModelExecutor) {
+    if let Some(ctx) = prepared
+        .provider
+        .opened
+        .graphs
+        .as_ref()
+        .filter(|_| prepared.decode_graphs)
+    {
+        let backend: Arc<dyn GraphBackend<Graph = _>> = Arc::<ShimContext>::clone(ctx);
+        let capacity = graphs::capacity_for(prepared.scheduler.max_running_requests);
+        executor.set_decode_graphs(Some(DecodeGraphs::new(backend, capacity)));
+        tracing::info!(event = "decode_graphs", capacity, "decode graphs on");
+    }
+    if prepared.tp_prefill_overlap {
+        executor.set_prefill_overlap(Some(
+            turbine_model::executor::decoder::PREFILL_OVERLAP_MIN_TOKENS,
+        ));
+    }
+}
+
 /// Steps 8–10: upload the weights; re-measure the memory budget (P3 S-2: dedicated memory
 /// free now plus the weights Turbine holds, or unified `MemAvailable`); open the reservation
 /// ledger with the weights and the executor workspace committed; build the executor for
@@ -934,18 +962,7 @@ pub fn load(
         prepared.executor_options,
     )
     .map_err(|e| model_error("executor", e))?;
-    if let Some(ctx) = prepared
-        .provider
-        .opened
-        .graphs
-        .as_ref()
-        .filter(|_| prepared.decode_graphs)
-    {
-        let backend: Arc<dyn GraphBackend<Graph = _>> = Arc::<ShimContext>::clone(ctx);
-        let capacity = graphs::capacity_for(prepared.scheduler.max_running_requests);
-        executor.set_decode_graphs(Some(DecodeGraphs::new(backend, capacity)));
-        tracing::info!(event = "decode_graphs", capacity, "decode graphs on");
-    }
+    install_decode_graphs(prepared, executor.as_mut());
     let blocks = pool_blocks(prepared, &budget)?;
     let mut pool = allocate_pool(prepared, blocks, &ledger)?;
     let reserve = acquire_reserve(prepared, &ledger, reliability)?;

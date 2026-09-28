@@ -8,8 +8,9 @@
 //! (also the v2.4 implementation group, `-DTURBINE_STUB_V24`; minor 4),
 //! `TURBINE_STUB_GFX942_V25` (also the v2.5 copy streams, `-DTURBINE_STUB_V25`; minor 5),
 //! `TURBINE_STUB_GFX942_V26` (also the v2.6 native stream handles and sharded RMSNorm trios,
-//! `-DTURBINE_STUB_V26`; minor 6) and `TURBINE_STUB_GFX942_V27` (also the v2.7 host-mapped
-//! memory and collectives, `-DTURBINE_STUB_V27`; minor 7).
+//! `-DTURBINE_STUB_V26`; minor 6), `TURBINE_STUB_GFX942_V27` (also the v2.7 host-mapped
+//! memory and collectives, `-DTURBINE_STUB_V27`; minor 7) and `TURBINE_STUB_GFX942_V28` (also
+//! the v2.8 device-sequenced collective step, `-DTURBINE_STUB_V28`; minor 8).
 use std::path::{Path, PathBuf};
 
 fn build_stub(
@@ -102,7 +103,26 @@ fn main() {
             "TURBINE_STUB_V27",
         ],
     );
+    let gfx942_v28 = build_stub(
+        &out_dir,
+        "turbine_stub_gfx942_v28",
+        2,
+        "hip",
+        "gfx942",
+        &[
+            "TURBINE_STUB_V21",
+            "TURBINE_STUB_V24",
+            "TURBINE_STUB_V25",
+            "TURBINE_STUB_V26",
+            "TURBINE_STUB_V27",
+            "TURBINE_STUB_V28",
+        ],
+    );
     println!("cargo:rustc-env=TURBINE_STUB_ABI999={}", abi999.display());
+    println!(
+        "cargo:rustc-env=TURBINE_STUB_GFX942_V28={}",
+        gfx942_v28.display()
+    );
     println!(
         "cargo:rustc-env=TURBINE_STUB_GFX942_V27={}",
         gfx942_v27.display()

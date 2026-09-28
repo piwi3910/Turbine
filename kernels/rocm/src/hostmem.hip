@@ -26,6 +26,14 @@
 // during its own step seq - 1, which runs after the peer's step seq - 2 (the
 // last reader of that slot) has completed on its stream.
 //
+// Device-sequenced steps (v2.8, turbine_mapped_collective_dseq): instead of
+// the seq baked into the launch, thread 0 of every block reads the channel's
+// device counter (seq = counter + 1) and counts its block in the completion
+// word; the last block to arrive (acq_rel chain on that word) resets it and
+// stores seq into the counter. Every block's read happens before that store,
+// and the next step on the stream starts after this one completes, so a
+// captured graph advances the sequence on every replay.
+//
 // Every wait is bounded: thread 0 checks abort_word and the device wall clock
 // every 16 polls; past the deadline it stores the timeout reason into
 // abort_word (a plain system-scope store: no PCIe atomics are needed) and the
@@ -70,6 +78,9 @@ struct Args {
   uint64_t *flags;
   uint32_t *abort_word;
   uint64_t seq;
+  // v2.8: device counter (uint64) followed by the completion count (uint32);
+  // null for a host-sequenced step.
+  uint64_t *seq_counter;
   uint64_t timeout_ticks;
   int32_t kind, rank, world, root, max_blocks;
 };
@@ -356,9 +367,35 @@ __device__ void consume_step(const Args &a, int64_t r0, int64_t n) {
   }
 }
 
+// v2.8: the step's seq from the device counter (see the header comment);
+// every block of the step must call this first, before any early return.
+__device__ uint64_t device_seq(const Args &a) {
+  __shared__ uint64_t s_seq;
+  if (threadIdx.x == 0) {
+    uint32_t *done = reinterpret_cast<uint32_t *>(a.seq_counter + 1);
+    const uint64_t seq = __hip_atomic_load(a.seq_counter, __ATOMIC_RELAXED,
+                                           __HIP_MEMORY_SCOPE_AGENT) +
+                         1;
+    s_seq = seq;
+    const uint32_t before = __hip_atomic_fetch_add(
+        done, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+    if (before + 1 == gridDim.x) {
+      __hip_atomic_store(done, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(a.seq_counter, seq, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
+  __syncthreads();
+  return s_seq;
+}
+
 template <typename T, int OP, bool VEC>
-__global__ __launch_bounds__(kThreads) void mapped_collective_kernel(Args a) {
+__global__ __launch_bounds__(kThreads) void mapped_collective_kernel(Args a0) {
   __shared__ int s_stop;
+  Args a = a0;
+  if (a.seq_counter != nullptr) {
+    a.seq = device_seq(a);
+  }
   const int64_t start = static_cast<int64_t>(blockIdx.x) * a.per_block;
   const int64_t end = lmin(start + a.per_block, a.bytes);
   if (start >= end) {
@@ -430,6 +467,8 @@ int64_t elem_bytes(const turbine_mapped_collective_desc *d) {
 }
 
 int64_t round16(int64_t v) { return (v + 15) / 16 * 16; }
+
+int64_t lmin_host(int64_t a, int64_t b) { return a < b ? a : b; }
 
 // Blocks and bytes per block of a step: equal on every rank for equal bytes
 // and max_blocks.
@@ -505,6 +544,141 @@ bool aligned(const void *p, int64_t a) {
   return reinterpret_cast<uintptr_t>(p) % static_cast<uintptr_t>(a) == 0;
 }
 
+// ---- v2.8 copy-engine all-reduce (turbine_mapped_all_reduce_dma) ----
+//
+// For messages where the one-shot kernels are bound by their ~6.3 GB/s reads
+// of mapped host memory, the copy engines move the bytes instead (~12.5-13
+// GB/s per direction on novanas). Per chunk k of the message (seq from the
+// device counter, as the dseq steps):
+//   copy stream:    D2H send[k] -> own slot[k]; publish tag(seq, k) in flag
+//                   word rank * max_blocks + k (a one-thread kernel, after
+//                   the copy completed);
+//   compute stream: wait until every rank's (own included) flag word k
+//                   reaches tag(seq, k); H2D each peer's slot[k] -> scratch;
+//                   reduce recv[k] = combination of every rank's chunk in
+//                   rank order 0 .. world - 1 (F32, one rounding for BF16:
+//                   the bits of the one-shot kernel and of the host
+//                   reference); after the last chunk, counter += 1.
+// The copy stream first waits for the compute stream's work before the call
+// (an event), so send is final. Waiting for the own flag orders the reduce
+// after the own chunk left the device (recv may equal send). The chunks of
+// the D2H and the H2D directions overlap. The slot parity is the caller's
+// DMA call count (d->seq & 1), equal on every rank, since the device counter
+// cannot address a host-side copy; see the header for the reuse argument.
+
+__global__ void dma_publish_kernel(const uint64_t *counter, uint64_t *flag,
+                                   int64_t k) {
+  if (threadIdx.x == 0) {
+    const uint64_t seq =
+        __hip_atomic_load(counter, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
+        1;
+    __threadfence_system();
+    __hip_atomic_store(flag, tag(seq, k), __ATOMIC_RELEASE,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
+
+struct DmaWait {
+  const uint64_t *counter;
+  uint64_t *flags;
+  uint32_t *abort_word;
+  uint64_t timeout_ticks;
+  int32_t world, rank, max_blocks;
+};
+
+// Thread 0 waits until every rank's flag word k reaches tag(seq, k); bounded
+// like wait_peers (a timeout stores its reason into abort_word).
+__global__ void dma_wait_kernel(DmaWait w, int64_t k) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+  const uint64_t want =
+      tag(__hip_atomic_load(w.counter, __ATOMIC_RELAXED,
+                            __HIP_MEMORY_SCOPE_AGENT) +
+              1,
+          k);
+  if (load_abort(w.abort_word) != 0) {
+    return;
+  }
+  const uint64_t deadline =
+      static_cast<uint64_t>(wall_clock64()) + w.timeout_ticks;
+  for (int q = 0; q < w.world; ++q) {
+    uint64_t *f = w.flags + q * w.max_blocks + k;
+    uint32_t polls = 0;
+    while (load_flag(f) < want) {
+      if ((++polls & 15u) == 0) {
+        if (load_abort(w.abort_word) != 0) {
+          return;
+        }
+        if (static_cast<uint64_t>(wall_clock64()) > deadline) {
+          if (load_abort(w.abort_word) == 0) {
+            __hip_atomic_store(
+                w.abort_word,
+                (TURBINE_MAPPED_ABORT_TIMEOUT << 24) |
+                    (static_cast<uint32_t>(TURBINE_MAPPED_ALL_REDUCE) << 16) |
+                    static_cast<uint32_t>(w.rank),
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+          return;
+        }
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+  // Later readers of the peers' chunks are copies ordered after this kernel.
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+}
+
+struct DmaReduce {
+  uint8_t *out;
+  const uint8_t *own;
+  const uint8_t *scratch;
+  int64_t scratch_stride, n, per_block;
+  uint32_t *abort_word;
+  int32_t world, rank;
+  // Peer q's part is scratch part q (its slot) instead of q < rank ? q : q - 1.
+  bool direct;
+};
+
+// out[0, n) = combination of the ranks' chunks in rank order (own: `own`,
+// peer q: scratch part q < rank ? q : q - 1); blocks split n.
+template <typename T, int OP, bool VEC>
+__global__ __launch_bounds__(kThreads) void dma_reduce_kernel(DmaReduce r) {
+  if (load_abort(r.abort_word) != 0) {
+    return;
+  }
+  const int64_t start = static_cast<int64_t>(blockIdx.x) * r.per_block;
+  const int64_t end = lmin(start + r.per_block, r.n);
+  if (start >= end) {
+    return;
+  }
+  const uint8_t *srcs[TURBINE_MAPPED_MAX_WORLD];
+  for (int q = 0; q < r.world; ++q) {
+    const int part = r.direct ? q : (q < r.rank ? q : q - 1);
+    srcs[q] =
+        (q == r.rank ? r.own : r.scratch + part * r.scratch_stride) + start;
+  }
+  reduce_bytes<T, OP, VEC>(r.out + start, srcs, r.world, end - start);
+}
+
+__global__ void dma_advance_kernel(uint64_t *counter) {
+  if (threadIdx.x == 0) {
+    *counter += 1;
+  }
+}
+
+template <typename T, int OP>
+void launch_dma_reduce(hipStream_t s, const DmaReduce &r, bool vec,
+                       unsigned blocks) {
+  if (vec) {
+    hipLaunchKernelGGL((dma_reduce_kernel<T, OP, true>), dim3(blocks),
+                       dim3(kThreads), 0, s, r);
+  } else {
+    hipLaunchKernelGGL((dma_reduce_kernel<T, OP, false>), dim3(blocks),
+                       dim3(kThreads), 0, s, r);
+  }
+}
+
 } // namespace
 
 extern "C" {
@@ -534,6 +708,29 @@ int32_t turbine_host_alloc_mapped(turbine_ctx *ctx, size_t bytes, void **out) {
       rc != TURBINE_OK)
     return rc;
   std::memset(p, 0, n);
+  *out = p;
+  return TURBINE_OK;
+}
+
+int32_t turbine_host_alloc_dma(turbine_ctx *ctx, size_t bytes, void **out) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (ctx->capturing)
+    return refuse_while_capturing(ctx, "turbine_host_alloc_dma");
+  if (out == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_host_alloc_dma: out is NULL");
+  }
+  *out = nullptr;
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  const size_t n = bytes == 0 ? 1 : bytes;
+  const std::string what =
+      "hipHostMalloc(portable) " + std::to_string(n) + " bytes";
+  void *p = nullptr;
+  if (int32_t rc = check_hip(ctx, hipHostMalloc(&p, n, hipHostMallocPortable),
+                             what.c_str());
+      rc != TURBINE_OK)
+    return rc;
   *out = p;
   return TURBINE_OK;
 }
@@ -576,10 +773,43 @@ turbine_mapped_collective_impl(const turbine_mapped_collective_desc *d) {
   return kImpl;
 }
 
-int32_t turbine_mapped_collective(turbine_ctx *ctx,
-                                  const turbine_mapped_collective_desc *d) {
-  if (ctx == nullptr)
-    return TURBINE_E_ARGUMENT;
+} // extern "C"
+
+namespace {
+
+// The device's wall clock rate (kHz), read once per context.
+int32_t ensure_wall_clock(turbine_ctx *ctx) {
+  if (ctx->wall_clock_khz <= 0) {
+    int khz = 0;
+    if (int32_t rc =
+            check_hip(ctx,
+                      hipDeviceGetAttribute(
+                          &khz, hipDeviceAttributeWallClockRate, ctx->device),
+                      "hipDeviceGetAttribute(hipDeviceAttributeWallClockRate)");
+        rc != TURBINE_OK)
+      return rc;
+    if (khz <= 0) {
+      return fail(ctx, TURBINE_E_DEVICE,
+                  "turbine_mapped_collective: the device reports no wall "
+                  "clock rate");
+    }
+    ctx->wall_clock_khz = khz;
+  }
+  return TURBINE_OK;
+}
+
+// Ticks of the device wall clock in timeout_ns (rounded up), saturating.
+uint64_t timeout_ticks(const turbine_ctx *ctx, int64_t timeout_ns) {
+  // ns * kHz / 1e6, without overflow for any timeout below ~290 years.
+  const double ticks = static_cast<double>(timeout_ns) *
+                       static_cast<double>(ctx->wall_clock_khz) / 1e6;
+  return ticks >= 1.8e19 ? UINT64_MAX : static_cast<uint64_t>(ticks) + 1;
+}
+
+// Both entry points: validates d and enqueues its step; seq_counter null =
+// host-sequenced (d->seq).
+int32_t enqueue_step(turbine_ctx *ctx, const turbine_mapped_collective_desc *d,
+                     uint64_t *seq_counter) {
   if (const std::string why = refusal(d); !why.empty()) {
     return fail(ctx, d == nullptr ? TURBINE_E_ARGUMENT : TURBINE_E_UNSUPPORTED,
                 "turbine_mapped_collective: " + why);
@@ -600,22 +830,8 @@ int32_t turbine_mapped_collective(turbine_ctx *ctx,
   }
   if (int32_t rc = enter(ctx); rc != TURBINE_OK)
     return rc;
-  if (ctx->wall_clock_khz <= 0) {
-    int khz = 0;
-    if (int32_t rc =
-            check_hip(ctx,
-                      hipDeviceGetAttribute(
-                          &khz, hipDeviceAttributeWallClockRate, ctx->device),
-                      "hipDeviceGetAttribute(hipDeviceAttributeWallClockRate)");
-        rc != TURBINE_OK)
-      return rc;
-    if (khz <= 0) {
-      return fail(ctx, TURBINE_E_DEVICE,
-                  "turbine_mapped_collective: the device reports no wall "
-                  "clock rate");
-    }
-    ctx->wall_clock_khz = khz;
-  }
+  if (int32_t rc = ensure_wall_clock(ctx); rc != TURBINE_OK)
+    return rc;
   Args a{};
   a.send = static_cast<const uint8_t *>(d->send);
   a.recv = static_cast<uint8_t *>(d->recv);
@@ -628,11 +844,8 @@ int32_t turbine_mapped_collective(turbine_ctx *ctx,
   a.flags = d->flags;
   a.abort_word = d->abort_word;
   a.seq = d->seq;
-  // ns * kHz / 1e6, without overflow for any timeout below ~290 years.
-  const double ticks = static_cast<double>(d->timeout_ns) *
-                       static_cast<double>(ctx->wall_clock_khz) / 1e6;
-  a.timeout_ticks =
-      ticks >= 1.8e19 ? UINT64_MAX : static_cast<uint64_t>(ticks) + 1;
+  a.seq_counter = seq_counter;
+  a.timeout_ticks = timeout_ticks(ctx, d->timeout_ns);
   a.kind = d->kind;
   a.rank = d->rank;
   a.world = d->world;
@@ -657,6 +870,185 @@ int32_t turbine_mapped_collective(turbine_ctx *ctx,
       launch_typed<float, TURBINE_REDUCE_MAX>(s, a, vec, blocks);
   }
   return check_hip(ctx, hipGetLastError(), "mapped_collective kernel launch");
+}
+
+
+// v2.8: the copy-engine all-reduce (header; the kernels' comment above).
+int32_t enqueue_dma(turbine_ctx *ctx, const turbine_mapped_collective_desc *d,
+                    const turbine_mapped_dma_desc *m) {
+  const char *what = "turbine_mapped_all_reduce_dma";
+  if (const std::string why = refusal(d); !why.empty()) {
+    return fail(ctx, d == nullptr ? TURBINE_E_ARGUMENT : TURBINE_E_UNSUPPORTED,
+                std::string(what) + ": " + why);
+  }
+  if (d->kind != TURBINE_MAPPED_ALL_REDUCE) {
+    return fail(ctx, TURBINE_E_UNSUPPORTED,
+                std::string(what) + ": only ALL_REDUCE");
+  }
+  if (m == nullptr || m->copy == nullptr || m->event == nullptr ||
+      m->seq_counter == nullptr || !aligned(m->seq_counter, 8) ||
+      m->chunk_bytes <= 0 || m->chunk_bytes % 16 != 0 ||
+      (m->flags & ~TURBINE_MAPPED_DMA_PEER_READ) != 0 ||
+      (d->world > 1 && m->scratch == nullptr &&
+       (m->flags & TURBINE_MAPPED_DMA_PEER_READ) == 0)) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                std::string(what) + ": invalid DMA descriptor");
+  }
+  if (d->bytes == 0) {
+    return TURBINE_OK;
+  }
+  const int64_t chunks = (d->bytes + m->chunk_bytes - 1) / m->chunk_bytes;
+  if (chunks > d->max_blocks) {
+    return fail(ctx, TURBINE_E_UNSUPPORTED,
+                std::string(what) + ": " + std::to_string(chunks) +
+                    " chunks exceed max_blocks " +
+                    std::to_string(d->max_blocks));
+  }
+  const int64_t e = elem_bytes(d);
+  if (d->send == nullptr || d->recv == nullptr || d->slots == nullptr ||
+      d->flags == nullptr || d->abort_word == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, std::string(what) + ": NULL operand");
+  }
+  if (!aligned(d->send, e) || !aligned(d->recv, e) || !aligned(d->slots, 16) ||
+      !aligned(d->flags, 8) || !aligned(d->abort_word, 4) ||
+      (m->scratch != nullptr && !aligned(m->scratch, 16))) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                std::string(what) + ": misaligned operand");
+  }
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  if (int32_t rc = ensure_wall_clock(ctx); rc != TURBINE_OK)
+    return rc;
+  hipStream_t cs = ctx->stream;
+  hipStream_t xs = reinterpret_cast<hipStream_t>(m->copy);
+  hipEvent_t ev = reinterpret_cast<hipEvent_t>(m->event);
+  if (int32_t rc = check_hip(ctx, hipEventRecord(ev, cs), "hipEventRecord");
+      rc != TURBINE_OK)
+    return rc;
+  if (int32_t rc =
+          check_hip(ctx, hipStreamWaitEvent(xs, ev, 0), "hipStreamWaitEvent");
+      rc != TURBINE_OK)
+    return rc;
+  const auto *send = static_cast<const uint8_t *>(d->send);
+  auto *recv = static_cast<uint8_t *>(d->recv);
+  auto *slots = static_cast<uint8_t *>(d->slots);
+  auto *scratch = static_cast<uint8_t *>(m->scratch);
+  const int64_t parity = static_cast<int64_t>(d->seq & 1);
+  auto slot = [&](int q) {
+    return slots + (parity * d->world + q) * d->slot_bytes;
+  };
+  auto chunk_len = [&](int64_t k) {
+    return lmin_host(m->chunk_bytes, d->bytes - k * m->chunk_bytes);
+  };
+  // Copy engine: every chunk out, each followed by its flag.
+  for (int64_t k = 0; k < chunks; ++k) {
+    const int64_t off = k * m->chunk_bytes;
+    if (int32_t rc = check_hip(ctx,
+                               hipMemcpyAsync(slot(d->rank) + off, send + off,
+                                              static_cast<size_t>(chunk_len(k)),
+                                              hipMemcpyDefault, xs),
+                               "hipMemcpyAsync (chunk out)");
+        rc != TURBINE_OK)
+      return rc;
+    hipLaunchKernelGGL(dma_publish_kernel, dim3(1), dim3(64), 0, xs,
+                       m->seq_counter, d->flags + d->rank * d->max_blocks + k,
+                       k);
+  }
+  DmaWait w{};
+  w.counter = m->seq_counter;
+  w.flags = d->flags;
+  w.abort_word = d->abort_word;
+  w.timeout_ticks = timeout_ticks(ctx, d->timeout_ns);
+  w.world = d->world;
+  w.rank = d->rank;
+  w.max_blocks = d->max_blocks;
+  const bool direct = (m->flags & TURBINE_MAPPED_DMA_PEER_READ) != 0;
+  for (int64_t k = 0; k < chunks; ++k) {
+    const int64_t off = k * m->chunk_bytes;
+    const int64_t n = chunk_len(k);
+    hipLaunchKernelGGL(dma_wait_kernel, dim3(1), dim3(64), 0, cs, w, k);
+    for (int q = 0; q < d->world; ++q) {
+      if (q == d->rank || direct)
+        continue;
+      uint8_t *dst = scratch + (q < d->rank ? q : q - 1) * m->chunk_bytes;
+      if (int32_t rc =
+              check_hip(ctx,
+                        hipMemcpyAsync(dst, slot(q) + off,
+                                       static_cast<size_t>(n),
+                                       hipMemcpyDefault, cs),
+                        "hipMemcpyAsync (chunk in)");
+          rc != TURBINE_OK)
+        return rc;
+    }
+    DmaReduce r{};
+    r.out = recv + off;
+    r.own = send + off;
+    r.scratch = direct ? slot(0) + off : scratch;
+    r.scratch_stride = direct ? d->slot_bytes : m->chunk_bytes;
+    r.direct = direct;
+    r.n = n;
+    r.abort_word = d->abort_word;
+    r.world = d->world;
+    r.rank = d->rank;
+    const int64_t want = (n + kBlockMinBytes - 1) / kBlockMinBytes;
+    const int64_t nb = want < 1 ? 1 : (want > 256 ? 256 : want);
+    r.per_block = round16((n + nb - 1) / nb);
+    const unsigned blocks = static_cast<unsigned>(nb);
+    const bool vec = aligned(r.out, 16) && aligned(r.own, 16);
+    if (d->dtype == TURBINE_DTYPE_BF16) {
+      if (d->reduce_op == TURBINE_REDUCE_SUM)
+        launch_dma_reduce<turbine_hip::Bf16, TURBINE_REDUCE_SUM>(cs, r, vec,
+                                                                 blocks);
+      else
+        launch_dma_reduce<turbine_hip::Bf16, TURBINE_REDUCE_MAX>(cs, r, vec,
+                                                                 blocks);
+    } else {
+      if (d->reduce_op == TURBINE_REDUCE_SUM)
+        launch_dma_reduce<float, TURBINE_REDUCE_SUM>(cs, r, vec, blocks);
+      else
+        launch_dma_reduce<float, TURBINE_REDUCE_MAX>(cs, r, vec, blocks);
+    }
+  }
+  hipLaunchKernelGGL(dma_advance_kernel, dim3(1), dim3(1), 0, cs,
+                     m->seq_counter);
+  return check_hip(ctx, hipGetLastError(), "mapped DMA all-reduce launch");
+}
+
+} // namespace
+
+extern "C" {
+
+int32_t turbine_mapped_collective(turbine_ctx *ctx,
+                                  const turbine_mapped_collective_desc *d) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  // A captured step would replay its baked seq: v2.8 steps only (header).
+  if (ctx->capturing)
+    return refuse_while_capturing(ctx, "turbine_mapped_collective");
+  return enqueue_step(ctx, d, nullptr);
+}
+
+int32_t turbine_mapped_collective_dseq(turbine_ctx *ctx,
+                                       const turbine_mapped_collective_desc *d,
+                                       uint64_t *seq_counter) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (seq_counter == nullptr || !aligned(seq_counter, 8)) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_mapped_collective_dseq: seq_counter NULL or "
+                "misaligned");
+  }
+  return enqueue_step(ctx, d, seq_counter);
+}
+
+int32_t turbine_mapped_all_reduce_dma(turbine_ctx *ctx,
+                                      const turbine_mapped_collective_desc *d,
+                                      const turbine_mapped_dma_desc *m) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (ctx->capturing)
+    return refuse_while_capturing(ctx, "turbine_mapped_all_reduce_dma");
+  return enqueue_dma(ctx, d, m);
 }
 
 } // extern "C"
