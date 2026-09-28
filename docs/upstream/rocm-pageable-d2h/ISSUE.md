@@ -73,3 +73,6 @@ higher: 20 of 240 reads, always the destination's last partial page, exactly `(e
 
 Copy through pinned (page-locked, `hipHostMalloc`) staging buffers owned by each thread and
 memcpy on the host; no wrong read was seen through pinned memory in any variant.
+In our two-GPU application runs (221,000 collective outputs read back and compared in a stress
+test, and about 657,000 collective results cross-checked between the GPUs during data-, tensor-,
+expert- and pipeline-parallel serving), copying through pinned staging gave no wrong reads.
