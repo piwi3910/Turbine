@@ -12,6 +12,7 @@ pub mod ffi;
 pub mod host;
 pub mod hostmem;
 pub mod nccl_api;
+pub mod verify;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -253,6 +254,8 @@ pub enum CollectiveErrorKind {
     Timeout,
     RemoteAbort,
     Backend,
+    /// `parallel.collective.verify` found ranks holding different outputs of one collective.
+    Corrupt,
 }
 
 impl CollectiveErrorKind {
@@ -261,6 +264,7 @@ impl CollectiveErrorKind {
             CollectiveErrorKind::Timeout => "timeout",
             CollectiveErrorKind::RemoteAbort => "remote_abort",
             CollectiveErrorKind::Backend => "backend",
+            CollectiveErrorKind::Corrupt => "corrupt",
         }
     }
 }
@@ -286,6 +290,10 @@ pub enum RouteReason {
     NoPeerAccess,
     /// At least the backend's copy-engine threshold: its copy-engine path (`hostmem`).
     CopyEngine,
+    /// The caller's stream on a GPU context has no native handle (a kernel library without
+    /// ABI v2.6): an NCCL-API call would run on the legacy default stream, unordered with the
+    /// context's non-blocking compute stream, so it is refused (`Unavailable`).
+    NoNativeStream,
 }
 
 impl RouteReason {
@@ -296,6 +304,7 @@ impl RouteReason {
             RouteReason::OpUnsupported => "op_unsupported",
             RouteReason::NoPeerAccess => "no_peer_access",
             RouteReason::CopyEngine => "copy_engine",
+            RouteReason::NoNativeStream => "no_native_stream",
         }
     }
 }

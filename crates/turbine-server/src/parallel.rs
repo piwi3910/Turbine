@@ -277,6 +277,18 @@ pub fn load_collective(
     let library = backend
         .load(backend.configured_library(&config.parallel))
         .map_err(|e| format!("collective backend `{}`: {e}", plan.backend))?;
+    // P5 Task 32: parallel.collective.verify checks every rank-identical output across ranks.
+    let library = if config.parallel.collective.verify {
+        tracing::warn!(
+            event = "collective_verify_on",
+            backend = library.backend(),
+            "parallel.collective.verify: every all-reduce, all-gather and broadcast is \
+             synchronized, read back and compared across ranks (diagnosis mode, slow)"
+        );
+        turbine_distributed::collective::verify::VerifyingLibrary::wrap(library)
+    } else {
+        library
+    };
     tracing::info!(
         event = "collective_backend_loaded",
         backend = library.backend(),

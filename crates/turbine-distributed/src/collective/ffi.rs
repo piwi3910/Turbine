@@ -888,6 +888,38 @@ impl NcclCollective {
         *lock(&self.shared.armed) = None;
     }
 
+    /// `Err` (nothing enqueued) when `stream` belongs to a GPU context but has no native handle:
+    /// the call would run on the legacy default stream ([`super::RouteReason::NoNativeStream`]).
+    fn native_stream_ok(
+        &self,
+        op: CollectiveOp,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        if stream.native_handle() != 0 || stream.memory().as_host().is_some() {
+            return Ok(());
+        }
+        let reason = super::RouteReason::NoNativeStream;
+        if let Some(m) = &self.shared.metrics {
+            m.route(op, self.shared.api.backend_name(), reason);
+        }
+        tracing::warn!(
+            event = "collective_refused",
+            op = op.as_str(),
+            backend = self.shared.api.backend_name(),
+            reason = reason.as_str(),
+            "the stream has no native handle (kernel library without ABI v2.6): the call would \
+             run unordered with the compute stream"
+        );
+        Err(CollectiveError::Unavailable {
+            library: self.shared.api.backend_name().into(),
+            detail: format!(
+                "{}: {} on a stream without a native handle",
+                reason.as_str(),
+                op.as_str()
+            ),
+        })
+    }
+
     /// Issues one non-blocking call under the op watchdog and waits for it to be enqueued.
     fn issue(
         &self,
@@ -1000,6 +1032,7 @@ impl Collective for NcclCollective {
     ) -> Result<(), CollectiveError> {
         let (dt, count) = reduce_type(dtype, buf.len())?;
         let (ptr, s, redop) = (device_ptr(buf), native_stream(stream), reduce_op(op));
+        self.native_stream_ok(CollectiveOp::AllReduce, stream)?;
         let f = self.shared.api.fns.all_reduce;
         self.run(CollectiveOp::AllReduce, buf.len(), |comm| {
             // SAFETY: `f` comes from the library the NcclApi keeps loaded; `comm` is live under
@@ -1021,6 +1054,7 @@ impl Collective for NcclCollective {
             return Err(CollectiveError::ShapeMismatch);
         }
         let (src, dst, s) = (device_ptr(send), device_ptr(recv), native_stream(stream));
+        self.native_stream_ok(CollectiveOp::AllGather, stream)?;
         let f = self.shared.api.fns.all_gather;
         self.run(CollectiveOp::AllGather, count, |comm| {
             // SAFETY: as in all_reduce; `src` holds `count` bytes and `dst` (borrowed mutably)
@@ -1047,6 +1081,7 @@ impl Collective for NcclCollective {
             native_stream(stream),
             reduce_op(op),
         );
+        self.native_stream_ok(CollectiveOp::ReduceScatter, stream)?;
         let f = self.shared.api.fns.reduce_scatter;
         self.run(CollectiveOp::ReduceScatter, send.len(), |comm| {
             // SAFETY: as in all_reduce; `src` holds world × `count` elements and `dst`
@@ -1068,6 +1103,7 @@ impl Collective for NcclCollective {
             return Err(CollectiveError::ShapeMismatch);
         }
         let (ptr, count, s) = (device_ptr(buf), buf.len(), native_stream(stream));
+        self.native_stream_ok(CollectiveOp::Broadcast, stream)?;
         let f = self.shared.api.fns.broadcast;
         self.run(CollectiveOp::Broadcast, count, |comm| {
             // SAFETY: as in all_reduce; in place on `count` bytes of the caller's buffer.
@@ -1088,6 +1124,7 @@ impl Collective for NcclCollective {
             return Err(CollectiveError::ShapeMismatch);
         }
         let (ptr, count, s) = (device_ptr(buf), buf.len(), native_stream(stream));
+        self.native_stream_ok(CollectiveOp::Send, stream)?;
         let f = self.shared.api.fns.send;
         self.run(CollectiveOp::Send, count, |comm| {
             // SAFETY: as in all_reduce; ncclSend only reads `count` bytes of the caller's
@@ -1109,6 +1146,7 @@ impl Collective for NcclCollective {
             return Err(CollectiveError::ShapeMismatch);
         }
         let (ptr, count, s) = (device_ptr(buf), buf.len(), native_stream(stream));
+        self.native_stream_ok(CollectiveOp::Recv, stream)?;
         let f = self.shared.api.fns.recv;
         self.run(CollectiveOp::Recv, count, |comm| {
             // SAFETY: as in all_reduce; ncclRecv writes `count` bytes of the caller's buffer,
@@ -1427,6 +1465,61 @@ mod tests {
         ));
         drop(comm);
         assert_eq!(stub_abort_calls(&path), before + 1, "no destroy-time abort");
+    }
+
+    /// A GPU context's stream without a native handle (a kernel library without ABI v2.6) is
+    /// refused before the library is called (`Unavailable`, reason `no_native_stream`, counted),
+    /// and the communicator stays usable: the same call on a context with native handles runs.
+    /// Breaks if a null stream handle reaches the NCCL-API library (it would run on the legacy
+    /// default stream, unordered with the context's compute stream).
+    #[test]
+    fn stub_refuses_a_gpu_stream_without_a_native_handle() {
+        use turbine_kernels::test_support::stub_mapped_context_minor;
+        use turbine_tensor::DeviceMemory;
+
+        let path = stub("nccl", "libnccl.so.2");
+        let api = NcclApi::load_from(&path, &NCCL_FLAVOR).expect("stub loads");
+        let id = api.unique_id().expect("unique id");
+        let t = Duration::from_secs(1);
+        let reg = turbine_observability::MetricsRegistry::new();
+        let metrics = CollectiveMetrics::register(&reg);
+        let comm = Arc::clone(&api)
+            .open(CollectiveInit {
+                metrics: Some(metrics),
+                ..init(0, 1, id, t, t, None)
+            })
+            .expect("a world of one initialises");
+        let old: Arc<dyn DeviceMemory> = stub_mapped_context_minor(0, 5);
+        assert_eq!(
+            old.compute_stream().native_handle(),
+            0,
+            "v2.5: no native handle"
+        );
+        let buf = DeviceBuffer::alloc(&old, 16).expect("alloc");
+        let err = comm
+            .all_reduce(
+                &mut buf.whole(),
+                DType::F32,
+                ReduceOp::Sum,
+                &old.compute_stream(),
+            )
+            .expect_err("refused");
+        assert!(
+            matches!(&err, CollectiveError::Unavailable { detail, .. } if detail.contains("no_native_stream")),
+            "{err:?}"
+        );
+        let text = reg.render().expect("renders");
+        assert!(text.contains("reason=\"no_native_stream\""), "{text}");
+        let new: Arc<dyn DeviceMemory> = stub_mapped_context_minor(1, 8);
+        assert_ne!(new.compute_stream().native_handle(), 0);
+        let buf = DeviceBuffer::alloc(&new, 16).expect("alloc");
+        comm.all_reduce(
+            &mut buf.whole(),
+            DType::F32,
+            ReduceOp::Sum,
+            &new.compute_stream(),
+        )
+        .expect("a stream with a native handle runs");
     }
 
     /// A step whose device work never completes (nobody calls `step_end`) is aborted by the

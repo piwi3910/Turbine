@@ -395,3 +395,36 @@ fn scanner_flags_leaks_and_missing_safety_comments() {
     let ok = "// SAFETY: the pointer is owned by this context.\n#[allow(clippy::x)]\nunsafe impl Send for C {}\n// SAFETY: see above.\nlet x = unsafe { g() };\n// SAFETY: wrapped statement.\nlet y =\n    unsafe { g() } == 0;\ntype F = unsafe extern \"C\" fn();\nlet r = r#\"unsafe {\"#; let c = '\"'; fn l<'a>() {}\n";
     assert!(scan_source("crates/turbine-kernels/src/x.rs", ok).is_empty());
 }
+
+/// P5 Task 32 corruption guard: host copies reach the library's `turbine_memcpy_h2d` /
+/// `turbine_memcpy_d2h` only from `shim.rs`, three times each — through the pinned bounce buffer,
+/// through a pinned staging buffer, and the counted, debug-asserted pageable fallback of a
+/// library without pinned memory. A new call site (a pageable copy creeping back) fails here and
+/// must be reviewed: device-to-host copies into untouched pageable memory returned wrong bytes on
+/// ROCm 7.14.1 with two GPUs in one process.
+#[test]
+fn host_copies_reach_the_library_only_through_the_audited_sites() {
+    let src = repo_root().join("crates/turbine-kernels/src");
+    let mut sites = Vec::new();
+    for entry in std::fs::read_dir(&src).expect("src dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).expect("read");
+            for (i, line) in text.lines().enumerate() {
+                if line.contains("syms.memcpy_h2d") || line.contains("syms.memcpy_d2h") {
+                    sites.push(format!(
+                        "{}:{}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        i + 1
+                    ));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        sites.iter().filter(|s| s.starts_with("shim.rs:")).count(),
+        6,
+        "memcpy_h2d/d2h call sites: {sites:?}"
+    );
+    assert_eq!(sites.len(), 6, "memcpy_h2d/d2h call sites: {sites:?}");
+}
