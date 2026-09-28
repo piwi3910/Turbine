@@ -310,6 +310,25 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
     let intermediate = family_cfg
         .moe
         .map_or(raw.intermediate_size, |m| m.expert_intermediate);
+    // Every weight size and offset (slots, stacks, buffers, the total in `shape`) is computed in
+    // `usize` from these dimensions: refuse a config whose weights could not be addressed at 4
+    // bytes per element (an upper bound on every model's parameters, so nothing below can wrap).
+    let (hidden, inter) = (u128::from(raw.hidden_size), u128::from(intermediate));
+    let (q_dim, kv_dim) = (
+        u128::from(heads) * u128::from(head_dim),
+        u128::from(num_kv_heads) * u128::from(head_dim),
+    );
+    let experts = family_cfg.moe.map_or(1, |m| u128::from(m.num_experts));
+    // Each term fits u128 (at most 2^99 from u32 inputs); the layer product saturates.
+    let per_layer = (2 * q_dim + 2 * kv_dim) * hidden + experts * (3 * inter + 1) * hidden;
+    let elements = u128::from(raw.num_hidden_layers)
+        .saturating_mul(per_layer)
+        .saturating_add(2 * u128::from(raw.vocab_size) * hidden);
+    if elements.saturating_mul(4) > usize::MAX as u128 {
+        return Err(invalid(format!(
+            "the dimensions give {elements} weight elements, too large to address"
+        )));
+    }
     let rope_scaling = parse_rope_scaling(raw.rope_scaling, &config_path)?;
     let eos_token_ids = load_eos(dir, raw.eos_token_id, &config_path)?;
 
@@ -570,6 +589,24 @@ mod tests {
         let llama = load_model_config(&fixture_dir()).unwrap();
         assert_eq!(llama.moe, None);
         assert!(!llama.qk_norm);
+    }
+
+    /// Dimensions whose weights cannot be addressed are refused at load, before any slot offset
+    /// or buffer size is computed from them (Scout 99ababd5).
+    #[test]
+    fn rejects_dimensions_whose_weights_overflow() {
+        let dir = edited_config("dims-overflow", |v| {
+            v["vocab_size"] = serde_json::json!(u32::MAX);
+            v["hidden_size"] = serde_json::json!(u32::MAX);
+            v["head_dim"] = serde_json::json!(128);
+        });
+        match load_model_config(&dir).unwrap_err() {
+            ModelError::Io { detail, .. } => {
+                assert!(detail.contains("too large to address"), "{detail}")
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
