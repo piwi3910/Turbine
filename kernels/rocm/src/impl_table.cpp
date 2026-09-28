@@ -8,9 +8,14 @@
 //                                  BF16 buckets), 1 turbine_hip [turbine_hip]
 //   attention_prefill_paged      0 ck_tile_fmha_pagedkv [ck] (pages of a
 //                                  multiple of 128 tokens), 1 turbine_hip
+//                                  (BF16 pages); FP8 pages (v2.9): 2
+//                                  ck_tile_fmha_pagedkv_fp8_staged [ck]
+//                                  (multiple of 128), 3 turbine_hip_fp8
 //   attention_decode_paged       0 ck_tile_fmha_splitkv [ck] (grouped query
 //                                  heads, pages of a multiple of 128 tokens),
 //                                  1 ck_tile_fmha_pagedkv [ck], 2 turbine_hip
+//                                  (BF16 pages); FP8 pages: 3
+//                                  turbine_hip_fp8_decode, 4 turbine_hip_fp8
 //   copy_blocks                  0 hip_memcpy_d2d [turbine_hip]
 //   moe_experts                  0 turbine_hip_moe_small_m (hidden and inter
 //                                  multiples of 8; the first row tier),
@@ -166,6 +171,10 @@ const ImplEntry kPrefillPagedImpls[] = {
     entry<Paged<kPrefillPaged, PagedPath::CkPagedkv>>(
         "ck_tile_fmha_pagedkv", kCk, 0, page_multiple_allows),
     entry<Paged<kPrefillPaged, PagedPath::Turbine>>("turbine_hip", kTurbine),
+    entry<Paged<kPrefillPaged, PagedPath::CkPagedkvFp8Staged>>(
+        "ck_tile_fmha_pagedkv_fp8_staged", kCk),
+    entry<Paged<kPrefillPaged, PagedPath::TurbineFp8>>("turbine_hip_fp8",
+                                                       kTurbine),
 };
 const ImplEntry kDecodePagedImpls[] = {
     entry<Paged<kDecodePaged, PagedPath::CkSplitkv>>(
@@ -173,6 +182,10 @@ const ImplEntry kDecodePagedImpls[] = {
     entry<Paged<kDecodePaged, PagedPath::CkPagedkv>>(
         "ck_tile_fmha_pagedkv", kCk, 0, page_multiple_allows),
     entry<Paged<kDecodePaged, PagedPath::Turbine>>("turbine_hip", kTurbine),
+    entry<Paged<kDecodePaged, PagedPath::TurbineFp8Decode>>(
+        "turbine_hip_fp8_decode", kTurbine),
+    entry<Paged<kDecodePaged, PagedPath::TurbineFp8>>("turbine_hip_fp8",
+                                                      kTurbine),
 };
 const ImplEntry kCopyBlocks[] = {
     whole<turbine_copy_blocks_desc, turbine_copy_blocks_supported,

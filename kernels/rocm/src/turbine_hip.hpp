@@ -303,7 +303,16 @@ int32_t add_rmsnorm_run(turbine_ctx *ctx, const turbine_add_rmsnorm_desc *d,
 // paged_attention.cpp: the paged attention implementations -- CK
 // fmha_fwd_pagedkv, CK fmha_fwd_splitkv (decode of grouped query heads only)
 // or the Turbine kernel; entry names the op in error messages.
-enum class PagedPath { CkPagedkv, CkSplitkv, Turbine };
+// FP8 pages (Phase 6a S-13): CkPagedkvFp8Staged (prefill, the pages staged as
+// BF16 for CK pagedkv), TurbineFp8Decode, TurbineFp8; the others are BF16 only.
+enum class PagedPath {
+  CkPagedkv,
+  CkSplitkv,
+  Turbine,
+  CkPagedkvFp8Staged,
+  TurbineFp8Decode,
+  TurbineFp8
+};
 bool paged_supports(const turbine_attention_paged_desc *d, PagedPath path);
 int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                   const char *entry, PagedPath path);
