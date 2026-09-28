@@ -2086,3 +2086,175 @@ async fn topology_route() {
 fn app_default() -> Router {
     app(1 << 20)
 }
+
+/// P5 multi-GPU pressure views (Task 16, pressure part; the documents come from Task 14).
+mod p5 {
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+    use serde_json::{Value, json};
+    use turbine_api::{ApiError, ApiLimits, ApiState, Diagnostics, router};
+    use turbine_core::types::{CircuitState, DeviceId, MemoryKind, PressureState};
+    use turbine_observability::MetricsRegistry;
+    use turbine_reliability::budget::{DeviceBudget, PoolKind};
+    use turbine_reliability::document::{GroupDoc, ReplicaDoc, device_doc};
+    use turbine_reliability::metrics::ReliabilityMetrics;
+    use turbine_reliability::multi_device::GroupState;
+
+    use super::{NoModel, NotReady, get_json, send};
+
+    const GIB: u64 = 1 << 30;
+
+    /// Serves a fixed pressure document.
+    struct MultiDevice(Value);
+    impl Diagnostics for MultiDevice {
+        fn status(&self) -> Value {
+            json!({})
+        }
+        fn devices(&self) -> Value {
+            json!({"devices": [], "backends": []})
+        }
+        fn scheduler(&self) -> Result<Value, ApiError> {
+            Err(ApiError::not_implemented())
+        }
+        fn kv(&self) -> Result<Value, ApiError> {
+            Err(ApiError::not_implemented())
+        }
+        fn pressure(&self) -> Result<Value, ApiError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn budget(device: u32) -> DeviceBudget {
+        DeviceBudget {
+            device: DeviceId(device),
+            memory_kind: MemoryKind::Dedicated,
+            budget_bytes: 30 * GIB,
+            pools: vec![
+                (PoolKind::Weights, 3 * GIB),
+                (PoolKind::Kv, 22 * GIB),
+                (PoolKind::Workspace, GIB),
+                (PoolKind::Collective, GIB),
+                (PoolKind::Runtime, GIB),
+                (PoolKind::Reserve, 2 * GIB),
+            ],
+        }
+    }
+
+    /// Two devices of one TP group (device 1 ORANGE): the pressure document carries the
+    /// `devices`, `groups` (limited by device 1) and `replicas` views, and `/metrics` the
+    /// per-device budget by component and the group gauges.
+    #[tokio::test]
+    async fn pressure_multi_device_view() {
+        let (b0, b1) = (budget(0), budget(1));
+        let members = [
+            (DeviceId(0), PressureState::Green),
+            (DeviceId(1), PressureState::Orange),
+        ];
+        let doc = json!({
+            "devices": [device_doc(&b0, members[0].1), device_doc(&b1, members[1].1)],
+            "groups": [GroupDoc::of(0, &members)],
+            "replicas": [ReplicaDoc::of(0, GroupState::of(&members).state, CircuitState::Healthy)],
+        });
+        let metrics = MetricsRegistry::new();
+        let reliability = ReliabilityMetrics::register(&metrics);
+        reliability.record_device_budget(&b0);
+        reliability.record_device_budget(&b1);
+        reliability.record_group(0, GroupState::of(&members));
+        let app = router(ApiState {
+            inference: Arc::new(NoModel),
+            diagnostics: Arc::new(MultiDevice(doc)),
+            readiness: Arc::new(NotReady),
+            metrics,
+            limits: ApiLimits {
+                max_request_bytes: 1 << 20,
+            },
+        });
+
+        let (s, d) = get_json(&app, "GET", "/turbine/v1/pressure").await;
+        assert_eq!(s, StatusCode::OK, "{d}");
+        let devices = d["devices"].as_array().expect("devices[]");
+        assert_eq!(devices.len(), 2, "{d}");
+        for (i, dev) in devices.iter().enumerate() {
+            assert_eq!(dev["device"], i, "{d}");
+            for component in [
+                "weights",
+                "kv",
+                "workspace",
+                "collective",
+                "runtime",
+                "reserve",
+            ] {
+                assert!(dev["budget"][component].is_u64(), "{component}: {d}");
+            }
+        }
+        assert_eq!(devices[1]["state"], "ORANGE");
+        assert_eq!(devices[0]["budget"]["collective"], GIB);
+        assert_eq!(
+            d["groups"],
+            json!([{"replica": 0, "state": "ORANGE", "limiting_device": 1}])
+        );
+        assert_eq!(
+            d["replicas"],
+            json!([{"replica": 0, "eligible": false, "reason": "pressure"}])
+        );
+
+        let (s, _, body) = send(&app, "GET", "/metrics", Vec::new(), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let text = String::from_utf8(body).unwrap();
+        for line in [
+            format!(r#"turbine_device_budget_bytes{{device="0",component="collective"}} {GIB}"#),
+            format!(
+                r#"turbine_device_budget_bytes{{device="1",component="kv"}} {}"#,
+                22 * GIB
+            ),
+            r#"turbine_group_pressure_state{replica="0"} 2"#.to_string(),
+            r#"turbine_group_limiting_device{replica="0"} 1"#.to_string(),
+        ] {
+            assert!(text.contains(&line), "{line} missing:\n{text}");
+        }
+    }
+}
+
+/// Not ready for a fixed reason.
+struct NotReadyFor(NotReadyReason);
+impl Readiness for NotReadyFor {
+    fn ready(&self) -> ReadyState {
+        ReadyState::NotReady { reason: self.0 }
+    }
+}
+
+/// P5 (T16, vocabulary part): `/ready` renders the multi-GPU reasons, and the two new error
+/// codes carry the contract's status and type.
+#[tokio::test]
+async fn phase5_ready_reasons_and_error_codes() {
+    for (reason, text) in [
+        (NotReadyReason::CollectiveInit, "collective_init"),
+        (NotReadyReason::LoadingWeights, "loading_weights"),
+        (NotReadyReason::RankMissing, "rank_missing"),
+    ] {
+        let app = router(ApiState {
+            inference: Arc::new(NoModel),
+            diagnostics: Arc::new(Phase0Diagnostics),
+            readiness: Arc::new(NotReadyFor(reason)),
+            metrics: MetricsRegistry::new(),
+            limits: ApiLimits {
+                max_request_bytes: 1 << 20,
+            },
+        });
+        let (s, b) = get_json(&app, "GET", "/ready").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+        assert_eq!(b, json!({"ready": false, "reason": text}));
+    }
+    for (e, kind, code) in [
+        (ApiError::not_leader(), "service_unavailable", "not_leader"),
+        (
+            ApiError::replica_failed("replica 1: all_reduce timed out"),
+            "server_error",
+            "replica_failed",
+        ),
+    ] {
+        assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE, "{code}");
+        assert_error(&e.to_json(), kind, code);
+    }
+}

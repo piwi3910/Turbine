@@ -124,6 +124,12 @@ pub enum NotReadyReason {
     ShuttingDown,
     /// The circuit breaker is CIRCUIT_OPEN, DRAINING or PROBING (Phase 3).
     CircuitOpen,
+    /// A replica's communicator is not initialised yet, or its init timed out (P5).
+    CollectiveInit,
+    /// A rank of a replica is still loading its weight shard (P5).
+    LoadingWeights,
+    /// A static-mode rank has not joined the leader (P5).
+    RankMissing,
 }
 
 impl NotReadyReason {
@@ -136,6 +142,9 @@ impl NotReadyReason {
             NotReadyReason::DeviceError => "device_error",
             NotReadyReason::ShuttingDown => "shutting_down",
             NotReadyReason::CircuitOpen => "circuit_open",
+            NotReadyReason::CollectiveInit => "collective_init",
+            NotReadyReason::LoadingWeights => "loading_weights",
+            NotReadyReason::RankMissing => "rank_missing",
         }
     }
 }

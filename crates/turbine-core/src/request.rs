@@ -69,6 +69,12 @@ pub enum ErrorCode {
     SessionNotFound,
     PrefetchQueueFull,
     PressureTooHigh,
+    // Phase 5
+    /// An inference route on a static-mode worker rank (rank ≠ 0): 503.
+    NotLeader,
+    /// The request's replica failed mid-generation (collective timeout or abort): 503, or the
+    /// stream's error event.
+    ReplicaFailed,
 }
 
 impl ErrorCode {
@@ -104,6 +110,8 @@ impl ErrorCode {
             ErrorCode::SessionNotFound => "session_not_found",
             ErrorCode::PrefetchQueueFull => "prefetch_queue_full",
             ErrorCode::PressureTooHigh => "pressure_too_high",
+            ErrorCode::NotLeader => "not_leader",
+            ErrorCode::ReplicaFailed => "replica_failed",
         }
     }
 }

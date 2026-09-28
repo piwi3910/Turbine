@@ -249,6 +249,21 @@ impl ApiError {
         )
     }
 
+    /// 503 `service_unavailable`/`not_leader`: a static-mode worker rank serves only `/health`,
+    /// `/ready` and `/metrics` (P5).
+    pub fn not_leader() -> Self {
+        Self::from_code(
+            ErrorCode::NotLeader,
+            "this process is a worker rank; send inference requests to the leader (rank 0)",
+        )
+    }
+
+    /// 503 `server_error`/`replica_failed`: the request's data-parallel replica failed
+    /// (collective timeout or abort) while serving it (P5).
+    pub fn replica_failed(message: impl Into<String>) -> Self {
+        Self::from_code(ErrorCode::ReplicaFailed, message)
+    }
+
     /// 504 `timeout`/`request_timeout`: the request ran past `server.request_timeout`.
     pub fn request_timeout() -> Self {
         Self::from_code(
@@ -352,12 +367,13 @@ impl ApiError {
             ErrorCode::QueueTimeout
             | ErrorCode::ShuttingDown
             | ErrorCode::Overloaded
-            | ErrorCode::CircuitOpen => (
+            | ErrorCode::CircuitOpen
+            | ErrorCode::NotLeader => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorType::ServiceUnavailable,
             ),
             // P3: 503 for a non-streaming request; the mid-stream event keeps `server_error`.
-            ErrorCode::ResourceExhausted => {
+            ErrorCode::ResourceExhausted | ErrorCode::ReplicaFailed => {
                 (StatusCode::SERVICE_UNAVAILABLE, ErrorType::ServerError)
             }
             ErrorCode::RequestTimeout => (StatusCode::GATEWAY_TIMEOUT, ErrorType::Timeout),
