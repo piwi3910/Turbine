@@ -315,6 +315,41 @@ fn impossible_plan_exits_2_before_bind() {
     TcpListener::bind(addr).expect("the configured port must still be free");
 }
 
+/// P5 S-11, S-12: expert parallelism on a dense model is refused before bind: the tiny Llama
+/// with `expert_parallel_size: 2` exits 2 naming `parallel.expert_parallel_size` and the reason
+/// code `ep_moe_only` (checked against `config.json`, with replicated and with tensor-parallel
+/// attention), and the port stays free. The GPU planner's refusal is `plan::tests`'s.
+#[test]
+fn ep_on_dense_model_exits_2() {
+    let port = free_port();
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let (_model, yaml) = tiny_model_yaml(addr);
+    for (tag, yaml) in [
+        (
+            "ep-dense-cpu",
+            yaml.clone() + "parallel:\n  expert_parallel_size: 2\n  collective_backend: host\n",
+        ),
+        (
+            "ep-dense-cpu-tp2",
+            yaml.clone()
+                + "parallel:\n  expert_parallel_size: 2\n  tensor_parallel_size: 2\n  \
+                   collective_backend: host\n",
+        ),
+    ] {
+        let cfg = TempConfig::new(tag, &yaml);
+        let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(30));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{tag}: stderr: {stderr}");
+        assert!(
+            stderr.contains(
+                "turbine-server: invalid parallel plan: parallel.expert_parallel_size: ep_moe_only"
+            ),
+            "{tag}: stderr: {stderr}"
+        );
+        TcpListener::bind(addr).expect("the configured port must still be free");
+    }
+}
+
 #[test]
 fn port_in_use_exits_1() {
     let holder = TcpListener::bind("127.0.0.1:0").unwrap();

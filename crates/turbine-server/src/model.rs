@@ -26,6 +26,7 @@ use turbine_kernels::{
 };
 use turbine_kv::metrics::log_pool_startup;
 use turbine_kv::{BlockPool, BlockPoolConfig};
+use turbine_model::ep::{self, EpShard, ExpertPlacement, ExpertTokenCounts};
 use turbine_model::executor::{
     self, BatchInput, DecodeGraphs, ExecutorLimits, ExecutorOptions, GraphBackend, ModelExecutor,
     SeqSlice, graphs,
@@ -213,6 +214,38 @@ fn apply_gemm_autotune(ctx: &ShimContext, on: bool) {
     }
 }
 
+/// How one rank of a parallel group splits the model (P5).
+#[derive(Clone, Debug)]
+pub enum RankPart {
+    /// Tensor parallelism (S-6): the rank's shard of every layer.
+    Tensor(ShardSpec),
+    /// Expert parallelism (S-11): the rank's routed experts, everything else replicated (tp 1)
+    /// or tensor-parallel over the same ranks (tp = ep).
+    Expert(EpRank),
+}
+
+impl RankPart {
+    /// The rank's position in its group.
+    pub fn position(&self) -> ShardSpec {
+        match self {
+            RankPart::Tensor(s) => *s,
+            RankPart::Expert(e) => ShardSpec {
+                rank: e.shard.rank,
+                world: e.shard.world,
+            },
+        }
+    }
+}
+
+/// One rank of an expert-parallel group: its shard, the group's placement and the token counts
+/// its executor records (rank 0's are the server's, [`crate::parallel::ExpertStats`]).
+#[derive(Clone, Debug)]
+pub struct EpRank {
+    pub shard: EpShard,
+    pub placement: Arc<ExpertPlacement>,
+    pub counts: Arc<ExpertTokenCounts>,
+}
+
 /// Everything resolved before the listener binds: the model is known to be loadable and to fit.
 pub struct PreparedModel {
     pub provider: Provider,
@@ -262,9 +295,13 @@ pub struct PreparedModel {
     pub identity: ModelIdentity,
     /// The kernel crate's metrics, registered once and shared by every replica (P5).
     pub kernel_metrics: KernelMetrics,
-    /// Tensor parallelism (P5 S-6): the rank of its group this model is prepared for (its
-    /// weight shard, KV heads, op shapes and workspace); `None` on one device.
+    /// Tensor or expert parallelism (P5 S-6, S-11): the rank of its group this model is
+    /// prepared for (its position; with `expert` `None` also its tensor-parallel weight shard,
+    /// KV heads, op shapes and workspace); `None` on one device.
     pub shard: Option<ShardSpec>,
+    /// Expert parallelism (P5 S-11): the rank's experts, placement and counts; its weights, KV
+    /// layout, op shapes and workspace are `turbine_model::ep`'s.
+    pub expert: Option<EpRank>,
     /// Bytes of the weights this rank loads: its shard, or the whole model.
     pub weight_bytes: u64,
 }
@@ -300,14 +337,14 @@ pub fn prepare_rank(
     config: &Config,
     inventory: &DeviceInventory,
     metrics: &MetricsRegistry,
-    shard: Option<ShardSpec>,
+    part: Option<RankPart>,
 ) -> Result<PreparedModel, StartupError> {
     prepare_with(
         config,
         inventory,
         &KernelMetrics::register(metrics),
         None,
-        shard,
+        part,
     )
 }
 
@@ -318,9 +355,9 @@ pub fn prepare_replica(
     config: &Config,
     inventory: &DeviceInventory,
     base: &PreparedModel,
-    shard: Option<ShardSpec>,
+    part: Option<RankPart>,
 ) -> Result<PreparedModel, StartupError> {
-    prepare_with(config, inventory, &base.kernel_metrics, Some(base), shard)
+    prepare_with(config, inventory, &base.kernel_metrics, Some(base), part)
 }
 
 /// The device bytes `slots` take (BF16, the only weight dtype tensor parallelism serves; a
@@ -337,8 +374,13 @@ fn prepare_with(
     inventory: &DeviceInventory,
     kernel_metrics: &KernelMetrics,
     base: Option<&PreparedModel>,
-    shard: Option<ShardSpec>,
+    part: Option<RankPart>,
 ) -> Result<PreparedModel, StartupError> {
+    let shard = part.as_ref().map(RankPart::position);
+    let expert = match part {
+        Some(RankPart::Expert(e)) => Some(e),
+        _ => None,
+    };
     let provider = load_provider(config, inventory)?;
 
     let dir = config.model.path.as_path();
@@ -393,10 +435,27 @@ fn prepare_with(
         max_seqs: scheduler.max_running_requests,
     };
     let tp_error = |e: ModelError| model_error("tensor parallelism", e);
+    let ep_error = |e: ModelError| model_error("expert parallelism", e);
     // One device: the family's ops, workspace, KV layout and weights. A tensor-parallel rank
-    // (P5 S-6): its shard's (its heads, KV heads, intermediate and vocabulary columns).
-    let (mut requirements, workspace, layout, weights) = match shard {
-        None => (
+    // (P5 S-6): its shard's (its heads, KV heads, intermediate and vocabulary columns). An
+    // expert-parallel rank (S-11): its experts' (one `moe_experts` config per run of them) and
+    // the replicated or tensor-parallel rest.
+    let (mut requirements, workspace, layout, weights) = match (&expert, shard) {
+        (Some(e), _) => (
+            ep::available_requirements(
+                &arch,
+                e.shard,
+                &e.placement,
+                block_tokens,
+                executor_options,
+                &ordered,
+            )
+            .map_err(ep_error)?,
+            ep::workspace_bytes(&arch, e.shard, &e.placement, limits).map_err(ep_error)?,
+            ep::kv_layout(&arch, e.shard, block_tokens).map_err(ep_error)?,
+            slot_bytes(&ep::weight_slots(&arch, e.shard, &e.placement).map_err(ep_error)?),
+        ),
+        (None, None) => (
             executor::available_requirements(&arch, block_tokens, executor_options, &ordered),
             executor::workspace_bytes(
                 &arch,
@@ -407,7 +466,7 @@ fn prepare_with(
             arch.kv_layout(block_tokens),
             arch.shape().weight_bytes,
         ),
-        Some(s) => (
+        (None, Some(s)) => (
             tp::available_requirements(&arch, s, block_tokens, executor_options, &ordered)
                 .map_err(tp_error)?,
             tp::workspace_bytes(&arch, s, limits).map_err(tp_error)?,
@@ -439,14 +498,20 @@ fn prepare_with(
     }
 
     let decode_graphs = config.execution.decode_graphs && opened.graphs.is_some();
+    // The reason code of a multi-rank group's forced-off features.
+    let group_reason = if expert.is_some() {
+        "expert_parallel"
+    } else {
+        "tensor_parallel"
+    };
     let decode_graphs = if decode_graphs && shard.is_some_and(|s| s.world > 1) {
         // Decode graphs cannot capture the collectives (P5): forced off, not refused.
         if shard.is_some_and(|s| s.rank == 0) {
             tracing::warn!(
                 event = "decode_graphs_unavailable",
-                reason = "tensor_parallel",
-                "execution.decode_graphs is on but tensor-parallel ranks cannot capture their \
-                 collectives into graphs; decode iterations run eagerly"
+                reason = group_reason,
+                "execution.decode_graphs is on but tensor- or expert-parallel ranks cannot \
+                 capture their collectives into graphs; decode iterations run eagerly"
             );
         }
         false
@@ -466,9 +531,9 @@ fn prepare_with(
     {
         tracing::warn!(
             event = "overlap_scheduling_unavailable",
-            reason = "tensor_parallel",
-            "execution.overlap_scheduling is on but a tensor-parallel group runs each step to \
-             completion on every rank; iterations run serially"
+            reason = group_reason,
+            "execution.overlap_scheduling is on but a tensor- or expert-parallel group runs \
+             each step to completion on every rank; iterations run serially"
         );
     }
 
@@ -586,6 +651,7 @@ fn prepare_with(
         identity: model_identity(dir)?,
         kernel_metrics: kernel_metrics.clone(),
         shard,
+        expert,
         weight_bytes: weights,
     })
 }
@@ -870,9 +936,13 @@ pub(crate) fn budget_breakdown(b: &DeviceBudget) -> String {
 /// device, the tensor (in the loader's message) and the pre-load budget.
 pub(crate) fn load_weights(prepared: &PreparedModel) -> Result<LoadedWeights, StartupError> {
     let arch = &prepared.arch;
-    let slots = match prepared.shard {
-        None => arch.family.0.weight_slots(arch),
-        Some(s) => tp::weight_slots(arch, s).map_err(|e| model_error("tensor parallelism", e))?,
+    let slots = match (&prepared.expert, prepared.shard) {
+        (Some(e), _) => ep::weight_slots(arch, e.shard, &e.placement)
+            .map_err(|e| model_error("expert parallelism", e))?,
+        (None, None) => arch.family.0.weight_slots(arch),
+        (None, Some(s)) => {
+            tp::weight_slots(arch, s).map_err(|e| model_error("tensor parallelism", e))?
+        }
     };
     WeightLoader::load_format(
         arch.weight_format.0,
