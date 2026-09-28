@@ -788,10 +788,20 @@ async fn response_shapes_and_stream_order() {
     let chunks = sse_data(&body);
     assert_eq!(chunks.len(), 4, "{body}");
     assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "Hel");
+    // The client gets a fixed message naming the request, never the engine's internal detail
+    // (which is logged with the same id) (Scout feb0de60).
+    let id = chunks[1]["id"].as_str().expect("chunk id");
     assert_eq!(
         chunks[2],
-        json!({"error": {"message": "kernel failed", "type": "server_error", "code": "internal_error"}})
+        json!({"error": {
+            "message": format!(
+                "The server had an error while processing your request (request {id})."
+            ),
+            "type": "server_error",
+            "code": "internal_error",
+        }})
     );
+    assert!(!body.contains("kernel failed"), "{body}");
     assert_eq!(chunks[3], "[DONE]");
 
     // The same error on a non-streaming request is a plain 500.

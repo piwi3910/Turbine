@@ -19,7 +19,7 @@ use std::convert::Infallible;
 use axum::response::sse::{Event, Sse};
 use futures_util::stream::{self, Stream, StreamExt};
 use serde_json::{Value, json};
-use turbine_core::request::{FinishReason, GenerationEvent, ToolCallOut, Usage};
+use turbine_core::request::{ErrorCode, FinishReason, GenerationEvent, ToolCallOut, Usage};
 
 use crate::backend::GenerationStream;
 use crate::error::ApiError;
@@ -186,13 +186,16 @@ impl StreamState {
         Ok(out)
     }
 
-    fn fail(&mut self, error: ApiError) -> Vec<Event> {
-        tracing::warn!(
+    /// The engine's detail (kernel errors, internal state) is logged with the response id; the
+    /// client gets a fixed message per error code naming that id, never the detail itself.
+    fn fail(&mut self, mut error: ApiError) -> Vec<Event> {
+        tracing::error!(
             response_id = %self.ctx.id,
             code = error.code.as_str(),
             message = %error.message,
             "generation failed mid-stream"
         );
+        error.message = format!("{} (request {}).", client_message(error.code), self.ctx.id);
         self.done = true;
         vec![data(&error.to_json()), done_event()]
     }
@@ -229,4 +232,17 @@ fn data(value: &Value) -> Event {
 
 fn done_event() -> Event {
     Event::default().data("[DONE]")
+}
+
+/// The client-facing message of a mid-stream error: fixed per code, never the engine's detail.
+fn client_message(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::RequestTimeout => "The request exceeded the server's time limit",
+        ErrorCode::ShuttingDown => "The server is shutting down",
+        ErrorCode::SlowClient => "The client did not read the stream fast enough",
+        ErrorCode::Overloaded | ErrorCode::CircuitOpen | ErrorCode::ResourceExhausted => {
+            "The server is overloaded; retry later"
+        }
+        _ => "The server had an error while processing your request",
+    }
 }
