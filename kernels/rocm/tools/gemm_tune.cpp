@@ -399,6 +399,9 @@ struct Candidate {
 };
 
 double median(std::vector<double> v) {
+  // No rounds timed: no median (never an index past the end).
+  if (v.empty())
+    return std::nan("");
   std::sort(v.begin(), v.end());
   return v[v.size() / 2];
 }
