@@ -51,6 +51,10 @@ enum Command {
         /// Reference prompts in flight at once; results are still reported in prompt order.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         concurrency: u32,
+        /// Judge with the tolerance's batched logprob bounds at every concurrency (the
+        /// tensor-parallel gate against a one-GPU capture, P5).
+        #[arg(long)]
+        batched_bounds: bool,
     },
     /// Record reference.jsonl from any OpenAI-compatible endpoint.
     Capture {
@@ -133,6 +137,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             tolerance,
             output,
             concurrency,
+            batched_bounds,
         } => {
             let endpoint = Endpoint::new(&url)?;
             let references: Vec<ReferenceRecord> = read_jsonl(&reference)?;
@@ -144,8 +149,13 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             let tolerance =
                 tolerance.unwrap_or_else(|| reference_dir(&reference).join("tolerance.json"));
             let tol = read_tolerance(&tolerance)?;
+            let tol = if batched_bounds {
+                tol.batched_everywhere()
+            } else {
+                tol
+            };
             let model = endpoint.model(model.as_deref()).await?;
-            let report = compare(
+            let mut report = compare(
                 &endpoint,
                 &model,
                 &references,
@@ -154,6 +164,9 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
                 concurrency as usize,
             )
             .await?;
+            if batched_bounds {
+                report.logprob_bounds.batched = true;
+            }
             match output {
                 OutputFormat::Json => println!(
                     "{}",

@@ -281,6 +281,9 @@ pub enum RouteReason {
     AboveThreshold,
     /// The backend's own path cannot run the call: the delegate.
     OpUnsupported,
+    /// Above the threshold, but the delegate cannot run the call between these devices
+    /// (point-to-point without a peer path): the backend's own path.
+    NoPeerAccess,
 }
 
 impl RouteReason {
@@ -289,6 +292,7 @@ impl RouteReason {
             RouteReason::BelowThreshold => "below_threshold",
             RouteReason::AboveThreshold => "above_threshold",
             RouteReason::OpUnsupported => "op_unsupported",
+            RouteReason::NoPeerAccess => "no_peer_access",
         }
     }
 }
