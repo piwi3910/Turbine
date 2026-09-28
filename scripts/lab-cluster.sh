@@ -2,7 +2,8 @@
 # Run one Phase 5 multi-GPU lab scenario on novanas as a k3s Job holding both R9700s.
 #
 #   scripts/lab-cluster.sh [--dry-run] <collbench-novanas|collbench-sweep-novanas|
-#                                       collbench-hostmem-novanas|tp2-novanas|dp2-novanas>
+#                                       collbench-hostmem-novanas|tp2-novanas|dp2-novanas|
+#                                       ep2-novanas>
 #   scripts/lab-cluster.sh [--dry-run] --stop <run-id>
 #
 # Scenarios (P5 S-9; everything runs inside the Job on loopback — no Service, no host port):
@@ -35,6 +36,16 @@
 #                      bench at concurrency 32 (the load that fills both cards) and at 16 (the
 #                      same load as dp 1), each requests_ok 200, and turbine_dp_routed_total
 #                      non-zero for replica 0 and replica 1.
+#   ep2-novanas        OLMoE-1B-7B (scripts/lab/phase5-novanas-ep2.yaml): first an ep 1 baseline
+#                      on device 0 on the standard throughput workload (512-word prompts, 256
+#                      tokens with --ignore-eos, concurrency 16, 200 requests, after a
+#                      16-request warm-up); then ep 2 with tp 1 over rccl (golden at
+#                      concurrency 1 and 16, turbine_expert_rank_tokens_total non-zero for rank
+#                      0 and rank 1, the standard workload), ep 2 with tp 1 over hostmem (golden
+#                      c1, the standard workload) and ep 2 with tp 2 (golden c1). Prints one
+#                      `ep-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run and
+#                      the scheduler document's `expert` section. 2-GPU numbers are "2-GPU
+#                      (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
 #
 # Like scripts/lab-test.sh, the tree is uploaded to /home/piwi/turbine-ci/runs/<run id>/src and
 # one template (scripts/lab/novanas-cluster-job.yaml) runs twice: first GPU-less as
@@ -51,7 +62,7 @@
 # <reason>` (exit 1); usage errors exit 2.
 set -euo pipefail
 
-SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas"
+SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas"
 
 usage() {
 	echo "usage: scripts/lab-cluster.sh [--dry-run] <${SCENARIOS}>" >&2
@@ -60,7 +71,7 @@ usage() {
 }
 
 valid_scenario() {
-	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas)$ ]]
+	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas)$ ]]
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -333,6 +344,69 @@ scenario_dp2() {
 	stop_servers
 }
 
+# ep_counts <label>: both EP ranks computed token-expert assignments
+# (turbine_expert_rank_tokens_total{rank} > 0 for rank 0 and rank 1); prints the series, the
+# imbalance and the scheduler document's `expert` section.
+ep_counts() {
+	local label="$1" rank total
+	curl -s "${URL}/metrics" >"${WORK}/${label}-metrics.txt" || job_fail "GET /metrics failed"
+	grep -E '^turbine_expert_(rank_tokens_total|imbalance_ratio)' "${WORK}/${label}-metrics.txt" || true
+	curl -s "${URL}/turbine/v1/scheduler" | jq -c '.["0"].expert' || true
+	curl -s "${URL}/turbine/v1/status" | jq -c '.parallel | {tp, ep, backend, plan_reasons, experts: .groups[0].experts}' || true
+	for rank in 0 1; do
+		total="$(awk -v r="rank=\"$rank\"" '/^turbine_expert_rank_tokens_total\{/ && index($0, r) { s += $NF } END { print s + 0 }' \
+			"${WORK}/${label}-metrics.txt")"
+		echo "ep-counts ${label} rank=${rank} tokens=${total}"
+		awk -v t="$total" 'BEGIN { exit !(t > 0) }' ||
+			job_fail "turbine_expert_rank_tokens_total is 0 for rank ${rank} (${label})"
+	done
+}
+
+scenario_ep2() {
+	local ep2=scripts/lab/phase5-novanas-ep2.yaml slug=olmoe-1b-7b-0125-instruct
+	# The ep 1 baseline: the same configuration with one device.
+	start_server "${WORK}/ep1.log" "$ep2" --set parallel.expert_parallel_size=1 \
+		--set "parallel.devices=[0]"
+	wait_ready "$URL" "${WORK}/ep1.log"
+	bench_ok 16 "${WORK}/ep1-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
+	bench_ok 200 "${WORK}/ep1-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	stop_servers
+
+	start_server "${WORK}/ep2.log" "$ep2"
+	wait_ready "$URL" "${WORK}/ep2.log"
+	golden "$slug" "olmoe ep2 c1"
+	golden "$slug" "olmoe ep2 c16" --concurrency 16
+	ep_counts ep2
+	bench_ok 16 "${WORK}/ep2-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
+	bench_ok 200 "${WORK}/ep2-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	ep_counts ep2-after-bench
+	stop_servers
+
+	start_server "${WORK}/ep2-hostmem.log" "$ep2" --set parallel.collective_backend=hostmem
+	wait_ready "$URL" "${WORK}/ep2-hostmem.log"
+	golden "$slug" "olmoe ep2 hostmem c1"
+	bench_ok 16 "${WORK}/ep2-hostmem-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 16
+	bench_ok 200 "${WORK}/ep2-hostmem-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	ep_counts ep2-hostmem
+	stop_servers
+
+	start_server "${WORK}/ep2-tp2.log" "$ep2" --set parallel.tensor_parallel_size=2
+	wait_ready "$URL" "${WORK}/ep2-tp2.log"
+	golden "$slug" "olmoe ep2 tp2 c1"
+	ep_counts ep2-tp2
+	stop_servers
+
+	local f
+	for f in ep1-c16 ep2-c16 ep2-hostmem-c16; do
+		jq -r --arg f "$f" '"ep-bench \($f) tok/s=\(.output_token_throughput) ttft_p50_ms=\(.ttft_ms.p50) itl_p50_ms=\(.itl_ms.p50) requests_ok=\(.requests_ok)"' \
+			"${WORK}/${f}-bench.json"
+	done
+}
+
 in_job() {
 	SCENARIO="$1"
 	valid_scenario "$SCENARIO" || usage
@@ -346,6 +420,7 @@ in_job() {
 	collbench-hostmem-novanas) scenario_collbench_hostmem ;;
 	tp2-novanas) scenario_tp2 ;;
 	dp2-novanas) scenario_dp2 ;;
+	ep2-novanas) scenario_ep2 ;;
 	esac
 	echo "lab-cluster: ${SCENARIO} PASS"
 }
