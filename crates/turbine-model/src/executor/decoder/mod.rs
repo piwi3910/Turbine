@@ -489,6 +489,63 @@ struct Part<'p> {
 /// ([`ModelExecutor::set_prefill_overlap`]).
 pub const PREFILL_OVERLAP_MIN_TOKENS: usize = 256;
 
+/// The row at which the prefill overlap splits a batch of `total_q` rows holding `seqs` (P5
+/// Task 34): the candidate nearest the middle (the lower one on a tie) among the rows where a
+/// sequence starts and the rows inside a sequence whose KV position (the sequence's cached
+/// tokens plus its rows before it) is a multiple of `block_tokens`, so that every half starts
+/// each of its sequences at a sequence start or at a KV block boundary, where a chunked prefill
+/// or a prefix-cache hit also starts. Paged prefill attention is only bit-exact against the
+/// unsplit run at such q-starts; a split in the middle of a block is not. `None` when no row
+/// in `1..total_q` qualifies.
+pub fn overlap_split_row(
+    seqs: &[SeqSlice<'_>],
+    total_q: usize,
+    block_tokens: usize,
+) -> Option<usize> {
+    if total_q < 2 || block_tokens == 0 {
+        return None;
+    }
+    let target = total_q / 2;
+    let mut best: Option<usize> = None;
+    let mut consider = |r: usize| {
+        if r == 0 || r >= total_q {
+            return;
+        }
+        let better = match best {
+            None => true,
+            Some(b) => {
+                let (dr, db) = (r.abs_diff(target), b.abs_diff(target));
+                dr < db || (dr == db && r < b)
+            }
+        };
+        if better {
+            best = Some(r);
+        }
+    };
+    for s in seqs {
+        let (start, q_len) = (s.q_start as usize, s.q_len as usize);
+        consider(start);
+        consider(start + q_len);
+        // Heads h in 1..q_len with (cached + h) % block_tokens == 0, nearest target - start.
+        let cached = (s.kv_len - s.q_len) as usize;
+        let first = match (block_tokens - cached % block_tokens) % block_tokens {
+            0 => block_tokens,
+            h => h,
+        };
+        if first >= q_len {
+            continue;
+        }
+        let want = target.saturating_sub(start).max(first);
+        let below = first + (want - first) / block_tokens * block_tokens;
+        for h in [below, below + block_tokens] {
+            if h < q_len {
+                consider(start + h);
+            }
+        }
+    }
+    best
+}
+
 /// The tensor-parallel prefill overlap's state: the collective side stream (`None`: the halves
 /// run one after the other on the compute stream, same results) and each half's host and device
 /// batch metadata.
@@ -1165,9 +1222,10 @@ impl DecoderExecutor {
 
     /// The two halves of `batch` (packed as `p`) for the prefill overlap, packed and uploaded
     /// into the overlap's metadata: `None` when the overlap is off, for a decode batch, a batch
-    /// under the overlap's `min_tokens` rows, or while tracing or profiling. The split row is
-    /// the middle one; a sequence across it continues in the second half as a chunked prefill
-    /// does (its first rows' K/V appended by the first half).
+    /// under the overlap's `min_tokens` rows, while tracing or profiling, or when no row
+    /// qualifies. The split row is [`overlap_split_row`]'s (P5 Task 34: at a sequence start or
+    /// a KV block boundary nearest the middle); a sequence across it continues in the second
+    /// half as a chunked prefill does (its first rows' K/V appended by the first half).
     fn split_prefill(
         &mut self,
         batch: &BatchInput<'_>,
@@ -1184,7 +1242,13 @@ impl DecoderExecutor {
         {
             return Ok(None);
         }
-        let split = p.total_q / 2;
+        let Some(split) = overlap_split_row(
+            batch.seqs,
+            p.total_q,
+            self.limits.layout.block_tokens as usize,
+        ) else {
+            return Ok(None);
+        };
         let mut first: Vec<SeqSlice<'_>> = Vec::new();
         let mut second: Vec<SeqSlice<'_>> = Vec::new();
         for s in batch.seqs {
@@ -2288,5 +2352,71 @@ mod tests {
             kv: &kv,
         };
         assert_eq!(exec.graph_key(&prefill, &[]).expect("prefill"), None);
+    }
+
+    /// `(q_len, cached)` sequences packed back to back, as the scheduler packs a batch.
+    fn packed(seqs: &[(u32, u32)]) -> Vec<SeqSlice<'static>> {
+        let mut start = 0;
+        seqs.iter()
+            .enumerate()
+            .map(|(i, &(q_len, cached))| {
+                let s = SeqSlice {
+                    seq: SeqId(i as u64 + 1),
+                    q_start: start,
+                    q_len,
+                    kv_len: cached + q_len,
+                    block_table: &[],
+                    reduce: None,
+                };
+                start += q_len;
+                s
+            })
+            .collect()
+    }
+
+    /// P5 Task 34: the overlap split sits at a sequence start or at a KV block boundary of the
+    /// sequence it cuts (never mid-block), nearest the middle. Breaks if the split falls back
+    /// to the middle row (385 rows cold: 192 is mid-block), ignores the cached prefix (a
+    /// sequence resuming at 100 cached tokens aligns at heads 28, 156, ...), or prefers a far
+    /// candidate over a near one.
+    #[test]
+    fn overlap_split_row_is_block_aligned_nearest_the_middle() {
+        let b = 128;
+        // One cold sequence: boundaries 128 and 256 tie around the middle 192 -> the lower.
+        assert_eq!(overlap_split_row(&packed(&[(385, 0)]), 385, b), Some(128));
+        assert_eq!(overlap_split_row(&packed(&[(512, 0)]), 512, b), Some(256));
+        // A cached prefix of 100 tokens: boundaries at heads 28, 156, 284; middle 200 -> 156.
+        assert_eq!(overlap_split_row(&packed(&[(400, 100)]), 400, b), Some(156));
+        // 200 cached: boundaries at heads 56, 184 (KV 256, 384); middle 150 -> 184.
+        assert_eq!(overlap_split_row(&packed(&[(300, 200)]), 300, b), Some(184));
+        // Alone and too short to reach a boundary: no split.
+        assert_eq!(overlap_split_row(&packed(&[(100, 0)]), 100, b), None);
+        // Several sequences: a sequence start nearer the middle than any boundary wins.
+        assert_eq!(
+            overlap_split_row(&packed(&[(90, 0), (90, 0), (90, 0)]), 270, b),
+            Some(90)
+        );
+        assert_eq!(
+            overlap_split_row(&packed(&[(200, 0), (300, 0)]), 500, b),
+            Some(200)
+        );
+        // Every chosen row is a sequence start or a block boundary of the sequence it cuts.
+        for (seqs, total) in [
+            (vec![(385u32, 0u32)], 385usize),
+            (vec![(257, 3), (129, 1000), (600, 7)], 986),
+            (vec![(1, 0), (511, 64), (2, 5)], 514),
+        ] {
+            let slices = packed(&seqs);
+            let r = overlap_split_row(&slices, total, b).expect("a row");
+            assert!(0 < r && r < total, "{seqs:?}: {r}");
+            let ok = slices.iter().any(|s| {
+                let (st, en) = (s.q_start as usize, (s.q_start + s.q_len) as usize);
+                r == st
+                    || (st < r
+                        && r < en
+                        && ((s.kv_len - s.q_len) as usize + r - st).is_multiple_of(b))
+            });
+            assert!(ok, "{seqs:?}: row {r} is mid-block");
+        }
     }
 }

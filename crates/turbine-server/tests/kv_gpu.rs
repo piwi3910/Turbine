@@ -19,7 +19,8 @@
 //! - `prefix_reuse_matches_cold_tp2`, `prefix_reuse_suffix_lengths_match_cold_tp2`: the same at
 //!   tensor parallelism 2 over both R9700s (P5 Task 29: the tp 2 per-rank GEMM shapes have
 //!   invariant rows too); they need `scripts/lab-test.sh novanas --gpus 2` (a one-GPU Job skips
-//!   them: `TWO_GPU_TESTS` in the script).
+//!   them: `TWO_GPU_TESTS` in the script); their `_overlap` variants run with the tensor-parallel
+//!   prefill overlap on over `hostmem` (P5 Task 34: the split sits at a KV block boundary).
 //! - `nvme_round_trip_matches_cold`: with 1 GiB of L1 (L0 demotes by capacity past 70 %)
 //!   and the NVMe tier at `/home/piwi/turbine-kv`, prompt A runs cold, long filler prompts push
 //!   its blocks through L1 to L2 (L0 → L2 on unified memory), then A runs again: the same greedy
@@ -351,6 +352,45 @@ fn prefix_reuse_matches_cold_tp2() {
         return;
     }
     prefix_reuse_matches_cold_with(&tp2_sets());
+}
+
+/// [`prefix_reuse_matches_cold_tp2`] with the tensor-parallel prefill overlap on, over
+/// `hostmem` as served (P5 Task 34): its prompts of about 400 tokens split, at a KV block
+/// boundary, so the cold run's second half starts where the warm run's suffix does.
+#[test]
+#[ignore = "lab, 2 GPUs (scripts/lab-test.sh novanas --gpus 2): HIP, libturbine_hip.so, Llama-3.2-3B"]
+fn prefix_reuse_matches_cold_tp2_overlap() {
+    if !require_backend("hip") {
+        return;
+    }
+    prefix_reuse_matches_cold_with(&tp2_overlap_sets());
+}
+
+/// [`prefix_reuse_suffix_lengths_match_cold_tp2`] with the prefill overlap on (see
+/// [`prefix_reuse_matches_cold_tp2_overlap`]); the 700-token suffix splits in the warm run too.
+/// Before Task 34 (the middle-row split) this failed.
+#[test]
+#[ignore = "lab, 2 GPUs (scripts/lab-test.sh novanas --gpus 2): HIP, libturbine_hip.so, Llama-3.2-3B"]
+fn prefix_reuse_suffix_lengths_match_cold_tp2_overlap() {
+    if !require_backend("hip") {
+        return;
+    }
+    prefix_reuse_suffix_lengths_match_cold_with(&tp2_overlap_sets());
+}
+
+/// [`tp2_sets`] over `hostmem` with `parallel.tp_prefill_overlap` on.
+fn tp2_overlap_sets() -> Vec<String> {
+    tp2_sets()
+        .into_iter()
+        .map(|s| {
+            if s == "parallel.collective_backend=rccl" {
+                "parallel.collective_backend=hostmem".to_string()
+            } else {
+                s
+            }
+        })
+        .chain(["parallel.tp_prefill_overlap=true".to_string()])
+        .collect()
 }
 
 /// The `--set` overrides of the tp 2 variants: both R9700s as one tensor-parallel group over

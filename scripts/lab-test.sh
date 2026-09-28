@@ -57,7 +57,7 @@ TWO_GPU_TESTS=(
 	hostmem_
 	rccl_init_with_a_missing_peer
 	# crates/turbine-server/tests/kv_gpu.rs: prefix_reuse_matches_cold_tp2,
-	# prefix_reuse_suffix_lengths_match_cold_tp2 (P5 Task 29)
+	# prefix_reuse_suffix_lengths_match_cold_tp2 (P5 Task 29) and their _tp2_overlap variants (Task 34)
 	cold_tp2
 	# crates/turbine-server/tests/fault.rs (--features fault-injection)
 	tp2_collective_failure_recovers_on_gpu

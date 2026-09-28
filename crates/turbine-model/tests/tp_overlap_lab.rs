@@ -1,10 +1,11 @@
-//! Lab only, two GPUs (P5 Task 32 / Task 34 diagnosis): Llama-3.2-3B at tp 2 over `hostmem`
-//! (its RCCL delegate above the thresholds, as served) on both R9700s. One sequence of N prompt
-//! tokens is prefilled serially (twice: the determinism baseline) and with the prefill overlap
-//! (the halves split at the middle row), each into a fresh KV pool; the test prints, per N, the
-//! logits' max |Δ| against the first serial run and, for the first layers whose K/V differ, the
-//! differing token range — which rows (first half, second half, around the split) and which
-//! layer first diverge. Run by `scripts/lab-test.sh novanas --gpus 2 -- -p turbine-model --test
+//! Lab only, two GPUs (P5 Task 32 / Task 34): Llama-3.2-3B at tp 2 over `hostmem` (its RCCL
+//! delegate above the thresholds, as served) on both R9700s. One sequence of N prompt tokens is
+//! prefilled serially (twice: the determinism baseline) and with the prefill overlap (split at
+//! [`overlap_split_row`]: a KV block boundary nearest the middle, Task 34), each into a fresh KV
+//! pool; the test prints, per N, the logits' max |Δ| against the first serial run and, for the
+//! first layers whose K/V differ, the differing token range, and fails unless the split run is
+//! bitwise the serial one (logits and every layer's K/V). Before Task 34 the middle-row split
+//! (mid-block for N = 385, 386, 401) differed from layer 2 on. Run by `scripts/lab-test.sh novanas --gpus 2 -- -p turbine-model --test
 //! tp_overlap_lab -- --nocapture`.
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use turbine_distributed::collective::{self, Collective, CollectiveInit};
 use turbine_kernels::test_support::{open_context_nth, require_backend, require_env_dir};
 use turbine_kernels::{KernelMetrics, KernelRegistry, ShimContext, shim_provider};
 use turbine_model::config::ModelArchConfig;
+use turbine_model::executor::decoder::overlap_split_row;
 use turbine_model::executor::{
     BatchInput, DecoderExecutor, ExecutorLimits, ExecutorOptions, ModelExecutor, SeqSlice,
 };
@@ -205,10 +207,24 @@ fn hostmem_tp2_3b_prefill_split_diagnosis() {
                                 .map(|(x, y)| (x - y).abs())
                                 .fold(0f32, f32::max)
                         };
+                        let row = overlap_split_row(
+                            &[SeqSlice {
+                                seq: SeqId(1),
+                                q_start: 0,
+                                q_len: n,
+                                kv_len: n,
+                                block_table: &[],
+                                reduce: None,
+                            }],
+                            n as usize,
+                            BLOCK_TOKENS as usize,
+                        );
+                        let exact = dmax(&serial.0, &split.0) == 0.0
+                            && kv_diff(&layout, n, &serial.1, &split.1).is_empty();
                         lines.push(format!(
-                            "rank {rank} n {n} split_row {}: serial-vs-serial logits max|d| {} \
+                            "{} rank {rank} n {n} split_row {row:?}: serial-vs-serial logits max|d| {} \
                              kv_diff {:?}; split-vs-serial logits max|d| {} first kv diffs {:?}",
-                            n / 2,
+                            if exact { "EXACT" } else { "DIFFERS" },
                             dmax(&serial.0, &again.0),
                             kv_diff(&layout, n, &serial.1, &again.1)
                                 .into_iter()
@@ -233,4 +249,13 @@ fn hostmem_tp2_3b_prefill_split_diagnosis() {
     for line in reports.iter().flatten() {
         println!("tp-split-diag {line}");
     }
+    let differs: Vec<&String> = reports
+        .iter()
+        .flatten()
+        .filter(|l| l.starts_with("DIFFERS"))
+        .collect();
+    assert!(
+        differs.is_empty(),
+        "the block-aligned overlap split differs from the serial prefill: {differs:?}"
+    );
 }

@@ -3703,11 +3703,12 @@ fn hostmem_tp2_graphs_match_eager() {
 
 /// P5 Task 32 (tensor-parallel prefill overlap): the tiny Llama at tp 2 on the host collective
 /// (cpu-reference provider, no side stream, so the halves run one after the other), with the
-/// prefill split at row 16 of the ragged 20 + 13-token prefill — the first sequence continues in
-/// the second half after its first 16 rows' K/V — gives [`greedy_pair`]'s tokens and every
-/// logits row bitwise equal to the unsplit run on both ranks. Breaks if a half's attention
-/// metadata, its row window, the order of a half's norm and all-reduce, or the continuation of
-/// the straddling sequence is wrong.
+/// ragged 20 + 13-token prefill split at row 20 (the second sequence's start: P5 Task 34 splits
+/// only at a sequence start or a KV block boundary, and no block boundary falls inside these
+/// sequences), gives [`greedy_pair`]'s tokens and every logits row bitwise equal to the unsplit
+/// run on both ranks. Breaks if a half's attention metadata, its row window or the order of a
+/// half's norm and all-reduce is wrong; [`tp2_prefill_split_at_a_block_boundary_matches_unsplit`]
+/// covers a sequence continuing across the split.
 #[test]
 fn tp2_prefill_split_matches_unsplit_on_host() {
     let tmp = TempDir::new("tiny-model-tp-split");
@@ -4732,4 +4733,68 @@ fn hip_pp2_matches_pp1() {
         check_pp_against_one_device(&what, &stages, &want);
         println!("hip_pp2_matches_pp1 {what}: bitwise");
     }
+}
+
+/// P5 Task 34: the tiny Llama at tp 2 on the host collective prefills one 160-token sequence in
+/// chunks of 60, 60 and 40 rows with the overlap on at any size; the first two chunks hold no
+/// block boundary and do not split, the third (120 cached tokens) splits at row 8 — KV position
+/// 128, a block boundary inside the sequence, which continues in the second half after its
+/// first 8 rows' K/V. Every chunk's last logits row is bitwise the unsplit run's on both ranks.
+/// Breaks if the split ignores the cached prefix (the middle row 20 would be mid-block), or the
+/// continuation of the straddling sequence (its K/V start, its kv_len) is wrong.
+#[test]
+fn tp2_prefill_split_at_a_block_boundary_matches_unsplit() {
+    let tmp = TempDir::new("tiny-model-tp-split-block");
+    let spec = write_tiny_llama(tmp.path(), SEED);
+    let tokens: Vec<u32> = (0..160u32).map(|i| (i * 37 + 11) % spec.vocab).collect();
+    let run = |split: bool| -> Vec<Vec<Vec<f32>>> {
+        let group = HostCollective::group(2, std::time::Duration::from_secs(60));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = group
+                .into_iter()
+                .enumerate()
+                .map(|(rank, collective)| {
+                    let (spec, tokens) = (&spec, &tokens);
+                    scope.spawn(move || {
+                        let s = tp::ShardSpec {
+                            rank: rank as u32,
+                            world: 2,
+                        };
+                        let mem: Arc<dyn DeviceMemory> =
+                            HostMemory::new(DeviceId(rank as u32), 1 << 30);
+                        let collective: Arc<dyn Collective> = Arc::new(collective);
+                        let mut exec = tp_decoder(spec, Some((s, collective)), &mem);
+                        if split {
+                            assert!(exec.set_prefill_overlap(Some(2)), "rank {rank}: overlap on");
+                        }
+                        let layout = *exec.kv_layout();
+                        let storage = pool(&mem, &layout, 2);
+                        let kv = pool_view(&storage, &layout, 2);
+                        let table = [BlockId(0), BlockId(1)];
+                        let rows: Vec<Vec<f32>> = [(0usize, 60usize), (60, 120), (120, 160)]
+                            .iter()
+                            .map(|&(a, b)| run_seq(&mut exec, &kv, &table, &tokens[a..b], a as u32))
+                            .collect();
+                        // Only the last chunk holds a block boundary (KV position 128).
+                        assert_eq!(exec.prefill_splits(), u64::from(split), "rank {rank}");
+                        rows
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("rank thread"))
+                .collect()
+        })
+    };
+    let (serial, split) = (run(false), run(true));
+    for rank in 0..2 {
+        for chunk in 0..3 {
+            assert!(
+                split[rank][chunk] == serial[rank][chunk],
+                "rank {rank} chunk {chunk}: split prefill logits differ from the unsplit run"
+            );
+        }
+    }
+    println!("tp2_prefill_split_at_a_block_boundary_matches_unsplit: bitwise on both ranks");
 }
