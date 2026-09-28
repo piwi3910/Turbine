@@ -18,6 +18,7 @@ use turbine_core::config::DevicesConfig;
 use turbine_core::types::{BlockId, DType, DeviceId, Vendor};
 use turbine_device::{DiscoveryOptions, discover};
 use turbine_kernels::cards::GFX1201;
+use turbine_kernels::cpu::quant::fp8_e4m3_round;
 use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
@@ -1088,13 +1089,61 @@ fn paged_case(
     q_lens: &[usize],
     kv_lens: &[usize],
 ) -> String {
+    paged_case_pages(
+        p,
+        rng,
+        kind,
+        heads,
+        block_tokens,
+        q_lens,
+        kv_lens,
+        Pages::Bf16,
+    )
+}
+
+/// The KV pages of a paged case: BF16, or FP8 e4m3 with the layer's K and V scales.
+#[derive(Clone, Copy, Debug)]
+enum Pages {
+    Bf16,
+    Fp8 { k_scale: f32, v_scale: f32 },
+}
+
+/// FP8 history bytes: the e4m3 codes of normal samples (as K/V of scale 1 would be stored), so
+/// scores stay in the range real pages give (uniform codes up to ±448 would make every softmax
+/// row one-hot and turn rounding-order noise into large differences).
+fn fp8_history(rng: &mut Rng, n: usize) -> Vec<u8> {
+    rng.normal(4099, 1.0)
+        .iter()
+        .map(|&x| fp8_e4m3_round(x))
+        .cycle()
+        .take(n)
+        .collect()
+}
+
+/// [`paged_case`] over `pages`: FP8 pages start with random e4m3 history and are compared byte
+/// for byte after the append.
+#[allow(clippy::too_many_arguments)]
+fn paged_case_pages(
+    p: &Pair,
+    rng: &mut Rng,
+    kind: AttentionKind,
+    heads: (usize, usize),
+    block_tokens: usize,
+    q_lens: &[usize],
+    kv_lens: &[usize],
+    pages: Pages,
+) -> String {
     let (q_heads, kv_heads) = heads;
+    let (page_dtype, (k_scale, v_scale)) = match pages {
+        Pages::Bf16 => (DType::BF16, (1.0, 1.0)),
+        Pages::Fp8 { k_scale, v_scale } => (DType::F8E4M3, (k_scale, v_scale)),
+    };
     let cfg = AttentionConfig {
         kind,
         num_q_heads: q_heads as u32,
         num_kv_heads: kv_heads as u32,
         head_dim: HEAD_DIM as u32,
-        dtype: DType::BF16,
+        dtype: page_dtype,
         block_tokens: Some(block_tokens as u32),
         causal: true,
     };
@@ -1129,7 +1178,17 @@ fn paged_case(
     let pool_len = num_blocks * 2 * block_tokens * kv_rows;
 
     // The pool starts with random history in every slot, including the unowned blocks.
-    let (pool_hip, pool_cpu) = twin(p, &pool_shape, DType::BF16, &rng.normal(pool_len, 1.0));
+    let (pool_hip, pool_cpu) = match pages {
+        Pages::Bf16 => twin(p, &pool_shape, DType::BF16, &rng.normal(pool_len, 1.0)),
+        Pages::Fp8 { .. } => {
+            let raw = fp8_history(rng, pool_len);
+            let mut hip = Tensor::empty(&p.hip_mem, &pool_shape, DType::F8E4M3).expect("HIP");
+            let mut cpu = Tensor::empty(&p.cpu_mem, &pool_shape, DType::F8E4M3).expect("host");
+            hip.storage.copy_from_host(0, &raw).expect("copy to HIP");
+            cpu.storage.copy_from_host(0, &raw).expect("copy to host");
+            (hip, cpu)
+        }
+    };
     let q_shape = [total_q, q_heads, HEAD_DIM];
     let new_shape = [total_q, kv_heads, HEAD_DIM];
     let (q_hip, q_cpu) = twin(p, &q_shape, DType::BF16, &rng.normal(total_q * q_rows, 1.0));
@@ -1177,14 +1236,14 @@ fn paged_case(
             max_kv_len: kv_lens.iter().copied().max().unwrap_or(0) as u32,
             max_blocks_per_seq: max_blocks as u32,
             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
-            k_scale: 1.0,
-            v_scale: 1.0,
+            k_scale,
+            v_scale,
         };
         kernel.execute_paged(&mut ctx).expect("paged attention");
     }
     let what = format!(
-        "{} heads={q_heads}/{kv_heads} block_tokens={block_tokens} q_lens={q_lens:?} \
-         kv_lens={kv_lens:?}",
+        "{} heads={q_heads}/{kv_heads} block_tokens={block_tokens} pages={pages:?} \
+         q_lens={q_lens:?} kv_lens={kv_lens:?}",
         cfg.op()
     );
     assert_close(
@@ -1194,12 +1253,23 @@ fn paged_case(
         &read(&o_cpu),
         DType::BF16,
     );
-    assert_exact(
-        &format!("{what} pool after append"),
-        &impl_name,
-        &read(&pool_hip),
-        &read(&pool_cpu),
-    );
+    if matches!(pages, Pages::Bf16) {
+        assert_exact(
+            &format!("{what} pool after append"),
+            &impl_name,
+            &read(&pool_hip),
+            &read(&pool_cpu),
+        );
+    } else {
+        let bytes = |t: &Tensor| t.view().slice.read_bytes().expect("read back");
+        let (hip_bytes, cpu_bytes) = (bytes(&pool_hip), bytes(&pool_cpu));
+        let first = hip_bytes.iter().zip(&cpu_bytes).position(|(h, c)| h != c);
+        assert!(
+            first.is_none(),
+            "{what} pool after append ({impl_name}): byte {first:?} differs"
+        );
+        println!("{what} pool after append: impl={impl_name} exact ok");
+    }
     impl_name
 }
 
@@ -1568,6 +1638,365 @@ fn paged_decode_splitkv_matches_cpu() {
                 got, "ck_tile_fmha_splitkv",
                 "heads={heads:?} kv_lens={kv_lens:?}"
             );
+        }
+    }
+}
+
+/// Phase 6a S-13 (plan Task 23): paged attention over FP8 e4m3 pages matches the CPU reference
+/// (pages written as `e4m3(x / scale)`, read as `bf16(e4m3 · scale)`) for every registered FP8
+/// implementation, each run alone as the registry binds it: prefill batches (ragged chunks after
+/// cached tokens with decode rows riding along; 64 sequences whose staged pages need two CK
+/// groups; one sequence too long to stage, which runs the Turbine kernel) and decode batches, at
+/// 128- and 16-token pages, the Llama (24/8), OLMoE (16/16) and GQA-4 (32/8) head shapes, unit
+/// and non-unit K/V scales; the append's page bytes are compared exactly. The library's own
+/// choice is the staged CK prefill at 128-token pages, the Turbine FP8 kernel at 16, and the FP8
+/// decode kernel. Breaks if a page is written or read with the wrong scale or byte, or a group,
+/// staged table or head mapping is wrong.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn paged_fp8_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(23);
+    // (new tokens, cached tokens before them) per sequence.
+    let mixed: &[(usize, usize)] = &[(512, 1000), (17, 0), (1, 255), (300, 100), (1, 1)];
+    let many: Vec<(usize, usize)> = (0..64).map(|s| (1, 1060 + (37 * s) % 60)).collect();
+    let decode_lens = [1usize, 17, 128, 129, 1001];
+    let ragged16: Vec<usize> = (0..16).map(|s| 740 + (37 * s) % 90).collect();
+    let scales = [
+        Pages::Fp8 {
+            k_scale: 1.0,
+            v_scale: 1.0,
+        },
+        Pages::Fp8 {
+            k_scale: 0.07,
+            v_scale: 0.11,
+        },
+    ];
+    for heads in [(Q_HEADS, KV_HEADS), (16, 16), (32, 8)] {
+        for block_tokens in [128usize, 16] {
+            let cfg = |kind| AttentionConfig {
+                kind,
+                num_q_heads: heads.0 as u32,
+                num_kv_heads: heads.1 as u32,
+                head_dim: HEAD_DIM as u32,
+                dtype: DType::F8E4M3,
+                block_tokens: Some(block_tokens as u32),
+                causal: true,
+            };
+            let hip = p.hip.attention().expect("hip attention");
+            let prefill_default = hip.implementation(&cfg(AttentionKind::PrefillPaged));
+            let want = if block_tokens == 128 {
+                "ck_tile_fmha_pagedkv_fp8_staged"
+            } else {
+                "turbine_hip_fp8"
+            };
+            assert_eq!(
+                prefill_default, want,
+                "prefill heads={heads:?} {block_tokens}"
+            );
+            assert_eq!(
+                hip.implementation(&cfg(AttentionKind::DecodePaged)),
+                "turbine_hip_fp8_decode",
+                "decode heads={heads:?} {block_tokens}"
+            );
+            for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
+                let spec = OpConfig::Attention(cfg(kind));
+                let impls: Vec<ImplInfo> = p
+                    .hip
+                    .implementations(spec.op())
+                    .into_iter()
+                    .filter(|i| p.hip.implementation_supports(&spec, i.index, None))
+                    .collect();
+                assert!(
+                    impls.iter().all(|i| i.name.contains("fp8")),
+                    "only FP8 implementations take FP8 pages: {impls:?}"
+                );
+                assert!(!impls.is_empty(), "{kind:?}: {impls:?}");
+                for info in &impls {
+                    let b = bound(&p, &spec, info.index);
+                    for pages in scales {
+                        let run = |rng: &mut Rng, batch: &[(usize, usize)]| {
+                            let q_lens: Vec<usize> = batch.iter().map(|&(q, _)| q).collect();
+                            let kv_lens: Vec<usize> = batch.iter().map(|&(q, c)| q + c).collect();
+                            let got = paged_case_pages(
+                                &b,
+                                rng,
+                                kind,
+                                heads,
+                                block_tokens,
+                                &q_lens,
+                                &kv_lens,
+                                pages,
+                            );
+                            assert_eq!(got, info.name);
+                        };
+                        match kind {
+                            AttentionKind::PrefillPaged => {
+                                run(&mut rng, mixed);
+                                if heads == (Q_HEADS, KV_HEADS) {
+                                    run(&mut rng, &many);
+                                }
+                            }
+                            _ => {
+                                for batch in [&decode_lens[..], &ragged16] {
+                                    let batch: Vec<(usize, usize)> =
+                                        batch.iter().map(|&k| (1, k - 1)).collect();
+                                    run(&mut rng, &batch);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // One sequence whose staged pages exceed the staging bound (256 MiB: 513 Llama pages of
+    // 128 tokens) runs the Turbine FP8 kernel inside the staged implementation.
+    let spec = OpConfig::Attention(AttentionConfig {
+        kind: AttentionKind::PrefillPaged,
+        num_q_heads: Q_HEADS as u32,
+        num_kv_heads: KV_HEADS as u32,
+        head_dim: HEAD_DIM as u32,
+        dtype: DType::F8E4M3,
+        block_tokens: Some(128),
+        causal: true,
+    });
+    let staged = p
+        .hip
+        .implementations(spec.op())
+        .into_iter()
+        .find(|i| i.name == "ck_tile_fmha_pagedkv_fp8_staged")
+        .expect("the staged implementation");
+    let got = paged_case_pages(
+        &bound(&p, &spec, staged.index),
+        &mut rng,
+        AttentionKind::PrefillPaged,
+        (Q_HEADS, KV_HEADS),
+        128,
+        &[3, 1],
+        &[66_000, 40],
+        scales[1],
+    );
+    assert_eq!(got, "ck_tile_fmha_pagedkv_fp8_staged");
+}
+
+/// FP8 KV paged decode timings (plan Task 23 provider evaluation): `attention_decode_paged`
+/// (append + attend) of every implementation that takes BF16 pages, then every one that takes
+/// FP8 pages, bound as the registry binds it, for Llama (24/8) and OLMoE (16/16) at 128-token
+/// pages, batches 1, 16 and 64 at ~768 tokens and 16 at ~2,048 / ~8,192; pools cycled past the
+/// MALL as in `decode_attention_timings`. Prints `decode_attention_fp8` lines with the KV
+/// bandwidth of the pool's own bytes (2 per element for BF16, 1 for FP8).
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn decode_attention_timings_fp8() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(11);
+    const ITERS: u32 = 50;
+    const BLOCK_TOKENS: usize = 128;
+    let cases: [(usize, usize); 5] = [(1, 768), (16, 768), (64, 768), (16, 2048), (16, 8192)];
+    for model in BENCH_MODELS {
+        for page_dtype in [DType::BF16, DType::F8E4M3] {
+            let cfg = AttentionConfig {
+                dtype: page_dtype,
+                ..model.attention_cfg(BLOCK_TOKENS)
+            };
+            let spec = OpConfig::Attention(cfg);
+            let impls: Vec<ImplInfo> = p
+                .hip
+                .implementations(OpKind::AttentionDecodePaged)
+                .into_iter()
+                .filter(|i| p.hip.implementation_supports(&spec, i.index, None))
+                .collect();
+            let es = page_dtype.size_bytes();
+            let max_m = cases.iter().map(|&(m, _)| m).max().unwrap_or(1);
+            let q = on_hip(
+                &p,
+                &[max_m, model.q_heads, HEAD_DIM],
+                DType::BF16,
+                &rng.normal(max_m * model.q_rows(), 1.0),
+            );
+            let kv_new = on_hip(
+                &p,
+                &[max_m, model.kv_heads, HEAD_DIM],
+                DType::BF16,
+                &rng.normal(max_m * model.kv_rows(), 1.0),
+            );
+            let out = zeros_on_hip(&p, &[max_m, model.q_heads, HEAD_DIM], DType::BF16);
+            for &(m, ctx) in &cases {
+                let kv_lens = bench_kv_lens(m, ctx);
+                let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
+                let max_blocks = max_kv.div_ceil(BLOCK_TOKENS);
+                let num_blocks = m * max_blocks;
+                let pool_elems = num_blocks * 2 * BLOCK_TOKENS * model.kv_rows();
+                let copies = (512usize << 20).div_ceil(pool_elems * es).max(1);
+                let raw = if page_dtype == DType::F8E4M3 {
+                    fp8_history(&mut rng, pool_elems)
+                } else {
+                    encode(DType::BF16, &pattern(&mut rng, pool_elems, 1.0))
+                };
+                let pool_shape = [num_blocks, 2, BLOCK_TOKENS, model.kv_heads, HEAD_DIM];
+                let pools: Vec<Tensor> = (0..copies)
+                    .map(|_| raw_on_hip(&p, &pool_shape, page_dtype, &raw))
+                    .collect();
+                let table: Vec<f32> = shuffled(&mut rng, num_blocks)
+                    .iter()
+                    .map(|&b| b as f32)
+                    .collect();
+                let bt = on_hip(&p, &[m, max_blocks], DType::I32, &table);
+                let indptr: Vec<f32> = (0..=m).map(|i| i as f32).collect();
+                let ip = on_hip(&p, &[m + 1], DType::I32, &indptr);
+                let lens: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
+                let kl = on_hip(&p, &[m], DType::I32, &lens);
+                let kv_bytes = kv_lens.iter().sum::<usize>() * model.kv_rows() * 2 * es;
+                for info in &impls {
+                    let b = bound(&p, &spec, info.index);
+                    let attn = b.hip.attention().expect("hip attention");
+                    let mut next = 0usize;
+                    let us = time_us(&b, ITERS, || {
+                        next = (next + 1) % copies;
+                        attn.execute_paged(&mut PagedAttentionContext {
+                            cfg,
+                            q: q.view().rows(0, m),
+                            k_new: kv_new.view().rows(0, m),
+                            v_new: kv_new.view().rows(0, m),
+                            out: out.view().rows(0, m),
+                            kv_layer: pools[next].view(),
+                            block_table: bt.view(),
+                            q_indptr: ip.view(),
+                            kv_lens: kl.view(),
+                            max_q_len: 1,
+                            max_kv_len: max_kv as u32,
+                            max_blocks_per_seq: max_blocks as u32,
+                            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                            k_scale: 1.0,
+                            v_scale: 1.0,
+                        })
+                        .expect("paged decode attention");
+                    });
+                    println!(
+                        "decode_attention_fp8 {} heads={}/{} pages={} impl={} b={m} kv~{ctx}: \
+                         {us:.1} us ({:.0} GB/s of KV)",
+                        model.name,
+                        model.q_heads,
+                        model.kv_heads,
+                        page_dtype.as_str(),
+                        info.name,
+                        kv_bytes as f64 / us / 1e3,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// FP8 KV paged prefill timings (plan Task 23 provider evaluation): `attention_prefill_paged`
+/// (append + attend) of every implementation taking BF16 pages, then FP8 pages, bound as the
+/// registry binds it, at 128-token pages: 16 prompts of 512 new tokens after 0 and after 1,024
+/// cached tokens, and one prompt of 2,048 new tokens, for Llama and OLMoE heads. Prints
+/// `prefill_attention_fp8` lines.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn prefill_op_timings_fp8() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(12);
+    const ITERS: u32 = 10;
+    const BLOCK_TOKENS: usize = 128;
+    // (sequences, new tokens, cached tokens) per case.
+    let cases: [(usize, usize, usize); 3] = [(16, 512, 0), (16, 512, 1024), (1, 2048, 0)];
+    for model in BENCH_MODELS {
+        for page_dtype in [DType::BF16, DType::F8E4M3] {
+            let cfg = AttentionConfig {
+                kind: AttentionKind::PrefillPaged,
+                dtype: page_dtype,
+                ..model.attention_cfg(BLOCK_TOKENS)
+            };
+            let spec = OpConfig::Attention(cfg);
+            let impls: Vec<ImplInfo> = p
+                .hip
+                .implementations(OpKind::AttentionPrefillPaged)
+                .into_iter()
+                .filter(|i| p.hip.implementation_supports(&spec, i.index, None))
+                .collect();
+            for &(m, new, cached) in &cases {
+                let total_q = m * new;
+                let kv = new + cached;
+                let max_blocks = kv.div_ceil(BLOCK_TOKENS);
+                let num_blocks = m * max_blocks;
+                let pool_elems = num_blocks * 2 * BLOCK_TOKENS * model.kv_rows();
+                let raw = if page_dtype == DType::F8E4M3 {
+                    fp8_history(&mut rng, pool_elems)
+                } else {
+                    encode(DType::BF16, &pattern(&mut rng, pool_elems, 1.0))
+                };
+                let pool_shape = [num_blocks, 2, BLOCK_TOKENS, model.kv_heads, HEAD_DIM];
+                let pool = raw_on_hip(&p, &pool_shape, page_dtype, &raw);
+                let q = on_hip(
+                    &p,
+                    &[total_q, model.q_heads, HEAD_DIM],
+                    DType::BF16,
+                    &pattern(&mut rng, total_q * model.q_rows(), 1.0),
+                );
+                let kv_new = on_hip(
+                    &p,
+                    &[total_q, model.kv_heads, HEAD_DIM],
+                    DType::BF16,
+                    &pattern(&mut rng, total_q * model.kv_rows(), 1.0),
+                );
+                let out = zeros_on_hip(&p, &[total_q, model.q_heads, HEAD_DIM], DType::BF16);
+                let table: Vec<f32> = shuffled(&mut rng, num_blocks)
+                    .iter()
+                    .map(|&b| b as f32)
+                    .collect();
+                let bt = on_hip(&p, &[m, max_blocks], DType::I32, &table);
+                let indptr: Vec<f32> = (0..=m).map(|i| (i * new) as f32).collect();
+                let ip = on_hip(&p, &[m + 1], DType::I32, &indptr);
+                let kl = on_hip(&p, &[m], DType::I32, &vec![kv as f32; m]);
+                for info in &impls {
+                    let b = bound(&p, &spec, info.index);
+                    let attn = b.hip.attention().expect("hip attention");
+                    let us = time_us(&b, ITERS, || {
+                        attn.execute_paged(&mut PagedAttentionContext {
+                            cfg,
+                            q: q.view(),
+                            k_new: kv_new.view(),
+                            v_new: kv_new.view(),
+                            out: out.view(),
+                            kv_layer: pool.view(),
+                            block_table: bt.view(),
+                            q_indptr: ip.view(),
+                            kv_lens: kl.view(),
+                            max_q_len: new as u32,
+                            max_kv_len: kv as u32,
+                            max_blocks_per_seq: max_blocks as u32,
+                            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                            k_scale: 1.0,
+                            v_scale: 1.0,
+                        })
+                        .expect("paged prefill attention");
+                    });
+                    println!(
+                        "prefill_attention_fp8 {} heads={}/{} pages={} impl={} seqs={m} \
+                         new={new} cached={cached}: {us:.1} us",
+                        model.name,
+                        model.q_heads,
+                        model.kv_heads,
+                        page_dtype.as_str(),
+                        info.name,
+                    );
+                }
+            }
         }
     }
 }
@@ -4628,11 +5057,15 @@ fn implementations_enumerated() {
     let paged = vec![
         ("ck_tile_fmha_pagedkv", "ck", false),
         ("turbine_hip", "turbine_hip", false),
+        ("ck_tile_fmha_pagedkv_fp8_staged", "ck", false),
+        ("turbine_hip_fp8", "turbine_hip", false),
     ];
     let paged_decode = vec![
         ("ck_tile_fmha_splitkv", "ck", false),
         ("ck_tile_fmha_pagedkv", "ck", false),
         ("turbine_hip", "turbine_hip", false),
+        ("turbine_hip_fp8_decode", "turbine_hip", false),
+        ("turbine_hip_fp8", "turbine_hip", false),
     ];
     // (name, provider, needs host offsets) in library order.
     type Impls = Vec<(&'static str, &'static str, bool)>;
@@ -4917,6 +5350,38 @@ fn every_implementation_matches_cpu() {
     }
     for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
         for block_tokens in [16, 128] {
+            let OpConfig::Attention(base) =
+                attention(kind, Some(block_tokens), (Q_HEADS, KV_HEADS))
+            else {
+                unreachable!("an attention config")
+            };
+            let fp8 = AttentionConfig {
+                dtype: DType::F8E4M3,
+                ..base
+            };
+            cases.push(case(
+                OpConfig::Attention(fp8),
+                Box::new(move |p, rng| {
+                    let (q_lens, kv_lens): (&[usize], &[usize]) = match kind {
+                        AttentionKind::PrefillPaged => (&[37, 1, 70], &[37, 300, 200]),
+                        _ => (&[1, 1, 1, 1], &[1, 17, 129, 513]),
+                    };
+                    let pages = Pages::Fp8 {
+                        k_scale: 0.07,
+                        v_scale: 0.11,
+                    };
+                    paged_case_pages(
+                        p,
+                        rng,
+                        kind,
+                        (Q_HEADS, KV_HEADS),
+                        block_tokens,
+                        q_lens,
+                        kv_lens,
+                        pages,
+                    );
+                }),
+            ));
             cases.push(case(
                 attention(kind, Some(block_tokens), (Q_HEADS, KV_HEADS)),
                 Box::new(move |p, rng| {

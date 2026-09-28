@@ -24,12 +24,32 @@
 // Decode is the same computation with one query per sequence and runs the same
 // paths.
 //
+// FP8 pages (dtype TURBINE_DTYPE_F8E4M3, kv.dtype fp8_e4m3, Phase 6a S-13):
+// the append writes e4m3(x / scale) with the descriptor's k_scale / v_scale
+// (read at ABI minor >= 9; a caller only sends dtype F8E4M3 from there), and
+// attention reads bf16(e4m3 * scale). The BF16 implementations refuse FP8
+// pages; the FP8 ones (decision "P6: FP8 paged attention -- provider
+// evaluation") are:
+// - "ck_tile_fmha_pagedkv_fp8_staged" (prefill, pages of a multiple of 128):
+//   the batch's pages dequantized into a BF16 staging pool in the context's
+//   attention scratch, then CK fmha_fwd_pagedkv over it with a staged block
+//   table, in groups of sequences whose staged pages fit kStagedMaxBytes; a
+//   call where one sequence alone does not fit runs the Turbine FP8 kernel;
+// - "turbine_hip_fp8_decode" (decode, any page size): paged_attention.hip's
+//   FP8 decode kernel, the query heads of a KV head together, pages read as
+//   bytes;
+// - "turbine_hip_fp8" (any page size): the Turbine kernel reading FP8 pages.
+//
 // The device arrays (block_table, q_indptr, kv_lens) are trusted: the host
 // cannot read them without a synchronisation. The Turbine kernels skip pages
 // outside the pool instead of faulting.
 #include <string>
 
+#include <algorithm>
+#include <cmath>
+
 #include "fmha_fwd.hpp"
+#include "paged_fp8.hpp"
 #include "turbine_hip.hpp"
 
 using turbine_hip::check_hip;
@@ -41,6 +61,12 @@ namespace {
 constexpr const char *kImplCk = "ck_tile_fmha_pagedkv";
 constexpr const char *kImplCkSplitkv = "ck_tile_fmha_splitkv";
 constexpr const char *kImplTurbine = "turbine_hip";
+constexpr const char *kImplCkFp8Staged = "ck_tile_fmha_pagedkv_fp8_staged";
+constexpr const char *kImplTurbineFp8Decode = "turbine_hip_fp8_decode";
+constexpr const char *kImplTurbineFp8 = "turbine_hip_fp8";
+// Bytes of BF16 staged pages (plus their table) one CK call of the staged FP8
+// prefill may use: sequences are staged in groups that fit.
+constexpr int64_t kStagedMaxBytes = int64_t{256} << 20;
 constexpr int32_t kHeadDim = 128;
 // Page sizes the CK pagedkv instances serve are multiples of this: a
 // property of the instances (a capability supports reports), not a tuning
@@ -52,8 +78,10 @@ constexpr int32_t kMaxGridYZ = 65535;
 bool supported(const turbine_attention_paged_desc *d) {
   if (d == nullptr)
     return false;
-  if (d->dtype != TURBINE_DTYPE_BF16 || d->head_dim != kHeadDim)
+  if ((d->dtype != TURBINE_DTYPE_BF16 && d->dtype != TURBINE_DTYPE_F8E4M3) ||
+      d->head_dim != kHeadDim) {
     return false;
+  }
   if (d->causal != 0 && d->causal != 1)
     return false;
   if (d->num_q_heads < 1 || d->num_kv_heads < 1 ||
@@ -101,8 +129,29 @@ std::string describe(const turbine_attention_paged_desc *d) {
          " causal=" + std::to_string(d->causal);
 }
 
+// The pages CK reads: the pool (BF16) or a staged copy of FP8 pages, with its
+// block table, for sequences [g0, g0 + count).
+struct CkPages {
+  const uint16_t *pool;
+  const int32_t *table;
+  int32_t table_stride;
+  int32_t g0;
+  int32_t count;
+};
+
+int32_t run_ck_pages(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
+                     const std::string &entry, const CkPages &pages);
+
 int32_t run_ck(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                const std::string &entry) {
+  return run_ck_pages(ctx, d, entry,
+                      CkPages{static_cast<const uint16_t *>(d->kv_layer),
+                              d->block_table, d->max_blocks_per_seq, 0,
+                              d->num_seqs});
+}
+
+int32_t run_ck_pages(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
+                     const std::string &entry, const CkPages &pages) {
   fmha_fwd_pagedkv_traits traits{};
   traits.hdim_q = kHeadDim;
   traits.hdim_v = kHeadDim;
@@ -123,7 +172,7 @@ int32_t run_ck(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   const auto page_stride =
       static_cast<ck_tile::index_t>(2 * d->block_tokens * token_elems);
   // BF16 elements, addressed as their 16-bit storage.
-  const auto *pool = static_cast<const uint16_t *>(d->kv_layer);
+  const uint16_t *pool = pages.pool;
 
   fmha_fwd_pagedkv_args args{};
   args.q_ptr = d->q;
@@ -132,21 +181,23 @@ int32_t run_ck(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   args.bias_ptr = nullptr;
   args.lse_ptr = nullptr;
   args.o_ptr = d->out;
-  args.block_table_ptr = const_cast<int32_t *>(d->block_table);
-  args.batch_stride_block_table = d->max_blocks_per_seq;
+  args.block_table_ptr = const_cast<int32_t *>(pages.table);
+  args.batch_stride_block_table = pages.table_stride;
   args.page_block_size = d->block_tokens;
   args.is_gappy = false;
   args.cache_batch_idx = nullptr;
   // Group mode with a page table: query rows from seqstart_q, key counts from
   // seqlen_k. The kernel reads seqstart_k[b] but, with pages, only for an
   // offset it never uses; q_indptr is a valid [num_seqs + 1] array for it.
-  args.seqstart_q_ptr = d->q_indptr;
-  args.seqstart_k_ptr = d->q_indptr;
-  args.seqlen_k_ptr = d->kv_lens;
+  // A group [g0, g0 + count) reads its slice of the arrays: q_indptr holds
+  // absolute rows, so the group's queries stay where they are.
+  args.seqstart_q_ptr = d->q_indptr + pages.g0;
+  args.seqstart_k_ptr = d->q_indptr + pages.g0;
+  args.seqlen_k_ptr = d->kv_lens + pages.g0;
   args.sink_ptr = nullptr;
   args.seqlen_q = d->max_q_len;
   args.seqlen_k = d->max_kv_len;
-  args.batch = d->num_seqs;
+  args.batch = pages.count;
   args.max_seqlen_q = d->max_q_len;
   args.hdim_q = kHeadDim;
   args.hdim_v = kHeadDim;
@@ -192,13 +243,22 @@ int32_t run_ck(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
 // What path serves beyond the common checks of supported().
 bool path_serves(const turbine_attention_paged_desc *d,
                  turbine_hip::PagedPath path) {
+  const bool fp8 = d->dtype == TURBINE_DTYPE_F8E4M3;
   switch (path) {
   case turbine_hip::PagedPath::CkPagedkv:
-    return ck_serves(d);
+    return !fp8 && ck_serves(d);
   case turbine_hip::PagedPath::CkSplitkv:
-    return ck_serves(d) && turbine_hip::ck_splitkv_serves(d);
+    return !fp8 && ck_serves(d) && turbine_hip::ck_splitkv_serves(d);
   case turbine_hip::PagedPath::Turbine:
-    return true;
+    return !fp8;
+  case turbine_hip::PagedPath::CkPagedkvFp8Staged:
+    return fp8 && ck_serves(d);
+  case turbine_hip::PagedPath::TurbineFp8Decode:
+    return fp8 && d->max_q_len <= 1 && d->total_q <= d->num_seqs &&
+           d->num_q_heads / d->num_kv_heads <=
+               turbine_hip::kPagedFp8DecodeMaxGroup;
+  case turbine_hip::PagedPath::TurbineFp8:
+    return fp8;
   }
   return false;
 }
@@ -209,10 +269,65 @@ const char *path_name(turbine_hip::PagedPath path) {
     return kImplCk;
   case turbine_hip::PagedPath::CkSplitkv:
     return kImplCkSplitkv;
+  case turbine_hip::PagedPath::CkPagedkvFp8Staged:
+    return kImplCkFp8Staged;
+  case turbine_hip::PagedPath::TurbineFp8Decode:
+    return kImplTurbineFp8Decode;
+  case turbine_hip::PagedPath::TurbineFp8:
+    return kImplTurbineFp8;
   case turbine_hip::PagedPath::Turbine:
     break;
   }
   return kImplTurbine;
+}
+
+// The staged FP8 prefill: groups of sequences whose pages, dequantized to BF16,
+// fit kStagedMaxBytes, each staged into the attention scratch and run through
+// CK; the Turbine FP8 kernel when one sequence alone does not fit.
+int32_t run_ck_fp8_staged(turbine_ctx *ctx,
+                          const turbine_attention_paged_desc *d,
+                          const std::string &entry) {
+  const int64_t token_elems = static_cast<int64_t>(d->num_kv_heads) * kHeadDim;
+  const int64_t block_bytes =
+      2 * static_cast<int64_t>(d->block_tokens) * token_elems * 2;
+  const int64_t pages =
+      (static_cast<int64_t>(d->max_kv_len) + d->block_tokens - 1) /
+      d->block_tokens;
+  if (pages < 1)
+    return TURBINE_OK;
+  const int64_t per_seq = pages * (block_bytes + 4);
+  if (per_seq > kStagedMaxBytes || pages > d->max_blocks_per_seq)
+    return turbine_hip::launch_paged_attention(ctx, d);
+  const int64_t group =
+      std::min<int64_t>(kStagedMaxBytes / per_seq, d->num_seqs);
+  const int64_t pool_bytes = group * pages * block_bytes;
+  void *scratch = nullptr;
+  if (int32_t rc = turbine_hip::attention_scratch(
+          ctx, static_cast<size_t>(pool_bytes + group * pages * 4), &scratch);
+      rc != TURBINE_OK) {
+    return rc;
+  }
+  auto *staged = static_cast<uint16_t *>(scratch);
+  auto *table =
+      reinterpret_cast<int32_t *>(static_cast<char *>(scratch) + pool_bytes);
+  for (int64_t g0 = 0; g0 < d->num_seqs; g0 += group) {
+    const auto count =
+        static_cast<int32_t>(std::min<int64_t>(group, d->num_seqs - g0));
+    if (int32_t rc = turbine_hip::launch_paged_stage_fp8(
+            ctx, d, staged, table, static_cast<int32_t>(g0), count,
+            static_cast<int32_t>(pages));
+        rc != TURBINE_OK) {
+      return rc;
+    }
+    if (int32_t rc =
+            run_ck_pages(ctx, d, entry,
+                         CkPages{staged, table, static_cast<int32_t>(pages),
+                                 static_cast<int32_t>(g0), count});
+        rc != TURBINE_OK) {
+      return rc;
+    }
+  }
+  return TURBINE_OK;
 }
 
 int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
@@ -243,6 +358,16 @@ int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
       d->kv_lens == nullptr) {
     return fail(ctx, TURBINE_E_ARGUMENT, entry + ": NULL operand");
   }
+  if (d->dtype == TURBINE_DTYPE_F8E4M3 &&
+      !(std::isfinite(d->k_scale) && d->k_scale > 0.0f &&
+        std::isfinite(d->v_scale) && d->v_scale > 0.0f)) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                entry +
+                    ": FP8 pages need finite positive k_scale / v_scale, "
+                    "got " +
+                    std::to_string(d->k_scale) + " / " +
+                    std::to_string(d->v_scale));
+  }
   if (int32_t rc = enter(ctx); rc != TURBINE_OK)
     return rc;
   if (int32_t rc = turbine_hip::launch_paged_append(ctx, d); rc != TURBINE_OK)
@@ -252,7 +377,12 @@ int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
     return run_ck(ctx, d, entry);
   case turbine_hip::PagedPath::CkSplitkv:
     return turbine_hip::run_ck_splitkv(ctx, d, entry);
+  case turbine_hip::PagedPath::CkPagedkvFp8Staged:
+    return run_ck_fp8_staged(ctx, d, entry);
+  case turbine_hip::PagedPath::TurbineFp8Decode:
+    return turbine_hip::launch_paged_decode_fp8(ctx, d);
   case turbine_hip::PagedPath::Turbine:
+  case turbine_hip::PagedPath::TurbineFp8:
     break;
   }
   return turbine_hip::launch_paged_attention(ctx, d);
