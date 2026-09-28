@@ -1075,6 +1075,28 @@ Finding: a 2-rank all-reduce through host memory makes four transfers of the mes
 
 Decision (Phase 5 lead, 2026-09-28): no end-to-end tp2 bench of (b); `hostmem_dma_min_bytes` stays off (null) by default; the code stays behind its option.
 
-(c) measured in the same series (`scripts/lab-cluster.sh --bench-lock tp2-novanas`, run 0928110628-273fa1ed, 2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8), Llama c16; labbook f8fa3766, e98a9877, ee74de42): tp1 858.0 tok/s / TTFT p50 208.6 ms / ITL 15.42 ms; tp2 914.4 / 445.2 / 11.84; tp2 with `parallel.tp_prefill_overlap` 1007.7 / 274.0 / 11.82 (+10.2 % tok/s, −38 % TTFT); bitwise equal to the unsplit run; golden c1/c16 16/16 against the capture and HF (batched bounds). Kept off by default pending the user's decision on making it the default. (a) decode graphs: ITL 11.84 → 11.52 ms, tok/s within noise; off by default.
+(c) measured in the same series (`scripts/lab-cluster.sh --bench-lock tp2-novanas`, run 0928110628-273fa1ed, 2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8), Llama c16; labbook f8fa3766, e98a9877, ee74de42): tp1 858.0 tok/s / TTFT p50 208.6 ms / ITL 15.42 ms; tp2 914.4 / 445.2 / 11.84; tp2 with `parallel.tp_prefill_overlap` 1007.7 / 274.0 / 11.82 (+10.2 % tok/s, −38 % TTFT); bitwise equal to the unsplit run; golden c1/c16 16/16 against the capture and HF (batched bounds). (a) decode graphs: ITL 11.84 → 11.52 ms, tok/s within noise; off by default.
 
-Open question for the user — fix (d) (shard-local logits reduction): the lse and categorical draw are full-row reductions whose order changes per shard. Options: A exact-only (per-shard merge only for rows with no draw and no lse consumer; the standard bench and golden gain nothing); B per-shard lse and draw merge, not bitwise (ulp-level logprob differences, different draw rounding), judged by golden; C defer (d). Phase 5 lead recommends C. Pending.
+## P5 Task 32 (c): tensor-parallel prefill overlap on by default?
+
+- Default on, `parallel.tp_prefill_overlap: false` turns it off (recommended: bitwise equal to the unsplit run, golden-clean, +10.2 % tok/s and −38 % TTFT at tp 2 on Llama; dense-FFN families only)
+- Keep it opt-in (default off)
+
+**Decision (user, 2026-09-28): default on.** `parallel.tp_prefill_overlap` defaults to `true`; the switch stays to turn it off; the Phase 5 exit bench runs with it on.
+
+## P5 Task 32 (d): per-shard logits reduction before the gather
+
+- A) exact-only: merge per shard only for rows with no categorical draw and no log-sum-exp consumer (a new row flag the server sets); the standard bench (sampled) and golden (logprobs) gain nothing
+- B) per-shard log-sum-exp and draw merge, not bitwise (ulp-level logprob differences, a different draw rounding), judged by golden
+- C) defer (d) (recommended)
+
+**Decision (user, 2026-09-28): C, defer.** Reason: the full-row log-sum-exp and the categorical draw are one full-row reduction whose summation order changes per shard, so they cannot be reproduced exactly per shard; the saving is ~1.2 ms per decode step (the tp 2 logits all-gather).
+
+## Lab disk: pruning stale remote build caches on novanas
+
+Context: novanas reached 95 % disk and k3s evicted a lab Job (2026-09-28). The Phase 5 exit-prep agent then deleted 24 stale `remote-cargo` target directories (~135 GB) **without asking first**; that was outside the lab rules at the time and was raised with the user.
+
+- Auto-prune before each lab run: the `target/` of any `/home/piwi/turbine-ci/remote/agent-*` workspace with no matching local worktree under `.claude/worktrees/` and no writes for 12 h, logged with the bytes freed (recommended)
+- Prune only by hand, asking the user each time
+
+**Decision (user, 2026-09-28): auto-prune approved**, with these limits: only `remote/agent-*/target`; never the per-slot caches under `turbine-ci/cache/`, anything in use, or anything else; every removal logged with the bytes freed. This rule now covers the earlier manual prune after the fact; any prune beyond it still needs the user.

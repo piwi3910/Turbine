@@ -16,6 +16,8 @@
 # Only builds and host-side tests run here: GPU tests stay #[ignore]d and run through lab-test.sh.
 # Builds take a shared lock on /home/piwi/turbine-ci/bench.lock: a benchmark holds it exclusively
 # (scripts/bench-lock.sh) so that no build competes with the server for CPU while it measures.
+# Before syncing it runs scripts/lab-prune.sh: stale remote/agent-*/target caches of removed
+# worktrees (idle 12 h) are deleted and logged.
 set -euo pipefail
 
 host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
@@ -40,6 +42,8 @@ if [[ "$1" == "--clean" ]]; then
 	exit 0
 fi
 
+# Stale build caches of other, removed worktrees go first (scripts/lab-prune.sh; never fails).
+"$root/scripts/lab-prune.sh" --host "$host" >&2 || true
 ssh -o BatchMode=yes "$host" "mkdir -p '$remote/src' '$remote/target'"
 rsync -rlpc --delete \
 	--exclude /target --exclude /.git --exclude /.claude --exclude node_modules \

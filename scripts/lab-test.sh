@@ -286,6 +286,14 @@ kube() {
 	fi
 }
 
+# prune_stale_caches: scripts/lab-prune.sh before the upload (stale remote/agent-*/target of
+# removed worktrees; logged; never fails the run). A dry run prints what it would run.
+prune_stale_caches() {
+	local args=(--host "$REMOTE")
+	[[ $DRY_RUN -eq 1 ]] && args+=(--dry-run)
+	"${REPO_ROOT}/scripts/lab-prune.sh" "${args[@]}" || true
+}
+
 upload_tree() {
 	say "syncing working tree to ${1}"
 	run rsync -rlpcz --delete --exclude target/ --exclude .git/ --exclude .claude/ \
@@ -440,6 +448,7 @@ run_novanas() {
 	remote "mkdir -p ${RUN_DIR}/src ${CI_ROOT}/cache/slots && find ${CI_ROOT}/runs -mindepth 1 -maxdepth 1 -mmin +1440 -exec rm -rf {} +" ||
 		fail "ssh to ${REMOTE} failed"
 	[[ $DRY_RUN -eq 1 ]] || trap on_interrupt INT TERM
+	prune_stale_caches
 	upload_tree "${RUN_DIR}/src"
 	say "test command: ${TEST_CMD[*]}"
 	local cmd_file="cat > ${RUN_DIR}/test-command"

@@ -1198,6 +1198,10 @@ run_scenario() {
 	remote "mkdir -p ${RUN_DIR}/src ${CI_ROOT}/cache/slots && find ${CI_ROOT}/runs -mindepth 1 -maxdepth 1 -mmin +1440 -exec rm -rf {} +" ||
 		fail "ssh to ${REMOTE} failed"
 	[[ $DRY_RUN -eq 1 ]] || trap on_interrupt INT TERM
+	# Stale remote/agent-*/target caches of removed worktrees (scripts/lab-prune.sh; never fails).
+	local prune=(--host "$REMOTE")
+	[[ $DRY_RUN -eq 1 ]] && prune+=(--dry-run)
+	"${REPO_ROOT}/scripts/lab-prune.sh" "${prune[@]}" || true
 	say "syncing working tree to ${RUN_DIR}/src"
 	run rsync -rlpcz --delete --exclude target/ --exclude .git/ --exclude .claude/ \
 		-e "ssh ${SSH_OPTS[*]}" "${REPO_ROOT}/" "${REMOTE}:${RUN_DIR}/src/" ||

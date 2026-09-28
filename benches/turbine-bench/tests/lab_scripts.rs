@@ -1809,3 +1809,115 @@ fn phase5_novanas_configs_load() {
         assert_eq!(c.kv.block_tokens, 128, "{file}");
     }
 }
+
+/// The remote script a `lab-prune.sh --dry-run` prints (between `<<'PRUNE'` and `PRUNE`).
+fn prune_script(text: &str) -> &str {
+    let open = "<<'PRUNE'\n";
+    let start = text.find(open).expect("prune heredoc") + open.len();
+    let len = text[start..].find("\nPRUNE\n").expect("prune heredoc end");
+    &text[start..start + len]
+}
+
+/// Sets `path` and, below a directory, everything in it to `when` (children first).
+fn age_tree(path: &Path, when: std::time::SystemTime) {
+    if path.is_dir() {
+        for e in fs::read_dir(path).expect("read dir") {
+            age_tree(&e.expect("entry").path(), when);
+        }
+    }
+    fs::File::open(path)
+        .and_then(|f| f.set_modified(when))
+        .unwrap_or_else(|e| panic!("age {}: {e}", path.display()));
+}
+
+/// User decision 2026-09-28 (lab disk): the prune only ever deletes `remote/agent-*/target` of a
+/// workspace with no local worktree and no write for 12 h, logs each removal with its bytes, and
+/// `--dry-run` contacts no host. The printed remote script is then run against a scratch tree.
+#[test]
+fn lab_prune_removes_only_stale_agent_targets() {
+    let text = dry_run("lab-prune.sh", "prune-dry", &["--dry-run"]);
+    let checkout = repo_root()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let keep = text
+        .lines()
+        .find(|l| l.starts_with("+ lab-prune: keep "))
+        .expect("keep line");
+    assert!(
+        keep.split_whitespace().any(|w| w == checkout),
+        "this checkout is kept: {keep}"
+    );
+    assert!(
+        text.contains(&format!(
+            "{SSH} bash -s -- remove 12 {CI_ROOT}/remote <keep> <<'PRUNE'"
+        )),
+        "{text}"
+    );
+    let script = prune_script(&text);
+    let removals: Vec<&str> = script.lines().filter(|l| l.contains("rm ")).collect();
+    assert_eq!(removals.len(), 1, "one removal: {removals:?}");
+    assert!(removals[0].contains("rm -rf -- \"$t\""), "{removals:?}");
+    assert!(script.contains("t=$d/target") && script.contains("\"$base\"/agent-*"));
+    assert!(
+        !script.contains("cache"),
+        "never the slot caches:\n{script}"
+    );
+
+    // Bad idle hours are a usage error before any host is contacted (ssh is not stubbed
+    // here, so the check must come first: the script exits before it could reach one).
+    let bad = Command::new("bash")
+        .arg(repo_root().join("scripts/lab-prune.sh"))
+        .env("TURBINE_PRUNE_IDLE_HOURS", "0")
+        .env("TURBINE_REMOTE_HOST", "nobody@127.0.0.1")
+        .current_dir(repo_root())
+        .output()
+        .expect("run lab-prune.sh");
+    assert_eq!(bad.status.code(), Some(2), "{}", stderr(&bad));
+
+    // The script against a scratch base: agent-old (no worktree, idle) loses target/ only;
+    // agent-keep (a worktree), agent-new (written now) and other/ are untouched.
+    let base = std::env::temp_dir().join(format!("turbine-lab-prune-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    for d in ["agent-keep", "agent-old", "agent-new", "other"] {
+        for sub in ["src", "target/debug"] {
+            fs::create_dir_all(base.join(d).join(sub)).expect("mkdir");
+            fs::write(base.join(d).join(sub).join("f"), vec![0u8; 4096]).expect("write");
+        }
+    }
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(13 * 3600);
+    for d in ["agent-keep", "agent-old", "other"] {
+        age_tree(&base.join(d), old);
+    }
+    let run = |mode: &str| {
+        let out = Command::new("bash")
+            .args(["-c", script, "lab-prune", mode, "12"])
+            .arg(&base)
+            .arg("agent-keep")
+            .output()
+            .expect("run prune script");
+        assert!(out.status.success(), "{}", stderr(&out));
+        stdout(&out)
+    };
+    let old_target = base.join("agent-old/target");
+    let report = run("report");
+    println!("{report}");
+    assert!(report.contains(&format!("would remove {}", old_target.display())));
+    assert!(old_target.exists(), "report removes nothing");
+    let removed = run("remove");
+    println!("{removed}");
+    assert!(removed.contains(&format!("removed {} (", old_target.display())));
+    assert!(removed.contains("keep agent-new (written within 12 h)"));
+    assert!(removed.contains("removed 1 stale target dir(s)"));
+    assert!(!old_target.exists());
+    assert!(base.join("agent-old/src/f").exists());
+    for kept in [
+        "agent-keep/target/debug/f",
+        "agent-new/target/debug/f",
+        "other/target/debug/f",
+    ] {
+        assert!(base.join(kept).exists(), "{kept} kept");
+    }
+    let _ = fs::remove_dir_all(&base);
+}
