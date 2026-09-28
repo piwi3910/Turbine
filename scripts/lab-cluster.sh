@@ -342,7 +342,12 @@ scenario_collbench_hostmem() {
 collective_report() {
 	local label="$1"
 	echo "tp-collective ${label} backend=$(curl -s "${URL}/turbine/v1/status" | jq -r '.parallel.backend // "?"')"
-	curl -s "${URL}/metrics" | grep '^turbine_collective_route_total' | sed "s/^/tp-collective ${label} /" || true
+	local metrics
+	metrics=$(curl -s "${URL}/metrics" || true)
+	grep -E '^turbine_collective_(route|errors)_total' <<<"$metrics" | sed "s/^/tp-collective ${label} /" || true
+	# The errors family has no series until its first error: print the total, 0 included
+	# (parallel.collective.verify counts its detections under kind="corrupt").
+	echo "tp-collective ${label} errors_total=$(awk '/^turbine_collective_errors_total/ { n += $NF } END { print n + 0 }' <<<"$metrics") corrupt_total=$(awk '/^turbine_collective_errors_total.*kind="corrupt"/ { n += $NF } END { print n + 0 }' <<<"$metrics")"
 }
 
 scenario_tp2() {
