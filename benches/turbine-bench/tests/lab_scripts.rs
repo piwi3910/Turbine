@@ -6,6 +6,7 @@
 //!   replaced by stubs that record any call, so a dry run that reaches for a host fails the test.
 //! - The rendered Jobs carry the cached workspace slots, the kernel build, the environment and
 //!   the read-only model mount that the GPU tests and `turbine-server` rely on.
+//! - `scripts/track-gate.sh` runs (with `bash`) against a stub procoder launcher.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -2036,4 +2037,184 @@ fn lab_serve_gpus_2_renders_a_two_gpu_serve_job() {
         "{}",
         stderr(&out)
     );
+}
+
+/// Umbrella S-1 (amended by the Phase 6 split, 2026-09-28): `scripts/track-gate.sh` against a
+/// stub procoder launcher, temporary track specs and support-matrix files.
+#[cfg(unix)]
+mod track_gate_script {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const HEADER: &str = "vendor  arch     architecture       weight_format  kv_format speculative status       reason\n";
+    const BASELINE: &str =
+        "amd     gfx1201  LlamaForCausalLM   bf16           bf16      none        supported    -\n";
+    const QUANT: &str =
+        "amd     gfx1201  LlamaForCausalLM   fp8            bf16      none        supported    -\n";
+    const NVIDIA_QUANT: &str =
+        "nvidia  sm_121   LlamaForCausalLM   fp8            bf16      none        supported    -\n";
+    const TQ: &str =
+        "amd     gfx1201  LlamaForCausalLM   bf16           tq4       none        supported    -\n";
+    const FAMILY: &str =
+        "amd     gfx1201  Qwen3ForCausalLM   bf16           bf16      none        supported    -\n";
+
+    const SPEC_6A: &str = "# phase-6a-quantization\n\nStatus: complete\n\n## In scope\n\n- [S-1] fp8 and fp8_block weights.\n- [S-2] mxfp4, awq_int4 and gptq_int4 weights.\n- [S-3] fp8_e4m3 KV cache.\n- [S-4] YaRN RoPE scaling.\n\n## Out of scope\n\n- NVFP4, GGUF.\n";
+    const SPEC_6B: &str = "# phase-6b-kv-compression\n\nStatus: complete\n\n## In scope\n\n- [S-1] kv.cpu.format and kv.nvme.format.\n- [S-2] TurboQuant tq4 and tq2.\n- [S-3] The compression ladder.\n\n## Out of scope\n\n- NVFP4 KV.\n";
+    const SPEC_7: &str = "# phase-7-model-families\n\nStatus: complete\n\n## In scope\n\n- [S-1] Qwen3 dense and Qwen3 MoE.\n- [S-2] gpt-oss-20b.\n- [S-3] Qwen3.5/3.6 hybrids with Gated DeltaNet; linear-attention kernel provider on AMD: to be evaluated.\n- [S-4] Mistral and Mixtral.\n";
+    const SPEC_8: &str = "# phase-8-speculative-decoding\n\nStatus: complete\n\n## In scope\n\n- [S-1] Llama-3.2-1B-Instruct drafts for Llama-3.2-3B-Instruct behind a Proposer trait.\n\n## Out of scope\n\n- MTP heads, EAGLE heads, DFlash drafters.\n";
+
+    /// A temp directory with `specs/` and a stub launcher, removed on drop.
+    struct Gate {
+        dir: PathBuf,
+    }
+
+    impl Gate {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("turbine-track-gate-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("specs")).unwrap();
+            // Stub procoder launcher: COMPLETE iff the spec says `Status: complete`.
+            let launcher = dir.join("launcher.sh");
+            std::fs::write(
+                &launcher,
+                "#!/usr/bin/env bash\nf=\"$TURBINE_SPEC_DIR/$3.md\"\nif grep -qx 'Status: complete' \"$f\"; then echo \"spec $3: COMPLETE\"; else echo \"spec $3: NOT ready\"; exit 1; fi\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Gate { dir }
+        }
+        fn spec(&self, track: &str, body: &str) -> &Self {
+            std::fs::write(self.dir.join("specs").join(format!("{track}.md")), body).unwrap();
+            self
+        }
+        fn matrix(&self, name: &str, rows: &[&str]) -> PathBuf {
+            let p = self.dir.join(format!("matrix-{name}.txt"));
+            std::fs::write(&p, format!("{HEADER}{}", rows.concat())).unwrap();
+            p
+        }
+        fn run(&self, track: &str, matrix: &Path) -> (Option<i32>, String) {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let out = Command::new("bash")
+                .arg(root.join("scripts/track-gate.sh"))
+                .arg(track)
+                .env("TURBINE_PROCODER_LAUNCHER", self.dir.join("launcher.sh"))
+                .env("TURBINE_SPEC_DIR", self.dir.join("specs"))
+                .env("TURBINE_SUPPORT_MATRIX", matrix)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            (out.status.code(), text)
+        }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Breaks if a track can start before its predecessor closed (NVIDIA rows must not count),
+    /// on an incomplete spec, or with a spec whose In scope leaves the umbrella scope.
+    #[test]
+    fn track_gate() {
+        let g = Gate::new();
+        let baseline = g.matrix("baseline", &[BASELINE]);
+        let nvidia_only = g.matrix("nvidia", &[BASELINE, NVIDIA_QUANT]);
+        let closed_6a = g.matrix("6a", &[BASELINE, QUANT]);
+        let closed_6b = g.matrix("6b", &[BASELINE, QUANT, TQ]);
+        let closed_7 = g.matrix("7", &[BASELINE, QUANT, TQ, FAMILY]);
+
+        // Usage (the old track names are gone) and a missing spec.
+        assert_eq!(g.run("phase-8a-quantization", &baseline).0, Some(2));
+        assert_eq!(g.run("phase-6-quantization", &baseline).0, Some(2));
+        let (code, out) = g.run("phase-6a-quantization", &baseline);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("does not exist"), "{out}");
+
+        // 6a: needs no earlier track; its In scope must cover the formats and name no NVFP4.
+        g.spec("phase-6a-quantization", SPEC_6A);
+        let (code, out) = g.run("phase-6a-quantization", &baseline);
+        assert_eq!(code, Some(0), "{out}");
+        assert!(out.contains("GATE PASS phase-6a-quantization"), "{out}");
+        g.spec(
+            "phase-6a-quantization",
+            &SPEC_6A.replace(
+                "## Out of scope",
+                "- [S-5] NVFP4 weights.\n\n## Out of scope",
+            ),
+        );
+        let (code, out) = g.run("phase-6a-quantization", &baseline);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("NVFP4"), "{out}");
+        g.spec(
+            "phase-6a-quantization",
+            &SPEC_6A.replace("Status: complete", "Status: draft"),
+        );
+        let (code, out) = g.run("phase-6a-quantization", &baseline);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(
+            out.contains("not COMPLETE") && out.contains("Status line"),
+            "{out}"
+        );
+
+        // 6b: refused until 6a has a supported amd row; an NVIDIA row does not count.
+        g.spec("phase-6b-kv-compression", SPEC_6B);
+        for m in [&baseline, &nvidia_only] {
+            let (code, out) = g.run("phase-6b-kv-compression", m);
+            assert_eq!(code, Some(1), "{out}");
+            assert!(
+                out.contains("phase-6a-quantization has not closed"),
+                "{out}"
+            );
+        }
+        assert_eq!(g.run("phase-6b-kv-compression", &closed_6a).0, Some(0));
+        g.spec(
+            "phase-6b-kv-compression",
+            &SPEC_6B.replace("- [S-3] The compression ladder.\n", ""),
+        );
+        let (code, out) = g.run("phase-6b-kv-compression", &closed_6a);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("ladder"), "{out}");
+
+        // 7: refused until 6b closed; every S-8 family must be in scope, gpt-oss included.
+        g.spec("phase-7-model-families", SPEC_7);
+        let (code, out) = g.run("phase-7-model-families", &closed_6a);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(
+            out.contains("phase-6b-kv-compression has not closed"),
+            "{out}"
+        );
+        assert_eq!(g.run("phase-7-model-families", &closed_6b).0, Some(0));
+        g.spec(
+            "phase-7-model-families",
+            &SPEC_7.replace("- [S-2] gpt-oss-20b.\n", ""),
+        );
+        let (code, out) = g.run("phase-7-model-families", &closed_6b);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("gpt-oss"), "{out}");
+
+        // 8: refused until a Phase 7 family row is supported; no EAGLE.
+        g.spec("phase-8-speculative-decoding", SPEC_8);
+        let (code, out) = g.run("phase-8-speculative-decoding", &closed_6b);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(
+            out.contains("phase-7-model-families has not closed"),
+            "{out}"
+        );
+        assert_eq!(g.run("phase-8-speculative-decoding", &closed_7).0, Some(0));
+        g.spec(
+            "phase-8-speculative-decoding",
+            &SPEC_8.replace("behind a Proposer trait", "and an EAGLE head"),
+        );
+        let (code, out) = g.run("phase-8-speculative-decoding", &closed_7);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("EAGLE"), "{out}");
+    }
 }

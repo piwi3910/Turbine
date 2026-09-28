@@ -746,3 +746,248 @@ async fn compare_without_batched_keys_falls_back_to_strict_bounds() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Phase 8 (S-3, S-4): `turbine-golden eval` and `eval-compare` against an in-process mock.
+mod phase8_eval {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use axum::{Json, Router, http::StatusCode, routing::get, routing::post};
+    use serde_json::{Value, json};
+
+    /// A per-test directory under the system temp dir, removed on drop.
+    struct EvalTempDir(PathBuf);
+
+    impl EvalTempDir {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("turbine-golden-eval-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            EvalTempDir(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for EvalTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Expected answer of eval mock task `i`.
+    fn eval_mock_answer(i: u64) -> u64 {
+        i * 1000 + 7
+    }
+
+    /// The mock's reply to a prompt `q<i>`: tasks 0..150 correct (plain, comma-grouped, trailing
+    /// period), 150..200 wrong (`$` prefix, unit suffix, off by one); a prompt `fail` returns 500.
+    fn eval_mock_reply(prompt: &str) -> Result<String, StatusCode> {
+        if prompt == "fail" {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        let i: u64 = prompt
+            .trim_start_matches('q')
+            .parse()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let n = eval_mock_answer(i);
+        let grouped = format!("{},{:03}", n / 1000, n % 1000);
+        Ok(match (i < 150, i % 3) {
+            (true, 0) => n.to_string(),
+            (true, 1) => grouped,
+            (true, _) => format!("{n}."),
+            (false, 0) => format!("${n}"),
+            (false, 1) => format!("{n} apples"),
+            (false, _) => (n + 1).to_string(),
+        })
+    }
+
+    async fn spawn_eval_mock() -> String {
+        let app = Router::new()
+        .route("/v1/models", get(|| async { Json(json!({"object": "list", "data": [{"id": "mock-model"}]})) }))
+        .route(
+            "/v1/completions",
+            post(|Json(body): Json<Value>| async move {
+                assert_eq!(body["temperature"], 0.0);
+                assert_eq!(body["model"], "mock-model");
+                let text = eval_mock_reply(body["prompt"].as_str().unwrap_or_default())?;
+                Ok::<_, StatusCode>(Json(json!({"choices": [{"index": 0, "text": text}]})))
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let prompt = body["messages"][0]["content"].as_str().unwrap_or_default().to_string();
+                let text = eval_mock_reply(&prompt)?;
+                Ok::<_, StatusCode>(Json(
+                    json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": text}}]}),
+                ))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// 200 tasks, even ids as completions, odd ids as chat.
+    fn write_eval_tasks(path: &Path, fail_at: Option<u64>) {
+        let mut lines = String::new();
+        for i in 0..200u64 {
+            let q = if Some(i) == fail_at {
+                "fail".to_string()
+            } else {
+                format!("q{i}")
+            };
+            let task = if i % 2 == 0 {
+                json!({"id": format!("t{i}"), "prompt": q, "answer": eval_mock_answer(i).to_string(),
+                   "match": "number", "max_tokens": 16})
+            } else {
+                json!({"id": format!("t{i}"), "messages": [{"role": "user", "content": q}],
+                   "answer": eval_mock_answer(i).to_string(), "match": "number", "max_tokens": 16})
+            };
+            lines.push_str(&task.to_string());
+            lines.push('\n');
+        }
+        std::fs::write(path, lines).unwrap();
+    }
+
+    fn eval_golden_cmd() -> Command {
+        Command::new(env!("CARGO_BIN_EXE_turbine-golden"))
+    }
+
+    fn eval_compare(
+        dir: &Path,
+        baseline: &Path,
+        accuracy: f64,
+        correct: u64,
+        max_drop: &str,
+    ) -> Option<i32> {
+        let mut report: Value = serde_json::from_slice(&std::fs::read(baseline).unwrap()).unwrap();
+        report["accuracy"] = json!(accuracy);
+        report["correct"] = json!(correct);
+        let candidate = dir.join(format!("candidate-{correct}.json"));
+        std::fs::write(&candidate, report.to_string()).unwrap();
+        let out = eval_golden_cmd()
+            .args(["eval-compare", "--baseline"])
+            .arg(baseline)
+            .arg("--candidate")
+            .arg(&candidate)
+            .args(["--max-drop", max_drop])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("baseline accuracy 0.7500"), "{stdout}");
+        out.status.code()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eval_accuracy_report() {
+        let base = spawn_eval_mock().await;
+        let dir = EvalTempDir::new();
+        let tasks = dir.path().join("tasks.jsonl");
+        write_eval_tasks(&tasks, None);
+
+        let out = tokio::task::spawn_blocking({
+            let (base, tasks) = (base.clone(), tasks.clone());
+            move || {
+                eval_golden_cmd()
+                    .args(["eval", "--url", &base, "--output", "json", "--tasks"])
+                    .arg(&tasks)
+                    .output()
+                    .unwrap()
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["accuracy"], json!(0.75), "{report}");
+        assert_eq!(report["correct"], 150);
+        assert_eq!(report["total"], 200);
+        assert_eq!(report["model"], "mock-model");
+        let results = report["results"].as_array().unwrap();
+        assert_eq!(results.len(), 200);
+        assert_eq!(results[1]["id"], "t1");
+        assert_eq!(results[1]["correct"], true, "comma-grouped answer accepted");
+        assert_eq!(results[2]["correct"], true, "trailing period accepted");
+        assert_eq!(results[150]["correct"], false, "$ prefix rejected");
+        assert_eq!(results[151]["correct"], false, "unit suffix rejected");
+        let baseline = dir.path().join("baseline.json");
+        std::fs::write(&baseline, &out.stdout).unwrap();
+
+        let (d, b) = (dir.path().to_path_buf(), baseline.clone());
+        let codes = tokio::task::spawn_blocking(move || {
+            (
+                eval_compare(&d, &b, 0.745, 149, "0.01"),
+                eval_compare(&d, &b, 0.73, 146, "0.01"),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(codes, (Some(0), Some(1)));
+
+        // A failure midway exits 2 naming the task and prints no report.
+        let failing = dir.path().join("failing.jsonl");
+        write_eval_tasks(&failing, Some(120));
+        let out = tokio::task::spawn_blocking(move || {
+            eval_golden_cmd()
+                .args(["eval", "--url", &base, "--output", "json", "--tasks"])
+                .arg(&failing)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("task t120"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+    }
+}
+
+/// Phase 8 (S-4): the committed GSM8K-200 task set every lossy-format gate runs.
+mod phase8_eval_task_set {
+    use std::path::Path;
+
+    #[test]
+    fn eval_task_set_valid() {
+        use turbine_bench::golden::eval::{MatchKind, load_tasks, normalize_number};
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/eval");
+        let path = root.join("gsm8k-200.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 200, "exactly 200 lines");
+        let tasks = load_tasks(&path).expect("every line parses, ids unique");
+        assert_eq!(tasks.len(), 200);
+        let mut ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 200, "unique ids");
+        for t in &tasks {
+            assert_eq!(t.match_kind, MatchKind::Number, "{}", t.id);
+            assert!(
+                normalize_number(&t.answer).is_some(),
+                "{}: answer {:?} is not numeric",
+                t.id,
+                t.answer
+            );
+            assert!(t.max_tokens > 0, "{}", t.id);
+        }
+        let notice =
+            std::fs::read_to_string(root.join("NOTICE")).expect("tests/eval/NOTICE exists");
+        assert!(
+            notice.contains("MIT License"),
+            "NOTICE carries the source license"
+        );
+    }
+}

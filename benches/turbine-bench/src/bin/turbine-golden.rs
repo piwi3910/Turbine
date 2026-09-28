@@ -1,5 +1,6 @@
 //! `turbine-golden compare|capture|positions` (P1 S-11; `positions`: P5): exit 0 when the tolerance holds (or the capture
 //! was written), 1 when it is violated or the endpoint fails, 2 on usage or I/O errors.
+//! `turbine-golden eval|eval-compare` (P8 S-4): task-set accuracy and the lossy-format gate.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -8,7 +9,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use turbine_bench::golden::fixture::{
     read_jsonl, read_prompts, read_tolerance, write_jsonl_atomic,
 };
-use turbine_bench::golden::{Endpoint, GoldenError, ReferenceRecord, capture, compare, positions};
+use turbine_bench::golden::{
+    Endpoint, GoldenError, ReferenceRecord, capture, compare, eval, positions,
+};
+use turbine_core::config::QualityConfig;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
@@ -98,6 +102,87 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
     },
+    /// Task-set accuracy against an OpenAI-compatible endpoint (greedy, sequential) (P8 S-4).
+    Eval {
+        /// Base URL, e.g. http://127.0.0.1:8000.
+        #[arg(long)]
+        url: String,
+        /// Tasks file (JSONL), e.g. tests/eval/gsm8k-200.jsonl.
+        #[arg(long)]
+        tasks: PathBuf,
+        /// Model id; default: the first id from GET <url>/v1/models.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        output: OutputFormat,
+    },
+    /// Quality gate: exit 0 when candidate accuracy ≥ baseline accuracy − max drop, else 1.
+    EvalCompare {
+        #[arg(long)]
+        baseline: PathBuf,
+        #[arg(long)]
+        candidate: PathBuf,
+        /// Default: the `quality.max_accuracy_drop` default (0.01); 0..=0.1.
+        #[arg(long, default_value_t = QualityConfig::default().max_accuracy_drop)]
+        max_drop: f64,
+    },
+}
+
+/// `eval`: exit 0 with the report on a completed run; 2 (no report) on any I/O, task-file or
+/// endpoint failure, naming the failing task.
+async fn run_eval(
+    url: &str,
+    tasks_path: &Path,
+    model: Option<&str>,
+    output: OutputFormat,
+) -> ExitCode {
+    let report = match eval::load_tasks(tasks_path) {
+        Ok(tasks) => eval::run_eval(url, model, tasks_path, &tasks).await,
+        Err(e) => Err(e),
+    };
+    match report {
+        Ok(report) => {
+            match output {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).expect("report serializes")
+                ),
+                OutputFormat::Text => println!(
+                    "model {} tasks {}: accuracy {:.4} ({}/{})",
+                    report.model, report.tasks_file, report.accuracy, report.correct, report.total
+                ),
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("turbine-golden eval: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `eval-compare`: exit 0 on pass, 1 on fail, 2 on usage or I/O errors.
+fn run_eval_compare(baseline: &Path, candidate: &Path, max_drop: f64) -> ExitCode {
+    if !(0.0..=0.1).contains(&max_drop) {
+        eprintln!("turbine-golden eval-compare: --max-drop must be between 0 and 0.1");
+        return ExitCode::from(2);
+    }
+    let (baseline, candidate) = match (eval::read_report(baseline), eval::read_report(candidate)) {
+        (Ok(b), Ok(c)) => (b, c),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("turbine-golden eval-compare: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let o = eval::compare(&baseline, &candidate, max_drop);
+    println!(
+        "baseline accuracy {:.4}, candidate accuracy {:.4}, max drop {:.4}: {}",
+        o.baseline_accuracy,
+        o.candidate_accuracy,
+        o.max_drop,
+        if o.pass { "PASS" } else { "FAIL" }
+    );
+    ExitCode::from(if o.pass { 0 } else { 1 })
 }
 
 /// The reference's directory (`.` for a bare file name).
@@ -252,6 +337,17 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Eval {
+            url,
+            tasks,
+            model,
+            output,
+        } => Ok(run_eval(&url, &tasks, model.as_deref(), output).await),
+        Command::EvalCompare {
+            baseline,
+            candidate,
+            max_drop,
+        } => Ok(run_eval_compare(&baseline, &candidate, max_drop)),
     }
 }
 

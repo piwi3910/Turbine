@@ -6,7 +6,9 @@ mod duration;
 mod kv;
 mod overrides;
 mod parallel;
+mod quality;
 mod reliability;
+mod speculative;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -29,6 +31,8 @@ pub use parallel::{
     ByteSizeOrAuto, CollectiveTimeouts, DeviceSelection, ExpertConfig, ExpertPlacementChoice,
     ParallelConfig, PipelineConfig, RankMode, RanksConfig, SizeOrAuto, TopologyConfig,
 };
+pub use quality::QualityConfig;
+pub use speculative::{SpeculativeConfig, SpeculativeMethod};
 
 /// Configuration errors. Every variant maps to exit code 2 in `turbine-server`.
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +154,10 @@ pub struct Config {
     pub structured_output: StructuredOutputConfig,
     /// Multi-GPU plan (Phase 5).
     pub parallel: ParallelConfig,
+    /// Quality gates for lossy formats (umbrella phase-6-8-expansion, Phase 6a).
+    pub quality: QualityConfig,
+    /// Speculative decoding (Phase 8; the umbrella owns `method`).
+    pub speculative: SpeculativeConfig,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -623,6 +631,7 @@ impl Config {
                 format!("must be between 1KiB and 1MiB, got {msb}"),
             ));
         }
+        self.quality.validate()?;
         Ok(())
     }
 }
