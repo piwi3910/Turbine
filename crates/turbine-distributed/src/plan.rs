@@ -665,6 +665,9 @@ mod tests {
             vendor_interconnect: None,
             rdma: None,
             source: Some(AttrSource::Nominal),
+            measured_h2d_gbps: None,
+            measured_d2h_gbps: None,
+            cost_gbps: None,
         }
     }
 

@@ -367,16 +367,16 @@ Interfaces:
 
 ## Task 20: Host-link probe and measured edge costs
 
-Files: `crates/turbine-device/src/topology/{mod.rs,probe.rs}` (probe trait and edge attributes), `crates/turbine-server/src/startup.rs` (run the probe through the kernel library's v2.5 copy streams after discovery), `crates/turbine-distributed/src/plan.rs` (device ordering by measured cost), `crates/turbine-core/src/config/parallel.rs` (`parallel.topology.measure_links`), `crates/turbine-device/tests/lab.rs`
+Files: `crates/turbine-device/src/topology/{mod.rs,probe.rs}` (probe trait and edge attributes), `crates/turbine-server/src/startup.rs` (run the probe through the kernel library's v2.5 copy streams after discovery), `crates/turbine-distributed/src/plan.rs` (device ordering by measured cost), `crates/turbine-core/src/config/parallel.rs` (`parallel.topology.measure_links`), `crates/turbine-kernels/src/link_probe.rs` (the probe over a context's pinned memory and copy stream), `crates/turbine-kernels/tests/lab.rs`
 Interfaces:
 
-- `pub trait LinkProbe { fn host_link(&mut self, device: DeviceId, bytes: u64) -> Result<LinkBandwidth, String>; }`, `pub struct LinkBandwidth { pub h2d_gbps: f64, pub d2h_gbps: f64 }`, `pub fn apply_link_probe(graph: &mut TopologyGraph, results: &BTreeMap<DeviceId, Result<LinkBandwidth, String>>)`; edge fields `measured_h2d_gbps`, `measured_d2h_gbps`, `cost_gbps: Option<f64>`, `source: measured`; metric `turbine_topology_link_gbps{device,direction}`
-  Covers: S-13; `topology::tests::measured_links_on_edges`, lab `topology_matches_host` with the probe
+- `pub trait LinkProbe { fn host_link(&mut self, device: DeviceId, bytes: u64) -> Result<LinkBandwidth, String>; }`, `pub struct LinkBandwidth { pub h2d_gbps: f64, pub d2h_gbps: f64 }`, `pub fn apply_link_probe(graph: &mut TopologyGraph, results: &BTreeMap<DeviceId, Result<LinkBandwidth, String>>)`; edge fields `measured_h2d_gbps`, `measured_d2h_gbps`, `cost_gbps: Option<f64>`, `TopologyGraph::host_link_gbps(device)`, `probe_links(graph, probe)`, `turbine_kernels::link_probe::{CopyLinkProbe, ProbeTarget, measure_host_link}`; metric `turbine_topology_link_gbps{device,direction}`
+  Covers: S-13; `topology::tests::measured_links_on_edges`, `link_probe::tests::host_probe_measures_both_directions`, lab `turbine-kernels --test lab host_link_probe`
   Depends on: Tasks 2, 10, 19
 
 - [ ] Write failing test `topology::tests::measured_links_on_edges` (the S-13 criterion). Run: `cargo test -p turbine-device topology::tests::measured_links_on_edges` — expect FAIL.
 - [ ] Implement the probe (≤ 64 MiB per direction per GPU, ≤ 2 s total, pinned host memory, median of 3), the edge attributes and the planner's use of them (TP/EP groups costed by the slowest member; PP placement input for Task 22).
-- [ ] Extend lab `topology_matches_host` with the probe: both GPUs measured > 0, GPU0 h2d ≥ GPU1 h2d on novanas. Run: `scripts/lab-test.sh novanas --gpus 2 -- -p turbine-device --test lab` — expect PASS.
+- [ ] Lab `host_link_probe` in `crates/turbine-kernels/tests/lab.rs` (the probe `turbine_kernels::link_probe::CopyLinkProbe` over each device's context): both GPUs > 1 GB/s each way, GPU0 h2d ≥ GPU1 h2d with `TURBINE_EXPECT_AMD=2`. Run: `scripts/bench-lock.sh scripts/lab-test.sh novanas --gpus 2 -- -p turbine-kernels --test lab host_link_probe` — expect PASS.
 - [ ] Gate: `scripts/gate.sh`
 - [ ] Commit: `feat(device,distributed): measured host-link bandwidth on topology edges and in the planner`
 

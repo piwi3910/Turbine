@@ -218,3 +218,74 @@ fn demotion_host_cost() {
         (N * BLOCK_128) as f64 / started.elapsed().as_secs_f64() / 1e9
     );
 }
+
+/// P5 S-13: the startup host-link probe on every visible GPU of the backend's vendor, printed as
+/// `host_link device=<i> h2d_gbps=… d2h_gbps=…`; each direction must measure > 1 GB/s. With
+/// `TURBINE_EXPECT_AMD=2` (a `--gpus 2` run on novanas) GPU0's slot (Gen5 x8) must measure at
+/// least GPU1's (Gen4 x8) host-to-device. Breaks if the probe fails on a real device or the
+/// asymmetric slots are not reflected.
+#[test]
+#[ignore = "needs a HIP device and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn host_link_probe() {
+    use turbine_device::topology::{LinkProbe, PROBE_BYTES};
+    use turbine_kernels::backends::{self, BackendRequest};
+    use turbine_kernels::link_probe::{CopyLinkProbe, ProbeTarget};
+
+    if !require_backend("hip") {
+        return;
+    }
+    let backend = backends::registry().get("hip").expect("hip backend");
+    let inventory =
+        turbine_device::discover(&turbine_device::DiscoveryOptions::default()).expect("discovery");
+    let devices: Vec<_> = inventory
+        .devices
+        .iter()
+        .filter(|d| d.vendor.as_str() == backend.vendor())
+        .map(|d| d.index)
+        .collect();
+    assert!(!devices.is_empty(), "a visible HIP device");
+    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY").map(std::path::PathBuf::from);
+    let mut probe = CopyLinkProbe::new(|device| {
+        let opened = backend
+            .open(&BackendRequest {
+                device,
+                kernel_library: library.as_deref(),
+                inventory: &inventory,
+                meminfo: std::path::Path::new("/proc/meminfo"),
+                card_profile: "auto",
+            })
+            .map_err(|e| e.to_string())?;
+        let ctx = opened.context.ok_or("no kernel-library context")?;
+        Ok(ProbeTarget {
+            memory: opened.mem,
+            copies: ctx.clone(),
+            pinned: ctx,
+        })
+    });
+    let mut h2d = Vec::new();
+    for &d in &devices {
+        let bw = probe.host_link(d, PROBE_BYTES).expect("probe");
+        println!(
+            "host_link device={} h2d_gbps={:.2} d2h_gbps={:.2}",
+            d.0, bw.h2d_gbps, bw.d2h_gbps
+        );
+        assert!(
+            bw.h2d_gbps > 1.0 && bw.d2h_gbps > 1.0,
+            "device {}: {bw:?}",
+            d.0
+        );
+        h2d.push(bw.h2d_gbps);
+    }
+    let expect_amd = std::env::var("TURBINE_EXPECT_AMD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    if expect_amd == Some(2) {
+        assert_eq!(h2d.len(), 2, "two GPUs visible");
+        assert!(
+            h2d[0] >= h2d[1],
+            "GPU0 (Gen5 x8) {:.2} GB/s < GPU1 (Gen4 x8) {:.2} GB/s",
+            h2d[0],
+            h2d[1]
+        );
+    }
+}

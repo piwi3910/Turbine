@@ -10,6 +10,7 @@ pub mod backends;
 pub mod cards;
 pub mod cpu;
 pub(crate) mod ffi;
+pub mod link_probe;
 pub mod ops;
 mod pinned;
 mod registries;

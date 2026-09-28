@@ -3,6 +3,7 @@
 //! source. Built once at startup from a sysfs root plus a [`TopologyVendor`]; discovery never
 //! fails — a source that cannot be read leaves its values `unknown`/`null` and logs one WARN.
 
+mod probe;
 mod sysfs;
 mod vendor;
 
@@ -15,6 +16,9 @@ use turbine_core::types::{DeviceId, Vendor};
 
 use crate::discovery::DiscoveryOptions;
 use crate::inventory::{DeviceInfo, DeviceInventory};
+pub use probe::{
+    LinkBandwidth, LinkProbe, PROBE_BUDGET, PROBE_BYTES, apply_link_probe, probe_links,
+};
 use sysfs::{PciDevice, PciFunction, Sysfs};
 pub use vendor::{AmdSmiTopology, NoVendorTopology, NvmlTopology};
 
@@ -132,6 +136,17 @@ pub struct Edge {
     pub vendor_interconnect: Option<String>,
     pub rdma: Option<bool>,
     pub source: Option<AttrSource>,
+    /// Host-to-device bandwidth measured at startup on the GPU's upstream PCIe edge (P5 S-13;
+    /// always from the probe, whatever `source` says about the other fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_h2d_gbps: Option<f64>,
+    /// Device-to-host bandwidth measured with `measured_h2d_gbps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_d2h_gbps: Option<f64>,
+    /// A GPU↔GPU edge without peer access: the bandwidth a transfer between the two gets, the
+    /// slower of their measured host links (every byte crosses host memory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_gbps: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -342,6 +357,9 @@ fn edge(a: &str, b: &str, kind: EdgeKind) -> Edge {
         vendor_interconnect: None,
         rdma: None,
         source: None,
+        measured_h2d_gbps: None,
+        measured_d2h_gbps: None,
+        cost_gbps: None,
     }
 }
 
@@ -1172,6 +1190,81 @@ mod tests {
             }
             other => panic!("not a NIC: {other:?}"),
         }
+    }
+
+    /// P5 S-13: injected probe results on the novanas graph (GPU0 24 / 22 GB/s, GPU1 12 / 11)
+    /// land on each GPU's upstream PCIe edge as `measured_h2d_gbps` / `measured_d2h_gbps`, the
+    /// GPU0↔GPU1 edge (no peer access) carries `cost_gbps` = the slower link (11), and
+    /// `host_link_gbps` reads the slower direction back; a failed probe for GPU1 leaves its edge
+    /// nominal, gives no `cost_gbps` and logs one WARN. Breaks if a measured value is guessed,
+    /// misplaced or missing.
+    #[test]
+    fn measured_links_on_edges() {
+        let (base, _) = discover_fixture("novanas");
+        let bw = |h, d| LinkBandwidth {
+            h2d_gbps: h,
+            d2h_gbps: d,
+        };
+        let upstream = |g: &TopologyGraph, id: &str| {
+            g.edges
+                .iter()
+                .find(|e| e.kind == EdgeKind::Pcie && e.b == id && e.a.starts_with("pcie:"))
+                .cloned()
+                .unwrap_or_else(|| panic!("no upstream edge of {id}"))
+        };
+        let gpu_pair = |g: &TopologyGraph| {
+            g.edges
+                .iter()
+                .find(|e| e.a == "gpu0" && e.b == "gpu1")
+                .cloned()
+                .expect("gpu0-gpu1 edge")
+        };
+
+        let mut g = base.clone();
+        let mut results = BTreeMap::new();
+        results.insert(DeviceId(0), Ok(bw(24.0, 22.0)));
+        results.insert(DeviceId(1), Ok(bw(12.0, 11.0)));
+        apply_link_probe(&mut g, &results);
+        let e0 = upstream(&g, "gpu0");
+        assert_eq!(
+            (e0.measured_h2d_gbps, e0.measured_d2h_gbps),
+            (Some(24.0), Some(22.0))
+        );
+        let e1 = upstream(&g, "gpu1");
+        assert_eq!(
+            (e1.measured_h2d_gbps, e1.measured_d2h_gbps),
+            (Some(12.0), Some(11.0))
+        );
+        assert_eq!(
+            e0.link_gts,
+            upstream(&base, "gpu0").link_gts,
+            "nominal values kept"
+        );
+        assert_eq!(gpu_pair(&g).cost_gbps, Some(11.0));
+        assert_eq!(g.host_link_gbps(DeviceId(0)), Some(22.0));
+        assert_eq!(g.host_link_gbps(DeviceId(1)), Some(11.0));
+        assert_eq!(g.gpu_devices(), vec![DeviceId(0), DeviceId(1)]);
+        let json = serde_json::to_value(&g).expect("graph serializes");
+        assert!(
+            json.to_string().contains("\"measured_h2d_gbps\":24.0"),
+            "{json}"
+        );
+        // Unmeasured edges serialize as before.
+        let plain = serde_json::to_value(&base).expect("graph serializes");
+        assert!(!plain.to_string().contains("measured_"), "{plain}");
+
+        let mut g = base.clone();
+        let mut results = BTreeMap::new();
+        results.insert(DeviceId(0), Ok(bw(24.0, 22.0)));
+        results.insert(DeviceId(1), Err("pinned allocation failed".to_string()));
+        let ((), logs) = with_logs(|| apply_link_probe(&mut g, &results));
+        let e1 = upstream(&g, "gpu1");
+        assert_eq!((e1.measured_h2d_gbps, e1.measured_d2h_gbps), (None, None));
+        assert_eq!(gpu_pair(&g).cost_gbps, None);
+        assert_eq!(g.host_link_gbps(DeviceId(1)), None);
+        let warned = logs.warnings("topology_link_probe_failed");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert_eq!(warned[0]["fields"]["device"], 1);
     }
 
     #[test]
