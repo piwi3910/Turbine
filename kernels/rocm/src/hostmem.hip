@@ -50,6 +50,8 @@ namespace {
 
 constexpr const char *kImpl = "turbine_hip_mapped_oneshot";
 constexpr int kThreads = 256;
+// 16-byte vectors each thread keeps in flight.
+constexpr int kUnroll = 4;
 // Bytes of one pipeline step of a block.
 constexpr int64_t kStepBytes = 16384;
 // A step spreads over as many blocks as have at least this many bytes each
@@ -154,9 +156,23 @@ __device__ void copy_bytes(uint8_t *dst, const uint8_t *src, int64_t n) {
   int64_t done = 0;
   if constexpr (VEC) {
     const int64_t nv = n / 16;
-    for (int64_t i = threadIdx.x; i < nv; i += kThreads) {
-      reinterpret_cast<uint4 *>(dst)[i] =
-          reinterpret_cast<const uint4 *>(src)[i];
+    const uint4 *s4 = reinterpret_cast<const uint4 *>(src);
+    uint4 *d4 = reinterpret_cast<uint4 *>(dst);
+    int64_t i = threadIdx.x;
+    // kUnroll independent loads in flight per thread before their stores.
+    for (; i + (kUnroll - 1) * kThreads < nv; i += kUnroll * kThreads) {
+      uint4 v[kUnroll];
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        v[u] = s4[i + u * kThreads];
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        d4[i + u * kThreads] = v[u];
+      }
+    }
+    for (; i < nv; i += kThreads) {
+      d4[i] = s4[i];
     }
     done = nv * 16;
   }
@@ -174,7 +190,42 @@ __device__ void reduce_bytes(uint8_t *out, const uint8_t *const *srcs,
   if constexpr (VEC) {
     constexpr int E = Elem<T>::kPerVec;
     const int64_t nv = n / 16;
-    for (int64_t i = threadIdx.x; i < nv; i += kThreads) {
+    int64_t i = threadIdx.x;
+    // kUnroll independent vectors per thread: each source's loads are in flight
+    // together.
+    for (; i + (kUnroll - 1) * kThreads < nv; i += kUnroll * kThreads) {
+      float acc[kUnroll][E];
+      uint4 v[kUnroll];
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        v[u] = reinterpret_cast<const uint4 *>(srcs[0])[i + u * kThreads];
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        Elem<T>::unpack(v[u], acc[u]);
+      }
+      for (int q = 1; q < world; ++q) {
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+          v[u] = reinterpret_cast<const uint4 *>(srcs[q])[i + u * kThreads];
+        }
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+          float x[E];
+          Elem<T>::unpack(v[u], x);
+#pragma unroll
+          for (int e = 0; e < E; ++e) {
+            acc[u][e] = combine<OP>(acc[u][e], x[e]);
+          }
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        reinterpret_cast<uint4 *>(out)[i + u * kThreads] =
+            Elem<T>::pack(acc[u]);
+      }
+    }
+    for (; i < nv; i += kThreads) {
       float acc[E];
       float x[E];
       Elem<T>::unpack(reinterpret_cast<const uint4 *>(srcs[0])[i], acc);

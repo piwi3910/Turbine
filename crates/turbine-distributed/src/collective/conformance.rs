@@ -99,6 +99,7 @@ fn two_rank_ops(
             clock: Arc::new(SystemClock::new()),
             metrics: None,
             memory: None,
+            route_max_bytes: None,
         })
         .map_err(|e| err(&e))?;
     let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank as u32), 1 << 20);

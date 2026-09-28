@@ -168,18 +168,24 @@ pub struct CollectiveInit {
     /// communication buffers and runs its kernels through the kernel library (`hostmem`);
     /// `None` where the rank has none (the host backend) or the backend needs none.
     pub memory: Option<Arc<dyn DeviceMemory>>,
+    /// `parallel.collective.hostmem_max_bytes` for a backend that routes large messages to a
+    /// delegate (`hostmem` → `rccl`): the largest message (nccl-tests bytes) it keeps; `None`
+    /// is `auto`, the backend's measured per-op default. Other backends ignore it.
+    pub route_max_bytes: Option<u64>,
 }
 
 static HOST: HostBackend = HostBackend;
-static RCCL: NcclApiBackend = NcclApiBackend::new(&nccl_api::RCCL_FLAVOR);
+/// Also `hostmem`'s delegate for large messages.
+pub(crate) static RCCL: NcclApiBackend = NcclApiBackend::new(&nccl_api::RCCL_FLAVOR);
 static NCCL: NcclApiBackend = NcclApiBackend::new(&nccl_api::NCCL_FLAVOR);
 static HOSTMEM: HostmemBackend = HostmemBackend;
 
-// `hostmem` comes after `rccl`: `auto` keeps RCCL, which serves every rank mode and needs
-// nothing from the kernel library; `hostmem` is chosen by name (`docs/extending/
-// collective-backend.md`).
+// `hostmem` comes before `rccl`: `auto` picks it for AMD plans in `local` rank mode (it
+// routes large messages to RCCL itself, and hands the whole communicator to RCCL on a kernel
+// library without ABI v2.7); in `static` mode `auto` skips it (`one_process_only`) and takes
+// `rccl`.
 static COLLECTIVE_BACKENDS: Registry<dyn CollectiveBackend> =
-    Registry::new("collective_backend", &[&HOST, &RCCL, &NCCL, &HOSTMEM]);
+    Registry::new("collective_backend", &[&HOST, &HOSTMEM, &RCCL, &NCCL]);
 
 /// The registered collective backends, in registration order (`auto` takes the first one
 /// serving the plan's vendor).
@@ -264,6 +270,35 @@ struct OpLabels {
     backend: &'static str,
 }
 
+/// Why a routing backend sent one call where it did (`reason` of
+/// `turbine_collective_route_total`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RouteReason {
+    /// The message is at most the threshold: the backend's own path.
+    BelowThreshold,
+    /// Above the threshold: the delegate.
+    AboveThreshold,
+    /// The backend's own path cannot run the call: the delegate.
+    OpUnsupported,
+}
+
+impl RouteReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteReason::BelowThreshold => "below_threshold",
+            RouteReason::AboveThreshold => "above_threshold",
+            RouteReason::OpUnsupported => "op_unsupported",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RouteLabels {
+    op: &'static str,
+    backend: &'static str,
+    reason: &'static str,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ErrorLabels {
     backend: &'static str,
@@ -277,6 +312,7 @@ pub struct CollectiveMetrics {
     duration: Family<OpLabels, Histogram>,
     bytes: Family<OpLabels, Counter>,
     errors: Family<ErrorLabels, Counter>,
+    route: Family<RouteLabels, Counter>,
 }
 
 impl CollectiveMetrics {
@@ -299,11 +335,28 @@ impl CollectiveMetrics {
             "Collective operations that failed, by kind",
             Family::<ErrorLabels, Counter>::default(),
         );
+        let route = reg.register(
+            "turbine_collective_route",
+            "Calls a routing collective backend sent to itself or to its delegate, by reason",
+            Family::<RouteLabels, Counter>::default(),
+        );
         CollectiveMetrics {
             duration,
             bytes,
             errors,
+            route,
         }
+    }
+
+    /// One call of `op` sent to `backend` (the routing backend or its delegate) for `reason`.
+    pub fn route(&self, op: CollectiveOp, backend: &'static str, reason: RouteReason) {
+        self.route
+            .get_or_create(&RouteLabels {
+                op: op.as_str(),
+                backend,
+                reason: reason.as_str(),
+            })
+            .inc();
     }
 
     pub fn observe(&self, op: CollectiveOp, backend: &'static str, bytes: u64, seconds: f64) {
@@ -335,6 +388,11 @@ mod tests {
         let m = CollectiveMetrics::register(&reg);
         m.observe(CollectiveOp::AllReduce, "rccl", 4096, 0.002);
         m.error("rccl", CollectiveErrorKind::Timeout);
+        m.route(
+            CollectiveOp::AllReduce,
+            "hostmem",
+            RouteReason::BelowThreshold,
+        );
         let text = reg.render().expect("renders");
         assert!(
             text.contains(
@@ -350,6 +408,12 @@ mod tests {
         );
         assert!(
             text.contains("turbine_collective_errors_total{backend=\"rccl\",kind=\"timeout\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "turbine_collective_route_total{op=\"all_reduce\",backend=\"hostmem\",reason=\"below_threshold\"} 1"
+            ),
             "{text}"
         );
         let timeout = CollectiveError::Timeout {

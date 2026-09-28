@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::{ConfigError, HumanDuration, ModuleName, invalid};
+use super::{ByteSize, ConfigError, HumanDuration, ModuleName, invalid};
 use crate::types::{DeviceId, Vendor};
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -21,9 +21,10 @@ pub struct ParallelConfig {
     pub tensor_parallel_size: SizeOrAuto,
     pub data_parallel_size: SizeOrAuto,
     pub devices: DeviceSelection,
-    /// A registered collective backend (extension point `collective_backend`: `rccl`, `nccl`,
-    /// `host`; checked by `Config::validate_modules`) or `auto`, the backend serving the plan's
-    /// vendor (`host` when tensor_parallel_size is 1).
+    /// A registered collective backend (extension point `collective_backend`: `host`,
+    /// `hostmem`, `rccl`, `nccl`; checked by `Config::validate_modules`) or `auto`, the first
+    /// registered backend serving the plan's vendor and rank mode (`host` when
+    /// tensor_parallel_size is 1; `hostmem` for AMD in `local` mode, `rccl` in `static` mode).
     pub collective_backend: ModuleName,
     /// Explicit `libnccl.so.2`; failure to load it is fatal (exit 1).
     pub nccl_library: Option<PathBuf>,
@@ -56,12 +57,16 @@ impl Default for ParallelConfig {
     }
 }
 
-/// `parallel.collective`: communicator init and per-step collective bounds.
+/// `parallel.collective`: communicator init and per-step collective bounds, and the size
+/// threshold of the `hostmem` backend.
 #[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields, default)]
 pub struct CollectiveTimeouts {
     pub init_timeout: HumanDuration,
     pub op_timeout: HumanDuration,
+    /// The largest message (nccl-tests bytes) the `hostmem` backend keeps on its own kernels;
+    /// larger ones go to RCCL. `auto` (default): the measured per-op crossover.
+    pub hostmem_max_bytes: ByteSizeOrAuto,
 }
 
 impl Default for CollectiveTimeouts {
@@ -69,7 +74,62 @@ impl Default for CollectiveTimeouts {
         CollectiveTimeouts {
             init_timeout: HumanDuration::from_secs(120),
             op_timeout: HumanDuration::from_secs(30),
+            hostmem_max_bytes: ByteSizeOrAuto::Auto,
         }
+    }
+}
+
+/// A byte size or `auto`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ByteSizeOrAuto {
+    Auto,
+    Bytes(ByteSize),
+}
+
+impl ByteSizeOrAuto {
+    /// The explicit size in bytes, `None` for `auto`.
+    pub fn fixed(self) -> Option<u64> {
+        match self {
+            ByteSizeOrAuto::Auto => None,
+            ByteSizeOrAuto::Bytes(b) => Some(b.0),
+        }
+    }
+}
+
+impl Serialize for ByteSizeOrAuto {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ByteSizeOrAuto::Auto => s.serialize_str("auto"),
+            ByteSizeOrAuto::Bytes(b) => b.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ByteSizeOrAuto {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl Visitor<'_> for V {
+            type Value = ByteSizeOrAuto;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a byte size (e.g. \"256KiB\") or `auto`")
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<ByteSizeOrAuto, E> {
+                Ok(ByteSizeOrAuto::Bytes(ByteSize(v)))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<ByteSizeOrAuto, E> {
+                u64::try_from(v)
+                    .map(|v| ByteSizeOrAuto::Bytes(ByteSize(v)))
+                    .map_err(|_| E::custom(format!("invalid byte size {v}: must be non-negative")))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<ByteSizeOrAuto, E> {
+                if v == "auto" {
+                    Ok(ByteSizeOrAuto::Auto)
+                } else {
+                    v.parse().map(ByteSizeOrAuto::Bytes).map_err(E::custom)
+                }
+            }
+        }
+        d.deserialize_any(V)
     }
 }
 

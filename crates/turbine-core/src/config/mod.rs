@@ -26,8 +26,8 @@ use crate::registry::valid_name;
 use crate::types::DeviceId;
 pub use overrides::Override;
 pub use parallel::{
-    CollectiveTimeouts, DeviceSelection, DpRouterPolicy, ParallelConfig, RankMode, RanksConfig,
-    SizeOrAuto,
+    ByteSizeOrAuto, CollectiveTimeouts, DeviceSelection, DpRouterPolicy, ParallelConfig, RankMode,
+    RanksConfig, SizeOrAuto,
 };
 
 /// Configuration errors. Every variant maps to exit code 2 in `turbine-server`.

@@ -919,6 +919,19 @@ fn parallel_rejections() {
     assert_eq!(d.router, DpRouterPolicy::PrefixAffinity);
     assert_eq!(d.collective.init_timeout.0, Duration::from_secs(120));
     assert_eq!(d.collective.op_timeout.0, Duration::from_secs(30));
+    assert_eq!(d.collective.hostmem_max_bytes, ByteSizeOrAuto::Auto);
+    let hm = parse(base, &["parallel.collective.hostmem_max_bytes=256KiB"]).unwrap();
+    assert_eq!(
+        hm.parallel.collective.hostmem_max_bytes.fixed(),
+        Some(256 << 10)
+    );
+    let hm = parse(base, &["parallel.collective.hostmem_max_bytes=4096"]).unwrap();
+    assert_eq!(hm.parallel.collective.hostmem_max_bytes.fixed(), Some(4096));
+    assert_rejected(
+        base,
+        &["parallel.collective.hostmem_max_bytes=lots"],
+        "hostmem_max_bytes",
+    );
     assert_eq!(d.ranks.mode, RankMode::Local);
     assert_eq!(d.ranks.rank, 0);
     assert_eq!(d.ranks.leader, None);

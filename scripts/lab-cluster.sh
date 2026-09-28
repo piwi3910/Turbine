@@ -9,9 +9,11 @@
 #   collbench-novanas  turbine-collbench --backend rccl --devices 0,1 --op all --max-bytes 1GiB;
 #                      PASS when every row is correct and all-reduce busbw > 0 at 268,435,456 B.
 #   collbench-sweep-novanas  small-message all-reduce latency under RCCL settings (diagnostics).
-#   collbench-hostmem-novanas  turbine-collbench --op all, 8 B .. 1 GiB, BF16, for hostmem and
-#                      rccl, each per op (op + synchronize, median) and --pipelined (back to
-#                      back, mean): every row printed as `hm <backend> <per-op|pipelined> <op>
+#   collbench-hostmem-novanas  turbine-collbench --op all, 8 B .. 1 GiB, BF16, for hostmem's
+#                      kernels at every size (--route-max-bytes 1TiB), hostmem routed at its
+#                      measured crossover (hostmem-auto) and rccl, each per op (op +
+#                      synchronize, median) and --pipelined (back to back, mean): every row
+#                      printed as `hm <hostmem|hostmem-auto|rccl> <per-op|pipelined> <op>
 #                      <bytes> <time_us> <busbw_gbps>`; PASS when every row of every run is
 #                      correct (each rank checks its result bit for bit against the host
 #                      reference backend, so both ranks hold the same bits). Keep the numbers
@@ -190,20 +192,23 @@ scenario_collbench_sweep() {
 
 # collbench-hostmem-novanas: hostmem against rccl, every op, 8 B .. 1 GiB, per op and pipelined.
 scenario_collbench_hostmem() {
-	local backend mode out
-	for backend in hostmem rccl; do
+	local run backend mode out
+	# hostmem = its kernels at every size; hostmem-auto = routed at the measured crossover.
+	for run in hostmem hostmem-auto rccl; do
+		backend="${run%-auto}"
 		for mode in per-op pipelined; do
-			out="${WORK}/hm-${backend}-${mode}.json"
+			out="${WORK}/hm-${run}-${mode}.json"
 			local flags=(--backend "$backend" --devices 0,1 --op all --max-bytes 1GiB --output json)
+			[[ $run == hostmem ]] && flags+=(--route-max-bytes 1TiB)
 			[[ $mode == pipelined ]] && flags+=(--pipelined)
 			echo "lab-step: turbine-collbench ${flags[*]}"
 			"${BIN}/turbine-collbench" "${flags[@]}" >"$out" || {
 				cat "$out"
-				job_fail "turbine-collbench ${backend} ${mode} exited non-zero"
+				job_fail "turbine-collbench ${run} ${mode} exited non-zero"
 			}
 			jq -e '([.ops[].rows[]] | length > 0 and all(.correct))' "$out" >/dev/null ||
-				job_fail "${backend} ${mode}: a row differs from the host reference"
-			jq -r --arg b "$backend" --arg m "$mode" \
+				job_fail "${run} ${mode}: a row differs from the host reference"
+			jq -r --arg b "$run" --arg m "$mode" \
 				'.ops[] | .op as $op | .rows[] | "hm \($b) \($m) \($op) \(.bytes) \(.time_us) \(.busbw_gbps)"' "$out"
 		done
 	done

@@ -767,7 +767,7 @@ mod tests {
         )
         .expect("novanas tp 2");
         assert_eq!((p.tp, p.dp), (2, 1));
-        assert_eq!(p.backend, "rccl");
+        assert_eq!(p.backend, "hostmem", "auto: AMD, local ranks");
         assert_eq!(p.vendor, Some(Vendor::Amd));
         assert_eq!(devices_of(&p), vec![vec![0, 1]]);
         assert_eq!(p.groups[0].replica, ReplicaId(0));
@@ -976,7 +976,7 @@ mod tests {
     fn backend_from_registry() {
         use super::choose_backend;
         let (local, stat) = (RankMode::Local, RankMode::Static);
-        assert_eq!(choose_backend("auto", Vendor::Amd, 2, local), Ok("rccl"));
+        assert_eq!(choose_backend("auto", Vendor::Amd, 2, local), Ok("hostmem"));
         assert_eq!(choose_backend("auto", Vendor::Amd, 2, stat), Ok("rccl"));
         assert_eq!(choose_backend("auto", Vendor::Nvidia, 4, local), Ok("nccl"));
         assert_eq!(choose_backend("auto", Vendor::Amd, 1, local), Ok("host"));

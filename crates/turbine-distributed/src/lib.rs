@@ -18,7 +18,7 @@ mod registry_conformance {
     fn collective_backends() {
         let reg = crate::collective::registry();
         conformance::check(reg).unwrap();
-        assert_eq!(reg.names(), ["host", "rccl", "nccl", "hostmem"]);
+        assert_eq!(reg.names(), ["host", "hostmem", "rccl", "nccl"]);
         for backend in reg.iter() {
             crate::collective::conformance::check(backend).unwrap();
         }

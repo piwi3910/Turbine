@@ -61,6 +61,8 @@ fn init(
         clock: Arc::new(SystemClock::new()),
         metrics: None,
         memory: Some(memory),
+        // The kernels at every size (no routing to RCCL).
+        route_max_bytes: Some(u64::MAX),
     }
 }
 

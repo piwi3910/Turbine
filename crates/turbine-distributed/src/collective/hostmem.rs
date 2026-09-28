@@ -21,8 +21,18 @@
 //! `Timeout { op }` on the rank whose kernel timed out, `RemoteAbort { rank }` elsewhere.
 //! [`Collective::abort`] writes the abort word from the host, which releases spinning peers.
 //!
+//! Routing: the kernels win for small messages and lose to RCCL's copy path for large ones
+//! (the latency table of `docs/extending/collective-backend.md`), so a call whose message
+//! (nccl-tests bytes) exceeds `CollectiveInit::route_max_bytes` — `auto`: the measured per-op
+//! crossover [`auto_max_bytes`] — goes to an RCCL communicator the group opens beside its own
+//! (`above_threshold`); the rest stay here (`below_threshold`); every choice is counted in
+//! `turbine_collective_route_total{op,backend,reason}`. The choice depends only on the op and
+//! its size, so every rank routes a call the same way. On a kernel library without the v2.7
+//! group the communicator is RCCL's alone (`op_unsupported`, logged once). Without a loadable
+//! RCCL (default search) hostmem keeps every message.
+//!
 //! In `static` rank mode (one process per rank) there is no shared allocation: `open` answers
-//! `Unavailable`, and the plan keeps `rccl`.
+//! `Unavailable`, the planner refuses `hostmem` there and `auto` takes `rccl`.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,9 +47,11 @@ use turbine_tensor::{
     StreamRef,
 };
 
+use turbine_core::config::ParallelConfig;
+
 use super::{
     Collective, CollectiveBackend, CollectiveError, CollectiveInit, CollectiveLibrary,
-    CollectiveMetrics, CollectiveOp, ReduceOp, UNIQUE_ID_BYTES,
+    CollectiveMetrics, CollectiveOp, ReduceOp, RouteReason, UNIQUE_ID_BYTES,
 };
 
 /// The registered name and `backend` label.
@@ -54,6 +66,20 @@ pub const MAX_BLOCKS: u32 = 64;
 pub const MAX_WORLD: usize = 8;
 /// Identifies a hostmem group id (bytes 20..28), next to the creating process id.
 const ID_MARKER: &[u8; 8] = b"hostmem\0";
+
+/// The largest message (nccl-tests bytes: the all-reduce / broadcast / send buffer, the
+/// all-gather receive buffer, the reduce-scatter send buffer) `op` keeps on hostmem when
+/// `parallel.collective.hostmem_max_bytes` is `auto`: the crossover measured against RCCL on
+/// novanas (2-GPU, GPU0 Gen5 x8 + GPU1 Gen4 x8, BF16, back-to-back ops, `scripts/lab-cluster.sh
+/// collbench-hostmem-novanas`, 2026-09-28). Larger messages go to RCCL.
+pub fn auto_max_bytes(op: CollectiveOp) -> u64 {
+    match op {
+        CollectiveOp::AllReduce => 128 << 10,
+        CollectiveOp::AllGather | CollectiveOp::ReduceScatter => 256 << 10,
+        CollectiveOp::Broadcast | CollectiveOp::Send | CollectiveOp::Recv => 32 << 10,
+        CollectiveOp::Barrier => u64::MAX,
+    }
+}
 
 /// Offsets of one group's region.
 #[derive(Clone, Copy, Debug)]
@@ -77,8 +103,9 @@ impl Layout {
     }
 }
 
-/// The `hostmem` module of the `collective_backend` registry. It has no library of its own: it
-/// runs on the kernel library of each rank's device context (ABI v2.7).
+/// The `hostmem` module of the `collective_backend` registry. Its kernels come from the kernel
+/// library of each rank's device context (ABI v2.7); its library is RCCL's, the delegate of
+/// large messages (`parallel.rccl_library`).
 pub struct HostmemBackend;
 
 impl Module for HostmemBackend {
@@ -91,17 +118,29 @@ impl CollectiveBackend for HostmemBackend {
     fn vendors(&self) -> &'static [Vendor] {
         &[Vendor::Amd]
     }
+    fn configured_library<'a>(&self, cfg: &'a ParallelConfig) -> Option<&'a Path> {
+        cfg.rccl_library.as_deref()
+    }
+    /// Loads RCCL, the delegate of large messages: an explicit library that fails is fatal;
+    /// without one, a failed default search leaves hostmem with every message (WARN).
     fn load(&self, explicit: Option<&Path>) -> Result<Arc<dyn CollectiveLibrary>, CollectiveError> {
-        if let Some(path) = explicit {
-            return Err(CollectiveError::Unavailable {
-                library: path.display().to_string(),
-                detail: "hostmem takes no library of its own: it runs on the kernel library of \
-                         each rank's device context (kernel ABI v2.7)"
-                    .into(),
-            });
-        }
+        let delegate = match super::RCCL.load(explicit) {
+            Ok(lib) => Some(lib),
+            Err(e) if explicit.is_some() => return Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    event = "collective_route_unavailable",
+                    backend = NAME,
+                    delegate = "rccl",
+                    error = %e,
+                    "RCCL did not load: hostmem keeps every message, whatever its size"
+                );
+                None
+            }
+        };
         Ok(Arc::new(HostmemLibrary {
             slot_bytes: SLOT_BYTES,
+            delegate,
         }))
     }
     fn one_process_only(&self) -> bool {
@@ -126,6 +165,50 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 struct HostmemLibrary {
     slot_bytes: u64,
+    /// The library of large messages (RCCL), if it loaded.
+    delegate: Option<Arc<dyn CollectiveLibrary>>,
+}
+
+/// Delegate group ids by hostmem id (process-local): the first rank to open makes it, and the
+/// entry leaves once every rank has taken it.
+type DelegateIds = Vec<([u8; UNIQUE_ID_BYTES], [u8; UNIQUE_ID_BYTES], usize)>;
+static DELEGATE_IDS: Mutex<DelegateIds> = Mutex::new(Vec::new());
+
+impl HostmemLibrary {
+    /// Opens rank `init.rank` of the delegate group paired with `init.unique_id`.
+    fn open_delegate(
+        &self,
+        delegate: &Arc<dyn CollectiveLibrary>,
+        init: &CollectiveInit,
+    ) -> Result<Arc<dyn Collective>, CollectiveError> {
+        let id = {
+            let mut ids = DELEGATE_IDS.lock().unwrap_or_else(|p| p.into_inner());
+            let at = match ids.iter().position(|(h, _, _)| *h == init.unique_id) {
+                Some(at) => at,
+                None => {
+                    ids.push((init.unique_id, delegate.unique_id()?, 0));
+                    ids.len() - 1
+                }
+            };
+            ids[at].2 += 1;
+            let id = ids[at].1;
+            if ids[at].2 == init.world {
+                ids.swap_remove(at);
+            }
+            id
+        };
+        Arc::clone(delegate).open(CollectiveInit {
+            rank: init.rank,
+            world: init.world,
+            unique_id: id,
+            init_timeout: init.init_timeout,
+            op_timeout: init.op_timeout,
+            clock: Arc::clone(&init.clock),
+            metrics: init.metrics.clone(),
+            memory: init.memory.clone(),
+            route_max_bytes: None,
+        })
+    }
 }
 
 impl CollectiveLibrary for HostmemLibrary {
@@ -173,10 +256,22 @@ impl CollectiveLibrary for HostmemLibrary {
             ));
         };
         let Some(mc) = memory.mapped_collectives() else {
-            return Err(unavailable(format!(
+            let detail = format!(
                 "the kernel library of device {} does not export the ABI v2.7 host-mapped group",
                 memory.device().0
-            )));
+            );
+            let Some(delegate) = &self.delegate else {
+                return Err(unavailable(detail));
+            };
+            tracing::warn!(
+                event = "collective_route",
+                backend = NAME,
+                delegate = delegate.backend(),
+                reason = RouteReason::OpUnsupported.as_str(),
+                rank = init.rank,
+                "{detail}: the communicator is the delegate's for every call"
+            );
+            return self.open_delegate(delegate, &init);
         };
         let group = join(&init, self.slot_bytes, mc)?;
         let base = mc
@@ -185,12 +280,18 @@ impl CollectiveLibrary for HostmemLibrary {
                 code: -1,
                 message: format!("hostmem: mapping the region into device: {e}"),
             })?;
+        let delegate = match &self.delegate {
+            Some(d) => Some(self.open_delegate(d, &init)?),
+            None => None,
+        };
         tracing::info!(
             event = "collective_init",
             backend = NAME,
             rank = init.rank,
             world = init.world,
             region_bytes = group.layout.total,
+            delegate = delegate.as_ref().map_or("none", |d| d.backend()),
+            route_max_bytes = ?init.route_max_bytes,
             "communicator ready"
         );
         Ok(Arc::new(HostmemCollective {
@@ -204,6 +305,8 @@ impl CollectiveLibrary for HostmemLibrary {
             metrics: init.metrics,
             reported: AtomicBool::new(false),
             pairs: Mutex::new(std::collections::HashMap::new()),
+            delegate,
+            route_max: init.route_max_bytes,
         }))
     }
 }
@@ -273,6 +376,10 @@ pub struct HostmemCollective {
     reported: AtomicBool,
     /// This rank's pair channels by peer.
     pairs: Mutex<std::collections::HashMap<usize, Arc<Pair>>>,
+    /// The RCCL communicator of large messages, if RCCL loaded.
+    delegate: Option<Arc<dyn Collective>>,
+    /// The operator's threshold; `None` is [`auto_max_bytes`].
+    route_max: Option<u64>,
 }
 
 impl std::fmt::Debug for HostmemCollective {
@@ -464,6 +571,34 @@ impl HostmemCollective {
         Ok(())
     }
 
+    /// The delegate when a call of `op` over `bytes` (nccl-tests bytes) goes there, `None`
+    /// when hostmem runs it; counts the choice.
+    fn route(&self, op: CollectiveOp, bytes: usize) -> Option<&dyn Collective> {
+        let delegate = self.delegate.as_deref()?;
+        let max = self.route_max.unwrap_or_else(|| auto_max_bytes(op));
+        let (to, backend, reason) = if bytes as u64 > max {
+            (
+                Some(delegate),
+                delegate.backend(),
+                RouteReason::AboveThreshold,
+            )
+        } else {
+            (None, NAME, RouteReason::BelowThreshold)
+        };
+        if let Some(m) = &self.metrics {
+            m.route(op, backend, reason);
+        }
+        tracing::trace!(
+            event = "collective_route",
+            op = op.as_str(),
+            bytes,
+            backend,
+            reason = reason.as_str(),
+            "collective routed"
+        );
+        to
+    }
+
     /// The group's own channel.
     fn group_chan(&self) -> Chan<'_> {
         let layout = self.group.layout;
@@ -594,6 +729,9 @@ impl Collective for HostmemCollective {
         stream: &StreamRef,
     ) -> Result<(), CollectiveError> {
         Self::reduction(dtype, buf.len())?;
+        if let Some(d) = self.route(CollectiveOp::AllReduce, buf.len()) {
+            return d.all_reduce(buf, dtype, op, stream);
+        }
         let plan = Plan {
             kind: MappedKind::AllReduce,
             reduce: reduce_of(op),
@@ -624,6 +762,9 @@ impl Collective for HostmemCollective {
         if recv.len() != n * self.world {
             return Err(CollectiveError::ShapeMismatch);
         }
+        if let Some(d) = self.route(CollectiveOp::AllGather, recv.len()) {
+            return d.all_gather(send, recv, stream);
+        }
         let plan = Plan {
             kind: MappedKind::AllGather,
             reduce: MappedReduce::Sum,
@@ -650,6 +791,9 @@ impl Collective for HostmemCollective {
         let n = recv.len();
         if send.len() != n * self.world {
             return Err(CollectiveError::ShapeMismatch);
+        }
+        if let Some(d) = self.route(CollectiveOp::ReduceScatter, send.len()) {
+            return d.reduce_scatter(send, recv, dtype, op, stream);
         }
         // A step's slot holds `world` parts, each rounded up to 16 bytes.
         let chunk = (self.group.layout.slot_bytes / self.world as u64) / 16 * 16;
@@ -681,6 +825,9 @@ impl Collective for HostmemCollective {
     ) -> Result<(), CollectiveError> {
         if root >= self.world {
             return Err(CollectiveError::ShapeMismatch);
+        }
+        if let Some(d) = self.route(CollectiveOp::Broadcast, buf.len()) {
+            return d.broadcast(buf, root, stream);
         }
         let plan = Plan {
             kind: MappedKind::Broadcast { root: root as u32 },
@@ -743,6 +890,12 @@ impl Collective for HostmemCollective {
         peer: usize,
         stream: &StreamRef,
     ) -> Result<(), CollectiveError> {
+        if peer < self.world
+            && peer != self.rank
+            && let Some(d) = self.route(CollectiveOp::Send, buf.len())
+        {
+            return d.send(buf, peer, stream);
+        }
         self.p2p(CollectiveOp::Send, buf, peer, self.rank, stream)
     }
 
@@ -752,20 +905,37 @@ impl Collective for HostmemCollective {
         peer: usize,
         stream: &StreamRef,
     ) -> Result<(), CollectiveError> {
+        if peer < self.world
+            && peer != self.rank
+            && let Some(d) = self.route(CollectiveOp::Recv, buf.len())
+        {
+            return d.recv(buf, peer, stream);
+        }
         self.p2p(CollectiveOp::Recv, buf, peer, peer, stream)
     }
 
-    /// Nothing to arm: every step's kernel bounds its own waits by `op_timeout`.
-    fn step_begin(&self) {}
+    /// Nothing to arm for the kernels (each bounds its own waits by `op_timeout`); arms the
+    /// delegate's step deadline.
+    fn step_begin(&self) {
+        if let Some(d) = &self.delegate {
+            d.step_begin();
+        }
+    }
 
-    /// `Err` when a step of this or another rank timed out or the group was aborted.
+    /// `Err` when a step of this or another rank timed out, the group was aborted, or the
+    /// delegate's step failed.
     fn step_end(&self) -> Result<(), CollectiveError> {
-        self.check()
+        let own = self.check();
+        let delegated = self.delegate.as_ref().map_or(Ok(()), |d| d.step_end());
+        own.and(delegated)
     }
 
     /// Stores the host abort into the abort word (unless a reason is already there): every
     /// waiting and later step of every rank ends, and every later call fails.
     fn abort(&self) {
+        if let Some(d) = &self.delegate {
+            d.abort();
+        }
         let offset = self.group.layout.abort;
         if self.group.region.load_u32(offset) == 0 {
             self.group
@@ -846,7 +1016,16 @@ mod tests {
             clock: Arc::new(SystemClock::new()),
             metrics: None,
             memory,
+            route_max_bytes: None,
         }
+    }
+
+    /// hostmem without a delegate (the build host's RCCL is never loaded by these tests).
+    fn plain() -> Arc<dyn CollectiveLibrary> {
+        Arc::new(HostmemLibrary {
+            slot_bytes: SLOT_BYTES,
+            delegate: None,
+        })
     }
 
     /// One rank's results of every op, in order: all-reduce sum, all-reduce max, all-gather,
@@ -973,7 +1152,10 @@ mod tests {
     #[test]
     fn matches_host_backend() {
         for slot_bytes in [SLOT_BYTES, 4096] {
-            let lib: Arc<dyn CollectiveLibrary> = Arc::new(HostmemLibrary { slot_bytes });
+            let lib: Arc<dyn CollectiveLibrary> = Arc::new(HostmemLibrary {
+                slot_bytes,
+                delegate: None,
+            });
             for world in [1usize, 2, 3] {
                 for dtype in [DType::F32, DType::BF16] {
                     for elems in [1usize, 7, 4099] {
@@ -1001,7 +1183,7 @@ mod tests {
     /// stays aborted. Breaks if a wait is unbounded or the timeout is not surfaced.
     #[test]
     fn missing_peer_times_out() {
-        let lib = HostmemBackend.load(None).expect("load");
+        let lib = plain();
         let id = lib.unique_id().expect("id");
         let mem: Arc<dyn DeviceMemory> = stub_mapped_context(0);
         let comm = Arc::clone(&lib)
@@ -1050,7 +1232,7 @@ mod tests {
     /// the peer reports `RemoteAbort` naming the aborting rank.
     #[test]
     fn abort_releases_a_spinning_peer() {
-        let lib = HostmemBackend.load(None).expect("load");
+        let lib = plain();
         let id = lib.unique_id().expect("id");
         let mems: Vec<Arc<dyn DeviceMemory>> = (0..2)
             .map(|r| stub_mapped_context(r) as Arc<dyn DeviceMemory>)
@@ -1098,11 +1280,96 @@ mod tests {
         ));
     }
 
+    /// Routing with the host backend as the delegate: calls above the threshold go to the
+    /// delegate, the others stay on hostmem, the results are the host backend's either way, and
+    /// `turbine_collective_route_total` counts each choice. Breaks if the threshold is compared
+    /// on another size, a rank routes differently, or the counts are not kept.
+    #[test]
+    fn routes_above_the_threshold_to_the_delegate() {
+        let delegate = crate::collective::HostBackend.load(None).expect("host");
+        let lib: Arc<dyn CollectiveLibrary> = Arc::new(HostmemLibrary {
+            slot_bytes: SLOT_BYTES,
+            delegate: Some(delegate),
+        });
+        let id = lib.unique_id().expect("id");
+        let reg = turbine_observability::MetricsRegistry::new();
+        let metrics = CollectiveMetrics::register(&reg);
+        let outs: Vec<Vec<Vec<u8>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2usize)
+                .map(|r| {
+                    let (lib, metrics) = (Arc::clone(&lib), metrics.clone());
+                    s.spawn(move || {
+                        let mem: Arc<dyn DeviceMemory> = stub_mapped_context(r as u32);
+                        let comm = lib
+                            .open(CollectiveInit {
+                                metrics: Some(metrics),
+                                route_max_bytes: Some(64),
+                                ..init(r, 2, id, Duration::from_secs(20), Some(Arc::clone(&mem)))
+                            })
+                            .expect("open");
+                        assert_eq!(comm.backend(), "hostmem");
+                        let stream = mem.compute_stream();
+                        [16usize, 4096]
+                            .iter()
+                            .map(|&n| {
+                                let v = encode(DType::F32, &values(r as u64 + n as u64, n / 4));
+                                let buf = DeviceBuffer::alloc(&mem, n).expect("alloc");
+                                buf.whole().write_bytes(&v).expect("write");
+                                comm.all_reduce(
+                                    &mut buf.whole(),
+                                    DType::F32,
+                                    ReduceOp::Sum,
+                                    &stream,
+                                )
+                                .expect("all_reduce");
+                                mem.synchronize().expect("sync");
+                                comm.step_end().expect("healthy");
+                                buf.whole().read_bytes().expect("read")
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("rank"))
+                .collect()
+        });
+        for (k, n) in [16usize, 4096].iter().enumerate() {
+            let inputs: Vec<Vec<u8>> = (0..2)
+                .map(|r| encode(DType::F32, &values(r as u64 + *n as u64, n / 4)))
+                .collect();
+            let f = |b: &[u8]| -> Vec<f32> {
+                b.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            };
+            let sum: Vec<f32> = f(&inputs[0])
+                .iter()
+                .zip(f(&inputs[1]))
+                .map(|(a, b)| a + b)
+                .collect();
+            let want = encode(DType::F32, &sum);
+            for (r, o) in outs.iter().enumerate() {
+                assert_eq!(o[k], want, "{n} bytes rank {r}");
+            }
+        }
+        let text = reg.render().expect("renders");
+        for (backend, reason) in [("hostmem", "below_threshold"), ("host", "above_threshold")] {
+            let line = format!(
+                "turbine_collective_route_total{{op=\"all_reduce\",backend=\"{backend}\",reason=\"{reason}\"}} 2"
+            );
+            assert!(text.contains(&line), "{line}\n{text}");
+        }
+        assert_eq!(auto_max_bytes(CollectiveOp::AllReduce), 128 << 10);
+        assert_eq!(auto_max_bytes(CollectiveOp::Barrier), u64::MAX);
+    }
+
     /// Unavailable (never a panic) without a device context, on a device whose library lacks
     /// the v2.7 group, and for an id made by another process (static rank mode).
     #[test]
     fn unavailable_cases() {
-        let lib = HostmemBackend.load(None).expect("load");
+        let lib = plain();
         let id = lib.unique_id().expect("id");
         let t = Duration::from_secs(1);
         let unavailable = |r: Result<Arc<dyn Collective>, CollectiveError>, want: &str| match r {
@@ -1130,7 +1397,7 @@ mod tests {
         let err = HostmemBackend
             .load(Some(Path::new("/nonexistent/libx.so")))
             .map(|_| ())
-            .expect_err("no library of its own");
+            .expect_err("an explicit delegate library that does not exist");
         assert!(
             matches!(&err, CollectiveError::Unavailable { library, .. } if library == "/nonexistent/libx.so"),
             "{err:?}"

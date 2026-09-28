@@ -95,6 +95,11 @@ struct Args {
     /// timing each op plus its own synchronize (median).
     #[arg(long)]
     pipelined: bool,
+    /// A routing backend's size threshold (`parallel.collective.hostmem_max_bytes`): `auto`
+    /// (default) is its measured per-op crossover; a byte size (e.g. `1TiB` to keep every
+    /// message on hostmem's own kernels) overrides it.
+    #[arg(long, default_value = "auto")]
+    route_max_bytes: String,
     #[arg(long, value_enum, default_value = "text")]
     output: Output,
 }
@@ -481,6 +486,13 @@ fn main() -> ExitCode {
         dtype,
         pipelined: args.pipelined,
     };
+    let route_max_bytes = match args.route_max_bytes.as_str() {
+        "auto" => None,
+        v => match v.parse::<ByteSize>() {
+            Ok(b) => Some(b.0),
+            Err(e) => return usage(format!("--route-max-bytes {v}: {e}")),
+        },
+    };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let metrics = CollectiveMetrics::register(&MetricsRegistry::new());
     let init_timeout = Duration::from_secs(120);
@@ -556,6 +568,7 @@ fn main() -> ExitCode {
                             clock,
                             metrics: Some(metrics),
                             memory: Some(Arc::clone(&mem)),
+                            route_max_bytes,
                         })
                         .map_err(|e| format!("rank {rank}: {e}"))?;
                     run_rank(&RankEnv { comm, mem }, plan)
