@@ -3,10 +3,18 @@
 //! (P1 AC S-1, contract §1.3).
 use std::path::{Path, PathBuf};
 
-/// Source trees that may contain `unsafe` (contract §1.3, Phase 1 row).
-const ALLOWED_SOURCES: &[&str] = &["crates/turbine-device/src", "crates/turbine-kernels/src"];
+/// Source trees (a directory, or a module given without `.rs`) that may contain `unsafe`
+/// (contract §1.3, Phase 1 and Phase 5 rows; CONFLICT C-19).
+const ALLOWED_SOURCES: &[&str] = &[
+    "crates/turbine-device/src",
+    "crates/turbine-kernels/src",
+    "crates/turbine-distributed/src/collective/ffi",
+];
 /// Crate directories whose manifests allow `unsafe_code`.
 const UNSAFE_CRATES: &[&str] = &["turbine-device", "turbine-kernels"];
+/// Crates that deny `unsafe_code` in the manifest and at the crate root, and allow it on one
+/// module listed in `ALLOWED_SOURCES`.
+const DENY_CRATES: &[&str] = &["turbine-distributed"];
 /// Top-level directories holding one crate per subdirectory.
 const CRATE_ROOTS: &[&str] = &["crates", "benches"];
 
@@ -212,7 +220,7 @@ fn preceded_by_safety(raw: &[&str], masked: &[&str], idx: usize) -> bool {
 fn scan_source(rel: &str, text: &str) -> Vec<String> {
     let allowed = ALLOWED_SOURCES
         .iter()
-        .any(|a| rel.starts_with(&format!("{a}/")));
+        .any(|a| rel.starts_with(&format!("{a}/")) || rel == format!("{a}.rs"));
     let masked_text = mask_non_code(text);
     let masked: Vec<&str> = masked_text.lines().collect();
     let raw: Vec<&str> = text.lines().collect();
@@ -286,9 +294,22 @@ fn other_crates_forbid_unsafe_code() {
         let manifest = dir.join("Cargo.toml");
         let text = std::fs::read_to_string(&manifest)
             .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+        let level = if DENY_CRATES.contains(&name.as_str()) {
+            let lib = dir.join("src/lib.rs");
+            let root = std::fs::read_to_string(&lib)
+                .unwrap_or_else(|e| panic!("read {}: {e}", lib.display()));
+            assert!(
+                root.lines().any(|l| l.trim() == "#![deny(unsafe_code)]"),
+                "{} lacks `#![deny(unsafe_code)]`",
+                lib.display()
+            );
+            "deny"
+        } else {
+            "forbid"
+        };
         if !text
             .lines()
-            .any(|l| l.trim() == r#"unsafe_code = "forbid""#)
+            .any(|l| l.trim() == format!(r#"unsafe_code = "{level}""#))
         {
             missing.push(
                 manifest
@@ -301,8 +322,23 @@ fn other_crates_forbid_unsafe_code() {
     }
     assert!(
         missing.is_empty(),
-        "manifests without `unsafe_code = \"forbid\"`: {missing:?}"
+        "manifests without `unsafe_code = \"forbid\"` (or \"deny\" for {DENY_CRATES:?}): {missing:?}"
     );
+}
+
+/// Every allow-listed location exists (a directory or `<module>.rs`), so a moved module cannot
+/// leave a stale entry that silently allows `unsafe` wherever the path is recreated.
+#[test]
+fn allowlisted_sources_exist() {
+    let root = repo_root();
+    for a in ALLOWED_SOURCES {
+        let dir = root.join(a);
+        let file = root.join(format!("{a}.rs"));
+        assert!(
+            dir.is_dir() || file.is_file(),
+            "allow-listed `unsafe` location {a} does not exist"
+        );
+    }
 }
 
 /// The scanner itself: masked comments/strings never count, and both failure kinds name the line.
@@ -334,6 +370,27 @@ fn scanner_flags_leaks_and_missing_safety_comments() {
                 .to_string()
         ]
     );
+
+    // Only the collective::ffi module of turbine-distributed is allow-listed.
+    let block = "// SAFETY: the library outlives the pointer.\nlet x = unsafe { g() };\n";
+    assert!(scan_source("crates/turbine-distributed/src/collective/ffi.rs", block).is_empty());
+    assert!(
+        scan_source(
+            "crates/turbine-distributed/src/collective/ffi/table.rs",
+            block
+        )
+        .is_empty()
+    );
+    for other in [
+        "crates/turbine-distributed/src/collective/host.rs",
+        "crates/turbine-distributed/src/collective/ffi_extra.rs",
+        "crates/turbine-distributed/src/lib.rs",
+    ] {
+        assert_eq!(
+            scan_source(other, block),
+            vec![format!("{other}:2: `unsafe` outside {ALLOWED_SOURCES:?}")]
+        );
+    }
 
     let ok = "// SAFETY: the pointer is owned by this context.\n#[allow(clippy::x)]\nunsafe impl Send for C {}\n// SAFETY: see above.\nlet x = unsafe { g() };\n// SAFETY: wrapped statement.\nlet y =\n    unsafe { g() } == 0;\ntype F = unsafe extern \"C\" fn();\nlet r = r#\"unsafe {\"#; let c = '\"'; fn l<'a>() {}\n";
     assert!(scan_source("crates/turbine-kernels/src/x.rs", ok).is_empty());

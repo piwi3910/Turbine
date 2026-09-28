@@ -2357,7 +2357,9 @@ dependencies = [
 name = "turbine-distributed"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "half",
+ "libloading 0.9.0",
  "prometheus-client",
  "thiserror 2.0.21",
  "tracing",

@@ -5,7 +5,11 @@
 //! never allocates model memory. Supported element types: BF16 and FP32.
 
 pub mod conformance;
+// The only module of this crate allowed to contain `unsafe` (contract §1.3, CONFLICT C-19).
+#[allow(unsafe_code)]
+pub mod ffi;
 pub mod host;
+pub mod nccl_api;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,7 +26,9 @@ use turbine_core::types::Vendor;
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::{DType, DeviceSlice, StreamRef};
 
+pub use ffi::NcclApi;
 pub use host::{HostBackend, HostCollective};
+pub use nccl_api::{NcclApiBackend, NcclFlavor};
 
 /// Element-wise reduction of all-reduce and reduce-scatter.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -124,9 +130,11 @@ pub struct CollectiveInit {
 }
 
 static HOST: HostBackend = HostBackend;
+static RCCL: NcclApiBackend = NcclApiBackend::new(&nccl_api::RCCL_FLAVOR);
+static NCCL: NcclApiBackend = NcclApiBackend::new(&nccl_api::NCCL_FLAVOR);
 
 static COLLECTIVE_BACKENDS: Registry<dyn CollectiveBackend> =
-    Registry::new("collective_backend", &[&HOST]);
+    Registry::new("collective_backend", &[&HOST, &RCCL, &NCCL]);
 
 /// The registered collective backends, in registration order (`auto` takes the first one
 /// serving the plan's vendor).

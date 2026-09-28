@@ -10,19 +10,28 @@ use turbine_tensor::{DType, DeviceBuffer, DeviceId, DeviceMemory};
 
 use super::{CollectiveBackend, CollectiveError, CollectiveInit, ReduceOp};
 
-/// `Err` naming the first problem. Loading must succeed or answer `Unavailable` (a missing
-/// library is never a panic); a loaded backend reports its own name and makes distinct ids; a
-/// host-memory backend (no vendors) must run a two-rank all-reduce and all-gather correctly
-/// here, a device backend is exercised by the lab (`turbine-collbench`).
+/// `Err` naming the first problem. A device backend (with vendors) must answer an explicit
+/// library that does not exist with `Unavailable` naming that path — never a panic, and never
+/// by loading a real vendor library on the build host; its communicators are exercised by the
+/// lab (`turbine-collbench`). A host-memory backend (no vendors) must load, report its own
+/// name, make distinct ids and run a two-rank all-reduce and all-gather correctly here.
 pub fn check(backend: &dyn CollectiveBackend) -> Result<(), String> {
     let name = backend.name();
-    let lib = match backend.load(None) {
-        Ok(lib) => lib,
-        Err(CollectiveError::Unavailable { .. }) if !backend.vendors().is_empty() => {
-            return Ok(());
-        }
-        Err(e) => return Err(format!("{name}: load failed with {e}")),
-    };
+    if !backend.vendors().is_empty() {
+        let missing = std::path::Path::new("/nonexistent/turbine-conformance/lib.so");
+        return match backend.load(Some(missing)) {
+            Err(CollectiveError::Unavailable { library, .. })
+                if library.contains("/nonexistent/turbine-conformance") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(format!("{name}: a missing explicit library gave {e}")),
+            Ok(_) => Err(format!("{name}: a missing explicit library loaded")),
+        };
+    }
+    let lib = backend
+        .load(None)
+        .map_err(|e| format!("{name}: load failed with {e}"))?;
     if lib.backend() != name {
         return Err(format!("{name}: the library reports `{}`", lib.backend()));
     }
@@ -30,9 +39,6 @@ pub fn check(backend: &dyn CollectiveBackend) -> Result<(), String> {
         (Ok(a), Ok(b)) if a != b => {}
         (Ok(_), Ok(_)) => return Err(format!("{name}: two unique ids are equal")),
         (Err(e), _) | (_, Err(e)) => return Err(format!("{name}: unique_id failed: {e}")),
-    }
-    if !backend.vendors().is_empty() {
-        return Ok(());
     }
     let id = lib.unique_id().map_err(|e| e.to_string())?;
     let results: Vec<Result<RankOut, String>> = std::thread::scope(|s| {

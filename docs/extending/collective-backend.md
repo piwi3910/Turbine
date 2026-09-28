@@ -59,17 +59,18 @@ In `crates/turbine-distributed/src/collective/mod.rs`: add `mod <name>;` next to
 
 ```rust
 static COLLECTIVE_BACKENDS: Registry<dyn CollectiveBackend> =
-    Registry::new("collective_backend", &[&HOST, &LOOPBACK]);
+    Registry::new("collective_backend", &[&HOST, &RCCL, &NCCL, &LOOPBACK]);
 ```
 
 Then add the name to the pinned list in `registry_conformance::collective_backends` (`crates/turbine-distributed/src/lib.rs`). Registration order matters for `auto`: the first backend serving the plan's vendor wins. The server validates `parallel.collective_backend` against `registry().names()` (`crates/turbine-server/src/modules.rs`).
 
 ## Conformance suite
 
-`check` (`crates/turbine-distributed/src/collective/conformance.rs`) runs over every registered backend: loading succeeds or answers `Unavailable`, the loaded library reports its own name and makes distinct ids, and a host-memory backend runs a two-rank all-reduce and all-gather correctly on the build host. The host backend's own tests compare every op for world sizes 1–8, FP32 and BF16 and odd sizes bit for bit against a naive reference, and check that a missing rank times out and aborts the group.
+`check` (`crates/turbine-distributed/src/collective/conformance.rs`) runs over every registered backend. A device backend must answer an explicit library path that does not exist with `Unavailable` naming it (no panic, and no real vendor library is loaded on the build host). A host-memory backend must load, report its own name, make distinct ids and run a two-rank all-reduce and all-gather correctly. The NCCL-API binding (`crates/turbine-distributed/src/collective/ffi.rs`, registered twice by `crates/turbine-distributed/src/collective/nccl_api.rs` as `rccl` and `nccl`) is also tested against a stub library that `crates/turbine-distributed/build.rs` compiles with the host C compiler: every symbol resolved, the version floor, a missing symbol refused. The host backend's own tests compare every op for world sizes 1–8, FP32 and BF16 and odd sizes bit for bit against a naive reference, and check that a missing rank times out and aborts the group.
 
 - `scripts/remote-cargo.sh test -p turbine-distributed registry_conformance` — the suite over the registry.
 - `scripts/remote-cargo.sh test -p turbine-distributed collective::host::tests::ops_match_reference` — the reference every device backend is compared against.
+- `scripts/remote-cargo.sh test -p turbine-distributed collective::ffi::tests` — the NCCL-API binding against the stubs.
 
 ## Lab checks
 

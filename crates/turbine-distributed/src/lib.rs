@@ -1,6 +1,7 @@
 //! Multi-GPU building blocks (P5): the backend-neutral [`collective::Collective`] trait, its
 //! backends as modules of the `collective_backend` registry (a deterministic host reference
-//! backend first).
+//! backend, and one runtime-loaded NCCL-API binding serving `rccl` and `nccl`).
+#![deny(unsafe_code)]
 
 pub mod collective;
 
@@ -12,7 +13,7 @@ mod registry_conformance {
     fn collective_backends() {
         let reg = crate::collective::registry();
         conformance::check(reg).unwrap();
-        assert_eq!(reg.names(), ["host"]);
+        assert_eq!(reg.names(), ["host", "rccl", "nccl"]);
         for backend in reg.iter() {
             crate::collective::conformance::check(backend).unwrap();
         }

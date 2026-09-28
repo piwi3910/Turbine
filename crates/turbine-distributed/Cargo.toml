@@ -16,8 +16,14 @@ turbine-tensor.workspace = true
 prometheus-client.workspace = true
 # BF16 element interpretation in the host reference backend
 half.workspace = true
+# Runtime loading of librccl.so.1 / libnccl.so.2; nothing links a collective library at build time
+libloading.workspace = true
 
-# No module contains `unsafe` yet; the NCCL-API binding (collective::ffi) relaxes this to
-# `deny` with a single module-level allow (contract §1.3).
+[build-dependencies]
+# Finds the host C compiler that build.rs uses to compile the NCCL-API stub for the ffi tests
+cc.workspace = true
+
+# `unsafe` is denied crate-wide; only the NCCL-API binding module `collective::ffi` carries
+# `#[allow(unsafe_code)]` (contract §1.3, checked by turbine-kernels tests/unsafe_isolation.rs).
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
