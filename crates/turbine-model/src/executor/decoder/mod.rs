@@ -72,6 +72,7 @@ use crate::ModelError;
 use crate::config::{ModelArchConfig, MoeConfig};
 use crate::ep::{EpContext, EpDims};
 use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name};
+use crate::pp::PpContext;
 use crate::tp::{TpContext, rank_config};
 
 pub mod hooks;
@@ -552,6 +553,8 @@ pub struct DecoderExecutor {
     tp: Option<TpContext>,
     /// The rank's experts and combine, when expert-parallel.
     ep: Option<EpContext>,
+    /// The stage's layers and hand-off, when pipeline-parallel ([`crate::pp`]).
+    pp: Option<PpContext>,
     tp_bufs: Option<TpBuffers>,
     spec: DecoderSpec,
     dims: DecoderDims,
@@ -567,10 +570,12 @@ pub struct DecoderExecutor {
     /// Residual adds followed by a norm run as one `add_rmsnorm` (`fused_ops` and a provider
     /// selected for it).
     add_norm: bool,
-    embed: Tensor,
+    /// `None` on a pipeline stage that neither embeds nor ties its LM head to the embedding.
+    embed: Option<Tensor>,
     layers: Vec<Layer>,
-    final_norm: Tensor,
-    /// `None` when the model ties its LM head to `embed`.
+    /// `None` on a pipeline stage before the last.
+    final_norm: Option<Tensor>,
+    /// `None` when the model ties its LM head to `embed` (or on a stage before the last).
     lm_head: Option<Tensor>,
     bufs: Buffers,
     ffn_buffers: HookBuffers,
@@ -717,6 +722,30 @@ impl DecoderExecutor {
         spec: &DecoderSpec,
         limits: ExecutorLimits,
     ) -> u64 {
+        Self::workspace_with_head(cfg, d, spec, limits, limits.max_seqs as usize)
+    }
+
+    /// [`DecoderExecutor::workspace_bytes`] of pipeline stage configuration `cfg`
+    /// ([`crate::pp::stage_config`]): the logits rows for `max_seqs` sequences only on the last
+    /// stage (`lm_head`), one row before it.
+    pub(crate) fn stage_workspace_bytes(
+        cfg: &ModelArchConfig,
+        spec: &DecoderSpec,
+        limits: ExecutorLimits,
+        lm_head: bool,
+    ) -> u64 {
+        let rows = if lm_head { limits.max_seqs as usize } else { 1 };
+        Self::workspace_with_head(cfg, &DecoderDims::of(cfg), spec, limits, rows)
+    }
+
+    /// [`DecoderExecutor::workspace_of`] with logits rows for `head_rows` sequences.
+    fn workspace_with_head(
+        cfg: &ModelArchConfig,
+        d: &DecoderDims,
+        spec: &DecoderSpec,
+        limits: ExecutorLimits,
+        head_rows: usize,
+    ) -> u64 {
         let es = d.act.size_bytes() as u64;
         let f32 = DType::F32.size_bytes() as u64;
         let per_token = es * (3 * d.hidden + 2 * d.q_dim + 2 * d.kv_dim) as u64;
@@ -725,7 +754,7 @@ impl DecoderExecutor {
         u64::from(t) * per_token
             + spec.ffn.workspace_bytes(d, t as usize)
             + u64::from(limits.max_seqs) * per_seq
-            + LogitsHead::bytes(d.vocab, limits.max_seqs as usize)
+            + LogitsHead::bytes(d.vocab, head_rows)
             + f32 * (d.head_dim / 2) as u64
             + DeviceBatch::bytes(&batch_limits(cfg, limits))
     }
@@ -776,6 +805,80 @@ impl DecoderExecutor {
     pub fn new_parallel(
         cfg: &ModelArchConfig,
         spec: DecoderSpec,
+        weights: LoadedWeights,
+        registry: Arc<KernelRegistry>,
+        mem: Arc<dyn DeviceMemory>,
+        limits: ExecutorLimits,
+        opts: ExecutorOptions,
+        tp: Option<TpContext>,
+        ep: Option<EpContext>,
+    ) -> Result<DecoderExecutor, ModelError> {
+        Self::build(
+            cfg, spec, weights, registry, mem, limits, opts, tp, ep, None,
+        )
+    }
+
+    /// [`DecoderExecutor::new`] as stage `pp.stage` of a pipeline-parallel group
+    /// ([`crate::pp`]): `cfg` is the model's configuration, `weights` the stage's
+    /// ([`crate::pp::weight_slots`]), `registry` was built from [`crate::pp::requirements`] of
+    /// its layers, and every forward's pool is laid out as the stage's KV layout
+    /// ([`crate::pp::kv_layout`]). Stage 0 embeds; a later stage receives the residual rows from
+    /// the stage before it; a stage before the last sends its rows on and returns empty logits
+    /// (0 rows); the last returns the logits. Never captures decode graphs nor overlaps
+    /// launches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_stage(
+        cfg: &ModelArchConfig,
+        spec: DecoderSpec,
+        weights: LoadedWeights,
+        registry: Arc<KernelRegistry>,
+        mem: Arc<dyn DeviceMemory>,
+        limits: ExecutorLimits,
+        opts: ExecutorOptions,
+        pp: PpContext,
+    ) -> Result<DecoderExecutor, ModelError> {
+        let c = &pp.collective;
+        if pp.stages == 0
+            || pp.stage >= pp.stages
+            || c.world_size() != pp.stages as usize
+            || c.rank() != pp.stage as usize
+        {
+            return Err(invalid(format!(
+                "pipeline stage {} of {} over a communicator of rank {} of {}",
+                pp.stage,
+                pp.stages,
+                c.rank(),
+                c.world_size()
+            )));
+        }
+        let stage_cfg = crate::pp::stage_config(cfg, &pp.layers)?;
+        if pp.is_first() != (pp.layers.start == 0)
+            || pp.is_last() != (pp.layers.end == cfg.num_layers)
+        {
+            return Err(invalid(format!(
+                "pipeline stage {} of {} over layers {:?} of {}",
+                pp.stage, pp.stages, pp.layers, cfg.num_layers
+            )));
+        }
+        Self::build(
+            &stage_cfg,
+            spec,
+            weights,
+            registry,
+            mem,
+            limits,
+            opts,
+            None,
+            None,
+            Some(pp),
+        )
+    }
+
+    /// Every constructor: `cfg` is the stage's configuration when `pp` is set.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        cfg: &ModelArchConfig,
+        spec: DecoderSpec,
         mut weights: LoadedWeights,
         registry: Arc<KernelRegistry>,
         mem: Arc<dyn DeviceMemory>,
@@ -783,6 +886,7 @@ impl DecoderExecutor {
         opts: ExecutorOptions,
         tp: Option<TpContext>,
         ep: Option<EpContext>,
+        pp: Option<PpContext>,
     ) -> Result<DecoderExecutor, ModelError> {
         let shard = tp.as_ref().map(TpContext::shard);
         if let Some(e) = &ep
@@ -850,7 +954,10 @@ impl DecoderExecutor {
             fused: opts.fused_projections && spec.attention.fuses_qkv(),
         };
         let mut layers = Vec::with_capacity(d.layers);
-        for i in 0..cfg.num_layers {
+        // A pipeline stage's layer `local` is the model's layer `first + local`.
+        let first = pp.as_ref().map_or(0, |s| s.layers.start);
+        for local in 0..cfg.num_layers {
+            let i = first + local;
             let p = format!("model.layers.{i}");
             let w_qkv = d.take_weight(&mut weights, &qkv_proj_name(i), &[qkv.width(), d.hidden])?;
             let mut take = |s: &str| weights.take(&format!("{p}.{s}.weight"));
@@ -870,9 +977,20 @@ impl DecoderExecutor {
                 ffn,
             });
         }
-        let embed = weights.take("model.embed_tokens.weight")?;
-        let final_norm = weights.take("model.norm.weight")?;
-        let lm_head = if d.tied_lm_head {
+        let (embeds, heads) = pp
+            .as_ref()
+            .map_or((true, true), |s| (s.is_first(), s.is_last()));
+        let embed = if embeds || (heads && d.tied_lm_head) {
+            Some(weights.take("model.embed_tokens.weight")?)
+        } else {
+            None
+        };
+        let final_norm = if heads {
+            Some(weights.take("model.norm.weight")?)
+        } else {
+            None
+        };
+        let lm_head = if d.tied_lm_head || !heads {
             None
         } else {
             Some(weights.take(LM_HEAD)?)
@@ -898,7 +1016,8 @@ impl DecoderExecutor {
             proj: act(d.hidden)?,
             last: Tensor::empty(&mem, &[n, d.hidden], d.act)?,
         };
-        let head = LogitsHead::new(cfg, &registry, &mem, n)?;
+        // A stage before the last never computes logits: one row keeps the head valid.
+        let head = LogitsHead::new(cfg, &registry, &mem, if heads { n } else { 1 })?;
         let meta = DeviceBatch::alloc(&mem, &limits)?;
         let tp_bufs = match &tp {
             Some(tc) => Some(TpBuffers {
@@ -913,6 +1032,7 @@ impl DecoderExecutor {
             cfg: cfg.clone(),
             tp,
             ep,
+            pp,
             tp_bufs,
             spec,
             dims: d,
@@ -1098,6 +1218,45 @@ impl DecoderExecutor {
             .as_ref()
             .map(|t| &t.collective)
             .or(self.ep.as_ref().map(|e| &e.collective))
+            .or(self.pp.as_ref().map(|p| &p.collective))
+    }
+
+    /// The forward ends with logits: every executor but a pipeline stage before the last.
+    fn emits_logits(&self) -> bool {
+        self.pp.as_ref().is_none_or(PpContext::is_last)
+    }
+
+    /// Launched steps not collected yet: the logits reads in flight, or a stage's launches.
+    fn pending(&self) -> usize {
+        if self.emits_logits() {
+            self.head.pending()
+        } else {
+            self.launches.len()
+        }
+    }
+
+    /// Pipeline parallelism: sends the residual stream's `t` rows to the next stage.
+    fn pp_send(&self, pp: &PpContext, t: usize) -> Result<(), ModelError> {
+        let slice = rows(&self.bufs.x, t).slice;
+        let backend = pp.collective.backend();
+        self.profiler
+            .step(self.mem.as_ref(), profile::PP_SEND, backend, || {
+                Ok(pp
+                    .collective
+                    .send(&slice, pp.stage as usize + 1, &pp.stream)?)
+            })
+    }
+
+    /// Pipeline parallelism: receives the residual stream's `t` rows from the stage before.
+    fn pp_recv(&self, pp: &PpContext, t: usize) -> Result<(), ModelError> {
+        let mut slice = rows(&self.bufs.x, t).slice;
+        let backend = pp.collective.backend();
+        self.profiler
+            .step(self.mem.as_ref(), profile::PP_RECV, backend, || {
+                Ok(pp
+                    .collective
+                    .recv(&mut slice, pp.stage as usize - 1, &pp.stream)?)
+            })
     }
 
     /// Tensor parallelism: the LM head of the `n` final-norm rows over this rank's vocabulary
@@ -1325,12 +1484,12 @@ impl DecoderExecutor {
     fn final_norm_last_rows(&self, p: &Packed, order: &[usize]) -> Result<(), ModelError> {
         let b = &self.bufs;
         let x = rows(&b.x, p.total_q);
+        let final_norm = self
+            .final_norm
+            .as_ref()
+            .ok_or_else(|| invalid("final norm on a pipeline stage before the last".into()))?;
         for (src, dst, len) in logits::norm_runs(&p.last_rows, order) {
-            self.rmsnorm(
-                x.rows(src, len),
-                &self.final_norm,
-                b.last.view().rows(dst, len),
-            )?;
+            self.rmsnorm(x.rows(src, len), final_norm, b.last.view().rows(dst, len))?;
         }
         Ok(())
     }
@@ -1349,42 +1508,60 @@ impl DecoderExecutor {
         let b = &self.bufs;
         let (t, n) = (p.total_q, p.num_seqs);
         self.step_prefill.store(!p.is_decode(), Ordering::Relaxed);
-        let embedding = self.dims.embedding();
-        let vocab_offset = self.dims.tp.map_or(0, |tp| tp.vocab_offset as i64);
-        self.op(OpConfig::Embedding(embedding), || {
-            self.registry
-                .embedding(&embedding)
-                .execute(&mut EmbeddingContext {
-                    ids: self.meta.ids_view(p),
-                    table: self.embed.view(),
-                    out: rows(&b.x, t),
-                    vocab_offset,
-                })
-        })?;
-        for &(token, word, len) in runs {
+        if let Some(pp) = self.pp.as_ref().filter(|s| !s.is_first()) {
+            // The residual stream of the stage before, in place of the embedding.
+            self.pp_recv(pp, t)?;
+            self.record(None, "pp_recv", rows(&b.x, t))?;
+        } else {
+            let table = self
+                .embed
+                .as_ref()
+                .ok_or_else(|| invalid("embedding on a stage without the table".into()))?;
+            let embedding = self.dims.embedding();
+            let vocab_offset = self.dims.tp.map_or(0, |tp| tp.vocab_offset as i64);
             self.op(OpConfig::Embedding(embedding), || {
                 self.registry
                     .embedding(&embedding)
                     .execute(&mut EmbeddingContext {
-                        ids: self.head.ids_at(word, len),
-                        table: self.embed.view(),
-                        out: rows(&b.x, t).rows(token, len),
+                        ids: self.meta.ids_view(p),
+                        table: table.view(),
+                        out: rows(&b.x, t),
                         vocab_offset,
                     })
             })?;
+            for &(token, word, len) in runs {
+                self.op(OpConfig::Embedding(embedding), || {
+                    self.registry
+                        .embedding(&embedding)
+                        .execute(&mut EmbeddingContext {
+                            ids: self.head.ids_at(word, len),
+                            table: table.view(),
+                            out: rows(&b.x, t).rows(token, len),
+                            vocab_offset,
+                        })
+                })?;
+            }
+            // Each id was embedded by the rank whose shard holds it, zeros elsewhere.
+            self.all_reduce(&rows(&b.x, t))?;
+            self.record(None, "embed", rows(&b.x, t))?;
         }
-        // Each id was embedded by the rank whose shard holds it, zeros elsewhere.
-        self.all_reduce(&rows(&b.x, t))?;
-        self.record(None, "embed", rows(&b.x, t))?;
         if let Some(first) = self.layers.first() {
             self.rmsnorm(rows(&b.x, t), &first.input_norm, rows(&b.h, t))?;
         }
         for i in 0..self.layers.len() {
             self.layer(i, p, kv)?;
         }
+        if let Some(pp) = self.pp.as_ref().filter(|s| !s.is_last()) {
+            // The next stage continues from the residual stream (its input norm comes first).
+            return self.pp_send(pp, t);
+        }
         self.final_norm_last_rows(p, order)?;
         self.record(None, "final_norm", rows(&b.last, n))?;
-        let head = self.lm_head.as_ref().unwrap_or(&self.embed);
+        let head = self
+            .lm_head
+            .as_ref()
+            .or(self.embed.as_ref())
+            .ok_or_else(|| invalid("LM head on a stage without it".into()))?;
         match (&self.tp, &self.tp_bufs) {
             (Some(tp), Some(bufs)) => self.tp_lm_head(tp, bufs, head, n)?,
             _ => self.linear(rows(&b.last, n), head.view(), self.head.rows(n))?,
@@ -1405,7 +1582,7 @@ impl ModelExecutor for DecoderExecutor {
     }
 
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
-        if self.head.pending() > 0 {
+        if self.pending() > 0 {
             return Err(invalid(
                 "forward while a launched step is not collected".into(),
             ));
@@ -1421,12 +1598,12 @@ impl ModelExecutor for DecoderExecutor {
 
     fn launch(&mut self, batch: &BatchInput<'_>, feeds: &[TokenFeed]) -> Result<(), ModelError> {
         let in_flight = if self.overlaps() { 2 } else { 1 };
-        if self.head.pending() >= in_flight {
+        if self.pending() >= in_flight {
             return Err(invalid(format!(
                 "{in_flight} launched steps are not collected yet"
             )));
         }
-        if !feeds.is_empty() && self.head.pending() == 0 && !self.overlaps() {
+        if !feeds.is_empty() && self.pending() == 0 && !self.overlaps() {
             return Err(invalid(
                 "token feeds need an executor that overlaps steps".into(),
             ));
@@ -1459,7 +1636,9 @@ impl ModelExecutor for DecoderExecutor {
                 Ok((p, key))
             },
         )?;
-        self.head.upload_inputs()?;
+        if self.emits_logits() {
+            self.head.upload_inputs()?;
+        }
         let launch_started = Instant::now();
         if let Some(group) = self.group() {
             // Bounds the step's collectives until `collect` has synchronised the stream.
@@ -1479,16 +1658,29 @@ impl ModelExecutor for DecoderExecutor {
         }
         enqueued?;
         // The step's one device-to-host read, after the device reduction of the rows that
-        // asked for one; collected by `collect`.
-        self.head.launch_read()?;
+        // asked for one; collected by `collect`. A stage before the last has none.
+        if self.emits_logits() {
+            self.head.launch_read()?;
+        }
         self.launches.push_back(launch_started.elapsed());
         Ok(())
     }
 
     fn collect(&mut self) -> Result<Logits, ModelError> {
         let wait_started = Instant::now();
+        if self.launches.is_empty() {
+            return Err(invalid("collect without a launched forward".into()));
+        }
         let launch = self.launches.pop_front().unwrap_or_default();
-        let logits = self.head.collect(&self.profiler, self.mem.as_ref());
+        let logits = if self.emits_logits() {
+            self.head.collect(&self.profiler, self.mem.as_ref())
+        } else {
+            // A stage before the last: its output went to the next stage; wait for the step.
+            self.mem
+                .synchronize()
+                .map(|()| Logits::full(0, self.dims.vocab, Vec::new()))
+                .map_err(ModelError::from)
+        };
         if let Some(group) = self.group() {
             // The read synchronised the stream: the step's collectives are complete.
             let ended = group.step_end();
@@ -1506,9 +1698,17 @@ impl ModelExecutor for DecoderExecutor {
         Ok(logits)
     }
 
-    /// Ignored (graphs stay off) for a tensor- or expert-parallel rank: its collectives are not
-    /// captured.
+    /// Ignored (graphs stay off) for a tensor- or expert-parallel rank or a pipeline stage: its
+    /// collectives are not captured.
     fn set_decode_graphs(&mut self, graphs: Option<DecodeGraphs>) {
+        if self.pp.is_some() && graphs.is_some() {
+            tracing::warn!(
+                event = "decode_graphs_off",
+                reason = "pipeline_parallel",
+                "decode graphs are not captured on pipeline stages"
+            );
+            return;
+        }
         if self.group().is_some() && graphs.is_some() {
             tracing::info!(
                 event = "decode_graphs_off",

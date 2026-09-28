@@ -17,6 +17,7 @@ pub mod formats;
 pub mod generate;
 pub mod loader;
 pub mod metrics;
+pub mod pp;
 pub mod registries;
 pub mod safetensors;
 pub mod sampling;
@@ -44,6 +45,7 @@ pub use generate::{GenerateOptions, Generation, generate};
 pub use loader::{LoadedWeights, MAX_STAGING_BYTES, WeightLoader, WeightSlot};
 pub use loader::{StackPlace, gate_up_proj_name, qkv_proj_name, stacked_experts_name};
 pub use metrics::{ForwardPhase, ModelMetrics, ToolCallOutcome};
+pub use pp::PpContext;
 pub use sampler::{SampleJob, SampledToken, Sampler, SamplerState, sample_rows};
 pub use structured::{
     GrammarCompiler, GrammarLimits, JSON_MAX_WHITESPACE, TokenMask, TokenMatcher, constraint_kind,
@@ -87,8 +89,9 @@ pub enum ModelError {
     Constraint(String),
     #[error(transparent)]
     Kernel(#[from] KernelError),
-    /// A tensor-parallel rank's collective failed (P5 S-6): a timeout, a peer's abort or a
-    /// backend error; the group's communicator is unusable afterwards.
+    /// A tensor-, expert- or pipeline-parallel rank's collective failed (P5 S-6, S-10, S-11): a
+    /// timeout, a peer's abort or a backend error; the group's communicator is unusable
+    /// afterwards.
     #[error("collective: {0}")]
     Collective(#[from] turbine_distributed::collective::CollectiveError),
 }
