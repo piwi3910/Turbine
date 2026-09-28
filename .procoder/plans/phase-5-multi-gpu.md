@@ -550,6 +550,8 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh`
 - [ ] Commit: `feat(reliability,server): KV admission reserves on every rank's ledger`
 
+As built (2026-09-28, branch p5-group-reservation 3d069c2): the group's reservation is rank 0's `Reservation` carrying the other ranks' as members (`Reservation::with_members` / `members`, `GroupReservation::into_reservation`), so commit, preemption, cancellation, SURVIVAL requeue, forks and pool payment reach every rank without scheduler changes; `multi_device::try_reserve_group` reserves rank by rank and rolls back on the first refusal (`reserve_group` wraps it); `Admission::with_group_ledgers` decides against the tightest rank (a request larger than the smallest pool is `context_exceeds_kv_capacity`); one pressure machine per group, fed by the worst rank's KV utilisation (`PressureController::with_group_ranks`), every rank reporting the group state; `/turbine/v1/pressure` lists every rank; sim `OverloadConfig.group_kv_blocks`. Tests: `overload_sim group_reservation_unequal_pools`, `admission::tests::group_admission_reserves_on_every_rank`, `multi_device::tests::group_reservation_commits_and_releases_every_rank`, `tiny_server tp2_admission_reserves_on_both_ranks`. `static` mode still admits on the leader's ledger (open question "P5: group KV admission in static rank mode").
+
 ## Task 32: Tensor-parallel performance
 
 Files: as the measurements direct (`crates/turbine-model/src/tp.rs`, `crates/turbine-distributed/src/collective/hostmem.rs` thresholds, decode graphs under TP), `crates/turbine-model/tests/perf.rs` (`tp_step_profile`)
