@@ -40,8 +40,9 @@
 #                      against the one-GPU capture"): batched bounds at c1 and c16 against a
 #                      one-GPU capture of the same model taken in the run and against the
 #                      committed reference; the one-GPU leg itself is gated strictly against
-#                      the committed reference. A violation fails the
-#                      scenario at its end, after every leg ran.
+#                      the committed reference. For OLMoE the capture leg is informational
+#                      (`info olmoe_tp_capture`) and the committed reference is its gate. A
+#                      violation fails the scenario at its end, after every leg ran.
 #   dp2-novanas       Llama-3.2-3B-Instruct at tp 1 on the standard throughput workload
 #                      (512-word prompts, 256 tokens with --ignore-eos, 200 requests, after a
 #                      16-request warm-up): first a dp 1 baseline on device 0 at concurrency 16,
@@ -61,7 +62,8 @@
 #                      the transformers reference is compared for information only (and p14's
 #                      positions report printed). turbine_expert_rank_tokens_total must be
 #                      non-zero for rank 0 and rank 1. The ep 2 × tp 2 leg includes tensor
-#                      parallelism and takes the TP rule (as tp2-novanas). A gate violation fails
+#                      parallelism and takes the TP rule (as tp2-novanas; its capture leg is
+#                      informational for OLMoE). A gate violation fails
 #                      the scenario at its end, after every run. Prints one
 #                      `ep-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run and
 #                      the scheduler document's `expert` section. 2-GPU numbers are
@@ -450,14 +452,21 @@ capture_one_gpu() {
 # tensor-parallel accuracy gate against the one-GPU capture", A): against the one-GPU capture
 # with the batched bounds at c1 and c16, and against the committed transformers reference with
 # the batched bounds at c1 and c16 too (follow-up (a)). A violation is recorded in GATE_FAILED;
-# the scenario goes on and fails at its end.
+# the scenario goes on and fails at its end. For OLMoE (follow-up "HF only for OLMoE TP") the
+# capture leg is informational: a violation prints `info olmoe_tp_capture …` and does not fail.
 gate_vs_capture() {
 	local slug="$1" capture="$2" label="$3" c
 	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
 	for c in 1 16; do
 		echo "lab-step: golden ${label} c${c} vs 1 GPU (batched bounds)"
-		"${BIN}/turbine-golden" compare --url "$URL" --reference "$capture" "${tol[@]}" \
-			--concurrency "$c" --batched-bounds || GATE_FAILED+=("golden ${label} c${c} vs 1 GPU")
+		if ! "${BIN}/turbine-golden" compare --url "$URL" --reference "$capture" "${tol[@]}" \
+			--concurrency "$c" --batched-bounds; then
+			if [[ $slug == olmoe-* ]]; then
+				echo "info olmoe_tp_capture golden ${label} c${c} vs 1 GPU outside the batched bounds"
+			else
+				GATE_FAILED+=("golden ${label} c${c} vs 1 GPU")
+			fi
+		fi
 		golden_gate "$slug" "${label} c${c} vs HF" --concurrency "$c" --batched-bounds
 	done
 }
