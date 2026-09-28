@@ -29,8 +29,12 @@
 #                      tp 2 in local mode (golden c1 and c16; Task 29: an OLMoE tp 1 capture on
 #                      device 0 first, the tp 2 run also compared with it — informational — and
 #                      p10 position by position), then Llama in static mode (ranks
-#                      0 and 1, leader 127.0.0.1:18100; golden c1 and c16). Prints one
-#                      `tp-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run.
+#                      0 and 1, leader 127.0.0.1:18100; golden c1 and c16), then again in
+#                      static mode with every rank's own KV tiers on a small L0 (Task 30: the
+#                      Phase 4 multi-turn load — 8 sessions × 4 turns, 400 shared words,
+#                      session hints — needs cached_tokens_ratio > 0; golden c1 against the
+#                      one-GPU capture). Prints one `tp-bench <run> tok/s=… ttft_p50_ms=…
+#                      itl_p50_ms=…` line per bench run and one `tp-multiturn …` line.
 #                      2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)". Every tp 2
 #                      golden is gated against a one-GPU capture of the same model taken in
 #                      the run (strict c1, batched c16; the one-GPU leg itself against the
@@ -383,9 +387,50 @@ scenario_tp2() {
 	gate_vs_capture llama-3.2-3b-instruct "${WORK}/llama-tp1-capture.jsonl" "llama tp2 static"
 	collective_report tp2-static
 	stop_servers
+	static_tiers_leg "$llama" "${static[@]}"
 	if [[ ${#GATE_FAILED[@]} -gt 0 ]]; then
 		job_fail "outside tolerance: ${GATE_FAILED[*]}"
 	fi
+}
+
+# static_tiers_leg <config> [--set k=v]...: Llama at tp 2 in static mode with every rank's own
+# KV tiers (plan Task 30): a small L0 (256 MiB per rank, 16 running requests), one 1 GiB L1 slab
+# per rank and each rank's L2 under ${WORK}/kv-static/rank-<r>, so the Phase 4 multi-turn load
+# demotes and promotes. Requires cached_tokens_ratio > 0 and requests_ok of every turn; then
+# golden c1 against the one-GPU capture on the same (tiered) group. Prints the leader's tier
+# counters and one `tp-multiturn tp2-static-tiers …` line.
+static_tiers_leg() {
+	local config="$1"
+	shift
+	local tiers=(--set kv.gpu.max_bytes=256MiB --set scheduler.max_running_requests=16
+		--set kv.cpu.enabled=true --set kv.cpu.max_bytes=2GiB --set kv.nvme.enabled=true
+		--set "kv.nvme.path=${WORK}/kv-static" --set kv.nvme.max_bytes=4GiB)
+	start_server "${WORK}/tp2-static-tiers-rank1.log" "$config" "$@" "${tiers[@]}" \
+		--set parallel.ranks.rank=1 --set "parallel.ranks.local_devices=[1]" \
+		--set server.listen=127.0.0.1:18001
+	start_server "${WORK}/tp2-static-tiers-rank0.log" "$config" "$@" "${tiers[@]}" \
+		--set parallel.ranks.rank=0 --set "parallel.ranks.local_devices=[0]"
+	wait_ready "$URL" "${WORK}/tp2-static-tiers-rank0.log"
+	grep -h -E '"event":"(kv_hierarchy_ready|kv_rank_tiers_ready|kv_tier_unavailable_on_rank)"|event=(kv_hierarchy_ready|kv_rank_tiers_ready|kv_tier_unavailable_on_rank)' \
+		"${WORK}"/tp2-static-tiers-rank*.log | sed 's/^/lab-info: /' || true
+	local out="${WORK}/tp2-static-tiers-multiturn.json"
+	bench_ok 32 "$out" --profile multi-turn --sessions 8 --turns 4 --shared-prefix-words 400 \
+		--session-hints --concurrency 4
+	jq -r '"tp-multiturn tp2-static-tiers cached_tokens_ratio=\(.cached_tokens_ratio) ttft_first_p50_ms=\(.ttft_ms_first_turn.p50 // "?") ttft_later_p50_ms=\(.ttft_ms_later_turns.p50 // "?") requests_ok=\(.requests_ok)"' \
+		"$out"
+	curl -s "${URL}/metrics" | grep -E '^turbine_kv_(demotions|promotions|drops)_total' |
+		sed 's/^/tp-kv tp2-static-tiers /' || true
+	jq -e '(.cached_tokens_ratio // 0) > 0' "$out" >/dev/null ||
+		GATE_FAILED+=("multi-turn tp2 static tiers cached_tokens_ratio not > 0")
+	echo "lab-step: golden llama tp2 static tiers c1 vs 1 GPU"
+	"${BIN}/turbine-golden" compare --url "$URL" \
+		--reference "${WORK}/llama-tp1-capture.jsonl" \
+		--tolerance tests/golden/llama-3.2-3b-instruct/tolerance.json \
+		--prompts tests/golden/prompts.jsonl --concurrency 1 ||
+		GATE_FAILED+=("golden llama tp2 static tiers c1 vs 1 GPU")
+	curl -s "${URL}/metrics" | grep -E '^turbine_kv_(demotions|promotions)_total' |
+		sed 's/^/tp-kv tp2-static-tiers-after-golden /' || true
+	stop_servers
 }
 
 # capture_one_gpu <slug> <out>: the one-GPU server's golden c1 against the committed reference
