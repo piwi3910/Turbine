@@ -185,6 +185,17 @@ fn ops(
     let got = DeviceBuffer::alloc(mem, n).expect("alloc");
     let rank = comm.rank();
     let (next, prev) = ((rank + 1) % world, (rank + world - 1) % world);
+    if matches!(comm.backend(), "rccl" | "nccl") {
+        // NCCL-API point-to-point needs a peer path, which novanas lacks: the input stands in.
+        mem.synchronize().expect("synchronize");
+        comm.step_end().expect("healthy step");
+        let mut out: Vec<Vec<u8>> = [sum, max, gathered, srecv, bcast]
+            .iter()
+            .map(|b| b.whole().read_bytes().expect("read"))
+            .collect();
+        out.push(Vec::new());
+        return out;
+    }
     if rank.is_multiple_of(2) {
         comm.send(&send.whole(), next, &stream).expect("send");
         comm.recv(&mut got.whole(), prev, &stream).expect("recv");
@@ -1685,4 +1696,140 @@ fn hostmem_repro_pageable_d2h() {
             );
         }
     }
+}
+
+/// Rounds of [`hostmem_stress_collectives`] for a message of `elems` elements: the base count
+/// (`TURBINE_STRESS_ROUNDS`, default 5), ×20 up to 64 Ki elements, ×4 up to 1 Mi.
+fn stress_rounds(elems: usize) -> u64 {
+    let base: u64 = std::env::var("TURBINE_STRESS_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    match elems {
+        0..=65_537 => base * 20,
+        65_538..=1_048_577 => base * 4,
+        _ => base,
+    }
+}
+
+/// P5 Task 32 corruption proof (lab, two GPUs): every collective op — all-reduce sum and max,
+/// all-gather, reduce-scatter, broadcast, send/recv (hostmem only: RCCL point-to-point needs a
+/// peer path) — on `hostmem` with its kernels at every size, `hostmem` routed at its `auto`
+/// thresholds (large messages on its RCCL delegate) and plain `rccl`, BF16 and FP32, messages of
+/// 2 .. 4,194,305 elements (8 B .. 16 MiB), fresh inputs every round (see [`stress_rounds`];
+/// `TURBINE_STRESS_ROUNDS` scales the proof run), every output read back (through the context's
+/// pinned bounce buffer) and compared bit for bit with the host reference backend. Fails on any
+/// mismatch, naming it.
+#[test]
+#[ignore = "needs two HIP devices, libturbine_hip.so and RCCL (scripts/lab-test.sh novanas --gpus 2)"]
+fn hostmem_stress_collectives() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _serial = lab_serial();
+    let limit = Duration::from_secs(
+        std::env::var("TURBINE_STRESS_TIMEOUT_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1800),
+    );
+    let _watchdog = watchdog("hostmem_stress_collectives", limit);
+    let mems = devices();
+    assert!(mems.len() >= 2, "two AMD devices");
+    let mems = &mems[..2];
+    let names = [
+        "all_reduce sum",
+        "all_reduce max",
+        "all_gather",
+        "reduce_scatter",
+        "broadcast",
+        "send/recv",
+    ];
+    let mut total = 0u64;
+    let mut bad = Vec::new();
+    for (label, backend, route) in [
+        ("hostmem kernels", "hostmem", Some(u64::MAX)),
+        ("hostmem auto", "hostmem", None),
+        ("rccl", "rccl", None),
+    ] {
+        let lib = collective::registry()
+            .get(backend)
+            .expect("registered")
+            .load(None)
+            .expect("load");
+        let id = lib.unique_id().expect("id");
+        let comms: Vec<Arc<dyn Collective>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|r| {
+                    let (lib, mem) = (Arc::clone(&lib), &mems[r]);
+                    s.spawn(move || {
+                        lib.open(CollectiveInit {
+                            route_max_bytes: route,
+                            ..init(r, 2, id, Duration::from_secs(60), Arc::clone(mem))
+                        })
+                        .expect("open")
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("rank"))
+                .collect()
+        });
+        for dtype in [DType::BF16, DType::F32] {
+            for elems in [2usize, 4099, 65_537, 524_289, 4_194_305] {
+                for round in 0..stress_rounds(elems) {
+                    let seed = round * 1_000_003 + elems as u64;
+                    let inputs: Vec<Vec<u8>> = (0..2)
+                        .map(|r| encode(dtype, &values(seed + r as u64 * 7919, elems)))
+                        .collect();
+                    let scatter: Vec<Vec<u8>> = (0..2)
+                        .map(|r| encode(dtype, &values(seed + r as u64 * 104_729 + 3, elems * 2)))
+                        .collect();
+                    let want = reference(2, dtype, &inputs, &scatter);
+                    let got: Vec<Vec<Vec<u8>>> = std::thread::scope(|s| {
+                        let handles: Vec<_> = (0..2)
+                            .map(|r| {
+                                let (comm, mem, i, si) =
+                                    (&comms[r], &mems[r], &inputs[r], &scatter[r]);
+                                s.spawn(move || ops(comm.as_ref(), mem, dtype, i, si))
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().expect("rank"))
+                            .collect()
+                    });
+                    for (r, (g, w)) in got.iter().zip(&want).enumerate() {
+                        for (k, name) in names.iter().enumerate() {
+                            if g[k].is_empty() {
+                                continue;
+                            }
+                            total += 1;
+                            if g[k] != w[k] {
+                                bad.push(format!(
+                                    "{label} {dtype:?} {elems} round {round} rank {r} {name}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                println!(
+                    "stress {label} {dtype:?} {elems} elements: {} rounds, mismatches so far {}",
+                    stress_rounds(elems),
+                    bad.len()
+                );
+            }
+        }
+    }
+    println!(
+        "stress total checked outputs {total}, mismatches {}",
+        bad.len()
+    );
+    assert!(
+        bad.is_empty(),
+        "{} mismatches: {:?}",
+        bad.len(),
+        &bad[..bad.len().min(10)]
+    );
 }
