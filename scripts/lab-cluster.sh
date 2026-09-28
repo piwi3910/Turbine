@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run one Phase 5 multi-GPU lab scenario on novanas as a k3s Job holding both R9700s.
 #
-#   scripts/lab-cluster.sh [--dry-run] <collbench-novanas|collbench-sweep-novanas|
+#   scripts/lab-cluster.sh [--dry-run] [--bench-lock] <collbench-novanas|collbench-sweep-novanas|
 #                                       collbench-hostmem-novanas|tp2-novanas|dp2-novanas|
 #                                       ep2-novanas>
 #   scripts/lab-cluster.sh [--dry-run] --stop <run-id>
@@ -64,6 +64,10 @@
 # user, never evict it. Whatever happens, the script deletes only the Jobs of its own run
 # (label selector turbine-lab=true,turbine-lab-run=<run id>) and its upload.
 # --dry-run prints every command that would contact the host (and the rendered Jobs).
+# --bench-lock takes the exclusive benchmark lock (the one scripts/bench-lock.sh takes) after the
+# build Job and holds it only while the two-GPU Job runs: use it for every run whose numbers are
+# kept, instead of wrapping the whole script in scripts/bench-lock.sh (which would hold the lock
+# through the build).
 #
 # The last line is `lab-cluster: <scenario> PASS` (exit 0) or `lab-cluster: <scenario> FAIL
 # <reason>` (exit 1); usage errors exit 2.
@@ -72,7 +76,7 @@ set -euo pipefail
 SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas"
 
 usage() {
-	echo "usage: scripts/lab-cluster.sh [--dry-run] <${SCENARIOS}>" >&2
+	echo "usage: scripts/lab-cluster.sh [--dry-run] [--bench-lock] <${SCENARIOS}>" >&2
 	echo "       scripts/lab-cluster.sh [--dry-run] --stop <run-id>" >&2
 	exit 2
 }
@@ -515,10 +519,12 @@ fi
 # ---------------------------------------------------------------------------------------------
 
 DRY_RUN=0
-if [[ "${1:-}" == --dry-run ]]; then
-	DRY_RUN=1
+BENCH_LOCK=0
+while [[ "${1:-}" == --dry-run || "${1:-}" == --bench-lock ]]; do
+	[[ $1 == --dry-run ]] && DRY_RUN=1
+	[[ $1 == --bench-lock ]] && BENCH_LOCK=1
 	shift
-fi
+done
 MODE=run
 STOP_RUN=""
 SCENARIO=""
@@ -691,6 +697,42 @@ apply_and_follow() {
 	wait_for_result "$job"
 }
 
+# take_bench_lock / release_bench_lock: the exclusive flock on ${CI_ROOT}/bench.lock that
+# scripts/bench-lock.sh takes (the same file and mode), held from before the GPU Job is applied
+# until it ends, so builds never hold it.
+LOCK_DIR=""
+LOCK_PID=""
+take_bench_lock() {
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ ssh ${SSH_OPTS[*]} ${REMOTE} 'flock -x ${CI_ROOT}/bench.lock …' (held for the GPU Job)"
+		return
+	fi
+	LOCK_DIR="$(mktemp -d)"
+	mkfifo "${LOCK_DIR}/in" "${LOCK_DIR}/out"
+	# shellcheck disable=SC2029 # CI_ROOT is expanded here on purpose
+	ssh "${SSH_OPTS[@]}" "$REMOTE" \
+		"flock -x ${CI_ROOT}/bench.lock sh -c 'echo locked; cat >/dev/null'" \
+		<"${LOCK_DIR}/in" >"${LOCK_DIR}/out" &
+	LOCK_PID=$!
+	exec 7>"${LOCK_DIR}/in"
+	say "waiting for the benchmark lock"
+	local state=""
+	read -r state <"${LOCK_DIR}/out" || true
+	if [[ "$state" != locked ]]; then
+		cleanup
+		fail "could not take the benchmark lock"
+	fi
+	say "holding the benchmark lock"
+}
+release_bench_lock() {
+	[[ $DRY_RUN -eq 1 || -z $LOCK_PID ]] && return 0
+	exec 7>&-
+	wait "$LOCK_PID" || true
+	rm -rf "$LOCK_DIR"
+	LOCK_PID=""
+	say "released the benchmark lock"
+}
+
 run_scenario() {
 	say "run ${RUN_ID}: job ${JOB}, scenario ${SCENARIO}, 2 GPU(s)"
 	remote "mkdir -p ${RUN_DIR}/src ${CI_ROOT}/cache/slots && find ${CI_ROOT}/runs -mindepth 1 -maxdepth 1 -mmin +1440 -exec rm -rf {} +" ||
@@ -713,7 +755,10 @@ run_scenario() {
 		fail "build job ${BUILD_JOB} failed"
 	fi
 	local ok=0
+	# --bench-lock: the exclusive benchmark lock covers the GPU Job only (build first, unlocked).
+	[[ $BENCH_LOCK -eq 1 ]] && take_bench_lock
 	apply_and_follow run "$JOB" 2 && ok=1
+	[[ $BENCH_LOCK -eq 1 ]] && release_bench_lock
 	say "deleting the jobs of run ${RUN_ID}"
 	cleanup
 	[[ $DRY_RUN -eq 1 ]] && say "dry run: nothing contacted"
