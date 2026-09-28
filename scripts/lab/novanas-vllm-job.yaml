@@ -4,8 +4,10 @@
 #
 # The script renders the placeholders before applying it: RUN_ID (a unique Job name), SLUG (the
 # weights directory under /home/piwi/turbine-models, mounted at /models), SERVED_NAME (the model
-# id Turbine's lab config serves for that slug) and MAX_MODEL_LEN (Turbine's default
-# model.max_seq_len for that model: min(32768, max_position_embeddings)).
+# id Turbine's lab config serves for that slug), MAX_MODEL_LEN (Turbine's default
+# model.max_seq_len for that model: min(32768, max_position_embeddings)), GPUS (1, or 2 for the
+# Phase 5 two-GPU baselines) and the EXTRA_ARGS line (replaced by one list entry per
+# `--vllm-arg`, e.g. --tensor-parallel-size 2; removed when there are none).
 #
 # Image: rocm/vllm, the ROCm 7.14.1 RDNA build (the host's ROCm version; RDNA covers gfx1201),
 # pinned by tag and digest as listed by
@@ -56,6 +58,7 @@ spec:
             - auto
             - --max-model-len
             - "__MAX_MODEL_LEN__"
+            # __EXTRA_ARGS__
           env:
             - name: HF_HUB_OFFLINE
               value: "1"
@@ -65,7 +68,7 @@ spec:
               value: "1"
           resources:
             limits:
-              amd.com/gpu: 1
+              amd.com/gpu: __GPUS__
           volumeMounts:
             # Weights provisioned once over SSH; vLLM never downloads.
             - name: models

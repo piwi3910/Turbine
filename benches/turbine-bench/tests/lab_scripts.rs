@@ -1921,3 +1921,75 @@ fn lab_prune_removes_only_stale_agent_targets() {
     }
     let _ = fs::remove_dir_all(&base);
 }
+
+/// P5 Task 35 (user decision "P5 exit: vLLM-ROCm baselines for the two-GPU modes"): `--vllm
+/// <slug> --gpus 2 --vllm-arg …` renders the same pinned Job with `amd.com/gpu: 2` and the extra
+/// arguments appended to `vllm serve`, in order; without them the Job is unchanged (one GPU, no
+/// extra arguments). Bad values are usage errors before any host is contacted.
+#[test]
+fn lab_serve_vllm_two_gpus_renders_the_job() {
+    let text = dry_run(
+        "lab-serve.sh",
+        "vllm-tp2",
+        &[
+            "--dry-run",
+            "novanas",
+            "--vllm",
+            "olmoe-1b-7b-0125-instruct",
+            "--gpus",
+            "2",
+            "--vllm-arg",
+            "--tensor-parallel-size",
+            "--vllm-arg",
+            "2",
+            "--vllm-arg",
+            "--enable-expert-parallel",
+        ],
+    );
+    let job = applied_job(&text);
+    assert_eq!(amd_gpus(&job), 2);
+    let c = container(&job);
+    assert_eq!(str_at(c, "image"), VLLM_IMAGE);
+    let args: Vec<String> = at(c, "args")
+        .as_sequence()
+        .expect("args")
+        .iter()
+        .map(|v| v.as_str().expect("string").to_string())
+        .collect();
+    assert_eq!(
+        args.join(" "),
+        "/models/olmoe-1b-7b-0125-instruct --served-model-name allenai/OLMoE-1B-7B-0125-Instruct \
+         --host 0.0.0.0 --port 18100 --dtype bfloat16 --kv-cache-dtype auto --max-model-len 4096 \
+         --tensor-parallel-size 2 --enable-expert-parallel"
+    );
+    assert!(text.contains("2 GPU(s)"), "{text}");
+
+    for (tag, args, expect) in [
+        (
+            "vllm-gpus-3",
+            &["novanas", "--vllm", "llama-3.2-3b-instruct", "--gpus", "3"][..],
+            "--gpus is 1 or 2",
+        ),
+        (
+            "vllm-arg-shell",
+            &[
+                "novanas",
+                "--vllm",
+                "llama-3.2-3b-instruct",
+                "--vllm-arg",
+                "$(id)",
+            ][..],
+            "--vllm-arg expects a plain word",
+        ),
+        (
+            "vllm-arg-missing",
+            &["novanas", "--vllm", "llama-3.2-3b-instruct", "--vllm-arg"][..],
+            "usage:",
+        ),
+    ] {
+        let (out, called) = lab_script("lab-serve.sh", tag, args);
+        assert_eq!(called, None, "{tag}: contacted a host");
+        assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
+        assert!(stderr(&out).contains(expect), "{tag}: {}", stderr(&out));
+    }
+}

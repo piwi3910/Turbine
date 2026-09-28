@@ -2,7 +2,7 @@
 # Run turbine-server on a lab host for manual golden and benchmark runs.
 #
 #   scripts/lab-serve.sh [--dry-run] novanas <config.yaml> [--set <dotted.key>=<value>]...
-#   scripts/lab-serve.sh [--dry-run] novanas --vllm <slug>
+#   scripts/lab-serve.sh [--dry-run] novanas --vllm <slug> [--gpus 1|2] [--vllm-arg <arg>]...
 #   scripts/lab-serve.sh [--dry-run] novanas --stop [<run-id>]
 #
 # novanas: uploads the tree and <config.yaml> to /home/piwi/turbine-ci/runs/<run id> and applies
@@ -26,6 +26,9 @@
 #   Nothing is uploaded. Refuses to start while something answers on port 18100, streams the pod
 #   log until http://192.168.10.203:18100/v1/models answers 200 and exits 0 leaving vLLM running;
 #   when vLLM fails to start or serve (e.g. on gfx1201) it prints the pod log and exits 1.
+#   --gpus 2 gives the Job both R9700s and each --vllm-arg is appended to `vllm serve` in
+#   order (plain words: letters, digits and _ . : = / -), for the Phase 5 two-GPU baselines
+#   (e.g. --vllm-arg --tensor-parallel-size --vllm-arg 2).
 # --dry-run prints every command that would contact the host instead of running it.
 # TURBINE_LAB_SERVE_TIMEOUT: seconds to wait for /ready once the pod runs (default 3600; a cold
 #   run compiles Composable Kernel and the release server).
@@ -35,7 +38,7 @@ set -euo pipefail
 
 usage() {
 	echo "usage: scripts/lab-serve.sh [--dry-run] novanas <config.yaml> [--set <dotted.key>=<value>]..." >&2
-	echo "       scripts/lab-serve.sh [--dry-run] novanas --vllm <slug>" >&2
+	echo "       scripts/lab-serve.sh [--dry-run] novanas --vllm <slug> [--gpus 1|2] [--vllm-arg <arg>]..." >&2
 	echo "       scripts/lab-serve.sh [--dry-run] novanas --stop [<run-id>]" >&2
 	exit 2
 }
@@ -58,6 +61,8 @@ SLUG=""
 STOP_RUN=""
 # Rendered into the serve Job's turbine-server command line (scripts/lab/novanas-serve-job.yaml).
 SERVER_ARGS=""
+VLLM_GPUS=1
+VLLM_ARGS=()
 case "$2" in
 --stop)
 	[[ $# -le 3 ]] || usage
@@ -71,9 +76,32 @@ case "$2" in
 	fi
 	;;
 --vllm)
-	[[ $# -eq 3 ]] || usage
+	[[ $# -ge 3 ]] || usage
 	MODE=vllm
 	SLUG="$3"
+	shift 3
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--gpus)
+			[[ $# -ge 2 ]] || usage
+			if [[ "$2" != 1 && "$2" != 2 ]]; then
+				echo "lab-serve: ${HOST}: --gpus is 1 or 2 (the R9700s of novanas), got: $2" >&2
+				exit 2
+			fi
+			VLLM_GPUS="$2"
+			;;
+		--vllm-arg)
+			[[ $# -ge 2 ]] || usage
+			if [[ ! "$2" =~ ^[A-Za-z0-9_.:=/-]+$ ]]; then
+				echo "lab-serve: ${HOST}: --vllm-arg expects a plain word (letters, digits, _ . : = / -), got: $2" >&2
+				exit 2
+			fi
+			VLLM_ARGS+=("$2")
+			;;
+		*) usage ;;
+		esac
+		shift 2
+	done
 	# The model id each slug is served under (as in scripts/lab/phase2-novanas-*.yaml) and
 	# Turbine's default max_seq_len for it: min(32768, max_position_embeddings).
 	case "$SLUG" in
@@ -388,7 +416,7 @@ start() {
 }
 
 start_vllm() {
-	say "run ${RUN_ID}: job ${JOB} (vLLM-ROCm serving ${SLUG} as ${SERVED_NAME})"
+	say "run ${RUN_ID}: job ${JOB} (vLLM-ROCm serving ${SLUG} as ${SERVED_NAME}, ${VLLM_GPUS} GPU(s)${VLLM_ARGS[*]+, ${VLLM_ARGS[*]}})"
 	require_free_port
 	remote "test -d /home/piwi/turbine-models/${SLUG}" ||
 		fail "weights /home/piwi/turbine-models/${SLUG} are not provisioned (or ssh to ${REMOTE} failed)"
@@ -397,9 +425,15 @@ start_vllm() {
 		fail "cannot create namespace ${NS}"
 	[[ $DRY_RUN -eq 1 ]] || trap on_interrupt INT TERM
 	say "applying scripts/lab/novanas-vllm-job.yaml as ${JOB}"
+	local extra="" a
+	for a in "${VLLM_ARGS[@]+"${VLLM_ARGS[@]}"}"; do
+		extra+="            - \"${a}\"\n"
+	done
 	sed -e "s/__RUN_ID__/${RUN_ID}/g" -e "s/__SLUG__/${SLUG}/g" \
 		-e "s|__SERVED_NAME__|${SERVED_NAME}|g" -e "s/__MAX_MODEL_LEN__/${MAX_MODEL_LEN}/g" \
+		-e "s/__GPUS__/${VLLM_GPUS}/g" \
 		"${REPO_ROOT}/scripts/lab/novanas-vllm-job.yaml" |
+		awk -v extra="$extra" '/# __EXTRA_ARGS__$/ { printf "%s", extra; next } { print }' |
 		remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" || fail "kubectl apply failed"
 
 	say "waiting for the pod"
