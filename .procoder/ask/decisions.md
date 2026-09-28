@@ -943,3 +943,5 @@ Measured on novanas today (Llama-3.2-3B, TP 2): Turbine is ready 6–8 s after p
 
 - Add `startup_s` (process start → /ready 200) as a data point to `engine-comparison-multi-gpu` for every run, both engines (recommended)
 - Leave it out; mention it only in the set conclusion
+
+**Answer (2026-09-28, user): neither — it was a question, not a request; nothing is added to the tests or the package.**
