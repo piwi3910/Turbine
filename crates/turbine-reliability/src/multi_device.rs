@@ -9,7 +9,7 @@ use turbine_core::types::{DeviceId, PressureState};
 
 use crate::admission::{AdmissionDecision, PressureReason};
 use crate::budget::{DeviceBudget, PoolKind};
-use crate::ledger::{Ledger, Reservation};
+use crate::ledger::{Ledger, LedgerError, Reservation};
 
 /// A TP group's pressure: the worst member state and the first device at that state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +56,16 @@ impl From<Vec<Reservation>> for GroupReservation {
     }
 }
 
+impl GroupReservation {
+    /// One guard for the whole group: rank 0's reservation carrying the other ranks' as
+    /// members ([`Reservation::with_members`]); `None` for an empty group.
+    pub fn into_reservation(self) -> Option<Reservation> {
+        let mut ranks = self.reservations.into_iter();
+        let leader = ranks.next()?;
+        Some(leader.with_members(ranks.collect()))
+    }
+}
+
 /// Reserves `blocks` KV blocks of `block_bytes_per_rank` on every rank's ledger, all or
 /// nothing: the first rank that cannot hold them releases what the earlier ranks took and the
 /// request queues with `KvReservation` (CONFLICT C-11).
@@ -64,6 +74,19 @@ pub fn reserve_group(
     blocks: u32,
     block_bytes_per_rank: u64,
 ) -> Result<Vec<Reservation>, AdmissionDecision> {
+    try_reserve_group(ledgers, blocks, block_bytes_per_rank).map_err(|_| AdmissionDecision::Queue {
+        reason: PressureReason::KvReservation,
+    })
+}
+
+/// [`reserve_group`] keeping the refusing rank's device and ledger error (an exhausted pool,
+/// or an injected allocation failure in the fault-injection build). Nothing is held on an
+/// error.
+pub fn try_reserve_group(
+    ledgers: &[(DeviceId, Arc<Ledger>)],
+    blocks: u32,
+    block_bytes_per_rank: u64,
+) -> Result<Vec<Reservation>, (DeviceId, LedgerError)> {
     let bytes = u64::from(blocks).saturating_mul(block_bytes_per_rank);
     let mut taken = Vec::with_capacity(ledgers.len());
     for (device, ledger) in ledgers {
@@ -74,13 +97,12 @@ pub fn reserve_group(
                     event = "group_reservation_queued",
                     device = device.0,
                     bytes,
+                    released_ranks = taken.len(),
                     error = %e,
                     "a rank cannot hold the group's KV reservation; nothing is held"
                 );
                 // `taken` drops here: every earlier rank's reservation is released.
-                return Err(AdmissionDecision::Queue {
-                    reason: PressureReason::KvReservation,
-                });
+                return Err((*device, e));
             }
         }
     }
@@ -268,6 +290,55 @@ mod tests {
         drop(held);
         assert_eq!(l0.usage(DeviceId(0), PoolKind::Kv), before.0);
         assert_eq!(l1.usage(DeviceId(1), PoolKind::Kv), before.1);
+    }
+
+    /// A group reservation as one guard: rank 0's reservation carries rank 1's; committing on
+    /// it commits the same share on rank 1 (the same bytes when the ranks' block bytes agree,
+    /// the same fraction rounded up otherwise, reaching the whole at a full commit), and
+    /// dropping it releases both ranks. Breaks if a member's commit drifts or a member leaks.
+    #[test]
+    fn group_reservation_commits_and_releases_every_rank() {
+        let block = 1u64 << 20;
+        let l0 = Ledger::new(&budget(0, 64 * block));
+        let l1 = Ledger::new(&budget(1, 64 * block));
+        let ledgers = [
+            (DeviceId(0), Arc::clone(&l0)),
+            (DeviceId(1), Arc::clone(&l1)),
+        ];
+        let kv = |l: &Ledger, d| {
+            let u = l.usage(DeviceId(d), PoolKind::Kv);
+            (u.used, u.reserved)
+        };
+        let mut r = GroupReservation::from(reserve_group(&ledgers, 10, block).unwrap())
+            .into_reservation()
+            .unwrap();
+        assert_eq!((r.device(), r.members().len()), (DeviceId(0), 1));
+        r.commit_bytes(3 * block);
+        assert_eq!(kv(&l0, 0), (3 * block, 7 * block));
+        assert_eq!(kv(&l1, 1), kv(&l0, 0));
+        r.commit();
+        assert_eq!(kv(&l1, 1), (10 * block, 0));
+        drop(r);
+        assert_eq!((kv(&l0, 0), kv(&l1, 1)), ((0, 0), (0, 0)));
+
+        // A member of another size commits its share, rounded up, and all of it at the end.
+        let mut r = l0
+            .reserve(DeviceId(0), PoolKind::Kv, 4 * block)
+            .unwrap()
+            .with_members(vec![l1.reserve(DeviceId(1), PoolKind::Kv, 3).unwrap()]);
+        r.commit_bytes(block);
+        assert_eq!(kv(&l1, 1), (1, 2), "ceil(3 / 4)");
+        r.commit_bytes(2 * block);
+        assert_eq!(kv(&l1, 1), (3, 0), "ceil(9 / 4)");
+        r.commit();
+        assert_eq!(kv(&l1, 1), (3, 0));
+        drop(r);
+        assert_eq!(kv(&l1, 1), (0, 0));
+        assert!(
+            GroupReservation::from(Vec::new())
+                .into_reservation()
+                .is_none()
+        );
     }
 
     /// Two replicas on one 32 GiB device each see half the budget; a KV reservation by replica

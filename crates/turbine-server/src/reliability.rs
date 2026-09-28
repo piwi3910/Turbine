@@ -86,6 +86,8 @@ pub struct EngineLedgerProbe {
     device: DeviceId,
     queue_len: Arc<AtomicU32>,
     max_queue: u32,
+    /// A tensor-parallel group's other ranks (P5 S-8): the KV utilisation is the worst rank's.
+    group: Vec<(DeviceId, Arc<Ledger>)>,
 }
 
 impl EngineLedgerProbe {
@@ -100,13 +102,27 @@ impl EngineLedgerProbe {
             device,
             queue_len,
             max_queue,
+            group: Vec::new(),
         }
+    }
+
+    /// Reads a tensor-parallel group whose other ranks are `group` (device, ledger): the KV
+    /// utilisation is then its worst member's (P5 S-8).
+    pub fn with_group(mut self, group: Vec<(DeviceId, Arc<Ledger>)>) -> EngineLedgerProbe {
+        self.group = group;
+        self
     }
 }
 
 impl LedgerProbe for EngineLedgerProbe {
     fn kv_utilization(&self) -> f64 {
-        self.ledger.usage(self.device, PoolKind::Kv).utilization()
+        self.group
+            .iter()
+            .map(|(d, l)| l.usage(*d, PoolKind::Kv).utilization())
+            .fold(
+                self.ledger.usage(self.device, PoolKind::Kv).utilization(),
+                f64::max,
+            )
     }
 
     fn queue_fill(&self) -> f64 {
@@ -200,6 +216,10 @@ pub(crate) struct ReliabilityInputs<'a> {
     pub reclaimer: Arc<dyn KvReclaimer>,
     /// The data-parallel replica this engine serves (P5; 0 with one replica).
     pub replica: u32,
+    /// A tensor-parallel group's other ranks, in rank order (P5 S-8): each rank's budget and
+    /// ledger. Admission reserves every request's KV on each of them and on `ledger`, all or
+    /// nothing; the pressure document lists them. Empty on one device.
+    pub group: Vec<(DeviceBudget, Arc<Ledger>)>,
 }
 
 /// The pieces [`build`] returns: the engine's end, the admission gate for its scheduler, and
@@ -231,6 +251,11 @@ pub(crate) fn build(inp: ReliabilityInputs<'_>) -> ReliabilityParts {
         Arc::clone(&inp.clock),
     );
     let controller = controller.with_replica(inp.replica);
+    let controller = if inp.group.is_empty() {
+        controller
+    } else {
+        controller.with_group_ranks(inp.group.clone())
+    };
     let admission = Admission::new(
         AdmissionParams {
             device,
@@ -245,7 +270,13 @@ pub(crate) fn build(inp: ReliabilityInputs<'_>) -> ReliabilityParts {
         Arc::clone(&inp.ledger),
         inp.metrics.clone(),
     )
-    .with_kv_headroom(effective_thresholds(&cfg.pressure)[&PressureSignal::KvUtilization]);
+    .with_kv_headroom(effective_thresholds(&cfg.pressure)[&PressureSignal::KvUtilization])
+    .with_group_ledgers(
+        inp.group
+            .iter()
+            .map(|(b, l)| (b.device, Arc::clone(l)))
+            .collect(),
+    );
     let queue = AdmissionQueue::new(
         cfg.admission.max_queue,
         cfg.admission.queue_timeout.0,
