@@ -334,6 +334,8 @@ Interfaces:
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 - [ ] Commit: `feat(model): tensor-parallel Llama and OLMoE execution over the collective trait`
 
+As built (2026-09-28, branch p5-t17-server a1f19e2): the static-mode rank protocol is v2 (`StepPlan.copies` carries `copy_blocks` forks); `RankRuntime::wait_idle` lets the leader touch worker contexts (KV calibration, tier copies) only while every worker is idle; the cpu backend's TP path needs an explicit `parallel.collective_backend: host`; collective errors open the circuit with reason `collective_failed` and, until Task 28, exit 3 (user decision "P5: collective failure recovery"); a stopped worker is the server fatal `Fatal::RankStopped` (server fatal); rank pools agree on the minimum block count; `collective_bytes` is budgeted per device; decode graphs and overlapped launches are off under TP with a WARN and reason code; an L1 share below one 1 GiB slab per rank logs `kv_l1_share_below_slab`; `/ready` reports `collective_init` / `loading_weights` / `rank_missing`; dp × tp works. First tp2-novanas (2-GPU, GPU0 Gen5 x8 + GPU1 Gen4 x8): Llama local and static golden 16/16 at c1 and c16, OLMoE 15/16 at c1 and 14/16 at c16 (p10, p14 diverge; margin pursued in Tasks 29/32); standard workload tp1 856.4 tok/s (TTFT 208 ms, ITL 15.42 ms) vs tp2 854.0 tok/s (TTFT 453 ms, ITL 12.88 ms).
+
 ## Task 18: Data-parallel replicas and the DP lab run
 
 Files: `crates/turbine-server/src/engine/replicas.rs` (one engine thread, scheduler, KV pool, KV orchestrator and pressure controller per replica; router in front; shared-device budgets when `allow_device_sharing`), `crates/turbine-server/src/startup.rs` (build replicas from `ParallelPlan.groups`), `crates/turbine-server/tests/tiny_server.rs` (DP test on the CPU backend), `scripts/lab/phase5-novanas-dp2.yaml`
@@ -441,6 +443,8 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh`
 - [ ] Commit: `feat(scheduler,server): micro-batched pipeline parallelism and the pp2 lab run`
 
+As built (2026-09-28, branch p5-pp-scheduler 68b1492, the scheduler half): `Scheduler::with_micro_batches(m)` keeps up to m plans in flight (`crates/turbine-scheduler/src/pipeline.rs`: `MicroBatchPlan`, `StageTimeline`, `PipelineMetrics`; `SchedulerSnapshot.pipeline`; `Simulation::run_pipelined` in `sim/pipeline.rs`; `tests/sim.rs` `pipeline_micro_batches_overlap`, `pipeline_cancel_in_flight`, `pipeline_m1_matches_serial`). A plan takes at most ceil(live / m) sequences, and max_batch_tokens / m tokens only with chunked prefill on; a cancellation lands after the in-flight plan completes, a preemption victim in flight is waited for, and a finish for a sequence of another in-flight plan takes effect when that plan completes; with one sequence and m = 2 the second plan is empty and completes at once; the sim reaches 2.0× with 2 micro-batches and bubble 0.0 when stage cost scales with the batch (a flat cost gives 1.0×). Pipelining is not combined with the Phase 2c `turn_overlap` path. The engine half (stage threads, per-stage KV, pp2-novanas) remains.
+
 ## Task 25: Expert placement and the EP provider evaluation
 
 Files: `crates/turbine-distributed/src/expert.rs` (placement map, validation, per-rank token counts), `.procoder/ask/decisions.md` (provider evaluation: CK `moe_sorting` local-expert mask, vLLM `fused_moe` `expert_map`, llama.cpp MoE, the Phase 2 providers with a global→local map)
@@ -470,6 +474,8 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh`
 - [ ] Commit: `feat(model): expert-parallel OLMoE over the collective trait`
 
+As built (2026-09-28, branch p5-ep-model 95f4e7f): `turbine_model::ep` (`EpContext`, `EpShard`, `EpAttention::{Replicated, TensorParallel}`, `check`, `moe_layers`, `rank_config`, `kv_layout`, `weight_slots`, `available_requirements`, `workspace_bytes`, `build_executor`, `ExpertTokenCounts`) runs each rank's experts through the `moe_experts` local expert range the kernel ABI v2 already has (no ABI change; decision "P5 Task 25: EP expert-subset GEMMs"); the combine is one all-reduce at tp 1 and folds into the TP FFN all-reduce at tp = ep; `hip_ep2_matches_ep1` runs tiny-model seed 1 (seed 7 has a 0.0006 near-tie TP attention flips — the golden margin excuse); `moe_ep_local_timings` is a slow perf test in `scripts/lab-test.sh`.
+
 ## Task 27: EP serving and the EP lab run
 
 Files: `crates/turbine-server/src/{startup.rs,parallel.rs,engine/tp.rs}` (EP groups reuse the TP group runtime), `crates/turbine-api` (the `expert` section of `/turbine/v1/scheduler`), `scripts/lab/phase5-novanas-ep2.yaml`, `scripts/lab-cluster.sh` (`ep2-novanas`)
@@ -484,3 +490,76 @@ Interfaces:
 - [ ] Lab: `scripts/bench-lock.sh scripts/lab-cluster.sh ep2-novanas` — OLMoE golden c1 / c16, both ranks' token counts non-zero, the standard workload beside tp 2 and dp 2; upload to labbook, labelled "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
 - [ ] Gate: `scripts/gate.sh`
 - [ ] Commit: `feat(server): expert-parallel serving and the ep2 lab run`
+
+## Task 28: Re-create a failed communicator while probing
+
+Files: `crates/turbine-server/src/engine/tp.rs` (swap every rank executor's collective, re-init step plan), `crates/turbine-server/src/reliability.rs` (probing hook), `crates/turbine-distributed/src/rank.rs` (a `Reinit` step message, protocol v3), `crates/turbine-model/src/tp.rs` / `ep.rs` (`set_collective` on the executor), `crates/turbine-server/tests/tiny_server.rs`
+Interfaces:
+
+- `ModelExecutor`-side `fn set_collective(&mut self, c: Arc<dyn Collective>)` for TP/EP executors; `RankMessage::Reinit { unique_id: [u8; 128] }`; circuit reason `collective_failed` recovers through `PROBING` instead of exiting 3
+  Covers: S-6 failure mode "Collective op times out"; user decision "P5: collective failure recovery" (B; C until this task lands)
+  Depends on: Tasks 12, 17
+
+- [ ] Write failing test `tiny_server tp2_collective_failure_recovers`: a tp 2 server on the cpu backend whose host collective fails one all-reduce answers the in-flight request with `replica_failed`, `/ready` 503 `circuit_open`, then, after the probe re-creates the communicator, 200 and a greedy completion identical to before. Run: `cargo test -p turbine-server --test tiny_server tp2_collective_failure_recovers` — expect FAIL.
+- [ ] Implement re-creation (fresh unique id, bounded init on every rank concurrently, the re-init step plan in `local` and `static` mode) and drop the interim exit 3 for collective failures (a sticky device error still exits 3).
+- [ ] Lab: `scripts/lab-test.sh novanas --gpus 2 --features fault-injection -- -p turbine-server --test fault` gains `tp2_collective_failure_recovers_on_gpu` (hard timeout 10 min).
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(server,distributed): re-create a failed communicator while probing`
+
+## Task 29: Batch-invariant GEMM rows for the tensor-parallel shapes
+
+Files: `kernels/rocm/tuning/gfx1201/gemm.tsv`, `crates/turbine-kernels/tests/hip_ops.rs` (the invariance check over the new rows), `crates/turbine-server/tests/kv_gpu.rs` (prefix reuse at tp 2)
+Interfaces:
+
+- new table rows for the tp 2 per-rank shapes (Llama qkv 2560×3072, o 3072×1536, gate/up and down halves, lm_head 64128×3072; OLMoE qkv 3072×2048, o 2048×1024, lm_head 25152×2048), each with one algorithm for every m (batch-invariant)
+  Covers: user decision "P5: bit-exact prefix reuse under tensor parallelism" (B)
+  Depends on: Task 17
+
+- [ ] Write failing lab test `kv_gpu prefix_reuse_matches_cold_tp2` (the Phase 4 prefix-reuse check on a tp 2 group, bit-exact against cold). Run: `scripts/lab-test.sh novanas --gpus 2 -- -p turbine-server --test kv_gpu` — expect FAIL.
+- [ ] Tune the rows with the existing tuning procedure (decision "Pre-Phase-5 #1 follow-up (A)") on GPU 0 under `scripts/bench-lock.sh`; add them; extend the table invariance test.
+- [ ] Run the lab test — expect PASS; then `scripts/bench-lock.sh scripts/lab-cluster.sh tp2-novanas` and compare tok/s, TTFT and ITL with the previous tp2 run (labbook).
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `perf(kernels): batch-invariant GEMM rows for the tensor-parallel shapes`
+
+## Task 30: KV tiers in static rank mode
+
+Files: `crates/turbine-distributed/src/rank.rs` (tier messages), `crates/turbine-server/src/{kv_orchestrator.rs,engine/tp.rs,startup.rs}` (worker-side per-rank L1/L2, leader-driven), `scripts/lab-cluster.sh` (the tp2 static leg runs the Phase 4 multi-turn check)
+Interfaces:
+
+- `RankMessage::{TierCopy { copies: Vec<TierCopy> }, TierAck { … }}` carrying promote / demote / tier copies of the leader's block ids; a worker's `KvShard` is its own process's; tier state symmetric with `local` mode
+  Covers: user decision "P5: KV tiers in static rank mode" (B); S-6 KV
+  Depends on: Tasks 12, 17; T17b
+
+- [ ] Write failing test `kv_orchestrator::static_workers_round_trip_through_l1_and_l2`: two ranks in separate threads linked only by the rank transport (loopback `tcp`), leader-driven demote to L1 and L2 and promote back, each rank's bytes in its own pool. Run: `cargo test -p turbine-server --bin turbine-server kv_orchestrator::static_workers_round_trip_through_l1_and_l2` — expect FAIL.
+- [ ] Implement the messages, the worker side and the leader's wait for acks (bounded; a lost worker is `RankStopped`).
+- [ ] Lab: the static leg of `scripts/lab-cluster.sh tp2-novanas` adds `turbine-bench --profile multi-turn` with `cached_tokens_ratio` > 0 and golden c1.
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(server,distributed): per-rank KV tiers in static rank mode`
+
+## Task 31: Group KV reservation on every rank's ledger
+
+Files: `crates/turbine-reliability/src/multi_device.rs` (`reserve_group` across ledgers), `crates/turbine-server/src/{engine/mod.rs,reliability.rs}` (admission through the group), `crates/turbine-scheduler/tests/overload_sim.rs`
+Interfaces:
+
+- admission reserves each request's worst-case KV on every rank's ledger through `reserve_group`, atomically: a partial failure rolls back and queues with `PressureReason::KvReservation`
+  Covers: S-8; user decision "P5: KV admission across tensor-parallel ranks" (B)
+  Depends on: Tasks 14, 17
+
+- [ ] Write failing test `overload_sim group_reservation_unequal_pools`: a 2-rank group whose rank 1 pool is smaller; under overload no request is admitted beyond rank 1's capacity, a partial reservation never leaks, and every admitted request completes. Run: `cargo test -p turbine-scheduler --test overload_sim group_reservation_unequal_pools` — expect FAIL.
+- [ ] Implement.
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(reliability,server): KV admission reserves on every rank's ledger`
+
+## Task 32: Tensor-parallel performance
+
+Files: as the measurements direct (`crates/turbine-model/src/tp.rs`, `crates/turbine-distributed/src/collective/hostmem.rs` thresholds, decode graphs under TP), `crates/turbine-model/tests/perf.rs` (`tp_step_profile`)
+Interfaces:
+
+- a lab profile of one tp 2 prefill chunk and one decode step: collective time vs GEMM vs other, per rank
+  Covers: S-6 performance after correctness (spec Constraints)
+  Depends on: Tasks 17, 21, 29
+
+- [ ] Profile (GPU 0 + GPU 1 under `scripts/bench-lock.sh`, hard timeout); record the split.
+- [ ] Land fixes one at a time — hostmem route thresholds for prefill-size messages, the Task 29 rows, decode graphs under TP if feasible — each followed by `scripts/bench-lock.sh scripts/lab-cluster.sh tp2-novanas` (golden c1/c16 and the bench) and a labbook upload.
+- [ ] Gate: `scripts/gate.sh` per commit.
+- [ ] Commit: one `perf(...)` commit per fix.

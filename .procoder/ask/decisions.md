@@ -955,3 +955,63 @@ Within the fold-in decision above (PP and EP in Phase 5, sharded DP skipped), th
 - PP stage placement on novanas's asymmetric slots: the last stage (logits or their device reduction, plus its KV tier copies) goes on the GPU with the fastest measured host link (GPU0, Gen5 x8), reason `pp_stage_host_traffic:<device>`.
 
 **Decision (user, 2026-09-28): all four accepted.** PP send / recv on the `hostmem` slots, with `ncclSend` / `ncclRecv` as the fallback, `local` mode only; EP with replicated tokens and an FP32 all-reduce combine, all-to-all deferred; the supported-combination set, everything else exits 2 at startup; the last PP stage on GPU0. Not taken: EP all-to-all now, TP × PP combinations.
+
+## P5: collective failure recovery
+
+Asked 2026-09-28 (after the first tp2 serving run). A collective timeout or async error mid-generation aborts the group's communicator; the spec's failure mode says the phase-3 breaker's `PROBING` re-creates it, which the tp2 wiring does not do yet.
+
+- A) leave the replica `CIRCUIT_OPEN` until a restart
+- B) re-create the communicator while probing: swap every rank executor's collective for a new one (fresh unique id, bounded init) and run a re-init step plan, then the ordinary probes
+- C) exit 3 and let the supervisor restart the process
+
+**Decision (user, 2026-09-28): B, with C as the interim** ("Re-create, exit 3 meanwhile"). A collective failure exits 3 now; re-creation is a Phase 5 task (plan Task 28), after which the interim exit is dropped.
+
+## P5: bit-exact prefix reuse under tensor parallelism
+
+Asked 2026-09-28. At tp 1 Llama's prefix reuse is bit-exact (the invariant GEMM rows of `kernels/rocm/tuning/gfx1201/gemm.tsv`, decision "Pre-Phase-5 #1 follow-up (A)"); at tp 2 every rank's projections have half-size shapes the table has no rows for, so the library's heuristic choice may change with m and a reused prefix may differ from a cold one.
+
+- A) accept the golden bound only (no bit-exactness claim under TP)
+- B) tune invariant GEMM rows for the TP shapes
+
+**Decision (user, 2026-09-28): B.** Add batch-invariant rows for the tp 2 shapes of Llama and OLMoE (prefill and decode) to `kernels/rocm/tuning/gfx1201/gemm.tsv`; the target is `kv_gpu` prefix reuse bit-exact at tp 2 as at tp 1, with throughput re-measured (plan Task 29).
+
+## P5: KV tiers in static rank mode
+
+Asked 2026-09-28. In `local` mode the leader drives every rank's L1/L2 copies (T17b); in `static` mode the ranks are separate processes, and the first wiring turned the tiers off there.
+
+- A) keep tiers off in `static` mode for now
+- B) build tiers in `static` mode too
+
+**Decision (user, 2026-09-28): B.** Worker processes manage their own per-rank L1/L2 copies, driven by the leader over the rank link (protocol messages for promote, demote and tier copies), symmetric with `local` mode; the tp2 static lab scenario gains the Phase 4 multi-turn check (plan Task 30).
+
+## P5: KV admission across tensor-parallel ranks
+
+Asked 2026-09-28. The tp2 wiring reserves each admission's worst-case KV on the leader's ledger only (the pools agree on the minimum block count at startup).
+
+- A) keep the leader's ledger as the group's
+- B) reserve on every rank's ledger per admission
+
+**Decision (user, 2026-09-28): B.** Admission calls `reserve_group` across every rank's ledger, atomically with rollback on a partial failure, covered by a simulator test with unequal pools (plan Task 31).
+
+## P5 Task 25: EP expert-subset GEMMs for OLMoE — provider evaluation (kernel reuse rule)
+
+Measured 2026-09-28. Kernel ABI v2 already gives every `moe_experts` provider (cpu-reference and all five HIP implementations: small-m, WMMA prefill, WMMA, `hipblaslt_per_expert`, `hipblaslt_grouped`) a local expert range `[expert_begin, expert_end)`; the positions kernel marks rows routed outside it as −1, so they are never gathered, multiplied or scattered. No ABI change is needed.
+
+`turbine-model --test perf moe_ep_local_timings` (commit f2b2812), OLMoE-1B-7B real routing from the traced 2,048-token golden prefill (its first 16 tokens stand for a 16-sequence decode step), real expert weights of layers 0/5/10/15, the library's default choice, natively on novanas GPU 0 under `scripts/bench-lock.sh`; µs per `moe_experts` call over those layers:
+
+| Case                                                               | 16 tokens (128 routed rows) | 2,048 tokens (16,384 routed rows) |
+| ------------------------------------------------------------------ | --------------------------- | --------------------------------- |
+| All 64 experts (one device, or remote experts at weight 0)         | 966–1,207                   | 2,493–2,559                       |
+| EP 2 rank 0, experts 0–31                                          | 504–639                     | 1,279–1,331                       |
+| EP 2 rank 1, experts 32–63                                         | 576–690                     | 1,284–1,415                       |
+| Interleaved placement, rank 0's even experts as 32 one-expert runs | 1,097–1,388                 | 2,992–3,096                       |
+
+Bitwise at every layer and size: range `[0,32)` then `[32,64)` into one accumulator equals the 64-expert call, and so do the 64 one-expert runs in ascending order (the scatter adds each token's experts in ascending order either way).
+
+- A) the existing local expert range with the rank's own weight stacks, one `moe_experts` call per run of consecutive expert ids: halves the MoE cost per rank, bitwise-compatible with one device, no ABI change (recommended)
+- B) a global→local id map with remote experts at weight 0: the full 64-expert cost, no saving
+- C) CK `moe_sorting` with a local-expert mask: replaces only the `moe_route` sort, and CK's fused MoE does not build on gfx1201 (MFMA 32×32×8; "Pre-Phase-5 #2")
+- D) vLLM `fused_moe` `expert_map`: the same idea as A for arbitrary maps, but its GEMMs are CUDA / gfx9 / Triton and its align/permute helpers duplicate `moe_route`
+- E) llama.cpp `mul_mat_id`: no expert parallelism (ids index the full weight tensor), 2.9× slower at 16k rows and not invariance-compatible ("Pre-Phase-5 #2")
+
+**Choice (Phase 5 lead, per the kernel reuse rule, 2026-09-28): A**, with contiguous placements (the default). Placement files are supported and exact, but fragmented runs cost as much as the full call (last row), so `docs` and the `parallel.expert.placement` description steer files towards contiguous blocks.
