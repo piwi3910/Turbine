@@ -32,10 +32,12 @@
 #                      0 and 1, leader 127.0.0.1:18100; golden c1 and c16). Prints one
 #                      `tp-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run.
 #                      2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)". Every tp 2
-#                      golden is gated against a one-GPU capture of the same model taken in
-#                      the run (strict c1, batched c16; the one-GPU leg itself against the
-#                      committed reference), the committed reference printed for information;
-#                      a violation fails the scenario at its end, after every leg ran.
+#                      golden takes the TP rule (user decision "P5: tensor-parallel accuracy gate
+#                      against the one-GPU capture"): batched bounds at c1 and c16 against a
+#                      one-GPU capture of the same model taken in the run, and the golden rule
+#                      (strict c1, batched c16) against the committed reference; the one-GPU leg
+#                      itself is gated against the committed reference. A violation fails the
+#                      scenario at its end, after every leg ran.
 #   dp2-novanas       Llama-3.2-3B-Instruct at tp 1 on the standard throughput workload
 #                      (512-word prompts, 256 tokens with --ignore-eos, 200 requests, after a
 #                      16-request warm-up): first a dp 1 baseline on device 0 at concurrency 16,
@@ -54,9 +56,9 @@
 #                      (user decision "P5: OLMoE golden tolerance under expert parallelism");
 #                      the transformers reference is compared for information only (and p14's
 #                      positions report printed). turbine_expert_rank_tokens_total must be
-#                      non-zero for rank 0 and rank 1. A gate violation fails the scenario at its
-#                      end, after every run — except the ep 2 × tp 2 leg, printed as `known_fail
-#                      task29` until plan Task 29 settles OLMoE tp 2 p10. Prints one
+#                      non-zero for rank 0 and rank 1. The ep 2 × tp 2 leg includes tensor
+#                      parallelism and takes the TP rule (as tp2-novanas). A gate violation fails
+#                      the scenario at its end, after every run. Prints one
 #                      `ep-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run and
 #                      the scheduler document's `expert` section. 2-GPU numbers are
 #                      "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
@@ -398,18 +400,19 @@ capture_one_gpu() {
 		--out "$out" || job_fail "turbine-golden capture failed"
 }
 
-# gate_vs_capture <slug> <capture> <label>: the multi-GPU gate — strict at c1, batched at c16,
-# against the one-GPU capture (a violation is recorded in GATE_FAILED; the scenario goes on and
-# fails at its end); the committed transformers reference at c1 and c16 for information.
+# gate_vs_capture <slug> <capture> <label>: the tensor-parallel gate (user decision "P5:
+# tensor-parallel accuracy gate against the one-GPU capture", A): against the one-GPU capture
+# with the batched bounds at c1 and c16, and against the committed transformers reference with
+# the golden rule (strict c1, batched c16). A violation is recorded in GATE_FAILED; the scenario
+# goes on and fails at its end.
 gate_vs_capture() {
 	local slug="$1" capture="$2" label="$3" c
 	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
 	for c in 1 16; do
-		echo "lab-step: golden ${label} c${c} vs 1 GPU"
+		echo "lab-step: golden ${label} c${c} vs 1 GPU (batched bounds)"
 		"${BIN}/turbine-golden" compare --url "$URL" --reference "$capture" "${tol[@]}" \
-			--concurrency "$c" || GATE_FAILED+=("golden ${label} c${c} vs 1 GPU")
-		golden_info "${label} c${c} vs HF" --reference "tests/golden/${slug}/reference.jsonl" \
-			--concurrency "$c"
+			--concurrency "$c" --batched-bounds || GATE_FAILED+=("golden ${label} c${c} vs 1 GPU")
+		golden_gate "$slug" "${label} c${c} vs HF" --concurrency "$c"
 	done
 }
 
@@ -558,10 +561,9 @@ scenario_ep2() {
 
 	start_server "${WORK}/ep2-tp2.log" "$ep2" --set parallel.tensor_parallel_size=2
 	wait_ready "$URL" "${WORK}/ep2-tp2.log"
-	# OLMoE tp 2 p10 diverges (not a near-tie): plan Task 29 fixes or explains it; until then this
-	# leg reports and does not decide the scenario's verdict.
-	golden_vs_one_gpu "olmoe ep2 tp2" known_fail task29
-	golden_info "olmoe ep2 tp2 c1 vs HF" --reference "tests/golden/${slug}/reference.jsonl"
+	# ep 2 Ã tp 2 includes tensor parallelism: the TP rule (batched bounds against the ep 1
+	# capture, the golden rule against the transformers reference).
+	gate_vs_capture "$slug" "${WORK}/ep1-capture.jsonl" "olmoe ep2 tp2"
 	ep_counts ep2-tp2
 	stop_servers
 
