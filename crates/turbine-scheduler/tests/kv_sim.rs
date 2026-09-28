@@ -33,6 +33,7 @@ fn format() -> KvFormat {
             dtype: DType::BF16,
             block_tokens: 16,
         },
+        shards: 1,
     }
 }
 

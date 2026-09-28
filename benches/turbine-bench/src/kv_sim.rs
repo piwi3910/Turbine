@@ -315,6 +315,7 @@ impl Engine {
             KvFormat {
                 dtype: KvDtype::Bf16,
                 layout,
+                shards: 1,
             },
             args.l0_blocks,
             l1.clone(),

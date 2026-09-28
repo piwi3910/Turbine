@@ -38,10 +38,32 @@ impl fmt::Debug for KvKey {
 pub struct NamespaceKey(pub [u8; 32]);
 
 /// Stored KV format: element type plus the per-token layout (which carries `block_tokens`).
+///
+/// Under tensor parallelism (Phase 5 §Data) every rank's pool holds its own KV heads and `layout`
+/// is one rank's; a tier copy of a block is then the `shards` rank shards concatenated in rank
+/// order, [`KvFormat::block_bytes`] bytes in all. `shards` is 1 without tensor parallelism.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KvFormat {
     pub dtype: KvDtype,
     pub layout: KvLayout,
+    /// Rank shards of one block (the tensor-parallel size; 1 without it).
+    pub shards: u32,
+}
+
+impl KvFormat {
+    /// One block's format on one device (no tensor parallelism).
+    pub fn single(dtype: KvDtype, layout: KvLayout) -> Self {
+        KvFormat {
+            dtype,
+            layout,
+            shards: 1,
+        }
+    }
+
+    /// Bytes of one logical block: every rank shard of it.
+    pub fn block_bytes(&self) -> u64 {
+        self.layout.block_bytes() * u64::from(self.shards.max(1))
+    }
 }
 
 /// Canonical namespace JSON. Field order is the sorted key order and must never change:
@@ -61,6 +83,10 @@ struct CanonicalFormat {
     head_dim: u32,
     num_kv_heads: u32,
     num_layers: u32,
+    /// Only with tensor parallelism (> 1), so single-device keys never change: a tier copy of a
+    /// tp = n block is n rank shards and must never be read by a process of another tp size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shards: Option<u32>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -78,6 +104,7 @@ pub fn namespace_key(id: &ModelIdentity, fmt: &KvFormat, cache_salt: &str) -> Na
             head_dim: fmt.layout.head_dim,
             num_kv_heads: fmt.layout.num_kv_heads,
             num_layers: fmt.layout.num_layers,
+            shards: (fmt.shards > 1).then_some(fmt.shards),
         },
         model_config_hash: hex(&id.config_hash),
         weights_index_hash: hex(&id.weights_index_hash),
@@ -171,16 +198,16 @@ mod tests {
     use turbine_core::types::{DType, KvDtype, KvLayout, ModelIdentity};
 
     fn llama_format(block_tokens: u32) -> KvFormat {
-        KvFormat {
-            dtype: KvDtype::Bf16,
-            layout: KvLayout {
+        KvFormat::single(
+            KvDtype::Bf16,
+            KvLayout {
                 num_layers: 28,
                 num_kv_heads: 8,
                 head_dim: 128,
                 dtype: DType::BF16,
                 block_tokens,
             },
-        }
+        )
     }
 
     fn model(config_byte: u8) -> ModelIdentity {
@@ -257,5 +284,27 @@ mod tests {
             "a partial block has no key"
         );
         assert_eq!(prefix_keys(&h, &tokens[..31], 16).len(), 1);
+    }
+
+    #[test]
+    fn shard_count_scopes_the_namespace_only_under_tp() {
+        let one = llama_format(16);
+        // tp = 1 keeps the Phase 4 canonical JSON, so its namespace is the golden one.
+        assert_eq!(hex(&namespace_key(&model(1), &one, "").0), GOLDEN_NS);
+        assert_eq!(one.block_bytes(), one.layout.block_bytes());
+        let two = KvFormat { shards: 2, ..one };
+        let four = KvFormat { shards: 4, ..one };
+        let ns1 = namespace_key(&model(1), &one, "");
+        let ns2 = namespace_key(&model(1), &two, "");
+        let ns4 = namespace_key(&model(1), &four, "");
+        assert_ne!(ns2, ns1, "a tp = 2 blob is never read by a tp = 1 process");
+        assert_ne!(ns4, ns2, "nor by another tp size");
+        assert_eq!(two.block_bytes(), 2 * one.layout.block_bytes());
+        let tokens: Vec<u32> = (100..116).collect();
+        assert_ne!(
+            block_key(&ns2, None, &tokens),
+            block_key(&ns1, None, &tokens),
+            "the shard count changes every block key"
+        );
     }
 }

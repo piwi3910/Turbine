@@ -1405,6 +1405,7 @@ mod kv_sim {
                 KvFormat {
                     dtype: KvDtype::Bf16,
                     layout,
+                    shards: 1,
                 },
                 64,
                 Some(l1.clone()),

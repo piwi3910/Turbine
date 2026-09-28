@@ -2518,6 +2518,7 @@ mod tests {
                 device: CopyDevice::Sync {
                     mem: pool_mem(&pool),
                 },
+                shards: Vec::new(),
                 l2,
                 clock: Arc::clone(&clock),
                 metrics: metrics.kv.clone(),
