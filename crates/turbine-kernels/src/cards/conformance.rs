@@ -81,17 +81,19 @@ pub fn cards_suite(reg: &Registry<CardProfile>) -> Result<(), Vec<String>> {
                 p.vendor
             )),
         };
+        // A missing or unreadable build list is one failure of the profile, not one per arch.
+        if let Err(e) = &build_list {
+            fail("archs", e.clone());
+        }
         for arch in p.archs {
             if let Some((_, other)) = claimed.iter().find(|(a, _)| a == arch) {
                 fail("archs", format!("{arch} is also listed by {other}"));
             }
             claimed.push((arch, p.name));
-            match &build_list {
-                Ok((file, list)) if !list.iter().any(|a| a == arch) => {
-                    fail("archs", format!("{arch} is not built: missing from {file}"));
-                }
-                Ok(_) => {}
-                Err(e) => fail("archs", e.clone()),
+            if let Ok((file, list)) = &build_list
+                && !list.iter().any(|a| a == arch)
+            {
+                fail("archs", format!("{arch} is not built: missing from {file}"));
             }
         }
         let t = &p.thresholds;
@@ -211,5 +213,38 @@ mod tests {
             "{failures:#?}"
         );
         assert_eq!(checks, ["archs", "tiers", "tiers"], "{failures:#?}");
+    }
+
+    /// A vendor with no kernel-library build list, two architectures, nothing else wrong.
+    static NO_BUILD_LIST: CardProfile = CardProfile {
+        name: "no_build_list",
+        vendor: "cpu",
+        archs: &["cpu_a", "cpu_b"],
+        capabilities: CardCapabilities {
+            matrix_instructions: &[],
+            bf16: true,
+            wave_size: 1,
+            lds_bytes: 1,
+        },
+        thresholds: CardThresholds {
+            moe_small_max_rows: 1,
+            paged_page_multiple: 1,
+        },
+        preferences: &[],
+    };
+
+    static WITH_NO_BUILD_LIST: Registry<CardProfile> =
+        Registry::new("card_profile", &[&NO_BUILD_LIST]);
+
+    /// The missing build list is one failure per profile, not one per architecture
+    /// (Scout 8f4b1230).
+    #[test]
+    fn missing_build_list_reported_once() {
+        let failures = cards_suite(&WITH_NO_BUILD_LIST).unwrap_err();
+        assert_eq!(
+            failures,
+            ["no_build_list: archs: no kernel-library build list for vendor cpu"],
+            "{failures:#?}"
+        );
     }
 }
