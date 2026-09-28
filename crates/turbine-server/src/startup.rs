@@ -366,6 +366,7 @@ pub fn run(cli: Cli) -> ExitCode {
                             listen: config.parallel.ranks.leader.unwrap_or(config.server.listen),
                             expect,
                             world: tp,
+                            mirror_check_steps: engine::tp::MIRROR_CHECK_STEPS,
                         })
                     } else {
                         StaticRole::Worker(engine::tp::StaticWorker {
@@ -651,7 +652,7 @@ async fn serve(
                         worker,
                         &reliability,
                         &phase,
-                        || backend.set_rank_ready(),
+                        |_| backend.set_rank_ready(),
                     );
                     let _ = fatal.send(Fatal::RankStopped(result.err()));
                 });

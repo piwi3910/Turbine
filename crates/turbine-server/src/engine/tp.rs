@@ -37,6 +37,17 @@
 //! executes plans until the leader shuts it down or is lost (exit 1). There is no per-step
 //! acknowledgement across processes, so KV tiers (which copy every rank's shard from the
 //! leader) are off in static mode.
+//!
+//! Group admission in `static` mode (P5 Task 33, decision "P5: group KV admission in static
+//! rank mode" B): each worker reports its memory budget once it loaded (`Loaded`), and the
+//! leader keeps an exact mirror of that worker's ledger ([`Ledger::mirror`]) in the group's
+//! ledgers, so admission reserves on every rank as in `local` mode. Every step plan carries the
+//! mirrors' changes since the previous plan ([`StepPlan::ledger`]); the worker replays them on
+//! its real ledger before the step ([`LedgerReplica`]), so the two follow the leader's
+//! reservations in step order. Every [`MIRROR_CHECK_STEPS`] steps, and in the last plan before
+//! shutdown, a plan also carries the mirror's digest, which the worker compares with its real
+//! ledger's: a mismatch logs `event="ledger_mirror_divergence"` (WARN, reason
+//! `mirror_digest_mismatch`) and counts `turbine_ledger_mirror_divergence_total{rank}`.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -44,13 +55,13 @@ use std::time::{Duration, Instant};
 
 use turbine_api::backend::NotReadyReason;
 use turbine_core::clock::Clock;
-use turbine_core::types::{BlockId, KvLayout, ModelShape};
+use turbine_core::types::{BlockId, DeviceId, KvLayout, MemoryKind, ModelShape};
 use turbine_distributed::collective::{
     Collective, CollectiveError, CollectiveInit, CollectiveLibrary, CollectiveMetrics, ReduceOp,
 };
 use turbine_distributed::rank::{
-    ExecError, HelloExpect, RankError, RankMessage, RankRuntime, StepExecutor, StepOutput,
-    StepPlan, StepSeq,
+    ExecError, HelloExpect, LedgerChange, RankBudget, RankError, RankLedger, RankMessage,
+    RankRuntime, StepExecutor, StepOutput, StepPlan, StepSeq,
 };
 use turbine_distributed::transport::Transport;
 use turbine_kv::BlockPool;
@@ -61,7 +72,10 @@ use turbine_model::executor::{
 use turbine_model::tp::{self, ShardSpec, TpContext};
 use turbine_model::{ModelError, ModelMetrics};
 use turbine_reliability::budget::DeviceBudget;
+use turbine_reliability::budget::PoolKind;
 use turbine_reliability::ledger::{Ledger, Reservation};
+use turbine_reliability::ledger::{LedgerOp, LedgerReplica};
+use turbine_reliability::metrics::RankLabel;
 use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_reliability::reserve::EmergencyReserve;
 use turbine_tensor::{DType, DeviceBuffer, DeviceMemory};
@@ -100,6 +114,45 @@ fn step_plan(step: u64, batch: &BatchInput<'_>) -> StepPlan {
             })
             .collect(),
         copies: Vec::new(),
+        ledger: Vec::new(),
+    }
+}
+
+/// Steps between two mirror-ledger digest checks in `static` mode (P5 Task 33); the last plan
+/// before shutdown always carries the digests.
+pub(crate) const MIRROR_CHECK_STEPS: u64 = 64;
+
+/// The leader's mirror of one `static` worker rank's ledger (module comment).
+struct Mirror {
+    rank: u32,
+    device: DeviceId,
+    ledger: Arc<Ledger>,
+}
+
+/// A mirror's KV-pool change on the rank link (the mirror reserves only KV: group admission).
+fn wire_change(op: LedgerOp) -> Option<LedgerChange> {
+    match op {
+        LedgerOp::Reserve {
+            id,
+            pool: PoolKind::Kv,
+            bytes,
+        } => Some(LedgerChange::Reserve { id, bytes }),
+        LedgerOp::Reserve { .. } => None,
+        LedgerOp::Commit { id, bytes } => Some(LedgerChange::Commit { id, bytes }),
+        LedgerOp::Release { id } => Some(LedgerChange::Release { id }),
+    }
+}
+
+/// A change from the rank link as a ledger op on the worker's KV pool.
+fn ledger_op(c: LedgerChange) -> LedgerOp {
+    match c {
+        LedgerChange::Reserve { id, bytes } => LedgerOp::Reserve {
+            id,
+            pool: PoolKind::Kv,
+            bytes,
+        },
+        LedgerChange::Commit { id, bytes } => LedgerOp::Commit { id, bytes },
+        LedgerChange::Release { id } => LedgerOp::Release { id },
     }
 }
 
@@ -113,6 +166,13 @@ pub(crate) struct TpExecutor {
     step: u64,
     /// Expert parallelism: the group's token counts, turned into metrics after every step.
     experts: Option<Arc<ExpertStats>>,
+    /// `static` mode: the mirrors of the workers' ledgers (module comment), the steps between
+    /// digest checks, the mirror changes a failed hand-off did not deliver, and the workers'
+    /// startup commitments on the mirrors (held, never sent: the workers hold their own).
+    mirrors: Vec<Mirror>,
+    check_every: u64,
+    unsent: Vec<RankLedger>,
+    _mirror_held: Vec<Reservation>,
 }
 
 impl TpExecutor {
@@ -129,6 +189,10 @@ impl TpExecutor {
             faults,
             step: 0,
             experts: None,
+            mirrors: Vec::new(),
+            check_every: MIRROR_CHECK_STEPS,
+            unsent: Vec::new(),
+            _mirror_held: Vec::new(),
         }
     }
 
@@ -136,6 +200,43 @@ impl TpExecutor {
     pub(crate) fn with_experts(mut self, experts: Option<Arc<ExpertStats>>) -> TpExecutor {
         self.experts = experts;
         self
+    }
+
+    /// `static` mode: sends `mirrors`' changes with every plan and their digests every
+    /// `check_every` steps (module comment); `held` are the workers' startup commitments on them.
+    fn with_mirrors(
+        mut self,
+        mirrors: Vec<Mirror>,
+        check_every: u64,
+        held: Vec<Reservation>,
+    ) -> TpExecutor {
+        self.mirrors = mirrors;
+        self.check_every = check_every.max(1);
+        self._mirror_held = held;
+        self
+    }
+
+    /// Every mirror's changes since the last plan (after any undelivered ones), with its digest
+    /// when `check`.
+    fn ledger_part(&mut self, check: bool) -> Vec<RankLedger> {
+        let mut unsent = std::mem::take(&mut self.unsent);
+        self.mirrors
+            .iter()
+            .map(|m| {
+                let (ops, digest) = m.ledger.drain_journal_with_digest(m.device, PoolKind::Kv);
+                let mut changes = unsent
+                    .iter_mut()
+                    .find(|u| u.rank == m.rank)
+                    .map(|u| std::mem::take(&mut u.changes))
+                    .unwrap_or_default();
+                changes.extend(ops.into_iter().filter_map(wire_change));
+                RankLedger {
+                    rank: m.rank,
+                    changes,
+                    digest: check.then_some(digest),
+                }
+            })
+            .collect()
     }
 
     /// A worker's sticky device error, if one was reported (the process must exit 3).
@@ -172,11 +273,17 @@ impl TpExecutor {
     /// Hands `plan` to the workers, runs `own` on rank 0 and waits until every worker is idle.
     fn run<T>(
         &mut self,
-        plan: StepPlan,
+        mut plan: StepPlan,
         own: impl FnOnce(&mut dyn ModelExecutor) -> Result<T, ModelError>,
     ) -> Result<T, ModelError> {
         self.step += 1;
+        if !self.mirrors.is_empty() {
+            plan.ledger = self.ledger_part(self.step.is_multiple_of(self.check_every));
+        }
+        let sent_ledger = (!plan.ledger.is_empty()).then(|| plan.ledger.clone());
         if let Err(e) = self.runtime.step(plan) {
+            // The workers never saw these changes: they go with the next plan.
+            self.unsent = sent_ledger.unwrap_or_default();
             return Err(self.rank_failed(e));
         }
         let out = own(self.leader.as_mut());
@@ -231,13 +338,25 @@ impl ModelExecutor for TpExecutor {
             step: self.step,
             sequences: Vec::new(),
             copies: src.iter().copied().zip(dst.iter().copied()).collect(),
+            ledger: Vec::new(),
         };
         self.run(plan, |leader| leader.copy_blocks(kv, src, dst))
     }
 }
 
 impl Drop for TpExecutor {
+    /// `static` mode: the mirrors' last changes and digests go to the workers before the
+    /// shutdown (a final check).
     fn drop(&mut self) {
+        if !self.mirrors.is_empty() {
+            let ledger = self.ledger_part(true);
+            let _ = self.runtime.step(StepPlan {
+                step: self.step,
+                sequences: Vec::new(),
+                copies: Vec::new(),
+                ledger,
+            });
+        }
         self.runtime.shutdown("engine stopped");
     }
 }
@@ -253,8 +372,58 @@ pub(crate) struct WorkerRank {
     /// The executor reduces logits on the device: ask for one candidate per row instead of
     /// copying whole rows to the host.
     reduce: bool,
+    /// `static` mode: its real ledger following the leader's mirror (module comment).
+    mirror: Option<MirrorCheck>,
     /// Its ledger, reservations and emergency reserve, held while the rank runs.
     _keep: Box<dyn Send>,
+}
+
+/// A `static` worker's side of the mirror ledger: its real ledger replaying the mirror's
+/// changes, and where divergences are counted.
+struct MirrorCheck {
+    replica: LedgerReplica,
+    metrics: ReliabilityMetrics,
+}
+
+impl MirrorCheck {
+    /// Applies the plan's changes for `rank` and, when it carries a digest, compares.
+    fn apply(&mut self, rank: u32, plan: &StepPlan) {
+        for part in plan.ledger.iter().filter(|p| p.rank == rank) {
+            let ops: Vec<LedgerOp> = part.changes.iter().map(|&c| ledger_op(c)).collect();
+            if let Err(detail) = self.replica.apply(&ops) {
+                self.diverged(rank, plan.step, "mirror_replay_failed", &detail);
+            }
+            if let Some(want) = part.digest {
+                let have = self.replica.digest(PoolKind::Kv);
+                if have != want {
+                    let detail =
+                        format!("leader's mirror digest {want:#018x}, ledger {have:#018x}");
+                    self.diverged(rank, plan.step, "mirror_digest_mismatch", &detail);
+                }
+            }
+        }
+    }
+
+    fn diverged(&self, rank: u32, step: u64, reason: &'static str, detail: &str) {
+        let usage = self
+            .replica
+            .ledger()
+            .usage(self.replica.device(), PoolKind::Kv);
+        tracing::warn!(
+            event = "ledger_mirror_divergence",
+            reason,
+            rank,
+            step,
+            used = usage.used,
+            reserved = usage.reserved,
+            detail,
+            "this rank's KV ledger differs from the leader's mirror of it"
+        );
+        self.metrics
+            .ledger_mirror_divergence
+            .get_or_create(&RankLabel { rank })
+            .inc();
+    }
 }
 
 impl WorkerRank {
@@ -273,6 +442,7 @@ impl WorkerRank {
             pool,
             collective,
             faults,
+            mirror: None,
             _keep: keep,
         }
     }
@@ -333,6 +503,10 @@ impl WorkerRank {
 
 impl StepExecutor for WorkerRank {
     fn execute(&mut self, plan: &StepPlan) -> Result<StepOutput, ExecError> {
+        // The mirror's changes first: they are the leader's reservations up to this step.
+        if let Some(m) = &mut self.mirror {
+            m.apply(self.rank, plan);
+        }
         match self.run(plan) {
             Ok(rows) => Ok(StepOutput {
                 logits: None,
@@ -384,6 +558,73 @@ pub(crate) struct StaticLeader {
     pub listen: SocketAddr,
     pub expect: HelloExpect,
     pub world: u32,
+    /// Steps between two mirror-ledger digest checks ([`MIRROR_CHECK_STEPS`]).
+    pub mirror_check_steps: u64,
+}
+
+/// The mirror of a worker's ledger from its reported `budget` (`Loaded`), with the worker's
+/// startup commitments (weights, workspace, …) taken on it and kept out of its journal: the
+/// worker holds its own.
+fn mirror_of(
+    rank: u32,
+    b: &RankBudget,
+    memory_kind: MemoryKind,
+) -> Result<(DeviceBudget, Mirror, Vec<Reservation>), StartupError> {
+    let pool = |name: &str| {
+        PoolKind::ALL
+            .into_iter()
+            .find(|k| k.as_str() == name)
+            .ok_or_else(|| StartupError::new(format!("rank {rank}: unknown pool {name:?}")))
+    };
+    let budget = DeviceBudget {
+        device: DeviceId(b.device),
+        memory_kind,
+        budget_bytes: b.budget_bytes,
+        pools: b
+            .pools
+            .iter()
+            .map(|(name, bytes)| Ok((pool(name)?, *bytes)))
+            .collect::<Result<_, StartupError>>()?,
+    };
+    let ledger = Ledger::mirror(&budget);
+    let mut held = Vec::with_capacity(b.committed.len());
+    for (name, bytes) in &b.committed {
+        let mut r = ledger
+            .reserve(budget.device, pool(name)?, *bytes)
+            .map_err(|e| StartupError::new(format!("rank {rank}'s mirror ledger: {e}")))?;
+        r.commit();
+        held.push(r);
+    }
+    let _ = ledger.drain_journal();
+    let mirror = Mirror {
+        rank,
+        device: budget.device,
+        ledger,
+    };
+    Ok((budget, mirror, held))
+}
+
+/// What a worker reports to its leader once it loaded (`Loaded`): its budget, the bytes committed
+/// outside the KV pool and its pool's geometry.
+fn rank_budget(budget: &DeviceBudget, ledger: &Ledger, pool: &BlockPool) -> RankBudget {
+    RankBudget {
+        device: budget.device.0,
+        budget_bytes: budget.budget_bytes,
+        pools: budget
+            .pools
+            .iter()
+            .map(|(k, bytes)| (k.as_str().to_string(), *bytes))
+            .collect(),
+        committed: budget
+            .pools
+            .iter()
+            .filter(|(k, _)| *k != PoolKind::Kv)
+            .map(|(k, _)| (k.as_str().to_string(), ledger.usage(budget.device, *k).used))
+            .filter(|(_, used)| *used > 0)
+            .collect(),
+        block_bytes: pool.layout().block_bytes(),
+        blocks: pool.total_blocks(),
+    }
 }
 
 /// A `static`-mode worker rank process (P5 S-5): how it joins its leader and loads its shard.
@@ -656,6 +897,10 @@ pub(crate) fn load_group(
         .map_err(|e| StartupError::new(format!("collective unique id: {e}")))?;
     // `static` mode: every worker process joins before anything is loaded (`rank_missing`
     // meanwhile; exit 1 naming the missing ranks after `parallel.collective.init_timeout`).
+    let check_every = group
+        .remote
+        .as_ref()
+        .map_or(MIRROR_CHECK_STEPS, |s| s.mirror_check_steps);
     let remote = match group.remote {
         Some(s) => {
             phase(NotReadyReason::RankMissing);
@@ -757,12 +1002,42 @@ pub(crate) fn load_group(
             Box::new((rank.held, rank.reserve, rank.ledger)),
         )));
     }
+    // `static` mode: a mirror of every worker's ledger from the budget it reports once loaded
+    // (P5 Task 33), admitted through like a `local` rank's ledger.
+    let mut mirrors = Vec::new();
+    let mut mirror_held = Vec::new();
+    if let Some(runtime) = &remote {
+        let budgets = runtime
+            .budgets(group.init_timeout)
+            .map_err(|e| StartupError::new(format!("static ranks' budgets: {e}")))?;
+        for (rank, b) in budgets {
+            if b.blocks != rank0.pool.total_blocks() {
+                return Err(StartupError::new(format!(
+                    "rank {rank} reports {} KV blocks, rank 0 has {}",
+                    b.blocks,
+                    rank0.pool.total_blocks()
+                )));
+            }
+            let (budget, mirror, held) = mirror_of(rank, &b, rank0.budget.memory_kind)?;
+            tracing::info!(
+                event = "ledger_mirror",
+                rank,
+                device = b.device,
+                kv_bytes = budget.pool(PoolKind::Kv),
+                "the leader mirrors this static rank's ledger for group admission"
+            );
+            ledgers.push((budget, Arc::clone(&mirror.ledger)));
+            mirrors.push(mirror);
+            mirror_held.extend(held);
+        }
+    }
     let runtime = match remote {
         Some(runtime) => runtime,
         None => RankRuntime::local(workers, group.depth),
     };
     let mut executor = TpExecutor::new(rank0.executor, runtime, rank0.collective, faults)
-        .with_experts(group.experts.clone());
+        .with_experts(group.experts.clone())
+        .with_mirrors(mirrors, check_every, mirror_held);
     let mut pool = rank0.pool;
     phase(NotReadyReason::LoadingModel);
     model::warm_up(&mut executor, &mut pool, warmup_token)?;
@@ -797,7 +1072,8 @@ pub(crate) fn load_group(
 
 /// A `static`-mode worker rank process (P5 S-5): joins its leader (`rank_missing` until the
 /// leader welcomes it), opens the communicator with the leader's unique id, loads its shard,
-/// agrees on the pool with the group, calls `ready` and then executes every step plan until the
+/// agrees on the pool with the group, reports its budget (`Loaded`), calls `ready` with its ledger
+/// and then executes every step plan (replaying the leader's mirror of its ledger) until the
 /// leader shuts it down (`Ok`). A lost leader aborts the communicator and returns `Err` (the
 /// process exits 1 and releases its device memory), as does a failed load or step.
 pub(crate) fn run_static_worker(
@@ -805,7 +1081,7 @@ pub(crate) fn run_static_worker(
     start: StaticWorker,
     reliability: &ReliabilityMetrics,
     phase: &(dyn Fn(NotReadyReason) + Sync),
-    ready: impl FnOnce(),
+    ready: impl FnOnce(&Arc<Ledger>),
 ) -> Result<(), String> {
     let s = prepared
         .shard
@@ -834,7 +1110,12 @@ pub(crate) fn run_static_worker(
         phase,
     };
     let rank = load_rank(prepared, &load).map_err(|e| e.to_string())?;
+    let mut link = link;
+    // P5 Task 33: the leader mirrors this rank's ledger from the budget it reports now.
+    link.loaded(rank_budget(&rank.budget, &rank.ledger, &rank.pool))
+        .map_err(|e| format!("rank {}: reporting its budget: {e}", s.rank))?;
     let collective = Arc::clone(&rank.collective);
+    let ledger = Arc::clone(&rank.ledger);
     let mut worker = WorkerRank::new(
         s.rank,
         rank.executor,
@@ -843,12 +1124,16 @@ pub(crate) fn run_static_worker(
         Arc::new(Mutex::new(None)),
         Box::new((rank.held, rank.reserve, rank.ledger)),
     );
+    worker.mirror = Some(MirrorCheck {
+        replica: LedgerReplica::new(Arc::clone(&ledger), rank.budget.device),
+        metrics: reliability.clone(),
+    });
     tracing::info!(
         event = "tp_static_worker_ready",
         rank = s.rank,
         "worker rank loaded; executing step plans"
     );
-    ready();
+    ready(&ledger);
     link.run(&mut worker, collective.as_ref())
         .map_err(|e| format!("rank {}: {e}", s.rank))
 }
@@ -1082,14 +1367,19 @@ mod tests {
     }
 
     /// Rank `rank` of a tp 2 group of the tiny Llama prepared as the server prepares it: the
-    /// cpu backend on host device `rank`, a 16 MiB pool.
-    fn prepared(spec: &TinySpec, rank: u32) -> PreparedModel {
+    /// cpu backend on host device `rank`, a 16 MiB pool, then `edit` on the configuration.
+    fn prepared_with(
+        spec: &TinySpec,
+        rank: u32,
+        edit: impl Fn(&mut turbine_core::config::Config),
+    ) -> PreparedModel {
         let mut config = turbine_core::config::Config::default();
         config.model.path = spec.dir.clone();
         config.execution.backend = turbine_core::config::ModuleName::new("cpu").unwrap();
         config.execution.device = DeviceId(rank);
         config.kv.gpu.max_bytes = Some(turbine_core::config::ByteSize(16 << 20));
         config.reliability.emergency_vram_reserve = turbine_core::config::ByteSize(1 << 20);
+        edit(&mut config);
         let inventory = turbine_device::DeviceInventory {
             devices: Vec::new(),
             backends: Vec::new(),
@@ -1103,21 +1393,29 @@ mod tests {
         .expect("prepare")
     }
 
-    /// P5 S-5, `static` rank mode in one process: a leader group with a remote rank that joins
-    /// over the `tcp` rank transport (Hello → Welcome with the leader's unique id), both
-    /// loading, agreeing on the pool through the communicator and warming up; the leader's
-    /// executor then gives one device's greedy tokens (fork copy included), and dropping it
-    /// shuts the worker down cleanly (`Ok`). Breaks if the handshake, the collective pool
-    /// agreement or the step plans over the socket are wrong.
-    #[test]
-    fn static_group_over_tcp_matches_one_device() {
-        let dir = TempDir::new("engine-tp-static");
-        let spec = write_tiny_llama(dir.path(), 11);
-        let prompt: Vec<u32> = (0..10).map(|i| (i * 17 + 3) % spec.vocab).collect();
-        let (mut one, one_pool) = one_device(&spec);
-        let want = greedy_with_fork(one.as_mut(), &one_pool, &prompt, 5);
+    /// A tp 2 `static` group in one process: the leader's loaded model (rank 0) and the worker
+    /// rank 1 on its own thread, joined over the `tcp` rank transport and the host collective.
+    struct StaticRun {
+        leader: PreparedModel,
+        loaded: LoadedModel,
+        /// The worker's `run_static_worker` result.
+        worker: std::thread::JoinHandle<Result<(), String>>,
+        /// The worker's real ledger, once it loaded.
+        worker_ledger: Arc<Ledger>,
+        /// The worker's metrics (its own registry, as in its own process).
+        worker_metrics: MetricsRegistry,
+        /// The leader's metrics.
+        metrics: MetricsRegistry,
+    }
 
-        let (leader, worker) = (prepared(&spec, 0), prepared(&spec, 1));
+    /// Starts a [`StaticRun`] over `spec` with `edit` on both ranks' configuration and a
+    /// mirror-ledger check every `check_steps` steps.
+    fn start_static(
+        spec: &TinySpec,
+        edit: impl Fn(&mut turbine_core::config::Config) + Copy,
+        check_steps: u64,
+    ) -> StaticRun {
+        let (leader, worker) = (prepared_with(spec, 0, edit), prepared_with(spec, 1, edit));
         let library = turbine_distributed::collective::HostBackend
             .load(None)
             .expect("host library");
@@ -1141,7 +1439,7 @@ mod tests {
             device_vendor: expect.device_vendor,
             device_arch: expect.device_arch.clone(),
         };
-        let reg = MetricsRegistry::new();
+        let (reg, worker_reg) = (MetricsRegistry::new(), MetricsRegistry::new());
         let (metrics, reliability) = (
             CollectiveMetrics::register(&reg),
             ReliabilityMetrics::register(&reg),
@@ -1155,13 +1453,16 @@ mod tests {
             init_timeout: Duration::from_secs(30),
             op_timeout: Duration::from_secs(30),
             route_max_bytes: None,
-            metrics: metrics.clone(),
+            metrics: CollectiveMetrics::register(&worker_reg),
             clock: Arc::clone(&clock),
         };
-        let worker_reliability = reliability.clone();
+        let worker_reliability = ReliabilityMetrics::register(&worker_reg);
+        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
         let worker_thread = std::thread::spawn(move || {
             let phase = |_| {};
-            run_static_worker(&worker, worker_start, &worker_reliability, &phase, || {})
+            run_static_worker(&worker, worker_start, &worker_reliability, &phase, |l| {
+                let _ = ledger_tx.send(Arc::clone(l));
+            })
         });
         let group = TpGroupStart {
             workers: Vec::new(),
@@ -1177,24 +1478,372 @@ mod tests {
                 listen,
                 expect,
                 world: 2,
+                mirror_check_steps: check_steps,
             }),
             experts: None,
         };
         let model_metrics = ModelMetrics::register(&reg);
         let loaded = load_group(&leader, group, 0, &model_metrics, &reliability, &|_| {})
             .expect("static group");
-        assert!(loaded.shards.is_empty(), "no tier shards across processes");
+        let worker_ledger = ledger_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the worker loaded");
+        StaticRun {
+            leader,
+            loaded,
+            worker: worker_thread,
+            worker_ledger,
+            worker_metrics: worker_reg,
+            metrics: reg,
+        }
+    }
+
+    /// P5 S-5, `static` rank mode in one process: a leader group with a remote rank that joins
+    /// over the `tcp` rank transport (Hello → Welcome with the leader's unique id), both
+    /// loading, agreeing on the pool through the communicator and warming up; the leader's
+    /// executor then gives one device's greedy tokens (fork copy included), and dropping it
+    /// shuts the worker down cleanly (`Ok`). Breaks if the handshake, the collective pool
+    /// agreement or the step plans over the socket are wrong.
+    #[test]
+    fn static_group_over_tcp_matches_one_device() {
+        let dir = TempDir::new("engine-tp-static");
+        let spec = write_tiny_llama(dir.path(), 11);
+        let prompt: Vec<u32> = (0..10).map(|i| (i * 17 + 3) % spec.vocab).collect();
+        let (mut one, one_pool) = one_device(&spec);
+        let want = greedy_with_fork(one.as_mut(), &one_pool, &prompt, 5);
+
+        let run = start_static(&spec, |_| {}, MIRROR_CHECK_STEPS);
+        assert!(
+            run.loaded.shards.is_empty(),
+            "no tier shards across processes"
+        );
+        assert_eq!(run.loaded.group.len(), 1, "the worker's mirror ledger");
         let LoadedModel {
             mut executor, pool, ..
-        } = loaded;
+        } = run.loaded;
         let got = greedy_with_fork(executor.as_mut(), &pool, &prompt, 5);
         assert_eq!(got, want);
         drop(executor);
-        let stopped = worker_thread.join().expect("worker thread");
+        let stopped = run.worker.join().expect("worker thread");
         assert_eq!(
             stopped,
             Ok(()),
             "the leader's shutdown stops the worker cleanly"
+        );
+    }
+
+    /// The engine over a loaded group, built as `engine::spawn` builds it (KV hierarchy, the
+    /// reliability side admitting through the group's ledgers, the scheduler behind its gate),
+    /// its command channel and published documents.
+    fn engine_over(
+        prepared: &PreparedModel,
+        mut loaded: LoadedModel,
+    ) -> (
+        crate::engine::EngineLoop,
+        tokio::sync::mpsc::Sender<crate::engine::EngineCommand>,
+        Arc<crate::engine::EngineShared>,
+        MetricsRegistry,
+    ) {
+        let reg = MetricsRegistry::new();
+        let metrics = crate::engine::EngineMetrics {
+            server: crate::metrics::ServerMetrics::register(&reg),
+            model: ModelMetrics::register(&reg),
+            scheduler: turbine_scheduler::SchedulerMetrics::register(&reg),
+            kv: turbine_kv::KvMetrics::register(&reg),
+        };
+        let clock: Arc<dyn Clock> = Arc::new(turbine_core::clock::SystemClock::new());
+        let mut pool = loaded.pool;
+        let kv_cfg = turbine_core::config::KvConfig {
+            block_tokens: pool.layout().block_tokens,
+            ..turbine_core::config::KvConfig::default()
+        };
+        let (kv, _handle) = crate::kv_orchestrator::KvOrchestrator::start(
+            crate::kv_orchestrator::KvStart {
+                cfg: &kv_cfg,
+                memory_kind: MemoryKind::Dedicated,
+                identity: prepared.identity,
+                device: crate::engine::copy_device(prepared),
+                shards: std::mem::take(&mut loaded.shards),
+                l2: None,
+                clock: Arc::clone(&clock),
+                metrics: metrics.kv.clone(),
+            },
+            &mut pool,
+        )
+        .expect("the KV hierarchy starts");
+        let parts = crate::reliability::build(crate::reliability::ReliabilityInputs {
+            config: &prepared.reliability,
+            budget: loaded.budget,
+            ledger: Arc::clone(&loaded.ledger),
+            reserve: loaded.reserve,
+            held: loaded.held,
+            params: &prepared.scheduler,
+            block_bytes: pool.layout().block_bytes(),
+            workspace_bytes_per_token: 0,
+            metrics: ReliabilityMetrics::register(&reg),
+            clock: Arc::clone(&clock),
+            reclaimer: kv.reclaimer(),
+            replica: 0,
+            group: loaded.group,
+        });
+        let scheduler = turbine_scheduler::Scheduler::new(prepared.scheduler, Arc::clone(&clock))
+            .with_metrics(metrics.scheduler.clone())
+            .with_gate(parts.gate);
+        let (tx, commands) = tokio::sync::mpsc::channel(64);
+        let shared = Arc::new(crate::engine::EngineShared::default());
+        let engine = crate::engine::EngineLoop::new(crate::engine::EngineParts {
+            executor: loaded.executor,
+            pool,
+            scheduler,
+            clock,
+            commands,
+            shared: Arc::clone(&shared),
+            tokenizer: Arc::clone(&prepared.tokenizer),
+            max_seq_len: prepared.max_seq_len,
+            metrics,
+            timeouts: crate::engine::Timeouts {
+                request: Duration::from_secs(600),
+                slow_client: Duration::from_secs(600),
+            },
+            overlap: false,
+            reliability: parts.engine,
+            kv,
+        });
+        (engine, tx, shared, reg)
+    }
+
+    /// A greedy request for `max_tokens` tokens of `prompt` with `n` choices.
+    fn greedy_request(
+        prompt: Vec<u32>,
+        max_tokens: u32,
+        n: u32,
+    ) -> turbine_core::request::GenerationRequest {
+        use turbine_core::request::{Endpoint, GenerationRequest, SamplingParams, StopConditions};
+        GenerationRequest {
+            id: turbine_core::types::RequestId::new_v4(),
+            n,
+            priority: turbine_core::types::Priority::default(),
+            echo: false,
+            constraint: None,
+            deadline_ms: u64::MAX,
+            session: None,
+            cache_salt: None,
+            endpoint: Endpoint::Completions,
+            http_request_id: "t".into(),
+            prompt_tokens: prompt,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            stop: StopConditions {
+                max_tokens,
+                ignore_eos: true,
+                ..StopConditions::default()
+            },
+        }
+    }
+
+    type Events = tokio::sync::mpsc::Receiver<turbine_core::request::GenerationEvent>;
+
+    /// Queues `req` with an output channel of `capacity` events; waits for its admission ack.
+    fn submit(
+        tx: &tokio::sync::mpsc::Sender<crate::engine::EngineCommand>,
+        req: turbine_core::request::GenerationRequest,
+        capacity: usize,
+    ) -> Events {
+        let (events, rx) = tokio::sync::mpsc::channel(capacity);
+        let (ack, admitted) = tokio::sync::oneshot::channel();
+        tx.blocking_send(crate::engine::EngineCommand::Submit(
+            Box::new(req.into()),
+            events,
+            ack,
+        ))
+        .unwrap_or_else(|_| panic!("engine gone"));
+        assert_eq!(admitted.blocking_recv().expect("ack"), Ok(()));
+        rx
+    }
+
+    /// Reads a stream to its end: the tokens, or the error code.
+    fn read_all(rx: &mut Events) -> Result<usize, String> {
+        use turbine_core::request::GenerationEvent;
+        let mut tokens = 0;
+        while let Some(e) = rx.blocking_recv() {
+            match e {
+                GenerationEvent::Token { .. } => tokens += 1,
+                GenerationEvent::Finished { .. } => return Ok(tokens),
+                GenerationEvent::Error { code, message } => {
+                    return Err(format!("{code:?}: {message}"));
+                }
+                _ => {}
+            }
+        }
+        Err("stream closed without an end".into())
+    }
+
+    /// The sum of `series`' samples in a registry's rendering.
+    fn sum_series(reg: &MetricsRegistry, series: &str) -> f64 {
+        reg.render()
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with(series))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum()
+    }
+
+    /// Polls `cond` every 10 ms; panics naming `what` after `limit`.
+    fn wait_until(limit: Duration, what: &str, mut cond: impl FnMut() -> bool) {
+        let started = Instant::now();
+        while !cond() {
+            assert!(started.elapsed() < limit, "{what}: not within {limit:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// P5 Task 33 (decision "P5: group KV admission in static rank mode" B), the plan's
+    /// `tiny_server tp2_static_mirror_matches_worker_ledger` in one process (the host collective
+    /// joins threads of one process only): a tp 2 `static` group on the cpu backend over
+    /// loopback `tcp` runs a mixed workload through the engine — 18 concurrent greedy requests,
+    /// `n` = 2 forks among them, 4 cancelled mid-stream, on a 32-block pool whose worst-case
+    /// reservations queue them (`kv_reservation`; worst-case admission leaves no decode short of
+    /// a block, so nothing is preempted) — with the mirror's digest checked at every step: no
+    /// divergence is counted; then two held streams pause holding KV, and the worker's real
+    /// ledger equals the leader's mirror exactly (live reservations, nothing in flight). A
+    /// deliberately skewed worker ledger makes the final check (the last plan before shutdown)
+    /// log `mirror_digest_mismatch` once. Breaks if admission skips the mirror, a reservation,
+    /// commit or release misses the worker or arrives out of order, or a divergence goes unseen.
+    #[test]
+    fn static_mirror_matches_worker_ledger() {
+        let dir = TempDir::new("engine-tp-mirror");
+        let spec = write_tiny_llama(dir.path(), 11);
+        let edit = |c: &mut turbine_core::config::Config| {
+            c.kv.block_tokens = 16;
+            // 32 blocks of 2 KiB per rank (one of the tiny model's two KV heads), one per running
+            // request at most (forks included: the executor holds `max_running_requests`
+            // sequences).
+            c.kv.gpu.max_bytes = Some(turbine_core::config::ByteSize(64 << 10));
+            c.scheduler.max_running_requests = 32;
+            c.model.max_seq_len = Some(256);
+        };
+        let run = start_static(&spec, edit, 1);
+        let StaticRun {
+            leader,
+            loaded,
+            worker,
+            worker_ledger,
+            worker_metrics,
+            metrics: _leader_metrics,
+        } = run;
+        assert_eq!(loaded.group.len(), 1, "one worker, one mirror");
+        let mirror = Arc::clone(&loaded.group[0].1);
+        let device = loaded.group[0].0.device;
+        assert_eq!(loaded.pool.total_blocks(), 32, "the small pool");
+        let (engine, tx, shared, engine_metrics) = engine_over(&leader, loaded);
+        let engine = std::thread::spawn(move || engine.run());
+        let divergences = || sum_series(&worker_metrics, "turbine_ledger_mirror_divergence_total{");
+
+        // Phase 1: the mixed workload, to the end.
+        let streams: Vec<(usize, Events)> = (0..18usize)
+            .map(|i| {
+                let prompt: Vec<u32> = std::iter::once(256)
+                    .chain((0..(6 + (i * 5) % 24) as u32).map(|t| 97 + (t * 7 + i as u32) % 26))
+                    .collect();
+                let n = if i % 5 == 2 { 2 } else { 1 };
+                let max_tokens = 8 + ((i * 11) % 40) as u32;
+                (i, submit(&tx, greedy_request(prompt, max_tokens, n), 256))
+            })
+            .collect();
+        let readers: Vec<_> = streams
+            .into_iter()
+            .map(|(i, mut rx)| {
+                std::thread::spawn(move || {
+                    if i % 4 == 1 {
+                        // Cancelled mid-stream: the client goes away after a few tokens.
+                        let mut seen = 0;
+                        while seen < 3 {
+                            match rx.blocking_recv() {
+                                Some(turbine_core::request::GenerationEvent::Token { .. }) => {
+                                    seen += 1;
+                                }
+                                Some(_) => {}
+                                None => break,
+                            }
+                        }
+                        drop(rx);
+                        return Ok(0);
+                    }
+                    read_all(&mut rx)
+                })
+            })
+            .collect();
+        for (i, r) in readers.into_iter().enumerate() {
+            let result = r.join().expect("reader");
+            assert!(result.is_ok(), "request {i}: {result:?}");
+        }
+        wait_until(Duration::from_secs(30), "the workload drained", || {
+            shared.docs().is_some_and(|d| {
+                d.scheduler.waiting + d.scheduler.prefilling + d.scheduler.decoding == 0
+            })
+        });
+        let snapshot = shared.docs().unwrap().scheduler;
+        let queued = sum_series(
+            &engine_metrics,
+            r#"turbine_admission_decisions_total{decision="queue",reason="kv_reservation"}"#,
+        );
+        eprintln!(
+            "mirror workload: {} iterations, {} preemptions, {queued} kv_reservation queueings",
+            snapshot.iterations_total, snapshot.preemptions_total
+        );
+        assert!(queued > 0.0, "the small pool queued admissions");
+        assert_eq!(divergences(), 0.0, "no divergence at any step");
+
+        // Phase 2: two held streams pause holding KV; the step that ran them carried every
+        // change before them, and nothing changes while they are paused.
+        let held: Vec<Events> = (0..2)
+            .map(|i| {
+                let prompt: Vec<u32> = std::iter::once(256).chain(100..110 + i).collect();
+                submit(&tx, greedy_request(prompt, 120, 1), 4)
+            })
+            .collect();
+        wait_until(Duration::from_secs(30), "both held streams paused", || {
+            shared.docs().is_some_and(|d| {
+                d.scheduler.paused == 2
+                    && d.scheduler.waiting + d.scheduler.prefilling + d.scheduler.decoding == 0
+            })
+        });
+        let live = mirror.usage(device, PoolKind::Kv);
+        assert!(
+            live.used + live.reserved > 0,
+            "the held streams hold KV: {live:?}"
+        );
+        assert_eq!(
+            worker_ledger.usage(device, PoolKind::Kv),
+            live,
+            "the worker's real ledger is the mirror, exactly"
+        );
+        assert_eq!(divergences(), 0.0);
+
+        // Phase 3: skew the worker's ledger; the final plan's check sees it once.
+        let skew = worker_ledger
+            .reserve(device, PoolKind::Kv, 1)
+            .expect("skew the worker's ledger");
+        drop(held);
+        drop(tx);
+        assert_eq!(engine.join().expect("engine thread"), Ok(()));
+        assert_eq!(
+            worker.join().expect("worker thread"),
+            Ok(()),
+            "the leader's shutdown stops the worker cleanly"
+        );
+        assert_eq!(
+            divergences(),
+            1.0,
+            "the skew is seen by the final check, once"
+        );
+        drop(skew);
+        assert_eq!(
+            worker_ledger.usage(device, PoolKind::Kv),
+            mirror.usage(device, PoolKind::Kv),
+            "every release reached the worker"
         );
     }
 

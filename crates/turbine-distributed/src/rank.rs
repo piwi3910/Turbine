@@ -11,7 +11,7 @@
 //! a u32 little-endian length plus a postcard body, at most 16 MiB. A closed leader socket makes
 //! a worker abort its communicator and return [`RankError::Closed`]; `Shutdown` travels both ways.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -28,10 +28,15 @@ use turbine_core::types::{BlockId, ModelFingerprint, SeqId, Vendor};
 use crate::collective::{Collective, CollectiveError};
 use crate::transport::{RankStream, Transport};
 
-/// Static-mode protocol version carried in `Hello`. 2 adds [`StepPlan::copies`].
-pub const PROTOCOL_VERSION: u16 = 2;
+/// Static-mode protocol version carried in `Hello`. 2 adds [`StepPlan::copies`]; 3 adds the
+/// mirror ledgers ([`StepPlan::ledger`], [`RankMessage::Loaded`]).
+pub const PROTOCOL_VERSION: u16 = 3;
 /// Largest frame body accepted or sent (16 MiB).
 pub const MAX_FRAME_BYTES: usize = 16 << 20;
+/// Worker → leader messages the leader has not taken yet, per link; beyond this the oldest is
+/// dropped (logged): every such message answers a leader request, so a leader that stops taking
+/// them has given up on them.
+const INBOX_CAPACITY: usize = 1024;
 
 /// One engine step, identical on every rank.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -42,6 +47,47 @@ pub struct StepPlan {
     /// leader's `n` > 1 fork copies); a plan may carry copies and no sequences.
     #[serde(default)]
     pub copies: Vec<(BlockId, BlockId)>,
+    /// `static` mode (P5 Task 33): the changes of the leader's mirror of each worker's KV
+    /// ledger since the previous plan, which that worker applies to its real ledger before the
+    /// step, and every few steps the mirror's digest after them. Empty in `local` mode.
+    #[serde(default)]
+    pub ledger: Vec<RankLedger>,
+}
+
+/// The mirror-ledger part of a [`StepPlan`] for one worker rank.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RankLedger {
+    pub rank: u32,
+    /// The mirror's KV-pool changes, in order.
+    pub changes: Vec<LedgerChange>,
+    /// The mirror's KV-pool digest once `changes` are applied (`Ledger::digest`), when the
+    /// worker should check its real ledger against it.
+    pub digest: Option<u64>,
+}
+
+/// One change of a mirror ledger's KV pool; `id` names the mirror's reservation.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LedgerChange {
+    Reserve { id: u64, bytes: u64 },
+    Commit { id: u64, bytes: u64 },
+    Release { id: u64 },
+}
+
+/// What a worker rank's memory budget holds once it loaded (P5 Task 33): the leader builds its
+/// mirror of the worker's ledger from it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RankBudget {
+    /// The worker's device index (its ledger's device).
+    pub device: u32,
+    pub budget_bytes: u64,
+    /// Every pool's capacity by pool name (`kv`, `weights`, …).
+    pub pools: Vec<(String, u64)>,
+    /// Bytes committed at load in pools other than `kv` (weights, workspace, communicator
+    /// buffers, the emergency reserve), by pool name.
+    pub committed: Vec<(String, u64)>,
+    /// Bytes of one of its KV blocks and its pool's block count.
+    pub block_bytes: u64,
+    pub blocks: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -110,7 +156,7 @@ mod unique_id_bytes {
     }
 }
 
-/// Static-mode protocol v1 messages.
+/// Static-mode protocol messages ([`PROTOCOL_VERSION`]).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum RankMessage {
     Hello {
@@ -132,6 +178,11 @@ pub enum RankMessage {
     StepPlan(StepPlan),
     Shutdown {
         reason: String,
+    },
+    /// Worker → leader once its shard and pool are loaded (v3): its memory budget.
+    Loaded {
+        rank: u32,
+        budget: RankBudget,
     },
 }
 
@@ -210,6 +261,58 @@ impl Failure {
     }
 }
 
+/// Worker → leader messages of a `static` group that answer a leader request (`Loaded`, …),
+/// each with its sender's rank, until the leader takes them.
+#[derive(Default)]
+struct Inbox {
+    queue: Mutex<VecDeque<(u32, RankMessage)>>,
+    cv: Condvar,
+}
+
+/// How often a wait on the inbox looks at the group's failure.
+const INBOX_POLL: Duration = Duration::from_millis(50);
+
+impl Inbox {
+    fn push(&self, rank: u32, msg: RankMessage) {
+        let mut q = lock(&self.queue);
+        if q.len() >= INBOX_CAPACITY
+            && let Some((from, dropped)) = q.pop_front()
+        {
+            tracing::warn!(event = "rank_inbox_full", rank = from, message = ?dropped, "rank inbox full; dropping its oldest message");
+        }
+        q.push_back((rank, msg));
+        self.cv.notify_all();
+    }
+
+    /// The first message `pick` accepts, waiting until `deadline` (`None`) or until the group
+    /// fails (that failure).
+    fn take(
+        &self,
+        deadline: Instant,
+        failure: &Failure,
+        mut pick: impl FnMut(u32, &RankMessage) -> bool,
+    ) -> Result<Option<(u32, RankMessage)>, RankError> {
+        let mut q = lock(&self.queue);
+        loop {
+            if let Some(i) = q.iter().position(|(r, m)| pick(*r, m)) {
+                return Ok(q.remove(i));
+            }
+            if let Some(e) = failure.get() {
+                return Err(e);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            q = self
+                .cv
+                .wait_timeout(q, (deadline - now).min(INBOX_POLL))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
 /// Outstanding plans of one local worker.
 struct Slots {
     outstanding: Mutex<usize>,
@@ -237,6 +340,7 @@ enum Mode {
     Static {
         links: Vec<StaticLink>,
         closing: Arc<AtomicBool>,
+        inbox: Arc<Inbox>,
     },
 }
 
@@ -431,6 +535,7 @@ impl RankRuntime {
         let depth = depth.max(1);
         let failure = Arc::new(Failure::default());
         let closing = Arc::new(AtomicBool::new(false));
+        let inbox = Arc::new(Inbox::default());
         let mut links = Vec::with_capacity(joined.len());
         for (rank, mut stream) in joined {
             stream.set_read_timeout(None).map_err(io_err)?;
@@ -452,16 +557,33 @@ impl RankRuntime {
                     }
                 })
                 .map_err(io_err)?;
-            let (f, c) = (Arc::clone(&failure), Arc::clone(&closing));
+            let (f, c, i) = (
+                Arc::clone(&failure),
+                Arc::clone(&closing),
+                Arc::clone(&inbox),
+            );
             std::thread::Builder::new()
                 .name(format!("turbine-rank-{rank}-rx"))
-                .spawn(move || match read_frame(&mut reader) {
-                    Ok(RankMessage::Shutdown { reason }) => f.set(RankError::Executor {
-                        rank,
-                        detail: reason,
-                    }),
-                    _ if c.load(Ordering::Acquire) => {}
-                    _ => f.set(RankError::Closed { rank }),
+                .spawn(move || {
+                    loop {
+                        match read_frame(&mut reader) {
+                            Ok(RankMessage::Shutdown { reason }) => {
+                                f.set(RankError::Executor {
+                                    rank,
+                                    detail: reason,
+                                });
+                                break;
+                            }
+                            Ok(msg) => i.push(rank, msg),
+                            Err(_) => {
+                                if !c.load(Ordering::Acquire) {
+                                    f.set(RankError::Closed { rank });
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    i.cv.notify_all();
                 })
                 .map_err(io_err)?;
             links.push(StaticLink {
@@ -473,10 +595,43 @@ impl RankRuntime {
         }
         tracing::info!(event = "ranks_ready", world, "every static rank joined");
         Ok(RankRuntime {
-            mode: Mode::Static { links, closing },
+            mode: Mode::Static {
+                links,
+                closing,
+                inbox,
+            },
             depth,
             failure,
         })
+    }
+
+    /// Static mode: every worker's budget from its `Loaded` message, in rank order, waiting
+    /// until `timeout` (`Timeout { missing }`) or the group fails. Local mode: none.
+    pub fn budgets(&self, timeout: Duration) -> Result<Vec<(u32, RankBudget)>, RankError> {
+        let Mode::Static { links, inbox, .. } = &self.mode else {
+            return Ok(Vec::new());
+        };
+        let deadline = Instant::now() + timeout;
+        let mut got: BTreeMap<u32, RankBudget> = BTreeMap::new();
+        while got.len() < links.len() {
+            let taken = inbox.take(deadline, &self.failure, |_, m| {
+                matches!(m, RankMessage::Loaded { .. })
+            })?;
+            match taken {
+                Some((rank, RankMessage::Loaded { budget, .. })) => {
+                    got.insert(rank, budget);
+                }
+                _ => {
+                    let missing = links
+                        .iter()
+                        .map(|l| l.rank)
+                        .filter(|r| !got.contains_key(r))
+                        .collect();
+                    return Err(RankError::Timeout { missing });
+                }
+            }
+        }
+        Ok(got.into_iter().collect())
     }
 
     /// Static mode, ranks 1..: connects to `leader` over `transport` (retrying with 50 ms
@@ -628,7 +783,7 @@ impl RankRuntime {
                     }
                 }
             }
-            Mode::Static { links, closing } => {
+            Mode::Static { links, closing, .. } => {
                 closing.store(true, Ordering::Release);
                 for l in links.iter_mut() {
                     if let Some(tx) = l.tx.take() {
@@ -659,7 +814,7 @@ impl Drop for RankRuntime {
                     w.tx = None;
                 }
             }
-            Mode::Static { links, closing } => {
+            Mode::Static { links, closing, .. } => {
                 closing.store(true, Ordering::Release);
                 for l in links.iter_mut() {
                     l.tx = None;
@@ -685,6 +840,18 @@ impl WorkerLink {
     /// The communicator unique id from `Welcome`.
     pub fn unique_id(&self) -> [u8; 128] {
         self.unique_id
+    }
+
+    /// Tells the leader this rank loaded, with its memory budget (`Loaded`, P5 Task 33).
+    pub fn loaded(&mut self, budget: RankBudget) -> Result<(), RankError> {
+        write_frame(
+            &mut self.stream,
+            &RankMessage::Loaded {
+                rank: self.rank,
+                budget,
+            },
+        )
+        .map_err(io_err)
     }
 
     /// Executes every `StepPlan` the leader sends until `Shutdown` (`Ok`). A lost leader aborts
@@ -795,6 +962,29 @@ mod tests {
                 is_prefill: true,
             }],
             copies: vec![(BlockId(4), BlockId(5))],
+            ledger: vec![RankLedger {
+                rank: 1,
+                changes: vec![
+                    LedgerChange::Reserve { id: 3, bytes: 64 },
+                    LedgerChange::Commit { id: 3, bytes: 32 },
+                    LedgerChange::Release { id: 2 },
+                ],
+                digest: Some(step.wrapping_mul(0x9E37_79B9)),
+            }],
+        }
+    }
+
+    fn budget(rank: u32) -> RankBudget {
+        RankBudget {
+            device: rank,
+            budget_bytes: 1 << 30,
+            pools: vec![
+                ("kv".into(), (1 << 20) * u64::from(rank + 1)),
+                ("weights".into(), 1 << 28),
+            ],
+            committed: vec![("weights".into(), 1 << 27)],
+            block_bytes: 1 << 16,
+            blocks: 16,
         }
     }
 
@@ -815,6 +1005,10 @@ mod tests {
             RankMessage::StepPlan(step_plan(3)),
             RankMessage::Shutdown {
                 reason: "bye".into(),
+            },
+            RankMessage::Loaded {
+                rank: 2,
+                budget: budget(2),
             },
         ];
         let mut wire = Vec::new();
@@ -916,6 +1110,60 @@ mod tests {
         );
         // The joined worker is told why and does not get a Welcome.
         assert!(good.join().unwrap().is_err());
+    }
+
+    /// P5 Task 33: every worker's `Loaded` budget reaches the leader, in rank order whatever
+    /// order they arrive in; a worker that never reports makes `budgets` fail within its timeout
+    /// naming that rank. Breaks if a budget is lost, misattributed or waited for forever.
+    #[test]
+    fn budgets_reach_the_leader() {
+        let addr = free_addr();
+        let leader = thread::spawn(move || {
+            RankRuntime::static_leader(
+                tcp(),
+                addr,
+                expect(),
+                3,
+                Duration::from_secs(5),
+                unique_id(),
+                2,
+            )
+        });
+        let (keep_tx, keep_rx) = mpsc::channel::<WorkerLink>();
+        let workers: Vec<_> = [2u32, 1]
+            .into_iter()
+            .map(|rank| {
+                let keep = keep_tx.clone();
+                thread::spawn(move || {
+                    let mut link = RankRuntime::static_worker(
+                        tcp(),
+                        addr,
+                        hello(rank, 3),
+                        Duration::from_secs(5),
+                    )
+                    .expect("welcome");
+                    if rank == 2 {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    link.loaded(budget(rank)).expect("loaded");
+                    keep.send(link).unwrap();
+                })
+            })
+            .collect();
+        let mut rt = leader.join().unwrap().expect("joined");
+        for w in workers {
+            w.join().unwrap();
+        }
+        let got = rt.budgets(Duration::from_secs(5)).expect("budgets");
+        assert_eq!(got, vec![(1, budget(1)), (2, budget(2))]);
+        let started = Instant::now();
+        match rt.budgets(Duration::from_millis(200)) {
+            Err(RankError::Timeout { missing }) => assert_eq!(missing, vec![1, 2]),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        rt.shutdown("test done");
+        drop(keep_rx);
     }
 
     /// Executes nothing; counts plans.

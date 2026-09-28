@@ -1,8 +1,17 @@
 //! Reservation ledger (P3 S-3): `reserve → commit → release`, with RAII guards that release
 //! on drop, so cancellation, request failure and preemption never leak pool bytes.
+//!
+//! Mirror ledgers (P5 Task 33, decision "P5: group KV admission in static rank mode" B): in
+//! `static` rank mode the leader keeps an exact copy of each worker rank's ledger
+//! ([`Ledger::mirror`], built from the budget the worker reports once it loaded) and admits
+//! through it like through a `local` rank's ledger. A mirror journals every change
+//! ([`LedgerOp`], [`Ledger::drain_journal`]); the leader sends the journal to the worker with its
+//! step plans, and the worker replays it on its real ledger in the same order
+//! ([`LedgerReplica`]). Both sides compare [`Ledger::digest`]s of the pool to catch a divergence.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use turbine_core::types::DeviceId;
@@ -49,10 +58,23 @@ pub enum LedgerError {
     Injected,
 }
 
+/// One change of a mirror ledger ([`Ledger::mirror`]), in the order it happened. `id` names the
+/// reservation within its ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LedgerOp {
+    Reserve { id: u64, pool: PoolKind, bytes: u64 },
+    Commit { id: u64, bytes: u64 },
+    Release { id: u64 },
+}
+
 /// Per-device pools with their capacity, committed and reserved bytes.
 #[derive(Default)]
 pub struct Ledger {
     pools: Mutex<BTreeMap<(DeviceId, PoolKind), PoolUsage>>,
+    /// The id of the next reservation handed out.
+    next_id: AtomicU64,
+    /// A mirror's journal of every change, appended under the pools lock.
+    journal: Option<Mutex<Vec<LedgerOp>>>,
     metrics: OnceLock<ReliabilityMetrics>,
     #[cfg(feature = "fault-injection")]
     injector: OnceLock<Arc<crate::fault::FaultInjector>>,
@@ -85,6 +107,69 @@ impl Ledger {
         Arc::new(ledger)
     }
 
+    /// A mirror of another process's ledger over the same `budget`: like [`Ledger::new`], and
+    /// every reservation, commit and release is journaled for [`Ledger::drain_journal`].
+    pub fn mirror(budget: &DeviceBudget) -> Arc<Ledger> {
+        let mut ledger = Arc::into_inner(Ledger::new(budget)).expect("a new ledger is unshared");
+        ledger.journal = Some(Mutex::new(Vec::new()));
+        Arc::new(ledger)
+    }
+
+    /// The changes since the last call, oldest first (always empty unless a mirror).
+    pub fn drain_journal(&self) -> Vec<LedgerOp> {
+        self.journal.as_ref().map_or_else(Vec::new, |j| {
+            std::mem::take(&mut *j.lock().unwrap_or_else(PoisonError::into_inner))
+        })
+    }
+
+    /// [`Ledger::drain_journal`] and the [`Ledger::digest`] of `pool` right after the last
+    /// drained change, read together (no change can land between them).
+    pub fn drain_journal_with_digest(
+        &self,
+        device: DeviceId,
+        pool: PoolKind,
+    ) -> (Vec<LedgerOp>, u64) {
+        let pools = self.lock();
+        let usage = pools.get(&(device, pool)).copied().unwrap_or_default();
+        let ops = self.drain_journal();
+        drop(pools);
+        (ops, digest_of(device, pool, &usage))
+    }
+
+    /// A digest of one pool's state (device, pool, capacity, committed and reserved bytes):
+    /// equal digests of a mirror and the ledger it mirrors mean the same state.
+    pub fn digest(&self, device: DeviceId, pool: PoolKind) -> u64 {
+        digest_of(device, pool, &self.usage(device, pool))
+    }
+
+    /// Appends `op` to a mirror's journal; called with the pools lock held, so the journal keeps
+    /// the ledger's order.
+    fn record(&self, op: LedgerOp) {
+        if let Some(j) = &self.journal {
+            j.lock().unwrap_or_else(PoisonError::into_inner).push(op);
+        }
+    }
+}
+
+/// FNV-1a over a pool's identity and bytes ([`Ledger::digest`]).
+fn digest_of(device: DeviceId, pool: PoolKind, u: &PoolUsage) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for word in [
+        u64::from(device.0),
+        pool as u64,
+        u.capacity,
+        u.used,
+        u.reserved,
+    ] {
+        for b in word.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+impl Ledger {
     /// Attach metrics (first call wins); publishes every pool, then every change.
     pub fn set_metrics(&self, metrics: ReliabilityMetrics) {
         // A second call keeps the first metrics: the families are process-wide anyway.
@@ -136,9 +221,12 @@ impl Ledger {
         usage.reserved += bytes;
         let snapshot = *usage;
         self.publish(device, pool, &snapshot);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.record(LedgerOp::Reserve { id, pool, bytes });
         drop(pools);
         Ok(Reservation {
             ledger: Arc::clone(self),
+            id,
             device,
             pool,
             bytes,
@@ -209,13 +297,21 @@ impl Ledger {
         }
     }
 
-    fn update(&self, device: DeviceId, pool: PoolKind, f: impl FnOnce(&mut PoolUsage)) {
+    /// Applies `f` to one pool and journals `op` (a mirror), both under the pools lock.
+    fn update(
+        &self,
+        device: DeviceId,
+        pool: PoolKind,
+        op: LedgerOp,
+        f: impl FnOnce(&mut PoolUsage),
+    ) {
         let mut pools = self.lock();
         // A Reservation exists only for a pool that `reserve` found.
         if let Some(usage) = pools.get_mut(&(device, pool)) {
             f(usage);
             let snapshot = *usage;
             self.publish(device, pool, &snapshot);
+            self.record(op);
         }
     }
 }
@@ -229,6 +325,8 @@ impl Ledger {
 /// block pool keep handling one guard per request.
 pub struct Reservation {
     ledger: Arc<Ledger>,
+    /// Unique within its ledger ([`LedgerOp`]).
+    id: u64,
     device: DeviceId,
     pool: PoolKind,
     bytes: u64,
@@ -251,7 +349,11 @@ impl Reservation {
             return;
         }
         self.committed += n;
-        self.ledger.update(self.device, self.pool, |u| {
+        let op = LedgerOp::Commit {
+            id: self.id,
+            bytes: n,
+        };
+        self.ledger.update(self.device, self.pool, op, |u| {
             u.reserved -= n;
             u.used += n;
         });
@@ -295,10 +397,87 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         let (committed, reserved) = (self.committed, self.bytes - self.committed);
-        self.ledger.update(self.device, self.pool, |u| {
+        let op = LedgerOp::Release { id: self.id };
+        self.ledger.update(self.device, self.pool, op, |u| {
             u.used -= committed;
             u.reserved -= reserved;
         });
+    }
+}
+
+/// A worker rank's real ledger following the leader's mirror of it (P5 Task 33): replays the
+/// mirror's journal in order, holding one reservation of its own per live mirror reservation,
+/// so both ledgers pass through the same states.
+pub struct LedgerReplica {
+    ledger: Arc<Ledger>,
+    device: DeviceId,
+    /// The replica's reservation of each live mirror reservation id.
+    held: BTreeMap<u64, Reservation>,
+}
+
+impl LedgerReplica {
+    /// Replays onto `device`'s pools of `ledger`.
+    pub fn new(ledger: Arc<Ledger>, device: DeviceId) -> LedgerReplica {
+        LedgerReplica {
+            ledger,
+            device,
+            held: BTreeMap::new(),
+        }
+    }
+
+    /// Applies `ops` in order. Every op that can be applied is; the first that cannot (the real
+    /// ledger refuses a reservation the mirror took, or an unknown id) is returned as the reason
+    /// once the rest are applied.
+    pub fn apply(&mut self, ops: &[LedgerOp]) -> Result<(), String> {
+        let mut first = None;
+        for op in ops {
+            let failed = match *op {
+                LedgerOp::Reserve { id, pool, bytes } => {
+                    match self.ledger.reserve(self.device, pool, bytes) {
+                        Ok(r) => {
+                            self.held.insert(id, r);
+                            None
+                        }
+                        Err(e) => Some(format!("reservation {id}: {e}")),
+                    }
+                }
+                LedgerOp::Commit { id, bytes } => match self.held.get_mut(&id) {
+                    Some(r) => {
+                        r.commit_bytes(bytes);
+                        None
+                    }
+                    None => Some(format!("commit of unknown reservation {id}")),
+                },
+                LedgerOp::Release { id } => match self.held.remove(&id) {
+                    Some(_) => None,
+                    None => Some(format!("release of unknown reservation {id}")),
+                },
+            };
+            if first.is_none() {
+                first = failed;
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// [`Ledger::digest`] of `pool` on the replica's device.
+    pub fn digest(&self, pool: PoolKind) -> u64 {
+        self.ledger.digest(self.device, pool)
+    }
+
+    /// Live reservations replayed from the mirror.
+    pub fn held(&self) -> usize {
+        self.held.len()
+    }
+
+    /// The real ledger.
+    pub fn ledger(&self) -> &Arc<Ledger> {
+        &self.ledger
+    }
+
+    /// The device whose pools it replays onto.
+    pub fn device(&self) -> DeviceId {
+        self.device
     }
 }
 
@@ -436,5 +615,93 @@ mod tests {
             ledger.reserve(DeviceId(0), PoolKind::Workspace, 1),
             Err(LedgerError::Exhausted { available: 0, .. })
         ));
+    }
+
+    /// P5 Task 33: a mirror journals every reservation, commit and release (group members
+    /// included); replaying the journal in chunks on another ledger over the same budget reaches
+    /// the same state (equal digests) after every chunk, a replica with a skewed ledger differs,
+    /// and an unknown id is reported without stopping the replay. Breaks if a change escapes the
+    /// journal or the replay reorders it.
+    #[test]
+    fn mirror_journal_replays_to_the_same_state() {
+        let budget = DeviceBudget {
+            device: DeviceId(1),
+            memory_kind: MemoryKind::Dedicated,
+            budget_bytes: 1000,
+            pools: vec![(PoolKind::Kv, 1000)],
+        };
+        let mirror = Ledger::mirror(&budget);
+        let mut replica = LedgerReplica::new(Ledger::new(&budget), DeviceId(1));
+        let leader = Ledger::new(&DeviceBudget {
+            device: DeviceId(0),
+            ..budget.clone()
+        });
+        let mut rng = 7u64;
+        let mut held: Vec<Reservation> = Vec::new();
+        for step in 0..400 {
+            match splitmix(&mut rng) % 3 {
+                0 => {
+                    let bytes = 1 + splitmix(&mut rng) % 200;
+                    // A group reservation: rank 0's carrying the mirror's as a member.
+                    if let Ok(m) = mirror.reserve(DeviceId(1), PoolKind::Kv, bytes)
+                        && let Ok(r) = leader.reserve(DeviceId(0), PoolKind::Kv, bytes)
+                    {
+                        held.push(r.with_members(vec![m]));
+                    }
+                }
+                1 if !held.is_empty() => {
+                    let i = (splitmix(&mut rng) as usize) % held.len();
+                    let part = splitmix(&mut rng) % 64;
+                    held[i].commit_bytes(part);
+                }
+                _ if !held.is_empty() => {
+                    let i = (splitmix(&mut rng) as usize) % held.len();
+                    drop(held.swap_remove(i));
+                }
+                _ => {}
+            }
+            if step % 7 == 0 {
+                replica.apply(&mirror.drain_journal()).expect("replay");
+                assert_eq!(
+                    replica.digest(PoolKind::Kv),
+                    mirror.digest(DeviceId(1), PoolKind::Kv),
+                    "step {step}"
+                );
+                assert_eq!(
+                    replica.ledger().usage(DeviceId(1), PoolKind::Kv),
+                    mirror.usage(DeviceId(1), PoolKind::Kv)
+                );
+            }
+        }
+        drop(held);
+        replica.apply(&mirror.drain_journal()).expect("replay");
+        assert_eq!(replica.held(), 0);
+        assert_eq!(replica.ledger().usage(DeviceId(1), PoolKind::Kv).used, 0);
+        assert!(
+            Ledger::new(&budget).drain_journal().is_empty(),
+            "not a mirror"
+        );
+
+        // A skewed real ledger: the digests differ.
+        let _skew = replica
+            .ledger()
+            .reserve(DeviceId(1), PoolKind::Kv, 3)
+            .unwrap();
+        assert_ne!(
+            replica.digest(PoolKind::Kv),
+            mirror.digest(DeviceId(1), PoolKind::Kv)
+        );
+        let err = replica
+            .apply(&[
+                LedgerOp::Commit { id: 99, bytes: 1 },
+                LedgerOp::Reserve {
+                    id: 100,
+                    pool: PoolKind::Kv,
+                    bytes: 5,
+                },
+            ])
+            .unwrap_err();
+        assert!(err.contains("unknown reservation 99"), "{err}");
+        assert_eq!(replica.held(), 1, "the later op still applied");
     }
 }
