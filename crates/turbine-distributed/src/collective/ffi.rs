@@ -750,8 +750,6 @@ pub struct NcclCollective {
     world: usize,
     op_timeout: Duration,
     watchdog: Option<JoinHandle<()>>,
-    /// A call refused under graph capture was logged.
-    graph_refusal_logged: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for NcclCollective {
@@ -873,7 +871,6 @@ impl NcclCollective {
             world,
             op_timeout,
             watchdog: Some(watchdog),
-            graph_refusal_logged: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -912,20 +909,6 @@ impl NcclCollective {
                 Err(self.shared.after_abort())
             }
         }
-    }
-
-    /// `Err` (refused, nothing enqueued) while `stream` is captured into a graph
-    /// ([`super::RouteReason::GraphCaptureRefused`]).
-    fn refuse_captured(&self, op: CollectiveOp, stream: &StreamRef) -> Result<(), CollectiveError> {
-        if super::capturing(stream) {
-            return Err(super::refuse_captured(
-                op,
-                self.shared.api.backend_name(),
-                self.shared.metrics.as_ref(),
-                &self.graph_refusal_logged,
-            ));
-        }
-        Ok(())
     }
 
     /// Runs `call` as operation `op` of `bytes`: watchdog, metrics and error accounting.
@@ -1017,7 +1000,6 @@ impl Collective for NcclCollective {
     ) -> Result<(), CollectiveError> {
         let (dt, count) = reduce_type(dtype, buf.len())?;
         let (ptr, s, redop) = (device_ptr(buf), native_stream(stream), reduce_op(op));
-        self.refuse_captured(CollectiveOp::AllReduce, stream)?;
         let f = self.shared.api.fns.all_reduce;
         self.run(CollectiveOp::AllReduce, buf.len(), |comm| {
             // SAFETY: `f` comes from the library the NcclApi keeps loaded; `comm` is live under
@@ -1039,7 +1021,6 @@ impl Collective for NcclCollective {
             return Err(CollectiveError::ShapeMismatch);
         }
         let (src, dst, s) = (device_ptr(send), device_ptr(recv), native_stream(stream));
-        self.refuse_captured(CollectiveOp::AllGather, stream)?;
         let f = self.shared.api.fns.all_gather;
         self.run(CollectiveOp::AllGather, count, |comm| {
             // SAFETY: as in all_reduce; `src` holds `count` bytes and `dst` (borrowed mutably)
@@ -1066,7 +1047,6 @@ impl Collective for NcclCollective {
             native_stream(stream),
             reduce_op(op),
         );
-        self.refuse_captured(CollectiveOp::ReduceScatter, stream)?;
         let f = self.shared.api.fns.reduce_scatter;
         self.run(CollectiveOp::ReduceScatter, send.len(), |comm| {
             // SAFETY: as in all_reduce; `src` holds world × `count` elements and `dst`
@@ -1088,7 +1068,6 @@ impl Collective for NcclCollective {
             return Err(CollectiveError::ShapeMismatch);
         }
         let (ptr, count, s) = (device_ptr(buf), buf.len(), native_stream(stream));
-        self.refuse_captured(CollectiveOp::Broadcast, stream)?;
         let f = self.shared.api.fns.broadcast;
         self.run(CollectiveOp::Broadcast, count, |comm| {
             // SAFETY: as in all_reduce; in place on `count` bytes of the caller's buffer.
@@ -1109,7 +1088,6 @@ impl Collective for NcclCollective {
             return Err(CollectiveError::ShapeMismatch);
         }
         let (ptr, count, s) = (device_ptr(buf), buf.len(), native_stream(stream));
-        self.refuse_captured(CollectiveOp::Send, stream)?;
         let f = self.shared.api.fns.send;
         self.run(CollectiveOp::Send, count, |comm| {
             // SAFETY: as in all_reduce; ncclSend only reads `count` bytes of the caller's
@@ -1131,7 +1109,6 @@ impl Collective for NcclCollective {
             return Err(CollectiveError::ShapeMismatch);
         }
         let (ptr, count, s) = (device_ptr(buf), buf.len(), native_stream(stream));
-        self.refuse_captured(CollectiveOp::Recv, stream)?;
         let f = self.shared.api.fns.recv;
         self.run(CollectiveOp::Recv, count, |comm| {
             // SAFETY: as in all_reduce; ncclRecv writes `count` bytes of the caller's buffer,
