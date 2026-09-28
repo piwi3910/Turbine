@@ -288,6 +288,35 @@ fn gemm_rows_are_batch_invariant() {
     if !require_backend("hip") {
         return;
     }
+    // Fused Q/K/V, O (and unfused Q, K or V), router, LM head.
+    olmoe_gemm_rows(&[(3 * HIDDEN, HIDDEN), (HIDDEN, HIDDEN)], VOCAB);
+}
+
+/// [`gemm_rows_are_batch_invariant`] for the per-rank OLMoE GEMMs at tensor parallelism 2
+/// (`turbine_model::tp::rank_config`: 8 of 16 heads, half the vocabulary): fused Q/K/V
+/// 3,072 × 2,048, unfused Q, K or V 1,024 × 2,048, O 2,048 × 1,024, the replicated router and
+/// the LM head's shard 25,152 × 2,048 (decision 2026-09-28, "P5: bit-exact prefix reuse under
+/// tensor parallelism", B). One device: the shapes, not the collective, are under test.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn olmoe_tp2_gemm_rows_are_batch_invariant() {
+    if !require_backend("hip") {
+        return;
+    }
+    olmoe_gemm_rows(
+        &[
+            (3 * HIDDEN / 2, HIDDEN),
+            (HIDDEN / 2, HIDDEN),
+            (HIDDEN, HIDDEN / 2),
+        ],
+        VOCAB / 2,
+    );
+}
+
+/// Asserts the OLMoE-style GEMMs (any step: decode rows too) row-invariant: BF16-out
+/// projections `(n, k)` at 1 to 2,048 rows, the router (F32 logits) and an LM head of
+/// `vocab_rows` rows (F32 logits, 1 to 64 sequences).
+fn olmoe_gemm_rows(projections: &[(usize, usize)], vocab_rows: usize) {
     let h = setup();
     let mut rng = Rng(11);
     let tokens = [
@@ -295,24 +324,17 @@ fn gemm_rows_are_batch_invariant() {
     ];
     let seqs = [1, 2, 3, 4, 7, 8, 15, 16, 17, 32, 33, 64];
     let mut out = Vec::new();
-    out.extend(gemm_case(
-        &h,
-        &mut rng,
-        3 * HIDDEN,
-        HIDDEN,
-        DType::BF16,
-        &tokens,
-        ANY_STEP,
-    ));
-    out.extend(gemm_case(
-        &h,
-        &mut rng,
-        HIDDEN,
-        HIDDEN,
-        DType::BF16,
-        &tokens,
-        ANY_STEP,
-    ));
+    for &(n, k) in projections {
+        out.extend(gemm_case(
+            &h,
+            &mut rng,
+            n,
+            k,
+            DType::BF16,
+            &tokens,
+            ANY_STEP,
+        ));
+    }
     out.extend(gemm_case(
         &h,
         &mut rng,
@@ -325,7 +347,7 @@ fn gemm_rows_are_batch_invariant() {
     out.extend(gemm_case(
         &h,
         &mut rng,
-        VOCAB,
+        vocab_rows,
         HIDDEN,
         DType::F32,
         &seqs,
@@ -353,10 +375,57 @@ fn llama_prefill_gemm_rows_are_batch_invariant() {
     if !require_backend("hip") {
         return;
     }
-    const L_HIDDEN: usize = 3072;
-    const L_KV: usize = 1024;
-    const L_INTER: usize = 8192;
-    const L_VOCAB: usize = 128_256;
+    llama_prefill_gemm_rows(
+        &[
+            (L_HIDDEN + 2 * L_KV, L_HIDDEN),
+            (L_HIDDEN, L_HIDDEN),
+            (L_KV, L_HIDDEN),
+            (2 * L_INTER, L_HIDDEN),
+            (L_INTER, L_HIDDEN),
+            (L_HIDDEN, L_INTER),
+        ],
+        L_VOCAB,
+    );
+}
+
+/// [`llama_prefill_gemm_rows_are_batch_invariant`] for the per-rank Llama-3.2-3B GEMMs at
+/// tensor parallelism 2 (`turbine_model::tp::rank_config`: 12 of 24 query heads, 4 of 8 KV
+/// heads, half the FFN and vocabulary): fused Q/K/V 2,560 × 3,072, unfused Q 1,536 × 3,072 and
+/// K or V 512 × 3,072, O 3,072 × 1,536, fused gate/up 8,192 × 3,072 (the tp 1 unfused shape),
+/// unfused gate or up 4,096 × 3,072, down 3,072 × 4,096 and the LM head's shard 64,128 × 3,072:
+/// `kv_gpu prefix_reuse_*_tp2` is bit-exact only with these (decision 2026-09-28, "P5:
+/// bit-exact prefix reuse under tensor parallelism", B). One device: the shapes, not the
+/// collective, are under test.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn llama_tp2_prefill_gemm_rows_are_batch_invariant() {
+    if !require_backend("hip") {
+        return;
+    }
+    llama_prefill_gemm_rows(
+        &[
+            ((L_HIDDEN + 2 * L_KV) / 2, L_HIDDEN),
+            (L_HIDDEN / 2, L_HIDDEN),
+            (L_KV / 2, L_HIDDEN),
+            (L_HIDDEN, L_HIDDEN / 2),
+            (L_INTER, L_HIDDEN),
+            (L_INTER / 2, L_HIDDEN),
+            (L_HIDDEN, L_INTER / 2),
+        ],
+        L_VOCAB / 2,
+    );
+}
+
+// Llama-3.2-3B shapes.
+const L_HIDDEN: usize = 3072;
+const L_KV: usize = 1024;
+const L_INTER: usize = 8192;
+const L_VOCAB: usize = 128_256;
+
+/// Asserts the BF16-out projections `(n, k)` at 1 to 2,048 rows and an LM head of `vocab_rows`
+/// rows (F32 logits, 1 to 64 sequences) row-invariant in prefill steps, on a heavy-tailed
+/// target row.
+fn llama_prefill_gemm_rows(projections: &[(usize, usize)], vocab_rows: usize) {
     let h = setup();
     let mut rng = Rng(13);
     let tokens = [
@@ -368,20 +437,13 @@ fn llama_prefill_gemm_rows_are_batch_invariant() {
         heavy_target: true,
     };
     let mut out = Vec::new();
-    for (n, k) in [
-        (L_HIDDEN + 2 * L_KV, L_HIDDEN),
-        (L_HIDDEN, L_HIDDEN),
-        (L_KV, L_HIDDEN),
-        (2 * L_INTER, L_HIDDEN),
-        (L_INTER, L_HIDDEN),
-        (L_HIDDEN, L_INTER),
-    ] {
+    for &(n, k) in projections {
         out.extend(gemm_case(&h, &mut rng, n, k, DType::BF16, &tokens, prefill));
     }
     out.extend(gemm_case(
         &h,
         &mut rng,
-        L_VOCAB,
+        vocab_rows,
         L_HIDDEN,
         DType::F32,
         &seqs,

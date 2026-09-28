@@ -1,6 +1,6 @@
 //! Phase 4 KV correctness on the GPU (P4 S-3, S-11, S-17; plan Task 16).
 //!
-//! Both tests are ignored (lab only, run by `scripts/lab-test.sh novanas`, later `dgx-spark`):
+//! The GPU tests are ignored (lab only, run by `scripts/lab-test.sh novanas`, later `dgx-spark`):
 //! they start `turbine-server` on `TURBINE_TEST_MODEL_DIR` (Llama-3.2-3B-Instruct BF16) with
 //! `scripts/lab/phase4-novanas.yaml` and `--set` overrides, and compare greedy completions.
 //!
@@ -16,6 +16,10 @@
 //!   tokens to prefill, since a one-token step is decode-shaped — and gives the cold answer bit
 //!   for bit (text and every token's logprob): Llama's prefill GEMMs must compute a row alike at
 //!   any row count (decision 2026-09-27, "Pre-Phase-5 #1 follow-up").
+//! - `prefix_reuse_matches_cold_tp2`, `prefix_reuse_suffix_lengths_match_cold_tp2`: the same at
+//!   tensor parallelism 2 over both R9700s (P5 Task 29: the tp 2 per-rank GEMM shapes have
+//!   invariant rows too); they need `scripts/lab-test.sh novanas --gpus 2` and say they skip in
+//!   a one-GPU Job.
 //! - `nvme_round_trip_matches_cold`: with 1 GiB of L1 (L0 demotes by capacity past 70 %)
 //!   and the NVMe tier at `/home/piwi/turbine-kv`, prompt A runs cold, long filler prompts push
 //!   its blocks through L1 to L2 (L0 → L2 on unified memory), then A runs again: the same greedy
@@ -334,19 +338,84 @@ fn prefix_reuse_matches_cold() {
     if !require_backend("hip") {
         return;
     }
+    prefix_reuse_matches_cold_with(&[]);
+}
+
+/// [`prefix_reuse_matches_cold`] at tensor parallelism 2 over both R9700s: every rank's
+/// projections have half-size shapes, which need their own invariant rows in the tuned GEMM
+/// table (decision 2026-09-28, "P5: bit-exact prefix reuse under tensor parallelism", B).
+#[test]
+#[ignore = "lab, 2 GPUs (scripts/lab-test.sh novanas --gpus 2): HIP, libturbine_hip.so, Llama-3.2-3B"]
+fn prefix_reuse_matches_cold_tp2() {
+    if !require_backend("hip") || !two_gpus("prefix_reuse_matches_cold_tp2") {
+        return;
+    }
+    prefix_reuse_matches_cold_with(&tp2_sets());
+}
+
+/// Whether the lab Job holds two R9700s: `TURBINE_EXPECT_AMD`, the GPU count
+/// `scripts/lab-test.sh novanas [--gpus 2]` gives its Job. A one-GPU Job (the default run)
+/// skips the tp 2 tests with a line saying so; outside a lab Job (unset) they fail.
+fn two_gpus(test: &str) -> bool {
+    let gpus = std::env::var("TURBINE_EXPECT_AMD").unwrap_or_else(|_| {
+        panic!("{test}: TURBINE_EXPECT_AMD unset; run scripts/lab-test.sh novanas --gpus 2")
+    });
+    let n: u32 = gpus
+        .parse()
+        .unwrap_or_else(|_| panic!("TURBINE_EXPECT_AMD={gpus:?}"));
+    if n < 2 {
+        println!("{test}: skipped, the Job holds {n} GPU (scripts/lab-test.sh novanas --gpus 2)");
+    }
+    n >= 2
+}
+
+/// The `--set` overrides of the tp 2 variants: both R9700s as one tensor-parallel group over
+/// RCCL (local rank mode). The L1/L2 tiers are off: these tests are about the prefill rows of a
+/// warm suffix, which reuses L0 blocks only.
+fn tp2_sets() -> Vec<String> {
+    [
+        "parallel.tensor_parallel_size=2",
+        "parallel.devices=[0,1]",
+        "parallel.collective_backend=rccl",
+        "kv.cpu.enabled=false",
+        "kv.nvme.enabled=false",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// Asserts the server runs the tensor parallelism `sets` asks for (1 when they name none).
+fn assert_tp(server: &LabServer, sets: &[String]) {
+    let want = if sets.iter().any(|s| s == "parallel.tensor_parallel_size=2") {
+        2
+    } else {
+        1
+    };
+    let (status, text) = request(server.addr, "GET", "/turbine/v1/status", None);
+    assert_eq!(status, 200, "{text}");
+    let v: Value = serde_json::from_str(&text).expect("status JSON");
+    let tp = v["parallel"]["tp"].as_u64().unwrap_or(1);
+    assert_eq!(tp, want, "tensor parallelism: {}", v["parallel"]);
+}
+
+/// [`prefix_reuse_matches_cold`] on servers started with the extra overrides `sets`.
+fn prefix_reuse_matches_cold_with(sets: &[String]) {
     let _gpu = one_server_at_a_time();
     let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
     // About 400 tokens: three full 128-token blocks each.
     let prompts: Vec<String> = (1..=5).map(|s| prompt(s, 350)).collect();
 
+    let cold_sets = [sets, &["kv.prefix_sharing=false".to_string()]].concat();
     let cold: Vec<(String, u64, u64)> = {
-        let server = LabServer::start(&model_dir, &["kv.prefix_sharing=false".into()]);
+        let server = LabServer::start(&model_dir, &cold_sets);
+        assert_tp(&server, sets);
         prompts
             .iter()
             .map(|p| server.complete(p, ANSWER_TOKENS))
             .collect()
     };
-    let server = LabServer::start(&model_dir, &[]);
+    let server = LabServer::start(&model_dir, sets);
+    assert_tp(&server, sets);
     for (i, p) in prompts.iter().enumerate() {
         let first = server.complete(p, ANSWER_TOKENS);
         let warm = server.complete(p, ANSWER_TOKENS);
@@ -376,6 +445,23 @@ fn prefix_reuse_suffix_lengths_match_cold() {
     if !require_backend("hip") {
         return;
     }
+    prefix_reuse_suffix_lengths_match_cold_with(&[]);
+}
+
+/// [`prefix_reuse_suffix_lengths_match_cold`] at tensor parallelism 2 over both R9700s (see
+/// [`prefix_reuse_matches_cold_tp2`]).
+#[test]
+#[ignore = "lab, 2 GPUs (scripts/lab-test.sh novanas --gpus 2): HIP, libturbine_hip.so, Llama-3.2-3B"]
+fn prefix_reuse_suffix_lengths_match_cold_tp2() {
+    if !require_backend("hip") || !two_gpus("prefix_reuse_suffix_lengths_match_cold_tp2") {
+        return;
+    }
+    prefix_reuse_suffix_lengths_match_cold_with(&tp2_sets());
+}
+
+/// [`prefix_reuse_suffix_lengths_match_cold`] on servers started with the extra overrides
+/// `sets`.
+fn prefix_reuse_suffix_lengths_match_cold_with(sets: &[String]) {
     let _gpu = one_server_at_a_time();
     let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
     const BLOCK: u32 = 128;
@@ -400,14 +486,17 @@ fn prefix_reuse_suffix_lengths_match_cold() {
         })
         .collect();
 
+    let cold_sets = [sets, &["kv.prefix_sharing=false".to_string()]].concat();
     let cold: Vec<IdAnswer> = {
-        let server = LabServer::start(&model_dir, &["kv.prefix_sharing=false".into()]);
+        let server = LabServer::start(&model_dir, &cold_sets);
+        assert_tp(&server, sets);
         prompts
             .iter()
             .map(|(_, target)| server.complete_ids(target, ANSWER_TOKENS))
             .collect()
     };
-    let server = LabServer::start(&model_dir, &[]);
+    let server = LabServer::start(&model_dir, sets);
+    assert_tp(&server, sets);
     let mut failed = Vec::new();
     for (((primer, target), &(blocks, suffix)), cold) in prompts.iter().zip(&CASES).zip(&cold) {
         server.complete_ids(primer, ANSWER_TOKENS);
@@ -431,7 +520,13 @@ fn prefix_reuse_suffix_lengths_match_cold() {
                 .iter()
                 .zip(&warm.logprobs)
                 .position(|(c, w)| c.to_bits() != w.to_bits());
-            println!("blocks {blocks} suffix {suffix}: warm differs from cold at token {first:?}");
+            let at = |l: &[f64]| first.and_then(|i| l.get(i).copied());
+            println!(
+                "blocks {blocks} suffix {suffix}: warm differs from cold at token {first:?} \
+                 (logprob cold {:?} warm {:?})",
+                at(&cold.logprobs),
+                at(&warm.logprobs)
+            );
             failed.push(format!("blocks {blocks} suffix {suffix}"));
         }
     }
