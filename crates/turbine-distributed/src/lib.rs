@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 
 pub mod collective;
+pub mod plan;
 
 #[cfg(test)]
 mod registry_conformance {

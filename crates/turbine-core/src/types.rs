@@ -143,6 +143,11 @@ pub struct SeqId(pub u64);
 #[serde(transparent)]
 pub struct BlockId(pub u32);
 
+/// Data-parallel replica index (P5); rendered as a decimal `replica` label.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReplicaId(pub u32);
+
 /// Request priority (the vLLM `priority` extension): lower is served first; default 0
 /// (CONFLICT C-10).
 #[derive(
