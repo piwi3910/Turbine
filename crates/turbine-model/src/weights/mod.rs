@@ -16,7 +16,7 @@ use turbine_core::types::DType;
 use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
 
 use crate::ModelError;
-use crate::config::ModelArchConfig;
+use crate::config::{self, ModelArchConfig};
 use crate::loader::WeightSlot;
 use crate::safetensors::TensorEntry;
 
@@ -24,11 +24,15 @@ pub mod awq;
 pub mod bf16;
 mod common;
 pub mod ct_fp8;
+pub mod ct_mxfp4;
 pub mod ct_pack_int4;
 mod fp8;
 pub mod gptq;
 pub mod hf_fp8;
 mod int4;
+mod mxfp4;
+pub mod openai_mxfp4;
+pub mod quark_mxfp4;
 
 pub use bf16::Bf16;
 
@@ -255,6 +259,9 @@ static WEIGHT_FORMATS: Registry<dyn WeightFormat> = Registry::new(
         &awq::AWQ,
         &gptq::GPTQ,
         &ct_pack_int4::CT_PACK_INT4,
+        &ct_mxfp4::CT_MXFP4,
+        &quark_mxfp4::QUARK_MXFP4,
+        &openai_mxfp4::OPENAI_MXFP4,
     ],
 );
 
@@ -280,10 +287,31 @@ pub(crate) fn copy_checkpoint(from: &Path, to: &Path) -> Result<(), ModelError> 
     Ok(())
 }
 
+/// The containers the umbrella reserves for the deferred `phase-2b-nvidia` (NVFP4, ModelOpt):
+/// their refusal names that track instead of "no format".
+fn reserved_for_nvidia(top: &serde_json::Value) -> Option<ModelError> {
+    let q = top.get("quantization_config").filter(|q| !q.is_null())?;
+    let text = |k: &str| q.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let container = match (text("quant_method"), text("format")) {
+        ("modelopt", _) => "modelopt",
+        (_, "nvfp4-pack-quantized") => "compressed-tensors nvfp4-pack-quantized",
+        _ => return None,
+    };
+    Some(config::unsupported(
+        "quantization_config",
+        container,
+        "phase-2b-nvidia: NVFP4 and ModelOpt checkpoints arrive with NVIDIA support",
+    ))
+}
+
 /// The format of a top-level `config.json`: the first registered format whose
 /// [`WeightFormat::check_config`] accepts it, configured from it
-/// ([`WeightFormat::configure`], whose refusal is returned), else the first format's refusal.
+/// ([`WeightFormat::configure`], whose refusal is returned); a container reserved for the
+/// deferred NVIDIA track is refused naming `phase-2b-nvidia`; else the first format's refusal.
 pub fn detect(top: &serde_json::Value) -> Result<Arc<dyn WeightFormat>, ModelError> {
+    if let Some(err) = reserved_for_nvidia(top) {
+        return Err(err);
+    }
     let mut first_err = None;
     for format in registry().iter() {
         match format.check_config(top) {
@@ -402,8 +430,27 @@ mod tests {
         }
     }
 
-    /// Phase 6a S-3 (FP8 part; INT4 and MXFP4 join with Tasks 9 and 10): tiny checkpoints
-    /// written in each FP8 variant are detected as the right packaging and column, with the
+    /// A Quark MXFP4 `quantization_config` (weight-only, or W4A4 with `a4`).
+    fn quark(a4: bool) -> serde_json::Value {
+        let mx = |dynamic: bool| {
+            json!({"dtype": "fp4", "qscheme": "per_group", "group_size": 32,
+                   "scale_format": "e8m0", "is_dynamic": dynamic, "round_method": "half_even",
+                   "scale_calculation_mode": "even"})
+        };
+        json!({
+            "quant_method": "quark",
+            "global_quant_config": {"weight": mx(false),
+                                    "input_tensors": if a4 { mx(true) } else { json!(null) },
+                                    "output_tensors": null, "bias": null},
+            "exclude": ["lm_head"],
+            "export": {"weight_format": "real_quantized", "pack_method": "reorder"},
+            "algo_config": [{"name": "gptq", "desc_act": true, "static_groups": true}],
+            "layer_quant_config": {}, "layer_type_quant_config": {}, "kv_cache_quant_config": {},
+        })
+    }
+
+    /// Phase 6a S-2, S-3: tiny checkpoints written in each FP8, INT4 and MXFP4 variant (all
+    /// nine packagings) are detected as the right packaging and column, with the
     /// right scheme on a projection, `BF16` on the LM head, and the right activation mode;
     /// unsupported variants are refused `quant_scheme_unsupported` naming the field. Breaks if
     /// a container maps to the wrong column, scheme or activation, or a refusal loses its
@@ -506,6 +553,39 @@ mod tests {
                 },
                 ActivationQuant::None,
             ),
+            (
+                json!({"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+                       "ignore": ["lm_head"],
+                       "config_groups": {"group_0": {"targets": ["Linear"],
+                           "input_activations": null,
+                           "weights": {"num_bits": 4, "type": "float", "strategy": "group",
+                                       "group_size": 32, "actorder": "static"}}}}),
+                "ct_mxfp4",
+                WeightFormatColumn::Mxfp4,
+                QuantScheme::Mxfp4,
+                ActivationQuant::None,
+            ),
+            (
+                quark(false),
+                "quark_mxfp4",
+                WeightFormatColumn::Mxfp4,
+                QuantScheme::Mxfp4,
+                ActivationQuant::None,
+            ),
+            (
+                quark(true),
+                "quark_mxfp4",
+                WeightFormatColumn::Mxfp4A4,
+                QuantScheme::Mxfp4,
+                ActivationQuant::Mxfp4Emulated,
+            ),
+            (
+                json!({"quant_method": "mxfp4", "modules_to_not_convert": ["lm_head"]}),
+                "openai_mxfp4",
+                WeightFormatColumn::Mxfp4,
+                QuantScheme::Mxfp4,
+                ActivationQuant::None,
+            ),
         ];
         for (i, (q, name, column, scheme, activation)) in cases.into_iter().enumerate() {
             let fixture = write_tiny_quantized(&tmp.path().join(i.to_string()), 3, &q, 128, 128);
@@ -559,6 +639,22 @@ mod tests {
         );
         let (field, _) = refused(ct("channel", json!(null), act("token", false, json!(null))));
         assert_eq!(field, "input_activations");
+
+        // MXFP4 refusals: a compressed-tensors group of 64; NVFP4 names the NVIDIA track.
+        let (field, supported) = refused(json!({
+            "quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+            "config_groups": {"group_0": {"targets": ["Linear"], "input_activations": null,
+                "weights": {"num_bits": 4, "type": "float", "strategy": "group",
+                            "group_size": 64}}}}));
+        assert_eq!(field, "weights.group_size");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
+        let (field, supported) = refused(json!({
+            "quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized"}));
+        assert_eq!(field, "quantization_config");
+        assert!(supported.starts_with("phase-2b-nvidia"), "{supported}");
 
         // INT4 refusals: 3-bit GPTQ, act order, AWQ GEMV, a group of 16.
         let (field, supported) =

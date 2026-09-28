@@ -196,7 +196,7 @@ Interfaces:
 
 ## Task 10: MXFP4 packagings `ct_mxfp4`, `quark_mxfp4`, `openai_mxfp4` (host path)
 
-Files: `crates/turbine-model/src/weights/ct_mxfp4.rs`, `crates/turbine-model/src/weights/quark_mxfp4.rs`, `crates/turbine-model/src/weights/openai_mxfp4.rs` (new), `crates/turbine-model/src/weights/mod.rs` (registry), `crates/turbine-model/src/testing/tiny.rs` (writers for the three packagings, Quark weight-only and W4A4), `crates/turbine-model/tests/tiny_model.rs`
+Files: `crates/turbine-model/src/weights/ct_mxfp4.rs`, `crates/turbine-model/src/weights/quark_mxfp4.rs`, `crates/turbine-model/src/weights/openai_mxfp4.rs` (new), `crates/turbine-model/src/weights/mxfp4.rs` (new: the shared MXFP4 layout and its tiny writer, for the three packagings, Quark weight-only and W4A4), `crates/turbine-model/src/weights/mod.rs` (registry; NVFP4 / ModelOpt refused naming `phase-2b-nvidia`), `crates/turbine-model/tests/tiny_model.rs`
 Interfaces:
 
 - repack target (`MXFP4` scheme): `data` U8 `[n, k/2]` E2M1 codes low nibble first, `scales` U8 `[n, k/32]` E8M0

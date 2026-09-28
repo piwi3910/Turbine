@@ -91,7 +91,17 @@ mod registry_conformance {
         names_are(
             reg,
             "weight_format",
-            &["bf16", "ct_fp8", "hf_fp8", "awq", "gptq", "ct_pack_int4"],
+            &[
+                "bf16",
+                "ct_fp8",
+                "hf_fp8",
+                "awq",
+                "gptq",
+                "ct_pack_int4",
+                "ct_mxfp4",
+                "quark_mxfp4",
+                "openai_mxfp4",
+            ],
         );
         passes(weights_suite(reg));
     }

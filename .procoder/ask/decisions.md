@@ -1621,3 +1621,10 @@ Total 41,185,550,352 bytes. The 8B BF16 download waited while free disk was ≈ 
 4. AWQ `modules_to_not_convert` entries match as substrings of the module name (AutoAWQ / vLLM), compressed-tensors `ignore` entries as compressed-tensors defines them.
 5. compressed-tensors `pack-quantized` is served symmetric only and without `actorder` (refused `gptq_act_order`), matching the fixture scripts.
 
+**MXFP4 packagings (6a Task 10, lead), provisional, pending user review:**
+
+1. compressed-tensors `actorder: static` (the FabioTrindade 8B checkpoint) and Quark GPTQ `desc_act: true` with `static_groups: true` (the matmelis 3B checkpoint) are served: static groups keep the weights in order, so nothing is permuted at run time; other act orders are refused `gptq_act_order`. The same `static` acceptance now applies to compressed-tensors INT4.
+2. Quark checkpoints are served only with an empty `layer_quant_config` / `layer_type_quant_config` / `kv_cache_quant_config`, `export.weight_format: real_quantized`, `pack_method` `reorder` or `order`, weights and inputs `fp4 per_group 32 e8m0 half_even even`; anything else is refused `quant_scheme_unsupported`.
+3. Ignore entries written as globs (Quark `exclude`, OpenAI `modules_to_not_convert`) match with `*` as any text from the start of the module name.
+4. `quant_method: modelopt` and compressed-tensors `nvfp4-pack-quantized` are refused naming `phase-2b-nvidia` before any format is tried.
+

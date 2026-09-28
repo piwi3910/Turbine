@@ -935,7 +935,7 @@ fn input_scales(dir: &Path) -> HashMap<String, f32> {
         .collect()
 }
 
-/// Phase 6a S-5 (FP8 and INT4 parts): each FP8 and INT4 tiny checkpoint on the CPU provider — prefill and greedy
+/// Phase 6a S-5: each FP8, INT4 and MXFP4 tiny checkpoint on the CPU provider — prefill and greedy
 /// decode — gives logits within 1e-3 of the naive model over its dequantized BF16 twin with
 /// the checkpoint's activation quantization applied to every projection input (static scales:
 /// the largest part's for a fused projection); weight-only checkpoints equal the twin run on
@@ -944,6 +944,20 @@ fn input_scales(dir: &Path) -> HashMap<String, f32> {
 /// decoder runs the BF16 GEMM on quantized bytes.
 #[test]
 fn quantized_matches_dequantized_bf16() {
+    let quark = |a4: bool| {
+        let mx = |dynamic: bool| {
+            serde_json::json!({"dtype": "fp4", "qscheme": "per_group", "group_size": 32,
+                               "scale_format": "e8m0", "is_dynamic": dynamic,
+                               "round_method": "half_even", "scale_calculation_mode": "even"})
+        };
+        serde_json::json!({
+            "quant_method": "quark",
+            "global_quant_config": {"weight": mx(false),
+                                    "input_tensors": if a4 { mx(true) } else { serde_json::Value::Null }},
+            "exclude": ["lm_head"],
+            "export": {"weight_format": "real_quantized", "pack_method": "reorder"},
+        })
+    };
     let tmp = TempDir::new("tiny-model-quantized");
     let ct = |strategy: &str, block: serde_json::Value, input: serde_json::Value| {
         serde_json::json!({
@@ -1015,6 +1029,22 @@ fn quantized_matches_dequantized_bf16() {
             "gptq asym v1",
             serde_json::json!({"quant_method": "gptq", "bits": 4, "group_size": 64,
                                "desc_act": false, "sym": false}),
+            128,
+        ),
+        (
+            "ct mxfp4",
+            serde_json::json!({"quant_method": "compressed-tensors",
+                               "format": "mxfp4-pack-quantized", "ignore": ["lm_head"],
+                               "config_groups": {"group_0": {"targets": ["Linear"],
+                                   "weights": {"num_bits": 4, "type": "float",
+                                               "strategy": "group", "group_size": 32}}}}),
+            128,
+        ),
+        ("quark mxfp4 w4a16", quark(false), 128),
+        ("quark mxfp4 w4a4", quark(true), 128),
+        (
+            "openai mxfp4",
+            serde_json::json!({"quant_method": "mxfp4", "modules_to_not_convert": ["lm_head"]}),
             128,
         ),
         (
