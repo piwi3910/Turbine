@@ -12,6 +12,7 @@ pub mod ffi;
 pub mod host;
 pub mod hostmem;
 pub mod nccl_api;
+pub mod verify;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -253,6 +254,8 @@ pub enum CollectiveErrorKind {
     Timeout,
     RemoteAbort,
     Backend,
+    /// `parallel.collective.verify` found ranks holding different outputs of one collective.
+    Corrupt,
 }
 
 impl CollectiveErrorKind {
@@ -261,6 +264,7 @@ impl CollectiveErrorKind {
             CollectiveErrorKind::Timeout => "timeout",
             CollectiveErrorKind::RemoteAbort => "remote_abort",
             CollectiveErrorKind::Backend => "backend",
+            CollectiveErrorKind::Corrupt => "corrupt",
         }
     }
 }

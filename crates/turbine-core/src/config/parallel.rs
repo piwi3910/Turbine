@@ -169,6 +169,10 @@ pub struct CollectiveTimeouts {
     /// All-reduces of at least this many bytes run on the `hostmem` copy-engine path (kernel ABI
     /// v2.8; P5 Task 32) instead of its kernels or RCCL; `null` (default): off until benched.
     pub hostmem_dma_min_bytes: Option<ByteSize>,
+    /// Every all-reduce, all-gather and broadcast is checked across ranks after it completes
+    /// (a synchronize, a read-back, a hash all-gather); a mismatch fails the step with reason
+    /// code `collective_corrupt` (P5 Task 32). A diagnosis mode: off by default.
+    pub verify: bool,
 }
 
 impl Default for CollectiveTimeouts {
@@ -178,6 +182,7 @@ impl Default for CollectiveTimeouts {
             op_timeout: HumanDuration::from_secs(30),
             hostmem_max_bytes: ByteSizeOrAuto::Auto,
             hostmem_dma_min_bytes: None,
+            verify: false,
         }
     }
 }
