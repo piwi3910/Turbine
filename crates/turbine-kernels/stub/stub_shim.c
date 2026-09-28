@@ -6,7 +6,7 @@
  * it with the host C compiler once per variant:
  *   -DSTUB_ABI=<n>u  -DSTUB_BACKEND="<name>"  -DSTUB_ARCHS="<a,b>"
  *   [-DTURBINE_STUB_V21] [-DTURBINE_STUB_V24] [-DTURBINE_STUB_V25]
- *   [-DTURBINE_STUB_V26]
+ *   [-DTURBINE_STUB_V26] [-DTURBINE_STUB_V27]
  * With TURBINE_STUB_V21 it also exports the optional ABI v2.1 and v2.3
  * symbols: turbine_abi_minor (3, a v2.3 library), context options
  * (TURBINE_OPTION_GEMM_AUTOTUNE kept per context,
@@ -17,12 +17,17 @@
  * TURBINE_STUB_V24 as well it reports minor 4 and exports the v2.4
  * implementation group (see the v2.4 section); with TURBINE_STUB_V25 as well
  * it reports minor 5 and exports the v2.5 copy streams (see the v2.5
- * section); with TURBINE_STUB_V26 as well it reports minor TURBINE_ABI_MINOR
- * (6) and exports the v2.6 group (see the v2.6 section at the end).
+ * section); with TURBINE_STUB_V26 as well it reports minor 6 and exports the
+ * v2.6 group (see the v2.6 section); with TURBINE_STUB_V27 as well it reports
+ * minor TURBINE_ABI_MINOR (7) and exports the v2.7 host-mapped group, whose
+ * collective runs the protocol on the calling thread (see the v2.7 section at
+ * the end).
  *
  * stub_live_contexts() is a test hook (not part of the ABI): the number of
  * contexts created and not yet destroyed, so tests can prove the Rust side
  * destroys each context exactly once. */
+/* clock_gettime and nanosleep for the v2.7 section. */
+#define _POSIX_C_SOURCE 200809L
 #include "turbine_kernels.h"
 
 #include <stdatomic.h>
@@ -59,8 +64,8 @@ int32_t stub_live_contexts(void) { return atomic_load(&live_contexts); }
 /* Test hook: sizeof each descriptor, indexed in header order (gemm,
  * attention, rmsnorm, rope, silu_mul, embedding, add, then v2: ctx_info,
  * attention_paged, copy_blocks, moe_route, moe_experts, then v2.1:
- * add_rmsnorm, logits_reduce, then v2.6: row_sumsq, rmsnorm_sharded); 0 past
- * the end. */
+ * add_rmsnorm, logits_reduce, then v2.6: row_sumsq, rmsnorm_sharded, then
+ * v2.7: mapped_collective); 0 past the end. */
 size_t stub_desc_size(int32_t which) {
   switch (which) {
   case 0:
@@ -95,6 +100,8 @@ size_t stub_desc_size(int32_t which) {
     return sizeof(turbine_row_sumsq_desc);
   case 15:
     return sizeof(turbine_rmsnorm_sharded_desc);
+  case 16:
+    return sizeof(turbine_mapped_collective_desc);
   default:
     return 0;
   }
@@ -238,8 +245,10 @@ STUB_OP(moe_experts, turbine_moe_experts_desc)
 STUB_OP(add_rmsnorm, turbine_add_rmsnorm_desc)
 STUB_OP(logits_reduce, turbine_logits_reduce_desc)
 
-#if defined(TURBINE_STUB_V26)
+#if defined(TURBINE_STUB_V27)
 uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
+#elif defined(TURBINE_STUB_V26)
+uint32_t turbine_abi_minor(void) { return 6u; }
 #elif defined(TURBINE_STUB_V25)
 uint32_t turbine_abi_minor(void) { return 5u; }
 #elif defined(TURBINE_STUB_V24)
@@ -654,3 +663,243 @@ int32_t turbine_stream_native_handle(turbine_ctx *ctx, turbine_stream *s,
   return TURBINE_OK;
 }
 #endif /* TURBINE_STUB_V26 */
+
+#ifdef TURBINE_STUB_V27
+/* v2.7: host-mapped memory is heap memory (the stub's "device" memory is host
+ * memory too, so the device address is the host address), and
+ * turbine_mapped_collective runs the one-shot protocol of the header on the
+ * calling thread as one block: it writes this rank's contribution into its
+ * slot, publishes flag word rank * max_blocks with a release store, waits
+ * (sleeping 20 us between polls) for every peer's flag word with acquire
+ * loads, then combines in rank order. A wait past timeout_ns stores the
+ * timeout reason into abort_word and returns TURBINE_OK, like the kernel.
+ * stub_live_mapped() counts allocations not yet freed. */
+#include <time.h>
+
+static atomic_int live_mapped;
+
+int32_t stub_live_mapped(void) { return atomic_load(&live_mapped); }
+
+int32_t turbine_host_alloc_mapped(turbine_ctx *ctx, size_t bytes, void **out) {
+  if (out == NULL) {
+    set_error(ctx->last_error, "stub: null out pointer");
+    return TURBINE_E_ARGUMENT;
+  }
+  *out = calloc(1, bytes == 0 ? 1 : bytes);
+  if (*out == NULL) {
+    set_error(ctx->last_error, "stub: out of host memory");
+    return TURBINE_E_OUT_OF_MEMORY;
+  }
+  atomic_fetch_add(&live_mapped, 1);
+  return TURBINE_OK;
+}
+
+int32_t turbine_host_mapped_device_ptr(turbine_ctx *ctx, void *host,
+                                       void **out) {
+  if (host == NULL || out == NULL) {
+    set_error(ctx->last_error, "stub: null pointer");
+    return TURBINE_E_ARGUMENT;
+  }
+  *out = host;
+  return TURBINE_OK;
+}
+
+int32_t turbine_host_free_mapped(turbine_ctx *ctx, void *host) {
+  (void)ctx;
+  if (host != NULL) {
+    free(host);
+    atomic_fetch_sub(&live_mapped, 1);
+  }
+  return TURBINE_OK;
+}
+
+static int64_t stub_round16(int64_t v) { return (v + 15) / 16 * 16; }
+
+static int stub_reduction(int32_t kind) {
+  return kind == TURBINE_MAPPED_ALL_REDUCE ||
+         kind == TURBINE_MAPPED_REDUCE_SCATTER;
+}
+
+static int stub_mapped_ok(const turbine_mapped_collective_desc *d) {
+  if (d == NULL || d->kind < 0 || d->kind > TURBINE_MAPPED_BROADCAST ||
+      d->world < 1 || d->world > TURBINE_MAPPED_MAX_WORLD || d->rank < 0 ||
+      d->rank >= d->world || d->max_blocks < 1 ||
+      d->max_blocks > TURBINE_MAPPED_MAX_BLOCKS || d->timeout_ns <= 0 ||
+      d->seq < 1 || d->bytes < 0 || d->slot_bytes % 16 != 0) {
+    return 0;
+  }
+  if (d->kind == TURBINE_MAPPED_BROADCAST &&
+      (d->root < 0 || d->root >= d->world)) {
+    return 0;
+  }
+  int64_t e = 1;
+  if (stub_reduction(d->kind)) {
+    if (d->dtype != TURBINE_DTYPE_BF16 && d->dtype != TURBINE_DTYPE_F32) {
+      return 0;
+    }
+    if (d->reduce_op != TURBINE_REDUCE_SUM &&
+        d->reduce_op != TURBINE_REDUCE_MAX) {
+      return 0;
+    }
+    e = d->dtype == TURBINE_DTYPE_BF16 ? 2 : 4;
+  }
+  if (d->bytes % e != 0) {
+    return 0;
+  }
+  const int64_t parts = d->kind == TURBINE_MAPPED_REDUCE_SCATTER ? d->world : 1;
+  return parts * stub_round16(d->bytes) <= d->slot_bytes;
+}
+
+int32_t
+turbine_mapped_collective_supported(const turbine_mapped_collective_desc *d) {
+  return stub_mapped_ok(d);
+}
+
+const char *
+turbine_mapped_collective_impl(const turbine_mapped_collective_desc *d) {
+  (void)d;
+  return "stub_mapped_collective";
+}
+
+static uint64_t stub_now_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
+}
+
+static float stub_load(const uint8_t *p, int32_t dtype) {
+  if (dtype == TURBINE_DTYPE_BF16) {
+    uint16_t b;
+    memcpy(&b, p, 2);
+    uint32_t u = (uint32_t)b << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+  }
+  float f;
+  memcpy(&f, p, 4);
+  return f;
+}
+
+static void stub_store(uint8_t *p, int32_t dtype, float v) {
+  if (dtype == TURBINE_DTYPE_BF16) {
+    uint32_t u;
+    memcpy(&u, &v, 4);
+    uint16_t b;
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+      b = (uint16_t)((u >> 16) | 0x0040u);
+    } else {
+      u += 0x7fffu + ((u >> 16) & 1u);
+      b = (uint16_t)(u >> 16);
+    }
+    memcpy(p, &b, 2);
+    return;
+  }
+  memcpy(p, &v, 4);
+}
+
+int32_t turbine_mapped_collective(turbine_ctx *ctx,
+                                  const turbine_mapped_collective_desc *d) {
+  if (!stub_mapped_ok(d)) {
+    set_error(ctx->last_error, "stub: mapped_collective descriptor refused");
+    return TURBINE_E_UNSUPPORTED;
+  }
+  if (d->bytes == 0) {
+    return TURBINE_OK;
+  }
+  _Atomic uint32_t *abort_word = (_Atomic uint32_t *)d->abort_word;
+  if (atomic_load(abort_word) != 0) {
+    return TURBINE_OK;
+  }
+  const int64_t part = stub_round16(d->bytes);
+  uint8_t *base = (uint8_t *)d->slots;
+  const int64_t parity = (int64_t)(d->seq & 1u);
+#define STUB_SLOT(r) (base + (parity * d->world + (r)) * d->slot_bytes)
+  const uint8_t *send = (const uint8_t *)d->send;
+  uint8_t *recv = (uint8_t *)d->recv;
+  uint8_t *mine = STUB_SLOT(d->rank);
+  switch (d->kind) {
+  case TURBINE_MAPPED_REDUCE_SCATTER:
+    for (int32_t q = 0; q < d->world; ++q) {
+      if (q != d->rank) {
+        memcpy(mine + q * part, send + q * d->send_stride, (size_t)d->bytes);
+      }
+    }
+    break;
+  case TURBINE_MAPPED_BROADCAST:
+    if (d->rank == d->root) {
+      memcpy(mine, send, (size_t)d->bytes);
+    }
+    break;
+  default:
+    memcpy(mine, send, (size_t)d->bytes);
+    break;
+  }
+  const uint64_t tag = (d->seq << 24) | 1u;
+  atomic_store_explicit(
+      (_Atomic uint64_t *)&d->flags[(int64_t)d->rank * d->max_blocks], tag,
+      memory_order_release);
+  const uint64_t deadline = stub_now_ns() + (uint64_t)d->timeout_ns;
+  for (int32_t q = 0; q < d->world; ++q) {
+    if (q == d->rank) {
+      continue;
+    }
+    _Atomic uint64_t *f =
+        (_Atomic uint64_t *)&d->flags[(int64_t)q * d->max_blocks];
+    while (atomic_load_explicit(f, memory_order_acquire) < tag) {
+      if (atomic_load(abort_word) != 0) {
+        return TURBINE_OK;
+      }
+      if (stub_now_ns() > deadline) {
+        uint32_t expected = 0;
+        atomic_compare_exchange_strong(abort_word, &expected,
+                                       (TURBINE_MAPPED_ABORT_TIMEOUT << 24) |
+                                           ((uint32_t)d->kind << 16) |
+                                           (uint32_t)d->rank);
+        return TURBINE_OK;
+      }
+      struct timespec nap = {0, 20000};
+      nanosleep(&nap, NULL);
+    }
+  }
+  switch (d->kind) {
+  case TURBINE_MAPPED_ALL_GATHER:
+    for (int32_t q = 0; q < d->world; ++q) {
+      memcpy(recv + q * d->recv_stride, q == d->rank ? send : STUB_SLOT(q),
+             (size_t)d->bytes);
+    }
+    break;
+  case TURBINE_MAPPED_BROADCAST:
+    if (d->rank != d->root) {
+      memcpy(recv, STUB_SLOT(d->root), (size_t)d->bytes);
+    } else if (recv != send) {
+      memcpy(recv, send, (size_t)d->bytes);
+    }
+    break;
+  default: {
+    const int scatter = d->kind == TURBINE_MAPPED_REDUCE_SCATTER;
+    const int64_t e = d->dtype == TURBINE_DTYPE_BF16 ? 2 : 4;
+    for (int64_t i = 0; i < d->bytes; i += e) {
+      float acc = 0.0f;
+      for (int32_t q = 0; q < d->world; ++q) {
+        const uint8_t *src =
+            q == d->rank ? send + (scatter ? d->rank * d->send_stride : 0)
+                         : STUB_SLOT(q) + (scatter ? d->rank * part : 0);
+        const float x = stub_load(src + i, d->dtype);
+        if (q == 0) {
+          acc = x;
+        } else if (d->reduce_op == TURBINE_REDUCE_SUM) {
+          acc = acc + x;
+        } else {
+          acc = x > acc ? x : acc;
+        }
+      }
+      stub_store(recv + i, d->dtype, acc);
+    }
+    break;
+  }
+  }
+#undef STUB_SLOT
+  return TURBINE_OK;
+}
+#endif /* TURBINE_STUB_V27 */

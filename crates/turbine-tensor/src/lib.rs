@@ -4,6 +4,7 @@ pub mod buffer;
 pub mod dtype;
 pub mod host;
 pub mod kv_view;
+pub mod mapped;
 pub mod pinned;
 pub mod tensor;
 
@@ -13,6 +14,10 @@ pub use buffer::{
 };
 pub use dtype::DType;
 pub use kv_view::KvPoolView;
+pub use mapped::{
+    MAPPED_ABORT_HOST, MAPPED_ABORT_TIMEOUT, MappedCollectives, MappedHost, MappedKind,
+    MappedReduce, MappedRegion, MappedStep,
+};
 pub use pinned::{
     CopyEngine, CopySource, CopyTarget, CopyTicket, PinnedBuffer, PinnedMemory, PinnedOwner,
 };

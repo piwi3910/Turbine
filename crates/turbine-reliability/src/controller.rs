@@ -109,6 +109,9 @@ pub struct PressureController {
     /// The data-parallel replica this controller watches (P5; 0 in a single-replica process):
     /// the `replica` of its document's group and replica views and of the group gauges.
     replica: u32,
+    /// A tensor-parallel group's other ranks (P5 S-8): each rank's budget and ledger, listed in
+    /// the document's `memory` and `devices` and as members of its group. Empty on one device.
+    workers: Vec<(DeviceBudget, Arc<Ledger>)>,
 }
 
 impl PressureController {
@@ -171,9 +174,21 @@ impl PressureController {
                 snap: Arc::clone(&handle.snap),
             },
             replica: 0,
+            workers: Vec::new(),
         };
         c.publish();
         (c, handle)
+    }
+
+    /// Watches a tensor-parallel group whose other ranks have `workers` (budget, ledger), in
+    /// rank order (P5 S-8): the document's `memory` and `devices` list every rank and the
+    /// group's members are every rank's device. The group runs one pressure machine fed by its
+    /// worst member's KV utilisation (the engine's ledger probe reads every rank), so each
+    /// member reports the group's state. Republishes at once.
+    pub fn with_group_ranks(mut self, workers: Vec<(DeviceBudget, Arc<Ledger>)>) -> Self {
+        self.workers = workers;
+        self.publish();
+        self
     }
 
     /// Watches data-parallel replica `replica` (P5): its document's `groups` / `replicas` and the
@@ -380,6 +395,10 @@ impl PressureController {
             .filter(|s| !s.stale && s.level > PressureState::Green)
             .max_by(|a, b| a.level.cmp(&b.level).then(b.signal.cmp(&a.signal)))
             .map(|s| s.signal);
+        let members: Vec<_> = std::iter::once(self.budget.device)
+            .chain(self.workers.iter().map(|(b, _)| b.device))
+            .map(|d| (d, state))
+            .collect();
         let document = PressureDocument {
             enabled: self.cfg.enabled,
             state,
@@ -388,7 +407,13 @@ impl PressureController {
             exhaustion_horizon_seconds: self.last_horizon.is_finite().then_some(self.last_horizon),
             signals: self.last_signals.clone(),
             throttle: ThrottleDoc::from(&self.plan),
-            memory: vec![memory_doc(&self.budget, &self.ledger, self.reserve.held())],
+            memory: std::iter::once(memory_doc(&self.budget, &self.ledger, self.reserve.held()))
+                .chain(
+                    self.workers
+                        .iter()
+                        .map(|(b, l)| memory_doc(b, l, self.reserve.held())),
+                )
+                .collect(),
             admission: AdmissionDoc {
                 queued: self.metrics.admission_queue_depth.get().max(0) as u32,
                 max_queue: self.cfg.admission.max_queue,
@@ -405,14 +430,21 @@ impl PressureController {
                 last_reason: self.circuit.last_reason(),
             },
             transitions: self.machine.history().map(TransitionDoc::from).collect(),
-            // P5 S-8: a single-GPU process is one device, one group of one, one replica.
-            devices: vec![device_doc(&self.budget, state)],
-            groups: vec![GroupDoc::of(self.replica, &[(self.budget.device, state)])],
+            // P5 S-8: a single-GPU process is one device, one group of one, one replica; a
+            // tensor-parallel group lists every rank's device.
+            devices: std::iter::once(&self.budget)
+                .chain(self.workers.iter().map(|(b, _)| b))
+                .map(|b| device_doc(b, state))
+                .collect(),
+            groups: vec![GroupDoc::of(self.replica, &members)],
             replicas: vec![ReplicaDoc::of(self.replica, state, self.circuit.state())],
         };
         self.metrics.record_device_budget(&self.budget);
+        for (b, _) in &self.workers {
+            self.metrics.record_device_budget(b);
+        }
         self.metrics
-            .record_group(self.replica, GroupState::of(&[(self.budget.device, state)]));
+            .record_group(self.replica, GroupState::of(&members));
         self.handle.snap.store(Arc::new(Snapshot {
             state,
             circuit: self.circuit.state(),

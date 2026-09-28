@@ -55,6 +55,7 @@ use crate::kv_orchestrator::{PrefetchRefused, PrefetchTargetOwned};
 use crate::metrics::{Outcome, ServerMetrics};
 use crate::model::PreparedModel;
 use crate::modules::ModuleChoices;
+use crate::parallel::ExpertStats;
 use crate::reliability::api_error_for;
 use crate::replicas::{ReplicaLoad, ReplicaRouter};
 
@@ -232,6 +233,9 @@ pub struct ModelBackend {
     topology: Option<Value>,
     /// The `parallel` object of `GET /turbine/v1/status` (P5 S-4).
     parallel: Option<Value>,
+    /// Expert parallelism (P5 S-11): each replica's token counts, the `expert` section of its
+    /// `/turbine/v1/scheduler` document; empty without it.
+    experts: Vec<Option<Arc<ExpertStats>>>,
 }
 
 impl ModelBackend {
@@ -292,6 +296,7 @@ impl ModelBackend {
             support: None,
             topology: None,
             parallel: None,
+            experts: Vec::new(),
         }
     }
 
@@ -326,6 +331,13 @@ impl ModelBackend {
     /// Reports `parallel` (the plan computed before bind) in the status document.
     pub fn with_parallel(mut self, parallel: Value) -> ModelBackend {
         self.parallel = Some(parallel);
+        self
+    }
+
+    /// Reports each replica's expert-parallel token counts (in replica order) in its scheduler
+    /// document's `expert` section.
+    pub fn with_experts(mut self, experts: Vec<Option<Arc<ExpertStats>>>) -> ModelBackend {
+        self.experts = experts;
         self
     }
 
@@ -938,8 +950,11 @@ impl Diagnostics for ModelBackend {
     fn scheduler(&self) -> Result<Value, ApiError> {
         let mut out = serde_json::Map::new();
         for (r, docs) in self.engine_docs()? {
-            let doc = serde_json::to_value(docs.scheduler)
+            let mut doc = serde_json::to_value(docs.scheduler)
                 .map_err(|e| ApiError::internal(e.to_string()))?;
+            if let (Some(Some(experts)), Value::Object(map)) = (self.experts.get(r), &mut doc) {
+                map.insert("expert".to_string(), experts.document());
+            }
             out.insert(r.to_string(), doc);
         }
         Ok(Value::Object(out))

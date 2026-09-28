@@ -11,6 +11,7 @@ pub mod cards;
 pub mod cpu;
 pub(crate) mod ffi;
 pub mod link_probe;
+mod mapped;
 pub mod ops;
 mod pinned;
 mod registries;

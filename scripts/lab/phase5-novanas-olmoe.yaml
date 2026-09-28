@@ -23,7 +23,8 @@ parallel:
   tensor_parallel_size: 2
   data_parallel_size: 1
   devices: [0, 1]
-  collective_backend: rccl
+  # auto: hostmem (RCCL above its thresholds) in local mode, rccl in static mode.
+  collective_backend: auto
 kv:
   block_tokens: 128
   gpu:

@@ -14,7 +14,8 @@ use super::{CollectiveBackend, CollectiveError, CollectiveInit, ReduceOp};
 /// library that does not exist with `Unavailable` naming that path — never a panic, and never
 /// by loading a real vendor library on the build host; its communicators are exercised by the
 /// lab (`turbine-collbench`). A host-memory backend (no vendors) must load, report its own
-/// name, make distinct ids and run a two-rank all-reduce and all-gather correctly here.
+/// name, make distinct ids and run a two-rank all-reduce, all-gather and send/recv correctly
+/// here.
 pub fn check(backend: &dyn CollectiveBackend) -> Result<(), String> {
     let name = backend.name();
     if !backend.vendors().is_empty() {
@@ -54,7 +55,13 @@ pub fn check(backend: &dyn CollectiveBackend) -> Result<(), String> {
             .collect()
     });
     for (rank, r) in results.into_iter().enumerate() {
-        let (reduced, gathered) = r.map_err(|e| format!("{name}: rank {rank}: {e}"))?;
+        let (reduced, gathered, exchanged) = r.map_err(|e| format!("{name}: rank {rank}: {e}"))?;
+        // Each rank receives the other's `[1 + 2·rank, 2 + 2·rank]` point to point.
+        let peer = 1 - rank as u32;
+        let want = [1.0 + 2.0 * peer as f32, 2.0 + 2.0 * peer as f32];
+        if f32s(&exchanged) != want {
+            return Err(format!("{name}: send/recv gave {:?}", f32s(&exchanged)));
+        }
         if f32s(&reduced) != [4.0, 6.0] {
             return Err(format!("{name}: all_reduce gave {:?}", f32s(&reduced)));
         }
@@ -65,8 +72,8 @@ pub fn check(backend: &dyn CollectiveBackend) -> Result<(), String> {
     Ok(())
 }
 
-/// One rank's all-reduced and all-gathered bytes.
-type RankOut = (Vec<u8>, Vec<u8>);
+/// One rank's all-reduced, all-gathered and point-to-point received bytes.
+type RankOut = (Vec<u8>, Vec<u8>, Vec<u8>);
 
 fn f32s(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
@@ -91,6 +98,8 @@ fn two_rank_ops(
             op_timeout: Duration::from_secs(10),
             clock: Arc::new(SystemClock::new()),
             metrics: None,
+            memory: None,
+            route_max_bytes: None,
         })
         .map_err(|e| err(&e))?;
     let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank as u32), 1 << 20);
@@ -113,5 +122,21 @@ fn two_rank_ops(
     comm.all_gather(&send.whole(), &mut gathered, &stream)
         .map_err(|e| err(&e))?;
     let gathered = gathered.read_bytes().map_err(|e| err(&e))?;
-    Ok((reduced, gathered))
+    // Point to point: rank 0 sends then receives, rank 1 receives then sends.
+    let got = DeviceBuffer::alloc(&mem, 8).map_err(|e| err(&e))?;
+    let mut got_slice = got.whole();
+    let peer = 1 - rank;
+    if rank == 0 {
+        comm.send(&send.whole(), peer, &stream)
+            .map_err(|e| err(&e))?;
+        comm.recv(&mut got_slice, peer, &stream)
+            .map_err(|e| err(&e))?;
+    } else {
+        comm.recv(&mut got_slice, peer, &stream)
+            .map_err(|e| err(&e))?;
+        comm.send(&send.whole(), peer, &stream)
+            .map_err(|e| err(&e))?;
+    }
+    let exchanged = got_slice.read_bytes().map_err(|e| err(&e))?;
+    Ok((reduced, gathered, exchanged))
 }

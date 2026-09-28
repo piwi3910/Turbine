@@ -38,6 +38,12 @@ pub const TP_ALL_GATHER: &str = "tp_all_gather";
 /// Tensor parallelism: the device-to-device copies reordering the gathered shards into
 /// row-major logits rows; implementation [`D2D`].
 pub const TP_LOGITS_REORDER: &str = "tp_logits_reorder";
+/// Pipeline parallelism: sending the residual rows to the next stage; implementation: the
+/// collective backend.
+pub const PP_SEND: &str = "pp_send";
+/// Pipeline parallelism: receiving the residual rows from the stage before; implementation: the
+/// collective backend.
+pub const PP_RECV: &str = "pp_recv";
 /// Implementation name of device-to-device copies.
 pub const D2D: &str = "d2d";
 /// Implementation name of host work followed by a host-to-device copy.

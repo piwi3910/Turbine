@@ -83,6 +83,11 @@ pub struct OverloadConfig {
     /// Hold the circuit in DEGRADED while `run_load` submits (a `telemetry_stale` event on every
     /// tick, as a stale vendor library would).
     pub degraded_during_load: bool,
+    /// A tensor-parallel group (P5 S-8): the `kv` ledger pool, in blocks, of every rank after
+    /// rank 0 (whose ledger holds `pool_blocks`). Every admission then reserves on every rank's
+    /// ledger, and the block pool holds the smallest of them, as the ranks agree at startup.
+    /// Empty (the default): one device.
+    pub group_kv_blocks: Vec<u32>,
 }
 
 impl Default for OverloadConfig {
@@ -114,11 +119,20 @@ impl Default for OverloadConfig {
             max_tokens_range: (16, 1024),
             policy: "default",
             degraded_during_load: false,
+            group_kv_blocks: Vec::new(),
         }
     }
 }
 
 impl OverloadConfig {
+    /// The block pool's size: `pool_blocks`, or the smallest rank's `kv` pool in a group.
+    pub fn agreed_blocks(&self) -> u32 {
+        self.group_kv_blocks
+            .iter()
+            .copied()
+            .fold(self.pool_blocks, u32::min)
+    }
+
     /// Analytic service capacity (requests/s) for `run_load`'s length ranges: the requests the
     /// KV pool (worst-case reservations) and `max_running` let run at once, divided by the time
     /// one request occupies its slot (its prefill plus its decode steps in a full batch).
@@ -126,7 +140,7 @@ impl OverloadConfig {
         let mean = |r: (u32, u32)| (f64::from(r.0) + f64::from(r.1)) / 2.0;
         let (prompt, output) = (mean(self.prompt_range), mean(self.max_tokens_range));
         let blocks = ((prompt + output) / f64::from(LAYOUT.block_tokens)).ceil();
-        let concurrency = (f64::from(self.pool_blocks) / blocks)
+        let concurrency = (f64::from(self.agreed_blocks()) / blocks)
             .floor()
             .clamp(1.0, f64::from(self.params.max_running_requests));
         let step = self.cost.per_decode_step_s + self.cost.per_seq_s * concurrency;
@@ -219,6 +233,10 @@ pub struct OverloadSim {
     pool: BlockPool,
     exec: SimExecutor,
     ledger: Arc<Ledger>,
+    /// The other ranks' ledgers of a tensor-parallel group (device `i + 1`); empty on one device.
+    group: Vec<Arc<Ledger>>,
+    /// Observations where a group rank's `kv` used or reserved bytes differed from rank 0's.
+    group_kv_mismatches: u32,
     controller: PressureController,
     handle: ControllerHandle,
     recovery: RecoveryController,
@@ -284,6 +302,23 @@ impl OverloadSim {
             metrics.clone(),
         )
         .expect("the reserve pool holds the emergency reserve");
+        // P5 S-8: every other rank of a tensor-parallel group has its own ledger.
+        let group: Vec<(DeviceBudget, Arc<Ledger>)> = cfg
+            .group_kv_blocks
+            .iter()
+            .enumerate()
+            .map(|(i, blocks)| {
+                let kv = u64::from(*blocks) * block_bytes;
+                let budget = DeviceBudget {
+                    device: DeviceId(i as u32 + 1),
+                    memory_kind: MemoryKind::Dedicated,
+                    budget_bytes: kv,
+                    pools: vec![(PoolKind::Kv, kv)],
+                };
+                let ledger = Ledger::new(&budget);
+                (budget, ledger)
+            })
+            .collect();
         let (controller, handle) = PressureController::new(
             rel,
             SchedulerLimits {
@@ -297,6 +332,11 @@ impl OverloadSim {
             metrics.clone(),
             Arc::clone(&clock_dyn),
         );
+        let controller = if group.is_empty() {
+            controller
+        } else {
+            controller.with_group_ranks(group.clone())
+        };
         let admission = Admission::new(
             AdmissionParams {
                 device: DEVICE,
@@ -314,7 +354,13 @@ impl OverloadSim {
             Arc::clone(&ledger),
             metrics.clone(),
         )
-        .with_kv_headroom(effective_thresholds(&rel.pressure)[&PressureSignal::KvUtilization]);
+        .with_kv_headroom(effective_thresholds(&rel.pressure)[&PressureSignal::KvUtilization])
+        .with_group_ledgers(
+            group
+                .iter()
+                .map(|(b, l)| (b.device, Arc::clone(l)))
+                .collect(),
+        );
         let queue = AdmissionQueue::new(
             rel.admission.max_queue,
             rel.admission.queue_timeout.0,
@@ -342,7 +388,7 @@ impl OverloadSim {
         let pool = BlockPool::new(
             BlockPoolConfig {
                 layout: LAYOUT,
-                num_blocks: cfg.pool_blocks,
+                num_blocks: cfg.agreed_blocks(),
             },
             mem,
         )
@@ -359,6 +405,8 @@ impl OverloadSim {
             sched,
             pool,
             ledger,
+            group: group.into_iter().map(|(_, l)| l).collect(),
+            group_kv_mismatches: 0,
             controller,
             handle,
             recovery,
@@ -618,11 +666,30 @@ impl OverloadSim {
         self.ledger.usage(DEVICE, PoolKind::Workspace)
     }
 
-    /// No `kv` or `workspace` bytes are reserved or committed.
+    /// No `kv` or `workspace` bytes are reserved or committed (on any rank of a group).
     pub fn ledger_idle(&self) -> bool {
         let kv = self.kv_usage();
         let ws = self.workspace_usage();
         kv.used + kv.reserved + ws.used + ws.reserved == 0
+            && (1..=self.group.len()).all(|r| {
+                let u = self.rank_kv_usage(r);
+                u.used + u.reserved == 0
+            })
+    }
+
+    /// The `kv` pool of rank `rank` of a tensor-parallel group (0: this device's).
+    pub fn rank_kv_usage(&self, rank: usize) -> PoolUsage {
+        match rank {
+            0 => self.kv_usage(),
+            r => self.group[r - 1].usage(DeviceId(r as u32), PoolKind::Kv),
+        }
+    }
+
+    /// Observations (after every plan and completion) in which a group rank's `kv` used or
+    /// reserved bytes differed from rank 0's: 0 when every reservation, commit and release
+    /// reaches every rank.
+    pub fn group_kv_mismatches(&self) -> u32 {
+        self.group_kv_mismatches
     }
 
     /// Mean duration of the iterations started in `[from, to)` that decoded any of `ids`.
@@ -947,7 +1014,10 @@ impl OverloadSim {
                 ..DeviceSample::empty(DEVICE, SourceStatus::Ok)
             }],
             ledger: LedgerSample {
-                kv_utilization: self.kv_usage().utilization(),
+                // A group's worst member (P5 S-8).
+                kv_utilization: (1..=self.group.len())
+                    .map(|r| self.rank_kv_usage(r).utilization())
+                    .fold(self.kv_usage().utilization(), f64::max),
                 queue_fill: self.gate_len() as f64 / max_queue as f64,
             },
             storage: None,
@@ -957,6 +1027,12 @@ impl OverloadSim {
     fn observe_ledger(&mut self) {
         let kv = self.kv_usage();
         self.max_kv = self.max_kv.max(kv.used + kv.reserved);
+        for r in 1..=self.group.len() {
+            let u = self.rank_kv_usage(r);
+            if (u.used, u.reserved) != (kv.used, kv.reserved) {
+                self.group_kv_mismatches += 1;
+            }
+        }
         self.max_queue_len = self.max_queue_len.max(self.gate_len());
     }
 

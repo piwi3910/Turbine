@@ -6,3 +6,18 @@
 [[profile.default.overrides]]
 filter = 'binary(server_cli)'
 threads-required = 'num-test-threads'
+
+# hostmem_lab drives both GPUs: a test that hangs must end, not hold the lab Job (the tests also
+# carry their own watchdog, for runs under plain `cargo test`).
+[[profile.default.overrides]]
+filter = 'binary(hostmem_lab)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+# tiny_server tests whose assertions are wall-clock bounds the specs fix (P2 S-8: a dropped
+# client's KV freed within 1 s; P2c S-1: the eight stage timings sum to the iteration's duration
+# within 5 % or 0.5 ms). Under a fully loaded host the OS can preempt the engine thread between
+# two clock reads for longer than that; run them with the host to themselves rather than loosen
+# the bounds (both flaked in parallel gates on novanas, 2026-09-28).
+[[profile.default.overrides]]
+filter = 'binary(tiny_server) & (test(=disconnect_releases_kv) | test(=iteration_stage_breakdown))'
+threads-required = 'num-test-threads'

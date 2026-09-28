@@ -7,6 +7,16 @@
 //! start helper threads that outlive their communicators), so every function pointer copied
 //! out of it stays valid for the life of the process. Communicators, device buffers and streams
 //! are never created here; callers pass the phase-1 handles they own.
+//!
+//! Communicator init runs on a helper thread (`turbine-collective-init-<rank>`) that the opening
+//! rank gives up after `init_timeout` + [`INIT_GRACE`]: the init watchdog aborts a communicator
+//! whose peers never arrive, but on RCCL 2.30.4 the init or abort call itself may not return
+//! (measured on novanas: a lone rank 0 came back only through this bound). A thread given up
+//! that way is leaked together with whatever RCCL holds for it (its half-initialised
+//! communicator, its sockets); nothing of it is reachable from Turbine afterwards. That is
+//! acceptable because such a failure ends the process: at startup the open fails and the server
+//! exits, and at runtime a communicator is only re-created on the circuit path, which restarts
+//! the process on a fatal collective failure.
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::mem::ManuallyDrop;
@@ -26,8 +36,9 @@ use super::{
     CollectiveOp, ReduceOp, UNIQUE_ID_BYTES,
 };
 
-/// The 13 symbols the binding resolves (contract §15.1); a library missing any is refused.
-pub(crate) const SYMBOLS: [&str; 13] = [
+/// The 15 symbols the binding resolves (contract §15.1, plus `ncclSend` / `ncclRecv` for
+/// point-to-point); a library missing any is refused.
+pub(crate) const SYMBOLS: [&str; 15] = [
     "ncclGetVersion",
     "ncclGetUniqueId",
     "ncclCommInitRankConfig",
@@ -38,6 +49,8 @@ pub(crate) const SYMBOLS: [&str; 13] = [
     "ncclAllGather",
     "ncclReduceScatter",
     "ncclBroadcast",
+    "ncclSend",
+    "ncclRecv",
     "ncclGroupStart",
     "ncclGroupEnd",
     "ncclGetErrorString",
@@ -96,10 +109,20 @@ type BroadcastFn = unsafe extern "C" fn(
     comm: NcclComm,
     stream: NativeStream,
 ) -> NcclResult;
+/// `ncclSend` and `ncclRecv` (the buffer is `const void*` for send, `void*` for recv; the same
+/// ABI).
+type P2pFn = unsafe extern "C" fn(
+    buf: *mut c_void,
+    count: usize,
+    datatype: c_int,
+    peer: c_int,
+    comm: NcclComm,
+    stream: NativeStream,
+) -> NcclResult;
 type GroupFn = unsafe extern "C" fn() -> NcclResult;
 type GetErrorStringFn = unsafe extern "C" fn(result: NcclResult) -> *const c_char;
 
-/// The resolved entry points (all 13 are required so a library is refused as a whole).
+/// The resolved entry points (all 15 are required so a library is refused as a whole).
 #[expect(
     dead_code,
     reason = "ncclGroupStart/ncclGroupEnd are resolved but no grouped call is issued yet"
@@ -116,6 +139,8 @@ pub(crate) struct NcclFns {
     /// Same signature as all-reduce, with `count` = elements received per rank.
     pub(crate) reduce_scatter: AllReduceFn,
     pub(crate) broadcast: BroadcastFn,
+    pub(crate) send: P2pFn,
+    pub(crate) recv: P2pFn,
     pub(crate) group_start: GroupFn,
     pub(crate) group_end: GroupFn,
     pub(crate) get_error_string: GetErrorStringFn,
@@ -243,10 +268,63 @@ impl CollectiveLibrary for NcclApi {
         }
         Ok(id.internal.map(|c| c as u8))
     }
+    /// [`NcclCollective::init`] on a helper thread bound to the rank's device, given up after
+    /// `init_timeout` + [`INIT_GRACE`] (see the module's ownership rules).
     fn open(self: Arc<Self>, init: CollectiveInit) -> Result<Arc<dyn Collective>, CollectiveError> {
-        Ok(Arc::new(NcclCollective::init(self, init)?))
+        let (rank, world, init_timeout) = (init.rank, init.world, init.init_timeout);
+        let metrics = init.metrics.clone();
+        let backend = self.backend_name();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name(format!("turbine-collective-init-{rank}"))
+            .spawn(move || {
+                // The library initialises on the calling thread's current device: a kernel-library
+                // call makes the rank's device current on this thread (every call of the shim
+                // selects its context's device first).
+                if let Some(mem) = &init.memory
+                    && let Err(e) = mem.mem_info()
+                {
+                    let _ = tx.send(Err(CollectiveError::Backend {
+                        code: -1,
+                        message: format!("selecting the rank's device for communicator init: {e}"),
+                    }));
+                    return;
+                }
+                let _ = tx.send(NcclCollective::init(self, init));
+            });
+        if let Err(e) = spawned {
+            return Err(CollectiveError::Backend {
+                code: -1,
+                message: format!("cannot start the communicator init thread: {e}"),
+            });
+        }
+        match rx.recv_timeout(init_timeout + INIT_GRACE) {
+            Ok(result) => Ok(Arc::new(result?)),
+            Err(_) => {
+                tracing::warn!(
+                    event = "collective_init_failed",
+                    backend,
+                    reason = "init_timeout",
+                    rank,
+                    world,
+                    after_ms = (init_timeout + INIT_GRACE).as_millis() as u64,
+                    "communicator init did not return; the rank gives it up (its thread is leaked)"
+                );
+                if let Some(m) = &metrics {
+                    m.error(backend, super::CollectiveErrorKind::Timeout);
+                }
+                Err(CollectiveError::Timeout {
+                    op: "comm_init",
+                    after: init_timeout,
+                })
+            }
+        }
     }
 }
+
+/// How long past its `init_timeout` a communicator init may take before the opening rank gives
+/// up its helper thread.
+pub const INIT_GRACE: Duration = Duration::from_secs(5);
 
 /// The flavor whose file-name prefix `path` carries (`librccl*` → rccl, `libnccl*` → nccl).
 /// Sets the flavor's library settings the operator did not set (`NcclFlavor::env_defaults`),
@@ -355,6 +433,8 @@ fn bind(
         all_gather: sym!("ncclAllGather", AllGatherFn),
         reduce_scatter: sym!("ncclReduceScatter", AllReduceFn),
         broadcast: sym!("ncclBroadcast", BroadcastFn),
+        send: sym!("ncclSend", P2pFn),
+        recv: sym!("ncclRecv", P2pFn),
         group_start: sym!("ncclGroupStart", GroupFn),
         group_end: sym!("ncclGroupEnd", GroupFn),
         get_error_string: sym!("ncclGetErrorString", GetErrorStringFn),
@@ -696,6 +776,8 @@ impl NcclCollective {
             op_timeout,
             clock,
             metrics,
+            memory: _,
+            route_max_bytes: _,
         } = init;
         let backend = api.backend_name();
         let (Ok(nranks), Ok(rank_c)) = (c_int::try_from(world), c_int::try_from(rank)) else {
@@ -993,6 +1075,48 @@ impl Collective for NcclCollective {
         })
     }
 
+    fn send(
+        &self,
+        buf: &DeviceSlice,
+        peer: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        let Ok(peer_c) = c_int::try_from(peer) else {
+            return Err(CollectiveError::ShapeMismatch);
+        };
+        if peer >= self.world || peer == self.shared.rank {
+            return Err(CollectiveError::ShapeMismatch);
+        }
+        let (ptr, count, s) = (device_ptr(buf), buf.len(), native_stream(stream));
+        let f = self.shared.api.fns.send;
+        self.run(CollectiveOp::Send, count, |comm| {
+            // SAFETY: as in all_reduce; ncclSend only reads `count` bytes of the caller's
+            // buffer (declared `const void*`; the pointer type differs only in constness).
+            unsafe { f(ptr, count, NCCL_UINT8, peer_c, comm, s) }
+        })
+    }
+
+    fn recv(
+        &self,
+        buf: &mut DeviceSlice,
+        peer: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        let Ok(peer_c) = c_int::try_from(peer) else {
+            return Err(CollectiveError::ShapeMismatch);
+        };
+        if peer >= self.world || peer == self.shared.rank {
+            return Err(CollectiveError::ShapeMismatch);
+        }
+        let (ptr, count, s) = (device_ptr(buf), buf.len(), native_stream(stream));
+        let f = self.shared.api.fns.recv;
+        self.run(CollectiveOp::Recv, count, |comm| {
+            // SAFETY: as in all_reduce; ncclRecv writes `count` bytes of the caller's buffer,
+            // borrowed mutably for this call.
+            unsafe { f(ptr, count, NCCL_UINT8, peer_c, comm, s) }
+        })
+    }
+
     /// An all-reduce of one FP32 on `stream`, then a synchronize of the stream's context, all
     /// under the op watchdog (a peer that never arrives is aborted at `op_timeout`).
     fn barrier(&self, stream: &StreamRef) -> Result<(), CollectiveError> {
@@ -1158,7 +1282,7 @@ mod tests {
             .expect("nccl stub loads");
         assert_eq!(nccl.backend_name(), "nccl");
         assert_eq!(nccl.version_code(), expected);
-        assert_eq!(SYMBOLS.len(), 13);
+        assert_eq!(SYMBOLS.len(), 15);
         assert_eq!(nccl.error_string(4), "invalid argument");
         // Through the registry's trait: the name, the version text and a group id.
         let lib: &dyn CollectiveLibrary = &*nccl;
@@ -1223,6 +1347,8 @@ mod tests {
             op_timeout,
             clock: Arc::new(turbine_core::clock::SystemClock::new()),
             metrics,
+            memory: None,
+            route_max_bytes: None,
         }
     }
 

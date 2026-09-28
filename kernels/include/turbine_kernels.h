@@ -1,4 +1,4 @@
-/* Turbine vendor-neutral kernel C ABI, version 2.6 (contract section 9).
+/* Turbine vendor-neutral kernel C ABI, version 2.7 (contract section 9).
  *
  * Every backend shim library implements this header and is loaded by
  * turbine-kernels at run time. No vendor type, identifier or name appears here,
@@ -389,8 +389,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
 /* v2.2 adds TURBINE_MOE_ROUTE_BF16_LOGITS (a flag bit, no new symbol); v2.3
  * adds pinned host memory and events; v2.4 implementation enumeration and the
  * card profile; v2.5 copy streams and asynchronous copies; v2.6 the native
- * stream handle and the sharded RMSNorm ops (all below). */
-#define TURBINE_ABI_MINOR 6u
+ * stream handle and the sharded RMSNorm ops; v2.7 host-mapped memory and the
+ * one-shot collectives over it (all below). */
+#define TURBINE_ABI_MINOR 7u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -690,6 +691,112 @@ int32_t turbine_rmsnorm_sharded(turbine_ctx *ctx,
 int32_t
 turbine_rmsnorm_sharded_supported(const turbine_rmsnorm_sharded_desc *d);
 const char *turbine_rmsnorm_sharded_impl(const turbine_rmsnorm_sharded_desc *d);
+
+/* ======== v2.7 (additive, optional): host-mapped memory and one-shot
+ * collectives ========
+ * Tensor parallelism between devices of one process that have no
+ * peer-to-peer path (decision "P5: small-message all-reduce latency on
+ * novanas"): the ranks exchange partial results through page-locked host
+ * memory mapped into every device, one kernel per collective step and rank,
+ * with no host thread on the path. Resolved only when
+ * turbine_abi_minor() >= 7 and all six symbols exist; a library without them
+ * has no `hostmem` collective backend (the NCCL-API backends are
+ * unaffected). The ROCm shim exports the group; the CUDA shim is on hold
+ * (NVIDIA on hold).
+ *
+ * turbine_host_alloc_mapped returns bytes of zeroed page-locked host memory
+ * (a host pointer) that every context of the process can map, coherent
+ * between the host and every device (no cache hides another agent's
+ * writes); turbine_host_mapped_device_ptr stores in *out its address on
+ * ctx's device (for kernels of that context); turbine_host_free_mapped frees
+ * it (through any context of the process) once no enqueued work uses it.
+ *
+ * turbine_mapped_collective enqueues one collective step of rank `rank` of
+ * `world` (<= TURBINE_MAPPED_MAX_WORLD) on the compute stream. Every rank
+ * issues the same steps in the same order with the same kind, bytes, dtype,
+ * reduce_op, root, max_blocks and seq (seq >= 1, strictly increasing from
+ * step to step, equal on every rank for one step) over one mapped region:
+ *   - slots: this context's address of 2 * world slots of slot_bytes each
+ *     (slot (seq & 1) * world + r is rank r's for step seq, so a slot is
+ *     reused every second step);
+ *   - flags: this context's address of world * max_blocks uint64 words, zero
+ *     before the first step (rank r's block b publishes into word
+ *     r * max_blocks + b);
+ *   - abort_word: this context's address of one uint32, zero while the group
+ *     is healthy.
+ * Each rank writes its contribution into its slot, publishes a flag with a
+ * system-scope release, waits for every peer's flag with system-scope
+ * acquires and reads their contributions; a reduction combines every rank's
+ * contribution in rank order 0, 1, ..., world - 1 (BF16 accumulated in F32
+ * and rounded once), so every rank computes the same bits. A wait gives up
+ * after timeout_ns: the step then stores
+ * TURBINE_MAPPED_ABORT_TIMEOUT << 24 | kind << 16 | rank into abort_word
+ * (unless it is already set) and ends early, leaving recv undefined. A step
+ * that finds abort_word non-zero (a timeout of any rank, or the host's
+ * TURBINE_MAPPED_ABORT_HOST << 24 | rank, which aborts the group) ends
+ * without waiting, so no step holds the stream much longer than timeout_ns.
+ *
+ * Kinds (bytes is one rank's part):
+ *   ALL_REDUCE     recv[0, bytes) = reduction of every rank's send[0, bytes);
+ *                  recv may equal send.
+ *   ALL_GATHER     recv[r * recv_stride + i] = rank r's send[i], i < bytes.
+ *   REDUCE_SCATTER recv[0, bytes) = reduction of every rank's
+ *                  send[rank * send_stride, + bytes).
+ *   BROADCAST      recv[0, bytes) = rank root's send[0, bytes); recv may
+ *                  equal send.
+ * Capacity: a slot holds one part (world parts for REDUCE_SCATTER) of bytes
+ * rounded up to 16; the caller splits larger messages into several steps.
+ * The trio is not an op of the v2.4 implementation enumeration (one
+ * implementation, no op code). */
+#define TURBINE_MAPPED_ALL_REDUCE 0
+#define TURBINE_MAPPED_ALL_GATHER 1
+#define TURBINE_MAPPED_REDUCE_SCATTER 2
+#define TURBINE_MAPPED_BROADCAST 3
+#define TURBINE_REDUCE_SUM 0
+#define TURBINE_REDUCE_MAX 1
+#define TURBINE_MAPPED_MAX_WORLD 8
+#define TURBINE_MAPPED_MAX_BLOCKS 1024
+/* abort_word reasons (bits 24..31; bits 16..23 hold the kind of a step that
+ * timed out, bits 0..15 the rank that stored the word) */
+#define TURBINE_MAPPED_ABORT_TIMEOUT 1u
+#define TURBINE_MAPPED_ABORT_HOST 2u
+
+typedef struct turbine_mapped_collective_desc {
+  /* device memory of this rank */
+  const void *send;
+  void *recv;
+  /* bytes of one part; send_stride (REDUCE_SCATTER) and recv_stride
+   * (ALL_GATHER) are the byte distances between the ranks' parts */
+  int64_t bytes, send_stride, recv_stride;
+  /* this context's addresses in the mapped region (above) */
+  void *slots;
+  int64_t slot_bytes;
+  uint64_t *flags;
+  uint32_t *abort_word;
+  uint64_t seq;
+  /* > 0: how long one wait for a peer may spin */
+  int64_t timeout_ns;
+  /* TURBINE_MAPPED_*; TURBINE_REDUCE_* and TURBINE_DTYPE_BF16 or
+   * TURBINE_DTYPE_F32 for the reductions (ignored by the other kinds) */
+  int32_t kind, reduce_op, dtype;
+  int32_t rank, world, root;
+  /* flag words per rank (1 .. TURBINE_MAPPED_MAX_BLOCKS): the step runs at
+   * most this many blocks */
+  int32_t max_blocks;
+} turbine_mapped_collective_desc;
+
+int32_t turbine_host_alloc_mapped(turbine_ctx *ctx, size_t bytes, void **out);
+int32_t turbine_host_mapped_device_ptr(turbine_ctx *ctx, void *host,
+                                       void **out);
+int32_t turbine_host_free_mapped(turbine_ctx *ctx, void *host);
+
+/* v2.7 trio: mapped_collective. */
+int32_t turbine_mapped_collective(turbine_ctx *ctx,
+                                  const turbine_mapped_collective_desc *d);
+int32_t
+turbine_mapped_collective_supported(const turbine_mapped_collective_desc *d);
+const char *
+turbine_mapped_collective_impl(const turbine_mapped_collective_desc *d);
 
 #ifdef __cplusplus
 }

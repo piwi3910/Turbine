@@ -117,6 +117,9 @@ struct turbine_ctx {
   std::map<int32_t, std::map<std::string, int>> gemm_solutions;
   // Table rows whose fallback was logged (once per row and context).
   std::set<const turbine_hip::TunedGemm *> gemm_table_logged;
+  // hipDeviceAttributeWallClockRate of the device (kHz), read at the first
+  // host-mapped collective step (hostmem.hip); 0 until then.
+  int64_t wall_clock_khz = 0;
   // True between turbine_graph_begin and turbine_graph_end (graph.cpp): the
   // stream is being captured, so copies, syncs and allocations are refused.
   bool capturing = false;

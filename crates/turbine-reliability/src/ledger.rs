@@ -143,6 +143,7 @@ impl Ledger {
             pool,
             bytes,
             committed: 0,
+            members: Vec::new(),
         })
     }
 
@@ -221,12 +222,18 @@ impl Ledger {
 
 /// A pool reservation. Uncommitted bytes count as `reserved`, committed bytes as `used`;
 /// dropping the guard returns both to the pool.
+///
+/// A tensor-parallel group's KV reservation (P5 S-8) is rank 0's reservation carrying every
+/// other rank's as `members` ([`Reservation::with_members`]): committing on it commits the same
+/// share of each member, and dropping it releases every rank's part, so the scheduler and the
+/// block pool keep handling one guard per request.
 pub struct Reservation {
     ledger: Arc<Ledger>,
     device: DeviceId,
     pool: PoolKind,
     bytes: u64,
     committed: u64,
+    members: Vec<Reservation>,
 }
 
 impl Reservation {
@@ -235,7 +242,9 @@ impl Reservation {
         self.commit_bytes(self.bytes - self.committed);
     }
 
-    /// Commit `bytes` more (e.g. KV blocks as a sequence grows); saturates at the total.
+    /// Commit `bytes` more (e.g. KV blocks as a sequence grows); saturates at the total. Each
+    /// member commits the same fraction of its own bytes (rounded up, so a fully committed
+    /// reservation leaves every member fully committed).
     pub fn commit_bytes(&mut self, bytes: u64) {
         let n = bytes.min(self.bytes - self.committed);
         if n == 0 {
@@ -246,6 +255,24 @@ impl Reservation {
             u.reserved -= n;
             u.used += n;
         });
+        let (committed, total) = (u128::from(self.committed), u128::from(self.bytes));
+        for m in &mut self.members {
+            let target = (committed * u128::from(m.bytes)).div_ceil(total);
+            let target = u64::try_from(target).unwrap_or(m.bytes);
+            m.commit_bytes(target.saturating_sub(m.committed));
+        }
+    }
+
+    /// This reservation carrying `members` (the other ranks' parts of a group reservation):
+    /// they commit with it and are released when it drops.
+    pub fn with_members(mut self, members: Vec<Reservation>) -> Reservation {
+        self.members.extend(members);
+        self
+    }
+
+    /// The other ranks' parts of a group reservation (empty on one device).
+    pub fn members(&self) -> &[Reservation] {
+        &self.members
     }
 
     pub fn bytes(&self) -> u64 {
@@ -282,6 +309,7 @@ impl fmt::Debug for Reservation {
             .field("pool", &self.pool)
             .field("bytes", &self.bytes)
             .field("committed", &self.committed)
+            .field("members", &self.members)
             .finish()
     }
 }

@@ -2,13 +2,15 @@
 //! implements, its error type and the `turbine_collective_*` metrics.
 //!
 //! Buffers are phase-1 [`DeviceSlice`]s and ordering is the phase-1 [`StreamRef`]; a backend
-//! never allocates model memory. Supported element types: BF16 and FP32.
+//! never allocates model memory (`hostmem` allocates only its own mapped exchange region).
+//! Supported element types: BF16 and FP32.
 
 pub mod conformance;
 // The only module of this crate allowed to contain `unsafe` (contract §1.3, CONFLICT C-19).
 #[allow(unsafe_code)]
 pub mod ffi;
 pub mod host;
+pub mod hostmem;
 pub mod nccl_api;
 
 use std::path::Path;
@@ -24,10 +26,11 @@ use turbine_core::config::ParallelConfig;
 use turbine_core::registry::{Module, Registry};
 use turbine_core::types::Vendor;
 use turbine_observability::MetricsRegistry;
-use turbine_tensor::{DType, DeviceSlice, StreamRef};
+use turbine_tensor::{DType, DeviceMemory, DeviceSlice, StreamRef};
 
 pub use ffi::NcclApi;
 pub use host::{HostBackend, HostCollective};
+pub use hostmem::{HostmemBackend, HostmemCollective};
 pub use nccl_api::{NcclApiBackend, NcclFlavor};
 
 /// Element-wise reduction of all-reduce and reduce-scatter.
@@ -79,6 +82,24 @@ pub trait Collective: Send + Sync {
         stream: &StreamRef,
     ) -> Result<(), CollectiveError>;
     fn barrier(&self, stream: &StreamRef) -> Result<(), CollectiveError>;
+    /// Point-to-point (pipeline stages hand activations on): `buf` (byte-wise) goes to rank
+    /// `peer`, whose matching [`Self::recv`] receives it. The two ranks of a pair issue their
+    /// sends and receives to each other in the same order and with the same lengths; a send may
+    /// wait (on the device or the host, bounded by the op timeout) until the peer receives, so a
+    /// schedule where both ranks send first may time out.
+    fn send(
+        &self,
+        buf: &DeviceSlice,
+        peer: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError>;
+    /// Receives into `buf` what rank `peer`'s matching [`Self::send`] sent (same length).
+    fn recv(
+        &self,
+        buf: &mut DeviceSlice,
+        peer: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError>;
     /// Starts bounding one step: every collective enqueued until [`Self::step_end`] must
     /// complete on the device within the op timeout, or the communicator is aborted (a peer
     /// that never arrives otherwise leaves a device kernel waiting forever). Default: nothing
@@ -108,6 +129,12 @@ pub trait CollectiveBackend: Module {
     }
     /// Loads the backend: `explicit` is the configured library, else the default search.
     fn load(&self, explicit: Option<&Path>) -> Result<Arc<dyn CollectiveLibrary>, CollectiveError>;
+    /// True for a backend whose ranks must be threads of one process (it exchanges through
+    /// memory of that process, e.g. `hostmem`): the planner refuses it in `static` rank mode and
+    /// `auto` skips it there. Default: false.
+    fn one_process_only(&self) -> bool {
+        false
+    }
 }
 
 /// A loaded backend: makes the group's unique id (on one rank) and opens each rank's
@@ -137,14 +164,29 @@ pub struct CollectiveInit {
     pub clock: Arc<dyn Clock>,
     /// `turbine_collective_*`; `None` records nothing (tests).
     pub metrics: Option<CollectiveMetrics>,
+    /// The rank's device memory (its kernel-library context), for a backend that allocates its
+    /// communication buffers and runs its kernels through the kernel library (`hostmem`);
+    /// `None` where the rank has none (the host backend) or the backend needs none.
+    pub memory: Option<Arc<dyn DeviceMemory>>,
+    /// `parallel.collective.hostmem_max_bytes` for a backend that routes large messages to a
+    /// delegate (`hostmem` → `rccl`): the largest message (nccl-tests bytes) it keeps; `None`
+    /// is `auto`, the backend's measured per-op default; `Some(u64::MAX)` keeps every call on
+    /// the backend and opens no delegate. Other backends ignore it.
+    pub route_max_bytes: Option<u64>,
 }
 
 static HOST: HostBackend = HostBackend;
-static RCCL: NcclApiBackend = NcclApiBackend::new(&nccl_api::RCCL_FLAVOR);
+/// Also `hostmem`'s delegate for large messages.
+pub(crate) static RCCL: NcclApiBackend = NcclApiBackend::new(&nccl_api::RCCL_FLAVOR);
 static NCCL: NcclApiBackend = NcclApiBackend::new(&nccl_api::NCCL_FLAVOR);
+static HOSTMEM: HostmemBackend = HostmemBackend;
 
+// `hostmem` comes before `rccl`: `auto` picks it for AMD plans in `local` rank mode (it
+// routes large messages to RCCL itself, and hands the whole communicator to RCCL on a kernel
+// library without ABI v2.7); in `static` mode `auto` skips it (`one_process_only`) and takes
+// `rccl`.
 static COLLECTIVE_BACKENDS: Registry<dyn CollectiveBackend> =
-    Registry::new("collective_backend", &[&HOST, &RCCL, &NCCL]);
+    Registry::new("collective_backend", &[&HOST, &HOSTMEM, &RCCL, &NCCL]);
 
 /// The registered collective backends, in registration order (`auto` takes the first one
 /// serving the plan's vendor).
@@ -187,6 +229,8 @@ pub enum CollectiveOp {
     ReduceScatter,
     Broadcast,
     Barrier,
+    Send,
+    Recv,
 }
 
 impl CollectiveOp {
@@ -197,6 +241,8 @@ impl CollectiveOp {
             CollectiveOp::ReduceScatter => "reduce_scatter",
             CollectiveOp::Broadcast => "broadcast",
             CollectiveOp::Barrier => "barrier",
+            CollectiveOp::Send => "send",
+            CollectiveOp::Recv => "recv",
         }
     }
 }
@@ -225,6 +271,35 @@ struct OpLabels {
     backend: &'static str,
 }
 
+/// Why a routing backend sent one call where it did (`reason` of
+/// `turbine_collective_route_total`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RouteReason {
+    /// The message is at most the threshold: the backend's own path.
+    BelowThreshold,
+    /// Above the threshold: the delegate.
+    AboveThreshold,
+    /// The backend's own path cannot run the call: the delegate.
+    OpUnsupported,
+}
+
+impl RouteReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteReason::BelowThreshold => "below_threshold",
+            RouteReason::AboveThreshold => "above_threshold",
+            RouteReason::OpUnsupported => "op_unsupported",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RouteLabels {
+    op: &'static str,
+    backend: &'static str,
+    reason: &'static str,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ErrorLabels {
     backend: &'static str,
@@ -238,6 +313,7 @@ pub struct CollectiveMetrics {
     duration: Family<OpLabels, Histogram>,
     bytes: Family<OpLabels, Counter>,
     errors: Family<ErrorLabels, Counter>,
+    route: Family<RouteLabels, Counter>,
 }
 
 impl CollectiveMetrics {
@@ -260,11 +336,28 @@ impl CollectiveMetrics {
             "Collective operations that failed, by kind",
             Family::<ErrorLabels, Counter>::default(),
         );
+        let route = reg.register(
+            "turbine_collective_route",
+            "Calls a routing collective backend sent to itself or to its delegate, by reason",
+            Family::<RouteLabels, Counter>::default(),
+        );
         CollectiveMetrics {
             duration,
             bytes,
             errors,
+            route,
         }
+    }
+
+    /// One call of `op` sent to `backend` (the routing backend or its delegate) for `reason`.
+    pub fn route(&self, op: CollectiveOp, backend: &'static str, reason: RouteReason) {
+        self.route
+            .get_or_create(&RouteLabels {
+                op: op.as_str(),
+                backend,
+                reason: reason.as_str(),
+            })
+            .inc();
     }
 
     pub fn observe(&self, op: CollectiveOp, backend: &'static str, bytes: u64, seconds: f64) {
@@ -296,6 +389,11 @@ mod tests {
         let m = CollectiveMetrics::register(&reg);
         m.observe(CollectiveOp::AllReduce, "rccl", 4096, 0.002);
         m.error("rccl", CollectiveErrorKind::Timeout);
+        m.route(
+            CollectiveOp::AllReduce,
+            "hostmem",
+            RouteReason::BelowThreshold,
+        );
         let text = reg.render().expect("renders");
         assert!(
             text.contains(
@@ -311,6 +409,12 @@ mod tests {
         );
         assert!(
             text.contains("turbine_collective_errors_total{backend=\"rccl\",kind=\"timeout\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "turbine_collective_route_total{op=\"all_reduce\",backend=\"hostmem\",reason=\"below_threshold\"} 1"
+            ),
             "{text}"
         );
         let timeout = CollectiveError::Timeout {

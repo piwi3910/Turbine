@@ -47,6 +47,7 @@ use turbine_distributed::collective::CollectiveMetrics;
 use turbine_kv::KvMetrics;
 use turbine_kv::tier::L2NvmeTier;
 use turbine_model::ModelMetrics;
+use turbine_model::ep::{EpAttention, EpShard};
 use turbine_model::tp::ShardSpec;
 use turbine_observability::MetricsRegistry;
 use turbine_reliability::metrics::ReliabilityMetrics;
@@ -59,7 +60,7 @@ use crate::exit::ExitCode;
 use crate::host;
 use crate::kv_orchestrator::{self, tp_kv_format};
 use crate::metrics::ServerMetrics;
-use crate::model::{self, PreparedModel};
+use crate::model::{self, EpRank, PreparedModel, RankPart};
 use crate::modules::known_module_names;
 use crate::parallel::{self, PlanFailure};
 use crate::{support_matrix, support_startup};
@@ -154,8 +155,8 @@ pub fn run(cli: Cli) -> ExitCode {
 
     // P5 S-4: the parallel plan before the kernel provider and the listener (exit 2, or exit 1
     // when the model config it needs is unreadable).
-    let plan = match parallel::plan_for(&config, &inventory, &topology).and_then(|p| {
-        parallel::check_executable(&p, &config)?;
+    let plan = match parallel::plan_for(&config, &inventory, &topology).and_then(|mut p| {
+        parallel::check_executable(&mut p, &config)?;
         Ok(p)
     }) {
         Ok(p) => p,
@@ -220,9 +221,12 @@ pub fn run(cli: Cli) -> ExitCode {
     // others on theirs, sharing the grammar compiler and the kernel metrics. Replicas that share
     // a device (`parallel.allow_device_sharing`) split its budget. With tensor parallelism
     // (P5 S-6) each replica is a group: every rank is prepared on its device for its shard, and
-    // the collective backend loads once (exit 1 naming the library when it cannot).
+    // the collective backend loads once (exit 1 naming the library when it cannot). An
+    // expert-parallel group (P5 S-11) runs through the same group runtime: every rank holds its
+    // experts, fed the same batches as a tensor-parallel group's ranks.
     let tp = plan.tp;
-    let collective = if tp > 1 {
+    let group_size = plan.group_size();
+    let collective = if group_size > 1 {
         match parallel::load_collective(&config, &plan) {
             Ok(library) => Some((library, CollectiveMetrics::register(&metrics))),
             Err(e) => {
@@ -242,7 +246,31 @@ pub fn run(cli: Cli) -> ExitCode {
             .filter(|s| s.device == device)
             .count() as u32
     };
-    let shard = |rank: u32| (tp > 1).then_some(ShardSpec { rank, world: tp });
+    // Expert parallelism: every replica's rank-0 token counts, and the metrics they feed.
+    let expert_metrics = (plan.ep > 1).then(|| parallel::ExpertMetrics::register(&metrics));
+    let part = |rank: u32, stats: Option<&Arc<parallel::ExpertStats>>| -> Option<RankPart> {
+        match (&plan.experts, stats) {
+            (Some(placement), Some(stats)) => Some(RankPart::Expert(EpRank {
+                shard: EpShard {
+                    rank,
+                    world: plan.ep,
+                    attention: if tp == plan.ep {
+                        EpAttention::TensorParallel
+                    } else {
+                        EpAttention::Replicated
+                    },
+                },
+                placement: Arc::clone(placement),
+                // Rank 0's counts are the server's; the other ranks count the same.
+                counts: if rank == 0 {
+                    Arc::clone(stats.counts())
+                } else {
+                    Arc::default()
+                },
+            })),
+            _ => (tp > 1).then_some(RankPart::Tensor(ShardSpec { rank, world: tp })),
+        }
+    };
     let startup_failed = |r: usize, e: &dyn std::fmt::Display| {
         tracing::error!(replica = r, error = %e, "model startup failed");
         eprintln!("turbine-server: {e}");
@@ -257,10 +285,18 @@ pub fn run(cli: Cli) -> ExitCode {
             None => (group.ranks[0].device, 0),
         };
         let cfg = replica_config(&config, r, plan.groups.len(), device);
+        let experts = expert_metrics.as_ref().map(|m| {
+            Arc::new(parallel::ExpertStats::new(
+                plan.ep,
+                &config.parallel.expert.placement,
+                m.clone(),
+            ))
+        });
+        let stats = experts.as_ref();
         let prepared = match replicas.first() {
-            None => model::prepare_rank(&cfg, &inventory, &metrics, shard(first_rank)),
+            None => model::prepare_rank(&cfg, &inventory, &metrics, part(first_rank, stats)),
             Some(base) => {
-                model::prepare_replica(&cfg, &inventory, &base.prepared, shard(first_rank))
+                model::prepare_replica(&cfg, &inventory, &base.prepared, part(first_rank, stats))
             }
         };
         let mut prepared = match prepared {
@@ -279,11 +315,15 @@ pub fn run(cli: Cli) -> ExitCode {
         for slot in group.ranks.iter().take(local_workers).skip(1) {
             let mut rank_cfg = cfg.clone();
             rank_cfg.execution.device = slot.device;
-            let mut worker =
-                match model::prepare_replica(&rank_cfg, &inventory, &prepared, shard(slot.rank)) {
-                    Ok(w) => w,
-                    Err(e) => return startup_failed(r, &e),
-                };
+            let mut worker = match model::prepare_replica(
+                &rank_cfg,
+                &inventory,
+                &prepared,
+                part(slot.rank, stats),
+            ) {
+                Ok(w) => w,
+                Err(e) => return startup_failed(r, &e),
+            };
             if let Err(e) = worker.share_device(slots_on(slot.device)) {
                 return startup_failed(r, &e);
             }
@@ -291,8 +331,9 @@ pub fn run(cli: Cli) -> ExitCode {
         }
         // P4: the model's block size is known now (exit 2), and L2 opens before the listener
         // binds (exit 1 naming the path). A tier copy of a tensor-parallel block holds every
-        // rank's shard (decision "P5 T17" B).
-        let format = tp_kv_format(prepared.pool.layout, tp);
+        // rank's shard (decision "P5 T17" B); an expert-parallel block at tp 1 every rank's
+        // replica of it (each rank runs the whole attention).
+        let format = tp_kv_format(prepared.pool.layout, group_size);
         if let Err(e) = cfg.kv.validate_block_bytes(format.block_bytes()) {
             eprintln!("turbine-server: invalid configuration: {e}");
             return ExitCode::Config;
@@ -334,6 +375,7 @@ pub fn run(cli: Cli) -> ExitCode {
                             library: Arc::clone(library),
                             init_timeout: config.parallel.collective.init_timeout.0,
                             op_timeout: config.parallel.collective.op_timeout.0,
+                            route_max_bytes: config.parallel.collective.hostmem_max_bytes.fixed(),
                             metrics: cmetrics.clone(),
                             clock: Arc::new(SystemClock::new()),
                         })
@@ -359,14 +401,17 @@ pub fn run(cli: Cli) -> ExitCode {
                 library: Arc::clone(library),
                 init_timeout: config.parallel.collective.init_timeout.0,
                 op_timeout: config.parallel.collective.op_timeout.0,
+                route_max_bytes: config.parallel.collective.hostmem_max_bytes.fixed(),
                 depth: config.parallel.plan_queue_depth as usize,
                 metrics: metrics.clone(),
                 clock: Arc::new(SystemClock::new()),
                 remote,
+                experts: experts.clone(),
             });
         replicas.push(ReplicaStart {
             prepared,
             group,
+            experts,
             worker,
             kv_cfg: cfg.kv.clone(),
             kv_metrics: replica_kv_metrics,
@@ -475,6 +520,9 @@ struct ReplicaStart {
     prepared: PreparedModel,
     /// Tensor parallelism: the group's worker ranks and its collective backend (P5 S-6).
     group: Option<engine::tp::TpGroupStart>,
+    /// Expert parallelism (P5 S-11): the group's token counts (`/turbine/v1/scheduler`
+    /// `expert`, the expert metrics).
+    experts: Option<Arc<parallel::ExpertStats>>,
     /// `static` rank mode, ranks 1..: this process is a worker rank, not an engine.
     worker: Option<engine::tp::StaticWorker>,
     kv_cfg: KvConfig,
@@ -528,6 +576,7 @@ async fn serve(
             .with_support(support)
             .with_topology(&cluster.topology)
             .with_parallel(cluster.parallel)
+            .with_experts(replicas.iter().map(|r| r.experts.clone()).collect())
             .with_rank_worker(replicas[0].worker.is_some()),
     );
     let state = ApiState {

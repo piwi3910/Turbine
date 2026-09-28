@@ -51,6 +51,36 @@ pub fn open_context(name: &str) -> Arc<ShimContext> {
         .unwrap_or_else(|| panic!("execution backend {name} has no kernel-library context"))
 }
 
+/// A context on mocked device `index` (an AMD `gfx942`, vendor index `index`) of the test stub
+/// kernel library that exports every optional group up to ABI v2.7 (`stub/stub_shim.c`, built
+/// by this crate's build script with the host C compiler). Its "device" memory is host memory
+/// and its host-mapped collective steps run on the calling thread, so the `hostmem` collective
+/// backend can be tested without a GPU. Only usable on the host that built this crate.
+pub fn stub_mapped_context(index: u32) -> Arc<ShimContext> {
+    use turbine_core::types::{MemoryKind, Vendor};
+    use turbine_device::{DeviceInfo, DeviceMemoryInfo};
+
+    let lib = crate::ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V27")), "hip")
+        .expect("the v2.7 stub library loads");
+    let device = DeviceInfo {
+        index: DeviceId(index),
+        vendor: Vendor::Amd,
+        vendor_index: index,
+        name: "stub".into(),
+        uuid: None,
+        pci_bus_id: None,
+        arch: Some("gfx942".into()),
+        driver_version: None,
+        memory: DeviceMemoryInfo {
+            kind: MemoryKind::Dedicated,
+            total_bytes: 1 << 30,
+            shared_with_host: false,
+        },
+    };
+    lib.create_context(&device)
+        .expect("a stub context on a mocked device")
+}
+
 /// A device error a registered backend classifies as sticky (the context is corrupted).
 pub fn sticky_device_error(detail: &str) -> KernelError {
     let name = backends::registry()

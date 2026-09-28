@@ -1,0 +1,47 @@
+# turbine-server configuration for the Phase 5 expert-parallel lab run on novanas:
+#   scripts/lab-cluster.sh ep2-novanas
+# Both R9700s of the Job form one EP group (expert_parallel_size 2, tensor_parallel_size 1, local
+# rank mode): each rank holds 32 of OLMoE's 64 routed experts per layer (contiguous placement)
+# and a replica of everything else, and the ranks combine the expert outputs with one all-reduce
+# per MoE layer. The scenario also runs tp 2 (= ep) with `--set`. The server listens on the
+# pod's loopback only. Weights: /home/piwi/turbine-models/olmoe-1b-7b-0125-instruct on the host,
+# mounted read-only at /models by scripts/lab/novanas-cluster-job.yaml. Execution, scheduler and
+# KV keys as scripts/lab/phase5-novanas-olmoe.yaml, so the EP run is comparable with the tp 2
+# run and the single-GPU baseline (decode graphs and overlapped launches are forced off for the
+# EP group, reason expert_parallel).
+server:
+  listen: 127.0.0.1:18000
+model:
+  path: /models/olmoe-1b-7b-0125-instruct
+  served_name: allenai/OLMoE-1B-7B-0125-Instruct
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: false
+parallel:
+  tensor_parallel_size: 1
+  expert_parallel_size: 2
+  data_parallel_size: 1
+  devices: [0, 1]
+  collective_backend: rccl
+  expert:
+    placement: contiguous
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 8GiB
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    # The Phase 2 scheduler.queue_timeout (CONFLICT C-1).
+    queue_timeout: 60s

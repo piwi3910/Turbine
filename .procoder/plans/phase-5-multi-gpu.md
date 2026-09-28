@@ -21,7 +21,7 @@ Copied verbatim from the spec (Constraints):
 - Every queue is bounded (TS §21 rule 8): the leader→worker plan channel holds at most _parallel.plan_queue_depth_ plans (default 2); frames on the static-mode socket are capped at 16 MiB.
 - No collective call may block forever: communicator init is bounded by `parallel.collective.init_timeout` and each step's collectives by `parallel.collective.op_timeout`; on expiry the communicator is aborted, the group enters the phase-3 circuit breaker as `CIRCUIT_OPEN`, and the reason is logged.
 - Every automatic decision (device grouping, vendor choice, backend choice, replica routing, pressure state of a group) emits a structured log line with a reason code and a metric (TS §14, §21 rule 7).
-- Correctness before speed (TS §21 rule 1): TP=2 must meet the phase-1 golden tolerance (≥ 14/16 prompts with the first 32 greedy tokens identical, top-5 |Δlogprob| ≤ 0.15 nats against the committed HF transformers BF16 fixtures) at concurrency 1 and the batched bounds at concurrency 16, as for any batching change, before any TP performance work is accepted; the same golden gate (c1 strict, c16 batched) holds for PP and EP. That golden check is the TP accuracy bound (user decision 2026-09-28, "P5: tensor-parallel accuracy bound"): TP output is not bit-exact with tp = 1 and raw logits are not bounded, since each all-reduce rounds BF16 partial sums (~1 % relative logit drift, identical greedy tokens).
+- Correctness before speed (TS §21 rule 1): TP=2 must meet the phase-1 golden tolerance (≥ 14/16 prompts with the first 32 greedy tokens identical, top-5 |Δlogprob| ≤ 0.15 nats against the committed HF transformers BF16 fixtures) at concurrency 1 and the batched bounds at concurrency 16, as for any batching change, before any TP performance work is accepted; the same golden gate (c1 strict, c16 batched) holds for PP and EP. Amended 2026-09-28 (user decision "P5: OLMoE golden tolerance under expert parallelism", A then C): a multi-GPU run (EP, TP, PP) is gated against a one-GPU capture of the same model and commit taken in the same lab run (`turbine-golden capture`, then `compare` with the model's `tolerance.json`: strict at c1, batched at c16); one GPU stays gated against the committed transformers reference, and the multi-GPU verdict against that reference is reported for information only; `turbine-golden positions` prints a prompt's teacher-forced per-position |Δ| for such checks. That golden check is the TP accuracy bound (user decision 2026-09-28, "P5: tensor-parallel accuracy bound"): TP output is not bit-exact with tp = 1 and raw logits are not bounded, since each all-reduce rounds BF16 partial sums (~1 % relative logit drift, identical greedy tokens).
 - Lab: Phase 5 hardware runs are on novanas only (k3s Job, `amd.com/gpu: 2`, `rust:1.97-trixie` image as in phase-0/phase-1 (CONFLICT C-7), hostPath `/opt/rocm/rocm` read-only; RCCL is `/opt/rocm/rocm/lib/librccl.so.1`). Ports are loopback inside the Job (HTTP 18000, static-mode leader 18100); no Service or host port is created. Read-only topology checks also run under `scripts/lab-test.sh dgx-spark`. Memory is capped by the phase-3 device budget.
 - Before any lab run that needs production workloads moved, GPUs emptied or memory freed on any host, the implementer asks the user first and waits; scripts never evict, scale or stop other workloads, and a Job that cannot be scheduled (GPUs in use) makes the script exit non-zero naming that reason.
 - With peer access disabled on novanas, RCCL uses host-staged transfers; the topology graph must report `p2p: disabled` rather than assume.
@@ -427,6 +427,8 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh`
 - [ ] Commit: `feat(model): pipeline stages over the collective's point-to-point pair`
 
+As built (2026-09-28, branch p5-pp-model 122253a): `turbine_model::pp` — `PpContext { stage, stages, layers, collective, stream }`, `check_stage`, `check`, `stage_config`, `kv_layout(cfg, layers, block_tokens)`, `weight_slots(cfg, &StageSpec)`, `requirements`, `available_requirements`, `workspace_bytes`, `build_executor`; the hidden state crosses stages through the merged `Collective::send` / `recv`; a stage's `ModelShape` and KV layout cover only its layers; only the last stage returns logits (a non-last stage's forward returns empty `Logits`); every stage receives the same `BatchInput` and runs `copy_blocks` on its own pool; decode graphs and overlapped launches are off under PP (WARN, reason `pipeline_parallel`). Tests `tiny_model pp2_matches_pp1_on_host` (last stage bitwise one device; the tiny checkpoints have 2 layers, so only 2 stages) and lab `hip_pp2_matches_pp1` (tiny_model quick tier 31/31). Loader: stages and EP ranks load through `WeightLoader::load_part(format, index, slots, whole, …)`, which skips tensors of other stages / ranks quietly (`LoadedWeights.elsewhere`, one debug line) instead of warning `unexpected_tensor` per tensor. Engine half (this task): one thread per stage, stages run concurrently (`send` may block until the peer receives).
+
 ## Task 24: Micro-batched pipeline in the engine and the PP lab run
 
 Files: `crates/turbine-scheduler/src/pipeline.rs` and `crates/turbine-scheduler/tests/sim.rs` (micro-batch assignment in the deterministic simulator), `crates/turbine-server/src/engine/{pp.rs,loop.rs}` (stage threads, bounded in-flight micro-batches, per-stage KV pools), `crates/turbine-server/src/{startup.rs,kv_orchestrator.rs}` (per-stage KV shards of unequal size), `scripts/lab/phase5-novanas-pp2.yaml`, `scripts/lab-cluster.sh` (`pp2-novanas`)
@@ -491,6 +493,8 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh`
 - [ ] Commit: `feat(server): expert-parallel serving and the ep2 lab run`
 
+As built (2026-09-28, branch p5-ep-server 3d1b8d8, Task 27): `ParallelPlan` gains `ep`, `experts` and `group_size()` = max(tp, ep); reasons `configured`, `ep_moe_only`, `backend:<name>`; `plan::expert_size` / `plan::expert_placement`; ep × dp with tp ∈ {1, ep}; refused before bind: ep on a dense model, ep not dividing the experts, other tp (`combination_unsupported:ep+tp`), too few devices, a bad placement file; `ep: auto` resolves to 1 (capacity is left to `tp: auto`). `check_executable(&mut ParallelPlan)` rebuilds the placement from the model's MoE layers and checks every rank; EP groups start on the TP group runtime (`RankPart` / `EpRank`, `PreparedModel.expert`), load through `WeightLoader::load_part`, with decode graphs and overlap off (reason `expert_parallel`); KV tier blocks hold every rank's copy. `/turbine/v1/status` `parallel` shows `pp`, `ep` and each rank's experts; the scheduler document's `expert` section is injected in `backend.rs` (not `turbine-api`); metrics `turbine_expert_rank_tokens_total{rank}`, `turbine_expert_imbalance_ratio`. Tests `plan::tests::expert_parallel_plans`, `parallel::tests::expert_parallel_checked_against_the_model`, `parallel::tests::expert_stats_feed_metrics_and_document`, `tiny_server ep2_serves_like_ep1` (tp 1 and tp 2), `server_cli ep_on_dense_model_exits_2`. ep2-novanas (2-GPU, GPU0 Gen5 x8 + GPU1 Gen4 x8): standard workload c16 ep1 611.8 tok/s (TTFT 118 ms, ITL 24.4 ms), ep2 rccl 802.3 (141 ms, 17.8 ms), ep2 hostmem 812.9 (138 ms, 17.6 ms); both ranks' expert counts non-zero; golden against the committed reference fails p14's likely bound (1.0246 > 1.01) while ep2 matches an ep1 capture 16/16 strict — open question "P5: OLMoE golden tolerance under expert parallelism". The scenario runs to the end and reports both comparisons.
+
 ## Task 28: Re-create a failed communicator while probing
 
 Files: `crates/turbine-server/src/engine/tp.rs` (swap every rank executor's collective, re-init step plan), `crates/turbine-server/src/reliability.rs` (probing hook), `crates/turbine-distributed/src/rank.rs` (a `Reinit` step message, protocol v3), `crates/turbine-model/src/tp.rs` / `ep.rs` (`set_collective` on the executor), `crates/turbine-server/tests/tiny_server.rs`
@@ -507,6 +511,8 @@ Interfaces:
 - [ ] Commit: `feat(server,distributed): re-create a failed communicator while probing`
 
 ## Task 29: Batch-invariant GEMM rows for the tensor-parallel shapes
+
+Main open accuracy item for the Phase 5 exit (coordinator, 2026-09-28): this task must fix or explain OLMoE tp 2 p10 — greedy divergence at token 21 with margin 1.3 (not a near-tie), likely |Δ| 1.36 / 1.33 against the one-GPU capture (ep 2 × tp 2) and 0.98–1.17 against the transformers reference. Until it lands, `ep2-novanas` reports its ep 2 × tp 2 leg as `known_fail task29` (not deciding the verdict).
 
 Files: `kernels/rocm/tuning/gfx1201/gemm.tsv`, `crates/turbine-kernels/tests/hip_ops.rs` (the invariance check over the new rows), `crates/turbine-server/tests/kv_gpu.rs` (prefix reuse at tp 2)
 Interfaces:
@@ -550,7 +556,11 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh`
 - [ ] Commit: `feat(reliability,server): KV admission reserves on every rank's ledger`
 
+As built (2026-09-28, branch p5-group-reservation 3d069c2): the group's reservation is rank 0's `Reservation` carrying the other ranks' as members (`Reservation::with_members` / `members`, `GroupReservation::into_reservation`), so commit, preemption, cancellation, SURVIVAL requeue, forks and pool payment reach every rank without scheduler changes; `multi_device::try_reserve_group` reserves rank by rank and rolls back on the first refusal (`reserve_group` wraps it); `Admission::with_group_ledgers` decides against the tightest rank (a request larger than the smallest pool is `context_exceeds_kv_capacity`); one pressure machine per group, fed by the worst rank's KV utilisation (`PressureController::with_group_ranks`), every rank reporting the group state; `/turbine/v1/pressure` lists every rank; sim `OverloadConfig.group_kv_blocks`. Tests: `overload_sim group_reservation_unequal_pools`, `admission::tests::group_admission_reserves_on_every_rank`, `multi_device::tests::group_reservation_commits_and_releases_every_rank`, `tiny_server tp2_admission_reserves_on_both_ranks`. `static` mode still admits on the leader's ledger (open question "P5: group KV admission in static rank mode").
+
 ## Task 32: Tensor-parallel performance
+
+Also tracked here and in Task 29 (coordinator, 2026-09-28): OLMoE p10 at tp 2 and at ep 2 × tp 2 (identical prefix 21/32, margin 1.24 at the divergence, likely |Δ| 0.98–1.17 against the transformers reference) — under the multi-GPU gate it is judged against the one-GPU capture; check whether the Task 29 rows remove it.
 
 Files: as the measurements direct (`crates/turbine-model/src/tp.rs`, `crates/turbine-distributed/src/collective/hostmem.rs` thresholds, decode graphs under TP), `crates/turbine-model/tests/perf.rs` (`tp_step_profile`)
 Interfaces:
@@ -563,3 +573,17 @@ Interfaces:
 - [ ] Land fixes one at a time — hostmem route thresholds for prefill-size messages, the Task 29 rows, decode graphs under TP if feasible — each followed by `scripts/bench-lock.sh scripts/lab-cluster.sh tp2-novanas` (golden c1/c16 and the bench) and a labbook upload.
 - [ ] Gate: `scripts/gate.sh` per commit.
 - [ ] Commit: one `perf(...)` commit per fix.
+
+## Task 33: Mirror ledgers for group admission in static rank mode
+
+Files: `crates/turbine-distributed/src/rank.rs` (the budget in `Hello`, a ledger digest on the rank link, protocol v3), `crates/turbine-reliability/src/{ledger.rs,multi_device.rs}` (a mirror ledger built from a worker's budget; a ledger digest), `crates/turbine-server/src/{engine/tp.rs,startup.rs,model.rs}` (the leader builds one mirror per joined worker and admits through `reserve_group` over its own ledger and the mirrors; the worker applies the leader's reservations to its real ledger in step order and compares digests), `crates/turbine-server/tests/tiny_server.rs`
+Interfaces:
+
+- `Hello` gains the worker's KV budget (blocks, bytes per block, reserve); `RankMessage::StepPlan` carries, every _n_ steps, the leader's mirror digest for that rank (the ledger state after the plan's reservations are applied); the worker compares it with its real ledger's digest after the same step and logs `event="ledger_mirror_divergence"` (WARN, reason code `mirror_digest_mismatch`, metric `turbine_ledger_mirror_divergence_total{rank}`) on a mismatch
+  Covers: user decisions "P5: KV admission across tensor-parallel ranks" (B) and "P5: group KV admission in static rank mode" (B); S-8
+  Depends on: Tasks 12, 17, 31
+
+- [ ] Write failing test `tiny_server tp2_static_mirror_matches_worker_ledger`: a tp 2 `static` group on the cpu backend over loopback `tcp` and the host collective, a mixed workload (concurrent streams, cancels mid-stream, preemption forced by a small pool) — after it, each mirror's reservations equal the worker's real ledger exactly, and no divergence was logged; a deliberately skewed worker ledger logs `mirror_digest_mismatch` once per check. Run: `cargo test -p turbine-server --test tiny_server tp2_static_mirror_matches_worker_ledger` — expect FAIL.
+- [ ] Implement.
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(server,distributed,reliability): mirror ledgers for group admission in static rank mode`
