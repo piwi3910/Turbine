@@ -1531,14 +1531,42 @@ Also relayed the same night (coordinator, at the user's request "more speed"): b
 
 Downloaded on `novanas` by the fixtures builder with `hf download <repo> --revision <sha> --local-dir /home/piwi/turbine-models/<slug>` (approved: user answer Q4 and "Continue through Phases 6a and 6b unattended"), every one rc 0, `config.json` and the listed safetensors present:
 
-| Slug | Repo @ revision | Bytes |
-| ---- | --------------- | ----- |
-| `llama-3.2-3b-instruct-fp8-dynamic` | `RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic` @ `c308a86de78778c5f904a1d82401ac85e18ca205` | 4,413,814,259 |
-| `llama-3.2-3b-instruct-fp8` | `RedHatAI/Llama-3.2-3B-Instruct-FP8` @ `377571d314b30f1d58448499e4100e2deafe7d7d` | 4,404,163,249 |
-| `llama-3.2-3b-instruct-fp8-block` | `unsloth/Llama-3.2-3B-Instruct-FP8-Block` @ `08cf804398b23fab4a1df02fbe8d4d5a11a800cc` | 3,624,601,065 |
-| `llama-3.2-3b-instruct-awq` | `casperhansen/llama-3.2-3b-instruct-awq` @ `272b3bde867b606760447deb9a4d2719fbdfd3ae` | 2,270,034,219 |
-| `llama-3.2-3b-instruct-gptq` | `shuyuej/Llama-3.2-3B-Instruct-GPTQ` @ `dd5a311f040728fbc612eb03c8dadfae0a90552f` | 2,264,970,345 |
-| `llama-3.2-3b-mxfp4-a4` | `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` @ `91925ffda6977d097354a99718a20e035f8af80a` | 2,303,041,140 |
-| `llama-3.1-8b-instruct-mxfp4a16` | `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16` @ `14c3aca849a72df8fcc8b3a30ab8d9eed86ee646` | 5,827,024,421 |
+| Slug                                | Repo @ revision                                                                                       | Bytes         |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------- | ------------- |
+| `llama-3.2-3b-instruct-fp8-dynamic` | `RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic` @ `c308a86de78778c5f904a1d82401ac85e18ca205`             | 4,413,814,259 |
+| `llama-3.2-3b-instruct-fp8`         | `RedHatAI/Llama-3.2-3B-Instruct-FP8` @ `377571d314b30f1d58448499e4100e2deafe7d7d`                     | 4,404,163,249 |
+| `llama-3.2-3b-instruct-fp8-block`   | `unsloth/Llama-3.2-3B-Instruct-FP8-Block` @ `08cf804398b23fab4a1df02fbe8d4d5a11a800cc`                | 3,624,601,065 |
+| `llama-3.2-3b-instruct-awq`         | `casperhansen/llama-3.2-3b-instruct-awq` @ `272b3bde867b606760447deb9a4d2719fbdfd3ae`                 | 2,270,034,219 |
+| `llama-3.2-3b-instruct-gptq`        | `shuyuej/Llama-3.2-3B-Instruct-GPTQ` @ `dd5a311f040728fbc612eb03c8dadfae0a90552f`                     | 2,264,970,345 |
+| `llama-3.2-3b-mxfp4-a4`             | `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` @ `91925ffda6977d097354a99718a20e035f8af80a`             | 2,303,041,140 |
+| `llama-3.1-8b-instruct-mxfp4a16`    | `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16` @ `14c3aca849a72df8fcc8b3a30ab8d9eed86ee646` | 5,827,024,421 |
 
 Free disk went from 99.0 GB before to 72.3 GB after the last download (00:17). The 8B BF16 baseline (`unsloth/Llama-3.1-8B-Instruct` @ `4699cc75b550f9c6f3173fb80f4703b62d946aa5`, 16 GB) is on hold: novanas fell to 49 GB free at 00:25 (other workspaces' build trees) and the kubelet evicts lab pods below ~47.7 GB; it is downloaded once stale build trees are cleared.
+
+## Phase 6a/6b builder decisions, provisional (2026-09-29)
+
+Taken under "Continue through Phases 6a and 6b unattended (2026-09-29)" (rule 2: recommended option, provisional, pending user review); each is also a line of `.procoder/review-2026-09-29.md`.
+
+**YaRN (6a Task 26, landed 42ee226):**
+
+1. Tolerance of `yarn_parameters_match_transformers`: transformers computes the YaRN table in FP32 with a `powf` 1 ulp off, so the spec's 1e-7 relative is below FP32 resolution. A) FP64 as specified, each value within 2 FP32 ulps (max seen 1.46e-7) — chosen; B) mimic transformers' FP32 operation order (252/256 bitwise, the rest 1 ulp, max 1.12e-7). Spec S-15 criterion amended to "within 2 FP32 ulps". **Provisional, pending user review — A.**
+2. Context extension: YaRN extends `max_positions` only when `original_max_position_embeddings` < `max_position_embeddings` (the spec's edge case literally; a model with both equal, e.g. Qwen2.5 at 32768, is not extended). Alternative: always allow up to `max(factor × original, max_position_embeddings)`. **Provisional — as the spec.**
+3. Refusals where transformers only warns: factor < 1, attention factor ≤ 0, `beta_slow` > `beta_fast` or ≤ 0. **Provisional.**
+4. Defaults follow Python's `or` (0 means default for the original length and the betas); unknown keys ignored; `dynamic: false` accepted. **Provisional.**
+5. `rope_identity()` includes `rotary_dim` next to theta and the scaling fields. **Provisional.**
+
+**FP8 KV (6a Task 22, landed 877b0ab):** a paged `AttentionConfig.dtype` of F8E4M3 means FP8 pages while Q, the new rows and the output stay BF16 (the C descriptor's `dtype` = 16 means the same); the CPU row `cpu/*/*/bf16/fp8_e4m3/none` is `experimental`, `amd` stays `unsupported` until Task 24's gate. **Provisional.**
+
+**6b groundwork (branch `p6b-groundwork`: 0a0b20a, 3d07054, 66dcf2d; lands with 6b):**
+
+1. TurboQuant QJL projection: the plan's second randomized Hadamard (`H·(s'⊙r)`) failed the unbiasedness test (overestimates ⟨q, r⟩ by ~2.7 %: tq4 mean error 6.5e-4 > 3 SE 3.7e-4). A) the paper's Gaussian projection S (128 × 128, seeded per layer and head) — chosen: unbiased (tq4 5.4e-5 vs limit 6.0e-4), but O(d²) encode/decode and 64 KB of S per (layer, head) passed to the GPU codec (~15 MB Llama, ~17 MB OLMoE); B) one S per namespace (64 KB); C) keep Hadamard and loosen unbiasedness. **Provisional — A**; 6b plan Task 7 / spec S-4 updated when 6b starts.
+2. `turbine-kv` keeps its own bit-exact copy of the e4m3fn rounding (tested against the kernels' table) instead of moving it to `turbine-core`. **Provisional.**
+3. `KvCodec`: takes `&KvLayout`; `CodecParams` carries per-layer `k_scales` / `v_scales`; `lossy(layout)` (FP8 is lossless from an FP8 L0); extra `abi_code`, `nmse_bound`, `supports`; registration order is the ladder order. **Provisional.**
+4. FP8 codec from BF16 L0: one K and one V scale per block per layer, `max(absmax / 448, 1 / (448·512))`, in a slot header (alternative: per token or per head). **Provisional.**
+5. TurboQuant record layout: array of structs per token-head in the spec's field order, padded to 16 bytes (tq4 144 B = 3.56× BF16, tq2 80 B = 6.4×; unpadded would be 3.82× / 7.3×); codes LSB-first. Alternatives: struct of arrays per (layer, head), or no padding. **Provisional.**
+6. Rounding: codes from the exact F32 norm, decode and residual from the BF16-rounded norm (QJL corrects the norm rounding); ties between centroids take the lower code; a zero QJL projection signs +1. **Provisional.**
+7. Seeds: SplitMix64 from the namespace seed mixed with (layer, head, kind: K 0, V 1, QJL 2); Box–Muller in F64 rounded to F32; block-local head index (global head index under TP is a 6b Task 8/15 decision). **Provisional.**
+8. Codebooks: trapezoid integration on 2^18 points, Lloyd iteration to 1e-13, committed as symmetrised F32 constants regenerated within 1e-6 by the test (distortion 0.3609 / 0.1160 / 0.0340 / 0.00931 for 1–4 bits vs the paper's 0.36 / 0.117 / 0.03 / 0.009). **Provisional.**
+9. Conformance NMSE bounds: tq4 0.07, tq2 0.75 over a block (K error ≈ (π/2)·D_mse from the Gaussian QJL). **Provisional.**
+10. Ladder policy: no action at GREEN; a tier acts only when it is the lowest and about to drop, or above high water; one rung down from the copy's own format, capped at `max_format`; an upper tier acts only once every lower tier reached the target rung; at the floor the lowest tier evicts and an upper tier keeps or demotes; `LadderContext` gains `format`, `must_leave`, `demote_to`, `lower_rung`, `ladder` (the spec's `PressureLevel` is `PressureState`). **Provisional.**
+11. `EvictReason::{Compressed, LadderFloor}` exist but join the pre-registered metric label sets only with 6b Task 15 (so `api.rs check_labels` stays green). **Provisional.**
