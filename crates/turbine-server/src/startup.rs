@@ -1,7 +1,8 @@
 //! Startup order (P1 §Interfaces, contract §16.3): config and module names (exit 2) →
 //! support-matrix row with the device arch unknown (exit 2 when unsupported; also under
 //! `--check-config`) → tracing → device discovery → support-matrix row with the device arch
-//! (exit 2 when unsupported; `event="support_matrix"`, WARN when experimental) → the P4 `kv`
+//! (exit 2 when unsupported; `event="support_matrix"`, WARN when experimental) → the node
+//! topology graph (P5 S-1, never fails; `GET /turbine/v1/topology`) → the P4 `kv`
 //! host rules (`kv.cpu.max_bytes` against MemTotal minus `reliability.memory.host_reserve_bytes`
 //! exit 2, `kv.nvme.max_bytes` against free disk exit 1) → kernel provider → model config,
 //! tokenizer, template → kernel registry → pre-load memory budget (P3 S-2: the KV pool, the
@@ -27,6 +28,7 @@
 //! C-25).
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +39,7 @@ use turbine_core::clock::SystemClock;
 use turbine_core::config::{self, Config, ConfigError};
 use turbine_core::support::SupportRowView;
 use turbine_device::telemetry::TelemetryMetrics;
+use turbine_device::topology::{RegisteredTopology, TopologyGraph, discover_topology};
 use turbine_device::{DeviceInventory, DeviceMetrics, DiscoveryOptions};
 use turbine_kv::KvMetrics;
 use turbine_kv::tier::L2NvmeTier;
@@ -141,6 +144,8 @@ pub fn run(cli: Cli) -> ExitCode {
         Err(e) => return refuse_support(&e),
     };
     support_startup::log(&support);
+    // P5 S-1: the node-local topology graph, right after discovery (never fails).
+    let topology = capture_topology(&DiscoveryOptions::from_config(&config.devices), &inventory);
 
     // P4 host rules (contract §16.3): a `kv.nvme.*` violation is a runtime failure (exit 1),
     // any other an invalid configuration (exit 2); both before anything is bound.
@@ -205,6 +210,7 @@ pub fn run(cli: Cli) -> ExitCode {
     let code = runtime.block_on(serve(
         config,
         inventory,
+        topology,
         metrics,
         prepared,
         support.view(),
@@ -232,6 +238,7 @@ struct ServeKv {
 async fn serve(
     config: Config,
     inventory: DeviceInventory,
+    topology: TopologyGraph,
     metrics: MetricsRegistry,
     prepared: PreparedModel,
     support: SupportRowView,
@@ -244,8 +251,11 @@ async fn serve(
         scheduler: SchedulerMetrics::register(&metrics),
         kv: kv.metrics,
     };
-    let backend =
-        Arc::new(ModelBackend::new(&prepared, &inventory, &engine_metrics).with_support(support));
+    let backend = Arc::new(
+        ModelBackend::new(&prepared, &inventory, &engine_metrics)
+            .with_support(support)
+            .with_topology(&topology),
+    );
     let state = ApiState {
         inference: backend.clone(),
         diagnostics: backend.clone(),
@@ -349,6 +359,24 @@ async fn serve(
             code
         }
     }
+}
+
+/// Startup step after discovery (P5 S-1): the node-local topology graph from `/sys` and the
+/// vendor source of every registered discovery kind (never fails; missing sources are `unknown`
+/// with one WARN each), logged as `event="topology_captured"`.
+fn capture_topology(opts: &DiscoveryOptions, inventory: &DeviceInventory) -> TopologyGraph {
+    let started = std::time::Instant::now();
+    let mut vendor = RegisteredTopology::new(opts.clone());
+    let graph = discover_topology(Path::new("/sys"), inventory, &mut vendor);
+    tracing::info!(
+        event = "topology_captured",
+        hostname = %graph.node.hostname,
+        vertices = graph.vertices.len(),
+        edges = graph.edges.len(),
+        seconds = started.elapsed().as_secs_f64(),
+        "node topology captured"
+    );
+    graph
 }
 
 /// Resolves when the listener should close: after a signal, the drain and the engine stop

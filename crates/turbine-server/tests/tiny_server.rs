@@ -698,6 +698,22 @@ fn completions_stream_and_non_stream() {
     assert_eq!(status["model"]["architecture"], "LlamaForCausalLM");
     assert!(status["model"]["weight_bytes"].as_u64().unwrap() > 0);
     assert!(status["model"]["load_seconds"].as_f64().is_some());
+
+    // P5 S-1: the node graph captured at startup (whatever this host's sysfs holds; discovery
+    // never fails), the same document with `scope=node`, and no cluster scope before Phase 6.
+    let topology = server.get("/turbine/v1/topology");
+    assert_eq!(topology.status, 200, "{}", topology.body);
+    let graph = topology.json();
+    assert!(graph["node"]["hostname"].is_string(), "{graph}");
+    assert!(graph["node"]["captured_at"].is_string(), "{graph}");
+    assert!(graph["vertices"].is_array(), "{graph}");
+    assert!(graph["edges"].is_array(), "{graph}");
+    assert_eq!(
+        server.get("/turbine/v1/topology?scope=node").json(),
+        graph,
+        "the graph is captured once"
+    );
+    assert_eq!(server.get("/turbine/v1/topology?scope=cluster").status, 400);
 }
 
 /// Phase 2m: `/turbine/v1/status` names the module chosen at each extension point and, per op

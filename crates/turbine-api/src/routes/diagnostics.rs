@@ -1,12 +1,14 @@
 //! `/turbine/v1/*` diagnostics.
 
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 
-use crate::backend::ApiState;
+use crate::backend::{ApiState, TopologyScope};
 use crate::error::ApiError;
 use crate::kv::{PrefetchAccepted, PrefetchRequest};
 
@@ -51,4 +53,16 @@ pub(super) async fn scheduler(
     State(state): State<ApiState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.diagnostics.scheduler().map(Json)
+}
+
+/// `?scope=node` (the default); any other scope is 400 `unsupported_parameter` until phase 6.
+pub(super) async fn topology(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let scope = match query.get("scope").map(String::as_str) {
+        None | Some("node") => TopologyScope::Node,
+        Some(_) => return Err(ApiError::unsupported_parameter("scope")),
+    };
+    state.diagnostics.topology(scope).map(Json)
 }

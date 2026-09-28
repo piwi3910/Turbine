@@ -82,6 +82,20 @@ pub trait Diagnostics: Send + Sync {
     fn scheduler(&self) -> Result<serde_json::Value, ApiError>;
     fn kv(&self) -> Result<serde_json::Value, ApiError>;
     fn pressure(&self) -> Result<serde_json::Value, ApiError>;
+    /// `GET /turbine/v1/topology` (P5 S-1): the topology graph captured at startup. The default
+    /// is `ApiError::not_implemented()` for a source that captured none.
+    fn topology(&self, scope: TopologyScope) -> Result<serde_json::Value, ApiError> {
+        let _ = scope;
+        Err(ApiError::not_implemented())
+    }
+}
+
+/// `?scope=` of `GET /turbine/v1/topology`. Phase 6 adds `Cluster`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TopologyScope {
+    /// This node's graph (the default).
+    Node,
 }
 
 /// Source of the `/ready` answer.

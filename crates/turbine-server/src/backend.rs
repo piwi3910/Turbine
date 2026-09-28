@@ -26,7 +26,7 @@ use turbine_api::openai::request::{OpenAiRequest, PromptInput, ResponseFormat, T
 use turbine_api::{
     ApiError, BoxFuture, Diagnostics, GenerationStream, InferenceBackend, InferenceRequest,
     ModelCard, NotReadyReason, PrefetchAccepted, PrefetchRequest, Readiness, ReadyState,
-    readiness_for_circuit,
+    TopologyScope, readiness_for_circuit,
 };
 use turbine_core::request::{
     ConstraintSpec, Endpoint, ErrorCode, GenerationRequest, SamplingParams, SessionHints,
@@ -35,6 +35,7 @@ use turbine_core::request::{
 use turbine_core::support::SupportRowView;
 use turbine_core::types::{CircuitState, PressureState, Priority};
 use turbine_device::DeviceInventory;
+use turbine_device::topology::TopologyGraph;
 use turbine_kernels::Selection;
 use turbine_kv::blocks_for_tokens;
 use turbine_kv::hierarchy::PrefetchError;
@@ -191,6 +192,8 @@ pub struct ModelBackend {
     kernels: Vec<KernelChoiceView>,
     /// The support-matrix row resolved at startup (`support` of the status document).
     support: Option<SupportRowView>,
+    /// The node topology graph captured at startup (`GET /turbine/v1/topology`, P5 S-1).
+    topology: Option<Value>,
 }
 
 impl ModelBackend {
@@ -246,7 +249,14 @@ impl ModelBackend {
                 .map(KernelChoiceView::from)
                 .collect(),
             support: None,
+            topology: None,
         }
+    }
+
+    /// Serves `graph` at `GET /turbine/v1/topology` (captured once at startup).
+    pub fn with_topology(mut self, graph: &TopologyGraph) -> ModelBackend {
+        self.topology = serde_json::to_value(graph).ok();
+        self
     }
 
     /// Reports `support` (the support-matrix row resolved at startup) in the status document.
@@ -765,6 +775,13 @@ impl Diagnostics for ModelBackend {
         let loaded = self.loaded.get().ok_or_else(ApiError::model_not_loaded)?;
         serde_json::to_value(loaded.controller.document())
             .map_err(|e| ApiError::internal(e.to_string()))
+    }
+    /// The graph captured at startup; only the node scope exists before Phase 6.
+    fn topology(&self, scope: TopologyScope) -> Result<Value, ApiError> {
+        match (scope, &self.topology) {
+            (TopologyScope::Node, Some(graph)) => Ok(graph.clone()),
+            _ => Err(ApiError::not_implemented()),
+        }
     }
 }
 

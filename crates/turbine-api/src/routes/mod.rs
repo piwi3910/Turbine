@@ -29,6 +29,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/turbine/v1/kv/prefetch", post(diagnostics::kv_prefetch))
         .route("/turbine/v1/pressure", get(diagnostics::pressure))
         .route("/turbine/v1/scheduler", get(diagnostics::scheduler))
+        .route("/turbine/v1/topology", get(diagnostics::topology))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(limit))

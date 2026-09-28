@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use turbine_api::{
     ApiError, ApiLimits, ApiState, Diagnostics, InferenceBackend, ModelCard, NotReadyReason,
-    Readiness, ReadyState, router,
+    Readiness, ReadyState, TopologyScope, router,
 };
 use turbine_observability::{MetricsRegistry, OPENMETRICS_CONTENT_TYPE};
 
@@ -1999,4 +1999,80 @@ async fn kv_metrics_bounded() {
     {
         check_labels(line);
     }
+}
+/// The novanas pair as `turbine_device::topology::TopologyGraph` serialises it.
+fn two_gpu_graph() -> Value {
+    let gpu = |i: u32, bdf: &str| {
+        json!({"id": format!("gpu{i}"), "kind": "gpu", "device_index": i, "vendor": "amd",
+               "arch": "gfx1201", "pci_bus_id": bdf, "numa": 0, "numa_source": "nominal"})
+    };
+    json!({
+        "node": {"hostname": "novanas", "captured_at": "2026-09-25T12:00:00Z"},
+        "vertices": [
+            {"id": "numa0", "kind": "numa", "node": 0, "cpus": "0-31",
+             "memory_bytes": 137_438_953_472u64, "distances": [10]},
+            gpu(0, "0000:03:00.0"),
+            gpu(1, "0000:07:00.0"),
+        ],
+        "edges": [{"a": "gpu0", "b": "gpu1", "kind": "pcie", "path": "sys", "hops": 2,
+                   "link_gts": 32.0, "width": 16, "p2p": "disabled",
+                   "vendor_interconnect": null, "rdma": null, "source": "vendor"}],
+    })
+}
+
+struct TopologyDiagnostics(Value);
+impl Diagnostics for TopologyDiagnostics {
+    fn status(&self) -> Value {
+        json!({})
+    }
+    fn devices(&self) -> Value {
+        json!({"devices": [], "backends": []})
+    }
+    fn scheduler(&self) -> Result<Value, ApiError> {
+        Err(ApiError::not_implemented())
+    }
+    fn kv(&self) -> Result<Value, ApiError> {
+        Err(ApiError::not_implemented())
+    }
+    fn pressure(&self) -> Result<Value, ApiError> {
+        Err(ApiError::not_implemented())
+    }
+    fn topology(&self, scope: TopologyScope) -> Result<Value, ApiError> {
+        assert_eq!(scope, TopologyScope::Node);
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn topology_route() {
+    let graph = two_gpu_graph();
+    let app = router(ApiState {
+        inference: Arc::new(NoModel),
+        diagnostics: Arc::new(TopologyDiagnostics(graph.clone())),
+        readiness: Arc::new(NotReady),
+        metrics: MetricsRegistry::new(),
+        limits: ApiLimits {
+            max_request_bytes: 1 << 20,
+        },
+    });
+    for path in ["/turbine/v1/topology", "/turbine/v1/topology?scope=node"] {
+        let (s, b) = get_json(&app, "GET", path).await;
+        assert_eq!(s, StatusCode::OK, "{path}");
+        assert_eq!(b["vertices"], graph["vertices"], "{path}");
+        assert_eq!(b["edges"], graph["edges"], "{path}");
+        assert_eq!(b, graph, "{path}");
+    }
+    // Cluster scope arrives with phase 6.
+    let (s, b) = get_json(&app, "GET", "/turbine/v1/topology?scope=cluster").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_error(&b, "invalid_request_error", "unsupported_parameter");
+
+    // A diagnostics source without a captured graph answers 501, like the other documents.
+    let (s, b) = get_json(&app_default(), "GET", "/turbine/v1/topology").await;
+    assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
+    assert_error(&b, "not_implemented", "not_implemented");
+}
+
+fn app_default() -> Router {
+    app(1 << 20)
 }

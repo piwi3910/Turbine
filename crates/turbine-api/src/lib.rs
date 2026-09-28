@@ -10,7 +10,8 @@ pub mod support;
 
 pub use backend::{
     ApiLimits, ApiState, BoxFuture, Diagnostics, GenerationStream, InferenceBackend,
-    InferenceRequest, ModelCard, NotReadyReason, Readiness, ReadyState, readiness_for_circuit,
+    InferenceRequest, ModelCard, NotReadyReason, Readiness, ReadyState, TopologyScope,
+    readiness_for_circuit,
 };
 pub use error::{ApiError, ErrorType};
 pub use kv::{PrefetchAccepted, PrefetchRequest, TurbineHeaders};
