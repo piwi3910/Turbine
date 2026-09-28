@@ -264,7 +264,7 @@ fn gemm_case(p: &Pair, rng: &mut Rng, m: usize, n: usize, k: usize, c_dtype: DTy
 
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
-fn gemm_matches_cpu() {
+fn bf16_gemm_matches_cpu() {
     if !require_backend("hip") {
         return;
     }
@@ -4663,6 +4663,9 @@ fn implementations_enumerated() {
         (OpKind::LogitsReduce, one("turbine_hip", "turbine_hip")),
         (OpKind::RowSumsq, one("turbine_hip", "turbine_hip")),
         (OpKind::RmsnormSharded, one("turbine_hip", "turbine_hip")),
+        // ABI v2.9 (Phase 6a).
+        (OpKind::QGemm, one("hipblaslt_fp8", "hipblaslt")),
+        (OpKind::QuantizeAct, one("turbine_hip", "turbine_hip")),
     ];
     assert_eq!(table.len(), OpKind::ALL.len());
     for (op, want) in &table {
@@ -4975,6 +4978,11 @@ fn every_implementation_matches_cpu() {
         }
     }
     for &op in OpKind::ALL {
+        // The v2.9 quantized ops are run against the CPU reference by their own suite
+        // (`tests/hip_qgemm.rs`), implementation by implementation as their builders add them.
+        if matches!(op, OpKind::QGemm | OpKind::QuantizeAct) {
+            continue;
+        }
         for info in p.hip.implementations(op) {
             if ran.iter().any(|(o, n)| *o == op && *n == info.name) {
                 continue;
