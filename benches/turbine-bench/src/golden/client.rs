@@ -93,6 +93,22 @@ impl Endpoint {
     }
 }
 
+impl Endpoint {
+    /// POST `body` to `path` and return the JSON reply (non-2xx is an endpoint error).
+    pub async fn post_json(&self, path: &str, body: &Value) -> Result<Value, GoldenError> {
+        let url = format!("{}{path}", self.base);
+        let resp = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| GoldenError::Endpoint(format!("POST {url}: {e}")))?;
+        json_body(resp, &url).await
+    }
+}
+
 async fn json_body(resp: reqwest::Response, url: &str) -> Result<Value, GoldenError> {
     let status = resp.status();
     let text = resp

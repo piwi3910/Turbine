@@ -4,6 +4,7 @@
 pub mod client;
 pub mod compare;
 pub mod fixture;
+pub mod positions;
 
 pub use client::{Endpoint, Generation, capture, compare};
 pub use compare::{CompareReport, MissingTopK, PromptVerdict, compare_prompt, judge};

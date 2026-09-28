@@ -1,4 +1,4 @@
-//! `turbine-golden compare|capture` (P1 S-11): exit 0 when the tolerance holds (or the capture
+//! `turbine-golden compare|capture|positions` (P1 S-11; `positions`: P5): exit 0 when the tolerance holds (or the capture
 //! was written), 1 when it is violated or the endpoint fails, 2 on usage or I/O errors.
 
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use turbine_bench::golden::fixture::{
     read_jsonl, read_prompts, read_tolerance, write_jsonl_atomic,
 };
-use turbine_bench::golden::{Endpoint, GoldenError, ReferenceRecord, capture, compare};
+use turbine_bench::golden::{Endpoint, GoldenError, ReferenceRecord, capture, compare, positions};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
@@ -65,6 +65,34 @@ enum Command {
         model: Option<String>,
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(2..=20))]
         top_logprobs: u32,
+    },
+    /// One reference prompt judged position by position: every reference top-k candidate's
+    /// |Δ logprob|, tier and strict bound. With --url the endpoint is teacher-forced on the
+    /// reference's tokens (every position has the reference's history); with --candidate a
+    /// captured record is judged up to its first divergence. Always exits 0 on success.
+    Positions {
+        #[arg(long)]
+        reference: PathBuf,
+        /// The prompt id, e.g. p14.
+        #[arg(long)]
+        prompt_id: String,
+        /// Teacher-force this endpoint (completions route, token-id prompts).
+        #[arg(
+            long,
+            conflicts_with = "candidate",
+            required_unless_present = "candidate"
+        )]
+        url: Option<String>,
+        /// A captured reference.jsonl to judge instead of an endpoint.
+        #[arg(long)]
+        candidate: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Default: tolerance.json beside the reference.
+        #[arg(long)]
+        tolerance: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        output: OutputFormat,
     },
 }
 
@@ -156,6 +184,59 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
                 records.len(),
                 out.display()
             );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Positions {
+            reference,
+            prompt_id,
+            url,
+            candidate,
+            model,
+            tolerance,
+            output,
+        } => {
+            let references: Vec<ReferenceRecord> = read_jsonl(&reference)?;
+            let find = |records: &[ReferenceRecord], what: &Path| {
+                records
+                    .iter()
+                    .find(|r| r.id == prompt_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        GoldenError::Usage(format!("no prompt {prompt_id} in {}", what.display()))
+                    })
+            };
+            let record = find(&references, &reference)?;
+            let tolerance =
+                tolerance.unwrap_or_else(|| reference_dir(&reference).join("tolerance.json"));
+            let tol = read_tolerance(&tolerance)?;
+            let (rows, source) = match (url, candidate) {
+                (Some(url), _) => {
+                    let endpoint = Endpoint::new(&url)?;
+                    let model = endpoint.model(model.as_deref()).await?;
+                    let rows =
+                        positions::positions_teacher_forced(&endpoint, &model, &record, &tol)
+                            .await?;
+                    (rows, format!("teacher-forced {url}"))
+                }
+                (None, Some(path)) => {
+                    let captured: Vec<ReferenceRecord> = read_jsonl(&path)?;
+                    let cand = find(&captured, &path)?;
+                    (
+                        positions::positions_of_capture(&record, &cand, &tol),
+                        format!("capture {}", path.display()),
+                    )
+                }
+                (None, None) => {
+                    return Err(GoldenError::Usage("pass --url or --candidate".into()));
+                }
+            };
+            match output {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rows).expect("rows serialize")
+                ),
+                OutputFormat::Text => print!("{}", positions::to_text(&prompt_id, &source, &rows)),
+            }
             Ok(ExitCode::SUCCESS)
         }
     }
