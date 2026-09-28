@@ -16,6 +16,8 @@ A collective backend reduces, gathers and broadcasts buffers across the ranks of
 | `CollectiveLibrary::open(init)`             | Rank `init.rank` of `init.world` for that id, bounded by `init.init_timeout` (on expiry: abort, `Timeout { op: "comm_init" }`).                                                                                  |
 | `Collective`                                | `all_reduce` / `reduce_scatter` (BF16 or FP32, `Sum` / `Max`), byte-wise `all_gather` / `broadcast`, `barrier`, `abort`. Every call is bounded by the op timeout; after an abort every call on every rank fails. |
 
+A backend whose calls return before the device work completes (NCCL-API) also bounds a whole step: `Collective::step_begin` arms a deadline that `step_end` (after the caller synchronised its stream) clears, and its watchdog aborts the communicator when the deadline passes — a peer that never arrives otherwise leaves a device kernel waiting forever.
+
 Buffers are `DeviceSlice`s of the phase-1 device layer and ordering is its `StreamRef` (`native_handle()` is the vendor stream); a backend never allocates model memory and adds no GPU runtime binding of its own.
 
 ## Files to add

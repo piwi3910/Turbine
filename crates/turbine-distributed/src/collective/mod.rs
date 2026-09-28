@@ -79,6 +79,16 @@ pub trait Collective: Send + Sync {
         stream: &StreamRef,
     ) -> Result<(), CollectiveError>;
     fn barrier(&self, stream: &StreamRef) -> Result<(), CollectiveError>;
+    /// Starts bounding one step: every collective enqueued until [`Self::step_end`] must
+    /// complete on the device within the op timeout, or the communicator is aborted (a peer
+    /// that never arrives otherwise leaves a device kernel waiting forever). Default: nothing
+    /// (backends whose calls complete before they return).
+    fn step_begin(&self) {}
+    /// The step's work has completed (the caller synchronised its stream); `Err` when the
+    /// communicator was aborted meanwhile.
+    fn step_end(&self) -> Result<(), CollectiveError> {
+        Ok(())
+    }
     /// Aborts the communicator: every pending and later call on any rank fails.
     fn abort(&self);
 }
@@ -111,7 +121,7 @@ pub trait CollectiveLibrary: Send + Sync {
     fn unique_id(&self) -> Result<[u8; UNIQUE_ID_BYTES], CollectiveError>;
     /// Opens rank `init.rank` of the group `init.unique_id`, bounded by `init.init_timeout`
     /// (on expiry the communicator is aborted and `Timeout { op: "comm_init" }` returned).
-    fn open(&self, init: CollectiveInit) -> Result<Arc<dyn Collective>, CollectiveError>;
+    fn open(self: Arc<Self>, init: CollectiveInit) -> Result<Arc<dyn Collective>, CollectiveError>;
 }
 
 /// Bytes of a group id (`ncclUniqueId`).

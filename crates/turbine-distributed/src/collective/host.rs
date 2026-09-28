@@ -164,7 +164,7 @@ impl CollectiveLibrary for HostLibrary {
     }
     /// Joins (or starts) the group of `init.unique_id`. Ranks wait for each other only inside
     /// the first operation, which the op timeout bounds.
-    fn open(&self, init: CollectiveInit) -> Result<Arc<dyn Collective>, CollectiveError> {
+    fn open(self: Arc<Self>, init: CollectiveInit) -> Result<Arc<dyn Collective>, CollectiveError> {
         if init.world == 0 || init.rank >= init.world {
             return Err(CollectiveError::ShapeMismatch);
         }

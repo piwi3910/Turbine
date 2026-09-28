@@ -45,7 +45,7 @@ pub fn check(backend: &dyn CollectiveBackend) -> Result<(), String> {
         let handles: Vec<_> = (0..2usize)
             .map(|rank| {
                 let lib = Arc::clone(&lib);
-                s.spawn(move || two_rank_ops(&*lib, rank, id))
+                s.spawn(move || two_rank_ops(lib, rank, id))
             })
             .collect();
         handles
@@ -77,7 +77,7 @@ fn f32s(b: &[u8]) -> Vec<f32> {
 /// Rank `rank` of a two-rank group over host memory: all-reduce (sum) and all-gather of
 /// `[1 + 2·rank, 2 + 2·rank]`.
 fn two_rank_ops(
-    lib: &dyn super::CollectiveLibrary,
+    lib: Arc<dyn super::CollectiveLibrary>,
     rank: usize,
     id: [u8; super::UNIQUE_ID_BYTES],
 ) -> Result<RankOut, String> {

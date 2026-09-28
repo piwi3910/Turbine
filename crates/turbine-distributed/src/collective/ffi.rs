@@ -8,15 +8,23 @@
 //! out of it stays valid for the life of the process. Communicators, device buffers and streams
 //! are never created here; callers pass the phase-1 handles they own.
 
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use libloading::Library;
+use turbine_core::clock::Clock;
+use turbine_tensor::{DType, DeviceBuffer, DeviceSlice, StreamRef};
 
 use super::nccl_api::{FLAVORS, NcclFlavor};
-use super::{Collective, CollectiveError, CollectiveInit, CollectiveLibrary, UNIQUE_ID_BYTES};
+use super::{
+    Collective, CollectiveError, CollectiveInit, CollectiveLibrary, CollectiveMetrics,
+    CollectiveOp, ReduceOp, UNIQUE_ID_BYTES,
+};
 
 /// The 13 symbols the binding resolves (contract §15.1); a library missing any is refused.
 pub(crate) const SYMBOLS: [&str; 13] = [
@@ -91,10 +99,10 @@ type BroadcastFn = unsafe extern "C" fn(
 type GroupFn = unsafe extern "C" fn() -> NcclResult;
 type GetErrorStringFn = unsafe extern "C" fn(result: NcclResult) -> *const c_char;
 
-/// The resolved entry points. Communicator calls are made by `NcclCollective` (P5 Task 7).
+/// The resolved entry points (all 13 are required so a library is refused as a whole).
 #[expect(
     dead_code,
-    reason = "communicator entry points are called by NcclCollective (P5 Task 7)"
+    reason = "ncclGroupStart/ncclGroupEnd are resolved but no grouped call is issued yet"
 )]
 pub(crate) struct NcclFns {
     pub(crate) get_version: GetVersionFn,
@@ -227,11 +235,8 @@ impl CollectiveLibrary for NcclApi {
         }
         Ok(id.internal.map(|c| c as u8))
     }
-    fn open(&self, _init: CollectiveInit) -> Result<Arc<dyn Collective>, CollectiveError> {
-        Err(CollectiveError::Unavailable {
-            library: self.path.display().to_string(),
-            detail: "communicators arrive with P5 Task 7".into(),
-        })
+    fn open(self: Arc<Self>, init: CollectiveInit) -> Result<Arc<dyn Collective>, CollectiveError> {
+        Ok(Arc::new(NcclCollective::init(self, init)?))
     }
 }
 
@@ -353,6 +358,707 @@ fn bind(
     }))
 }
 
+impl NcclApi {
+    fn backend_error(&self, code: NcclResult) -> CollectiveError {
+        CollectiveError::Backend {
+            code,
+            message: self.error_string(code),
+        }
+    }
+}
+
+const NCCL_SUCCESS: NcclResult = 0;
+/// `ncclInProgress`: a non-blocking communicator call has not finished yet.
+const NCCL_IN_PROGRESS: NcclResult = 7;
+/// `ncclUint8`, `ncclFloat32`, `ncclBfloat16` (`ncclDataType_t`).
+const NCCL_UINT8: c_int = 1;
+const NCCL_FLOAT32: c_int = 7;
+const NCCL_BFLOAT16: c_int = 9;
+/// `ncclSum`, `ncclMax` (`ncclRedOp_t`).
+const NCCL_SUM: c_int = 0;
+const NCCL_MAX: c_int = 2;
+
+/// `NCCL_API_MAGIC`.
+const NCCL_API_MAGIC: c_uint = 0xcafe_beef;
+/// `NCCL_CONFIG_UNDEF_INT` (`INT_MIN`).
+const NCCL_CONFIG_UNDEF_INT: c_int = c_int::MIN;
+/// `NCCL_VERSION(NCCL_MAJOR, NCCL_MINOR, NCCL_PATCH)` of the header this layout is copied from.
+const NCCL_CONFIG_VERSION: c_uint = 23_004;
+
+/// `ncclConfig_t` exactly as `/opt/rocm/rocm/include/rccl/rccl.h` of ROCm 7.14.1 declares it
+/// (`struct ncclConfig_v22800`, RCCL `NCCL_VERSION_CODE` 23004; read 2026-09-26). The library
+/// reads `size` and `version` to know which fields exist; NCCL appends fields release by
+/// release, so an older library reads the leading fields it knows.
+#[repr(C)]
+struct NcclConfig {
+    size: usize,
+    magic: c_uint,
+    version: c_uint,
+    blocking: c_int,
+    cga_cluster_size: c_int,
+    min_ctas: c_int,
+    max_ctas: c_int,
+    net_name: *const c_char,
+    split_share: c_int,
+    traffic_class: c_int,
+    comm_name: *const c_char,
+    collnet_enable: c_int,
+    cta_policy: c_int,
+    shrink_share: c_int,
+    nvls_ctas: c_int,
+    n_channels_per_net_peer: c_int,
+    nvlink_centric_sched: c_int,
+    graph_usage_mode: c_int,
+    num_rma_ctx: c_int,
+    max_p2p_peers: c_int,
+}
+
+impl NcclConfig {
+    /// `NCCL_CONFIG_INITIALIZER` with `blocking = 0` (every call returns promptly, possibly
+    /// with `ncclInProgress`, so a hung peer can never block a Turbine thread).
+    fn non_blocking() -> Self {
+        let undef = NCCL_CONFIG_UNDEF_INT;
+        NcclConfig {
+            size: std::mem::size_of::<NcclConfig>(),
+            magic: NCCL_API_MAGIC,
+            version: NCCL_CONFIG_VERSION,
+            blocking: 0,
+            cga_cluster_size: undef,
+            min_ctas: undef,
+            max_ctas: undef,
+            net_name: std::ptr::null(),
+            split_share: undef,
+            traffic_class: undef,
+            comm_name: std::ptr::null(),
+            collnet_enable: undef,
+            cta_policy: undef,
+            shrink_share: undef,
+            nvls_ctas: undef,
+            n_channels_per_net_peer: undef,
+            nvlink_centric_sched: undef,
+            graph_usage_mode: undef,
+            num_rma_ctx: undef,
+            max_p2p_peers: undef,
+        }
+    }
+}
+
+/// An `ncclComm_t` shared between the calling thread and the watchdog.
+#[derive(Clone, Copy)]
+struct CommPtr(NcclComm);
+
+// SAFETY: an ncclComm_t is an opaque handle that NCCL/RCCL allow to be used from any thread
+// (ncclCommGetAsyncError and ncclCommAbort are documented to be called from a thread other
+// than the one issuing collectives). Its end of life (abort/destroy) is serialised against
+// every call that uses it by `Shared::gate`.
+unsafe impl Send for CommPtr {}
+// SAFETY: see `Send` above; the handle itself is never mutated after init.
+unsafe impl Sync for CommPtr {}
+
+/// Why a communicator was aborted by Turbine (reported to the call that was in flight).
+#[derive(Clone, Copy, Debug)]
+enum Failure {
+    Timeout { op: &'static str, after: Duration },
+    Backend { code: NcclResult },
+}
+
+/// A deadline the watchdog enforces.
+#[derive(Clone, Copy, Debug)]
+struct Armed {
+    op: &'static str,
+    /// `Clock::now_mono` value after which the communicator is aborted.
+    deadline: Duration,
+    after: Duration,
+}
+
+/// State shared by the rank's calling thread and its watchdog thread.
+struct Shared {
+    api: Arc<NcclApi>,
+    rank: usize,
+    /// `Some` while the communicator is usable, `None` once aborted or destroyed. Read-held
+    /// only across non-blocking NCCL calls (the communicator is created with `blocking = 0`),
+    /// so an abort never waits behind a hung peer.
+    gate: RwLock<Option<CommPtr>>,
+    /// The enqueue in flight.
+    armed: Mutex<Option<Armed>>,
+    /// The step in flight ([`Collective::step_begin`] .. `step_end`): bounds the device-side
+    /// completion of every collective the step enqueued, which the enqueue watchdog cannot
+    /// see (a peer that never arrives leaves the kernel spinning on the device).
+    step: Mutex<Option<Armed>>,
+    failure: Mutex<Option<Failure>>,
+    stop: AtomicBool,
+    clock: Arc<dyn Clock>,
+    metrics: Option<CollectiveMetrics>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Shared {
+    fn read_gate(&self) -> RwLockReadGuard<'_, Option<CommPtr>> {
+        self.gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn error_metric(&self, e: &CollectiveError) {
+        if let (Some(m), Some(kind)) = (&self.metrics, e.kind()) {
+            m.error(self.api.backend_name(), kind);
+        }
+    }
+
+    /// Aborts the communicator once; `why` is kept for the call in flight. Returns whether
+    /// this call performed the abort.
+    fn abort(&self, why: Option<Failure>) -> bool {
+        let mut gate = self
+            .gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(comm) = gate.take() else {
+            return false;
+        };
+        if let Some(why) = why {
+            lock(&self.failure).get_or_insert(why);
+        }
+        // SAFETY: `comm` came from ncclCommInitRankConfig of this library and was just taken
+        // out of the gate under its write lock, so no other call is using it and nothing can
+        // use it afterwards; ncclCommAbort releases it.
+        let rc = unsafe { (self.api.fns.comm_abort)(comm.0) };
+        tracing::warn!(
+            event = "collective_aborted",
+            backend = self.api.backend_name(),
+            rank = self.rank,
+            reason = ?why,
+            abort_result = rc,
+            "communicator aborted"
+        );
+        true
+    }
+
+    /// `ncclCommGetAsyncError`: the communicator's pending state (`ncclSuccess`,
+    /// `ncclInProgress` or an error code).
+    fn async_state(&self) -> Result<NcclResult, CollectiveError> {
+        let gate = self.read_gate();
+        let Some(comm) = *gate else {
+            return Err(self.after_abort());
+        };
+        let mut state: NcclResult = NCCL_SUCCESS;
+        // SAFETY: `comm` is live while the read guard is held (abort/destroy need the write
+        // lock); `state` is an exclusively borrowed local the call writes.
+        let rc = unsafe { (self.api.fns.comm_get_async_error)(comm.0, &mut state) };
+        if rc != NCCL_SUCCESS {
+            return Ok(rc);
+        }
+        Ok(state)
+    }
+
+    /// The error a call reports once the communicator is gone.
+    fn after_abort(&self) -> CollectiveError {
+        match *lock(&self.failure) {
+            Some(Failure::Timeout { op, after }) => CollectiveError::Timeout { op, after },
+            Some(Failure::Backend { code }) => self.api.backend_error(code),
+            None => CollectiveError::RemoteAbort { rank: self.rank },
+        }
+    }
+
+    /// Polls a non-blocking call to completion, aborting at `deadline`.
+    fn wait_complete(&self, armed: Armed) -> Result<(), CollectiveError> {
+        loop {
+            match self.async_state()? {
+                NCCL_SUCCESS => return Ok(()),
+                NCCL_IN_PROGRESS => {
+                    if self.clock.now_mono() >= armed.deadline {
+                        self.abort(Some(Failure::Timeout {
+                            op: armed.op,
+                            after: armed.after,
+                        }));
+                        return Err(self.after_abort());
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                code => {
+                    self.abort(Some(Failure::Backend { code }));
+                    return Err(self.after_abort());
+                }
+            }
+        }
+    }
+
+    /// Watchdog body: every 10 ms, abort on an asynchronous error or a passed deadline (of
+    /// the enqueue or of the step).
+    fn watch(&self) {
+        while !self.stop.load(Ordering::Acquire) {
+            match self.async_state() {
+                Err(_) => return,
+                Ok(NCCL_SUCCESS | NCCL_IN_PROGRESS) => {}
+                Ok(code) => {
+                    if self.abort(Some(Failure::Backend { code })) {
+                        self.error_metric(&CollectiveError::Backend {
+                            code,
+                            message: String::new(),
+                        });
+                    }
+                    return;
+                }
+            }
+            let now = self.clock.now_mono();
+            let passed = [*lock(&self.armed), *lock(&self.step)]
+                .into_iter()
+                .flatten()
+                .find(|a| now >= a.deadline);
+            if let Some(a) = passed {
+                let failure = Failure::Timeout {
+                    op: a.op,
+                    after: a.after,
+                };
+                if self.abort(Some(failure)) {
+                    self.error_metric(&CollectiveError::Timeout {
+                        op: a.op,
+                        after: a.after,
+                    });
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// One rank of an NCCL-API communicator (RCCL or NCCL) with an init watchdog and a watchdog
+/// thread. Created non-blocking, so no call into the library can hang a Turbine thread: every
+/// enqueue is bounded by `op_timeout`, and so is a step between `step_begin` and `step_end`;
+/// on expiry the communicator is aborted and every later call fails.
+///
+/// Buffers are the caller's device memory ([`DeviceSlice`]) and ordering is its stream
+/// ([`StreamRef::native_handle`], the vendor stream of the kernel library's context).
+pub struct NcclCollective {
+    shared: Arc<Shared>,
+    world: usize,
+    op_timeout: Duration,
+    watchdog: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for NcclCollective {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NcclCollective")
+            .field("backend", &self.shared.api.backend_name())
+            .field("rank", &self.shared.rank)
+            .field("world", &self.world)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NcclCollective {
+    /// `ncclCommInitRankConfig` (non-blocking) for `init.rank` of `init.world`, polled every
+    /// 1 ms until ready; after `init.init_timeout` the communicator is aborted and
+    /// `Timeout { op: "comm_init" }` returned. Waits sleep in real time and compare against
+    /// `init.clock`.
+    pub fn init(api: Arc<NcclApi>, init: CollectiveInit) -> Result<Self, CollectiveError> {
+        let CollectiveInit {
+            rank,
+            world,
+            unique_id,
+            init_timeout,
+            op_timeout,
+            clock,
+            metrics,
+        } = init;
+        let backend = api.backend_name();
+        let (Ok(nranks), Ok(rank_c)) = (c_int::try_from(world), c_int::try_from(rank)) else {
+            return Err(CollectiveError::ShapeMismatch);
+        };
+        if world == 0 || rank >= world {
+            return Err(CollectiveError::ShapeMismatch);
+        }
+        let mut comm: NcclComm = std::ptr::null_mut();
+        let mut config = NcclConfig::non_blocking();
+        let id = NcclUniqueId {
+            internal: unique_id.map(|b| b as c_char),
+        };
+        // SAFETY: `comm_init_rank_config` comes from the library `api` keeps loaded; `comm` and
+        // `config` are exclusively borrowed locals of the layouts the header declares
+        // (`ncclComm_t*`, `ncclConfig_t*`), and `id` is passed by value.
+        let rc = unsafe {
+            (api.fns.comm_init_rank_config)(
+                &mut comm,
+                nranks,
+                id,
+                rank_c,
+                (&raw mut config).cast::<c_void>(),
+            )
+        };
+        let shared = Arc::new(Shared {
+            api: Arc::clone(&api),
+            rank,
+            gate: RwLock::new((!comm.is_null()).then_some(CommPtr(comm))),
+            armed: Mutex::new(None),
+            step: Mutex::new(None),
+            failure: Mutex::new(None),
+            stop: AtomicBool::new(false),
+            clock: Arc::clone(&clock),
+            metrics,
+        });
+        let fail = |e: CollectiveError| {
+            shared.error_metric(&e);
+            tracing::warn!(
+                event = "collective_init_failed",
+                backend,
+                rank,
+                world,
+                error = %e,
+                "communicator init failed"
+            );
+            Err(e)
+        };
+        if rc != NCCL_SUCCESS && rc != NCCL_IN_PROGRESS {
+            shared.abort(Some(Failure::Backend { code: rc }));
+            return fail(api.backend_error(rc));
+        }
+        if comm.is_null() {
+            return fail(CollectiveError::Backend {
+                code: rc,
+                message: "ncclCommInitRankConfig returned no communicator".into(),
+            });
+        }
+        let armed = Armed {
+            op: "comm_init",
+            deadline: clock.now_mono() + init_timeout,
+            after: init_timeout,
+        };
+        if let Err(e) = shared.wait_complete(armed) {
+            return fail(e);
+        }
+        let watched = Arc::clone(&shared);
+        let watchdog = std::thread::Builder::new()
+            .name(format!("turbine-collective-watchdog-{rank}"))
+            .spawn(move || watched.watch())
+            .map_err(|e| CollectiveError::Backend {
+                code: -1,
+                message: format!("cannot start the watchdog thread: {e}"),
+            });
+        let watchdog = match watchdog {
+            Ok(handle) => handle,
+            Err(e) => {
+                shared.abort(None);
+                return fail(e);
+            }
+        };
+        tracing::info!(
+            event = "collective_init",
+            backend,
+            rank,
+            world,
+            "communicator ready"
+        );
+        Ok(NcclCollective {
+            shared,
+            world,
+            op_timeout,
+            watchdog: Some(watchdog),
+        })
+    }
+
+    fn arm(&self, op: &'static str) -> Armed {
+        let armed = Armed {
+            op,
+            deadline: self.shared.clock.now_mono() + self.op_timeout,
+            after: self.op_timeout,
+        };
+        *lock(&self.shared.armed) = Some(armed);
+        armed
+    }
+
+    fn disarm(&self) {
+        *lock(&self.shared.armed) = None;
+    }
+
+    /// Issues one non-blocking call under the op watchdog and waits for it to be enqueued.
+    fn issue(
+        &self,
+        armed: Armed,
+        call: impl FnOnce(NcclComm) -> NcclResult,
+    ) -> Result<(), CollectiveError> {
+        let rc = {
+            let gate = self.shared.read_gate();
+            let Some(comm) = *gate else {
+                return Err(self.shared.after_abort());
+            };
+            call(comm.0)
+        };
+        match rc {
+            NCCL_SUCCESS => Ok(()),
+            NCCL_IN_PROGRESS => self.shared.wait_complete(armed),
+            code => {
+                self.shared.abort(Some(Failure::Backend { code }));
+                Err(self.shared.after_abort())
+            }
+        }
+    }
+
+    /// Runs `call` as operation `op` of `bytes`: watchdog, metrics and error accounting.
+    fn run(
+        &self,
+        op: CollectiveOp,
+        bytes: usize,
+        call: impl FnOnce(NcclComm) -> NcclResult,
+    ) -> Result<(), CollectiveError> {
+        let started = Instant::now();
+        let armed = self.arm(op.as_str());
+        let result = self.issue(armed, call);
+        self.disarm();
+        self.account(op, bytes, started, &result);
+        result
+    }
+
+    fn account(
+        &self,
+        op: CollectiveOp,
+        bytes: usize,
+        started: Instant,
+        result: &Result<(), CollectiveError>,
+    ) {
+        match result {
+            Ok(()) => {
+                if let Some(m) = &self.shared.metrics {
+                    m.observe(
+                        op,
+                        self.shared.api.backend_name(),
+                        bytes as u64,
+                        started.elapsed().as_secs_f64(),
+                    );
+                }
+            }
+            Err(e) => self.shared.error_metric(e),
+        }
+    }
+}
+
+/// `ncclDataType_t` and element count of a reduction over `bytes` of `dtype` (BF16 or FP32).
+fn reduce_type(dtype: DType, bytes: usize) -> Result<(c_int, usize), CollectiveError> {
+    let code = match dtype {
+        DType::BF16 => NCCL_BFLOAT16,
+        DType::F32 => NCCL_FLOAT32,
+        _ => return Err(CollectiveError::ShapeMismatch),
+    };
+    let size = dtype.size_bytes();
+    if !bytes.is_multiple_of(size) {
+        return Err(CollectiveError::ShapeMismatch);
+    }
+    Ok((code, bytes / size))
+}
+
+fn reduce_op(op: ReduceOp) -> c_int {
+    match op {
+        ReduceOp::Sum => NCCL_SUM,
+        ReduceOp::Max => NCCL_MAX,
+    }
+}
+
+fn device_ptr(slice: &DeviceSlice) -> *mut c_void {
+    slice.ptr().addr() as *mut c_void
+}
+
+fn native_stream(stream: &StreamRef) -> NativeStream {
+    stream.native_handle() as NativeStream
+}
+
+impl Collective for NcclCollective {
+    fn backend(&self) -> &'static str {
+        self.shared.api.backend_name()
+    }
+
+    fn rank(&self) -> usize {
+        self.shared.rank
+    }
+
+    fn world_size(&self) -> usize {
+        self.world
+    }
+
+    fn all_reduce(
+        &self,
+        buf: &mut DeviceSlice,
+        dtype: DType,
+        op: ReduceOp,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        let (dt, count) = reduce_type(dtype, buf.len())?;
+        let (ptr, s, redop) = (device_ptr(buf), native_stream(stream), reduce_op(op));
+        let f = self.shared.api.fns.all_reduce;
+        self.run(CollectiveOp::AllReduce, buf.len(), |comm| {
+            // SAFETY: `f` comes from the library the NcclApi keeps loaded; `comm` is live under
+            // the gate's read guard; `ptr` is `count` elements of the caller's device buffer,
+            // borrowed mutably for this call and in place (send == recv is allowed by NCCL);
+            // `s` is the caller's stream, which outlives the enqueue.
+            unsafe { f(ptr, ptr, count, dt, redop, comm, s) }
+        })
+    }
+
+    fn all_gather(
+        &self,
+        send: &DeviceSlice,
+        recv: &mut DeviceSlice,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        let count = send.len();
+        if recv.len() != count * self.world {
+            return Err(CollectiveError::ShapeMismatch);
+        }
+        let (src, dst, s) = (device_ptr(send), device_ptr(recv), native_stream(stream));
+        let f = self.shared.api.fns.all_gather;
+        self.run(CollectiveOp::AllGather, count, |comm| {
+            // SAFETY: as in all_reduce; `src` holds `count` bytes and `dst` (borrowed mutably)
+            // world × `count`, both caller-owned device memory.
+            unsafe { f(src, dst, count, NCCL_UINT8, comm, s) }
+        })
+    }
+
+    fn reduce_scatter(
+        &self,
+        send: &DeviceSlice,
+        recv: &mut DeviceSlice,
+        dtype: DType,
+        op: ReduceOp,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        let (dt, count) = reduce_type(dtype, recv.len())?;
+        if send.len() != recv.len() * self.world {
+            return Err(CollectiveError::ShapeMismatch);
+        }
+        let (src, dst, s, redop) = (
+            device_ptr(send),
+            device_ptr(recv),
+            native_stream(stream),
+            reduce_op(op),
+        );
+        let f = self.shared.api.fns.reduce_scatter;
+        self.run(CollectiveOp::ReduceScatter, send.len(), |comm| {
+            // SAFETY: as in all_reduce; `src` holds world × `count` elements and `dst`
+            // (borrowed mutably) `count`, both caller-owned device memory.
+            unsafe { f(src, dst, count, dt, redop, comm, s) }
+        })
+    }
+
+    fn broadcast(
+        &self,
+        buf: &mut DeviceSlice,
+        root: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        let Ok(root_c) = c_int::try_from(root) else {
+            return Err(CollectiveError::ShapeMismatch);
+        };
+        if root >= self.world {
+            return Err(CollectiveError::ShapeMismatch);
+        }
+        let (ptr, count, s) = (device_ptr(buf), buf.len(), native_stream(stream));
+        let f = self.shared.api.fns.broadcast;
+        self.run(CollectiveOp::Broadcast, count, |comm| {
+            // SAFETY: as in all_reduce; in place on `count` bytes of the caller's buffer.
+            unsafe { f(ptr, ptr, count, NCCL_UINT8, root_c, comm, s) }
+        })
+    }
+
+    /// An all-reduce of one FP32 on `stream`, then a synchronize of the stream's context, all
+    /// under the op watchdog (a peer that never arrives is aborted at `op_timeout`).
+    fn barrier(&self, stream: &StreamRef) -> Result<(), CollectiveError> {
+        if self.shared.read_gate().is_none() {
+            return Err(self.shared.after_abort());
+        }
+        let started = Instant::now();
+        let mem = stream.memory();
+        let scratch = DeviceBuffer::alloc(mem, 4).map_err(|e| CollectiveError::Backend {
+            code: -1,
+            message: format!("barrier scratch allocation: {e}"),
+        })?;
+        let ptr = device_ptr(&scratch.whole());
+        let s = native_stream(stream);
+        let f = self.shared.api.fns.all_reduce;
+        let armed = self.arm(CollectiveOp::Barrier.as_str());
+        let result = self
+            .issue(armed, |comm| {
+                // SAFETY: as in all_reduce; `ptr` is the 4-byte scratch buffer owned by this
+                // call, which outlives the synchronize below.
+                unsafe { f(ptr, ptr, 1, NCCL_FLOAT32, NCCL_SUM, comm, s) }
+            })
+            .and_then(|()| {
+                mem.synchronize().map_err(|e| {
+                    // A synchronize released by the watchdog's abort reports the abort reason.
+                    if self.shared.read_gate().is_none() {
+                        self.shared.after_abort()
+                    } else {
+                        CollectiveError::Backend {
+                            code: -1,
+                            message: format!("barrier synchronize: {e}"),
+                        }
+                    }
+                })
+            })
+            .and_then(|()| {
+                // Aborted by the watchdog while the synchronize waited.
+                if self.shared.read_gate().is_none() {
+                    Err(self.shared.after_abort())
+                } else {
+                    Ok(())
+                }
+            });
+        self.disarm();
+        drop(scratch);
+        self.account(CollectiveOp::Barrier, 4, started, &result);
+        result
+    }
+
+    fn step_begin(&self) {
+        *lock(&self.shared.step) = Some(Armed {
+            op: "step",
+            deadline: self.shared.clock.now_mono() + self.op_timeout,
+            after: self.op_timeout,
+        });
+    }
+
+    fn step_end(&self) -> Result<(), CollectiveError> {
+        *lock(&self.shared.step) = None;
+        if self.shared.read_gate().is_none() {
+            Err(self.shared.after_abort())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn abort(&self) {
+        self.shared.abort(None);
+    }
+}
+
+impl Drop for NcclCollective {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.watchdog.take() {
+            let _ = handle.join();
+        }
+        let mut gate = self
+            .shared
+            .gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(comm) = gate.take() {
+            // SAFETY: the watchdog has exited and the gate's write lock is held, so no call is
+            // using `comm`; it is taken out of the gate, so it is destroyed exactly once.
+            let rc = unsafe { (self.shared.api.fns.comm_destroy)(comm.0) };
+            if rc != NCCL_SUCCESS && rc != NCCL_IN_PROGRESS {
+                tracing::warn!(
+                    event = "collective_destroy_failed",
+                    backend = self.shared.api.backend_name(),
+                    rank = self.shared.rank,
+                    code = rc,
+                    "ncclCommDestroy failed"
+                );
+            }
+        }
+    }
+}
+
 /// libloading's message plus the platform loader's (`dlerror`) text.
 fn loader_error(e: &libloading::Error) -> String {
     match std::error::Error::source(e) {
@@ -452,5 +1158,146 @@ mod tests {
                 .expect_err("ncclGroupEnd missing"),
         );
         assert!(detail.contains("ncclGroupEnd"), "{detail}");
+    }
+
+    /// `stub_abort_calls()` of the stub loaded from `path` (the loader returns the handle the
+    /// NcclApi already holds, so the counter is the one it increments).
+    fn stub_abort_calls(path: &Path) -> i32 {
+        // SAFETY: test-only; the stub library is never unloaded while the NcclApi under test
+        // holds it, and `stub_abort_calls` is `int (void)` in tests/stub/nccl_stub.c.
+        unsafe {
+            let lib = Library::new(path).expect("stub reloads");
+            let f = lib
+                .get::<unsafe extern "C" fn() -> c_int>(b"stub_abort_calls")
+                .expect("test hook");
+            f()
+        }
+    }
+
+    fn init(
+        rank: usize,
+        world: usize,
+        id: [u8; UNIQUE_ID_BYTES],
+        init_timeout: Duration,
+        op_timeout: Duration,
+        metrics: Option<CollectiveMetrics>,
+    ) -> CollectiveInit {
+        CollectiveInit {
+            rank,
+            world,
+            unique_id: id,
+            init_timeout,
+            op_timeout,
+            clock: Arc::new(turbine_core::clock::SystemClock::new()),
+            metrics,
+        }
+    }
+
+    #[test]
+    fn stub_init_times_out() {
+        let path = stub("inithang", "librccl.so.1");
+        let api = NcclApi::load_from(&path, &RCCL_FLAVOR).expect("stub loads");
+        let id = api.unique_id().expect("unique id");
+        assert_eq!(id[5], 5, "the stub fills the id with 0..128");
+        let before = stub_abort_calls(&path);
+        let reg = turbine_observability::MetricsRegistry::new();
+        let started = Instant::now();
+        let err = Arc::clone(&api)
+            .open(init(
+                0,
+                2,
+                id,
+                Duration::from_millis(200),
+                Duration::from_secs(1),
+                Some(CollectiveMetrics::register(&reg)),
+            ))
+            .map(|_| ())
+            .expect_err("init never completes");
+        let waited = started.elapsed();
+        assert!(
+            matches!(err, CollectiveError::Timeout { op: "comm_init", after } if after == Duration::from_millis(200)),
+            "{err:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(200) && waited < Duration::from_secs(1),
+            "{waited:?}"
+        );
+        assert_eq!(stub_abort_calls(&path), before + 1, "one ncclCommAbort");
+        let text = reg.render().expect("renders");
+        assert!(
+            text.contains("turbine_collective_errors_total{backend=\"rccl\",kind=\"timeout\"} 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn stub_world_one_abort_fails_later_calls() {
+        use turbine_tensor::host::HostMemory;
+        use turbine_tensor::{DeviceId, DeviceMemory};
+
+        let path = stub("nccl", "libnccl.so.2");
+        let api = NcclApi::load_from(&path, &NCCL_FLAVOR).expect("stub loads");
+        let id = api.unique_id().expect("unique id");
+        let t = Duration::from_secs(1);
+        let comm = Arc::clone(&api)
+            .open(init(0, 1, id, t, t, None))
+            .expect("a world of one initialises");
+        assert_eq!(comm.backend(), "nccl");
+        assert_eq!((comm.rank(), comm.world_size()), (0, 1));
+
+        let before = stub_abort_calls(&path);
+        comm.abort();
+        comm.abort();
+        assert_eq!(stub_abort_calls(&path), before + 1, "aborted exactly once");
+
+        // Every later call fails before reaching the library.
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 10);
+        let stream = mem.compute_stream();
+        let buf = DeviceBuffer::alloc(&mem, 16).expect("alloc");
+        let mut slice = buf.whole();
+        let err = comm
+            .all_reduce(&mut slice, DType::F32, ReduceOp::Sum, &stream)
+            .expect_err("aborted");
+        assert!(
+            matches!(err, CollectiveError::RemoteAbort { rank: 0 }),
+            "{err:?}"
+        );
+        assert!(matches!(
+            comm.barrier(&stream),
+            Err(CollectiveError::RemoteAbort { .. })
+        ));
+        drop(comm);
+        assert_eq!(stub_abort_calls(&path), before + 1, "no destroy-time abort");
+    }
+
+    /// A step whose device work never completes (nobody calls `step_end`) is aborted by the
+    /// watchdog at the op timeout, and the late `step_end` reports the step timeout.
+    #[test]
+    fn stub_step_deadline_aborts() {
+        let path = stub("rccl", "librccl.so.1");
+        let api = NcclApi::load_from(&path, &RCCL_FLAVOR).expect("stub loads");
+        let id = api.unique_id().expect("unique id");
+        let comm = Arc::clone(&api)
+            .open(init(
+                0,
+                1,
+                id,
+                Duration::from_secs(1),
+                Duration::from_millis(100),
+                None,
+            ))
+            .expect("a world of one initialises");
+        // A step that ends in time leaves the communicator usable.
+        comm.step_begin();
+        comm.step_end().expect("step ended in time");
+        let before = stub_abort_calls(&path);
+        comm.step_begin();
+        std::thread::sleep(Duration::from_millis(400));
+        let err = comm.step_end().expect_err("the watchdog aborted the step");
+        assert!(
+            matches!(err, CollectiveError::Timeout { op: "step", .. }),
+            "{err:?}"
+        );
+        assert_eq!(stub_abort_calls(&path), before + 1);
     }
 }

@@ -63,8 +63,8 @@ pub enum MemoryError {
 pub struct StreamRef {
     native: u64,
     device: DeviceId,
-    // Held only to keep the owning context alive while the stream handle exists.
-    _owner: Arc<dyn DeviceMemory>,
+    // Keeps the owning context alive while the stream handle exists.
+    owner: Arc<dyn DeviceMemory>,
 }
 
 impl StreamRef {
@@ -72,7 +72,7 @@ impl StreamRef {
         StreamRef {
             native,
             device,
-            _owner: owner,
+            owner,
         }
     }
 
@@ -82,6 +82,12 @@ impl StreamRef {
 
     pub fn device(&self) -> DeviceId {
         self.device
+    }
+
+    /// The backend context that owns this stream (for scratch buffers and synchronization
+    /// ordered on it, e.g. a collective barrier).
+    pub fn memory(&self) -> &Arc<dyn DeviceMemory> {
+        &self.owner
     }
 }
 

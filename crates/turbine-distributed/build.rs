@@ -3,7 +3,8 @@
 //! `$OUT_DIR/<variant>/<file name>` and the directory is exported to the crate as
 //! `TURBINE_NCCL_STUB_DIR`:
 //! `rccl/librccl.so.1`, `nccl/libnccl.so.2` (version 23004), `low/librccl.so.1` (version 21800)
-//! and `nogroupend/libnccl.so.2` (built without `ncclGroupEnd`).
+//! `nogroupend/libnccl.so.2` (built without `ncclGroupEnd`) and `inithang/librccl.so.1`
+//! (communicator init that never completes).
 use std::path::{Path, PathBuf};
 
 /// `NCCL_VERSION_CODE` the stubs report (2.30.4, the ROCm 7.14.1 RCCL), at or above both
@@ -49,6 +50,13 @@ fn main() {
         "libnccl.so.2",
         STUB_VERSION,
         &["STUB_OMIT_GROUP_END"],
+    );
+    build_stub(
+        &out_dir,
+        "inithang",
+        "librccl.so.1",
+        STUB_VERSION,
+        &["STUB_INIT_NEVER_COMPLETES"],
     );
     println!(
         "cargo:rustc-env=TURBINE_NCCL_STUB_DIR={}",

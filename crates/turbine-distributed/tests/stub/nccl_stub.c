@@ -6,7 +6,10 @@
  *
  * build.rs compiles it with the host C compiler once per variant.
  * STUB_VERSION is the NCCL_VERSION_CODE that ncclGetVersion reports;
- * STUB_OMIT_GROUP_END leaves ncclGroupEnd out for the missing-symbol test. */
+ * STUB_OMIT_GROUP_END leaves ncclGroupEnd out for the missing-symbol test;
+ * STUB_INIT_NEVER_COMPLETES makes ncclCommInitRankConfig return
+ * ncclInProgress and ncclCommGetAsyncError keep reporting it, for any world
+ * size (the init-watchdog test). stub_abort_calls() counts ncclCommAbort. */
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +26,13 @@ typedef struct ncclConfig ncclConfig_t;
 enum {
   ncclSuccess = 0,
   ncclInvalidArgument = 4,
+  ncclInProgress = 7,
 };
+
+static int abort_calls = 0;
+
+/* Test hook: how many times ncclCommAbort was called. */
+int stub_abort_calls(void) { return abort_calls; }
 
 struct stub_comm {
   int nranks;
@@ -67,25 +76,39 @@ ncclResult_t ncclCommInitRankConfig(ncclComm_t *comm, int nranks,
                                     ncclConfig_t *config) {
   (void)id;
   (void)config;
+#ifdef STUB_INIT_NEVER_COMPLETES
+  if (comm == NULL || rank < 0 || rank >= nranks)
+    return ncclInvalidArgument;
+#else
   if (comm == NULL || nranks != 1 || rank != 0)
     return ncclInvalidArgument;
+#endif
   struct stub_comm *c = malloc(sizeof *c);
   if (c == NULL)
     return ncclInvalidArgument;
   c->nranks = nranks;
   c->rank = rank;
   *comm = c;
+#ifdef STUB_INIT_NEVER_COMPLETES
+  return ncclInProgress;
+#else
   return ncclSuccess;
+#endif
 }
 
 ncclResult_t ncclCommGetAsyncError(ncclComm_t comm, ncclResult_t *async_error) {
   if (comm == NULL || async_error == NULL)
     return ncclInvalidArgument;
+#ifdef STUB_INIT_NEVER_COMPLETES
+  *async_error = ncclInProgress;
+#else
   *async_error = ncclSuccess;
+#endif
   return ncclSuccess;
 }
 
 ncclResult_t ncclCommAbort(ncclComm_t comm) {
+  abort_calls++;
   free(comm);
   return ncclSuccess;
 }
