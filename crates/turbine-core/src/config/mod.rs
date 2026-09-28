@@ -5,6 +5,7 @@ mod byte_size;
 mod duration;
 mod kv;
 mod overrides;
+mod parallel;
 mod reliability;
 
 use std::net::SocketAddr;
@@ -24,6 +25,10 @@ pub use reliability::*;
 use crate::registry::valid_name;
 use crate::types::DeviceId;
 pub use overrides::Override;
+pub use parallel::{
+    CollectiveTimeouts, DeviceSelection, DpRouterPolicy, ParallelConfig, RankMode, RanksConfig,
+    SizeOrAuto,
+};
 
 /// Configuration errors. Every variant maps to exit code 2 in `turbine-server`.
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +127,8 @@ pub struct ModuleNames<'a> {
     pub scheduling_policies: &'a [&'a str],
     /// `kv.policy` (Phase 4).
     pub eviction_policies: &'a [&'a str],
+    /// `parallel.collective_backend` (Phase 5; `auto` is always accepted).
+    pub collective_backends: &'a [&'a str],
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -137,6 +144,8 @@ pub struct Config {
     pub devices: DevicesConfig,
     pub execution: ExecutionConfig,
     pub structured_output: StructuredOutputConfig,
+    /// Multi-GPU plan (Phase 5).
+    pub parallel: ParallelConfig,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -447,7 +456,8 @@ impl Config {
                 format!("not a valid tracing filter directive: {e}"),
             ));
         }
-        self.validate_phase2()
+        self.validate_phase2()?;
+        self.parallel.validate()
     }
 
     /// Rules that need host facts (contract §3.2): `kv.cpu.max_bytes` against `MemTotal` minus
@@ -506,7 +516,13 @@ impl Config {
             known.scheduling_policies,
             None,
         )?;
-        check("kv.policy", &self.kv.policy, known.eviction_policies, None)
+        check("kv.policy", &self.kv.policy, known.eviction_policies, None)?;
+        check(
+            "parallel.collective_backend",
+            &self.parallel.collective_backend,
+            known.collective_backends,
+            Some("auto"),
+        )
     }
 
     /// Running-request bound actually applied: `scheduler.continuous_batching: false` forces 1.

@@ -31,6 +31,11 @@ pub static SCHEDULING_POLICIES: LazyLock<Vec<&'static str>> =
 pub static EVICTION_POLICIES: LazyLock<Vec<&'static str>> =
     LazyLock::new(|| turbine_kv::policy::registry().names());
 
+/// Collective backends (`collective_backend`, Phase 5): the fixed list until
+/// `turbine-distributed` holds the registry.
+pub static COLLECTIVE_BACKENDS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| vec!["host", "nccl", "rccl"]);
+
 /// The registered module names, per configuration key, for `Config::validate_modules`.
 pub fn known_module_names() -> ModuleNames<'static> {
     ModuleNames {
@@ -39,6 +44,7 @@ pub fn known_module_names() -> ModuleNames<'static> {
         card_profiles: card_profiles(),
         scheduling_policies: &SCHEDULING_POLICIES,
         eviction_policies: &EVICTION_POLICIES,
+        collective_backends: &COLLECTIVE_BACKENDS,
     }
 }
 
@@ -98,6 +104,7 @@ mod tests {
             known.card_profiles,
             known.scheduling_policies,
             known.eviction_policies,
+            known.collective_backends,
         ] {
             assert!(!names.is_empty());
             for name in names {

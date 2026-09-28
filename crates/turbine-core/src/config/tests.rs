@@ -566,6 +566,7 @@ fn task1_modules() -> ModuleNames<'static> {
         card_profiles: &["gfx1201"],
         scheduling_policies: &["default"],
         eviction_policies: &["cost_aware", "lru"],
+        collective_backends: &["host", "nccl", "rccl"],
     }
 }
 
@@ -896,4 +897,228 @@ fn kv_config_validation() {
     let err = small_slab.validate_block_bytes(block).unwrap_err();
     assert_eq!(err.key(), Some("kv.nvme.slab_bytes"));
     assert_eq!(KV_IO_ALIGN, 4096);
+}
+
+#[test]
+fn parallel_rejections() {
+    use std::time::Duration;
+
+    use crate::types::Vendor;
+
+    let base = "model:\n  path: /m\n";
+    // Defaults (P5 §Configuration).
+    let d = parse(base, &[]).unwrap().parallel;
+    assert_eq!(d.tensor_parallel_size, SizeOrAuto::Size(1));
+    assert_eq!(d.data_parallel_size, SizeOrAuto::Size(1));
+    assert_eq!(d.devices, DeviceSelection::Auto);
+    assert_eq!(d.collective_backend.as_str(), "auto");
+    assert_eq!(d.nccl_library, None);
+    assert_eq!(d.rccl_library, None);
+    assert!(!d.allow_device_sharing);
+    assert_eq!(d.plan_queue_depth, 2);
+    assert_eq!(d.router, DpRouterPolicy::PrefixAffinity);
+    assert_eq!(d.collective.init_timeout.0, Duration::from_secs(120));
+    assert_eq!(d.collective.op_timeout.0, Duration::from_secs(30));
+    assert_eq!(d.ranks.mode, RankMode::Local);
+    assert_eq!(d.ranks.rank, 0);
+    assert_eq!(d.ranks.leader, None);
+    assert_eq!(d.ranks.local_devices, vec![DeviceId(0)]);
+
+    // Values the static rules accept.
+    let ok = parse(
+        base,
+        &[
+            "parallel.tensor_parallel_size=auto",
+            "parallel.data_parallel_size=auto",
+            "parallel.devices=[0, 1]",
+            "parallel.router=least_loaded",
+            "parallel.collective_backend=rccl",
+        ],
+    )
+    .unwrap()
+    .parallel;
+    assert_eq!(ok.tensor_parallel_size, SizeOrAuto::Auto);
+    assert_eq!(ok.data_parallel_size, SizeOrAuto::Auto);
+    assert_eq!(
+        ok.devices,
+        DeviceSelection::List(vec![DeviceId(0), DeviceId(1)])
+    );
+    assert_eq!(ok.router, DpRouterPolicy::LeastLoaded);
+    assert_eq!(ok.collective_backend.as_str(), "rccl");
+    let stat = parse(
+        base,
+        &[
+            "parallel.tensor_parallel_size=2",
+            "parallel.ranks.mode=static",
+            "parallel.ranks.rank=1",
+            "parallel.ranks.leader=127.0.0.1:18100",
+            "parallel.ranks.local_devices=[1]",
+        ],
+    )
+    .unwrap()
+    .parallel;
+    assert_eq!(stat.ranks.mode, RankMode::Static);
+    assert_eq!(
+        stat.ranks.leader,
+        Some("127.0.0.1:18100".parse::<SocketAddr>().unwrap())
+    );
+
+    // Static rules, each naming its key.
+    let tp = "parallel.tensor_parallel_size";
+    assert_rejected(base, &["parallel.tensor_parallel_size=3"], tp);
+    assert_rejected(base, &["parallel.tensor_parallel_size=16"], tp);
+    assert_rejected(base, &["parallel.tensor_parallel_size=0"], tp);
+    assert_rejected(base, &["parallel.tensor_parallel_size=many"], tp);
+    let dp = "parallel.data_parallel_size";
+    assert_rejected(base, &["parallel.data_parallel_size=0"], dp);
+    assert_rejected(base, &["parallel.data_parallel_size=65"], dp);
+    assert_rejected(
+        base,
+        &["parallel.tensor_parallel_size=2", "parallel.devices=[0, 0]"],
+        "parallel.devices",
+    );
+    assert_rejected(
+        base,
+        &["parallel.plan_queue_depth=0"],
+        "parallel.plan_queue_depth",
+    );
+    assert_rejected(
+        base,
+        &["parallel.plan_queue_depth=17"],
+        "parallel.plan_queue_depth",
+    );
+    assert_rejected(
+        base,
+        &[
+            "parallel.ranks.mode=static",
+            "parallel.ranks.leader=127.0.0.1:18100",
+        ],
+        "parallel.ranks.mode",
+    );
+    assert_rejected(
+        base,
+        &[
+            "parallel.tensor_parallel_size=2",
+            "parallel.ranks.mode=static",
+        ],
+        "parallel.ranks.leader",
+    );
+    assert_rejected(
+        base,
+        &[
+            "parallel.tensor_parallel_size=2",
+            "parallel.data_parallel_size=2",
+            "parallel.ranks.mode=static",
+            "parallel.ranks.leader=127.0.0.1:18100",
+        ],
+        "parallel.ranks.mode",
+    );
+    assert_rejected(
+        base,
+        &[
+            "parallel.tensor_parallel_size=2",
+            "parallel.ranks.mode=static",
+            "parallel.ranks.leader=127.0.0.1:18100",
+            "parallel.ranks.rank=2",
+        ],
+        "parallel.ranks.rank",
+    );
+    assert_rejected(
+        base,
+        &[
+            "parallel.tensor_parallel_size=2",
+            "parallel.ranks.mode=static",
+            "parallel.ranks.leader=127.0.0.1:18100",
+            "parallel.ranks.local_devices=[0, 1]",
+        ],
+        "parallel.ranks.local_devices",
+    );
+    let op = "parallel.collective.op_timeout";
+    assert_rejected(base, &["parallel.collective.op_timeout=50ms"], op);
+    assert_rejected(base, &["parallel.collective.op_timeout=11m"], op);
+    assert_rejected(base, &["parallel.collective.op_timeout=\"30 s\""], op);
+    let init = "parallel.collective.init_timeout";
+    assert_rejected(base, &["parallel.collective.init_timeout=999ms"], init);
+    assert_rejected(base, &["parallel.collective.init_timeout=31m"], init);
+    // The backend is a registry name: malformed at parse, unregistered in validate_modules.
+    assert_rejected(
+        base,
+        &["parallel.collective_backend=Gloo!"],
+        "parallel.collective_backend",
+    );
+    let gloo = parse(base, &["parallel.collective_backend=gloo"]).unwrap();
+    let err = gloo.validate_modules(&task1_modules()).unwrap_err();
+    assert_eq!(err.key(), Some("parallel.collective_backend"), "{err}");
+    assert!(
+        parse(base, &[])
+            .unwrap()
+            .validate_modules(&task1_modules())
+            .is_ok()
+    );
+
+    // Inventory rules (after device discovery).
+    // What the registered modules serve (turbine-distributed): host memory, one vendor each.
+    const HOST: Option<&[Vendor]> = Some(&[]);
+    const NCCL: Option<&[Vendor]> = Some(&[Vendor::Nvidia]);
+    const RCCL: Option<&[Vendor]> = Some(&[Vendor::Amd]);
+    let gpu = |i: u32, v: Vendor| (DeviceId(i), v, Some("gfx1201".to_string()));
+    let novanas = [gpu(0, Vendor::Amd), gpu(1, Vendor::Amd)];
+    let with = |sets: &[&str]| parse(base, sets).unwrap().parallel;
+    let names = |r: Result<(), ConfigError>, key: &str| match r {
+        Ok(()) => panic!("expected an inventory rejection naming {key}"),
+        Err(e) => assert!(e.to_string().contains(key), "{e} does not name {key}"),
+    };
+    let host_tp2 = with(&[
+        "parallel.tensor_parallel_size=2",
+        "parallel.collective_backend=host",
+    ]);
+    names(
+        host_tp2.validate_devices(&novanas, HOST),
+        "parallel.collective_backend",
+    );
+    // The host backend serves a plan without tensor parallelism, even on GPUs.
+    let host_tp1 = with(&["parallel.collective_backend=host"]);
+    assert!(host_tp1.validate_devices(&novanas[..1], HOST).is_ok());
+    let tp2 = with(&["parallel.tensor_parallel_size=2"]);
+    assert!(
+        with(&[
+            "parallel.collective_backend=rccl",
+            "parallel.tensor_parallel_size=2"
+        ])
+        .validate_devices(&novanas, RCCL)
+        .is_ok()
+    );
+    assert!(tp2.validate_devices(&novanas, None).is_ok());
+    // Index 2 does not exist.
+    names(
+        with(&["parallel.devices=[0, 2]", "parallel.data_parallel_size=2"])
+            .validate_devices(&novanas, None),
+        "parallel.devices",
+    );
+    // Two devices for tp 1 × dp 1.
+    names(
+        with(&["parallel.devices=[0, 1]"]).validate_devices(&novanas, None),
+        "parallel.devices",
+    );
+    // Mixed vendors.
+    names(
+        with(&["parallel.tensor_parallel_size=2", "parallel.devices=[0, 1]"])
+            .validate_devices(&[gpu(0, Vendor::Amd), gpu(1, Vendor::Nvidia)], None),
+        "parallel.devices",
+    );
+    names(
+        with(&["parallel.collective_backend=nccl"]).validate_devices(&novanas, NCCL),
+        "parallel.collective_backend",
+    );
+    names(
+        with(&["parallel.collective_backend=rccl", "parallel.devices=[0]"])
+            .validate_devices(&[gpu(0, Vendor::Nvidia)], RCCL),
+        "parallel.collective_backend",
+    );
+    let sharing = with(&[
+        "parallel.data_parallel_size=2",
+        "parallel.devices=[0, 0]",
+        "parallel.allow_device_sharing=true",
+    ]);
+    assert!(sharing.validate_devices(&novanas, None).is_ok());
 }

@@ -137,3 +137,32 @@ execution:
   # lacks host staging (ABI v2.3) or device_sampling is off. Off by default: on novanas it
   # measured no faster and raised OLMoE's median time to first token.
   overlap_scheduling: false
+parallel:
+  # Phase 5 multi-GPU plan, validated before the port is bound (exit 2). Integer or auto:
+  # tensor parallelism 1..8 (a power of two dividing the attention heads), data parallelism 1..64.
+  tensor_parallel_size: 1
+  data_parallel_size: 1
+  # auto, or a list of global device indices (one vendor; tensor × data entries).
+  devices: auto
+  # auto (rccl on AMD, nccl on NVIDIA, host for tensor_parallel_size 1), rccl, nccl or host.
+  collective_backend: auto
+  # null: libnccl.so.2 on the loader path / /opt/rocm/lib/librccl.so.1 then the loader path.
+  nccl_library: null
+  rccl_library: null
+  # Lets data-parallel replicas share one device (testing only).
+  allow_device_sharing: false
+  # Leader-to-worker step-plan queue bound (1..16).
+  plan_queue_depth: 2
+  # prefix_affinity or least_loaded.
+  router: prefix_affinity
+  collective:
+    # Communicator init bound (1s..30m) and per-step collective bound (100ms..10m).
+    init_timeout: 120s
+    op_timeout: 30s
+  ranks:
+    # local: one thread per device in this process; static: one process per rank, joined to
+    # the leader over TCP (tensor_parallel_size > 1, data_parallel_size 1).
+    mode: local
+    rank: 0
+    leader: null
+    local_devices: [0]
