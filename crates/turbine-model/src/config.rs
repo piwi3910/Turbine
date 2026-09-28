@@ -104,21 +104,42 @@ impl ModelArchConfig {
             num_experts: self.moe.map_or(0, |m| m.num_experts),
             experts_per_token: self.moe.map_or(0, |m| m.experts_per_token),
             tied_embeddings: self.tie_word_embeddings,
-            weight_bytes: self.param_count() * self.weight_format.0.bytes_per_param(),
+            weight_bytes: self.weight_format.0.weight_bytes(self),
             max_position_embeddings: self.max_position_embeddings,
         }
     }
 
-    /// Per-token K and V of every layer, in the weight format's KV dtype, in blocks of
-    /// `block_tokens` tokens.
+    /// Per-token K and V of every layer, in BF16 (the configured `kv.dtype` replaces this in
+    /// Phase 6a Task 22), in blocks of `block_tokens` tokens.
     pub fn kv_layout(&self, block_tokens: u32) -> KvLayout {
         KvLayout {
             num_layers: self.num_layers,
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
-            dtype: self.weight_format.0.kv_dtype(),
+            dtype: crate::weights::Bf16::DTYPE,
             block_tokens,
         }
+    }
+
+    /// The executor's activation dtype (BF16 for every weight format).
+    pub fn activation_dtype(&self) -> turbine_core::types::DType {
+        crate::weights::ACTIVATION_DTYPE
+    }
+
+    /// Every linear layer the executor loads: the family's 2-D slots except the token embedding
+    /// (a gather, never a GEMM), by checkpoint name with `n × k` from the slot shape.
+    pub fn linear_slots(&self) -> Vec<crate::weights::LinearSlot> {
+        self.family
+            .0
+            .weight_slots(self)
+            .into_iter()
+            .filter(|s| s.shape.len() == 2 && !s.name.ends_with("embed_tokens.weight"))
+            .map(|s| crate::weights::LinearSlot {
+                name: s.name,
+                n: s.shape[0] as u32,
+                k: s.shape[1] as u32,
+            })
+            .collect()
     }
 
     /// The dtype half of the allowlist: every checkpoint tensor this architecture loads must be
@@ -131,16 +152,6 @@ impl ModelArchConfig {
             }
         }
         Ok(())
-    }
-
-    /// Parameters of every slot the executor loads, so the count cannot drift from the loader.
-    fn param_count(&self) -> u64 {
-        self.family
-            .0
-            .weight_slots(self)
-            .iter()
-            .map(|s| s.shape.iter().map(|&d| d as u64).product::<u64>())
-            .sum()
     }
 }
 

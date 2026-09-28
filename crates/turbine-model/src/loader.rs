@@ -203,7 +203,7 @@ impl WeightLoader {
     /// offset in the stacked tensor (host-to-device copies only). Nothing is allocated when
     /// validation fails. The staging buffer is reused only after the previous copy completed
     /// (`synchronize`), since device copies are enqueued. Parameters are allocated as
-    /// [`WeightFormat::weight_dtype`].
+    /// [`WeightFormat::slot_dtype`].
     pub fn load_format(
         format: &dyn WeightFormat,
         index: &SafetensorsIndex,
@@ -294,12 +294,14 @@ impl WeightLoader {
             );
         }
 
-        let dtype = format.weight_dtype();
         let largest = planned
             .iter()
             .map(|(slot, e)| match slot.source {
                 None => e.byte_len(),
-                Some(_) => (slot.shape.iter().product::<usize>() * dtype.size_bytes()) as u64,
+                Some(_) => {
+                    (slot.shape.iter().product::<usize>() * format.slot_dtype(slot).size_bytes())
+                        as u64
+                }
             })
             .max()
             .unwrap_or(0);
@@ -312,6 +314,7 @@ impl WeightLoader {
         let mut tensors: HashMap<String, Tensor> = HashMap::with_capacity(planned.len());
         let mut weight_bytes = 0u64;
         for (slot, entry) in planned {
+            let dtype = format.slot_dtype(slot);
             // The destination tensor and this slot's byte offset in it.
             let (key, shape, base) = match &slot.stack {
                 Some(place) => (&place.name, &place.shape, place.offset * dtype.size_bytes()),

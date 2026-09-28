@@ -171,7 +171,7 @@ impl DecoderDims {
             vocab: cfg.vocab_size as usize,
             layers: cfg.num_layers as usize,
             eps: cfg.rms_norm_eps,
-            act: cfg.weight_format.0.activation_dtype(),
+            act: cfg.activation_dtype(),
             tied_lm_head: cfg.tie_word_embeddings,
             moe: cfg.moe,
             vocab_rows: cfg.vocab_size as usize,
@@ -564,19 +564,23 @@ pub fn rows(buf: &Tensor, t: usize) -> TensorView<'_> {
     buf.view().rows(0, t)
 }
 
-/// Refuses a configuration whose weight format stores weights, activations and KV in different
-/// dtypes (the skeleton runs one dtype for all three).
+/// Refuses a weight format whose linear layers are quantized or whose activations are
+/// quantized: the decoder runs every linear layer through the BF16 GEMM until the quantized
+/// GEMM is wired (Phase 6a Task 8).
 fn check_weight_format(cfg: &ModelArchConfig) -> Result<(), ModelError> {
     let format = cfg.weight_format.0;
-    let act = format.activation_dtype();
-    if format.weight_dtype() == act && format.kv_dtype() == act {
-        Ok(())
-    } else {
-        Err(invalid(format!(
-            "the decoder executor runs weights, activations and KV in one dtype; weight format \
-             {} is not supported",
-            format.name()
-        )))
+    let quantized = cfg
+        .linear_slots()
+        .iter()
+        .find(|l| format.scheme(l) != crate::weights::QuantScheme::Bf16)
+        .map(|l| l.name.clone());
+    match quantized {
+        None if format.activation() == crate::weights::ActivationQuant::None => Ok(()),
+        _ => Err(invalid(format!(
+            "the decoder executor runs BF16 linear layers only; weight format {} quantizes {}",
+            format.name(),
+            quantized.as_deref().unwrap_or("activations")
+        ))),
     }
 }
 
