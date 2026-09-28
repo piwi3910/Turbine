@@ -88,6 +88,23 @@ Then add the name to the pinned list in `registry_conformance::collective_backen
 
 A device backend is proven on the GPUs it serves: `turbine-collbench --backend <name> --devices 0,1 --op all --max-bytes 1GiB --output json` must report `correct: true` for every size (results compared against the host backend) and a positive all-reduce bus bandwidth, under `scripts/bench-lock.sh` when the numbers are kept. Tensor-parallel serving with it must then meet the Phase 1 golden tolerance at `parallel.tensor_parallel_size: 2` before any throughput is compared. Both GPUs must be free (`amd-smi monitor`, the k3s pods) and the lab rules of `AGENTS.md` apply.
 
+### hostmem against rccl
+
+BF16 all-reduce on novanas, 2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8), `scripts/bench-lock.sh scripts/lab-cluster.sh collbench-hostmem-novanas` at commit 0134052 (µs; per op = op + synchronize, median of 20; back to back = 20 ops and one synchronize, mean). `hostmem` is its kernels at every size; `auto` routes to RCCL above 128 KiB.
+
+| bytes   | rccl per op | hostmem per op | rccl back to back | hostmem back to back | auto back to back |
+| ------- | ----------: | -------------: | ----------------: | -------------------: | ----------------: |
+| 8 B     |        48.3 |           28.9 |              27.5 |                 10.1 |              10.1 |
+| 4 KiB   |        47.8 |           31.9 |              23.2 |                  8.9 |               9.0 |
+| 16 KiB  |        44.8 |           35.4 |              22.9 |                 12.0 |              12.1 |
+| 64 KiB  |        51.0 |           53.0 |              30.1 |                 38.0 |              26.1 |
+| 128 KiB |        64.5 |           67.8 |              40.6 |                 43.4 |              38.7 |
+| 1 MiB   |       261.2 |          221.1 |             252.0 |                215.4 |             251.6 |
+| 16 MiB  |      4298.9 |         4620.8 |            4270.0 |               4598.8 |            4293.4 |
+| 1 GiB   |    249085.1 |       280252.5 |          246081.2 |             277829.1 |          253758.1 |
+
+The kernels win up to about 32 KiB by 1.5–2.7× and trade places with RCCL between 64 KiB and 2 MiB (run to run noise there is ±10 µs); above that RCCL's copy path is 5–25 % faster (broadcast 25 %: the kernels read mapped host memory at about 6.3 GB/s, the copy engines move pinned memory at about 12.5 GB/s), hence the routing.
+
 ## Pitfalls
 
 - A collective that can block forever hangs the whole group: every wait needs the op timeout, and a timeout must abort the communicator so the other ranks fail too instead of waiting. A device kernel that spins on a peer's flag must bound the spin itself (the host cannot interrupt a running kernel) and must check an abort word the host can write.

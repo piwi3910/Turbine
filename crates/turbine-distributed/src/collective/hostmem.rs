@@ -22,7 +22,7 @@
 //! [`Collective::abort`] writes the abort word from the host, which releases spinning peers.
 //!
 //! Routing: the kernels win for small messages and lose to RCCL's copy path for large ones
-//! (the latency table of `docs/extending/collective-backend.md`), so a call whose message
+//! (the latency table under "hostmem against rccl" in `docs/extending/collective-backend.md`), so a call whose message
 //! (nccl-tests bytes) exceeds `CollectiveInit::route_max_bytes` — `auto`: the measured per-op
 //! crossover [`auto_max_bytes`] — goes to an RCCL communicator the group opens beside its own
 //! (`above_threshold`); the rest stay here (`below_threshold`); every choice is counted in
