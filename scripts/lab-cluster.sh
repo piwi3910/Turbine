@@ -99,6 +99,13 @@ STANDARD_BENCH=(--prompt-words 512 --max-tokens 256 --ignore-eos)
 job_fail() {
 	echo "lab-cluster: ${SCENARIO} FAIL $1"
 	stop_servers
+	# The server logs live in the Job's scratch directory: show their ends before it goes.
+	local f
+	for f in "${WORK:-/nonexistent}"/*.log; do
+		[[ -f $f ]] || continue
+		echo "lab-info: last lines of ${f##*/}"
+		tail -n 40 "$f" | sed "s/^/  ${f##*/}: /"
+	done
 	exit 1
 }
 
