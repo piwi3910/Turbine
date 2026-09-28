@@ -730,7 +730,17 @@ mod p3 {
                 p["name"].as_str().unwrap()
             })
             .collect();
-        assert_eq!(names, ["weights", "kv", "workspace", "runtime", "reserve"]);
+        assert_eq!(
+            names,
+            [
+                "weights",
+                "kv",
+                "workspace",
+                "collective",
+                "runtime",
+                "reserve"
+            ]
+        );
         for (key, kind) in [
             ("queued", "number"),
             ("max_queue", "number"),

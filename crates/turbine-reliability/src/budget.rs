@@ -1,10 +1,11 @@
-//! Per-device memory budget split into pools (P3 S-2).
+//! Per-device memory budget split into pools (P3 S-2; P5 S-8 adds the `collective` pool:
+//! communicator buffers, measured as the drop in free device memory across communicator init).
 
 use serde::Serialize;
 use turbine_core::config::{ByteSize, ReliabilityConfig};
 use turbine_core::types::{DeviceId, MemoryKind};
 
-/// The five pools a device budget is split into.
+/// The pools a device budget is split into.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -12,15 +13,18 @@ pub enum PoolKind {
     Weights,
     Kv,
     Workspace,
+    /// Collective communicator buffers (P5); 0 without tensor parallelism.
+    Collective,
     Runtime,
     Reserve,
 }
 
 impl PoolKind {
-    pub const ALL: [PoolKind; 5] = [
+    pub const ALL: [PoolKind; 6] = [
         PoolKind::Weights,
         PoolKind::Kv,
         PoolKind::Workspace,
+        PoolKind::Collective,
         PoolKind::Runtime,
         PoolKind::Reserve,
     ];
@@ -31,6 +35,7 @@ impl PoolKind {
             PoolKind::Weights => "weights",
             PoolKind::Kv => "kv",
             PoolKind::Workspace => "workspace",
+            PoolKind::Collective => "collective",
             PoolKind::Runtime => "runtime",
             PoolKind::Reserve => "reserve",
         }
@@ -62,6 +67,9 @@ pub struct BudgetInputs {
     pub kv_bytes_per_token: u64,
     pub max_seq_len: u32,
     pub block_bytes: u64,
+    /// Communicator buffers on this device (P5): the drop in free device memory across
+    /// communicator init, 0 without a communicator.
+    pub collective_bytes: u64,
 }
 
 /// A device budget and its pools; the pools never exceed the budget.
@@ -103,7 +111,7 @@ fn show(bytes: u64) -> String {
 
 /// Dedicated: budget = measured free + already held; unified: `MemAvailable` −
 /// `host_reserve_bytes`; both capped by `reliability.memory.device_budget_bytes`. The `kv` pool
-/// is budget − weights − workspace − runtime − reserve, then capped by `kv_cap`
+/// is budget − weights − workspace − collective − runtime − reserve, then capped by `kv_cap`
 /// (`kv.gpu.max_bytes`, CONFLICT C-8); it must hold one full-context sequence.
 pub fn compute_budget(
     inp: &BudgetInputs,
@@ -154,9 +162,11 @@ pub fn compute_budget(
     let workspace = cfg.memory.workspace_bytes.0;
     let runtime = cfg.memory.runtime_overhead_bytes.0;
     let reserve = cfg.emergency_vram_reserve.0;
+    let collective = inp.collective_bytes;
     let fixed = inp
         .weights_bytes
         .saturating_add(workspace)
+        .saturating_add(collective)
         .saturating_add(runtime)
         .saturating_add(reserve);
     let block = inp.block_bytes.max(1);
@@ -176,11 +186,12 @@ pub fn compute_budget(
             .unwrap_or_default();
         return Err(BudgetError {
             breakdown: format!(
-                "device {device} {}: budget={} ({source}{cap}); weights={}; workspace={}; runtime={}; reserve={}; kv={}{kv_capped} (minimum {} for one {}-token sequence)",
+                "device {device} {}: budget={} ({source}{cap}); weights={}; workspace={}; collective={}; runtime={}; reserve={}; kv={}{kv_capped} (minimum {} for one {}-token sequence)",
                 memory_kind_str(inp.memory_kind),
                 show(budget),
                 show(inp.weights_bytes),
                 show(workspace),
+                show(collective),
                 show(runtime),
                 show(reserve),
                 show(kv),
@@ -197,6 +208,7 @@ pub fn compute_budget(
             (PoolKind::Weights, inp.weights_bytes),
             (PoolKind::Kv, kv),
             (PoolKind::Workspace, workspace),
+            (PoolKind::Collective, collective),
             (PoolKind::Runtime, runtime),
             (PoolKind::Reserve, reserve),
         ],
@@ -224,6 +236,7 @@ mod tests {
             kv_bytes_per_token: PER_TOKEN,
             max_seq_len: 32_768,
             block_bytes: PER_TOKEN * 16,
+            collective_bytes: 0,
         }
     }
 
@@ -251,7 +264,16 @@ mod tests {
         assert_eq!(b.pool(PoolKind::Runtime), GIB);
         assert_eq!(b.pool(PoolKind::Reserve), 2 * GIB);
         assert_eq!(b.pool(PoolKind::Kv), 20 * GIB);
+        assert_eq!(b.pool(PoolKind::Collective), 0);
         assert_eq!(pool_sum(&b), b.budget_bytes, "pools partition the budget");
+
+        // P5: communicator buffers come out of the kv pool and still partition the budget.
+        let mut tp = inputs(MemoryKind::Dedicated, Some(30 * GIB), None);
+        tp.collective_bytes = GIB / 2;
+        let with_collective = compute_budget(&tp, &cfg_with_cap(None), None).unwrap();
+        assert_eq!(with_collective.pool(PoolKind::Collective), GIB / 2);
+        assert_eq!(with_collective.pool(PoolKind::Kv), 20 * GIB - GIB / 2);
+        assert_eq!(pool_sum(&with_collective), with_collective.budget_bytes);
 
         // Measured after weights load: 24 GiB free + 6 GiB already held is the same budget.
         let mut after = inputs(MemoryKind::Dedicated, Some(24 * GIB), None);
@@ -327,6 +349,7 @@ mod tests {
             "budget=",
             "weights=",
             "workspace=",
+            "collective=",
             "runtime=",
             "reserve=",
             "kv=",

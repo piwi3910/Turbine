@@ -534,6 +534,8 @@ fn measure_budget(
             kv_bytes_per_token: layout.bytes_per_token(),
             max_seq_len,
             block_bytes: layout.block_bytes(),
+            // P5: communicator buffers (0 on a single device; TP measures them at init).
+            collective_bytes: 0,
         },
         reliability,
         kv_cap,

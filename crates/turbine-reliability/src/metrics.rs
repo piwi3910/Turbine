@@ -55,6 +55,19 @@ pub struct PoolLabels {
     pub kind: &'static str,
 }
 
+/// `turbine_device_budget_bytes{device,component}` (P5; `component` from `PoolKind`).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DeviceComponentLabels {
+    pub device: u32,
+    pub component: &'static str,
+}
+
+/// `replica` label (decimal index, CONFLICT C-5).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ReplicaLabel {
+    pub replica: u32,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DeviceLabel {
     pub device: u32,
@@ -99,6 +112,12 @@ pub struct ReliabilityMetrics {
     pub recovery_retries: Counter,
     pub circuit_state: Family<StateLabel, Gauge>,
     pub circuit_transitions: Family<CircuitTransitionLabels, Counter>,
+    /// P5: per-device budget by component.
+    pub device_budget_bytes: Family<DeviceComponentLabels, Gauge>,
+    /// P5: TP group state per replica, 0 GREEN … 4 SURVIVAL.
+    pub group_pressure_state: Family<ReplicaLabel, Gauge>,
+    /// P5: the device index limiting each replica's group.
+    pub group_limiting_device: Family<ReplicaLabel, Gauge>,
 }
 
 impl ReliabilityMetrics {
@@ -195,7 +214,45 @@ impl ReliabilityMetrics {
             "Circuit breaker transitions by reason",
             m.circuit_transitions.clone(),
         );
+        reg.register(
+            "turbine_device_budget_bytes",
+            "Per-device memory budget by component",
+            m.device_budget_bytes.clone(),
+        );
+        reg.register(
+            "turbine_group_pressure_state",
+            "Pressure state of each replica's TP group (0 GREEN .. 4 SURVIVAL): its worst member",
+            m.group_pressure_state.clone(),
+        );
+        reg.register(
+            "turbine_group_limiting_device",
+            "Device index whose state sets each replica's group state",
+            m.group_limiting_device.clone(),
+        );
         m
+    }
+
+    /// Publishes `budget` as `turbine_device_budget_bytes{device,component}`, every component.
+    pub fn record_device_budget(&self, budget: &crate::budget::DeviceBudget) {
+        for kind in crate::budget::PoolKind::ALL {
+            self.device_budget_bytes
+                .get_or_create(&DeviceComponentLabels {
+                    device: budget.device.0,
+                    component: kind.as_str(),
+                })
+                .set(i64::try_from(budget.pool(kind)).unwrap_or(i64::MAX));
+        }
+    }
+
+    /// Publishes replica `replica`'s group state and limiting device.
+    pub fn record_group(&self, replica: u32, group: crate::multi_device::GroupState) {
+        let label = ReplicaLabel { replica };
+        self.group_pressure_state
+            .get_or_create(&label)
+            .set(i64::from(group.state.as_u8()));
+        self.group_limiting_device
+            .get_or_create(&label)
+            .set(i64::from(group.limiting_device.0));
     }
 
     /// Families attached to no registry (components under unit test that read values back).
@@ -220,6 +277,9 @@ impl ReliabilityMetrics {
             recovery_retries: Counter::default(),
             circuit_state: Family::default(),
             circuit_transitions: Family::default(),
+            device_budget_bytes: Family::default(),
+            group_pressure_state: Family::default(),
+            group_limiting_device: Family::default(),
         }
     }
 }

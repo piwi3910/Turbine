@@ -12,6 +12,7 @@ pub mod fault;
 pub mod horizon;
 pub mod ledger;
 pub mod metrics;
+pub mod multi_device;
 pub mod recovery;
 pub mod reserve;
 pub mod signals;

@@ -4,12 +4,13 @@
 use crate::budget::{DeviceBudget, PoolKind};
 use crate::circuit::{CircuitBreaker, CircuitEvent, CircuitReason, CircuitTransition};
 use crate::document::{
-    AdmissionDoc, CircuitDoc, PressureDocument, ThrottleDoc, TransitionDoc, decisions_doc,
-    memory_doc, rfc3339_millis,
+    AdmissionDoc, CircuitDoc, GroupDoc, PressureDocument, ReplicaDoc, ThrottleDoc, TransitionDoc,
+    decisions_doc, device_doc, memory_doc, rfc3339_millis,
 };
 use crate::horizon::ExhaustionHorizon;
 use crate::ledger::Ledger;
 use crate::metrics::{ReliabilityMetrics, SignalLabel};
+use crate::multi_device::GroupState;
 use crate::reserve::EmergencyReserve;
 use crate::signals::{
     DeviceMemoryInput, PressureSignal, SignalEvaluator, SignalInputs, SignalValue,
@@ -392,7 +393,14 @@ impl PressureController {
                 last_reason: self.circuit.last_reason(),
             },
             transitions: self.machine.history().map(TransitionDoc::from).collect(),
+            // P5 S-8: a single-GPU process is one device, one group of one, one replica.
+            devices: vec![device_doc(&self.budget, state)],
+            groups: vec![GroupDoc::of(0, &[(self.budget.device, state)])],
+            replicas: vec![ReplicaDoc::of(0, state, self.circuit.state())],
         };
+        self.metrics.record_device_budget(&self.budget);
+        self.metrics
+            .record_group(0, GroupState::of(&[(self.budget.device, state)]));
         self.handle.snap.store(Arc::new(Snapshot {
             state,
             circuit: self.circuit.state(),
@@ -422,6 +430,9 @@ fn empty_document(enabled: bool, plan: &ThrottlePlan) -> PressureDocument {
             last_reason: None,
         },
         transitions: Vec::new(),
+        devices: Vec::new(),
+        groups: Vec::new(),
+        replicas: Vec::new(),
     }
 }
 
@@ -459,6 +470,7 @@ mod tests {
             kv_bytes_per_token: 114_688,
             max_seq_len: 8192,
             block_bytes: 1_835_008,
+            collective_bytes: 0,
         };
         let budget = compute_budget(&inputs, &cfg, None).unwrap();
         let ledger = Ledger::new(&budget);
@@ -580,9 +592,17 @@ mod tests {
             "admission",
             "circuit",
             "transitions",
+            "devices",
+            "groups",
+            "replicas",
         ] {
             assert!(doc.get(key).is_some(), "pressure document key {key}");
         }
+        // One device, one group of one, one replica (P5 views of a single-GPU process).
+        assert_eq!(doc["devices"][0]["device"], 0);
+        assert_eq!(doc["devices"][0]["budget"]["collective"], 0);
+        assert_eq!(doc["groups"][0]["limiting_device"], 0);
+        assert_eq!(doc["replicas"][0]["eligible"], true);
         assert_eq!(doc["state"], "GREEN");
         assert!(doc["transitions"].as_array().unwrap().len() >= 6);
     }

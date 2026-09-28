@@ -10,7 +10,9 @@ use crate::throttle::{AdmissionMode, ThrottlePlan};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use turbine_core::types::{CircuitState, MemoryKind, PressureState};
+use turbine_core::types::{CircuitState, DeviceId, MemoryKind, PressureState};
+
+use crate::multi_device::GroupState;
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct PressureDocument {
@@ -26,6 +28,79 @@ pub struct PressureDocument {
     pub admission: AdmissionDoc,
     pub circuit: CircuitDoc,
     pub transitions: Vec<TransitionDoc>,
+    /// P5 S-8: per-device budget by component and pressure state.
+    pub devices: Vec<DeviceDoc>,
+    /// P5 S-8: per TP group (one per replica) the worst member state and its device.
+    pub groups: Vec<GroupDoc>,
+    /// P5 S-7: whether the data-parallel router may pick each replica, and why not.
+    pub replicas: Vec<ReplicaDoc>,
+}
+
+/// `devices[]` entry: a device's state and its budget by component (pool).
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct DeviceDoc {
+    pub device: u32,
+    pub state: PressureState,
+    /// Component → bytes, every [`PoolKind`] present (0 when the budget has no such pool).
+    pub budget: BTreeMap<&'static str, u64>,
+}
+
+/// The `devices[]` entry of `budget` in `state`.
+pub fn device_doc(budget: &DeviceBudget, state: PressureState) -> DeviceDoc {
+    DeviceDoc {
+        device: budget.device.0,
+        state,
+        budget: PoolKind::ALL
+            .iter()
+            .map(|&k| (k.as_str(), budget.pool(k)))
+            .collect(),
+    }
+}
+
+/// `groups[]` entry: a replica's TP group state (worst member) and the device limiting it.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct GroupDoc {
+    pub replica: u32,
+    pub state: PressureState,
+    pub limiting_device: u32,
+}
+
+impl GroupDoc {
+    /// The group of `replica` whose members are (device, state).
+    pub fn of(replica: u32, members: &[(DeviceId, PressureState)]) -> GroupDoc {
+        let g = GroupState::of(members);
+        GroupDoc {
+            replica,
+            state: g.state,
+            limiting_device: g.limiting_device.0,
+        }
+    }
+}
+
+/// `replicas[]` entry: router eligibility (below ORANGE, circuit neither open nor draining).
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct ReplicaDoc {
+    pub replica: u32,
+    pub eligible: bool,
+    /// `eligible`, `pressure` (ORANGE or worse) or `circuit` (CIRCUIT_OPEN / DRAINING).
+    pub reason: &'static str,
+}
+
+impl ReplicaDoc {
+    pub fn of(replica: u32, state: PressureState, circuit: CircuitState) -> ReplicaDoc {
+        let reason = if matches!(circuit, CircuitState::CircuitOpen | CircuitState::Draining) {
+            "circuit"
+        } else if state >= PressureState::Orange {
+            "pressure"
+        } else {
+            "eligible"
+        };
+        ReplicaDoc {
+            replica,
+            eligible: reason == "eligible",
+            reason,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
