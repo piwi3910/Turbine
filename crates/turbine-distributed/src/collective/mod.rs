@@ -170,7 +170,8 @@ pub struct CollectiveInit {
     pub memory: Option<Arc<dyn DeviceMemory>>,
     /// `parallel.collective.hostmem_max_bytes` for a backend that routes large messages to a
     /// delegate (`hostmem` → `rccl`): the largest message (nccl-tests bytes) it keeps; `None`
-    /// is `auto`, the backend's measured per-op default. Other backends ignore it.
+    /// is `auto`, the backend's measured per-op default; `Some(u64::MAX)` keeps every call on
+    /// the backend and opens no delegate. Other backends ignore it.
     pub route_max_bytes: Option<u64>,
 }
 

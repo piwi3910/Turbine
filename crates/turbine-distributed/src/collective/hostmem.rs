@@ -280,9 +280,12 @@ impl CollectiveLibrary for HostmemLibrary {
                 code: -1,
                 message: format!("hostmem: mapping the region into device: {e}"),
             })?;
+        // A threshold no message can exceed needs no delegate communicator.
         let delegate = match &self.delegate {
-            Some(d) => Some(self.open_delegate(d, &init)?),
-            None => None,
+            Some(d) if init.route_max_bytes != Some(u64::MAX) => {
+                Some(self.open_delegate(d, &init)?)
+            }
+            _ => None,
         };
         tracing::info!(
             event = "collective_init",

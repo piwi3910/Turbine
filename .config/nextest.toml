@@ -6,3 +6,9 @@
 [[profile.default.overrides]]
 filter = 'binary(server_cli)'
 threads-required = 'num-test-threads'
+
+# hostmem_lab drives both GPUs: a test that hangs must end, not hold the lab Job (the tests also
+# carry their own watchdog, for runs under plain `cargo test`).
+[[profile.default.overrides]]
+filter = 'binary(hostmem_lab)'
+slow-timeout = { period = "60s", terminate-after = 15 }

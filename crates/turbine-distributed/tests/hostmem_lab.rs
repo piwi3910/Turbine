@@ -16,6 +16,32 @@ use turbine_kernels::test_support::require_backend;
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DType, DeviceBuffer, DeviceId, DeviceMemory};
 
+/// Aborts the whole test process when the test holding the guard runs longer than `limit`:
+/// a hang here would otherwise hold both GPUs of the lab Job until someone deletes it.
+struct Watchdog(Arc<std::sync::atomic::AtomicBool>);
+
+fn watchdog(name: &'static str, limit: Duration) -> Watchdog {
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&done);
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        while !seen.load(std::sync::atomic::Ordering::Acquire) {
+            if started.elapsed() > limit {
+                eprintln!("hostmem_lab: {name} ran longer than {limit:?}; aborting the process");
+                std::process::abort();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    Watchdog(done)
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// The device memory (kernel-library context) of every AMD device, in index order.
 fn devices() -> Vec<Arc<dyn DeviceMemory>> {
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
@@ -188,6 +214,10 @@ fn hostmem_matches_host_backend_on_two_gpus() {
     if !require_backend("hip") {
         return;
     }
+    let _watchdog = watchdog(
+        "hostmem_matches_host_backend_on_two_gpus",
+        Duration::from_secs(900),
+    );
     let mems = devices();
     assert!(mems.len() >= 2, "two AMD devices, found {}", mems.len());
     let mems = &mems[..2];
@@ -261,6 +291,10 @@ fn hostmem_missing_peer_times_out_on_gpu() {
     if !require_backend("hip") {
         return;
     }
+    let _watchdog = watchdog(
+        "hostmem_missing_peer_times_out_on_gpu",
+        Duration::from_secs(60),
+    );
     let mems = devices();
     let mem = &mems[0];
     let lib = collective::registry()
@@ -314,6 +348,10 @@ fn hostmem_abort_releases_a_spinning_gpu_peer() {
     if !require_backend("hip") {
         return;
     }
+    let _watchdog = watchdog(
+        "hostmem_abort_releases_a_spinning_gpu_peer",
+        Duration::from_secs(60),
+    );
     let mems = devices();
     assert!(mems.len() >= 2, "two AMD devices");
     let lib: Arc<dyn CollectiveLibrary> = collective::registry()
