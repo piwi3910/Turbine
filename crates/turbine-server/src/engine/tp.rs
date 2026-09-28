@@ -2376,4 +2376,273 @@ mod tests {
             "the leader's shutdown stops the worker cleanly"
         );
     }
+
+    /// What [`flood_scenario`] saw: every later turn's `cached_tokens` in the first pass, each
+    /// resumed session's, and the L2 -> L0 promotions during the resume.
+    #[derive(Debug)]
+    struct Flood {
+        later: Vec<u32>,
+        resumed: Vec<u32>,
+        promoted: f64,
+    }
+
+    /// Run 8 of the Task 30 lab on the host, over an engine's command channel and its metrics:
+    /// 4 multi-turn sessions of 3 turns, one-off prompts that cycle a 32-block L0 many times,
+    /// two prompts that need the whole pool at once, then each session's next turn (its whole
+    /// history, which only the first pass wrote).
+    fn flood_scenario(
+        label: &str,
+        tx: &tokio::sync::mpsc::Sender<crate::engine::EngineCommand>,
+        reg: &MetricsRegistry,
+    ) -> Flood {
+        let run_one = |prompt: &[u32]| {
+            let mut rx = submit(tx, greedy_request(prompt.to_vec(), 8, 1), 64);
+            tokens_and_cached_plain(&mut rx)
+        };
+        let counters = |stage: &str| {
+            let text = reg.render().unwrap();
+            for l in text.lines().filter(|l| {
+                ["promotions", "demotions", "drops", "plans"]
+                    .iter()
+                    .any(|m| l.starts_with(&format!("turbine_kv_{m}_total")))
+            }) {
+                if !l.ends_with(" 0") {
+                    eprintln!("{label} {stage}: {l}");
+                }
+            }
+        };
+        let system: Vec<u32> = std::iter::once(256).chain(97..128).collect();
+        let mut histories = Vec::new();
+        let mut later = Vec::new();
+        for s in 0..4u32 {
+            let mut history = system.clone();
+            for turn in 0..3u32 {
+                history.extend((0..12).map(|t| 97 + (t * 5 + s * 7 + turn * 3) % 26));
+                let (answer, cached, _) = run_one(&history);
+                if turn > 0 {
+                    later.push(cached);
+                }
+                history.extend(answer);
+            }
+            histories.push(history);
+        }
+        counters("after the sessions");
+        for i in 0..24u32 {
+            let filler: Vec<u32> = std::iter::once(256)
+                .chain((0..100).map(|t| 97 + (t * 11 + i * 13) % 26))
+                .collect();
+            let _ = run_one(&filler);
+        }
+        counters("after the flood");
+        let wide: Vec<_> = (0..2u32)
+            .map(|i| {
+                let prompt: Vec<u32> = std::iter::once(256)
+                    .chain((0..230).map(|t| 97 + (t * 17 + i * 5) % 26))
+                    .collect();
+                submit(tx, greedy_request(prompt, 8, 1), 64)
+            })
+            .collect();
+        for mut rx in wide {
+            let _ = tokens_and_cached_plain(&mut rx);
+        }
+        counters("after the wide prompts");
+        let promoted = r#"turbine_kv_promotions_total{from="l2",to="l0"}"#;
+        let before = sum_series(reg, promoted);
+        let resumed = histories
+            .iter_mut()
+            .enumerate()
+            .map(|(s, history)| {
+                history.extend((0..12).map(|t| 97 + (t * 3 + s as u32) % 26));
+                run_one(history).1
+            })
+            .collect();
+        counters("after the resume");
+        let out = Flood {
+            later,
+            resumed,
+            promoted: sum_series(reg, promoted) - before,
+        };
+        eprintln!("{label}: {out:?}");
+        out
+    }
+
+    /// The `kv` section of the flood tests: L2 only (the cpu backend has no copy stream).
+    fn flood_kv(dir: &TempDir) -> turbine_core::config::KvConfig {
+        let mut kv = turbine_core::config::KvConfig {
+            block_tokens: 16,
+            ..turbine_core::config::KvConfig::default()
+        };
+        kv.cpu.enabled = false;
+        kv.nvme.enabled = true;
+        kv.nvme.path = dir.path().join("kv");
+        kv.nvme.max_bytes = turbine_core::config::ByteSize(16 << 20);
+        kv.nvme.slab_bytes = turbine_core::config::ByteSize(1 << 20);
+        kv
+    }
+
+    fn flood_edit(c: &mut turbine_core::config::Config) {
+        c.kv.block_tokens = 16;
+        c.kv.gpu.max_bytes = Some(turbine_core::config::ByteSize(64 << 10));
+        c.scheduler.max_running_requests = 32;
+        c.model.max_seq_len = Some(256);
+    }
+
+    /// [`flood_scenario`] on a tp 2 `local` group (the leader copies both ranks' shards): the
+    /// control of `static_tiers_flood_then_resume`.
+    fn flood_local() -> Flood {
+        let dir = TempDir::new("engine-tp-local-flood");
+        let spec = write_tiny_llama(dir.path(), 11);
+        let kv = flood_kv(&dir);
+        let (leader, worker) = (
+            prepared_with(&spec, 0, flood_edit),
+            prepared_with(&spec, 1, flood_edit),
+        );
+        let reg = MetricsRegistry::new();
+        let group = TpGroupStart {
+            workers: vec![worker],
+            library: turbine_distributed::collective::HostBackend
+                .load(None)
+                .expect("host library"),
+            init_timeout: Duration::from_secs(30),
+            op_timeout: Duration::from_secs(30),
+            route_max_bytes: None,
+            depth: 2,
+            metrics: CollectiveMetrics::register(&reg),
+            clock: Arc::new(turbine_core::clock::SystemClock::new()),
+            remote: None,
+            experts: None,
+        };
+        let loaded = load_group(
+            &leader,
+            group,
+            0,
+            &ModelMetrics::register(&reg),
+            &ReliabilityMetrics::register(&reg),
+            &|_| {},
+        )
+        .expect("local group");
+        let clock: Arc<dyn Clock> = Arc::new(turbine_core::clock::SystemClock::new());
+        let (engine, tx, _shared, ereg) = engine_over_kv(
+            &leader,
+            loaded,
+            &kv,
+            |metrics| {
+                crate::kv_orchestrator::open_l2(
+                    &kv,
+                    &crate::kv_orchestrator::tp_kv_format(leader.pool.layout, 2),
+                    &leader.identity,
+                    clock,
+                    metrics,
+                )
+                .expect("L2 opens")
+            },
+            |_| {},
+        );
+        let engine = std::thread::spawn(move || engine.run());
+        let out = flood_scenario("local", &tx, &ereg);
+        drop(tx);
+        assert_eq!(engine.join().expect("engine thread"), Ok(()));
+        out
+    }
+
+    /// [`flood_scenario`] on a tp 2 `static` group, each rank with its own L2.
+    fn flood_static() -> Flood {
+        use super::super::tp_tiers::{self, WorkerTierStart};
+
+        let dir = TempDir::new("engine-tp-static-flood");
+        let spec = write_tiny_llama(dir.path(), 11);
+        let kv = flood_kv(&dir);
+        let (mut kv0, mut kv1) = (kv.clone(), kv);
+        tp_tiers::static_rank_kv(&mut kv0, 0, 2);
+        tp_tiers::static_rank_kv(&mut kv1, 1, 2);
+        let rank1 = prepared_with(&spec, 1, flood_edit);
+        let clock: Arc<dyn Clock> = Arc::new(turbine_core::clock::SystemClock::new());
+        let worker_l2 = tp_tiers::open_rank_l2(
+            &kv1,
+            rank1.pool.layout,
+            2,
+            &rank1.identity,
+            Arc::clone(&clock),
+            turbine_kv::KvMetrics::register(&MetricsRegistry::new()),
+        )
+        .expect("the worker's L2 opens");
+        let StaticRun {
+            leader,
+            loaded,
+            worker,
+            ..
+        } = start_static(
+            &spec,
+            flood_edit,
+            MIRROR_CHECK_STEPS,
+            std::convert::identity,
+            WorkerTierStart {
+                kv: kv1,
+                l2: worker_l2,
+            },
+        );
+        let (engine, tx, _shared, reg) = engine_over_kv(
+            &leader,
+            loaded,
+            &kv0,
+            |metrics| {
+                tp_tiers::open_rank_l2(
+                    &kv0,
+                    leader.pool.layout,
+                    2,
+                    &leader.identity,
+                    Arc::clone(&clock),
+                    metrics,
+                )
+                .expect("the leader's L2 opens")
+            },
+            |_| {},
+        );
+        let engine = std::thread::spawn(move || engine.run());
+        let out = flood_scenario("static", &tx, &reg);
+        drop(tx);
+        assert_eq!(engine.join().expect("engine thread"), Ok(()));
+        assert_eq!(worker.join().expect("worker thread"), Ok(()));
+        out
+    }
+
+    /// Run 8 of the Task 30 lab on the host (cpu backend, tp 2, a 32-block L0 per rank, L2):
+    /// the `static` group, each rank with its own L2, behaves as the `local` group whose leader
+    /// copies both shards — every later turn reuses its session's previous one, and after a
+    /// flood and two pool-wide prompts each resumed session gets the same cached tokens and
+    /// the same L2 promotions in both modes. Breaks if static mode loses the sessions' blocks,
+    /// never completes a promotion, or reuses less than local mode.
+    #[test]
+    fn static_tiers_flood_then_resume() {
+        let local = flood_local();
+        let stat = flood_static();
+        assert!(
+            stat.later.iter().all(|&c| c > 0),
+            "later turns reuse: {stat:?}"
+        );
+        assert_eq!(stat.later, local.later, "static reuses as local does");
+        assert_eq!(stat.resumed, local.resumed, "static resumes as local does");
+        assert_eq!(
+            stat.promoted, local.promoted,
+            "static promotes as local does"
+        );
+    }
+
+    /// A request's greedy tokens and `usage.cached_tokens` (no logprobs), read to its end; the
+    /// third field is filled by the caller.
+    fn tokens_and_cached_plain(rx: &mut Events) -> (Vec<u32>, u32, Duration) {
+        use turbine_core::request::GenerationEvent;
+        let mut tokens = Vec::new();
+        while let Some(e) = rx.blocking_recv() {
+            match e {
+                GenerationEvent::Token { token_id, .. } => tokens.push(token_id),
+                GenerationEvent::Finished { usage, .. } => {
+                    return (tokens, usage.expect("usage").cached_tokens, Duration::ZERO);
+                }
+                GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                _ => {}
+            }
+        }
+        panic!("stream closed without an end");
+    }
 }
