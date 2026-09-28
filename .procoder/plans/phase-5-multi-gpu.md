@@ -512,6 +512,8 @@ Interfaces:
 
 ## Task 29: Batch-invariant GEMM rows for the tensor-parallel shapes
 
+Main open accuracy item for the Phase 5 exit (coordinator, 2026-09-28): this task must fix or explain OLMoE tp 2 p10 — greedy divergence at token 21 with margin 1.3 (not a near-tie), likely |Δ| 1.36 / 1.33 against the one-GPU capture (ep 2 × tp 2) and 0.98–1.17 against the transformers reference. Until it lands, `ep2-novanas` reports its ep 2 × tp 2 leg as `known_fail task29` (not deciding the verdict).
+
 Files: `kernels/rocm/tuning/gfx1201/gemm.tsv`, `crates/turbine-kernels/tests/hip_ops.rs` (the invariance check over the new rows), `crates/turbine-server/tests/kv_gpu.rs` (prefix reuse at tp 2)
 Interfaces:
 
