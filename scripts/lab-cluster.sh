@@ -190,12 +190,35 @@ scenario_collbench_sweep() {
 	done
 }
 
+# tp_prefix_check <label>: is prefix reuse bit-exact on the running server? One greedy request
+# with a ~600-token prompt (whole 128-token blocks cached) under cache salt A (cold), again under
+# A (its prefix blocks reused) and under salt B (cold again); prints whether the top-5 logprobs
+# of the reused and the repeated cold run equal the first bit for bit. Informational only.
+tp_prefix_check() {
+	local label="$1" prompt i
+	prompt="$(for ((i = 0; i < 120; i++)); do printf 'The engine counts step %d of the plan. ' "$i"; done)"
+	local body
+	body="$(jq -n --arg p "$prompt" '{model: "meta-llama/Llama-3.2-3B-Instruct", prompt: $p,
+		max_tokens: 16, temperature: 0, logprobs: 5}')"
+	for i in a1:A a2:A b1:B; do
+		curl -s -H 'content-type: application/json' -H "x-turbine-cache-salt: ${i#*:}" \
+			-d "$body" "${URL}/v1/completions" >"${WORK}/prefix-${label}-${i%%:*}.json"
+	done
+	local cold reused again
+	cold="$(jq -S -c '.choices[0].logprobs' "${WORK}/prefix-${label}-a1.json")"
+	reused="$(jq -S -c '.choices[0].logprobs' "${WORK}/prefix-${label}-a2.json")"
+	again="$(jq -S -c '.choices[0].logprobs' "${WORK}/prefix-${label}-b1.json")"
+	echo "tp-prefix ${label} cached_tokens=$(jq -r '.usage.prompt_tokens_details.cached_tokens // 0' \
+		"${WORK}/prefix-${label}-a2.json") reuse_bitexact=$([[ "$cold" == "$reused" ]] && echo yes || echo no) cold_repeat_bitexact=$([[ "$cold" == "$again" ]] && echo yes || echo no)"
+}
+
 scenario_tp2() {
 	local llama=scripts/lab/phase5-novanas-llama.yaml olmoe=scripts/lab/phase5-novanas-olmoe.yaml
 	# The tp 1 baseline: the same configuration with one rank on device 0.
 	start_server "${WORK}/tp1.log" "$llama" --set parallel.tensor_parallel_size=1 \
 		--set "parallel.devices=[0]"
 	wait_ready "$URL" "${WORK}/tp1.log"
+	tp_prefix_check tp1
 	bench_ok 16 "${WORK}/tp1-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
 	bench_ok 200 "${WORK}/tp1-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
 		--requests 200
@@ -203,6 +226,7 @@ scenario_tp2() {
 
 	start_server "${WORK}/tp2-local.log" "$llama"
 	wait_ready "$URL" "${WORK}/tp2-local.log"
+	tp_prefix_check tp2-local
 	golden llama-3.2-3b-instruct "llama tp2 local c1"
 	golden llama-3.2-3b-instruct "llama tp2 local c16" --concurrency 16
 	bench_ok 64 "${WORK}/tp2-bench.json" --concurrency 4 --requests 64
@@ -231,6 +255,7 @@ scenario_tp2() {
 	start_server "${WORK}/tp2-static-rank0.log" "$llama" "${static[@]}" \
 		--set parallel.ranks.rank=0 --set "parallel.ranks.local_devices=[0]"
 	wait_ready "$URL" "${WORK}/tp2-static-rank0.log"
+	tp_prefix_check tp2-static
 	golden llama-3.2-3b-instruct "llama tp2 static c1"
 	golden llama-3.2-3b-instruct "llama tp2 static c16" --concurrency 16
 	stop_servers
