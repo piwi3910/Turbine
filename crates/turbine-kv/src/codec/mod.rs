@@ -9,16 +9,18 @@
 //! (the v2.10 `turbine_kv_transcode` op, identified by [`KvCodec::abi_code`]) is tested against.
 //!
 //! Registration order is the lossiness order of the compression ladder (P6b S-6): `l0` (the L0
-//! bytes unchanged) < `fp8_e4m3`. [`rung_index`] and [`next_rung`] read it; the
+//! bytes unchanged) < `fp8_e4m3` < `tq4` < `tq2`. [`rung_index`] and [`next_rung`] read it; the
 //! conformance suite checks that slot sizes never grow along it.
 
 #[cfg(test)]
 pub(crate) mod conformance;
 mod fp8_e4m3;
 mod l0;
+pub mod turboquant;
 
 pub use fp8_e4m3::Fp8E4m3Codec;
 pub use l0::L0Codec;
+pub use turboquant::{Tq2Codec, Tq4Codec};
 
 use turbine_core::registry::{Module, Registry};
 use turbine_core::types::{DType, KvLayout};
@@ -108,7 +110,10 @@ pub trait KvCodec: Module {
     ) -> Result<(), CodecError>;
 }
 
-static REGISTRY: Registry<dyn KvCodec> = Registry::new("kv_format", &[&L0Codec, &Fp8E4m3Codec]);
+static REGISTRY: Registry<dyn KvCodec> = Registry::new(
+    "kv_format",
+    &[&L0Codec, &Fp8E4m3Codec, &Tq4Codec, &Tq2Codec],
+);
 
 /// Every registered KV codec, in lossiness order (`l0` first, the configuration default).
 pub fn registry() -> &'static Registry<dyn KvCodec> {
@@ -389,16 +394,18 @@ pub(crate) mod tests {
     fn registry_lists_codecs() {
         let reg = registry();
         assert_eq!(reg.point(), "kv_format");
-        assert_eq!(reg.names(), ["l0", "fp8_e4m3"]);
+        assert_eq!(reg.names(), ["l0", "fp8_e4m3", "tq4", "tq2"]);
         let codes: Vec<u8> = reg.iter().map(|c| c.abi_code()).collect();
-        assert_eq!(codes, [0, 1], "TURBINE_KVFMT_* codes");
+        assert_eq!(codes, [0, 1, 2, 3], "TURBINE_KVFMT_* codes");
         assert_eq!(rung_index("l0"), Some(0));
-        assert_eq!(rung_index("fp8_e4m3"), Some(1));
+        assert_eq!(rung_index("tq2"), Some(3));
         assert_eq!(rung_index("zstd"), None);
         assert_eq!(next_rung("l0"), Some("fp8_e4m3"));
-        assert_eq!(next_rung("fp8_e4m3"), None);
-        assert_eq!(lossier("l0", "fp8_e4m3"), "fp8_e4m3");
-        assert_eq!(lossier("fp8_e4m3", "l0"), "fp8_e4m3");
+        assert_eq!(next_rung("fp8_e4m3"), Some("tq4"));
+        assert_eq!(next_rung("tq4"), Some("tq2"));
+        assert_eq!(next_rung("tq2"), None);
+        assert_eq!(lossier("l0", "tq4"), "tq4");
+        assert_eq!(lossier("tq2", "fp8_e4m3"), "tq2");
     }
 
     /// `l0` stores the L0 bytes unchanged, for BF16 and FP8 pages. Breaks if the identity codec
