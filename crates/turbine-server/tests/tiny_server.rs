@@ -33,6 +33,7 @@ use turbine_model::testing::TempDir;
 use turbine_model::testing::naive;
 use turbine_model::testing::tiny::{
     TINY_EOS, TinyOptions, write_tiny_family, write_tiny_llama, write_tiny_llama_with,
+    write_tiny_olmoe,
 };
 use turbine_model::{
     GenerateOptions, MAX_STAGING_BYTES, SafetensorsIndex, Tokenizer, WeightLoader, generate,
@@ -125,6 +126,8 @@ struct Setup<'a> {
     template_with_tools: bool,
     /// Keep the server's stderr (its log) for [`TinyServer::logs`].
     capture_logs: bool,
+    /// Serve the tiny OLMoE (8 experts top-2, `tiny-olmoe`) instead of the tiny Llama.
+    olmoe: bool,
 }
 
 impl Default for Setup<'_> {
@@ -138,6 +141,7 @@ impl Default for Setup<'_> {
             max_positions: None,
             template_with_tools: true,
             capture_logs: false,
+            olmoe: false,
         }
     }
 }
@@ -193,15 +197,24 @@ impl TinyServer {
 
     fn launch(setup: &Setup<'_>) -> TinyServer {
         let dir = TempDir::new("turbine-tiny-server");
-        let model_dir = dir.path().join("tiny-llama");
-        write_tiny_llama_with(
-            &model_dir,
-            7,
-            &TinyOptions {
-                template_with_tools: setup.template_with_tools,
-                ..TinyOptions::default()
-            },
-        );
+        let model = if setup.olmoe {
+            "tiny-olmoe"
+        } else {
+            "tiny-llama"
+        };
+        let model_dir = dir.path().join(model);
+        if setup.olmoe {
+            write_tiny_olmoe(&model_dir, 7);
+        } else {
+            write_tiny_llama_with(
+                &model_dir,
+                7,
+                &TinyOptions {
+                    template_with_tools: setup.template_with_tools,
+                    ..TinyOptions::default()
+                },
+            );
+        }
         if let Some(positions) = setup.max_positions {
             let path = model_dir.join("config.json");
             let mut cfg: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -233,7 +246,7 @@ impl TinyServer {
                     return TinyServer {
                         child,
                         addr,
-                        model: "tiny-llama".into(),
+                        model: model.into(),
                         logs: setup.capture_logs.then_some(logs),
                         _dir: dir,
                     };
@@ -3220,5 +3233,117 @@ fn dp2_of_tp2_groups_serve() {
             .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
             .sum();
         assert!(routed > 0.0, "replica {replica}: {metrics}");
+    }
+}
+
+/// Expert parallelism of 2 on the cpu backend: two rank threads over the host collective, each
+/// holding half the tiny OLMoE's experts (P5 S-11).
+const EP2: &str = "parallel:\n  expert_parallel_size: 2\n  collective_backend: host\n";
+
+/// P5 S-11, S-12: the tiny OLMoE served at ep 2 — with replicated attention (tp 1) and with
+/// tp = ep = 2 — completes greedy prompts with exactly ep 1's tokens, alone and 8 at a time;
+/// `/turbine/v1/status` shows `ep` 2, the plan's reason codes and the contiguous placement
+/// (experts 0–3 on rank 0, 4–7 on rank 1), `/turbine/v1/scheduler` has the `expert` section
+/// with non-zero token counts for both ranks, and `turbine_expert_rank_tokens_total` counts
+/// both ranks. Breaks if the server places, loads or steps the EP ranks wrongly, or drops the
+/// counts.
+#[test]
+fn ep2_serves_like_ep1() {
+    let olmoe = |extra: &str| {
+        TinyServer::launch(&Setup {
+            extra,
+            olmoe: true,
+            ..Setup::default()
+        })
+    };
+    let one = olmoe("");
+    let greedy = |server: &TinyServer, prompt: &str| -> Vec<u32> {
+        let body = json!({"model": server.model, "prompt": prompt, "max_tokens": 16,
+                          "ignore_eos": true, "temperature": 0, "logprobs": 0,
+                          "return_tokens_as_token_ids": true});
+        let resp = server.post("/v1/completions", &body);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        choice_token_ids(&resp.json()["choices"][0])
+    };
+    let prompts = [
+        "Hello",
+        "Once upon a time",
+        "The quick brown fox jumps",
+        "1 2 3 4",
+    ];
+    let want: Vec<Vec<u32>> = prompts.iter().map(|p| greedy(&one, p)).collect();
+    let tp2 = format!("{EP2}  tensor_parallel_size: 2\n");
+    for (what, extra) in [("ep 2 tp 1", EP2), ("ep 2 tp 2", tp2.as_str())] {
+        let two = olmoe(extra);
+        for (prompt, want) in prompts.iter().zip(&want) {
+            assert_eq!(&greedy(&two, prompt), want, "{what}: {prompt:?}");
+        }
+        // Batched: 8 at once through the one engine.
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let (addr, model, prompt) = (two.addr, two.model.clone(), prompts[i % 4]);
+                std::thread::spawn(move || {
+                    let body = json!({"model": model, "prompt": prompt, "max_tokens": 16,
+                                      "ignore_eos": true, "temperature": 0, "logprobs": 0,
+                                      "return_tokens_as_token_ids": true});
+                    request(addr, "POST", "/v1/completions", Some(&body.to_string()))
+                })
+            })
+            .collect();
+        for (i, w) in workers.into_iter().enumerate() {
+            let resp = w.join().unwrap();
+            assert_eq!(resp.status, 200, "{what} request {i}: {}", resp.body);
+            let got = choice_token_ids(&resp.json()["choices"][0]);
+            assert_eq!(got, want[i % 4], "{what} request {i}");
+        }
+
+        let parallel = &two.get("/turbine/v1/status").json()["parallel"];
+        assert_eq!(
+            (&parallel["ep"], &parallel["pp"]),
+            (&json!(2), &json!(1)),
+            "{parallel}"
+        );
+        assert_eq!(parallel["backend"], "host", "{parallel}");
+        assert_eq!(
+            parallel["groups"][0]["experts"],
+            json!([{"rank": 0, "experts": [0, 3]}, {"rank": 1, "experts": [4, 7]}]),
+            "{parallel}"
+        );
+        let reasons = parallel["plan_reasons"].as_array().unwrap();
+        for code in ["configured", "backend:host"] {
+            assert!(reasons.contains(&json!(code)), "{what}: {parallel}");
+        }
+        let expert = &two.scheduler()["expert"];
+        assert_eq!(expert["parallel_size"], 2, "{expert}");
+        assert_eq!(expert["placement"], "contiguous", "{expert}");
+        let per_rank: Vec<u64> = expert["tokens_per_rank"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        assert!(
+            per_rank.len() == 2 && per_rank.iter().all(|&n| n > 0),
+            "{what}: {expert}"
+        );
+        assert!(
+            !expert["top_experts"].as_array().unwrap().is_empty(),
+            "{expert}"
+        );
+        let metrics = two.metrics();
+        for rank in ["0", "1"] {
+            let series = format!("turbine_expert_rank_tokens_total{{rank=\"{rank}\"}}");
+            assert!(
+                sample(&metrics, &series).is_some_and(|n| n > 0.0),
+                "{what} rank {rank}: {metrics}"
+            );
+        }
+        assert!(
+            sample(&metrics, "turbine_expert_imbalance_ratio").is_some_and(|r| r >= 1.0),
+            "{metrics}"
+        );
+        wait_for(Duration::from_secs(10), "every block free", || {
+            two.blocks_used() == 0
+        });
     }
 }

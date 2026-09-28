@@ -10,21 +10,34 @@
 //! remaining device. Automatic TP groups are built greedily from the best GPU↔GPU link class
 //! between unassigned devices (never by index order); explicit device lists keep their order.
 //! Every decision is logged with its reason code and returned in [`ParallelPlan::reasons`].
+//!
+//! Expert parallelism (P5 S-11, S-12): `expert_parallel_size` ep > 1 needs a model with routed
+//! experts (`ep_moe_only`), divides their count and runs with tp ∈ {1, ep}; a group is
+//! max(tp, ep) ranks (attention replicated at tp = 1, tensor-parallel over the same ranks at
+//! tp = ep) and the plan carries the expert placement ([`expert_placement`]). `ep: auto` is 1:
+//! capacity is tensor parallelism's job (`tp: auto`). Pipeline parallelism is not planned here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
-use turbine_core::config::{DeviceSelection, ParallelConfig, RankMode, SizeOrAuto};
+use turbine_core::config::{
+    DeviceSelection, ExpertPlacementChoice, ParallelConfig, RankMode, SizeOrAuto,
+};
 use turbine_core::registry::Module;
 use turbine_core::types::{DeviceId, ModelShape, ReplicaId, Vendor};
 use turbine_device::DeviceInventory;
 use turbine_device::topology::{PathClass, TopologyGraph};
+
+use crate::expert::{EP_KEY, ExpertPlacement};
 
 /// The process-lifetime multi-GPU plan (P5 §Data).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParallelPlan {
     pub tp: u32,
     pub dp: u32,
+    /// Expert-parallel ranks per group (P5 S-11); a group has max(tp, ep) ranks.
+    pub ep: u32,
     /// The registered collective backend (`collective_backend` registry).
     pub backend: &'static str,
     pub mode: RankMode,
@@ -33,6 +46,15 @@ pub struct ParallelPlan {
     pub excluded_devices: Vec<DeviceId>,
     pub groups: Vec<ReplicaGroup>,
     pub reasons: Vec<PlanReason>,
+    /// ep > 1: which rank of a group holds each routed expert (the same for every group).
+    pub experts: Option<Arc<ExpertPlacement>>,
+}
+
+impl ParallelPlan {
+    /// Ranks per group (per DP replica): max(tp, ep).
+    pub fn group_size(&self) -> u32 {
+        self.tp.max(self.ep)
+    }
 }
 
 /// One DP replica: one TP group.
@@ -63,6 +85,14 @@ pub enum PlanReason {
     /// One engine per replica on `execution.device` (the single-GPU default, or the `cpu`
     /// reference backend): the inventory is not consulted.
     ExecutionDevice,
+    /// A size set explicitly in the configuration (expert parallelism).
+    Configured,
+    /// Expert parallelism places only the routed experts; everything else is replicated (tp 1)
+    /// or tensor-parallel over the same ranks (tp = ep). Also the refusal code of ep on a dense
+    /// model.
+    EpMoeOnly,
+    /// The collective backend a multi-rank group runs on.
+    Backend(&'static str),
 }
 
 impl fmt::Display for PlanReason {
@@ -76,6 +106,9 @@ impl fmt::Display for PlanReason {
             PlanReason::ExplicitDevices => f.write_str("explicit_devices"),
             PlanReason::DeviceSharingEnabled => f.write_str("device_sharing_enabled"),
             PlanReason::ExecutionDevice => f.write_str("execution_device"),
+            PlanReason::Configured => f.write_str("configured"),
+            PlanReason::EpMoeOnly => f.write_str("ep_moe_only"),
+            PlanReason::Backend(name) => write!(f, "backend:{name}"),
         }
     }
 }
@@ -315,6 +348,71 @@ fn choose_backend(
     Ok(backend.name())
 }
 
+/// The expert-parallel size of `cfg` (`auto` is 1) checked against the model: ep > 1 needs
+/// `num_experts` routed experts (`ep_moe_only`), divisible by ep, and `tp` of 1 or ep. The
+/// reasons of an EP plan are `configured` and `ep_moe_only`.
+pub fn expert_size(
+    cfg: &ParallelConfig,
+    num_experts: u32,
+    architecture: &str,
+    tp: u32,
+    reasons: &mut Vec<PlanReason>,
+) -> Result<u32, PlanError> {
+    let ep = cfg.expert_parallel_size.fixed().unwrap_or(1);
+    if ep <= 1 {
+        return Ok(1);
+    }
+    if num_experts == 0 {
+        return Err(err(
+            EP_KEY,
+            format!(
+                "ep_moe_only: {ep} expert-parallel ranks need a mixture-of-experts model; \
+                 {architecture} has no routed experts"
+            ),
+        ));
+    }
+    if !num_experts.is_multiple_of(ep) {
+        return Err(err(
+            EP_KEY,
+            format!("{ep} does not divide the model's {num_experts} routed experts"),
+        ));
+    }
+    if tp != 1 && tp != ep {
+        return Err(err(
+            EP_KEY,
+            format!(
+                "combination_unsupported:ep+tp: expert parallelism {ep} runs with \
+                 tensor_parallel_size 1 or {ep}, not {tp}"
+            ),
+        ));
+    }
+    reasons.push(PlanReason::Configured);
+    reasons.push(PlanReason::EpMoeOnly);
+    Ok(ep)
+}
+
+/// The placement of `num_experts` routed experts of every layer of `moe_layers` over `ep`
+/// ranks (`parallel.expert.placement`: contiguous, or read from its file); `None` for ep 1.
+pub fn expert_placement(
+    cfg: &ParallelConfig,
+    num_experts: u32,
+    moe_layers: &[u32],
+    ep: u32,
+) -> Result<Option<Arc<ExpertPlacement>>, PlanError> {
+    if ep <= 1 {
+        return Ok(None);
+    }
+    let placement = match &cfg.expert.placement {
+        ExpertPlacementChoice::Contiguous => {
+            ExpertPlacement::contiguous(num_experts, moe_layers, ep)?
+        }
+        ExpertPlacementChoice::File(path) => {
+            ExpertPlacement::from_file(path, num_experts, moe_layers, ep)?
+        }
+    };
+    Ok(Some(Arc::new(placement)))
+}
+
 /// Plans TP groups and DP replicas. `device_budget` is the per-device memory budget (phase-3
 /// budget) used for `tp: auto`.
 pub fn plan(
@@ -433,11 +531,21 @@ pub fn plan(
             tp
         }
     };
-    if tp > distinct {
+    // 2b. Expert-parallel size: a group is max(tp, ep) ranks.
+    let ep = expert_size(
+        cfg,
+        model.num_experts,
+        &model.architecture,
+        tp,
+        &mut reasons,
+    )?;
+    let group = tp.max(ep);
+    let group_key = if ep > tp { EP_KEY } else { TP_KEY };
+    if group > distinct {
         return Err(err(
-            TP_KEY,
+            group_key,
             format!(
-                "{tp} ranks need {tp} {} devices, {distinct} usable",
+                "{group} ranks need {group} {} devices, {distinct} usable",
                 vendor.as_str()
             ),
         ));
@@ -451,17 +559,17 @@ pub fn plan(
     };
     let dp = match cfg.data_parallel_size {
         SizeOrAuto::Size(dp) => dp,
-        SizeOrAuto::Auto => (slots / tp).max(1),
+        SizeOrAuto::Auto => (slots / group).max(1),
     };
-    let distinct_groups = (slots / tp) as usize;
-    let sharing = tp * dp > slots || (explicit && distinct < slots);
+    let distinct_groups = (slots / group) as usize;
+    let sharing = group * dp > slots || (explicit && distinct < slots);
     if sharing && !cfg.allow_device_sharing {
         return Err(err(
             DP_KEY,
             format!(
-                "{dp} replicas of {tp} ranks need {} devices, {slots} available (set \
+                "{dp} replicas of {group} ranks need {} devices, {slots} available (set \
                  parallel.allow_device_sharing to share devices between replicas)",
-                tp * dp
+                group * dp
             ),
         ));
     }
@@ -472,26 +580,35 @@ pub fn plan(
     // 4. TP groups.
     let base: Vec<Vec<DeviceId>> = if explicit {
         let chunks: Vec<Vec<DeviceId>> = pool
-            .chunks(tp as usize)
+            .chunks(group as usize)
             .map(|c| c.iter().map(|c| c.id).collect())
             .collect();
-        if pool.len() % tp as usize != 0 {
+        if pool.len() % group as usize != 0 {
             return Err(err(
                 DEVICES_KEY,
-                format!("{} devices do not split into TP groups of {tp}", pool.len()),
+                format!("{} devices do not split into groups of {group}", pool.len()),
             ));
         }
-        for (chunk, group) in pool.chunks(tp as usize).zip(&chunks) {
+        for (chunk, members) in pool.chunks(group as usize).zip(&chunks) {
             if chunk.iter().any(|c| c.arch != chunk[0].arch) {
-                return Err(err(TP_KEY, "a TP group mixes device architectures"));
+                return Err(err(group_key, "a group mixes device architectures"));
             }
-            if group.iter().collect::<BTreeSet<_>>().len() != group.len() {
-                return Err(err(DEVICES_KEY, "a TP group lists one device twice"));
+            if members.iter().collect::<BTreeSet<_>>().len() != members.len() {
+                return Err(err(DEVICES_KEY, "a group lists one device twice"));
             }
         }
         chunks
     } else {
-        link_groups(&pool, tp as usize, distinct_groups.min(dp as usize), &links)?
+        link_groups(
+            &pool,
+            group as usize,
+            distinct_groups.min(dp as usize),
+            &links,
+        )
+        .map_err(|e| PlanError {
+            key: group_key.to_string(),
+            ..e
+        })?
     };
     let host = topo.node.hostname.clone();
     let groups: Vec<ReplicaGroup> = (0..dp as usize)
@@ -508,7 +625,7 @@ pub fn plan(
                 .collect(),
         })
         .collect();
-    if tp > 1 {
+    if group > 1 {
         let mut seen = Vec::new();
         for g in &base {
             if let Some(worst) = links.worst(g)
@@ -520,8 +637,19 @@ pub fn plan(
         }
     }
 
-    // 5. Collective backend.
-    let backend = choose_backend(cfg.collective_backend.as_str(), vendor, tp, cfg.ranks.mode)?;
+    // 5. Collective backend, and the expert placement over every layer (a model shape with
+    // routed experts has them in every layer; the server re-checks against the family).
+    let backend = choose_backend(
+        cfg.collective_backend.as_str(),
+        vendor,
+        group,
+        cfg.ranks.mode,
+    )?;
+    if group > 1 {
+        reasons.push(PlanReason::Backend(backend));
+    }
+    let moe_layers: Vec<u32> = (0..model.num_layers).collect();
+    let experts = expert_placement(cfg, model.num_experts, &moe_layers, ep)?;
 
     for r in &reasons {
         tracing::info!(event = "parallel_plan_decision", reason = %r, "parallel plan decision");
@@ -530,6 +658,7 @@ pub fn plan(
         event = "parallel_plan",
         tp,
         dp,
+        ep,
         backend,
         vendor = vendor.as_str(),
         mode = ?cfg.ranks.mode,
@@ -539,12 +668,14 @@ pub fn plan(
     Ok(ParallelPlan {
         tp,
         dp,
+        ep,
         backend,
         mode: cfg.ranks.mode,
         vendor: Some(vendor),
         excluded_devices: excluded,
         groups,
         reasons,
+        experts,
     })
 }
 
@@ -563,20 +694,36 @@ pub fn plan_execution_device(
     host: &str,
 ) -> Result<ParallelPlan, PlanError> {
     let tp = cfg.tensor_parallel_size.fixed().unwrap_or(1);
+    let ep = cfg.expert_parallel_size.fixed().unwrap_or(1);
+    let group = tp.max(ep);
     let host_backend = crate::collective::registry()
         .get(cfg.collective_backend.as_str())
         .is_some_and(|b| b.vendors().is_empty());
-    if tp != 1 && (vendor.is_some() || !host_backend) {
+    if group != 1 && (vendor.is_some() || !host_backend) {
         return Err(err(
-            TP_KEY,
+            if ep > tp { EP_KEY } else { TP_KEY },
             format!(
-                "{tp} ranks need {tp} GPUs; execution.backend cpu runs tensor_parallel_size 1 \
-                 (or tensor-parallel ranks as threads with parallel.collective_backend: host)"
+                "{group} ranks need {group} GPUs; execution.backend cpu runs one rank per \
+                 group (or tensor- and expert-parallel ranks as threads with \
+                 parallel.collective_backend: host)"
+            ),
+        ));
+    }
+    if ep > 1 && tp != 1 && tp != ep {
+        return Err(err(
+            EP_KEY,
+            format!(
+                "combination_unsupported:ep+tp: expert parallelism {ep} runs with \
+                 tensor_parallel_size 1 or {ep}, not {tp}"
             ),
         ));
     }
     let dp = cfg.data_parallel_size.fixed().unwrap_or(1);
     let mut reasons = vec![PlanReason::ExecutionDevice];
+    if ep > 1 {
+        // The model's experts are checked (and placed) by the server against its config.
+        reasons.push(PlanReason::Configured);
+    }
     if dp > 1 {
         if !cfg.allow_device_sharing {
             return Err(err(
@@ -611,7 +758,7 @@ pub fn plan_execution_device(
     let groups = (0..dp)
         .map(|r| ReplicaGroup {
             replica: ReplicaId(r),
-            ranks: (0..tp)
+            ranks: (0..group)
                 .map(|rank| RankSlot {
                     rank,
                     device: DeviceId(device.0 + rank),
@@ -620,6 +767,9 @@ pub fn plan_execution_device(
                 .collect(),
         })
         .collect();
+    if group > 1 {
+        reasons.push(PlanReason::Backend(backend));
+    }
     for r in &reasons {
         tracing::info!(event = "parallel_plan_decision", reason = %r, "parallel plan decision");
     }
@@ -627,6 +777,7 @@ pub fn plan_execution_device(
         event = "parallel_plan",
         tp,
         dp,
+        ep,
         backend,
         vendor = vendor.map_or("none", |v| v.as_str()),
         device = device.0,
@@ -635,18 +786,22 @@ pub fn plan_execution_device(
     Ok(ParallelPlan {
         tp,
         dp,
+        ep,
         backend,
         mode: cfg.ranks.mode,
         vendor,
         excluded_devices: Vec::new(),
         groups,
         reasons,
+        experts: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use turbine_core::config::{DeviceSelection, ParallelConfig, SizeOrAuto};
+    use turbine_core::config::{
+        DeviceSelection, ExpertPlacementChoice, ParallelConfig, SizeOrAuto,
+    };
     use turbine_core::types::{DeviceId, MemoryKind, ModelShape, ReplicaId, Vendor};
     use turbine_device::topology::{
         AttrSource, Edge, EdgeKind, P2pStatus, PathClass, TopologyGraph, TopologyNode,
@@ -982,6 +1137,140 @@ mod tests {
             "{:?}",
             codes(&p)
         );
+    }
+
+    /// allenai/OLMoE-1B-7B-0125-Instruct.
+    fn olmoe() -> ModelShape {
+        ModelShape {
+            architecture: "OlmoeForCausalLM".into(),
+            num_layers: 16,
+            hidden: 2048,
+            num_attention_heads: 16,
+            num_kv_heads: 16,
+            head_dim: 128,
+            intermediate: 1024,
+            vocab: 50_304,
+            num_experts: 64,
+            experts_per_token: 8,
+            tied_embeddings: false,
+            weight_bytes: 13_838_000_000,
+            max_position_embeddings: 4096,
+        }
+    }
+
+    fn ep_cfg(tp: u32, ep: u32, dp: u32) -> ParallelConfig {
+        ParallelConfig {
+            expert_parallel_size: SizeOrAuto::Size(ep),
+            ..cfg(SizeOrAuto::Size(tp), SizeOrAuto::Size(dp))
+        }
+    }
+
+    /// P5 S-11, S-12: expert parallelism as a plan choice. On novanas OLMoE at ep 2 with tp 1
+    /// (attention replicated) and with tp 2 (= ep) is one group of both GPUs, with reason codes
+    /// `configured`, `ep_moe_only` and `backend:hostmem` and the contiguous placement (experts
+    /// 0–31 on rank 0, 32–63 on rank 1, every layer); ep × dp builds ep-rank groups. Refused:
+    /// ep on the dense Llama (`ep_moe_only`, naming the key), ep 3 (does not divide 64), tp 4
+    /// with ep 2 (`combination_unsupported:ep+tp`), more ranks than devices, and a placement
+    /// file missing an expert (naming `parallel.expert.placement`). Breaks if an unsupported
+    /// combination plans or an EP group is sized by tp alone.
+    #[test]
+    fn expert_parallel_plans() {
+        let novanas = inventory(vec![
+            gpu(0, Vendor::Amd, "gfx1201"),
+            gpu(1, Vendor::Amd, "gfx1201"),
+        ]);
+        let g = graph(vec![link(0, 1, EdgeKind::Pcie, PathClass::Sys)]);
+        for tp in [1, 2] {
+            let p = plan(&novanas, &g, &ep_cfg(tp, 2, 1), &olmoe(), &budget_32g)
+                .unwrap_or_else(|e| panic!("ep 2 tp {tp}: {e}"));
+            assert_eq!((p.tp, p.ep, p.dp, p.group_size()), (tp, 2, 1, 2));
+            assert_eq!(devices_of(&p), vec![vec![0, 1]]);
+            assert_eq!(p.backend, "hostmem", "auto: AMD, local ranks");
+            for code in ["configured", "ep_moe_only", "backend:hostmem"] {
+                assert!(codes(&p).contains(&code.to_string()), "{:?}", codes(&p));
+            }
+            let experts = p.experts.as_ref().expect("placement");
+            assert_eq!(experts.ranks, 2);
+            assert_eq!(experts.layers.len(), 16);
+            assert_eq!(experts.local_experts(15, 0), (0..32).collect::<Vec<_>>());
+            assert_eq!(experts.local_experts(0, 1), (32..64).collect::<Vec<_>>());
+        }
+        // tp 1 and ep 1 plan no placement and keep their reasons.
+        let p = plan(&novanas, &g, &ep_cfg(1, 1, 2), &olmoe(), &budget_32g).expect("dp 2");
+        assert_eq!((p.ep, p.experts.clone()), (1, None));
+        assert!(!codes(&p).contains(&"ep_moe_only".to_string()));
+
+        // ep × dp: two groups of two ranks on four GPUs.
+        let four = inventory((0..4).map(|i| gpu(i, Vendor::Amd, "gfx1201")).collect());
+        let p = plan(
+            &four,
+            &graph(Vec::new()),
+            &ep_cfg(1, 2, 2),
+            &olmoe(),
+            &budget_32g,
+        )
+        .expect("ep 2 × dp 2");
+        assert_eq!(devices_of(&p), vec![vec![0, 1], vec![2, 3]]);
+        assert_eq!(p.group_size(), 2);
+
+        let refused = |c: &ParallelConfig, model: &ModelShape| {
+            plan(&novanas, &g, c, model, &budget_32g).expect_err("refused")
+        };
+        let e = refused(&ep_cfg(1, 2, 1), &llama_3b());
+        assert_eq!(e.key, "parallel.expert_parallel_size");
+        assert!(e.reason.starts_with("ep_moe_only"), "{e}");
+        let e = refused(&ep_cfg(1, 3, 1), &olmoe());
+        assert_eq!(e.key, "parallel.expert_parallel_size");
+        assert!(e.reason.contains("does not divide"), "{e}");
+        let e = refused(&ep_cfg(4, 2, 1), &olmoe());
+        assert!(e.reason.starts_with("combination_unsupported:ep+tp"), "{e}");
+        let e = refused(&ep_cfg(1, 4, 1), &olmoe());
+        assert_eq!(e.key, "parallel.expert_parallel_size");
+        assert!(e.reason.contains("4 ranks need 4"), "{e}");
+
+        let dir = std::env::temp_dir().join(format!("turbine-plan-ep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("placement.yaml");
+        let mut text = String::new();
+        for layer in 0..16 {
+            let n = if layer == 3 { 63 } else { 64 };
+            let ranks: Vec<String> = (0..n).map(|e| (e % 2).to_string()).collect();
+            text += &format!("{layer}: [{}]\n", ranks.join(", "));
+        }
+        std::fs::write(&file, text).unwrap();
+        let mut from_file = ep_cfg(1, 2, 1);
+        from_file.expert.placement = ExpertPlacementChoice::File(file.clone());
+        let e = refused(&from_file, &olmoe());
+        assert_eq!(e.key, "parallel.expert.placement");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The cpu host path: ep 2 as two rank threads on host devices 0 and 1.
+        use turbine_core::config::ModuleName;
+        let host = ParallelConfig {
+            collective_backend: ModuleName::new("host").unwrap(),
+            ..ep_cfg(1, 2, 1)
+        };
+        let p = plan_execution_device(&host, DeviceId(0), None, "h").expect("host ep 2");
+        assert_eq!((p.tp, p.ep), (1, 2));
+        assert_eq!(devices_of(&p), vec![vec![0, 1]]);
+        assert_eq!(
+            codes(&p),
+            vec!["execution_device", "configured", "backend:host"]
+        );
+        let e = plan_execution_device(&ep_cfg(1, 2, 1), DeviceId(0), None, "h")
+            .expect_err("cpu ep without the host backend");
+        assert_eq!(e.key, "parallel.expert_parallel_size");
+        let e = plan_execution_device(
+            &ParallelConfig {
+                collective_backend: ModuleName::new("host").unwrap(),
+                ..ep_cfg(4, 2, 1)
+            },
+            DeviceId(0),
+            None,
+            "h",
+        )
+        .expect_err("tp 4 ep 2");
+        assert!(e.reason.starts_with("combination_unsupported:ep+tp"), "{e}");
     }
 
     /// The backend comes from the `collective_backend` registry: explicit names must serve the

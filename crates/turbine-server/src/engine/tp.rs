@@ -54,6 +54,7 @@ use turbine_distributed::rank::{
 };
 use turbine_distributed::transport::Transport;
 use turbine_kv::BlockPool;
+use turbine_model::ep::{self, EpAttention, EpContext};
 use turbine_model::executor::{
     BatchInput, ExecutorLimits, ForwardTimings, Logits, ModelExecutor, RowReduce, SeqSlice,
 };
@@ -67,6 +68,7 @@ use turbine_tensor::{DType, DeviceBuffer, DeviceMemory};
 
 use crate::kv_orchestrator::{BlockAddresses, KvShard};
 use crate::model::{self, LoadedModel, PreparedModel, StartupError};
+use crate::parallel::ExpertStats;
 
 /// A worker rank's failure, kept for the leader: its rank and its error (a sticky device error
 /// is returned to the engine as it is).
@@ -109,6 +111,8 @@ pub(crate) struct TpExecutor {
     collective: Arc<dyn Collective>,
     faults: Arc<Fault>,
     step: u64,
+    /// Expert parallelism: the group's token counts, turned into metrics after every step.
+    experts: Option<Arc<ExpertStats>>,
 }
 
 impl TpExecutor {
@@ -124,7 +128,14 @@ impl TpExecutor {
             collective,
             faults,
             step: 0,
+            experts: None,
         }
+    }
+
+    /// Reports `experts` after every forward (expert parallelism).
+    pub(crate) fn with_experts(mut self, experts: Option<Arc<ExpertStats>>) -> TpExecutor {
+        self.experts = experts;
+        self
     }
 
     /// A worker's sticky device error, if one was reported (the process must exit 3).
@@ -194,7 +205,11 @@ impl ModelExecutor for TpExecutor {
 
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
         let plan = step_plan(self.step, batch);
-        self.run(plan, |leader| leader.forward(batch))
+        let logits = self.run(plan, |leader| leader.forward(batch))?;
+        if let Some(experts) = &self.experts {
+            experts.observe();
+        }
+        Ok(logits)
     }
 
     fn last_timings(&self) -> ForwardTimings {
@@ -358,6 +373,8 @@ pub(crate) struct TpGroupStart {
     /// `static` rank mode (P5 S-5): the worker ranks are other processes that join this leader
     /// over the rank transport; `workers` is empty.
     pub remote: Option<StaticLeader>,
+    /// Expert parallelism (P5 S-11): rank 0's token counts, reported after every step.
+    pub experts: Option<Arc<ExpertStats>>,
 }
 
 /// The leader's side of a `static` group: where it listens and what every joining rank must
@@ -554,24 +571,47 @@ fn load_rank(p: &PreparedModel, g: &GroupLoad<'_>) -> Result<RankLoaded, Startup
                 "the group's smallest KV pool sizes this rank's pool"
             );
         }
-        let executor = tp::build_executor(
-            &p.arch,
-            weights,
-            Arc::clone(&p.registry),
-            Arc::clone(mem),
-            ExecutorLimits {
-                block_tokens: p.block_tokens,
-                max_batch_tokens: p.scheduler.max_batch_tokens,
-                max_seqs: p.scheduler.max_running_requests,
-            },
-            p.executor_options,
-            TpContext {
-                rank: s.rank,
-                world: s.world,
-                collective: Arc::clone(&collective),
-                stream: mem.compute_stream(),
-            },
-        )
+        let limits = ExecutorLimits {
+            block_tokens: p.block_tokens,
+            max_batch_tokens: p.scheduler.max_batch_tokens,
+            max_seqs: p.scheduler.max_running_requests,
+        };
+        let tp_context = TpContext {
+            rank: s.rank,
+            world: s.world,
+            collective: Arc::clone(&collective),
+            stream: mem.compute_stream(),
+        };
+        let executor = match &p.expert {
+            // Expert parallelism (P5 S-11): the rank's experts over the same communicator;
+            // tensor-parallel attention at tp = ep, whose FFN all-reduce is the combine.
+            Some(e) => ep::build_executor(
+                &p.arch,
+                weights,
+                Arc::clone(&p.registry),
+                Arc::clone(mem),
+                limits,
+                p.executor_options,
+                EpContext {
+                    rank: s.rank,
+                    world: s.world,
+                    placement: Arc::clone(&e.placement),
+                    collective: Arc::clone(&collective),
+                    stream: mem.compute_stream(),
+                    counts: Arc::clone(&e.counts),
+                },
+                (e.shard.attention == EpAttention::TensorParallel).then_some(tp_context),
+            ),
+            None => tp::build_executor(
+                &p.arch,
+                weights,
+                Arc::clone(&p.registry),
+                Arc::clone(mem),
+                limits,
+                p.executor_options,
+                tp_context,
+            ),
+        }
         .map_err(|e| rank_error("executor", &e))?;
         let pool = model::allocate_pool(p, blocks, &ledger)?;
         let reserve = model::acquire_reserve(p, &ledger, g.reliability)?;
@@ -721,7 +761,8 @@ pub(crate) fn load_group(
         Some(runtime) => runtime,
         None => RankRuntime::local(workers, group.depth),
     };
-    let mut executor = TpExecutor::new(rank0.executor, runtime, rank0.collective, faults);
+    let mut executor = TpExecutor::new(rank0.executor, runtime, rank0.collective, faults)
+        .with_experts(group.experts.clone());
     let mut pool = rank0.pool;
     phase(NotReadyReason::LoadingModel);
     model::warm_up(&mut executor, &mut pool, warmup_token)?;
@@ -1057,7 +1098,7 @@ mod tests {
             &config,
             &inventory,
             &MetricsRegistry::new(),
-            Some(ShardSpec { rank, world: 2 }),
+            Some(model::RankPart::Tensor(ShardSpec { rank, world: 2 })),
         )
         .expect("prepare")
     }
@@ -1137,6 +1178,7 @@ mod tests {
                 expect,
                 world: 2,
             }),
+            experts: None,
         };
         let model_metrics = ModelMetrics::register(&reg);
         let loaded = load_group(&leader, group, 0, &model_metrics, &reliability, &|_| {})
