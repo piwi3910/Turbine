@@ -3746,6 +3746,37 @@ mod tests {
         }
     }
 
+    /// `n` > 1 on an executor sized for `max_running_requests` sequences: two running requests,
+    /// one with 3 choices, hold 4 decoding sequences on an executor built for 2; the scheduler
+    /// steps at most 2 per iteration, in turn, and both requests complete every choice. Breaks
+    /// if a step hands the executor more sequences than it holds ("sequences exceed max_seqs").
+    #[test]
+    fn choices_beyond_the_executor_batch_take_turns() {
+        let (_dir, spec, tokenizer) = tiny();
+        let t = engine(tiny_executor(&spec, 2), tokenizer, params(2, 64));
+        let mut three = request(&[256, 1, 2, 3], 6);
+        three.n = 3;
+        let streams = [
+            submit(&t.tx, three),
+            submit(&t.tx, request(&[256, 4, 5], 6)),
+        ];
+        let engine = t.engine;
+        let handle = std::thread::spawn(move || engine.run());
+        for (i, (mut rx, admitted)) in streams.into_iter().enumerate() {
+            assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+            // Every choice ends with its own event: read until the request drops its channel.
+            let events: Vec<GenerationEvent> = std::iter::from_fn(|| rx.blocking_recv()).collect();
+            assert_eq!(error_code(&events), None, "request {i}: {events:?}");
+            let tokens = events
+                .iter()
+                .filter(|e| matches!(e, GenerationEvent::Token { .. }))
+                .count();
+            assert_eq!(tokens, if i == 0 { 18 } else { 6 }, "request {i}");
+        }
+        drop(t.tx);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+    }
+
     /// P5 S-6: a tensor-parallel group's failed collective (a rank aborted) ends the running
     /// request with `replica_failed`, opens the circuit with reason `collective_failed` (queued
     /// requests are rejected `circuit_open`), keeps the engine running and frees every block.
