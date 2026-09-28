@@ -1294,3 +1294,13 @@ Written with `.procoder/specs/phase-5p-serving-efficiency.md` and its plan, ahea
 - `structured_output.jump_forward_max_tokens` default 32.
 
 Known limit, unchanged from Phase 4 and stated in the spec: KV written by decode steps (a previous turn's generated tokens) is reused within the golden tolerance, not bit-exactly, because decode steps run Llama's speed-tuned GEMM rows; the bit-exact `kv_gpu` checks cover prefill-written prefixes.
+
+## Phase 5p moves after Phase 6 (2026-09-28)
+
+The user asked to move all Phase 5p items to after Phase 6. Asked whether that includes the two items carried over from the Phase 5 exit (5p plan Task 0: `lab-test.sh --release` plus the release-mode one-GPU full-tier rerun; Task 0b: the `parallel.tp_prefill_overlap` golden and bench confirmation, then turning it on):
+
+- Keep the release-mode lab tests now, move the rest (recommended)
+- Move everything
+- Keep both carry-overs now
+
+**Answer (2026-09-28, user): "skip the tests".** Tasks 0 and 0b are skipped: the stopped one-GPU full tier is not rerun, `tp_prefill_overlap` stays off by default, and `lab-test.sh` keeps the debug profile. Phase 5p (the measurement, token-granular prefix reuse, `cache_aware`, jump-forward) now runs after Phase 6 quantization; next up is `phase-6-quantization`. Tasks 0/0b stay in the 5p plan marked skipped, so they can be picked up again on request.

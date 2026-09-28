@@ -36,7 +36,7 @@ From the interface contract and the work in flight (binding):
 - Builds and tests run on novanas through `scripts/remote-cargo.sh` (no local target directories); every task ends with `scripts/gate.sh` printing `gate: ok`; GPU-facing tasks add `scripts/lab-test.sh novanas --tier quick`; every task that changes serving code ends with `scripts/lab-bench.sh --model llama` and `--model olmoe` (GPU 0, under `scripts/bench-lock.sh`, labbook set `phase-5p`) and a row in `.procoder/perf-log.md` — one change, then measure; the next task starts only after that row.
 - Lab runs of this phase fall under the standing novanas approvals (2026-09-25, 2026-09-26): `lab-test.sh`, `lab-bench.sh`, golden and bench runs while the R9700s are free; if `amd.com/gpu` is held by another workload, stop and ask the user; the overload soak is asked for first.
 
-## Task 0: `lab-test.sh --release` and the release-mode one-GPU full tier
+## Task 0: `lab-test.sh --release` and the release-mode one-GPU full tier (skipped, user decision 2026-09-28)
 
 Files: `scripts/lab-test.sh` (the `--release` option, default for `--tier full`), `scripts/lab/novanas-test-job.yaml` (the release profile in the same cached slot target dirs), `benches/turbine-bench/tests/lab_scripts.rs` (dry-run test), `AGENTS.md`
 Interfaces:
@@ -51,7 +51,7 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `feat(scripts): lab-test --release, the default for the full tier`
 
-## Task 0b: Prefill overlap — golden and bench confirmation, then the default
+## Task 0b: Prefill overlap — golden and bench confirmation, then the default (skipped, user decision 2026-09-28)
 
 Files: `crates/turbine-core/src/config/parallel.rs` (the default), `crates/turbine-core/src/config/tests.rs`, `.procoder/contract/interfaces.md`, `.procoder/ask/decisions.md`, `AGENTS.md`
 Interfaces:
