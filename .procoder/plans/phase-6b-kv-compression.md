@@ -131,10 +131,10 @@ Interfaces:
 
 ## Task 7: TurboQuant CPU codec (`tq4`, `tq2`)
 
-Files: `crates/turbine-kv/src/codec/turboquant/mod.rs` (codec, layout), `crates/turbine-kv/src/codec/turboquant/hadamard.rs` (randomized fast Walsh–Hadamard), `crates/turbine-kv/src/codec/turboquant/codebook.rs` (Lloyd–Max codebooks as constants plus the generator used by the test), `crates/turbine-kv/src/codec/turboquant/qjl.rs` (1-bit residual projection), `crates/turbine-kv/src/codec/mod.rs` (registry adds `tq4`, `tq2`), `crates/turbine-core/src/support.rs` (`TIER_FORMAT_REFUSALS`: `tq4`/`tq2` `experimental`)
+Files: `crates/turbine-kv/src/codec/turboquant/mod.rs` (codec, layout), `crates/turbine-kv/src/codec/turboquant/hadamard.rs` (randomized fast Walsh–Hadamard), `crates/turbine-kv/src/codec/turboquant/codebook.rs` (Lloyd–Max codebooks as constants plus the generator used by the test), `crates/turbine-kv/src/codec/turboquant/qjl.rs` (1-bit residual projection through a seeded Gaussian `S`), `crates/turbine-kv/src/codec/mod.rs` (registry adds `tq4`, `tq2`), `crates/turbine-core/src/support.rs` (`TIER_FORMAT_REFUSALS`: `tq4`/`tq2` `experimental`)
 Interfaces:
 
-- per token-head vector of 128: signs `s = rademacher(seed, layer, head, kind)`, `y = H·(s ⊙ x) / √128`, `norm = ‖x‖` (BF16), codes = nearest codebook entry of `y_i·√128 / norm`; K residual `r = y − ŷ`, QJL signs of `H·(s' ⊙ r)`, residual norm (BF16); decode inverts; `seed` = first 8 bytes of the namespace key
+- per token-head vector of 128: signs `s = rademacher(seed, layer, head, kind)`, `y = H·(s ⊙ x) / √128`, `norm = ‖x‖` (BF16), codes = nearest codebook entry of `y_i·√128 / norm`; K residual `r = y − ŷ`, QJL signs of `S·r` with `S` a 128 × 128 Gaussian matrix seeded per (layer, head, kind) (SplitMix64 + Box–Muller in F64 rounded to F32), residual norm (BF16); decode adds the paper's estimate of the residual from the signs and its norm (`p6b-groundwork` `qjl.rs`); decode inverts; `seed` = first 8 bytes of the namespace key
   Covers: spec S-4 (CPU); AC `codec::turboquant::tests`
   Depends on: Task 1
 
