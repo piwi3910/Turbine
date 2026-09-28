@@ -32,7 +32,12 @@ fn pinned_round_trip() {
     }
     let ctx = open_context("hip");
     let lib = ctx.library();
-    assert_eq!((lib.abi_version(), lib.abi_minor()), (2, 5));
+    assert_eq!(lib.abi_version(), 2);
+    assert!(
+        lib.abi_minor() >= 5,
+        "minor {} lacks the v2.5 copy streams",
+        lib.abi_minor()
+    );
     assert!(ctx.has_copy_engine(), "the v2.3 and v2.5 groups resolve");
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
 
