@@ -400,7 +400,7 @@ Interfaces:
 Files: `crates/turbine-distributed/src/{pipeline.rs,plan.rs}`, `crates/turbine-core/src/config/parallel.rs` (`pipeline_parallel_size`, `pipeline.layer_split`, `pipeline.micro_batches`, `expert_parallel_size`, `expert.placement`), `crates/turbine-server/src/parallel.rs` (`check_executable`), `crates/turbine-server/tests/server_cli.rs`
 Interfaces:
 
-- `pub struct StageSpec { pub stage: u32, pub device: DeviceId, pub layers: Range<u32>, pub embedding: bool, pub lm_head: bool }`, `pub fn partition(costs: &[LayerCost], stages: u32, split: Option<&[u32]>) -> Result<Vec<Range<u32>>, PlanError>`, `pub fn place_stages(ranges: &[Range<u32>], devices: &[DeviceId], graph: &TopologyGraph) -> (Vec<StageSpec>, Vec<PlanReason>)`; `ParallelPlan` gains `pp`, `ep`, `stages`, `experts`; reason codes of the spec's Data section
+- `pub struct StageSpec { pub stage: u32, pub device: DeviceId, pub layers: Range<u32>, pub embedding: bool, pub lm_head: bool }`, `pub struct LayerCost { pub weight_bytes: u64, pub flops_per_token: u64 }`, `pub struct PipelineCosts { pub layers: Vec<LayerCost>, pub first: LayerCost, pub last: LayerCost }`, `pub fn partition(costs: &PipelineCosts, stages: u32, split: Option<&[u32]>) -> Result<Vec<Range<u32>>, PlanError>`, `pub fn validate_split(split: &[u32], layers: u32, stages: u32) -> Result<(), PlanError>`, `pub fn place_stages(ranges: &[Range<u32>], devices: &[DeviceId], host_link_gbps: &dyn Fn(DeviceId) -> Option<f64>) -> Result<(Vec<StageSpec>, StageReason), PlanError>` (`StageReason` ∈ `pp_stage_host_traffic:<device>`, `pp_stage_device_order`); `ParallelPlan` gains `pp`, `ep`, `stages`, `experts`; reason codes of the spec's Data section
   Covers: S-10, S-12; `pipeline::tests::{partition_balances_cost, explicit_split_validated, last_stage_on_fastest_link}`, `plan::tests::parallel_modes`, `server_cli unsupported_parallel_combination_exits_2`
   Depends on: Tasks 1, 10, 11, 20
 
@@ -446,7 +446,7 @@ Interfaces:
 Files: `crates/turbine-distributed/src/expert.rs` (placement map, validation, per-rank token counts), `.procoder/ask/decisions.md` (provider evaluation: CK `moe_sorting` local-expert mask, vLLM `fused_moe` `expert_map`, llama.cpp MoE, the Phase 2 providers with a global→local map)
 Interfaces:
 
-- `pub struct ExpertPlacement { pub layers: Vec<Vec<u32>> }` (rank per expert), `pub fn contiguous(num_experts: u32, layers: u32, ep: u32) -> Result<ExpertPlacement, PlanError>`, `pub fn from_file(path, num_experts, layers, ep)`, `pub fn local_experts(&self, layer, rank) -> Vec<u32>`
+- `pub struct ExpertPlacement { pub ranks: u32, pub layers: Vec<(u32, Vec<u32>)> }` (per MoE layer: its index and the rank of each expert), `ExpertPlacement::contiguous(num_experts: u32, moe_layers: &[u32], ep: u32) -> Result<Self, PlanError>`, `ExpertPlacement::parse(text, num_experts, moe_layers, ep)` / `from_file(path, num_experts, moe_layers, ep)`, `fn layer(&self, layer) -> Option<&[u32]>`, `fn local_experts(&self, layer, rank) -> Vec<u32>`
   Covers: S-11; `expert::tests::placement_map_valid`
   Depends on: Task 22
 

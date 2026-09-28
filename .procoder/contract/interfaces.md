@@ -1837,8 +1837,8 @@ pub struct RankSlot { pub rank: u32, pub device: DeviceId, pub host: String }
 pub enum PlanReason { FitsSingleDevice, TpRequiredForCapacity, GroupedByLink(PathClass), VendorHomogeneous, VendorExcluded(Vendor),
                       ExplicitDevices, DeviceSharingEnabled, ExecutionDevice, Configured, PpRequiredForCapacity, EpMoeOnly, PpStageHostTraffic(DeviceId),
                       PpPartitionCostBalanced, PpPartitionExplicit, Backend(&'static str), CombinationUnsupported(String) }   // Display: "fits_single_device", "grouped_by_link:<path>", "vendor_excluded:<vendor>", …, "execution_device", "pp_stage_host_traffic:<device>", "backend:<name>", "combination_unsupported:<modes>"
-pub struct StageSpec { pub stage: u32, pub device: DeviceId, pub layers: Range<u32>, pub embedding: bool, pub lm_head: bool }   // P5 amended 2026-09-28 (pipeline.rs)
-pub struct ExpertPlacement { pub layers: Vec<Vec<u32>> /* rank per expert */ }                                              // P5 amended 2026-09-28 (expert.rs)
+pub struct StageSpec { pub stage: u32, pub device: DeviceId, pub layers: Range<u32>, pub embedding: bool, pub lm_head: bool }   // P5 amended 2026-09-28 (pipeline.rs: partition, validate_split, place_stages)
+pub struct ExpertPlacement { pub ranks: u32, pub layers: Vec<(u32, Vec<u32>)> /* MoE layer, rank per expert */ }                                              // P5 amended 2026-09-28 (expert.rs)
 pub fn plan(inv: &DeviceInventory, topo: &TopologyGraph, cfg: &ParallelConfig, model: &ModelShape, device_budget: &dyn Fn(DeviceId) -> u64) -> Result<ParallelPlan, PlanError>;
 // (P5 T11, contract addition) every replica on `execution.device`, inventory not consulted: the cpu backend (vendor None)
 // and the single-GPU default (tp 1, dp 1, devices auto); tp > 1 and rccl/nccl without a matching vendor are PlanErrors.
@@ -1965,7 +1965,7 @@ pub enum FailureDetector { Heartbeat, Connection, Collective }                  
 pub mod sim { pub struct ClusterSim; pub enum ScriptedFault { Kill(String), Restart(String), Partition(String, String), Heal(String, String), Delay(..), Drop(..), Corrupt(..) } }
 ```
 
-### 15.4 Advanced distribution (P7)
+### 15.4 Advanced distribution (P7; single-node `pipeline` and `expert` moved to P5 §15.2, amended 2026-09-28 — the sketch below is superseded there)
 
 ```rust
 pub mod pipeline { pub struct PipelinePlan { pub stages: Vec<StagePlan> }  pub struct StagePlan { pub stage: u32, pub device_group: u32, pub first_layer: u32, pub last_layer: u32, pub weight_bytes: u64, pub est_cost: f64 }
