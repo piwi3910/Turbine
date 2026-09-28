@@ -17,7 +17,9 @@ slow-timeout = { period = "60s", terminate-after = 15 }
 # client's KV freed within 1 s; P2c S-1: the eight stage timings sum to the iteration's duration
 # within 5 % or 0.5 ms). Under a fully loaded host the OS can preempt the engine thread between
 # two clock reads for longer than that; run them with the host to themselves rather than loosen
-# the bounds (both flaked in parallel gates on novanas, 2026-09-28).
+# the bounds (both flaked in parallel gates on novanas, 2026-09-28). Likewise the admission and
+# slow-client tests, whose streams and queues are judged against 1-10 s waits (queue_full_429 and
+# slow_client_paused_then_cancelled flaked in parallel gates, 2026-09-28; they pass alone).
 [[profile.default.overrides]]
-filter = 'binary(tiny_server) & (test(=disconnect_releases_kv) | test(=iteration_stage_breakdown))'
+filter = 'binary(tiny_server) & (test(=disconnect_releases_kv) | test(=iteration_stage_breakdown) | test(=queue_full_429) | test(=slow_client_paused_then_cancelled))'
 threads-required = 'num-test-threads'
