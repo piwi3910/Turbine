@@ -900,3 +900,25 @@ Consequences (docs amended the same day):
 - Phase 8 speculative decoding (umbrella S-7) now comes after the families, so recurrent-state rollback for the hybrids belongs to phase 8, not to phase 7.
 - Open for the track specs (not decided here): the hybrids' cached checkpoints are NVFP4, so phase 7 needs FP8 or BF16 checkpoints of them (Qwen3.6-35B-A3B needs FP8 + TP 2 or similar to fit 2 × 32 GB); each phase-6 format is proven on a registered architecture (Llama-3.2-3B or OLMoE) where such a checkpoint exists — which ones is the phase-6 spec's choice (e.g. RedHatAI / neuralmagic FP8, AWQ and GPTQ Llama-3.2-3B checkpoints); MXFP4 checkpoints may exist only for gpt-oss, which needs the phase-7 family — the phase-6 spec decides between an MXFP4 fixture checkpoint quantized offline (Python quantizer at fixture-generation time only) and proving MXFP4 in phase 7 with gpt-oss.
 - Code still names the old track names: the support-matrix refusal reasons in `crates/turbine-core/src/support.rs` (`phase-8a-quantization`, `phase-8b-speculative-decoding`, `phase-8c-model-families`) and the tests that assert them, and tests that use `GptOssForCausalLM` as the example of an unregistered architecture; and the four `nvidia`/`sm_121` × Llama / OLMoE BF16 baseline rows are still `supported` although phase-2b never ran (unreachable today: `execution.backend: cuda` exits 2). They change with the first code task of phase 6 (reasons, NVIDIA rows, the five new `weight_format` values) and phase 7 (the gpt-oss test name), not in this docs change.
+
+## Phase 6 MXFP4: packaging formats and proof checkpoints (2026-09-28)
+
+Found on Hugging Face (2026-09-28, real safetensors checkpoints, `config.json` inspected): OpenAI native `quant_method: mxfp4` (`openai/gpt-oss-20b`, Apache-2.0); compressed-tensors `mxfp4-pack-quantized` (float4 group 32, E8M0 `uint8` scales; W4A16 in `nm-testing/Qwen3-30B-A3B-MXFP4A16` and `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16`); AMD Quark MXFP4 (`amd/Qwen3.5-35B-A3B-MXFP4`, `amd/gpt-oss-20b-MoE-Quant-W-MXFP4-A-FP8-KV-FP8`, `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq`; mostly W4A4). Rejected as proof: `ISTA-DASLab/*-FPQuant-*` (Hadamard rotations, not plain MXFP4).
+
+**1. Which MXFP4 packaging formats does phase 6 support?** — multi-select
+
+- compressed-tensors `mxfp4-pack-quantized` (recommended)
+- OpenAI native `mxfp4` (gpt-oss; loader in phase 6, proven with gpt-oss in phase 7)
+- AMD Quark MXFP4 (mostly W4A4; activation FP4 emulated on RDNA4)
+
+**Answer (2026-09-28, user): all three.**
+
+**2. Which real checkpoint proves MXFP4 on a registered architecture?**
+
+- A) `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16` (compressed-tensors, `LlamaForCausalLM`, 5.8 GB) (recommended)
+- B) `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` (Quark W4A4, `LlamaForCausalLM`)
+- C) defer the first real proof to `openai/gpt-oss-20b` in phase 7
+
+**Answer (2026-09-28, user): all three** — A and B are phase-6 proofs, C is the phase-7 proof of the OpenAI native packaging.
+
+Consequences: the `phase-6-quantization` spec covers the three MXFP4 packagings under one `mxfp4` weight format (or one value per packaging, the spec's choice) and proves compressed-tensors on A and Quark on B; B's activation FP4 is emulated on RDNA4 (activations quantize-dequantized to FP4 before an FP8/BF16 matmul), and its row is `supported` only if it passes the S-3 gate against the checkpoint's reference output, else `experimental`. The OpenAI native loader may land in phase 6 under unit tests; its row turns `supported` when phase 7 closes gpt-oss-20b. Reference outputs for A and B are captured once with transformers (compressed-tensors / Quark dequantization, fixture generation only) and committed; quality is compared with BF16 `meta-llama/Llama-3.1-8B-Instruct` and `Llama-3.2-3B-Instruct`. The weights are downloaded on `novanas` with `hf download` into `/home/piwi/turbine-models/<slug>` like the Phase 1/2 weights.
