@@ -821,12 +821,20 @@ fn support_matrix_output() {
                 && r["status"] == status
         })
     };
-    // Every registered family has its supported rows, and the phase 8 families are refused on
-    // the GPU vendors.
+    // Every registered family has its supported AMD rows; the former NVIDIA baseline rows are
+    // refused while phase-2b-nvidia is deferred, and every nvidia key is (deferred_vendors).
     for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
         assert!(has("amd", "gfx1201", architecture, "supported"), "{v}");
-        assert!(has("nvidia", "sm_121", architecture, "supported"), "{v}");
+        assert!(has("nvidia", "sm_121", architecture, "unsupported"), "{v}");
     }
+    let deferred = v["deferred_vendors"].as_array().expect("deferred_vendors");
+    assert!(
+        deferred.iter().any(|d| d["vendor"] == "nvidia"
+            && d["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("phase-2b-nvidia"))),
+        "{v}"
+    );
     for architecture in [
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -834,7 +842,6 @@ fn support_matrix_output() {
         "MixtralForCausalLM",
     ] {
         assert!(has("amd", "*", architecture, "unsupported"), "{v}");
-        assert!(has("nvidia", "*", architecture, "unsupported"), "{v}");
     }
     assert!(has("cpu", "*", "*", "experimental"), "{v}");
     // P5 exit (user decision 2026-09-28): OLMoE with expert × tensor parallelism is refused.
@@ -858,7 +865,7 @@ fn support_matrix_output() {
     assert!(text.starts_with("vendor "), "{text}");
     assert_eq!(
         text.lines().count(),
-        rows.len() + 1 + refusals.len(),
+        rows.len() + 1 + deferred.len() + refusals.len(),
         "{text}"
     );
 
@@ -963,7 +970,7 @@ fn unsupported_row_exits_2_before_bind() {
     assert!(stderr.contains("support matrix"), "stderr: {stderr}");
     assert!(stderr.contains("Qwen3ForCausalLM"), "stderr: {stderr}");
     assert!(
-        stderr.contains("phase-8c-model-families"),
+        stderr.contains("phase-7-model-families"),
         "stderr: {stderr}"
     );
     let logs = format!("{stdout}\n{stderr}");

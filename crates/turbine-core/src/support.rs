@@ -1,6 +1,7 @@
-//! Support matrix (phase 8 S-2, Phase 2m S-11): one declarative table of
+//! Support matrix (umbrella phase-6-8-expansion S-2, Phase 2m S-11): one declarative table of
 //! `(vendor, arch, architecture, weight_format, kv_format, speculative) → status`.
-//! Tracks add rows only when their exit gate (S-3) passed.
+//! Tracks add rows only when their exit gate (S-3) passed. A vendor whose phase is deferred
+//! ([`DEFERRED_VENDORS`]: NVIDIA, `phase-2b-nvidia`) is refused before any row is consulted.
 //!
 //! The columns are plain names, so this crate needs neither the backend nor the family
 //! registry: `vendor` is `ExecutionBackend::vendor()` of the configured backend, `arch` the
@@ -28,6 +29,20 @@ pub const WILDCARD: &str = "*";
 #[non_exhaustive]
 pub enum WeightFormatColumn {
     Bf16,
+    /// FP8 e4m3 weights with per-tensor or per-channel scales (Phase 6a).
+    Fp8,
+    /// FP8 e4m3 weights with 128 × 128 block scales (Phase 6a).
+    Fp8Block,
+    /// MXFP4 weight-only (W4A16): compressed-tensors, OpenAI native, Quark weight-only (Phase 6a).
+    Mxfp4,
+    /// MXFP4 weights with emulated MXFP4 activations (Quark W4A4, Phase 6a; user decision
+    /// 2026-09-28, Q6).
+    Mxfp4A4,
+    /// INT4 AWQ, group-wise with zero points (Phase 6a).
+    AwqInt4,
+    /// INT4 GPTQ, group-wise (Phase 6a).
+    GptqInt4,
+    /// Reserved for the deferred `phase-2b-nvidia` (NVFP4 arrives with NVIDIA support).
     ModeloptNvfp4,
     ModeloptFp8,
     ModeloptMixed,
@@ -35,8 +50,30 @@ pub enum WeightFormatColumn {
 }
 
 impl WeightFormatColumn {
-    pub const ALL: [WeightFormatColumn; 5] = [
+    pub const ALL: [WeightFormatColumn; 11] = [
         WeightFormatColumn::Bf16,
+        WeightFormatColumn::Fp8,
+        WeightFormatColumn::Fp8Block,
+        WeightFormatColumn::Mxfp4,
+        WeightFormatColumn::Mxfp4A4,
+        WeightFormatColumn::AwqInt4,
+        WeightFormatColumn::GptqInt4,
+        WeightFormatColumn::ModeloptNvfp4,
+        WeightFormatColumn::ModeloptFp8,
+        WeightFormatColumn::ModeloptMixed,
+        WeightFormatColumn::CtNvfp4,
+    ];
+    /// The Phase 6a formats (each refused until its proof passes).
+    pub const PHASE_6A: [WeightFormatColumn; 6] = [
+        WeightFormatColumn::Fp8,
+        WeightFormatColumn::Fp8Block,
+        WeightFormatColumn::Mxfp4,
+        WeightFormatColumn::Mxfp4A4,
+        WeightFormatColumn::AwqInt4,
+        WeightFormatColumn::GptqInt4,
+    ];
+    /// The values reserved for the deferred `phase-2b-nvidia`.
+    pub const RESERVED_NVIDIA: [WeightFormatColumn; 4] = [
         WeightFormatColumn::ModeloptNvfp4,
         WeightFormatColumn::ModeloptFp8,
         WeightFormatColumn::ModeloptMixed,
@@ -45,6 +82,12 @@ impl WeightFormatColumn {
     pub fn as_str(self) -> &'static str {
         match self {
             WeightFormatColumn::Bf16 => "bf16",
+            WeightFormatColumn::Fp8 => "fp8",
+            WeightFormatColumn::Fp8Block => "fp8_block",
+            WeightFormatColumn::Mxfp4 => "mxfp4",
+            WeightFormatColumn::Mxfp4A4 => "mxfp4_a4",
+            WeightFormatColumn::AwqInt4 => "awq_int4",
+            WeightFormatColumn::GptqInt4 => "gptq_int4",
             WeightFormatColumn::ModeloptNvfp4 => "modelopt_nvfp4",
             WeightFormatColumn::ModeloptFp8 => "modelopt_fp8",
             WeightFormatColumn::ModeloptMixed => "modelopt_mixed",
@@ -194,12 +237,30 @@ const BF16: Option<WeightFormatColumn> = Some(WeightFormatColumn::Bf16);
 const KV_BF16: Option<KvFormatColumn> = Some(KvFormatColumn::Bf16);
 const NO_SPEC: Option<SpeculativeColumn> = Some(SpeculativeColumn::None);
 const QUANT_REASON: &str =
-    "quantized checkpoints are not validated yet (track phase-8a-quantization)";
+    "this quantized weight format is not validated yet (track phase-6a-quantization)";
+const RESERVED_NVIDIA_REASON: &str = "this weight format is reserved for the deferred phase-2b-nvidia (NVFP4 arrives with NVIDIA support)";
 const FAMILY_REASON: &str =
-    "this model family is not validated on this vendor yet (track phase-8c-model-families)";
+    "this model family is not validated on this vendor yet (track phase-7-model-families)";
+/// Why every `nvidia` key is refused while Phase 2b is deferred (decision 2026-09-28).
+pub const NVIDIA_REASON: &str =
+    "NVIDIA execution is deferred (phase-2b-nvidia, on hold until the user lifts it)";
 
-/// The track 3 families on a GPU vendor, BF16: refused until the track closes (Task 10 of the
-/// umbrella plan flips each validated row to `supported`). The CPU reference provider serves
+/// Vendors whose phase is deferred: any key of such a vendor resolves `unsupported` with the
+/// reason, before the rows are consulted, so no row can make it supported by accident. The
+/// table still lists the vendor's former baseline rows as `unsupported` so `--support-matrix`
+/// shows them.
+pub static DEFERRED_VENDORS: &[(&str, &str)] = &[("nvidia", NVIDIA_REASON)];
+
+/// The deferral reason of `vendor`, if its phase is deferred.
+pub fn deferred_vendor(vendor: &str) -> Option<&'static str> {
+    DEFERRED_VENDORS
+        .iter()
+        .find(|(v, _)| *v == vendor)
+        .map(|(_, reason)| *reason)
+}
+
+/// The Phase 7 families on the AMD GPU vendor, BF16: refused until the track closes (Task 10 of
+/// the umbrella plan flips each validated row to `supported`). The CPU reference provider serves
 /// them through its `experimental` row.
 const fn family_row(vendor: &'static str, architecture: &'static str) -> SupportRow {
     row(
@@ -213,10 +274,36 @@ const fn family_row(vendor: &'static str, architecture: &'static str) -> Support
     )
 }
 
+/// A weight format refused on every vendor and architecture (BF16 KV, no speculation).
+const fn format_row(format: WeightFormatColumn, reason: &'static str) -> SupportRow {
+    row(
+        None,
+        None,
+        None,
+        Some(format),
+        KV_BF16,
+        NO_SPEC,
+        unsupported(reason),
+    )
+}
+
+/// A former NVIDIA baseline row, refused while `phase-2b-nvidia` is deferred.
+const fn nvidia_row(architecture: &'static str) -> SupportRow {
+    row(
+        Some("nvidia"),
+        Some("sm_121"),
+        Some(architecture),
+        BF16,
+        KV_BF16,
+        NO_SPEC,
+        unsupported(NVIDIA_REASON),
+    )
+}
+
 /// The support matrix. Order is irrelevant: the most specific matching row wins, and
 /// `support::tests::resolution_and_refusal` proves no two overlapping rows tie.
 pub static SUPPORT_MATRIX: &[SupportRow] = &[
-    // Phase 1–7 baseline (S-2).
+    // Phase 1–5 baseline (S-2).
     row(
         Some("amd"),
         Some("gfx1201"),
@@ -235,24 +322,10 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Supported,
     ),
-    row(
-        Some("nvidia"),
-        Some("sm_121"),
-        Some("LlamaForCausalLM"),
-        BF16,
-        KV_BF16,
-        NO_SPEC,
-        SupportStatus::Supported,
-    ),
-    row(
-        Some("nvidia"),
-        Some("sm_121"),
-        Some("OlmoeForCausalLM"),
-        BF16,
-        KV_BF16,
-        NO_SPEC,
-        SupportStatus::Supported,
-    ),
+    // Deferred with phase-2b-nvidia (decision 2026-09-28); DEFERRED_VENDORS refuses every other
+    // nvidia key with the same reason.
+    nvidia_row("LlamaForCausalLM"),
+    nvidia_row("OlmoeForCausalLM"),
     // CPU reference provider: tests and tiny checkpoints only; `experimental` by user decision
     // (2026-09-25, `.procoder/ask/decisions.md`).
     row(
@@ -269,46 +342,18 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     family_row("amd", "Qwen3MoeForCausalLM"),
     family_row("amd", "MistralForCausalLM"),
     family_row("amd", "MixtralForCausalLM"),
-    family_row("nvidia", "Qwen3ForCausalLM"),
-    family_row("nvidia", "Qwen3MoeForCausalLM"),
-    family_row("nvidia", "MistralForCausalLM"),
-    family_row("nvidia", "MixtralForCausalLM"),
-    row(
-        None,
-        None,
-        None,
-        Some(WeightFormatColumn::ModeloptNvfp4),
-        KV_BF16,
-        NO_SPEC,
-        unsupported(QUANT_REASON),
-    ),
-    row(
-        None,
-        None,
-        None,
-        Some(WeightFormatColumn::ModeloptFp8),
-        KV_BF16,
-        NO_SPEC,
-        unsupported(QUANT_REASON),
-    ),
-    row(
-        None,
-        None,
-        None,
-        Some(WeightFormatColumn::ModeloptMixed),
-        KV_BF16,
-        NO_SPEC,
-        unsupported(QUANT_REASON),
-    ),
-    row(
-        None,
-        None,
-        None,
-        Some(WeightFormatColumn::CtNvfp4),
-        KV_BF16,
-        NO_SPEC,
-        unsupported(QUANT_REASON),
-    ),
+    // Phase 6a weight formats: each row turns `supported` for its proven combination only.
+    format_row(WeightFormatColumn::Fp8, QUANT_REASON),
+    format_row(WeightFormatColumn::Fp8Block, QUANT_REASON),
+    format_row(WeightFormatColumn::Mxfp4, QUANT_REASON),
+    format_row(WeightFormatColumn::Mxfp4A4, QUANT_REASON),
+    format_row(WeightFormatColumn::AwqInt4, QUANT_REASON),
+    format_row(WeightFormatColumn::GptqInt4, QUANT_REASON),
+    // Reserved for the deferred phase-2b-nvidia.
+    format_row(WeightFormatColumn::ModeloptNvfp4, RESERVED_NVIDIA_REASON),
+    format_row(WeightFormatColumn::ModeloptFp8, RESERVED_NVIDIA_REASON),
+    format_row(WeightFormatColumn::ModeloptMixed, RESERVED_NVIDIA_REASON),
+    format_row(WeightFormatColumn::CtNvfp4, RESERVED_NVIDIA_REASON),
     row(
         None,
         None,
@@ -316,7 +361,7 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         None,
         Some(KvFormatColumn::Fp8E4m3),
         NO_SPEC,
-        unsupported("fp8_e4m3 KV cache is not validated yet (track phase-8a-quantization)"),
+        unsupported("fp8_e4m3 KV cache is not validated yet (track phase-6a-quantization)"),
     ),
     row(
         None,
@@ -326,7 +371,7 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         None,
         Some(SpeculativeColumn::Draft),
         unsupported(
-            "draft-model speculative decoding is not validated yet (track phase-8b-speculative-decoding)",
+            "draft-model speculative decoding is not validated yet (track phase-8-speculative-decoding)",
         ),
     ),
 ];
@@ -407,7 +452,9 @@ impl SupportKey {
             && !SUPPORT_MATRIX
                 .iter()
                 .any(|r| r.key.architecture == Some(self.architecture.as_str()));
-        if self.speculative != SpeculativeColumn::None {
+        if deferred_vendor(&self.vendor).is_some() {
+            "execution.backend"
+        } else if self.speculative != SpeculativeColumn::None {
             "speculative.method"
         } else if self.kv_format != KvFormatColumn::Bf16 {
             "kv.dtype"
@@ -420,28 +467,59 @@ impl SupportKey {
 
     /// Key before device discovery (startup and `--check-config`): `vendor` is the configured
     /// execution backend's vendor column, `arch` is unknown ([`WILDCARD`]) except on the
-    /// [`HOST_VENDOR`], and `architecture` is the model's Hugging Face architecture name, or
-    /// [`WILDCARD`] when `config.json` cannot be read yet.
-    pub fn before_discovery(vendor: &str, architecture: Option<&str>) -> SupportKey {
+    /// [`HOST_VENDOR`], `architecture` is the model's Hugging Face architecture name, or
+    /// [`WILDCARD`] when `config.json` cannot be read yet, and the format columns are the
+    /// checkpoint's detected weight format and the configured L0 KV dtype.
+    pub fn before_discovery(
+        vendor: &str,
+        architecture: Option<&str>,
+        weight: WeightFormatColumn,
+        kv: KvFormatColumn,
+    ) -> SupportKey {
         let arch = if vendor == HOST_VENDOR {
             HOST_VENDOR
         } else {
             WILDCARD
         };
-        SupportKey::bf16(vendor, arch, architecture.unwrap_or(WILDCARD))
+        SupportKey::for_model(
+            vendor,
+            arch,
+            architecture.unwrap_or(WILDCARD),
+            weight,
+            kv,
+            SpeculativeColumn::None,
+        )
     }
 
-    /// Key with the BF16 weight and KV columns and no speculation — the only format columns
-    /// Phase 2m serves (`speculative.method` and the quantized formats stay with Phase 8).
-    pub fn bf16(vendor: &str, arch: &str, architecture: &str) -> SupportKey {
+    /// The key of a served model: every column spelled out.
+    pub fn for_model(
+        vendor: &str,
+        arch: &str,
+        architecture: &str,
+        weight: WeightFormatColumn,
+        kv: KvFormatColumn,
+        speculative: SpeculativeColumn,
+    ) -> SupportKey {
         SupportKey {
             vendor: vendor.to_string(),
             arch: arch.to_string(),
             architecture: architecture.to_string(),
-            weight_format: WeightFormatColumn::Bf16,
-            kv_format: KvFormatColumn::Bf16,
-            speculative: SpeculativeColumn::None,
+            weight_format: weight,
+            kv_format: kv,
+            speculative,
         }
+    }
+
+    /// Key with the BF16 weight and KV columns and no speculation (tests and the BF16 baseline).
+    pub fn bf16(vendor: &str, arch: &str, architecture: &str) -> SupportKey {
+        SupportKey::for_model(
+            vendor,
+            arch,
+            architecture,
+            WeightFormatColumn::Bf16,
+            KvFormatColumn::Bf16,
+            SpeculativeColumn::None,
+        )
     }
 }
 
@@ -461,8 +539,12 @@ impl fmt::Display for SupportKey {
     }
 }
 
-/// Most specific row of `table` matching `key` exactly; no row → unsupported.
+/// Most specific row of `table` matching `key` exactly; no row → unsupported. A key of a
+/// [`DEFERRED_VENDORS`] vendor is unsupported with its deferral reason whatever the rows say.
 pub fn resolve_in(table: &[SupportRow], key: &SupportKey) -> SupportStatus {
+    if let Some(reason) = deferred_vendor(&key.vendor) {
+        return unsupported(reason);
+    }
     table
         .iter()
         .filter(|r| r.key.matches(key))
@@ -477,6 +559,9 @@ pub fn resolve_in(table: &[SupportRow], key: &SupportKey) -> SupportStatus {
 /// give (unsupported only when every compatible row is unsupported, with the reason of the
 /// most specific one).
 pub fn resolve_partial_in(table: &[SupportRow], key: &SupportKey) -> SupportStatus {
+    if let Some(reason) = deferred_vendor(&key.vendor) {
+        return unsupported(reason);
+    }
     let compatible: Vec<&SupportRow> = table.iter().filter(|r| r.key.compatible(key)).collect();
     if let Some(best) = compatible
         .iter()
@@ -685,7 +770,7 @@ mod tests {
                 status: SupportStatus::Supported,
             },
             SupportRow {
-                key: pat(Some("nvidia"), Some("sm_121"), None, Some(S::None)),
+                key: pat(Some("cpu"), Some("host-a"), None, Some(S::None)),
                 status: SupportStatus::Experimental,
             },
             SupportRow {
@@ -733,8 +818,8 @@ mod tests {
 
         // Experimental passes with a WARN.
         let k = key(
-            "nvidia",
-            "sm_121",
+            "cpu",
+            "host-a",
             "LlamaForCausalLM",
             W::Bf16,
             K::Bf16,
@@ -755,8 +840,8 @@ mod tests {
 
         // No row at all is unsupported.
         let k = key(
-            "nvidia",
-            "sm_90",
+            "cpu",
+            "host-b",
             "LlamaForCausalLM",
             W::Bf16,
             K::Bf16,
@@ -814,33 +899,100 @@ mod tests {
         use KvFormatColumn as K;
         use SpeculativeColumn as S;
         use WeightFormatColumn as W;
-        for (vendor, arch) in [("amd", "gfx1201"), ("nvidia", "sm_121")] {
-            for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
-                let k = key(vendor, arch, architecture, W::Bf16, K::Bf16, S::None);
-                let row = SUPPORT_MATRIX
-                    .iter()
-                    .filter(|r| r.key.matches(&k))
-                    .max_by_key(|r| r.key.specificity())
-                    .expect("baseline row");
-                assert_eq!(
-                    row.key.specificity(),
-                    6,
-                    "{k}: baseline rows are fully specific"
-                );
-                assert_eq!(resolve(&k), SupportStatus::Supported, "{k}");
+        // The AMD baseline: fully specific supported rows.
+        for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
+            let k = key("amd", "gfx1201", architecture, W::Bf16, K::Bf16, S::None);
+            let row = SUPPORT_MATRIX
+                .iter()
+                .filter(|r| r.key.matches(&k))
+                .max_by_key(|r| r.key.specificity())
+                .expect("baseline row");
+            assert_eq!(
+                row.key.specificity(),
+                6,
+                "{k}: baseline rows are fully specific"
+            );
+            assert_eq!(resolve(&k), SupportStatus::Supported, "{k}");
+        }
+        // Every nvidia key, listed row or not, is refused naming the deferred phase-2b-nvidia.
+        for architecture in [
+            "LlamaForCausalLM",
+            "OlmoeForCausalLM",
+            "Qwen3ForCausalLM",
+            "MixtralForCausalLM",
+        ] {
+            for w in W::ALL {
+                for kv in K::ALL {
+                    for spec in S::ALL {
+                        for arch in ["sm_121", "sm_90", WILDCARD] {
+                            let k = key("nvidia", arch, architecture, w, kv, spec);
+                            let status = if k.is_partial() {
+                                resolve_partial_in(SUPPORT_MATRIX, &k)
+                            } else {
+                                resolve(&k)
+                            };
+                            assert_eq!(status.as_str(), "unsupported", "{k}");
+                            assert!(
+                                status.reason().unwrap().contains("phase-2b-nvidia"),
+                                "{k}: {status:?}"
+                            );
+                        }
+                    }
+                }
             }
         }
+        let err = check(SupportKey::bf16("nvidia", "sm_121", "LlamaForCausalLM")).unwrap_err();
+        assert_eq!(err.key(), Some("execution.backend"));
+        // No reason names a Phase 8 run-ahead track name; every reason names a live track.
+        for r in SUPPORT_MATRIX {
+            if let Some(reason) = r.status.reason() {
+                for stale in ["a", "b", "c"].map(|t| format!("phase-8{t}")) {
+                    assert!(!reason.contains(&stale), "{:?}", r.view());
+                }
+            }
+        }
+        // Nothing but the AMD BF16 baseline is supported before the tracks add rows.
         for r in SUPPORT_MATRIX
             .iter()
             .filter(|r| r.status == SupportStatus::Supported)
         {
+            assert_eq!(r.key.vendor, Some("amd"), "{:?}", r.view());
             assert_eq!(r.key.weight_format, Some(W::Bf16), "{:?}", r.view());
             assert_eq!(r.key.kv_format, Some(K::Bf16), "{:?}", r.view());
             assert_eq!(r.key.speculative, Some(S::None), "{:?}", r.view());
         }
-        for w in W::ALL.into_iter().filter(|w| *w != W::Bf16) {
-            let k = key("nvidia", "sm_121", "LlamaForCausalLM", w, K::Bf16, S::None);
-            assert_eq!(resolve(&k).as_str(), "unsupported", "{k}");
+        // The Phase 6a formats exist and are refused naming the track; the NVIDIA-reserved
+        // formats name phase-2b-nvidia.
+        let spelled: Vec<&str> = W::PHASE_6A.iter().map(|w| w.as_str()).collect();
+        assert_eq!(
+            spelled,
+            [
+                "fp8",
+                "fp8_block",
+                "mxfp4",
+                "mxfp4_a4",
+                "awq_int4",
+                "gptq_int4"
+            ]
+        );
+        for w in W::PHASE_6A {
+            let k = key("amd", "gfx1201", "LlamaForCausalLM", w, K::Bf16, S::None);
+            let status = resolve(&k);
+            assert_eq!(status.as_str(), "unsupported", "{k}");
+            assert!(
+                status.reason().unwrap().contains("phase-6a-quantization"),
+                "{k}: {status:?}"
+            );
+            let err = check(k).unwrap_err();
+            assert_eq!(err.key(), Some("model.path"));
+        }
+        for w in W::RESERVED_NVIDIA {
+            let k = key("amd", "gfx1201", "LlamaForCausalLM", w, K::Bf16, S::None);
+            let status = resolve(&k);
+            assert!(
+                status.reason().unwrap().contains("phase-2b-nvidia"),
+                "{k}: {status:?}"
+            );
         }
         let k = key(
             "amd",
@@ -850,7 +1002,11 @@ mod tests {
             K::Fp8E4m3,
             S::None,
         );
-        assert_eq!(resolve(&k).as_str(), "unsupported");
+        let status = resolve(&k);
+        assert!(
+            status.reason().unwrap().contains("phase-6a-quantization"),
+            "{status:?}"
+        );
         let k = key(
             "amd",
             "gfx1201",
@@ -859,21 +1015,27 @@ mod tests {
             K::Bf16,
             S::Draft,
         );
-        assert_eq!(resolve(&k).as_str(), "unsupported");
-        // Track 3 families: refused on both GPU vendors (any arch), experimental on the CPU
-        // reference provider.
+        let status = resolve(&k);
+        assert!(
+            status
+                .reason()
+                .unwrap()
+                .contains("phase-8-speculative-decoding"),
+            "{status:?}"
+        );
+        // Phase 7 families: refused on AMD (any arch), experimental on the CPU reference.
         for architecture in [
             "Qwen3ForCausalLM",
             "Qwen3MoeForCausalLM",
             "MistralForCausalLM",
             "MixtralForCausalLM",
         ] {
-            for (vendor, arch) in [("amd", "gfx1201"), ("nvidia", "sm_121"), ("amd", "gfx942")] {
-                let k = key(vendor, arch, architecture, W::Bf16, K::Bf16, S::None);
+            for arch in ["gfx1201", "gfx942"] {
+                let k = key("amd", arch, architecture, W::Bf16, K::Bf16, S::None);
                 let status = resolve(&k);
                 assert_eq!(status.as_str(), "unsupported", "{k}");
                 assert!(
-                    status.reason().unwrap().contains("phase-8c-model-families"),
+                    status.reason().unwrap().contains("phase-7-model-families"),
                     "{k}: {status:?}"
                 );
             }
@@ -900,12 +1062,14 @@ mod tests {
     /// discovery a device arch is unknown, a host backend's arch is its vendor word.
     #[test]
     fn keys_before_discovery() {
-        let k = SupportKey::before_discovery("amd", Some("LlamaForCausalLM"));
+        use KvFormatColumn as K;
+        use WeightFormatColumn as W;
+        let k = SupportKey::before_discovery("amd", Some("LlamaForCausalLM"), W::Bf16, K::Bf16);
         assert_eq!(k.to_string(), "amd/*/LlamaForCausalLM/bf16/bf16/none");
         assert!(k.is_partial());
         assert_eq!(check(k).unwrap().status, SupportStatus::Supported);
 
-        let k = SupportKey::before_discovery("amd", Some("Qwen3ForCausalLM"));
+        let k = SupportKey::before_discovery("amd", Some("Qwen3ForCausalLM"), W::Bf16, K::Bf16);
         let err = check(k).unwrap_err();
         assert_eq!(err.key(), Some("execution.backend"));
         let msg = err.to_string();
@@ -914,15 +1078,20 @@ mod tests {
             "{msg}"
         );
 
-        let k = SupportKey::before_discovery(HOST_VENDOR, None);
+        let k = SupportKey::before_discovery(HOST_VENDOR, None, W::Bf16, K::Bf16);
         assert_eq!(k.to_string(), "cpu/cpu/*/bf16/bf16/none");
         assert_eq!(check(k).unwrap().status, SupportStatus::Experimental);
-        let k = SupportKey::before_discovery(HOST_VENDOR, Some("Qwen3ForCausalLM"));
+        let k =
+            SupportKey::before_discovery(HOST_VENDOR, Some("Qwen3ForCausalLM"), W::Bf16, K::Bf16);
         assert!(!k.is_partial());
         assert_eq!(resolve(&k), SupportStatus::Experimental);
 
         let k = SupportKey::bf16("amd", "gfx1201", "OlmoeForCausalLM");
         assert_eq!(resolve(&k), SupportStatus::Supported);
+        // A detected quantized format and FP8 KV show in the key.
+        let k = SupportKey::before_discovery("amd", Some("LlamaForCausalLM"), W::Fp8, K::Fp8E4m3);
+        assert_eq!(k.to_string(), "amd/*/LlamaForCausalLM/fp8/fp8_e4m3/none");
+        assert_eq!(check(k).unwrap_err().key(), Some("kv.dtype"));
         assert!(VENDORS.contains(&HOST_VENDOR));
     }
 }

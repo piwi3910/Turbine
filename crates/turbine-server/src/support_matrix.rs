@@ -2,18 +2,24 @@
 //! matrix as text or JSON, without reading a configuration.
 use std::fmt::Write as _;
 
-use turbine_core::support::{PARALLEL_REFUSALS, SUPPORT_MATRIX, SupportDecision};
+use turbine_core::support::{DEFERRED_VENDORS, PARALLEL_REFUSALS, SUPPORT_MATRIX, SupportDecision};
 
 use crate::cli::OutputFormat;
 
 /// Body printed by `turbine-server --support-matrix`.
 pub fn render_matrix(output: OutputFormat) -> String {
     let rows: Vec<_> = SUPPORT_MATRIX.iter().map(|r| r.view()).collect();
+    let deferred: Vec<_> = DEFERRED_VENDORS
+        .iter()
+        .map(|(vendor, reason)| serde_json::json!({ "vendor": vendor, "reason": reason }))
+        .collect();
     match output {
         OutputFormat::Json => {
-            let mut s = serde_json::to_string(
-                &serde_json::json!({ "rows": rows, "parallel_refusals": PARALLEL_REFUSALS }),
-            )
+            let mut s = serde_json::to_string(&serde_json::json!({
+                "rows": rows,
+                "parallel_refusals": PARALLEL_REFUSALS,
+                "deferred_vendors": deferred,
+            }))
             .expect("rows serialize");
             s.push('\n');
             s
@@ -45,6 +51,10 @@ pub fn render_matrix(output: OutputFormat) -> String {
                     r.reason.as_deref().unwrap_or("-")
                 );
             }
+            // Vendors refused whatever the rows say (their phase is deferred).
+            for (vendor, reason) in DEFERRED_VENDORS {
+                let _ = writeln!(s, "deferred {vendor:<7} unsupported {reason}");
+            }
             // Parallel-mode combinations refused per architecture (every vendor).
             for r in PARALLEL_REFUSALS {
                 let _ = writeln!(
@@ -74,7 +84,13 @@ mod tests {
         assert!(lines[0].starts_with("vendor "), "{text}");
         assert_eq!(
             lines.len(),
-            SUPPORT_MATRIX.len() + 1 + PARALLEL_REFUSALS.len()
+            SUPPORT_MATRIX.len() + 1 + DEFERRED_VENDORS.len() + PARALLEL_REFUSALS.len()
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("deferred nvidia") && l.contains("phase-2b-nvidia")),
+            "{text}"
         );
         assert!(
             lines
