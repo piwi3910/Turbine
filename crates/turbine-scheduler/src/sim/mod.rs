@@ -1,16 +1,19 @@
 //! Deterministic scheduler simulator (P2 S-12): the real `Scheduler` and `BlockPool` driven by
 //! a cost-model executor on virtual time (`FakeClock`, no sleeps). `KvSimDriver` (P4) adds the
-//! real `KvHierarchy` with simulated tiers and transfers.
+//! real `KvHierarchy` with simulated tiers and transfers; `Simulation::run_pipelined` (P5) runs
+//! pipeline micro-batches through simulated stages.
 
 pub mod arrivals;
 pub mod digests;
 pub mod executor;
 pub mod overload;
+pub mod pipeline;
 #[cfg(test)]
 pub(crate) mod workloads;
 
 pub use arrivals::{ArrivalProcess, LengthMix, SimArrival};
 pub use executor::{CostModel, SimExecutor};
+pub use pipeline::{MicroBatchTrace, PipelineReport};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;

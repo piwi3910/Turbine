@@ -4,6 +4,7 @@
 
 pub mod gate;
 pub mod metrics;
+pub mod pipeline;
 pub mod policy;
 pub mod queue;
 pub mod request;
@@ -12,11 +13,13 @@ pub mod sim;
 
 pub use gate::{AdmissionGate, GateOutcome};
 pub use metrics::SchedulerMetrics;
+pub use pipeline::{MicroBatchPlan, PipelineMetrics, StageTimeline};
 pub use queue::WaitingQueue;
 pub use request::{CancelReason, PreemptReason, RequestState, SchedError, SchedRequest};
 pub use scheduler::{
     BatchItem, BatchKind, ForkOp, IterationFailure, IterationLimits, IterationOutcome,
-    IterationPlan, Scheduler, SchedulerParams, SchedulerSnapshot, SubmitError,
+    IterationPlan, PipelineSnapshot, Scheduler, SchedulerParams, SchedulerSnapshot, StageSnapshot,
+    SubmitError,
 };
 pub use turbine_core::types::{BlockId, Priority, RequestId, SeqId};
 /// The reason carried by `SubmitError::Rejected`.

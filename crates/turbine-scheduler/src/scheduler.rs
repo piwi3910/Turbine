@@ -14,6 +14,16 @@
 //! most recently admitted). Whatever the policy, a prefill or fork may preempt only requests
 //! ranked below its own, so the best-ranked request always progresses — no livelock while each
 //! request's full KV fits the empty pool (checked at submission).
+//!
+//! Micro-batches (Phase 5 S-10, pipeline parallelism): with `with_micro_batches(m)` up to `m`
+//! plans are in flight at once, each matched by its `iteration` in `complete`, in any order.
+//! A plan never touches a request of another plan in flight: no decode, prefill chunk or fork,
+//! never a preemption victim, and a cancellation is applied by the first plan after its plan
+//! completed — so no block is freed under an executing plan. Each plan holds at most
+//! `ceil(live / m)` sequences (`live`: the running sequences, in flight or not, plus the waiting
+//! requests a free slot could start) and, with chunked prefill, `max_batch_tokens / m` tokens,
+//! so the running set spreads over the micro-batches; decodes go least recently stepped first.
+//! With `m = 1` (the default) planning is unchanged.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -264,6 +274,30 @@ pub struct SchedulerSnapshot {
     pub iterations_total: u64,
     pub preemptions_total: u64,
     pub last_iteration: LastIteration,
+    /// Pipeline micro-batches (Phase 5 S-10); present only with more than one micro-batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<PipelineSnapshot>,
+}
+
+/// The `pipeline` section of `GET /turbine/v1/scheduler` (Phase 5 S-10). The scheduler fills
+/// the micro-batch counts; the engine fills `stages` (placement and busy ratios) in the
+/// document it publishes, as it does `LastIteration::stages_ms`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct PipelineSnapshot {
+    pub stages: Vec<StageSnapshot>,
+    pub micro_batches: u32,
+    pub micro_batches_in_flight: u32,
+}
+
+/// One pipeline stage in the `pipeline` section.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StageSnapshot {
+    pub stage: u32,
+    pub device: u32,
+    /// First and last layer of the stage.
+    pub layers: [u32; 2],
+    /// Fraction of the last 10 s the stage was executing.
+    pub busy_ratio: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -316,6 +350,24 @@ struct SeqEntry {
     awaiting_fork: bool,
     /// Paused while not decoding: becomes `Paused` on reaching `Decoding`.
     pause_pending: bool,
+    /// Iteration of the last plan with an item of this sequence (0: none). With micro-batches
+    /// the least recently stepped decodes go first, so a capped micro-batch starves none.
+    last_step: u64,
+}
+
+/// A plan awaiting `complete`.
+#[derive(Debug, Default)]
+struct InFlight {
+    items: Vec<(SeqId, BatchKind)>,
+    /// Running requests with an item or a fork in the plan.
+    requests: Vec<RequestId>,
+    started: Duration,
+    last: LastIteration,
+    /// Sequences of this plan reported finished by another plan's outcome; finished when this
+    /// plan completes, so their blocks are not freed under it.
+    deferred_finished: Vec<SeqId>,
+    /// The plan has work (`!IterationPlan::is_empty`); only these count as micro-batches.
+    executes: bool,
 }
 
 impl SeqEntry {
@@ -370,14 +422,16 @@ pub struct Scheduler {
     running: Vec<RequestId>,
     queue: WaitingQueue,
     seqs: HashMap<SeqId, SeqEntry>,
-    /// Items of the plan awaiting `complete`.
-    in_flight: Vec<(SeqId, BatchKind)>,
-    in_flight_requests: Vec<RequestId>,
+    /// Plans awaiting `complete`, by iteration (empty plans too, until the next `plan`).
+    in_flight: BTreeMap<u64, InFlight>,
+    /// Requests of a plan in flight, with its iteration: no other plan may touch them.
+    busy: HashMap<RequestId, u64>,
+    /// Plans with work that may be in flight at once (`parallel.pipeline.micro_batches`).
+    micro_batches: u32,
     iteration: u64,
     admissions: u64,
     preemptions_total: u64,
     shutting_down: bool,
-    plan_started: Duration,
     last: LastIteration,
     /// P3 admission gate; `None` keeps the Phase 2 behaviour.
     gate: Option<AdmissionGate>,
@@ -402,13 +456,13 @@ impl Scheduler {
             running: Vec::new(),
             queue: WaitingQueue::new(),
             seqs: HashMap::new(),
-            in_flight: Vec::new(),
-            in_flight_requests: Vec::new(),
+            in_flight: BTreeMap::new(),
+            busy: HashMap::new(),
+            micro_batches: 1,
             iteration: 0,
             admissions: 0,
             preemptions_total: 0,
             shutting_down: false,
-            plan_started: Duration::ZERO,
             last: LastIteration::default(),
             gate: None,
             gate_dropped: Vec::new(),
@@ -465,6 +519,37 @@ impl Scheduler {
 
     pub fn params(&self) -> &SchedulerParams {
         &self.params
+    }
+
+    /// Keep up to `m` plans in flight (pipeline micro-batches, Phase 5 S-10; `m` ≥ 1, default
+    /// 1): each plan skips the requests of the others and is capped to its share of the
+    /// running set (module docs).
+    pub fn with_micro_batches(mut self, m: u32) -> Scheduler {
+        self.micro_batches = m.max(1);
+        self
+    }
+
+    pub fn micro_batches(&self) -> u32 {
+        self.micro_batches
+    }
+
+    /// Plans with work that were planned and not completed yet.
+    pub fn micro_batches_in_flight(&self) -> usize {
+        self.in_flight.values().filter(|f| f.executes).count()
+    }
+
+    /// Iterations of the plans with work awaiting `complete`, oldest first.
+    pub fn in_flight_iterations(&self) -> Vec<u64> {
+        self.in_flight
+            .iter()
+            .filter(|(_, f)| f.executes)
+            .map(|(i, _)| *i)
+            .collect()
+    }
+
+    /// The iteration of the plan in flight holding request `id`, if any.
+    pub fn in_flight_iteration_of(&self, id: RequestId) -> Option<u64> {
+        self.busy.get(&id).copied()
     }
 
     /// Submission checks (P2 §Scheduling rules), then queue by priority and arrival. With an
@@ -587,6 +672,7 @@ impl Scheduler {
                     target: r.prompt_len,
                     awaiting_fork: false,
                     pause_pending: false,
+                    last_step: 0,
                 },
             );
         }
@@ -743,7 +829,6 @@ impl Scheduler {
                 pool.release(&extra);
             }
         }
-        self.in_flight = plan.items.iter().map(|i| (i.seq, i.kind)).collect();
         let kept: HashSet<RequestId> = plan
             .items
             .iter()
@@ -754,10 +839,25 @@ impl Scheduler {
                     .filter_map(|f| self.seqs.get(&f.dst).map(|e| e.request)),
             )
             .collect();
-        self.in_flight_requests.retain(|id| kept.contains(id));
         self.last.prefill_tokens = plan.prefill_tokens();
         self.last.decode_tokens = plan.decode_tokens();
         self.last.requests = plan.items.len() as u32;
+        let Some(f) = self.in_flight.get_mut(&plan.iteration) else {
+            tracing::warn!(
+                event = "scheduler_outcome_mismatch",
+                iteration = plan.iteration,
+                "shrunk a plan that is not in flight"
+            );
+            return;
+        };
+        f.items = plan.items.iter().map(|i| (i.seq, i.kind)).collect();
+        f.requests.retain(|id| kept.contains(id));
+        f.last.prefill_tokens = self.last.prefill_tokens;
+        f.last.decode_tokens = self.last.decode_tokens;
+        f.last.requests = self.last.requests;
+        let iteration = plan.iteration;
+        self.busy
+            .retain(|id, it| *it != iteration || kept.contains(id));
     }
 
     /// Fail `ids` (retries exhausted, P3 S-11): their blocks and reservations are released.
@@ -771,7 +871,9 @@ impl Scheduler {
                 failed.push(id);
             }
         }
-        self.in_flight_requests.retain(|id| !failed.contains(id));
+        for f in self.in_flight.values_mut() {
+            f.requests.retain(|id| !failed.contains(id));
+        }
         self.publish_gauges();
         failed
     }
@@ -797,14 +899,35 @@ impl Scheduler {
     }
 
     /// One iteration's batch (P2 §Scheduling rules 1–3).
+    ///
+    /// With micro-batches, the requests of the plans in flight are skipped and the plan is
+    /// capped to its share of the running set; with every micro-batch in flight the plan is
+    /// empty.
     pub fn plan(&mut self, pool: &mut BlockPool, limits: &IterationLimits) -> IterationPlan {
         self.iteration += 1;
         let now = self.clock.now_mono();
-        self.plan_started = now;
+        // Empty plans hold nothing; an engine need not complete them.
+        self.in_flight.retain(|_, f| f.executes);
         let mut plan = IterationPlan {
             iteration: self.iteration,
             ..IterationPlan::default()
         };
+        if self.micro_batches_in_flight() >= self.micro_batches as usize {
+            tracing::debug!(
+                event = "micro_batches_full",
+                in_flight = self.micro_batches_in_flight(),
+                "every micro-batch is in flight: empty plan"
+            );
+            self.in_flight.insert(
+                plan.iteration,
+                InFlight {
+                    started: now,
+                    ..InFlight::default()
+                },
+            );
+            return plan;
+        }
+        let (seq_cap, token_cap) = self.micro_batch_caps();
         let mut in_plan: HashSet<RequestId> = HashSet::new();
         let mut preempted_now: HashSet<RequestId> = HashSet::new();
 
@@ -817,7 +940,14 @@ impl Scheduler {
         }
 
         // (2) Every decodable sequence decodes; preempt until the pool covers them.
-        self.plan_decodes(pool, limits, &mut plan, &mut in_plan, &mut preempted_now);
+        self.plan_decodes(
+            pool,
+            limits,
+            seq_cap.min(token_cap as usize),
+            &mut plan,
+            &mut in_plan,
+            &mut preempted_now,
+        );
 
         // Forks of finished shared prefills (n > 1) wait for blocks, never re-prefill.
         self.plan_forks(pool, &mut plan, &mut in_plan, &mut preempted_now);
@@ -825,13 +955,15 @@ impl Scheduler {
         // (3) Prefill: continuing prefills oldest first, then admissions.
         let decode_tokens = plan.decode_tokens();
         let fraction = limits.prefill_budget_fraction.clamp(0.0, 1.0);
-        let mut budget = (f64::from(self.params.max_batch_tokens.saturating_sub(decode_tokens))
-            * fraction)
-            .floor() as u32;
+        let mut budget =
+            (f64::from(token_cap.saturating_sub(decode_tokens)) * fraction).floor() as u32;
         let chunk_cap = self.policy.chunk_cap(&self.params, limits);
         for id in self.running.clone() {
+            if self.busy.contains_key(&id) {
+                continue;
+            }
             for seq in self.prefill_seqs(id) {
-                if budget == 0 || !self.is_running(id) {
+                if budget == 0 || !self.is_running(id) || plan.items.len() >= seq_cap {
                     break;
                 }
                 self.schedule_chunk(
@@ -881,6 +1013,7 @@ impl Scheduler {
             while budget > 0
                 && (self.running.len() as u32) < self.params.max_running_requests
                 && (gated || limits.batch_growth_limit.is_none_or(|g| admitted_now < g))
+                && plan.items.len() < seq_cap
             {
                 let Some(head) = self.queue.peek() else {
                     break;
@@ -892,7 +1025,7 @@ impl Scheduler {
                 self.admit(head, now);
                 admitted_now += 1;
                 for seq in self.prefill_seqs(head) {
-                    if budget == 0 {
+                    if budget == 0 || plan.items.len() >= seq_cap {
                         break;
                     }
                     self.schedule_chunk(
@@ -909,13 +1042,20 @@ impl Scheduler {
             }
         }
 
-        self.in_flight = plan.items.iter().map(|i| (i.seq, i.kind)).collect();
-        self.in_flight_requests = self
+        let requests: Vec<RequestId> = self
             .running
             .iter()
             .copied()
             .filter(|id| in_plan.contains(id))
             .collect();
+        for &id in &requests {
+            self.busy.insert(id, plan.iteration);
+        }
+        for item in &plan.items {
+            if let Some(e) = self.seqs.get_mut(&item.seq) {
+                e.last_step = plan.iteration;
+            }
+        }
         self.last = LastIteration {
             prefill_tokens: plan.prefill_tokens(),
             decode_tokens,
@@ -923,25 +1063,79 @@ impl Scheduler {
             duration_ms: 0.0,
             stages_ms: BTreeMap::new(),
         };
+        self.in_flight.insert(
+            plan.iteration,
+            InFlight {
+                items: plan.items.iter().map(|i| (i.seq, i.kind)).collect(),
+                requests,
+                started: now,
+                last: self.last.clone(),
+                deferred_finished: Vec::new(),
+                executes: !plan.is_empty(),
+            },
+        );
         self.prev_admitted = self.admitted_count();
         self.publish_gauges();
         plan
     }
 
+    /// Per-plan caps `(sequences, tokens)`: unlimited and `max_batch_tokens` with one
+    /// micro-batch; with `m`, `ceil(live / m)` sequences and (chunked prefill only — a whole
+    /// prompt must still fit one plan) `max_batch_tokens / m` tokens, where `live` counts the
+    /// running sequences that prefill or decode (in flight or not) plus the waiting requests
+    /// the free running slots could start.
+    fn micro_batch_caps(&self) -> (usize, u32) {
+        let m = self.micro_batches.max(1);
+        if m == 1 {
+            return (usize::MAX, self.params.max_batch_tokens);
+        }
+        let live = self
+            .running
+            .iter()
+            .flat_map(|id| self.requests[id].req.seqs.iter())
+            .filter(|s| {
+                self.seqs.get(s).is_some_and(|e| {
+                    matches!(e.state, RequestState::Prefilling | RequestState::Decoding)
+                })
+            })
+            .count();
+        let free_slots =
+            (self.params.max_running_requests as usize).saturating_sub(self.running.len());
+        let startable = self.queue_len().min(free_slots);
+        let seqs = (live + startable).div_ceil(m as usize).max(1);
+        let tokens = if self.params.chunked_prefill {
+            (self.params.max_batch_tokens / m).max(1)
+        } else {
+            self.params.max_batch_tokens
+        };
+        (seqs, tokens)
+    }
+
     /// Apply an executed plan: prefill completion, appended tokens, finished sequences, or
     /// the failure of every request in the iteration.
+    ///
+    /// The plan is matched by `outcome.iteration`; plans may complete in any order. A failure
+    /// fails only that plan's requests. `finished` and `appended` may name sequences of
+    /// earlier, already completed plans (late finishes); a sequence held by another plan in
+    /// flight finishes when that plan completes.
     pub fn complete(&mut self, pool: &mut BlockPool, outcome: IterationOutcome) {
-        if outcome.iteration != self.iteration {
+        let Some(entry) = self.in_flight.remove(&outcome.iteration) else {
             tracing::warn!(
                 event = "scheduler_outcome_mismatch",
-                expected = self.iteration,
+                expected = ?self.in_flight.keys().collect::<Vec<_>>(),
                 got = outcome.iteration,
-                "outcome for another iteration"
+                "outcome for a plan that is not in flight"
             );
-        }
-        let elapsed = self.clock.now_mono().saturating_sub(self.plan_started);
+            self.apply_samples(pool, outcome);
+            self.publish_gauges();
+            return;
+        };
+        let iteration = outcome.iteration;
+        self.busy.retain(|_, it| *it != iteration);
+        let elapsed = self.clock.now_mono().saturating_sub(entry.started);
+        self.last = entry.last;
         self.last.duration_ms = elapsed.as_secs_f64() * 1000.0;
-        if !self.in_flight.is_empty()
+        if !entry.items.is_empty()
             && let Some(m) = &self.metrics
         {
             m.iteration(
@@ -951,8 +1145,8 @@ impl Scheduler {
                 self.last.requests,
             );
         }
-        let in_flight = std::mem::take(&mut self.in_flight);
-        let in_flight_requests = std::mem::take(&mut self.in_flight_requests);
+        let in_flight = entry.items;
+        let in_flight_requests = entry.requests;
 
         if let Some(failure) = outcome.failed {
             for id in in_flight_requests {
@@ -965,7 +1159,7 @@ impl Scheduler {
             return;
         }
 
-        for (seq, n) in outcome.appended {
+        for &(seq, n) in &outcome.appended {
             if let Some(e) = self.seqs.get_mut(&seq) {
                 e.generated += n;
             }
@@ -1005,10 +1199,40 @@ impl Scheduler {
                 e.start_decoding(seq);
             }
         }
-        for (seq, _reason) in outcome.finished {
+        for &(seq, _reason) in &outcome.finished {
+            self.finish_or_defer(pool, seq);
+        }
+        for seq in entry.deferred_finished {
             self.finish_seq(pool, seq);
         }
         self.publish_gauges();
+    }
+
+    /// Tokens and finishes of an outcome without a plan in flight.
+    fn apply_samples(&mut self, pool: &mut BlockPool, outcome: IterationOutcome) {
+        if outcome.failed.is_some() {
+            return;
+        }
+        for (seq, n) in outcome.appended {
+            if let Some(e) = self.seqs.get_mut(&seq) {
+                e.generated += n;
+            }
+        }
+        for (seq, _reason) in outcome.finished {
+            self.finish_or_defer(pool, seq);
+        }
+    }
+
+    /// Finish `seq` now, or when the plan in flight holding its request completes.
+    fn finish_or_defer(&mut self, pool: &mut BlockPool, seq: SeqId) {
+        if let Some(e) = self.seqs.get(&seq)
+            && let Some(it) = self.busy.get(&e.request)
+            && let Some(f) = self.in_flight.get_mut(it)
+        {
+            f.deferred_finished.push(seq);
+            return;
+        }
+        self.finish_seq(pool, seq);
     }
 
     /// Body of `GET /turbine/v1/scheduler`.
@@ -1039,6 +1263,11 @@ impl Scheduler {
             iterations_total: self.iteration,
             preemptions_total: self.preemptions_total,
             last_iteration: self.last.clone(),
+            pipeline: (self.micro_batches > 1).then(|| PipelineSnapshot {
+                stages: Vec::new(),
+                micro_batches: self.micro_batches,
+                micro_batches_in_flight: self.micro_batches_in_flight() as u32,
+            }),
         }
     }
 
@@ -1046,11 +1275,13 @@ impl Scheduler {
 
     fn drop_cancelled(&mut self, pool: &mut BlockPool, now: Duration, plan: &mut IterationPlan) {
         self.drop_gated(pool, plan);
+        // A request of a plan in flight is dropped by the first plan after that one completed.
         let candidates: Vec<RequestId> = self
             .running
             .iter()
             .copied()
             .chain(self.queue.iter())
+            .filter(|id| !self.busy.contains_key(id))
             .collect();
         for id in candidates {
             let Some(e) = self.requests.get(&id) else {
@@ -1214,19 +1445,27 @@ impl Scheduler {
         &mut self,
         pool: &mut BlockPool,
         limits: &IterationLimits,
+        cap: usize,
         plan: &mut IterationPlan,
         in_plan: &mut HashSet<RequestId>,
         preempted_now: &mut HashSet<RequestId>,
     ) {
         let bt = self.params.block_tokens;
-        // Preempt until the pool covers every decode (never, without allow_preempt).
-        while limits.allow_preempt && self.decode_blocks_needed() > pool.available_blocks() {
+        // Preempt until the pool covers every decode (never, without allow_preempt). With
+        // micro-batches the victim is still the worst-ranked running request; when it is in
+        // flight nothing is preempted, and the decodes lacking a block wait for its plan.
+        let mut victim_in_flight = false;
+        while limits.allow_preempt && self.decode_blocks_needed(cap) > pool.available_blocks() {
             let Some(victim) = self.worst_running(|_| true) else {
                 break;
             };
+            if self.busy.contains_key(&victim) {
+                victim_in_flight = true;
+                break;
+            }
             self.preempt(pool, victim, plan, preempted_now);
         }
-        for seq in self.decode_set() {
+        for seq in self.decode_candidates(cap) {
             let e = self
                 .seqs
                 .get_mut(&seq)
@@ -1235,7 +1474,14 @@ impl Scheduler {
             let Ok(blocks) = Self::allocate_for(pool, &mut self.requests, e.request, need) else {
                 // With preemption allowed the loop above made the pool cover every decode;
                 // without it (a gate below SURVIVAL) the sequence waits for a block.
-                if limits.allow_preempt {
+                if victim_in_flight {
+                    tracing::debug!(
+                        event = "decode_deferred",
+                        seq = seq.0,
+                        reason = "victim_in_flight",
+                        "decode waits for the micro-batch holding the preemption victim"
+                    );
+                } else if limits.allow_preempt {
                     tracing::error!(
                         event = "scheduler_bug",
                         seq = seq.0,
@@ -1273,7 +1519,7 @@ impl Scheduler {
             let Some(r) = self.requests.get(&id) else {
                 continue;
             };
-            if !r.shared_prefill_done || r.admitted.is_none() {
+            if !r.shared_prefill_done || r.admitted.is_none() || self.busy.contains_key(&id) {
                 continue;
             }
             let seqs = r.req.seqs.clone();
@@ -1294,9 +1540,12 @@ impl Scheduler {
                 let mut forked = pool.fork(&parent_table);
                 if forked.is_err() && self.gate.is_none() {
                     // Make room from requests ranked below this one that are not in the plan.
-                    while let Some(victim) =
-                        self.worst_running(|v| v.0 != id && !in_plan.contains(&v.0) && v.1 > rank)
-                    {
+                    while let Some(victim) = self.worst_running(|v| {
+                        v.0 != id
+                            && !in_plan.contains(&v.0)
+                            && !self.busy.contains_key(&v.0)
+                            && v.1 > rank
+                    }) {
                         self.preempt(pool, victim, plan, preempted_now);
                         if pool.available_blocks() > 0 {
                             break;
@@ -1369,9 +1618,12 @@ impl Scheduler {
         if need > pool.available_blocks() && may_preempt && self.gate.is_none() {
             let rank = self.rank(id);
             while need > pool.available_blocks() {
-                let Some(victim) =
-                    self.worst_running(|v| v.0 != id && !in_plan.contains(&v.0) && v.1 > rank)
-                else {
+                let Some(victim) = self.worst_running(|v| {
+                    v.0 != id
+                        && !in_plan.contains(&v.0)
+                        && !self.busy.contains_key(&v.0)
+                        && v.1 > rank
+                }) else {
                     break;
                 };
                 self.preempt(pool, victim, plan, preempted_now);
@@ -1588,6 +1840,7 @@ impl Scheduler {
         }
         self.running.retain(|x| *x != id);
         self.queue.remove(id);
+        self.busy.remove(&id);
     }
 
     // ---- helpers -----------------------------------------------------------------------
@@ -1609,13 +1862,26 @@ impl Scheduler {
         self.requests.get(&id).is_some_and(|r| r.admitted.is_some())
     }
 
-    /// Blocks the decode set needs for one more token each.
-    fn decode_blocks_needed(&self) -> u32 {
+    /// Blocks this plan's decodes need for one more token each.
+    fn decode_blocks_needed(&self, cap: usize) -> u32 {
         let bt = self.params.block_tokens;
-        self.decode_set()
+        self.decode_candidates(cap)
             .iter()
             .map(|s| self.seqs[s].table.blocks_needed(1, bt))
             .sum()
+    }
+
+    /// The decodes of this plan: the whole decode set with one micro-batch; with more, the
+    /// sequences of requests not in flight, least recently stepped first (admission order
+    /// among equals), at most `cap`.
+    fn decode_candidates(&self, cap: usize) -> Vec<SeqId> {
+        let mut set = self.decode_set();
+        if self.micro_batches > 1 {
+            set.retain(|s| !self.busy.contains_key(&self.seqs[s].request));
+            set.sort_by_key(|s| self.seqs[s].last_step);
+            set.truncate(cap);
+        }
+        set
     }
 
     /// Decoding (not paused) sequences of running requests, in admission order.
@@ -2236,5 +2502,165 @@ mod tests {
         complete_all(&mut s, &mut p, &plan, &[21]);
         assert_eq!(p.used_blocks(), 0);
         assert!(s.is_idle());
+    }
+
+    fn seqs_of(plan: &IterationPlan) -> Vec<u64> {
+        plan.items.iter().map(|i| i.seq.0).collect()
+    }
+
+    /// Two micro-batches (Phase 5 S-10): each plan takes half the running set and skips the
+    /// requests of the plan in flight; with both in flight the plan is empty; plans complete
+    /// out of order; a late finish of an in-flight sequence waits for its plan; a failed plan
+    /// fails only its own requests. Catches a sequence planned twice, `complete` consuming the
+    /// wrong plan, blocks freed under an executing plan, or a failure spilling over.
+    #[test]
+    fn micro_batches_in_flight_out_of_order() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let mut s = Scheduler::new(
+            SchedulerParams {
+                max_queued_requests: 8,
+                ..params()
+            },
+            Arc::new(clock),
+        )
+        .with_micro_batches(2);
+        let mut p = pool(64);
+        for n in 1..=4 {
+            s.submit(request(n, n as u64, 8, 50), p.total_blocks())
+                .unwrap();
+        }
+        // Four startable requests over two micro-batches: two each.
+        let a = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(seqs_of(&a), [1, 2]);
+        let b = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(seqs_of(&b), [3, 4]);
+        assert_eq!(s.micro_batches_in_flight(), 2);
+        assert_eq!(s.in_flight_iterations(), [a.iteration, b.iteration]);
+        let snap = s.snapshot().pipeline.expect("pipeline section");
+        assert_eq!((snap.micro_batches, snap.micro_batches_in_flight), (2, 2));
+
+        // Both micro-batches in flight: nothing more may start.
+        let c = s.plan(&mut p, &IterationLimits::default());
+        assert!(c.is_empty());
+        s.complete(
+            &mut p,
+            IterationOutcome {
+                iteration: c.iteration,
+                ..IterationOutcome::default()
+            },
+        );
+
+        // `b` completes first: its requests decode while `a` is still in flight.
+        complete_all(&mut s, &mut p, &b, &[]);
+        assert_eq!(s.in_flight_iterations(), [a.iteration]);
+        let d = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(
+            kinds(&d),
+            [(3, BatchKind::Decode), (4, BatchKind::Decode)],
+            "the requests of the plan in flight are skipped"
+        );
+        assert_eq!(s.seq_state(SeqId(1)), Some(RequestState::Prefilling));
+
+        // `a` completes and reports seq 3 finished late: seq 3 is in `d`, so its block stays.
+        s.complete(
+            &mut p,
+            IterationOutcome {
+                iteration: a.iteration,
+                appended: vec![(SeqId(1), 1), (SeqId(2), 1)],
+                finished: vec![(SeqId(3), FinishReason::Stop)],
+                failed: None,
+            },
+        );
+        assert_eq!(
+            p.used_blocks(),
+            4,
+            "no block freed under the executing plan"
+        );
+        let e = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(kinds(&e), [(1, BatchKind::Decode), (2, BatchKind::Decode)]);
+        complete_all(&mut s, &mut p, &d, &[]);
+        assert_eq!(p.used_blocks(), 3, "seq 3 finished with its plan");
+
+        // A failed micro-batch fails only its own requests.
+        let f = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(kinds(&f), [(4, BatchKind::Decode)]);
+        s.complete(
+            &mut p,
+            IterationOutcome {
+                iteration: f.iteration,
+                failed: Some(IterationFailure {
+                    message: "device".into(),
+                }),
+                ..IterationOutcome::default()
+            },
+        );
+        assert_eq!(s.seq_state(SeqId(4)), None);
+        assert_eq!(s.seq_state(SeqId(1)), Some(RequestState::Decoding));
+        assert_eq!(p.used_blocks(), 2);
+        complete_all(&mut s, &mut p, &e, &[1, 2]);
+        assert_eq!(p.used_blocks(), 0);
+        assert!(s.is_idle());
+        assert_eq!(s.micro_batches_in_flight(), 0);
+    }
+
+    /// A request of a plan in flight is never a preemption victim: when the worst-ranked
+    /// request is in flight, the better one's decode waits for that plan instead of being
+    /// preempted, and the next plan preempts the victim. Catches blocks freed under an
+    /// executing plan, or the best-ranked request preempted for lack of an eligible victim.
+    #[test]
+    fn micro_batches_never_preempt_in_flight() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let mut s = Scheduler::new(
+            SchedulerParams {
+                max_queued_requests: 8,
+                free_watermark: 0.0,
+                ..params()
+            },
+            Arc::new(clock),
+        )
+        .with_micro_batches(2);
+        // Two 30-token prompts fill the 4 blocks exactly.
+        let mut p = pool(4);
+        let mut low = request(1, 1, 30, 30);
+        low.priority = Priority(1);
+        s.submit(low, p.total_blocks()).unwrap();
+        s.submit(request(2, 2, 30, 30), p.total_blocks()).unwrap();
+        let lim = IterationLimits::default();
+
+        let a = s.plan(&mut p, &lim);
+        assert_eq!(kinds(&a), [(2, BatchKind::Prefill { start: 0, len: 30 })]);
+        let b = s.plan(&mut p, &lim);
+        assert_eq!(kinds(&b), [(1, BatchKind::Prefill { start: 0, len: 30 })]);
+        complete_all(&mut s, &mut p, &a, &[]);
+        let c = s.plan(&mut p, &lim);
+        assert_eq!(kinds(&c), [(2, BatchKind::Decode)]);
+        complete_all(&mut s, &mut p, &b, &[]);
+        complete_all(&mut s, &mut p, &c, &[]);
+        // Least recently stepped first: seq 1, then seq 2; positions 30 and 31 need no block.
+        let d = s.plan(&mut p, &lim);
+        assert_eq!(kinds(&d), [(1, BatchKind::Decode)]);
+        let e = s.plan(&mut p, &lim);
+        assert_eq!(kinds(&e), [(2, BatchKind::Decode)]);
+        complete_all(&mut s, &mut p, &d, &[]);
+        complete_all(&mut s, &mut p, &e, &[]);
+        let f = s.plan(&mut p, &lim);
+        assert_eq!(kinds(&f), [(1, BatchKind::Decode)]);
+
+        // Seq 2 needs a third block; the victim (request 1) is in `f`: nothing is preempted.
+        let g = s.plan(&mut p, &lim);
+        assert!(g.is_empty() && g.preempted.is_empty(), "{g:?}");
+        assert_eq!(p.used_blocks(), 4);
+        s.complete(
+            &mut p,
+            IterationOutcome {
+                iteration: g.iteration,
+                ..IterationOutcome::default()
+            },
+        );
+        complete_all(&mut s, &mut p, &f, &[]);
+        // `f` completed: request 1 is preempted and seq 2 decodes.
+        let h = s.plan(&mut p, &lim);
+        assert_eq!(h.preempted, [(SeqId(1), PreemptReason::KvExhausted)]);
+        assert_eq!(kinds(&h), [(2, BatchKind::Decode)]);
     }
 }
