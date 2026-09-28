@@ -522,7 +522,12 @@ fn lab_test_gpus_2_is_the_inventory_path() {
 /// lands in the one-GPU leg or the two-GPU leg reruns the whole workspace.
 #[test]
 fn lab_test_routes_two_gpu_tests_to_the_gpus_2_leg() {
-    let two_gpu = ["hostmem_", "rccl_init_with_a_missing_peer"];
+    let two_gpu = [
+        "hostmem_",
+        "rccl_init_with_a_missing_peer",
+        "cold_tp2",
+        "tp2_collective_failure_recovers_on_gpu",
+    ];
     let gpu_count = [
         "inventory_matches_expectation",
         "concurrent_discovery_sees_every_device",
