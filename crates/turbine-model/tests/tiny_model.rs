@@ -30,6 +30,7 @@ use turbine_model::executor::{
     TokenFeed, TraceTensor, build_executor, graphs,
 };
 use turbine_model::families;
+use turbine_model::pp;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
@@ -38,7 +39,7 @@ use turbine_model::testing::tiny::{
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::tp;
 use turbine_model::{
-    EpContext, MAX_STAGING_BYTES, ModelError, SafetensorsIndex, TpContext, WeightLoader,
+    EpContext, MAX_STAGING_BYTES, ModelError, PpContext, SafetensorsIndex, TpContext, WeightLoader,
     llama_slots, olmoe_slots,
 };
 use turbine_observability::MetricsRegistry;
@@ -4221,4 +4222,291 @@ fn hip_ep2_matches_ep1() {
     }
     let fresh = pool(&mem, &layout, 1);
     check_one_rank_batch(&spec, one.as_mut(), &pool_view(&fresh, &layout, 1), hip);
+}
+
+// ------------------------------------------------------------ pipeline parallelism (P5 S-10)
+
+/// Every fusion off: residual adds and norms as separate ops, one GEMM per projection.
+const UNFUSED: ExecutorOptions = ExecutorOptions {
+    fused_ops: false,
+    fused_projections: false,
+};
+
+/// Stage `stage` of `spec`'s model split into the contiguous `ranges` (one per stage), on
+/// `provider` over `mem`, its hand-off on `collective`, run with `opts`.
+fn pp_stage(
+    spec: &TinySpec,
+    ranges: &[std::ops::Range<u32>],
+    stage: u32,
+    collective: Arc<dyn Collective>,
+    provider: Arc<dyn KernelProvider>,
+    mem: &Arc<dyn DeviceMemory>,
+    opts: ExecutorOptions,
+) -> Box<dyn ModelExecutor> {
+    let cfg = &spec.config;
+    let layers = ranges[stage as usize].clone();
+    let stages = ranges.len() as u32;
+    let plan: Vec<pp::StageSpec> = ranges
+        .iter()
+        .enumerate()
+        .map(|(s, r)| pp::StageSpec {
+            stage: s as u32,
+            device: DeviceId(s as u32),
+            layers: r.clone(),
+            embedding: s == 0,
+            lm_head: s + 1 == ranges.len(),
+        })
+        .collect();
+    pp::check(cfg, &plan).expect("pipeline plan");
+    let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+    let slots = pp::weight_slots(cfg, &plan[stage as usize]).expect("stage slots");
+    let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load stage");
+    let reqs = pp::available_requirements(
+        cfg,
+        &layers,
+        BLOCK_TOKENS,
+        opts,
+        std::slice::from_ref(&provider),
+    )
+    .expect("requirements");
+    let order = [provider.id()];
+    let card = provider.card_profile();
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
+        .expect("every op has a provider");
+    pp::build_executor(
+        cfg,
+        weights,
+        Arc::new(registry),
+        Arc::clone(mem),
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: 64,
+            max_seqs: MAX_SEQS,
+        },
+        opts,
+        PpContext {
+            stage,
+            stages,
+            layers,
+            collective,
+            stream: mem.compute_stream(),
+        },
+    )
+    .expect("stage executor")
+}
+
+/// [`greedy_pair`]'s batches with the tokens of `chosen` fed after each step (the leader samples
+/// from the last stage and feeds every stage the same batch): every step's logits rows (none on
+/// a stage before the last, whose every step must return 0 rows).
+fn scripted_pair(
+    exec: &mut dyn ModelExecutor,
+    kv: &KvPoolView<'_>,
+    vocab: u32,
+    chosen: &[[u32; 2]],
+) -> Vec<Vec<f32>> {
+    let prompts: [Vec<u32>; 2] = [
+        prompt(vocab),
+        (0..13u32).map(|i| (i * 29 + 3) % vocab).collect(),
+    ];
+    let tables = [[BlockId(0)], [BlockId(1)]];
+    let mut lens = [prompts[0].len() as u32, prompts[1].len() as u32];
+    let tokens: Vec<u32> = prompts.concat();
+    let positions: Vec<u32> = prompts.iter().flat_map(|p| 0..p.len() as u32).collect();
+    let seqs = [
+        SeqSlice {
+            seq: SeqId(1),
+            q_start: 0,
+            q_len: lens[0],
+            kv_len: lens[0],
+            block_table: &tables[0],
+            reduce: None,
+        },
+        SeqSlice {
+            seq: SeqId(2),
+            q_start: lens[0],
+            q_len: lens[1],
+            kv_len: lens[1],
+            block_table: &tables[1],
+            reduce: None,
+        },
+    ];
+    let mut steps = vec![
+        exec.forward(&BatchInput {
+            tokens: &tokens,
+            positions: &positions,
+            seqs: &seqs,
+            kv,
+        })
+        .expect("prefill"),
+    ];
+    for next in chosen {
+        let positions = lens;
+        lens = [lens[0] + 1, lens[1] + 1];
+        let seqs: Vec<SeqSlice<'_>> = (0..2)
+            .map(|s| SeqSlice {
+                seq: SeqId(s as u64 + 1),
+                q_start: s as u32,
+                q_len: 1,
+                kv_len: lens[s],
+                block_table: &tables[s],
+                reduce: None,
+            })
+            .collect();
+        steps.push(
+            exec.forward(&BatchInput {
+                tokens: next,
+                positions: &positions,
+                seqs: &seqs,
+                kv,
+            })
+            .expect("decode"),
+        );
+    }
+    let mut rows = Vec::new();
+    for logits in &steps {
+        if logits.rows == 0 {
+            assert!(logits.reduced.is_empty());
+            continue;
+        }
+        assert_eq!(logits.rows, 2);
+        rows.extend([logits.row(0).to_vec(), logits.row(1).to_vec()]);
+    }
+    assert!(
+        rows.is_empty() || rows.len() == 2 * steps.len(),
+        "a stage returns logits at every step or at none"
+    );
+    rows
+}
+
+/// Runs [`scripted_pair`] with one device's greedy tokens on every stage of `spec`'s model
+/// split into `ranges`, over the host collective's `send` / `recv`, one thread per stage, each
+/// on the memory and provider `env(stage)` gives with its own pool of its layers' KV layout;
+/// returns every stage's rows.
+fn pp_group(
+    spec: &TinySpec,
+    ranges: &[std::ops::Range<u32>],
+    opts: ExecutorOptions,
+    chosen: &[[u32; 2]],
+    env: impl Fn(u32) -> (Arc<dyn DeviceMemory>, Arc<dyn KernelProvider>) + Sync,
+) -> Vec<Vec<Vec<f32>>> {
+    let group = HostCollective::group(ranges.len(), std::time::Duration::from_secs(60));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = group
+            .into_iter()
+            .enumerate()
+            .map(|(stage, collective)| {
+                let env = &env;
+                scope.spawn(move || {
+                    let stage = stage as u32;
+                    let range = &ranges[stage as usize];
+                    let (mem, provider) = env(stage);
+                    let collective: Arc<dyn Collective> = Arc::new(collective);
+                    let mut exec = pp_stage(spec, ranges, stage, collective, provider, &mem, opts);
+                    let layout =
+                        pp::kv_layout(&spec.config, range, BLOCK_TOKENS).expect("stage layout");
+                    assert_eq!(*exec.kv_layout(), layout);
+                    assert_eq!(layout.num_layers as usize, range.len());
+                    let storage = pool(&mem, &layout, 4);
+                    let kv = pool_view(&storage, &layout, 4);
+                    scripted_pair(exec.as_mut(), &kv, spec.vocab, chosen)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("stage thread"))
+            .collect()
+    })
+}
+
+/// Checks a pipeline group's rows against one device's run `want`: every stage before the last
+/// returned no logits, the last stage's rows are bitwise one device's (pipeline parallelism
+/// moves the residual stream's bytes; it does not change arithmetic) and their greedy tokens
+/// are the tokens fed.
+fn check_pp_against_one_device(what: &str, stages: &[Vec<Vec<f32>>], want: &GreedyRun) {
+    let (last, before) = stages.split_last().expect("a stage");
+    for (s, rows) in before.iter().enumerate() {
+        assert!(rows.is_empty(), "{what}: stage {s} returned logits");
+    }
+    assert_eq!(last.len(), want.1.len(), "{what}: logits rows");
+    for (i, (got, w)) in last.iter().zip(&want.1).enumerate() {
+        assert!(got == w, "{what}: row {i} differs from one device");
+    }
+    let tokens: Vec<[u32; 2]> = last
+        .chunks_exact(2)
+        .take(want.0.len())
+        .map(|r| [argmax(&r[0]), argmax(&r[1])])
+        .collect();
+    assert_eq!(tokens, want.0, "{what}: greedy tokens");
+}
+
+/// P5 S-10: the tiny Llama (tied embedding: on the first and the last stage) and the tiny
+/// OLMoE (untied LM head, Q/K norm, 8 experts top-2) on the cpu-reference provider, split into
+/// 2 stages of one layer each (the tiny checkpoints have 2 layers, so 3 or 4 stages do not fit)
+/// over the host collective's `send` / `recv`, each stage its own host "device" and KV pool of
+/// its layer on its own thread, fed the same batches (a ragged two-sequence prefill and 16
+/// batched decode steps, one device's greedy tokens fed back): the last stage's logits are
+/// bitwise one device's, the first stage returns none; a single stage over both layers is
+/// bitwise one device too. Both run with every fusion on (fused Q/K/V and the fused residual
+/// add + norm, which one device runs across the stage boundary and a stage splits into its
+/// last add and the next stage's input norm) and with every fusion off. Breaks if a stage
+/// boundary drops or repeats a layer, the hand-off moves the wrong rows, a stage's KV holds
+/// another stage's layers, or the tied embedding is missing on the last stage.
+#[test]
+fn pp2_matches_pp1_on_host() {
+    let tmp = TempDir::new("tiny-model-pp");
+    for spec in both_checkpoints(&tmp) {
+        let name = spec.config.family.0.name();
+        let layers = spec.config.num_layers;
+        for opts in [UNFUSED, ALL_FUSED] {
+            let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+            let mut one = cpu_model_with(&spec, &host, 64, opts, cpu_reference_provider(), false);
+            let layout = spec.config.kv_layout(BLOCK_TOKENS);
+            let storage = pool(&host, &layout, 4);
+            let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+            let splits: Vec<Vec<std::ops::Range<u32>>> =
+                vec![vec![0..layers], (0..layers).map(|l| l..l + 1).collect()];
+            for ranges in splits {
+                let stages = pp_group(&spec, &ranges, opts, &want.0, |stage| {
+                    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(stage), 1 << 30);
+                    (mem, cpu_reference_provider())
+                });
+                let what = format!("{name} pp {} {opts:?}", ranges.len());
+                check_pp_against_one_device(&what, &stages, &want);
+                println!("pp2_matches_pp1_on_host {what}: bitwise");
+            }
+        }
+    }
+}
+
+/// Lab only: the pipeline stages on the HIP provider without RCCL — the head_dim-128 tiny Llama
+/// split into 2 stages, each its own context on the same GPU, over the host collective (which
+/// reaches any device memory), against one HIP context, with every fusion on (the fused
+/// residual add + norm across the boundary against the stage's add and the next stage's norm)
+/// and off: the last stage's logits bitwise one device's. Proves the HIP stage loading, the
+/// per-stage KV pools and the hand-off of device rows.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_pp2_matches_pp1() {
+    let tmp = TempDir::new("tiny-model-hip-pp");
+    let spec = write_gpu_tiny(tmp.path());
+    let layers = spec.config.num_layers;
+    for opts in [UNFUSED, ALL_FUSED] {
+        let ctx = hip_context();
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let mut one = cpu_model_with(&spec, &mem, 64, opts, shim_provider(ctx), false);
+        let layout = spec.config.kv_layout(BLOCK_TOKENS);
+        let storage = pool(&mem, &layout, 4);
+        let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+        let ranges: Vec<std::ops::Range<u32>> = (0..layers).map(|l| l..l + 1).collect();
+        let stages = pp_group(&spec, &ranges, opts, &want.0, |_| {
+            let ctx = hip_context();
+            let mem: Arc<dyn DeviceMemory> = ctx.clone();
+            (mem, shim_provider(ctx))
+        });
+        let what = format!("hip pp 2 {opts:?}");
+        check_pp_against_one_device(&what, &stages, &want);
+        println!("hip_pp2_matches_pp1 {what}: bitwise");
+    }
 }
