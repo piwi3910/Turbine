@@ -1,7 +1,7 @@
 //! The L0 KV cache element format of a model (Phase 6a S-13, `kv.dtype`): BF16 (the exact
 //! default), or FP8 e4m3 pages with one K and one V scale per layer (user decision 2026-09-28,
 //! Q10: the checkpoint's `k_scale` / `v_scale` tensors when present, else 1.0). A K element is
-//! stored as `e4m3(k / k_scale)` and read back as `e4m3 · k_scale`, likewise V.
+//! stored as `e4m3(k / k_scale)` and read back as `bf16(e4m3 · k_scale)`, likewise V.
 
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;

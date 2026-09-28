@@ -458,11 +458,11 @@ impl Naive {
     }
 }
 
-/// `x ← e4m3(x / scale) · scale` element by element: a page write and read (OCP e4m3fn, ties to
-/// even, saturated at ±448).
+/// `x ← bf16(e4m3(x / scale) · scale)` element by element: a page write and read (OCP e4m3fn,
+/// ties to even, saturated at ±448; read back into the BF16 activation dtype).
 fn fp8_quantize_dequantize(x: &mut [f32], scale: f32) {
     for v in x {
-        *v = fp8_e4m3_value(fp8_e4m3_round(*v / scale)) * scale;
+        *v = bf(fp8_e4m3_value(fp8_e4m3_round(*v / scale)) * scale);
     }
 }
 

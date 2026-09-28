@@ -18,7 +18,8 @@ use crate::KernelError;
 use crate::ops::PagedAttentionContext;
 
 /// How the pool pages hold K and V: a float type, or FP8 e4m3 with per-half scales (Phase 6a
-/// S-13: `e4m3(x / scale)` written, `e4m3 · scale` read, in F32).
+/// S-13: `e4m3(x / scale)` written, `e4m3 · scale` read in F32 and rounded to the activation
+/// dtype, so attention runs on BF16 K/V exactly as over BF16 pages holding those values).
 #[derive(Clone, Copy)]
 enum Pages {
     Float(FloatCodec),
@@ -249,7 +250,7 @@ pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelErr
                 let base = half * block_tokens * token_elems;
                 dst.extend(
                     (base..base + tokens * token_elems)
-                        .map(|e| pages.decode(half, &bytes[e * es..])),
+                        .map(|e| super::round_to(act, pages.decode(half, &bytes[e * es..]))),
                 );
             }
         }
@@ -354,7 +355,7 @@ mod tests {
         let (ks, vs) = (0.0625f32, 0.125f32);
         let qdq = |x: &[f32], s: f32| {
             x.iter()
-                .map(|&e| fp8_e4m3_value(fp8_e4m3_round(e / s)) * s)
+                .map(|&e| round_to(DType::BF16, fp8_e4m3_value(fp8_e4m3_round(e / s)) * s))
                 .collect::<Vec<_>>()
         };
         let (kq, vq) = (qdq(&k, ks), qdq(&v, vs));
@@ -400,6 +401,16 @@ mod tests {
         let (swapped, _) =
             prefill(DType::F8E4M3, DType::F8E4M3, &k, &v, (odd_v, odd_k)).expect("fp8");
         assert_ne!(swapped, odd, "K and V scales are not interchangeable");
+        // Any scale: the dequantized element is rounded to BF16, as BF16 pages would hold it.
+        let (want_odd, _) = prefill(
+            DType::BF16,
+            DType::BF16,
+            &qdq(&k, odd_k),
+            &qdq(&v, odd_v),
+            (1.0, 1.0),
+        )
+        .expect("bf16");
+        assert_eq!(odd, want_odd);
         for bad in [0.0, f32::NAN, -1.0] {
             let err = prefill(DType::F8E4M3, DType::F8E4M3, &k, &v, (bad, vs)).unwrap_err();
             assert!(err.to_string().contains("k_scale"), "{err}");
