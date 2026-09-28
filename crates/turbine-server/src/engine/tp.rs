@@ -451,6 +451,11 @@ impl ModelExecutor for TpExecutor {
         self.leader.reduces_logits()
     }
 
+    /// Rank 0's decode graphs (every rank captures and replays the same keys).
+    fn graph_counters(&self) -> turbine_model::executor::GraphCounters {
+        self.leader.graph_counters()
+    }
+
     /// Copies on rank 0's pool now and on every worker's before anything else runs there.
     fn copy_blocks(
         &mut self,
@@ -1057,6 +1062,8 @@ fn load_rank(p: &PreparedModel, g: &GroupLoad<'_>) -> Result<RankLoaded, Startup
             ),
         }
         .map_err(|e| rank_error("executor", &e))?;
+        let mut executor = executor;
+        model::install_decode_graphs(p, executor.as_mut());
         let pool = model::allocate_pool(p, blocks, &ledger)?;
         let reserve = model::acquire_reserve(p, &ledger, g.reliability)?;
         Ok(RankLoaded {

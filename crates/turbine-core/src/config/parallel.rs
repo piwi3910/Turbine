@@ -48,6 +48,10 @@ pub struct ParallelConfig {
     pub pipeline: PipelineConfig,
     pub expert: ExpertConfig,
     pub topology: TopologyConfig,
+    /// Tensor-parallel ranks capture decode iterations into graphs (with
+    /// `execution.decode_graphs`), their collectives inside (P5 Task 32; the `hostmem` backend
+    /// needs kernel ABI v2.8). Default off until benched.
+    pub tp_decode_graphs: bool,
 }
 
 /// `parallel.pipeline`.
@@ -141,6 +145,7 @@ impl Default for ParallelConfig {
             pipeline: PipelineConfig::default(),
             expert: ExpertConfig::default(),
             topology: TopologyConfig::default(),
+            tp_decode_graphs: false,
         }
     }
 }

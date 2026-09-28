@@ -26,6 +26,14 @@
 // during its own step seq - 1, which runs after the peer's step seq - 2 (the
 // last reader of that slot) has completed on its stream.
 //
+// Device-sequenced steps (v2.8, turbine_mapped_collective_dseq): instead of
+// the seq baked into the launch, thread 0 of every block reads the channel's
+// device counter (seq = counter + 1) and counts its block in the completion
+// word; the last block to arrive (acq_rel chain on that word) resets it and
+// stores seq into the counter. Every block's read happens before that store,
+// and the next step on the stream starts after this one completes, so a
+// captured graph advances the sequence on every replay.
+//
 // Every wait is bounded: thread 0 checks abort_word and the device wall clock
 // every 16 polls; past the deadline it stores the timeout reason into
 // abort_word (a plain system-scope store: no PCIe atomics are needed) and the
@@ -70,6 +78,9 @@ struct Args {
   uint64_t *flags;
   uint32_t *abort_word;
   uint64_t seq;
+  // v2.8: device counter (uint64) followed by the completion count (uint32);
+  // null for a host-sequenced step.
+  uint64_t *seq_counter;
   uint64_t timeout_ticks;
   int32_t kind, rank, world, root, max_blocks;
 };
@@ -356,9 +367,35 @@ __device__ void consume_step(const Args &a, int64_t r0, int64_t n) {
   }
 }
 
+// v2.8: the step's seq from the device counter (see the header comment);
+// every block of the step must call this first, before any early return.
+__device__ uint64_t device_seq(const Args &a) {
+  __shared__ uint64_t s_seq;
+  if (threadIdx.x == 0) {
+    uint32_t *done = reinterpret_cast<uint32_t *>(a.seq_counter + 1);
+    const uint64_t seq = __hip_atomic_load(a.seq_counter, __ATOMIC_RELAXED,
+                                           __HIP_MEMORY_SCOPE_AGENT) +
+                         1;
+    s_seq = seq;
+    const uint32_t before = __hip_atomic_fetch_add(
+        done, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+    if (before + 1 == gridDim.x) {
+      __hip_atomic_store(done, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(a.seq_counter, seq, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
+  __syncthreads();
+  return s_seq;
+}
+
 template <typename T, int OP, bool VEC>
-__global__ __launch_bounds__(kThreads) void mapped_collective_kernel(Args a) {
+__global__ __launch_bounds__(kThreads) void mapped_collective_kernel(Args a0) {
   __shared__ int s_stop;
+  Args a = a0;
+  if (a.seq_counter != nullptr) {
+    a.seq = device_seq(a);
+  }
   const int64_t start = static_cast<int64_t>(blockIdx.x) * a.per_block;
   const int64_t end = lmin(start + a.per_block, a.bytes);
   if (start >= end) {
@@ -576,10 +613,14 @@ turbine_mapped_collective_impl(const turbine_mapped_collective_desc *d) {
   return kImpl;
 }
 
-int32_t turbine_mapped_collective(turbine_ctx *ctx,
-                                  const turbine_mapped_collective_desc *d) {
-  if (ctx == nullptr)
-    return TURBINE_E_ARGUMENT;
+} // extern "C"
+
+namespace {
+
+// Both entry points: validates d and enqueues its step; seq_counter null =
+// host-sequenced (d->seq).
+int32_t enqueue_step(turbine_ctx *ctx, const turbine_mapped_collective_desc *d,
+                     uint64_t *seq_counter) {
   if (const std::string why = refusal(d); !why.empty()) {
     return fail(ctx, d == nullptr ? TURBINE_E_ARGUMENT : TURBINE_E_UNSUPPORTED,
                 "turbine_mapped_collective: " + why);
@@ -628,6 +669,7 @@ int32_t turbine_mapped_collective(turbine_ctx *ctx,
   a.flags = d->flags;
   a.abort_word = d->abort_word;
   a.seq = d->seq;
+  a.seq_counter = seq_counter;
   // ns * kHz / 1e6, without overflow for any timeout below ~290 years.
   const double ticks = static_cast<double>(d->timeout_ns) *
                        static_cast<double>(ctx->wall_clock_khz) / 1e6;
@@ -657,6 +699,33 @@ int32_t turbine_mapped_collective(turbine_ctx *ctx,
       launch_typed<float, TURBINE_REDUCE_MAX>(s, a, vec, blocks);
   }
   return check_hip(ctx, hipGetLastError(), "mapped_collective kernel launch");
+}
+
+} // namespace
+
+extern "C" {
+
+int32_t turbine_mapped_collective(turbine_ctx *ctx,
+                                  const turbine_mapped_collective_desc *d) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  // A captured step would replay its baked seq: v2.8 steps only (header).
+  if (ctx->capturing)
+    return refuse_while_capturing(ctx, "turbine_mapped_collective");
+  return enqueue_step(ctx, d, nullptr);
+}
+
+int32_t turbine_mapped_collective_dseq(turbine_ctx *ctx,
+                                       const turbine_mapped_collective_desc *d,
+                                       uint64_t *seq_counter) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (seq_counter == nullptr || !aligned(seq_counter, 8)) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_mapped_collective_dseq: seq_counter NULL or "
+                "misaligned");
+  }
+  return enqueue_step(ctx, d, seq_counter);
 }
 
 } // extern "C"

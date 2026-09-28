@@ -205,8 +205,9 @@ fn header_declares_the_v24_minor_revision() {
         "2u",
         "v2.4 keeps major 2"
     );
-    // v2.5 (Phase 4), v2.6 and v2.7 (Phase 5) raised the minor; the v2.4 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "7u");
+    // v2.5 (Phase 4), v2.6, v2.7 and v2.8 (Phase 5) raised the minor; the v2.4 group is
+    // unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
     for (i, op) in OpKind::ALL.iter().enumerate() {
         let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
         assert_eq!(define(&code, &name), i.to_string(), "{name}");
@@ -245,8 +246,8 @@ fn header_declares_the_v25_copy_streams() {
         "2u",
         "v2.5 keeps major 2"
     );
-    // v2.6 and v2.7 (Phase 5) raised the minor; the v2.5 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "7u");
+    // v2.6, v2.7 and v2.8 (Phase 5) raised the minor; the v2.5 group is unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
     assert_eq!(define(&code, "TURBINE_COPY_H2D"), "0");
     assert_eq!(define(&code, "TURBINE_COPY_D2H"), "1");
     assert_eq!(define(&code, "TURBINE_COPY_D2D"), "2");
@@ -279,8 +280,8 @@ fn header_declares_the_v26_tensor_parallel_group() {
         "2u",
         "v2.6 keeps major 2"
     );
-    // v2.7 raised the minor; the v2.6 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "7u");
+    // v2.7 and v2.8 raised the minor; the v2.6 group is unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
     assert_eq!(define(&code, "TURBINE_OP_ROW_SUMSQ"), "15");
     assert_eq!(define(&code, "TURBINE_OP_RMSNORM_SHARDED"), "16");
     for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
@@ -322,7 +323,8 @@ fn header_declares_the_v27_host_mapped_group() {
         "2u",
         "v2.7 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "7u");
+    // v2.8 raised the minor; the v2.7 group is unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
     for (name, value) in [
         ("TURBINE_MAPPED_ALL_REDUCE", "0"),
         ("TURBINE_MAPPED_ALL_GATHER", "1"),
@@ -362,4 +364,26 @@ fn header_declares_the_v27_host_mapped_group() {
             "turbine_kernels.h lacks the v2.7 {decl}"
         );
     }
+}
+
+/// v2.8 (P5 Task 32, tensor-parallel decode graphs): the minor becomes 8 and the
+/// device-sequenced step is declared with the v2.7 descriptor and a device counter pointer. No
+/// registry op code. Breaks if the declaration drifts from `ffi::MappedDseqFn`.
+#[test]
+fn header_declares_the_v28_device_sequenced_step() {
+    let code = strip_comments(&header());
+    assert_eq!(
+        define(&code, "TURBINE_ABI_VERSION"),
+        "2u",
+        "v2.8 keeps major 2"
+    );
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
+    assert_eq!(OpKind::ALL.len(), 17, "v2.8 adds no op code");
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let decl = "int32_t turbine_mapped_collective_dseq(turbine_ctx *ctx, \
+                const turbine_mapped_collective_desc *d, uint64_t *seq_counter);";
+    assert!(
+        flat.contains(decl),
+        "turbine_kernels.h lacks the v2.8 {decl}"
+    );
 }

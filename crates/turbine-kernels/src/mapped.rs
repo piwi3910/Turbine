@@ -1,4 +1,5 @@
-//! Kernel C ABI v2.7 (Phase 5, decision "P5: small-message all-reduce latency on novanas"):
+//! Kernel C ABI v2.7 (Phase 5, decision "P5: small-message all-reduce latency on novanas") and
+//! its v2.8 device-sequenced step (P5 Task 32, tensor-parallel decode graphs):
 //! host memory mapped into every device of the process and the one-shot collective steps over
 //! it, exposed as `turbine_tensor::MappedCollectives` on `ShimContext` (through
 //! `DeviceMemory::mapped_collectives`). A library without the group answers `None` there, and
@@ -208,6 +209,33 @@ impl MappedCollectives for ShimContext {
         // `slots`/`flags`/`abort_word` are this context's addresses of a mapped region the caller
         // keeps alive until then as well (see the module's ownership rules).
         let code = unsafe { (fns.collective.run)(self.raw_ctx(), &desc) };
+        self.mapped_check(code)
+    }
+
+    fn mapped_dseq_supported(&self) -> bool {
+        self.library().syms().v21.mapped_dseq.is_some()
+    }
+
+    fn enqueue_mapped_step_dseq(
+        &self,
+        step: &MappedStep,
+        seq_counter: DevicePtr,
+    ) -> Result<(), MemoryError> {
+        let run = self.library().syms().v21.mapped_dseq.ok_or_else(|| {
+            MemoryError::Unsupported(format!(
+                "{} does not export the kernel ABI v2.8 device-sequenced collective step \
+                 (minor {})",
+                self.library().path().display(),
+                self.library().abi_minor()
+            ))
+        })?;
+        let mut desc = descriptor(step)?;
+        // Ignored by the library, but a valid descriptor has seq >= 1.
+        desc.seq = 1;
+        // SAFETY: as in `enqueue_mapped_step`; `seq_counter` is 16 bytes of this context's
+        // device memory that the caller keeps alive (and uses for this channel only) until the
+        // step completes, and every graph that captured it is destroyed (hostmem's rules).
+        let code = unsafe { run(self.raw_ctx(), &desc, seq_counter.addr() as *mut u64) };
         self.mapped_check(code)
     }
 }

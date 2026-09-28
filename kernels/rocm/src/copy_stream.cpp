@@ -73,7 +73,9 @@ int32_t turbine_memcpy_async(turbine_ctx *ctx, turbine_stream *s, void *dst,
                              const void *src, size_t bytes, int32_t kind) {
   if (ctx == nullptr)
     return TURBINE_E_ARGUMENT;
-  if (ctx->capturing)
+  // A device-to-device copy on the compute stream is captured as a graph node
+  // (tensor-parallel decode graphs reorder the gathered logits with them).
+  if (ctx->capturing && (s != nullptr || kind != TURBINE_COPY_D2D))
     return refuse_while_capturing(ctx, "turbine_memcpy_async");
   if (bytes == 0)
     return TURBINE_OK;

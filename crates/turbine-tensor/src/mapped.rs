@@ -166,6 +166,24 @@ pub trait MappedCollectives: Send + Sync {
     fn mapped_step_supported(&self, step: &MappedStep) -> bool;
     /// Enqueues `step` on the compute stream; returns without waiting for it or for the peers.
     fn enqueue_mapped_step(&self, step: &MappedStep) -> Result<(), MemoryError>;
+    /// Whether [`MappedCollectives::enqueue_mapped_step_dseq`] is available (kernel ABI v2.8).
+    fn mapped_dseq_supported(&self) -> bool {
+        false
+    }
+    /// [`MappedCollectives::enqueue_mapped_step`] with the step's sequence number read on the
+    /// device from `seq_counter` (16 bytes of this device's memory, zero before the channel's
+    /// first step; `step.seq` is ignored), so the step may be captured into a graph and replayed.
+    /// Every step of the channel must then be enqueued this way.
+    fn enqueue_mapped_step_dseq(
+        &self,
+        step: &MappedStep,
+        seq_counter: DevicePtr,
+    ) -> Result<(), MemoryError> {
+        let _ = (step, seq_counter);
+        Err(MemoryError::Unsupported(
+            "device-sequenced mapped collective steps (kernel ABI v2.8)".into(),
+        ))
+    }
 }
 
 #[cfg(test)]

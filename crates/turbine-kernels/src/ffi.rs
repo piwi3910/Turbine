@@ -454,6 +454,11 @@ pub(crate) struct MappedFns {
     pub collective: OpTrio<MappedCollectiveDesc>,
 }
 
+/// `turbine_mapped_collective_dseq` (v2.8): a mapped collective step sequenced by a device
+/// counter (graph-capturable).
+pub(crate) type MappedDseqFn =
+    unsafe extern "C" fn(*mut TurbineCtx, *const MappedCollectiveDesc, *mut u64) -> i32;
+
 /// `TURBINE_IMPL_NEEDS_HOST_OFFSETS` (v2.4): the implementation reads `host_expert_offsets`.
 pub(crate) const IMPL_NEEDS_HOST_OFFSETS: u32 = 1;
 
@@ -522,6 +527,8 @@ pub(crate) struct V21Symbols {
     pub tensor_parallel: Option<TensorParallelFns>,
     /// v2.7 host-mapped memory and one-shot collectives (the `hostmem` collective backend).
     pub mapped: Option<MappedFns>,
+    /// v2.8 device-sequenced mapped collective steps (needs the v2.7 group).
+    pub mapped_dseq: Option<MappedDseqFn>,
 }
 
 impl V21Symbols {
@@ -611,8 +618,14 @@ impl V21Symbols {
                 collective: optional_trio(lib, "mapped_collective")?,
             })
         })();
+        let mapped_dseq = if minor >= 8 && mapped.is_some() {
+            optional(lib, "turbine_mapped_collective_dseq")
+        } else {
+            None
+        };
         V21Symbols {
             minor,
+            mapped_dseq,
             options,
             add_rmsnorm: optional_trio(lib, "add_rmsnorm"),
             logits_reduce: optional_trio(lib, "logits_reduce"),

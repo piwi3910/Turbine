@@ -35,6 +35,13 @@
 //! with "unhandled system error"), so a call above the threshold is counted with reason
 //! `no_peer_access` (logged once) instead of going to the delegate.
 //!
+//! Sequencing: on a kernel library with ABI v2.8 each rank's group channel keeps its step
+//! counter in device memory (`turbine_mapped_collective_dseq`), so the steps of a call can be
+//! captured into a graph and every replay runs with fresh sequence numbers (tensor-parallel
+//! decode graphs, P5 Task 32); the arithmetic is the same. On a v2.7 library the counter is the
+//! host's, and a step refuses stream capture. [`set_device_sequencing`] turns the device counter
+//! off for groups opened afterwards (an A/B switch for `turbine-collbench`).
+//!
 //! In `static` rank mode (one process per rank) there is no shared allocation: `open` answers
 //! `Unavailable`, the planner refuses `hostmem` there and `auto` takes `rccl`.
 
@@ -68,6 +75,16 @@ pub const SLOT_BYTES: u64 = 32 << 20;
 pub const MAX_BLOCKS: u32 = 64;
 /// `TURBINE_MAPPED_MAX_WORLD`.
 pub const MAX_WORLD: usize = 8;
+/// Whether groups opened from now on sequence their steps on the device when the kernel library
+/// can (ABI v2.8); on by default.
+static DEVICE_SEQ: AtomicBool = AtomicBool::new(true);
+
+/// Turns device-sequenced steps on or off for the groups opened afterwards (every rank of a group
+/// must open under the same setting). Off: host sequence numbers, which a graph cannot replay.
+pub fn set_device_sequencing(on: bool) {
+    DEVICE_SEQ.store(on, Ordering::Relaxed);
+}
+
 /// Identifies a hostmem group id (bytes 20..28), next to the creating process id.
 const ID_MARKER: &[u8; 8] = b"hostmem\0";
 
@@ -295,11 +312,24 @@ impl CollectiveLibrary for HostmemLibrary {
             }
             _ => None,
         };
+        // The group channel's device step counter (v2.8): two zeroed words.
+        let device_seq = if DEVICE_SEQ.load(Ordering::Relaxed) && mc.mapped_dseq_supported() {
+            let counter = DeviceBuffer::alloc(&memory, 16)
+                .and_then(|b| b.whole().write_bytes(&[0u8; 16]).map(|()| b))
+                .map_err(|e| CollectiveError::Backend {
+                    code: -1,
+                    message: format!("hostmem: the device step counter: {e}"),
+                })?;
+            Some(counter)
+        } else {
+            None
+        };
         tracing::info!(
             event = "collective_init",
             backend = NAME,
             rank = init.rank,
             world = init.world,
+            device_sequenced = device_seq.is_some(),
             region_bytes = group.layout.total,
             delegate = delegate.as_ref().map_or("none", |d| d.backend()),
             route_max_bytes = ?init.route_max_bytes,
@@ -312,6 +342,7 @@ impl CollectiveLibrary for HostmemLibrary {
             memory,
             base,
             seq: AtomicU64::new(1),
+            device_seq,
             op_timeout: init.op_timeout,
             metrics: init.metrics,
             reported: AtomicBool::new(false),
@@ -380,8 +411,12 @@ pub struct HostmemCollective {
     memory: Arc<dyn DeviceMemory>,
     /// The region's address on this rank's device.
     base: DevicePtr,
-    /// The next step's sequence number (the same on every rank).
+    /// The next step's sequence number (the same on every rank); with `device_seq` only a count
+    /// of the steps this host enqueued (graph replays advance the device counter alone).
     seq: AtomicU64,
+    /// The group channel's device step counter (kernel ABI v2.8), when its steps are sequenced
+    /// on the device.
+    device_seq: Option<DeviceBuffer>,
     op_timeout: Duration,
     metrics: Option<CollectiveMetrics>,
     /// The abort was logged and counted.
@@ -438,6 +473,8 @@ struct Chan<'a> {
     slot_bytes: u64,
     flags: DevicePtr,
     seq: &'a AtomicU64,
+    /// The device step counter, when the channel's steps are device-sequenced.
+    counter: Option<DevicePtr>,
 }
 
 /// A pair channel of this rank: a 2-rank exchange region (allocated by whichever rank of the
@@ -560,7 +597,11 @@ impl HostmemCollective {
                 seq,
                 timeout: self.op_timeout,
             };
-            if let Err(e) = self.mapped().enqueue_mapped_step(&step) {
+            let enqueued = match chan.counter {
+                Some(counter) => self.mapped().enqueue_mapped_step_dseq(&step, counter),
+                None => self.mapped().enqueue_mapped_step(&step),
+            };
+            if let Err(e) = enqueued {
                 // The peers expect this step: fail the group rather than let them time out.
                 self.abort();
                 let err = CollectiveError::Backend {
@@ -651,6 +692,7 @@ impl HostmemCollective {
             slot_bytes: layout.slot_bytes,
             flags: self.base,
             seq: &self.seq,
+            counter: self.device_seq.as_ref().map(|b| b.whole().ptr()),
         }
     }
 
@@ -725,6 +767,8 @@ impl HostmemCollective {
             slot_bytes: slot,
             flags: pair.base,
             seq: &pair.seq,
+            // Point-to-point (pipeline stages) is never captured.
+            counter: None,
         };
         let plan = Plan {
             kind: MappedKind::Broadcast { root: local(from) },
@@ -1001,7 +1045,7 @@ mod tests {
 
     use half::bf16;
     use turbine_core::clock::SystemClock;
-    use turbine_kernels::test_support::stub_mapped_context;
+    use turbine_kernels::test_support::{stub_mapped_context, stub_mapped_context_minor};
     use turbine_tensor::host::HostMemory;
     use turbine_tensor::{DType, DeviceBuffer, DeviceId, DeviceMemory};
 
@@ -1130,9 +1174,11 @@ mod tests {
         out
     }
 
-    /// Every rank's outputs through `lib` (hostmem on stub device contexts) or, with `None`,
-    /// through the host reference backend.
+    /// Every rank's outputs through `lib` (hostmem on stub device contexts of kernel ABI minor
+    /// `minor`: 7 host-sequenced, 8 device-sequenced) or, with `None`, through the host
+    /// reference backend.
     fn run_group(
+        minor: u32,
         lib: Option<Arc<dyn CollectiveLibrary>>,
         world: usize,
         dtype: DType,
@@ -1149,7 +1195,7 @@ mod tests {
                     let (lib, i, si) = (lib.clone(), &inputs[r], &scatter_inputs[r]);
                     scope.spawn(move || match lib {
                         Some(lib) => {
-                            let ctx = stub_mapped_context(r as u32);
+                            let ctx = stub_mapped_context_minor(r as u32, minor);
                             let mem: Arc<dyn DeviceMemory> = ctx;
                             let comm = lib
                                 .open(init(
@@ -1181,10 +1227,11 @@ mod tests {
     /// sizes, and messages larger than a slot (a 4 KiB slot splits them into several steps, so
     /// both slot parities and the sequence numbers are exercised). Breaks if the reduction
     /// order, the chunking, the strides of all-gather / reduce-scatter or the broadcast root is
-    /// wrong.
+    /// wrong. Both sequencings: host sequence numbers (a v2.7 library) and the device step counter
+    /// (v2.8) — a counter that does not advance per step would reuse a slot parity and a tag.
     #[test]
     fn matches_host_backend() {
-        for slot_bytes in [SLOT_BYTES, 4096] {
+        for (minor, slot_bytes) in [(8, SLOT_BYTES), (8, 4096), (7, 4096)] {
             let lib: Arc<dyn CollectiveLibrary> = Arc::new(HostmemLibrary {
                 slot_bytes,
                 delegate: None,
@@ -1192,16 +1239,23 @@ mod tests {
             for world in [1usize, 2, 3] {
                 for dtype in [DType::F32, DType::BF16] {
                     for elems in [1usize, 7, 4099] {
-                        let ctx = format!("slot {slot_bytes} world {world} {dtype:?} {elems}");
+                        let ctx =
+                            format!("v2.{minor} slot {slot_bytes} world {world} {dtype:?} {elems}");
                         let inputs: Vec<Vec<u8>> = (0..world)
                             .map(|r| encode(dtype, &values(r as u64 * 7919 + elems as u64, elems)))
                             .collect();
                         let scatter: Vec<Vec<u8>> = (0..world)
                             .map(|r| encode(dtype, &values(r as u64 * 104_729 + 3, elems * world)))
                             .collect();
-                        let want = run_group(None, world, dtype, &inputs, &scatter);
-                        let got =
-                            run_group(Some(Arc::clone(&lib)), world, dtype, &inputs, &scatter);
+                        let want = run_group(minor, None, world, dtype, &inputs, &scatter);
+                        let got = run_group(
+                            minor,
+                            Some(Arc::clone(&lib)),
+                            world,
+                            dtype,
+                            &inputs,
+                            &scatter,
+                        );
                         for (r, (g, w)) in got.iter().zip(&want).enumerate() {
                             assert_eq!(g, w, "{ctx} rank {r}");
                         }

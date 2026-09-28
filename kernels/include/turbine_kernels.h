@@ -390,8 +390,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * adds pinned host memory and events; v2.4 implementation enumeration and the
  * card profile; v2.5 copy streams and asynchronous copies; v2.6 the native
  * stream handle and the sharded RMSNorm ops; v2.7 host-mapped memory and the
- * one-shot collectives over it (all below). */
-#define TURBINE_ABI_MINOR 7u
+ * one-shot collectives over it; v2.8 the device-sequenced (graph-capturable)
+ * mapped collective step (all below). */
+#define TURBINE_ABI_MINOR 8u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -481,7 +482,9 @@ const char *turbine_logits_reduce_impl(const turbine_logits_reduce_desc *d);
  * turbine_graph_launch enqueues it on the compute stream;
  * turbine_graph_destroy releases it. Between begin and end only op calls are
  * allowed: turbine_memcpy_*, turbine_stream_sync, turbine_malloc and
- * turbine_free return TURBINE_E_ARGUMENT while capturing. A failed capture
+ * turbine_free return TURBINE_E_ARGUMENT while capturing (from v2.8 except a
+ * TURBINE_COPY_D2D turbine_memcpy_async on the compute stream, s = NULL,
+ * which is captured as a copy node). A failed capture
  * leaves the context usable. A graph records the device pointers its ops were
  * captured with: the caller keeps those buffers alive and destroys the graph
  * before freeing them. */
@@ -797,6 +800,31 @@ int32_t
 turbine_mapped_collective_supported(const turbine_mapped_collective_desc *d);
 const char *
 turbine_mapped_collective_impl(const turbine_mapped_collective_desc *d);
+
+/* ======== v2.8 (additive, optional): device-sequenced mapped collective
+ * steps ========
+ * Tensor-parallel decode graphs (P5 Task 32): a step of
+ * turbine_mapped_collective bakes its seq into the kernel, so a captured
+ * graph would replay stale sequence numbers. Resolved only when
+ * turbine_abi_minor() >= 8 and the symbol exists.
+ *
+ * turbine_mapped_collective_dseq enqueues the step d describes exactly as
+ * turbine_mapped_collective does, except that its sequence number is read on
+ * the device: seq_counter is this context's device memory of two words
+ * (uint64 counter, then a uint32 completion count; both zero before the
+ * first step of the channel) and the step runs with seq = counter + 1, then
+ * stores seq back into the counter (the last of the step's blocks to start
+ * does, so the next step on the stream reads it). d->seq is ignored (must
+ * still be >= 1 for the descriptor to be valid). Every step of a channel
+ * must then go through this function, on every rank, in the same order; the
+ * result is bit for bit the one turbine_mapped_collective computes. It may
+ * be called while the compute stream is captured into a graph (v2.1): each
+ * replay advances the counter. From v2.8, turbine_mapped_collective itself
+ * returns TURBINE_E_ARGUMENT while the stream is captured (its seq would not
+ * advance on replay). */
+int32_t turbine_mapped_collective_dseq(turbine_ctx *ctx,
+                                       const turbine_mapped_collective_desc *d,
+                                       uint64_t *seq_counter);
 
 #ifdef __cplusplus
 }

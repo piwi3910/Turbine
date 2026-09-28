@@ -20,6 +20,13 @@ const BACKEND_VAR: &str = "TURBINE_TEST_BACKEND";
 /// (device 0 when there is none), with the kernel library `TURBINE_KERNEL_LIBRARY` names (else
 /// the backend's own search order). Panics when the backend is not registered or cannot open.
 pub fn open_backend(name: &str) -> OpenedBackend {
+    open_backend_nth(name, 0)
+}
+
+/// [`open_backend`] on the `nth` discovered device of the backend's vendor (0: the first; a
+/// two-GPU lab test opens 0 and 1). Panics when there is no such device (except `nth` 0, which
+/// falls back to device 0).
+pub fn open_backend_nth(name: &str, nth: usize) -> OpenedBackend {
     let backend = backends::registry()
         .get(name)
         .unwrap_or_else(|| panic!("{}", backends::registry().unknown(name)));
@@ -28,8 +35,14 @@ pub fn open_backend(name: &str) -> OpenedBackend {
     let device = inventory
         .devices
         .iter()
-        .find(|d| d.vendor.as_str() == backend.vendor())
-        .map_or(DeviceId(0), |d| d.index);
+        .filter(|d| d.vendor.as_str() == backend.vendor())
+        .nth(nth)
+        .map(|d| d.index);
+    let device = match device {
+        Some(d) => d,
+        None if nth == 0 => DeviceId(0),
+        None => panic!("no device {nth} of execution backend {name}'s vendor"),
+    };
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
@@ -51,17 +64,35 @@ pub fn open_context(name: &str) -> Arc<ShimContext> {
         .unwrap_or_else(|| panic!("execution backend {name} has no kernel-library context"))
 }
 
+/// [`open_context`] on the `nth` device of the backend's vendor ([`open_backend_nth`]).
+pub fn open_context_nth(name: &str, nth: usize) -> Arc<ShimContext> {
+    open_backend_nth(name, nth)
+        .context
+        .unwrap_or_else(|| panic!("execution backend {name} has no kernel-library context"))
+}
+
 /// A context on mocked device `index` (an AMD `gfx942`, vendor index `index`) of the test stub
-/// kernel library that exports every optional group up to ABI v2.7 (`stub/stub_shim.c`, built
+/// kernel library that exports every optional group up to ABI v2.8 (`stub/stub_shim.c`, built
 /// by this crate's build script with the host C compiler). Its "device" memory is host memory
 /// and its host-mapped collective steps run on the calling thread, so the `hostmem` collective
 /// backend can be tested without a GPU. Only usable on the host that built this crate.
 pub fn stub_mapped_context(index: u32) -> Arc<ShimContext> {
+    stub_mapped_context_minor(index, 8)
+}
+
+/// [`stub_mapped_context`] on the stub of ABI minor `minor`: 7 (host-sequenced steps only) or 8
+/// (also the device-sequenced steps).
+pub fn stub_mapped_context_minor(index: u32, minor: u32) -> Arc<ShimContext> {
     use turbine_core::types::{MemoryKind, Vendor};
     use turbine_device::{DeviceInfo, DeviceMemoryInfo};
 
-    let lib = crate::ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V27")), "hip")
-        .expect("the v2.7 stub library loads");
+    let path = match minor {
+        7 => env!("TURBINE_STUB_GFX942_V27"),
+        8 => env!("TURBINE_STUB_GFX942_V28"),
+        _ => panic!("no stub library of ABI minor {minor}"),
+    };
+    let lib = crate::ShimLibrary::load(Path::new(path), "hip")
+        .unwrap_or_else(|e| panic!("the v2.{minor} stub library loads: {e}"));
     let device = DeviceInfo {
         index: DeviceId(index),
         vendor: Vendor::Amd,

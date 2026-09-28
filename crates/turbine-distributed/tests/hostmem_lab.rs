@@ -11,6 +11,7 @@ use turbine_core::clock::SystemClock;
 use turbine_distributed::collective::{
     self, Collective, CollectiveError, CollectiveInit, CollectiveLibrary, HostCollective, ReduceOp,
 };
+use turbine_kernels::ShimContext;
 use turbine_kernels::backends::BackendRequest;
 use turbine_kernels::test_support::require_backend;
 use turbine_tensor::host::HostMemory;
@@ -44,6 +45,14 @@ impl Drop for Watchdog {
 
 /// The device memory (kernel-library context) of every AMD device, in index order.
 fn devices() -> Vec<Arc<dyn DeviceMemory>> {
+    contexts().into_iter().map(|(mem, _)| mem).collect()
+}
+
+/// A device's memory and the context its graphs capture on (kernel ABI v2.1).
+type DeviceContext = (Arc<dyn DeviceMemory>, Option<Arc<ShimContext>>);
+
+/// Every AMD device's [`DeviceContext`], in index order.
+fn contexts() -> Vec<DeviceContext> {
     let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
         .expect("device discovery");
     let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
@@ -66,8 +75,8 @@ fn devices() -> Vec<Arc<dyn DeviceMemory>> {
                     card_profile: "auto",
                 })
                 .unwrap_or_else(|e| panic!("open device {}: {e}", d.index.0))
-                .mem
         })
+        .map(|opened| (opened.mem, opened.graphs))
         .collect()
 }
 
@@ -568,4 +577,201 @@ fn rccl_init_with_a_missing_peer_fails_in_time() {
         "{err:?}"
     );
     assert!(waited < Duration::from_secs(10), "{waited:?}");
+}
+
+fn f32s(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+fn bf16s(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(2)
+        .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
+/// One round's inputs of rank `r`: a BF16 all-reduce of a decode step's hidden rows (16 × 3,072,
+/// 96 KiB), an FP32 all-reduce of 64 sums of squares and an FP32 all-gather of `gather` bytes
+/// per rank.
+fn graph_inputs(round: u64, r: usize, gather: usize) -> [Vec<u8>; 3] {
+    let seed = round * 1_000 + r as u64 * 17;
+    [
+        encode(DType::BF16, &values(seed + 1, 16 * 3072)),
+        encode(DType::F32, &values(seed + 2, 64)),
+        encode(DType::F32, &values(seed + 3, gather / 4)),
+    ]
+}
+
+/// Both ranks' expected results of one round of [`graph_inputs`]: the rank-order sums (BF16
+/// rounded once) and the rank-major gather.
+fn graph_want(inputs: &[[Vec<u8>; 3]]) -> [Vec<u8>; 3] {
+    let bsum: Vec<f32> = bf16s(&inputs[0][0])
+        .iter()
+        .zip(bf16s(&inputs[1][0]))
+        .map(|(a, b)| a + b)
+        .collect();
+    let fsum: Vec<f32> = f32s(&inputs[0][1])
+        .iter()
+        .zip(f32s(&inputs[1][1]))
+        .map(|(a, b)| a + b)
+        .collect();
+    [
+        encode(DType::BF16, &bsum),
+        encode(DType::F32, &fsum),
+        [inputs[0][2].clone(), inputs[1][2].clone()].concat(),
+    ]
+}
+
+/// P5 Task 32 (tensor-parallel decode graphs): both ranks capture a step's collectives — a BF16
+/// and an FP32 all-reduce on hostmem's kernels and an FP32 all-gather of `gather` bytes per rank
+/// (routed by the `auto` thresholds: to the RCCL delegate above 256 KiB) — into a graph once,
+/// then replay it for several rounds with fresh inputs, an eager all-reduce between replays.
+/// Every replay and every eager step must equal the reference bit for bit on both ranks: the
+/// device step counter (kernel ABI v2.8) advances per replay, so no replay reuses a stale
+/// sequence number (it would pass its waits early or read another round's slot).
+fn graph_replays(name: &'static str, gather: usize, route_max_bytes: Option<u64>) {
+    if !require_backend("hip") {
+        return;
+    }
+    let _watchdog = watchdog(name, Duration::from_secs(180));
+    let ctxs = contexts();
+    assert!(ctxs.len() >= 2, "two AMD devices, found {}", ctxs.len());
+    let lib = collective::registry()
+        .get("hostmem")
+        .expect("registered")
+        .load(None)
+        .expect("load (with RCCL as the delegate)");
+    let id = lib.unique_id().expect("id");
+    const ROUNDS: usize = 5;
+    let inputs: Vec<Vec<[Vec<u8>; 3]>> = (0..=ROUNDS as u64)
+        .map(|round| (0..2).map(|r| graph_inputs(round, r, gather)).collect())
+        .collect();
+    let got: Vec<Vec<[Vec<u8>; 3]>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..2)
+            .map(|r| {
+                let (lib, (mem, ctx), inputs) = (Arc::clone(&lib), &ctxs[r], &inputs);
+                s.spawn(move || {
+                    let ctx = ctx
+                        .as_ref()
+                        .expect("the library exports the graph functions");
+                    let comm = lib
+                        .open(CollectiveInit {
+                            route_max_bytes,
+                            ..init(r, 2, id, Duration::from_secs(60), Arc::clone(mem))
+                        })
+                        .expect("open");
+                    let stream = mem.compute_stream();
+                    let bufs: Vec<DeviceBuffer> = inputs[0][r]
+                        .iter()
+                        .map(|i| DeviceBuffer::alloc(mem, i.len()).expect("alloc"))
+                        .collect();
+                    let gathered = DeviceBuffer::alloc(mem, 2 * gather).expect("alloc");
+                    let enqueue = || {
+                        comm.all_reduce(&mut bufs[0].whole(), DType::BF16, ReduceOp::Sum, &stream)
+                            .expect("bf16 all_reduce");
+                        comm.all_reduce(&mut bufs[1].whole(), DType::F32, ReduceOp::Sum, &stream)
+                            .expect("f32 all_reduce");
+                        comm.all_gather(&bufs[2].whole(), &mut gathered.whole(), &stream)
+                            .expect("all_gather");
+                    };
+                    let write = |round: &[Vec<u8>; 3]| {
+                        for (b, i) in bufs.iter().zip(round) {
+                            b.whole().write_bytes(i).expect("write");
+                        }
+                    };
+                    let read = || {
+                        [
+                            bufs[0].whole().read_bytes().expect("read"),
+                            bufs[1].whole().read_bytes().expect("read"),
+                            gathered.whole().read_bytes().expect("read"),
+                        ]
+                    };
+                    let mut out = Vec::new();
+                    // Round 0 eagerly, then the capture (nothing runs), then the replays.
+                    write(&inputs[0][r]);
+                    comm.step_begin();
+                    enqueue();
+                    mem.synchronize().expect("sync");
+                    comm.step_end().expect("healthy eager step");
+                    out.push(read());
+                    ctx.graph_begin().expect("begin capture");
+                    enqueue();
+                    let graph = ctx.graph_end().expect("the collectives are capturable");
+                    for round in 1..=ROUNDS {
+                        write(&inputs[round][r]);
+                        comm.step_begin();
+                        ctx.graph_launch(&graph).expect("replay");
+                        mem.synchronize().expect("sync");
+                        comm.step_end().expect("healthy replay");
+                        out.push(read());
+                        // An eager all-reduce between replays shares the step counter.
+                        write(&inputs[0][r]);
+                        comm.step_begin();
+                        comm.all_reduce(&mut bufs[0].whole(), DType::BF16, ReduceOp::Sum, &stream)
+                            .expect("eager all_reduce");
+                        mem.synchronize().expect("sync");
+                        comm.step_end().expect("healthy eager step");
+                        let eager = bufs[0].whole().read_bytes().expect("read");
+                        out.push([eager, Vec::new(), Vec::new()]);
+                    }
+                    drop(graph);
+                    out
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("rank"))
+            .collect()
+    });
+    let first = graph_want(&inputs[0]);
+    for (r, rank) in got.iter().enumerate() {
+        assert!(rank[0] == first, "{name}: rank {r} eager round 0 differs");
+        for round in 1..=ROUNDS {
+            let want = graph_want(&inputs[round]);
+            let replay = &rank[2 * round - 1];
+            for (k, what) in ["bf16 all_reduce", "f32 all_reduce", "all_gather"]
+                .iter()
+                .enumerate()
+            {
+                assert!(
+                    replay[k] == want[k],
+                    "{name}: rank {r} replay {round} {what} differs from the reference"
+                );
+            }
+            assert!(
+                rank[2 * round][0] == first[0],
+                "{name}: rank {r} eager all_reduce after replay {round} differs"
+            );
+        }
+    }
+    println!(
+        "{name}: {ROUNDS} graph replays (gather {gather} B per rank) and the eager steps between \
+         them bitwise equal to the reference on both ranks"
+    );
+}
+
+/// [`graph_replays`] with every collective on hostmem's kernels (a 32 KiB all-gather).
+#[test]
+#[ignore = "needs two HIP devices and libturbine_hip.so (scripts/lab-test.sh novanas --gpus 2)"]
+fn hostmem_graph_replays_match_reference_on_two_gpus() {
+    graph_replays(
+        "hostmem_graph_replays_match_reference_on_two_gpus",
+        32 << 10,
+        // No RCCL delegate: hostmem's kernels only.
+        Some(u64::MAX),
+    );
+}
+
+/// [`graph_replays`] with the logits all-gather of a 16-sequence Llama decode step (16 × 64,128
+/// FP32 per rank, 4 MiB): routed to the RCCL delegate and captured with the rest.
+#[test]
+#[ignore = "needs two HIP devices, libturbine_hip.so and RCCL (scripts/lab-test.sh novanas --gpus 2)"]
+fn hostmem_graph_replays_with_rccl_delegate_on_two_gpus() {
+    graph_replays(
+        "hostmem_graph_replays_with_rccl_delegate_on_two_gpus",
+        16 * 64_128 * 4,
+        None,
+    );
 }

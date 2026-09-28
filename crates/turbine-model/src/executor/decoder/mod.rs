@@ -36,6 +36,10 @@
 //! batch metadata and reduction inputs are uploaded into the same device buffers first. Never
 //! while tracing or profiling, nor when the FFN hook says the batch cannot be captured
 //! ([`FfnHook::graph_capturable`]: MoE with a provider reading the expert offsets on the host).
+//! A tensor-parallel rank captures its collectives into the graph too (P5 Task 32; the server
+//! gives it graphs only under `parallel.tp_decode_graphs`): every rank sees the same batches, so
+//! every rank captures and replays the same keys, and a collective that is captured must advance
+//! its own sequencing on replay (the `hostmem` backend's device step counter, kernel ABI v2.8).
 //!
 //! Diagnostics: [`DecoderExecutor::set_trace`] makes each forward record every intermediate
 //! tensor ([`TraceTensor`]) with a blocking device read after the op that wrote it; comparing
@@ -781,7 +785,8 @@ impl DecoderExecutor {
     /// `registry` was built from [`DecoderExecutor::requirements_for`] of the same shard, and
     /// every forward's pool is laid out as the rank's KV layout ([`crate::tp::kv_layout`]).
     /// Every rank of the group must be fed the same batches in the same order; each returns
-    /// the full logits. Tensor-parallel ranks never capture decode graphs nor overlap launches.
+    /// the full logits. Tensor-parallel ranks never overlap launches; they capture decode graphs
+    /// only when given them ([`ModelExecutor::set_decode_graphs`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new_tp(
         cfg: &ModelArchConfig,
@@ -1723,8 +1728,8 @@ impl ModelExecutor for DecoderExecutor {
         Ok(logits)
     }
 
-    /// Ignored (graphs stay off) for a tensor- or expert-parallel rank or a pipeline stage: its
-    /// collectives are not captured.
+    /// Ignored (graphs stay off) for an expert-parallel rank or a pipeline stage. A
+    /// tensor-parallel rank captures its collectives with the rest of the step (module docs).
     fn set_decode_graphs(&mut self, graphs: Option<DecodeGraphs>) {
         if self.pp.is_some() && graphs.is_some() {
             tracing::warn!(
@@ -1734,15 +1739,11 @@ impl ModelExecutor for DecoderExecutor {
             );
             return;
         }
-        if self.group().is_some() && graphs.is_some() {
+        if self.ep.is_some() && graphs.is_some() {
             tracing::info!(
                 event = "decode_graphs_off",
-                reason = if self.tp.is_some() {
-                    "tensor_parallel"
-                } else {
-                    "expert_parallel"
-                },
-                "decode graphs are not captured under tensor or expert parallelism"
+                reason = "expert_parallel",
+                "decode graphs are not captured under expert parallelism"
             );
             return;
         }

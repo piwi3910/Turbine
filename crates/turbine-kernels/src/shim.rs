@@ -3501,4 +3501,66 @@ mod tests {
         assert_eq!(live(), before, "freed once with the last handle");
         drop((buf, mem, ctx));
     }
+
+    /// ABI v2.8 (P5 Task 32): a v2.7 library has no device-sequenced step; on the v2.8 stub
+    /// each step reads the device counter, runs with seq = counter + 1 (its published tag) and
+    /// stores it back, so two steps publish tags of seq 1 and 2 with no host sequence number.
+    /// Breaks if the symbol resolves on a v2.7 library, the counter address does not reach the
+    /// library, or the descriptor's own seq is used instead of the counter.
+    #[test]
+    fn v28_device_sequenced_step() {
+        use std::time::Duration;
+
+        use turbine_tensor::{MappedKind, MappedReduce, MappedStep};
+
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let v27 = crate::test_support::stub_mapped_context_minor(0, 7);
+        let mc27 = v27.mapped_collectives().expect("the v2.7 group");
+        assert!(!mc27.mapped_dseq_supported());
+        drop(v27);
+
+        let ctx = crate::test_support::stub_mapped_context_minor(0, 8);
+        assert_eq!(ctx.library().abi_minor(), 8);
+        let mc = ctx.mapped_collectives().expect("the v2.7 group");
+        assert!(mc.mapped_dseq_supported());
+        let region = mc.alloc_mapped(4096 + 2 * 64).expect("mapped region");
+        let base = mc.mapped_device_addr(&region).expect("device address");
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let buf = turbine_tensor::DeviceBuffer::alloc(&mem, 8).expect("buffer");
+        buf.whole().write_bytes(&[0u8; 8]).expect("write");
+        let counter = turbine_tensor::DeviceBuffer::alloc(&mem, 16).expect("counter");
+        counter.whole().write_bytes(&[0u8; 16]).expect("zero");
+        let step = MappedStep {
+            kind: MappedKind::AllReduce,
+            reduce: MappedReduce::Sum,
+            dtype: DType::F32,
+            rank: 0,
+            world: 1,
+            send: buf.whole().ptr(),
+            recv: buf.whole().ptr(),
+            bytes: 8,
+            send_stride: 0,
+            recv_stride: 0,
+            flags: base,
+            max_blocks: 1,
+            abort_word: base.offset(64),
+            slots: base.offset(128),
+            slot_bytes: 64,
+            // Ignored: the counter sequences the step.
+            seq: 77,
+            timeout: Duration::from_secs(1),
+        };
+        for want in 1u32..=2 {
+            mc.enqueue_mapped_step_dseq(&step, counter.whole().ptr())
+                .expect("device-sequenced step");
+            let words = counter.whole().read_bytes().expect("read");
+            assert_eq!(
+                u64::from_le_bytes(words[..8].try_into().unwrap()),
+                u64::from(want)
+            );
+            // The tag seq << 24 | 1, low word then high word.
+            assert_eq!(region.load_u32(0), (want << 24) | 1);
+        }
+        drop((region, buf, counter, mem, ctx));
+    }
 }
