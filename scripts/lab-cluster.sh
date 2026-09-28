@@ -36,8 +36,9 @@
 #                      each run the Phase 4 multi-turn load (8 sessions × 4 turns, 400 shared
 #                      words, session hints; cached_tokens_ratio > 0), 48 one-off prompts and
 #                      the multi-turn load replayed (cached_tokens_ratio > 0, 0 bytes in flight
-#                      after idle); tp 1 and local must promote, static must reuse and promote
-#                      as local does within one block; golden c1 against the one-GPU capture
+#                      after idle); every leg must promote and reuse in the replay, and static
+#                      must reach 0.75 × local on L1 -> L0 promotions and on replay cached
+#                      tokens; golden c1 against the one-GPU capture
 #                      on the tiered static group. Prints one `tp-bench <run> tok/s=…
 #                      ttft_p50_ms=… itl_p50_ms=…` line per bench run and `tp-multiturn …`,
 #                      `tp-tiers …` lines.
@@ -524,16 +525,20 @@ tiers_workload() {
 		GATE_FAILED+=("tiers ${leg}: replay cached_tokens_ratio not > 0")
 	[[ $inflight == 0 ]] || GATE_FAILED+=("tiers ${leg}: ${inflight} bytes still in flight after idle")
 	TIERS_PROMOTED[$leg]=$promoted
+	TIERS_PROMOTED_L1[$leg]=${delta[2]}
 	TIERS_REPLAY_CACHED[$leg]=$cached_replay
 }
 
-declare -A TIERS_PROMOTED=() TIERS_REPLAY_CACHED=()
+declare -A TIERS_PROMOTED=() TIERS_PROMOTED_L1=() TIERS_REPLAY_CACHED=()
 
 # tiers_legs <config> <static args>...: the tiers workload on tp 1 (device 0), tp 2 local and
-# tp 2 static (plan Task 30 and its follow-up): tp 1 and local must promote (> 0), else the
-# scenario does not exercise promotion; static must reuse and promote as local does, within one
-# block (block_tokens = 128; the copy timing of the two modes differs by an engine turn); then
-# golden c1 against the one-GPU capture on the tiered static group.
+# tp 2 static (plan Task 30 and its follow-up): every leg must promote (> 0) and reuse in the
+# replay (> 0), else the scenario does not exercise the tiers; static must reach 0.75 × local on
+# L1 -> L0 promotions and on replay cached tokens (one-sided, user decision "Task 30 parity":
+# how capacity demotion and the flood's allocations interleave with the 4 sessions moves both
+# by more than a block between runs and modes — run 0928111413-39b46c20: tp 1 27 promotions and
+# 22,400 replay tokens, local 42 and 28,032, static 35 and 35,072); then golden c1 against the
+# one-GPU capture on the tiered static group.
 tiers_legs() {
 	local config="$1"
 	shift
@@ -568,17 +573,19 @@ tiers_legs() {
 	stop_servers
 
 	local leg
-	for leg in tp1 local; do
+	for leg in tp1 local static; do
 		((TIERS_PROMOTED[$leg] > 0)) ||
 			GATE_FAILED+=("tiers ${leg}: no promotion (the scenario does not exercise the tiers)")
+		((TIERS_REPLAY_CACHED[$leg] > 0)) ||
+			GATE_FAILED+=("tiers ${leg}: no reuse in the replay")
 	done
-	local dp=$((TIERS_PROMOTED[static] - TIERS_PROMOTED[local]))
-	local dc=$((TIERS_REPLAY_CACHED[static] - TIERS_REPLAY_CACHED[local]))
-	echo "tp-tiers parity static-local promoted_diff=${dp} replay_cached_tokens_diff=${dc}"
-	((dp >= -1 && dp <= 1)) ||
-		GATE_FAILED+=("tiers static promotes ${TIERS_PROMOTED[static]} blocks, local ${TIERS_PROMOTED[local]}")
-	((dc >= -128 && dc <= 128)) ||
-		GATE_FAILED+=("tiers static reuses ${TIERS_REPLAY_CACHED[static]} tokens in the replay, local ${TIERS_REPLAY_CACHED[local]}")
+	local sp=${TIERS_PROMOTED_L1[static]} lp=${TIERS_PROMOTED_L1[local]}
+	local sc=${TIERS_REPLAY_CACHED[static]} lc=${TIERS_REPLAY_CACHED[local]}
+	echo "tp-tiers parity static/local promoted_l1_l0=${sp}/${lp} replay_cached_tokens=${sc}/${lc} floor=0.75"
+	((4 * sp >= 3 * lp)) ||
+		GATE_FAILED+=("tiers static promotes ${sp} blocks L1 -> L0, below 0.75 x local's ${lp}")
+	((4 * sc >= 3 * lc)) ||
+		GATE_FAILED+=("tiers static reuses ${sc} tokens in the replay, below 0.75 x local's ${lc}")
 }
 
 # The tp 2 A/B variant (P5 Task 32): an uncommitted scripts/lab/tp2-variant.local in the uploaded
