@@ -56,11 +56,14 @@ TWO_GPU_TESTS=(
 	# crates/turbine-server/tests/kv_gpu.rs: prefix_reuse_matches_cold_tp2,
 	# prefix_reuse_suffix_lengths_match_cold_tp2 (P5 Task 29)
 	cold_tp2
+	# crates/turbine-model/tests/perf.rs (P5 Task 32)
+	tp_forward_profile
 )
 
 SLOW_TESTS=(
 	# crates/turbine-model/tests/perf.rs, tests/host_step.rs
 	serving_mix
+	# also matches (by substring) tp_forward_profile (P5 Task 32)
 	forward_profile
 	moe_prefill_timings
 	moe_ep_local_timings
