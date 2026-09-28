@@ -497,6 +497,8 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
             "cold_tp2",
             "--skip",
             "tp2_collective_failure_recovers_on_gpu",
+            "--skip",
+            "tp_forward_profile",
         ]
     );
 }
@@ -546,6 +548,8 @@ fn lab_test_forwards_cargo_features() {
             "cold_tp2",
             "--skip",
             "tp2_collective_failure_recovers_on_gpu",
+            "--skip",
+            "tp_forward_profile",
         ]
     );
     for args in [
@@ -621,6 +625,8 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "cold_tp2".to_string(),
         "--skip".to_string(),
         "tp2_collective_failure_recovers_on_gpu".to_string(),
+        "--skip".to_string(),
+        "tp_forward_profile".to_string(),
     ];
     for t in slow {
         want.push("--skip".to_string());
@@ -653,6 +659,8 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "cold_tp2".to_string(),
         "--skip".to_string(),
         "tp2_collective_failure_recovers_on_gpu".to_string(),
+        "--skip".to_string(),
+        "tp_forward_profile".to_string(),
     ];
     for t in slow {
         want.push(t.to_string());
@@ -686,6 +694,8 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
             "cold_tp2",
             "--skip",
             "tp2_collective_failure_recovers_on_gpu",
+            "--skip",
+            "tp_forward_profile",
         ]
     );
 
@@ -742,6 +752,8 @@ fn lab_test_passes_a_subset_and_opts_into_the_hf_reference() {
             "cold_tp2",
             "--skip",
             "tp2_collective_failure_recovers_on_gpu",
+            "--skip",
+            "tp_forward_profile",
         ]
     );
     assert!(
@@ -791,6 +803,8 @@ fn lab_test_passes_a_subset_and_opts_into_the_hf_reference() {
             "cold_tp2",
             "--skip",
             "tp2_collective_failure_recovers_on_gpu",
+            "--skip",
+            "tp_forward_profile",
             "hf_reference",
         ]
     );

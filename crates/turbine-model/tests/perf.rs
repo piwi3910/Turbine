@@ -14,11 +14,17 @@
 //!
 //! Run with `scripts/lab-test.sh novanas -- --release -p turbine-model --test perf -- forward_profile --nocapture`.
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use turbine_core::clock::SystemClock;
 use turbine_core::types::{BlockId, KvLayout, SeqId};
+use turbine_distributed::collective::{
+    self, Collective, CollectiveError, CollectiveInit, CollectiveMetrics, CollectiveOp, ReduceOp,
+    hostmem,
+};
 use turbine_kernels::{
     KernelMetrics, KernelRegistry, OpKind, shim_provider, test_support::require_backend,
     test_support::require_env_dir,
@@ -26,12 +32,13 @@ use turbine_kernels::{
 use turbine_model::config::ModelArchConfig;
 use turbine_model::executor::{
     self, BatchInput, DecoderExecutor, ExecutorLimits, ExecutorOptions, ModelExecutor, OpProfile,
-    OpProfileEntry, SeqSlice,
+    OpProfileEntry, RowReduce, SeqSlice,
 };
 use turbine_model::families;
+use turbine_model::tp;
 use turbine_model::{MAX_STAGING_BYTES, SafetensorsIndex, WeightLoader, load_model_config};
 use turbine_observability::MetricsRegistry;
-use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView};
+use turbine_tensor::{DType, DeviceBuffer, DeviceMemory, DeviceSlice, KvPoolView, StreamRef};
 
 /// KV page size of the profile (the Phase 2c default: both paged ops on CK `fmha_fwd_pagedkv`).
 const BLOCK_TOKENS: u32 = 128;
@@ -1017,6 +1024,798 @@ fn moe_ep_local_timings() {
                 println!(
                     "moe_ep_timing layer={layer} tokens={t} rows={rows} case={case} \
                      local_rows={local_rows} us={us:.1} impl={imp}"
+                );
+            }
+        }
+    }
+}
+
+// ---- Tensor-parallel step profile (P5 Task 32) ----
+
+/// Sequences of the tensor-parallel decode case (the c16 serving workload).
+const TP_DECODE_SEQS: u32 = 16;
+/// Forwards pass through to the real communicator.
+const COLL_PASS: u8 = 0;
+/// Every call is timed: the rank's stream is drained, the call enqueued and the stream drained
+/// again; the host instants of arrival and completion are recorded (both ranks are threads of
+/// this process, so the instants compare across ranks).
+const COLL_TIME: u8 = 1;
+/// Every call is skipped (both ranks skip the same calls; the numbers are wrong, the timing of
+/// everything else is not): the forward without collectives.
+const COLL_SKIP_ALL: u8 = 2;
+/// The calls `hostmem` routes to RCCL are skipped: the forward with free large collectives.
+const COLL_SKIP_RCCL: u8 = 3;
+
+/// One timed collective call.
+#[derive(Clone, Copy, Debug)]
+struct CollCall {
+    op: CollectiveOp,
+    /// nccl-tests bytes (the routing size).
+    bytes: usize,
+    route: &'static str,
+    arrive: Instant,
+    end: Instant,
+}
+
+/// A rank's communicator as the profile sees it: the real one (`hostmem` with its RCCL delegate)
+/// behind a switch ([`COLL_PASS`] …). Test-only, so the serving path pays nothing for it.
+struct TimedCollective {
+    inner: Arc<dyn Collective>,
+    mem: Arc<dyn DeviceMemory>,
+    mode: AtomicU8,
+    calls: Mutex<Vec<CollCall>>,
+}
+
+impl TimedCollective {
+    fn new(inner: Arc<dyn Collective>, mem: Arc<dyn DeviceMemory>) -> Arc<TimedCollective> {
+        Arc::new(TimedCollective {
+            inner,
+            mem,
+            mode: AtomicU8::new(COLL_PASS),
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn set_mode(&self, mode: u8) {
+        self.mode.store(mode, Ordering::Release);
+    }
+
+    fn take_calls(&self) -> Vec<CollCall> {
+        std::mem::take(&mut *self.calls.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Where `hostmem` sends `op` over `bytes` at `parallel.collective.hostmem_max_bytes: auto`
+    /// (checked against `turbine_collective_route_total` after the run).
+    fn route(&self, op: CollectiveOp, bytes: usize) -> &'static str {
+        let backend = self.inner.backend();
+        if backend == "hostmem" && bytes as u64 > hostmem::auto_max_bytes(op) {
+            "rccl"
+        } else {
+            backend
+        }
+    }
+
+    fn call(
+        &self,
+        op: CollectiveOp,
+        bytes: usize,
+        f: impl FnOnce() -> Result<(), CollectiveError>,
+    ) -> Result<(), CollectiveError> {
+        let route = self.route(op, bytes);
+        match self.mode.load(Ordering::Acquire) {
+            COLL_SKIP_ALL => Ok(()),
+            COLL_SKIP_RCCL if route == "rccl" => Ok(()),
+            COLL_TIME => {
+                let drain = || {
+                    self.mem
+                        .synchronize()
+                        .map_err(|e| CollectiveError::Backend {
+                            code: -1,
+                            message: e.to_string(),
+                        })
+                };
+                drain()?;
+                let arrive = Instant::now();
+                f()?;
+                drain()?;
+                let end = Instant::now();
+                self.calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(CollCall {
+                        op,
+                        bytes,
+                        route,
+                        arrive,
+                        end,
+                    });
+                Ok(())
+            }
+            _ => f(),
+        }
+    }
+}
+
+impl Collective for TimedCollective {
+    fn backend(&self) -> &'static str {
+        self.inner.backend()
+    }
+    fn rank(&self) -> usize {
+        self.inner.rank()
+    }
+    fn world_size(&self) -> usize {
+        self.inner.world_size()
+    }
+    fn all_reduce(
+        &self,
+        buf: &mut DeviceSlice<'_>,
+        dtype: DType,
+        op: ReduceOp,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        let n = buf.len();
+        self.call(CollectiveOp::AllReduce, n, || {
+            self.inner.all_reduce(buf, dtype, op, stream)
+        })
+    }
+    fn all_gather(
+        &self,
+        send: &DeviceSlice<'_>,
+        recv: &mut DeviceSlice<'_>,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        let n = recv.len();
+        self.call(CollectiveOp::AllGather, n, || {
+            self.inner.all_gather(send, recv, stream)
+        })
+    }
+    fn reduce_scatter(
+        &self,
+        send: &DeviceSlice<'_>,
+        recv: &mut DeviceSlice<'_>,
+        dtype: DType,
+        op: ReduceOp,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        let n = send.len();
+        self.call(CollectiveOp::ReduceScatter, n, || {
+            self.inner.reduce_scatter(send, recv, dtype, op, stream)
+        })
+    }
+    fn broadcast(
+        &self,
+        buf: &mut DeviceSlice<'_>,
+        root: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        let n = buf.len();
+        self.call(CollectiveOp::Broadcast, n, || {
+            self.inner.broadcast(buf, root, stream)
+        })
+    }
+    fn barrier(&self, stream: &StreamRef) -> Result<(), CollectiveError> {
+        self.inner.barrier(stream)
+    }
+    fn send(
+        &self,
+        buf: &DeviceSlice<'_>,
+        peer: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        self.inner.send(buf, peer, stream)
+    }
+    fn recv(
+        &self,
+        buf: &mut DeviceSlice<'_>,
+        peer: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        self.inner.recv(buf, peer, stream)
+    }
+    fn step_begin(&self) {
+        self.inner.step_begin();
+    }
+    fn step_end(&self) -> Result<(), CollectiveError> {
+        self.inner.step_end()
+    }
+    fn abort(&self) {
+        self.inner.abort();
+    }
+}
+
+/// Aborts the test process when the guard lives longer than `limit`: a rank stuck in a
+/// collective would otherwise hold both GPUs of the lab Job.
+struct TpWatchdog(Arc<AtomicBool>);
+
+fn tp_watchdog(name: &'static str, limit: Duration) -> TpWatchdog {
+    let done = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&done);
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        while !seen.load(Ordering::Acquire) {
+            if started.elapsed() > limit {
+                eprintln!("perf: {name} ran longer than {limit:?}; aborting the process");
+                std::process::abort();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+    TpWatchdog(done)
+}
+
+impl Drop for TpWatchdog {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// The kernel-library context of every AMD device, in index order.
+fn hip_contexts() -> Vec<Arc<turbine_kernels::ShimContext>> {
+    let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::default())
+        .expect("device discovery");
+    let library = std::env::var_os("TURBINE_KERNEL_LIBRARY")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let backend = turbine_kernels::backends::registry()
+        .get("hip")
+        .expect("the hip execution backend");
+    inventory
+        .devices
+        .iter()
+        .filter(|d| d.vendor.as_str() == backend.vendor())
+        .map(|d| {
+            backend
+                .open(&turbine_kernels::backends::BackendRequest {
+                    device: d.index,
+                    kernel_library: library.as_deref(),
+                    inventory: &inventory,
+                    meminfo: Path::new("/proc/meminfo"),
+                    card_profile: "auto",
+                })
+                .unwrap_or_else(|e| panic!("open device {}: {e}", d.index.0))
+                .context
+                .expect("a kernel-library context")
+        })
+        .collect()
+}
+
+/// Rank `s` of `cfg` on `ctx` over `collective` (the [`turbine_model::tp`] shard, the family's
+/// tensor-parallel hooks), for batches of up to [`PREFILL`] tokens and [`TP_DECODE_SEQS`]
+/// sequences, as the server builds it (no decode graphs, no overlapped launches under TP).
+fn tp_rank_decoder(
+    cfg: &ModelArchConfig,
+    dir: &Path,
+    ctx: &Arc<turbine_kernels::ShimContext>,
+    s: tp::ShardSpec,
+    collective: Arc<dyn Collective>,
+) -> DecoderExecutor {
+    let opts = ExecutorOptions::default();
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let index = SafetensorsIndex::open(dir).expect("open safetensors");
+    let slots = tp::weight_slots(cfg, s).expect("shard slots");
+    let weights = WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("weights");
+    let provider = shim_provider(ctx.clone());
+    let order = [provider.id()];
+    let reqs =
+        tp::available_requirements(cfg, s, BLOCK_TOKENS, opts, std::slice::from_ref(&provider))
+            .expect("rank requirements");
+    let card = provider.card_profile();
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let registry = Arc::new(
+        KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
+            .expect("every op has a provider"),
+    );
+    let spec = cfg
+        .family
+        .0
+        .tp_decoder_spec()
+        .expect("tensor-parallel hooks");
+    let limits = ExecutorLimits {
+        block_tokens: BLOCK_TOKENS,
+        max_batch_tokens: PREFILL,
+        max_seqs: TP_DECODE_SEQS,
+    };
+    let stream = mem.compute_stream();
+    DecoderExecutor::new_tp(
+        cfg,
+        spec,
+        weights,
+        registry,
+        mem,
+        limits,
+        opts,
+        Some(tp::TpContext {
+            rank: s.rank,
+            world: s.world,
+            collective,
+            stream,
+        }),
+    )
+    .expect("rank executor")
+}
+
+/// One rank's measurements of one case.
+struct RankCase {
+    case: String,
+    /// Median of [`RUNS`] unprofiled forwards (pipelined, as served), and of their step stages.
+    forward_ms: f64,
+    launch_ms: f64,
+    device_wait_ms: f64,
+    /// The same with every collective skipped, and with the RCCL-routed ones skipped.
+    no_collectives_ms: f64,
+    no_rccl_ms: f64,
+    profile: OpProfile,
+    calls: Vec<CollCall>,
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// Measures one case on one rank; `barrier` (both ranks) precedes every forward, so the ranks
+/// start each one together.
+fn tp_case(
+    name: &str,
+    exec: &mut DecoderExecutor,
+    coll: Option<&TimedCollective>,
+    barrier: Option<&Barrier>,
+    run: &mut dyn FnMut(&mut DecoderExecutor),
+) -> RankCase {
+    let sync = || {
+        if let Some(b) = barrier {
+            b.wait();
+        }
+    };
+    let set = |mode| {
+        if let Some(c) = coll {
+            c.set_mode(mode);
+        }
+    };
+    let mut pipelined = |mode: u8, exec: &mut DecoderExecutor| -> (f64, f64, f64) {
+        set(mode);
+        sync();
+        run(exec);
+        let (mut total, mut launch, mut wait) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..RUNS {
+            sync();
+            let start = Instant::now();
+            run(exec);
+            total.push(start.elapsed().as_secs_f64() * 1e3);
+            let t = ModelExecutor::last_timings(exec);
+            launch.push(t.launch.as_secs_f64() * 1e3);
+            wait.push(t.device_wait.as_secs_f64() * 1e3);
+        }
+        set(COLL_PASS);
+        (median(total), median(launch), median(wait))
+    };
+    let (forward_ms, launch_ms, device_wait_ms) = pipelined(COLL_PASS, exec);
+    let (no_collectives_ms, _, _) = pipelined(COLL_SKIP_ALL, exec);
+    let (no_rccl_ms, _, _) = pipelined(COLL_SKIP_RCCL, exec);
+    set(COLL_TIME);
+    exec.set_profile(true);
+    sync();
+    run(exec);
+    exec.take_profile();
+    let _ = coll.map(TimedCollective::take_calls);
+    sync();
+    run(exec);
+    let profile = exec.take_profile();
+    let calls = coll.map(TimedCollective::take_calls).unwrap_or_default();
+    exec.set_profile(false);
+    set(COLL_PASS);
+    RankCase {
+        case: name.to_string(),
+        forward_ms,
+        launch_ms,
+        device_wait_ms,
+        no_collectives_ms,
+        no_rccl_ms,
+        profile,
+        calls,
+    }
+}
+
+/// Fills the KV of [`TP_DECODE_SEQS`] sequences with distinct `DECODE_CTX − 1`-token prompts
+/// (two per step), then measures a decode step of all of them and one [`PREFILL`]-token chunk.
+fn tp_rank_cases(
+    exec: &mut DecoderExecutor,
+    mem: &Arc<dyn DeviceMemory>,
+    vocab: u32,
+    coll: Option<&TimedCollective>,
+    barrier: Option<&Barrier>,
+) -> Vec<RankCase> {
+    let layout = *ModelExecutor::kv_layout(exec);
+    let per_decode = DECODE_CTX.div_ceil(BLOCK_TOKENS);
+    let per_prefill = PREFILL.div_ceil(BLOCK_TOKENS);
+    let blocks = TP_DECODE_SEQS * per_decode + per_prefill;
+    let storage = DeviceBuffer::alloc(mem, (layout.block_bytes() * u64::from(blocks)) as usize)
+        .expect("KV pool");
+    let kv = pool_view(&storage, &layout, blocks);
+    let tables: Vec<Vec<BlockId>> = (0..TP_DECODE_SEQS)
+        .map(|s| {
+            (0..per_decode)
+                .map(|b| BlockId(s * per_decode + b))
+                .collect()
+        })
+        .collect();
+    let prompts: Vec<Vec<u32>> = (0..TP_DECODE_SEQS)
+        .map(|s| {
+            (0..DECODE_CTX - 1)
+                .map(|i| (i * 7919 + s * 104_729 + 1000) % vocab)
+                .collect()
+        })
+        .collect();
+    for pair in (0..TP_DECODE_SEQS as usize).collect::<Vec<_>>().chunks(2) {
+        let seqs: Vec<(&[BlockId], &[u32], u32)> = pair
+            .iter()
+            .map(|&s| (tables[s].as_slice(), prompts[s].as_slice(), 0))
+            .collect();
+        step(exec, &kv, &seqs).expect("fill the KV");
+    }
+    let next: Vec<[u32; 1]> = (0..TP_DECODE_SEQS)
+        .map(|s| [(s * 97 + 13) % vocab])
+        .collect();
+    let decode: Vec<(&[BlockId], &[u32], u32)> = (0..TP_DECODE_SEQS as usize)
+        .map(|s| (tables[s].as_slice(), next[s].as_slice(), DECODE_CTX - 1))
+        .collect();
+    let table: Vec<BlockId> = (0..per_prefill)
+        .map(|b| BlockId(TP_DECODE_SEQS * per_decode + b))
+        .collect();
+    let prompt: Vec<u32> = (0..PREFILL).map(|i| (i * 31 + 7) % vocab).collect();
+    vec![
+        tp_case(
+            &format!("decode_b{TP_DECODE_SEQS}_ctx{DECODE_CTX}"),
+            exec,
+            coll,
+            barrier,
+            &mut |e| served_step(e, &kv, &decode).expect("decode step"),
+        ),
+        tp_case(
+            &format!("prefill_{PREFILL}"),
+            exec,
+            coll,
+            barrier,
+            &mut |e| served_step(e, &kv, &[(&table, &prompt, 0)]).expect("prefill step"),
+        ),
+    ]
+}
+
+/// [`step`] as the server runs it: every row reduced on the device (greedy, one candidate) when
+/// the executor reduces, so only the reductions are read back (under tensor parallelism the
+/// vocabulary shards are still all-gathered first).
+fn served_step(
+    exec: &mut DecoderExecutor,
+    kv: &KvPoolView<'_>,
+    seqs: &[(&[BlockId], &[u32], u32)],
+) -> Result<(), turbine_model::ModelError> {
+    let reduce = ModelExecutor::reduces_logits(exec).then_some(RowReduce {
+        top_n: 1,
+        temperature: 0.0,
+        uniform: None,
+        top_p: 1.0,
+    });
+    let mut tokens = Vec::new();
+    let mut positions = Vec::new();
+    let mut slices = Vec::with_capacity(seqs.len());
+    for (s, &(table, toks, start)) in seqs.iter().enumerate() {
+        slices.push(SeqSlice {
+            seq: SeqId(s as u64 + 1),
+            q_start: tokens.len() as u32,
+            q_len: toks.len() as u32,
+            kv_len: start + toks.len() as u32,
+            block_table: table,
+            reduce,
+        });
+        tokens.extend_from_slice(toks);
+        positions.extend(start..start + toks.len() as u32);
+    }
+    exec.forward(&BatchInput {
+        tokens: &tokens,
+        positions: &positions,
+        seqs: &slices,
+        kv,
+    })?;
+    Ok(())
+}
+
+/// One (op, bytes, route) group of a case's collective calls on one rank.
+#[derive(Serialize)]
+struct CollGroup {
+    op: &'static str,
+    bytes: usize,
+    route: &'static str,
+    calls: u32,
+    /// From the later rank's arrival until this rank's call completed, summed.
+    transfer_ms: f64,
+    /// This rank waiting for the later one to arrive, summed.
+    peer_wait_ms: f64,
+}
+
+#[derive(Serialize)]
+struct TpCaseReport {
+    model: String,
+    tp: u32,
+    rank: u32,
+    case: String,
+    forward_ms: f64,
+    launch_ms: f64,
+    device_wait_ms: f64,
+    no_collectives_ms: f64,
+    no_rccl_ms: f64,
+    profiled_ms: f64,
+    /// Profiled collective ops (`tp_all_reduce`, `tp_all_gather`), peer wait included.
+    collective_ms: f64,
+    collective_transfer_ms: f64,
+    collective_peer_wait_ms: f64,
+    /// Profiled `gemm` and `moe_experts`.
+    gemm_ms: f64,
+    other_ms: f64,
+    collectives: Vec<CollGroup>,
+    ops: Vec<OpProfileEntry>,
+}
+
+const COLLECTIVE_OPS: [&str; 3] = ["tp_all_reduce", "tp_all_gather", "ep_combine"];
+
+/// The report of rank `rank`'s `case`; `peer` is the other rank's call list of the same case.
+fn tp_report(model: &str, tp: u32, rank: u32, case: &RankCase, peer: &[CollCall]) -> TpCaseReport {
+    let sum = |f: &dyn Fn(&str) -> bool| -> f64 {
+        case.profile
+            .entries
+            .iter()
+            .filter(|e| f(&e.op))
+            .map(|e| e.total_ms)
+            .sum()
+    };
+    let collective_ms = sum(&|op| COLLECTIVE_OPS.contains(&op));
+    let gemm_ms = sum(&|op| op == "gemm" || op == "moe_experts");
+    let profiled_ms = case.profile.total_ms();
+    assert!(
+        peer.is_empty() || peer.len() == case.calls.len(),
+        "{model} {}: rank {rank} made {} collective calls, its peer {}",
+        case.case,
+        case.calls.len(),
+        peer.len()
+    );
+    let mut groups: Vec<CollGroup> = Vec::new();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    for (i, c) in case.calls.iter().enumerate() {
+        let later = match peer.get(i) {
+            Some(p) => {
+                assert!(
+                    p.op == c.op && p.bytes == c.bytes,
+                    "{model} {}: call {i} differs across ranks",
+                    case.case
+                );
+                p.arrive.max(c.arrive)
+            }
+            None => c.arrive,
+        };
+        let transfer = ms(c.end.saturating_duration_since(later));
+        let wait = ms(later.saturating_duration_since(c.arrive));
+        match groups
+            .iter_mut()
+            .find(|g| g.op == c.op.as_str() && g.bytes == c.bytes && g.route == c.route)
+        {
+            Some(g) => {
+                g.calls += 1;
+                g.transfer_ms += transfer;
+                g.peer_wait_ms += wait;
+            }
+            None => groups.push(CollGroup {
+                op: c.op.as_str(),
+                bytes: c.bytes,
+                route: c.route,
+                calls: 1,
+                transfer_ms: transfer,
+                peer_wait_ms: wait,
+            }),
+        }
+    }
+    let mut ops = case.profile.entries.clone();
+    ops.sort_by(|a, b| b.total_ms.total_cmp(&a.total_ms));
+    TpCaseReport {
+        model: model.to_string(),
+        tp,
+        rank,
+        case: case.case.clone(),
+        forward_ms: case.forward_ms,
+        launch_ms: case.launch_ms,
+        device_wait_ms: case.device_wait_ms,
+        no_collectives_ms: case.no_collectives_ms,
+        no_rccl_ms: case.no_rccl_ms,
+        profiled_ms,
+        collective_ms,
+        collective_transfer_ms: groups.iter().map(|g| g.transfer_ms).sum(),
+        collective_peer_wait_ms: groups.iter().map(|g| g.peer_wait_ms).sum(),
+        gemm_ms,
+        other_ms: profiled_ms - collective_ms - gemm_ms,
+        collectives: groups,
+        ops,
+    }
+}
+
+fn print_tp_report(r: &TpCaseReport) {
+    let top: Vec<String> = r
+        .ops
+        .iter()
+        .take(6)
+        .map(|e| format!("{}/{}={:.3}x{}", e.op, e.r#impl, e.total_ms, e.calls))
+        .collect();
+    println!(
+        "tp_forward_profile_split: model={} tp={} rank={} case={} forward_ms={:.3} launch_ms={:.3} \
+         device_wait_ms={:.3} no_collectives_ms={:.3} no_rccl_ms={:.3} profiled_ms={:.3} \
+         collective_ms={:.3} (transfer {:.3}, peer_wait {:.3}) gemm_ms={:.3} other_ms={:.3} top=[{}]",
+        r.model,
+        r.tp,
+        r.rank,
+        r.case,
+        r.forward_ms,
+        r.launch_ms,
+        r.device_wait_ms,
+        r.no_collectives_ms,
+        r.no_rccl_ms,
+        r.profiled_ms,
+        r.collective_ms,
+        r.collective_transfer_ms,
+        r.collective_peer_wait_ms,
+        r.gemm_ms,
+        r.other_ms,
+        top.join(" ")
+    );
+    for g in &r.collectives {
+        println!(
+            "tp_forward_profile_collective: model={} rank={} case={} op={} bytes={} route={} \
+             calls={} transfer_us_per_call={:.1} peer_wait_us_per_call={:.1} transfer_ms={:.3}",
+            r.model,
+            r.rank,
+            r.case,
+            g.op,
+            g.bytes,
+            g.route,
+            g.calls,
+            1e3 * g.transfer_ms / f64::from(g.calls),
+            1e3 * g.peer_wait_ms / f64::from(g.calls),
+            g.transfer_ms
+        );
+    }
+    println!(
+        "tp_forward_profile: {}",
+        serde_json::to_string(r).expect("serialize the report")
+    );
+}
+
+/// What one rank thread hands back: its cases and the route of every profiled call.
+type RankRun = (Vec<RankCase>, Vec<&'static str>);
+
+/// Lab only (novanas, both R9700s; P5 Task 32): where a tensor-parallel (tp 2) step spends its
+/// time, for Llama-3.2-3B-Instruct and OLMoE-1B-7B-0125-Instruct. Per model it runs tp 1 on GPU 0
+/// for reference, then tp 2 on GPUs 0 and 1 (ranks as threads, `hostmem` with its RCCL delegate
+/// at the `auto` threshold, as `parallel.ranks.mode: local` serves) over a decode step of 16
+/// sequences at a 768-token context and one 2,048-token prefill chunk, each rank printing:
+///
+/// - the pipelined forward (median of 5, as served: no per-op synchronisation), its step stages
+///   (`launch`, `device_wait`), and the same forward with every collective skipped and with only
+///   the RCCL-routed ones skipped (wrong numbers, right timing of everything else: what a free
+///   collective would save);
+/// - the profiled forward (every op synchronised): collective, GEMM (`gemm`, `moe_experts`) and
+///   other time, the top ops, and every collective call grouped by (op, bytes, route) with its
+///   transfer time (from the later rank's arrival) and its wait for the peer.
+///
+/// Asserts only that both ranks issue the same calls and that every route the report names was
+/// counted by `turbine_collective_route_total`. Run with
+/// `scripts/lab-test.sh novanas --gpus 2 -- --release -p turbine-model --test perf -- tp_forward_profile --nocapture`.
+#[test]
+#[ignore = "needs two HIP devices, TURBINE_KERNEL_LIBRARY, RCCL, TURBINE_TEST_MODEL_DIR and TURBINE_TEST_MOE_MODEL_DIR"]
+fn tp_forward_profile() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let _watchdog = tp_watchdog("tp_forward_profile", Duration::from_secs(1800));
+    let dirs = [
+        require_env_dir("TURBINE_TEST_MODEL_DIR"),
+        require_env_dir("TURBINE_TEST_MOE_MODEL_DIR"),
+    ];
+    let ctxs = hip_contexts();
+    assert!(ctxs.len() >= 2, "two AMD devices, found {}", ctxs.len());
+    let lib = collective::registry()
+        .get("hostmem")
+        .expect("registered")
+        .load(None)
+        .expect("hostmem (with RCCL as the delegate)");
+    for dir in &dirs {
+        let cfg = load_model_config(dir).expect("config.json");
+        let model = dir
+            .file_name()
+            .map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into());
+        // tp 1 on GPU 0, for reference.
+        {
+            let mut exec = hip_decoder(&cfg, dir, &ctxs[0], ExecutorOptions::default(), PREFILL);
+            let mem: Arc<dyn DeviceMemory> = ctxs[0].clone();
+            for case in tp_rank_cases(&mut exec, &mem, cfg.vocab_size, None, None) {
+                print_tp_report(&tp_report(&model, 1, 0, &case, &[]));
+            }
+        }
+        // tp 2 on GPUs 0 and 1.
+        let registry = MetricsRegistry::new();
+        let metrics = CollectiveMetrics::register(&registry);
+        let id = lib.unique_id().expect("group id");
+        let barrier = Barrier::new(2);
+        let ranks: Vec<RankRun> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2u32)
+                .map(|rank| {
+                    let (lib, ctx, cfg, barrier, metrics) = (
+                        Arc::clone(&lib),
+                        &ctxs[rank as usize],
+                        &cfg,
+                        &barrier,
+                        &metrics,
+                    );
+                    scope.spawn(move || {
+                        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+                        // Makes this thread's current device the rank's (RCCL's init uses it).
+                        mem.mem_info().expect("device memory info");
+                        let inner = lib
+                            .open(CollectiveInit {
+                                rank: rank as usize,
+                                world: 2,
+                                unique_id: id,
+                                init_timeout: Duration::from_secs(120),
+                                op_timeout: Duration::from_secs(60),
+                                clock: Arc::new(SystemClock::new()),
+                                metrics: Some(metrics.clone()),
+                                memory: Some(Arc::clone(&mem)),
+                                route_max_bytes: None,
+                            })
+                            .expect("open the communicator");
+                        let coll = TimedCollective::new(inner, Arc::clone(&mem));
+                        let s = tp::ShardSpec { rank, world: 2 };
+                        let mut exec = tp_rank_decoder(
+                            cfg,
+                            dir,
+                            ctx,
+                            s,
+                            Arc::clone(&coll) as Arc<dyn Collective>,
+                        );
+                        let cases = tp_rank_cases(
+                            &mut exec,
+                            &mem,
+                            cfg.vocab_size,
+                            Some(&coll),
+                            Some(barrier),
+                        );
+                        let routes = cases
+                            .iter()
+                            .flat_map(|c| c.calls.iter().map(|k| k.route))
+                            .collect();
+                        (cases, routes)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("rank"))
+                .collect()
+        });
+        for (rank, (cases, _)) in ranks.iter().enumerate() {
+            let peer = &ranks[1 - rank].0;
+            for (case, other) in cases.iter().zip(peer) {
+                print_tp_report(&tp_report(&model, 2, rank as u32, case, &other.calls));
+            }
+        }
+        let text = registry.render().expect("render the collective metrics");
+        for line in text
+            .lines()
+            .filter(|l| l.starts_with("turbine_collective_route_total"))
+        {
+            println!("tp_forward_profile_route: model={model} {line}");
+        }
+        for route in ["hostmem", "rccl"] {
+            if ranks[0].1.contains(&route) {
+                assert!(
+                    text.contains(&format!("backend=\"{route}\"")),
+                    "{model}: the report names route {route}, the route metric never counted it"
                 );
             }
         }
