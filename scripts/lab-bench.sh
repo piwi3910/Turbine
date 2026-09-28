@@ -183,12 +183,21 @@ stop_server="if [ -f $pidf ]; then p=\$(cat $pidf); \
   if [ \"\$(cat /proc/\$p/comm 2>/dev/null)\" = turbine-server ]; then kill \$p; \
     for i in 1 2 3 4 5 6 7 8 9 10; do [ -d /proc/\$p ] || break; sleep 1; done; fi; \
   rm -f $pidf; fi"
-# Another run's server (live pid file) or anything else on the port: refuse, never kill it
-# (a leftover lab-bench server is stopped deliberately: kill "$(cat $pidf)" on the host).
-if ssh -o BatchMode=yes "$host" "ss -ltnH 'sport = :18000' | grep -q ."; then
-	echo "lab-bench: port 18000 on $host is already served (pid file $pidf: $(ssh -o BatchMode=yes "$host" "cat $pidf 2>/dev/null || echo none")); stop that server first" >&2
-	exit 1
-fi
+# Another run's server (live pid file) or anything else on the port: wait for it to go, up
+# to TURBINE_LAB_BENCH_PORT_WAIT seconds (default 3 h, naming the holder every 10 min), never
+# kill it (a leftover lab-bench server is stopped deliberately: kill "$(cat $pidf)" on the host).
+port_wait=${TURBINE_LAB_BENCH_PORT_WAIT:-10800}
+waited=0
+while ssh -o BatchMode=yes "$host" "ss -ltnH 'sport = :18000' | grep -q ."; do
+	holder=$(ssh -o BatchMode=yes "$host" "cat $pidf 2>/dev/null || echo none")
+	if ((waited >= port_wait)); then
+		echo "lab-bench: port 18000 on $host still served after ${waited}s (pid file $pidf: $holder); stop that server first" >&2
+		exit 1
+	fi
+	((waited % 600 == 0)) && echo "lab-bench: port 18000 on $host is served (pid file $pidf: $holder); waiting (${waited}s of ${port_wait}s)" >&2
+	sleep 60
+	waited=$((waited + 60))
+done
 ssh -o BatchMode=yes "$host" "rm -f $pidf"
 ssh -o BatchMode=yes "$host" "setsid bash -c \"echo \\\$\\\$ > $pidf; cd '$remote/src' && \
     LD_LIBRARY_PATH=/opt/rocm/rocm/lib:/opt/rocm/rocm/lib/rocm_sysdeps/lib \
