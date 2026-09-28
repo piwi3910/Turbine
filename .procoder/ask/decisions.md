@@ -1579,3 +1579,36 @@ Taken under "Continue through Phases 6a and 6b unattended (2026-09-29)" (rule 2:
 4. A decoder with some BF16 and some quantized linear layers requires both the GEMM and `qgemm` configs for each linear shape (the registry resolves a BF16 GEMM that a fully quantized model never calls). Alternative: per-layer requirements. **Provisional.**
 5. Tiny fixtures are written by each format (`WeightFormat::write_tiny`, test support in the format's file, as families' `write_tiny`), not by one writer in `testing/tiny.rs`; power-of-two scales so the dequantized twin is exact in BF16; static input scales differ per projection so the fused-stack max rule is tested. **Provisional.**
 
+## Phase 6a proof checkpoints downloaded on novanas (2026-09-29)
+
+Task 11, fixtures builder, under the approved downloads (user decision 2026-09-28, ≈ 41 GB, ≥ 60 GB free kept; floor raised to 70 GB by the coordinator on 2026-09-29). `hf download <repo> --revision <sha> --local-dir /home/piwi/turbine-models/<slug>`; the token stayed on the host. Every run exited 0; each directory holds `config.json` and every safetensors file the Hub lists. Free disk in bytes (`df -B1 /home/piwi`); two lanes ran at once, so an "after" can include the other lane's progress.
+
+| slug                              | repo                                                   | revision                                 | bytes (du)     | free before     | free after      |
+| --------------------------------- | ------------------------------------------------------ | ---------------------------------------- | -------------- | --------------- | --------------- |
+| llama-3.2-3b-instruct-fp8-dynamic | RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic             | c308a86de78778c5f904a1d82401ac85e18ca205 | 4,413,814,259  | 99,008,782,336  | 94,534,942,720  |
+| llama-3.2-3b-instruct-fp8         | RedHatAI/Llama-3.2-3B-Instruct-FP8                     | 377571d314b30f1d58448499e4100e2deafe7d7d | 4,404,163,249  | 92,897,808,384  | 87,486,226,432  |
+| llama-3.2-3b-instruct-fp8-block   | unsloth/Llama-3.2-3B-Instruct-FP8-Block                | 08cf804398b23fab4a1df02fbe8d4d5a11a800cc | 3,624,601,065  | 94,534,942,720  | 90,773,061,632  |
+| llama-3.2-3b-instruct-awq         | casperhansen/llama-3.2-3b-instruct-awq                 | 272b3bde867b606760447deb9a4d2719fbdfd3ae | 2,270,034,219  | 90,773,061,632  | 86,498,451,456  |
+| llama-3.2-3b-instruct-gptq        | shuyuej/Llama-3.2-3B-Instruct-GPTQ                     | dd5a311f040728fbc612eb03c8dadfae0a90552f | 2,264,970,345  | 87,486,226,432  | 82,073,235,456  |
+| llama-3.2-3b-mxfp4-a4             | matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq             | 91925ffda6977d097354a99718a20e035f8af80a | 2,303,041,140  | 86,498,451,456  | 80,744,726,528  |
+| llama-3.1-8b-instruct-mxfp4a16    | FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16 | 14c3aca849a72df8fcc8b3a30ab8d9eed86ee646 | 5,827,024,421  | 82,076,160,000  | 72,268,472,320  |
+| llama-3.1-8b-instruct             | unsloth/Llama-3.1-8B-Instruct                          | 4699cc75b550f9c6f3173fb80f4703b62d946aa5 | 16,077,901,654 | 132,625,727,488 | 116,133,445,632 |
+
+Total 41,185,550,352 bytes. The 8B BF16 download waited while free disk was ≈ 49 GB and ran after the cleanup (70 GB floor).
+
+**Fixture scripts (Task 11, fixtures builder), provisional, pending user review:**
+
+1. The dequantized reference copy rounds each decoded weight (computed in F32) to nearest-even BF16: exact for MXFP4, up to 2^-9 relative for FP8 and INT4 × scale. Alternative: an F32 copy with F32 quantized layers in the reference.
+2. Activation fake-quantization hooks run in F32 and hand BF16 back to the layer, which runs in BF16. Alternative: those linears in F32.
+3. F16 embeddings and norms of AWQ / GPTQ checkpoints are rounded to BF16 in the copy (as a BF16 transformers load).
+4. Unsupported variants (compressed-tensors asymmetric INT4, act-order `g_idx`) exit with an error; `hf_fp8` activations map dynamic → per token (per group 128 with blocks), static → per tensor.
+5. `dequantize_checkpoint.py` uses the CPU torch build; `quant_reference.py` keeps `hf_reference.py`'s exact pins.
+6. `--act-quant` defaults to `auto` (the checkpoint's scheme); an explicit different mode only warns.
+7. `quant_fixtures_valid` lists the 8B BF16 baseline slug; `yarn16` is left out (not quantized, 17 prompts).
+8. The reference's `model` field is `--model-name`, else the directory name (the checkpoints' `_name_or_path` is a local path); committed fixtures pass `--model-name <hub-id>`.
+
+**YaRN namespace (6a Task 27, YaRN builder, landed c848810 + 835d37d), provisional, pending user review:**
+
+1. `ModelIdentity` carries `rope_hash: [u8; 32]` (BLAKE3 of `ModelArchConfig::rope_identity()`) instead of the plan's `rope: String`, keeping `ModelIdentity` `Copy`; the namespace key is equivalent (its JSON is hashed).
+2. The model fingerprint does not include RoPE (lookups go through the namespace); alternative: fold it in, changing the fingerprint golden.
+3. `rope_hash` is always in the namespace JSON, so every cached key changes once (L2 is wiped at startup anyway).

@@ -1018,3 +1018,238 @@ mod phase8_eval_task_set {
         );
     }
 }
+
+/// Phase 6a (S-11): the golden fixture of every quantized proof checkpoint (and the 8B BF16
+/// baseline it is compared with) is complete: 16 reference records, the Llama tolerance keys and
+/// a README naming the checkpoint and the command that produced the reference. Slugs whose
+/// directory does not exist yet pass (each format task commits its own fixture).
+mod quant_fixtures {
+    use std::path::{Path, PathBuf};
+
+    use serde_json::Value;
+
+    /// Slugs of spec phase-6a Data with the Hub repository, the pinned revision and the fixture
+    /// script the README must name. `llama-3.2-3b-instruct-yarn16` is not listed: it is not a
+    /// quantized checkpoint and holds a 17th (long) prompt.
+    const QUANT_SLUGS: [(&str, &str, &str, &str); 8] = [
+        (
+            "llama-3.2-3b-instruct-fp8-dynamic",
+            "RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic",
+            "c308a86de78778c5f904a1d82401ac85e18ca205",
+            "quant_reference.py",
+        ),
+        (
+            "llama-3.2-3b-instruct-fp8",
+            "RedHatAI/Llama-3.2-3B-Instruct-FP8",
+            "377571d314b30f1d58448499e4100e2deafe7d7d",
+            "quant_reference.py",
+        ),
+        (
+            "llama-3.2-3b-instruct-fp8-block",
+            "unsloth/Llama-3.2-3B-Instruct-FP8-Block",
+            "08cf804398b23fab4a1df02fbe8d4d5a11a800cc",
+            "quant_reference.py",
+        ),
+        (
+            "llama-3.2-3b-instruct-awq",
+            "casperhansen/llama-3.2-3b-instruct-awq",
+            "272b3bde867b606760447deb9a4d2719fbdfd3ae",
+            "quant_reference.py",
+        ),
+        (
+            "llama-3.2-3b-instruct-gptq",
+            "shuyuej/Llama-3.2-3B-Instruct-GPTQ",
+            "dd5a311f040728fbc612eb03c8dadfae0a90552f",
+            "quant_reference.py",
+        ),
+        (
+            "llama-3.1-8b-instruct-mxfp4a16",
+            "FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16",
+            "14c3aca849a72df8fcc8b3a30ab8d9eed86ee646",
+            "quant_reference.py",
+        ),
+        (
+            "llama-3.1-8b-instruct",
+            "unsloth/Llama-3.1-8B-Instruct",
+            "4699cc75b550f9c6f3173fb80f4703b62d946aa5",
+            "hf_reference.py",
+        ),
+        (
+            "llama-3.2-3b-mxfp4-a4",
+            "matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq",
+            "91925ffda6977d097354a99718a20e035f8af80a",
+            "quant_reference.py",
+        ),
+    ];
+
+    fn golden_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden")
+    }
+
+    fn read_json(path: &Path) -> Result<Value, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Checks one fixture directory; `Err` names the first incomplete part.
+    fn check_fixture(
+        dir: &Path,
+        prompts_path: &Path,
+        tolerance_template: &Path,
+        repo: &str,
+        revision: &str,
+        script: &str,
+    ) -> Result<(), String> {
+        let name = dir.display();
+        let prompts = prompts(prompts_path)?;
+        if prompts.len() != 16 {
+            return Err(format!(
+                "{}: {} prompts, want 16",
+                prompts_path.display(),
+                prompts.len()
+            ));
+        }
+        let reference = dir.join("reference.jsonl");
+        let text = std::fs::read_to_string(&reference)
+            .map_err(|e| format!("{}: {e}", reference.display()))?;
+        let records: Vec<Value> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).map_err(|e| format!("{name}: reference line: {e}")))
+            .collect::<Result<_, _>>()?;
+        if records.len() != prompts.len() {
+            return Err(format!(
+                "{name}: reference.jsonl has {} records, want 16",
+                records.len()
+            ));
+        }
+        for (rec, (id, max_tokens)) in records.iter().zip(&prompts) {
+            if rec["id"].as_str() != Some(id.as_str()) {
+                return Err(format!(
+                    "{name}: record {} where prompt {id} is expected",
+                    rec["id"]
+                ));
+            }
+            let tokens = rec["tokens"].as_array().map_or(0, Vec::len);
+            let tops = rec["top_logprobs"].as_array().map_or(0, Vec::len);
+            if tokens as u64 != *max_tokens || tops != tokens {
+                return Err(format!(
+                    "{name}: {id} has {tokens} tokens and {tops} top_logprobs rows, want {max_tokens}"
+                ));
+            }
+            if rec["prompt_token_ids"].as_array().is_none_or(Vec::is_empty) {
+                return Err(format!("{name}: {id} has no prompt_token_ids"));
+            }
+        }
+        let want = read_json(tolerance_template)?;
+        let have = read_json(&dir.join("tolerance.json"))?;
+        let keys = want
+            .as_object()
+            .ok_or("tolerance template is not an object")?;
+        for key in keys.keys() {
+            if have.get(key).is_none_or(|v| !v.is_number()) {
+                return Err(format!("{name}: tolerance.json lacks numeric {key}"));
+            }
+        }
+        let readme = dir.join("README.md");
+        let readme =
+            std::fs::read_to_string(&readme).map_err(|e| format!("{}: {e}", readme.display()))?;
+        for needle in [repo, revision, script] {
+            if !readme.contains(needle) {
+                return Err(format!("{name}: README.md does not name {needle}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The prompts of `prompts.jsonl`: `(id, max_tokens)` in file order.
+    fn prompts(path: &Path) -> Result<Vec<(String, u64)>, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let v: Value = serde_json::from_str(l).map_err(|e| format!("prompts: {e}"))?;
+                match (v["id"].as_str(), v["max_tokens"].as_u64()) {
+                    (Some(id), Some(max)) => Ok((id.to_string(), max)),
+                    _ => Err(format!("prompts: bad line {l}")),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn quant_fixtures_valid() {
+        let root = golden_root();
+        let template = root.join("llama-3.2-3b-instruct/tolerance.json");
+        let mut failures = Vec::new();
+        for (slug, repo, revision, script) in QUANT_SLUGS {
+            let dir = root.join(slug);
+            if !dir.exists() {
+                continue;
+            }
+            let prompts = root.join("prompts.jsonl");
+            if let Err(e) = check_fixture(&dir, &prompts, &template, repo, revision, script) {
+                failures.push(e);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "incomplete fixtures:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// The checker itself: a complete fixture (built from the committed Llama one) passes, and
+    /// each incomplete variant fails naming what is missing. Breaks if a missing record, a
+    /// missing tolerance key or a README without the repo, revision or command slips through.
+    #[test]
+    fn quant_fixtures_valid_rejects_incomplete() {
+        let root = golden_root();
+        let prompts = root.join("prompts.jsonl");
+        let template = root.join("llama-3.2-3b-instruct/tolerance.json");
+        let (repo, rev, script) = (
+            "org/model",
+            "0123456789abcdef0123456789abcdef01234567",
+            "quant_reference.py",
+        );
+        let base =
+            std::env::temp_dir().join(format!("turbine-quant-fixture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let write = |name: &str, drop_record: bool, drop_key: bool, readme: &str| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let reference =
+                std::fs::read_to_string(root.join("llama-3.2-3b-instruct/reference.jsonl"))
+                    .unwrap();
+            let mut lines: Vec<&str> = reference.lines().collect();
+            if drop_record {
+                lines.pop();
+            }
+            std::fs::write(dir.join("reference.jsonl"), lines.join("\n") + "\n").unwrap();
+            let mut tol = read_json(&template).unwrap();
+            if drop_key {
+                tol.as_object_mut()
+                    .unwrap()
+                    .remove("max_abs_logprob_diff_tail_batched");
+            }
+            std::fs::write(dir.join("tolerance.json"), tol.to_string()).unwrap();
+            std::fs::write(dir.join("README.md"), readme).unwrap();
+            dir
+        };
+        let full = format!("`{repo}` at `{rev}`: `uv run scripts/golden/{script} …`");
+        let check = |dir: &Path| check_fixture(dir, &prompts, &template, repo, rev, script);
+
+        assert_eq!(check(&write("ok", false, false, &full)), Ok(()));
+        let e = check(&write("short", true, false, &full)).unwrap_err();
+        assert!(e.contains("15 records"), "{e}");
+        let e = check(&write("key", false, true, &full)).unwrap_err();
+        assert!(e.contains("max_abs_logprob_diff_tail_batched"), "{e}");
+        let e = check(&write("rev", false, false, &format!("`{repo}`, {script}"))).unwrap_err();
+        assert!(e.contains(rev), "{e}");
+        let e = check(&write("cmd", false, false, &format!("`{repo}` at `{rev}`"))).unwrap_err();
+        assert!(e.contains(script), "{e}");
+        let e = check(&base.join("absent")).unwrap_err();
+        assert!(e.contains("reference.jsonl"), "{e}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
