@@ -1701,9 +1701,13 @@ fn hostmem_repro_pageable_d2h() {
 /// Rounds of [`hostmem_stress_collectives`] for a message of `elems` elements: the base count
 /// (`TURBINE_STRESS_ROUNDS`, default 5), ×20 up to 64 Ki elements, ×4 up to 1 Mi.
 fn stress_rounds(elems: usize) -> u64 {
+    // The environment, else an uncommitted scripts/lab/stress-rounds.local (lab Jobs pass no
+    // environment through), else 5.
+    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lab/stress-rounds.local");
     let base: u64 = std::env::var("TURBINE_STRESS_ROUNDS")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .or_else(|| std::fs::read_to_string(local).ok())
+        .and_then(|v| v.trim().parse().ok())
         .unwrap_or(5);
     match elems {
         0..=65_537 => base * 20,
@@ -1727,11 +1731,12 @@ fn hostmem_stress_collectives() {
         return;
     }
     let _serial = lab_serial();
+    // Scaled with the rounds: about 50 s per base round, at least 30 min.
     let limit = Duration::from_secs(
         std::env::var("TURBINE_STRESS_TIMEOUT_S")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1800),
+            .unwrap_or(1800.max(stress_rounds(u32::MAX as usize) * 120)),
     );
     let _watchdog = watchdog("hostmem_stress_collectives", limit);
     let mems = devices();
