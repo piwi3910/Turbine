@@ -10,6 +10,7 @@ pub mod budget;
 pub mod chat_template;
 pub mod config;
 pub mod conformance;
+pub mod ep;
 pub mod executor;
 pub mod families;
 pub mod formats;
@@ -36,6 +37,7 @@ pub use config::MoeConfig;
 pub use config::{
     GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config, load_model_config,
 };
+pub use ep::EpContext;
 pub use families::{FamilyConfig, FamilyRef, ModelFamily, llama_slots, mixtral_slots, olmoe_slots};
 pub use formats::{BoundToolFormat, HermesParser, Llama3JsonParser, MistralParser, ToolFormat};
 pub use generate::{GenerateOptions, Generation, generate};

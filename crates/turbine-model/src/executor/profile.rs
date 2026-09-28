@@ -29,6 +29,9 @@ pub const MOE_ZERO: &str = "moe_zero";
 /// Tensor parallelism: an all-reduce of the rank's partial sums (embedding, O and down
 /// projections, sharded norms); implementation: the collective backend.
 pub const TP_ALL_REDUCE: &str = "tp_all_reduce";
+/// Expert parallelism at tp = 1: the all-reduce combining the ranks' MoE outputs;
+/// implementation: the collective backend.
+pub const EP_COMBINE: &str = "ep_combine";
 /// Tensor parallelism: the all-gather of the ranks' LM-head shards; implementation: the
 /// collective backend.
 pub const TP_ALL_GATHER: &str = "tp_all_gather";

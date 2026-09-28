@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
-use turbine_distributed::collective::ReduceOp;
+use turbine_distributed::collective::{Collective, ReduceOp};
 use turbine_distributed::tp::{ShardSpec, vocab_shard};
 use turbine_kernels::{
     AddRmsnormConfig, AddRmsnormContext, AttentionConfig, AttentionKind, ElementwiseConfig,
@@ -58,7 +58,7 @@ use turbine_kernels::{
     KernelRegistry, NormConfig, NormContext, OpConfig, OpRequirement, PagedAttentionContext,
     RopeConfig, RopeContext,
 };
-use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, Tensor, TensorView};
+use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, StreamRef, Tensor, TensorView};
 
 use super::batch::{self, BatchLimits, DeviceBatch, HostBatch, Packed};
 use super::graphs::{self, DecodeGraphs, GraphCounters, GraphKey, PoolId};
@@ -70,6 +70,7 @@ use super::{
 };
 use crate::ModelError;
 use crate::config::{ModelArchConfig, MoeConfig};
+use crate::ep::{EpContext, EpDims};
 use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name};
 use crate::tp::{TpContext, rank_config};
 
@@ -103,7 +104,7 @@ impl std::fmt::Debug for DecoderSpec {
 }
 
 /// Model dimensions in elements, and what the hooks read of the configuration.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DecoderDims {
     pub hidden: usize,
     pub heads: usize,
@@ -131,6 +132,9 @@ pub struct DecoderDims {
     /// A tensor-parallel rank's place in its group (the widths above are then the rank's);
     /// `None` on one device.
     pub tp: Option<TpDims>,
+    /// An expert-parallel rank's experts and counts ([`crate::ep`]); `None` without expert
+    /// parallelism.
+    pub ep: Option<Arc<EpDims>>,
 }
 
 /// What a tensor-parallel rank's dims add ([`DecoderDims::for_shard`]).
@@ -167,6 +171,7 @@ impl DecoderDims {
             moe: cfg.moe,
             vocab_rows: cfg.vocab_size as usize,
             tp: None,
+            ep: None,
         }
     }
 
@@ -362,6 +367,13 @@ pub trait FfnHook: Send + Sync {
         let _ = (d, registry, rows);
         true
     }
+    /// After a step's logits are collected (the stream synchronised; never while another
+    /// launch is in flight): e.g. read back what the step's buffers recorded. Nothing by
+    /// default.
+    fn collected(&self, d: &DecoderDims, buffers: &HookBuffers) -> Result<(), ModelError> {
+        let _ = (d, buffers);
+        Ok(())
+    }
 }
 
 /// One decoder layer's forward, as the hooks see it: its dimensions, the registry, the row
@@ -439,6 +451,13 @@ impl LayerRun<'_> {
     /// dtype, BF16 or F32); nothing on one device.
     pub fn all_reduce(&self, view: &TensorView<'_>) -> Result<(), ModelError> {
         self.exec.all_reduce(view)
+    }
+
+    /// Expert parallelism: sums the rank's MoE output `view` across the EP group in place (the
+    /// combine); nothing without expert parallelism or at tp = ep (the tensor-parallel
+    /// all-reduce after the FFN combines).
+    pub fn ep_combine(&self, view: &TensorView<'_>) -> Result<(), ModelError> {
+        self.exec.ep_combine(view)
     }
 
     /// Tensor parallelism: the F32 `[2 · max_batch_tokens]` scratch a sharded norm keeps its
@@ -531,6 +550,8 @@ pub struct DecoderExecutor {
     cfg: ModelArchConfig,
     /// The rank's collectives, when tensor-parallel.
     tp: Option<TpContext>,
+    /// The rank's experts and combine, when expert-parallel.
+    ep: Option<EpContext>,
     tp_bufs: Option<TpBuffers>,
     spec: DecoderSpec,
     dims: DecoderDims,
@@ -605,14 +626,13 @@ impl DecoderExecutor {
     }
 
     /// The requirements of dims `d` over the KV layout of `cfg` (the rank's configuration).
-    fn requirements_of(
+    pub(crate) fn requirements_of(
         cfg: &ModelArchConfig,
         d: &DecoderDims,
         spec: &DecoderSpec,
         block_tokens: u32,
         opts: ExecutorOptions,
     ) -> Vec<OpRequirement> {
-        let d = *d;
         let act = d.act;
         let mut specs = vec![
             OpConfig::Embedding(d.embedding()),
@@ -630,7 +650,7 @@ impl DecoderExecutor {
                 OpConfig::Gemm(d.gemm(d.kv_dim, d.hidden, act)),
             ]);
         }
-        specs.extend(spec.attention.requirements(&d));
+        specs.extend(spec.attention.requirements(d));
         specs.extend([
             OpConfig::Rope(d.rope()),
             OpConfig::Attention(d.attention(AttentionKind::PrefillPaged, block_tokens)),
@@ -641,7 +661,7 @@ impl DecoderExecutor {
         if opts.fused_ops {
             specs.push(OpConfig::AddRmsnorm(d.add_norm()));
         }
-        specs.extend(spec.ffn.requirements(&d, opts));
+        specs.extend(spec.ffn.requirements(d, opts));
         specs.extend([
             OpConfig::Gemm(d.gemm(d.vocab_rows, d.hidden, DType::F32)),
             OpConfig::CopyBlocks(batch::copy_config(&cfg.kv_layout(block_tokens))),
@@ -689,20 +709,21 @@ impl DecoderExecutor {
         Ok(Self::workspace_of(&rank, &d, spec, limits) + tp)
     }
 
-    fn workspace_of(
+    /// [`DecoderExecutor::workspace_bytes`] of dims `d` over the batch limits of `cfg` (the
+    /// rank's configuration).
+    pub(crate) fn workspace_of(
         cfg: &ModelArchConfig,
         d: &DecoderDims,
         spec: &DecoderSpec,
         limits: ExecutorLimits,
     ) -> u64 {
-        let d = *d;
         let es = d.act.size_bytes() as u64;
         let f32 = DType::F32.size_bytes() as u64;
         let per_token = es * (3 * d.hidden + 2 * d.q_dim + 2 * d.kv_dim) as u64;
         let per_seq = es * d.hidden as u64;
         let t = limits.max_batch_tokens;
         u64::from(t) * per_token
-            + spec.ffn.workspace_bytes(&d, t as usize)
+            + spec.ffn.workspace_bytes(d, t as usize)
             + u64::from(limits.max_seqs) * per_seq
             + LogitsHead::bytes(d.vocab, limits.max_seqs as usize)
             + f32 * (d.head_dim / 2) as u64
@@ -736,14 +757,48 @@ impl DecoderExecutor {
     pub fn new_tp(
         cfg: &ModelArchConfig,
         spec: DecoderSpec,
-        mut weights: LoadedWeights,
+        weights: LoadedWeights,
         registry: Arc<KernelRegistry>,
         mem: Arc<dyn DeviceMemory>,
         limits: ExecutorLimits,
         opts: ExecutorOptions,
         tp: Option<TpContext>,
     ) -> Result<DecoderExecutor, ModelError> {
+        Self::new_parallel(cfg, spec, weights, registry, mem, limits, opts, tp, None)
+    }
+
+    /// [`DecoderExecutor::new_tp`] as rank `ep.rank` of an expert-parallel group too
+    /// ([`crate::ep`]; `None`: no expert parallelism, exactly `new_tp`): `weights` are the rank's
+    /// ([`crate::ep::weight_slots`]) and `registry` was built from
+    /// [`crate::ep::requirements`]. `tp` is `None` (attention replicated) or the
+    /// tensor-parallel rank of the same position in a group over the same ranks (tp = ep).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_parallel(
+        cfg: &ModelArchConfig,
+        spec: DecoderSpec,
+        mut weights: LoadedWeights,
+        registry: Arc<KernelRegistry>,
+        mem: Arc<dyn DeviceMemory>,
+        limits: ExecutorLimits,
+        opts: ExecutorOptions,
+        tp: Option<TpContext>,
+        ep: Option<EpContext>,
+    ) -> Result<DecoderExecutor, ModelError> {
         let shard = tp.as_ref().map(TpContext::shard);
+        if let Some(e) = &ep
+            && (e.collective.world_size() != e.world as usize
+                || e.collective.rank() != e.rank as usize
+                || shard.is_some_and(|s| (s.rank, s.world) != (e.rank, e.world)))
+        {
+            return Err(invalid(format!(
+                "expert-parallel rank {} of {} over a communicator of rank {} of {} and \
+                 tensor-parallel shard {shard:?}",
+                e.rank,
+                e.world,
+                e.collective.rank(),
+                e.collective.world_size()
+            )));
+        }
         if let Some(t) = &tp
             && (t.collective.world_size() != t.world as usize
                 || t.collective.rank() != t.rank as usize)
@@ -772,7 +827,23 @@ impl DecoderExecutor {
             )));
         }
         check_weight_format(cfg)?;
-        let d = DecoderDims::for_shard(cfg, shard)?;
+        let d = match &ep {
+            Some(e) => crate::ep::rank_dims(
+                cfg,
+                crate::ep::EpShard {
+                    rank: e.rank,
+                    world: e.world,
+                    attention: if shard.is_some() {
+                        crate::ep::EpAttention::TensorParallel
+                    } else {
+                        crate::ep::EpAttention::Replicated
+                    },
+                },
+                &e.placement,
+                &e.counts,
+            )?,
+            None => DecoderDims::for_shard(cfg, shard)?,
+        };
         spec.ffn.check(&d)?;
         let qkv = Split {
             cols: [d.q_dim, d.kv_dim, d.kv_dim],
@@ -841,6 +912,7 @@ impl DecoderExecutor {
             graphs: None,
             cfg: cfg.clone(),
             tp,
+            ep,
             tp_bufs,
             spec,
             dims: d,
@@ -891,14 +963,14 @@ impl DecoderExecutor {
     /// synchronisation and timed into the profile returned by
     /// [`DecoderExecutor::take_profile`]. Disabling drops what was recorded. Off by default.
     pub fn set_profile(&mut self, on: bool) {
-        let mut reqs = Self::requirements_for(
-            &self.cfg,
-            &self.spec,
-            self.kv_layout.block_tokens,
-            self.opts,
-            self.tp.as_ref().map(TpContext::shard),
-        )
-        .unwrap_or_default();
+        let shard = self.tp.as_ref().map(TpContext::shard);
+        let rank = shard.map_or(Ok(self.cfg.clone()), |s| rank_config(&self.cfg, s));
+        let mut reqs = rank
+            .map(|rank| {
+                let block_tokens = self.kv_layout.block_tokens;
+                Self::requirements_of(&rank, &self.dims, &self.spec, block_tokens, self.opts)
+            })
+            .unwrap_or_default();
         reqs.push(logits::reduce_requirement(&self.cfg));
         self.profiler.set(on, &self.registry, &reqs);
     }
@@ -978,9 +1050,21 @@ impl DecoderExecutor {
     /// Tensor parallelism: sums the contiguous `view` (BF16 or F32) across the group in place,
     /// on the rank's stream; nothing on one device.
     fn all_reduce(&self, view: &TensorView<'_>) -> Result<(), ModelError> {
-        let Some(tp) = &self.tp else {
-            return Ok(());
-        };
+        match &self.tp {
+            Some(tp) => self.reduce_on(profile::TP_ALL_REDUCE, &tp.collective, &tp.stream, view),
+            None => Ok(()),
+        }
+    }
+
+    /// Sums the contiguous `view` (BF16 or F32) across `collective`'s ranks in place, on
+    /// `stream`, timed as `op`.
+    fn reduce_on(
+        &self,
+        op: &'static str,
+        collective: &Arc<dyn Collective>,
+        stream: &StreamRef,
+        view: &TensorView<'_>,
+    ) -> Result<(), ModelError> {
         if view.slice.len() != view.numel() * view.dtype.size_bytes() {
             return Err(invalid(format!(
                 "all-reduce of a non-contiguous view {:?} strides {:?}",
@@ -989,16 +1073,31 @@ impl DecoderExecutor {
             )));
         }
         let (mut slice, dtype) = (view.slice, view.dtype);
-        self.profiler.step(
-            self.mem.as_ref(),
-            profile::TP_ALL_REDUCE,
-            tp.collective.backend(),
-            || {
-                Ok(tp
-                    .collective
-                    .all_reduce(&mut slice, dtype, ReduceOp::Sum, &tp.stream)?)
-            },
-        )
+        self.profiler
+            .step(self.mem.as_ref(), op, collective.backend(), || {
+                Ok(collective.all_reduce(&mut slice, dtype, ReduceOp::Sum, stream)?)
+            })
+    }
+
+    /// Expert parallelism at tp = 1: sums the rank's MoE output across the EP group (the
+    /// combine). Nothing without expert parallelism, and nothing at tp = ep, where the
+    /// tensor-parallel all-reduce after the FFN combines the ranks' experts.
+    fn ep_combine(&self, view: &TensorView<'_>) -> Result<(), ModelError> {
+        match (&self.ep, &self.tp) {
+            (Some(ep), None) => {
+                self.reduce_on(profile::EP_COMBINE, &ep.collective, &ep.stream, view)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The communicator bounding each step's collectives: tensor parallelism's, else expert
+    /// parallelism's; `None` on one device.
+    fn group(&self) -> Option<&Arc<dyn Collective>> {
+        self.tp
+            .as_ref()
+            .map(|t| &t.collective)
+            .or(self.ep.as_ref().map(|e| &e.collective))
     }
 
     /// Tensor parallelism: the LM head of the `n` final-norm rows over this rank's vocabulary
@@ -1315,9 +1414,9 @@ impl ModelExecutor for DecoderExecutor {
         self.collect()
     }
 
-    /// Never for a tensor-parallel rank: its collectives run inside the launch.
+    /// Never for a tensor- or expert-parallel rank: its collectives run inside the launch.
     fn overlaps(&self) -> bool {
-        self.tp.is_none() && self.head.overlaps() && self.meta.is_async()
+        self.group().is_none() && self.head.overlaps() && self.meta.is_async()
     }
 
     fn launch(&mut self, batch: &BatchInput<'_>, feeds: &[TokenFeed]) -> Result<(), ModelError> {
@@ -1362,9 +1461,9 @@ impl ModelExecutor for DecoderExecutor {
         )?;
         self.head.upload_inputs()?;
         let launch_started = Instant::now();
-        if let Some(tp) = &self.tp {
+        if let Some(group) = self.group() {
             // Bounds the step's collectives until `collect` has synchronised the stream.
-            tp.collective.step_begin();
+            group.step_begin();
         }
         let mut graphs = self.graphs.take();
         let enqueued = match graphs.as_mut() {
@@ -1374,9 +1473,9 @@ impl ModelExecutor for DecoderExecutor {
             None => self.enqueue(&p, batch.kv, &order, &runs),
         };
         self.graphs = graphs;
-        if let (Err(_), Some(tp)) = (&enqueued, &self.tp) {
+        if let (Err(_), Some(group)) = (&enqueued, self.group()) {
             // The step is abandoned: close its bound (the error that ended it is returned).
-            let _ = tp.collective.step_end();
+            let _ = group.step_end();
         }
         enqueued?;
         // The step's one device-to-host read, after the device reduction of the rows that
@@ -1390,14 +1489,16 @@ impl ModelExecutor for DecoderExecutor {
         let wait_started = Instant::now();
         let launch = self.launches.pop_front().unwrap_or_default();
         let logits = self.head.collect(&self.profiler, self.mem.as_ref());
-        if let Some(tp) = &self.tp {
+        if let Some(group) = self.group() {
             // The read synchronised the stream: the step's collectives are complete.
-            let ended = tp.collective.step_end();
+            let ended = group.step_end();
             if logits.is_ok() {
                 ended?;
             }
         }
         let logits = logits?;
+        // E.g. expert parallelism's token counts, read after the step's synchronisation.
+        self.spec.ffn.collected(&self.dims, &self.ffn_buffers)?;
         self.timings = ForwardTimings {
             launch,
             device_wait: wait_started.elapsed(),
@@ -1405,13 +1506,18 @@ impl ModelExecutor for DecoderExecutor {
         Ok(logits)
     }
 
-    /// Ignored (graphs stay off) for a tensor-parallel rank: its collectives are not captured.
+    /// Ignored (graphs stay off) for a tensor- or expert-parallel rank: its collectives are not
+    /// captured.
     fn set_decode_graphs(&mut self, graphs: Option<DecodeGraphs>) {
-        if self.tp.is_some() && graphs.is_some() {
+        if self.group().is_some() && graphs.is_some() {
             tracing::info!(
                 event = "decode_graphs_off",
-                reason = "tensor_parallel",
-                "decode graphs are not captured under tensor parallelism"
+                reason = if self.tp.is_some() {
+                    "tensor_parallel"
+                } else {
+                    "expert_parallel"
+                },
+                "decode graphs are not captured under tensor or expert parallelism"
             );
             return;
         }
