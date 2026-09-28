@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::buffer::{DevicePtr, MemoryError};
+use crate::buffer::{DevicePtr, MemoryError, StreamRef};
 use crate::dtype::DType;
 
 /// One mapped allocation, seen from the host. Implemented by the backend that allocated it;
@@ -199,6 +199,26 @@ pub trait MappedCollectives: Send + Sync {
         Err(MemoryError::Unsupported(
             "device-sequenced mapped collective steps (kernel ABI v2.8)".into(),
         ))
+    }
+    /// A second stream of this device for collectives that overlap the compute stream's work
+    /// (tensor-parallel prefill overlap, P5 Task 32), with [`MappedCollectives::side_after_compute`],
+    /// [`MappedCollectives::side_mark`] and [`MappedCollectives::compute_after_mark`] ordering
+    /// the two. `Unsupported` without one.
+    fn side_stream(&self) -> Result<StreamRef, MemoryError> {
+        Err(MemoryError::Unsupported("a collective side stream".into()))
+    }
+    /// Work enqueued on the side stream from now on waits for the compute stream's work so far.
+    fn side_after_compute(&self) -> Result<(), MemoryError> {
+        Err(MemoryError::Unsupported("a collective side stream".into()))
+    }
+    /// A mark after the side stream's work so far.
+    fn side_mark(&self) -> Result<u64, MemoryError> {
+        Err(MemoryError::Unsupported("a collective side stream".into()))
+    }
+    /// Work enqueued on the compute stream from now on waits for the side stream up to `mark`.
+    fn compute_after_mark(&self, mark: u64) -> Result<(), MemoryError> {
+        let _ = mark;
+        Err(MemoryError::Unsupported("a collective side stream".into()))
     }
     /// True while the compute stream is being captured into a graph (only capturable steps may
     /// be enqueued then: the device-sequenced ones).

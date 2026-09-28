@@ -282,6 +282,8 @@ pub struct PreparedModel {
     pub executor_options: ExecutorOptions,
     /// `execution.decode_graphs`, and the provider can capture graphs.
     pub decode_graphs: bool,
+    /// `parallel.tp_prefill_overlap` on a tensor-parallel rank (P5 Task 32).
+    pub tp_prefill_overlap: bool,
     /// `execution.overlap_scheduling` (P2c): the engine launches each iteration before the host
     /// work of the previous one, when the executor can.
     pub overlap_scheduling: bool,
@@ -691,6 +693,7 @@ fn prepare_with(
         scheduler,
         executor_options,
         decode_graphs,
+        tp_prefill_overlap: config.parallel.tp_prefill_overlap && tensor_parallel,
         overlap_scheduling: config.execution.overlap_scheduling && !tensor_parallel,
         grammar,
         structured_output: config.structured_output.clone(),
@@ -920,6 +923,11 @@ pub(crate) fn install_decode_graphs(prepared: &PreparedModel, executor: &mut dyn
         let capacity = graphs::capacity_for(prepared.scheduler.max_running_requests);
         executor.set_decode_graphs(Some(DecodeGraphs::new(backend, capacity)));
         tracing::info!(event = "decode_graphs", capacity, "decode graphs on");
+    }
+    if prepared.tp_prefill_overlap {
+        executor.set_prefill_overlap(Some(
+            turbine_model::executor::decoder::PREFILL_OVERLAP_MIN_TOKENS,
+        ));
     }
 }
 

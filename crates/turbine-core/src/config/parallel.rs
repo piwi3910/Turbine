@@ -52,6 +52,10 @@ pub struct ParallelConfig {
     /// `execution.decode_graphs`), their collectives inside (P5 Task 32; the `hostmem` backend
     /// needs kernel ABI v2.8). Default off until benched.
     pub tp_decode_graphs: bool,
+    /// Tensor-parallel ranks split large prefills in two halves whose all-reduces run on a
+    /// second stream while the other half computes (P5 Task 32; same results). Default off
+    /// until benched.
+    pub tp_prefill_overlap: bool,
 }
 
 /// `parallel.pipeline`.
@@ -146,6 +150,7 @@ impl Default for ParallelConfig {
             expert: ExpertConfig::default(),
             topology: TopologyConfig::default(),
             tp_decode_graphs: false,
+            tp_prefill_overlap: false,
         }
     }
 }

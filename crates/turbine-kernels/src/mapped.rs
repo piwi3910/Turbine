@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use turbine_tensor::{
-    DevicePtr, MappedCollectives, MappedDma, MappedHost, MappedKind, MappedReduce, MappedRegion,
-    MappedStep, MemoryError,
+    DeviceMemory, DevicePtr, MappedCollectives, MappedDma, MappedHost, MappedKind, MappedReduce,
+    MappedRegion, MappedStep, MemoryError, StreamRef,
 };
 
 use crate::ffi::{MappedCollectiveDesc, MappedDmaDesc, MappedFns};
@@ -241,6 +241,36 @@ impl MappedCollectives for ShimContext {
 
     fn mapped_capturing(&self) -> bool {
         self.is_capturing()
+    }
+
+    fn side_stream(&self) -> Result<StreamRef, MemoryError> {
+        let tp = self.library().syms().v21.tensor_parallel.ok_or_else(|| {
+            MemoryError::Unsupported("native stream handles (kernel ABI v2.6)".into())
+        })?;
+        let (stream, _) = self.collective_copy_resources()?;
+        let mut native: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `stream` is this context's live copy stream (owned by its pinned state until the
+        // context is destroyed); the shim only writes its handle into the live out-pointer.
+        let code = unsafe { (tp.stream_native_handle)(self.raw_ctx(), stream, &mut native) };
+        self.mapped_check(code)?;
+        let owner: Arc<dyn DeviceMemory> = self.owning_arc();
+        Ok(StreamRef::new(
+            native as u64,
+            DeviceMemory::device(self),
+            owner,
+        ))
+    }
+
+    fn side_after_compute(&self) -> Result<(), MemoryError> {
+        ShimContext::side_after_compute(self)
+    }
+
+    fn side_mark(&self) -> Result<u64, MemoryError> {
+        ShimContext::side_mark(self)
+    }
+
+    fn compute_after_mark(&self, mark: u64) -> Result<(), MemoryError> {
+        ShimContext::compute_after_mark(self, mark)
     }
 
     fn mapped_dma_supported(&self) -> bool {
