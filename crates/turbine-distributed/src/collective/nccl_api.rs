@@ -22,7 +22,14 @@ pub struct NcclFlavor {
     /// File-name prefix identifying this library (`librccl`); a file named for another flavor
     /// is refused.
     pub file_prefix: &'static str,
-    /// Default locations, searched in order when no explicit path is configured.
+    /// An environment variable naming the vendor install root (`TURBINE_ROCM_PATH`): when set,
+    /// `<root>/lib/<file>` is searched first. ROCm keeps RCCL's device code in `<root>/.kpack`
+    /// next to the real `lib` directory, so a library opened through a symlinked or bind-mounted
+    /// `lib` (as the lab containers mount `/opt/rocm/rocm/lib`) finds no kernel for the GPU
+    /// ("invalid device function").
+    pub root_env: Option<(&'static str, &'static str)>,
+    /// Default locations, searched in order after the root, when no explicit path is
+    /// configured.
     pub defaults: &'static [&'static str],
     /// The explicit library key of the `parallel` section (`parallel.rccl_library`).
     pub configured: fn(&ParallelConfig) -> Option<&Path>,
@@ -43,6 +50,7 @@ pub static RCCL_FLAVOR: NcclFlavor = NcclFlavor {
     name: "rccl",
     vendor: Vendor::Amd,
     file_prefix: "librccl",
+    root_env: Some(("TURBINE_ROCM_PATH", "librccl.so.1")),
     defaults: &[
         "/opt/rocm/lib/librccl.so.1",
         "/opt/rocm/rocm/lib/librccl.so.1",
@@ -57,6 +65,7 @@ pub static NCCL_FLAVOR: NcclFlavor = NcclFlavor {
     name: "nccl",
     vendor: Vendor::Nvidia,
     file_prefix: "libnccl",
+    root_env: None,
     defaults: &["libnccl.so.2"],
     min_version: NCCL_MIN_VERSION,
     configured: |cfg| cfg.nccl_library.as_deref(),

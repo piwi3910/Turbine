@@ -153,11 +153,18 @@ impl NcclApi {
             return NcclApi::load_from(path, flavor);
         }
         let mut tried = Vec::new();
-        for candidate in flavor.defaults {
-            match open(Path::new(candidate)) {
+        let rooted = flavor.root_env.and_then(|(var, file)| {
+            let root = std::env::var_os(var).filter(|v| !v.is_empty())?;
+            Some(PathBuf::from(root).join("lib").join(file))
+        });
+        let candidates = rooted
+            .into_iter()
+            .chain(flavor.defaults.iter().map(PathBuf::from));
+        for candidate in candidates {
+            match open(&candidate) {
                 // A library that loads but fails the binding checks is reported as such,
                 // not skipped in favour of the next candidate.
-                Ok(lib) => return bind(lib, Path::new(candidate), flavor),
+                Ok(lib) => return bind(lib, &candidate, flavor),
                 Err(e) => tried.push(e),
             }
         }

@@ -463,6 +463,11 @@ fn main() -> ExitCode {
         Ok(lib) => lib,
         Err(e) => return failure(e),
     };
+    eprintln!(
+        "turbine-collbench: backend {} {}",
+        lib.backend(),
+        lib.version().unwrap_or_default()
+    );
     let inventory = if on_device {
         match turbine_device::discover(&Default::default()) {
             Ok(inv) => Some(inv),
