@@ -15,6 +15,7 @@ use turbine_core::types::{DeviceId, Vendor};
 
 use crate::inventory::{BackendReport, BackendStatus, DeviceInfo, DeviceInventory, DiscoveryError};
 use crate::telemetry::VendorTelemetry;
+use crate::topology::{AmdSmiTopology, NvmlTopology, TopologyVendor};
 
 /// Library names searched by the platform loader when no explicit path is configured.
 const NVML_DEFAULT_LIBRARY: &str = "libnvidia-ml.so.1";
@@ -79,6 +80,9 @@ pub trait DiscoveryKind: Module {
     /// The live telemetry backend (P3 vendor tick) over the same library, or why it cannot
     /// load (its devices then stay `unavailable`).
     fn telemetry(&self, opts: &DiscoveryOptions) -> Result<Box<dyn VendorTelemetry>, String>;
+    /// The vendor topology source (P5 S-1: GPU↔GPU links, peer access, coherent host links)
+    /// over the same library, or why it cannot load (its values then stay `unknown`).
+    fn topology(&self, opts: &DiscoveryOptions) -> Result<Box<dyn TopologyVendor>, String>;
 }
 
 struct NvmlKind;
@@ -106,6 +110,12 @@ impl DiscoveryKind for NvmlKind {
         let t = crate::telemetry::nvml::NvmlTelemetry::open(self.configured_library(opts))?;
         Ok(Box::new(t))
     }
+    fn topology(&self, opts: &DiscoveryOptions) -> Result<Box<dyn TopologyVendor>, String> {
+        let library = self
+            .configured_library(opts)
+            .unwrap_or(Path::new(NVML_DEFAULT_LIBRARY));
+        Ok(Box::new(NvmlTopology::open(library)?))
+    }
 }
 
 struct AmdSmiKind;
@@ -132,6 +142,12 @@ impl DiscoveryKind for AmdSmiKind {
     fn telemetry(&self, opts: &DiscoveryOptions) -> Result<Box<dyn VendorTelemetry>, String> {
         let t = crate::telemetry::amd_smi::AmdSmiTelemetry::open(self.configured_library(opts))?;
         Ok(Box::new(t))
+    }
+    fn topology(&self, opts: &DiscoveryOptions) -> Result<Box<dyn TopologyVendor>, String> {
+        let library = self
+            .configured_library(opts)
+            .unwrap_or(Path::new(AMD_SMI_DEFAULT_LIBRARY));
+        Ok(Box::new(AmdSmiTopology::open(library)?))
     }
 }
 

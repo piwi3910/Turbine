@@ -19,6 +19,8 @@ turbine-observability.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# Captures the topology WARN lines in unit tests
+tracing-subscriber.workspace = true
 
 # The only crate (with turbine-kernels from P1) allowed to contain `unsafe`: FFI to NVML / amd-smi.
 [lints.rust]

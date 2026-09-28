@@ -1,0 +1,87 @@
+# Topology capture for a DGX Spark: 1x NVIDIA GB10 (sm_121, unified memory, NVLink-C2C to
+# the Grace CPU) and the ConnectX-7 exposing four RoCE functions on two PCI domains.
+# Format: one entry per line, "<path><TAB><content>" for a file (in content "\n" is a newline
+# and "\\" a backslash) or "<path><TAB>-> <target>" for a symbolic link; "#" starts a comment.
+# Paths are relative to a root holding "sys/", "proc/" and "vendor.json" (the recorded vendor
+# topology answers and inventory replayed by the unit tests).
+# Authored from the phase-5 spec (S-1 acceptance criteria): RDMA devices rocep1s0f0,
+# rocep1s0f1, roceP2p1s0f0 and roceP2p1s0f1, two of them active at 200 Gb/s, and NVML
+# reporting C2C mode with no GPU<->NIC P2P data. Bus numbers are representative; plan Task 19
+# replaces any line the real host shows differently.
+sys/devices/system/node/node0/cpulist	0-19
+sys/devices/system/node/node0/meminfo	Node 0 MemTotal:       127535952 kB\nNode 0 MemFree:        119034100 kB\n
+sys/devices/system/node/node0/distance	10
+sys/devices/pci000f:00/000f:00:00.0/class	0x060400
+sys/devices/pci000f:00/000f:00:00.0/numa_node	0
+sys/devices/pci000f:00/000f:00:00.0/current_link_speed	32.0 GT/s PCIe
+sys/devices/pci000f:00/000f:00:00.0/current_link_width	4
+sys/devices/pci0000:00/0000:00:00.0/class	0x060400
+sys/devices/pci0000:00/0000:00:00.0/numa_node	0
+sys/devices/pci0000:00/0000:00:00.0/current_link_speed	32.0 GT/s PCIe
+sys/devices/pci0000:00/0000:00:00.0/current_link_width	4
+sys/devices/pci0002:00/0002:00:00.0/class	0x060400
+sys/devices/pci0002:00/0002:00:00.0/numa_node	0
+sys/devices/pci0002:00/0002:00:00.0/current_link_speed	32.0 GT/s PCIe
+sys/devices/pci0002:00/0002:00:00.0/current_link_width	4
+sys/devices/pci000f:00/000f:00:00.0/000f:01:00.0/class	0x030200
+sys/devices/pci000f:00/000f:00:00.0/000f:01:00.0/numa_node	0
+sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0/class	0x020000
+sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0/numa_node	0
+sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0/current_link_speed	32.0 GT/s PCIe
+sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0/current_link_width	4
+sys/devices/pci0000:00/0000:00:00.0/0000:01:00.1/class	0x020000
+sys/devices/pci0000:00/0000:00:00.0/0000:01:00.1/numa_node	0
+sys/devices/pci0000:00/0000:00:00.0/0000:01:00.1/current_link_speed	32.0 GT/s PCIe
+sys/devices/pci0000:00/0000:00:00.0/0000:01:00.1/current_link_width	4
+sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0/class	0x020000
+sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0/numa_node	0
+sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0/current_link_speed	32.0 GT/s PCIe
+sys/devices/pci0002:00/0002:00:00.0/0002:01:00.0/current_link_width	4
+sys/devices/pci0002:00/0002:00:00.0/0002:01:00.1/class	0x020000
+sys/devices/pci0002:00/0002:00:00.0/0002:01:00.1/numa_node	0
+sys/devices/pci0002:00/0002:00:00.0/0002:01:00.1/current_link_speed	32.0 GT/s PCIe
+sys/devices/pci0002:00/0002:00:00.0/0002:01:00.1/current_link_width	4
+sys/bus/pci/devices/000f:00:00.0	-> ../../../devices/pci000f:00/000f:00:00.0
+sys/bus/pci/devices/000f:01:00.0	-> ../../../devices/pci000f:00/000f:00:00.0/000f:01:00.0
+sys/bus/pci/devices/0000:00:00.0	-> ../../../devices/pci0000:00/0000:00:00.0
+sys/bus/pci/devices/0002:00:00.0	-> ../../../devices/pci0002:00/0002:00:00.0
+sys/bus/pci/devices/0000:01:00.0	-> ../../../devices/pci0000:00/0000:00:00.0/0000:01:00.0
+sys/bus/pci/devices/0000:01:00.1	-> ../../../devices/pci0000:00/0000:00:00.0/0000:01:00.1
+sys/bus/pci/devices/0002:01:00.0	-> ../../../devices/pci0002:00/0002:00:00.0/0002:01:00.0
+sys/bus/pci/devices/0002:01:00.1	-> ../../../devices/pci0002:00/0002:00:00.0/0002:01:00.1
+sys/class/net/enp1s0f0np0/device	-> ../../../devices/pci0000:00/0000:00:00.0/0000:01:00.0
+sys/class/net/enp1s0f0np0/speed	200000
+sys/class/net/enp1s0f0np0/address	4c:bb:47:2d:00:01
+sys/class/net/enp1s0f0np0/type	1
+sys/class/infiniband/rocep1s0f0/device	-> ../../../devices/pci0000:00/0000:00:00.0/0000:01:00.0
+sys/class/infiniband/rocep1s0f0/ports/1/link_layer	Ethernet
+sys/class/infiniband/rocep1s0f0/ports/1/state	4: ACTIVE
+sys/class/infiniband/rocep1s0f0/ports/1/rate	200 Gb/sec (4X HDR)
+sys/class/net/enp1s0f1np1/device	-> ../../../devices/pci0000:00/0000:00:00.0/0000:01:00.1
+sys/class/net/enp1s0f1np1/speed	-1
+sys/class/net/enp1s0f1np1/address	4c:bb:47:2d:00:02
+sys/class/net/enp1s0f1np1/type	1
+sys/class/infiniband/rocep1s0f1/device	-> ../../../devices/pci0000:00/0000:00:00.0/0000:01:00.1
+sys/class/infiniband/rocep1s0f1/ports/1/link_layer	Ethernet
+sys/class/infiniband/rocep1s0f1/ports/1/state	1: DOWN
+sys/class/infiniband/rocep1s0f1/ports/1/rate	10 Gb/sec (4X SDR)
+sys/class/net/enP2p1s0f0np0/device	-> ../../../devices/pci0002:00/0002:00:00.0/0002:01:00.0
+sys/class/net/enP2p1s0f0np0/speed	200000
+sys/class/net/enP2p1s0f0np0/address	4c:bb:47:2d:00:03
+sys/class/net/enP2p1s0f0np0/type	1
+sys/class/infiniband/roceP2p1s0f0/device	-> ../../../devices/pci0002:00/0002:00:00.0/0002:01:00.0
+sys/class/infiniband/roceP2p1s0f0/ports/1/link_layer	Ethernet
+sys/class/infiniband/roceP2p1s0f0/ports/1/state	4: ACTIVE
+sys/class/infiniband/roceP2p1s0f0/ports/1/rate	200 Gb/sec (4X HDR)
+sys/class/net/enP2p1s0f1np1/device	-> ../../../devices/pci0002:00/0002:00:00.0/0002:01:00.1
+sys/class/net/enP2p1s0f1np1/speed	-1
+sys/class/net/enP2p1s0f1np1/address	4c:bb:47:2d:00:04
+sys/class/net/enP2p1s0f1np1/type	1
+sys/class/infiniband/roceP2p1s0f1/device	-> ../../../devices/pci0002:00/0002:00:00.0/0002:01:00.1
+sys/class/infiniband/roceP2p1s0f1/ports/1/link_layer	Ethernet
+sys/class/infiniband/roceP2p1s0f1/ports/1/state	1: DOWN
+sys/class/infiniband/roceP2p1s0f1/ports/1/rate	10 Gb/sec (4X SDR)
+proc/sys/kernel/hostname	spark-01
+proc/net/route	Iface	Destination	Gateway 	Flags	RefCnt	Use	Metric	Mask		MTU	Window	IRTT\nenp1s0f0np0	00000A0A	00000000	0001	0	0	0	00FFFFFF	0	0	0\nenP2p1s0f0np0	00010A0A	00000000	0001	0	0	0	00FFFFFF	0	0	0\n
+proc/net/fib_trie	Main:\n  +-- 10.10.0.0/23 2 0 2\n     +-- 10.10.0.0/24 2 0 2\n        |-- 10.10.0.0\n           /24 link UNICAST\n        |-- 10.10.0.1\n           /32 host LOCAL\n     +-- 10.10.1.0/24 2 0 2\n        |-- 10.10.1.0\n           /24 link UNICAST\n        |-- 10.10.1.1\n           /32 host LOCAL\n
+vendor.json	{"inventory": [{"index": 0, "vendor": "nvidia", "arch": "sm_121", "name": "NVIDIA GB10", "pci_bus_id": "000f:01:00.0", "memory_bytes": 130596814848, "unified": true}], "links": [], "gpu_nic_p2p": {"0": null}, "coherent": {"0": "nvlink_c2c"}}

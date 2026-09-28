@@ -11,6 +11,7 @@ pub mod discovery;
 mod host;
 mod inventory;
 pub mod telemetry;
+pub mod topology;
 
 pub use discovery::{DiscoveryBackend, DiscoveryKind, DiscoveryOptions, discover, run_backends};
 pub use host::host_mem_available;
