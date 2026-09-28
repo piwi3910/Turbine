@@ -1033,3 +1033,5 @@ Asked 2026-09-28 (Task 31 as built, branch p5-group-reservation 3d069c2). In `lo
 - C) add reservation messages to the rank protocol (a round trip per admission)
 
 Recommendation: B — atomic in one process, no per-admission round trip; the worker's own ledger still guards its allocations. Pending the user's answer; `static` mode keeps A meanwhile.
+
+**Decision (user, 2026-09-28): B, mirror ledgers.** Each worker sends its budget in its join message and the leader keeps an exact mirror ledger per worker, reserving through `reserve_group` as in `local` mode. A host or simulator test shows that after a mixed workload with cancels and preemption, each mirror equals the worker's real ledger. Workers check that equality periodically: a ledger digest travels in the step acknowledgement, and a mismatch is logged with a reason code (plan Task 33).

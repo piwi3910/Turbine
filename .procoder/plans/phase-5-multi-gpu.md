@@ -565,3 +565,17 @@ Interfaces:
 - [ ] Land fixes one at a time — hostmem route thresholds for prefill-size messages, the Task 29 rows, decode graphs under TP if feasible — each followed by `scripts/bench-lock.sh scripts/lab-cluster.sh tp2-novanas` (golden c1/c16 and the bench) and a labbook upload.
 - [ ] Gate: `scripts/gate.sh` per commit.
 - [ ] Commit: one `perf(...)` commit per fix.
+
+## Task 33: Mirror ledgers for group admission in static rank mode
+
+Files: `crates/turbine-distributed/src/rank.rs` (the budget in `Hello`, a ledger digest on the rank link, protocol v3), `crates/turbine-reliability/src/{ledger.rs,multi_device.rs}` (a mirror ledger built from a worker's budget; a ledger digest), `crates/turbine-server/src/{engine/tp.rs,startup.rs,model.rs}` (the leader builds one mirror per joined worker and admits through `reserve_group` over its own ledger and the mirrors; the worker applies the leader's reservations to its real ledger in step order and compares digests), `crates/turbine-server/tests/tiny_server.rs`
+Interfaces:
+
+- `Hello` gains the worker's KV budget (blocks, bytes per block, reserve); `RankMessage::StepPlan` carries, every _n_ steps, the leader's mirror digest for that rank (the ledger state after the plan's reservations are applied); the worker compares it with its real ledger's digest after the same step and logs `event="ledger_mirror_divergence"` (WARN, reason code `mirror_digest_mismatch`, metric `turbine_ledger_mirror_divergence_total{rank}`) on a mismatch
+  Covers: user decisions "P5: KV admission across tensor-parallel ranks" (B) and "P5: group KV admission in static rank mode" (B); S-8
+  Depends on: Tasks 12, 17, 31
+
+- [ ] Write failing test `tiny_server tp2_static_mirror_matches_worker_ledger`: a tp 2 `static` group on the cpu backend over loopback `tcp` and the host collective, a mixed workload (concurrent streams, cancels mid-stream, preemption forced by a small pool) — after it, each mirror's reservations equal the worker's real ledger exactly, and no divergence was logged; a deliberately skewed worker ledger logs `mirror_digest_mismatch` once per check. Run: `cargo test -p turbine-server --test tiny_server tp2_static_mirror_matches_worker_ledger` — expect FAIL.
+- [ ] Implement.
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(server,distributed,reliability): mirror ledgers for group admission in static rank mode`
