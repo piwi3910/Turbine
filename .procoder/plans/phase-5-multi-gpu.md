@@ -653,4 +653,4 @@ As built (2026-09-28, user decision "P5 exit: OLMoE with expert × tensor parall
 
 ## Queued after Phase 5 (not part of this phase)
 
-- Release profile for the lab-test GPU tests (coordinator follow-up 2026-09-28): build the `#[ignore]`d GPU and weights tests of `scripts/lab-test.sh` in a release (or optimised-test) profile so the full tier runs shorter. This is queued for after Phase 5 exit, not now.
+- Release profile for the lab-test GPU tests: moved to Phase 5p as its first item (user decision "Lab-test release profile", 2026-09-28): `scripts/lab-test.sh --release`, the default for `--tier full`, in the same cached slot target dirs. Not part of the Phase 5 exit runs.

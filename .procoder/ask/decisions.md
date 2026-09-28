@@ -1103,6 +1103,13 @@ Context: novanas reached 95 % disk and k3s evicted a lab Job (2026-09-28). The P
 
 **Decision (user, 2026-09-28): auto-prune approved**, with these limits: only `remote/agent-*/target`; never the per-slot caches under `turbine-ci/cache/`, anything in use, or anything else; every removal logged with the bytes freed. This rule now covers the earlier manual prune after the fact; any prune beyond it still needs the user.
 
+## Lab-test release profile
+
+- A `--release` option for `scripts/lab-test.sh`, the default for `--tier full`, built in the same cached slot target dirs (first item of Phase 5p)
+- Keep the debug profile for every tier
+
+**Decision (user, 2026-09-28): add it right after the Phase 5 exit, as the first item of Phase 5p.** The full tier takes 40+ min in the debug profile. `--release` becomes the default for `--tier full`; the build uses the same cached slot target dirs (the release artifacts live beside the debug ones). The Phase 5 exit runs are not changed.
+
 ## P5 exit: `parallel.collective.verify` as a diagnosis mode
 
 Built at the coordinator's request during the collective-corruption diagnosis (b38ec2b): each collective's output is checksummed across ranks and a mismatch fails the step with `collective_corrupt` (metric `turbine_collective_errors_total{kind="corrupt"}`, WARN `collective_corrupt`; WARN `collective_verify_on` at startup). **Status (coordinator, 2026-09-28): a diagnosis/canary mode, default off.** Cost measured at tp 2: ~237 vs 912 tok/s. It ran the proof's tp 2 verify leg (~657,000 collectives cross-checked, no mismatch).
