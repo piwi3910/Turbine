@@ -33,7 +33,9 @@ pub struct ParallelConfig {
     pub allow_device_sharing: bool,
     /// Leader → worker plan channel bound.
     pub plan_queue_depth: u32,
-    pub router: DpRouterPolicy,
+    /// A registered DP router policy (extension point `dp_router_policy`: `prefix_affinity`,
+    /// `least_loaded`; checked by `Config::validate_modules`).
+    pub router: ModuleName,
     pub collective: CollectiveTimeouts,
     pub ranks: RanksConfig,
 }
@@ -49,7 +51,7 @@ impl Default for ParallelConfig {
             rccl_library: None,
             allow_device_sharing: false,
             plan_queue_depth: 2,
-            router: DpRouterPolicy::PrefixAffinity,
+            router: ModuleName::fixed("prefix_affinity"),
             collective: CollectiveTimeouts::default(),
             ranks: RanksConfig::default(),
         }
@@ -84,6 +86,9 @@ pub struct RanksConfig {
     pub leader: Option<SocketAddr>,
     /// The device this rank process drives (`static` only; exactly one in Phase 5).
     pub local_devices: Vec<DeviceId>,
+    /// A registered rank transport (extension point `rank_transport`: `tcp`; checked by
+    /// `Config::validate_modules`) carrying the `static` bootstrap and step plans.
+    pub transport: ModuleName,
 }
 
 impl Default for RanksConfig {
@@ -93,6 +98,7 @@ impl Default for RanksConfig {
             rank: 0,
             leader: None,
             local_devices: vec![DeviceId(0)],
+            transport: ModuleName::fixed("tcp"),
         }
     }
 }
@@ -201,15 +207,6 @@ impl<'de> Deserialize<'de> for DeviceSelection {
         }
         d.deserialize_any(V)
     }
-}
-
-/// `parallel.router`: how a request picks its DP replica.
-#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum DpRouterPolicy {
-    PrefixAffinity,
-    LeastLoaded,
 }
 
 /// `parallel.ranks.mode`.

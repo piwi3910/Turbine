@@ -153,7 +153,8 @@ parallel:
   allow_device_sharing: false
   # Leader-to-worker step-plan queue bound (1..16).
   plan_queue_depth: 2
-  # prefix_affinity or least_loaded.
+  # A registered DP router policy (docs/extending/dp-router-policy.md): prefix_affinity or
+  # least_loaded.
   router: prefix_affinity
   collective:
     # Communicator init bound (1s..30m) and per-step collective bound (100ms..10m).
@@ -161,8 +162,11 @@ parallel:
     op_timeout: 30s
   ranks:
     # local: one thread per device in this process; static: one process per rank, joined to
-    # the leader over TCP (tensor_parallel_size > 1, data_parallel_size 1).
+    # the leader over the rank transport (tensor_parallel_size > 1, data_parallel_size 1).
     mode: local
     rank: 0
     leader: null
     local_devices: [0]
+    # The registered rank transport carrying the static bootstrap and step plans
+    # (docs/extending/rank-transport.md): tcp.
+    transport: tcp

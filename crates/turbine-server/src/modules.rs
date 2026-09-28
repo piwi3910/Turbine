@@ -36,6 +36,16 @@ pub static EVICTION_POLICIES: LazyLock<Vec<&'static str>> =
 pub static COLLECTIVE_BACKENDS: LazyLock<Vec<&'static str>> =
     LazyLock::new(|| turbine_distributed::collective::registry().names());
 
+/// Rank transports (`rank_transport`, Phase 5): the names of
+/// `turbine_distributed::transport::registry()`.
+pub static RANK_TRANSPORTS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| turbine_distributed::transport::registry().names());
+
+/// DP router policies (`dp_router_policy`, Phase 5): the names of
+/// `turbine_distributed::router::registry()`.
+pub static ROUTER_POLICIES: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| turbine_distributed::router::registry().names());
+
 /// The registered module names, per configuration key, for `Config::validate_modules`.
 pub fn known_module_names() -> ModuleNames<'static> {
     ModuleNames {
@@ -45,6 +55,8 @@ pub fn known_module_names() -> ModuleNames<'static> {
         scheduling_policies: &SCHEDULING_POLICIES,
         eviction_policies: &EVICTION_POLICIES,
         collective_backends: &COLLECTIVE_BACKENDS,
+        rank_transports: &RANK_TRANSPORTS,
+        router_policies: &ROUTER_POLICIES,
     }
 }
 
@@ -105,6 +117,8 @@ mod tests {
             known.scheduling_policies,
             known.eviction_policies,
             known.collective_backends,
+            known.rank_transports,
+            known.router_policies,
         ] {
             assert!(!names.is_empty());
             for name in names {
@@ -113,5 +127,7 @@ mod tests {
         }
         assert!(known.scheduling_policies.contains(&"default"));
         assert!(known.eviction_policies.contains(&"cost_aware"));
+        assert!(known.rank_transports.contains(&"tcp"));
+        assert!(known.router_policies.contains(&"prefix_affinity"));
     }
 }
