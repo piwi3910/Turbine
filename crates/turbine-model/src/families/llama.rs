@@ -52,6 +52,11 @@ impl ModelFamily for Llama {
         DecoderExecutor::workspace_bytes(cfg, &decoder_spec(), limits)
     }
 
+    /// Tensor parallelism (P5 S-6): the same hooks on the rank's shard.
+    fn tp_decoder_spec(&self) -> Option<DecoderSpec> {
+        Some(decoder_spec())
+    }
+
     fn default_tool_format(&self) -> Option<&'static str> {
         Some(LLAMA3_JSON)
     }
@@ -114,6 +119,7 @@ pub(crate) fn dense_slots(
         name,
         shape,
         stack: None,
+        source: None,
     };
 
     let mut slots = vec![slot(

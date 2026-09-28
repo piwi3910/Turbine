@@ -828,10 +828,35 @@ impl DeviceMemory for ShimContext {
         self.synchronize()
     }
 
-    fn copy_d2d(&self, _dst: DevicePtr, _src: DevicePtr, _bytes: usize) -> Result<(), MemoryError> {
-        Err(MemoryError::Unsupported(
-            "device-to-device copy needs kernel ABI v3".into(),
-        ))
+    /// Kernel ABI v2.5: `turbine_memcpy_async` of kind D2D on the compute stream (the null
+    /// stream argument), so the copy is ordered with the ops around it and nothing waits for
+    /// it (the tensor-parallel logits reorder, Phase 5). A library without the v2.5 copy group
+    /// answers `Unsupported`; the library refuses it while the compute stream is captured.
+    fn copy_d2d(&self, dst: DevicePtr, src: DevicePtr, bytes: usize) -> Result<(), MemoryError> {
+        let copies = self.lib.syms.v21.copies.ok_or_else(|| {
+            MemoryError::Unsupported(format!(
+                "device-to-device copy needs the kernel ABI v2.5 copy group, which {} does not \
+                 export (minor {})",
+                self.lib.path.display(),
+                self.lib.syms.v21.minor
+            ))
+        })?;
+        // SAFETY: `dst` and `src` are device addresses of `bytes`-long ranges inside live
+        // allocations of this context (callers derive them from bounds-checked `DeviceSlice`s
+        // that outlive the call); the copy is enqueued on the compute stream, so it completes
+        // before any later work on that stream and before the buffers can be freed (freeing
+        // synchronises through the same context).
+        let code = unsafe {
+            (copies.memcpy_async)(
+                self.raw,
+                std::ptr::null_mut(),
+                dst.addr() as *mut c_void,
+                src.addr() as *const c_void,
+                bytes,
+                ffi::COPY_D2D,
+            )
+        };
+        Ok(self.check(code)?)
     }
 
     fn synchronize(&self) -> Result<(), MemoryError> {

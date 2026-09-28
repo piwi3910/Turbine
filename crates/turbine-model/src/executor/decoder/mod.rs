@@ -50,6 +50,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
+use turbine_distributed::collective::ReduceOp;
+use turbine_distributed::tp::{ShardSpec, vocab_shard};
 use turbine_kernels::{
     AddRmsnormConfig, AddRmsnormContext, AttentionConfig, AttentionKind, ElementwiseConfig,
     ElementwiseContext, EmbeddingConfig, EmbeddingContext, GemmConfig, GemmContext, KernelError,
@@ -69,6 +71,7 @@ use super::{
 use crate::ModelError;
 use crate::config::{ModelArchConfig, MoeConfig};
 use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name};
+use crate::tp::{TpContext, rank_config};
 
 pub mod hooks;
 mod trace;
@@ -122,6 +125,27 @@ pub struct DecoderDims {
     pub tied_lm_head: bool,
     /// The mixture of experts, when the configuration has one.
     pub moe: Option<MoeConfig>,
+    /// Rows of the embedding table and the LM head this executor holds: `vocab`, or a
+    /// tensor-parallel rank's padded vocabulary shard.
+    pub vocab_rows: usize,
+    /// A tensor-parallel rank's place in its group (the widths above are then the rank's);
+    /// `None` on one device.
+    pub tp: Option<TpDims>,
+}
+
+/// What a tensor-parallel rank's dims add ([`DecoderDims::for_shard`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TpDims {
+    pub rank: u32,
+    pub world: u32,
+    /// The width a full-projection Q norm normalises over: the model's `heads · head_dim`.
+    pub q_norm_dim: usize,
+    /// The width a full-projection K norm's all-reduced sum of squares counts: the model's
+    /// `kv_heads · head_dim`, times the replication factor when KV heads are replicated (each
+    /// rank of a replicated head adds its squares), so the mean is the model's.
+    pub k_norm_dim: usize,
+    /// The first vocabulary id of the rank's shard.
+    pub vocab_offset: usize,
 }
 
 impl DecoderDims {
@@ -141,7 +165,39 @@ impl DecoderDims {
             act: cfg.weight_format.0.activation_dtype(),
             tied_lm_head: cfg.tie_word_embeddings,
             moe: cfg.moe,
+            vocab_rows: cfg.vocab_size as usize,
+            tp: None,
         }
+    }
+
+    /// The dims tensor-parallel rank `shard` of `cfg` runs with ([`crate::tp::rank_config`]:
+    /// its heads, KV heads and intermediate widths, its vocabulary shard); `None` is
+    /// [`DecoderDims::of`]. Refuses a split the rules cannot make.
+    pub fn for_shard(
+        cfg: &ModelArchConfig,
+        shard: Option<ShardSpec>,
+    ) -> Result<DecoderDims, ModelError> {
+        let Some(s) = shard else {
+            return Ok(DecoderDims::of(cfg));
+        };
+        let mut d = DecoderDims::of(&rank_config(cfg, s)?);
+        let (offset, _, padded) = vocab_shard(cfg.vocab_size, s);
+        let kv_full = cfg.num_kv_heads as usize * d.head_dim;
+        // Ranks per KV head: `world / kv_heads` when replicated, else 1.
+        let replicas = if s.world > cfg.num_kv_heads {
+            (s.world / cfg.num_kv_heads) as usize
+        } else {
+            1
+        };
+        d.vocab_rows = padded as usize;
+        d.tp = Some(TpDims {
+            rank: s.rank,
+            world: s.world,
+            q_norm_dim: cfg.num_attention_heads as usize * d.head_dim,
+            k_norm_dim: kv_full * replicas,
+            vocab_offset: offset as usize,
+        });
+        Ok(d)
     }
 
     /// `c = a · wᵀ` for an HF Linear weight `w` of `[n, k]` (activation-dtype operands).
@@ -180,7 +236,7 @@ impl DecoderDims {
     fn embedding(&self) -> EmbeddingConfig {
         EmbeddingConfig {
             hidden: self.hidden as u64,
-            vocab_rows: self.vocab as u64,
+            vocab_rows: self.vocab_rows as u64,
             dtype: self.act,
         }
     }
@@ -378,6 +434,19 @@ impl LayerRun<'_> {
     pub fn trace(&self, name: &'static str, view: &TensorView<'_>) -> Result<(), ModelError> {
         self.exec.trace.record(Some(self.layer), name, view)
     }
+
+    /// Tensor parallelism: sums the contiguous `view` across the group's ranks in place (its
+    /// dtype, BF16 or F32); nothing on one device.
+    pub fn all_reduce(&self, view: &TensorView<'_>) -> Result<(), ModelError> {
+        self.exec.all_reduce(view)
+    }
+
+    /// Tensor parallelism: the F32 `[2 · max_batch_tokens]` scratch a sharded norm keeps its
+    /// partial sums of squares in (the Q rows' then the K rows', so one all-reduce covers
+    /// both); `None` on one device.
+    pub fn sumsq(&self) -> Option<&Tensor> {
+        self.exec.tp_bufs.as_ref().map(|b| &b.sumsq)
+    }
 }
 
 /// Rows `[0, t)` of an activation buffer as `[t, cols]`.
@@ -440,13 +509,29 @@ struct Buffers {
     last: Tensor,
 }
 
+/// A tensor-parallel rank's extra buffers: the sharded norms' partial sums and the LM head's
+/// shard and gathered logits.
+struct TpBuffers {
+    /// F32 `[2 · max_batch_tokens]`.
+    sumsq: Tensor,
+    /// F32 `[max_seqs, vocab_rows]`: this rank's LM-head shard, the all-gather's input.
+    shard_logits: Tensor,
+    /// F32 `[world · max_seqs, vocab_rows]`: every rank's shard, rank-major.
+    gathered: Tensor,
+}
+
 /// The decoder executor: ragged batches of up to `max_seqs` sequences and `max_batch_tokens`
-/// tokens over the paged KV pool, on one device, for any [`DecoderSpec`].
+/// tokens over the paged KV pool, on one device (or as one rank of a tensor-parallel group,
+/// [`DecoderExecutor::new_tp`]), for any [`DecoderSpec`].
 pub struct DecoderExecutor {
     /// Decode graphs, when on. First field: the graphs record pointers into the buffers below
     /// and are destroyed before them.
     graphs: Option<DecodeGraphs>,
+    /// The model's configuration (unsharded).
     cfg: ModelArchConfig,
+    /// The rank's collectives, when tensor-parallel.
+    tp: Option<TpContext>,
+    tp_bufs: Option<TpBuffers>,
     spec: DecoderSpec,
     dims: DecoderDims,
     shape: ModelShape,
@@ -497,7 +582,37 @@ impl DecoderExecutor {
         block_tokens: u32,
         opts: ExecutorOptions,
     ) -> Vec<OpRequirement> {
-        let d = DecoderDims::of(cfg);
+        Self::requirements_of(cfg, &DecoderDims::of(cfg), spec, block_tokens, opts)
+    }
+
+    /// [`DecoderExecutor::requirements`] of tensor-parallel rank `shard` (`None`: one device):
+    /// the rank's GEMM, attention, RoPE and FFN widths, its vocabulary shard's embedding and LM
+    /// head, its KV layout's block copy, and a full-projection Q/K norm as `row_sumsq` and
+    /// `rmsnorm_sharded`.
+    pub fn requirements_for(
+        cfg: &ModelArchConfig,
+        spec: &DecoderSpec,
+        block_tokens: u32,
+        opts: ExecutorOptions,
+        shard: Option<ShardSpec>,
+    ) -> Result<Vec<OpRequirement>, ModelError> {
+        let d = DecoderDims::for_shard(cfg, shard)?;
+        let rank = match shard {
+            Some(s) => rank_config(cfg, s)?,
+            None => cfg.clone(),
+        };
+        Ok(Self::requirements_of(&rank, &d, spec, block_tokens, opts))
+    }
+
+    /// The requirements of dims `d` over the KV layout of `cfg` (the rank's configuration).
+    fn requirements_of(
+        cfg: &ModelArchConfig,
+        d: &DecoderDims,
+        spec: &DecoderSpec,
+        block_tokens: u32,
+        opts: ExecutorOptions,
+    ) -> Vec<OpRequirement> {
+        let d = *d;
         let act = d.act;
         let mut specs = vec![
             OpConfig::Embedding(d.embedding()),
@@ -528,7 +643,7 @@ impl DecoderExecutor {
         }
         specs.extend(spec.ffn.requirements(&d, opts));
         specs.extend([
-            OpConfig::Gemm(d.gemm(d.vocab, d.hidden, DType::F32)),
+            OpConfig::Gemm(d.gemm(d.vocab_rows, d.hidden, DType::F32)),
             OpConfig::CopyBlocks(batch::copy_config(&cfg.kv_layout(block_tokens))),
         ]);
         let mut unique: Vec<OpConfig> = Vec::with_capacity(specs.len());
@@ -551,7 +666,36 @@ impl DecoderExecutor {
         spec: &DecoderSpec,
         limits: ExecutorLimits,
     ) -> u64 {
-        let d = DecoderDims::of(cfg);
+        Self::workspace_of(cfg, &DecoderDims::of(cfg), spec, limits)
+    }
+
+    /// [`DecoderExecutor::workspace_bytes`] of tensor-parallel rank `shard` (`None`: one
+    /// device): the rank's widths, plus the F32 partial sums of squares (2 per token) and the
+    /// LM head's shard and gathered logits (`(1 + world) · max_seqs · vocab_rows`).
+    pub fn workspace_bytes_for(
+        cfg: &ModelArchConfig,
+        spec: &DecoderSpec,
+        limits: ExecutorLimits,
+        shard: Option<ShardSpec>,
+    ) -> Result<u64, ModelError> {
+        let d = DecoderDims::for_shard(cfg, shard)?;
+        let Some(s) = shard else {
+            return Ok(Self::workspace_bytes(cfg, spec, limits));
+        };
+        let rank = rank_config(cfg, s)?;
+        let tp = DType::F32.size_bytes() as u64
+            * (2 * u64::from(limits.max_batch_tokens)
+                + (1 + u64::from(s.world)) * u64::from(limits.max_seqs) * d.vocab_rows as u64);
+        Ok(Self::workspace_of(&rank, &d, spec, limits) + tp)
+    }
+
+    fn workspace_of(
+        cfg: &ModelArchConfig,
+        d: &DecoderDims,
+        spec: &DecoderSpec,
+        limits: ExecutorLimits,
+    ) -> u64 {
+        let d = *d;
         let es = d.act.size_bytes() as u64;
         let f32 = DType::F32.size_bytes() as u64;
         let per_token = es * (3 * d.hidden + 2 * d.q_dim + 2 * d.kv_dim) as u64;
@@ -573,12 +717,49 @@ impl DecoderExecutor {
     pub fn new(
         cfg: &ModelArchConfig,
         spec: DecoderSpec,
-        mut weights: LoadedWeights,
+        weights: LoadedWeights,
         registry: Arc<KernelRegistry>,
         mem: Arc<dyn DeviceMemory>,
         limits: ExecutorLimits,
         opts: ExecutorOptions,
     ) -> Result<DecoderExecutor, ModelError> {
+        Self::new_tp(cfg, spec, weights, registry, mem, limits, opts, None)
+    }
+
+    /// [`DecoderExecutor::new`] as rank `tp.rank` of a tensor-parallel group (`None`: one
+    /// device, exactly `new`): `weights` are the rank's shard ([`crate::tp::weight_slots`]),
+    /// `registry` was built from [`DecoderExecutor::requirements_for`] of the same shard, and
+    /// every forward's pool is laid out as the rank's KV layout ([`crate::tp::kv_layout`]).
+    /// Every rank of the group must be fed the same batches in the same order; each returns
+    /// the full logits. Tensor-parallel ranks never capture decode graphs nor overlap launches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_tp(
+        cfg: &ModelArchConfig,
+        spec: DecoderSpec,
+        mut weights: LoadedWeights,
+        registry: Arc<KernelRegistry>,
+        mem: Arc<dyn DeviceMemory>,
+        limits: ExecutorLimits,
+        opts: ExecutorOptions,
+        tp: Option<TpContext>,
+    ) -> Result<DecoderExecutor, ModelError> {
+        let shard = tp.as_ref().map(TpContext::shard);
+        if let Some(t) = &tp
+            && (t.collective.world_size() != t.world as usize
+                || t.collective.rank() != t.rank as usize)
+        {
+            return Err(invalid(format!(
+                "tensor-parallel rank {} of {} over a communicator of rank {} of {}",
+                t.rank,
+                t.world,
+                t.collective.rank(),
+                t.collective.world_size()
+            )));
+        }
+        let rank_cfg = match shard {
+            Some(s) => rank_config(cfg, s)?,
+            None => cfg.clone(),
+        };
         let ExecutorLimits {
             block_tokens,
             max_batch_tokens,
@@ -591,7 +772,7 @@ impl DecoderExecutor {
             )));
         }
         check_weight_format(cfg)?;
-        let d = DecoderDims::of(cfg);
+        let d = DecoderDims::for_shard(cfg, shard)?;
         spec.ffn.check(&d)?;
         let qkv = Split {
             cols: [d.q_dim, d.kv_dim, d.kv_dim],
@@ -627,7 +808,7 @@ impl DecoderExecutor {
         };
 
         let add_norm = opts.fused_ops && registry.is_selected(&OpConfig::AddRmsnorm(d.add_norm()));
-        let limits = batch_limits(cfg, limits);
+        let limits = batch_limits(&rank_cfg, limits);
         let t = max_batch_tokens as usize;
         let n = max_seqs as usize;
         let act = |cols: usize| Tensor::empty(&mem, &[t, cols], d.act);
@@ -648,9 +829,19 @@ impl DecoderExecutor {
         };
         let head = LogitsHead::new(cfg, &registry, &mem, n)?;
         let meta = DeviceBatch::alloc(&mem, &limits)?;
+        let tp_bufs = match &tp {
+            Some(tc) => Some(TpBuffers {
+                sumsq: Tensor::empty(&mem, &[2 * t], DType::F32)?,
+                shard_logits: Tensor::empty(&mem, &[n, d.vocab_rows], DType::F32)?,
+                gathered: Tensor::empty(&mem, &[tc.world as usize * n, d.vocab_rows], DType::F32)?,
+            }),
+            None => None,
+        };
         Ok(DecoderExecutor {
             graphs: None,
             cfg: cfg.clone(),
+            tp,
+            tp_bufs,
             spec,
             dims: d,
             shape: cfg.shape(),
@@ -700,12 +891,14 @@ impl DecoderExecutor {
     /// synchronisation and timed into the profile returned by
     /// [`DecoderExecutor::take_profile`]. Disabling drops what was recorded. Off by default.
     pub fn set_profile(&mut self, on: bool) {
-        let mut reqs = Self::requirements(
+        let mut reqs = Self::requirements_for(
             &self.cfg,
             &self.spec,
             self.kv_layout.block_tokens,
             self.opts,
-        );
+            self.tp.as_ref().map(TpContext::shard),
+        )
+        .unwrap_or_default();
         reqs.push(logits::reduce_requirement(&self.cfg));
         self.profiler.set(on, &self.registry, &reqs);
     }
@@ -780,6 +973,94 @@ impl DecoderExecutor {
                 prefill: self.step_prefill.load(Ordering::Relaxed),
             })
         })
+    }
+
+    /// Tensor parallelism: sums the contiguous `view` (BF16 or F32) across the group in place,
+    /// on the rank's stream; nothing on one device.
+    fn all_reduce(&self, view: &TensorView<'_>) -> Result<(), ModelError> {
+        let Some(tp) = &self.tp else {
+            return Ok(());
+        };
+        if view.slice.len() != view.numel() * view.dtype.size_bytes() {
+            return Err(invalid(format!(
+                "all-reduce of a non-contiguous view {:?} strides {:?}",
+                view.shape.as_slice(),
+                view.strides.as_slice()
+            )));
+        }
+        let (mut slice, dtype) = (view.slice, view.dtype);
+        self.profiler.step(
+            self.mem.as_ref(),
+            profile::TP_ALL_REDUCE,
+            tp.collective.backend(),
+            || {
+                Ok(tp
+                    .collective
+                    .all_reduce(&mut slice, dtype, ReduceOp::Sum, &tp.stream)?)
+            },
+        )
+    }
+
+    /// Tensor parallelism: the LM head of the `n` final-norm rows over this rank's vocabulary
+    /// shard, all-gathered from every rank (rank-major `[world][n][vocab_rows]`) and reordered
+    /// by device-to-device copies into the logits head's row-major `[n, vocab]` rows, each
+    /// rank's real rows only (an uneven last shard's padding columns stay behind).
+    fn tp_lm_head(
+        &self,
+        tp: &TpContext,
+        bufs: &TpBuffers,
+        head: &Tensor,
+        n: usize,
+    ) -> Result<(), ModelError> {
+        let d = &self.dims;
+        let (vr, vocab, world) = (d.vocab_rows, d.vocab, tp.world as usize);
+        let f32 = DType::F32.size_bytes();
+        let shard =
+            TensorView::contiguous(bufs.shard_logits.storage.whole(), 0, &[n, vr], DType::F32);
+        self.linear(rows(&self.bufs.last, n), head.view(), shard.clone())?;
+        let mut gathered = bufs.gathered.storage.whole().sub(0, world * n * vr * f32);
+        self.profiler.step(
+            self.mem.as_ref(),
+            profile::TP_ALL_GATHER,
+            tp.collective.backend(),
+            || {
+                Ok(tp
+                    .collective
+                    .all_gather(&shard.slice, &mut gathered, &tp.stream)?)
+            },
+        )?;
+        let out = self.head.rows(n).slice;
+        self.profiler.step(
+            self.mem.as_ref(),
+            profile::TP_LOGITS_REORDER,
+            profile::D2D,
+            || {
+                if n == 1 {
+                    // One row: the ranks' shards are already consecutive.
+                    self.mem.copy_d2d(out.ptr(), gathered.ptr(), vocab * f32)?;
+                    return Ok(());
+                }
+                for r in 0..world {
+                    let (offset, real, _) = vocab_shard(
+                        vocab as u32,
+                        ShardSpec {
+                            rank: r as u32,
+                            world: tp.world,
+                        },
+                    );
+                    let (offset, real) = (offset as usize, real as usize);
+                    if real == 0 {
+                        continue;
+                    }
+                    for i in 0..n {
+                        let src = gathered.sub((r * n + i) * vr * f32, real * f32);
+                        let dst = out.sub((i * vocab + offset) * f32, real * f32);
+                        self.mem.copy_d2d(dst.ptr(), src.ptr(), real * f32)?;
+                    }
+                }
+                Ok(())
+            },
+        )
     }
 
     /// RMSNorm over rows of `w.numel()` elements.
@@ -925,6 +1206,7 @@ impl DecoderExecutor {
         })?;
         self.record(li, "attn", rows(&b.attn, t))?;
         self.linear(rows(&b.attn, t), l.wo.view(), rows(&b.proj, t))?;
+        self.all_reduce(&rows(&b.proj, t))?;
         self.record(li, "o_proj", rows(&b.proj, t))?;
         self.residual_add_norm(t, Some(&l.post_norm))?;
         self.record(li, "resid_attn", rows(&b.x, t))?;
@@ -932,6 +1214,7 @@ impl DecoderExecutor {
         // FFN block.
         self.record(li, "mlp_norm", rows(&b.h, t))?;
         self.spec.ffn.forward(&run, &l.ffn)?;
+        self.all_reduce(&rows(&b.proj, t))?;
         let next_norm = self.layers.get(i + 1).map(|next| &next.input_norm);
         self.residual_add_norm(t, next_norm)?;
         self.record(li, "resid_mlp", rows(&b.x, t))
@@ -968,6 +1251,7 @@ impl DecoderExecutor {
         let (t, n) = (p.total_q, p.num_seqs);
         self.step_prefill.store(!p.is_decode(), Ordering::Relaxed);
         let embedding = self.dims.embedding();
+        let vocab_offset = self.dims.tp.map_or(0, |tp| tp.vocab_offset as i64);
         self.op(OpConfig::Embedding(embedding), || {
             self.registry
                 .embedding(&embedding)
@@ -975,7 +1259,7 @@ impl DecoderExecutor {
                     ids: self.meta.ids_view(p),
                     table: self.embed.view(),
                     out: rows(&b.x, t),
-                    vocab_offset: 0,
+                    vocab_offset,
                 })
         })?;
         for &(token, word, len) in runs {
@@ -986,10 +1270,12 @@ impl DecoderExecutor {
                         ids: self.head.ids_at(word, len),
                         table: self.embed.view(),
                         out: rows(&b.x, t).rows(token, len),
-                        vocab_offset: 0,
+                        vocab_offset,
                     })
             })?;
         }
+        // Each id was embedded by the rank whose shard holds it, zeros elsewhere.
+        self.all_reduce(&rows(&b.x, t))?;
         self.record(None, "embed", rows(&b.x, t))?;
         if let Some(first) = self.layers.first() {
             self.rmsnorm(rows(&b.x, t), &first.input_norm, rows(&b.h, t))?;
@@ -1000,7 +1286,10 @@ impl DecoderExecutor {
         self.final_norm_last_rows(p, order)?;
         self.record(None, "final_norm", rows(&b.last, n))?;
         let head = self.lm_head.as_ref().unwrap_or(&self.embed);
-        self.linear(rows(&b.last, n), head.view(), self.head.rows(n))?;
+        match (&self.tp, &self.tp_bufs) {
+            (Some(tp), Some(bufs)) => self.tp_lm_head(tp, bufs, head, n)?,
+            _ => self.linear(rows(&b.last, n), head.view(), self.head.rows(n))?,
+        }
         self.record(None, "logits", self.head.rows(n))?;
         self.head
             .reduce(&self.registry, &self.profiler, self.mem.as_ref())
@@ -1026,8 +1315,9 @@ impl ModelExecutor for DecoderExecutor {
         self.collect()
     }
 
+    /// Never for a tensor-parallel rank: its collectives run inside the launch.
     fn overlaps(&self) -> bool {
-        self.head.overlaps() && self.meta.is_async()
+        self.tp.is_none() && self.head.overlaps() && self.meta.is_async()
     }
 
     fn launch(&mut self, batch: &BatchInput<'_>, feeds: &[TokenFeed]) -> Result<(), ModelError> {
@@ -1072,6 +1362,10 @@ impl ModelExecutor for DecoderExecutor {
         )?;
         self.head.upload_inputs()?;
         let launch_started = Instant::now();
+        if let Some(tp) = &self.tp {
+            // Bounds the step's collectives until `collect` has synchronised the stream.
+            tp.collective.step_begin();
+        }
         let mut graphs = self.graphs.take();
         let enqueued = match graphs.as_mut() {
             Some(g) => g.run(key, PoolId::of(batch.kv), || {
@@ -1080,6 +1374,10 @@ impl ModelExecutor for DecoderExecutor {
             None => self.enqueue(&p, batch.kv, &order, &runs),
         };
         self.graphs = graphs;
+        if let (Err(_), Some(tp)) = (&enqueued, &self.tp) {
+            // The step is abandoned: close its bound (the error that ended it is returned).
+            let _ = tp.collective.step_end();
+        }
         enqueued?;
         // The step's one device-to-host read, after the device reduction of the rows that
         // asked for one; collected by `collect`.
@@ -1091,7 +1389,15 @@ impl ModelExecutor for DecoderExecutor {
     fn collect(&mut self) -> Result<Logits, ModelError> {
         let wait_started = Instant::now();
         let launch = self.launches.pop_front().unwrap_or_default();
-        let logits = self.head.collect(&self.profiler, self.mem.as_ref())?;
+        let logits = self.head.collect(&self.profiler, self.mem.as_ref());
+        if let Some(tp) = &self.tp {
+            // The read synchronised the stream: the step's collectives are complete.
+            let ended = tp.collective.step_end();
+            if logits.is_ok() {
+                ended?;
+            }
+        }
+        let logits = logits?;
         self.timings = ForwardTimings {
             launch,
             device_wait: wait_started.elapsed(),
@@ -1099,7 +1405,16 @@ impl ModelExecutor for DecoderExecutor {
         Ok(logits)
     }
 
+    /// Ignored (graphs stay off) for a tensor-parallel rank: its collectives are not captured.
     fn set_decode_graphs(&mut self, graphs: Option<DecodeGraphs>) {
+        if self.tp.is_some() && graphs.is_some() {
+            tracing::info!(
+                event = "decode_graphs_off",
+                reason = "tensor_parallel",
+                "decode graphs are not captured under tensor parallelism"
+            );
+            return;
+        }
         self.graphs = graphs;
     }
 

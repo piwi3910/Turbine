@@ -16,7 +16,7 @@ use turbine_tensor::DeviceMemory;
 
 use crate::ModelError;
 use crate::config::{ModelArchConfig, MoeConfig, unsupported};
-use crate::executor::{ExecutorLimits, ExecutorOptions, ModelExecutor};
+use crate::executor::{DecoderSpec, ExecutorLimits, ExecutorOptions, ModelExecutor};
 use crate::loader::{LoadedWeights, WeightSlot};
 use crate::testing::tiny::TinySpec;
 
@@ -67,6 +67,13 @@ pub trait ModelFamily: Module {
         limits: ExecutorLimits,
         opts: ExecutorOptions,
     ) -> Result<Box<dyn ModelExecutor>, ModelError>;
+    /// The decoder hooks a tensor-parallel rank runs this family with (P5 S-6, [`crate::tp`]):
+    /// heads, KV heads, intermediate columns and vocabulary split across ranks by the
+    /// `turbine_distributed::tp` rules. `None` (the default): the family serves one device per
+    /// model, and a tensor-parallel size above 1 is refused naming it.
+    fn tp_decoder_spec(&self) -> Option<DecoderSpec> {
+        None
+    }
     /// Writes a tiny synthetic checkpoint of this family into `dir` (weights from a ChaCha8
     /// stream seeded by `seed`; the tiny tokenizer): the checkpoint the family's conformance
     /// suite ([`crate::conformance::families_suite`]) runs on the CPU provider. A test
