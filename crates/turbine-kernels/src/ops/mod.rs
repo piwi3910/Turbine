@@ -664,7 +664,7 @@ pub struct PagedAttentionContext<'a> {
     /// Usually `1 / sqrt(head_dim)`.
     pub scale: f32,
     /// FP8 pages (`cfg.dtype` F8E4M3): a K element is stored as `e4m3(k / k_scale)` and read as
-    /// `e4m3 · k_scale`, likewise V with `v_scale` (this layer's scales, > 0). Ignored (1.0 by
+    /// `e4m3 · k_scale` rounded to the activation dtype, likewise V with `v_scale` (this layer's scales, > 0). Ignored (1.0 by
     /// convention) for BF16 / F16 / F32 pages.
     pub k_scale: f32,
     pub v_scale: f32,
