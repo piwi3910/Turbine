@@ -31,8 +31,8 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use libloading::Library;
 use turbine_core::types::{DType, DeviceId};
@@ -365,6 +365,8 @@ impl ShimLibrary {
             pinned: PinnedState::default(),
             gemm_prefill: AtomicU8::new(0),
             capturing: AtomicBool::new(false),
+            bounce: Mutex::new(None),
+            pageable_copies: AtomicU64::new(0),
         }))
     }
 }
@@ -423,7 +425,22 @@ pub struct ShimContext {
     /// Between a successful `graph_begin` and its `graph_end` (the hostmem backend keeps
     /// captured all-reduces on its capturable steps).
     capturing: AtomicBool,
+    /// The pinned bounce buffer of `copy_h2d` / `copy_d2h` (kernel ABI v2.3), allocated on
+    /// first use, freed before the context. See [`ShimContext::bounce`].
+    bounce: Mutex<Option<Bounce>>,
+    /// Host copies that went through pageable memory (a library without v2.3).
+    pageable_copies: AtomicU64,
 }
+
+/// One pinned host allocation of [`BOUNCE_BYTES`] (`turbine_host_alloc_pinned`).
+struct Bounce(*mut u8);
+
+// SAFETY: the pointer is page-locked host memory owned by its context's `bounce` field and only
+// dereferenced under that field's lock.
+unsafe impl Send for Bounce {}
+
+/// Bytes of a context's pinned bounce buffer: host copies are split into chunks of this size.
+pub const BOUNCE_BYTES: usize = 4 << 20;
 
 /// The staging buffers of one context and the next id.
 #[derive(Default)]
@@ -463,6 +480,19 @@ impl Drop for ShimContext {
         // The copy stream (waiting for its copies) and copy events go first: they belong to
         // this context. No `PinnedBuffer` is alive: each holds an `Arc` of the context.
         self.pinned.release();
+        let bounce = self
+            .bounce
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let (Some(Bounce(host)), Some(fns)) = (bounce, self.lib.syms.v21.staging) {
+            // SAFETY: `host` came from `turbine_host_alloc_pinned` on this context and is freed
+            // exactly once, here, before the context; every copy through it was synchronized.
+            let code = unsafe { (fns.host_free)(self.raw, host.cast()) };
+            if code != 0 {
+                tracing::error!(event = "kernel_bounce_free_failed", code);
+            }
+        }
         // SAFETY: `raw` came from `turbine_ctx_create` of this library and is destroyed exactly
         // once, here. No `DeviceBuffer` or `StreamRef` of this context is alive: each holds an
         // `Arc` of it. `self.lib` keeps the library loaded until after this call.
@@ -507,6 +537,101 @@ impl ShimContext {
 
     fn check(&self, code: i32) -> Result<(), KernelError> {
         ffi::check(code, &self.lib.syms, self.raw)
+    }
+
+    /// Host copies that went through pageable host memory because the library lacks the
+    /// kernel ABI v2.3 pinned allocations (`kernel_pageable_copy_fallback`).
+    pub fn pageable_copies(&self) -> u64 {
+        self.pageable_copies.load(Ordering::Relaxed)
+    }
+
+    /// The pinned bounce buffer of `copy_h2d` / `copy_d2h`.
+    ///
+    /// Why: a device-to-host copy into pageable host memory that was never touched (a fresh
+    /// `vec![0u8; n]`) returned wrong bytes at the destination's last partial page on novanas
+    /// (ROCm 7.14.1, two R9700s driven from two threads), while the same copies into pinned or
+    /// already-touched memory were always right (P5 Task 32 corruption diagnosis,
+    /// `hostmem_lab` `hostmem_diag_rccl_protocols`). Every host copy therefore goes through
+    /// page-locked memory: [`BOUNCE_BYTES`] chunks, each copied and synchronized in turn under
+    /// the buffer's lock (concurrent callers of one context serialize).
+    ///
+    /// Returns `Ok(None)` when the library has no pinned allocations (the caller copies
+    /// pageable, counted in [`ShimContext::pageable_copies`], one WARN).
+    fn bounce(&self) -> Result<Option<MutexGuard<'_, Option<Bounce>>>, MemoryError> {
+        let Some(fns) = self.lib.syms.v21.staging else {
+            if self.pageable_copies.fetch_add(1, Ordering::Relaxed) == 0 {
+                tracing::warn!(
+                    event = "kernel_pageable_copy_fallback",
+                    library = %self.lib.path.display(),
+                    "the kernel library has no pinned host memory (ABI v2.3): host copies go \
+                     through pageable memory, destinations touched first (a mitigation, not a \
+                     guarantee: device-to-host copies into untouched pageable memory returned \
+                     wrong bytes on ROCm 7.14.1)"
+                );
+            }
+            return Ok(None);
+        };
+        let mut guard = self.bounce.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_none() {
+            let mut host: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `host` is a live out-pointer; on success the shim stores a page-locked
+            // allocation of BOUNCE_BYTES owned from here by this context's `bounce` field.
+            let code = unsafe { (fns.host_alloc)(self.raw, BOUNCE_BYTES, &mut host) };
+            self.check(code)?;
+            if host.is_null() {
+                return Err(MemoryError::Device {
+                    message: "turbine_host_alloc_pinned succeeded but returned NULL".into(),
+                    sticky: false,
+                });
+            }
+            *guard = Some(Bounce(host.cast()));
+        }
+        Ok(Some(guard))
+    }
+
+    /// Runs `copy(bounce, at, n)` for every chunk `[at, at + n)` of `len` bytes (host to device:
+    /// `copy` fills the bounce buffer and enqueues the copy), synchronizing after each.
+    /// `Ok(None)`: no bounce buffer (pageable fallback).
+    fn bounce_copy(
+        &self,
+        len: usize,
+        copy: impl Fn(*mut u8, usize, usize) -> Result<(), KernelError>,
+    ) -> Result<Option<()>, MemoryError> {
+        let Some(guard) = self.bounce()? else {
+            return Ok(None);
+        };
+        let bounce = guard.as_ref().expect("allocated by bounce()").0;
+        let mut at = 0;
+        while at < len {
+            let n = BOUNCE_BYTES.min(len - at);
+            copy(bounce, at, n)?;
+            self.synchronize()?;
+            at += n;
+        }
+        Ok(Some(()))
+    }
+
+    /// Device to host through the bounce buffer: per chunk `enqueue(bounce, at, n)`, a
+    /// synchronize, then `drain(bounce, at, n)`. `Ok(None)`: pageable fallback.
+    fn bounce_copy_d2h(
+        &self,
+        len: usize,
+        enqueue: impl Fn(*mut u8, usize, usize) -> Result<(), KernelError>,
+        drain: impl Fn(*mut u8, usize, usize),
+    ) -> Result<Option<()>, MemoryError> {
+        let Some(guard) = self.bounce()? else {
+            return Ok(None);
+        };
+        let bounce = guard.as_ref().expect("allocated by bounce()").0;
+        let mut at = 0;
+        while at < len {
+            let n = BOUNCE_BYTES.min(len - at);
+            enqueue(bounce, at, n)?;
+            self.synchronize()?;
+            drain(bounce, at, n);
+            at += n;
+        }
+        Ok(Some(()))
     }
 
     /// The v2.3 staging functions, or `Unsupported` naming the library.
@@ -810,7 +935,28 @@ impl DeviceMemory for ShimContext {
         }
     }
 
+    /// Through the context's pinned bounce buffer ([`ShimContext::bounce`]); the pageable
+    /// fallback (a library without kernel ABI v2.3) is counted and logged once.
     fn copy_h2d(&self, dst: DevicePtr, src: &[u8]) -> Result<(), MemoryError> {
+        if let Some(done) = self.bounce_copy(src.len(), |bounce, at, n| {
+            // SAFETY: `bounce` is `n` bytes of the context's pinned buffer, held under its lock
+            // (see `bounce_copy`); `src[at..at + n]` is a live host slice; `dst + at` a
+            // bounds-checked device range. The stream is synchronized after the copy (by
+            // `bounce_copy`) before the bounce buffer is reused.
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr().add(at), bounce, n) };
+            // SAFETY: as above: the bounce buffer holds the chunk, `dst + at` is in bounds.
+            let code = unsafe {
+                (self.lib.syms.memcpy_h2d)(
+                    self.raw,
+                    dst.offset(at as u64).addr() as *mut c_void,
+                    bounce.cast_const().cast(),
+                    n,
+                )
+            };
+            self.check(code)
+        })? {
+            return Ok(done);
+        }
         // SAFETY: `src` is a live host slice of `src.len()` bytes and `dst` a device range the
         // caller (`DeviceBuffer`/`DeviceSlice`) bounds-checked. The copy may be asynchronous, so
         // the stream is synchronized below before `src` stops being borrowed.
@@ -826,7 +972,36 @@ impl DeviceMemory for ShimContext {
         self.synchronize()
     }
 
+    /// Through the context's pinned bounce buffer ([`ShimContext::bounce`]); see `copy_h2d`.
     fn copy_d2h(&self, dst: &mut [u8], src: DevicePtr) -> Result<(), MemoryError> {
+        let len = dst.len();
+        let out = dst.as_mut_ptr();
+        if let Some(done) = self.bounce_copy_d2h(
+            len,
+            |bounce, at, n| {
+                // SAFETY: `bounce` is `n` bytes of the context's pinned buffer under its lock;
+                // `src + at` a bounds-checked device range.
+                let code = unsafe {
+                    (self.lib.syms.memcpy_d2h)(
+                        self.raw,
+                        bounce.cast(),
+                        src.offset(at as u64).addr() as *const c_void,
+                        n,
+                    )
+                };
+                self.check(code)
+            },
+            |bounce, at, n| {
+                // SAFETY: the copy into `bounce` completed (the stream was synchronized); `out` is
+                // the live, exclusively borrowed `dst` of `len` bytes and `at + n <= len`.
+                unsafe { std::ptr::copy_nonoverlapping(bounce.cast_const(), out.add(at), n) };
+            },
+        )? {
+            return Ok(done);
+        }
+        // Pageable fallback: touch the destination first (a mitigation: touched pageable
+        // destinations were always read right, untouched ones not; see `bounce`).
+        dst.fill(0);
         // SAFETY: `dst` is a live, exclusively borrowed host slice of `dst.len()` bytes and `src`
         // a bounds-checked device range. The stream is synchronized below, so the write completes
         // while `dst` is still borrowed.
@@ -3513,6 +3688,47 @@ mod tests {
         drop(copy);
         assert_eq!(live(), before, "freed once with the last handle");
         drop((buf, mem, ctx));
+    }
+
+    /// Host copies go through the context's pinned bounce buffer in [`BOUNCE_BYTES`] chunks
+    /// (P5 Task 32 corruption diagnosis): on a v2.3 stub, device round trips of 1 B,
+    /// 4 MiB - 1, 4 MiB, 4 MiB + 1 and 9 MiB at an odd device offset come back exactly, with no
+    /// pageable copy; on a v2.0 stub (no pinned memory) the copies fall back to pageable memory,
+    /// counted, and still round-trip. Breaks if a chunk boundary drops or repeats bytes, the
+    /// offset is not applied per chunk, or the fallback is silent.
+    #[test]
+    fn host_copies_go_through_the_pinned_bounce_buffer() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        for (stub, pinned) in [
+            (env!("TURBINE_STUB_GFX942_V21"), true),
+            (env!("TURBINE_STUB_GFX942"), false),
+        ] {
+            let lib = ShimLibrary::load(Path::new(stub), "hip").expect("load");
+            let ctx = lib
+                .create_context(&mocked_device("gfx942"))
+                .expect("context");
+            let mem: Arc<dyn DeviceMemory> = ctx.clone();
+            let sizes = [
+                1usize,
+                BOUNCE_BYTES - 1,
+                BOUNCE_BYTES,
+                BOUNCE_BYTES + 1,
+                9 << 20,
+            ];
+            let mut copies = 0u64;
+            for n in sizes {
+                let buf = DeviceBuffer::alloc(&mem, n + 3).expect("alloc");
+                let data: Vec<u8> = (0..n).map(|i| (i * 7 + n) as u8).collect();
+                let dst = buf.ptr().offset(3);
+                mem.copy_h2d(dst, &data).expect("h2d");
+                let mut back = vec![0xffu8; n];
+                mem.copy_d2h(&mut back, dst).expect("d2h");
+                assert!(back == data, "{stub}: {n} bytes");
+                copies += 2;
+            }
+            let want = if pinned { 0 } else { copies };
+            assert_eq!(ctx.pageable_copies(), want, "{stub}");
+        }
     }
 
     /// ABI v2.8 (P5 Task 32): a v2.7 library has no device-sequenced step; on the v2.8 stub
