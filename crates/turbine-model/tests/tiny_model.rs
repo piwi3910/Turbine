@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use half::bf16;
 use turbine_core::types::{BlockId, DeviceId, KvLayout, SeqId};
+use turbine_distributed::collective::{Collective, HostCollective};
 use turbine_kernels::torch_topk;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -34,8 +35,10 @@ use turbine_model::testing::tiny::{
     write_tiny_olmoe_with_head_dim,
 };
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
+use turbine_model::tp;
 use turbine_model::{
-    MAX_STAGING_BYTES, ModelError, SafetensorsIndex, WeightLoader, llama_slots, olmoe_slots,
+    MAX_STAGING_BYTES, ModelError, SafetensorsIndex, TpContext, WeightLoader, llama_slots,
+    olmoe_slots,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::host::HostMemory;
@@ -3276,5 +3279,460 @@ fn hip_v23_library_matches_cpu() {
             }
             println!("hip_v23_library_matches_cpu {name} {lib}: max abs logit diff {worst}");
         }
+    }
+}
+
+// ----------------------------------------------------------- tensor parallelism (P5 S-6)
+
+/// Greedy decode steps after the prefill in the tensor-parallel comparisons.
+const TP_STEPS: usize = 16;
+/// Max |Δ logit| of a tensor-parallel group against one device, relative to the row's largest
+/// |logit|. Not the 1e-4 absolute bound of bit-faithful provider comparisons: each all-reduce
+/// adds BF16-rounded partial sums (one device rounds once, after an F32 accumulation over the
+/// whole reduction), so logits move by a few BF16 ulps; measured on the cpu-reference provider
+/// with the tiny checkpoints (logits up to ~24 for Llama, ~3.5 for OLMoE): 9.5e-3 (Llama tp 2),
+/// 1.2e-2 (tp 4), 1.1e-2 (OLMoE tp 2 and 4), i.e. at most 0.19 and 0.031 absolute, with every
+/// greedy token identical. 2^-5 (3.1 %) keeps a ~2.5× margin;
+/// `tp_layer0_matches_one_device_slices` pins the sharding itself bitwise.
+const TP_MAX_SCALED_LOGIT_DIFF: f32 = 1.0 / 32.0;
+
+/// One run's greedy tokens per step and every step's logits rows.
+type GreedyRun = (Vec<[u32; 2]>, Vec<Vec<f32>>);
+
+/// Two ragged sequences (a 20- and a 13-token prompt) prefilled in one batch, then
+/// [`TP_STEPS`] greedy decode steps of both in one batch: the greedy tokens per step and every
+/// step's two logits rows. Sequence `s` keeps its K/V in pool block `s`.
+fn greedy_pair(exec: &mut dyn ModelExecutor, kv: &KvPoolView<'_>, vocab: u32) -> GreedyRun {
+    let prompts: [Vec<u32>; 2] = [
+        prompt(vocab),
+        (0..13u32).map(|i| (i * 29 + 3) % vocab).collect(),
+    ];
+    let tables = [[BlockId(0)], [BlockId(1)]];
+    let mut lens = [prompts[0].len() as u32, prompts[1].len() as u32];
+    let tokens: Vec<u32> = prompts.concat();
+    let positions: Vec<u32> = prompts.iter().flat_map(|p| 0..p.len() as u32).collect();
+    let seqs = [
+        SeqSlice {
+            seq: SeqId(1),
+            q_start: 0,
+            q_len: lens[0],
+            kv_len: lens[0],
+            block_table: &tables[0],
+            reduce: None,
+        },
+        SeqSlice {
+            seq: SeqId(2),
+            q_start: lens[0],
+            q_len: lens[1],
+            kv_len: lens[1],
+            block_table: &tables[1],
+            reduce: None,
+        },
+    ];
+    let mut logits = exec
+        .forward(&BatchInput {
+            tokens: &tokens,
+            positions: &positions,
+            seqs: &seqs,
+            kv,
+        })
+        .expect("prefill");
+    let (mut chosen, mut rows) = (Vec::new(), Vec::new());
+    for _ in 0..TP_STEPS {
+        assert_eq!(logits.rows, 2);
+        rows.extend([logits.row(0).to_vec(), logits.row(1).to_vec()]);
+        let next = [argmax(logits.row(0)), argmax(logits.row(1))];
+        chosen.push(next);
+        let positions = lens;
+        lens = [lens[0] + 1, lens[1] + 1];
+        let seqs: Vec<SeqSlice<'_>> = (0..2)
+            .map(|s| SeqSlice {
+                seq: SeqId(s as u64 + 1),
+                q_start: s as u32,
+                q_len: 1,
+                kv_len: lens[s],
+                block_table: &tables[s],
+                reduce: None,
+            })
+            .collect();
+        logits = exec
+            .forward(&BatchInput {
+                tokens: &next,
+                positions: &positions,
+                seqs: &seqs,
+                kv,
+            })
+            .expect("decode");
+    }
+    rows.extend([logits.row(0).to_vec(), logits.row(1).to_vec()]);
+    (chosen, rows)
+}
+
+/// Rank `s` of `spec`'s model on `provider` over `mem`, its collectives on `collective`.
+fn tp_rank(
+    spec: &TinySpec,
+    s: tp::ShardSpec,
+    collective: Arc<dyn Collective>,
+    provider: Arc<dyn KernelProvider>,
+    mem: &Arc<dyn DeviceMemory>,
+) -> Box<dyn ModelExecutor> {
+    let cfg = &spec.config;
+    let opts = ExecutorOptions::default();
+    let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+    let slots = tp::weight_slots(cfg, s).expect("shard slots");
+    let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load shard");
+    let reqs =
+        tp::available_requirements(cfg, s, BLOCK_TOKENS, opts, std::slice::from_ref(&provider))
+            .expect("requirements");
+    let order = [provider.id()];
+    let card = provider.card_profile();
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
+        .expect("every op has a provider");
+    tp::build_executor(
+        cfg,
+        weights,
+        Arc::new(registry),
+        Arc::clone(mem),
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: 64,
+            max_seqs: MAX_SEQS,
+        },
+        opts,
+        TpContext {
+            rank: s.rank,
+            world: s.world,
+            collective,
+            stream: mem.compute_stream(),
+        },
+    )
+    .expect("rank executor")
+}
+
+/// Runs [`greedy_pair`] on every rank of a `world`-rank group over the host collective, one
+/// thread per rank, each on the memory and provider `env(rank)` gives, with its own pool of its
+/// KV layout; returns every rank's run.
+fn tp_group(
+    spec: &TinySpec,
+    world: u32,
+    env: impl Fn(u32) -> (Arc<dyn DeviceMemory>, Arc<dyn KernelProvider>) + Sync,
+) -> Vec<GreedyRun> {
+    let group = HostCollective::group(world as usize, std::time::Duration::from_secs(60));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = group
+            .into_iter()
+            .enumerate()
+            .map(|(rank, collective)| {
+                let env = &env;
+                scope.spawn(move || {
+                    let s = tp::ShardSpec {
+                        rank: rank as u32,
+                        world,
+                    };
+                    let (mem, provider) = env(s.rank);
+                    let mut exec = tp_rank(spec, s, Arc::new(collective), provider, &mem);
+                    let layout = tp::kv_layout(&spec.config, s, BLOCK_TOKENS).expect("layout");
+                    assert_eq!(*exec.kv_layout(), layout);
+                    let storage = pool(&mem, &layout, 4);
+                    greedy_pair(exec.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("rank thread"))
+            .collect()
+    })
+}
+
+/// Checks a group's runs against one device's: every rank ends each step with bitwise the same
+/// logits rows, the greedy tokens are one device's, and every row's max |Δ logit| is within
+/// `bound` of the row's largest |logit|. Returns the largest such ratio.
+fn check_tp_against_one_device(
+    what: &str,
+    ranks: &[GreedyRun],
+    want: &GreedyRun,
+    bound: f32,
+) -> f32 {
+    for (rank, (tokens, rows)) in ranks.iter().enumerate() {
+        assert!(
+            rows == &ranks[0].1,
+            "{what}: rank {rank} logits differ from rank 0"
+        );
+        assert_eq!(
+            tokens, &want.0,
+            "{what}: greedy tokens differ from one device"
+        );
+    }
+    let mut worst = 0f32;
+    for (row, (got, w)) in ranks[0].1.iter().zip(&want.1).enumerate() {
+        let scale = w.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let diff = max_abs_diff(got, w) / scale;
+        worst = worst.max(diff);
+        assert!(
+            diff <= bound,
+            "{what} row {row}: max |Δ logit| / max |logit| = {diff} > {bound}"
+        );
+    }
+    worst
+}
+
+/// P5 S-6: the tiny Llama (4 heads, 2 KV heads, vocabulary 263 — not divisible by the group,
+/// so the last vocabulary shard is padded) and the tiny OLMoE (4 = 4 KV heads, full-projection
+/// Q/K norm, 8 experts top-2, untied LM head) on the cpu-reference provider, split over 2 and 4
+/// ranks on the host collective (each rank its own host "device" and KV pool, fed the same
+/// batches on its own thread; tp 4 replicates the Llama KV heads), give one device's greedy
+/// tokens for a ragged two-sequence prefill and 16 batched decode steps, with logits within
+/// [`TP_MAX_SCALED_LOGIT_DIFF`] and bitwise equal on every rank; a group of one is bitwise one
+/// device. Breaks if any sharding rule, collective insertion point, vocabulary offset, the
+/// sharded norm or the logits reorder is wrong.
+#[test]
+fn tp2_matches_tp1_on_host() {
+    let tmp = TempDir::new("tiny-model-tp");
+    for spec in both_checkpoints(&tmp) {
+        let name = spec.config.family.0.name();
+        let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let mut one = cpu_model(&spec, &host, 64);
+        let layout = spec.config.kv_layout(BLOCK_TOKENS);
+        let storage = pool(&host, &layout, 4);
+        let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+        for world in [1u32, 2, 4] {
+            let ranks = tp_group(&spec, world, |rank| {
+                let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank), 1 << 30);
+                (mem, cpu_reference_provider())
+            });
+            let what = format!("{name} tp {world}");
+            // A group of one runs the tensor-parallel path with identity collectives: bitwise.
+            let bound = if world == 1 {
+                0.0
+            } else {
+                TP_MAX_SCALED_LOGIT_DIFF
+            };
+            let worst = check_tp_against_one_device(&what, &ranks, &want, bound);
+            println!("tp2_matches_tp1_on_host {what}: max |Δ logit| / max |logit| {worst:e}");
+        }
+    }
+}
+
+/// Lab only: the tensor-parallel path on the HIP provider without RCCL — the head_dim-128 tiny
+/// Llama split over two ranks, each its own context on the same GPU, through the host
+/// collective (which reaches any device memory), against one HIP context: identical greedy
+/// tokens and logits within [`TP_MAX_SCALED_LOGIT_DIFF`]. Proves the HIP shard loading, the
+/// `vocab_offset` embedding, the per-rank GEMM shapes, the all-reduce insertion points and the
+/// device-to-device logits reorder (kernel ABI v2.5 `turbine_memcpy_async`).
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_tp2_matches_tp1() {
+    let tmp = TempDir::new("tiny-model-hip-tp");
+    let spec = write_gpu_tiny(tmp.path());
+    let ctx = hip_context();
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let opts = ExecutorOptions::default();
+    let mut one = cpu_model_with(&spec, &mem, 64, opts, shim_provider(ctx), false);
+    let layout = spec.config.kv_layout(BLOCK_TOKENS);
+    let storage = pool(&mem, &layout, 4);
+    let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+    let ranks = tp_group(&spec, 2, |_| {
+        let ctx = hip_context();
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        (mem, shim_provider(ctx))
+    });
+    let worst = check_tp_against_one_device("hip tp 2", &ranks, &want, TP_MAX_SCALED_LOGIT_DIFF);
+    println!("hip_tp2_matches_tp1: max |Δ logit| / max |logit| {worst:e}");
+}
+
+/// `spec`'s decoder on the cpu-reference provider over `mem`: one device (`rank: None`) or rank
+/// `s` of a tensor-parallel group on `collective`.
+fn tp_decoder(
+    spec: &TinySpec,
+    rank: Option<(tp::ShardSpec, Arc<dyn Collective>)>,
+    mem: &Arc<dyn DeviceMemory>,
+) -> DecoderExecutor {
+    let cfg = &spec.config;
+    let opts = ExecutorOptions::default();
+    let decoder = cfg
+        .family
+        .0
+        .tp_decoder_spec()
+        .expect("tensor-parallel family");
+    let shard = rank.as_ref().map(|(s, _)| *s);
+    let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+    let slots = match shard {
+        Some(s) => tp::weight_slots(cfg, s).expect("shard slots"),
+        None => cfg.family.0.weight_slots(cfg),
+    };
+    let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load");
+    let reqs = DecoderExecutor::requirements_for(cfg, &decoder, BLOCK_TOKENS, opts, shard)
+        .expect("requirements");
+    let provider = cpu_reference_provider();
+    let order = [provider.id()];
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, None)
+        .expect("every op has a provider");
+    DecoderExecutor::new_tp(
+        cfg,
+        decoder,
+        weights,
+        Arc::new(registry),
+        Arc::clone(mem),
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: 64,
+            max_seqs: MAX_SEQS,
+        },
+        opts,
+        rank.map(|(s, collective)| TpContext {
+            rank: s.rank,
+            world: s.world,
+            collective,
+            stream: mem.compute_stream(),
+        }),
+    )
+    .expect("executor")
+}
+
+/// The traced prefill of `prompt(vocab)` on `exec` over a fresh pool of its layout.
+fn traced_prefill(
+    exec: &mut DecoderExecutor,
+    mem: &Arc<dyn DeviceMemory>,
+    vocab: u32,
+) -> Vec<TraceTensor> {
+    let layout = *exec.kv_layout();
+    let storage = pool(mem, &layout, 1);
+    let kv = pool_view(&storage, &layout, 1);
+    exec.set_trace(true);
+    run_seq(exec, &kv, &[BlockId(0)], &prompt(vocab), 0);
+    exec.take_trace()
+}
+
+/// Columns `cols` of every row of trace tensor `t`.
+fn trace_cols(t: &TraceTensor, cols: std::ops::Range<usize>) -> Vec<f32> {
+    t.data
+        .chunks_exact(t.shape[1])
+        .flat_map(|row| row[cols.clone()].to_vec())
+        .collect()
+}
+
+/// Max |a − b| over the largest |b|: how far apart two tensors are at their own scale.
+fn scaled_diff(a: &[f32], b: &[f32]) -> f32 {
+    let scale = b
+        .iter()
+        .fold(0f32, |m, x| m.max(x.abs()))
+        .max(f32::MIN_POSITIVE);
+    max_abs_diff(a, b) / scale
+}
+
+/// P5 S-6, the sharding itself: up to the first all-reduce a tensor-parallel rank computes
+/// exactly one device's numbers for its heads. On both tiny checkpoints at tp 2 (host
+/// collective, cpu-reference provider), layer 0 of a 20-token prefill: the embedding
+/// (vocabulary-parallel, all-reduced: one rank's row plus zeros) is bitwise one device's; each
+/// rank's Q, K and V projections are bitwise the columns of its heads and KV head of one
+/// device's (the Q/K/V shard loading and fused stacks); for Llama the RoPE outputs and the
+/// attention output are too (the rank's KV, positions and head mapping); OLMoE's sharded Q/K
+/// norm and everything after the first all-reduce (O projection, the gate/up inputs of the
+/// rank's intermediate columns, the residual) agree at the BF16 rounding scale (2^-6 of the
+/// tensor's largest value; the partial sums round before they are added). Breaks on a head,
+/// KV-head or column taken from the wrong place, which the end-to-end logits comparison only
+/// bounds.
+#[test]
+fn tp_layer0_matches_one_device_slices() {
+    let tmp = TempDir::new("tiny-model-tp-trace");
+    for spec in both_checkpoints(&tmp) {
+        let name = spec.config.family.0.name();
+        let olmoe = spec.config.qk_norm;
+        let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let mut one = tp_decoder(&spec, None, &host);
+        let want = traced_prefill(&mut one, &host, spec.vocab);
+        let world = 2u32;
+        let group = HostCollective::group(world as usize, std::time::Duration::from_secs(60));
+        let traces: Vec<Vec<TraceTensor>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = group
+                .into_iter()
+                .enumerate()
+                .map(|(rank, c)| {
+                    let spec = &spec;
+                    scope.spawn(move || {
+                        let s = tp::ShardSpec {
+                            rank: rank as u32,
+                            world,
+                        };
+                        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(s.rank), 1 << 30);
+                        let mut exec = tp_decoder(spec, Some((s, Arc::new(c))), &mem);
+                        traced_prefill(&mut exec, &mem, spec.vocab)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("rank"))
+                .collect()
+        });
+        let find = |trace: &[TraceTensor], layer: Option<usize>, op: &str| -> TraceTensor {
+            trace
+                .iter()
+                .find(|t| t.layer == layer && t.name == op)
+                .unwrap_or_else(|| panic!("{name}: no {op} in the trace"))
+                .clone()
+        };
+        let cfg = &spec.config;
+        let hd = cfg.head_dim as usize;
+        let (q_dim, kv_heads) = (
+            cfg.num_attention_heads as usize * hd,
+            cfg.num_kv_heads as usize,
+        );
+        let inter = cfg.moe.map_or(cfg.intermediate, |m| m.expert_intermediate) as usize;
+        let mut worst = 0f32;
+        for (rank, trace) in traces.iter().enumerate() {
+            let what = |op: &str| format!("{name} tp {world} rank {rank} layer 0 {op}");
+            assert_eq!(
+                find(trace, None, "embed").data,
+                find(&want, None, "embed").data,
+                "{}",
+                what("embed")
+            );
+            let heads = rank * q_dim / 2..(rank + 1) * q_dim / 2;
+            let kv_head = rank * kv_heads / 2 * hd..(rank + 1) * kv_heads / 2 * hd;
+            let mut exact = vec![
+                ("q", heads.clone()),
+                ("k", kv_head.clone()),
+                ("v", kv_head.clone()),
+            ];
+            let mut close = vec![
+                ("o_proj", 0..cfg.hidden as usize),
+                ("resid_mlp", 0..cfg.hidden as usize),
+            ];
+            if olmoe {
+                close.extend([
+                    ("q_norm", heads.clone()),
+                    ("k_norm", kv_head.clone()),
+                    ("attn", heads.clone()),
+                ]);
+            } else {
+                exact.extend([
+                    ("q_rope", heads.clone()),
+                    ("k_rope", kv_head.clone()),
+                    ("attn", heads.clone()),
+                ]);
+                let cols = rank * inter / 2..(rank + 1) * inter / 2;
+                close.extend([("gate", cols.clone()), ("up", cols)]);
+            }
+            for (op, cols) in exact {
+                let got = find(trace, Some(0), op);
+                assert_eq!(got.shape[1], cols.len(), "{}", what(op));
+                assert!(
+                    got.data == trace_cols(&find(&want, Some(0), op), cols),
+                    "{} is not one device's bitwise",
+                    what(op)
+                );
+            }
+            for (op, cols) in close {
+                let got = find(trace, Some(0), op);
+                let d = scaled_diff(&got.data, &trace_cols(&find(&want, Some(0), op), cols));
+                worst = worst.max(d);
+                assert!(d <= 1.0 / 64.0, "{}: scaled diff {d}", what(op));
+            }
+        }
+        println!("tp_layer0_matches_one_device_slices {name}: worst scaled diff {worst:e}");
     }
 }

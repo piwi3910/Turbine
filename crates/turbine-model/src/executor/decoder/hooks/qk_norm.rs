@@ -3,9 +3,17 @@
 //! its K projection (`kv_heads·head_dim`) with `self_attn.k_norm.weight`, in place (each row is
 //! read whole before it is written, so the row-strided fused layout works too).
 //!
+//! Tensor parallelism (P5 S-6): a rank holds only its heads' slice of each row, so the norm
+//! runs sharded — `row_sumsq` of the rank's Q and K slices into one F32 buffer, one all-reduce
+//! of those partial sums across the group, then `rmsnorm_sharded` of each slice with the full
+//! row's mean square and the rank's slice of the weight.
+//!
 //! Q/K RMSNorm per head (Qwen3): [`QkNormPerHead`], below.
-use turbine_kernels::OpConfig;
-use turbine_tensor::TensorView;
+use turbine_core::types::DType;
+use turbine_kernels::{
+    OpConfig, RmsnormShardedConfig, RmsnormShardedContext, RowSumsqConfig, RowSumsqContext,
+};
+use turbine_tensor::{Tensor, TensorView};
 
 use crate::ModelError;
 use crate::executor::decoder::{AttentionHook, DecoderDims, HookWeights, LayerRun, invalid};
@@ -26,11 +34,25 @@ impl AttentionHook for QkNormFull {
         "qk_norm_full"
     }
 
+    /// One device: RMSNorm over `q_dim` and `kv_dim`. A tensor-parallel rank: `row_sumsq` and
+    /// `rmsnorm_sharded` over its slices.
     fn requirements(&self, d: &DecoderDims) -> Vec<OpConfig> {
-        vec![
-            OpConfig::Rmsnorm(d.norm(d.q_dim)),
-            OpConfig::Rmsnorm(d.norm(d.kv_dim)),
-        ]
+        match d.tp {
+            None => vec![
+                OpConfig::Rmsnorm(d.norm(d.q_dim)),
+                OpConfig::Rmsnorm(d.norm(d.kv_dim)),
+            ],
+            Some(_) => {
+                let (q_sum, q_norm) = sharded(d, false);
+                let (k_sum, k_norm) = sharded(d, true);
+                vec![
+                    OpConfig::RowSumsq(q_sum),
+                    OpConfig::RowSumsq(k_sum),
+                    OpConfig::RmsnormSharded(q_norm),
+                    OpConfig::RmsnormSharded(k_norm),
+                ]
+            }
+        }
     }
 
     fn fuses_qkv(&self) -> bool {
@@ -56,11 +78,87 @@ impl AttentionHook for QkNormFull {
         q: &TensorView<'_>,
         k: &TensorView<'_>,
     ) -> Result<(), ModelError> {
+        if let Some(sumsq) = run.sumsq() {
+            return sharded_norms(run, w, q, k, sumsq);
+        }
         run.rmsnorm(q.clone(), &w.0[Q_NORM], q.clone())?;
         run.trace("q_norm", q)?;
         run.rmsnorm(k.clone(), &w.0[K_NORM], k.clone())?;
         run.trace("k_norm", k)
     }
+}
+
+/// The `row_sumsq` and `rmsnorm_sharded` configs of the rank's Q slice (`k` false: normalised
+/// over the model's Q width) or K slice (`k`: over the K norm's width,
+/// [`crate::executor::decoder::TpDims`]).
+fn sharded(d: &DecoderDims, k: bool) -> (RowSumsqConfig, RmsnormShardedConfig) {
+    let tp = d.tp.expect("sharded norms only on a tensor-parallel rank");
+    let (dim, full) = if k {
+        (d.kv_dim, tp.k_norm_dim)
+    } else {
+        (d.q_dim, tp.q_norm_dim)
+    };
+    (
+        RowSumsqConfig {
+            dim: dim as u32,
+            dtype: d.act,
+        },
+        RmsnormShardedConfig {
+            dim: dim as u32,
+            full_dim: full as u32,
+            dtype: d.act,
+        },
+    )
+}
+
+/// The tensor-parallel Q/K norm: partial sums of squares of both slices into `sumsq` (Q rows
+/// first), one F32 all-reduce, then each slice normalised in place.
+fn sharded_norms(
+    run: &LayerRun<'_>,
+    w: &HookWeights,
+    q: &TensorView<'_>,
+    k: &TensorView<'_>,
+    sumsq: &Tensor,
+) -> Result<(), ModelError> {
+    let (d, t) = (run.dims, run.tokens);
+    let sums = |i: usize| TensorView::contiguous(sumsq.storage.whole(), i * t, &[t], DType::F32);
+    for (i, x) in [(0, q), (1, k)] {
+        let (cfg, _) = sharded(d, i == 1);
+        run.op(OpConfig::RowSumsq(cfg), || {
+            run.registry
+                .row_sumsq(&cfg)
+                .row_sumsq(&mut RowSumsqContext {
+                    x: x.clone(),
+                    sumsq: sums(i),
+                })
+        })?;
+    }
+    run.all_reduce(&TensorView::contiguous(
+        sumsq.storage.whole(),
+        0,
+        &[2 * t],
+        DType::F32,
+    ))?;
+    for (i, x, weight, name) in [
+        (0, q, &w.0[Q_NORM], "q_norm"),
+        (1, k, &w.0[K_NORM], "k_norm"),
+    ] {
+        let (_, cfg) = sharded(d, i == 1);
+        run.op(OpConfig::RmsnormSharded(cfg), || {
+            run.registry
+                .rmsnorm_sharded(&cfg)
+                .rmsnorm_sharded(&mut RmsnormShardedContext {
+                    x: x.clone(),
+                    sumsq: sums(i),
+                    weight: weight.view(),
+                    out: x.clone(),
+                    full_dim: cfg.full_dim,
+                    eps: d.eps,
+                })
+        })?;
+        run.trace(name, x)?;
+    }
+    Ok(())
 }
 
 /// RMSNorm over each Q and K head (Qwen3, Qwen3-MoE): before RoPE, every `head_dim` elements

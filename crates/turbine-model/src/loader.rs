@@ -36,6 +36,54 @@ pub struct WeightSlot {
     /// `Some`: the tensor is a contiguous part of the stacked parameter `stack.name` and is
     /// loaded only as part of it (`LoadedWeights` holds the stack, not the slot's own name).
     pub stack: Option<StackPlace>,
+    /// `Some`: the slot is one tensor-parallel rank's shard of a larger checkpoint tensor
+    /// ([`crate::tp::weight_slots`]); only its bytes are read. `None`: the whole tensor, of
+    /// `shape`.
+    pub source: Option<SlotSource>,
+}
+
+/// The part of a checkpoint tensor of `shape` a sharded [`WeightSlot`] loads: elements
+/// `[start, start + len)` along `axis` (0: whole rows, one contiguous byte range; 1: a column
+/// block of a 2-D tensor, one positioned read per row), every other dimension whole. The slot's
+/// own `shape` is the checkpoint's with `len` along `axis`, except that along axis 0 it may be
+/// longer: the rows past `len` are zeros (the last vocabulary shard's padding).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotSource {
+    pub shape: Vec<usize>,
+    pub axis: usize,
+    pub start: usize,
+    pub len: usize,
+}
+
+impl SlotSource {
+    /// Whether `slot_shape` can hold this part (see [`SlotSource`]).
+    fn fits(&self, slot_shape: &[usize]) -> bool {
+        let dims = self.shape.len();
+        (self.axis == 0 && dims >= 1 || self.axis == 1 && dims == 2)
+            && slot_shape.len() == dims
+            && self.start + self.len <= self.shape[self.axis]
+            && (0..dims).all(|d| {
+                if d != self.axis {
+                    slot_shape[d] == self.shape[d]
+                } else if d == 0 {
+                    slot_shape[d] >= self.len
+                } else {
+                    slot_shape[d] == self.len
+                }
+            })
+    }
+
+    /// The `(file offset, bytes)` runs to read, relative to the tensor's first byte, in
+    /// destination order.
+    fn runs(&self, es: usize) -> Vec<(u64, usize)> {
+        let inner: usize = self.shape[1..].iter().product();
+        match self.axis {
+            0 => vec![((self.start * inner * es) as u64, self.len * inner * es)],
+            _ => (0..self.shape[0])
+                .map(|r| (((r * inner + self.start) * es) as u64, self.len * es))
+                .collect(),
+        }
+    }
 }
 
 /// Elements `[offset, offset + slot numel)` of the stacked parameter `name` of `shape`: an entry
@@ -79,6 +127,7 @@ pub(crate) fn row_concat(stack: String, parts: &[(String, usize)], cols: usize) 
                     shape: vec![total, cols],
                     offset,
                 }),
+                source: None,
             };
             offset += rows * cols;
             slot
@@ -165,11 +214,21 @@ impl WeightLoader {
                 .get(&slot.name)
                 .ok_or_else(|| ModelError::MissingTensor(slot.name.clone()))?;
             format.check_tensor(entry)?;
-            if entry.shape != slot.shape {
+            let expected = slot.source.as_ref().map_or(&slot.shape, |src| &src.shape);
+            if entry.shape != *expected {
                 return Err(ModelError::Safetensors {
                     file: entry.file.clone(),
                     tensor: entry.name.clone(),
-                    rule: format!("shape {:?} != expected {:?}", entry.shape, slot.shape),
+                    rule: format!("shape {:?} != expected {:?}", entry.shape, expected),
+                });
+            }
+            if let Some(src) = &slot.source
+                && !src.fits(&slot.shape)
+            {
+                return Err(ModelError::Safetensors {
+                    file: entry.file.clone(),
+                    tensor: entry.name.clone(),
+                    rule: format!("shard {src:?} does not fit slot shape {:?}", slot.shape),
                 });
             }
             planned.push((slot, entry));
@@ -201,7 +260,15 @@ impl WeightLoader {
             }
         }
 
-        let largest = planned.iter().map(|(_, e)| e.byte_len()).max().unwrap_or(0);
+        let dtype = format.weight_dtype();
+        let largest = planned
+            .iter()
+            .map(|(slot, e)| match slot.source {
+                None => e.byte_len(),
+                Some(_) => (slot.shape.iter().product::<usize>() * dtype.size_bytes()) as u64,
+            })
+            .max()
+            .unwrap_or(0);
         let staging_len = staging_bytes
             .min(MAX_STAGING_BYTES)
             .min(usize::try_from(largest).unwrap_or(usize::MAX))
@@ -210,7 +277,6 @@ impl WeightLoader {
         let mut files: HashMap<PathBuf, File> = HashMap::new();
         let mut tensors: HashMap<String, Tensor> = HashMap::with_capacity(planned.len());
         let mut weight_bytes = 0u64;
-        let dtype = format.weight_dtype();
         for (slot, entry) in planned {
             // The destination tensor and this slot's byte offset in it.
             let (key, shape, base) = match &slot.stack {
@@ -228,6 +294,19 @@ impl WeightLoader {
                     files.entry(entry.file.clone()).or_insert(f)
                 }
             };
+            if let Some(src) = &slot.source {
+                weight_bytes += upload_shard(
+                    file,
+                    entry,
+                    src,
+                    &mut staging,
+                    tensor,
+                    base,
+                    (slot.shape.iter().product::<usize>() * dtype.size_bytes()) as u64,
+                    mem.as_ref(),
+                )?;
+                continue;
+            }
             let mut done = 0u64;
             while done < entry.byte_len() {
                 let n = (entry.byte_len() - done).min(staging_len as u64) as usize;
@@ -253,6 +332,71 @@ impl WeightLoader {
             ignored,
         })
     }
+}
+
+/// Uploads the part `src` of checkpoint tensor `entry` to `tensor` at byte `base`, then zeros up
+/// to `dest_bytes` (the padding rows), through `staging`: the runs of [`SlotSource::runs`] are
+/// read with positioned reads into consecutive staging bytes, each full staging buffer uploaded
+/// once (so a column block of many short rows is one upload per buffer, not per row). Returns
+/// the checkpoint bytes read.
+#[allow(clippy::too_many_arguments)]
+fn upload_shard(
+    file: &File,
+    entry: &TensorEntry,
+    src: &SlotSource,
+    staging: &mut [u8],
+    tensor: &mut Tensor,
+    base: usize,
+    dest_bytes: u64,
+    mem: &dyn DeviceMemory,
+) -> Result<u64, ModelError> {
+    let numel = entry.shape.iter().product::<usize>().max(1) as u64;
+    let es = (entry.byte_len() / numel) as usize;
+    let mut filled = 0usize;
+    let mut written = 0usize;
+    let mut read = 0u64;
+    let mut flush = |staging: &[u8], filled: &mut usize, written: &mut usize| {
+        if *filled == 0 {
+            return Ok::<(), ModelError>(());
+        }
+        tensor
+            .storage
+            .copy_from_host(base + *written, &staging[..*filled])?;
+        mem.synchronize()?;
+        *written += *filled;
+        *filled = 0;
+        Ok(())
+    };
+    for (offset, len) in src.runs(es) {
+        let mut done = 0usize;
+        while done < len {
+            if filled == staging.len() {
+                flush(staging, &mut filled, &mut written)?;
+            }
+            let n = (len - done).min(staging.len() - filled);
+            file.read_exact_at(
+                &mut staging[filled..filled + n],
+                entry.range.start + offset + done as u64,
+            )
+            .map_err(|e| io_err(&entry.file, e))?;
+            filled += n;
+            done += n;
+            read += n as u64;
+        }
+    }
+    flush(staging, &mut filled, &mut written)?;
+    // Padding rows: zeros, a staging buffer at a time.
+    let pad = dest_bytes as usize - written;
+    if pad > 0 {
+        staging.fill(0);
+        let mut done = 0usize;
+        while done < pad {
+            filled = (pad - done).min(staging.len());
+            done += filled;
+            flush(staging, &mut filled, &mut written)?;
+        }
+    }
+    Ok(read)
 }
 
 /// Every stack is tiled exactly: each slot's trailing dimensions are the stack's, and the slots

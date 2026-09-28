@@ -23,7 +23,7 @@ pub mod rope;
 pub use batch::SequenceKv;
 pub use decoder::{
     AttentionHook, DecoderDims, DecoderExecutor, DecoderSpec, FfnHook, HookBuffers, HookWeights,
-    LayerRun, TraceTensor,
+    LayerRun, TpDims, TraceTensor,
 };
 pub use graphs::{DecodeGraphs, GraphBackend, GraphCache, GraphCounters, GraphKey, GraphStep};
 pub use profile::{OpProfile, OpProfileEntry};

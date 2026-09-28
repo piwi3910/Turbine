@@ -91,6 +91,11 @@ impl ModelFamily for Olmoe {
         DecoderExecutor::workspace_bytes(cfg, &decoder_spec(), limits)
     }
 
+    /// Tensor parallelism (P5 S-6): the same hooks on the rank's shard.
+    fn tp_decoder_spec(&self) -> Option<DecoderSpec> {
+        Some(decoder_spec())
+    }
+
     fn default_tool_format(&self) -> Option<&'static str> {
         None
     }
@@ -184,6 +189,7 @@ pub(crate) fn moe_slots(
         name,
         shape,
         stack: None,
+        source: None,
     };
 
     let mut slots = vec![slot(
@@ -225,6 +231,7 @@ pub(crate) fn moe_slots(
                 name: format!("{p}.{}.{e}.{proj}.weight", names.experts),
                 shape,
                 stack: Some(place),
+                source: None,
             }
         };
         for e in 0..experts {

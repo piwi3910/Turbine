@@ -26,6 +26,17 @@ pub const MOE_OFFSETS_READ: &str = "moe_offsets_read";
 /// OLMoE: resetting the BF16 expert accumulator to zero (`0 + 0` through the registry's
 /// `add`: kernel ABI v2 has no device-to-device copy); implementation [`ZERO_ADD`].
 pub const MOE_ZERO: &str = "moe_zero";
+/// Tensor parallelism: an all-reduce of the rank's partial sums (embedding, O and down
+/// projections, sharded norms); implementation: the collective backend.
+pub const TP_ALL_REDUCE: &str = "tp_all_reduce";
+/// Tensor parallelism: the all-gather of the ranks' LM-head shards; implementation: the
+/// collective backend.
+pub const TP_ALL_GATHER: &str = "tp_all_gather";
+/// Tensor parallelism: the device-to-device copies reordering the gathered shards into
+/// row-major logits rows; implementation [`D2D`].
+pub const TP_LOGITS_REORDER: &str = "tp_logits_reorder";
+/// Implementation name of device-to-device copies.
+pub const D2D: &str = "d2d";
 /// Implementation name of host work followed by a host-to-device copy.
 pub const HOST: &str = "host";
 /// Implementation name of a device-to-host copy.

@@ -23,6 +23,7 @@ pub mod structured;
 pub mod testing;
 pub mod tokenizer;
 pub mod tools;
+pub mod tp;
 pub mod weights;
 
 /// The sampler at its Phase 1 path, so `turbine_model::sampler::…` keeps resolving.
@@ -48,6 +49,7 @@ pub use structured::{
 };
 pub use tokenizer::{IncrementalDetokenizer, Tokenizer};
 pub use tools::{ToolCallParser, ToolChoice, ToolParse, new_call_id, tool_call_grammar};
+pub use tp::TpContext;
 
 /// Every failure of the model layer (contract §10). Messages name the offending file, field or
 /// tensor so a startup failure is actionable from the log line alone.
@@ -83,6 +85,10 @@ pub enum ModelError {
     Constraint(String),
     #[error(transparent)]
     Kernel(#[from] KernelError),
+    /// A tensor-parallel rank's collective failed (P5 S-6): a timeout, a peer's abort or a
+    /// backend error; the group's communicator is unusable afterwards.
+    #[error("collective: {0}")]
+    Collective(#[from] turbine_distributed::collective::CollectiveError),
 }
 
 impl From<MemoryError> for ModelError {
