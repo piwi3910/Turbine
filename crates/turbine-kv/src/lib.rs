@@ -1,6 +1,7 @@
 //! Turbine KV cache (contract §11, TS §8). Each module is a separate boundary with its own
 //! public API — there is no catch-all "KV manager" (TS §21 rule 6).
 
+pub mod codec;
 pub mod directory;
 pub mod document;
 pub mod hierarchy;
@@ -28,7 +29,21 @@ mod test_log;
 /// registered module its extension point's suite, run over the registry itself.
 #[cfg(test)]
 mod registry_conformance {
+    use crate::codec::{self, conformance::kv_codecs_suite};
     use crate::policy::{self, conformance::eviction_policies_suite};
+
+    /// Every KV codec fits its slot, round-trips exactly (lossless) or within its documented
+    /// bound (lossy) on seeded Gaussian and outlier-heavy blocks, encodes deterministically and
+    /// refuses short buffers (`kv_codecs_suite`); `l0` is first and slot sizes never grow along
+    /// the lossiness order. Catches a codec that breaks the contract.
+    #[test]
+    fn kv_codecs() {
+        let reg = codec::registry();
+        assert_eq!(reg.point(), "kv_format");
+        if let Err(failures) = kv_codecs_suite(reg) {
+            panic!("kv codec conformance failures:\n{}", failures.join("\n"));
+        }
+    }
 
     /// Every eviction policy scores finitely and deterministically and orders every candidate
     /// (`eviction_policies_suite`); `cost_aware` is the configuration default and comes first.
