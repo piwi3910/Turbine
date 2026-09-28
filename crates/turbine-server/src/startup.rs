@@ -43,9 +43,11 @@ use turbine_core::types::DeviceId;
 use turbine_device::telemetry::TelemetryMetrics;
 use turbine_device::topology::{RegisteredTopology, TopologyGraph, discover_topology};
 use turbine_device::{DeviceInventory, DeviceMetrics, DiscoveryOptions};
+use turbine_distributed::collective::CollectiveMetrics;
 use turbine_kv::KvMetrics;
 use turbine_kv::tier::L2NvmeTier;
 use turbine_model::ModelMetrics;
+use turbine_model::tp::ShardSpec;
 use turbine_observability::MetricsRegistry;
 use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_scheduler::SchedulerMetrics;
@@ -55,7 +57,7 @@ use crate::cli::Cli;
 use crate::engine::{self, EngineMetrics, Fatal, KvSetup, ReliabilityStartup, Timeouts};
 use crate::exit::ExitCode;
 use crate::host;
-use crate::kv_orchestrator::{self, kv_format};
+use crate::kv_orchestrator::{self, tp_kv_format};
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
 use crate::modules::known_module_names;
@@ -153,7 +155,7 @@ pub fn run(cli: Cli) -> ExitCode {
     // P5 S-4: the parallel plan before the kernel provider and the listener (exit 2, or exit 1
     // when the model config it needs is unreadable).
     let plan = match parallel::plan_for(&config, &inventory, &topology).and_then(|p| {
-        parallel::check_executable(&p)?;
+        parallel::check_executable(&p, &config)?;
         Ok(p)
     }) {
         Ok(p) => p,
@@ -197,34 +199,71 @@ pub fn run(cli: Cli) -> ExitCode {
     parallel::register_info(&metrics, &plan);
     // Steps 4–6 per data-parallel replica (P5 S-7): replica 0 on the plan's first device, the
     // others on theirs, sharing the grammar compiler and the kernel metrics. Replicas that share
-    // a device (`parallel.allow_device_sharing`) split its budget.
-    let devices: Vec<DeviceId> = plan.groups.iter().map(|g| g.ranks[0].device).collect();
-    let kv_metrics = KvMetrics::register(&metrics);
-    let mut replicas: Vec<ReplicaStart> = Vec::with_capacity(devices.len());
-    for (r, &device) in devices.iter().enumerate() {
-        let cfg = replica_config(&config, r, devices.len(), device);
-        let prepared = match replicas.first() {
-            None => model::prepare(&cfg, &inventory, &metrics),
-            Some(base) => model::prepare_replica(&cfg, &inventory, &base.prepared),
-        };
-        let mut prepared = match prepared {
-            Ok(p) => p,
+    // a device (`parallel.allow_device_sharing`) split its budget. With tensor parallelism
+    // (P5 S-6) each replica is a group: every rank is prepared on its device for its shard, and
+    // the collective backend loads once (exit 1 naming the library when it cannot).
+    let tp = plan.tp;
+    let collective = if tp > 1 {
+        match parallel::load_collective(&config, &plan) {
+            Ok(library) => Some((library, CollectiveMetrics::register(&metrics))),
             Err(e) => {
-                tracing::error!(replica = r, error = %e, "model startup failed");
+                tracing::error!(event = "collective_unavailable", backend = plan.backend, error = %e, "collective backend unavailable");
                 eprintln!("turbine-server: {e}");
                 return ExitCode::Startup;
             }
+        }
+    } else {
+        None
+    };
+    // Rank slots of every group on `device`: replicas sharing it split its budget.
+    let slots_on = |device: DeviceId| {
+        plan.groups
+            .iter()
+            .flat_map(|g| &g.ranks)
+            .filter(|s| s.device == device)
+            .count() as u32
+    };
+    let shard = |rank: u32| (tp > 1).then_some(ShardSpec { rank, world: tp });
+    let startup_failed = |r: usize, e: &dyn std::fmt::Display| {
+        tracing::error!(replica = r, error = %e, "model startup failed");
+        eprintln!("turbine-server: {e}");
+        ExitCode::Startup
+    };
+    let kv_metrics = KvMetrics::register(&metrics);
+    let mut replicas: Vec<ReplicaStart> = Vec::with_capacity(plan.groups.len());
+    for (r, group) in plan.groups.iter().enumerate() {
+        let device = group.ranks[0].device;
+        let cfg = replica_config(&config, r, plan.groups.len(), device);
+        let prepared = match replicas.first() {
+            None => model::prepare_rank(&cfg, &inventory, &metrics, shard(0)),
+            Some(base) => model::prepare_replica(&cfg, &inventory, &base.prepared, shard(0)),
         };
-        let sharing = devices.iter().filter(|d| **d == device).count() as u32;
-        if let Err(e) = prepared.share_device(sharing) {
-            tracing::error!(replica = r, error = %e, "model startup failed");
-            eprintln!("turbine-server: {e}");
-            return ExitCode::Startup;
+        let mut prepared = match prepared {
+            Ok(p) => p,
+            Err(e) => return startup_failed(r, &e),
+        };
+        if let Err(e) = prepared.share_device(slots_on(device)) {
+            return startup_failed(r, &e);
+        }
+        let mut workers = Vec::with_capacity(group.ranks.len().saturating_sub(1));
+        for slot in group.ranks.iter().skip(1) {
+            let mut rank_cfg = cfg.clone();
+            rank_cfg.execution.device = slot.device;
+            let mut worker =
+                match model::prepare_replica(&rank_cfg, &inventory, &prepared, shard(slot.rank)) {
+                    Ok(w) => w,
+                    Err(e) => return startup_failed(r, &e),
+                };
+            if let Err(e) = worker.share_device(slots_on(slot.device)) {
+                return startup_failed(r, &e);
+            }
+            workers.push(worker);
         }
         // P4: the model's block size is known now (exit 2), and L2 opens before the listener
-        // binds (exit 1 naming the path).
-        let layout = prepared.pool.layout;
-        if let Err(e) = cfg.kv.validate_block_bytes(layout.block_bytes()) {
+        // binds (exit 1 naming the path). A tier copy of a tensor-parallel block holds every
+        // rank's shard (decision "P5 T17" B).
+        let format = tp_kv_format(prepared.pool.layout, tp);
+        if let Err(e) = cfg.kv.validate_block_bytes(format.block_bytes()) {
             eprintln!("turbine-server: invalid configuration: {e}");
             return ExitCode::Config;
         }
@@ -235,7 +274,7 @@ pub fn run(cli: Cli) -> ExitCode {
         };
         let l2 = match kv_orchestrator::open_l2(
             &cfg.kv,
-            &kv_format(layout),
+            &format,
             &prepared.identity,
             Arc::new(SystemClock::new()),
             replica_kv_metrics.clone(),
@@ -247,8 +286,20 @@ pub fn run(cli: Cli) -> ExitCode {
                 return ExitCode::Startup;
             }
         };
+        let group = collective
+            .as_ref()
+            .map(|(library, metrics)| engine::tp::TpGroupStart {
+                workers,
+                library: Arc::clone(library),
+                init_timeout: config.parallel.collective.init_timeout.0,
+                op_timeout: config.parallel.collective.op_timeout.0,
+                depth: config.parallel.plan_queue_depth as usize,
+                metrics: metrics.clone(),
+                clock: Arc::new(SystemClock::new()),
+            });
         replicas.push(ReplicaStart {
             prepared,
+            group,
             kv_cfg: cfg.kv.clone(),
             kv_metrics: replica_kv_metrics,
             l2,
@@ -301,6 +352,8 @@ struct ServeCluster {
 /// metrics and its L2 tier (Phase 4).
 struct ReplicaStart {
     prepared: PreparedModel,
+    /// Tensor parallelism: the group's worker ranks and its collective backend (P5 S-6).
+    group: Option<engine::tp::TpGroupStart>,
     kv_cfg: KvConfig,
     kv_metrics: KvMetrics,
     l2: Option<Arc<L2NvmeTier>>,
@@ -410,6 +463,7 @@ async fn serve(
         };
         if let Err(e) = engine::spawn(
             replica.prepared,
+            replica.group,
             Arc::clone(&backend),
             metrics,
             startup,

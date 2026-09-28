@@ -7,11 +7,16 @@
 # Scenarios (P5 S-9; everything runs inside the Job on loopback — no Service, no host port):
 #   collbench-novanas  turbine-collbench --backend rccl --devices 0,1 --op all --max-bytes 1GiB;
 #                      PASS when every row is correct and all-reduce busbw > 0 at 268,435,456 B.
-#   tp2-novanas        Llama-3.2-3B-Instruct at tensor_parallel_size 2 in local mode, then in
-#                      static mode (ranks 0 and 1, leader 127.0.0.1:18100), then OLMoE-1B-7B at
-#                      tp 2 in local mode: each passes turbine-golden compare against its
-#                      committed reference; then turbine-bench --concurrency 4 --requests 64
-#                      against the local-mode Llama server must report requests_ok 64.
+#   tp2-novanas        Llama-3.2-3B-Instruct: first a tp 1 baseline on device 0 on the standard
+#                      throughput workload (512-word prompts, 256 tokens with --ignore-eos,
+#                      concurrency 16, 200 requests, after a 16-request warm-up); then tp 2 in
+#                      local mode (golden at concurrency 1 — strict bounds — and 16 — batched
+#                      bounds, the TP accuracy bound; turbine-bench --concurrency 4 --requests 64
+#                      must report requests_ok 64; the standard workload), then OLMoE-1B-7B at
+#                      tp 2 in local mode (golden c1 and c16), then Llama in static mode (ranks
+#                      0 and 1, leader 127.0.0.1:18100; golden c1 and c16). Prints one
+#                      `tp-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run.
+#                      2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
 #   dp2-novanas        Llama-3.2-3B-Instruct at tp 1 on the standard throughput workload
 #                      (512-word prompts, 256 tokens with --ignore-eos, 200 requests, after a
 #                      16-request warm-up): first a dp 1 baseline on device 0 at concurrency 16,
@@ -187,10 +192,34 @@ scenario_collbench_sweep() {
 
 scenario_tp2() {
 	local llama=scripts/lab/phase5-novanas-llama.yaml olmoe=scripts/lab/phase5-novanas-olmoe.yaml
+	# The tp 1 baseline: the same configuration with one rank on device 0.
+	start_server "${WORK}/tp1.log" "$llama" --set parallel.tensor_parallel_size=1 \
+		--set "parallel.devices=[0]"
+	wait_ready "$URL" "${WORK}/tp1.log"
+	bench_ok 16 "${WORK}/tp1-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
+	bench_ok 200 "${WORK}/tp1-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	stop_servers
+
 	start_server "${WORK}/tp2-local.log" "$llama"
 	wait_ready "$URL" "${WORK}/tp2-local.log"
-	golden llama-3.2-3b-instruct "llama tp2 local"
+	golden llama-3.2-3b-instruct "llama tp2 local c1"
+	golden llama-3.2-3b-instruct "llama tp2 local c16" --concurrency 16
 	bench_ok 64 "${WORK}/tp2-bench.json" --concurrency 4 --requests 64
+	bench_ok 16 "${WORK}/tp2-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
+	bench_ok 200 "${WORK}/tp2-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	local f
+	for f in tp1-c16 tp2-c16 tp2; do
+		jq -r --arg f "$f" '"tp-bench \($f) tok/s=\(.output_token_throughput) ttft_p50_ms=\(.ttft_ms.p50) itl_p50_ms=\(.itl_ms.p50) requests_ok=\(.requests_ok)"' \
+			"${WORK}/${f}-bench.json"
+	done
+	stop_servers
+
+	start_server "${WORK}/tp2-olmoe.log" "$olmoe"
+	wait_ready "$URL" "${WORK}/tp2-olmoe.log"
+	golden olmoe-1b-7b-0125-instruct "olmoe tp2 local c1"
+	golden olmoe-1b-7b-0125-instruct "olmoe tp2 local c16" --concurrency 16
 	stop_servers
 
 	# Static mode: one process per rank; rank 1 joins the leader on 127.0.0.1:18100 and serves
@@ -202,12 +231,8 @@ scenario_tp2() {
 	start_server "${WORK}/tp2-static-rank0.log" "$llama" "${static[@]}" \
 		--set parallel.ranks.rank=0 --set "parallel.ranks.local_devices=[0]"
 	wait_ready "$URL" "${WORK}/tp2-static-rank0.log"
-	golden llama-3.2-3b-instruct "llama tp2 static"
-	stop_servers
-
-	start_server "${WORK}/tp2-olmoe.log" "$olmoe"
-	wait_ready "$URL" "${WORK}/tp2-olmoe.log"
-	golden olmoe-1b-7b-0125-instruct "olmoe tp2 local"
+	golden llama-3.2-3b-instruct "llama tp2 static c1"
+	golden llama-3.2-3b-instruct "llama tp2 static c16" --concurrency 16
 	stop_servers
 }
 

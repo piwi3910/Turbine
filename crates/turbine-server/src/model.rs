@@ -27,10 +27,12 @@ use turbine_kernels::{
 use turbine_kv::metrics::log_pool_startup;
 use turbine_kv::{BlockPool, BlockPoolConfig};
 use turbine_model::executor::{
-    self, BatchInput, DecodeGraphs, ExecutorOptions, GraphBackend, ModelExecutor, SeqSlice, graphs,
+    self, BatchInput, DecodeGraphs, ExecutorLimits, ExecutorOptions, GraphBackend, ModelExecutor,
+    SeqSlice, graphs,
 };
 use turbine_model::formats::{self, BoundToolFormat, ToolFormat};
 use turbine_model::loader::LoadedWeights;
+use turbine_model::tp::{self, ShardSpec};
 use turbine_model::{
     ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES, ModelArchConfig,
     ModelError, ModelFamily, ModelMetrics, SafetensorsIndex, Tokenizer, WeightLoader,
@@ -260,6 +262,11 @@ pub struct PreparedModel {
     pub identity: ModelIdentity,
     /// The kernel crate's metrics, registered once and shared by every replica (P5).
     pub kernel_metrics: KernelMetrics,
+    /// Tensor parallelism (P5 S-6): the rank of its group this model is prepared for (its
+    /// weight shard, KV heads, op shapes and workspace); `None` on one device.
+    pub shard: Option<ShardSpec>,
+    /// Bytes of the weights this rank loads: its shard, or the whole model.
+    pub weight_bytes: u64,
 }
 
 /// The model's identity (P4 §Data namespace key): BLAKE3 of `config.json` and of the
@@ -285,25 +292,44 @@ pub fn model_identity(dir: &Path) -> Result<ModelIdentity, StartupError> {
     Ok(ModelIdentity::from_bytes(&config, &index))
 }
 
-/// Steps 4–6: provider, model config + tokenizer + template, registry, memory budget. No weight
-/// byte is read here (safetensors headers only).
-pub fn prepare(
+/// Steps 4–6: provider, model config + tokenizer + template, registry, memory budget, on one
+/// device (`shard` `None`) or for rank `shard` of a tensor-parallel group (P5 S-6: the kernel
+/// registry of the rank's op shapes, its workspace, its KV layout — its KV heads — and a budget
+/// for its weight shard). No weight byte is read here (safetensors headers only).
+pub fn prepare_rank(
     config: &Config,
     inventory: &DeviceInventory,
     metrics: &MetricsRegistry,
+    shard: Option<ShardSpec>,
 ) -> Result<PreparedModel, StartupError> {
-    prepare_with(config, inventory, &KernelMetrics::register(metrics), None)
+    prepare_with(
+        config,
+        inventory,
+        &KernelMetrics::register(metrics),
+        None,
+        shard,
+    )
 }
 
-/// Steps 4–6 for another data-parallel replica (P5 S-7) on `config.execution.device`: its own
-/// provider, kernel registry and memory budget; the grammar compiler (its token trie) and the
-/// kernel metrics are `base`'s.
+/// Steps 4–6 for another data-parallel replica (P5 S-7), or another rank `shard` of a
+/// tensor-parallel group, on `config.execution.device`: its own provider, kernel registry and
+/// memory budget; the grammar compiler (its token trie) and the kernel metrics are `base`'s.
 pub fn prepare_replica(
     config: &Config,
     inventory: &DeviceInventory,
     base: &PreparedModel,
+    shard: Option<ShardSpec>,
 ) -> Result<PreparedModel, StartupError> {
-    prepare_with(config, inventory, &base.kernel_metrics, Some(base))
+    prepare_with(config, inventory, &base.kernel_metrics, Some(base), shard)
+}
+
+/// The device bytes `slots` take (BF16, the only weight dtype tensor parallelism serves; a
+/// stacked slot is its part of the stack; a padded vocabulary shard counts its padding rows).
+fn slot_bytes(slots: &[turbine_model::WeightSlot]) -> u64 {
+    slots
+        .iter()
+        .map(|s| s.shape.iter().product::<usize>() as u64 * 2)
+        .sum()
 }
 
 fn prepare_with(
@@ -311,6 +337,7 @@ fn prepare_with(
     inventory: &DeviceInventory,
     kernel_metrics: &KernelMetrics,
     base: Option<&PreparedModel>,
+    shard: Option<ShardSpec>,
 ) -> Result<PreparedModel, StartupError> {
     let provider = load_provider(config, inventory)?;
 
@@ -359,8 +386,35 @@ fn prepare_with(
         .filter(|p| opened.order.contains(&p.id()))
         .cloned()
         .collect();
-    let mut requirements =
-        executor::available_requirements(&arch, block_tokens, executor_options, &ordered);
+    let scheduler = SchedulerParams::from_config(config, max_seq_len);
+    let limits = ExecutorLimits {
+        block_tokens,
+        max_batch_tokens: scheduler.max_batch_tokens,
+        max_seqs: scheduler.max_running_requests,
+    };
+    let tp_error = |e: ModelError| model_error("tensor parallelism", e);
+    // One device: the family's ops, workspace, KV layout and weights. A tensor-parallel rank
+    // (P5 S-6): its shard's (its heads, KV heads, intermediate and vocabulary columns).
+    let (mut requirements, workspace, layout, weights) = match shard {
+        None => (
+            executor::available_requirements(&arch, block_tokens, executor_options, &ordered),
+            executor::workspace_bytes(
+                &arch,
+                block_tokens,
+                scheduler.max_batch_tokens,
+                scheduler.max_running_requests,
+            ),
+            arch.kv_layout(block_tokens),
+            arch.shape().weight_bytes,
+        ),
+        Some(s) => (
+            tp::available_requirements(&arch, s, block_tokens, executor_options, &ordered)
+                .map_err(tp_error)?,
+            tp::workspace_bytes(&arch, s, limits).map_err(tp_error)?,
+            tp::kv_layout(&arch, s, block_tokens).map_err(tp_error)?,
+            slot_bytes(&tp::weight_slots(&arch, s).map_err(tp_error)?),
+        ),
+    };
     // Device-side logits reduction (P2c S-4) is optional: only when enabled and a provider
     // implements it; otherwise the executor copies every row whole.
     let reduce = executor::logits::reduce_requirement(&arch);
@@ -385,31 +439,46 @@ fn prepare_with(
     }
 
     let decode_graphs = config.execution.decode_graphs && opened.graphs.is_some();
-    if config.execution.decode_graphs && !decode_graphs {
+    let decode_graphs = if decode_graphs && shard.is_some_and(|s| s.world > 1) {
+        // Decode graphs cannot capture the collectives (P5): forced off, not refused.
+        if shard.is_some_and(|s| s.rank == 0) {
+            tracing::warn!(
+                event = "decode_graphs_unavailable",
+                reason = "tensor_parallel",
+                "execution.decode_graphs is on but tensor-parallel ranks cannot capture their \
+                 collectives into graphs; decode iterations run eagerly"
+            );
+        }
+        false
+    } else {
+        if config.execution.decode_graphs && !decode_graphs {
+            tracing::warn!(
+                event = "decode_graphs_unavailable",
+                backend = %config.execution.backend,
+                "execution.decode_graphs is on but the kernel provider cannot capture graphs \
+                 (kernel ABI v2.1 graph functions); decode iterations run eagerly"
+            );
+        }
+        decode_graphs
+    };
+    let tensor_parallel = shard.is_some_and(|s| s.world > 1);
+    if tensor_parallel && config.execution.overlap_scheduling && shard.is_some_and(|s| s.rank == 0)
+    {
         tracing::warn!(
-            event = "decode_graphs_unavailable",
-            backend = %config.execution.backend,
-            "execution.decode_graphs is on but the kernel provider cannot capture graphs \
-             (kernel ABI v2.1 graph functions); decode iterations run eagerly"
+            event = "overlap_scheduling_unavailable",
+            reason = "tensor_parallel",
+            "execution.overlap_scheduling is on but a tensor-parallel group runs each step to \
+             completion on every rank; iterations run serially"
         );
     }
 
-    let scheduler = SchedulerParams::from_config(config, max_seq_len);
     let device_free = opened
         .mem
         .mem_info()
         .map_err(|e| StartupError::new(format!("device memory info: {e}")))?
         .free_bytes;
-    let weights = arch.shape().weight_bytes;
-    let workspace = executor::workspace_bytes(
-        &arch,
-        block_tokens,
-        scheduler.max_batch_tokens,
-        scheduler.max_running_requests,
-    );
     let reliability = reliability_for_workspace(&config.reliability, workspace);
     let device = config.execution.device;
-    let layout = arch.kv_layout(block_tokens);
     // P3 S-2 pre-check: the budget of the memory free now, before any weight byte is read,
     // must hold the model; the engine re-measures it after the weights load.
     let budget = measure_budget(
@@ -422,16 +491,17 @@ fn prepare_with(
         max_seq_len,
         &reliability,
         config.kv.gpu.max_bytes,
+        0,
     )?;
     let pool = kv_pool_config(
-        &arch,
-        block_tokens,
+        layout,
         budget.pool(PoolKind::Kv),
         scheduler.max_running_requests,
     )?;
     tracing::info!(
         event = "memory_budget",
         device = device.0,
+        rank = shard.map_or(0, |s| s.rank),
         memory_kind = turbine_reliability::budget::memory_kind_str(budget.memory_kind),
         budget_bytes = budget.budget_bytes,
         weights,
@@ -502,7 +572,7 @@ fn prepare_with(
         scheduler,
         executor_options,
         decode_graphs,
-        overlap_scheduling: config.execution.overlap_scheduling,
+        overlap_scheduling: config.execution.overlap_scheduling && !tensor_parallel,
         grammar,
         structured_output: config.structured_output.clone(),
         tool_format,
@@ -515,6 +585,8 @@ fn prepare_with(
         workspace_bytes: workspace,
         identity: model_identity(dir)?,
         kernel_metrics: kernel_metrics.clone(),
+        shard,
+        weight_bytes: weights,
     })
 }
 
@@ -543,21 +615,21 @@ impl PreparedModel {
             .mem_info()
             .map_err(|e| StartupError::new(format!("device memory info: {e}")))?
             .free_bytes;
-        let layout = self.arch.kv_layout(self.block_tokens);
+        let layout = self.pool.layout;
         self.budget = measure_budget(
             self.device,
             self.provider.opened.memory_kind,
             Some(free),
             0,
-            self.arch.shape().weight_bytes,
+            self.weight_bytes,
             &layout,
             self.max_seq_len,
             &self.reliability,
             self.kv_cap,
+            0,
         )?;
         self.pool = kv_pool_config(
-            &self.arch,
-            self.block_tokens,
+            layout,
             self.budget.pool(PoolKind::Kv),
             self.scheduler.max_running_requests,
         )?;
@@ -591,9 +663,10 @@ fn reliability_for_workspace(cfg: &ReliabilityConfig, workspace: u64) -> Reliabi
 
 /// `compute_budget` for `device`: dedicated memory from `measured_free` plus what Turbine
 /// already holds there, unified memory from the host `MemAvailable` read now. The error names
-/// every pool and its bytes.
+/// every pool and its bytes. `collective` is the communicator's device memory (P5 S-8: the drop
+/// of free memory across its init; 0 on one device).
 #[allow(clippy::too_many_arguments)]
-fn measure_budget(
+pub(crate) fn measure_budget(
     device: DeviceId,
     memory_kind: MemoryKind,
     measured_free: Option<u64>,
@@ -603,6 +676,7 @@ fn measure_budget(
     max_seq_len: u32,
     reliability: &ReliabilityConfig,
     kv_cap: Option<ByteSize>,
+    collective: u64,
 ) -> Result<DeviceBudget, StartupError> {
     let host = read_host(&FsProc::default()).sample.mem_available_bytes;
     compute_budget(
@@ -616,8 +690,7 @@ fn measure_budget(
             kv_bytes_per_token: layout.bytes_per_token(),
             max_seq_len,
             block_bytes: layout.block_bytes(),
-            // P5: communicator buffers (0 on a single device; TP measures them at init).
-            collective_bytes: 0,
+            collective_bytes: collective,
         },
         reliability,
         kv_cap,
@@ -645,13 +718,12 @@ fn log_backend_note(note: &BackendNote, block_tokens: u32) {
 /// The L0 pool: as many blocks as the budget's `kv` pool (`bytes`: the budget remainder after
 /// weights, workspace, runtime overhead and the emergency reserve, capped by
 /// `kv.gpu.max_bytes`) holds. At least one block per running request.
-fn kv_pool_config(
-    arch: &ModelArchConfig,
-    block_tokens: u32,
+pub(crate) fn kv_pool_config(
+    layout: KvLayout,
     bytes: u64,
     max_running: u32,
 ) -> Result<BlockPoolConfig, StartupError> {
-    let pool = BlockPoolConfig::for_bytes(arch.kv_layout(block_tokens), bytes);
+    let pool = BlockPoolConfig::for_bytes(layout, bytes);
     if pool.num_blocks < max_running {
         return Err(StartupError::new(format!(
             "the kv pool of {bytes} B holds {} KV blocks of {} B; at least one block per \
@@ -701,6 +773,9 @@ pub struct LoadedModel {
     pub reserve: EmergencyReserve,
     /// The committed `weights` and `workspace` reservations: held while the engine runs.
     pub held: Vec<Reservation>,
+    /// Tensor parallelism: every worker rank's end of the KV tier copies, in rank order (P5,
+    /// decision "P5 T17" B); empty on one device.
+    pub shards: Vec<crate::kv_orchestrator::KvShard>,
 }
 
 /// Steps 8–10: upload the weights; re-measure the memory budget (P3 S-2: dedicated memory
@@ -719,46 +794,9 @@ pub fn load(
     let started = Instant::now();
     let arch = &prepared.arch;
     let mem = &prepared.provider.opened.mem;
-    let weights = WeightLoader::load_format(
-        arch.weight_format.0,
-        &prepared.index,
-        &arch.family.0.weight_slots(arch),
-        mem,
-        MAX_STAGING_BYTES,
-    )
-    .map_err(|e| model_error("weight load", e))?;
+    let weights = load_weights(prepared)?;
     let weight_bytes = weights.weight_bytes;
-
-    let device = prepared.device;
-    let layout = arch.kv_layout(prepared.block_tokens);
-    let free = mem
-        .mem_info()
-        .map_err(|e| StartupError::new(format!("device memory info: {e}")))?
-        .free_bytes;
-    let budget = measure_budget(
-        device,
-        prepared.provider.opened.memory_kind,
-        Some(free),
-        weight_bytes,
-        weight_bytes,
-        &layout,
-        prepared.max_seq_len,
-        &prepared.reliability,
-        prepared.kv_cap,
-    )?;
-    let ledger = Ledger::new(&budget);
-    ledger.set_metrics(reliability.clone());
-    let mut held = Vec::with_capacity(2);
-    for (pool, bytes) in [
-        (PoolKind::Weights, weight_bytes),
-        (PoolKind::Workspace, prepared.workspace_bytes),
-    ] {
-        let mut r = ledger
-            .reserve(device, pool, bytes)
-            .map_err(|e| StartupError::new(format!("memory budget: {e}")))?;
-        r.commit();
-        held.push(r);
-    }
+    let (budget, ledger, held) = post_load_budget(prepared, weight_bytes, 0, reliability)?;
 
     let mut executor = build_executor(
         arch,
@@ -783,37 +821,9 @@ pub fn load(
         executor.set_decode_graphs(Some(DecodeGraphs::new(backend, capacity)));
         tracing::info!(event = "decode_graphs", capacity, "decode graphs on");
     }
-    let measured = kv_pool_config(
-        arch,
-        prepared.block_tokens,
-        budget.pool(PoolKind::Kv),
-        prepared.scheduler.max_running_requests,
-    )?;
-    let pool_config = BlockPoolConfig {
-        num_blocks: measured.num_blocks.min(prepared.pool.num_blocks),
-        ..measured
-    };
-    let mut pool = BlockPool::new(pool_config, Arc::clone(mem))
-        .map_err(|e| StartupError::new(format!("KV block pool: {e}")))?
-        .with_ledger(Arc::clone(&ledger), device);
-    log_pool_startup(&pool);
-    let reserve_bytes = prepared.reliability.emergency_vram_reserve.0;
-    if reserve_bytes == 0 {
-        tracing::warn!(
-            event = "emergency_reserve",
-            reason = "disabled",
-            device = device.0,
-            "reliability.emergency_vram_reserve is 0: no emergency reserve"
-        );
-    }
-    let reserve = EmergencyReserve::acquire(
-        device,
-        reserve_bytes,
-        &ledger,
-        Box::new(crate::reliability::DeviceReserve::new(Arc::clone(mem))),
-        reliability.clone(),
-    )
-    .map_err(|e| StartupError::new(format!("emergency reserve: {e}")))?;
+    let blocks = pool_blocks(prepared, &budget)?;
+    let mut pool = allocate_pool(prepared, blocks, &ledger)?;
+    let reserve = acquire_reserve(prepared, &ledger, reliability)?;
     warm_up(executor.as_mut(), &mut pool, warmup_token)?;
     let load_seconds = started.elapsed().as_secs_f64();
     metrics.record_load(load_seconds, arch.weight_format.0.name(), weight_bytes);
@@ -822,7 +832,7 @@ pub fn load(
         weight_bytes,
         budget_bytes = budget.budget_bytes,
         kv_blocks = pool.total_blocks(),
-        emergency_reserve = reserve_bytes,
+        emergency_reserve = prepared.reliability.emergency_vram_reserve.0,
         "model loaded and warmed up"
     );
     Ok(LoadedModel {
@@ -834,11 +844,165 @@ pub fn load(
         ledger,
         reserve,
         held,
+        shards: Vec::new(),
     })
 }
 
+/// Every pool of `b` and its bytes, for an error message.
+pub(crate) fn budget_breakdown(b: &DeviceBudget) -> String {
+    let pools = [
+        PoolKind::Weights,
+        PoolKind::Kv,
+        PoolKind::Workspace,
+        PoolKind::Collective,
+        PoolKind::Runtime,
+        PoolKind::Reserve,
+    ];
+    let parts: Vec<String> = pools
+        .iter()
+        .map(|&p| format!("{} {} B", p.as_str(), b.pool(p)))
+        .collect();
+    format!("budget {} B ({})", b.budget_bytes, parts.join(", "))
+}
+
+/// Step 8: `prepared`'s weights on its device — the whole model, or the rank's shard under
+/// tensor parallelism (P5 S-6), whose failure (out of memory included) names the rank, the
+/// device, the tensor (in the loader's message) and the pre-load budget.
+pub(crate) fn load_weights(prepared: &PreparedModel) -> Result<LoadedWeights, StartupError> {
+    let arch = &prepared.arch;
+    let slots = match prepared.shard {
+        None => arch.family.0.weight_slots(arch),
+        Some(s) => tp::weight_slots(arch, s).map_err(|e| model_error("tensor parallelism", e))?,
+    };
+    WeightLoader::load_format(
+        arch.weight_format.0,
+        &prepared.index,
+        &slots,
+        &prepared.provider.opened.mem,
+        MAX_STAGING_BYTES,
+    )
+    .map_err(|e| match prepared.shard {
+        Some(s) => StartupError::new(format!(
+            "rank {} of {} (device {}): weight shard load: {e}; {}",
+            s.rank,
+            s.world,
+            prepared.device.0,
+            budget_breakdown(&prepared.budget)
+        )),
+        None => model_error("weight load", e),
+    })
+}
+
+/// Step 9: the memory budget re-measured after the weights load (dedicated memory free now plus
+/// the `weight_bytes` and `collective` bytes Turbine holds) and the reservation ledger with the
+/// weights, the executor workspace and the communicator buffers (P5 S-8) committed.
+pub(crate) fn post_load_budget(
+    prepared: &PreparedModel,
+    weight_bytes: u64,
+    collective: u64,
+    reliability: &ReliabilityMetrics,
+) -> Result<(DeviceBudget, Arc<Ledger>, Vec<Reservation>), StartupError> {
+    let device = prepared.device;
+    let free = prepared
+        .provider
+        .opened
+        .mem
+        .mem_info()
+        .map_err(|e| StartupError::new(format!("device memory info: {e}")))?
+        .free_bytes;
+    let budget = measure_budget(
+        device,
+        prepared.provider.opened.memory_kind,
+        Some(free),
+        weight_bytes + collective,
+        weight_bytes,
+        &prepared.pool.layout,
+        prepared.max_seq_len,
+        &prepared.reliability,
+        prepared.kv_cap,
+        collective,
+    )?;
+    let ledger = Ledger::new(&budget);
+    ledger.set_metrics(reliability.clone());
+    let mut held = Vec::with_capacity(3);
+    for (pool, bytes) in [
+        (PoolKind::Weights, weight_bytes),
+        (PoolKind::Workspace, prepared.workspace_bytes),
+        (PoolKind::Collective, collective),
+    ] {
+        if bytes == 0 && pool == PoolKind::Collective {
+            continue;
+        }
+        let mut r = ledger
+            .reserve(device, pool, bytes)
+            .map_err(|e| StartupError::new(format!("memory budget: {e}")))?;
+        r.commit();
+        held.push(r);
+    }
+    Ok((budget, ledger, held))
+}
+
+/// The L0 pool's block count after the weights load: the budget's `kv` pool, at most the
+/// pre-load size.
+pub(crate) fn pool_blocks(
+    prepared: &PreparedModel,
+    budget: &DeviceBudget,
+) -> Result<u32, StartupError> {
+    let measured = kv_pool_config(
+        prepared.pool.layout,
+        budget.pool(PoolKind::Kv),
+        prepared.scheduler.max_running_requests,
+    )?;
+    Ok(measured.num_blocks.min(prepared.pool.num_blocks))
+}
+
+/// The L0 pool of `blocks` blocks of `prepared`'s layout, linked to `ledger`.
+pub(crate) fn allocate_pool(
+    prepared: &PreparedModel,
+    blocks: u32,
+    ledger: &Arc<Ledger>,
+) -> Result<BlockPool, StartupError> {
+    let config = BlockPoolConfig {
+        layout: prepared.pool.layout,
+        num_blocks: blocks,
+    };
+    let pool = BlockPool::new(config, Arc::clone(&prepared.provider.opened.mem))
+        .map_err(|e| StartupError::new(format!("KV block pool: {e}")))?
+        .with_ledger(Arc::clone(ledger), prepared.device);
+    log_pool_startup(&pool);
+    Ok(pool)
+}
+
+/// The emergency reserve on `prepared`'s device (step 10).
+pub(crate) fn acquire_reserve(
+    prepared: &PreparedModel,
+    ledger: &Arc<Ledger>,
+    reliability: &ReliabilityMetrics,
+) -> Result<EmergencyReserve, StartupError> {
+    let device = prepared.device;
+    let reserve_bytes = prepared.reliability.emergency_vram_reserve.0;
+    if reserve_bytes == 0 {
+        tracing::warn!(
+            event = "emergency_reserve",
+            reason = "disabled",
+            device = device.0,
+            "reliability.emergency_vram_reserve is 0: no emergency reserve"
+        );
+    }
+    EmergencyReserve::acquire(
+        device,
+        reserve_bytes,
+        ledger,
+        Box::new(crate::reliability::DeviceReserve::new(Arc::clone(
+            &prepared.provider.opened.mem,
+        ))),
+        reliability.clone(),
+    )
+    .map_err(|e| StartupError::new(format!("emergency reserve: {e}")))
+}
+
 /// One one-token forward on a block borrowed from the pool, which gets it back.
-fn warm_up(
+pub(crate) fn warm_up(
     exec: &mut dyn ModelExecutor,
     pool: &mut BlockPool,
     token: u32,

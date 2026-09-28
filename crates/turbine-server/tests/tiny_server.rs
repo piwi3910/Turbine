@@ -2983,3 +2983,156 @@ fn dp2_routes_to_both_replicas() {
         json!(["execution_device", "device_sharing_enabled"])
     );
 }
+
+/// Tensor parallelism of 2 on the cpu backend: two rank threads over the host collective
+/// (the host test path, P5 S-6).
+const TP2: &str = "parallel:\n  tensor_parallel_size: 2\n  collective_backend: host\n";
+
+/// P5 S-6: the tiny Llama served at tp 2 (two cpu ranks over the host collective, each its own
+/// host memory and KV pool) completes greedy prompts with exactly tp 1's tokens, alone and 8
+/// at a time; `/ready` is 200 and `/turbine/v1/status` shows the group (2 ranks on host devices
+/// 0 and 1, backend `host`). Breaks if the server shards, batches or steps the ranks wrongly.
+#[test]
+fn tp2_serves_tp1_tokens() {
+    let one = TinyServer::start("");
+    let two = TinyServer::start(TP2);
+    let greedy = |server: &TinyServer, prompt: &str| -> Vec<u32> {
+        let body = json!({"model": server.model, "prompt": prompt, "max_tokens": 16,
+                          "ignore_eos": true, "temperature": 0, "logprobs": 0,
+                          "return_tokens_as_token_ids": true});
+        let resp = server.post("/v1/completions", &body);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        choice_token_ids(&resp.json()["choices"][0])
+    };
+    let prompts = [
+        "Hello",
+        "Once upon a time",
+        "The quick brown fox jumps",
+        "1 2 3 4",
+    ];
+    for prompt in prompts {
+        assert_eq!(greedy(&two, prompt), greedy(&one, prompt), "{prompt:?}");
+    }
+    // Batched: 8 at once through the one engine, the same tokens as one at a time on tp 1.
+    let want: Vec<Vec<u32>> = prompts.iter().map(|p| greedy(&one, p)).collect();
+    let workers: Vec<_> = (0..8)
+        .map(|i| {
+            let (addr, model, prompt) = (two.addr, two.model.clone(), prompts[i % 4]);
+            std::thread::spawn(move || {
+                let body = json!({"model": model, "prompt": prompt, "max_tokens": 16,
+                                  "ignore_eos": true, "temperature": 0, "logprobs": 0,
+                                  "return_tokens_as_token_ids": true});
+                request(addr, "POST", "/v1/completions", Some(&body.to_string()))
+            })
+        })
+        .collect();
+    for (i, w) in workers.into_iter().enumerate() {
+        let resp = w.join().unwrap();
+        assert_eq!(resp.status, 200, "request {i}: {}", resp.body);
+        let got = choice_token_ids(&resp.json()["choices"][0]);
+        // The tiny model's logits are far apart: batching does not move a greedy token.
+        assert_eq!(got, want[i % 4], "request {i}");
+    }
+
+    assert_eq!(two.get("/ready").status, 200);
+    let parallel = &two.get("/turbine/v1/status").json()["parallel"];
+    assert_eq!(parallel["tp"], 2, "{parallel}");
+    assert_eq!(parallel["backend"], "host", "{parallel}");
+    assert_eq!(
+        parallel["groups"],
+        json!([{"replica": 0, "ranks": [
+            {"rank": 0, "device": 0, "host": parallel["groups"][0]["ranks"][0]["host"]},
+            {"rank": 1, "device": 1, "host": parallel["groups"][0]["ranks"][1]["host"]}]}]),
+        "{parallel}"
+    );
+    wait_for(Duration::from_secs(10), "every block free", || {
+        two.blocks_used() == 0
+    });
+}
+
+/// P5 S-6 edge case "cancellation mid-step in a TP group": at tp 2, dropping held streams
+/// frees their blocks promptly — the leader's block manager is the only one, so its pool
+/// returning the blocks frees them on every rank (worker pools are indexed by the leader's
+/// ids) — and the surviving streams finish normally. Breaks if a cancelled sequence keeps its
+/// blocks or the group stalls after the cancellation.
+#[test]
+fn tp2_cancellation_frees_blocks() {
+    let server = TinyServer::start_long_with(HOLD_PAUSED, TP2);
+    let mut streams: Vec<OpenStream> = (0..4).map(|_| server.hold_stream()).collect();
+    wait_for(Duration::from_secs(60), "all 4 streams paused", || {
+        let doc = server.scheduler();
+        doc["paused"] == 4 && doc["waiting"] == 0
+    });
+    let all4 = server.blocks_used();
+    let kept = streams.split_off(2);
+    drop(streams);
+    wait_for(
+        Duration::from_secs(5),
+        "dropped clients' blocks freed",
+        || {
+            let doc = server.scheduler();
+            doc["paused"] == 2 && running(&doc) == 2
+        },
+    );
+    let remaining = server.blocks_used();
+    assert!(remaining + 2 <= all4, "{remaining} of {all4}");
+    for s in kept {
+        assert_eq!(stream_finish_reason(&s.read_rest()), "length");
+    }
+    wait_for(Duration::from_secs(5), "every block free", || {
+        server.blocks_used() == 0
+    });
+}
+
+/// P5 S-6, `/ready` and data parallelism of tensor-parallel groups: dp 2 × tp 2 on the cpu
+/// backend (two groups of two rank threads, the host devices shared) serves 8 concurrent
+/// requests on both replicas with tp 1's tokens. Breaks if replicas of groups share a
+/// communicator or a pool.
+#[test]
+fn dp2_of_tp2_groups_serve() {
+    let one = TinyServer::start("");
+    let server = TinyServer::start(
+        "parallel:\n  tensor_parallel_size: 2\n  data_parallel_size: 2\n  \
+         collective_backend: host\n  allow_device_sharing: true\n  router: least_loaded\n",
+    );
+    let body = |model: &str| {
+        json!({"model": model, "prompt": "Once upon a time", "max_tokens": 12,
+               "ignore_eos": true, "temperature": 0, "logprobs": 0,
+               "return_tokens_as_token_ids": true})
+    };
+    let resp = one.post("/v1/completions", &body(&one.model));
+    let want = choice_token_ids(&resp.json()["choices"][0]);
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let (addr, b) = (server.addr, body(&server.model).to_string());
+            std::thread::spawn(move || request(addr, "POST", "/v1/completions", Some(&b)))
+        })
+        .collect();
+    for (i, w) in workers.into_iter().enumerate() {
+        let resp = w.join().unwrap();
+        assert_eq!(resp.status, 200, "request {i}: {}", resp.body);
+        assert_eq!(
+            choice_token_ids(&resp.json()["choices"][0]),
+            want,
+            "request {i}"
+        );
+    }
+    let parallel = &server.get("/turbine/v1/status").json()["parallel"];
+    assert_eq!(
+        (&parallel["tp"], &parallel["dp"]),
+        (&json!(2), &json!(2)),
+        "{parallel}"
+    );
+    let metrics = server.metrics();
+    for replica in ["0", "1"] {
+        let routed: f64 = metrics
+            .lines()
+            .filter(|l| {
+                l.starts_with("turbine_dp_routed_total{")
+                    && l.contains(&format!("replica=\"{replica}\""))
+            })
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum();
+        assert!(routed > 0.0, "replica {replica}: {metrics}");
+    }
+}

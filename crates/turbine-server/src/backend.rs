@@ -58,6 +58,28 @@ use crate::modules::ModuleChoices;
 use crate::reliability::api_error_for;
 use crate::replicas::{ReplicaLoad, ReplicaRouter};
 
+/// The loading steps `/ready` reports, as stored in `ModelBackend::loading`.
+const LOADING_REASONS: [NotReadyReason; 4] = [
+    NotReadyReason::LoadingModel,
+    NotReadyReason::CollectiveInit,
+    NotReadyReason::LoadingWeights,
+    NotReadyReason::RankMissing,
+];
+
+fn loading_code(reason: NotReadyReason) -> u8 {
+    LOADING_REASONS
+        .iter()
+        .position(|r| *r == reason)
+        .unwrap_or(0) as u8
+}
+
+fn loading_reason(code: u8) -> NotReadyReason {
+    LOADING_REASONS
+        .get(usize::from(code))
+        .copied()
+        .unwrap_or(NotReadyReason::LoadingModel)
+}
+
 const STATE_LOADING: u8 = 0;
 const STATE_READY: u8 = 1;
 const STATE_LOAD_FAILED: u8 = 2;
@@ -167,6 +189,9 @@ struct Loaded {
 /// The server's `InferenceBackend`, `Readiness` and `Diagnostics`.
 pub struct ModelBackend {
     state: AtomicU8,
+    /// While loading: the `/ready` reason of the step a tensor-parallel group is in (P5:
+    /// `collective_init`, `loading_weights`, `rank_missing`), else `loading_model`.
+    loading: AtomicU8,
     /// One slot per data-parallel replica (P5 S-7), filled when that replica's engine is warm.
     replicas: Vec<OnceLock<Loaded>>,
     /// The replica choice when there is more than one replica.
@@ -224,6 +249,7 @@ impl ModelBackend {
         });
         ModelBackend {
             state: AtomicU8::new(STATE_LOADING),
+            loading: AtomicU8::new(loading_code(NotReadyReason::LoadingModel)),
             replicas: vec![OnceLock::new()],
             router: None,
             served_name: model.served_name.clone(),
@@ -349,6 +375,12 @@ impl ModelBackend {
                 Ordering::Acquire,
             );
         }
+    }
+
+    /// While loading, `/ready` answers 503 with `reason` (`loading_model`, or a tensor-parallel
+    /// group's `collective_init`, `loading_weights` or `rank_missing`, P5).
+    pub fn set_loading(&self, reason: NotReadyReason) {
+        self.loading.store(loading_code(reason), Ordering::Release);
     }
 
     /// `/ready` 503 with the reason of `fatal` until the process exits.
@@ -830,7 +862,7 @@ impl Readiness for ModelBackend {
                 }
                 return answers.find(|a| *a == ReadyState::Ready).unwrap_or(first);
             }
-            STATE_LOADING => NotReadyReason::LoadingModel,
+            STATE_LOADING => loading_reason(self.loading.load(Ordering::Acquire)),
             STATE_LOAD_FAILED => NotReadyReason::ModelLoadFailed,
             STATE_SHUTTING_DOWN => NotReadyReason::ShuttingDown,
             _ => NotReadyReason::CircuitOpen,

@@ -293,6 +293,21 @@ impl KvOrchestrator {
         }
         let world = shards.len() as u32;
         let format = tp_kv_format(layout, world);
+        if world > 1
+            && s.cfg.cpu.enabled
+            && s.cfg.cpu.max_bytes.0 / u64::from(world) < L1_SLAB_BYTES
+        {
+            // Each rank pins its share in whole slabs: a share below one slab holds none.
+            tracing::warn!(
+                event = "kv_l1_share_below_slab",
+                tier = "l1",
+                ranks = world,
+                max_bytes = s.cfg.cpu.max_bytes.0,
+                slab_bytes = L1_SLAB_BYTES,
+                "kv.cpu.max_bytes / tensor_parallel_size is below one L1 slab per rank; L1 holds \
+                 nothing (raise kv.cpu.max_bytes to at least tensor_parallel_size GiB)"
+            );
+        }
         // One logical block: every rank's shard of it, in rank order.
         let block_bytes = format.block_bytes();
         let l1 = if !s.cfg.cpu.enabled {

@@ -1105,9 +1105,9 @@ impl EngineLoop {
                         message: error.message,
                     });
                 } else {
-                    self.fail_iteration(error.message, &mut outcome);
-                    self.rel
-                        .circuit_event(CircuitEvent::DeviceError { sticky: false });
+                    let (code, event) = error.failure();
+                    self.fail_iteration(code, error.message, &mut outcome);
+                    self.rel.circuit_event(event);
                 }
                 return outcome;
             }
@@ -1840,10 +1840,9 @@ impl EngineLoop {
             self.rel.recovery_failed();
             self.fail_requests(ids, iteration, ErrorCode::ResourceExhausted, &error.message);
         } else {
-            self.fail_requests(ids, iteration, ErrorCode::InternalError, &error.message);
-            self.rel.circuit_event(CircuitEvent::DeviceError {
-                sticky: error.sticky,
-            });
+            let (code, event) = error.failure();
+            self.fail_requests(ids, iteration, code, &error.message);
+            self.rel.circuit_event(event);
         }
     }
 
@@ -2046,16 +2045,14 @@ impl EngineLoop {
         self.retire(id);
     }
 
-    /// Every request of the iteration fails with `internal_error`; the scheduler frees them.
-    fn fail_iteration(&mut self, message: String, outcome: &mut IterationOutcome) {
-        tracing::error!(event = "iteration_failed", iteration = outcome.iteration, error = %message, "iteration failed");
+    /// Every request of the iteration fails with `code` (`internal_error`, or `replica_failed`
+    /// for a failed collective); the scheduler frees them.
+    fn fail_iteration(&mut self, code: ErrorCode, message: String, outcome: &mut IterationOutcome) {
+        tracing::error!(event = "iteration_failed", iteration = outcome.iteration, code = code.as_str(), error = %message, "iteration failed");
         for id in self.iteration_requests.clone() {
             if self.requests.get(&id).is_some_and(|r| !r.done) {
                 self.account(id, Outcome::Failed, &message);
-                self.deliver(
-                    id,
-                    ActiveRequest::error_event(ErrorCode::InternalError, message.clone()),
-                );
+                self.deliver(id, ActiveRequest::error_event(code, message.clone()));
                 self.retire(id);
             }
         }
@@ -2244,24 +2241,29 @@ fn device_choice(reduced: &ReducedRow, reduce: Option<RowReduce>) -> Option<u32>
 
 /// Why an iteration attempt failed, as the execution backend classifies it
 /// (`KernelError::is_oom`, `KernelError::is_sticky`): out of memory is recovered from, a sticky
-/// device error is fatal, anything else opens the circuit.
+/// device error is fatal, anything else opens the circuit. A tensor-parallel group's failed
+/// collective (P5: a timeout, a rank's abort or a backend error) opens it with reason
+/// `collective_failed`, and the iteration's requests end with `replica_failed`.
 #[derive(Debug)]
 struct IterationError {
     message: String,
     oom: bool,
     sticky: bool,
+    collective: bool,
 }
 
 impl IterationError {
     fn model(context: &str, e: ModelError) -> IterationError {
-        let (oom, sticky) = match &e {
-            ModelError::Kernel(k) => (k.is_oom(), k.is_sticky()),
-            _ => (false, false),
+        let (oom, sticky, collective) = match &e {
+            ModelError::Kernel(k) => (k.is_oom(), k.is_sticky(), false),
+            ModelError::Collective(_) => (false, false, true),
+            _ => (false, false, false),
         };
         IterationError {
             message: format!("{context}: {e}"),
             oom,
             sticky,
+            collective,
         }
     }
 
@@ -2270,6 +2272,21 @@ impl IterationError {
             message,
             oom: false,
             sticky: false,
+            collective: false,
+        }
+    }
+
+    /// The error code the iteration's requests end with, and the circuit event.
+    fn failure(&self) -> (ErrorCode, CircuitEvent) {
+        if self.collective {
+            (ErrorCode::ReplicaFailed, CircuitEvent::CollectiveFailed)
+        } else {
+            (
+                ErrorCode::InternalError,
+                CircuitEvent::DeviceError {
+                    sticky: self.sticky,
+                },
+            )
         }
     }
 }
@@ -3361,11 +3378,13 @@ mod tests {
         }
     }
 
-    /// Fails every forward like a device error, or panics.
+    /// Fails every forward like a device error (or, with `collective`, like a tensor-parallel
+    /// group's failed collective), or panics.
     struct BrokenExecutor {
         shape: ModelShape,
         kv: KvLayout,
         panic: bool,
+        collective: bool,
     }
 
     impl ModelExecutor for BrokenExecutor {
@@ -3377,6 +3396,11 @@ mod tests {
         }
         fn forward(&mut self, _batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
             assert!(!self.panic, "injected engine panic");
+            if self.collective {
+                return Err(ModelError::Collective(
+                    turbine_distributed::collective::CollectiveError::RemoteAbort { rank: 1 },
+                ));
+            }
             Err(ModelError::Kernel(plain_device_error("injected")))
         }
         fn copy_blocks(
@@ -3394,6 +3418,7 @@ mod tests {
             shape: spec.config.shape(),
             kv: spec.config.kv_layout(BLOCK_TOKENS),
             panic,
+            collective: false,
         })
     }
 
@@ -3459,6 +3484,47 @@ mod tests {
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");
         }
+    }
+
+    /// P5 S-6: a tensor-parallel group's failed collective (a rank aborted) ends the running
+    /// request with `replica_failed`, opens the circuit with reason `collective_failed` (queued
+    /// requests are rejected `circuit_open`), keeps the engine running and frees every block.
+    /// Breaks if a collective failure is reported as a plain device error or turns fatal.
+    #[test]
+    fn collective_failure_ends_requests_with_replica_failed() {
+        let (_dir, spec, tokenizer) = tiny();
+        let exec = Box::new(BrokenExecutor {
+            shape: spec.config.shape(),
+            kv: spec.config.kv_layout(BLOCK_TOKENS),
+            panic: false,
+            collective: true,
+        });
+        let t = engine(exec, tokenizer, params(1, 64));
+        let streams: Vec<_> = (0..3)
+            .map(|_| submit(&t.tx, request(&[256, 1, 2], 4)))
+            .collect();
+        let engine = t.engine;
+        let handle = std::thread::spawn(move || engine.run());
+        for (i, (mut rx, admitted)) in streams.into_iter().enumerate() {
+            assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+            let expected = if i == 0 {
+                ErrorCode::ReplicaFailed
+            } else {
+                ErrorCode::CircuitOpen
+            };
+            assert_eq!(
+                error_code(&read_to_end(&mut rx)),
+                Some(expected),
+                "request {i}"
+            );
+        }
+        assert!(t.controller.circuit().blocks_readiness());
+        drop(t.tx);
+        assert_eq!(handle.join().unwrap(), Ok(()), "not fatal: no exit 3");
+        assert_eq!(held_blocks(&t.shared.docs().unwrap()), 0);
+        let text = t.reg.render().unwrap();
+        let line = r#"turbine_circuit_transitions_total{from="HEALTHY",to="CIRCUIT_OPEN",reason="collective_failed"} 1"#;
+        assert!(text.contains(line), "missing {line:?} in\n{text}");
     }
 
     /// An engine panic is caught: every in-flight request gets `internal_error`, the circuit

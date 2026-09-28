@@ -16,12 +16,16 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use serde_json::{Value, json};
-use turbine_core::config::{Config, DeviceSelection, SizeOrAuto};
+use std::sync::Arc;
+use turbine_core::config::{Config, DeviceSelection, RankMode, SizeOrAuto};
 use turbine_core::types::{DeviceId, Vendor};
 use turbine_device::DeviceInventory;
 use turbine_device::topology::TopologyGraph;
 use turbine_distributed::plan::{ParallelPlan, plan, plan_execution_device};
+
+use turbine_distributed::collective::CollectiveLibrary;
 use turbine_model::load_model_config;
+use turbine_model::tp::ShardSpec;
 use turbine_observability::MetricsRegistry;
 
 /// Why startup cannot use the configured plan.
@@ -90,17 +94,72 @@ pub fn plan_for(
     plan(inventory, topology, p, &shape, &budget).map_err(plan_error)
 }
 
-/// Refuses a plan this build cannot execute yet (exit 2, like any other unusable
-/// configuration): tensor-parallel model execution is not wired into the engine yet.
-pub fn check_executable(plan: &ParallelPlan) -> Result<(), PlanFailure> {
-    if plan.tp > 1 {
-        return Err(PlanFailure::Config(format!(
-            "parallel.tensor_parallel_size: {} ranks planned; tensor-parallel model execution is \
-             not available in this build",
-            plan.tp
-        )));
+/// Refuses a plan the model cannot run (exit 2, like any other unusable configuration, before
+/// anything is loaded or bound): with tensor parallelism the model's family must have
+/// tensor-parallel hooks and the group size must split its attention heads, KV heads (or be a
+/// multiple of them), intermediate and expert widths (`turbine_model::tp::check`, reason code
+/// in the message). `config.json` is read here; an unreadable one is exit 1.
+pub fn check_executable(plan: &ParallelPlan, config: &Config) -> Result<(), PlanFailure> {
+    if plan.tp <= 1 {
+        return Ok(());
     }
-    Ok(())
+    if plan.mode == RankMode::Static {
+        return Err(PlanFailure::Config(
+            "parallel.ranks.mode: static rank processes are not available in this build; use \
+             local"
+                .into(),
+        ));
+    }
+    let arch = load_model_config(&config.model.path)
+        .map_err(|e| PlanFailure::Startup(format!("model config: {e}")))?;
+    turbine_model::tp::check(
+        &arch,
+        ShardSpec {
+            rank: 0,
+            world: plan.tp,
+        },
+    )
+    .map_err(|e| {
+        tracing::error!(
+            event = "parallel_plan_failed",
+            reason = "tp_unsplittable_model",
+            tp = plan.tp,
+            error = %e,
+            "the model cannot be split over the tensor-parallel group"
+        );
+        PlanFailure::Config(format!(
+            "parallel.tensor_parallel_size: {} ranks cannot split {}: {e}",
+            plan.tp, arch.hf_architecture
+        ))
+    })
+}
+
+/// Loads the plan's collective backend (`parallel.collective_backend`, `auto` resolved by the
+/// planner; registry-driven, so a new backend needs no change here): its configured library
+/// (`parallel.rccl_library`, …) or the default search. A failure names the backend and the
+/// library (exit 1: tensor parallelism cannot run without it).
+pub fn load_collective(
+    config: &Config,
+    plan: &ParallelPlan,
+) -> Result<Arc<dyn CollectiveLibrary>, String> {
+    let backend = turbine_distributed::collective::registry()
+        .get(plan.backend)
+        .ok_or_else(|| {
+            format!(
+                "parallel.collective_backend: `{}` is not registered",
+                plan.backend
+            )
+        })?;
+    let library = backend
+        .load(backend.configured_library(&config.parallel))
+        .map_err(|e| format!("collective backend `{}`: {e}", plan.backend))?;
+    tracing::info!(
+        event = "collective_backend_loaded",
+        backend = library.backend(),
+        version = library.version().as_deref().unwrap_or("none"),
+        "collective backend loaded"
+    );
+    Ok(library)
 }
 
 /// The device of the single engine: rank 0 of replica 0.
@@ -204,14 +263,36 @@ mod tests {
             text.contains(r#"turbine_parallel_info{tp="1",dp="1",backend="host",mode="local"} 1"#),
             "{text}"
         );
-        assert!(check_executable(&p).is_ok());
-        // Data-parallel replicas run (Task 18); tensor parallelism waits for Task 17.
-        assert!(check_executable(&plan(1, 2)).is_ok());
-        match check_executable(&plan(2, 1)) {
-            Err(PlanFailure::Config(m)) => {
-                assert!(m.starts_with("parallel.tensor_parallel_size"), "{m}")
-            }
-            other => panic!("tp 2: {other:?}"),
+        // Without tensor parallelism nothing is read (the model path is not even looked at).
+        let config = Config::default();
+        assert!(check_executable(&p, &config).is_ok());
+        assert!(check_executable(&plan(1, 2), &config).is_ok());
+    }
+
+    /// Tensor parallelism is checked against the model (P5 S-6): the tiny Llama (4 heads, 2 KV
+    /// heads, intermediate 128) splits over 2 and 4 ranks, not over 8 (more ranks than heads),
+    /// which is refused naming `parallel.tensor_parallel_size`; an unreadable `config.json` is
+    /// a startup failure (exit 1), not a configuration error.
+    #[test]
+    fn tensor_parallel_checked_against_the_model() {
+        let dir = turbine_model::testing::TempDir::new("parallel-tp-check");
+        turbine_model::testing::tiny::write_tiny_llama(dir.path(), 1);
+        let mut config = Config::default();
+        config.model.path = dir.path().to_path_buf();
+        for tp in [2, 4] {
+            assert!(check_executable(&plan(tp, 1), &config).is_ok(), "tp {tp}");
         }
+        match check_executable(&plan(8, 1), &config) {
+            Err(PlanFailure::Config(m)) => {
+                assert!(m.starts_with("parallel.tensor_parallel_size: 8"), "{m}");
+                assert!(m.contains("4 attention heads"), "{m}");
+            }
+            other => panic!("tp 8: {other:?}"),
+        }
+        config.model.path = dir.path().join("missing");
+        assert!(matches!(
+            check_executable(&plan(2, 1), &config),
+            Err(PlanFailure::Startup(_))
+        ));
     }
 }

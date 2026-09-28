@@ -28,6 +28,9 @@ pub enum CircuitReason {
     ProbeFailed,
     DeviceFatal,
     ControllerFailed,
+    /// A tensor-parallel group's collective failed (P5: a timeout, a rank's abort or a backend
+    /// error); the replica's requests end with `replica_failed`.
+    CollectiveFailed,
     NoTrigger,
     DrainStarted,
     DrainComplete,
@@ -35,7 +38,7 @@ pub enum CircuitReason {
 }
 
 impl CircuitReason {
-    pub const ALL: [CircuitReason; 14] = [
+    pub const ALL: [CircuitReason; 15] = [
         CircuitReason::LatencyDrift,
         CircuitReason::ThermalThrottle,
         CircuitReason::OomRecovered,
@@ -46,6 +49,7 @@ impl CircuitReason {
         CircuitReason::ProbeFailed,
         CircuitReason::DeviceFatal,
         CircuitReason::ControllerFailed,
+        CircuitReason::CollectiveFailed,
         CircuitReason::NoTrigger,
         CircuitReason::DrainStarted,
         CircuitReason::DrainComplete,
@@ -64,6 +68,7 @@ impl CircuitReason {
             CircuitReason::ProbeFailed => "probe_failed",
             CircuitReason::DeviceFatal => "device_fatal",
             CircuitReason::ControllerFailed => "controller_failed",
+            CircuitReason::CollectiveFailed => "collective_failed",
             CircuitReason::NoTrigger => "no_trigger",
             CircuitReason::DrainStarted => "drain_started",
             CircuitReason::DrainComplete => "drain_complete",
@@ -91,6 +96,9 @@ pub enum CircuitEvent {
     },
     /// The controller task panicked (fatal).
     ControllerFailed,
+    /// A tensor-parallel group's collective failed mid-step (P5): opens like a non-sticky
+    /// device error, with its own reason.
+    CollectiveFailed,
     /// Probe latency / baseline.
     ProbeSucceeded {
         latency_ratio: f64,
@@ -247,7 +255,12 @@ impl CircuitBreaker {
             CircuitEvent::DeviceError { sticky: false } if can_open => {
                 self.open(CircuitReason::DeviceError, now)
             }
-            CircuitEvent::RecoveryFailed | CircuitEvent::DeviceError { sticky: false } => None,
+            CircuitEvent::CollectiveFailed if can_open => {
+                self.open(CircuitReason::CollectiveFailed, now)
+            }
+            CircuitEvent::RecoveryFailed
+            | CircuitEvent::DeviceError { sticky: false }
+            | CircuitEvent::CollectiveFailed => None,
             CircuitEvent::DeviceError { sticky: true } | CircuitEvent::ControllerFailed => {
                 self.fatal = true;
                 let reason = if ev == CircuitEvent::ControllerFailed {
@@ -448,6 +461,14 @@ mod tests {
             breaker().on_event(E::DeviceError { sticky: false }, s(1)),
             Some((Healthy, CircuitOpen, R::DeviceError))
         );
+        // P5: a tensor-parallel group's failed collective opens with its own reason, once.
+        let mut b = breaker();
+        assert_eq!(
+            b.on_event(E::CollectiveFailed, s(1)),
+            Some((Healthy, CircuitOpen, R::CollectiveFailed))
+        );
+        assert_eq!(b.on_event(E::CollectiveFailed, s(2)), None);
+        assert_eq!(R::CollectiveFailed.as_str(), "collective_failed");
         // CIRCUIT_OPEN → DRAINING immediately (next tick); retry-after is the remaining cooldown.
         let mut b = breaker();
         b.on_event(E::DeviceError { sticky: false }, s(10));
