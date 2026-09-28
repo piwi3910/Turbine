@@ -37,15 +37,17 @@ use axum::serve::ListenerExt;
 use turbine_api::support::SupportMetrics;
 use turbine_api::{ApiLimits, ApiState};
 use turbine_core::clock::SystemClock;
-use turbine_core::config::{self, ByteSize, Config, ConfigError, KvConfig};
+use turbine_core::config::{self, ByteSize, Config, ConfigError, KvConfig, RankMode};
 use turbine_core::support::SupportRowView;
 use turbine_core::types::DeviceId;
 use turbine_device::telemetry::TelemetryMetrics;
 use turbine_device::topology::{RegisteredTopology, TopologyGraph, discover_topology};
 use turbine_device::{DeviceInventory, DeviceMetrics, DiscoveryOptions};
+use turbine_distributed::collective::CollectiveMetrics;
 use turbine_kv::KvMetrics;
 use turbine_kv::tier::L2NvmeTier;
 use turbine_model::ModelMetrics;
+use turbine_model::tp::ShardSpec;
 use turbine_observability::MetricsRegistry;
 use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_scheduler::SchedulerMetrics;
@@ -55,7 +57,7 @@ use crate::cli::Cli;
 use crate::engine::{self, EngineMetrics, Fatal, KvSetup, ReliabilityStartup, Timeouts};
 use crate::exit::ExitCode;
 use crate::host;
-use crate::kv_orchestrator::{self, kv_format};
+use crate::kv_orchestrator::{self, tp_kv_format};
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
 use crate::modules::known_module_names;
@@ -153,7 +155,7 @@ pub fn run(cli: Cli) -> ExitCode {
     // P5 S-4: the parallel plan before the kernel provider and the listener (exit 2, or exit 1
     // when the model config it needs is unreadable).
     let plan = match parallel::plan_for(&config, &inventory, &topology).and_then(|p| {
-        parallel::check_executable(&p)?;
+        parallel::check_executable(&p, &config)?;
         Ok(p)
     }) {
         Ok(p) => p,
@@ -178,6 +180,25 @@ pub fn run(cli: Cli) -> ExitCode {
         );
         config.execution.device = device;
     }
+    // P5 S-5 `static` rank mode: this process is one rank of the group, on its local device.
+    // Tier copies need every rank's pool in one process, so L1/L2 are off (WARN, reason code).
+    let static_rank =
+        (plan.tp > 1 && plan.mode == RankMode::Static).then_some(config.parallel.ranks.rank);
+    if static_rank.is_some() {
+        if let Some(&local) = config.parallel.ranks.local_devices.first() {
+            config.execution.device = local;
+        }
+        if config.kv.cpu.enabled || config.kv.nvme.enabled {
+            tracing::warn!(
+                event = "kv_tiers_unavailable",
+                reason = "static_ranks",
+                "kv.cpu and kv.nvme are off in static rank mode: a tier copy of a block needs \
+                 every rank's shard, and the other ranks' pools live in other processes"
+            );
+            config.kv.cpu.enabled = false;
+            config.kv.nvme.enabled = false;
+        }
+    }
 
     // P4 host rules (contract §16.3): a `kv.nvme.*` violation is a runtime failure (exit 1),
     // any other an invalid configuration (exit 2); both before anything is bound.
@@ -197,34 +218,82 @@ pub fn run(cli: Cli) -> ExitCode {
     parallel::register_info(&metrics, &plan);
     // Steps 4–6 per data-parallel replica (P5 S-7): replica 0 on the plan's first device, the
     // others on theirs, sharing the grammar compiler and the kernel metrics. Replicas that share
-    // a device (`parallel.allow_device_sharing`) split its budget.
-    let devices: Vec<DeviceId> = plan.groups.iter().map(|g| g.ranks[0].device).collect();
-    let kv_metrics = KvMetrics::register(&metrics);
-    let mut replicas: Vec<ReplicaStart> = Vec::with_capacity(devices.len());
-    for (r, &device) in devices.iter().enumerate() {
-        let cfg = replica_config(&config, r, devices.len(), device);
-        let prepared = match replicas.first() {
-            None => model::prepare(&cfg, &inventory, &metrics),
-            Some(base) => model::prepare_replica(&cfg, &inventory, &base.prepared),
-        };
-        let mut prepared = match prepared {
-            Ok(p) => p,
+    // a device (`parallel.allow_device_sharing`) split its budget. With tensor parallelism
+    // (P5 S-6) each replica is a group: every rank is prepared on its device for its shard, and
+    // the collective backend loads once (exit 1 naming the library when it cannot).
+    let tp = plan.tp;
+    let collective = if tp > 1 {
+        match parallel::load_collective(&config, &plan) {
+            Ok(library) => Some((library, CollectiveMetrics::register(&metrics))),
             Err(e) => {
-                tracing::error!(replica = r, error = %e, "model startup failed");
+                tracing::error!(event = "collective_unavailable", backend = plan.backend, error = %e, "collective backend unavailable");
                 eprintln!("turbine-server: {e}");
                 return ExitCode::Startup;
             }
+        }
+    } else {
+        None
+    };
+    // Rank slots of every group on `device`: replicas sharing it split its budget.
+    let slots_on = |device: DeviceId| {
+        plan.groups
+            .iter()
+            .flat_map(|g| &g.ranks)
+            .filter(|s| s.device == device)
+            .count() as u32
+    };
+    let shard = |rank: u32| (tp > 1).then_some(ShardSpec { rank, world: tp });
+    let startup_failed = |r: usize, e: &dyn std::fmt::Display| {
+        tracing::error!(replica = r, error = %e, "model startup failed");
+        eprintln!("turbine-server: {e}");
+        ExitCode::Startup
+    };
+    let kv_metrics = KvMetrics::register(&metrics);
+    let mut replicas: Vec<ReplicaStart> = Vec::with_capacity(plan.groups.len());
+    for (r, group) in plan.groups.iter().enumerate() {
+        // Static mode (dp 1): this process prepares only its own rank, on its local device.
+        let (device, first_rank) = match static_rank {
+            Some(rank) => (config.execution.device, rank),
+            None => (group.ranks[0].device, 0),
         };
-        let sharing = devices.iter().filter(|d| **d == device).count() as u32;
-        if let Err(e) = prepared.share_device(sharing) {
-            tracing::error!(replica = r, error = %e, "model startup failed");
-            eprintln!("turbine-server: {e}");
-            return ExitCode::Startup;
+        let cfg = replica_config(&config, r, plan.groups.len(), device);
+        let prepared = match replicas.first() {
+            None => model::prepare_rank(&cfg, &inventory, &metrics, shard(first_rank)),
+            Some(base) => {
+                model::prepare_replica(&cfg, &inventory, &base.prepared, shard(first_rank))
+            }
+        };
+        let mut prepared = match prepared {
+            Ok(p) => p,
+            Err(e) => return startup_failed(r, &e),
+        };
+        if let Err(e) = prepared.share_device(slots_on(device)) {
+            return startup_failed(r, &e);
+        }
+        let mut workers = Vec::with_capacity(group.ranks.len().saturating_sub(1));
+        let local_workers = if static_rank.is_some() {
+            0
+        } else {
+            group.ranks.len()
+        };
+        for slot in group.ranks.iter().take(local_workers).skip(1) {
+            let mut rank_cfg = cfg.clone();
+            rank_cfg.execution.device = slot.device;
+            let mut worker =
+                match model::prepare_replica(&rank_cfg, &inventory, &prepared, shard(slot.rank)) {
+                    Ok(w) => w,
+                    Err(e) => return startup_failed(r, &e),
+                };
+            if let Err(e) = worker.share_device(slots_on(slot.device)) {
+                return startup_failed(r, &e);
+            }
+            workers.push(worker);
         }
         // P4: the model's block size is known now (exit 2), and L2 opens before the listener
-        // binds (exit 1 naming the path).
-        let layout = prepared.pool.layout;
-        if let Err(e) = cfg.kv.validate_block_bytes(layout.block_bytes()) {
+        // binds (exit 1 naming the path). A tier copy of a tensor-parallel block holds every
+        // rank's shard (decision "P5 T17" B).
+        let format = tp_kv_format(prepared.pool.layout, tp);
+        if let Err(e) = cfg.kv.validate_block_bytes(format.block_bytes()) {
             eprintln!("turbine-server: invalid configuration: {e}");
             return ExitCode::Config;
         }
@@ -235,7 +304,7 @@ pub fn run(cli: Cli) -> ExitCode {
         };
         let l2 = match kv_orchestrator::open_l2(
             &cfg.kv,
-            &kv_format(layout),
+            &format,
             &prepared.identity,
             Arc::new(SystemClock::new()),
             replica_kv_metrics.clone(),
@@ -247,8 +316,58 @@ pub fn run(cli: Cli) -> ExitCode {
                 return ExitCode::Startup;
             }
         };
+        let statics = match (static_rank, &collective) {
+            (Some(rank), Some((library, cmetrics))) => {
+                match static_parts(&config, &inventory, &plan, &prepared, rank) {
+                    Ok((transport, expect, hello)) => Some(if rank == 0 {
+                        StaticRole::Leader(engine::tp::StaticLeader {
+                            transport,
+                            listen: config.parallel.ranks.leader.unwrap_or(config.server.listen),
+                            expect,
+                            world: tp,
+                        })
+                    } else {
+                        StaticRole::Worker(engine::tp::StaticWorker {
+                            transport,
+                            leader: config.parallel.ranks.leader.unwrap_or(config.server.listen),
+                            hello,
+                            library: Arc::clone(library),
+                            init_timeout: config.parallel.collective.init_timeout.0,
+                            op_timeout: config.parallel.collective.op_timeout.0,
+                            metrics: cmetrics.clone(),
+                            clock: Arc::new(SystemClock::new()),
+                        })
+                    }),
+                    Err(e) => {
+                        eprintln!("turbine-server: {e}");
+                        return ExitCode::Config;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let (remote, worker) = match statics {
+            Some(StaticRole::Leader(l)) => (Some(l), None),
+            Some(StaticRole::Worker(w)) => (None, Some(w)),
+            None => (None, None),
+        };
+        let group = collective
+            .as_ref()
+            .filter(|_| worker.is_none())
+            .map(|(library, metrics)| engine::tp::TpGroupStart {
+                workers,
+                library: Arc::clone(library),
+                init_timeout: config.parallel.collective.init_timeout.0,
+                op_timeout: config.parallel.collective.op_timeout.0,
+                depth: config.parallel.plan_queue_depth as usize,
+                metrics: metrics.clone(),
+                clock: Arc::new(SystemClock::new()),
+                remote,
+            });
         replicas.push(ReplicaStart {
             prepared,
+            group,
+            worker,
             kv_cfg: cfg.kv.clone(),
             kv_metrics: replica_kv_metrics,
             l2,
@@ -281,6 +400,59 @@ pub fn run(cli: Cli) -> ExitCode {
     code
 }
 
+/// This process's part of a `static` group.
+enum StaticRole {
+    Leader(engine::tp::StaticLeader),
+    Worker(engine::tp::StaticWorker),
+}
+
+/// The rank transport (`parallel.ranks.transport`), what the leader expects of every rank and
+/// this rank's `Hello` (P5 S-5): the model and configuration fingerprints and the local device's
+/// vendor and architecture.
+fn static_parts(
+    config: &Config,
+    inventory: &DeviceInventory,
+    plan: &turbine_distributed::plan::ParallelPlan,
+    prepared: &PreparedModel,
+    rank: u32,
+) -> Result<
+    (
+        &'static dyn turbine_distributed::transport::Transport,
+        turbine_distributed::rank::HelloExpect,
+        turbine_distributed::rank::RankMessage,
+    ),
+    String,
+> {
+    let transport =
+        turbine_distributed::transport::select(config.parallel.ranks.transport.as_str())
+            .map_err(|e| format!("parallel.ranks.transport: {e}"))?;
+    let device = inventory
+        .devices
+        .iter()
+        .find(|d| d.index == config.execution.device);
+    let vendor = device
+        .map(|d| d.vendor)
+        .or(plan.vendor)
+        .ok_or("parallel.ranks.mode: static ranks need a GPU device")?;
+    let arch = device.and_then(|d| d.arch.clone()).unwrap_or_default();
+    let expect = turbine_distributed::rank::HelloExpect {
+        model_fingerprint: prepared.identity.fingerprint(),
+        config_fingerprint: parallel::config_fingerprint(config),
+        device_vendor: vendor,
+        device_arch: arch.clone(),
+    };
+    let hello = turbine_distributed::rank::RankMessage::Hello {
+        protocol: turbine_distributed::rank::PROTOCOL_VERSION,
+        rank,
+        world_size: plan.tp,
+        model_fingerprint: expect.model_fingerprint,
+        config_fingerprint: expect.config_fingerprint,
+        device_vendor: vendor,
+        device_arch: arch,
+    };
+    Ok((transport, expect, hello))
+}
+
 /// An unsupported support-matrix row: logged as `event="support_matrix"`, exit 2 (a
 /// configuration error, before any port is bound).
 fn refuse_support(error: &ConfigError) -> ExitCode {
@@ -301,6 +473,10 @@ struct ServeCluster {
 /// metrics and its L2 tier (Phase 4).
 struct ReplicaStart {
     prepared: PreparedModel,
+    /// Tensor parallelism: the group's worker ranks and its collective backend (P5 S-6).
+    group: Option<engine::tp::TpGroupStart>,
+    /// `static` rank mode, ranks 1..: this process is a worker rank, not an engine.
+    worker: Option<engine::tp::StaticWorker>,
     kv_cfg: KvConfig,
     kv_metrics: KvMetrics,
     l2: Option<Arc<L2NvmeTier>>,
@@ -351,7 +527,8 @@ async fn serve(
             .with_replicas(replicas.len(), router_policy, &metrics)
             .with_support(support)
             .with_topology(&cluster.topology)
-            .with_parallel(cluster.parallel),
+            .with_parallel(cluster.parallel)
+            .with_rank_worker(replicas[0].worker.is_some()),
     );
     let state = ApiState {
         inference: backend.clone(),
@@ -408,8 +585,37 @@ async fn serve(
             },
             kv: replica.kv_metrics,
         };
+        if let Some(worker) = replica.worker {
+            // P5 S-5: a static worker rank runs its shard, not an engine.
+            let (backend, fatal, reliability) = (
+                Arc::clone(&backend),
+                fatal_tx.clone(),
+                reliability_metrics.clone(),
+            );
+            let prepared = replica.prepared;
+            let spawned = std::thread::Builder::new()
+                .name("turbine-rank-worker".into())
+                .spawn(move || {
+                    let phase = |reason| backend.set_loading(reason);
+                    let result = engine::tp::run_static_worker(
+                        &prepared,
+                        worker,
+                        &reliability,
+                        &phase,
+                        || backend.set_rank_ready(),
+                    );
+                    let _ = fatal.send(Fatal::RankStopped(result.err()));
+                });
+            if let Err(e) = spawned {
+                let _ = fatal_tx.send(Fatal::LoadFailed(format!(
+                    "cannot start the worker rank thread: {e}"
+                )));
+            }
+            continue;
+        }
         if let Err(e) = engine::spawn(
             replica.prepared,
+            replica.group,
             Arc::clone(&backend),
             metrics,
             startup,
@@ -466,6 +672,11 @@ async fn serve(
             let (message, code) = match &fatal {
                 Fatal::LoadFailed(m) => (format!("model load failed: {m}"), ExitCode::Startup),
                 Fatal::DeviceFatal(m) => (format!("device error: {m}"), ExitCode::DeviceFatal),
+                Fatal::RankStopped(None) => {
+                    tracing::info!(event = "rank_shutdown", "the leader shut this rank down");
+                    return ExitCode::Clean;
+                }
+                Fatal::RankStopped(Some(m)) => (format!("rank stopped: {m}"), ExitCode::Startup),
             };
             tracing::error!(error = %message, "exiting");
             eprintln!("turbine-server: {message}");

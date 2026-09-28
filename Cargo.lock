@@ -2587,6 +2587,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
+ "blake3",
  "clap",
  "jsonschema",
  "prometheus-client",

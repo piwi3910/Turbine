@@ -28,8 +28,8 @@ use turbine_core::types::{BlockId, ModelFingerprint, SeqId, Vendor};
 use crate::collective::{Collective, CollectiveError};
 use crate::transport::{RankStream, Transport};
 
-/// Static-mode protocol version carried in `Hello`.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Static-mode protocol version carried in `Hello`. 2 adds [`StepPlan::copies`].
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Largest frame body accepted or sent (16 MiB).
 pub const MAX_FRAME_BYTES: usize = 16 << 20;
 
@@ -38,6 +38,10 @@ pub const MAX_FRAME_BYTES: usize = 16 << 20;
 pub struct StepPlan {
     pub step: u64,
     pub sequences: Vec<StepSeq>,
+    /// Block copies `(src, dst)` every rank runs on its own pool before the step's forward (the
+    /// leader's `n` > 1 fork copies); a plan may carry copies and no sequences.
+    #[serde(default)]
+    pub copies: Vec<(BlockId, BlockId)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -589,6 +593,27 @@ impl RankRuntime {
         Ok(())
     }
 
+    /// Local mode: waits until every worker has executed every plan handed to it (none queued or
+    /// running), so the leader may use the workers' device memory between steps (tier copies);
+    /// returns the first failure any rank reported. Static mode has no per-step
+    /// acknowledgement (the step's collectives synchronise the ranks): only a failure already
+    /// seen is reported.
+    pub fn wait_idle(&self) -> Result<(), RankError> {
+        if let Mode::Local(workers) = &self.mode {
+            for w in workers {
+                let mut outstanding = lock(&w.slots.outstanding);
+                while *outstanding > 0 && w.slots.alive.load(Ordering::Acquire) {
+                    outstanding = w
+                        .slots
+                        .cv
+                        .wait(outstanding)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        }
+        self.failure.get().map_or(Ok(()), Err)
+    }
+
     /// Clean shutdown: static workers receive `Shutdown { reason }`; local workers finish their
     /// queued plans and exit.
     pub fn shutdown(&mut self, reason: &str) {
@@ -769,6 +794,7 @@ mod tests {
                 block_table: vec![BlockId(4)],
                 is_prefill: true,
             }],
+            copies: vec![(BlockId(4), BlockId(5))],
         }
     }
 

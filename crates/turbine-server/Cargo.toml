@@ -40,6 +40,8 @@ turbine-reliability.workspace = true
 turbine-distributed.workspace = true
 # P3: the per-iteration engine statistics the pressure controller reads without a lock
 arc-swap.workspace = true
+# P5 static rank mode: the configuration fingerprint every rank's Hello carries
+blake3.workspace = true
 
 [features]
 # P3 S-16: `reliability.fault_injection` (failed pool reservations, injected device errors,

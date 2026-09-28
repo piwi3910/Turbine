@@ -533,7 +533,10 @@ pub fn plan(
 /// inventory: the `cpu` reference backend (`vendor` `None`; every replica shares the host) and
 /// the single-GPU default (tp 1, dp 1, `devices: auto`), whose device and vendor the kernel
 /// provider checks when it loads (exit 1). Tensor parallelism needs GPUs, and so do the `rccl`
-/// and `nccl` backends; `auto` sizes resolve to 1.
+/// and `nccl` backends; `auto` sizes resolve to 1. The one exception is the host test path: the
+/// cpu reference backend with an explicitly configured host-memory collective backend
+/// (`parallel.collective_backend: host`) runs tp > 1 ranks as threads, rank `r` of every group
+/// on the host "device" `execution.device + r` (each rank its own host memory).
 pub fn plan_execution_device(
     cfg: &ParallelConfig,
     device: DeviceId,
@@ -541,10 +544,16 @@ pub fn plan_execution_device(
     host: &str,
 ) -> Result<ParallelPlan, PlanError> {
     let tp = cfg.tensor_parallel_size.fixed().unwrap_or(1);
-    if tp != 1 {
+    let host_backend = crate::collective::registry()
+        .get(cfg.collective_backend.as_str())
+        .is_some_and(|b| b.vendors().is_empty());
+    if tp != 1 && (vendor.is_some() || !host_backend) {
         return Err(err(
             TP_KEY,
-            format!("{tp} ranks need {tp} GPUs; execution.backend cpu runs tensor_parallel_size 1"),
+            format!(
+                "{tp} ranks need {tp} GPUs; execution.backend cpu runs tensor_parallel_size 1 \
+                 (or tensor-parallel ranks as threads with parallel.collective_backend: host)"
+            ),
         ));
     }
     let dp = cfg.data_parallel_size.fixed().unwrap_or(1);
@@ -583,11 +592,13 @@ pub fn plan_execution_device(
     let groups = (0..dp)
         .map(|r| ReplicaGroup {
             replica: ReplicaId(r),
-            ranks: vec![RankSlot {
-                rank: 0,
-                device,
-                host: host.to_string(),
-            }],
+            ranks: (0..tp)
+                .map(|rank| RankSlot {
+                    rank,
+                    device: DeviceId(device.0 + rank),
+                    host: host.to_string(),
+                })
+                .collect(),
         })
         .collect();
     for r in &reasons {
@@ -1015,6 +1026,24 @@ mod tests {
         // Tensor parallelism and GPU communicators need GPUs.
         let tp2 = cfg(SizeOrAuto::Size(2), SizeOrAuto::Size(1));
         let e = plan_execution_device(&tp2, DeviceId(0), None, "h").expect_err("cpu tp 2");
+        assert_eq!(e.key, "parallel.tensor_parallel_size");
+        // … except the host test path: cpu ranks as threads over an explicit host backend,
+        // rank r on host device `execution.device + r`, one group per replica.
+        let host_tp = ParallelConfig {
+            collective_backend: ModuleName::new("host").unwrap(),
+            allow_device_sharing: true,
+            ..cfg(SizeOrAuto::Size(2), SizeOrAuto::Size(2))
+        };
+        let p = plan_execution_device(&host_tp, DeviceId(3), None, "h").expect("host tp 2");
+        assert_eq!((p.tp, p.dp, p.backend), (2, 2, "host"));
+        let devices: Vec<Vec<u32>> = p
+            .groups
+            .iter()
+            .map(|g| g.ranks.iter().map(|r| r.device.0).collect())
+            .collect();
+        assert_eq!(devices, [[3, 4], [3, 4]]);
+        let e = plan_execution_device(&host_tp, DeviceId(0), Some(Vendor::Amd), "h")
+            .expect_err("a GPU never takes the host path");
         assert_eq!(e.key, "parallel.tensor_parallel_size");
         let rccl = ParallelConfig {
             collective_backend: ModuleName::new("rccl").unwrap(),

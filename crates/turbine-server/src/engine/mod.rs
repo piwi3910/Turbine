@@ -24,6 +24,7 @@ pub(crate) mod grammar;
 mod r#loop;
 pub(crate) mod requests;
 pub(crate) mod stages;
+pub(crate) mod tp;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -92,6 +93,8 @@ pub struct KvSetup {
 
 /// Why the engine asks the server to exit.
 #[derive(Debug)]
+// `DeviceFatal` names the P3 circuit reason; the lint only notices it from three variants on.
+#[allow(clippy::enum_variant_names)]
 pub enum Fatal {
     /// Weight load, memory budget, KV allocation, emergency reserve or warm-up failed after
     /// the listener bound: exit 1.
@@ -99,6 +102,9 @@ pub enum Fatal {
     /// The circuit breaker is fatal — a sticky device error, a controller failure, or an
     /// engine panic: exit 3 (P3 S-12, CONFLICT C-25).
     DeviceFatal(String),
+    /// A `static`-mode worker rank process stopped (P5 S-5): `None` when its leader shut it down
+    /// (exit 0), else why — a lost leader, a failed join, load or step (exit 1).
+    RankStopped(Option<String>),
 }
 
 /// The documents behind `GET /turbine/v1/scheduler` and `GET /turbine/v1/kv`.
@@ -165,12 +171,41 @@ pub struct ReliabilityStartup {
     pub replica: u32,
 }
 
+/// The device side of `prepared`'s KV copies (Phase 4): its kernel library's copy stream and
+/// pinned memory, or synchronous copies (no copy engine: L1 is disabled, logged).
+pub(crate) fn copy_device(prepared: &PreparedModel) -> CopyDevice {
+    match &prepared.provider.opened.context {
+        Some(ctx) if ctx.has_copy_engine() => CopyDevice::Stream {
+            engine: Arc::clone(ctx) as _,
+            pinned: Arc::clone(ctx) as _,
+        },
+        Some(ctx) => {
+            tracing::warn!(
+                event = "kv_copy_engine_unavailable",
+                library = %ctx.library().path().display(),
+                minor = ctx.library().abi_minor(),
+                "the kernel library has no copy streams (ABI v2.5); KV copies are \
+                 synchronous and L1 is disabled"
+            );
+            CopyDevice::Sync {
+                mem: Arc::clone(&prepared.provider.opened.mem),
+            }
+        }
+        None => CopyDevice::Sync {
+            mem: Arc::clone(&prepared.provider.opened.mem),
+        },
+    }
+}
+
 /// Starts the engine thread: it loads the weights, measures the memory budget, allocates the KV
 /// pool and the emergency reserve, warms up, starts the telemetry sampler and the pressure
 /// controller, marks the backend ready and then serves until the command channel closes or
-/// `Shutdown`. Failures are reported on `fatal`.
+/// `Shutdown`. With `group` (P5 S-6) `prepared` is rank 0 of a tensor-parallel group, loaded with
+/// its workers ([`tp::load_group`]). Failures are reported on `fatal`.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     prepared: PreparedModel,
+    group: Option<tp::TpGroupStart>,
     backend: Arc<ModelBackend>,
     metrics: EngineMetrics,
     startup: ReliabilityStartup,
@@ -198,39 +233,34 @@ pub fn spawn(
                 }
             };
             let warmup_token = prepared.generation.bos_token_id.unwrap_or(0);
-            let loaded =
-                match model::load(&prepared, warmup_token, &metrics.model, &startup.metrics) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
-                        return;
-                    }
-                };
+            let loaded = match group {
+                None => model::load(&prepared, warmup_token, &metrics.model, &startup.metrics),
+                Some(group) => {
+                    let phase = |reason| backend.set_loading(reason);
+                    tp::load_group(
+                        &prepared,
+                        group,
+                        warmup_token,
+                        &metrics.model,
+                        &startup.metrics,
+                        &phase,
+                    )
+                }
+            };
+            let mut loaded = match loaded {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
+                    return;
+                }
+            };
             let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
             // Phase 4: the KV hierarchy over the pool, before the reliability side that drives
-            // it. L1 needs the kernel library's copy engine (ABI v2.3 + v2.5).
+            // it. L1 needs the kernel library's copy engine (ABI v2.3 + v2.5). Under tensor
+            // parallelism every worker rank's pool is a shard of each block (P5).
+            let shards = std::mem::take(&mut loaded.shards);
             let mut pool = loaded.pool;
-            let device = match &prepared.provider.opened.context {
-                Some(ctx) if ctx.has_copy_engine() => CopyDevice::Stream {
-                    engine: Arc::clone(ctx) as _,
-                    pinned: Arc::clone(ctx) as _,
-                },
-                Some(ctx) => {
-                    tracing::warn!(
-                        event = "kv_copy_engine_unavailable",
-                        library = %ctx.library().path().display(),
-                        minor = ctx.library().abi_minor(),
-                        "the kernel library has no copy streams (ABI v2.5); KV copies are \
-                         synchronous and L1 is disabled"
-                    );
-                    CopyDevice::Sync {
-                        mem: Arc::clone(&prepared.provider.opened.mem),
-                    }
-                }
-                None => CopyDevice::Sync {
-                    mem: Arc::clone(&prepared.provider.opened.mem),
-                },
-            };
+            let device = copy_device(&prepared);
             let l2 = startup.kv.l2.clone();
             let started = KvOrchestrator::start(
                 KvStart {
@@ -238,7 +268,7 @@ pub fn spawn(
                     memory_kind: prepared.provider.opened.memory_kind,
                     identity: prepared.identity,
                     device,
-                    shards: Vec::new(),
+                    shards,
                     l2: startup.kv.l2,
                     clock: Arc::clone(&clock),
                     metrics: metrics.kv.clone(),

@@ -264,7 +264,8 @@ fn wait_until_ready(child: &mut Child, addr: SocketAddr) {
 
 /// P5 S-4: the parallel plan is checked after device discovery and before the kernel provider
 /// or the listener: tensor parallelism of 2 with no second GPU (or none at all) is exit 2 naming
-/// `parallel.tensor_parallel_size`, and the port stays free. So is TP on the cpu backend.
+/// `parallel.tensor_parallel_size`, and the port stays free. So is TP on the cpu backend without
+/// the host collective, and a group larger than the model's attention heads (P5 S-6).
 #[test]
 fn impossible_plan_exits_2_before_bind() {
     let port = free_port();
@@ -276,7 +277,16 @@ fn impossible_plan_exits_2_before_bind() {
             yaml.replace("  backend: cpu\n", "  backend: hip\n")
                 + "parallel:\n  tensor_parallel_size: 2\n",
         ),
-        ("plan-cpu", yaml + "parallel:\n  tensor_parallel_size: 2\n"),
+        (
+            "plan-cpu",
+            yaml.clone() + "parallel:\n  tensor_parallel_size: 2\n",
+        ),
+        // The cpu host path runs tp > 1, but never more ranks than the model can split: the
+        // tiny Llama has 4 attention heads (P5 S-6, checked against config.json before bind).
+        (
+            "plan-cpu-heads",
+            yaml.clone() + "parallel:\n  tensor_parallel_size: 8\n  collective_backend: host\n",
+        ),
     ] {
         let cfg = TempConfig::new(tag, &yaml);
         let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(30));
@@ -288,6 +298,21 @@ fn impossible_plan_exits_2_before_bind() {
         );
         TcpListener::bind(addr).expect("the configured port must still be free");
     }
+    // Static rank processes need a device communicator: the host collective's ranks are threads.
+    let cfg = TempConfig::new(
+        "plan-cpu-static",
+        &(yaml
+            + "parallel:\n  tensor_parallel_size: 2\n  collective_backend: host\n  ranks:\n    \
+               mode: static\n    leader: 127.0.0.1:9\n"),
+    );
+    let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(30));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("invalid parallel plan: parallel.ranks.mode"),
+        "stderr: {stderr}"
+    );
+    TcpListener::bind(addr).expect("the configured port must still be free");
 }
 
 #[test]
