@@ -12,9 +12,10 @@
 #                      tp 2 in local mode: each passes turbine-golden compare against its
 #                      committed reference; then turbine-bench --concurrency 4 --requests 64
 #                      against the local-mode Llama server must report requests_ok 64.
-#   dp2-novanas        Llama-3.2-3B-Instruct at tp 1, dp 2: turbine-bench --concurrency 8
-#                      --requests 128 must report requests_ok 128, and turbine_dp_routed_total
-#                      must be non-zero for replica 0 and replica 1.
+#   dp2-novanas        Llama-3.2-3B-Instruct at tp 1: first a dp 1 baseline on device 0
+#                      (turbine-bench --concurrency 8 --requests 128), then dp 2 (one replica per
+#                      R9700): golden at concurrency 1 and 16, the same bench (requests_ok 128),
+#                      and turbine_dp_routed_total non-zero for replica 0 and replica 1.
 #
 # Like scripts/lab-test.sh, the tree is uploaded to /home/piwi/turbine-ci/runs/<run id>/src and
 # one template (scripts/lab/novanas-cluster-job.yaml) runs twice: first GPU-less as
@@ -96,12 +97,13 @@ wait_ready() {
 	job_fail "${url}/ready not 200 within 30 min"
 }
 
-# golden <slug> <label>: turbine-golden compare against the committed reference.
+# golden <slug> <label> [compare args]...: turbine-golden compare against the committed reference.
 golden() {
 	local slug="$1" label="$2"
-	echo "lab-step: golden ${label}"
+	shift 2
+	echo "lab-step: golden ${label} $*"
 	"${BIN}/turbine-golden" compare --url "$URL" \
-		--reference "tests/golden/${slug}/reference.jsonl" ||
+		--reference "tests/golden/${slug}/reference.jsonl" "$@" ||
 		job_fail "golden ${label} outside tolerance"
 }
 
@@ -159,8 +161,18 @@ scenario_tp2() {
 }
 
 scenario_dp2() {
-	start_server "${WORK}/dp2.log" scripts/lab/phase5-novanas-dp2.yaml
+	local dp2=scripts/lab/phase5-novanas-dp2.yaml
+	# The dp 1 baseline: the same configuration with one replica on device 0.
+	start_server "${WORK}/dp1.log" "$dp2" --set parallel.data_parallel_size=1 \
+		--set "parallel.devices=[0]"
+	wait_ready "$URL" "${WORK}/dp1.log"
+	bench_ok 128 "${WORK}/dp1-bench.json" --concurrency 8 --requests 128
+	stop_servers
+
+	start_server "${WORK}/dp2.log" "$dp2"
 	wait_ready "$URL" "${WORK}/dp2.log"
+	golden llama-3.2-3b-instruct "llama dp2 c1"
+	golden llama-3.2-3b-instruct "llama dp2 c16" --concurrency 16
 	bench_ok 128 "${WORK}/dp2-bench.json" --concurrency 8 --requests 128
 	curl -s "${URL}/metrics" >"${WORK}/dp2-metrics.txt" || job_fail "GET /metrics failed"
 	grep '^turbine_dp_routed_total' "${WORK}/dp2-metrics.txt" || true
