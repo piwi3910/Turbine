@@ -872,6 +872,8 @@ Options:
 
 Until answered: the Rust side of the stream handle (`StreamRef::native_handle()` filled when the library exports it) and the NCCL-API communicator (Task 7) proceed, since every option has the same `turbine_stream_native_handle(ctx, s, void**)` signature; no kernel or header change lands.
 
+**Answer (2026-09-28, user): B.** An optional minor group v2.6 with `turbine_stream_native_handle` plus own `row_sumsq` and `rmsnorm_sharded` kernels for the sharded QK-norm (a); `TURBINE_ABI_VERSION` stays 2. Under the reuse-first rule the evaluation of existing providers for the sharded case is recorded with the kernels (decision "P5 T6: sharded RMSNorm — provider evaluation"), and each new kernel gets a correctness test against the CPU reference.
+
 ## P5 T17: Phase 4 KV tiers (L1 pinned host, L2 NVMe) under tensor parallelism
 
 Asked 2026-09-28. Spec §Data: "Phase-4 tier copies (CPU, NVMe) of a TP block are stored per rank shard, keyed by (block key, tp size, rank)". Today the KV hierarchy and its orchestrator (`turbine_kv::hierarchy`, `turbine_server::kv_orchestrator`) drive one pool on one device: demotion, promotion, the copy streams, the L2 slab files and the transfer calibration are all per pool. With tp = 2 every block has one shard per rank, so every tier copy becomes one copy per rank that must all complete before the block counts as demoted or promoted.
@@ -880,3 +882,5 @@ Asked 2026-09-28. Spec §Data: "Phase-4 tier copies (CPU, NVMe) of a TP block ar
 - B) Build per-rank tier copies in the same task: one copy per rank per block, the hierarchy tracks completion across ranks, L2 slab files keyed by (block key, tp, rank)
 
 DP replicas (tp = 1 each) are unaffected: each replica has its own pool and hierarchy.
+
+**Answer (2026-09-28, user): B.** Per-rank L1/L2 tier copies are built inside T17 (one copy per rank per block, completion tracked across ranks, L2 slab files keyed by (block key, tp, rank)); no L0-only first landing.
