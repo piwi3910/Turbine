@@ -175,8 +175,22 @@ if ! ssh -o BatchMode=yes "$host" "test -f /home/piwi/turbine-models/$slug/confi
 fi
 
 # 2. serve natively, pinned to one card
-ssh -o BatchMode=yes "$host" "pkill -u piwi -x turbine-server; sleep 1; \
-  setsid bash -c \"cd '$remote/src' && \
+# Only this run's own server is ever stopped: its pid is kept in $pidf and checked to still be
+# a turbine-server before the kill (a blanket pkill would also end other agents' test servers
+# running as piwi). A port already served is refused, not taken over.
+pidf=/tmp/lab-bench-server.pid
+stop_server="if [ -f $pidf ]; then p=\$(cat $pidf); \
+  if [ \"\$(cat /proc/\$p/comm 2>/dev/null)\" = turbine-server ]; then kill \$p; \
+    for i in 1 2 3 4 5 6 7 8 9 10; do [ -d /proc/\$p ] || break; sleep 1; done; fi; \
+  rm -f $pidf; fi"
+# Another run's server (live pid file) or anything else on the port: refuse, never kill it
+# (a leftover lab-bench server is stopped deliberately: kill "$(cat $pidf)" on the host).
+if ssh -o BatchMode=yes "$host" "ss -ltnH 'sport = :18000' | grep -q ."; then
+	echo "lab-bench: port 18000 on $host is already served (pid file $pidf: $(ssh -o BatchMode=yes "$host" "cat $pidf 2>/dev/null || echo none")); stop that server first" >&2
+	exit 1
+fi
+ssh -o BatchMode=yes "$host" "rm -f $pidf"
+ssh -o BatchMode=yes "$host" "setsid bash -c \"echo \\\$\\\$ > $pidf; cd '$remote/src' && \
     LD_LIBRARY_PATH=/opt/rocm/rocm/lib:/opt/rocm/rocm/lib/rocm_sysdeps/lib \
     TURBINE_AMD_SMI_LIBRARY=/opt/rocm/rocm/lib/libamd_smi.so.26.5.0 ROCR_VISIBLE_DEVICES=$gpu \
     exec '$remote/target/release/turbine-server' --config $cfg \
@@ -192,7 +206,7 @@ for _ in $(seq 1 150); do
 	sleep 2
 done
 if [[ $ready -ne 1 ]]; then
-	ssh -o BatchMode=yes "$host" "tail -30 /tmp/lab-bench-server.log; pkill -u piwi -x turbine-server" >"$out/server.log" 2>&1
+	ssh -o BatchMode=yes "$host" "tail -30 /tmp/lab-bench-server.log; $stop_server" >"$out/server.log" 2>&1
 	echo "BENCH $label $model commit=$commit SERVER NOT READY (see $out/server.log)"
 	exit 1
 fi
@@ -222,7 +236,7 @@ scripts/bench-lock.sh sh -c "
 " 2>/dev/null
 curl -s "$url/metrics" >"$out/metrics.txt"
 curl -s "$url/turbine/v1/status" >"$out/status.json"
-ssh -o BatchMode=yes "$host" "cp /tmp/lab-bench-server.log /tmp/lab-bench-server.last.log; pkill -u piwi -x turbine-server"
+ssh -o BatchMode=yes "$host" "cp /tmp/lab-bench-server.log /tmp/lab-bench-server.last.log; $stop_server"
 
 # 4. summary
 python3 - "$out" "$label" "$model" "$commit" "$gpu" "$tests" "$run_golden16" "$quick" "$client" <<'EOF'
