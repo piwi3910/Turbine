@@ -949,10 +949,12 @@ pub(crate) fn load_weights(prepared: &PreparedModel) -> Result<LoadedWeights, St
             tp::weight_slots(arch, s).map_err(|e| model_error("tensor parallelism", e))?
         }
     };
-    WeightLoader::load_format(
+    // Other expert ranks' tensors are skipped quietly (counted), not warned one by one.
+    WeightLoader::load_part(
         arch.weight_format.0,
         &prepared.index,
         &slots,
+        &arch.family.0.weight_slots(arch),
         &prepared.provider.opened.mem,
         MAX_STAGING_BYTES,
     )
