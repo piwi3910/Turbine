@@ -1,5 +1,5 @@
-//! `#[repr(C)]` mirrors of `kernels/include/turbine_kernels.h` (ABI v2.6), the symbol table
-//! resolved once per loaded library (the minor groups v2.1–v2.6 optionally), and the status-code
+//! `#[repr(C)]` mirrors of `kernels/include/turbine_kernels.h` (ABI v2.7), the symbol table
+//! resolved once per loaded library (the minor groups v2.1–v2.7 optionally), and the status-code
 //! mapping (contract §9.4).
 //!
 //! Descriptor field order and types match the header field for field. Pointer fields carry
@@ -334,6 +334,30 @@ pub(crate) struct RmsnormShardedDesc {
     pub dtype: i32,
 }
 
+/// `turbine_mapped_collective_desc` (v2.7).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MappedCollectiveDesc {
+    pub send: *const c_void,
+    pub recv: *mut c_void,
+    pub bytes: i64,
+    pub send_stride: i64,
+    pub recv_stride: i64,
+    pub slots: *mut c_void,
+    pub slot_bytes: i64,
+    pub flags: *mut u64,
+    pub abort_word: *mut u32,
+    pub seq: u64,
+    pub timeout_ns: i64,
+    pub kind: i32,
+    pub reduce_op: i32,
+    pub dtype: i32,
+    pub rank: i32,
+    pub world: i32,
+    pub root: i32,
+    pub max_blocks: i32,
+}
+
 /// `turbine_<op>`: enqueue on the context's compute stream.
 pub(crate) type OpFn<D> = unsafe extern "C" fn(*mut TurbineCtx, *const D) -> i32;
 /// `turbine_<op>_supported`: 1 / 0 (negative on an internal error); pointers may be null.
@@ -420,6 +444,16 @@ pub(crate) struct TensorParallelFns {
     pub rmsnorm_sharded: OpTrio<RmsnormShardedDesc>,
 }
 
+/// The v2.7 host-mapped group: `turbine_host_{alloc,free}_mapped`,
+/// `turbine_host_mapped_device_ptr` and the `mapped_collective` trio.
+#[derive(Clone, Copy)]
+pub(crate) struct MappedFns {
+    pub alloc: unsafe extern "C" fn(*mut TurbineCtx, usize, *mut *mut c_void) -> i32,
+    pub device_ptr: unsafe extern "C" fn(*mut TurbineCtx, *mut c_void, *mut *mut c_void) -> i32,
+    pub free: unsafe extern "C" fn(*mut TurbineCtx, *mut c_void) -> i32,
+    pub collective: OpTrio<MappedCollectiveDesc>,
+}
+
 /// `TURBINE_IMPL_NEEDS_HOST_OFFSETS` (v2.4): the implementation reads `host_expert_offsets`.
 pub(crate) const IMPL_NEEDS_HOST_OFFSETS: u32 = 1;
 
@@ -466,11 +500,11 @@ pub(crate) struct ImplFns {
     pub set_profile: unsafe extern "C" fn(*mut TurbineCtx, *const CardProfileDesc) -> i32,
 }
 
-/// The optional ABI v2.1–v2.6 functions. `minor` is `turbine_abi_minor()` (0 when the library
+/// The optional ABI v2.1–v2.7 functions. `minor` is `turbine_abi_minor()` (0 when the library
 /// lacks it); every v2.1 group is `None` unless `minor` ≥ 1, `staging` unless `minor` ≥ 3,
 /// `impls` unless `minor` ≥ 4, `copies` unless `minor` ≥ 5 and `staging` is resolved,
-/// `tensor_parallel` unless `minor` ≥ 6, and each only when the library exports the whole
-/// group.
+/// `tensor_parallel` unless `minor` ≥ 6, `mapped` unless `minor` ≥ 7, and each only when the
+/// library exports the whole group.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct V21Symbols {
     pub minor: u32,
@@ -486,6 +520,8 @@ pub(crate) struct V21Symbols {
     pub copies: Option<CopyFns>,
     /// v2.6 native stream handles and the sharded RMSNorm ops (Phase 5 tensor parallelism).
     pub tensor_parallel: Option<TensorParallelFns>,
+    /// v2.7 host-mapped memory and one-shot collectives (the `hostmem` collective backend).
+    pub mapped: Option<MappedFns>,
 }
 
 impl V21Symbols {
@@ -564,6 +600,17 @@ impl V21Symbols {
                 rmsnorm_sharded: optional_trio(lib, "rmsnorm_sharded")?,
             })
         })();
+        let mapped = (|| {
+            if minor < 7 {
+                return None;
+            }
+            Some(MappedFns {
+                alloc: optional(lib, "turbine_host_alloc_mapped")?,
+                device_ptr: optional(lib, "turbine_host_mapped_device_ptr")?,
+                free: optional(lib, "turbine_host_free_mapped")?,
+                collective: optional_trio(lib, "mapped_collective")?,
+            })
+        })();
         V21Symbols {
             minor,
             options,
@@ -574,6 +621,7 @@ impl V21Symbols {
             impls,
             copies,
             tensor_parallel,
+            mapped,
         }
     }
 }

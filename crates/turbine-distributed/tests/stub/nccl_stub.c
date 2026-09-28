@@ -158,6 +158,30 @@ ncclResult_t ncclBroadcast(const void *send, void *recv, size_t count,
   return copy(send, recv, count, t, comm);
 }
 
+/* Point-to-point: the stub's communicators have one rank, so every peer is
+ * invalid. */
+ncclResult_t ncclSend(const void *send, size_t count, ncclDataType_t t,
+                      int peer, ncclComm_t comm, void *stream) {
+  (void)send;
+  (void)count;
+  (void)t;
+  (void)peer;
+  (void)comm;
+  (void)stream;
+  return ncclInvalidArgument;
+}
+
+ncclResult_t ncclRecv(void *recv, size_t count, ncclDataType_t t, int peer,
+                      ncclComm_t comm, void *stream) {
+  (void)recv;
+  (void)count;
+  (void)t;
+  (void)peer;
+  (void)comm;
+  (void)stream;
+  return ncclInvalidArgument;
+}
+
 ncclResult_t ncclGroupStart(void) { return ncclSuccess; }
 
 #ifndef STUB_OMIT_GROUP_END

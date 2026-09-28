@@ -39,7 +39,8 @@ use turbine_core::types::{DType, DeviceId};
 use turbine_device::DeviceInfo;
 use turbine_tensor::tensor::contiguous_strides;
 use turbine_tensor::{
-    DeviceMemory, DevicePtr, DeviceSlice, MemInfo, MemoryError, StagingId, StreamRef, TensorView,
+    DeviceMemory, DevicePtr, DeviceSlice, MappedCollectives, MemInfo, MemoryError, StagingId,
+    StreamRef, TensorView,
 };
 
 use crate::cards::CardProfile;
@@ -874,6 +875,11 @@ impl DeviceMemory for ShimContext {
             free_bytes: free as u64,
             total_bytes: total as u64,
         })
+    }
+
+    fn mapped_collectives(&self) -> Option<&dyn MappedCollectives> {
+        self.has_mapped_collectives()
+            .then_some(self as &dyn MappedCollectives)
     }
 
     fn compute_stream(&self) -> StreamRef {
@@ -2938,6 +2944,7 @@ mod tests {
             size_of::<LogitsReduceDesc>(),
             size_of::<RowSumsqDesc>(),
             size_of::<RmsnormShardedDesc>(),
+            size_of::<ffi::MappedCollectiveDesc>(),
         ];
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");
@@ -3391,5 +3398,107 @@ mod tests {
             matches!(err, KernelError::InvalidArgument { .. }),
             "{err:?}"
         );
+    }
+
+    /// ABI v2.7 (Phase 5 hostmem): a v2.6 library has no host-mapped group
+    /// (`DeviceMemory::mapped_collectives` is `None`); the v2.7 stub resolves the whole group:
+    /// a zeroed mapped region whose words the host reads and writes, the device address the
+    /// library reports, a one-rank all-reduce step run through the library, a refused step, and
+    /// the allocation freed exactly once when the last region handle drops. Breaks if the group
+    /// resolves without the symbols, the region is not freed or freed twice, or the descriptor
+    /// does not reach the library as the header lays it out.
+    #[test]
+    fn v27_host_mapped_group() {
+        use std::time::Duration;
+
+        use turbine_tensor::{MappedKind, MappedReduce, MappedStep};
+
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let v26 = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V26")), "hip")
+            .expect("a v2.6 library loads");
+        let old = v26
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        assert!(!old.has_mapped_collectives());
+        assert!(old.mapped_collectives().is_none());
+        drop(old);
+
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V27")), "hip")
+            .expect("a v2.7 library loads");
+        assert_eq!((lib.abi_version(), lib.abi_minor()), (2, 7));
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        assert!(ctx.has_mapped_collectives());
+        let live = || {
+            stub_hook(
+                &lib,
+                "stub_live_mapped",
+                |f: unsafe extern "C" fn() -> i32| {
+                    // SAFETY: the stub defines `int32_t stub_live_mapped(void)`; loaded.
+                    unsafe { f() }
+                },
+            )
+        };
+        let before = live();
+        let mc = ctx.mapped_collectives().expect("the v2.7 group");
+        let region = mc.alloc_mapped(4096 + 2 * 64).expect("mapped region");
+        assert_eq!(live(), before + 1);
+        assert_eq!(region.len(), 4096 + 128);
+        assert_eq!(region.load_u32(0), 0, "zeroed");
+        region.store_u32(8, 0xabcd);
+        assert_eq!(region.load_u32(8), 0xabcd);
+        region.store_u32(8, 0);
+        let base = mc.mapped_device_addr(&region).expect("device address");
+        // The stub's device memory is host memory.
+        assert_eq!(base.addr(), region.host_addr());
+
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let buf = turbine_tensor::DeviceBuffer::alloc(&mem, 8).expect("buffer");
+        let input: Vec<u8> = [1.5f32, -2.0]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        buf.whole().write_bytes(&input).expect("write");
+        let mut step = MappedStep {
+            kind: MappedKind::AllReduce,
+            reduce: MappedReduce::Sum,
+            dtype: DType::F32,
+            rank: 0,
+            world: 1,
+            send: buf.whole().ptr(),
+            recv: buf.whole().ptr(),
+            bytes: 8,
+            send_stride: 0,
+            recv_stride: 0,
+            flags: base,
+            max_blocks: 1,
+            abort_word: base.offset(64),
+            slots: base.offset(128),
+            slot_bytes: 64,
+            seq: 1,
+            timeout: Duration::from_secs(1),
+        };
+        assert!(mc.mapped_step_supported(&step));
+        mc.enqueue_mapped_step(&step).expect("one-rank all-reduce");
+        assert_eq!(buf.whole().read_bytes().expect("read"), input);
+        // Published this rank's flag (tag seq << 24 | 1) through the flags address.
+        assert_eq!(region.load_u32(0), (1 << 24) | 1);
+        assert_eq!(region.load_u32(4), 0);
+
+        step.bytes = 6; // not whole F32 elements
+        assert!(!mc.mapped_step_supported(&step));
+        let err = mc.enqueue_mapped_step(&step).expect_err("refused");
+        assert!(
+            matches!(&err, MemoryError::Unsupported(m) if m.contains("mapped_collective")),
+            "{err:?}"
+        );
+
+        let copy = region.clone();
+        drop(region);
+        assert_eq!(live(), before + 1, "a handle still holds it");
+        drop(copy);
+        assert_eq!(live(), before, "freed once with the last handle");
+        drop((buf, mem, ctx));
     }
 }

@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # Run one Phase 5 multi-GPU lab scenario on novanas as a k3s Job holding both R9700s.
 #
-#   scripts/lab-cluster.sh [--dry-run] <collbench-novanas|tp2-novanas|dp2-novanas>
+#   scripts/lab-cluster.sh [--dry-run] <collbench-novanas|collbench-sweep-novanas|
+#                                       collbench-hostmem-novanas|tp2-novanas|dp2-novanas>
 #   scripts/lab-cluster.sh [--dry-run] --stop <run-id>
 #
 # Scenarios (P5 S-9; everything runs inside the Job on loopback — no Service, no host port):
 #   collbench-novanas  turbine-collbench --backend rccl --devices 0,1 --op all --max-bytes 1GiB;
 #                      PASS when every row is correct and all-reduce busbw > 0 at 268,435,456 B.
+#   collbench-sweep-novanas  small-message all-reduce latency under RCCL settings (diagnostics).
+#   collbench-hostmem-novanas  turbine-collbench --op all, 8 B .. 1 GiB, BF16, for hostmem's
+#                      kernels at every size (--route-max-bytes 1TiB), hostmem routed at its
+#                      measured crossover (hostmem-auto) and rccl, each per op (op +
+#                      synchronize, median) and --pipelined (back to back, mean): every row
+#                      printed as `hm <hostmem|hostmem-auto|rccl> <per-op|pipelined> <op>
+#                      <bytes> <time_us> <busbw_gbps>`; PASS when every row of every run is
+#                      correct (each rank checks its result bit for bit against the host
+#                      reference backend, so both ranks hold the same bits). Keep the numbers
+#                      only from a run under scripts/bench-lock.sh.
 #   tp2-novanas        Llama-3.2-3B-Instruct: first a tp 1 baseline on device 0 on the standard
 #                      throughput workload (512-word prompts, 256 tokens with --ignore-eos,
 #                      concurrency 16, 200 requests, after a 16-request warm-up); then tp 2 in
@@ -40,7 +51,7 @@
 # <reason>` (exit 1); usage errors exit 2.
 set -euo pipefail
 
-SCENARIOS="collbench-novanas|collbench-sweep-novanas|tp2-novanas|dp2-novanas"
+SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas"
 
 usage() {
 	echo "usage: scripts/lab-cluster.sh [--dry-run] <${SCENARIOS}>" >&2
@@ -49,7 +60,7 @@ usage() {
 }
 
 valid_scenario() {
-	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|tp2-novanas|dp2-novanas)$ ]]
+	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas)$ ]]
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -212,6 +223,30 @@ tp_prefix_check() {
 		"${WORK}/prefix-${label}-a2.json") reuse_bitexact=$([[ "$cold" == "$reused" ]] && echo yes || echo no) cold_repeat_bitexact=$([[ "$cold" == "$again" ]] && echo yes || echo no)"
 }
 
+# collbench-hostmem-novanas: hostmem against rccl, every op, 8 B .. 1 GiB, per op and pipelined.
+scenario_collbench_hostmem() {
+	local run backend mode out
+	# hostmem = its kernels at every size; hostmem-auto = routed at the measured crossover.
+	for run in hostmem hostmem-auto rccl; do
+		backend="${run%-auto}"
+		for mode in per-op pipelined; do
+			out="${WORK}/hm-${run}-${mode}.json"
+			local flags=(--backend "$backend" --devices 0,1 --op all --max-bytes 1GiB --output json)
+			[[ $run == hostmem ]] && flags+=(--route-max-bytes 1TiB)
+			[[ $mode == pipelined ]] && flags+=(--pipelined)
+			echo "lab-step: turbine-collbench ${flags[*]}"
+			"${BIN}/turbine-collbench" "${flags[@]}" >"$out" || {
+				cat "$out"
+				job_fail "turbine-collbench ${run} ${mode} exited non-zero"
+			}
+			jq -e '([.ops[].rows[]] | length > 0 and all(.correct))' "$out" >/dev/null ||
+				job_fail "${run} ${mode}: a row differs from the host reference"
+			jq -r --arg b "$run" --arg m "$mode" \
+				'.ops[] | .op as $op | .rows[] | "hm \($b) \($m) \($op) \(.bytes) \(.time_us) \(.busbw_gbps)"' "$out"
+		done
+	done
+}
+
 scenario_tp2() {
 	local llama=scripts/lab/phase5-novanas-llama.yaml olmoe=scripts/lab/phase5-novanas-olmoe.yaml
 	# The tp 1 baseline: the same configuration with one rank on device 0.
@@ -308,6 +343,7 @@ in_job() {
 	case "$SCENARIO" in
 	collbench-novanas) scenario_collbench ;;
 	collbench-sweep-novanas) scenario_collbench_sweep ;;
+	collbench-hostmem-novanas) scenario_collbench_hostmem ;;
 	tp2-novanas) scenario_tp2 ;;
 	dp2-novanas) scenario_dp2 ;;
 	esac

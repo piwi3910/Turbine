@@ -349,6 +349,8 @@ pub(crate) struct TpGroupStart {
     pub library: Arc<dyn CollectiveLibrary>,
     pub init_timeout: Duration,
     pub op_timeout: Duration,
+    /// `parallel.collective.hostmem_max_bytes` (`None` = `auto`).
+    pub route_max_bytes: Option<u64>,
     /// `parallel.plan_queue_depth`.
     pub depth: usize,
     pub metrics: CollectiveMetrics,
@@ -376,6 +378,8 @@ pub(crate) struct StaticWorker {
     pub library: Arc<dyn CollectiveLibrary>,
     pub init_timeout: Duration,
     pub op_timeout: Duration,
+    /// `parallel.collective.hostmem_max_bytes` (`None` = `auto`).
+    pub route_max_bytes: Option<u64>,
     pub metrics: CollectiveMetrics,
     pub clock: Arc<dyn Clock>,
 }
@@ -472,6 +476,7 @@ struct GroupLoad<'a> {
     world: u32,
     init_timeout: Duration,
     op_timeout: Duration,
+    route_max_bytes: Option<u64>,
     clock: &'a Arc<dyn Clock>,
     metrics: &'a CollectiveMetrics,
     reliability: &'a ReliabilityMetrics,
@@ -509,6 +514,8 @@ fn load_rank(p: &PreparedModel, g: &GroupLoad<'_>) -> Result<RankLoaded, Startup
             op_timeout: g.op_timeout,
             clock: Arc::clone(g.clock),
             metrics: Some(g.metrics.clone()),
+            memory: Some(Arc::clone(mem)),
+            route_max_bytes: g.route_max_bytes,
         })
         .map_err(|e| {
             g.agreement.fail();
@@ -635,6 +642,7 @@ pub(crate) fn load_group(
         world,
         init_timeout: group.init_timeout,
         op_timeout: group.op_timeout,
+        route_max_bytes: group.route_max_bytes,
         clock: &group.clock,
         metrics: &group.metrics,
         reliability,
@@ -774,6 +782,7 @@ pub(crate) fn run_static_worker(
         world: s.world,
         init_timeout: start.init_timeout,
         op_timeout: start.op_timeout,
+        route_max_bytes: start.route_max_bytes,
         clock: &start.clock,
         metrics: &start.metrics,
         reliability,
@@ -1101,6 +1110,7 @@ mod tests {
             library: Arc::clone(&library),
             init_timeout: Duration::from_secs(30),
             op_timeout: Duration::from_secs(30),
+            route_max_bytes: None,
             metrics: metrics.clone(),
             clock: Arc::clone(&clock),
         };
@@ -1114,6 +1124,7 @@ mod tests {
             library,
             init_timeout: Duration::from_secs(30),
             op_timeout: Duration::from_secs(30),
+            route_max_bytes: None,
             depth: 2,
             metrics,
             clock,

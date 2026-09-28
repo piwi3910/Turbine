@@ -334,6 +334,7 @@ pub fn run(cli: Cli) -> ExitCode {
                             library: Arc::clone(library),
                             init_timeout: config.parallel.collective.init_timeout.0,
                             op_timeout: config.parallel.collective.op_timeout.0,
+                            route_max_bytes: config.parallel.collective.hostmem_max_bytes.fixed(),
                             metrics: cmetrics.clone(),
                             clock: Arc::new(SystemClock::new()),
                         })
@@ -359,6 +360,7 @@ pub fn run(cli: Cli) -> ExitCode {
                 library: Arc::clone(library),
                 init_timeout: config.parallel.collective.init_timeout.0,
                 op_timeout: config.parallel.collective.op_timeout.0,
+                route_max_bytes: config.parallel.collective.hostmem_max_bytes.fixed(),
                 depth: config.parallel.plan_queue_depth as usize,
                 metrics: metrics.clone(),
                 clock: Arc::new(SystemClock::new()),
