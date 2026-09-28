@@ -489,6 +489,10 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
             "--show-output",
             "--skip",
             "hf_reference_matches_cpu",
+            "--skip",
+            "hostmem_",
+            "--skip",
+            "rccl_init_with_a_missing_peer",
         ]
     );
 }
@@ -530,6 +534,10 @@ fn lab_test_forwards_cargo_features() {
             "--show-output",
             "--skip",
             "hf_reference_matches_cpu",
+            "--skip",
+            "hostmem_",
+            "--skip",
+            "rccl_init_with_a_missing_peer",
         ]
     );
     for args in [
@@ -597,6 +605,10 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "--show-output".to_string(),
         "--skip".to_string(),
         "hf_reference_matches_cpu".to_string(),
+        "--skip".to_string(),
+        "hostmem_".to_string(),
+        "--skip".to_string(),
+        "rccl_init_with_a_missing_peer".to_string(),
     ];
     for t in slow {
         want.push("--skip".to_string());
@@ -621,6 +633,10 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "--show-output".to_string(),
         "--skip".to_string(),
         "hf_reference_matches_cpu".to_string(),
+        "--skip".to_string(),
+        "hostmem_".to_string(),
+        "--skip".to_string(),
+        "rccl_init_with_a_missing_peer".to_string(),
     ];
     for t in slow {
         want.push(t.to_string());
@@ -646,6 +662,10 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
             "--show-output",
             "--skip",
             "hf_reference_matches_cpu",
+            "--skip",
+            "hostmem_",
+            "--skip",
+            "rccl_init_with_a_missing_peer",
         ]
     );
 
@@ -694,6 +714,10 @@ fn lab_test_passes_a_subset_and_opts_into_the_hf_reference() {
             "--show-output",
             "--skip",
             "hf_reference_matches_cpu",
+            "--skip",
+            "hostmem_",
+            "--skip",
+            "rccl_init_with_a_missing_peer",
         ]
     );
     assert!(
@@ -735,6 +759,10 @@ fn lab_test_passes_a_subset_and_opts_into_the_hf_reference() {
             "--",
             "--include-ignored",
             "--show-output",
+            "--skip",
+            "hostmem_",
+            "--skip",
+            "rccl_init_with_a_missing_peer",
             "hf_reference",
         ]
     );

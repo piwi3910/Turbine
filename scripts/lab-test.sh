@@ -47,6 +47,14 @@ usage() {
 # tests: > ~60 s each on novanas (nextest's "has been running for over 60 seconds" warning in
 # scripts/lab-test.sh full runs, e.g. target/lab-perf and lab-test logs from 2026-09-26/27).
 # One list, used both ways by --tier: skipped for `quick`, the only ones run for `perf`.
+# Lab tests that open two GPUs (Phase 5): skipped (libtest `--skip`, by substring) in a
+# one-GPU Job, where they would fail on the missing device; run them with `--gpus 2`.
+TWO_GPU_TESTS=(
+	# crates/turbine-distributed/tests/hostmem_lab.rs
+	hostmem_
+	rccl_init_with_a_missing_peer
+)
+
 SLOW_TESTS=(
 	# crates/turbine-model/tests/perf.rs, tests/host_step.rs
 	serving_mix
@@ -162,6 +170,12 @@ build_test_command() {
 	# The golden references are committed; the Hugging Face transformers CPU reference is only
 	# needed to regenerate them.
 	[[ $HF_REFERENCE -eq 1 ]] || TEST_CMD+=(--skip hf_reference_matches_cpu)
+	# A one-GPU Job cannot run the two-GPU tests (TWO_GPU_TESTS above); `--gpus 2` runs them.
+	if [[ $GPUS -lt 2 ]]; then
+		for t in "${TWO_GPU_TESTS[@]}"; do
+			TEST_CMD+=(--skip "$t")
+		done
+	fi
 	# quick: skip the slow perf/timing tests (SLOW_TESTS above); perf: run only those (the same
 	# list as bare filter args, which libtest ORs by substring); full: neither, unchanged.
 	if [[ $TIER == quick ]]; then
