@@ -395,3 +395,50 @@ fn hostmem_abort_releases_a_spinning_gpu_peer() {
         Err(CollectiveError::RemoteAbort { rank: 0 })
     ));
 }
+
+/// Production path with RCCL as the delegate (`auto` threshold): only rank 0 opens, so RCCL's
+/// communicator init waits for a rank that never comes. The open must fail with
+/// `Timeout { op: "comm_init" }` within the init timeout (plus the delegate-init grace), never
+/// hang.
+#[test]
+#[ignore = "needs a HIP device, libturbine_hip.so and RCCL (scripts/lab-test.sh novanas --gpus 2)"]
+fn hostmem_delegate_init_with_a_missing_peer_fails_in_time() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _watchdog = watchdog(
+        "hostmem_delegate_init_with_a_missing_peer_fails_in_time",
+        Duration::from_secs(60),
+    );
+    let mems = devices();
+    let lib = collective::registry()
+        .get("hostmem")
+        .expect("registered")
+        .load(None)
+        .expect("load (with RCCL as the delegate)");
+    let id = lib.unique_id().expect("id");
+    let started = Instant::now();
+    let result = Arc::clone(&lib).open(CollectiveInit {
+        route_max_bytes: None,
+        ..init(0, 2, id, Duration::from_secs(3), Arc::clone(&mems[0]))
+    });
+    let waited = started.elapsed();
+    println!(
+        "hostmem delegate init without its peer: {:?} after {waited:?}",
+        result.as_ref().map(|_| ()).map_err(|e| e.to_string())
+    );
+    let err = result
+        .map(|_| ())
+        .expect_err("the delegate's peer never opens");
+    assert!(
+        matches!(
+            err,
+            CollectiveError::Timeout {
+                op: "comm_init",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(waited < Duration::from_secs(10), "{waited:?}");
+}
