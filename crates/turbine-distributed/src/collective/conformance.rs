@@ -1,0 +1,111 @@
+//! The behaviour every registered collective backend must show, run over the registry by
+//! `registry_conformance` (the naming rules are `turbine_core::registry::conformance`).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use turbine_core::clock::SystemClock;
+use turbine_tensor::host::HostMemory;
+use turbine_tensor::{DType, DeviceBuffer, DeviceId, DeviceMemory};
+
+use super::{CollectiveBackend, CollectiveError, CollectiveInit, ReduceOp};
+
+/// `Err` naming the first problem. Loading must succeed or answer `Unavailable` (a missing
+/// library is never a panic); a loaded backend reports its own name and makes distinct ids; a
+/// host-memory backend (no vendors) must run a two-rank all-reduce and all-gather correctly
+/// here, a device backend is exercised by the lab (`turbine-collbench`).
+pub fn check(backend: &dyn CollectiveBackend) -> Result<(), String> {
+    let name = backend.name();
+    let lib = match backend.load(None) {
+        Ok(lib) => lib,
+        Err(CollectiveError::Unavailable { .. }) if !backend.vendors().is_empty() => {
+            return Ok(());
+        }
+        Err(e) => return Err(format!("{name}: load failed with {e}")),
+    };
+    if lib.backend() != name {
+        return Err(format!("{name}: the library reports `{}`", lib.backend()));
+    }
+    match (lib.unique_id(), lib.unique_id()) {
+        (Ok(a), Ok(b)) if a != b => {}
+        (Ok(_), Ok(_)) => return Err(format!("{name}: two unique ids are equal")),
+        (Err(e), _) | (_, Err(e)) => return Err(format!("{name}: unique_id failed: {e}")),
+    }
+    if !backend.vendors().is_empty() {
+        return Ok(());
+    }
+    let id = lib.unique_id().map_err(|e| e.to_string())?;
+    let results: Vec<Result<RankOut, String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..2usize)
+            .map(|rank| {
+                let lib = Arc::clone(&lib);
+                s.spawn(move || two_rank_ops(&*lib, rank, id))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err("rank panicked".into())))
+            .collect()
+    });
+    for (rank, r) in results.into_iter().enumerate() {
+        let (reduced, gathered) = r.map_err(|e| format!("{name}: rank {rank}: {e}"))?;
+        if f32s(&reduced) != [4.0, 6.0] {
+            return Err(format!("{name}: all_reduce gave {:?}", f32s(&reduced)));
+        }
+        if f32s(&gathered) != [1.0, 2.0, 3.0, 4.0] {
+            return Err(format!("{name}: all_gather gave {:?}", f32s(&gathered)));
+        }
+    }
+    Ok(())
+}
+
+/// One rank's all-reduced and all-gathered bytes.
+type RankOut = (Vec<u8>, Vec<u8>);
+
+fn f32s(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Rank `rank` of a two-rank group over host memory: all-reduce (sum) and all-gather of
+/// `[1 + 2·rank, 2 + 2·rank]`.
+fn two_rank_ops(
+    lib: &dyn super::CollectiveLibrary,
+    rank: usize,
+    id: [u8; super::UNIQUE_ID_BYTES],
+) -> Result<RankOut, String> {
+    let err = |e: &dyn std::fmt::Display| e.to_string();
+    let comm = lib
+        .open(CollectiveInit {
+            rank,
+            world: 2,
+            unique_id: id,
+            init_timeout: Duration::from_secs(10),
+            op_timeout: Duration::from_secs(10),
+            clock: Arc::new(SystemClock::new()),
+            metrics: None,
+        })
+        .map_err(|e| err(&e))?;
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank as u32), 1 << 20);
+    let stream = mem.compute_stream();
+    let base = rank as f32 * 2.0;
+    let values: Vec<u8> = [1.0f32 + base, 2.0 + base]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let buf = DeviceBuffer::alloc(&mem, 8).map_err(|e| err(&e))?;
+    let mut slice = buf.whole();
+    slice.write_bytes(&values).map_err(|e| err(&e))?;
+    comm.all_reduce(&mut slice, DType::F32, ReduceOp::Sum, &stream)
+        .map_err(|e| err(&e))?;
+    let reduced = slice.read_bytes().map_err(|e| err(&e))?;
+    let send = DeviceBuffer::alloc(&mem, 8).map_err(|e| err(&e))?;
+    send.whole().write_bytes(&values).map_err(|e| err(&e))?;
+    let recv = DeviceBuffer::alloc(&mem, 16).map_err(|e| err(&e))?;
+    let mut gathered = recv.whole();
+    comm.all_gather(&send.whole(), &mut gathered, &stream)
+        .map_err(|e| err(&e))?;
+    let gathered = gathered.read_bytes().map_err(|e| err(&e))?;
+    Ok((reduced, gathered))
+}

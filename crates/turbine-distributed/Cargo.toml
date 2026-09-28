@@ -1,0 +1,23 @@
+[package]
+name = "turbine-distributed"
+description = "Turbine collectives (host reference and runtime-loaded NCCL-API backends), rank runtime, tensor-parallel sharding rules and data-parallel routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+turbine-core.workspace = true
+turbine-observability.workspace = true
+turbine-tensor.workspace = true
+# turbine_collective_* metric families
+prometheus-client.workspace = true
+# BF16 element interpretation in the host reference backend
+half.workspace = true
+
+# No module contains `unsafe` yet; the NCCL-API binding (collective::ffi) relaxes this to
+# `deny` with a single module-level allow (contract §1.3).
+[lints.rust]
+unsafe_code = "forbid"

@@ -2354,6 +2354,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbine-distributed"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "prometheus-client",
+ "thiserror 2.0.21",
+ "tracing",
+ "turbine-core",
+ "turbine-observability",
+ "turbine-tensor",
+]
+
+[[package]]
 name = "turbine-kernels"
 version = "0.1.0"
 dependencies = [
@@ -2489,6 +2502,7 @@ dependencies = [
  "turbine-api",
  "turbine-core",
  "turbine-device",
+ "turbine-distributed",
  "turbine-kernels",
  "turbine-kv",
  "turbine-model",

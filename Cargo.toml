@@ -21,6 +21,7 @@ turbine-scheduler = { path = "crates/turbine-scheduler" }
 turbine-reliability = { path = "crates/turbine-reliability" }
 # P3: lock-free snapshot the engine reads once per iteration (decision: arc-swap 1.x).
 arc-swap = "1.9"
+turbine-distributed = { path = "crates/turbine-distributed" }
 axum = "0.8.9"
 # P4 KV identity: block and namespace keys, model fingerprint
 blake3 = "1.8"

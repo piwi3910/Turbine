@@ -36,6 +36,8 @@ turbine-scheduler.workspace = true
 # P3: memory budget, reservation ledger, emergency reserve, pressure controller, admission,
 # recovery and circuit breaker
 turbine-reliability.workspace = true
+# P5: collective backends, planner, rank runtime, DP router
+turbine-distributed.workspace = true
 # P3: the per-iteration engine statistics the pressure controller reads without a lock
 arc-swap.workspace = true
 
