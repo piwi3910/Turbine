@@ -6,6 +6,7 @@
 pub mod collective;
 pub mod plan;
 pub mod rank;
+pub mod tp;
 
 #[cfg(test)]
 mod registry_conformance {
