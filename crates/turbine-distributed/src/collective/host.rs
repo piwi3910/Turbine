@@ -9,6 +9,7 @@
 //! explicit [`Collective::abort`]) aborts the group, after which every call on every rank
 //! returns [`CollectiveError::RemoteAbort`] naming that rank.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -32,6 +33,8 @@ enum OpKind {
     ReduceScatter(ReduceOp),
     Broadcast(usize),
     Barrier,
+    Send,
+    Recv,
 }
 
 impl OpKind {
@@ -42,6 +45,8 @@ impl OpKind {
             OpKind::ReduceScatter(_) => "reduce_scatter",
             OpKind::Broadcast(_) => "broadcast",
             OpKind::Barrier => "barrier",
+            OpKind::Send => "send",
+            OpKind::Recv => "recv",
         }
     }
 }
@@ -70,7 +75,12 @@ struct State {
     departed: usize,
     /// The rank whose timeout or abort poisoned the group.
     aborted_by: Option<usize>,
+    /// Point-to-point messages in flight by (sender, receiver), each at most `P2P_DEPTH` deep.
+    mailboxes: HashMap<(usize, usize), VecDeque<Vec<u8>>>,
 }
+
+/// Messages one sender may have in flight to one receiver before `send` waits.
+const P2P_DEPTH: usize = 16;
 
 struct Shared {
     world: usize,
@@ -106,6 +116,7 @@ impl Shared {
                 arrived: 0,
                 departed: 0,
                 aborted_by: None,
+                mailboxes: HashMap::new(),
             }),
             cv: Condvar::new(),
         })
@@ -354,6 +365,8 @@ fn compute(deposits: &[Deposit], world: usize) -> Result<Vec<u8>, ()> {
         }
         OpKind::Broadcast(root) => inputs.get(root).map(|b| b.to_vec()).ok_or(()),
         OpKind::Barrier => Ok(Vec::new()),
+        // Point-to-point messages never pass through the rendezvous.
+        OpKind::Send | OpKind::Recv => Err(()),
     }
 }
 
@@ -470,6 +483,79 @@ impl Collective for HostCollective {
     fn barrier(&self, _stream: &StreamRef) -> Result<(), CollectiveError> {
         self.exchange(OpKind::Barrier, None, Vec::new(), 0)
             .map(drop)
+    }
+
+    /// Queues a copy of `buf` for `peer` (waiting, bounded by the op timeout, while
+    /// `P2P_DEPTH` messages to it are already queued) and returns.
+    fn send(
+        &self,
+        buf: &DeviceSlice,
+        peer: usize,
+        _stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        if peer >= self.shared.world || peer == self.rank {
+            return Err(CollectiveError::ShapeMismatch);
+        }
+        let bytes = buf.read_bytes().map_err(memory)?;
+        let sh = &*self.shared;
+        let deadline = Instant::now() + sh.op_timeout;
+        let mut st = sh.lock();
+        loop {
+            if let Some(rank) = st.aborted_by {
+                return Err(CollectiveError::RemoteAbort { rank });
+            }
+            if st
+                .mailboxes
+                .get(&(self.rank, peer))
+                .is_none_or(|q| q.len() < P2P_DEPTH)
+            {
+                break;
+            }
+            st = self.wait(st, deadline, OpKind::Send)?;
+        }
+        st.mailboxes
+            .entry((self.rank, peer))
+            .or_default()
+            .push_back(bytes);
+        sh.cv.notify_all();
+        Ok(())
+    }
+
+    /// Waits (bounded by the op timeout) for the next message from `peer` and writes it into
+    /// `buf`; a message of another length is a `ShapeMismatch` and aborts the group.
+    fn recv(
+        &self,
+        buf: &mut DeviceSlice,
+        peer: usize,
+        _stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        if peer >= self.shared.world || peer == self.rank {
+            return Err(CollectiveError::ShapeMismatch);
+        }
+        let sh = &*self.shared;
+        let deadline = Instant::now() + sh.op_timeout;
+        let mut st = sh.lock();
+        let bytes = loop {
+            if let Some(rank) = st.aborted_by {
+                return Err(CollectiveError::RemoteAbort { rank });
+            }
+            if let Some(m) = st
+                .mailboxes
+                .get_mut(&(peer, self.rank))
+                .and_then(VecDeque::pop_front)
+            {
+                break m;
+            }
+            st = self.wait(st, deadline, OpKind::Recv)?;
+        };
+        sh.cv.notify_all();
+        if bytes.len() != buf.len() {
+            st.aborted_by.get_or_insert(self.rank);
+            sh.cv.notify_all();
+            return Err(CollectiveError::ShapeMismatch);
+        }
+        drop(st);
+        buf.write_bytes(&bytes).map_err(memory)
     }
 
     fn abort(&self) {
@@ -670,6 +756,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Point-to-point around a ring (even ranks send first, odd ranks receive first): every
+    /// rank receives its predecessor's bytes; a receive with no sender times out and aborts.
+    #[test]
+    fn send_recv_ring() {
+        for world in [2usize, 3, 4] {
+            let group = HostCollective::group(world, Duration::from_secs(10));
+            let got: Vec<Vec<u8>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = group
+                    .iter()
+                    .enumerate()
+                    .map(|(r, c)| {
+                        scope.spawn(move || {
+                            let mem: Arc<dyn DeviceMemory> =
+                                HostMemory::new(DeviceId(r as u32), 1 << 20);
+                            let stream = mem.compute_stream();
+                            let out = DeviceBuffer::alloc(&mem, 5).expect("alloc");
+                            out.whole().write_bytes(&[r as u8; 5]).expect("write");
+                            let inp = DeviceBuffer::alloc(&mem, 5).expect("alloc");
+                            let (next, prev) = ((r + 1) % world, (r + world - 1) % world);
+                            if r % 2 == 0 {
+                                c.send(&out.whole(), next, &stream).expect("send");
+                                c.recv(&mut inp.whole(), prev, &stream).expect("recv");
+                            } else {
+                                c.recv(&mut inp.whole(), prev, &stream).expect("recv");
+                                c.send(&out.whole(), next, &stream).expect("send");
+                            }
+                            inp.whole().read_bytes().expect("read")
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("rank"))
+                    .collect()
+            });
+            for (r, g) in got.iter().enumerate() {
+                assert_eq!(
+                    g,
+                    &vec![((r + world - 1) % world) as u8; 5],
+                    "world {world} rank {r}"
+                );
+            }
+        }
+        let group = HostCollective::group(2, Duration::from_millis(200));
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 10);
+        let buf = DeviceBuffer::alloc(&mem, 4).expect("alloc");
+        let err = group[0]
+            .recv(&mut buf.whole(), 1, &mem.compute_stream())
+            .expect_err("nobody sends");
+        assert!(
+            matches!(err, CollectiveError::Timeout { op: "recv", .. }),
+            "{err:?}"
+        );
+        assert!(matches!(
+            group[1].send(&buf.whole(), 0, &mem.compute_stream()),
+            Err(CollectiveError::RemoteAbort { rank: 0 })
+        ));
     }
 
     #[test]

@@ -129,7 +129,10 @@ fn busbw_factor(op: CollectiveOp, n: usize) -> f64 {
     match op {
         CollectiveOp::AllReduce => 2.0 * (n - 1.0) / n,
         CollectiveOp::AllGather | CollectiveOp::ReduceScatter => (n - 1.0) / n,
-        CollectiveOp::Broadcast | CollectiveOp::Barrier => 1.0,
+        CollectiveOp::Broadcast
+        | CollectiveOp::Barrier
+        | CollectiveOp::Send
+        | CollectiveOp::Recv => 1.0,
     }
 }
 

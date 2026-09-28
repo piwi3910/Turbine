@@ -82,6 +82,24 @@ pub trait Collective: Send + Sync {
         stream: &StreamRef,
     ) -> Result<(), CollectiveError>;
     fn barrier(&self, stream: &StreamRef) -> Result<(), CollectiveError>;
+    /// Point-to-point (pipeline stages hand activations on): `buf` (byte-wise) goes to rank
+    /// `peer`, whose matching [`Self::recv`] receives it. The two ranks of a pair issue their
+    /// sends and receives to each other in the same order and with the same lengths; a send may
+    /// wait (on the device or the host, bounded by the op timeout) until the peer receives, so a
+    /// schedule where both ranks send first may time out.
+    fn send(
+        &self,
+        buf: &DeviceSlice,
+        peer: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError>;
+    /// Receives into `buf` what rank `peer`'s matching [`Self::send`] sent (same length).
+    fn recv(
+        &self,
+        buf: &mut DeviceSlice,
+        peer: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError>;
     /// Starts bounding one step: every collective enqueued until [`Self::step_end`] must
     /// complete on the device within the op timeout, or the communicator is aborted (a peer
     /// that never arrives otherwise leaves a device kernel waiting forever). Default: nothing
@@ -204,6 +222,8 @@ pub enum CollectiveOp {
     ReduceScatter,
     Broadcast,
     Barrier,
+    Send,
+    Recv,
 }
 
 impl CollectiveOp {
@@ -214,6 +234,8 @@ impl CollectiveOp {
             CollectiveOp::ReduceScatter => "reduce_scatter",
             CollectiveOp::Broadcast => "broadcast",
             CollectiveOp::Barrier => "barrier",
+            CollectiveOp::Send => "send",
+            CollectiveOp::Recv => "recv",
         }
     }
 }

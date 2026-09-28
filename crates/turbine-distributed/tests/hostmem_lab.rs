@@ -131,9 +131,20 @@ fn ops(
     .expect("reduce_scatter");
     comm.broadcast(&mut bcast.whole(), world - 1, &stream)
         .expect("broadcast");
+    // Point to point around the ring: even ranks send first, odd ranks receive first.
+    let got = DeviceBuffer::alloc(mem, n).expect("alloc");
+    let rank = comm.rank();
+    let (next, prev) = ((rank + 1) % world, (rank + world - 1) % world);
+    if rank.is_multiple_of(2) {
+        comm.send(&send.whole(), next, &stream).expect("send");
+        comm.recv(&mut got.whole(), prev, &stream).expect("recv");
+    } else {
+        comm.recv(&mut got.whole(), prev, &stream).expect("recv");
+        comm.send(&send.whole(), next, &stream).expect("send");
+    }
     mem.synchronize().expect("synchronize");
     comm.step_end().expect("healthy step");
-    [sum, max, gathered, srecv, bcast]
+    [sum, max, gathered, srecv, bcast, got]
         .iter()
         .map(|b| b.whole().read_bytes().expect("read"))
         .collect()
@@ -167,7 +178,7 @@ fn reference(
 }
 
 /// Bit for bit the host backend's results, identical on both ranks: all-reduce (sum, max),
-/// all-gather, reduce-scatter and broadcast, BF16 and FP32, odd sizes up to one that spans
+/// all-gather, reduce-scatter, broadcast and send/recv, BF16 and FP32, odd sizes up to one that spans
 /// several 32 MiB slots (so steps alternate slot parities within one call).
 #[test]
 #[ignore = "needs two HIP devices and libturbine_hip.so (scripts/lab-test.sh novanas --gpus 2)"]
@@ -219,6 +230,7 @@ fn hostmem_matches_host_backend_on_two_gpus() {
                     "all_gather",
                     "reduce_scatter",
                     "broadcast",
+                    "send/recv",
                 ]
                 .iter()
                 .enumerate()

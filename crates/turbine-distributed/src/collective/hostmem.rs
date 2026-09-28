@@ -115,6 +115,8 @@ struct Group {
     layout: Layout,
     region: MappedRegion,
     joined: Mutex<Vec<bool>>,
+    /// Point-to-point regions by (lower rank, higher rank), allocated on first use.
+    pairs: Mutex<std::collections::HashMap<(usize, usize), MappedRegion>>,
 }
 
 /// Open groups by unique id (process-local); an entry dies with its last rank.
@@ -201,6 +203,7 @@ impl CollectiveLibrary for HostmemLibrary {
             op_timeout: init.op_timeout,
             metrics: init.metrics,
             reported: AtomicBool::new(false),
+            pairs: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 }
@@ -232,6 +235,7 @@ fn join(
                 layout,
                 region,
                 joined: Mutex::new(vec![false; init.world]),
+                pairs: Mutex::new(std::collections::HashMap::new()),
             });
             groups.push((init.unique_id, Arc::downgrade(&g)));
             g
@@ -267,6 +271,8 @@ pub struct HostmemCollective {
     metrics: Option<CollectiveMetrics>,
     /// The abort was logged and counted.
     reported: AtomicBool,
+    /// This rank's pair channels by peer.
+    pairs: Mutex<std::collections::HashMap<usize, Arc<Pair>>>,
 }
 
 impl std::fmt::Debug for HostmemCollective {
@@ -300,6 +306,32 @@ fn reduce_of(op: ReduceOp) -> MappedReduce {
 fn at(slice: &DeviceSlice, offset: u64) -> DevicePtr {
     slice.ptr().offset(offset)
 }
+
+/// The flags, slots and sequence counter one call's steps run over: the group's own, or a
+/// pair channel of two ranks (point-to-point). The abort word is always the group's.
+struct Chan<'a> {
+    /// This rank's index in the channel.
+    rank: u32,
+    world: u32,
+    slots: DevicePtr,
+    slot_bytes: u64,
+    flags: DevicePtr,
+    seq: &'a AtomicU64,
+}
+
+/// A pair channel of this rank: a 2-rank exchange region (allocated by whichever rank of the
+/// pair first needs it) mapped into this device, with this side's step counter.
+struct Pair {
+    _region: MappedRegion,
+    base: DevicePtr,
+    seq: AtomicU64,
+}
+
+/// Bytes of one rank's point-to-point slot (a pair region holds 2 × 2 of them).
+pub const P2P_SLOT_BYTES: u64 = 8 << 20;
+
+/// Offset of a pair region's slots (after 2 × `MAX_BLOCKS` flag words).
+const PAIR_SLOTS: u64 = 4096;
 
 /// What one call enqueues: its kind and per-step geometry.
 struct Plan {
@@ -378,6 +410,7 @@ impl HostmemCollective {
         metric_bytes: usize,
         stream: &StreamRef,
         plan: Plan,
+        chan: Chan<'_>,
     ) -> Result<(), CollectiveError> {
         self.stream_ok(stream)?;
         self.check()?;
@@ -386,21 +419,21 @@ impl HostmemCollective {
         let mut off = 0u64;
         while off < plan.part {
             let n = plan.chunk.min(plan.part - off);
-            let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+            let seq = chan.seq.fetch_add(1, Ordering::Relaxed);
             let step = MappedStep {
                 kind: plan.kind,
                 reduce: plan.reduce,
                 dtype: plan.dtype,
-                rank: self.rank as u32,
-                world: self.world as u32,
+                rank: chan.rank,
+                world: chan.world,
                 send: plan.send.offset(off),
                 recv: plan.recv.offset(off),
                 bytes: n,
                 send_stride: plan.send_stride,
                 recv_stride: plan.recv_stride,
-                slots: self.base.offset(layout.slots as u64),
-                slot_bytes: layout.slot_bytes,
-                flags: self.base,
+                slots: chan.slots,
+                slot_bytes: chan.slot_bytes,
+                flags: chan.flags,
                 max_blocks: MAX_BLOCKS,
                 abort_word: self.base.offset(layout.abort as u64),
                 seq,
@@ -429,6 +462,105 @@ impl HostmemCollective {
             );
         }
         Ok(())
+    }
+
+    /// The group's own channel.
+    fn group_chan(&self) -> Chan<'_> {
+        let layout = self.group.layout;
+        Chan {
+            rank: self.rank as u32,
+            world: self.world as u32,
+            slots: self.base.offset(layout.slots as u64),
+            slot_bytes: layout.slot_bytes,
+            flags: self.base,
+            seq: &self.seq,
+        }
+    }
+
+    /// The pair channel to `peer`, allocating the pair's region if this rank is first.
+    fn pair(&self, peer: usize) -> Result<Arc<Pair>, CollectiveError> {
+        let mut mine = self.pairs.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = mine.get(&peer) {
+            return Ok(Arc::clone(p));
+        }
+        let slot = self.p2p_slot_bytes();
+        let key = (self.rank.min(peer), self.rank.max(peer));
+        let region = {
+            let mut shared = self.group.pairs.lock().unwrap_or_else(|p| p.into_inner());
+            match shared.get(&key) {
+                Some(r) => r.clone(),
+                None => {
+                    let bytes = (PAIR_SLOTS + 4 * slot) as usize;
+                    let r = self.mapped().alloc_mapped(bytes).map_err(|e| {
+                        CollectiveError::Backend {
+                            code: -1,
+                            message: format!("hostmem: allocating a {bytes}-byte pair region: {e}"),
+                        }
+                    })?;
+                    shared.insert(key, r.clone());
+                    r
+                }
+            }
+        };
+        let base =
+            self.mapped()
+                .mapped_device_addr(&region)
+                .map_err(|e| CollectiveError::Backend {
+                    code: -1,
+                    message: format!("hostmem: mapping a pair region: {e}"),
+                })?;
+        let p = Arc::new(Pair {
+            _region: region,
+            base,
+            seq: AtomicU64::new(1),
+        });
+        mine.insert(peer, Arc::clone(&p));
+        Ok(p)
+    }
+
+    /// A point-to-point slot: at most `P2P_SLOT_BYTES`, never more than the group's slot.
+    fn p2p_slot_bytes(&self) -> u64 {
+        self.group.layout.slot_bytes.min(P2P_SLOT_BYTES)
+    }
+
+    /// One point-to-point transfer from rank `from` over the pair channel to `peer`: a
+    /// broadcast of the 2-rank channel rooted at the sender, in place in `buf`.
+    fn p2p(
+        &self,
+        op: CollectiveOp,
+        buf: &DeviceSlice,
+        peer: usize,
+        from: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        if peer >= self.world || peer == self.rank {
+            return Err(CollectiveError::ShapeMismatch);
+        }
+        self.check()?;
+        let pair = self.pair(peer)?;
+        // Channel ranks: the lower global rank is 0.
+        let local = |r: usize| u32::from(r > self.rank.min(peer));
+        let slot = self.p2p_slot_bytes();
+        let chan = Chan {
+            rank: local(self.rank),
+            world: 2,
+            slots: pair.base.offset(PAIR_SLOTS),
+            slot_bytes: slot,
+            flags: pair.base,
+            seq: &pair.seq,
+        };
+        let plan = Plan {
+            kind: MappedKind::Broadcast { root: local(from) },
+            reduce: MappedReduce::Sum,
+            dtype: DType::BF16,
+            send: at(buf, 0),
+            recv: at(buf, 0),
+            part: buf.len() as u64,
+            send_stride: 0,
+            recv_stride: 0,
+            chunk: slot,
+        };
+        self.run(op, buf.len(), stream, plan, chan)
     }
 
     /// `dtype` is BF16 or FP32 and `len` whole elements of it.
@@ -473,7 +605,13 @@ impl Collective for HostmemCollective {
             recv_stride: 0,
             chunk: self.group.layout.slot_bytes,
         };
-        self.run(CollectiveOp::AllReduce, buf.len(), stream, plan)
+        self.run(
+            CollectiveOp::AllReduce,
+            buf.len(),
+            stream,
+            plan,
+            self.group_chan(),
+        )
     }
 
     fn all_gather(
@@ -497,7 +635,7 @@ impl Collective for HostmemCollective {
             recv_stride: n as u64,
             chunk: self.group.layout.slot_bytes,
         };
-        self.run(CollectiveOp::AllGather, n, stream, plan)
+        self.run(CollectiveOp::AllGather, n, stream, plan, self.group_chan())
     }
 
     fn reduce_scatter(
@@ -526,7 +664,13 @@ impl Collective for HostmemCollective {
             recv_stride: 0,
             chunk,
         };
-        self.run(CollectiveOp::ReduceScatter, send.len(), stream, plan)
+        self.run(
+            CollectiveOp::ReduceScatter,
+            send.len(),
+            stream,
+            plan,
+            self.group_chan(),
+        )
     }
 
     fn broadcast(
@@ -549,7 +693,13 @@ impl Collective for HostmemCollective {
             recv_stride: 0,
             chunk: self.group.layout.slot_bytes,
         };
-        self.run(CollectiveOp::Broadcast, buf.len(), stream, plan)
+        self.run(
+            CollectiveOp::Broadcast,
+            buf.len(),
+            stream,
+            plan,
+            self.group_chan(),
+        )
     }
 
     /// An all-reduce of one FP32 on `stream`, then a synchronize of the device: returns once
@@ -574,7 +724,7 @@ impl Collective for HostmemCollective {
             recv_stride: 0,
             chunk: 4,
         };
-        self.run(CollectiveOp::Barrier, 4, stream, plan)?;
+        self.run(CollectiveOp::Barrier, 4, stream, plan, self.group_chan())?;
         self.memory
             .synchronize()
             .map_err(|e| CollectiveError::Backend {
@@ -583,6 +733,26 @@ impl Collective for HostmemCollective {
             })?;
         drop(scratch);
         self.check()
+    }
+
+    /// A broadcast from this rank over the pair channel to `peer`: the kernel waits (bounded by
+    /// `op_timeout`) until the peer's matching `recv` has arrived.
+    fn send(
+        &self,
+        buf: &DeviceSlice,
+        peer: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        self.p2p(CollectiveOp::Send, buf, peer, self.rank, stream)
+    }
+
+    fn recv(
+        &self,
+        buf: &mut DeviceSlice,
+        peer: usize,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        self.p2p(CollectiveOp::Recv, buf, peer, peer, stream)
     }
 
     /// Nothing to arm: every step's kernel bounds its own waits by `op_timeout`.
@@ -727,6 +897,22 @@ mod tests {
             .expect("broadcast");
         mem.synchronize().expect("sync");
         out.push(s.read_bytes().expect("read"));
+        if world > 1 {
+            // Around the ring: even ranks send first, odd ranks receive first.
+            let rank = comm.rank();
+            let (next, prev) = ((rank + 1) % world, (rank + world - 1) % world);
+            let got = DeviceBuffer::alloc(mem, n).expect("alloc");
+            s.write_bytes(input).expect("write");
+            if rank.is_multiple_of(2) {
+                comm.send(&s, next, &stream).expect("send");
+                comm.recv(&mut got.whole(), prev, &stream).expect("recv");
+            } else {
+                comm.recv(&mut got.whole(), prev, &stream).expect("recv");
+                comm.send(&s, next, &stream).expect("send");
+            }
+            mem.synchronize().expect("sync");
+            out.push(got.whole().read_bytes().expect("read"));
+        }
         comm.barrier(&stream).expect("barrier");
         comm.step_end().expect("healthy");
         out
