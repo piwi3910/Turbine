@@ -434,14 +434,14 @@ Interfaces:
 
 ## Task 25: `quantization` in status, weight-format and KV metrics
 
-Files: `crates/turbine-server/src/status.rs` or the file defining `StatusDocument` (`quantization` object), `crates/turbine-api/src/…` metrics registration for `turbine_weight_format_info`, `turbine_qgemm_calls_total`, `crates/turbine-api/tests/api.rs` (`status_reports_quantization`), `crates/turbine-model/src/weights/mod.rs` (`weight_format` log event)
+Files: `crates/turbine-server/src/backend.rs` (`StatusDocument.quantization`), `crates/turbine-model/src/metrics.rs` (`turbine_weight_format_info`), `crates/turbine-model/src/weights/mod.rs` (`QuantizationSummary`, the `weight_format` and `quant_refused` log events), `crates/turbine-server/src/model.rs` and `engine/{tp,pp}.rs` (recorded at load), `crates/turbine-server/src/support_startup.rs` (the support key's weight column from the detected packaging), `crates/turbine-core/src/support.rs` (CPU experimental rows per quantized format; gfx1201 Llama experimental rows during the proofs), `crates/turbine-server/tests/tiny_server.rs` (`status_reports_quantization`: the server harness lives there)
 Interfaces:
 
-- `StatusDocument.quantization: QuantizationStatus { weight_format, packaging, activation, kv_dtype }` (6b adds `tier_formats` and `ladder`)
+- `StatusDocument.quantization: QuantizationSummary { weight_format, packaging, activation, kv_dtype, layers }` (6b adds `tier_formats` and `ladder`); no per-call `turbine_qgemm_calls_total` (decode-graph replays bypass the host call; the selection is `turbine_kernel_provider_selected{op="qgemm"}`)
   Covers: spec S-19; AC `status_reports_quantization`
   Depends on: Task 24
 
-- [ ] Write failing tests. Run: `scripts/remote-cargo.sh test -p turbine-api --test api status_reports_quantization` — expect FAIL
+- [ ] Write failing tests. Run: `scripts/remote-cargo.sh test -p turbine-server --test tiny_server status_reports_quantization` — expect FAIL
 - [ ] Implement.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-api -p turbine-kv -p turbine-server` — expect PASS
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`

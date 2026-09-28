@@ -58,11 +58,21 @@ pub fn device_arch(cfg: &Config, vendor: &str, inventory: &DeviceInventory) -> O
         .and_then(|d| d.arch.clone())
 }
 
-/// The format columns of the configured model: `(weight_format, kv_format)`. Every checkpoint
-/// the model loader accepts today is BF16 (the Phase 6a weight-format registry, plan Task 6,
-/// supplies the detected column); the KV column is `kv.dtype` (Phase 6a S-13).
+/// The format columns of the configured model: `(weight_format, kv_format)`. The weight column
+/// is the one of the checkpoint's packaging (`turbine_model::weights::detect` on `config.json`,
+/// Phase 6a S-3); BF16 when `config.json` cannot be read or detection refuses it (the model load
+/// then reports why). The KV column is `kv.dtype` (Phase 6a S-13).
 pub fn format_columns(cfg: &Config) -> (WeightFormatColumn, KvFormatColumn) {
-    (WeightFormatColumn::Bf16, kv_column(cfg.kv.dtype))
+    (weight_column(&cfg.model.path), kv_column(cfg.kv.dtype))
+}
+
+/// The support-matrix weight column of the checkpoint in `model_dir`.
+pub fn weight_column(model_dir: &Path) -> WeightFormatColumn {
+    std::fs::read_to_string(model_dir.join("config.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|top| turbine_model::weights::detect(&top).ok())
+        .map_or(WeightFormatColumn::Bf16, |format| format.column())
 }
 
 /// The support-matrix KV column of `kv.dtype`: the column of the same spelling (a `kv.dtype`
@@ -343,16 +353,39 @@ mod tests {
             serde_json::json!({"architectures": ["LlamaForCausalLM"]}),
         );
         let cfg = config("hip", llama.path());
-        // Nothing configured: BF16 weights (the only loadable format so far) and BF16 KV.
+        // No `quantization_config`: BF16 weights; nothing configured: BF16 KV.
         assert_eq!(
             format_columns(&cfg),
             (WeightFormatColumn::Bf16, KvFormatColumn::Bf16)
         );
+        // A compressed-tensors FP8 checkpoint: the detected column.
+        let fp8 = model_dir(
+            "fmt-fp8",
+            serde_json::json!({"architectures": ["LlamaForCausalLM"],
+                "quantization_config": {"quant_method": "compressed-tensors",
+                    "format": "float-quantized", "ignore": ["lm_head"],
+                    "config_groups": {"group_0": {"targets": ["Linear"],
+                        "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}}}}}),
+        );
+        assert_eq!(
+            format_columns(&config("hip", fp8.path())),
+            (WeightFormatColumn::Fp8, KvFormatColumn::Bf16)
+        );
         let key = key_before_discovery(&cfg, WeightFormatColumn::Fp8, KvFormatColumn::Bf16);
         assert_eq!(key.to_string(), "amd/*/LlamaForCausalLM/fp8/bf16/none");
+        // Experimental on gfx1201 Llama while its proof runs; another family is refused.
+        assert_eq!(support::check(key).unwrap().status.as_str(), "experimental");
+        let qwen = model_dir(
+            "fmt-qwen",
+            serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}),
+        );
+        let key = key_before_discovery(
+            &config("hip", qwen.path()),
+            WeightFormatColumn::Fp8,
+            KvFormatColumn::Bf16,
+        );
         let err = support::check(key).unwrap_err();
         assert_eq!(err.key(), Some("model.path"));
-        assert!(err.to_string().contains("phase-6a-quantization"), "{err}");
 
         // After discovery the format columns are kept.
         let first = SupportDecision {

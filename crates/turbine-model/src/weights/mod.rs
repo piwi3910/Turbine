@@ -112,6 +112,18 @@ pub enum ActivationQuant {
 }
 
 impl ActivationQuant {
+    /// The name in `/turbine/v1/status` and the `weight_format` log event (`none`,
+    /// `fp8_tensor_static`, `fp8_token`, `fp8_group128`, `mxfp4_emulated`).
+    pub fn name(self) -> String {
+        match self {
+            ActivationQuant::None => "none".into(),
+            ActivationQuant::Fp8PerTensorStatic => "fp8_tensor_static".into(),
+            ActivationQuant::Fp8PerTokenDynamic => "fp8_token".into(),
+            ActivationQuant::Fp8PerGroupDynamic { group } => format!("fp8_group{group}"),
+            ActivationQuant::Mxfp4Emulated => "mxfp4_emulated".into(),
+        }
+    }
+
     /// The kernel-side mode (the static FP8 scale, `input_scale`, travels with each call).
     pub fn kernel(self) -> ActQuantDesc {
         match self {
@@ -222,6 +234,90 @@ pub trait WeightFormat: Module {
     fn write_tiny(&self, dir: &Path, twin: Option<&Path>) -> Result<bool, ModelError> {
         let _ = (dir, twin);
         Ok(false)
+    }
+}
+
+impl QuantScheme {
+    /// The name in the `weight_format` log event (`bf16`, `fp8_channel`, `int4_group_zp`, …).
+    pub fn name(self) -> &'static str {
+        self.kernel().map_or("bf16", QuantSchemeDesc::as_str)
+    }
+}
+
+/// What `/turbine/v1/status` reports under `quantization` and the `weight_format` log event
+/// records (Phase 6a S-19): the support-matrix column, the packaging, the activation scheme,
+/// the L0 KV dtype and the number of linear layers per scheme.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct QuantizationSummary {
+    pub weight_format: &'static str,
+    pub packaging: &'static str,
+    pub activation: String,
+    pub kv_dtype: &'static str,
+    /// Linear layers (the LM head included) per scheme name.
+    pub layers: std::collections::BTreeMap<&'static str, u32>,
+}
+
+impl QuantizationSummary {
+    pub fn of(cfg: &ModelArchConfig) -> QuantizationSummary {
+        let format = cfg.weight_format.get();
+        let mut layers = std::collections::BTreeMap::new();
+        for l in cfg.linear_slots() {
+            *layers.entry(format.scheme(&l).name()).or_insert(0) += 1;
+        }
+        QuantizationSummary {
+            weight_format: format.column().as_str(),
+            packaging: format.name(),
+            activation: format.activation().name(),
+            kv_dtype: if cfg.kv_cache.is_fp8() {
+                "fp8_e4m3"
+            } else {
+                "bf16"
+            },
+            layers,
+        }
+    }
+
+    /// The `weight_format` INFO event at load (Phase 6a S-19), with the loaded `weight_bytes`.
+    pub fn log(&self, weight_bytes: u64) {
+        let layers: Vec<String> = self
+            .layers
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect();
+        tracing::info!(
+            event = "weight_format",
+            weight_format = self.weight_format,
+            packaging = self.packaging,
+            activation = %self.activation,
+            kv_dtype = self.kv_dtype,
+            layers = %layers.join(","),
+            weight_bytes,
+            "weights loaded"
+        );
+    }
+}
+
+/// The reason code of a quantization refusal in `e`'s text (`quant_scheme_unsupported`,
+/// `gptq_act_order`, `quant_moe_phase7`, `quant_shard_misaligned`,
+/// `quant_pipeline_unsupported`, `phase-2b-nvidia`); `None` for any other error.
+pub fn quant_refusal_reason(e: &ModelError) -> Option<&'static str> {
+    const CODES: [&str; 6] = [
+        "quant_scheme_unsupported",
+        "gptq_act_order",
+        "quant_moe_phase7",
+        "quant_shard_misaligned",
+        "quant_pipeline_unsupported",
+        "phase-2b-nvidia",
+    ];
+    let text = e.to_string();
+    CODES.into_iter().find(|c| text.contains(c))
+}
+
+/// Logs `e` as the `quant_refused` ERROR event (Phase 6a S-19) when it is a quantization
+/// refusal; nothing otherwise.
+pub fn log_quant_refusal(context: &str, e: &ModelError) {
+    if let Some(reason) = quant_refusal_reason(e) {
+        tracing::error!(event = "quant_refused", reason, context, "{e}");
     }
 }
 

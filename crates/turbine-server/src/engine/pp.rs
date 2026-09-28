@@ -1006,6 +1006,7 @@ pub(crate) fn load_pipeline(
         last.arch.weight_format.0.name(),
         tail.weight_bytes,
     );
+    model::record_quantization(metrics, &last.arch, tail.weight_bytes);
     tracing::info!(
         event = "pp_pipeline_ready",
         stages,

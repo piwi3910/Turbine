@@ -75,12 +75,27 @@ impl fmt::Display for StartupError {
     }
 }
 
-fn model_error(context: &str, e: ModelError) -> StartupError {
+/// A model-layer startup failure; a quantization refusal is also logged as the `quant_refused`
+/// event with its reason code (Phase 6a S-19).
+pub(crate) fn model_error(context: &str, e: ModelError) -> StartupError {
+    turbine_model::weights::log_quant_refusal(context, &e);
     StartupError::new(format!("{context}: {e}"))
 }
 
 fn kernel_error(context: &str, e: KernelError) -> StartupError {
     StartupError::new(format!("{context}: {e}"))
+}
+
+/// `turbine_weight_format_info` and the `weight_format` log event of a loaded model (Phase 6a
+/// S-19).
+pub(crate) fn record_quantization(
+    metrics: &turbine_model::metrics::ModelMetrics,
+    arch: &turbine_model::config::ModelArchConfig,
+    weight_bytes: u64,
+) {
+    let summary = turbine_model::weights::QuantizationSummary::of(arch);
+    metrics.record_weight_format(summary.weight_format, summary.packaging);
+    summary.log(weight_bytes);
 }
 
 /// The L0 KV format of `kv.dtype` (Phase 6a S-13): BF16, or FP8 e4m3 with the checkpoint's
@@ -1053,6 +1068,7 @@ pub fn load(
     warm_up(executor.as_mut(), &mut pool, warmup_token)?;
     let load_seconds = started.elapsed().as_secs_f64();
     metrics.record_load(load_seconds, arch.weight_format.0.name(), weight_bytes);
+    record_quantization(metrics, arch, weight_bytes);
     tracing::info!(
         load_seconds,
         weight_bytes,

@@ -1635,3 +1635,9 @@ Total 41,185,550,352 bytes. The 8B BF16 download waited while free disk was ≈ 
 3. Pipeline-parallel stages with quantized weights are refused (`quant_pipeline_unsupported`) until tested; the spec's S-12 names tensor parallelism only.
 4. The test is model-level (`tiny_model tp2_quantized_matches_tp1_on_host`, host collective) instead of the plan's server-level `tiny_server`; the lab two-GPU leg stays for when the HIP kernels land (Tasks 14, 18, 20).
 
+**Quantization status and metrics (6a Task 25, lead), provisional, pending user review:**
+
+1. `turbine_qgemm_calls_total{scheme,impl}` is dropped: a decode-graph replay runs every quantized GEMM without the host call a counter would count; the per-config implementation is already `turbine_kernel_provider_selected{op="qgemm",…}`. Alternative: count per graph key at capture and add on replay. Spec S-19 and Interfaces amended.
+2. The support key's weight column is now the detected packaging's (Task 2 had left it BF16). Every Phase 6a format gets an `experimental` row on `amd/gfx1201/LlamaForCausalLM` with BF16 KV while its proof runs (turned `supported` by each proof task after its gate), and on the `cpu` backend with BF16 or FP8 KV (tests and tiny checkpoints). Without these rows the proofs could not serve.
+3. The status test lives in `tiny_server` (the server harness) instead of `turbine-api tests/api.rs`.
+

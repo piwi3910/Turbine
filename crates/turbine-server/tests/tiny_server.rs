@@ -136,6 +136,11 @@ struct Setup<'a> {
     olmoe: bool,
     /// More environment variables for the server.
     env: &'a [(&'a str, String)],
+    /// Rewrite the tiny Llama into the weight format this `quantization_config` declares
+    /// (Phase 6a).
+    quantization: Option<Value>,
+    /// Extra `kv` keys, e.g. `"  dtype: fp8_e4m3\n"`.
+    kv_extra: &'a str,
 }
 
 impl Default for Setup<'_> {
@@ -151,6 +156,8 @@ impl Default for Setup<'_> {
             capture_logs: false,
             olmoe: false,
             env: &[],
+            quantization: None,
+            kv_extra: "",
         }
     }
 }
@@ -224,6 +231,11 @@ impl TinyServer {
                 },
             );
         }
+        if let Some(q) = &setup.quantization {
+            let format =
+                turbine_model::weights::detect(&json!({ "quantization_config": q })).unwrap();
+            assert!(format.write_tiny(&model_dir, None).unwrap());
+        }
         if let Some(positions) = setup.max_positions {
             let path = model_dir.join("config.json");
             let mut cfg: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -244,7 +256,7 @@ impl TinyServer {
                 setup.model_extra,
                 setup.server_extra,
                 setup.execution_extra,
-                setup.kv_bytes,
+                &format!("{}\n{}", setup.kv_bytes, setup.kv_extra.trim_end()),
                 setup.extra,
             );
             std::fs::write(&config, yaml).unwrap();
@@ -811,6 +823,56 @@ fn status_reports_modules_and_kernels() {
         .collect();
     assert!(!expected.is_empty());
     assert_eq!(status["kernels"], Value::Array(expected), "{status}");
+}
+
+/// Phase 6a S-19: `/turbine/v1/status` of a tiny compressed-tensors FP8 server with FP8 KV
+/// reports `quantization` (weight format, packaging, activation, KV dtype) and lists the
+/// `qgemm` and `quantize_act` choices under `kernels`; `turbine_weight_format_info` names the
+/// format and the `weight_format` event is logged. Breaks if a key is missing.
+#[test]
+fn status_reports_quantization() {
+    let server = TinyServer::launch(&Setup {
+        quantization: Some(json!({
+            "quant_method": "compressed-tensors", "format": "float-quantized",
+            "ignore": ["lm_head"],
+            "config_groups": {"group_0": {"targets": ["Linear"],
+                "input_activations": {"num_bits": 8, "type": "float", "strategy": "token",
+                                      "dynamic": true},
+                "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}}}})),
+        kv_extra: "  dtype: fp8_e4m3\n",
+        capture_logs: true,
+        extra: "logging:\n  format: json\n",
+        ..Setup::default()
+    });
+    let status = server.get("/turbine/v1/status").json();
+    let q = &status["quantization"];
+    assert_eq!(q["weight_format"], "fp8", "{status}");
+    assert_eq!(q["packaging"], "ct_fp8", "{status}");
+    assert_eq!(q["activation"], "fp8_token", "{status}");
+    assert_eq!(q["kv_dtype"], "fp8_e4m3", "{status}");
+    assert!(q["layers"]["fp8_channel"].as_u64().unwrap() > 0, "{status}");
+    let ops: Vec<&str> = status["kernels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|k| k["op"].as_str())
+        .collect();
+    assert!(ops.contains(&"qgemm"), "{ops:?}");
+    assert!(ops.contains(&"quantize_act"), "{ops:?}");
+    assert_eq!(status["support"]["weight_format"], "fp8", "{status}");
+    let metrics = server.metrics();
+    let line = r#"turbine_weight_format_info{format="fp8",packaging="ct_fp8"} 1"#;
+    assert!(metrics.lines().any(|l| l == line), "{line}:\n{metrics}");
+    let logs = server.logs.as_ref().expect("logs captured");
+    wait_for(
+        Duration::from_secs(10),
+        "the weight_format log line",
+        || {
+            let text = logs.lock().unwrap();
+            text.lines()
+                .any(|l| l.contains(r#""event":"weight_format""#) && l.contains("ct_fp8"))
+        },
+    );
 }
 
 /// Phase 2m S-11: the support-matrix row resolved at startup is the `support` key of

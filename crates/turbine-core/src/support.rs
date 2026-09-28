@@ -287,6 +287,33 @@ const fn format_row(format: WeightFormatColumn, reason: &'static str) -> Support
     )
 }
 
+/// A Phase 6a weight format on gfx1201 Llama with BF16 KV during its proof: `experimental`.
+const fn gfx1201_quant_row(format: WeightFormatColumn) -> SupportRow {
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("LlamaForCausalLM"),
+        Some(format),
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Experimental,
+    )
+}
+
+/// A Phase 6a weight format on the CPU reference provider: `experimental` (tests and tiny
+/// checkpoints), more specific than the format's `unsupported` row.
+const fn cpu_quant_row(format: WeightFormatColumn, kv: KvFormatColumn) -> SupportRow {
+    row(
+        Some("cpu"),
+        None,
+        None,
+        Some(format),
+        Some(kv),
+        NO_SPEC,
+        SupportStatus::Experimental,
+    )
+}
+
 /// A former NVIDIA baseline row, refused while `phase-2b-nvidia` is deferred.
 const fn nvidia_row(architecture: &'static str) -> SupportRow {
     row(
@@ -357,6 +384,28 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Experimental,
     ),
+    // Phase 6a weight formats on gfx1201 Llama: `experimental` while each proof runs (plan
+    // Tasks 14, 15, 18, 20), `supported` only after its gate.
+    gfx1201_quant_row(WeightFormatColumn::Fp8),
+    gfx1201_quant_row(WeightFormatColumn::Fp8Block),
+    gfx1201_quant_row(WeightFormatColumn::Mxfp4),
+    gfx1201_quant_row(WeightFormatColumn::Mxfp4A4),
+    gfx1201_quant_row(WeightFormatColumn::AwqInt4),
+    gfx1201_quant_row(WeightFormatColumn::GptqInt4),
+    // Quantized weights on the CPU reference provider (Phase 6a S-3): tests and tiny
+    // checkpoints only, with BF16 or FP8 KV.
+    cpu_quant_row(WeightFormatColumn::Fp8, KvFormatColumn::Bf16),
+    cpu_quant_row(WeightFormatColumn::Fp8, KvFormatColumn::Fp8E4m3),
+    cpu_quant_row(WeightFormatColumn::Fp8Block, KvFormatColumn::Bf16),
+    cpu_quant_row(WeightFormatColumn::Fp8Block, KvFormatColumn::Fp8E4m3),
+    cpu_quant_row(WeightFormatColumn::Mxfp4, KvFormatColumn::Bf16),
+    cpu_quant_row(WeightFormatColumn::Mxfp4, KvFormatColumn::Fp8E4m3),
+    cpu_quant_row(WeightFormatColumn::Mxfp4A4, KvFormatColumn::Bf16),
+    cpu_quant_row(WeightFormatColumn::Mxfp4A4, KvFormatColumn::Fp8E4m3),
+    cpu_quant_row(WeightFormatColumn::AwqInt4, KvFormatColumn::Bf16),
+    cpu_quant_row(WeightFormatColumn::AwqInt4, KvFormatColumn::Fp8E4m3),
+    cpu_quant_row(WeightFormatColumn::GptqInt4, KvFormatColumn::Bf16),
+    cpu_quant_row(WeightFormatColumn::GptqInt4, KvFormatColumn::Fp8E4m3),
     // FP8 KV on the CPU reference provider (Phase 6a S-13): tests and tiny checkpoints.
     row(
         Some("cpu"),
@@ -1006,7 +1055,10 @@ mod tests {
             ]
         );
         for w in W::PHASE_6A {
+            // Experimental on gfx1201 Llama while each proof runs; refused elsewhere.
             let k = key("amd", "gfx1201", "LlamaForCausalLM", w, K::Bf16, S::None);
+            assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
+            let k = key("amd", "gfx1201", "OlmoeForCausalLM", w, K::Bf16, S::None);
             let status = resolve(&k);
             assert_eq!(status.as_str(), "unsupported", "{k}");
             assert!(

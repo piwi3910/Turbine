@@ -1268,6 +1268,7 @@ pub(crate) fn load_group(
         leader.arch.weight_format.0.name(),
         rank0.weight_bytes,
     );
+    model::record_quantization(metrics, &leader.arch, rank0.weight_bytes);
     tracing::info!(
         event = "tp_group_ready",
         world,
