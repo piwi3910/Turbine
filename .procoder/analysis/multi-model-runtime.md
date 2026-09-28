@@ -175,7 +175,7 @@ Spec amendments the recommended placement requires. Each is to be written when t
   - S-4 heartbeats carry model residency.
   - S-6 model placement becomes dynamic through the control plane.
   - Out of scope: remove "Dynamic re-planning of model placement at runtime".
-- **`phase-8-expansion.md`:** remove "serving several models in one process" from Out of scope. Keep speculative decoding's draft model modelled as part of the target deployment, or as a co-resident model under the same quota.
+- **`phase-6-8-expansion.md`** (written as `phase-8-expansion.md`): remove "serving several models in one process" from Out of scope. Keep speculative decoding's draft model modelled as part of the target deployment, or as a co-resident model under the same quota.
 
 Where it does not pay, stated so the gate stays honest: one hot model that saturates a GPU gains nothing from any of this. The single-model regression gate in 3b must prove the multi-model machinery costs that case nothing measurable.
 
