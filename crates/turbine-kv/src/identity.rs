@@ -1,8 +1,9 @@
 //! KV identity (P4 S-1): namespace keys and 128-bit block keys forming a BLAKE3 hash chain.
 //!
-//! A block key covers the namespace (model identity, KV format, block size, cache salt), the
-//! parent block's key and the block's token ids, so equal keys mean equal prefixes up to a hash
-//! collision; the directory still compares stored tokens, so a collision is a miss.
+//! A block key covers the namespace (model identity with its RoPE parameters, KV format, block
+//! size, cache salt), the parent block's key and the block's token ids, so equal keys mean equal
+//! prefixes up to a hash collision; the directory still compares stored tokens, so a collision is
+//! a miss.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -102,6 +103,9 @@ struct CanonicalNamespace<'a> {
     cache_salt: &'a str,
     kv_format: CanonicalFormat,
     model_config_hash: String,
+    /// BLAKE3 of the resolved RoPE parameters (Phase 6a S-16, plan Task 27): a
+    /// `model.rope_scaling` override leaves `model_config_hash` unchanged.
+    rope_hash: String,
     weights_index_hash: String,
 }
 
@@ -142,6 +146,7 @@ pub fn namespace_key(id: &ModelIdentity, fmt: &KvFormat, cache_salt: &str) -> Na
             v_scales_hash: fmt.scales.map(|s| hex(&s.v)),
         },
         model_config_hash: hex(&id.config_hash),
+        rope_hash: hex(&id.rope_hash),
         weights_index_hash: hex(&id.weights_index_hash),
     };
     // Serialising a struct of strings and integers into a Vec cannot fail.
@@ -249,6 +254,7 @@ mod tests {
         ModelIdentity {
             config_hash: [config_byte; 32],
             weights_index_hash: [7; 32],
+            rope_hash: [0; 32],
         }
     }
 
@@ -257,9 +263,14 @@ mod tests {
     }
 
     // Golden values: a change here means every cached prefix silently changes identity.
-    const GOLDEN_NS: &str = "7e1498499592da3bafd9f9da2af720288b56e58647a30c92555d8992abe96933";
-    const GOLDEN_K0: &str = "048a689576719fe25e37707f36c80bcb";
-    const GOLDEN_K1: &str = "1a566e6449ac3bd7d1fccfda42604a3d";
+    // Phase 6a Task 27 changed them once, on purpose: the canonical namespace JSON gained
+    // `rope_hash` (the resolved RoPE parameters; here the all-zero test hash), so blocks cached
+    // under one RoPE configuration are never reused under another. Before: namespace
+    // 7e1498499592da3bafd9f9da2af720288b56e58647a30c92555d8992abe96933, keys
+    // 048a689576719fe25e37707f36c80bcb, 1a566e6449ac3bd7d1fccfda42604a3d.
+    const GOLDEN_NS: &str = "ed23b1a59bb18212b164ef794fa9cf9d322aab219e06c339fae5ed8039daf370";
+    const GOLDEN_K0: &str = "c702bd85238874d09bfd14994b61c7dd";
+    const GOLDEN_K1: &str = "3160290f63b886a8ec86883ec3e382cf";
 
     #[test]
     fn keys_are_stable_and_scoped() {
@@ -324,7 +335,7 @@ mod tests {
     #[test]
     fn shard_count_scopes_the_namespace_only_under_tp() {
         let one = llama_format(16);
-        // tp = 1 keeps the Phase 4 canonical JSON, so its namespace is the golden one.
+        // tp = 1 adds no `shards` field, so its namespace is the golden one.
         assert_eq!(hex(&namespace_key(&model(1), &one, "").0), GOLDEN_NS);
         assert_eq!(one.block_bytes(), one.layout.block_bytes());
         let two = KvFormat { shards: 2, ..one };
@@ -356,10 +367,12 @@ mod tests {
         }
     }
 
-    /// Phase 6a S-16: the FP8 KV scales enter the namespace key (the RoPE part lands with
-    /// plan Task 27). Identical scales give one namespace; a scale change in any layer of K or
-    /// of V, or K and V swapped, gives another; a BF16 format keeps the Phase 4 golden key.
-    /// Breaks if blocks written under one set of scales could be read under another.
+    /// Phase 6a S-16: the FP8 KV scales and the resolved RoPE parameters enter the namespace
+    /// key. Identical scales give one namespace; a scale change in any layer of K or of V, or K
+    /// and V swapped, gives another; a BF16 format keeps the golden key. Two identities that
+    /// differ only in RoPE parameters give different keys, identical ones the same key. Breaks
+    /// if blocks written under one set of scales or one RoPE configuration could be read under
+    /// another.
     #[test]
     fn rope_and_scales_scope_the_namespace() {
         let bf16 = llama_format(16);
@@ -402,6 +415,35 @@ mod tests {
             block_key(&ns(&base), None, &tokens),
             block_key(&ns(&fp8_format(&k, &ones)), None, &tokens),
             "the scales change every block key"
+        );
+
+        // RoPE (plan Task 27): the resolved RoPE parameters (`ModelArchConfig::rope_identity`)
+        // scope the namespace, so a `model.rope_scaling` override — which leaves config.json,
+        // hence `config_hash`, unchanged — never reuses blocks cached without it.
+        let llama3 = r#"{"rotary_dim":128,"scaling":{"factor":32.0,"high_freq_factor":4.0,"low_freq_factor":1.0,"original_max_position_embeddings":8192,"type":"llama3"},"theta":500000.0}"#;
+        let yarn16 = r#"{"rotary_dim":128,"scaling":{"attention_factor":1.2772588722239782,"beta_fast":32.0,"beta_slow":1.0,"factor":16.0,"original_max_position_embeddings":8192,"truncate":true,"type":"yarn"},"theta":500000.0}"#;
+        let yarn8 = yarn16.replace(r#""factor":16.0"#, r#""factor":8.0"#);
+        let with = |rope: &str| namespace_key(&model(1).with_rope(rope), &bf16, "");
+        assert_eq!(with(llama3), with(llama3), "same RoPE, same key");
+        assert_ne!(
+            with(llama3),
+            with(yarn16),
+            "YaRN blocks are never read without it"
+        );
+        assert_ne!(with(yarn16), with(&yarn8), "nor under another factor");
+        assert_ne!(
+            with(yarn16),
+            namespace_key(&model(1), &bf16, ""),
+            "a resolved RoPE differs from none"
+        );
+        assert_ne!(
+            block_key(&with(llama3), None, &tokens),
+            block_key(&with(yarn16), None, &tokens),
+            "RoPE changes every block key"
+        );
+        assert_eq!(
+            model(1).with_rope(yarn16).rope_hash,
+            *blake3::hash(yarn16.as_bytes()).as_bytes()
         );
     }
 }
