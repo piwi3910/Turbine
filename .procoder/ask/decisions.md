@@ -1256,3 +1256,41 @@ Measured on novanas today (Llama-3.2-3B, TP 2): Turbine is ready 6–8 s after p
 - Leave it out; mention it only in the set conclusion
 
 **Answer (2026-09-28, user): neither — it was a question, not a request; nothing is added to the tests or the package.**
+
+## Phase 5p spec: provisional design choices (2026-09-28)
+
+Written with `.procoder/specs/phase-5p-serving-efficiency.md` and its plan, ahead of Phase 5's merge. The decision "Phase 5p: serving efficiency interlude" fixes scope, order and constraints; the choices below are the ones it leaves open. The spec first wrote each recommended option marked "(provisional)"; the user answered all of them on 2026-09-28 (below) and the spec and plan now mark them "(user decision 2026-09-28)". None is implemented yet.
+
+**1. Jump-forward and "identical to token-by-token decoding".** llguidance's forced tokens are the canonical tokenization of the forced bytes; greedy token-by-token decoding may pick another tokenization of the same bytes, and a prefill-shaped step rounds differently from a decode step.
+
+- A) Verified jump-forward: feed the sampled token plus the forced tokens in one chunked-prefill step with logits for every position; step each row through the normal mask, processors and sampler (its own uniform), accept while the sampled token equals the forced one, take the model's token at the first disagreement and roll the rest back. Same tokens as token-by-token for greedy and seeded sampling up to prefill-vs-decode rounding; handles the retokenization boundary by construction; costs full logits rows for the forced positions; its multi-token append and roll-back are reusable by Phase 8 (recommended)
+- B) SGLang-style: append the canonical forced tokens unverified (llguidance already re-tokenizes the last committed token with the forced bytes and chops tokens that could merge with what follows); cheapest, but the output can differ where the model would tokenize differently
+- C) Jump only where the mask allows exactly one token: bit-identical, but multi-byte forced strings almost always allow several tokenizations, so it rarely fires
+
+**Answer (2026-09-28, user): A** — verify the forced tokens as a draft, roll back at the first disagreement.
+
+**2. The `cache_aware` admission key and its starvation bound.** A scheduling policy is stateless and computes a request's key once, at push.
+
+- A) Windowed longest-prefix-first: requests are grouped by arrival window (`scheduler.cache_aware_window`, default 1 s); within a window and a priority the longest cached prefix goes first; windows keep arrival order. Bound: a request is never admitted after an equal-priority request that arrived one window or more later (recommended)
+- B) Virtual deadline: key = arrival + window − credit, credit growing with the cached tokens (capped at the window); smoother, but needs a token scale (a second knob)
+- C) Order by the cached fraction of the prompt instead of the cached length (closer to shortest-remaining-prefill-first)
+
+**Answer (2026-09-28, user): A** — 1 s arrival windows, longest cached prefix first within a window.
+
+**3. Default scheduling policy.** **Answer (2026-09-28, user): accepted as written** — `default` stays the default in this phase; the saturated multi-turn A/B (plan Task 9) is recorded and the user decides whether `cache_aware` becomes the default.
+
+**4. Partial blocks and the KV tiers** ("a partial block is L0-only or copied whole"). **Answer (2026-09-28, user): accepted as written** — L0-only — partial entries are never demoted, prefetched or promoted, a reclaim drops them (`partial_l0_only`), and a full block that is only in L1/L2 is not used for a token-granular match. Alternative not taken: promote such a block whole, then copy (more reuse after demotion, more copy traffic). The user confirmed L0 only.
+
+**5. Which sequences publish a partial tail.** **Answer (2026-09-28, user): accepted as written** — choice 0 of a request that finished normally (stop, EOS, length), holding the tokens whose KV is written; cancelled and failed requests publish nothing partial; at most 8 partial entries per parent, 64 children compared per lookup.
+
+**6. Host share and the overlap rule.** **Answer (2026-09-28, user): accepted as written** — host share = all engine iteration stages except `device_wait` over all stages, from `turbine_engine_iteration_seconds{stage}` (so `launch`, which includes the blocking graph launch, counts as host); overlap work is built if either model's c1 share exceeds 0.05; if built, its default flips only when throughput rises and TTFT p50 stays ≤ 1.10 × serial for both models.
+
+**7. Performance targets** (spec Interfaces, "Performance targets"). **Answer (2026-09-28, user): accepted as written** —
+
+- Standard bench, every landing step: tok/s ≥ 0.98 × the Task 3 baseline and TTFT p50 ≤ 1.10 ×.
+- Token-granular reuse: multi-turn `cached_tokens_ratio` +0.01 or more (reference 0.907) and later-turn TTFT p50 ≤ 0.95 × (reference 76 ms).
+- `cache_aware` against `default`, saturated profile: later-turn TTFT p50 ≤ 0.85 ×, cached ratio ≥, profile tok/s ≥ 0.98 ×, first-turn TTFT p99 ≤ 1.5 ×.
+- Jump-forward on the four golden JSON cases: forward steps per completion token ≤ 0.8 × and wall time ≤ 0.9 ×.
+- `structured_output.jump_forward_max_tokens` default 32.
+
+Known limit, unchanged from Phase 4 and stated in the spec: KV written by decode steps (a previous turn's generated tokens) is reused within the golden tolerance, not bit-exactly, because decode steps run Llama's speed-tuned GEMM rows; the bit-exact `kv_gpu` checks cover prefill-written prefixes.

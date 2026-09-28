@@ -1,6 +1,6 @@
 # Turbine cross-phase interface contract
 
-Status: binding for every implementation plan of phases 0, 1, 2, 2b, 3, 4, 5, 6, 7 and 8 (umbrella).
+Status: binding for every implementation plan of phases 0, 1, 2, 2b, 3, 4, 5, 5p, 6, 7 and 8 (umbrella).
 
 Renumbering (2026-09-28, decision "Roadmap reorganisation after Phase 5 (2026-09-28)" in `.procoder/ask/decisions.md`): this contract keeps the phase labels it was written with. "P6" is now `phase-9-multi-node` and "P7" `phase-10-advanced-distribution` (both deferred, like "P2b" `phase-2b-nvidia`); "P8" is the umbrella `phase-6-8-expansion`, "P8a" `phase-6-quantization`, "P8c" `phase-7-model-families` and "P8b" `phase-8-speculative-decoding` — the active order after Phase 5 is quantization, model families, speculative decoding, AMD only. NVFP4 moves to the deferred P2b.
 Date: 2026-09-25. Inputs: `turbine-spec.md` (cited "TS §N"), `.procoder/specs/phase-*.md` (cited "P0 §Interfaces", "P3 S-9", …), `.procoder/ask/decisions.md` (cited "DEC"), `AGENTS.md`.
@@ -2445,7 +2445,7 @@ Convention (`turbine_core::registry`): `trait Module { fn name(&self) -> &'stati
 | `weight_format`      | `WeightFormat`                              | `turbine_model::weights`          | `bf16`                                                                                         | `detect(config.json)`                             |
 | `tool_format`        | `ToolFormat`                                | `turbine_model::formats`          | `llama3_json`, `hermes`, `mistral`                                                             | `model.tool_call_parser`, else the family default |
 | `logits_processor`   | `LogitsProcessor` (chain in registry order) | `turbine_model::sampling`         | `logit_bias`, `repetition_penalty`, `presence_frequency_penalty`, `min_tokens`, `grammar_mask` | always (each `applies` per request)               |
-| `scheduling_policy`  | `SchedulingPolicy`                          | `turbine_scheduler::policy`       | `default`                                                                                      | `scheduler.policy`                                |
+| `scheduling_policy`  | `SchedulingPolicy`                          | `turbine_scheduler::policy`       | `default`, `cache_aware` (P5p)                                                                 | `scheduler.policy`                                |
 | `eviction_policy`    | `EvictionPolicy` (P4)                       | `turbine_kv::policy`              | `cost_aware`, `lru`                                                                            | `kv.policy`                                       |
 | `execution_backend`  | `ExecutionBackend`                          | `turbine_kernels::backends`       | `cpu`, `hip`                                                                                   | `execution.backend`                               |
 | `card_profile`       | `CardProfile` (declarative struct)          | `turbine_kernels::cards`          | `gfx1201`                                                                                      | `execution.card_profile` (`auto` = device arch)   |
@@ -2468,3 +2468,74 @@ Signatures (the plan `.procoder/plans/phase-2m-modularity.md` holds the full lis
 - Kernel selection: `KernelProvider::{implementations(op) -> Vec<ImplInfo>, implementation_supports(&OpConfig, index, rows), bind(&OpConfig, &ImplChoice), card_profile() -> Option<&'static CardProfile>}` (the last: the profile a shim context was given, so tests build the registry as the server does); `ShimLibrary::{enumerates_implementations, implementations}`, `ShimContext::{set_profile(&'static CardProfile), card_profile}`; `ImplChoice::index_for(rows)`; `ImplChoice { Single(u32), ByRows(Vec<RowTier>) }`; `KernelRegistry::build(providers, order, reqs, metrics, card: Option<&CardProfile>)`; `Selection` gains `impl_provider`, `reason_code` ∈ `profile_preferred`, `profile_fallback`, `library_order`, `provider_internal`, and `tiers`.
 - Diagnostics: `/turbine/v1/status` gains `modules { family, tool_format, weight_format, backend, card_profile, scheduling_policy, eviction_policy /* P4 */ }`, `kernels [{ op, config, provider, implementation, impl_provider, reason, reason_code, tiers }]` and `support` (§3.8).
 - Conformance suites (S-13), each run over a registry by its crate's `registry_conformance` tests: `turbine_model::conformance::{ConformanceFailure { point, module, check, detail }, families_suite, formats_suite, weights_suite, processors_suite, fixture_tools, feed_text}` (each `(&Registry<dyn Trait>) -> Result<(), Vec<ConformanceFailure>>`); `turbine_kernels::backends::conformance::backends_suite`, `turbine_kernels::cards::conformance::{cards_suite, cmake_profile_archs}` and the test-only `turbine_scheduler::policy::conformance::policies_suite` and (P4) `turbine_kv::policy::conformance::eviction_policies_suite` (each `-> Result<(), Vec<String>>`); kernel implementations: the lab test `hip_ops every_implementation_matches_cpu`.
+
+---
+
+## 25. Phase 5p additions (serving efficiency)
+
+Source: `.procoder/specs/phase-5p-serving-efficiency.md` (cited "P5p S-n"), decision "Phase 5p: serving efficiency interlude (SGLang-inspired items) (2026-09-28)" and the provisional choices of "Phase 5p spec: provisional design choices (2026-09-28)". Builds on the Phase 5 names (`TpExecutor`, `StepPlan.copies`, `KvFormat.shards`) as merged. No kernel ABI change.
+
+Configuration (P5p S-11; `#[serde(deny_unknown_fields, default)]` as every config struct):
+
+| Key                                         | Rust field                                            | Default | Validation                                                      |
+| ------------------------------------------- | ----------------------------------------------------- | ------- | --------------------------------------------------------------- |
+| `kv.partial_prefix_reuse`                   | `KvConfig.partial_prefix_reuse: bool`                 | `true`  | —; ignored when `kv.prefix_sharing` is false                    |
+| `scheduler.cache_aware_window`              | `SchedulerConfig.cache_aware_window: HumanDuration`   | `1s`    | 10 ms ..= 60 s                                                  |
+| `structured_output.jump_forward`            | `StructuredOutputConfig.jump_forward: bool`           | `true`  | —                                                               |
+| `structured_output.jump_forward_max_tokens` | `StructuredOutputConfig.jump_forward_max_tokens: u32` | `32`    | 1 ..= 256 and value + 1 ≤ `scheduler.max_batch_tokens` (exit 2) |
+
+`turbine-kv` (P5p S-4, S-5):
+
+```rust
+// directory
+pub struct PartialMatch { pub key: KvKey, pub block: BlockId, pub tokens: u32 }
+// PrefixMatch gains: pub partial: Option<PartialMatch>
+impl KvDirectory { pub fn insert_partial(&mut self, block: KvBlock) -> Result<(), DirectoryError>; }   // L0-only partial entry; LRU beyond PARTIAL_PER_PARENT
+impl KvBlock { pub fn is_partial(&self, block_tokens: u32) -> bool; }
+pub const PARTIAL_SCAN_LIMIT: usize = 64; pub const PARTIAL_PER_PARENT: usize = 8;
+// planner
+// PlanInputs gains: pub partial_tokens: u32;  KvPlan gains: pub partial_tokens: u32
+pub fn reuse_cap_tokens(prompt_tokens: u32) -> u32;          // prompt − MIN_RECOMPUTE_TOKENS (still 2)
+// hierarchy
+pub struct TailCopy { pub src: BlockId, pub dst: BlockId, pub tokens: u32 }
+// PrefixAttach gains: pub tail_copy: Option<TailCopy>   (cached_tokens = blocks × block_tokens + tail tokens)
+impl KvHierarchy {
+    pub fn publish_tail(&mut self, pool: &mut BlockPool, request: RequestId, block: BlockId, tokens: &[u32]);
+    pub fn tail_copied(&mut self, pool: &mut BlockPool, request: RequestId);
+}
+// HierarchyConfig gains: pub partial_prefix_reuse: bool
+// metrics
+#[non_exhaustive] pub enum PartialOutcome { Reused, NoCandidate, NotResident, PlannerCutoff, Disabled }   // "reused", "no_candidate", "not_resident", "planner_cutoff", "disabled"
+// EvictReason gains PartialL0Only ("partial_l0_only")
+```
+
+Partial entries never enter L1/L2, prefetch or promotion; `has_reuse_evidence` is false for them. Under TP a tail copy is one logical `(src, dst)` pair executed on every rank through `TpExecutor::copy_blocks` / `StepPlan.copies`, like a fork copy.
+
+`turbine-scheduler` (P5p S-5, S-7, S-9):
+
+```rust
+// IterationPlan gains: pub tail_copies: Vec<(SeqId, BlockId, BlockId)>   (executed before the forward, after forks)
+// IterationOutcome gains: pub rolled_back: Vec<(SeqId, u32)>            (tokens removed from the table's end)
+impl Scheduler { pub fn extend(&mut self, seq: SeqId, tokens: u32) -> Result<(), SchedError>; }   // SchedError::NotDecoding
+// SchedulerParams gains: pub cache_aware_window: Duration
+// policy::AdmissionInfo gains: pub prompt_tokens: u32, pub cached_prefix_tokens: u32, pub window: Duration
+// policy::AdmissionKey becomes { tier: u8, priority: Priority, arrival: Duration, affinity: u64, order: u64 }   (DefaultPolicy: affinity 0)
+pub struct CacheAwarePolicy;   // name "cache_aware"; key: tier 1, priority, arrival window start, affinity u32::MAX − cached_prefix_tokens, order submit_no
+// sim: KvSimDriver::with_policy(&'static dyn SchedulingPolicy); SimReport gains pub admission_inversions: Vec<(RequestId, RequestId)>
+```
+
+`turbine-model` (P5p S-9, S-10): `SeqSlice.logits_rows: u32` (1 ≤ rows ≤ `q_len`; rows > 1 are full rows, never device-reduced); `Logits::rows_of(&self, seq_index: usize) -> &[f32]`; `structured::TokenMatcher::forced_tokens(&mut self, max: usize) -> Vec<u32>` (default empty; `LlguidanceMatcher` over llguidance's `Matcher::compute_ff_tokens`, commits nothing).
+
+`turbine-server` (P5p S-10): `engine::requests::ForcedOutcome { accepted: u32, next: Option<SampledToken>, finished: Option<FinishReason> }` and `ActiveRequest::step_forced(..)` (contract-chosen names; engine-internal).
+
+`turbine-bench` (P5p S-1): subcommand `turbine-bench stage-share --before <file> --after <file> [--output text|json]` (`turbine_bench::stage_share::{StageShare { iterations, seconds, host_share }, stage_share(before, after), StageShareError}`; exit 0, 2 on a missing histogram or no iterations).
+
+Metrics (P5p S-12; labels from closed enums): `turbine_kv_partial_reuse_total{outcome}` (outcome ∈ `PartialOutcome`), `turbine_kv_partial_reused_tokens_total`, `turbine_kv_partial_entries` (gauge), `turbine_jump_forward_tokens_total{outcome}` (`accepted`, `rejected`), `turbine_jump_forward_steps_total`; `turbine_kv_evictions_total{reason}` gains `partial_l0_only`.
+
+Log events: `kv_partial_reuse` (DEBUG), `jump_forward` (DEBUG; reason `all_accepted` | `model_disagreed` | `stopped`).
+
+Diagnostics: `GET /turbine/v1/kv` gains `partial_prefix_reuse` (bool) and `tiers[l0].partial_entries`.
+
+Lab: `scripts/lab-bench.sh` gains `--dry-run`, `--concurrency <n>`, `--multi-turn`, `--multi-turn-sessions <n>`; the `BENCH` line gains `conc=`, `host_share=` and, with a multi-turn flag, `mt_cached=`, `mt_ttft_first_p50=`, `mt_ttft_first_p99=`, `mt_ttft_later_p50=`, `mt_tok_s=`.
+
+Tests (P5p; `ign` = lab): `turbine-bench --test bench stage_share_from_metrics`, `--test lab_scripts lab_bench_dry_run_passes_flags`; `turbine-core config::tests::phase5p_keys`; `turbine-kv directory::tests::token_granular_match`, `planner::tests::token_granular_cap`; `turbine-scheduler --test kv_sim partial_tail_reuse`, `cancellation_before_tail_copy`, `cache_aware_starvation_bound`, `policy::tests::cache_aware_orders_by_window_then_prefix`, `scheduler::tests::extend_and_roll_back`; `turbine-model --test tiny_model multi_row_logits_match_single_steps`, `structured::tests::forced_tokens_follow_llguidance`; `turbine-server engine::r#loop::tests::partial_prefix_reuse_matches_cold`, (conditional) `engine::r#loop::tests::overlap_waits_for_new_prefills`, `--test tiny_server tp2_partial_prefix_reuse`, `jump_forward_matches_token_by_token`, `--test kv_gpu prefix_reuse_partial_block_matches_cold` (ign), `--test lab_openai json_schema_jump_forward_matches` (ign).
