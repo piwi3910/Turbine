@@ -2452,6 +2452,7 @@ dependencies = [
  "prometheus-client",
  "serde",
  "serde_json",
+ "serde_norway",
  "thiserror 2.0.21",
  "tracing",
  "turbine-core",

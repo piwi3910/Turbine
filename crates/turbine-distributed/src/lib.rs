@@ -7,6 +7,8 @@
 #![deny(unsafe_code)]
 
 pub mod collective;
+pub mod expert;
+pub mod pipeline;
 pub mod plan;
 pub mod rank;
 pub mod router;

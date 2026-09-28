@@ -27,6 +27,8 @@ serde.workspace = true
 serde_json.workspace = true
 # Static-mode rank protocol frames (u32 LE length + postcard)
 postcard.workspace = true
+# Expert placement files (`parallel.expert.placement`, YAML like the configuration)
+serde_norway.workspace = true
 
 [[bin]]
 name = "turbine-collbench"
