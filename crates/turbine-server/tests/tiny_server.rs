@@ -60,6 +60,11 @@ fn free_addr() -> SocketAddr {
 }
 
 fn spawn(config: &Path) -> Child {
+    spawn_with_env(config, &[])
+}
+
+/// [`spawn`] with more environment variables.
+fn spawn_with_env(config: &Path, env: &[(&str, String)]) -> Child {
     Command::new(env!("CARGO_BIN_EXE_turbine-server"))
         .arg("--config")
         .arg(config)
@@ -67,6 +72,7 @@ fn spawn(config: &Path) -> Child {
         .env_remove("TURBINE_KERNEL_LIBRARY")
         .env(SEND_BUFFER_ENV, HELD_SOCKET_BUFFER.to_string())
         .env("RUST_LOG", "info")
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -128,6 +134,8 @@ struct Setup<'a> {
     capture_logs: bool,
     /// Serve the tiny OLMoE (8 experts top-2, `tiny-olmoe`) instead of the tiny Llama.
     olmoe: bool,
+    /// More environment variables for the server.
+    env: &'a [(&'a str, String)],
 }
 
 impl Default for Setup<'_> {
@@ -142,6 +150,7 @@ impl Default for Setup<'_> {
             template_with_tools: true,
             capture_logs: false,
             olmoe: false,
+            env: &[],
         }
     }
 }
@@ -239,7 +248,7 @@ impl TinyServer {
                 setup.extra,
             );
             std::fs::write(&config, yaml).unwrap();
-            let mut child = spawn(&config);
+            let mut child = spawn_with_env(&config, setup.env);
             let logs = drain_stderr(&mut child);
             match wait_until_ready(&mut child, addr, &logs) {
                 Ready::Serving => {
@@ -3183,6 +3192,78 @@ fn tp2_admission_reserves_on_both_ranks() {
     });
 }
 
+/// P5 Task 28 (decision "P5: collective failure recovery" B): a tp 2 server on the cpu backend
+/// whose host collective fails one all-reduce mid-generation (the host backend's test-only
+/// failure file) ends the in-flight stream with `replica_failed` and answers `/ready` 503
+/// `circuit_open` (not exit 3); after the cooldown the circuit's probe re-creates the
+/// communicator on both ranks (`event="collective_reinit"`, `recreated`), `/ready` is 200 again
+/// and a greedy completion is identical to the one before the failure. Breaks if a collective
+/// failure is fatal, the group stays failed, or a rank keeps its aborted communicator.
+#[test]
+fn tp2_collective_failure_recovers() {
+    let dir = TempDir::new("turbine-tp2-reinit");
+    let trigger = dir.path().join("fail-one-all-reduce");
+    let env = [(
+        "TURBINE_TEST_HOST_COLLECTIVE_FAIL_FILE",
+        trigger.display().to_string(),
+    )];
+    // The config ends inside `reliability.circuit`: a 2 s cooldown before the probes.
+    let extra = format!("    cooldown: 2s\n{TP2}");
+    let server = TinyServer::launch(&Setup {
+        server_extra: HOLD_PAUSED,
+        extra: &extra,
+        max_positions: Some(LONG_POSITIONS),
+        capture_logs: true,
+        env: &env,
+        ..Setup::default()
+    });
+    let greedy = || -> Vec<u32> {
+        let body = json!({"model": server.model, "prompt": "Once upon a time", "max_tokens": 16,
+                          "ignore_eos": true, "temperature": 0, "logprobs": 0,
+                          "return_tokens_as_token_ids": true});
+        let resp = server.post("/v1/completions", &body);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        choice_token_ids(&resp.json()["choices"][0])
+    };
+    let before = greedy();
+
+    // Mid-generation: the next all-reduce of either rank fails and aborts the group.
+    let stream = OpenStream::open(server.addr, &server.long_stream_body(), true);
+    std::fs::write(&trigger, b"fail").unwrap();
+    let data = stream.read_rest();
+    assert_eq!(data.last().map(String::as_str), Some("[DONE]"), "{data:?}");
+    let err: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
+    assert_eq!(err["error"]["code"], "replica_failed", "{err}");
+    assert!(!trigger.exists(), "the failure was injected");
+    let ready = server.get("/ready");
+    assert_eq!(ready.status, 503, "{}", ready.body);
+    assert_eq!(ready.json()["reason"], "circuit_open", "{}", ready.body);
+
+    // The probe re-creates the communicator; a probe slower than twice the baseline (a loaded
+    // test host) fails and the cycle repeats, so allow a few.
+    wait_for(
+        Duration::from_secs(90),
+        "/ready 200 after the re-creation",
+        || server.get("/ready").status == 200,
+    );
+    let logs = server.logs.as_ref().unwrap().lock().unwrap().clone();
+    assert!(
+        logs.contains("collective_reinit") && logs.contains("recreated"),
+        "no re-creation logged:\n{logs}"
+    );
+    assert_eq!(
+        greedy(),
+        before,
+        "the re-created group gives the same tokens"
+    );
+    let metrics = server.metrics();
+    let recovered = sample(
+        &metrics,
+        r#"turbine_circuit_transitions_total{from="PROBING",to="HEALTHY",reason="probes_succeeded"}"#,
+    );
+    assert_eq!(recovered, Some(1.0), "{metrics}");
+}
+
 /// P5 S-6, `/ready` and data parallelism of tensor-parallel groups: dp 2 × tp 2 on the cpu
 /// backend (two groups of two rank threads, the host devices shared) serves 8 concurrent
 /// requests on both replicas with tp 1's tokens. Breaks if replicas of groups share a
@@ -3346,4 +3427,144 @@ fn ep2_serves_like_ep1() {
             two.blocks_used() == 0
         });
     }
+}
+
+/// Pipeline parallelism of 2 on the cpu backend: two stage threads over the host collective
+/// (P5 S-10), one layer of the tiny checkpoints each.
+const PP2: &str = "parallel:\n  pipeline_parallel_size: 2\n  collective_backend: host\n";
+
+/// P5 S-10 (plan Task 24): the tiny Llama and the tiny OLMoE served at pp 2 — stage 0 on its
+/// own thread and host device 0, the last stage on the engine thread and host device 1, each
+/// its own KV pool of its layer — complete greedy prompts with exactly pp 1's tokens, alone and
+/// 8 at a time, with 1 and 2 micro-batches in flight; `/turbine/v1/status` shows `pp` 2 and the
+/// group's stages with their layers, `/turbine/v1/scheduler` the `pipeline` section, the
+/// pipeline metrics count both stages, and every block is free at the end. Breaks if a stage
+/// runs another stage's layers, a micro-batch's tokens go to another's requests, or blocks
+/// leak.
+#[test]
+fn pp2_serves_like_pp1() {
+    let prompts = [
+        "Hello",
+        "Once upon a time",
+        "The quick brown fox jumps",
+        "1 2 3 4",
+    ];
+    let body = |model: &str, prompt: &str| {
+        json!({"model": model, "prompt": prompt, "max_tokens": 16, "ignore_eos": true,
+               "temperature": 0, "logprobs": 0, "return_tokens_as_token_ids": true})
+    };
+    for olmoe in [false, true] {
+        let launch = |extra: &str| {
+            TinyServer::launch(&Setup {
+                extra,
+                olmoe,
+                ..Setup::default()
+            })
+        };
+        let greedy = |server: &TinyServer, prompt: &str| -> Vec<u32> {
+            let resp = server.post("/v1/completions", &body(&server.model, prompt));
+            assert_eq!(resp.status, 200, "{}", resp.body);
+            choice_token_ids(&resp.json()["choices"][0])
+        };
+        let one = launch("");
+        let want: Vec<Vec<u32>> = prompts.iter().map(|p| greedy(&one, p)).collect();
+        drop(one);
+        for m in [1, 2] {
+            let what = format!("olmoe {olmoe} micro-batches {m}");
+            let extra = format!("{PP2}  pipeline:\n    micro_batches: {m}\n");
+            let two = launch(&extra);
+            for (prompt, want) in prompts.iter().zip(&want) {
+                assert_eq!(&greedy(&two, prompt), want, "{what}: {prompt:?}");
+            }
+            let workers: Vec<_> = (0..8)
+                .map(|i| {
+                    let (addr, b) = (two.addr, body(&two.model, prompts[i % 4]).to_string());
+                    std::thread::spawn(move || request(addr, "POST", "/v1/completions", Some(&b)))
+                })
+                .collect();
+            for (i, w) in workers.into_iter().enumerate() {
+                let resp = w.join().unwrap();
+                assert_eq!(resp.status, 200, "{what} request {i}: {}", resp.body);
+                let got = choice_token_ids(&resp.json()["choices"][0]);
+                assert_eq!(got, want[i % 4], "{what} request {i}");
+            }
+
+            assert_eq!(two.get("/ready").status, 200);
+            let parallel = &two.get("/turbine/v1/status").json()["parallel"];
+            assert_eq!(
+                (&parallel["pp"], &parallel["tp"], &parallel["ep"]),
+                (&json!(2), &json!(1), &json!(1)),
+                "{parallel}"
+            );
+            let stages = &parallel["groups"][0]["stages"];
+            assert_eq!(stages[0]["device"], 0, "{parallel}");
+            assert_eq!(stages[0]["layers"], json!([0, 0]), "{parallel}");
+            assert_eq!(stages[1]["device"], 1, "{parallel}");
+            assert_eq!(stages[1]["layers"], json!([1, 1]), "{parallel}");
+            let reasons = parallel["plan_reasons"].as_array().unwrap();
+            for code in ["pp_partition_cost_balanced", "backend:host"] {
+                assert!(reasons.contains(&json!(code)), "{what}: {parallel}");
+            }
+            let pipeline = &two.scheduler()["pipeline"];
+            assert_eq!(pipeline["micro_batches"], m, "{pipeline}");
+            assert_eq!(
+                pipeline["stages"].as_array().unwrap().len(),
+                2,
+                "{pipeline}"
+            );
+            let metrics = two.metrics();
+            for stage in ["0", "1"] {
+                let series =
+                    format!("turbine_pipeline_stage_duration_seconds_count{{stage=\"{stage}\"}}");
+                assert!(
+                    sample(&metrics, &series).is_some_and(|n| n > 0.0),
+                    "{what} stage {stage}: {metrics}"
+                );
+            }
+            assert!(
+                sample(&metrics, "turbine_pipeline_bubble_ratio").is_some(),
+                "{metrics}"
+            );
+            wait_for(Duration::from_secs(10), "every block free", || {
+                two.blocks_used() == 0
+            });
+        }
+    }
+}
+
+/// P5 S-10, "cancellation frees blocks on every stage": at pp 2 with 2 micro-batches, dropping
+/// held streams frees their blocks promptly — the engine's pool (the last stage's) is the only
+/// block manager and every stage's pool is indexed by its block ids, so a freed block is free
+/// on both stages — and the surviving streams finish normally. Breaks if a cancelled sequence
+/// keeps its blocks or the pipeline stalls after the cancellation.
+#[test]
+fn pp2_cancellation_frees_blocks() {
+    let server = TinyServer::start_long_with(
+        HOLD_PAUSED,
+        &format!("{PP2}  pipeline:\n    micro_batches: 2\n"),
+    );
+    let mut streams: Vec<OpenStream> = (0..4).map(|_| server.hold_stream()).collect();
+    wait_for(Duration::from_secs(60), "all 4 streams paused", || {
+        let doc = server.scheduler();
+        doc["paused"] == 4 && doc["waiting"] == 0
+    });
+    let all4 = server.blocks_used();
+    let kept = streams.split_off(2);
+    drop(streams);
+    wait_for(
+        Duration::from_secs(5),
+        "dropped clients' blocks freed",
+        || {
+            let doc = server.scheduler();
+            doc["paused"] == 2 && running(&doc) == 2
+        },
+    );
+    let remaining = server.blocks_used();
+    assert!(remaining + 2 <= all4, "{remaining} of {all4}");
+    for s in kept {
+        assert_eq!(stream_finish_reason(&s.read_rest()), "length");
+    }
+    wait_for(Duration::from_secs(5), "every block free", || {
+        server.blocks_used() == 0
+    });
 }

@@ -22,6 +22,7 @@
 pub(crate) mod deadlines;
 pub(crate) mod grammar;
 mod r#loop;
+pub(crate) mod pp;
 pub(crate) mod requests;
 pub(crate) mod stages;
 pub(crate) mod tp;
@@ -201,11 +202,14 @@ pub(crate) fn copy_device(prepared: &PreparedModel) -> CopyDevice {
 /// pool and the emergency reserve, warms up, starts the telemetry sampler and the pressure
 /// controller, marks the backend ready and then serves until the command channel closes or
 /// `Shutdown`. With `group` (P5 S-6) `prepared` is rank 0 of a tensor-parallel group, loaded with
-/// its workers ([`tp::load_group`]). Failures are reported on `fatal`.
+/// its workers ([`tp::load_group`]); with `pipeline` (P5 S-10) it is the last stage of a
+/// pipeline, loaded with the earlier stages ([`pp::load_pipeline`]), and the engine keeps up to
+/// `parallel.pipeline.micro_batches` micro-batches in flight. Failures are reported on `fatal`.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     prepared: PreparedModel,
     group: Option<tp::TpGroupStart>,
+    pipeline: Option<pp::PipelineStart>,
     backend: Arc<ModelBackend>,
     metrics: EngineMetrics,
     startup: ReliabilityStartup,
@@ -233,9 +237,23 @@ pub fn spawn(
                 }
             };
             let warmup_token = prepared.generation.bos_token_id.unwrap_or(0);
-            let loaded = match group {
-                None => model::load(&prepared, warmup_token, &metrics.model, &startup.metrics),
-                Some(group) => {
+            let stats = pipeline.as_ref().map(|p| Arc::clone(&p.stats));
+            let loaded = match (group, pipeline) {
+                (_, Some(pipeline)) => {
+                    let phase = |reason| backend.set_loading(reason);
+                    pp::load_pipeline(
+                        &prepared,
+                        pipeline,
+                        warmup_token,
+                        &metrics.model,
+                        &startup.metrics,
+                        &phase,
+                    )
+                }
+                (None, None) => {
+                    model::load(&prepared, warmup_token, &metrics.model, &startup.metrics)
+                }
+                (Some(group), None) => {
                     let phase = |reason| backend.set_loading(reason);
                     tp::load_group(
                         &prepared,
@@ -262,7 +280,13 @@ pub fn spawn(
             let mut pool = loaded.pool;
             let device = copy_device(&prepared);
             let l2 = startup.kv.l2.clone();
-            let started = KvOrchestrator::start(
+            // A pipeline's pool is its last stage's; the earlier stages' shards come first.
+            let start_kv = if stats.is_some() {
+                KvOrchestrator::start_pipeline
+            } else {
+                KvOrchestrator::start
+            };
+            let started = start_kv(
                 KvStart {
                     cfg: &startup.kv.cfg,
                     memory_kind: prepared.provider.opened.memory_kind,
@@ -386,7 +410,8 @@ pub fn spawn(
             let scheduler = Scheduler::new(params, Arc::clone(&clock))
                 .with_policy(policy)
                 .with_metrics(metrics.scheduler.clone())
-                .with_gate(parts.gate);
+                .with_gate(parts.gate)
+                .with_micro_batches(stats.as_ref().map_or(1, |s| s.micro_batches));
             let (submit_tx, commands) = mpsc::channel(queue_capacity.max(1));
             let stop = Arc::new(AtomicBool::new(false));
             if let Err(e) = rel::spawn_controller(
@@ -418,6 +443,7 @@ pub fn spawn(
                 timeouts,
                 overlap: overlap_scheduling,
                 reliability: parts.engine,
+                pipeline: stats,
             });
             backend.set_ready(
                 replica,

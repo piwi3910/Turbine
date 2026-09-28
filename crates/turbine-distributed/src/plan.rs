@@ -15,7 +15,17 @@
 //! experts (`ep_moe_only`), divides their count and runs with tp ∈ {1, ep}; a group is
 //! max(tp, ep) ranks (attention replicated at tp = 1, tensor-parallel over the same ranks at
 //! tp = ep) and the plan carries the expert placement ([`expert_placement`]). `ep: auto` is 1:
-//! capacity is tensor parallelism's job (`tp: auto`). Pipeline parallelism is not planned here.
+//! capacity is tensor parallelism's job (`tp: auto`).
+//!
+//! Pipeline parallelism (P5 S-10, S-12): `pipeline_parallel_size` pp > 1 runs with tp = ep = 1
+//! in `local` ranks only (anything else is `combination_unsupported:<modes>`); a group is then
+//! pp devices, one per stage. [`plan_stages`] splits the layers ([`crate::pipeline::partition`]
+//! over [`PipelineCosts::from_shape`], reason `pp_partition_cost_balanced`, or the explicit
+//! `parallel.pipeline.layer_split`, `pp_partition_explicit`) and places each group's stages by
+//! measured host link ([`crate::pipeline::place_stages`], `pp_stage_host_traffic:<device>`; no
+//! measurement: `pp_stage_device_order`); a group's ranks are its stages, in stage order.
+//! `pp: auto` is 1 unless the model and one maximum-length sequence do not fit one device at
+//! tp 1 (`pp_required_for_capacity`, the smallest pp that fits).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -30,12 +40,15 @@ use turbine_device::DeviceInventory;
 use turbine_device::topology::{PathClass, TopologyGraph};
 
 use crate::expert::{EP_KEY, ExpertPlacement};
+use crate::pipeline::{PP_KEY, PipelineCosts, StageReason, StageSpec, partition, place_stages};
 
 /// The process-lifetime multi-GPU plan (P5 §Data).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParallelPlan {
     pub tp: u32,
     pub dp: u32,
+    /// Pipeline stages per group (P5 S-10); > 1 only with tp = ep = 1.
+    pub pp: u32,
     /// Expert-parallel ranks per group (P5 S-11); a group has max(tp, ep) ranks.
     pub ep: u32,
     /// The registered collective backend (`collective_backend` registry).
@@ -48,12 +61,20 @@ pub struct ParallelPlan {
     pub reasons: Vec<PlanReason>,
     /// ep > 1: which rank of a group holds each routed expert (the same for every group).
     pub experts: Option<Arc<ExpertPlacement>>,
+    /// pp > 1: replica 0's stages in stage order (every group has the same layer ranges; group
+    /// `g`'s stage `s` runs on `groups[g].ranks[s].device`); empty otherwise.
+    pub stages: Vec<StageSpec>,
 }
 
 impl ParallelPlan {
-    /// Ranks per group (per DP replica): max(tp, ep).
+    /// Ranks per tensor- or expert-parallel group: max(tp, ep).
     pub fn group_size(&self) -> u32 {
         self.tp.max(self.ep)
+    }
+
+    /// Devices one model instance (one DP replica) spans: pp × max(tp, ep).
+    pub fn replica_size(&self) -> u32 {
+        self.pp.max(1) * self.group_size()
     }
 }
 
@@ -93,6 +114,29 @@ pub enum PlanReason {
     EpMoeOnly,
     /// The collective backend a multi-rank group runs on.
     Backend(&'static str),
+    /// `pipeline_parallel_size: auto` and the model does not fit one device at tp 1.
+    PpRequiredForCapacity,
+    /// The layers were split by estimated stage cost.
+    PpPartitionCostBalanced,
+    /// The layers were split as `parallel.pipeline.layer_split` says.
+    PpPartitionExplicit,
+    /// The stage with the most host-side traffic (the last) is on this device, the fastest
+    /// measured host link.
+    PpStageHostTraffic(DeviceId),
+    /// No host link was measured: the stages follow device order.
+    PpStageDeviceOrder,
+    /// A combination of parallel modes Phase 5 does not run (`pp+tp`, `pp+ep`, `pp+static`,
+    /// `ep+tp`): the code of a refusal (a [`PlanError`]'s reason starts with it).
+    CombinationUnsupported(&'static str),
+}
+
+impl From<&StageReason> for PlanReason {
+    fn from(r: &StageReason) -> PlanReason {
+        match r {
+            StageReason::HostTraffic(d) => PlanReason::PpStageHostTraffic(*d),
+            StageReason::NominalLinks => PlanReason::PpStageDeviceOrder,
+        }
+    }
 }
 
 impl fmt::Display for PlanReason {
@@ -109,6 +153,14 @@ impl fmt::Display for PlanReason {
             PlanReason::Configured => f.write_str("configured"),
             PlanReason::EpMoeOnly => f.write_str("ep_moe_only"),
             PlanReason::Backend(name) => write!(f, "backend:{name}"),
+            PlanReason::PpRequiredForCapacity => f.write_str("pp_required_for_capacity"),
+            PlanReason::PpPartitionCostBalanced => f.write_str("pp_partition_cost_balanced"),
+            PlanReason::PpPartitionExplicit => f.write_str("pp_partition_explicit"),
+            PlanReason::PpStageHostTraffic(d) => write!(f, "pp_stage_host_traffic:{}", d.0),
+            PlanReason::PpStageDeviceOrder => f.write_str("pp_stage_device_order"),
+            PlanReason::CombinationUnsupported(modes) => {
+                write!(f, "combination_unsupported:{modes}")
+            }
         }
     }
 }
@@ -391,6 +443,135 @@ pub fn expert_size(
     Ok(ep)
 }
 
+/// The combinations of parallel modes Phase 5 runs with pipeline stages (S-12): pp > 1 needs
+/// tp = ep = 1 and `local` ranks; anything else is refused naming the key and
+/// `combination_unsupported:<modes>`.
+pub fn check_pipeline_combination(
+    pp: u32,
+    tp: u32,
+    ep: u32,
+    mode: RankMode,
+) -> Result<(), PlanError> {
+    if pp <= 1 {
+        return Ok(());
+    }
+    let refuse = |modes: &'static str, why: &str| {
+        Err(err(
+            PP_KEY,
+            format!("{}: {why}", PlanReason::CombinationUnsupported(modes)),
+        ))
+    };
+    if tp > 1 {
+        return refuse(
+            "pp+tp",
+            "pipeline stages run one device each in Phase 5 (tensor_parallel_size 1)",
+        );
+    }
+    if ep > 1 {
+        return refuse(
+            "pp+ep",
+            "pipeline and expert parallelism do not combine in Phase 5",
+        );
+    }
+    if mode != RankMode::Local {
+        return refuse("pp+static", "pipeline stages run in `local` ranks only");
+    }
+    Ok(())
+}
+
+/// The pipeline-parallel size of `cfg` (module comment): a fixed size (reason `configured`
+/// when > 1), or for `auto` 1 unless `fits(1)` fails at tp = ep = 1, then the smallest pp up to
+/// `devices` that `fits` (`pp_required_for_capacity`). Checked against the other modes.
+fn pipeline_size(
+    cfg: &ParallelConfig,
+    tp: u32,
+    ep: u32,
+    devices: u32,
+    reasons: &mut Vec<PlanReason>,
+    fits: impl Fn(u32) -> bool,
+) -> Result<u32, PlanError> {
+    let pp = match cfg.pipeline_parallel_size {
+        SizeOrAuto::Size(pp) => {
+            if pp > 1 && !reasons.contains(&PlanReason::Configured) {
+                reasons.push(PlanReason::Configured);
+            }
+            pp
+        }
+        SizeOrAuto::Auto if tp == 1 && ep == 1 && !fits(1) => {
+            let pp = (2..=devices.max(1)).find(|&p| fits(p)).ok_or_else(|| {
+                err(
+                    PP_KEY,
+                    format!(
+                        "auto: no pipeline of up to {devices} stages fits the model and one \
+                         maximum-length sequence in the device budget"
+                    ),
+                )
+            })?;
+            reasons.push(PlanReason::PpRequiredForCapacity);
+            pp
+        }
+        SizeOrAuto::Auto => 1,
+    };
+    check_pipeline_combination(pp, tp, ep, cfg.ranks.mode)?;
+    Ok(pp)
+}
+
+/// The pipeline stages of every group of `plan` (P5 S-10; no-op for pp 1): the layers of
+/// `model` split by estimated cost ([`PipelineCosts::from_shape`], `pp_partition_cost_balanced`)
+/// or as `parallel.pipeline.layer_split` says (`pp_partition_explicit`), then each group's
+/// stages placed on its devices by `host_link_gbps` (the measured host link, the slower
+/// direction; `pp_stage_host_traffic:<device>`, or `pp_stage_device_order` unmeasured). Each
+/// group's ranks become its stages in stage order; `plan.stages` holds replica 0's.
+pub fn plan_stages(
+    plan: &mut ParallelPlan,
+    cfg: &ParallelConfig,
+    model: &ModelShape,
+    host_link_gbps: &dyn Fn(DeviceId) -> Option<f64>,
+) -> Result<(), PlanError> {
+    if plan.pp <= 1 {
+        return Ok(());
+    }
+    let split = cfg.pipeline.layer_split.as_deref();
+    let ranges = partition(&PipelineCosts::from_shape(model), plan.pp, split)?;
+    let mut reasons = vec![if split.is_some() {
+        PlanReason::PpPartitionExplicit
+    } else {
+        PlanReason::PpPartitionCostBalanced
+    }];
+    for g in &mut plan.groups {
+        let devices: Vec<DeviceId> = g.ranks.iter().map(|r| r.device).collect();
+        let host = g.ranks.first().map(|r| r.host.clone()).unwrap_or_default();
+        let (stages, why) = place_stages(&ranges, &devices, host_link_gbps)?;
+        let reason = PlanReason::from(&why);
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+        g.ranks = stages
+            .iter()
+            .map(|s| RankSlot {
+                rank: s.stage,
+                device: s.device,
+                host: host.clone(),
+            })
+            .collect();
+        if g.replica.0 == 0 {
+            plan.stages = stages;
+        }
+    }
+    for r in &reasons {
+        tracing::info!(event = "parallel_plan_decision", reason = %r, "parallel plan decision");
+    }
+    tracing::info!(
+        event = "pipeline_stages",
+        pp = plan.pp,
+        layers = ?ranges,
+        devices = ?plan.stages.iter().map(|s| s.device.0).collect::<Vec<_>>(),
+        "pipeline stages planned"
+    );
+    plan.reasons.extend(reasons);
+    Ok(())
+}
+
 /// The placement of `num_experts` routed experts of every layer of `moe_layers` over `ep`
 /// ranks (`parallel.expert.placement`: contiguous, or read from its file); `None` for ep 1.
 pub fn expert_placement(
@@ -539,8 +720,22 @@ pub fn plan(
         tp,
         &mut reasons,
     )?;
-    let group = tp.max(ep);
-    let group_key = if ep > tp { EP_KEY } else { TP_KEY };
+    // 2c. Pipeline stages: a replica spans pp × max(tp, ep) devices.
+    let pp = {
+        let budget = pool.iter().map(|c| device_budget(c.id)).min().unwrap_or(0);
+        let whole = per_rank_bytes(1, model);
+        pipeline_size(cfg, tp, ep, distinct, &mut reasons, |pp| {
+            whole.div_ceil(u64::from(pp)) <= budget
+        })?
+    };
+    let group = tp.max(ep) * pp;
+    let group_key = if pp > 1 {
+        PP_KEY
+    } else if ep > tp {
+        EP_KEY
+    } else {
+        TP_KEY
+    };
     if group > distinct {
         return Err(err(
             group_key,
@@ -658,6 +853,7 @@ pub fn plan(
         event = "parallel_plan",
         tp,
         dp,
+        pp,
         ep,
         backend,
         vendor = vendor.as_str(),
@@ -665,9 +861,10 @@ pub fn plan(
         excluded = ?excluded,
         "parallel plan"
     );
-    Ok(ParallelPlan {
+    let mut plan = ParallelPlan {
         tp,
         dp,
+        pp,
         ep,
         backend,
         mode: cfg.ranks.mode,
@@ -676,7 +873,11 @@ pub fn plan(
         groups,
         reasons,
         experts,
-    })
+        stages: Vec::new(),
+    };
+    // 6. Pipeline stages on each group's devices by measured host link (S-10, S-13).
+    plan_stages(&mut plan, cfg, model, &|d| topo.host_link_gbps(d))?;
+    Ok(plan)
 }
 
 /// The plan of a server whose replicas all run on `execution.device`, without consulting the
@@ -685,8 +886,9 @@ pub fn plan(
 /// provider checks when it loads (exit 1). Tensor parallelism needs GPUs, and so do the `rccl`
 /// and `nccl` backends; `auto` sizes resolve to 1. The one exception is the host test path: the
 /// cpu reference backend with an explicitly configured host-memory collective backend
-/// (`parallel.collective_backend: host`) runs tp > 1 ranks as threads, rank `r` of every group
-/// on the host "device" `execution.device + r` (each rank its own host memory).
+/// (`parallel.collective_backend: host`) runs tp > 1 ranks (or pp > 1 stages) as threads, rank
+/// `r` of every group on the host "device" `execution.device + r` (each rank its own host
+/// memory). A pipeline's stages are placed afterwards by [`plan_stages`], which needs the model.
 pub fn plan_execution_device(
     cfg: &ParallelConfig,
     device: DeviceId,
@@ -695,17 +897,25 @@ pub fn plan_execution_device(
 ) -> Result<ParallelPlan, PlanError> {
     let tp = cfg.tensor_parallel_size.fixed().unwrap_or(1);
     let ep = cfg.expert_parallel_size.fixed().unwrap_or(1);
-    let group = tp.max(ep);
+    let pp = cfg.pipeline_parallel_size.fixed().unwrap_or(1);
+    check_pipeline_combination(pp, tp, ep, cfg.ranks.mode)?;
+    let group = tp.max(ep) * pp;
     let host_backend = crate::collective::registry()
         .get(cfg.collective_backend.as_str())
         .is_some_and(|b| b.vendors().is_empty());
     if group != 1 && (vendor.is_some() || !host_backend) {
         return Err(err(
-            if ep > tp { EP_KEY } else { TP_KEY },
+            if pp > 1 {
+                PP_KEY
+            } else if ep > tp {
+                EP_KEY
+            } else {
+                TP_KEY
+            },
             format!(
                 "{group} ranks need {group} GPUs; execution.backend cpu runs one rank per \
-                 group (or tensor- and expert-parallel ranks as threads with \
-                 parallel.collective_backend: host)"
+                 group (or tensor- and expert-parallel ranks and pipeline stages as threads \
+                 with parallel.collective_backend: host)"
             ),
         ));
     }
@@ -720,7 +930,7 @@ pub fn plan_execution_device(
     }
     let dp = cfg.data_parallel_size.fixed().unwrap_or(1);
     let mut reasons = vec![PlanReason::ExecutionDevice];
-    if ep > 1 {
+    if ep > 1 || pp > 1 {
         // The model's experts are checked (and placed) by the server against its config.
         reasons.push(PlanReason::Configured);
     }
@@ -786,6 +996,7 @@ pub fn plan_execution_device(
     Ok(ParallelPlan {
         tp,
         dp,
+        pp,
         ep,
         backend,
         mode: cfg.ranks.mode,
@@ -794,6 +1005,7 @@ pub fn plan_execution_device(
         groups,
         reasons,
         experts: None,
+        stages: Vec::new(),
     })
 }
 
@@ -1379,5 +1591,216 @@ mod tests {
         let e = plan_execution_device(&nccl, DeviceId(0), Some(Vendor::Amd), "h")
             .expect_err("nccl on AMD");
         assert_eq!(e.key, "parallel.collective_backend");
+    }
+
+    /// A GPU's upstream PCIe edge carrying a measured host link.
+    fn upstream(gpu: u32, gbps: f64) -> Edge {
+        Edge {
+            a: format!("pcie:0000:00:01.{gpu}"),
+            b: format!("gpu{gpu}"),
+            path: None,
+            measured_h2d_gbps: Some(gbps),
+            measured_d2h_gbps: Some(gbps),
+            ..link(0, 0, EdgeKind::Pcie, PathClass::Sys)
+        }
+    }
+
+    fn pp_cfg(pp: u32, tp: u32, ep: u32, dp: u32) -> ParallelConfig {
+        ParallelConfig {
+            pipeline_parallel_size: SizeOrAuto::Size(pp),
+            ..ep_cfg(tp, ep, dp)
+        }
+    }
+
+    /// P5 S-12 (plan Task 22): the parallel modes as plan choices on novanas's two GPUs. Refused
+    /// with `combination_unsupported:<modes>` naming `parallel.pipeline_parallel_size`: pp 2
+    /// with tp 2, pp 2 with ep 2 (on OLMoE), pp 2 in `static` ranks; ep 2 on the dense Llama is
+    /// `ep_moe_only` and ep 3 on OLMoE does not divide its experts, both naming
+    /// `parallel.expert_parallel_size`. Accepted with a reason code per choice: tp 2
+    /// (`grouped_by_link:sys`), dp 2 (`vendor_homogeneous`), ep 2 at tp 1 and tp 2
+    /// (`ep_moe_only`) and pp 2 (`configured`, `pp_partition_cost_balanced`, the last stage on
+    /// the faster measured host link `pp_stage_host_traffic:0`, backend `hostmem`, its ranks in
+    /// stage order, the head's stage with fewer layers); an explicit split is
+    /// `pp_partition_explicit`, unmeasured links `pp_stage_device_order`, and pp × dp on four
+    /// GPUs builds two 2-stage groups. Breaks if an unsupported combination plans or a PP plan
+    /// loses its stages or reasons.
+    #[test]
+    fn parallel_modes() {
+        let novanas = inventory(vec![
+            gpu(0, Vendor::Amd, "gfx1201"),
+            gpu(1, Vendor::Amd, "gfx1201"),
+        ]);
+        let measured = graph(vec![
+            link(0, 1, EdgeKind::Pcie, PathClass::Sys),
+            upstream(0, 13.1),
+            upstream(1, 12.5),
+        ]);
+        let run = |c: &ParallelConfig, m: &ModelShape| plan(&novanas, &measured, c, m, &budget_32g);
+        let refused = |c: &ParallelConfig, m: &ModelShape, key: &str, code: &str| {
+            let e = run(c, m).expect_err(code);
+            assert_eq!(e.key, key, "{code}: {e}");
+            assert!(e.reason.starts_with(code), "{code}: {e}");
+        };
+        refused(
+            &pp_cfg(2, 2, 1, 1),
+            &llama_3b(),
+            PP_KEY,
+            "combination_unsupported:pp+tp",
+        );
+        refused(
+            &pp_cfg(2, 1, 2, 1),
+            &olmoe(),
+            PP_KEY,
+            "combination_unsupported:pp+ep",
+        );
+        let mut stat = pp_cfg(2, 1, 1, 1);
+        stat.ranks.mode = RankMode::Static;
+        refused(
+            &stat,
+            &llama_3b(),
+            PP_KEY,
+            "combination_unsupported:pp+static",
+        );
+        refused(&pp_cfg(1, 1, 2, 1), &llama_3b(), EP_KEY, "ep_moe_only");
+        let e = run(&pp_cfg(1, 1, 3, 1), &olmoe()).expect_err("ep 3");
+        assert_eq!(e.key, EP_KEY);
+        assert!(e.reason.contains("does not divide"), "{e}");
+
+        let accepted = |c: &ParallelConfig, m: &ModelShape, what: &str| {
+            let p = run(c, m).unwrap_or_else(|e| panic!("{what}: {e}"));
+            println!("parallel_modes {what}: {:?}", codes(&p));
+            p
+        };
+        let p = accepted(&pp_cfg(1, 2, 1, 1), &llama_3b(), "tp 2");
+        assert_eq!((p.tp, p.pp, p.replica_size()), (2, 1, 2));
+        assert!(codes(&p).contains(&"grouped_by_link:sys".into()));
+        let p = accepted(&pp_cfg(1, 1, 1, 2), &llama_3b(), "dp 2");
+        assert_eq!((p.dp, devices_of(&p)), (2, vec![vec![0], vec![1]]));
+        assert!(codes(&p).contains(&"vendor_homogeneous".into()));
+        for tp in [1, 2] {
+            let p = accepted(&pp_cfg(1, tp, 2, 1), &olmoe(), "ep 2");
+            assert_eq!((p.ep, p.tp), (2, tp));
+            assert!(codes(&p).contains(&"ep_moe_only".into()));
+        }
+
+        let p = accepted(&pp_cfg(2, 1, 1, 1), &llama_3b(), "pp 2");
+        assert_eq!((p.pp, p.tp, p.ep, p.dp, p.replica_size()), (2, 1, 1, 1, 2));
+        assert_eq!(p.backend, "hostmem");
+        for code in [
+            "configured",
+            "pp_partition_cost_balanced",
+            "pp_stage_host_traffic:0",
+            "backend:hostmem",
+        ] {
+            assert!(codes(&p).contains(&code.to_string()), "{:?}", codes(&p));
+        }
+        assert_eq!(p.stages.len(), 2);
+        assert_eq!(
+            (p.stages[0].device, p.stages[1].device),
+            (DeviceId(1), DeviceId(0))
+        );
+        assert_eq!(p.stages[0].layers.start, 0);
+        assert_eq!(p.stages[0].layers.end, p.stages[1].layers.start);
+        assert_eq!(p.stages[1].layers.end, 28);
+        assert!(p.stages[1].layers.len() < p.stages[0].layers.len());
+        assert!(p.stages[0].embedding && p.stages[1].lm_head);
+        // The group's ranks are its stages, in stage order.
+        assert_eq!(devices_of(&p), vec![vec![1, 0]]);
+        assert_eq!(p.groups[0].ranks[1].rank, 1);
+
+        let mut split = pp_cfg(2, 1, 1, 1);
+        split.pipeline.layer_split = Some(vec![14, 14]);
+        let p = plan(
+            &novanas,
+            &graph(Vec::new()),
+            &split,
+            &llama_3b(),
+            &budget_32g,
+        )
+        .expect("explicit split");
+        assert_eq!(
+            p.stages
+                .iter()
+                .map(|s| s.layers.clone())
+                .collect::<Vec<_>>(),
+            vec![0..14, 14..28]
+        );
+        for code in ["pp_partition_explicit", "pp_stage_device_order"] {
+            assert!(codes(&p).contains(&code.to_string()), "{:?}", codes(&p));
+        }
+        assert_eq!(devices_of(&p), vec![vec![0, 1]]);
+        split.pipeline.layer_split = Some(vec![14, 13]);
+        let e = run(&split, &llama_3b()).expect_err("[14, 13]");
+        assert_eq!(e.key, "parallel.pipeline.layer_split");
+
+        let four = inventory((0..4).map(|i| gpu(i, Vendor::Amd, "gfx1201")).collect());
+        let p = plan(
+            &four,
+            &graph(Vec::new()),
+            &pp_cfg(2, 1, 1, 2),
+            &olmoe(),
+            &budget_32g,
+        )
+        .expect("pp 2 × dp 2");
+        assert_eq!(devices_of(&p), vec![vec![0, 1], vec![2, 3]]);
+
+        // The cpu host path: two stage threads on host devices 0 and 1, placed by the model.
+        use turbine_core::config::ModuleName;
+        let host = ParallelConfig {
+            collective_backend: ModuleName::new("host").unwrap(),
+            ..pp_cfg(2, 1, 1, 1)
+        };
+        let mut p = plan_execution_device(&host, DeviceId(0), None, "h").expect("host pp 2");
+        assert_eq!((p.pp, p.replica_size()), (2, 2));
+        plan_stages(&mut p, &host, &llama_3b(), &|_| None).expect("stages");
+        assert_eq!(devices_of(&p), vec![vec![0, 1]]);
+        assert_eq!(
+            codes(&p),
+            vec![
+                "execution_device",
+                "configured",
+                "backend:host",
+                "pp_partition_cost_balanced",
+                "pp_stage_device_order"
+            ]
+        );
+        let e = plan_execution_device(&pp_cfg(2, 1, 1, 1), DeviceId(0), None, "h")
+            .expect_err("cpu pp without the host backend");
+        assert_eq!(e.key, PP_KEY);
+        let e = plan_execution_device(
+            &ParallelConfig {
+                collective_backend: ModuleName::new("host").unwrap(),
+                ..pp_cfg(2, 2, 1, 1)
+            },
+            DeviceId(0),
+            None,
+            "h",
+        )
+        .expect_err("pp 2 tp 2");
+        assert!(e.reason.starts_with("combination_unsupported:pp+tp"), "{e}");
+    }
+
+    /// `pipeline_parallel_size: auto` is 1 while the model fits one device, else the smallest
+    /// pp that fits (`pp_required_for_capacity`). Breaks if auto splits a fitting model.
+    #[test]
+    fn pipeline_auto_by_capacity() {
+        let novanas = inventory(vec![
+            gpu(0, Vendor::Amd, "gfx1201"),
+            gpu(1, Vendor::Amd, "gfx1201"),
+        ]);
+        let g = graph(Vec::new());
+        let auto = ParallelConfig {
+            pipeline_parallel_size: SizeOrAuto::Auto,
+            ..pp_cfg(1, 1, 1, 1)
+        };
+        let p = plan(&novanas, &g, &auto, &shape(24, 8), &budget_32g).expect("fits");
+        assert_eq!(p.pp, 1);
+        let big = ModelShape {
+            weight_bytes: 40 * GIB,
+            ..shape(24, 8)
+        };
+        let p = plan(&novanas, &g, &auto, &big, &budget_32g).expect("pp for capacity");
+        assert_eq!(p.pp, 2);
+        assert!(codes(&p).contains(&"pp_required_for_capacity".into()));
     }
 }

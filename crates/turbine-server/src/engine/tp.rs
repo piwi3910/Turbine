@@ -19,9 +19,13 @@
 //! Failures: a failed collective or a failed rank aborts the group's communicator, so no rank
 //! waits out the op timeout, and the step returns [`ModelError::Collective`]: the engine fails
 //! the iteration's requests with `replica_failed` and opens the circuit (`collective_failed`).
-//! A worker's sticky device error is returned as that error, so the process still exits 3. The
-//! communicator is not re-created: the replica stays failed until the process restarts (the
-//! circuit's probes fail against the aborted communicator).
+//! A worker's sticky device error is returned as that error, so the process still exits 3.
+//! Anything else marks the group broken, and its next step — the circuit's probe after the
+//! cooldown — first re-creates the communicator (P5 Task 28, decision "P5: collective failure
+//! recovery" B): a fresh unique id, `Reinit` to every worker (a failed worker thread or process
+//! stays up for it), every rank opening its rank of the new group at once, each bounded by the
+//! init timeout, and every executor on its new communicator (`ModelExecutor::set_collective`).
+//! A failed re-creation fails the probe; the next probe tries again.
 //!
 //! Loading ([`load_group`]): every rank loads on its own thread at once — the communicator init
 //! is collective — measures the communicator's device memory (the drop of free memory across the
@@ -129,6 +133,38 @@ struct Mirror {
     ledger: Arc<Ledger>,
 }
 
+/// Fault injection (the `fault-injection` build only, P5 Task 28 lab test): when this
+/// environment variable names a file, the first worker-rank step that finds the file deletes it
+/// and aborts that rank's communicator before its forward — a collective failure mid-generation
+/// on any backend.
+#[cfg(feature = "fault-injection")]
+pub(crate) const ABORT_FILE_ENV: &str = "TURBINE_FAULT_TP_ABORT_FILE";
+
+/// True once per appearance of the [`ABORT_FILE_ENV`] file.
+#[cfg(feature = "fault-injection")]
+fn abort_injected() -> bool {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os(ABORT_FILE_ENV).map(Into::into))
+        .as_ref()
+        .is_some_and(|p| std::fs::remove_file(p).is_ok())
+}
+
+/// A failure at the rank runtime as the collective failure the engine reports
+/// (`replica_failed`, circuit `collective_failed`).
+fn collective_error(e: RankError) -> ModelError {
+    ModelError::Collective(match e {
+        RankError::Closed { rank } | RankError::Executor { rank, .. } => {
+            CollectiveError::RemoteAbort {
+                rank: rank as usize,
+            }
+        }
+        other => CollectiveError::Backend {
+            code: -1,
+            message: other.to_string(),
+        },
+    })
+}
+
 /// A mirror's KV-pool change on the rank link (the mirror reserves only KV: group admission).
 fn wire_change(op: LedgerOp) -> Option<LedgerChange> {
     match op {
@@ -173,7 +209,15 @@ pub(crate) struct TpExecutor {
     check_every: u64,
     unsent: Vec<RankLedger>,
     _mirror_held: Vec<Reservation>,
+    /// How rank 0 opens its communicator again; `None`: the group cannot be re-created.
+    comm: Option<CommSpec>,
+    /// A collective failed: the next step re-creates the communicator first (P5 Task 28).
+    broken: bool,
 }
+
+/// How long the leader waits for the workers' answers to a re-init beyond the communicator
+/// init timeout (an NCCL-API init that never returns is abandoned 5 s after it).
+const REINIT_MARGIN: Duration = Duration::from_secs(10);
 
 impl TpExecutor {
     pub(crate) fn new(
@@ -193,7 +237,15 @@ impl TpExecutor {
             check_every: MIRROR_CHECK_STEPS,
             unsent: Vec::new(),
             _mirror_held: Vec::new(),
+            comm: None,
+            broken: false,
         }
+    }
+
+    /// Re-creates a failed communicator with `comm` (P5 Task 28).
+    fn with_comm(mut self, comm: CommSpec) -> TpExecutor {
+        self.comm = Some(comm);
+        self
     }
 
     /// Reports `experts` after every forward (expert parallelism).
@@ -257,21 +309,93 @@ impl TpExecutor {
             return sticky;
         }
         tracing::error!(event = "tp_rank_failed", error = %e, "a tensor-parallel rank failed");
-        ModelError::Collective(match e {
-            RankError::Closed { rank } | RankError::Executor { rank, .. } => {
-                CollectiveError::RemoteAbort {
-                    rank: rank as usize,
-                }
-            }
-            other => CollectiveError::Backend {
-                code: -1,
-                message: other.to_string(),
-            },
-        })
+        collective_error(e)
     }
 
-    /// Hands `plan` to the workers, runs `own` on rank 0 and waits until every worker is idle.
+    /// Re-creates the group's failed communicator (P5 Task 28, decision "P5: collective failure
+    /// recovery" B): a fresh unique id, every worker opening its rank of the new group while
+    /// rank 0 opens its own — each bounded by the init timeout — and every rank's executor on
+    /// its new communicator. The circuit breaker's probe is the step that runs this; a failure
+    /// leaves the group broken for the next probe.
+    fn recover(&mut self) -> Result<(), ModelError> {
+        if let Some(sticky) = self.sticky_fault() {
+            return Err(sticky);
+        }
+        let Some(comm) = self.comm.clone() else {
+            return Err(ModelError::Collective(CollectiveError::Backend {
+                code: -1,
+                message: "this group cannot re-create its communicator".into(),
+            }));
+        };
+        let started = Instant::now();
+        let failed = |why: &str, e: &dyn std::fmt::Display| {
+            tracing::warn!(
+                event = "collective_reinit",
+                outcome = "failed",
+                reason = why,
+                error = %e,
+                "re-creating the tensor-parallel communicator failed; the next probe retries"
+            );
+        };
+        let unique_id = comm.library.unique_id().map_err(|e| {
+            failed("unique_id", &e);
+            ModelError::Collective(e)
+        })?;
+        if let Err(e) = self.runtime.reinit_begin(unique_id) {
+            failed("rank_gone", &e);
+            return Err(collective_error(e));
+        }
+        let opened = comm.open(unique_id);
+        let answered = self.runtime.reinit_wait(comm.init_timeout + REINIT_MARGIN);
+        let c = match (opened, answered) {
+            (Ok(c), Ok(())) => c,
+            (Ok(c), Err(e)) => {
+                c.abort();
+                failed("worker_init", &e);
+                return Err(collective_error(e));
+            }
+            (Err(e), _) => {
+                failed("leader_init", &e);
+                return Err(ModelError::Collective(e));
+            }
+        };
+        if let Err(e) = self.leader.set_collective(Arc::clone(&c)) {
+            c.abort();
+            failed("executor", &e);
+            return Err(e);
+        }
+        self.collective = c;
+        lock(&self.faults).take();
+        self.broken = false;
+        tracing::info!(
+            event = "collective_reinit",
+            outcome = "recreated",
+            backend = self.collective.backend(),
+            seconds = started.elapsed().as_secs_f64(),
+            "tensor-parallel communicator re-created on every rank"
+        );
+        Ok(())
+    }
+
+    /// Hands `plan` to the workers, runs `own` on rank 0 and waits until every worker is idle;
+    /// a group whose collective failed is re-created first. A failed collective marks it
+    /// broken.
     fn run<T>(
+        &mut self,
+        plan: StepPlan,
+        own: impl FnOnce(&mut dyn ModelExecutor) -> Result<T, ModelError>,
+    ) -> Result<T, ModelError> {
+        if self.broken {
+            self.recover()?;
+        }
+        let result = self.run_once(plan, own);
+        if matches!(result, Err(ModelError::Collective(_))) {
+            self.broken = true;
+        }
+        result
+    }
+
+    fn run_once<T>(
         &mut self,
         mut plan: StepPlan,
         own: impl FnOnce(&mut dyn ModelExecutor) -> Result<T, ModelError>,
@@ -374,6 +498,8 @@ pub(crate) struct WorkerRank {
     reduce: bool,
     /// `static` mode: its real ledger following the leader's mirror (module comment).
     mirror: Option<MirrorCheck>,
+    /// How it opens its communicator again (P5 Task 28); `None`: it cannot.
+    comm: Option<CommSpec>,
     /// Its ledger, reservations and emergency reserve, held while the rank runs.
     _keep: Box<dyn Send>,
 }
@@ -443,6 +569,7 @@ impl WorkerRank {
             collective,
             faults,
             mirror: None,
+            comm: None,
             _keep: keep,
         }
     }
@@ -455,6 +582,17 @@ impl WorkerRank {
         }
         if plan.sequences.is_empty() {
             return Ok(0);
+        }
+        #[cfg(feature = "fault-injection")]
+        if abort_injected() {
+            // The step's collectives then fail on the aborted communicator, as after a real
+            // mid-generation failure of the backend.
+            tracing::warn!(
+                event = "fault_injection",
+                rank = self.rank,
+                "aborting this rank's communicator"
+            );
+            self.collective.abort();
         }
         let reduce = self.reduce.then_some(RowReduce {
             top_n: 1,
@@ -527,6 +665,29 @@ impl StepExecutor for WorkerRank {
                 })
             }
         }
+    }
+
+    /// Opens this rank of the new group and puts the executor on it (P5 Task 28).
+    fn reinit(&mut self, unique_id: [u8; 128]) -> Result<(), ExecError> {
+        let Some(comm) = &self.comm else {
+            return Err(ExecError::Executor(format!(
+                "rank {} cannot re-create its communicator",
+                self.rank
+            )));
+        };
+        let c = comm.open(unique_id).map_err(ExecError::Collective)?;
+        if let Err(e) = self.exec.set_collective(Arc::clone(&c)) {
+            c.abort();
+            return Err(ExecError::Executor(format!("rank {}: {e}", self.rank)));
+        }
+        self.collective = c;
+        // A static worker's own fault slot: the failure is over.
+        lock(&self.faults).take();
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        self.collective.abort();
     }
 }
 
@@ -640,6 +801,9 @@ pub(crate) struct StaticWorker {
     pub route_max_bytes: Option<u64>,
     pub metrics: CollectiveMetrics,
     pub clock: Arc<dyn Clock>,
+    /// Wraps the loaded executor (`std::convert::identity` in the server; tests inject
+    /// failures).
+    pub wrap: fn(Box<dyn ModelExecutor>) -> Box<dyn ModelExecutor>,
 }
 
 /// A rank after its load, before the group's warm-up.
@@ -652,6 +816,44 @@ struct RankLoaded {
     held: Vec<Reservation>,
     reserve: EmergencyReserve,
     collective: Arc<dyn Collective>,
+    /// How to open the rank's communicator again (P5 Task 28).
+    comm: CommSpec,
+}
+
+/// How one rank opens its communicator of a group: at load and again when a failed group is
+/// re-created (P5 Task 28), each time with the group's new unique id.
+#[derive(Clone)]
+struct CommSpec {
+    library: Arc<dyn CollectiveLibrary>,
+    rank: usize,
+    world: usize,
+    init_timeout: Duration,
+    op_timeout: Duration,
+    route_max_bytes: Option<u64>,
+    clock: Arc<dyn Clock>,
+    metrics: CollectiveMetrics,
+    /// The rank's device memory: its context is entered on the opening thread first (the
+    /// NCCL-API init uses the thread's current device).
+    memory: Arc<dyn DeviceMemory>,
+}
+
+impl CommSpec {
+    /// Opens this rank of the group `unique_id`, bounded by the init timeout.
+    fn open(&self, unique_id: [u8; 128]) -> Result<Arc<dyn Collective>, CollectiveError> {
+        // Reading the free memory makes this thread's current device the rank's.
+        let _ = self.memory.mem_info();
+        Arc::clone(&self.library).open(CollectiveInit {
+            rank: self.rank,
+            world: self.world,
+            unique_id,
+            init_timeout: self.init_timeout,
+            op_timeout: self.op_timeout,
+            clock: Arc::clone(&self.clock),
+            metrics: Some(self.metrics.clone()),
+            memory: Some(Arc::clone(&self.memory)),
+            route_max_bytes: self.route_max_bytes,
+        })
+    }
 }
 
 /// The group's block-count agreement: every rank proposes the blocks its budget holds and all
@@ -763,22 +965,21 @@ fn load_rank(p: &PreparedModel, g: &GroupLoad<'_>) -> Result<RankLoaded, Startup
             .map_err(|e| rank_error(what, &e))
     };
     let before = free("device memory info")?;
-    let collective = Arc::clone(g.library)
-        .open(CollectiveInit {
-            rank: s.rank as usize,
-            world: s.world as usize,
-            unique_id: g.unique_id,
-            init_timeout: g.init_timeout,
-            op_timeout: g.op_timeout,
-            clock: Arc::clone(g.clock),
-            metrics: Some(g.metrics.clone()),
-            memory: Some(Arc::clone(mem)),
-            route_max_bytes: g.route_max_bytes,
-        })
-        .map_err(|e| {
-            g.agreement.fail();
-            rank_error("collective init", &e)
-        })?;
+    let comm = CommSpec {
+        library: Arc::clone(g.library),
+        rank: s.rank as usize,
+        world: s.world as usize,
+        init_timeout: g.init_timeout,
+        op_timeout: g.op_timeout,
+        route_max_bytes: g.route_max_bytes,
+        clock: Arc::clone(g.clock),
+        metrics: g.metrics.clone(),
+        memory: Arc::clone(mem),
+    };
+    let collective = comm.open(g.unique_id).map_err(|e| {
+        g.agreement.fail();
+        rank_error("collective init", &e)
+    })?;
     let collective_bytes = before.saturating_sub(free("device memory info")?);
     tracing::info!(
         event = "tp_rank_collective",
@@ -865,6 +1066,7 @@ fn load_rank(p: &PreparedModel, g: &GroupLoad<'_>) -> Result<RankLoaded, Startup
             held,
             reserve,
             collective: Arc::clone(&collective),
+            comm: comm.clone(),
         })
     })();
     if loaded.is_err() {
@@ -993,14 +1195,16 @@ pub(crate) fn load_group(
             device: super::copy_device(p),
             addresses: BlockAddresses::of(&rank.pool),
         });
-        workers.push(Box::new(WorkerRank::new(
+        let mut worker = WorkerRank::new(
             i as u32 + 1,
             rank.executor,
             rank.pool,
             rank.collective,
             Arc::clone(&faults),
             Box::new((rank.held, rank.reserve, rank.ledger)),
-        )));
+        );
+        worker.comm = Some(rank.comm);
+        workers.push(Box::new(worker));
     }
     // `static` mode: a mirror of every worker's ledger from the budget it reports once loaded
     // (P5 Task 33), admitted through like a `local` rank's ledger.
@@ -1037,7 +1241,8 @@ pub(crate) fn load_group(
     };
     let mut executor = TpExecutor::new(rank0.executor, runtime, rank0.collective, faults)
         .with_experts(group.experts.clone())
-        .with_mirrors(mirrors, check_every, mirror_held);
+        .with_mirrors(mirrors, check_every, mirror_held)
+        .with_comm(rank0.comm);
     let mut pool = rank0.pool;
     phase(NotReadyReason::LoadingModel);
     model::warm_up(&mut executor, &mut pool, warmup_token)?;
@@ -1114,16 +1319,16 @@ pub(crate) fn run_static_worker(
     // P5 Task 33: the leader mirrors this rank's ledger from the budget it reports now.
     link.loaded(rank_budget(&rank.budget, &rank.ledger, &rank.pool))
         .map_err(|e| format!("rank {}: reporting its budget: {e}", s.rank))?;
-    let collective = Arc::clone(&rank.collective);
     let ledger = Arc::clone(&rank.ledger);
     let mut worker = WorkerRank::new(
         s.rank,
-        rank.executor,
+        (start.wrap)(rank.executor),
         rank.pool,
         rank.collective,
         Arc::new(Mutex::new(None)),
         Box::new((rank.held, rank.reserve, rank.ledger)),
     );
+    worker.comm = Some(rank.comm);
     worker.mirror = Some(MirrorCheck {
         replica: LedgerReplica::new(Arc::clone(&ledger), rank.budget.device),
         metrics: reliability.clone(),
@@ -1134,7 +1339,7 @@ pub(crate) fn run_static_worker(
         "worker rank loaded; executing step plans"
     );
     ready(&ledger);
-    link.run(&mut worker, collective.as_ref())
+    link.run(&mut worker)
         .map_err(|e| format!("rank {}: {e}", s.rank))
 }
 
@@ -1267,6 +1472,9 @@ mod tests {
                 return Err((self.error)());
             }
             self.inner.forward(batch)
+        }
+        fn set_collective(&mut self, c: Arc<dyn Collective>) -> Result<(), ModelError> {
+            self.inner.set_collective(c)
         }
         fn copy_blocks(
             &mut self,
@@ -1409,11 +1617,12 @@ mod tests {
     }
 
     /// Starts a [`StaticRun`] over `spec` with `edit` on both ranks' configuration and a
-    /// mirror-ledger check every `check_steps` steps.
+    /// mirror-ledger check every `check_steps` steps, the worker's executor wrapped by `wrap`.
     fn start_static(
         spec: &TinySpec,
         edit: impl Fn(&mut turbine_core::config::Config) + Copy,
         check_steps: u64,
+        wrap: fn(Box<dyn ModelExecutor>) -> Box<dyn ModelExecutor>,
     ) -> StaticRun {
         let (leader, worker) = (prepared_with(spec, 0, edit), prepared_with(spec, 1, edit));
         let library = turbine_distributed::collective::HostBackend
@@ -1455,6 +1664,7 @@ mod tests {
             route_max_bytes: None,
             metrics: CollectiveMetrics::register(&worker_reg),
             clock: Arc::clone(&clock),
+            wrap,
         };
         let worker_reliability = ReliabilityMetrics::register(&worker_reg);
         let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
@@ -1512,7 +1722,7 @@ mod tests {
         let (mut one, one_pool) = one_device(&spec);
         let want = greedy_with_fork(one.as_mut(), &one_pool, &prompt, 5);
 
-        let run = start_static(&spec, |_| {}, MIRROR_CHECK_STEPS);
+        let run = start_static(&spec, |_| {}, MIRROR_CHECK_STEPS, std::convert::identity);
         assert!(
             run.loaded.shards.is_empty(),
             "no tier shards across processes"
@@ -1608,6 +1818,7 @@ mod tests {
             overlap: false,
             reliability: parts.engine,
             kv,
+            pipeline: None,
         });
         (engine, tx, shared, reg)
     }
@@ -1724,7 +1935,7 @@ mod tests {
             c.scheduler.max_running_requests = 32;
             c.model.max_seq_len = Some(256);
         };
-        let run = start_static(&spec, edit, 1);
+        let run = start_static(&spec, edit, 1, std::convert::identity);
         let StaticRun {
             leader,
             loaded,
@@ -1844,6 +2055,58 @@ mod tests {
             worker_ledger.usage(device, PoolKind::Kv),
             mirror.usage(device, PoolKind::Kv),
             "every release reached the worker"
+        );
+    }
+
+    /// A worker executor whose third forward (after the warm-up and a prefill) fails with a plain
+    /// device error before its collectives.
+    fn fail_third(inner: Box<dyn ModelExecutor>) -> Box<dyn ModelExecutor> {
+        Box::new(FailAt {
+            inner,
+            forwards: 0,
+            fail_at: 3,
+            error: || ModelError::Kernel(plain_device_error("injected")),
+        })
+    }
+
+    /// P5 Task 28 in `static` rank mode: a worker process whose step fails stays up (it reports
+    /// the failure and aborts its communicator); the leader's step fails as a collective
+    /// failure, and its next step re-creates the communicator on both ranks (fresh unique id,
+    /// `Reinit` over the rank link) and then runs: the greedy tokens are one device's, the retried
+    /// decode included, and the worker still shuts down cleanly. Breaks if a failed worker exits,
+    /// the group is not re-created or a rank stays on its aborted communicator.
+    #[test]
+    fn static_group_recovers_from_a_failed_step() {
+        let dir = TempDir::new("engine-tp-static-recover");
+        let spec = write_tiny_llama(dir.path(), 11);
+        let prompt: Vec<u32> = (0..10).map(|i| (i * 17 + 3) % spec.vocab).collect();
+        let table = [BlockId(0)];
+        let plen = prompt.len() as u32;
+        let (mut one, one_pool) = one_device(&spec);
+        let want = {
+            let view = one_pool.view();
+            let t0 = step(one.as_mut(), &view, &prompt, 0, &table).unwrap();
+            let t1 = step(one.as_mut(), &view, &[t0], plen, &table).unwrap();
+            let t2 = step(one.as_mut(), &view, &[t1], plen + 1, &table).unwrap();
+            vec![t0, t1, t2]
+        };
+
+        let run = start_static(&spec, |_| {}, MIRROR_CHECK_STEPS, fail_third);
+        let LoadedModel {
+            mut executor, pool, ..
+        } = run.loaded;
+        let view = pool.view();
+        let t0 = step(executor.as_mut(), &view, &prompt, 0, &table).expect("prefill");
+        let err = step(executor.as_mut(), &view, &[t0], plen, &table).expect_err("rank 1 fails");
+        assert!(matches!(err, ModelError::Collective(_)), "{err}");
+        let t1 = step(executor.as_mut(), &view, &[t0], plen, &table).expect("re-created");
+        let t2 = step(executor.as_mut(), &view, &[t1], plen + 1, &table).expect("decode");
+        assert_eq!(vec![t0, t1, t2], want);
+        drop(executor);
+        assert_eq!(
+            run.worker.join().expect("worker thread"),
+            Ok(()),
+            "the failed worker stayed up and shut down cleanly"
         );
     }
 
