@@ -901,6 +901,12 @@ wait_for_pod() {
 			echo "lab-cluster: amd.com/gpu unavailable on novanas"
 			exit 1
 		fi
+		# Unschedulable for another reason (a node taint such as disk pressure): print the
+		# scheduler's own message rather than waiting out the 30 min.
+		if [[ -n "$unschedulable" && "$unschedulable" != *"amd.com/gpu"* && $waited -ge $UNSCHEDULABLE_LIMIT ]]; then
+			cleanup
+			fail "pod of ${job} unschedulable: ${unschedulable}"
+		fi
 		if [[ $waited -ge 1800 ]]; then
 			cleanup
 			fail "pod of ${job} did not start within 30 min (phase: ${phase:-none})"

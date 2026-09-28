@@ -595,3 +595,7 @@ Interfaces:
 - [ ] Implement.
 - [ ] Gate: `scripts/gate.sh`
 - [ ] Commit: `feat(server,distributed,reliability): mirror ledgers for group admission in static rank mode`
+
+## Queued after Phase 5 (not part of this phase)
+
+- Release profile for the lab-test GPU tests (coordinator follow-up 2026-09-28): build the `#[ignore]`d GPU and weights tests of `scripts/lab-test.sh` in a release (or optimised-test) profile so the full tier runs shorter. This is queued for after Phase 5 exit, not now.

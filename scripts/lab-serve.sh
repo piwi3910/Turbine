@@ -286,8 +286,13 @@ wait_for_pod() {
 		fi
 		unschedulable="$(kube "-n ${NS} get pods -l job-name=${JOB} -o jsonpath='{.items[*].status.conditions[?(@.reason==\"Unschedulable\")].message}'" || true)"
 		if [[ -n "$unschedulable" && $waited -ge 120 ]]; then
+			# The scheduler's own reason (a busy amd.com/gpu, or a node taint such as disk
+			# pressure), never a guess.
 			cleanup
-			fail "pod unschedulable for 120 s (${unschedulable}); amd.com/gpu is held by another workload — ask the user to free an R9700"
+			if [[ "$unschedulable" == *"amd.com/gpu"* ]]; then
+				fail "pod unschedulable for 120 s: ${unschedulable} — amd.com/gpu is held; identify the holder, ask the user to free an R9700"
+			fi
+			fail "pod unschedulable for 120 s: ${unschedulable}"
 		fi
 		if [[ $waited -ge 1800 ]]; then
 			cleanup

@@ -359,9 +359,30 @@ wait_for_pod() {
 		phase="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.phase}'" || true)"
 		[[ "$phase" == Running || "$phase" == Succeeded || "$phase" == Failed ]] && return 0
 		unschedulable="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.conditions[?(@.reason==\"Unschedulable\")].message}'" || true)"
+		# Waiting for GPUs held by another Turbine lab Job (label turbine-lab=true) is our own
+		# queue: wait, naming the holders every 5 min, up to TURBINE_LAB_QUEUE_LIMIT.
+		if [[ "$unschedulable" == *"amd.com/gpu"* ]]; then
+			local ours=""
+			ours="$(kube "-n ${NS} get pods -l 'turbine-lab=true,turbine-lab-role in (test,cluster,serve)' --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.labels.job-name} {end}'" || true)"
+			ours="${ours//${job}/}"
+			if [[ -n "${ours// /}" && $waited -lt ${TURBINE_LAB_QUEUE_LIMIT:-10800} ]]; then
+				((waited % 300 == 0)) && say "queued behind our lab Job(s):${ours} (waited ${waited} s)"
+				sleep 5
+				waited=$((waited + 5))
+				continue
+			fi
+		fi
 		if [[ -n "$unschedulable" && $waited -ge 120 ]]; then
+			# The scheduler's own reason (a busy amd.com/gpu, or a node taint such as disk
+			# pressure) and the pod's recent events, never a guess.
+			local events=""
+			events="$(kube "-n ${NS} get events --field-selector involvedObject.kind=Pod --sort-by=.lastTimestamp -o jsonpath='{range .items[*]}{.involvedObject.name}: {.reason}: {.message}{\"\\n\"}{end}'" | grep -F "$job" | tail -n 5 || true)"
+			[[ -n "$events" ]] && printf 'lab-test: novanas: %s\n' "$events" >&2
 			cleanup_novanas
-			fail "pod unschedulable for 120 s (${unschedulable}); ${gpus} amd.com/gpu is not free — another workload holds it; ask the user"
+			if [[ "$unschedulable" == *"amd.com/gpu"* ]]; then
+				fail "pod unschedulable for 120 s: ${unschedulable} — ${gpus} amd.com/gpu is held by a workload that is not a Turbine lab Job; ask the user"
+			fi
+			fail "pod unschedulable for 120 s: ${unschedulable}"
 		fi
 		if [[ $waited -ge 1800 ]]; then
 			cleanup_novanas
