@@ -1844,6 +1844,11 @@ pub struct ExpertPlacement { pub ranks: u32, pub layers: Vec<(u32, Vec<u32>)> /*
 // P5 as built 2026-09-28 — model (turbine_model::ep): EpContext { rank, world, placement: Arc<ExpertPlacement>, collective, stream, counts: Arc<ExpertTokenCounts> }, EpShard { rank, world, attention: EpAttention }, EpAttention { Replicated, TensorParallel },
 //   check, moe_layers, rank_config, kv_layout, weight_slots, available_requirements, workspace_bytes, build_executor(cfg, weights, registry, mem, limits, opts, ep, tp: Option<TpContext>); ExpertTokenCounts::snapshot() -> { per_rank, per_expert, per_layer, top_experts(n) }
 // P5 as built 2026-09-28 — rank protocol v2: StepPlan gains `copies: Vec<(BlockId, BlockId)>` (copy_blocks forks); RankRuntime::wait_idle(); a stopped worker ends the process as `Fatal::RankStopped` (turbine-server); circuit reason `collective_failed` (exit 3 until plan Task 28)
+// P5 as built 2026-09-28 — model (turbine_model::pp): PpContext { stage, stages, layers: Range<u32>, collective, stream }; check_stage, check, stage_config, kv_layout(cfg, layers, block_tokens),
+//   weight_slots(cfg, &StageSpec), requirements, available_requirements, workspace_bytes, build_executor; a stage's ModelShape and KvLayout cover only its layers; only the last stage returns logits
+// P5 as built 2026-09-28 — loader: WeightLoader::load_part(format, index, slots, whole: &[WeightSlot], mem, staging) skips other stages'/ranks' tensors quietly; LoadedWeights.elsewhere: usize
+// P5 as built 2026-09-28 — collective: Collective::send(&self, buf, peer, stream) / recv(&self, buf, peer, stream) on host, hostmem and rccl (ncclSend / ncclRecv; the NCCL-API binding binds 15 symbols);
+//   CollectiveInit gains memory: Option<Arc<dyn DeviceMemory>> and route_max_bytes: Option<u64>
 pub fn plan(inv: &DeviceInventory, topo: &TopologyGraph, cfg: &ParallelConfig, model: &ModelShape, device_budget: &dyn Fn(DeviceId) -> u64) -> Result<ParallelPlan, PlanError>;
 // (P5 T11, contract addition) every replica on `execution.device`, inventory not consulted: the cpu backend (vendor None)
 // and the single-GPU default (tp 1, dp 1, devices auto); tp > 1 and rccl/nccl without a matching vendor are PlanErrors.
