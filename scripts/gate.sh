@@ -19,7 +19,9 @@
 #    #[ignore]d (scripts/lab-test.sh runs those).
 #
 # Prints one line: "gate: ok|FAIL crates=<list> passed=N failed=M". Exit code is the failure
-# (0 on a clean gate, matching the last failing step's exit code otherwise).
+# (0 on a clean gate, matching the last failing step's exit code otherwise). The clippy and test
+# output is also written to target/gate/<timestamp>.log in the checkout; a clean gate deletes
+# it, a failing one keeps it and names it on the FAIL line (" log=<path>").
 set -euo pipefail
 
 usage() {
@@ -53,10 +55,22 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 
 say() { echo "gate: $*" >&2; }
 
-# Prints the final one-line summary and exits with the gate's verdict.
+# The run's clippy and test output, kept when the gate fails (never deleted by a trap).
+GATE_LOG_DIR="$(git rev-parse --show-toplevel)/target/gate"
+mkdir -p "$GATE_LOG_DIR"
+LOG="${GATE_LOG_DIR}/$(date +%Y%m%d-%H%M%S)-$$.log"
+: >"$LOG"
+
+# Prints the final one-line summary and exits with the gate's verdict: a clean gate deletes
+# its log, a failing one keeps it and names it.
 finish() {
-	local status="$1" crates="$2" passed="$3" failed="$4" code="$5"
-	echo "gate: ${status} crates=${crates} passed=${passed} failed=${failed}"
+	local status="$1" crates="$2" passed="$3" failed="$4" code="$5" where=""
+	if [[ $status == ok || ! -s $LOG ]]; then
+		rm -f "$LOG"
+	else
+		where=" log=${LOG}"
+	fi
+	echo "gate: ${status} crates=${crates} passed=${passed} failed=${failed}${where}"
 	exit "$code"
 }
 
@@ -168,7 +182,7 @@ say "crates: ${CRATES_DISPLAY}"
 
 # 2b. clippy, always whole-workspace.
 say "cargo clippy --workspace --all-targets -- -D warnings (on ${HOST})"
-if ! scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings; then
+if ! scripts/remote-cargo.sh clippy --workspace --all-targets -- -D warnings 2>&1 | tee -a "$LOG"; then
 	finish FAIL "$CRATES_DISPLAY" 0 0 1
 fi
 
@@ -194,15 +208,14 @@ else
 	fi
 fi
 
-LOG="$(mktemp)"
-trap 'rm -f "$LOG"' EXIT
 RC=0
+TEST_FROM=$(($(wc -l <"$LOG") + 1))
 if [[ $NEXTEST -eq 1 ]]; then
 	say "cargo nextest run ${TEST_SELECT[*]:-} (on ${HOST})"
-	scripts/remote-cargo.sh nextest run --no-fail-fast "${TEST_SELECT[@]}" 2>&1 | tee "$LOG" || RC=1
+	scripts/remote-cargo.sh nextest run --no-fail-fast "${TEST_SELECT[@]}" 2>&1 | tee -a "$LOG" || RC=1
 else
 	say "cargo test --no-fail-fast ${TEST_SELECT[*]:-} (on ${HOST})"
-	scripts/remote-cargo.sh test --no-fail-fast "${TEST_SELECT[@]}" 2>&1 | tee "$LOG" || RC=1
+	scripts/remote-cargo.sh test --no-fail-fast "${TEST_SELECT[@]}" 2>&1 | tee -a "$LOG" || RC=1
 fi
 
 # grep exits 1 with no match (e.g. nextest omits "N failed" from its summary when nothing failed),
@@ -210,11 +223,13 @@ fi
 # piping to awk, which always prints a count (0 for no input).
 # Under nextest only its `Summary` line counts: a failing test's captured libtest output
 # ("0 passed; 1 failed") would count that test twice.
-COUNTS="$LOG"
+# The counts come from the test output only (the log also holds clippy's).
+COUNTS="$(mktemp)"
+trap 'rm -f "$COUNTS"' EXIT
 if [[ $NEXTEST -eq 1 ]]; then
-	COUNTS="$(mktemp)"
-	trap 'rm -f "$LOG" "$COUNTS"' EXIT
-	(grep -E '^ *Summary \[' "$LOG" || true) >"$COUNTS"
+	(tail -n "+${TEST_FROM}" "$LOG" | grep -E '^ *Summary \[' || true) >"$COUNTS"
+else
+	tail -n "+${TEST_FROM}" "$LOG" >"$COUNTS"
 fi
 PASSED="$( (grep -oE '[0-9]+ passed' "$COUNTS" || true) | awk '{s+=$1} END{print s+0}')"
 FAILED="$( (grep -oE '[0-9]+ failed' "$COUNTS" || true) | awk '{s+=$1} END{print s+0}')"
