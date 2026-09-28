@@ -343,18 +343,23 @@ scenario_tp2() {
 	done
 	collective_report tp2-local
 	stop_servers
+	tp2_variant_leg "$llama"
 
-	# The same tp 2 run over RCCL alone (the default `auto` picks hostmem in local mode), so the
-	# collective's share of a throughput change is visible (plan Task 29).
-	start_server "${WORK}/tp2-rccl.log" "$llama" --set parallel.collective_backend=rccl
-	wait_ready "$URL" "${WORK}/tp2-rccl.log"
-	bench_ok 16 "${WORK}/tp2-rccl-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
-		--requests 16
-	bench_ok 200 "${WORK}/tp2-rccl-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
-		--requests 200
-	jq -r '"tp-bench tp2-rccl-c16 tok/s=\(.output_token_throughput) ttft_p50_ms=\(.ttft_ms.p50) itl_p50_ms=\(.itl_ms.p50) requests_ok=\(.requests_ok)"' \
-		"${WORK}/tp2-rccl-c16-bench.json"
-	stop_servers
+	if [[ $TP2_SKIP_REST -eq 1 ]]; then
+		echo "lab-info: tp2 variant: skip-rest (the rccl and static legs do not run)"
+	else
+		# The same tp 2 run over RCCL alone (the default `auto` picks hostmem in local mode), so the
+		# collective's share of a throughput change is visible (plan Task 29).
+		start_server "${WORK}/tp2-rccl.log" "$llama" --set parallel.collective_backend=rccl
+		wait_ready "$URL" "${WORK}/tp2-rccl.log"
+		bench_ok 16 "${WORK}/tp2-rccl-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+			--requests 16
+		bench_ok 200 "${WORK}/tp2-rccl-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+			--requests 200
+		jq -r '"tp-bench tp2-rccl-c16 tok/s=\(.output_token_throughput) ttft_p50_ms=\(.ttft_ms.p50) itl_p50_ms=\(.itl_ms.p50) requests_ok=\(.requests_ok)"' \
+			"${WORK}/tp2-rccl-c16-bench.json"
+		stop_servers
+	fi
 
 	# OLMoE: a one-GPU capture first (tp 1 on device 0), the reference the tp 2 run is also
 	# compared with, position by position on p10 (plan Task 29: OLMoE tp 2 p10).
@@ -366,7 +371,7 @@ scenario_tp2() {
 	positions_p "$slug" olmoe-tp1 p10
 	stop_servers
 
-	start_server "${WORK}/tp2-olmoe.log" "$olmoe"
+	start_server "${WORK}/tp2-olmoe.log" "$olmoe" ${TP2_VARIANT[@]+"${TP2_VARIANT[@]}"}
 	wait_ready "$URL" "${WORK}/tp2-olmoe.log"
 	gate_vs_capture "$slug" "${WORK}/olmoe-tp1-capture.jsonl" "olmoe tp2 local"
 	positions_p "$slug" olmoe-tp2 p10
@@ -378,6 +383,12 @@ scenario_tp2() {
 	collective_report tp2-olmoe
 	stop_servers
 
+	if [[ $TP2_SKIP_REST -eq 1 ]]; then
+		if [[ ${#GATE_FAILED[@]} -gt 0 ]]; then
+			job_fail "outside tolerance: ${GATE_FAILED[*]}"
+		fi
+		return 0
+	fi
 	# Static mode: one process per rank; rank 1 joins the leader on 127.0.0.1:18100 and serves
 	# only /health, /ready and /metrics on its own port.
 	local static=(--set parallel.ranks.mode=static --set parallel.ranks.leader=127.0.0.1:18100)
@@ -437,6 +448,45 @@ static_tiers_leg() {
 		GATE_FAILED+=("golden llama tp2 static tiers c1 vs 1 GPU")
 	curl -s "${URL}/metrics" | grep -E '^turbine_kv_(demotions|promotions)_total' |
 		sed 's/^/tp-kv tp2-static-tiers-after-golden /' || true
+	stop_servers
+}
+
+# The tp 2 A/B variant (P5 Task 32): an uncommitted scripts/lab/tp2-variant.local in the uploaded
+# tree, one `set <dotted.key>=<value>` per line (and optionally `skip-rest`), adds a leg after
+# tp2-local with those settings — golden c1 / c16 against the one-GPU capture, the standard
+# workload, a `tp-bench tp2-variant-c16 …` line — applies them to the OLMoE tp 2 leg, and with
+# skip-rest leaves out the rccl and static legs. Without the file nothing changes.
+TP2_VARIANT=()
+TP2_SKIP_REST=0
+read_tp2_variant() {
+	local f=scripts/lab/tp2-variant.local line
+	[[ -f $f ]] || return 0
+	while read -r line; do
+		case "$line" in
+		set\ *) TP2_VARIANT+=(--set "${line#set }") ;;
+		skip-rest) TP2_SKIP_REST=1 ;;
+		esac
+	done <"$f"
+	echo "lab-info: tp2 variant: ${TP2_VARIANT[*]:-none} skip_rest=${TP2_SKIP_REST}"
+}
+
+# tp2_variant_leg <config>: the variant leg (above), when a variant is set.
+tp2_variant_leg() {
+	[[ ${#TP2_VARIANT[@]} -gt 0 ]] || return 0
+	local config="$1"
+	start_server "${WORK}/tp2-variant.log" "$config" "${TP2_VARIANT[@]}"
+	wait_ready "$URL" "${WORK}/tp2-variant.log"
+	gate_vs_capture llama-3.2-3b-instruct "${WORK}/llama-tp1-capture.jsonl" "llama tp2 variant"
+	bench_ok 16 "${WORK}/tp2-variant-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 16
+	bench_ok 200 "${WORK}/tp2-variant-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	jq -r '"tp-bench tp2-variant-c16 tok/s=\(.output_token_throughput) ttft_p50_ms=\(.ttft_ms.p50) itl_p50_ms=\(.itl_ms.p50) requests_ok=\(.requests_ok)"' \
+		"${WORK}/tp2-variant-c16-bench.json"
+	curl -s "${URL}/metrics" | grep -E '^turbine_decode_graph' | sed 's/^/tp-graphs tp2-variant /' || true
+	collective_report tp2-variant
+	grep -h -E 'decode_graphs|collective_init' "${WORK}/tp2-variant.log" | head -n 6 |
+		sed 's/^/lab-info: /' || true
 	stop_servers
 }
 
@@ -725,6 +775,7 @@ in_job() {
 	BIN="${CARGO_TARGET_DIR}/release"
 	WORK="$(mktemp -d)"
 	trap 'stop_servers' EXIT
+	read_tp2_variant
 	case "$SCENARIO" in
 	collbench-novanas) scenario_collbench ;;
 	collbench-sweep-novanas) scenario_collbench_sweep ;;
