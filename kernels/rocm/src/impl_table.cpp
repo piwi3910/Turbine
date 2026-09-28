@@ -23,8 +23,13 @@
 //   rope, silu_mul, embedding,   0 turbine_hip [turbine_hip]
 //   add, moe_route, logits_reduce,
 //   row_sumsq, rmsnorm_sharded (v2.6)
+//   qgemm (v2.9)                 0 hipblaslt_fp8 [hipblaslt] (FP8_TENSOR /
+//                                  FP8_CHANNEL weights, FP8_TENSOR /
+//                                  FP8_TOKEN activations)
+//   quantize_act (v2.9)          0 turbine_hip [turbine_hip] (FP8 modes)
 #include <string>
 
+#include "qgemm_impls.hpp"
 #include "turbine_hip.hpp"
 
 namespace turbine_hip {
@@ -205,6 +210,27 @@ const ImplEntry kRmsnormSharded[] = {
           turbine_rmsnorm_sharded>("turbine_hip", kTurbine),
 };
 
+// An implementation given by its supports / run pair (qgemm_impls.hpp).
+template <typename D, bool (*Supports)(const D *),
+          int32_t (*Run)(turbine_ctx *, const D *)>
+struct Impl {
+  static bool supports(const void *d) {
+    return Supports(static_cast<const D *>(d));
+  }
+  static int32_t run(turbine_ctx *ctx, const void *d) {
+    return Run(ctx, static_cast<const D *>(d));
+  }
+};
+
+const ImplEntry kQGemm[] = {
+    entry<Impl<turbine_qgemm_desc, qgemm_fp8_supports, qgemm_fp8_run>>(
+        "hipblaslt_fp8", kHipblaslt),
+};
+const ImplEntry kQuantizeAct[] = {
+    entry<Impl<turbine_quantize_act_desc, quantize_act_fp8_supports,
+               quantize_act_fp8_run>>("turbine_hip", kTurbine),
+};
+
 struct OpImpls {
   const ImplEntry *entries;
   int32_t count;
@@ -233,14 +259,16 @@ const OpImpls kOps[] = {
     of(kLogitsReduce),
     of(kRowSumsq),
     of(kRmsnormSharded),
+    of(kQGemm),
+    of(kQuantizeAct),
 };
-static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_RMSNORM_SHARDED + 1,
+static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_QUANTIZE_ACT + 1,
               "one implementation list per TURBINE_OP_* code");
 
 } // namespace
 
 const ImplEntry *impl_entries(int32_t op, int32_t *count) {
-  if (op < 0 || op > TURBINE_OP_RMSNORM_SHARDED) {
+  if (op < 0 || op > TURBINE_OP_QUANTIZE_ACT) {
     *count = 0;
     return nullptr;
   }

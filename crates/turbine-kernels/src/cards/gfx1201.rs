@@ -81,6 +81,18 @@ pub static GFX1201: CardProfile = CardProfile {
             order: SHARDED_NORM_ORDER,
             row_tiers: &[],
         },
+        // ABI v2.9 (Phase 6a): FP8 W8A8 on hipBLASLt and Turbine's own e4m3 activation
+        // quantization (decision "P6: FP8 GEMM — provider evaluation (kernel reuse rule)").
+        OpPreference {
+            op: OpKind::QGemm,
+            order: &["hipblaslt_fp8"],
+            row_tiers: &[],
+        },
+        OpPreference {
+            op: OpKind::QuantizeAct,
+            order: &["turbine_hip"],
+            row_tiers: &[],
+        },
         OpPreference {
             op: OpKind::AttentionPrefillPaged,
             order: PAGED_ORDER,
