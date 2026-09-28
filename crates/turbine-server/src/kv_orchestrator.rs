@@ -272,14 +272,62 @@ impl KvOrchestrator {
         s: KvStart<'_>,
         pool: &mut BlockPool,
     ) -> Result<(KvOrchestrator, KvHandle), StartupError> {
+        KvOrchestrator::start_with(s, pool, false)
+    }
+
+    /// [`KvOrchestrator::start`] for a pipeline (P5 S-10): `pool` is the last stage's (the
+    /// engine thread's) and `s.shards` are the stages before it, in stage order, each with the
+    /// pool's block count and its own layers' block size. A logical block is every stage's
+    /// shard in stage order — the model's layers in order, byte for byte one device's block —
+    /// so its format is the whole model's ([`kv_format`] of every layer); L1 is one pinned tier
+    /// per stage, each sized to its share of `kv.cpu.max_bytes` by its shard's bytes.
+    pub fn start_pipeline(
+        s: KvStart<'_>,
+        pool: &mut BlockPool,
+    ) -> Result<(KvOrchestrator, KvHandle), StartupError> {
+        KvOrchestrator::start_with(s, pool, true)
+    }
+
+    /// The rank (or stage) shards of a logical block, in order, and its format.
+    fn shards_of(
+        device: CopyDevice,
+        others: Vec<KvShard>,
+        pool: &BlockPool,
+        pipeline: bool,
+    ) -> Result<(Vec<KvShard>, KvFormat), StartupError> {
         let layout = pool.layout();
         let shard_bytes = layout.block_bytes();
-        let mut shards = Vec::with_capacity(1 + s.shards.len());
-        shards.push(KvShard {
-            device: s.device,
+        let own = KvShard {
+            device,
             addresses: BlockAddresses::of(pool),
-        });
-        for (i, shard) in s.shards.into_iter().enumerate() {
+        };
+        if pipeline {
+            let per_layer = (shard_bytes / u64::from(layout.num_layers.max(1))).max(1);
+            let mut layers = layout.num_layers;
+            let mut shards = Vec::with_capacity(1 + others.len());
+            for (stage, shard) in others.into_iter().enumerate() {
+                let (blocks, bytes) = (shard.addresses.blocks(), shard.addresses.block_bytes());
+                if blocks != pool.total_blocks() || bytes == 0 || bytes % per_layer != 0 {
+                    return Err(StartupError::new(format!(
+                        "KV stage {stage}: its pool has {blocks} blocks of {bytes} bytes; the \
+                         last stage's has {} blocks of {per_layer} bytes per layer, and every \
+                         stage needs the same block count",
+                        pool.total_blocks()
+                    )));
+                }
+                layers += (bytes / per_layer) as u32;
+                shards.push(shard);
+            }
+            shards.push(own);
+            let format = kv_format(KvLayout {
+                num_layers: layers,
+                ..layout
+            });
+            return Ok((shards, format));
+        }
+        let mut shards = Vec::with_capacity(1 + others.len());
+        shards.push(own);
+        for (i, shard) in others.into_iter().enumerate() {
             let (blocks, bytes) = (shard.addresses.blocks(), shard.addresses.block_bytes());
             if blocks != pool.total_blocks() || bytes != shard_bytes {
                 return Err(StartupError::new(format!(
@@ -292,7 +340,18 @@ impl KvOrchestrator {
             shards.push(shard);
         }
         let world = shards.len() as u32;
-        let format = tp_kv_format(layout, world);
+        Ok((shards, tp_kv_format(layout, world)))
+    }
+
+    fn start_with(
+        s: KvStart<'_>,
+        pool: &mut BlockPool,
+        pipeline: bool,
+    ) -> Result<(KvOrchestrator, KvHandle), StartupError> {
+        let layout = pool.layout();
+        let (shards, format) = KvOrchestrator::shards_of(s.device, s.shards, pool, pipeline)?;
+        let world = shards.len() as u32;
+        let sizes: Vec<u64> = shards.iter().map(|sh| sh.addresses.block_bytes()).collect();
         if world > 1
             && s.cfg.cpu.enabled
             && s.cfg.cpu.max_bytes.0 / u64::from(world) < L1_SLAB_BYTES
@@ -308,7 +367,7 @@ impl KvOrchestrator {
                  nothing (raise kv.cpu.max_bytes to at least tensor_parallel_size GiB)"
             );
         }
-        // One logical block: every rank's shard of it, in rank order.
+        // One logical block: every rank's (or stage's) shard of it, in order.
         let block_bytes = format.block_bytes();
         let l1 = if !s.cfg.cpu.enabled {
             None
@@ -320,16 +379,20 @@ impl KvOrchestrator {
             })
             .collect::<Option<Vec<_>>>()
         {
-            // Each rank pins its share of `kv.cpu.max_bytes` through its own context.
+            // Each rank (stage) pins its share of `kv.cpu.max_bytes` through its own context,
+            // in proportion to its shard of a block (even shares under tensor parallelism).
+            let total: u64 = sizes.iter().sum::<u64>().max(1);
             let tiers = pinned
                 .into_iter()
-                .map(|p| {
+                .zip(&sizes)
+                .map(|(p, &bytes)| {
                     Arc::new(L1PinnedTier::new(
                         L1Config {
                             enabled: true,
-                            max_bytes: s.cfg.cpu.max_bytes.0 / u64::from(world),
+                            max_bytes: (u128::from(s.cfg.cpu.max_bytes.0) * u128::from(bytes)
+                                / u128::from(total)) as u64,
                             slab_bytes: L1_SLAB_BYTES,
-                            block_bytes: shard_bytes,
+                            block_bytes: bytes,
                             memory_kind: s.memory_kind,
                         },
                         p,
@@ -337,7 +400,7 @@ impl KvOrchestrator {
                     ))
                 })
                 .collect();
-            Some(Arc::new(ShardedL1Tier::new(tiers, shard_bytes)))
+            Some(Arc::new(ShardedL1Tier::with_sizes(tiers, sizes.clone())))
         } else {
             tracing::warn!(
                 event = "kv_l1_disabled_no_pinned_memory",
@@ -404,9 +467,10 @@ impl KvOrchestrator {
             tracing::info!(
                 event = "kv_tier_shards",
                 shards = world,
-                shard_bytes,
+                shard_bytes = ?sizes,
                 block_bytes,
-                "KV tier copies are stored per tensor-parallel rank shard"
+                pipeline,
+                "KV tier copies are stored per tensor-parallel rank (or pipeline stage) shard"
             );
         }
         Ok((o, KvHandle { tx }))
@@ -1075,6 +1139,8 @@ enum Job {
 struct Shard {
     device: CopyDevice,
     addresses: BlockAddresses,
+    /// Bytes of this shard of a block.
+    bytes: usize,
     staging: Vec<HostBuf>,
 }
 
@@ -1096,14 +1162,13 @@ pub struct CopyStreamBackend {
     io: IoPoolBackend,
     /// Bytes of one logical block (every shard).
     block_bytes: usize,
-    /// Bytes of one rank shard.
-    shard_bytes: usize,
     jobs: HashMap<u64, Job>,
 }
 
 impl CopyStreamBackend {
-    /// `shards` in rank order (rank 0 first); `block_bytes` is one logical block, the shards'
-    /// bytes together.
+    /// `shards` in rank (or stage) order; `block_bytes` is one logical block, the shards'
+    /// bytes together. Each shard's part is its pool's block size (the shards of a pipeline's
+    /// stages differ, P5 S-10); a shard without blocks takes an even share.
     pub fn new(
         shards: Vec<KvShard>,
         l1: Option<Arc<ShardedL1Tier>>,
@@ -1114,11 +1179,15 @@ impl CopyStreamBackend {
         io.l1 = l1.clone().map(|t| t as Arc<dyn KvTier>);
         io.l2 = l2.clone();
         io.block_bytes = block_bytes;
-        let shard_bytes = block_bytes / shards.len().max(1);
+        let even = block_bytes / shards.len().max(1);
         CopyStreamBackend {
             shards: shards
                 .into_iter()
                 .map(|s| Shard {
+                    bytes: match s.addresses.block_bytes() {
+                        0 => even,
+                        b => b as usize,
+                    },
                     device: s.device,
                     addresses: s.addresses,
                     staging: Vec::new(),
@@ -1128,7 +1197,6 @@ impl CopyStreamBackend {
             l2,
             io,
             block_bytes,
-            shard_bytes,
             jobs: HashMap::new(),
         }
     }
@@ -1165,10 +1233,10 @@ impl CopyStreamBackend {
                 Some(b) => Ok(b),
                 None => match &shard.device {
                     CopyDevice::Stream { pinned, .. } => pinned
-                        .alloc_pinned(self.shard_bytes)
+                        .alloc_pinned(shard.bytes)
                         .map(HostBuf::Pinned)
                         .map_err(|e| TierError::Io(format!("staging buffer: {e}"))),
-                    CopyDevice::Sync { .. } => Ok(HostBuf::Heap(vec![0; self.shard_bytes])),
+                    CopyDevice::Sync { .. } => Ok(HostBuf::Heap(vec![0; shard.bytes])),
                 },
             };
             match buf {
@@ -1899,6 +1967,137 @@ mod tests {
             o.backend.shards.iter().all(|s| s.staging.len() == 1),
             "each rank's staging buffer went back to that rank"
         );
+    }
+
+    /// A pool of `layers` layers of the test layout on host device `device`.
+    fn stage_rank(device: u32, layers: u32) -> Rank {
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(device), 1 << 30);
+        let pool = BlockPool::new(
+            BlockPoolConfig {
+                layout: KvLayout {
+                    num_layers: layers,
+                    ..layout()
+                },
+                num_blocks: BLOCKS,
+            },
+            Arc::clone(&mem),
+        )
+        .unwrap();
+        (mem, pool)
+    }
+
+    /// P5 S-10 (plan Task 24): a pipeline's stages hold unequal layer counts — stage 0 three
+    /// layers, the last stage (the engine's pool) one — so their shards of a block differ in
+    /// size. The logical block is the stages' shards in stage order (the whole model's layers:
+    /// the format is one device's of 4 layers), each copied on its own stage's copy stream into
+    /// its own L1 tier (sized in proportion) and back; L2 stores the concatenation and gives
+    /// each shard back to its own stage; a stage pool with another block count is refused.
+    /// Breaks if a shard is cut at an even split or lands in the wrong stage.
+    #[test]
+    fn pipeline_stages_round_trip_through_l1_and_l2() {
+        let dir = TempDir::new("turbine-kv-stages");
+        let mut kv = kv_config(&dir, true);
+        kv.cpu.max_bytes = ByteSize(8 * L1_SLAB_BYTES);
+        let whole = KvLayout {
+            num_layers: 4,
+            ..layout()
+        };
+        let reg = MetricsRegistry::new();
+        let metrics = KvMetrics::register(&reg);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let l2 = open_l2(
+            &kv,
+            &kv_format(whole),
+            &identity(),
+            Arc::clone(&clock),
+            metrics.clone(),
+        )
+        .unwrap()
+        .expect("L2 is enabled");
+        let (mem0, pool0) = stage_rank(0, 3);
+        let (mem1, mut pool1) = stage_rank(1, 1);
+        let (mut o, _handle) = KvOrchestrator::start_pipeline(
+            KvStart {
+                cfg: &kv,
+                memory_kind: MemoryKind::Dedicated,
+                identity: identity(),
+                device: stream(&mem1, 1),
+                shards: vec![KvShard {
+                    device: stream(&mem0, 0),
+                    addresses: BlockAddresses::of(&pool0),
+                }],
+                l2: Some(Arc::clone(&l2)),
+                clock,
+                metrics,
+            },
+            &mut pool1,
+        )
+        .expect("the pipeline's KV hierarchy starts");
+        assert_eq!(o.backend.block_bytes as u64, whole.block_bytes());
+        assert!(o.h.l1_enabled(), "L1 calibrated through both stages");
+        let l1 = o.backend.l1.clone().expect("L1");
+        // Each stage's L1 share follows its shard's bytes: both hold about as many blocks.
+        let (c0, c1) = (
+            l1.shards()[0].capacity_bytes() as f64,
+            l1.shards()[1].capacity_bytes() as f64,
+        );
+        assert!((c0 / (3.0 * c1) - 1.0).abs() < 0.01, "{c0} vs {c1}");
+        let ranks = vec![(mem0, pool0), (mem1, pool1)];
+
+        let key = KvKey([6; 16]);
+        let want = fill(&ranks, 2);
+        assert_eq!(want[0].len(), 3 * want[1].len());
+        run(&mut o, 1, TransferPath::L0ToL1, key, 2, 0).unwrap();
+        wipe(&ranks);
+        run(&mut o, 2, TransferPath::L1ToL0, key, 0, 7).unwrap();
+        assert_block(&ranks, 7, &want);
+        run(&mut o, 3, TransferPath::L1ToL2, key, 0, 0).unwrap();
+        let mut blob = vec![0u8; o.backend.block_bytes];
+        l2.get(&key, TierBlockMut::Host(&mut blob)).unwrap();
+        assert_eq!(blob, [want[0].as_slice(), want[1].as_slice()].concat());
+        wipe(&ranks);
+        run(&mut o, 4, TransferPath::L2ToL0, key, 0, 11).unwrap();
+        assert_block(&ranks, 11, &want);
+        let key2 = KvKey([7; 16]);
+        let want2 = fill(&ranks, 3);
+        run(&mut o, 5, TransferPath::L0ToL2, key2, 3, 0).unwrap();
+        wipe(&ranks);
+        run(&mut o, 6, TransferPath::L2ToL0, key2, 0, 12).unwrap();
+        assert_block(&ranks, 12, &want2);
+
+        // A stage pool with another block count is refused.
+        let (mem2, mut last) = stage_rank(2, 1);
+        let (mem3, _) = stage_rank(3, 3);
+        let small = BlockPool::new(
+            BlockPoolConfig {
+                layout: KvLayout {
+                    num_layers: 3,
+                    ..layout()
+                },
+                num_blocks: BLOCKS / 2,
+            },
+            Arc::clone(&mem3),
+        )
+        .unwrap();
+        let err = KvOrchestrator::start_pipeline(
+            KvStart {
+                cfg: &kv_config(&dir, false),
+                memory_kind: MemoryKind::Dedicated,
+                identity: identity(),
+                device: CopyDevice::Sync { mem: mem2 },
+                shards: vec![KvShard {
+                    device: CopyDevice::Sync { mem: mem3 },
+                    addresses: BlockAddresses::of(&small),
+                }],
+                l2: None,
+                clock: Arc::new(SystemClock::new()),
+                metrics: KvMetrics::register(&MetricsRegistry::new()),
+            },
+            &mut last,
+        )
+        .err()
+        .expect("a stage pool with fewer blocks is refused");
+        assert!(err.to_string().contains("KV stage 0"), "{err}");
     }
 
     /// A worker pool that differs from the leader's is refused at startup.
