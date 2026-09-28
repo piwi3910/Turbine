@@ -205,9 +205,9 @@ fn header_declares_the_v24_minor_revision() {
         "2u",
         "v2.4 keeps major 2"
     );
-    // v2.5 (Phase 4), v2.6, v2.7 and v2.8 (Phase 5) raised the minor; the v2.4 group is
-    // unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
+    // v2.5 (Phase 4), v2.6, v2.7 and v2.8 (Phase 5) and v2.9 (Phase 6a) raised the minor; the
+    // v2.4 group is unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
     for (i, op) in OpKind::ALL.iter().enumerate() {
         let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
         assert_eq!(define(&code, &name), i.to_string(), "{name}");
@@ -247,7 +247,7 @@ fn header_declares_the_v25_copy_streams() {
         "v2.5 keeps major 2"
     );
     // v2.6, v2.7 and v2.8 (Phase 5) raised the minor; the v2.5 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
     assert_eq!(define(&code, "TURBINE_COPY_H2D"), "0");
     assert_eq!(define(&code, "TURBINE_COPY_D2H"), "1");
     assert_eq!(define(&code, "TURBINE_COPY_D2D"), "2");
@@ -281,7 +281,7 @@ fn header_declares_the_v26_tensor_parallel_group() {
         "v2.6 keeps major 2"
     );
     // v2.7 and v2.8 raised the minor; the v2.6 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
     assert_eq!(define(&code, "TURBINE_OP_ROW_SUMSQ"), "15");
     assert_eq!(define(&code, "TURBINE_OP_RMSNORM_SHARDED"), "16");
     for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
@@ -324,7 +324,7 @@ fn header_declares_the_v27_host_mapped_group() {
         "v2.7 keeps major 2"
     );
     // v2.8 raised the minor; the v2.7 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
     for (name, value) in [
         ("TURBINE_MAPPED_ALL_REDUCE", "0"),
         ("TURBINE_MAPPED_ALL_GATHER", "1"),
@@ -340,9 +340,9 @@ fn header_declares_the_v27_host_mapped_group() {
         assert_eq!(define(&code, name), value, "{name}");
     }
     assert_eq!(
-        OpKind::ALL.len(),
+        OpKind::ALL.iter().filter(|op| op.abi_minor() <= 7).count(),
         17,
-        "v2.7 adds no op code: TURBINE_OP_RMSNORM_SHARDED stays the last"
+        "v2.7 adds no op code: TURBINE_OP_RMSNORM_SHARDED stays the last before v2.9"
     );
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     for decl in [
@@ -377,8 +377,12 @@ fn header_declares_the_v28_device_sequenced_step() {
         "2u",
         "v2.8 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
-    assert_eq!(OpKind::ALL.len(), 17, "v2.8 adds no op code");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
+    assert_eq!(
+        OpKind::ALL.iter().filter(|op| op.abi_minor() <= 8).count(),
+        17,
+        "v2.8 adds no op code"
+    );
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let decl = "int32_t turbine_mapped_collective_dseq(turbine_ctx *ctx, \
                 const turbine_mapped_collective_desc *d, uint64_t *seq_counter);";
@@ -386,4 +390,78 @@ fn header_declares_the_v28_device_sequenced_step() {
         flat.contains(decl),
         "turbine_kernels.h lacks the v2.8 {decl}"
     );
+}
+
+/// v2.9 (Phase 6a Task 7): the minor becomes 9; the quantized GEMM and activation quantization
+/// trios are declared with op codes 17 and 18, the scheme and activation codes equal the Rust
+/// `abi_code`s, the FP8 dtype codes are 16 and 17, and the paged-attention descriptor gains the
+/// trailing `k_scale` / `v_scale`. Breaks if a code drifts between the header and
+/// `turbine_kernels::quant` (a library would dequantize with the wrong layout).
+#[test]
+fn header_declares_the_v29_quantization_group() {
+    use turbine_core::types::DType;
+    use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
+    let code = strip_comments(&header());
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
+    assert_eq!(define(&code, "TURBINE_OP_QGEMM"), "17");
+    assert_eq!(define(&code, "TURBINE_OP_QUANTIZE_ACT"), "18");
+    assert_eq!(OpKind::QGemm.abi_code(), 17);
+    assert_eq!(OpKind::QuantizeAct.abi_code(), 18);
+    assert_eq!(
+        define(&code, "TURBINE_DTYPE_F8E4M3"),
+        DType::F8E4M3.abi_code().to_string()
+    );
+    assert_eq!(
+        define(&code, "TURBINE_DTYPE_U8"),
+        DType::U8.abi_code().to_string()
+    );
+    for (name, scheme) in [
+        ("TURBINE_QSCHEME_FP8_TENSOR", QuantSchemeDesc::Fp8Tensor),
+        ("TURBINE_QSCHEME_FP8_CHANNEL", QuantSchemeDesc::Fp8Channel),
+        (
+            "TURBINE_QSCHEME_FP8_BLOCK",
+            QuantSchemeDesc::Fp8Block {
+                block_n: 128,
+                block_k: 128,
+            },
+        ),
+        (
+            "TURBINE_QSCHEME_INT4_GROUP_ZP",
+            QuantSchemeDesc::Int4GroupZp { group: 128 },
+        ),
+        (
+            "TURBINE_QSCHEME_INT4_GROUP_SYM",
+            QuantSchemeDesc::Int4GroupSym { group: 128 },
+        ),
+        ("TURBINE_QSCHEME_MXFP4", QuantSchemeDesc::Mxfp4),
+    ] {
+        assert_eq!(define(&code, name), scheme.abi_code().to_string(), "{name}");
+    }
+    for (name, mode) in [
+        ("TURBINE_ACTQ_NONE", ActQuantDesc::None),
+        ("TURBINE_ACTQ_FP8_TENSOR", ActQuantDesc::Fp8Tensor),
+        ("TURBINE_ACTQ_FP8_TOKEN", ActQuantDesc::Fp8Token),
+        (
+            "TURBINE_ACTQ_FP8_GROUP128",
+            ActQuantDesc::Fp8Group { group: 128 },
+        ),
+        ("TURBINE_ACTQ_MXFP4_EMULATED", ActQuantDesc::Mxfp4Emulated),
+    ] {
+        assert_eq!(define(&code, name), mode.abi_code().to_string(), "{name}");
+    }
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for decl in [
+        "int32_t turbine_qgemm(turbine_ctx *ctx, const turbine_qgemm_desc *d);",
+        "int32_t turbine_qgemm_supported(const turbine_qgemm_desc *d);",
+        "const char *turbine_qgemm_impl(const turbine_qgemm_desc *d);",
+        "int32_t turbine_quantize_act(turbine_ctx *ctx, const turbine_quantize_act_desc *d);",
+        "int32_t turbine_quantize_act_supported(const turbine_quantize_act_desc *d);",
+        "const char *turbine_quantize_act_impl(const turbine_quantize_act_desc *d);",
+        "int32_t causal, dtype; float k_scale, v_scale; } turbine_attention_paged_desc;",
+    ] {
+        assert!(
+            flat.contains(decl),
+            "turbine_kernels.h lacks the v2.9 {decl}"
+        );
+    }
 }

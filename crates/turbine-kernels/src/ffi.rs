@@ -186,6 +186,10 @@ pub(crate) struct AttentionPagedDesc {
     pub scale: f32,
     pub causal: i32,
     pub dtype: i32,
+    /// v2.9: per-layer K / V scales of FP8 pages (read only by a library of minor ≥ 9; 1.0
+    /// otherwise).
+    pub k_scale: f32,
+    pub v_scale: f32,
 }
 
 /// `turbine_copy_blocks_desc` (v2). `src_blocks`/`dst_blocks` are host arrays.
@@ -317,6 +321,49 @@ pub(crate) struct RowSumsqDesc {
     pub dtype: i32,
 }
 
+/// `turbine_qgemm_desc` (v2.9).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QGemmDesc {
+    pub a: *const c_void,
+    pub a_scales: *const f32,
+    pub b: *const c_void,
+    pub b_scales: *const c_void,
+    pub b_zeros: *const u8,
+    pub c: *mut c_void,
+    pub m: i64,
+    pub n: i64,
+    pub k: i64,
+    pub lda: i64,
+    pub ldc: i64,
+    pub scheme: i32,
+    pub act_quant: i32,
+    pub a_dtype: i32,
+    pub c_dtype: i32,
+    pub group_size: i32,
+    pub block_n: i32,
+    pub block_k: i32,
+    pub alpha: f32,
+    pub prefill: i32,
+}
+
+/// `turbine_quantize_act_desc` (v2.9).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuantizeActDesc {
+    pub x: *const c_void,
+    pub out: *mut c_void,
+    pub scales: *mut f32,
+    pub rows: i64,
+    pub cols: i64,
+    pub x_stride_row: i64,
+    pub out_stride_row: i64,
+    pub mode: i32,
+    pub static_scale: f32,
+    pub x_dtype: i32,
+    pub out_dtype: i32,
+}
+
 /// `turbine_rmsnorm_sharded_desc` (v2.6).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -444,6 +491,13 @@ pub(crate) struct TensorParallelFns {
     pub rmsnorm_sharded: OpTrio<RmsnormShardedDesc>,
 }
 
+/// The v2.9 quantization group: the `qgemm` and `quantize_act` trios.
+#[derive(Clone, Copy)]
+pub(crate) struct QuantFns {
+    pub qgemm: OpTrio<QGemmDesc>,
+    pub quantize_act: OpTrio<QuantizeActDesc>,
+}
+
 /// The v2.7 host-mapped group: `turbine_host_{alloc,free}_mapped`,
 /// `turbine_host_mapped_device_ptr` and the `mapped_collective` trio.
 #[derive(Clone, Copy)]
@@ -555,6 +609,8 @@ pub(crate) struct V21Symbols {
     pub mapped_dseq: Option<MappedDseqFn>,
     /// v2.8 copy-engine all-reduce (needs the v2.7 group and the v2.3 / v2.5 copy functions).
     pub mapped_dma: Option<MappedDmaFns>,
+    /// v2.9 quantized GEMM and activation quantization (Phase 6a).
+    pub quant: Option<QuantFns>,
 }
 
 impl V21Symbols {
@@ -658,10 +714,20 @@ impl V21Symbols {
                 alloc: optional(lib, "turbine_host_alloc_dma")?,
             })
         })();
+        let quant = (|| {
+            if minor < 9 {
+                return None;
+            }
+            Some(QuantFns {
+                qgemm: optional_trio(lib, "qgemm")?,
+                quantize_act: optional_trio(lib, "quantize_act")?,
+            })
+        })();
         V21Symbols {
             minor,
             mapped_dseq,
             mapped_dma,
+            quant,
             options,
             add_rmsnorm: optional_trio(lib, "add_rmsnorm"),
             logits_reduce: optional_trio(lib, "logits_reduce"),

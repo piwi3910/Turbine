@@ -96,13 +96,11 @@ pub enum ActivationQuant {
 }
 
 impl ActivationQuant {
-    /// The kernel-side mode; `static_scale` is the layer's `input_scale` (static FP8 only).
-    pub fn kernel(self, static_scale: Option<f32>) -> ActQuantDesc {
+    /// The kernel-side mode (the static FP8 scale, `input_scale`, travels with each call).
+    pub fn kernel(self) -> ActQuantDesc {
         match self {
             ActivationQuant::None => ActQuantDesc::None,
-            ActivationQuant::Fp8PerTensorStatic => ActQuantDesc::Fp8Tensor {
-                scale: static_scale.unwrap_or(1.0),
-            },
+            ActivationQuant::Fp8PerTensorStatic => ActQuantDesc::Fp8Tensor,
             ActivationQuant::Fp8PerTokenDynamic => ActQuantDesc::Fp8Token,
             ActivationQuant::Fp8PerGroupDynamic { group } => ActQuantDesc::Fp8Group { group },
             ActivationQuant::Mxfp4Emulated => ActQuantDesc::Mxfp4Emulated,
@@ -360,8 +358,8 @@ mod tests {
         assert_eq!(QuantScheme::Mxfp4.bytes(256, 512), 65_536 + 4096);
         assert_eq!(QuantScheme::Bf16.kernel(), None);
         assert_eq!(
-            ActivationQuant::Fp8PerTensorStatic.kernel(Some(0.5)),
-            ActQuantDesc::Fp8Tensor { scale: 0.5 }
+            ActivationQuant::Fp8PerTensorStatic.kernel(),
+            ActQuantDesc::Fp8Tensor
         );
     }
 }

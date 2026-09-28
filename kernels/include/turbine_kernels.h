@@ -276,6 +276,9 @@ typedef struct turbine_attention_paged_desc {
   int64_t q_stride_token, new_stride_token, out_stride_token;
   float scale;
   int32_t causal, dtype;
+  /* v2.9: per-layer K and V scales of TURBINE_DTYPE_F8E4M3 pages (value =
+   * e4m3 * scale); read only by a library reporting minor >= 9 */
+  float k_scale, v_scale;
 } turbine_attention_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_prefill_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_decode_paged_desc;
@@ -396,8 +399,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * card profile; v2.5 copy streams and asynchronous copies; v2.6 the native
  * stream handle and the sharded RMSNorm ops; v2.7 host-mapped memory and the
  * one-shot collectives over it; v2.8 the device-sequenced (graph-capturable)
- * mapped collective step (all below). */
-#define TURBINE_ABI_MINOR 8u
+ * mapped collective step; v2.9 the quantized GEMM, activation quantization
+ * and FP8 KV scales (all below). */
+#define TURBINE_ABI_MINOR 9u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -872,6 +876,101 @@ int32_t turbine_mapped_all_reduce_dma(turbine_ctx *ctx,
  * engines' rate): the slots of turbine_mapped_all_reduce_dma, addressed by
  * this host pointer. Freed with turbine_host_free_mapped. */
 int32_t turbine_host_alloc_dma(turbine_ctx *ctx, size_t bytes, void **out);
+
+/* ======== v2.9 (additive, optional): quantized GEMM, activation
+ * quantization, FP8 KV scales ========
+ * Phase 6a. Resolved only when turbine_abi_minor() >= 9 and all six trio
+ * functions exist; a library without them serves BF16 weights only, and a
+ * quantized checkpoint is refused at startup (qgemm_unavailable).
+ * turbine_attention_paged_desc's trailing k_scale / v_scale fields are read
+ * only by a library reporting minor >= 9 (dtype TURBINE_DTYPE_F8E4M3 pages).
+ *
+ * Weight layouts (row-major, n output rows x k input columns, what the loader
+ * repacks every checkpoint packaging into; see crates/turbine-kernels/src/
+ * quant.rs):
+ *   FP8 schemes: b = n x k e4m3 bytes; b_scales = F32 [1] (tensor), [n]
+ *     (channel) or [ceil(n/block_n) x ceil(k/block_k)] (block).
+ *   INT4 groups: b = n x k/2 bytes, low nibble = even column; b_scales = F32
+ *     [n x k/group_size]; b_zeros = bytes 0..15 [n x k/group_size] (ZP only;
+ *     SYM uses 8).
+ *   MXFP4: b = n x k/2 bytes of E2M1 codes, low nibble first; b_scales = E8M0
+ *     bytes [n x k/32].
+ * Value of an element: FP8 e4m3(q) * scale; INT4 (q - z) * s; MXFP4
+ * e2m1(q) * 2^(e - 127). */
+#define TURBINE_QSCHEME_FP8_TENSOR 1
+#define TURBINE_QSCHEME_FP8_CHANNEL 2
+#define TURBINE_QSCHEME_FP8_BLOCK 3
+#define TURBINE_QSCHEME_INT4_GROUP_ZP 4
+#define TURBINE_QSCHEME_INT4_GROUP_SYM 5
+#define TURBINE_QSCHEME_MXFP4 6
+/* How a (the activations) arrive: NONE = BF16 (weight-only schemes, and the
+ * MXFP4-emulated activations after turbine_quantize_act); the FP8 modes = a is
+ * e4m3 with a_scales F32 [1] (TENSOR), [m] (TOKEN) or [m x k/128] (GROUP128).
+ */
+#define TURBINE_ACTQ_NONE 0
+#define TURBINE_ACTQ_FP8_TENSOR 1
+#define TURBINE_ACTQ_FP8_TOKEN 2
+#define TURBINE_ACTQ_FP8_GROUP128 3
+#define TURBINE_ACTQ_MXFP4_EMULATED 4
+#define TURBINE_OP_QGEMM 17
+#define TURBINE_OP_QUANTIZE_ACT 18
+
+/* c[m, n] = alpha * a[m, k] . dequant(b)[n, k]^T, F32 accumulation. */
+typedef struct turbine_qgemm_desc {
+  /* [m, k]: BF16 (act_quant NONE) or e4m3 (FP8 modes); row stride lda */
+  const void *a;
+  /* F32 activation scales (FP8 modes), else NULL */
+  const float *a_scales;
+  /* packed weights, layout of scheme */
+  const void *b;
+  /* F32 scales (FP8, INT4) or E8M0 bytes (MXFP4) */
+  const void *b_scales;
+  /* INT4_GROUP_ZP zero points, else NULL */
+  const uint8_t *b_zeros;
+  /* [m, n]: BF16 or F32; row stride ldc */
+  void *c;
+  int64_t m, n, k, lda, ldc;
+  /* TURBINE_QSCHEME_* */
+  int32_t scheme;
+  /* TURBINE_ACTQ_* */
+  int32_t act_quant;
+  /* TURBINE_DTYPE_* of a and c */
+  int32_t a_dtype, c_dtype;
+  /* INT4 group size; FP8 block shape (0 otherwise) */
+  int32_t group_size, block_n, block_k;
+  float alpha;
+  /* 1 when the call belongs to a prefill step (as turbine_gemm's option) */
+  int32_t prefill;
+} turbine_qgemm_desc;
+
+/* Quantizes x[rows, cols] (BF16) per mode into out and scales:
+ *   FP8_TENSOR: out e4m3 = round(x / static_scale), scales[0] = static_scale;
+ *   FP8_TOKEN: per row scale = max(amax / 448, 1 / (448 * 512));
+ *   FP8_GROUP128: per row and 128-column group, the same rule;
+ *   MXFP4_EMULATED: out BF16 = quantize-dequantize of each 32-column group
+ *     to MXFP4 (E8M0 exponent by Quark's 'even' rule, E2M1 round to nearest
+ *     even, saturating at 6); scales = the group scales as F32 powers of 2.
+ * e4m3 rounding: to nearest, ties to even, saturated to +-448. */
+typedef struct turbine_quantize_act_desc {
+  const void *x;
+  void *out;
+  float *scales;
+  int64_t rows, cols, x_stride_row, out_stride_row;
+  /* TURBINE_ACTQ_* (not NONE) */
+  int32_t mode;
+  float static_scale;
+  /* TURBINE_DTYPE_* of x and out */
+  int32_t x_dtype, out_dtype;
+} turbine_quantize_act_desc;
+
+/* v2.9 trios: qgemm, quantize_act. */
+int32_t turbine_qgemm(turbine_ctx *ctx, const turbine_qgemm_desc *d);
+int32_t turbine_qgemm_supported(const turbine_qgemm_desc *d);
+const char *turbine_qgemm_impl(const turbine_qgemm_desc *d);
+int32_t turbine_quantize_act(turbine_ctx *ctx,
+                             const turbine_quantize_act_desc *d);
+int32_t turbine_quantize_act_supported(const turbine_quantize_act_desc *d);
+const char *turbine_quantize_act_impl(const turbine_quantize_act_desc *d);
 
 #ifdef __cplusplus
 }

@@ -47,8 +47,9 @@ use crate::cards::CardProfile;
 use crate::ffi::{
     self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo,
     EmbeddingDesc, GemmDesc, LogitsReduceDesc, MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE,
-    MoeExpertsDesc, MoeRouteDesc, OpTrio, RmsnormDesc, RmsnormShardedDesc, RopeDesc, RowSumsqDesc,
-    ShimSymbols, SiluMulDesc, StagingFns, TurbineCtx, TurbineEvent, TurbineGraph,
+    MoeExpertsDesc, MoeRouteDesc, OpTrio, QGemmDesc, QuantizeActDesc, RmsnormDesc,
+    RmsnormShardedDesc, RopeDesc, RowSumsqDesc, ShimSymbols, SiluMulDesc, StagingFns, TurbineCtx,
+    TurbineEvent, TurbineGraph,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -58,8 +59,9 @@ use crate::ops::{
     KvCopyConfig, KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext,
     LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
     MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
-    ProviderId, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext, RopeKernel,
-    RowSumsqConfig, RowSumsqContext, ShardedNormKernel,
+    ProviderId, QGemmConfig, QGemmContext, QGemmKernel, QuantizeActConfig, QuantizeActContext,
+    QuantizeActKernel, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
+    RopeKernel, RowSumsqConfig, RowSumsqContext, ShardedNormKernel,
 };
 use crate::pinned::PinnedState;
 use crate::registry::OpConfig;
@@ -1551,6 +1553,51 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         scale: 1.0 / (cfg.head_dim.max(1) as f32).sqrt(),
         causal: i32::from(cfg.causal),
         dtype: cfg.dtype.abi_code(),
+        k_scale: 1.0,
+        v_scale: 1.0,
+    }
+}
+
+fn qgemm_probe(cfg: &QGemmConfig) -> QGemmDesc {
+    let (group_size, block_n, block_k) = cfg.scheme.abi_shape();
+    QGemmDesc {
+        a: null(),
+        a_scales: std::ptr::null(),
+        b: null(),
+        b_scales: null(),
+        b_zeros: std::ptr::null(),
+        c: null(),
+        m: 1,
+        n: i64::from(cfg.n),
+        k: i64::from(cfg.k),
+        lda: i64::from(cfg.k),
+        ldc: i64::from(cfg.n),
+        scheme: cfg.scheme.abi_code(),
+        act_quant: cfg.act_quant.abi_code(),
+        a_dtype: cfg.a_dtype.abi_code(),
+        c_dtype: cfg.c_dtype.abi_code(),
+        group_size,
+        block_n,
+        block_k,
+        alpha: 1.0,
+        prefill: 0,
+    }
+}
+
+fn quantize_act_probe(cfg: &QuantizeActConfig) -> QuantizeActDesc {
+    let cols = i64::from(cfg.cols);
+    QuantizeActDesc {
+        x: null(),
+        out: null(),
+        scales: std::ptr::null_mut(),
+        rows: 1,
+        cols,
+        x_stride_row: cols,
+        out_stride_row: cols,
+        mode: cfg.mode.abi_code(),
+        static_scale: 1.0,
+        x_dtype: cfg.x_dtype.abi_code(),
+        out_dtype: cfg.out_dtype.abi_code(),
     }
 }
 
@@ -1754,6 +1801,130 @@ impl ShimProvider {
                 .lib
                 .lacks("the ABI v2.6 row_sumsq / rmsnorm_sharded group")
         })
+    }
+}
+
+impl ShimProvider {
+    /// The v2.9 group; `KernelProvider::qgemm` / `quantize_act` are `Some` exactly when it
+    /// exists.
+    fn quant_fns(&self) -> Result<&ffi::QuantFns, KernelError> {
+        self.syms().v21.quant.as_ref().ok_or_else(|| {
+            self.ctx
+                .lib
+                .lacks("the ABI v2.9 qgemm / quantize_act group")
+        })
+    }
+}
+
+/// A dense view's device pointer, or null for `None`.
+fn optional_ptr(
+    ctx: &ShimContext,
+    name: &str,
+    v: Option<&TensorView<'_>>,
+) -> Result<*const c_void, KernelError> {
+    v.map_or(Ok(null()), |v| {
+        ctx.device_ptr(name, v).map(|p| p as *const c_void)
+    })
+}
+
+impl QGemmKernel for ShimProvider {
+    fn supports(&self, cfg: &QGemmConfig) -> bool {
+        self.quant_fns()
+            .is_ok_and(|f| Self::supported(&f.qgemm, &qgemm_probe(cfg)))
+    }
+
+    fn implementation(&self, cfg: &QGemmConfig) -> String {
+        self.quant_fns()
+            .map(|f| self.implementation_of(OpKind::QGemm, &f.qgemm, &qgemm_probe(cfg)))
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut QGemmContext<'_>) -> Result<(), KernelError> {
+        let fns = self.quant_fns()?;
+        let lda = row_stride("a", &ctx.a, 2)?;
+        let ldc = row_stride("c", &ctx.c, 2)?;
+        let (m, k) = (ctx.a.shape[0], ctx.a.shape[1]);
+        let n = ctx.c.shape[1];
+        if ctx.c.shape[0] != m || ctx.b.shape.first() != Some(&n) {
+            return Err(invalid(format!(
+                "qgemm: a {:?}, b {:?}, c {:?} do not form an m × k by n × k product",
+                ctx.a.shape.as_slice(),
+                ctx.b.shape.as_slice(),
+                ctx.c.shape.as_slice()
+            )));
+        }
+        let (group_size, block_n, block_k) = ctx.cfg.scheme.abi_shape();
+        let d = QGemmDesc {
+            a: self.ctx.device_ptr("a", &ctx.a)?,
+            a_scales: optional_ptr(&self.ctx, "a_scales", ctx.a_scales.as_ref())?.cast(),
+            b: self.ctx.device_ptr("b", &ctx.b)?,
+            b_scales: self.ctx.device_ptr("b_scales", &ctx.b_scales)?,
+            b_zeros: optional_ptr(&self.ctx, "b_zeros", ctx.b_zeros.as_ref())?.cast(),
+            c: self.ctx.device_ptr("c", &ctx.c)?,
+            m: to_i64("m", m)?,
+            n: to_i64("n", n)?,
+            k: to_i64("k", k)?,
+            lda,
+            ldc,
+            scheme: ctx.cfg.scheme.abi_code(),
+            act_quant: ctx.cfg.act_quant.abi_code(),
+            a_dtype: ctx.a.dtype.abi_code(),
+            c_dtype: ctx.c.dtype.abi_code(),
+            group_size,
+            block_n,
+            block_k,
+            alpha: ctx.alpha,
+            prefill: i32::from(ctx.prefill),
+        };
+        self.run(OpKind::QGemm, &fns.qgemm, &d, m)
+    }
+}
+
+impl QuantizeActKernel for ShimProvider {
+    fn supports(&self, cfg: &QuantizeActConfig) -> bool {
+        self.quant_fns()
+            .is_ok_and(|f| Self::supported(&f.quantize_act, &quantize_act_probe(cfg)))
+    }
+
+    fn implementation(&self, cfg: &QuantizeActConfig) -> String {
+        self.quant_fns()
+            .map(|f| {
+                self.implementation_of(
+                    OpKind::QuantizeAct,
+                    &f.quantize_act,
+                    &quantize_act_probe(cfg),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut QuantizeActContext<'_>) -> Result<(), KernelError> {
+        let fns = self.quant_fns()?;
+        let x_stride_row = row_stride("x", &ctx.x, 2)?;
+        let out_stride_row = row_stride("out", &ctx.out, 2)?;
+        let (rows, cols) = (ctx.x.shape[0], ctx.x.shape[1]);
+        if ctx.out.shape.as_slice() != [rows, cols] {
+            return Err(invalid(format!(
+                "quantize_act: out has shape {:?}, expected [{rows}, {cols}]",
+                ctx.out.shape.as_slice()
+            )));
+        }
+        let scales = ctx.cfg.mode.scale_count(rows, cols);
+        dense("scales", &ctx.scales, &[scales], DType::F32)?;
+        let d = QuantizeActDesc {
+            x: self.ctx.device_ptr("x", &ctx.x)?,
+            out: self.ctx.device_ptr("out", &ctx.out)?,
+            scales: self.ctx.device_ptr("scales", &ctx.scales)?.cast(),
+            rows: to_i64("rows", rows)?,
+            cols: to_i64("cols", cols)?,
+            x_stride_row,
+            out_stride_row,
+            mode: ctx.cfg.mode.abi_code(),
+            static_scale: ctx.static_scale,
+            x_dtype: ctx.x.dtype.abi_code(),
+            out_dtype: ctx.out.dtype.abi_code(),
+        };
+        self.run(OpKind::QuantizeAct, &fns.quantize_act, &d, rows)
     }
 }
 
@@ -2090,6 +2261,8 @@ impl AttentionKernel for ShimProvider {
             scale: ctx.scale,
             causal: i32::from(cfg.causal),
             dtype: cfg.dtype.abi_code(),
+            k_scale: 1.0,
+            v_scale: 1.0,
         };
         self.run(cfg.op(), trio, &d, 0)
     }
@@ -2482,6 +2655,20 @@ impl KernelProvider for ShimProvider {
             .is_some()
             .then_some(self as &dyn ShardedNormKernel)
     }
+    fn qgemm(&self) -> Option<&dyn QGemmKernel> {
+        self.syms()
+            .v21
+            .quant
+            .is_some()
+            .then_some(self as &dyn QGemmKernel)
+    }
+    fn quantize_act(&self) -> Option<&dyn QuantizeActKernel> {
+        self.syms()
+            .v21
+            .quant
+            .is_some()
+            .then_some(self as &dyn QuantizeActKernel)
+    }
 
     fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
         self.ctx.lib.implementations(op)
@@ -2575,6 +2762,10 @@ impl KernelProvider for ShimProvider {
                 lib.exports_native_streams()
                     && cfg.full_dim >= cfg.dim
                     && lib.impl_supports(OpKind::RmsnormSharded, index, &rmsnorm_sharded_probe(cfg))
+            }
+            OpConfig::QGemm(cfg) => lib.impl_supports(OpKind::QGemm, index, &qgemm_probe(cfg)),
+            OpConfig::QuantizeAct(cfg) => {
+                lib.impl_supports(OpKind::QuantizeAct, index, &quantize_act_probe(cfg))
             }
         }
     }
@@ -3143,6 +3334,8 @@ mod tests {
             size_of::<RowSumsqDesc>(),
             size_of::<RmsnormShardedDesc>(),
             size_of::<ffi::MappedCollectiveDesc>(),
+            size_of::<ffi::QGemmDesc>(),
+            size_of::<ffi::QuantizeActDesc>(),
         ];
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");
@@ -3475,6 +3668,71 @@ mod tests {
         drop((dev, mem, ctx));
         assert_eq!(live_contexts(&lib), contexts - 1);
         assert_eq!(stub_count(&lib, "stub_live_streams"), 0);
+    }
+
+    /// ABI v2.9 (Phase 6a Task 7): a v2.8 library has no quantized GEMM and no activation
+    /// quantization, is not asked for their op codes, and a quantized config is not supported
+    /// by it; the v2.9 stub resolves both trios (named by the library's `_impl`, unsupported
+    /// like every stub op) and enumerates the new ops. Breaks if the group resolves on an older
+    /// library or is missing on a v2.9 one.
+    #[test]
+    fn optional_groups_v29() {
+        use crate::quant::{ActQuantDesc, QuantSchemeDesc};
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let q_cfg = QGemmConfig {
+            n: 3072,
+            k: 3072,
+            scheme: QuantSchemeDesc::Fp8Channel,
+            act_quant: ActQuantDesc::Fp8Token,
+            a_dtype: DType::F8E4M3,
+            c_dtype: DType::BF16,
+        };
+        let a_cfg = QuantizeActConfig {
+            cols: 3072,
+            mode: ActQuantDesc::Fp8Token,
+            x_dtype: DType::BF16,
+            out_dtype: DType::F8E4M3,
+        };
+
+        let v28 = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V28")), "hip")
+            .expect("a v2.8 library loads");
+        assert_eq!(v28.abi_minor(), 8);
+        let old = v28
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let old_provider = shim_provider(Arc::clone(&old));
+        assert!(old_provider.qgemm().is_none());
+        assert!(old_provider.quantize_act().is_none());
+        assert!(!OpConfig::QGemm(q_cfg).supported_by(old_provider.as_ref()));
+        for op in [OpKind::QGemm, OpKind::QuantizeAct] {
+            assert!(v28.implementations(op).is_empty(), "{op}");
+        }
+        drop((old_provider, old));
+
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V29")), "hip")
+            .expect("a v2.9 library loads");
+        assert_eq!((lib.abi_version(), lib.abi_minor()), (2, 9));
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let provider = shim_provider(Arc::clone(&ctx));
+        let qgemm = provider.qgemm().expect("the v2.9 qgemm family");
+        assert!(!qgemm.supports(&q_cfg));
+        assert_eq!(qgemm.implementation(&q_cfg), "stub_qgemm");
+        let quant = provider
+            .quantize_act()
+            .expect("the v2.9 quantize_act family");
+        assert!(!quant.supports(&a_cfg));
+        assert_eq!(quant.implementation(&a_cfg), "stub_quantize_act");
+        for (op, name) in [
+            (OpKind::QGemm, "stub_qgemm"),
+            (OpKind::QuantizeAct, "stub_quantize_act"),
+        ] {
+            let impls = lib.implementations(op);
+            assert_eq!(impls.len(), 1, "{op}");
+            assert_eq!(impls[0].name, name);
+        }
+        drop((provider, ctx));
     }
 
     /// ABI v2.6 (Phase 5 Task 6): a v2.5 library has no native stream handle (the compute

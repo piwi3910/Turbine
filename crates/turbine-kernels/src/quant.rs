@@ -13,7 +13,7 @@
 //!   bytes. Value = `e2m1(q) × 2^(e − 127)`.
 
 /// A quantized linear layer's weight scheme (`TURBINE_QSCHEME_*`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[non_exhaustive]
 pub enum QuantSchemeDesc {
     /// FP8 e4m3 with one scale for the whole tensor.
@@ -31,6 +31,18 @@ pub enum QuantSchemeDesc {
 }
 
 impl QuantSchemeDesc {
+    /// `group_size`, `block_n`, `block_k` of the C descriptor.
+    pub fn abi_shape(self) -> (i32, i32, i32) {
+        match self {
+            QuantSchemeDesc::Fp8Block { block_n, block_k } => (0, block_n as i32, block_k as i32),
+            QuantSchemeDesc::Int4GroupZp { group } | QuantSchemeDesc::Int4GroupSym { group } => {
+                (group as i32, 0, 0)
+            }
+            QuantSchemeDesc::Mxfp4 => (MX_BLOCK as i32, 0, 0),
+            QuantSchemeDesc::Fp8Tensor | QuantSchemeDesc::Fp8Channel => (0, 0, 0),
+        }
+    }
+
     /// `TURBINE_QSCHEME_*` (0 is BF16, never passed to the quantized GEMM).
     pub fn abi_code(self) -> i32 {
         match self {
@@ -85,14 +97,16 @@ impl QuantSchemeDesc {
 /// Elements sharing one E8M0 exponent in MXFP4.
 pub const MX_BLOCK: usize = 32;
 
-/// How activations are quantized before a quantized GEMM (`TURBINE_ACTQ_*`).
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// How activations are quantized before a quantized GEMM (`TURBINE_ACTQ_*`). The static
+/// per-tensor scale of [`ActQuantDesc::Fp8Tensor`] travels with the call, not the mode, so a
+/// mode is a registry key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[non_exhaustive]
 pub enum ActQuantDesc {
     /// Activations stay BF16 (weight-only schemes).
     None,
     /// FP8 e4m3 with a static per-tensor scale from the checkpoint (`input_scale`).
-    Fp8Tensor { scale: f32 },
+    Fp8Tensor,
     /// FP8 e4m3 with a dynamic scale per row (token): `amax / 448`.
     Fp8Token,
     /// FP8 e4m3 with a dynamic scale per row and group of `group` columns.
@@ -103,11 +117,40 @@ pub enum ActQuantDesc {
 }
 
 impl ActQuantDesc {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActQuantDesc::None => "none",
+            ActQuantDesc::Fp8Tensor => "fp8_tensor",
+            ActQuantDesc::Fp8Token => "fp8_token",
+            ActQuantDesc::Fp8Group { .. } => "fp8_group",
+            ActQuantDesc::Mxfp4Emulated => "mxfp4_emulated",
+        }
+    }
+
+    /// True for the FP8 modes (activations arrive as e4m3 with F32 scales).
+    pub fn is_fp8(self) -> bool {
+        matches!(
+            self,
+            ActQuantDesc::Fp8Tensor | ActQuantDesc::Fp8Token | ActQuantDesc::Fp8Group { .. }
+        )
+    }
+
+    /// Number of activation scales for an `m × k` activation matrix.
+    pub fn scale_count(self, m: usize, k: usize) -> usize {
+        match self {
+            ActQuantDesc::None => 0,
+            ActQuantDesc::Fp8Tensor => 1,
+            ActQuantDesc::Fp8Token => m,
+            ActQuantDesc::Fp8Group { group } => m * k.div_ceil(group as usize),
+            ActQuantDesc::Mxfp4Emulated => m * k.div_ceil(MX_BLOCK),
+        }
+    }
+
     /// `TURBINE_ACTQ_*`.
     pub fn abi_code(self) -> i32 {
         match self {
             ActQuantDesc::None => 0,
-            ActQuantDesc::Fp8Tensor { .. } => 1,
+            ActQuantDesc::Fp8Tensor => 1,
             ActQuantDesc::Fp8Token => 2,
             ActQuantDesc::Fp8Group { .. } => 3,
             ActQuantDesc::Mxfp4Emulated => 4,

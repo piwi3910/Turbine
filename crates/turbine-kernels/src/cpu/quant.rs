@@ -236,23 +236,64 @@ fn dynamic_fp8_scale(values: &[f32]) -> f32 {
     (amax / FP8_E4M3_MAX).max(FP8_MIN_SCALE)
 }
 
+/// Quantizes a row-major `rows × cols` activation matrix to FP8 e4m3 bytes for an FP8 `mode`
+/// and returns `(bytes, scales)`: the same scales and the same rounding as
+/// [`quantize_dequantize_activations`], so `e4m3(byte) × scale` is its result exactly.
+pub fn quantize_activations_fp8(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    mode: ActQuantDesc,
+    static_scale: f32,
+) -> (Vec<u8>, Vec<f32>) {
+    assert!(mode.is_fp8(), "FP8 activation mode");
+    assert_eq!(x.len(), rows * cols, "activation shape");
+    let mut bytes = vec![0u8; x.len()];
+    let mut scales = Vec::with_capacity(mode.scale_count(rows, cols));
+    let group = match mode {
+        ActQuantDesc::Fp8Group { group } => group as usize,
+        _ => cols,
+    };
+    if mode == ActQuantDesc::Fp8Tensor {
+        scales.push(static_scale);
+    }
+    for r in 0..rows {
+        let row = &x[r * cols..(r + 1) * cols];
+        for (gi, grp) in row.chunks(group).enumerate() {
+            let s = if mode == ActQuantDesc::Fp8Tensor {
+                static_scale
+            } else {
+                let s = dynamic_fp8_scale(grp);
+                scales.push(s);
+                s
+            };
+            for (i, v) in grp.iter().enumerate() {
+                bytes[r * cols + gi * group + i] = fp8_e4m3_round(v / s);
+            }
+        }
+    }
+    (bytes, scales)
+}
+
 /// Quantize-dequantizes a row-major `rows × cols` activation matrix in place as `mode`
 /// prescribes and returns the scales used (row-major per row / per group; for MXFP4 the group
-/// scales as powers of two; empty for [`ActQuantDesc::None`]).
+/// scales as powers of two; empty for [`ActQuantDesc::None`]). `static_scale` is the
+/// checkpoint's `input_scale` of [`ActQuantDesc::Fp8Tensor`] (ignored by the other modes).
 pub fn quantize_dequantize_activations(
     x: &mut [f32],
     rows: usize,
     cols: usize,
     mode: ActQuantDesc,
+    static_scale: f32,
 ) -> Vec<f32> {
     assert_eq!(x.len(), rows * cols, "activation shape");
     match mode {
         ActQuantDesc::None => Vec::new(),
-        ActQuantDesc::Fp8Tensor { scale } => {
+        ActQuantDesc::Fp8Tensor => {
             for v in x.iter_mut() {
-                *v = fp8_qdq(*v, scale);
+                *v = fp8_qdq(*v, static_scale);
             }
-            vec![scale]
+            vec![static_scale]
         }
         ActQuantDesc::Fp8Token => {
             let mut scales = Vec::with_capacity(rows);
@@ -479,7 +520,7 @@ mod tests {
     #[test]
     fn act_quant_modes() {
         let mut x = vec![1.0, -448.0, 3.0, 0.1, 0.0, 0.0, 0.0, 0.0];
-        let s = quantize_dequantize_activations(&mut x, 2, 4, ActQuantDesc::Fp8Token);
+        let s = quantize_dequantize_activations(&mut x, 2, 4, ActQuantDesc::Fp8Token, 1.0);
         assert_eq!(s[0], 1.0);
         assert_eq!(s[1], FP8_MIN_SCALE);
         assert_eq!(&x[..3], &[1.0, -448.0, 3.0]);
@@ -487,28 +528,28 @@ mod tests {
         assert_eq!(&x[4..], &[0.0; 4]);
 
         let mut x = vec![2.0, 1000.0];
-        let s =
-            quantize_dequantize_activations(&mut x, 1, 2, ActQuantDesc::Fp8Tensor { scale: 2.0 });
+        let s = quantize_dequantize_activations(&mut x, 1, 2, ActQuantDesc::Fp8Tensor, 2.0);
         assert_eq!(s, [2.0]);
         assert_eq!(x, [2.0, 896.0]); // 1000 / 2 = 500 saturates to 448
 
         let mut x = vec![448.0, 1.0, 4.0, 2.0];
-        let s = quantize_dequantize_activations(&mut x, 1, 4, ActQuantDesc::Fp8Group { group: 2 });
+        let s =
+            quantize_dequantize_activations(&mut x, 1, 4, ActQuantDesc::Fp8Group { group: 2 }, 1.0);
         assert_eq!(s, [1.0, 4.0 / 448.0]);
         assert_eq!(x[0], 448.0);
 
         let mut x: Vec<f32> = (0..64).map(|i| (i as f32 - 20.0) * 0.37).collect();
-        let s = quantize_dequantize_activations(&mut x, 1, 64, ActQuantDesc::Mxfp4Emulated);
+        let s = quantize_dequantize_activations(&mut x, 1, 64, ActQuantDesc::Mxfp4Emulated, 1.0);
         assert_eq!(s.len(), 2);
         let once = x.clone();
-        quantize_dequantize_activations(&mut x, 1, 64, ActQuantDesc::Mxfp4Emulated);
+        quantize_dequantize_activations(&mut x, 1, 64, ActQuantDesc::Mxfp4Emulated, 1.0);
         assert_eq!(x, once, "MXFP4 quantize-dequantize is idempotent");
         for v in &once {
             assert_eq!(half::bf16::from_f32(*v).to_f32(), *v, "{v} is BF16-exact");
         }
 
         let mut x = vec![1.23, 4.56];
-        assert!(quantize_dequantize_activations(&mut x, 1, 2, ActQuantDesc::None).is_empty());
+        assert!(quantize_dequantize_activations(&mut x, 1, 2, ActQuantDesc::None, 1.0).is_empty());
         assert_eq!(x, [1.23, 4.56]);
     }
 }

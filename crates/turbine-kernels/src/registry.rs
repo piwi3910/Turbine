@@ -22,8 +22,9 @@ use crate::ops::{
     AttentionKernel, ElementwiseConfig, ElementwiseKernel, EmbeddingConfig, EmbeddingKernel,
     GemmConfig, GemmKernel, ImplChoice, ImplInfo, KernelProvider, KvCopyConfig, KvCopyKernel,
     LogitsReduceConfig, LogitsReduceKernel, MoeExpertsConfig, MoeKernel, MoeRouteConfig,
-    NormConfig, NormKernel, OpKind, ProviderId, RmsnormShardedConfig, RopeConfig, RopeKernel,
-    RowSumsqConfig, RowTier, ShardedNormKernel,
+    NormConfig, NormKernel, OpKind, ProviderId, QGemmConfig, QGemmKernel, QuantizeActConfig,
+    QuantizeActKernel, RmsnormShardedConfig, RopeConfig, RopeKernel, RowSumsqConfig, RowTier,
+    ShardedNormKernel,
 };
 
 /// `reason_code` of a selection: the card profile's first listed implementation (that the
@@ -88,6 +89,10 @@ pub enum OpConfig {
     RowSumsq(RowSumsqConfig),
     /// ABI v2.6; a shim library without the group has no provider for it.
     RmsnormSharded(RmsnormShardedConfig),
+    /// ABI v2.9; a shim library without the group has no provider for it.
+    QGemm(QGemmConfig),
+    /// ABI v2.9; a shim library without the group has no provider for it.
+    QuantizeAct(QuantizeActConfig),
 }
 
 impl OpConfig {
@@ -107,6 +112,8 @@ impl OpConfig {
             OpConfig::LogitsReduce(_) => OpKind::LogitsReduce,
             OpConfig::RowSumsq(_) => OpKind::RowSumsq,
             OpConfig::RmsnormSharded(_) => OpKind::RmsnormSharded,
+            OpConfig::QGemm(_) => OpKind::QGemm,
+            OpConfig::QuantizeAct(_) => OpKind::QuantizeAct,
         }
     }
 
@@ -127,6 +134,8 @@ impl OpConfig {
             OpConfig::LogitsReduce(cfg) => cfg.to_string(),
             OpConfig::RowSumsq(cfg) => cfg.to_string(),
             OpConfig::RmsnormSharded(cfg) => cfg.to_string(),
+            OpConfig::QGemm(cfg) => cfg.to_string(),
+            OpConfig::QuantizeAct(cfg) => cfg.to_string(),
         }
     }
 
@@ -191,6 +200,14 @@ impl OpConfig {
                 .sharded_norm()
                 .filter(|k| k.supports_rmsnorm_sharded(cfg))
                 .map(|k| k.implementation_rmsnorm_sharded(cfg)),
+            OpConfig::QGemm(cfg) => provider
+                .qgemm()
+                .filter(|k| k.supports(cfg))
+                .map(|k| k.implementation(cfg)),
+            OpConfig::QuantizeAct(cfg) => provider
+                .quantize_act()
+                .filter(|k| k.supports(cfg))
+                .map(|k| k.implementation(cfg)),
         }
     }
 
@@ -664,6 +681,20 @@ impl KernelRegistry {
         self.provider(OpConfig::RmsnormSharded(*cfg))
             .sharded_norm()
             .expect("the selected provider implements rmsnorm_sharded")
+    }
+
+    /// The quantized GEMM kernel selected for `cfg` (ABI v2.9).
+    pub fn qgemm(&self, cfg: &QGemmConfig) -> &dyn QGemmKernel {
+        self.provider(OpConfig::QGemm(*cfg))
+            .qgemm()
+            .expect("the selected provider implements qgemm")
+    }
+
+    /// The activation quantization kernel selected for `cfg` (ABI v2.9).
+    pub fn quantize_act(&self, cfg: &QuantizeActConfig) -> &dyn QuantizeActKernel {
+        self.provider(OpConfig::QuantizeAct(*cfg))
+            .quantize_act()
+            .expect("the selected provider implements quantize_act")
     }
 }
 

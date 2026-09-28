@@ -1,6 +1,8 @@
 // turbine_abi_minor: the minor revision of the library it is linked into.
 //
-// libturbine_hip.so reports TURBINE_ABI_MINOR (8): besides the ABI v2 trios it
+// libturbine_hip.so reports 8 (the header is at 9; the v2.9 quantized GEMM,
+// activation quantization and FP8 KV scales arrive with Phase 6a Task 13, which
+// switches this back to TURBINE_ABI_MINOR): besides the ABI v2 trios it
 // exports the optional add_rmsnorm trio (rmsnorm.cpp), the v2.1 context
 // options (context.cpp: the tuned GEMM table switch), logits_reduce
 // (logits_reduce.hip), the graph functions (graph.cpp), the v2.3 pinned host
@@ -23,7 +25,7 @@ uint32_t turbine_abi_minor(void) {
 #ifdef TURBINE_V23_BUILD
   return 3u;
 #else
-  return TURBINE_ABI_MINOR;
+  return 8u;
 #endif
 }
 
