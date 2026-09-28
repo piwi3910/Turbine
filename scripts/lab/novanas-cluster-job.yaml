@@ -1,0 +1,184 @@
+# k3s Job template run by scripts/lab-cluster.sh: one Phase 5 multi-GPU scenario on novanas, in
+# rust:1.97-trixie with the host ROCm tree (RCCL is /opt/rocm/rocm/lib/librccl.so.1) and the
+# model weights mounted read-only. The script renders the placeholders: JOB (the Job name), ROLE,
+# RUN_ID, GPUS (0 for the build, 2 for the scenario), PHASE (build or run) and SCENARIO.
+#
+# Two phases from this one template, as scripts/lab/novanas-test-job.yaml: the build Job
+# turbine-lab-cluster-build-<run id> (`amd.com/gpu: 0`) syncs the upload into the cached slot
+# cluster-0 and builds the HIP kernel library and the release binaries (turbine-server,
+# turbine-bench, turbine-golden, turbine-collbench); the scenario Job turbine-lab-cluster-<run id>
+# (`amd.com/gpu: 2`) finds everything built and runs `scripts/lab-cluster.sh --in-job <scenario>`
+# from the slot. Servers and clients talk over the pod's loopback only (HTTP 127.0.0.1:18000,
+# static-mode leader 127.0.0.1:18100): no Service, no host port, no host network.
+#
+# Caches (hostPath under /home/piwi/turbine-ci/cache): cargo registry/git and apt as the test
+# Job; slots/cluster-0/{src,target,kernels} is this scenario runner's own release workspace,
+# held under the flock slots/cluster-0.lock (both R9700s are needed, so there is one slot).
+#
+# Each step prints `lab-step: <name>`; a failing step prints `lab-step failed: <name>`.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB__
+  namespace: turbine-ci
+  labels:
+    turbine-lab: "true"
+    turbine-lab-role: __ROLE__
+    turbine-lab-run: "__RUN_ID__"
+    turbine-scenario: __SCENARIO__
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  # A cold slot compiles Composable Kernel and the release workspace; tp2-novanas then loads
+  # three models and runs three golden comparisons and a benchmark.
+  activeDeadlineSeconds: 7200
+  template:
+    metadata:
+      labels:
+        turbine-lab: "true"
+        turbine-lab-role: __ROLE__
+        turbine-lab-run: "__RUN_ID__"
+        turbine-scenario: __SCENARIO__
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: cluster
+          image: rust:1.97-trixie
+          workingDir: /home/piwi/turbine-ci
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              STEP=setup
+              step() { STEP="$1"; echo "lab-step: $1"; }
+              trap 'echo "lab-step failed: ${STEP}" >&2' ERR
+              export DEBIAN_FRONTEND=noninteractive
+              RUN_DIR="$TURBINE_LAB_ROOT/runs/$TURBINE_LAB_RUN_ID"
+
+              step "install cmake ninja python3 rsync jq"
+              rm -f /etc/apt/apt.conf.d/docker-clean
+              mkdir -p /var/cache/apt/archives/partial /var/lib/apt/lists/partial
+              (
+                flock -w 900 9
+                if [[ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' -mmin -360 -print -quit)" ]]; then
+                  apt-get update -qq >/dev/null
+                fi
+                apt-get install -y -qq cmake ninja-build python3 rsync jq >/dev/null
+              ) 9>/var/cache/apt/archives/turbine-lab.flock
+
+              PHASE="$TURBINE_LAB_PHASE"
+              [[ $PHASE == build || $PHASE == run ]]
+
+              step "take the cluster slot"
+              SLOT_DIR="$TURBINE_LAB_CACHE/slots/cluster-0"
+              exec {LOCK_FD}>"$TURBINE_LAB_CACHE/slots/cluster-0.lock"
+              flock -w 1800 "$LOCK_FD"
+              export CARGO_TARGET_DIR="$SLOT_DIR/target"
+              export KERNEL_BUILD_DIR="$SLOT_DIR/kernels"
+              export TURBINE_KERNEL_LIBRARY="$KERNEL_BUILD_DIR/libturbine_hip.so"
+              mkdir -p "$SLOT_DIR/src" "$CARGO_TARGET_DIR" "$KERNEL_BUILD_DIR"
+
+              step "sync the uploaded tree into the slot"
+              rsync -rlpc --delete "$RUN_DIR/src/" "$SLOT_DIR/src/"
+              cd "$SLOT_DIR/src"
+
+              step "build kernels/rocm"
+              if [[ -f "$KERNEL_BUILD_DIR/CMakeCache.txt" ]] && {
+                ! grep -qx "CMAKE_HOME_DIRECTORY:INTERNAL=$PWD/kernels/rocm" "$KERNEL_BUILD_DIR/CMakeCache.txt" ||
+                  ! grep -qx "CMAKE_GENERATOR:INTERNAL=Ninja" "$KERNEL_BUILD_DIR/CMakeCache.txt"
+              }; then
+                rm -rf "$KERNEL_BUILD_DIR/CMakeCache.txt" "$KERNEL_BUILD_DIR/CMakeFiles"
+              fi
+              if [[ ! -f "$KERNEL_BUILD_DIR/CMakeCache.txt" ]]; then
+                cmake -S kernels/rocm -B "$KERNEL_BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                  -DCMAKE_HIP_COMPILER="$TURBINE_ROCM_PATH/bin/hipcc" -DGPU_TARGETS=gfx1201
+              fi
+              cmake --build "$KERNEL_BUILD_DIR" --parallel "$(nproc)"
+              test -f "$TURBINE_KERNEL_LIBRARY"
+
+              step "cargo build --release"
+              cargo build --release -p turbine-server -p turbine-bench -p turbine-distributed
+              if [[ $PHASE == build ]]; then
+                echo "lab-step: built in slot cluster-0"
+                exit 0
+              fi
+
+              step "scenario $TURBINE_LAB_SCENARIO"
+              exec bash scripts/lab-cluster.sh --in-job "$TURBINE_LAB_SCENARIO"
+          env:
+            - name: TURBINE_LAB_RUN_ID
+              value: "__RUN_ID__"
+            - name: TURBINE_LAB_PHASE
+              value: "__PHASE__"
+            - name: TURBINE_LAB_SCENARIO
+              value: "__SCENARIO__"
+            - name: TURBINE_LAB_ROOT
+              value: /home/piwi/turbine-ci
+            - name: TURBINE_LAB_CACHE
+              value: /home/piwi/turbine-ci/cache
+            - name: LD_LIBRARY_PATH
+              value: /opt/rocm/rocm/lib:/opt/rocm/rocm/lib/rocm_sysdeps/lib
+            - name: TURBINE_AMD_SMI_LIBRARY
+              value: /opt/rocm/rocm/lib/libamd_smi.so.26.5.0
+            - name: TURBINE_ROCM_PATH
+              value: /opt/rocm/rocm/core-7.14
+            - name: TURBINE_TEST_MODEL_DIR
+              value: /models/llama-3.2-3b-instruct
+            - name: TURBINE_TEST_MOE_MODEL_DIR
+              value: /models/olmoe-1b-7b-0125-instruct
+          resources:
+            limits:
+              amd.com/gpu: __GPUS__
+          volumeMounts:
+            - name: turbine-ci
+              mountPath: /home/piwi/turbine-ci
+            - name: cargo-registry
+              mountPath: /usr/local/cargo/registry
+            - name: cargo-git
+              mountPath: /usr/local/cargo/git
+            - name: apt-archives
+              mountPath: /var/cache/apt/archives
+            - name: apt-lists
+              mountPath: /var/lib/apt/lists
+            - name: rocm
+              mountPath: /opt/rocm/rocm
+              readOnly: true
+            - name: rocm-lib-alternative
+              mountPath: /etc/alternatives/rocm-lib
+              readOnly: true
+            - name: models
+              mountPath: /models
+              readOnly: true
+      volumes:
+        - name: turbine-ci
+          hostPath:
+            path: /home/piwi/turbine-ci
+            type: Directory
+        - name: cargo-registry
+          hostPath:
+            path: /home/piwi/turbine-ci/cache/cargo/registry
+            type: DirectoryOrCreate
+        - name: cargo-git
+          hostPath:
+            path: /home/piwi/turbine-ci/cache/cargo/git
+            type: DirectoryOrCreate
+        - name: apt-archives
+          hostPath:
+            path: /home/piwi/turbine-ci/cache/apt/archives
+            type: DirectoryOrCreate
+        - name: apt-lists
+          hostPath:
+            path: /home/piwi/turbine-ci/cache/apt/lists
+            type: DirectoryOrCreate
+        - name: rocm
+          hostPath:
+            path: /opt/rocm/rocm
+            type: Directory
+        - name: rocm-lib-alternative
+          hostPath:
+            path: /etc/alternatives/rocm-lib
+            type: Directory
+        - name: models
+          hostPath:
+            path: /home/piwi/turbine-models
+            type: Directory

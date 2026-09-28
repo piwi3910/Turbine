@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# Run one Phase 5 multi-GPU lab scenario on novanas as a k3s Job holding both R9700s.
+#
+#   scripts/lab-cluster.sh [--dry-run] <collbench-novanas|tp2-novanas|dp2-novanas>
+#   scripts/lab-cluster.sh [--dry-run] --stop <run-id>
+#
+# Scenarios (P5 S-9; everything runs inside the Job on loopback — no Service, no host port):
+#   collbench-novanas  turbine-collbench --backend rccl --devices 0,1 --op all --max-bytes 1GiB;
+#                      PASS when every row is correct and all-reduce busbw > 0 at 268,435,456 B.
+#   tp2-novanas        Llama-3.2-3B-Instruct at tensor_parallel_size 2 in local mode, then in
+#                      static mode (ranks 0 and 1, leader 127.0.0.1:18100), then OLMoE-1B-7B at
+#                      tp 2 in local mode: each passes turbine-golden compare against its
+#                      committed reference; then turbine-bench --concurrency 4 --requests 64
+#                      against the local-mode Llama server must report requests_ok 64.
+#   dp2-novanas        Llama-3.2-3B-Instruct at tp 1, dp 2: turbine-bench --concurrency 8
+#                      --requests 128 must report requests_ok 128, and turbine_dp_routed_total
+#                      must be non-zero for replica 0 and replica 1.
+#
+# Like scripts/lab-test.sh, the tree is uploaded to /home/piwi/turbine-ci/runs/<run id>/src and
+# one template (scripts/lab/novanas-cluster-job.yaml) runs twice: first GPU-less as
+# turbine-lab-cluster-build-<run id> (kernels and the release binaries into the cached slot
+# cluster-0), then as turbine-lab-cluster-<run id> with `amd.com/gpu: 2`, which runs
+# `scripts/lab-cluster.sh --in-job <scenario>` from that slot. A GPU Job still Pending with
+# "Insufficient amd.com/gpu" after 60 s is deleted and the script exits 1 with
+# `lab-cluster: amd.com/gpu unavailable on novanas` — another workload holds a card; ask the
+# user, never evict it. Whatever happens, the script deletes only the Jobs of its own run
+# (label selector turbine-lab=true,turbine-lab-run=<run id>) and its upload.
+# --dry-run prints every command that would contact the host (and the rendered Jobs).
+#
+# The last line is `lab-cluster: <scenario> PASS` (exit 0) or `lab-cluster: <scenario> FAIL
+# <reason>` (exit 1); usage errors exit 2.
+set -euo pipefail
+
+SCENARIOS="collbench-novanas|tp2-novanas|dp2-novanas"
+
+usage() {
+	echo "usage: scripts/lab-cluster.sh [--dry-run] <${SCENARIOS}>" >&2
+	echo "       scripts/lab-cluster.sh [--dry-run] --stop <run-id>" >&2
+	exit 2
+}
+
+valid_scenario() {
+	[[ "$1" =~ ^(collbench-novanas|tp2-novanas|dp2-novanas)$ ]]
+}
+
+# ---------------------------------------------------------------------------------------------
+# Inside the Job: `scripts/lab-cluster.sh --in-job <scenario>`, run from the slot's source tree
+# with the release binaries in $CARGO_TARGET_DIR/release and the weights at /models.
+# ---------------------------------------------------------------------------------------------
+
+HTTP=127.0.0.1:18000
+URL="http://${HTTP}"
+SERVER_PIDS=()
+
+job_fail() {
+	echo "lab-cluster: ${SCENARIO} FAIL $1"
+	stop_servers
+	exit 1
+}
+
+stop_servers() {
+	local pid
+	for pid in ${SERVER_PIDS[@]+"${SERVER_PIDS[@]}"}; do
+		kill -TERM "$pid" 2>/dev/null || true
+	done
+	for pid in ${SERVER_PIDS[@]+"${SERVER_PIDS[@]}"}; do
+		wait "$pid" 2>/dev/null || true
+	done
+	SERVER_PIDS=()
+}
+
+# start_server <log> <config> [--set k=v]...: turbine-server in the background.
+start_server() {
+	local log="$1" config="$2"
+	shift 2
+	"${BIN}/turbine-server" --config "$config" "$@" >"$log" 2>&1 &
+	SERVER_PIDS+=($!)
+	echo "lab-step: turbine-server --config ${config} $* (pid $!, log ${log})"
+}
+
+# wait_ready <url> <log>: /ready 200 within 30 min (cold weight loads), else fail with the log.
+wait_ready() {
+	local url="$1" log="$2" waited
+	for ((waited = 0; waited < 1800; waited += 2)); do
+		if [[ "$(curl -s -o /dev/null -w '%{http_code}' "${url}/ready")" == 200 ]]; then
+			echo "lab-step: ${url}/ready 200 after ${waited} s"
+			return 0
+		fi
+		if ! kill -0 "${SERVER_PIDS[-1]}" 2>/dev/null; then
+			tail -n 40 "$log"
+			job_fail "turbine-server exited before ${url}/ready answered 200"
+		fi
+		sleep 2
+	done
+	tail -n 40 "$log"
+	job_fail "${url}/ready not 200 within 30 min"
+}
+
+# golden <slug> <label>: turbine-golden compare against the committed reference.
+golden() {
+	local slug="$1" label="$2"
+	echo "lab-step: golden ${label}"
+	"${BIN}/turbine-golden" compare --url "$URL" \
+		--reference "tests/golden/${slug}/reference.jsonl" ||
+		job_fail "golden ${label} outside tolerance"
+}
+
+# bench_ok <requests> <json> [bench args]...: turbine-bench must report requests_ok <requests>.
+bench_ok() {
+	local want="$1" out="$2"
+	shift 2
+	echo "lab-step: turbine-bench $*"
+	"${BIN}/turbine-bench" --url "$URL" "$@" --output json >"$out" ||
+		job_fail "turbine-bench failed"
+	cat "$out"
+	jq -e --argjson want "$want" '.requests_ok == $want' "$out" >/dev/null ||
+		job_fail "turbine-bench requests_ok is not $want"
+}
+
+scenario_collbench() {
+	local out="${WORK}/collbench.json"
+	echo "lab-step: turbine-collbench --backend rccl --devices 0,1 --op all --max-bytes 1GiB"
+	"${BIN}/turbine-collbench" --backend rccl --devices 0,1 --op all --max-bytes 1GiB \
+		--output json >"$out" || {
+		cat "$out"
+		job_fail "turbine-collbench exited non-zero"
+	}
+	cat "$out"
+	jq -e '([.ops[].rows[]] | length > 0 and all(.correct))
+		and ([.ops[] | select(.op == "all_reduce") | .rows[] | select(.bytes == 268435456)
+			| .busbw_gbps] | length == 1 and .[0] > 0)' "$out" >/dev/null ||
+		job_fail "a row is incorrect or all-reduce busbw is 0 at 268435456 B"
+}
+
+scenario_tp2() {
+	local llama=scripts/lab/phase5-novanas-llama.yaml olmoe=scripts/lab/phase5-novanas-olmoe.yaml
+	start_server "${WORK}/tp2-local.log" "$llama"
+	wait_ready "$URL" "${WORK}/tp2-local.log"
+	golden llama-3.2-3b-instruct "llama tp2 local"
+	bench_ok 64 "${WORK}/tp2-bench.json" --concurrency 4 --requests 64
+	stop_servers
+
+	# Static mode: one process per rank; rank 1 joins the leader on 127.0.0.1:18100 and serves
+	# only /health, /ready and /metrics on its own port.
+	local static=(--set parallel.ranks.mode=static --set parallel.ranks.leader=127.0.0.1:18100)
+	start_server "${WORK}/tp2-static-rank1.log" "$llama" "${static[@]}" \
+		--set parallel.ranks.rank=1 --set "parallel.ranks.local_devices=[1]" \
+		--set server.listen=127.0.0.1:18001
+	start_server "${WORK}/tp2-static-rank0.log" "$llama" "${static[@]}" \
+		--set parallel.ranks.rank=0 --set "parallel.ranks.local_devices=[0]"
+	wait_ready "$URL" "${WORK}/tp2-static-rank0.log"
+	golden llama-3.2-3b-instruct "llama tp2 static"
+	stop_servers
+
+	start_server "${WORK}/tp2-olmoe.log" "$olmoe"
+	wait_ready "$URL" "${WORK}/tp2-olmoe.log"
+	golden olmoe-1b-7b-0125-instruct "olmoe tp2 local"
+	stop_servers
+}
+
+scenario_dp2() {
+	start_server "${WORK}/dp2.log" scripts/lab/phase5-novanas-dp2.yaml
+	wait_ready "$URL" "${WORK}/dp2.log"
+	bench_ok 128 "${WORK}/dp2-bench.json" --concurrency 8 --requests 128
+	curl -s "${URL}/metrics" >"${WORK}/dp2-metrics.txt" || job_fail "GET /metrics failed"
+	grep '^turbine_dp_routed_total' "${WORK}/dp2-metrics.txt" || true
+	local replica total
+	for replica in 0 1; do
+		total="$(awk -v r="replica=\"$replica\"" '/^turbine_dp_routed_total\{/ && index($0, r) { s += $NF } END { print s + 0 }' \
+			"${WORK}/dp2-metrics.txt")"
+		awk -v t="$total" 'BEGIN { exit !(t > 0) }' ||
+			job_fail "turbine_dp_routed_total is 0 for replica $replica"
+	done
+	stop_servers
+}
+
+in_job() {
+	SCENARIO="$1"
+	valid_scenario "$SCENARIO" || usage
+	: "${CARGO_TARGET_DIR:?the Job sets CARGO_TARGET_DIR}"
+	BIN="${CARGO_TARGET_DIR}/release"
+	WORK="$(mktemp -d)"
+	trap 'stop_servers' EXIT
+	case "$SCENARIO" in
+	collbench-novanas) scenario_collbench ;;
+	tp2-novanas) scenario_tp2 ;;
+	dp2-novanas) scenario_dp2 ;;
+	esac
+	echo "lab-cluster: ${SCENARIO} PASS"
+}
+
+if [[ "${1:-}" == --in-job ]]; then
+	[[ $# -eq 2 ]] || usage
+	in_job "$2"
+	exit 0
+fi
+
+# ---------------------------------------------------------------------------------------------
+# On the workstation: upload, build Job, GPU Job, cleanup.
+# ---------------------------------------------------------------------------------------------
+
+DRY_RUN=0
+if [[ "${1:-}" == --dry-run ]]; then
+	DRY_RUN=1
+	shift
+fi
+MODE=run
+STOP_RUN=""
+SCENARIO=""
+case "${1:-}" in
+--stop)
+	[[ $# -eq 2 && "$2" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || usage
+	MODE=stop
+	STOP_RUN="$2"
+	;;
+*)
+	if [[ $# -ne 1 ]] || ! valid_scenario "$1"; then
+		usage
+	fi
+	SCENARIO="$1"
+	;;
+esac
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REMOTE=piwi@192.168.10.203
+CI_ROOT=/home/piwi/turbine-ci
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
+NS=turbine-ci
+# Short, unique and DNS-1123 safe: UTC time plus 30 random bits.
+RUN_ID="$(date -u +%m%d%H%M%S)-$(printf '%08x' $(((RANDOM << 15) | RANDOM)))"
+[[ $MODE == stop ]] && RUN_ID="$STOP_RUN"
+JOB="turbine-lab-cluster-${RUN_ID}"
+BUILD_JOB="turbine-lab-cluster-build-${RUN_ID}"
+RUN_DIR="${CI_ROOT}/runs/${RUN_ID}"
+# Every Job of this run, and nothing else.
+SELECTOR="turbine-lab=true,turbine-lab-run=${RUN_ID}"
+# How long a GPU pod may stay unschedulable before the run gives up.
+UNSCHEDULABLE_LIMIT=60
+
+say() {
+	echo "lab-cluster: novanas: $*"
+}
+
+# The final line on failure.
+fail() {
+	echo "lab-cluster: ${SCENARIO:-stop} FAIL $1"
+	exit 1
+}
+
+# Runs a local command, or prints it under --dry-run.
+run() {
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ $*"
+	else
+		"$@"
+	fi
+}
+
+# Arguments are one remote shell command, expanded locally on purpose.
+# shellcheck disable=SC2029
+remote() {
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ ssh ${SSH_OPTS[*]} ${REMOTE} '$*'"
+	else
+		ssh "${SSH_OPTS[@]}" "$REMOTE" "$@"
+	fi
+}
+
+# Like remote, with stdin passed through (shown under --dry-run).
+# shellcheck disable=SC2029
+remote_stdin() {
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ ssh ${SSH_OPTS[*]} ${REMOTE} '$*' <<'EOF'"
+		cat
+		echo "EOF"
+	else
+		ssh "${SSH_OPTS[@]}" "$REMOTE" "$@" 2> >(grep -v -e 'permission denied' >&2)
+	fi
+}
+
+# kubectl on novanas; the same warning filter as scripts/lab-test.sh.
+kube() {
+	if [[ $DRY_RUN -eq 1 ]]; then
+		remote "export KUBECTL_KUBERC=false; kubectl $*"
+	else
+		remote "export KUBECTL_KUBERC=false; kubectl $*" 2> >(grep -v -e 'permission denied' >&2)
+	fi
+}
+
+# Deletes this run's Jobs (by its run label) and its upload, nothing else.
+cleanup() {
+	if [[ $DRY_RUN -eq 1 ]]; then
+		kube "-n ${NS} delete job -l ${SELECTOR} --ignore-not-found"
+	else
+		kube "-n ${NS} delete job -l ${SELECTOR} --ignore-not-found" >/dev/null || true
+	fi
+	remote "rm -rf ${RUN_DIR}" || true
+}
+
+on_interrupt() {
+	trap - INT TERM
+	echo "lab-cluster: novanas: interrupted; deleting the jobs of run ${RUN_ID}" >&2
+	cleanup
+	exit 130
+}
+
+# render_job build|run: the template as the GPU-less build Job or the two-GPU scenario Job.
+render_job() {
+	local name="$JOB" gpus=2 role=cluster
+	if [[ $1 == build ]]; then
+		name="$BUILD_JOB"
+		gpus=0
+		role=cluster-build
+	fi
+	sed -e "s/__JOB__/${name}/g" -e "s/__ROLE__/${role}/g" -e "s/__RUN_ID__/${RUN_ID}/g" \
+		-e "s/__GPUS__/${gpus}/g" -e "s/__PHASE__/$1/g" -e "s/__SCENARIO__/${SCENARIO}/g" \
+		"${REPO_ROOT}/scripts/lab/novanas-cluster-job.yaml"
+}
+
+# wait_for_pod <job> <gpus>: until its pod runs; a GPU pod Pending on amd.com/gpu is given up.
+wait_for_pod() {
+	local job="$1" gpus="$2"
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ wait until pod job-name=${job} runs (Insufficient amd.com/gpu limit ${UNSCHEDULABLE_LIMIT} s)"
+		return
+	fi
+	local waited=0 phase="" unschedulable=""
+	while :; do
+		phase="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.phase}'" || true)"
+		[[ "$phase" == Running || "$phase" == Succeeded || "$phase" == Failed ]] && return 0
+		unschedulable="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.conditions[?(@.reason==\"Unschedulable\")].message}'" || true)"
+		if [[ $gpus -gt 0 && "$unschedulable" == *"amd.com/gpu"* && $waited -ge $UNSCHEDULABLE_LIMIT ]]; then
+			echo "lab-cluster: novanas: ${unschedulable}" >&2
+			cleanup
+			echo "lab-cluster: amd.com/gpu unavailable on novanas"
+			exit 1
+		fi
+		if [[ $waited -ge 1800 ]]; then
+			cleanup
+			fail "pod of ${job} did not start within 30 min (phase: ${phase:-none})"
+		fi
+		sleep 5
+		waited=$((waited + 5))
+	done
+}
+
+# wait_for_result <job>: 0 when the Job succeeded, 1 otherwise.
+wait_for_result() {
+	local job="$1"
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ wait until job ${job} succeeds or fails"
+		return 0
+	fi
+	local succeeded="" failed=""
+	while :; do
+		succeeded="$(kube "-n ${NS} get job ${job} -o jsonpath='{.status.succeeded}'" || true)"
+		failed="$(kube "-n ${NS} get job ${job} -o jsonpath='{.status.failed}'" || true)"
+		[[ "$succeeded" == 1 || -n "$failed" ]] && break
+		sleep 5
+	done
+	[[ "$succeeded" == 1 ]]
+}
+
+# apply_and_follow build|run <job> <gpus>: applies the rendered Job, streams its log, waits.
+apply_and_follow() {
+	local phase="$1" job="$2" gpus="$3"
+	say "applying scripts/lab/novanas-cluster-job.yaml as ${job} (${gpus} GPU(s))"
+	render_job "$phase" | remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" ||
+		{
+			cleanup
+			fail "kubectl apply of ${job} failed"
+		}
+	wait_for_pod "$job" "$gpus"
+	say "streaming pod log of ${job}"
+	kube "-n ${NS} logs -f job/${job}" || echo "lab-cluster: novanas: log stream of ${job} ended with an error" >&2
+	wait_for_result "$job"
+}
+
+run_scenario() {
+	say "run ${RUN_ID}: job ${JOB}, scenario ${SCENARIO}, 2 GPU(s)"
+	remote "mkdir -p ${RUN_DIR}/src ${CI_ROOT}/cache/slots && find ${CI_ROOT}/runs -mindepth 1 -maxdepth 1 -mmin +1440 -exec rm -rf {} +" ||
+		fail "ssh to ${REMOTE} failed"
+	[[ $DRY_RUN -eq 1 ]] || trap on_interrupt INT TERM
+	say "syncing working tree to ${RUN_DIR}/src"
+	run rsync -rlpcz --delete --exclude target/ --exclude .git/ --exclude .claude/ \
+		-e "ssh ${SSH_OPTS[*]}" "${REPO_ROOT}/" "${REMOTE}:${RUN_DIR}/src/" ||
+		{
+			cleanup
+			fail "rsync to ${REMOTE}:${RUN_DIR}/src failed"
+		}
+	remote "command -v kubectl >/dev/null" || fail "kubectl is not available on novanas"
+	kube "create namespace ${NS} --dry-run=client -o yaml | kubectl apply -f - >/dev/null" ||
+		fail "cannot create namespace ${NS}"
+
+	# Compile without a GPU claim, then hold both R9700s only for the scenario itself.
+	if ! apply_and_follow build "$BUILD_JOB" 0; then
+		cleanup
+		fail "build job ${BUILD_JOB} failed"
+	fi
+	local ok=0
+	apply_and_follow run "$JOB" 2 && ok=1
+	say "deleting the jobs of run ${RUN_ID}"
+	cleanup
+	[[ $DRY_RUN -eq 1 ]] && say "dry run: nothing contacted"
+	if [[ $ok -eq 1 ]]; then
+		echo "lab-cluster: ${SCENARIO} PASS"
+	else
+		fail "job ${JOB} failed (see the log above)"
+	fi
+}
+
+stop_run() {
+	say "deleting the jobs of run ${RUN_ID} in namespace ${NS}"
+	kube "-n ${NS} delete job -l ${SELECTOR} --ignore-not-found --wait=true" ||
+		fail "cannot delete the jobs of run ${RUN_ID}"
+	remote "rm -rf ${RUN_DIR}" || fail "cannot remove ${RUN_DIR}"
+	if [[ $DRY_RUN -eq 1 ]]; then say "dry run: nothing contacted"; else say "stopped"; fi
+}
+
+case "$MODE" in
+run) run_scenario ;;
+stop) stop_run ;;
+esac

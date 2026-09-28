@@ -1455,3 +1455,167 @@ fn phase3_soak_config_loads() {
         "the kv pool is the budget remainder (C-8)"
     );
 }
+/// P5 Task 9: `lab-cluster.sh` passes `bash -n`, and its dry run renders a GPU-less build Job and
+/// a two-R9700 scenario Job from `scripts/lab/novanas-cluster-job.yaml`, with the weights
+/// read-only, no Service or host port, and a cleanup that selects only this run's Jobs.
+#[test]
+fn cluster_dry_run_manifest() {
+    let syntax = Command::new("bash")
+        .arg("-n")
+        .arg(repo_root().join("scripts/lab-cluster.sh"))
+        .output()
+        .expect("run bash -n");
+    assert!(syntax.status.success(), "bash -n: {}", stderr(&syntax));
+
+    let text = dry_run(
+        "lab-cluster.sh",
+        "cluster-tp2",
+        &["--dry-run", "tp2-novanas"],
+    );
+    let id = run_id(&text, "lab-cluster");
+    let job_name = format!("turbine-lab-cluster-{id}");
+    let build_name = format!("turbine-lab-cluster-build-{id}");
+    let run_dir = format!("{CI_ROOT}/runs/{id}");
+    let selector = format!("-l turbine-lab=true,turbine-lab-run={id}");
+    assert_in_order(
+        &text,
+        &[
+            &format!("{SSH} 'mkdir -p {run_dir}/src {CACHE}/slots"),
+            "rsync -rlpcz --delete --exclude target/ --exclude .git/ --exclude .claude/",
+            &format!("piwi@192.168.10.203:{run_dir}/src/"),
+            "kubectl apply -f -",
+            &format!("kubectl -n turbine-ci logs -f job/{build_name}"),
+            "kubectl apply -f -",
+            "Insufficient amd.com/gpu limit 60 s",
+            &format!("kubectl -n turbine-ci logs -f job/{job_name}"),
+            &format!("kubectl -n turbine-ci delete job {selector} --ignore-not-found"),
+            &format!("rm -rf {run_dir}'"),
+        ],
+    );
+    // The only delete is the run's own label selector; never a bare `turbine-lab=true`.
+    assert_eq!(text.matches(" delete ").count(), 1, "{text}");
+    assert_eq!(
+        text.lines().last(),
+        Some("lab-cluster: tp2-novanas PASS"),
+        "{text}"
+    );
+
+    let jobs = applied_jobs(&text);
+    assert_eq!(jobs.len(), 2, "a build Job and the scenario Job");
+    let (build, job) = (&jobs[0], &jobs[1]);
+    assert_eq!(str_at(build, "metadata.name"), build_name);
+    assert_eq!(str_at(job, "metadata.name"), job_name);
+    for (j, gpus, phase) in [(build, 0, "build"), (job, 2, "run")] {
+        assert_eq!(str_at(j, "metadata.namespace"), "turbine-ci");
+        assert_eq!(str_at(j, "metadata.labels.turbine-lab"), "true");
+        assert_eq!(str_at(j, "metadata.labels.turbine-lab-run"), id);
+        assert_eq!(str_at(j, "metadata.labels.turbine-scenario"), "tp2-novanas");
+        assert_eq!(amd_gpus(j), gpus);
+        assert_eq!(env(j, "TURBINE_LAB_PHASE"), phase);
+        assert_eq!(env(j, "TURBINE_LAB_SCENARIO"), "tp2-novanas");
+        assert_eq!(str_at(container(j), "image"), "rust:1.97-trixie");
+        let m = mounts(j);
+        for want in [
+            ("/models", "/home/piwi/turbine-models", true),
+            ("/opt/rocm/rocm", "/opt/rocm/rocm", true),
+        ] {
+            let want = (want.0.to_string(), want.1.to_string(), want.2);
+            assert!(m.contains(&want), "{want:?} missing from {m:?}");
+        }
+        assert!(
+            at(j, "spec.template.spec").get("hostNetwork").is_none(),
+            "loopback only"
+        );
+    }
+    let s = script(job);
+    assert_in_order(
+        &s,
+        &[
+            "flock -w 1800 \"$LOCK_FD\"",
+            "rsync -rlpc --delete \"$RUN_DIR/src/\" \"$SLOT_DIR/src/\"",
+            "cmake --build \"$KERNEL_BUILD_DIR\"",
+            "cargo build --release -p turbine-server -p turbine-bench -p turbine-distributed",
+            "exec bash scripts/lab-cluster.sh --in-job \"$TURBINE_LAB_SCENARIO\"",
+        ],
+    );
+    let template =
+        fs::read_to_string(repo_root().join("scripts/lab/novanas-cluster-job.yaml")).unwrap();
+    for manifest in [
+        heredoc(&text, "export KUBECTL_KUBERC=false; kubectl apply -f -"),
+        template.as_str(),
+    ] {
+        assert!(!manifest.contains("kind: Service"), "{manifest}");
+        assert!(!manifest.contains("hostPort"), "{manifest}");
+    }
+}
+
+#[test]
+fn lab_cluster_scenarios_and_stop_touch_only_their_own_run() {
+    for scenario in ["collbench-novanas", "dp2-novanas"] {
+        let text = dry_run("lab-cluster.sh", scenario, &["--dry-run", scenario]);
+        let job = applied_jobs(&text).remove(1);
+        assert_eq!(env(&job, "TURBINE_LAB_SCENARIO"), scenario);
+        assert_eq!(amd_gpus(&job), 2);
+        assert_eq!(
+            text.lines().last(),
+            Some(format!("lab-cluster: {scenario} PASS").as_str())
+        );
+    }
+    let text = dry_run(
+        "lab-cluster.sh",
+        "cluster-stop",
+        &["--dry-run", "--stop", "0926-ab"],
+    );
+    assert!(
+        text.contains(
+            "kubectl -n turbine-ci delete job -l turbine-lab=true,turbine-lab-run=0926-ab --ignore-not-found --wait=true"
+        ),
+        "{text}"
+    );
+    for absent in ["rsync", "apply"] {
+        assert!(
+            !text.contains(absent),
+            "--stop must not run {absent}: {text}"
+        );
+    }
+    for (tag, args) in [
+        ("cl-noargs", &[][..]),
+        ("cl-scenario", &["tp4-novanas"][..]),
+        ("cl-two", &["tp2-novanas", "dp2-novanas"][..]),
+        ("cl-stop-noid", &["--stop"][..]),
+        ("cl-stop-badid", &["--stop", "../x"][..]),
+        ("cl-injob", &["--in-job"][..]),
+    ] {
+        let (out, called) = lab_script("lab-cluster.sh", tag, args);
+        assert_eq!(called, None, "{tag}: contacted a host");
+        assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
+        assert!(stderr(&out).contains("usage:"), "{tag}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn phase5_novanas_configs_load() {
+    use turbine_core::config::{DeviceSelection, SizeOrAuto};
+    use turbine_core::types::DeviceId;
+    for (file, dir, tp, dp) in [
+        ("phase5-novanas-llama.yaml", MODEL_DIR, 2, 1),
+        ("phase5-novanas-olmoe.yaml", MOE_MODEL_DIR, 2, 1),
+        ("phase5-novanas-dp2.yaml", MODEL_DIR, 1, 2),
+    ] {
+        let path = repo_root().join("scripts/lab").join(file);
+        let c = turbine_core::config::load(&path, &[])
+            .unwrap_or_else(|e| panic!("{file} does not load: {e}"));
+        assert_eq!(c.server.listen.to_string(), "127.0.0.1:18000", "{file}");
+        assert_eq!(c.model.path, Path::new(dir), "{file}");
+        assert_eq!(c.execution.backend.as_str(), "hip", "{file}");
+        let p = &c.parallel;
+        assert_eq!(p.tensor_parallel_size, SizeOrAuto::Size(tp), "{file}");
+        assert_eq!(p.data_parallel_size, SizeOrAuto::Size(dp), "{file}");
+        assert_eq!(
+            p.devices,
+            DeviceSelection::List(vec![DeviceId(0), DeviceId(1)]),
+            "{file}"
+        );
+        assert_eq!(c.kv.block_tokens, 128, "{file}");
+    }
+}
