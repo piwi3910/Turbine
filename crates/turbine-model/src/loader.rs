@@ -166,6 +166,9 @@ pub struct LoadedWeights {
     pub unexpected: Vec<String>,
     /// Checkpoint tensors deliberately skipped: `lm_head.weight` of a tied model.
     pub ignored: Vec<String>,
+    /// Checkpoint tensors another pipeline stage or expert-parallel rank loads
+    /// ([`WeightLoader::load_part`]): counted, logged at debug level only.
+    pub elsewhere: usize,
 }
 
 impl LoadedWeights {
@@ -208,6 +211,23 @@ impl WeightLoader {
         mem: &Arc<dyn DeviceMemory>,
         staging_bytes: usize,
     ) -> Result<LoadedWeights, ModelError> {
+        WeightLoader::load_part(format, index, slots, &[], mem, staging_bytes)
+    }
+
+    /// [`WeightLoader::load_format`] of one part of a model split by pipeline stages or expert
+    /// ranks: `whole` is the unsplit model's slot list (the family's
+    /// `weight_slots`); a checkpoint tensor it names but `slots` does not belongs to another
+    /// stage or rank and is skipped quietly (counted in [`LoadedWeights::elsewhere`], one
+    /// `debug` line) instead of warning `unexpected_tensor`. Tensors neither list names still
+    /// warn. An empty `whole` is [`WeightLoader::load_format`].
+    pub fn load_part(
+        format: &dyn WeightFormat,
+        index: &SafetensorsIndex,
+        slots: &[WeightSlot],
+        whole: &[WeightSlot],
+        mem: &Arc<dyn DeviceMemory>,
+        staging_bytes: usize,
+    ) -> Result<LoadedWeights, ModelError> {
         let mut planned: Vec<(&WeightSlot, &TensorEntry)> = Vec::with_capacity(slots.len());
         for slot in slots {
             let entry = index
@@ -236,12 +256,19 @@ impl WeightLoader {
         check_stacks(slots)?;
 
         let wanted: HashSet<&str> = slots.iter().map(|s| s.name.as_str()).collect();
-        let (mut unexpected, mut ignored) = (Vec::new(), Vec::new());
+        let others: HashSet<&str> = whole
+            .iter()
+            .map(|s| s.name.as_str())
+            .filter(|n| !wanted.contains(n))
+            .collect();
+        let (mut unexpected, mut ignored, mut elsewhere) = (Vec::new(), Vec::new(), 0usize);
         for entry in index.entries() {
             if wanted.contains(entry.name.as_str()) {
                 continue;
             }
-            if entry.name == LM_HEAD {
+            if others.contains(entry.name.as_str()) {
+                elsewhere += 1;
+            } else if entry.name == LM_HEAD {
                 tracing::warn!(
                     event = "ignored_tensor",
                     tensor = %entry.name,
@@ -258,6 +285,13 @@ impl WeightLoader {
                 );
                 unexpected.push(entry.name.clone());
             }
+        }
+        if elsewhere > 0 {
+            tracing::debug!(
+                event = "tensors_elsewhere",
+                tensors = elsewhere,
+                "checkpoint tensors of other pipeline stages or expert ranks are not read here"
+            );
         }
 
         let dtype = format.weight_dtype();
@@ -330,6 +364,7 @@ impl WeightLoader {
             weight_bytes,
             unexpected,
             ignored,
+            elsewhere,
         })
     }
 }

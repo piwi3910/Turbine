@@ -213,8 +213,9 @@ fn layer_of(name: &str) -> Option<u32> {
 
 /// The stage's weight slots: the family's slots of the stage's layers (fused and stacked as on
 /// one device), the embedding on the first stage and on a tied last stage, the final norm and an
-/// untied LM head on the last. Other stages' tensors are not read (the loader reports them as
-/// `unexpected_tensor`). Load them with [`crate::WeightLoader`].
+/// untied LM head on the last. Other stages' tensors are not read; load the slots with
+/// [`crate::WeightLoader::load_part`] and the family's whole slot list so those tensors are skipped
+/// quietly (counted, not warned as `unexpected_tensor`).
 pub fn weight_slots(
     cfg: &ModelArchConfig,
     stage: &StageSpec,
@@ -465,6 +466,23 @@ mod tests {
                 w.tensors.keys()
             );
             assert!(w.tensors.contains_key(FINAL_NORM));
+            assert!(
+                !w.unexpected.is_empty(),
+                "plain load warns stage 0's tensors"
+            );
+            // Told the whole model's slots, the loader skips stage 0's tensors quietly.
+            let part = WeightLoader::load_part(
+                cfg.weight_format.0,
+                &index,
+                &slots[1],
+                &one,
+                &mem,
+                MAX_STAGING_BYTES,
+            )
+            .unwrap();
+            assert!(part.unexpected.is_empty(), "{:?}", part.unexpected);
+            assert_eq!(part.elsewhere, w.unexpected.len());
+            assert_eq!(part.weight_bytes, w.weight_bytes);
         }
     }
 }

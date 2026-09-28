@@ -342,8 +342,9 @@ pub fn kv_layout(
 /// Rank `s`'s weight slots: everything but the experts as one device's (tp = 1) or as the
 /// tensor-parallel rank's shard (tp = ep), plus every expert `placement` puts on the rank,
 /// whole, stacked in ascending expert order into `[local experts, …]` stacks of the
-/// [`stacked_experts_name`] parameters. Other ranks' experts are not read. Load them with
-/// [`crate::WeightLoader`].
+/// [`stacked_experts_name`] parameters. Other ranks' experts are not read; load the slots with
+/// [`crate::WeightLoader::load_part`] and the family's whole slot list so those experts are skipped
+/// quietly.
 pub fn weight_slots(
     cfg: &ModelArchConfig,
     s: EpShard,
