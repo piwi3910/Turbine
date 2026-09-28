@@ -34,9 +34,9 @@
 #                      2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)". Every tp 2
 #                      golden takes the TP rule (user decision "P5: tensor-parallel accuracy gate
 #                      against the one-GPU capture"): batched bounds at c1 and c16 against a
-#                      one-GPU capture of the same model taken in the run, and the golden rule
-#                      (strict c1, batched c16) against the committed reference; the one-GPU leg
-#                      itself is gated against the committed reference. A violation fails the
+#                      one-GPU capture of the same model taken in the run and against the
+#                      committed reference; the one-GPU leg itself is gated strictly against
+#                      the committed reference. A violation fails the
 #                      scenario at its end, after every leg ran.
 #   dp2-novanas       Llama-3.2-3B-Instruct at tp 1 on the standard throughput workload
 #                      (512-word prompts, 256 tokens with --ignore-eos, 200 requests, after a
@@ -403,8 +403,8 @@ capture_one_gpu() {
 # gate_vs_capture <slug> <capture> <label>: the tensor-parallel gate (user decision "P5:
 # tensor-parallel accuracy gate against the one-GPU capture", A): against the one-GPU capture
 # with the batched bounds at c1 and c16, and against the committed transformers reference with
-# the golden rule (strict c1, batched c16). A violation is recorded in GATE_FAILED; the scenario
-# goes on and fails at its end.
+# the batched bounds at c1 and c16 too (follow-up (a)). A violation is recorded in GATE_FAILED;
+# the scenario goes on and fails at its end.
 gate_vs_capture() {
 	local slug="$1" capture="$2" label="$3" c
 	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
@@ -412,7 +412,7 @@ gate_vs_capture() {
 		echo "lab-step: golden ${label} c${c} vs 1 GPU (batched bounds)"
 		"${BIN}/turbine-golden" compare --url "$URL" --reference "$capture" "${tol[@]}" \
 			--concurrency "$c" --batched-bounds || GATE_FAILED+=("golden ${label} c${c} vs 1 GPU")
-		golden_gate "$slug" "${label} c${c} vs HF" --concurrency "$c"
+		golden_gate "$slug" "${label} c${c} vs HF" --concurrency "$c" --batched-bounds
 	done
 }
 

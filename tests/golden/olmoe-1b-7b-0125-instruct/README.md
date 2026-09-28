@@ -74,6 +74,5 @@ prompt's per-position |Δ| teacher-forced on the reference's tokens, to check su
 Tensor parallelism changes the arithmetic (each rank rounds its partial sums before the
 all-reduce), so a mode that includes it (tp > 1, also ep × tp) is gated against the one-GPU
 capture with the batched bounds at concurrency 1 and 16 (`turbine-golden compare
---batched-bounds`) and against this transformers reference with the ordinary golden rule (strict
-c1, batched c16); expert and pipeline parallelism without TP stay strict against the capture
+--batched-bounds`) and against this transformers reference with the batched bounds at c1 and c16 too; expert and pipeline parallelism without TP stay strict against the capture
 (user decision 2026-09-28, "P5: tensor-parallel accuracy gate against the one-GPU capture").
