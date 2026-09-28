@@ -967,6 +967,27 @@ release_bench_lock() {
 	say "released the benchmark lock"
 }
 
+# wait_for_free_gpus: until no GPU-holding Turbine lab Job (roles test, cluster, serve) is running
+# or pending, naming them every 5 min, up to OWN_QUEUE_LIMIT; our builds (GPU-less) don't count.
+wait_for_free_gpus() {
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ wait until no turbine-lab test/cluster/serve pod is running or pending"
+		return
+	fi
+	local waited=0 holders=""
+	while :; do
+		holders="$(kube "-n ${NS} get pods -l 'turbine-lab=true,turbine-lab-role in (test,cluster,serve)' --field-selector=status.phase!=Succeeded,status.phase!=Failed -o jsonpath='{range .items[*]}{.metadata.labels.job-name} {end}'" || true)"
+		[[ -z "${holders// /}" ]] && return 0
+		if [[ $waited -ge $OWN_QUEUE_LIMIT ]]; then
+			cleanup
+			fail "the GPUs stayed held by our lab Job(s) ${holders} for ${waited} s"
+		fi
+		((waited % 300 == 0)) && say "waiting for the GPUs (held by our lab Job(s): ${holders}) before taking the benchmark lock"
+		sleep 5
+		waited=$((waited + 5))
+	done
+}
+
 run_scenario() {
 	say "run ${RUN_ID}: job ${JOB}, scenario ${SCENARIO}, 2 GPU(s)"
 	remote "mkdir -p ${RUN_DIR}/src ${CI_ROOT}/cache/slots && find ${CI_ROOT}/runs -mindepth 1 -maxdepth 1 -mmin +1440 -exec rm -rf {} +" ||
@@ -989,8 +1010,13 @@ run_scenario() {
 		fail "build job ${BUILD_JOB} failed"
 	fi
 	local ok=0
-	# --bench-lock: the exclusive benchmark lock covers the GPU Job only (build first, unlocked).
-	[[ $BENCH_LOCK -eq 1 ]] && take_bench_lock
+	# --bench-lock: the exclusive benchmark lock covers the GPU Job only (build first, unlocked),
+	# and is taken only once no other GPU-holding lab Job of ours is running or pending, so a
+	# queued run never blocks every build's shared lock while it waits for the cards.
+	if [[ $BENCH_LOCK -eq 1 ]]; then
+		wait_for_free_gpus
+		take_bench_lock
+	fi
 	apply_and_follow run "$JOB" 2 && ok=1
 	[[ $BENCH_LOCK -eq 1 ]] && release_bench_lock
 	say "deleting the jobs of run ${RUN_ID}"
