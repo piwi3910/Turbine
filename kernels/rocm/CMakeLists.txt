@@ -254,3 +254,25 @@ target_include_directories(turbine_gemm_tune PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../include"
   "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(turbine_gemm_tune PRIVATE hip::host roc::hipblaslt)
+
+# The quantized GEMM provider evaluation harness (Phase 6a, decisions "P6: FP8 GEMM — provider
+# evaluation (kernel reuse rule)" and its block-scaled sequel): times and checks the hipBLASLt FP8
+# candidates, the CK ck_tile gemm_quant instances (tools/qgemm_eval_ck.cpp, with CK example
+# 38_block_scale_gemm's tile configs) and the activation quantization kernels for the Llama
+# shapes on the current device. A lab tool, off by default: -DTURBINE_BUILD_QGEMM_EVAL=ON.
+option(TURBINE_BUILD_QGEMM_EVAL "Build the FP8 GEMM provider evaluation harness" OFF)
+if(TURBINE_BUILD_QGEMM_EVAL)
+  add_executable(turbine_qgemm_eval tools/qgemm_eval.cpp tools/qgemm_eval_ck.cpp)
+  set_source_files_properties(tools/qgemm_eval.cpp tools/qgemm_eval_ck.cpp PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(tools/qgemm_eval_ck.cpp PROPERTIES COMPILE_OPTIONS
+    "-DCK_TILE_USE_OCP_FP8;-DCK_USE_OCP_FP8;-Wno-global-constructors;-Wno-unknown-warning-option")
+  target_compile_definitions(turbine_qgemm_eval PRIVATE TURBINE_QGEMM_EVAL_CK)
+  set_target_properties(turbine_qgemm_eval PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+  target_include_directories(turbine_qgemm_eval PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+    "${CK_ROOT}/include"
+    "${CK_ROOT}/example/ck_tile/38_block_scale_gemm")
+  target_link_libraries(turbine_qgemm_eval PRIVATE hip::host roc::hipblaslt)
+endif()
