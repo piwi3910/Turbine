@@ -56,7 +56,8 @@ enum Output {
     about = "Collective bandwidth benchmark (nccl-tests formulas), checked against the host backend"
 )]
 struct Args {
-    /// A registered collective backend (`collective_backend` registry: host, rccl, nccl).
+    /// A registered collective backend (`collective_backend` registry: host, rccl, nccl,
+    /// hostmem).
     #[arg(long)]
     backend: String,
     /// Explicit collective library (else the backend's default search).
@@ -551,6 +552,7 @@ fn main() -> ExitCode {
                             op_timeout,
                             clock,
                             metrics: Some(metrics),
+                            memory: Some(Arc::clone(&mem)),
                         })
                         .map_err(|e| format!("rank {rank}: {e}"))?;
                     run_rank(&RankEnv { comm, mem }, plan)

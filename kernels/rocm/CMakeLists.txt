@@ -156,8 +156,9 @@ endif()
 # ---- the shared libraries ----
 # Every kernel source is compiled once into an OBJECT library. libturbine_hip.so
 # links it with the ABI v2.4 exports (impl_exports.cpp) and abi_minor.cpp
-# (minor 6: the v2.5 copy streams and the v2.6 stream handle, copy_stream.cpp,
-# and the v2.6 sharded RMSNorm, sharded_norm.hip, are in every build);
+# (minor 7: the v2.5 copy streams and the v2.6 stream handle, copy_stream.cpp,
+# the v2.6 sharded RMSNorm, sharded_norm.hip, and the v2.7 host-mapped memory
+# and collectives, hostmem.hip, are in every build);
 # libturbine_hip_v23.so links the same objects with abi_minor.cpp compiled
 # with TURBINE_V23_BUILD and without the v2.4 exports: a real v2.3 library
 # (minor 3, no implementation group) for the fallback test
@@ -182,6 +183,7 @@ set(TURBINE_SOURCES
   src/moe_grouped.hip
   src/logits_reduce.hip
   src/sharded_norm.hip
+  src/hostmem.hip
   src/impl_table.cpp)
 set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/paged_attention_splitkv.cpp
   src/rmsnorm.cpp ${FMHA_BLOBS})

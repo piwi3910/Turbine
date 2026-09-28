@@ -2,13 +2,15 @@
 //! implements, its error type and the `turbine_collective_*` metrics.
 //!
 //! Buffers are phase-1 [`DeviceSlice`]s and ordering is the phase-1 [`StreamRef`]; a backend
-//! never allocates model memory. Supported element types: BF16 and FP32.
+//! never allocates model memory (`hostmem` allocates only its own mapped exchange region).
+//! Supported element types: BF16 and FP32.
 
 pub mod conformance;
 // The only module of this crate allowed to contain `unsafe` (contract §1.3, CONFLICT C-19).
 #[allow(unsafe_code)]
 pub mod ffi;
 pub mod host;
+pub mod hostmem;
 pub mod nccl_api;
 
 use std::path::Path;
@@ -24,10 +26,11 @@ use turbine_core::config::ParallelConfig;
 use turbine_core::registry::{Module, Registry};
 use turbine_core::types::Vendor;
 use turbine_observability::MetricsRegistry;
-use turbine_tensor::{DType, DeviceSlice, StreamRef};
+use turbine_tensor::{DType, DeviceMemory, DeviceSlice, StreamRef};
 
 pub use ffi::NcclApi;
 pub use host::{HostBackend, HostCollective};
+pub use hostmem::{HostmemBackend, HostmemCollective};
 pub use nccl_api::{NcclApiBackend, NcclFlavor};
 
 /// Element-wise reduction of all-reduce and reduce-scatter.
@@ -108,6 +111,12 @@ pub trait CollectiveBackend: Module {
     }
     /// Loads the backend: `explicit` is the configured library, else the default search.
     fn load(&self, explicit: Option<&Path>) -> Result<Arc<dyn CollectiveLibrary>, CollectiveError>;
+    /// True for a backend whose ranks must be threads of one process (it exchanges through
+    /// memory of that process, e.g. `hostmem`): the planner refuses it in `static` rank mode and
+    /// `auto` skips it there. Default: false.
+    fn one_process_only(&self) -> bool {
+        false
+    }
 }
 
 /// A loaded backend: makes the group's unique id (on one rank) and opens each rank's
@@ -137,14 +146,22 @@ pub struct CollectiveInit {
     pub clock: Arc<dyn Clock>,
     /// `turbine_collective_*`; `None` records nothing (tests).
     pub metrics: Option<CollectiveMetrics>,
+    /// The rank's device memory (its kernel-library context), for a backend that allocates its
+    /// communication buffers and runs its kernels through the kernel library (`hostmem`);
+    /// `None` where the rank has none (the host backend) or the backend needs none.
+    pub memory: Option<Arc<dyn DeviceMemory>>,
 }
 
 static HOST: HostBackend = HostBackend;
 static RCCL: NcclApiBackend = NcclApiBackend::new(&nccl_api::RCCL_FLAVOR);
 static NCCL: NcclApiBackend = NcclApiBackend::new(&nccl_api::NCCL_FLAVOR);
+static HOSTMEM: HostmemBackend = HostmemBackend;
 
+// `hostmem` comes after `rccl`: `auto` keeps RCCL, which serves every rank mode and needs
+// nothing from the kernel library; `hostmem` is chosen by name (`docs/extending/
+// collective-backend.md`).
 static COLLECTIVE_BACKENDS: Registry<dyn CollectiveBackend> =
-    Registry::new("collective_backend", &[&HOST, &RCCL, &NCCL]);
+    Registry::new("collective_backend", &[&HOST, &RCCL, &NCCL, &HOSTMEM]);
 
 /// The registered collective backends, in registration order (`auto` takes the first one
 /// serving the plan's vendor).

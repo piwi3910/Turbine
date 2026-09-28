@@ -10,6 +10,7 @@ pub mod backends;
 pub mod cards;
 pub mod cpu;
 pub(crate) mod ffi;
+mod mapped;
 pub mod ops;
 mod pinned;
 mod registries;

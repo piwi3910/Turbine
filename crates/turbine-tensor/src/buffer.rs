@@ -10,6 +10,7 @@ use std::sync::Arc;
 use turbine_core::types::DeviceId;
 
 use crate::host::HostMemory;
+use crate::mapped::MappedCollectives;
 
 /// Opaque device address. Never dereferenced outside the `unsafe`-allowed crates.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -117,6 +118,13 @@ pub trait DeviceMemory: Send + Sync {
     fn compute_stream(&self) -> StreamRef;
     /// The host backend, when this is one; lets CPU kernels reach the bytes safely.
     fn as_host(&self) -> Option<&HostMemory> {
+        None
+    }
+
+    /// Host memory mapped into every device of the process and the one-shot collective steps
+    /// over it (kernel ABI v2.7), when this backend has them: the `hostmem` collective backend
+    /// runs on it. `None` by default.
+    fn mapped_collectives(&self) -> Option<&dyn MappedCollectives> {
         None
     }
 

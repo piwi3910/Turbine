@@ -205,8 +205,8 @@ fn header_declares_the_v24_minor_revision() {
         "2u",
         "v2.4 keeps major 2"
     );
-    // v2.5 (Phase 4) and v2.6 (Phase 5) raised the minor; the v2.4 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "6u");
+    // v2.5 (Phase 4), v2.6 and v2.7 (Phase 5) raised the minor; the v2.4 group is unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "7u");
     for (i, op) in OpKind::ALL.iter().enumerate() {
         let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
         assert_eq!(define(&code, &name), i.to_string(), "{name}");
@@ -245,8 +245,8 @@ fn header_declares_the_v25_copy_streams() {
         "2u",
         "v2.5 keeps major 2"
     );
-    // v2.6 (Phase 5) raised the minor; the v2.5 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "6u");
+    // v2.6 and v2.7 (Phase 5) raised the minor; the v2.5 group is unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "7u");
     assert_eq!(define(&code, "TURBINE_COPY_H2D"), "0");
     assert_eq!(define(&code, "TURBINE_COPY_D2H"), "1");
     assert_eq!(define(&code, "TURBINE_COPY_D2D"), "2");
@@ -279,7 +279,8 @@ fn header_declares_the_v26_tensor_parallel_group() {
         "2u",
         "v2.6 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "6u");
+    // v2.7 raised the minor; the v2.6 group is unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "7u");
     assert_eq!(define(&code, "TURBINE_OP_ROW_SUMSQ"), "15");
     assert_eq!(define(&code, "TURBINE_OP_RMSNORM_SHARDED"), "16");
     for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
@@ -303,6 +304,62 @@ fn header_declares_the_v26_tensor_parallel_group() {
         assert!(
             flat.contains(decl),
             "turbine_kernels.h lacks the v2.6 {decl}"
+        );
+    }
+}
+
+/// v2.7 (Phase 5, decision "P5: small-message all-reduce latency on novanas"): the minor
+/// becomes 7 and the host-mapped group is declared: the three memory functions, the
+/// `mapped_collective` trio and its descriptor (the member order `ffi::MappedCollectiveDesc`
+/// mirrors), the kinds, reductions and abort reasons. It adds no registry op code (the trio is
+/// driven by the `hostmem` collective backend, not the kernel registry). Breaks if a member or a
+/// code moves (the library would read another field or run another kind).
+#[test]
+fn header_declares_the_v27_host_mapped_group() {
+    let code = strip_comments(&header());
+    assert_eq!(
+        define(&code, "TURBINE_ABI_VERSION"),
+        "2u",
+        "v2.7 keeps major 2"
+    );
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "7u");
+    for (name, value) in [
+        ("TURBINE_MAPPED_ALL_REDUCE", "0"),
+        ("TURBINE_MAPPED_ALL_GATHER", "1"),
+        ("TURBINE_MAPPED_REDUCE_SCATTER", "2"),
+        ("TURBINE_MAPPED_BROADCAST", "3"),
+        ("TURBINE_REDUCE_SUM", "0"),
+        ("TURBINE_REDUCE_MAX", "1"),
+        ("TURBINE_MAPPED_MAX_WORLD", "8"),
+        ("TURBINE_MAPPED_MAX_BLOCKS", "1024"),
+        ("TURBINE_MAPPED_ABORT_TIMEOUT", "1u"),
+        ("TURBINE_MAPPED_ABORT_HOST", "2u"),
+    ] {
+        assert_eq!(define(&code, name), value, "{name}");
+    }
+    assert_eq!(
+        OpKind::ALL.len(),
+        17,
+        "v2.7 adds no op code: TURBINE_OP_RMSNORM_SHARDED stays the last"
+    );
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for decl in [
+        "typedef struct turbine_mapped_collective_desc { const void *send; void *recv; \
+         int64_t bytes, send_stride, recv_stride; void *slots; int64_t slot_bytes; \
+         uint64_t *flags; uint32_t *abort_word; uint64_t seq; int64_t timeout_ns; \
+         int32_t kind, reduce_op, dtype; int32_t rank, world, root; int32_t max_blocks; \
+         } turbine_mapped_collective_desc;",
+        "int32_t turbine_host_alloc_mapped(turbine_ctx *ctx, size_t bytes, void **out);",
+        "int32_t turbine_host_mapped_device_ptr(turbine_ctx *ctx, void *host, void **out);",
+        "int32_t turbine_host_free_mapped(turbine_ctx *ctx, void *host);",
+        "int32_t turbine_mapped_collective(turbine_ctx *ctx, \
+         const turbine_mapped_collective_desc *d);",
+        "int32_t turbine_mapped_collective_supported(const turbine_mapped_collective_desc *d);",
+        "const char * turbine_mapped_collective_impl(const turbine_mapped_collective_desc *d);",
+    ] {
+        assert!(
+            flat.contains(decl),
+            "turbine_kernels.h lacks the v2.7 {decl}"
         );
     }
 }

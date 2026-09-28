@@ -249,19 +249,28 @@ fn link_groups(
     Ok(groups)
 }
 
-/// The collective backend of a plan on `vendor` with `tp` ranks per group, from the
-/// `collective_backend` registry: a configured name must serve the plan (a host-memory backend
-/// only without tensor parallelism, a device backend only its vendors); `auto` is `host` for
-/// tp = 1, else the first registered backend serving `vendor`.
-fn choose_backend(name: &str, vendor: Vendor, tp: u32) -> Result<&'static str, PlanError> {
+/// The collective backend of a plan on `vendor` with `tp` ranks per group in rank `mode`, from
+/// the `collective_backend` registry: a configured name must serve the plan (a host-memory
+/// backend only without tensor parallelism, a device backend only its vendors, a one-process
+/// backend only in `local` mode); `auto` is `host` for tp = 1, else the first registered backend
+/// serving `vendor` (in `static` mode: that also crosses processes).
+fn choose_backend(
+    name: &str,
+    vendor: Vendor,
+    tp: u32,
+    mode: RankMode,
+) -> Result<&'static str, PlanError> {
     let registry = crate::collective::registry();
+    let crosses = |b: &dyn crate::collective::CollectiveBackend| {
+        mode != RankMode::Static || !b.one_process_only()
+    };
     if name == "auto" {
         if tp == 1 {
             return Ok(crate::collective::HostBackend.name());
         }
         return registry
             .iter()
-            .find(|b| b.vendors().contains(&vendor))
+            .find(|b| b.vendors().contains(&vendor) && crosses(*b))
             .map(|b| b.name())
             .ok_or_else(|| {
                 err(
@@ -291,6 +300,16 @@ fn choose_backend(name: &str, vendor: Vendor, tp: u32) -> Result<&'static str, P
         return Err(err(
             BACKEND_KEY,
             format!("`{name}` cannot drive {} devices", vendor.as_str()),
+        ));
+    }
+    if !crosses(backend) {
+        return Err(err(
+            BACKEND_KEY,
+            format!(
+                "`{name}` exchanges data through memory of one process, so its ranks must be \
+                 threads of one process (parallel.ranks.mode local); static mode needs a \
+                 backend that crosses processes"
+            ),
         ));
     }
     Ok(backend.name())
@@ -502,7 +521,7 @@ pub fn plan(
     }
 
     // 5. Collective backend.
-    let backend = choose_backend(cfg.collective_backend.as_str(), vendor, tp)?;
+    let backend = choose_backend(cfg.collective_backend.as_str(), vendor, tp, cfg.ranks.mode)?;
 
     for r in &reasons {
         tracing::info!(event = "parallel_plan_decision", reason = %r, "parallel plan decision");
@@ -564,7 +583,7 @@ pub fn plan_execution_device(
     }
     let name = cfg.collective_backend.as_str();
     let backend = match vendor {
-        Some(v) => choose_backend(name, v, 1)?,
+        Some(v) => choose_backend(name, v, 1, RankMode::Local)?,
         // The cpu reference backend has no device memory: only a host-memory backend.
         None => match crate::collective::registry().get(name) {
             _ if name == "auto" => crate::collective::HostBackend.name(),
@@ -956,20 +975,30 @@ mod tests {
     #[test]
     fn backend_from_registry() {
         use super::choose_backend;
-        assert_eq!(choose_backend("auto", Vendor::Amd, 2), Ok("rccl"));
-        assert_eq!(choose_backend("auto", Vendor::Nvidia, 4), Ok("nccl"));
-        assert_eq!(choose_backend("auto", Vendor::Amd, 1), Ok("host"));
-        assert_eq!(choose_backend("host", Vendor::Amd, 1), Ok("host"));
-        assert_eq!(choose_backend("rccl", Vendor::Amd, 1), Ok("rccl"));
-        for (name, vendor, tp) in [
-            ("host", Vendor::Amd, 2),
-            ("rccl", Vendor::Nvidia, 2),
-            ("nccl", Vendor::Amd, 2),
-            ("gloo", Vendor::Amd, 2),
+        let (local, stat) = (RankMode::Local, RankMode::Static);
+        assert_eq!(choose_backend("auto", Vendor::Amd, 2, local), Ok("rccl"));
+        assert_eq!(choose_backend("auto", Vendor::Amd, 2, stat), Ok("rccl"));
+        assert_eq!(choose_backend("auto", Vendor::Nvidia, 4, local), Ok("nccl"));
+        assert_eq!(choose_backend("auto", Vendor::Amd, 1, local), Ok("host"));
+        assert_eq!(choose_backend("host", Vendor::Amd, 1, local), Ok("host"));
+        assert_eq!(choose_backend("rccl", Vendor::Amd, 1, local), Ok("rccl"));
+        assert_eq!(
+            choose_backend("hostmem", Vendor::Amd, 2, local),
+            Ok("hostmem")
+        );
+        for (name, vendor, tp, mode) in [
+            ("host", Vendor::Amd, 2, local),
+            ("rccl", Vendor::Nvidia, 2, local),
+            ("nccl", Vendor::Amd, 2, local),
+            ("gloo", Vendor::Amd, 2, local),
+            ("hostmem", Vendor::Nvidia, 2, local),
+            ("hostmem", Vendor::Amd, 2, stat),
         ] {
-            let e = choose_backend(name, vendor, tp).expect_err(name);
+            let e = choose_backend(name, vendor, tp, mode).expect_err(name);
             assert_eq!(e.key, "parallel.collective_backend", "{name}: {e}");
         }
+        let e = choose_backend("hostmem", Vendor::Amd, 2, stat).expect_err("static");
+        assert!(e.reason.contains("parallel.ranks.mode local"), "{e}");
     }
 
     /// The server's single-device paths: the `cpu` reference backend (no vendor, every replica

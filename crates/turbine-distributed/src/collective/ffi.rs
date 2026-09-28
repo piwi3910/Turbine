@@ -696,6 +696,7 @@ impl NcclCollective {
             op_timeout,
             clock,
             metrics,
+            memory: _,
         } = init;
         let backend = api.backend_name();
         let (Ok(nranks), Ok(rank_c)) = (c_int::try_from(world), c_int::try_from(rank)) else {
@@ -1223,6 +1224,7 @@ mod tests {
             op_timeout,
             clock: Arc::new(turbine_core::clock::SystemClock::new()),
             metrics,
+            memory: None,
         }
     }
 
