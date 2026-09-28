@@ -37,6 +37,7 @@ pub use chat_template::ChatTemplate;
 pub use config::MoeConfig;
 pub use config::{
     GenerationConfig, ModelArchConfig, RopeScaling, load_generation_config, load_model_config,
+    load_model_config_with,
 };
 pub use ep::EpContext;
 pub use families::{FamilyConfig, FamilyRef, ModelFamily, llama_slots, mixtral_slots, olmoe_slots};

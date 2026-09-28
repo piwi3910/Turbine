@@ -1308,3 +1308,58 @@ fn parallel_mode_rules() {
         "parallel.devices",
     );
 }
+
+/// P6a S-15 / S-18 (rope part of `phase6_keys`): `model.rope_scaling` is a mapping with
+/// Hugging Face's field names that replaces `config.json`'s `rope_scaling`; types that scale
+/// dynamically are refused naming the key (exit 2); the fields are checked at model load.
+#[test]
+fn phase6_keys_rope() {
+    let base = "model:\n  path: /m\n";
+    assert_eq!(parse(base, &[]).unwrap().model.rope_scaling, None);
+    let c = parse(
+        base,
+        &[
+            "model.rope_scaling={rope_type: yarn, factor: 16.0, original_max_position_embeddings: 8192}",
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        c.model.rope_scaling,
+        Some(serde_json::json!({
+            "rope_type": "yarn", "factor": 16.0, "original_max_position_embeddings": 8192
+        }))
+    );
+    let c = parse(
+        "model:\n  path: /m\n  rope_scaling:\n    type: yarn\n    factor: 4\n    truncate: false\n",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(c.model.rope_scaling.as_ref().unwrap()["truncate"], false);
+    for accepted in ["default", "llama3", "yarn"] {
+        let set = format!("model.rope_scaling={{rope_type: {accepted}, factor: 2.0}}");
+        assert!(parse(base, &[&set]).is_ok(), "{accepted}");
+    }
+    assert_eq!(
+        parse(base, &["model.rope_scaling=null"])
+            .unwrap()
+            .model
+            .rope_scaling,
+        None
+    );
+    for refused in [
+        "{rope_type: dynamic, factor: 2.0}",
+        "{rope_type: linear, factor: 2.0}",
+        "{rope_type: longrope, factor: 2.0}",
+        "{type: dynamic, factor: 2.0}",
+        "{rope_type: yarn, factor: 2.0, dynamic: true}",
+        "{factor: 2.0}",
+        "yarn",
+        "[yarn]",
+    ] {
+        assert_rejected(
+            base,
+            &[&format!("model.rope_scaling={refused}")],
+            "model.rope_scaling",
+        );
+    }
+}

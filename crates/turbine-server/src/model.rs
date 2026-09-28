@@ -38,7 +38,7 @@ use turbine_model::tp::{self, ShardSpec};
 use turbine_model::{
     ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES, ModelArchConfig,
     ModelError, ModelFamily, ModelMetrics, SafetensorsIndex, Tokenizer, WeightLoader,
-    load_generation_config, load_model_config,
+    load_generation_config, load_model_config_with,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_reliability::budget::{BudgetInputs, DeviceBudget, PoolKind, compute_budget};
@@ -419,7 +419,8 @@ fn prepare_with(
             dir.display()
         )));
     }
-    let arch = load_model_config(dir).map_err(|e| model_error("model config", e))?;
+    let arch = load_model_config_with(dir, config.model.rope_scaling.as_ref())
+        .map_err(|e| model_error("model config", e))?;
     let generation = if dir.join("generation_config.json").is_file() {
         load_generation_config(dir).map_err(|e| model_error("generation config", e))?
     } else {
@@ -435,8 +436,12 @@ fn prepare_with(
     let template = ChatTemplate::resolve(dir, config.model.chat_template.as_deref())
         .map(Arc::new)
         .map_err(|e| model_error("chat template", e))?;
-    let max_seq_len = resolve_max_seq_len(config.model.max_seq_len, arch.max_position_embeddings)
-        .map_err(StartupError::new)?;
+    let max_seq_len = resolve_max_seq_len(
+        config.model.max_seq_len,
+        arch.max_position_embeddings,
+        arch.max_positions(),
+    )
+    .map_err(StartupError::new)?;
     let index = SafetensorsIndex::open(dir).map_err(|e| model_error("weights", e))?;
     arch.check_supported_weights(&index)
         .map_err(|e| model_error("weights", e))?;

@@ -125,6 +125,9 @@ pub struct DecoderDims {
     pub layers: usize,
     /// RMSNorm epsilon.
     pub eps: f32,
+    /// The attention softmax scale ([`ModelArchConfig::attention_scale`]: `head_dim^-0.5`,
+    /// times YaRN's attention factor squared).
+    pub attn_scale: f32,
     /// Weights, activations and KV dtype (the weight format's; logits are F32).
     pub act: DType,
     /// The LM head is `embed_tokens` (`tie_word_embeddings`).
@@ -171,6 +174,7 @@ impl DecoderDims {
             vocab: cfg.vocab_size as usize,
             layers: cfg.num_layers as usize,
             eps: cfg.rms_norm_eps,
+            attn_scale: cfg.attention_scale(),
             act: cfg.activation_dtype(),
             tied_lm_head: cfg.tie_word_embeddings,
             moe: cfg.moe,
@@ -589,7 +593,7 @@ fn batch_limits(cfg: &ModelArchConfig, limits: ExecutorLimits) -> BatchLimits {
         vocab: cfg.vocab_size,
         max_batch_tokens: limits.max_batch_tokens,
         max_seqs: limits.max_seqs,
-        max_positions: cfg.max_position_embeddings,
+        max_positions: cfg.max_positions(),
         layout: cfg.kv_layout(limits.block_tokens),
     }
 }
@@ -1675,7 +1679,7 @@ impl DecoderExecutor {
                     max_q_len: p.max_q_len,
                     max_kv_len: p.max_kv_len,
                     max_blocks_per_seq: p.max_blocks_per_seq,
-                    scale: 1.0 / (d.head_dim as f32).sqrt(),
+                    scale: d.attn_scale,
                 })
         })?;
         self.record(li, "attn", at(&b.attn))?;

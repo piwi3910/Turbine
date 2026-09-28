@@ -16,11 +16,13 @@ use smallvec::SmallVec;
 use turbine_core::types::{KvLayout, ModelShape};
 
 use crate::ModelError;
+use crate::executor::rope::yarn_attention_factor;
 use crate::families::{FamilyRef, resolve};
 use crate::safetensors::SafetensorsIndex;
 use crate::weights::{WeightFormatRef, detect};
 
-/// `config.json` `rope_scaling` (absent or `rope_type: default` → `None`).
+/// `config.json` `rope_scaling`, or the `model.rope_scaling` override that replaces it (absent
+/// or `rope_type: default` → `None`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 #[non_exhaustive]
 pub enum RopeScaling {
@@ -29,6 +31,20 @@ pub enum RopeScaling {
         low_freq_factor: f64,
         high_freq_factor: f64,
         original_max_position_embeddings: u32,
+    },
+    /// Static YaRN (P6a S-15), every field resolved as transformers 4.57.1 resolves it:
+    /// `original_max_position_embeddings` defaults to `max_position_embeddings`, the betas to
+    /// 32 / 1, `truncate` to true, and `attention_factor` to
+    /// [`crate::executor::rope::yarn_attention_factor`] of `factor`, `mscale` and
+    /// `mscale_all_dim`. The attention factor scales the attention logits by its square
+    /// ([`ModelArchConfig::attention_scale`]), not the rotary table.
+    Yarn {
+        factor: f64,
+        original_max_position_embeddings: u32,
+        beta_fast: f64,
+        beta_slow: f64,
+        attention_factor: f64,
+        truncate: bool,
     },
 }
 
@@ -105,8 +121,85 @@ impl ModelArchConfig {
             experts_per_token: self.moe.map_or(0, |m| m.experts_per_token),
             tied_embeddings: self.tie_word_embeddings,
             weight_bytes: self.weight_format.0.weight_bytes(self),
-            max_position_embeddings: self.max_position_embeddings,
+            max_position_embeddings: self.max_positions(),
         }
+    }
+
+    /// The longest sequence the model serves: `max_position_embeddings`, or with YaRN
+    /// `factor × original_max_position_embeddings` when that is larger and the original
+    /// context is below `max_position_embeddings` (with `original ≥ max_position_embeddings`
+    /// there is nothing to extend; P6a S-15).
+    pub fn max_positions(&self) -> u32 {
+        match self.rope_scaling {
+            Some(RopeScaling::Yarn {
+                factor,
+                original_max_position_embeddings: original,
+                ..
+            }) if original < self.max_position_embeddings => {
+                let extended = (factor * f64::from(original))
+                    .floor()
+                    .min(f64::from(u32::MAX));
+                self.max_position_embeddings.max(extended as u32)
+            }
+            _ => self.max_position_embeddings,
+        }
+    }
+
+    /// The attention softmax scale: `head_dim^-0.5`, times YaRN's `attention_factor²`
+    /// (transformers scales cos and sin, hence Q and K, by the factor; folding it into the
+    /// scale keeps the RoPE ABI unchanged — user decision 2026-09-28, Q19). Without YaRN it is
+    /// exactly `1 / sqrt(head_dim)` in FP32, as before Phase 6a.
+    pub fn attention_scale(&self) -> f32 {
+        let base = 1.0 / (self.head_dim as f32).sqrt();
+        match self.rope_scaling {
+            Some(RopeScaling::Yarn {
+                attention_factor, ..
+            }) => base * (attention_factor * attention_factor) as f32,
+            _ => base,
+        }
+    }
+
+    /// Canonical JSON of the resolved RoPE parameters (`theta` and every scaling field, keys
+    /// sorted), for the prefix-cache namespace (P6a S-16): blocks cached under one RoPE
+    /// configuration must never be reused under another.
+    pub fn rope_identity(&self) -> String {
+        let scaling = match self.rope_scaling {
+            None => serde_json::Value::Null,
+            Some(RopeScaling::Llama3 {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position_embeddings,
+            }) => serde_json::json!({
+                "type": "llama3",
+                "factor": factor,
+                "low_freq_factor": low_freq_factor,
+                "high_freq_factor": high_freq_factor,
+                "original_max_position_embeddings": original_max_position_embeddings,
+            }),
+            Some(RopeScaling::Yarn {
+                factor,
+                original_max_position_embeddings,
+                beta_fast,
+                beta_slow,
+                attention_factor,
+                truncate,
+            }) => serde_json::json!({
+                "type": "yarn",
+                "factor": factor,
+                "original_max_position_embeddings": original_max_position_embeddings,
+                "beta_fast": beta_fast,
+                "beta_slow": beta_slow,
+                "attention_factor": attention_factor,
+                "truncate": truncate,
+            }),
+        };
+        let value = serde_json::json!({
+            "theta": self.rope_theta,
+            "rotary_dim": self.head_dim,
+            "scaling": scaling,
+        });
+        canonical_json(&value)
     }
 
     /// Per-token K and V of every layer, in BF16 (the configured `kv.dtype` replaces this in
@@ -153,6 +246,28 @@ impl ModelArchConfig {
         }
         Ok(())
     }
+}
+
+/// Compact JSON with every object's keys sorted, whatever `serde_json`'s map order is.
+fn canonical_json(value: &serde_json::Value) -> String {
+    fn sorted(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut out = serde_json::Map::new();
+                for k in keys {
+                    out.insert(k.clone(), sorted(&map[k]));
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(sorted).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    sorted(value).to_string()
 }
 
 /// `eos_token_id` is an int or a list of ints in HF configs.
@@ -253,6 +368,17 @@ pub fn load_generation_config(dir: &Path) -> Result<GenerationConfig, ModelError
 /// Parses `config.json` (and `generation_config.json` for EOS ids) in `dir` and applies the
 /// model-family and weight-format allowlist.
 pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
+    load_model_config_with(dir, None)
+}
+
+/// [`load_model_config`] with the configuration key `model.rope_scaling` (a mapping with
+/// Hugging Face's field names): when given, it replaces `config.json`'s `rope_scaling`
+/// wholesale (P6a S-15, user decision 2026-09-28, Q19), and its refusals name
+/// `model.rope_scaling`.
+pub fn load_model_config_with(
+    dir: &Path,
+    rope_scaling: Option<&serde_json::Value>,
+) -> Result<ModelArchConfig, ModelError> {
     let config_path = dir.join("config.json");
     let top: serde_json::Value = read_json(&config_path)?;
     let invalid = |detail: String| ModelError::Io {
@@ -340,7 +466,20 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
             "the dimensions give {elements} weight elements, too large to address"
         )));
     }
-    let rope_scaling = parse_rope_scaling(raw.rope_scaling, &config_path)?;
+    let rope_scaling = match rope_scaling {
+        Some(over) => parse_rope_scaling(
+            Some(over),
+            raw.max_position_embeddings,
+            "model.rope_scaling",
+            &config_path,
+        )?,
+        None => parse_rope_scaling(
+            raw.rope_scaling.as_ref(),
+            raw.max_position_embeddings,
+            "rope_scaling",
+            &config_path,
+        )?,
+    };
     let eos_token_ids = load_eos(dir, raw.eos_token_id, &config_path)?;
 
     Ok(ModelArchConfig {
@@ -366,12 +505,24 @@ pub fn load_model_config(dir: &Path) -> Result<ModelArchConfig, ModelError> {
     })
 }
 
+/// The RoPE scaling types Turbine implements; `dynamic`, `linear`, `longrope` and the rest are
+/// refused (dynamic scaling would change cached keys mid-sequence; P6a S-15).
+const SUPPORTED_ROPE_TYPES: &str = "default, llama3, yarn";
+
+/// `rope_scaling` of `config.json` (`key` = `rope_scaling`) or the `model.rope_scaling`
+/// override that replaces it (`key` = `model.rope_scaling`); refusals name `key`.
 fn parse_rope_scaling(
-    value: Option<serde_json::Value>,
+    value: Option<&serde_json::Value>,
+    max_position_embeddings: u32,
+    key: &str,
     config_path: &Path,
 ) -> Result<Option<RopeScaling>, ModelError> {
-    let Some(value) = value.filter(|v| !v.is_null()) else {
+    let Some(value) = value.filter(|v| !v.is_null()).cloned() else {
         return Ok(None);
+    };
+    let invalid = |detail: String| ModelError::Io {
+        path: config_path.to_path_buf(),
+        detail: format!("{key}: {detail}"),
     };
     // Older configs spell the key `type`.
     let rope_type = value
@@ -382,31 +533,25 @@ fn parse_rope_scaling(
         .to_string();
     match rope_type.as_str() {
         "default" => Ok(None),
+        "yarn" => parse_yarn(&value, max_position_embeddings, key, &invalid).map(Some),
         "llama3" => {
             let raw: RawLlama3Scaling =
-                serde_json::from_value(value).map_err(|e| ModelError::Io {
-                    path: config_path.to_path_buf(),
-                    detail: format!("rope_scaling: {e}"),
-                })?;
+                serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
             // The interpolated band divides by `high − low`: equal factors give NaN frequencies.
             let valid = raw.factor > 0.0
                 && raw.low_freq_factor > 0.0
                 && raw.high_freq_factor > raw.low_freq_factor
                 && raw.original_max_position_embeddings > 0;
             if !valid {
-                return Err(ModelError::Io {
-                    path: config_path.to_path_buf(),
-                    detail: format!(
-                        "rope_scaling: llama3 requires factor > 0, 0 < low_freq_factor < \
-                         high_freq_factor and original_max_position_embeddings > 0 (got factor \
-                         {}, low_freq_factor {}, high_freq_factor {}, \
-                         original_max_position_embeddings {})",
-                        raw.factor,
-                        raw.low_freq_factor,
-                        raw.high_freq_factor,
-                        raw.original_max_position_embeddings
-                    ),
-                });
+                return Err(invalid(format!(
+                    "llama3 requires factor > 0, 0 < low_freq_factor < high_freq_factor and \
+                     original_max_position_embeddings > 0 (got factor {}, low_freq_factor {}, \
+                     high_freq_factor {}, original_max_position_embeddings {})",
+                    raw.factor,
+                    raw.low_freq_factor,
+                    raw.high_freq_factor,
+                    raw.original_max_position_embeddings
+                )));
             }
             Ok(Some(RopeScaling::Llama3 {
                 factor: raw.factor,
@@ -416,11 +561,94 @@ fn parse_rope_scaling(
             }))
         }
         _ => Err(unsupported(
-            "rope_scaling.rope_type",
+            &format!("{key}.rope_type"),
             rope_type,
-            "default, llama3",
+            SUPPORTED_ROPE_TYPES,
         )),
     }
+}
+
+/// A `yarn` entry, resolved as transformers 4.57.1's `_compute_yarn_parameters` resolves it:
+/// a missing, null or zero `original_max_position_embeddings`, `beta_fast` or `beta_slow`
+/// takes its default (Python `or`: `max_position_embeddings`, 32, 1); `truncate` defaults to
+/// true; a missing `attention_factor` is [`yarn_attention_factor`]. `dynamic: true` is refused;
+/// other keys are ignored, as transformers ignores them.
+fn parse_yarn(
+    value: &serde_json::Value,
+    max_position_embeddings: u32,
+    key: &str,
+    invalid: &dyn Fn(String) -> ModelError,
+) -> Result<RopeScaling, ModelError> {
+    let number = |name: &str| -> Result<Option<f64>, ModelError> {
+        match value.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => v
+                .as_f64()
+                .map(Some)
+                .ok_or_else(|| invalid(format!("yarn {name} must be a number (got {v})"))),
+        }
+    };
+    let flag = |name: &str, default: bool| -> Result<bool, ModelError> {
+        match value.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(default),
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| invalid(format!("yarn {name} must be a boolean (got {v})"))),
+        }
+    };
+    if flag("dynamic", false)? {
+        return Err(unsupported(&format!("{key}.dynamic"), "true", "false"));
+    }
+    let factor = number("factor")?.ok_or_else(|| invalid("yarn requires factor".to_string()))?;
+    let original_max_position_embeddings = match value.get("original_max_position_embeddings") {
+        None | Some(serde_json::Value::Null) => max_position_embeddings,
+        Some(v) => match v.as_u64() {
+            Some(0) => max_position_embeddings,
+            Some(n) => u32::try_from(n).map_err(|_| {
+                invalid(format!(
+                    "yarn original_max_position_embeddings {n} is too large"
+                ))
+            })?,
+            None => {
+                return Err(invalid(format!(
+                    "yarn original_max_position_embeddings must be a positive integer (got {v})"
+                )));
+            }
+        },
+    };
+    let or = |v: Option<f64>, default: f64| v.filter(|&x| x != 0.0).unwrap_or(default);
+    let beta_fast = or(number("beta_fast")?, 32.0);
+    let beta_slow = or(number("beta_slow")?, 1.0);
+    let attention_factor = match number("attention_factor")? {
+        Some(a) => a,
+        None => yarn_attention_factor(factor, number("mscale")?, number("mscale_all_dim")?),
+    };
+    let truncate = flag("truncate", true)?;
+    // transformers only warns on these; a factor below 1, a non-positive attention factor or
+    // inverted betas give no meaningful extension, so Turbine refuses them.
+    let valid = factor.is_finite()
+        && factor >= 1.0
+        && attention_factor.is_finite()
+        && attention_factor > 0.0
+        && beta_slow.is_finite()
+        && beta_fast.is_finite()
+        && beta_slow > 0.0
+        && beta_slow <= beta_fast;
+    if !valid {
+        return Err(invalid(format!(
+            "yarn requires factor >= 1, attention_factor > 0 and 0 < beta_slow <= beta_fast \
+             (got factor {factor}, attention_factor {attention_factor}, beta_fast {beta_fast}, \
+             beta_slow {beta_slow})"
+        )));
+    }
+    Ok(RopeScaling::Yarn {
+        factor,
+        original_max_position_embeddings,
+        beta_fast,
+        beta_slow,
+        attention_factor,
+        truncate,
+    })
 }
 
 /// EOS ids from `generation_config.json` when it names any, else from `config.json`.
@@ -834,15 +1062,304 @@ mod tests {
         assert!(value.contains(f8), "{value}");
         assert_eq!(supported, "BF16");
 
-        let dir = edited_config("yarn", |v| {
-            v["rope_scaling"] = serde_json::json!({"rope_type": "yarn", "factor": 4.0});
+        // Dynamic scaling would change cached keys mid-sequence (P6a S-15).
+        let dir = edited_config("dynamic", |v| {
+            v["rope_scaling"] = serde_json::json!({"rope_type": "dynamic", "factor": 4.0});
         });
         let (field, value, supported) = unsupported(load_model_config(&dir).unwrap_err());
         assert_eq!(
             (field.as_str(), value.as_str(), supported.as_str()),
-            ("rope_scaling.rope_type", "yarn", "default, llama3")
+            ("rope_scaling.rope_type", "dynamic", "default, llama3, yarn")
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The committed transformers values (`tests/fixtures/yarn_params.json`, written by
+    /// `scripts/golden/yarn_params.py` with transformers 4.57.1).
+    fn yarn_fixture() -> serde_json::Value {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/yarn_params.json");
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    /// The target config with a fixture entry's RoPE keys (`rope_theta`, `head_dim`,
+    /// `max_position_embeddings`, `rope_scaling`).
+    fn yarn_config(name: &str, entry: &serde_json::Value) -> PathBuf {
+        edited_config(&format!("yarn-{name}"), |v| {
+            for key in [
+                "rope_theta",
+                "head_dim",
+                "max_position_embeddings",
+                "rope_scaling",
+            ] {
+                v[key] = entry[key].clone();
+            }
+        })
+    }
+
+    /// One FP32 unit in the last place of `x`.
+    fn ulp(x: f32) -> f64 {
+        f64::from(f32::from_bits(x.to_bits() + 1) - x)
+    }
+
+    /// P6a S-15: `inv_freq` and the attention factor of four YaRN configurations equal
+    /// transformers' (`LlamaRotaryEmbedding`, i.e. `_compute_yarn_parameters`). transformers
+    /// evaluates the blend in FP32 with a 1-ulp `powf`; Turbine evaluates it in FP64 and rounds
+    /// once, so each frequency must lie within 2 FP32 ulps of transformers' (≈ 1.5e-7
+    /// relative at worst). The attention factor is FP64 on both sides and must be equal to
+    /// 1e-12 relative; the attention scale is `head_dim^-0.5 · attention_factor²`.
+    #[test]
+    fn yarn_parameters_match_transformers() {
+        let fixture = yarn_fixture();
+        assert_eq!(fixture["transformers"], "4.57.1");
+        let configs = fixture["configs"].as_array().unwrap();
+        let names: Vec<&str> = configs
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "llama-yarn16",
+                "qwen3-yarn4",
+                "gpt-oss-yarn32",
+                "mscale-pair"
+            ]
+        );
+        for c in configs {
+            let name = c["name"].as_str().unwrap();
+            let dir = yarn_config(name, &c["config"]);
+            let cfg = load_model_config(&dir).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+            let Some(RopeScaling::Yarn {
+                attention_factor, ..
+            }) = cfg.rope_scaling
+            else {
+                panic!("{name}: expected YaRN, got {:?}", cfg.rope_scaling);
+            };
+            let want: Vec<f64> = c["inv_freq"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap())
+                .collect();
+            let got = crate::executor::rope::inv_freq(
+                cfg.rope_theta,
+                cfg.head_dim,
+                cfg.rope_scaling.as_ref(),
+            );
+            assert_eq!(got.len(), want.len(), "{name}");
+            let mut max_rel = 0f64;
+            for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                let diff = (f64::from(g) - w).abs();
+                max_rel = max_rel.max(diff / w);
+                assert!(
+                    diff <= 2.0 * ulp(w as f32),
+                    "{name}: inv_freq[{i}] = {g:e}, transformers {w:e}"
+                );
+            }
+            let want_af = c["attention_factor"].as_f64().unwrap();
+            assert!(
+                (attention_factor - want_af).abs() <= 1e-12 * want_af,
+                "{name}: attention factor {attention_factor}, transformers {want_af}"
+            );
+            let base = 1.0 / (cfg.head_dim as f32).sqrt();
+            assert_eq!(
+                cfg.attention_scale(),
+                base * (attention_factor * attention_factor) as f32,
+                "{name}"
+            );
+            eprintln!(
+                "{name}: inv_freq max relative error {max_rel:.3e}, attention factor \
+                 {attention_factor}"
+            );
+        }
+        // Without YaRN the scale is exactly the Phase 1 one.
+        let plain = load_model_config(&fixture_dir()).unwrap();
+        assert_eq!(plain.attention_scale(), 1.0 / (128f32).sqrt());
+    }
+
+    /// The configuration key `model.rope_scaling` replaces `config.json`'s entry wholesale
+    /// (P6a S-15), here Llama-3.2's `llama3` scaling by the factor-16 YaRN of the proof.
+    #[test]
+    fn yarn_override_replaces_config_entry() {
+        let fixture = yarn_fixture();
+        let llama = &fixture["configs"][0];
+        let over = &llama["config"]["rope_scaling"];
+        let cfg = load_model_config_with(&fixture_dir(), Some(over)).unwrap();
+        assert_eq!(
+            cfg.rope_scaling,
+            Some(RopeScaling::Yarn {
+                factor: 16.0,
+                original_max_position_embeddings: 8192,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                attention_factor: llama["attention_factor"].as_f64().unwrap(),
+                truncate: true,
+            })
+        );
+        // `default` turns scaling off; no override keeps config.json's.
+        let off = serde_json::json!({"rope_type": "default"});
+        assert_eq!(
+            load_model_config_with(&fixture_dir(), Some(&off))
+                .unwrap()
+                .rope_scaling,
+            None
+        );
+        assert!(matches!(
+            load_model_config_with(&fixture_dir(), None)
+                .unwrap()
+                .rope_scaling,
+            Some(RopeScaling::Llama3 { .. })
+        ));
+        // A refused override names the configuration key.
+        let dynamic = serde_json::json!({"rope_type": "dynamic", "factor": 2.0});
+        let (field, value, supported) =
+            unsupported(load_model_config_with(&fixture_dir(), Some(&dynamic)).unwrap_err());
+        assert_eq!(
+            (field.as_str(), value.as_str(), supported.as_str()),
+            (
+                "model.rope_scaling.rope_type",
+                "dynamic",
+                "default, llama3, yarn"
+            )
+        );
+    }
+
+    /// YaRN defaults (transformers' `or` rules), and what is refused: a `dynamic` flag, the
+    /// other scaling types, and values that give no valid ramp or scale.
+    #[test]
+    fn yarn_defaults_and_refusals() {
+        // `type` spelling; only the factor given: original = max_position_embeddings, betas
+        // 32 / 1, truncate true, attention factor 0.1·ln(factor) + 1.
+        let dir = edited_config("yarn-defaults", |v| {
+            v["rope_scaling"] = serde_json::json!({"type": "yarn", "factor": 4.0});
+        });
+        let cfg = load_model_config(&dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(
+            cfg.rope_scaling,
+            Some(RopeScaling::Yarn {
+                factor: 4.0,
+                original_max_position_embeddings: 131_072,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                attention_factor: 0.1 * 4f64.ln() + 1.0,
+                truncate: true,
+            })
+        );
+        // An explicit attention factor wins over mscale; `truncate: false` is kept.
+        let dir = edited_config("yarn-explicit", |v| {
+            v["rope_scaling"] = serde_json::json!({
+                "rope_type": "yarn", "factor": 8.0, "original_max_position_embeddings": 4096,
+                "attention_factor": 1.5, "mscale": 2.0, "mscale_all_dim": 1.0,
+                "truncate": false, "dynamic": false
+            });
+        });
+        let cfg = load_model_config(&dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(matches!(
+            cfg.rope_scaling,
+            Some(RopeScaling::Yarn { attention_factor, truncate: false, .. })
+                if attention_factor == 1.5
+        ));
+
+        for (name, scaling) in [
+            (
+                "linear",
+                serde_json::json!({"rope_type": "linear", "factor": 2.0}),
+            ),
+            (
+                "longrope",
+                serde_json::json!({"rope_type": "longrope", "factor": 2.0}),
+            ),
+        ] {
+            let dir = edited_config(name, |v| v["rope_scaling"] = scaling);
+            let (field, value, supported) = unsupported(load_model_config(&dir).unwrap_err());
+            assert_eq!(
+                (field.as_str(), value.as_str(), supported.as_str()),
+                ("rope_scaling.rope_type", name, "default, llama3, yarn")
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+        let dir = edited_config("yarn-dynamic", |v| {
+            v["rope_scaling"] =
+                serde_json::json!({"rope_type": "yarn", "factor": 4.0, "dynamic": true});
+        });
+        let (field, value, supported) = unsupported(load_model_config(&dir).unwrap_err());
+        assert_eq!(
+            (field.as_str(), value.as_str(), supported.as_str()),
+            ("rope_scaling.dynamic", "true", "false")
+        );
+        fs::remove_dir_all(dir).unwrap();
+
+        for (name, key, value) in [
+            ("yarn-small-factor", "factor", serde_json::json!(0.5)),
+            ("yarn-zero-af", "attention_factor", serde_json::json!(0.0)),
+            ("yarn-inverted-betas", "beta_slow", serde_json::json!(64.0)),
+        ] {
+            let dir = edited_config(name, |v| {
+                v["rope_scaling"] = serde_json::json!({"rope_type": "yarn", "factor": 4.0});
+                v["rope_scaling"][key] = value;
+            });
+            match load_model_config(&dir).unwrap_err() {
+                ModelError::Io { detail, .. } => assert!(
+                    detail.starts_with("rope_scaling: yarn requires factor >= 1"),
+                    "{name}: {detail}"
+                ),
+                other => panic!("{name}: expected Io, got {other:?}"),
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// `model.max_seq_len` may extend to `factor × original_max_position_embeddings` when
+    /// `max_position_embeddings` is smaller; with nothing to extend (original ≥ max) or no YaRN
+    /// the model's own `max_position_embeddings` stays the bound (P6a S-15).
+    #[test]
+    fn yarn_extends_max_positions() {
+        let qwen3 = yarn_fixture()["configs"][1]["config"].clone();
+        let dir = yarn_config("qwen3-ext", &qwen3);
+        let cfg = load_model_config(&dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(cfg.max_position_embeddings, 40_960);
+        assert_eq!(cfg.max_positions(), 131_072);
+        assert_eq!(cfg.shape().max_position_embeddings, 131_072);
+
+        let dir = edited_config("yarn-no-ext", |v| {
+            v["max_position_embeddings"] = serde_json::json!(4096);
+            v["rope_scaling"] = serde_json::json!({
+                "rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 8192
+            });
+        });
+        let cfg = load_model_config(&dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(cfg.max_positions(), 4096);
+
+        let plain = load_model_config(&fixture_dir()).unwrap();
+        assert_eq!(plain.max_positions(), plain.max_position_embeddings);
+    }
+
+    /// The canonical RoPE description the prefix namespace will carry (Task 27): equal for
+    /// equal parameters, different when any of them differs.
+    #[test]
+    fn rope_identity_names_every_parameter() {
+        let plain = load_model_config(&fixture_dir()).unwrap();
+        let fixture = yarn_fixture();
+        let over = fixture["configs"][0]["config"]["rope_scaling"].clone();
+        let yarn = load_model_config_with(&fixture_dir(), Some(&over)).unwrap();
+        let mut other = over.clone();
+        other["beta_fast"] = serde_json::json!(16);
+        let yarn_other = load_model_config_with(&fixture_dir(), Some(&other)).unwrap();
+        assert_eq!(plain.rope_identity(), plain.clone().rope_identity());
+        assert_ne!(plain.rope_identity(), yarn.rope_identity());
+        assert_ne!(yarn.rope_identity(), yarn_other.rope_identity());
+        let v: serde_json::Value = serde_json::from_str(&yarn.rope_identity()).unwrap();
+        assert_eq!(v["theta"], 500_000.0);
+        assert_eq!(v["scaling"]["type"], "yarn");
+        assert_eq!(v["scaling"]["factor"], 16.0);
+        assert_eq!(v["scaling"]["truncate"], true);
+        let v: serde_json::Value = serde_json::from_str(&plain.rope_identity()).unwrap();
+        assert_eq!(v["scaling"]["type"], "llama3");
     }
 
     /// The `config.json` / `generation_config.json` of the Phase 8 checkpoints, copied verbatim

@@ -203,6 +203,61 @@ pub struct ModelConfig {
     /// `llama3_json` for `LlamaForCausalLM` whose template renders `tools`, else none (resolved
     /// at startup); `none` turns tool calling off.
     pub tool_call_parser: Option<ModuleName>,
+    /// Replaces `config.json`'s `rope_scaling` wholesale (P6a S-15, user decision 2026-09-28,
+    /// Q19): a mapping with Hugging Face's field names (`rope_type` or `type`, `factor`,
+    /// `original_max_position_embeddings`, …). Only `default`, `llama3` and `yarn` pass
+    /// [`Config::validate`] (dynamic scaling would change cached keys mid-sequence); the fields
+    /// are checked when the model loads.
+    pub rope_scaling: Option<serde_json::Value>,
+}
+
+/// The RoPE scaling types `model.rope_scaling` may name.
+const ROPE_SCALING_TYPES: [&str; 3] = ["default", "llama3", "yarn"];
+
+impl ModelConfig {
+    /// `model.rope_scaling`: a mapping naming a static scaling type, without `dynamic: true`.
+    fn validate_rope_scaling(&self) -> Result<(), ConfigError> {
+        const KEY: &str = "model.rope_scaling";
+        let Some(value) = self.rope_scaling.as_ref().filter(|v| !v.is_null()) else {
+            return Ok(());
+        };
+        let Some(map) = value.as_object() else {
+            return Err(invalid(
+                KEY,
+                format!("must be a mapping with Hugging Face rope_scaling fields, got {value}"),
+            ));
+        };
+        let rope_type = map
+            .get("rope_type")
+            .or_else(|| map.get("type"))
+            .and_then(|t| t.as_str());
+        match rope_type {
+            Some(t) if ROPE_SCALING_TYPES.contains(&t) => {}
+            Some(t) => {
+                return Err(invalid(
+                    KEY,
+                    format!(
+                        "rope_type {t} is not supported (supported: {}; dynamic scaling would \
+                         change cached keys mid-sequence)",
+                        ROPE_SCALING_TYPES.join(", ")
+                    ),
+                ));
+            }
+            None => {
+                return Err(invalid(
+                    KEY,
+                    format!("needs rope_type (one of {})", ROPE_SCALING_TYPES.join(", ")),
+                ));
+            }
+        }
+        if map.get("dynamic").and_then(|d| d.as_bool()) == Some(true) {
+            return Err(invalid(
+                KEY,
+                "dynamic: true is not supported (static scaling only)",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -455,6 +510,7 @@ impl Config {
         if self.model.max_seq_len == Some(0) {
             return Err(invalid("model.max_seq_len", "must be at least 1"));
         }
+        self.model.validate_rope_scaling()?;
         if self.scheduler.queue_timeout.is_some() {
             return Err(invalid(
                 "scheduler.queue_timeout",

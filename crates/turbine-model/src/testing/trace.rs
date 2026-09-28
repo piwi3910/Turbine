@@ -247,7 +247,7 @@ impl<'a> LocalChecker<'a> {
         let hq = self.cfg.num_attention_heads as usize;
         let hkv = self.cfg.num_kv_heads as usize;
         let t = q.len() / (hq * d);
-        let scale = 1.0 / (d as f32).sqrt();
+        let scale = self.cfg.attention_scale();
         let mut out = vec![0f32; t * hq * d];
         for i in 0..t {
             let visible = p0 + i + 1;
