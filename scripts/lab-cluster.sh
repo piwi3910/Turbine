@@ -247,6 +247,13 @@ scenario_collbench_hostmem() {
 	done
 }
 
+# collective_report <label>: the running server's collective backend and its per-call routes.
+collective_report() {
+	local label="$1"
+	echo "tp-collective ${label} backend=$(curl -s "${URL}/turbine/v1/status" | jq -r '.parallel.backend // "?"')"
+	curl -s "${URL}/metrics" | grep '^turbine_collective_route_total' | sed "s/^/tp-collective ${label} /" || true
+}
+
 scenario_tp2() {
 	local llama=scripts/lab/phase5-novanas-llama.yaml olmoe=scripts/lab/phase5-novanas-olmoe.yaml
 	# The tp 1 baseline: the same configuration with one rank on device 0.
@@ -273,12 +280,14 @@ scenario_tp2() {
 		jq -r --arg f "$f" '"tp-bench \($f) tok/s=\(.output_token_throughput) ttft_p50_ms=\(.ttft_ms.p50) itl_p50_ms=\(.itl_ms.p50) requests_ok=\(.requests_ok)"' \
 			"${WORK}/${f}-bench.json"
 	done
+	collective_report tp2-local
 	stop_servers
 
 	start_server "${WORK}/tp2-olmoe.log" "$olmoe"
 	wait_ready "$URL" "${WORK}/tp2-olmoe.log"
 	golden olmoe-1b-7b-0125-instruct "olmoe tp2 local c1"
 	golden olmoe-1b-7b-0125-instruct "olmoe tp2 local c16" --concurrency 16
+	collective_report tp2-olmoe
 	stop_servers
 
 	# Static mode: one process per rank; rank 1 joins the leader on 127.0.0.1:18100 and serves
@@ -293,6 +302,7 @@ scenario_tp2() {
 	tp_prefix_check tp2-static
 	golden llama-3.2-3b-instruct "llama tp2 static c1"
 	golden llama-3.2-3b-instruct "llama tp2 static c16" --concurrency 16
+	collective_report tp2-static
 	stop_servers
 }
 
