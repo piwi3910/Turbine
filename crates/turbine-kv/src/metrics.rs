@@ -22,8 +22,12 @@ pub const TIER_L0: &str = "l0";
 type Labels1 = [(&'static str, &'static str); 1];
 type Labels2 = [(&'static str, &'static str); 2];
 
-/// Why a copy left a tier. `turbine_kv_evictions_total{reason}` uses the first five;
-/// `turbine_kv_drops_total{reason}` (a block gone from every tier) adds the last two.
+/// Why a copy left a tier (or its rung). `turbine_kv_evictions_total{reason}` uses the first
+/// five; `turbine_kv_drops_total{reason}` (a block gone from every tier) adds `below_min_value`
+/// and `no_room`. The compression ladder (P6b S-6) adds `compressed` (a copy rewritten one rung
+/// down) and `ladder_floor` (evicted at `kv.ladder.max_format`), [`EvictReason::LADDER`]; they
+/// join the pre-registered label sets when the hierarchy applies the ladder (plan Task 15).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EvictReason {
     Capacity,
@@ -33,6 +37,8 @@ pub enum EvictReason {
     TierDegraded,
     BelowMinValue,
     NoRoom,
+    Compressed,
+    LadderFloor,
 }
 
 impl EvictReason {
@@ -54,6 +60,8 @@ impl EvictReason {
         EvictReason::BelowMinValue,
         EvictReason::NoRoom,
     ];
+    /// The compression ladder's reasons (P6b S-6).
+    pub const LADDER: [EvictReason; 2] = [EvictReason::Compressed, EvictReason::LadderFloor];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -64,6 +72,8 @@ impl EvictReason {
             EvictReason::TierDegraded => "tier_degraded",
             EvictReason::BelowMinValue => "below_min_value",
             EvictReason::NoRoom => "no_room",
+            EvictReason::Compressed => "compressed",
+            EvictReason::LadderFloor => "ladder_floor",
         }
     }
 }
@@ -495,5 +505,16 @@ mod tests {
         assert!(!text.contains(r#"tier="l3""#), "no L3 before Phase 6");
         assert_eq!(TierId::L0.as_str(), TIER_L0);
         assert!(!text.contains(r#"turbine_kv_evictions_total{tier="l0",reason="no_room"}"#));
+    }
+
+    /// The ladder's reason codes render as the spec's label values and are not yet part of the
+    /// pre-registered sets (plan Task 15 adds them with the hierarchy wiring).
+    #[test]
+    fn ladder_reasons() {
+        let labels: Vec<&str> = EvictReason::LADDER.iter().map(|r| r.as_str()).collect();
+        assert_eq!(labels, ["compressed", "ladder_floor"]);
+        for r in EvictReason::LADDER {
+            assert!(!EvictReason::EVICTION.contains(&r) && !EvictReason::ALL.contains(&r));
+        }
     }
 }

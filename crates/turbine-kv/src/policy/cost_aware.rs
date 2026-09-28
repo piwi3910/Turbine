@@ -2,8 +2,12 @@
 //! × retrieval / memory.
 
 use turbine_core::registry::Module;
+use turbine_core::types::PressureState;
 
-use super::{BlockScoreInputs, EvictionPolicy, PolicyWeights, recompute_seconds};
+use super::{
+    BlockScoreInputs, EvictAction, EvictionPolicy, LadderContext, PolicyWeights, recompute_seconds,
+};
+use crate::codec;
 use crate::directory::{Timestamp, decay};
 
 /// Retrieval costs below this count as this (a copy is never free).
@@ -53,5 +57,41 @@ impl EvictionPolicy for CostAwarePolicy {
         let memory = b.block.size_bytes.max(1) as f64 / b.tier_capacity.max(1) as f64
             * (1.0 + f64::from(b.tier_pressure.as_u8()));
         reuse * recompute * f64::from(b.block.priority.0) * retrieval / memory
+    }
+
+    /// The compression ladder (P6b S-6). With the ladder on and the pressure controller not
+    /// GREEN, a copy of a tier that is triggered — the lowest enabled tier about to drop it, or
+    /// any tier above `high_water` — moves one rung down from its own format (`l0` →
+    /// `fp8_e4m3` → `tq4` → `tq2`, bounded by `max_format`), provided every enabled tier below
+    /// has already reached that rung (so the lowest tier compresses first and upper tiers follow
+    /// rung by rung). At the floor the lowest tier evicts the copy (`ladder_floor`); an upper
+    /// tier keeps it (or demotes a leaving one). Everything else is Phase 4's decision. Which
+    /// copies are offered, and how many per tick, is the hierarchy's call (oldest,
+    /// least-reusable first: [`super::order_victims`]).
+    fn action(&self, _b: &BlockScoreInputs, ctx: &LadderContext) -> EvictAction {
+        let Some(ladder) = ctx.ladder else {
+            return ctx.phase4_action();
+        };
+        let triggered = (ctx.must_leave && ctx.lowest()) || ctx.fill > ladder.high_water;
+        if ctx.pressure == PressureState::Green || !triggered {
+            return ctx.phase4_action();
+        }
+        let max = codec::rung_index(ladder.max_format).unwrap_or(0);
+        let target =
+            codec::next_rung(ctx.format).filter(|t| codec::rung_index(t).is_some_and(|i| i <= max));
+        match target {
+            Some(to) => {
+                let reached = ctx.lower_rung.is_none_or(|lower| {
+                    codec::rung_index(lower).unwrap_or(0) >= codec::rung_index(to).unwrap_or(0)
+                });
+                if reached {
+                    EvictAction::Compress { to }
+                } else {
+                    ctx.phase4_action()
+                }
+            }
+            None if ctx.lowest() => EvictAction::Drop,
+            None => ctx.phase4_action(),
+        }
     }
 }

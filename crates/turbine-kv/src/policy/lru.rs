@@ -5,7 +5,9 @@ use turbine_core::registry::Module;
 use super::{BlockScoreInputs, EvictionPolicy, PolicyWeights};
 use crate::directory::Timestamp;
 
-/// Recency only: the most recently accessed block is kept longest.
+/// Recency only: the most recently accessed block is kept longest. Takes the default
+/// [`EvictionPolicy::action`] (Phase 4: demote or drop, never compress), so the ladder is a
+/// `cost_aware` behaviour.
 #[derive(Clone, Copy, Debug)]
 pub struct LruPolicy;
 
