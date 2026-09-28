@@ -203,6 +203,20 @@ fn check_expert_parallel(plan: &mut ParallelPlan, config: &Config) -> Result<(),
             ),
         ));
     };
+    // Combinations the support matrix refuses for this architecture (P5 exit: OLMoE with
+    // expert × tensor parallelism, `olmoe_ep_tp_drift`).
+    if let Some(r) =
+        turbine_core::support::parallel_refusal(&arch.hf_architecture, plan.tp, plan.ep)
+    {
+        let code = r.reason.split(':').next().unwrap_or(r.reason);
+        return Err(refuse(
+            code,
+            format!(
+                "{EP_KEY}: {} (expert_parallel_size {} with tensor_parallel_size {} on {})",
+                r.reason, plan.ep, plan.tp, arch.hf_architecture
+            ),
+        ));
+    }
     let placement = expert_placement(
         &config.parallel,
         moe.num_experts,
@@ -867,7 +881,17 @@ mod tests {
         turbine_model::testing::tiny::write_tiny_olmoe(dir.path(), 1);
         let mut config = Config::default();
         config.model.path = dir.path().to_path_buf();
-        for tp in [1, 2] {
+        // P5 exit (user decision 2026-09-28): OLMoE at ep 2 × tp 2 is refused with
+        // `olmoe_ep_tp_drift` naming `parallel.expert_parallel_size`.
+        match check_executable(&mut ep_plan(2, 2), &config) {
+            Err(PlanFailure::Config(m)) => assert!(
+                m.starts_with("parallel.expert_parallel_size: olmoe_ep_tp_drift"),
+                "{m}"
+            ),
+            other => panic!("ep 2 tp 2: {other:?}"),
+        }
+        {
+            let tp = 1;
             let mut p = ep_plan(tp, 2);
             check_executable(&mut p, &config).unwrap_or_else(|e| panic!("tp {tp}: {e:?}"));
             let placement = p.experts.as_ref().expect("placement");

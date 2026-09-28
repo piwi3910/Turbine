@@ -9,7 +9,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use turbine_model::testing::TempDir;
-use turbine_model::testing::tiny::write_tiny_llama;
+use turbine_model::testing::tiny::{write_tiny_llama, write_tiny_olmoe};
 
 const POLL: Duration = Duration::from_millis(20);
 /// The server's test-only cap on each accepted connection's kernel send buffer.
@@ -348,6 +348,39 @@ fn ep_on_dense_model_exits_2() {
         );
         TcpListener::bind(addr).expect("the configured port must still be free");
     }
+}
+
+/// P5 exit (user decision 2026-09-28, `turbine_core::support::PARALLEL_REFUSALS`): OLMoE with
+/// expert and tensor parallelism together is refused before bind: the tiny OLMoE with
+/// `expert_parallel_size: 2` and `tensor_parallel_size: 2` exits 2 naming
+/// `parallel.expert_parallel_size` and the reason code `olmoe_ep_tp_drift`, and the port stays
+/// free; ep 2 alone still starts (tiny_server `ep2_serves_like_ep1`). Breaks if the refusal is
+/// lost or moves after the port is bound.
+#[test]
+fn olmoe_ep_tp_exits_2() {
+    let port = free_port();
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let dir = TempDir::new("turbine-server-cli-olmoe");
+    write_tiny_olmoe(dir.path(), 7);
+    let yaml = format!(
+        "model:\n  path: {}\n  served_name: m\n  max_seq_len: 64\nserver:\n  listen: {addr}\n\
+         execution:\n  backend: cpu\nreliability:\n  emergency_vram_reserve: 1MiB\n\
+         parallel:\n  expert_parallel_size: 2\n  tensor_parallel_size: 2\n  \
+         collective_backend: host\n",
+        dir.path().display()
+    );
+    let cfg = TempConfig::new("olmoe-ep-tp", &yaml);
+    let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(30));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains(
+            "turbine-server: invalid parallel plan: parallel.expert_parallel_size: \
+             olmoe_ep_tp_drift"
+        ),
+        "stderr: {stderr}"
+    );
+    TcpListener::bind(addr).expect("the configured port must still be free");
 }
 
 /// P5 S-12 (plan Task 22): pipeline parallelism combined with tensor parallelism is refused
@@ -804,12 +837,30 @@ fn support_matrix_output() {
         assert!(has("nvidia", "*", architecture, "unsupported"), "{v}");
     }
     assert!(has("cpu", "*", "*", "experimental"), "{v}");
+    // P5 exit (user decision 2026-09-28): OLMoE with expert × tensor parallelism is refused.
+    let refusals = v["parallel_refusals"]
+        .as_array()
+        .expect("parallel_refusals");
+    assert!(
+        refusals
+            .iter()
+            .any(|r| r["architecture"] == "OlmoeForCausalLM"
+                && r["modes"] == "ep+tp"
+                && r["reason"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("olmoe_ep_tp_drift"))),
+        "{v}"
+    );
 
     let out = run(&["--support-matrix"]);
     assert_eq!(out.status.code(), Some(0));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.starts_with("vendor "), "{text}");
-    assert_eq!(text.lines().count(), rows.len() + 1, "{text}");
+    assert_eq!(
+        text.lines().count(),
+        rows.len() + 1 + refusals.len(),
+        "{text}"
+    );
 
     // --support-matrix takes no configuration; --output needs --support-matrix.
     let out = run(&["--support-matrix", "--config", "/nonexistent.yaml"]);

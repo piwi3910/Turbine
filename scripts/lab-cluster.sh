@@ -63,14 +63,14 @@
 #                      positions` report of p14, the standard throughput workload: 512-word
 #                      prompts, 256 tokens with --ignore-eos, concurrency 16, 200 requests,
 #                      after a 16-request warm-up); then ep 2 with tp 1 over rccl, ep 2 over
-#                      hostmem and ep 2 with tp 2. The accuracy gate of every EP run is the ep 1
+#                      hostmem, and a check that ep 2 with tp 2 is refused (exit 2,
+#                      olmoe_ep_tp_drift). The accuracy gate of every EP run is the ep 1
 #                      capture of the same run: strict bounds at concurrency 1, batched at 16
 #                      (user decision "P5: OLMoE golden tolerance under expert parallelism");
 #                      the transformers reference is compared for information only (and p14's
 #                      positions report printed). turbine_expert_rank_tokens_total must be
-#                      non-zero for rank 0 and rank 1. The ep 2 × tp 2 leg includes tensor
-#                      parallelism and takes the TP rule (as tp2-novanas; its capture leg is
-#                      informational for OLMoE). A gate violation fails
+#                      non-zero for rank 0 and rank 1. A gate violation (or ep 2 x tp 2
+#                      not refused) fails
 #                      the scenario at its end, after every run. Prints one
 #                      `ep-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run and
 #                      the scheduler document's `expert` section. 2-GPU numbers are
@@ -803,13 +803,18 @@ scenario_ep2() {
 	ep_counts ep2-hostmem
 	stop_servers
 
-	start_server "${WORK}/ep2-tp2.log" "$ep2" --set parallel.tensor_parallel_size=2
-	wait_ready "$URL" "${WORK}/ep2-tp2.log"
-	# ep 2 Ã tp 2 includes tensor parallelism: the TP rule (batched bounds against the ep 1
-	# capture, the golden rule against the transformers reference).
-	gate_vs_capture "$slug" "${WORK}/ep1-capture.jsonl" "olmoe ep2 tp2"
-	ep_counts ep2-tp2
-	stop_servers
+	# OLMoE at ep 2 x tp 2 is refused (user decision 2026-09-28, olmoe_ep_tp_drift, until the
+	# phase 7 OLMoE tensor-parallel drift investigation): the server must exit 2 with the reason
+	# before binding.
+	local rc=0
+	timeout 600 "${BIN}/turbine-server" --config "$ep2" --set parallel.tensor_parallel_size=2 \
+		>"${WORK}/ep2-tp2.log" 2>&1 || rc=$?
+	if [[ $rc -eq 2 ]] && grep -q "olmoe_ep_tp_drift" "${WORK}/ep2-tp2.log"; then
+		echo "lab-step: olmoe ep2 tp2 refused: exit 2, olmoe_ep_tp_drift"
+	else
+		tail -n 20 "${WORK}/ep2-tp2.log"
+		GATE_FAILED+=("olmoe ep2 tp2 not refused (exit ${rc})")
+	fi
 
 	local f
 	for f in ep1-c16 ep2-c16 ep2-hostmem-c16; do

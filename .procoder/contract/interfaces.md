@@ -547,6 +547,9 @@ pub enum SpeculativeColumn { None, Draft }                                      
 pub struct SupportRow { pub key: SupportKeyPattern /* each column Option = "*" */, pub status: SupportStatus }
 pub static SUPPORT_MATRIX: &[SupportRow];
 pub fn resolve(key: &SupportKey) -> SupportStatus;             // most specific row wins; no row → Unsupported{"no support-matrix row"}
+pub struct ParallelRefusal { pub architecture: &'static str, pub modes: &'static str /* "ep+tp" */, pub reason: &'static str }   // P5 exit 2026-09-28
+pub static PARALLEL_REFUSALS: &[ParallelRefusal];  // OlmoeForCausalLM / ep+tp / "olmoe_ep_tp_drift: …" (exit 2 naming parallel.expert_parallel_size; --support-matrix `parallel …` lines, JSON "parallel_refusals")
+pub fn parallel_refusal(architecture: &str, tp: u32, ep: u32) -> Option<&'static ParallelRefusal>;
 pub const VENDORS: &[&str];      // "amd", "nvidia", "cpu" — every ExecutionBackend::vendor() is one of them
 pub const WILDCARD: &str;        // "*": any (row) / not known yet (key)
 pub const HOST_VENDOR: &str;     // "cpu": a host backend's arch column is the same word

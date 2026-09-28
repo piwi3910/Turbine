@@ -1103,6 +1103,14 @@ Context: novanas reached 95 % disk and k3s evicted a lab Job (2026-09-28). The P
 
 **Decision (user, 2026-09-28): auto-prune approved**, with these limits: only `remote/agent-*/target`; never the per-slot caches under `turbine-ci/cache/`, anything in use, or anything else; every removal logged with the bytes freed. This rule now covers the earlier manual prune after the fact; any prune beyond it still needs the user.
 
+## P5 exit: OLMoE with expert × tensor parallelism
+
+- (1) Mark OLMoE ep × tp `experimental` (recommended)
+- (2) Refuse it for OLMoE (`unsupported`) until phase 7 fixes the OLMoE tensor-parallel drift
+- (3) Fix the drift before the Phase 5 exit
+
+**Decision (user, 2026-09-28): (2) refuse.** Evidence (tp-perf ep2 proof on 31fa6b0, and the same p10 failure on 3d1b8d8 and 1c16934, before the pinned bounce buffer): the ep 2 × tp 2 OLMoE leg fails the transformers golden on p10 (likely |Δ| 1.031 > 1.01) and p08, while plain EP and plain TP pass. `OlmoeForCausalLM` with ep > 1 and tp > 1 is `unsupported` with reason `olmoe_ep_tp_drift` (`turbine_core::support::PARALLEL_REFUSALS`, shown by `--support-matrix`), refused at startup with exit 2 naming `parallel.expert_parallel_size` before any port is bound; plain EP and plain TP for OLMoE stay supported; dense models are unaffected (EP does not apply to them). The ep2-novanas scenario checks the refusal instead of serving ep 2 × tp 2. Re-opened by the phase 7 investigation (expansion umbrella question (d)).
+
 ## P5 exit: "collective corruption" was wrong bytes in pageable device-to-host copies (unexplained; avoided by pinned staging)
 
 Context (2026-09-28): the Phase 5 exit gate 3 (`lab-test novanas --gpus 2 --features fault-injection --tier full`, run 0928125603-04f6f801) failed `hostmem_lab` `hostmem_matches_host_backend_on_two_gpus` and `hostmem_graph_replays_with_rccl_delegate_on_two_gpus` with wrong bytes; the exit was blocked as a possible silent collective corruption in every collective mode (TP, EP, PP).

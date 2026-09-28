@@ -623,6 +623,10 @@ Interfaces:
 
 Owner: the tp-perf agent. May land inside Phase 5 if quick; otherwise a tracked Phase 5p item — the Phase 5 exit does not wait for it.
 
+## P5 exit: OLMoE ep × tp refused
+
+As built (2026-09-28, user decision "P5 exit: OLMoE with expert × tensor parallelism", (2)): `turbine_core::support::PARALLEL_REFUSALS` holds `OlmoeForCausalLM` / `ep+tp` / `olmoe_ep_tp_drift`; `parallel::check_expert_parallel` refuses it (exit 2, `parallel.expert_parallel_size: olmoe_ep_tp_drift …`) before loading; `--support-matrix` lists it (text line `parallel …`, JSON `parallel_refusals`). Tests: `parallel::tests::expert_parallel_checked_against_the_model`, `server_cli olmoe_ep_tp_exits_2`, `support_matrix_output`; `tiny_server ep2_serves_like_ep1` serves ep 2 with tp 1 only; `scripts/lab-cluster.sh ep2-novanas` checks the refusal instead of serving ep 2 × tp 2.
+
 ## Queued after Phase 5 (not part of this phase)
 
 - Release profile for the lab-test GPU tests (coordinator follow-up 2026-09-28): build the `#[ignore]`d GPU and weights tests of `scripts/lab-test.sh` in a release (or optimised-test) profile so the full tier runs shorter. This is queued for after Phase 5 exit, not now.

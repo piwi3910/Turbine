@@ -569,6 +569,41 @@ impl SupportRow {
     }
 }
 
+/// Parallel-mode combinations a model architecture is refused in (`unsupported`, exit 2 at
+/// startup with the reason code), on every vendor. `modes` names the combination: `ep+tp` is
+/// expert parallelism > 1 together with tensor parallelism > 1. Each mode on its own stays
+/// supported.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ParallelRefusal {
+    pub architecture: &'static str,
+    pub modes: &'static str,
+    pub reason: &'static str,
+}
+
+/// User decision "P5 exit: OLMoE with expert × tensor parallelism" (2026-09-28): OLMoE at
+/// ep 2 × tp 2 drifts past its golden tolerance against the transformers reference (p10 likely
+/// |Δ| 1.031 > 1.01, and p08) while ep 2 and tp 2 alone pass; refused until the Phase 7
+/// investigation of the OLMoE tensor-parallel drift (expansion umbrella question (d)).
+pub static PARALLEL_REFUSALS: &[ParallelRefusal] = &[ParallelRefusal {
+    architecture: "OlmoeForCausalLM",
+    modes: "ep+tp",
+    reason: "olmoe_ep_tp_drift: OLMoE with expert and tensor parallelism together drifts past \
+             its golden tolerance (phase 7 investigates the OLMoE tensor-parallel drift); use \
+             expert_parallel_size or tensor_parallel_size alone",
+}];
+
+/// The refusal of `architecture` at tensor-parallel size `tp` and expert-parallel size `ep`,
+/// if [`PARALLEL_REFUSALS`] has one.
+pub fn parallel_refusal(architecture: &str, tp: u32, ep: u32) -> Option<&'static ParallelRefusal> {
+    PARALLEL_REFUSALS.iter().find(|r| {
+        r.architecture == architecture
+            && match r.modes {
+                "ep+tp" => ep > 1 && tp > 1,
+                _ => false,
+            }
+    })
+}
+
 /// Table invariants: vendors from [`VENDORS`], non-empty string columns, and no two
 /// overlapping rows with equal specificity (a key matching both would be ambiguous).
 pub fn validate_table(table: &[SupportRow]) -> Result<(), String> {

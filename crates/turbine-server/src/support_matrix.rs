@@ -2,7 +2,7 @@
 //! matrix as text or JSON, without reading a configuration.
 use std::fmt::Write as _;
 
-use turbine_core::support::{SUPPORT_MATRIX, SupportDecision};
+use turbine_core::support::{PARALLEL_REFUSALS, SUPPORT_MATRIX, SupportDecision};
 
 use crate::cli::OutputFormat;
 
@@ -11,8 +11,10 @@ pub fn render_matrix(output: OutputFormat) -> String {
     let rows: Vec<_> = SUPPORT_MATRIX.iter().map(|r| r.view()).collect();
     match output {
         OutputFormat::Json => {
-            let mut s = serde_json::to_string(&serde_json::json!({ "rows": rows }))
-                .expect("rows serialize");
+            let mut s = serde_json::to_string(
+                &serde_json::json!({ "rows": rows, "parallel_refusals": PARALLEL_REFUSALS }),
+            )
+            .expect("rows serialize");
             s.push('\n');
             s
         }
@@ -43,6 +45,14 @@ pub fn render_matrix(output: OutputFormat) -> String {
                     r.reason.as_deref().unwrap_or("-")
                 );
             }
+            // Parallel-mode combinations refused per architecture (every vendor).
+            for r in PARALLEL_REFUSALS {
+                let _ = writeln!(
+                    s,
+                    "parallel {:<18} {:<6} unsupported {}",
+                    r.architecture, r.modes, r.reason
+                );
+            }
             s
         }
     }
@@ -62,7 +72,18 @@ mod tests {
         let text = render_matrix(OutputFormat::Text);
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with("vendor "), "{text}");
-        assert_eq!(lines.len(), SUPPORT_MATRIX.len() + 1);
+        assert_eq!(
+            lines.len(),
+            SUPPORT_MATRIX.len() + 1 + PARALLEL_REFUSALS.len()
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("parallel OlmoeForCausalLM")
+                    && l.contains("ep+tp")
+                    && l.contains("unsupported olmoe_ep_tp_drift")),
+            "{text}"
+        );
         assert!(
             lines
                 .iter()
