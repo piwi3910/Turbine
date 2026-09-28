@@ -1103,6 +1103,13 @@ Context: novanas reached 95 % disk and k3s evicted a lab Job (2026-09-28). The P
 
 **Decision (user, 2026-09-28): auto-prune approved**, with these limits: only `remote/agent-*/target`; never the per-slot caches under `turbine-ci/cache/`, anything in use, or anything else; every removal logged with the bytes freed. This rule now covers the earlier manual prune after the fact; any prune beyond it still needs the user.
 
+## Closing Phase 5: recheck, merge and push
+
+- Close: quick recheck then merge (chosen); full reruns then merge; merge now
+- Push: push after the merge (chosen); do not push yet
+
+**Decision (user, 2026-09-28): quick recheck, then merge; push after the merge.** The recheck is `scripts/lab-bench.sh --golden16` for Llama and OLMoE on GPU 0 on the final tip (golden c1 16/16 for Llama, OLMoE ≥ 14/16, tok/s ≥ 0.97× the exit numbers 855.3 / 613.8), then `scripts/gate.sh --full`, the merge of `phase-5-multi-gpu` (with the Phase 5p docs of `phase-5p-docs`) into main, a gate on main, a gitleaks scan, and `git push origin main` only. The one-GPU full tier (stopped at the user's request with 33 binaries done and no failure) is re-run in release mode as Phase 5p task 1; the vLLM two-GPU matrix was stopped early at the user's request (partial results in labbook set `phase-5-vs-vllm`).
+
 ## Lab-test release profile
 
 - A `--release` option for `scripts/lab-test.sh`, the default for `--tier full`, built in the same cached slot target dirs (first item of Phase 5p)
