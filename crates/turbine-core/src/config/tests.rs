@@ -1178,6 +1178,20 @@ fn parallel_rejections() {
     assert!(sharing.validate_devices(&novanas, None).is_ok());
 }
 
+/// P5 Task 32 switches: prefill overlap on by default (user decision 2026-09-28) and
+/// `false` turns it off; decode graphs under TP stay opt-in.
+#[test]
+fn tp_perf_switch_defaults() {
+    let base = "model:\n  path: /m\n";
+    let d = parse(base, &[]).unwrap().parallel;
+    assert!(d.tp_prefill_overlap);
+    assert!(!d.tp_decode_graphs);
+    let off = parse(base, &["parallel.tp_prefill_overlap=false"])
+        .unwrap()
+        .parallel;
+    assert!(!off.tp_prefill_overlap);
+}
+
 /// P5 S-10 to S-13 keys: defaults, accepted values and the Phase 5 combination rules (S-12),
 /// each refusal naming its key and, for a combination, `combination_unsupported:<modes>`.
 #[test]

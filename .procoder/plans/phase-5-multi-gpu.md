@@ -587,9 +587,9 @@ Profile as built (2026-09-28, branch p5-tp-profile c0533b3, merged b9da838): `tu
 Fixes as built (2026-09-28, branch p5-tp-perf-clean, merged; each off by default, each bitwise equal to its baseline in host and 2-GPU lab tests; A/B in one `lab-cluster --bench-lock tp2-novanas` run, 2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8), Llama c16, tp2 baseline 914 tok/s / TTFT 445 ms / ITL 11.84 ms):
 
 - (b) 21dfec0 copy-engine all-reduce (`parallel.collective.hostmem_dma_min_bytes`, reason `copy_engine`): no faster than RCCL (16 MiB 4.53–4.67 ms vs 4.24–4.28 ms); a 2-rank all-reduce through host memory is capped near 15 GB/s aggregate for every transport, so the prefill all-reduce floor is ≈ 198 ms per 2,048-token chunk and the (b) TTFT estimate (~255 ms) does not hold. Not benched end to end (lead decision in decisions.md).
-- (c) dbd4f52 prefill overlap (`parallel.tp_prefill_overlap`): 1007.7 tok/s (+10.2 %), TTFT 274 ms (−38 %); dense-FFN families only (OLMoE unchanged); golden 16/16 c1/c16 against capture and HF. Default flip pending the user.
+- (c) dbd4f52 prefill overlap (`parallel.tp_prefill_overlap`): 1007.7 tok/s (+10.2 %), TTFT 274 ms (−38 %); dense-FFN families only (OLMoE unchanged); golden 16/16 c1/c16 against capture and HF. On by default (user decision 2026-09-28); `parallel.tp_prefill_overlap: false` turns it off.
 - (a) 901a5c7 decode graphs under TP (`parallel.tp_decode_graphs`, ABI v2.8 device-side sequence counter): ITL 11.52 ms, tok/s within noise.
-- (d) not built: an exact per-shard merge cannot reproduce the full-row lse or the categorical draw; options A/B/C open for the user (decisions.md, recommendation C, defer).
+- (d) deferred (user decision 2026-09-28): an exact per-shard merge cannot reproduce the full-row lse or the categorical draw; the saving is ~1.2 ms per step.
 - 6b3b467: lab tests opening RCCL communicators concurrently fail on novanas; `hostmem_lab` serialises them.
 
 ## Task 33: Mirror ledgers for group admission in static rank mode
