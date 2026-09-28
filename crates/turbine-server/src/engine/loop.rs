@@ -2556,6 +2556,7 @@ mod tests {
             clock: Arc::clone(&clock),
             reclaimer: kv.reclaimer(),
             replica: 0,
+            group: Vec::new(),
         });
         let scheduler = Scheduler::new(params, Arc::clone(&clock))
             .with_metrics(metrics.scheduler.clone())

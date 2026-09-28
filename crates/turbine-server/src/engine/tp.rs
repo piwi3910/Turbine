@@ -692,8 +692,10 @@ pub(crate) fn load_group(
     };
     let faults: Arc<Fault> = Arc::new(Mutex::new(None));
     let mut shards = Vec::with_capacity(group.workers.len());
+    let mut ledgers = Vec::with_capacity(group.workers.len());
     let mut workers: Vec<Box<dyn StepExecutor>> = Vec::with_capacity(group.workers.len());
     for (i, (rank, p)) in loaded.zip(&group.workers).enumerate() {
+        ledgers.push((rank.budget.clone(), Arc::clone(&rank.ledger)));
         shards.push(KvShard {
             device: super::copy_device(p),
             addresses: BlockAddresses::of(&rank.pool),
@@ -740,6 +742,7 @@ pub(crate) fn load_group(
         reserve: rank0.reserve,
         held: rank0.held,
         shards,
+        group: ledgers,
     })
 }
 

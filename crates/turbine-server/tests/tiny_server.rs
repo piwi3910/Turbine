@@ -3084,6 +3084,92 @@ fn tp2_cancellation_frees_blocks() {
     });
 }
 
+/// Each rank's `kv` ledger pool in `/turbine/v1/pressure`, in `memory` order: (device, used
+/// bytes, reserved bytes).
+fn kv_by_device(server: &TinyServer) -> Vec<(u64, u64, u64)> {
+    let doc = server.get("/turbine/v1/pressure").json();
+    doc["memory"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no memory: {doc}"))
+        .iter()
+        .map(|m| {
+            let kv = m["pools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == "kv")
+                .unwrap_or_else(|| panic!("no kv pool: {doc}"));
+            (
+                m["device"].as_u64().unwrap(),
+                kv["used_bytes"].as_u64().unwrap(),
+                kv["reserved_bytes"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// P5 S-8, plan Task 31 (decision "P5: KV admission across tensor-parallel ranks" B): at tp 2
+/// on the cpu backend over the host collective, `/turbine/v1/pressure` lists both ranks'
+/// ledgers (`memory`, `devices`) and admission reserves every request's KV on both: while two
+/// streams hold their KV the two ranks' `kv` pools hold the same used and reserved bytes, a
+/// dropped client releases its share on both, and both return to zero at the end. Breaks if
+/// admission reserves on the leader's ledger only or a release misses a rank.
+#[test]
+fn tp2_admission_reserves_on_both_ranks() {
+    let server = TinyServer::start_long_with(HOLD_PAUSED, TP2);
+    let doc = server.get("/turbine/v1/pressure").json();
+    let devices: Vec<u64> = doc["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["device"].as_u64().unwrap())
+        .collect();
+    assert_eq!(devices, [0, 1], "{doc}");
+    let idle = kv_by_device(&server);
+    assert_eq!(
+        idle.iter().map(|k| (k.0, k.1 + k.2)).collect::<Vec<_>>(),
+        [(0, 0), (1, 0)],
+        "{doc}"
+    );
+
+    let mut streams: Vec<OpenStream> = (0..2).map(|_| server.hold_stream()).collect();
+    wait_for(Duration::from_secs(60), "both streams paused", || {
+        let doc = server.scheduler();
+        doc["paused"] == 2 && doc["waiting"] == 0
+    });
+    // The pressure document is republished on the controller's next tick.
+    let mut both = Vec::new();
+    wait_for(Duration::from_secs(10), "both ranks hold KV", || {
+        both = kv_by_device(&server);
+        both.len() == 2 && both[0].1 + both[0].2 > 0
+    });
+    assert_eq!(
+        (both[1].1, both[1].2),
+        (both[0].1, both[0].2),
+        "rank 1 holds rank 0's KV: {both:?}"
+    );
+    let held = both[0].1 + both[0].2;
+
+    drop(streams.pop());
+    wait_for(Duration::from_secs(10), "one stream's KV released", || {
+        both = kv_by_device(&server);
+        let total = both[0].1 + both[0].2;
+        total > 0 && total < held
+    });
+    assert_eq!(
+        (both[1].1, both[1].2),
+        (both[0].1, both[0].2),
+        "released on both ranks: {both:?}"
+    );
+
+    drop(streams);
+    wait_for(Duration::from_secs(10), "both ranks back to zero", || {
+        kv_by_device(&server)
+            .iter()
+            .all(|(_, used, reserved)| used + reserved == 0)
+    });
+}
+
 /// P5 S-6, `/ready` and data parallelism of tensor-parallel groups: dp 2 × tp 2 on the cpu
 /// backend (two groups of two rank threads, the host devices shared) serves 8 concurrent
 /// requests on both replicas with tp 1's tokens. Breaks if replicas of groups share a

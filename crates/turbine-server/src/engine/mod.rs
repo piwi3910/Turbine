@@ -295,6 +295,12 @@ pub fn spawn(
             }
             let layout = *loaded.executor.kv_layout();
             let ledger = Arc::clone(&loaded.ledger);
+            // P5 S-8: a tensor-parallel group admits against every rank's ledger.
+            let group = std::mem::take(&mut loaded.group);
+            let probe_group = group
+                .iter()
+                .map(|(b, l)| (b.device, Arc::clone(l)))
+                .collect();
             let parts = rel::build(ReliabilityInputs {
                 config: reliability,
                 budget: loaded.budget,
@@ -309,6 +315,7 @@ pub fn spawn(
                 clock: Arc::clone(&clock),
                 reclaimer: kv.reclaimer(),
                 replica,
+                group,
             });
             #[allow(unused_mut)]
             let mut executor: Box<dyn ModelExecutor> = loaded.executor;
@@ -349,7 +356,8 @@ pub fn spawn(
                 prepared.device,
                 Arc::clone(&parts.queue_len),
                 reliability.admission.max_queue,
-            );
+            )
+            .with_group(probe_group);
             let mut core = SamplerCore::new(
                 TelemetryConfig::from_config(&reliability.telemetry),
                 &startup.inventory,

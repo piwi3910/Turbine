@@ -570,3 +570,98 @@ fn survival_liveness_sweep() {
         }
     }
 }
+
+/// P5 S-8, decision "P5: KV admission across tensor-parallel ranks" (B), plan Task 31: a
+/// 2-rank group whose rank 1 `kv` pool (2,048 blocks) is half of rank 0's (4,096; the block
+/// pool holds the agreed 2,048). Under 10× overload admission never reserves beyond rank 1's
+/// capacity (rank 0's ledger alone would admit up to 4,096 blocks and run the pool dry), both
+/// ranks' ledgers hold the same bytes after every plan and completion (no partial reservation
+/// leaks), every admitted request completes (none fails or is preempted below SURVIVAL), and
+/// both ledgers are idle at the end. A client cancellation mid-flight releases on both ranks.
+/// Breaks if admission reads only rank 0's ledger or a reservation, commit or release misses
+/// a rank.
+#[test]
+fn group_reservation_unequal_pools() {
+    const BLOCK_BYTES: u64 = 16_384;
+    let cfg = OverloadConfig {
+        seed: 7,
+        rate_multiple: 10.0,
+        pool_blocks: 4096,
+        group_kv_blocks: vec![2048],
+        ..OverloadConfig::default()
+    };
+    let mut sim = OverloadSim::new(cfg);
+    let rank1 = sim.rank_kv_usage(1).capacity;
+    assert_eq!(rank1, 2048 * BLOCK_BYTES);
+    assert_eq!(sim.rank_kv_usage(0).capacity, 4096 * BLOCK_BYTES);
+    let r = sim.run_load(secs(300), secs(120));
+    let completed = r
+        .outcomes
+        .iter()
+        .filter(|o| **o == Outcome::Completed)
+        .count();
+    eprintln!(
+        "group_reservation_unequal_pools: {} requests, {completed} completed, max KV {} of rank 1's {rank1}, states {:?}",
+        r.outcomes.len(),
+        r.max_kv_committed_plus_reserved,
+        r.states
+    );
+    assert!(
+        r.max_kv_committed_plus_reserved <= rank1,
+        "rank 0 held {} > rank 1's capacity {rank1}",
+        r.max_kv_committed_plus_reserved
+    );
+    assert!(
+        r.max_kv_committed_plus_reserved > rank1 / 2,
+        "the load fills rank 1's pool: {}",
+        r.max_kv_committed_plus_reserved
+    );
+    assert_eq!(sim.group_kv_mismatches(), 0, "both ranks hold the same KV");
+    assert_eq!(r.preempted_below_survival, 0);
+    assert_eq!(r.unfinished, 0, "every request reached an outcome");
+    assert!(r.outcomes.len() > 500, "{} requests", r.outcomes.len());
+    assert!(completed > 0);
+    for o in &r.outcomes {
+        match o {
+            Outcome::Completed => {}
+            Outcome::Rejected(code) => {
+                assert!(REJECT_CODES.contains(&code.as_str()), "code {code}")
+            }
+            other => panic!("an admitted request did not complete: {other:?}"),
+        }
+    }
+    assert!(sim.ledger_idle(), "both ledgers balance to zero");
+
+    // Cancellation mid-flight: the cancelled requests' KV leaves both ranks at once.
+    let ids: Vec<RequestId> = (0..8).map(|_| sim.submit_now(512, Some(512))).collect();
+    for _ in 0..3 {
+        sim.step_iteration();
+    }
+    let running = sim.running_ids();
+    assert!(ids.iter().all(|id| running.contains(id)), "all 8 run");
+    let held = |sim: &OverloadSim, rank| {
+        let u = sim.rank_kv_usage(rank);
+        (u.used, u.reserved)
+    };
+    let all8 = held(&sim, 0);
+    assert!(all8.0 > 0 && all8.1 > 0, "{all8:?}");
+    assert_eq!(held(&sim, 1), all8);
+    for id in &ids[..4] {
+        sim.cancel(*id);
+    }
+    sim.step_iteration();
+    let four = held(&sim, 0);
+    assert_eq!(held(&sim, 1), four);
+    // 4 × (512 + 512 tokens) = 4 × 64 blocks released.
+    let total = |(u, r): (u64, u64)| u + r;
+    assert_eq!(total(all8) - total(four), 4 * 64 * BLOCK_BYTES);
+    for id in &ids[..4] {
+        assert_eq!(sim.outcome(*id), Some(&Outcome::Cancelled));
+    }
+    sim.run_until_done(secs(120));
+    for id in &ids[4..] {
+        assert_eq!(sim.outcome(*id), Some(&Outcome::Completed));
+    }
+    assert!(sim.ledger_idle());
+    assert_eq!(sim.group_kv_mismatches(), 0);
+}

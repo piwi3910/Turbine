@@ -1,8 +1,9 @@
 //! Predictive admission (P3 S-9): estimate → Admit | Queue{reason} | Reject{reason}, worst-case KV
 //! reservation, and the bounded admission queue with its starvation guard.
 use crate::budget::PoolKind;
-use crate::ledger::{Ledger, LedgerError, Reservation};
+use crate::ledger::{Ledger, LedgerError, PoolUsage, Reservation};
 use crate::metrics::{DecisionLabels, ReliabilityMetrics};
+use crate::multi_device::{GroupReservation, try_reserve_group};
 use crate::signals::SignalThresholds;
 use serde::Serialize;
 use std::sync::Arc;
@@ -137,6 +138,9 @@ pub struct Admission {
     expensive_in_flight: u32,
     /// `kv_utilization` thresholds for the KV headroom rule; `None` = no headroom rule.
     kv_headroom: Option<SignalThresholds>,
+    /// A tensor-parallel group's ledgers (P5 S-8), rank 0 (`ledger`) first; empty on one
+    /// device. Every admission reserves on each of them ([`Admission::with_group_ledgers`]).
+    group: Vec<(DeviceId, Arc<Ledger>)>,
 }
 
 impl Admission {
@@ -152,7 +156,37 @@ impl Admission {
             seed_decode: (0.0, 0),
             expensive_in_flight: 0,
             kv_headroom: None,
+            group: Vec::new(),
         }
+    }
+
+    /// Admission for a tensor-parallel group (P5 S-8, user decision "P5: KV admission across
+    /// tensor-parallel ranks" B): `workers` are the other ranks' devices and ledgers. Each
+    /// admission then reserves its worst-case KV on every rank's ledger through
+    /// [`try_reserve_group`], all or nothing, and the decision checks capacity, availability
+    /// and headroom on every rank (the tightest decides). No workers: one device, unchanged.
+    pub fn with_group_ledgers(mut self, workers: Vec<(DeviceId, Arc<Ledger>)>) -> Self {
+        self.group = if workers.is_empty() {
+            Vec::new()
+        } else {
+            std::iter::once((self.params.device, Arc::clone(&self.ledger)))
+                .chain(workers)
+                .collect()
+        };
+        self
+    }
+
+    /// The `kv` pool usage of every rank (only rank 0's on one device).
+    fn kv_usages(&self) -> impl Iterator<Item = PoolUsage> + '_ {
+        let single = self
+            .group
+            .is_empty()
+            .then(|| self.ledger.usage(self.params.device, PoolKind::Kv));
+        single.into_iter().chain(
+            self.group
+                .iter()
+                .map(|(device, ledger)| ledger.usage(*device, PoolKind::Kv)),
+        )
     }
 
     /// The KV headroom rule (P3 S-9, amendment 2026-09-27): with adaptive admission, in
@@ -340,9 +374,9 @@ impl Admission {
         circuit: CircuitState,
         queue_len: usize,
     ) -> AdmissionDecision {
-        let kv = self.ledger.usage(self.params.device, PoolKind::Kv);
         let need = self.kv_bytes(est);
-        if need > kv.capacity {
+        let capacity = self.kv_usages().map(|u| u.capacity).min().unwrap_or(0);
+        if need > capacity {
             return AdmissionDecision::Reject {
                 reason: RejectionReason::ContextExceedsKvCapacity,
             };
@@ -373,8 +407,8 @@ impl Admission {
                 _ => None,
             }
         };
-        let short =
-            need > kv.available() || (self.params.adaptive && !self.within_headroom(need, actual));
+        let short = self.kv_usages().any(|kv| need > kv.available())
+            || (self.params.adaptive && !self.within_headroom(need, actual));
         let reason = pressure.or(short.then_some(PressureReason::KvReservation));
         match reason {
             None => AdmissionDecision::Admit,
@@ -400,21 +434,36 @@ impl Admission {
         let Some(limit) = kv.threshold(next) else {
             return true;
         };
-        let usage = self.ledger.usage(self.params.device, PoolKind::Kv);
-        if usage.capacity == 0 {
-            return true;
-        }
-        let after = usage
-            .used
-            .saturating_add(usage.reserved)
-            .saturating_add(need);
-        (after as f64 / usage.capacity as f64) <= limit
+        self.kv_usages().all(|usage| {
+            if usage.capacity == 0 {
+                return true;
+            }
+            let after = usage
+                .used
+                .saturating_add(usage.reserved)
+                .saturating_add(need);
+            (after as f64 / usage.capacity as f64) <= limit
+        })
     }
 
-    /// Takes the worst-case KV reservation of an admitted request.
+    /// Takes the worst-case KV reservation of an admitted request. In a tensor-parallel group
+    /// it holds on every rank's ledger (rank 0's guard carrying the others as members) or on
+    /// none: a rank that cannot hold it releases what the earlier ranks took.
     pub fn reserve_kv(&self, est: &ResourceEstimate) -> Result<Reservation, LedgerError> {
-        self.ledger
-            .reserve(self.params.device, PoolKind::Kv, self.kv_bytes(est))
+        if self.group.is_empty() {
+            return self
+                .ledger
+                .reserve(self.params.device, PoolKind::Kv, self.kv_bytes(est));
+        }
+        let taken = try_reserve_group(
+            &self.group,
+            est.projected_kv_blocks,
+            self.params.block_bytes,
+        )
+        .map_err(|(_, e)| e)?;
+        Ok(GroupReservation::from(taken)
+            .into_reservation()
+            .expect("a group has rank 0"))
     }
 
     pub fn expensive_prefill_started(&mut self) {
@@ -1029,6 +1078,85 @@ mod tests {
             p.expire(Duration::from_secs(30)).len(),
             2,
             "queue_timeout bounds the wait"
+        );
+    }
+
+    /// P5 S-8, decision "P5: KV admission across tensor-parallel ranks" (B): a group's
+    /// admission decides against its tightest rank and reserves on every rank or none. Rank 1's
+    /// pool is half of rank 0's: a request larger than rank 1's pool is refused
+    /// `context_exceeds_kv_capacity` although rank 0 could hold it; one that fits rank 0's free
+    /// bytes but not rank 1's queues `kv_reservation` and its failed reservation leaves rank 0
+    /// untouched (rolled back); commits and the release reach both ranks. Breaks if admission
+    /// reads only rank 0's ledger or a partial reservation leaks.
+    #[test]
+    fn group_admission_reserves_on_every_rank() {
+        use AdmissionDecision::*;
+        let (a, l0) = setup(1024, false);
+        let l1 = Ledger::new(&DeviceBudget {
+            device: DeviceId(1),
+            memory_kind: MemoryKind::Dedicated,
+            budget_bytes: 512 * BLOCK_BYTES,
+            pools: vec![(PoolKind::Kv, 512 * BLOCK_BYTES)],
+        });
+        let mut a = a.with_group_ledgers(vec![(DeviceId(1), Arc::clone(&l1))]);
+        let (g, h) = (PressureState::Green, CircuitState::Healthy);
+        let blocks = |n| ResourceEstimate {
+            projected_kv_blocks: n,
+            ..ResourceEstimate::default()
+        };
+        let kv = |l: &Ledger, d| {
+            let u = l.usage(DeviceId(d), PoolKind::Kv);
+            (u.used, u.reserved)
+        };
+        assert_eq!(
+            a.decide(&blocks(600), g, h, 0),
+            Reject {
+                reason: RejectionReason::ContextExceedsKvCapacity
+            },
+            "rank 1 cannot ever hold 600 blocks"
+        );
+        assert_eq!(a.decide(&blocks(400), g, h, 0), Admit);
+        let mut first = a.reserve_kv(&blocks(400)).unwrap();
+        assert_eq!(first.members().len(), 1);
+        assert_eq!(kv(&l0, 0), (0, 400 * BLOCK_BYTES));
+        assert_eq!(kv(&l1, 1), (0, 400 * BLOCK_BYTES));
+        first.commit_bytes(3 * BLOCK_BYTES);
+        assert_eq!(kv(&l0, 0), (3 * BLOCK_BYTES, 397 * BLOCK_BYTES));
+        assert_eq!(kv(&l1, 1), kv(&l0, 0), "commits reach every rank");
+
+        // Rank 0 has 624 blocks free, rank 1 only 112: the request waits and nothing is held.
+        let before = (kv(&l0, 0), kv(&l1, 1));
+        assert_eq!(
+            a.decide(&blocks(200), g, h, 0),
+            Queue {
+                reason: PressureReason::KvReservation
+            }
+        );
+        assert!(matches!(
+            a.reserve_kv(&blocks(200)),
+            Err(LedgerError::Exhausted { .. })
+        ));
+        assert_eq!(
+            (kv(&l0, 0), kv(&l1, 1)),
+            before,
+            "rank 0's part rolled back"
+        );
+        assert_eq!(a.decide(&blocks(112), g, h, 0), Admit);
+
+        drop(first);
+        assert_eq!(
+            (kv(&l0, 0), kv(&l1, 1)),
+            ((0, 0), (0, 0)),
+            "released on both"
+        );
+        // One device: unchanged, a plain reservation without members.
+        let (single, _) = setup(1024, false);
+        assert!(
+            single
+                .reserve_kv(&blocks(600))
+                .unwrap()
+                .members()
+                .is_empty()
         );
     }
 }
