@@ -1,41 +1,41 @@
-# phase-6-quantization — implementation plan
+# phase-6a-quantization — implementation plan
 
 Status: draft
-Spec: .procoder/specs/phase-6-quantization.md
+Spec: .procoder/specs/phase-6a-quantization.md
 
-Blocked on the user's answers to questions 1–20 of `.procoder/ask/decisions.md`, entry "Phase 6 spec: provisional design choices (2026-09-28)". Every task below is written for the recommended option; when an answer differs, the spec and this plan are amended first and both checks re-run, then building starts at Task 1. Tasks are grouped by the spec's sub-steps in the provisional order of Q1: foundations (Tasks 1–4), weights (5–21), FP8 KV (22–25), YaRN (26–28), per-tier formats (29–34), TurboQuant (35–37), compression ladder (38–40), phase exit (41).
+The user answered questions 1–20 of `.procoder/ask/decisions.md`, entry "Phase 6 spec: provisional design choices (2026-09-28)", and split Phase 6 in two (entry "Phase 6 split: 6a quantization, 6b KV compression (2026-09-28)"). This plan builds 6a: foundations (Tasks 1–4), weights (5–21), FP8 KV (22–25), YaRN (26–28), phase exit (29). `phase-6b-kv-compression` (per-tier formats, TurboQuant, the ladder) has its own plan and starts after Task 29.
 
 ## Goal
 
-Serve FP8 (per-tensor/channel and block-scaled), INT4 AWQ/GPTQ and MXFP4 (compressed-tensors, Quark W4A4 emulated, OpenAI native loader) checkpoints of registered architectures on the R9700 (`gfx1201`), add an FP8 e4m3 L0 KV cache, static YaRN RoPE scaling for every family, per-tier KV formats with GPU-side transcoding and TurboQuant as the first sub-8-bit lower-tier codec, and a pressure-driven KV compression ladder in L1/L2 — each format proven against a reference, gated for quality, measured on GPU 0, and entered into the support matrix only when its gate passes.
+Serve FP8 (per-tensor/channel and block-scaled), INT4 AWQ/GPTQ and MXFP4 (compressed-tensors, Quark W4A4 emulated, OpenAI native loader) checkpoints of registered architectures on the R9700 (`gfx1201`), add an FP8 e4m3 L0 KV cache and static YaRN RoPE scaling for every family — each format proven against a reference, gated for quality, measured on GPU 0, and entered into the support matrix only when its gate passes — after porting the umbrella's quality-gate tooling and cleaning up the support matrix.
 
 ## Architecture
 
-Weights: `turbine_model::weights::WeightFormat` becomes a description of a quantized linear layer (`QuantScheme`, `ActivationQuant`, extra tensor slots, a repack step), with one registry entry per checkpoint packaging; the loader builds `QuantLinear` values that the decoder hands to a new quantized GEMM op. `turbine-kernels` gains `OpKind::QGemm` / `OpKind::QuantizeAct` with a CPU reference (`cpu::quant`) and the optional kernel ABI group v2.9 (`turbine_qgemm*`, `turbine_quantize_act*`, dtype codes F8E4M3 / U8); the HIP shim registers implementations chosen by recorded provider evaluations (hipBLASLt FP8 first for `fp8`, CK `gemm_quant` for block-scaled and INT4, CK microscale / llama.cpp for MXFP4). KV: `kv.dtype: fp8_e4m3` switches the L0 layout to one byte per element with per-layer scales and an FP8-reading paged attention; `turbine_kv::codec` is a new `kv_format` registry of codecs (`l0`, `fp8_e4m3`, `tq4`, `tq2`) whose CPU side lives in `turbine-kv` and whose GPU side is the v2.10 `turbine_kv_transcode` op called by the server's orchestrator around the existing demotion/promotion copies. Directory locations carry a format; lossy copies and blocks computed over them get lineage keys; the planner weighs lossy retrieval with a penalty; requests may opt out with `x-turbine-kv-lossy: deny`. The ladder is a third `EvictAction` (`Compress`) decided by the eviction policy from tier fill and the pressure state and applied by the hierarchy within the Phase 4 per-tick bounds. YaRN is a `RopeScaling::Yarn` variant computed on the host into the existing `inv_freq` table with the attention factor folded into the attention scale; the resolved RoPE parameters and the FP8 KV scales enter the namespace key.
+Weights: `turbine_model::weights::WeightFormat` becomes a description of a quantized linear layer (`QuantScheme`, `ActivationQuant`, extra tensor slots, a repack step), with one registry entry per checkpoint packaging; the loader builds `QuantLinear` values that the decoder hands to a new quantized GEMM op. `turbine-kernels` gains `OpKind::QGemm` / `OpKind::QuantizeAct` with a CPU reference (`cpu::quant`) and the optional kernel ABI group v2.9 (`turbine_qgemm*`, `turbine_quantize_act*`, dtype codes F8E4M3 / U8); the HIP shim registers implementations chosen by recorded provider evaluations (hipBLASLt FP8 first for `fp8`, CK `gemm_quant` for block-scaled and INT4, CK microscale / llama.cpp for MXFP4). KV: `kv.dtype: fp8_e4m3` switches the L0 layout to one byte per element with per-layer scales and an FP8-reading paged attention. YaRN is a `RopeScaling::Yarn` variant computed on the host into the existing `inv_freq` table with the attention factor folded into the attention scale; the resolved RoPE parameters and the FP8 KV scales enter the namespace key.
 
 ## Constraints
 
 Copied verbatim from the spec (Constraints):
 
 - Test tiers (AGENTS.md "Test tiers", decision 2026-09-27): per landing step `scripts/gate.sh`, plus `scripts/lab-test.sh novanas --tier quick` when GPU-facing code changes (`turbine-kernels`, `turbine-model`, `turbine-device`, the ABI, `kernels/rocm`), plus `scripts/lab-bench.sh --quick` when throughput or numerics can change; phase exit: `scripts/gate.sh --full`, `scripts/lab-test.sh novanas --tier full` and its two-GPU leg, `scripts/lab-bench.sh --golden16` for Llama and OLMoE BF16 plus every proof checkpoint, and `scripts/overload-soak.sh novanas --duration 10m` (asked first).
-- Reuse first (AGENTS.md rule, decision "Kernel reuse policy"): every kernel of S-7 … S-10, S-13, S-17 and S-20 is preceded by a recorded evaluation in `.procoder/ask/decisions.md` of CK (`ck_tile` `gemm_quant`, microscale, FMHA FP8), hipBLASLt (FP8, scaled), llama.cpp HIP (q4/q8 and MXFP4 mat-vec and mmq, flash attention with quantized KV), vLLM / SGLang / aiter ROCm kernels and the compressed-tensors / Quark unpack paths; an own kernel only when none builds, none is correct on `gfx1201` or all are measurably slower. No Python in the build or runtime path; third-party kernel sources are pinned (CK by its existing `FetchContent` commit; llama.cpp by commit if used) and their licenses land in `kernels/rocm/third_party/LICENSES/`.
+- Reuse first (AGENTS.md rule, decision "Kernel reuse policy"): every kernel of S-7 … S-10 and S-13 is preceded by a recorded evaluation in `.procoder/ask/decisions.md` of CK (`ck_tile` `gemm_quant`, microscale, FMHA FP8), hipBLASLt (FP8, scaled), llama.cpp HIP (q4/q8 and MXFP4 mat-vec and mmq, flash attention with quantized KV), vLLM / SGLang / aiter ROCm kernels and the compressed-tensors / Quark unpack paths; an own kernel only when none builds, none is correct on `gfx1201` or all are measurably slower. No Python in the build or runtime path; third-party kernel sources are pinned (CK by its existing `FetchContent` commit; llama.cpp by commit if used) and their licenses land in `kernels/rocm/third_party/LICENSES/`.
 - Correctness bar: every GPU implementation has a lab test against the S-5 CPU reference; every quantized checkpoint has a golden reference; the BF16 golden tolerances, the OLMoE calibration and the Phase 4 `kv_gpu` bit-exact checks at `kv.dtype: bf16` and at the `l0` tier format do not change; lossy blocks are never served to an opted-out request.
-- Nothing lossy by default: `kv.dtype`, `kv.cpu.format`, `kv.nvme.format` and `kv.ladder.enabled` default to the exact behaviour; a quantized checkpoint is lossy only relative to BF16, and it is served as stored.
-- Pluggability: every packaging, weight format, KV codec and kernel implementation is one file (or directory) plus a registry entry; `docs/extending/weight-format.md` is rewritten for S-3 and a new `docs/extending/kv-format.md` describes codecs; `cargo test -p turbine-model --test docs_extending` keeps them true.
+- Nothing lossy by default: `kv.dtype` defaults to the exact behaviour; a quantized checkpoint is lossy only relative to BF16, and it is served as stored.
+- Pluggability: every packaging, weight format and kernel implementation is one file (or directory) plus a registry entry; `docs/extending/weight-format.md` is rewritten for S-3; `cargo test -p turbine-model --test docs_extending` keeps them true.
 - Vendor neutrality (umbrella S-5): no HIP type in a public signature of `turbine-kernels`, `turbine-tensor`, `turbine-scheduler`, `turbine-kv` or `turbine-reliability`; every ABI addition is an optional minor group specified so a CUDA library can implement it when `phase-2b-nvidia` is re-specced.
-- Unsafe Rust and FFI stay in `turbine-kernels` (and the existing allowlist); `turbine-kv` stays GPU-free (codecs' GPU side is a kernel op the server's orchestrator calls).
+- Unsafe Rust and FFI stay in `turbine-kernels` (and the existing allowlist); `turbine-kv` stays GPU-free.
 - Host copies go through pinned memory (L1 slots, the per-shard pinned bounce buffer); no pageable async copy is added (ROCm pageable-copy bug).
-- Bounded everything (TS §21 rule 8): transcode batches (≤ 32 blocks, the Phase 4 `DEMOTION_INFLIGHT`), ladder rewrites per tick (32), lineage keys (one per lossy copy, reclaimed with it), the `lossy_penalty` map (one entry per registered codec).
+- Bounded everything (TS §21 rule 8): load-time staging (the existing 256 MiB staging buffer), refusal reasons from closed sets, metric labels from registered values.
 - Lab: `novanas` only; perf numbers on GPU 0 only, through `scripts/lab-bench.sh` holding `scripts/bench-lock.sh`; GPU 1 for functional tests; two-GPU runs through `scripts/lab-cluster.sh --bench-lock`; every GPU test has a hard timeout; a busy GPU or lock is identified (`kubectl -n turbine-ci get pods`, `pgrep -fa`) before waiting; a card held by another workload stops the run and goes to the coordinator; weights only into `/home/piwi/turbine-models/<slug>`, only the checkpoints named in S-11, with the free disk checked first (≥ 60 GB free) and the Hugging Face token never read, printed or passed.
 - Git: one commit per plan task, gate-clean; no push; nothing filed outside the repository.
 
 From the interface contract and the work in flight (binding):
 
-- Names in `.procoder/contract/interfaces.md` §3.8 (support matrix), §9 (kernel C ABI), §10 (`turbine-model`), §11 (`turbine-kv`), §17 (metrics) and §24 (registries) are used verbatim; this phase's additions go into a new contract section §26 "Phase 6 additions" in Task 1's commit, and §9.1's planned "≥ 6" major is replaced by the optional minors v2.9 / v2.10 (the umbrella constraint: `TURBINE_ABI_VERSION` stays `2u`).
-- Toolchain edition 2024, `rust-version = "1.97"`; `#[non_exhaustive]` on enums later phases extend (`QuantScheme`, `ActivationQuant`, `EvictAction`, `EvictReason`, `WeightFormatColumn`); config structs `#[serde(deny_unknown_fields, default)]`; metric labels from closed enums rendered with `as_str()`.
-- Starting point: branch `phase-6-quantization` from `main` at `44e9a0a` (Phase 5 merged, Phase 5p docs only). BF16 baseline on GPU 0: Llama 855.2 tok/s (ITL p50 15.4 ms, TTFT p50 208 ms), OLMoE 613.9 (24.3, 118) — Task 4 re-measures it as the phase-start baseline.
-- Builds and tests run on novanas through `scripts/remote-cargo.sh` (no local target directories); every task ends with `scripts/gate.sh` printing `gate: ok`; GPU-facing tasks add `scripts/lab-test.sh novanas --tier quick`; every task that changes serving code ends with `scripts/lab-bench.sh --quick --model llama` and `--model olmoe` (GPU 0, under `scripts/bench-lock.sh`, `LABBOOK_SET=phase-6-quantization`) and a row in `.procoder/perf-log.md` — one change, then measure.
-- Lab runs fall under the standing novanas approvals (2026-09-25, 2026-09-26) for `lab-test.sh`, `lab-serve.sh`, `lab-bench.sh`, golden and bench runs while the R9700s are free; downloads only of the checkpoints named in S-11 (approved by the coordinator's kickoff); anything else, and every soak, is asked first. Sub-agents used for file-disjoint work run in worktrees and receive these lab rules verbatim.
+- Names in `.procoder/contract/interfaces.md` §3.8 (support matrix), §9 (kernel C ABI), §10 (`turbine-model`), §11 (`turbine-kv`), §17 (metrics) and §24 (registries) are used verbatim; this phase's additions go into a new contract section §26 "Phase 6 additions" in Task 1's commit (6b appends to it), and §9.1's planned "≥ 6" major is replaced by the optional minor v2.9 (the umbrella constraint: `TURBINE_ABI_VERSION` stays `2u`).
+- Toolchain edition 2024, `rust-version = "1.97"`; `#[non_exhaustive]` on enums later phases extend (`QuantScheme`, `ActivationQuant`, `WeightFormatColumn`, `KvDtypeChoice`); config structs `#[serde(deny_unknown_fields, default)]`; metric labels from closed enums rendered with `as_str()`.
+- Starting point: branch `phase-6a-quantization` (created as `phase-6-quantization`, renamed at the split) from `main` at `44e9a0a` (Phase 5 merged, Phase 5p docs only). BF16 baseline on GPU 0: Llama 855.2 tok/s (ITL p50 15.4 ms, TTFT p50 208 ms), OLMoE 613.9 (24.3, 118) — Task 4 re-measures it as the phase-start baseline.
+- Builds and tests run on novanas through `scripts/remote-cargo.sh` (no local target directories); every task ends with `scripts/gate.sh` printing `gate: ok`; GPU-facing tasks add `scripts/lab-test.sh novanas --tier quick`; every task that changes serving code ends with `scripts/lab-bench.sh --quick --model llama` and `--model olmoe` (GPU 0, under `scripts/bench-lock.sh`, `LABBOOK_SET=phase-6a-quantization`) and a row in `.procoder/perf-log.md` — one change, then measure.
+- Lab runs fall under the standing novanas approvals (2026-09-25, 2026-09-26) for `lab-test.sh`, `lab-serve.sh`, `lab-bench.sh`, golden and bench runs while the R9700s are free; downloads only of the checkpoints named in spec S-11 (approved by the user 2026-09-28, ≈ 41 GB, ≥ 60 GB kept free); anything else, and every soak, is asked first. Sub-agents used for file-disjoint work run in worktrees and receive these lab rules verbatim.
 
 ## Task 1: Port the umbrella tasks from `runahead/p8-umbrella`
 
@@ -47,28 +47,27 @@ Interfaces:
   Depends on: nothing in this phase
 
 - [ ] Red: `scripts/remote-cargo.sh test -p turbine-bench --test golden eval_accuracy_report` — expect FAIL (`unrecognized subcommand 'eval'`).
-- [ ] Cherry-pick in order onto `phase-6-quantization`: `5794d4d` (config keys), `6bb5157` (eval), `844b229` (GSM8K set), `bde359f` (track gate); resolve conflicts against the Phase 2m / 5 tree by keeping main's structure and the commits' additions; apply the amended gate of the umbrella plan Task 8 (phase 6 needs no earlier track; phase 7 counts `amd` rows with a quantized weight column or `fp8_e4m3` KV).
+- [ ] Cherry-pick in order onto `phase-6a-quantization`: `5794d4d` (config keys), `6bb5157` (eval), `844b229` (GSM8K set), `bde359f` (track gate); resolve conflicts against the Phase 2m / 5 tree by keeping main's structure and the commits' additions; apply the amended gate of the umbrella plan Task 8 with the track names `phase-6a-quantization`, `phase-6b-kv-compression`, `phase-7-model-families`, `phase-8-speculative-decoding` (6a needs no earlier track; 6b needs an `amd` row with a quantized weight column or `fp8_e4m3` KV `supported`; 7 needs 6b's `tq4`/`tq2` or a lower-tier format closed, per the umbrella track list).
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-bench --test golden` and `scripts/remote-cargo.sh test -p turbine-bench --test lab_scripts track_gate` and `scripts/remote-cargo.sh test -p turbine-core config::tests` — expect PASS; `shasum -a 256 tests/eval/gsm8k-200.jsonl` — expect the sha above.
-- [ ] Run: `scripts/track-gate.sh phase-6-quantization` — expect `GATE PASS phase-6-quantization`.
-- [ ] Update the umbrella plan's state line (Tasks 1, 5, 6, 8 ported on `phase-6-quantization`) and add the contract §26 heading listing this phase's additions (filled by later tasks).
+- [ ] Run: `scripts/track-gate.sh phase-6a-quantization` — expect `GATE PASS phase-6a-quantization`.
+- [ ] Update the umbrella plan's state line (Tasks 1, 5, 6, 8 ported on `phase-6a-quantization`) and add the contract §26 heading listing this phase's additions (filled by later tasks).
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `chore: port the phase 6-8 umbrella tasks (quality keys, eval gate, GSM8K-200, track gate)` (one commit; the cherry-picks are squashed so the branch keeps one commit per task)
 
 ## Task 2: Support-matrix cleanup and the new weight-format columns
 
-Files: `crates/turbine-core/src/support.rs` (reasons, NVIDIA rows, `WeightFormatColumn` values, `SupportKey::for_model`, `TIER_FORMAT_REFUSALS`), `crates/turbine-server/src/support_startup.rs` (keys from the detected format and `kv.dtype`; the `phase-8c` assert), `crates/turbine-server/tests/server_cli.rs` (`unsupported_row_exits_2_before_bind` reason), `crates/turbine-server/tests/tiny_server.rs`, `crates/turbine-model/src/config.rs`, `crates/turbine-model/src/families/mod.rs` (only the `phase-8*` strings; the `GptOssForCausalLM` unregistered-architecture examples stay until Phase 7), `AGENTS.md` (support-matrix sentence)
+Files: `crates/turbine-core/src/support.rs` (reasons, NVIDIA rows, `WeightFormatColumn` values, `SupportKey::for_model`), `crates/turbine-server/src/support_startup.rs` (keys from the detected format and `kv.dtype`; the `phase-8c` assert), `crates/turbine-server/tests/server_cli.rs` (`unsupported_row_exits_2_before_bind` reason), `crates/turbine-server/tests/tiny_server.rs`, `crates/turbine-model/src/config.rs`, `crates/turbine-model/src/families/mod.rs` (only the `phase-8*` strings; the `GptOssForCausalLM` unregistered-architecture examples stay until Phase 7), `AGENTS.md` (support-matrix sentence)
 Interfaces:
 
 - `const QUANT_REASON: &str = "quantized format not validated yet (track phase-6-quantization)"`, `FAMILY_REASON` naming `phase-7-model-families`, the draft row naming `phase-8-speculative-decoding`, `NVIDIA_REASON = "NVIDIA execution is deferred (phase-2b-nvidia)"`
 - `WeightFormatColumn::{Fp8, Fp8Block, Mxfp4, Mxfp4A4, AwqInt4, GptqInt4}` with serde names `fp8`, `fp8_block`, `mxfp4`, `mxfp4_a4`, `awq_int4`, `gptq_int4`, each with a `*/*/*/<value>/*/none` unsupported row
 - `SupportKey::for_model(vendor: &str, arch: Option<&str>, architecture: &str, weight: WeightFormatColumn, kv: KvFormatColumn, spec: SpeculativeColumn) -> SupportKey`; `SupportKey::bf16` becomes a thin wrapper used only by tests
-- `pub struct TierFormatRefusal { pub format: &'static str, pub status: SupportStatus }`, `pub static TIER_FORMAT_REFUSALS: &[TierFormatRefusal]` (`tq4`, `tq2` → unsupported naming `phase-6-quantization`), `pub fn check_tier_format(key: &str, format: &str) -> Result<SupportStatus, ConfigError>`
   Covers: spec S-1; AC `baseline_rows_present`, `key_uses_detected_format`
   Depends on: Task 1
 
-- [ ] Write failing test `support::tests::baseline_rows_present` (extend): no row reason contains `phase-8`; every `nvidia` row resolves unsupported naming `phase-2b-nvidia`; the six new columns resolve unsupported naming `phase-6-quantization`; `validate_table` passes. Run: `scripts/remote-cargo.sh test -p turbine-core support::tests` — expect FAIL
+- [ ] Write failing test `support::tests::baseline_rows_present` (extend): no row reason contains `phase-8`; every `nvidia` row resolves unsupported naming `phase-2b-nvidia`; the six new columns resolve unsupported naming `phase-6a-quantization`; `validate_table` passes. Run: `scripts/remote-cargo.sh test -p turbine-core support::tests` — expect FAIL
 - [ ] Write failing test `support_startup::tests::key_uses_detected_format` in `crates/turbine-server/src/support_startup.rs`: for a config with `kv.dtype` unset the key's KV column is `bf16`; the weight column comes from a `WeightFormatColumn` argument (Task 6 wires detection; until then `Bf16`). Run: `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server support_startup` — expect FAIL
-- [ ] Implement the reasons, the NVIDIA rows, the columns, `for_model` and the tier refusal table; update the three tests that assert `phase-8c` to `phase-7-model-families`.
+- [ ] Implement the reasons, the NVIDIA rows, the columns, `for_model`; update the three tests that assert `phase-8c` to `phase-7-model-families`.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-core` and `scripts/remote-cargo.sh test -p turbine-server` — expect PASS; `grep -rn "phase-8[abc]" crates` — expect no output.
 - [ ] Run: `scripts/remote-cargo.sh run -p turbine-server -- --support-matrix` — expect the NVIDIA rows `unsupported` and the six new columns listed.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
@@ -95,12 +94,12 @@ Files: `scripts/lab-bench.sh` (`--model` values of the spec's Interfaces, each m
 Interfaces:
 
 - `scripts/lab-bench.sh --model <llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16>`; unknown values exit 2 listing the valid ones; a model whose weights directory is missing on novanas exits 1 naming the directory
-  Covers: spec S-25 (baseline)
+  Covers: spec S-20 (baseline)
   Depends on: Task 1
 
 - [ ] Write failing test `lab_scripts lab_bench_model_map`: `bash -n scripts/lab-bench.sh`, and for each value the script's `--print-model <value>` helper prints `<slug> <config>`; an unknown value exits 2. Run: `scripts/remote-cargo.sh test -p turbine-bench --test lab_scripts lab_bench_model_map` — expect FAIL
 - [ ] Implement the map, the helper and the configs; `shellcheck scripts/lab-bench.sh` clean.
-- [ ] Lab (GPU 0, bench lock): `LABBOOK_SET=phase-6-quantization scripts/lab-bench.sh --model llama --golden16` and `--model olmoe --golden16` — expect golden1 and golden16 PASS; record both `BENCH` lines as the phase-start baseline in `.procoder/perf-log.md`.
+- [ ] Lab (GPU 0, bench lock): `LABBOOK_SET=phase-6a-quantization scripts/lab-bench.sh --model llama --golden16` and `--model olmoe --golden16` — expect golden1 and golden16 PASS; record both `BENCH` lines as the phase-start baseline in `.procoder/perf-log.md`.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `chore(lab): phase 6 lab-bench models and the phase-start baseline`
 
@@ -150,10 +149,10 @@ Interfaces:
 - `QGemmConfig { n: u32, k: u32, scheme: QuantSchemeDesc, act_quant: ActQuantDesc, c_dtype: DType, group_size: u32 }`; `QGemmContext { a: TensorView, b: QuantWeightView, c: TensorView, a_scales: Option<TensorView>, prefill: bool }`; `trait QGemmKernel { fn supports(&self, cfg: &QGemmConfig) -> bool; fn implementation(&self, cfg: &QGemmConfig) -> String; fn execute(&self, ctx: &mut QGemmContext) -> Result<(), KernelError>; }`; same trio shape for `QuantizeActKernel`
 - `KernelProvider::qgemm(&self) -> Option<&dyn QGemmKernel>` and `quantize_act(&self) -> Option<&dyn QuantizeActKernel>`, default `None`; the CPU provider implements both as `cpu_qgemm_ref` / `cpu_quantize_act_ref`
 - C: `turbine_qgemm_desc` and `turbine_quantize_act_desc` field lists as the spec's Interfaces; `TURBINE_ABI_MINOR` constant in the header becomes 9 (a library reports its own minor)
-  Covers: spec S-6; AC `ffi::tests::optional_groups_v29_v210` (the v2.9 half), `vendor_neutral_api`
+  Covers: spec S-6; AC `ffi::tests::optional_groups_v29`, `vendor_neutral_api`
   Depends on: Task 5
 
-- [ ] Write failing test `ffi::tests::optional_groups_v29_v210` (v2.9 half): a stub symbol table with minor 8 resolves no qgemm; minor 9 with every symbol resolves both trios; minor 9 missing `turbine_quantize_act_impl` resolves neither of that trio. Run: `scripts/remote-cargo.sh test -p turbine-kernels ffi::tests` — expect FAIL
+- [ ] Write failing test `ffi::tests::optional_groups_v29`: a stub symbol table with minor 8 resolves no qgemm; minor 9 with every symbol resolves both trios; minor 9 missing `turbine_quantize_act_impl` resolves neither of that trio. Run: `scripts/remote-cargo.sh test -p turbine-kernels ffi::tests` — expect FAIL
 - [ ] Write failing test `cpu::qgemm::tests::matches_dequantized_gemm`: for every scheme and activation mode, random seeded inputs, CPU `qgemm` equals `gemm(dequantize(W), quantize_dequantize(A))` bitwise in F32. Run: `scripts/remote-cargo.sh test -p turbine-kernels cpu::qgemm` — expect FAIL
 - [ ] Implement header, FFI resolution, Rust ops, registry lookups and the CPU implementation.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-kernels` — expect PASS (including `vendor_neutral_api`)
@@ -266,7 +265,7 @@ Files: `tests/golden/llama-3.2-3b-instruct-fp8-dynamic/{reference.jsonl,toleranc
 Interfaces:
 
 - support rows `amd/gfx1201/LlamaForCausalLM/fp8/bf16/none` → `supported` after all gate items pass
-  Covers: spec S-11 (fp8), S-22; AC S-11 per-checkpoint criterion
+  Covers: spec S-11 (fp8), S-17; AC S-11 per-checkpoint criterion
   Depends on: Tasks 11, 13
 
 - [ ] Fixture (novanas, CPU is enough): `uv run scripts/golden/quant_reference.py --model-dir /home/piwi/turbine-models/llama-3.2-3b-instruct-fp8-dynamic --prompts tests/golden/prompts.jsonl --out tests/golden/llama-3.2-3b-instruct-fp8-dynamic/reference.jsonl --act-quant fp8_token`; calibrate `tolerance.json` with `uv run scripts/golden/self_spread.py` on the dequantized copy; README with repo, revision, commands. Same for the per-tensor checkpoint with `--act-quant fp8_tensor`.
@@ -285,7 +284,7 @@ Files: `.procoder/ask/decisions.md` (entry "P6: block-scaled FP8 GEMM — provid
 Interfaces:
 
 - implementation `ck_tile_abquant_fp8` (scheme `FP8_BLOCK`, act `FP8_GROUP128`) or, per Q3 fallback, `dequant_fp8_block_bf16` + BF16 GEMM (act `NONE`, W8A16)
-  Covers: spec S-8, S-11 (fp8_block), S-22
+  Covers: spec S-8, S-11 (fp8_block), S-17
   Depends on: Task 14
 
 - [ ] Evaluate (GPU 0, bench lock, 20-minute timeout): CK `ABQuantGrouped` built from the pinned CK for gfx1201 (WMMA policy), correctness vs `cpu::quant`, timings; the dequant fallback candidates if it fails; write the decisions entry.
@@ -330,7 +329,7 @@ Files: `tests/golden/llama-3.2-3b-instruct-awq/{…}`, `tests/golden/llama-3.2-3
 Interfaces:
 
 - rows `amd/gfx1201/LlamaForCausalLM/{awq_int4,gptq_int4}/bf16/none` → `supported` after their gates
-  Covers: spec S-11 (INT4), S-22
+  Covers: spec S-11 (INT4), S-17
   Depends on: Tasks 11, 17
 
 - [ ] Fixtures: `quant_reference.py … --act-quant none` for both checkpoints; tolerance from `self_spread.py` on the dequantized copies; READMEs.
@@ -361,7 +360,7 @@ Files: `tests/golden/llama-3.1-8b-instruct/{…}` (BF16 baseline fixture from `h
 Interfaces:
 
 - rows `amd/gfx1201/LlamaForCausalLM/mxfp4/bf16/none` → `supported` after its gate; `…/mxfp4_a4/…` → `supported` if its gate passes, else `experimental` (decision "Phase 6 MXFP4")
-  Covers: spec S-10, S-11 (MXFP4), S-22
+  Covers: spec S-10, S-11 (MXFP4), S-17
   Depends on: Tasks 11, 19
 
 - [ ] Fixtures: BF16 8B via `hf_reference.py` (CPU, may take hours — run as a background Job with a 6-hour timeout), MXFP4 8B via `quant_reference.py --act-quant none`, Quark 3B via `--act-quant mxfp4`; tolerances via `self_spread.py`.
@@ -393,7 +392,7 @@ Interfaces:
 
 - `KvConfig.dtype: KvDtypeChoice::{Bf16, Fp8E4m3}` (serde `bf16`, `fp8_e4m3`); `KvFormat` canonical JSON gains `k_scales_hash` / `v_scales_hash` (BLAKE3 of the per-layer scales) when the dtype is FP8
   Covers: spec S-13 (host), S-16 (scales half); AC `fp8_kv_matches_reference`, `rope_and_scales_scope_the_namespace` (scales part)
-  Depends on: Task 3
+  Depends on: Tasks 3, 6
 
 - [ ] Write failing tests `tiny_model fp8_kv_matches_reference` (tiny Llama and OLMoE, with and without checkpoint scales) and `identity::tests::rope_and_scales_scope_the_namespace` (scales part). Run: `scripts/remote-cargo.sh test -p turbine-model --test tiny_model fp8_kv` and `scripts/remote-cargo.sh test -p turbine-kv identity` — expect FAIL
 - [ ] Implement; `kv.dtype: fp8_e4m3` on a kernel library without FP8 paged attention exits 1 `kv_fp8_unavailable`.
@@ -423,7 +422,7 @@ Files: `crates/turbine-server/tests/kv_gpu.rs` (`prefix_reuse_matches_cold_fp8_k
 Interfaces:
 
 - rows `amd/gfx1201/{LlamaForCausalLM,OlmoeForCausalLM}/bf16/fp8_e4m3/none` → `supported` after the gate; FP8 KV with a quantized weight column only per combination that passed its own golden (`llama fp8 + fp8_e4m3` is run here)
-  Covers: spec S-13, S-14, S-22; AC `paged_fp8` lab proof, `kv_gpu` FP8 round trips
+  Covers: spec S-13, S-14, S-17; AC `paged_fp8` lab proof, `kv_gpu` FP8 round trips
   Depends on: Task 23
 
 - [ ] Write failing lab tests in `kv_gpu.rs`. Run: `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu` — expect FAIL (new tests), existing ones PASS
@@ -435,18 +434,18 @@ Interfaces:
 
 ## Task 25: `quantization` in status, weight-format and KV metrics
 
-Files: `crates/turbine-server/src/status.rs` or the file defining `StatusDocument` (`quantization` object), `crates/turbine-api/src/…` metrics registration for `turbine_weight_format_info`, `turbine_qgemm_calls_total`, `crates/turbine-kv/src/metrics.rs` (`format` label on `turbine_kv_blocks` / `turbine_kv_bytes`), `crates/turbine-kv/src/document.rs` (tier `formats`), `crates/turbine-api/tests/api.rs` (`status_reports_quantization`, `kv_metrics_bounded` extension), `crates/turbine-model/src/weights/mod.rs` (`weight_format` log event)
+Files: `crates/turbine-server/src/status.rs` or the file defining `StatusDocument` (`quantization` object), `crates/turbine-api/src/…` metrics registration for `turbine_weight_format_info`, `turbine_qgemm_calls_total`, `crates/turbine-api/tests/api.rs` (`status_reports_quantization`), `crates/turbine-model/src/weights/mod.rs` (`weight_format` log event)
 Interfaces:
 
-- `StatusDocument.quantization: QuantizationStatus { weight_format, packaging, activation, kv_dtype, tier_formats: { l1, l2 }, ladder: { enabled, rungs } }` (ladder fields report `enabled: false` until Task 39)
-  Covers: spec S-24; AC `status_reports_quantization`, `kv_metrics_bounded` (format label)
+- `StatusDocument.quantization: QuantizationStatus { weight_format, packaging, activation, kv_dtype }` (6b adds `tier_formats` and `ladder`)
+  Covers: spec S-19; AC `status_reports_quantization`
   Depends on: Task 24
 
 - [ ] Write failing tests. Run: `scripts/remote-cargo.sh test -p turbine-api --test api status_reports_quantization` — expect FAIL
 - [ ] Implement.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-api -p turbine-kv -p turbine-server` — expect PASS
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(api): quantization status and per-format KV metrics`
+- [ ] Commit: `feat(api): quantization status and weight-format metrics`
 
 ## Task 26: YaRN parsing, `inv_freq` and the attention factor
 
@@ -493,203 +492,20 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `test(golden): YaRN Llama-3.2-3B reference and lab proof`
 
-## Task 29: `KvCodec` registry with `l0` and `fp8_e4m3` (CPU)
+## Task 29: Phase exit (6a)
 
-Files: `crates/turbine-kv/src/codec/mod.rs` (trait, registry, conformance), `crates/turbine-kv/src/codec/l0.rs`, `crates/turbine-kv/src/codec/fp8_e4m3.rs` (new), `crates/turbine-kv/src/lib.rs`, `crates/turbine-kv/tests/registry_conformance.rs` or the crate's existing conformance module (`kv_codecs`), `docs/extending/kv-format.md` (new), `docs/extending/README.md` (index), `crates/turbine-model/tests/docs_extending.rs` (page list)
-Interfaces:
-
-- `trait KvCodec` and `CodecParams` as in the spec; `fn registry() -> &'static Registry<dyn KvCodec>` named `"kv_format"`; `fp8_e4m3` from a BF16 source uses per-layer scales = the L0 scales if L0 is FP8, else per-block-per-layer absmax/448 stored in the slot header (so a BF16 L0 demoting to FP8 needs no calibration)
-  Covers: spec S-17 (CPU); AC `codec::tests`, `docs_extending`
-  Depends on: Task 24
-
-- [ ] Write failing tests `codec::tests::{registry_lists_codecs, l0_is_identity, fp8_from_bf16_within_bound, fp8_from_fp8_is_identity}` and the conformance suite. Run: `scripts/remote-cargo.sh test -p turbine-kv codec` — expect FAIL
-- [ ] Implement; write `docs/extending/kv-format.md` (files, registry entry, CPU codec, GPU transcode op, suite command, lab checks, pitfalls: tier ordering, lineage keys, bit-exact decode).
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv` and `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(kv): KV codec registry with l0 and fp8_e4m3`
-
-## Task 30: Per-tier format configuration keys
-
-Files: `crates/turbine-core/src/config/kv.rs` (`cpu.format`, `nvme.format`, `lossless_tail_blocks`, `lossy_reuse`, `lossy_penalty`, `ladder.*`), `crates/turbine-core/src/config/mod.rs` (tests `phase6_keys`), `crates/turbine-server/src/startup.rs` (codec names validated against the `kv_format` registry and `check_tier_format`), `examples/turbine.yaml` (commented defaults)
-Interfaces:
-
-- keys, defaults and validation exactly as the spec's configuration table
-  Covers: spec S-18, S-23; AC `phase6_keys`, `--check-config` criterion
-  Depends on: Task 29
-
-- [ ] Write failing test `config::tests::phase6_keys`. Run: `scripts/remote-cargo.sh test -p turbine-core config::tests::phase6_keys` — expect FAIL
-- [ ] Implement.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-core`; `scripts/remote-cargo.sh run -p turbine-server -- --config examples/turbine.yaml --check-config --set kv.dtype=fp8_e4m3 --set kv.cpu.format=fp8_e4m3` — expect `config ok`; `--set kv.dtype=int8` — expect exit 2 naming `kv.dtype`
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(core): per-tier KV format and lossy-reuse configuration`
-
-## Task 31: Per-tier demotion and promotion through codecs (host path)
-
-Files: `crates/turbine-kv/src/tier/mod.rs` (`KvLocation.format`), `crates/turbine-kv/src/tier/l1.rs`, `crates/turbine-kv/src/tier/l2.rs` (slot size from the codec; slab header v2), `crates/turbine-kv/src/hierarchy.rs` (demotion picks the tier format except the lossless tail; promotion decodes), `crates/turbine-kv/src/transfer.rs` (`TransferRequest.codec`), `crates/turbine-server/src/kv_orchestrator.rs` (`CopyDevice::Sync` path calls `encode_cpu` / `decode_cpu`), `crates/turbine-scheduler/tests/kv_sim.rs` (`per_tier_formats`)
-Interfaces:
-
-- `KvLocation { tier, slot, format: &'static str }`; `HierarchyConfig.{l1_format, l2_format, lossless_tail_blocks}`; the lossless tail is computed from the sequence's block table at `request_done` / session demotion (blocks within the last N full blocks are flagged `tail`)
-  Covers: spec S-17, S-18 (host); AC `kv_sim per_tier_formats`
-  Depends on: Task 30
-
-- [ ] Write failing test `kv_sim per_tier_formats`. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim per_tier_formats` — expect FAIL
-- [ ] Implement; every existing `turbine-kv` and `kv_sim` test passes unchanged with `l0` formats.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-server` — expect PASS (including `engine::r#loop` `l2_round_trip_matches_cold`)
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(kv): lower tiers store blocks in their configured format`
-
-## Task 32: Lossy lineage, opt-out, lossy token counts and the planner penalty
-
-Files: `crates/turbine-kv/src/identity.rs` (`lossy_key`), `crates/turbine-kv/src/directory.rs` (`Lineage`, lookup order, opt-out cut), `crates/turbine-kv/src/planner.rs` (`lossy_penalty`, `allow_lossy`), `crates/turbine-kv/src/hierarchy.rs` (`PrefixAttach.lossy_tokens`, publishing over lossy prefixes), `crates/turbine-kv/src/metrics.rs` (lossy counters), `crates/turbine-api/src/openai/…` (header `x-turbine-kv-lossy`, `usage.prompt_tokens_details.lossy_cached_tokens`), `crates/turbine-core/src/request.rs` (`Usage.lossy_cached_tokens`, `RequestKvPolicy`), `crates/turbine-server/src/engine/requests.rs`, `crates/turbine-scheduler/tests/kv_sim.rs` (`lossy_lineage_never_reaches_opted_out`), `crates/turbine-api/tests/api.rs` (`kv_metrics_bounded`)
-Interfaces:
-
-- `lossy_key(key, format, seed) = BLAKE3("lossy" ‖ key ‖ format ‖ seed)[..16]`; a block computed with any lossy ancestor gets `Lineage::Lossy` and its key chains from the lossy parent key; `KvDirectory::lookup(.., allow_lossy: bool)`
-  Covers: spec S-19; AC `lossy_lineage_never_reaches_opted_out`, `kv_metrics_bounded`
-  Depends on: Task 31
-
-- [ ] Write failing tests. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim lossy_lineage` and `scripts/remote-cargo.sh test -p turbine-api --test api kv_metrics_bounded` — expect FAIL
-- [ ] Implement.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-api -p turbine-server` — expect PASS
-- [ ] Mutation check (do not commit): make `lookup` ignore `allow_lossy` — expect `lossy_lineage_never_reaches_opted_out` to FAIL; revert.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(kv): lossy lineage keys, per-request opt-out and lossy token counts`
-
-## Task 33: Kernel ABI v2.10 `kv_transcode` and the FP8 transcode on HIP
-
-Files: `kernels/include/turbine_kernels.h` (v2.10 group), `crates/turbine-kernels/src/ffi.rs` (`V210Symbols`, depends on v2.9 and v2.5), `crates/turbine-kernels/src/ops/mod.rs` (`OpKind::KvTranscode`, config, trait), `crates/turbine-kernels/src/cpu/kv_transcode.rs` (CPU provider calls a codec function table passed in from the server, keeping `turbine-kernels` free of `turbine-kv`), `kernels/rocm/src/kv_transcode.hip` (FP8 encode/decode; the TurboQuant slots added by Task 36), `kernels/rocm/src/impl_table.cpp`, `kernels/rocm/src/abi_minor.cpp` (10), `crates/turbine-server/src/kv_orchestrator.rs` (`CopyStreamBackend`: encode into a device staging buffer, then the existing pinned copies; promotion: copy small bytes into a device staging buffer, decode into the L0 page), `.procoder/ask/decisions.md` (entry "P6: KV transcode — provider evaluation": CK elementwise/transform, own), `crates/turbine-kernels/tests/hip_ops.rs` (`kv_transcode_matches_cpu`), `crates/turbine-server/tests/kv_gpu.rs` (`nvme_round_trip_fp8_tier`)
-Interfaces:
-
-- C and Rust shapes as the spec's Interfaces; one staging buffer of `DEMOTION_INFLIGHT` × the largest encoded block per shard, allocated at startup when a lower-tier format is not `l0`
-  Covers: spec S-17 (GPU); AC `optional_groups_v29_v210` (v2.10 half), `kv_transcode_matches_cpu` (FP8)
-  Depends on: Task 32
-
-- [ ] Evaluate transcode providers (short: CK `elementwise` / `batched_transpose` building blocks vs own) and write the entry.
-- [ ] Write failing tests: `ffi::tests::optional_groups_v29_v210` (v2.10 half), lab `hip_ops::kv_transcode_matches_cpu` (FP8), lab `kv_gpu::nvme_round_trip_fp8_tier` (L2 `fp8_e4m3` from BF16 L0 within the codec bound; `l0` still bit-exact). Run: `scripts/remote-cargo.sh test -p turbine-kernels ffi::tests` — expect FAIL; `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops kv_transcode` — expect FAIL
-- [ ] Implement.
-- [ ] Run the three — expect PASS; `scripts/lab-test.sh novanas --tier quick` — expect PASS; `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(rocm): ABI v2.10 KV transcode with FP8 on the demotion path`
-
-## Task 34: Per-tier FP8 lab proof
-
-Files: `scripts/lab/phase6-novanas-llama.yaml` (commented per-tier example), `tests/eval/llama-3.2-3b-instruct/turbine-l1-fp8.json`, `.procoder/perf-log.md`, `crates/turbine-server/tests/kv_gpu.rs` (`lossy_tier_reuse` with FP8 L1)
-Interfaces:
-
-- no new interface; measures S-17 … S-19 with the FP8 codec
-  Covers: spec S-17 … S-19, S-22 (FP8 tier)
-  Depends on: Task 33
-
-- [ ] Write failing lab test `kv_gpu::lossy_tier_reuse` (FP8 L1 from BF16 L0: within the golden token rule, `lossy_cached_tokens` > 0; with `x-turbine-kv-lossy: deny` bit-equal to cold). Run: `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu lossy_tier_reuse` — expect FAIL, then implement any gap — expect PASS
-- [ ] Lab (GPU 0, bench lock): `scripts/lab-bench.sh --model llama --golden16 -- --set kv.cpu.format=fp8_e4m3 --set kv.cpu.max_bytes=4GiB` — expect PASS; the Phase 4 multi-turn profile with `kv.cpu.format` `fp8_e4m3` vs `l0` on the same L1 bytes (commands of the spec's TurboQuant lab criterion) — record `cached_tokens_ratio` and L1 blocks per GiB; eval-compare at 0.01 — expect exit 0.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `test(kv): per-tier FP8 lab proof`
-
-## Task 35: TurboQuant CPU codec (`tq4`, `tq2`)
-
-Files: `crates/turbine-kv/src/codec/turboquant/mod.rs` (codec, layout), `crates/turbine-kv/src/codec/turboquant/hadamard.rs` (randomized fast Walsh–Hadamard), `crates/turbine-kv/src/codec/turboquant/codebook.rs` (Lloyd–Max codebooks as constants plus the generator used by the test), `crates/turbine-kv/src/codec/turboquant/qjl.rs` (1-bit residual projection), `crates/turbine-kv/src/codec/mod.rs` (registry adds `tq4`, `tq2`), `crates/turbine-core/src/support.rs` (`TIER_FORMAT_REFUSALS`: `tq4`/`tq2` `experimental`)
-Interfaces:
-
-- per token-head vector of 128: signs `s = rademacher(seed, layer, head, kind)`, `y = H·(s ⊙ x) / √128`, `norm = ‖x‖` (BF16), codes = nearest codebook entry of `y_i·√128 / norm`; K residual `r = y − ŷ`, QJL signs of `H·(s' ⊙ r)`, residual norm (BF16); decode inverts; `seed` = first 8 bytes of the namespace key
-  Covers: spec S-20 (CPU); AC `codec::turboquant::tests`
-  Depends on: Task 29
-
-- [ ] Write failing tests `codec::turboquant::tests::{hadamard_orthonormal, codebooks_reproduce, k_inner_product_unbiased, v_mse_bound_4bit, v_mse_bound_2bit, layout_round_trip}` and the registry conformance for both codecs. Run: `scripts/remote-cargo.sh test -p turbine-kv codec::turboquant` — expect FAIL
-- [ ] Implement.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv` — expect PASS
-- [ ] Mutation check (do not commit): drop the QJL residual term in K decode — expect `k_inner_product_unbiased` to FAIL; revert.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(kv): TurboQuant tq4 and tq2 codecs (CPU reference)`
-
-## Task 36: TurboQuant GPU transcode — evaluation and implementation
-
-Files: `.procoder/ask/decisions.md` (entry "P6: TurboQuant transcode — provider evaluation": llama.cpp / vLLM / SGLang TurboQuant or QJL HIP kernels at their current commits, CK building blocks, own), `kernels/rocm/src/kv_transcode_tq.hip` (encode/decode per the pick), `kernels/rocm/src/impl_table.cpp`, `crates/turbine-kernels/tests/hip_ops.rs` (`kv_transcode_matches_cpu` TurboQuant cases)
-Interfaces:
-
-- codebooks and seeds passed through `turbine_kv_transcode_desc`; decode bit-exact to the CPU codec; encode ties documented and counted
-  Covers: spec S-20 (GPU); AC `kv_transcode_matches_cpu`
-  Depends on: Tasks 33, 35
-
-- [ ] Evaluate; write the entry.
-- [ ] Write failing lab cases; run `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops kv_transcode` — expect FAIL
-- [ ] Implement; run — expect PASS; `scripts/lab-test.sh novanas --tier quick` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(rocm): TurboQuant KV transcode`
-
-## Task 37: TurboQuant lab proof
-
-Files: `tests/eval/llama-3.2-3b-instruct/{turbine-l1-tq4.json,turbine-l1-tq2.json}`, `tests/eval/olmoe-1b-7b-0125-instruct/{…}`, `crates/turbine-core/src/support.rs` (`TIER_FORMAT_REFUSALS` → `supported` for the passing codecs), `.procoder/perf-log.md`, `crates/turbine-server/tests/kv_gpu.rs` (`lossy_tier_reuse` with `tq4`)
-Interfaces:
-
-- no new interface; decides `tq4` / `tq2` `supported` or `experimental`
-  Covers: spec S-20, S-22; AC TurboQuant lab criterion, `lossy_tier_reuse`
-  Depends on: Task 36
-
-- [ ] Run the spec's TurboQuant lab criterion for Llama and OLMoE, `tq4` then `tq2` (GPU 0, bench lock): lab-bench golden16 with `kv.cpu.format`, the multi-turn profile against `lab-serve.sh`, `/turbine/v1/kv` capacity, eval-compare — record every number in the perf log and labbook.
-- [ ] `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu lossy_tier_reuse` with the `tq4` case — expect PASS
-- [ ] Flip the passing codecs; `support::tests` updated. Run: `scripts/remote-cargo.sh test -p turbine-core support` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(kv): TurboQuant lower-tier formats gated on gfx1201`
-
-## Task 38: `EvictAction` and the ladder decision in the eviction policy
-
-Files: `crates/turbine-kv/src/policy/mod.rs` (`EvictAction`, `LadderContext`, default `action`), `crates/turbine-kv/src/policy/cost_aware.rs` (ladder rule), `crates/turbine-kv/src/policy/lru.rs` (default), `crates/turbine-kv/src/metrics.rs` (`EvictReason::{Compressed, LadderFloor}`), `docs/extending/eviction-policy.md` (action, ladder, pitfalls)
-Interfaces:
-
-- as the spec's Interfaces; rung order from `kv.ladder.max_format` and the codec registry's lossiness order (`l0` < `fp8_e4m3` < `tq4` < `tq2`)
-  Covers: spec S-21 (policy); AC `policy::tests::ladder_actions`
-  Depends on: Task 37
-
-- [ ] Write failing test `policy::tests::ladder_actions` and extend `registry_conformance::eviction_policies` (every policy's `action` never upgrades and never compresses at GREEN). Run: `scripts/remote-cargo.sh test -p turbine-kv policy` — expect FAIL
-- [ ] Implement; update the docs page.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv` and `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(kv): compress as a third eviction action with the ladder rule`
-
-## Task 39: The ladder in the hierarchy, driven by the pressure controller
-
-Files: `crates/turbine-kv/src/hierarchy.rs` (rung state per tier, hysteresis, bounded rewrites per tick through `apply_reclaim` / `tick`, new demotions at the current rung), `crates/turbine-kv/src/metrics.rs` (`turbine_kv_ladder_rung`, `turbine_kv_ladder_actions_total`), `crates/turbine-server/src/kv_orchestrator.rs` (rewrites: L1/L2 slot → device staging → transcode → back, through the pinned paths), `crates/turbine-server/src/status.rs` (ladder fields), `crates/turbine-scheduler/tests/kv_sim.rs` (`ladder_under_pinned_pressure`), `crates/turbine-scheduler/tests/fixtures/ladder_pressure_trace.json`, `crates/turbine-scheduler/tests/fixtures/ladder_expected_rungs.json`
-Interfaces:
-
-- `HierarchyConfig.ladder: Option<LadderConfig { max_format, high_water, low_water, dwell }>`; `KvHierarchy::ladder_tick(&mut self, pool, pressure: PressureLevel, now)`; log event `kv_ladder`
-  Covers: spec S-21; AC `ladder_under_pinned_pressure`, `kv_metrics_bounded` (ladder families)
-  Depends on: Task 38
-
-- [ ] Write failing test `kv_sim ladder_under_pinned_pressure` with the committed trace and expected rung sequence. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim ladder` — expect FAIL
-- [ ] Implement.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-server -p turbine-api` — expect PASS; `overload_sim` unchanged
-- [ ] Mutation check (do not commit): remove the dwell check on stepping up — expect `ladder_under_pinned_pressure` to FAIL on the rung sequence; revert.
-- [ ] Lab: `scripts/lab-test.sh novanas --tier quick` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(kv): pressure-driven compression ladder in L1 and L2`
-
-## Task 40: Ladder lab proof and soak
-
-Files: `scripts/lab/phase6-novanas-ladder.yaml` (small L1/L2, `kv.ladder.enabled: true`), `.procoder/perf-log.md`, `tests/eval/llama-3.2-3b-instruct/turbine-ladder.json`
+Files: `.procoder/perf-log.md` (6a summary), `AGENTS.md` (6a commands: weight formats, `kv.dtype: fp8_e4m3`, `model.rope_scaling`, lab-bench models, fixture scripts), `.procoder/contract/interfaces.md` (§26, 6a part), `.procoder/specs/phase-6a-quantization.md` (criteria ticked with evidence), `.procoder/plans/phase-6-8-expansion.md` (6a closed)
 Interfaces:
 
 - no new interface
-  Covers: spec S-21, S-22, S-25; AC ladder soak criterion
-  Depends on: Task 39
-
-- [ ] Lab (GPU 0, bench lock): the multi-turn profile with the ladder config and with `kv.ladder.enabled: false` on the same bytes — record recomputed tokens, `cached_tokens_ratio`, rung metrics; eval-compare at 0.01 against BF16 KV — expect exit 0.
-- [ ] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m` with the ladder config — expect verdict pass and `turbine_kv_ladder_actions_total` > 0.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `test(kv): compression ladder lab proof and soak`
-
-## Task 41: Phase exit
-
-Files: `.procoder/perf-log.md` (phase summary), `AGENTS.md` (Phase 6 commands: formats, `kv.dtype`, per-tier formats, ladder, YaRN override, lab-bench models, fixture scripts), `.procoder/contract/interfaces.md` (§26 complete), `.procoder/specs/phase-6-quantization.md` (criteria ticked with evidence), `.procoder/plans/phase-6-8-expansion.md` (track 1 closed)
-Interfaces:
-
-- no new interface
-  Covers: spec S-25 phase-exit criterion; umbrella Task 10 (track close runbook) for track 1
-  Depends on: Tasks 1–40
+  Covers: spec S-20 phase-exit criterion; umbrella Task 10 (track close runbook) for 6a
+  Depends on: Tasks 1–28
 
 - [ ] `scripts/gate.sh --full` — expect `gate: ok`
 - [ ] `scripts/lab-test.sh novanas --tier full` and `scripts/lab-test.sh novanas --gpus 2 --features fault-injection --tier full` — expect exit 0
-- [ ] `scripts/lab-bench.sh --golden16` for `llama`, `olmoe` and every proof model — expect PASS; every performance target of the spec met or its miss recorded with the user's decision.
-- [ ] `scripts/overload-soak.sh novanas --duration 10m` (asked first) — expect pass.
-- [ ] `scripts/remote-cargo.sh run -p turbine-server -- --support-matrix --output json` — paste into the evidence; `scripts/track-gate.sh phase-7-model-families` — expect the order check to pass (spec check fails until that spec exists).
-- [ ] Report to the coordinator: every row's status, every non-passing format with its finding.
+- [ ] `scripts/lab-bench.sh --golden16` for `llama`, `olmoe` and every proof model — expect PASS; every performance target met or its miss recorded with the user's decision.
+- [ ] `scripts/overload-soak.sh novanas --duration 10m` (asked first) on BF16 Llama and each newly `supported` checkpoint — expect pass.
+- [ ] `scripts/remote-cargo.sh run -p turbine-server -- --support-matrix --output json` — paste into the evidence; `scripts/track-gate.sh phase-6b-kv-compression` — expect the order check to pass.
+- [ ] Report to the coordinator: every row's status, every non-passing format with its finding; 6b starts only after this report.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `docs: phase 6 exit — quantization track closed`
+- [ ] Commit: `docs: phase 6a exit — quantization closed`

@@ -5,7 +5,7 @@ Spec: .procoder/specs/phase-6-8-expansion.md
 
 Renamed from `phase-8-expansion` and amended on 2026-09-28 with its spec (decision "Roadmap reorganisation after Phase 5 (2026-09-28)" in `.procoder/ask/decisions.md`): the tracks are now `phase-6-quantization`, `phase-7-model-families` and `phase-8-speculative-decoding`, in that order, AMD (`novanas`) only. In the code and in older docs "P8a" means phase-6-quantization, "P8c" phase-7-model-families and "P8b" phase-8-speculative-decoding; test modules named `phase8_…` keep their names.
 
-State on main (2026-09-28): Tasks 2, 3, 4 and 7 landed in Phase 2m (S-11, from `runahead/p8-umbrella`); their text stays as the record of what was built. Tasks 1, 5, 6 and 8 exist only on `runahead/p8-umbrella` and are ported (Task 8 with the amended gate below) before Task 9 when phase 6 starts. Tasks 9–12 run once per track.
+State on main (2026-09-28): Tasks 2, 3, 4 and 7 landed in Phase 2m (S-11, from `runahead/p8-umbrella`); their text stays as the record of what was built. Tasks 1, 5, 6 and 8 exist only on `runahead/p8-umbrella` and are ported (Task 8 with the amended gate below) before Task 9 when phase 6 starts. Tasks 9–12 run once per track. Since the user's split of 2026-09-28 (decision "Phase 6 split: 6a quantization, 6b KV compression"), track 1 is `phase-6a-quantization` then `phase-6b-kv-compression`: Task 9's gate applies to both specs (both written and COMPLETE on 2026-09-28), Task 10's close runbook runs once for each, and the ported `scripts/track-gate.sh` accepts both names.
 
 ## Goal
 

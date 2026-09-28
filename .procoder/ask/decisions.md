@@ -1339,7 +1339,7 @@ Refined in discussion: a per-block ladder (lossless → FP8 → ~4-bit → ~2-bi
 
 ## Phase 6 spec: provisional design choices (2026-09-28)
 
-Written with `.procoder/specs/phase-6-quantization.md` and its plan. The scope, the formats, the MXFP4 packagings and proof checkpoints, YaRN, TurboQuant, the per-tier formats and the compression ladder are fixed by the entries "Roadmap reorganisation after Phase 5", "Phase 6 MXFP4: packaging formats and proof checkpoints", "YaRN RoPE scaling moves into Phase 6", "KV-cache quantization beyond FP8", "Sub-8-bit KV and per-tier KV formats in Phase 6" and "Pressure-driven KV compression ladder in Phase 6" (all 2026-09-28). The choices below are the ones those entries leave open. The spec writes each recommended option marked "(provisional)"; none is implemented until the user answers. Facts behind them, gathered 2026-09-28: hipBLASLt on `novanas` (ROCm 7.14.1, `gfx1201`) ships FP8 × FP8 → BF16/F32 Tensile kernels with scalar (`SAB`) and per-row/column vector (`SABV`) scales, but no BF16 × FP8 mixed kernel and no block-scaled or microscaled variant; the pinned CK (`therock-7.14.1`) has `ck_tile` `gemm_quant` (`TensorQuant`, `RowColQuant`, `AQuantGrouped`, `BQuantGrouped`, `ABQuantGrouped`, a microscale pipeline, some with WMMA policies) and FP8 hooks in the paged / split-KV FMHA kernels; whether any of them builds and is correct on `gfx1201` is what the reuse evaluations of the plan establish.
+Written with `.procoder/specs/phase-6-quantization.md` and its plan. The scope, the formats, the MXFP4 packagings and proof checkpoints, YaRN, TurboQuant, the per-tier formats and the compression ladder are fixed by the entries "Roadmap reorganisation after Phase 5", "Phase 6 MXFP4: packaging formats and proof checkpoints", "YaRN RoPE scaling moves into Phase 6", "KV-cache quantization beyond FP8", "Sub-8-bit KV and per-tier KV formats in Phase 6" and "Pressure-driven KV compression ladder in Phase 6" (all 2026-09-28). The choices below are the ones those entries leave open. The spec first wrote each recommended option marked "(provisional)"; the user answered all twenty on 2026-09-28 (below; Q11 differs from the recommendation). Facts behind them, gathered 2026-09-28: hipBLASLt on `novanas` (ROCm 7.14.1, `gfx1201`) ships FP8 × FP8 → BF16/F32 Tensile kernels with scalar (`SAB`) and per-row/column vector (`SABV`) scales, but no BF16 × FP8 mixed kernel and no block-scaled or microscaled variant; the pinned CK (`therock-7.14.1`) has `ck_tile` `gemm_quant` (`TensorQuant`, `RowColQuant`, `AQuantGrouped`, `BQuantGrouped`, `ABQuantGrouped`, a microscale pipeline, some with WMMA policies) and FP8 hooks in the paged / split-KV FMHA kernels; whether any of them builds and is correct on `gfx1201` is what the reuse evaluations of the plan establish.
 
 **1. Order of the sub-steps.** The kickoff listed weights → FP8 KV → TurboQuant → per-tier formats → YaRN → ladder.
 
@@ -1460,3 +1460,55 @@ The MXFP4 proofs are fixed: `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4
 
 - A) `fp8`: c16 tok/s ≥ 1.10 × BF16 and c1 ITL p50 ≤ 0.75 × BF16; `fp8_block`: c16 ≥ 1.0 ×; `awq_int4` / `gptq_int4` / `mxfp4` (on 3B-sized checkpoints): c1 ITL p50 ≤ 0.6 × BF16 and c16 tok/s ≥ 0.9 × BF16; where vLLM-ROCm serves the same checkpoint, Turbine c16 tok/s ≥ 0.9 × vLLM; FP8 KV: pool blocks ≥ 1.95 × BF16 KV and c16 tok/s ≥ 0.95 × BF16 KV; `tq4` in L1: L1 blocks per GiB ≥ 3.5 × `l0`, and multi-turn `mt_cached` not below the `l0` run; the ladder: `scripts/overload-soak.sh novanas --duration 10m` passes with a small L1/L2 (recommended)
 - B) No hard targets; record the numbers and decide at the track close
+
+**Answers (2026-09-28, user, relayed by the coordinator):**
+
+- **Q1: B** — foundations → weights → FP8 KV → YaRN → per-tier formats (proven with FP8) → TurboQuant → ladder.
+- **Q2: A** — W8A8 FP8 on hipBLASLt following the checkpoint's activation scheme.
+- **Q3: A** — block-scaled FP8 falls back to a dequantize-to-BF16 path if CK does not work on `gfx1201`.
+- **Q4: A** — the proof checkpoints as listed, with `unsloth/Llama-3.1-8B-Instruct` as the 8B BF16 baseline. The ≈ 41 GB of downloads are approved; keep ≥ 60 GB free on `novanas`.
+- **Q5: A** — container mapping as listed; act-order GPTQ refused (`gptq_act_order`).
+- **Q6: A** — a separate `mxfp4_a4` column value. **Signed off as an amendment of the umbrella** `phase-6-8-expansion` (bounded `weight_format` set).
+- **Q7: A** — dense linear layers only, including under TP; quantized MoE experts move to Phase 7 (added to the umbrella's S-8 list).
+- **Q8: A** — exact-BF16 dequantized references with activation fake-quantization, tolerances calibrated from transformers' spread.
+- **Q9: A** — weights: vLLM-ROCm on the same checkpoint where it runs (0.01), otherwise BF16 with max drop 0.02 for FP8 and 0.04 for 4-bit formats; KV formats: 0.01 against BF16 KV. **Signed off as an amendment of the umbrella** S-3 item 4.
+- **Q10: A** — FP8 KV scales from the checkpoint, else 1.0; explicit setting only.
+- **Q11: changed from the recommendation — TurboQuant also lives in L0 in Phase 6.** Build a TurboQuant-aware paged attention with a per-block format tag: attention reads BF16/FP8 blocks and `tq4`/`tq2` blocks, rotates q once per step and dots against the compressed K, and decodes V. Reuse first: evaluate existing quantized-KV attention (llama.cpp HIP flash attention with q4/q8 KV, CK FP8 KV, vLLM/aiter) before writing our own, and record it. Gates: a bitwise or tolerance test against a CPU reference TurboQuant attention; golden and eval-compare with `tq4`/`tq2` KV in L0; the decode ITL impact measured and reported. Consequence: mixed-format attention exists in Phase 6, so the compression ladder includes L0 once that attention has passed its correctness and performance gates — L1/L2 first, L0 as the ladder's final sub-step.
+- **Q12: A** — `tq4` and `tq2` with the randomized Hadamard rotation.
+- **Q13: A** — `kv.cpu.format` / `kv.nvme.format`, the last full block kept at the L0 format.
+- **Q14: A** — lineage keys for lossy blocks and their descendants.
+- **Q15: A** — header `x-turbine-kv-lossy: deny` plus `usage.prompt_tokens_details.lossy_cached_tokens`.
+- **Q16: A** — per-format lossy retrieval penalty.
+- **Q17: A** — ladder driven by tier fill, never at GREEN, ≤ 32 rewrites per tick with hysteresis (L0 joins as the final sub-step, per Q11).
+- **Q18: A** — the lossless rung stored plain.
+- **Q19: A** — `model.rope_scaling`, factor 16 proof plus a ≈ 12,000-token prompt, attention factor folded into the scale.
+- **Q20: A** — the performance targets as listed; for `tq4`/`tq2` in L0 the decode ITL impact is measured and reported (no fixed bound).
+
+The spec and plan now mark these "(user decision 2026-09-28)".
+
+## Phase 6 split: 6a quantization, 6b KV compression (2026-09-28)
+
+After the answers to "Phase 6 spec: provisional design choices" (with Q11 widening TurboQuant into L0), the user split Phase 6 in two. Options shown by the coordinator:
+
+**1. Where does YaRN go?**
+
+- A) In 6a, with the weight formats and FP8 KV
+- B) In 6b, with the KV compression work
+
+**Answer (2026-09-28, user): A — YaRN in 6a.**
+
+**2. When does 6b run?**
+
+- A) Right after 6a
+- B) After Phase 5p
+- C) After Phase 7
+
+**Answer (2026-09-28, user): A — right after 6a.**
+
+The split, as decided:
+
+- `phase-6a-quantization`: foundations (the quality-gate tooling port from `runahead/p8-umbrella` and the support-matrix cleanup), every weight format (`fp8`, `fp8_block`, `mxfp4` in three packagings, `mxfp4_a4`, `awq_int4`, `gptq_int4`), FP8 KV in L0, YaRN.
+- `phase-6b-kv-compression`: per-tier KV formats (proven with FP8 first), TurboQuant `tq4` / `tq2` including the TurboQuant-aware L0 attention, the pressure-driven compression ladder (L1/L2, then L0). It starts only after 6a closes and gets its own full test and gate cycle.
+- Order: 6a → 6b → 5p → 7 → 8.
+
+Consequences (docs changed the same day): the joint `phase-6-quantization` spec and plan are replaced by `.procoder/specs/phase-6a-quantization.md` / `.procoder/plans/phase-6a-quantization.md` and `.procoder/specs/phase-6b-kv-compression.md` / `.procoder/plans/phase-6b-kv-compression.md`; the answers of "Phase 6 spec: provisional design choices" carry over unchanged. 6a keeps the joint spec's item numbers S-1 … S-16 (its gate items S-22 … S-25 become S-17 … S-20); 6b renumbers its items S-1 … S-11 (joint S-17 … S-21, S-26, S-27, gates S-22 … S-25). The work branch `phase-6-quantization` was renamed `phase-6a-quantization` before any code landed. The umbrella `phase-6-8-expansion` S-1 lists 6a and 6b as the two phases of track 1; AGENTS.md's order line follows. `scripts/track-gate.sh` (ported in 6a Task 1) knows both track names.
