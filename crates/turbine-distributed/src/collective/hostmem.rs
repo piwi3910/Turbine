@@ -29,7 +29,11 @@
 //! `turbine_collective_route_total{op,backend,reason}`. The choice depends only on the op and
 //! its size, so every rank routes a call the same way. On a kernel library without the v2.7
 //! group the communicator is RCCL's alone (`op_unsupported`, logged once). Without a loadable
-//! RCCL (default search) hostmem keeps every message.
+//! RCCL (default search) hostmem keeps every message. Point-to-point (`send` / `recv`, pipeline
+//! stages) stays on hostmem at every size: RCCL's `ncclSend` / `ncclRecv` need a peer path
+//! between the devices, which the group does not know to exist (novanas has none; RCCL fails
+//! with "unhandled system error"), so a call above the threshold is counted with reason
+//! `no_peer_access` (logged once) instead of going to the delegate.
 //!
 //! In `static` rank mode (one process per rank) there is no shared allocation: `open` answers
 //! `Unavailable`, the planner refuses `hostmem` there and `auto` takes `rccl`.
@@ -71,7 +75,8 @@ const ID_MARKER: &[u8; 8] = b"hostmem\0";
 /// all-gather receive buffer, the reduce-scatter send buffer) `op` keeps on hostmem when
 /// `parallel.collective.hostmem_max_bytes` is `auto`: the crossover measured against RCCL on
 /// novanas (2-GPU, GPU0 Gen5 x8 + GPU1 Gen4 x8, BF16, back-to-back ops, `scripts/lab-cluster.sh
-/// collbench-hostmem-novanas`, 2026-09-28). Larger messages go to RCCL.
+/// collbench-hostmem-novanas`, 2026-09-28). Larger messages go to RCCL — except send / recv,
+/// which stay on hostmem (reason `no_peer_access`, module docs).
 pub fn auto_max_bytes(op: CollectiveOp) -> u64 {
     match op {
         CollectiveOp::AllReduce => 128 << 10,
@@ -312,6 +317,7 @@ impl CollectiveLibrary for HostmemLibrary {
             reported: AtomicBool::new(false),
             pairs: Mutex::new(std::collections::HashMap::new()),
             delegate,
+            p2p_kept_logged: AtomicBool::new(false),
             route_max: init.route_max_bytes,
         }))
     }
@@ -384,6 +390,8 @@ pub struct HostmemCollective {
     pairs: Mutex<std::collections::HashMap<usize, Arc<Pair>>>,
     /// The RCCL communicator of large messages, if RCCL loaded.
     delegate: Option<Arc<dyn Collective>>,
+    /// A point-to-point call above the threshold kept on hostmem was logged.
+    p2p_kept_logged: AtomicBool,
     /// The operator's threshold; `None` is [`auto_max_bytes`].
     route_max: Option<u64>,
 }
@@ -603,6 +611,34 @@ impl HostmemCollective {
             "collective routed"
         );
         to
+    }
+
+    /// Counts where a point-to-point call of `op` over `bytes` runs: always here. Above the
+    /// threshold, with a delegate loaded, the reason is `no_peer_access` (logged once): the
+    /// delegate's send / recv need a peer path between the devices, which the group has no
+    /// knowledge of (and novanas lacks).
+    fn route_p2p(&self, op: CollectiveOp, bytes: usize) {
+        let max = self.route_max.unwrap_or_else(|| auto_max_bytes(op));
+        let reason = if self.delegate.is_some() && bytes as u64 > max {
+            if !self.p2p_kept_logged.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    event = "collective_route",
+                    op = op.as_str(),
+                    bytes,
+                    backend = NAME,
+                    reason = RouteReason::NoPeerAccess.as_str(),
+                    rank = self.rank,
+                    "point-to-point above the threshold stays on hostmem: the delegate's \
+                     send / recv need a peer path between the devices"
+                );
+            }
+            RouteReason::NoPeerAccess
+        } else {
+            RouteReason::BelowThreshold
+        };
+        if let Some(m) = &self.metrics {
+            m.route(op, NAME, reason);
+        }
     }
 
     /// The group's own channel.
@@ -889,19 +925,15 @@ impl Collective for HostmemCollective {
     }
 
     /// A broadcast from this rank over the pair channel to `peer`: the kernel waits (bounded by
-    /// `op_timeout`) until the peer's matching `recv` has arrived.
+    /// `op_timeout`) until the peer's matching `recv` has arrived. Never the delegate's
+    /// ([`HostmemCollective::route_p2p`]).
     fn send(
         &self,
         buf: &DeviceSlice,
         peer: usize,
         stream: &StreamRef,
     ) -> Result<(), CollectiveError> {
-        if peer < self.world
-            && peer != self.rank
-            && let Some(d) = self.route(CollectiveOp::Send, buf.len())
-        {
-            return d.send(buf, peer, stream);
-        }
+        self.route_p2p(CollectiveOp::Send, buf.len());
         self.p2p(CollectiveOp::Send, buf, peer, self.rank, stream)
     }
 
@@ -911,12 +943,7 @@ impl Collective for HostmemCollective {
         peer: usize,
         stream: &StreamRef,
     ) -> Result<(), CollectiveError> {
-        if peer < self.world
-            && peer != self.rank
-            && let Some(d) = self.route(CollectiveOp::Recv, buf.len())
-        {
-            return d.recv(buf, peer, stream);
-        }
+        self.route_p2p(CollectiveOp::Recv, buf.len());
         self.p2p(CollectiveOp::Recv, buf, peer, peer, stream)
     }
 
@@ -1369,6 +1396,67 @@ mod tests {
         }
         assert_eq!(auto_max_bytes(CollectiveOp::AllReduce), 128 << 10);
         assert_eq!(auto_max_bytes(CollectiveOp::Barrier), u64::MAX);
+    }
+
+    /// Point-to-point above the threshold stays on hostmem even with a delegate loaded (the
+    /// delegate's send / recv need a peer path; RCCL fails without one on novanas): a 4 KiB
+    /// send / recv pair against a 64-byte threshold arrives bit for bit over hostmem's pair
+    /// channel, and `turbine_collective_route_total` counts it on `hostmem` with reason
+    /// `no_peer_access`, never on the delegate. Breaks if send / recv go back to the size
+    /// routing.
+    #[test]
+    fn point_to_point_stays_on_hostmem_above_the_threshold() {
+        let delegate = crate::collective::HostBackend.load(None).expect("host");
+        let lib: Arc<dyn CollectiveLibrary> = Arc::new(HostmemLibrary {
+            slot_bytes: SLOT_BYTES,
+            delegate: Some(delegate),
+        });
+        let id = lib.unique_id().expect("id");
+        let reg = turbine_observability::MetricsRegistry::new();
+        let metrics = CollectiveMetrics::register(&reg);
+        let sent = encode(DType::F32, &values(99, 1024));
+        let got: Vec<Vec<u8>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2usize)
+                .map(|r| {
+                    let (lib, metrics, sent) = (Arc::clone(&lib), metrics.clone(), &sent);
+                    s.spawn(move || {
+                        let mem: Arc<dyn DeviceMemory> = stub_mapped_context(r as u32);
+                        let comm = lib
+                            .open(CollectiveInit {
+                                metrics: Some(metrics),
+                                route_max_bytes: Some(64),
+                                ..init(r, 2, id, Duration::from_secs(20), Some(Arc::clone(&mem)))
+                            })
+                            .expect("open");
+                        let stream = mem.compute_stream();
+                        let buf = DeviceBuffer::alloc(&mem, sent.len()).expect("alloc");
+                        if r == 0 {
+                            buf.whole().write_bytes(sent).expect("write");
+                            comm.send(&buf.whole(), 1, &stream).expect("send");
+                        } else {
+                            comm.recv(&mut buf.whole(), 0, &stream).expect("recv");
+                        }
+                        mem.synchronize().expect("sync");
+                        comm.step_end().expect("healthy");
+                        buf.whole().read_bytes().expect("read")
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("rank"))
+                .collect()
+        });
+        assert_eq!(got[1], sent, "the receiver holds the sender's bytes");
+        let text = reg.render().expect("renders");
+        for op in ["send", "recv"] {
+            let line = format!(
+                "turbine_collective_route_total{{op=\"{op}\",backend=\"hostmem\",reason=\"no_peer_access\"}} 1"
+            );
+            assert!(text.contains(&line), "{line}\n{text}");
+            let delegated = format!("op=\"{op}\",backend=\"host\"");
+            assert!(!text.contains(&delegated), "{delegated}\n{text}");
+        }
     }
 
     /// A delegate whose init waits for a peer that never opens: the rank's open fails with
