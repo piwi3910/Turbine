@@ -1612,3 +1612,12 @@ Total 41,185,550,352 bytes. The 8B BF16 download waited while free disk was ≈ 
 1. `ModelIdentity` carries `rope_hash: [u8; 32]` (BLAKE3 of `ModelArchConfig::rope_identity()`) instead of the plan's `rope: String`, keeping `ModelIdentity` `Copy`; the namespace key is equivalent (its JSON is hashed).
 2. The model fingerprint does not include RoPE (lookups go through the namespace); alternative: fold it in, changing the fingerprint golden.
 3. `rope_hash` is always in the namespace JSON, so every cached key changes once (L2 is wiped at startup anyway).
+
+**INT4 packagings (6a Task 9, lead), provisional, pending user review:**
+
+1. Group sizes 32, 64 and 128 are served (the proof checkpoints use 128; 32 lets every registered family's tiny checkpoint be written in the format for the conformance suite); others are refused `quant_scheme_unsupported`. Alternative: 128 only.
+2. GPTQ `sym: false` loads with stored zero points (`Int4GroupZp`, `checkpoint_format: gptq` zeros + 1); symmetric GPTQ must store zero 8 everywhere, else refused. Alternative: refuse asymmetric GPTQ.
+3. AWQ and GPTQ tensors left unquantized may be F16 and are converted to BF16 at load, each read whole (an embedding is up to ≈ 1 GB of host memory for an 8B model, above the 256 MB staging bound). Alternative: a chunked conversion in the loader.
+4. AWQ `modules_to_not_convert` entries match as substrings of the module name (AutoAWQ / vLLM), compressed-tensors `ignore` entries as compressed-tensors defines them.
+5. compressed-tensors `pack-quantized` is served symmetric only and without `actorder` (refused `gptq_act_order`), matching the fixture scripts.
+

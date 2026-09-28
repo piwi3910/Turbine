@@ -10,10 +10,8 @@
 use serde_json::{Value, json};
 
 use super::ActivationQuant;
-use super::fp8::{
-    FP8_BLOCK, Fp8Format, Fp8Layout, Fp8Packaging, Fp8Weights, check_block, pair,
-    scheme_unsupported, string_list,
-};
+use super::common::{pair, scheme_unsupported, string_list};
+use super::fp8::{FP8_BLOCK, Fp8Format, Fp8Layout, Fp8Packaging, Fp8Weights, check_block};
 use crate::ModelError;
 use crate::config::unsupported;
 

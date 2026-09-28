@@ -178,7 +178,7 @@ Interfaces:
 
 ## Task 9: INT4 packagings `awq`, `gptq`, `ct_pack_int4` (host path)
 
-Files: `crates/turbine-model/src/weights/awq.rs`, `crates/turbine-model/src/weights/gptq.rs`, `crates/turbine-model/src/weights/ct_pack_int4.rs` (new), `crates/turbine-model/src/weights/mod.rs` (registry), `crates/turbine-model/src/testing/tiny.rs` (writers: AWQ interleaved order `[0,2,4,6,1,3,5,7]`, GPTQ row-packed `qweight` along k, compressed-tensors `weight_packed` / `weight_shape`), `crates/turbine-model/tests/tiny_model.rs`, `crates/turbine-model/src/weights/tests.rs` (hand-built 8 × 8 packing cases)
+Files: `crates/turbine-model/src/weights/awq.rs`, `crates/turbine-model/src/weights/gptq.rs`, `crates/turbine-model/src/weights/ct_pack_int4.rs` (new), `crates/turbine-model/src/weights/mod.rs` (registry), `crates/turbine-model/src/weights/int4.rs` (new: the shared INT4 layout, `Int4Format<P>` over an `Int4Packaging`, the three containers' repacks and tiny writers: AWQ interleaved order `[0,2,4,6,1,3,5,7]`, GPTQ row-packed `qweight` along k, compressed-tensors `weight_packed` / `weight_shape`; hand-built 8 × 8 packing cases in its tests), `crates/turbine-model/src/weights/common.rs` (new: helpers shared with the FP8 layout), `crates/turbine-model/src/loader.rs` (check-only slots), `crates/turbine-model/tests/tiny_model.rs`
 Interfaces:
 
 - repack target (the layout the v2.9 `INT4_GROUP_*` schemes consume): `data` U8 `[n, k/2]`, low nibble = even k, unsigned 0..15; `scales` F32 `[n, k/group]`; `zeros` U8 `[n, k/group]` (AWQ from `qzeros`; symmetric GPTQ and compressed-tensors → scheme `INT4_GROUP_SYM` with implicit 8)
@@ -186,7 +186,7 @@ Interfaces:
   Covers: spec S-3, S-4, S-5 for INT4; AC `detect_every_packaging` (INT4), `quantized_matches_dequantized_bf16` (INT4)
   Depends on: Task 8
 
-- [ ] Write failing tests `weights::tests::{awq_repack_8x8, gptq_repack_8x8, ct_pack_repack_8x8}` from hand-built tensors whose dequantized values are known, and extend `detect_every_packaging` with the INT4 cases and the refusals. Run: `scripts/remote-cargo.sh test -p turbine-model weights::tests` — expect FAIL
+- [ ] Write failing tests `weights::int4::tests::{awq_repack_8x8, gptq_repack_8x8, ct_pack_repack_8x8}` from hand-built tensors whose dequantized values are known, and extend `detect_every_packaging` with the INT4 cases and the refusals. Run: `scripts/remote-cargo.sh test -p turbine-model weights::` — expect FAIL
 - [ ] Extend `quantized_matches_dequantized_bf16` with the three INT4 packagings. Run — expect FAIL
 - [ ] Implement the three packagings and their writers.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-model` — expect PASS

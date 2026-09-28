@@ -224,8 +224,8 @@ impl WeightLoader {
     /// Both lists are the family's slots: each is expanded by [`WeightFormat::slots`] (a
     /// quantized layer's scales, zero points and activation scales). A slot the format
     /// [`WeightFormat::repacks`] is read whole, rewritten by [`WeightFormat::repack`] and
-    /// uploaded (its checkpoint tensor's shape is the format's to check); every other slot is
-    /// copied as stored.
+    /// uploaded (its checkpoint tensor's shape is the format's to check), or only validated
+    /// when it has no elements (a check-only slot); every other slot is copied as stored.
     pub fn load_part(
         format: &dyn WeightFormat,
         index: &SafetensorsIndex,
@@ -341,10 +341,6 @@ impl WeightLoader {
                 Some(place) => (&place.name, &place.shape, place.offset * dtype.size_bytes()),
                 None => (&slot.name, &slot.shape, 0),
             };
-            if !tensors.contains_key(key) {
-                tensors.insert(key.clone(), Tensor::empty(mem, shape, dtype)?);
-            }
-            let tensor = tensors.get_mut(key).expect("inserted above");
             let file = match files.get(&entry.file) {
                 Some(f) => f,
                 None => {
@@ -352,6 +348,25 @@ impl WeightLoader {
                     files.entry(entry.file.clone()).or_insert(f)
                 }
             };
+            // A check-only slot (no elements): the format validates the tensor (e.g. GPTQ's
+            // `g_idx`), nothing is stored.
+            if format.repacks(slot) && slot.shape.iter().product::<usize>() == 0 {
+                let mut raw = vec![0u8; entry.byte_len() as usize];
+                file.read_exact_at(&mut raw, entry.range.start)
+                    .map_err(|e| io_err(&entry.file, e))?;
+                if !format.repack(slot, entry, raw)?.is_empty() {
+                    return Err(ModelError::Safetensors {
+                        file: entry.file.clone(),
+                        tensor: entry.name.clone(),
+                        rule: "a check-only slot repacked to bytes".to_string(),
+                    });
+                }
+                continue;
+            }
+            if !tensors.contains_key(key) {
+                tensors.insert(key.clone(), Tensor::empty(mem, shape, dtype)?);
+            }
+            let tensor = tensors.get_mut(key).expect("inserted above");
             if format.repacks(slot) {
                 let mut raw = vec![0u8; entry.byte_len() as usize];
                 file.read_exact_at(&mut raw, entry.range.start)

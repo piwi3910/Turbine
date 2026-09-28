@@ -227,8 +227,8 @@ impl DecoderDims {
     }
 
     /// Linear layer `name` taken from `weights`: a BF16 `shape` matrix (or stack), or the
-    /// quantized data with its `_scale`, optional `_zeros` and (static activations)
-    /// `_input_scale` parameters.
+    /// quantized data (`[n, k/2]` bytes when packed 4-bit) with its `_scale`, optional `_zeros`
+    /// and (static activations) `_input_scale` parameters.
     pub fn take_linear(
         &self,
         weights: &mut LoadedWeights,
@@ -236,6 +236,14 @@ impl DecoderDims {
         shape: &[usize],
     ) -> Result<Linear, ModelError> {
         let w = weights.take(name)?;
+        // Packed 4-bit data (INT4, MXFP4) holds two columns per byte.
+        let mut shape = shape.to_vec();
+        if w.dtype == DType::U8
+            && let Some(k) = shape.last_mut()
+        {
+            *k /= 2;
+        }
+        let shape = shape.as_slice();
         if w.shape.as_slice() != shape {
             return Err(invalid(format!(
                 "{name} is {:?}, expected {shape:?}",

@@ -20,10 +20,15 @@ use crate::config::ModelArchConfig;
 use crate::loader::WeightSlot;
 use crate::safetensors::TensorEntry;
 
+pub mod awq;
 pub mod bf16;
+mod common;
 pub mod ct_fp8;
+pub mod ct_pack_int4;
 mod fp8;
+pub mod gptq;
 pub mod hf_fp8;
+mod int4;
 
 pub use bf16::Bf16;
 
@@ -241,8 +246,17 @@ impl std::fmt::Debug for WeightFormatRef {
     }
 }
 
-static WEIGHT_FORMATS: Registry<dyn WeightFormat> =
-    Registry::new("weight_format", &[&Bf16, &ct_fp8::CT_FP8, &hf_fp8::HF_FP8]);
+static WEIGHT_FORMATS: Registry<dyn WeightFormat> = Registry::new(
+    "weight_format",
+    &[
+        &Bf16,
+        &ct_fp8::CT_FP8,
+        &hf_fp8::HF_FP8,
+        &awq::AWQ,
+        &gptq::GPTQ,
+        &ct_pack_int4::CT_PACK_INT4,
+    ],
+);
 
 /// Every weight format, in detection order.
 pub fn registry() -> &'static Registry<dyn WeightFormat> {
@@ -443,6 +457,55 @@ mod tests {
                 QuantScheme::Fp8Channel,
                 ActivationQuant::Fp8PerTensorStatic,
             ),
+            (
+                json!({"quant_method": "awq", "bits": 4, "group_size": 128, "zero_point": true,
+                       "version": "gemm", "modules_to_not_convert": null}),
+                "awq",
+                WeightFormatColumn::AwqInt4,
+                QuantScheme::Int4Group {
+                    group: 128,
+                    zero_points: true,
+                },
+                ActivationQuant::None,
+            ),
+            (
+                json!({"quant_method": "gptq", "bits": 4, "group_size": 128, "desc_act": false,
+                       "sym": true}),
+                "gptq",
+                WeightFormatColumn::GptqInt4,
+                QuantScheme::Int4Group {
+                    group: 128,
+                    zero_points: false,
+                },
+                ActivationQuant::None,
+            ),
+            (
+                json!({"quant_method": "gptq", "bits": 4, "group_size": 64, "desc_act": false,
+                       "sym": false, "checkpoint_format": "gptq"}),
+                "gptq",
+                WeightFormatColumn::GptqInt4,
+                QuantScheme::Int4Group {
+                    group: 64,
+                    zero_points: true,
+                },
+                ActivationQuant::None,
+            ),
+            (
+                json!({"quant_method": "compressed-tensors", "format": "pack-quantized",
+                       "ignore": ["lm_head"],
+                       "config_groups": {"group_0": {"targets": ["Linear"],
+                           "input_activations": null,
+                           "weights": {"num_bits": 4, "type": "int", "symmetric": true,
+                                       "strategy": "group", "group_size": 128,
+                                       "actorder": null}}}}),
+                "ct_pack_int4",
+                WeightFormatColumn::GptqInt4,
+                QuantScheme::Int4Group {
+                    group: 128,
+                    zero_points: false,
+                },
+                ActivationQuant::None,
+            ),
         ];
         for (i, (q, name, column, scheme, activation)) in cases.into_iter().enumerate() {
             let fixture = write_tiny_quantized(&tmp.path().join(i.to_string()), 3, &q, 128, 128);
@@ -496,6 +559,31 @@ mod tests {
         );
         let (field, _) = refused(ct("channel", json!(null), act("token", false, json!(null))));
         assert_eq!(field, "input_activations");
+
+        // INT4 refusals: 3-bit GPTQ, act order, AWQ GEMV, a group of 16.
+        let (field, supported) =
+            refused(json!({"quant_method": "gptq", "bits": 3, "group_size": 128}));
+        assert_eq!(field, "bits");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
+        let (field, supported) = refused(
+            json!({"quant_method": "gptq", "bits": 4, "group_size": 128, "desc_act": true}),
+        );
+        assert_eq!(field, "desc_act");
+        assert!(supported.starts_with("gptq_act_order"), "{supported}");
+        let (field, _) = refused(json!({"quant_method": "awq", "bits": 4, "group_size": 128,
+                                        "zero_point": true, "version": "gemv"}));
+        assert_eq!(field, "version");
+        let (field, supported) =
+            refused(json!({"quant_method": "awq", "bits": 4, "group_size": 16,
+                           "zero_point": true, "version": "gemm"}));
+        assert_eq!(field, "group_size");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
     }
 
     /// Phase 6a S-3: the BF16 entry describes every linear layer of a tiny Llama as unquantized

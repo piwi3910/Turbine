@@ -1425,7 +1425,8 @@ impl DecoderExecutor {
         let Some(q) = w.q else {
             return self.gemm(a, w.w, c);
         };
-        let (m, n, k) = (a.shape[0], w.w.shape[0], w.w.shape[1]);
+        // `k` from the activations: packed 4-bit weights hold two columns per byte.
+        let (m, n, k) = (a.shape[0], w.w.shape[0], a.shape[1]);
         let prefill = self.step_prefill.load(Ordering::Relaxed);
         let (a, a_scales) = match (self.dims.quantize_act(k, q.quant), &self.act_quant) {
             (None, _) => (a, None),

@@ -935,7 +935,7 @@ fn input_scales(dir: &Path) -> HashMap<String, f32> {
         .collect()
 }
 
-/// Phase 6a S-5 (FP8 part): each FP8 tiny checkpoint on the CPU provider — prefill and greedy
+/// Phase 6a S-5 (FP8 and INT4 parts): each FP8 and INT4 tiny checkpoint on the CPU provider — prefill and greedy
 /// decode — gives logits within 1e-3 of the naive model over its dequantized BF16 twin with
 /// the checkpoint's activation quantization applied to every projection input (static scales:
 /// the largest part's for a fused projection); weight-only checkpoints equal the twin run on
@@ -998,6 +998,33 @@ fn quantized_matches_dequantized_bf16() {
             "hf tensor static",
             serde_json::json!({"quant_method": "fp8", "activation_scheme": "static"}),
             64,
+        ),
+        (
+            "awq",
+            serde_json::json!({"quant_method": "awq", "bits": 4, "group_size": 128,
+                               "zero_point": true, "version": "gemm"}),
+            128,
+        ),
+        (
+            "gptq sym",
+            serde_json::json!({"quant_method": "gptq", "bits": 4, "group_size": 128,
+                               "desc_act": false, "sym": true}),
+            128,
+        ),
+        (
+            "gptq asym v1",
+            serde_json::json!({"quant_method": "gptq", "bits": 4, "group_size": 64,
+                               "desc_act": false, "sym": false}),
+            128,
+        ),
+        (
+            "ct pack int4",
+            serde_json::json!({"quant_method": "compressed-tensors", "format": "pack-quantized",
+                               "ignore": ["lm_head"],
+                               "config_groups": {"group_0": {"targets": ["Linear"],
+                                   "weights": {"num_bits": 4, "type": "int", "symmetric": true,
+                                               "strategy": "group", "group_size": 128}}}}),
+            128,
         ),
     ];
     for (i, (name, q, hidden)) in cases.into_iter().enumerate() {
