@@ -161,9 +161,10 @@ pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelErr
         let mut v = Vec::with_capacity(seq.kv_len * token_elems);
         for (n, &block) in seq.blocks.iter().enumerate() {
             let tokens = (seq.kv_len - n * block_tokens).min(block_tokens);
-            let bytes = match touched.get(&block) {
-                Some(bytes) => bytes.clone(),
-                None => block_slice(block).read_bytes()?,
+            // A block the append touched is read from its patched copy, without cloning it.
+            let bytes: std::borrow::Cow<'_, [u8]> = match touched.get(&block) {
+                Some(bytes) => bytes.as_slice().into(),
+                None => block_slice(block).read_bytes()?.into(),
             };
             for (half, dst) in [(0, &mut k), (1, &mut v)] {
                 let base = half * block_tokens * token_elems;
