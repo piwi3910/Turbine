@@ -192,6 +192,8 @@ pub struct ModelBackend {
     /// While loading: the `/ready` reason of the step a tensor-parallel group is in (P5:
     /// `collective_init`, `loading_weights`, `rank_missing`), else `loading_model`.
     loading: AtomicU8,
+    /// A `static`-mode worker rank process (P5 S-5): inference routes answer 503 `not_leader`.
+    rank_worker: bool,
     /// One slot per data-parallel replica (P5 S-7), filled when that replica's engine is warm.
     replicas: Vec<OnceLock<Loaded>>,
     /// The replica choice when there is more than one replica.
@@ -250,6 +252,7 @@ impl ModelBackend {
         ModelBackend {
             state: AtomicU8::new(STATE_LOADING),
             loading: AtomicU8::new(loading_code(NotReadyReason::LoadingModel)),
+            rank_worker: false,
             replicas: vec![OnceLock::new()],
             router: None,
             served_name: model.served_name.clone(),
@@ -377,6 +380,23 @@ impl ModelBackend {
         }
     }
 
+    /// This process is a `static`-mode worker rank (P5 S-5): it serves `/health`, `/ready`,
+    /// `/metrics` and the diagnostics; inference routes answer 503 `not_leader`.
+    pub fn with_rank_worker(mut self, worker: bool) -> ModelBackend {
+        self.rank_worker = worker;
+        self
+    }
+
+    /// A worker rank has joined its leader and loaded its shard: `/ready` turns 200.
+    pub fn set_rank_ready(&self) {
+        let _ = self.state.compare_exchange(
+            STATE_LOADING,
+            STATE_READY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     /// While loading, `/ready` answers 503 with `reason` (`loading_model`, or a tensor-parallel
     /// group's `collective_init`, `loading_weights` or `rank_missing`, P5).
     pub fn set_loading(&self, reason: NotReadyReason) {
@@ -388,6 +408,8 @@ impl ModelBackend {
         let state = match fatal {
             Fatal::LoadFailed(_) => STATE_LOAD_FAILED,
             Fatal::DeviceFatal(_) => STATE_DEVICE_FATAL,
+            Fatal::RankStopped(None) => STATE_SHUTTING_DOWN,
+            Fatal::RankStopped(Some(_)) => STATE_LOAD_FAILED,
         };
         self.state.store(state, Ordering::Release);
     }
@@ -737,6 +759,9 @@ impl ModelBackend {
     /// scheduler has queued it.
     async fn start(&self, req: InferenceRequest) -> Result<GenerationStream, ApiError> {
         let endpoint = req.endpoint;
+        if self.rank_worker {
+            return Err(self.reject(endpoint, ApiError::not_leader()));
+        }
         if self.state.load(Ordering::Acquire) == STATE_SHUTTING_DOWN {
             return Err(self.reject(endpoint, ApiError::shutting_down()));
         }

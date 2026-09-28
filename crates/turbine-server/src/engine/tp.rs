@@ -28,7 +28,17 @@
 //! init, P5 S-8), loads its weight shard, re-measures its budget and proposes the block count its
 //! budget holds; the group takes the smallest, so every pool has the same block count. The
 //! leader's warm-up forward then runs the whole group once.
+//!
+//! `static` rank mode (`parallel.ranks.mode: static`): rank 0 is the leader process serving
+//! HTTP; it waits for every worker process to join over the rank transport
+//! (`RankRuntime::static_leader`, `rank_missing` meanwhile), then loads like `local` mode with
+//! only its own rank, the pool agreement going through the communicator (an all-reduce); plans
+//! travel as frames. Each worker process ([`run_static_worker`]) joins, loads its rank and
+//! executes plans until the leader shuts it down or is lost (exit 1). There is no per-step
+//! acknowledgement across processes, so KV tiers (which copy every rank's shard from the
+//! leader) are off in static mode.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -36,11 +46,13 @@ use turbine_api::backend::NotReadyReason;
 use turbine_core::clock::Clock;
 use turbine_core::types::{BlockId, KvLayout, ModelShape};
 use turbine_distributed::collective::{
-    Collective, CollectiveError, CollectiveInit, CollectiveLibrary, CollectiveMetrics,
+    Collective, CollectiveError, CollectiveInit, CollectiveLibrary, CollectiveMetrics, ReduceOp,
 };
 use turbine_distributed::rank::{
-    ExecError, RankError, RankRuntime, StepExecutor, StepOutput, StepPlan, StepSeq,
+    ExecError, HelloExpect, RankError, RankMessage, RankRuntime, StepExecutor, StepOutput,
+    StepPlan, StepSeq,
 };
+use turbine_distributed::transport::Transport;
 use turbine_kv::BlockPool;
 use turbine_model::executor::{
     BatchInput, ExecutorLimits, ForwardTimings, Logits, ModelExecutor, RowReduce, SeqSlice,
@@ -51,6 +63,7 @@ use turbine_reliability::budget::DeviceBudget;
 use turbine_reliability::ledger::{Ledger, Reservation};
 use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_reliability::reserve::EmergencyReserve;
+use turbine_tensor::{DType, DeviceBuffer, DeviceMemory};
 
 use crate::kv_orchestrator::{BlockAddresses, KvShard};
 use crate::model::{self, LoadedModel, PreparedModel, StartupError};
@@ -340,6 +353,31 @@ pub(crate) struct TpGroupStart {
     pub depth: usize,
     pub metrics: CollectiveMetrics,
     pub clock: Arc<dyn Clock>,
+    /// `static` rank mode (P5 S-5): the worker ranks are other processes that join this leader
+    /// over the rank transport; `workers` is empty.
+    pub remote: Option<StaticLeader>,
+}
+
+/// The leader's side of a `static` group: where it listens and what every joining rank must
+/// match (its `Hello`).
+pub(crate) struct StaticLeader {
+    pub transport: &'static dyn Transport,
+    pub listen: SocketAddr,
+    pub expect: HelloExpect,
+    pub world: u32,
+}
+
+/// A `static`-mode worker rank process (P5 S-5): how it joins its leader and loads its shard.
+pub(crate) struct StaticWorker {
+    pub transport: &'static dyn Transport,
+    pub leader: SocketAddr,
+    /// This rank's `Hello` (rank, world size, fingerprints, vendor, architecture).
+    pub hello: RankMessage,
+    pub library: Arc<dyn CollectiveLibrary>,
+    pub init_timeout: Duration,
+    pub op_timeout: Duration,
+    pub metrics: CollectiveMetrics,
+    pub clock: Arc<dyn Clock>,
 }
 
 /// A rank after its load, before the group's warm-up.
@@ -392,6 +430,41 @@ impl Agreement {
     }
 }
 
+/// How the ranks agree on the pool's block count: in this process (`local` rank mode), or
+/// across processes through the communicator (`static`: an all-reduce of the negated proposals
+/// with `Max`, exact in F32 below 2^24 blocks).
+enum Agree<'a> {
+    Local(&'a Agreement),
+    Collective,
+}
+
+impl Agree<'_> {
+    fn fail(&self) {
+        if let Agree::Local(a) = self {
+            a.fail();
+        }
+    }
+}
+
+/// The smallest `blocks` over every rank of `c`, by an all-reduce on `mem`'s compute stream.
+fn agree_over(c: &dyn Collective, mem: &Arc<dyn DeviceMemory>, blocks: u32) -> Result<u32, String> {
+    let mut buf = DeviceBuffer::alloc(mem, 4).map_err(|e| e.to_string())?;
+    buf.copy_from_host(0, &(-(blocks as f32)).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    let stream = mem.compute_stream();
+    c.step_begin();
+    let mut slice = buf.whole();
+    let reduced = c.all_reduce(&mut slice, DType::F32, ReduceOp::Max, &stream);
+    let synced = mem.synchronize();
+    let ended = c.step_end();
+    reduced.map_err(|e| e.to_string())?;
+    synced.map_err(|e| e.to_string())?;
+    ended.map_err(|e| e.to_string())?;
+    let mut out = [0u8; 4];
+    buf.copy_to_host(0, &mut out).map_err(|e| e.to_string())?;
+    Ok((-f32::from_le_bytes(out)) as u32)
+}
+
 /// Everything one rank's loader thread shares with the others.
 struct GroupLoad<'a> {
     library: &'a Arc<dyn CollectiveLibrary>,
@@ -402,7 +475,7 @@ struct GroupLoad<'a> {
     clock: &'a Arc<dyn Clock>,
     metrics: &'a CollectiveMetrics,
     reliability: &'a ReliabilityMetrics,
-    agreement: &'a Agreement,
+    agreement: Agree<'a>,
     phase: &'a (dyn Fn(NotReadyReason) + Sync),
 }
 
@@ -451,19 +524,20 @@ fn load_rank(p: &PreparedModel, g: &GroupLoad<'_>) -> Result<RankLoaded, Startup
         collective_bytes,
         "tensor-parallel rank joined its communicator"
     );
-    if s.rank == 0 {
-        (g.phase)(NotReadyReason::LoadingWeights);
-    }
+    (g.phase)(NotReadyReason::LoadingWeights);
     let loaded = (|| {
         let weights = model::load_weights(p)?;
         let weight_bytes = weights.weight_bytes;
         let (budget, ledger, held) =
             model::post_load_budget(p, weight_bytes, collective_bytes, g.reliability)?;
         let mine = model::pool_blocks(p, &budget)?;
-        let blocks = g
-            .agreement
-            .agree(s.rank as usize, mine)
-            .ok_or_else(|| rank_error("load", &ANOTHER_RANK_FAILED))?;
+        let blocks = match &g.agreement {
+            Agree::Local(a) => a
+                .agree(s.rank as usize, mine)
+                .ok_or_else(|| rank_error("load", &ANOTHER_RANK_FAILED))?,
+            Agree::Collective => agree_over(collective.as_ref(), mem, mine)
+                .map_err(|e| rank_error("KV pool agreement", &e))?,
+        };
         if blocks < mine {
             tracing::info!(
                 event = "tp_pool_agreed",
@@ -525,13 +599,36 @@ pub(crate) fn load_group(
     phase: &(dyn Fn(NotReadyReason) + Sync),
 ) -> Result<LoadedModel, StartupError> {
     let started = Instant::now();
-    let world = group.workers.len() as u32 + 1;
-    phase(NotReadyReason::CollectiveInit);
+    let world = match &group.remote {
+        Some(s) => s.world,
+        None => group.workers.len() as u32 + 1,
+    };
     let unique_id = group
         .library
         .unique_id()
         .map_err(|e| StartupError::new(format!("collective unique id: {e}")))?;
-    let agreement = Agreement::new(world as usize);
+    // `static` mode: every worker process joins before anything is loaded (`rank_missing`
+    // meanwhile; exit 1 naming the missing ranks after `parallel.collective.init_timeout`).
+    let remote = match group.remote {
+        Some(s) => {
+            phase(NotReadyReason::RankMissing);
+            tracing::info!(event = "tp_static_leader", listen = %s.listen, world, "waiting for the static worker ranks");
+            let runtime = RankRuntime::static_leader(
+                s.transport,
+                s.listen,
+                s.expect,
+                world as usize,
+                group.init_timeout,
+                unique_id,
+                group.depth,
+            )
+            .map_err(|e| StartupError::new(format!("static ranks: {e}")))?;
+            Some(runtime)
+        }
+        None => None,
+    };
+    phase(NotReadyReason::CollectiveInit);
+    let local = Agreement::new(group.workers.len() + 1);
     let load = GroupLoad {
         library: &group.library,
         unique_id,
@@ -541,7 +638,11 @@ pub(crate) fn load_group(
         clock: &group.clock,
         metrics: &group.metrics,
         reliability,
-        agreement: &agreement,
+        agreement: if remote.is_some() {
+            Agree::Collective
+        } else {
+            Agree::Local(&local)
+        },
         phase,
     };
     let ranks: Vec<&PreparedModel> = std::iter::once(leader).chain(&group.workers).collect();
@@ -606,7 +707,10 @@ pub(crate) fn load_group(
             Box::new((rank.held, rank.reserve, rank.ledger)),
         )));
     }
-    let runtime = RankRuntime::local(workers, group.depth);
+    let runtime = match remote {
+        Some(runtime) => runtime,
+        None => RankRuntime::local(workers, group.depth),
+    };
     let mut executor = TpExecutor::new(rank0.executor, runtime, rank0.collective, faults);
     let mut pool = rank0.pool;
     phase(NotReadyReason::LoadingModel);
@@ -639,12 +743,69 @@ pub(crate) fn load_group(
     })
 }
 
+/// A `static`-mode worker rank process (P5 S-5): joins its leader (`rank_missing` until the
+/// leader welcomes it), opens the communicator with the leader's unique id, loads its shard,
+/// agrees on the pool with the group, calls `ready` and then executes every step plan until the
+/// leader shuts it down (`Ok`). A lost leader aborts the communicator and returns `Err` (the
+/// process exits 1 and releases its device memory), as does a failed load or step.
+pub(crate) fn run_static_worker(
+    prepared: &PreparedModel,
+    start: StaticWorker,
+    reliability: &ReliabilityMetrics,
+    phase: &(dyn Fn(NotReadyReason) + Sync),
+    ready: impl FnOnce(),
+) -> Result<(), String> {
+    let s = prepared
+        .shard
+        .ok_or_else(|| "a static worker rank needs its shard".to_string())?;
+    phase(NotReadyReason::RankMissing);
+    let link = RankRuntime::static_worker(
+        start.transport,
+        start.leader,
+        start.hello,
+        start.init_timeout,
+    )
+    .map_err(|e| format!("rank {}: joining the leader {}: {e}", s.rank, start.leader))?;
+    tracing::info!(event = "tp_static_joined", rank = s.rank, leader = %start.leader, "joined the leader");
+    phase(NotReadyReason::CollectiveInit);
+    let load = GroupLoad {
+        library: &start.library,
+        unique_id: link.unique_id(),
+        world: s.world,
+        init_timeout: start.init_timeout,
+        op_timeout: start.op_timeout,
+        clock: &start.clock,
+        metrics: &start.metrics,
+        reliability,
+        agreement: Agree::Collective,
+        phase,
+    };
+    let rank = load_rank(prepared, &load).map_err(|e| e.to_string())?;
+    let collective = Arc::clone(&rank.collective);
+    let mut worker = WorkerRank::new(
+        s.rank,
+        rank.executor,
+        rank.pool,
+        rank.collective,
+        Arc::new(Mutex::new(None)),
+        Box::new((rank.held, rank.reserve, rank.ledger)),
+    );
+    tracing::info!(
+        event = "tp_static_worker_ready",
+        rank = s.rank,
+        "worker rank loaded; executing step plans"
+    );
+    ready();
+    link.run(&mut worker, collective.as_ref())
+        .map_err(|e| format!("rank {}: {e}", s.rank))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
     use turbine_core::types::{DeviceId, SeqId};
-    use turbine_distributed::collective::HostCollective;
+    use turbine_distributed::collective::{CollectiveBackend, HostCollective};
     use turbine_kernels::test_support::{plain_device_error, sticky_device_error};
     use turbine_kernels::{KernelMetrics, KernelRegistry, cpu_reference_provider};
     use turbine_kv::BlockPoolConfig;
@@ -865,6 +1026,120 @@ mod tests {
         assert_eq!(*tp.kv_layout(), pool.layout());
         let got = greedy_with_fork(&mut tp, &pool, &prompt, 5);
         assert_eq!(got, want);
+    }
+
+    /// Rank `rank` of a tp 2 group of the tiny Llama prepared as the server prepares it: the
+    /// cpu backend on host device `rank`, a 16 MiB pool.
+    fn prepared(spec: &TinySpec, rank: u32) -> PreparedModel {
+        let mut config = turbine_core::config::Config::default();
+        config.model.path = spec.dir.clone();
+        config.execution.backend = turbine_core::config::ModuleName::new("cpu").unwrap();
+        config.execution.device = DeviceId(rank);
+        config.kv.gpu.max_bytes = Some(turbine_core::config::ByteSize(16 << 20));
+        config.reliability.emergency_vram_reserve = turbine_core::config::ByteSize(1 << 20);
+        let inventory = turbine_device::DeviceInventory {
+            devices: Vec::new(),
+            backends: Vec::new(),
+        };
+        model::prepare_rank(
+            &config,
+            &inventory,
+            &MetricsRegistry::new(),
+            Some(ShardSpec { rank, world: 2 }),
+        )
+        .expect("prepare")
+    }
+
+    /// P5 S-5, `static` rank mode in one process: a leader group with a remote rank that joins
+    /// over the `tcp` rank transport (Hello → Welcome with the leader's unique id), both
+    /// loading, agreeing on the pool through the communicator and warming up; the leader's
+    /// executor then gives one device's greedy tokens (fork copy included), and dropping it
+    /// shuts the worker down cleanly (`Ok`). Breaks if the handshake, the collective pool
+    /// agreement or the step plans over the socket are wrong.
+    #[test]
+    fn static_group_over_tcp_matches_one_device() {
+        let dir = TempDir::new("engine-tp-static");
+        let spec = write_tiny_llama(dir.path(), 11);
+        let prompt: Vec<u32> = (0..10).map(|i| (i * 17 + 3) % spec.vocab).collect();
+        let (mut one, one_pool) = one_device(&spec);
+        let want = greedy_with_fork(one.as_mut(), &one_pool, &prompt, 5);
+
+        let (leader, worker) = (prepared(&spec, 0), prepared(&spec, 1));
+        let library = turbine_distributed::collective::HostBackend
+            .load(None)
+            .expect("host library");
+        let transport = turbine_distributed::transport::select("tcp").unwrap();
+        let listen = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let expect = HelloExpect {
+            model_fingerprint: leader.identity.fingerprint(),
+            config_fingerprint: [7; 32],
+            device_vendor: turbine_core::types::Vendor::Amd,
+            device_arch: "test".into(),
+        };
+        let hello = RankMessage::Hello {
+            protocol: turbine_distributed::rank::PROTOCOL_VERSION,
+            rank: 1,
+            world_size: 2,
+            model_fingerprint: expect.model_fingerprint,
+            config_fingerprint: expect.config_fingerprint,
+            device_vendor: expect.device_vendor,
+            device_arch: expect.device_arch.clone(),
+        };
+        let reg = MetricsRegistry::new();
+        let (metrics, reliability) = (
+            CollectiveMetrics::register(&reg),
+            ReliabilityMetrics::register(&reg),
+        );
+        let clock: Arc<dyn Clock> = Arc::new(turbine_core::clock::SystemClock::new());
+        let worker_start = StaticWorker {
+            transport,
+            leader: listen,
+            hello,
+            library: Arc::clone(&library),
+            init_timeout: Duration::from_secs(30),
+            op_timeout: Duration::from_secs(30),
+            metrics: metrics.clone(),
+            clock: Arc::clone(&clock),
+        };
+        let worker_reliability = reliability.clone();
+        let worker_thread = std::thread::spawn(move || {
+            let phase = |_| {};
+            run_static_worker(&worker, worker_start, &worker_reliability, &phase, || {})
+        });
+        let group = TpGroupStart {
+            workers: Vec::new(),
+            library,
+            init_timeout: Duration::from_secs(30),
+            op_timeout: Duration::from_secs(30),
+            depth: 2,
+            metrics,
+            clock,
+            remote: Some(StaticLeader {
+                transport,
+                listen,
+                expect,
+                world: 2,
+            }),
+        };
+        let model_metrics = ModelMetrics::register(&reg);
+        let loaded = load_group(&leader, group, 0, &model_metrics, &reliability, &|_| {})
+            .expect("static group");
+        assert!(loaded.shards.is_empty(), "no tier shards across processes");
+        let LoadedModel {
+            mut executor, pool, ..
+        } = loaded;
+        let got = greedy_with_fork(executor.as_mut(), &pool, &prompt, 5);
+        assert_eq!(got, want);
+        drop(executor);
+        let stopped = worker_thread.join().expect("worker thread");
+        assert_eq!(
+            stopped,
+            Ok(()),
+            "the leader's shutdown stops the worker cleanly"
+        );
     }
 
     /// A worker that fails before its collectives aborts the group at once (well inside the

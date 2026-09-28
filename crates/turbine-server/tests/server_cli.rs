@@ -285,7 +285,7 @@ fn impossible_plan_exits_2_before_bind() {
         // tiny Llama has 4 attention heads (P5 S-6, checked against config.json before bind).
         (
             "plan-cpu-heads",
-            yaml + "parallel:\n  tensor_parallel_size: 8\n  collective_backend: host\n",
+            yaml.clone() + "parallel:\n  tensor_parallel_size: 8\n  collective_backend: host\n",
         ),
     ] {
         let cfg = TempConfig::new(tag, &yaml);
@@ -298,6 +298,21 @@ fn impossible_plan_exits_2_before_bind() {
         );
         TcpListener::bind(addr).expect("the configured port must still be free");
     }
+    // Static rank processes need a device communicator: the host collective's ranks are threads.
+    let cfg = TempConfig::new(
+        "plan-cpu-static",
+        &(yaml
+            + "parallel:\n  tensor_parallel_size: 2\n  collective_backend: host\n  ranks:\n    \
+               mode: static\n    leader: 127.0.0.1:9\n"),
+    );
+    let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(30));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("invalid parallel plan: parallel.ranks.mode"),
+        "stderr: {stderr}"
+    );
+    TcpListener::bind(addr).expect("the configured port must still be free");
 }
 
 #[test]

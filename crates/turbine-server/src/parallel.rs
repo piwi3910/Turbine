@@ -103,10 +103,11 @@ pub fn check_executable(plan: &ParallelPlan, config: &Config) -> Result<(), Plan
     if plan.tp <= 1 {
         return Ok(());
     }
-    if plan.mode == RankMode::Static {
+    if plan.mode == RankMode::Static && plan.vendor.is_none() {
+        // The host collective's ranks are threads of one process; static ranks are processes.
         return Err(PlanFailure::Config(
-            "parallel.ranks.mode: static rank processes are not available in this build; use \
-             local"
+            "parallel.ranks.mode: static rank processes need a device collective backend; the \
+             cpu backend's host collective runs its ranks as threads (use local)"
                 .into(),
         ));
     }
@@ -160,6 +161,19 @@ pub fn load_collective(
         "collective backend loaded"
     );
     Ok(library)
+}
+
+/// The configuration fingerprint of the static-mode `Hello` (P5 S-5): BLAKE3 of the resolved
+/// configuration with what legitimately differs per rank process cleared — the rank, its
+/// local devices, its listen address and its execution device.
+pub fn config_fingerprint(config: &Config) -> [u8; 32] {
+    let mut c = config.clone();
+    c.parallel.ranks.rank = 0;
+    c.parallel.ranks.local_devices = Vec::new();
+    c.server.listen = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+    c.execution.device = DeviceId(0);
+    let bytes = serde_json::to_vec(&c).unwrap_or_default();
+    *blake3::hash(&bytes).as_bytes()
 }
 
 /// The device of the single engine: rank 0 of replica 0.

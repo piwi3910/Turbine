@@ -93,6 +93,8 @@ pub struct KvSetup {
 
 /// Why the engine asks the server to exit.
 #[derive(Debug)]
+// `DeviceFatal` names the P3 circuit reason; the lint only notices it from three variants on.
+#[allow(clippy::enum_variant_names)]
 pub enum Fatal {
     /// Weight load, memory budget, KV allocation, emergency reserve or warm-up failed after
     /// the listener bound: exit 1.
@@ -100,6 +102,9 @@ pub enum Fatal {
     /// The circuit breaker is fatal — a sticky device error, a controller failure, or an
     /// engine panic: exit 3 (P3 S-12, CONFLICT C-25).
     DeviceFatal(String),
+    /// A `static`-mode worker rank process stopped (P5 S-5): `None` when its leader shut it down
+    /// (exit 0), else why — a lost leader, a failed join, load or step (exit 1).
+    RankStopped(Option<String>),
 }
 
 /// The documents behind `GET /turbine/v1/scheduler` and `GET /turbine/v1/kv`.
