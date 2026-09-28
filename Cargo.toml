@@ -40,6 +40,8 @@ llguidance = "=1.8.0"
 minijinja = { version = "2.24.0", features = ["json", "loader", "loop_controls", "preserve_order"] }
 minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
 nvml-wrapper = "0.13.0"
+# Phase 5 static-mode rank protocol framing (compact serde, no schema compiler)
+postcard = { version = "1.1.3", features = ["use-std"] }
 prometheus-client = "0.25.1"
 # Phase 2 dev-dependency: property tests of KV accounting and scheduler invariants
 proptest = "1.11.0"
