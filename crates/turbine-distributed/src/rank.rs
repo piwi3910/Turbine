@@ -10,12 +10,18 @@
 //! and answers `Welcome { unique_id }` once every rank joined, or `Reject { reason }`. Frames are
 //! a u32 little-endian length plus a postcard body, at most 16 MiB. A closed leader socket makes
 //! a worker abort its communicator and return [`RankError::Closed`]; `Shutdown` travels both ways.
+//!
+//! A failed step (P5 Task 28) does not end a worker: it reports the failure (`StepFailed` in
+//! `static` mode) and waits, and the leader re-creates the group — [`RankRuntime::reinit_begin`]
+//! hands every worker a fresh unique id, each opens its new communicator at once while the
+//! leader opens its own, and [`RankRuntime::reinit_wait`] collects the answers. Only a sticky
+//! device error ends a worker.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -25,7 +31,7 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use turbine_core::types::{BlockId, ModelFingerprint, SeqId, Vendor};
 
-use crate::collective::{Collective, CollectiveError};
+use crate::collective::CollectiveError;
 use crate::transport::{RankStream, Transport};
 
 /// Static-mode protocol version carried in `Hello`. 2 adds [`StepPlan::copies`]; 3 adds the
@@ -103,6 +109,18 @@ pub struct StepSeq {
 /// Runs one rank's share of a step (implemented in `turbine-server` over `turbine-model`).
 pub trait StepExecutor: Send {
     fn execute(&mut self, plan: &StepPlan) -> Result<StepOutput, ExecError>;
+    /// Replaces the rank's failed communicator with a new one of the group `unique_id` (P5
+    /// Task 28), opened at once: every rank of the group opens concurrently, bounded by the
+    /// communicator init timeout. Unsupported by default.
+    fn reinit(&mut self, unique_id: [u8; 128]) -> Result<(), ExecError> {
+        let _ = unique_id;
+        Err(ExecError::Executor(
+            "this rank cannot re-create its communicator".into(),
+        ))
+    }
+    /// Aborts the rank's communicator (the leader is lost): nothing may keep waiting in a
+    /// collective. Default: nothing.
+    fn abort(&mut self) {}
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -184,6 +202,25 @@ pub enum RankMessage {
         rank: u32,
         budget: RankBudget,
     },
+    /// Worker → leader (v3): plan `step` failed on this rank (not a sticky device error); the
+    /// rank aborted its communicator and waits for `Reinit`.
+    StepFailed {
+        rank: u32,
+        step: u64,
+        reason: String,
+    },
+    /// Leader → worker (v3, P5 Task 28): re-create the communicator, this rank of the new
+    /// group `unique_id`; the worker answers `ReinitDone`.
+    Reinit {
+        #[serde(with = "unique_id_bytes")]
+        unique_id: [u8; 128],
+    },
+    /// Worker → leader (v3): the answer to `Reinit` (`error` when the new communicator could
+    /// not be opened).
+    ReinitDone {
+        rank: u32,
+        error: Option<String>,
+    },
 }
 
 /// Writes one frame: u32 LE body length, then the postcard body (≤ [`MAX_FRAME_BYTES`]).
@@ -259,6 +296,10 @@ impl Failure {
     fn get(&self) -> Option<RankError> {
         lock(&self.0).clone()
     }
+    /// Forgets the failure (the group is being re-created).
+    fn clear(&self) {
+        *lock(&self.0) = None;
+    }
 }
 
 /// Worker → leader messages of a `static` group that answer a leader request (`Loaded`, …),
@@ -320,9 +361,16 @@ struct Slots {
     alive: AtomicBool,
 }
 
+/// What the leader hands a local worker thread.
+enum LocalMsg {
+    Plan(StepPlan),
+    /// Re-create the communicator (P5 Task 28).
+    Reinit([u8; 128]),
+}
+
 struct LocalWorker {
     rank: u32,
-    tx: Option<SyncSender<StepPlan>>,
+    tx: Option<SyncSender<LocalMsg>>,
     slots: Arc<Slots>,
     handle: Option<JoinHandle<()>>,
 }
@@ -333,6 +381,8 @@ struct StaticLink {
     /// A clone of the connection, kept to close it (both directions) on shutdown or drop.
     control: Box<dyn RankStream>,
     writer: Option<JoinHandle<()>>,
+    /// Cleared when either direction of the connection ends: the rank is gone.
+    alive: Arc<AtomicBool>,
 }
 
 enum Mode {
@@ -341,6 +391,9 @@ enum Mode {
         links: Vec<StaticLink>,
         closing: Arc<AtomicBool>,
         inbox: Arc<Inbox>,
+        /// A worker's `StepFailed` for a plan below this step is stale: the group was
+        /// re-created after it.
+        stale_below: Arc<AtomicU64>,
     },
 }
 
@@ -349,25 +402,35 @@ pub struct RankRuntime {
     mode: Mode,
     depth: usize,
     failure: Arc<Failure>,
+    /// The highest step handed out.
+    last_step: u64,
 }
 
+/// A local worker thread: executes plans and re-inits in order. A failed plan is reported
+/// (the first failure is the group's) and the thread goes on, so the group can be re-created
+/// (P5 Task 28); a sticky device error ends it.
 fn local_worker_loop(
     rank: u32,
     mut exec: Box<dyn StepExecutor>,
-    rx: Receiver<StepPlan>,
+    rx: Receiver<LocalMsg>,
     slots: Arc<Slots>,
     failure: Arc<Failure>,
 ) {
-    for plan in rx {
-        let result = exec.execute(&plan);
-        *lock(&slots.outstanding) -= 1;
-        slots.cv.notify_all();
-        if let Err(e) = result {
+    for msg in rx {
+        let result = match &msg {
+            LocalMsg::Plan(plan) => exec.execute(plan).map(|_| ()),
+            LocalMsg::Reinit(id) => exec.reinit(*id),
+        };
+        if let Err(e) = &result {
             tracing::warn!(event = "rank_failed", rank, error = %e, "worker rank failed");
             failure.set(RankError::Executor {
                 rank,
                 detail: e.to_string(),
             });
+        }
+        *lock(&slots.outstanding) -= 1;
+        slots.cv.notify_all();
+        if matches!(result, Err(ExecError::DeviceFatal(_))) {
             break;
         }
     }
@@ -466,6 +529,7 @@ impl RankRuntime {
             mode: Mode::Local(workers),
             depth,
             failure,
+            last_step: 0,
         }
     }
 
@@ -536,19 +600,26 @@ impl RankRuntime {
         let failure = Arc::new(Failure::default());
         let closing = Arc::new(AtomicBool::new(false));
         let inbox = Arc::new(Inbox::default());
+        let stale_below = Arc::new(AtomicU64::new(0));
         let mut links = Vec::with_capacity(joined.len());
         for (rank, mut stream) in joined {
             stream.set_read_timeout(None).map_err(io_err)?;
             write_frame(&mut stream, &RankMessage::Welcome { unique_id }).map_err(io_err)?;
             let control = stream.try_clone().map_err(io_err)?;
             let mut reader = stream.try_clone().map_err(io_err)?;
+            let alive = Arc::new(AtomicBool::new(true));
             let (tx, rx) = sync_channel::<RankMessage>(depth);
-            let (f, c) = (Arc::clone(&failure), Arc::clone(&closing));
+            let (f, c, a) = (
+                Arc::clone(&failure),
+                Arc::clone(&closing),
+                Arc::clone(&alive),
+            );
             let writer = std::thread::Builder::new()
                 .name(format!("turbine-rank-{rank}-tx"))
                 .spawn(move || {
                     for msg in rx {
                         if write_frame(&mut stream, &msg).is_err() {
+                            a.store(false, Ordering::Release);
                             if !c.load(Ordering::Acquire) {
                                 f.set(RankError::Closed { rank });
                             }
@@ -557,10 +628,12 @@ impl RankRuntime {
                     }
                 })
                 .map_err(io_err)?;
-            let (f, c, i) = (
+            let (f, c, i, a, s) = (
                 Arc::clone(&failure),
                 Arc::clone(&closing),
                 Arc::clone(&inbox),
+                Arc::clone(&alive),
+                Arc::clone(&stale_below),
             );
             std::thread::Builder::new()
                 .name(format!("turbine-rank-{rank}-rx"))
@@ -574,6 +647,17 @@ impl RankRuntime {
                                 });
                                 break;
                             }
+                            Ok(RankMessage::StepFailed { step, reason, .. }) => {
+                                // A plan handed out before the group was re-created fails on
+                                // its aborted communicator: not a new failure.
+                                if step >= s.load(Ordering::Acquire) {
+                                    f.set(RankError::Executor {
+                                        rank,
+                                        detail: reason,
+                                    });
+                                    i.cv.notify_all();
+                                }
+                            }
                             Ok(msg) => i.push(rank, msg),
                             Err(_) => {
                                 if !c.load(Ordering::Acquire) {
@@ -583,6 +667,7 @@ impl RankRuntime {
                             }
                         }
                     }
+                    a.store(false, Ordering::Release);
                     i.cv.notify_all();
                 })
                 .map_err(io_err)?;
@@ -591,6 +676,7 @@ impl RankRuntime {
                 tx: Some(tx),
                 control,
                 writer: Some(writer),
+                alive,
             });
         }
         tracing::info!(event = "ranks_ready", world, "every static rank joined");
@@ -599,10 +685,128 @@ impl RankRuntime {
                 links,
                 closing,
                 inbox,
+                stale_below,
             },
             depth,
             failure,
+            last_step: 0,
         })
+    }
+
+    /// Re-creation of a failed group, first half (P5 Task 28): waits until every local worker
+    /// has run what it was handed, forgets the group's failure and hands every worker
+    /// `Reinit { unique_id }`, which it opens at once. The leader opens its own communicator of
+    /// the group meanwhile, then collects the answers with [`RankRuntime::reinit_wait`]. A worker
+    /// that is gone (thread ended, connection closed) fails it: the group cannot be re-created
+    /// without that rank.
+    pub fn reinit_begin(&mut self, unique_id: [u8; 128]) -> Result<(), RankError> {
+        match &mut self.mode {
+            Mode::Local(workers) => {
+                for w in workers.iter() {
+                    let mut outstanding = lock(&w.slots.outstanding);
+                    while *outstanding > 0 && w.slots.alive.load(Ordering::Acquire) {
+                        outstanding = w
+                            .slots
+                            .cv
+                            .wait(outstanding)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if !w.slots.alive.load(Ordering::Acquire) {
+                        return Err(RankError::Closed { rank: w.rank });
+                    }
+                }
+                self.failure.clear();
+                for w in workers.iter() {
+                    *lock(&w.slots.outstanding) += 1;
+                    let sent =
+                        w.tx.as_ref()
+                            .is_some_and(|tx| tx.send(LocalMsg::Reinit(unique_id)).is_ok());
+                    if !sent {
+                        return Err(RankError::Closed { rank: w.rank });
+                    }
+                }
+            }
+            Mode::Static {
+                links,
+                inbox,
+                stale_below,
+                ..
+            } => {
+                if let Some(l) = links.iter().find(|l| !l.alive.load(Ordering::Acquire)) {
+                    return Err(RankError::Closed { rank: l.rank });
+                }
+                stale_below.store(self.last_step.saturating_add(1), Ordering::Release);
+                // Answers to an earlier, abandoned re-creation are stale too.
+                lock(&inbox.queue).retain(|(_, m)| !matches!(m, RankMessage::ReinitDone { .. }));
+                self.failure.clear();
+                for l in links.iter() {
+                    let sent =
+                        l.tx.as_ref()
+                            .is_some_and(|tx| tx.send(RankMessage::Reinit { unique_id }).is_ok());
+                    if !sent {
+                        return Err(RankError::Closed { rank: l.rank });
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            event = "rank_reinit",
+            "every worker rank re-creates its communicator"
+        );
+        Ok(())
+    }
+
+    /// Re-creation, second half: every worker's answer to `Reinit` within `timeout`; the first
+    /// failure otherwise (a worker's own, or `Timeout { missing }`).
+    pub fn reinit_wait(&self, timeout: Duration) -> Result<(), RankError> {
+        let deadline = Instant::now() + timeout;
+        match &self.mode {
+            Mode::Local(workers) => {
+                for w in workers {
+                    let mut outstanding = lock(&w.slots.outstanding);
+                    while *outstanding > 0 && w.slots.alive.load(Ordering::Acquire) {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Err(RankError::Timeout {
+                                missing: vec![w.rank],
+                            });
+                        }
+                        outstanding = w
+                            .slots
+                            .cv
+                            .wait_timeout(outstanding, deadline - now)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
+                    }
+                }
+                self.failure.get().map_or(Ok(()), Err)
+            }
+            Mode::Static { links, inbox, .. } => {
+                let mut done: Vec<u32> = Vec::with_capacity(links.len());
+                while done.len() < links.len() {
+                    let taken = inbox.take(deadline, &self.failure, |_, m| {
+                        matches!(m, RankMessage::ReinitDone { .. })
+                    })?;
+                    match taken {
+                        Some((rank, RankMessage::ReinitDone { error: None, .. })) => {
+                            done.push(rank);
+                        }
+                        Some((rank, RankMessage::ReinitDone { error: Some(e), .. })) => {
+                            return Err(RankError::Executor { rank, detail: e });
+                        }
+                        _ => {
+                            let missing = links
+                                .iter()
+                                .map(|l| l.rank)
+                                .filter(|r| !done.contains(r))
+                                .collect();
+                            return Err(RankError::Timeout { missing });
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Static mode: every worker's budget from its `Loaded` message, in rank order, waiting
@@ -701,6 +905,7 @@ impl RankRuntime {
         if let Some(e) = self.failure.get() {
             return Err(e);
         }
+        self.last_step = self.last_step.max(plan.step);
         let depth = self.depth;
         match &mut self.mode {
             Mode::Local(workers) => {
@@ -722,8 +927,10 @@ impl RankRuntime {
                     }
                     *outstanding += 1;
                     drop(outstanding);
-                    let sent = w.tx.as_ref().map(|tx| tx.send(plan.clone()));
-                    if !matches!(sent, Some(Ok(()))) {
+                    let sent =
+                        w.tx.as_ref()
+                            .is_some_and(|tx| tx.send(LocalMsg::Plan(plan.clone())).is_ok());
+                    if !sent {
                         return Err(self
                             .failure
                             .get()
@@ -854,49 +1061,64 @@ impl WorkerLink {
         .map_err(io_err)
     }
 
-    /// Executes every `StepPlan` the leader sends until `Shutdown` (`Ok`). A lost leader aborts
-    /// `comm` and returns `Closed { rank: 0 }`; a failed step sends `Shutdown` to the leader,
-    /// aborts `comm` and returns `Executor`.
-    pub fn run(
-        mut self,
-        exec: &mut dyn StepExecutor,
-        comm: &dyn Collective,
-    ) -> Result<(), RankError> {
+    /// Executes every message the leader sends until `Shutdown` (`Ok`): step plans, and
+    /// `Reinit` (answered `ReinitDone`). A failed step is reported `StepFailed` and the rank
+    /// waits for the leader to re-create the group (P5 Task 28); a sticky device error sends
+    /// `Shutdown` to the leader, aborts the executor's communicator and returns `Executor`. A
+    /// lost leader aborts it and returns `Closed { rank: 0 }`.
+    pub fn run(mut self, exec: &mut dyn StepExecutor) -> Result<(), RankError> {
+        let rank = self.rank;
         loop {
-            match read_frame(&mut self.stream) {
-                Ok(RankMessage::StepPlan(plan)) => {
-                    if let Err(e) = exec.execute(&plan) {
+            let reply = match read_frame(&mut self.stream) {
+                Ok(RankMessage::StepPlan(plan)) => match exec.execute(&plan) {
+                    Ok(_) => None,
+                    Err(e @ ExecError::DeviceFatal(_)) => {
                         let detail = e.to_string();
                         let _ = write_frame(
                             &mut self.stream,
                             &RankMessage::Shutdown {
-                                reason: format!("rank {}: {detail}", self.rank),
+                                reason: format!("rank {rank}: {detail}"),
                             },
                         );
-                        comm.abort();
-                        return Err(RankError::Executor {
-                            rank: self.rank,
-                            detail,
-                        });
+                        exec.abort();
+                        return Err(RankError::Executor { rank, detail });
                     }
+                    Err(e) => Some(RankMessage::StepFailed {
+                        rank,
+                        step: plan.step,
+                        reason: format!("rank {rank}: {e}"),
+                    }),
+                },
+                Ok(RankMessage::Reinit { unique_id }) => {
+                    let error = exec.reinit(unique_id).err().map(|e| e.to_string());
+                    tracing::info!(
+                        event = "rank_reinit",
+                        rank,
+                        ok = error.is_none(),
+                        "communicator re-created"
+                    );
+                    Some(RankMessage::ReinitDone { rank, error })
                 }
                 Ok(RankMessage::Shutdown { reason }) => {
-                    tracing::info!(event = "rank_shutdown", rank = self.rank, %reason, "leader shut down");
+                    tracing::info!(event = "rank_shutdown", rank, %reason, "leader shut down");
                     return Ok(());
                 }
                 Ok(other) => {
-                    comm.abort();
+                    exec.abort();
                     return Err(RankError::Io(format!("unexpected message {other:?}")));
                 }
                 Err(_) => {
-                    tracing::warn!(
-                        event = "leader_lost",
-                        rank = self.rank,
-                        "leader connection closed"
-                    );
-                    comm.abort();
+                    tracing::warn!(event = "leader_lost", rank, "leader connection closed");
+                    exec.abort();
                     return Err(RankError::Closed { rank: 0 });
                 }
+            };
+            if let Some(msg) = reply
+                && write_frame(&mut self.stream, &msg).is_err()
+            {
+                tracing::warn!(event = "leader_lost", rank, "leader connection closed");
+                exec.abort();
+                return Err(RankError::Closed { rank: 0 });
             }
         }
     }
@@ -1166,16 +1388,186 @@ mod tests {
         drop(keep_rx);
     }
 
-    /// Executes nothing; counts plans.
-    struct Count(Arc<std::sync::atomic::AtomicU64>);
+    /// Counts plans; aborts `comm` when the leader is lost. With `reduce`, every plan all-reduces
+    /// one element across the group, and plan `fail_at` fails instead (aborting `comm`);
+    /// `reinit` opens this rank of a new host group.
+    struct Count {
+        steps: Arc<std::sync::atomic::AtomicU64>,
+        comm: Arc<dyn Collective>,
+        rank: usize,
+        world: usize,
+        reduce: bool,
+        fail_at: Option<u64>,
+    }
+
+    impl Count {
+        fn new(steps: &Arc<std::sync::atomic::AtomicU64>, comm: Arc<dyn Collective>) -> Count {
+            Count {
+                steps: Arc::clone(steps),
+                rank: comm.rank(),
+                world: comm.world_size(),
+                comm,
+                reduce: false,
+                fail_at: None,
+            }
+        }
+    }
+
     impl StepExecutor for Count {
         fn execute(&mut self, plan: &StepPlan) -> Result<StepOutput, ExecError> {
-            self.0.store(plan.step, std::sync::atomic::Ordering::SeqCst);
+            self.steps
+                .store(plan.step, std::sync::atomic::Ordering::SeqCst);
+            if self.reduce {
+                if self.fail_at == Some(plan.step) {
+                    self.fail_at = None;
+                    self.comm.abort();
+                    return Err(ExecError::Collective(CollectiveError::RemoteAbort {
+                        rank: self.rank,
+                    }));
+                }
+                reduce_one(self.comm.as_ref())?;
+            }
             Ok(StepOutput {
                 logits: None,
                 rows: 0,
                 vocab: 0,
             })
+        }
+        fn reinit(&mut self, unique_id: [u8; 128]) -> Result<(), ExecError> {
+            self.comm = open_host(unique_id, self.rank, self.world)?;
+            Ok(())
+        }
+        fn abort(&mut self) {
+            self.comm.abort();
+        }
+    }
+
+    /// One F32 all-reduce of one element on `c`.
+    fn reduce_one(c: &dyn Collective) -> Result<(), CollectiveError> {
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(turbine_core::types::DeviceId(0), 64);
+        let stream = mem.compute_stream();
+        let buf = DeviceBuffer::alloc(&mem, 4).expect("alloc");
+        c.all_reduce(
+            &mut buf.whole(),
+            turbine_tensor::DType::F32,
+            ReduceOp::Sum,
+            &stream,
+        )
+    }
+
+    /// Rank `rank` of `world` of the host group `unique_id`.
+    fn open_host(
+        unique_id: [u8; 128],
+        rank: usize,
+        world: usize,
+    ) -> Result<Arc<dyn Collective>, CollectiveError> {
+        use crate::collective::{CollectiveBackend, CollectiveInit, HostBackend};
+        HostBackend.load(None)?.open(CollectiveInit {
+            rank,
+            world,
+            unique_id,
+            init_timeout: Duration::from_secs(5),
+            op_timeout: Duration::from_secs(5),
+            clock: Arc::new(turbine_core::clock::SystemClock::new()),
+            metrics: None,
+            memory: None,
+            route_max_bytes: None,
+        })
+    }
+
+    /// A fresh host group id.
+    fn host_id() -> [u8; 128] {
+        use crate::collective::{CollectiveBackend, HostBackend};
+        HostBackend
+            .load(None)
+            .and_then(|l| l.unique_id())
+            .expect("host unique id")
+    }
+
+    /// P5 Task 28 in both rank modes: a worker whose collective fails mid-plan leaves its
+    /// thread or process running; the group reports the failure, and after `reinit_begin` +
+    /// the leader's own new communicator + `reinit_wait` every rank all-reduces again over the
+    /// new group, while the failed plan's late report does not fail it again. Breaks if a
+    /// failed worker stops, a re-init leaves a rank on its aborted communicator, or a stale
+    /// failure poisons the new group.
+    #[test]
+    fn failed_group_is_recreated() {
+        for local in [true, false] {
+            let steps = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let id = host_id();
+            let first = [open_host(id, 0, 2).unwrap(), open_host(id, 1, 2).unwrap()];
+            let mut worker = Count::new(&steps, Arc::clone(&first[1]));
+            worker.reduce = true;
+            worker.fail_at = Some(2);
+            let mut leader_comm = Arc::clone(&first[0]);
+            let (mut rt, worker_thread) = if local {
+                (RankRuntime::local(vec![Box::new(worker)], 2), None)
+            } else {
+                let addr = free_addr();
+                let leader = thread::spawn(move || {
+                    RankRuntime::static_leader(
+                        tcp(),
+                        addr,
+                        expect(),
+                        2,
+                        Duration::from_secs(5),
+                        unique_id(),
+                        2,
+                    )
+                });
+                let w = thread::spawn(move || {
+                    let link = RankRuntime::static_worker(
+                        tcp(),
+                        addr,
+                        hello(1, 2),
+                        Duration::from_secs(5),
+                    )
+                    .expect("welcome");
+                    link.run(&mut worker)
+                });
+                (leader.join().unwrap().expect("joined"), Some(w))
+            };
+            let plan = |step: u64| StepPlan {
+                sequences: Vec::new(),
+                copies: Vec::new(),
+                ledger: Vec::new(),
+                ..step_plan(step)
+            };
+            rt.step(plan(1)).expect("step 1");
+            reduce_one(leader_comm.as_ref()).expect("step 1 all-reduce");
+            rt.step(plan(2)).expect("step 2 is handed out");
+            let err = reduce_one(leader_comm.as_ref()).expect_err("rank 1 aborted");
+            assert!(
+                matches!(err, CollectiveError::RemoteAbort { .. }),
+                "{err:?}"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while rt.wait_idle().is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "local {local}: failure never seen"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(rt.step(plan(3)).is_err(), "a failed group takes no plan");
+
+            let id = host_id();
+            rt.reinit_begin(id).expect("reinit begins");
+            leader_comm = open_host(id, 0, 2).expect("the leader's new communicator");
+            rt.reinit_wait(Duration::from_secs(5))
+                .expect("every rank re-created");
+            for step in 4..6 {
+                rt.step(plan(step))
+                    .expect("the re-created group takes plans");
+                reduce_one(leader_comm.as_ref()).expect("all-reduce over the new group");
+            }
+            thread::sleep(Duration::from_millis(50));
+            rt.wait_idle().expect("no stale failure");
+            assert_eq!(steps.load(std::sync::atomic::Ordering::SeqCst), 5);
+            rt.shutdown("test done");
+            if let Some(w) = worker_thread {
+                assert_eq!(w.join().unwrap(), Ok(()));
+            }
         }
     }
 
@@ -1206,8 +1598,8 @@ mod tests {
                     RankRuntime::static_worker(tcp(), addr, hello(rank, 3), Duration::from_secs(5))
                         .expect("welcome");
                 let steps = Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let mut exec = Count(Arc::clone(&steps));
-                let result = link.run(&mut exec, comm.as_ref());
+                let mut exec = Count::new(&steps, comm);
+                let result = link.run(&mut exec);
                 done.send((
                     rank,
                     result,

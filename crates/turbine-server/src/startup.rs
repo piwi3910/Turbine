@@ -379,6 +379,7 @@ pub fn run(cli: Cli) -> ExitCode {
                             route_max_bytes: config.parallel.collective.hostmem_max_bytes.fixed(),
                             metrics: cmetrics.clone(),
                             clock: Arc::new(SystemClock::new()),
+                            wrap: std::convert::identity,
                         })
                     }),
                     Err(e) => {

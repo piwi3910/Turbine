@@ -82,6 +82,21 @@ struct State {
 /// Messages one sender may have in flight to one receiver before `send` waits.
 const P2P_DEPTH: usize = 16;
 
+/// Test-only failure hook, not a configuration key (P5 Task 28: a collective failure injected
+/// into a black-box server): when this environment variable names a file, the first all-reduce
+/// of any rank of this process that finds the file deletes it, aborts its group and fails with
+/// a backend error. One file, one failure.
+pub const FAIL_FILE_ENV: &str = "TURBINE_TEST_HOST_COLLECTIVE_FAIL_FILE";
+
+/// True once per appearance of the [`FAIL_FILE_ENV`] file (whose deletion only one caller
+/// wins).
+fn injected_failure() -> bool {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os(FAIL_FILE_ENV).map(Into::into))
+        .as_ref()
+        .is_some_and(|p| std::fs::remove_file(p).is_ok())
+}
+
 struct Shared {
     world: usize,
     op_timeout: Duration,
@@ -435,6 +450,13 @@ impl Collective for HostCollective {
         op: ReduceOp,
         _stream: &StreamRef,
     ) -> Result<(), CollectiveError> {
+        if injected_failure() {
+            self.abort();
+            return Err(CollectiveError::Backend {
+                code: -1,
+                message: format!("injected all-reduce failure ({FAIL_FILE_ENV})"),
+            });
+        }
         Self::check_elems(dtype, buf.len())?;
         let bytes = buf.read_bytes().map_err(memory)?;
         let out = self.exchange(OpKind::AllReduce(op), Some(dtype), bytes, buf.len())?;

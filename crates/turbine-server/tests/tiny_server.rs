@@ -60,6 +60,11 @@ fn free_addr() -> SocketAddr {
 }
 
 fn spawn(config: &Path) -> Child {
+    spawn_with_env(config, &[])
+}
+
+/// [`spawn`] with more environment variables.
+fn spawn_with_env(config: &Path, env: &[(&str, String)]) -> Child {
     Command::new(env!("CARGO_BIN_EXE_turbine-server"))
         .arg("--config")
         .arg(config)
@@ -67,6 +72,7 @@ fn spawn(config: &Path) -> Child {
         .env_remove("TURBINE_KERNEL_LIBRARY")
         .env(SEND_BUFFER_ENV, HELD_SOCKET_BUFFER.to_string())
         .env("RUST_LOG", "info")
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -128,6 +134,8 @@ struct Setup<'a> {
     capture_logs: bool,
     /// Serve the tiny OLMoE (8 experts top-2, `tiny-olmoe`) instead of the tiny Llama.
     olmoe: bool,
+    /// More environment variables for the server.
+    env: &'a [(&'a str, String)],
 }
 
 impl Default for Setup<'_> {
@@ -142,6 +150,7 @@ impl Default for Setup<'_> {
             template_with_tools: true,
             capture_logs: false,
             olmoe: false,
+            env: &[],
         }
     }
 }
@@ -239,7 +248,7 @@ impl TinyServer {
                 setup.extra,
             );
             std::fs::write(&config, yaml).unwrap();
-            let mut child = spawn(&config);
+            let mut child = spawn_with_env(&config, setup.env);
             let logs = drain_stderr(&mut child);
             match wait_until_ready(&mut child, addr, &logs) {
                 Ready::Serving => {
@@ -3181,6 +3190,78 @@ fn tp2_admission_reserves_on_both_ranks() {
             .iter()
             .all(|(_, used, reserved)| used + reserved == 0)
     });
+}
+
+/// P5 Task 28 (decision "P5: collective failure recovery" B): a tp 2 server on the cpu backend
+/// whose host collective fails one all-reduce mid-generation (the host backend's test-only
+/// failure file) ends the in-flight stream with `replica_failed` and answers `/ready` 503
+/// `circuit_open` (not exit 3); after the cooldown the circuit's probe re-creates the
+/// communicator on both ranks (`event="collective_reinit"`, `recreated`), `/ready` is 200 again
+/// and a greedy completion is identical to the one before the failure. Breaks if a collective
+/// failure is fatal, the group stays failed, or a rank keeps its aborted communicator.
+#[test]
+fn tp2_collective_failure_recovers() {
+    let dir = TempDir::new("turbine-tp2-reinit");
+    let trigger = dir.path().join("fail-one-all-reduce");
+    let env = [(
+        "TURBINE_TEST_HOST_COLLECTIVE_FAIL_FILE",
+        trigger.display().to_string(),
+    )];
+    // The config ends inside `reliability.circuit`: a 2 s cooldown before the probes.
+    let extra = format!("    cooldown: 2s\n{TP2}");
+    let server = TinyServer::launch(&Setup {
+        server_extra: HOLD_PAUSED,
+        extra: &extra,
+        max_positions: Some(LONG_POSITIONS),
+        capture_logs: true,
+        env: &env,
+        ..Setup::default()
+    });
+    let greedy = || -> Vec<u32> {
+        let body = json!({"model": server.model, "prompt": "Once upon a time", "max_tokens": 16,
+                          "ignore_eos": true, "temperature": 0, "logprobs": 0,
+                          "return_tokens_as_token_ids": true});
+        let resp = server.post("/v1/completions", &body);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        choice_token_ids(&resp.json()["choices"][0])
+    };
+    let before = greedy();
+
+    // Mid-generation: the next all-reduce of either rank fails and aborts the group.
+    let stream = OpenStream::open(server.addr, &server.long_stream_body(), true);
+    std::fs::write(&trigger, b"fail").unwrap();
+    let data = stream.read_rest();
+    assert_eq!(data.last().map(String::as_str), Some("[DONE]"), "{data:?}");
+    let err: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
+    assert_eq!(err["error"]["code"], "replica_failed", "{err}");
+    assert!(!trigger.exists(), "the failure was injected");
+    let ready = server.get("/ready");
+    assert_eq!(ready.status, 503, "{}", ready.body);
+    assert_eq!(ready.json()["reason"], "circuit_open", "{}", ready.body);
+
+    // The probe re-creates the communicator; a probe slower than twice the baseline (a loaded
+    // test host) fails and the cycle repeats, so allow a few.
+    wait_for(
+        Duration::from_secs(90),
+        "/ready 200 after the re-creation",
+        || server.get("/ready").status == 200,
+    );
+    let logs = server.logs.as_ref().unwrap().lock().unwrap().clone();
+    assert!(
+        logs.contains("collective_reinit") && logs.contains("recreated"),
+        "no re-creation logged:\n{logs}"
+    );
+    assert_eq!(
+        greedy(),
+        before,
+        "the re-created group gives the same tokens"
+    );
+    let metrics = server.metrics();
+    let recovered = sample(
+        &metrics,
+        r#"turbine_circuit_transitions_total{from="PROBING",to="HEALTHY",reason="probes_succeeded"}"#,
+    );
+    assert_eq!(recovered, Some(1.0), "{metrics}");
 }
 
 /// P5 S-6, `/ready` and data parallelism of tensor-parallel groups: dp 2 × tp 2 on the cpu

@@ -53,6 +53,8 @@ TWO_GPU_TESTS=(
 	# crates/turbine-distributed/tests/hostmem_lab.rs
 	hostmem_
 	rccl_init_with_a_missing_peer
+	# crates/turbine-server/tests/fault.rs (--features fault-injection)
+	tp2_collective_failure_recovers_on_gpu
 )
 
 SLOW_TESTS=(

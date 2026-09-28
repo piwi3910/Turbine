@@ -500,6 +500,18 @@ pub trait ModelExecutor: Send {
     fn reduces_logits(&self) -> bool {
         false
     }
+    /// Tensor or expert parallelism (P5 Task 28): replaces the rank's communicator with `c`, a
+    /// fresh one of the same group and rank (the old one failed and was aborted). Unsupported by
+    /// an executor without one.
+    fn set_collective(
+        &mut self,
+        c: Arc<dyn turbine_distributed::collective::Collective>,
+    ) -> Result<(), ModelError> {
+        let _ = c;
+        Err(ModelError::Kernel(KernelError::Unsupported {
+            message: "this executor has no communicator".into(),
+        }))
+    }
     /// Copies block `src[i]` to `dst[i]` in every layer of `kv` (the `n > 1` fork), ordered
     /// before the next forward on the same stream.
     fn copy_blocks(
