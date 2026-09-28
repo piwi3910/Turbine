@@ -429,7 +429,14 @@ fn assert_implementations(p: &Pair) {
             .map(|i| i.name)
             .collect()
     };
-    assert_eq!(names(OpKind::QGemm), ["hipblaslt_fp8"]);
+    assert_eq!(
+        names(OpKind::QGemm),
+        [
+            "hipblaslt_fp8",
+            "turbine_hip_int4_wmma",
+            "turbine_hip_int4_dequant"
+        ]
+    );
     assert_eq!(names(OpKind::QuantizeAct), ["turbine_hip"]);
 }
 
