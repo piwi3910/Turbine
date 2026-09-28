@@ -3286,15 +3286,6 @@ fn hip_v23_library_matches_cpu() {
 
 /// Greedy decode steps after the prefill in the tensor-parallel comparisons.
 const TP_STEPS: usize = 16;
-/// Max |Δ logit| of a tensor-parallel group against one device, relative to the row's largest
-/// |logit|. Not the 1e-4 absolute bound of bit-faithful provider comparisons: each all-reduce
-/// adds BF16-rounded partial sums (one device rounds once, after an F32 accumulation over the
-/// whole reduction), so logits move by a few BF16 ulps; measured on the cpu-reference provider
-/// with the tiny checkpoints (logits up to ~24 for Llama, ~3.5 for OLMoE): 9.5e-3 (Llama tp 2),
-/// 1.2e-2 (tp 4), 1.1e-2 (OLMoE tp 2 and 4), i.e. at most 0.19 and 0.031 absolute, with every
-/// greedy token identical. 2^-5 (3.1 %) keeps a ~2.5× margin;
-/// `tp_layer0_matches_one_device_slices` pins the sharding itself bitwise.
-const TP_MAX_SCALED_LOGIT_DIFF: f32 = 1.0 / 32.0;
 
 /// One run's greedy tokens per step and every step's logits rows.
 type GreedyRun = (Vec<[u32; 2]>, Vec<Vec<f32>>);
@@ -3446,15 +3437,69 @@ fn tp_group(
     })
 }
 
+/// How a tensor-parallel group's logits must match one device's.
+#[derive(Clone, Copy)]
+enum TpBound {
+    /// A group of one: the tensor-parallel path with identity collectives, bitwise.
+    Bitwise,
+    /// The golden rule (user decision 2026-09-28, "P5: tensor-parallel accuracy bound"):
+    /// greedy tokens identical and, for each of one device's top-k candidates of every row,
+    /// |Δ logprob| within the strict golden bounds of `tests/golden/llama-3.2-3b-instruct/
+    /// tolerance.json` — the bound the served model is held to at concurrency 1. Raw logits are
+    /// not bounded: each all-reduce rounds BF16 partial sums (one device rounds once, after an
+    /// F32 accumulation over the whole reduction), which moves them by ~1 % relative.
+    Golden(GoldenLogprobBounds),
+}
+
+/// The strict (concurrency-1) logprob bounds of a golden `tolerance.json`.
+#[derive(Clone, Copy, Debug)]
+struct GoldenLogprobBounds {
+    top_k: usize,
+    likely: f64,
+    tail: f64,
+    likely_floor: f64,
+}
+
+impl GoldenLogprobBounds {
+    /// The committed Llama bounds (0.15 above logprob −2, 0.55 below, top 5): the tightest of
+    /// the golden references, used for both tiny families.
+    fn llama() -> Self {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/golden/llama-3.2-3b-instruct/tolerance.json");
+        let text = std::fs::read_to_string(&path).expect("golden tolerance.json");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("tolerance.json parses");
+        let num = |key: &str| {
+            v[key]
+                .as_f64()
+                .unwrap_or_else(|| panic!("tolerance.json {key}"))
+        };
+        GoldenLogprobBounds {
+            top_k: num("top_k") as usize,
+            likely: num("max_abs_logprob_diff_likely"),
+            tail: num("max_abs_logprob_diff_tail"),
+            likely_floor: num("likely_logprob_floor"),
+        }
+    }
+}
+
+/// Log-softmax of one logits row, in f64.
+fn log_softmax(row: &[f32]) -> Vec<f64> {
+    let max = row.iter().fold(f64::NEG_INFINITY, |m, &x| m.max(x as f64));
+    let sum: f64 = row.iter().map(|&x| (x as f64 - max).exp()).sum();
+    let log_z = max + sum.ln();
+    row.iter().map(|&x| x as f64 - log_z).collect()
+}
+
 /// Checks a group's runs against one device's: every rank ends each step with bitwise the same
-/// logits rows, the greedy tokens are one device's, and every row's max |Δ logit| is within
-/// `bound` of the row's largest |logit|. Returns the largest such ratio.
+/// logits rows, the greedy tokens are exactly one device's, and the logits obey `bound`.
+/// Returns the largest |Δ logprob| over the compared candidates as a fraction of its golden
+/// bound (0 for [`TpBound::Bitwise`]).
 fn check_tp_against_one_device(
     what: &str,
     ranks: &[GreedyRun],
     want: &GreedyRun,
-    bound: f32,
-) -> f32 {
+    bound: TpBound,
+) -> f64 {
     for (rank, (tokens, rows)) in ranks.iter().enumerate() {
         assert!(
             rows == &ranks[0].1,
@@ -3465,15 +3510,36 @@ fn check_tp_against_one_device(
             "{what}: greedy tokens differ from one device"
         );
     }
-    let mut worst = 0f32;
+    let bounds = match bound {
+        TpBound::Bitwise => {
+            assert!(
+                ranks[0].1 == want.1,
+                "{what}: logits differ from one device"
+            );
+            return 0.0;
+        }
+        TpBound::Golden(b) => b,
+    };
+    let mut worst = 0f64;
     for (row, (got, w)) in ranks[0].1.iter().zip(&want.1).enumerate() {
-        let scale = w.iter().fold(0f32, |m, x| m.max(x.abs()));
-        let diff = max_abs_diff(got, w) / scale;
-        worst = worst.max(diff);
-        assert!(
-            diff <= bound,
-            "{what} row {row}: max |Δ logit| / max |logit| = {diff} > {bound}"
-        );
+        let (got, w) = (log_softmax(got), log_softmax(w));
+        let mut order: Vec<usize> = (0..w.len()).collect();
+        order.sort_by(|&a, &b| w[b].total_cmp(&w[a]));
+        for &cand in order.iter().take(bounds.top_k) {
+            let diff = (got[cand] - w[cand]).abs();
+            let limit = if w[cand] > bounds.likely_floor {
+                bounds.likely
+            } else {
+                bounds.tail
+            };
+            worst = worst.max(diff / limit);
+            assert!(
+                diff <= limit,
+                "{what} row {row} token {cand}: |Δ logprob| = {diff} > {limit} \
+                 (one device {:.4})",
+                w[cand]
+            );
+        }
     }
     worst
 }
@@ -3483,13 +3549,15 @@ fn check_tp_against_one_device(
 /// Q/K norm, 8 experts top-2, untied LM head) on the cpu-reference provider, split over 2 and 4
 /// ranks on the host collective (each rank its own host "device" and KV pool, fed the same
 /// batches on its own thread; tp 4 replicates the Llama KV heads), give one device's greedy
-/// tokens for a ragged two-sequence prefill and 16 batched decode steps, with logits within
-/// [`TP_MAX_SCALED_LOGIT_DIFF`] and bitwise equal on every rank; a group of one is bitwise one
-/// device. Breaks if any sharding rule, collective insertion point, vocabulary offset, the
-/// sharded norm or the logits reorder is wrong.
+/// tokens exactly for a ragged two-sequence prefill and 16 batched decode steps, with logits
+/// bitwise equal on every rank and every row's top-5 logprobs within the strict golden bounds
+/// ([`TpBound::Golden`]); a group of one is bitwise one device. Breaks if any sharding rule,
+/// collective insertion point, vocabulary offset, the sharded norm or the logits reorder is
+/// wrong.
 #[test]
 fn tp2_matches_tp1_on_host() {
     let tmp = TempDir::new("tiny-model-tp");
+    let golden = TpBound::Golden(GoldenLogprobBounds::llama());
     for spec in both_checkpoints(&tmp) {
         let name = spec.config.family.0.name();
         let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
@@ -3503,14 +3571,11 @@ fn tp2_matches_tp1_on_host() {
                 (mem, cpu_reference_provider())
             });
             let what = format!("{name} tp {world}");
-            // A group of one runs the tensor-parallel path with identity collectives: bitwise.
-            let bound = if world == 1 {
-                0.0
-            } else {
-                TP_MAX_SCALED_LOGIT_DIFF
-            };
+            let bound = if world == 1 { TpBound::Bitwise } else { golden };
             let worst = check_tp_against_one_device(&what, &ranks, &want, bound);
-            println!("tp2_matches_tp1_on_host {what}: max |Δ logit| / max |logit| {worst:e}");
+            println!(
+                "tp2_matches_tp1_on_host {what}: worst top-k |Δ logprob| / golden bound {worst:.3}"
+            );
         }
     }
 }
@@ -3518,7 +3583,8 @@ fn tp2_matches_tp1_on_host() {
 /// Lab only: the tensor-parallel path on the HIP provider without RCCL — the head_dim-128 tiny
 /// Llama split over two ranks, each its own context on the same GPU, through the host
 /// collective (which reaches any device memory), against one HIP context: identical greedy
-/// tokens and logits within [`TP_MAX_SCALED_LOGIT_DIFF`]. Proves the HIP shard loading, the
+/// tokens and top-5 logprobs within the strict golden bounds ([`TpBound::Golden`]). Proves the
+/// HIP shard loading, the
 /// `vocab_offset` embedding, the per-rank GEMM shapes, the all-reduce insertion points and the
 /// device-to-device logits reorder (kernel ABI v2.5 `turbine_memcpy_async`).
 #[test]
@@ -3538,8 +3604,9 @@ fn hip_tp2_matches_tp1() {
         let mem: Arc<dyn DeviceMemory> = ctx.clone();
         (mem, shim_provider(ctx))
     });
-    let worst = check_tp_against_one_device("hip tp 2", &ranks, &want, TP_MAX_SCALED_LOGIT_DIFF);
-    println!("hip_tp2_matches_tp1: max |Δ logit| / max |logit| {worst:e}");
+    let golden = TpBound::Golden(GoldenLogprobBounds::llama());
+    let worst = check_tp_against_one_device("hip tp 2", &ranks, &want, golden);
+    println!("hip_tp2_matches_tp1: worst top-k |Δ logprob| / golden bound {worst:.3}");
 }
 
 /// `spec`'s decoder on the cpu-reference provider over `mem`: one device (`rank: None`) or rank
