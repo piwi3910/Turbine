@@ -31,10 +31,14 @@
 //   qgemm (v2.9)                 0 hipblaslt_fp8 [hipblaslt] (FP8_TENSOR /
 //                                  FP8_CHANNEL weights, FP8_TENSOR /
 //                                  FP8_TOKEN activations)
+//                                1 turbine_hip_int4_wmma [turbine_hip],
+//                                2 turbine_hip_int4_dequant [turbine_hip]
+//                                  (INT4_GROUP_ZP / _SYM, BF16 activations)
 //   quantize_act (v2.9)          0 turbine_hip [turbine_hip] (FP8 modes)
 #include <string>
 
 #include "qgemm_impls.hpp"
+#include "qgemm_int4.hpp"
 #include "turbine_hip.hpp"
 
 namespace turbine_hip {
@@ -235,9 +239,22 @@ struct Impl {
   }
 };
 
+template <Int4Path Path> struct Int4 {
+  static bool supports(const void *d) {
+    return qgemm_int4_supports(static_cast<const turbine_qgemm_desc *>(d),
+                               Path);
+  }
+  static int32_t run(turbine_ctx *ctx, const void *d) {
+    return qgemm_int4_run(ctx, static_cast<const turbine_qgemm_desc *>(d),
+                          Path);
+  }
+};
+
 const ImplEntry kQGemm[] = {
     entry<Impl<turbine_qgemm_desc, qgemm_fp8_supports, qgemm_fp8_run>>(
         "hipblaslt_fp8", kHipblaslt),
+    entry<Int4<Int4Path::Wmma>>("turbine_hip_int4_wmma", kTurbine),
+    entry<Int4<Int4Path::Dequant>>("turbine_hip_int4_dequant", kTurbine),
 };
 const ImplEntry kQuantizeAct[] = {
     entry<Impl<turbine_quantize_act_desc, quantize_act_fp8_supports,
