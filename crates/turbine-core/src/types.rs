@@ -47,11 +47,18 @@ pub enum DType {
     F32,
     I32,
     I64,
+    /// FP8 e4m3 (OCP `e4m3fn`: no infinities, NaN = 0x7f / 0xff, max ±448) — FP8 weights and
+    /// the FP8 KV cache (Phase 6a).
+    F8E4M3,
+    /// Raw bytes: the storage of packed formats (INT4 / FP4 nibbles, E8M0 exponents), whose
+    /// meaning a quantization scheme describes (Phase 6a).
+    U8,
 }
 
 impl DType {
     pub fn size_bytes(self) -> usize {
         match self {
+            DType::F8E4M3 | DType::U8 => 1,
             DType::BF16 | DType::F16 => 2,
             DType::F32 | DType::I32 => 4,
             DType::I64 => 8,
@@ -64,6 +71,8 @@ impl DType {
             DType::F32 => 2,
             DType::I32 => 3,
             DType::I64 => 4,
+            DType::F8E4M3 => 16,
+            DType::U8 => 17,
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -73,7 +82,13 @@ impl DType {
             DType::F32 => "f32",
             DType::I32 => "i32",
             DType::I64 => "i64",
+            DType::F8E4M3 => "f8e4m3",
+            DType::U8 => "u8",
         }
+    }
+    /// True for raw storage whose element meaning comes from a quantization scheme.
+    pub fn is_packed_storage(self) -> bool {
+        matches!(self, DType::U8)
     }
 }
 
@@ -225,5 +240,45 @@ mod tests {
         assert_eq!(huge.bytes_per_token(), u64::MAX);
         assert_eq!(huge.block_bytes(), u64::MAX);
         assert_ne!(RequestId::new_v4(), RequestId::new_v4());
+    }
+
+    /// Phase 6a S-2: FP8 e4m3 and raw packed bytes take ABI codes 16 and 17 (the header's
+    /// reserved 16..63 range), one byte each; an FP8 KV page is half a BF16 one. Neither is a
+    /// float the CPU GEMM computes in, and `U8` alone is packed storage (INT4 / FP4 / E8M0).
+    /// Breaks if a code collides with the Phase 1 codes or a size is wrong.
+    #[test]
+    fn quant_dtypes() {
+        assert_eq!(
+            (
+                DType::F8E4M3.abi_code(),
+                DType::F8E4M3.size_bytes(),
+                DType::F8E4M3.as_str()
+            ),
+            (16, 1, "f8e4m3")
+        );
+        assert_eq!(
+            (
+                DType::U8.abi_code(),
+                DType::U8.size_bytes(),
+                DType::U8.as_str()
+            ),
+            (17, 1, "u8")
+        );
+        assert!(DType::U8.is_packed_storage());
+        assert!(!DType::F8E4M3.is_packed_storage());
+        assert!(!DType::BF16.is_packed_storage());
+        let bf16 = KvLayout {
+            num_layers: 28,
+            num_kv_heads: 8,
+            head_dim: 128,
+            dtype: DType::BF16,
+            block_tokens: 128,
+        };
+        let fp8 = KvLayout {
+            dtype: DType::F8E4M3,
+            ..bf16
+        };
+        assert_eq!(fp8.bytes_per_token() * 2, bf16.bytes_per_token());
+        assert_eq!(fp8.block_bytes(), 7_340_032);
     }
 }

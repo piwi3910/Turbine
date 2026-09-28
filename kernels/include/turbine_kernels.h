@@ -74,6 +74,11 @@ extern "C" {
 #define TURBINE_DTYPE_F32 2
 #define TURBINE_DTYPE_I32 3
 #define TURBINE_DTYPE_I64 4
+/* Phase 6a (quantized formats; used by the optional v2.9 group): FP8 e4m3 (OCP
+ * e4m3fn) and raw packed bytes (INT4 / FP4 nibbles, E8M0 exponents; the scheme
+ * gives the meaning). */
+#define TURBINE_DTYPE_F8E4M3 16
+#define TURBINE_DTYPE_U8 17
 
 typedef struct turbine_ctx turbine_ctx;
 
