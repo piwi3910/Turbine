@@ -432,4 +432,25 @@ mod tests {
         assert_eq!(after, want);
         assert_ne!(after, before);
     }
+
+    /// A layer stride whose extent overflows `usize` is refused, not a panic or a wrapped bound
+    /// (Scout 93a929a9 / 8df17681).
+    #[test]
+    fn copy_blocks_refuses_an_overflowing_layer_stride() {
+        let mem = HostMemory::new(DeviceId(0), 1 << 16) as Arc<dyn DeviceMemory>;
+        let cpu = cpu_reference_provider();
+        let buf = DeviceBuffer::alloc(&mem, 4096).expect("pool");
+        let err = cpu
+            .kv_copy()
+            .expect("kv_copy family")
+            .execute(&mut KvCopyContext {
+                pool: buf.whole(),
+                layer_stride_bytes: u64::MAX / 2,
+                block_bytes: 16,
+                num_layers: 3,
+                pairs: &[(BlockId(0), BlockId(1))],
+            })
+            .expect_err("an overflowing extent is refused");
+        assert!(err.to_string().contains("exceed"), "{err}");
+    }
 }
