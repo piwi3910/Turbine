@@ -947,9 +947,11 @@ Asked 2026-09-28. Tensor parallelism is not bit-exact with one device: each all-
 
 ## P5: PP activation hand-off, EP combine and the supported parallel combinations (implementation choices, 2026-09-28)
 
-Within the fold-in decision above (PP and EP in Phase 5, sharded DP skipped), the Phase 5 lead chose the following; they are in the spec (S-10 to S-14) and plan (Tasks 20–27) and stay open to the user:
+Within the fold-in decision above (PP and EP in Phase 5, sharded DP skipped), the Phase 5 lead proposed the following (spec S-10 to S-14, plan Tasks 20–27). Alternatives considered: EP all-to-all dispatch now; allowing TP × PP combinations.
 
 - PP hand-off: `Collective::send` / `recv` (point-to-point on the group's backend: `hostmem` slot, `ncclSend` / `ncclRecv` on RCCL, the host backend in tests) rather than the rank transport, so the hidden state never leaves the device path through a socket and `static` mode needs nothing new; PP runs in `local` mode only in Phase 5.
 - EP combine: tokens stay replicated on every EP rank (attention replicated at tp = 1, TP-sharded at tp = ep), so dispatch is a local selection and combine is one FP32 all-reduce in fixed rank order — the "all-gather + reduce-scatter" option; all-to-all dispatch between data-parallel attention ranks is deferred (it needs lockstep DP engines). The router runs identically on every rank, so its choices are exact.
 - Supported combinations in Phase 5: tp × dp; pp × dp with tp = ep = 1; ep × dp with tp ∈ {1, ep}. Anything else is refused at startup with `combination_unsupported:<modes>` (two cards cannot validate pp × tp).
 - PP stage placement on novanas's asymmetric slots: the last stage (logits or their device reduction, plus its KV tier copies) goes on the GPU with the fastest measured host link (GPU0, Gen5 x8), reason `pp_stage_host_traffic:<device>`.
+
+**Decision (user, 2026-09-28): all four accepted.** PP send / recv on the `hostmem` slots, with `ncclSend` / `ncclRecv` as the fallback, `local` mode only; EP with replicated tokens and an FP32 all-reduce combine, all-to-all deferred; the supported-combination set, everything else exits 2 at startup; the last PP stage on GPU0. Not taken: EP all-to-all now, TP × PP combinations.
