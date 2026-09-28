@@ -5,7 +5,7 @@ Spec: .procoder/specs/phase-5-multi-gpu.md
 
 ## Goal
 
-Let one Turbine process drive several GPUs: discover the node-local topology graph, abstract collectives behind a backend-neutral `Collective` trait with a host reference backend and one runtime-loaded NCCL-API binding (RCCL now, NCCL later), plan single-vendor TP groups and DP replicas from link classes, run TP (local and static rank modes) and DP behind one API, and account pressure per device, group and replica — proven on the novanas R9700 pair.
+Let one Turbine process drive several GPUs: discover the node-local topology graph, abstract collectives behind a backend-neutral `Collective` trait with a host reference backend and one runtime-loaded NCCL-API binding (RCCL now, NCCL later), plan single-vendor TP groups and DP replicas from link classes, run TP (local and static rank modes) and DP behind one API, and account pressure per device, group and replica — proven on the novanas R9700 pair. Amended 2026-09-28: single-node pipeline and expert parallelism (Tasks 22–27), a `hostmem` collective backend for the peer-less board (Task 21) and measured host-link costs for its asymmetric slots (Task 20).
 
 ## Architecture
 
@@ -21,7 +21,7 @@ Copied verbatim from the spec (Constraints):
 - Every queue is bounded (TS §21 rule 8): the leader→worker plan channel holds at most _parallel.plan_queue_depth_ plans (default 2); frames on the static-mode socket are capped at 16 MiB.
 - No collective call may block forever: communicator init is bounded by `parallel.collective.init_timeout` and each step's collectives by `parallel.collective.op_timeout`; on expiry the communicator is aborted, the group enters the phase-3 circuit breaker as `CIRCUIT_OPEN`, and the reason is logged.
 - Every automatic decision (device grouping, vendor choice, backend choice, replica routing, pressure state of a group) emits a structured log line with a reason code and a metric (TS §14, §21 rule 7).
-- Correctness before speed (TS §21 rule 1): TP=2 must meet the phase-1 golden tolerance (≥ 14/16 prompts with the first 32 greedy tokens identical, top-5 |Δlogprob| ≤ 0.15 nats against the committed HF transformers BF16 fixtures) at concurrency 1 and the batched bounds at concurrency 16, as for any batching change, before any TP performance work is accepted. That golden check is the TP accuracy bound (user decision 2026-09-28, "P5: tensor-parallel accuracy bound"): TP output is not bit-exact with tp = 1 and raw logits are not bounded, since each all-reduce rounds BF16 partial sums (~1 % relative logit drift, identical greedy tokens).
+- Correctness before speed (TS §21 rule 1): TP=2 must meet the phase-1 golden tolerance (≥ 14/16 prompts with the first 32 greedy tokens identical, top-5 |Δlogprob| ≤ 0.15 nats against the committed HF transformers BF16 fixtures) at concurrency 1 and the batched bounds at concurrency 16, as for any batching change, before any TP performance work is accepted; the same golden gate (c1 strict, c16 batched) holds for PP and EP. That golden check is the TP accuracy bound (user decision 2026-09-28, "P5: tensor-parallel accuracy bound"): TP output is not bit-exact with tp = 1 and raw logits are not bounded, since each all-reduce rounds BF16 partial sums (~1 % relative logit drift, identical greedy tokens).
 - Lab: Phase 5 hardware runs are on novanas only (k3s Job, `amd.com/gpu: 2`, `rust:1.97-trixie` image as in phase-0/phase-1 (CONFLICT C-7), hostPath `/opt/rocm/rocm` read-only; RCCL is `/opt/rocm/rocm/lib/librccl.so.1`). Ports are loopback inside the Job (HTTP 18000, static-mode leader 18100); no Service or host port is created. Read-only topology checks also run under `scripts/lab-test.sh dgx-spark`. Memory is capped by the phase-3 device budget.
 - Before any lab run that needs production workloads moved, GPUs emptied or memory freed on any host, the implementer asks the user first and waits; scripts never evict, scale or stop other workloads, and a Job that cannot be scheduled (GPUs in use) makes the script exit non-zero naming that reason.
 - With peer access disabled on novanas, RCCL uses host-staged transfers; the topology graph must report `p2p: disabled` rather than assume.
@@ -35,7 +35,7 @@ From the interface contract (`.procoder/contract/interfaces.md`, binding):
 - Kernel C ABI v2.6 (§9.1; decision "P5 T6", answer B, supersedes the planned v4): optional minor group with `turbine_stream_native_handle` and the ops `row_sumsq`, `rmsnorm_sharded` in the ROCm shim (CUDA on hold); `TURBINE_KERNELS_ABI_VERSION` stays 2, `TURBINE_ABI_MINOR` = 6; no `fill`.
 - Metric labels from closed enums; `device` and `replica` rendered as decimal indices; pressure states upper-case (CONFLICT C-5).
 - `/turbine/v1/scheduler` becomes an object keyed by replica index (`{"0": {…}}`); `/ready` adds `collective_init`, `loading_weights`, `rank_missing`; static-mode workers answer inference routes with 503 `not_leader`.
-- Lab: `scripts/lab-cluster.sh [--dry-run] <collbench-novanas|tp2-novanas|dp2-novanas>`, one k3s Job labelled `turbine-lab=true` in namespace `turbine-ci`; no `docker run` outside lab scripts.
+- Lab: `scripts/lab-cluster.sh [--dry-run] <collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|pp2-novanas|ep2-novanas>`, one k3s Job labelled `turbine-lab=true` in namespace `turbine-ci`; no `docker run` outside lab scripts.
 
 ## Task 1: `parallel` configuration section
 
@@ -364,3 +364,123 @@ Interfaces:
 - [ ] Run: `scripts/lab-test.sh novanas` (ASK THE USER FIRST: the Job requests one R9700 even though discovery is read-only) and `scripts/lab-test.sh dgx-spark` (correctness run: proceeds after the script's MemAvailable precondition) — expect PASS with log line `test topology_matches_host ... ok` on both.
 - [ ] Gate: cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 - [ ] Commit: `test(device): topology discovery matches novanas and dgx-spark`
+
+## Task 20: Host-link probe and measured edge costs
+
+Files: `crates/turbine-device/src/topology/{mod.rs,probe.rs}` (probe trait and edge attributes), `crates/turbine-server/src/startup.rs` (run the probe through the kernel library's v2.5 copy streams after discovery), `crates/turbine-distributed/src/plan.rs` (device ordering by measured cost), `crates/turbine-core/src/config/parallel.rs` (`parallel.topology.measure_links`), `crates/turbine-device/tests/lab.rs`
+Interfaces:
+
+- `pub trait LinkProbe { fn host_link(&mut self, device: DeviceId, bytes: u64) -> Result<LinkBandwidth, String>; }`, `pub struct LinkBandwidth { pub h2d_gbps: f64, pub d2h_gbps: f64 }`, `pub fn apply_link_probe(graph: &mut TopologyGraph, results: &BTreeMap<DeviceId, Result<LinkBandwidth, String>>)`; edge fields `measured_h2d_gbps`, `measured_d2h_gbps`, `cost_gbps: Option<f64>`, `source: measured`; metric `turbine_topology_link_gbps{device,direction}`
+  Covers: S-13; `topology::tests::measured_links_on_edges`, lab `topology_matches_host` with the probe
+  Depends on: Tasks 2, 10, 19
+
+- [ ] Write failing test `topology::tests::measured_links_on_edges` (the S-13 criterion). Run: `cargo test -p turbine-device topology::tests::measured_links_on_edges` — expect FAIL.
+- [ ] Implement the probe (≤ 64 MiB per direction per GPU, ≤ 2 s total, pinned host memory, median of 3), the edge attributes and the planner's use of them (TP/EP groups costed by the slowest member; PP placement input for Task 22).
+- [ ] Extend lab `topology_matches_host` with the probe: both GPUs measured > 0, GPU0 h2d ≥ GPU1 h2d on novanas. Run: `scripts/lab-test.sh novanas --gpus 2 -- -p turbine-device --test lab` — expect PASS.
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(device,distributed): measured host-link bandwidth on topology edges and in the planner`
+
+## Task 21: `hostmem` collective backend
+
+Files: `kernels/include/turbine_kernels.h` and `kernels/rocm/src/hostmem.hip` (ABI minor group v2.7: mapped host allocation, one-shot all-reduce / all-gather / reduce-scatter / send / recv kernels), `crates/turbine-kernels/src/{ffi.rs,shim.rs}` (bindings, host stub), `crates/turbine-distributed/src/collective/{hostmem.rs,mod.rs,conformance.rs,nccl_api.rs,ffi.rs}` (registry entry, `send` / `recv` on the trait, `ncclSend` / `ncclRecv`), `crates/turbine-distributed/src/bin/turbine-collbench.rs`, `scripts/lab-cluster.sh` (`collbench-hostmem-novanas`), `docs/extending/collective-backend.md`, `docs/extending/kernel-implementation.md`
+Interfaces:
+
+- `Collective::send(&self, buf, peer, stream)`, `Collective::recv(&self, buf, peer, stream)`; registry `COLLECTIVE_BACKENDS` = `host`, `rccl`, `nccl`, `hostmem`; config `parallel.collective.hostmem_max_bytes`; metric `turbine_collective_route_total{op,backend,reason}`; kernel ABI `TURBINE_ABI_MINOR` = 7 (optional group)
+  Covers: S-14, S-2 (send / recv); `collective::hostmem::tests::matches_host_backend`, lab `collbench-hostmem-novanas`
+  Depends on: Tasks 4, 5, 6, 7, 8; user decision 2026-09-28 "P5: small-message all-reduce latency on novanas — host-memory all-reduce?"
+
+- [ ] Write failing test `collective::hostmem::tests::matches_host_backend` (the S-14 criterion) over the host stub of the v2.7 group. Run: `cargo test -p turbine-distributed collective::hostmem::tests::matches_host_backend` — expect FAIL.
+- [ ] Implement the v2.7 group in the ROCm shim, the bindings, the backend (fixed rank-order FP32 reduction, sequence-numbered flags with system-scope release/acquire, double-buffered slots, bounded spin tied to the op timeout and `step_begin` / `step_end`, abort releases a spinning peer, RCCL above the threshold with a reason code), `send` / `recv` on every backend, and the conformance cases.
+- [ ] Lab: `scripts/lab-test.sh novanas --gpus 2 --tier quick -- -p turbine-distributed` (bit-exact on both ranks, missing peer times out), then `scripts/bench-lock.sh scripts/lab-cluster.sh collbench-hostmem-novanas`; upload the rccl vs hostmem latency table to labbook (set `phase-5-multi-gpu`, type `turbine-collbench`), labelled "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(kernels,distributed): hostmem collective backend over mapped pinned host memory (ABI v2.7)`
+
+## Task 22: Pipeline partitioner, stage placement and the plan's parallel modes
+
+Files: `crates/turbine-distributed/src/{pipeline.rs,plan.rs}`, `crates/turbine-core/src/config/parallel.rs` (`pipeline_parallel_size`, `pipeline.layer_split`, `pipeline.micro_batches`, `expert_parallel_size`, `expert.placement`), `crates/turbine-server/src/parallel.rs` (`check_executable`), `crates/turbine-server/tests/server_cli.rs`
+Interfaces:
+
+- `pub struct StageSpec { pub stage: u32, pub device: DeviceId, pub layers: Range<u32>, pub embedding: bool, pub lm_head: bool }`, `pub fn partition(costs: &[LayerCost], stages: u32, split: Option<&[u32]>) -> Result<Vec<Range<u32>>, PlanError>`, `pub fn place_stages(ranges: &[Range<u32>], devices: &[DeviceId], graph: &TopologyGraph) -> (Vec<StageSpec>, Vec<PlanReason>)`; `ParallelPlan` gains `pp`, `ep`, `stages`, `experts`; reason codes of the spec's Data section
+  Covers: S-10, S-12; `pipeline::tests::{partition_balances_cost, explicit_split_validated, last_stage_on_fastest_link}`, `plan::tests::parallel_modes`, `server_cli unsupported_parallel_combination_exits_2`
+  Depends on: Tasks 1, 10, 11, 20
+
+- [ ] Write failing tests `pipeline::tests::partition_balances_cost`, `explicit_split_validated`, `last_stage_on_fastest_link`, `plan::tests::parallel_modes`, `server_cli unsupported_parallel_combination_exits_2` (the spec criteria). Run each — expect FAIL.
+- [ ] Implement the config keys and their validation, the cost-balanced partition, stage placement by measured host-link cost (the last stage on the fastest link), and the combination rules of S-12 refused before bind.
+- [ ] Run the five tests — expect PASS.
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(distributed,core): pipeline partitioner, stage placement and the parallel-mode rules`
+
+## Task 23: Pipeline stages in `turbine-model`
+
+Files: `crates/turbine-model/src/pp.rs` (stage config, weight slots of a layer range, stage executor with `send` / `recv` of the hidden state), `crates/turbine-model/src/executor/decoder.rs` (layer range, optional embedding / LM head), `crates/turbine-model/tests/tiny_model.rs`
+Interfaces:
+
+- `pub struct PpContext { pub stage: u32, pub stages: u32, pub layers: Range<u32>, pub collective: Arc<dyn Collective>, pub stream: StreamRef }`; `pp::weight_slots(cfg, &StageSpec)`, `pp::kv_layout(cfg, layers, block_tokens)`, `pp::build_executor(...)`; a non-last stage's `forward` returns no logits (its output is sent to the next stage)
+  Covers: S-10; `tiny_model pp2_matches_pp1_on_host`
+  Depends on: Tasks 17, 21 (`send` / `recv`), 22
+
+- [ ] Write failing test `tiny_model pp2_matches_pp1_on_host` (the S-10 criterion; bitwise equal logits). Run: `cargo test -p turbine-model --test tiny_model pp2_matches_pp1_on_host` — expect FAIL.
+- [ ] Implement stage loading (only the stage's layers; tied embeddings on the first and last stage), the stage executor and the hidden-state hand-off.
+- [ ] Run the test — expect PASS; `scripts/lab-test.sh novanas --tier quick -- -p turbine-model --test tiny_model` for the HIP variant `hip_pp2_matches_pp1`.
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(model): pipeline stages over the collective's point-to-point pair`
+
+## Task 24: Micro-batched pipeline in the engine and the PP lab run
+
+Files: `crates/turbine-scheduler/src/pipeline.rs` and `crates/turbine-scheduler/tests/sim.rs` (micro-batch assignment in the deterministic simulator), `crates/turbine-server/src/engine/{pp.rs,loop.rs}` (stage threads, bounded in-flight micro-batches, per-stage KV pools), `crates/turbine-server/src/{startup.rs,kv_orchestrator.rs}` (per-stage KV shards of unequal size), `scripts/lab/phase5-novanas-pp2.yaml`, `scripts/lab-cluster.sh` (`pp2-novanas`)
+Interfaces:
+
+- `pub struct MicroBatchPlan { pub micro_batch: u32, pub seqs: Vec<SeqId> }`; metrics `turbine_pipeline_stage_duration_seconds{stage}`, `turbine_pipeline_bubble_ratio`; `/turbine/v1/scheduler` `pipeline` section
+  Covers: S-10, S-9; `sim pipeline_micro_batches_overlap`, lab `pp2-novanas`
+  Depends on: Tasks 17, 22, 23; T17b (per-rank KV tier copies)
+
+- [ ] Write failing test `sim pipeline_micro_batches_overlap` (the S-10 criterion). Run: `cargo test -p turbine-scheduler --test sim pipeline_micro_batches_overlap` — expect FAIL.
+- [ ] Implement micro-batch assignment compatible with continuous batching and chunked prefill (a sequence's next step enters stage 0 only after its token was sampled), stage threads with bounded queues, cancellation freeing blocks on every stage, stage failure → `replica_failed` and `CIRCUIT_OPEN`, per-stage KV tier shards.
+- [ ] Run the test and `cargo test -p turbine-server` — expect PASS.
+- [ ] Lab: `scripts/bench-lock.sh scripts/lab-cluster.sh pp2-novanas` — golden c1 / c16, then the standard workload at c16 and c32 beside tp 2 and dp 2; upload to labbook (`turbine-parallel-serving`), labelled "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(scheduler,server): micro-batched pipeline parallelism and the pp2 lab run`
+
+## Task 25: Expert placement and the EP provider evaluation
+
+Files: `crates/turbine-distributed/src/expert.rs` (placement map, validation, per-rank token counts), `.procoder/ask/decisions.md` (provider evaluation: CK `moe_sorting` local-expert mask, vLLM `fused_moe` `expert_map`, llama.cpp MoE, the Phase 2 providers with a global→local map)
+Interfaces:
+
+- `pub struct ExpertPlacement { pub layers: Vec<Vec<u32>> }` (rank per expert), `pub fn contiguous(num_experts: u32, layers: u32, ep: u32) -> Result<ExpertPlacement, PlanError>`, `pub fn from_file(path, num_experts, layers, ep)`, `pub fn local_experts(&self, layer, rank) -> Vec<u32>`
+  Covers: S-11; `expert::tests::placement_map_valid`
+  Depends on: Task 22
+
+- [ ] Write failing test `expert::tests::placement_map_valid` (the S-11 criterion). Run: `cargo test -p turbine-distributed expert::tests::placement_map_valid` — expect FAIL.
+- [ ] Implement the placement map; measure the candidate providers for the expert-subset GEMMs on one R9700 (`scripts/lab-test.sh novanas --tier perf` under bench-lock) and record the evaluation with a recommendation.
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(distributed): expert placement map; docs(decisions): EP provider evaluation`
+
+## Task 26: Expert-parallel OLMoE in `turbine-model`
+
+Files: `crates/turbine-model/src/ep.rs` (weight slots of the rank's experts, `EpContext`), `crates/turbine-model/src/executor/decoder.rs` (MoE layer: local expert selection, combine all-reduce in fixed rank order), `crates/turbine-model/tests/tiny_model.rs`
+Interfaces:
+
+- `pub struct EpContext { pub rank: u32, pub world: u32, pub placement: Arc<ExpertPlacement>, pub collective: Arc<dyn Collective>, pub stream: StreamRef }`; composes with `TpContext` when tp = ep
+  Covers: S-11; `tiny_model ep2_matches_ep1_on_host`
+  Depends on: Tasks 17, 25
+
+- [ ] Write failing test `tiny_model ep2_matches_ep1_on_host` (the S-11 criterion). Run: `cargo test -p turbine-model --test tiny_model ep2_matches_ep1_on_host` — expect FAIL.
+- [ ] Implement expert-sharded loading, the local-expert MoE path over the provider chosen in Task 25, the FP32 combine all-reduce, and per-rank / per-expert token counts.
+- [ ] Run the test — expect PASS; `scripts/lab-test.sh novanas --tier quick -- -p turbine-model --test tiny_model` for `hip_ep2_matches_ep1`.
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(model): expert-parallel OLMoE over the collective trait`
+
+## Task 27: EP serving and the EP lab run
+
+Files: `crates/turbine-server/src/{startup.rs,parallel.rs,engine/tp.rs}` (EP groups reuse the TP group runtime), `crates/turbine-api` (the `expert` section of `/turbine/v1/scheduler`), `scripts/lab/phase5-novanas-ep2.yaml`, `scripts/lab-cluster.sh` (`ep2-novanas`)
+Interfaces:
+
+- metrics `turbine_expert_rank_tokens_total{rank}`, `turbine_expert_imbalance_ratio`; `/turbine/v1/status` `parallel.ep` and `experts`
+  Covers: S-11, S-9; lab `ep2-novanas`
+  Depends on: Tasks 17, 26
+
+- [ ] Write failing test `tiny_server ep2_serves_like_ep1` on the cpu backend (greedy completion tokens identical to ep 1, the `expert` section present). Run: `cargo test -p turbine-server --test tiny_server ep2_serves_like_ep1` — expect FAIL.
+- [ ] Implement EP group start-up (per-rank expert shards, replicated or TP-sharded attention), diagnostics and metrics.
+- [ ] Lab: `scripts/bench-lock.sh scripts/lab-cluster.sh ep2-novanas` — OLMoE golden c1 / c16, both ranks' token counts non-zero, the standard workload beside tp 2 and dp 2; upload to labbook, labelled "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(server): expert-parallel serving and the ep2 lab run`

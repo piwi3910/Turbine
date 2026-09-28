@@ -944,3 +944,12 @@ Asked 2026-09-28. Tensor parallelism is not bit-exact with one device: each all-
 - C) bit-exact TP against tp 1 (a fixed-order FP32 reduction of full partial sums; costs bandwidth and still differs in GEMM shapes)
 
 **Decision (user, 2026-09-28): A.** The spec's and plan's 1e-4 logit bound is replaced by the golden check (c1 strict, c16 batched) for tp 2 serving; `tiny_model tp2_matches_tp1_on_host` and the lab `hip_tp2_matches_tp1` require exactly identical greedy tokens, bitwise-identical logits on every rank, and each row's top-5 logprobs (of tp 1) within the strict bounds of `tests/golden/llama-3.2-3b-instruct/tolerance.json` (0.15 above logprob −2, 0.55 below); a group of one stays bitwise equal to one device.
+
+## P5: PP activation hand-off, EP combine and the supported parallel combinations (implementation choices, 2026-09-28)
+
+Within the fold-in decision above (PP and EP in Phase 5, sharded DP skipped), the Phase 5 lead chose the following; they are in the spec (S-10 to S-14) and plan (Tasks 20–27) and stay open to the user:
+
+- PP hand-off: `Collective::send` / `recv` (point-to-point on the group's backend: `hostmem` slot, `ncclSend` / `ncclRecv` on RCCL, the host backend in tests) rather than the rank transport, so the hidden state never leaves the device path through a socket and `static` mode needs nothing new; PP runs in `local` mode only in Phase 5.
+- EP combine: tokens stay replicated on every EP rank (attention replicated at tp = 1, TP-sharded at tp = ep), so dispatch is a local selection and combine is one FP32 all-reduce in fixed rank order — the "all-gather + reduce-scatter" option; all-to-all dispatch between data-parallel attention ranks is deferred (it needs lockstep DP engines). The router runs identically on every rank, so its choices are exact.
+- Supported combinations in Phase 5: tp × dp; pp × dp with tp = ep = 1; ep × dp with tp ∈ {1, ep}. Anything else is refused at startup with `combination_unsupported:<modes>` (two cards cannot validate pp × tp).
+- PP stage placement on novanas's asymmetric slots: the last stage (logits or their device reduction, plus its KV tier copies) goes on the GPU with the fastest measured host link (GPU0, Gen5 x8), reason `pp_stage_host_traffic:<device>`.
