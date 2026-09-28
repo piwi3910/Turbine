@@ -936,3 +936,10 @@ Context: comparing vLLM and SGLang, four SGLang ideas are missing from Turbine: 
 **Answer (2026-09-28, user): A.**
 
 Consequences: `phase-5p-serving-efficiency` is specced when Phase 5 has merged (spec and plan written then, under the usual chain) and runs before `phase-6-quantization`. Order inside it: (4) measurement first (host share of a step at c1 and c16 on Llama and OLMoE; build overlap scheduling only if the host share exceeds 5 % at c1), then (1), (2), (3), each landed alone with `scripts/lab-bench.sh` (golden c1 + throughput) and, for (1) and (2), the Phase 4 multi-turn profile (`cached_tokens_ratio`, later-turn TTFT) before and after. Constraints: (1) must keep the Phase 4 tiers (L1/L2 hold full blocks; a partial block is L0-only or copied whole) and the prefix-exact prefill invariance (the #1 follow-up), and Phase 7's hybrid recurrent state can be cached only at block boundaries, which the phase-7 spec handles; (2) is a registered scheduling policy with its conformance suite and a deterministic simulator test for starvation; (3) must keep outputs identical to token-by-token decoding under greedy (golden JSON-schema cases) and handle retokenization at the forced-span boundary.
+
+## Startup time in the Turbine vs vLLM comparison package (2026-09-28)
+
+Measured on novanas today (Llama-3.2-3B, TP 2): Turbine is ready 6–8 s after process start; vLLM-ROCm needs ~98 s (≈124 s from pod start), mostly spawning workers, torch.compile (11 s) and graph capture (49 s); weight loading is ~2.5 s for both.
+
+- Add `startup_s` (process start → /ready 200) as a data point to `engine-comparison-multi-gpu` for every run, both engines (recommended)
+- Leave it out; mention it only in the set conclusion
