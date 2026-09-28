@@ -34,6 +34,7 @@ fn format() -> KvFormat {
             block_tokens: 16,
         },
         shards: 1,
+        scales: None,
     }
 }
 

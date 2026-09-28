@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use half::bf16;
-use turbine_core::types::{BlockId, DeviceId, KvLayout, SeqId};
+use turbine_core::types::{BlockId, DType, DeviceId, KvLayout, SeqId};
 use turbine_distributed::collective::{Collective, HostCollective};
+use turbine_kernels::cpu::quant::{fp8_e4m3_round, fp8_e4m3_value};
 use turbine_kernels::torch_topk;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -30,6 +31,7 @@ use turbine_model::executor::{
     TokenFeed, TraceTensor, build_executor, graphs,
 };
 use turbine_model::families;
+use turbine_model::kv_scales::KvCache;
 use turbine_model::pp;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
@@ -217,6 +219,9 @@ struct Naive {
     renormalize: bool,
     /// Round the router logits to BF16 (transformers' BF16 router linear); likewise.
     bf16_router: bool,
+    /// FP8 KV (Phase 6a S-13): K after RoPE and V quantize-dequantized with each layer's
+    /// scales before attention; from the config's `kv_cache`.
+    kv_fp8: Option<KvCache>,
 }
 
 impl Naive {
@@ -240,6 +245,7 @@ impl Naive {
             qk_norm: cfg.qk_norm,
             renormalize: cfg.moe.is_some_and(|m| m.norm_topk_prob),
             bf16_router: true,
+            kv_fp8: cfg.kv_cache.is_fp8().then(|| cfg.kv_cache.clone()),
         }
     }
 
@@ -419,13 +425,18 @@ impl Naive {
             let h = self.rmsnorm(&x, w("input_layernorm"));
             let mut q = Naive::linear_bf(&h, w("self_attn.q_proj"), hidden);
             let mut k = Naive::linear_bf(&h, w("self_attn.k_proj"), hidden);
-            let v = Naive::linear_bf(&h, w("self_attn.v_proj"), hidden);
+            let mut v = Naive::linear_bf(&h, w("self_attn.v_proj"), hidden);
             if self.qk_norm {
                 q = self.rmsnorm(&q, w("self_attn.q_norm"));
                 k = self.rmsnorm(&k, w("self_attn.k_norm"));
             }
             self.rope(&mut q, c.num_attention_heads as usize);
             self.rope(&mut k, c.num_kv_heads as usize);
+            if let Some(kv) = &self.kv_fp8 {
+                let l = layer as usize;
+                fp8_quantize_dequantize(&mut k, kv.k_scale(l));
+                fp8_quantize_dequantize(&mut v, kv.v_scale(l));
+            }
             let attn = self.attention(&q, &k, &v, t);
             let o = Naive::linear_bf(&attn, w("self_attn.o_proj"), q_dim);
             x = x.iter().zip(&o).map(|(a, b)| bf(a + b)).collect();
@@ -444,6 +455,14 @@ impl Naive {
             self.get("lm_head.weight")
         };
         Naive::linear(&last, head, hidden)
+    }
+}
+
+/// `x ← e4m3(x / scale) · scale` element by element: a page write and read (OCP e4m3fn, ties to
+/// even, saturated at ±448).
+fn fp8_quantize_dequantize(x: &mut [f32], scale: f32) {
+    for v in x {
+        *v = fp8_e4m3_value(fp8_e4m3_round(*v / scale)) * scale;
     }
 }
 
@@ -733,6 +752,116 @@ fn requirements_and_workspace() {
     );
     // Fixed: the extra q_indptr entry and inv_freq [head_dim / 2] f32.
     assert_eq!(ws(1, 1) - per_token - (ws(1, 2) - ws(1, 1)), 4 + 4 * 8);
+}
+
+/// Adds per-layer `self_attn.k_scale` / `v_scale` scalars (BF16, as a compressed-tensors
+/// checkpoint with a `kv_cache_scheme` stores them) to the tiny checkpoint in `dir`.
+fn add_kv_scales(dir: &Path, k: &[f32], v: &[f32]) {
+    let path = dir.join("model.safetensors");
+    let bytes = std::fs::read(&path).expect("read safetensors");
+    let st = safetensors::SafeTensors::deserialize(&bytes).expect("parse safetensors");
+    let mut owned: Vec<(String, safetensors::Dtype, Vec<usize>, Vec<u8>)> = st
+        .tensors()
+        .into_iter()
+        .map(|(n, t)| (n, t.dtype(), t.shape().to_vec(), t.data().to_vec()))
+        .collect();
+    for (layer, (&ks, &vs)) in k.iter().zip(v).enumerate() {
+        for (name, s) in [("k_scale", ks), ("v_scale", vs)] {
+            owned.push((
+                format!("model.layers.{layer}.self_attn.{name}"),
+                safetensors::Dtype::BF16,
+                vec![],
+                bf16::from_f32(s).to_le_bytes().to_vec(),
+            ));
+        }
+    }
+    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = owned
+        .iter()
+        .map(|(n, d, s, b)| {
+            let view = safetensors::tensor::TensorView::new(*d, s.clone(), b).expect("view");
+            (n.clone(), view)
+        })
+        .collect();
+    let out = safetensors::serialize(views, None).expect("serialize");
+    std::fs::write(&path, out).expect("write safetensors");
+}
+
+/// Prefill and 10 greedy decode steps of `spec` with FP8 KV (`kv_cache`) on the CPU provider:
+/// logits within 1e-4 of the naive model quantize-dequantizing K and V with the same scales,
+/// and far from the naive model with the wrong scales (`wrong`), so a page written or read with
+/// another layer's, the other half's or no scale fails.
+fn check_fp8_kv(spec: &TinySpec, kv_cache: KvCache, wrong: KvCache) {
+    let mut fp8 = spec.clone();
+    fp8.config.kv_cache = kv_cache;
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = cpu_model(&fp8, &mem, MAX_SEQ_LEN);
+    let layout = *exec.kv_layout();
+    assert_eq!(layout.dtype, DType::F8E4M3);
+    assert_eq!(
+        2 * layout.block_bytes(),
+        spec.config.kv_layout(BLOCK_TOKENS).block_bytes(),
+        "FP8 pages are half the BF16 bytes"
+    );
+    let mut kv = SequenceKv::new(&mem, layout, MAX_SEQ_LEN).expect("kv");
+    let naive = Naive::load(&fp8.dir, &fp8.config);
+
+    let mut tokens = prompt(fp8.vocab);
+    let positions: Vec<u32> = (0..tokens.len() as u32).collect();
+    let mut row = kv
+        .forward(exec.as_mut(), &tokens, &positions)
+        .expect("prefill")
+        .row(0)
+        .to_vec();
+    let name = &fp8.config.hf_architecture;
+    let diff = max_abs_diff(&row, &naive.logits(&tokens));
+    assert!(diff <= 1e-4, "{name} prefill: max abs diff {diff}");
+    for step in 0..10 {
+        let next = argmax(&row);
+        let pos = tokens.len() as u32;
+        tokens.push(next);
+        row = kv
+            .forward(exec.as_mut(), &[next], &[pos])
+            .expect("decode")
+            .row(0)
+            .to_vec();
+        let diff = max_abs_diff(&row, &naive.logits(&tokens));
+        assert!(
+            diff <= 1e-4,
+            "{name} decode step {step}: max abs diff {diff}"
+        );
+    }
+    let mut other = Naive::load(&fp8.dir, &fp8.config);
+    other.kv_fp8 = wrong.is_fp8().then_some(wrong);
+    let diff = max_abs_diff(&row, &other.logits(&tokens));
+    assert!(diff > 1e-3, "{name}: the scales change nothing ({diff})");
+}
+
+/// Phase 6a S-13: `kv.dtype: fp8_e4m3` on the CPU provider, tiny Llama and OLMoE. Without
+/// checkpoint scales every scale is 1.0 (and BF16 KV is measurably different); with the
+/// checkpoint's per-layer `k_scale` / `v_scale` those are read and used (and K and V swapped
+/// is measurably different). Breaks if a page is written or read with the wrong scale.
+#[test]
+fn fp8_kv_matches_reference() {
+    let tmp = TempDir::new("tiny-model-fp8-kv");
+    for spec in both_checkpoints(&tmp) {
+        let layers = spec.config.num_layers as usize;
+        let index = SafetensorsIndex::open(&spec.dir).expect("index");
+        let unit = KvCache::fp8_from_checkpoint(&index, spec.config.num_layers).expect("scales");
+        assert!(unit.is_fp8());
+        assert_eq!(&unit.k_scales[..], vec![1.0; layers].as_slice());
+        assert_eq!(&unit.v_scales[..], vec![1.0; layers].as_slice());
+        check_fp8_kv(&spec, unit, KvCache::bf16());
+
+        // BF16 values (stored exactly in the checkpoint), not powers of two (those only move
+        // the e4m3 range), different for K and V in every layer.
+        let k: Vec<f32> = (0..layers).map(|l| bf(0.07 * (l + 1) as f32)).collect();
+        let v: Vec<f32> = (0..layers).map(|l| bf(0.11 / (l + 1) as f32)).collect();
+        add_kv_scales(&spec.dir, &k, &v);
+        let index = SafetensorsIndex::open(&spec.dir).expect("index");
+        let read = KvCache::fp8_from_checkpoint(&index, spec.config.num_layers).expect("scales");
+        assert_eq!((&read.k_scales[..], &read.v_scales[..]), (&k[..], &v[..]));
+        check_fp8_kv(&spec, read, KvCache::fp8_e4m3(v.clone(), k.clone()));
+    }
 }
 
 /// One pool shared by the paged tests: `blocks` blocks of `layout`.

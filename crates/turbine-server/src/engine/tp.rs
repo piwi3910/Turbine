@@ -1823,6 +1823,7 @@ mod tests {
                 clock: Arc::clone(&clock),
                 metrics: metrics.kv.clone(),
                 remote: loaded.remote_tiers.take(),
+                kv_scales: None,
             },
             &mut pool,
         )

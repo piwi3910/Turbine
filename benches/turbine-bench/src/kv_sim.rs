@@ -316,6 +316,7 @@ impl Engine {
                 dtype: KvDtype::Bf16,
                 layout,
                 shards: 1,
+                scales: None,
             },
             args.l0_blocks,
             l1.clone(),

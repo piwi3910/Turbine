@@ -298,6 +298,7 @@ pub fn spawn(
                     clock: Arc::clone(&clock),
                     metrics: metrics.kv.clone(),
                     remote: loaded.remote_tiers.take(),
+                    kv_scales: crate::kv_orchestrator::scale_hashes(&prepared.arch.kv_cache),
                 },
                 &mut pool,
             );

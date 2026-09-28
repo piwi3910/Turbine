@@ -12,8 +12,10 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Instant;
 
-use turbine_core::config::{ByteSize, Config, ReliabilityConfig, StructuredOutputConfig};
-use turbine_core::types::{DeviceId, KvLayout, MemoryKind, ModelIdentity, SeqId};
+use turbine_core::config::{
+    ByteSize, Config, KvDtypeChoice, ReliabilityConfig, StructuredOutputConfig,
+};
+use turbine_core::types::{DType, DeviceId, KvLayout, MemoryKind, ModelIdentity, SeqId};
 use turbine_device::DeviceInventory;
 use turbine_device::telemetry::proc::FsProc;
 use turbine_device::telemetry::read_host;
@@ -21,8 +23,8 @@ use turbine_kernels::backends::{
     self, BackendNote, BackendRequest, ExecutionBackend, OpenedBackend,
 };
 use turbine_kernels::{
-    KernelError, KernelMetrics, KernelProvider, KernelRegistry, ShimContext,
-    TURBINE_OPTION_GEMM_AUTOTUNE,
+    KernelError, KernelMetrics, KernelProvider, KernelRegistry, OpConfig, OpRequirement,
+    ShimContext, TURBINE_OPTION_GEMM_AUTOTUNE,
 };
 use turbine_kv::metrics::log_pool_startup;
 use turbine_kv::{BlockPool, BlockPoolConfig};
@@ -32,6 +34,7 @@ use turbine_model::executor::{
     SeqSlice, graphs,
 };
 use turbine_model::formats::{self, BoundToolFormat, ToolFormat};
+use turbine_model::kv_scales::KvCache;
 use turbine_model::loader::LoadedWeights;
 use turbine_model::pp;
 use turbine_model::tp::{self, ShardSpec};
@@ -78,6 +81,59 @@ fn model_error(context: &str, e: ModelError) -> StartupError {
 
 fn kernel_error(context: &str, e: KernelError) -> StartupError {
     StartupError::new(format!("{context}: {e}"))
+}
+
+/// The L0 KV format of `kv.dtype` (Phase 6a S-13): BF16, or FP8 e4m3 with the checkpoint's
+/// per-layer `k_scale` / `v_scale` (1.0 when it stores none; user decision 2026-09-28, Q10).
+fn kv_cache(
+    config: &Config,
+    index: &SafetensorsIndex,
+    num_layers: u32,
+) -> Result<KvCache, StartupError> {
+    if config.kv.dtype != KvDtypeChoice::Fp8E4m3 {
+        return Ok(KvCache::bf16());
+    }
+    let cache = KvCache::fp8_from_checkpoint(index, num_layers)
+        .map_err(|e| model_error("kv.dtype fp8_e4m3 scales", e))?;
+    let from_checkpoint = cache
+        .k_scales
+        .iter()
+        .chain(cache.v_scales.iter())
+        .any(|&s| s != 1.0);
+    tracing::info!(
+        event = "kv_dtype",
+        dtype = config.kv.dtype.as_str(),
+        checkpoint_scales = from_checkpoint,
+        "L0 KV pages are FP8 e4m3 with per-layer scales{}",
+        if from_checkpoint {
+            " from the checkpoint"
+        } else {
+            " of 1.0"
+        }
+    );
+    Ok(cache)
+}
+
+/// `kv.dtype: fp8_e4m3` needs FP8 paged attention: exit 1 `kv_fp8_unavailable` before any
+/// weight is read when no provider in the selection order runs it (a kernel library below ABI
+/// v2.9, or one without FP8 pages at this shape).
+fn check_fp8_attention(
+    requirements: &[OpRequirement],
+    ordered: &[Arc<dyn KernelProvider>],
+) -> Result<(), StartupError> {
+    for r in requirements {
+        if let OpConfig::Attention(a) = &r.spec
+            && a.dtype == DType::F8E4M3
+            && !ordered.iter().any(|p| r.spec.supported_by(p.as_ref()))
+        {
+            return Err(StartupError::new(format!(
+                "kv_fp8_unavailable: kv.dtype fp8_e4m3 needs FP8 paged attention ({} {}), which \
+                 no kernel provider in the selection order implements",
+                r.op, r.config
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `model.served_name` default: `<org>/<name>` for a Hugging Face cache snapshot
@@ -430,7 +486,7 @@ fn prepare_with(
             dir.display()
         )));
     }
-    let arch = load_model_config_with(dir, config.model.rope_scaling.as_ref())
+    let mut arch = load_model_config_with(dir, config.model.rope_scaling.as_ref())
         .map_err(|e| model_error("model config", e))?;
     let generation = if dir.join("generation_config.json").is_file() {
         load_generation_config(dir).map_err(|e| model_error("generation config", e))?
@@ -456,6 +512,7 @@ fn prepare_with(
     let index = SafetensorsIndex::open(dir).map_err(|e| model_error("weights", e))?;
     arch.check_supported_weights(&index)
         .map_err(|e| model_error("weights", e))?;
+    arch.kv_cache = kv_cache(config, &index, arch.num_layers)?;
 
     if !config.kv.gpu.enabled {
         return Err(StartupError::new(
@@ -546,6 +603,7 @@ fn prepare_with(
     {
         requirements.push(reduce);
     }
+    check_fp8_attention(&requirements, &ordered)?;
     let registry = KernelRegistry::build(
         opened.providers.clone(),
         &opened.order,

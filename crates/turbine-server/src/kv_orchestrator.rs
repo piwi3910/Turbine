@@ -50,14 +50,15 @@ use turbine_core::config::KvConfig;
 use turbine_core::request::SessionHints;
 use turbine_core::telemetry::{StorageProbe, StorageSample};
 use turbine_core::types::{
-    BlockId, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, Priority, RequestId,
+    BlockId, DType, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, Priority,
+    RequestId,
 };
 use turbine_kv::document::HitWindow;
 use turbine_kv::hierarchy::{
     AttachOutcome, AttachRequest, HierarchyConfig, KvHierarchy, KvReclaimHandle, PrefetchAccepted,
     PrefetchError, PrefetchTarget, PrefixAttach,
 };
-use turbine_kv::identity::{KvFormat, KvKey, namespace_key};
+use turbine_kv::identity::{KvFormat, KvKey, KvScaleHashes, namespace_key};
 use turbine_kv::metrics::EvictReason;
 use turbine_kv::planner::PathCost;
 use turbine_kv::tier::{
@@ -66,6 +67,7 @@ use turbine_kv::tier::{
 };
 use turbine_kv::transfer::{TransferBackend, TransferPath, TransferTicket};
 use turbine_kv::{BlockPool, KvDocument, KvMetrics};
+use turbine_model::kv_scales::KvCache;
 use turbine_tensor::{
     CopyEngine, CopyTarget, CopyTicket, DeviceMemory, DevicePtr, PinnedBuffer, PinnedMemory,
 };
@@ -158,9 +160,45 @@ impl StorageProbe for L2StorageProbe {
     }
 }
 
-/// The KV format of `layout` on one device (KV is BF16 only before Phase 8a).
+/// The KV format of `layout` on one device: BF16 pages, or FP8 e4m3 pages with per-layer
+/// scales (`kv.dtype: fp8_e4m3`, Phase 6a S-13; the scales join in [`KvOrchestrator::start`]
+/// from [`KvStart::kv_scales`]). Lower tiers store the L0 page bytes as they are (S-14).
 pub fn kv_format(layout: KvLayout) -> KvFormat {
-    KvFormat::single(KvDtype::Bf16, layout)
+    let dtype = if layout.dtype == DType::F8E4M3 {
+        KvDtype::Fp8E4m3PerTensorScale
+    } else {
+        KvDtype::Bf16
+    };
+    KvFormat::single(dtype, layout)
+}
+
+/// `format` scoped by the model's FP8 KV scales (Phase 6a S-16): required for FP8 pages,
+/// refused for BF16 ones.
+pub fn with_scales(
+    format: KvFormat,
+    scales: Option<KvScaleHashes>,
+) -> Result<KvFormat, StartupError> {
+    match (format.dtype, scales) {
+        (KvDtype::Fp8E4m3PerTensorScale, Some(_)) | (KvDtype::Bf16, None) => {
+            Ok(KvFormat { scales, ..format })
+        }
+        (dtype, _) => Err(StartupError::new(format!(
+            "a {} KV pool {} per-layer KV scales",
+            dtype.as_str(),
+            if scales.is_some() {
+                "takes no"
+            } else {
+                "needs the model's"
+            }
+        ))),
+    }
+}
+
+/// The namespace hashes of a model's FP8 KV scales ([`KvStart::kv_scales`]); `None` for BF16.
+pub fn scale_hashes(cache: &KvCache) -> Option<KvScaleHashes> {
+    cache
+        .is_fp8()
+        .then(|| KvScaleHashes::of(&cache.k_scales, &cache.v_scales))
 }
 
 /// The KV format of a tensor-parallel group of `tp` ranks whose pools each have `layout` (one
@@ -257,6 +295,9 @@ pub struct KvStart<'a> {
     /// `shards` is then empty and `l2` holds this rank's shards only
     /// (`crate::engine::tp_tiers::open_rank_l2`).
     pub remote: Option<TierDriver>,
+    /// The FP8 KV scales' hashes ([`scale_hashes`] of the model's `kv_cache`), which scope the
+    /// KV namespace (Phase 6a S-16); required with an FP8 pool, `None` with BF16.
+    pub kv_scales: Option<KvScaleHashes>,
 }
 
 /// Owns the hierarchy and its copy backend on the engine thread (module comment).
@@ -368,6 +409,7 @@ impl KvOrchestrator {
             Some(r) => tp_kv_format(layout, r.world()),
             None => format,
         };
+        let format = with_scales(format, s.kv_scales)?;
         if world > 1
             && s.cfg.cpu.enabled
             && s.cfg.cpu.max_bytes.0 / u64::from(world) < L1_SLAB_BYTES
@@ -1791,6 +1833,7 @@ mod tests {
                 clock,
                 metrics,
                 remote: None,
+                kv_scales: None,
             },
             &mut pool0,
         )
@@ -1831,6 +1874,37 @@ mod tests {
                 "rank {i}'s shard came back into its own pool"
             );
         }
+    }
+
+    /// Phase 6a S-13 / S-16: an F8E4M3 pool's format is FP8 at half the block bytes, scoped by
+    /// the model's scales; FP8 without scales or BF16 with scales is refused. Breaks if an FP8
+    /// pool shares a namespace with BF16 or with other scales.
+    #[test]
+    fn fp8_pool_format_carries_the_scales() {
+        let bf16 = kv_format(layout());
+        assert_eq!(bf16.dtype, KvDtype::Bf16);
+        let fp8_layout = KvLayout {
+            dtype: DType::F8E4M3,
+            ..layout()
+        };
+        let fp8 = kv_format(fp8_layout);
+        assert_eq!(fp8.dtype, KvDtype::Fp8E4m3PerTensorScale);
+        assert_eq!(2 * fp8.block_bytes(), bf16.block_bytes());
+        let cache = KvCache::fp8_e4m3(vec![1.0, 0.5], vec![1.0, 1.0]);
+        let hashes = scale_hashes(&cache).expect("FP8 has scales");
+        assert_eq!(scale_hashes(&KvCache::bf16()), None);
+        let scoped = with_scales(fp8, Some(hashes)).unwrap();
+        let other = with_scales(
+            tp_kv_format(fp8_layout, 1),
+            scale_hashes(&KvCache::fp8_e4m3(vec![1.0, 1.0], vec![1.0, 1.0])),
+        )
+        .unwrap();
+        let ns = |f: &KvFormat| namespace_key(&identity(), f, "");
+        assert_ne!(ns(&scoped), ns(&other), "other scales, other namespace");
+        assert_ne!(ns(&scoped), ns(&bf16));
+        assert_eq!(with_scales(bf16, None).unwrap(), bf16);
+        assert!(with_scales(fp8, None).is_err());
+        assert!(with_scales(bf16, Some(hashes)).is_err());
     }
 
     #[test]
@@ -2074,6 +2148,7 @@ mod tests {
                 clock,
                 metrics,
                 remote: None,
+                kv_scales: None,
             },
             &mut pool1,
         )
@@ -2138,6 +2213,7 @@ mod tests {
                 clock: Arc::new(SystemClock::new()),
                 metrics: KvMetrics::register(&MetricsRegistry::new()),
                 remote: None,
+                kv_scales: None,
             },
             &mut last,
         )
@@ -2176,6 +2252,7 @@ mod tests {
                 clock: Arc::new(SystemClock::new()),
                 metrics: KvMetrics::register(&reg),
                 remote: None,
+                kv_scales: None,
             },
             &mut pool0,
         )
@@ -2344,6 +2421,7 @@ mod tests {
                 clock,
                 metrics,
                 remote: Some(driver),
+                kv_scales: None,
             },
             &mut pool0,
         )

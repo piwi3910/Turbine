@@ -37,6 +37,31 @@ impl fmt::Debug for KvKey {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NamespaceKey(pub [u8; 32]);
 
+/// BLAKE3 of the per-layer FP8 KV scales (Phase 6a S-16): K's and V's, each over the scales as
+/// little-endian f32 in layer order.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct KvScaleHashes {
+    pub k: [u8; 32],
+    pub v: [u8; 32],
+}
+
+impl KvScaleHashes {
+    /// The hashes of per-layer scales `k` and `v`.
+    pub fn of(k: &[f32], v: &[f32]) -> KvScaleHashes {
+        let hash = |scales: &[f32]| {
+            let mut h = blake3::Hasher::new();
+            for s in scales {
+                h.update(&s.to_le_bytes());
+            }
+            *h.finalize().as_bytes()
+        };
+        KvScaleHashes {
+            k: hash(k),
+            v: hash(v),
+        }
+    }
+}
+
 /// Stored KV format: element type plus the per-token layout (which carries `block_tokens`).
 ///
 /// Under tensor parallelism (Phase 5 §Data) every rank's pool holds its own KV heads and `layout`
@@ -48,6 +73,8 @@ pub struct KvFormat {
     pub layout: KvLayout,
     /// Rank shards of one block (the tensor-parallel size; 1 without it).
     pub shards: u32,
+    /// The per-layer scales of quantized pages (FP8, Phase 6a S-16); `None` for BF16.
+    pub scales: Option<KvScaleHashes>,
 }
 
 impl KvFormat {
@@ -57,6 +84,7 @@ impl KvFormat {
             dtype,
             layout,
             shards: 1,
+            scales: None,
         }
     }
 
@@ -81,12 +109,17 @@ struct CanonicalNamespace<'a> {
 struct CanonicalFormat {
     dtype: &'static str,
     head_dim: u32,
+    /// Only for quantized pages (FP8), like `v_scales_hash`, so BF16 keys never change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    k_scales_hash: Option<String>,
     num_kv_heads: u32,
     num_layers: u32,
     /// Only with tensor parallelism (> 1), so single-device keys never change: a tier copy of a
     /// tp = n block is n rank shards and must never be read by a process of another tp size.
     #[serde(skip_serializing_if = "Option::is_none")]
     shards: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v_scales_hash: Option<String>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -102,9 +135,11 @@ pub fn namespace_key(id: &ModelIdentity, fmt: &KvFormat, cache_salt: &str) -> Na
         kv_format: CanonicalFormat {
             dtype: fmt.dtype.as_str(),
             head_dim: fmt.layout.head_dim,
+            k_scales_hash: fmt.scales.map(|s| hex(&s.k)),
             num_kv_heads: fmt.layout.num_kv_heads,
             num_layers: fmt.layout.num_layers,
             shards: (fmt.shards > 1).then_some(fmt.shards),
+            v_scales_hash: fmt.scales.map(|s| hex(&s.v)),
         },
         model_config_hash: hex(&id.config_hash),
         weights_index_hash: hex(&id.weights_index_hash),
@@ -305,6 +340,68 @@ mod tests {
             block_key(&ns2, None, &tokens),
             block_key(&ns1, None, &tokens),
             "the shard count changes every block key"
+        );
+    }
+
+    fn fp8_format(k: &[f32], v: &[f32]) -> KvFormat {
+        let bf16 = llama_format(16);
+        KvFormat {
+            dtype: KvDtype::Fp8E4m3PerTensorScale,
+            layout: KvLayout {
+                dtype: DType::F8E4M3,
+                ..bf16.layout
+            },
+            scales: Some(KvScaleHashes::of(k, v)),
+            ..bf16
+        }
+    }
+
+    /// Phase 6a S-16: the FP8 KV scales enter the namespace key (the RoPE part lands with
+    /// plan Task 27). Identical scales give one namespace; a scale change in any layer of K or
+    /// of V, or K and V swapped, gives another; a BF16 format keeps the Phase 4 golden key.
+    /// Breaks if blocks written under one set of scales could be read under another.
+    #[test]
+    fn rope_and_scales_scope_the_namespace() {
+        let bf16 = llama_format(16);
+        assert_eq!(bf16.scales, None);
+        assert_eq!(hex(&namespace_key(&model(1), &bf16, "").0), GOLDEN_NS);
+        let ones = vec![1.0f32; 28];
+        let ns = |f: &KvFormat| namespace_key(&model(1), f, "");
+        let base = fp8_format(&ones, &ones);
+        assert_eq!(
+            ns(&base),
+            ns(&fp8_format(&ones, &ones)),
+            "same scales, same key"
+        );
+        assert_ne!(ns(&base), ns(&bf16), "FP8 pages are never read as BF16");
+        assert_eq!(
+            base.block_bytes() * 2,
+            bf16.block_bytes(),
+            "FP8 halves a block"
+        );
+        let mut k = ones.clone();
+        k[27] = 0.5;
+        assert_ne!(
+            ns(&base),
+            ns(&fp8_format(&k, &ones)),
+            "one K scale changes the key"
+        );
+        assert_ne!(
+            ns(&base),
+            ns(&fp8_format(&ones, &k)),
+            "one V scale changes the key"
+        );
+        let half = vec![0.5f32; 28];
+        assert_ne!(
+            ns(&fp8_format(&half, &ones)),
+            ns(&fp8_format(&ones, &half)),
+            "K and V scales are not interchangeable"
+        );
+        let tokens: Vec<u32> = (100..116).collect();
+        assert_ne!(
+            block_key(&ns(&base), None, &tokens),
+            block_key(&ns(&fp8_format(&k, &ones)), None, &tokens),
+            "the scales change every block key"
         );
     }
 }

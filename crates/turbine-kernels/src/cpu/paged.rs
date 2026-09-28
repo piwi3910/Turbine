@@ -7,11 +7,78 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
+use turbine_core::types::DType;
 use turbine_tensor::tensor::contiguous_strides;
 
-use super::{FloatCodec, expect_rank, expect_shape, invalid, load, load_i32, math, store};
+use super::quant::{fp8_e4m3_round, fp8_e4m3_value};
+use super::{
+    FloatCodec, expect_rank, expect_shape, invalid, is_float, load, load_i32, math, store,
+};
 use crate::KernelError;
 use crate::ops::PagedAttentionContext;
+
+/// How the pool pages hold K and V: a float type, or FP8 e4m3 with per-half scales (Phase 6a
+/// S-13: `e4m3(x / scale)` written, `e4m3 · scale` read, in F32).
+#[derive(Clone, Copy)]
+enum Pages {
+    Float(FloatCodec),
+    Fp8 { k_scale: f32, v_scale: f32 },
+}
+
+impl Pages {
+    fn of(ctx: &PagedAttentionContext<'_>) -> Result<Pages, KernelError> {
+        let pool = ctx.kv_layer.dtype;
+        if ctx.cfg.dtype != DType::F8E4M3 {
+            if pool != ctx.cfg.dtype {
+                return Err(invalid(format!(
+                    "kv_layer is {} but the config names {}",
+                    pool.as_str(),
+                    ctx.cfg.dtype.as_str()
+                )));
+            }
+            return Ok(Pages::Float(FloatCodec::require(pool)?));
+        }
+        if pool != DType::F8E4M3 {
+            return Err(invalid(format!(
+                "FP8 paged attention needs an f8e4m3 kv_layer, got {}",
+                pool.as_str()
+            )));
+        }
+        for (name, s) in [("k_scale", ctx.k_scale), ("v_scale", ctx.v_scale)] {
+            if !(s.is_finite() && s > 0.0) {
+                return Err(invalid(format!(
+                    "{name} must be finite and positive, got {s}"
+                )));
+            }
+        }
+        Ok(Pages::Fp8 {
+            k_scale: ctx.k_scale,
+            v_scale: ctx.v_scale,
+        })
+    }
+
+    /// Writes `v` of half `half` (0 = K, 1 = V) into `out`.
+    fn encode(self, half: usize, v: f32, out: &mut [u8]) {
+        match self {
+            Pages::Float(codec) => codec.encode(v, out),
+            Pages::Fp8 { k_scale, v_scale } => {
+                let scale = if half == 0 { k_scale } else { v_scale };
+                out[0] = fp8_e4m3_round(v / scale);
+            }
+        }
+    }
+
+    /// Reads an element of half `half` from `b`.
+    fn decode(self, half: usize, b: &[u8]) -> f32 {
+        match self {
+            Pages::Float(codec) => codec.decode(b),
+            Pages::Fp8 { k_scale, v_scale } => {
+                let scale = if half == 0 { k_scale } else { v_scale };
+                fp8_e4m3_value(b[0]) * scale
+            }
+        }
+    }
+}
 
 /// One sequence of the ragged batch.
 struct Seq {
@@ -111,7 +178,19 @@ pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelErr
             pool.strides.as_slice()
         )));
     }
-    let codec = FloatCodec::require(pool.dtype)?;
+    let pages = Pages::of(ctx)?;
+    // The activation dtype: the config's, or Q's under FP8 pages.
+    let act = if ctx.cfg.dtype == DType::F8E4M3 {
+        ctx.q.dtype
+    } else {
+        ctx.cfg.dtype
+    };
+    if !is_float(act) {
+        return Err(invalid(format!(
+            "q must be bf16/f16/f32, is {}",
+            act.as_str()
+        )));
+    }
     let es = pool.dtype.size_bytes();
     let token_elems = hkv * d;
     let block_bytes = 2 * block_tokens * token_elems * es;
@@ -145,7 +224,7 @@ pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelErr
             for (half, values) in [(0, &k_new), (1, &v_new)] {
                 let base = (half * block_tokens + slot) * token_elems;
                 for (j, &v) in values[src..src + token_elems].iter().enumerate() {
-                    codec.encode(v, &mut bytes[(base + j) * es..]);
+                    pages.encode(half, v, &mut bytes[(base + j) * es..]);
                 }
             }
         }
@@ -169,7 +248,8 @@ pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelErr
             for (half, dst) in [(0, &mut k), (1, &mut v)] {
                 let base = half * block_tokens * token_elems;
                 dst.extend(
-                    (base..base + tokens * token_elems).map(|e| codec.decode(&bytes[e * es..])),
+                    (base..base + tokens * token_elems)
+                        .map(|e| pages.decode(half, &bytes[e * es..])),
                 );
             }
         }
@@ -182,9 +262,8 @@ pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelErr
             causal: ctx.cfg.causal,
         };
         let rows = seq.row * hq * d..(seq.row + seq.q_len) * hq * d;
-        let dt = ctx.cfg.dtype;
         let o = math::attention(&q[rows.clone()], &k, &v, &shape, ctx.scale, |p| {
-            super::round_to(dt, p)
+            super::round_to(act, p)
         });
         out[rows].copy_from_slice(&o);
     }
@@ -193,8 +272,141 @@ pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelErr
 
 #[cfg(test)]
 mod tests {
+    use crate::cpu::quant::{fp8_e4m3_round, fp8_e4m3_value};
     use crate::cpu::test_util::*;
     use crate::cpu::*;
+
+    /// One 20-token prefill of one sequence into blocks [3, 1] of a 4-block pool of `pool_dtype`
+    /// pages (`cfg_dtype` in the config), K and V from `k` / `v`: the output and the pool bytes.
+    fn prefill(
+        cfg_dtype: DType,
+        pool_dtype: DType,
+        k: &[f32],
+        v: &[f32],
+        scales: (f32, f32),
+    ) -> Result<(Vec<f32>, Vec<u8>), KernelError> {
+        let mem = HostMemory::new(DeviceId(0), 1 << 22) as Arc<dyn DeviceMemory>;
+        let (hq, hkv, d, bt, t) = (4usize, 2usize, 8usize, 16usize, 20usize);
+        let cfg = AttentionConfig {
+            kind: AttentionKind::PrefillPaged,
+            num_q_heads: hq as u32,
+            num_kv_heads: hkv as u32,
+            head_dim: d as u32,
+            dtype: cfg_dtype,
+            block_tokens: Some(bt as u32),
+            causal: true,
+        };
+        let pool = Tensor::empty(&mem, &[4, 2, bt, hkv, d], pool_dtype).expect("pool");
+        let q = tensor(&mem, &[t, hq, d], DType::BF16, &seeded(41, t * hq * d));
+        let kn = tensor(&mem, &[t, hkv, d], DType::BF16, k);
+        let vn = tensor(&mem, &[t, hkv, d], DType::BF16, v);
+        let out = Tensor::empty(&mem, &[t, hq, d], DType::BF16).expect("out");
+        let table = i32_tensor_2d(&mem, 1, &[3, 1]);
+        let q_indptr = i32_tensor(&mem, &[0, t as i32]);
+        let kv_lens = i32_tensor(&mem, &[t as i32]);
+        let provider = cpu_reference_provider();
+        let attn = provider.attention().expect("attention family");
+        attn.execute_paged(&mut PagedAttentionContext {
+            cfg,
+            q: q.view(),
+            k_new: kn.view(),
+            v_new: vn.view(),
+            out: out.view(),
+            kv_layer: pool.view(),
+            block_table: table.view(),
+            q_indptr: q_indptr.view(),
+            kv_lens: kv_lens.view(),
+            max_q_len: t as u32,
+            max_kv_len: t as u32,
+            max_blocks_per_seq: 2,
+            scale: 1.0 / (d as f32).sqrt(),
+            k_scale: scales.0,
+            v_scale: scales.1,
+        })?;
+        Ok((
+            load(&out.view()).expect("out"),
+            pool.view().slice.read_bytes().expect("pool"),
+        ))
+    }
+
+    /// FP8 pages (Phase 6a S-13): the append writes `e4m3(x / scale)` bytes and attention reads
+    /// `e4m3 · scale`, so the output equals BF16-page attention over K and V quantize-dequantized
+    /// with the same scales (power-of-two scales keep the dequantized values exact in BF16).
+    /// Breaks if K and V swap scales, a scale is applied twice or not at all, or a page byte is
+    /// not the e4m3 of the scaled value.
+    #[test]
+    fn fp8_pages_hold_scaled_e4m3_and_attend_like_dequantized_kv() {
+        let (t, hkv, d) = (20usize, 2usize, 8usize);
+        let bf = |x: &[f32]| {
+            x.iter()
+                .map(|&v| round_to(DType::BF16, v))
+                .collect::<Vec<_>>()
+        };
+        // Magnitudes up to ~12: e4m3 rounding is visible at these scales, nothing saturates.
+        let k = bf(&seeded(42, t * hkv * d)
+            .iter()
+            .map(|x| x * 3.0)
+            .collect::<Vec<_>>());
+        let v = bf(&seeded(43, t * hkv * d)
+            .iter()
+            .map(|x| x * 4.0)
+            .collect::<Vec<_>>());
+        let (ks, vs) = (0.0625f32, 0.125f32);
+        let qdq = |x: &[f32], s: f32| {
+            x.iter()
+                .map(|&e| fp8_e4m3_value(fp8_e4m3_round(e / s)) * s)
+                .collect::<Vec<_>>()
+        };
+        let (kq, vq) = (qdq(&k, ks), qdq(&v, vs));
+        assert_ne!(kq, k, "the scales must make e4m3 rounding visible");
+
+        let (fp8_out, pages) =
+            prefill(DType::F8E4M3, DType::F8E4M3, &k, &v, (ks, vs)).expect("fp8");
+        let (want, _) = prefill(DType::BF16, DType::BF16, &kq, &vq, (1.0, 1.0)).expect("bf16");
+        assert_eq!(fp8_out, want);
+        assert_eq!(
+            AttentionKernel::implementation(
+                &CpuReference,
+                &AttentionConfig {
+                    kind: AttentionKind::DecodePaged,
+                    num_q_heads: 4,
+                    num_kv_heads: 2,
+                    head_dim: 8,
+                    dtype: DType::F8E4M3,
+                    block_tokens: Some(16),
+                    causal: true,
+                }
+            ),
+            "cpu_attention_paged_fp8kv_f32acc"
+        );
+
+        // Token 0 is block 3 slot 0; token 17 is block 1 slot 1. One byte per element.
+        let token = hkv * d;
+        let block = 2 * 16 * token;
+        let page = |b: usize, half: usize, slot: usize| {
+            let at = b * block + (half * 16 + slot) * token;
+            pages[at..at + token].to_vec()
+        };
+        let enc = |x: &[f32], s: f32| x.iter().map(|&e| fp8_e4m3_round(e / s)).collect::<Vec<_>>();
+        assert_eq!(page(3, 0, 0), enc(&k[..token], ks));
+        assert_eq!(page(3, 1, 0), enc(&v[..token], vs));
+        assert_eq!(page(1, 0, 1), enc(&k[17 * token..18 * token], ks));
+        assert_eq!(page(1, 1, 1), enc(&v[17 * token..18 * token], vs));
+
+        // Power-of-two scales only move the e4m3 range; others change every rounding, so K and V
+        // with swapped scales give another output.
+        let (odd_k, odd_v) = (0.07f32, 0.11f32);
+        let (odd, _) = prefill(DType::F8E4M3, DType::F8E4M3, &k, &v, (odd_k, odd_v)).expect("fp8");
+        let (swapped, _) =
+            prefill(DType::F8E4M3, DType::F8E4M3, &k, &v, (odd_v, odd_k)).expect("fp8");
+        assert_ne!(swapped, odd, "K and V scales are not interchangeable");
+        for bad in [0.0, f32::NAN, -1.0] {
+            let err = prefill(DType::F8E4M3, DType::F8E4M3, &k, &v, (bad, vs)).unwrap_err();
+            assert!(err.to_string().contains("k_scale"), "{err}");
+        }
+        let err = prefill(DType::F8E4M3, DType::BF16, &k, &v, (ks, vs)).unwrap_err();
+        assert!(err.to_string().contains("f8e4m3 kv_layer"), "{err}");
+    }
 
     #[test]
     fn paged_attention_equals_contiguous_and_moe_route_ties() {

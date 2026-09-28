@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use turbine_core::config::{Config, ConfigError};
+use turbine_core::config::{Config, ConfigError, KvDtypeChoice};
 use turbine_core::support::{
     self, HOST_VENDOR, KvFormatColumn, SupportDecision, SupportKey, SupportStatus,
     WeightFormatColumn,
@@ -59,10 +59,19 @@ pub fn device_arch(cfg: &Config, vendor: &str, inventory: &DeviceInventory) -> O
 }
 
 /// The format columns of the configured model: `(weight_format, kv_format)`. Every checkpoint
-/// the model loader accepts today is BF16 and the KV cache is BF16; the Phase 6a weight-format
-/// registry (plan Task 6) supplies the detected column and `kv.dtype` (plan Task 22) the KV one.
-pub fn format_columns(_cfg: &Config) -> (WeightFormatColumn, KvFormatColumn) {
-    (WeightFormatColumn::Bf16, KvFormatColumn::Bf16)
+/// the model loader accepts today is BF16 (the Phase 6a weight-format registry, plan Task 6,
+/// supplies the detected column); the KV column is `kv.dtype` (Phase 6a S-13).
+pub fn format_columns(cfg: &Config) -> (WeightFormatColumn, KvFormatColumn) {
+    (WeightFormatColumn::Bf16, kv_column(cfg.kv.dtype))
+}
+
+/// The support-matrix KV column of `kv.dtype`: the column of the same spelling (a `kv.dtype`
+/// value lands together with its column).
+pub fn kv_column(dtype: KvDtypeChoice) -> KvFormatColumn {
+    KvFormatColumn::ALL
+        .into_iter()
+        .find(|c| c.as_str() == dtype.as_str())
+        .expect("every kv.dtype value has a support-matrix KV column")
 }
 
 /// The key before device discovery for `cfg` with the given format columns.
@@ -231,6 +240,31 @@ mod tests {
         for backend in turbine_kernels::backends::registry().iter() {
             assert!(VENDORS.contains(&backend.vendor()), "{}", backend.name());
         }
+    }
+
+    /// Phase 6a S-13: the KV column is the configured `kv.dtype`; FP8 KV is refused on `amd`
+    /// (exit 2 naming `kv.dtype`) until its gate passes, and experimental on the cpu backend.
+    /// Breaks if the KV column is still hard-coded BF16.
+    #[test]
+    fn kv_column_follows_kv_dtype() {
+        let llama = model_dir(
+            "llama-fp8-kv",
+            serde_json::json!({"architectures": ["LlamaForCausalLM"]}),
+        );
+        let mut cfg = config("hip", llama.path());
+        assert_eq!(format_columns(&cfg).1, KvFormatColumn::Bf16);
+        cfg.kv.dtype = turbine_core::config::KvDtypeChoice::Fp8E4m3;
+        assert_eq!(format_columns(&cfg).1, KvFormatColumn::Fp8E4m3);
+        let err = before_discovery(&cfg).unwrap_err();
+        assert_eq!(err.key(), Some("kv.dtype"), "{err}");
+        let mut cpu = config("cpu", llama.path());
+        cpu.kv.dtype = turbine_core::config::KvDtypeChoice::Fp8E4m3;
+        let d = before_discovery(&cpu).unwrap();
+        assert_eq!(
+            d.key.to_string(),
+            "cpu/cpu/LlamaForCausalLM/bf16/fp8_e4m3/none"
+        );
+        assert_eq!(d.status, SupportStatus::Experimental);
     }
 
     #[test]
