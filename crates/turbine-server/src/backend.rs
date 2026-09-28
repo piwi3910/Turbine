@@ -789,8 +789,10 @@ impl ModelBackend {
         // P5 S-7: the replica whose engine takes the request (replica 0 without data parallelism).
         let tokens =
             u64::from(prompt_len) + u64::from(submission.request.n.max(1)) * u64::from(max_tokens);
-        let (replica, key) = match &self.router {
-            None => (0, None),
+        // `transit` counts the tokens as in transit to the replica until the engine answers (or
+        // this future is dropped: a client gone while the command channel was full).
+        let (replica, key, transit) = match &self.router {
+            None => (0, None, None),
             Some(router) => {
                 let key = router.prefix_key(
                     submission.request.cache_salt.as_deref(),
@@ -810,8 +812,7 @@ impl ModelBackend {
                 let Some((replica, _)) = router.pick(&loads, key) else {
                     return Err(self.reject(endpoint, ApiError::model_not_loaded()));
                 };
-                router.sending(replica, tokens);
-                (replica, key)
+                (replica, key, Some(router.sending(replica, tokens)))
             }
         };
         let Some(loaded) = self.replicas[replica].get() else {
@@ -830,17 +831,14 @@ impl ModelBackend {
             ApiError::internal("the engine thread has stopped")
         };
         if sent.is_err() {
-            if let Some(router) = &self.router {
-                router.delivered(replica, tokens);
-            }
             return Err(engine_gone());
         }
         let answer = admitted.await;
-        if let Some(router) = &self.router {
-            router.delivered(replica, tokens);
-            if matches!(answer, Ok(Ok(()))) {
-                router.remember(key, replica);
-            }
+        drop(transit);
+        if let Some(router) = &self.router
+            && matches!(answer, Ok(Ok(())))
+        {
+            router.remember(key, replica);
         }
         match answer {
             Ok(Ok(())) => Ok(stream),

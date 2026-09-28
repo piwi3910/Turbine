@@ -119,13 +119,20 @@ impl ReplicaRouter {
         Some((replica.0 as usize, reason))
     }
 
-    /// `tokens` are on their way to `replica`'s engine (until [`Self::delivered`]).
-    pub fn sending(&self, replica: usize, tokens: u64) {
+    /// `tokens` are on their way to `replica`'s engine until the returned guard drops: drop it
+    /// once the engine has taken (or refused) the submission. A submission future dropped
+    /// mid-send (the client went away) drops the guard with it, so nothing stays in transit.
+    pub fn sending(&self, replica: usize, tokens: u64) -> InTransit<'_> {
         self.in_transit[replica].fetch_add(tokens, Ordering::AcqRel);
+        InTransit {
+            router: self,
+            replica,
+            tokens,
+        }
     }
 
     /// The engine has taken (or refused) the submission: it counts the tokens itself now.
-    pub fn delivered(&self, replica: usize, tokens: u64) {
+    fn delivered(&self, replica: usize, tokens: u64) {
         let _ = self.in_transit[replica].fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
             Some(v.saturating_sub(tokens))
         });
@@ -148,6 +155,21 @@ impl ReplicaRouter {
     }
 }
 
+/// Tokens of one submission in transit to a replica's engine ([`ReplicaRouter::sending`]);
+/// dropping it hands them over to the engine's own count.
+#[must_use = "dropping the guard ends the transit at once"]
+pub struct InTransit<'a> {
+    router: &'a ReplicaRouter,
+    replica: usize,
+    tokens: u64,
+}
+
+impl Drop for InTransit<'_> {
+    fn drop(&mut self) {
+        self.router.delivered(self.replica, self.tokens);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +189,26 @@ mod tests {
         })
     }
 
+    /// Tokens in transit are released when their guard drops, so a submission whose future is
+    /// dropped mid-send (client gone while the engine channel was full) does not leave its
+    /// replica looking busy forever (Scout 616d53ca).
+    #[test]
+    fn in_transit_released_when_the_submission_is_dropped() {
+        let reg = MetricsRegistry::new();
+        let r = ReplicaRouter::new(2, prefix_affinity(), 4, &reg);
+        let submit = async {
+            let _transit = r.sending(1, 200);
+            std::future::pending::<()>().await;
+        };
+        let mut submit = Box::pin(submit);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(submit.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(r.in_transit[1].load(Ordering::Acquire), 200);
+        drop(submit);
+        assert_eq!(r.in_transit[1].load(Ordering::Acquire), 0);
+    }
+
     /// Least-loaded counts tokens in transit; a remembered first block pulls its request back to
     /// the replica that computed it unless that replica is under pressure; replicas that are not
     /// ready are skipped; the affinity table stays bounded.
@@ -179,9 +221,9 @@ mod tests {
             load(PressureState::Green, 50),
         ];
         assert_eq!(r.pick(&green, None).map(|p| p.0), Some(1));
-        r.sending(1, 200);
+        let transit = r.sending(1, 200);
         assert_eq!(r.pick(&green, None).map(|p| p.0), Some(0));
-        r.delivered(1, 200);
+        drop(transit);
 
         let key = r.prefix_key(Some("s"), &[1, 2, 3, 4, 5]);
         assert!(key.is_some());
