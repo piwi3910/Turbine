@@ -504,6 +504,10 @@ scenario_pp2() {
 	echo "lab-step: golden llama pp2 c16 vs pp1 (the gate)"
 	"${BIN}/turbine-golden" compare --url "$URL" --reference "${WORK}/pp1-capture.jsonl" \
 		"${tol[@]}" --concurrency 16 || GATE_FAILED+=("golden llama pp2 c16 vs pp1")
+	if [[ ${#GATE_FAILED[@]} -gt 0 ]]; then
+		sed 's/\x1b\[[0-9;]*m//g' "${WORK}/pp2.log" | grep -iE 'error|fail|abort' | head -n 30 || true
+		job_fail "outside tolerance: ${GATE_FAILED[*]}"
+	fi
 	golden_info "llama pp2 c1" --reference "tests/golden/${slug}/reference.jsonl"
 	golden_info "llama pp2 c16" --reference "tests/golden/${slug}/reference.jsonl" \
 		--concurrency 16

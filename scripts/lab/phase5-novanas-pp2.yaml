@@ -29,6 +29,11 @@ parallel:
   pipeline_parallel_size: 2
   devices: [0, 1]
   collective_backend: auto
+  collective:
+    # Every stage hand-off stays on hostmem's point-to-point slots: RCCL's ncclSend / ncclRecv
+    # (auto routes sends above 32 KiB there) fail with "unhandled system error" on this
+    # peer-less board (first pp2-novanas run, 2026-09-28).
+    hostmem_max_bytes: 1TiB
   pipeline:
     micro_batches: auto
 kv:
