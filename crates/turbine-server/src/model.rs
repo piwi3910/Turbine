@@ -760,6 +760,9 @@ fn prepare_with(
         weight_bytes = weights,
         "model prepared"
     );
+    // The resolved RoPE parameters scope the prefix namespace (P6a S-16): a `model.rope_scaling`
+    // override leaves config.json, hence its hash, unchanged.
+    let identity = model_identity(dir)?.with_rope(&arch.rope_identity());
     Ok(PreparedModel {
         provider,
         arch,
@@ -786,7 +789,7 @@ fn prepare_with(
         reliability,
         kv_cap: config.kv.gpu.max_bytes,
         workspace_bytes: workspace,
-        identity: model_identity(dir)?,
+        identity,
         kernel_metrics: kernel_metrics.clone(),
         shard,
         expert,

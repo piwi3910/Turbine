@@ -1401,6 +1401,7 @@ mod kv_sim {
                 ModelIdentity {
                     config_hash: [5; 32],
                     weights_index_hash: [6; 32],
+                    rope_hash: [0; 32],
                 },
                 KvFormat {
                     dtype: KvDtype::Bf16,
