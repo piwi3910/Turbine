@@ -939,7 +939,7 @@ Consequences: `phase-5p-serving-efficiency` is specced when Phase 5 has merged (
 
 ## Phase 5p spec: provisional design choices (2026-09-28)
 
-Written with `.procoder/specs/phase-5p-serving-efficiency.md` and its plan, ahead of Phase 5's merge. The decision "Phase 5p: serving efficiency interlude" fixes scope, order and constraints; the choices below are the ones it leaves open. The spec writes each recommended option marked "(provisional)", pending the user's review; none is implemented yet.
+Written with `.procoder/specs/phase-5p-serving-efficiency.md` and its plan, ahead of Phase 5's merge. The decision "Phase 5p: serving efficiency interlude" fixes scope, order and constraints; the choices below are the ones it leaves open. The spec first wrote each recommended option marked "(provisional)"; the user answered all of them on 2026-09-28 (below) and the spec and plan now mark them "(user decision 2026-09-28)". None is implemented yet.
 
 **1. Jump-forward and "identical to token-by-token decoding".** llguidance's forced tokens are the canonical tokenization of the forced bytes; greedy token-by-token decoding may pick another tokenization of the same bytes, and a prefill-shaped step rounds differently from a decode step.
 
@@ -947,7 +947,7 @@ Written with `.procoder/specs/phase-5p-serving-efficiency.md` and its plan, ahea
 - B) SGLang-style: append the canonical forced tokens unverified (llguidance already re-tokenizes the last committed token with the forced bytes and chops tokens that could merge with what follows); cheapest, but the output can differ where the model would tokenize differently
 - C) Jump only where the mask allows exactly one token: bit-identical, but multi-byte forced strings almost always allow several tokenizations, so it rarely fires
 
-**Provisional: A.**
+**Answer (2026-09-28, user): A** — verify the forced tokens as a draft, roll back at the first disagreement.
 
 **2. The `cache_aware` admission key and its starvation bound.** A scheduling policy is stateless and computes a request's key once, at push.
 
@@ -955,17 +955,17 @@ Written with `.procoder/specs/phase-5p-serving-efficiency.md` and its plan, ahea
 - B) Virtual deadline: key = arrival + window − credit, credit growing with the cached tokens (capped at the window); smoother, but needs a token scale (a second knob)
 - C) Order by the cached fraction of the prompt instead of the cached length (closer to shortest-remaining-prefill-first)
 
-**Provisional: A, window 1 s.**
+**Answer (2026-09-28, user): A** — 1 s arrival windows, longest cached prefix first within a window.
 
-**3. Default scheduling policy.** Provisional: `default` stays the default in this phase; the saturated multi-turn A/B (plan Task 9) is recorded and the user decides whether `cache_aware` becomes the default.
+**3. Default scheduling policy.** **Answer (2026-09-28, user): accepted as written** — `default` stays the default in this phase; the saturated multi-turn A/B (plan Task 9) is recorded and the user decides whether `cache_aware` becomes the default.
 
-**4. Partial blocks and the KV tiers** ("a partial block is L0-only or copied whole"). Provisional: L0-only — partial entries are never demoted, prefetched or promoted, a reclaim drops them (`partial_l0_only`), and a full block that is only in L1/L2 is not used for a token-granular match. Alternative: promote such a block whole, then copy (more reuse after demotion, more copy traffic).
+**4. Partial blocks and the KV tiers** ("a partial block is L0-only or copied whole"). **Answer (2026-09-28, user): accepted as written** — L0-only — partial entries are never demoted, prefetched or promoted, a reclaim drops them (`partial_l0_only`), and a full block that is only in L1/L2 is not used for a token-granular match. Alternative not taken: promote such a block whole, then copy (more reuse after demotion, more copy traffic). The user confirmed L0 only.
 
-**5. Which sequences publish a partial tail.** Provisional: choice 0 of a request that finished normally (stop, EOS, length), holding the tokens whose KV is written; cancelled and failed requests publish nothing partial; at most 8 partial entries per parent, 64 children compared per lookup.
+**5. Which sequences publish a partial tail.** **Answer (2026-09-28, user): accepted as written** — choice 0 of a request that finished normally (stop, EOS, length), holding the tokens whose KV is written; cancelled and failed requests publish nothing partial; at most 8 partial entries per parent, 64 children compared per lookup.
 
-**6. Host share and the overlap rule.** Provisional: host share = all engine iteration stages except `device_wait` over all stages, from `turbine_engine_iteration_seconds{stage}` (so `launch`, which includes the blocking graph launch, counts as host); overlap work is built if either model's c1 share exceeds 0.05; if built, its default flips only when throughput rises and TTFT p50 stays ≤ 1.10 × serial for both models.
+**6. Host share and the overlap rule.** **Answer (2026-09-28, user): accepted as written** — host share = all engine iteration stages except `device_wait` over all stages, from `turbine_engine_iteration_seconds{stage}` (so `launch`, which includes the blocking graph launch, counts as host); overlap work is built if either model's c1 share exceeds 0.05; if built, its default flips only when throughput rises and TTFT p50 stays ≤ 1.10 × serial for both models.
 
-**7. Performance targets** (spec Interfaces, "Performance targets"). Provisional numbers:
+**7. Performance targets** (spec Interfaces, "Performance targets"). **Answer (2026-09-28, user): accepted as written** —
 
 - Standard bench, every landing step: tok/s ≥ 0.98 × the Task 3 baseline and TTFT p50 ≤ 1.10 ×.
 - Token-granular reuse: multi-turn `cached_tokens_ratio` +0.01 or more (reference 0.907) and later-turn TTFT p50 ≤ 0.95 × (reference 76 ms).
