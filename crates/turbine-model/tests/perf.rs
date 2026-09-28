@@ -32,7 +32,7 @@ use turbine_kernels::{
 use turbine_model::config::ModelArchConfig;
 use turbine_model::executor::{
     self, BatchInput, DecoderExecutor, ExecutorLimits, ExecutorOptions, ModelExecutor, OpProfile,
-    OpProfileEntry, SeqSlice,
+    OpProfileEntry, RowReduce, SeqSlice,
 };
 use turbine_model::families;
 use turbine_model::tp;
@@ -1469,16 +1469,54 @@ fn tp_rank_cases(
             exec,
             coll,
             barrier,
-            &mut |e| step(e, &kv, &decode).expect("decode step"),
+            &mut |e| served_step(e, &kv, &decode).expect("decode step"),
         ),
         tp_case(
             &format!("prefill_{PREFILL}"),
             exec,
             coll,
             barrier,
-            &mut |e| step(e, &kv, &[(&table, &prompt, 0)]).expect("prefill step"),
+            &mut |e| served_step(e, &kv, &[(&table, &prompt, 0)]).expect("prefill step"),
         ),
     ]
+}
+
+/// [`step`] as the server runs it: every row reduced on the device (greedy, one candidate) when
+/// the executor reduces, so only the reductions are read back (under tensor parallelism the
+/// vocabulary shards are still all-gathered first).
+fn served_step(
+    exec: &mut DecoderExecutor,
+    kv: &KvPoolView<'_>,
+    seqs: &[(&[BlockId], &[u32], u32)],
+) -> Result<(), turbine_model::ModelError> {
+    let reduce = ModelExecutor::reduces_logits(exec).then_some(RowReduce {
+        top_n: 1,
+        temperature: 0.0,
+        uniform: None,
+        top_p: 1.0,
+    });
+    let mut tokens = Vec::new();
+    let mut positions = Vec::new();
+    let mut slices = Vec::with_capacity(seqs.len());
+    for (s, &(table, toks, start)) in seqs.iter().enumerate() {
+        slices.push(SeqSlice {
+            seq: SeqId(s as u64 + 1),
+            q_start: tokens.len() as u32,
+            q_len: toks.len() as u32,
+            kv_len: start + toks.len() as u32,
+            block_table: table,
+            reduce,
+        });
+        tokens.extend_from_slice(toks);
+        positions.extend(start..start + toks.len() as u32);
+    }
+    exec.forward(&BatchInput {
+        tokens: &tokens,
+        positions: &positions,
+        seqs: &slices,
+        kv,
+    })?;
+    Ok(())
 }
 
 /// One (op, bytes, route) group of a case's collective calls on one rank.
