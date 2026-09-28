@@ -1102,3 +1102,19 @@ Context: novanas reached 95 % disk and k3s evicted a lab Job (2026-09-28). The P
 - Prune only by hand, asking the user each time
 
 **Decision (user, 2026-09-28): auto-prune approved**, with these limits: only `remote/agent-*/target`; never the per-slot caches under `turbine-ci/cache/`, anything in use, or anything else; every removal logged with the bytes freed. This rule now covers the earlier manual prune after the fact; any prune beyond it still needs the user.
+
+## P5 exit: "collective corruption" was pageable device-to-host copies (ROCm 7.14.1, gfx1201)
+
+Context (2026-09-28): the Phase 5 exit gate 3 (`lab-test novanas --gpus 2 --features fault-injection --tier full`, run 0928125603-04f6f801) failed `hostmem_lab` `hostmem_matches_host_backend_on_two_gpus` and `hostmem_graph_replays_with_rccl_delegate_on_two_gpus` with wrong bytes; the exit was blocked as a possible silent collective corruption in every collective mode (TP, EP, PP).
+
+Evidence (tp-perf diagnosis runs diag1–diag6, 2 GPUs):
+
+- RCCL ran RING / SIMPLE under every `NCCL_PROTO`; send-buffer reuse, buffer registration (`NCCL_LOCAL_REGISTER=0`, `NCCL_GRAPH_REGISTER=0`), our allocator (plain `hipMalloc`), the binding's sizing and the stream handles (each rank's non-blocking compute stream, non-zero and distinct) were all ruled out; hostmem one-shot steps were clean in steady state and on fresh groups (0/240, 0/120).
+- diag5: every pageable write read back correctly (write_bad 0), but two consecutive pageable `read_bytes` of the same buffer — after the stream synchronize, nothing enqueued between them — disagreed 9–14 times.
+- diag6 (the decider): 60 rounds × 2 ranks × 2 processes; pinned-staging reads 0/240 bad, pageable reads 15 and 11 bad; the garbage is always at an edge of the transfer (the first or last 56–1,016 FP32 words of an 8 MiB read), matches no data in the process, and hits either of two back-to-back reads.
+
+Finding: `hipMemcpyAsync` device-to-host into pageable host memory, followed by `hipStreamSynchronize` (`kernels/rocm/src/memory.cpp` `turbine_memcpy_d2h`; `crates/turbine-kernels/src/shim.rs` `copy_d2h`), sometimes returns wrong host bytes at the transfer's edges while another thread copies on another device in the same process. The device data was always correct: the collectives were never wrong. Exposure: every mode with two devices in one process — TP, EP, PP and DP (two replicas on two threads) — wherever a pageable copy is on the path; single-GPU serving has one copying thread.
+
+Plan (coordinator, 2026-09-28): audit every host↔device copy in the serving path (pageable vs pinned); move every hot or concurrent copy to pinned staging (or a synchronous copy only where the repro proves it safe); a shim guard refuses pageable async copies on GPU contexts (debug assert, counter, reason code); the lab harness reads back through pinned memory; proof: dp2/tp2/ep2/pp2 golden c1/c16, a long verify-mode read-twice run and the guarded serves, then the gate 3 rerun. A minimal standalone plain-HIP repro (two threads, two devices; pageable async, pageable sync, pinned and a single-thread control) is kept for an upstream ROCm report — path and results recorded here when it lands.
+
+Consequences for earlier work: `bffabda` (refusing RCCL inside a captured graph) was motivated by a pageable-read artefact; it is held until a pinned re-test of RCCL graph replays. The Task 34 attention diagnosis (split at a non-64-aligned q-start) is re-run with pinned reads to confirm.
