@@ -152,7 +152,7 @@ fn check_test_command(span: &str) -> Result<(), String> {
     while i < args.len() {
         match args[i] {
             "-p" | "--package" => {
-                package = args.get(i + 1).copied();
+                package = Some(args.get(i + 1).copied().ok_or("-p without a package")?);
                 i += 1;
             }
             "--test" => {
@@ -262,6 +262,8 @@ fn docs_checker_rejects_what_does_not_exist() {
     assert!(check_test_command("cargo test -p turbine-scheduler no_such_test_anywhere").is_err());
     assert!(check_test_command("cargo test -p turbine-model --test no_such_target").is_err());
     assert!(check_test_command("cargo test -p no-such-crate x").is_err());
+    // `-p` with no package name is refused, like `--test` without a name (Scout 6c7fc8ed).
+    assert!(check_test_command("cargo test -p").is_err());
     let spans = code_spans("a `x` b `y`\n```\n`z`\n```\n");
     assert_eq!(spans, ["x", "y"]);
 }

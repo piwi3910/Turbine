@@ -113,6 +113,10 @@ impl IncrementalDetokenizer {
     /// At the end of generation: any text still held back (lossy: an unfinished sequence
     /// becomes U+FFFD).
     pub fn flush(&mut self) -> Option<String> {
+        if self.read_offset == self.ids.len() {
+            // Every token's text was already emitted: nothing to decode.
+            return None;
+        }
         let prefix_text = self.decode(self.prefix_offset, self.read_offset)?;
         let new_text = self.decode(self.prefix_offset, self.ids.len())?;
         self.prefix_offset = self.ids.len();
@@ -211,6 +215,21 @@ mod tests {
         let out: String = ids.iter().filter_map(|&id| detok.push(id)).collect();
         assert_eq!(out, "A B");
         assert_eq!(detok.flush(), None);
+    }
+
+    /// With every pushed token already emitted, `flush` is a no-op: `None`, and it leaves the
+    /// window alone instead of re-decoding it (Scout 806bcf1e).
+    #[test]
+    fn flush_with_nothing_pending_is_a_no_op() {
+        let tokenizer = Arc::new(fixture_tokenizer());
+        let ids = tokenizer.encode("Hello world", false).expect("encode");
+        let mut detok = IncrementalDetokenizer::new(Arc::clone(&tokenizer));
+        let out: String = ids.iter().filter_map(|&id| detok.push(id)).collect();
+        assert_eq!(out, "Hello world");
+        assert_eq!(detok.read_offset, ids.len(), "everything was emitted");
+        let window = (detok.prefix_offset, detok.read_offset);
+        assert_eq!(detok.flush(), None);
+        assert_eq!((detok.prefix_offset, detok.read_offset), window);
     }
 
     #[test]

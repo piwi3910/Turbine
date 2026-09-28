@@ -189,7 +189,12 @@ async fn completions(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> 
             "prompt_token_ids": PROMPT_TOKEN_IDS,
             "logprobs": {
                 "tokens": s.tokens.iter().map(|t| id_str(*t)).collect::<Vec<_>>(),
-                "token_logprobs": s.top.iter().map(|r| r[0].1).collect::<Vec<_>>(),
+                "token_logprobs": s
+                    .tokens
+                    .iter()
+                    .zip(&s.top)
+                    .map(|(tok, row)| row.iter().find(|(id, _)| id == tok).map_or(-9.0, |e| e.1))
+                    .collect::<Vec<_>>(),
                 "top_logprobs": tops,
             },
             "finish_reason": "length",
@@ -250,6 +255,28 @@ async fn chat(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> Respons
         }],
     }))
     .into_response()
+}
+
+/// The completions mock reports each generated token's own logprob, also where a flip made it
+/// the runner-up (like the chat mock), not the top candidate's (Scout e6bb10da).
+#[tokio::test]
+async fn completions_mock_logprob_is_the_generated_tokens() {
+    let mock = Arc::new(Mock::new(script(Variant::FlipP01), false, Duration::ZERO));
+    let body = json!({
+        "model": "mock-model", "temperature": 0, "return_tokens_as_token_ids": true,
+        "ignore_eos": true, "stream": false, "max_tokens": POSITIONS, "logprobs": 20,
+        "prompt": "alpha",
+    });
+    let resp = completions(State(mock), Json(body)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let lps = &v["choices"][0]["logprobs"]["token_logprobs"];
+    assert_eq!(lps[4], json!(-0.5), "{v}");
+    // Position 5 generated the runner-up, scripted at -0.5 - 2.0.
+    assert_eq!(lps[5], json!(-2.5), "{v}");
 }
 
 async fn mock_server(variant: Variant) -> SocketAddr {

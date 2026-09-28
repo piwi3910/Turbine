@@ -27,9 +27,10 @@ impl KvCopyKernel for CpuReference {
             )));
         }
         let blocks_per_layer = layer_stride / block_bytes;
-        if layers > 0
-            && (layers - 1) * layer_stride + blocks_per_layer * block_bytes > ctx.pool.len()
-        {
+        let extent = (layers.max(1) - 1)
+            .checked_mul(layer_stride)
+            .and_then(|e| e.checked_add(blocks_per_layer * block_bytes));
+        if layers > 0 && extent.is_none_or(|e| e > ctx.pool.len()) {
             return Err(invalid(format!(
                 "{layers} layers of {layer_stride} bytes exceed the pool of {} bytes",
                 ctx.pool.len()

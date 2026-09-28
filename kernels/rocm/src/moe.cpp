@@ -504,7 +504,10 @@ int32_t moe_experts_run(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
   const bool device_offsets = path == MoePath::SmallM ||
                               path == MoePath::WmmaPrefill ||
                               path == MoePath::Wmma;
-  if (!device_offsets && d->host_expert_offsets == nullptr) {
+  // Zero tokens read nothing: like expert_offsets below, the host copy is only
+  // required when there are rows to group.
+  if (!device_offsets && d->num_tokens > 0 &&
+      d->host_expert_offsets == nullptr) {
     return fail(
         ctx, TURBINE_E_ARGUMENT,
         "turbine_moe_experts: host_expert_offsets is NULL for " +

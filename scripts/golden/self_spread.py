@@ -77,7 +77,7 @@ def judge(ref, lps):
     worst_likely_pos = None
     for pos in range(div if div is not None else n):
         top = torch.topk(lps[pos], TOP_N)
-        got = {int(i): float(v) for i, v in zip(top.indices, top.values)}
+        got = {int(i): float(v) for i, v in zip(top.indices, top.values, strict=True)}
         row = sorted(ref["top_logprobs"][pos], key=lambda e: (-e[1], e[0]))[:TOP_K]
         for tid, rlp in row:
             if tid not in got:

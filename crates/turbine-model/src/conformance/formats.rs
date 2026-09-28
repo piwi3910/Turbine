@@ -97,7 +97,7 @@ pub fn formats_suite(reg: &Registry<dyn ToolFormat>) -> Result<(), Vec<Conforman
         report.check(name, "special_tokens", || {
             let texts: Vec<&str> = format.special_tokens().iter().map(|t| t.text).collect();
             for (i, text) in texts.iter().enumerate() {
-                ensure(!text.is_empty(), || "an empty special token".into())?;
+                ensure(!text.is_empty(), || format!("special token {i} is empty"))?;
                 ensure(!texts[..i].contains(text), || format!("{text} twice"))?;
             }
             bound = Some(bind(format, &tokenizer).map_err(|e| e.to_string())?);

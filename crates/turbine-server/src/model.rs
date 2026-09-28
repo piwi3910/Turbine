@@ -345,6 +345,13 @@ pub fn model_identity(dir: &Path) -> Result<ModelIdentity, StartupError> {
         let n = u64::from_le_bytes(len);
         let mut header = Vec::new();
         f.take(n).read_to_end(&mut header).map_err(io)?;
+        if header.len() as u64 != n {
+            return Err(StartupError::new(format!(
+                "{}: truncated safetensors header ({} of {n} bytes)",
+                path.display(),
+                header.len()
+            )));
+        }
         header
     };
     Ok(ModelIdentity::from_bytes(&config, &index))
@@ -1225,6 +1232,22 @@ mod tests {
         );
         // Not a cache layout: `snapshots` without the `models--<org>--<name>` parent.
         assert_eq!(default_served_name(Path::new("/x/snapshots/abc")), "abc");
+    }
+
+    /// A single-file checkpoint whose header is shorter than its length prefix is refused, not
+    /// hashed into a model identity from a partial header (Scout 702e45d9).
+    #[test]
+    fn model_identity_refuses_a_truncated_safetensors_header() {
+        let dir =
+            std::env::temp_dir().join(format!("turbine-identity-trunc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), b"{}").unwrap();
+        let mut file = 100u64.to_le_bytes().to_vec();
+        file.extend_from_slice(b"{\"x\":1}");
+        std::fs::write(dir.join("model.safetensors"), &file).unwrap();
+        let err = model_identity(&dir).map(|_| ()).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(err.to_string().contains("truncated"), "{err}");
     }
 
     #[test]
