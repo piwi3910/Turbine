@@ -276,6 +276,37 @@ fn gemm_case(
             ));
         }
     }
+    // Every row, not one target: an m-row window of a batch of the largest m, run alone, must
+    // give its rows the bits they get inside that batch (at its start and at its end: a
+    // prefix-reused suffix against the whole-prompt prefill). One target row misses solutions
+    // whose summation orders agree on it by chance (P5 Task 29: a tp 2 class mixing orders
+    // passed the single-row check and broke prefix reuse).
+    let top = ms.iter().copied().max().unwrap_or(1);
+    let mut big = rng.normal(top * k, 1.0);
+    if call.heavy_target {
+        for (i, v) in big.iter_mut().enumerate() {
+            if (i % k).is_multiple_of(97) {
+                *v *= 30.0;
+            }
+        }
+    }
+    let whole = run(&big, top);
+    for &m in ms.iter().filter(|&&m| m < top) {
+        let mut starts = vec![0, top - m];
+        starts.dedup();
+        for at in starts {
+            let c = run(&big[at * k..(at + m) * k], m);
+            out.push(Outcome::of(
+                format!(
+                    "gemm n={n} k={k} c={} window m={m} at={at} of {top}",
+                    c_dtype.as_str()
+                ),
+                row_slice(&whole, n, at, m),
+                &c,
+                &impl_name,
+            ));
+        }
+    }
     out
 }
 
