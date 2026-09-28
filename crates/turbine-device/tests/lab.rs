@@ -232,3 +232,82 @@ fn live_telemetry() {
         }
     }
 }
+
+/// P5 S-1: read-only topology discovery on the lab host (no device memory is allocated).
+/// `TURBINE_EXPECT_AMD=<n>` asserts n GPU vertices of `TURBINE_EXPECT_AMD_ARCH` (when set) and,
+/// for two or more, a PCIe GPU↔GPU edge whose peer access is reported, never guessed (novanas:
+/// `p2p: disabled`, `TURBINE_EXPECT_P2P`, default `disabled`); `TURBINE_EXPECT_NVIDIA=<n>` asserts
+/// n GPU vertices and an RDMA NIC at 200 Gb/s (dgx-spark). With neither set the test fails: a
+/// lab run must say what the host has.
+#[test]
+#[ignore = "needs lab GPUs; run via scripts/lab-test.sh"]
+fn topology_matches_host() {
+    use turbine_device::topology::{EdgeKind, RegisteredTopology, VertexAttrs, discover_topology};
+
+    let opts = DiscoveryOptions::from_config(&DevicesConfig::default());
+    let inv = discover(&opts).expect("discovery");
+    let mut vendor = RegisteredTopology::new(opts);
+    let graph = discover_topology(std::path::Path::new("/sys"), &inv, &mut vendor);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&graph).expect("graph serializes")
+    );
+    println!(
+        "topology_matches_host vertices={} edges={}",
+        graph.vertices.len(),
+        graph.edges.len()
+    );
+    let gpus: Vec<_> = graph
+        .vertices
+        .iter()
+        .filter_map(|v| match &v.attrs {
+            VertexAttrs::Gpu(g) => Some((v.id.clone(), g.clone())),
+            _ => None,
+        })
+        .collect();
+    let amd = expected_count("TURBINE_EXPECT_AMD");
+    let nvidia = expected_count("TURBINE_EXPECT_NVIDIA");
+    assert!(
+        amd.is_some() || nvidia.is_some(),
+        "set TURBINE_EXPECT_AMD or TURBINE_EXPECT_NVIDIA to what this host has"
+    );
+    if let Some(n) = amd {
+        let amd_gpus: Vec<_> = gpus
+            .iter()
+            .filter(|(_, g)| g.vendor == Vendor::Amd)
+            .collect();
+        assert_eq!(amd_gpus.len(), n, "AMD GPU vertices");
+        if let Some(arch) = expected("TURBINE_EXPECT_AMD_ARCH") {
+            for (id, g) in &amd_gpus {
+                assert_eq!(g.arch.as_deref(), Some(arch.as_str()), "{id}");
+            }
+        }
+        if n >= 2 {
+            let want = expected("TURBINE_EXPECT_P2P").unwrap_or_else(|| "disabled".into());
+            let (a, b) = (&amd_gpus[0].0, &amd_gpus[1].0);
+            let edge = graph
+                .edges
+                .iter()
+                .find(|e| {
+                    ((&e.a, &e.b) == (a, b) || (&e.a, &e.b) == (b, a)) && e.kind == EdgeKind::Pcie
+                })
+                .unwrap_or_else(|| panic!("no PCIe edge between {a} and {b}"));
+            let p2p = serde_json::to_value(edge.p2p).expect("p2p serializes");
+            assert_eq!(p2p, serde_json::Value::String(want), "{edge:?}");
+        }
+    }
+    if let Some(n) = nvidia {
+        let nv = gpus
+            .iter()
+            .filter(|(_, g)| g.vendor == Vendor::Nvidia)
+            .count();
+        assert_eq!(nv, n, "NVIDIA GPU vertices");
+        let rdma_200 = graph.vertices.iter().any(|v| match &v.attrs {
+            VertexAttrs::Nic(nic) => {
+                nic.rdma_device.is_some() && nic.rate_gbps.is_some_and(|r| r >= 200.0)
+            }
+            _ => false,
+        });
+        assert!(rdma_200, "an RDMA NIC at 200 Gb/s");
+    }
+}
