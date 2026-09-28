@@ -38,6 +38,7 @@ The lab's only multi-GPU host is novanas: 2× AMD Radeon AI PRO R9700 (gfx1201, 
 
 ## Out of scope
 
+- Deferred at the Phase 5 exit (2026-09-28) to Phase 5p: the release-mode one-GPU full-tier re-run (5p task 1), and the golden and bench confirmation that flips `parallel.tp_prefill_overlap` to on (Task 34's block-aligned split already passes the exact-reuse lab tests). OLMoE with expert × tensor parallelism is refused until phase 7 (`olmoe_ep_tp_drift`).
 - Worker discovery, membership, the general transport layer, the cluster-wide topology graph, request forwarding between nodes, the cluster KV directory, node-failure handling and NCCL hardware validation on the Sparks (Phase 6). The `static` rank mode is a fixed rank table for one TP group, not discovery.
 - Multi-node pipeline and expert parallelism, all-to-all token dispatch between data-parallel attention ranks, hot-expert replication and dynamic expert re-placement, prefill/decode disaggregation, RDMA/direct KV transfer and heterogeneous pools (deferred phases 9 and 10).
 - Sharded data parallelism (ZeRO / FSDP-style weight sharding across DP replicas): skipped (user decision 2026-09-28) — it serves training, and inference replicas that do not fit use TP, PP or EP.

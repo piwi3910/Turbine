@@ -1,6 +1,6 @@
 # phase-5-multi-gpu — implementation plan
 
-Status: draft
+Status: complete
 Spec: .procoder/specs/phase-5-multi-gpu.md
 
 ## Goal
@@ -650,6 +650,16 @@ Interfaces:
 ## P5 exit: OLMoE ep × tp refused
 
 As built (2026-09-28, user decision "P5 exit: OLMoE with expert × tensor parallelism", (2)): `turbine_core::support::PARALLEL_REFUSALS` holds `OlmoeForCausalLM` / `ep+tp` / `olmoe_ep_tp_drift`; `parallel::check_expert_parallel` refuses it (exit 2, `parallel.expert_parallel_size: olmoe_ep_tp_drift …`) before loading; `--support-matrix` lists it (text line `parallel …`, JSON `parallel_refusals`). Tests: `parallel::tests::expert_parallel_checked_against_the_model`, `server_cli olmoe_ep_tp_exits_2`, `support_matrix_output`; `tiny_server ep2_serves_like_ep1` serves ep 2 with tp 1 only; `scripts/lab-cluster.sh ep2-novanas` checks the refusal instead of serving ep 2 × tp 2.
+
+## Phase exit (2026-09-28)
+
+User decision "Closing Phase 5: recheck, merge and push": quick recheck, then merge and push.
+
+- Gates: `gate --full` ok; the one-GPU full tier (`lab-test --tier full`) passed before the copy fix (768/0, run 0928121037-0764c2d7); its re-run after the pinned bounce buffer was stopped at the user's request with 33 test binaries done and no failure — the release-mode re-run is Phase 5p task 1. The two-GPU fault-injection leg passed after the fixes (25/0, run 0928164601-2ec83d3b). `lab-bench --golden16` Llama and OLMoE passed before the copy fix (855.3 / 613.8 tok/s) and are re-checked on the final tip (close recheck, labbook). The 10-minute soak passed before the copy fix (all 8 checks; one GPU, a single copying thread).
+- `parallel.tp_prefill_overlap` stays off by default: Task 34's block-aligned split passed the exact-reuse lab tests (run 0928165853-0f5d9239), but its golden and bench confirmation at tp 2 was not run before the close; it moves to Phase 5p, which flips the default once it passes.
+- OLMoE with ep > 1 and tp > 1 is refused (`olmoe_ep_tp_drift`) until the phase 7 OLMoE tensor-parallel drift investigation.
+- The pageable device-to-host corruption was reported upstream as ROCm/clr#291 (filed 2026-09-28 from the user's account); Turbine avoids it with the pinned bounce buffer.
+- The vLLM-ROCm two-GPU comparison (Task 35) was stopped early at the user's request; the partial results are in labbook set `phase-5-vs-vllm` (vLLM tp 2 at c16: 97.5 tok/s against Turbine's 912, vLLM falling back to RCCL-only all-reduce without custom all-reduce).
 
 ## Queued after Phase 5 (not part of this phase)
 
