@@ -25,7 +25,7 @@ mod r#loop;
 pub(crate) mod requests;
 pub(crate) mod stages;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -112,9 +112,25 @@ pub struct EngineDocs {
 #[derive(Default)]
 pub struct EngineShared {
     docs: Mutex<Option<EngineDocs>>,
+    /// Tokens this engine still has to process for the requests it holds: per request its
+    /// prompt plus `n × max_tokens`, less what it generated. Raised when a submission is
+    /// accepted and recomputed after every step; the data-parallel router's load (P5 S-7).
+    outstanding_tokens: AtomicU64,
 }
 
 impl EngineShared {
+    pub fn outstanding_tokens(&self) -> u64 {
+        self.outstanding_tokens.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn add_outstanding(&self, tokens: u64) {
+        self.outstanding_tokens.fetch_add(tokens, Ordering::AcqRel);
+    }
+
+    pub(crate) fn set_outstanding(&self, tokens: u64) {
+        self.outstanding_tokens.store(tokens, Ordering::Release);
+    }
+
     pub fn publish(&self, docs: EngineDocs) {
         *self.docs.lock().unwrap_or_else(PoisonError::into_inner) = Some(docs);
     }
@@ -145,6 +161,8 @@ pub struct ReliabilityStartup {
     pub telemetry: TelemetryMetrics,
     /// The KV hierarchy's inputs (Phase 4).
     pub kv: KvSetup,
+    /// The data-parallel replica this engine serves (P5 S-7; 0 with one replica).
+    pub replica: u32,
 }
 
 /// Starts the engine thread: it loads the weights, measures the memory budget, allocates the KV
@@ -160,8 +178,13 @@ pub fn spawn(
     timeouts: Timeouts,
     fatal: UnboundedSender<Fatal>,
 ) -> std::io::Result<()> {
+    let replica = startup.replica;
     std::thread::Builder::new()
-        .name("turbine-engine".into())
+        .name(if replica == 0 {
+            "turbine-engine".into()
+        } else {
+            format!("turbine-engine-{replica}")
+        })
         .spawn(move || {
             // `scheduler.policy` was checked against the registry before any port was bound
             // (`Config::validate_modules`); `select` logs `module_selected`.
@@ -254,6 +277,7 @@ pub fn spawn(
                 metrics: startup.metrics.clone(),
                 clock: Arc::clone(&clock),
                 reclaimer: kv.reclaimer(),
+                replica,
             });
             #[allow(unused_mut)]
             let mut executor: Box<dyn ModelExecutor> = loaded.executor;
@@ -357,6 +381,7 @@ pub fn spawn(
                 reliability: parts.engine,
             });
             backend.set_ready(
+                replica,
                 EngineHandle {
                     submit_tx,
                     kv: kv_handle,
@@ -366,7 +391,7 @@ pub fn spawn(
                 loaded.load_seconds,
                 loaded.weight_bytes,
             );
-            tracing::info!("ready");
+            tracing::info!(replica, "ready");
             drop(backend);
             let result = engine.run();
             stop.store(true, Ordering::Release);

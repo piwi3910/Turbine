@@ -106,6 +106,9 @@ pub struct PressureController {
     last_signals: Vec<SignalValue>,
     last_horizon: f64,
     handle: ControllerHandle,
+    /// The data-parallel replica this controller watches (P5; 0 in a single-replica process):
+    /// the `replica` of its document's group and replica views and of the group gauges.
+    replica: u32,
 }
 
 impl PressureController {
@@ -167,9 +170,18 @@ impl PressureController {
             handle: ControllerHandle {
                 snap: Arc::clone(&handle.snap),
             },
+            replica: 0,
         };
         c.publish();
         (c, handle)
+    }
+
+    /// Watches data-parallel replica `replica` (P5): its document's `groups` / `replicas` and the
+    /// group gauges carry that index. Republishes at once.
+    pub fn with_replica(mut self, replica: u32) -> Self {
+        self.replica = replica;
+        self.publish();
+        self
     }
 
     pub fn handle(&self) -> ControllerHandle {
@@ -395,12 +407,12 @@ impl PressureController {
             transitions: self.machine.history().map(TransitionDoc::from).collect(),
             // P5 S-8: a single-GPU process is one device, one group of one, one replica.
             devices: vec![device_doc(&self.budget, state)],
-            groups: vec![GroupDoc::of(0, &[(self.budget.device, state)])],
-            replicas: vec![ReplicaDoc::of(0, state, self.circuit.state())],
+            groups: vec![GroupDoc::of(self.replica, &[(self.budget.device, state)])],
+            replicas: vec![ReplicaDoc::of(self.replica, state, self.circuit.state())],
         };
         self.metrics.record_device_budget(&self.budget);
         self.metrics
-            .record_group(0, GroupState::of(&[(self.budget.device, state)]));
+            .record_group(self.replica, GroupState::of(&[(self.budget.device, state)]));
         self.handle.snap.store(Arc::new(Snapshot {
             state,
             circuit: self.circuit.state(),

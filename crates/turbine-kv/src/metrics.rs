@@ -8,7 +8,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
-use turbine_observability::MetricsRegistry;
+use turbine_observability::{GaugeFamilyShare, GaugeShare, MetricsRegistry};
 
 use crate::directory::PrefixMatch;
 use crate::planner::PlanReason;
@@ -98,8 +98,9 @@ impl PrefetchOutcome {
 /// Shared handles to every KV family; cloning shares the underlying values.
 #[derive(Clone)]
 pub struct KvMetrics {
-    pub blocks: Family<Labels2, Gauge>,
-    pub bytes: Family<Labels2, Gauge>,
+    /// Gauges are this pool's share: data-parallel replicas add up ([`KvMetrics::another_replica`]).
+    pub blocks: GaugeFamilyShare<Labels2>,
+    pub bytes: GaugeFamilyShare<Labels2>,
     pub lookups: Family<Labels1, Counter>,
     pub prefix_cached_tokens: Counter,
     pub prompt_tokens: Counter,
@@ -113,9 +114,9 @@ pub struct KvMetrics {
     pub transfer_bytes: Family<Labels1, Counter>,
     pub transfer_bandwidth: Family<Labels1, Gauge<f64, AtomicU64>>,
     pub prefetch: Family<Labels1, Counter>,
-    pub sessions: Gauge,
+    pub sessions: GaugeShare,
     pub tier_degraded: Family<Labels1, Gauge>,
-    pub storage_queue_depth: Gauge,
+    pub storage_queue_depth: GaugeShare,
     pub storage_latency: Histogram,
 }
 
@@ -128,8 +129,8 @@ impl KvMetrics {
     /// Families not attached to any registry (unit tests and the offline simulator).
     pub fn unregistered() -> Self {
         KvMetrics {
-            blocks: Family::default(),
-            bytes: Family::default(),
+            blocks: GaugeFamilyShare::new(Family::default()),
+            bytes: GaugeFamilyShare::new(Family::default()),
             lookups: Family::default(),
             prefix_cached_tokens: Counter::default(),
             prompt_tokens: Counter::default(),
@@ -143,9 +144,9 @@ impl KvMetrics {
             transfer_bytes: Family::default(),
             transfer_bandwidth: Family::default(),
             prefetch: Family::default(),
-            sessions: Gauge::default(),
+            sessions: GaugeShare::default(),
             tier_degraded: Family::default(),
-            storage_queue_depth: Gauge::default(),
+            storage_queue_depth: GaugeShare::default(),
             storage_latency: latency_histogram(),
         }
     }
@@ -156,12 +157,12 @@ impl KvMetrics {
         reg.register(
             "turbine_kv_blocks",
             "KV blocks per tier and state",
-            m.blocks.clone(),
+            m.blocks.family().clone(),
         );
         reg.register(
             "turbine_kv_bytes",
             "KV bytes per tier (capacity, used)",
-            m.bytes.clone(),
+            m.bytes.family().clone(),
         );
         reg.register(
             "turbine_kv_lookups",
@@ -231,7 +232,7 @@ impl KvMetrics {
         reg.register(
             "turbine_kv_sessions",
             "Sessions in the KV session table",
-            m.sessions.clone(),
+            m.sessions.gauge().clone(),
         );
         reg.register(
             "turbine_kv_tier_degraded",
@@ -241,7 +242,7 @@ impl KvMetrics {
         reg.register(
             "turbine_storage_queue_depth",
             "In-flight L2 NVMe I/O operations",
-            m.storage_queue_depth.clone(),
+            m.storage_queue_depth.gauge().clone(),
         );
         reg.register(
             "turbine_storage_latency_seconds",
@@ -252,18 +253,26 @@ impl KvMetrics {
         m
     }
 
+    /// The same families for another data-parallel replica's pool: counters and histograms are
+    /// shared, the occupancy gauges get a fresh share (the gauges report the sum over replicas).
+    pub fn another_replica(&self) -> KvMetrics {
+        KvMetrics {
+            blocks: self.blocks.another(),
+            bytes: self.bytes.another(),
+            sessions: self.sessions.another(),
+            storage_queue_depth: self.storage_queue_depth.another(),
+            ..self.clone()
+        }
+    }
+
     /// Touches every documented label combination so each family renders from startup.
     pub fn init_labels(&self) {
         for t in TierId::LOCAL {
             for s in ["used", "free"] {
-                let _ = self
-                    .blocks
-                    .get_or_create(&[("tier", t.as_str()), ("state", s)]);
+                self.blocks.touch(&[("tier", t.as_str()), ("state", s)]);
             }
             for k in ["capacity", "used"] {
-                let _ = self
-                    .bytes
-                    .get_or_create(&[("tier", t.as_str()), ("kind", k)]);
+                self.bytes.touch(&[("tier", t.as_str()), ("kind", k)]);
             }
             let _ = self.lookups.get_or_create(&[("result", t.as_str())]);
             let _ = self.tier_degraded.get_or_create(&[("tier", t.as_str())]);
@@ -395,12 +404,14 @@ impl KvMetrics {
 
     /// Publish the L0 pool's current occupancy (Phase 2; the engine calls it every iteration).
     pub fn record(&self, pool: &BlockPool) {
-        let gauge = |state| {
-            self.blocks
-                .get_or_create(&[("tier", TIER_L0), ("state", state)])
-        };
-        gauge("used").set(i64::from(pool.used_blocks()));
-        gauge("free").set(i64::from(pool.free_blocks()));
+        self.blocks.set(
+            &[("tier", TIER_L0), ("state", "used")],
+            i64::from(pool.used_blocks()),
+        );
+        self.blocks.set(
+            &[("tier", TIER_L0), ("state", "free")],
+            i64::from(pool.free_blocks()),
+        );
     }
 
     /// Capacity and usage of one tier (a disabled tier reports zeros).
@@ -415,17 +426,13 @@ impl KvMetrics {
         let t = tier.as_str();
         let gauge = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
         self.bytes
-            .get_or_create(&[("tier", t), ("kind", "capacity")])
-            .set(gauge(capacity_bytes));
+            .set(&[("tier", t), ("kind", "capacity")], gauge(capacity_bytes));
         self.bytes
-            .get_or_create(&[("tier", t), ("kind", "used")])
-            .set(gauge(used_bytes));
+            .set(&[("tier", t), ("kind", "used")], gauge(used_bytes));
         self.blocks
-            .get_or_create(&[("tier", t), ("state", "used")])
-            .set(gauge(used_blocks));
+            .set(&[("tier", t), ("state", "used")], gauge(used_blocks));
         self.blocks
-            .get_or_create(&[("tier", t), ("state", "free")])
-            .set(gauge(free_blocks));
+            .set(&[("tier", t), ("state", "free")], gauge(free_blocks));
     }
 }
 

@@ -198,6 +198,8 @@ pub(crate) struct ReliabilityInputs<'a> {
     /// What the controller's reclaim step drives (P3 S-10): the KV hierarchy's lock-free
     /// `KvReclaimHandle` from Phase 4 (demotion to lower tiers, freeing cached blocks).
     pub reclaimer: Arc<dyn KvReclaimer>,
+    /// The data-parallel replica this engine serves (P5; 0 with one replica).
+    pub replica: u32,
 }
 
 /// The pieces [`build`] returns: the engine's end, the admission gate for its scheduler, and
@@ -228,6 +230,7 @@ pub(crate) fn build(inp: ReliabilityInputs<'_>) -> ReliabilityParts {
         inp.metrics.clone(),
         Arc::clone(&inp.clock),
     );
+    let controller = controller.with_replica(inp.replica);
     let admission = Admission::new(
         AdmissionParams {
             device,

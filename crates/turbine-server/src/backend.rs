@@ -28,6 +28,7 @@ use turbine_api::{
     ModelCard, NotReadyReason, PrefetchAccepted, PrefetchRequest, Readiness, ReadyState,
     TopologyScope, readiness_for_circuit,
 };
+use turbine_core::config::DpRouterPolicy;
 use turbine_core::request::{
     ConstraintSpec, Endpoint, ErrorCode, GenerationRequest, SamplingParams, SessionHints,
     StopConditions,
@@ -40,6 +41,7 @@ use turbine_kernels::Selection;
 use turbine_kv::blocks_for_tokens;
 use turbine_kv::hierarchy::PrefetchError;
 use turbine_model::{ChatTemplate, Tokenizer, ToolChoice};
+use turbine_observability::MetricsRegistry;
 use turbine_reliability::budget::PoolKind;
 use turbine_reliability::controller::ControllerHandle;
 use turbine_scheduler::{SchedulerMetrics, SubmitError};
@@ -54,6 +56,7 @@ use crate::metrics::{Outcome, ServerMetrics};
 use crate::model::PreparedModel;
 use crate::modules::ModuleChoices;
 use crate::reliability::api_error_for;
+use crate::replicas::{ReplicaLoad, ReplicaRouter};
 
 const STATE_LOADING: u8 = 0;
 const STATE_READY: u8 = 1;
@@ -164,7 +167,10 @@ struct Loaded {
 /// The server's `InferenceBackend`, `Readiness` and `Diagnostics`.
 pub struct ModelBackend {
     state: AtomicU8,
-    loaded: OnceLock<Loaded>,
+    /// One slot per data-parallel replica (P5 S-7), filled when that replica's engine is warm.
+    replicas: Vec<OnceLock<Loaded>>,
+    /// The replica choice when there is more than one replica.
+    router: Option<ReplicaRouter>,
     served_name: String,
     architecture: String,
     expected_weight_bytes: u64,
@@ -218,7 +224,8 @@ impl ModelBackend {
         });
         ModelBackend {
             state: AtomicU8::new(STATE_LOADING),
-            loaded: OnceLock::new(),
+            replicas: vec![OnceLock::new()],
+            router: None,
             served_name: model.served_name.clone(),
             architecture: model.arch.hf_architecture.clone(),
             expected_weight_bytes: model.budget.pool(PoolKind::Weights),
@@ -259,6 +266,34 @@ impl ModelBackend {
         }
     }
 
+    /// Serves `replicas` data-parallel replicas (P5 S-7): `/ready` turns 200 once every one is
+    /// warm and each request goes to the replica [`ReplicaRouter`] picks.
+    pub fn with_replicas(
+        mut self,
+        replicas: usize,
+        policy: DpRouterPolicy,
+        reg: &MetricsRegistry,
+    ) -> ModelBackend {
+        let replicas = replicas.max(1);
+        self.replicas = (0..replicas).map(|_| OnceLock::new()).collect();
+        self.router =
+            (replicas > 1).then(|| ReplicaRouter::new(replicas, policy, self.block_tokens, reg));
+        self
+    }
+
+    /// Replica 0 (the only one without data parallelism), once warm.
+    fn loaded(&self) -> Option<&Loaded> {
+        self.replicas.first().and_then(OnceLock::get)
+    }
+
+    /// Every warm replica with its index.
+    fn warm(&self) -> impl Iterator<Item = (usize, &Loaded)> {
+        self.replicas
+            .iter()
+            .enumerate()
+            .filter_map(|(r, slot)| slot.get().map(|l| (r, l)))
+    }
+
     /// Reports `parallel` (the plan computed before bind) in the status document.
     pub fn with_parallel(mut self, parallel: Value) -> ModelBackend {
         self.parallel = Some(parallel);
@@ -277,9 +312,11 @@ impl ModelBackend {
         self
     }
 
-    /// Weights loaded and warmed up: `/ready` turns 200 and requests are accepted.
+    /// Replica `replica`'s weights are loaded and warmed up; once every replica is, `/ready`
+    /// turns 200 and requests are accepted.
     pub fn set_ready(
         &self,
+        replica: u32,
         engine: EngineHandle,
         shared: Arc<EngineShared>,
         controller: ControllerHandle,
@@ -289,8 +326,10 @@ impl ModelBackend {
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        if self
-            .loaded
+        let Some(slot) = self.replicas.get(replica as usize) else {
+            return;
+        };
+        if slot
             .set(Loaded {
                 engine,
                 shared,
@@ -300,6 +339,7 @@ impl ModelBackend {
                 created,
             })
             .is_ok()
+            && self.replicas.iter().all(|s| s.get().is_some())
         {
             // A shutdown that began during the load keeps `shutting_down`.
             let _ = self.state.compare_exchange(
@@ -331,27 +371,24 @@ impl ModelBackend {
             });
     }
 
-    /// No request is queued or running in the engine (true before it runs).
+    /// No request is queued or running in any engine (true before they run).
     pub fn engine_idle(&self) -> bool {
-        self.loaded
-            .get()
-            .and_then(|l| l.shared.docs())
-            .is_none_or(|d| {
+        self.warm().all(|(_, l)| {
+            l.shared.docs().is_none_or(|d| {
                 let s = &d.scheduler;
                 s.waiting + s.prefilling + s.decoding + s.paused == 0
             })
+        })
     }
 
-    /// The engine thread has stopped (its command receiver is gone), or never started.
+    /// Every engine thread has stopped (its command receiver is gone), or never started.
     pub fn engine_stopped(&self) -> bool {
-        self.loaded
-            .get()
-            .is_none_or(|l| l.engine.submit_tx.is_closed())
+        self.warm().all(|(_, l)| l.engine.submit_tx.is_closed())
     }
 
     /// Asks the engine to cancel what is left and stop (the server is exiting). Never waits.
     pub fn stop_engine(&self) {
-        if let Some(loaded) = self.loaded.get() {
+        for (_, loaded) in self.warm() {
             let _ = loaded.engine.submit_tx.try_send(EngineCommand::Shutdown);
         }
     }
@@ -603,9 +640,9 @@ impl ModelBackend {
     /// the OpenAI routes (the chat template with the generation prompt), then the engine queues
     /// the promotions of its cached blocks.
     async fn prefetch_blocks(&self, req: PrefetchRequest) -> Result<PrefetchAccepted, ApiError> {
-        let Some(loaded) = self.loaded.get().filter(|_| self.is_ready()) else {
+        if self.loaded().is_none() || !self.is_ready() {
             return Err(ApiError::model_not_loaded());
-        };
+        }
         let cache_salt = req.cache_salt.unwrap_or_default();
         let target = match req.target {
             PrefetchTarget::Session { session_id } => PrefetchTargetOwned::Session(session_id),
@@ -634,7 +671,17 @@ impl ModelBackend {
                 }
             }
         };
-        match loaded.engine.kv.prefetch(target).await {
+        // Every replica keeps its own KV hierarchy (P5 S-7): a session or prefix lives on the
+        // replica that computed it, so the first replica that accepts answers; otherwise the
+        // last refusal (normally `session_not_found`).
+        let mut answer = Err(PrefetchRefused::EngineGone);
+        for (_, loaded) in self.warm() {
+            answer = loaded.engine.kv.prefetch(target.clone()).await;
+            if answer.is_ok() {
+                break;
+            }
+        }
+        match answer {
             Ok(a) => Ok(PrefetchAccepted {
                 blocks_queued: a.blocks_queued,
                 blocks_resident: a.blocks_resident,
@@ -661,15 +708,46 @@ impl ModelBackend {
         if self.state.load(Ordering::Acquire) == STATE_SHUTTING_DOWN {
             return Err(self.reject(endpoint, ApiError::shutting_down()));
         }
-        let Some(loaded) = self.loaded.get().filter(|_| self.is_ready()) else {
+        if self.loaded().is_none() || !self.is_ready() {
             return Err(self.reject(endpoint, ApiError::model_not_loaded()));
-        };
+        }
         let mut submission = self.build(&req).map_err(|e| self.reject(endpoint, e))?;
         self.compile(&mut submission)
             .await
             .map_err(|e| self.reject(endpoint, e))?;
         let prompt_len = u32::try_from(submission.request.prompt_tokens.len()).unwrap_or(u32::MAX);
         let max_tokens = submission.request.stop.max_tokens;
+        // P5 S-7: the replica whose engine takes the request (replica 0 without data parallelism).
+        let tokens =
+            u64::from(prompt_len) + u64::from(submission.request.n.max(1)) * u64::from(max_tokens);
+        let (replica, key) = match &self.router {
+            None => (0, None),
+            Some(router) => {
+                let key = router.prefix_key(
+                    submission.request.cache_salt.as_deref(),
+                    &submission.request.prompt_tokens,
+                );
+                let loads: Vec<Option<ReplicaLoad>> = self
+                    .replicas
+                    .iter()
+                    .map(|slot| {
+                        slot.get().map(|l| ReplicaLoad {
+                            state: l.controller.state(),
+                            circuit: l.controller.circuit(),
+                            engine_outstanding: l.shared.outstanding_tokens(),
+                        })
+                    })
+                    .collect();
+                let Some((replica, _)) = router.pick(&loads, key) else {
+                    return Err(self.reject(endpoint, ApiError::model_not_loaded()));
+                };
+                router.sending(replica, tokens);
+                (replica, key)
+            }
+        };
+        let Some(loaded) = self.replicas[replica].get() else {
+            return Err(self.reject(endpoint, ApiError::model_not_loaded()));
+        };
         let (events, stream) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (ack, admitted) = oneshot::channel();
         // Waits for room in the bounded command channel, which the engine drains every turn.
@@ -683,9 +761,19 @@ impl ModelBackend {
             ApiError::internal("the engine thread has stopped")
         };
         if sent.is_err() {
+            if let Some(router) = &self.router {
+                router.delivered(replica, tokens);
+            }
             return Err(engine_gone());
         }
-        match admitted.await {
+        let answer = admitted.await;
+        if let Some(router) = &self.router {
+            router.delivered(replica, tokens);
+            if matches!(answer, Ok(Ok(()))) {
+                router.remember(key, replica);
+            }
+        }
+        match answer {
             Ok(Ok(())) => Ok(stream),
             Ok(Err(e)) => Err(self.reject(endpoint, self.submit_error(e, prompt_len, max_tokens))),
             Err(_) => Err(engine_gone()),
@@ -695,7 +783,7 @@ impl ModelBackend {
 
 impl InferenceBackend for ModelBackend {
     fn models(&self) -> Vec<ModelCard> {
-        match self.loaded.get().filter(|_| self.is_serving()) {
+        match self.loaded().filter(|_| self.is_serving()) {
             Some(loaded) => vec![ModelCard {
                 id: self.served_name.clone(),
                 object: "model".into(),
@@ -728,14 +816,19 @@ impl InferenceBackend for ModelBackend {
 }
 
 impl Readiness for ModelBackend {
+    /// Ready once every replica is warm; with data parallelism the circuit that decides is the
+    /// best replica's (one replica with its circuit open leaves the others serving, P5 S-7).
     fn ready(&self) -> ReadyState {
         let reason = match self.state.load(Ordering::Acquire) {
             STATE_READY => {
-                let circuit = self
-                    .loaded
-                    .get()
-                    .map_or(CircuitState::Healthy, |l| l.controller.circuit());
-                return readiness_for_circuit(circuit, ReadyState::Ready);
+                let mut answers = self
+                    .warm()
+                    .map(|(_, l)| readiness_for_circuit(l.controller.circuit(), ReadyState::Ready));
+                let first = answers.next().unwrap_or(ReadyState::Ready);
+                if first == ReadyState::Ready {
+                    return first;
+                }
+                return answers.find(|a| *a == ReadyState::Ready).unwrap_or(first);
             }
             STATE_LOADING => NotReadyReason::LoadingModel,
             STATE_LOAD_FAILED => NotReadyReason::ModelLoadFailed,
@@ -748,7 +841,18 @@ impl Readiness for ModelBackend {
 
 impl Diagnostics for ModelBackend {
     fn status(&self) -> Value {
-        let loaded = self.loaded.get();
+        let loaded = self.loaded();
+        // With data parallelism the worst replica's pressure state and circuit.
+        let pressure_state = self
+            .warm()
+            .map(|(_, l)| l.controller.state())
+            .max()
+            .unwrap_or(PressureState::Green);
+        let circuit_state = self
+            .warm()
+            .map(|(_, l)| l.controller.circuit())
+            .max_by_key(|c| circuit_rank(*c))
+            .unwrap_or(CircuitState::Healthy);
         serde_json::to_value(StatusDocument {
             version: env!("CARGO_PKG_VERSION"),
             uptime_seconds: self.started.elapsed().as_secs(),
@@ -763,8 +867,8 @@ impl Diagnostics for ModelBackend {
             modules: &self.modules,
             kernels: &self.kernels,
             support: self.support.as_ref(),
-            pressure_state: loaded.map_or(PressureState::Green, |l| l.controller.state()),
-            circuit_state: loaded.map_or(CircuitState::Healthy, |l| l.controller.circuit()),
+            pressure_state,
+            circuit_state,
             parallel: self.parallel.as_ref(),
         })
         .unwrap_or(Value::Null)
@@ -772,22 +876,66 @@ impl Diagnostics for ModelBackend {
     fn devices(&self) -> Value {
         self.devices.clone()
     }
-    /// `Scheduler::snapshot` as of the engine's last step; 503 until the engine runs.
+    /// `Scheduler::snapshot` of every replica's engine as of its last step, keyed by replica
+    /// index (P5 contract §14: `{"0": {…}}`); 503 until every engine runs.
     fn scheduler(&self) -> Result<Value, ApiError> {
-        let docs = self.engine_docs()?;
-        serde_json::to_value(docs.scheduler).map_err(|e| ApiError::internal(e.to_string()))
+        let mut out = serde_json::Map::new();
+        for (r, docs) in self.engine_docs()? {
+            let doc = serde_json::to_value(docs.scheduler)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            out.insert(r.to_string(), doc);
+        }
+        Ok(Value::Object(out))
     }
-    /// The KV hierarchy's document (P4 §Data) as of the engine's last step; 503 until the
-    /// engine runs.
+    /// The KV hierarchy's document (P4 §Data) as of the engine's last step; with data
+    /// parallelism one per replica, keyed by replica index. 503 until every engine runs.
     fn kv(&self) -> Result<Value, ApiError> {
         let docs = self.engine_docs()?;
-        serde_json::to_value(docs.kv).map_err(|e| ApiError::internal(e.to_string()))
+        if self.replicas.len() == 1 {
+            let (_, only) = docs
+                .into_iter()
+                .next()
+                .ok_or_else(ApiError::model_not_loaded)?;
+            return serde_json::to_value(only.kv).map_err(|e| ApiError::internal(e.to_string()));
+        }
+        let mut out = serde_json::Map::new();
+        for (r, d) in docs {
+            let doc = serde_json::to_value(d.kv).map_err(|e| ApiError::internal(e.to_string()))?;
+            out.insert(r.to_string(), doc);
+        }
+        Ok(Value::Object(out))
     }
-    /// The pressure controller's document (P3 §Data); 503 until the engine runs.
+    /// The pressure controller's document (P3 §Data); 503 until the engine runs. With data
+    /// parallelism replica 0's document carries every replica's `devices`, `groups` and
+    /// `replicas` views (P5 S-8), and each replica's whole document is under `replica_documents`.
     fn pressure(&self) -> Result<Value, ApiError> {
-        let loaded = self.loaded.get().ok_or_else(ApiError::model_not_loaded)?;
-        serde_json::to_value(loaded.controller.document())
-            .map_err(|e| ApiError::internal(e.to_string()))
+        let first = self.loaded().ok_or_else(ApiError::model_not_loaded)?;
+        let to_json = |l: &Loaded| {
+            serde_json::to_value(l.controller.document())
+                .map_err(|e| ApiError::internal(e.to_string()))
+        };
+        let mut doc = to_json(first)?;
+        if self.replicas.len() == 1 {
+            return Ok(doc);
+        }
+        let mut views: [Vec<Value>; 3] = Default::default();
+        let mut whole = serde_json::Map::new();
+        for (r, l) in self.warm() {
+            let d = to_json(l)?;
+            for (i, key) in ["devices", "groups", "replicas"].into_iter().enumerate() {
+                if let Some(Value::Array(items)) = d.get(key) {
+                    views[i].extend(items.iter().cloned());
+                }
+            }
+            whole.insert(r.to_string(), d);
+        }
+        if let Value::Object(map) = &mut doc {
+            for (i, key) in ["devices", "groups", "replicas"].into_iter().enumerate() {
+                map.insert(key.to_string(), Value::Array(std::mem::take(&mut views[i])));
+            }
+            map.insert("replica_documents".to_string(), Value::Object(whole));
+        }
+        Ok(doc)
     }
     /// The graph captured at startup; only the node scope exists before Phase 6.
     fn topology(&self, scope: TopologyScope) -> Result<Value, ApiError> {
@@ -798,12 +946,31 @@ impl Diagnostics for ModelBackend {
     }
 }
 
+/// Severity order of circuit states for the status document's worst replica.
+fn circuit_rank(c: CircuitState) -> u8 {
+    match c {
+        CircuitState::Healthy => 0,
+        CircuitState::Degraded => 1,
+        CircuitState::Probing => 2,
+        CircuitState::Draining => 3,
+        _ => 4,
+    }
+}
+
 impl ModelBackend {
-    fn engine_docs(&self) -> Result<crate::engine::EngineDocs, ApiError> {
-        self.loaded
-            .get()
-            .and_then(|l| l.shared.docs())
-            .ok_or_else(ApiError::model_not_loaded)
+    /// Every replica's latest documents, in replica order; `model_not_loaded` until each engine
+    /// has published once.
+    fn engine_docs(&self) -> Result<Vec<(usize, crate::engine::EngineDocs)>, ApiError> {
+        self.replicas
+            .iter()
+            .enumerate()
+            .map(|(r, slot)| {
+                slot.get()
+                    .and_then(|l| l.shared.docs())
+                    .map(|d| (r, d))
+                    .ok_or_else(ApiError::model_not_loaded)
+            })
+            .collect()
     }
 }
 

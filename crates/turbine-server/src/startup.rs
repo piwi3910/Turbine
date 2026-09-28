@@ -37,8 +37,9 @@ use axum::serve::ListenerExt;
 use turbine_api::support::SupportMetrics;
 use turbine_api::{ApiLimits, ApiState};
 use turbine_core::clock::SystemClock;
-use turbine_core::config::{self, Config, ConfigError};
+use turbine_core::config::{self, ByteSize, Config, ConfigError, KvConfig};
 use turbine_core::support::SupportRowView;
+use turbine_core::types::DeviceId;
 use turbine_device::telemetry::TelemetryMetrics;
 use turbine_device::topology::{RegisteredTopology, TopologyGraph, discover_topology};
 use turbine_device::{DeviceInventory, DeviceMetrics, DiscoveryOptions};
@@ -194,36 +195,65 @@ pub fn run(cli: Cli) -> ExitCode {
     DeviceMetrics::register(&metrics).record(&inventory);
     SupportMetrics::register(&metrics).set(&support.status);
     parallel::register_info(&metrics, &plan);
-    let prepared = match model::prepare(&config, &inventory, &metrics) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(error = %e, "model startup failed");
-            eprintln!("turbine-server: {e}");
-            return ExitCode::Startup;
-        }
-    };
-    // P4: the model's block size is known now (exit 2), and L2 opens before the listener binds
-    // (exit 1 naming the path).
-    let layout = prepared.pool.layout;
-    if let Err(e) = config.kv.validate_block_bytes(layout.block_bytes()) {
-        eprintln!("turbine-server: invalid configuration: {e}");
-        return ExitCode::Config;
-    }
+    // Steps 4–6 per data-parallel replica (P5 S-7): replica 0 on the plan's first device, the
+    // others on theirs, sharing the grammar compiler and the kernel metrics. Replicas that share
+    // a device (`parallel.allow_device_sharing`) split its budget.
+    let devices: Vec<DeviceId> = plan.groups.iter().map(|g| g.ranks[0].device).collect();
     let kv_metrics = KvMetrics::register(&metrics);
-    let l2 = match kv_orchestrator::open_l2(
-        &config.kv,
-        &kv_format(layout),
-        &prepared.identity,
-        Arc::new(SystemClock::new()),
-        kv_metrics.clone(),
-    ) {
-        Ok(l2) => l2,
-        Err(e) => {
-            tracing::error!(error = %e, "KV tier startup failed");
+    let mut replicas: Vec<ReplicaStart> = Vec::with_capacity(devices.len());
+    for (r, &device) in devices.iter().enumerate() {
+        let cfg = replica_config(&config, r, devices.len(), device);
+        let prepared = match replicas.first() {
+            None => model::prepare(&cfg, &inventory, &metrics),
+            Some(base) => model::prepare_replica(&cfg, &inventory, &base.prepared),
+        };
+        let mut prepared = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(replica = r, error = %e, "model startup failed");
+                eprintln!("turbine-server: {e}");
+                return ExitCode::Startup;
+            }
+        };
+        let sharing = devices.iter().filter(|d| **d == device).count() as u32;
+        if let Err(e) = prepared.share_device(sharing) {
+            tracing::error!(replica = r, error = %e, "model startup failed");
             eprintln!("turbine-server: {e}");
             return ExitCode::Startup;
         }
-    };
+        // P4: the model's block size is known now (exit 2), and L2 opens before the listener
+        // binds (exit 1 naming the path).
+        let layout = prepared.pool.layout;
+        if let Err(e) = cfg.kv.validate_block_bytes(layout.block_bytes()) {
+            eprintln!("turbine-server: invalid configuration: {e}");
+            return ExitCode::Config;
+        }
+        let replica_kv_metrics = if r == 0 {
+            kv_metrics.clone()
+        } else {
+            kv_metrics.another_replica()
+        };
+        let l2 = match kv_orchestrator::open_l2(
+            &cfg.kv,
+            &kv_format(layout),
+            &prepared.identity,
+            Arc::new(SystemClock::new()),
+            replica_kv_metrics.clone(),
+        ) {
+            Ok(l2) => l2,
+            Err(e) => {
+                tracing::error!(replica = r, error = %e, "KV tier startup failed");
+                eprintln!("turbine-server: {e}");
+                return ExitCode::Startup;
+            }
+        };
+        replicas.push(ReplicaStart {
+            prepared,
+            kv_cfg: cfg.kv.clone(),
+            kv_metrics: replica_kv_metrics,
+            l2,
+        });
+    }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -235,10 +265,6 @@ pub fn run(cli: Cli) -> ExitCode {
             return ExitCode::Startup;
         }
     };
-    let kv = ServeKv {
-        metrics: kv_metrics,
-        l2,
-    };
     let code = runtime.block_on(serve(
         config,
         inventory,
@@ -247,9 +273,8 @@ pub fn run(cli: Cli) -> ExitCode {
             parallel: parallel::status(&plan),
         },
         metrics,
-        prepared,
+        replicas,
         support.view(),
-        kv,
     ));
     // Never wait for the generation thread or in-flight blocking work on the way out.
     runtime.shutdown_background();
@@ -271,10 +296,30 @@ struct ServeCluster {
     parallel: serde_json::Value,
 }
 
-/// The KV pieces built before the listener binds (Phase 4).
-struct ServeKv {
-    metrics: KvMetrics,
+/// One data-parallel replica prepared before the listener binds (P5 S-7): its model on its
+/// device, its `kv` section (per-replica L1 share and L2 directory), its share of the KV
+/// metrics and its L2 tier (Phase 4).
+struct ReplicaStart {
+    prepared: PreparedModel,
+    kv_cfg: KvConfig,
+    kv_metrics: KvMetrics,
     l2: Option<Arc<L2NvmeTier>>,
+}
+
+/// Replica `r`'s configuration (of `replicas`) on `device`: with data parallelism every replica
+/// gets its share of the host-wide L1 cap (`kv.cpu.max_bytes / replicas`) and of the L2 cap, and
+/// its own L2 directory (`kv.nvme.path/replica-<r>`), since each replica wipes and owns its slab
+/// files.
+fn replica_config(config: &Config, r: usize, replicas: usize, device: DeviceId) -> Config {
+    let mut cfg = config.clone();
+    cfg.execution.device = device;
+    if replicas > 1 {
+        let n = replicas as u64;
+        cfg.kv.cpu.max_bytes = ByteSize(cfg.kv.cpu.max_bytes.0 / n);
+        cfg.kv.nvme.max_bytes = ByteSize(cfg.kv.nvme.max_bytes.0 / n);
+        cfg.kv.nvme.path = cfg.kv.nvme.path.join(format!("replica-{r}"));
+    }
+    cfg
 }
 
 async fn serve(
@@ -282,19 +327,19 @@ async fn serve(
     inventory: DeviceInventory,
     cluster: ServeCluster,
     metrics: MetricsRegistry,
-    prepared: PreparedModel,
+    replicas: Vec<ReplicaStart>,
     support: SupportRowView,
-    kv: ServeKv,
 ) -> ExitCode {
     let addr: SocketAddr = config.server.listen;
     let engine_metrics = EngineMetrics {
         server: ServerMetrics::register(&metrics),
         model: ModelMetrics::register(&metrics),
         scheduler: SchedulerMetrics::register(&metrics),
-        kv: kv.metrics,
+        kv: replicas[0].kv_metrics.clone(),
     };
     let backend = Arc::new(
-        ModelBackend::new(&prepared, &inventory, &engine_metrics)
+        ModelBackend::new(&replicas[0].prepared, &inventory, &engine_metrics)
+            .with_replicas(replicas.len(), config.parallel.router, &metrics)
             .with_support(support)
             .with_topology(&cluster.topology)
             .with_parallel(cluster.parallel),
@@ -328,28 +373,45 @@ async fn serve(
 
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let queue_capacity = config.scheduler.max_queued_requests as usize;
-    let startup = ReliabilityStartup {
-        inventory: inventory.clone(),
-        devices: config.devices.clone(),
-        metrics: ReliabilityMetrics::register(&state.metrics),
-        telemetry: TelemetryMetrics::register(&state.metrics),
-        kv: KvSetup {
-            cfg: config.kv.clone(),
-            l2: kv.l2,
-        },
-    };
-    if let Err(e) = engine::spawn(
-        prepared,
-        Arc::clone(&backend),
-        engine_metrics,
-        startup,
-        queue_capacity,
-        Timeouts::from_config(&config.server),
-        fatal_tx.clone(),
-    ) {
-        let _ = fatal_tx.send(Fatal::LoadFailed(format!(
-            "cannot start the engine thread: {e}"
-        )));
+    let reliability_metrics = ReliabilityMetrics::register(&state.metrics);
+    let telemetry_metrics = TelemetryMetrics::register(&state.metrics);
+    for (r, replica) in replicas.into_iter().enumerate() {
+        let startup = ReliabilityStartup {
+            inventory: inventory.clone(),
+            devices: config.devices.clone(),
+            metrics: reliability_metrics.clone(),
+            telemetry: telemetry_metrics.clone(),
+            kv: KvSetup {
+                cfg: replica.kv_cfg,
+                l2: replica.l2,
+            },
+            replica: r as u32,
+        };
+        // Replica 0 uses the metric shares registered above; the others add their own shares
+        // of the scheduler and KV gauges (the gauges report the sum over replicas).
+        let metrics = EngineMetrics {
+            server: engine_metrics.server.clone(),
+            model: engine_metrics.model.clone(),
+            scheduler: if r == 0 {
+                engine_metrics.scheduler.clone()
+            } else {
+                engine_metrics.scheduler.another_replica()
+            },
+            kv: replica.kv_metrics,
+        };
+        if let Err(e) = engine::spawn(
+            replica.prepared,
+            Arc::clone(&backend),
+            metrics,
+            startup,
+            queue_capacity,
+            Timeouts::from_config(&config.server),
+            fatal_tx.clone(),
+        ) {
+            let _ = fatal_tx.send(Fatal::LoadFailed(format!(
+                "cannot start engine thread {r}: {e}"
+            )));
+        }
     }
 
     let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();

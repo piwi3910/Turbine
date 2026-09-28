@@ -265,10 +265,11 @@ impl TinyServer {
         self.get("/metrics").body
     }
 
+    /// Replica 0's scheduler document (the route is keyed by replica, P5).
     fn scheduler(&self) -> Value {
         let resp = self.get("/turbine/v1/scheduler");
         assert_eq!(resp.status, 200, "{}", resp.body);
-        resp.json()
+        resp.json()["0"].clone()
     }
 
     /// The `l0` tier object of `/turbine/v1/kv` (Phase 4 lists `l0`, `l1`, `l2`).
@@ -2888,4 +2889,97 @@ fn qwen3_tiny_generates_on_cpu() {
         return;
     }
     panic!("turbine-server lost its port {LAUNCH_ATTEMPTS} times in a row");
+}
+
+/// P5 S-7: two data-parallel replicas of the tiny model share the cpu "device"
+/// (`allow_device_sharing`, each with half the device budget); 32 concurrent requests all
+/// succeed, the router sends work to both replicas (`turbine_dp_routed_total` non-zero for
+/// replica 0 and 1), the scheduler document has one entry per replica, the KV document one per
+/// replica, the free-block gauge adds up over both pools, and the pressure document lists both
+/// replicas' groups.
+#[test]
+fn dp2_routes_to_both_replicas() {
+    let server = TinyServer::start(
+        "parallel:\n  data_parallel_size: 2\n  allow_device_sharing: true\n\
+         scheduler:\n  max_running_requests: 4\n",
+    );
+    let workers: Vec<_> = (0..32)
+        .map(|i| {
+            let (addr, model) = (server.addr, server.model.clone());
+            std::thread::spawn(move || {
+                let body = json!({"model": model, "prompt": format!("Hello {i}"),
+                                  "max_tokens": 24, "ignore_eos": true});
+                request(addr, "POST", "/v1/completions", Some(&body.to_string()))
+            })
+        })
+        .collect();
+    for (i, w) in workers.into_iter().enumerate() {
+        let resp = w.join().unwrap();
+        assert_eq!(resp.status, 200, "request {i}: {}", resp.body);
+        assert_eq!(resp.json()["usage"]["completion_tokens"], 24, "request {i}");
+    }
+
+    let metrics = server.metrics();
+    let routed = |replica: u32| -> f64 {
+        metrics
+            .lines()
+            .filter(|l| {
+                l.starts_with("turbine_dp_routed_total{")
+                    && l.contains(&format!("replica=\"{replica}\""))
+            })
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum()
+    };
+    assert!(routed(0) > 0.0, "{metrics}");
+    assert!(routed(1) > 0.0, "{metrics}");
+    assert_eq!(routed(0) + routed(1), 32.0, "{metrics}");
+
+    let resp = server.get("/turbine/v1/scheduler");
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let doc = resp.json();
+    let mut keys: Vec<&str> = doc
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["0", "1"], "{doc}");
+    for r in ["0", "1"] {
+        assert!(doc[r]["iterations_total"].as_u64().unwrap() > 0, "{doc}");
+        assert_eq!(doc[r]["waiting"], 0, "{doc}");
+    }
+    let kv = server.get("/turbine/v1/kv").json();
+    let total = |r: &str| kv[r]["tiers"][0]["blocks_total"].as_u64().unwrap();
+    let (t0, t1) = (total("0"), total("1"));
+    assert!(t0 > 0 && t1 > 0, "{kv}");
+    // Each engine publishes after the step that finished its last request.
+    wait_for(Duration::from_secs(30), "both pools free", || {
+        sample(
+            &server.metrics(),
+            r#"turbine_kv_blocks{tier="l0",state="free"}"#,
+        ) == Some((t0 + t1) as f64)
+    });
+
+    let pressure = server.get("/turbine/v1/pressure").json();
+    let groups: Vec<u64> = pressure["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["replica"].as_u64().unwrap())
+        .collect();
+    assert_eq!(groups, [0, 1], "{pressure}");
+    assert_eq!(
+        pressure["replicas"].as_array().unwrap().len(),
+        2,
+        "{pressure}"
+    );
+
+    let parallel = &server.get("/turbine/v1/status").json()["parallel"];
+    assert_eq!(parallel["dp"], 2, "{parallel}");
+    assert_eq!(parallel["groups"][1]["replica"], 1, "{parallel}");
+    assert_eq!(
+        parallel["plan_reasons"],
+        json!(["execution_device", "device_sharing_enabled"])
+    );
 }

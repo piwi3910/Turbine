@@ -553,7 +553,7 @@ fn paused_requests(addr: SocketAddr) -> u64 {
     assert_eq!(status, 200, "{resp}");
     let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
     let doc: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-    doc["paused"].as_u64().unwrap_or(0)
+    doc["0"]["paused"].as_u64().unwrap_or(0)
 }
 
 #[cfg(unix)]

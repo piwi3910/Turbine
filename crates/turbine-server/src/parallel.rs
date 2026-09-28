@@ -91,21 +91,13 @@ pub fn plan_for(
 }
 
 /// Refuses a plan this build cannot execute yet (exit 2, like any other unusable
-/// configuration): tensor-parallel model execution and data-parallel replicas are not wired
-/// into the engine yet.
+/// configuration): tensor-parallel model execution is not wired into the engine yet.
 pub fn check_executable(plan: &ParallelPlan) -> Result<(), PlanFailure> {
     if plan.tp > 1 {
         return Err(PlanFailure::Config(format!(
             "parallel.tensor_parallel_size: {} ranks planned; tensor-parallel model execution is \
              not available in this build",
             plan.tp
-        )));
-    }
-    if plan.dp > 1 {
-        return Err(PlanFailure::Config(format!(
-            "parallel.data_parallel_size: {} replicas planned; data-parallel replicas are not \
-             available in this build",
-            plan.dp
         )));
     }
     Ok(())
@@ -213,14 +205,13 @@ mod tests {
             "{text}"
         );
         assert!(check_executable(&p).is_ok());
-        for (tp, dp, key) in [
-            (2, 1, "parallel.tensor_parallel_size"),
-            (1, 2, "parallel.data_parallel_size"),
-        ] {
-            match check_executable(&plan(tp, dp)) {
-                Err(PlanFailure::Config(m)) => assert!(m.starts_with(key), "{m}"),
-                other => panic!("{tp}x{dp}: {other:?}"),
+        // Data-parallel replicas run (Task 18); tensor parallelism waits for Task 17.
+        assert!(check_executable(&plan(1, 2)).is_ok());
+        match check_executable(&plan(2, 1)) {
+            Err(PlanFailure::Config(m)) => {
+                assert!(m.starts_with("parallel.tensor_parallel_size"), "{m}")
             }
+            other => panic!("tp 2: {other:?}"),
         }
     }
 }

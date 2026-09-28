@@ -4,7 +4,7 @@ pub mod http;
 mod metrics;
 mod tracing;
 
-pub use metrics::{MetricsRegistry, OPENMETRICS_CONTENT_TYPE};
+pub use metrics::{GaugeFamilyShare, GaugeShare, MetricsRegistry, OPENMETRICS_CONTENT_TYPE};
 pub use tracing::init_tracing;
 
 /// The crate's single error type.

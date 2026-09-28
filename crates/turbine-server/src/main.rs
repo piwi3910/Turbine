@@ -12,6 +12,7 @@ mod model;
 mod modules;
 mod parallel;
 mod reliability;
+mod replicas;
 mod startup;
 mod support_matrix;
 mod support_startup;

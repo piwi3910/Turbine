@@ -6,7 +6,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
-use turbine_observability::MetricsRegistry;
+use turbine_observability::{GaugeFamilyShare, GaugeShare, MetricsRegistry};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct StateLabels {
@@ -37,8 +37,9 @@ fn token_histogram() -> Histogram {
 /// Handles to the Phase 2 scheduler metric families.
 #[derive(Clone)]
 pub struct SchedulerMetrics {
-    requests_active: Family<StateLabels, Gauge>,
-    requests_queued: Gauge,
+    /// This scheduler's share: data-parallel replicas add up ([`SchedulerMetrics::another_replica`]).
+    requests_active: GaugeFamilyShare<StateLabels>,
+    requests_queued: GaugeShare,
     admission: Family<AdmissionLabels, Counter>,
     queue_wait_seconds: Histogram,
     iteration_seconds: Histogram,
@@ -51,16 +52,16 @@ pub struct SchedulerMetrics {
 impl SchedulerMetrics {
     pub fn register(reg: &MetricsRegistry) -> SchedulerMetrics {
         let m = SchedulerMetrics {
-            requests_active: reg.register(
+            requests_active: GaugeFamilyShare::new(reg.register(
                 "turbine_requests_active",
                 "Running requests by state",
                 Family::default(),
-            ),
-            requests_queued: reg.register(
+            )),
+            requests_queued: GaugeShare::new(reg.register(
                 "turbine_requests_queued",
                 "Requests in the waiting queue",
                 Gauge::default(),
-            ),
+            )),
             admission: reg.register(
                 "turbine_admission",
                 "Submissions by outcome and reason",
@@ -104,10 +105,19 @@ impl SchedulerMetrics {
         m
     }
 
+    /// The same families for another data-parallel replica's scheduler: counters and histograms
+    /// are shared, the state gauges get a fresh share (the gauges report the sum).
+    pub fn another_replica(&self) -> SchedulerMetrics {
+        SchedulerMetrics {
+            requests_active: self.requests_active.another(),
+            requests_queued: self.requests_queued.another(),
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn set_active(&self, state: &'static str, n: u32) {
         self.requests_active
-            .get_or_create(&StateLabels { state })
-            .set(i64::from(n));
+            .set(&StateLabels { state }, i64::from(n));
     }
 
     pub(crate) fn set_queued(&self, n: u32) {

@@ -40,6 +40,7 @@ use turbine_observability::MetricsRegistry;
 use turbine_reliability::budget::{BudgetInputs, DeviceBudget, PoolKind, compute_budget};
 use turbine_reliability::ledger::{Ledger, Reservation};
 use turbine_reliability::metrics::ReliabilityMetrics;
+use turbine_reliability::multi_device::SharedDeviceBudget;
 use turbine_reliability::reserve::EmergencyReserve;
 use turbine_scheduler::SchedulerParams;
 
@@ -257,6 +258,8 @@ pub struct PreparedModel {
     pub workspace_bytes: u64,
     /// What the KV cache depends on: the namespace of every cached block (P4 S-1).
     pub identity: ModelIdentity,
+    /// The kernel crate's metrics, registered once and shared by every replica (P5).
+    pub kernel_metrics: KernelMetrics,
 }
 
 /// The model's identity (P4 §Data namespace key): BLAKE3 of `config.json` and of the
@@ -288,6 +291,26 @@ pub fn prepare(
     config: &Config,
     inventory: &DeviceInventory,
     metrics: &MetricsRegistry,
+) -> Result<PreparedModel, StartupError> {
+    prepare_with(config, inventory, &KernelMetrics::register(metrics), None)
+}
+
+/// Steps 4–6 for another data-parallel replica (P5 S-7) on `config.execution.device`: its own
+/// provider, kernel registry and memory budget; the grammar compiler (its token trie) and the
+/// kernel metrics are `base`'s.
+pub fn prepare_replica(
+    config: &Config,
+    inventory: &DeviceInventory,
+    base: &PreparedModel,
+) -> Result<PreparedModel, StartupError> {
+    prepare_with(config, inventory, &base.kernel_metrics, Some(base))
+}
+
+fn prepare_with(
+    config: &Config,
+    inventory: &DeviceInventory,
+    kernel_metrics: &KernelMetrics,
+    base: Option<&PreparedModel>,
 ) -> Result<PreparedModel, StartupError> {
     let provider = load_provider(config, inventory)?;
 
@@ -350,7 +373,7 @@ pub fn prepare(
         opened.providers.clone(),
         &opened.order,
         &requirements,
-        &KernelMetrics::register(metrics),
+        kernel_metrics,
         opened.card,
     )
     .map_err(|e| kernel_error("kernel selection", e))?;
@@ -421,9 +444,12 @@ pub fn prepare(
     );
 
     let started = Instant::now();
-    let grammar = GrammarCompiler::new(&tokenizer, &eos_token_ids(&arch, &generation))
-        .map(Arc::new)
-        .map_err(|e| model_error("structured output", e))?;
+    let grammar = match base {
+        Some(b) => Arc::clone(&b.grammar),
+        None => GrammarCompiler::new(&tokenizer, &eos_token_ids(&arch, &generation))
+            .map(Arc::new)
+            .map_err(|e| model_error("structured output", e))?,
+    };
     // A format whose required special tokens the tokenizer lacks is refused here (exit 1).
     let tool_format = resolve_tool_call_parser(
         config.model.tool_call_parser.as_ref().map(|n| n.as_str()),
@@ -488,7 +514,63 @@ pub fn prepare(
         kv_cap: config.kv.gpu.max_bytes,
         workspace_bytes: workspace,
         identity: model_identity(dir)?,
+        kernel_metrics: kernel_metrics.clone(),
     })
+}
+
+impl PreparedModel {
+    /// This replica shares its device with `replicas` data-parallel replicas in all
+    /// (`parallel.allow_device_sharing`, P5 S-7/S-8): its budget becomes its
+    /// [`SharedDeviceBudget::split`] share of the device budget — the shares add up to the device
+    /// budget, so replicas never double-count memory — applied as a
+    /// `reliability.memory.device_budget_bytes` cap that the engine's post-load budget keeps.
+    /// The KV pool is resized to the share. No-op for one replica.
+    pub fn share_device(&mut self, replicas: u32) -> Result<(), StartupError> {
+        if replicas <= 1 {
+            return Ok(());
+        }
+        let share = SharedDeviceBudget::split(&self.budget, replicas)[0].budget_bytes;
+        let cap = self
+            .reliability
+            .memory
+            .device_budget_bytes
+            .map_or(share, |c| c.0.min(share));
+        self.reliability.memory.device_budget_bytes = Some(ByteSize(cap));
+        let free = self
+            .provider
+            .opened
+            .mem
+            .mem_info()
+            .map_err(|e| StartupError::new(format!("device memory info: {e}")))?
+            .free_bytes;
+        let layout = self.arch.kv_layout(self.block_tokens);
+        self.budget = measure_budget(
+            self.device,
+            self.provider.opened.memory_kind,
+            Some(free),
+            0,
+            self.arch.shape().weight_bytes,
+            &layout,
+            self.max_seq_len,
+            &self.reliability,
+            self.kv_cap,
+        )?;
+        self.pool = kv_pool_config(
+            &self.arch,
+            self.block_tokens,
+            self.budget.pool(PoolKind::Kv),
+            self.scheduler.max_running_requests,
+        )?;
+        tracing::info!(
+            event = "device_shared",
+            device = self.device.0,
+            replicas,
+            budget_bytes = self.budget.budget_bytes,
+            kv_blocks = self.pool.num_blocks,
+            "this replica's share of a device shared by data-parallel replicas"
+        );
+        Ok(())
+    }
 }
 
 /// `reliability` with `memory.workspace_bytes` at least the executor's `workspace` (logged when

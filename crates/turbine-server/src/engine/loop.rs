@@ -821,6 +821,12 @@ impl EngineLoop {
         self.metrics
             .server
             .add_tokens(TokenKind::Prompt, u64::from(prompt_len));
+        self.shared.add_outstanding(outstanding(
+            prompt_len,
+            submission.request.n,
+            submission.request.stop.max_tokens,
+            0,
+        ));
         let mut active = ActiveRequest::new(submission, events, &seqs, &self.tokenizer);
         active.cached_tokens = cached_tokens;
         for (i, &seq) in seqs.iter().enumerate() {
@@ -2183,6 +2189,20 @@ impl EngineLoop {
             .map(|(stage, ms)| (stage.to_string(), ms))
             .collect();
         self.shared.publish(EngineDocs { scheduler, kv });
+        let pending = self
+            .requests
+            .values()
+            .filter(|r| !r.done)
+            .map(|r| {
+                outstanding(
+                    r.prompt_len(),
+                    r.request.n,
+                    r.request.stop.max_tokens,
+                    r.generated_tokens(),
+                )
+            })
+            .sum();
+        self.shared.set_outstanding(pending);
     }
 }
 
@@ -2252,6 +2272,12 @@ impl IterationError {
             sticky: false,
         }
     }
+}
+
+/// Tokens a request still has to process: its prompt plus `n × max_tokens`, less what it
+/// generated (the data-parallel router's load measure, P5 S-7).
+fn outstanding(prompt_len: u32, n: u32, max_tokens: u32, generated: u64) -> u64 {
+    (u64::from(prompt_len) + u64::from(n.max(1)) * u64::from(max_tokens)).saturating_sub(generated)
 }
 
 /// Distinct requests of the plan's items and forks, in plan order.
@@ -2511,6 +2537,7 @@ mod tests {
             metrics: reliability_metrics,
             clock: Arc::clone(&clock),
             reclaimer: kv.reclaimer(),
+            replica: 0,
         });
         let scheduler = Scheduler::new(params, Arc::clone(&clock))
             .with_metrics(metrics.scheduler.clone())
