@@ -80,13 +80,14 @@ pub fn stub_mapped_context(index: u32) -> Arc<ShimContext> {
     stub_mapped_context_minor(index, 8)
 }
 
-/// [`stub_mapped_context`] on the stub of ABI minor `minor`: 7 (host-sequenced steps only) or 8
-/// (also the device-sequenced steps).
+/// [`stub_mapped_context`] on the stub of ABI minor `minor`: 5 (no v2.6 native stream handles,
+/// no host-mapped group), 7 (host-sequenced steps only) or 8 (also the device-sequenced steps).
 pub fn stub_mapped_context_minor(index: u32, minor: u32) -> Arc<ShimContext> {
     use turbine_core::types::{MemoryKind, Vendor};
     use turbine_device::{DeviceInfo, DeviceMemoryInfo};
 
     let path = match minor {
+        5 => env!("TURBINE_STUB_GFX942_V25"),
         7 => env!("TURBINE_STUB_GFX942_V27"),
         8 => env!("TURBINE_STUB_GFX942_V28"),
         _ => panic!("no stub library of ABI minor {minor}"),
