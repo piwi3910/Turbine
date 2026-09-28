@@ -1304,3 +1304,9 @@ The user asked to move all Phase 5p items to after Phase 6. Asked whether that i
 - Keep both carry-overs now
 
 **Answer (2026-09-28, user): "skip the tests".** Tasks 0 and 0b are skipped: the stopped one-GPU full tier is not rerun, `tp_prefill_overlap` stays off by default, and `lab-test.sh` keeps the debug profile. Phase 5p (the measurement, token-granular prefix reuse, `cache_aware`, jump-forward) now runs after Phase 6 quantization; next up is `phase-6-quantization`. Tasks 0/0b stay in the 5p plan marked skipped, so they can be picked up again on request.
+
+## YaRN RoPE scaling moves into Phase 6 (2026-09-28)
+
+The user asked for YaRN (RoPE context extension: per-dimension frequency interpolation plus attention temperature; used by Qwen3 at 32K→128K and gpt-oss at 4K→128K) to move from the Phase 7 families track into Phase 6.
+
+**Answer (2026-09-28, user): move it to Phase 6.** Consequences: umbrella S-6 now includes static YaRN `rope_scaling` for every registered family; dynamic scaling is refused (cached keys are stored after RoPE, so the factor must not change within a sequence); the RoPE configuration is part of the prefix-cache identity. The `phase-6-quantization` spec picks the proof. Candidates: Llama-3.2-3B-Instruct with a YaRN `rope_scaling` override, compared against transformers' native YaRN at fixture-generation time; `NousResearch/Yarn-Llama-2-7b-64k` is `LlamaForCausalLM` but needs remote code for its reference, so it is a weaker candidate. Qwen3 and gpt-oss then use it in Phase 7.
