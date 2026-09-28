@@ -3247,12 +3247,19 @@ fn tp2_collective_failure_recovers() {
     let err: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
     assert_eq!(err["error"]["code"], "replica_failed", "{err}");
     assert!(!trigger.exists(), "the failure was injected");
-    // The failed iteration's requests end before the engine reports the failure to the circuit
-    // breaker: /ready turns 503 `circuit_open` a moment after the error event.
-    wait_for(Duration::from_secs(5), "/ready 503 circuit_open", || {
-        let ready = server.get("/ready");
-        ready.status == 503 && ready.json()["reason"] == "circuit_open"
-    });
+    // The circuit opened before the stream heard of the failure (`/ready` 503 `circuit_open`
+    // from then on). It may already be HEALTHY again: the cooldown and the probe can pass
+    // while the client still reads the stream's backlog, so the transition counter, not a
+    // `/ready` read, is the evidence.
+    let opened = sample(
+        &server.metrics(),
+        r#"turbine_circuit_transitions_total{from="HEALTHY",to="CIRCUIT_OPEN",reason="collective_failed"}"#,
+    );
+    assert_eq!(
+        opened,
+        Some(1.0),
+        "the collective failure opened the circuit"
+    );
 
     // The probe re-creates the communicator; a probe slower than twice the baseline (a loaded
     // test host) fails and the cycle repeats, so allow a few.

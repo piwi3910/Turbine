@@ -672,8 +672,10 @@ impl EngineLoop {
             self.fail_iteration(ErrorCode::ResourceExhausted, error.message, &mut outcome);
         } else {
             let (code, event) = error.failure();
-            self.fail_iteration(code, error.message, &mut outcome);
+            // The circuit opens before the requests hear of the failure, so a client that
+            // reads its error already finds `/ready` at 503 `circuit_open`.
             self.rel.circuit_event(event);
+            self.fail_iteration(code, error.message, &mut outcome);
         }
         outcome
     }
@@ -1345,8 +1347,9 @@ impl EngineLoop {
                     });
                 } else {
                     let (code, event) = error.failure();
-                    self.fail_iteration(code, error.message, &mut outcome);
+                    // The circuit opens first (see `pipe_failure`).
                     self.rel.circuit_event(event);
+                    self.fail_iteration(code, error.message, &mut outcome);
                 }
                 return outcome;
             }
@@ -2080,8 +2083,9 @@ impl EngineLoop {
             self.fail_requests(ids, iteration, ErrorCode::ResourceExhausted, &error.message);
         } else {
             let (code, event) = error.failure();
-            self.fail_requests(ids, iteration, code, &error.message);
+            // The circuit opens first (see `pipe_failure`).
             self.rel.circuit_event(event);
+            self.fail_requests(ids, iteration, code, &error.message);
         }
     }
 
@@ -3743,6 +3747,49 @@ mod tests {
             r#"turbine_circuit_transitions_total{from="HEALTHY",to="CIRCUIT_OPEN",reason="device_error"} 1"#,
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+    }
+
+    /// A failed iteration opens the circuit before its requests hear of the failure: the
+    /// moment a client reads its `replica_failed` (collective) or `internal_error` (device) event,
+    /// the circuit already blocks readiness (`/ready` 503 `circuit_open`). Breaks if the engine
+    /// answers the requests first, which lets a client see `/ready` 200 after its error.
+    #[test]
+    fn circuit_opens_before_the_failed_request_hears() {
+        for collective in [true, false] {
+            let (_dir, spec, tokenizer) = tiny();
+            let exec = Box::new(BrokenExecutor {
+                shape: spec.config.shape(),
+                kv: spec.config.kv_layout(BLOCK_TOKENS),
+                panic: false,
+                collective,
+            });
+            let t = engine(exec, tokenizer, params(1, 64));
+            let (mut rx, admitted) = submit(&t.tx, request(&[256, 1, 2], 4));
+            let controller = t.controller.clone();
+            let engine = t.engine;
+            let handle = std::thread::spawn(move || engine.run());
+            assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+            loop {
+                match rx.blocking_recv().expect("an error event") {
+                    GenerationEvent::Error { code, .. } => {
+                        let want = if collective {
+                            ErrorCode::ReplicaFailed
+                        } else {
+                            ErrorCode::InternalError
+                        };
+                        assert_eq!(code, want);
+                        assert!(
+                            controller.circuit().blocks_readiness(),
+                            "collective {collective}: the circuit is open when the error arrives"
+                        );
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+            drop(t.tx);
+            assert_eq!(handle.join().unwrap(), Ok(()));
         }
     }
 
