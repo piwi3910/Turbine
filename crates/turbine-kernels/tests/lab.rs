@@ -221,9 +221,11 @@ fn demotion_host_cost() {
 
 /// P5 S-13: the startup host-link probe on every visible GPU of the backend's vendor, printed as
 /// `host_link device=<i> h2d_gbps=… d2h_gbps=…`; each direction must measure > 1 GB/s. With
-/// `TURBINE_EXPECT_AMD=2` (a `--gpus 2` run on novanas) GPU0's slot (Gen5 x8) must measure at
-/// least GPU1's (Gen4 x8) host-to-device. Breaks if the probe fails on a real device or the
-/// asymmetric slots are not reflected.
+/// `TURBINE_EXPECT_AMD=2` (a `--gpus 2` run on novanas) GPU0's slot (Gen5 x8) must measure no
+/// more than 10 % below GPU1's (Gen4 x8) host-to-device. A 64 MiB pinned copy measures about the
+/// same on both, below either link's rate (2026-09-28: GPU0 13.08 / 12.74 GB/s, GPU1 12.47 /
+/// 12.29 GB/s h2d / d2h), so a strict order would flake. Breaks if the probe fails on a real device
+/// or GPU0 measures clearly slower than GPU1.
 #[test]
 #[ignore = "needs a HIP device and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn host_link_probe() {
@@ -282,8 +284,8 @@ fn host_link_probe() {
     if expect_amd == Some(2) {
         assert_eq!(h2d.len(), 2, "two GPUs visible");
         assert!(
-            h2d[0] >= h2d[1],
-            "GPU0 (Gen5 x8) {:.2} GB/s < GPU1 (Gen4 x8) {:.2} GB/s",
+            h2d[0] >= 0.9 * h2d[1],
+            "GPU0 (Gen5 x8) {:.2} GB/s is more than 10 % below GPU1 (Gen4 x8) {:.2} GB/s",
             h2d[0],
             h2d[1]
         );

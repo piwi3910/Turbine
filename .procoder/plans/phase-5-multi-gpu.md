@@ -376,7 +376,7 @@ Interfaces:
 
 - [ ] Write failing test `topology::tests::measured_links_on_edges` (the S-13 criterion). Run: `cargo test -p turbine-device topology::tests::measured_links_on_edges` — expect FAIL.
 - [ ] Implement the probe (≤ 64 MiB per direction per GPU, ≤ 2 s total, pinned host memory, median of 3), the edge attributes and the planner's use of them (TP/EP groups costed by the slowest member; PP placement input for Task 22).
-- [ ] Lab `host_link_probe` in `crates/turbine-kernels/tests/lab.rs` (the probe `turbine_kernels::link_probe::CopyLinkProbe` over each device's context): both GPUs > 1 GB/s each way, GPU0 h2d ≥ GPU1 h2d with `TURBINE_EXPECT_AMD=2`. Run: `scripts/bench-lock.sh scripts/lab-test.sh novanas --gpus 2 -- -p turbine-kernels --test lab host_link_probe` — expect PASS.
+- [ ] Lab `host_link_probe` in `crates/turbine-kernels/tests/lab.rs` (the probe `turbine_kernels::link_probe::CopyLinkProbe` over each device's context): both GPUs > 1 GB/s each way, GPU0 h2d ≥ 0.9 × GPU1 h2d with `TURBINE_EXPECT_AMD=2`. Run: `scripts/bench-lock.sh scripts/lab-test.sh novanas --gpus 2 -- -p turbine-kernels --test lab host_link_probe` — expect PASS.
 - [ ] Gate: `scripts/gate.sh`
 - [ ] Commit: `feat(device,distributed): measured host-link bandwidth on topology edges and in the planner`
 
