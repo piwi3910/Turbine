@@ -22,7 +22,8 @@ use crate::ops::{
     AttentionKernel, ElementwiseConfig, ElementwiseKernel, EmbeddingConfig, EmbeddingKernel,
     GemmConfig, GemmKernel, ImplChoice, ImplInfo, KernelProvider, KvCopyConfig, KvCopyKernel,
     LogitsReduceConfig, LogitsReduceKernel, MoeExpertsConfig, MoeKernel, MoeRouteConfig,
-    NormConfig, NormKernel, OpKind, ProviderId, RopeConfig, RopeKernel, RowTier,
+    NormConfig, NormKernel, OpKind, ProviderId, RmsnormShardedConfig, RopeConfig, RopeKernel,
+    RowSumsqConfig, RowTier, ShardedNormKernel,
 };
 
 /// `reason_code` of a selection: the card profile's first listed implementation (that the
@@ -83,6 +84,10 @@ pub enum OpConfig {
     AddRmsnorm(AddRmsnormConfig),
     /// ABI v2.1; a shim library without the symbols has no provider for it.
     LogitsReduce(LogitsReduceConfig),
+    /// ABI v2.6; a shim library without the group has no provider for it.
+    RowSumsq(RowSumsqConfig),
+    /// ABI v2.6; a shim library without the group has no provider for it.
+    RmsnormSharded(RmsnormShardedConfig),
 }
 
 impl OpConfig {
@@ -100,6 +105,8 @@ impl OpConfig {
             OpConfig::MoeExperts(_) => OpKind::MoeExperts,
             OpConfig::AddRmsnorm(_) => OpKind::AddRmsnorm,
             OpConfig::LogitsReduce(_) => OpKind::LogitsReduce,
+            OpConfig::RowSumsq(_) => OpKind::RowSumsq,
+            OpConfig::RmsnormSharded(_) => OpKind::RmsnormSharded,
         }
     }
 
@@ -118,6 +125,8 @@ impl OpConfig {
             OpConfig::MoeExperts(cfg) => cfg.to_string(),
             OpConfig::AddRmsnorm(cfg) => cfg.to_string(),
             OpConfig::LogitsReduce(cfg) => cfg.to_string(),
+            OpConfig::RowSumsq(cfg) => cfg.to_string(),
+            OpConfig::RmsnormSharded(cfg) => cfg.to_string(),
         }
     }
 
@@ -174,6 +183,14 @@ impl OpConfig {
                 .logits_reduce()
                 .filter(|k| k.supports(cfg))
                 .map(|k| k.implementation(cfg)),
+            OpConfig::RowSumsq(cfg) => provider
+                .sharded_norm()
+                .filter(|k| k.supports_row_sumsq(cfg))
+                .map(|k| k.implementation_row_sumsq(cfg)),
+            OpConfig::RmsnormSharded(cfg) => provider
+                .sharded_norm()
+                .filter(|k| k.supports_rmsnorm_sharded(cfg))
+                .map(|k| k.implementation_rmsnorm_sharded(cfg)),
         }
     }
 
@@ -634,6 +651,20 @@ impl KernelRegistry {
             .logits_reduce()
             .expect("the selected provider implements logits_reduce")
     }
+
+    /// The sharded RMSNorm kernel selected for `row_sumsq` at `cfg` (ABI v2.6).
+    pub fn row_sumsq(&self, cfg: &RowSumsqConfig) -> &dyn ShardedNormKernel {
+        self.provider(OpConfig::RowSumsq(*cfg))
+            .sharded_norm()
+            .expect("the selected provider implements row_sumsq")
+    }
+
+    /// The sharded RMSNorm kernel selected for `rmsnorm_sharded` at `cfg` (ABI v2.6).
+    pub fn rmsnorm_sharded(&self, cfg: &RmsnormShardedConfig) -> &dyn ShardedNormKernel {
+        self.provider(OpConfig::RmsnormSharded(*cfg))
+            .sharded_norm()
+            .expect("the selected provider implements rmsnorm_sharded")
+    }
 }
 
 #[cfg(test)]
@@ -1028,6 +1059,79 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "no kernel provider supports add_rmsnorm dim=3072 dtype=bf16"
+        );
+    }
+
+    /// ABI v2.6: the sharded RMSNorm ops are an optional family like the v2.1 ops: a provider
+    /// without it is skipped, the cpu-reference serves both, and each op has its own accessor
+    /// (`row_sumsq`, `rmsnorm_sharded`) returning the one `ShardedNormKernel`. Breaks if the ops
+    /// are not selectable through the registry or render another config form.
+    #[test]
+    fn v26_sharded_norm_ops_select() {
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        let sumsq = RowSumsqConfig {
+            dim: 1024,
+            dtype: DType::BF16,
+        };
+        let sharded = RmsnormShardedConfig {
+            dim: 1024,
+            full_dim: 2048,
+            dtype: DType::BF16,
+        };
+        let reqs: Vec<OpRequirement> =
+            [OpConfig::RowSumsq(sumsq), OpConfig::RmsnormSharded(sharded)]
+                .into_iter()
+                .map(OpRequirement::from)
+                .collect();
+        for req in &reqs {
+            assert!(!req.spec.supported_by(first().as_ref()));
+        }
+        let registry = KernelRegistry::build(
+            vec![first(), crate::cpu_reference_provider()],
+            &[ProviderId("first"), ProviderId("cpu-reference")],
+            &reqs,
+            &metrics,
+            None,
+        )
+        .expect("cpu-reference supports both v2.6 ops");
+        let picked: Vec<(OpKind, &str, &str, &str)> = registry
+            .selections()
+            .iter()
+            .map(|s| {
+                (
+                    s.op,
+                    s.provider.0,
+                    s.implementation.as_str(),
+                    s.config.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            picked,
+            [
+                (
+                    OpKind::RowSumsq,
+                    "cpu-reference",
+                    "cpu_row_sumsq",
+                    "dim=1024 dtype=bf16"
+                ),
+                (
+                    OpKind::RmsnormSharded,
+                    "cpu-reference",
+                    "cpu_rmsnorm_sharded",
+                    "dim=1024 full_dim=2048 dtype=bf16"
+                ),
+            ]
+        );
+        assert_eq!(
+            registry.row_sumsq(&sumsq).implementation_row_sumsq(&sumsq),
+            "cpu_row_sumsq"
+        );
+        assert_eq!(
+            registry
+                .rmsnorm_sharded(&sharded)
+                .implementation_rmsnorm_sharded(&sharded),
+            "cpu_rmsnorm_sharded"
         );
     }
 

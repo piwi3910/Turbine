@@ -113,7 +113,8 @@ pub(crate) fn attention(
 }
 
 /// HF LlamaRMSNorm on rows of `dim`: `round_out(round_x(x · rsqrt(mean(x²) + eps)) · w)`, the
-/// mean of squares accumulated in f32.
+/// mean of squares accumulated in f32. Exactly [`row_sumsq`] followed by
+/// [`rmsnorm_from_sumsq`] with `full_dim = dim`.
 pub(crate) fn rmsnorm(
     x: &[f32],
     w: &[f32],
@@ -122,13 +123,44 @@ pub(crate) fn rmsnorm(
     round_x: impl Fn(f32) -> f32,
     round_out: impl Fn(f32) -> f32,
 ) -> Vec<f32> {
+    let sumsq = row_sumsq(x, dim);
+    rmsnorm_from_sumsq(x, w, dim, &sumsq, dim, eps, round_x, round_out)
+}
+
+/// The f32 sum of squares of each row of `dim`, accumulated sequentially over the row.
+pub(crate) fn row_sumsq(x: &[f32], dim: usize) -> Vec<f32> {
+    x.chunks_exact(dim)
+        .map(|row| {
+            let mut sum_sq = 0f32;
+            for &v in row {
+                sum_sq += v * v;
+            }
+            sum_sq
+        })
+        .collect()
+}
+
+/// The RMSNorm scaling of rows of `dim` with a given sum of squares per row over `full_dim`
+/// elements: `round_out(round_x(x · 1 / sqrt(sumsq / full_dim + eps)) · w)` (the ABI v2.6
+/// `rmsnorm_sharded`; with `full_dim = dim` and the row's own `row_sumsq`, [`rmsnorm`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rmsnorm_from_sumsq(
+    x: &[f32],
+    w: &[f32],
+    dim: usize,
+    sumsq: &[f32],
+    full_dim: usize,
+    eps: f32,
+    round_x: impl Fn(f32) -> f32,
+    round_out: impl Fn(f32) -> f32,
+) -> Vec<f32> {
     let mut out = vec![0f32; x.len()];
-    for (row, o) in x.chunks_exact(dim).zip(out.chunks_exact_mut(dim)) {
-        let mut sum_sq = 0f32;
-        for &v in row {
-            sum_sq += v * v;
-        }
-        let r = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
+    for ((row, o), &sum_sq) in x
+        .chunks_exact(dim)
+        .zip(out.chunks_exact_mut(dim))
+        .zip(sumsq)
+    {
+        let r = 1.0 / (sum_sq / full_dim as f32 + eps).sqrt();
         for ((o, &xv), &wv) in o.iter_mut().zip(row).zip(w) {
             *o = round_out(round_x(xv * r) * wv);
         }

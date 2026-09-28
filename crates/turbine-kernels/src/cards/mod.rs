@@ -190,6 +190,9 @@ mod tests {
                 "{op}"
             );
         }
+        for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
+            assert_eq!(order(op), Some(&["turbine_hip"][..]), "{op}");
+        }
         assert_eq!(
             order(OpKind::AttentionPrefillPaged),
             Some(&["ck_tile_fmha_pagedkv", "turbine_hip"][..])

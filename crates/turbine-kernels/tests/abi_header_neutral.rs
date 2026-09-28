@@ -1,8 +1,9 @@
 //! The kernel C ABI header names no vendor, declares the entry-point trio of every op the
 //! registry binds, and carries the ABI version the Rust side expects (P1 AC S-1/S-7, contract §9)
 //! and the additive minor revisions v2.1 (P2c AC S-5), v2.2 (the `moe_route` BF16-logits
-//! flag), v2.4 (Phase 2m: implementation enumeration and the card profile) and v2.5 (Phase 4:
-//! copy streams and asynchronous copies).
+//! flag), v2.4 (Phase 2m: implementation enumeration and the card profile), v2.5 (Phase 4:
+//! copy streams and asynchronous copies) and v2.6 (Phase 5: native stream handles and the
+//! sharded RMSNorm ops).
 use std::path::Path;
 
 use turbine_kernels::TURBINE_KERNELS_ABI_VERSION;
@@ -204,8 +205,8 @@ fn header_declares_the_v24_minor_revision() {
         "2u",
         "v2.4 keeps major 2"
     );
-    // v2.5 (Phase 4) raised the minor; the v2.4 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "5u");
+    // v2.5 (Phase 4) and v2.6 (Phase 5) raised the minor; the v2.4 group is unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "6u");
     for (i, op) in OpKind::ALL.iter().enumerate() {
         let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
         assert_eq!(define(&code, &name), i.to_string(), "{name}");
@@ -244,7 +245,8 @@ fn header_declares_the_v25_copy_streams() {
         "2u",
         "v2.5 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "5u");
+    // v2.6 (Phase 5) raised the minor; the v2.5 group is unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "6u");
     assert_eq!(define(&code, "TURBINE_COPY_H2D"), "0");
     assert_eq!(define(&code, "TURBINE_COPY_D2H"), "1");
     assert_eq!(define(&code, "TURBINE_COPY_D2D"), "2");
@@ -260,6 +262,47 @@ fn header_declares_the_v25_copy_streams() {
         assert!(
             flat.contains(decl),
             "turbine_kernels.h lacks the v2.5 {decl}"
+        );
+    }
+}
+
+/// v2.6 (Phase 5 Task 6, decision "P5 T6", answer B): the minor becomes 6, the native stream
+/// handle and the two sharded RMSNorm trios are declared with their descriptors (the member
+/// order of contract §9.3), and the two new op codes follow `OpKind::ALL`; the major stays 2.
+/// Breaks if a descriptor member moves (a library would read another field) or the op codes
+/// are not appended.
+#[test]
+fn header_declares_the_v26_tensor_parallel_group() {
+    let code = strip_comments(&header());
+    assert_eq!(
+        define(&code, "TURBINE_ABI_VERSION"),
+        "2u",
+        "v2.6 keeps major 2"
+    );
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "6u");
+    assert_eq!(define(&code, "TURBINE_OP_ROW_SUMSQ"), "15");
+    assert_eq!(define(&code, "TURBINE_OP_RMSNORM_SHARDED"), "16");
+    for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
+        assert!(
+            OpKind::ALL.contains(&op),
+            "{op} is a registry op, so header_declares_every_registry_op checks its trio"
+        );
+        assert_eq!(op.abi_minor(), 6, "{op}");
+    }
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for decl in [
+        "int32_t turbine_stream_native_handle(turbine_ctx *ctx, turbine_stream *s, void **out);",
+        "typedef struct turbine_row_sumsq_desc { const void *x; float *sumsq; \
+         int64_t rows, dim, x_stride_row; int32_t dtype; } turbine_row_sumsq_desc;",
+        "typedef struct turbine_rmsnorm_sharded_desc { const void *x; const void *weight; \
+         const float *sumsq; void *out; int64_t rows, dim, full_dim, x_stride_row, \
+         out_stride_row; float eps; int32_t dtype; } turbine_rmsnorm_sharded_desc;",
+        "int32_t turbine_row_sumsq(turbine_ctx *ctx, const turbine_row_sumsq_desc *d);",
+        "int32_t turbine_rmsnorm_sharded(turbine_ctx *ctx, const turbine_rmsnorm_sharded_desc *d);",
+    ] {
+        assert!(
+            flat.contains(decl),
+            "turbine_kernels.h lacks the v2.6 {decl}"
         );
     }
 }

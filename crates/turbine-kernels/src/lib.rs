@@ -26,7 +26,8 @@ pub use ops::{
     KvCopyConfig, KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext,
     LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
     MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
-    ProviderId, RopeConfig, RopeContext, RopeKernel, RowTier,
+    ProviderId, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext, RopeKernel,
+    RowSumsqConfig, RowSumsqContext, RowTier, ShardedNormKernel,
 };
 pub use registry::{KernelMetrics, KernelRegistry, OpConfig, OpRequirement, Selection};
 pub use shim::{

@@ -37,10 +37,17 @@ pub enum OpKind {
     AddRmsnorm,
     /// ABI v2.1 (optional in a shim library).
     LogitsReduce,
+    /// ABI v2.6 (optional in a shim library): per-row FP32 sum of squares of a tensor-parallel
+    /// rank's slice.
+    RowSumsq,
+    /// ABI v2.6 (optional in a shim library): RMSNorm of a slice with the all-reduced sum of
+    /// squares of the full row.
+    RmsnormSharded,
 }
 
 impl OpKind {
-    /// Every op of the current ABI version (v2.1 included), in header order.
+    /// Every op of the current ABI version (the optional minor groups included), in header order:
+    /// the position is the op's `TURBINE_OP_*` code, so new ops are appended.
     pub const ALL: &'static [OpKind] = &[
         OpKind::Gemm,
         OpKind::AttentionPrefill,
@@ -57,6 +64,8 @@ impl OpKind {
         OpKind::MoeExperts,
         OpKind::AddRmsnorm,
         OpKind::LogitsReduce,
+        OpKind::RowSumsq,
+        OpKind::RmsnormSharded,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -76,6 +85,8 @@ impl OpKind {
             OpKind::MoeExperts => "moe_experts",
             OpKind::AddRmsnorm => "add_rmsnorm",
             OpKind::LogitsReduce => "logits_reduce",
+            OpKind::RowSumsq => "row_sumsq",
+            OpKind::RmsnormSharded => "rmsnorm_sharded",
         }
     }
 
@@ -97,6 +108,18 @@ impl OpKind {
             OpKind::MoeExperts => 12,
             OpKind::AddRmsnorm => 13,
             OpKind::LogitsReduce => 14,
+            OpKind::RowSumsq => 15,
+            OpKind::RmsnormSharded => 16,
+        }
+    }
+
+    /// The kernel ABI minor revision that added the op (0: part of ABI v2 proper). A library of
+    /// an earlier minor has no such op and does not know its `TURBINE_OP_*` code.
+    pub fn abi_minor(self) -> u32 {
+        match self {
+            OpKind::AddRmsnorm | OpKind::LogitsReduce => 1,
+            OpKind::RowSumsq | OpKind::RmsnormSharded => 6,
+            _ => 0,
         }
     }
 }
@@ -460,6 +483,41 @@ impl fmt::Display for LogitsReduceConfig {
     }
 }
 
+/// Per-row FP32 sum of squares over rows of `dim` elements (ABI v2.6 `row_sumsq`): the partial
+/// sum a tensor-parallel rank contributes for its slice of a row normalised across ranks.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RowSumsqConfig {
+    pub dim: u32,
+    pub dtype: DType,
+}
+
+impl fmt::Display for RowSumsqConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "dim={} dtype={}", self.dim, self.dtype.as_str())
+    }
+}
+
+/// RMSNorm of a `dim`-wide slice of rows `full_dim` wide, from the all-reduced FP32 sum of
+/// squares of the full rows (ABI v2.6 `rmsnorm_sharded`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RmsnormShardedConfig {
+    pub dim: u32,
+    pub full_dim: u32,
+    pub dtype: DType,
+}
+
+impl fmt::Display for RmsnormShardedConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "dim={} full_dim={} dtype={}",
+            self.dim,
+            self.full_dim,
+            self.dtype.as_str()
+        )
+    }
+}
+
 // --------------------------------------------------------------------------------- contexts
 
 /// `a`: `[m, k]`; `b`: `[n, k]` when `trans_b`, else `[k, n]`; `c`: `[m, n]`. Row strides are
@@ -633,6 +691,28 @@ pub struct AddRmsnormContext<'a> {
     pub eps: f32,
 }
 
+/// `sumsq[r] = Σ_j x[r, j]²`, accumulated in f32 in an order that depends only on the row's
+/// length (never on the number of rows). `x`: `[rows, dim]` (rows may be strided); `sumsq`:
+/// `[rows]` F32, dense.
+pub struct RowSumsqContext<'a> {
+    pub x: TensorView<'a>,
+    pub sumsq: TensorView<'a>,
+}
+
+/// `out[r, j] = round(round(x[r, j] · inv) · weight[j])` with
+/// `inv = 1 / sqrt(sumsq[r] / full_dim + eps)` in f32: `rmsnorm` of the full row restricted to
+/// this slice when `sumsq[r]` is the sum of squares of the whole row (the ranks' `row_sumsq`
+/// all-reduced). `x`/`out`: `[rows, dim]` (rows may be strided); `weight`: `[dim]`, this slice of
+/// the norm weight; `sumsq`: `[rows]` F32, dense.
+pub struct RmsnormShardedContext<'a> {
+    pub x: TensorView<'a>,
+    pub sumsq: TensorView<'a>,
+    pub weight: TensorView<'a>,
+    pub out: TensorView<'a>,
+    pub full_dim: u32,
+    pub eps: f32,
+}
+
 /// Reduces the first `rows` rows of `logits` (every view may hold more rows, e.g. buffers sized
 /// for the largest batch). Per row `r`:
 ///
@@ -761,10 +841,21 @@ pub trait LogitsReduceKernel: Send + Sync {
     fn execute(&self, ctx: &mut LogitsReduceContext<'_>) -> Result<(), KernelError>;
 }
 
+/// The tensor-parallel sharded RMSNorm (ABI v2.6): `row_sumsq` of a rank's slice, then, after
+/// the caller all-reduced the sums across ranks, `rmsnorm_sharded` of the slice.
+pub trait ShardedNormKernel: Send + Sync {
+    fn supports_row_sumsq(&self, cfg: &RowSumsqConfig) -> bool;
+    fn supports_rmsnorm_sharded(&self, cfg: &RmsnormShardedConfig) -> bool;
+    fn implementation_row_sumsq(&self, cfg: &RowSumsqConfig) -> String;
+    fn implementation_rmsnorm_sharded(&self, cfg: &RmsnormShardedConfig) -> String;
+    fn row_sumsq(&self, ctx: &mut RowSumsqContext<'_>) -> Result<(), KernelError>;
+    fn rmsnorm_sharded(&self, ctx: &mut RmsnormShardedContext<'_>) -> Result<(), KernelError>;
+}
+
 /// One implementation source (`cpu-reference`, a loaded shim library). A family the provider
-/// does not implement at all returns `None`; per-config support is `supports`. The ABI v2.1
-/// families default to `None`, so a provider (or a shim library) without them is a fallback, not
-/// an error.
+/// does not implement at all returns `None`; per-config support is `supports`. The ABI v2.1 and
+/// v2.6 families default to `None`, so a provider (or a shim library) without them is a
+/// fallback, not an error.
 pub trait KernelProvider: Send + Sync {
     fn id(&self) -> ProviderId;
     fn gemm(&self) -> Option<&dyn GemmKernel>;
@@ -780,6 +871,10 @@ pub trait KernelProvider: Send + Sync {
         None
     }
     fn logits_reduce(&self) -> Option<&dyn LogitsReduceKernel> {
+        None
+    }
+    /// ABI v2.6: `None` (the default) for a provider without the sharded RMSNorm ops.
+    fn sharded_norm(&self) -> Option<&dyn ShardedNormKernel> {
         None
     }
 
@@ -838,7 +933,9 @@ mod tests {
                 "moe_route",
                 "moe_experts",
                 "add_rmsnorm",
-                "logits_reduce"
+                "logits_reduce",
+                "row_sumsq",
+                "rmsnorm_sharded"
             ]
         );
         assert_eq!(OpKind::SiluMul.to_string(), "silu_mul");
@@ -971,5 +1068,37 @@ mod tests {
             .to_string(),
             "vocab=128256 top_n=20"
         );
+        assert_eq!(
+            RowSumsqConfig {
+                dim: 1024,
+                dtype: DType::BF16
+            }
+            .to_string(),
+            "dim=1024 dtype=bf16"
+        );
+        assert_eq!(
+            RmsnormShardedConfig {
+                dim: 1024,
+                full_dim: 2048,
+                dtype: DType::BF16
+            }
+            .to_string(),
+            "dim=1024 full_dim=2048 dtype=bf16"
+        );
+    }
+
+    /// The minor that introduced each op: the v2 ops 0, the v2.1 fused ops 1, the v2.6 sharded
+    /// RMSNorm ops 6. Breaks if a new op is appended without saying which minor group adds it (an
+    /// older library would be asked for an op code it does not know).
+    #[test]
+    fn op_minor_revisions() {
+        for &op in OpKind::ALL {
+            let want = match op.abi_code() {
+                0..=12 => 0,
+                13 | 14 => 1,
+                _ => 6,
+            };
+            assert_eq!(op.abi_minor(), want, "{op}");
+        }
     }
 }

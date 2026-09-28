@@ -1,6 +1,6 @@
-//! `#[repr(C)]` mirrors of `kernels/include/turbine_kernels.h` (ABI v2.1), the symbol table
-//! resolved once per loaded library (the v2.1 symbols optionally), and the status-code mapping
-//! (contract §9.4).
+//! `#[repr(C)]` mirrors of `kernels/include/turbine_kernels.h` (ABI v2.6), the symbol table
+//! resolved once per loaded library (the minor groups v2.1–v2.6 optionally), and the status-code
+//! mapping (contract §9.4).
 //!
 //! Descriptor field order and types match the header field for field. Pointer fields carry
 //! device pointers (except where the header says "host"); the shim never retains them beyond
@@ -305,6 +305,35 @@ pub(crate) struct LogitsReduceDesc {
     pub top_p: *const f32,
 }
 
+/// `turbine_row_sumsq_desc` (v2.6).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowSumsqDesc {
+    pub x: *const c_void,
+    pub sumsq: *mut f32,
+    pub rows: i64,
+    pub dim: i64,
+    pub x_stride_row: i64,
+    pub dtype: i32,
+}
+
+/// `turbine_rmsnorm_sharded_desc` (v2.6).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RmsnormShardedDesc {
+    pub x: *const c_void,
+    pub weight: *const c_void,
+    pub sumsq: *const f32,
+    pub out: *mut c_void,
+    pub rows: i64,
+    pub dim: i64,
+    pub full_dim: i64,
+    pub x_stride_row: i64,
+    pub out_stride_row: i64,
+    pub eps: f32,
+    pub dtype: i32,
+}
+
 /// `turbine_<op>`: enqueue on the context's compute stream.
 pub(crate) type OpFn<D> = unsafe extern "C" fn(*mut TurbineCtx, *const D) -> i32;
 /// `turbine_<op>_supported`: 1 / 0 (negative on an internal error); pointers may be null.
@@ -381,6 +410,16 @@ pub(crate) struct CopyFns {
         unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineStream, *mut TurbineEvent) -> i32,
 }
 
+/// The v2.6 tensor-parallel group: `turbine_stream_native_handle` and the `row_sumsq` and
+/// `rmsnorm_sharded` trios.
+#[derive(Clone, Copy)]
+pub(crate) struct TensorParallelFns {
+    pub stream_native_handle:
+        unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineStream, *mut *mut c_void) -> i32,
+    pub row_sumsq: OpTrio<RowSumsqDesc>,
+    pub rmsnorm_sharded: OpTrio<RmsnormShardedDesc>,
+}
+
 /// `TURBINE_IMPL_NEEDS_HOST_OFFSETS` (v2.4): the implementation reads `host_expert_offsets`.
 pub(crate) const IMPL_NEEDS_HOST_OFFSETS: u32 = 1;
 
@@ -427,10 +466,11 @@ pub(crate) struct ImplFns {
     pub set_profile: unsafe extern "C" fn(*mut TurbineCtx, *const CardProfileDesc) -> i32,
 }
 
-/// The optional ABI v2.1–v2.5 functions. `minor` is `turbine_abi_minor()` (0 when the library
+/// The optional ABI v2.1–v2.6 functions. `minor` is `turbine_abi_minor()` (0 when the library
 /// lacks it); every v2.1 group is `None` unless `minor` ≥ 1, `staging` unless `minor` ≥ 3,
-/// `impls` unless `minor` ≥ 4, `copies` unless `minor` ≥ 5 and `staging` is resolved, and each
-/// only when the library exports the whole group.
+/// `impls` unless `minor` ≥ 4, `copies` unless `minor` ≥ 5 and `staging` is resolved,
+/// `tensor_parallel` unless `minor` ≥ 6, and each only when the library exports the whole
+/// group.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct V21Symbols {
     pub minor: u32,
@@ -444,6 +484,8 @@ pub(crate) struct V21Symbols {
     pub impls: Option<ImplFns>,
     /// v2.5 copy streams and asynchronous copies (Phase 4 KV tiers).
     pub copies: Option<CopyFns>,
+    /// v2.6 native stream handles and the sharded RMSNorm ops (Phase 5 tensor parallelism).
+    pub tensor_parallel: Option<TensorParallelFns>,
 }
 
 impl V21Symbols {
@@ -512,6 +554,16 @@ impl V21Symbols {
                 stream_wait_event: optional(lib, "turbine_stream_wait_event")?,
             })
         })();
+        let tensor_parallel = (|| {
+            if minor < 6 {
+                return None;
+            }
+            Some(TensorParallelFns {
+                stream_native_handle: optional(lib, "turbine_stream_native_handle")?,
+                row_sumsq: optional_trio(lib, "row_sumsq")?,
+                rmsnorm_sharded: optional_trio(lib, "rmsnorm_sharded")?,
+            })
+        })();
         V21Symbols {
             minor,
             options,
@@ -521,6 +573,7 @@ impl V21Symbols {
             staging,
             impls,
             copies,
+            tensor_parallel,
         }
     }
 }

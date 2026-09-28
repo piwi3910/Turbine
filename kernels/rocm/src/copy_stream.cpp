@@ -1,5 +1,7 @@
 // ABI v2.5 (Phase 4): copy streams, asynchronous copies, event queries and
-// stream waits, on top of the v2.3 pinned host memory and events (memory.cpp).
+// stream waits, on top of the v2.3 pinned host memory and events (memory.cpp);
+// and ABI v2.6 (Phase 5): the native handle of a stream, for a collective
+// library that enqueues on it.
 //
 // Ownership: a copy stream belongs to the caller until
 // turbine_copy_stream_destroy, which drains it first and must come before
@@ -131,6 +133,21 @@ int32_t turbine_stream_wait_event(turbine_ctx *ctx, turbine_stream *s,
       ctx,
       hipStreamWaitEvent(stream_of(ctx, s), reinterpret_cast<hipEvent_t>(e), 0),
       "hipStreamWaitEvent");
+}
+
+// ABI v2.6: the hipStream_t itself. Allowed while capturing (it only reads
+// the handle); the stream stays owned by the context or the copy stream's
+// owner.
+int32_t turbine_stream_native_handle(turbine_ctx *ctx, turbine_stream *s,
+                                     void **out) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (out == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_stream_native_handle: out is NULL");
+  }
+  *out = reinterpret_cast<void *>(stream_of(ctx, s));
+  return TURBINE_OK;
 }
 
 } // extern "C"

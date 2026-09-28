@@ -1,4 +1,4 @@
-/* Turbine vendor-neutral kernel C ABI, version 2.4 (contract section 9).
+/* Turbine vendor-neutral kernel C ABI, version 2.6 (contract section 9).
  *
  * Every backend shim library implements this header and is loaded by
  * turbine-kernels at run time. No vendor type, identifier or name appears here,
@@ -388,8 +388,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * (add then rmsnorm, whole logits rows, eager launches). */
 /* v2.2 adds TURBINE_MOE_ROUTE_BF16_LOGITS (a flag bit, no new symbol); v2.3
  * adds pinned host memory and events; v2.4 implementation enumeration and the
- * card profile; v2.5 copy streams and asynchronous copies (all below). */
-#define TURBINE_ABI_MINOR 5u
+ * card profile; v2.5 copy streams and asynchronous copies; v2.6 the native
+ * stream handle and the sharded RMSNorm ops (all below). */
+#define TURBINE_ABI_MINOR 6u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -618,6 +619,77 @@ int32_t turbine_memcpy_async(turbine_ctx *ctx, turbine_stream *s, void *dst,
 int32_t turbine_event_query(turbine_ctx *ctx, turbine_event *e);
 int32_t turbine_stream_wait_event(turbine_ctx *ctx, turbine_stream *s,
                                   turbine_event *e);
+
+/* ======== v2.6 (additive, optional): native stream handle and sharded
+ * RMSNorm ========
+ * Tensor parallelism (Phase 5, decision "P5 T6", answer B). Resolved only
+ * when turbine_abi_minor() >= 6 and all seven symbols exist
+ * (turbine_stream_native_handle and the row_sumsq and rmsnorm_sharded trios);
+ * a library without them serves one device per model only (tensor
+ * parallelism is refused at startup). The ROCm shim exports the group; the
+ * CUDA shim is on hold (NVIDIA on hold) and gains it with its v2.5 group.
+ *
+ * turbine_stream_native_handle stores in *out (a host pointer) the device
+ * runtime's own handle of stream s (NULL = the compute stream, else a copy
+ * stream of ctx), for a collective library that enqueues its work on that
+ * stream so it is ordered with the ops. The handle stays owned by the
+ * context (the copy stream: by its owner): valid until turbine_ctx_destroy
+ * (turbine_copy_stream_destroy), never destroyed by the caller, and never
+ * used by the caller while the compute stream is being captured
+ * (turbine_graph_begin .. turbine_graph_end) except by ops of the capture.
+ *
+ * A tensor-parallel rank holds a contiguous slice of the normalised
+ * dimension (OLMoE's QK-norm over all heads, split by heads). The rank
+ * computes the FP32 sum of squares of its slice (row_sumsq), the caller
+ * all-reduces the sums across ranks in FP32, and each rank normalises its
+ * slice with the full sum (rmsnorm_sharded). Both ops reduce every row alone
+ * in an order that depends only on the row's length: a row's result does not
+ * depend on the number of rows in the call or on the other rows. */
+#define TURBINE_OP_ROW_SUMSQ 15
+#define TURBINE_OP_RMSNORM_SHARDED 16
+
+/* sumsq[r] = sum over j < dim of x[r, j]^2, accumulated in F32. */
+typedef struct turbine_row_sumsq_desc {
+  /* [rows, dim] of dtype, row stride x_stride_row */
+  const void *x;
+  /* [rows] F32 */
+  float *sumsq;
+  int64_t rows, dim, x_stride_row;
+  int32_t dtype;
+} turbine_row_sumsq_desc;
+
+/* out[r, j] = round(round(x[r, j] * inv) * weight[j]) with
+ * inv = 1 / sqrt(sumsq[r] / full_dim + eps) in F32 (rounding to dtype where
+ * rmsnorm rounds): rmsnorm of the full row, restricted to this slice, when
+ * sumsq[r] is the sum of squares of the full row. */
+typedef struct turbine_rmsnorm_sharded_desc {
+  /* [rows, dim] of dtype, row stride x_stride_row */
+  const void *x;
+  /* [dim]: this slice of the norm weight */
+  const void *weight;
+  /* [rows] F32, summed over every slice of the full row */
+  const float *sumsq;
+  /* [rows, dim] of dtype, row stride out_stride_row */
+  void *out;
+  /* full_dim >= dim: the width of the full row */
+  int64_t rows, dim, full_dim, x_stride_row, out_stride_row;
+  float eps;
+  int32_t dtype;
+} turbine_rmsnorm_sharded_desc;
+
+int32_t turbine_stream_native_handle(turbine_ctx *ctx, turbine_stream *s,
+                                     void **out);
+
+/* v2.6 trios: row_sumsq, rmsnorm_sharded. */
+int32_t turbine_row_sumsq(turbine_ctx *ctx, const turbine_row_sumsq_desc *d);
+int32_t turbine_row_sumsq_supported(const turbine_row_sumsq_desc *d);
+const char *turbine_row_sumsq_impl(const turbine_row_sumsq_desc *d);
+
+int32_t turbine_rmsnorm_sharded(turbine_ctx *ctx,
+                                const turbine_rmsnorm_sharded_desc *d);
+int32_t
+turbine_rmsnorm_sharded_supported(const turbine_rmsnorm_sharded_desc *d);
+const char *turbine_rmsnorm_sharded_impl(const turbine_rmsnorm_sharded_desc *d);
 
 #ifdef __cplusplus
 }

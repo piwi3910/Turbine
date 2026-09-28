@@ -22,7 +22,11 @@
 //!
 //! ABI v2.1 is optional: `ShimLibrary::abi_minor` is 0 for a v2.0 library, whose provider then
 //! has no `add_rmsnorm`/`logits_reduce` family and whose context answers the option and graph
-//! calls with `KernelError::Unsupported`.
+//! calls with `KernelError::Unsupported`. ABI v2.6 is optional the same way: without it the
+//! provider has no `sharded_norm` family and `ShimContext::compute_stream` carries native handle
+//! 0 (`ShimContext::has_native_streams` is false), so collectives cannot be ordered with the ops.
+//! The native handle is owned by the context (it is the context's compute stream) and is valid
+//! while the context lives; every `StreamRef` holds an `Arc` of the context.
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::fmt;
@@ -42,8 +46,8 @@ use crate::cards::CardProfile;
 use crate::ffi::{
     self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo,
     EmbeddingDesc, GemmDesc, LogitsReduceDesc, MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE,
-    MoeExpertsDesc, MoeRouteDesc, OpTrio, RmsnormDesc, RopeDesc, ShimSymbols, SiluMulDesc,
-    StagingFns, TurbineCtx, TurbineEvent, TurbineGraph,
+    MoeExpertsDesc, MoeRouteDesc, OpTrio, RmsnormDesc, RmsnormShardedDesc, RopeDesc, RowSumsqDesc,
+    ShimSymbols, SiluMulDesc, StagingFns, TurbineCtx, TurbineEvent, TurbineGraph,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -53,7 +57,8 @@ use crate::ops::{
     KvCopyConfig, KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext,
     LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
     MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
-    ProviderId, RopeConfig, RopeContext, RopeKernel,
+    ProviderId, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext, RopeKernel,
+    RowSumsqConfig, RowSumsqContext, ShardedNormKernel,
 };
 use crate::pinned::PinnedState;
 use crate::registry::OpConfig;
@@ -230,6 +235,13 @@ impl ShimLibrary {
         &self.archs
     }
 
+    /// True when the library exports the ABI v2.6 group: the native handle of its streams (so a
+    /// collective library can enqueue on the compute stream) and the sharded RMSNorm ops. Without
+    /// it tensor parallelism cannot run on this library.
+    pub fn exports_native_streams(&self) -> bool {
+        self.syms.v21.tensor_parallel.is_some()
+    }
+
     /// True when the library exports the ABI v2.4 group (implementation enumeration, explicit
     /// runs and the card profile); otherwise it chooses the implementation of every call itself.
     pub fn enumerates_implementations(&self) -> bool {
@@ -237,12 +249,15 @@ impl ShimLibrary {
     }
 
     /// The implementations of `op` the library contains, in its order (ABI v2.4
-    /// `turbine_impl_count` / `turbine_impl_info`); empty when it does not enumerate or reports
-    /// an error for `op`.
+    /// `turbine_impl_count` / `turbine_impl_info`); empty when it does not enumerate, predates
+    /// the op (a minor below [`OpKind::abi_minor`]) or reports an error for `op`.
     pub fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
         let Some(fns) = self.syms.v21.impls else {
             return Vec::new();
         };
+        if self.syms.v21.minor < op.abi_minor() {
+            return Vec::new();
+        }
         let code = op.abi_code();
         // SAFETY: `turbine_impl_count` takes an integer and returns one; no pointer is involved.
         let count = unsafe { (fns.count)(code) };
@@ -322,8 +337,24 @@ impl ShimLibrary {
             return Err(e);
         }
         let info = ContextInfo::from_raw(&info);
+        let mut native_compute: *mut c_void = std::ptr::null_mut();
+        if let Some(tp) = self.syms.v21.tensor_parallel {
+            // SAFETY: `raw` is the live context created above; a null stream names its compute
+            // stream, and `native_compute` is a live out-pointer on this stack frame. The handle
+            // stays owned by the context (header v2.6) and is only carried as an integer.
+            let code = unsafe {
+                (tp.stream_native_handle)(raw, std::ptr::null_mut(), &mut native_compute)
+            };
+            if let Err(e) = ffi::check(code, &self.syms, raw) {
+                // SAFETY: as above: `raw` was never shared and no `ShimContext` owns it yet, so it
+                // is destroyed exactly once, here.
+                unsafe { (self.syms.ctx_destroy)(raw) };
+                return Err(e);
+            }
+        }
         Ok(Arc::new_cyclic(|weak| ShimContext {
             raw,
+            native_compute: native_compute as u64,
             lib: Arc::clone(self),
             device: device.index,
             info,
@@ -369,6 +400,10 @@ impl ContextInfo {
 /// handles and workspace. The `DeviceMemory` backend for that device.
 pub struct ShimContext {
     raw: *mut TurbineCtx,
+    /// The device runtime's handle of the compute stream (ABI v2.6
+    /// `turbine_stream_native_handle`), 0 when the library lacks the v2.6 group. Owned by the
+    /// context; only ever handed out as an integer inside a `StreamRef`, which holds the context.
+    native_compute: u64,
     lib: Arc<ShimLibrary>,
     device: DeviceId,
     info: ContextInfo,
@@ -455,6 +490,14 @@ impl ShimContext {
     /// Workspace size, compute capability and device arch of this context.
     pub fn info(&self) -> ContextInfo {
         self.info.clone()
+    }
+
+    /// True when [`DeviceMemory::compute_stream`] carries the device runtime's own stream handle
+    /// (the library exports the ABI v2.6 group), so a collective library can enqueue on the
+    /// compute stream in order with the ops; false (handle 0) otherwise, and tensor parallelism
+    /// is refused on this library.
+    pub fn has_native_streams(&self) -> bool {
+        self.lib.exports_native_streams()
     }
 
     fn check(&self, code: i32) -> Result<(), KernelError> {
@@ -813,7 +856,7 @@ impl DeviceMemory for ShimContext {
             .self_ref
             .upgrade()
             .expect("a ShimContext only exists inside the Arc create_context returns");
-        StreamRef::new(0, self.device, owner)
+        StreamRef::new(self.native_compute, self.device, owner)
     }
 
     fn staging_alloc(&self, bytes: usize) -> Result<StagingId, MemoryError> {
@@ -1376,6 +1419,35 @@ fn add_rmsnorm_probe(cfg: &AddRmsnormConfig) -> AddRmsnormDesc {
     }
 }
 
+fn row_sumsq_probe(cfg: &RowSumsqConfig) -> RowSumsqDesc {
+    let dim = i64::from(cfg.dim);
+    RowSumsqDesc {
+        x: std::ptr::null(),
+        sumsq: std::ptr::null_mut(),
+        rows: 1,
+        dim,
+        x_stride_row: dim,
+        dtype: cfg.dtype.abi_code(),
+    }
+}
+
+fn rmsnorm_sharded_probe(cfg: &RmsnormShardedConfig) -> RmsnormShardedDesc {
+    let dim = i64::from(cfg.dim);
+    RmsnormShardedDesc {
+        x: std::ptr::null(),
+        weight: std::ptr::null(),
+        sumsq: std::ptr::null(),
+        out: null(),
+        rows: 1,
+        dim,
+        full_dim: i64::from(cfg.full_dim),
+        x_stride_row: dim,
+        out_stride_row: dim,
+        eps: 1e-5,
+        dtype: cfg.dtype.abi_code(),
+    }
+}
+
 fn logits_reduce_probe(cfg: &LogitsReduceConfig) -> LogitsReduceDesc {
     let vocab = i64::from(cfg.vocab);
     LogitsReduceDesc {
@@ -1442,6 +1514,100 @@ impl ShimProvider {
             .logits_reduce
             .as_ref()
             .ok_or_else(|| self.ctx.lib.lacks("turbine_logits_reduce"))
+    }
+}
+
+impl ShimProvider {
+    /// The v2.6 group; `KernelProvider::sharded_norm` is `Some` exactly when it exists.
+    fn tensor_parallel_fns(&self) -> Result<&ffi::TensorParallelFns, KernelError> {
+        self.syms().v21.tensor_parallel.as_ref().ok_or_else(|| {
+            self.ctx
+                .lib
+                .lacks("the ABI v2.6 row_sumsq / rmsnorm_sharded group")
+        })
+    }
+}
+
+/// Checks that `v` is a dense F32 view of shape `[rows]` (the per-row sums of squares).
+fn sumsq_view(v: &TensorView<'_>, rows: usize) -> Result<(), KernelError> {
+    dense("sumsq", v, &[rows], DType::F32)
+}
+
+impl ShardedNormKernel for ShimProvider {
+    fn supports_row_sumsq(&self, cfg: &RowSumsqConfig) -> bool {
+        self.tensor_parallel_fns()
+            .is_ok_and(|f| Self::supported(&f.row_sumsq, &row_sumsq_probe(cfg)))
+    }
+
+    fn supports_rmsnorm_sharded(&self, cfg: &RmsnormShardedConfig) -> bool {
+        cfg.full_dim >= cfg.dim
+            && self
+                .tensor_parallel_fns()
+                .is_ok_and(|f| Self::supported(&f.rmsnorm_sharded, &rmsnorm_sharded_probe(cfg)))
+    }
+
+    fn implementation_row_sumsq(&self, cfg: &RowSumsqConfig) -> String {
+        self.tensor_parallel_fns()
+            .map(|f| self.implementation_of(OpKind::RowSumsq, &f.row_sumsq, &row_sumsq_probe(cfg)))
+            .unwrap_or_default()
+    }
+
+    fn implementation_rmsnorm_sharded(&self, cfg: &RmsnormShardedConfig) -> String {
+        self.tensor_parallel_fns()
+            .map(|f| {
+                self.implementation_of(
+                    OpKind::RmsnormSharded,
+                    &f.rmsnorm_sharded,
+                    &rmsnorm_sharded_probe(cfg),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn row_sumsq(&self, ctx: &mut RowSumsqContext<'_>) -> Result<(), KernelError> {
+        let fns = self.tensor_parallel_fns()?;
+        let x_stride_row = row_stride("x", &ctx.x, 2)?;
+        let (rows, dim) = (ctx.x.shape[0], ctx.x.shape[1]);
+        sumsq_view(&ctx.sumsq, rows)?;
+        let d = RowSumsqDesc {
+            x: self.ctx.device_ptr("x", &ctx.x)?,
+            sumsq: self.ctx.device_ptr("sumsq", &ctx.sumsq)?.cast(),
+            rows: to_i64("rows", rows)?,
+            dim: to_i64("dim", dim)?,
+            x_stride_row,
+            dtype: ctx.x.dtype.abi_code(),
+        };
+        self.run(OpKind::RowSumsq, &fns.row_sumsq, &d, 0)
+    }
+
+    fn rmsnorm_sharded(&self, ctx: &mut RmsnormShardedContext<'_>) -> Result<(), KernelError> {
+        let fns = self.tensor_parallel_fns()?;
+        let x_stride_row = row_stride("x", &ctx.x, 2)?;
+        let (rows, dim) = (ctx.x.shape[0], ctx.x.shape[1]);
+        if ctx.out.shape.as_slice() != [rows, dim] || ctx.out.dtype != ctx.x.dtype {
+            return Err(invalid(format!(
+                "out must be a {} view of shape [{rows}, {dim}], has {} shape {:?}",
+                ctx.x.dtype.as_str(),
+                ctx.out.dtype.as_str(),
+                ctx.out.shape.as_slice()
+            )));
+        }
+        dense("weight", &ctx.weight, &[dim], ctx.x.dtype)?;
+        sumsq_view(&ctx.sumsq, rows)?;
+        let d = RmsnormShardedDesc {
+            out_stride_row: row_stride("out", &ctx.out, 2)?,
+            x: self.ctx.device_ptr("x", &ctx.x)?,
+            weight: self.ctx.device_ptr("weight", &ctx.weight)?,
+            sumsq: self.ctx.device_ptr("sumsq", &ctx.sumsq)? as *const f32,
+            out: self.ctx.device_ptr("out", &ctx.out)?,
+            rows: to_i64("rows", rows)?,
+            dim: to_i64("dim", dim)?,
+            full_dim: i64::from(ctx.full_dim),
+            x_stride_row,
+            eps: ctx.eps,
+            dtype: ctx.x.dtype.abi_code(),
+        };
+        self.run(OpKind::RmsnormSharded, &fns.rmsnorm_sharded, &d, 0)
     }
 }
 
@@ -2080,6 +2246,13 @@ impl KernelProvider for ShimProvider {
             .is_some()
             .then_some(self as &dyn LogitsReduceKernel)
     }
+    fn sharded_norm(&self) -> Option<&dyn ShardedNormKernel> {
+        self.syms()
+            .v21
+            .tensor_parallel
+            .is_some()
+            .then_some(self as &dyn ShardedNormKernel)
+    }
 
     fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
         self.ctx.lib.implementations(op)
@@ -2164,6 +2337,15 @@ impl KernelProvider for ShimProvider {
             OpConfig::LogitsReduce(cfg) => {
                 cfg.top_n <= LogitsReduceConfig::MAX_TOP_N
                     && lib.impl_supports(OpKind::LogitsReduce, index, &logits_reduce_probe(cfg))
+            }
+            OpConfig::RowSumsq(cfg) => {
+                lib.exports_native_streams()
+                    && lib.impl_supports(OpKind::RowSumsq, index, &row_sumsq_probe(cfg))
+            }
+            OpConfig::RmsnormSharded(cfg) => {
+                lib.exports_native_streams()
+                    && cfg.full_dim >= cfg.dim
+                    && lib.impl_supports(OpKind::RmsnormSharded, index, &rmsnorm_sharded_probe(cfg))
             }
         }
     }
@@ -2729,6 +2911,8 @@ mod tests {
             size_of::<MoeExpertsDesc>(),
             size_of::<AddRmsnormDesc>(),
             size_of::<LogitsReduceDesc>(),
+            size_of::<RowSumsqDesc>(),
+            size_of::<RmsnormShardedDesc>(),
         ];
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");
@@ -2820,7 +3004,10 @@ mod tests {
         );
         for &op in OpKind::ALL {
             let impls = lib.implementations(op);
-            if op != OpKind::Rmsnorm {
+            if op.abi_minor() > 4 {
+                // A v2.4 library predates the op: its code is not asked for.
+                assert!(impls.is_empty(), "{op}");
+            } else if op != OpKind::Rmsnorm {
                 let names: Vec<&str> = impls.iter().map(|i| i.name.as_str()).collect();
                 assert_eq!(names, [format!("stub_{op}")], "{op}");
             }
@@ -3058,5 +3245,126 @@ mod tests {
         drop((dev, mem, ctx));
         assert_eq!(live_contexts(&lib), contexts - 1);
         assert_eq!(stub_count(&lib, "stub_live_streams"), 0);
+    }
+
+    /// ABI v2.6 (Phase 5 Task 6): a v2.5 library has no native stream handle (the compute
+    /// stream's `StreamRef` carries 0, `has_native_streams` is false) and no sharded RMSNorm
+    /// family, and is not asked for the v2.6 op codes; the v2.6 stub resolves the whole group:
+    /// the compute stream carries the library's own handle for the context, the provider has the
+    /// `sharded_norm` family forwarding to `turbine_row_sumsq` / `turbine_rmsnorm_sharded`, and
+    /// the new ops are enumerated. Breaks if the handle is not fetched from a v2.6 library, is
+    /// invented for an older one, or the group resolves on a library without it.
+    #[test]
+    fn v26_native_stream_and_sharded_norm_group() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let sum_cfg = RowSumsqConfig {
+            dim: 1024,
+            dtype: DType::BF16,
+        };
+        let norm_cfg = RmsnormShardedConfig {
+            dim: 1024,
+            full_dim: 2048,
+            dtype: DType::BF16,
+        };
+
+        let v25 = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V25")), "hip")
+            .expect("a v2.5 library loads");
+        assert_eq!(v25.abi_minor(), 5);
+        assert!(!v25.exports_native_streams());
+        let old = v25
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        assert!(!old.has_native_streams());
+        assert_eq!(old.compute_stream().native_handle(), 0);
+        let old_provider = shim_provider(Arc::clone(&old));
+        assert!(old_provider.sharded_norm().is_none());
+        assert!(!OpConfig::RowSumsq(sum_cfg).supported_by(old_provider.as_ref()));
+        for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
+            assert!(v25.implementations(op).is_empty(), "{op}");
+        }
+        drop((old_provider, old));
+
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V26")), "hip")
+            .expect("a v2.6 library loads");
+        assert_eq!((lib.abi_version(), lib.abi_minor()), (2, 6));
+        assert!(lib.exports_native_streams());
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        assert!(ctx.has_native_streams());
+        let want = stub_hook(
+            &lib,
+            "stub_compute_stream",
+            |f: unsafe extern "C" fn(*mut TurbineCtx) -> *mut c_void| {
+                // SAFETY: the stub defines `void *stub_compute_stream(turbine_ctx *)`; `ctx.raw`
+                // is a live context of this library, and the hook only takes a field's address.
+                unsafe { f(ctx.raw) }
+            },
+        ) as u64;
+        assert_ne!(want, 0);
+        let stream = ctx.compute_stream();
+        assert_eq!(stream.native_handle(), want);
+        assert_eq!(stream.device(), DeviceId(0));
+
+        let provider = shim_provider(Arc::clone(&ctx));
+        let sharded = provider.sharded_norm().expect("the v2.6 family");
+        // The stub supports no op; the names come from the library's `_impl`.
+        assert!(!sharded.supports_row_sumsq(&sum_cfg));
+        assert!(!sharded.supports_rmsnorm_sharded(&norm_cfg));
+        assert_eq!(sharded.implementation_row_sumsq(&sum_cfg), "stub_row_sumsq");
+        assert_eq!(
+            sharded.implementation_rmsnorm_sharded(&norm_cfg),
+            "stub_rmsnorm_sharded"
+        );
+        for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
+            let names: Vec<String> = lib
+                .implementations(op)
+                .into_iter()
+                .map(|i| i.name)
+                .collect();
+            assert_eq!(names, [format!("stub_{op}")], "{op}");
+        }
+
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let x = Tensor::empty(&mem, &[3, 1024], DType::BF16).expect("x");
+        let w = Tensor::empty(&mem, &[1024], DType::BF16).expect("w");
+        let sumsq = Tensor::empty(&mem, &[3], DType::F32).expect("sumsq");
+        let out = Tensor::empty(&mem, &[3, 1024], DType::BF16).expect("out");
+        let err = sharded
+            .row_sumsq(&mut RowSumsqContext {
+                x: x.view(),
+                sumsq: sumsq.view(),
+            })
+            .expect_err("the stub refuses");
+        assert!(
+            matches!(&err, KernelError::Unsupported { message } if message == "stub: row_sumsq is not implemented"),
+            "{err:?}"
+        );
+        let err = sharded
+            .rmsnorm_sharded(&mut RmsnormShardedContext {
+                x: x.view(),
+                sumsq: sumsq.view(),
+                weight: w.view(),
+                out: out.view(),
+                full_dim: 2048,
+                eps: 1e-5,
+            })
+            .expect_err("the stub refuses");
+        assert!(
+            err.to_string()
+                .contains("rmsnorm_sharded is not implemented"),
+            "{err}"
+        );
+        // A sums view of the wrong dtype is refused before the library.
+        let err = sharded
+            .row_sumsq(&mut RowSumsqContext {
+                x: x.view(),
+                sumsq: w.view(),
+            })
+            .expect_err("bf16 sums");
+        assert!(
+            matches!(err, KernelError::InvalidArgument { .. }),
+            "{err:?}"
+        );
     }
 }

@@ -6,6 +6,7 @@
  * it with the host C compiler once per variant:
  *   -DSTUB_ABI=<n>u  -DSTUB_BACKEND="<name>"  -DSTUB_ARCHS="<a,b>"
  *   [-DTURBINE_STUB_V21] [-DTURBINE_STUB_V24] [-DTURBINE_STUB_V25]
+ *   [-DTURBINE_STUB_V26]
  * With TURBINE_STUB_V21 it also exports the optional ABI v2.1 and v2.3
  * symbols: turbine_abi_minor (3, a v2.3 library), context options
  * (TURBINE_OPTION_GEMM_AUTOTUNE kept per context,
@@ -15,8 +16,9 @@
  * staging memory and events (see the v2.3 section below). With
  * TURBINE_STUB_V24 as well it reports minor 4 and exports the v2.4
  * implementation group (see the v2.4 section); with TURBINE_STUB_V25 as well
- * it reports minor TURBINE_ABI_MINOR (5) and exports the v2.5 copy streams
- * (see the v2.5 section at the end).
+ * it reports minor 5 and exports the v2.5 copy streams (see the v2.5
+ * section); with TURBINE_STUB_V26 as well it reports minor TURBINE_ABI_MINOR
+ * (6) and exports the v2.6 group (see the v2.6 section at the end).
  *
  * stub_live_contexts() is a test hook (not part of the ABI): the number of
  * contexts created and not yet destroyed, so tests can prove the Rust side
@@ -39,6 +41,8 @@ struct turbine_ctx {
   /* v2.4: the moe_small_max_rows of the last turbine_ctx_set_profile, -1
    * before one */
   int64_t profile_small_rows;
+  /* v2.6: its address is the compute stream's native handle */
+  char compute_stream_tag;
 };
 
 static atomic_int live_contexts;
@@ -55,7 +59,8 @@ int32_t stub_live_contexts(void) { return atomic_load(&live_contexts); }
 /* Test hook: sizeof each descriptor, indexed in header order (gemm,
  * attention, rmsnorm, rope, silu_mul, embedding, add, then v2: ctx_info,
  * attention_paged, copy_blocks, moe_route, moe_experts, then v2.1:
- * add_rmsnorm, logits_reduce); 0 past the end. */
+ * add_rmsnorm, logits_reduce, then v2.6: row_sumsq, rmsnorm_sharded); 0 past
+ * the end. */
 size_t stub_desc_size(int32_t which) {
   switch (which) {
   case 0:
@@ -86,6 +91,10 @@ size_t stub_desc_size(int32_t which) {
     return sizeof(turbine_add_rmsnorm_desc);
   case 13:
     return sizeof(turbine_logits_reduce_desc);
+  case 14:
+    return sizeof(turbine_row_sumsq_desc);
+  case 15:
+    return sizeof(turbine_rmsnorm_sharded_desc);
   default:
     return 0;
   }
@@ -229,8 +238,10 @@ STUB_OP(moe_experts, turbine_moe_experts_desc)
 STUB_OP(add_rmsnorm, turbine_add_rmsnorm_desc)
 STUB_OP(logits_reduce, turbine_logits_reduce_desc)
 
-#if defined(TURBINE_STUB_V25)
+#if defined(TURBINE_STUB_V26)
 uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
+#elif defined(TURBINE_STUB_V25)
+uint32_t turbine_abi_minor(void) { return 5u; }
 #elif defined(TURBINE_STUB_V24)
 uint32_t turbine_abi_minor(void) { return 4u; }
 #else
@@ -422,8 +433,9 @@ int32_t turbine_event_destroy(turbine_ctx *ctx, turbine_event *e) {
 #ifdef TURBINE_STUB_V24
 /* v2.4: rmsnorm has two implementations, "stub_a" (provider "stub",
  * supports every descriptor) and "stub_b" (provider "stub_alt", refuses dim
- * 4096); every other op has one implementation "stub_<op>" (provider "stub")
- * that supports nothing, like its turbine_<op>_supported. turbine_impl_run
+ * 4096); every other op (the v2.6 ops only with TURBINE_STUB_V26) has one
+ * implementation "stub_<op>" (provider "stub") that supports nothing, like
+ * its turbine_<op>_supported. turbine_impl_run
  * records op * 100 + index for stub_last_impl_run() and does nothing else.
  * turbine_ctx_set_profile accepts a profile of a build arch and keeps its
  * moe_small_max_rows for stub_profile_small_rows(). */
@@ -443,6 +455,10 @@ static const char *const stub_op_names[] = {
     "stub_moe_experts",
     "stub_add_rmsnorm",
     "stub_logits_reduce",
+#ifdef TURBINE_STUB_V26
+    "stub_row_sumsq",
+    "stub_rmsnorm_sharded",
+#endif
 };
 #define STUB_OPS ((int32_t)(sizeof stub_op_names / sizeof stub_op_names[0]))
 
@@ -613,3 +629,28 @@ int32_t turbine_stream_wait_event(turbine_ctx *ctx, turbine_stream *st,
   return TURBINE_OK;
 }
 #endif /* TURBINE_STUB_V25 */
+
+#ifdef TURBINE_STUB_V26
+/* v2.6: the row_sumsq and rmsnorm_sharded trios (unsupported like every op)
+ * and native stream handles: the compute stream's handle is the address of
+ * the context's compute_stream_tag (stub_compute_stream(ctx) returns it), a
+ * copy stream's handle is the turbine_stream pointer itself. */
+STUB_OP(row_sumsq, turbine_row_sumsq_desc)
+STUB_OP(rmsnorm_sharded, turbine_rmsnorm_sharded_desc)
+
+void *stub_compute_stream(turbine_ctx *ctx) { return &ctx->compute_stream_tag; }
+
+int32_t turbine_stream_native_handle(turbine_ctx *ctx, turbine_stream *s,
+                                     void **out) {
+  if (out == NULL) {
+    set_error(ctx->last_error, "stub: null handle pointer");
+    return TURBINE_E_ARGUMENT;
+  }
+  if (s != NULL && s->ctx != ctx) {
+    set_error(ctx->last_error, "stub: stream of another context");
+    return TURBINE_E_ARGUMENT;
+  }
+  *out = s != NULL ? (void *)s : stub_compute_stream(ctx);
+  return TURBINE_OK;
+}
+#endif /* TURBINE_STUB_V26 */

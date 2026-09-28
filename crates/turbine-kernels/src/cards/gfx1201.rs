@@ -27,6 +27,9 @@ const PAGED_DECODE_ORDER: &[&str] = &[
     "turbine_hip",
 ];
 const FMHA_ORDER: &[&str] = &["ck_tile_fmha_fwd"];
+/// The tensor-parallel sharded RMSNorm (ABI v2.6): the Turbine kernels only (no CK instance takes
+/// an external sum of squares; decision "P5 T6: sharded RMSNorm — provider evaluation").
+const SHARDED_NORM_ORDER: &[&str] = &["turbine_hip"];
 
 pub static GFX1201: CardProfile = CardProfile {
     name: "gfx1201",
@@ -66,6 +69,16 @@ pub static GFX1201: CardProfile = CardProfile {
         OpPreference {
             op: OpKind::AddRmsnorm,
             order: RMSNORM_ORDER,
+            row_tiers: &[],
+        },
+        OpPreference {
+            op: OpKind::RowSumsq,
+            order: SHARDED_NORM_ORDER,
+            row_tiers: &[],
+        },
+        OpPreference {
+            op: OpKind::RmsnormSharded,
+            order: SHARDED_NORM_ORDER,
             row_tiers: &[],
         },
         OpPreference {

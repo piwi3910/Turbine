@@ -21,7 +21,8 @@
 //                                  solution), 4 hipblaslt_per_expert; 3 and 4
 //                                  read host_expert_offsets
 //   rope, silu_mul, embedding,   0 turbine_hip [turbine_hip]
-//   add, moe_route, logits_reduce
+//   add, moe_route, logits_reduce,
+//   row_sumsq, rmsnorm_sharded (v2.6)
 #include <string>
 
 #include "turbine_hip.hpp"
@@ -195,6 +196,14 @@ const ImplEntry kLogitsReduce[] = {
     whole<turbine_logits_reduce_desc, turbine_logits_reduce_supported,
           turbine_logits_reduce>("turbine_hip", kTurbine),
 };
+const ImplEntry kRowSumsq[] = {
+    whole<turbine_row_sumsq_desc, turbine_row_sumsq_supported,
+          turbine_row_sumsq>("turbine_hip", kTurbine),
+};
+const ImplEntry kRmsnormSharded[] = {
+    whole<turbine_rmsnorm_sharded_desc, turbine_rmsnorm_sharded_supported,
+          turbine_rmsnorm_sharded>("turbine_hip", kTurbine),
+};
 
 struct OpImpls {
   const ImplEntry *entries;
@@ -222,14 +231,16 @@ const OpImpls kOps[] = {
     of(kMoeExperts),
     of(kAddRmsnorm),
     of(kLogitsReduce),
+    of(kRowSumsq),
+    of(kRmsnormSharded),
 };
-static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_LOGITS_REDUCE + 1,
+static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_RMSNORM_SHARDED + 1,
               "one implementation list per TURBINE_OP_* code");
 
 } // namespace
 
 const ImplEntry *impl_entries(int32_t op, int32_t *count) {
-  if (op < 0 || op > TURBINE_OP_LOGITS_REDUCE) {
+  if (op < 0 || op > TURBINE_OP_RMSNORM_SHARDED) {
     *count = 0;
     return nullptr;
   }

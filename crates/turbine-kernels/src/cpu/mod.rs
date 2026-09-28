@@ -20,7 +20,7 @@ use crate::KernelError;
 use crate::ops::{
     ActivationKernel, AddRmsnormKernel, AttentionKernel, ElementwiseKernel, EmbeddingKernel,
     GemmKernel, KernelProvider, KvCopyKernel, LogitsReduceKernel, MoeKernel, NormKernel,
-    ProviderId, RopeKernel,
+    ProviderId, RopeKernel, ShardedNormKernel,
 };
 
 // One file per op family (Phase 2m S-5); `math`, `paged` and `topk` hold the shared numerics.
@@ -294,6 +294,9 @@ impl KernelProvider for CpuReference {
         Some(self)
     }
     fn logits_reduce(&self) -> Option<&dyn LogitsReduceKernel> {
+        Some(self)
+    }
+    fn sharded_norm(&self) -> Option<&dyn ShardedNormKernel> {
         Some(self)
     }
 }

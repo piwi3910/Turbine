@@ -8,7 +8,8 @@
 //! is 2 or more (a rounding flip after a different f32 summation order); F32 outputs |Δ| ≤ 1e-4;
 //! copies (the paged K/V append, `copy_blocks`) and `moe_route` selections are exact;
 //! `logits_reduce` (ABI v2.1) top-n ids are exact, its lse within 1e-5 relative and its draws
-//! identical except within 1e-6 of a CDF boundary.
+//! identical except within 1e-6 of a CDF boundary; the sharded RMSNorm (ABI v2.6) as stated at
+//! `sharded_norm_ops`.
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -24,9 +25,9 @@ use turbine_kernels::{
     EmbeddingContext, GemmConfig, GemmContext, ImplChoice, ImplInfo, KernelProvider, KvCopyConfig,
     KvCopyContext, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
     MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, OpConfig, OpKind,
-    PagedAttentionContext, RopeConfig, RopeContext, ShimContext, ShimLibrary,
-    TURBINE_OPTION_GEMM_AUTOTUNE, TURBINE_OPTION_GEMM_TUNED_SHAPES, cpu_reference_provider,
-    shim_provider,
+    PagedAttentionContext, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
+    RowSumsqConfig, RowSumsqContext, ShimContext, ShimLibrary, TURBINE_OPTION_GEMM_AUTOTUNE,
+    TURBINE_OPTION_GEMM_TUNED_SHAPES, cpu_reference_provider, shim_provider,
 };
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceMemory, HostStaging, Tensor, TensorView};
@@ -739,6 +740,298 @@ fn add_rmsnorm_matches_cpu() {
     for (rows, dim, x_stride) in cases {
         add_rmsnorm_case(&p, &mut rng, rows, dim, x_stride);
     }
+}
+
+/// Columns `[start, start + cols)` of every row of the `[rows, stride]` tensor `t`, as a
+/// row-strided `[rows, cols]` view (one tensor-parallel rank's slice of the row).
+fn column_slice(t: &Tensor, start: usize, cols: usize) -> TensorView<'_> {
+    let (rows, stride) = (t.shape[0], t.shape[1]);
+    let es = t.dtype.size_bytes();
+    TensorView {
+        slice: t
+            .storage
+            .whole()
+            .sub(start * es, ((rows - 1) * stride + cols) * es),
+        shape: (&[rows, cols][..]).into(),
+        strides: (&[stride, 1][..]).into(),
+        dtype: t.dtype,
+    }
+}
+
+/// Rows `[first, first + count)` of the `[rows, cols]` tensor `t` (dense rows).
+fn row_range(t: &Tensor, first: usize, count: usize) -> TensorView<'_> {
+    let cols = t.shape.get(1).copied().unwrap_or(1);
+    let es = t.dtype.size_bytes();
+    let shape: Vec<usize> = if t.shape.len() == 2 {
+        vec![count, cols]
+    } else {
+        vec![count]
+    };
+    let strides: Vec<usize> = if t.shape.len() == 2 {
+        vec![cols, 1]
+    } else {
+        vec![1]
+    };
+    TensorView {
+        slice: t.storage.whole().sub(first * cols * es, count * cols * es),
+        shape: shape.as_slice().into(),
+        strides: strides.as_slice().into(),
+        dtype: t.dtype,
+    }
+}
+
+/// One tensor-parallel sharded RMSNorm case of `sharded_norm_ops`: `rows` BF16 rows of `full`
+/// split into `tp` equal slices. Per rank, HIP `row_sumsq` of the slice vs the CPU reference (F32,
+/// |Δ| ≤ 1e-5 relative: only the summation order differs); the per-rank sums are added on the host
+/// (the all-reduce) and the same sums go to both providers' `rmsnorm_sharded`, whose BF16 outputs
+/// must be bitwise equal on at least 99.9 % of the elements and within the BF16 tolerance on the
+/// rest (a 1-ulp f32 difference of `inv_rms` flipping a rounding of `x·inv_rms`). Returns the HIP
+/// implementation names (`row_sumsq`, `rmsnorm_sharded`).
+fn sharded_norm_case(
+    p: &Pair,
+    rng: &mut Rng,
+    rows: usize,
+    full: usize,
+    tp: usize,
+) -> (String, String) {
+    let hip = p
+        .hip
+        .sharded_norm()
+        .expect("libturbine_hip.so exports the ABI v2.6 sharded RMSNorm group");
+    let cpu = p.cpu.sharded_norm().expect("cpu sharded norm");
+    let dim = full / tp;
+    let bf16 = DType::BF16;
+    let sum_cfg = RowSumsqConfig {
+        dim: dim as u32,
+        dtype: bf16,
+    };
+    let norm_cfg = RmsnormShardedConfig {
+        dim: dim as u32,
+        full_dim: full as u32,
+        dtype: bf16,
+    };
+    assert!(hip.supports_row_sumsq(&sum_cfg), "hip row_sumsq {sum_cfg}");
+    assert!(
+        hip.supports_rmsnorm_sharded(&norm_cfg),
+        "hip rmsnorm_sharded {norm_cfg}"
+    );
+    let names = (
+        hip.implementation_row_sumsq(&sum_cfg),
+        hip.implementation_rmsnorm_sharded(&norm_cfg),
+    );
+    let (x_hip, x_cpu) = twin(p, &[rows, full], bf16, &rng.normal(rows * full, 1.0));
+    let w: Vec<f32> = rng.normal(full, 0.5).iter().map(|v| 1.0 + v).collect();
+
+    let mut total = vec![0f32; rows];
+    for rank in 0..tp {
+        let (s_hip, s_cpu) = twin(p, &[rows], DType::F32, &vec![0.0; rows]);
+        for (kernel, x, sumsq) in [(hip, &x_hip, &s_hip), (cpu, &x_cpu, &s_cpu)] {
+            kernel
+                .row_sumsq(&mut RowSumsqContext {
+                    x: column_slice(x, rank * dim, dim),
+                    sumsq: sumsq.view(),
+                })
+                .expect("row_sumsq");
+        }
+        let (got, want) = (read(&s_hip), read(&s_cpu));
+        for (r, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-5 * w.abs(),
+                "row_sumsq rows={rows} {sum_cfg} rank {rank} row {r}: hip {g} vs cpu {w}"
+            );
+        }
+        for (t, v) in total.iter_mut().zip(&want) {
+            *t += v;
+        }
+    }
+    println!(
+        "row_sumsq rows={rows} {sum_cfg} tp={tp}: impl={} within 1e-5 relative ok",
+        names.0
+    );
+
+    let (s_hip, s_cpu) = twin(p, &[rows], DType::F32, &total);
+    let (o_hip, o_cpu) = twin(p, &[rows, full], bf16, &vec![0.0; rows * full]);
+    for rank in 0..tp {
+        let (w_hip, w_cpu) = twin(p, &[dim], bf16, &w[rank * dim..(rank + 1) * dim]);
+        for (kernel, x, sumsq, weight, out) in [
+            (hip, &x_hip, &s_hip, &w_hip, &o_hip),
+            (cpu, &x_cpu, &s_cpu, &w_cpu, &o_cpu),
+        ] {
+            kernel
+                .rmsnorm_sharded(&mut RmsnormShardedContext {
+                    x: column_slice(x, rank * dim, dim),
+                    sumsq: sumsq.view(),
+                    weight: weight.view(),
+                    out: column_slice(out, rank * dim, dim),
+                    full_dim: full as u32,
+                    eps: 1e-5,
+                })
+                .expect("rmsnorm_sharded");
+        }
+    }
+    let (got, want) = (read(&o_hip), read(&o_cpu));
+    let what = format!("rmsnorm_sharded rows={rows} {norm_cfg} tp={tp}");
+    let mut differ = 0usize;
+    for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+        if g.to_bits() == w.to_bits() {
+            continue;
+        }
+        assert!(
+            bf16_close(g, w),
+            "{what} ({}): element {i}: hip {g} vs cpu {w}",
+            names.1
+        );
+        differ += 1;
+    }
+    assert!(
+        differ * 1000 <= got.len(),
+        "{what} ({}): {differ} of {} elements not bitwise equal",
+        names.1,
+        got.len()
+    );
+    println!(
+        "{what}: impl={} {differ} of {} elements one rounding step off, the rest bitwise ok",
+        names.1,
+        got.len()
+    );
+    names
+}
+
+/// Phase 5 Task 6 (kernel ABI v2.6, decision "P5 T6", answer B): the tensor-parallel sharded
+/// RMSNorm of OLMoE's QK-norm (a row of 16 heads × 128 = 2,048 split by heads over 2 and 4
+/// ranks) matches the CPU reference (`sharded_norm_case`: sums within 1e-5 relative, outputs
+/// bitwise except ≤ 0.1 % one-rounding-step flips). Batch invariance: a row's `row_sumsq` and
+/// `rmsnorm_sharded` alone are bit-identical to the same row inside a 37-row call. One slice
+/// spanning the whole row with its own sum is bitwise the HIP `rmsnorm` (the Turbine kernel at
+/// 2,048: the same reduction order). `turbine_stream_native_handle` gives the compute stream a
+/// non-null native handle. Breaks if a kernel reduces in a row-count-dependent order, divides by
+/// the slice width, or the library does not resolve the v2.6 group.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn sharded_norm_ops() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    assert!(
+        p.ctx.library().exports_native_streams(),
+        "libturbine_hip.so exports the ABI v2.6 group (minor {})",
+        p.ctx.library().abi_minor()
+    );
+    assert!(p.ctx.has_native_streams());
+    let stream = p.hip_mem.compute_stream();
+    assert_ne!(
+        stream.native_handle(),
+        0,
+        "the compute stream's native handle"
+    );
+    println!(
+        "turbine_stream_native_handle: compute stream 0x{:x} ok",
+        stream.native_handle()
+    );
+
+    let mut rng = Rng(61);
+    let full = MOE_HIDDEN;
+    for (rows, tp) in [(1, 2), (37, 2), (37, 4), (2048, 2)] {
+        let names = sharded_norm_case(&p, &mut rng, rows, full, tp);
+        assert_eq!(names, ("turbine_hip".into(), "turbine_hip".into()));
+    }
+
+    // Row invariance: row 17 alone vs inside the 37-row call, both ops, tp = 2.
+    let hip = p.hip.sharded_norm().expect("v2.6 group");
+    let (rows, dim) = (37usize, full / 2);
+    let x = on_hip(
+        &p,
+        &[rows, full],
+        DType::BF16,
+        &rng.normal(rows * full, 1.0),
+    );
+    let w = on_hip(&p, &[dim], DType::BF16, &rng.normal(dim, 1.0));
+    let all_sums = zeros_on_hip(&p, &[rows], DType::F32);
+    let one_sum = zeros_on_hip(&p, &[1], DType::F32);
+    let x_slice = column_slice(&x, dim, dim);
+    let run_sumsq = |x: TensorView<'_>, sumsq: TensorView<'_>| {
+        hip.row_sumsq(&mut RowSumsqContext { x, sumsq })
+            .expect("row_sumsq")
+    };
+    run_sumsq(x_slice.clone(), all_sums.view());
+    let row = 17usize;
+    let x_row = TensorView {
+        slice: x.storage.whole().sub((row * full + dim) * 2, dim * 2),
+        shape: (&[1usize, dim][..]).into(),
+        strides: (&[full, 1][..]).into(),
+        dtype: DType::BF16,
+    };
+    run_sumsq(x_row.clone(), one_sum.view());
+    let (all, one) = (read(&all_sums), read(&one_sum));
+    assert_eq!(
+        all[row].to_bits(),
+        one[0].to_bits(),
+        "row_sumsq of row {row} alone vs in a {rows}-row call"
+    );
+    let all_out = zeros_on_hip(&p, &[rows, dim], DType::BF16);
+    let one_out = zeros_on_hip(&p, &[1, dim], DType::BF16);
+    for (xv, sums, out) in [
+        (x_slice, all_sums.view(), all_out.view()),
+        (x_row, row_range(&all_sums, row, 1), one_out.view()),
+    ] {
+        hip.rmsnorm_sharded(&mut RmsnormShardedContext {
+            x: xv,
+            sumsq: sums,
+            weight: w.view(),
+            out,
+            full_dim: full as u32,
+            eps: 1e-5,
+        })
+        .expect("rmsnorm_sharded");
+    }
+    let (all, one) = (read(&all_out), read(&one_out));
+    assert!(
+        all[row * dim..(row + 1) * dim]
+            .iter()
+            .zip(&one)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "rmsnorm_sharded of row {row} alone vs in a {rows}-row call"
+    );
+    println!("sharded norm row invariance: row {row} alone == in {rows} rows (bitwise) ok");
+
+    // One full-width slice with its own sum: bitwise the HIP rmsnorm (Turbine kernel at 2048).
+    let norm_cfg = NormConfig {
+        dim: full as u64,
+        dtype: DType::BF16,
+    };
+    let norm = p.hip.norm().expect("hip rmsnorm");
+    assert_eq!(norm.implementation(&norm_cfg), "turbine_hip");
+    let wf = on_hip(&p, &[full], DType::BF16, &rng.normal(full, 1.0));
+    let sums = zeros_on_hip(&p, &[rows], DType::F32);
+    let (sharded_out, norm_out) = (
+        zeros_on_hip(&p, &[rows, full], DType::BF16),
+        zeros_on_hip(&p, &[rows, full], DType::BF16),
+    );
+    run_sumsq(x.view(), sums.view());
+    hip.rmsnorm_sharded(&mut RmsnormShardedContext {
+        x: x.view(),
+        sumsq: sums.view(),
+        weight: wf.view(),
+        out: sharded_out.view(),
+        full_dim: full as u32,
+        eps: 1e-5,
+    })
+    .expect("rmsnorm_sharded");
+    norm.execute(&mut NormContext {
+        x: x.view(),
+        weight: wf.view(),
+        out: norm_out.view(),
+        eps: 1e-5,
+    })
+    .expect("rmsnorm");
+    assert_exact(
+        "rmsnorm_sharded (tp = 1) vs hip rmsnorm",
+        "turbine_hip",
+        &read(&sharded_out),
+        &read(&norm_out),
+    );
 }
 
 /// `x[j] · inv_rms(x)` computed exactly enough (f64) to bracket any f32 implementation's value.
@@ -4358,6 +4651,8 @@ fn implementations_enumerated() {
         ),
         (OpKind::AddRmsnorm, norm),
         (OpKind::LogitsReduce, one("turbine_hip", "turbine_hip")),
+        (OpKind::RowSumsq, one("turbine_hip", "turbine_hip")),
+        (OpKind::RmsnormSharded, one("turbine_hip", "turbine_hip")),
     ];
     assert_eq!(table.len(), OpKind::ALL.len());
     for (op, want) in &table {
@@ -4572,6 +4867,25 @@ fn every_implementation_matches_cpu() {
             }),
         ),
     ];
+    cases.push(case(
+        OpConfig::RowSumsq(RowSumsqConfig {
+            dim: (MOE_HIDDEN / 2) as u32,
+            dtype: bf16,
+        }),
+        Box::new(|p, rng| {
+            sharded_norm_case(p, rng, 37, MOE_HIDDEN, 2);
+        }),
+    ));
+    cases.push(case(
+        OpConfig::RmsnormSharded(RmsnormShardedConfig {
+            dim: (MOE_HIDDEN / 2) as u32,
+            full_dim: MOE_HIDDEN as u32,
+            dtype: bf16,
+        }),
+        Box::new(|p, rng| {
+            sharded_norm_case(p, rng, 37, MOE_HIDDEN, 2);
+        }),
+    ));
     for (rows, dim, x_stride) in [
         (16, HIDDEN, HIDDEN),
         (16, MOE_HIDDEN, MOE_HIDDEN),
