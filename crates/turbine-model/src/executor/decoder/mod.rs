@@ -1577,6 +1577,31 @@ impl ModelExecutor for DecoderExecutor {
         &self.shape
     }
 
+    /// The tensor- and expert-parallel contexts share the rank's one communicator: both take
+    /// `c` (P5 Task 28).
+    fn set_collective(&mut self, c: Arc<dyn Collective>) -> Result<(), ModelError> {
+        let own = self.tp.as_ref().map(|t| (t.rank, t.world));
+        let Some((rank, world)) = own.or(self.ep.as_ref().map(|e| (e.rank, e.world))) else {
+            return Err(ModelError::Kernel(KernelError::Unsupported {
+                message: "this executor has no tensor- or expert-parallel communicator".into(),
+            }));
+        };
+        if (c.rank(), c.world_size()) != (rank as usize, world as usize) {
+            return Err(invalid(format!(
+                "a communicator of rank {} of {} replacing rank {rank} of {world}'s",
+                c.rank(),
+                c.world_size()
+            )));
+        }
+        if let Some(tp) = &mut self.tp {
+            tp.collective = Arc::clone(&c);
+        }
+        if let Some(ep) = &mut self.ep {
+            ep.collective = c;
+        }
+        Ok(())
+    }
+
     fn kv_layout(&self) -> &KvLayout {
         &self.kv_layout
     }

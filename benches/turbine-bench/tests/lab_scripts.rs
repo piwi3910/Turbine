@@ -495,6 +495,8 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
             "rccl_init_with_a_missing_peer",
             "--skip",
             "cold_tp2",
+            "--skip",
+            "tp2_collective_failure_recovers_on_gpu",
         ]
     );
 }
@@ -542,6 +544,8 @@ fn lab_test_forwards_cargo_features() {
             "rccl_init_with_a_missing_peer",
             "--skip",
             "cold_tp2",
+            "--skip",
+            "tp2_collective_failure_recovers_on_gpu",
         ]
     );
     for args in [
@@ -615,6 +619,8 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "rccl_init_with_a_missing_peer".to_string(),
         "--skip".to_string(),
         "cold_tp2".to_string(),
+        "--skip".to_string(),
+        "tp2_collective_failure_recovers_on_gpu".to_string(),
     ];
     for t in slow {
         want.push("--skip".to_string());
@@ -645,6 +651,8 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "rccl_init_with_a_missing_peer".to_string(),
         "--skip".to_string(),
         "cold_tp2".to_string(),
+        "--skip".to_string(),
+        "tp2_collective_failure_recovers_on_gpu".to_string(),
     ];
     for t in slow {
         want.push(t.to_string());
@@ -676,6 +684,8 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
             "rccl_init_with_a_missing_peer",
             "--skip",
             "cold_tp2",
+            "--skip",
+            "tp2_collective_failure_recovers_on_gpu",
         ]
     );
 
@@ -730,6 +740,8 @@ fn lab_test_passes_a_subset_and_opts_into_the_hf_reference() {
             "rccl_init_with_a_missing_peer",
             "--skip",
             "cold_tp2",
+            "--skip",
+            "tp2_collective_failure_recovers_on_gpu",
         ]
     );
     assert!(
@@ -777,6 +789,8 @@ fn lab_test_passes_a_subset_and_opts_into_the_hf_reference() {
             "rccl_init_with_a_missing_peer",
             "--skip",
             "cold_tp2",
+            "--skip",
+            "tp2_collective_failure_recovers_on_gpu",
             "hf_reference",
         ]
     );
