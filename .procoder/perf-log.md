@@ -157,3 +157,11 @@ Known failing on main from 39916b3: `kv_gpu prefix_reuse_matches_cold` (Llama's 
 
 Close-out (2026-09-28, main 46b1957): `scripts/gate.sh --full` and the full GPU suite green after 2d1e9e5 (596/0 apart from the slow-test list fixed there); lab-bench Llama 855.2 tok/s (ITL 15.4, TTFT 208), OLMoE 613.9 (ITL 24.3, TTFT 118), golden c1/c16 pass both; multi-turn cached ratio 0.907, later-turn TTFT 76 vs 460 ms (0.17×); 10-minute overload soak with L1 on: pass (ITL p99 205 vs calibration 174 ms). The first close-out soak failed (393 vs 176 ms): Phase 4's pressure reclaim copied every one-off block to L1 (A/B with `kv.cpu.enabled=false` passed at 205 vs 173); fixed by 46b1957. All runs are in labbook, set `pre-phase5-perf`. Against the Phase 4 baseline: Llama +12.3 % (1.20× vLLM 715), OLMoE −0.1 % tok/s with TTFT −13 % (1.15× vLLM 535).
 
+## Phase 6a: quantization (branch `phase-6a-quantization`, labbook set `phase-6a-quantization`)
+
+Workload unchanged (`scripts/lab-bench.sh`, novanas GPU 0, 16 concurrent, 512-word prompts, 256 tokens, 200 requests; BF16 models on the phase2c configs). No-regression bound for the BF16 paths at every landing: c16 tok/s ≥ 0.98 × and TTFT p50 ≤ 1.10 × the phase-start baseline.
+
+| Date       | Commit  | Change                                  | Model | tok/s | ITL p50 (ms) | TTFT p50 (ms) | golden c1 / c16 |
+| ---------- | ------- | --------------------------------------- | ----- | ----- | ------------ | ------------- | --------------- |
+| 2026-09-29 | 39d54d1 | Phase-start baseline (Tasks 1–5 landed) | Llama | 854.7 | 15.4         | 207           | PASS / PASS     |
+| 2026-09-29 | 39d54d1 | Phase-start baseline (Tasks 1–5 landed) | OLMoE | 613.4 | 24.5         | 118           | PASS / PASS     |
