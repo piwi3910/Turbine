@@ -39,7 +39,9 @@ Packagings (detected from `config.json` `quantization_config` and the tensors pr
 - compressed-tensors `mxfp4-pack-quantized` (`ct_mxfp4`) and AMD Quark `fp4` (`quark_mxfp4`,
   `pack_method: reorder` does not reorder fp4 in Quark's `Pack_fp4`): `weight_packed` / `weight`
   U8 `[n, k/2]` E2M1 codes, low nibble = even column, `weight_scale` U8 `[n, k/32]` E8M0;
-  value `e2m1(q) × 2^(e − 127)`.
+  value `e2m1(q) × 2^(e − 127)`;
+- OpenAI native `quant_method: mxfp4` (`openai_mxfp4`): `weight_blocks` U8 `[n, k/32, 16]` (the
+  same E2M1 bytes, low nibble first) and `weight_scales` U8 `[n, k/32]` E8M0.
 
 Every other floating tensor is copied as BF16 (F16/F32 checkpoints are rounded to BF16, as the
 BF16 transformers load does). `config.json` loses `quantization_config` (and a legacy
@@ -54,12 +56,20 @@ failure exits 1 and leaves no output directory.
 Usage:
     uv run scripts/golden/dequantize_checkpoint.py --model-dir <quantized-dir> --out <bf16-dir>
         [--shard-bytes 4000000000] [--compare-with <bf16-original-dir>]
+    uv run scripts/golden/dequantize_checkpoint.py --check-tiny <dir>
 
 `--compare-with` prints, per decoded layer, the relative RMS error of the dequantized weight
 against the same tensor of an unquantized checkpoint (a wrong packing order gives ~1 or more;
 real quantization error is a few percent) and exits 1 if any layer exceeds `--max-rel-rms`.
 Not meaningful for AWQ: it folds its activation scales into the preceding norm or projection, so
 single layers (and norms) legitimately differ from the unquantized checkpoint.
+
+`--check-tiny <dir>` checks this decode against Turbine's Rust one: every `<dir>/<case>/` (or
+`<dir>` itself) holding `quantized/` and `twin/`, as written by
+`cargo run -p turbine-model --example dump_dequant -- <dir>` (`write_tiny_quantized`: the twin is
+the exact BF16 dequantization in the same tensor names), is dequantized into a temporary
+directory and must equal `twin/` bit for bit, tensor by tensor (names, dtypes, shapes, bytes).
+Exits 1 naming the first differing tensor of every failing case.
 """
 
 from __future__ import annotations
@@ -119,14 +129,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p = _Parser(
         description="Write a BF16 copy of a quantized checkpoint (Turbine CPU decode)."
     )
-    p.add_argument("--model-dir", required=True, type=Path)
-    p.add_argument("--out", required=True, type=Path)
+    p.add_argument("--model-dir", type=Path)
+    p.add_argument("--out", type=Path)
+    p.add_argument(
+        "--check-tiny", type=Path, help="compare with Rust tiny fixtures (see above)"
+    )
     p.add_argument("--shard-bytes", type=int, default=4_000_000_000)
     p.add_argument(
         "--compare-with", type=Path, help="unquantized checkpoint to measure against"
     )
     p.add_argument("--max-rel-rms", type=float, default=0.5)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.check_tiny is None and (args.model_dir is None or args.out is None):
+        p.error("--model-dir and --out are required (or --check-tiny <dir>)")
+    return args
 
 
 # ---------------------------------------------------------------------------------------------
@@ -285,6 +301,8 @@ def detect(config: dict) -> Packaging:
         else:
             raise DequantError(f"quark input_tensors spec unsupported: {inp}")
         return Packaging("quark_mxfp4", act)
+    if method == "mxfp4":
+        return Packaging("openai_mxfp4", ACT_NONE)
     raise DequantError(f"quant_method {method!r} unsupported")
 
 
@@ -316,6 +334,8 @@ def decode_fp8(torch, pk: Packaging, w, scale):
     n, k = w.shape
     v = fp8_values(torch, w)
     s = _f32(scale)
+    if pk.block is not None:
+        return v * expand_block(torch, s, n, k, pk.block[0], pk.block[1])
     if s.numel() == 1:
         return v * s.reshape(())
     if tuple(s.shape) in ((n, 1), (n,)):
@@ -470,6 +490,9 @@ def quantized_prefixes(tensors: Tensors, pk: Packaging) -> list[str]:
         elif pk.name in ("ct_pack_int4", "ct_mxfp4"):
             if name.endswith(".weight_packed"):
                 out.append(name[: -len(".weight_packed")])
+        elif pk.name == "openai_mxfp4":
+            if name.endswith(".weight_blocks"):
+                out.append(name[: -len(".weight_blocks")])
         elif name.endswith(".weight"):
             prefix = name[: -len(".weight")]
             has_scale = tensors.has(prefix + ".weight_scale") or tensors.has(
@@ -500,7 +523,9 @@ def decode_layer(torch, tensors: Tensors, pk: Packaging, prefix: str):
         if scale is None:
             scale = t(prefix + ".weight_scale_inv")
         value = decode_fp8(torch, pk, w, scale)
-        if scale.numel() == 1:
+        if pk.block is not None:
+            scheme = "fp8_block"
+        elif scale.numel() == 1:
             scheme = "fp8_tensor"
         elif tuple(scale.shape) in ((w.shape[0], 1), (w.shape[0],)):
             scheme = "fp8_channel"
@@ -559,6 +584,14 @@ def decode_layer(torch, tensors: Tensors, pk: Packaging, prefix: str):
         value = decode_mxfp4(torch, t(prefix + ".weight"), t(prefix + ".weight_scale"))
         scheme = "mxfp4"
         used.append(prefix + ".weight")
+    elif pk.name == "openai_mxfp4":
+        blocks = t(prefix + ".weight_blocks")
+        if blocks.dim() != 3 or blocks.shape[2] != 16:
+            raise DequantError(f"{prefix}.weight_blocks shape {tuple(blocks.shape)}")
+        packed = blocks.reshape(blocks.shape[0], -1)
+        value = decode_mxfp4(torch, packed, t(prefix + ".weight_scales"))
+        scheme = "mxfp4"
+        used += [prefix + ".weight_blocks", prefix + ".weight_scales"]
     else:
         raise DequantError(f"packaging {pk.name}")
     return value, scheme, used
@@ -726,8 +759,75 @@ def compare(out: Path, reference: Path, max_rel_rms: float, log=print) -> bool:
     return ok
 
 
+def tensors_equal(ours: Path, twin: Path) -> str | None:
+    """None when both checkpoints hold the same tensors bit for bit, else the first difference."""
+    import torch
+
+    a, b = Tensors(ours), Tensors(twin)
+    if set(a.names()) != set(b.names()):
+        only_a = sorted(set(a.names()) - set(b.names()))[:3]
+        only_b = sorted(set(b.names()) - set(a.names()))[:3]
+        return f"tensor names differ: only decoded {only_a}, only twin {only_b}"
+    for name in sorted(b.names()):
+        x, y = a.get(name), b.get(name)
+        if x.dtype != y.dtype or x.shape != y.shape:
+            return (
+                f"{name}: {x.dtype}{tuple(x.shape)} vs twin {y.dtype}{tuple(y.shape)}"
+            )
+        xb = x.contiguous().reshape(-1).view(torch.uint8).reshape(x.numel(), -1)
+        yb = y.contiguous().reshape(-1).view(torch.uint8).reshape(y.numel(), -1)
+        if not torch.equal(xb, yb):
+            diff = (x.to(torch.float32) - y.to(torch.float32)).abs()
+            count = int((xb != yb).any(-1).sum())
+            return (
+                f"{name}: {count} of {x.numel()} values differ,"
+                f" max |diff| {float(diff.max()):.3g}"
+            )
+    return None
+
+
+def check_tiny(root: Path, log=print) -> bool:
+    import tempfile
+
+    if (root / "quantized").is_dir():
+        cases = [root]
+    else:
+        cases = sorted(d for d in root.iterdir() if (d / "quantized").is_dir())
+    if not cases:
+        raise DequantError(f"{root}: no <case>/quantized directory")
+    ok = True
+    for case in cases:
+        if not (case / "twin").is_dir():
+            raise DequantError(f"{case}: quantized/ without twin/")
+        with tempfile.TemporaryDirectory(prefix="turbine-check-tiny-") as tmp:
+            out = Path(tmp) / "bf16"
+            record = dequantize(case / "quantized", out, log=lambda _m: None)
+            problem = tensors_equal(out, case / "twin")
+        schemes = "/".join(sorted({e["scheme"] for e in record["layers"].values()}))
+        label = (
+            f"{case.name}: {record['packaging']} {schemes} act {record['activation']}"
+        )
+        if problem is None:
+            log(f"{label}: {len(record['layers'])} layers bit-exact")
+        else:
+            ok = False
+            log(f"{label}: MISMATCH {problem}")
+    log(f"check-tiny: {len(cases)} case(s) {'ok' if ok else 'FAIL'}")
+    return ok
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.check_tiny is not None:
+        try:
+            ok = check_tiny(args.check_tiny, log=lambda m: print(m, file=sys.stderr))
+        except Exception as e:  # noqa: BLE001 -- any failure: exit 1
+            print(
+                f"dequantize_checkpoint.py: error: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            return 1
+        return 0 if ok else 1
     tmp = args.out.with_name(args.out.name + ".tmp")
     try:
         if args.out.exists():
