@@ -529,6 +529,7 @@ fn lab_test_routes_two_gpu_tests_to_the_gpus_2_leg() {
         "rccl_init_with_a_missing_peer",
         "cold_tp2",
         "tp2_collective_failure_recovers_on_gpu",
+        "tp_forward_profile",
     ];
     let gpu_count = [
         "inventory_matches_expectation",
