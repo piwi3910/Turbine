@@ -424,11 +424,12 @@ static_tiers_leg() {
 		sed 's/^/tp-kv tp2-static-tiers /' || true
 	jq -e '(.cached_tokens_ratio // 0) > 0' "$out" >/dev/null ||
 		GATE_FAILED+=("multi-turn tp2 static tiers cached_tokens_ratio not > 0")
-	echo "lab-step: golden llama tp2 static tiers c1 vs 1 GPU"
+	# A TP leg: batched bounds against the one-GPU capture (user decision, follow-up (a)).
+	echo "lab-step: golden llama tp2 static tiers c1 vs 1 GPU (batched bounds)"
 	"${BIN}/turbine-golden" compare --url "$URL" \
 		--reference "${WORK}/llama-tp1-capture.jsonl" \
 		--tolerance tests/golden/llama-3.2-3b-instruct/tolerance.json \
-		--prompts tests/golden/prompts.jsonl --concurrency 1 ||
+		--prompts tests/golden/prompts.jsonl --concurrency 1 --batched-bounds ||
 		GATE_FAILED+=("golden llama tp2 static tiers c1 vs 1 GPU")
 	curl -s "${URL}/metrics" | grep -E '^turbine_kv_(demotions|promotions)_total' |
 		sed 's/^/tp-kv tp2-static-tiers-after-golden /' || true
