@@ -1541,6 +1541,82 @@ fn lab_bench_new_flags_are_not_usage_errors() {
     }
 }
 
+/// Phase 6a: every `--model` value maps to its weights directory, golden slug and lab config
+/// (the BF16 models keep their phase2c configs; each proof model has a phase6 config), printed by
+/// `--print-model` without contacting a host; an unknown model is a usage error listing the
+/// valid ones. Breaks if a model points at the wrong weights, reference or config.
+#[test]
+fn lab_bench_model_map() {
+    let expected = [
+        (
+            "llama",
+            "llama-3.2-3b-instruct llama-3.2-3b-instruct scripts/lab/phase2c-novanas-llama.yaml",
+        ),
+        (
+            "olmoe",
+            "olmoe-1b-7b-0125-instruct olmoe-1b-7b-0125-instruct scripts/lab/phase2c-novanas-olmoe.yaml",
+        ),
+        (
+            "llama-fp8",
+            "llama-3.2-3b-instruct-fp8-dynamic llama-3.2-3b-instruct-fp8-dynamic scripts/lab/phase6-novanas-llama-fp8.yaml",
+        ),
+        (
+            "llama-fp8-tensor",
+            "llama-3.2-3b-instruct-fp8 llama-3.2-3b-instruct-fp8 scripts/lab/phase6-novanas-llama-fp8-tensor.yaml",
+        ),
+        (
+            "llama-fp8-block",
+            "llama-3.2-3b-instruct-fp8-block llama-3.2-3b-instruct-fp8-block scripts/lab/phase6-novanas-llama-fp8-block.yaml",
+        ),
+        (
+            "llama-awq",
+            "llama-3.2-3b-instruct-awq llama-3.2-3b-instruct-awq scripts/lab/phase6-novanas-llama-awq.yaml",
+        ),
+        (
+            "llama-gptq",
+            "llama-3.2-3b-instruct-gptq llama-3.2-3b-instruct-gptq scripts/lab/phase6-novanas-llama-gptq.yaml",
+        ),
+        (
+            "llama8b-mxfp4",
+            "llama-3.1-8b-instruct-mxfp4a16 llama-3.1-8b-instruct-mxfp4a16 scripts/lab/phase6-novanas-llama8b-mxfp4.yaml",
+        ),
+        (
+            "llama8b",
+            "llama-3.1-8b-instruct llama-3.1-8b-instruct scripts/lab/phase6-novanas-llama8b.yaml",
+        ),
+        (
+            "llama-mxfp4-a4",
+            "llama-3.2-3b-mxfp4-a4 llama-3.2-3b-mxfp4-a4 scripts/lab/phase6-novanas-llama-mxfp4-a4.yaml",
+        ),
+        (
+            "llama-yarn16",
+            "llama-3.2-3b-instruct llama-3.2-3b-instruct-yarn16 scripts/lab/phase6-novanas-llama-yarn16.yaml",
+        ),
+    ];
+    for (model, triple) in expected {
+        let (out, called) = lab_script(
+            "lab-bench.sh",
+            &format!("model-{model}"),
+            &["--print-model", model],
+        );
+        assert_eq!(called, None, "{model}: contacted a host");
+        assert_eq!(out.status.code(), Some(0), "{model}: {}", stderr(&out));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            triple,
+            "{model}"
+        );
+    }
+    let (out, called) = lab_script("lab-bench.sh", "model-bogus", &["--print-model", "qwen"]);
+    assert_eq!(called, None);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("llama-yarn16") && stderr(&out).contains("llama8b-mxfp4"),
+        "the usage lists the models: {}",
+        stderr(&out)
+    );
+}
+
 /// Runs `bash <args>` with the host-contacting tools stubbed as in [`lab_script`]; returns the
 /// output and whether any stub was called.
 fn bash_with_stubs(args: &[&str], tag: &str) -> (Output, Option<String>) {

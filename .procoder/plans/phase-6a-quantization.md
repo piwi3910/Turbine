@@ -90,18 +90,18 @@ Interfaces:
 
 ## Task 4: Phase-start baseline and lab-bench model entries
 
-Files: `scripts/lab-bench.sh` (`--model` values of the spec's Interfaces, each mapping to a slug and `scripts/lab/phase6-novanas-<model>.yaml`; `BENCH` fields `weight_format=` and `kv=`), `scripts/lab/phase6-novanas-llama.yaml`, `scripts/lab/phase6-novanas-olmoe.yaml` (copies of the phase2c configs with the Phase 6 keys spelled out at their defaults), `benches/turbine-bench/tests/lab_scripts.rs` (model map test), `.procoder/perf-log.md` (Phase 6 section)
+Files: `scripts/lab-bench.sh` (`--model` values of the spec's Interfaces, each mapping to a weights directory, a golden slug and a config — the BF16 `llama` / `olmoe` keep `scripts/lab/phase2c-novanas-<model>.yaml` so baselines stay comparable, each proof model uses `scripts/lab/phase6-novanas-<model>.yaml` written by the task that proves it; `--print-model <model>`; a missing config exits 2, a missing weights directory on novanas exits 1; `BENCH` fields `weight_format=` and `kv=` from the status document's support row; the labbook `config` parameter names the config file), `benches/turbine-bench/tests/lab_scripts.rs` (model map test), `.procoder/perf-log.md` (Phase 6a section)
 Interfaces:
 
-- `scripts/lab-bench.sh --model <llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16>`; unknown values exit 2 listing the valid ones; a model whose weights directory is missing on novanas exits 1 naming the directory
+- `scripts/lab-bench.sh --model <llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16>`; `scripts/lab-bench.sh --print-model <model>` prints `<weights> <golden slug> <config>` and exits 0 without contacting a host; unknown values exit 2 listing the valid ones
   Covers: spec S-20 (baseline)
   Depends on: Task 1
 
-- [ ] Write failing test `lab_scripts lab_bench_model_map`: `bash -n scripts/lab-bench.sh`, and for each value the script's `--print-model <value>` helper prints `<slug> <config>`; an unknown value exits 2. Run: `scripts/remote-cargo.sh test -p turbine-bench --test lab_scripts lab_bench_model_map` — expect FAIL
-- [ ] Implement the map, the helper and the configs; `shellcheck scripts/lab-bench.sh` clean.
+- [ ] Write failing test `lab_scripts lab_bench_model_map`: for every value `--print-model` prints the expected triple (e.g. `llama-yarn16` → `llama-3.2-3b-instruct llama-3.2-3b-instruct-yarn16 scripts/lab/phase6-novanas-llama-yarn16.yaml`), no host is contacted, and an unknown value exits 2 listing the models. Run: `scripts/remote-cargo.sh test -p turbine-bench --test lab_scripts lab_bench_model_map` — expect FAIL
+- [ ] Implement the map and the helper; `bash -n` and `shellcheck scripts/lab-bench.sh` clean.
 - [ ] Lab (GPU 0, bench lock): `LABBOOK_SET=phase-6a-quantization scripts/lab-bench.sh --model llama --golden16` and `--model olmoe --golden16` — expect golden1 and golden16 PASS; record both `BENCH` lines as the phase-start baseline in `.procoder/perf-log.md`.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `chore(lab): phase 6 lab-bench models and the phase-start baseline`
+- [ ] Commit: `chore(lab): phase 6a lab-bench models and the phase-start baseline`
 
 ## Task 5: `cpu::quant` — the dequantization and rounding reference
 

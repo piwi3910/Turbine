@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # lab-bench.sh — fast land-and-measure step on novanas without a k8s Job.
 #
-#   scripts/lab-bench.sh [--gpu 0] [--model llama|olmoe] [--label L] [--with-tests] [--skip-tests]
+#   scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests]
 #                         [--golden16] [--quick] [-- <--set k=v>...]
+#   scripts/lab-bench.sh --print-model <model>
+#
+# <model>: llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16
+# (Phase 6a: one value per proof checkpoint; each maps to a weights directory under
+# /home/piwi/turbine-models/, a golden slug under tests/golden/ and a lab config).
+# --print-model prints "<weights> <golden slug> <config>" and exits without contacting a host.
 #
 # 1. On novanas: the release turbine-server build (scripts/remote-cargo.sh, cached) plus the HIP
 #    kernel library (CMake, cached); workspace tests only with --with-tests (off by default:
@@ -28,8 +34,10 @@ label="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 run_tests=0
 run_golden16=0
 quick=0
+print_model=0
 usage() {
-	echo "usage: scripts/lab-bench.sh [--gpu 0] [--model llama|olmoe] [--label L] [--with-tests] [--skip-tests] [--golden16] [--quick] [-- --set k=v ...]" >&2
+	echo "usage: scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--quick] [-- --set k=v ...] | --print-model <model>" >&2
+	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16" >&2
 	exit 2
 }
 while [[ $# -gt 0 ]]; do
@@ -63,6 +71,12 @@ while [[ $# -gt 0 ]]; do
 		quick=1
 		shift
 		;;
+	--print-model)
+		[[ $# -ge 2 ]] || usage
+		model="$2"
+		print_model=1
+		shift 2
+		;;
 	--)
 		shift
 		break
@@ -77,6 +91,10 @@ if [[ "$gpu" != 0 ]]; then
 	echo "lab-bench: --gpu $gpu refused: throughput and golden numbers must come from GPU 0 (GPU 1's PCIe link is not comparable); functional-only lab-test.sh runs may use GPU 1" >&2
 	exit 2
 fi
+# model → weights directory (under /home/piwi/turbine-models), golden slug (under tests/golden)
+# and lab config. The BF16 models keep their phase2c configs so baselines stay comparable; each
+# Phase 6a checkpoint gets scripts/lab/phase6-novanas-<model>.yaml in the task that proves it.
+golden_slug=""
 case "$model" in
 llama)
 	slug=llama-3.2-3b-instruct
@@ -86,11 +104,29 @@ olmoe)
 	slug=olmoe-1b-7b-0125-instruct
 	cfg=scripts/lab/phase2c-novanas-olmoe.yaml
 	;;
+llama-fp8) slug=llama-3.2-3b-instruct-fp8-dynamic ;;
+llama-fp8-tensor) slug=llama-3.2-3b-instruct-fp8 ;;
+llama-fp8-block) slug=llama-3.2-3b-instruct-fp8-block ;;
+llama-awq) slug=llama-3.2-3b-instruct-awq ;;
+llama-gptq) slug=llama-3.2-3b-instruct-gptq ;;
+llama8b-mxfp4) slug=llama-3.1-8b-instruct-mxfp4a16 ;;
+llama8b) slug=llama-3.1-8b-instruct ;;
+llama-mxfp4-a4) slug=llama-3.2-3b-mxfp4-a4 ;;
+llama-yarn16)
+	slug=llama-3.2-3b-instruct
+	golden_slug=llama-3.2-3b-instruct-yarn16
+	;;
 *)
 	echo "lab-bench: unknown model $model" >&2
-	exit 2
+	usage
 	;;
 esac
+[[ -n "$golden_slug" ]] || golden_slug="$slug"
+[[ -n "${cfg:-}" ]] || cfg="scripts/lab/phase6-novanas-$model.yaml"
+if [[ $print_model -eq 1 ]]; then
+	echo "$slug $golden_slug $cfg"
+	exit 0
+fi
 requests=200
 [[ $quick -eq 1 ]] && requests=64
 
@@ -98,6 +134,10 @@ requests=200
 # no .git (e.g. run from a remote-cargo.sh-synced tree, which excludes .git).
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root" || exit 1
+if [[ ! -f "$cfg" ]]; then
+	echo "lab-bench: $cfg does not exist yet (written by the Phase 6a task that proves $model)" >&2
+	exit 2
+fi
 name="$(basename "$root")"
 remote="/home/piwi/turbine-ci/remote/$name"
 out="$root/target/lab-bench/$label-$model"
@@ -127,6 +167,10 @@ if [[ $run_tests -eq 1 ]]; then
 fi
 if [[ $build_rc -ne 0 ]]; then
 	echo "BENCH $label $model commit=$commit BUILD FAILED (see $out/build.log)"
+	exit 1
+fi
+if ! ssh -o BatchMode=yes "$host" "test -f /home/piwi/turbine-models/$slug/config.json"; then
+	echo "lab-bench: /home/piwi/turbine-models/$slug is missing on novanas (download it first)" >&2
 	exit 1
 fi
 
@@ -166,7 +210,7 @@ else
 	bench_cmd="ssh -o BatchMode=yes $host '$remote/target/release/turbine-bench' --url http://127.0.0.1:18000"
 fi
 golden="ssh -o BatchMode=yes $host cd '$remote/src' \\&\\& '$remote/target/release/turbine-golden'"
-ref="tests/golden/$slug/reference.jsonl"
+ref="tests/golden/$golden_slug/reference.jsonl"
 golden16_cmd=""
 [[ $run_golden16 -eq 1 ]] && golden16_cmd="$golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 16 > '$out/golden16.txt' 2>&1"
 scripts/bench-lock.sh sh -c "
@@ -195,6 +239,12 @@ try:
 except Exception as e:
     print(f"BENCH {label} {model} commit={commit} gpu={gpu} tests={tests} golden1={g1}{quick_field} BENCH FAILED ({e})")
     sys.exit(1)
+# The resolved support row names the served weight format and L0 KV format (Phase 6a).
+try:
+    support = json.load(open(f"{out}/status.json")).get("support") or {}
+except Exception:
+    support = {}
+formats = f" weight_format={support.get('weight_format', '?')} kv={support.get('kv_format', '?')}"
 # Forward-time averages over the throughput run only: subtract the scrape taken after the golden
 # runs, whose batch-1 steps would otherwise pull the decode average down.
 def read(path):
@@ -218,7 +268,7 @@ values = {"tok_s": round(d["output_token_throughput"], 1), "itl_p50_ms": round(d
 if g16 != "SKIP":
     values["golden_c16"] = g16.startswith("PASS")
 json.dump({k: v for k, v in values.items() if v == v}, open(f"{out}/labbook-values.json", "w"))
-print(f"BENCH {label} {model} commit={commit} gpu={gpu} tests={tests} golden1={g1} golden16={g16}{quick_field} "
+print(f"BENCH {label} {model} commit={commit} gpu={gpu} tests={tests} golden1={g1} golden16={g16}{quick_field}{formats} "
       f"ok={d['requests_ok']} failed={d['requests_failed']} tok/s={d['output_token_throughput']:.1f} "
       f"itl_p50={d['itl_ms']['p50']:.1f} ttft_p50={d['ttft_ms']['p50']:.0f} decode_fwd_ms={avg('decode'):.1f}")
 bad = (tests != "skipped" and not tests.endswith("/0")) or g1 != "PASS:" or d["requests_failed"] != 0
@@ -240,7 +290,7 @@ if [[ $rc -eq 0 && "${LABBOOK_UPLOAD:-1}" != 0 && -f "$uploader" && -f "$HOME/.c
 		[[ -s "$out/$f" ]] && attach+=(--attach "$out/$f")
 	done
 	branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-	config_param="$(printf '%s ' phase2c "$@" | sed 's/--set //g; s/ *$//')"
+	config_param="$(printf '%s ' "$(basename "$cfg" .yaml)" "$@" | sed 's/--set //g; s/ *$//')"
 	if LABBOOK_URL="${LABBOOK_URL:-https://labbook.kw.watteel.lab}" NODE_EXTRA_CA_CERTS="$HOME/.labbook/cluster-ca.crt" \
 		node "$uploader" run --type turbine-lab-bench --external-id "lab-bench:$label-$model:$commit" \
 		--param model="$slug" --param gpu="R9700 GPU$gpu" --param config="$config_param" \

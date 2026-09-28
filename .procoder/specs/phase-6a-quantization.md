@@ -129,7 +129,7 @@ The sub-steps land in this order (user decision 2026-09-28, Q1): foundations (S-
 
 ### Lab scripts and commands
 
-- `scripts/lab-bench.sh --model <llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16>` — each value maps to its slug under `/home/piwi/turbine-models/` and a config `scripts/lab/phase6-novanas-<model>.yaml`; the `BENCH` line gains `weight_format=<col> kv=<fmt>`; `LABBOOK_SET=phase-6-quantization`.
+- `scripts/lab-bench.sh --model <llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16>` — each value maps to its slug under `/home/piwi/turbine-models/` and a config (`scripts/lab/phase2c-novanas-<llama|olmoe>.yaml` for the BF16 models, so baselines stay comparable; `scripts/lab/phase6-novanas-<model>.yaml` for each proof model, written by the task that proves it); `--print-model <model>` prints `<weights> <golden slug> <config>` without contacting a host; the `BENCH` line gains `weight_format=<col> kv=<fmt>`; `LABBOOK_SET=phase-6-quantization`.
 - `scripts/golden/quant_reference.py --model-dir <dir> --prompts <file> --out <reference.jsonl> [--act-quant fp8_token|fp8_tensor|mxfp4]` and `scripts/golden/dequantize_checkpoint.py --model-dir <dir> --out <bf16-dir>` (fixture time only, `uv run`).
 - `turbine-golden eval --url <base> --tasks tests/eval/gsm8k-200.jsonl --output json > tests/eval/<slug>/<engine>.json`, `turbine-golden eval-compare --baseline … --candidate … --max-drop <gate.json value>`.
 
