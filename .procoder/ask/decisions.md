@@ -1103,6 +1103,13 @@ Context: novanas reached 95 % disk and k3s evicted a lab Job (2026-09-28). The P
 
 **Decision (user, 2026-09-28): auto-prune approved**, with these limits: only `remote/agent-*/target`; never the per-slot caches under `turbine-ci/cache/`, anything in use, or anything else; every removal logged with the bytes freed. This rule now covers the earlier manual prune after the fact; any prune beyond it still needs the user.
 
+## P5 exit: vLLM-ROCm baselines for the two-GPU modes
+
+- Run vLLM-ROCm two-GPU baselines before the merge-to-main decision
+- Skip them (Phase 5 compares multi-GPU modes against Turbine's own one-GPU numbers only)
+
+**Decision (user, 2026-09-28): run them**, strictly after the Phase 5 proofs (the verify-on tp2 run and the gate 3 rerun) and before the merge-to-main decision, in queue order and under the benchmark lock for the whole run: a two-GPU variant of the pinned vLLM-ROCm Job (`amd.com/gpu: 2`, same `rocm/vllm` tag) and a `lab-serve.sh --vllm` option for the GPU count and extra vLLM arguments; the standard workload (512-word prompts, 256 tokens, 200 requests, `--ignore-eos`) at c16 and c32; Llama at `--tensor-parallel-size 2`, `--pipeline-parallel-size 2` and data parallel (`--data-parallel-size 2` if the pinned version supports it on ROCm, else two one-GPU instances behind a round-robin, said which); OLMoE at `--tensor-parallel-size 2`, `--enable-expert-parallel` with TP 2, and DP 2; the one-GPU vLLM baselines (Llama, OLMoE) re-run in the same session. Recorded in labbook (set `phase-5-multi-gpu`, vLLM version and flags) with a Turbine vs vLLM table per mode (tok/s, TTFT p50, ITL p50, ratio) and vLLM's fallbacks noted (e.g. no custom all-reduce without peer-to-peer). A mode vLLM cannot run on this board is recorded with its error and skipped, not debugged at length. Plan Task 35.
+
 ## P5 exit: OLMoE with expert × tensor parallelism
 
 - (1) Mark OLMoE ep × tp `experimental` (recommended)

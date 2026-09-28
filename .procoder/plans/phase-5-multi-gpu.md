@@ -623,6 +623,21 @@ Interfaces:
 
 Owner: the tp-perf agent. May land inside Phase 5 if quick; otherwise a tracked Phase 5p item — the Phase 5 exit does not wait for it.
 
+## Task 35: vLLM-ROCm baselines for the two-GPU modes
+
+Files: `scripts/lab/novanas-vllm-job.yaml` (a two-GPU variant, same pinned `rocm/vllm` tag), `scripts/lab-serve.sh` (`--vllm` GPU count and extra vLLM arguments), `benches/turbine-bench/tests/lab_scripts.rs` (dry-run checks of the two-GPU Job)
+Interfaces:
+
+- `scripts/lab-serve.sh novanas --vllm <slug> [--vllm-gpus 2] [--vllm-arg <arg>]…` renders `amd.com/gpu: <n>` and appends the arguments to `vllm serve`
+  Covers: user decision "P5 exit: vLLM-ROCm baselines for the two-GPU modes"
+  Depends on: Tasks 17, 18, 24, 27 and the Phase 5 proofs (the verify-on tp2 run and the gate 3 rerun)
+
+- [ ] Write failing test `lab_scripts lab_serve_vllm_two_gpus_renders_the_job` (dry run: `amd.com/gpu: 2`, the pinned tag, the extra arguments on the `vllm serve` line). Run: `cargo test -p turbine-bench --test lab_scripts lab_serve_vllm_two_gpus` — expect FAIL.
+- [ ] Implement the Job variant and the options.
+- [ ] Lab, strictly after the proofs, one run at a time under `scripts/bench-lock.sh` for the whole session (novanas may reset under two-GPU load until the new PSU: wait, check allocatable 2, rerun): the standard workload at c16 and c32 for Llama (TP 2, PP 2, DP 2 — `--data-parallel-size 2` if supported on ROCm, else two one-GPU instances behind a round-robin) and OLMoE (TP 2, TP 2 with `--enable-expert-parallel`, DP 2), plus the one-GPU vLLM baselines re-run in the same session; labbook uploads (set `phase-5-multi-gpu`, vLLM version and flags); a Turbine vs vLLM table per mode (tok/s, TTFT p50, ITL p50, ratio) with vLLM's fallbacks noted. A mode vLLM cannot run is recorded with its error and skipped.
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `feat(scripts): two-GPU vLLM-ROCm baseline Job and lab-serve options`
+
 ## P5 exit: OLMoE ep × tp refused
 
 As built (2026-09-28, user decision "P5 exit: OLMoE with expert × tensor parallelism", (2)): `turbine_core::support::PARALLEL_REFUSALS` holds `OlmoeForCausalLM` / `ep+tp` / `olmoe_ep_tp_drift`; `parallel::check_expert_parallel` refuses it (exit 2, `parallel.expert_parallel_size: olmoe_ep_tp_drift …`) before loading; `--support-matrix` lists it (text line `parallel …`, JSON `parallel_refusals`). Tests: `parallel::tests::expert_parallel_checked_against_the_model`, `server_cli olmoe_ep_tp_exits_2`, `support_matrix_output`; `tiny_server ep2_serves_like_ep1` serves ep 2 with tp 1 only; `scripts/lab-cluster.sh ep2-novanas` checks the refusal instead of serving ep 2 × tp 2.
