@@ -12,10 +12,13 @@
 #                      tp 2 in local mode: each passes turbine-golden compare against its
 #                      committed reference; then turbine-bench --concurrency 4 --requests 64
 #                      against the local-mode Llama server must report requests_ok 64.
-#   dp2-novanas        Llama-3.2-3B-Instruct at tp 1: first a dp 1 baseline on device 0
-#                      (turbine-bench --concurrency 8 --requests 128), then dp 2 (one replica per
-#                      R9700): golden at concurrency 1 and 16, the same bench (requests_ok 128),
-#                      and turbine_dp_routed_total non-zero for replica 0 and replica 1.
+#   dp2-novanas        Llama-3.2-3B-Instruct at tp 1 on the standard throughput workload
+#                      (512-word prompts, 256 tokens with --ignore-eos, 200 requests, after a
+#                      16-request warm-up): first a dp 1 baseline on device 0 at concurrency 16,
+#                      then dp 2 (one replica per R9700): golden at concurrency 1 and 16, the
+#                      bench at concurrency 32 (the load that fills both cards) and at 16 (the
+#                      same load as dp 1), each requests_ok 200, and turbine_dp_routed_total
+#                      non-zero for replica 0 and replica 1.
 #
 # Like scripts/lab-test.sh, the tree is uploaded to /home/piwi/turbine-ci/runs/<run id>/src and
 # one template (scripts/lab/novanas-cluster-job.yaml) runs twice: first GPU-less as
@@ -52,6 +55,9 @@ valid_scenario() {
 HTTP=127.0.0.1:18000
 URL="http://${HTTP}"
 SERVER_PIDS=()
+# The fixed throughput workload of scripts/lab-bench.sh and scripts/lab-perf.sh (concurrency
+# and request count are added per run).
+STANDARD_BENCH=(--prompt-words 512 --max-tokens 256 --ignore-eos)
 
 job_fail() {
 	echo "lab-cluster: ${SCENARIO} FAIL $1"
@@ -211,14 +217,25 @@ scenario_dp2() {
 	start_server "${WORK}/dp1.log" "$dp2" --set parallel.data_parallel_size=1 \
 		--set "parallel.devices=[0]"
 	wait_ready "$URL" "${WORK}/dp1.log"
-	bench_ok 128 "${WORK}/dp1-bench.json" --concurrency 8 --requests 128
+	bench_ok 16 "${WORK}/dp1-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
+	bench_ok 200 "${WORK}/dp1-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
 	stop_servers
 
 	start_server "${WORK}/dp2.log" "$dp2"
 	wait_ready "$URL" "${WORK}/dp2.log"
 	golden llama-3.2-3b-instruct "llama dp2 c1"
 	golden llama-3.2-3b-instruct "llama dp2 c16" --concurrency 16
-	bench_ok 128 "${WORK}/dp2-bench.json" --concurrency 8 --requests 128
+	bench_ok 32 "${WORK}/dp2-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 32 --requests 32
+	bench_ok 200 "${WORK}/dp2-c32-bench.json" "${STANDARD_BENCH[@]}" --concurrency 32 \
+		--requests 200
+	bench_ok 200 "${WORK}/dp2-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	local f
+	for f in dp1-c16 dp2-c32 dp2-c16; do
+		jq -r --arg f "$f" '"dp-bench \($f) tok/s=\(.output_token_throughput) ttft_p50_ms=\(.ttft_ms.p50) itl_p50_ms=\(.itl_ms.p50)"' \
+			"${WORK}/${f}-bench.json"
+	done
 	curl -s "${URL}/metrics" >"${WORK}/dp2-metrics.txt" || job_fail "GET /metrics failed"
 	grep '^turbine_dp_routed_total' "${WORK}/dp2-metrics.txt" || true
 	local replica total
