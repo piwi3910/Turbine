@@ -843,3 +843,10 @@ Local main e2f8178 holds Phase 3, Phase 4 and the pre-Phase-5 track, unpushed; `
 - D) Hold everything: no push, no Phase 5
 
 **Answer (2026-09-28): A — review first.** Push and Phase 5 wait until the user has reviewed `.procoder/review-2026-09-28.md`.
+
+## Review of the 19 provisional decisions (`.procoder/review-2026-09-28.md`)
+
+- A) Accept all 19 as recorded
+- B) Change some of them
+
+**Answer (2026-09-28): A — the user accepted all 19 ("all good").** Every item listed in `.procoder/review-2026-09-28.md` is now a confirmed decision; #18's parked `perf-gemm-stagger-wip` stays parked.
