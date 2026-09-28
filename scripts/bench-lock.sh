@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # bench-lock.sh — run a command while holding the build host's benchmark lock exclusively.
 #
-#   scripts/bench-lock.sh [--host <ssh-host>] [--shared] <command...>
+#   scripts/bench-lock.sh [--host <ssh-host>] [--name <lock>] [--shared] <command...>
+#
+# --name picks another lock file, /home/piwi/turbine-ci/<lock>.lock (lab-bench.sh holds
+# `port18000` for its whole serve-and-measure run, so two runs never share the port).
 #
 # Takes an exclusive flock on <host>:/home/piwi/turbine-ci/bench.lock (waiting for running
 # scripts/remote-cargo.sh builds, which hold it shared, to finish), runs <command> locally, then
@@ -16,13 +19,18 @@ if [[ "${1:-}" == "--host" ]]; then
 	host="$2"
 	shift 2
 fi
+lock=bench
+if [[ "${1:-}" == "--name" ]]; then
+	lock="$2"
+	shift 2
+fi
 mode="-x"
 if [[ "${1:-}" == "--shared" ]]; then
 	mode="-s"
 	shift
 fi
 if [[ $# -eq 0 ]]; then
-	echo "usage: scripts/bench-lock.sh [--host <ssh-host>] [--shared] <command...>" >&2
+	echo "usage: scripts/bench-lock.sh [--host <ssh-host>] [--name <lock>] [--shared] <command...>" >&2
 	exit 2
 fi
 
@@ -31,17 +39,17 @@ trap 'rm -rf "$dir"' EXIT
 mkfifo "$dir/in" "$dir/out"
 # The remote side prints "locked" once it holds the lock and keeps it until its stdin closes.
 ssh -o BatchMode=yes "$host" \
-	"flock $mode /home/piwi/turbine-ci/bench.lock sh -c 'echo locked; cat >/dev/null'" \
+	"flock $mode /home/piwi/turbine-ci/$lock.lock sh -c 'echo locked; cat >/dev/null'" \
 	<"$dir/in" >"$dir/out" &
 lock_pid=$!
 exec 3>"$dir/in"
-echo "bench-lock: waiting for $host benchmark lock" >&2
+echo "bench-lock: waiting for $host $lock lock" >&2
 read -r state <"$dir/out"
 if [[ "$state" != "locked" ]]; then
 	echo "bench-lock: could not take the lock on $host" >&2
 	exit 1
 fi
-echo "bench-lock: holding $host benchmark lock" >&2
+echo "bench-lock: holding $host $lock lock" >&2
 
 rc=0
 "$@" || rc=$?

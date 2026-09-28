@@ -26,6 +26,7 @@
 #    used; golden16=SKIP when --golden16 was not); exits 1 if tests, golden c1 or the bench fail.
 #    Results land in target/lab-bench/<label>/ on the workstation.
 set -uo pipefail
+orig_args=("$@")
 
 host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
 gpu=0
@@ -145,6 +146,12 @@ mkdir -p "$out"
 commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 url=http://192.168.10.203:18000
 
+# The whole serve-and-measure run holds the host's `port18000` lock (scripts/bench-lock.sh
+# --name), so a second lab-bench waits instead of racing this one for the port.
+if [[ -z "${LAB_BENCH_PORT_LOCKED:-}" ]]; then
+	LAB_BENCH_PORT_LOCKED=1 exec scripts/bench-lock.sh --host "$host" --name port18000 \
+		"$root/scripts/lab-bench.sh" "${orig_args[@]}"
+fi
 # 1. build (server + kernels) on novanas, tests alongside only with --with-tests
 (
 	scripts/remote-cargo.sh build -q --release -p turbine-server -p turbine-bench &&
@@ -217,6 +224,15 @@ done
 if [[ $ready -ne 1 ]]; then
 	ssh -o BatchMode=yes "$host" "tail -30 /tmp/lab-bench-server.log; $stop_server" >"$out/server.log" 2>&1
 	echo "BENCH $label $model commit=$commit SERVER NOT READY (see $out/server.log)"
+	exit 1
+fi
+# The server answering must be this run's (a lab-serve Job on the host network could have taken
+# the port meanwhile): its pid owns the listening socket.
+owner=$(ssh -o BatchMode=yes "$host" "ss -ltnpH 'sport = :18000' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2")
+mine=$(ssh -o BatchMode=yes "$host" "cat $pidf 2>/dev/null")
+if [[ -z "$owner" || "$owner" != "$mine" ]]; then
+	ssh -o BatchMode=yes "$host" "$stop_server" >/dev/null 2>&1
+	echo "BENCH $label $model commit=$commit PORT TAKEN (port 18000 served by pid ${owner:-unknown}, not this run's ${mine:-none})"
 	exit 1
 fi
 
