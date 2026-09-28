@@ -852,3 +852,51 @@ Local main e2f8178 holds Phase 3, Phase 4 and the pre-Phase-5 track, unpushed; `
 **Answer (2026-09-28): A — the user accepted all 19 ("all good").** Every item listed in `.procoder/review-2026-09-28.md` is now a confirmed decision; #18's parked `perf-gemm-stagger-wip` stays parked.
 
 **Answer (2026-09-28, after the review): push and start Phase 5.** main pushed to origin at 6545638; Phase 5 starts by porting the `p5-distributed` run-ahead onto main (novanas only, NVIDIA still on hold).
+
+## Roadmap reorganisation after Phase 5 (2026-09-28)
+
+Asked 2026-09-28, while Phase 5 (multi-GPU, novanas) is being built on `phase-5-multi-gpu`. The user does not want multi-node or anything NVIDIA yet, and wants quantization and more model families brought forward. Before this, the order after Phase 5 was: Phase 6 multi-node (the two Sparks), Phase 7 advanced distribution (PP, EP, PD, RDMA, mixed vendor), Phase 8 expansion umbrella with tracks 8a quantization → 8b speculative decoding → 8c model families; Phase 2b NVIDIA on hold since 2026-09-26.
+
+**1. Order after Phase 5**
+
+- A) Phase 6 = quantization (AMD), Phase 7 = model families, Phase 8 = speculative decoding; multi-node (old 6), advanced distribution (old 7) and NVIDIA (2b) move to a deferred block, re-specced when un-held (recommended)
+- B) Paired by model: each new family arrives together with the quantized format its checkpoints need
+- C) Families first, then quantization, then speculative decoding
+
+**Answer (2026-09-28, user): A.**
+
+**2. Quantization formats on the R9700** (`gfx1201`, RDNA4: native FP8 WMMA, no FP4 matrix path) — multi-select
+
+- FP8 weights (per-channel compressed-tensors and block-scaled Qwen3-FP8 style) + FP8 e4m3 KV cache
+- MXFP4 (weight-only on RDNA4, dequantized to FP8/BF16 in the kernel)
+- INT4 AWQ / GPTQ (weight-only, group scales)
+- NVFP4 weight-only (the old Phase 8 scope)
+
+**Answer (2026-09-28, user): FP8 weights + FP8 KV, MXFP4, INT4 AWQ/GPTQ.** NVFP4 is not selected. **Clarification (2026-09-28, user): NVFP4 support is added together with NVIDIA support** — modelopt NVFP4/FP8 mixed precision (`hf_quant_config.json`, `MIXED_PRECISION`) and compressed-tensors `nvfp4-pack-quantized` belong to the deferred NVIDIA block (phase-2b-nvidia), not to phase 6.
+
+**3. Model families** — multi-select
+
+- Qwen3 dense + Qwen3 MoE
+- gpt-oss-20b (MXFP4 experts, attention sinks, alternating sliding-window / full attention)
+- Qwen3.5 / 3.6 hybrids (Gated DeltaNet + full attention, recurrent-state KV)
+- Mistral / Mixtral (Mixtral needs FP8 + TP to fit 2 × 32 GB)
+
+**Answer (2026-09-28, user): all four.**
+
+**4. Speculative decoding**
+
+- A) After quantization and families, as the last active phase (recommended)
+- B) Defer it with the multi-node block
+- C) Before families (right after quantization)
+
+**Answer (2026-09-28, user): A.**
+
+Consequences (docs amended the same day):
+
+- Active order: Phase 5 multi-GPU (in progress), Phase 6 quantization, Phase 7 model families, Phase 8 speculative decoding — all AMD only, on `novanas` (`gfx1201`). Track specs `phase-6-quantization`, `phase-7-model-families`, `phase-8-speculative-decoding` are each written when their phase starts, under the umbrella `.procoder/specs/phase-6-8-expansion.md` (renamed from `phase-8-expansion.md`, amended: AMD only, new order, new S-6 / S-8 scope).
+- Deferred block, re-specced when the user lifts the multi-node / NVIDIA hold: phase-2b-nvidia (now also carrying NVFP4), `phase-9-multi-node` (was `phase-6-multi-node`), `phase-10-advanced-distribution` (was `phase-7-advanced-distribution`). The two renamed specs and plans keep their text as written and carry `Status: deferred` plus a numbering note; NVIDIA support-matrix rows stay `unsupported`.
+- Phase 6 scope (umbrella S-6): FP8 e4m3 weights with per-tensor / per-channel scales (`fp8`) and block-scaled (`fp8_block`), FP8 e4m3 KV cache (`kv.dtype: fp8_e4m3`), MXFP4 (OCP, weight-only on RDNA4; `mxfp4`), INT4 AWQ (`awq_int4`) and GPTQ (`gptq_int4`), weight-only and group-wise. Support-matrix `weight_format` gains these five values; `modelopt_nvfp4`, `modelopt_fp8`, `modelopt_mixed` and `ct_nvfp4` stay reserved for the deferred NVIDIA block.
+- Phase 7 families (umbrella S-8): Qwen3 dense and MoE, gpt-oss-20b, the Qwen3.5 / 3.6 hybrids, Mistral and Mixtral. This lifts the 2026-09-25 gpt-oss exclusion (it was out only because MXFP4 was out of scope).
+- Phase 8 speculative decoding (umbrella S-7) now comes after the families, so recurrent-state rollback for the hybrids belongs to phase 8, not to phase 7.
+- Open for the track specs (not decided here): the hybrids' cached checkpoints are NVFP4, so phase 7 needs FP8 or BF16 checkpoints of them (Qwen3.6-35B-A3B needs FP8 + TP 2 or similar to fit 2 × 32 GB); each phase-6 format is proven on a registered architecture (Llama-3.2-3B or OLMoE) where such a checkpoint exists — which ones is the phase-6 spec's choice (e.g. RedHatAI / neuralmagic FP8, AWQ and GPTQ Llama-3.2-3B checkpoints); MXFP4 checkpoints may exist only for gpt-oss, which needs the phase-7 family — the phase-6 spec decides between an MXFP4 fixture checkpoint quantized offline (Python quantizer at fixture-generation time only) and proving MXFP4 in phase 7 with gpt-oss.
+- Code still names the old track names: the support-matrix refusal reasons in `crates/turbine-core/src/support.rs` (`phase-8a-quantization`, `phase-8b-speculative-decoding`, `phase-8c-model-families`) and the tests that assert them, and tests that use `GptOssForCausalLM` as the example of an unregistered architecture. They change with the first code task of phase 6 / phase 7, not in this docs change.
