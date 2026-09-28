@@ -841,3 +841,5 @@ Local main e2f8178 holds Phase 3, Phase 4 and the pre-Phase-5 track, unpushed; `
 - B) Push now, then review the list; hold Phase 5
 - C) Push now and start Phase 5 (port the `p5-distributed` run-ahead onto main)
 - D) Hold everything: no push, no Phase 5
+
+**Answer (2026-09-28): A — review first.** Push and Phase 5 wait until the user has reviewed `.procoder/review-2026-09-28.md`.
