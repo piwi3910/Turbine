@@ -33,6 +33,7 @@ use turbine_model::executor::{
 };
 use turbine_model::formats::{self, BoundToolFormat, ToolFormat};
 use turbine_model::loader::LoadedWeights;
+use turbine_model::pp;
 use turbine_model::tp::{self, ShardSpec};
 use turbine_model::{
     ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES, ModelArchConfig,
@@ -222,6 +223,16 @@ pub enum RankPart {
     /// Expert parallelism (S-11): the rank's routed experts, everything else replicated (tp 1)
     /// or tensor-parallel over the same ranks (tp = ep).
     Expert(EpRank),
+    /// Pipeline parallelism (S-10): one stage's layers (the embedding on the first, the final
+    /// norm and the LM head on the last).
+    Stage(PpStage),
+}
+
+/// One stage of a pipeline of `stages` stages (P5 S-10).
+#[derive(Clone, Debug)]
+pub struct PpStage {
+    pub spec: turbine_model::pp::StageSpec,
+    pub stages: u32,
 }
 
 impl RankPart {
@@ -232,6 +243,10 @@ impl RankPart {
             RankPart::Expert(e) => ShardSpec {
                 rank: e.shard.rank,
                 world: e.shard.world,
+            },
+            RankPart::Stage(s) => ShardSpec {
+                rank: s.spec.stage,
+                world: s.stages,
             },
         }
     }
@@ -302,6 +317,10 @@ pub struct PreparedModel {
     /// Expert parallelism (P5 S-11): the rank's experts, placement and counts; its weights, KV
     /// layout, op shapes and workspace are `turbine_model::ep`'s.
     pub expert: Option<EpRank>,
+    /// Pipeline parallelism (P5 S-10): the stage this model is prepared for; its weights, KV
+    /// layout (its layers only), op shapes and workspace are `turbine_model::pp`'s. `shard` is
+    /// then `None` (a stage is not a tensor-parallel shard).
+    pub stage: Option<PpStage>,
     /// Bytes of the weights this rank loads: its shard, or the whole model.
     pub weight_bytes: u64,
 }
@@ -376,10 +395,11 @@ fn prepare_with(
     base: Option<&PreparedModel>,
     part: Option<RankPart>,
 ) -> Result<PreparedModel, StartupError> {
-    let shard = part.as_ref().map(RankPart::position);
-    let expert = match part {
-        Some(RankPart::Expert(e)) => Some(e),
-        _ => None,
+    let (shard, expert, stage) = match part {
+        Some(RankPart::Expert(e)) => (Some(RankPart::Expert(e.clone()).position()), Some(e), None),
+        Some(RankPart::Stage(s)) => (None, None, Some(s)),
+        Some(RankPart::Tensor(s)) => (Some(s), None, None),
+        None => (None, None, None),
     };
     let provider = load_provider(config, inventory)?;
 
@@ -436,11 +456,28 @@ fn prepare_with(
     };
     let tp_error = |e: ModelError| model_error("tensor parallelism", e);
     let ep_error = |e: ModelError| model_error("expert parallelism", e);
+    let pp_error = |e: ModelError| model_error("pipeline parallelism", e);
     // One device: the family's ops, workspace, KV layout and weights. A tensor-parallel rank
     // (P5 S-6): its shard's (its heads, KV heads, intermediate and vocabulary columns). An
     // expert-parallel rank (S-11): its experts' (one `moe_experts` config per run of them) and
-    // the replicated or tensor-parallel rest.
+    // the replicated or tensor-parallel rest. A pipeline stage (S-10): its layers'.
     let (mut requirements, workspace, layout, weights) = match (&expert, shard) {
+        _ if stage.is_some() => {
+            let s = &stage.as_ref().expect("a stage").spec;
+            (
+                pp::available_requirements(
+                    &arch,
+                    &s.layers,
+                    block_tokens,
+                    executor_options,
+                    &ordered,
+                )
+                .map_err(pp_error)?,
+                pp::workspace_bytes(&arch, s, limits).map_err(pp_error)?,
+                pp::kv_layout(&arch, &s.layers, block_tokens).map_err(pp_error)?,
+                slot_bytes(&pp::weight_slots(&arch, s).map_err(pp_error)?),
+            )
+        }
         (Some(e), _) => (
             ep::available_requirements(
                 &arch,
@@ -477,7 +514,9 @@ fn prepare_with(
     // Device-side logits reduction (P2c S-4) is optional: only when enabled and a provider
     // implements it; otherwise the executor copies every row whole.
     let reduce = executor::logits::reduce_requirement(&arch);
+    let has_head = stage.as_ref().is_none_or(|s| s.spec.lm_head);
     if config.execution.device_sampling
+        && has_head
         && ordered.iter().any(|p| reduce.spec.supported_by(p.as_ref()))
     {
         requirements.push(reduce);
@@ -501,17 +540,26 @@ fn prepare_with(
     // The reason code of a multi-rank group's forced-off features.
     let group_reason = if expert.is_some() {
         "expert_parallel"
+    } else if stage.is_some() {
+        "pipeline_parallel"
     } else {
         "tensor_parallel"
     };
-    let decode_graphs = if decode_graphs && shard.is_some_and(|s| s.world > 1) {
-        // Decode graphs cannot capture the collectives (P5): forced off, not refused.
-        if shard.is_some_and(|s| s.rank == 0) {
+    // The rank's place in its group: a tensor- or expert-parallel shard, or a pipeline stage.
+    let position = shard.or(stage.as_ref().map(|s| ShardSpec {
+        rank: s.spec.stage,
+        world: s.stages,
+    }));
+    let decode_graphs = if decode_graphs && position.is_some_and(|s| s.world > 1) {
+        // Decode graphs cannot capture the collectives or the stage hand-off (P5): forced
+        // off, not refused.
+        if position.is_some_and(|s| s.rank == 0) {
             tracing::warn!(
                 event = "decode_graphs_unavailable",
                 reason = group_reason,
-                "execution.decode_graphs is on but tensor- or expert-parallel ranks cannot \
-                 capture their collectives into graphs; decode iterations run eagerly"
+                "execution.decode_graphs is on but tensor- or expert-parallel ranks and \
+                 pipeline stages cannot capture their collectives into graphs; decode \
+                 iterations run eagerly"
             );
         }
         false
@@ -526,14 +574,17 @@ fn prepare_with(
         }
         decode_graphs
     };
-    let tensor_parallel = shard.is_some_and(|s| s.world > 1);
-    if tensor_parallel && config.execution.overlap_scheduling && shard.is_some_and(|s| s.rank == 0)
+    let tensor_parallel = position.is_some_and(|s| s.world > 1);
+    if tensor_parallel
+        && config.execution.overlap_scheduling
+        && position.is_some_and(|s| s.rank == 0)
     {
         tracing::warn!(
             event = "overlap_scheduling_unavailable",
             reason = group_reason,
             "execution.overlap_scheduling is on but a tensor- or expert-parallel group runs \
-             each step to completion on every rank; iterations run serially"
+             each step to completion on every rank (a pipeline overlaps its micro-batches \
+             instead); iterations are not launched ahead"
         );
     }
 
@@ -566,7 +617,7 @@ fn prepare_with(
     tracing::info!(
         event = "memory_budget",
         device = device.0,
-        rank = shard.map_or(0, |s| s.rank),
+        rank = position.map_or(0, |s| s.rank),
         memory_kind = turbine_reliability::budget::memory_kind_str(budget.memory_kind),
         budget_bytes = budget.budget_bytes,
         weights,
@@ -652,6 +703,7 @@ fn prepare_with(
         kernel_metrics: kernel_metrics.clone(),
         shard,
         expert,
+        stage,
         weight_bytes: weights,
     })
 }
@@ -942,6 +994,10 @@ pub(crate) fn budget_breakdown(b: &DeviceBudget) -> String {
 pub(crate) fn load_weights(prepared: &PreparedModel) -> Result<LoadedWeights, StartupError> {
     let arch = &prepared.arch;
     let slots = match (&prepared.expert, prepared.shard) {
+        _ if prepared.stage.is_some() => {
+            let s = &prepared.stage.as_ref().expect("a stage").spec;
+            pp::weight_slots(arch, s).map_err(|e| model_error("pipeline parallelism", e))?
+        }
         (Some(e), _) => ep::weight_slots(arch, e.shard, &e.placement)
             .map_err(|e| model_error("expert parallelism", e))?,
         (None, None) => arch.family.0.weight_slots(arch),
@@ -949,7 +1005,8 @@ pub(crate) fn load_weights(prepared: &PreparedModel) -> Result<LoadedWeights, St
             tp::weight_slots(arch, s).map_err(|e| model_error("tensor parallelism", e))?
         }
     };
-    // Other expert ranks' tensors are skipped quietly (counted), not warned one by one.
+    // Other expert ranks' and stages' tensors are skipped quietly (counted), not warned one
+    // by one.
     WeightLoader::load_part(
         arch.weight_format.0,
         &prepared.index,
@@ -958,15 +1015,23 @@ pub(crate) fn load_weights(prepared: &PreparedModel) -> Result<LoadedWeights, St
         &prepared.provider.opened.mem,
         MAX_STAGING_BYTES,
     )
-    .map_err(|e| match prepared.shard {
-        Some(s) => StartupError::new(format!(
+    .map_err(|e| match (prepared.shard, &prepared.stage) {
+        (Some(s), _) => StartupError::new(format!(
             "rank {} of {} (device {}): weight shard load: {e}; {}",
             s.rank,
             s.world,
             prepared.device.0,
             budget_breakdown(&prepared.budget)
         )),
-        None => model_error("weight load", e),
+        (None, Some(s)) => StartupError::new(format!(
+            "stage {} of {} (device {}, layers {:?}): weight load: {e}; {}",
+            s.spec.stage,
+            s.stages,
+            prepared.device.0,
+            s.spec.layers,
+            budget_breakdown(&prepared.budget)
+        )),
+        (None, None) => model_error("weight load", e),
     })
 }
 

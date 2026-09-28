@@ -26,7 +26,9 @@ use turbine_core::types::{DeviceId, Vendor};
 use turbine_device::DeviceInventory;
 use turbine_device::topology::TopologyGraph;
 use turbine_distributed::expert::{EP_KEY, ExpertPlacement};
-use turbine_distributed::plan::{ParallelPlan, expert_placement, plan, plan_execution_device};
+use turbine_distributed::plan::{
+    ParallelPlan, expert_placement, plan, plan_execution_device, plan_stages,
+};
 
 use turbine_distributed::collective::CollectiveLibrary;
 use turbine_model::ep::{self, EpAttention, EpShard, ExpertCountsSnapshot, ExpertTokenCounts};
@@ -69,17 +71,16 @@ pub fn plan_for(
     let exec = &config.execution;
     let host = topology.node.hostname.as_str();
     let plan_error = |e: turbine_distributed::plan::PlanError| PlanFailure::Config(e.to_string());
-    // Pipeline parallelism (P5 S-10) is configured and validated but not executable yet:
-    // refused before any port is bound, like any unusable configuration.
-    let pp = p.pipeline_parallel_size;
-    if pp != SizeOrAuto::Size(1) {
-        return Err(PlanFailure::Config(format!(
-            "parallel.pipeline_parallel_size: {} is not executable in this build yet (only 1)",
-            pp.fixed().map_or("auto".to_string(), |n| n.to_string())
-        )));
-    }
     let Some(vendor) = backend_vendor(exec.backend.as_str()) else {
-        return plan_execution_device(p, exec.device, None, host).map_err(plan_error);
+        let mut plan = plan_execution_device(p, exec.device, None, host).map_err(plan_error)?;
+        if plan.pp > 1 {
+            // The cpu host path's stages (P5 S-10): split by the model's costs, device order.
+            let shape = load_model_config(&config.model.path)
+                .map_err(|e| PlanFailure::Startup(format!("model config: {e}")))?
+                .shape();
+            plan_stages(&mut plan, p, &shape, &|_| None).map_err(plan_error)?;
+        }
+        return Ok(plan);
     };
     let inv: Vec<(DeviceId, Vendor, Option<String>)> = inventory
         .devices
@@ -91,6 +92,7 @@ pub fn plan_for(
     let single_default = p.tensor_parallel_size == SizeOrAuto::Size(1)
         && p.data_parallel_size == SizeOrAuto::Size(1)
         && p.expert_parallel_size.fixed().unwrap_or(1) == 1
+        && p.pipeline_parallel_size == SizeOrAuto::Size(1)
         && p.devices == DeviceSelection::Auto;
     if single_default {
         return plan_execution_device(p, exec.device, Some(vendor), host).map_err(plan_error);
@@ -116,11 +118,30 @@ pub fn plan_for(
 /// multiple of them), intermediate and expert widths (`turbine_model::tp::check`, reason code
 /// in the message). With expert parallelism (P5 S-11) the model must have routed experts
 /// (`ep_moe_only`), and the placement (`parallel.expert.placement`, over the family's MoE
-/// layers) must fit every rank (`turbine_model::ep::check`); it becomes `plan.experts`.
+/// layers) must fit every rank (`turbine_model::ep::check`); it becomes `plan.experts`. With
+/// pipeline stages (P5 S-10) the model's family must run as stages and the planned layer
+/// ranges must cover its layers (`turbine_model::pp::check`).
 /// `config.json` is read here; an unreadable one is exit 1.
 pub fn check_executable(plan: &mut ParallelPlan, config: &Config) -> Result<(), PlanFailure> {
     if plan.ep > 1 {
         return check_expert_parallel(plan, config);
+    }
+    if plan.pp > 1 {
+        let arch = load_model_config(&config.model.path)
+            .map_err(|e| PlanFailure::Startup(format!("model config: {e}")))?;
+        return turbine_model::pp::check(&arch, &plan.stages).map_err(|e| {
+            tracing::error!(
+                event = "parallel_plan_failed",
+                reason = "pp_unsplittable_model",
+                pp = plan.pp,
+                error = %e,
+                "the model cannot run as the planned pipeline stages"
+            );
+            PlanFailure::Config(format!(
+                "parallel.pipeline_parallel_size: {} stages cannot run {}: {e}",
+                plan.pp, arch.hf_architecture
+            ))
+        });
     }
     if plan.tp <= 1 {
         return Ok(());
@@ -256,9 +277,125 @@ pub fn config_fingerprint(config: &Config) -> [u8; 32] {
     *blake3::hash(&bytes).as_bytes()
 }
 
-/// The device of the single engine: rank 0 of replica 0.
+/// The device of the single engine: rank 0 of replica 0 — with pipeline stages the last stage
+/// (the engine thread runs it and owns its KV pool, P5 S-10).
 pub fn engine_device(plan: &ParallelPlan) -> DeviceId {
-    plan.groups[0].ranks[0].device
+    leader_device(plan, &plan.groups[0])
+}
+
+/// The device of `group`'s engine: its rank 0, or its last stage under pipeline parallelism.
+pub fn leader_device(
+    plan: &ParallelPlan,
+    group: &turbine_distributed::plan::ReplicaGroup,
+) -> DeviceId {
+    let rank = if plan.pp > 1 {
+        group.ranks.last()
+    } else {
+        group.ranks.first()
+    };
+    rank.map_or(DeviceId(0), |r| r.device)
+}
+
+/// The startup host-link probe (P5 S-13): with `parallel.topology.measure_links` on a GPU
+/// backend whose configuration spans more than the single-GPU default, every GPU of the
+/// topology graph gets one bounded host↔device copy each way through a context of the
+/// configured backend (its pinned memory and copy stream, kernel ABI v2.3 + v2.5), and the
+/// graph's upstream PCIe edges carry the measured bandwidth; the planner places pipeline
+/// stages by it. Bounded by `turbine_device::topology::PROBE_BUDGET`; a GPU whose context has no
+/// copy stream (or fails to open) keeps its nominal edge with a WARN. The one-GPU default and
+/// the cpu backend skip it (nothing reads the links).
+pub fn measure_host_links(
+    config: &Config,
+    inventory: &DeviceInventory,
+    topology: &mut TopologyGraph,
+) {
+    let p = &config.parallel;
+    let exec = &config.execution;
+    if !p.topology.measure_links || backend_vendor(exec.backend.as_str()).is_none() {
+        return;
+    }
+    let single_default = p.tensor_parallel_size == SizeOrAuto::Size(1)
+        && p.data_parallel_size == SizeOrAuto::Size(1)
+        && p.expert_parallel_size.fixed().unwrap_or(1) == 1
+        && p.pipeline_parallel_size == SizeOrAuto::Size(1)
+        && p.devices == DeviceSelection::Auto;
+    if single_default {
+        return;
+    }
+    let Some(backend) = turbine_kernels::backends::registry().get(exec.backend.as_str()) else {
+        return;
+    };
+    let started = Instant::now();
+    let mut probe = turbine_kernels::link_probe::CopyLinkProbe::new(|device| {
+        let opened = backend
+            .open(&turbine_kernels::backends::BackendRequest {
+                device,
+                kernel_library: exec.kernel_library.as_deref(),
+                inventory,
+                meminfo: std::path::Path::new("/proc/meminfo"),
+                card_profile: exec.card_profile.as_str(),
+            })
+            .map_err(|e| e.to_string())?;
+        let ctx = opened
+            .context
+            .filter(|c| c.has_copy_engine())
+            .ok_or("the kernel library has no copy streams (ABI v2.5)")?;
+        Ok(turbine_kernels::link_probe::ProbeTarget {
+            memory: opened.mem,
+            copies: ctx.clone(),
+            pinned: ctx,
+        })
+    });
+    let results = turbine_device::topology::probe_links(topology, &mut probe);
+    tracing::info!(
+        event = "topology_link_probe",
+        devices = results.len(),
+        measured = results.values().filter(|r| r.is_ok()).count(),
+        seconds = started.elapsed().as_secs_f64(),
+        "host links probed"
+    );
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct LinkLabels {
+    device: String,
+    direction: &'static str,
+}
+
+/// `turbine_topology_link_gbps{device,direction}` (P5 S-13): every measured host link of
+/// `topology` (`h2d`, `d2h`); nothing when no link was measured.
+pub fn register_links(reg: &MetricsRegistry, topology: &TopologyGraph) {
+    let measured: Vec<(DeviceId, f64, f64)> = topology
+        .gpu_devices()
+        .into_iter()
+        .filter_map(|d| {
+            let id = format!("gpu{}", d.0);
+            topology.edges.iter().find_map(|e| {
+                (e.b == id && e.a.starts_with("pcie:"))
+                    .then(|| e.measured_h2d_gbps.zip(e.measured_d2h_gbps))
+                    .flatten()
+                    .map(|(h, dd)| (d, h, dd))
+            })
+        })
+        .collect();
+    if measured.is_empty() {
+        return;
+    }
+    let gauge = reg.register(
+        "turbine_topology_link_gbps",
+        "Measured host-link bandwidth of a GPU, GB/s",
+        Family::<LinkLabels, Gauge<f64, AtomicU64>>::default(),
+    );
+    for (d, h2d, d2h) in measured {
+        for (direction, v) in [("h2d", h2d), ("d2h", d2h)] {
+            gauge
+                .get_or_create(&LinkLabels {
+                    device: d.0.to_string(),
+                    direction,
+                })
+                .set(v);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -313,8 +450,18 @@ pub fn status(plan: &ParallelPlan) -> Value {
         })).collect::<Vec<_>>(),
         "plan_reasons": plan.reasons.iter().map(ToString::to_string).collect::<Vec<_>>(),
     });
+    if plan.pp > 1 {
+        doc["pp"] = json!(plan.pp);
+        doc["ep"] = json!(plan.ep);
+        let codes: Vec<String> = plan.reasons.iter().map(ToString::to_string).collect();
+        if let Some(groups) = doc["groups"].as_array_mut() {
+            for (g, doc) in plan.groups.iter().zip(groups) {
+                doc["stages"] = stages_status(plan, g, &codes);
+            }
+        }
+    }
     if plan.ep > 1 {
-        doc["pp"] = json!(1);
+        doc["pp"] = json!(plan.pp);
         doc["ep"] = json!(plan.ep);
         if let (Some(placement), Some(groups)) = (&plan.experts, doc["groups"].as_array_mut()) {
             let experts = placement_status(placement);
@@ -324,6 +471,36 @@ pub fn status(plan: &ParallelPlan) -> Value {
         }
     }
     doc
+}
+
+/// Group `g`'s pipeline stages (see [`status`]): per stage its device, `layers: [first, last]`
+/// and the placement reason of the group (`pp_stage_host_traffic:<device>` when one of its
+/// devices got the host-traffic placement, else `pp_stage_device_order`).
+fn stages_status(
+    plan: &ParallelPlan,
+    g: &turbine_distributed::plan::ReplicaGroup,
+    codes: &[String],
+) -> Value {
+    let reason = g
+        .ranks
+        .iter()
+        .map(|r| format!("pp_stage_host_traffic:{}", r.device.0))
+        .find(|c| codes.contains(c))
+        .unwrap_or_else(|| "pp_stage_device_order".to_string());
+    Value::Array(
+        plan.stages
+            .iter()
+            .zip(&g.ranks)
+            .map(|(s, r)| {
+                json!({
+                    "stage": s.stage,
+                    "device": r.device.0,
+                    "layers": [s.layers.start, s.layers.end.saturating_sub(1)],
+                    "reason": reason,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Every rank's experts (see [`status`]).
@@ -526,7 +703,9 @@ mod tests {
         ParallelPlan {
             tp,
             dp,
+            pp: 1,
             ep: 1,
+            stages: Vec::new(),
             backend: "host",
             mode: turbine_core::config::RankMode::Local,
             vendor: Some(Vendor::Amd),
@@ -596,6 +775,63 @@ mod tests {
             check_executable(&mut plan(2, 1).clone(), &config),
             Err(PlanFailure::Startup(_))
         ));
+    }
+
+    /// P5 S-10, S-12 on the cpu host path: `pipeline_parallel_size: 2` over the host collective
+    /// plans the tiny Llama's 2 layers as 2 stages on host devices 0 and 1 (checked against the
+    /// model), the engine runs the last stage (device 1), and the status object carries `pp`,
+    /// `ep` and every group's `stages` with their layers and placement reason; a split that
+    /// does not cover the model is exit 2 naming `parallel.pipeline.layer_split`. Breaks if the
+    /// stages or their status go missing, or the engine lands on another stage.
+    #[test]
+    fn pipeline_planned_checked_and_shown() {
+        let dir = turbine_model::testing::TempDir::new("parallel-pp-check");
+        turbine_model::testing::tiny::write_tiny_llama(dir.path(), 1);
+        let mut config = Config::default();
+        config.model.path = dir.path().to_path_buf();
+        config.execution.backend = turbine_core::config::ModuleName::new("cpu").unwrap();
+        config.parallel.pipeline_parallel_size = SizeOrAuto::Size(2);
+        config.parallel.collective_backend = turbine_core::config::ModuleName::new("host").unwrap();
+        let inventory = DeviceInventory {
+            devices: Vec::new(),
+            backends: Vec::new(),
+        };
+        let topology = TopologyGraph {
+            node: turbine_device::topology::TopologyNode {
+                hostname: "h".into(),
+                captured_at: String::new(),
+            },
+            vertices: Vec::new(),
+            edges: Vec::new(),
+        };
+        let mut p = plan_for(&config, &inventory, &topology).expect("pp 2 plan");
+        check_executable(&mut p, &config).expect("the tiny Llama splits into 2 stages");
+        assert_eq!((p.pp, p.tp, p.replica_size()), (2, 1, 2));
+        assert_eq!(
+            p.stages
+                .iter()
+                .map(|s| s.layers.clone())
+                .collect::<Vec<_>>(),
+            vec![0..1, 1..2]
+        );
+        assert_eq!(engine_device(&p), DeviceId(1));
+        let doc = status(&p);
+        assert_eq!((&doc["pp"], &doc["ep"]), (&json!(2), &json!(1)), "{doc}");
+        assert_eq!(
+            doc["groups"][0]["stages"],
+            json!([
+                {"stage": 0, "device": 0, "layers": [0, 0], "reason": "pp_stage_device_order"},
+                {"stage": 1, "device": 1, "layers": [1, 1], "reason": "pp_stage_device_order"}
+            ]),
+            "{doc}"
+        );
+        config.parallel.pipeline.layer_split = Some(vec![2, 1]);
+        match plan_for(&config, &inventory, &topology) {
+            Err(PlanFailure::Config(m)) => {
+                assert!(m.starts_with("parallel.pipeline.layer_split"), "{m}")
+            }
+            other => panic!("bad split: {other:?}"),
+        }
     }
 
     fn ep_plan(tp: u32, ep: u32) -> ParallelPlan {

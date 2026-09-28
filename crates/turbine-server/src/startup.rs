@@ -151,7 +151,10 @@ pub fn run(cli: Cli) -> ExitCode {
     };
     support_startup::log(&support);
     // P5 S-1: the node-local topology graph, right after discovery (never fails).
-    let topology = capture_topology(&DiscoveryOptions::from_config(&config.devices), &inventory);
+    let mut topology =
+        capture_topology(&DiscoveryOptions::from_config(&config.devices), &inventory);
+    // P5 S-13: measured host links on the GPU edges (multi-GPU configurations only).
+    parallel::measure_host_links(&config, &inventory, &mut topology);
 
     // P5 S-4: the parallel plan before the kernel provider and the listener (exit 2, or exit 1
     // when the model config it needs is unreadable).
@@ -217,6 +220,7 @@ pub fn run(cli: Cli) -> ExitCode {
     DeviceMetrics::register(&metrics).record(&inventory);
     SupportMetrics::register(&metrics).set(&support.status);
     parallel::register_info(&metrics, &plan);
+    parallel::register_links(&metrics, &topology);
     // Steps 4–6 per data-parallel replica (P5 S-7): replica 0 on the plan's first device, the
     // others on theirs, sharing the grammar compiler and the kernel metrics. Replicas that share
     // a device (`parallel.allow_device_sharing`) split its budget. With tensor parallelism
@@ -226,7 +230,7 @@ pub fn run(cli: Cli) -> ExitCode {
     // experts, fed the same batches as a tensor-parallel group's ranks.
     let tp = plan.tp;
     let group_size = plan.group_size();
-    let collective = if group_size > 1 {
+    let collective = if plan.replica_size() > 1 {
         match parallel::load_collective(&config, &plan) {
             Ok(library) => Some((library, CollectiveMetrics::register(&metrics))),
             Err(e) => {
@@ -277,12 +281,14 @@ pub fn run(cli: Cli) -> ExitCode {
         ExitCode::Startup
     };
     let kv_metrics = KvMetrics::register(&metrics);
+    let pipeline_metrics =
+        (plan.pp > 1).then(|| turbine_scheduler::PipelineMetrics::register(&metrics));
     let mut replicas: Vec<ReplicaStart> = Vec::with_capacity(plan.groups.len());
     for (r, group) in plan.groups.iter().enumerate() {
         // Static mode (dp 1): this process prepares only its own rank, on its local device.
         let (device, first_rank) = match static_rank {
             Some(rank) => (config.execution.device, rank),
-            None => (group.ranks[0].device, 0),
+            None => (parallel::leader_device(&plan, group), 0),
         };
         let cfg = replica_config(&config, r, plan.groups.len(), device);
         let experts = expert_metrics.as_ref().map(|m| {
@@ -293,9 +299,27 @@ pub fn run(cli: Cli) -> ExitCode {
             ))
         });
         let stats = experts.as_ref();
-        let prepared = match replicas.first() {
-            None => model::prepare_rank(&cfg, &inventory, &metrics, part(first_rank, stats)),
-            Some(base) => {
+        // P5 S-10: a pipeline's stages are prepared on their devices; the engine runs the last.
+        let mut pipeline = None;
+        let prepared = match (replicas.first(), &collective, &pipeline_metrics) {
+            (base, Some(c), Some(pm)) => engine::pp::prepare_stages(
+                &cfg,
+                &inventory,
+                &metrics,
+                base.map(|b| &b.prepared),
+                &plan,
+                group,
+                c,
+                pm,
+            )
+            .map(|(last, start)| {
+                pipeline = Some(start);
+                last
+            }),
+            (None, _, _) => {
+                model::prepare_rank(&cfg, &inventory, &metrics, part(first_rank, stats))
+            }
+            (Some(base), _, _) => {
                 model::prepare_replica(&cfg, &inventory, &base.prepared, part(first_rank, stats))
             }
         };
@@ -303,11 +327,13 @@ pub fn run(cli: Cli) -> ExitCode {
             Ok(p) => p,
             Err(e) => return startup_failed(r, &e),
         };
-        if let Err(e) = prepared.share_device(slots_on(device)) {
+        if pipeline.is_none()
+            && let Err(e) = prepared.share_device(slots_on(device))
+        {
             return startup_failed(r, &e);
         }
         let mut workers = Vec::with_capacity(group.ranks.len().saturating_sub(1));
-        let local_workers = if static_rank.is_some() {
+        let local_workers = if static_rank.is_some() || pipeline.is_some() {
             0
         } else {
             group.ranks.len()
@@ -333,7 +359,10 @@ pub fn run(cli: Cli) -> ExitCode {
         // binds (exit 1 naming the path). A tier copy of a tensor-parallel block holds every
         // rank's shard (decision "P5 T17" B); an expert-parallel block at tp 1 every rank's
         // replica of it (each rank runs the whole attention).
-        let format = tp_kv_format(prepared.pool.layout, group_size);
+        let format = pipeline.as_ref().map_or_else(
+            || tp_kv_format(prepared.pool.layout, group_size),
+            |p| p.format,
+        );
         if let Err(e) = cfg.kv.validate_block_bytes(format.block_bytes()) {
             eprintln!("turbine-server: invalid configuration: {e}");
             return ExitCode::Config;
@@ -396,7 +425,7 @@ pub fn run(cli: Cli) -> ExitCode {
         };
         let group = collective
             .as_ref()
-            .filter(|_| worker.is_none())
+            .filter(|_| worker.is_none() && pipeline.is_none())
             .map(|(library, metrics)| engine::tp::TpGroupStart {
                 workers,
                 library: Arc::clone(library),
@@ -412,6 +441,7 @@ pub fn run(cli: Cli) -> ExitCode {
         replicas.push(ReplicaStart {
             prepared,
             group,
+            pipeline,
             experts,
             worker,
             kv_cfg: cfg.kv.clone(),
@@ -521,6 +551,8 @@ struct ReplicaStart {
     prepared: PreparedModel,
     /// Tensor parallelism: the group's worker ranks and its collective backend (P5 S-6).
     group: Option<engine::tp::TpGroupStart>,
+    /// Pipeline parallelism: the stages before the last and the collective backend (P5 S-10).
+    pipeline: Option<engine::pp::PipelineStart>,
     /// Expert parallelism (P5 S-11): the group's token counts (`/turbine/v1/scheduler`
     /// `expert`, the expert metrics).
     experts: Option<Arc<parallel::ExpertStats>>,
@@ -666,6 +698,7 @@ async fn serve(
         if let Err(e) = engine::spawn(
             replica.prepared,
             replica.group,
+            replica.pipeline,
             Arc::clone(&backend),
             metrics,
             startup,
