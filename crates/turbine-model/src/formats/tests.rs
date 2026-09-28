@@ -280,6 +280,62 @@ impl ToolFormat for NeedsNone {
     }
 }
 
+/// `llama3_json` with an empty second special token.
+struct EmptySpecial;
+
+impl Module for EmptySpecial {
+    fn name(&self) -> &'static str {
+        "empty_special"
+    }
+}
+
+impl ToolFormat for EmptySpecial {
+    fn special_tokens(&self) -> &'static [SpecialToken] {
+        &[
+            SpecialToken {
+                text: "<|python_tag|>",
+                required: false,
+            },
+            SpecialToken {
+                text: "",
+                required: false,
+            },
+        ]
+    }
+    fn grammar(
+        &self,
+        tools: &[Value],
+        choice: &ToolChoice,
+        parallel: bool,
+    ) -> Result<ConstraintSpec, ModelError> {
+        Llama3Json.grammar(tools, choice, parallel)
+    }
+    fn parser(&self) -> Box<dyn ToolCallParser> {
+        Llama3Json.parser()
+    }
+    fn opens_like_call(&self, text: &str, first: Option<u32>, tokens: &BoundTokens) -> Opening {
+        Llama3Json.opens_like_call(text, first, tokens)
+    }
+    fn sample_call(&self) -> &'static str {
+        Llama3Json.sample_call()
+    }
+}
+
+static WITH_EMPTY_SPECIAL: turbine_core::registry::Registry<dyn ToolFormat> =
+    turbine_core::registry::Registry::new("tool_format", &[&EmptySpecial]);
+
+/// The suite's empty-special-token failure names the token's index (Scout 5a957de4).
+#[test]
+fn empty_special_token_failure_names_its_index() {
+    let failures = crate::conformance::formats_suite(&WITH_EMPTY_SPECIAL).unwrap_err();
+    let special: Vec<&str> = failures
+        .iter()
+        .filter(|f| f.check == "special_tokens")
+        .map(|f| f.detail.as_str())
+        .collect();
+    assert_eq!(special, ["special token 1 is empty"], "{failures:#?}");
+}
+
 #[test]
 fn bind_refuses_missing_required_token() {
     let (_dir, tokenizer) = tiny_tokenizer("turbine-formats-bind");
