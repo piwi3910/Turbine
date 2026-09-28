@@ -26,8 +26,8 @@ use turbine_kernels::cpu::quant::{e2m1_value, e8m0_value, mxfp4_quantize_group};
 use turbine_kernels::quant::MX_BLOCK;
 
 use super::common::{
-    Owned, bf16_bytes, bf16_values, matches_ignore, module_of, quantization_config, read_owned,
-    scheme_unsupported, write_fixture,
+    Follows, Owned, bf16_bytes, bf16_values, matches_ignore, module_of, quantization_config,
+    read_owned, scheme_unsupported, shard_like, shard_misaligned, write_fixture,
 };
 use super::{ActivationQuant, LinearSlot, QuantScheme, WeightFormat};
 use crate::ModelError;
@@ -142,8 +142,21 @@ impl Mxfp4Layout {
     /// The slots of family slot `base`: for a quantized layer its data and scales, stacked like
     /// `base`; else `base`.
     pub fn slots(&self, base: &WeightSlot) -> Vec<WeightSlot> {
+        self.derive(base).0
+    }
+
+    /// Refuses a tensor-parallel shard that cuts a 32-input block.
+    pub fn check_shard(&self, base: &WeightSlot) -> Result<(), ModelError> {
+        match (&base.source, self.derive(base).1) {
+            (Some(src), false) => Err(shard_misaligned(&base.name, src, "the 32-input block")),
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Mxfp4Layout::slots`], sharded like `base`, and whether the shard is aligned.
+    fn derive(&self, base: &WeightSlot) -> (Vec<WeightSlot>, bool) {
         if !self.quantizes(&base.name, &base.shape) {
-            return vec![base.clone()];
+            return (vec![base.clone()], true);
         }
         let module = module_of(&base.name).expect("quantizes() checked the suffix");
         let (data, scales) = self.kind.names();
@@ -174,10 +187,26 @@ impl Mxfp4Layout {
                 source: None,
             }
         };
-        vec![
+        let mut out = vec![
             per_row(data, key.clone(), k / 2),
             per_row(scales, format!("{key}_scale"), k.div_ceil(MX_BLOCK)),
-        ]
+        ];
+        let mut aligned = true;
+        if let Some(src) = &base.source {
+            let (full_n, full_k) = (src.shape[0], src.shape[1]);
+            for (slot, cols) in out.iter_mut().zip([2, MX_BLOCK]) {
+                aligned &= shard_like(
+                    slot,
+                    src,
+                    vec![full_n, full_k / cols],
+                    Follows {
+                        rows: 1,
+                        cols: Some(cols),
+                    },
+                );
+            }
+        }
+        (out, aligned)
     }
 
     pub fn slot_dtype(&self, slot: &WeightSlot) -> DType {
@@ -312,6 +341,10 @@ impl<P: Mxfp4Packaging> WeightFormat for Mxfp4Format<P> {
 
     fn slots(&self, base: &WeightSlot) -> Vec<WeightSlot> {
         self.layout.slots(base)
+    }
+
+    fn check_shard(&self, base: &WeightSlot) -> Result<(), ModelError> {
+        self.layout.check_shard(base)
     }
 
     fn slot_dtype(&self, slot: &WeightSlot) -> DType {

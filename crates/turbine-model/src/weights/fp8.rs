@@ -31,8 +31,9 @@ use turbine_core::types::DType;
 use turbine_kernels::cpu::quant::{fp8_e4m3_round, fp8_e4m3_value};
 
 use super::common::{
-    Owned, bf16_bytes, bf16_values, f32_bytes, matches_ignore, module_of, pow2_at_least,
-    quantization_config, read_owned, scheme_unsupported, write_fixture,
+    Follows, Owned, bf16_bytes, bf16_values, f32_bytes, matches_ignore, module_of, pow2_at_least,
+    quantization_config, read_owned, scheme_unsupported, shard_like, shard_misaligned,
+    write_fixture,
 };
 use super::{ActivationQuant, LinearSlot, QuantScheme, WeightFormat};
 use crate::ModelError;
@@ -128,9 +129,26 @@ impl Fp8Layout {
     /// with static activations, its input scale — stacked like `base` (by rows of a 2-D stack,
     /// or per entry of a stack of experts).
     pub fn slots(&self, base: &WeightSlot) -> Vec<WeightSlot> {
+        self.derive(base).0
+    }
+
+    /// Refuses a tensor-parallel shard that cuts a scale block.
+    pub fn check_shard(&self, base: &WeightSlot) -> Result<(), ModelError> {
+        match (&base.source, self.derive(base).1) {
+            (Some(src), false) => Err(shard_misaligned(
+                &base.name,
+                src,
+                "the 128 × 128 scale block",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Fp8Layout::slots`], sharded like `base`, and whether the shard is aligned.
+    fn derive(&self, base: &WeightSlot) -> (Vec<WeightSlot>, bool) {
         let mut out = vec![base.clone()];
         if !self.quantizes(&base.name, &base.shape) {
-            return out;
+            return (out, true);
         }
         let module = module_of(&base.name).expect("quantizes() checked the suffix");
         let (n, k) = (base.shape[0], base.shape[1]);
@@ -187,7 +205,36 @@ impl Fp8Layout {
                 source: None,
             });
         }
-        out
+        let mut aligned = true;
+        if let Some(src) = &base.source {
+            let (full_n, full_k) = (src.shape[0], src.shape[1]);
+            let (rows_per, cols) = match self.weights {
+                Fp8Weights::Tensor | Fp8Weights::Channel => (1, None),
+                Fp8Weights::Block { n: bn, k: bk } => (bn as usize, Some(bk as usize)),
+            };
+            let scale_full = self.scale_shape(full_n, full_k);
+            aligned &= shard_like(
+                &mut out[1],
+                src,
+                scale_full,
+                Follows {
+                    rows: rows_per,
+                    cols,
+                },
+            );
+            if let Some(input) = out.get_mut(2) {
+                aligned &= shard_like(
+                    input,
+                    src,
+                    vec![full_n],
+                    Follows {
+                        rows: 1,
+                        cols: None,
+                    },
+                );
+            }
+        }
+        (out, aligned)
     }
 
     pub fn slot_dtype(&self, slot: &WeightSlot) -> DType {
@@ -355,6 +402,10 @@ impl<P: Fp8Packaging> WeightFormat for Fp8Format<P> {
 
     fn slots(&self, base: &WeightSlot) -> Vec<WeightSlot> {
         self.layout.slots(base)
+    }
+
+    fn check_shard(&self, base: &WeightSlot) -> Result<(), ModelError> {
+        self.layout.check_shard(base)
     }
 
     fn slot_dtype(&self, slot: &WeightSlot) -> DType {

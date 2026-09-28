@@ -371,16 +371,16 @@ Interfaces:
 
 ## Task 21: Quantized dense layers under tensor parallelism
 
-Files: `crates/turbine-model/src/loader.rs` (`SlotSource` sharding of data, scales and zeros per scheme; alignment check), `crates/turbine-model/src/executor/tp.rs` (quantized row/column-parallel linears), `crates/turbine-server/src/parallel.rs` or the Phase 5 plan-validation file (refusals `quant_shard_misaligned`, `quant_moe_phase7`), `crates/turbine-server/tests/tiny_server.rs` (`tp2_quantized_matches_tp1`), `scripts/lab/phase5-novanas-llama-fp8.yaml`, `scripts/lab/phase5-novanas-llama-awq.yaml`
+Files: `crates/turbine-model/src/loader.rs` (`SlotSource` sharding of data, scales and zeros per scheme; sharded repacked slots repack the whole tensor then take the rank's part; alignment check), `crates/turbine-model/src/weights/{common,fp8,int4,mxfp4}.rs` (`shard_like` / `check_shard`: derived slots follow the layer's split, refusal `quant_shard_misaligned`), `crates/turbine-model/src/executor/decoder/mod.rs` (TP allowed; `quant_moe_phase7` stays, pipeline stages refused `quant_pipeline_unsupported`), `crates/turbine-model/tests/tiny_model.rs` (`tp2_quantized_matches_tp1_on_host`: the model-level host test over the host collective, the pattern of `tp2_matches_tp1_on_host`, instead of a server test), `scripts/lab/phase5-novanas-llama-fp8.yaml`, `scripts/lab/phase5-novanas-llama-awq.yaml`
 Interfaces:
 
 - column-parallel: `data` and per-channel `scales` split along n; per-tensor scale replicated; row-parallel: split along k, group scales and zeros split with it, requires `k_shard % group == 0` (and `% 128` for `FP8_BLOCK`) else `quant_shard_misaligned` naming the layer; any quantized expert tensor → `quant_moe_phase7`
   Covers: spec S-12; AC `tp2_quantized_matches_tp1`
   Depends on: Tasks 14, 18, 20
 
-- [ ] Write failing test `tiny_server tp2_quantized_matches_tp1` (local and static modes over loopback tcp; `ct_fp8`, `awq`, `ct_mxfp4` tiny checkpoints; misaligned and MoE refusals). Run: `scripts/remote-cargo.sh test -p turbine-server --test tiny_server tp2_quantized` — expect FAIL
+- [ ] Write failing test `tiny_model tp2_quantized_matches_tp1_on_host` (tp 1 and 2 over the host collective; `ct_fp8` weight-only / static / token, `awq`, `gptq`, `ct_mxfp4` tiny checkpoints; misaligned and MoE refusals). Run: `scripts/remote-cargo.sh test -p turbine-model --test tiny_model tp2_quantized` — expect FAIL
 - [ ] Implement.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-server --test tiny_server` — expect PASS
+- [ ] Run: `scripts/remote-cargo.sh test -p turbine-model --test tiny_model` — expect PASS
 - [ ] Lab (both GPUs, bench lock): `scripts/lab-cluster.sh --bench-lock tp2-novanas` with the two new configs — expect golden c1 PASS under `--batched-bounds` against each slug's reference.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `feat(model): quantized dense layers under tensor parallelism`

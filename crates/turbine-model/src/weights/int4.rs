@@ -39,8 +39,9 @@ use turbine_core::support::WeightFormatColumn;
 use turbine_core::types::DType;
 
 use super::common::{
-    Owned, bf16_bytes, bf16_values, matches_ignore, module_of, pow2_at_least, quantization_config,
-    read_owned, scheme_unsupported, write_fixture,
+    Follows, Owned, bf16_bytes, bf16_values, matches_ignore, module_of, pow2_at_least,
+    quantization_config, read_owned, scheme_unsupported, shard_like, shard_misaligned,
+    write_fixture,
 };
 use super::{LinearSlot, QuantScheme, WeightFormat};
 use crate::ModelError;
@@ -203,8 +204,25 @@ impl Int4Layout {
     /// and check-only tensors, stacked like `base`; else `base` (converted from F16 when so
     /// stored).
     pub fn slots(&self, base: &WeightSlot) -> Vec<WeightSlot> {
+        self.derive(base).0
+    }
+
+    /// Refuses a tensor-parallel shard that cuts a group or a packed byte.
+    pub fn check_shard(&self, base: &WeightSlot) -> Result<(), ModelError> {
+        match (&base.source, self.derive(base).1) {
+            (Some(src), false) => Err(shard_misaligned(
+                &base.name,
+                src,
+                &format!("the {}-input group", self.group),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Int4Layout::slots`], sharded like `base`, and whether the shard is aligned.
+    fn derive(&self, base: &WeightSlot) -> (Vec<WeightSlot>, bool) {
         if !self.quantizes(&base.name, &base.shape) {
-            return vec![base.clone()];
+            return (vec![base.clone()], true);
         }
         let module = module_of(&base.name).expect("quantizes() checked the suffix");
         let names = self.kind.names();
@@ -248,8 +266,27 @@ impl Int4Layout {
                 check_slot(module, zeros)
             });
         }
+        let mut aligned = true;
+        if let Some(src) = &base.source {
+            let (full_n, full_k) = (src.shape[0], src.shape[1]);
+            let g = self.group as usize;
+            let per_row = [(2, full_k / 2), (g, full_k / g), (g, full_k / g)];
+            for (slot, (cols, full_cols)) in out.iter_mut().zip(per_row) {
+                if slot.shape != [0] {
+                    aligned &= shard_like(
+                        slot,
+                        src,
+                        vec![full_n, full_cols],
+                        Follows {
+                            rows: 1,
+                            cols: Some(cols),
+                        },
+                    );
+                }
+            }
+        }
         out.extend(names.checks.iter().map(|c| check_slot(module, c)));
-        out
+        (out, aligned)
     }
 
     pub fn slot_dtype(&self, slot: &WeightSlot) -> DType {
@@ -613,6 +650,10 @@ impl<P: Int4Packaging> WeightFormat for Int4Format<P> {
 
     fn slots(&self, base: &WeightSlot) -> Vec<WeightSlot> {
         self.layout.slots(base)
+    }
+
+    fn check_shard(&self, base: &WeightSlot) -> Result<(), ModelError> {
+        self.layout.check_shard(base)
     }
 
     fn slot_dtype(&self, slot: &WeightSlot) -> DType {

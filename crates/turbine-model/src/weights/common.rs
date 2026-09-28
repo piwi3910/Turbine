@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::ModelError;
 use crate::config::unsupported;
+use crate::loader::{SlotSource, WeightSlot};
 use crate::safetensors::Dtype;
 
 /// `X` of a parameter named `X.weight`.
@@ -112,6 +113,54 @@ pub fn scheme_unsupported(field: &str, value: impl Into<String>, supported: &str
         field,
         value,
         &format!("quant_scheme_unsupported: {supported}"),
+    )
+}
+
+/// How a slot derived from a quantized layer (its scales, zero points, packed data) follows the
+/// layer's `[n, k]` weight when tensor parallelism shards it (Phase 6a S-12).
+#[derive(Clone, Copy, Debug)]
+pub struct Follows {
+    /// Weight rows per slot row (1 per row, 128 per FP8 block).
+    pub rows: usize,
+    /// Weight columns per slot column (1, 2 for packed 4-bit data, the group or block size),
+    /// or `None` for a slot that does not follow `k` (per-row scales: whole on every rank).
+    pub cols: Option<usize>,
+}
+
+/// Shards `slot` like its layer's slot `base`, sharded as `src` (a whole `[N, K]` checkpoint
+/// weight): `full` is the slot's unsharded shape in the loaded layout. Returns `false` (and
+/// leaves `slot` whole) when the shard does not fall on the slot's row or column units: the
+/// caller refuses the split (`quant_shard_misaligned`).
+pub fn shard_like(slot: &mut WeightSlot, src: &SlotSource, full: Vec<usize>, f: Follows) -> bool {
+    let div = match (src.axis, f.cols) {
+        (0, _) => f.rows,
+        (_, Some(c)) => c,
+        // Row-parallel and not following k: every rank holds the whole slot.
+        (_, None) => return true,
+    };
+    if !src.start.is_multiple_of(div) || !src.len.is_multiple_of(div) {
+        return false;
+    }
+    slot.source = Some(SlotSource {
+        shape: full,
+        axis: src.axis,
+        start: src.start / div,
+        len: src.len / div,
+    });
+    true
+}
+
+/// The refusal of a tensor-parallel split that cuts a quantized layer's groups or blocks.
+pub fn shard_misaligned(layer: &str, src: &SlotSource, unit: &str) -> ModelError {
+    unsupported(
+        "tensor-parallel shard",
+        format!(
+            "{layer} {} {}..{}",
+            if src.axis == 0 { "rows" } else { "columns" },
+            src.start,
+            src.start + src.len
+        ),
+        &format!("quant_shard_misaligned: shards on {unit} boundaries"),
     )
 }
 

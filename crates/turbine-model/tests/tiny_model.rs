@@ -3775,7 +3775,14 @@ fn tp_rank(
     let opts = ExecutorOptions::default();
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
     let slots = tp::weight_slots(cfg, s).expect("shard slots");
-    let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load shard");
+    let weights = WeightLoader::load_format(
+        cfg.weight_format.get(),
+        &index,
+        &slots,
+        mem,
+        MAX_STAGING_BYTES,
+    )
+    .expect("load shard");
     let reqs =
         tp::available_requirements(cfg, s, BLOCK_TOKENS, opts, std::slice::from_ref(&provider))
             .expect("requirements");
@@ -3982,6 +3989,152 @@ fn tp2_matches_tp1_on_host() {
             );
         }
     }
+}
+
+/// Phase 6a S-12: quantized dense layers under tensor parallelism on the CPU provider — each
+/// FP8, INT4 and MXFP4 tiny checkpoint (hidden 128, head_dim 128) at tp 1 and 2 over the host
+/// collective against one device: identical greedy tokens and top-k logprobs within the strict
+/// golden bounds (a group of one bitwise; with quantized activations the tail below logprob −2
+/// is not bounded, see the bound's comment). Column-parallel layers split the data and per-row
+/// scales along n, row-parallel ones split the data, group scales and zero points along k
+/// (per-row FP8 scales and static input scales whole on every rank). A split that cuts a
+/// block or group is refused `quant_shard_misaligned` naming the layer, a quantized
+/// mixture-of-experts model `quant_moe_phase7`. Breaks if a derived tensor is sharded along
+/// the wrong axis or at the wrong offset.
+#[test]
+fn tp2_quantized_matches_tp1_on_host() {
+    use serde_json::json;
+    let tmp = TempDir::new("tiny-model-tp-quant");
+    let golden = TpBound::Golden(GoldenLogprobBounds::llama());
+    let ct_fp8 = |strategy: &str, input: serde_json::Value| {
+        json!({"quant_method": "compressed-tensors", "format": "float-quantized",
+               "ignore": ["lm_head"],
+               "config_groups": {"group_0": {"targets": ["Linear"], "input_activations": input,
+                   "weights": {"num_bits": 8, "type": "float", "strategy": strategy}}}})
+    };
+    let cases = [
+        ("ct_fp8 channel weight-only", ct_fp8("channel", json!(null))),
+        (
+            "ct_fp8 tensor static",
+            ct_fp8(
+                "tensor",
+                json!({"num_bits": 8, "type": "float", "strategy": "tensor",
+                                    "dynamic": false}),
+            ),
+        ),
+        (
+            "ct_fp8 channel token",
+            ct_fp8(
+                "channel",
+                json!({"num_bits": 8, "type": "float", "strategy": "token",
+                                     "dynamic": true}),
+            ),
+        ),
+        (
+            "awq group 32",
+            json!({"quant_method": "awq", "bits": 4, "group_size": 32, "zero_point": true,
+                   "version": "gemm"}),
+        ),
+        (
+            "gptq group 32",
+            json!({"quant_method": "gptq", "bits": 4, "group_size": 32, "desc_act": false,
+                   "sym": true}),
+        ),
+        (
+            "ct_mxfp4",
+            json!({"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+                   "ignore": ["lm_head"],
+                   "config_groups": {"group_0": {"targets": ["Linear"],
+                       "weights": {"num_bits": 4, "type": "float", "strategy": "group",
+                                   "group_size": 32}}}}),
+        ),
+    ];
+    for (i, (name, q)) in cases.into_iter().enumerate() {
+        let fixture = write_tiny_quantized(&tmp.path().join(i.to_string()), SEED, &q, 128, 128);
+        let spec = &fixture.quantized;
+        let act_quant = spec.config.weight_format.get().activation()
+            != turbine_model::weights::ActivationQuant::None;
+        let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let mut one = cpu_model(spec, &host, 64);
+        let layout = spec.config.kv_layout(BLOCK_TOKENS);
+        let storage = pool(&host, &layout, 4);
+        let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+        for world in [1u32, 2] {
+            let ranks = tp_group(spec, world, |rank| {
+                let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank), 1 << 30);
+                (mem, cpu_reference_provider())
+            });
+            let what = format!("{name} tp {world}");
+            let bound = match (world, act_quant) {
+                (1, _) => TpBound::Bitwise,
+                (_, false) => golden,
+                // Quantized activations: each all-reduce's BF16 rounding can flip an FP8 code
+                // of the next layer's input, which moves the far tail (logprob < −2) by more
+                // than the golden tail bound; greedy tokens and likely candidates hold.
+                (_, true) => TpBound::Golden(GoldenLogprobBounds {
+                    tail: f64::INFINITY,
+                    ..GoldenLogprobBounds::llama()
+                }),
+            };
+            let worst = check_tp_against_one_device(&what, &ranks, &want, bound);
+            println!("tp2_quantized_matches_tp1_on_host {what}: worst / golden bound {worst:.3}");
+        }
+    }
+
+    // Block scales: at tp 2 the gate/up rows of a rank (64) cut the 128-row blocks.
+    let block = ct_fp8("block", json!(null));
+    let mut block = block;
+    block["config_groups"]["group_0"]["weights"]["block_structure"] = json!([128, 128]);
+    let fixture = write_tiny_quantized(&tmp.path().join("block"), SEED, &block, 128, 128);
+    let cfg = &fixture.quantized.config;
+    let index = SafetensorsIndex::open(&fixture.quantized.dir).expect("index");
+    let slots = tp::weight_slots(cfg, tp::ShardSpec { rank: 0, world: 2 }).expect("slots");
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let err = WeightLoader::load_format(cfg.weight_format.get(), &index, &slots, &host, 1 << 20)
+        .expect_err("a split through a scale block")
+        .to_string();
+    assert!(err.contains("quant_shard_misaligned"), "{err}");
+    assert!(err.contains("mlp."), "names the layer: {err}");
+
+    // A quantized mixture of experts is Phase 7's.
+    let dir = tmp.path().join("olmoe");
+    write_tiny_olmoe(&dir, SEED);
+    let format = turbine_model::weights::detect(
+        &json!({ "quantization_config": ct_fp8("channel", json!(null)) }),
+    )
+    .expect("ct_fp8");
+    assert!(format.write_tiny(&dir, None).expect("write"));
+    let olmoe = turbine_model::config::load_model_config(&dir).expect("config");
+    let index = SafetensorsIndex::open(&dir).expect("index");
+    let weights = WeightLoader::load_format(
+        olmoe.weight_format.get(),
+        &index,
+        &olmoe.family.0.weight_slots(&olmoe),
+        &host,
+        MAX_STAGING_BYTES,
+    )
+    .expect("the loader reads quantized experts");
+    let reqs = executor::requirements(&olmoe, BLOCK_TOKENS, ExecutorOptions::default());
+    let provider = cpu_reference_provider();
+    let order = [provider.id()];
+    let card = provider.card_profile();
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let registry =
+        KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card).expect("registry");
+    let err = build_executor(
+        &olmoe,
+        weights,
+        Arc::new(registry),
+        Arc::clone(&host),
+        BLOCK_TOKENS,
+        64,
+        MAX_SEQS,
+        ExecutorOptions::default(),
+    )
+    .err()
+    .expect("a quantized MoE is refused")
+    .to_string();
+    assert!(err.contains("quant_moe_phase7"), "{err}");
 }
 
 /// Lab only: the tensor-parallel path on the HIP provider without RCCL — the head_dim-128 tiny

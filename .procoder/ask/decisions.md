@@ -1628,3 +1628,10 @@ Total 41,185,550,352 bytes. The 8B BF16 download waited while free disk was ≈ 
 3. Ignore entries written as globs (Quark `exclude`, OpenAI `modules_to_not_convert`) match with `*` as any text from the start of the module name.
 4. `quant_method: modelopt` and compressed-tensors `nvfp4-pack-quantized` are refused naming `phase-2b-nvidia` before any format is tried.
 
+**Quantized layers under tensor parallelism (6a Task 21, lead), provisional, pending user review:**
+
+1. With quantized activations (static per-tensor, per-token or per-group FP8, MXFP4 emulation) the host TP test holds greedy tokens and the likely candidates (logprob > −2) to the golden bounds but not the far tail: each all-reduce's BF16 rounding can flip an FP8 code of the next layer's input (seen: a −25 logprob candidate moved 0.79 at tp 2 with static FP8). Weight-only formats keep the full golden bounds (worst 0.34–0.41 of them). The lab gate against each slug's reference (`--batched-bounds`) stays the real bound. Alternative: a looser tail bound, or quantizing activations on the full rows before the split.
+2. Per-token dynamic activation scales are computed per rank on its row-parallel input slice (as vLLM does), not over the full row.
+3. Pipeline-parallel stages with quantized weights are refused (`quant_pipeline_unsupported`) until tested; the spec's S-12 names tensor parallelism only.
+4. The test is model-level (`tiny_model tp2_quantized_matches_tp1_on_host`, host collective) instead of the plan's server-level `tiny_server`; the lab two-GPU leg stays for when the HIP kernels land (Tasks 14, 18, 20).
+

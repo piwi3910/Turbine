@@ -234,6 +234,9 @@ impl WeightLoader {
         mem: &Arc<dyn DeviceMemory>,
         staging_bytes: usize,
     ) -> Result<LoadedWeights, ModelError> {
+        for base in slots.iter().filter(|s| s.source.is_some()) {
+            format.check_shard(base)?;
+        }
         let slots: Vec<WeightSlot> = slots.iter().flat_map(|s| format.slots(s)).collect();
         let whole: Vec<WeightSlot> = whole.iter().flat_map(|s| format.slots(s)).collect();
         let (slots, whole) = (slots.as_slice(), whole.as_slice());
@@ -244,13 +247,6 @@ impl WeightLoader {
                 .ok_or_else(|| ModelError::MissingTensor(slot.name.clone()))?;
             format.check_tensor(entry)?;
             if format.repacks(slot) {
-                if slot.source.is_some() {
-                    return Err(ModelError::Safetensors {
-                        file: entry.file.clone(),
-                        tensor: entry.name.clone(),
-                        rule: "a repacked tensor cannot be sharded".to_string(),
-                    });
-                }
                 planned.push((slot, entry));
                 continue;
             }
@@ -371,7 +367,26 @@ impl WeightLoader {
                 let mut raw = vec![0u8; entry.byte_len() as usize];
                 file.read_exact_at(&mut raw, entry.range.start)
                     .map_err(|e| io_err(&entry.file, e))?;
-                let bytes = format.repack(slot, entry, raw)?;
+                // A sharded slot: the whole tensor is repacked into the loaded layout (the
+                // source's shape), then the rank's part is taken from it.
+                let bytes = match &slot.source {
+                    None => format.repack(slot, entry, raw)?,
+                    Some(src) => {
+                        let whole = WeightSlot {
+                            shape: src.shape.clone(),
+                            source: None,
+                            ..slot.clone()
+                        };
+                        let all = format.repack(&whole, entry, raw)?;
+                        let mut part = take_part(&all, src, dtype.size_bytes());
+                        // The last vocabulary shard's padding rows are zeros.
+                        let want = slot.shape.iter().product::<usize>() * dtype.size_bytes();
+                        if src.axis == 0 && part.len() < want {
+                            part.resize(want, 0);
+                        }
+                        part
+                    }
+                };
                 let want = slot.shape.iter().product::<usize>() * dtype.size_bytes();
                 if bytes.len() != want {
                     return Err(ModelError::Safetensors {
@@ -428,6 +443,20 @@ impl WeightLoader {
             ignored,
             elsewhere,
         })
+    }
+}
+
+/// The part `src` of a whole row-major tensor `all` of `src.shape` (elements of `es` bytes):
+/// rows `start..start + len` along axis 0, or that column block of every row along axis 1.
+fn take_part(all: &[u8], src: &SlotSource, es: usize) -> Vec<u8> {
+    let row: usize = src.shape[1..].iter().product::<usize>() * es;
+    match src.axis {
+        0 => all[src.start * row..(src.start + src.len) * row].to_vec(),
+        _ => all
+            .chunks_exact(row)
+            .flat_map(|r| &r[src.start * es..(src.start + src.len) * es])
+            .copied()
+            .collect(),
     }
 }
 

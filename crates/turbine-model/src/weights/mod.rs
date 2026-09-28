@@ -174,6 +174,13 @@ pub trait WeightFormat: Module {
     fn slot_dtype(&self, _slot: &WeightSlot) -> DType {
         Bf16::DTYPE
     }
+    /// Refuses a tensor-parallel shard of family slot `base` (its `source` set) that cuts a
+    /// quantized layer's groups or blocks (`quant_shard_misaligned` naming the layer). The
+    /// loader calls it before [`WeightFormat::slots`]; unquantized slots always split.
+    fn check_shard(&self, base: &WeightSlot) -> Result<(), ModelError> {
+        let _ = base;
+        Ok(())
+    }
     /// Whether the loader passes `slot`'s checkpoint bytes through [`WeightFormat::repack`]
     /// (read whole, rewritten, then uploaded) instead of copying them as they are. The shape of a
     /// repacked slot is the loaded layout; its checkpoint tensor may differ in shape and dtype.

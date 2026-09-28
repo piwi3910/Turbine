@@ -595,9 +595,11 @@ pub fn rows(buf: &Tensor, t: usize) -> TensorView<'_> {
 /// Refuses what the decoder cannot run of a quantized weight format (Phase 6a): layers of
 /// different quantized schemes, a stacked parameter (fused Q/K/V, gate/up) whose parts differ
 /// in scheme, block-scaled parts not on block boundaries, a quantized LM head, quantized
-/// experts (`quant_moe_phase7`: mixture-of-experts layers are Phase 7's) and tensor, expert or
-/// pipeline parallelism (Phase 6a Task 21).
-fn check_weight_format(cfg: &ModelArchConfig, parallel: bool) -> Result<(), ModelError> {
+/// experts (`quant_moe_phase7`: mixture-of-experts layers are Phase 7's) and pipeline
+/// parallelism (`pipeline` set: not yet proven with quantized stages). Tensor parallelism is
+/// served (Phase 6a S-12): the loader refuses a shard that cuts a group or block
+/// (`quant_shard_misaligned`).
+fn check_weight_format(cfg: &ModelArchConfig, pipeline: bool) -> Result<(), ModelError> {
     use crate::weights::QuantScheme;
     let format = cfg.weight_format.get();
     let (quant, _) = LinearQuant::of(cfg).map_err(|e| {
@@ -615,10 +617,9 @@ fn check_weight_format(cfg: &ModelArchConfig, parallel: bool) -> Result<(), Mode
             "quant_moe_phase7: quantized mixture-of-experts models arrive with Phase 7".into(),
         );
     }
-    if parallel {
+    if pipeline {
         return refuse(
-            "quantized weights under tensor, expert or pipeline parallelism arrive with Phase 6a Task 21"
-                .into(),
+            "quant_pipeline_unsupported: quantized pipeline stages are not served".into(),
         );
     }
     let schemes: std::collections::HashMap<String, QuantScheme> = cfg
@@ -1111,7 +1112,7 @@ impl DecoderExecutor {
                  {max_seqs} must be positive"
             )));
         }
-        check_weight_format(cfg, tp.is_some() || ep.is_some() || pp.is_some())?;
+        check_weight_format(cfg, pp.is_some())?;
         let d = match &ep {
             Some(e) => crate::ep::rank_dims(
                 cfg,
