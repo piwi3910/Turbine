@@ -904,3 +904,23 @@ Asked 2026-09-28 (Phase 5 port): the static-mode rank bootstrap is plain TCP (sp
 - B) Registries now: a small `Transport` trait for the rank link with a static registry holding `tcp`, and a DP router policy registry holding `prefix_affinity` and `least_loaded`, each with a conformance suite and a `docs/extending/` page (the configuration keeps the same names)
 
 **Answer (2026-09-28, user): B.** The rank link goes behind a `Transport` trait with a static registry (one entry, `tcp`; the deferred multi-node phase adds more), and the DP router policy becomes a registry (`prefix_affinity`, `least_loaded`); both with conformance tests and a `docs/extending/` page, same pattern as `collective_backend`. `parallel.router` keeps its names.
+
+## Parallelism modes: pipeline and expert parallelism in Phase 5; sharded data parallelism
+
+Asked 2026-09-28. The user listed five parallelism modes — data parallel (DP), sharded data parallel (ZeRO / FSDP), pipeline parallel (PP), tensor parallel (TP) and MoE expert parallel (EP) — and said "we are doing all 5".
+
+Q1, where PP and EP go:
+
+- A) A new Phase 5b after Phase 5 (recommended)
+- B) Fold into Phase 5
+- C) After quantization
+
+**Answer (2026-09-28, user): B.** PP and EP join Phase 5 as new tasks after T19 (T17 unchanged), single node (novanas, both R9700s); their single-node designs come from the deferred `phase-10-advanced-distribution` spec (formerly Phase 7), whose multi-node, RDMA and disaggregation parts stay deferred.
+
+Q2, what sharded data parallelism means for inference:
+
+- A) ZeRO-Inference-style weight streaming from the L1/L2 tiers (recommended)
+- B) FSDP-style per-layer all-gather of the weights
+- C) Both
+
+**Answer (2026-09-28, user): skip it.** No ZeRO/FSDP or weight-streaming mode.
