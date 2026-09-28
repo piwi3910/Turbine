@@ -262,6 +262,34 @@ fn wait_until_ready(child: &mut Child, addr: SocketAddr) {
     panic!("turbine-server never became ready on {addr}");
 }
 
+/// P5 S-4: the parallel plan is checked after device discovery and before the kernel provider
+/// or the listener: tensor parallelism of 2 with no second GPU (or none at all) is exit 2 naming
+/// `parallel.tensor_parallel_size`, and the port stays free. So is TP on the cpu backend.
+#[test]
+fn impossible_plan_exits_2_before_bind() {
+    let port = free_port();
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let (_model, yaml) = tiny_model_yaml(addr);
+    for (tag, yaml) in [
+        (
+            "plan-hip",
+            yaml.replace("  backend: cpu\n", "  backend: hip\n")
+                + "parallel:\n  tensor_parallel_size: 2\n",
+        ),
+        ("plan-cpu", yaml + "parallel:\n  tensor_parallel_size: 2\n"),
+    ] {
+        let cfg = TempConfig::new(tag, &yaml);
+        let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(30));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{tag}: stderr: {stderr}");
+        assert!(
+            stderr.contains("turbine-server: invalid parallel plan: parallel.tensor_parallel_size"),
+            "{tag}: stderr: {stderr}"
+        );
+        TcpListener::bind(addr).expect("the configured port must still be free");
+    }
+}
+
 #[test]
 fn port_in_use_exits_1() {
     let holder = TcpListener::bind("127.0.0.1:0").unwrap();

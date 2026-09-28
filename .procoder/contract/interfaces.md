@@ -1807,13 +1807,16 @@ NCCL-API symbols bound (P5, exactly 13): `ncclGetVersion`, `ncclGetUniqueId`, `n
 ### 15.2 Plan, ranks, TP, DP router (P5)
 
 ```rust
-pub struct ParallelPlan { pub tp: u32, pub dp: u32, pub backend: CollectiveBackendKind, pub mode: RankMode, pub vendor: Vendor,
+pub struct ParallelPlan { pub tp: u32, pub dp: u32, pub backend: &'static str /* registered collective_backend */, pub mode: RankMode, pub vendor: Option<Vendor> /* None: cpu backend */,
                           pub excluded_devices: Vec<DeviceId>, pub groups: Vec<ReplicaGroup>, pub reasons: Vec<PlanReason> }   // P5 §Data
 pub struct ReplicaGroup { pub replica: ReplicaId, pub ranks: Vec<RankSlot> }
 pub struct RankSlot { pub rank: u32, pub device: DeviceId, pub host: String }
 pub enum PlanReason { FitsSingleDevice, TpRequiredForCapacity, GroupedByLink(PathClass), VendorHomogeneous, VendorExcluded(Vendor),
-                      ExplicitDevices, DeviceSharingEnabled }   // Display: "fits_single_device", "grouped_by_link:<path>", "vendor_excluded:<vendor>", …
+                      ExplicitDevices, DeviceSharingEnabled, ExecutionDevice }   // Display: "fits_single_device", "grouped_by_link:<path>", "vendor_excluded:<vendor>", …, "execution_device"
 pub fn plan(inv: &DeviceInventory, topo: &TopologyGraph, cfg: &ParallelConfig, model: &ModelShape, device_budget: &dyn Fn(DeviceId) -> u64) -> Result<ParallelPlan, PlanError>;
+// (P5 T11, contract addition) every replica on `execution.device`, inventory not consulted: the cpu backend (vendor None)
+// and the single-GPU default (tp 1, dp 1, devices auto); tp > 1 and rccl/nccl without a matching vendor are PlanErrors.
+pub fn plan_execution_device(cfg: &ParallelConfig, device: DeviceId, vendor: Option<Vendor>, host: &str) -> Result<ParallelPlan, PlanError>;
 #[derive(Debug, thiserror::Error)] #[error("{key}: {reason}")] pub struct PlanError { pub key: String, pub reason: String }   // exit 2 before bind; "vendor-mixed plan"
 
 // rank runtime (local | static)

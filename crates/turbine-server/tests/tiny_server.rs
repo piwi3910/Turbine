@@ -698,6 +698,25 @@ fn completions_stream_and_non_stream() {
     assert_eq!(status["model"]["architecture"], "LlamaForCausalLM");
     assert!(status["model"]["weight_bytes"].as_u64().unwrap() > 0);
     assert!(status["model"]["load_seconds"].as_f64().is_some());
+    // P5 S-4: the cpu backend's plan — one replica on execution.device, no communicator.
+    let parallel = &status["parallel"];
+    assert_eq!(parallel["tp"], 1, "{parallel}");
+    assert_eq!(parallel["dp"], 1, "{parallel}");
+    assert_eq!(parallel["backend"], "host", "{parallel}");
+    assert_eq!(parallel["mode"], "local", "{parallel}");
+    assert_eq!(parallel["groups"][0]["replica"], 0, "{parallel}");
+    assert_eq!(parallel["groups"][0]["ranks"][0]["device"], 0, "{parallel}");
+    assert!(
+        parallel["groups"][0]["ranks"][0]["host"].is_string(),
+        "{parallel}"
+    );
+    assert_eq!(parallel["plan_reasons"], json!(["execution_device"]));
+    assert!(
+        server
+            .metrics()
+            .contains(r#"turbine_parallel_info{tp="1",dp="1",backend="host",mode="local"} 1"#),
+        "turbine_parallel_info"
+    );
 
     // P5 S-1: the node graph captured at startup (whatever this host's sysfs holds; discovery
     // never fails), the same document with `scope=node`, and no cluster scope before Phase 6.

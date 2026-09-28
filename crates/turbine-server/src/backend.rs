@@ -98,6 +98,9 @@ struct StatusDocument<'a> {
     /// P3 S-13: the pressure state and the circuit state (GREEN / HEALTHY before the load).
     pressure_state: PressureState,
     circuit_state: CircuitState,
+    /// The parallel plan (P5 S-4): tp, dp, backend, mode, groups and the plan's reason codes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel: Option<&'a Value>,
 }
 
 /// One entry of `kernels` in `GET /turbine/v1/status`: a `KernelRegistry` selection.
@@ -194,6 +197,8 @@ pub struct ModelBackend {
     support: Option<SupportRowView>,
     /// The node topology graph captured at startup (`GET /turbine/v1/topology`, P5 S-1).
     topology: Option<Value>,
+    /// The `parallel` object of `GET /turbine/v1/status` (P5 S-4).
+    parallel: Option<Value>,
 }
 
 impl ModelBackend {
@@ -250,7 +255,14 @@ impl ModelBackend {
                 .collect(),
             support: None,
             topology: None,
+            parallel: None,
         }
+    }
+
+    /// Reports `parallel` (the plan computed before bind) in the status document.
+    pub fn with_parallel(mut self, parallel: Value) -> ModelBackend {
+        self.parallel = Some(parallel);
+        self
     }
 
     /// Serves `graph` at `GET /turbine/v1/topology` (captured once at startup).
@@ -753,6 +765,7 @@ impl Diagnostics for ModelBackend {
             support: self.support.as_ref(),
             pressure_state: loaded.map_or(PressureState::Green, |l| l.controller.state()),
             circuit_state: loaded.map_or(CircuitState::Healthy, |l| l.controller.circuit()),
+            parallel: self.parallel.as_ref(),
         })
         .unwrap_or(Value::Null)
     }

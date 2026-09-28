@@ -212,7 +212,7 @@ Interfaces:
 
 ## Task 11: Plan before bind in `turbine-server`
 
-Files: `crates/turbine-server/src/startup.rs` (startup step 3: `ParallelConfig::validate_devices` + `plan`, exit 2 before bind; `turbine_parallel_info` gauge; `/turbine/v1/status` `parallel` object), `crates/turbine-server/src/exit.rs` (map `PlanError` → exit 2), `crates/turbine-server/tests/server_cli.rs` (test)
+Files: `crates/turbine-server/src/startup.rs` (startup step 3: `ParallelConfig::validate_devices` + `plan`, exit 2 before bind; `turbine_parallel_info` gauge; `/turbine/v1/status` `parallel` object), `crates/turbine-server/src/parallel.rs` (the step itself: cpu backend and single-GPU default via `plan_execution_device`, otherwise `validate_devices` + `plan` with the model shape read from `config.json`; a plan with tp > 1 or dp > 1 is exit 2 until Tasks 17/18 wire the execution; the engine device is rank 0 of replica 0), `crates/turbine-distributed/src/plan.rs` (`plan_execution_device`, `PlanReason::ExecutionDevice`, `ParallelPlan.vendor: Option<Vendor>`), `crates/turbine-server/src/backend.rs` (status `parallel`), `crates/turbine-server/tests/server_cli.rs` (test); `exit.rs` needs no change (`ExitCode::Config` is 2)
 Interfaces:
 
 - consumes `turbine_distributed::plan::{plan, ParallelPlan, PlanError}`; status `"parallel": {"tp","dp","backend","mode","groups":[{"replica","ranks":[{"rank","device","host"}]}],"plan_reasons"}`

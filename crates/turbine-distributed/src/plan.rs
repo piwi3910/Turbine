@@ -28,7 +28,8 @@ pub struct ParallelPlan {
     /// The registered collective backend (`collective_backend` registry).
     pub backend: &'static str,
     pub mode: RankMode,
-    pub vendor: Vendor,
+    /// The plan's one vendor; `None` for the `cpu` reference backend, which has no GPU.
+    pub vendor: Option<Vendor>,
     pub excluded_devices: Vec<DeviceId>,
     pub groups: Vec<ReplicaGroup>,
     pub reasons: Vec<PlanReason>,
@@ -59,6 +60,9 @@ pub enum PlanReason {
     VendorExcluded(Vendor),
     ExplicitDevices,
     DeviceSharingEnabled,
+    /// One engine per replica on `execution.device` (the single-GPU default, or the `cpu`
+    /// reference backend): the inventory is not consulted.
+    ExecutionDevice,
 }
 
 impl fmt::Display for PlanReason {
@@ -71,6 +75,7 @@ impl fmt::Display for PlanReason {
             PlanReason::VendorExcluded(v) => write!(f, "vendor_excluded:{}", v.as_str()),
             PlanReason::ExplicitDevices => f.write_str("explicit_devices"),
             PlanReason::DeviceSharingEnabled => f.write_str("device_sharing_enabled"),
+            PlanReason::ExecutionDevice => f.write_str("execution_device"),
         }
     }
 }
@@ -517,8 +522,93 @@ pub fn plan(
         dp,
         backend,
         mode: cfg.ranks.mode,
-        vendor,
+        vendor: Some(vendor),
         excluded_devices: excluded,
+        groups,
+        reasons,
+    })
+}
+
+/// The plan of a server whose replicas all run on `execution.device`, without consulting the
+/// inventory: the `cpu` reference backend (`vendor` `None`; every replica shares the host) and
+/// the single-GPU default (tp 1, dp 1, `devices: auto`), whose device and vendor the kernel
+/// provider checks when it loads (exit 1). Tensor parallelism needs GPUs, and so do the `rccl`
+/// and `nccl` backends; `auto` sizes resolve to 1.
+pub fn plan_execution_device(
+    cfg: &ParallelConfig,
+    device: DeviceId,
+    vendor: Option<Vendor>,
+    host: &str,
+) -> Result<ParallelPlan, PlanError> {
+    let tp = cfg.tensor_parallel_size.fixed().unwrap_or(1);
+    if tp != 1 {
+        return Err(err(
+            TP_KEY,
+            format!("{tp} ranks need {tp} GPUs; execution.backend cpu runs tensor_parallel_size 1"),
+        ));
+    }
+    let dp = cfg.data_parallel_size.fixed().unwrap_or(1);
+    let mut reasons = vec![PlanReason::ExecutionDevice];
+    if dp > 1 {
+        if !cfg.allow_device_sharing {
+            return Err(err(
+                DP_KEY,
+                format!(
+                    "{dp} replicas would share execution.device {} (set \
+                     parallel.allow_device_sharing to share it)",
+                    device.0
+                ),
+            ));
+        }
+        reasons.push(PlanReason::DeviceSharingEnabled);
+    }
+    let name = cfg.collective_backend.as_str();
+    let backend = match vendor {
+        Some(v) => choose_backend(name, v, 1)?,
+        // The cpu reference backend has no device memory: only a host-memory backend.
+        None => match crate::collective::registry().get(name) {
+            _ if name == "auto" => crate::collective::HostBackend.name(),
+            Some(b) if b.vendors().is_empty() => b.name(),
+            _ => {
+                return Err(err(
+                    BACKEND_KEY,
+                    format!(
+                        "`{name}` cannot drive the cpu reference backend (execution.device {})",
+                        device.0
+                    ),
+                ));
+            }
+        },
+    };
+    let groups = (0..dp)
+        .map(|r| ReplicaGroup {
+            replica: ReplicaId(r),
+            ranks: vec![RankSlot {
+                rank: 0,
+                device,
+                host: host.to_string(),
+            }],
+        })
+        .collect();
+    for r in &reasons {
+        tracing::info!(event = "parallel_plan_decision", reason = %r, "parallel plan decision");
+    }
+    tracing::info!(
+        event = "parallel_plan",
+        tp,
+        dp,
+        backend,
+        vendor = vendor.map_or("none", |v| v.as_str()),
+        device = device.0,
+        "parallel plan"
+    );
+    Ok(ParallelPlan {
+        tp,
+        dp,
+        backend,
+        mode: cfg.ranks.mode,
+        vendor,
+        excluded_devices: Vec::new(),
         groups,
         reasons,
     })
@@ -659,7 +749,7 @@ mod tests {
         .expect("novanas tp 2");
         assert_eq!((p.tp, p.dp), (2, 1));
         assert_eq!(p.backend, "rccl");
-        assert_eq!(p.vendor, Vendor::Amd);
+        assert_eq!(p.vendor, Some(Vendor::Amd));
         assert_eq!(devices_of(&p), vec![vec![0, 1]]);
         assert_eq!(p.groups[0].replica, ReplicaId(0));
         assert_eq!(p.groups[0].ranks[1].rank, 1);
@@ -731,7 +821,7 @@ mod tests {
             &budget_32g,
         )
         .expect("dp over the AMD devices");
-        assert_eq!((p.tp, p.dp, p.vendor), (1, 3, Vendor::Amd));
+        assert_eq!((p.tp, p.dp, p.vendor), (1, 3, Some(Vendor::Amd)));
         assert_eq!(p.excluded_devices, vec![DeviceId(0)]);
         assert_eq!(devices_of(&p), vec![vec![1], vec![2], vec![3]]);
         assert_eq!(p.backend, "host", "tp 1 needs no communicator");
@@ -880,5 +970,64 @@ mod tests {
             let e = choose_backend(name, vendor, tp).expect_err(name);
             assert_eq!(e.key, "parallel.collective_backend", "{name}: {e}");
         }
+    }
+
+    /// The server's single-device paths: the `cpu` reference backend (no vendor, every replica
+    /// on `execution.device`) and the default GPU plan (tp 1, dp 1, `devices: auto` →
+    /// `execution.device`), which never consult the inventory.
+    #[test]
+    fn execution_device_plans() {
+        use turbine_core::config::ModuleName;
+        let default = ParallelConfig::default();
+        let p = plan_execution_device(&default, DeviceId(1), Some(Vendor::Amd), "h")
+            .expect("default GPU plan");
+        assert_eq!((p.tp, p.dp), (1, 1));
+        assert_eq!(p.vendor, Some(Vendor::Amd));
+        assert_eq!(p.backend, "host");
+        assert_eq!(devices_of(&p), vec![vec![1]]);
+        assert_eq!(p.groups[0].ranks[0].host, "h");
+        assert_eq!(codes(&p), vec!["execution_device"]);
+
+        // cpu: dp 2 on the one host "device" only with sharing.
+        let dp2 = cfg(SizeOrAuto::Size(1), SizeOrAuto::Size(2));
+        let e = plan_execution_device(&dp2, DeviceId(0), None, "h").expect_err("no sharing");
+        assert_eq!(e.key, "parallel.data_parallel_size");
+        assert!(e.reason.contains("allow_device_sharing"), "{e}");
+        let mut shared = dp2.clone();
+        shared.allow_device_sharing = true;
+        let p = plan_execution_device(&shared, DeviceId(0), None, "h").expect("shared");
+        assert_eq!(p.vendor, None);
+        assert_eq!(devices_of(&p), vec![vec![0], vec![0]]);
+        assert_eq!(p.groups[1].replica, ReplicaId(1));
+        assert_eq!(
+            codes(&p),
+            vec!["execution_device", "device_sharing_enabled"]
+        );
+        let mut auto = shared.clone();
+        auto.data_parallel_size = SizeOrAuto::Auto;
+        auto.tensor_parallel_size = SizeOrAuto::Auto;
+        let p = plan_execution_device(&auto, DeviceId(0), None, "h").expect("auto");
+        assert_eq!((p.tp, p.dp), (1, 1));
+
+        // Tensor parallelism and GPU communicators need GPUs.
+        let tp2 = cfg(SizeOrAuto::Size(2), SizeOrAuto::Size(1));
+        let e = plan_execution_device(&tp2, DeviceId(0), None, "h").expect_err("cpu tp 2");
+        assert_eq!(e.key, "parallel.tensor_parallel_size");
+        let rccl = ParallelConfig {
+            collective_backend: ModuleName::new("rccl").unwrap(),
+            ..ParallelConfig::default()
+        };
+        let e = plan_execution_device(&rccl, DeviceId(0), None, "h").expect_err("cpu rccl");
+        assert_eq!(e.key, "parallel.collective_backend");
+        let p = plan_execution_device(&rccl, DeviceId(0), Some(Vendor::Amd), "h")
+            .expect("rccl kept for an AMD device");
+        assert_eq!(p.backend, "rccl");
+        let nccl = ParallelConfig {
+            collective_backend: ModuleName::new("nccl").unwrap(),
+            ..ParallelConfig::default()
+        };
+        let e = plan_execution_device(&nccl, DeviceId(0), Some(Vendor::Amd), "h")
+            .expect_err("nccl on AMD");
+        assert_eq!(e.key, "parallel.collective_backend");
     }
 }

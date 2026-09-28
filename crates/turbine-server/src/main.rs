@@ -10,6 +10,7 @@ mod kv_orchestrator;
 mod metrics;
 mod model;
 mod modules;
+mod parallel;
 mod reliability;
 mod startup;
 mod support_matrix;

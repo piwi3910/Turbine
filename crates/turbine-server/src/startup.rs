@@ -2,7 +2,8 @@
 //! support-matrix row with the device arch unknown (exit 2 when unsupported; also under
 //! `--check-config`) → tracing → device discovery → support-matrix row with the device arch
 //! (exit 2 when unsupported; `event="support_matrix"`, WARN when experimental) → the node
-//! topology graph (P5 S-1, never fails; `GET /turbine/v1/topology`) → the P4 `kv`
+//! topology graph (P5 S-1, never fails; `GET /turbine/v1/topology`) → the parallel plan (P5 S-4,
+//! `crate::parallel`; exit 2, or exit 1 when the model config it needs is unreadable) → the P4 `kv`
 //! host rules (`kv.cpu.max_bytes` against MemTotal minus `reliability.memory.host_reserve_bytes`
 //! exit 2, `kv.nvme.max_bytes` against free disk exit 1) → kernel provider → model config,
 //! tokenizer, template → kernel registry → pre-load memory budget (P3 S-2: the KV pool, the
@@ -57,6 +58,7 @@ use crate::kv_orchestrator::{self, kv_format};
 use crate::metrics::ServerMetrics;
 use crate::model::{self, PreparedModel};
 use crate::modules::known_module_names;
+use crate::parallel::{self, PlanFailure};
 use crate::{support_matrix, support_startup};
 
 /// How long `/ready` reports the failure before the process exits 1 (P1: at most 1 s).
@@ -94,7 +96,7 @@ pub fn run(cli: Cli) -> ExitCode {
     };
     // Module names are checked against the registries with the rest of the configuration:
     // exit 2 before device discovery and before binding, also under --check-config.
-    let config = match config::load(config_path, &cli.set)
+    let mut config = match config::load(config_path, &cli.set)
         .and_then(|c| c.validate_modules(&known_module_names()).map(|()| c))
     {
         Ok(c) => c,
@@ -147,6 +149,35 @@ pub fn run(cli: Cli) -> ExitCode {
     // P5 S-1: the node-local topology graph, right after discovery (never fails).
     let topology = capture_topology(&DiscoveryOptions::from_config(&config.devices), &inventory);
 
+    // P5 S-4: the parallel plan before the kernel provider and the listener (exit 2, or exit 1
+    // when the model config it needs is unreadable).
+    let plan = match parallel::plan_for(&config, &inventory, &topology).and_then(|p| {
+        parallel::check_executable(&p)?;
+        Ok(p)
+    }) {
+        Ok(p) => p,
+        Err(PlanFailure::Config(message)) => {
+            tracing::error!(event = "parallel_plan_failed", error = %message, "invalid parallel plan");
+            eprintln!("turbine-server: invalid parallel plan: {message}");
+            return ExitCode::Config;
+        }
+        Err(PlanFailure::Startup(message)) => {
+            tracing::error!(error = %message, "parallel planning failed");
+            eprintln!("turbine-server: {message}");
+            return ExitCode::Startup;
+        }
+    };
+    let device = parallel::engine_device(&plan);
+    if device != config.execution.device {
+        tracing::info!(
+            event = "execution_device_from_plan",
+            configured = config.execution.device.0,
+            device = device.0,
+            "the parallel plan places the engine on another device than execution.device"
+        );
+        config.execution.device = device;
+    }
+
     // P4 host rules (contract §16.3): a `kv.nvme.*` violation is a runtime failure (exit 1),
     // any other an invalid configuration (exit 2); both before anything is bound.
     if let Err(e) = config.validate_host(&host::facts(&config.kv)) {
@@ -162,6 +193,7 @@ pub fn run(cli: Cli) -> ExitCode {
     let metrics = MetricsRegistry::new();
     DeviceMetrics::register(&metrics).record(&inventory);
     SupportMetrics::register(&metrics).set(&support.status);
+    parallel::register_info(&metrics, &plan);
     let prepared = match model::prepare(&config, &inventory, &metrics) {
         Ok(p) => p,
         Err(e) => {
@@ -210,7 +242,10 @@ pub fn run(cli: Cli) -> ExitCode {
     let code = runtime.block_on(serve(
         config,
         inventory,
-        topology,
+        ServeCluster {
+            topology,
+            parallel: parallel::status(&plan),
+        },
         metrics,
         prepared,
         support.view(),
@@ -229,6 +264,13 @@ fn refuse_support(error: &ConfigError) -> ExitCode {
     ExitCode::Config
 }
 
+/// The multi-GPU pieces computed before the listener binds (Phase 5): the node topology graph
+/// and the `parallel` status object of the plan.
+struct ServeCluster {
+    topology: TopologyGraph,
+    parallel: serde_json::Value,
+}
+
 /// The KV pieces built before the listener binds (Phase 4).
 struct ServeKv {
     metrics: KvMetrics,
@@ -238,7 +280,7 @@ struct ServeKv {
 async fn serve(
     config: Config,
     inventory: DeviceInventory,
-    topology: TopologyGraph,
+    cluster: ServeCluster,
     metrics: MetricsRegistry,
     prepared: PreparedModel,
     support: SupportRowView,
@@ -254,7 +296,8 @@ async fn serve(
     let backend = Arc::new(
         ModelBackend::new(&prepared, &inventory, &engine_metrics)
             .with_support(support)
-            .with_topology(&topology),
+            .with_topology(&cluster.topology)
+            .with_parallel(cluster.parallel),
     );
     let state = ApiState {
         inference: backend.clone(),
