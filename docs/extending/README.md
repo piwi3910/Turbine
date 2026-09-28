@@ -14,6 +14,8 @@ Every pluggable part of Turbine is one file (or directory) plus one entry in a s
 | Scheduling policy     | [scheduling-policy.md](scheduling-policy.md)         | `turbine_scheduler::policy` (`scheduling_policy`)                  | `scheduler.policy`                                  |
 | Eviction policy       | [eviction-policy.md](eviction-policy.md)             | `turbine_kv::policy` (`eviction_policy`)                           | `kv.policy`                                         |
 | Collective backend    | [collective-backend.md](collective-backend.md)       | `turbine_distributed::collective` (`collective_backend`)           | `parallel.collective_backend` (`auto` = by vendor)  |
+| Rank transport        | [rank-transport.md](rank-transport.md)               | `turbine_distributed::transport` (`rank_transport`)                | `parallel.ranks.transport`                          |
+| DP router policy      | [dp-router-policy.md](dp-router-policy.md)           | `turbine_distributed::router` (`dp_router_policy`)                 | `parallel.router`                                   |
 
 ## The registry convention
 
@@ -21,7 +23,7 @@ Every pluggable part of Turbine is one file (or directory) plus one entry in a s
 
 - A module implements `Module` (`fn name(&self) -> &'static str`) and its extension point's trait. Names match `^[a-z0-9_]{1,64}$` and are unique per registry.
 - A registry is a compiled-in `static Registry<dyn Trait>` (`Registry::new(point, &[&A, &B])`) returned by the owning module's `registry()`. Lookup is by name (`get`, first registration wins), `iter` is registration order (which is meaningful for the logits-processor chain and weight-format detection), and `select(name, reason)` logs `event="module_selected"` with `point`, `name` and `reason`. Nothing is loaded at run time except kernel libraries.
-- Configuration names (`model.tool_call_parser`, `execution.backend`, `execution.card_profile`, `scheduler.policy`, `kv.policy`, `parallel.collective_backend`) are validated against the registries before any port is bound; an unknown name exits 2 naming the registered ones. `/turbine/v1/status` reports the chosen module per point under `modules`.
+- Configuration names (`model.tool_call_parser`, `execution.backend`, `execution.card_profile`, `scheduler.policy`, `kv.policy`, `parallel.collective_backend`, `parallel.ranks.transport`, `parallel.router`) are validated against the registries before any port is bound; an unknown name exits 2 naming the registered ones. `/turbine/v1/status` reports the chosen module per point under `modules`.
 - Each crate's `registry_conformance` tests run the point's suite over the real registry and pin the registered names, so a module registered without passing its suite fails `cargo test --workspace` (`conformance_rejects_broken_module` in `crates/turbine-model/tests/conformance.rs` proves the suites catch broken modules).
 
 ## Every page has
