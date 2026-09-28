@@ -1,8 +1,10 @@
-# phase-6-multi-node
+# phase-9-multi-node
 
-Status: complete
+Status: deferred
 
-Source: `turbine-spec.md` §19 Phase 6 (multi-node), with §10 (multi-GPU and multi-node), §11 (cluster-wide KV directory), §12 (failure model), §14 (observability), §16 (security and isolation), §17 (testing) and §21 (engineering rules). Sections of that document are cited as "TS §N". Decisions are recorded in `.procoder/ask/decisions.md` ("Answers log for phase 1–8 spec questions (2026-09-25)"); where they depart from TS this spec says "amends TS §N". This spec builds on phase-0-skeleton through phase-5-multi-gpu; phase-7-advanced-distribution builds on the worker registry, authenticated control channel, TCP transport and KV directory defined here.
+Numbering: written as Phase 6 (`phase-6-multi-node`) and renumbered on 2026-09-28; only spec file names in the text were updated, the phase numbers in the prose are as written. Within this document "Phase 6" means this spec (phase-9-multi-node), "Phase 7" means `phase-10-advanced-distribution`, and the "Phase 8" tracks (P8a/P8b/P8c) mean active phases 6–8 under `phase-6-8-expansion` (6 quantization, 7 model families, 8 speculative decoding). Deferred until the user lifts the multi-node / NVIDIA hold (decision "Roadmap reorganisation after Phase 5 (2026-09-28)" in `.procoder/ask/decisions.md`); re-specced against the tree of that day before implementation starts.
+
+Source: `turbine-spec.md` §19 Phase 6 (multi-node), with §10 (multi-GPU and multi-node), §11 (cluster-wide KV directory), §12 (failure model), §14 (observability), §16 (security and isolation), §17 (testing) and §21 (engineering rules). Sections of that document are cited as "TS §N". Decisions are recorded in `.procoder/ask/decisions.md` ("Answers log for phase 1–8 spec questions (2026-09-25)"); where they depart from TS this spec says "amends TS §N". This spec builds on phase-0-skeleton through phase-5-multi-gpu; phase-10-advanced-distribution (written as phase-7) builds on the worker registry, authenticated control channel, TCP transport and KV directory defined here.
 
 ## Problem
 

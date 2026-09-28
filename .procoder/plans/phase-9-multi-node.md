@@ -1,7 +1,9 @@
-# phase-6-multi-node — implementation plan
+# phase-9-multi-node — implementation plan
 
-Status: draft
-Spec: .procoder/specs/phase-6-multi-node.md
+Status: deferred
+Spec: .procoder/specs/phase-9-multi-node.md
+
+Numbering: written as the Phase 6 plan; renumbered on 2026-09-28 without changing its content. "Phase 6" / "phase-6" here means phase-9-multi-node, "Phase 7" means phase-10-advanced-distribution, and the Phase 8 tracks mean active phases 6–8 (`phase-6-8-expansion`). Deferred with its spec (decision "Roadmap reorganisation after Phase 5 (2026-09-28)" in `.procoder/ask/decisions.md`); the plan is rewritten from the re-specced spec when the hold is lifted.
 
 ## Goal
 

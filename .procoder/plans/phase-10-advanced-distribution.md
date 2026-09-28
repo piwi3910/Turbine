@@ -1,7 +1,9 @@
-# phase-7-advanced-distribution — implementation plan
+# phase-10-advanced-distribution — implementation plan
 
-Status: draft
-Spec: .procoder/specs/phase-7-advanced-distribution.md
+Status: deferred
+Spec: .procoder/specs/phase-10-advanced-distribution.md
+
+Numbering: written as the Phase 7 plan; renumbered on 2026-09-28 without changing its content. "Phase 7" / "phase-7" here (including the `.procoder/evidence/phase-7-*.md` evidence files) means phase-10-advanced-distribution, "Phase 6" / "phase-6 Task N" means phase-9-multi-node, and the Phase 8 tracks mean active phases 6–8 (`phase-6-8-expansion`). Deferred with its spec (decision "Roadmap reorganisation after Phase 5 (2026-09-28)" in `.procoder/ask/decisions.md`); the plan is rewritten from the re-specced spec when the hold is lifted.
 
 ## Goal
 

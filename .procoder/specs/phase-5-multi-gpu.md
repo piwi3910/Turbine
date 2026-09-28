@@ -10,14 +10,14 @@ After Phase 4 Turbine serves one model on one GPU: one scheduler, one paged KV p
 
 Amended 2026-09-28 (user decisions "Parallelism modes: pipeline and expert parallelism in Phase 5; sharded data parallelism" and "P5: small-message all-reduce latency on novanas — host-memory all-reduce?"): single-node pipeline parallelism (PP) and expert parallelism (EP) move into Phase 5 from the deferred advanced-distribution phase, as plan choices next to TP and DP, proven on the two R9700s as correctness vehicles (both models fit one card); sharded data parallelism (ZeRO/FSDP) is skipped. The novanas board allows no peer-to-peer at all and its two slots are asymmetric (GPU0 PCIe Gen5 x8, GPU1 Gen4 x8, a board limit), so every GPU↔GPU byte crosses host memory: Phase 5 adds a `hostmem` collective backend (pinned host memory mapped into every device, one-shot kernels) beside RCCL, measures each GPU's host link at startup, and lets the planner and the PP stage placement use those measured link costs.
 
-The lab's only multi-GPU host is novanas: 2× AMD Radeon AI PRO R9700 (gfx1201, 32 GB each, PCIe, peer-to-peer access reported **disabled** by `amd-smi topology`, measured 2026-09-25), ROCm 7.14.1 at `/opt/rocm/rocm`, jobs run as k3s Jobs. Because AMD execution already exists from Phase 1 (amends TS §19 Phase 8: AMD/ROCm moved to Phase 1), Phase 5 is built and proven on that pair with RCCL. The collective layer is one runtime-loaded binding to the NCCL C API, which RCCL implements; it serves RCCL now and NCCL on NVIDIA later without a second binding. NCCL hardware validation happens in phase-6-multi-node on the two DGX Sparks (amends TS §19 Phase 5 "NCCL abstraction": the abstraction is NCCL-API-shaped and proven first on RCCL). No plan may mix vendors until Phase 7.
+The lab's only multi-GPU host is novanas: 2× AMD Radeon AI PRO R9700 (gfx1201, 32 GB each, PCIe, peer-to-peer access reported **disabled** by `amd-smi topology`, measured 2026-09-25), ROCm 7.14.1 at `/opt/rocm/rocm`, jobs run as k3s Jobs. Because AMD execution already exists from Phase 1 (amends TS §19 Phase 8: AMD/ROCm moved to Phase 1), Phase 5 is built and proven on that pair with RCCL. The collective layer is one runtime-loaded binding to the NCCL C API, which RCCL implements; it serves RCCL now and NCCL on NVIDIA later without a second binding. NCCL hardware validation happens in phase-9-multi-node (written as phase-6-multi-node; deferred) on the two DGX Sparks (amends TS §19 Phase 5 "NCCL abstraction": the abstraction is NCCL-API-shaped and proven first on RCCL). No plan may mix vendors until Phase 7.
 
 ## Users
 
 - **Turbine developers (humans and AI agents):** need TP/DP logic that is testable on macOS without a GPU (a host-memory reference collective backend and deterministic fixtures), and one command per lab scenario that proves it on the R9700 pair.
 - **Operators:** need to say `tensor_parallel_size: 2` or `devices: auto`, have Turbine refuse impossible plans (vendor-mixed plans, TP not dividing the head count, too few devices) before binding a port, and see in `/turbine/v1/topology`, `/turbine/v1/status` and logs why each device was grouped the way it was.
 - **Benchmark runners:** need a collective bandwidth benchmark (all-reduce, all-gather, reduce-scatter, broadcast) comparable to `nccl-tests`/`rccl-tests`, and `turbine-bench` results for TP=1 vs TP=2 and DP=1 vs DP=2 on the same model (TS §18).
-- **Phase 6 (multi-node) implementers:** need the node-local topology subgraph, the collective trait, the NCCL-API binding and the `static` rank bootstrap as the pieces they compose into a cluster.
+- **Phase 9 (multi-node, deferred; written as Phase 6) implementers:** need the node-local topology subgraph, the collective trait, the NCCL-API binding and the `static` rank bootstrap as the pieces they compose into a cluster.
 
 ## In scope
 
@@ -44,8 +44,8 @@ The lab's only multi-GPU host is novanas: 2× AMD Radeon AI PRO R9700 (gfx1201, 
 - Sharded data parallelism (ZeRO / FSDP-style weight sharding across DP replicas): skipped (user decision 2026-09-28) — it serves training, and inference replicas that do not fit use TP, PP or EP.
 - Peer-to-peer and IPC collectives (vLLM custom all-reduce, quick reduce, mscclpp): the novanas board allows no peer access (user-confirmed 2026-09-28).
 - Investigating the OLMoE tensor-parallel drift against a one-GPU capture (p10 likely |Δ| 1.198, p08 diverging at token 25; hypothesis: expert-routing near-ties amplify the ~1 % TP partial-sum rounding): deferred to the Phase 6–8 umbrella, question (d) for `phase-7-model-families` (user decision 2026-09-28, "P5: tensor-parallel accuracy gate against the one-GPU capture", OLMoE follow-up); Phase 5 gates OLMoE under TP against the transformers reference only.
-- Any plan mixing vendors (NVIDIA + AMD), in TP or DP — rejected at plan time until Phase 7.
-- Tensor parallelism of quantized weights (Phase 8 quantization track); Phase 5 serves BF16 only.
+- Any plan mixing vendors (NVIDIA + AMD), in TP or DP — rejected at plan time until Phase 10 (advanced distribution, deferred; written as Phase 7).
+- Tensor parallelism of quantized weights (Phase 6 quantization); Phase 5 serves BF16 only.
 - oneCCL / Intel devices.
 - Changing TP or DP size at runtime, elastic scaling, live re-sharding. A plan is fixed for the process lifetime.
 - Measuring GPU↔GPU collective bandwidth at startup: the startup probe measures host links only (S-13); collective numbers come from `turbine-collbench` and are not fed back automatically.
@@ -241,7 +241,7 @@ scripts/lab-cluster.sh <collbench-novanas|collbench-sweep-novanas|collbench-host
 ## Edge cases
 
 - One device in the inventory with `tensor_parallel_size: 2` and no `static` mode (rejected naming the key and the device count).
-- `devices: [0, 1]` where 0 is NVIDIA and 1 is AMD, with tp = 2 or with tp = 1, dp = 2 (both rejected: `vendor-mixed plan`, until Phase 7); `devices: auto` on such a host picks one vendor and reports the other's devices under `excluded_devices` with `vendor_excluded:<vendor>`.
+- `devices: [0, 1]` where 0 is NVIDIA and 1 is AMD, with tp = 2 or with tp = 1, dp = 2 (both rejected: `vendor-mixed plan`, until Phase 10, advanced distribution); `devices: auto` on such a host picks one vendor and reports the other's devices under `excluded_devices` with `vendor_excluded:<vendor>`.
 - Two GPUs of the same vendor but different architecture in one TP group (rejected).
 - tp = 4 on a model with 2 KV heads (KV heads replicated ×2), tp = 8 on a model with 3 KV heads (rejected: neither divides nor is a multiple), tp larger than the attention head count (rejected). Llama-3.2-3B (24 heads, 8 KV heads) accepts tp = 2, 4 and 8; OLMoE (16/16) accepts tp = 2, 4, 8.
 - OLMoE QK-norm at tp = 2: each rank holds half of the normalised dimension; the norm must use the full-dimension mean of squares (all-reduce of partial sums), never the rank-local one.

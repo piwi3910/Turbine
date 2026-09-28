@@ -1163,3 +1163,96 @@ Plan (coordinator, 2026-09-28): audit every host↔device copy in the serving pa
 Upstream report — options shown: report upstream (a draft first), or keep it internal. **Decision (user, 2026-09-28): report it upstream, filed by the coordinator with `gh` under the user's account after the user has seen the draft.** No agent files anything. The draft (a plain-HIP `repro.hip`, the build line and `ISSUE.md`: environment, expected vs actual, variant results, frequency, the pinned-staging workaround; nothing Turbine-internal, no hostnames, IPs or credentials) goes under `docs/upstream/rocm-pageable-d2h/` once the repro reproduces on novanas.
 
 Consequences for earlier work: `bffabda` (refusing RCCL inside a captured graph) was motivated by a pageable-read artefact; it is held until a pinned re-test of RCCL graph replays. The Task 34 attention diagnosis (split at a non-64-aligned q-start) is re-run with pinned reads to confirm.
+
+## Roadmap reorganisation after Phase 5 (2026-09-28)
+
+Asked 2026-09-28, while Phase 5 (multi-GPU, novanas) is being built on `phase-5-multi-gpu`. The user does not want multi-node or anything NVIDIA yet, and wants quantization and more model families brought forward. Before this, the order after Phase 5 was: Phase 6 multi-node (the two Sparks), Phase 7 advanced distribution (PP, EP, PD, RDMA, mixed vendor), Phase 8 expansion umbrella with tracks 8a quantization → 8b speculative decoding → 8c model families; Phase 2b NVIDIA on hold since 2026-09-26.
+
+**1. Order after Phase 5**
+
+- A) Phase 6 = quantization (AMD), Phase 7 = model families, Phase 8 = speculative decoding; multi-node (old 6), advanced distribution (old 7) and NVIDIA (2b) move to a deferred block, re-specced when un-held (recommended)
+- B) Paired by model: each new family arrives together with the quantized format its checkpoints need
+- C) Families first, then quantization, then speculative decoding
+
+**Answer (2026-09-28, user): A.**
+
+**2. Quantization formats on the R9700** (`gfx1201`, RDNA4: native FP8 WMMA, no FP4 matrix path) — multi-select
+
+- FP8 weights (per-channel compressed-tensors and block-scaled Qwen3-FP8 style) + FP8 e4m3 KV cache
+- MXFP4 (weight-only on RDNA4, dequantized to FP8/BF16 in the kernel)
+- INT4 AWQ / GPTQ (weight-only, group scales)
+- NVFP4 weight-only (the old Phase 8 scope)
+
+**Answer (2026-09-28, user): FP8 weights + FP8 KV, MXFP4, INT4 AWQ/GPTQ.** NVFP4 is not selected. **Clarification (2026-09-28, user): NVFP4 support is added together with NVIDIA support** — modelopt NVFP4/FP8 mixed precision (`hf_quant_config.json`, `MIXED_PRECISION`) and compressed-tensors `nvfp4-pack-quantized` belong to the deferred NVIDIA block (phase-2b-nvidia), not to phase 6.
+
+**3. Model families** — multi-select
+
+- Qwen3 dense + Qwen3 MoE
+- gpt-oss-20b (MXFP4 experts, attention sinks, alternating sliding-window / full attention)
+- Qwen3.5 / 3.6 hybrids (Gated DeltaNet + full attention, recurrent-state KV)
+- Mistral / Mixtral (Mixtral needs FP8 + TP to fit 2 × 32 GB)
+
+**Answer (2026-09-28, user): all four.**
+
+**4. Speculative decoding**
+
+- A) After quantization and families, as the last active phase (recommended)
+- B) Defer it with the multi-node block
+- C) Before families (right after quantization)
+
+**Answer (2026-09-28, user): A.**
+
+Consequences (docs amended the same day):
+
+- Active order: Phase 5 multi-GPU (in progress), Phase 6 quantization, Phase 7 model families, Phase 8 speculative decoding — all AMD only, on `novanas` (`gfx1201`). Track specs `phase-6-quantization`, `phase-7-model-families`, `phase-8-speculative-decoding` are each written when their phase starts, under the umbrella `.procoder/specs/phase-6-8-expansion.md` (renamed from `phase-8-expansion.md`, amended: AMD only, new order, new S-6 / S-8 scope).
+- Deferred block, re-specced when the user lifts the multi-node / NVIDIA hold: phase-2b-nvidia (now also carrying NVFP4), `phase-9-multi-node` (was `phase-6-multi-node`), `phase-10-advanced-distribution` (was `phase-7-advanced-distribution`). The two renamed specs and plans keep their text as written and carry `Status: deferred` plus a numbering note; NVIDIA support-matrix rows stay `unsupported`.
+- Phase 6 scope (umbrella S-6): FP8 e4m3 weights with per-tensor / per-channel scales (`fp8`) and block-scaled (`fp8_block`), FP8 e4m3 KV cache (`kv.dtype: fp8_e4m3`), MXFP4 (OCP, weight-only on RDNA4; `mxfp4`), INT4 AWQ (`awq_int4`) and GPTQ (`gptq_int4`), weight-only and group-wise. Support-matrix `weight_format` gains these five values; `modelopt_nvfp4`, `modelopt_fp8`, `modelopt_mixed` and `ct_nvfp4` stay reserved for the deferred NVIDIA block.
+- Phase 7 families (umbrella S-8): Qwen3 dense and MoE, gpt-oss-20b, the Qwen3.5 / 3.6 hybrids, Mistral and Mixtral. This lifts the 2026-09-25 gpt-oss exclusion (it was out only because MXFP4 was out of scope).
+- Phase 8 speculative decoding (umbrella S-7) now comes after the families, so recurrent-state rollback for the hybrids belongs to phase 8, not to phase 7.
+- Open for the track specs (not decided here): the hybrids' cached checkpoints are NVFP4, so phase 7 needs FP8 or BF16 checkpoints of them (Qwen3.6-35B-A3B needs FP8 + TP 2 or similar to fit 2 × 32 GB); each phase-6 format is proven on a registered architecture (Llama-3.2-3B or OLMoE) where such a checkpoint exists — which ones is the phase-6 spec's choice (e.g. RedHatAI / neuralmagic FP8, AWQ and GPTQ Llama-3.2-3B checkpoints); MXFP4 checkpoints may exist only for gpt-oss, which needs the phase-7 family — the phase-6 spec decides between an MXFP4 fixture checkpoint quantized offline (Python quantizer at fixture-generation time only) and proving MXFP4 in phase 7 with gpt-oss.
+- Code still names the old track names: the support-matrix refusal reasons in `crates/turbine-core/src/support.rs` (`phase-8a-quantization`, `phase-8b-speculative-decoding`, `phase-8c-model-families`) and the tests that assert them, and tests that use `GptOssForCausalLM` as the example of an unregistered architecture; and the four `nvidia`/`sm_121` × Llama / OLMoE BF16 baseline rows are still `supported` although phase-2b never ran (unreachable today: `execution.backend: cuda` exits 2). They change with the first code task of phase 6 (reasons, NVIDIA rows, the five new `weight_format` values) and phase 7 (the gpt-oss test name), not in this docs change.
+
+## Phase 6 MXFP4: packaging formats and proof checkpoints (2026-09-28)
+
+Found on Hugging Face (2026-09-28, real safetensors checkpoints, `config.json` inspected): OpenAI native `quant_method: mxfp4` (`openai/gpt-oss-20b`, Apache-2.0); compressed-tensors `mxfp4-pack-quantized` (float4 group 32, E8M0 `uint8` scales; W4A16 in `nm-testing/Qwen3-30B-A3B-MXFP4A16` and `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16`); AMD Quark MXFP4 (`amd/Qwen3.5-35B-A3B-MXFP4`, `amd/gpt-oss-20b-MoE-Quant-W-MXFP4-A-FP8-KV-FP8`, `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq`; mostly W4A4). Rejected as proof: `ISTA-DASLab/*-FPQuant-*` (Hadamard rotations, not plain MXFP4).
+
+**1. Which MXFP4 packaging formats does phase 6 support?** — multi-select
+
+- compressed-tensors `mxfp4-pack-quantized` (recommended)
+- OpenAI native `mxfp4` (gpt-oss; loader in phase 6, proven with gpt-oss in phase 7)
+- AMD Quark MXFP4 (mostly W4A4; activation FP4 emulated on RDNA4)
+
+**Answer (2026-09-28, user): all three.**
+
+**2. Which real checkpoint proves MXFP4 on a registered architecture?**
+
+- A) `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16` (compressed-tensors, `LlamaForCausalLM`, 5.8 GB) (recommended)
+- B) `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` (Quark W4A4, `LlamaForCausalLM`)
+- C) defer the first real proof to `openai/gpt-oss-20b` in phase 7
+
+**Answer (2026-09-28, user): all three** — A and B are phase-6 proofs, C is the phase-7 proof of the OpenAI native packaging.
+
+Consequences: the `phase-6-quantization` spec covers the three MXFP4 packagings under one `mxfp4` weight format (or one value per packaging, the spec's choice) and proves compressed-tensors on A and Quark on B; B's activation FP4 is emulated on RDNA4 (activations quantize-dequantized to FP4 before an FP8/BF16 matmul), and its row is `supported` only if it passes the S-3 gate against the checkpoint's reference output, else `experimental`. The OpenAI native loader may land in phase 6 under unit tests; its row turns `supported` when phase 7 closes gpt-oss-20b. Reference outputs for A and B are captured once with transformers (compressed-tensors / Quark dequantization, fixture generation only) and committed; quality is compared with BF16 `meta-llama/Llama-3.1-8B-Instruct` and `Llama-3.2-3B-Instruct`. The weights are downloaded on `novanas` with `hf download` into `/home/piwi/turbine-models/<slug>` like the Phase 1/2 weights.
+
+## Phase 5p: serving efficiency interlude (SGLang-inspired items) (2026-09-28)
+
+Context: comparing vLLM and SGLang, four SGLang ideas are missing from Turbine: (1) token-granular prefix matching (RadixAttention-style: reuse the partial last block of a cached prefix, copy-on-write; today only full 128-token blocks are shared, so up to 127 reusable tokens are lost per request); (2) a cache-aware scheduling policy (admit waiting requests with the longest cached prefix first, with a starvation bound; a new entry in the scheduling-policy registry); (3) jump-forward structured output (append llguidance's forced tokens in one forward pass through the chunked-prefill path instead of one decode step each); (4) CPU/GPU overlap scheduling (prepare step N+1 while the GPU runs step N; at c16 host overhead is ~0.2 ms of a 15.4 ms step, so measure at c1 first).
+
+**Where do they go?**
+
+- A) Interlude "Phase 5p: serving efficiency" after Phase 5 merges, before Phase 6, run like the pre-Phase-5 fixes (one change, then measure) (recommended)
+- B) Split: 1 + 2 in the interlude, 3 in Phase 8 with speculative decoding, 4 measured in the interlude
+- C) After Phase 7, across every KV format at once
+
+**Answer (2026-09-28, user): A.**
+
+Consequences: `phase-5p-serving-efficiency` is specced when Phase 5 has merged (spec and plan written then, under the usual chain) and runs before `phase-6-quantization`. Order inside it: (4) measurement first (host share of a step at c1 and c16 on Llama and OLMoE; build overlap scheduling only if the host share exceeds 5 % at c1), then (1), (2), (3), each landed alone with `scripts/lab-bench.sh` (golden c1 + throughput) and, for (1) and (2), the Phase 4 multi-turn profile (`cached_tokens_ratio`, later-turn TTFT) before and after. Constraints: (1) must keep the Phase 4 tiers (L1/L2 hold full blocks; a partial block is L0-only or copied whole) and the prefix-exact prefill invariance (the #1 follow-up), and Phase 7's hybrid recurrent state can be cached only at block boundaries, which the phase-7 spec handles; (2) is a registered scheduling policy with its conformance suite and a deterministic simulator test for starvation; (3) must keep outputs identical to token-by-token decoding under greedy (golden JSON-schema cases) and handle retokenization at the forced-span boundary.
+
+## Startup time in the Turbine vs vLLM comparison package (2026-09-28)
+
+Measured on novanas today (Llama-3.2-3B, TP 2): Turbine is ready 6–8 s after process start; vLLM-ROCm needs ~98 s (≈124 s from pod start), mostly spawning workers, torch.compile (11 s) and graph capture (49 s); weight loading is ~2.5 s for both.
+
+- Add `startup_s` (process start → /ready 200) as a data point to `engine-comparison-multi-gpu` for every run, both engines (recommended)
+- Leave it out; mention it only in the set conclusion
+
+**Answer (2026-09-28, user): neither — it was a question, not a request; nothing is added to the tests or the package.**

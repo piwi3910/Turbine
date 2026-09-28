@@ -1,8 +1,10 @@
-# phase-7-advanced-distribution
+# phase-10-advanced-distribution
 
-Status: complete
+Status: deferred
 
-Source: `turbine-spec.md` §19 Phase 7 (advanced distribution), with TS §10 (multi-GPU and multi-node), TS §11 (cluster-wide KV directory), TS §12 (failure model), TS §16 (security), TS §17 (testing), TS §18 (benchmarking), TS §20 (definition of done) and TS §21 (engineering rules). Sections of that document are cited as "TS §N". Decisions are recorded in `.procoder/ask/decisions.md` ("Answers log for phase 1–8 spec questions (2026-09-25)"). Earlier phase specs are cited by name (phase-1-single-request … phase-6-multi-node).
+Numbering: written as Phase 7 (`phase-7-advanced-distribution`) and renumbered on 2026-09-28; only spec file names in the text were updated, the phase numbers in the prose are as written. Within this document "Phase 7" means this spec (phase-10-advanced-distribution), "Phase 6" means `phase-9-multi-node`, and the "Phase 8" tracks (quantization, model families) mean active phases 6–8 under `phase-6-8-expansion` (6 quantization, 7 model families, 8 speculative decoding) — so the hybrid-state transfer this spec leaves to "the Phase 8 model-families track" belongs to phase 7 (model families), and lossy KV conversion to phase 6 (quantization). Deferred until the user lifts the multi-node / NVIDIA hold (decision "Roadmap reorganisation after Phase 5 (2026-09-28)" in `.procoder/ask/decisions.md`); re-specced against the tree of that day before implementation starts.
+
+Source: `turbine-spec.md` §19 Phase 7 (advanced distribution), with TS §10 (multi-GPU and multi-node), TS §11 (cluster-wide KV directory), TS §12 (failure model), TS §16 (security), TS §17 (testing), TS §18 (benchmarking), TS §20 (definition of done) and TS §21 (engineering rules). Sections of that document are cited as "TS §N". Decisions are recorded in `.procoder/ask/decisions.md` ("Answers log for phase 1–8 spec questions (2026-09-25)"). Earlier phase specs are cited by name (phase-1-single-request … phase-5-multi-gpu, and phase-9-multi-node, written as phase-6-multi-node).
 
 ## Problem
 

@@ -1,6 +1,8 @@
 # Turbine cross-phase interface contract
 
 Status: binding for every implementation plan of phases 0, 1, 2, 2b, 3, 4, 5, 6, 7 and 8 (umbrella).
+
+Renumbering (2026-09-28, decision "Roadmap reorganisation after Phase 5 (2026-09-28)" in `.procoder/ask/decisions.md`): this contract keeps the phase labels it was written with. "P6" is now `phase-9-multi-node` and "P7" `phase-10-advanced-distribution` (both deferred, like "P2b" `phase-2b-nvidia`); "P8" is the umbrella `phase-6-8-expansion`, "P8a" `phase-6-quantization`, "P8c" `phase-7-model-families` and "P8b" `phase-8-speculative-decoding` — the active order after Phase 5 is quantization, model families, speculative decoding, AMD only. NVFP4 moves to the deferred P2b.
 Date: 2026-09-25. Inputs: `turbine-spec.md` (cited "TS §N"), `.procoder/specs/phase-*.md` (cited "P0 §Interfaces", "P3 S-9", …), `.procoder/ask/decisions.md` (cited "DEC"), `AGENTS.md`.
 
 ## 0. How to read this contract
@@ -543,6 +545,8 @@ pub enum SupportStatus { Supported, Experimental, Unsupported { reason: String }
 pub struct SupportKey { pub vendor: String, pub arch: String, pub architecture: String,
                         pub weight_format: WeightFormatColumn, pub kv_format: KvFormatColumn, pub speculative: SpeculativeColumn }
 pub enum WeightFormatColumn { Bf16, ModeloptNvfp4, ModeloptFp8, ModeloptMixed, CtNvfp4 }   // P2m rename (was WeightFormat); serde "bf16","modelopt_nvfp4","modelopt_fp8","modelopt_mixed","ct_nvfp4"
+    // P8a (phase-6-quantization) adds Fp8, Fp8Block, Mxfp4, AwqInt4, GptqInt4 — serde "fp8","fp8_block","mxfp4","awq_int4","gptq_int4";
+    // the four modelopt_* / ct_nvfp4 values stay reserved (unsupported) for the deferred P2b NVFP4 work (DEC 2026-09-28)
 pub enum KvFormatColumn { Bf16, Fp8E4m3 }                                           // "bf16","fp8_e4m3"
 pub enum SpeculativeColumn { None, Draft }                                          // "none","draft"
 pub struct SupportRow { pub key: SupportKeyPattern /* each column Option = "*" */, pub status: SupportStatus }
@@ -564,7 +568,7 @@ pub struct SupportRowView { vendor, arch, architecture, weight_format, kv_format
 
 Phase 2m (S-11): the server builds the key from `ExecutionBackend::vendor()` of `execution.backend`, the model's `config.json` `architectures[0]` (of `text_config` when the family registry resolves it there) and the discovered device arch, and resolves it twice (before discovery, after discovery); `turbine_api::support::SupportMetrics` registers `turbine_support_matrix_status`. The Phase 8 families (`Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`, `MistralForCausalLM`, `MixtralForCausalLM`) are `unsupported` on (`amd`, `*`) and (`nvidia`, `*`) until their track closes; `cpu` × `*` is `experimental`.
 
-Baseline rows (P8 AC): `supported` for (`amd`,`gfx1201`) and (`nvidia`,`sm_121`) × {`LlamaForCausalLM`, `OlmoeForCausalLM`} × `bf16` × `bf16` × `none`.
+Baseline rows (P8 AC, amended 2026-09-28): `supported` for (`amd`,`gfx1201`) × {`LlamaForCausalLM`, `OlmoeForCausalLM`} × `bf16` × `bf16` × `none`; the (`nvidia`,`sm_121`) rows become `unsupported` naming the deferred `phase-2b-nvidia` (the code still marks them `supported` until the first phase-6-quantization task changes it).
 
 Note: the Rust type names of the config enums/structs in §3.2 (`ModelDtype`, `ToolCallParserKind`, `KvDtypeChoice`, `AuthMode`, `GidIndex`, `CrossNodeTp`, `WorkerRole`, `ExpertPlacementSource`, `PdFallback`, `LogFormat`, `DeviceSelection`, `CollectiveBackendChoice`, `RankMode`, `CrossNodeGroup`, `GroupRank`, section struct names `<Section>Config`) are (contract-chosen); YAML key names and serde value spellings are verbatim from the specs.
 

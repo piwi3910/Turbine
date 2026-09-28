@@ -1,0 +1,152 @@
+# phase-6-8-expansion
+
+Status: complete
+
+Renamed from `phase-8-expansion` and amended on 2026-09-28 by the decision "Roadmap reorganisation after Phase 5 (2026-09-28)" (`.procoder/ask/decisions.md`): the Phase 8 umbrella with tracks 8a quantization → 8b speculative decoding → 8c model families became the umbrella for the active **Phases 6–8** — 6 quantization, 7 model families, 8 speculative decoding — on AMD only. Other specs written before that day say "Phase 8 track", "P8a", "P8b" or "P8c"; they mean phase-6-quantization, phase-8-speculative-decoding and phase-7-model-families respectively.
+
+Source: `turbine-spec.md` §19 Phase 8 (expansion: "AMD/ROCm, Intel where viable, additional model families, quantization, speculative decoding and multimodal as separately scoped work"), with TS §2 (non-goals), TS §3 (V1 scope), TS §6 (runtime, tensors and kernels), TS §8 (lossy KV transforms need quality validation), TS §16 (security), TS §17 (testing), TS §18 (benchmarking), TS §20 (definition of done) and TS §21 (engineering rules). Sections of that document are cited as "TS §N". Decisions are recorded in `.procoder/ask/decisions.md` ("Answers log for phase 1–8 spec questions (2026-09-25)", amended by "Roadmap reorganisation after Phase 5 (2026-09-28)"). Earlier phase specs are cited by name (phase-1-single-request … phase-5-multi-gpu).
+
+This is the **umbrella spec** for Phases 6–8. It fixes the phase list, their order and the rules every one of them shares (support matrix, exit gate, vendor neutrality, quality evaluation). Each phase gets its own spec, written when the phase starts; this spec does not contain them:
+
+1. `phase-6-quantization`
+2. `phase-7-model-families`
+3. `phase-8-speculative-decoding`
+
+Below, each of these three phases is called a **track**.
+
+Amendments to TS §19 Phase 8: **AMD/ROCm is not an expansion track** — AMD execution moved to Phase 1. **NVIDIA is deferred** (decision 2026-09-28): Phases 6–8 run on the R9700 cards in `novanas` (`gfx1201`) only; NVIDIA execution, NVFP4 and the NVIDIA rows of everything delivered here belong to the deferred `phase-2b-nvidia`, together with the deferred `phase-9-multi-node` and `phase-10-advanced-distribution`. **Multimodal is out** of the roadmap. **Intel** has no phase and no code until an Intel GPU exists in the lab.
+
+## Problem
+
+By the end of Phase 5 Turbine serves two BF16 models — `meta-llama/Llama-3.2-3B-Instruct` (dense) and `allenai/OLMoE-1B-7B-0125-Instruct` (MoE) — on one or both AMD R9700 cards (`gfx1201`, 32 GB each) of `novanas`, text only, one decoded token per forward step per sequence, with BF16 weights and BF16 KV only. Three gaps remain. The models people run at useful sizes ship quantized — FP8 (per-channel and block-scaled), MXFP4 (gpt-oss) and INT4 AWQ / GPTQ — and two 32 GB cards hold them only when quantized, so quantization is the entry ticket; RDNA4 has native FP8 WMMA but no FP4 matrix path, so the FP4 and INT4 formats run weight-only there, and each format must be proven against a reference before it is trusted (TS §8, §21 rule 1). Two architectures are not enough for real use: the families people deploy — Qwen3 dense and MoE, gpt-oss-20b, the Qwen3.5/3.6 hybrids with Gated DeltaNet linear attention, Mistral and Mixtral — each need their own config parsing, weight mapping and layer execution. And decode is memory-bandwidth bound, so without speculative decoding Turbine leaves a large ITL gap compared with engines that draft. TS §19 lists these as "separately scoped work": they share little code and have different dependencies, so they are delivered as separate phase specs in a fixed order, and they must share one honest mechanism for saying which device × model × format × method combinations are supported (TS §21 rule 4).
+
+## Users
+
+- **Operators:** need to know, before deploying, whether a given device × model architecture × weight format × KV format × speculative method combination is supported, and to have Turbine refuse an unsupported one at startup with a reason instead of failing mid-request.
+- **Clients of the OpenAI API:** need lower ITL from speculative decoding with no change in output distribution, and access to more model families and quantized checkpoints behind the same API.
+- **Turbine developers (humans and AI agents):** need each track to be buildable and testable on the macOS workstation where no GPU is involved, a lab procedure per track on the host with the right hardware, and a fixed contract (this spec) each track spec must satisfy so no track re-decides the shared rules.
+- **Benchmark runners:** need per-track comparisons against a reference engine on the identical checkpoint, hardware and request profile (TS §18), including quality metrics for lossy formats.
+
+## In scope
+
+- [S-1] **Track list and order:** three tracks, delivered strictly in this order, each by its own spec: (1) `phase-6-quantization`, (2) `phase-7-model-families`, (3) `phase-8-speculative-decoding` (decision 2026-09-28). A track spec is written when its track starts, cites this spec for S-2 … S-5 instead of restating them, and must reach `Status: complete` before implementation of that track begins. A later track starts only when the earlier track's exit gate (S-3) has passed for at least one support-matrix row. All three run on AMD (`novanas`, `gfx1201`) only.
+- [S-2] **Support matrix (shared):** a single declarative table in `turbine-core` of `(vendor, arch, architecture, weight_format, kv_format, speculative_method) → supported | experimental | unsupported{reason}`; `turbine-server --support-matrix` prints it; startup (before binding) resolves the configured combination against it and exits 1 on `unsupported` naming the combination and reason; `experimental` starts with a WARN. `GET /turbine/v1/status` reports the resolved row. (Landed in Phase 2m, S-11.) The `supported` baseline is the Phase 1–5 combinations on AMD (`amd`/`gfx1201` × Llama-3.2-3B and OLMoE, BF16 weights, BF16 KV, no speculation); every `nvidia` row is `unsupported` with a reason naming the deferred `phase-2b-nvidia` until that phase is re-specced and closes; each track adds its AMD rows only when its acceptance criteria pass.
+- [S-3] **Per-track exit gate (shared):** a track's rows enter the support matrix as `supported` only when (1) its golden comparison passes the tolerance file of that model slug (phase-1 format: ≥ 14 of 16 prompts with the first 32 greedy tokens identical, top-5 |Δlogprob| within the slug's bounds) against committed HF transformers reference fixtures for BF16 models, or — for quantized checkpoints, where a BF16 transformers run is not the same arithmetic — against the same checkpoint's reference output captured once with the checkpoint's reference runtime and committed; (2) `turbine-bench` on the same hardware and profile is recorded against a reference engine where one runs on that device (vLLM-ROCm on `novanas`), else as a Turbine baseline (TS §18); (3) `scripts/overload-soak.sh novanas` (Phase 3) still passes with the track's feature enabled; and (4) for a lossy format, `turbine-golden eval` accuracy on the committed task set is within _quality.max_accuracy_drop_ of the same model in BF16 (or of the reference engine on the same checkpoint). The TS §20 first-useful-release items must not regress on AMD.
+- [S-4] **Quality evaluation tool (shared):** `turbine-golden eval` (Interfaces) and the committed task set `tests/eval/gsm8k-200.jsonl`, used by every lossy-format gate.
+- [S-5] **Vendor neutrality and re-entry of other vendors (shared):** no public type or function signature in `turbine-kernels`, `turbine-tensor`, `turbine-scheduler`, `turbine-kv` or `turbine-reliability` names a CUDA-, HIP- or other vendor-specific type, so every track's kernels go behind the Phase 1 vendor-neutral kernel traits and the deferred NVIDIA provider, or a future Intel provider, can be added without touching core logic (TS §21 rule 11). Intel work re-enters the roadmap only when an Intel GPU is installed in the lab; until then no Intel code is written and Intel devices are discovered nowhere (logged, no crash).
+- [S-6] **Track 1 — quantization (`phase-6-quantization`), fixed scope** (decision 2026-09-28): FP8 e4m3 weights with per-tensor or per-channel scales (`fp8`) and block-scaled FP8 e4m3 weights (`fp8_block`, the Qwen3-FP8 128 × 128 style); FP8 e4m3 KV cache as an explicit _kv.dtype_ choice (`fp8_e4m3`); MXFP4 (OCP microscaling FP4 e2m1 with shared E8M0 scales per 32 elements; `mxfp4`), weight-only on RDNA4 (dequantized to FP8 or BF16 inside the kernel, since RDNA4 has no FP4 matrix path); INT4 AWQ (`awq_int4`) and INT4 GPTQ (`gptq_int4`), weight-only with group-wise scales (and zero points where the checkpoint has them). MXFP4 covers three checkpoint packagings — compressed-tensors `mxfp4-pack-quantized`, OpenAI native `quant_method: mxfp4` and AMD Quark MXFP4 (W4A4 checkpoints run with activation FP4 emulated) — proven on real checkpoints (decision 2026-09-28, "Phase 6 MXFP4"): `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16` (compressed-tensors) and `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` (Quark) in this track, `openai/gpt-oss-20b` (OpenAI native) in track 2. Each other format is proven on a checkpoint in that format of an architecture already registered (Llama or OLMoE). The track spec decides which checkpoint containers (the HF _quantization_config_ `quant_method` values and compressed-tensors schemes of _config.json_) map to each `weight_format` value, which proof checkpoints are used, whether FP8 weights run W8A8 (FP8 WMMA with dynamically quantized activations) or W8A16, the kernel provider per format under the reuse-first rule, and the questions listed under Constraints. NVFP4 is not in this track (deferred NVIDIA block).
+- [S-7] **Track 3 — speculative decoding (`phase-8-speculative-decoding`), fixed scope:** a separate small draft model of the same family as the target, sharing its tokenizer (first pairing: `meta-llama/Llama-3.2-1B-Instruct` drafting for `meta-llama/Llama-3.2-3B-Instruct`), behind a `Proposer` trait; a verifier in `turbine-scheduler` that scores k proposals in one target forward and accepts with standard speculative rejection sampling (greedy: exact prefix match); rollback by truncating KV blocks past the last accepted position; per-request disable below _speculative.min_acceptance_ and global disable at pressure ORANGE or worse (Phase 3). Because this track now follows the families track, it also owns rollback of linear-attention recurrent state for the Qwen3.5/3.6 hybrid targets (a checkpointed or recomputed state per verification step, decided in its spec). MTP heads, EAGLE heads and DFlash-style drafters are not in this track.
+- [S-8] **Track 2 — model families (`phase-7-model-families`), fixed scope** (decision 2026-09-28): the architecture registry in `turbine-model` keyed on the checkpoint's `architectures[0]` and `model_type` (top level and nested _text_config_; landed in Phase 2m with CPU execution of Qwen3, Qwen3-MoE, Mistral and Mixtral), each entry providing config parsing, weight-name mapping, layer execution and KV/state layout; an unregistered architecture is exit 1 naming it. Families on AMD: Qwen3 dense and Qwen3 MoE; gpt-oss-20b (MXFP4 experts from track 1, attention sinks, alternating sliding-window / full attention — this lifts the 2026-09-25 gpt-oss exclusion); the Qwen3.5/3.6 hybrids (Gated DeltaNet linear attention + full attention, text only with vision weights skipped), which bring a recurrent/conv-state layout next to the paged KV and its prefix-cache handling; Mistral and Mixtral. The linear-attention kernel provider on AMD is decided in the track spec under the reuse-first rule. Each family gets its own golden fixtures in the phase-1 format, and the track spec states per family whether it runs on one card, Phase 5 TP over both cards, or only from an in-scope quantized checkpoint.
+
+## Out of scope
+
+- AMD/ROCm execution as an expansion track (Phase 1 delivers it; amends TS §19).
+- NVIDIA execution and the NVIDIA rows of Phases 6–8, and **NVFP4** in every container (modelopt NVFP4 / FP8 mixed precision, compressed-tensors `nvfp4-pack-quantized`): deferred to `phase-2b-nvidia` (decision 2026-09-28: NVFP4 arrives together with NVIDIA support).
+- Multi-node, PP, EP, PD disaggregation and RDMA (deferred `phase-9-multi-node`, `phase-10-advanced-distribution`); families that would need them are served with Phase 5 TP or a quantized checkpoint, or wait.
+- Multimodal input of any kind (image, video, audio); checkpoints with a vision tower are served text-only with vision weights skipped, and image content parts keep the phase-1 `400 unsupported_parameter` behaviour (amends TS §19).
+- Intel execution, discovery or build support until an Intel GPU exists in the lab (S-5); Apple/Metal; CPU serving beyond the phase-1 reference provider.
+- Quantization formats beyond S-6: NVFP4 weights or KV (deferred with NVIDIA), INT8 weights or activations, INT4 in other packings, FP4 or INT4 KV, MXFP6 / MXFP8, GGUF. A family whose only checkpoints use such a format runs from a checkpoint in an in-scope format, or the format is added by a new recorded decision first.
+- Speculative methods other than a separate draft model (S-7).
+- Training, fine-tuning, quantization-aware training, or producing quantized checkpoints for serving; Turbine only loads checkpoints quantized elsewhere (TS §2). A fixture checkpoint quantized offline for a correctness test (Constraints) is test data, not a served format.
+- Custom GPU kernels without a provider evaluation showing none meets the need (AGENTS.md reuse-first rule); each such kernel is its own decision recorded in `.procoder/ask/decisions.md`.
+- Formats that are not safetensors (GGUF, PyTorch pickle `.bin`/`.pt`): never deserialized (TS §16).
+- Hot-swapping models or serving several models in one process (a draft model is part of the target's deployment, not a second served model).
+- Writing the three track specs; this spec only names them and fixes their shared contract.
+
+## Constraints
+
+- Rust only in the serving path; no Python at runtime (TS §21 rule 4). Python is allowed only at fixture-generation time (HF transformers dumps, reference-runtime captures, an offline-quantized fixture checkpoint), never in a build or test that `cargo test` runs. Vendor libraries are loaded at runtime through the prebuilt kernel library (_libturbine_hip.so_, CMake-built), never linked by Cargo, so the workspace still builds and every non-ignored test passes on macOS arm64 with no GPU libraries.
+- `unsafe` stays in the allowlisted locations: `turbine-device`, `turbine-kernels`, `turbine-distributed/src/collective/ffi` (Phase 5), and `turbine-transport/src/rdma` once the deferred phase-10 adds it (CONFLICT C-19).
+- The kernel C ABI stays vendor-neutral: every addition is an optional minor group resolved at load time (decisions "Phase 4: kernel ABI v2.5 instead of v3" and "P5 T6"), specified so a CUDA library can implement it when phase-2b is re-specced.
+- Every lossy format or lossy KV transform ships with its quality gate (TS §8, S-3); nothing lossy is enabled by default unless the checkpoint itself is stored in that format.
+- Bounded inputs (TS §16, §21 rule 8): speculative k ≤ 8; draft-model memory is reserved through the Phase 3 budget before speculation is enabled.
+- Model weights live in `/home/piwi/turbine-models/<slug>` on `novanas`, fetched over SSH with the user's HF login there (never stored in the repo); tests read `TURBINE_TEST_MODEL_DIR` and never download.
+- **Host workloads:** any lab run that needs workloads moved or memory freed on `novanas` is started only after the implementer has asked the user and the user has moved the workloads; the implementer never stops, moves or reconfigures someone else's workload. Reference-engine runs use `scripts/lab-serve.sh novanas --vllm <slug>` (vLLM-ROCm, port 18100).
+- Lab host: `novanas` (192.168.10.203), 2× Radeon AI PRO R9700 (`gfx1201`, 32 GB each, native FP8 WMMA, no FP4 matrix path), ROCm 7.14.1 at `/opt/rocm/rocm`, k3s Jobs requesting `amd.com/gpu`; perf numbers on GPU 0 only. The Sparks are not used by Phases 6–8. Families that do not fit one card rely on Phase 5 TP over both cards and an in-scope quantized checkpoint (e.g. Mixtral-8x7B: ≈ 93 GB in BF16, ≈ 47 GB in FP8, so FP8 + TP 2); the track 2 spec states which per family.
+- Questions the track specs must answer (inputs, not decided here): (a) the hybrids' cached checkpoints are NVFP4 (listed below), so `phase-7-model-families` needs FP8 or BF16 checkpoints of them — Qwen3.6-35B-A3B needs FP8 + TP 2 or similar to fit 2 × 32 GB; (b) `phase-6-quantization` proves each format on Llama-3.2-3B or OLMoE where such checkpoints exist and names them (e.g. RedHatAI / neuralmagic FP8, AWQ and GPTQ Llama-3.2-3B checkpoints); (c) MXFP4 proof checkpoints are decided (S-6); the OpenAI native packaging's row turns `supported` only when track 2 closes gpt-oss-20b. (d) `phase-7-model-families`: investigate the OLMoE tensor-parallel drift against a one-GPU capture (Phase 5: p10 likely |Δ| 1.198, p08 diverging at token 25; hypothesis: expert-routing near-ties amplify the ~1 % partial-sum rounding of TP; a routing trace per position would show it) before MoE families rely on TP; until then OLMoE under TP is gated against the transformers reference only (decision 2026-09-28). Phase 5 exit (user decision 2026-09-28): OLMoE with expert × tensor parallelism is `unsupported` (reason `olmoe_ep_tp_drift`, `turbine_core::support::PARALLEL_REFUSALS`), refused at startup with exit 2; evidence: ep 2 × tp 2 fails the transformers golden on p10 (likely |Δ| 1.031 > 1.01) and p08 while ep 2 and tp 2 alone pass, identically before and after the pinned-copy fix; the phase-7 OLMoE tensor-parallel drift investigation must fix or explain it, then re-enable the combination by removing the refusal row, gated by ep2×tp2 golden c1/c16.
+- Cached NVFP4 checkpoints (from their _config.json_, verified 2026-09-25), which defined the old Phase 8a scope and now belong to the deferred NVIDIA block: `nvidia/Qwen3.6-35B-A3B-NVFP4` (`qwen3_5_moe`, modelopt mixed precision, FP8 KV); `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` (`qwen3_5` dense hybrid, modelopt); `RadixArk/Qwen3.8-Flash-Next-NVFP4` (`qwen4_exp`, 126 GB); `YourHighnessLA/Qwen3.8-27B-DFlash2-NVFP4` (compressed-tensors `nvfp4-pack-quantized`).
+
+## Interfaces
+
+### `turbine-server`
+
+```
+turbine-server --support-matrix [--output text|json]
+turbine-server --config <path> [--set <dotted.key>=<yaml value>]... [--check-config]
+```
+
+- `--support-matrix` prints the S-2 table and exits 0 without reading a config. JSON: `{"rows":[{"vendor":"amd","arch":"gfx1201","architecture":"LlamaForCausalLM","weight_format":"bf16","kv_format":"bf16","speculative":"none","status":"supported","reason":null}]}`; `*` is allowed as a wildcard in any column, most specific row wins.
+- `--check-config` additionally resolves the support-matrix row; `unsupported` prints the reason and exits 2 (configuration error), before model weights are read.
+- Bounded column values: `vendor` ∈ {`amd`, `nvidia`, `cpu`}; `weight_format` ∈ {`bf16`, `fp8`, `fp8_block`, `mxfp4`, `awq_int4`, `gptq_int4`} for Phases 6–8, plus `modelopt_nvfp4`, `modelopt_fp8`, `modelopt_mixed` and `ct_nvfp4`, which stay in the table as `unsupported` and are reserved for the deferred NVIDIA block (phase-2b-nvidia, NVFP4); `kv_format` ∈ {`bf16`, `fp8_e4m3`}; `speculative` ∈ {`none`, `draft`}. The five new `weight_format` values are added to `WeightFormatColumn` by the `phase-6-quantization` plan (contract §3.8). `arch` and `architecture` are free strings from the device inventory and _config.json_.
+
+### Configuration additions (umbrella-owned)
+
+| Key                         | Type  | Default | Validation                                                      |
+| --------------------------- | ----- | ------- | --------------------------------------------------------------- |
+| _quality.max_accuracy_drop_ | float | `0.01`  | 0 ≤ value ≤ 0.1; used only by `turbine-golden eval` comparisons |
+
+Track-owned keys are defined in the track specs; their names are reserved here so tracks do not collide: _kv.dtype_ (track 1, `phase-6-quantization`; adds `fp8_e4m3`), _speculative.method_, _speculative.num_tokens_, _speculative.draft_model_path_, _speculative.min_acceptance_ (track 3, `phase-8-speculative-decoding`).
+
+### `turbine-golden` addition
+
+```
+turbine-golden eval --url <base> --tasks <tasks.jsonl> [--model <name>] [--output text|json]
+turbine-golden eval-compare --baseline <report.json> --candidate <report.json> [--max-drop <float>]
+```
+
+- The tasks file (JSONL): one `{"id","prompt"|"messages","answer","match":"exact"|"number"}` per line; greedy, `max_tokens` from the file. `eval` reports accuracy and per-task correctness; exit 0 on a completed run, 2 on usage/I/O errors.
+- `eval-compare` exits 0 when candidate accuracy ≥ baseline accuracy − max drop (default _quality.max_accuracy_drop_), 1 otherwise, printing both accuracies.
+- A committed task set `tests/eval/gsm8k-200.jsonl` (200 GSM8K test items, numeric match) is used for every lossy-format gate.
+
+### Metrics (added)
+
+- `turbine_support_matrix_status{status}` gauge — 1 for the resolved status of the running configuration.
+- Track metrics (e.g. speculative acceptance) are defined in the track specs with bounded label sets.
+
+### Lab
+
+- Each track spec runs its GPU tests through `scripts/lab-test.sh novanas` and its server configs under `scripts/lab/phase<N>-<track-topic>-novanas.yaml` (e.g. `scripts/lab/phase6-quantization-novanas.yaml`) on port 18000.
+
+## Data
+
+- **Support matrix:** compiled into `turbine-core` as a static table (source of truth in code, printed by `--support-matrix`); no runtime file.
+- **Golden fixtures** per architecture and format under `tests/golden/<model-slug>/` in the phase-1 format (`reference.jsonl`, `tolerance.json`).
+- **Eval set:** `tests/eval/gsm8k-200.jsonl` (MIT-licensed source, attribution in `tests/eval/NOTICE`), and one `tests/eval/<model-slug>/<engine>.json` report per gated combination.
+- **Track specs:** `.procoder/specs/phase-6-quantization.md`, `.procoder/specs/phase-7-model-families.md`, `.procoder/specs/phase-8-speculative-decoding.md`, created when each track starts.
+
+## Edge cases
+
+- A configuration that matches two wildcard rows with equal specificity (must be impossible: the table is validated at build time by a unit test).
+- A configured combination with no matching row at all: treated as `unsupported{reason: "no support-matrix row"}`.
+- A track rolled back after release (its row moves from `supported` to `experimental` or `unsupported`): existing configs fail at next startup with the new reason, never mid-request.
+- A checkpoint with a vision tower (e.g. Qwen3.6-35B-A3B): served text-only; vision weights skipped, not loaded; image parts rejected as in phase-1.
+- An Intel GPU present on some host: discovered nowhere, logged once, no crash.
+- Eval answers with thousands separators, trailing periods or units (numeric match tolerates commas and a trailing period only).
+- A track closes on AMD only: its `nvidia` rows stay `unsupported{reason}` naming the deferred `phase-2b-nvidia`, and the NVIDIA work for them is listed when phase-2b is re-specced.
+- A packaging whose only proof checkpoint belongs to a family of a later track (OpenAI native MXFP4 on gpt-oss): its row stays `unsupported` until that track closes, as the `phase-6-quantization` spec records.
+
+## Failure modes
+
+- **Unsupported combination (support matrix):** exit 2 with `--check-config`, exit 1 at startup, before weights are read, naming the combination and the reason.
+- **Experimental combination:** starts with a WARN naming the row; `turbine_support_matrix_status{status="experimental"}` is 1.
+- **Quality gate fails for a format:** the row stays `experimental` (or `unsupported` if outputs are wrong rather than merely degraded); the track does not close.
+- **Eval run fails midway (server error, timeout):** `turbine-golden eval` exits 2 with the failing task id; no partial report is written as if complete.
+- **A track spec cannot satisfy this contract** (e.g. needs a format or method outside S-6 … S-8): the track stops and the question goes to the user as a new decision; the umbrella is amended, never silently widened by a track.
+
+## Acceptance criteria
+
+- [ ] [S-2] `cargo test -p turbine-core support::tests::resolution_and_refusal` exits 0; it asserts the most specific row wins over wildcards, an `unsupported` row makes config validation fail with the reason, an `experimental` row passes with a WARN recorded, a combination with no row is unsupported, no two rows tie in specificity, and every row's enum values are from the documented bounded sets; fails if a wildcard shadows a specific row or an unsupported combination validates.
+- [ ] [S-2] `cargo test -p turbine-core support::tests::baseline_rows_present` exits 0; it asserts the table contains `supported` rows for `amd`/`gfx1201` × `LlamaForCausalLM` and `OlmoeForCausalLM` × `bf16` weights × `bf16` KV × `none`, that every `nvidia` row resolves `unsupported` with a reason naming `phase-2b-nvidia`, and that no row is `supported` for any quantized format, `fp8_e4m3` KV or `draft` before the tracks add them; fails if a row is marked supported without its track or an NVIDIA row is supported while phase-2b is deferred.
+- [ ] [S-2] `cargo test -p turbine-server --test server_cli support_matrix_output` exits 0; it runs `turbine-server --support-matrix --output json` and asserts exit 0 and a JSON body with a non-empty `rows` array, and runs `--check-config` with `speculative.method: draft` on a build where `draft` is unsupported and asserts exit 2 naming _speculative.method_; fails if an unsupported combination starts.
+- [ ] [S-2] `cargo test -p turbine-api --test api status_reports_support_row` exits 0; it starts the server on the CPU reference provider and asserts `GET /turbine/v1/status` includes the resolved row and `/metrics` shows `turbine_support_matrix_status` at 1 for exactly one status; fails if the row or gauge is missing.
+- [ ] [S-3] [S-4] `cargo test -p turbine-bench --test golden eval_accuracy_report` exits 0; it runs `turbine-golden eval` against an in-test mock that answers 150 of 200 items correctly (numeric match tolerating commas and trailing periods) and asserts accuracy 0.75 in the JSON report, then asserts `turbine-golden eval-compare` exits 0 for a candidate at 0.745 against a 0.75 baseline with max drop 0.01 and exits 1 for 0.73; fails if matching is wrong, the report shape changes, or the gate passes a drop larger than allowed.
+- [ ] [S-4] `cargo test -p turbine-bench --test golden eval_task_set_valid` exits 0; it asserts `tests/eval/gsm8k-200.jsonl` has exactly 200 lines, unique ids, a numeric `answer` for every `match: "number"` item, and that `tests/eval/NOTICE` exists; fails if the committed task set is malformed.
+- [ ] [S-5] `cargo test -p turbine-kernels --test vendor_neutral_api` exits 0; it parses each listed crate's `src` with `syn` and walks the signatures of every `pub` item reachable from the crate root in `turbine-kernels`, `turbine-tensor`, `turbine-scheduler`, `turbine-kv` and `turbine-reliability`, and asserts no path contains `cuda`, `hip`, `rocm`, `nccl`, `rccl`, `cublas`, `sycl` or `level_zero` outside the backend-enum variant names; fails if a vendor type leaks into a core public signature.
+- [ ] [S-1] [S-6] Before track 1 implementation starts: `"/Users/pascal/.claude/plugins/cache/procoder/procoder/3.7.0/hooks/launcher.sh" spec check phase-6-quantization` exits 0 reporting COMPLETE, the file's Status line reads `complete`, and `grep -c -E "fp8_block|mxfp4|awq_int4|gptq_int4|fp8_e4m3" .procoder/specs/phase-6-quantization.md` is non-zero while its In scope section names no format outside S-6 (in particular no NVFP4); fails if track 1 starts on an incomplete spec or its scope differs from S-6.
+- [ ] [S-1] [S-8] Before track 2 implementation starts (and only after track 1 closed): `"/Users/pascal/.claude/plugins/cache/procoder/procoder/3.7.0/hooks/launcher.sh" spec check phase-7-model-families` exits 0 reporting COMPLETE with Status `complete`, and the spec covers Qwen3 dense, Qwen3 MoE, gpt-oss-20b, the Qwen3.5/3.6 hybrids with the AMD linear-attention kernel provider decided, Mistral and Mixtral, with the checkpoint each family is served from; fails if track 2 starts early, on an incomplete spec, or a family from S-8 is missing.
+- [ ] [S-1] [S-7] Before track 3 implementation starts (and only after track 2 closed): `"/Users/pascal/.claude/plugins/cache/procoder/procoder/3.7.0/hooks/launcher.sh" spec check phase-8-speculative-decoding` exits 0 reporting COMPLETE with Status `complete`, and the spec names `Llama-3.2-1B-Instruct` as the first draft model, covers recurrent-state rollback for the hybrid targets, and has no MTP, EAGLE or DFlash proposer; fails if track 3 starts early, on an incomplete spec, or with a method outside S-7.
+- [ ] [S-3] [S-6] [S-7] [S-8] Manual track close, per track in S-1 order, on `novanas`: `scripts/overload-soak.sh novanas` exits 0 with the track's feature enabled, `turbine-golden compare --url <turbine> --reference tests/golden/<model-slug>/reference.jsonl` exits 0 under that slug's tolerance file, `turbine-bench --url <turbine> --output json` exits 0 with its report committed, for lossy formats `turbine-golden eval-compare --baseline <bf16.json> --candidate <quantized.json>` exits 0, and then `turbine-server --support-matrix --output json` exits 0 showing the track's new `amd` rows as `supported`; every output pasted into the task evidence; fails if a row turns `supported` without all four gate items or a track closes out of order.
+
+## Open questions
+
+<!-- None: decisions recorded in .procoder/ask/decisions.md -->
