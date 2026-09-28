@@ -18,6 +18,17 @@ prometheus-client.workspace = true
 half.workspace = true
 # Runtime loading of librccl.so.1 / libnccl.so.2; nothing links a collective library at build time
 libloading.workspace = true
+# turbine-collbench: device inventory and the kernel shim's device buffers and streams
+turbine-device.workspace = true
+turbine-kernels.workspace = true
+# turbine-collbench CLI and JSON report
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "turbine-collbench"
+path = "src/bin/turbine-collbench.rs"
 
 [build-dependencies]
 # Finds the host C compiler that build.rs uses to compile the NCCL-API stub for the ffi tests
