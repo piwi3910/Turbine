@@ -18,8 +18,8 @@
 //!   any row count (decision 2026-09-27, "Pre-Phase-5 #1 follow-up").
 //! - `prefix_reuse_matches_cold_tp2`, `prefix_reuse_suffix_lengths_match_cold_tp2`: the same at
 //!   tensor parallelism 2 over both R9700s (P5 Task 29: the tp 2 per-rank GEMM shapes have
-//!   invariant rows too); they need `scripts/lab-test.sh novanas --gpus 2` and say they skip in
-//!   a one-GPU Job.
+//!   invariant rows too); they need `scripts/lab-test.sh novanas --gpus 2` (a one-GPU Job skips
+//!   them: `TWO_GPU_TESTS` in the script).
 //! - `nvme_round_trip_matches_cold`: with 1 GiB of L1 (L0 demotes by capacity past 70 %)
 //!   and the NVMe tier at `/home/piwi/turbine-kv`, prompt A runs cold, long filler prompts push
 //!   its blocks through L1 to L2 (L0 → L2 on unified memory), then A runs again: the same greedy
@@ -347,26 +347,10 @@ fn prefix_reuse_matches_cold() {
 #[test]
 #[ignore = "lab, 2 GPUs (scripts/lab-test.sh novanas --gpus 2): HIP, libturbine_hip.so, Llama-3.2-3B"]
 fn prefix_reuse_matches_cold_tp2() {
-    if !require_backend("hip") || !two_gpus("prefix_reuse_matches_cold_tp2") {
+    if !require_backend("hip") {
         return;
     }
     prefix_reuse_matches_cold_with(&tp2_sets());
-}
-
-/// Whether the lab Job holds two R9700s: `TURBINE_EXPECT_AMD`, the GPU count
-/// `scripts/lab-test.sh novanas [--gpus 2]` gives its Job. A one-GPU Job (the default run)
-/// skips the tp 2 tests with a line saying so; outside a lab Job (unset) they fail.
-fn two_gpus(test: &str) -> bool {
-    let gpus = std::env::var("TURBINE_EXPECT_AMD").unwrap_or_else(|_| {
-        panic!("{test}: TURBINE_EXPECT_AMD unset; run scripts/lab-test.sh novanas --gpus 2")
-    });
-    let n: u32 = gpus
-        .parse()
-        .unwrap_or_else(|_| panic!("TURBINE_EXPECT_AMD={gpus:?}"));
-    if n < 2 {
-        println!("{test}: skipped, the Job holds {n} GPU (scripts/lab-test.sh novanas --gpus 2)");
-    }
-    n >= 2
 }
 
 /// The `--set` overrides of the tp 2 variants: both R9700s as one tensor-parallel group over
@@ -453,7 +437,7 @@ fn prefix_reuse_suffix_lengths_match_cold() {
 #[test]
 #[ignore = "lab, 2 GPUs (scripts/lab-test.sh novanas --gpus 2): HIP, libturbine_hip.so, Llama-3.2-3B"]
 fn prefix_reuse_suffix_lengths_match_cold_tp2() {
-    if !require_backend("hip") || !two_gpus("prefix_reuse_suffix_lengths_match_cold_tp2") {
+    if !require_backend("hip") {
         return;
     }
     prefix_reuse_suffix_lengths_match_cold_with(&tp2_sets());
