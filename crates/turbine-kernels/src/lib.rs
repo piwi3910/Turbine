@@ -14,6 +14,7 @@ pub mod link_probe;
 mod mapped;
 pub mod ops;
 mod pinned;
+pub mod quant;
 mod registries;
 pub mod registry;
 pub mod shim;

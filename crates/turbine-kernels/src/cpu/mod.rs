@@ -35,6 +35,7 @@ mod math;
 mod moe;
 mod norm;
 mod paged;
+pub mod quant;
 mod rope;
 mod topk;
 
