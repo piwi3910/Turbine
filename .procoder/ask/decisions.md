@@ -1328,3 +1328,11 @@ After the per-tier discussion (different KV formats per tier: L0 BF16/FP8 for at
 - per-layer precision;
 - a per-request opt-out of lossy reuse (recommended: yes);
 - kernel providers under the reuse-first rule.
+
+## Pressure-driven KV compression ladder in Phase 6 (2026-09-28)
+
+User proposal: instead of fixed per-tier formats, start lossless everywhere. When all tiers fill, lower the precision of the lowest tier first, so only the oldest data loses precision. Under more pressure, lower the next faster tier, and so on until all tiers are at the same level, then repeat with the next, stronger quantization.
+
+Refined in discussion: a per-block ladder (lossless → FP8 → ~4-bit → ~2-bit → evict) driven by the pressure controller. "Compress" becomes a third eviction-policy action next to demote and evict, applied to the blocks least likely to be reused, which in practice means oldest-first from the lowest tier. It works mostly on new demotions, rewrites existing blocks only oldest-first and bounded per step, uses hysteresis, and never upgrades a block that has lost precision. L1/L2 come first; L0 joins after mixed-format attention.
+
+**Answer (2026-09-28, user): do it.** Added to `phase-6-quantization` scope as its last step (umbrella S-6 amended), after the weight formats, FP8 KV, TurboQuant and the per-tier formats. Observability rules: reason codes, per-tier × format metrics, lossy-token counts per response, an opt-out that recomputes instead, and tests that pin the pressure state.
