@@ -398,7 +398,8 @@ scenario_tp2() {
 }
 
 # static_tiers_leg <config> [--set k=v]...: Llama at tp 2 in static mode with every rank's own
-# KV tiers (plan Task 30): a small L0 (256 MiB per rank, 16 running requests), one 1 GiB L1 slab
+# KV tiers (plan Task 30): a small L0 (512 MiB per rank: 73 blocks, one 4096-token sequence at
+# least as model.max_seq_len 4096 needs; 16 running requests), one 1 GiB L1 slab
 # per rank and each rank's L2 under ${WORK}/kv-static/rank-<r>, so the Phase 4 multi-turn load
 # demotes and promotes. Requires cached_tokens_ratio > 0 and requests_ok of every turn; then
 # golden c1 against the one-GPU capture on the same (tiered) group. Prints the leader's tier
@@ -406,7 +407,8 @@ scenario_tp2() {
 static_tiers_leg() {
 	local config="$1"
 	shift
-	local tiers=(--set kv.gpu.max_bytes=256MiB --set scheduler.max_running_requests=16
+	local tiers=(--set kv.gpu.max_bytes=512MiB --set model.max_seq_len=4096
+		--set scheduler.max_running_requests=16
 		--set kv.cpu.enabled=true --set kv.cpu.max_bytes=2GiB --set kv.nvme.enabled=true
 		--set "kv.nvme.path=${WORK}/kv-static" --set kv.nvme.max_bytes=4GiB)
 	start_server "${WORK}/tp2-static-tiers-rank1.log" "$config" "$@" "${tiers[@]}" \
