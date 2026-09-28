@@ -842,9 +842,9 @@ pub struct LoadedModel {
     /// Tensor parallelism: every worker rank's end of the KV tier copies, in rank order (P5,
     /// decision "P5 T17" B); empty on one device.
     pub shards: Vec<crate::kv_orchestrator::KvShard>,
-    /// Tensor parallelism in `local` rank mode: every worker rank's budget and ledger, in rank
-    /// order, for the group's KV admission (P5 S-8); empty on one device and for `static`
-    /// workers (their ledgers live in their own processes).
+    /// Tensor parallelism: every worker rank's budget and ledger, in rank order, for the group's
+    /// KV admission (P5 S-8) — in `static` rank mode the leader's mirror of each worker's ledger
+    /// (P5 Task 33); empty on one device.
     pub group: Vec<(DeviceBudget, Arc<Ledger>)>,
 }
 

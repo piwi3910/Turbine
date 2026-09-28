@@ -62,6 +62,12 @@ pub struct DeviceComponentLabels {
     pub component: &'static str,
 }
 
+/// `rank` label (decimal rank index of a tensor-parallel group).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RankLabel {
+    pub rank: u32,
+}
+
 /// `replica` label (decimal index, CONFLICT C-5).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ReplicaLabel {
@@ -118,6 +124,8 @@ pub struct ReliabilityMetrics {
     pub group_pressure_state: Family<ReplicaLabel, Gauge>,
     /// P5: the device index limiting each replica's group.
     pub group_limiting_device: Family<ReplicaLabel, Gauge>,
+    /// P5 Task 33: a `static` worker rank's real ledger differed from the leader's mirror of it.
+    pub ledger_mirror_divergence: Family<RankLabel, Counter>,
 }
 
 impl ReliabilityMetrics {
@@ -229,6 +237,11 @@ impl ReliabilityMetrics {
             "Device index whose state sets each replica's group state",
             m.group_limiting_device.clone(),
         );
+        reg.register(
+            "turbine_ledger_mirror_divergence",
+            "Static-mode worker rank ledgers found different from the leader's mirror of them",
+            m.ledger_mirror_divergence.clone(),
+        );
         m
     }
 
@@ -280,6 +293,7 @@ impl ReliabilityMetrics {
             device_budget_bytes: Family::default(),
             group_pressure_state: Family::default(),
             group_limiting_device: Family::default(),
+            ledger_mirror_divergence: Family::default(),
         }
     }
 }
