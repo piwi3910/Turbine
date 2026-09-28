@@ -242,8 +242,9 @@ mod tests {
         }
     }
 
-    /// Phase 6a S-13: the KV column is the configured `kv.dtype`; FP8 KV is refused on `amd`
-    /// (exit 2 naming `kv.dtype`) until its gate passes, and experimental on the cpu backend.
+    /// Phase 6a S-13: the KV column is the configured `kv.dtype`; FP8 KV is experimental on
+    /// `amd` gfx1201 Llama / OLMoE during its lab proof, refused elsewhere on `amd` (exit 2
+    /// naming `kv.dtype`) until its gate passes, and experimental on the cpu backend.
     /// Breaks if the KV column is still hard-coded BF16.
     #[test]
     fn kv_column_follows_kv_dtype() {
@@ -255,7 +256,18 @@ mod tests {
         assert_eq!(format_columns(&cfg).1, KvFormatColumn::Bf16);
         cfg.kv.dtype = turbine_core::config::KvDtypeChoice::Fp8E4m3;
         assert_eq!(format_columns(&cfg).1, KvFormatColumn::Fp8E4m3);
-        let err = before_discovery(&cfg).unwrap_err();
+        // Before discovery the arch is unknown: the gfx1201 row (experimental during the lab
+        // proof) is the best any card could give.
+        let d = before_discovery(&cfg).unwrap();
+        assert_eq!(d.status.as_str(), "experimental", "{:?}", d.key);
+        // A key on another architecture family is refused naming `kv.dtype`.
+        let qwen = model_dir(
+            "qwen-fp8-kv",
+            serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}),
+        );
+        let mut other = config("hip", qwen.path());
+        other.kv.dtype = turbine_core::config::KvDtypeChoice::Fp8E4m3;
+        let err = before_discovery(&other).unwrap_err();
         assert_eq!(err.key(), Some("kv.dtype"), "{err}");
         let mut cpu = config("cpu", llama.path());
         cpu.kv.dtype = turbine_core::config::KvDtypeChoice::Fp8E4m3;

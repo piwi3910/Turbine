@@ -337,6 +337,26 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Experimental,
     ),
+    // FP8 KV on gfx1201 (Phase 6a S-13, S-14): `experimental` while the lab proof runs (Task 24),
+    // `supported` only after its gate.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("LlamaForCausalLM"),
+        BF16,
+        Some(KvFormatColumn::Fp8E4m3),
+        NO_SPEC,
+        SupportStatus::Experimental,
+    ),
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("OlmoeForCausalLM"),
+        BF16,
+        Some(KvFormatColumn::Fp8E4m3),
+        NO_SPEC,
+        SupportStatus::Experimental,
+    ),
     // FP8 KV on the CPU reference provider (Phase 6a S-13): tests and tiny checkpoints.
     row(
         Some("cpu"),
@@ -1004,9 +1024,15 @@ mod tests {
                 "{k}: {status:?}"
             );
         }
+        // FP8 KV: experimental on gfx1201 Llama and OLMoE while its lab proof runs (Task 24),
+        // refused naming the track anywhere else.
+        for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
+            let k = key("amd", "gfx1201", architecture, W::Bf16, K::Fp8E4m3, S::None);
+            assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
+        }
         let k = key(
             "amd",
-            "gfx1201",
+            "gfx942",
             "LlamaForCausalLM",
             W::Bf16,
             K::Fp8E4m3,

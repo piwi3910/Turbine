@@ -706,7 +706,7 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "prefill_op_timings",
         "every_implementation_matches_cpu",
         "implementations_enumerated",
-        "gemm_matches_cpu",
+        "bf16_gemm_matches_cpu",
         "gemm_table_matches_cpu",
         "norm_rope_silu_embedding_add_match_cpu",
         "paged_prefill_ck_128_matches_cpu",
