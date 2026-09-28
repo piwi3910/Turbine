@@ -850,3 +850,5 @@ Local main e2f8178 holds Phase 3, Phase 4 and the pre-Phase-5 track, unpushed; `
 - B) Change some of them
 
 **Answer (2026-09-28): A — the user accepted all 19 ("all good").** Every item listed in `.procoder/review-2026-09-28.md` is now a confirmed decision; #18's parked `perf-gemm-stagger-wip` stays parked.
+
+**Answer (2026-09-28, after the review): push and start Phase 5.** main pushed to origin at 6545638; Phase 5 starts by porting the `p5-distributed` run-ahead onto main (novanas only, NVIDIA still on hold).
