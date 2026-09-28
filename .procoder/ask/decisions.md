@@ -922,3 +922,17 @@ Found on Hugging Face (2026-09-28, real safetensors checkpoints, `config.json` i
 **Answer (2026-09-28, user): all three** — A and B are phase-6 proofs, C is the phase-7 proof of the OpenAI native packaging.
 
 Consequences: the `phase-6-quantization` spec covers the three MXFP4 packagings under one `mxfp4` weight format (or one value per packaging, the spec's choice) and proves compressed-tensors on A and Quark on B; B's activation FP4 is emulated on RDNA4 (activations quantize-dequantized to FP4 before an FP8/BF16 matmul), and its row is `supported` only if it passes the S-3 gate against the checkpoint's reference output, else `experimental`. The OpenAI native loader may land in phase 6 under unit tests; its row turns `supported` when phase 7 closes gpt-oss-20b. Reference outputs for A and B are captured once with transformers (compressed-tensors / Quark dequantization, fixture generation only) and committed; quality is compared with BF16 `meta-llama/Llama-3.1-8B-Instruct` and `Llama-3.2-3B-Instruct`. The weights are downloaded on `novanas` with `hf download` into `/home/piwi/turbine-models/<slug>` like the Phase 1/2 weights.
+
+## Phase 5p: serving efficiency interlude (SGLang-inspired items) (2026-09-28)
+
+Context: comparing vLLM and SGLang, four SGLang ideas are missing from Turbine: (1) token-granular prefix matching (RadixAttention-style: reuse the partial last block of a cached prefix, copy-on-write; today only full 128-token blocks are shared, so up to 127 reusable tokens are lost per request); (2) a cache-aware scheduling policy (admit waiting requests with the longest cached prefix first, with a starvation bound; a new entry in the scheduling-policy registry); (3) jump-forward structured output (append llguidance's forced tokens in one forward pass through the chunked-prefill path instead of one decode step each); (4) CPU/GPU overlap scheduling (prepare step N+1 while the GPU runs step N; at c16 host overhead is ~0.2 ms of a 15.4 ms step, so measure at c1 first).
+
+**Where do they go?**
+
+- A) Interlude "Phase 5p: serving efficiency" after Phase 5 merges, before Phase 6, run like the pre-Phase-5 fixes (one change, then measure) (recommended)
+- B) Split: 1 + 2 in the interlude, 3 in Phase 8 with speculative decoding, 4 measured in the interlude
+- C) After Phase 7, across every KV format at once
+
+**Answer (2026-09-28, user): A.**
+
+Consequences: `phase-5p-serving-efficiency` is specced when Phase 5 has merged (spec and plan written then, under the usual chain) and runs before `phase-6-quantization`. Order inside it: (4) measurement first (host share of a step at c1 and c16 on Llama and OLMoE; build overlap scheduling only if the host share exceeds 5 % at c1), then (1), (2), (3), each landed alone with `scripts/lab-bench.sh` (golden c1 + throughput) and, for (1) and (2), the Phase 4 multi-turn profile (`cached_tokens_ratio`, later-turn TTFT) before and after. Constraints: (1) must keep the Phase 4 tiers (L1/L2 hold full blocks; a partial block is L0-only or copied whole) and the prefix-exact prefill invariance (the #1 follow-up), and Phase 7's hybrid recurrent state can be cached only at block boundaries, which the phase-7 spec handles; (2) is a registered scheduling policy with its conformance suite and a deterministic simulator test for starvation; (3) must keep outputs identical to token-by-token decoding under greedy (golden JSON-schema cases) and handle retokenization at the forced-span boundary.
