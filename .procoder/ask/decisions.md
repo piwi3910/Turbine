@@ -895,3 +895,12 @@ Recorded 2026-09-28 with the v2.6 kernels (decision "P5 T6", answer B). The op: 
 - hipBLASLt, vLLM / SGLang and llama.cpp HIP kernels: fused RMSNorms over a whole row (the same shape as CK's), no external sum of squares.
 
 Outcome: own kernels, as the answer chose — `kernels/rocm/src/sharded_norm.hip` (`row_sumsq`, `rmsnorm_sharded`): one 256-thread block per row, the reduction order of the Turbine rmsnorm fallback (so `row_sumsq` then `rmsnorm_sharded` over a whole row is bitwise the HIP `rmsnorm` at 2,048), independent of the number of rows (batch invariance); correctness against the cpu-reference in `hip_ops sharded_norm_ops`. A CK reduce2d `row_sumsq` could be registered as a second implementation later if a measurement favours it.
+
+## P5: the static-mode rank link and the DP router policy as registries?
+
+Asked 2026-09-28 (Phase 5 port): the static-mode rank bootstrap is plain TCP (spec S-5) and `parallel.router` a closed `prefix_affinity | least_loaded` enum (spec S-7), while the pluggability rule (2026-09-26) lists "collectives and transports" and policies as registered extension points.
+
+- A) Keep TCP and the enum until the multi-node phase adds `turbine-transport`
+- B) Registries now: a small `Transport` trait for the rank link with a static registry holding `tcp`, and a DP router policy registry holding `prefix_affinity` and `least_loaded`, each with a conformance suite and a `docs/extending/` page (the configuration keeps the same names)
+
+**Answer (2026-09-28, user): B.** The rank link goes behind a `Transport` trait with a static registry (one entry, `tcp`; the deferred multi-node phase adds more), and the DP router policy becomes a registry (`prefix_affinity`, `least_loaded`); both with conformance tests and a `docs/extending/` page, same pattern as `collective_backend`. `parallel.router` keeps its names.
