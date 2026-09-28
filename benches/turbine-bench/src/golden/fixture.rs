@@ -131,6 +131,18 @@ impl Tolerance {
 
     /// This tolerance with the strict bounds replaced by [`Self::logprob_bounds`] for
     /// `concurrency`, the form [`super::compare_prompt`] judges a prompt with.
+    /// The batched bounds at every concurrency (`turbine-golden compare --batched-bounds`): the
+    /// tensor-parallel gate against a one-GPU capture (decision "P5: tensor-parallel accuracy
+    /// gate against the one-GPU capture").
+    pub fn batched_everywhere(&self) -> Tolerance {
+        let bounds = self.logprob_bounds(2);
+        Tolerance {
+            max_abs_logprob_diff_likely: bounds.max_abs_logprob_diff_likely,
+            max_abs_logprob_diff_tail: bounds.max_abs_logprob_diff_tail,
+            ..self.clone()
+        }
+    }
+
     pub fn at_concurrency(&self, concurrency: usize) -> Tolerance {
         let bounds = self.logprob_bounds(concurrency);
         Tolerance {
@@ -228,6 +240,26 @@ pub fn tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `batched_everywhere` judges concurrency 1 by the batched bounds, falls back to a strict
+    /// bound whose batched key is absent, and keeps the token rule. Breaks if `--batched-bounds`
+    /// would keep a strict bound at c1.
+    #[test]
+    fn batched_everywhere_uses_batched_bounds_at_c1() {
+        let t: Tolerance = serde_json::from_value(serde_json::json!({
+            "min_identical_prefix": 32, "min_prompts_passing": 14, "top_k": 5,
+            "max_abs_logprob_diff_likely": 0.15, "max_abs_logprob_diff_tail": 0.55,
+            "likely_logprob_floor": -2.0, "margin_nats": 0.5,
+            "max_abs_logprob_diff_likely_batched": 0.25
+        }))
+        .unwrap();
+        let b = t.batched_everywhere();
+        let at1 = b.at_concurrency(1);
+        assert_eq!(at1.max_abs_logprob_diff_likely, 0.25);
+        assert_eq!(at1.max_abs_logprob_diff_tail, 0.55, "no batched tail key");
+        assert_eq!(at1.min_prompts_passing, 14);
+        assert_eq!(b.at_concurrency(16).max_abs_logprob_diff_likely, 0.25);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

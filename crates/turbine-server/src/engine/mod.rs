@@ -26,6 +26,7 @@ pub(crate) mod pp;
 pub(crate) mod requests;
 pub(crate) mod stages;
 pub(crate) mod tp;
+pub(crate) mod tp_tiers;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -296,6 +297,7 @@ pub fn spawn(
                     l2: startup.kv.l2,
                     clock: Arc::clone(&clock),
                     metrics: metrics.kv.clone(),
+                    remote: loaded.remote_tiers.take(),
                 },
                 &mut pool,
             );

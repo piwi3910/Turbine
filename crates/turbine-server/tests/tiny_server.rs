@@ -3247,9 +3247,12 @@ fn tp2_collective_failure_recovers() {
     let err: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
     assert_eq!(err["error"]["code"], "replica_failed", "{err}");
     assert!(!trigger.exists(), "the failure was injected");
-    let ready = server.get("/ready");
-    assert_eq!(ready.status, 503, "{}", ready.body);
-    assert_eq!(ready.json()["reason"], "circuit_open", "{}", ready.body);
+    // The failed iteration's requests end before the engine reports the failure to the circuit
+    // breaker: /ready turns 503 `circuit_open` a moment after the error event.
+    wait_for(Duration::from_secs(5), "/ready 503 circuit_open", || {
+        let ready = server.get("/ready");
+        ready.status == 503 && ready.json()["reason"] == "circuit_open"
+    });
 
     // The probe re-creates the communicator; a probe slower than twice the baseline (a loaded
     // test host) fails and the cycle repeats, so allow a few.

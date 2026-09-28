@@ -21,7 +21,10 @@
 //! block is the tp rank shards in rank order: L1 is one pinned tier per rank
 //! ([`ShardedL1Tier`], `kv.cpu.max_bytes / tp` each), L2 stores the concatenation, every shard
 //! is copied on its own rank's copy stream, and the KV namespace carries the shard count
-//! ([`tp_kv_format`]) so no other tp size ever reads the blobs. tp = 1 is unchanged.
+//! ([`tp_kv_format`]) so no other tp size ever reads the blobs. tp = 1 is unchanged. In
+//! `static` rank mode ([`KvStart::remote`], P5 Task 30) the workers are other processes: the
+//! leader's tiers hold its own shard and every copy and eviction is mirrored on the workers'
+//! own tiers over the rank link (`crate::engine::tp_tiers`).
 //!
 //! Calibration (P4 S-6): at startup one 64 MiB copy (in whole blocks, through the production
 //! copy paths) per enabled path seeds the transfer estimates and the L2 slow-tier baseline; it
@@ -67,6 +70,7 @@ use turbine_tensor::{
     CopyEngine, CopyTarget, CopyTicket, DeviceMemory, DevicePtr, PinnedBuffer, PinnedMemory,
 };
 
+use crate::engine::tp_tiers::TierDriver;
 use crate::model::StartupError;
 
 /// Bytes per L1 pinned slab (P4 S-5: grown lazily in 1 GiB slabs).
@@ -249,6 +253,10 @@ pub struct KvStart<'a> {
     pub l2: Option<Arc<L2NvmeTier>>,
     pub clock: Arc<dyn Clock>,
     pub metrics: KvMetrics,
+    /// `static` rank mode (P5 Task 30): the worker processes' tiers, driven over the rank link;
+    /// `shards` is then empty and `l2` holds this rank's shards only
+    /// (`crate::engine::tp_tiers::open_rank_l2`).
+    pub remote: Option<TierDriver>,
 }
 
 /// Owns the hierarchy and its copy backend on the engine thread (module comment).
@@ -261,6 +269,8 @@ pub struct KvOrchestrator {
     prefill_tps: Option<f64>,
     /// When capacity demotion and the reclaim-order refresh last ran.
     last_housekeeping: Option<Duration>,
+    /// `static` rank mode: every copy also runs on the workers (module comment).
+    remote: Option<TierDriver>,
 }
 
 impl KvOrchestrator {
@@ -352,6 +362,12 @@ impl KvOrchestrator {
         let (shards, format) = KvOrchestrator::shards_of(s.device, s.shards, pool, pipeline)?;
         let world = shards.len() as u32;
         let sizes: Vec<u64> = shards.iter().map(|sh| sh.addresses.block_bytes()).collect();
+        // `static` rank mode: this process holds rank 0's shard only, in the group's format.
+        let mut remote = s.remote;
+        let format = match &remote {
+            Some(r) => tp_kv_format(layout, r.world()),
+            None => format,
+        };
         if world > 1
             && s.cfg.cpu.enabled
             && s.cfg.cpu.max_bytes.0 / u64::from(world) < L1_SLAB_BYTES
@@ -367,8 +383,9 @@ impl KvOrchestrator {
                  nothing (raise kv.cpu.max_bytes to at least tensor_parallel_size GiB)"
             );
         }
-        // One logical block: every rank's (or stage's) shard of it, in order.
-        let block_bytes = format.block_bytes();
+        // One logical block: every rank's (or stage's) shard of it this process copies, in
+        // order (`format.block_bytes()` but in `static` mode, whose other ranks copy their own).
+        let block_bytes: u64 = sizes.iter().sum();
         let l1 = if !s.cfg.cpu.enabled {
             None
         } else if let Some(pinned) = shards
@@ -410,7 +427,21 @@ impl KvOrchestrator {
             None
         };
         let l1 = l1.filter(|t| t.enabled());
-        let l2_dyn = s.l2.clone().map(|t| t as Arc<dyn KvTier>);
+        // `static` mode: a tier any worker lacks is off for the group.
+        let has = |tier| remote.as_ref().is_none_or(|r| r.workers_have(tier));
+        let l1 = l1.filter(|_| has(TierId::L1));
+        let l2 = s.l2.filter(|_| has(TierId::L2));
+        let l2_dyn = l2.clone().map(|t| t as Arc<dyn KvTier>);
+        let (l1_seen, l2_seen) = match &mut remote {
+            None => (l1.clone().map(|t| t as Arc<dyn KvTier>), l2_dyn.clone()),
+            Some(r) => {
+                r.bind(l1.clone(), l2_dyn.clone());
+                (
+                    l1.clone().map(|t| r.mirror(t as Arc<dyn KvTier>)),
+                    l2_dyn.clone().map(|t| r.mirror(t)),
+                )
+            }
+        };
         // `kv.policy` was checked against the registry before any port was bound
         // (`Config::validate_modules`); `select` logs `module_selected`.
         turbine_kv::policy::registry()
@@ -422,8 +453,8 @@ impl KvOrchestrator {
             s.identity,
             format,
             pool.total_blocks(),
-            l1.clone().map(|t| t as Arc<dyn KvTier>),
-            l2_dyn.clone(),
+            l1_seen,
+            l2_seen,
             Arc::clone(&s.clock),
             s.metrics,
         );
@@ -447,11 +478,12 @@ impl KvOrchestrator {
             hits: HitWindow::default(),
             prefill_tps: None,
             last_housekeeping: None,
+            remote,
         };
         o.calibrate(
             pool,
             s.cfg.cpu.enabled && l1.is_some(),
-            s.l2.as_deref(),
+            l2.as_deref(),
             s.cfg.nvme.io_threads,
         )?;
         tracing::info!(
@@ -514,7 +546,15 @@ impl KvOrchestrator {
 
     /// Transfer completions: requests whose promotions all landed, with their prefixes.
     pub fn poll(&mut self, pool: &mut BlockPool) -> Vec<(RequestId, PrefixAttach)> {
-        self.h.poll(pool, &mut self.backend)
+        match &mut self.remote {
+            None => self.h.poll(pool, &mut self.backend),
+            Some(r) => {
+                let ready = self.h.poll(pool, &mut r.backend(&mut self.backend));
+                // The copies this pump started, before the turn's step plan.
+                r.flush();
+                ready
+            }
+        }
     }
 
     /// Counts a request's prompt and cached tokens in the 300 s hit-rate window.
@@ -603,6 +643,9 @@ impl KvOrchestrator {
     pub fn end_turn(&mut self, pool: &mut BlockPool) {
         self.h.apply_reclaim(pool);
         self.h.tick(pool);
+        if let Some(r) = &mut self.remote {
+            r.flush();
+        }
     }
 
     /// One executed iteration prefilled `tokens` tokens in `seconds`: folds the rate into the
@@ -1747,6 +1790,7 @@ mod tests {
                 l2: Some(Arc::clone(&l2)),
                 clock,
                 metrics,
+                remote: None,
             },
             &mut pool0,
         )
@@ -2029,6 +2073,7 @@ mod tests {
                 l2: Some(Arc::clone(&l2)),
                 clock,
                 metrics,
+                remote: None,
             },
             &mut pool1,
         )
@@ -2092,6 +2137,7 @@ mod tests {
                 l2: None,
                 clock: Arc::new(SystemClock::new()),
                 metrics: KvMetrics::register(&MetricsRegistry::new()),
+                remote: None,
             },
             &mut last,
         )
@@ -2129,11 +2175,231 @@ mod tests {
                 l2: None,
                 clock: Arc::new(SystemClock::new()),
                 metrics: KvMetrics::register(&reg),
+                remote: None,
             },
             &mut pool0,
         )
         .err()
         .expect("a smaller worker pool is refused");
         assert!(err.to_string().contains("KV rank 1"), "{err}");
+    }
+
+    /// Runs one copy of a `static` group to completion: the leader's own copy and every
+    /// worker's, over the rank link.
+    fn run_static(
+        o: &mut KvOrchestrator,
+        id: u64,
+        path: TransferPath,
+        key: KvKey,
+        src_slot: u64,
+        dst_slot: u64,
+    ) -> Result<TierSlot, TierError> {
+        let t = TransferTicket {
+            id,
+            req: TransferRequest {
+                path,
+                key,
+                bytes: o.backend.block_bytes as u64,
+                owner: None,
+                purpose: TransferPurpose::Demote,
+                src_slot,
+                dst_slot,
+            },
+        };
+        let driver = o.remote.as_mut().expect("a static group");
+        driver.backend(&mut o.backend).start(&t)?;
+        driver.flush();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(slot) = driver.backend(&mut o.backend).poll(&t)? {
+                driver.flush();
+                return Ok(slot);
+            }
+            assert!(Instant::now() < deadline, "copy {path:?} did not complete");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Executes nothing (the tier test's worker runs no steps).
+    struct NoSteps;
+    impl turbine_distributed::rank::StepExecutor for NoSteps {
+        fn execute(
+            &mut self,
+            _plan: &turbine_distributed::rank::StepPlan,
+        ) -> Result<turbine_distributed::rank::StepOutput, turbine_distributed::rank::ExecError>
+        {
+            Ok(turbine_distributed::rank::StepOutput {
+                logits: None,
+                rows: 0,
+                vocab: 0,
+            })
+        }
+    }
+
+    /// P5 Task 30 (decision "P5: KV tiers in static rank mode" B): a tp 2 `static` group whose
+    /// two ranks run on separate threads, linked only by the loopback `tcp` rank transport —
+    /// each with its own pool, its own copy engine and pinned L1 (its own context) and its own
+    /// L2 directory (`rank-<r>`). The leader's orchestrator drives every copy: L0 -> L1 -> L0,
+    /// L1 -> L2 -> L0 and L0 -> L2 -> L0 bring each rank's shard back into its own pool bit-exact,
+    /// and each rank's L2 holds only its own shard. An eviction through the tier the hierarchy
+    /// sees reaches the worker: a later promotion the leader can still serve fails on the worker
+    /// (and so for the group). Breaks if a copy is not mirrored on the worker, completes before
+    /// the worker's copy did, crosses the ranks' bytes, or an eviction stays on the leader.
+    #[test]
+    fn static_workers_round_trip_through_l1_and_l2() {
+        use turbine_distributed::rank::{HelloExpect, PROTOCOL_VERSION, RankMessage, RankRuntime};
+
+        use crate::engine::tp_tiers::{self, WorkerTiers};
+
+        let dir = TempDir::new("turbine-kv-static-tiers");
+        let kv = kv_config(&dir, true);
+        let (mut kv0, mut kv1) = (kv.clone(), kv);
+        tp_tiers::static_rank_kv(&mut kv0, 0, 2);
+        tp_tiers::static_rank_kv(&mut kv1, 1, 2);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let transport = turbine_distributed::transport::select("tcp").expect("tcp");
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let expect = HelloExpect {
+            model_fingerprint: identity().fingerprint(),
+            config_fingerprint: [1; 32],
+            device_vendor: turbine_core::types::Vendor::Amd,
+            device_arch: "test".into(),
+        };
+        let hello = RankMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            rank: 1,
+            world_size: 2,
+            model_fingerprint: expect.model_fingerprint,
+            config_fingerprint: expect.config_fingerprint,
+            device_vendor: expect.device_vendor,
+            device_arch: expect.device_arch.clone(),
+        };
+        let (mem0, mut pool0) = rank(0);
+        let (mem1, pool1) = rank(1);
+        // The worker rank: its own tiers over its own pool, on its own thread.
+        let (device1, addresses1) = (stream(&mem1, 1), BlockAddresses::of(&pool1));
+        let worker_clock = Arc::clone(&clock);
+        let worker = std::thread::spawn(move || {
+            let mut link =
+                RankRuntime::static_worker(transport, addr, hello, Duration::from_secs(10))
+                    .expect("welcome");
+            let l2 = tp_tiers::open_rank_l2(
+                &kv1,
+                layout(),
+                2,
+                &identity(),
+                Arc::clone(&worker_clock),
+                KvMetrics::register(&MetricsRegistry::new()),
+            )
+            .expect("the worker's L2 opens");
+            let tiers = WorkerTiers::new(
+                &kv1,
+                MemoryKind::Dedicated,
+                device1,
+                addresses1,
+                l2,
+                worker_clock,
+            )
+            .expect("the worker's tiers");
+            link.tiers_ready(tiers.l1_enabled(), tiers.l2_enabled())
+                .expect("tiers ready");
+            link.run_with_tiers(&mut NoSteps, Some(Box::new(tiers)))
+        });
+        let mut rt = RankRuntime::static_leader(
+            transport,
+            addr,
+            expect,
+            2,
+            Duration::from_secs(10),
+            [0; 128],
+            2,
+        )
+        .expect("the worker joins");
+        let driver = tp_tiers::leader_driver(&rt, Duration::from_secs(10), Duration::from_secs(10))
+            .expect("tier ready")
+            .expect("a static group drives tiers");
+        let reg = MetricsRegistry::new();
+        let metrics = KvMetrics::register(&reg);
+        let l2 = tp_tiers::open_rank_l2(
+            &kv0,
+            layout(),
+            2,
+            &identity(),
+            Arc::clone(&clock),
+            metrics.clone(),
+        )
+        .unwrap()
+        .expect("L2 is enabled");
+        let (mut o, _handle) = KvOrchestrator::start(
+            KvStart {
+                cfg: &kv0,
+                memory_kind: MemoryKind::Dedicated,
+                identity: identity(),
+                device: stream(&mem0, 0),
+                shards: Vec::new(),
+                l2: Some(Arc::clone(&l2)),
+                clock,
+                metrics,
+                remote: Some(driver),
+            },
+            &mut pool0,
+        )
+        .expect("the static leader's KV hierarchy starts");
+        assert!(o.h.l1_enabled() && o.h.l2_enabled(), "both tiers on");
+        let shard_bytes = layout().block_bytes() as usize;
+        assert_eq!(
+            o.backend.block_bytes, shard_bytes,
+            "the leader copies its own shard"
+        );
+        let ranks = vec![(mem0, pool0), (mem1, pool1)];
+
+        // L0 -> L1 -> L0.
+        let key = KvKey([4; 16]);
+        let want = fill(&ranks, 2);
+        run_static(&mut o, 1, TransferPath::L0ToL1, key, 2, 0).unwrap();
+        wipe(&ranks);
+        run_static(&mut o, 2, TransferPath::L1ToL0, key, 0, 7).unwrap();
+        assert_block(&ranks, 7, &want);
+
+        // L1 -> L2 (each rank its own shard) -> L0.
+        run_static(&mut o, 3, TransferPath::L1ToL2, key, 0, 0).unwrap();
+        let mut blob = vec![0u8; shard_bytes];
+        l2.get(&key, TierBlockMut::Host(&mut blob)).unwrap();
+        assert_eq!(blob, want[0], "the leader's L2 holds its own shard only");
+        wipe(&ranks);
+        run_static(&mut o, 4, TransferPath::L2ToL0, key, 0, 11).unwrap();
+        assert_block(&ranks, 11, &want);
+
+        // L0 -> L2 through each rank's own staging, and back.
+        let key2 = KvKey([5; 16]);
+        let want2 = fill(&ranks, 3);
+        run_static(&mut o, 5, TransferPath::L0ToL2, key2, 3, 0).unwrap();
+        wipe(&ranks);
+        run_static(&mut o, 6, TransferPath::L2ToL0, key2, 0, 12).unwrap();
+        assert_block(&ranks, 12, &want2);
+
+        // An eviction through the tier the hierarchy holds reaches the worker: with the block
+        // put back on the leader alone, its promotion fails on the worker, so for the group.
+        let seen = o
+            .remote
+            .as_ref()
+            .unwrap()
+            .mirror(Arc::clone(&l2) as Arc<dyn KvTier>);
+        seen.evict(&key2).unwrap();
+        l2.put(key2, TierBlockRef::Host(&want2[0])).unwrap();
+        let err = run_static(&mut o, 7, TransferPath::L2ToL0, key2, 0, 13)
+            .expect_err("the worker no longer holds the block");
+        assert!(err.to_string().contains("rank 1"), "{err}");
+
+        drop(o);
+        rt.shutdown("test done");
+        assert_eq!(
+            worker.join().expect("worker thread"),
+            Ok(()),
+            "the leader's shutdown ends the worker cleanly"
+        );
     }
 }

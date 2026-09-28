@@ -894,6 +894,9 @@ pub struct LoadedModel {
     /// Tensor parallelism: every worker rank's end of the KV tier copies, in rank order (P5,
     /// decision "P5 T17" B); empty on one device.
     pub shards: Vec<crate::kv_orchestrator::KvShard>,
+    /// `static` rank mode: the leader's driver of the worker processes' KV tiers (P5 Task 30);
+    /// `None` otherwise.
+    pub remote_tiers: Option<crate::engine::tp_tiers::TierDriver>,
     /// Tensor parallelism: every worker rank's budget and ledger, in rank order, for the group's
     /// KV admission (P5 S-8) — in `static` rank mode the leader's mirror of each worker's ledger
     /// (P5 Task 33); empty on one device.
@@ -967,6 +970,7 @@ pub fn load(
         reserve,
         held,
         shards: Vec::new(),
+        remote_tiers: None,
         group: Vec::new(),
     })
 }

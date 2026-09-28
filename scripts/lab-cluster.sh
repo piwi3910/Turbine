@@ -29,13 +29,19 @@
 #                      tp 2 in local mode (golden c1 and c16; Task 29: an OLMoE tp 1 capture on
 #                      device 0 first, the tp 2 run also compared with it — informational — and
 #                      p10 position by position), then Llama in static mode (ranks
-#                      0 and 1, leader 127.0.0.1:18100; golden c1 and c16). Prints one
-#                      `tp-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run.
+#                      0 and 1, leader 127.0.0.1:18100; golden c1 and c16), then again in
+#                      static mode with every rank's own KV tiers on a small L0 (Task 30: the
+#                      Phase 4 multi-turn load — 8 sessions × 4 turns, 400 shared words,
+#                      session hints — needs cached_tokens_ratio > 0; golden c1 against the
+#                      one-GPU capture). Prints one `tp-bench <run> tok/s=… ttft_p50_ms=…
+#                      itl_p50_ms=…` line per bench run and one `tp-multiturn …` line.
 #                      2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)". Every tp 2
-#                      golden is gated against a one-GPU capture of the same model taken in
-#                      the run (strict c1, batched c16; the one-GPU leg itself against the
-#                      committed reference), the committed reference printed for information;
-#                      a violation fails the scenario at its end, after every leg ran.
+#                      golden takes the TP rule (user decision "P5: tensor-parallel accuracy gate
+#                      against the one-GPU capture"): batched bounds at c1 and c16 against a
+#                      one-GPU capture of the same model taken in the run and against the
+#                      committed reference; the one-GPU leg itself is gated strictly against
+#                      the committed reference. A violation fails the
+#                      scenario at its end, after every leg ran.
 #   dp2-novanas       Llama-3.2-3B-Instruct at tp 1 on the standard throughput workload
 #                      (512-word prompts, 256 tokens with --ignore-eos, 200 requests, after a
 #                      16-request warm-up): first a dp 1 baseline on device 0 at concurrency 16,
@@ -54,9 +60,9 @@
 #                      (user decision "P5: OLMoE golden tolerance under expert parallelism");
 #                      the transformers reference is compared for information only (and p14's
 #                      positions report printed). turbine_expert_rank_tokens_total must be
-#                      non-zero for rank 0 and rank 1. A gate violation fails the scenario at its
-#                      end, after every run — except the ep 2 × tp 2 leg, printed as `known_fail
-#                      task29` until plan Task 29 settles OLMoE tp 2 p10. Prints one
+#                      non-zero for rank 0 and rank 1. The ep 2 × tp 2 leg includes tensor
+#                      parallelism and takes the TP rule (as tp2-novanas). A gate violation fails
+#                      the scenario at its end, after every run. Prints one
 #                      `ep-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run and
 #                      the scheduler document's `expert` section. 2-GPU numbers are
 #                      "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
@@ -383,9 +389,51 @@ scenario_tp2() {
 	gate_vs_capture llama-3.2-3b-instruct "${WORK}/llama-tp1-capture.jsonl" "llama tp2 static"
 	collective_report tp2-static
 	stop_servers
+	static_tiers_leg "$llama" "${static[@]}"
 	if [[ ${#GATE_FAILED[@]} -gt 0 ]]; then
 		job_fail "outside tolerance: ${GATE_FAILED[*]}"
 	fi
+}
+
+# static_tiers_leg <config> [--set k=v]...: Llama at tp 2 in static mode with every rank's own
+# KV tiers (plan Task 30): a small L0 (256 MiB per rank, 16 running requests), one 1 GiB L1 slab
+# per rank and each rank's L2 under ${WORK}/kv-static/rank-<r>, so the Phase 4 multi-turn load
+# demotes and promotes. Requires cached_tokens_ratio > 0 and requests_ok of every turn; then
+# golden c1 against the one-GPU capture on the same (tiered) group. Prints the leader's tier
+# counters and one `tp-multiturn tp2-static-tiers …` line.
+static_tiers_leg() {
+	local config="$1"
+	shift
+	local tiers=(--set kv.gpu.max_bytes=256MiB --set scheduler.max_running_requests=16
+		--set kv.cpu.enabled=true --set kv.cpu.max_bytes=2GiB --set kv.nvme.enabled=true
+		--set "kv.nvme.path=${WORK}/kv-static" --set kv.nvme.max_bytes=4GiB)
+	start_server "${WORK}/tp2-static-tiers-rank1.log" "$config" "$@" "${tiers[@]}" \
+		--set parallel.ranks.rank=1 --set "parallel.ranks.local_devices=[1]" \
+		--set server.listen=127.0.0.1:18001
+	start_server "${WORK}/tp2-static-tiers-rank0.log" "$config" "$@" "${tiers[@]}" \
+		--set parallel.ranks.rank=0 --set "parallel.ranks.local_devices=[0]"
+	wait_ready "$URL" "${WORK}/tp2-static-tiers-rank0.log"
+	grep -h -E '"event":"(kv_hierarchy_ready|kv_rank_tiers_ready|kv_tier_unavailable_on_rank)"|event=(kv_hierarchy_ready|kv_rank_tiers_ready|kv_tier_unavailable_on_rank)' \
+		"${WORK}"/tp2-static-tiers-rank*.log | sed 's/^/lab-info: /' || true
+	local out="${WORK}/tp2-static-tiers-multiturn.json"
+	bench_ok 32 "$out" --profile multi-turn --sessions 8 --turns 4 --shared-prefix-words 400 \
+		--session-hints --concurrency 4
+	jq -r '"tp-multiturn tp2-static-tiers cached_tokens_ratio=\(.cached_tokens_ratio) ttft_first_p50_ms=\(.ttft_ms_first_turn.p50 // "?") ttft_later_p50_ms=\(.ttft_ms_later_turns.p50 // "?") requests_ok=\(.requests_ok)"' \
+		"$out"
+	curl -s "${URL}/metrics" | grep -E '^turbine_kv_(demotions|promotions|drops)_total' |
+		sed 's/^/tp-kv tp2-static-tiers /' || true
+	jq -e '(.cached_tokens_ratio // 0) > 0' "$out" >/dev/null ||
+		GATE_FAILED+=("multi-turn tp2 static tiers cached_tokens_ratio not > 0")
+	# A TP leg: batched bounds against the one-GPU capture (user decision, follow-up (a)).
+	echo "lab-step: golden llama tp2 static tiers c1 vs 1 GPU (batched bounds)"
+	"${BIN}/turbine-golden" compare --url "$URL" \
+		--reference "${WORK}/llama-tp1-capture.jsonl" \
+		--tolerance tests/golden/llama-3.2-3b-instruct/tolerance.json \
+		--prompts tests/golden/prompts.jsonl --concurrency 1 --batched-bounds ||
+		GATE_FAILED+=("golden llama tp2 static tiers c1 vs 1 GPU")
+	curl -s "${URL}/metrics" | grep -E '^turbine_kv_(demotions|promotions)_total' |
+		sed 's/^/tp-kv tp2-static-tiers-after-golden /' || true
+	stop_servers
 }
 
 # capture_one_gpu <slug> <out>: the one-GPU server's golden c1 against the committed reference
@@ -398,18 +446,19 @@ capture_one_gpu() {
 		--out "$out" || job_fail "turbine-golden capture failed"
 }
 
-# gate_vs_capture <slug> <capture> <label>: the multi-GPU gate — strict at c1, batched at c16,
-# against the one-GPU capture (a violation is recorded in GATE_FAILED; the scenario goes on and
-# fails at its end); the committed transformers reference at c1 and c16 for information.
+# gate_vs_capture <slug> <capture> <label>: the tensor-parallel gate (user decision "P5:
+# tensor-parallel accuracy gate against the one-GPU capture", A): against the one-GPU capture
+# with the batched bounds at c1 and c16, and against the committed transformers reference with
+# the batched bounds at c1 and c16 too (follow-up (a)). A violation is recorded in GATE_FAILED;
+# the scenario goes on and fails at its end.
 gate_vs_capture() {
 	local slug="$1" capture="$2" label="$3" c
 	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
 	for c in 1 16; do
-		echo "lab-step: golden ${label} c${c} vs 1 GPU"
+		echo "lab-step: golden ${label} c${c} vs 1 GPU (batched bounds)"
 		"${BIN}/turbine-golden" compare --url "$URL" --reference "$capture" "${tol[@]}" \
-			--concurrency "$c" || GATE_FAILED+=("golden ${label} c${c} vs 1 GPU")
-		golden_info "${label} c${c} vs HF" --reference "tests/golden/${slug}/reference.jsonl" \
-			--concurrency "$c"
+			--concurrency "$c" --batched-bounds || GATE_FAILED+=("golden ${label} c${c} vs 1 GPU")
+		golden_gate "$slug" "${label} c${c} vs HF" --concurrency "$c" --batched-bounds
 	done
 }
 
@@ -558,10 +607,9 @@ scenario_ep2() {
 
 	start_server "${WORK}/ep2-tp2.log" "$ep2" --set parallel.tensor_parallel_size=2
 	wait_ready "$URL" "${WORK}/ep2-tp2.log"
-	# OLMoE tp 2 p10 diverges (not a near-tie): plan Task 29 fixes or explains it; until then this
-	# leg reports and does not decide the scenario's verdict.
-	golden_vs_one_gpu "olmoe ep2 tp2" known_fail task29
-	golden_info "olmoe ep2 tp2 c1 vs HF" --reference "tests/golden/${slug}/reference.jsonl"
+	# ep 2 Ã tp 2 includes tensor parallelism: the TP rule (batched bounds against the ep 1
+	# capture, the golden rule against the transformers reference).
+	gate_vs_capture "$slug" "${WORK}/ep1-capture.jsonl" "olmoe ep2 tp2"
 	ep_counts ep2-tp2
 	stop_servers
 
@@ -727,6 +775,8 @@ RUN_DIR="${CI_ROOT}/runs/${RUN_ID}"
 SELECTOR="turbine-lab=true,turbine-lab-run=${RUN_ID}"
 # How long a GPU pod may stay unschedulable before the run gives up.
 UNSCHEDULABLE_LIMIT=60
+# How long it may wait behind other Turbine lab Jobs (our own queue) before giving up.
+OWN_QUEUE_LIMIT="${TURBINE_LAB_QUEUE_LIMIT:-10800}"
 
 say() {
 	echo "lab-cluster: novanas: $*"
@@ -820,6 +870,20 @@ wait_for_pod() {
 		phase="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.phase}'" || true)"
 		[[ "$phase" == Running || "$phase" == Succeeded || "$phase" == Failed ]] && return 0
 		unschedulable="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.conditions[?(@.reason==\"Unschedulable\")].message}'" || true)"
+		# Waiting behind another Turbine lab Job (label turbine-lab=true) is a queue, not a
+		# failure: name the holders every 5 min and wait up to OWN_QUEUE_LIMIT. Anything else
+		# holding amd.com/gpu gives up after UNSCHEDULABLE_LIMIT (never evicted).
+		if [[ $gpus -gt 0 && "$unschedulable" == *"amd.com/gpu"* ]]; then
+			local ours=""
+			ours="$(kube "-n ${NS} get pods -l turbine-lab=true --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.labels.job-name} {end}'" || true)"
+			ours="${ours//${job}/}"
+			if [[ -n "${ours// /}" && $waited -lt $OWN_QUEUE_LIMIT ]]; then
+				((waited % 300 == 0)) && say "queued behind our lab Job(s):${ours} (waited ${waited} s)"
+				sleep 5
+				waited=$((waited + 5))
+				continue
+			fi
+		fi
 		if [[ $gpus -gt 0 && "$unschedulable" == *"amd.com/gpu"* && $waited -ge $UNSCHEDULABLE_LIMIT ]]; then
 			echo "lab-cluster: novanas: ${unschedulable}" >&2
 			cleanup
