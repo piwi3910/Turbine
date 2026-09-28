@@ -76,8 +76,11 @@ pub struct ModelArchConfig {
     /// RMSNorm over each Q and K head (`q_norm` / `k_norm` of `[head_dim]`) before RoPE
     /// (Qwen3, Qwen3-MoE); never together with `qk_norm`.
     pub qk_norm_per_head: bool,
-    /// How the weights are stored and which dtypes weights, activations and KV use.
+    /// How the weights are stored and which dtypes weights and activations use.
     pub weight_format: WeightFormatRef,
+    /// How the paged KV pool stores K and V (`kv.dtype`, Phase 6a S-13): BF16 as parsed; the
+    /// server sets FP8 and its per-layer scales before the executor is built.
+    pub kv_cache: crate::kv_scales::KvCache,
 }
 
 /// Per-layer mixture of experts: a router picks `experts_per_token` of `num_experts` SwiGLU
@@ -202,14 +205,14 @@ impl ModelArchConfig {
         canonical_json(&value)
     }
 
-    /// Per-token K and V of every layer, in BF16 (the configured `kv.dtype` replaces this in
-    /// Phase 6a Task 22), in blocks of `block_tokens` tokens.
+    /// Per-token K and V of every layer in the [`ModelArchConfig::kv_cache`] dtype (BF16, or
+    /// FP8 e4m3 under `kv.dtype: fp8_e4m3`), in blocks of `block_tokens` tokens.
     pub fn kv_layout(&self, block_tokens: u32) -> KvLayout {
         KvLayout {
             num_layers: self.num_layers,
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
-            dtype: crate::weights::Bf16::DTYPE,
+            dtype: self.kv_cache.dtype,
             block_tokens,
         }
     }
@@ -502,6 +505,7 @@ pub fn load_model_config_with(
         qk_norm: family_cfg.qk_norm,
         qk_norm_per_head: family_cfg.qk_norm_per_head,
         weight_format,
+        kv_cache: crate::kv_scales::KvCache::bf16(),
     })
 }
 

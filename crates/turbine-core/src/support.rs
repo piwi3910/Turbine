@@ -337,6 +337,16 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Experimental,
     ),
+    // FP8 KV on the CPU reference provider (Phase 6a S-13): tests and tiny checkpoints.
+    row(
+        Some("cpu"),
+        None,
+        None,
+        BF16,
+        Some(KvFormatColumn::Fp8E4m3),
+        NO_SPEC,
+        SupportStatus::Experimental,
+    ),
     // Reserved for the tracks; each track replaces its refusal with validated rows.
     family_row("amd", "Qwen3ForCausalLM"),
     family_row("amd", "Qwen3MoeForCausalLM"),

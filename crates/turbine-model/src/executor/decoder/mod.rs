@@ -265,14 +265,17 @@ impl DecoderDims {
         }
     }
 
-    /// Paged causal GQA attention over blocks of `block_tokens` tokens.
-    fn attention(&self, kind: AttentionKind, block_tokens: u32) -> AttentionConfig {
+    /// Paged causal GQA attention over blocks of `block_tokens` tokens of `kv` pages (the
+    /// activation dtype, or F8E4M3 under `kv.dtype: fp8_e4m3`: the config then names the page
+    /// dtype, [`AttentionConfig::dtype`]).
+    fn attention(&self, kind: AttentionKind, block_tokens: u32, kv: DType) -> AttentionConfig {
+        let dtype = if kv == DType::F8E4M3 { kv } else { self.act };
         AttentionConfig {
             kind,
             num_q_heads: self.heads as u32,
             num_kv_heads: self.kv_heads as u32,
             head_dim: self.head_dim as u32,
-            dtype: self.act,
+            dtype,
             block_tokens: Some(block_tokens),
             causal: true,
         }
@@ -758,8 +761,16 @@ impl DecoderExecutor {
         specs.extend(spec.attention.requirements(d));
         specs.extend([
             OpConfig::Rope(d.rope()),
-            OpConfig::Attention(d.attention(AttentionKind::PrefillPaged, block_tokens)),
-            OpConfig::Attention(d.attention(AttentionKind::DecodePaged, block_tokens)),
+            OpConfig::Attention(d.attention(
+                AttentionKind::PrefillPaged,
+                block_tokens,
+                cfg.kv_cache.dtype,
+            )),
+            OpConfig::Attention(d.attention(
+                AttentionKind::DecodePaged,
+                block_tokens,
+                cfg.kv_cache.dtype,
+            )),
             OpConfig::Gemm(d.gemm(d.hidden, d.q_dim, act)),
             OpConfig::Add(d.add()),
         ]);
@@ -1656,7 +1667,14 @@ impl DecoderExecutor {
         } else {
             AttentionKind::PrefillPaged
         };
-        let attn = d.attention(kind, self.kv_layout.block_tokens);
+        let attn = d.attention(kind, self.kv_layout.block_tokens, self.kv_layout.dtype);
+        // The KV scales are the model layer's (a pipeline stage's layer `i` is model layer
+        // `layers.start + i`); every tensor-parallel rank has the same ones.
+        let model_layer = self.pp.as_ref().map_or(0, |pp| pp.layers.start as usize) + i;
+        let (k_scale, v_scale) = (
+            self.cfg.kv_cache.k_scale(model_layer),
+            self.cfg.kv_cache.v_scale(model_layer),
+        );
         let out = TensorView::contiguous(
             b.attn.storage.whole(),
             w.r0 * d.heads * d.head_dim,
@@ -1680,6 +1698,8 @@ impl DecoderExecutor {
                     max_kv_len: p.max_kv_len,
                     max_blocks_per_seq: p.max_blocks_per_seq,
                     scale: d.attn_scale,
+                    k_scale,
+                    v_scale,
                 })
         })?;
         self.record(li, "attn", at(&b.attn))?;

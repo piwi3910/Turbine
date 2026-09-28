@@ -15,6 +15,7 @@ pub mod executor;
 pub mod families;
 pub mod formats;
 pub mod generate;
+pub mod kv_scales;
 pub mod loader;
 pub mod metrics;
 pub mod pp;

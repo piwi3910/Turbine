@@ -2261,8 +2261,8 @@ impl AttentionKernel for ShimProvider {
             scale: ctx.scale,
             causal: i32::from(cfg.causal),
             dtype: cfg.dtype.abi_code(),
-            k_scale: 1.0,
-            v_scale: 1.0,
+            k_scale: ctx.k_scale,
+            v_scale: ctx.v_scale,
         };
         self.run(cfg.op(), trio, &d, 0)
     }

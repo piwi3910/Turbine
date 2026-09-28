@@ -257,6 +257,11 @@ pub struct AttentionConfig {
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
+    /// Element type of Q, the new K/V rows, the output and the KV. A paged kind may name
+    /// [`DType::F8E4M3`] (Phase 6a S-13, `kv.dtype: fp8_e4m3`): the pool pages are then OCP
+    /// e4m3fn bytes with one K and one V scale per layer ([`PagedAttentionContext::k_scale`]),
+    /// while Q, the new rows and the output stay BF16 (the C ABI's `dtype` names the pages the
+    /// same way).
     pub dtype: DType,
     /// KV page size in tokens for paged attention; `None` for the contiguous per-sequence KV of
     /// Phase 1.
@@ -658,6 +663,11 @@ pub struct PagedAttentionContext<'a> {
     pub max_blocks_per_seq: u32,
     /// Usually `1 / sqrt(head_dim)`.
     pub scale: f32,
+    /// FP8 pages (`cfg.dtype` F8E4M3): a K element is stored as `e4m3(k / k_scale)` and read as
+    /// `e4m3 · k_scale`, likewise V with `v_scale` (this layer's scales, > 0). Ignored (1.0 by
+    /// convention) for BF16 / F16 / F32 pages.
+    pub k_scale: f32,
+    pub v_scale: f32,
 }
 
 /// Copies block `src` to block `dst` in every layer, for each `(src, dst)` of `pairs` in order.

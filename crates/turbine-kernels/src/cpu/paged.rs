@@ -281,6 +281,8 @@ mod tests {
             max_kv_len: 20,
             max_blocks_per_seq: 2,
             scale: 1.0 / (d as f32).sqrt(),
+            k_scale: 1.0,
+            v_scale: 1.0,
         })
         .expect("paged attention");
         let paged_out = load(&out.view()).expect("load");

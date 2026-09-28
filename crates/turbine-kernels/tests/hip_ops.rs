@@ -1177,6 +1177,8 @@ fn paged_case(
             max_kv_len: kv_lens.iter().copied().max().unwrap_or(0) as u32,
             max_blocks_per_seq: max_blocks as u32,
             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+            k_scale: 1.0,
+            v_scale: 1.0,
         };
         kernel.execute_paged(&mut ctx).expect("paged attention");
     }
@@ -2742,6 +2744,8 @@ fn decode_op_timings() {
                         max_kv_len: max_kv as u32,
                         max_blocks_per_seq: max_blocks as u32,
                         scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                        k_scale: 1.0,
+                        v_scale: 1.0,
                     })
                     .expect("paged decode attention");
                 });
@@ -3286,6 +3290,8 @@ fn decode_forward_timing() {
                             max_kv_len: max_kv as u32,
                             max_blocks_per_seq: max_blocks as u32,
                             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                            k_scale: 1.0,
+                            v_scale: 1.0,
                         })
                         .expect("paged decode attention")
                     });
@@ -3584,6 +3590,8 @@ fn decode_attention_timings() {
                         max_kv_len: max_kv as u32,
                         max_blocks_per_seq: max_blocks as u32,
                         scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                        k_scale: 1.0,
+                        v_scale: 1.0,
                     })
                     .expect("paged decode attention");
                 });
@@ -3899,6 +3907,8 @@ fn fused_projection_timings() {
                 max_kv_len: max_kv as u32,
                 max_blocks_per_seq: max_blocks as u32,
                 scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                k_scale: 1.0,
+                v_scale: 1.0,
             })
             .expect("paged decode attention");
         };
