@@ -53,8 +53,9 @@ pub struct ParallelConfig {
     /// needs kernel ABI v2.8). Default off until benched.
     pub tp_decode_graphs: bool,
     /// Tensor-parallel ranks split large prefills in two halves whose all-reduces run on a
-    /// second stream while the other half computes (P5 Task 32; same results). Default on
-    /// (user decision 2026-09-28: +10 % throughput, −38 % TTFT at tp 2); `false` turns it off.
+    /// second stream while the other half computes (P5 Task 32; same results). Default off
+    /// (user decision 2026-09-28, superseding "default on": the middle-row split breaks
+    /// bit-exact prefix reuse at tp 2 until it splits at a block boundary).
     pub tp_prefill_overlap: bool,
 }
 
@@ -150,7 +151,7 @@ impl Default for ParallelConfig {
             expert: ExpertConfig::default(),
             topology: TopologyConfig::default(),
             tp_decode_graphs: false,
-            tp_prefill_overlap: true,
+            tp_prefill_overlap: false,
         }
     }
 }

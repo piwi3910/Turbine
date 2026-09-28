@@ -1084,6 +1084,8 @@ Decision (Phase 5 lead, 2026-09-28): no end-to-end tp2 bench of (b); `hostmem_dm
 
 **Decision (user, 2026-09-28): default on.** `parallel.tp_prefill_overlap` defaults to `true`; the switch stays to turn it off; the Phase 5 exit bench runs with it on.
 
+**Superseded (user, 2026-09-28): A now, then B.** Options shown: off now, fix, then on (recommended, chosen); keep on and fix before the exit; keep on and relax exactness. Evidence: the Phase 5 exit gate 3 (`lab-test novanas --gpus 2 --features fault-injection --tier full`, run 0928125603-04f6f801, 599e746) failed kv_gpu `prefix_reuse_suffix_lengths_match_cold_tp2` in 6 of 7 cases (warm vs cold differ at token 0, |Δ logprob| 0.005–0.06) with the overlap on; the same test with `parallel.tp_prefill_overlap=false` passes — the default conflicted with "P5: bit-exact prefix reuse under tensor parallelism" (B). `parallel.tp_prefill_overlap` is off by default again; plan Task 34 (tp-perf) splits the overlapped prefill at a `kv.block_tokens` boundary with batch-invariant GEMM rows for the half shapes, and re-enables the default only once that kv_gpu test and golden pass at tp 2, with a re-bench (inside Phase 5 if quick, else a Phase 5p item; the exit does not wait for it).
+
 ## P5 Task 32 (d): per-shard logits reduction before the gather
 
 - A) exact-only: merge per shard only for rows with no categorical draw and no log-sum-exp consumer (a new row flag the server sets); the standard bench (sampled) and golden (logprobs) gain nothing

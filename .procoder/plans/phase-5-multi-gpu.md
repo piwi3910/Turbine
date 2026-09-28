@@ -587,7 +587,7 @@ Profile as built (2026-09-28, branch p5-tp-profile c0533b3, merged b9da838): `tu
 Fixes as built (2026-09-28, branch p5-tp-perf-clean, merged; each off by default, each bitwise equal to its baseline in host and 2-GPU lab tests; A/B in one `lab-cluster --bench-lock tp2-novanas` run, 2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8), Llama c16, tp2 baseline 914 tok/s / TTFT 445 ms / ITL 11.84 ms):
 
 - (b) 21dfec0 copy-engine all-reduce (`parallel.collective.hostmem_dma_min_bytes`, reason `copy_engine`): no faster than RCCL (16 MiB 4.53–4.67 ms vs 4.24–4.28 ms); a 2-rank all-reduce through host memory is capped near 15 GB/s aggregate for every transport, so the prefill all-reduce floor is ≈ 198 ms per 2,048-token chunk and the (b) TTFT estimate (~255 ms) does not hold. Not benched end to end (lead decision in decisions.md).
-- (c) dbd4f52 prefill overlap (`parallel.tp_prefill_overlap`): 1007.7 tok/s (+10.2 %), TTFT 274 ms (−38 %); dense-FFN families only (OLMoE unchanged); golden 16/16 c1/c16 against capture and HF. On by default (user decision 2026-09-28); `parallel.tp_prefill_overlap: false` turns it off.
+- (c) dbd4f52 prefill overlap (`parallel.tp_prefill_overlap`): 1007.7 tok/s (+10.2 %), TTFT 274 ms (−38 %); dense-FFN families only (OLMoE unchanged); golden 16/16 c1/c16 against capture and HF. Briefly on by default, then back to off (user decision 2026-09-28): with it on, kv_gpu `prefix_reuse_suffix_lengths_match_cold_tp2` fails 6/7 (the middle-row split puts the halves outside the batch-invariant GEMM rows, so cached blocks depend on the split); it passes with it off. Follow-up Task 34.
 - (a) 901a5c7 decode graphs under TP (`parallel.tp_decode_graphs`, ABI v2.8 device-side sequence counter): ITL 11.52 ms, tok/s within noise.
 - (d) deferred (user decision 2026-09-28): an exact per-shard merge cannot reproduce the full-row lse or the categorical draw; the saving is ~1.2 ms per step.
 - 6b3b467: lab tests opening RCCL communicators concurrently fail on novanas; `hostmem_lab` serialises them.
@@ -605,6 +605,23 @@ Interfaces:
 - [ ] Implement.
 - [ ] Gate: `scripts/gate.sh`
 - [ ] Commit: `feat(server,distributed,reliability): mirror ledgers for group admission in static rank mode`
+
+## Task 34: Prefill overlap that keeps prefix reuse bit-exact
+
+Files: `crates/turbine-model/src/executor/decoder/` (the split point), the GEMM batch-invariance table (Task 29 rows for the half shapes), `crates/turbine-core/src/config/parallel.rs` (the default), `crates/turbine-server/tests/kv_gpu.rs`
+Interfaces:
+
+- the overlapped prefill splits at a `kv.block_tokens` boundary; the half shapes have batch-invariant GEMM rows; `parallel.tp_prefill_overlap` defaults to `true` again only after the checks below pass
+  Covers: user decisions "P5 Task 32 (c): tensor-parallel prefill overlap on by default?" (superseded: A now, then B) and "P5: bit-exact prefix reuse under tensor parallelism" (B)
+  Depends on: Tasks 29, 32
+
+- [ ] Failing test first: `kv_gpu prefix_reuse_suffix_lengths_match_cold_tp2` with `parallel.tp_prefill_overlap=true` (fails 6/7 on 599e746). Run: `scripts/lab-test.sh novanas --gpus 2 -- -p turbine-server --test kv_gpu -- prefix_reuse_suffix_lengths_match_cold_tp2` — expect FAIL.
+- [ ] Implement the block-boundary split and the table rows; the host split-vs-unsplit and the 2-GPU overlap-vs-serial tests stay bitwise.
+- [ ] Lab: the kv_gpu test passes with the overlap on; golden c1/c16 at tp 2 under the TP rule; re-bench `scripts/lab-cluster.sh --bench-lock tp2-novanas`; then flip the default.
+- [ ] Gate: `scripts/gate.sh`
+- [ ] Commit: `perf(model): tensor-parallel prefill overlap split at a block boundary; default on`
+
+Owner: the tp-perf agent. May land inside Phase 5 if quick; otherwise a tracked Phase 5p item — the Phase 5 exit does not wait for it.
 
 ## Queued after Phase 5 (not part of this phase)
 
