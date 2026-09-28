@@ -17,11 +17,13 @@ mod l0;
 mod l1;
 mod l2;
 mod mem;
+mod sharded;
 
 pub use l0::L0Tier;
 pub use l1::{L1Config, L1PinnedTier};
 pub use l2::{L2Config, L2NvmeTier, SLAB_MAGIC};
 pub use mem::MemTier;
+pub use sharded::{ShardSlots, ShardedL1Tier};
 
 /// A KV tier, fastest first. Serde and label spelling `"l0"`..`"l3"` everywhere (CONFLICT C-4);
 /// `L3` (cluster) arrives with Phase 6.

@@ -362,6 +362,7 @@ pub(crate) mod tests {
                 dtype: DType::BF16,
                 block_tokens: 16,
             },
+            shards: 1,
         }
     }
 

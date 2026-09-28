@@ -238,6 +238,7 @@ pub fn spawn(
                     memory_kind: prepared.provider.opened.memory_kind,
                     identity: prepared.identity,
                     device,
+                    shards: Vec::new(),
                     l2: startup.kv.l2,
                     clock: Arc::clone(&clock),
                     metrics: metrics.kv.clone(),

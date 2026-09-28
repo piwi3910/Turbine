@@ -509,6 +509,108 @@ fn l1_passes_the_contract_suite() {
     suite(&l1, 4);
 }
 
+/// Two rank shards of `BLOCK / 2` bytes each, 2-slot slabs, `max_slabs` slabs per shard, each
+/// shard over its own allocator (a rank's own kernel-library context).
+fn sharded_l1(max_slabs: u64) -> (ShardedL1Tier, [Arc<HostPinned>; 2]) {
+    let half = BLOCK / 2;
+    let allocs = [
+        Arc::new(HostPinned::new(u64::MAX)),
+        Arc::new(HostPinned::new(u64::MAX)),
+    ];
+    let shards = allocs
+        .iter()
+        .map(|a| {
+            Arc::new(L1PinnedTier::new(
+                L1Config {
+                    enabled: true,
+                    max_bytes: max_slabs * 2 * half,
+                    slab_bytes: 2 * half,
+                    block_bytes: half,
+                    memory_kind: MemoryKind::Dedicated,
+                },
+                a.clone() as Arc<dyn turbine_tensor::PinnedMemory>,
+                clock(),
+            ))
+        })
+        .collect();
+    (ShardedL1Tier::new(shards, half), allocs)
+}
+
+#[test]
+fn sharded_l1_passes_the_contract_suite() {
+    let (l1, allocs) = sharded_l1(2);
+    assert_eq!(l1.capacity_bytes(), 4 * BLOCK, "capacity sums the shards");
+    suite(&l1, 4);
+    assert!(
+        allocs.iter().all(|a| a.live_buffers() == 2),
+        "each shard pins its slabs through its own allocator"
+    );
+}
+
+#[test]
+fn sharded_l1_splits_blocks_by_rank() {
+    let (l1, _allocs) = sharded_l1(2);
+    let half = (BLOCK / 2) as usize;
+    let block = bytes(7);
+    l1.put(key(1), TierBlockRef::Host(&block)).unwrap();
+    for (rank, shard) in l1.shards().iter().enumerate() {
+        let mut out = vec![0u8; half];
+        shard.get(&key(1), TierBlockMut::Host(&mut out)).unwrap();
+        assert_eq!(
+            out,
+            block[rank * half..(rank + 1) * half],
+            "rank {rank} holds its slice"
+        );
+    }
+
+    // A block one shard lacks is not stored.
+    l1.shards()[1].evict(&key(1)).unwrap();
+    assert!(!l1.contains(&key(1)));
+    let mut out = vec![0u8; BLOCK as usize];
+    assert_eq!(
+        l1.get(&key(1), TierBlockMut::Host(&mut out)),
+        Err(TierError::Missing)
+    );
+    assert_eq!(
+        l1.evict(&key(1)),
+        Ok(()),
+        "evicts the shard that still held it"
+    );
+    assert_eq!(l1.evict(&key(1)), Err(TierError::Missing));
+
+    // Reservations are all-or-nothing and commit / abort on every shard.
+    let slots = l1.reserve(key(2)).unwrap();
+    assert_eq!(slots.len(), 2);
+    assert!(l1.locate(&key(2)).is_none(), "invisible until committed");
+    l1.commit(&key(2));
+    assert_eq!(l1.locate(&key(2)).unwrap(), slots);
+    l1.reserve(key(3)).unwrap();
+    assert!(l1.abort_reservation(&key(3)));
+    assert_eq!(
+        l1.used_bytes(),
+        BLOCK,
+        "the aborted reservation is freed on both shards"
+    );
+
+    // A put that fails on one shard leaves no partial copy on the others.
+    let (full, _a) = sharded_l1(1);
+    full.shards()[1]
+        .put(key(8), TierBlockRef::Host(&vec![0u8; half]))
+        .unwrap();
+    full.shards()[1]
+        .put(key(9), TierBlockRef::Host(&vec![0u8; half]))
+        .unwrap();
+    assert_eq!(
+        full.put(key(1), TierBlockRef::Host(&block)),
+        Err(TierError::Full)
+    );
+    assert!(!full.shards()[0].contains(&key(1)));
+    assert_eq!(full.shards()[0].used_bytes(), 0);
+    // A reservation that fails on one shard frees the other's.
+    assert_eq!(full.reserve(key(1)), Err(TierError::Full));
+    assert_eq!(full.shards()[0].used_bytes(), 0);
+}
+
 /// A tier whose reads keep failing degrades, and every attach that needed it ends ready with
 /// reason `tier_degraded` (recompute), never failed or lost.
 #[test]
