@@ -558,6 +558,7 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "serving_mix",
         "forward_profile",
         "moe_prefill_timings",
+        "moe_ep_local_timings",
         "host_step_costs",
         "decode_forward_timing",
         "decode_op_timings",

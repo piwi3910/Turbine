@@ -23,6 +23,7 @@ use turbine_kernels::{
     ShimLibrary, cpu_reference_provider, shim_provider,
 };
 use turbine_model::config::{ModelArchConfig, RopeScaling};
+use turbine_model::ep::{self, ExpertPlacement};
 use turbine_model::executor::{
     self, BatchInput, DecodeGraphs, DecoderExecutor, DecoderSpec, ExecutorLimits, ExecutorOptions,
     GraphBackend, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice, SequenceKv,
@@ -37,8 +38,8 @@ use turbine_model::testing::tiny::{
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::tp;
 use turbine_model::{
-    MAX_STAGING_BYTES, ModelError, SafetensorsIndex, TpContext, WeightLoader, llama_slots,
-    olmoe_slots,
+    EpContext, MAX_STAGING_BYTES, ModelError, SafetensorsIndex, TpContext, WeightLoader,
+    llama_slots, olmoe_slots,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::host::HostMemory;
@@ -3802,4 +3803,422 @@ fn tp_layer0_matches_one_device_slices() {
         }
         println!("tp_layer0_matches_one_device_slices {name}: worst scaled diff {worst:e}");
     }
+}
+
+// ----------------------------------------------------------- expert parallelism (P5 S-11)
+
+/// One EP rank's run: its greedy run, its router's choices (every layer's `topk_ids` and
+/// `topk_weights` trace, in order) and its token counts afterwards.
+struct EpRun {
+    run: GreedyRun,
+    router: Vec<TraceTensor>,
+    counts: ep::ExpertCountsSnapshot,
+}
+
+/// Rank `s` of `spec`'s model (an EP rank; with tp = ep also the tensor-parallel rank of the
+/// same position, both on `collective`) on `provider` over `mem`, its experts placed by
+/// `placement`; the executor and the counts it records.
+fn ep_decoder(
+    spec: &TinySpec,
+    s: ep::EpShard,
+    placement: &Arc<ExpertPlacement>,
+    collective: Arc<dyn Collective>,
+    provider: Arc<dyn KernelProvider>,
+    mem: &Arc<dyn DeviceMemory>,
+) -> (DecoderExecutor, Arc<ep::ExpertTokenCounts>) {
+    let cfg = &spec.config;
+    let opts = ExecutorOptions::default();
+    let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+    let slots = ep::weight_slots(cfg, s, placement).expect("rank slots");
+    let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load rank");
+    let reqs = ep::available_requirements(
+        cfg,
+        s,
+        placement,
+        BLOCK_TOKENS,
+        opts,
+        std::slice::from_ref(&provider),
+    )
+    .expect("requirements");
+    let order = [provider.id()];
+    let card = provider.card_profile();
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
+        .expect("every op has a provider");
+    let counts = Arc::new(ep::ExpertTokenCounts::default());
+    let tp = s.tp_shard().map(|t| TpContext {
+        rank: t.rank,
+        world: t.world,
+        collective: Arc::clone(&collective),
+        stream: mem.compute_stream(),
+    });
+    let ctx = EpContext {
+        rank: s.rank,
+        world: s.world,
+        placement: Arc::clone(placement),
+        collective,
+        stream: mem.compute_stream(),
+        counts: Arc::clone(&counts),
+    };
+    let decoder = cfg.family.0.tp_decoder_spec().expect("olmoe hooks");
+    let exec = DecoderExecutor::new_parallel(
+        cfg,
+        decoder,
+        weights,
+        Arc::new(registry),
+        Arc::clone(mem),
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: 64,
+            max_seqs: MAX_SEQS,
+        },
+        opts,
+        tp,
+        Some(ctx),
+    )
+    .expect("rank executor");
+    (exec, counts)
+}
+
+/// Runs `body` on every rank of a `world`-rank EP group (attention `attention`, experts placed
+/// by `placement`) over the host collective, one thread per rank, each on the memory and
+/// provider `env(rank)` gives, with its own pool of its KV layout; returns every rank's result.
+fn ep_group<T: Send>(
+    spec: &TinySpec,
+    world: u32,
+    attention: ep::EpAttention,
+    placement: &Arc<ExpertPlacement>,
+    env: impl Fn(u32) -> (Arc<dyn DeviceMemory>, Arc<dyn KernelProvider>) + Sync,
+    body: impl Fn(&mut DecoderExecutor, &KvPoolView<'_>, &ep::ExpertTokenCounts) -> T + Sync,
+) -> Vec<T> {
+    let group = HostCollective::group(world as usize, std::time::Duration::from_secs(60));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = group
+            .into_iter()
+            .enumerate()
+            .map(|(rank, collective)| {
+                let (env, body) = (&env, &body);
+                scope.spawn(move || {
+                    let s = ep::EpShard {
+                        rank: rank as u32,
+                        world,
+                        attention,
+                    };
+                    let (mem, provider) = env(s.rank);
+                    let (mut exec, counts) =
+                        ep_decoder(spec, s, placement, Arc::new(collective), provider, &mem);
+                    let layout = ep::kv_layout(&spec.config, s, BLOCK_TOKENS).expect("layout");
+                    assert_eq!(*exec.kv_layout(), layout);
+                    let storage = pool(&mem, &layout, 4);
+                    body(&mut exec, &pool_view(&storage, &layout, 4), &counts)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("rank thread"))
+            .collect()
+    })
+}
+
+/// [`greedy_pair`] traced on an EP rank: its run, router choices and counts.
+fn ep_greedy_pair(
+    exec: &mut DecoderExecutor,
+    kv: &KvPoolView<'_>,
+    counts: &ep::ExpertTokenCounts,
+    vocab: u32,
+) -> EpRun {
+    exec.set_trace(true);
+    let run = greedy_pair(exec, kv, vocab);
+    let router = exec
+        .take_trace()
+        .into_iter()
+        .filter(|t| t.name == "topk_ids" || t.name == "topk_weights")
+        .collect();
+    EpRun {
+        run,
+        router,
+        counts: counts.snapshot(),
+    }
+}
+
+/// Checks an EP group's runs against one device's run `want` (as
+/// [`check_tp_against_one_device`]) and among themselves: the same router choices on every
+/// rank at every layer and step, and the same token counts, which account for every routed row
+/// of the run exactly once (`tokens · top_k` per layer) and none to a rank without the expert.
+fn check_ep_group(what: &str, ranks: &[EpRun], want: &GreedyRun, bound: TpBound, rows: u64) -> f64 {
+    for (rank, r) in ranks.iter().enumerate() {
+        assert!(!r.router.is_empty(), "{what}: rank {rank} traced no router");
+        assert!(
+            r.router == ranks[0].router,
+            "{what}: rank {rank}'s router choices differ from rank 0's"
+        );
+        assert_eq!(r.counts, ranks[0].counts, "{what}: rank {rank}'s counts");
+    }
+    let c = &ranks[0].counts;
+    let layers = c.per_layer.len() as u64;
+    assert_eq!(
+        c.per_rank.iter().sum::<u64>(),
+        rows * layers,
+        "{what}: {c:?}"
+    );
+    assert_eq!(
+        c.per_expert.iter().sum::<u64>(),
+        rows * layers,
+        "{what}: {c:?}"
+    );
+    for (_, per_expert) in &c.per_layer {
+        assert_eq!(per_expert.iter().sum::<u64>(), rows, "{what}: {c:?}");
+    }
+    let runs: Vec<GreedyRun> = ranks.iter().map(|r| r.run.clone()).collect();
+    check_tp_against_one_device(what, &runs, want, bound)
+}
+
+/// A single-token placement file text for `world` ranks: in every layer the experts
+/// `chosen[layer]` on rank 0, the others dealt round-robin over ranks 1.. (rank 0 too when
+/// `world` is 1).
+fn one_rank_placement(chosen: &[Vec<u32>], experts: u32, world: u32) -> String {
+    chosen
+        .iter()
+        .enumerate()
+        .map(|(layer, picked)| {
+            let mut next = 0u32;
+            let ranks: Vec<String> = (0..experts)
+                .map(|e| {
+                    if world == 1 || picked.contains(&e) {
+                        return "0".to_string();
+                    }
+                    let r = 1 + next % (world - 1);
+                    next += 1;
+                    r.to_string()
+                })
+                .collect();
+            format!("{layer}: [{}]\n", ranks.join(", "))
+        })
+        .collect()
+}
+
+/// P5 S-11: the tiny OLMoE (8 experts top-2, Q/K norm, untied LM head) on the cpu-reference
+/// provider split into EP 2 and EP 4 (contiguous: 4 or 2 experts per rank) over the host
+/// collective, with attention replicated (tp = 1) and tensor-parallel over the same ranks
+/// (tp = ep), gives one device's greedy tokens exactly for a ragged two-sequence prefill and 16
+/// batched decode steps, with logits bitwise equal on every rank, the same router choices
+/// (`topk_ids`, `topk_weights`) on every rank at every layer and step, every routed row counted
+/// once, and every row's top-5 logprobs within the strict golden bounds ([`TpBound::Golden`]);
+/// an EP group of one is bitwise one device. Then a batch whose every token routes to rank 0's
+/// experts: one token, its layers' two chosen experts placed on rank 0 by a placement file
+/// (the others dealt over the other ranks, non-contiguously), at tp = 1 gives one device's
+/// logits bitwise (the other ranks add exact zeros) and counts every routed row on rank 0.
+/// Breaks if a rank drops or double-counts an expert, loads another rank's expert, the combine
+/// is missing or doubled (tp = ep) or the router differs between ranks.
+#[test]
+fn ep2_matches_ep1_on_host() {
+    let tmp = TempDir::new("tiny-model-ep");
+    let spec = write_tiny_olmoe(tmp.path(), SEED);
+    let cfg = &spec.config;
+    let moe = cfg.moe.expect("tiny OLMoE has experts");
+    let layers = ep::moe_layers(cfg);
+    let host = |rank: u32| -> (Arc<dyn DeviceMemory>, Arc<dyn KernelProvider>) {
+        (
+            HostMemory::new(DeviceId(rank), 1 << 30),
+            cpu_reference_provider(),
+        )
+    };
+    let (mem, _) = host(0);
+    let mut one = cpu_model(&spec, &mem, 64);
+    let layout = cfg.kv_layout(BLOCK_TOKENS);
+    let storage = pool(&mem, &layout, 4);
+    let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+    // greedy_pair routes 20 + 13 prefill and 16 × 2 decode tokens.
+    let rows = u64::from((20 + 13 + 2 * TP_STEPS as u32) * moe.experts_per_token);
+    let golden = TpBound::Golden(GoldenLogprobBounds::llama());
+    use ep::EpAttention::{Replicated, TensorParallel};
+    for (world, attention) in [
+        (1, Replicated),
+        (2, Replicated),
+        (4, Replicated),
+        (2, TensorParallel),
+        (4, TensorParallel),
+    ] {
+        let placement = Arc::new(
+            ExpertPlacement::contiguous(moe.num_experts, &layers, world).expect("placement"),
+        );
+        let ranks = ep_group(
+            &spec,
+            world,
+            attention,
+            &placement,
+            host,
+            |exec, kv, counts| ep_greedy_pair(exec, kv, counts, spec.vocab),
+        );
+        let what = format!("ep {world} {attention:?}");
+        let bound = if world == 1 { TpBound::Bitwise } else { golden };
+        let worst = check_ep_group(&what, &ranks, &want, bound, rows);
+        let per_rank = &ranks[0].counts.per_rank;
+        assert!(
+            per_rank.iter().all(|&r| r > 0),
+            "{what}: every rank computes some rows: {per_rank:?}"
+        );
+        println!(
+            "ep2_matches_ep1_on_host {what}: worst top-k |Δ logprob| / golden bound {worst:.3}, \
+             rows per rank {per_rank:?}"
+        );
+    }
+    let fresh = pool(&mem, &layout, 1);
+    check_one_rank_batch(&spec, one.as_mut(), &pool_view(&fresh, &layout, 1), host);
+}
+
+/// The batch whose every token routes to rank 0's experts: one token, whose chosen experts in
+/// every layer (read from an EP group of one, itself bitwise one device) a placement file puts
+/// on rank 0 (the others dealt over the other ranks, non-contiguously). At EP 2 and EP 4 with
+/// tp = 1 every rank ends with one device's logits `one` gives, bitwise (the other ranks add
+/// exact zeros), and every routed row is counted on rank 0.
+fn check_one_rank_batch(
+    spec: &TinySpec,
+    one: &mut dyn ModelExecutor,
+    kv: &KvPoolView<'_>,
+    env: impl Fn(u32) -> (Arc<dyn DeviceMemory>, Arc<dyn KernelProvider>) + Sync + Copy,
+) {
+    use ep::EpAttention::Replicated;
+    let cfg = &spec.config;
+    let moe = cfg.moe.expect("tiny OLMoE has experts");
+    let layers = ep::moe_layers(cfg);
+    let token = [prompt(spec.vocab)[3]];
+    let one_token = |exec: &mut dyn ModelExecutor, kv: &KvPoolView<'_>| {
+        run_seq(exec, kv, &[BlockId(0)], &token, 0)
+    };
+    let want = one_token(one, kv);
+    let single = Arc::new(ExpertPlacement::contiguous(moe.num_experts, &layers, 1).expect("one"));
+    let traced = ep_group(spec, 1, Replicated, &single, env, |exec, kv, _| {
+        exec.set_trace(true);
+        let logits = one_token(exec, kv);
+        (logits, exec.take_trace())
+    });
+    let (logits, trace) = &traced[0];
+    assert!(logits == &want, "an EP group of one is one device's logits");
+    let chosen: Vec<Vec<u32>> = trace
+        .iter()
+        .filter(|t| t.name == "topk_ids")
+        .map(|t| t.data.iter().map(|&e| e as u32).collect())
+        .collect();
+    assert_eq!(chosen.len(), layers.len());
+    for world in [2u32, 4] {
+        let text = one_rank_placement(&chosen, moe.num_experts, world);
+        let placement = Arc::new(
+            ExpertPlacement::parse(&text, moe.num_experts, &layers, world).expect("placement"),
+        );
+        let got = ep_group(
+            spec,
+            world,
+            Replicated,
+            &placement,
+            env,
+            |exec, kv, counts| (one_token(exec, kv), counts.snapshot()),
+        );
+        let per_layer = u64::from(moe.experts_per_token);
+        for (rank, (logits, counts)) in got.iter().enumerate() {
+            assert!(
+                logits == &want,
+                "ep {world} rank {rank}: a batch on rank 0's experts is one device's logits"
+            );
+            let mut on_rank = vec![0u64; world as usize];
+            on_rank[0] = per_layer * layers.len() as u64;
+            assert_eq!(counts.per_rank, on_rank, "ep {world} rank {rank}");
+        }
+    }
+}
+
+/// P5 S-12: expert parallelism over a dense model (the tiny Llama) is refused before anything
+/// is loaded or built, as `parallel.expert_parallel_size` with the reason code `ep_moe_only`;
+/// so is a placement over another group size. Breaks if a dense model plans an EP group.
+#[test]
+fn ep_refuses_dense_model() {
+    let tmp = TempDir::new("tiny-model-ep-dense");
+    let llama = write_tiny_llama(&tmp.path().join("llama"), SEED);
+    let olmoe = write_tiny_olmoe(&tmp.path().join("olmoe"), SEED);
+    let s = ep::EpShard {
+        rank: 0,
+        world: 2,
+        attention: ep::EpAttention::Replicated,
+    };
+    let layers: Vec<u32> = (0..llama.config.num_layers).collect();
+    let placement = Arc::new(ExpertPlacement::contiguous(8, &layers, 2).expect("placement"));
+    let dense = |e: ModelError| match e {
+        ModelError::Unsupported { field, value, .. } => {
+            assert_eq!(field, ep::EP_KEY);
+            assert!(value.contains(ep::EP_MOE_ONLY), "{value}");
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    };
+    dense(ep::check(&llama.config, s, &placement).unwrap_err());
+    dense(ep::weight_slots(&llama.config, s, &placement).unwrap_err());
+    dense(
+        ep::requirements(
+            &llama.config,
+            s,
+            &placement,
+            BLOCK_TOKENS,
+            ExecutorOptions::default(),
+        )
+        .unwrap_err(),
+    );
+    let four = ExpertPlacement::contiguous(8, &layers, 4).expect("placement");
+    let err = ep::check(&olmoe.config, s, &four).unwrap_err().to_string();
+    assert!(err.contains(ep::EP_KEY) && err.contains("4 ranks"), "{err}");
+}
+
+/// Lab only: expert parallelism on the HIP provider without RCCL — the head_dim-128 tiny OLMoE
+/// split into EP 2 over two contexts on the same GPU, through the host collective, at tp = 1
+/// and tp = 2, against one HIP context: identical greedy tokens, logits bitwise equal on both
+/// ranks, the same router choices and counts on both, top-5 logprobs within the strict golden
+/// bounds ([`TpBound::Golden`]). Proves the local-expert `moe_experts` calls (the rank's weight
+/// stacks at the range's offset), the per-layer offsets and their read-back, and the combine
+/// on device memory. Then the one-token batch on rank 0's experts, bitwise one device's.
+///
+/// Seed `EP_HIP_SEED` (1), not [`SEED`]: the head_dim-128 tiny OLMoE's random weights leave
+/// near-ties between the top two greedy candidates (at seed 7, decode step 1 of sequence 0:
+/// one device's logprobs −3.5855 / −3.5860), which the tensor-parallel attention's BF16
+/// partial sums flip at tp = 2 (as tensor parallelism alone does at step 14) while every
+/// logprob stays ≤ 0.01 from one device's. A sweep of seeds 1–12 on the R9700 and on the
+/// cpu-reference provider (2026-09-28): tp = 1 matches one device's tokens at every seed,
+/// tp = 2 at seeds 1, 5, 6, 9, 10 and 11.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_ep2_matches_ep1() {
+    const EP_HIP_SEED: u64 = 1;
+    let tmp = TempDir::new("tiny-model-hip-ep");
+    let spec = write_tiny_olmoe_with_head_dim(tmp.path(), EP_HIP_SEED, GPU_HEAD_DIM);
+    let cfg = &spec.config;
+    let moe = cfg.moe.expect("tiny OLMoE has experts");
+    let ctx = hip_context();
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let opts = ExecutorOptions::default();
+    let mut one = cpu_model_with(&spec, &mem, 64, opts, shim_provider(ctx), false);
+    let layout = cfg.kv_layout(BLOCK_TOKENS);
+    let storage = pool(&mem, &layout, 4);
+    let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+    let rows = u64::from((20 + 13 + 2 * TP_STEPS as u32) * moe.experts_per_token);
+    let layers = ep::moe_layers(cfg);
+    let placement =
+        Arc::new(ExpertPlacement::contiguous(moe.num_experts, &layers, 2).expect("placement"));
+    let golden = TpBound::Golden(GoldenLogprobBounds::llama());
+    let hip = |_| -> (Arc<dyn DeviceMemory>, Arc<dyn KernelProvider>) {
+        let ctx = hip_context();
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        (mem, shim_provider(ctx))
+    };
+    for attention in [ep::EpAttention::Replicated, ep::EpAttention::TensorParallel] {
+        let ranks = ep_group(&spec, 2, attention, &placement, hip, |exec, kv, counts| {
+            ep_greedy_pair(exec, kv, counts, spec.vocab)
+        });
+        let what = format!("hip ep 2 {attention:?}");
+        let worst = check_ep_group(&what, &ranks, &want, golden, rows);
+        println!(
+            "hip_ep2_matches_ep1 {what}: worst top-k |Δ logprob| / golden bound {worst:.3}, \
+             rows per rank {:?}",
+            ranks[0].counts.per_rank
+        );
+    }
+    let fresh = pool(&mem, &layout, 1);
+    check_one_rank_batch(&spec, one.as_mut(), &pool_view(&fresh, &layout, 1), hip);
 }

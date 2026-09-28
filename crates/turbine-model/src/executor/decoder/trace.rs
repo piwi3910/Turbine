@@ -11,7 +11,8 @@ use crate::ModelError;
 use crate::weights::Bf16;
 
 /// One intermediate tensor of a traced forward ([`super::DecoderExecutor::set_trace`]),
-/// widened to f32 from its stored dtype (BF16 activations, F32 router logits and logits).
+/// widened to f32 from its stored dtype (BF16 activations, F32 router logits and logits, I32
+/// ids).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TraceTensor {
     /// Decoder layer; `None` for `embed`, `final_norm` and `logits`.
@@ -19,8 +20,9 @@ pub struct TraceTensor {
     /// The op output: `embed`; per layer `attn_norm`, `q`, `k`, `v` (projections of the new
     /// rows), `q_norm`, `k_norm` (Q/K-norm attention hooks only), `q_rope`, `k_rope`, `attn`,
     /// `o_proj`, `resid_attn`, `mlp_norm`, then the FFN hook's outputs (SwiGLU: `gate`, `up`,
-    /// `act`, `down`; MoE: `router_logits`, `moe_out`), then `resid_mlp`; then `final_norm`
-    /// (each sequence's last row) and `logits`.
+    /// `act`, `down`; MoE: `router_logits`, on an expert-parallel rank `topk_ids`,
+    /// `topk_weights` and its own experts' `moe_partial`, then `moe_out`), then `resid_mlp`; then
+    /// `final_norm` (each sequence's last row) and `logits`.
     pub name: &'static str,
     /// `[rows, cols]`: rows are the forward's tokens (one per sequence for `final_norm` and
     /// `logits`).
@@ -101,6 +103,11 @@ fn read_f32(view: &TensorView<'_>) -> Result<Vec<f32>, ModelError> {
         Bf16::DTYPE => bytes
             .chunks_exact(2)
             .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        // Ids (e.g. the MoE router's top-k choices), exact below 2^24.
+        DType::I32 => bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
             .collect(),
         other => return Err(invalid(format!("trace of a {other:?} tensor"))),
     })
