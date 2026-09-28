@@ -186,6 +186,8 @@ fi
 # a turbine-server before the kill (a blanket pkill would also end other agents' test servers
 # running as piwi). A port already served is refused, not taken over.
 pidf=/tmp/lab-bench-server.pid
+# Server and client run on cores 0-11: CPU fixture jobs are pinned to 12-15 (AGENTS.md lab rules).
+bench_cpus=${TURBINE_LAB_BENCH_CPUS:-0-11}
 stop_server="if [ -f $pidf ]; then p=\$(cat $pidf); \
   if [ \"\$(cat /proc/\$p/comm 2>/dev/null)\" = turbine-server ]; then kill \$p; \
     for i in 1 2 3 4 5 6 7 8 9 10; do [ -d /proc/\$p ] || break; sleep 1; done; fi; \
@@ -209,7 +211,7 @@ ssh -o BatchMode=yes "$host" "rm -f $pidf"
 ssh -o BatchMode=yes "$host" "setsid bash -c \"echo \\\$\\\$ > $pidf; cd '$remote/src' && \
     LD_LIBRARY_PATH=/opt/rocm/rocm/lib:/opt/rocm/rocm/lib/rocm_sysdeps/lib \
     TURBINE_AMD_SMI_LIBRARY=/opt/rocm/rocm/lib/libamd_smi.so.26.5.0 ROCR_VISIBLE_DEVICES=$gpu \
-    exec '$remote/target/release/turbine-server' --config $cfg \
+    exec taskset -c $bench_cpus '$remote/target/release/turbine-server' --config $cfg \
       --set model.path=/home/piwi/turbine-models/$slug \
       --set execution.kernel_library='$remote/kbuild/libturbine_hip.so' $*\" \
     > /tmp/lab-bench-server.log 2>&1 < /dev/null &"
@@ -246,7 +248,7 @@ if [[ -x "$root/target/release/turbine-bench" ]]; then
 	bench_cmd="'$root/target/release/turbine-bench' --url $url"
 else
 	client=novanas
-	bench_cmd="ssh -o BatchMode=yes $host '$remote/target/release/turbine-bench' --url http://127.0.0.1:18000"
+	bench_cmd="ssh -o BatchMode=yes $host taskset -c $bench_cpus '$remote/target/release/turbine-bench' --url http://127.0.0.1:18000"
 fi
 golden="ssh -o BatchMode=yes $host cd '$remote/src' \\&\\& '$remote/target/release/turbine-golden'"
 ref="tests/golden/$golden_slug/reference.jsonl"
