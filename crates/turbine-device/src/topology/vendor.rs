@@ -11,6 +11,7 @@ use libloading::Library;
 use nvml_wrapper::Nvml;
 use turbine_core::types::Vendor;
 
+use crate::discovery::amd_smi::{session_begin, session_end};
 use crate::discovery::loader_error;
 
 use super::{EdgeKind, P2pStatus, PathClass, TopologyVendor, VendorLink};
@@ -120,8 +121,13 @@ impl AmdSmiTopology {
         let is_p2p_accessible: IsP2pAccessibleFn =
             sym!("amdsmi_is_P2P_accessible", IsP2pAccessibleFn);
 
-        // SAFETY: amdsmi_init takes no pointers; the session is closed by Drop (or below on error).
-        check(unsafe { init(AMDSMI_INIT_AMD_GPUS) }, "amdsmi_init")?;
+        // Joins the process-wide amd-smi session shared with discovery and telemetry (see
+        // `discovery::amd_smi::SESSIONS`): an init / shut-down pair of its own would tear the
+        // library down under a concurrent discovery (novanas, two GPUs: discoveries beside a
+        // topology discovery saw 0 devices, and its own links fell back to nominal).
+        // SAFETY: amdsmi_init takes no pointers; the session is left by Drop (also on the error
+        // below, since `topo` owns it by then).
+        session_begin(|| unsafe { init(AMDSMI_INIT_AMD_GPUS) })?;
         let mut topo = AmdSmiTopology {
             topo_get_link_type,
             is_p2p_accessible,
@@ -243,8 +249,10 @@ impl TopologyVendor for AmdSmiTopology {
 
 impl Drop for AmdSmiTopology {
     fn drop(&mut self) {
-        // SAFETY: closes the session opened in `open`; no handle is used afterwards.
-        let _ = unsafe { (self.shut_down)() };
+        let shut_down = self.shut_down;
+        // SAFETY: amdsmi_shut_down takes no arguments; it runs only when this was the last open
+        // session in the process, and no handle of this value is used afterwards.
+        session_end(|| unsafe { shut_down() });
     }
 }
 
