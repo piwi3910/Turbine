@@ -24,8 +24,11 @@
 #                      concurrency 16, 200 requests, after a 16-request warm-up); then tp 2 in
 #                      local mode (golden at concurrency 1 — strict bounds — and 16 — batched
 #                      bounds, the TP accuracy bound; turbine-bench --concurrency 4 --requests 64
-#                      must report requests_ok 64; the standard workload), then OLMoE-1B-7B at
-#                      tp 2 in local mode (golden c1 and c16), then Llama in static mode (ranks
+#                      must report requests_ok 64; the standard workload; the standard workload
+#                      again with parallel.collective_backend=rccl), then OLMoE-1B-7B at
+#                      tp 2 in local mode (golden c1 and c16; Task 29: an OLMoE tp 1 capture on
+#                      device 0 first, the tp 2 run also compared with it — informational — and
+#                      p10 position by position), then Llama in static mode (ranks
 #                      0 and 1, leader 127.0.0.1:18100; golden c1 and c16). Prints one
 #                      `tp-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run.
 #                      2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
@@ -301,10 +304,44 @@ scenario_tp2() {
 	collective_report tp2-local
 	stop_servers
 
+	# The same tp 2 run over RCCL alone (the default `auto` picks hostmem in local mode), so the
+	# collective's share of a throughput change is visible (plan Task 29).
+	start_server "${WORK}/tp2-rccl.log" "$llama" --set parallel.collective_backend=rccl
+	wait_ready "$URL" "${WORK}/tp2-rccl.log"
+	bench_ok 16 "${WORK}/tp2-rccl-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 16
+	bench_ok 200 "${WORK}/tp2-rccl-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	jq -r '"tp-bench tp2-rccl-c16 tok/s=\(.output_token_throughput) ttft_p50_ms=\(.ttft_ms.p50) itl_p50_ms=\(.itl_ms.p50) requests_ok=\(.requests_ok)"' \
+		"${WORK}/tp2-rccl-c16-bench.json"
+	stop_servers
+
+	# OLMoE: a one-GPU capture first (tp 1 on device 0), the reference the tp 2 run is also
+	# compared with, position by position on p10 (plan Task 29: OLMoE tp 2 p10).
+	local slug=olmoe-1b-7b-0125-instruct
+	start_server "${WORK}/tp1-olmoe.log" "$olmoe" --set parallel.tensor_parallel_size=1 \
+		--set "parallel.devices=[0]"
+	wait_ready "$URL" "${WORK}/tp1-olmoe.log"
+	echo "lab-step: turbine-golden capture (olmoe tp1)"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
+		--out "${WORK}/olmoe-tp1-capture.jsonl" || job_fail "turbine-golden capture failed"
+	positions_p "$slug" olmoe-tp1 p10
+	stop_servers
+
 	start_server "${WORK}/tp2-olmoe.log" "$olmoe"
 	wait_ready "$URL" "${WORK}/tp2-olmoe.log"
-	golden olmoe-1b-7b-0125-instruct "olmoe tp2 local c1"
-	golden olmoe-1b-7b-0125-instruct "olmoe tp2 local c16" --concurrency 16
+	golden "$slug" "olmoe tp2 local c1"
+	golden "$slug" "olmoe tp2 local c16" --concurrency 16
+	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
+	golden_info "olmoe tp2 c1 vs 1 GPU" --reference "${WORK}/olmoe-tp1-capture.jsonl" "${tol[@]}"
+	golden_info "olmoe tp2 c16 vs 1 GPU" --reference "${WORK}/olmoe-tp1-capture.jsonl" "${tol[@]}" \
+		--concurrency 16
+	positions_p "$slug" olmoe-tp2 p10
+	echo "lab-step: turbine-golden positions olmoe-tp2-vs-1gpu p10"
+	"${BIN}/turbine-golden" positions --url "$URL" --reference "${WORK}/olmoe-tp1-capture.jsonl" \
+		--tolerance "tests/golden/${slug}/tolerance.json" --prompt-id p10 |
+		sed "s/^/positions olmoe-tp2-vs-1gpu /" ||
+		echo "lab-info: positions olmoe-tp2-vs-1gpu failed"
 	collective_report tp2-olmoe
 	stop_servers
 
