@@ -22,6 +22,10 @@
 //!   source block of a demotion stays unallocatable and the target of a promotion unused until
 //!   then, exactly as with `local` mode's copy streams. If any rank failed, the copy fails for
 //!   all (the ranks that made a copy drop it again) and the hierarchy recomputes;
+//! - the transfer estimates learn the copy's time as its slowest rank's own: the leader's copy
+//!   as its poll saw it (as in `local` mode) or a worker's as the worker timed it
+//!   ([`TierAck::took_ns`]), not the extra engine turn the acknowledgement took to arrive, which
+//!   would read every static copy as slower and tilt admission towards recomputing;
 //! - the wait is bounded by `parallel.collective.op_timeout`: a worker that does not answer
 //!   within it fails the group (`RankError`), as a lost worker (a closed link) or a failed step
 //!   (`StepFailed`, P5 Task 28) already does, so the leader's next step fails like any failed
@@ -226,7 +230,8 @@ pub(crate) struct WorkerTiers {
     backend: CopyStreamBackend,
     l1: Option<Arc<ShardedL1Tier>>,
     l2: Option<Arc<dyn KvTier>>,
-    inflight: Vec<TransferTicket>,
+    /// Copies in flight with their start.
+    inflight: Vec<(TransferTicket, Instant)>,
     done: Vec<TierAck>,
     shard_bytes: u64,
 }
@@ -331,10 +336,11 @@ impl TierWorker for WorkerTiers {
                         },
                     };
                     match self.backend.start(&t) {
-                        Ok(()) => self.inflight.push(t),
+                        Ok(()) => self.inflight.push((t, Instant::now())),
                         Err(e) => self.done.push(TierAck {
                             id,
                             error: Some(e.to_string()),
+                            took_ns: 0,
                         }),
                     }
                 }
@@ -353,16 +359,18 @@ impl TierWorker for WorkerTiers {
 
     fn poll(&mut self) -> Vec<TierAck> {
         let mut running = Vec::with_capacity(self.inflight.len());
-        for t in std::mem::take(&mut self.inflight) {
+        for (t, started) in std::mem::take(&mut self.inflight) {
             match self.backend.poll(&t) {
-                Ok(None) => running.push(t),
+                Ok(None) => running.push((t, started)),
                 Ok(Some(_)) => self.done.push(TierAck {
                     id: t.id,
                     error: None,
+                    took_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 }),
                 Err(e) => self.done.push(TierAck {
                     id: t.id,
                     error: Some(e.to_string()),
+                    took_ns: 0,
                 }),
             }
         }
@@ -397,7 +405,11 @@ pub(crate) fn leader_driver(
 struct Pending {
     queued: Instant,
     local: Option<Result<TierSlot, TierError>>,
+    /// When the leader saw its own copy complete, from the start.
+    local_took: Option<Duration>,
     acks: HashMap<u32, Option<String>>,
+    /// Each worker's own copy time (`TierAck::took_ns`).
+    worker_took: Duration,
     /// The copy never reached the workers (their link closed): nothing to wait for.
     unsent: bool,
     /// The group failed while the copy was in flight (a `StepFailed`, a lost or silent worker).
@@ -417,6 +429,8 @@ pub(crate) struct TierDriver {
     closed: Option<RankError>,
     local_l1: Option<Arc<ShardedL1Tier>>,
     local_l2: Option<Arc<dyn KvTier>>,
+    /// Copy times of the copies completed by the last `poll`s, taken by `took`.
+    took: HashMap<u64, Duration>,
 }
 
 impl TierDriver {
@@ -444,6 +458,7 @@ impl TierDriver {
             closed: None,
             local_l1: None,
             local_l2: None,
+            took: HashMap::new(),
         }
     }
 
@@ -518,6 +533,7 @@ impl TierDriver {
         for (rank, acks) in self.link.acks() {
             for a in acks {
                 if let Some(p) = self.pending.get_mut(&a.id) {
+                    p.worker_took = p.worker_took.max(Duration::from_nanos(a.took_ns));
                     p.acks.insert(rank, a.error);
                 }
             }
@@ -582,7 +598,14 @@ impl TierDriver {
             })
         });
         let error = match (&local, worker.or(group)) {
-            (Ok(slot), None) => return Ok(Some(*slot)),
+            (Ok(slot), None) => {
+                // The copy took as long as its slowest rank's part: the leader's own as its
+                // poll saw it (as in `local` mode) or a worker's as the worker timed it — not
+                // the extra engine turn its acknowledgement took to arrive.
+                let own = p.local_took.unwrap_or_default();
+                self.took.insert(t.id, own.max(p.worker_took));
+                return Ok(Some(*slot));
+            }
             (_, Some(e)) => TierError::Io(e),
             (Err(e), None) => e.clone(),
         };
@@ -698,7 +721,9 @@ impl TransferBackend for StaticBackend<'_> {
             Pending {
                 queued: Instant::now(),
                 local: None,
+                local_took: None,
                 acks: HashMap::new(),
+                worker_took: Duration::ZERO,
                 unsent: false,
                 broken: None,
             },
@@ -741,7 +766,10 @@ impl TransferBackend for StaticBackend<'_> {
         if p.local.is_none() {
             match self.local.poll(t) {
                 Ok(None) => {}
-                Ok(Some(slot)) => p.local = Some(Ok(slot)),
+                Ok(Some(slot)) => {
+                    p.local = Some(Ok(slot));
+                    p.local_took = Some(p.queued.elapsed());
+                }
                 Err(e) => p.local = Some(Err(e)),
             }
         }
@@ -751,6 +779,10 @@ impl TransferBackend for StaticBackend<'_> {
         }
         let p = self.driver.pending.remove(&t.id).expect("present above");
         self.driver.finish(t, p)
+    }
+
+    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
+        self.driver.took.remove(&t.id)
     }
 }
 
@@ -817,7 +849,11 @@ mod tests {
             }
             self.held
                 .drain(..)
-                .map(|id| TierAck { id, error: None })
+                .map(|id| TierAck {
+                    id,
+                    error: None,
+                    took_ns: 0,
+                })
                 .collect()
         }
         fn busy(&self) -> bool {
@@ -1109,6 +1145,87 @@ mod tests {
         assert!(
             !g.l2.contains(&KvKey([6; 16])),
             "the leader dropped its half"
+        );
+        g.runtime.shutdown("test done");
+        assert!(g.worker.join().unwrap().is_ok());
+    }
+
+    /// Answers every copy only `delay` after it was submitted, reporting `took` as its own copy
+    /// time: a worker whose acknowledgement arrives late for reasons other than its copy.
+    struct Late {
+        delay: Duration,
+        took: Duration,
+        held: Vec<(u64, Instant)>,
+    }
+    impl TierWorker for Late {
+        fn submit(&mut self, copies: Vec<TierCopy>) {
+            let now = Instant::now();
+            self.held.extend(copies.iter().filter_map(|c| match c {
+                TierCopy::Copy { id, .. } => Some((*id, now)),
+                TierCopy::Evict { .. } => None,
+            }));
+        }
+        fn poll(&mut self) -> Vec<TierAck> {
+            let (due, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+                .into_iter()
+                .partition(|(_, at)| at.elapsed() >= self.delay);
+            self.held = held;
+            due.into_iter()
+                .map(|(id, _)| TierAck {
+                    id,
+                    error: None,
+                    took_ns: self.took.as_nanos() as u64,
+                })
+                .collect()
+        }
+        fn busy(&self) -> bool {
+            !self.held.is_empty()
+        }
+    }
+
+    /// P5 Task 30: the time a static copy is recorded as taking (what the transfer estimates
+    /// learn from) is its slowest rank's own copy time — the leader's copy as its poll saw it,
+    /// or a worker's as the worker timed it — not the time the acknowledgement took to reach
+    /// the leader. Breaks if a late acknowledgement is read as a slow copy (static mode would
+    /// then plan recomputes local mode plans as retrievals).
+    #[test]
+    fn copy_time_is_the_ranks_own_not_the_ack_delay() {
+        let delay = Duration::from_millis(300);
+        let reported = Duration::from_millis(1);
+        let late = Late {
+            delay,
+            took: reported,
+            held: Vec::new(),
+        };
+        let mut g = group(
+            Some(Box::new(late)),
+            Box::new(NoSteps),
+            Duration::from_secs(10),
+        );
+        let (result, waited) = copy_down(&mut g, KvKey([3; 16]));
+        result.expect("the copy completes");
+        assert!(waited >= delay, "the ack came after {waited:?}");
+        let t = TransferTicket {
+            id: 1,
+            req: TransferRequest {
+                path: TransferPath::L0ToL2,
+                key: KvKey([3; 16]),
+                bytes: layout().block_bytes(),
+                owner: None,
+                purpose: TransferPurpose::Demote,
+                src_slot: 1,
+                dst_slot: 0,
+            },
+        };
+        let took = g.driver.backend(&mut g.local).took(&t).expect("measured");
+        assert!(took >= reported, "at least the worker's own copy: {took:?}");
+        assert!(
+            took < delay / 3,
+            "not the acknowledgement's delay: {took:?}"
+        );
+        assert!(
+            g.driver.backend(&mut g.local).took(&t).is_none(),
+            "taken once"
         );
         g.runtime.shutdown("test done");
         assert!(g.worker.join().unwrap().is_ok());

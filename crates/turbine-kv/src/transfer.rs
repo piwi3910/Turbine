@@ -136,6 +136,13 @@ pub trait TransferBackend {
     fn start(&mut self, t: &TransferTicket) -> Result<(), TierError>;
     /// `Ok(Some(destination slot))` once the copy has completed, `Ok(None)` while it runs.
     fn poll(&mut self, t: &TransferTicket) -> Result<Option<TierSlot>, TierError>;
+    /// How long the copy `poll` just completed took, when the backend measured it itself (a
+    /// copy some of whose parts run elsewhere, P5 Task 30); `None`: the time from its start to
+    /// the `poll` that saw it complete.
+    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
+        let _ = t;
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -222,7 +229,11 @@ impl TransferEngine {
                     running.push((ticket, started));
                     continue;
                 }
-                Ok(Some(slot)) => Ok((now.saturating_sub(started), slot)),
+                Ok(Some(slot)) => Ok((
+                    b.took(&ticket)
+                        .unwrap_or_else(|| now.saturating_sub(started)),
+                    slot,
+                )),
                 Err(e) => Err(e),
             };
             self.inflight_bytes -= ticket.req.bytes;

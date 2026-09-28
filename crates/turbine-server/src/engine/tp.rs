@@ -2384,6 +2384,8 @@ mod tests {
         later: Vec<u32>,
         resumed: Vec<u32>,
         promoted: f64,
+        /// Admission plans `retrieve_cheaper` and `recompute_cheaper` over the whole scenario.
+        plans: (f64, f64),
     }
 
     /// Run 8 of the Task 30 lab on the host, over an engine's command channel and its metrics:
@@ -2393,6 +2395,7 @@ mod tests {
     fn flood_scenario(
         label: &str,
         tx: &tokio::sync::mpsc::Sender<crate::engine::EngineCommand>,
+        shared: &crate::engine::EngineShared,
         reg: &MetricsRegistry,
     ) -> Flood {
         let run_one = |prompt: &[u32]| {
@@ -2402,9 +2405,17 @@ mod tests {
         let counters = |stage: &str| {
             let text = reg.render().unwrap();
             for l in text.lines().filter(|l| {
-                ["promotions", "demotions", "drops", "plans"]
-                    .iter()
-                    .any(|m| l.starts_with(&format!("turbine_kv_{m}_total")))
+                [
+                    "promotions",
+                    "demotions",
+                    "drops",
+                    "plans",
+                    "transfer_bandwidth_bytes_per_second",
+                    "transfer_seconds_sum",
+                    "transfer_seconds_count",
+                ]
+                .iter()
+                .any(|m| l.starts_with(&format!("turbine_kv_{m}")))
             }) {
                 if !l.ends_with(" 0") {
                     eprintln!("{label} {stage}: {l}");
@@ -2457,10 +2468,26 @@ mod tests {
             })
             .collect();
         counters("after the resume");
+        // Nothing stays in flight once the engine is idle: every copy, every rank's part of it
+        // included, completes (a lost acknowledgement would hold its bytes forever).
+        wait_until(Duration::from_secs(10), "every tier copy completed", || {
+            shared.docs().is_some_and(|d| {
+                d.kv.summary
+                    .as_ref()
+                    .is_some_and(|k| k.transfers.inflight_bytes == 0)
+            })
+        });
+        let plan = |reason: &str| {
+            sum_series(
+                reg,
+                &format!("turbine_kv_plans_total{{reason=\"{reason}\"}}"),
+            )
+        };
         let out = Flood {
             later,
             resumed,
             promoted: sum_series(reg, promoted) - before,
+            plans: (plan("retrieve_cheaper"), plan("recompute_cheaper")),
         };
         eprintln!("{label}: {out:?}");
         out
@@ -2522,7 +2549,7 @@ mod tests {
         )
         .expect("local group");
         let clock: Arc<dyn Clock> = Arc::new(turbine_core::clock::SystemClock::new());
-        let (engine, tx, _shared, ereg) = engine_over_kv(
+        let (engine, tx, shared, ereg) = engine_over_kv(
             &leader,
             loaded,
             &kv,
@@ -2539,7 +2566,7 @@ mod tests {
             |_| {},
         );
         let engine = std::thread::spawn(move || engine.run());
-        let out = flood_scenario("local", &tx, &ereg);
+        let out = flood_scenario("local", &tx, &shared, &ereg);
         drop(tx);
         assert_eq!(engine.join().expect("engine thread"), Ok(()));
         out
@@ -2581,7 +2608,7 @@ mod tests {
                 l2: worker_l2,
             },
         );
-        let (engine, tx, _shared, reg) = engine_over_kv(
+        let (engine, tx, shared, reg) = engine_over_kv(
             &leader,
             loaded,
             &kv0,
@@ -2599,7 +2626,7 @@ mod tests {
             |_| {},
         );
         let engine = std::thread::spawn(move || engine.run());
-        let out = flood_scenario("static", &tx, &reg);
+        let out = flood_scenario("static", &tx, &shared, &reg);
         drop(tx);
         assert_eq!(engine.join().expect("engine thread"), Ok(()));
         assert_eq!(worker.join().expect("worker thread"), Ok(()));
@@ -2610,8 +2637,9 @@ mod tests {
     /// the `static` group, each rank with its own L2, behaves as the `local` group whose leader
     /// copies both shards — every later turn reuses its session's previous one, and after a
     /// flood and two pool-wide prompts each resumed session gets the same cached tokens and
-    /// the same L2 promotions in both modes. Breaks if static mode loses the sessions' blocks,
-    /// never completes a promotion, or reuses less than local mode.
+    /// the same L2 promotions in both modes, and no copy is left in flight once idle. Breaks if
+    /// static mode loses the sessions' blocks, never completes a promotion, reuses less than
+    /// local mode, or leaks a copy (a lost acknowledgement would hold its bytes in flight).
     #[test]
     fn static_tiers_flood_then_resume() {
         let local = flood_local();
@@ -2625,6 +2653,14 @@ mod tests {
         assert_eq!(
             stat.promoted, local.promoted,
             "static promotes as local does"
+        );
+        // The retrieve / recompute choices are printed, not compared: on the cpu backend a copy
+        // and a block's prefill both take about one engine turn (~2 ms), so either mode's
+        // choices flip between runs. `tp_tiers::tests::copy_time_is_the_ranks_own_not_the_ack_delay`
+        // pins what static mode feeds its estimates.
+        eprintln!(
+            "plans (retrieve, recompute): local {:?}, static {:?}",
+            local.plans, stat.plans
         );
     }
 

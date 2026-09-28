@@ -287,6 +287,10 @@ pub enum TierCopy {
 pub struct TierAck {
     pub id: u64,
     pub error: Option<String>,
+    /// How long the worker's copy took, from its start to its completion on the worker
+    /// (nanoseconds; 0 when it failed): the leader's transfer estimates use it instead of the
+    /// time the acknowledgement took to reach it.
+    pub took_ns: u64,
 }
 
 /// A worker rank's end of the KV tier copies (implemented in `turbine-server` over its pool and
@@ -1381,6 +1385,7 @@ impl WorkerLink {
                             TierCopy::Copy { id, .. } => Some(TierAck {
                                 id,
                                 error: Some(format!("rank {rank} has no KV tiers")),
+                                took_ns: 0,
                             }),
                             TierCopy::Evict { .. } => None,
                         })
@@ -2102,10 +2107,15 @@ mod tests {
             RankMessage::TierAck {
                 rank: 1,
                 acks: vec![
-                    TierAck { id: 7, error: None },
+                    TierAck {
+                        id: 7,
+                        error: None,
+                        took_ns: 0,
+                    },
                     TierAck {
                         id: 8,
                         error: Some("tier full".into()),
+                        took_ns: 0,
                     },
                 ],
             },
@@ -2155,6 +2165,7 @@ mod tests {
                 .map(|id| TierAck {
                     id,
                     error: (id % 2 == 1).then(|| format!("copy {id} failed")),
+                    took_ns: 0,
                 })
                 .collect()
         }
@@ -2241,14 +2252,20 @@ mod tests {
         rt.step(step_plan(1)).expect("step");
         link.send(&tier_copies()).expect("send");
         let got = gather(&link, 4);
-        let ok = |id| TierAck { id, error: None };
+        let ok = |id| TierAck {
+            id,
+            error: None,
+            took_ns: 0,
+        };
         let failed = |id: u64| TierAck {
             id,
             error: Some(format!("copy {id} failed")),
+            took_ns: 0,
         };
         let none = |id| TierAck {
             id,
             error: Some("rank 2 has no KV tiers".into()),
+            took_ns: 0,
         };
         assert_eq!(
             got,
