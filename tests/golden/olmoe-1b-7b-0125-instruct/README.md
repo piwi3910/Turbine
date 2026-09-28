@@ -56,3 +56,17 @@ The tolerance is the smallest two-decimal bound that every variant meets: `max_a
 spread already covers a change of GEMM shape (full sequence vs incremental), attention kernel and
 precision, which is what batch composition changes. Re-run the script and
 re-derive the bounds if the reference, the transformers version or the prompts change.
+
+## Multi-GPU modes (Phase 5)
+
+This reference and tolerance gate **one GPU**. A multi-GPU run (expert, tensor or pipeline
+parallelism) is gated against a one-GPU capture of the same model and commit taken in the same
+lab run (`turbine-golden capture` on the one-GPU server, then `turbine-golden compare
+--reference <capture> --tolerance tests/golden/<slug>/tolerance.json` at concurrency 1 with the
+strict bounds and at 16 with the batched bounds); its verdict against this transformers reference
+is reported for information only (user decision 2026-09-28, "P5: OLMoE golden tolerance under
+expert parallelism"). The reason: this tolerance is transformers' own spread, and one GPU already
+sits at its edge on some prompts (p14: likely |Δ| 1.0003 of 1.01 before diverging at token 14),
+so a multi-GPU run that follows the reference further is scored on positions one GPU never
+reaches. `turbine-golden positions --url <server> --reference … --prompt-id <id>` prints a
+prompt's per-position |Δ| teacher-forced on the reference's tokens, to check such a case.
