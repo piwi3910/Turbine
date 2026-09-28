@@ -103,12 +103,23 @@ pub fn default_served_name(path: &Path) -> String {
         .map_or_else(|| path.display().to_string(), |s| (*s).to_string())
 }
 
-/// `model.max_seq_len`: the configured value, at most the model's `max_position_embeddings`;
-/// by default min(32768, `max_position_embeddings`).
-pub fn resolve_max_seq_len(configured: Option<u32>, max_positions: u32) -> Result<u32, String> {
+/// `model.max_seq_len`: the configured value, at most `max_positions`
+/// ([`ModelArchConfig::max_positions`]: the model's `max_position_embeddings`, or with YaRN up
+/// to `factor × original_max_position_embeddings` when that is larger; P6a S-15); by default
+/// min(32768, `max_positions`).
+pub fn resolve_max_seq_len(
+    configured: Option<u32>,
+    max_position_embeddings: u32,
+    max_positions: u32,
+) -> Result<u32, String> {
     match configured {
         None => Ok(DEFAULT_MAX_SEQ_LEN.min(max_positions)),
         Some(n) if n >= 1 && n <= max_positions => Ok(n),
+        Some(n) if max_positions > max_position_embeddings => Err(format!(
+            "model.max_seq_len {n} is outside 1..={max_positions} (YaRN's factor × \
+             original_max_position_embeddings; max_position_embeddings is \
+             {max_position_embeddings})"
+        )),
         Some(n) => Err(format!(
             "model.max_seq_len {n} is outside 1..={max_positions} (the model's \
              max_position_embeddings)"
@@ -1257,13 +1268,38 @@ mod tests {
 
     #[test]
     fn max_seq_len_defaults_and_bounds() {
-        assert_eq!(resolve_max_seq_len(None, 131_072), Ok(32_768));
-        assert_eq!(resolve_max_seq_len(None, 512), Ok(512));
-        assert_eq!(resolve_max_seq_len(Some(256), 512), Ok(256));
-        assert_eq!(resolve_max_seq_len(Some(512), 512), Ok(512));
-        let err = resolve_max_seq_len(Some(513), 512).unwrap_err();
+        assert_eq!(resolve_max_seq_len(None, 131_072, 131_072), Ok(32_768));
+        assert_eq!(resolve_max_seq_len(None, 512, 512), Ok(512));
+        assert_eq!(resolve_max_seq_len(Some(256), 512, 512), Ok(256));
+        assert_eq!(resolve_max_seq_len(Some(512), 512, 512), Ok(512));
+        let err = resolve_max_seq_len(Some(513), 512, 512).unwrap_err();
         assert!(err.contains("model.max_seq_len 513"), "{err}");
-        assert!(resolve_max_seq_len(Some(0), 512).is_err());
+        assert!(err.contains("max_position_embeddings"), "{err}");
+        assert!(resolve_max_seq_len(Some(0), 512, 512).is_err());
+    }
+
+    /// P6a S-15: with YaRN, `model.max_seq_len` may extend past `max_position_embeddings` up
+    /// to `factor × original_max_position_embeddings` (`ModelArchConfig::max_positions`); the
+    /// default stays min(32768, that bound).
+    #[test]
+    fn max_seq_len_extends_with_yarn() {
+        // Qwen3-style: 40960 positions, YaRN factor 4 over 32768.
+        assert_eq!(
+            resolve_max_seq_len(Some(131_072), 40_960, 131_072),
+            Ok(131_072)
+        );
+        assert_eq!(
+            resolve_max_seq_len(Some(65_536), 40_960, 131_072),
+            Ok(65_536)
+        );
+        assert_eq!(resolve_max_seq_len(None, 40_960, 131_072), Ok(32_768));
+        assert_eq!(resolve_max_seq_len(None, 4096, 16_384), Ok(16_384));
+        let err = resolve_max_seq_len(Some(131_073), 40_960, 131_072).unwrap_err();
+        assert!(err.contains("outside 1..=131072"), "{err}");
+        assert!(
+            err.contains("factor × original_max_position_embeddings"),
+            "{err}"
+        );
     }
 
     #[test]
