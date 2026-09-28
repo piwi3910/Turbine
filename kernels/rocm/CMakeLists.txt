@@ -278,3 +278,19 @@ if(TURBINE_BUILD_QGEMM_EVAL)
     "${CK_ROOT}/example/ck_tile/38_block_scale_gemm")
   target_link_libraries(turbine_qgemm_eval PRIVATE hip::host roc::hipblaslt)
 endif()
+
+# The INT4 group GEMM provider evaluation harness (Phase 6a Task 16, decision "P6: INT4 group
+# GEMM — provider evaluation (kernel reuse rule)"): runs every turbine_qgemm implementation of
+# libturbine_hip.so for the INT4 schemes and the BF16 baseline on the Llama-3.2-3B shapes, checks
+# them against a host reference and times them. A lab tool, off by default:
+# -DTURBINE_BUILD_QGEMM_INT4_EVAL=ON.
+option(TURBINE_BUILD_QGEMM_INT4_EVAL "Build the INT4 GEMM provider evaluation harness" OFF)
+if(TURBINE_BUILD_QGEMM_INT4_EVAL)
+  add_executable(turbine_qgemm_int4_eval tools/qgemm_int4_eval.cpp)
+  set_source_files_properties(tools/qgemm_int4_eval.cpp PROPERTIES LANGUAGE HIP)
+  set_target_properties(turbine_qgemm_int4_eval PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+  target_include_directories(turbine_qgemm_int4_eval PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(turbine_qgemm_int4_eval PRIVATE hip::host turbine_hip)
+endif()
