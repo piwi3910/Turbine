@@ -186,6 +186,7 @@ set(TURBINE_SOURCES
   src/hostmem.hip
   src/qgemm.cpp
   src/quantize_act.hip
+  src/qgemm_int4.hip
   src/impl_table.cpp)
 set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/paged_attention_splitkv.cpp
   src/rmsnorm.cpp ${FMHA_BLOBS})
