@@ -154,9 +154,17 @@ if [[ $ready -ne 1 ]]; then
 fi
 
 # 3. measure under the exclusive lock
-bench_bin="$root/target/release/turbine-bench"
-# The golden check runs on the build host with the freshly built Linux binary (current rules);
-# the throughput client stays on the workstation so rows stay comparable with earlier ones.
+# The golden check runs on the build host with the freshly built Linux binary (current rules).
+# The throughput client runs on the workstation when it has a release turbine-bench (rows stay
+# comparable with earlier ones); otherwise — the rule is to build only on novanas — it runs on
+# the build host against the loopback URL, and the BENCH line says client=novanas.
+if [[ -x "$root/target/release/turbine-bench" ]]; then
+	client=local
+	bench_cmd="'$root/target/release/turbine-bench' --url $url"
+else
+	client=novanas
+	bench_cmd="ssh -o BatchMode=yes $host '$remote/target/release/turbine-bench' --url http://127.0.0.1:18000"
+fi
 golden="ssh -o BatchMode=yes $host cd '$remote/src' \\&\\& '$remote/target/release/turbine-golden'"
 ref="tests/golden/$slug/reference.jsonl"
 golden16_cmd=""
@@ -165,7 +173,7 @@ scripts/bench-lock.sh sh -c "
   $golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 1 > '$out/golden1.txt' 2>&1
   $golden16_cmd
   curl -s '$url/metrics' > '$out/metrics-before.txt'
-  '$bench_bin' --url $url --concurrency 16 --requests $requests --prompt-words 512 --max-tokens 256 \
+  $bench_cmd --concurrency 16 --requests $requests --prompt-words 512 --max-tokens 256 \
     --ignore-eos --output json > '$out/bench.json' 2> '$out/bench.err'
 " 2>/dev/null
 curl -s "$url/metrics" >"$out/metrics.txt"
@@ -173,15 +181,15 @@ curl -s "$url/turbine/v1/status" >"$out/status.json"
 ssh -o BatchMode=yes "$host" "cp /tmp/lab-bench-server.log /tmp/lab-bench-server.last.log; pkill -u piwi -x turbine-server"
 
 # 4. summary
-python3 - "$out" "$label" "$model" "$commit" "$gpu" "$tests" "$run_golden16" "$quick" <<'EOF'
+python3 - "$out" "$label" "$model" "$commit" "$gpu" "$tests" "$run_golden16" "$quick" "$client" <<'EOF'
 import json, re, sys
-out, label, model, commit, gpu, tests, run_golden16, quick = sys.argv[1:]
+out, label, model, commit, gpu, tests, run_golden16, quick, client = sys.argv[1:]
 g1 = open(f"{out}/golden1.txt").read().strip().splitlines()[-1][:5]
 if run_golden16 == "1":
     g16 = open(f"{out}/golden16.txt").read().strip().splitlines()[-1][:5]
 else:
     g16 = "SKIP"
-quick_field = " quick=1" if quick == "1" else ""
+quick_field = (" quick=1" if quick == "1" else "") + f" client={client}"
 try:
     d = json.load(open(f"{out}/bench.json"))
 except Exception as e:
