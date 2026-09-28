@@ -1506,9 +1506,18 @@ fn phase1_metrics() {
     );
 }
 
+/// P2 S-8: a paused slow stream is cancelled with `slow_client` after
+/// `server.slow_client_timeout` while another stream keeps progressing, its blocks are freed,
+/// and reading on shows the buffered events, the error event and `[DONE]`.
+///
+/// The timeout is 3 s, not 1 s: the engine closes a finished stream whose final events stay
+/// unread for one more timeout (`expire_deadlines`), so the test must start reading within one
+/// timeout of the cancellation; at 1 s a loaded gate host (nextest, every test at once) missed
+/// that window and read the close without the error event (`generation ended without a finish
+/// event`, 2026-09-28). It reads right after the cancellation, before the metrics.
 #[test]
 fn slow_client_paused_then_cancelled() {
-    let server = TinyServer::start_long_with("  slow_client_timeout: 1s\n", "");
+    let server = TinyServer::start_long_with("  slow_client_timeout: 3s\n", "");
     let slow = server.hold_stream();
     wait_for(Duration::from_secs(30), "the slow client is paused", || {
         server.scheduler()["paused"] == 1
@@ -1523,26 +1532,34 @@ fn slow_client_paused_then_cancelled() {
     );
     assert_eq!(other.status, 200, "{}", other.body);
     assert_eq!(stream_finish_reason(&other.sse_data()), "length");
-    assert_eq!(
-        server.scheduler()["paused"],
-        1,
-        "still paused before the timeout"
+    // Still paused before the timeout (a host too loaded to finish `other` within it proves
+    // nothing either way).
+    let paused = server.scheduler()["paused"].clone();
+    assert!(
+        paused == 1 || paused_at.elapsed() >= Duration::from_millis(2900),
+        "no longer paused after {:?}, before the timeout",
+        paused_at.elapsed()
     );
 
     // After the timeout it is cancelled with `slow_client` and its blocks are free.
     wait_for(
-        Duration::from_secs(5),
+        Duration::from_secs(10),
         "the slow client is cancelled",
         || {
             let doc = server.scheduler();
             running(&doc) == 0 && server.blocks_used() == 0
         },
     );
+    // Reading on shows what was buffered, then the error event and `[DONE]` (C-3).
+    let data = slow.read_rest();
     assert!(
-        paused_at.elapsed() >= Duration::from_millis(900),
+        paused_at.elapsed() >= Duration::from_millis(2900),
         "cancelled after {:?}",
         paused_at.elapsed()
     );
+    assert_eq!(data.last().map(String::as_str), Some("[DONE]"));
+    let error: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
+    assert_eq!(error["error"]["code"], "slow_client", "{error}");
     let metrics = server.metrics();
     assert_eq!(
         sample(
@@ -1552,11 +1569,6 @@ fn slow_client_paused_then_cancelled() {
         Some(1.0),
         "{metrics}"
     );
-    // Reading on shows what was buffered, then the error event and `[DONE]` (C-3).
-    let data = slow.read_rest();
-    assert_eq!(data.last().map(String::as_str), Some("[DONE]"));
-    let error: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
-    assert_eq!(error["error"]["code"], "slow_client", "{error}");
 }
 
 #[test]

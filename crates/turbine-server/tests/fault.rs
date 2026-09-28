@@ -426,9 +426,12 @@ fn kernel_error_opens_the_circuit_and_probes_close_it() {
     let err: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
     assert_eq!(err["error"]["code"], "internal_error", "{err}");
 
-    let ready = server.get("/ready");
-    assert_eq!(ready.status, 503, "{}", ready.body);
-    assert_eq!(ready.json()["reason"], "circuit_open");
+    // The failed iteration's request ends before the engine reports the error to the circuit
+    // breaker: /ready turns 503 `circuit_open` a moment after the error event.
+    wait_for(Duration::from_secs(5), "/ready 503 circuit_open", || {
+        let ready = server.get("/ready");
+        ready.status == 503 && ready.json()["reason"] == "circuit_open"
+    });
     let refused = server.complete(2, false);
     assert_eq!(refused.status, 503, "{}", refused.body);
     assert_eq!(refused.error_code(), "circuit_open");

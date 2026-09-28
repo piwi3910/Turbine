@@ -22,8 +22,9 @@
 #   turbine-lab-test only; production vLLM containers are never touched).
 # novanas: the k3s Job template scripts/lab/novanas-test-job.yaml in namespace turbine-ci, named
 #   turbine-lab-test-<run id> so several runs can go side by side. --gpus (default 1) is the
-#   R9700 count the Job requests and the AMD device count the inventory test expects; only the
-#   Phase 0 inventory check needs 2. The tree and the test command (NUL-separated argv) are
+#   R9700 count the Job requests and the AMD device count the lab tests expect
+#   (TURBINE_EXPECT_AMD). The default one-GPU leg skips TWO_GPU_TESTS; `--gpus 2` without an
+#   explicit selection is the two-GPU leg: only TWO_GPU_TESTS and GPU_COUNT_TESTS (see there). The tree and the test command (NUL-separated argv) are
 #   uploaded to /home/piwi/turbine-ci/runs/<run id>; the Job syncs the tree into a cached
 #   workspace slot (see the template for the cache layout and the per-slot target dirs).
 #   The same template first runs GPU-less as turbine-lab-build-<run id>, which compiles the
@@ -49,6 +50,8 @@ usage() {
 # One list, used both ways by --tier: skipped for `quick`, the only ones run for `perf`.
 # Lab tests that open two GPUs (Phase 5): skipped (libtest `--skip`, by substring) in a
 # one-GPU Job, where they would fail on the missing device; run them with `--gpus 2`.
+# (tiny_model's hip_tp2_matches_tp1 / hip_ep2_matches_ep1 / hip_pp2_matches_pp1 open their
+# ranks as several contexts on one GPU: they belong to the one-GPU leg.)
 TWO_GPU_TESTS=(
 	# crates/turbine-distributed/tests/hostmem_lab.rs
 	hostmem_
@@ -60,6 +63,18 @@ TWO_GPU_TESTS=(
 	tp2_collective_failure_recovers_on_gpu
 	# crates/turbine-model/tests/perf.rs (P5 Task 32)
 	tp_forward_profile
+)
+
+# Lab tests whose expectation follows the Job's R9700 count (TURBINE_EXPECT_AMD = --gpus): they
+# pass in the one-GPU leg with 1 and check the two-GPU host (both devices, the PCIe edge between
+# them, GPU0's link against GPU1's) only with 2, so the two-GPU leg runs them as well.
+GPU_COUNT_TESTS=(
+	# crates/turbine-device/tests/lab.rs
+	inventory_matches_expectation
+	concurrent_discovery_sees_every_device
+	topology_matches_host
+	# crates/turbine-kernels/tests/lab.rs
+	host_link_probe
 )
 
 SLOW_TESTS=(
@@ -155,6 +170,10 @@ done
 if [[ "$HOST" != novanas && ($MODE == stop || $GPUS_SET -eq 1) ]]; then
 	usage
 fi
+# The two-GPU leg is a selection of its own; perf's selection (SLOW_TESTS) is one-GPU work.
+if [[ $GPUS -eq 2 && $TIER == perf && ${#CARGO_ARGS[@]} -eq 0 ]]; then
+	usage
+fi
 if [[ $MODE == stop && ($GPUS_SET -eq 1 || $HF_REFERENCE -eq 1 || -n $FEATURES || $TIER != full || ${#CARGO_ARGS[@]} -gt 0) ]]; then
 	usage
 fi
@@ -179,10 +198,14 @@ build_test_command() {
 	# needed to regenerate them.
 	[[ $HF_REFERENCE -eq 1 ]] || TEST_CMD+=(--skip hf_reference_matches_cpu)
 	# A one-GPU Job cannot run the two-GPU tests (TWO_GPU_TESTS above); `--gpus 2` runs them.
+	# Without an explicit selection (`-- …`) the two-GPU leg runs only those and GPU_COUNT_TESTS
+	# (bare filter args, which libtest ORs by substring): every other test is the one-GPU leg's.
 	if [[ $GPUS -lt 2 ]]; then
 		for t in "${TWO_GPU_TESTS[@]}"; do
 			TEST_CMD+=(--skip "$t")
 		done
+	elif [[ ${#CARGO_ARGS[@]} -eq 0 ]]; then
+		TEST_CMD+=("${TWO_GPU_TESTS[@]}" "${GPU_COUNT_TESTS[@]}")
 	fi
 	# quick: skip the slow perf/timing tests (SLOW_TESTS above); perf: run only those (the same
 	# list as bare filter args, which libtest ORs by substring); full: neither, unchanged.

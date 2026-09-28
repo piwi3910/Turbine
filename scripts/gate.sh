@@ -208,8 +208,16 @@ fi
 # grep exits 1 with no match (e.g. nextest omits "N failed" from its summary when nothing failed),
 # which would abort the script right here under pipefail; each grep's own exit is masked before
 # piping to awk, which always prints a count (0 for no input).
-PASSED="$( (grep -oE '[0-9]+ passed' "$LOG" || true) | awk '{s+=$1} END{print s+0}')"
-FAILED="$( (grep -oE '[0-9]+ failed' "$LOG" || true) | awk '{s+=$1} END{print s+0}')"
+# Under nextest only its `Summary` line counts: a failing test's captured libtest output
+# ("0 passed; 1 failed") would count that test twice.
+COUNTS="$LOG"
+if [[ $NEXTEST -eq 1 ]]; then
+	COUNTS="$(mktemp)"
+	trap 'rm -f "$LOG" "$COUNTS"' EXIT
+	(grep -E '^ *Summary \[' "$LOG" || true) >"$COUNTS"
+fi
+PASSED="$( (grep -oE '[0-9]+ passed' "$COUNTS" || true) | awk '{s+=$1} END{print s+0}')"
+FAILED="$( (grep -oE '[0-9]+ failed' "$COUNTS" || true) | awk '{s+=$1} END{print s+0}')"
 
 if [[ $RC -ne 0 || $FAILED -ne 0 ]]; then
 	finish FAIL "$CRATES_DISPLAY" "$PASSED" "$FAILED" 1

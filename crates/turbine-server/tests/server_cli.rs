@@ -528,8 +528,10 @@ const LONG_TOKENS: u32 = 1500;
 /// it autotunes), so it pauses after 880 tokens or more.
 const SHORT_TOKENS: u32 = if cfg!(target_os = "macos") { 1200 } else { 600 };
 /// `server.shutdown_grace` of the drain test: time for the short stream's remaining tokens
-/// (at most about 300 on Linux, 320 on macOS) in a debug build.
-const GRACE: Duration = Duration::from_secs(if cfg!(target_os = "macos") { 5 } else { 2 });
+/// (at most about 300 on Linux, 320 on macOS) in a debug build. 5 s on Linux too: 2 s missed by
+/// 10 ms under a loaded lab run (`cargo test`, server_cli's tests side by side, 2026-09-28); the
+/// long stream stays paused (unread) however long the grace is, so only the test's length grows.
+const GRACE: Duration = Duration::from_secs(5);
 
 /// The tiny checkpoint patched to `LONG_POSITIONS` positions, served as `m` on the cpu backend
 /// with a 16 MiB KV pool; `server_extra` is appended to the `server` section verbatim.
@@ -732,10 +734,10 @@ fn sigterm_drains_then_cancels() {
 
     let out = wait_with_timeout(
         child,
-        (GRACE + Duration::from_secs(1)).saturating_sub(signalled.elapsed()),
+        (GRACE + Duration::from_secs(3)).saturating_sub(signalled.elapsed()),
     );
     assert!(
-        signalled.elapsed() < GRACE + Duration::from_secs(1),
+        signalled.elapsed() < GRACE + Duration::from_secs(3),
         "exit took {:?}",
         signalled.elapsed()
     );

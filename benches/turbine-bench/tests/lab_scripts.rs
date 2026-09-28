@@ -516,6 +516,124 @@ fn lab_test_gpus_2_is_the_inventory_path() {
     assert_eq!(env(&jobs[1], "TURBINE_EXPECT_AMD"), "2");
 }
 
+/// P5 exit: the two tiers split the lab tests by GPU count. The default one-GPU leg skips the
+/// two-GPU tests (`TWO_GPU_TESTS`); `--gpus 2` without a selection runs only those plus the
+/// tests whose expectation follows `TURBINE_EXPECT_AMD` (`GPU_COUNT_TESTS`), as bare filters;
+/// `--tier quick` still skips the slow tests there; an explicit selection passes unchanged, and
+/// `--gpus 2 --tier perf` (perf is one-GPU work) is a usage error. Breaks if a two-GPU test
+/// lands in the one-GPU leg or the two-GPU leg reruns the whole workspace.
+#[test]
+fn lab_test_routes_two_gpu_tests_to_the_gpus_2_leg() {
+    let two_gpu = [
+        "hostmem_",
+        "rccl_init_with_a_missing_peer",
+        "cold_tp2",
+        "tp2_collective_failure_recovers_on_gpu",
+    ];
+    let gpu_count = [
+        "inventory_matches_expectation",
+        "concurrent_discovery_sees_every_device",
+        "topology_matches_host",
+        "host_link_probe",
+    ];
+    let head = |cmd: &[&str]| -> Vec<String> {
+        [
+            "cargo",
+            "test",
+            "--no-fail-fast",
+            "--workspace",
+            "--",
+            "--include-ignored",
+            "--show-output",
+            "--skip",
+            "hf_reference_matches_cpu",
+        ]
+        .iter()
+        .chain(cmd)
+        .map(|s| s.to_string())
+        .collect()
+    };
+
+    let text = dry_run(
+        "lab-test.sh",
+        "route-one",
+        &["--dry-run", "novanas", "--tier", "full"],
+    );
+    let id = run_id(&text, "lab-test");
+    let skips: Vec<&str> = two_gpu.iter().flat_map(|t| ["--skip", *t]).collect();
+    assert_eq!(test_command(&text, &id), head(&skips));
+
+    let text = dry_run(
+        "lab-test.sh",
+        "route-two",
+        &["--dry-run", "novanas", "--gpus", "2", "--tier", "full"],
+    );
+    let id = run_id(&text, "lab-test");
+    let filters: Vec<&str> = two_gpu.iter().chain(&gpu_count).copied().collect();
+    assert_eq!(test_command(&text, &id), head(&filters));
+    assert_eq!(amd_gpus(&applied_jobs(&text)[1]), 2);
+
+    let text = dry_run(
+        "lab-test.sh",
+        "route-two-quick",
+        &["--dry-run", "novanas", "--gpus", "2", "--tier", "quick"],
+    );
+    let id = run_id(&text, "lab-test");
+    let cmd = test_command(&text, &id);
+    assert_eq!(cmd[..head(&filters).len()], head(&filters)[..]);
+    assert!(
+        cmd[head(&filters).len()..]
+            .chunks(2)
+            .all(|p| p[0] == "--skip" && !two_gpu.contains(&p[1].as_str())),
+        "{cmd:?}"
+    );
+
+    let text = dry_run(
+        "lab-test.sh",
+        "route-two-select",
+        &[
+            "--dry-run",
+            "novanas",
+            "--gpus",
+            "2",
+            "--",
+            "-p",
+            "turbine-kernels",
+            "--test",
+            "lab",
+            "--",
+            "host_link_probe",
+        ],
+    );
+    let id = run_id(&text, "lab-test");
+    assert_eq!(
+        test_command(&text, &id),
+        [
+            "cargo",
+            "test",
+            "--no-fail-fast",
+            "-p",
+            "turbine-kernels",
+            "--test",
+            "lab",
+            "--",
+            "--include-ignored",
+            "--show-output",
+            "--skip",
+            "hf_reference_matches_cpu",
+            "host_link_probe",
+        ]
+    );
+
+    let (out, called) = lab_script(
+        "lab-test.sh",
+        "route-two-perf",
+        &["novanas", "--gpus", "2", "--tier", "perf"],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(called, None, "--gpus 2 --tier perf contacted a host");
+}
+
 /// P3 Task 17: `--features <list>` reaches the in-container `cargo test` (the fault-injection
 /// build of `tests/fault.rs`), before the harness arguments; `--stop` takes no features.
 #[test]

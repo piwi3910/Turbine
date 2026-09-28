@@ -202,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn permits_bound_compilations_and_the_timeout_covers_the_wait() {
         let dir = TempDir::new("turbine-grammar-timeout");
-        let grammars = service(&dir, 64 * 1024, Duration::from_millis(100));
+        let mut grammars = service(&dir, 64 * 1024, Duration::from_millis(100));
         assert_eq!(grammars.permits.available_permits(), COMPILE_PERMITS);
         // Every permit is taken: the next compilation waits and runs into the timeout.
         let held = Arc::clone(&grammars.permits)
@@ -217,6 +217,9 @@ mod tests {
         assert_eq!(e.code, ErrorCode::InvalidJsonSchema);
         assert!(e.message.contains("compile_timeout"), "{}", e.message);
         drop(held);
+        // The permits are free again: a compilation succeeds. Under a generous timeout, since a
+        // loaded host (a parallel gate) can take longer than 100 ms to compile even json_object.
+        grammars.timeout = Duration::from_secs(30);
         assert!(
             grammars
                 .compile(&ConstraintSpec::JsonObject, 1)
