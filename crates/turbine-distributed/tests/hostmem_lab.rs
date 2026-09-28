@@ -442,3 +442,130 @@ fn hostmem_delegate_init_with_a_missing_peer_fails_in_time() {
     );
     assert!(waited < Duration::from_secs(10), "{waited:?}");
 }
+
+/// Routing on the GPUs: both ranks open with RCCL as the delegate and a 1 KiB threshold; a
+/// 64-byte all-reduce stays on hostmem, a 1 MiB one goes to RCCL, and both equal the host
+/// backend on both ranks.
+#[test]
+#[ignore = "needs two HIP devices, libturbine_hip.so and RCCL (scripts/lab-test.sh novanas --gpus 2)"]
+fn hostmem_routes_large_messages_to_rccl_on_two_gpus() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _watchdog = watchdog(
+        "hostmem_routes_large_messages_to_rccl_on_two_gpus",
+        Duration::from_secs(120),
+    );
+    let mems = devices();
+    assert!(mems.len() >= 2, "two AMD devices");
+    let lib = collective::registry()
+        .get("hostmem")
+        .expect("registered")
+        .load(None)
+        .expect("load (with RCCL as the delegate)");
+    let id = lib.unique_id().expect("id");
+    let sizes = [16usize, 262_144];
+    let inputs: Vec<Vec<Vec<u8>>> = (0..2)
+        .map(|r| {
+            sizes
+                .iter()
+                .map(|&n| encode(DType::F32, &values(r as u64 * 31 + n as u64, n)))
+                .collect()
+        })
+        .collect();
+    let got: Vec<Vec<Vec<u8>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..2)
+            .map(|r| {
+                let (lib, mem, inputs) = (Arc::clone(&lib), &mems[r], &inputs[r]);
+                s.spawn(move || {
+                    let comm = lib
+                        .open(CollectiveInit {
+                            route_max_bytes: Some(1024),
+                            ..init(r, 2, id, Duration::from_secs(60), Arc::clone(mem))
+                        })
+                        .expect("open with the RCCL delegate");
+                    let stream = mem.compute_stream();
+                    inputs
+                        .iter()
+                        .map(|input| {
+                            let buf = DeviceBuffer::alloc(mem, input.len()).expect("alloc");
+                            buf.whole().write_bytes(input).expect("write");
+                            comm.step_begin();
+                            comm.all_reduce(&mut buf.whole(), DType::F32, ReduceOp::Sum, &stream)
+                                .expect("all_reduce");
+                            mem.synchronize().expect("sync");
+                            comm.step_end().expect("healthy");
+                            buf.whole().read_bytes().expect("read")
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("rank"))
+            .collect()
+    });
+    for (k, n) in sizes.iter().enumerate() {
+        let f = |b: &[u8]| -> Vec<f32> {
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let sum: Vec<f32> = f(&inputs[0][k])
+            .iter()
+            .zip(f(&inputs[1][k]))
+            .map(|(a, b)| a + b)
+            .collect();
+        let want = encode(DType::F32, &sum);
+        for (r, g) in got.iter().enumerate() {
+            assert!(g[k] == want, "{n} F32 elements rank {r} differs");
+        }
+        println!(
+            "hostmem routed all-reduce of {} bytes: equal to the host backend on both ranks",
+            n * 4
+        );
+    }
+}
+
+/// Plain `rccl`: only rank 0 opens, so RCCL's communicator init waits for a rank that never
+/// comes. The open must fail with `Timeout { op: "comm_init" }` within the init timeout plus
+/// the init grace (`ffi::INIT_GRACE`), never hang.
+#[test]
+#[ignore = "needs a HIP device, libturbine_hip.so and RCCL (scripts/lab-test.sh novanas --gpus 2)"]
+fn rccl_init_with_a_missing_peer_fails_in_time() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _watchdog = watchdog(
+        "rccl_init_with_a_missing_peer_fails_in_time",
+        Duration::from_secs(60),
+    );
+    let mems = devices();
+    let lib = collective::registry()
+        .get("rccl")
+        .expect("registered")
+        .load(None)
+        .expect("RCCL loads");
+    let id = lib.unique_id().expect("id");
+    let started = Instant::now();
+    let result =
+        Arc::clone(&lib).open(init(0, 2, id, Duration::from_secs(3), Arc::clone(&mems[0])));
+    let waited = started.elapsed();
+    println!(
+        "rccl init without its peer: {:?} after {waited:?}",
+        result.as_ref().map(|_| ()).map_err(|e| e.to_string())
+    );
+    let err = result.map(|_| ()).expect_err("the peer never opens");
+    assert!(
+        matches!(
+            err,
+            CollectiveError::Timeout {
+                op: "comm_init",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(waited < Duration::from_secs(10), "{waited:?}");
+}

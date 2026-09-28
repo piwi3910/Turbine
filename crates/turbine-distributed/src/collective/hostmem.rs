@@ -173,8 +173,6 @@ struct HostmemLibrary {
 /// entry leaves once every rank has taken it.
 type DelegateIds = Vec<([u8; UNIQUE_ID_BYTES], [u8; UNIQUE_ID_BYTES], usize)>;
 static DELEGATE_IDS: Mutex<DelegateIds> = Mutex::new(Vec::new());
-/// How long past its init timeout a delegate init may take before the rank gives it up.
-const DELEGATE_INIT_GRACE: Duration = Duration::from_secs(5);
 
 impl HostmemLibrary {
     /// Opens rank `init.rank` of the delegate group paired with `init.unique_id`.
@@ -210,44 +208,9 @@ impl HostmemLibrary {
             memory: init.memory.clone(),
             route_max_bytes: None,
         };
-        // The delegate's own init watchdog bounds its init (abort + `Timeout { op: "comm_init" }`)
-        // as long as the library returns from its init call; the init also runs on a helper
-        // thread that is given up after the init timeout plus a grace, so a library call that
-        // never returns cannot hang the rank either.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let delegate = Arc::clone(delegate);
-        let spawned = std::thread::Builder::new()
-            .name(format!("turbine-hostmem-delegate-init-{}", init.rank))
-            .spawn(move || {
-                let _ = tx.send(delegate.open(delegated));
-            });
-        if let Err(e) = spawned {
-            return Err(CollectiveError::Backend {
-                code: -1,
-                message: format!("cannot start the delegate init thread: {e}"),
-            });
-        }
-        match rx.recv_timeout(init.init_timeout + DELEGATE_INIT_GRACE) {
-            Ok(result) => result,
-            Err(_) => {
-                tracing::warn!(
-                    event = "collective_init_failed",
-                    backend = NAME,
-                    reason = "delegate_init_timeout",
-                    rank = init.rank,
-                    world = init.world,
-                    after_ms = (init.init_timeout + DELEGATE_INIT_GRACE).as_millis() as u64,
-                    "the delegate's communicator init did not return; the rank gives it up"
-                );
-                if let Some(m) = &init.metrics {
-                    m.error(NAME, super::CollectiveErrorKind::Timeout);
-                }
-                Err(CollectiveError::Timeout {
-                    op: "comm_init",
-                    after: init.init_timeout,
-                })
-            }
-        }
+        // The delegate bounds its own init (RCCL: the init watchdog, and a helper thread given
+        // up after the init timeout plus a grace; `ffi::NcclApi::open`).
+        Arc::clone(delegate).open(delegated)
     }
 }
 

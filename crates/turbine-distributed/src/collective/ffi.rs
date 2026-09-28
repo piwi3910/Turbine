@@ -7,6 +7,16 @@
 //! start helper threads that outlive their communicators), so every function pointer copied
 //! out of it stays valid for the life of the process. Communicators, device buffers and streams
 //! are never created here; callers pass the phase-1 handles they own.
+//!
+//! Communicator init runs on a helper thread (`turbine-collective-init-<rank>`) that the opening
+//! rank gives up after `init_timeout` + [`INIT_GRACE`]: the init watchdog aborts a communicator
+//! whose peers never arrive, but on RCCL 2.30.4 the init or abort call itself may not return
+//! (measured on novanas: a lone rank 0 came back only through this bound). A thread given up
+//! that way is leaked together with whatever RCCL holds for it (its half-initialised
+//! communicator, its sockets); nothing of it is reachable from Turbine afterwards. That is
+//! acceptable because such a failure ends the process: at startup the open fails and the server
+//! exits, and at runtime a communicator is only re-created on the circuit path, which restarts
+//! the process on a fatal collective failure.
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::mem::ManuallyDrop;
@@ -258,10 +268,63 @@ impl CollectiveLibrary for NcclApi {
         }
         Ok(id.internal.map(|c| c as u8))
     }
+    /// [`NcclCollective::init`] on a helper thread bound to the rank's device, given up after
+    /// `init_timeout` + [`INIT_GRACE`] (see the module's ownership rules).
     fn open(self: Arc<Self>, init: CollectiveInit) -> Result<Arc<dyn Collective>, CollectiveError> {
-        Ok(Arc::new(NcclCollective::init(self, init)?))
+        let (rank, world, init_timeout) = (init.rank, init.world, init.init_timeout);
+        let metrics = init.metrics.clone();
+        let backend = self.backend_name();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name(format!("turbine-collective-init-{rank}"))
+            .spawn(move || {
+                // The library initialises on the calling thread's current device: a kernel-library
+                // call makes the rank's device current on this thread (every call of the shim
+                // selects its context's device first).
+                if let Some(mem) = &init.memory
+                    && let Err(e) = mem.mem_info()
+                {
+                    let _ = tx.send(Err(CollectiveError::Backend {
+                        code: -1,
+                        message: format!("selecting the rank's device for communicator init: {e}"),
+                    }));
+                    return;
+                }
+                let _ = tx.send(NcclCollective::init(self, init));
+            });
+        if let Err(e) = spawned {
+            return Err(CollectiveError::Backend {
+                code: -1,
+                message: format!("cannot start the communicator init thread: {e}"),
+            });
+        }
+        match rx.recv_timeout(init_timeout + INIT_GRACE) {
+            Ok(result) => Ok(Arc::new(result?)),
+            Err(_) => {
+                tracing::warn!(
+                    event = "collective_init_failed",
+                    backend,
+                    reason = "init_timeout",
+                    rank,
+                    world,
+                    after_ms = (init_timeout + INIT_GRACE).as_millis() as u64,
+                    "communicator init did not return; the rank gives it up (its thread is leaked)"
+                );
+                if let Some(m) = &metrics {
+                    m.error(backend, super::CollectiveErrorKind::Timeout);
+                }
+                Err(CollectiveError::Timeout {
+                    op: "comm_init",
+                    after: init_timeout,
+                })
+            }
+        }
     }
 }
+
+/// How long past its `init_timeout` a communicator init may take before the opening rank gives
+/// up its helper thread.
+pub const INIT_GRACE: Duration = Duration::from_secs(5);
 
 /// The flavor whose file-name prefix `path` carries (`librccl*` → rccl, `libnccl*` → nccl).
 /// Sets the flavor's library settings the operator did not set (`NcclFlavor::env_defaults`),
