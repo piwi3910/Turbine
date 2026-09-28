@@ -413,6 +413,7 @@ impl CollectiveLibrary for HostmemLibrary {
             pairs: Mutex::new(std::collections::HashMap::new()),
             delegate,
             p2p_kept_logged: AtomicBool::new(false),
+            graph_refusal_logged: AtomicBool::new(false),
             dma_min,
             dma: Mutex::new(None),
             dma_peer_read: DMA_PEER_READ.load(Ordering::Relaxed),
@@ -495,6 +496,8 @@ pub struct HostmemCollective {
     delegate: Option<Arc<dyn Collective>>,
     /// A point-to-point call above the threshold kept on hostmem was logged.
     p2p_kept_logged: AtomicBool,
+    /// A delegate call refused under graph capture was logged.
+    graph_refusal_logged: AtomicBool,
     /// The copy-engine threshold (`None`: off; also off without device sequencing or the v2.8
     /// copy-engine step).
     dma_min: Option<u64>,
@@ -713,9 +716,26 @@ impl HostmemCollective {
 
     /// The delegate when a call of `op` over `bytes` (nccl-tests bytes) goes there, `None`
     /// when hostmem runs it; counts the choice.
-    fn route(&self, op: CollectiveOp, bytes: usize) -> Option<&dyn Collective> {
-        let delegate = self.delegate.as_deref()?;
+    /// While the stream is captured into a graph, a call the delegate would run is refused
+    /// ([`RouteReason::GraphCaptureRefused`]): RCCL operations replayed from a graph gave wrong
+    /// results on novanas.
+    fn route(
+        &self,
+        op: CollectiveOp,
+        bytes: usize,
+    ) -> Result<Option<&dyn Collective>, CollectiveError> {
+        let Some(delegate) = self.delegate.as_deref() else {
+            return Ok(None);
+        };
         let max = self.route_max.unwrap_or_else(|| auto_max_bytes(op));
+        if bytes as u64 > max && self.mapped().mapped_capturing() {
+            return Err(super::refuse_captured(
+                op,
+                NAME,
+                self.metrics.as_ref(),
+                &self.graph_refusal_logged,
+            ));
+        }
         let (to, backend, reason) = if bytes as u64 > max {
             (
                 Some(delegate),
@@ -736,7 +756,7 @@ impl HostmemCollective {
             reason = reason.as_str(),
             "collective routed"
         );
-        to
+        Ok(to)
     }
 
     /// Counts where a point-to-point call of `op` over `bytes` runs: always here. Above the
@@ -1029,7 +1049,7 @@ impl Collective for HostmemCollective {
         if self.route_dma(buf.len()) {
             return self.all_reduce_dma(buf, dtype, op, stream);
         }
-        if let Some(d) = self.route(CollectiveOp::AllReduce, buf.len()) {
+        if let Some(d) = self.route(CollectiveOp::AllReduce, buf.len())? {
             return d.all_reduce(buf, dtype, op, stream);
         }
         let plan = Plan {
@@ -1062,7 +1082,7 @@ impl Collective for HostmemCollective {
         if recv.len() != n * self.world {
             return Err(CollectiveError::ShapeMismatch);
         }
-        if let Some(d) = self.route(CollectiveOp::AllGather, recv.len()) {
+        if let Some(d) = self.route(CollectiveOp::AllGather, recv.len())? {
             return d.all_gather(send, recv, stream);
         }
         let plan = Plan {
@@ -1092,7 +1112,7 @@ impl Collective for HostmemCollective {
         if send.len() != n * self.world {
             return Err(CollectiveError::ShapeMismatch);
         }
-        if let Some(d) = self.route(CollectiveOp::ReduceScatter, send.len()) {
+        if let Some(d) = self.route(CollectiveOp::ReduceScatter, send.len())? {
             return d.reduce_scatter(send, recv, dtype, op, stream);
         }
         // A step's slot holds `world` parts, each rounded up to 16 bytes.
@@ -1126,7 +1146,7 @@ impl Collective for HostmemCollective {
         if root >= self.world {
             return Err(CollectiveError::ShapeMismatch);
         }
-        if let Some(d) = self.route(CollectiveOp::Broadcast, buf.len()) {
+        if let Some(d) = self.route(CollectiveOp::Broadcast, buf.len())? {
             return d.broadcast(buf, root, stream);
         }
         let plan = Plan {
@@ -1747,6 +1767,52 @@ mod tests {
             let delegated = format!("op=\"{op}\",backend=\"host\"");
             assert!(!text.contains(&delegated), "{delegated}\n{text}");
         }
+    }
+
+    /// While the stream is captured into a graph, a call the delegate would run is refused
+    /// (`Unavailable`, reason `graph_rccl_delegate_unsupported`, counted in
+    /// `turbine_collective_route_total`) without enqueuing anything or aborting the group; after
+    /// the capture ends the same call routes to the delegate again. Breaks if an RCCL call can
+    /// be captured, or the refusal aborts the group.
+    #[test]
+    fn delegate_calls_are_refused_under_graph_capture() {
+        let delegate = crate::collective::HostBackend.load(None).expect("host");
+        let lib: Arc<dyn CollectiveLibrary> = Arc::new(HostmemLibrary {
+            slot_bytes: SLOT_BYTES,
+            dma_min: None,
+            delegate: Some(delegate),
+        });
+        let id = lib.unique_id().expect("id");
+        let reg = turbine_observability::MetricsRegistry::new();
+        let metrics = CollectiveMetrics::register(&reg);
+        let ctx = stub_mapped_context(0);
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let comm = lib
+            .open(CollectiveInit {
+                metrics: Some(metrics),
+                route_max_bytes: Some(64),
+                ..init(0, 1, id, Duration::from_secs(5), Some(Arc::clone(&mem)))
+            })
+            .expect("open");
+        let stream = mem.compute_stream();
+        let buf = DeviceBuffer::alloc(&mem, 4096).expect("alloc");
+        ctx.graph_begin().expect("begin capture");
+        let err = comm
+            .all_reduce(&mut buf.whole(), DType::F32, ReduceOp::Sum, &stream)
+            .expect_err("refused under capture");
+        drop(ctx.graph_end());
+        assert!(
+            matches!(&err, CollectiveError::Unavailable { detail, .. }
+                if detail.contains("graph_rccl_delegate_unsupported")),
+            "{err:?}"
+        );
+        comm.step_end().expect("the group is not aborted");
+        comm.all_reduce(&mut buf.whole(), DType::F32, ReduceOp::Sum, &stream)
+            .expect("routed to the delegate once the capture ended");
+        let text = reg.render().expect("renders");
+        let line = "turbine_collective_route_total{op=\"all_reduce\",backend=\"hostmem\",\
+                    reason=\"graph_rccl_delegate_unsupported\"} 1";
+        assert!(text.contains(line), "{line}\n{text}");
     }
 
     /// A delegate whose init waits for a peer that never opens: the rank's open fails with

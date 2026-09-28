@@ -221,6 +221,47 @@ impl CollectiveError {
     }
 }
 
+/// The refusal of an NCCL-API (RCCL) call of `op` on a stream being captured into a graph
+/// ([`RouteReason::GraphCaptureRefused`]): counted under `backend`, logged (WARN) the first time
+/// `logged` is unset.
+pub(crate) fn refuse_captured(
+    op: CollectiveOp,
+    backend: &'static str,
+    metrics: Option<&CollectiveMetrics>,
+    logged: &std::sync::atomic::AtomicBool,
+) -> CollectiveError {
+    let reason = RouteReason::GraphCaptureRefused;
+    if let Some(m) = metrics {
+        m.route(op, backend, reason);
+    }
+    if !logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            event = "collective_graph_refused",
+            op = op.as_str(),
+            backend,
+            reason = reason.as_str(),
+            "an RCCL collective cannot be captured into a graph (its replays gave wrong results \
+             on novanas); the capture fails and the step runs eagerly"
+        );
+    }
+    CollectiveError::Unavailable {
+        library: backend.into(),
+        detail: format!(
+            "{}: {} while the stream is captured into a graph",
+            reason.as_str(),
+            op.as_str()
+        ),
+    }
+}
+
+/// Whether `stream`'s context is capturing its compute stream into a graph.
+pub(crate) fn capturing(stream: &StreamRef) -> bool {
+    stream
+        .memory()
+        .mapped_collectives()
+        .is_some_and(|m| m.mapped_capturing())
+}
+
 /// `op` label values.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum CollectiveOp {
@@ -286,6 +327,10 @@ pub enum RouteReason {
     NoPeerAccess,
     /// At least the backend's copy-engine threshold: its copy-engine path (`hostmem`).
     CopyEngine,
+    /// The call would run an NCCL-API (RCCL) collective while its stream is captured into a
+    /// graph: refused (`Unavailable`), so the capture fails and the step runs eagerly. RCCL
+    /// operations replayed from a graph gave wrong results on novanas (P5 Task 32 follow-up).
+    GraphCaptureRefused,
 }
 
 impl RouteReason {
@@ -296,6 +341,7 @@ impl RouteReason {
             RouteReason::OpUnsupported => "op_unsupported",
             RouteReason::NoPeerAccess => "no_peer_access",
             RouteReason::CopyEngine => "copy_engine",
+            RouteReason::GraphCaptureRefused => "graph_rccl_delegate_unsupported",
         }
     }
 }

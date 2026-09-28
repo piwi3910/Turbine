@@ -706,6 +706,15 @@ fn graph_replays(name: &'static str, gather: usize, route_max_bytes: Option<u64>
                         .map(|i| DeviceBuffer::alloc(mem, i.len()).expect("alloc"))
                         .collect();
                     let gathered = DeviceBuffer::alloc(mem, 2 * gather).expect("alloc");
+                    let enqueue_checked = || -> Result<(), String> {
+                        let e = |e: collective::CollectiveError| e.to_string();
+                        comm.all_reduce(&mut bufs[0].whole(), DType::BF16, ReduceOp::Sum, &stream)
+                            .map_err(e)?;
+                        comm.all_reduce(&mut bufs[1].whole(), DType::F32, ReduceOp::Sum, &stream)
+                            .map_err(e)?;
+                        comm.all_gather(&bufs[2].whole(), &mut gathered.whole(), &stream)
+                            .map_err(e)
+                    };
                     let enqueue = || {
                         comm.all_reduce(&mut bufs[0].whole(), DType::BF16, ReduceOp::Sum, &stream)
                             .expect("bf16 all_reduce");
@@ -734,13 +743,34 @@ fn graph_replays(name: &'static str, gather: usize, route_max_bytes: Option<u64>
                     mem.synchronize().expect("sync");
                     comm.step_end().expect("healthy eager step");
                     out.push(read());
+                    // Delegate route: the RCCL all-gather refuses the capture (reason
+                    // graph_rccl_delegate_unsupported, nothing enqueued), the capture ends
+                    // unused and every round runs eagerly, as the decode graphs fall back.
                     ctx.graph_begin().expect("begin capture");
-                    enqueue();
-                    let graph = ctx.graph_end().expect("the collectives are capturable");
+                    let captured = enqueue_checked();
+                    let ended = ctx.graph_end();
+                    let graph = match (route_max_bytes, captured) {
+                        (None, Err(e)) => {
+                            assert!(
+                                e.contains("graph_rccl_delegate_unsupported"),
+                                "rank {r}: refusal reason: {e}"
+                            );
+                            drop(ended);
+                            None
+                        }
+                        (None, Ok(())) => panic!("rank {r}: an RCCL call was captured"),
+                        (Some(_), captured) => {
+                            captured.expect("hostmem's kernels are capturable");
+                            Some(ended.expect("the collectives are capturable"))
+                        }
+                    };
                     for round in 1..=ROUNDS {
                         write(&inputs[round][r]);
                         comm.step_begin();
-                        ctx.graph_launch(&graph).expect("replay");
+                        match &graph {
+                            Some(g) => ctx.graph_launch(g).expect("replay"),
+                            None => enqueue(),
+                        }
                         mem.synchronize().expect("sync");
                         comm.step_end().expect("healthy replay");
                         out.push(read());
@@ -804,7 +834,9 @@ fn hostmem_graph_replays_match_reference_on_two_gpus() {
 }
 
 /// [`graph_replays`] with the logits all-gather of a 16-sequence Llama decode step (16 × 64,128
-/// FP32 per rank, 4 MiB): routed to the RCCL delegate and captured with the rest.
+/// FP32 per rank, 4 MiB), routed to the RCCL delegate: the capture is refused with reason
+/// `graph_rccl_delegate_unsupported` (RCCL calls replayed from a graph gave wrong results from
+/// the second replay on) and every round runs eagerly, bitwise the reference.
 #[test]
 #[ignore = "needs two HIP devices, libturbine_hip.so and RCCL (scripts/lab-test.sh novanas --gpus 2)"]
 fn hostmem_graph_replays_with_rccl_delegate_on_two_gpus() {
