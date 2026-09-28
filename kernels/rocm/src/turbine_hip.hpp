@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -50,6 +51,9 @@ struct GemmChoice {
 };
 
 struct TunedGemm;
+
+// The per-context state of the quantized GEMM (qgemm.cpp).
+struct QGemmCache;
 
 // The card profile a context holds (ABI v2.4 turbine_card_profile, copied by
 // turbine_ctx_set_profile). The turbine_<op> entry points read their
@@ -117,6 +121,9 @@ struct turbine_ctx {
   std::map<int32_t, std::map<std::string, int>> gemm_solutions;
   // Table rows whose fallback was logged (once per row and context).
   std::set<const turbine_hip::TunedGemm *> gemm_table_logged;
+  // v2.9 quantized GEMM algorithm cache (qgemm.cpp), created at the first
+  // turbine_qgemm call.
+  std::shared_ptr<turbine_hip::QGemmCache> qgemm;
   // hipDeviceAttributeWallClockRate of the device (kHz), read at the first
   // host-mapped collective step (hostmem.hip); 0 until then.
   int64_t wall_clock_khz = 0;

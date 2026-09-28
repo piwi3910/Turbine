@@ -1,8 +1,6 @@
 // turbine_abi_minor: the minor revision of the library it is linked into.
 //
-// libturbine_hip.so reports 8 (the header is at 9; the v2.9 quantized GEMM,
-// activation quantization and FP8 KV scales arrive with Phase 6a Task 13, which
-// switches this back to TURBINE_ABI_MINOR): besides the ABI v2 trios it
+// libturbine_hip.so reports TURBINE_ABI_MINOR (9): besides the ABI v2 trios it
 // exports the optional add_rmsnorm trio (rmsnorm.cpp), the v2.1 context
 // options (context.cpp: the tuned GEMM table switch), logits_reduce
 // (logits_reduce.hip), the graph functions (graph.cpp), the v2.3 pinned host
@@ -10,7 +8,10 @@
 // (impl_exports.cpp), the v2.5 copy streams (copy_stream.cpp) and the v2.6
 // native stream handle (copy_stream.cpp) with the sharded RMSNorm trios
 // (sharded_norm.hip), the v2.7 host-mapped memory and collectives and the v2.8
-// device-sequenced collective step (hostmem.hip).
+// device-sequenced collective step (hostmem.hip), and the v2.9 quantized GEMM
+// (qgemm.cpp) and activation quantization (quantize_act.hip) trios; the v2.9
+// FP8 KV scales of turbine_attention_paged_desc are read only with F8E4M3
+// pages, which paged attention refuses until an implementation takes them.
 // libturbine_hip_v23.so, compiled with TURBINE_V23_BUILD, is the same kernels
 // without impl_exports.cpp and reports 3, so a caller keeps the library's own
 // choice of implementation (the fallback the v2.4 group is optional against)
@@ -25,7 +26,7 @@ uint32_t turbine_abi_minor(void) {
 #ifdef TURBINE_V23_BUILD
   return 3u;
 #else
-  return 8u;
+  return TURBINE_ABI_MINOR;
 #endif
 }
 
