@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use libloading::Library;
@@ -364,6 +364,7 @@ impl ShimLibrary {
             card: OnceLock::new(),
             pinned: PinnedState::default(),
             gemm_prefill: AtomicU8::new(0),
+            capturing: AtomicBool::new(false),
         }))
     }
 }
@@ -419,6 +420,9 @@ pub struct ShimContext {
     /// The step kind last handed to the library as `TURBINE_OPTION_GEMM_PREFILL` (0 decode, the
     /// library default; 1 prefill), or `GEMM_PREFILL_UNSUPPORTED`.
     gemm_prefill: AtomicU8,
+    /// Between a successful `graph_begin` and its `graph_end` (the hostmem backend keeps
+    /// captured all-reduces on its capturable steps).
+    capturing: AtomicBool,
 }
 
 /// The staging buffers of one context and the next id.
@@ -679,7 +683,14 @@ impl ShimContext {
         let fns = self.graph_fns()?;
         // SAFETY: `raw` is a live context of this library.
         let code = unsafe { (fns.begin)(self.raw) };
-        self.check(code)
+        self.check(code)?;
+        self.capturing.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// True while this context's compute stream is being captured into a graph.
+    pub fn is_capturing(&self) -> bool {
+        self.capturing.load(Ordering::Relaxed)
     }
 
     /// Stops the capture begun by `graph_begin` and instantiates it. The graph records the
@@ -692,6 +703,8 @@ impl ShimContext {
         // On success the shim stores a graph it allocated; ownership passes to the `GraphHandle`
         // below, which destroys it exactly once.
         let code = unsafe { (fns.end)(self.raw, &mut raw) };
+        // The shim always ends the capture, even when it fails.
+        self.capturing.store(false, Ordering::Relaxed);
         self.check(code)?;
         if raw.is_null() {
             return Err(KernelError::Library {

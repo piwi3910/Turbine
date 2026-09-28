@@ -100,6 +100,14 @@ struct Args {
     /// message on hostmem's own kernels) overrides it.
     #[arg(long, default_value = "auto")]
     route_max_bytes: String,
+    /// hostmem: all-reduces of at least this many bytes take the copy-engine path
+    /// (`parallel.collective.hostmem_dma_min_bytes`, kernel ABI v2.8); default off.
+    #[arg(long)]
+    hostmem_dma_min_bytes: Option<ByteSize>,
+    /// hostmem copy-engine path: copy the peers' chunks into device memory first instead of
+    /// the reduction reading them from the mapped slots (A/B).
+    #[arg(long)]
+    hostmem_dma_copy_in: bool,
     #[arg(long, value_enum, default_value = "text")]
     output: Output,
 }
@@ -498,6 +506,10 @@ fn main() -> ExitCode {
     let init_timeout = Duration::from_secs(120);
     let op_timeout = Duration::from_secs(60);
 
+    turbine_distributed::collective::hostmem::set_dma_min_bytes(
+        args.hostmem_dma_min_bytes.map(|b| b.0),
+    );
+    turbine_distributed::collective::hostmem::set_dma_peer_read(!args.hostmem_dma_copy_in);
     let lib = match backend.load(args.library.as_deref()) {
         Ok(lib) => lib,
         Err(e) => return failure(e),

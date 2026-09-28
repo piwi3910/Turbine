@@ -15,7 +15,7 @@ pub use buffer::{
 pub use dtype::DType;
 pub use kv_view::KvPoolView;
 pub use mapped::{
-    MAPPED_ABORT_HOST, MAPPED_ABORT_TIMEOUT, MappedCollectives, MappedHost, MappedKind,
+    MAPPED_ABORT_HOST, MAPPED_ABORT_TIMEOUT, MappedCollectives, MappedDma, MappedHost, MappedKind,
     MappedReduce, MappedRegion, MappedStep,
 };
 pub use pinned::{

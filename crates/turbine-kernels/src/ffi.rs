@@ -459,6 +459,30 @@ pub(crate) struct MappedFns {
 pub(crate) type MappedDseqFn =
     unsafe extern "C" fn(*mut TurbineCtx, *const MappedCollectiveDesc, *mut u64) -> i32;
 
+/// `turbine_mapped_dma_desc` (v2.8).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MappedDmaDesc {
+    pub copy: *mut TurbineStream,
+    pub event: *mut TurbineEvent,
+    pub scratch: *mut c_void,
+    pub chunk_bytes: i64,
+    pub seq_counter: *mut u64,
+    pub flags: i32,
+}
+
+/// `turbine_mapped_all_reduce_dma` (v2.8): the copy-engine all-reduce.
+pub(crate) type MappedDmaFn =
+    unsafe extern "C" fn(*mut TurbineCtx, *const MappedCollectiveDesc, *const MappedDmaDesc) -> i32;
+
+/// The v2.8 copy-engine group: `turbine_mapped_all_reduce_dma` and `turbine_host_alloc_dma`
+/// (freed with the v2.7 `turbine_host_free_mapped`).
+#[derive(Clone, Copy)]
+pub(crate) struct MappedDmaFns {
+    pub run: MappedDmaFn,
+    pub alloc: unsafe extern "C" fn(*mut TurbineCtx, usize, *mut *mut c_void) -> i32,
+}
+
 /// `TURBINE_IMPL_NEEDS_HOST_OFFSETS` (v2.4): the implementation reads `host_expert_offsets`.
 pub(crate) const IMPL_NEEDS_HOST_OFFSETS: u32 = 1;
 
@@ -529,6 +553,8 @@ pub(crate) struct V21Symbols {
     pub mapped: Option<MappedFns>,
     /// v2.8 device-sequenced mapped collective steps (needs the v2.7 group).
     pub mapped_dseq: Option<MappedDseqFn>,
+    /// v2.8 copy-engine all-reduce (needs the v2.7 group and the v2.3 / v2.5 copy functions).
+    pub mapped_dma: Option<MappedDmaFns>,
 }
 
 impl V21Symbols {
@@ -623,9 +649,19 @@ impl V21Symbols {
         } else {
             None
         };
+        let mapped_dma = (|| {
+            if minor < 8 || mapped.is_none() || copies.is_none() {
+                return None;
+            }
+            Some(MappedDmaFns {
+                run: optional(lib, "turbine_mapped_all_reduce_dma")?,
+                alloc: optional(lib, "turbine_host_alloc_dma")?,
+            })
+        })();
         V21Symbols {
             minor,
             mapped_dseq,
+            mapped_dma,
             options,
             add_rmsnorm: optional_trio(lib, "add_rmsnorm"),
             logits_reduce: optional_trio(lib, "logits_reduce"),

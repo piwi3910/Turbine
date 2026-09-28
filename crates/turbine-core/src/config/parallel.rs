@@ -160,6 +160,9 @@ pub struct CollectiveTimeouts {
     /// The largest message (nccl-tests bytes) the `hostmem` backend keeps on its own kernels;
     /// larger ones go to RCCL. `auto` (default): the measured per-op crossover.
     pub hostmem_max_bytes: ByteSizeOrAuto,
+    /// All-reduces of at least this many bytes run on the `hostmem` copy-engine path (kernel ABI
+    /// v2.8; P5 Task 32) instead of its kernels or RCCL; `null` (default): off until benched.
+    pub hostmem_dma_min_bytes: Option<ByteSize>,
 }
 
 impl Default for CollectiveTimeouts {
@@ -168,6 +171,7 @@ impl Default for CollectiveTimeouts {
             init_timeout: HumanDuration::from_secs(120),
             op_timeout: HumanDuration::from_secs(30),
             hostmem_max_bytes: ByteSizeOrAuto::Auto,
+            hostmem_dma_min_bytes: None,
         }
     }
 }

@@ -12,9 +12,10 @@
 #   collbench-sweep-novanas  small-message all-reduce latency under RCCL settings (diagnostics).
 #   collbench-hostmem-novanas  turbine-collbench --op all, 8 B .. 1 GiB, BF16, for hostmem's
 #                      kernels at every size (--route-max-bytes 1TiB), hostmem routed at its
-#                      measured crossover (hostmem-auto) and rccl, each per op (op +
+#                      measured crossover (hostmem-auto), hostmem's copy-engine all-reduce
+#                      from 64 KiB (hostmem-dma, P5 Task 32) and rccl, each per op (op +
 #                      synchronize, median) and --pipelined (back to back, mean): every row
-#                      printed as `hm <hostmem|hostmem-auto|rccl> <per-op|pipelined> <op>
+#                      printed as `hm <hostmem|hostmem-auto|hostmem-dma|rccl> <per-op|pipelined> <op>
 #                      <bytes> <time_us> <busbw_gbps>`; PASS when every row of every run is
 #                      correct (each rank checks its result bit for bit against the host
 #                      reference backend, so both ranks hold the same bits). Keep the numbers
@@ -284,13 +285,35 @@ tp_prefix_check() {
 # collbench-hostmem-novanas: hostmem against rccl, every op, 8 B .. 1 GiB, per op and pipelined.
 scenario_collbench_hostmem() {
 	local run backend mode out
-	# hostmem = its kernels at every size; hostmem-auto = routed at the measured crossover.
-	for run in hostmem hostmem-auto rccl; do
+	# hostmem = its kernels at every size; hostmem-auto = routed at the measured crossover;
+	# hostmem-dma = the copy-engine all-reduce (P5 Task 32) from 64 KiB, all-reduce only;
+	# hostmem-dma-copyin = the same with the peers' chunks copied in first (A/B, not by default).
+	# An uncommitted scripts/lab/collbench-hostmem.local narrows a diagnostic run: a line
+	# `runs=<run>...` picks the runs, `max_bytes=<size>` caps the sizes, `devices=<list>` picks
+	# the devices (e.g. `0` for a one-rank run of the copy-engine path: its copies out alone).
+	local runs=(hostmem hostmem-auto hostmem-dma rccl) max=1GiB devices=0,1 line
+	if [[ -f scripts/lab/collbench-hostmem.local ]]; then
+		while read -r line; do
+			case "$line" in
+			runs=*) read -r -a runs <<<"${line#runs=}" ;;
+			max_bytes=*) max="${line#max_bytes=}" ;;
+			devices=*) devices="${line#devices=}" ;;
+			esac
+		done <scripts/lab/collbench-hostmem.local
+		echo "lab-info: collbench-hostmem narrowed: runs=${runs[*]} max_bytes=${max} devices=${devices}"
+	fi
+	for run in "${runs[@]}"; do
 		backend="${run%-auto}"
+		backend="${backend%-copyin}"
+		backend="${backend%-dma}"
 		for mode in per-op pipelined; do
 			out="${WORK}/hm-${run}-${mode}.json"
-			local flags=(--backend "$backend" --devices 0,1 --op all --max-bytes 1GiB --output json)
+			local flags=(--backend "$backend" --devices "$devices" --op all --max-bytes "$max" --output json)
 			[[ $run == hostmem ]] && flags+=(--route-max-bytes 1TiB)
+			[[ $run == hostmem-dma* ]] && flags=(--backend hostmem --devices "$devices" --op all_reduce
+				--min-bytes 64KiB --max-bytes "$max" --output json --route-max-bytes 1TiB
+				--hostmem-dma-min-bytes 64KiB)
+			[[ $run == hostmem-dma-copyin ]] && flags+=(--hostmem-dma-copy-in)
 			[[ $mode == pipelined ]] && flags+=(--pipelined)
 			echo "lab-step: turbine-collbench ${flags[*]}"
 			"${BIN}/turbine-collbench" "${flags[@]}" >"$out" || {

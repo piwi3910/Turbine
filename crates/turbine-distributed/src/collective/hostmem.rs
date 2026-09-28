@@ -42,6 +42,14 @@
 //! host's, and a step refuses stream capture. [`set_device_sequencing`] turns the device counter
 //! off for groups opened afterwards (an A/B switch for `turbine-collbench`).
 //!
+//! Copy-engine all-reduce (P5 Task 32, off by default): with
+//! `parallel.collective.hostmem_dma_min_bytes` ([`set_dma_min_bytes`]) an all-reduce of at
+//! least that many bytes — outside a graph capture, on a kernel library with ABI v2.8 — moves
+//! its bytes with the copy engines (~2× the kernels' mapped-memory rate on novanas) through
+//! slots of its own (`2 × world ×` [`DMA_SLOT_BYTES`], allocated on first use) in pipelined
+//! chunks, and reduces on the device in rank order: bit for bit the one-shot kernels' result,
+//! counted as reason `copy_engine`. It takes precedence over the RCCL delegate.
+//!
 //! In `static` rank mode (one process per rank) there is no shared allocation: `open` answers
 //! `Unavailable`, the planner refuses `hostmem` there and `auto` takes `rccl`.
 
@@ -54,8 +62,8 @@ use turbine_core::registry::Module;
 use turbine_core::types::Vendor;
 use turbine_tensor::{
     DType, DeviceBuffer, DeviceMemory, DevicePtr, DeviceSlice, MAPPED_ABORT_HOST,
-    MAPPED_ABORT_TIMEOUT, MappedCollectives, MappedKind, MappedReduce, MappedRegion, MappedStep,
-    StreamRef,
+    MAPPED_ABORT_TIMEOUT, MappedCollectives, MappedDma, MappedKind, MappedReduce, MappedRegion,
+    MappedStep, StreamRef,
 };
 
 use turbine_core::config::ParallelConfig;
@@ -83,6 +91,48 @@ static DEVICE_SEQ: AtomicBool = AtomicBool::new(true);
 /// must open under the same setting). Off: host sequence numbers, which a graph cannot replay.
 pub fn set_device_sequencing(on: bool) {
     DEVICE_SEQ.store(on, Ordering::Relaxed);
+}
+
+/// `parallel.collective.hostmem_dma_min_bytes` for the libraries loaded from now on (0: off).
+static DMA_MIN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the copy-engine threshold (`parallel.collective.hostmem_dma_min_bytes`; `None`: off) of
+/// the hostmem libraries loaded afterwards: an all-reduce of at least this many bytes (outside a
+/// graph capture) runs on the copy-engine path, kernel ABI v2.8 `turbine_mapped_all_reduce_dma`,
+/// instead of the one-shot steps or the RCCL delegate (reason `copy_engine`). Every rank of a
+/// group must load under the same setting (one process in `local` mode).
+pub fn set_dma_min_bytes(min: Option<u64>) {
+    DMA_MIN_BYTES.store(
+        min.unwrap_or(0).max(u64::from(min.is_some())),
+        Ordering::Relaxed,
+    );
+}
+
+/// How the copy-engine path brings the peers' chunks in (groups opened afterwards): `true`
+/// (default) the reduction kernel reads them from the mapped slots while the copy engine
+/// writes the next chunk out (the two directions of the link at once); `false` the copy engine
+/// copies them into device scratch first. An A/B switch for `turbine-collbench`.
+static DMA_PEER_READ: AtomicBool = AtomicBool::new(true);
+
+/// Sets [`DMA_PEER_READ`] for the groups opened afterwards.
+pub fn set_dma_peer_read(on: bool) {
+    DMA_PEER_READ.store(on, Ordering::Relaxed);
+}
+
+/// Bytes of one rank's copy-engine slot: larger all-reduces run as several calls.
+pub const DMA_SLOT_BYTES: u64 = 16 << 20;
+/// The copy-engine path's pipeline chunk: the message over [`DMA_TARGET_CHUNKS`] chunks,
+/// within [`DMA_MIN_CHUNK`] ..= [`DMA_MAX_CHUNK`] bytes (so at most 64 chunks per call).
+pub const DMA_MIN_CHUNK: u64 = 64 << 10;
+pub const DMA_MAX_CHUNK: u64 = 2 << 20;
+pub const DMA_TARGET_CHUNKS: u64 = 8;
+
+/// The chunk bytes of a copy-engine call over `n` bytes (a multiple of 16, the same on every
+/// rank).
+pub fn dma_chunk_bytes(n: u64) -> u64 {
+    n.div_ceil(DMA_TARGET_CHUNKS)
+        .next_multiple_of(16)
+        .clamp(DMA_MIN_CHUNK, DMA_MAX_CHUNK)
 }
 
 /// Identifies a hostmem group id (bytes 20..28), next to the creating process id.
@@ -160,8 +210,13 @@ impl CollectiveBackend for HostmemBackend {
                 None
             }
         };
+        let dma_min = match DMA_MIN_BYTES.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        };
         Ok(Arc::new(HostmemLibrary {
             slot_bytes: SLOT_BYTES,
+            dma_min,
             delegate,
         }))
     }
@@ -178,6 +233,8 @@ struct Group {
     joined: Mutex<Vec<bool>>,
     /// Point-to-point regions by (lower rank, higher rank), allocated on first use.
     pairs: Mutex<std::collections::HashMap<(usize, usize), MappedRegion>>,
+    /// The copy-engine slots (`2 × world × DMA_SLOT_BYTES`), allocated on first use.
+    dma: Mutex<Option<MappedRegion>>,
 }
 
 /// Open groups by unique id (process-local); an entry dies with its last rank.
@@ -187,6 +244,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 struct HostmemLibrary {
     slot_bytes: u64,
+    /// All-reduces of at least this many bytes take the copy-engine path (`None`: never).
+    dma_min: Option<u64>,
     /// The library of large messages (RCCL), if it loaded.
     delegate: Option<Arc<dyn CollectiveLibrary>>,
 }
@@ -324,12 +383,17 @@ impl CollectiveLibrary for HostmemLibrary {
         } else {
             None
         };
+        // The copy-engine path needs the device counter and the v2.8 copy-engine step.
+        let dma_min = self
+            .dma_min
+            .filter(|_| device_seq.is_some() && mc.mapped_dma_supported());
         tracing::info!(
             event = "collective_init",
             backend = NAME,
             rank = init.rank,
             world = init.world,
             device_sequenced = device_seq.is_some(),
+            dma_min_bytes = ?dma_min,
             region_bytes = group.layout.total,
             delegate = delegate.as_ref().map_or("none", |d| d.backend()),
             route_max_bytes = ?init.route_max_bytes,
@@ -349,6 +413,9 @@ impl CollectiveLibrary for HostmemLibrary {
             pairs: Mutex::new(std::collections::HashMap::new()),
             delegate,
             p2p_kept_logged: AtomicBool::new(false),
+            dma_min,
+            dma: Mutex::new(None),
+            dma_peer_read: DMA_PEER_READ.load(Ordering::Relaxed),
             route_max: init.route_max_bytes,
         }))
     }
@@ -382,6 +449,7 @@ fn join(
                 region,
                 joined: Mutex::new(vec![false; init.world]),
                 pairs: Mutex::new(std::collections::HashMap::new()),
+                dma: Mutex::new(None),
             });
             groups.push((init.unique_id, Arc::downgrade(&g)));
             g
@@ -427,6 +495,13 @@ pub struct HostmemCollective {
     delegate: Option<Arc<dyn Collective>>,
     /// A point-to-point call above the threshold kept on hostmem was logged.
     p2p_kept_logged: AtomicBool,
+    /// The copy-engine threshold (`None`: off; also off without device sequencing or the v2.8
+    /// copy-engine step).
+    dma_min: Option<u64>,
+    /// This rank's copy-engine state, made on the first copy-engine call.
+    dma: Mutex<Option<DmaState>>,
+    /// The copy-engine path's reduction reads the peers' slots directly ([`DMA_PEER_READ`]).
+    dma_peer_read: bool,
     /// The operator's threshold; `None` is [`auto_max_bytes`].
     route_max: Option<u64>,
 }
@@ -483,6 +558,16 @@ struct Pair {
     _region: MappedRegion,
     base: DevicePtr,
     seq: AtomicU64,
+}
+
+/// One rank's copy-engine state: the group's copy-engine slots mapped into this device, the
+/// device scratch the peers' chunks land in, and the count of copy-engine calls (the slot
+/// parity, equal on every rank).
+struct DmaState {
+    _region: MappedRegion,
+    slots: DevicePtr,
+    scratch: DeviceBuffer,
+    calls: u64,
 }
 
 /// Bytes of one rank's point-to-point slot (a pair region holds 2 × 2 of them).
@@ -682,6 +767,132 @@ impl HostmemCollective {
         }
     }
 
+    /// Whether an all-reduce of `bytes` takes the copy-engine path: at least the threshold, and
+    /// not while the stream is captured (the path is not capturable). Counted when it does.
+    fn route_dma(&self, bytes: usize) -> bool {
+        let dma = self.dma_min.is_some_and(|min| bytes as u64 >= min)
+            && !self.mapped().mapped_capturing();
+        if dma && let Some(m) = &self.metrics {
+            m.route(CollectiveOp::AllReduce, NAME, RouteReason::CopyEngine);
+        }
+        dma
+    }
+
+    /// The copy-engine all-reduce of `buf` in place (module docs): calls of at most
+    /// [`DMA_SLOT_BYTES`], each over [`dma_chunk_bytes`] chunks.
+    fn all_reduce_dma(
+        &self,
+        buf: &mut DeviceSlice,
+        dtype: DType,
+        op: ReduceOp,
+        stream: &StreamRef,
+    ) -> Result<(), CollectiveError> {
+        self.stream_ok(stream)?;
+        self.check()?;
+        let started = Instant::now();
+        let counter = self
+            .device_seq
+            .as_ref()
+            .map(|b| b.whole().ptr())
+            .expect("the copy-engine path needs the device step counter (open)");
+        let backend = |what: &str, e: &dyn std::fmt::Display| CollectiveError::Backend {
+            code: -1,
+            message: format!("hostmem copy engine: {what}: {e}"),
+        };
+        let mut guard = self.dma.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_none() {
+            let region = {
+                let mut shared = self.group.dma.lock().unwrap_or_else(|p| p.into_inner());
+                match &*shared {
+                    Some(r) => r.clone(),
+                    None => {
+                        let bytes = (2 * self.world as u64 * DMA_SLOT_BYTES) as usize;
+                        let mc = self.mapped();
+                        let r = if self.dma_peer_read {
+                            mc.alloc_mapped(bytes)
+                        } else {
+                            mc.alloc_dma_region(bytes)
+                        }
+                        .map_err(|e| backend("allocating the slots", &e))?;
+                        *shared = Some(r.clone());
+                        r
+                    }
+                }
+            };
+            // Kernels read mapped slots at their device address; the copy engines reach
+            // the portable ones at their host address.
+            let slots = if self.dma_peer_read {
+                self.mapped()
+                    .mapped_device_addr(&region)
+                    .map_err(|e| backend("mapping the slots", &e))?
+            } else {
+                DevicePtr::from_addr(region.host_addr())
+            };
+            let scratch = DeviceBuffer::alloc(
+                &self.memory,
+                (self.world.max(2) - 1) * DMA_MAX_CHUNK as usize,
+            )
+            .map_err(|e| backend("the scratch buffer", &e))?;
+            *guard = Some(DmaState {
+                _region: region,
+                slots,
+                scratch,
+                calls: 0,
+            });
+        }
+        let state = guard.as_mut().expect("made above");
+        let layout = self.group.layout;
+        let total = buf.len() as u64;
+        let mut off = 0u64;
+        while off < total {
+            let n = DMA_SLOT_BYTES.min(total - off);
+            state.calls += 1;
+            let step = MappedStep {
+                kind: MappedKind::AllReduce,
+                reduce: reduce_of(op),
+                dtype,
+                rank: self.rank as u32,
+                world: self.world as u32,
+                send: at(buf, off),
+                recv: at(buf, off),
+                bytes: n,
+                send_stride: 0,
+                recv_stride: 0,
+                slots: state.slots,
+                slot_bytes: DMA_SLOT_BYTES,
+                flags: self.base,
+                max_blocks: MAX_BLOCKS,
+                abort_word: self.base.offset(layout.abort as u64),
+                seq: state.calls,
+                timeout: self.op_timeout,
+            };
+            let dma = MappedDma {
+                scratch: state.scratch.whole().ptr(),
+                chunk_bytes: dma_chunk_bytes(n),
+                seq_counter: counter,
+                peer_read: self.dma_peer_read,
+            };
+            if let Err(e) = self.mapped().enqueue_mapped_all_reduce_dma(&step, &dma) {
+                // The peers expect this call: fail the group rather than let them time out.
+                self.abort();
+                if let Some(m) = &self.metrics {
+                    m.error(NAME, super::CollectiveErrorKind::Backend);
+                }
+                return Err(backend(&format!("call {}", state.calls), &e));
+            }
+            off += n;
+        }
+        if let Some(m) = &self.metrics {
+            m.observe(
+                CollectiveOp::AllReduce,
+                NAME,
+                total,
+                started.elapsed().as_secs_f64(),
+            );
+        }
+        Ok(())
+    }
+
     /// The group's own channel.
     fn group_chan(&self) -> Chan<'_> {
         let layout = self.group.layout;
@@ -815,6 +1026,9 @@ impl Collective for HostmemCollective {
         stream: &StreamRef,
     ) -> Result<(), CollectiveError> {
         Self::reduction(dtype, buf.len())?;
+        if self.route_dma(buf.len()) {
+            return self.all_reduce_dma(buf, dtype, op, stream);
+        }
         if let Some(d) = self.route(CollectiveOp::AllReduce, buf.len()) {
             return d.all_reduce(buf, dtype, op, stream);
         }
@@ -1101,6 +1315,7 @@ mod tests {
     fn plain() -> Arc<dyn CollectiveLibrary> {
         Arc::new(HostmemLibrary {
             slot_bytes: SLOT_BYTES,
+            dma_min: None,
             delegate: None,
         })
     }
@@ -1228,19 +1443,38 @@ mod tests {
     /// both slot parities and the sequence numbers are exercised). Breaks if the reduction
     /// order, the chunking, the strides of all-gather / reduce-scatter or the broadcast root is
     /// wrong. Both sequencings: host sequence numbers (a v2.7 library) and the device step counter
-    /// (v2.8) — a counter that does not advance per step would reuse a slot parity and a tag.
+    /// (v2.8) — a counter that does not advance per step would reuse a slot parity and a tag —
+    /// and the copy-engine all-reduce (v2.8, every all-reduce of at least 16 bytes, among the
+    /// one-shot steps of the other ops and the barrier on the same counter; 300,001 elements
+    /// span several chunks, and 4,500,007 F32 elements several copy-engine calls).
     #[test]
     fn matches_host_backend() {
-        for (minor, slot_bytes) in [(8, SLOT_BYTES), (8, 4096), (7, 4096)] {
+        for (minor, slot_bytes, dma_min) in [
+            (8, SLOT_BYTES, None),
+            (8, 4096, None),
+            (7, 4096, None),
+            (8, SLOT_BYTES, Some(16)),
+        ] {
             let lib: Arc<dyn CollectiveLibrary> = Arc::new(HostmemLibrary {
                 slot_bytes,
+                dma_min,
                 delegate: None,
             });
+            let sizes: &[usize] = if dma_min.is_some() {
+                &[1, 7, 4099, 300_001, 4_500_007]
+            } else {
+                &[1, 7, 4099]
+            };
             for world in [1usize, 2, 3] {
                 for dtype in [DType::F32, DType::BF16] {
-                    for elems in [1usize, 7, 4099] {
-                        let ctx =
-                            format!("v2.{minor} slot {slot_bytes} world {world} {dtype:?} {elems}");
+                    for &elems in sizes {
+                        if elems > 1_000_000 && (dtype == DType::BF16 || world != 2) {
+                            continue;
+                        }
+                        let ctx = format!(
+                            "v2.{minor} slot {slot_bytes} dma {dma_min:?} world {world} \
+                             {dtype:?} {elems}"
+                        );
                         let inputs: Vec<Vec<u8>> = (0..world)
                             .map(|r| encode(dtype, &values(r as u64 * 7919 + elems as u64, elems)))
                             .collect();
@@ -1376,6 +1610,7 @@ mod tests {
         let delegate = crate::collective::HostBackend.load(None).expect("host");
         let lib: Arc<dyn CollectiveLibrary> = Arc::new(HostmemLibrary {
             slot_bytes: SLOT_BYTES,
+            dma_min: None,
             delegate: Some(delegate),
         });
         let id = lib.unique_id().expect("id");
@@ -1463,6 +1698,7 @@ mod tests {
         let delegate = crate::collective::HostBackend.load(None).expect("host");
         let lib: Arc<dyn CollectiveLibrary> = Arc::new(HostmemLibrary {
             slot_bytes: SLOT_BYTES,
+            dma_min: None,
             delegate: Some(delegate),
         });
         let id = lib.unique_id().expect("id");
@@ -1522,6 +1758,7 @@ mod tests {
         let delegate = crate::collective::HostBackend.load(None).expect("host");
         let lib: Arc<dyn CollectiveLibrary> = Arc::new(HostmemLibrary {
             slot_bytes: SLOT_BYTES,
+            dma_min: None,
             delegate: Some(delegate),
         });
         let id = lib.unique_id().expect("id");

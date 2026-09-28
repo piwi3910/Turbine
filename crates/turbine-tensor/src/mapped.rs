@@ -154,6 +154,22 @@ pub struct MappedStep {
     pub timeout: Duration,
 }
 
+/// The extra operands of a copy-engine all-reduce step (kernel ABI v2.8
+/// `turbine_mapped_all_reduce_dma`): `step.slots` is a region only these steps use and
+/// `step.seq` the caller's count of them (slot parity); the tags come from the device counter.
+#[derive(Clone, Copy, Debug)]
+pub struct MappedDma {
+    /// `(world - 1) × chunk_bytes` of this device's memory.
+    pub scratch: DevicePtr,
+    /// Bytes per pipeline chunk (a multiple of 16; at most `max_blocks` chunks per step).
+    pub chunk_bytes: u64,
+    /// The channel's device step counter (as [`MappedCollectives::enqueue_mapped_step_dseq`]).
+    pub seq_counter: DevicePtr,
+    /// The reduction reads each peer's chunk from its slot (a region of
+    /// [`MappedCollectives::alloc_mapped`]) instead of copying it in first.
+    pub peer_read: bool,
+}
+
 /// Mapped host memory and the one-shot collective steps over it, on one device (kernel ABI
 /// v2.7). Steps are enqueued on the device's compute stream in order with its other work.
 pub trait MappedCollectives: Send + Sync {
@@ -182,6 +198,37 @@ pub trait MappedCollectives: Send + Sync {
         let _ = (step, seq_counter);
         Err(MemoryError::Unsupported(
             "device-sequenced mapped collective steps (kernel ABI v2.8)".into(),
+        ))
+    }
+    /// True while the compute stream is being captured into a graph (only capturable steps may
+    /// be enqueued then: the device-sequenced ones).
+    fn mapped_capturing(&self) -> bool {
+        false
+    }
+    /// `bytes` of page-locked host memory for the copy-engine slots (kernel ABI v2.8): every
+    /// device's copy engines reach it at its host address ([`MappedRegion::host_addr`]); not
+    /// read by kernels.
+    fn alloc_dma_region(&self, bytes: usize) -> Result<MappedRegion, MemoryError> {
+        let _ = bytes;
+        Err(MemoryError::Unsupported(
+            "copy-engine slots (kernel ABI v2.8)".into(),
+        ))
+    }
+    /// Whether [`MappedCollectives::enqueue_mapped_all_reduce_dma`] is available (kernel ABI
+    /// v2.8 with the copy streams).
+    fn mapped_dma_supported(&self) -> bool {
+        false
+    }
+    /// Enqueues the all-reduce `step` with the copy engines moving its bytes (the header's
+    /// `turbine_mapped_all_reduce_dma`); bit for bit the one-shot step's result.
+    fn enqueue_mapped_all_reduce_dma(
+        &self,
+        step: &MappedStep,
+        dma: &MappedDma,
+    ) -> Result<(), MemoryError> {
+        let _ = (step, dma);
+        Err(MemoryError::Unsupported(
+            "copy-engine mapped all-reduce (kernel ABI v2.8)".into(),
         ))
     }
 }

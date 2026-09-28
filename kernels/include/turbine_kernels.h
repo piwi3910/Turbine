@@ -826,6 +826,48 @@ int32_t turbine_mapped_collective_dseq(turbine_ctx *ctx,
                                        const turbine_mapped_collective_desc *d,
                                        uint64_t *seq_counter);
 
+/* turbine_mapped_all_reduce_dma (v2.8, P5 Task 32) enqueues one ALL_REDUCE
+ * step d whose bytes the copy engines move instead of the step kernel (whose
+ * reads of mapped host memory are the bottleneck of large messages). The
+ * message is split into chunks of m->chunk_bytes (at most d->max_blocks of
+ * them); per chunk k: on m->copy (a v2.5 copy stream of ctx) a copy of
+ * send[k] into this rank's slot and then flag word rank * max_blocks + k set
+ * to the step's tag for k; on the compute stream a wait until every rank's
+ * (this rank's included) flag word k carries that tag, a copy of each peer's
+ * slot chunk into m->scratch (device memory of ctx, (world - 1) *
+ * chunk_bytes, peer q at part q < rank ? q : q - 1) and the reduction into
+ * recv[k] in rank order 0 .. world - 1, bit for bit
+ * turbine_mapped_collective's result. m->event (a v2.3 event of ctx) is
+ * recorded on the compute stream first and waited on by m->copy. The tag's
+ * sequence number is m->seq_counter's (as turbine_mapped_collective_dseq;
+ * the counter advances once per call); the slot parity is d->seq & 1, which
+ * the caller counts per call of this function (>= 1, equal on every rank):
+ * d->slots must be a region used only by these calls (2 * world slots of
+ * slot_bytes >= bytes rounded up to 16). Waits are bounded by timeout_ns and
+ * the abort word as for turbine_mapped_collective. Not while capturing. */
+typedef struct turbine_mapped_dma_desc {
+  turbine_stream *copy;
+  turbine_event *event;
+  void *scratch;
+  int64_t chunk_bytes;
+  uint64_t *seq_counter;
+  /* TURBINE_MAPPED_DMA_*: PEER_READ = the reduction reads each peer's chunk
+   * from its slot directly (d->slots must then be a region of
+   * turbine_host_alloc_mapped, so kernels may read it; scratch is unused)
+   * instead of copying it in first */
+  int32_t flags;
+} turbine_mapped_dma_desc;
+#define TURBINE_MAPPED_DMA_PEER_READ 1
+int32_t turbine_mapped_all_reduce_dma(turbine_ctx *ctx,
+                                      const turbine_mapped_collective_desc *d,
+                                      const turbine_mapped_dma_desc *m);
+/* turbine_host_alloc_dma returns bytes of page-locked host memory that the
+ * copy engines of every device of the process can read and write (portable,
+ * not mapped into kernels and not fine-grained, so copies run at the copy
+ * engines' rate): the slots of turbine_mapped_all_reduce_dma, addressed by
+ * this host pointer. Freed with turbine_host_free_mapped. */
+int32_t turbine_host_alloc_dma(turbine_ctx *ctx, size_t bytes, void **out);
+
 #ifdef __cplusplus
 }
 #endif

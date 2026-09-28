@@ -220,21 +220,38 @@ fn reference(
 #[test]
 #[ignore = "needs two HIP devices and libturbine_hip.so (scripts/lab-test.sh novanas --gpus 2)"]
 fn hostmem_matches_host_backend_on_two_gpus() {
+    matches_host_backend_on_two_gpus("hostmem_matches_host_backend_on_two_gpus", None);
+}
+
+/// P5 Task 32: [`hostmem_matches_host_backend_on_two_gpus`] with the copy-engine all-reduce
+/// (kernel ABI v2.8) for every all-reduce of at least 64 KiB — several pipelined chunks from
+/// 1 MiB up and several copy-engine calls for 20,000,001 elements (both slot parities) — among
+/// the one-shot steps of the other ops on the same device step counter: bit for bit the host
+/// backend's results on both ranks.
+#[test]
+#[ignore = "needs two HIP devices and libturbine_hip.so (scripts/lab-test.sh novanas --gpus 2)"]
+fn hostmem_dma_matches_host_backend_on_two_gpus() {
+    matches_host_backend_on_two_gpus(
+        "hostmem_dma_matches_host_backend_on_two_gpus",
+        Some(64 << 10),
+    );
+}
+
+fn matches_host_backend_on_two_gpus(name: &'static str, dma_min: Option<u64>) {
     if !require_backend("hip") {
         return;
     }
-    let _watchdog = watchdog(
-        "hostmem_matches_host_backend_on_two_gpus",
-        Duration::from_secs(900),
-    );
+    let _watchdog = watchdog(name, Duration::from_secs(900));
     let mems = devices();
     assert!(mems.len() >= 2, "two AMD devices, found {}", mems.len());
     let mems = &mems[..2];
+    collective::hostmem::set_dma_min_bytes(dma_min);
     let lib = collective::registry()
         .get("hostmem")
         .expect("registered")
         .load(None)
         .expect("load");
+    collective::hostmem::set_dma_min_bytes(None);
     for dtype in [DType::BF16, DType::F32] {
         for elems in [1usize, 7, 4099, 65_537, 1_000_003, 20_000_001] {
             let ctx = format!("{dtype:?} {elems} elements");
@@ -286,7 +303,10 @@ fn hostmem_matches_host_backend_on_two_gpus() {
                 got[0][0], got[1][0],
                 "{ctx}: both ranks hold the same all-reduce bits"
             );
-            println!("hostmem {ctx}: every op bitwise equal to the host backend on both ranks");
+            println!(
+                "{name} {ctx}: every op bitwise equal to the host backend on both ranks \
+                 (copy engine from {dma_min:?} bytes)"
+            );
         }
     }
 }

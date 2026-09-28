@@ -95,6 +95,9 @@ struct PinnedInner {
     next_ticket: u64,
     /// Events of tickets not yet seen complete.
     tickets: HashMap<u64, ShimEvent>,
+    /// The hostmem copy-engine all-reduce's own copy stream and fence event (ABI v2.8), apart
+    /// from the KV copy stream so tier copies never delay a collective.
+    collective: Option<(ShimStream, ShimEvent)>,
 }
 
 /// The Phase 4 pinned-memory state of one `ShimContext`.
@@ -116,6 +119,7 @@ impl PinnedState {
         let mut s = self.lock();
         s.tickets.clear();
         s.stream = None;
+        s.collective = None;
     }
 }
 
@@ -232,6 +236,32 @@ impl ShimContext {
 
     fn check_code(&self, code: i32) -> Result<(), KernelError> {
         ffi::check(code, self.library().syms(), self.raw_ctx())
+    }
+
+    /// The copy stream and event of the hostmem copy-engine all-reduce (ABI v2.8), created on
+    /// first use and owned by this context (destroyed with its other copy resources).
+    pub(crate) fn collective_copy_resources(
+        &self,
+    ) -> Result<(*mut TurbineStream, *mut TurbineEvent), MemoryError> {
+        let (staging, copies) = self.copy_fns()?;
+        let mut s = self.pinned_state().lock();
+        if let Some((stream, event)) = &s.collective {
+            return Ok((stream.raw, event.raw));
+        }
+        let mut raw: *mut TurbineStream = std::ptr::null_mut();
+        // SAFETY: `raw` is a live out-pointer; on success the stream belongs to this context
+        // and is owned by the `ShimStream` stored below, destroyed before the context.
+        let code = unsafe { (copies.stream_create)(self.raw_ctx(), &mut raw) };
+        self.check_code(code)?;
+        let stream = ShimStream {
+            raw,
+            ctx: self.raw_ctx(),
+            destroy: copies.stream_destroy,
+        };
+        let event = self.new_event(&staging)?;
+        let out = (stream.raw, event.raw);
+        s.collective = Some((stream, event));
+        Ok(out)
     }
 }
 

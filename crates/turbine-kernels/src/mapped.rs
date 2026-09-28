@@ -22,11 +22,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use turbine_tensor::{
-    DevicePtr, MappedCollectives, MappedHost, MappedKind, MappedReduce, MappedRegion, MappedStep,
-    MemoryError,
+    DevicePtr, MappedCollectives, MappedDma, MappedHost, MappedKind, MappedReduce, MappedRegion,
+    MappedStep, MemoryError,
 };
 
-use crate::ffi::{MappedCollectiveDesc, MappedFns};
+use crate::ffi::{MappedCollectiveDesc, MappedDmaDesc, MappedFns};
 use crate::shim::ShimContext;
 
 /// One `turbine_host_alloc_mapped` allocation, freed on Drop through its context.
@@ -237,5 +237,76 @@ impl MappedCollectives for ShimContext {
         // step completes, and every graph that captured it is destroyed (hostmem's rules).
         let code = unsafe { run(self.raw_ctx(), &desc, seq_counter.addr() as *mut u64) };
         self.mapped_check(code)
+    }
+
+    fn mapped_capturing(&self) -> bool {
+        self.is_capturing()
+    }
+
+    fn mapped_dma_supported(&self) -> bool {
+        self.library().syms().v21.mapped_dma.is_some()
+    }
+
+    fn enqueue_mapped_all_reduce_dma(
+        &self,
+        step: &MappedStep,
+        dma: &MappedDma,
+    ) -> Result<(), MemoryError> {
+        let fns = self.library().syms().v21.mapped_dma.ok_or_else(|| {
+            MemoryError::Unsupported(format!(
+                "{} does not export the kernel ABI v2.8 copy-engine all-reduce (minor {})",
+                self.library().path().display(),
+                self.library().abi_minor()
+            ))
+        })?;
+        let desc = descriptor(step)?;
+        let (copy, event) = self.collective_copy_resources()?;
+        let chunk_bytes = i64::try_from(dma.chunk_bytes).map_err(|_| {
+            MemoryError::InvalidArgument(format!("chunk_bytes {} overflows", dma.chunk_bytes))
+        })?;
+        let m = MappedDmaDesc {
+            copy,
+            event,
+            scratch: dma.scratch.addr() as *mut c_void,
+            chunk_bytes,
+            seq_counter: dma.seq_counter.addr() as *mut u64,
+            flags: i32::from(dma.peer_read),
+        };
+        // SAFETY: `desc` and `m` are live locals read during the call only. `copy` and `event`
+        // are this context's (owned by its pinned state until the context is destroyed, and
+        // destroying the stream waits for its copies); the device pointers follow
+        // `enqueue_mapped_step`'s rules, and `scratch` / `seq_counter` are this context's device
+        // memory the caller keeps alive until the step completes on the compute stream.
+        let code = unsafe { (fns.run)(self.raw_ctx(), &desc, &m) };
+        self.mapped_check(code)
+    }
+
+    fn alloc_dma_region(&self, bytes: usize) -> Result<MappedRegion, MemoryError> {
+        let (fns, mapped) = match (self.library().syms().v21.mapped_dma, self.mapped_fns()) {
+            (Some(fns), Ok(mapped)) => (fns, mapped),
+            _ => {
+                return Err(MemoryError::Unsupported(
+                    "copy-engine slots (kernel ABI v2.8)".into(),
+                ));
+            }
+        };
+        let mut host: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `host` is a live out-pointer; on success the shim stores a page-locked
+        // allocation of `bytes` bytes, owned from here by one `ShimMapped` (freed once through
+        // `turbine_host_free_mapped`, as the header says).
+        let code = unsafe { (fns.alloc)(self.raw_ctx(), bytes, &mut host) };
+        self.mapped_check(code)?;
+        if host.is_null() {
+            return Err(MemoryError::Device {
+                message: "turbine_host_alloc_dma succeeded but returned NULL".into(),
+                sticky: false,
+            });
+        }
+        Ok(MappedRegion::new(Arc::new(ShimMapped {
+            host: host.cast::<u8>(),
+            len: bytes,
+            ctx: self.owning_arc(),
+            free: mapped.free,
+        })))
     }
 }
