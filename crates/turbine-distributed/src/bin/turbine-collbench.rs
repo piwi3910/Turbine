@@ -90,6 +90,10 @@ struct Args {
     /// Rank 0 listens here and hands the 128-byte unique id to every other rank.
     #[arg(long, requires_all = ["rank", "world"])]
     leader: Option<SocketAddr>,
+    /// Enqueue the timed iterations back to back with one synchronize (mean per op) instead of
+    /// timing each op plus its own synchronize (median).
+    #[arg(long)]
+    pipelined: bool,
     #[arg(long, value_enum, default_value = "text")]
     output: Output,
 }
@@ -271,6 +275,9 @@ struct Plan {
     iters: u32,
     warmup: u32,
     dtype: DType,
+    /// `--pipelined`: time `iters` back-to-back ops and one synchronize (mean), not the median of
+    /// op + synchronize.
+    pipelined: bool,
 }
 
 /// Runs every size of every op on one rank. Every rank of the group must call this with the
@@ -288,7 +295,7 @@ fn run_rank(env: &RankEnv, plan: &Plan) -> RankResult {
             let (send_len, recv_len) = lens(op, bytes_us, world);
             let send = DeviceBuffer::alloc(&env.mem, send_len).map_err(|e| e.to_string())?;
             let recv = DeviceBuffer::alloc(&env.mem, recv_len).map_err(|e| e.to_string())?;
-            let run_once = || -> Result<(), String> {
+            let enqueue = || -> Result<(), String> {
                 let mut s = send.whole();
                 let mut d = recv.whole();
                 match op {
@@ -303,7 +310,10 @@ fn run_rank(env: &RankEnv, plan: &Plan) -> RankResult {
                     }
                     _ => env.comm.broadcast(&mut s, 0, &stream),
                 }
-                .map_err(|e| format!("{} {bytes} B: {e}", op.as_str()))?;
+                .map_err(|e| format!("{} {bytes} B: {e}", op.as_str()))
+            };
+            let run_once = || -> Result<(), String> {
+                enqueue()?;
                 env.mem.synchronize().map_err(|e| e.to_string())
             };
 
@@ -322,14 +332,26 @@ fn run_rank(env: &RankEnv, plan: &Plan) -> RankResult {
             for _ in 0..plan.warmup {
                 run_once()?;
             }
-            let mut times = Vec::with_capacity(plan.iters as usize);
-            for _ in 0..plan.iters.max(1) {
+            let seconds = if plan.pipelined {
+                // Every iteration enqueued back to back, one synchronize: the per-op device time
+                // without the host round trip of a synchronize per op.
                 let started = Instant::now();
-                run_once()?;
-                times.push(started.elapsed().as_secs_f64());
-            }
-            times.sort_by(f64::total_cmp);
-            rows.push(row(op, world, bytes, times[times.len() / 2], correct));
+                for _ in 0..plan.iters.max(1) {
+                    enqueue()?;
+                }
+                env.mem.synchronize().map_err(|e| e.to_string())?;
+                started.elapsed().as_secs_f64() / f64::from(plan.iters.max(1))
+            } else {
+                let mut times = Vec::with_capacity(plan.iters as usize);
+                for _ in 0..plan.iters.max(1) {
+                    let started = Instant::now();
+                    run_once()?;
+                    times.push(started.elapsed().as_secs_f64());
+                }
+                times.sort_by(f64::total_cmp);
+                times[times.len() / 2]
+            };
+            rows.push(row(op, world, bytes, seconds, correct));
         }
         out.push((op, rows));
     }
@@ -453,6 +475,7 @@ fn main() -> ExitCode {
         iters: args.iters,
         warmup: args.warmup,
         dtype,
+        pipelined: args.pipelined,
     };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let metrics = CollectiveMetrics::register(&MetricsRegistry::new());
@@ -660,6 +683,7 @@ mod tests {
             iters: 2,
             warmup: 1,
             dtype: DType::BF16,
+            pipelined: false,
         };
         let results: Vec<_> = std::thread::scope(|scope| {
             let handles: Vec<_> = group

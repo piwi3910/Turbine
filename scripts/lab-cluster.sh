@@ -32,7 +32,7 @@
 # <reason>` (exit 1); usage errors exit 2.
 set -euo pipefail
 
-SCENARIOS="collbench-novanas|tp2-novanas|dp2-novanas"
+SCENARIOS="collbench-novanas|collbench-sweep-novanas|tp2-novanas|dp2-novanas"
 
 usage() {
 	echo "usage: scripts/lab-cluster.sh [--dry-run] <${SCENARIOS}>" >&2
@@ -41,7 +41,7 @@ usage() {
 }
 
 valid_scenario() {
-	[[ "$1" =~ ^(collbench-novanas|tp2-novanas|dp2-novanas)$ ]]
+	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|tp2-novanas|dp2-novanas)$ ]]
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -134,6 +134,51 @@ scenario_collbench() {
 		job_fail "a row is incorrect or all-reduce busbw is 0 at 268435456 B"
 }
 
+# collbench-sweep-novanas: small-message all-reduce latency under RCCL settings (diagnostics; always
+# PASS unless a run fails). For each setting, BF16 all-reduce 8 B .. 16 MiB twice: op + synchronize
+# per iteration (median) and back to back with one synchronize (mean per op). Every row is printed
+# as `sweep <setting> <per-op|pipelined> <bytes> <time_us>`; the default setting also runs once with
+# NCCL_DEBUG=INFO so the log shows the transport, algorithm and protocol RCCL picks.
+scenario_collbench_sweep() {
+	local settings=(
+		"default"
+		"NCCL_PROTO=LL"
+		"NCCL_PROTO=LL128"
+		"NCCL_PROTO=Simple"
+		"NCCL_ALGO=Tree"
+		"NCCL_ALGO=Ring"
+		"RCCL_MSCCL_ENABLE=0"
+		"RCCL_MSCCLPP_ENABLE=0"
+		"NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1"
+		"NCCL_SHM_USE_CUDA_MEMCPY=1"
+		"HSA_ENABLE_SDMA=0"
+	)
+	echo "lab-step: NCCL_DEBUG=INFO turbine-collbench --op all_reduce --max-bytes 8"
+	NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,GRAPH,TUNING,ENV "${BIN}/turbine-collbench" \
+		--backend rccl --devices 0,1 --op all_reduce --max-bytes 8 --iters 5 --warmup 1 \
+		--output json >/dev/null || job_fail "NCCL_DEBUG run failed"
+	local s mode out
+	for s in "${settings[@]}"; do
+		for mode in per-op pipelined; do
+			out="${WORK}/sweep.json"
+			local flags=(--backend rccl --devices 0,1 --op all_reduce --max-bytes 16MiB --iters 50
+				--warmup 10 --output json)
+			[[ $mode == pipelined ]] && flags+=(--pipelined)
+			echo "lab-step: [$s] turbine-collbench ${flags[*]}"
+			if [[ $s == default ]]; then
+				"${BIN}/turbine-collbench" "${flags[@]}" >"$out" || job_fail "sweep [$s] $mode failed"
+			else
+				env $s "${BIN}/turbine-collbench" "${flags[@]}" >"$out" ||
+					job_fail "sweep [$s] $mode failed"
+			fi
+			jq -e '[.ops[].rows[].correct] | all' "$out" >/dev/null ||
+				job_fail "sweep [$s] $mode: a row is incorrect"
+			jq -r --arg s "$s" --arg m "$mode" \
+				'.ops[].rows[] | "sweep \($s | gsub(" "; "+")) \($m) \(.bytes) \(.time_us)"' "$out"
+		done
+	done
+}
+
 scenario_tp2() {
 	local llama=scripts/lab/phase5-novanas-llama.yaml olmoe=scripts/lab/phase5-novanas-olmoe.yaml
 	start_server "${WORK}/tp2-local.log" "$llama"
@@ -195,6 +240,7 @@ in_job() {
 	trap 'stop_servers' EXIT
 	case "$SCENARIO" in
 	collbench-novanas) scenario_collbench ;;
+	collbench-sweep-novanas) scenario_collbench_sweep ;;
 	tp2-novanas) scenario_tp2 ;;
 	dp2-novanas) scenario_dp2 ;;
 	esac
