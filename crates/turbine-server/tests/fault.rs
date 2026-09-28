@@ -51,13 +51,15 @@ fn write_config(dir: &TempDir, addr: SocketAddr, reliability: &str) -> std::path
     path
 }
 
-fn spawn(config: &Path) -> Child {
+/// The server on `config`, with `env` added to its environment.
+fn spawn_with_env(config: &Path, env: &[(&str, String)]) -> Child {
     Command::new(env!("CARGO_BIN_EXE_turbine-server"))
         .arg("--config")
         .arg(config)
         .env_remove("TURBINE_AMD_SMI_LIBRARY")
         .env_remove("TURBINE_KERNEL_LIBRARY")
         .env("RUST_LOG", "info")
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -92,7 +94,19 @@ impl Server {
         dir: Option<TempDir>,
         ready_limit: Duration,
     ) -> Server {
-        let mut child = spawn(config);
+        Server::launch_with_env(config, addr, model, dir, ready_limit, &[])
+    }
+
+    /// [`Server::launch`] with more environment variables for the server.
+    fn launch_with_env(
+        config: &Path,
+        addr: SocketAddr,
+        model: &str,
+        dir: Option<TempDir>,
+        ready_limit: Duration,
+        env: &[(&str, String)],
+    ) -> Server {
+        let mut child = spawn_with_env(config, env);
         let stderr = Arc::new(Mutex::new(String::new()));
         let mut pipe = BufReader::new(child.stderr.take().expect("stderr is piped"));
         let sink = Arc::clone(&stderr);
@@ -544,4 +558,92 @@ fn sticky_device_error_exits_3() {
     let body = json!({"model": "lab-llama", "prompt": "Once upon a time", "max_tokens": 64,
                       "ignore_eos": true, "stream": true});
     assert_sticky_exit(server, body, Duration::from_secs(120));
+}
+
+/// P5 Task 28 (lab, `scripts/lab-test.sh novanas --gpus 2 --features fault-injection`): the real
+/// Llama-3.2-3B at tp 2 in `local` rank mode on both GPUs of the backend under test (the `auto`
+/// collective backend) with one worker rank's communicator aborted during a request
+/// (`TURBINE_FAULT_TP_ABORT_FILE`, fault-injection build): the stream ends with `replica_failed`,
+/// `/ready` answers 503 `circuit_open` (no exit 3), and the circuit's probe re-creates the
+/// communicator on both GPUs — `/ready` is 200 again and a greedy completion is identical to the
+/// one before the failure. The whole test is bounded by 10 minutes.
+#[cfg(feature = "fault-injection")]
+#[test]
+#[ignore = "lab: needs two GPUs, their kernel library and the Llama-3.2-3B weights"]
+fn tp2_collective_failure_recovers_on_gpu() {
+    use turbine_kernels::test_support::{require_backend, require_env_dir};
+    let started = Instant::now();
+    let limit = Duration::from_secs(600);
+    let backend = std::env::var("TURBINE_TEST_BACKEND")
+        .expect("TURBINE_TEST_BACKEND is not set; set it to the backend under test (hip or cuda)");
+    if !require_backend(&backend) {
+        return;
+    }
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let dir = TempDir::new("turbine-fault-tp2-lab");
+    let trigger = dir.path().join("abort-one-rank");
+    let addr = free_addr();
+    let config = dir.path().join("config.yaml");
+    let library = std::env::var("TURBINE_KERNEL_LIBRARY")
+        .map(|l| format!("  kernel_library: {l}\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        &config,
+        format!(
+            "model:\n  path: {}\n  served_name: lab-llama\nserver:\n  listen: {addr}\n\
+             execution:\n  backend: {backend}\n{library}parallel:\n  tensor_parallel_size: 2\n\
+             reliability:\n  circuit:\n    cooldown: 2s\n    latency_drift_degraded: 1000.0\n    \
+             latency_drift_open: 2000.0\n",
+            model_dir.display()
+        ),
+    )
+    .unwrap();
+    let env = [("TURBINE_FAULT_TP_ABORT_FILE", trigger.display().to_string())];
+    // Weights load and warm-up of a debug build on two GPUs.
+    let server = Server::launch_with_env(
+        &config,
+        addr,
+        "lab-llama",
+        Some(dir),
+        Duration::from_secs(420),
+        &env,
+    );
+    let greedy = |server: &Server| {
+        let resp = server.complete(16, false);
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        resp.json()["choices"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let before = greedy(&server);
+
+    std::fs::write(&trigger, b"abort").unwrap();
+    let resp = server.complete(64, true);
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let data = resp.sse_data();
+    assert_eq!(data.last().map(String::as_str), Some("[DONE]"), "{data:?}");
+    let err: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
+    assert_eq!(err["error"]["code"], "replica_failed", "{err}");
+    assert!(!trigger.exists(), "the abort was injected");
+    let ready = server.get("/ready");
+    assert_eq!(ready.status, 503, "{}", ready.body);
+    assert_eq!(ready.json()["reason"], "circuit_open", "{}", ready.body);
+
+    let left = limit.saturating_sub(started.elapsed());
+    wait_for(left, "/ready 200 after the re-creation", || {
+        server.get("/ready").status == 200
+    });
+    assert_eq!(
+        greedy(&server),
+        before,
+        "the re-created group gives the same tokens"
+    );
+    let metrics = server.metrics();
+    let recovered = sample(
+        &metrics,
+        r#"turbine_circuit_transitions_total{from="PROBING",to="HEALTHY",reason="probes_succeeded"}"#,
+    );
+    assert_eq!(recovered, Some(1.0), "{metrics}");
+    assert!(started.elapsed() < limit, "{:?}", started.elapsed());
 }

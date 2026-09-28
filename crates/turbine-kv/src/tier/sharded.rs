@@ -23,18 +23,51 @@ pub type ShardSlots = SmallVec<[(u64, usize); 8]>;
 
 pub struct ShardedL1Tier {
     shards: Vec<Arc<L1PinnedTier>>,
-    /// Bytes of one rank shard of a block (each shard tier's block size).
-    shard_bytes: usize,
+    /// Bytes of each shard of a block (each shard tier's block size), in rank order.
+    shard_bytes: Vec<usize>,
 }
 
 impl ShardedL1Tier {
     /// `shards` in rank order, each storing `shard_bytes`-byte blocks. Panics without a shard.
     pub fn new(shards: Vec<Arc<L1PinnedTier>>, shard_bytes: u64) -> Self {
+        let sizes = vec![shard_bytes; shards.len()];
+        ShardedL1Tier::with_sizes(shards, sizes)
+    }
+
+    /// `shards` in order, shard `i` storing `sizes[i]`-byte blocks: a pipeline's stages hold
+    /// different layer counts (Phase 5 S-10), so their shards of a block differ in size. Panics
+    /// without a shard or with a size per shard missing.
+    pub fn with_sizes(shards: Vec<Arc<L1PinnedTier>>, sizes: Vec<u64>) -> Self {
         assert!(!shards.is_empty(), "a sharded L1 needs at least one shard");
+        assert_eq!(shards.len(), sizes.len(), "one block size per shard");
         ShardedL1Tier {
             shards,
-            shard_bytes: shard_bytes as usize,
+            shard_bytes: sizes.into_iter().map(|b| b as usize).collect(),
         }
+    }
+
+    /// `bytes` cut into the shards' parts, in shard order.
+    fn parts<'a>(&self, mut bytes: &'a [u8]) -> Vec<&'a [u8]> {
+        self.shard_bytes
+            .iter()
+            .map(|&n| {
+                let (part, rest) = bytes.split_at(n);
+                bytes = rest;
+                part
+            })
+            .collect()
+    }
+
+    /// [`Self::parts`] of a mutable block.
+    fn parts_mut<'a>(&self, mut bytes: &'a mut [u8]) -> Vec<&'a mut [u8]> {
+        self.shard_bytes
+            .iter()
+            .map(|&n| {
+                let (part, rest) = std::mem::take(&mut bytes).split_at_mut(n);
+                bytes = rest;
+                part
+            })
+            .collect()
     }
 
     /// The rank tiers, in rank order.
@@ -114,7 +147,7 @@ impl ShardedL1Tier {
     }
 
     fn check_len(&self, len: usize) -> Result<(), TierError> {
-        let want = self.shard_bytes * self.shards.len();
+        let want: usize = self.shard_bytes.iter().sum();
         if len == want {
             Ok(())
         } else {
@@ -176,12 +209,7 @@ impl KvTier for ShardedL1Tier {
         let TierBlockRef::Host(bytes) = src;
         self.check_len(bytes.len())?;
         let mut first = None;
-        for (i, (s, part)) in self
-            .shards
-            .iter()
-            .zip(bytes.chunks_exact(self.shard_bytes))
-            .enumerate()
-        {
+        for (i, (s, part)) in self.shards.iter().zip(self.parts(bytes)).enumerate() {
             match s.put(key, TierBlockRef::Host(part)) {
                 Ok(slot) => {
                     first.get_or_insert(slot);
@@ -206,11 +234,7 @@ impl KvTier for ShardedL1Tier {
             return Err(TierError::Missing);
         }
         self.check_len(out.len())?;
-        for (s, part) in self
-            .shards
-            .iter()
-            .zip(out.chunks_exact_mut(self.shard_bytes))
-        {
+        for (s, part) in self.shards.iter().zip(self.parts_mut(out)) {
             s.get(key, TierBlockMut::Host(part))?;
         }
         Ok(())

@@ -47,6 +47,45 @@ pub struct PipelineCosts {
 }
 
 impl PipelineCosts {
+    /// The costs of a model as its configuration describes it (P5 S-10): per decoder layer the
+    /// attention projections (Q, K, V, O) plus the MLP — three `hidden × intermediate`
+    /// projections, or on a mixture-of-experts model the router and every expert's three for
+    /// the weight bytes but only the `experts_per_token` active experts' for the FLOPs — and on
+    /// the last stage the final norm and the LM head (`vocab × hidden`). The embedding lookup
+    /// reads one row per token: no cost on the first stage. Bytes count two per parameter
+    /// (BF16); a constant factor cancels in the normalisation.
+    pub fn from_shape(m: &turbine_core::types::ModelShape) -> PipelineCosts {
+        let h = u64::from(m.hidden);
+        let q = u64::from(m.num_attention_heads) * u64::from(m.head_dim);
+        let kv = u64::from(m.num_kv_heads) * u64::from(m.head_dim);
+        let i = u64::from(m.intermediate);
+        let attention = 2 * h * q + 2 * h * kv;
+        let (resident, active) = if m.num_experts > 0 {
+            let e = u64::from(m.num_experts);
+            let top = u64::from(m.experts_per_token.max(1));
+            let expert = 3 * h * i;
+            (
+                attention + h * e + e * expert,
+                attention + h * e + top * expert,
+            )
+        } else {
+            (attention + 3 * h * i, attention + 3 * h * i)
+        };
+        let layer = LayerCost {
+            weight_bytes: 2 * resident,
+            flops_per_token: 2 * active,
+        };
+        let head = u64::from(m.vocab) * h;
+        PipelineCosts {
+            layers: vec![layer; m.num_layers as usize],
+            first: LayerCost::default(),
+            last: LayerCost {
+                weight_bytes: 2 * head,
+                flops_per_token: 2 * head,
+            },
+        }
+    }
+
     /// Normalised costs: per layer, then the first- and last-stage extras.
     fn normalised(&self) -> (Vec<f64>, f64, f64) {
         let all = self.layers.iter().chain([&self.first, &self.last]).copied();
@@ -291,6 +330,8 @@ pub fn place_stages(
 
 #[cfg(test)]
 mod tests {
+    use turbine_core::types::ModelShape;
+
     use super::*;
 
     /// Llama-3.2-3B-Instruct: 28 layers, hidden 3072, intermediate 8192, 24 heads / 8 KV heads of
@@ -425,5 +466,48 @@ mod tests {
         assert_eq!(reason, StageReason::NominalLinks);
 
         assert!(place_stages(&ranges, &devices[..1], &fast0).is_err());
+    }
+
+    fn shape(name: &str, layers: u32, experts: (u32, u32), tied: bool) -> ModelShape {
+        let llama = name == "llama";
+        ModelShape {
+            architecture: name.into(),
+            num_layers: layers,
+            hidden: if llama { 3072 } else { 2048 },
+            num_attention_heads: if llama { 24 } else { 16 },
+            num_kv_heads: if llama { 8 } else { 16 },
+            head_dim: 128,
+            intermediate: if llama { 8192 } else { 1024 },
+            vocab: if llama { 128_256 } else { 50_304 },
+            num_experts: experts.0,
+            experts_per_token: experts.1,
+            tied_embeddings: tied,
+            weight_bytes: 0,
+            max_position_embeddings: 4096,
+        }
+    }
+
+    /// The costs read from a model shape are the hand-written ones of Llama-3.2-3B and
+    /// OLMoE-1B-7B above (a MoE layer's bytes count every expert, its FLOPs the active ones),
+    /// and the balanced split of Llama over 2 stages gives the head's stage fewer layers.
+    /// Breaks if MoE layers are costed by every expert's FLOPs or the head is dropped.
+    #[test]
+    fn costs_from_the_model_shape() {
+        assert_eq!(
+            PipelineCosts::from_shape(&shape("llama", 28, (0, 0), true)),
+            llama()
+        );
+        assert_eq!(
+            PipelineCosts::from_shape(&shape("olmoe", 16, (64, 8), false)),
+            olmoe()
+        );
+        let ranges = partition(
+            &PipelineCosts::from_shape(&shape("llama", 28, (0, 0), true)),
+            2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ranges[0].end, ranges[1].start);
+        assert!(ranges[1].len() < ranges[0].len(), "{ranges:?}");
     }
 }

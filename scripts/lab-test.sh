@@ -56,6 +56,11 @@ TWO_GPU_TESTS=(
 	# crates/turbine-distributed/tests/hostmem_lab.rs
 	hostmem_
 	rccl_init_with_a_missing_peer
+	# crates/turbine-server/tests/kv_gpu.rs: prefix_reuse_matches_cold_tp2,
+	# prefix_reuse_suffix_lengths_match_cold_tp2 (P5 Task 29)
+	cold_tp2
+	# crates/turbine-server/tests/fault.rs (--features fault-injection)
+	tp2_collective_failure_recovers_on_gpu
 )
 
 # Lab tests whose expectation follows the Job's R9700 count (TURBINE_EXPECT_AMD = --gpus): they

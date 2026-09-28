@@ -3,7 +3,7 @@
 #
 #   scripts/lab-cluster.sh [--dry-run] [--bench-lock] <collbench-novanas|collbench-sweep-novanas|
 #                                       collbench-hostmem-novanas|tp2-novanas|dp2-novanas|
-#                                       ep2-novanas>
+#                                       ep2-novanas|pp2-novanas>
 #   scripts/lab-cluster.sh [--dry-run] --stop <run-id>
 #
 # Scenarios (P5 S-9; everything runs inside the Job on loopback — no Service, no host port):
@@ -24,12 +24,19 @@
 #                      concurrency 16, 200 requests, after a 16-request warm-up); then tp 2 in
 #                      local mode (golden at concurrency 1 — strict bounds — and 16 — batched
 #                      bounds, the TP accuracy bound; turbine-bench --concurrency 4 --requests 64
-#                      must report requests_ok 64; the standard workload), then OLMoE-1B-7B at
-#                      tp 2 in local mode (golden c1 and c16), then Llama in static mode (ranks
+#                      must report requests_ok 64; the standard workload; the standard workload
+#                      again with parallel.collective_backend=rccl), then OLMoE-1B-7B at
+#                      tp 2 in local mode (golden c1 and c16; Task 29: an OLMoE tp 1 capture on
+#                      device 0 first, the tp 2 run also compared with it — informational — and
+#                      p10 position by position), then Llama in static mode (ranks
 #                      0 and 1, leader 127.0.0.1:18100; golden c1 and c16). Prints one
 #                      `tp-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run.
-#                      2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
-#   dp2-novanas        Llama-3.2-3B-Instruct at tp 1 on the standard throughput workload
+#                      2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)". Every tp 2
+#                      golden is gated against a one-GPU capture of the same model taken in
+#                      the run (strict c1, batched c16; the one-GPU leg itself against the
+#                      committed reference), the committed reference printed for information;
+#                      a violation fails the scenario at its end, after every leg ran.
+#   dp2-novanas       Llama-3.2-3B-Instruct at tp 1 on the standard throughput workload
 #                      (512-word prompts, 256 tokens with --ignore-eos, 200 requests, after a
 #                      16-request warm-up): first a dp 1 baseline on device 0 at concurrency 16,
 #                      then dp 2 (one replica per R9700): golden at concurrency 1 and 16, the
@@ -53,6 +60,20 @@
 #                      `ep-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run and
 #                      the scheduler document's `expert` section. 2-GPU numbers are
 #                      "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
+#   pp2-novanas        Llama-3.2-3B-Instruct (scripts/lab/phase5-novanas-pp2.yaml): first a pp 1
+#                      baseline on device 0 (a capture of its greedy outputs, golden c1 against
+#                      the committed reference for information, the standard workload at
+#                      concurrency 16); then pp 2 (2 stages, 2 micro-batches, local mode):
+#                      golden at concurrency 1 (strict) and 16 (batched) against the pp 1
+#                      capture — the gate — and against the committed reference for information,
+#                      the standard workload (512-word prompts, 256 tokens with --ignore-eos,
+#                      200 requests, after a 32-request warm-up) at concurrency 16 and 32; then
+#                      tp 2 (phase5-novanas-llama.yaml) and dp 2 (phase5-novanas-dp2.yaml) on the
+#                      same workload at 16 and 32. Prints each server's parallel plan (backend,
+#                      stages, reasons), the pipeline section and metrics, and one `pp-bench <run>
+#                      tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run. A golden
+#                      violation fails the scenario at its end. 2-GPU numbers are "2-GPU (GPU0
+#                      Gen5 x8 + GPU1 Gen4 x8)".
 #
 # Like scripts/lab-test.sh, the tree is uploaded to /home/piwi/turbine-ci/runs/<run id>/src and
 # one template (scripts/lab/novanas-cluster-job.yaml) runs twice: first GPU-less as
@@ -73,7 +94,7 @@
 # <reason>` (exit 1); usage errors exit 2.
 set -euo pipefail
 
-SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas"
+SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas"
 
 usage() {
 	echo "usage: scripts/lab-cluster.sh [--dry-run] [--bench-lock] <${SCENARIOS}>" >&2
@@ -82,7 +103,7 @@ usage() {
 }
 
 valid_scenario() {
-	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas)$ ]]
+	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas)$ ]]
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -100,6 +121,13 @@ STANDARD_BENCH=(--prompt-words 512 --max-tokens 256 --ignore-eos)
 job_fail() {
 	echo "lab-cluster: ${SCENARIO} FAIL $1"
 	stop_servers
+	# The server logs live in the Job's scratch directory: show their ends before it goes.
+	local f
+	for f in "${WORK:-/nonexistent}"/*.log; do
+		[[ -f $f ]] || continue
+		echo "lab-info: last lines of ${f##*/}"
+		tail -n 40 "$f" | sed "s/^/  ${f##*/}: /"
+	done
 	exit 1
 }
 
@@ -283,6 +311,10 @@ scenario_tp2() {
 		--set "parallel.devices=[0]"
 	wait_ready "$URL" "${WORK}/tp1.log"
 	tp_prefix_check tp1
+	# The one-GPU capture every Llama tp 2 run is gated against (spec amendment 2026-09-28: a
+	# multi-GPU run is judged against a one-GPU capture of the same commit and lab run; the
+	# committed transformers reference is information only).
+	capture_one_gpu llama-3.2-3b-instruct "${WORK}/llama-tp1-capture.jsonl"
 	bench_ok 16 "${WORK}/tp1-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
 	bench_ok 200 "${WORK}/tp1-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
 		--requests 200
@@ -291,8 +323,7 @@ scenario_tp2() {
 	start_server "${WORK}/tp2-local.log" "$llama"
 	wait_ready "$URL" "${WORK}/tp2-local.log"
 	tp_prefix_check tp2-local
-	golden llama-3.2-3b-instruct "llama tp2 local c1"
-	golden llama-3.2-3b-instruct "llama tp2 local c16" --concurrency 16
+	gate_vs_capture llama-3.2-3b-instruct "${WORK}/llama-tp1-capture.jsonl" "llama tp2 local"
 	bench_ok 64 "${WORK}/tp2-bench.json" --concurrency 4 --requests 64
 	bench_ok 16 "${WORK}/tp2-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
 	bench_ok 200 "${WORK}/tp2-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
@@ -305,10 +336,37 @@ scenario_tp2() {
 	collective_report tp2-local
 	stop_servers
 
+	# The same tp 2 run over RCCL alone (the default `auto` picks hostmem in local mode), so the
+	# collective's share of a throughput change is visible (plan Task 29).
+	start_server "${WORK}/tp2-rccl.log" "$llama" --set parallel.collective_backend=rccl
+	wait_ready "$URL" "${WORK}/tp2-rccl.log"
+	bench_ok 16 "${WORK}/tp2-rccl-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 16
+	bench_ok 200 "${WORK}/tp2-rccl-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	jq -r '"tp-bench tp2-rccl-c16 tok/s=\(.output_token_throughput) ttft_p50_ms=\(.ttft_ms.p50) itl_p50_ms=\(.itl_ms.p50) requests_ok=\(.requests_ok)"' \
+		"${WORK}/tp2-rccl-c16-bench.json"
+	stop_servers
+
+	# OLMoE: a one-GPU capture first (tp 1 on device 0), the reference the tp 2 run is also
+	# compared with, position by position on p10 (plan Task 29: OLMoE tp 2 p10).
+	local slug=olmoe-1b-7b-0125-instruct
+	start_server "${WORK}/tp1-olmoe.log" "$olmoe" --set parallel.tensor_parallel_size=1 \
+		--set "parallel.devices=[0]"
+	wait_ready "$URL" "${WORK}/tp1-olmoe.log"
+	capture_one_gpu "$slug" "${WORK}/olmoe-tp1-capture.jsonl"
+	positions_p "$slug" olmoe-tp1 p10
+	stop_servers
+
 	start_server "${WORK}/tp2-olmoe.log" "$olmoe"
 	wait_ready "$URL" "${WORK}/tp2-olmoe.log"
-	golden olmoe-1b-7b-0125-instruct "olmoe tp2 local c1"
-	golden olmoe-1b-7b-0125-instruct "olmoe tp2 local c16" --concurrency 16
+	gate_vs_capture "$slug" "${WORK}/olmoe-tp1-capture.jsonl" "olmoe tp2 local"
+	positions_p "$slug" olmoe-tp2 p10
+	echo "lab-step: turbine-golden positions olmoe-tp2-vs-1gpu p10"
+	"${BIN}/turbine-golden" positions --url "$URL" --reference "${WORK}/olmoe-tp1-capture.jsonl" \
+		--tolerance "tests/golden/${slug}/tolerance.json" --prompt-id p10 |
+		sed "s/^/positions olmoe-tp2-vs-1gpu /" ||
+		echo "lab-info: positions olmoe-tp2-vs-1gpu failed"
 	collective_report tp2-olmoe
 	stop_servers
 
@@ -322,10 +380,37 @@ scenario_tp2() {
 		--set parallel.ranks.rank=0 --set "parallel.ranks.local_devices=[0]"
 	wait_ready "$URL" "${WORK}/tp2-static-rank0.log"
 	tp_prefix_check tp2-static
-	golden llama-3.2-3b-instruct "llama tp2 static c1"
-	golden llama-3.2-3b-instruct "llama tp2 static c16" --concurrency 16
+	gate_vs_capture llama-3.2-3b-instruct "${WORK}/llama-tp1-capture.jsonl" "llama tp2 static"
 	collective_report tp2-static
 	stop_servers
+	if [[ ${#GATE_FAILED[@]} -gt 0 ]]; then
+		job_fail "outside tolerance: ${GATE_FAILED[*]}"
+	fi
+}
+
+# capture_one_gpu <slug> <out>: the one-GPU server's golden c1 against the committed reference
+# (the one-GPU gate) and a capture of its greedy outputs, the reference of the multi-GPU runs.
+capture_one_gpu() {
+	local slug="$1" out="$2"
+	golden_gate "$slug" "${slug} 1 GPU c1"
+	echo "lab-step: turbine-golden capture (${slug} 1 GPU)"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
+		--out "$out" || job_fail "turbine-golden capture failed"
+}
+
+# gate_vs_capture <slug> <capture> <label>: the multi-GPU gate — strict at c1, batched at c16,
+# against the one-GPU capture (a violation is recorded in GATE_FAILED; the scenario goes on and
+# fails at its end); the committed transformers reference at c1 and c16 for information.
+gate_vs_capture() {
+	local slug="$1" capture="$2" label="$3" c
+	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
+	for c in 1 16; do
+		echo "lab-step: golden ${label} c${c} vs 1 GPU"
+		"${BIN}/turbine-golden" compare --url "$URL" --reference "$capture" "${tol[@]}" \
+			--concurrency "$c" || GATE_FAILED+=("golden ${label} c${c} vs 1 GPU")
+		golden_info "${label} c${c} vs HF" --reference "tests/golden/${slug}/reference.jsonl" \
+			--concurrency "$c"
+	done
 }
 
 scenario_dp2() {
@@ -490,6 +575,90 @@ scenario_ep2() {
 	fi
 }
 
+# pp_parallel <label>: the running server's parallel plan (backend, pp, stages, reasons) and
+# pipeline section (stage busy ratios, micro-batches) plus the pipeline metrics.
+pp_parallel() {
+	local label="$1"
+	echo "pp-parallel ${label} $(curl -s "${URL}/turbine/v1/status" | jq -c '.parallel | {tp, dp, pp, backend, plan_reasons, stages: .groups[0].stages}')"
+	echo "pp-pipeline ${label} $(curl -s "${URL}/turbine/v1/scheduler" | jq -c '.["0"].pipeline')"
+	curl -s "${URL}/metrics" | grep -E '^turbine_pipeline_(bubble_ratio|stage_duration_seconds_(sum|count))' |
+		sed "s/^/pp-metrics ${label} /" || true
+}
+
+scenario_pp2() {
+	local pp2=scripts/lab/phase5-novanas-pp2.yaml slug=llama-3.2-3b-instruct f
+	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
+	# The pp 1 baseline: the same configuration on device 0 alone. A capture of its greedy
+	# outputs is the reference pp 2 is gated against (user decision 2026-09-28, "A then C":
+	# multi-GPU runs against a one-GPU capture of the same model and commit, same run).
+	start_server "${WORK}/pp1.log" "$pp2" --set parallel.pipeline_parallel_size=1 \
+		--set "parallel.devices=[0]"
+	wait_ready "$URL" "${WORK}/pp1.log"
+	golden_info "llama pp1 c1" --reference "tests/golden/${slug}/reference.jsonl"
+	echo "lab-step: turbine-golden capture (pp1)"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
+		--out "${WORK}/pp1-capture.jsonl" || job_fail "turbine-golden capture failed"
+	bench_ok 16 "${WORK}/pp1-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
+	bench_ok 200 "${WORK}/pp1-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	stop_servers
+
+	start_server "${WORK}/pp2.log" "$pp2"
+	wait_ready "$URL" "${WORK}/pp2.log"
+	grep -E 'topology_link|pipeline_stages|pp_pool_agreed|pp_pipeline_ready|decode_graphs_unavailable' \
+		"${WORK}/pp2.log" | tail -n 12 || true
+	pp_parallel pp2-start
+	echo "lab-step: golden llama pp2 c1 vs pp1 (the gate)"
+	"${BIN}/turbine-golden" compare --url "$URL" --reference "${WORK}/pp1-capture.jsonl" \
+		"${tol[@]}" || GATE_FAILED+=("golden llama pp2 c1 vs pp1")
+	echo "lab-step: golden llama pp2 c16 vs pp1 (the gate)"
+	"${BIN}/turbine-golden" compare --url "$URL" --reference "${WORK}/pp1-capture.jsonl" \
+		"${tol[@]}" --concurrency 16 || GATE_FAILED+=("golden llama pp2 c16 vs pp1")
+	if [[ ${#GATE_FAILED[@]} -gt 0 ]]; then
+		sed 's/\x1b\[[0-9;]*m//g' "${WORK}/pp2.log" | grep -iE 'error|fail|abort' | head -n 30 || true
+		job_fail "outside tolerance: ${GATE_FAILED[*]}"
+	fi
+	golden_info "llama pp2 c1" --reference "tests/golden/${slug}/reference.jsonl"
+	golden_info "llama pp2 c16" --reference "tests/golden/${slug}/reference.jsonl" \
+		--concurrency 16
+	bench_ok 32 "${WORK}/pp2-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 32 --requests 32
+	bench_ok 200 "${WORK}/pp2-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	bench_ok 200 "${WORK}/pp2-c32-bench.json" "${STANDARD_BENCH[@]}" --concurrency 32 \
+		--requests 200
+	pp_parallel pp2-after-bench
+	stop_servers
+
+	# tp 2 and dp 2 on the same workload, in the same Job.
+	start_server "${WORK}/tp2.log" scripts/lab/phase5-novanas-llama.yaml
+	wait_ready "$URL" "${WORK}/tp2.log"
+	bench_ok 32 "${WORK}/tp2-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 32 --requests 32
+	bench_ok 200 "${WORK}/tp2-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	bench_ok 200 "${WORK}/tp2-c32-bench.json" "${STANDARD_BENCH[@]}" --concurrency 32 \
+		--requests 200
+	collective_report tp2
+	stop_servers
+
+	start_server "${WORK}/dp2.log" scripts/lab/phase5-novanas-dp2.yaml
+	wait_ready "$URL" "${WORK}/dp2.log"
+	bench_ok 32 "${WORK}/dp2-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 32 --requests 32
+	bench_ok 200 "${WORK}/dp2-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
+		--requests 200
+	bench_ok 200 "${WORK}/dp2-c32-bench.json" "${STANDARD_BENCH[@]}" --concurrency 32 \
+		--requests 200
+	echo "pp-parallel dp2 $(curl -s "${URL}/turbine/v1/status" | jq -c '.parallel | {tp, dp, backend, plan_reasons}')"
+	stop_servers
+
+	for f in pp1-c16 pp2-c16 pp2-c32 tp2-c16 tp2-c32 dp2-c16 dp2-c32; do
+		jq -r --arg f "$f" '"pp-bench \($f) tok/s=\(.output_token_throughput) ttft_p50_ms=\(.ttft_ms.p50) ttft_p99_ms=\(.ttft_ms.p99) itl_p50_ms=\(.itl_ms.p50) itl_p99_ms=\(.itl_ms.p99) requests_ok=\(.requests_ok)"' \
+			"${WORK}/${f}-bench.json"
+	done
+	if [[ ${#GATE_FAILED[@]} -gt 0 ]]; then
+		job_fail "outside tolerance: ${GATE_FAILED[*]}"
+	fi
+}
+
 in_job() {
 	SCENARIO="$1"
 	valid_scenario "$SCENARIO" || usage
@@ -504,6 +673,7 @@ in_job() {
 	tp2-novanas) scenario_tp2 ;;
 	dp2-novanas) scenario_dp2 ;;
 	ep2-novanas) scenario_ep2 ;;
+	pp2-novanas) scenario_pp2 ;;
 	esac
 	echo "lab-cluster: ${SCENARIO} PASS"
 }

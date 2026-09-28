@@ -20,3 +20,19 @@ olmoe.qkv       6144    2048  1        bf16     decode,prefill  invariant
 olmoe.q|k|v|o   2048    2048  1        bf16     decode,prefill  invariant
 olmoe.router    64      2048  1        f32      decode,prefill  invariant
 olmoe.lm_head   50304   2048  1        f32      decode,128,256  invariant
+# Tensor parallelism 2 (Phase 5): every rank's projections at half width (turbine_model::tp::
+# rank_config), in the model's mode, so prefix reuse is bit-exact at tp 2 as at tp 1 (user
+# decision 2026-09-28, "P5: bit-exact prefix reuse under tensor parallelism", B). Llama's fused
+# gate/up at tp 2 (8192 x 3072) is llama.gate|up above; the router is replicated (olmoe.router);
+# the expert GEMMs run in moe_experts, not through the table.
+llama.tp2.qkv       2560   3072  1    bf16     decode,prefill  prefix
+llama.tp2.q         1536   3072  1    bf16     decode,prefill  prefix
+llama.tp2.kv        512    3072  1    bf16     decode,prefill  prefix
+llama.tp2.o         3072   1536  1    bf16     decode,prefill  prefix
+llama.tp2.gate|up   4096   3072  1    bf16     decode,prefill  prefix
+llama.tp2.down      3072   4096  1    bf16     decode,prefill  prefix
+llama.tp2.lm_head   64128  3072  1    f32      decode,128,256  prefix
+olmoe.tp2.qkv       3072   2048  1    bf16     decode,prefill  invariant
+olmoe.tp2.q|k|v     1024   2048  1    bf16     decode,prefill  invariant
+olmoe.tp2.o         2048   1024  1    bf16     decode,prefill  invariant
+olmoe.tp2.lm_head   25152  2048  1    f32      decode,128,256  invariant

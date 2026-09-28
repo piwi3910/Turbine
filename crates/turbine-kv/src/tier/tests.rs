@@ -611,6 +611,44 @@ fn sharded_l1_splits_blocks_by_rank() {
     assert_eq!(full.shards()[0].used_bytes(), 0);
 }
 
+/// Phase 5 S-10: a pipeline's stage shards differ in size (a quarter and three quarters of a
+/// block here): each shard stores its own part, in order, and a whole block round-trips; a
+/// block of the wrong length is refused. Breaks if the split assumes equal shards.
+#[test]
+fn sharded_l1_with_uneven_shards() {
+    let sizes = [BLOCK / 4, BLOCK - BLOCK / 4];
+    let shards = sizes
+        .iter()
+        .map(|&n| {
+            Arc::new(L1PinnedTier::new(
+                L1Config {
+                    enabled: true,
+                    max_bytes: 4 * n,
+                    slab_bytes: 2 * n,
+                    block_bytes: n,
+                    memory_kind: MemoryKind::Dedicated,
+                },
+                Arc::new(HostPinned::new(u64::MAX)) as Arc<dyn turbine_tensor::PinnedMemory>,
+                clock(),
+            ))
+        })
+        .collect();
+    let l1 = ShardedL1Tier::with_sizes(shards, sizes.to_vec());
+    let block = bytes(5);
+    l1.put(key(1), TierBlockRef::Host(&block)).unwrap();
+    let mut start = 0usize;
+    for (shard, &n) in l1.shards().iter().zip(&sizes) {
+        let mut out = vec![0u8; n as usize];
+        shard.get(&key(1), TierBlockMut::Host(&mut out)).unwrap();
+        assert_eq!(out, block[start..start + n as usize]);
+        start += n as usize;
+    }
+    let mut out = vec![0u8; BLOCK as usize];
+    l1.get(&key(1), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, block);
+    assert!(l1.put(key(2), TierBlockRef::Host(&block[1..])).is_err());
+}
+
 /// A tier whose reads keep failing degrades, and every attach that needed it ends ready with
 /// reason `tier_degraded` (recompute), never failed or lost.
 #[test]
