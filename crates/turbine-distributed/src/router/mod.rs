@@ -1,18 +1,27 @@
-//! Data-parallel replica router (P5 S-7).
+//! Data-parallel replica router (P5 S-7): the [`RouterPolicy`] extension point
+//! (`dp_router_policy`), selected by `parallel.router`.
 //!
 //! Eligible replicas are below ORANGE with a circuit that is neither `CIRCUIT_OPEN` nor
-//! `DRAINING`; when none is eligible every replica is a candidate. With `prefix_affinity` a
-//! candidate holding the prompt's first KV blocks wins; otherwise (and with `least_loaded`) the
-//! candidate with the fewest outstanding tokens, ties to the lowest index. Skipping a prefix
-//! holder for pressure is reported as `pressure_avoidance`. The server fills `has_prefix` from
-//! each replica's KV directory lookup of the prompt's first block keys.
+//! `DRAINING`; when none is eligible every replica is a candidate ([`candidates`]). A policy
+//! picks among the candidates: `prefix_affinity` prefers a candidate holding the prompt's first
+//! KV blocks, else (like `least_loaded`) the candidate with the fewest outstanding tokens, ties
+//! to the lowest index. Skipping a prefix holder for pressure is reported as
+//! `pressure_avoidance`. The server fills `has_prefix` from each replica's KV directory lookup of
+//! the prompt's first block keys.
+
+pub mod conformance;
+pub mod least_loaded;
+pub mod prefix_affinity;
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
-use turbine_core::config::DpRouterPolicy;
+use turbine_core::registry::{Module, Registry, UnknownModule};
 use turbine_core::types::{CircuitState, PressureState, ReplicaId};
 use turbine_observability::MetricsRegistry;
+
+pub use least_loaded::LeastLoaded;
+pub use prefix_affinity::PrefixAffinity;
 
 /// Why a replica was chosen; `as_str` is the `reason` label value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -45,7 +54,8 @@ pub struct ReplicaView {
 }
 
 impl ReplicaView {
-    fn eligible(&self) -> bool {
+    /// Below ORANGE, with a circuit that is neither `CIRCUIT_OPEN` nor `DRAINING`.
+    pub fn eligible(&self) -> bool {
         self.state < PressureState::Orange
             && !matches!(
                 self.circuit,
@@ -54,35 +64,49 @@ impl ReplicaView {
     }
 }
 
+/// The replicas a policy may pick: the eligible ones, or every replica when none is eligible.
+pub fn candidates(views: &[ReplicaView]) -> impl Iterator<Item = &ReplicaView> {
+    let any_eligible = views.iter().any(ReplicaView::eligible);
+    views.iter().filter(move |v| !any_eligible || v.eligible())
+}
+
 /// The least-loaded view, ties to the lowest replica index.
-fn least_loaded<'a>(views: impl Iterator<Item = &'a ReplicaView>) -> Option<&'a ReplicaView> {
+pub fn least_loaded<'a>(views: impl Iterator<Item = &'a ReplicaView>) -> Option<&'a ReplicaView> {
     views.min_by_key(|v| (v.outstanding_tokens, v.replica))
+}
+
+/// A registered DP routing policy (extension point `dp_router_policy`, contract §24).
+pub trait RouterPolicy: Module {
+    /// Picks the replica for one request among `views` (at least two; [`route`] answers a single
+    /// replica itself with `only_candidate`). Must pick from [`candidates`], be deterministic,
+    /// and break ties by the lowest replica index.
+    fn choose(&self, views: &[ReplicaView]) -> (ReplicaId, DpRouteReason);
+}
+
+static PREFIX_AFFINITY: PrefixAffinity = PrefixAffinity;
+static LEAST_LOADED: LeastLoaded = LeastLoaded;
+
+static DP_ROUTER_POLICIES: Registry<dyn RouterPolicy> =
+    Registry::new("dp_router_policy", &[&PREFIX_AFFINITY, &LEAST_LOADED]);
+
+/// The registered DP router policies, in registration order.
+pub fn registry() -> &'static Registry<dyn RouterPolicy> {
+    &DP_ROUTER_POLICIES
+}
+
+/// The policy named by `parallel.router`, logging `event="module_selected"`.
+pub fn select(name: &str) -> Result<&'static dyn RouterPolicy, UnknownModule> {
+    registry().select(name, "parallel.router")
 }
 
 /// Picks the replica for one request. Panics on an empty slice (a plan has at least one
 /// replica).
-pub fn route(views: &[ReplicaView], policy: DpRouterPolicy) -> (ReplicaId, DpRouteReason) {
+pub fn route(views: &[ReplicaView], policy: &dyn RouterPolicy) -> (ReplicaId, DpRouteReason) {
     assert!(!views.is_empty(), "routing needs at least one replica");
     if views.len() == 1 {
         return (views[0].replica, DpRouteReason::OnlyCandidate);
     }
-    let any_eligible = views.iter().any(ReplicaView::eligible);
-    let candidate = |v: &&ReplicaView| !any_eligible || v.eligible();
-    let affinity = policy == DpRouterPolicy::PrefixAffinity;
-    if affinity
-        && let Some(v) = least_loaded(views.iter().filter(candidate).filter(|v| v.has_prefix))
-    {
-        return (v.replica, DpRouteReason::PrefixAffinity);
-    }
-    let chosen = least_loaded(views.iter().filter(candidate))
-        .expect("at least one candidate: all replicas are candidates when none is eligible");
-    let skipped_holder = affinity && views.iter().any(|v| v.has_prefix && !candidate(&v));
-    let reason = if skipped_holder {
-        DpRouteReason::PressureAvoidance
-    } else {
-        DpRouteReason::LeastLoaded
-    };
-    (chosen.replica, reason)
+    policy.choose(views)
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -126,7 +150,6 @@ impl RouterMetrics {
 
 #[cfg(test)]
 mod tests {
-    use turbine_core::config::DpRouterPolicy;
     use turbine_core::types::{CircuitState, PressureState, ReplicaId};
     use turbine_observability::MetricsRegistry;
 
@@ -145,7 +168,8 @@ mod tests {
     #[test]
     fn routing_policy() {
         use PressureState::{Green, Orange, Red, Yellow};
-        let affinity = DpRouterPolicy::PrefixAffinity;
+        let affinity = select("prefix_affinity").expect("registered");
+        let least = select("least_loaded").expect("registered");
 
         // The prefix holder wins even when busier.
         let v = [view(0, Green, 10, false), view(1, Green, 500, true)];
@@ -154,10 +178,7 @@ mod tests {
             (ReplicaId(1), DpRouteReason::PrefixAffinity)
         );
         // least_loaded ignores the prefix.
-        assert_eq!(
-            route(&v, DpRouterPolicy::LeastLoaded),
-            (ReplicaId(0), DpRouteReason::LeastLoaded)
-        );
+        assert_eq!(route(&v, least), (ReplicaId(0), DpRouteReason::LeastLoaded));
         // No prefix anywhere: fewest outstanding tokens, ties to the lowest index.
         let v = [
             view(0, Green, 300, false),

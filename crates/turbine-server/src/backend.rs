@@ -28,7 +28,6 @@ use turbine_api::{
     ModelCard, NotReadyReason, PrefetchAccepted, PrefetchRequest, Readiness, ReadyState,
     TopologyScope, readiness_for_circuit,
 };
-use turbine_core::config::DpRouterPolicy;
 use turbine_core::request::{
     ConstraintSpec, Endpoint, ErrorCode, GenerationRequest, SamplingParams, SessionHints,
     StopConditions,
@@ -37,6 +36,7 @@ use turbine_core::support::SupportRowView;
 use turbine_core::types::{CircuitState, PressureState, Priority};
 use turbine_device::DeviceInventory;
 use turbine_device::topology::TopologyGraph;
+use turbine_distributed::router::RouterPolicy;
 use turbine_kernels::Selection;
 use turbine_kv::blocks_for_tokens;
 use turbine_kv::hierarchy::PrefetchError;
@@ -271,7 +271,7 @@ impl ModelBackend {
     pub fn with_replicas(
         mut self,
         replicas: usize,
-        policy: DpRouterPolicy,
+        policy: &'static dyn RouterPolicy,
         reg: &MetricsRegistry,
     ) -> ModelBackend {
         let replicas = replicas.max(1);

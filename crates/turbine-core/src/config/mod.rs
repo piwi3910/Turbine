@@ -26,8 +26,7 @@ use crate::registry::valid_name;
 use crate::types::DeviceId;
 pub use overrides::Override;
 pub use parallel::{
-    CollectiveTimeouts, DeviceSelection, DpRouterPolicy, ParallelConfig, RankMode, RanksConfig,
-    SizeOrAuto,
+    CollectiveTimeouts, DeviceSelection, ParallelConfig, RankMode, RanksConfig, SizeOrAuto,
 };
 
 /// Configuration errors. Every variant maps to exit code 2 in `turbine-server`.
@@ -131,6 +130,8 @@ pub struct ModuleNames<'a> {
     pub collective_backends: &'a [&'a str],
     /// `parallel.ranks.transport` (Phase 5).
     pub rank_transports: &'a [&'a str],
+    /// `parallel.router` (Phase 5).
+    pub router_policies: &'a [&'a str],
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -529,6 +530,12 @@ impl Config {
             "parallel.ranks.transport",
             &self.parallel.ranks.transport,
             known.rank_transports,
+            None,
+        )?;
+        check(
+            "parallel.router",
+            &self.parallel.router,
+            known.router_policies,
             None,
         )
     }

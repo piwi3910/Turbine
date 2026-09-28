@@ -18,9 +18,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use turbine_core::config::DpRouterPolicy;
 use turbine_core::types::{CircuitState, PressureState, ReplicaId};
-use turbine_distributed::router::{DpRouteReason, ReplicaView, RouterMetrics, route};
+use turbine_distributed::router::{DpRouteReason, ReplicaView, RouterMetrics, RouterPolicy, route};
 use turbine_observability::MetricsRegistry;
 
 /// Prefix-affinity entries kept (first-block keys), across replicas.
@@ -37,7 +36,7 @@ pub struct ReplicaLoad {
 
 /// The replica choice for one process: policy, metrics, tokens in transit and the affinity table.
 pub struct ReplicaRouter {
-    policy: DpRouterPolicy,
+    policy: &'static dyn RouterPolicy,
     metrics: RouterMetrics,
     /// Per replica: tokens of submissions sent to its engine and not yet counted by it.
     in_transit: Vec<AtomicU64>,
@@ -54,7 +53,7 @@ struct Affinity {
 impl ReplicaRouter {
     pub fn new(
         replicas: usize,
-        policy: DpRouterPolicy,
+        policy: &'static dyn RouterPolicy,
         block_tokens: u32,
         reg: &MetricsRegistry,
     ) -> ReplicaRouter {
@@ -153,6 +152,13 @@ impl ReplicaRouter {
 mod tests {
     use super::*;
 
+    /// `parallel.router: prefix_affinity`, the default.
+    fn prefix_affinity() -> &'static dyn RouterPolicy {
+        turbine_distributed::router::registry()
+            .get("prefix_affinity")
+            .expect("registered")
+    }
+
     fn load(state: PressureState, outstanding: u64) -> Option<ReplicaLoad> {
         Some(ReplicaLoad {
             state,
@@ -167,7 +173,7 @@ mod tests {
     #[test]
     fn routes_by_load_affinity_and_readiness() {
         let reg = MetricsRegistry::new();
-        let r = ReplicaRouter::new(2, DpRouterPolicy::PrefixAffinity, 4, &reg);
+        let r = ReplicaRouter::new(2, prefix_affinity(), 4, &reg);
         let green = [
             load(PressureState::Green, 100),
             load(PressureState::Green, 50),

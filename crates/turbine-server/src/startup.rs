@@ -337,9 +337,18 @@ async fn serve(
         scheduler: SchedulerMetrics::register(&metrics),
         kv: replicas[0].kv_metrics.clone(),
     };
+    // `parallel.router` was checked against the registry before any port was bound
+    // (`Config::validate_modules`); `select` logs `module_selected`.
+    let router_policy = match turbine_distributed::router::select(config.parallel.router.as_str()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("turbine-server: parallel.router: {e}");
+            return ExitCode::Config;
+        }
+    };
     let backend = Arc::new(
         ModelBackend::new(&replicas[0].prepared, &inventory, &engine_metrics)
-            .with_replicas(replicas.len(), config.parallel.router, &metrics)
+            .with_replicas(replicas.len(), router_policy, &metrics)
             .with_support(support)
             .with_topology(&cluster.topology)
             .with_parallel(cluster.parallel),

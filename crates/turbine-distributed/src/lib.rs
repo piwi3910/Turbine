@@ -2,7 +2,8 @@
 //! backends as modules of the `collective_backend` registry (a deterministic host reference
 //! backend, and one runtime-loaded NCCL-API binding serving `rccl` and `nccl`), the static-mode
 //! rank link as modules of the `rank_transport` registry ([`transport`]: `tcp`), and the
-//! data-parallel router.
+//! data-parallel router's policies as modules of the `dp_router_policy` registry ([`router`]:
+//! `prefix_affinity`, `least_loaded`).
 #![deny(unsafe_code)]
 
 pub mod collective;
@@ -23,6 +24,16 @@ mod registry_conformance {
         assert_eq!(reg.names(), ["host", "rccl", "nccl"]);
         for backend in reg.iter() {
             crate::collective::conformance::check(backend).unwrap();
+        }
+    }
+
+    #[test]
+    fn dp_router_policies() {
+        let reg = crate::router::registry();
+        conformance::check(reg).unwrap();
+        assert_eq!(reg.names(), ["prefix_affinity", "least_loaded"]);
+        for policy in reg.iter() {
+            crate::router::conformance::check(policy).unwrap();
         }
     }
 

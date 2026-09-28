@@ -568,6 +568,7 @@ fn task1_modules() -> ModuleNames<'static> {
         eviction_policies: &["cost_aware", "lru"],
         collective_backends: &["host", "nccl", "rccl"],
         rank_transports: &["tcp"],
+        router_policies: &["prefix_affinity", "least_loaded"],
     }
 }
 
@@ -917,7 +918,7 @@ fn parallel_rejections() {
     assert_eq!(d.rccl_library, None);
     assert!(!d.allow_device_sharing);
     assert_eq!(d.plan_queue_depth, 2);
-    assert_eq!(d.router, DpRouterPolicy::PrefixAffinity);
+    assert_eq!(d.router.as_str(), "prefix_affinity");
     assert_eq!(d.collective.init_timeout.0, Duration::from_secs(120));
     assert_eq!(d.collective.op_timeout.0, Duration::from_secs(30));
     assert_eq!(d.ranks.mode, RankMode::Local);
@@ -944,7 +945,7 @@ fn parallel_rejections() {
         ok.devices,
         DeviceSelection::List(vec![DeviceId(0), DeviceId(1)])
     );
-    assert_eq!(ok.router, DpRouterPolicy::LeastLoaded);
+    assert_eq!(ok.router.as_str(), "least_loaded");
     assert_eq!(ok.collective_backend.as_str(), "rccl");
     let stat = parse(
         base,
@@ -1064,6 +1065,26 @@ fn parallel_rejections() {
     let err = rdma.validate_modules(&task1_modules()).unwrap_err();
     assert_eq!(err.key(), Some("parallel.ranks.transport"), "{err}");
     assert!(err.to_string().contains("(registered: tcp)"), "{err}");
+    // And the DP router policy, same names as before it became a registry.
+    assert_rejected(base, &["parallel.router=Least-Loaded"], "parallel.router");
+    let rr = parse(base, &["parallel.router=round_robin"]).unwrap();
+    let err = rr.validate_modules(&task1_modules()).unwrap_err();
+    assert_eq!(err.key(), Some("parallel.router"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("(registered: prefix_affinity, least_loaded)"),
+        "{err}"
+    );
+    for policy in ["prefix_affinity", "least_loaded"] {
+        let set = format!("parallel.router={policy}");
+        assert!(
+            parse(base, &[set.as_str()])
+                .unwrap()
+                .validate_modules(&task1_modules())
+                .is_ok(),
+            "{policy}"
+        );
+    }
     assert!(
         parse(base, &["parallel.ranks.transport=tcp"])
             .unwrap()
