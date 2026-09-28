@@ -1526,3 +1526,19 @@ Consequences (docs changed the same day): the joint `phase-6-quantization` spec 
 7. `.procoder/review-2026-09-29.md` is kept current: what landed, perf against vLLM, provisional decisions, anything unfinished — the file the user reads in the morning.
 
 Also relayed the same night (coordinator, at the user's request "more speed"): build in parallel. The Phase 6a lead stays the integrator; builder agents run in their own worktrees on branches cut from `phase-6a-quantization`, one owner per file (a shared registry or config file is owned by one track and the other sends its edit to the owner), each task test-first, one commit, `scripts/gate.sh` clean, merged or rebased back by the lead after it passes the gate; GPU work staggered (`lab-test.sh --tier quick` on either card, every perf number on GPU 0 under the bench lock). Branch `scout-fixes` is merged into main by the coordinator; main may move under the phase branches.
+
+## Phase 6a proof checkpoints downloaded (2026-09-29)
+
+Downloaded on `novanas` by the fixtures builder with `hf download <repo> --revision <sha> --local-dir /home/piwi/turbine-models/<slug>` (approved: user answer Q4 and "Continue through Phases 6a and 6b unattended"), every one rc 0, `config.json` and the listed safetensors present:
+
+| Slug | Repo @ revision | Bytes |
+| ---- | --------------- | ----- |
+| `llama-3.2-3b-instruct-fp8-dynamic` | `RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic` @ `c308a86de78778c5f904a1d82401ac85e18ca205` | 4,413,814,259 |
+| `llama-3.2-3b-instruct-fp8` | `RedHatAI/Llama-3.2-3B-Instruct-FP8` @ `377571d314b30f1d58448499e4100e2deafe7d7d` | 4,404,163,249 |
+| `llama-3.2-3b-instruct-fp8-block` | `unsloth/Llama-3.2-3B-Instruct-FP8-Block` @ `08cf804398b23fab4a1df02fbe8d4d5a11a800cc` | 3,624,601,065 |
+| `llama-3.2-3b-instruct-awq` | `casperhansen/llama-3.2-3b-instruct-awq` @ `272b3bde867b606760447deb9a4d2719fbdfd3ae` | 2,270,034,219 |
+| `llama-3.2-3b-instruct-gptq` | `shuyuej/Llama-3.2-3B-Instruct-GPTQ` @ `dd5a311f040728fbc612eb03c8dadfae0a90552f` | 2,264,970,345 |
+| `llama-3.2-3b-mxfp4-a4` | `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` @ `91925ffda6977d097354a99718a20e035f8af80a` | 2,303,041,140 |
+| `llama-3.1-8b-instruct-mxfp4a16` | `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16` @ `14c3aca849a72df8fcc8b3a30ab8d9eed86ee646` | 5,827,024,421 |
+
+Free disk went from 99.0 GB before to 72.3 GB after the last download (00:17). The 8B BF16 baseline (`unsloth/Llama-3.1-8B-Instruct` @ `4699cc75b550f9c6f3173fb80f4703b62d946aa5`, 16 GB) is on hold: novanas fell to 49 GB free at 00:25 (other workspaces' build trees) and the kubelet evicts lab pods below ~47.7 GB; it is downloaded once stale build trees are cleared.
