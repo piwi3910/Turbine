@@ -129,6 +129,8 @@ pub struct ModuleNames<'a> {
     pub eviction_policies: &'a [&'a str],
     /// `parallel.collective_backend` (Phase 5; `auto` is always accepted).
     pub collective_backends: &'a [&'a str],
+    /// `parallel.ranks.transport` (Phase 5).
+    pub rank_transports: &'a [&'a str],
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -522,6 +524,12 @@ impl Config {
             &self.parallel.collective_backend,
             known.collective_backends,
             Some("auto"),
+        )?;
+        check(
+            "parallel.ranks.transport",
+            &self.parallel.ranks.transport,
+            known.rank_transports,
+            None,
         )
     }
 

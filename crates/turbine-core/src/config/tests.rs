@@ -567,6 +567,7 @@ fn task1_modules() -> ModuleNames<'static> {
         scheduling_policies: &["default"],
         eviction_policies: &["cost_aware", "lru"],
         collective_backends: &["host", "nccl", "rccl"],
+        rank_transports: &["tcp"],
     }
 }
 
@@ -1049,6 +1050,26 @@ fn parallel_rejections() {
     let gloo = parse(base, &["parallel.collective_backend=gloo"]).unwrap();
     let err = gloo.validate_modules(&task1_modules()).unwrap_err();
     assert_eq!(err.key(), Some("parallel.collective_backend"), "{err}");
+    // So is the rank transport (default `tcp`).
+    assert_eq!(
+        parse(base, &[]).unwrap().parallel.ranks.transport.as_str(),
+        "tcp"
+    );
+    assert_rejected(
+        base,
+        &["parallel.ranks.transport=RDMA"],
+        "parallel.ranks.transport",
+    );
+    let rdma = parse(base, &["parallel.ranks.transport=rdma"]).unwrap();
+    let err = rdma.validate_modules(&task1_modules()).unwrap_err();
+    assert_eq!(err.key(), Some("parallel.ranks.transport"), "{err}");
+    assert!(err.to_string().contains("(registered: tcp)"), "{err}");
+    assert!(
+        parse(base, &["parallel.ranks.transport=tcp"])
+            .unwrap()
+            .validate_modules(&task1_modules())
+            .is_ok()
+    );
     assert!(
         parse(base, &[])
             .unwrap()

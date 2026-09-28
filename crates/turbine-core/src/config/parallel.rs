@@ -84,6 +84,9 @@ pub struct RanksConfig {
     pub leader: Option<SocketAddr>,
     /// The device this rank process drives (`static` only; exactly one in Phase 5).
     pub local_devices: Vec<DeviceId>,
+    /// A registered rank transport (extension point `rank_transport`: `tcp`; checked by
+    /// `Config::validate_modules`) carrying the `static` bootstrap and step plans.
+    pub transport: ModuleName,
 }
 
 impl Default for RanksConfig {
@@ -93,6 +96,7 @@ impl Default for RanksConfig {
             rank: 0,
             leader: None,
             local_devices: vec![DeviceId(0)],
+            transport: ModuleName::fixed("tcp"),
         }
     }
 }

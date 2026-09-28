@@ -4,7 +4,8 @@
 //! Two modes. `local`: one thread per worker rank in this process, fed through a bounded
 //! channel; at most `depth` (`parallel.plan_queue_depth`) plans are outstanding per worker
 //! (queued or executing), so a stalled worker blocks the leader instead of growing a queue.
-//! `static`: one process per rank; workers connect to the leader over TCP, the leader checks
+//! `static`: one process per rank; workers connect to the leader over a registered rank
+//! transport (`parallel.ranks.transport`, [`crate::transport`]; `tcp` in Phase 5), the leader checks
 //! each `Hello` (protocol, world size, rank, model/config fingerprints, vendor, architecture)
 //! and answers `Welcome { unique_id }` once every rank joined, or `Reject { reason }`. Frames are
 //! a u32 little-endian length plus a postcard body, at most 16 MiB. A closed leader socket makes
@@ -13,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown as NetShutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -25,6 +26,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use turbine_core::types::{BlockId, ModelFingerprint, SeqId, Vendor};
 
 use crate::collective::{Collective, CollectiveError};
+use crate::transport::{RankStream, Transport};
 
 /// Static-mode protocol version carried in `Hello`.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -221,8 +223,8 @@ struct LocalWorker {
 struct StaticLink {
     rank: u32,
     tx: Option<SyncSender<RankMessage>>,
-    /// A clone of the socket, kept to close it (both directions) on shutdown or drop.
-    control: TcpStream,
+    /// A clone of the connection, kept to close it (both directions) on shutdown or drop.
+    control: Box<dyn RankStream>,
     writer: Option<JoinHandle<()>>,
 }
 
@@ -270,7 +272,7 @@ fn check_hello(
     msg: &RankMessage,
     expect: &HelloExpect,
     world: usize,
-    joined: &BTreeMap<u32, TcpStream>,
+    joined: &BTreeMap<u32, Box<dyn RankStream>>,
 ) -> Result<u32, String> {
     let RankMessage::Hello {
         protocol,
@@ -359,10 +361,11 @@ impl RankRuntime {
         }
     }
 
-    /// Static mode, rank 0: accepts ranks `1..world` on `listen` until all joined (then
-    /// `Welcome { unique_id }` to each) or `init_timeout` passed (`Timeout { missing }`, and
-    /// `Shutdown` to the ranks that did join). Bad `Hello`s get `Reject { reason }`.
+    /// Static mode, rank 0: accepts ranks `1..world` on `listen` over `transport` until all
+    /// joined (then `Welcome { unique_id }` to each) or `init_timeout` passed (`Timeout {
+    /// missing }`, and `Shutdown` to the ranks that did join). Bad `Hello`s get `Reject { reason }`.
     pub fn static_leader(
+        transport: &dyn Transport,
         listen: SocketAddr,
         expect: HelloExpect,
         world: usize,
@@ -370,10 +373,9 @@ impl RankRuntime {
         unique_id: [u8; 128],
         depth: usize,
     ) -> Result<Self, RankError> {
-        let listener = TcpListener::bind(listen).map_err(io_err)?;
-        listener.set_nonblocking(true).map_err(io_err)?;
+        let listener = transport.listen(listen).map_err(io_err)?;
         let deadline = Instant::now() + init_timeout;
-        let mut joined: BTreeMap<u32, TcpStream> = BTreeMap::new();
+        let mut joined: BTreeMap<u32, Box<dyn RankStream>> = BTreeMap::new();
         while joined.len() + 1 < world {
             let now = Instant::now();
             if now >= deadline {
@@ -396,18 +398,15 @@ impl RankRuntime {
                 );
                 return Err(RankError::Timeout { missing });
             }
-            let mut stream = match listener.accept() {
-                Ok((s, _)) => s,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
+            let mut stream = match listener.accept(deadline - now) {
+                Ok(Some(s)) => s,
+                Ok(None) => continue,
                 Err(e) => return Err(io_err(e)),
             };
-            if stream.set_nonblocking(false).is_err()
-                || stream
-                    .set_read_timeout(Some((deadline - now).max(Duration::from_millis(1))))
-                    .is_err()
+            let left = deadline.saturating_duration_since(Instant::now());
+            if stream
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+                .is_err()
             {
                 continue;
             }
@@ -476,9 +475,11 @@ impl RankRuntime {
         })
     }
 
-    /// Static mode, ranks 1..: connects to `leader` (retrying with 50 ms doubling to 1 s
-    /// backoff until `init_timeout`), sends `hello` and waits for `Welcome` or `Reject`.
+    /// Static mode, ranks 1..: connects to `leader` over `transport` (retrying with 50 ms
+    /// doubling to 1 s backoff until `init_timeout`), sends `hello` and waits for `Welcome` or
+    /// `Reject`.
     pub fn static_worker(
+        transport: &dyn Transport,
         leader: SocketAddr,
         hello: RankMessage,
         init_timeout: Duration,
@@ -493,7 +494,7 @@ impl RankRuntime {
             if left.is_zero() {
                 return Err(RankError::Timeout { missing: vec![0] });
             }
-            match TcpStream::connect_timeout(&leader, left) {
+            match transport.connect(leader, left) {
                 Ok(s) => break s,
                 Err(_) => {
                     std::thread::sleep(
@@ -615,7 +616,7 @@ impl RankRuntime {
                     if let Some(h) = l.writer.take() {
                         let _ = h.join();
                     }
-                    let _ = l.control.shutdown(NetShutdown::Both);
+                    let _ = l.control.shutdown();
                 }
             }
         }
@@ -637,7 +638,7 @@ impl Drop for RankRuntime {
                 closing.store(true, Ordering::Release);
                 for l in links.iter_mut() {
                     l.tx = None;
-                    let _ = l.control.shutdown(NetShutdown::Both);
+                    let _ = l.control.shutdown();
                 }
             }
         }
@@ -646,7 +647,7 @@ impl Drop for RankRuntime {
 
 /// A static-mode worker's connection to its leader, after `Welcome`.
 pub struct WorkerLink {
-    stream: TcpStream,
+    stream: Box<dyn RankStream>,
     rank: u32,
     unique_id: [u8; 128],
 }
@@ -723,6 +724,13 @@ mod tests {
 
     use super::*;
     use crate::collective::{Collective, CollectiveError, HostCollective, ReduceOp};
+
+    /// The `tcp` rank transport, as `parallel.ranks.transport: tcp` selects it.
+    fn tcp() -> &'static dyn Transport {
+        crate::transport::registry()
+            .get("tcp")
+            .expect("tcp is registered")
+    }
 
     fn free_addr() -> SocketAddr {
         let l = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -803,12 +811,20 @@ mod tests {
         // Three workers join a world of four; all get the same id.
         let addr = free_addr();
         let leader = thread::spawn(move || {
-            RankRuntime::static_leader(addr, expect(), 4, Duration::from_secs(5), unique_id(), 2)
+            RankRuntime::static_leader(
+                tcp(),
+                addr,
+                expect(),
+                4,
+                Duration::from_secs(5),
+                unique_id(),
+                2,
+            )
         });
         let workers: Vec<_> = (1..4)
             .map(|rank| {
                 thread::spawn(move || {
-                    RankRuntime::static_worker(addr, hello(rank, 4), Duration::from_secs(5))
+                    RankRuntime::static_worker(tcp(), addr, hello(rank, 4), Duration::from_secs(5))
                 })
             })
             .collect();
@@ -823,12 +839,21 @@ mod tests {
         let addr = free_addr();
         let started = Instant::now();
         let leader = thread::spawn(move || {
-            RankRuntime::static_leader(addr, expect(), 3, Duration::from_secs(1), unique_id(), 2)
+            RankRuntime::static_leader(
+                tcp(),
+                addr,
+                expect(),
+                3,
+                Duration::from_secs(1),
+                unique_id(),
+                2,
+            )
         });
         let good = thread::spawn(move || {
-            RankRuntime::static_worker(addr, hello(1, 3), Duration::from_secs(3))
+            RankRuntime::static_worker(tcp(), addr, hello(1, 3), Duration::from_secs(3))
         });
         let reject = |msg: RankMessage| match RankRuntime::static_worker(
+            tcp(),
             addr,
             msg,
             Duration::from_secs(3),
@@ -886,7 +911,15 @@ mod tests {
         let mut comms = HostCollective::group(3, Duration::from_secs(5)).into_iter();
         let _leader_comm = comms.next().expect("rank 0");
         let leader = thread::spawn(move || {
-            RankRuntime::static_leader(addr, expect(), 3, Duration::from_secs(5), unique_id(), 2)
+            RankRuntime::static_leader(
+                tcp(),
+                addr,
+                expect(),
+                3,
+                Duration::from_secs(5),
+                unique_id(),
+                2,
+            )
         });
         let (done_tx, done_rx) = mpsc::channel();
         let mut shared = Vec::new();
@@ -895,8 +928,9 @@ mod tests {
             shared.push(Arc::clone(&comm));
             let done = done_tx.clone();
             thread::spawn(move || {
-                let link = RankRuntime::static_worker(addr, hello(rank, 3), Duration::from_secs(5))
-                    .expect("welcome");
+                let link =
+                    RankRuntime::static_worker(tcp(), addr, hello(rank, 3), Duration::from_secs(5))
+                        .expect("welcome");
                 let steps = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let mut exec = Count(Arc::clone(&steps));
                 let result = link.run(&mut exec, comm.as_ref());
