@@ -37,18 +37,20 @@
 #                      same load as dp 1), each requests_ok 200, and turbine_dp_routed_total
 #                      non-zero for replica 0 and replica 1.
 #   ep2-novanas        OLMoE-1B-7B (scripts/lab/phase5-novanas-ep2.yaml): first an ep 1 baseline
-#                      on device 0 (golden c1 and a capture of its greedy outputs, both
-#                      informational; the standard throughput workload: 512-word prompts, 256
-#                      tokens with --ignore-eos, concurrency 16, 200 requests, after a
-#                      16-request warm-up); then ep 2 with tp 1 over rccl (golden at
-#                      concurrency 1 and 16, turbine_expert_rank_tokens_total non-zero for rank
-#                      0 and rank 1, the standard workload), ep 2 with tp 1 over hostmem (golden
-#                      c1, the standard workload) and ep 2 with tp 2 (golden c1); every EP run
-#                      is also compared with the ep 1 capture (informational). A golden
-#                      violation fails the scenario at its end, after every run. Prints one
-#                      `ep-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run and
-#                      the scheduler document's `expert` section. 2-GPU numbers are "2-GPU
-#                      (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
+#                      on device 0 (golden c1 against the committed transformers reference, a
+#                      capture of its greedy outputs, the teacher-forced `turbine-golden
+#                      positions` report of p14, the standard throughput workload: 512-word
+#                      prompts, 256 tokens with --ignore-eos, concurrency 16, 200 requests,
+#                      after a 16-request warm-up); then ep 2 with tp 1 over rccl, ep 2 over
+#                      hostmem and ep 2 with tp 2. The accuracy gate of every EP run is the ep 1
+#                      capture of the same run: strict bounds at concurrency 1, batched at 16
+#                      (user decision "P5: OLMoE golden tolerance under expert parallelism");
+#                      the transformers reference is compared for information only (and p14's
+#                      positions report printed). turbine_expert_rank_tokens_total must be
+#                      non-zero for rank 0 and rank 1. A gate violation fails the scenario at its
+#                      end, after every run. Prints one `ep-bench <run> tok/s=… ttft_p50_ms=…
+#                      itl_p50_ms=…` line per bench run and the scheduler document's `expert`
+#                      section. 2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
 #
 # Like scripts/lab-test.sh, the tree is uploaded to /home/piwi/turbine-ci/runs/<run id>/src and
 # one template (scripts/lab/novanas-cluster-job.yaml) runs twice: first GPU-less as
@@ -393,9 +395,29 @@ golden_info() {
 	"${BIN}/turbine-golden" compare --url "$URL" "$@" || echo "lab-info: golden ${label} outside tolerance"
 }
 
+# positions_p <slug> <label> <prompt id>: turbine-golden positions, teacher-forced on the committed
+# reference (every position has the reference's history), printed with a prefix per line.
+positions_p() {
+	local slug="$1" label="$2" id="$3"
+	echo "lab-step: turbine-golden positions ${label} ${id}"
+	"${BIN}/turbine-golden" positions --url "$URL" --reference "tests/golden/${slug}/reference.jsonl" \
+		--prompt-id "$id" | sed "s/^/positions ${label} /" || echo "lab-info: positions ${label} failed"
+}
+
 scenario_ep2() {
 	local ep2=scripts/lab/phase5-novanas-ep2.yaml slug=olmoe-1b-7b-0125-instruct
 	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
+	# The multi-GPU accuracy gate (user decision "P5: OLMoE golden tolerance under expert
+	# parallelism", A then C): a strict compare at c1 and a batched one at c16 against the one-GPU
+	# capture taken in this run; the committed transformers reference is information only.
+	golden_vs_one_gpu() {
+		local label="$1"
+		echo "lab-step: golden ${label} vs 1 GPU c1 and c16"
+		"${BIN}/turbine-golden" compare --url "$URL" --reference "${WORK}/ep1-capture.jsonl" \
+			"${tol[@]}" || GATE_FAILED+=("golden ${label} c1 vs 1 GPU")
+		"${BIN}/turbine-golden" compare --url "$URL" --reference "${WORK}/ep1-capture.jsonl" \
+			"${tol[@]}" --concurrency 16 || GATE_FAILED+=("golden ${label} c16 vs 1 GPU")
+	}
 	# The ep 1 baseline: the same configuration with one device. Its golden c1 and a capture of
 	# its greedy outputs, the one-device reference the EP runs are also compared with.
 	start_server "${WORK}/ep1.log" "$ep2" --set parallel.expert_parallel_size=1 \
@@ -405,6 +427,7 @@ scenario_ep2() {
 	echo "lab-step: turbine-golden capture (ep1)"
 	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
 		--out "${WORK}/ep1-capture.jsonl" || job_fail "turbine-golden capture failed"
+	positions_p "$slug" ep1 p14
 	bench_ok 16 "${WORK}/ep1-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
 	bench_ok 200 "${WORK}/ep1-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
 		--requests 200
@@ -412,10 +435,10 @@ scenario_ep2() {
 
 	start_server "${WORK}/ep2.log" "$ep2"
 	wait_ready "$URL" "${WORK}/ep2.log"
-	golden_gate "$slug" "olmoe ep2 c1"
-	golden_gate "$slug" "olmoe ep2 c16" --concurrency 16
-	golden_info "olmoe ep2 c1 again" --reference "tests/golden/${slug}/reference.jsonl"
-	golden_info "olmoe ep2 c1 vs ep1" --reference "${WORK}/ep1-capture.jsonl" "${tol[@]}"
+	golden_vs_one_gpu "olmoe ep2"
+	golden_info "olmoe ep2 c1 vs HF" --reference "tests/golden/${slug}/reference.jsonl"
+	golden_info "olmoe ep2 c16 vs HF" --reference "tests/golden/${slug}/reference.jsonl" --concurrency 16
+	positions_p "$slug" ep2 p14
 	ep_counts ep2
 	bench_ok 16 "${WORK}/ep2-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
 	bench_ok 200 "${WORK}/ep2-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
@@ -425,8 +448,8 @@ scenario_ep2() {
 
 	start_server "${WORK}/ep2-hostmem.log" "$ep2" --set parallel.collective_backend=hostmem
 	wait_ready "$URL" "${WORK}/ep2-hostmem.log"
-	golden_gate "$slug" "olmoe ep2 hostmem c1"
-	golden_info "olmoe ep2 hostmem c1 vs ep1" --reference "${WORK}/ep1-capture.jsonl" "${tol[@]}"
+	golden_vs_one_gpu "olmoe ep2 hostmem"
+	golden_info "olmoe ep2 hostmem c1 vs HF" --reference "tests/golden/${slug}/reference.jsonl"
 	bench_ok 16 "${WORK}/ep2-hostmem-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
 		--requests 16
 	bench_ok 200 "${WORK}/ep2-hostmem-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
@@ -436,8 +459,8 @@ scenario_ep2() {
 
 	start_server "${WORK}/ep2-tp2.log" "$ep2" --set parallel.tensor_parallel_size=2
 	wait_ready "$URL" "${WORK}/ep2-tp2.log"
-	golden_gate "$slug" "olmoe ep2 tp2 c1"
-	golden_info "olmoe ep2 tp2 c1 vs ep1" --reference "${WORK}/ep1-capture.jsonl" "${tol[@]}"
+	golden_vs_one_gpu "olmoe ep2 tp2"
+	golden_info "olmoe ep2 tp2 c1 vs HF" --reference "tests/golden/${slug}/reference.jsonl"
 	ep_counts ep2-tp2
 	stop_servers
 
