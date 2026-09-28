@@ -775,6 +775,8 @@ RUN_DIR="${CI_ROOT}/runs/${RUN_ID}"
 SELECTOR="turbine-lab=true,turbine-lab-run=${RUN_ID}"
 # How long a GPU pod may stay unschedulable before the run gives up.
 UNSCHEDULABLE_LIMIT=60
+# How long it may wait behind other Turbine lab Jobs (our own queue) before giving up.
+OWN_QUEUE_LIMIT="${TURBINE_LAB_QUEUE_LIMIT:-10800}"
 
 say() {
 	echo "lab-cluster: novanas: $*"
@@ -868,6 +870,20 @@ wait_for_pod() {
 		phase="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.phase}'" || true)"
 		[[ "$phase" == Running || "$phase" == Succeeded || "$phase" == Failed ]] && return 0
 		unschedulable="$(kube "-n ${NS} get pods -l job-name=${job} -o jsonpath='{.items[*].status.conditions[?(@.reason==\"Unschedulable\")].message}'" || true)"
+		# Waiting behind another Turbine lab Job (label turbine-lab=true) is a queue, not a
+		# failure: name the holders every 5 min and wait up to OWN_QUEUE_LIMIT. Anything else
+		# holding amd.com/gpu gives up after UNSCHEDULABLE_LIMIT (never evicted).
+		if [[ $gpus -gt 0 && "$unschedulable" == *"amd.com/gpu"* ]]; then
+			local ours=""
+			ours="$(kube "-n ${NS} get pods -l turbine-lab=true --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.labels.job-name} {end}'" || true)"
+			ours="${ours//${job}/}"
+			if [[ -n "${ours// /}" && $waited -lt $OWN_QUEUE_LIMIT ]]; then
+				((waited % 300 == 0)) && say "queued behind our lab Job(s):${ours} (waited ${waited} s)"
+				sleep 5
+				waited=$((waited + 5))
+				continue
+			fi
+		fi
 		if [[ $gpus -gt 0 && "$unschedulable" == *"amd.com/gpu"* && $waited -ge $UNSCHEDULABLE_LIMIT ]]; then
 			echo "lab-cluster: novanas: ${unschedulable}" >&2
 			cleanup
