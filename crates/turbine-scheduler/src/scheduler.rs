@@ -1079,15 +1079,18 @@ impl Scheduler {
         plan
     }
 
-    /// Per-plan caps `(sequences, tokens)`: unlimited and `max_batch_tokens` with one
-    /// micro-batch; with `m`, `ceil(live / m)` sequences and (chunked prefill only — a whole
-    /// prompt must still fit one plan) `max_batch_tokens / m` tokens, where `live` counts the
-    /// running sequences that prefill or decode (in flight or not) plus the waiting requests
-    /// the free running slots could start.
+    /// Per-plan caps `(sequences, tokens)`: `max_running_requests` sequences (the executor's
+    /// batch is sized for that many; with `n` > 1 the running requests hold more sequences, which
+    /// then take turns) and `max_batch_tokens` with one micro-batch; with `m`, at most
+    /// `ceil(live / m)` sequences and (chunked prefill only — a whole prompt must still fit one
+    /// plan) `max_batch_tokens / m` tokens, where `live` counts the running sequences that
+    /// prefill or decode (in flight or not) plus the waiting requests the free running slots
+    /// could start.
     fn micro_batch_caps(&self) -> (usize, u32) {
         let m = self.micro_batches.max(1);
+        let max_seqs = self.params.max_running_requests as usize;
         if m == 1 {
-            return (usize::MAX, self.params.max_batch_tokens);
+            return (max_seqs, self.params.max_batch_tokens);
         }
         let live = self
             .running
@@ -1102,7 +1105,9 @@ impl Scheduler {
         let free_slots =
             (self.params.max_running_requests as usize).saturating_sub(self.running.len());
         let startable = self.queue_len().min(free_slots);
-        let seqs = (live + startable).div_ceil(m as usize).max(1);
+        let seqs = (live + startable)
+            .div_ceil(m as usize)
+            .clamp(1, max_seqs.max(1));
         let tokens = if self.params.chunked_prefill {
             (self.params.max_batch_tokens / m).max(1)
         } else {
@@ -1871,13 +1876,16 @@ impl Scheduler {
             .sum()
     }
 
-    /// The decodes of this plan: the whole decode set with one micro-batch; with more, the
+    /// The decodes of this plan: the whole decode set with one micro-batch while it fits `cap`;
+    /// with more micro-batches, or more decoding sequences than `cap` (forks of `n` > 1), the
     /// sequences of requests not in flight, least recently stepped first (admission order
     /// among equals), at most `cap`.
     fn decode_candidates(&self, cap: usize) -> Vec<SeqId> {
         let mut set = self.decode_set();
         if self.micro_batches > 1 {
             set.retain(|s| !self.busy.contains_key(&self.seqs[s].request));
+        }
+        if self.micro_batches > 1 || set.len() > cap {
             set.sort_by_key(|s| self.seqs[s].last_step);
             set.truncate(cap);
         }
@@ -2418,6 +2426,62 @@ mod tests {
             kinds(&plan),
             [(2, BatchKind::Prefill { start: 0, len: 64 })]
         );
+    }
+
+    /// `max_running_requests` bounds requests, and the executor is sized for that many
+    /// sequences per step: with `n` > 1 the running requests hold more decodable sequences than
+    /// that, so a plan takes at most `max_running_requests` of them, least recently stepped
+    /// first, and every sequence keeps decoding in turn. Breaks if a plan holds more sequences
+    /// than the executor was built for ("7 sequences exceed max_seqs 6") or a fork starves.
+    #[test]
+    fn forks_never_exceed_the_sequence_cap() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let mut s = Scheduler::new(
+            SchedulerParams {
+                max_running_requests: 2,
+                ..params()
+            },
+            Arc::new(clock),
+        );
+        let mut p = pool(64);
+        let mut a = request(1, 10, 20, 50);
+        a.seqs = smallvec![SeqId(10), SeqId(11), SeqId(12)];
+        s.submit(a, p.total_blocks()).unwrap();
+        s.submit(request(2, 20, 8, 50), p.total_blocks()).unwrap();
+        let mut steps: HashMap<u64, u32> = HashMap::new();
+        for i in 0..12 {
+            let plan = s.plan(&mut p, &IterationLimits::default());
+            assert!(plan.items.len() <= 2, "iteration {i}: {:?}", kinds(&plan));
+            for item in &plan.items {
+                if item.kind == BatchKind::Decode {
+                    *steps.entry(item.seq.0).or_default() += 1;
+                }
+            }
+            let appended = plan
+                .items
+                .iter()
+                .map(|i| i.seq)
+                .chain(
+                    // The shared prefill samples one token for every choice.
+                    plan.items
+                        .iter()
+                        .filter(|i| i.seq == SeqId(10) && i.kind != BatchKind::Decode)
+                        .flat_map(|_| [SeqId(11), SeqId(12)]),
+                )
+                .map(|q| (q, 1))
+                .collect();
+            s.complete(
+                &mut p,
+                IterationOutcome {
+                    iteration: plan.iteration,
+                    appended,
+                    ..IterationOutcome::default()
+                },
+            );
+        }
+        let counts: Vec<u32> = [10, 11, 12, 20].iter().map(|q| steps[q]).collect();
+        let (min, max) = (counts.iter().min().unwrap(), counts.iter().max().unwrap());
+        assert!(max - min <= 1, "every sequence decodes in turn: {steps:?}");
     }
 
     #[test]
