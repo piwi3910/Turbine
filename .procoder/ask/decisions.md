@@ -1336,3 +1336,127 @@ User proposal: instead of fixed per-tier formats, start lossless everywhere. Whe
 Refined in discussion: a per-block ladder (lossless → FP8 → ~4-bit → ~2-bit → evict) driven by the pressure controller. "Compress" becomes a third eviction-policy action next to demote and evict, applied to the blocks least likely to be reused, which in practice means oldest-first from the lowest tier. It works mostly on new demotions, rewrites existing blocks only oldest-first and bounded per step, uses hysteresis, and never upgrades a block that has lost precision. L1/L2 come first; L0 joins after mixed-format attention.
 
 **Answer (2026-09-28, user): do it.** Added to `phase-6-quantization` scope as its last step (umbrella S-6 amended), after the weight formats, FP8 KV, TurboQuant and the per-tier formats. Observability rules: reason codes, per-tier × format metrics, lossy-token counts per response, an opt-out that recomputes instead, and tests that pin the pressure state.
+
+## Phase 6 spec: provisional design choices (2026-09-28)
+
+Written with `.procoder/specs/phase-6-quantization.md` and its plan. The scope, the formats, the MXFP4 packagings and proof checkpoints, YaRN, TurboQuant, the per-tier formats and the compression ladder are fixed by the entries "Roadmap reorganisation after Phase 5", "Phase 6 MXFP4: packaging formats and proof checkpoints", "YaRN RoPE scaling moves into Phase 6", "KV-cache quantization beyond FP8", "Sub-8-bit KV and per-tier KV formats in Phase 6" and "Pressure-driven KV compression ladder in Phase 6" (all 2026-09-28). The choices below are the ones those entries leave open. The spec writes each recommended option marked "(provisional)"; none is implemented until the user answers. Facts behind them, gathered 2026-09-28: hipBLASLt on `novanas` (ROCm 7.14.1, `gfx1201`) ships FP8 × FP8 → BF16/F32 Tensile kernels with scalar (`SAB`) and per-row/column vector (`SABV`) scales, but no BF16 × FP8 mixed kernel and no block-scaled or microscaled variant; the pinned CK (`therock-7.14.1`) has `ck_tile` `gemm_quant` (`TensorQuant`, `RowColQuant`, `AQuantGrouped`, `BQuantGrouped`, `ABQuantGrouped`, a microscale pipeline, some with WMMA policies) and FP8 hooks in the paged / split-KV FMHA kernels; whether any of them builds and is correct on `gfx1201` is what the reuse evaluations of the plan establish.
+
+**1. Order of the sub-steps.** The kickoff listed weights → FP8 KV → TurboQuant → per-tier formats → YaRN → ladder.
+
+- A) As listed
+- B) Foundations → weights (fp8, fp8_block, INT4, MXFP4) → FP8 KV in L0 → YaRN → per-tier formats (first with `fp8_e4m3` as the lower-tier format) → TurboQuant (a registered codec plugged into the per-tier path) → ladder. Reason: TurboQuant in Phase 6 is a lower-tier storage format (question 11), so it needs the per-tier transcoding path first; proving that path with FP8 (a cheap, well-understood codec) separates plumbing bugs from codec bugs. YaRN is small and independent and changes the prefix namespace, so it lands before the per-tier identity rework (recommended)
+- C) YaRN first (smallest, and Phase 7 depends on it), then B's order
+
+**2. FP8 weight arithmetic (`fp8`).** No BF16 × FP8 kernel exists in hipBLASLt on `gfx1201`; FP8 × FP8 does.
+
+- A) W8A8 following the checkpoint: activations quantized to FP8 e4m3 per the checkpoint's `input_activations` (static per-tensor scale, or dynamic per-token), then hipBLASLt FP8 × FP8 → BF16 with the weight's per-tensor or per-channel scale; a checkpoint without an activation scheme runs W8A16 through a dequantize path. Same arithmetic the checkpoint was calibrated for, and what vLLM runs (recommended)
+- B) W8A16 always: dequantize FP8 weights to BF16 inside the GEMM (needs a dequant kernel — CK or own); decode gains the bandwidth, prefill runs at BF16 speed
+- C) Both, selectable with a configuration key
+
+**3. `fp8_block` kernel fallback.** Block-scaled FP8 (128 × 128 weight blocks, per-token groups of 128 activations) has no hipBLASLt kernel; the plan evaluates CK `ABQuantGrouped` first.
+
+- A) If CK does not work on `gfx1201`: W8A16 for `fp8_block` through a dequantize-to-BF16 path (CK, llama.cpp-style, or own — each own kernel recorded by the reuse rule) (recommended)
+- B) If CK does not work: `fp8_block` stays `experimental` and the phase continues
+- C) Write an own block-scaled FP8 WMMA kernel
+
+**4. Proof checkpoints for `fp8`, `fp8_block`, `awq_int4`, `gptq_int4`** (all `LlamaForCausalLM` Llama-3.2-3B-Instruct, ungated, revisions read 2026-09-28; no quantized OLMoE checkpoint exists).
+
+- A) `fp8`: `RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic` @ `c308a86de78778c5f904a1d82401ac85e18ca205` (compressed-tensors, per-channel weights, dynamic per-token activations, 4.4 GB) as the gate, plus `RedHatAI/Llama-3.2-3B-Instruct-FP8` @ `377571d314b30f1d58448499e4100e2deafe7d7d` (per-tensor weights, static per-tensor activations) for the per-tensor path; `fp8_block`: `unsloth/Llama-3.2-3B-Instruct-FP8-Block` @ `08cf804398b23fab4a1df02fbe8d4d5a11a800cc` (compressed-tensors 128 × 128 blocks, 3.6 GB); `awq_int4`: `casperhansen/llama-3.2-3b-instruct-awq` @ `272b3bde867b606760447deb9a4d2719fbdfd3ae` (AutoAWQ GEMM, zero points, group 128, 2.3 GB); `gptq_int4`: `shuyuej/Llama-3.2-3B-Instruct-GPTQ` @ `dd5a311f040728fbc612eb03c8dadfae0a90552f` (AutoGPTQ, symmetric, `desc_act: false`, group 128, Apache-2.0, 2.3 GB) (recommended)
+- B) As A, `fp8` with the dynamic checkpoint only
+- C) As A, `awq_int4` from `AMead10/Llama-3.2-3B-Instruct-AWQ` @ `df494d4903f031dadaeb40434529f1c01efcd130` (3.1 GB) instead
+
+The MXFP4 proofs are fixed: `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16` @ `14c3aca849a72df8fcc8b3a30ab8d9eed86ee646` (5.8 GB) and `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` @ `91925ffda6977d097354a99718a20e035f8af80a` (2.3 GB); the BF16 quality baseline for the 8B proof is `unsloth/Llama-3.1-8B-Instruct` @ `4699cc75b550f9c6f3173fb80f4703b62d946aa5` (ungated mirror of `meta-llama/Llama-3.1-8B-Instruct`, 16.1 GB) unless the user prefers the gated original.
+
+**5. Checkpoint containers per `weight_format`.**
+
+- A) `fp8` ← compressed-tensors `float-quantized` 8-bit with weight strategy `tensor` or `channel`, and HF/Quark `quant_method: fp8` without `weight_block_size`; `fp8_block` ← compressed-tensors weight strategy `block` [128, 128], and `quant_method: fp8` with `weight_block_size` [128, 128]; `awq_int4` ← `quant_method: awq`, `version: gemm`, 4 bits, with zero points; `gptq_int4` ← `quant_method: gptq` 4 bits with `desc_act: false`, and compressed-tensors `pack-quantized` 4-bit int group strategy (W4A16) without a non-trivial `g_idx`; MXFP4 as question 6. Act-order (`desc_act: true`, or a non-identity `g_idx`) is refused with reason `gptq_act_order` (recommended)
+- B) As A, plus act-order GPTQ (permute the weight's input dimension at load and the activation columns at run time)
+- C) As A, without compressed-tensors `pack-quantized` (AutoGPTQ containers only)
+
+**6. Support-matrix values for the three MXFP4 packagings.** The Quark proof is W4A4 (activation FP4 emulated) and may end `experimental` while compressed-tensors W4A16 ends `supported`, on the same architecture; one column value cannot hold both.
+
+- A) Two values: `mxfp4` (weight-only W4A16: compressed-tensors, OpenAI native, and Quark weight-only checkpoints) and `mxfp4_a4` (W4A4 checkpoints, activations quantize-dequantized to MXFP4 before a BF16 GEMM); this widens the umbrella's bounded `weight_format` set by one value, which amends `phase-6-8-expansion` Interfaces (recommended)
+- B) One `mxfp4` value; the Quark W4A4 checkpoint is refused by a separate refusal list (like `PARALLEL_REFUSALS`) until it passes
+- C) One value per packaging: `mxfp4_ct`, `mxfp4_openai`, `mxfp4_quark`
+
+**7. Quantized MoE experts and tensor parallelism.** No quantized OLMoE checkpoint exists; Phase 7 needs FP8 experts (Qwen3-MoE, Mixtral with TP 2) and MXFP4 experts (gpt-oss).
+
+- A) Phase 6 quantizes dense linear layers (attention and dense MLP projections) at tp 1 and under Phase 5 TP (scales sharded with their rows or columns; a block or group boundary that does not divide the shard is refused with `quant_shard_misaligned`), proven at tp 2 by the lab golden for `fp8` and `awq_int4`; quantized MoE expert GEMMs move to Phase 7 with the families that need them (recommended)
+- B) As A, plus quantized MoE experts proven on an OLMoE FP8 checkpoint quantized offline at fixture time (llm-compressor FP8-dynamic; test data, not a served format)
+- C) Phase 6 at tp 1 only; everything under TP moves to Phase 7
+
+**8. Golden references for quantized checkpoints.** The umbrella asks for the checkpoint's own reference output; transformers' AWQ/GPTQ/Quark integrations need extra packages that are mostly GPU-only.
+
+- A) A fixture script `scripts/golden/quant_reference.py` decodes the checkpoint's weights exactly (FP8 × scale, INT4 (q − zero) × scale, FP4 × 2^E8M0) into a temporary BF16 checkpoint and runs the existing transformers reference on it, with activation fake-quantization hooks for W8A8 (FP8 e4m3, the checkpoint's scheme) and W4A4 (MXFP4); the tolerance per slug is calibrated from transformers' own spread (`self_spread.py`, the OLMoE method); where the checkpoint's own integration runs on CPU (compressed-tensors FP8), one cross-check is recorded (recommended)
+- B) Capture the reference from vLLM-ROCm on the same checkpoint where it loads on `gfx1201`, transformers-dequant elsewhere
+- C) Each checkpoint's own transformers integration only; formats whose integration does not run are `experimental`
+
+**9. Accuracy gate for lossy formats.** The umbrella gate is GSM8K-200 accuracy within `quality.max_accuracy_drop` (default 0.01) of BF16. With 200 items one answer is 0.005, the paired noise is about ±0.02, and published 4-bit Llama-3.2-3B results lose 1–3 points on GSM8K, so a literal 0.01 against BF16 would likely fail every 4-bit weight format without a defect.
+
+- A) Weight formats: compared with the reference engine on the same checkpoint (vLLM-ROCm, where it loads the checkpoint on `gfx1201`) at 0.01; where it does not, compared with BF16 at a per-format drop recorded in `tests/eval/<slug>/gate.json` (provisional: FP8 0.02, INT4 and MXFP4 0.04), confirmed by the user at the track close. KV formats (FP8 KV, TurboQuant, the ladder): compared with the same weights at BF16 KV at 0.01 (recommended)
+- B) The umbrella literally: BF16 at 0.01 for everything; a format that fails stays `experimental`
+- C) As A, but the gate runs on the full GSM8K test split (1,319 items) to cut the noise
+
+**10. FP8 KV scales and attention.**
+
+- A) Per-layer K and V scales from the checkpoint (`kv_cache_scheme`, `k_scale` / `v_scale` tensors) when present, else 1.0 (vLLM's default); `kv.dtype: fp8_e4m3` must be set explicitly (nothing lossy by default); attention reads FP8 pages through the provider the evaluation picks (CK FMHA FP8 instances first, then an FP8-reading variant of the Turbine paged kernel) (recommended)
+- B) As A, but calibrate missing scales at warm-up on a fixed prompt set (deterministic, logged)
+- C) Per-block dynamic scales (`KvDtype::Fp8E4m3PerBlockScale`), computed at page write
+
+**11. Where TurboQuant runs in Phase 6.**
+
+- A) As a lower-tier storage format only (L1/L2, and ladder rungs there): encoded on the GPU at demotion, decoded to the L0 format on promotion; attention never reads it. L0 formats stay `bf16` / `fp8_e4m3`; TurboQuant attention and mixed-format attention are deferred to a later decision (recommended)
+- B) Also as an L0 format, decoded into a BF16 scratch before attention
+- C) Also as an L0 format with a native TurboQuant attention kernel
+
+**12. TurboQuant formats and bit widths.**
+
+- A) Two registered formats: `tq4` (K: 3-bit Lloyd–Max codebook for the rotated coordinates + 1-bit QJL residual sign, the paper's inner-product variant; V: 4-bit MSE codebook; one BF16 norm per token-head vector for K, V and the K residual; ≈ 4.4 bits per element) and `tq2` (K: 1-bit codebook + 1-bit QJL; V: 2-bit codebook; ≈ 2.4 bits); the rotation is a randomized Hadamard transform (random signs from a seed fixed per namespace, then the fast Walsh–Hadamard transform over `head_dim` = 128); the same widths for every layer (recommended)
+- B) As A, but keep the first and last two layers at FP8 in `tq2`
+- C) Three formats: `tq4`, `tq3` (3.5 bits, the paper's quality-neutral point) and `tq2`
+
+**13. Per-tier configuration and the recent window.**
+
+- A) `kv.cpu.format` and `kv.nvme.format` ∈ {`l0` (the L0 format, default), `fp8_e4m3`, `tq4`, `tq2`}; a tier may not hold a format more precise than the tier above it; the last `kv.lossless_tail_blocks` full blocks of a sequence (default 1) are demoted at the L0 format whatever the tier's format; a partial last block never leaves L0 (recommended)
+- B) As A, with the window in tokens (`kv.lossless_tail_tokens`, default 256)
+- C) No window: every demoted block takes the tier's format
+
+**14. Prefix identity of lossy blocks.** A block that passed through a lossy tier no longer holds the exact KV, and a block prefilled on top of it inherits the difference.
+
+- A) Lineage keys: a block keeps its exact key while any copy of it is exact; a lossy copy is filed under `lossy_key(key, format)`; a block computed on top of a lossy prefix is chained from the lossy parent key, so exact and lossy lineages never alias; a lookup takes the exact chain first and, unless the request opts out, continues on lossy keys; the format and the TurboQuant seed enter the key (recommended)
+- B) One key per block; locations carry a format tag; blocks computed on top of a lossy prefix are never published (no aliasing, less reuse)
+- C) One key per block with a format tag and no lineage (a child computed over lossy KV may be served to an exact request)
+
+**15. Per-request opt-out and reporting.**
+
+- A) Header `x-turbine-kv-lossy: deny` and config default `kv.lossy_reuse: allow|deny` (default `allow`); an opted-out request matches exact lineage only and recomputes the rest; every response reports `usage.prompt_tokens_details.lossy_cached_tokens` (Turbine extension, 0 when none) (recommended)
+- B) A body field instead of the header
+- C) Default `deny`: lossy reuse only for requests that ask for it
+
+**16. Lossy retrieve against recompute in the planner.**
+
+- A) A lossy block's retrieval cost is multiplied by `1 + penalty(format)` (provisional `fp8_e4m3` 0.1, `tq4` 0.5, `tq2` 1.0, config `kv.lossy_penalty`), so a lossy block is used only when clearly cheaper than recompute; every plan logs the penalty (recommended)
+- B) No penalty: transfer cost only
+- C) Lossy blocks used only at pressure ORANGE or worse
+
+**17. The ladder's trigger and bounds.**
+
+- A) Compress replaces a drop: when the policy would drop (not demote) a block from the lowest enabled tier, or that tier is above its high-water mark (0.95 used), the oldest, least-reusable blocks of that tier move one rung down (`l0` → `fp8_e4m3` → `tq4` → `tq2` → evict), then the next tier up once the lowest tier sits on one rung; new demotions into a tier take its current rung; at most 32 rewrites per reclaim tick, ticks ≥ 50 ms apart (the Phase 4 bounds); a tier's rung for new demotions steps back up only after it has stayed below 0.85 used for `reliability.pressure.deescalate_dwell`; compressed blocks are never upgraded; no compression while the pressure controller is GREEN (recommended)
+- B) Driven by the global pressure state only: YELLOW → new demotions at `fp8_e4m3`, ORANGE → `tq4` plus rewrites, RED → `tq2`
+- C) As A, and L0 joins now (needs mixed BF16/FP8 attention)
+
+**18. The "lossless" rung.**
+
+- A) The L0 format's bytes unchanged; no general-purpose compression in Phase 6 (recommended)
+- B) LZ4 on L2 slots at the lossless rung
+
+**19. YaRN proof and override.**
+
+- A) A `model.rope_scaling` configuration key (a mapping with HF's field names; replaces `config.json`'s `rope_scaling` and enters the model identity) serves Llama-3.2-3B-Instruct with `{rope_type: yarn, factor: 16.0, original_max_position_embeddings: 8192, beta_fast: 32, beta_slow: 1}`; the reference is transformers' native YaRN on a copy of the checkpoint with that `config.json`, over the 16 golden prompts plus one ≈ 12,000-token prompt; the attention factor (`mscale`) folds into the attention scale (`scale × mscale²`), so the RoPE ABI does not change; `truncate: false` (gpt-oss) is parsed and unit-tested (recommended)
+- B) As A with a Qwen3-style override (`factor: 4.0`, `original_max_position_embeddings: 32768`)
+- C) As A, but mscale scales the cos/sin tables through a new RoPE descriptor field (a minor ABI group), as transformers does
+
+**20. Performance targets** (novanas GPU 0, `lab-bench.sh`, Llama-3.2-3B, against the BF16 baseline of 855 tok/s at c16).
+
+- A) `fp8`: c16 tok/s ≥ 1.10 × BF16 and c1 ITL p50 ≤ 0.75 × BF16; `fp8_block`: c16 ≥ 1.0 ×; `awq_int4` / `gptq_int4` / `mxfp4` (on 3B-sized checkpoints): c1 ITL p50 ≤ 0.6 × BF16 and c16 tok/s ≥ 0.9 × BF16; where vLLM-ROCm serves the same checkpoint, Turbine c16 tok/s ≥ 0.9 × vLLM; FP8 KV: pool blocks ≥ 1.95 × BF16 KV and c16 tok/s ≥ 0.95 × BF16 KV; `tq4` in L1: L1 blocks per GiB ≥ 3.5 × `l0`, and multi-turn `mt_cached` not below the `l0` run; the ladder: `scripts/overload-soak.sh novanas --duration 10m` passes with a small L1/L2 (recommended)
+- B) No hard targets; record the numbers and decide at the track close
