@@ -30,12 +30,17 @@
 #                      tp 2 in local mode (golden c1 and c16; Task 29: an OLMoE tp 1 capture on
 #                      device 0 first, the tp 2 run also compared with it — informational — and
 #                      p10 position by position), then Llama in static mode (ranks
-#                      0 and 1, leader 127.0.0.1:18100; golden c1 and c16), then again in
-#                      static mode with every rank's own KV tiers on a small L0 (Task 30: the
-#                      Phase 4 multi-turn load — 8 sessions × 4 turns, 400 shared words,
-#                      session hints — needs cached_tokens_ratio > 0; golden c1 against the
-#                      one-GPU capture). Prints one `tp-bench <run> tok/s=… ttft_p50_ms=…
-#                      itl_p50_ms=…` line per bench run and one `tp-multiturn …` line.
+#                      0 and 1, leader 127.0.0.1:18100; golden c1 and c16), then the KV-tier
+#                      legs (Task 30) on a small L0 with the step-time-drift thresholds raised:
+#                      tp 1 on device 0, tp 2 local and tp 2 static (every rank its own tiers)
+#                      each run the Phase 4 multi-turn load (8 sessions × 4 turns, 400 shared
+#                      words, session hints; cached_tokens_ratio > 0), 48 one-off prompts and
+#                      the multi-turn load replayed (cached_tokens_ratio > 0, 0 bytes in flight
+#                      after idle); tp 1 and local must promote, static must reuse and promote
+#                      as local does within one block; golden c1 against the one-GPU capture
+#                      on the tiered static group. Prints one `tp-bench <run> tok/s=…
+#                      ttft_p50_ms=… itl_p50_ms=…` line per bench run and `tp-multiturn …`,
+#                      `tp-tiers …` lines.
 #                      2-GPU numbers are "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)". Every tp 2
 #                      golden takes the TP rule (user decision "P5: tensor-parallel accuracy gate
 #                      against the one-GPU capture"): batched bounds at c1 and c16 against a
@@ -134,6 +139,10 @@ job_fail() {
 	local f
 	for f in "${WORK:-/nonexistent}"/*.log; do
 		[[ -f $f ]] || continue
+		echo "lab-info: warnings, errors and circuit or pressure changes in ${f##*/}"
+		sed 's/\x1b\[[0-9;]*m//g' "$f" |
+			grep -E ' (WARN|ERROR) |circuit_(transition|state)|pressure_transition' |
+			tail -n 20 | sed "s/^/  ${f##*/}: /" || true
 		echo "lab-info: last lines of ${f##*/}"
 		tail -n 40 "$f" | sed "s/^/  ${f##*/}: /"
 	done
@@ -425,43 +434,130 @@ scenario_tp2() {
 	gate_vs_capture llama-3.2-3b-instruct "${WORK}/llama-tp1-capture.jsonl" "llama tp2 static"
 	collective_report tp2-static
 	stop_servers
-	static_tiers_leg "$llama" "${static[@]}"
+	tiers_legs "$llama" "${static[@]}"
 	if [[ ${#GATE_FAILED[@]} -gt 0 ]]; then
 		job_fail "outside tolerance: ${GATE_FAILED[*]}"
 	fi
 }
 
-# static_tiers_leg <config> [--set k=v]...: Llama at tp 2 in static mode with every rank's own
-# KV tiers (plan Task 30): a small L0 (512 MiB per rank: 73 blocks, one 4096-token sequence at
-# least as model.max_seq_len 4096 needs; 16 running requests), one 1 GiB L1 slab
-# per rank and each rank's L2 under ${WORK}/kv-static/rank-<r>, so the Phase 4 multi-turn load
-# demotes and promotes. Requires cached_tokens_ratio > 0 and requests_ok of every turn; then
-# golden c1 against the one-GPU capture on the same (tiered) group. Prints the leader's tier
-# counters and one `tp-multiturn tp2-static-tiers …` line.
-static_tiers_leg() {
-	local config="$1"
-	shift
-	local tiers=(--set kv.gpu.max_bytes=512MiB --set model.max_seq_len=4096
+# The KV-tier settings of the tiers legs (plan Task 30): a small L0 (1 GiB per tp 2 rank, 2 GiB
+# at tp 1: 146 blocks either way, as a 73-block tp 1 L0 reads the flood as SURVIVAL;
+# model.max_seq_len 4096, one sequence of which needs 32; 16 running requests), L1 2 GiB (one
+# 1 GiB slab per tp 2 rank), L2 4 GiB under ${WORK}/kv-<leg>, and the step-time-drift thresholds of the pressure
+# controller and of the circuit breaker raised (pressure 100/200/300, circuit 100/200): tp 2
+# prefill under the flood below drifts past the RED threshold (3.0), where Phase 4 plans no
+# promotion (`l0_pressure`), and past the circuit's 4.0 without the throttle. The standard legs
+# keep the defaults.
+tiers_settings() {
+	# tp 1 holds whole blocks (14 MiB), a tp 2 rank half of each: the same 146 blocks per tier.
+	local gpu=1GiB
+	[[ $1 == tp1 ]] && gpu=2GiB
+	TIERS_SETTINGS=(--set "kv.gpu.max_bytes=${gpu}" --set model.max_seq_len=4096
 		--set scheduler.max_running_requests=16
 		--set kv.cpu.enabled=true --set kv.cpu.max_bytes=2GiB --set kv.nvme.enabled=true
-		--set "kv.nvme.path=${WORK}/kv-static" --set kv.nvme.max_bytes=4GiB)
-	start_server "${WORK}/tp2-static-tiers-rank1.log" "$config" "$@" "${tiers[@]}" \
-		--set parallel.ranks.rank=1 --set "parallel.ranks.local_devices=[1]" \
-		--set server.listen=127.0.0.1:18001
-	start_server "${WORK}/tp2-static-tiers-rank0.log" "$config" "$@" "${tiers[@]}" \
-		--set parallel.ranks.rank=0 --set "parallel.ranks.local_devices=[0]"
-	wait_ready "$URL" "${WORK}/tp2-static-tiers-rank0.log"
-	grep -h -E '"event":"(kv_hierarchy_ready|kv_rank_tiers_ready|kv_tier_unavailable_on_rank)"|event=(kv_hierarchy_ready|kv_rank_tiers_ready|kv_tier_unavailable_on_rank)' \
-		"${WORK}"/tp2-static-tiers-rank*.log | sed 's/^/lab-info: /' || true
-	local out="${WORK}/tp2-static-tiers-multiturn.json"
+		--set "kv.nvme.path=${WORK}/kv-$1" --set kv.nvme.max_bytes=4GiB
+		--set "reliability.pressure.thresholds.step_time_drift=[100.0, 200.0, 300.0, null]"
+		--set reliability.circuit.latency_drift_degraded=100.0
+		--set reliability.circuit.latency_drift_open=200.0)
+	echo "lab-info: tiers leg $1: step-time-drift thresholds raised (pressure 100/200/300, circuit 100/200)"
+}
+
+# kv_counter <series>: the leader's value of one Prometheus series (0 when absent).
+kv_counter() {
+	curl -s "${URL}/metrics" | awk -v s="$1" '$1 == s { v = $2 } END { print v + 0 }'
+}
+
+# kv_report <label>: the leader's KV document (tiers, hit rate, transfers) and plan, lookup,
+# eviction and drop counters, for the record.
+kv_report() {
+	curl -s "${URL}/turbine/v1/kv" | jq -c . | cut -c1-3000 | sed "s/^/tp-kvdoc $1 /" || true
+	curl -s "${URL}/metrics" |
+		grep -E '^turbine_kv_(plans|lookups|evictions|drops|recompute_tokens)_total' |
+		sed "s/^/tp-kv $1 /" || true
+}
+
+# kv_cached_tokens: the leader's cached prompt tokens (the KV document's hit-rate window).
+kv_cached_tokens() {
+	curl -s "${URL}/turbine/v1/kv" | jq -r '.hit_rate.cached_tokens // 0'
+}
+
+# tiers_workload <leg>: the tiers legs' workload on the running server (plan Task 30):
+# the Phase 4 multi-turn run (8 sessions × 4 turns, 400 shared words, session hints, 4 at once),
+# 48 one-off prompts that push its blocks out of the 146-block L0 (capacity demotion copied them
+# to L1), then the multi-turn run replayed (same seed, same prompts: its prefixes come back
+# from L1, or L2), and after a short idle nothing may stay in flight. Prints one
+# `tp-tiers <leg> …` line; the parity check compares the legs' lines.
+tiers_workload() {
+	local leg="$1"
+	local out="${WORK}/tiers-${leg}-multiturn.json" replay="${WORK}/tiers-${leg}-replay.json"
 	bench_ok 32 "$out" --profile multi-turn --sessions 8 --turns 4 --shared-prefix-words 400 \
 		--session-hints --concurrency 4
-	jq -r '"tp-multiturn tp2-static-tiers cached_tokens_ratio=\(.cached_tokens_ratio) ttft_first_p50_ms=\(.ttft_ms_first_turn.p50 // "?") ttft_later_p50_ms=\(.ttft_ms_later_turns.p50 // "?") requests_ok=\(.requests_ok)"' \
+	jq -r --arg l "$leg" '"tp-multiturn \($l) cached_tokens_ratio=\(.cached_tokens_ratio) ttft_first_p50_ms=\(.ttft_ms_first_turn.p50 // "?") ttft_later_p50_ms=\(.ttft_ms_later_turns.p50 // "?") requests_ok=\(.requests_ok)"' \
 		"$out"
-	curl -s "${URL}/metrics" | grep -E '^turbine_kv_(demotions|promotions|drops)_total' |
-		sed 's/^/tp-kv tp2-static-tiers /' || true
+	local series=(
+		'turbine_kv_demotions_total{from="l0",to="l1"}' 'turbine_kv_demotions_total{from="l1",to="l2"}'
+		'turbine_kv_promotions_total{from="l1",to="l0"}' 'turbine_kv_promotions_total{from="l2",to="l1"}'
+		'turbine_kv_promotions_total{from="l2",to="l0"}'
+	)
+	local before=() i
+	for i in "${!series[@]}"; do before[i]="$(kv_counter "${series[i]}")"; done
+	kv_report "${leg}-before-flood"
+	bench_ok 48 "${WORK}/tiers-${leg}-flood.json" --prompt-words 512 --max-tokens 64 \
+		--concurrency 4 --requests 48 --seed 7
+	kv_report "${leg}-after-flood"
+	local cached_before
+	cached_before="$(kv_cached_tokens)"
+	bench_ok 32 "$replay" --profile multi-turn --sessions 8 --turns 4 --shared-prefix-words 400 \
+		--session-hints --concurrency 4
+	local cached_replay=$(($(kv_cached_tokens) - cached_before))
+	sleep 3
+	kv_report "${leg}-after-replay"
+	local inflight
+	inflight="$(curl -s "${URL}/turbine/v1/kv" | jq -r '.transfers.inflight_bytes // -1')"
+	local delta=()
+	for i in "${!series[@]}"; do delta[i]=$(($(kv_counter "${series[i]}") - before[i])); done
+	local promoted=$((delta[2] + delta[3] + delta[4]))
+	echo "tp-tiers ${leg} demoted_l0_l1=${delta[0]} demoted_l1_l2=${delta[1]} promoted_l1_l0=${delta[2]} promoted_l2_l1=${delta[3]} promoted_l2_l0=${delta[4]} promoted=${promoted} replay_cached_tokens=${cached_replay} replay_cached_ratio=$(jq -r '.cached_tokens_ratio' "$replay") inflight_after_idle=${inflight}"
 	jq -e '(.cached_tokens_ratio // 0) > 0' "$out" >/dev/null ||
-		GATE_FAILED+=("multi-turn tp2 static tiers cached_tokens_ratio not > 0")
+		GATE_FAILED+=("tiers ${leg}: first multi-turn run cached_tokens_ratio not > 0")
+	jq -e '(.cached_tokens_ratio // 0) > 0' "$replay" >/dev/null ||
+		GATE_FAILED+=("tiers ${leg}: replay cached_tokens_ratio not > 0")
+	[[ $inflight == 0 ]] || GATE_FAILED+=("tiers ${leg}: ${inflight} bytes still in flight after idle")
+	TIERS_PROMOTED[$leg]=$promoted
+	TIERS_REPLAY_CACHED[$leg]=$cached_replay
+}
+
+declare -A TIERS_PROMOTED=() TIERS_REPLAY_CACHED=()
+
+# tiers_legs <config> <static args>...: the tiers workload on tp 1 (device 0), tp 2 local and
+# tp 2 static (plan Task 30 and its follow-up): tp 1 and local must promote (> 0), else the
+# scenario does not exercise promotion; static must reuse and promote as local does, within one
+# block (block_tokens = 128; the copy timing of the two modes differs by an engine turn); then
+# golden c1 against the one-GPU capture on the tiered static group.
+tiers_legs() {
+	local config="$1"
+	shift
+	tiers_settings tp1
+	start_server "${WORK}/tiers-tp1.log" "$config" "${TIERS_SETTINGS[@]}" \
+		--set parallel.tensor_parallel_size=1 --set "parallel.devices=[0]"
+	wait_ready "$URL" "${WORK}/tiers-tp1.log"
+	tiers_workload tp1
+	stop_servers
+
+	tiers_settings local
+	start_server "${WORK}/tiers-local.log" "$config" "${TIERS_SETTINGS[@]}"
+	wait_ready "$URL" "${WORK}/tiers-local.log"
+	tiers_workload local
+	stop_servers
+
+	tiers_settings static
+	start_server "${WORK}/tiers-static-rank1.log" "$config" "$@" "${TIERS_SETTINGS[@]}" \
+		--set parallel.ranks.rank=1 --set "parallel.ranks.local_devices=[1]" \
+		--set server.listen=127.0.0.1:18001
+	start_server "${WORK}/tiers-static-rank0.log" "$config" "$@" "${TIERS_SETTINGS[@]}" \
+		--set parallel.ranks.rank=0 --set "parallel.ranks.local_devices=[0]"
+	wait_ready "$URL" "${WORK}/tiers-static-rank0.log"
+	tiers_workload static
 	# A TP leg: batched bounds against the one-GPU capture (user decision, follow-up (a)).
 	echo "lab-step: golden llama tp2 static tiers c1 vs 1 GPU (batched bounds)"
 	"${BIN}/turbine-golden" compare --url "$URL" \
@@ -469,9 +565,20 @@ static_tiers_leg() {
 		--tolerance tests/golden/llama-3.2-3b-instruct/tolerance.json \
 		--prompts tests/golden/prompts.jsonl --concurrency 1 --batched-bounds ||
 		GATE_FAILED+=("golden llama tp2 static tiers c1 vs 1 GPU")
-	curl -s "${URL}/metrics" | grep -E '^turbine_kv_(demotions|promotions)_total' |
-		sed 's/^/tp-kv tp2-static-tiers-after-golden /' || true
 	stop_servers
+
+	local leg
+	for leg in tp1 local; do
+		((TIERS_PROMOTED[$leg] > 0)) ||
+			GATE_FAILED+=("tiers ${leg}: no promotion (the scenario does not exercise the tiers)")
+	done
+	local dp=$((TIERS_PROMOTED[static] - TIERS_PROMOTED[local]))
+	local dc=$((TIERS_REPLAY_CACHED[static] - TIERS_REPLAY_CACHED[local]))
+	echo "tp-tiers parity static-local promoted_diff=${dp} replay_cached_tokens_diff=${dc}"
+	((dp >= -1 && dp <= 1)) ||
+		GATE_FAILED+=("tiers static promotes ${TIERS_PROMOTED[static]} blocks, local ${TIERS_PROMOTED[local]}")
+	((dc >= -128 && dc <= 128)) ||
+		GATE_FAILED+=("tiers static reuses ${TIERS_REPLAY_CACHED[static]} tokens in the replay, local ${TIERS_REPLAY_CACHED[local]}")
 }
 
 # The tp 2 A/B variant (P5 Task 32): an uncommitted scripts/lab/tp2-variant.local in the uploaded
