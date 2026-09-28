@@ -623,6 +623,15 @@ Interfaces:
 
 Owner: the tp-perf agent. May land inside Phase 5 if quick; otherwise a tracked Phase 5p item — the Phase 5 exit does not wait for it.
 
+## P5 exit: as built (tp-perf final report, 2026-09-28)
+
+- Task 32 (a) decode graphs under TP: 911 → 895 tok/s, ITL 11.84 → 11.52 ms; kept off (`parallel.tp_decode_graphs: false`).
+- Task 32 (b) copy-engine all-reduce: capped by host traffic (~9.4 GB/s per rank one-way, ~15 GB/s aggregate); kept off (`parallel.collective.hostmem_dma_min_bytes: null`).
+- Task 32 (c) prefill overlap: +10.2 % tok/s, −38 % TTFT at tp 2 (Llama c16).
+- Task 34 (119e5fb, was 480256f): the overlapped prefill splits at a sequence start or a KV block boundary (`overlap_split_row`); no GEMM rows were needed (the cause was CK paged prefill's q-tile alignment). Evidence: run 0928165853-0f5d9239 — `tp_overlap_lab` exact for 256–640 rows on both ranks, `kv_gpu` 4/4 including the `*_tp2_overlap` tests and `prefix_reuse_suffix_lengths_match_cold_tp2`.
+- Pageable device-to-host corruption: the pinned bounce buffer (30e763e), the pageable-copy guard (92085ed), `no_native_stream` (2a17762), `parallel.collective.verify` (b38ec2b). Proof: stress 221,000 outputs / 0 mismatches; tp2, pp2, dp2 PASS; ep2 PASS apart from the refused OLMoE ep × tp; tp2 with verify on ~657,000 collectives cross-checked, no failed step. Upstream: ROCm/clr#291.
+- Open: one unnamed gate failure before 480256f did not recur in 7 clean gates; the gate now keeps its log (`target/gate/<ts>.log`, `log=` on FAIL).
+
 ## Task 35: vLLM-ROCm baselines for the two-GPU modes
 
 Files: `scripts/lab/novanas-vllm-job.yaml` (a two-GPU variant, same pinned `rocm/vllm` tag), `scripts/lab-serve.sh` (`--vllm` GPU count and extra vLLM arguments), `benches/turbine-bench/tests/lab_scripts.rs` (dry-run checks of the two-GPU Job)
