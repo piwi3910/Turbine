@@ -1316,3 +1316,15 @@ The user asked for YaRN (RoPE context extension: per-dimension frequency interpo
 After a survey of KV quantization methods (FP8/INT8, KIVI 2-bit, KVQuant, QJL, TurboQuant, rotation + 4-bit, MXFP4/NVFP4 KV; token-dropping methods excluded because they change outputs), the recommendation was: FP8 e4m3 KV stays the Phase 6 baseline; the first sub-8-bit KV format is TurboQuant (random rotation + optimal per-coordinate scalar quantizer + 1-bit QJL residual, calibration-free, ~3.5 bits reported quality-neutral), with KIVI-style 2-bit later if TurboQuant's kernel works out.
 
 **Answer (2026-09-28, user): agree.** Sub-8-bit KV formats are lossy, so they're gated like lossy weights (eval accuracy within `quality.max_accuracy_drop`, not only golden). Each is a registered `kv_format` entry, following the reuse-first rule: check CK, llama.cpp's HIP flash-attention with q8_0/q4_0 KV, and vLLM's FP8 KV before writing our own attention kernel. The phase-6 spec decides whether TurboQuant sits at the end of Phase 6 or in a small phase right after it.
+
+## Sub-8-bit KV and per-tier KV formats in Phase 6 (2026-09-28)
+
+After the per-tier discussion (different KV formats per tier: L0 BF16/FP8 for attention speed, L1 ~4-bit for capacity and the ~12 GB/s host link, L2 2–4-bit plus lossless compression; quantize on the GPU during demotion; keep the recent window precise; retrieve vs recompute weighs quality):
+
+**Answer (2026-09-28, user): add it to Phase 6.** This supersedes the "end of Phase 6 or a small phase after" placement in the previous entry. TurboQuant and per-tier formats are both in `phase-6-quantization` scope (umbrella S-6 amended). Open for the phase-6 spec, with recommendations:
+
+- promotion: unpack to the L0 format first; mixed-format attention later;
+- K and V bit widths per format;
+- per-layer precision;
+- a per-request opt-out of lossy reuse (recommended: yes);
+- kernel providers under the reuse-first rule.
