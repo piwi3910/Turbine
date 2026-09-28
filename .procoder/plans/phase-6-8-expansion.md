@@ -1,29 +1,34 @@
-# phase-8-expansion — implementation plan
+# phase-6-8-expansion — implementation plan
 
 Status: draft
-Spec: .procoder/specs/phase-8-expansion.md
+Spec: .procoder/specs/phase-6-8-expansion.md
+
+Renamed from `phase-8-expansion` and amended on 2026-09-28 with its spec (decision "Roadmap reorganisation after Phase 5 (2026-09-28)" in `.procoder/ask/decisions.md`): the tracks are now `phase-6-quantization`, `phase-7-model-families` and `phase-8-speculative-decoding`, in that order, AMD (`novanas`) only. In the code and in older docs "P8a" means phase-6-quantization, "P8c" phase-7-model-families and "P8b" phase-8-speculative-decoding; test modules named `phase8_…` keep their names.
+
+State on main (2026-09-28): Tasks 2, 3, 4 and 7 landed in Phase 2m (S-11, from `runahead/p8-umbrella`); their text stays as the record of what was built. Tasks 1, 5, 6 and 8 exist only on `runahead/p8-umbrella` and are ported (Task 8 with the amended gate below) before Task 9 when phase 6 starts. Tasks 9–12 run once per track.
 
 ## Goal
 
-Deliver the mechanisms every Phase 8 track shares — the support matrix with startup refusal, the `turbine-golden eval`/`eval-compare` quality gate and its committed GSM8K task set, the vendor-neutrality guard, and the scripted track-start gate and track-close procedure — so that `phase-8a-quantization`, `phase-8b-speculative-decoding` and `phase-8c-model-families` can each be specified, gated and closed in order without re-deciding shared rules.
+Deliver the mechanisms every Phase 6–8 track shares — the support matrix with startup refusal, the `turbine-golden eval`/`eval-compare` quality gate and its committed GSM8K task set, the vendor-neutrality guard, and the scripted track-start gate and track-close procedure — so that `phase-6-quantization`, `phase-7-model-families` and `phase-8-speculative-decoding` can each be specified, gated and closed in order without re-deciding shared rules.
 
 ## Architecture
 
-`turbine_core::support` holds the static `SUPPORT_MATRIX` table and its resolution rules (most specific row wins; `--check-config` resolves with unknown device columns); `turbine-server` prints it (`--support-matrix`), resolves it under `--check-config` (exit 2) and at startup step 3 after discovery (exit 1, WARN for experimental), puts the resolved row under `support` in `GET /turbine/v1/status` and sets `turbine_support_matrix_status{status}` through `turbine_api::support::SupportMetrics`. `turbine-bench` gains `golden::eval` behind `turbine-golden eval`/`eval-compare` plus the committed `tests/eval/gsm8k-200.jsonl`; `turbine-kernels/tests/vendor_neutral_api.rs` parses the five core crates with `syn` and rejects vendor type paths in public signatures. Track sequencing is enforced by `scripts/phase8-track-gate.sh` (previous track closed per the support matrix, track spec COMPLETE and inside the umbrella scope) and a per-track close runbook (Task 10); the track contents themselves are planned by each track's own plan.
+`turbine_core::support` holds the static `SUPPORT_MATRIX` table and its resolution rules (most specific row wins; `--check-config` resolves with unknown device columns); `turbine-server` prints it (`--support-matrix`), resolves it under `--check-config` (exit 2) and at startup step 3 after discovery (exit 1, WARN for experimental), puts the resolved row under `support` in `GET /turbine/v1/status` and sets `turbine_support_matrix_status{status}` through `turbine_api::support::SupportMetrics`. `turbine-bench` gains `golden::eval` behind `turbine-golden eval`/`eval-compare` plus the committed `tests/eval/gsm8k-200.jsonl`; `turbine-kernels/tests/vendor_neutral_api.rs` parses the five core crates with `syn` and rejects vendor type paths in public signatures. Track sequencing is enforced by `scripts/track-gate.sh` (previous track closed per the support matrix, track spec COMPLETE and inside the umbrella scope) and a per-track close runbook (Task 10); the track contents themselves are planned by each track's own plan.
 
 ## Constraints
 
-From the spec (verbatim):
+From the spec (verbatim, as amended 2026-09-28):
 
-- Rust only in the serving path; no Python at runtime (TS §21 rule 4). Python is allowed only at fixture-generation time (HF transformers dumps, reference-runtime captures), never in a build or test that `cargo test` runs. Vendor libraries are loaded at runtime through the prebuilt kernel libraries (_libturbine_hip.so_, _libturbine_cuda.so_, CMake-built), never linked by Cargo, so the workspace still builds and every non-ignored test passes on macOS arm64 with no GPU libraries.
-- `unsafe` stays in `turbine-device`, `turbine-kernels` and the Phase 7 transport module.
-- The kernel C ABI is shared by both vendors' libraries; any additive change bumps `turbine_abi_version` for both together.
+- Rust only in the serving path; no Python at runtime (TS §21 rule 4). Python is allowed only at fixture-generation time (HF transformers dumps, reference-runtime captures, an offline-quantized fixture checkpoint), never in a build or test that `cargo test` runs. Vendor libraries are loaded at runtime through the prebuilt kernel library (_libturbine_hip.so_, CMake-built), never linked by Cargo, so the workspace still builds and every non-ignored test passes on macOS arm64 with no GPU libraries.
+- `unsafe` stays in the allowlisted locations: `turbine-device`, `turbine-kernels`, `turbine-distributed/src/collective/ffi` (Phase 5), and `turbine-transport/src/rdma` once the deferred phase-10 adds it (CONFLICT C-19).
+- The kernel C ABI stays vendor-neutral: every addition is an optional minor group resolved at load time (decisions "Phase 4: kernel ABI v2.5 instead of v3" and "P5 T6"), specified so a CUDA library can implement it when phase-2b is re-specced.
 - Every lossy format or lossy KV transform ships with its quality gate (TS §8, S-3); nothing lossy is enabled by default unless the checkpoint itself is stored in that format.
 - Bounded inputs (TS §16, §21 rule 8): speculative k ≤ 8; draft-model memory is reserved through the Phase 3 budget before speculation is enabled.
-- Model weights live in `/home/piwi/turbine-models/<slug>` on each host, downloaded by Claude with the user's HF token at that time (never stored in the repo); tests read `TURBINE_TEST_MODEL_DIR` and never download.
-- **Host workloads:** any lab run that needs production workloads (production vLLM on the Sparks, anything using the R9700 cards on `novanas`) moved or memory freed on any host is started only after the implementer has asked the user and the user has moved the workloads; the implementer never stops, moves or reconfigures production workloads itself. Reference-engine captures for a checkpoint other than the one production serves use a temporary container named `turbine-ref-*` within the free memory measured at run start, removed afterwards.
-- Lab hosts: `novanas` (192.168.10.203), 2× Radeon AI PRO R9700 (`gfx1201`, 32 GB each), ROCm 7.14.1 at `/opt/rocm/rocm`, k3s Jobs requesting `amd.com/gpu`, 10 GbE; `dgx-spark` (192.168.10.246) and `dgx-spark2` (192.168.10.245), 1× GB10 (`sm_121`) each, ~121 GB unified memory, Docker, RoCE between them. Families that do not fit one device (e.g. Mixtral in BF16) rely on Phase 5 TP or Phase 7 PP/EP, or on an in-scope quantized checkpoint; the track 3 spec states which per family.
-- Cached checkpoints that define the quantization scope (from their _config.json_, verified 2026-09-25): `nvidia/Qwen3.6-35B-A3B-NVFP4` (`qwen3_5_moe`, modelopt mixed precision, FP8 KV); `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` (`qwen3_5` dense hybrid, modelopt); `RadixArk/Qwen3.8-Flash-Next-NVFP4` (`qwen4_exp`, 126 GB — does not fit one Spark); `YourHighnessLA/Qwen3.8-27B-DFlash2-NVFP4` (compressed-tensors `nvfp4-pack-quantized`).
+- Model weights live in `/home/piwi/turbine-models/<slug>` on `novanas`, fetched over SSH with the user's HF login there (never stored in the repo); tests read `TURBINE_TEST_MODEL_DIR` and never download.
+- **Host workloads:** any lab run that needs workloads moved or memory freed on `novanas` is started only after the implementer has asked the user and the user has moved the workloads; the implementer never stops, moves or reconfigures someone else's workload. Reference-engine runs use `scripts/lab-serve.sh novanas --vllm <slug>` (vLLM-ROCm, port 18100).
+- Lab host: `novanas` (192.168.10.203), 2× Radeon AI PRO R9700 (`gfx1201`, 32 GB each, native FP8 WMMA, no FP4 matrix path), ROCm 7.14.1 at `/opt/rocm/rocm`, k3s Jobs requesting `amd.com/gpu`; perf numbers on GPU 0 only. The Sparks are not used by Phases 6–8. Families that do not fit one card rely on Phase 5 TP over both cards and an in-scope quantized checkpoint (e.g. Mixtral-8x7B: ≈ 93 GB in BF16, ≈ 47 GB in FP8, so FP8 + TP 2); the track 2 spec states which per family.
+- Questions the track specs must answer (inputs, not decided here): (a) the hybrids' cached checkpoints are NVFP4 (listed below), so `phase-7-model-families` needs FP8 or BF16 checkpoints of them — Qwen3.6-35B-A3B needs FP8 + TP 2 or similar to fit 2 × 32 GB; (b) `phase-6-quantization` proves each format on Llama-3.2-3B or OLMoE where such checkpoints exist and names them (e.g. RedHatAI / neuralmagic FP8, AWQ and GPTQ Llama-3.2-3B checkpoints); (c) MXFP4 checkpoints may exist only for gpt-oss, whose family arrives in track 2 — the `phase-6-quantization` spec chooses between an MXFP4 fixture checkpoint of a registered architecture quantized offline (a Python quantizer at fixture-generation time only) and proving MXFP4 in track 2 with gpt-oss-20b (the `mxfp4` row then turns `supported` when track 2 closes).
+- Cached NVFP4 checkpoints (from their _config.json_, verified 2026-09-25), which defined the old Phase 8a scope and now belong to the deferred NVIDIA block: `nvidia/Qwen3.6-35B-A3B-NVFP4` (`qwen3_5_moe`, modelopt mixed precision, FP8 KV); `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` (`qwen3_5` dense hybrid, modelopt); `RadixArk/Qwen3.8-Flash-Next-NVFP4` (`qwen4_exp`, 126 GB); `YourHighnessLA/Qwen3.8-27B-DFlash2-NVFP4` (compressed-tensors `nvfp4-pack-quantized`).
 
 From the interface contract (`.procoder/contract/interfaces.md`, binding):
 
@@ -33,7 +38,7 @@ From the interface contract (`.procoder/contract/interfaces.md`, binding):
 - Validation order (§3.2/§16.3): static `validate()` (exit 2) → device discovery → `validate_host` → P5 parallel plan (exit 2) → **P8 support-matrix resolution** (exit 1 at startup / exit 2 under `--check-config`) → kernel library/model/budget (exit 1).
 - Tests: unit tests in `#[cfg(test)] mod tests`, addressed `cargo test -p <crate> <module>::tests::<name>`; integration tests `crates/<crate>/tests/<binary>.rs`, addressed `cargo test -p <crate> --test <binary> <name>`; anything needing a GPU, weights or a lab host is `#[ignore]` and runs via `scripts/lab-test.sh <host>`; non-ignored tests pass on macOS arm64 with no GPU libraries and no weights. Phase-8 additions to an existing integration-test file go into their own `mod phase8_…` block so they never collide with earlier helpers or imports (the `--test <binary> <name>` filter still matches).
 - Gate after every task: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`, then `cargo test --workspace`.
-- Lab rules (§21.1): no `docker run` outside the defined lab scripts; scripts never stop/restart/reconfigure non-`turbine-lab-*` workloads; any run needing production workloads moved or memory freed is asked of the user first; Spark correctness runs proceed after the MemAvailable precondition, benchmark/soak/overload runs always ask.
+- Lab rules (§21.1): no `docker run` outside the defined lab scripts; scripts never stop/restart/reconfigure non-`turbine-lab-*` workloads; any run needing workloads moved or memory freed is asked of the user first. Phases 6–8 use `novanas` only (the Spark rules apply again when phase-2b is re-specced).
 
 ## Task 1: `quality` and `speculative.method` configuration keys
 
@@ -44,7 +49,7 @@ Interfaces:
 - produces `#[serde(deny_unknown_fields, default)] pub struct QualityConfig { pub max_accuracy_drop: f64 }` (default 0.01)
 - produces `pub fn QualityConfig::validate(&self) -> Result<(), ConfigError>` (`ConfigError::Invalid { key: "quality.max_accuracy_drop", .. }` when not finite or outside 0..=0.1)
 - produces `#[non_exhaustive] #[serde(rename_all = "lowercase")] pub enum SpeculativeMethod { #[default] None, Draft }` + `pub fn as_str(self) -> &'static str` (`"none"`/`"draft"`)
-- produces `#[serde(deny_unknown_fields, default)] pub struct SpeculativeConfig { pub method: SpeculativeMethod }` (the phase-8b plan adds `num_tokens`, `draft_model_path`, `min_acceptance`)
+- produces `#[serde(deny_unknown_fields, default)] pub struct SpeculativeConfig { pub method: SpeculativeMethod }` (the phase-8-speculative-decoding plan adds `num_tokens`, `draft_model_path`, `min_acceptance`)
 - produces `Config.quality: QualityConfig` (`// P8`), `Config.speculative: SpeculativeConfig` (`// P8b reserved; P8 umbrella owns method`), both after `parallel` (contract §3.2 names); re-exported as `turbine_core::config::{QualityConfig, SpeculativeConfig, SpeculativeMethod}`
 - consumes P0 `ConfigError` (`key() -> Option<&str>`), `Config`, `Config::validate`
 
@@ -79,13 +84,15 @@ Interfaces:
 - produces `pub fn check(key: SupportKey) -> Result<SupportDecision, ConfigError>`, `pub fn check_in(table: &[SupportRow], key: SupportKey) -> Result<SupportDecision, ConfigError>`
 - produces `pub fn validate_table(table: &[SupportRow]) -> Result<(), String>`
 - produces `pub fn vendor_column(backend: ExecutionBackend) -> &'static str` (hip→amd, cuda→nvidia, cpu→cpu)
-- produces `pub fn config_columns(cfg: &Config) -> (WeightFormat, KvFormatColumn, SpeculativeColumn)` (phase-8a replaces the weight/KV derivation)
+- produces `pub fn config_columns(cfg: &Config) -> (WeightFormat, KvFormatColumn, SpeculativeColumn)` (phase-6-quantization replaces the weight/KV derivation)
 - consumes Task 1 `Config.speculative.method`, P0 `ConfigError::Invalid { key, reason }`, P1 `turbine_core::types::ExecutionBackend { Hip, Cuda, Cpu }`
 
 Covers: S-2 — `cargo test -p turbine-core support::tests::resolution_and_refusal`, `cargo test -p turbine-core support::tests::baseline_rows_present`.
 Depends on: Task 1; phase-1 (`ExecutionBackend`).
 
 Rows are added only by track plans once their exit gate passes (Task 10); a track replaces its `unsupported` refusal rows with validated rows and keeps `validate_table` green.
+
+Amended 2026-09-28 (a code change for the first task of the `phase-6-quantization` plan, not part of this plan's landed Task 2): the refusal reasons name the new tracks (`phase-6-quantization`, `phase-7-model-families`, `phase-8-speculative-decoding`); the four `nvidia`/`sm_121` baseline rows become `unsupported` with a reason naming the deferred `phase-2b-nvidia`; `WeightFormatColumn` gains `fp8`, `fp8_block`, `mxfp4`, `awq_int4`, `gptq_int4` with `unsupported` refusal rows; `baseline_rows_present` is updated in the same commit.
 
 - [ ] Write failing test `support::tests::resolution_and_refusal`: on a four-row test table (amd/* unsupported "amd needs a validated arch"; amd/gfx1201 supported; nvidia/sm_121 experimental; _/_/draft unsupported), `validate_table` passes; amd/gfx1201 resolves `Supported` (most specific wins) and amd/gfx1100 `unsupported`; `check_in` for amd/gfx1100 errors with text containing `amd needs a validated arch` and `vendor=amd arch=gfx1100`; nvidia/sm_121 passes with a `warning()` containing `experimental`, amd/gfx1201 has no warning; nvidia/sm_90 resolves with reason `no support-matrix row`; on the real table a draft key (full and partial with `WILDCARD` arch/architecture) fails with `key() == Some("speculative.method")` while partial amd/bf16/none checks `Supported`; two overlapping rows of equal specificity fail `validate_table` with `equal specificity`, a vendor `intel` row fails, and `validate_table(SUPPORT_MATRIX)` passes.
 - [ ] Write failing test `support::tests::baseline_rows_present`: for amd/gfx1201 and nvidia/sm_121 × `LlamaForCausalLM`/`OlmoeForCausalLM` (bf16, bf16, none) the most specific matching row has specificity 6 and resolves `Supported`; every `supported` row is bf16/bf16/none; every non-bf16 weight format on nvidia/sm_121, `fp8_e4m3` KV and `draft` resolve `unsupported`; every row's view uses only `VENDORS`/`ALL` values or `*`. Create `support.rs` with only the tests module and add `pub mod support;`. Run: `cargo test -p turbine-core support::` — expect FAIL ("cannot find").
@@ -220,115 +227,114 @@ Depends on: phase-1 (core crates exist), phase-5/phase-6 (`CollectiveBackendKind
 
 ## Task 8: Track start gate script
 
-Files: `scripts/phase8-track-gate.sh` (new, mode 755, bash 3.2-compatible: order + spec-check + scope checks), `benches/turbine-bench/tests/lab_scripts.rs` (append `mod phase8_track_gate_script`; `tempfile` dev-dep if absent), `AGENTS.md` (Commands: phase 8 entries).
+Files: `scripts/track-gate.sh` (new, mode 755, bash 3.2-compatible: order + spec-check + scope checks; ported from the run-ahead's `scripts/phase8-track-gate.sh` with the amended rules below), `benches/turbine-bench/tests/lab_scripts.rs` (append `mod track_gate_script`; `tempfile` dev-dep if absent), `AGENTS.md` (Commands: track entries).
 Interfaces:
 
-- produces `scripts/phase8-track-gate.sh <phase-8a-quantization|phase-8b-speculative-decoding|phase-8c-model-families>` → `GATE PASS <track>` exit 0; one `GATE FAIL <track>: …` line per failed check plus `GATE FAIL <track>: <n> check(s) failed`, exit 1; usage exit 2
+- produces `scripts/track-gate.sh <phase-6-quantization|phase-7-model-families|phase-8-speculative-decoding>` → `GATE PASS <track>` exit 0; one `GATE FAIL <track>: …` line per failed check plus `GATE FAIL <track>: <n> check(s) failed`, exit 1; usage exit 2
 - produces env overrides `TURBINE_PROCODER_LAUNCHER` (default `$HOME/.claude/plugins/cache/procoder/procoder/3.7.0/hooks/launcher.sh`), `TURBINE_SPEC_DIR` (default `.procoder/specs`), `TURBINE_SUPPORT_MATRIX` (file holding `--support-matrix --output text`; default produced with `cargo run -q -p turbine-server`)
-- produces the closed-track rule: 8a closed ⇔ a `supported` row with a non-bf16 weight format or `fp8_e4m3` KV; 8b closed ⇔ a `supported` row with `speculative=draft`
+- produces the closed-track rule, on `amd` rows only: phase 6 closed ⇔ a `supported` `amd` row with a non-bf16 weight format or `fp8_e4m3` KV; phase 7 closed ⇔ a `supported` `amd` row whose architecture is neither `LlamaForCausalLM` nor `OlmoeForCausalLM`
 - consumes Task 3 `turbine-server --support-matrix --output text` column layout, the procoder launcher `spec check <name>` (prints `… COMPLETE …`, exit 0), `.procoder/specs/<track>.md` with a `Status:` line and a `## In scope` section
 
-Covers: S-1 (mechanism used by Tasks 9, 11, 12); test `cargo test -p turbine-bench --test lab_scripts phase8_track_gate`.
+Covers: S-1 (mechanism used by Tasks 9, 11, 12); test `cargo test -p turbine-bench --test lab_scripts track_gate`.
 Depends on: Task 3.
 
-- [ ] Write failing test `phase8_track_gate_script::phase8_track_gate`: with a stub launcher (COMPLETE iff the spec has the line `Status: complete`), temp specs and matrix files (baseline row; + an `nvidia sm_121 … modelopt_nvfp4 … supported` row; + an `amd gfx1201 … draft … supported` row): an unknown track exits 2; a missing 8a spec exits 1 with `does not exist`; a complete in-scope 8a spec passes with `GATE PASS phase-8a-quantization` (MXFP4/GPTQ/GGUF under "Out of scope" are fine), fails naming `MXFP4` when In scope lists it and fails with `not COMPLETE` and `Status line` when `Status: draft`; 8b fails with `phase-8a-quantization has not closed` on the baseline matrix, passes once the quantized row exists, and fails naming `EAGLE` when In scope mentions it; 8c fails with `phase-8b-speculative-decoding has not closed` until the draft row exists, then passes, and fails naming `Mixtral` when In scope drops it. Run: `cargo test -p turbine-bench --test lab_scripts phase8_track_gate` — expect FAIL (`left: Some(127)`).
-- [ ] Implement `scripts/phase8-track-gate.sh` (`set -euo pipefail`, failures counted, all printed before exiting): the order check counts `supported` rows (column 7) with column 4 ≠ `bf16` or column 5 = `fp8_e4m3` (for 8b) or column 6 = `draft` (for 8c) and fails with `track <prev> has not closed: …`; a missing spec fails with `<spec> does not exist; write it with /procoder:spec <track>`; a launcher `spec check` without `COMPLETE` fails with `procoder spec check is not COMPLETE: <first line>`; a missing `Status: complete` line fails with `Status line is not 'Status: complete'`; an empty `## In scope` section fails.
-- [ ] Implement the scope checks, matching the `## In scope` section case-insensitively with `grep -Ei`: 8a — the spec names `modelopt|compressed-tensors|fp8_e4m3` somewhere, and In scope refuses `mxfp4`, `gptq|awq|int4`, `gguf`, `block-scaled|block scaled`, `nvfp4 kv`; 8b — the spec names `Llama-3.2-1B-Instruct`, and In scope refuses `(^|[^a-z])mtp([^a-z]|$)`, `eagle`, `dflash`; 8c — In scope needs `qwen3 dense|Qwen3ForCausalLM`, `qwen3 moe|Qwen3MoeForCausalLM`, `qwen3\.5|qwen3\.6|qwen3_5`, `gated deltanet`, `mistral`, `mixtral`, `linear-attention.*(amd|gfx1201|hip|rocm)|(amd|gfx1201|hip|rocm).*linear-attention`, `linear-attention.*(nvidia|sm_121|cuda)|(nvidia|sm_121|cuda).*linear-attention`, and refuses `gpt-oss`; messages read `In scope does not cover <what> (/<regex>/)` and `In scope names <what>, outside the umbrella scope`.
-- [ ] Run: `cargo test -p turbine-bench --test lab_scripts phase8_track_gate` — expect PASS; `shfmt -d scripts/phase8-track-gate.sh scripts/eval/make-gsm8k-200.sh` — expect no output; `scripts/phase8-track-gate.sh phase-8b-speculative-decoding` on the real tree — expect `GATE FAIL phase-8b-speculative-decoding: track phase-8a-quantization has not closed: …` and exit 1.
-- [ ] Append to the `## Commands` section of `AGENTS.md` these three bullets verbatim:
+- [ ] Write failing test `track_gate_script::track_gate`: with a stub launcher (COMPLETE iff the spec has the line `Status: complete`), temp specs and matrix files (baseline row; + an `amd gfx1201 LlamaForCausalLM fp8 … supported` row; + an `amd gfx1201 Qwen3ForCausalLM bf16 … supported` row; + an `nvidia sm_121 … fp8 … supported` row that must not count): an unknown track exits 2; a missing phase-6 spec exits 1 with `does not exist`; a complete in-scope phase-6 spec passes with `GATE PASS phase-6-quantization` (NVFP4/GGUF under "Out of scope" are fine), fails naming `NVFP4` when In scope lists it and fails with `not COMPLETE` and `Status line` when `Status: draft`; phase 7 fails with `phase-6-quantization has not closed` on the baseline matrix and on the nvidia-only matrix, passes once the AMD quantized row exists, and fails naming `gpt-oss` when In scope drops it; phase 8 fails with `phase-7-model-families has not closed` until the Qwen3 row exists, then passes, and fails naming `EAGLE` when In scope mentions it. Run: `cargo test -p turbine-bench --test lab_scripts track_gate` — expect FAIL (`left: Some(127)`).
+- [ ] Implement `scripts/track-gate.sh` (`set -euo pipefail`, failures counted, all printed before exiting): the order check counts `supported` rows (column 7) with column 1 = `amd` and — for phase 7 — column 4 ≠ `bf16` or column 5 = `fp8_e4m3`, or — for phase 8 — column 3 ∉ {`LlamaForCausalLM`, `OlmoeForCausalLM`}, and fails with `track <prev> has not closed: …`; a missing spec fails with `<spec> does not exist; write it with /procoder:spec <track>`; a launcher `spec check` without `COMPLETE` fails with `procoder spec check is not COMPLETE: <first line>`; a missing `Status: complete` line fails with `Status line is not 'Status: complete'`; an empty `## In scope` section fails.
+- [ ] Implement the scope checks, matching the `## In scope` section case-insensitively with `grep -Ei`: phase 6 — the spec names `fp8_block|mxfp4|awq_int4|gptq_int4|fp8_e4m3` somewhere, In scope needs `fp8`, `fp8_e4m3|kv\.dtype`, `mxfp4`, `awq`, `gptq`, and refuses `nvfp4`, `gguf`, `int8`; phase 7 — In scope needs `qwen3 dense|Qwen3ForCausalLM`, `qwen3 moe|Qwen3MoeForCausalLM`, `gpt-oss`, `qwen3\.5|qwen3\.6|qwen3_5`, `gated deltanet`, `mistral`, `mixtral`, `linear-attention.*(amd|gfx1201|hip|rocm)|(amd|gfx1201|hip|rocm).*linear-attention`; phase 8 — the spec names `Llama-3.2-1B-Instruct`, In scope needs `recurrent`, and refuses `(^|[^a-z])mtp([^a-z]|$)`, `eagle`, `dflash`; messages read `In scope does not cover <what> (/<regex>/)` and `In scope names <what>, outside the umbrella scope`.
+- [ ] Run: `cargo test -p turbine-bench --test lab_scripts track_gate` — expect PASS; `shfmt -d scripts/track-gate.sh scripts/eval/make-gsm8k-200.sh` — expect no output; `scripts/track-gate.sh phase-7-model-families` on the real tree — expect `GATE FAIL phase-7-model-families: track phase-6-quantization has not closed: …` and exit 1.
+- [ ] Append to the `## Commands` section of `AGENTS.md` these two bullets verbatim (the support-matrix bullet is already there):
 
 ```markdown
-- Support matrix: `cargo run -q -p turbine-server -- --support-matrix [--output json]`; `--check-config` also resolves the configured row (exit 2 when unsupported).
 - Quality gate: `cargo run -q -p turbine-bench --bin turbine-golden -- eval --url <base> --tasks tests/eval/gsm8k-200.jsonl --output json > tests/eval/<model-slug>/<engine>.json`, then `turbine-golden eval-compare --baseline <bf16.json> --candidate <quantized.json>` (exit 1 when the drop exceeds `quality.max_accuracy_drop`, default 0.01).
-- Phase 8 track start: `scripts/phase8-track-gate.sh <phase-8a-quantization|phase-8b-speculative-decoding|phase-8c-model-families>` must print `GATE PASS <track>` before a track's implementation starts; tracks close with the runbook in `.procoder/plans/phase-8-expansion.md` Task 10.
+- Track start (Phases 6–8): `scripts/track-gate.sh <phase-6-quantization|phase-7-model-families|phase-8-speculative-decoding>` must print `GATE PASS <track>` before a track's implementation starts; tracks close with the runbook in `.procoder/plans/phase-6-8-expansion.md` Task 10.
 ```
 
 - [ ] Gate: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] Commit: `feat(scripts): add the phase 8 track start gate`
+- [ ] Commit: `feat(scripts): add the phase 6–8 track start gate`
 
-## Task 9: Gate — `phase-8a-quantization` spec written and checked before track 1 starts
+## Task 9: Gate — `phase-6-quantization` spec written and checked before track 1 starts
 
-Files: `.procoder/specs/phase-8a-quantization.md` (new, written through `/procoder:spec`).
+Files: `.procoder/specs/phase-6-quantization.md` (new, written through `/procoder:spec`).
 Interfaces:
 
-- consumes Task 8 `scripts/phase8-track-gate.sh`, the umbrella S-2 … S-6
-- produces the track 1 spec that the separate `phase-8a-quantization` plan implements; it cites this spec for S-2 … S-5 instead of restating them and reserves only `kv.dtype` (adds `fp8_e4m3`) among config keys
+- consumes Task 8 `scripts/track-gate.sh`, the umbrella S-2 … S-6
+- produces the track 1 spec that the separate `phase-6-quantization` plan implements; it cites the umbrella for S-2 … S-5 instead of restating them and reserves only `kv.dtype` (adds `fp8_e4m3`) among config keys
 
-Covers: S-1, S-6 — acceptance criterion "Before track 1 implementation starts: `launcher.sh spec check phase-8a-quantization` exits 0 reporting COMPLETE, Status `complete`, `grep -c -E "modelopt|compressed-tensors|fp8_e4m3"` non-zero while the spec lists no format outside S-6".
+Covers: S-1, S-6 — acceptance criterion "Before track 1 implementation starts: `launcher.sh spec check phase-6-quantization` exits 0 reporting COMPLETE, Status `complete`, `grep -c -E "fp8_block|mxfp4|awq_int4|gptq_int4|fp8_e4m3"` non-zero while In scope names no format outside S-6".
 Depends on: Tasks 1–8.
 
-- [ ] Red: run `scripts/phase8-track-gate.sh phase-8a-quantization` — expect FAIL with "does not exist; write it with /procoder:spec phase-8a-quantization".
-- [ ] Write the spec with `/procoder:spec phase-8a-quantization` (interview the user; every open question goes to the user). Fixed inputs to carry into it: In scope = exactly S-6 (modelopt NVFP4 + FP8 mixed precision with per-layer resolution from `hf_quant_config.json` incl. `MIXED_PRECISION`, W4A16 NVFP4 group-16 experts and BF16 excluded modules; compressed-tensors `nvfp4-pack-quantized` with the divisor global-scale convention; FP8 e4m3 KV as `kv.dtype: fp8_e4m3`); the spec decides which Llama-3.2 / OLMoE checkpoints in those formats prove each format, the per-vendor kernel providers, and weight-only NVFP4 on RDNA4; it names its lab hosts, `scripts/lab/phase8-<track>-<host>.yaml` files on port 18000 and the exact `SUPPORT_MATRIX` rows it will turn `supported` (Task 10 procedure); MXFP4, GPTQ/AWQ/INT4, GGUF, FP8 block-scaled weights and NVFP4 KV appear only under "Out of scope" (the gate refuses them inside "## In scope").
-- [ ] Run: `"/Users/pascal/.claude/plugins/cache/procoder/procoder/3.7.0/hooks/launcher.sh" spec check phase-8a-quantization` — expect `spec phase-8a-quantization: COMPLETE` and exit 0.
-- [ ] Run: `grep -x 'Status: complete' .procoder/specs/phase-8a-quantization.md` — expect `Status: complete`; `grep -c -E "modelopt|compressed-tensors|fp8_e4m3" .procoder/specs/phase-8a-quantization.md` — expect a number ≥ 1.
-- [ ] Green: run `scripts/phase8-track-gate.sh phase-8a-quantization` — expect `GATE PASS phase-8a-quantization`; paste the four outputs into this task's todo evidence.
-- [ ] Format: `prettier --write .procoder/specs/phase-8a-quantization.md`; rerun the spec check — expect COMPLETE.
-- [ ] Commit: `docs(spec): add the phase-8a-quantization track spec`
-- [ ] Hand-off: start the track with `/procoder:plan phase-8a-quantization` (a separate plan; not part of this one).
+- [ ] Red: run `scripts/track-gate.sh phase-6-quantization` — expect FAIL with "does not exist; write it with /procoder:spec phase-6-quantization".
+- [ ] Write the spec with `/procoder:spec phase-6-quantization` (interview the user; every open question goes to the user). Fixed inputs to carry into it: In scope = exactly S-6 (FP8 e4m3 weights per-tensor / per-channel `fp8` and block-scaled `fp8_block`; FP8 e4m3 KV as `kv.dtype: fp8_e4m3`; MXFP4 `mxfp4`, weight-only on RDNA4; INT4 `awq_int4` and `gptq_int4`, weight-only, group-wise); the spec decides the checkpoint containers per value, the Llama-3.2-3B / OLMoE checkpoints that prove each format, W8A8 vs W8A16 for FP8, the kernel provider per format after a provider evaluation (reuse-first rule), how MXFP4 is proven (offline-quantized fixture checkpoint or gpt-oss-20b in track 2; umbrella Constraints (c)), and the first code task that renames the support-matrix refusal reasons, turns the `nvidia` baseline rows `unsupported` and adds the five weight-format values (Task 2 amendment); it names `scripts/lab/phase6-quantization-novanas.yaml` on port 18000 and the exact `SUPPORT_MATRIX` rows it will turn `supported` (Task 10 procedure); NVFP4, INT8 and GGUF appear only under "Out of scope" (the gate refuses them inside "## In scope").
+- [ ] Run: `"/Users/pascal/.claude/plugins/cache/procoder/procoder/3.7.0/hooks/launcher.sh" spec check phase-6-quantization` — expect `spec phase-6-quantization: COMPLETE` and exit 0.
+- [ ] Run: `grep -x 'Status: complete' .procoder/specs/phase-6-quantization.md` — expect `Status: complete`; `grep -c -E "fp8_block|mxfp4|awq_int4|gptq_int4|fp8_e4m3" .procoder/specs/phase-6-quantization.md` — expect a number ≥ 1.
+- [ ] Green: run `scripts/track-gate.sh phase-6-quantization` — expect `GATE PASS phase-6-quantization`; paste the four outputs into this task's todo evidence.
+- [ ] Format: `prettier --write .procoder/specs/phase-6-quantization.md`; rerun the spec check — expect COMPLETE.
+- [ ] Commit: `docs(spec): add the phase-6-quantization track spec`
+- [ ] Hand-off: start the track with `/procoder:plan phase-6-quantization` (a separate plan; not part of this one).
 
 ## Task 10: Track close runbook (run once per track, in S-1 order)
 
-Files: `crates/turbine-core/src/support.rs` (the track's rows flip to `supported` — the edit itself is the last task of the track's own plan; this task verifies it), `tests/eval/<model-slug>/<engine>.json` (eval reports for lossy formats, new per gated combination), `tests/bench/phase8/<track>/<host>-<model-slug>-<engine>.json` (bench reports, new).
+Files: `crates/turbine-core/src/support.rs` (the track's rows flip to `supported` — the edit itself is the last task of the track's own plan; this task verifies it), `tests/eval/<model-slug>/<engine>.json` (eval reports for lossy formats, new per gated combination), `tests/bench/<track>/novanas-<model-slug>-<engine>.json` (bench reports, new).
 Interfaces:
 
 - consumes Task 3 `--support-matrix --output json`, Task 5 `turbine-golden eval`/`eval-compare`, Task 6 `tests/eval/gsm8k-200.jsonl`, P1 `turbine-golden compare`, P0/P3 `turbine-bench`
-- consumes P3 `scripts/overload-soak.sh <host> [--duration <dur>] [--model <path>]` with the requested addition `--config <yaml>` (see report)
-- consumes P1/P2b `scripts/lab-serve.sh <host> <config>` and `scripts/lab-serve.sh <host> --vllm <slug>` (vLLM on :18100), the track spec's `scripts/lab/phase8-<track>-<host>.yaml` (port 18000)
+- consumes P3 `scripts/overload-soak.sh novanas [--duration <dur>] [--model <path>]` with the requested addition `--config <yaml>` (see report)
+- consumes `scripts/lab-serve.sh novanas <config>` and `scripts/lab-serve.sh novanas --vllm <slug>` (vLLM-ROCm on :18100), the track spec's `scripts/lab/phase<N>-<topic>-novanas.yaml` (port 18000)
 - consumes `tests/golden/<model-slug>/{reference.jsonl,tolerance.json}` (phase-1 format; for quantized checkpoints captured once from the checkpoint's reference runtime by the track plan)
-- `<track>` ∈ {`phase-8a-quantization`, `phase-8b-speculative-decoding`, `phase-8c-model-families`}; `<host>` ∈ {`novanas` → `http://192.168.10.203:18000`, `dgx-spark` → `http://192.168.10.246:18000`}
+- `<track>` ∈ {`phase-6-quantization`, `phase-7-model-families`, `phase-8-speculative-decoding`}; host `novanas` → `http://192.168.10.203:18000`
 
-Covers: S-3, S-6, S-7, S-8 — acceptance criterion "Manual track close, per track in S-1 order: overload-soak, golden compare, bench report, eval-compare for lossy formats, then `--support-matrix` shows the new rows `supported` only for the vendors where all four passed".
+Covers: S-3, S-6, S-7, S-8 — acceptance criterion "Manual track close, per track in S-1 order, on `novanas`: overload-soak, golden compare, bench report, eval-compare for lossy formats, then `--support-matrix` shows the new `amd` rows `supported`".
 Depends on: Tasks 2–9 (and Task 11 / Task 12 for tracks 2 and 3); the track's own plan fully closed.
 
-- [ ] Precondition: `scripts/phase8-track-gate.sh <track>` printed `GATE PASS <track>` before the track started, and every task of the track's own plan is closed with `cargo test --workspace` green on macOS and `scripts/lab-test.sh novanas` / `scripts/lab-test.sh dgx-spark` green (exit 0) for the vendors the track claims.
-- [ ] ASK THE USER FIRST: every step below that runs on `novanas` uses the R9700 cards, and the soak and bench steps on the Sparks are benchmark/soak runs — ask the user to move production workloads/free memory and wait for the confirmation before each host's run. Spark correctness steps (golden compare, eval) proceed after the MemAvailable precondition that `scripts/lab-serve.sh` prints.
-- [ ] Serve the track configuration per host: `scripts/lab-serve.sh <host> scripts/lab/phase8-<track>-<host>.yaml`; expect `curl -fsS http://<host-ip>:18000/ready` → `{"ready":true}` and `curl -fsS http://<host-ip>:18000/turbine/v1/status | jq .support` → the row being gated (status `experimental` while unvalidated rows are experimental in the track branch).
-- [ ] Golden: `cargo run -q -p turbine-bench --bin turbine-golden -- compare --url http://<host-ip>:18000 --reference tests/golden/<model-slug>/reference.jsonl --tolerance tests/golden/<model-slug>/tolerance.json` — expect exit 0 (≥ 14 of 16 prompts with the first 32 greedy tokens identical, top-5 |Δlogprob| ≤ 0.15 nats).
-- [ ] Quality (lossy formats only — every quantized weight format and `fp8_e4m3` KV): `cargo run -q -p turbine-bench --bin turbine-golden -- eval --url http://<host-ip>:18000 --tasks tests/eval/gsm8k-200.jsonl --output json > tests/eval/<model-slug>/turbine-<host>.json` for the quantized row, the same against the BF16 model of the same family (or `scripts/lab-serve.sh <host> --vllm <model-slug>` on :18100 for the same checkpoint) into `tests/eval/<baseline-slug>/<engine>-<host>.json`, then `cargo run -q -p turbine-bench --bin turbine-golden -- eval-compare --baseline tests/eval/<baseline-slug>/<engine>-<host>.json --candidate tests/eval/<model-slug>/turbine-<host>.json` — expect `… : PASS` and exit 0.
-- [ ] Bench: `cargo run -q -p turbine-bench --bin turbine-bench -- --url http://<host-ip>:18000 --output json > tests/bench/phase8/<track>/<host>-<model-slug>-turbine.json` — expect exit 0; where a reference engine runs on that device, `scripts/lab-serve.sh <host> --vllm <model-slug>` and the same command against `http://<host-ip>:18100` into `…-vllm.json`, then `scripts/lab-serve.sh <host> --stop`; otherwise record the Turbine report as the baseline (TS §18).
-- [ ] Soak: `scripts/overload-soak.sh <host> --config scripts/lab/phase8-<track>-<host>.yaml` — expect exit 0 and a passing JSON verdict under `target/soak/<host>-<timestamp>/`.
-- [ ] No regression of TS §20 first-useful-release items on either vendor: with `scripts/lab/phase2-novanas-llama.yaml`, `phase2-novanas-olmoe.yaml`, `phase2b-spark-llama.yaml`, `phase2b-spark-olmoe.yaml` served in turn, `turbine-golden compare --url … --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl` and `… olmoe-1b-7b-0125-instruct/reference.jsonl` — expect exit 0 each.
-- [ ] Flip the rows (last task of the track's plan): rows turn `supported` only for vendors where all four items passed; the other vendor keeps an `unsupported` row whose reason names the failed item; `cargo test -p turbine-core support::` — expect PASS (update `baseline_rows_present` expectations in the same commit).
-- [ ] Verify: `cargo run -q -p turbine-server -- --support-matrix --output json | jq -c '.rows[] | select(.status == "supported")'` — expect the four baseline rows plus exactly the track's validated rows.
-- [ ] Record: paste every command output above into the track-close todo's evidence (`/procoder:todo`); `scripts/lab-serve.sh <host> --stop` on every host used.
-- [ ] Commit: `test(phase8): record <track> exit-gate reports`
+- [ ] Precondition: `scripts/track-gate.sh <track>` printed `GATE PASS <track>` before the track started, and every task of the track's own plan is closed with `scripts/gate.sh --full` and `scripts/lab-test.sh novanas --tier full` green (exit 0).
+- [ ] ASK THE USER FIRST when `amd.com/gpu` on `novanas` is held by another workload (standing approvals cover the Turbine lab Jobs while the cards are free); never evict someone else's workload.
+- [ ] Serve the track configuration: `scripts/lab-serve.sh novanas scripts/lab/phase<N>-<topic>-novanas.yaml`; expect `curl -fsS http://192.168.10.203:18000/ready` → `{"ready":true}` and `curl -fsS http://192.168.10.203:18000/turbine/v1/status | jq .support` → the row being gated (status `experimental` while unvalidated rows are experimental in the track branch).
+- [ ] Golden: `cargo run -q -p turbine-bench --bin turbine-golden -- compare --url http://192.168.10.203:18000 --reference tests/golden/<model-slug>/reference.jsonl` at `--concurrency 1` and `--concurrency 16` — expect exit 0 under the slug's `tolerance.json`.
+- [ ] Quality (lossy formats only — every quantized weight format and `fp8_e4m3` KV): `cargo run -q -p turbine-bench --bin turbine-golden -- eval --url http://192.168.10.203:18000 --tasks tests/eval/gsm8k-200.jsonl --output json > tests/eval/<model-slug>/turbine-novanas.json` for the quantized row, the same against the BF16 model of the same family (or `scripts/lab-serve.sh novanas --vllm <model-slug>` on :18100 for the same checkpoint) into `tests/eval/<baseline-slug>/<engine>-novanas.json`, then `cargo run -q -p turbine-bench --bin turbine-golden -- eval-compare --baseline tests/eval/<baseline-slug>/<engine>-novanas.json --candidate tests/eval/<model-slug>/turbine-novanas.json` — expect `… : PASS` and exit 0.
+- [ ] Bench: `cargo run -q -p turbine-bench --bin turbine-bench -- --url http://192.168.10.203:18000 --output json > tests/bench/<track>/novanas-<model-slug>-turbine.json` on GPU 0 — expect exit 0; where vLLM-ROCm serves the checkpoint, `scripts/lab-serve.sh novanas --vllm <model-slug>` and the same command against `http://192.168.10.203:18100` into `…-vllm.json`, then `scripts/lab-serve.sh novanas --stop`; otherwise record the Turbine report as the baseline (TS §18).
+- [ ] Soak: `scripts/overload-soak.sh novanas --config scripts/lab/phase<N>-<topic>-novanas.yaml` — expect exit 0 and a passing JSON verdict under `target/soak/`.
+- [ ] No regression of TS §20 first-useful-release items on AMD: with `scripts/lab/phase2-novanas-llama.yaml` and `phase2-novanas-olmoe.yaml` served in turn, `turbine-golden compare --url … --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl` and `… olmoe-1b-7b-0125-instruct/reference.jsonl` — expect exit 0 each.
+- [ ] Flip the rows (last task of the track's plan): the track's `amd` rows turn `supported` where all four items passed; `nvidia` rows stay `unsupported` naming `phase-2b-nvidia`; `cargo test -p turbine-core support::` — expect PASS (update `baseline_rows_present` expectations in the same commit).
+- [ ] Verify: `cargo run -q -p turbine-server -- --support-matrix --output json | jq -c '.rows[] | select(.status == "supported")'` — expect the AMD baseline rows plus exactly the tracks' validated rows.
+- [ ] Record: paste every command output above into the track-close todo's evidence (`/procoder:todo`); `scripts/lab-serve.sh novanas --stop`.
+- [ ] Commit: `test(<track>): record the exit-gate reports`
 
-## Task 11: Gate — `phase-8b-speculative-decoding` spec written and checked before track 2 starts
+## Task 11: Gate — `phase-7-model-families` spec written and checked before track 2 starts
 
-Files: `.procoder/specs/phase-8b-speculative-decoding.md` (new, written through `/procoder:spec`).
+Files: `.procoder/specs/phase-7-model-families.md` (new, written through `/procoder:spec`).
 Interfaces:
 
-- consumes Task 8 gate script, Task 10 executed for `phase-8a-quantization` (≥ 1 `supported` quantized or `fp8_e4m3` row)
+- consumes Task 8 gate script, Task 10 executed for `phase-6-quantization` (≥ 1 `supported` `amd` quantized or `fp8_e4m3` row)
+- consumes contract §10 `registry` (`ArchitectureEntry { architectures0, model_type, parse, weight_map, build_executor, kv_layout }`, `lookup(architectures0, model_type)`) and the Phase 2m families (`turbine_model::families::{Qwen3, Qwen3Moe, Mistral, Mixtral}`, CPU execution)
+- produces the track 2 spec implemented by the separate `phase-7-model-families` plan
+
+Covers: S-1, S-8 — acceptance criterion "Before track 2 implementation starts (and only after track 1 closed): spec check COMPLETE with Status `complete`, covering Qwen3 dense, Qwen3 MoE, gpt-oss-20b, the Qwen3.5/3.6 hybrids with the AMD linear-attention kernel provider decided, Mistral and Mixtral, with the checkpoint each family is served from".
+Depends on: Task 8; Task 10 run for `phase-6-quantization`.
+
+- [ ] Red: run `scripts/track-gate.sh phase-7-model-families` — expect FAIL with "does not exist" (and, until track 1 closed, "track phase-6-quantization has not closed").
+- [ ] Write the spec with `/procoder:spec phase-7-model-families` (interview the user). Fixed inputs: In scope = exactly S-8 (Qwen3 dense, Qwen3 MoE, gpt-oss-20b with MXFP4 experts, attention sinks and alternating sliding-window attention, the Qwen3.5/3.6 Gated DeltaNet hybrids text-only with vision weights skipped and their recurrent/conv-state layout, Mistral and Mixtral); the AMD linear-attention kernel provider after a provider evaluation (the gate looks for `linear-attention` together with `AMD`/`gfx1201`/`hip`/`rocm` in "## In scope"); per family: the checkpoint it is served from (FP8 or BF16 for the hybrids, whose cached checkpoints are NVFP4; FP8 + TP 2 where one card does not hold it, e.g. Mixtral-8x7B and Qwen3.6-35B-A3B), its golden fixtures under `tests/golden/<model-slug>/`, and one card or Phase 5 TP; the tests that use `GptOssForCausalLM` as the example of an unregistered architecture move to another name; recurrent-state rollback for speculation stays with track 3.
+- [ ] Run: `"/Users/pascal/.claude/plugins/cache/procoder/procoder/3.7.0/hooks/launcher.sh" spec check phase-7-model-families` — expect `COMPLETE`, exit 0; `grep -x 'Status: complete' .procoder/specs/phase-7-model-families.md` — expect a match.
+- [ ] Green: `scripts/track-gate.sh phase-7-model-families` — expect `GATE PASS phase-7-model-families`; paste the outputs into this task's todo evidence.
+- [ ] Format: `prettier --write .procoder/specs/phase-7-model-families.md`; rerun the spec check — expect COMPLETE.
+- [ ] Commit: `docs(spec): add the phase-7-model-families track spec`
+- [ ] Hand-off: `/procoder:plan phase-7-model-families` (separate plan); close it with Task 10.
+
+## Task 12: Gate — `phase-8-speculative-decoding` spec written and checked before track 3 starts
+
+Files: `.procoder/specs/phase-8-speculative-decoding.md` (new, written through `/procoder:spec`).
+Interfaces:
+
+- consumes Task 8 gate script, Task 10 executed for `phase-7-model-families` (≥ 1 `supported` `amd` row of a track 2 architecture)
 - consumes Task 1 `SpeculativeConfig`/`SpeculativeMethod` (the track adds `num_tokens` ≤ 8, `draft_model_path`, `min_acceptance`), Task 2 draft refusal row
-- produces the track 2 spec implemented by the separate `phase-8b-speculative-decoding` plan
+- produces the track 3 spec implemented by the separate `phase-8-speculative-decoding` plan
 
-Covers: S-1, S-7 — acceptance criterion "Before track 2 implementation starts (and only after track 1 closed): spec check COMPLETE with Status `complete`, names `Llama-3.2-1B-Instruct` as the first draft model and no MTP, EAGLE or DFlash proposer".
-Depends on: Task 8; Task 10 run for `phase-8a-quantization`.
+Covers: S-1, S-7 — acceptance criterion "Before track 3 implementation starts (and only after track 2 closed): spec check COMPLETE with Status `complete`, names `Llama-3.2-1B-Instruct` as the first draft model, covers recurrent-state rollback for the hybrid targets, and has no MTP, EAGLE or DFlash proposer".
+Depends on: Task 8; Task 10 run for `phase-7-model-families`.
 
-- [ ] Red: run `scripts/phase8-track-gate.sh phase-8b-speculative-decoding` — expect FAIL with "does not exist" (and, until track 1 closed, "track phase-8a-quantization has not closed").
-- [ ] Write the spec with `/procoder:spec phase-8b-speculative-decoding` (interview the user). Fixed inputs: In scope = exactly S-7 (separate draft model sharing the target's tokenizer behind a `Proposer` trait, first pairing `meta-llama/Llama-3.2-1B-Instruct` → `meta-llama/Llama-3.2-3B-Instruct`, slug `llama-3.2-1b-instruct`; verifier in `turbine-scheduler` scoring k ≤ 8 proposals in one target forward with standard speculative rejection sampling, greedy = exact prefix match; rollback by truncating KV blocks past the last accepted position; per-request disable below `speculative.min_acceptance`, global disable at pressure ORANGE or worse; draft memory reserved through the Phase 3 budget); config keys exactly `speculative.{method, num_tokens, draft_model_path, min_acceptance}`; track metrics with bounded labels; colocated only (no PD/PP); MTP, EAGLE and DFlash only under "Out of scope"; linear-attention state rollback deferred to track 3.
-- [ ] Run: `"/Users/pascal/.claude/plugins/cache/procoder/procoder/3.7.0/hooks/launcher.sh" spec check phase-8b-speculative-decoding` — expect `COMPLETE`, exit 0; `grep -x 'Status: complete' .procoder/specs/phase-8b-speculative-decoding.md` — expect a match; `grep -c 'Llama-3.2-1B-Instruct' .procoder/specs/phase-8b-speculative-decoding.md` — expect ≥ 1.
-- [ ] Green: `scripts/phase8-track-gate.sh phase-8b-speculative-decoding` — expect `GATE PASS phase-8b-speculative-decoding`; paste the outputs into this task's todo evidence.
-- [ ] Format: `prettier --write .procoder/specs/phase-8b-speculative-decoding.md`; rerun the spec check — expect COMPLETE.
-- [ ] Commit: `docs(spec): add the phase-8b-speculative-decoding track spec`
-- [ ] Hand-off: `/procoder:plan phase-8b-speculative-decoding` (separate plan); close it with Task 10.
-
-## Task 12: Gate — `phase-8c-model-families` spec written and checked before track 3 starts
-
-Files: `.procoder/specs/phase-8c-model-families.md` (new, written through `/procoder:spec`).
-Interfaces:
-
-- consumes Task 8 gate script, Task 10 executed for `phase-8b-speculative-decoding` (≥ 1 `supported` row with `speculative=draft`)
-- consumes contract §10 `registry` (`ArchitectureEntry { architectures0, model_type, parse, weight_map, build_executor, kv_layout }`, `lookup(architectures0, model_type)`), contract C-22 (TKV1 segment kinds 2/3 reserved for linear-attention state)
-- produces the track 3 spec implemented by the separate `phase-8c-model-families` plan
-
-Covers: S-1, S-8 — acceptance criterion "Before track 3 implementation starts (and only after track 2 closed): spec check COMPLETE with Status `complete`, covering Qwen3 dense, Qwen3 MoE, the Qwen3.5/3.6 hybrids with the linear-attention kernel provider decided per vendor, Mistral and Mixtral".
-Depends on: Task 8; Task 10 run for `phase-8b-speculative-decoding`.
-
-- [ ] Red: run `scripts/phase8-track-gate.sh phase-8c-model-families` — expect FAIL with "does not exist" (and, until track 2 closed, "track phase-8b-speculative-decoding has not closed").
-- [ ] Write the spec with `/procoder:spec phase-8c-model-families` (interview the user). Fixed inputs: In scope = exactly S-8 (architecture registry keyed on `architectures[0]` and `model_type`, top level and nested `text_config`; unregistered → exit 1 naming it; Qwen3 dense, Qwen3 MoE, the Qwen3.5/3.6 Gated DeltaNet hybrids including `Qwen3.6-35B-A3B` text-only with vision weights skipped, TKV1 recurrent/conv-state segments and speculative state rollback, Mistral and Mixtral); one line per vendor naming the linear-attention kernel provider (the gate looks for `linear-attention` together with `AMD`/`gfx1201`/`hip`/`rocm` and with `NVIDIA`/`sm_121`/`cuda` in "## In scope"); per family: its golden fixtures under `tests/golden/<model-slug>/` and whether it runs on one device, Phase 5 TP, Phase 7 PP/EP or an in-scope quantized checkpoint; gpt-oss only under "Out of scope".
-- [ ] Run: `"/Users/pascal/.claude/plugins/cache/procoder/procoder/3.7.0/hooks/launcher.sh" spec check phase-8c-model-families` — expect `COMPLETE`, exit 0; `grep -x 'Status: complete' .procoder/specs/phase-8c-model-families.md` — expect a match.
-- [ ] Green: `scripts/phase8-track-gate.sh phase-8c-model-families` — expect `GATE PASS phase-8c-model-families`; paste the outputs into this task's todo evidence.
-- [ ] Format: `prettier --write .procoder/specs/phase-8c-model-families.md`; rerun the spec check — expect COMPLETE.
-- [ ] Commit: `docs(spec): add the phase-8c-model-families track spec`
-- [ ] Hand-off: `/procoder:plan phase-8c-model-families` (separate plan); close it with Task 10; Phase 8 closes when Task 10 has run for all three tracks.
+- [ ] Red: run `scripts/track-gate.sh phase-8-speculative-decoding` — expect FAIL with "does not exist" (and, until track 2 closed, "track phase-7-model-families has not closed").
+- [ ] Write the spec with `/procoder:spec phase-8-speculative-decoding` (interview the user). Fixed inputs: In scope = exactly S-7 (separate draft model sharing the target's tokenizer behind a `Proposer` trait, first pairing `meta-llama/Llama-3.2-1B-Instruct` → `meta-llama/Llama-3.2-3B-Instruct`, slug `llama-3.2-1b-instruct`; verifier in `turbine-scheduler` scoring k ≤ 8 proposals in one target forward with standard speculative rejection sampling, greedy = exact prefix match; rollback by truncating KV blocks past the last accepted position, and rollback of the hybrids' recurrent state; per-request disable below `speculative.min_acceptance`, global disable at pressure ORANGE or worse; draft memory reserved through the Phase 3 budget); config keys exactly `speculative.{method, num_tokens, draft_model_path, min_acceptance}`; track metrics with bounded labels; colocated only; MTP, EAGLE and DFlash only under "Out of scope".
+- [ ] Run: `"/Users/pascal/.claude/plugins/cache/procoder/procoder/3.7.0/hooks/launcher.sh" spec check phase-8-speculative-decoding` — expect `COMPLETE`, exit 0; `grep -x 'Status: complete' .procoder/specs/phase-8-speculative-decoding.md` — expect a match; `grep -c 'Llama-3.2-1B-Instruct' .procoder/specs/phase-8-speculative-decoding.md` — expect ≥ 1.
+- [ ] Green: `scripts/track-gate.sh phase-8-speculative-decoding` — expect `GATE PASS phase-8-speculative-decoding`; paste the outputs into this task's todo evidence.
+- [ ] Format: `prettier --write .procoder/specs/phase-8-speculative-decoding.md`; rerun the spec check — expect COMPLETE.
+- [ ] Commit: `docs(spec): add the phase-8-speculative-decoding track spec`
+- [ ] Hand-off: `/procoder:plan phase-8-speculative-decoding` (separate plan); close it with Task 10; the expansion umbrella closes when Task 10 has run for all three tracks.
