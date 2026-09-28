@@ -117,7 +117,7 @@ spec:
               value: /opt/rocm/rocm/core-7.14
           resources:
             limits:
-              amd.com/gpu: 1
+              amd.com/gpu: __GPUS__
           volumeMounts:
             - name: turbine-ci
               mountPath: /home/piwi/turbine-ci

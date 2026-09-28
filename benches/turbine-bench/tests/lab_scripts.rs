@@ -1993,3 +1993,47 @@ fn lab_serve_vllm_two_gpus_renders_the_job() {
         assert!(stderr(&out).contains(expect), "{tag}: {}", stderr(&out));
     }
 }
+
+/// P5 engine comparison: `lab-serve.sh novanas <config> --gpus 2` renders the serve Job with
+/// `amd.com/gpu: 2` (default 1) and still passes every `--set`; `--gpus 3` is a usage error before
+/// any host is contacted.
+#[test]
+fn lab_serve_gpus_2_renders_a_two_gpu_serve_job() {
+    let one = applied_job(&dry_run(
+        "lab-serve.sh",
+        "serve-gpus-default",
+        &["--dry-run", "novanas", "scripts/lab/phase1-novanas.yaml"],
+    ));
+    assert_eq!(amd_gpus(&one), 1);
+    let two = applied_job(&dry_run(
+        "lab-serve.sh",
+        "serve-gpus-2",
+        &[
+            "--dry-run",
+            "novanas",
+            "scripts/lab/phase5-novanas-olmoe.yaml",
+            "--gpus",
+            "2",
+            "--set",
+            "server.listen=0.0.0.0:18000",
+        ],
+    ));
+    assert_eq!(amd_gpus(&two), 2);
+    assert!(
+        server_command(&two).ends_with("--set server.listen=0.0.0.0:18000"),
+        "{}",
+        server_command(&two)
+    );
+    let (out, called) = lab_script(
+        "lab-serve.sh",
+        "serve-gpus-3",
+        &["novanas", "scripts/lab/phase1-novanas.yaml", "--gpus", "3"],
+    );
+    assert_eq!(called, None);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--gpus is 1 or 2"),
+        "{}",
+        stderr(&out)
+    );
+}

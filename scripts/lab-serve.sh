@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run turbine-server on a lab host for manual golden and benchmark runs.
 #
-#   scripts/lab-serve.sh [--dry-run] novanas <config.yaml> [--set <dotted.key>=<value>]...
+#   scripts/lab-serve.sh [--dry-run] novanas <config.yaml> [--gpus 1|2] [--set <dotted.key>=<value>]...
 #   scripts/lab-serve.sh [--dry-run] novanas --vllm <slug> [--gpus 1|2] [--vllm-arg <arg>]...
 #   scripts/lab-serve.sh [--dry-run] novanas --stop [<run-id>]
 #
@@ -12,6 +12,8 @@
 #   runs it with that config. Each --set pair is appended as `--set <dotted.key>=<value>` to the
 #   turbine-server command line, so sweeps need no config edits; since the pairs are rendered
 #   into the Job's shell script, values are plain words (letters, digits and _ . : / @ + , -).
+#   --gpus 2 gives the Job both R9700s (a two-GPU config, e.g. scripts/lab/phase5-novanas-*.yaml
+#   with --set server.listen=0.0.0.0:18000; P5 engine comparison).
 #   The script refuses to start while something already answers on
 #   port 18000, streams the Job log until http://192.168.10.203:18000/ready answers 200, then
 #   exits 0 and leaves the server running. --stop deletes the serve Jobs (label
@@ -37,7 +39,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/lab-serve.sh [--dry-run] novanas <config.yaml> [--set <dotted.key>=<value>]..." >&2
+	echo "usage: scripts/lab-serve.sh [--dry-run] novanas <config.yaml> [--gpus 1|2] [--set <dotted.key>=<value>]..." >&2
 	echo "       scripts/lab-serve.sh [--dry-run] novanas --vllm <slug> [--gpus 1|2] [--vllm-arg <arg>]..." >&2
 	echo "       scripts/lab-serve.sh [--dry-run] novanas --stop [<run-id>]" >&2
 	exit 2
@@ -62,6 +64,7 @@ STOP_RUN=""
 # Rendered into the serve Job's turbine-server command line (scripts/lab/novanas-serve-job.yaml).
 SERVER_ARGS=""
 VLLM_GPUS=1
+SERVE_GPUS=1
 VLLM_ARGS=()
 case "$2" in
 --stop)
@@ -124,6 +127,15 @@ case "$2" in
 	CONFIG="$2"
 	shift 2
 	while [[ $# -gt 0 ]]; do
+		if [[ "$1" == --gpus && $# -ge 2 ]]; then
+			if [[ "$2" != 1 && "$2" != 2 ]]; then
+				echo "lab-serve: ${HOST}: --gpus is 1 or 2 (the R9700s of novanas), got: $2" >&2
+				exit 2
+			fi
+			SERVE_GPUS="$2"
+			shift 2
+			continue
+		fi
 		[[ "$1" == --set && $# -ge 2 ]] || usage
 		if [[ ! "$2" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*=[A-Za-z0-9_.:/@+,-]*$ ]]; then
 			echo "lab-serve: ${HOST}: --set expects <dotted.key>=<value> with a plain-word value (letters, digits, _ . : / @ + , -), got: $2" >&2
@@ -398,6 +410,7 @@ start() {
 		fail "cannot create namespace ${NS}"
 	say "applying scripts/lab/novanas-serve-job.yaml as ${JOB}"
 	sed -e "s/__RUN_ID__/${RUN_ID}/g" -e "s|__SERVER_ARGS__|${SERVER_ARGS}|g" \
+		-e "s/__GPUS__/${SERVE_GPUS}/g" \
 		"${REPO_ROOT}/scripts/lab/novanas-serve-job.yaml" |
 		remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" || fail "kubectl apply failed"
 
