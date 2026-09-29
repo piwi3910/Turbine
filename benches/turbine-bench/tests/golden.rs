@@ -1127,7 +1127,7 @@ mod phase8_eval {
         write_eval_tasks(&tasks, None);
 
         let baseline = dir.path().join("baseline.json");
-        let out = tokio::task::spawn_blocking({
+        tokio::task::spawn_blocking({
             let (base, tasks, baseline) = (base.clone(), tasks.clone(), baseline.clone());
             move || {
                 let out = eval_golden_cmd()
@@ -1140,7 +1140,6 @@ mod phase8_eval {
         })
         .await
         .unwrap();
-        let _ = out;
 
         // A candidate report identical to the baseline but measured at concurrency 16.
         let mut candidate: Value =
