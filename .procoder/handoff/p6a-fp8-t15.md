@@ -142,3 +142,110 @@ BENCH t15-proof llama-fp8-block commit=d76d123 gpu=0 tests=skip golden1=SKIP gol
 
 **Row-flip commit**: prepared separately (see below), not merged into this branch's history — the
 lead reviews and applies it.
+
+## Rotation 11 (2026-09-30, lead brief r11-fp8block)
+
+Merged `phase-6a-quantization` (tip `ff804c4`). The merge conflicted in `support.rs` on the fp8
+Task 14 row landing in the same block as the fp8_block flip; to keep the flip the LAST commit
+touching that file, `ef09f16` was reverted (`5695d2a`), the merge then applied cleanly
+(`fd16906`), and the flip was re-applied with the same content on top (`7d7e644`).
+
+### 0. lab-serve.sh remote log-stream fix — done
+
+`c648681`: `stop_log_stream` now also `pkill`s the remote `kubectl logs -f job/${JOB}` (the
+process an ssh ControlMaster keeps alive after the local client is killed — the cause of the
+19-minute hang in the previous rotation's soak) once a stream was actually started, with the
+same bracket-trick pattern `gpu_unlock` already uses. New test
+`lab_serve_stops_the_remote_log_stream_once` plus an assertion appended to
+`lab_serve_dry_run_prints_the_start_sequence`. `scripts/gate.sh` (background, this rotation's
+final state): see the tail of this session's log for the exit line; if it hasn't landed yet,
+rerun `scripts/gate.sh` before trusting this branch.
+
+### 1. Golden fixture — self-spread still running, not yet committed
+
+`tests/golden/llama-3.2-3b-instruct-fp8-block/reference.jsonl` exists and is verified
+(`novanas:/home/piwi/turbine-ci/remote/agent-adb021480bf19bfbe/fixtures/llama-3.2-3b-instruct-fp8-block/reference.jsonl`,
+16 lines, `rc=0` at 20260930 00:57Z). The self-spread it needs (`--act-quant none`, as the FP8
+per-tensor README's method) is running but had not finished as of this handoff:
+
+- Job: `/home/piwi/turbine-ci/fp8block_spread.sh` on novanas, launched detached
+  (`setsid nohup`), dequantizes the checkpoint to `/dev/shm` then runs
+  `scripts/golden/self_spread.py … --act-quant none` against the reference above, writing
+  `.../fixtures/llama-3.2-3b-instruct-fp8-block/spread.json`.
+- Queue: inserted `fp8-block-self-spread` (matches `FIXTURE_JOB=r11:fp8-block-self-spread` on
+  the job's command line) into `/home/piwi/turbine-ci/fixture.queue` right before the
+  `llama-3\.1-8b` line, per the brief (the 8B MXFP4-A16 reference job was already holding
+  `fixture.lock` and finishes first; a backup of the queue file before the edit is
+  `fixture.queue.bak-r11`). Confirmed by `fixture-order.log`: my job is ranked ahead of every
+  other current waiter, so it will run right after the 8B job frees the lock.
+- Watch: `/home/piwi/turbine-ci/fp8block_spread.nohup.log` and
+  `.../fixtures/llama-3.2-3b-instruct-fp8-block/{dequant.r11.log,spread.r11.log}`
+  (the log path baked into the script — see
+  `/private/tmp/claude-501/.../scratchpad/fp8block_spread.sh` for the exact script kept in this
+  session's scratchpad, not committed). Last line `fp8block-spread: done rc=<rc>`.
+- Once `spread.json` exists: build `tests/golden/llama-3.2-3b-instruct-fp8-block/tolerance.json`
+  and `README.md` from it exactly as
+  `tests/golden/llama-3.2-3b-instruct-fp8/{tolerance.json,README.md}` were (max(spread, BF16
+  bounds) — decisions.md "Golden tolerance floor for quantized checkpoints"), copy the verified
+  `reference.jsonl` in beside them, commit as
+  `tests/golden/llama-3.2-3b-instruct-fp8-block/{reference.jsonl,tolerance.json,README.md}`, and
+  run `cargo test -p turbine-bench --test golden quant_fixtures_valid` (the fixture is already
+  registered in `QUANT_SLUGS` with the matching repo/revision, so it only needs the three files
+  to exist and pass `check_fixture`). Not committed yet in this rotation because the numbers
+  aren't known.
+
+### 2. GPU job A: golden1 + golden16 + bench — running, waiting for its go-file
+
+Script `.procoder/handoff/p6a-fp8-t15-bench-r11.sh` (committed `eb85753`, log-redirect-order fix
+`5c6df91`), the equivalent of `scripts/lab-bench.sh --model llama-fp8-block --golden16 --c1` as a
+native detached script (built from this workspace's `src`, so it doesn't foreground-block a
+caller for the whole measurement). Launched on novanas as
+`/home/piwi/turbine-ci/remote/agent-a4baec4689b995379/fp8block_bench_launch.sh`
+(`setsid nohup`, pid printed in `fp8block_bench_launch.nohup.log`); it builds the kernel library
+and the release server/bench/golden, then waits (bounded 24h) for the go-file
+`/home/piwi/turbine-ci/gpu-queue/fp8block-bench.go` before taking
+`port18000.lock → bench.gate → bench.lock` on GPU 0, pausing CPU fixture jobs for the duration.
+Serves `scripts/lab/phase6-novanas-llama-fp8-block.yaml` with
+`reliability.circuit.latency_drift_open=100` (the golden-c1 / c1-latency legs serialize one
+request at a time, which can look like a latency drift to the default 4.0 threshold) and greps
+circuit transitions out of the server log.
+
+- Watch: `.../fp8block-bench/fp8block-bench.log`, last line `fp8block-bench: done rc=<rc>`, and
+  the `fp8block-bench: BENCH r11-fp8block llama-fp8-block …` summary line just above it.
+  Judge: `golden1`/`golden16` verdicts, `bench.json`'s `output_token_throughput` (compare to the
+  854.7 tok/s BF16 floor and the t15-proof pass's 1061.44), `bench-c1.json`'s ITL, and that no
+  `circuit:` lines show `CIRCUIT_OPEN`.
+- **Sent `ready: fp8block-bench.go` to the lead** — the lead creates the go-file in GPU queue
+  order; nothing here starts before it.
+
+### 3. GPU job B: the 10-minute soak — waiter running, waiting for its go-file
+
+Snapshot worktree `.claude/worktrees/r11-soak-fp8block` (`git worktree add --detach` at commit
+`5c6df91`, which carries the lab-serve fix), so later commits on `p6a-fp8-t15` don't change the
+soak mid-run. Mac-side waiter
+`scratchpad/fp8block-soak/wait_and_soak.sh` (not committed, session scratchpad only, following
+the previous rotation's `fp8-soak/wait_and_soak.sh` pattern) launched detached (`nohup … &`,
+pid in this session): waits for the go-file
+`/home/piwi/turbine-ci/gpu-queue/fp8block-soak.go` AND a free `bench.lock` (checked over ssh
+every 10 min, bounded 9h), then runs
+`scripts/overload-soak.sh novanas --duration 10m --model /home/piwi/turbine-models/llama-3.2-3b-instruct-fp8-block`
+from the snapshot worktree.
+
+- Watch: `scratchpad/fp8block-soak/wait_and_soak.log`, last line `fp8block-soak: done rc=<rc>`
+  naming the verdict directory (`target/soak/novanas-*` under the snapshot worktree).
+- **Sent `ready: fp8block-soak.go` to the lead** — same queue-order rule as job A; this should
+  run after job A releases `bench.lock` (or whatever the lead's queue order says).
+
+### Left after this rotation
+
+1. The self-spread (§1) — once it lands, build and commit the fixture's `tolerance.json` /
+   `README.md`, then run `quant_fixtures_valid`.
+2. Judge GPU job A's log once `fp8block-bench.go` is created and the run finishes.
+3. Judge GPU job B's log once `fp8block-soak.go` is created and the run finishes; delete the
+   snapshot worktree (`git worktree remove .claude/worktrees/r11-soak-fp8block`) once judged.
+4. Perf-log row and labbook entries for both runs, once judged (not added yet — the S-11 gate
+   needs golden c1/c16 against the real fixture plus the bench and the soak, all three still
+   pending at the end of this rotation).
+5. The support-matrix row flip (`7d7e644`) stays provisional until 1–3 above close it out; if
+   any of them fails, the row needs to go back to `experimental` in a follow-up
+   `handoff(support.rs)` commit.
