@@ -39,6 +39,7 @@ mod qgemm;
 pub mod quant;
 mod rope;
 mod topk;
+pub mod tq_attention;
 
 pub use topk::torch_topk;
 

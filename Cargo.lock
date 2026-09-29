@@ -2478,6 +2478,7 @@ dependencies = [
  "tracing-subscriber",
  "turbine-core",
  "turbine-device",
+ "turbine-kv",
  "turbine-observability",
  "turbine-tensor",
 ]
