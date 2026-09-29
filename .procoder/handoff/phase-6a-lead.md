@@ -81,6 +81,9 @@ Finished (don't reuse): ad2d9c8c7cc380c42 (Task 24 wrap-up).
 - Disk: cleanup from ~100 GB free (209 GB at 07:56): `git worktree remove` merged clean finished trees →
   `TURBINE_PRUNE_IDLE_HOURS=1 scripts/lab-prune.sh --report` → real run only if it lists finished agents' trees only.
 - Rotation: one task per builder; replace at ~300k tokens with a handoff; sonnet for mechanical work.
+- Never block in the foreground on a lock or a long remote run (coordinator, 2026-09-29; three builders died to
+  the 600 s stream watchdog): start them with `run_in_background` (or detached on the host) and get notified. Put
+  this line in every builder brief. Builds and gates no longer take bench.lock (f94cbf1: nice 19, cores 12-15).
 - No polling (coordinator, 2026-09-29): a builder whose only remaining work is waiting hours for a queued run writes
   the run's paths and how to judge it into its handoff, messages the lead and ends. The lead checks the novanas logs
   cheaply whenever woken and starts a short-lived collector (sonnet unless numerics) once a run has finished. The lead
@@ -116,3 +119,8 @@ Update it at the next clean point.
 - Task 15 served bytes: `scratchpad/t15_weight_bytes.txt` (last line `t15-serve: done rc=… run=…`; local pid 55147);
   the Task 15 proof builder judges it (3,607,615,488 B, no `fp8_block_decoded`).
 
+
+- 10:30: novanas stopped answering ssh (ping ~300 ms); waited, not debugged. Killed the queued T15 served-bytes chain
+  (pid 55147): its old bench-lock.sh would have run the T15 worktree's new self-locking lab-serve.sh and deadlocked
+  on its own lock; relaunch it with the new scripts. Worktrees without e06afc9 (p6a-mxfp4 with queue4 running,
+  p6a-int4, p6a-yarn-t28, p6a-kv-t24-full) must not merge integration while their old-script queues run.
