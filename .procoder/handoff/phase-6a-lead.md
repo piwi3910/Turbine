@@ -95,3 +95,24 @@ Finished (don't reuse): ad2d9c8c7cc380c42 (Task 24 wrap-up).
 `.procoder/review-2026-09-29.md` is as the previous lead left it (overnight state, through 2116221). Not yet updated
 with: the agent loss and rebuild, the new builders, the Task 24 / 18 / 20 numbers in this file, the GSM8K decisions.
 Update it at the next clean point.
+
+## Since 09:00 (second lead)
+
+- Merged p6a-fp8-t15 (16b06ef): `turbine_hip_fp8_block` (W8A16, fused WMMA decode, dequant+hipBLASLt prefill), FP8
+  layout in the loader with per-stack decode fallback (`for_kernels` / `resolve_for_providers`), the old widened test
+  bound removed. Lead-owned handoffs reviewed (weights/mod.rs, fp8.rs, model.rs) before the merge.
+- e06afc9: `lab-serve.sh` takes bench.lock itself for its serve Job's life (holder `runs/serve-locks/<run>.sh` on
+  novanas, released on Job deletion), `--gpus 2` refused; `bench-lock.sh` exports `TURBINE_BENCH_LOCK_HELD`.
+  Builders' worktrees get it when they merge integration.
+- Task 15 proof builder `ae29a5cff88bf0bdb` (worktree agent-a4baec4689b995379), gated on the served-bytes check.
+
+## Detached runs to collect (check cheaply when woken; start a short collector once done)
+
+- Full-GSM8K FP8 KV, 4 passes (a67eec8abc8f117eb, ended): handoff `.procoder/handoff/p6a-kv-t24-full.md` on
+  `p6a-kv-t24-full` (027803a). Log `/home/piwi/turbine-ci/remote/agent-a67eec8abc8f117eb/gsm8k_full_run.log`, done at
+  `ALLDONE rc: …`. Until then no remote-cargo / lab-bench / gate from that worktree and don't remove it. Both
+  checkpoints seem to lack k_scale/v_scale (scales 1.0): an OLMoE miss points at e4m3 range/saturation first, then
+  Turbine vs the emulated-FP8-KV reference; that collector needs the default model.
+- Task 15 served bytes: `scratchpad/t15_weight_bytes.txt` (last line `t15-serve: done rc=… run=…`; local pid 55147);
+  the Task 15 proof builder judges it (3,607,615,488 B, no `fp8_block_decoded`).
+
