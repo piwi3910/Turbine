@@ -983,23 +983,33 @@ mod phase8_eval {
     }
 }
 
-/// Phase 8 (S-4): the committed GSM8K-200 task set every lossy-format gate runs.
+/// Phase 8 (S-4): the committed GSM8K-200 task set every lossy-format gate runs, and
+/// (Phase 6a) the full GSM8K test split used for the FP8-KV and MXFP4-A16 full-set
+/// reruns (`.procoder/ask/decisions.md`, "Phase 6a gate misses on GSM8K-200").
 mod phase8_eval_task_set {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    #[test]
-    fn eval_task_set_valid() {
+    fn eval_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/eval")
+    }
+
+    /// Checks the shape every eval task file must have: exactly `expected_count` lines,
+    /// each a valid task with a unique id, `final_number` matching and a numeric answer.
+    fn check_task_set(path: &Path, expected_count: usize) {
         use turbine_bench::golden::eval::{MatchKind, load_tasks, normalize_number};
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/eval");
-        let path = root.join("gsm8k-200.jsonl");
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text.lines().count(), 200, "exactly 200 lines");
-        let tasks = load_tasks(&path).expect("every line parses, ids unique");
-        assert_eq!(tasks.len(), 200);
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            expected_count,
+            "{}: exactly {expected_count} lines",
+            path.display()
+        );
+        let tasks = load_tasks(path).expect("every line parses, ids unique");
+        assert_eq!(tasks.len(), expected_count);
         let mut ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 200, "unique ids");
+        assert_eq!(ids.len(), expected_count, "unique ids");
         for t in &tasks {
             assert_eq!(t.match_kind, MatchKind::FinalNumber, "{}", t.id);
             assert!(
@@ -1015,11 +1025,39 @@ mod phase8_eval_task_set {
             );
             assert!(t.max_tokens > 0, "{}", t.id);
         }
+    }
+
+    #[test]
+    fn eval_task_set_valid() {
+        let root = eval_root();
+        check_task_set(&root.join("gsm8k-200.jsonl"), 200);
         let notice =
             std::fs::read_to_string(root.join("NOTICE")).expect("tests/eval/NOTICE exists");
         assert!(
             notice.contains("MIT License"),
             "NOTICE carries the source license"
+        );
+    }
+
+    /// The full GSM8K test split: 1,319 items, same shape as gsm8k-200.jsonl, and its
+    /// first 200 items byte-identical to the committed gsm8k-200.jsonl (both are the
+    /// same GSM8K test split, wrapped and matched the same way).
+    #[test]
+    fn eval_task_set_full_valid_and_matches_200() {
+        let root = eval_root();
+        let full_path = root.join("gsm8k-full.jsonl");
+        check_task_set(&full_path, 1319);
+
+        let full_text = std::fs::read_to_string(&full_path).unwrap();
+        let full_first_200: String = full_text
+            .lines()
+            .take(200)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let text_200 = std::fs::read_to_string(root.join("gsm8k-200.jsonl")).unwrap();
+        assert_eq!(
+            full_first_200, text_200,
+            "gsm8k-full.jsonl's first 200 items are byte-identical to gsm8k-200.jsonl"
         );
     }
 }

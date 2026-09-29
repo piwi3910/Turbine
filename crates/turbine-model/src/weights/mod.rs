@@ -768,6 +768,24 @@ mod tests {
         kv_quark["kv_cache_quant_config"] = json!({"*k_proj": {"input_tensors": {"dtype": "fp4"}}});
         let format = detect(&json!({ "quantization_config": kv_quark })).expect("loads");
         assert_eq!(format.column(), WeightFormatColumn::Mxfp4A4);
+        // Quark repeats that KV recipe as K/V projection overrides that change only
+        // `output_tensors` (the AMD 8B checkpoint): accepted. An override that changes a
+        // projection's weight scheme, or one not mirrored in kv_cache_quant_config, is refused.
+        let mut kv_layers = quark(true);
+        let mut kv_spec = kv_layers["global_quant_config"].clone();
+        kv_spec["output_tensors"] = json!({"dtype": "fp8_e4m3", "qscheme": "per_tensor"});
+        let recipe = json!({"*k_proj": kv_spec.clone(), "*v_proj": kv_spec.clone()});
+        kv_layers["kv_cache_quant_config"] = recipe.clone();
+        kv_layers["layer_quant_config"] = recipe;
+        let format = detect(&json!({ "quantization_config": kv_layers.clone() })).expect("loads");
+        assert_eq!(format.column(), WeightFormatColumn::Mxfp4A4);
+        let mut other_weight = kv_layers.clone();
+        other_weight["layer_quant_config"]["*k_proj"]["weight"]["group_size"] = json!(64);
+        other_weight["kv_cache_quant_config"]["*k_proj"]["weight"]["group_size"] = json!(64);
+        assert_eq!(refused(other_weight).0, "layer_quant_config.*k_proj");
+        let mut not_kv = kv_layers;
+        not_kv["layer_quant_config"]["*o_proj"] = kv_spec;
+        assert_eq!(refused(not_kv).0, "layer_quant_config.*o_proj");
 
         // MXFP4 refusals: a compressed-tensors group of 64; NVFP4 names the NVIDIA track.
         let (field, supported) = refused(json!({
