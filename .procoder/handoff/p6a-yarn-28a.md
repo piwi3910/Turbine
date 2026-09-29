@@ -12,6 +12,29 @@ clean-passed**. Added the `t28a-lab.go` go-file wait to `p6a-yarn-28a-lab.sh` (r
 queue-order rule) before it takes `port18000.lock`. Did not touch lab-test.sh or the GPU (per
 brief, asked the lead for a slot instead).
 
+Updated 2026-09-30 ~00:30 by the same builder: `scripts/remote-cargo.sh build --release -p
+turbine-server -p turbine-bench -p turbine-model --tests` synced src and built clean (rc=0, ~42
+min cold). Copied the updated `p6a-yarn-28a-lab.sh` to
+`/home/piwi/turbine-ci/remote/agent-p6a-yarn-t28a/t28a_lab.sh` and started it detached
+(`setsid nohup bash t28a_lab.sh`). It waited on `t28a-lab.go` (created by the lead ~21:20 +04) and
+**ran to completion, rc=0, all PASS**: teacher-forced p16 max |Δ| likely/tail cpu (0.0667,
+0.3945) hip (0.0968, 0.2922), p17-long hip (0.0229, 0.4038); `llama-yarn16` golden c1/c16 17/17
+prompts passing (need 15), tok/s 854.7; `llama` (BF16, unchanged) golden c1/c16 16/16 (need 14),
+tok/s 871.9. Log `/home/piwi/turbine-ci/remote/agent-p6a-yarn-t28a/t28a-lab.log`, artifacts under
+`.../t28a-lab/`.
+
+The `t28a:yarn-nofold` spread fixture (queued under `fixture.lock`) also finished: `.../t28a/
+yarn-nofold-spread.log` last line `t28a-spread: done rc=0 short=0 long=0`. Computed max |Δ| across
+every prompt and variant in `yarn-nofold-{short,long}.json`: likely 0.1864316463470459, tail
+0.8377771377563477. Set `tests/golden/llama-3.2-3b-instruct-yarn16/tolerance.json` per the rule
+(max(spread, Llama BF16 0.15/0.55, batched 0.25/0.75), rounded up to 3 decimals): strict likely
+0.187, strict tail 0.838, batched likely 0.25 (unchanged — spread doesn't exceed it), batched tail
+0.838. Every number above (teacher-forced and golden) already passes the new, tighter-than-nothing
+bounds. README updated with the final numbers. Committed as `fdfc953` (go-file wait + status) and
+a follow-up tolerance/README commit (see `git log`).
+
+**Both the GPU proof and the CPU spread are done — nothing is running detached anymore.**
+
 ## Done (commits)
 
 - fd201ab `handoff(turbine_kernels.h, ffi.rs, ops)`: `turbine_rope_desc.attn_factor` (trailing float),
@@ -41,30 +64,32 @@ brief, asked the lead for a slot instead).
 Evidence: `scripts/remote-cargo.sh test -p turbine-kernels -p turbine-model -p turbine-server` rc=0,
 every new test ok. **`scripts/gate.sh` NOT run yet** (commits are ungated; clippy may flag something).
 
-## Running detached (do not duplicate)
+## Running detached
 
-- Transformers no-fold spread (tolerance input), CPU fixture job: `/home/piwi/turbine-ci/scratch/t28a/yarn_nofold_spread.sh`,
-  log `/home/piwi/turbine-ci/scratch/t28a/yarn-nofold-spread.log` (last line `t28a-spread: done rc=<rc> short=… long=…`),
-  outputs `…/t28a/yarn-nofold-short.json` (p01–p16, variants bf16-sdpa-incremental,bf16-sdpa-full,bf16-eager-incremental,fp32-sdpa-incremental)
-  and `…/t28a/yarn-nofold-long.json` (p17-long, bf16-sdpa-incremental), per-part logs `yarn-nofold-{short,long}.log`.
-  Queued under fixture.lock; queue entry `t28a:yarn-nofold` added to `/home/piwi/turbine-ci/fixture.queue`
-  after `t14:fp8-tensor` (backup `…/t28a/fixture.queue.bak`). Judge: per prompt max |Δ| likely/tail over
-  the variants; tolerance.json = max(spread, Llama BF16 bounds 0.15 / 0.55, batched 0.25 / 0.75).
+Nothing. Both the GPU proof (`t28a-lab.sh`, rc=0) and the CPU spread fixture (`t28a:yarn-nofold`,
+rc=0) finished 2026-09-30 ~00:xx and their results are folded into `tolerance.json` / the README
+(see the update above). The go-file (`t28a-lab.go`) and the fixture.queue entry can be cleaned up
+by whoever owns queue hygiene; not done here to avoid touching shared novanas state beyond scope.
 
 ## Exact next steps
 
-1. `scripts/gate.sh` (background) → fix clippy/fmt, amend or add a fix commit.
-2. `scripts/lab-test.sh novanas --tier quick` (background): hip_ops rope cases with the factor.
-3. GPU proof: a ready-made detached script is at `.procoder/handoff/p6a-yarn-28a-lab.sh` (copy to
-   `/home/piwi/turbine-ci/remote/agent-p6a-yarn-t28a/`, sync src first with `scripts/remote-cargo.sh build`,
-   start with `setsid nohup bash t28a_lab.sh >/dev/null 2>&1 </dev/null &`). It builds kernels + release bins,
-   then port18000.lock → bench.gate → bench.lock on GPU 0: teacher-forced p16,p17-long (hip + cpu), serve
-   yarn16 golden c1/c16 + bench, serve llama golden c1/c16 + bench. Log `…/t28a-lab.log`, last line
-   `t28a-lab: done rc=<rc>`, artifacts in `…/t28a-lab/`. Judge: p16 hip tail ≈ 0.40 (was 1.38), cpu ≈ 0.395;
-   yarn16 golden PASS; llama golden unchanged PASS. Not yet run (never started).
-   Then the formal `scripts/lab-bench.sh --model llama-yarn16 --golden16` and `--model llama --golden16`, perf-log row.
-4. When the spread lands: tolerance.json per the rule, README spread line, commit
-   `feat(kernels): YaRN attention factor on cos/sin (ABI v2.10)` per plan (or a follow-up test commit).
+1. `scripts/gate.sh` — attempted 3x by the rotation-9 builder, all 3 failed on an ssh transport
+   drop to novanas (not a code failure); **still needs a clean run**. Retry when novanas ssh load
+   is lower; if clippy/fmt then flags something real, fix and amend/add a commit.
+2. `scripts/lab-test.sh novanas --tier quick` (ask the lead for a GPU slot; not run yet): hip_ops
+   rope cases with the factor. The GPU proof above already exercised the HIP rope kernel with the
+   factor end-to-end (teacher-forced + served golden), so this is a lint-style backstop, not a
+   discovery step.
+3. GPU proof: **done**, see the 2026-09-30 update above and the README's "GPU proof" paragraph.
+   The formal `scripts/lab-bench.sh --model llama-yarn16 --golden16` and `--model llama --golden16`
+   perf-log rows are still outstanding (the ad-hoc lab script's numbers are a proxy, not the
+   official perf-log entry) — needs a GPU slot from the lead.
+4. Spread landed and tolerance.json/README updated (see above). Still open: the plan's final
+   commit `feat(kernels): YaRN attention factor on cos/sin (ABI v2.10)` — the three `fd201ab` /
+   `fcdd146` / `a61c453` commits plus this rotation's `fdfc953` and the tolerance/README commit
+   are all `handoff(...)`-prefixed per the ownership rule (lead owns turbine-model
+   config/decoder/loader, the kernel header, ffi.rs, ops, `.procoder/`); the lead should fold or
+   re-tag them into the plan's canonical commit when merging this branch.
 
 ## Open questions
 
