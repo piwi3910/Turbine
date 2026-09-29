@@ -35,6 +35,7 @@ impl Fp8Packaging for HfFp8 {
         act: ActivationQuant::Fp8PerTokenDynamic,
         ignore: Vec::new(),
         scale_suffix: "weight_scale",
+        decoded: Vec::new(),
     };
 
     fn claims(q: &Value) -> Result<(), ModelError> {
@@ -86,6 +87,7 @@ impl Fp8Packaging for HfFp8 {
             } else {
                 "weight_scale"
             },
+            decoded: Vec::new(),
         })
     }
 

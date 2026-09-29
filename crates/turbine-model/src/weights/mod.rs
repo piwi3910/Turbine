@@ -639,8 +639,9 @@ mod tests {
                 ct("block", block.clone(), act("group", true, json!(128))),
                 "ct_fp8",
                 WeightFormatColumn::Fp8Block,
-                // Block-scaled FP8 is decoded to BF16 at load (no gfx1201 provider).
-                QuantScheme::Bf16,
+                // Block-scaled FP8 stays FP8 (W8A16: BF16 activations); decoding to BF16 is
+                // only the per-device fallback (`for_kernels`).
+                QuantScheme::Fp8Block { n: 128, k: 128 },
                 ActivationQuant::None,
             ),
             (
@@ -648,8 +649,9 @@ mod tests {
                        "weight_block_size": [128, 128]}),
                 "hf_fp8",
                 WeightFormatColumn::Fp8Block,
-                // Block-scaled FP8 is decoded to BF16 at load (no gfx1201 provider).
-                QuantScheme::Bf16,
+                // Block-scaled FP8 stays FP8 (W8A16: BF16 activations); decoding to BF16 is
+                // only the per-device fallback (`for_kernels`).
+                QuantScheme::Fp8Block { n: 128, k: 128 },
                 ActivationQuant::None,
             ),
             (
