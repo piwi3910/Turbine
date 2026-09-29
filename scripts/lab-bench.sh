@@ -201,8 +201,23 @@ fi
 # 2. serve natively, pinned to one card
 # CPU fixture jobs (scripts/golden/*) are paused from here to the end (scripts/fixture-pause.sh
 # explains why: their swap-in pushes the server's pressure controller into SURVIVAL).
+# From here to the end the run also holds bench.lock exclusively (the gate first, as
+# scripts/bench-lock.sh does): GPU 0 serves this run only, so kernel evaluations (bench-lock),
+# lab-test and lab-serve Jobs (bench-lock --shared) and builds (flock -s) wait for it.
+lockdir="$(mktemp -d)"
+mkfifo "$lockdir/in" "$lockdir/out"
+ssh -o BatchMode=yes "$host" \
+	"flock -x /home/piwi/turbine-ci/bench.gate flock -x /home/piwi/turbine-ci/bench.lock sh -c 'echo locked; cat >/dev/null'" \
+	<"$lockdir/in" >"$lockdir/out" &
+exec 7>"$lockdir/in"
+echo "lab-bench: waiting for the exclusive bench lock" >&2
+read -r lock_state <"$lockdir/out"
+if [[ "$lock_state" != locked ]]; then
+	echo "lab-bench: could not take the bench lock on $host" >&2
+	exit 1
+fi
 ssh -o BatchMode=yes "$host" "pkill -STOP -u piwi -f 'scripts/[g]olden/'" >/dev/null 2>&1 || true
-trap 'ssh -o BatchMode=yes "$host" "pkill -CONT -u piwi -f '"'"'scripts/[g]olden/'"'"'" >/dev/null 2>&1 || true' EXIT
+trap 'ssh -o BatchMode=yes "$host" "pkill -CONT -u piwi -f '"'"'scripts/[g]olden/'"'"'" >/dev/null 2>&1 || true; exec 7>&-; rm -rf "$lockdir"' EXIT
 # Only this run's own server is ever stopped: its pid is kept in $pidf and checked to still be
 # a turbine-server before the kill (a blanket pkill would also end other agents' test servers
 # running as piwi). A port already served is refused, not taken over.
@@ -280,7 +295,7 @@ golden16_cmd=""
 c1_cmd=""
 rm -f "$out/bench-c1.json"
 [[ $run_c1 -eq 1 ]] && c1_cmd="$bench_cmd --concurrency 1 --requests 10 --max-tokens 128 --ignore-eos --output json > '$out/bench-c1.json' 2> '$out/bench-c1.err'"
-scripts/bench-lock.sh sh -c "
+sh -c "
   $golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 1 > '$out/golden1.txt' 2>&1
   $golden16_cmd
   curl -s '$url/metrics' > '$out/metrics-before.txt'
