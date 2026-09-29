@@ -334,6 +334,56 @@ impl TinyServer {
     }
 }
 
+/// A GET used for polling (`wait_for`) or a retried one-shot read: a transient connect/read
+/// hiccup from a loaded host (WouldBlock/TimedOut, a non-200 status, or a response that doesn't
+/// parse) is `None` rather than a panic, since it reflects host contention rather than the
+/// condition under test. `disconnect_releases_kv` (P2 S-8) hit exactly this: `request()`'s
+/// single-shot read timeout panicked mid-poll on a loaded host instead of letting `wait_for`'s
+/// own deadline decide pass/fail.
+fn poll_json(addr: SocketAddr, path: &str) -> Option<Value> {
+    let mut conn = TcpStream::connect(addr).ok()?;
+    conn.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    write!(
+        conn,
+        "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut resp = String::new();
+    conn.read_to_string(&mut resp).ok()?;
+    let status: u16 = resp.split_whitespace().nth(1)?.parse().ok()?;
+    if status != 200 {
+        return None;
+    }
+    serde_json::from_str(resp.split("\r\n\r\n").nth(1)?).ok()
+}
+
+/// `/turbine/v1/kv`'s `l0` `referenced_blocks`, tolerating a transient host hiccup (see
+/// [`poll_json`]).
+fn poll_blocks_used(addr: SocketAddr) -> Option<u64> {
+    poll_json(addr, "/turbine/v1/kv")?["tiers"][0]["referenced_blocks"].as_u64()
+}
+
+/// Replica 0's scheduler document, tolerating a transient host hiccup (see [`poll_json`]).
+fn poll_scheduler(addr: SocketAddr) -> Option<Value> {
+    poll_json(addr, "/turbine/v1/scheduler")?.get("0").cloned()
+}
+
+/// A one-shot (non-`wait_for`) read of `poll_blocks_used`, retried for up to 10 s instead of
+/// panicking on the first transient hiccup.
+fn blocks_used_retrying(addr: SocketAddr) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(n) = poll_blocks_used(addr) {
+            return n;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "GET /turbine/v1/kv: no usable response within 10s"
+        );
+        std::thread::sleep(POLL);
+    }
+}
+
 /// Running requests in a scheduler document.
 fn running(doc: &Value) -> u64 {
     ["prefilling", "decoding", "paused"]
@@ -379,7 +429,9 @@ impl OpenStream {
     /// the first SSE chunk (a queued request produces none until it runs).
     fn open(addr: SocketAddr, body: &Value, first_chunk: bool) -> OpenStream {
         let mut conn = held_connection(addr);
-        conn.set_read_timeout(Some(Duration::from_secs(60)))
+        // Generous: on a loaded host a chunk gap can run well past a healthy host's, and a read
+        // timeout here surfaces as a raw io::Error panic instead of a clear "not ready" signal.
+        conn.set_read_timeout(Some(Duration::from_secs(120)))
             .unwrap();
         write_request(
             &mut conn,
@@ -1107,33 +1159,36 @@ fn disconnect_releases_kv() {
     let server = TinyServer::start_long_with(HOLD_PAUSED, "");
     let mut streams: Vec<OpenStream> = (0..8).map(|_| server.hold_stream()).collect();
     wait_for(Duration::from_secs(60), "all 8 streams paused", || {
-        let doc = server.scheduler();
+        let doc = poll_scheduler(server.addr).unwrap_or_default();
         doc["paused"] == 8 && doc["waiting"] == 0
     });
     // Paused requests hold their blocks and grow no more.
-    let all8 = server.blocks_used();
+    let all8 = blocks_used_retrying(server.addr);
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(server.blocks_used(), all8);
+    assert_eq!(blocks_used_retrying(server.addr), all8);
 
     let kept = streams.split_off(4);
     drop(streams);
     let dropped = Instant::now();
+    // The 1 s bound is the P2 S-8 spec claim under test (cancellation frees blocks within one
+    // engine iteration); `poll_scheduler` only turns a transient read/connect hiccup from a
+    // loaded host into "not reached yet" instead of a panic that pre-empts this deadline.
     wait_for(
         Duration::from_secs(1),
         "dropped clients' blocks freed",
         || {
-            let doc = server.scheduler();
+            let doc = poll_scheduler(server.addr).unwrap_or_default();
             doc["paused"] == 4 && running(&doc) == 4
         },
     );
-    let remaining = server.blocks_used();
+    let remaining = blocks_used_retrying(server.addr);
     assert!(dropped.elapsed() < Duration::from_secs(1));
     // Every dropped request held at least its prompt block; the remaining four still hold
     // exactly theirs (they stay paused, so their usage is stable).
     assert!(remaining + 4 <= all8, "{remaining} of {all8}");
     assert!(remaining >= 4, "{remaining}");
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(server.blocks_used(), remaining);
+    assert_eq!(blocks_used_retrying(server.addr), remaining);
     let metrics = server.metrics();
     assert_eq!(
         sample(
@@ -1147,8 +1202,8 @@ fn disconnect_releases_kv() {
     for s in kept {
         assert_eq!(stream_finish_reason(&s.read_rest()), "length");
     }
-    wait_for(Duration::from_secs(1), "every block free", || {
-        server.blocks_used() == 0
+    wait_for(Duration::from_secs(5), "every block free", || {
+        poll_blocks_used(server.addr) == Some(0)
     });
     let tier = server.kv_tier();
     assert_eq!(tier["referenced_blocks"], 0, "{tier}");
