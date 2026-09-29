@@ -34,7 +34,10 @@
 //   the batch's pages dequantized into a BF16 staging pool in the context's
 //   attention scratch, then CK fmha_fwd_pagedkv over it with a staged block
 //   table, in groups of sequences whose staged pages fit kStagedMaxBytes; a
-//   call where one sequence alone does not fit runs the Turbine FP8 kernel;
+//   call where one sequence alone does not fit runs the Turbine FP8 kernel.
+//   Sequences with a single query row (decode rows riding along a prefill)
+//   are not staged: the FP8 decode kernel computes them after CK, as it does
+//   in a decode call, so a decode row's result does not depend on the batch;
 // - "turbine_hip_fp8_decode" (decode, any page size): paged_attention.hip's
 //   FP8 decode kernel, the query heads of a KV head together, pages read as
 //   bytes;
@@ -135,6 +138,8 @@ struct CkPages {
   const uint16_t *pool;
   const int32_t *table;
   int32_t table_stride;
+  // The group's key counts ([count], group-relative).
+  const int32_t *kv_lens;
   int32_t g0;
   int32_t count;
 };
@@ -146,8 +151,8 @@ int32_t run_ck(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                const std::string &entry) {
   return run_ck_pages(ctx, d, entry,
                       CkPages{static_cast<const uint16_t *>(d->kv_layer),
-                              d->block_table, d->max_blocks_per_seq, 0,
-                              d->num_seqs});
+                              d->block_table, d->max_blocks_per_seq, d->kv_lens,
+                              0, d->num_seqs});
 }
 
 int32_t run_ck_pages(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
@@ -193,7 +198,7 @@ int32_t run_ck_pages(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   // absolute rows, so the group's queries stay where they are.
   args.seqstart_q_ptr = d->q_indptr + pages.g0;
   args.seqstart_k_ptr = d->q_indptr + pages.g0;
-  args.seqlen_k_ptr = d->kv_lens + pages.g0;
+  args.seqlen_k_ptr = pages.kv_lens;
   args.sink_ptr = nullptr;
   args.seqlen_q = d->max_q_len;
   args.seqlen_k = d->max_kv_len;
@@ -295,7 +300,7 @@ int32_t run_ck_fp8_staged(turbine_ctx *ctx,
       d->block_tokens;
   if (pages < 1)
     return TURBINE_OK;
-  const int64_t per_seq = pages * (block_bytes + 4);
+  const int64_t per_seq = pages * (block_bytes + 4) + 4;
   if (per_seq > kStagedMaxBytes || pages > d->max_blocks_per_seq)
     return turbine_hip::launch_paged_attention(ctx, d);
   const int64_t group =
@@ -303,31 +308,35 @@ int32_t run_ck_fp8_staged(turbine_ctx *ctx,
   const int64_t pool_bytes = group * pages * block_bytes;
   void *scratch = nullptr;
   if (int32_t rc = turbine_hip::attention_scratch(
-          ctx, static_cast<size_t>(pool_bytes + group * pages * 4), &scratch);
+          ctx, static_cast<size_t>(pool_bytes + group * (pages + 1) * 4),
+          &scratch);
       rc != TURBINE_OK) {
     return rc;
   }
   auto *staged = static_cast<uint16_t *>(scratch);
   auto *table =
       reinterpret_cast<int32_t *>(static_cast<char *>(scratch) + pool_bytes);
+  int32_t *staged_kv_lens = table + group * pages;
   for (int64_t g0 = 0; g0 < d->num_seqs; g0 += group) {
     const auto count =
         static_cast<int32_t>(std::min<int64_t>(group, d->num_seqs - g0));
     if (int32_t rc = turbine_hip::launch_paged_stage_fp8(
-            ctx, d, staged, table, static_cast<int32_t>(g0), count,
-            static_cast<int32_t>(pages));
+            ctx, d, staged, table, staged_kv_lens, static_cast<int32_t>(g0),
+            count, static_cast<int32_t>(pages));
         rc != TURBINE_OK) {
       return rc;
     }
-    if (int32_t rc =
-            run_ck_pages(ctx, d, entry,
-                         CkPages{staged, table, static_cast<int32_t>(pages),
-                                 static_cast<int32_t>(g0), count});
+    if (int32_t rc = run_ck_pages(
+            ctx, d, entry,
+            CkPages{staged, table, static_cast<int32_t>(pages), staged_kv_lens,
+                    static_cast<int32_t>(g0), count});
         rc != TURBINE_OK) {
       return rc;
     }
   }
-  return TURBINE_OK;
+  // The single-query rows CK only saw one unconverted key for (after every
+  // group, so they overwrite CK's rows).
+  return turbine_hip::launch_paged_decode_fp8(ctx, d);
 }
 
 int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,

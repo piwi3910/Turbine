@@ -455,8 +455,9 @@ __global__ void __launch_bounds__(kThreads) paged_decode_fp8_kernel(
   const int32_t seq = blockIdx.x;
   const int32_t kv_head = blockIdx.y;
   const int32_t row = q_indptr[seq];
-  // Uniform across the block: return before any barrier.
-  if (q_indptr[seq + 1] - row < 1)
+  // Only sequences with one query row (a prefill call hands its decode rows
+  // here too). Uniform across the block: return before any barrier.
+  if (q_indptr[seq + 1] - row != 1)
     return;
   const int32_t kv_len = kv_lens[seq];
   const int64_t token_elems = static_cast<int64_t>(kv_heads) * kHeadDim;
@@ -619,20 +620,29 @@ __global__ void __launch_bounds__(kThreads) paged_decode_fp8_kernel(
 
 // Grid (pages, sequences of the group): converts page p of sequence g0 + y to
 // the BF16 staging block y * pages + p (both halves) and writes that index into
-// the staged table [group, pages]. Pages past a sequence's keys, or missing,
-// are not converted (CK never reads them).
+// the staged table [group, pages], and the key count CK sees into
+// staged_kv_lens[y]. Pages past a sequence's keys, or missing, are not
+// converted (CK never reads them). A sequence with a single query row is left
+// to the FP8 decode kernel (launched after CK): its pages are not converted
+// and CK sees one (unconverted) key, so CK's row for it is only overwritten.
 __global__ void paged_stage_fp8_kernel(
     const uint8_t *kv_layer, Bf16 *staged, int32_t *staged_table,
-    const int32_t *block_table, const int32_t *kv_lens, int32_t g0,
-    int32_t pages, int32_t max_blocks, int32_t num_blocks, int32_t block_tokens,
+    int32_t *staged_kv_lens, const int32_t *block_table,
+    const int32_t *q_indptr, const int32_t *kv_lens, int32_t g0, int32_t pages,
+    int32_t max_blocks, int32_t num_blocks, int32_t block_tokens,
     int64_t token_elems, float k_scale, float v_scale) {
   const int32_t p = blockIdx.x;
   const int32_t y = blockIdx.y;
   const int32_t s = g0 + y;
   const int32_t dst = y * pages + p;
-  if (threadIdx.x == 0)
+  const bool single = q_indptr[s + 1] - q_indptr[s] == 1;
+  if (threadIdx.x == 0) {
     staged_table[dst] = dst;
-  if (static_cast<int64_t>(p) * block_tokens >= kv_lens[s] || p >= max_blocks)
+    if (p == 0)
+      staged_kv_lens[y] = single ? 1 : kv_lens[s];
+  }
+  if (single || static_cast<int64_t>(p) * block_tokens >= kv_lens[s] ||
+      p >= max_blocks)
     return;
   const int32_t block = block_table[static_cast<int64_t>(s) * max_blocks + p];
   if (block < 0 || block >= num_blocks)
@@ -750,14 +760,16 @@ int32_t launch_paged_decode_fp8(turbine_ctx *ctx,
 
 int32_t launch_paged_stage_fp8(turbine_ctx *ctx,
                                const turbine_attention_paged_desc *d,
-                               void *staged, int32_t *staged_table, int32_t g0,
+                               void *staged, int32_t *staged_table,
+                               int32_t *staged_kv_lens, int32_t g0,
                                int32_t count, int32_t pages) {
   hipLaunchKernelGGL(
       paged_stage_fp8_kernel,
       dim3(static_cast<unsigned>(pages), static_cast<unsigned>(count)),
       dim3(kThreads), 0, ctx->stream,
       static_cast<const uint8_t *>(d->kv_layer), static_cast<Bf16 *>(staged),
-      staged_table, d->block_table, d->kv_lens, g0, pages,
+      staged_table, staged_kv_lens, d->block_table, d->q_indptr, d->kv_lens,
+      g0, pages,
       d->max_blocks_per_seq, d->num_blocks, d->block_tokens,
       static_cast<int64_t>(d->num_kv_heads) * kHeadDim, d->k_scale,
       d->v_scale);

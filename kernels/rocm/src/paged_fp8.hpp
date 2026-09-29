@@ -17,17 +17,21 @@ namespace turbine_hip {
 // Largest num_q_heads / num_kv_heads the FP8 decode kernel handles.
 constexpr int32_t kPagedFp8DecodeMaxGroup = 8;
 
-// Decode (one query per sequence) over FP8 pages, every query head of a KV
-// head in one workgroup.
+// Decode over FP8 pages, every query head of a KV head in one workgroup: the
+// sequences with exactly one query row (every one in a decode call; the
+// decode rows of a staged prefill call); the others are skipped.
 int32_t launch_paged_decode_fp8(turbine_ctx *ctx,
                                 const turbine_attention_paged_desc *d);
 
 // Dequantizes the pages of sequences [g0, g0 + count) into BF16 blocks of
 // staged ([count * pages] blocks, the pool's block layout) and writes the
-// staged block table [count, pages] (row-major) into staged_table.
+// staged block table [count, pages] (row-major) into staged_table and the key
+// counts CK sees into staged_kv_lens [count]; a sequence with one query row is
+// not staged (the decode kernel computes it) and gets one key.
 int32_t launch_paged_stage_fp8(turbine_ctx *ctx,
                                const turbine_attention_paged_desc *d,
-                               void *staged, int32_t *staged_table, int32_t g0,
+                               void *staged, int32_t *staged_table,
+                               int32_t *staged_kv_lens, int32_t g0,
                                int32_t count, int32_t pages);
 
 // Grows ctx's attention scratch (paged_attention_splitkv.cpp) to at least
