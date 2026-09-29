@@ -35,10 +35,14 @@
 //                                2 turbine_hip_int4_dequant [turbine_hip]
 //                                  (INT4_GROUP_ZP / _SYM, BF16 activations)
 //   quantize_act (v2.9)          0 turbine_hip [turbine_hip] (FP8 modes)
+//   qgemm 3, quantize_act 1      turbine_hip_mxfp4 [turbine_hip] (MXFP4
+//                                  weights x BF16 activations; the
+//                                  MXFP4_EMULATED quantize-dequantize)
 #include <string>
 
 #include "qgemm_impls.hpp"
 #include "qgemm_int4.hpp"
+#include "qgemm_mxfp4.hpp"
 #include "turbine_hip.hpp"
 
 namespace turbine_hip {
@@ -255,10 +259,14 @@ const ImplEntry kQGemm[] = {
         "hipblaslt_fp8", kHipblaslt),
     entry<Int4<Int4Path::Wmma>>("turbine_hip_int4_wmma", kTurbine),
     entry<Int4<Int4Path::Dequant>>("turbine_hip_int4_dequant", kTurbine),
+    entry<Impl<turbine_qgemm_desc, qgemm_mxfp4_supports, qgemm_mxfp4_run>>(
+        "turbine_hip_mxfp4", kTurbine),
 };
 const ImplEntry kQuantizeAct[] = {
     entry<Impl<turbine_quantize_act_desc, quantize_act_fp8_supports,
                quantize_act_fp8_run>>("turbine_hip", kTurbine),
+    entry<Impl<turbine_quantize_act_desc, quantize_act_mxfp4_supports,
+               quantize_act_mxfp4_run>>("turbine_hip_mxfp4", kTurbine),
 };
 
 struct OpImpls {
