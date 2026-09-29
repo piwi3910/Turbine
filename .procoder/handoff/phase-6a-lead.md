@@ -276,7 +276,7 @@ t28aspread, t28alab, gptqfull, w4a4segv, gpu-queue listing). Builder rules: `lea
 `scratch/w4a4-numerics/w4a4rope.sh` with the RAW checkpoint and integration binaries; GSM8K-200 c1 vs vLLM 0.735 + bench).
 
 **Integration** `phase-6a-quantization`: merged db6ba1a (p6a-server-flakes), ff051cd (p6a-gptq-numerics) — gate ok 313/0 —,
-6c4682c (decision: slow-client timer option A), 1bbbbe7 (p6a-w4a4-numerics: engine-join exit fix; NOT yet gated on integration).
+6c4682c (decision: slow-client timer option A), 1bbbbe7 (p6a-w4a4-numerics: engine-join exit fix; gate ok 314/0 --base ff051cd).
 
 **Pending merges / reviews:**
 - `p6a-yarn-t28a` (builder a6caa4f092a670c9c, gate running in its background) → merge first; then `p6a-rope-parameters`
