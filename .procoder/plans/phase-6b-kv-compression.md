@@ -197,6 +197,7 @@ Interfaces:
 - `turbine_kernels::cpu::tq_attention::{prefill, decode}` with the same shapes as the CPU paged attention plus `block_formats: &[u8]` and `&TqParams`
   Covers: spec S-5 (host); AC `cpu::tq_attention::tests`, `tq_kv_matches_reference`, `pool::tests::page_classes`
   Depends on: Task 10
+  Amended (lead, 2026-09-30): the block-table entries `(BlockId, format)` fed from the scheduler and the decoder's addressing of pages in non-base classes move to Task 17 — until the ladder's L0 step every L0 block is in the pool's base format, so Task 11 passes `block_formats` empty (uniform) from the decoder and proves mixed tables at the kernel level (`cpu::tq_attention::tests::mixed_block_table`, `cpu::paged::tests::mixed_formats_append_and_read_by_tag`).
 
 - [ ] Write failing tests `cpu::tq_attention::tests::{matches_decoded_attention, rotated_equals_decoded, mixed_block_table}`, `pool::tests::page_classes` and `tiny_model tq_kv_matches_reference`. Run: `scripts/remote-cargo.sh test -p turbine-kernels cpu::tq_attention` and `scripts/remote-cargo.sh test -p turbine-kv pool` and `scripts/remote-cargo.sh test -p turbine-model --test tiny_model tq_kv` — expect FAIL
 - [ ] Implement; every existing pool, `kv_sim` and `tiny_model` test passes unchanged with one class.
@@ -286,6 +287,7 @@ Interfaces:
 Files: `crates/turbine-kv/src/hierarchy.rs` (L0 as the ladder's top tier: rung state, candidates = unreferenced cached L0 blocks outside each sequence's lossless tail, not promoting or demoting), `crates/turbine-kv/src/policy/cost_aware.rs` (L0 in `LadderContext`), `crates/turbine-server/src/kv_orchestrator.rs` (in-place GPU recompression: base-class page → smaller-class page through `turbine_kv_transcode`, free the base page, lineage key), `crates/turbine-core/src/config/kv.rs` (`ladder.l0`), `crates/turbine-scheduler/tests/kv_sim.rs` (`ladder_l0_under_pinned_pressure`), `crates/turbine-scheduler/tests/fixtures/ladder_l0_expected_rungs.json`
 Interfaces:
 
+- Block-table entries carry the block's format (`(BlockId, format)`, moved here from Task 11) and the decoder passes them as `block_formats` and addresses each block in its page class's slabs (`BlockPool::format_of`)
 - `LadderConfig.l0: bool`; `EvictAction::Compress { to }` now also for `TierId::L0`; `turbine_kv_ladder_rung{tier="l0"}` and `turbine_kv_ladder_actions_total{tier="l0",…}`; skip reason `no_room` when a page class cannot grow
   Covers: spec S-7; AC `ladder_l0_under_pinned_pressure`
   Depends on: Tasks 13, 16
