@@ -9,10 +9,14 @@ use serde::{Deserialize, Serialize};
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum MatchKind {
     Exact,
+    /// The whole output is the number.
     Number,
+    /// The number after the output's last `Answer:` (else its last number), `$`, `,` and trailing
+    /// units ignored: a chain-of-thought answer (GSM8K-200, Phase 6a).
+    FinalNumber,
 }
 
 /// One line of a tasks file: `{"id","prompt"|"messages","answer","match","max_tokens"}`.
@@ -82,7 +86,7 @@ pub fn load_tasks(path: &Path) -> Result<Vec<EvalTask>, EvalError> {
         if task.prompt.is_some() == task.messages.is_some() {
             return Err(bad("exactly one of prompt or messages is required".into()));
         }
-        if task.match_kind == MatchKind::Number && normalize_number(&task.answer).is_none() {
+        if task.match_kind != MatchKind::Exact && normalize_number(&task.answer).is_none() {
             return Err(bad(format!("answer {:?} is not a number", task.answer)));
         }
         if tasks.iter().any(|t| t.id == task.id) {
@@ -120,7 +124,61 @@ pub fn is_correct(kind: MatchKind, expected: &str, output: &str) -> bool {
             (Some(a), Some(b)) => a == b,
             _ => false,
         },
+        MatchKind::FinalNumber => match (normalize_number(expected), final_number(output)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        },
     }
+}
+
+/// The final numeric answer of a chain-of-thought output: the last number after the last
+/// `Answer:` (case-insensitive), or the last number of the whole output when it has none, in
+/// [`normalize_number`]'s form (`$` and `,` dropped, a trailing `.` removed, `18.0` kept as
+/// written).
+pub fn final_number(output: &str) -> Option<String> {
+    let lower = output.to_ascii_lowercase();
+    let tail = match lower.rfind("answer:") {
+        Some(i) => &output[i + "answer:".len()..],
+        None => output,
+    };
+    // Numbers: an optional `-`, digits with `,` separators, at most one `.` followed by digits.
+    let chars: Vec<char> = tail.chars().collect();
+    let mut last: Option<String> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let neg = i > 0 && chars[i - 1] == '-';
+            let mut j = i;
+            let mut text = String::new();
+            let mut seen_dot = false;
+            while j < chars.len() {
+                let c = chars[j];
+                if c.is_ascii_digit() {
+                    text.push(c);
+                } else if c == ',' && j + 1 < chars.len() && chars[j + 1].is_ascii_digit() {
+                    // a thousands separator
+                } else if c == '.'
+                    && !seen_dot
+                    && j + 1 < chars.len()
+                    && chars[j + 1].is_ascii_digit()
+                {
+                    seen_dot = true;
+                    text.push(c);
+                } else {
+                    break;
+                }
+                j += 1;
+            }
+            if neg {
+                text.insert(0, '-');
+            }
+            last = Some(text);
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    last.and_then(|t| normalize_number(&t))
 }
 
 /// A 2xx response's body parsed as JSON; any other status or an unparsable body is an error.
@@ -266,6 +324,28 @@ mod tests {
         assert!(!is_correct(MatchKind::Number, "18", "18 apples"));
         assert!(!is_correct(MatchKind::Number, "18", "18.."));
         assert!(!is_correct(MatchKind::Number, "18", "180"));
+        // Chain of thought: the number after the last `Answer:`, else the last number.
+        let cot =
+            "Janet has 16 eggs, eats 3 and bakes 4: 16 - 3 - 4 = 9.\n9 * 2 = 18.\nAnswer: $18";
+        assert!(is_correct(MatchKind::FinalNumber, "18", cot));
+        assert!(is_correct(
+            MatchKind::FinalNumber,
+            "1234",
+            "so\nAnswer: 1,234 dollars."
+        ));
+        assert!(is_correct(MatchKind::FinalNumber, "-5", "Answer: -5"));
+        assert!(is_correct(
+            MatchKind::FinalNumber,
+            "2.5",
+            "the rate is 2.5."
+        ));
+        assert!(!is_correct(MatchKind::FinalNumber, "18", "Answer: 180"));
+        assert!(!is_correct(
+            MatchKind::FinalNumber,
+            "18",
+            "18 eggs, so\nAnswer: 9"
+        ));
+        assert!(!is_correct(MatchKind::FinalNumber, "18", "no number here"));
         assert!(is_correct(MatchKind::Exact, "yes", " yes "));
         assert!(!is_correct(MatchKind::Exact, "yes", "Yes"));
     }

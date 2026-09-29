@@ -1001,7 +1001,12 @@ mod phase8_eval_task_set {
         ids.dedup();
         assert_eq!(ids.len(), 200, "unique ids");
         for t in &tasks {
-            assert_eq!(t.match_kind, MatchKind::Number, "{}", t.id);
+            assert_eq!(t.match_kind, MatchKind::FinalNumber, "{}", t.id);
+            assert!(
+                t.max_tokens >= 512,
+                "{}: room for the chain of thought",
+                t.id
+            );
             assert!(
                 normalize_number(&t.answer).is_some(),
                 "{}: answer {:?} is not numeric",
