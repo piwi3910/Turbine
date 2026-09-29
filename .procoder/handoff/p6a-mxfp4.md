@@ -163,3 +163,42 @@ nothing is uploaded automatically — ask the lead whether/how to record these i
   numerics investigation (compare Turbine at c1 against a fixq reference once one exists for this slug,
   `turbine-golden positions` on failing prompts, trace tools) before any `mxfp4_a4` support-status
   decision.** Reported to the lead in this rotation's final message.
+
+## State 2026-09-29 ~18:00 (collector, lead rotation)
+
+**T20 t20-bench verdict.** `t20/t20-bench.log` last line `t20-bench: done rc=0`,
+`ALLDONE rc: bf16=0 mxfp4=0 mxfp4a4=0` — all three passes' servers came up and completed.
+
+- **llama8b (BF16 8B reference pass):** golden1 PASS 16/16, golden16 PASS 16/16. `llama8b-bench.json`
+  output_token_throughput 400.73 tok/s; `llama8b-bench-c1.json` itl_ms.p50 28.0 ms. This is the reference
+  the other two passes are judged against (within this same run, per the handoff's judging note — not the
+  differently-loaded `t20-llama8b:3b54bf6` row).
+- **llama8b-mxfp4 (MXFP4-A16 8B): PASS on the plan's perf targets.** `llama8b-mxfp4-bench.json`
+  output_token_throughput 674.23 tok/s = 674.23/400.73 = **1.683x** BF16 (target ≥ 0.9x: PASS).
+  `llama8b-mxfp4-bench-c1.json` itl_ms.p50 11.068 ms = 11.068/28.0 = **0.395x** BF16 (target ≤ 0.6x: PASS).
+  Golden SKIPPED (no `tests/golden/llama-3.1-8b-instruct-mxfp4a16/reference.jsonl` yet) — informational,
+  not a fail. GSM8K accuracy is judged separately (already committed): full 1319-item set drop 0.0258 ≤
+  0.04 PASS (`tests/eval/llama-3.1-8b-instruct-mxfp4a16/turbine-full.json` vs `-bf16-full.json`); the
+  200-item quick set drop (0.055) is stale/superseded by the full-set result per the prior rotation's note.
+- **llama8b-mxfp4-a4 (W4A4 8B): perf numbers informational only (config-read bug, not a clean measurement)**,
+  as flagged by the prior rotation. `llama8b-mxfp4-a4-bench.json` output_token_throughput 617.73 tok/s
+  (617.73/400.73 = 1.542x, would nominally pass ≥ 0.9x); `-bench-c1.json` itl_ms.p50 11.466 ms
+  (11.466/28.0 = 0.410x, would nominally pass ≤ 0.6x) — **do not treat as a pass**: this checkpoint's
+  `config.json` is read wrongly (transformers-5 `rope_parameters`, rope_theta silently fell back to 10000),
+  a fix is in progress, so these throughput/latency numbers do not reflect the corrected kernel path.
+  Golden SKIPPED (no reference yet). GSM8K-200 for this checkpoint is already committed at 0.54 (108/200),
+  far below vLLM's own 0.735 on the same checkpoint and BF16's 0.89 — flagged by the prior rotation as a
+  likely real accuracy problem, separate from the config bug, needing the ">0.04 rule" numerics
+  investigation before any `mxfp4_a4` support-status decision. Not re-investigated this rotation.
+
+Labbook: submitted three rows to set `phase-6a-quantization` (commit 535d0f4, the branch tip these frozen
+binaries were built from): `lab-bench:t20-llama8b:535d0f4` (pass, reference row), `lab-bench:t20-llama8b-mxfp4:535d0f4`
+(pass, perf gate), `lab-bench:t20-llama8b-mxfp4-a4:535d0f4` (status `info`, config-bug caveat and the GSM8K
+gap noted in the run's notes/conclusion).
+
+**No `support.rs` change made** (per the task: don't touch it for `mxfp4` or `mxfp4_a4`).
+
+Remaining, per the prior rotation's Open section: base-3B completion-form GSM8K side result (not started);
+W4A4 config-read fix (rope_parameters) plus a re-run of GSM8K-200/full and t20-bench once fixed; W4A4's
+0.54 GSM8K-200 accuracy gap needs the numerics investigation even after the config fix, since it may be a
+separate real problem.
