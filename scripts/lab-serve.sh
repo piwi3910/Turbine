@@ -116,8 +116,20 @@ case "$2" in
 		SERVED_NAME=allenai/OLMoE-1B-7B-0125-Instruct
 		MAX_MODEL_LEN=4096
 		;;
+	llama-3.1-8b-instruct)
+		SERVED_NAME=meta-llama/Llama-3.1-8B-Instruct
+		MAX_MODEL_LEN=32768
+		;;
+	llama-3.1-8b-instruct-mxfp4a16)
+		SERVED_NAME=FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16
+		MAX_MODEL_LEN=32768
+		;;
+	llama-3.2-3b-mxfp4-a4)
+		SERVED_NAME=matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq
+		MAX_MODEL_LEN=32768
+		;;
 	*)
-		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct or olmoe-1b-7b-0125-instruct)" >&2
+		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, llama-3.1-8b-instruct, llama-3.1-8b-instruct-mxfp4a16 or llama-3.2-3b-mxfp4-a4)" >&2
 		usage
 		;;
 	esac
