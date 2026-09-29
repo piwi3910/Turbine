@@ -50,7 +50,12 @@ the AMD 8B W4A4 checkpoint, identical to integration's 62ab8b7). Read AGENTS.md 
    self-spread too (golden16 fail).
 2. Rename the misnamed eval; W4A4 8B eval-compare vs BF16 8B; 3B base side result vs BF16 3B base.
 3. Full `lab-bench --golden16 --c1` for the three 8B models; labbook upload; rows via a `handoff(support.rs)` commit.
-4. Escalate the MXFP4-A16 GSM8K drop (0.055 > 0.04) to the lead with the per-item diff.
+4. MXFP4-A16 GSM8K drop (0.055 > 0.04) — user decision 2026-09-29 (decisions.md commit 4f45232): run the full
+   GSM8K (`tests/eval/gsm8k-full.jsonl`, 1,319 items, from branch `p6a-gsm8k-full`) on MXFP4-A16 8B and BF16 8B,
+   queued one after the other (one GPU job; ~6x a 200-item run each). If the drop is still > 0.04, do NOT blame
+   the format yet: compare Turbine with the dequantized-checkpoint reference (logits / golden positions,
+   `turbine-golden positions`, trace tools) to look for a Turbine numerics error, and report to the lead (who
+   reports to the coordinator) before any support-status change.
 
 ## Lab traps
 
