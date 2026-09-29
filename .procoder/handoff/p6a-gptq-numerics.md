@@ -76,3 +76,7 @@ concurrency 16 (6 h timeout), kills its server.
   HF-transformers GSM8K run on the dequantized BF16 copy (CPU, many hours) or vLLM with another GPTQ
   kernel (vLLM-ROCm refuses this checkpoint). Alternative: a better GPTQ checkpoint (e.g. damp 0.01,
   a known-good publisher) as the gate's candidate.
+
+Gate at 1f7290b: 785 passed, 1 failed — `turbine-server::tiny_server queue_full_429` (503 `queue_timeout`
+instead of 200, a timing flake while the GPTQ kernel build loaded the host); rerun alone it passes. No
+Rust change of this branch touches turbine-server (only the `int4_layer_dump` example).
