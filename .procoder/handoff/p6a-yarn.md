@@ -24,6 +24,7 @@ p16 tail 0.43 — so plain BF16 noise does not explain 1.38.
 Hypothesis under test: the folded attention factor (softmax scale × mscale² instead of scaling cos/sin, i.e.
 rounding q·k differently in BF16). Running now under fixture.lock:
 `yarn_self_spread.py --fold … bf16-sdpa-incremental` → `/home/piwi/turbine-ci/remote/agent-ad603c5a7f228a0ed/yarn-fold.json`.
+
 - If the fold alone reproduces ~1.4 tail: the fold placement costs accuracy → a design question for the
   coordinator (keep the fold with a calibrated tolerance from `--fold` spread, or scale cos/sin like transformers).
 - If not: debug with `DecoderExecutor::set_trace` + the `golden hip_trace_vs_cpu_3b` lab test on p16 (release,
@@ -34,10 +35,44 @@ rounding q·k differently in BF16). Running now under fixture.lock:
 1. Read the fold result; act per the two branches above; don't loosen the tolerance without the spread evidence
    and a lead/coordinator decision.
 2. When golden passes: `golden.rs` slug list, `quant_fixtures_valid`/fixture test, `lab-bench --model llama-yarn16
-   --golden16` and `--model llama --golden16` (unchanged), perf-log row, commit `test(golden): YaRN …`.
+--golden16` and `--model llama --golden16` (unchanged), perf-log row, commit `test(golden): YaRN …`.
 
 ## Lab traps
 
 - The long prompt's eager transformers run peaked ~30 GB RAM — a candidate cause of the 06:23 crash (unconfirmed).
   Keep fixture jobs on fixture.lock with 12 threads max and nothing else big alongside.
 - ONE GPU job at a time.
+
+## Rotation 5 (2026-09-29 ~13:45, T28 builder, reads only)
+
+Worktree `.claude/worktrees/agent-aa94fe3bfacab12b1`, branch `p6a-yarn-t28` (c06a1c8). The A/B work is
+STAGED, NOT COMMITTED: the Bash PreToolUse procoder hook runs in the session cwd (the memory dir), where
+prettier applies, and blocks golden.rs / README.md / tolerance.json as "unformatted"; the repo's own
+`procoder check` in the worktree says they are clean (0 blocking). Commit from a session rooted in the
+worktree (message in the lead's notes: `test(golden): YaRN factor-16 fixture, --config-override and the fold
+A/B diagnostic (Task 28, provisional tolerance)`), then merge `phase-6a-quantization`, then gate. README's
+"YaRN changes no kernel or precision" claim is corrected and tolerance marked provisional (staged).
+Plan amendment (prompts.jsonl instead of prompts-long.jsonl, crates/turbine-model/tests/golden.rs instead of
+benches/…) is an unstaged edit of `.procoder/plans/phase-6a-quantization.md` for a separate
+`handoff(.procoder/plans/phase-6a-quantization.md): …` commit.
+
+yarn-tf1 CPU-column NaN: not a numerical NaN. p17-long (12,030 prompt tokens) is above
+`YARN_CPU_MAX_TOKENS` (1024), so the cpu/unf runners are skipped and `cols()` prints the placeholder
+(argmax 4294967295, NaN). p16 in yarn-tf1: cpu-reference (folded) max likely/tail 0.190 / 1.488, hip
+0.099 / 1.382; worst position 22 (tail cpu 1.488, hip 1.382). So the HIP kernels are not the cause: the
+scalar reference with the same fold shows the same tail.
+
+Running detached (do not duplicate):
+
+- Read 1, transformers fold spread: fixture.lock job `yarn_self_spread.py --fold … bf16-sdpa-incremental`
+  (pid 89591 at 13:45, 4 threads on cores 12-15), log `/home/piwi/turbine-ci/scratch/fixtures-r5/yarn-fold-r5.log`
+  (ends `yarn-fold-r5: ALLDONE`), output `/home/piwi/turbine-ci/remote/agent-ad603c5a7f228a0ed/yarn-fold.json`.
+  Judge: p16 tail (and every prompt's max |Δ| likely/tail) of the fold variant vs the reference. ≈1.4 on p16
+  ⇒ the fold placement alone explains Turbine's tail (design question Q19 for the coordinator); ≈0.43 (the
+  unfolded bf16-sdpa-full spread) ⇒ it does not, trace per the steps above.
+- Read 2, HIP/CPU/unf A/B: `/home/piwi/turbine-ci/remote/agent-aa94fe3bfacab12b1/yarn_tf_r5.sh` (copy in the
+  lead scratchpad `yarn_tf_r5.sh`), log `…/agent-aa94fe3bfacab12b1/yarn-tf-r5.log` (last line
+  `yarn-tf-r5: done rc=<rc>`; summary `YaRN p16 max: cpu (l, t), unf (l, t), hip (l, t)`), full table
+  `…/yarn-tf-r5.out`. Queued at 09:43Z on port18000.lock → bench.gate → bench.lock behind the full-GSM8K runs.
+  Judge: `unf` (cpu-reference with the attention factor on cos/sin, softmax scale unscaled) against `cpu`
+  (same provider, folded). unf tail ≈ 0.43 and cpu ≈ 1.49 ⇒ the fold is the cause; both ≈ 1.49 ⇒ not the fold.
