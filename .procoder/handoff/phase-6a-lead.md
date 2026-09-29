@@ -190,7 +190,7 @@ inside `ssh host '…'` matches its own command line — start detached jobs fro
 
 **Gate:** ok 777 on 807aabc. On a181274 (merges of T15/T20/T28 handoffs, fixtures, yaml, golden.rs test): 776/1, only
 `server_cli sigterm_drains_then_cancels` ("bad chunk size line", 16 s) while novanas carried GSM8K + fixtures; no server
-code changed since 807aabc. Rerun of that test ×3: `tasks/bwc7h1ugk.output`. Rerun the whole gate on this tip first.
+code changed since 807aabc. That test alone passed 3/3 (8–10 s) → load flake. Full gate on 8f1bea4+ started at rotation: `scratchpad/gate-r5-final.txt` — read it first.
 a0ba309 fixed e06afc9's lab-serve `--gpus 2` dry-run break (+ test).
 
 **Merged this rotation:** a0ba309, p6a-int4 (12449c4), decision 807aabc (tolerance floor = max(spread, BF16 bounds);
