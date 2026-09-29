@@ -31,10 +31,11 @@ use crate::document::{
     HitRate, KvDocument, KvSummary, KvTierDocument, Prefetch, Sessions, TierState, Transfers,
 };
 use crate::identity::{Blake3Hasher, KeyHasher, KvFormat, KvKey, NamespaceCache, prefix_keys};
-use crate::metrics::{EvictReason, KvMetrics, PrefetchOutcome};
+use crate::metrics::{EvictReason, KvMetrics, LADDER_EVICT, LadderReason, PrefetchOutcome};
 use crate::planner::{KvPlan, PlanInputs, PlanReason, plan_prefix};
 use crate::policy::{
-    BlockScoreInputs, KvBlockSummary, SelectedPolicy, make_policy, recompute_seconds,
+    BlockScoreInputs, EvictAction, KvBlockSummary, LadderContext, LadderLimits, SelectedPolicy,
+    make_policy, recompute_seconds,
 };
 use crate::pool::BlockPool;
 use crate::session::{PrefetchTracker, SessionAction, SessionTable};
@@ -67,7 +68,45 @@ pub struct HierarchyConfig {
     /// `kv.lossless_tail_blocks`: the last N full blocks of a finished sequence are demoted at
     /// the L0 format whatever the tier's format.
     pub lossless_tail_blocks: u32,
+    /// The compression ladder in L1/L2 (P6b S-6), when `kv.ladder.enabled`.
+    pub ladder: Option<LadderConfig>,
 }
+
+/// The compression ladder's settings (P6b S-6): `kv.ladder.*` and the pressure controller's
+/// `reliability.pressure.deescalate_dwell`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LadderConfig {
+    /// The lossiest rung (`kv.ladder.max_format`, a registered lossy codec).
+    pub max_format: &'static str,
+    /// `kv.ladder.high_water`.
+    pub high_water: f64,
+    /// `kv.ladder.low_water`: also the fill a tier must stay below for `dwell` before its rung
+    /// steps back up.
+    pub low_water: f64,
+    /// How long a tier stays below `low_water` before its rung for new demotions steps back up
+    /// one rung (`reliability.pressure.deescalate_dwell`; the server sets it).
+    pub dwell: Duration,
+}
+
+impl LadderConfig {
+    /// `reliability.pressure.deescalate_dwell`'s default, until the server sets the configured
+    /// one ([`KvHierarchy::set_ladder_dwell`]).
+    pub const DEFAULT_DWELL: Duration = Duration::from_secs(10);
+
+    fn limits(&self) -> LadderLimits {
+        LadderLimits {
+            max_format: self.max_format,
+            high_water: self.high_water,
+            low_water: self.low_water,
+        }
+    }
+}
+
+/// Most ladder rewrites started per ladder tick, and most in flight (P6b S-6; TS §21 rule 8).
+pub const LADDER_REWRITES_PER_TICK: usize = 32;
+
+/// Ladder ticks are at least this far apart (P6b S-6).
+pub const LADDER_TICK_INTERVAL: Duration = Duration::from_millis(50);
 
 impl HierarchyConfig {
     /// Copies waiting to start, across all paths.
@@ -95,6 +134,16 @@ impl HierarchyConfig {
             l1_format: codec_name(kv.cpu.format.as_str())?,
             l2_format: codec_name(kv.nvme.format.as_str())?,
             lossless_tail_blocks: kv.lossless_tail_blocks,
+            ladder: if kv.ladder.enabled {
+                Some(LadderConfig {
+                    max_format: codec_name(kv.ladder.max_format.as_str())?,
+                    high_water: kv.ladder.high_water,
+                    low_water: kv.ladder.low_water,
+                    dwell: LadderConfig::DEFAULT_DWELL,
+                })
+            } else {
+                None
+            },
         })
     }
 }
@@ -171,6 +220,10 @@ pub struct KvStats {
     pub evictions: u64,
     pub drops: u64,
     pub transfer_errors: u64,
+    /// Ladder rewrites started (P6b S-6).
+    pub compressions: u64,
+    /// Ladder ticks run (each ≥ [`LADDER_TICK_INTERVAL`] after the previous one).
+    pub ladder_ticks: u64,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -315,6 +368,37 @@ impl PartialEq for Victim {
 
 impl Eq for Victim {}
 
+/// One lower tier's ladder state (P6b S-6).
+#[derive(Clone, Copy, Debug)]
+struct TierRung {
+    tier: TierId,
+    /// The tier's configured format (`kv.cpu.format` / `kv.nvme.format`): its top rung.
+    base: &'static str,
+    /// The rung new demotions into the tier take.
+    rung: &'static str,
+    /// Since when the tier has been below low water (the step-up dwell).
+    below_since: Option<Duration>,
+}
+
+/// The ladder's state: per-tier rungs and the current tick window.
+#[derive(Debug)]
+struct Ladder {
+    cfg: LadderConfig,
+    /// The enabled lower tiers, fastest first.
+    tiers: SmallVec<[TierRung; 2]>,
+    last_tick: Option<Duration>,
+    /// Rewrites started since `last_tick`.
+    window_rewrites: usize,
+}
+
+/// A ladder rewrite in flight.
+#[derive(Clone, Copy, Debug)]
+struct Compressing {
+    tier: TierId,
+    /// Bytes the rewritten copy saves (old format's minus new format's).
+    saved: u64,
+}
+
 /// An attach waiting for its promotions; `promotions` are the L0 targets still in flight.
 struct Pending {
     attach: PrefixAttach,
@@ -366,6 +450,12 @@ pub struct KvHierarchy {
     prefill_tps: f64,
     reclaim: Arc<KvReclaimHandle>,
     ready: Vec<(RequestId, PrefixAttach)>,
+    /// The compression ladder (P6b S-6), when enabled.
+    ladder: Option<Ladder>,
+    /// Keys with a ladder rewrite in flight.
+    compressing: HashMap<KvKey, Compressing>,
+    /// Bytes the last pressure reclaim wanted to demote into L1 and L2 (the ladder's demand).
+    ladder_demand: [u64; 2],
 }
 
 impl KvHierarchy {
@@ -392,8 +482,14 @@ impl KvHierarchy {
         // L1 exists only on discrete-VRAM devices (S-5): on unified memory L0 demotes to L2.
         let l1 = l1.filter(|t| t.enabled() && cfg.memory_kind != MemoryKind::Unified);
         let l2 = l2.filter(|t| t.enabled());
-        // A tier holds the most blocks at its own format (lossless-tail blocks are larger).
+        // A tier holds the most blocks at its own format (lossless-tail blocks are larger), or
+        // at the ladder's lossiest rung.
+        let smallest = |f: &'static str| {
+            cfg.ladder
+                .map_or(f, |l| crate::codec::lossier(f, l.max_format))
+        };
         let blocks_of = |t: &Option<Arc<dyn KvTier>>, f: &'static str| {
+            let f = smallest(f);
             t.as_ref().map_or(0, |t| {
                 let bytes = format_bytes(f, cfg.block_bytes, &format.layout, format.shards);
                 usize::try_from(t.capacity_bytes() / bytes.max(1)).unwrap_or(usize::MAX)
@@ -402,7 +498,33 @@ impl KvHierarchy {
         let max_entries = (l0_blocks as usize)
             .saturating_add(blocks_of(&l1, cfg.l1_format))
             .saturating_add(blocks_of(&l2, cfg.l2_format));
+        let ladder = cfg.ladder.map(|lc| Ladder {
+            cfg: lc,
+            tiers: [
+                (TierId::L1, &l1, cfg.l1_format),
+                (TierId::L2, &l2, cfg.l2_format),
+            ]
+            .into_iter()
+            .filter(|(_, t, _)| t.is_some())
+            .map(|(tier, _, base)| TierRung {
+                tier,
+                base,
+                rung: base,
+                below_since: None,
+            })
+            .collect(),
+            last_tick: None,
+            window_rewrites: 0,
+        });
+        if let Some(l) = &ladder {
+            for t in &l.tiers {
+                metrics.set_ladder_rung(t.tier, t.rung);
+            }
+        }
         KvHierarchy {
+            ladder,
+            compressing: HashMap::new(),
+            ladder_demand: [0; 2],
             layout: format.layout,
             shards: format.shards.max(1),
             tail: HashSet::new(),
@@ -504,7 +626,8 @@ impl KvHierarchy {
         self.clock.now_mono()
     }
 
-    /// A copy of `key` into L0 (promotion or prefetch) is queued or in flight.
+    /// A copy of `key` into L0 (promotion or prefetch), or a ladder rewrite of one of its
+    /// copies, is queued or in flight: an attach waits for it.
     fn incoming(&self, key: &KvKey) -> bool {
         self.transfer.is_busy_with(key) && !self.demoting.contains_key(key)
     }
@@ -530,9 +653,18 @@ impl KvHierarchy {
         format_bytes(format, self.cfg.block_bytes, &self.layout, self.shards)
     }
 
-    /// The formats of a copy of `key` from its copy in `from` to `to` (P6b S-1, S-2): into L0
-    /// the L0 format (a promotion decodes); into a lower tier that tier's format, or the L0
-    /// format for a lossless-tail block, but never more precise than the source copy.
+    /// The codec new demotions into `tier` take: the ladder's rung, else the tier's format.
+    fn rung(&self, tier: TierId) -> &'static str {
+        self.ladder
+            .as_ref()
+            .and_then(|l| l.tiers.iter().find(|t| t.tier == tier))
+            .map_or_else(|| self.tier_format(tier), |t| t.rung)
+    }
+
+    /// The formats of a copy of `key` from its copy in `from` to `to` (P6b S-1, S-2, S-6): into
+    /// L0 the L0 format (a promotion decodes); into a lower tier that tier's ladder rung (its
+    /// configured format without the ladder), or the L0 format for a lossless-tail block, but
+    /// never more precise than the source copy.
     fn copy_codec(&self, key: &KvKey, from: TierId, to: TierId) -> Option<TransferCodec> {
         let src = self.dir.get(key)?.location(from)?.format;
         let dst = if to == TierId::L0 {
@@ -540,7 +672,7 @@ impl KvHierarchy {
         } else if self.tail.contains(key) {
             crate::codec::lossier(src, L0_FORMAT)
         } else {
-            crate::codec::lossier(src, self.tier_format(to))
+            crate::codec::lossier(src, self.rung(to))
         };
         Some(TransferCodec {
             from: src,
@@ -578,7 +710,7 @@ impl KvHierarchy {
     /// Blocks of `tier`'s format a demotion of `key` from `from` into `tier` takes (more than
     /// one for a lossless-tail block stored at the larger L0 format).
     fn demotion_units(&self, key: &KvKey, from: TierId, tier: TierId) -> usize {
-        let unit = self.format_bytes(self.tier_format(tier)).max(1);
+        let unit = self.format_bytes(self.rung(tier)).max(1);
         self.copy_codec(key, from, tier)
             .map_or(1, |c| c.to_bytes.div_ceil(unit) as usize)
             .max(1)
@@ -904,13 +1036,15 @@ impl KvHierarchy {
             let path = t.req.path;
             match c.result {
                 Ok((took, slot)) => {
-                    self.stats.transfer_bytes += t.req.bytes;
-                    self.metrics.transfer(
-                        path,
-                        t.req.bytes,
-                        took.as_secs_f64(),
-                        self.transfer.estimate(path).bandwidth_bps,
-                    );
+                    if t.req.purpose != TransferPurpose::Compress {
+                        self.stats.transfer_bytes += t.req.bytes;
+                        self.metrics.transfer(
+                            path,
+                            t.req.bytes,
+                            took.as_secs_f64(),
+                            self.transfer.estimate(path).bandwidth_bps,
+                        );
+                    }
                     self.on_copy_done(pool, t.id, &t.req, slot.0, c.owner_cancelled);
                 }
                 Err(e) => {
@@ -961,7 +1095,42 @@ impl KvHierarchy {
                 );
                 self.metrics.demotion(from, to);
                 self.stats.demotions += 1;
+                // Stored at the tier's ladder rung, lossier than its own format would make it.
+                let unladdered = crate::codec::lossier(req.codec.from, self.tier_format(to));
+                if self.ladder.is_some() && req.codec.to != unladdered {
+                    self.metrics.ladder_action(
+                        to,
+                        unladdered,
+                        req.codec.to,
+                        LadderReason::NewDemotion,
+                    );
+                }
                 self.remove_copy(pool, &req.key, from, EvictReason::Pressure);
+            }
+            TransferPurpose::Compress => {
+                self.compressing.remove(&req.key);
+                let tier = from;
+                if self
+                    .dir
+                    .get(&req.key)
+                    .and_then(|b| b.location(tier))
+                    .is_none()
+                {
+                    // The copy left the tier (or the block was dropped) while it was rewritten.
+                    if let Some(t) = self.tier(tier) {
+                        let _ = t.evict(&req.key);
+                    }
+                    return;
+                }
+                self.dir.add_location(
+                    &req.key,
+                    KvLocation {
+                        tier,
+                        slot,
+                        format: req.codec.to,
+                    },
+                );
+                self.metrics.eviction(tier, EvictReason::Compressed);
             }
             TransferPurpose::Promote | TransferPurpose::Prefetch => {
                 let block = BlockId(req.dst_slot as u32);
@@ -1020,6 +1189,20 @@ impl KvHierarchy {
                 self.demoting.remove(&req.key);
                 if req.path.from() == TierId::L0 {
                     pool.release(&[BlockId(req.src_slot as u32)]);
+                }
+            }
+            TransferPurpose::Compress => {
+                // The copy keeps its old format unless the failed rewrite lost it.
+                self.compressing.remove(&req.key);
+                let tier = req.path.from();
+                let lost = self.tier(tier).is_some_and(|t| !t.contains(&req.key));
+                if lost
+                    && self
+                        .dir
+                        .get(&req.key)
+                        .is_some_and(|b| b.location(tier).is_some())
+                {
+                    self.remove_copy(pool, &req.key, tier, EvictReason::TierDegraded);
                 }
             }
             TransferPurpose::Prefetch => {
@@ -1304,6 +1487,7 @@ impl KvHierarchy {
     /// first: dropping is cheap and may already meet the demote target); returns the bytes
     /// scheduled or freed. See [`KvHierarchy::pressure_reclaim`].
     pub fn apply_reclaim(&mut self, pool: &mut BlockPool) -> u64 {
+        self.ladder_demand = [0; 2];
         let mut bytes = 0;
         if let Some(t) = KvReclaimHandle::take(&self.reclaim.free_target) {
             bytes += self.pressure_reclaim(pool, t, true);
@@ -1347,6 +1531,21 @@ impl KvHierarchy {
         }
         self.sync_l0_refs(pool);
         let victims = self.victims(pool, TierId::L0, need);
+        // The ladder's demand: the copies this reclaim wants in the lower tiers and cannot
+        // start this tick (recorded below).
+        let mut wanted = 0;
+        if self.ladder.is_some() {
+            wanted = victims
+                .iter()
+                .filter(|(k, v)| {
+                    *v >= self.cfg.demote_min_value
+                        && self
+                            .dir
+                            .get(k)
+                            .is_some_and(|b| has_reuse_evidence(b) && b.location(to).is_none())
+                })
+                .count();
+        }
         let mut budget = self.demotion_budget();
         let mut room = 0;
         if budget > 0 {
@@ -1399,7 +1598,11 @@ impl KvHierarchy {
                 budget -= 1;
                 departing.insert(key);
                 bytes += bb;
+                wanted = wanted.saturating_sub(1);
             }
+        }
+        if wanted > 0 {
+            self.record_demand(to, wanted as u64);
         }
         bytes
     }
@@ -1591,7 +1794,7 @@ impl KvHierarchy {
         let Some(t) = self.tier(tier).cloned() else {
             return 0;
         };
-        let unit = self.format_bytes(self.tier_format(tier)).max(1);
+        let unit = self.format_bytes(self.rung(tier)).max(1);
         let free = (t
             .capacity_bytes()
             .saturating_sub(t.used_bytes() + self.inflight_into(tier))
@@ -1614,10 +1817,361 @@ impl KvHierarchy {
             {
                 continue;
             }
-            self.remove_copy(pool, &victim, tier, EvictReason::Capacity);
+            match self.ladder_victim(pool, &victim, tier) {
+                Some(false) => continue,
+                Some(true) => self.remove_copy(pool, &victim, tier, EvictReason::LadderFloor),
+                None => self.remove_copy(pool, &victim, tier, EvictReason::Capacity),
+            }
             room += 1;
         }
         room
+    }
+
+    /// Adds `blocks` demotions into `to` to the ladder's demand; what `to` (L1) has no free room
+    /// for spills on into L2.
+    fn record_demand(&mut self, to: TierId, blocks: u64) {
+        let bytes = blocks * self.format_bytes(self.rung(to));
+        match to {
+            TierId::L1 => {
+                self.ladder_demand[0] += bytes;
+                if let (Some(l1), true) = (self.l1.as_ref(), self.l2.is_some()) {
+                    let free = l1
+                        .capacity_bytes()
+                        .saturating_sub(l1.used_bytes() + self.inflight_into(TierId::L1));
+                    let over = bytes.saturating_sub(free);
+                    let unit = self.format_bytes(self.rung(TierId::L1)).max(1);
+                    self.ladder_demand[1] +=
+                        over.div_ceil(unit) * self.format_bytes(self.rung(TierId::L2));
+                }
+            }
+            TierId::L2 => self.ladder_demand[1] += bytes,
+            _ => {}
+        }
+    }
+
+    /// `tier`'s fill once the copies in flight into it land and its rewrites complete.
+    fn tier_fill(&self, tier: TierId) -> f64 {
+        let Some(t) = self.tier(tier) else {
+            return 0.0;
+        };
+        let saved: u64 = self
+            .compressing
+            .values()
+            .filter(|c| c.tier == tier)
+            .map(|c| c.saved)
+            .sum();
+        let used = (t.used_bytes() + self.inflight_into(tier)).saturating_sub(saved);
+        used as f64 / t.capacity_bytes().max(1) as f64
+    }
+
+    /// The ladder's facts for a copy in `format` of `tier` (`None` with the ladder off).
+    fn ladder_context(
+        &self,
+        tier: TierId,
+        format: &'static str,
+        must_leave: bool,
+        pressure: PressureState,
+    ) -> Option<LadderContext> {
+        let l = self.ladder.as_ref()?;
+        let below = match tier {
+            TierId::L1 if self.l2.is_some() => Some(TierId::L2),
+            _ => None,
+        };
+        let cap = self.tier(tier).map_or(1, |t| t.capacity_bytes()).max(1);
+        let demand = match tier {
+            TierId::L1 => self.ladder_demand[0],
+            TierId::L2 => self.ladder_demand[1],
+            _ => 0,
+        };
+        Some(LadderContext {
+            tier,
+            fill: self.tier_fill(tier),
+            demand: demand as f64 / cap as f64,
+            rung: self.rung(tier),
+            pressure,
+            format,
+            must_leave,
+            demote_to: below.map(|t| (t, self.rung(t))),
+            lower_rung: below.map(|t| self.rung(t)),
+            ladder: Some(l.cfg.limits()),
+        })
+    }
+
+    /// Room for another ladder rewrite in this tick and in flight.
+    fn ladder_budget(&self) -> bool {
+        self.ladder.as_ref().is_some_and(|l| {
+            l.window_rewrites < LADDER_REWRITES_PER_TICK
+                && self.compressing.len() < LADDER_REWRITES_PER_TICK
+        })
+    }
+
+    /// Sets `tier`'s rung for new demotions and reports the change (`kv_ladder`, the rung gauge
+    /// and, for a step up, `rung_step_up`).
+    fn set_rung(&mut self, tier: TierId, to: &'static str, reason: LadderReason, now: Duration) {
+        let fill = self.tier_fill(tier);
+        let pressure = self.l0_state;
+        let Some(t) = self
+            .ladder
+            .as_mut()
+            .and_then(|l| l.tiers.iter_mut().find(|t| t.tier == tier))
+        else {
+            return;
+        };
+        let from = t.rung;
+        if from == to {
+            return;
+        }
+        t.rung = to;
+        // A move down restarts the step-up dwell; a step up starts the next one now.
+        t.below_since = (reason == LadderReason::RungStepUp).then_some(now);
+        self.metrics.set_ladder_rung(tier, to);
+        if reason == LadderReason::RungStepUp {
+            self.metrics.ladder_action(tier, from, to, reason);
+        }
+        tracing::info!(
+            event = "kv_ladder",
+            tier = tier.as_str(),
+            from,
+            to,
+            fill,
+            pressure = pressure.as_str(),
+            reason = reason.as_str(),
+            "KV compression ladder rung changed"
+        );
+    }
+
+    /// Starts the ladder rewrite of `key`'s copy in `tier` into codec `to`; moves the tier's rung
+    /// down to `to` when it is lossier. False when the copy or the transfer queue is not there.
+    fn submit_compress(
+        &mut self,
+        key: KvKey,
+        tier: TierId,
+        to: &'static str,
+        reason: LadderReason,
+    ) -> bool {
+        let Some(loc) = self.dir.get(&key).and_then(|b| b.location(tier)) else {
+            return false;
+        };
+        if self.tier(tier).is_none_or(|t| t.degraded()) {
+            return false;
+        }
+        let Some(path) = TransferPath::between(tier, TierId::L0) else {
+            return false;
+        };
+        let codec = TransferCodec {
+            from: loc.format,
+            from_bytes: self.format_bytes(loc.format),
+            to,
+            to_bytes: self.format_bytes(to),
+        };
+        let req = TransferRequest {
+            path,
+            key,
+            bytes: codec.from_bytes.min(codec.to_bytes),
+            owner: None,
+            purpose: TransferPurpose::Compress,
+            src_slot: loc.slot,
+            dst_slot: loc.slot,
+            codec,
+        };
+        if self.transfer.submit(req).is_err() {
+            return false;
+        }
+        self.compressing.insert(
+            key,
+            Compressing {
+                tier,
+                saved: codec.from_bytes.saturating_sub(codec.to_bytes),
+            },
+        );
+        if let Some(l) = self.ladder.as_mut() {
+            l.window_rewrites += 1;
+        }
+        self.stats.compressions += 1;
+        self.metrics.ladder_action(tier, loc.format, to, reason);
+        let rung = self.rung(tier);
+        if crate::codec::rung_index(to) > crate::codec::rung_index(rung) {
+            let now = self.now();
+            self.set_rung(tier, to, reason, now);
+        }
+        true
+    }
+
+    /// The ladder's say on a copy `make_room` must remove from `tier` (P6b S-6, `would_drop`):
+    /// `Some(false)` when it is being rewritten one rung down instead (no room yet), `Some(true)`
+    /// when it was evicted at the floor (`ladder_floor`), `None` to evict it as before.
+    fn ladder_victim(&mut self, pool: &BlockPool, key: &KvKey, tier: TierId) -> Option<bool> {
+        if self.l0_state == PressureState::Green {
+            return None;
+        }
+        let b = self.dir.get(key)?;
+        if b.ref_count > 0 {
+            return None;
+        }
+        let format = b.location(tier)?.format;
+        let ctx = self.ladder_context(tier, format, true, self.l0_state)?;
+        let inputs = self.score_one(b, tier, pool, self.now());
+        match self.policy.policy.action(&inputs, &ctx) {
+            EvictAction::Compress { to } => (self.ladder_budget()
+                && self.submit_compress(*key, tier, to, LadderReason::WouldDrop))
+            .then_some(false),
+            EvictAction::Drop => {
+                self.metrics
+                    .ladder_action(tier, format, LADDER_EVICT, LadderReason::FloorEvict);
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// One ladder tick (P6b S-6), at most every [`LADDER_TICK_INTERVAL`]: a tier that has
+    /// stayed below low water for the dwell steps its rung for new demotions back up one rung
+    /// (never above its configured format); then, while the pressure controller is not GREEN,
+    /// the eviction policy decides on the copies of each enabled lower tier, lowest tier first
+    /// — oldest, least-reusable and most precise first — and at most
+    /// [`LADDER_REWRITES_PER_TICK`] rewrites start (fewer while earlier ones are in flight). A
+    /// tier's sweep stops at the first copy the policy keeps. Copies of blocks a running
+    /// request references, and copies being copied, are never rewritten. `tick` calls it.
+    pub fn ladder_tick(&mut self, pool: &mut BlockPool, pressure: PressureState, now: Duration) {
+        let Some(l) = self.ladder.as_mut() else {
+            return;
+        };
+        if l.last_tick
+            .is_some_and(|t| now.saturating_sub(t) < LADDER_TICK_INTERVAL)
+        {
+            return;
+        }
+        l.last_tick = Some(now);
+        l.window_rewrites = 0;
+        let (low, dwell) = (l.cfg.low_water, l.cfg.dwell);
+        let tiers: SmallVec<[TierRung; 2]> = l.tiers.clone();
+        self.stats.ladder_ticks += 1;
+        // Hysteresis: one rung up after the dwell below low water.
+        for t in &tiers {
+            let below = self.tier_fill(t.tier) < low;
+            let Some(tr) = self
+                .ladder
+                .as_mut()
+                .and_then(|l| l.tiers.iter_mut().find(|x| x.tier == t.tier))
+            else {
+                continue;
+            };
+            if !below {
+                tr.below_since = None;
+                continue;
+            }
+            let since = *tr.below_since.get_or_insert(now);
+            if now.saturating_sub(since) >= dwell && tr.rung != tr.base {
+                let up = prev_rung(tr.rung)
+                    .filter(|u| crate::codec::rung_index(u) >= crate::codec::rung_index(tr.base))
+                    .unwrap_or(tr.base);
+                self.set_rung(t.tier, up, LadderReason::RungStepUp, now);
+            }
+        }
+        if pressure == PressureState::Green {
+            return;
+        }
+        self.sync_l0_refs(pool);
+        for t in tiers.iter().rev() {
+            if !self.ladder_budget() {
+                break;
+            }
+            self.ladder_sweep(pool, t.tier, pressure, now);
+        }
+    }
+
+    /// The ladder's sweep of one tier ([`KvHierarchy::ladder_tick`]).
+    fn ladder_sweep(
+        &mut self,
+        pool: &mut BlockPool,
+        tier: TierId,
+        pressure: PressureState,
+        now: Duration,
+    ) {
+        let mut order: Vec<(usize, Victim)> = self
+            .dir
+            .iter()
+            .filter(|b| {
+                b.ref_count == 0
+                    && !self.demoting.contains_key(&b.key)
+                    && !self.transfer.is_busy_with(&b.key)
+            })
+            .filter_map(|b| {
+                let loc = b.location(tier)?;
+                let inputs = self.score_one(b, tier, pool, now);
+                Some((
+                    crate::codec::rung_index(loc.format).unwrap_or(0),
+                    Victim {
+                        value: self.policy.score(&inputs, now),
+                        last_access: b.last_access,
+                        depth: b.token_range.end,
+                        key: b.key,
+                    },
+                ))
+            })
+            .collect();
+        order.sort_by(|(ra, a), (rb, b)| ra.cmp(rb).then_with(|| a.cmp(b)));
+        let mut departing: HashSet<KvKey> = self.demoting.keys().copied().collect();
+        for (_, v) in order {
+            if !self.ladder_budget() {
+                break;
+            }
+            let Some(b) = self.dir.get(&v.key) else {
+                continue;
+            };
+            let Some(format) = b.location(tier).map(|l| l.format) else {
+                continue;
+            };
+            let Some(ctx) = self.ladder_context(tier, format, false, pressure) else {
+                return;
+            };
+            let inputs = self.score_one(b, tier, pool, now);
+            match self.policy.policy.action(&inputs, &ctx) {
+                EvictAction::Compress { to } => {
+                    if !self.submit_compress(v.key, tier, to, LadderReason::FillHighWater) {
+                        return;
+                    }
+                }
+                EvictAction::Drop => {
+                    if !self.dir.evictable(b, tier, &departing) {
+                        continue;
+                    }
+                    self.metrics.ladder_action(
+                        tier,
+                        format,
+                        LADDER_EVICT,
+                        LadderReason::FloorEvict,
+                    );
+                    self.remove_copy(pool, &v.key, tier, EvictReason::LadderFloor);
+                    departing.insert(v.key);
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// The rung new demotions into `tier` take (`None` when the ladder is off or the tier is
+    /// not enabled).
+    pub fn ladder_rung(&self, tier: TierId) -> Option<&'static str> {
+        self.ladder
+            .as_ref()?
+            .tiers
+            .iter()
+            .find(|t| t.tier == tier)
+            .map(|t| t.rung)
+    }
+
+    /// The keys with a ladder rewrite in flight and their tier.
+    pub fn ladder_in_flight(&self) -> impl Iterator<Item = (&KvKey, TierId)> {
+        self.compressing.iter().map(|(k, c)| (k, c.tier))
+    }
+
+    /// `reliability.pressure.deescalate_dwell`: how long a tier stays below low water before
+    /// its ladder rung steps back up.
+    pub fn set_ladder_dwell(&mut self, dwell: Duration) {
+        if let Some(l) = self.ladder.as_mut() {
+            l.cfg.dwell = dwell;
+        }
     }
 
     /// Session TTLs, expiry and predicted-resume prefetch; call once per iteration.
@@ -1659,6 +2213,8 @@ impl KvHierarchy {
             }
         }
         self.metrics.sessions.set(self.sessions.len() as i64);
+        let state = self.l0_state;
+        self.ladder_tick(pool, state, now);
     }
 
     /// `POST /turbine/v1/kv/prefetch`: promote the cached blocks of a session or a prompt.
@@ -1861,6 +2417,15 @@ impl KvHierarchy {
             }),
         }
     }
+}
+
+/// The rung above `name` in the `kv_format` registry's lossiness order (`None` for the first).
+fn prev_rung(name: &str) -> Option<&'static str> {
+    let i = crate::codec::rung_index(name)?;
+    crate::codec::registry()
+        .iter()
+        .nth(i.checked_sub(1)?)
+        .map(|c| c.name())
 }
 
 /// The plan of an attach cut short after the blocks of `used` (a failed allocation or a full

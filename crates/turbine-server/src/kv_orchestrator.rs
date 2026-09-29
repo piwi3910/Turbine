@@ -66,7 +66,9 @@ use turbine_kv::tier::{
     KvTier, L0_FORMAT, L1Config, L1PinnedTier, L2Config, L2NvmeTier, ShardSlots, ShardedL1Tier,
     TierBlockMut, TierBlockRef, TierError, TierId, TierSlot,
 };
-use turbine_kv::transfer::{TransferBackend, TransferCodec, TransferPath, TransferTicket};
+use turbine_kv::transfer::{
+    TransferBackend, TransferCodec, TransferPath, TransferPurpose, TransferTicket,
+};
 use turbine_kv::{BlockPool, KvDocument, KvMetrics};
 use turbine_model::kv_scales::KvCache;
 use turbine_tensor::{
@@ -586,6 +588,11 @@ impl KvOrchestrator {
             );
         }
         Ok((o, KvHandle { tx }))
+    }
+
+    /// `reliability.pressure.deescalate_dwell`: the compression ladder's step-up dwell (P6b S-6).
+    pub fn set_ladder_dwell(&mut self, dwell: Duration) {
+        self.h.set_ladder_dwell(dwell);
     }
 
     /// The lock-free reclaim requests the Phase 3 controller issues (`KvReclaimer`).
@@ -1336,8 +1343,15 @@ impl IoPoolBackend {
 }
 
 impl TransferBackend for IoPoolBackend {
+    /// An L1 ↔ L2 copy, or a ladder rewrite (P6b S-6: the copy re-encoded by the host codec
+    /// and stored back in its own tier) of an L1 or L2 copy.
     fn start(&mut self, t: &TransferTicket) -> Result<(), TierError> {
-        let (from, to) = (t.req.path.from(), t.req.path.to());
+        let from = t.req.path.from();
+        let to = if t.req.purpose == TransferPurpose::Compress {
+            from
+        } else {
+            t.req.path.to()
+        };
         let (Some(from), Some(to)) = (self.tier(from), self.tier(to)) else {
             return Err(TierError::Missing);
         };
@@ -1647,6 +1661,13 @@ impl CopyStreamBackend {
 
     fn start_job(&mut self, t: &TransferTicket) -> Result<Job, TierError> {
         let req = &t.req;
+        if req.purpose == TransferPurpose::Compress {
+            // A ladder rewrite runs on the I/O pool with the host codec (the v2.10 device
+            // transcode through staging replaces it with P6b Task 5); the ladder is refused at
+            // startup until then.
+            self.io.start(t)?;
+            return Ok(Job::Io(IoStage::Final));
+        }
         match req.path {
             TransferPath::L1ToL2 | TransferPath::L2ToL1 => {
                 self.io.start(t)?;

@@ -1892,7 +1892,19 @@ fn check_labels(line: &str) {
         "recompute_cheaper",
         "l0_pressure",
         "no_match",
+        "compressed",
+        "ladder_floor",
     ];
+    // P6b S-6: the compression ladder's actions name codecs, not tiers, as from/to.
+    const LADDER_REASONS: &[&str] = &[
+        "fill_high_water",
+        "would_drop",
+        "new_demotion",
+        "rung_step_up",
+        "floor_evict",
+    ];
+    const CODECS: &[&str] = &["l0", "fp8_e4m3", "tq4", "tq2"];
+    let ladder = line.starts_with("turbine_kv_ladder_actions");
     let Some(labels) = line.split_once('{').map(|(_, rest)| rest) else {
         return;
     };
@@ -1901,6 +1913,9 @@ fn check_labels(line: &str) {
         let (k, v) = pair.split_once('=').unwrap_or_else(|| panic!("{line}"));
         let v = v.trim_matches('"');
         let ok = match k {
+            "from" if ladder => CODECS.contains(&v),
+            "to" if ladder => CODECS.contains(&v) || v == "evict",
+            "reason" if ladder => LADDER_REASONS.contains(&v),
             "tier" | "from" | "to" => TIERS.contains(&v),
             "state" => ["used", "free"].contains(&v),
             "kind" => ["capacity", "used"].contains(&v),
@@ -1988,6 +2003,9 @@ async fn kv_metrics_bounded() {
         "turbine_kv_tier_degraded{",
         "turbine_storage_queue_depth ",
         "turbine_storage_latency_seconds_bucket{",
+        // P6b S-6: the compression ladder (its actions render once the ladder acts).
+        "turbine_kv_ladder_rung{",
+        "turbine_kv_ladder_actions_total{",
     ] {
         assert!(text.contains(family), "{family} missing");
     }

@@ -1,0 +1,74 @@
+[
+  {
+    "step": 1177,
+    "tier": "l1",
+    "from": "l0",
+    "to": "fp8_e4m3"
+  },
+  {
+    "step": 1177,
+    "tier": "l2",
+    "from": "l0",
+    "to": "fp8_e4m3"
+  },
+  {
+    "step": 1700,
+    "tier": "l2",
+    "from": "fp8_e4m3",
+    "to": "l0"
+  },
+  {
+    "step": 3604,
+    "tier": "l2",
+    "from": "l0",
+    "to": "fp8_e4m3"
+  },
+  {
+    "step": 3623,
+    "tier": "l2",
+    "from": "fp8_e4m3",
+    "to": "tq4"
+  },
+  {
+    "step": 3649,
+    "tier": "l2",
+    "from": "tq4",
+    "to": "tq2"
+  },
+  {
+    "step": 3680,
+    "tier": "l1",
+    "from": "fp8_e4m3",
+    "to": "tq4"
+  },
+  {
+    "step": 4141,
+    "tier": "l2",
+    "from": "tq2",
+    "to": "tq4"
+  },
+  {
+    "step": 4417,
+    "tier": "l2",
+    "from": "tq4",
+    "to": "tq2"
+  },
+  {
+    "step": 4825,
+    "tier": "l2",
+    "from": "tq2",
+    "to": "tq4"
+  },
+  {
+    "step": 5242,
+    "tier": "l2",
+    "from": "tq4",
+    "to": "fp8_e4m3"
+  },
+  {
+    "step": 5890,
+    "tier": "l2",
+    "from": "fp8_e4m3",
+    "to": "l0"
+  }
+]
