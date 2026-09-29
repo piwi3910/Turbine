@@ -1,0 +1,53 @@
+# Llama-3.2-3B-Instruct with factor-16 YaRN: golden fixture
+
+The Phase 6a YaRN proof (spec S-16, plan Task 28). Turbine serves the BF16 Llama checkpoint with
+`model.rope_scaling` replacing its `llama3` scaling
+(`scripts/lab/phase6-novanas-llama-yarn16.yaml`):
+
+```yaml
+rope_scaling: {rope_type: yarn, factor: 16.0, original_max_position_embeddings: 8192, beta_fast: 32, beta_slow: 1}
+```
+
+and is compared with transformers' native YaRN on the same weights carrying that `config.json`.
+
+- `prompts.jsonl`: the 16 golden prompts (`tests/golden/prompts.jsonl`, byte for byte) plus
+  `p17-long`, a 12,030-token chat prompt made of the first 190 GSM8K questions of
+  `tests/eval/gsm8k-200.jsonl`, numbered and concatenated, followed by a request to repeat
+  question 1 word for word. Answering it needs attention from the last position back to the
+  start of the context, past the 8,192 positions the override treats as the original context.
+  `turbine-golden compare` reads `prompts.jsonl` beside the reference by default, so one file
+  holds both sets. Written by
+  `uv run scripts/golden/yarn_long_prompt.py --model-dir /home/piwi/turbine-models/llama-3.2-3b-instruct --out tests/golden/llama-3.2-3b-instruct-yarn16/prompts.jsonl`
+  (the tokenizer only counts tokens; the first prompt reaching 12,000 tokens is kept).
+- `reference.jsonl`: transformers 4.57.1, BF16 on CPU, SDPA attention, incremental decode with the
+  KV cache, FP32 LM head on the BF16 final-norm output, weights `unsloth/Llama-3.2-3B-Instruct` at
+  revision `006f5dcd1393c3add266de40994ba96225e9689d`, written on novanas (under a shared
+  `flock` on the benchmark lock) by
+
+  ```sh
+  uv run scripts/golden/hf_reference.py --model-dir /home/piwi/turbine-models/llama-3.2-3b-instruct \
+    --prompts tests/golden/llama-3.2-3b-instruct-yarn16/prompts.jsonl \
+    --out tests/golden/llama-3.2-3b-instruct-yarn16/reference.jsonl \
+    --config-override '{"rope_scaling":{"rope_type":"yarn","factor":16.0,"original_max_position_embeddings":8192,"beta_fast":32,"beta_slow":1}}'
+  ```
+
+  `--config-override` replaces `config.json`'s `rope_scaling` before the model loads (the same
+  as a copy of the checkpoint carrying that `config.json`, without copying the weights); the
+  script logged `rotary yarn, attention scaling 1.2772588722239782`, the attention factor Turbine
+  folds into the softmax scale (`scale × factor²`).
+- `tolerance.json`: the BF16 Llama bounds unchanged (|Δ logprob| ≤ 0.15 likely, ≤ 0.55 tail;
+  batched 0.25 / 0.75; `min_identical_prefix` 32, `top_k` 5, `margin_nats` 0.5), with
+  `min_prompts_passing` 15 of the 17 prompts (Llama's 14 of 16 plus the long prompt).
+  **Provisional** — not calibrated for YaRN, and not yet known to hold. The Llama bounds were
+  assumed to carry over on the grounds that YaRN changes no kernel or precision; the evidence
+  contradicts that: transformers' own spread on this fixture
+  (`uv run scripts/golden/yarn_self_spread.py`, variant `bf16-sdpa-full`) puts p16's tail at
+  0.43, while Turbine measures 1.38 (HIP) and 1.49 (cpu-reference provider) on p16 and 1.42 on
+  p17-long at a greedy-identical token stream. Whether the gap comes from where the YaRN
+  attention factor is applied (Turbine folds `factor²` into the softmax scale, transformers
+  scales cos/sin; `yarn_self_spread.py --fold` and the lab diagnostic
+  `turbine-model --test golden yarn_teacher_forced_vs_reference`, column `unf`, measure it) is
+  open; the bounds change only with that spread evidence and a recorded decision.
+
+Gate: `LABBOOK_SET=phase-6a-quantization scripts/lab-bench.sh --model llama-yarn16 --golden16`
+(GPU 0), golden at concurrency 1 and 16.

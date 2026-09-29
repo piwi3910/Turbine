@@ -27,7 +27,10 @@ use turbine_core::request::{
 };
 use turbine_core::types::RequestId;
 use turbine_kernels::{
-    KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider, shim_provider,
+    ActivationKernel, AddRmsnormKernel, AttentionKernel, ElementwiseKernel, EmbeddingKernel,
+    GemmKernel, KernelError, KernelMetrics, KernelProvider, KernelRegistry, KvCopyKernel,
+    LogitsReduceKernel, MoeKernel, NormKernel, ProviderId, QGemmKernel, QuantizeActKernel,
+    RopeConfig, RopeContext, RopeKernel, ShardedNormKernel, cpu_reference_provider, shim_provider,
 };
 use turbine_model::executor::{
     self, DecoderExecutor, ExecutorLimits, ExecutorOptions, ModelExecutor, SequenceKv,
@@ -39,7 +42,7 @@ use turbine_model::testing::tiny::write_tiny_llama;
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::{
     ChatTemplate, MAX_STAGING_BYTES, SafetensorsIndex, Tokenizer, WeightLoader, llama_slots,
-    load_model_config,
+    load_model_config, load_model_config_with,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::DeviceMemory;
@@ -880,7 +883,18 @@ fn build_any_executor(
     mem: Arc<dyn DeviceMemory>,
     max_seq_len: u32,
 ) -> AnyRunner {
-    let cfg = load_model_config(model_dir).expect("config.json");
+    build_any_executor_with(model_dir, None, provider, mem, max_seq_len)
+}
+
+/// [`build_any_executor`] with a `model.rope_scaling` override (the YaRN golden).
+fn build_any_executor_with(
+    model_dir: &Path,
+    rope_scaling: Option<&serde_json::Value>,
+    provider: Arc<dyn KernelProvider>,
+    mem: Arc<dyn DeviceMemory>,
+    max_seq_len: u32,
+) -> AnyRunner {
+    let cfg = load_model_config_with(model_dir, rope_scaling).expect("config.json");
     let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
     let slots = cfg.family.0.weight_slots(&cfg);
     let weights =
@@ -926,6 +940,8 @@ struct ForcedPosition {
     argmax: u32,
     likely: f32,
     tail: f32,
+    /// The reference's top-5 at this position: (token, reference logprob, ours).
+    candidates: Vec<(u32, f32, f32)>,
 }
 
 /// Runs `r`'s prompt and then its reference tokens (teacher-forced: every position sees the
@@ -946,7 +962,9 @@ fn teacher_forced(runner: &mut AnyRunner, r: &ReferenceRecord, floor: f32) -> Ve
             .max_by(|&a, &b| lp[a].total_cmp(&lp[b]).then(b.cmp(&a)))
             .expect("non-empty vocab") as u32;
         let (mut likely, mut tail) = (0f32, 0f32);
+        let mut candidates = Vec::with_capacity(5);
         for &(id, ref_lp) in r.top_logprobs[step].iter().take(5) {
+            candidates.push((id, ref_lp, lp[id as usize]));
             let d = (lp[id as usize] - ref_lp).abs();
             if ref_lp > floor {
                 likely = likely.max(d);
@@ -958,6 +976,7 @@ fn teacher_forced(runner: &mut AnyRunner, r: &ReferenceRecord, floor: f32) -> Ve
             argmax,
             likely,
             tail,
+            candidates,
         });
         p0 += batch.len();
         batch = vec![r.tokens[step]];
@@ -1033,5 +1052,278 @@ fn olmoe_teacher_forced_vs_reference() {
             worst(&c),
             worst(&h)
         );
+    }
+}
+
+// ------------------------------------------------------------------------------- YaRN
+
+/// The factor-16 YaRN override of `tests/golden/llama-3.2-3b-instruct-yarn16/` (its README and
+/// `scripts/lab/phase6-novanas-llama-yarn16.yaml`).
+fn yarn16_override() -> serde_json::Value {
+    serde_json::json!({
+        "rope_type": "yarn",
+        "factor": 16.0,
+        "original_max_position_embeddings": 8192,
+        "beta_fast": 32,
+        "beta_slow": 1
+    })
+}
+
+/// Prompts at most this long also run on the (scalar) cpu-reference provider in
+/// [`yarn_teacher_forced_vs_reference`]; longer ones run on HIP only.
+const YARN_CPU_MAX_TOKENS: usize = 1024;
+
+/// transformers' YaRN attention factor for the factor-16 override (`0.1 · ln 16 + 1`).
+const YARN16_ATTENTION_FACTOR: f32 = 1.277_258_9;
+
+/// RoPE with YaRN's attention factor placed as transformers places it (diagnostic only): cos
+/// and sin evaluated in f32, multiplied by `factor` in f32 and then rounded to BF16,
+/// `x1' = round(round(x1·c) + round(−x2·s))`, `x2' = round(round(x2·c) + round(x1·s))` — the
+/// cpu-reference rope with `c`, `s` scaled before rounding. Paired with a softmax scale of
+/// `head_dim^-0.5` (the override with `attention_factor: 1.0`), it is transformers' placement
+/// where Turbine folds `factor²` into the softmax scale (user decision 2026-09-28, Q19).
+struct UnfoldedRope {
+    factor: f32,
+}
+
+impl RopeKernel for UnfoldedRope {
+    fn supports(&self, cfg: &RopeConfig) -> bool {
+        cfg.dtype == turbine_tensor::DType::BF16
+    }
+    fn implementation(&self, _cfg: &RopeConfig) -> String {
+        "unfolded_yarn_rope".into()
+    }
+    fn execute(&self, ctx: &mut RopeContext<'_>) -> Result<(), KernelError> {
+        let half = ctx.cfg.rotary_dim as usize / 2;
+        let tokens = ctx.positions.shape[0];
+        let pos_bytes = ctx.positions.slice.read_bytes()?;
+        let freq_bytes = ctx.inv_freq.slice.read_bytes()?;
+        let word = |b: &[u8], i: usize| [b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]];
+        let round = |v: f32| turbine_kernels::round_to(turbine_tensor::DType::BF16, v);
+        for view in [&ctx.q, &ctx.k] {
+            let (heads, st) = (view.shape[1], &view.strides);
+            let mut bytes = view.slice.read_bytes()?;
+            let at = |t: usize, h: usize, i: usize| 2 * (t * st[0] + h * st[1] + i * st[2]);
+            for t in 0..tokens {
+                let pos = i32::from_le_bytes(word(&pos_bytes, t)) as f32;
+                for i in 0..half {
+                    let f = pos * f32::from_le_bytes(word(&freq_bytes, i));
+                    let (c, s) = (round(f.cos() * self.factor), round(f.sin() * self.factor));
+                    for h in 0..heads {
+                        let (o1, o2) = (at(t, h, i), at(t, h, i + half));
+                        let get = |b: &[u8], o: usize| {
+                            f32::from_bits(u32::from(u16::from_le_bytes([b[o], b[o + 1]])) << 16)
+                        };
+                        let (x1, x2) = (get(&bytes, o1), get(&bytes, o2));
+                        let y1 = round(round(x1 * c) + round(-x2 * s));
+                        let y2 = round(round(x2 * c) + round(x1 * s));
+                        let put = |b: &mut [u8], o: usize, y: f32| {
+                            b[o..o + 2].copy_from_slice(&((y.to_bits() >> 16) as u16).to_le_bytes())
+                        };
+                        put(&mut bytes, o1, y1);
+                        put(&mut bytes, o2, y2);
+                    }
+                }
+            }
+            view.slice.write_bytes(&bytes)?;
+        }
+        Ok(())
+    }
+}
+
+/// The cpu-reference provider with [`UnfoldedRope`] in place of its rope.
+struct UnfoldedProvider {
+    inner: Arc<dyn KernelProvider>,
+    rope: UnfoldedRope,
+}
+
+impl KernelProvider for UnfoldedProvider {
+    fn id(&self) -> ProviderId {
+        self.inner.id()
+    }
+    fn gemm(&self) -> Option<&dyn GemmKernel> {
+        self.inner.gemm()
+    }
+    fn attention(&self) -> Option<&dyn AttentionKernel> {
+        self.inner.attention()
+    }
+    fn norm(&self) -> Option<&dyn NormKernel> {
+        self.inner.norm()
+    }
+    fn rope(&self) -> Option<&dyn RopeKernel> {
+        Some(&self.rope)
+    }
+    fn activation(&self) -> Option<&dyn ActivationKernel> {
+        self.inner.activation()
+    }
+    fn embedding(&self) -> Option<&dyn EmbeddingKernel> {
+        self.inner.embedding()
+    }
+    fn elementwise(&self) -> Option<&dyn ElementwiseKernel> {
+        self.inner.elementwise()
+    }
+    fn kv_copy(&self) -> Option<&dyn KvCopyKernel> {
+        self.inner.kv_copy()
+    }
+    fn moe(&self) -> Option<&dyn MoeKernel> {
+        self.inner.moe()
+    }
+    fn add_rmsnorm(&self) -> Option<&dyn AddRmsnormKernel> {
+        self.inner.add_rmsnorm()
+    }
+    fn logits_reduce(&self) -> Option<&dyn LogitsReduceKernel> {
+        self.inner.logits_reduce()
+    }
+    fn sharded_norm(&self) -> Option<&dyn ShardedNormKernel> {
+        self.inner.sharded_norm()
+    }
+    fn qgemm(&self) -> Option<&dyn QGemmKernel> {
+        self.inner.qgemm()
+    }
+    fn quantize_act(&self) -> Option<&dyn QuantizeActKernel> {
+        self.inner.quantize_act()
+    }
+    fn card_profile(&self) -> Option<&'static turbine_kernels::cards::CardProfile> {
+        self.inner.card_profile()
+    }
+}
+
+/// Lab diagnostic (P6a Task 28, YaRN tail numerics), a no-op unless `TURBINE_GOLDEN_YARN`
+/// names prompts of the YaRN golden (comma-separated ids); run it alone in a release build.
+/// For each named prompt, Llama-3.2-3B with the factor-16 YaRN override runs the reference's
+/// prompt and then its tokens teacher-forced, and prints per position the largest |Δ logprob|
+/// against the transformers reference's top-5 for `hip` (the HIP provider), `cpu` (the
+/// cpu-reference provider) and `unf` (the cpu-reference provider with the attention factor
+/// placed as transformers places it, [`UnfoldedRope`]) — the last two only for prompts up to
+/// [`YARN_CPU_MAX_TOKENS`] — then every candidate of the positions whose tail |Δ| exceeds 0.3.
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY, TURBINE_TEST_MODEL_DIR and TURBINE_GOLDEN_YARN"]
+fn yarn_teacher_forced_vs_reference() {
+    let Some(ids) = std::env::var("TURBINE_GOLDEN_YARN")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        println!("TURBINE_GOLDEN_YARN is not set: nothing compared");
+        return;
+    };
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let _gpu = gpu_model_lock();
+    let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+
+    let fixture = golden_dir().join("llama-3.2-3b-instruct-yarn16");
+    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
+    let tol = read_tolerance(&fixture.join("tolerance.json"));
+    let selected: Vec<&ReferenceRecord> = ids
+        .split(',')
+        .map(|id| {
+            references
+                .iter()
+                .find(|r| r.id == id.trim())
+                .unwrap_or_else(|| panic!("no reference prompt {id}"))
+        })
+        .collect();
+    let seq_len = |r: &&ReferenceRecord| (r.prompt_token_ids.len() + r.tokens.len()) as u32;
+    let max_seq_len = selected.iter().map(seq_len).max().expect("a prompt");
+    let cpu_seq_len = selected
+        .iter()
+        .filter(|r| r.prompt_token_ids.len() <= YARN_CPU_MAX_TOKENS)
+        .map(seq_len)
+        .max();
+    let rope = yarn16_override();
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut hip = build_any_executor_with(
+        &model_dir,
+        Some(&rope),
+        shim_provider(ctx),
+        mem,
+        max_seq_len,
+    );
+    let host = || HostMemory::new(turbine_core::types::DeviceId(0), 16 << 30);
+    let mut cpu = cpu_seq_len.map(|len| {
+        build_any_executor_with(
+            &model_dir,
+            Some(&rope),
+            cpu_reference_provider(),
+            host(),
+            len,
+        )
+    });
+    let mut unfolded_rope = rope.clone();
+    unfolded_rope["attention_factor"] = serde_json::json!(1.0);
+    let mut unf = cpu_seq_len.map(|len| {
+        let provider: Arc<dyn KernelProvider> = Arc::new(UnfoldedProvider {
+            inner: cpu_reference_provider(),
+            rope: UnfoldedRope {
+                factor: YARN16_ATTENTION_FACTOR,
+            },
+        });
+        build_any_executor_with(&model_dir, Some(&unfolded_rope), provider, host(), len)
+    });
+    let worst = |v: &[ForcedPosition]| {
+        v.iter()
+            .fold((0f32, 0f32), |(l, t), p| (l.max(p.likely), t.max(p.tail)))
+    };
+    let cols = |v: &[ForcedPosition], pos: usize| {
+        v.get(pos).map_or((u32::MAX, f32::NAN, f32::NAN), |p| {
+            (p.argmax, p.likely, p.tail)
+        })
+    };
+    for r in selected {
+        let short = r.prompt_token_ids.len() <= YARN_CPU_MAX_TOKENS;
+        let h = teacher_forced(&mut hip, r, tol.likely_logprob_floor);
+        println!("YaRN {} hip max {:?}", r.id, worst(&h));
+        let forced = |runner: Option<&mut AnyRunner>| match runner {
+            Some(runner) if short => teacher_forced(runner, r, tol.likely_logprob_floor),
+            _ => Vec::new(),
+        };
+        let c = forced(cpu.as_mut());
+        let u = forced(unf.as_mut());
+        println!(
+            "YaRN {} teacher-forced vs transformers (|Δ| likely / tail):",
+            r.id
+        );
+        println!(
+            "pos  ref_tok  cpu_argmax cpu_likely cpu_tail  unf_argmax unf_likely unf_tail  \
+             hip_argmax hip_likely hip_tail"
+        );
+        for (pos, h) in h.iter().enumerate() {
+            let (ca, cl, ct) = cols(&c, pos);
+            let (ua, ul, ut) = cols(&u, pos);
+            println!(
+                "{pos:>3} {:>8} {ca:>10} {cl:>10.4} {ct:>8.4} {ua:>11} {ul:>10.4} {ut:>8.4} \
+                 {:>11} {:>10.4} {:>8.4}",
+                r.tokens[pos], h.argmax, h.likely, h.tail
+            );
+        }
+        for (pos, h) in h.iter().enumerate() {
+            let others = [c.get(pos), u.get(pos)];
+            if h.tail <= 0.3 && others.iter().all(|p| p.is_none_or(|p| p.tail <= 0.3)) {
+                continue;
+            }
+            println!(
+                "YaRN {} pos {pos} candidates (token ref cpu unf hip):",
+                r.id
+            );
+            for (i, &(id, ref_lp, hip_lp)) in h.candidates.iter().enumerate() {
+                let lp = |p: Option<&ForcedPosition>| p.map_or(f32::NAN, |p| p.candidates[i].2);
+                println!(
+                    "    {id:>8} {ref_lp:>9.4} {:>9.4} {:>9.4} {hip_lp:>9.4}",
+                    lp(others[0]),
+                    lp(others[1])
+                );
+            }
+        }
+        if short {
+            println!(
+                "YaRN {} max: cpu {:?}, unf {:?}, hip {:?}",
+                r.id,
+                worst(&c),
+                worst(&u),
+                worst(&h)
+            );
+        }
     }
 }
