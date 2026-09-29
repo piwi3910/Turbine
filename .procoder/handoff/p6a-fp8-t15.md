@@ -249,3 +249,20 @@ from the snapshot worktree.
 5. The support-matrix row flip (`7d7e644`) stays provisional until 1–3 above close it out; if
    any of them fails, the row needs to go back to `experimental` in a follow-up
    `handoff(support.rs)` commit.
+
+### Rotation 11 update: GPU job A ran already (bench numbers in, golden missing the fixture)
+
+The lead created `fp8block-bench.go` quickly; the job ran and finished:
+`fp8block-bench: BENCH r11-fp8block llama-fp8-block commit=unknown gpu=0 rc=1 (...)`. `rc=1`
+only because `golden1`/`golden16` failed with "cannot read
+tests/golden/llama-3.2-3b-instruct-fp8-block/reference.jsonl" — expected, since §1's fixture
+isn't committed yet. The measurement legs succeeded: `bench tok/s 1054.96 ok 200` (matches the
+t15-proof pass's 1061.44 within noise) and `c1 itl_ms.p50 8.43 tok_s_c1 112.66 ok 10`. No
+`fp8_block_decoded` or `CIRCUIT_OPEN` lines were expected to show and weren't checked yet in this
+note — read `.../fp8block-bench/server.log` before trusting the numbers. **Once §1's fixture is
+committed, rerun just the golden legs** (`turbine-golden compare --url ... --concurrency 1|16`
+against the release binaries already built in this run's workspace) rather than the whole job.
+
+`fp8block-soak.go` was also created; the soak (GPU job B) is running as of this note (job
+`turbine-lab-serve-0929224541-301172b6`, snapshot worktree `r11-soak-fp8block`) — not finished,
+judge `scratchpad/fp8block-soak/wait_and_soak.log` for its `fp8block-soak: done rc=` line.
