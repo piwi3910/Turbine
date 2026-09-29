@@ -2102,3 +2102,24 @@ novanas): Turbine 0.7703, vLLM-ROCm 0.7832, drop 0.0129 > the 0.01 reference-eng
 
 **Decision (user, 2026-09-29, relayed by the coordinator): A.** The c1 ITL item (0.846× BF16 against the 0.75× target)
 stays a perf follow-up (plan Task 14b) and does not block support.
+
+## GPTQ INT4: full-GSM8K drop just over the 4-bit bound (2026-09-30)
+
+Context: the full-GSM8K gate for `gptq_int4` (1,319 items, c16; checkpoint `shuyuej/Llama-3.2-3B-Instruct-GPTQ` @
+`dd5a311f040728fbc612eb03c8dadfae0a90552f`; gate `tests/eval/llama-3.2-3b-instruct-gptq/gate.json`, max drop 0.04 against
+Turbine BF16, since vLLM-ROCm 0.23 cannot load this checkpoint): Turbine GPTQ 972/1319 = 0.7369 vs Turbine BF16
+1029/1319 = 0.7801, a drop of 0.0432 > 0.04. Paired: 122 items lost, 65 gained, McNemar exact p = 3.7e-5 (the drop
+against BF16 is real), 95% CI of the drop +0.0230 … +0.0634; the overshoot of the 0.04 bound is not significant
+(z = 0.31, one-sided p ≈ 0.38). Turbine's dequantization is bit-exact against an independent AutoGPTQ reference over 21
+layers (`p6a-gptq-numerics`), so the loss is the checkpoint's or GPTQ's own. For comparison AWQ INT4 dropped 0.030 on
+GSM8K-200.
+
+- A) Accept the overshoot as noise and mark `gptq_int4` `supported`
+- B) Re-judge on a better GPTQ checkpoint of Llama-3.2-3B-Instruct from a known publisher (damp 0.01, `desc_act`
+  false, preferably one vLLM-ROCm loads), full GSM8K at c16 on Turbine and on vLLM if it loads — chosen
+- C) Keep `gptq_int4` `experimental` and close 6a with AWQ as the supported 4-bit format
+
+**Decision (user, 2026-09-30, relayed by the coordinator): B.** The run queues after `w4a4-rerun` and the fp8_block
+jobs; weights are fetched on `novanas` with `hf download … --revision <pinned rev>` (the token stays there). If no
+suitable published checkpoint exists, the options (e.g. quantizing one ourselves with a Python tool at fixture time,
+off the serving path) go back to the user. `gptq_int4` stays `experimental` meanwhile.
