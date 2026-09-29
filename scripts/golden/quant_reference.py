@@ -21,7 +21,10 @@ pre-hook on every decoded Linear quantize-dequantizes its input exactly as
 `turbine_dequant.json`):
 - `none`          weight-only (W4A16, W8A16);
 - `fp8_token`     FP8 e4m3 per row (token), scale `max(amax / 448, 1 / (448 × 512))`;
-- `fp8_tensor`    FP8 e4m3 with the layer's static `input_scale` from the checkpoint;
+- `fp8_tensor`    FP8 e4m3 with the layer's static `input_scale` from the checkpoint; a layer
+                  Turbine runs fused (q/k/v, gate/up) takes the largest `input_scale` of its
+                  parts, as Turbine's loader and vLLM do (`--input-scale per-part` keeps each
+                  layer's own);
 - `fp8_group128`  FP8 e4m3 per row and group of 128 columns, dynamic like `fp8_token`;
 - `mxfp4`         MXFP4 per 32 columns: E8M0 scale from Quark's `even` rule, E2M1 round to
                   nearest even, saturated to ±6 (Quark W4A4).
@@ -45,6 +48,7 @@ Usage:
         --prompts tests/golden/prompts.jsonl --out tests/golden/<slug>/reference.jsonl \
         [--act-quant auto|none|fp8_token|fp8_tensor|fp8_group128|mxfp4] [--top-logprobs 20] \
         [--work-dir /dev/shm] [--dequantized <dir>] [--keep-dequantized] [--model-name <hub-id>]
+        [--input-scale fused-max|per-part]
     uv run scripts/golden/quant_reference.py --self-test
 """
 
@@ -55,6 +59,7 @@ import datetime
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import sys
@@ -94,6 +99,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--work-dir", type=Path)
     p.add_argument("--dequantized", type=Path, help="reuse this dequantized copy")
     p.add_argument("--keep-dequantized", action="store_true")
+    p.add_argument(
+        "--input-scale",
+        choices=["fused-max", "per-part"],
+        default="fused-max",
+        help="fp8_tensor: a fused projection's parts share their largest input_scale",
+    )
     args = p.parse_args(argv)
     if not args.self_test:
         missing = [
@@ -183,18 +194,49 @@ def qdq_activations(torch, x, mode: str, input_scale: float | None = None):
     return out.reshape(x.shape)
 
 
-def install_hooks(torch, model, layers: dict, mode: str) -> int:
+# The projections Turbine's decoder runs as one fused GEMM on one quantized input: a static
+# per-tensor activation scale is shared by the parts (the largest of theirs).
+FUSED_PARTS = re.compile(
+    r"^(?P<prefix>.*)\.(?:(?P<qkv>[qkv])_proj|(?P<gu>gate|up)_proj)$"
+)
+
+
+def fused_group(name: str) -> str:
+    m = FUSED_PARTS.match(name)
+    if m is None:
+        return name
+    return m.group("prefix") + (".qkv_proj" if m.group("qkv") else ".gate_up_proj")
+
+
+def input_scales(layers: dict, fused_max: bool) -> dict:
+    """Each layer's static input_scale, a fused group's parts sharing their largest."""
+    own = {name: entry.get("input_scale") for name, entry in layers.items()}
+    if not fused_max:
+        return own
+    groups: dict = {}
+    for name, scale in own.items():
+        if scale is not None:
+            key = fused_group(name)
+            groups[key] = max(groups.get(key, scale), scale)
+    return {
+        name: (groups[fused_group(name)] if scale is not None else None)
+        for name, scale in own.items()
+    }
+
+
+def install_hooks(torch, model, layers: dict, mode: str, fused_max: bool = True) -> int:
     """A forward pre-hook per decoded Linear: BF16 input → F32 → quantize-dequantize → BF16."""
     if mode == "none":
         return 0
+    scales = input_scales(layers, fused_max)
     count = 0
-    for name, entry in layers.items():
+    for name in layers:
         if name == "lm_head":
             raise ValueError(
                 "lm_head is quantized: the FP32 LM head of hf_reference bypasses it"
             )
         module = model.get_submodule(name)
-        scale = entry.get("input_scale")
+        scale = scales[name]
         if mode == "fp8_tensor" and scale is None:
             raise ValueError(f"{name}: fp8_tensor needs the checkpoint's input_scale")
 
@@ -452,10 +494,13 @@ def run(args: argparse.Namespace) -> None:
         model = AutoModelForCausalLM.from_pretrained(bf16_dir, dtype=torch.bfloat16)
         model.to(args.device)
         model.eval()
-        hooks = install_hooks(torch, model, record["layers"], mode)
+        hooks = install_hooks(
+            torch, model, record["layers"], mode, args.input_scale == "fused-max"
+        )
         engine = (
             f"transformers-{transformers.__version__}-bf16-{args.device}"
-            f"-dequant-{record['packaging']}-act-{mode}-fp32-logits"
+            f"-dequant-{record['packaging']}-act-{mode}"
+            f"{'-per-part-scales' if args.input_scale == 'per-part' else ''}-fp32-logits"
         )
         name = args.model_name or hf_reference.model_name(args.model_dir)
         revision = hf_reference.model_revision(args.model_dir) or record.get("revision")
