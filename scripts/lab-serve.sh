@@ -128,6 +128,10 @@ case "$2" in
 		SERVED_NAME=matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq
 		MAX_MODEL_LEN=32768
 		;;
+	llama-3.1-8b-instruct-mxfp4-a4)
+		SERVED_NAME=amd/Llama-3.1-8B-Instruct-MXFP4-W4A4-MLCAL-C1000-GPTQ
+		MAX_MODEL_LEN=32768
+		;;
 	# Phase 6a INT4 proofs (as in scripts/lab/phase6-novanas-llama-{awq,gptq}.yaml).
 	llama-3.2-3b-instruct-awq)
 		SERVED_NAME=casperhansen/llama-3.2-3b-instruct-awq
@@ -151,7 +155,7 @@ case "$2" in
 		MAX_MODEL_LEN=32768
 		;;
 	*)
-		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, llama-3.1-8b-instruct, llama-3.1-8b-instruct-mxfp4a16, llama-3.2-3b-mxfp4-a4, llama-3.2-3b-instruct-awq, llama-3.2-3b-instruct-gptq, llama-3.2-3b-instruct-fp8-dynamic, llama-3.2-3b-instruct-fp8 or llama-3.2-3b-instruct-fp8-block)" >&2
+		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, llama-3.1-8b-instruct, llama-3.1-8b-instruct-mxfp4a16, llama-3.2-3b-mxfp4-a4, llama-3.1-8b-instruct-mxfp4-a4, llama-3.2-3b-instruct-awq, llama-3.2-3b-instruct-gptq, llama-3.2-3b-instruct-fp8-dynamic, llama-3.2-3b-instruct-fp8 or llama-3.2-3b-instruct-fp8-block)" >&2
 		usage
 		;;
 	esac
