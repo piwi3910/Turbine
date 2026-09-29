@@ -554,6 +554,18 @@ fn prepare_with(
     let tp_error = |e: ModelError| model_error("tensor parallelism", e);
     let ep_error = |e: ModelError| model_error("expert parallelism", e);
     let pp_error = |e: ModelError| model_error("pipeline parallelism", e);
+    // Phase 6a S-8: the weight format as the selected providers serve this device's slots (a
+    // block-scaled FP8 layer none runs is decoded to BF16 at load, `fp8_block_decoded`), before
+    // the requirements, the budget and the load read it.
+    let device_slots = match (&expert, shard) {
+        _ if stage.is_some() => {
+            pp::weight_slots(&arch, &stage.as_ref().expect("a stage").spec).map_err(pp_error)?
+        }
+        (Some(e), _) => ep::weight_slots(&arch, e.shard, &e.placement).map_err(ep_error)?,
+        (None, None) => arch.family.0.weight_slots(&arch),
+        (None, Some(s)) => tp::weight_slots(&arch, s).map_err(tp_error)?,
+    };
+    turbine_model::weights::resolve_for_providers(&mut arch, &device_slots, &ordered);
     // One device: the family's ops, workspace, KV layout and weights. A tensor-parallel rank
     // (P5 S-6): its shard's (its heads, KV heads, intermediate and vocabulary columns). An
     // expert-parallel rank (S-11): its experts' (one `moe_experts` config per run of them) and
