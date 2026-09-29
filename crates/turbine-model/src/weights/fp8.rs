@@ -28,7 +28,8 @@ use std::sync::Arc;
 use turbine_core::registry::Module;
 use turbine_core::support::WeightFormatColumn;
 use turbine_core::types::DType;
-use turbine_kernels::cpu::quant::{fp8_e4m3_round, fp8_e4m3_value};
+use turbine_kernels::cpu::quant::{dequantize, fp8_e4m3_round, fp8_e4m3_value};
+use turbine_kernels::quant::QuantSchemeDesc;
 
 use super::common::{
     Follows, Owned, bf16_bytes, bf16_values, f32_bytes, matches_ignore, module_of, pow2_at_least,
@@ -96,8 +97,15 @@ impl Fp8Layout {
             && !self.ignore.iter().any(|pat| matches_ignore(pat, module))
     }
 
+    /// Block-scaled weights are decoded to BF16 at load and served by the BF16 GEMM: no
+    /// provider runs block-scaled FP8 on gfx1201 (6a Task 15 evaluation; lead decision
+    /// 2026-09-29, provisional). Their activations stay BF16.
+    pub fn decodes(&self) -> bool {
+        matches!(self.weights, Fp8Weights::Block { .. })
+    }
+
     pub fn scheme(&self, l: &LinearSlot) -> QuantScheme {
-        if !self.quantizes(&l.name, &[l.n as usize, l.k as usize]) {
+        if !self.quantizes(&l.name, &[l.n as usize, l.k as usize]) || self.decodes() {
             return QuantScheme::Bf16;
         }
         match self.weights {
@@ -151,6 +159,15 @@ impl Fp8Layout {
             return (out, true);
         }
         let module = module_of(&base.name).expect("quantizes() checked the suffix");
+        if self.decodes() {
+            // The weight is decoded into its BF16 slot (sharded like any BF16 weight); its
+            // scales (and a static input scale) are only read, as companions or checked.
+            out.push(check_slot(&format!("{module}.{}", self.scale_suffix)));
+            if self.act == ActivationQuant::Fp8PerTensorStatic {
+                out.push(check_slot(&format!("{module}.input_scale")));
+            }
+            return (out, true);
+        }
         let (n, k) = (base.shape[0], base.shape[1]);
         // The stack's leading dimensions (none for a 2-D stack), its rows and `base`'s first
         // row in the stack's rows flattened.
@@ -238,7 +255,9 @@ impl Fp8Layout {
     }
 
     pub fn slot_dtype(&self, slot: &WeightSlot) -> DType {
-        if self.repacks(slot) {
+        if self.decodes() && self.quantizes(&slot.name, &slot.shape) {
+            super::Bf16::DTYPE
+        } else if self.repacks(slot) {
             DType::F32
         } else if self.quantizes(&slot.name, &slot.shape) {
             DType::F8E4M3
@@ -251,9 +270,65 @@ impl Fp8Layout {
         name.ends_with(&format!(".{}", self.scale_suffix)) || name.ends_with(".input_scale")
     }
 
-    /// The scale slots are converted to F32 (and expanded per row).
+    /// The scale slots are converted to F32 (and expanded per row); a decoded block-scaled
+    /// weight is converted to BF16.
     pub fn repacks(&self, slot: &WeightSlot) -> bool {
-        self.is_scale(&slot.name)
+        self.is_scale(&slot.name) || (self.decodes() && self.quantizes(&slot.name, &slot.shape))
+    }
+
+    /// A decoded weight reads its block scales.
+    pub fn companions(&self, slot: &WeightSlot) -> Vec<String> {
+        match module_of(&slot.name) {
+            Some(module) if self.decodes() && self.quantizes(&slot.name, &slot.shape) => {
+                vec![format!("{module}.{}", self.scale_suffix)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// [`Fp8Layout::repack`], and the BF16 decode of a block-scaled weight (`companions`: its
+    /// scales); check-only scale slots are validated and store nothing.
+    pub fn repack_with(
+        &self,
+        slot: &WeightSlot,
+        entry: &TensorEntry,
+        bytes: Vec<u8>,
+        companions: &[(&TensorEntry, Vec<u8>)],
+    ) -> Result<Vec<u8>, ModelError> {
+        if slot.shape == [0] {
+            scale_values(entry, &bytes)?;
+            return Ok(Vec::new());
+        }
+        let Fp8Weights::Block { n: bn, k: bk } = self.weights else {
+            return self.repack(slot, entry, bytes);
+        };
+        if !self.quantizes(&slot.name, &slot.shape) {
+            return self.repack(slot, entry, bytes);
+        }
+        let [(scale_entry, scale_bytes)] = companions else {
+            return Err(ModelError::MissingTensor(format!(
+                "the block scales of {}",
+                entry.name
+            )));
+        };
+        let (n, k) = (slot.shape[0], slot.shape[1]);
+        let scales = scale_values(scale_entry, scale_bytes)?;
+        let scheme = QuantSchemeDesc::Fp8Block {
+            block_n: bn,
+            block_k: bk,
+        };
+        if bytes.len() != n * k || scales.len() != scheme.scale_count(n, k) {
+            return Err(ModelError::Safetensors {
+                file: entry.file.clone(),
+                tensor: entry.name.clone(),
+                rule: format!(
+                    "{} bytes and {} block scales for [{n}, {k}]",
+                    bytes.len(),
+                    scales.len()
+                ),
+            });
+        }
+        Ok(bf16_bytes(&dequantize(scheme, &bytes, &scales, None, n, k)))
     }
 
     pub fn check_tensor(&self, entry: &TensorEntry) -> Result<(), ModelError> {
@@ -314,6 +389,16 @@ impl Fp8Layout {
             });
         };
         Ok(out.iter().flat_map(|v| v.to_le_bytes()).collect())
+    }
+}
+
+/// A slot only validated: no elements, not stored.
+fn check_slot(name: &str) -> WeightSlot {
+    WeightSlot {
+        name: name.to_string(),
+        shape: vec![0],
+        stack: None,
+        source: None,
     }
 }
 
@@ -397,7 +482,11 @@ impl<P: Fp8Packaging> WeightFormat for Fp8Format<P> {
     }
 
     fn activation(&self) -> ActivationQuant {
-        self.layout.act
+        if self.layout.decodes() {
+            ActivationQuant::None
+        } else {
+            self.layout.act
+        }
     }
 
     fn slots(&self, base: &WeightSlot) -> Vec<WeightSlot> {
@@ -414,6 +503,20 @@ impl<P: Fp8Packaging> WeightFormat for Fp8Format<P> {
 
     fn repacks(&self, slot: &WeightSlot) -> bool {
         self.layout.repacks(slot)
+    }
+
+    fn companions(&self, slot: &WeightSlot) -> Vec<String> {
+        self.layout.companions(slot)
+    }
+
+    fn repack_with(
+        &self,
+        slot: &WeightSlot,
+        entry: &TensorEntry,
+        bytes: Vec<u8>,
+        companions: &[(&TensorEntry, Vec<u8>)],
+    ) -> Result<Vec<u8>, ModelError> {
+        self.layout.repack_with(slot, entry, bytes, companions)
     }
 
     fn repack(

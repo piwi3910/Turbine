@@ -1066,9 +1066,13 @@ fn quantized_matches_dequantized_bf16() {
         naive.act_quant = mode;
         naive.input_scales = input_scales(&fixture.quantized.dir);
         let reqs = executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default());
-        assert!(
+        // Block-scaled FP8 is decoded to BF16 at load: no quantized GEMM.
+        let decoded =
+            cfg.weight_format.get().column() == turbine_core::support::WeightFormatColumn::Fp8Block;
+        assert_eq!(
             reqs.iter().any(|r| matches!(r.spec, OpConfig::QGemm(_))),
-            "{name}: no qgemm in the requirements"
+            !decoded,
+            "{name}: qgemm in the requirements"
         );
         // Fused projections run one qgemm per stack; unfused, one per part over row slices of
         // the data and its scales.
@@ -4041,6 +4045,15 @@ fn tp2_quantized_matches_tp1_on_host() {
                    "sym": true}),
         ),
         (
+            // Decoded to BF16 at load: splits like any BF16 weight.
+            "ct_fp8 block (decoded)",
+            {
+                let mut q = ct_fp8("block", json!(null));
+                q["config_groups"]["group_0"]["weights"]["block_structure"] = json!([128, 128]);
+                q
+            },
+        ),
+        (
             "ct_mxfp4",
             json!({"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
                    "ignore": ["lm_head"],
@@ -4081,17 +4094,16 @@ fn tp2_quantized_matches_tp1_on_host() {
         }
     }
 
-    // Block scales: at tp 2 the gate/up rows of a rank (64) cut the 128-row blocks.
-    let block = ct_fp8("block", json!(null));
-    let mut block = block;
-    block["config_groups"]["group_0"]["weights"]["block_structure"] = json!([128, 128]);
-    let fixture = write_tiny_quantized(&tmp.path().join("block"), SEED, &block, 128, 128);
+    // INT4 groups of 128: at tp 2 the down projection's rank inputs (64) cut a group.
+    let awq = json!({"quant_method": "awq", "bits": 4, "group_size": 128, "zero_point": true,
+                     "version": "gemm"});
+    let fixture = write_tiny_quantized(&tmp.path().join("awq128"), SEED, &awq, 128, 128);
     let cfg = &fixture.quantized.config;
     let index = SafetensorsIndex::open(&fixture.quantized.dir).expect("index");
     let slots = tp::weight_slots(cfg, tp::ShardSpec { rank: 0, world: 2 }).expect("slots");
     let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
     let err = WeightLoader::load_format(cfg.weight_format.get(), &index, &slots, &host, 1 << 20)
-        .expect_err("a split through a scale block")
+        .expect_err("a split through an INT4 group")
         .to_string();
     assert!(err.contains("quant_shard_misaligned"), "{err}");
     assert!(err.contains("mlp."), "names the layer: {err}");
