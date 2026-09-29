@@ -102,14 +102,25 @@ impl WeightFormatColumn {
 pub enum KvFormatColumn {
     Bf16,
     Fp8E4m3,
+    /// TurboQuant 4-bit L0 pages (P6b S-5).
+    Tq4,
+    /// TurboQuant 2-bit L0 pages (P6b S-5).
+    Tq2,
 }
 
 impl KvFormatColumn {
-    pub const ALL: [KvFormatColumn; 2] = [KvFormatColumn::Bf16, KvFormatColumn::Fp8E4m3];
+    pub const ALL: [KvFormatColumn; 4] = [
+        KvFormatColumn::Bf16,
+        KvFormatColumn::Fp8E4m3,
+        KvFormatColumn::Tq4,
+        KvFormatColumn::Tq2,
+    ];
     pub fn as_str(self) -> &'static str {
         match self {
             KvFormatColumn::Bf16 => "bf16",
             KvFormatColumn::Fp8E4m3 => "fp8_e4m3",
+            KvFormatColumn::Tq4 => "tq4",
+            KvFormatColumn::Tq2 => "tq2",
         }
     }
 }
@@ -239,6 +250,8 @@ const NO_SPEC: Option<SpeculativeColumn> = Some(SpeculativeColumn::None);
 const QUANT_REASON: &str =
     "this quantized weight format is not validated yet (track phase-6a-quantization)";
 const RESERVED_NVIDIA_REASON: &str = "this weight format is reserved for the deferred phase-2b-nvidia (NVFP4 arrives with NVIDIA support)";
+const TQ_KV_REASON: &str =
+    "TurboQuant KV pages are not validated yet (track phase-6b-kv-compression)";
 const FAMILY_REASON: &str =
     "this model family is not validated on this vendor yet (track phase-7-model-families)";
 /// Why every `nvidia` key is refused while Phase 2b is deferred (decision 2026-09-28).
@@ -441,6 +454,25 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         Some(KvFormatColumn::Fp8E4m3),
         NO_SPEC,
         unsupported("fp8_e4m3 KV cache is not validated yet (track phase-6a-quantization)"),
+    ),
+    // TurboQuant L0 pages (P6b S-5): refused until the mixed-format attention passes its gates.
+    row(
+        None,
+        None,
+        None,
+        None,
+        Some(KvFormatColumn::Tq4),
+        NO_SPEC,
+        unsupported(TQ_KV_REASON),
+    ),
+    row(
+        None,
+        None,
+        None,
+        None,
+        Some(KvFormatColumn::Tq2),
+        NO_SPEC,
+        unsupported(TQ_KV_REASON),
     ),
     row(
         None,
@@ -766,6 +798,49 @@ pub fn parallel_refusal(architecture: &str, tp: u32, ep: u32) -> Option<&'static
                 _ => false,
             }
     })
+}
+
+/// The status of a lower-tier KV format (`kv.cpu.format`, `kv.nvme.format`, the ladder's
+/// `kv.ladder.max_format`; P6b S-2). The support-matrix row keeps naming the L0 format, so the
+/// lower-tier formats are resolved against this table instead; a format it does not list
+/// (`l0`, `fp8_e4m3`) is `supported` here, its availability decided by the kernel library.
+#[derive(Clone, Debug)]
+pub struct TierFormatRefusal {
+    pub format: &'static str,
+    pub status: SupportStatus,
+}
+
+const TQ_TIER_REASON: &str =
+    "TurboQuant lower-tier KV is not validated yet (track phase-6b-kv-compression)";
+
+/// Lower-tier formats that are not `supported`: TurboQuant is refused until its codec lands
+/// (P6b Tasks 7–9), then `experimental` until the S-8 gate passes.
+pub static TIER_FORMAT_REFUSALS: &[TierFormatRefusal] = &[
+    TierFormatRefusal {
+        format: "tq4",
+        status: unsupported(TQ_TIER_REASON),
+    },
+    TierFormatRefusal {
+        format: "tq2",
+        status: unsupported(TQ_TIER_REASON),
+    },
+];
+
+/// Resolves lower-tier format `format`, configured under `key`, against
+/// [`TIER_FORMAT_REFUSALS`]: `unsupported` is a configuration error naming `key` (exit 2),
+/// otherwise the status (`experimental` starts with a WARN).
+pub fn check_tier_format(key: &str, format: &str) -> Result<SupportStatus, ConfigError> {
+    let status = TIER_FORMAT_REFUSALS
+        .iter()
+        .find(|r| r.format == format)
+        .map_or(SupportStatus::Supported, |r| r.status.clone());
+    if let SupportStatus::Unsupported { reason } = &status {
+        return Err(ConfigError::Invalid {
+            key: key.to_string(),
+            reason: format!("tier format {format} is unsupported: {reason}"),
+        });
+    }
+    Ok(status)
 }
 
 /// Table invariants: vendors from [`VENDORS`], non-empty string columns, and no two
@@ -1095,6 +1170,38 @@ mod tests {
             status.reason().unwrap().contains("phase-6a-quantization"),
             "{status:?}"
         );
+        // TurboQuant L0 pages (P6b S-5): refused naming the track on every vendor, blaming
+        // kv.dtype; the lower-tier formats resolve through TIER_FORMAT_REFUSALS.
+        for kv in [K::Tq4, K::Tq2] {
+            for (vendor, arch, architecture) in [
+                ("amd", "gfx1201", "LlamaForCausalLM"),
+                ("amd", "gfx1201", "OlmoeForCausalLM"),
+                ("cpu", "cpu", "LlamaForCausalLM"),
+            ] {
+                let k = key(vendor, arch, architecture, W::Bf16, kv, S::None);
+                let status = resolve(&k);
+                assert_eq!(status.as_str(), "unsupported", "{k}");
+                assert!(
+                    status.reason().unwrap().contains("phase-6b-kv-compression"),
+                    "{k}: {status:?}"
+                );
+                assert_eq!(check(k).unwrap_err().key(), Some("kv.dtype"));
+            }
+        }
+        for format in ["tq4", "tq2"] {
+            let err = check_tier_format("kv.nvme.format", format).unwrap_err();
+            assert_eq!(err.key(), Some("kv.nvme.format"));
+            let msg = err.to_string();
+            assert!(msg.contains("phase-6b-kv-compression"), "{msg}");
+            assert!(msg.contains(&format!("tier format {format}")), "{msg}");
+        }
+        for format in ["l0", "fp8_e4m3"] {
+            assert_eq!(
+                check_tier_format("kv.cpu.format", format).unwrap(),
+                SupportStatus::Supported,
+                "{format}"
+            );
+        }
         let k = key(
             "amd",
             "gfx1201",
