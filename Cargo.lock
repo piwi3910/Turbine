@@ -2597,6 +2597,7 @@ dependencies = [
  "socket2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "turbine-api",
  "turbine-core",
  "turbine-device",

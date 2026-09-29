@@ -802,6 +802,14 @@ fn completions_stream_and_non_stream() {
     assert_eq!(status["model"]["architecture"], "LlamaForCausalLM");
     assert!(status["model"]["weight_bytes"].as_u64().unwrap() > 0);
     assert!(status["model"]["load_seconds"].as_f64().is_some());
+    // P6a followups: the resolved RoPE configuration (also logged at load,
+    // event="rope_config"); the tiny Llama fixture carries llama3 scaling like the real
+    // checkpoint (`llama_config_json`), so it is not "default".
+    let rope = &status["model"]["rope"];
+    assert_eq!(rope["theta"], 10_000.0, "{rope}");
+    assert_eq!(rope["rope_type"], "llama3", "{rope}");
+    assert_eq!(rope["factor"], 8.0, "{rope}");
+    assert!(rope["attention_factor"].is_null(), "{rope}");
     // P5 S-4: the cpu backend's plan — one replica on execution.device, no communicator.
     let parallel = &status["parallel"];
     assert_eq!(parallel["tp"], 1, "{parallel}");

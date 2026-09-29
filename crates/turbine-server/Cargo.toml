@@ -56,3 +56,5 @@ unsafe_code = "forbid"
 jsonschema.workspace = true
 # Held-stream clients with a small receive buffer, so an unread stream back-pressures at once
 socket2.workspace = true
+# Captures tracing output in startup::tests::join_rank_workers_bounded (the tp_worker_join_timeout WARN)
+tracing-subscriber.workspace = true

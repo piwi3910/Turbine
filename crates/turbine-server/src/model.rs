@@ -152,6 +152,22 @@ fn check_fp8_attention(
 }
 
 /// A YaRN model whose attention factor is not 1 needs a rope kernel that multiplies cos and sin
+/// Logs the resolved RoPE configuration at model load (P6a followups), once `config.json` and
+/// any `model.rope_scaling` override are resolved: `rope_theta`, the scaling's name (`default`,
+/// `llama3`, `yarn`), its `factor` when scaled, and YaRN's attention factor when present. The
+/// same values go into `/turbine/v1/status`'s `model.rope` (`ModelBackend::new`, `Diagnostics::status`).
+fn log_rope_config(arch: &ModelArchConfig) {
+    let rope = arch.rope_summary();
+    tracing::info!(
+        event = "rope_config",
+        rope_theta = rope.theta,
+        rope_type = rope.rope_type,
+        factor = rope.factor,
+        attention_factor = rope.attention_factor,
+        "resolved RoPE configuration"
+    );
+}
+
 /// by it (kernel ABI v2.10, P6a S-15): exit 1 `rope_attn_factor_unavailable`, logged as
 /// `event="kernel_capability"`, before any weight is read when the rope kernel the selection
 /// order picks (the first provider that supports the rope requirement) does not apply the factor
@@ -545,6 +561,7 @@ fn prepare_with(
     }
     let mut arch = load_model_config_with(dir, config.model.rope_scaling.as_ref())
         .map_err(|e| model_error("model config", e))?;
+    log_rope_config(&arch);
     let generation = if dir.join("generation_config.json").is_file() {
         load_generation_config(dir).map_err(|e| model_error("generation config", e))?
     } else {
