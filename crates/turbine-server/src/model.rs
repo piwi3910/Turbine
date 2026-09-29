@@ -105,8 +105,18 @@ fn kv_cache(
     index: &SafetensorsIndex,
     num_layers: u32,
 ) -> Result<KvCache, StartupError> {
-    if config.kv.dtype != KvDtypeChoice::Fp8E4m3 {
-        return Ok(KvCache::bf16());
+    match config.kv.dtype {
+        KvDtypeChoice::Bf16 => return Ok(KvCache::bf16()),
+        KvDtypeChoice::Fp8E4m3 => {}
+        // Refused before binding (`support_startup::kv_format_availability`); never served as
+        // BF16 pages.
+        other => {
+            return Err(StartupError::new(format!(
+                "kv_tq_unavailable: kv.dtype {} needs the ABI v2.10 mixed-format paged \
+                 attention, which no kernel provider implements yet",
+                other.as_str()
+            )));
+        }
     }
     let cache = KvCache::fp8_from_checkpoint(index, num_layers)
         .map_err(|e| model_error("kv.dtype fp8_e4m3 scales", e))?;

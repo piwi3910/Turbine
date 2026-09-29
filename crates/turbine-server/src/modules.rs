@@ -46,6 +46,10 @@ pub static RANK_TRANSPORTS: LazyLock<Vec<&'static str>> =
 pub static ROUTER_POLICIES: LazyLock<Vec<&'static str>> =
     LazyLock::new(|| turbine_distributed::router::registry().names());
 
+/// KV codecs (`kv_format`, Phase 6b): the names of `turbine_kv::codec::registry()`.
+pub static KV_FORMATS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| turbine_kv::codec::registry().names());
+
 /// The registered module names, per configuration key, for `Config::validate_modules`.
 pub fn known_module_names() -> ModuleNames<'static> {
     ModuleNames {
@@ -57,6 +61,7 @@ pub fn known_module_names() -> ModuleNames<'static> {
         collective_backends: &COLLECTIVE_BACKENDS,
         rank_transports: &RANK_TRANSPORTS,
         router_policies: &ROUTER_POLICIES,
+        kv_formats: &KV_FORMATS,
     }
 }
 

@@ -38,6 +38,9 @@ kv:
     enabled: true
     # At most host MemTotal minus reliability.memory.host_reserve_bytes.
     max_bytes: 64GiB
+    # Codec of L1 blocks: l0 (the L0 bytes, lossless), fp8_e4m3, tq4 or tq2 (lossy); not more
+    # precise than kv.dtype. Anything but l0 needs a kernel library with the v2.10 transcode.
+    format: l0
   # L2 NVMe slab files; wiped at startup, nothing persists across restarts.
   nvme:
     enabled: false
@@ -49,6 +52,8 @@ kv:
     slab_bytes: 1GiB
     max_queue_depth: 64
     io_threads: 4
+    # Codec of L2 blocks, as kv.cpu.format; not more precise than kv.cpu.format (L1 enabled).
+    format: l0
   # cost_aware or lru (the benchmark baseline).
   policy: cost_aware
   # Blocks scoring below this are dropped instead of demoted.
@@ -72,6 +77,29 @@ kv:
     # Reuse boost of a hot session's blocks, 0..1.
     session_active: 0.5
     hit_half_life: 60s
+  # The last N full blocks of a sequence leave L0 at the L0 format whatever the tier's
+  # format (0..64).
+  lossless_tail_blocks: 1
+  # allow or deny: may requests without x-turbine-kv-lossy reuse lossy cached blocks.
+  lossy_reuse: allow
+  # A lossy block's retrieval cost is multiplied by 1 + penalty (0..100) when planning reuse.
+  lossy_penalty:
+    fp8_e4m3: 0.1
+    tq4: 0.5
+    tq2: 1.0
+  # Pressure-driven compression ladder (l0 -> fp8_e4m3 -> tq4 -> tq2 -> evict), off by default;
+  # needs L1 or L2 enabled.
+  ladder:
+    enabled: false
+    # true: L0 joins the ladder (needs the v2.10 mixed-format paged attention).
+    l0: true
+    # The lossiest rung, a lossy codec.
+    max_format: tq2
+    # An upper tier compresses above this fill (0.5 < high_water <= 1.0).
+    high_water: 0.95
+    # At YELLOW the lowest tier compresses only until its fill is back to this
+    # (0.5 <= low_water < high_water).
+    low_water: 0.85
 reliability:
   enabled: true
   emergency_vram_reserve: 2GiB

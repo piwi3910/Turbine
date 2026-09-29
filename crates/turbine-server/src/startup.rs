@@ -1,7 +1,9 @@
 //! Startup order (P1 §Interfaces, contract §16.3): config and module names (exit 2) →
 //! support-matrix row with the device arch unknown (exit 2 when unsupported; also under
 //! `--check-config`) → tracing → device discovery → support-matrix row with the device arch
-//! (exit 2 when unsupported; `event="support_matrix"`, WARN when experimental) → the node
+//! (exit 2 when unsupported; `event="support_matrix"`, WARN when experimental) → the KV
+//! formats no kernel provider runs yet (P6b; exit 1 `kv_tq_unavailable` or
+//! `kv_transcode_unavailable`) → the node
 //! topology graph (P5 S-1, never fails; `GET /turbine/v1/topology`) → the parallel plan (P5 S-4,
 //! `crate::parallel`; exit 2, or exit 1 when the model config it needs is unreadable) → the P4 `kv`
 //! host rules (`kv.cpu.max_bytes` against MemTotal minus `reliability.memory.host_reserve_bytes`
@@ -150,6 +152,13 @@ pub fn run(cli: Cli) -> ExitCode {
         Err(e) => return refuse_support(&e),
     };
     support_startup::log(&support);
+    support_startup::log_tier_formats(&config);
+    // P6b: KV formats that need the ABI v2.10 group no provider has yet: exit 1 before binding.
+    if let Err(e) = support_startup::kv_format_availability(&config) {
+        tracing::error!(event = e.code, error = %e.message, "KV format unavailable");
+        eprintln!("turbine-server: {}: {}", e.code, e.message);
+        return ExitCode::Startup;
+    }
     // P5 S-1: the node-local topology graph, right after discovery (never fails).
     let mut topology =
         capture_topology(&DiscoveryOptions::from_config(&config.devices), &inventory);

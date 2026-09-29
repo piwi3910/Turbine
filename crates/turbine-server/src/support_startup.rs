@@ -6,11 +6,14 @@
 //! speculation). It runs twice: [`before_discovery`] right after the configuration is read
 //! (also under `--check-config`; `arch` unknown except on the host backend), and
 //! [`after_discovery`] once the device's architecture is known. An `unsupported` resolution is a
-//! configuration error (exit 2, before any port is bound).
+//! configuration error (exit 2, before any port is bound). The lower-tier KV formats (P6b
+//! S-2) are resolved beside the row, against `TIER_FORMAT_REFUSALS` ([`tier_formats`]), and
+//! [`kv_format_availability`] refuses, before binding, the KV formats no kernel provider can
+//! run yet (exit 1).
 
 use std::path::Path;
 
-use turbine_core::config::{Config, ConfigError, KvDtypeChoice};
+use turbine_core::config::{Config, ConfigError, KvDtypeChoice, KvTierFormat};
 use turbine_core::support::{
     self, HOST_VENDOR, KvFormatColumn, SupportDecision, SupportKey, SupportStatus,
     WeightFormatColumn,
@@ -94,10 +97,116 @@ pub fn key_before_discovery(
     SupportKey::before_discovery(vendor(cfg), architecture.as_deref(), weight, kv)
 }
 
-/// The decision before device discovery (startup and `--check-config`).
+/// The decision before device discovery (startup and `--check-config`); the lower-tier KV
+/// formats are checked first ([`tier_formats`]).
 pub fn before_discovery(cfg: &Config) -> Result<SupportDecision, ConfigError> {
+    tier_formats(cfg)?;
     let (weight, kv) = format_columns(cfg);
     support::check(key_before_discovery(cfg, weight, kv))
+}
+
+/// The lower-tier KV formats in use, `(key, format)`: `kv.cpu.format` and `kv.nvme.format` of
+/// the enabled tiers and, with the ladder on, `kv.ladder.max_format` (the lossiest format a
+/// tier can reach).
+fn tier_format_keys(cfg: &Config) -> Vec<(&'static str, KvTierFormat)> {
+    let kv = &cfg.kv;
+    let mut keys = Vec::new();
+    if kv.cpu.enabled {
+        keys.push(("kv.cpu.format", kv.cpu.format));
+    }
+    if kv.nvme.enabled {
+        keys.push(("kv.nvme.format", kv.nvme.format));
+    }
+    if kv.ladder.enabled {
+        keys.push(("kv.ladder.max_format", kv.ladder.max_format));
+    }
+    keys
+}
+
+/// Resolves every lower-tier KV format in use against `TIER_FORMAT_REFUSALS` (P6b S-2): an
+/// unsupported one is a configuration error naming its key (exit 2, also under
+/// `--check-config`); the rest are returned with their status.
+pub fn tier_formats(
+    cfg: &Config,
+) -> Result<Vec<(&'static str, &'static str, SupportStatus)>, ConfigError> {
+    tier_format_keys(cfg)
+        .into_iter()
+        .map(|(key, format)| {
+            let status = support::check_tier_format(key, format.as_str())?;
+            Ok((key, format.as_str(), status))
+        })
+        .collect()
+}
+
+/// Logs every experimental lower-tier KV format as `event="support_matrix"` at WARN.
+pub fn log_tier_formats(cfg: &Config) {
+    for (key, format, status) in tier_formats(cfg).unwrap_or_default() {
+        if status == SupportStatus::Experimental {
+            tracing::warn!(
+                event = "support_matrix",
+                status = status.as_str(),
+                key,
+                format,
+                "support matrix: tier format {format} ({key}) is experimental"
+            );
+        }
+    }
+}
+
+/// A KV format no kernel provider can run yet: the reason code and the message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvFormatUnavailable {
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// Refuses, before binding (exit 1), the KV formats that need the optional ABI v2.10 group
+/// (P6b S-1, S-5, S-7), which no kernel provider implements yet: TurboQuant L0 pages
+/// (`kv.dtype: tq4|tq2`) and the ladder's L0 step need the mixed-format paged attention
+/// (`kv_tq_unavailable`); a lower tier not stored at the L0 format and the ladder's L1/L2
+/// rungs need the KV transcode (`kv_transcode_unavailable`). Plan Tasks 5 and 12 replace these
+/// refusals with the loaded library's v2.10 check.
+pub fn kv_format_availability(cfg: &Config) -> Result<(), KvFormatUnavailable> {
+    let kv = &cfg.kv;
+    let tq = |message: String| KvFormatUnavailable {
+        code: "kv_tq_unavailable",
+        message,
+    };
+    if kv.dtype.is_turboquant() {
+        return Err(tq(format!(
+            "kv.dtype {} needs the ABI v2.10 mixed-format paged attention, which no kernel \
+             provider implements yet",
+            kv.dtype.as_str()
+        )));
+    }
+    if kv.ladder.enabled && kv.ladder.l0 {
+        return Err(tq(
+            "kv.ladder.l0 (with kv.ladder.enabled) needs the ABI v2.10 mixed-format paged \
+             attention, which no kernel provider implements yet; set kv.ladder.l0: false"
+                .to_string(),
+        ));
+    }
+    let transcode = |what: String| KvFormatUnavailable {
+        code: "kv_transcode_unavailable",
+        message: format!(
+            "{what} needs the ABI v2.10 KV transcode, which no kernel provider implements yet"
+        ),
+    };
+    for (key, format) in [
+        (kv.cpu.enabled, ("kv.cpu.format", kv.cpu.format)),
+        (kv.nvme.enabled, ("kv.nvme.format", kv.nvme.format)),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, pair)| enabled.then_some(pair))
+    {
+        if !format.is_l0(kv.dtype) {
+            return Err(transcode(format!("{key} {}", format.as_str())));
+        }
+    }
+    if kv.ladder.enabled {
+        return Err(transcode("kv.ladder.enabled".to_string()));
+    }
+    Ok(())
 }
 
 /// The decision once the device is known; `first` is kept when the device arch is unknown.
@@ -287,6 +396,81 @@ mod tests {
             "cpu/cpu/LlamaForCausalLM/bf16/fp8_e4m3/none"
         );
         assert_eq!(d.status, SupportStatus::Experimental);
+    }
+
+    /// P6b S-2: the lower-tier formats in use are resolved against `TIER_FORMAT_REFUSALS`
+    /// (TurboQuant refused naming its key, exit 2, also under `--check-config`); the KV formats
+    /// that need the ABI v2.10 group are refused before binding with their reason code; the
+    /// `kv_format` registry holds exactly the configuration's codec names, in the same order.
+    /// Breaks if a tier format goes unchecked or a lossy format is silently served as `l0`.
+    #[test]
+    fn tier_formats_and_availability() {
+        use turbine_core::config::{KvDtypeChoice, KvTierFormat};
+        let names: Vec<&str> = KvTierFormat::ALL.iter().map(|f| f.as_str()).collect();
+        assert_eq!(turbine_kv::codec::registry().names(), names);
+
+        let llama = model_dir(
+            "llama-tier-formats",
+            serde_json::json!({"architectures": ["LlamaForCausalLM"]}),
+        );
+        let cfg = config("hip", llama.path());
+        assert_eq!(
+            tier_formats(&cfg).unwrap(),
+            vec![("kv.cpu.format", "l0", SupportStatus::Supported)]
+        );
+        assert_eq!(kv_format_availability(&cfg), Ok(()));
+
+        let mut fp8 = config("hip", llama.path());
+        fp8.kv.cpu.format = KvTierFormat::Fp8E4m3;
+        let tiers = tier_formats(&fp8).unwrap();
+        assert_eq!(
+            tiers,
+            vec![("kv.cpu.format", "fp8_e4m3", SupportStatus::Supported)]
+        );
+        assert!(before_discovery(&fp8).is_ok());
+        let err = kv_format_availability(&fp8).unwrap_err();
+        assert_eq!(err.code, "kv_transcode_unavailable", "{err:?}");
+        assert!(err.message.contains("kv.cpu.format fp8_e4m3"), "{err:?}");
+        // fp8_e4m3 below an FP8 L0 is the L0 format: nothing to transcode.
+        fp8.kv.dtype = KvDtypeChoice::Fp8E4m3;
+        assert_eq!(kv_format_availability(&fp8), Ok(()));
+
+        let mut tq = config("hip", llama.path());
+        tq.kv.nvme.enabled = true;
+        tq.kv.nvme.format = KvTierFormat::Tq4;
+        let err = before_discovery(&tq).unwrap_err();
+        assert_eq!(err.key(), Some("kv.nvme.format"), "{err}");
+        assert!(err.to_string().contains("phase-6b-kv-compression"), "{err}");
+        // A disabled tier's format is not in use.
+        tq.kv.nvme.enabled = false;
+        assert!(before_discovery(&tq).is_ok());
+
+        let mut ladder = config("hip", llama.path());
+        ladder.kv.ladder.enabled = true;
+        let err = before_discovery(&ladder).unwrap_err();
+        assert_eq!(err.key(), Some("kv.ladder.max_format"), "{err}");
+        ladder.kv.ladder.max_format = KvTierFormat::Fp8E4m3;
+        assert!(before_discovery(&ladder).is_ok());
+        assert_eq!(
+            kv_format_availability(&ladder).unwrap_err().code,
+            "kv_tq_unavailable"
+        );
+        ladder.kv.ladder.l0 = false;
+        assert_eq!(
+            kv_format_availability(&ladder).unwrap_err().code,
+            "kv_transcode_unavailable"
+        );
+
+        for dtype in [KvDtypeChoice::Tq4, KvDtypeChoice::Tq2] {
+            let mut l0 = config("cpu", llama.path());
+            l0.kv.dtype = dtype;
+            let err = kv_format_availability(&l0).unwrap_err();
+            assert_eq!(err.code, "kv_tq_unavailable", "{err:?}");
+            // The support matrix refuses it first, naming kv.dtype (exit 2).
+            assert_eq!(format_columns(&l0).1.as_str(), dtype.as_str());
+            let err = before_discovery(&l0).unwrap_err();
+            assert_eq!(err.key(), Some("kv.dtype"), "{err}");
+        }
     }
 
     #[test]
