@@ -639,9 +639,26 @@ fn read_body(reader: &mut BufReader<TcpStream>, head: &str) -> String {
 }
 
 fn request(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> Response {
+    request_within(addr, method, path, body, Duration::from_secs(30))
+}
+
+/// How long a client waits for a non-streaming response that queues behind long generations
+/// (the queued requests of `queue_full_429` and `phase2_metrics_and_reasons`): its head comes
+/// only once it has run to the end, and debug builds on a loaded host (the gate's tests share
+/// four cores at nice 19 with fixture jobs) take minutes for what a quiet host does in seconds.
+/// Only a bound against a hung server; no test measures the wait.
+const QUEUED_RESPONSE_LIMIT: Duration = Duration::from_secs(600);
+
+/// [`request`] with a read timeout of `limit` for each read.
+fn request_within(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    limit: Duration,
+) -> Response {
     let mut conn = TcpStream::connect(addr).expect("connect");
-    conn.set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
+    conn.set_read_timeout(Some(limit)).unwrap();
     write_request(&mut conn, method, path, body);
     let mut reader = BufReader::new(conn);
     let (status, head) = read_head(&mut reader);
@@ -1076,9 +1093,12 @@ fn single_slot_and_cancel() {
 #[test]
 fn queue_full_429() {
     // `extra` lines indented by two spaces continue the base config's `reliability` section.
+    // The queued two wait for the whole held stream (1,500 tokens with 20 logprobs each): on a
+    // loaded host far longer than the default `reliability.admission.queue_timeout`.
     let server = TinyServer::start_long_with(
         HOLD_PAUSED,
-        "  admission:\n    max_queue: 2\nscheduler:\n  max_running_requests: 1\n",
+        "  admission:\n    max_queue: 2\n    queue_timeout: 10m\nscheduler:\n  \
+         max_running_requests: 1\n",
     );
     let held = server.hold_stream();
     wait_for(Duration::from_secs(10), "first request running", || {
@@ -1092,7 +1112,7 @@ fn queue_full_429() {
             let addr = server.addr;
             let model = server.model.clone();
             std::thread::spawn(move || {
-                request(
+                request_within(
                     addr,
                     "POST",
                     "/v1/completions",
@@ -1101,6 +1121,7 @@ fn queue_full_429() {
                                 "ignore_eos": true})
                         .to_string(),
                     ),
+                    QUEUED_RESPONSE_LIMIT,
                 )
             })
         })
@@ -2455,8 +2476,16 @@ fn phase2_metrics_and_reasons() {
             let addr = server.addr;
             let body = json!({"model": model, "prompt": "Hello", "max_tokens": 450,
                               "ignore_eos": true, "temperature": 1.0, "seed": i});
+            // Non-streaming: the head comes when the request ends, and the sixth first waits for
+            // one of the five to finish its 450 tokens.
             std::thread::spawn(move || {
-                request(addr, "POST", "/v1/completions", Some(&body.to_string()))
+                request_within(
+                    addr,
+                    "POST",
+                    "/v1/completions",
+                    Some(&body.to_string()),
+                    QUEUED_RESPONSE_LIMIT,
+                )
             })
         })
         .collect();
