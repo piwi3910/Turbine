@@ -133,6 +133,10 @@ pub struct LadderLimits {
     pub max_format: &'static str,
     /// Tier fill above which the ladder compresses (`kv.ladder.high_water`, default 0.95).
     pub high_water: f64,
+    /// GREEN headroom (`kv.ladder.low_water`, default 0.85): at YELLOW the lowest tier
+    /// compresses only while its fill plus the YELLOW reclaim's demand is above it (user
+    /// decision 2026-09-29, "Compress only until GREEN").
+    pub low_water: f64,
 }
 
 /// The facts of one tier (and of the copy's place in it) the ladder decides on (P6b S-6). The
@@ -143,6 +147,9 @@ pub struct LadderContext {
     pub tier: TierId,
     /// That tier's used / capacity (0 ..= 1).
     pub fill: f64,
+    /// The bytes the pressure controller's YELLOW reclaim wants to demote into this tier this
+    /// tick, as a fraction of its capacity (0 when none).
+    pub demand: f64,
     /// That tier's current rung: the codec new demotions into it take.
     pub rung: &'static str,
     /// The pressure controller's state.
@@ -475,6 +482,7 @@ pub(crate) mod tests {
         LadderContext {
             tier: TierId::L2,
             fill: 0.5,
+            demand: 0.0,
             rung: "l0",
             pressure: PressureState::Yellow,
             format: "l0",
@@ -484,19 +492,22 @@ pub(crate) mod tests {
             ladder: Some(LadderLimits {
                 max_format: "tq2",
                 high_water: 0.95,
+                low_water: 0.85,
             }),
         }
     }
 
     /// The ladder rule of `cost_aware` with pinned fills and pressure states (P6b S-6, user
-    /// decision 2026-09-29 "Start at YELLOW earlier"): from YELLOW on the lowest enabled tier
-    /// compresses even with free room; at any non-GREEN state an upper tier compresses only
+    /// decisions 2026-09-29 "Start at YELLOW earlier" and "Compress only until GREEN"): from
+    /// ORANGE on the lowest enabled tier compresses even with free room, at YELLOW only while
+    /// `fill + demand > low_water`; at any non-GREEN state an upper tier compresses only
     /// above high water; one rung at a time (`l0` → `fp8_e4m3` → `tq4` → `tq2` → evict, bounded
     /// by `max_format`), an upper tier only once every tier below has reached the target rung;
     /// at the floor the lowest tier evicts only a leaving copy or above high water; it never
     /// upgrades a copy, and with the ladder off (or under `lru`) decides as Phase 4 did.
     /// Breaks if a rung is skipped, a copy upgraded or compressed at GREEN, if the lowest tier
-    /// waits for high water at YELLOW (the pre-amendment rule), or if the floor evicts a copy
+    /// waits for high water at YELLOW (the pre-amendment rule), if it keeps compressing at
+    /// YELLOW once its GREEN headroom is back (drifting to `tq2`), or if the floor evicts a copy
     /// from a tier with free room.
     #[test]
     fn ladder_actions() {
@@ -526,6 +537,7 @@ pub(crate) mod tests {
             c.ladder = Some(LadderLimits {
                 max_format: "tq4",
                 high_water: 0.95,
+                low_water: 0.85,
             });
         };
         assert_eq!(act(with(capped)), EvictAction::Drop);
@@ -547,9 +559,11 @@ pub(crate) mod tests {
             assert!(matches!(act(c), EvictAction::Compress { .. }), "{state:?}");
         }
 
-        // A sweep of the lowest tier (nothing must leave): from YELLOW on it compresses one
-        // rung even with free room (before the tiers are full); at the floor it evicts only
-        // above high water, never a copy of a tier with free room; GREEN never compresses.
+        // A sweep of the lowest tier (nothing must leave). From ORANGE on it compresses one
+        // rung even with free room (before the tiers are full); at YELLOW only while its GREEN
+        // headroom is short, `fill + demand > low_water` (user decision 2026-09-29, "Compress
+        // only until GREEN"); at the floor it evicts only above high water, never a copy of a
+        // tier with free room; GREEN never compresses.
         let sweep = |fill: f64, format: &'static str| {
             let mut c = ladder_ctx();
             c.must_leave = false;
@@ -558,7 +572,6 @@ pub(crate) mod tests {
             c
         };
         for state in [
-            PressureState::Yellow,
             PressureState::Orange,
             PressureState::Red,
             PressureState::Survival,
@@ -573,7 +586,52 @@ pub(crate) mod tests {
                 );
             }
         }
-        assert_eq!(act(sweep(0.10, "tq4")), EvictAction::Compress { to: "tq2" });
+        // YELLOW with GREEN headroom keeps, whatever the copy's rung.
+        for (fill, demand) in [
+            (0.0, 0.0),
+            (0.10, 0.0),
+            (0.50, 0.30),
+            (0.85, 0.0),
+            (0.80, 0.04),
+        ] {
+            for format in ["l0", "fp8_e4m3", "tq4"] {
+                let mut c = sweep(fill, format);
+                c.demand = demand;
+                assert_eq!(
+                    act(c),
+                    EvictAction::Keep,
+                    "YELLOW at fill {fill} + demand {demand} ≤ low water keeps a {format} copy"
+                );
+            }
+        }
+        // YELLOW whose fill or demand pushes it over low water compresses one rung.
+        for (fill, demand) in [
+            (0.80, 0.10),
+            (0.50, 0.40),
+            (0.86, 0.0),
+            (0.90, 0.0),
+            (0.95, 0.0),
+        ] {
+            let mut c = sweep(fill, "l0");
+            c.demand = demand;
+            assert_eq!(
+                act(c),
+                EvictAction::Compress { to: "fp8_e4m3" },
+                "YELLOW at fill {fill} + demand {demand} > low water"
+            );
+        }
+        let mut c = sweep(0.80, "tq4");
+        c.demand = 0.10;
+        assert_eq!(act(c), EvictAction::Compress { to: "tq2" });
+        // GREEN after YELLOW keeps, even with the demand still set.
+        let mut c = sweep(0.80, "fp8_e4m3");
+        c.demand = 0.10;
+        c.pressure = PressureState::Green;
+        assert_eq!(act(c), EvictAction::Keep, "GREEN after YELLOW keeps");
+        // ORANGE with room still compresses.
+        let mut c = sweep(0.10, "tq4");
+        c.pressure = PressureState::Orange;
+        assert_eq!(act(c), EvictAction::Compress { to: "tq2" });
         assert_eq!(
             act(sweep(0.10, "tq2")),
             EvictAction::Keep,
@@ -590,6 +648,57 @@ pub(crate) mod tests {
             green.pressure = PressureState::Green;
             assert_eq!(act(green), EvictAction::Keep, "GREEN at fill {fill}");
         }
+
+        // A repeated sweep at steady pressure: 16 copies of the lowest tier, starting in `l0`
+        // at fill 0.92 (above low water, below high water) with a YELLOW reclaim demand of 0.02
+        // each sweep; the returned actions are applied and `fill` re-derived from the copies'
+        // bytes per codec after every decision. At YELLOW the tier stops once its GREEN
+        // headroom is back and never reaches `tq2`; at ORANGE the same sweep does.
+        let sizes = |f: &str| {
+            let l0 = crate::codec::tests::layout(turbine_core::types::DType::BF16);
+            crate::codec::registry()
+                .get(f)
+                .expect("registered codec")
+                .bytes_per_block(&l0)
+        };
+        let steady = |pressure: PressureState| -> Vec<&'static str> {
+            let mut copies: Vec<&'static str> = vec!["l0"; 16];
+            let capacity = (16 * sizes("l0")) as f64 / 0.92;
+            for _ in 0..50 {
+                for i in 0..copies.len() {
+                    let used: u64 = copies.iter().map(|f| sizes(f)).sum();
+                    let mut c = sweep(used as f64 / capacity, copies[i]);
+                    c.pressure = pressure;
+                    c.demand = 0.02;
+                    match act(c) {
+                        EvictAction::Compress { to } => copies[i] = to,
+                        EvictAction::Keep => {}
+                        other => panic!("{pressure:?}: unexpected {other:?} in a sweep"),
+                    }
+                }
+            }
+            copies
+        };
+        let yellow = steady(PressureState::Yellow);
+        assert!(
+            !yellow.contains(&"tq2"),
+            "a steady YELLOW with room never drifts to tq2: {yellow:?}"
+        );
+        assert!(
+            yellow.contains(&"fp8_e4m3"),
+            "YELLOW above low water compresses: {yellow:?}"
+        );
+        let used: u64 = yellow.iter().map(|f| sizes(f)).sum();
+        let fill = used as f64 / ((16 * sizes("l0")) as f64 / 0.92);
+        assert!(
+            fill + 0.02 <= 0.85,
+            "YELLOW restored GREEN headroom: {fill}"
+        );
+        let orange = steady(PressureState::Orange);
+        assert!(
+            orange.iter().all(|f| *f == "tq2"),
+            "ORANGE walks the tier to tq2: {orange:?}"
+        );
 
         // An upper tier (L1 above L2) compresses only once L2 has reached the target rung;
         // otherwise a victim is demoted as in Phase 4, at the lossier of the two formats.

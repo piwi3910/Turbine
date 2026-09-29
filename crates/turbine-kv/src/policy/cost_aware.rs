@@ -59,11 +59,14 @@ impl EvictionPolicy for CostAwarePolicy {
         reuse * recompute * f64::from(b.block.priority.0) * retrieval / memory
     }
 
-    /// The compression ladder (P6b S-6, user decision 2026-09-29 "Start at YELLOW earlier").
-    /// With the ladder on and the pressure controller not GREEN (YELLOW or above), a copy of a
-    /// triggered tier — the lowest enabled tier always, before any tier is full; an upper tier
-    /// once it is above `high_water` — moves one rung down from its own format (`l0` →
-    /// `fp8_e4m3` → `tq4` → `tq2`, bounded by `max_format`), provided every enabled tier below
+    /// The compression ladder (P6b S-6, user decisions 2026-09-29 "Start at YELLOW earlier" and
+    /// "Compress only until GREEN"). With the ladder on and the pressure controller not GREEN
+    /// (YELLOW or above), a copy of a triggered tier — the lowest enabled tier always, before
+    /// any tier is full (at YELLOW, when nothing must leave and the tier is at or below
+    /// `high_water`, only while `fill + demand > low_water`, so a steady YELLOW does not drift
+    /// the tier to `max_format`); an upper tier once it is above `high_water` — moves one rung
+    /// down from its own format (`l0` → `fp8_e4m3` → `tq4` → `tq2`, bounded by `max_format`),
+    /// provided every enabled tier below
     /// has already reached that rung (so the lowest tier compresses first and upper tiers follow
     /// rung by rung). At the floor the lowest tier evicts the copy (`ladder_floor`) only when it
     /// must leave or the tier is above `high_water`, never from a tier with free room; an upper
@@ -77,6 +80,15 @@ impl EvictionPolicy for CostAwarePolicy {
         let above_high_water = ctx.fill > ladder.high_water;
         let triggered = ctx.lowest() || above_high_water;
         if ctx.pressure == PressureState::Green || !triggered {
+            return ctx.phase4_action();
+        }
+        // YELLOW depth ("Compress only until GREEN"): a lowest tier with nothing leaving and at
+        // or below high water compresses only while its GREEN headroom is short.
+        if ctx.pressure == PressureState::Yellow
+            && !ctx.must_leave
+            && !above_high_water
+            && ctx.fill + ctx.demand <= ladder.low_water
+        {
             return ctx.phase4_action();
         }
         let max = codec::rung_index(ladder.max_format).unwrap_or(0);

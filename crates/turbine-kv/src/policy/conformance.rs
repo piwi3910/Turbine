@@ -28,7 +28,8 @@ use crate::tier::TierId;
 /// - `orders_every_candidate`: `order_victims` returns each candidate exactly once, lowest score
 ///   first.
 /// - `ladder_contract` (P6b S-6): `action` never upgrades a copy, never compresses at GREEN or
-///   with the ladder off, never past `kv.ladder.max_format`, demotes only to the next tier and
+///   with the ladder off, nor at YELLOW with GREEN headroom (`fill + demand ≤ low_water`, no
+///   leaving copy), never past `kv.ladder.max_format`, demotes only to the next tier and
 ///   drops only from the lowest one, and only a leaving copy or above high water.
 pub(crate) fn eviction_policies_suite(
     reg: &Registry<dyn EvictionPolicy>,
@@ -131,7 +132,9 @@ const RUNGS: [&str; 4] = ["l0", "fp8_e4m3", "tq4", "tq2"];
 
 /// `action` over seeded ladder contexts (every tier position, fill, pressure, format, rung,
 /// ladder setting): a compression only to a strictly lossier rung within `max_format`, never
-/// at GREEN or with the ladder off; a demotion only to the tier below, never more precise than
+/// at GREEN or with the ladder off, nor at YELLOW for a copy that need not leave a tier with
+/// GREEN headroom (`fill + demand ≤ low_water`, user decision 2026-09-29 "Compress only until
+/// GREEN"); a demotion only to the tier below, never more precise than
 /// the copy or that tier's rung; a drop only from the lowest tier, and only of a copy that must
 /// leave or from a tier above high water (never evicting with free room). Deterministic.
 fn ladder_contract(p: &dyn EvictionPolicy, inputs: &[BlockScoreInputs]) -> Result<(), String> {
@@ -150,6 +153,7 @@ fn ladder_contract(p: &dyn EvictionPolicy, inputs: &[BlockScoreInputs]) -> Resul
         let ctx = LadderContext {
             tier: if lowest { TierId::L2 } else { TierId::L1 },
             fill: (next() % 1_001) as f64 / 1_000.0,
+            demand: (next() % 201) as f64 / 1_000.0,
             rung: RUNGS[pick(next())],
             pressure: PressureState::ALL[(next() % 5) as usize],
             format: RUNGS[pick(next())],
@@ -159,6 +163,7 @@ fn ladder_contract(p: &dyn EvictionPolicy, inputs: &[BlockScoreInputs]) -> Resul
             ladder: (next() % 4 != 0).then(|| LadderLimits {
                 max_format: RUNGS[1 + (next() % 3) as usize],
                 high_water: 0.95,
+                low_water: 0.85,
             }),
         };
         let a = p.action(b, &ctx);
@@ -170,7 +175,12 @@ fn ladder_contract(p: &dyn EvictionPolicy, inputs: &[BlockScoreInputs]) -> Resul
                 if ctx.pressure == PressureState::Green {
                     Some("compressed at GREEN")
                 } else if let Some(l) = ctx.ladder {
-                    if rank(to) <= rank(ctx.format) {
+                    if ctx.pressure == PressureState::Yellow
+                        && !ctx.must_leave
+                        && ctx.fill + ctx.demand <= l.low_water
+                    {
+                        Some("compressed at YELLOW with GREEN headroom (fill + demand ≤ low_water)")
+                    } else if rank(to) <= rank(ctx.format) {
                         Some("compressed to a rung no lossier than the copy (upgrade)")
                     } else if rank(to) > rank(l.max_format) {
                         Some("compressed past max_format")
