@@ -106,3 +106,30 @@ the bench's `--output json` / the test's stderr and diff; then revert hunks one 
 
 - Gate is not ok (above), so the plan's commit is not final; no other brief item open besides the
   lead-owned contract §26 names listed above. No lab/GPU work was in scope.
+
+## Regression fix (r11 builder, 2026-09-30)
+
+Root cause: `commit_progress`'s P6b S-3 publish rule (hierarchy.rs, the `publish` condition,
+~line 980) tested "every copy of the existing exact entry is lossy" with `locations.iter().all(..)`,
+which is true for an entry with **no** copy — a parent kept only because it has children
+(`forget` keeps it while `child_count > 0`). So with L0-format tiers a recomputed parent was
+re-keyed into its copyless entry, where the Phase 4 hierarchy leaves the recomputed block
+unkeyed. More reuse for both policies, much more for lru (it evicts parents under their
+children more often) — hence 251 → 199 s lru, ratio 0.78 → 0.93.
+Fix: `&& !b.locations.is_empty()` — publish only onto an entry holding lossy copies.
+
+kv_sim MultiTurn simulated_prefill_seconds (cost_aware / lru): base e58f715 195.033 / 251.126;
+ef69456 185.301 / 199.478; fix 195.033 / 251.126 (identical to base; Mixed and SharedSystem
+too).
+
+Test: `hierarchy::tests::commit_leaves_a_copyless_parent_unkeyed` (turbine-kv lib) — fails
+without the guard ("filed under a copyless exact entry: [L0 slot 0]"), passes with it.
+Mutation re-checked: lookup ignoring `allow_lossy` still fails
+`kv_sim lossy_lineage_never_reaches_opted_out`. `copy_bytes` ruled out (equals `block_bytes`
+at `l0`).
+
+Open (lead): re-keying a recomputed block into a copyless parent entry would itself be a real
+reuse win (lru −21 %, cost_aware −5 % on MultiTurn), a Phase 4 behaviour change of its own;
+not done here — it would need its own decision and a re-baselined bound.
+
+Gate: `scripts/gate.sh --base e58f715` → `gate: ok … passed=813 failed=0`.
