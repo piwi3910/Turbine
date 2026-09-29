@@ -2087,3 +2087,18 @@ finished stream now ends with the `slow_client` error event instead of a bare cl
 
 **Decision (user, 2026-09-29, relayed by the coordinator): A.** No code change; the phase-2 spec's edge-case list says
 partial reads do not reset the timer.
+
+## FP8-dynamic: full-GSM8K drop against vLLM over the bound (2026-09-29)
+
+Context: the Task 14 gate (decision "FP8-dynamic (Task 14): accuracy on full GSM8K against vLLM…", option B) ran both
+engines on `llama-3.2-3b-instruct-fp8-dynamic` at c16 on the full 1,319-item GSM8K (`scratch/p6a-fp8-full/run/` on
+novanas): Turbine 0.7703, vLLM-ROCm 0.7832, drop 0.0129 > the 0.01 reference-engine bound (`eval-compare` rc 1). Paired:
+54 items only Turbine solves, 71 only vLLM; McNemar exact p = 0.152; difference 95 % CI −0.0295..+0.0037. Golden c1/c16
+16/16 and c16 throughput (1.149× BF16) already passed.
+
+- A) Accept the drop as noise and mark FP8-dynamic `supported` (same call as OLMoE FP8 KV) — chosen
+- B) Numerics check first (golden per-position against the FP8 reference, the activation-quantization path), then decide
+- C) Hold the row `experimental`
+
+**Decision (user, 2026-09-29, relayed by the coordinator): A.** The c1 ITL item (0.846× BF16 against the 0.75× target)
+stays a perf follow-up (plan Task 14b) and does not block support.
