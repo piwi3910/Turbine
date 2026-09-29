@@ -1060,6 +1060,39 @@ mod phase8_eval_task_set {
             "gsm8k-full.jsonl's first 200 items are byte-identical to gsm8k-200.jsonl"
         );
     }
+
+    /// The completion-form counterpart of gsm8k-200.jsonl (Phase 6a: base checkpoints have no
+    /// chat template): same shape, every task a `prompt` (never `messages`) with a `stop`
+    /// sequence so a base model does not run on past its answer, and its 200 answers equal
+    /// gsm8k-200.jsonl's in order (both wrap the same 200 GSM8K test-split questions).
+    #[test]
+    fn eval_task_set_completion_valid_and_matches_200_answers() {
+        use turbine_bench::golden::eval::load_tasks;
+
+        let root = eval_root();
+        let completion_path = root.join("gsm8k-200-completion.jsonl");
+        check_task_set(&completion_path, 200);
+
+        let completion_tasks = load_tasks(&completion_path).unwrap();
+        for t in &completion_tasks {
+            assert!(t.prompt.is_some(), "{}: completion form uses prompt", t.id);
+            assert!(t.messages.is_none(), "{}: never messages", t.id);
+            assert!(
+                t.stop.as_ref().is_some_and(|s| !s.is_empty()),
+                "{}: needs a stop sequence (no chat template to end the turn)",
+                t.id
+            );
+        }
+
+        let chat_tasks = load_tasks(&root.join("gsm8k-200.jsonl")).unwrap();
+        let chat_answers: Vec<&str> = chat_tasks.iter().map(|t| t.answer.as_str()).collect();
+        let completion_answers: Vec<&str> =
+            completion_tasks.iter().map(|t| t.answer.as_str()).collect();
+        assert_eq!(
+            completion_answers, chat_answers,
+            "same 200 questions in the same order, so the same answers"
+        );
+    }
 }
 
 /// Phase 6a (S-11): the golden fixture of every quantized proof checkpoint (and the 8B BF16

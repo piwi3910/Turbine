@@ -19,7 +19,7 @@ pub enum MatchKind {
     FinalNumber,
 }
 
-/// One line of a tasks file: `{"id","prompt"|"messages","answer","match","max_tokens"}`.
+/// One line of a tasks file: `{"id","prompt"|"messages","answer","match","max_tokens","stop"?}`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvalTask {
@@ -32,6 +32,11 @@ pub struct EvalTask {
     #[serde(rename = "match")]
     pub match_kind: MatchKind,
     pub max_tokens: u32,
+    /// Stop sequences sent as `stop` on the request. A completion (`prompt`) task on a base
+    /// checkpoint with no chat template needs these to keep it from rambling past its answer
+    /// into a new few-shot-looking question (GSM8K-200-completion, Phase 6a).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -202,17 +207,11 @@ async fn served_model(client: &reqwest::Client, base: &str) -> Result<String, Ev
         .ok_or_else(|| EvalError::Server("GET /v1/models: no model listed".into()))
 }
 
-async fn complete(
-    client: &reqwest::Client,
-    base: &str,
-    model: &str,
-    task: &EvalTask,
-) -> Result<String, EvalError> {
-    let fail = |detail: String| EvalError::Request {
-        id: task.id.clone(),
-        detail,
-    };
-    let (path, body) = match (&task.prompt, &task.messages) {
+/// Builds the request path and JSON body for a task: `/v1/completions` with `prompt` for a
+/// completion task, `/v1/chat/completions` with `messages` otherwise. `task.stop`, when set, is
+/// carried onto the request as `stop` in either case.
+fn request_body(model: &str, task: &EvalTask) -> (&'static str, serde_json::Value) {
+    let (path, mut body) = match (&task.prompt, &task.messages) {
         (Some(prompt), _) => (
             "/v1/completions",
             serde_json::json!({"model": model, "prompt": prompt, "max_tokens": task.max_tokens,
@@ -224,6 +223,23 @@ async fn complete(
                                "temperature": 0.0, "stream": false}),
         ),
     };
+    if let Some(stop) = &task.stop {
+        body["stop"] = serde_json::json!(stop);
+    }
+    (path, body)
+}
+
+async fn complete(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    task: &EvalTask,
+) -> Result<String, EvalError> {
+    let fail = |detail: String| EvalError::Request {
+        id: task.id.clone(),
+        detail,
+    };
+    let (path, body) = request_body(model, task);
     let sent = client
         .post(format!("{base}{path}"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -348,5 +364,56 @@ mod tests {
         assert!(!is_correct(MatchKind::FinalNumber, "18", "no number here"));
         assert!(is_correct(MatchKind::Exact, "yes", " yes "));
         assert!(!is_correct(MatchKind::Exact, "yes", "Yes"));
+    }
+
+    fn task(
+        prompt: Option<&str>,
+        messages: Option<Vec<serde_json::Value>>,
+        stop: Option<Vec<&str>>,
+    ) -> EvalTask {
+        EvalTask {
+            id: "t".into(),
+            prompt: prompt.map(str::to_string),
+            messages,
+            answer: "1".into(),
+            match_kind: MatchKind::FinalNumber,
+            max_tokens: 8,
+            stop: stop.map(|v| v.into_iter().map(str::to_string).collect()),
+        }
+    }
+
+    #[test]
+    fn completion_task_posts_prompt_without_stop_by_default() {
+        let (path, body) = request_body("m", &task(Some("2+2="), None, None));
+        assert_eq!(path, "/v1/completions");
+        assert_eq!(body["prompt"], "2+2=");
+        assert!(body.get("stop").is_none());
+        assert!(body.get("messages").is_none());
+    }
+
+    #[test]
+    fn completion_task_carries_its_stop_sequences() {
+        let (path, body) = request_body(
+            "m",
+            &task(Some("2+2="), None, Some(vec!["\n\nQ:", "Answer:"])),
+        );
+        assert_eq!(path, "/v1/completions");
+        assert_eq!(body["stop"], serde_json::json!(["\n\nQ:", "Answer:"]));
+    }
+
+    #[test]
+    fn chat_task_posts_messages_and_can_carry_stop() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let (path, body) = request_body("m", &task(None, Some(messages), Some(vec!["\n"])));
+        assert_eq!(path, "/v1/chat/completions");
+        assert!(body.get("prompt").is_none());
+        assert_eq!(body["stop"], serde_json::json!(["\n"]));
+    }
+
+    #[test]
+    fn task_with_stop_round_trips_through_json() {
+        let json = r#"{"id":"x","prompt":"p","answer":"1","match":"final_number","max_tokens":8,"stop":["\n\nQ:"]}"#;
+        let t: EvalTask = serde_json::from_str(json).unwrap();
+        assert_eq!(t.stop, Some(vec!["\n\nQ:".to_string()]));
     }
 }
