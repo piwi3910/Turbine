@@ -27,7 +27,8 @@ under the same quantization; weight-only formats run without it.
 With `--kv-quant fp8_e4m3` every variant runs with the reference's FP8 KV emulation
 (`quant_reference.install_kv_quant`, the checkpoint's per-layer K/V scales or 1.0), so the spread
 of an FP8-KV reference (`quant_reference.py --kv-quant fp8_e4m3`) is measured under the same KV
-quantization (Phase 6a S-13).
+quantization (Phase 6a S-13). The emulation hooks the KV cache, so both decode shapes run with
+`use_cache=True`.
 
 usage: self_spread.py <model-dir> <reference.jsonl> <out.json> [variant,...] [--act-quant <mode>]
                       [--kv-quant none|fp8_e4m3]
@@ -86,7 +87,9 @@ def hidden_states(model, ref, mode):
     prompt, toks = ref["prompt_token_ids"], ref["tokens"]
     with torch.inference_mode():
         if mode == "full":
-            out = model.model(input_ids=torch.tensor([prompt + toks[:-1]]))
+            out = model.model(
+                input_ids=torch.tensor([prompt + toks[:-1]]), use_cache=True
+            )
             return out.last_hidden_state[0, len(prompt) - 1 :].to(torch.float32)
         out = model.model(input_ids=torch.tensor([prompt]), use_cache=True)
         rows = [out.last_hidden_state[0, -1]]
