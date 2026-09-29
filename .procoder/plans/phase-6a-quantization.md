@@ -480,14 +480,14 @@ Interfaces:
 
 ## Task 28: YaRN proof on Llama-3.2-3B
 
-Files: `tests/golden/llama-3.2-3b-instruct-yarn16/{reference.jsonl,tolerance.json,README.md,prompts-long.jsonl}`, `scripts/golden/hf_reference.py` (`--config-override`), `scripts/lab/phase6-novanas-llama-yarn16.yaml`, `benches/turbine-bench/tests/golden.rs`, `.procoder/perf-log.md`
+Files: `tests/golden/llama-3.2-3b-instruct-yarn16/{prompts.jsonl,reference.jsonl,tolerance.json,README.md}`, `scripts/golden/hf_reference.py` (`--config-override`), `scripts/golden/yarn_long_prompt.py`, `scripts/golden/yarn_self_spread.py` (`--fold`), `scripts/lab/phase6-novanas-llama-yarn16.yaml`, `crates/turbine-model/tests/golden.rs` (lab diagnostic `yarn_teacher_forced_vs_reference`), `.procoder/perf-log.md`
 Interfaces:
 
-- the long prompt (≈ 12,000 tokens, deterministic text from the committed GSM8K questions concatenated) lives in `prompts-long.jsonl`; `turbine-golden compare --prompts` takes both files in one run
+- the long prompt (≈ 12,000 tokens, deterministic text from the committed GSM8K questions concatenated, `yarn_long_prompt.py`) is `p17-long`, appended to the 16 golden prompts in the fixture's own `prompts.jsonl`, which `turbine-golden compare` reads beside the reference (amended 2026-09-29: one file, no `--prompts` change)
   Covers: spec S-16 (proof); AC YaRN lab golden
   Depends on: Task 27
 
-- [ ] Fixture: `uv run scripts/golden/hf_reference.py --model-dir /home/piwi/turbine-models/llama-3.2-3b-instruct --config-override '{"rope_scaling":{"rope_type":"yarn","factor":16.0,"original_max_position_embeddings":8192,"beta_fast":32,"beta_slow":1}}' …` for both prompt files; tolerance: the Llama BF16 values unless `self_spread.py` on the override shows a larger spread (recorded in the README).
+- [ ] Fixture: `uv run scripts/golden/hf_reference.py --model-dir /home/piwi/turbine-models/llama-3.2-3b-instruct --config-override '{"rope_scaling":{"rope_type":"yarn","factor":16.0,"original_max_position_embeddings":8192,"beta_fast":32,"beta_slow":1}}' …` on the fixture's `prompts.jsonl`; tolerance: the Llama BF16 values unless `yarn_self_spread.py` on the override (and `--fold`, Turbine's attention-factor placement) shows a larger spread (recorded in the README; provisional until then).
 - [ ] Lab (GPU 0, bench lock): `scripts/lab-bench.sh --model llama-yarn16 --golden16` — expect PASS; `--model llama --golden16` unchanged.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `test(golden): YaRN Llama-3.2-3B reference and lab proof`
