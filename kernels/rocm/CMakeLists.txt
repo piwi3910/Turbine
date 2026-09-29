@@ -187,6 +187,8 @@ set(TURBINE_SOURCES
   src/qgemm.cpp
   src/quantize_act.hip
   src/qgemm_int4.hip
+  src/qgemm_mxfp4.hip
+  src/quantize_act_mxfp4.hip
   src/impl_table.cpp)
 set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/paged_attention_splitkv.cpp
   src/rmsnorm.cpp ${FMHA_BLOBS})
@@ -294,4 +296,18 @@ if(TURBINE_BUILD_QGEMM_INT4_EVAL)
     "${CMAKE_CURRENT_SOURCE_DIR}/../include"
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(turbine_qgemm_int4_eval PRIVATE hip::host turbine_hip)
+endif()
+
+# The MXFP4 GEMM provider evaluation harness (Phase 6a Task 19, decision "P6: MXFP4 GEMM —
+# provider evaluation (kernel reuse rule)"): checks and times turbine_hip_mxfp4's tiles, its
+# MXFP4_EMULATED quantize-dequantize and the hipBLASLt BF16 baseline (and a dequantize + BF16
+# GEMM candidate) on the Llama-3.2-3B and Llama-3.1-8B shapes of the current device. Linked with
+# the library's objects. A lab tool, off by default: -DTURBINE_BUILD_QGEMM_MXFP4_EVAL=ON.
+option(TURBINE_BUILD_QGEMM_MXFP4_EVAL "Build the MXFP4 GEMM provider evaluation harness" OFF)
+if(TURBINE_BUILD_QGEMM_MXFP4_EVAL)
+  add_executable(turbine_qgemm_mxfp4_eval tools/qgemm_mxfp4_eval.cpp
+    $<TARGET_OBJECTS:turbine_hip_objects>)
+  set_source_files_properties(tools/qgemm_mxfp4_eval.cpp PROPERTIES LANGUAGE HIP)
+  turbine_hip_settings(turbine_qgemm_mxfp4_eval)
+  set_target_properties(turbine_qgemm_mxfp4_eval PROPERTIES LINKER_LANGUAGE HIP)
 endif()
