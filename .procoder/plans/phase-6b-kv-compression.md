@@ -269,6 +269,7 @@ Interfaces:
 - [ ] Commit: `feat(kv): pressure-driven compression ladder in L1 and L2`
 
 Notes (lead, 2026-09-30, from the Task 15 handoff): the static-rank tier driver (`TierDriver`) does not handle `TransferPurpose::Compress`; the ladder stays refused at startup in that mode until a task teaches the driver `Compress` (add that task when the ladder is allowed there). Left for after the Task 4 + Task 15 merge: `/turbine/v1/status` `quantization.ladder` and the `/turbine/v1/kv` tier `rung` (accessor `KvHierarchy::ladder_rung`), and the AC's opted-out identical-output check in `ladder_under_pinned_pressure`. `floor_evict` actions carry `to="evict"`.
+Step-up (user decision 2026-09-30, option A): a rung relaxes only at GREEN after `dwell` below low water; the t4 + t15 merge updates `ladder_tick`, regenerates `ladder_expected_rungs.json` and adds the assertion that no `rung_step_up` happens while the pinned state is not GREEN (mutation: drop the GREEN check → the test FAILS).
 
 ## Task 16: Ladder lab proof and soak
 

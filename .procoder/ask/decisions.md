@@ -2001,3 +2001,13 @@ Asked by the 6b Task 4 builder (branch `p6b-t4`, ef69456), relayed by the lead.
 
 Consequence (lead): 6b Task 15 (`p6b-t15`) observes transfer estimates at max(bytes, codec from/to bytes) to fix the same mispricing from the other side. Applied together the two corrections would count the saving twice. The t4 + t15 merge reconciles them to one consistent model under decision 1 (the planner prices at encoded bytes, and the estimate it multiplies must be a rate per encoded byte, however the simulator's copy times scale), and re-checks `ladder_under_pinned_pressure` and `cost_aware_beats_lru`.
 
+## 6b ladder: when a tier's rung steps back up (2026-09-30)
+
+Asked by the 6b Task 15 builder (`p6b-t15`, 940b871), relayed by the lead. Spec S-6 made step-up depend on fill only (below `kv.ladder.low_water` 0.85 for `reliability.pressure.deescalate_dwell`), while compression runs whenever the controller is not GREEN ("Start at YELLOW earlier"). So under sustained ORANGE a floor tier below low water stepped up after the dwell and was compressed again on the next sweep, once per dwell.
+
+- A) Step-up also requires GREEN: the rung relaxes only once the controller is GREEN and the tier has stayed below 0.85 for the dwell. No churn under sustained pressure; blocks stay compressed a little longer after pressure eases. (Lead recommendation.)
+- B) Keep fill-only (the spec as it was): the rung may relax under YELLOW / ORANGE; churn about once per dwell under sustained pressure.
+- C) Step-up requires YELLOW or better: a middle ground; still churns at YELLOW, where compression is active.
+
+**User decision 2026-09-30: A.** Spec S-6 and its AC amended; the t4 + t15 merge updates the ladder code and the pinned expected rung fixture of `ladder_under_pinned_pressure`, and adds an assertion that no step-up happens while not GREEN.
+
