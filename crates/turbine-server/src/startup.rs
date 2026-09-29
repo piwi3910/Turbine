@@ -19,8 +19,9 @@
 //! while the listener stays open; running requests continue until none is left or
 //! `server.shutdown_grace` has passed; then `EngineCommand::Shutdown` cancels the rest with
 //! reason `shutdown` (their streams end with `shutting_down`), the engine delivers what it holds
-//! and stops, the listener closes, open connections finish (bounded by [`CLOSE_LIMIT`]) and the
-//! process exits 0.
+//! and stops, the listener closes, open connections finish (bounded by [`CLOSE_LIMIT`]), the
+//! engine threads are joined once they have released their device resources (bounded by
+//! [`ENGINE_STOP_LIMIT`]) and the process exits 0.
 //!
 //! A load or warm-up failure after binding keeps `/ready` at 503 `model_load_failed` for
 //! [`FAILURE_GRACE`] and exits 1. A fatal circuit (P3 S-12: a sticky device error, a pressure
@@ -72,6 +73,12 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 /// After the grace: how long the engine may take to deliver the cancellations and stop, and
 /// then how long open connections may take to finish, before the process exits 0 regardless.
 const CLOSE_LIMIT: Duration = Duration::from_millis(500);
+/// On a clean exit: how long the engine threads may take, after the engine loop ends, to drop
+/// the executor, the KV tiers, the telemetry sampler and the kernel provider before the process
+/// exits regardless (`engine_stop_timeout`). Returning from `main` runs the device runtime's
+/// static destructors; an engine thread still freeing device memory then crashed the W4A4 8B
+/// server with SIGSEGV after `shutdown complete` (2026-09-29).
+const ENGINE_STOP_LIMIT: Duration = Duration::from_secs(10);
 /// Test-only, not a configuration key: a positive byte count caps every accepted connection's
 /// kernel send buffer (`SO_SNDBUF`; Linux doubles it and turns its autotuning off). The request
 /// output channel (P2 S-7) pauses a request once the client stops reading and everything
@@ -482,7 +489,8 @@ pub fn run(cli: Cli) -> ExitCode {
         replicas,
         support.view(),
     ));
-    // Never wait for the generation thread or in-flight blocking work on the way out.
+    // The engine threads were joined on a clean exit (`join_engines`); never wait for other
+    // in-flight blocking work on the way out.
     runtime.shutdown_background();
     code
 }
@@ -651,6 +659,7 @@ async fn serve(
     tracing::info!(%addr, devices = inventory.devices.len(), "listening; loading the model");
 
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut engines = Vec::new();
     let queue_capacity = config.scheduler.max_queued_requests as usize;
     let reliability_metrics = ReliabilityMetrics::register(&state.metrics);
     let telemetry_metrics = TelemetryMetrics::register(&state.metrics);
@@ -706,7 +715,7 @@ async fn serve(
             }
             continue;
         }
-        if let Err(e) = engine::spawn(
+        match engine::spawn(
             replica.prepared,
             replica.group,
             replica.pipeline,
@@ -717,9 +726,12 @@ async fn serve(
             Timeouts::from_config(&config.server),
             fatal_tx.clone(),
         ) {
-            let _ = fatal_tx.send(Fatal::LoadFailed(format!(
-                "cannot start engine thread {r}: {e}"
-            )));
+            Ok(thread) => engines.push(thread),
+            Err(e) => {
+                let _ = fatal_tx.send(Fatal::LoadFailed(format!(
+                    "cannot start engine thread {r}: {e}"
+                )));
+            }
         }
     }
 
@@ -748,6 +760,7 @@ async fn serve(
             Ok(()) => {
                 // Every connection has closed; the engine cancels anything left and stops.
                 backend.stop_engine();
+                join_engines(engines).await;
                 tracing::info!("shutdown complete");
                 ExitCode::Clean
             }
@@ -759,6 +772,8 @@ async fn serve(
         },
         () = connections_closed => {
             tracing::warn!(event = "shutdown_connections_open", "connections still open after shutdown; exiting");
+            backend.stop_engine();
+            join_engines(engines).await;
             ExitCode::Clean
         }
         Some(fatal) = fatal_rx.recv() => {
@@ -824,6 +839,26 @@ async fn drain_on_signal(
         tokio::time::sleep(SHUTDOWN_POLL).await;
     }
     let _ = drained.send(());
+}
+
+/// Waits up to [`ENGINE_STOP_LIMIT`] for the engine threads to end (they have been asked to
+/// stop), so that no device resource is still being released when the process exits.
+async fn join_engines(engines: Vec<std::thread::JoinHandle<()>>) {
+    let joined = tokio::task::spawn_blocking(move || {
+        for engine in engines {
+            let _ = engine.join();
+        }
+    });
+    if tokio::time::timeout(ENGINE_STOP_LIMIT, joined)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            event = "engine_stop_timeout",
+            limit_seconds = ENGINE_STOP_LIMIT.as_secs_f64(),
+            "the engine did not stop in time; exiting while it still runs"
+        );
+    }
 }
 
 async fn shutdown_signal() {

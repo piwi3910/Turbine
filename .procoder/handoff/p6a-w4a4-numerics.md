@@ -136,3 +136,58 @@ bench.gate → bench.lock and runs on GPU 0, cores 0–11.
   `catchsegv`/gdb batch on the current binaries.
 - Pinning test: `cargo test -p turbine-model --test config_rope_parameters -- --ignored` fails on
   7277c8b with `left: 10000.0 right: 500000.0` (run on novanas via remote-cargo).
+
+## Verdict (rotation 9)
+
+**W4A4 8B GSM8K-200 c1 = 148/200 = 0.740 vs vLLM 0.735: the W4A4 accuracy gap is closed; the
+cause was the RoPE config, not MXFP4 numerics.** Caveat: that run used the patched `config.json`
+(top-level `rope_theta` + `rope_scaling` added) and the frozen q4n binaries. The formal result is
+the rerun on the raw checkpoint directory after the lead merges the `config.rs` fix
+(`p6a-rope-parameters` 021b5f3); commit that one as `tests/eval/.../turbine.json`. The support
+row of `mxfp4_a4` is unchanged.
+
+## Exit segfault (rotation 9)
+
+Scope: of every `*.log` under `turbine-ci/scratch` and `turbine-ci/remote/agent-*` on novanas,
+only `scratch/w4a4-numerics/w4a4rope.log` has a `Segmentation fault` (or exit 139). No lab-bench,
+soak or eval log of any other model or binary has one. So far it is one occurrence, W4A4 8B on
+the q4n binaries (13:19 build of p6a-mxfp4).
+
+Cause (hypothesis from the code, confirmed by a host test): a clean shutdown never waited for
+the engine thread. `serve` sent `EngineCommand::Shutdown` (`backend.stop_engine()`), logged
+`shutdown complete` and returned; `startup::run` then called `runtime.shutdown_background()`
+and `main` returned, so the process ran `exit()` (libc atexit handlers and the HIP runtime's
+static destructors, then the unmap of `libturbine_hip.so`) while the engine thread was still
+dropping the executor, the KV pool and the weights (`hipFree`, stream and hipBLASLt handle
+destruction). On the 3B that drop is short and happens to finish first. On the 8B W4A4 (more
+buffers, `gemm_autotune`, decode graphs) it overlaps the runtime teardown: a use-after-destroy
+in the HIP runtime or a call into already unmapped code, so SIGSEGV after `shutdown complete`.
+`drain_on_signal` only waited (≤ 500 ms) until the command channel closed, which happens when
+the loop ends, before its resources drop. Not a ROCm bug: freeing device memory concurrently
+with `exit()` is ours.
+
+Fix (`fix(server): join the engine threads before exit`): `engine::spawn` returns the
+thread's `JoinHandle`; the thread body runs in a closure that owns everything, then logs
+`event="engine_stopped"` once it has dropped. Both clean exits (`shutdown complete` and
+`shutdown_connections_open`) join the engine threads, bounded by `ENGINE_STOP_LIMIT` = 10 s
+(`engine_stop_timeout` WARN, then exit anyway). The fatal paths (exit 1 / 3) still do not wait:
+a device-fatal engine may hang. The P5 static worker-rank thread is not joined either (its exit
+comes from the leader's `RankStopped`, when the rank thread has already ended its work).
+Test: `cargo test -p turbine-server --test server_cli sigterm_stops_the_engine_before_exit`
+(cpu backend; `engine_stopped` must precede `shutdown complete`). Red before the fix, green after.
+
+GPU repro/backtrace (detached on novanas, waits for the go-file):
+- Script `/home/piwi/turbine-ci/scratch/w4a4-segv/w4a4segv.sh` (copy committed as
+  `.procoder/handoff/w4a4segv.sh`); go-file `/home/piwi/turbine-ci/gpu-queue/w4a4-segv.go`; locks port18000 →
+  bench.gate → bench.lock; GPU 0, cores 0–11. 8 start → 2 requests → SIGTERM cycles with the old
+  q4n binaries, then 8 with this branch's release server and kernel library (copied to
+  `w4a4-segv/new/` at start), all on the RoPE-patched W4A4 model dir. Cores (private anon only,
+  ≤ 30 GiB) get a `rocgdb` `thread apply all bt` into `w4a4-segv/bt-<old|new>-<i>.txt` and are
+  deleted. ~15–25 min.
+- Log `/home/piwi/turbine-ci/scratch/w4a4-segv/w4a4segv.log`, last line `w4a4-segv: done rc=<rc>`;
+  one `cycle <old|new> <i> rc=<rc> … stopped=<n> complete=<n>` line per cycle and a `summary` line.
+- Judge: `new` must be 8/8 `rc=0` with `stopped=1`. `old` segfaulting (rc=139) in some cycles
+  confirms the cause; the `old` backtrace should show the engine thread in a free/destroy path
+  and the main thread in `exit`/`__cxa_finalize`/`_dl_fini`. If `old` never segfaults in 8, the
+  crash is rare; the fix still removes the race. If `new` segfaults, the cause is elsewhere:
+  read its backtrace.
