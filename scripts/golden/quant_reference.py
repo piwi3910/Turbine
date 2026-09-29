@@ -48,7 +48,7 @@ Usage:
         --prompts tests/golden/prompts.jsonl --out tests/golden/<slug>/reference.jsonl \
         [--act-quant auto|none|fp8_token|fp8_tensor|fp8_group128|mxfp4] [--top-logprobs 20] \
         [--work-dir /dev/shm] [--dequantized <dir>] [--keep-dequantized] [--model-name <hub-id>]
-        [--input-scale fused-max|per-part]
+        [--input-scale fused-max|per-part] [--chat-template <file.jinja>]
     uv run scripts/golden/quant_reference.py --self-test
 """
 
@@ -104,6 +104,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["fused-max", "per-part"],
         default="fused-max",
         help="fp8_tensor: a fused projection's parts share their largest input_scale",
+    )
+    p.add_argument(
+        "--chat-template",
+        type=Path,
+        help="render chat prompts with this Jinja template instead of the checkpoint's "
+        "(a base checkpoint without one; the served config names the same file)",
     )
     args = p.parse_args(argv)
     if not args.self_test:
@@ -491,6 +497,8 @@ def run(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
         tokenizer = AutoTokenizer.from_pretrained(bf16_dir)
+        if args.chat_template is not None:
+            tokenizer.chat_template = args.chat_template.read_text(encoding="utf-8")
         model = AutoModelForCausalLM.from_pretrained(bf16_dir, dtype=torch.bfloat16)
         model.to(args.device)
         model.eval()
