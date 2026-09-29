@@ -351,3 +351,67 @@ Old go-files `gptq-full.go`, `w4a4-segv.go` are spent (may be removed).
 core pinning option 1; AGENTS.md prose "Phase 6 quantized formats unsupported on amd" is stale (fix at 6a close or next
 AGENTS touch); review file not updated for rotations 8–10. Merge order unchanged: T28a, then p6a-rope-parameters (un-ignore
 `crates/turbine-model/tests/config_rope_parameters.rs`), then the formal W4A4 rerun (mxfp4_a4 experimental until then).
+
+## Rotation 11 lead (00:59 – 02:50 +04) — START HERE next
+
+State notes: `scratchpad/lead/r5-state.md` (lines "R11"). Check script `scratchpad/lead/r6-check.sh`. Builder rules:
+`lead/rules-r5.md` + `lead/rules-r9-add.md` (PSU rule CHANGED, see below). Briefs this rotation: `lead/brief-r11-*.md`,
+`lead/brief-p6b-t4-regress.md`.
+
+**User instructions (2026-09-30, via coordinator), binding until 6a closes:** finish Phase 6a, then PAUSE. 6b is frozen: no
+6b builders, no t4/t15 merge, p6b-stack stays at 5050a19 with its notes. At most 2 builders, sonnet for mechanical work.
+PSU is NOT a blocker: two-GPU items (Task 21 leg `scripts/lab-cluster.sh --bench-lock tp2-novanas`, Task 29
+`lab-test.sh novanas --gpus 2 --features fault-injection --tier full`, anything else deferred for two GPUs) run with
+`TURBINE_LAB_ONE_GPU_JOB=0`; if novanas freezes the user reboots, requeue, don't debug. Single-GPU jobs stay one at a time.
+Record nothing as deferred-by-PSU. End: merge `phase-6a-quantization` into local `main` (no push), stop all builders and
+detached jobs, no novanas job or go-file left, final handoff, report to the coordinator, stop.
+
+**Done this rotation (integration):** 9a94c46 merge p6a-yarn-t28a (Task 28a: ABI v2.10 rope attn_factor, yarn16 tolerance
+from the no-fold spread; GPU proof rc=0, golden 17/17 c1/c16, BF16 16/16); merge p6a-rope-parameters; ff804c4 un-ignore
+`config_rope_parameters.rs` + plan 28a nit (shim.rs + server startup check). Gate --base c144abf on ff804c4: ok 477/0.
+FP8 (per-tensor/dynamic) 10-min soak PASS 8/8 (verdict in `scratchpad/fp8-soak/novanas-20260929T204133Z/`): fp8 row stays
+supported. The soak had hung 19 min: lab-serve.sh's `kubectl logs -f` survives under ssh ControlMaster → fix is on
+p6a-fp8-t15 (5c6df91 `fix(lab): lab-serve stops its remote log stream`), merges with that branch.
+
+**6b (frozen):** p6b-stack 99dcc4a + 5050a19: user decisions copy_bytes (A), lossy chain rule (builder design, S-3 amended),
+ladder step-up only at GREEN (option A, S-6 + AC amended); contract §26 Task 4/15 names; plan Task 15 merge notes (reconcile
+Task 15's transfer.rs logical-size observe with copy_bytes; GREEN check; regen `ladder_expected_rungs.json`; assert no
+step-up while not GREEN). p6b-t4: ef69456 + bd8bf63 regression fix (commit_progress publish rule on copyless entries) +
+3662c44 handoff, gate ok 813/0, kv_sim back to 0.78. p6b-t15: 940b871 + ad006d5 (gate 693/0). Open 6b question for later:
+keying recomputed blocks into copyless parent entries (reuse gain, separate Phase 4 behaviour change, not adopted).
+
+**6a results this rotation:**
+- W4A4 formal rerun (branch p6a-w4a4-rerun 1f48941, raw checkpoint, integration binaries): GSM8K-200 c1 0.74 vs vLLM 0.735
+  → accuracy PASS; c16 631.9 tok/s. Log `scratch/w4a4-rerun/w4a4-rerun.log`; judge the shutdown-segfault line per
+  `.procoder/handoff/p6a-w4a4-rerun.md`. Still needed for the mxfp4_a4 flip (spec S-11): an Instruct W4A4 golden
+  reference + spread (CPU fixture, check reference-side rope handling — the r8 one was removed for the transformers-5
+  rope_parameters bug), golden c1/c16, soak. Needs a builder.
+- fp8_block (branch p6a-fp8-t15, builder retired at ~298k; handoff Rotation 11 section): bench job rc=1 only because golden
+  could not run (reference.jsonl not yet in the tree): c16 1055 tok/s (200 ok), c1 112.7 tok/s ITL p50 8.43 ms. The golden
+  fixture waits on its self-spread (CPU, fixture.queue ranked before `llama-3\.1-8b`); then a golden c1/c16 GPU rerun.
+  Soak `fp8block-soak.go` released 22:45Z, Mac waiter `scratchpad/fp8block-soak/wait_and_soak.log`, marker
+  `fp8block-soak: done rc=`, snapshot worktree r11-soak-fp8block (remove after). Flip ef09f16 stays the last support.rs
+  commit; merge p6a-fp8-t15 after golden + soak pass.
+- GPTQ (branch p6a-gptq-numerics; handoff "Rotation 11: C then A"): AutoRound run 1 failed (circuit latency_drift under
+  host load) → drivers now `--set reliability.circuit.latency_drift_open=100` with transitions logged (c0253e9, accepted).
+  Calibration failed: llmcompressor's fused Triton GPTQ kernel does not compile on ROCm Triton. Fix builder
+  a25695ab898be5398 (sonnet, `lead/brief-r11-gptq-calib.md`) → new go-file `gptq-calib2.go`, marker `gptq-calib2: done rc=`.
+  Then release `gptq-own.go` (driver pid 1377410 waiting; markers `gptq-own: done rc=`, `gptq-own-vllm: done rc=`).
+  Waiter `/home/piwi/turbine-ci/gpu-queue-seq-r11b.sh` (pid 1386054) releases `gptq-autoround2.go` after gptq-own finishes.
+  Judge with `scripts/eval/paired_compare.py` vs `turbine-bf16-full.json`; gptq_int4 stays experimental until then.
+- CPU fixtures: pass 2 `scratch/fixtures-r5/fixtures-r5c.sh` (YaRN section removed — superseded; pass 1 had re-entered it,
+  killed), log `fixtures-r5c.log`, marker `fixtures-r5: ALLDONE`: MXFP4-A16 8B reference started 21:40Z, then its spread →
+  then MXFP4-A16 golden c1/c16 GPU job → flip. fixture-order.sh (pid 41159) orders fixture.lock via `fixture.queue`.
+
+**GPU queue now:** fp8block-soak (released) → gptq-calib2 → gptq-own (+vLLM) → gptq-autoround2 (auto) → fp8_block golden
+rerun (after its fixture) → MXFP4-A16 golden (after its fixture) → W4A4 golden (after its fixture) → T28a leftovers
+(`lab-test --tier quick`, `lab-bench --golden16` llama-yarn16 + llama) → Task 21 two-GPU leg → Task 29 exit (gate --full,
+lab-test full + two-GPU tier, lab-bench --golden16 per proof model, soaks per newly supported checkpoint, support matrix,
+docs/AGENTS/perf-log, `docs: phase 6a exit`) → merge into local main.
+
+**Small follow-ups (no builder yet):** TP worker-rank thread join (10 s bound, timeout event, host test); INFO
+`event="rope_config"` (theta, type, factor) + status field (config.rs, lead-owned); AGENTS.md "Phase 6 quantized formats
+unsupported on amd" line stale; review file (rotations 8–11); core pinning in remote-cargo.sh optional.
+
+**Builders running:** a25695ab898be5398 (GPTQ calib fix). fp8_block builder a156d1c78ad466746 finishing its gate/handoff —
+retire it (don't resume). One slot free.
