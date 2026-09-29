@@ -30,6 +30,7 @@
 // server. Exit 0 when every candidate that has an algorithm matched the
 // reference and every quantization was bit-exact, 1 otherwise.
 #include <hip/hip_runtime.h>
+#include <hipblaslt/hipblaslt-ext.hpp>
 #include <hipblaslt/hipblaslt.h>
 
 #include <algorithm>
@@ -42,6 +43,7 @@
 #include <vector>
 
 #include "gemm_problem.hpp"
+#include "qgemm_epilogue.hpp"
 #include "qgemm_problem.hpp"
 #include "qgemm_quantize.hpp"
 #ifdef TURBINE_QGEMM_EVAL_CK
@@ -503,6 +505,509 @@ bool check_quant(int32_t mode, int64_t rows, int64_t cols, Rng &rng,
   return ok;
 }
 
+// --tune: for each shape and FP8 scale layout (SAB, SABV) and each decode
+// bucket m in {1, 2, 4, 8, 16, 32, 64}, times every solution hipBLASLt lists
+// for e4m3 x e4m3 -> BF16 that takes the problem within the workspace, checks
+// the fastest against the reference and prints it as a row of the pinned FP8
+// table (src/qgemm_tuned.hpp):
+//   qgemm_tune n k scale m_max index name best_us heuristic_us
+bool tune(Env &env, Rng &rng, const std::vector<std::string> &shapes) {
+  bool all_ok = true;
+  std::vector<hipblasLtMatmulHeuristicResult_t> all;
+  if (hipblaslt_ext::getAllAlgos(
+          env.lt, hipblaslt_ext::GemmType::HIPBLASLT_GEMM, HIPBLAS_OP_T,
+          HIPBLAS_OP_N, HIP_R_8F_E4M3, HIP_R_8F_E4M3, HIP_R_16BF, HIP_R_16BF,
+          HIPBLAS_COMPUTE_32F, all) != HIPBLAS_STATUS_SUCCESS) {
+    std::fprintf(stderr, "qgemm_eval: getAllAlgos (FP8) failed\n");
+    return false;
+  }
+  std::printf("# %zu FP8 solutions listed\n", all.size());
+  const int64_t buckets[] = {1, 2, 4, 8, 16, 32, 64};
+  for (const LinearShape &s : kShapes) {
+    if (std::find(shapes.begin(), shapes.end(), s.name) == shapes.end())
+      continue;
+    ShapeData d = make_shape(s, 64, rng);
+    for (const CandInfo &ci : kCands) {
+      if (ci.cand != Cand::Sab && ci.cand != Cand::Sabv)
+        continue;
+      for (int64_t m : buckets) {
+        Prepared p;
+        if (!prepare(env, ci, d, m, p)) {
+          std::printf("qgemm_tune %s %s m=%lld: no heuristic answer\n", s.name,
+                      ci.name, (long long)m);
+          all_ok = false;
+          continue;
+        }
+        const double heuristic = time_algo(env, ci, d, p, p.algos[0]);
+        double best = heuristic;
+        const hipblasLtMatmulAlgo_t *best_algo = &p.algos[0];
+        const float alpha = 1.0f, beta = 0.0f;
+        for (const auto &r : all) {
+          size_t ws = 0;
+          if (hipblaslt_ext::matmulIsAlgoSupported(
+                  env.lt, p.fp8.desc.handle, &alpha, p.fp8.weight.handle,
+                  p.fp8.act.handle, &beta, p.fp8.out.handle, p.fp8.out.handle,
+                  const_cast<hipblasLtMatmulAlgo_t &>(r.algo),
+                  ws) != HIPBLAS_STATUS_SUCCESS ||
+              ws > kWorkspaceBytes) {
+            continue;
+          }
+          const double t = time_algo(env, ci, d, p, r.algo);
+          if (!std::isnan(t) && t < best) {
+            best = t;
+            best_algo = &r.algo;
+          }
+        }
+        (void)run(env, ci, d, p, *best_algo, 0);
+        hip_ok(hipStreamSynchronize(env.stream), "sync");
+        std::vector<uint16_t> row0;
+        const Check c = check(ci, d, m, row0);
+        all_ok = all_ok && c.ok;
+        hipblasLtMatmulAlgo_t a = *best_algo;
+        const std::string name =
+            best_algo == &p.algos[0]
+                ? std::string("heuristic")
+                : hipblaslt_ext::getSolutionNameFromAlgo(env.lt, a);
+        const int index =
+            best_algo == &p.algos[0] ? -1 : hipblaslt_ext::getIndexFromAlgo(a);
+        std::printf("qgemm_tune %lld %lld %s %lld %d %s %.2f %.2f %s\n",
+                    (long long)s.n, (long long)s.k,
+                    ci.w == QScale::Vector ? "vector" : "scalar", (long long)m,
+                    index, name.c_str(), best, heuristic,
+                    c.ok ? "ok" : "MISMATCH");
+        std::fflush(stdout);
+      }
+    }
+    free_shape(d);
+  }
+  return all_ok;
+}
+
+// --block 1: the block-scaled FP8 candidates (Phase 6a Task 15, 128 x 128
+// weight blocks): CK ck_tile ABQuantGrouped (A per row and 128 columns, B per
+// block; W8A8) against the host reference, and the W8A16 fallback of decision
+// Q3 timed as its parts: an own dequantize-to-BF16 kernel over the whole
+// weight, and the BF16 hipBLASLt GEMM on the dequantized weight (also the cost
+// of dequantizing once at load), per shape and m.
+__global__ void dequant_block_bf16(const uint8_t *w, const float *scales,
+                                   uint16_t *out, int64_t n, int64_t k) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n * k)
+    return;
+  const int64_t r = i / k, c = i % k;
+  const int64_t kb = (k + 127) / 128;
+  const float v =
+      turbine_hip::fp8_e4m3_value(w[i]) * scales[(r / 128) * kb + c / 128];
+  uint32_t b;
+  __builtin_memcpy(&b, &v, 4);
+  out[i] = static_cast<uint16_t>((b + 0x7fff + ((b >> 16) & 1)) >> 16);
+}
+
+template <typename F> double time_launches(const Env &env, F &&launch) {
+  for (int i = 0; i < 3; ++i)
+    launch(i);
+  std::vector<double> rounds;
+  for (int r = 0; r < env.rounds; ++r) {
+    hip_ok(hipEventRecord(env.e0, env.stream), "hipEventRecord");
+    for (int i = 0; i < env.iters; ++i)
+      launch(i);
+    hip_ok(hipEventRecord(env.e1, env.stream), "hipEventRecord");
+    hip_ok(hipEventSynchronize(env.e1), "hipEventSynchronize");
+    float ms = 0;
+    hip_ok(hipEventElapsedTime(&ms, env.e0, env.e1), "hipEventElapsedTime");
+    rounds.push_back(1000.0 * ms / env.iters);
+  }
+  return median(rounds);
+}
+
+bool eval_block(Env &env, Rng &rng, const std::vector<std::string> &shapes,
+                const std::vector<int64_t> &ms) {
+  bool all_ok = true;
+  const int64_t m_max = ms.back();
+  for (const LinearShape &s : kShapes) {
+    if (std::find(shapes.begin(), shapes.end(), s.name) == shapes.end())
+      continue;
+    const int64_t n = s.n, k = s.k, nb = (n + 127) / 128, kb = (k + 127) / 128;
+    std::vector<float> w(n * k);
+    for (auto &v : w)
+      v = rng.normal(0.02f);
+    std::vector<float> sw(nb * kb, 0.0f);
+    for (int64_t r = 0; r < n; ++r)
+      for (int64_t c = 0; c < k; ++c) {
+        float &a = sw[(r / 128) * kb + c / 128];
+        a = std::max(a, std::fabs(w[r * k + c]));
+      }
+    for (auto &v : sw)
+      v = turbine_hip::dynamic_fp8_scale(v);
+    std::vector<uint8_t> wq(n * k);
+    std::vector<uint16_t> wbf(n * k);
+    for (int64_t r = 0; r < n; ++r)
+      for (int64_t c = 0; c < k; ++c) {
+        const float sc = sw[(r / 128) * kb + c / 128];
+        wq[r * k + c] = turbine_hip::fp8_e4m3_round(w[r * k + c] / sc);
+        wbf[r * k + c] =
+            bf16_bits(turbine_hip::fp8_e4m3_value(wq[r * k + c]) * sc);
+      }
+    std::vector<uint8_t> aq(m_max * k);
+    std::vector<uint16_t> abf(m_max * k);
+    std::vector<float> sa(m_max * kb);
+    for (int64_t r = 0; r < m_max; ++r)
+      for (int64_t g = 0; g < kb; ++g) {
+        float amax = 0;
+        const int64_t c1 = std::min(k, g * 128 + 128);
+        for (int64_t c = g * 128; c < c1; ++c) {
+          abf[r * k + c] = bf16_bits(rng.normal(1.0f));
+          amax = std::max(amax, std::fabs(bf16_value(abf[r * k + c])));
+        }
+        const float sc = turbine_hip::dynamic_fp8_scale(amax);
+        sa[r * kb + g] = sc;
+        for (int64_t c = g * 128; c < c1; ++c)
+          aq[r * k + c] =
+              turbine_hip::fp8_e4m3_round(bf16_value(abf[r * k + c]) / sc);
+      }
+    const size_t copies = std::min<size_t>(
+        8, std::max<size_t>(2, kRotateBytes / static_cast<size_t>(n * k) + 1));
+    ShapeData view;
+    view.n = n;
+    view.k = k;
+    view.m_max = m_max;
+    for (size_t i = 0; i < copies; ++i) {
+      view.w_fp8.push_back(device_copy(wq));
+      view.w_bf16.push_back(device_copy(wbf));
+    }
+    view.a_fp8 = device_copy(aq);
+    view.a_bf16 = device_copy(abf);
+    view.ws_dev = device_copy(sw);
+    view.as_dev = device_copy(sa);
+    hip_ok(hipMalloc(&view.c, static_cast<size_t>(m_max * n) * 4),
+           "hipMalloc c");
+    void *deq = nullptr;
+    hip_ok(hipMalloc(&deq, static_cast<size_t>(n * k) * 2), "hipMalloc deq");
+    const double t_deq = time_launches(env, [&](int i) {
+      const int64_t total = n * k;
+      hipLaunchKernelGGL(dequant_block_bf16,
+                         dim3(static_cast<uint32_t>((total + 255) / 256)),
+                         dim3(256), 0, env.stream,
+                         static_cast<const uint8_t *>(view.w_fp8[i % copies]),
+                         view.ws_dev, static_cast<uint16_t *>(deq), n, k);
+    });
+    // The dequantize kernel against the host's dequantized weight.
+    std::vector<uint16_t> got_deq(n * k);
+    hip_ok(hipMemcpy(got_deq.data(), deq, got_deq.size() * 2,
+                     hipMemcpyDeviceToHost),
+           "d2h");
+    const bool deq_ok = got_deq == wbf;
+    all_ok = all_ok && deq_ok;
+    std::printf("block shape=%s n=%lld k=%lld dequant_bf16_us=%.2f %s\n",
+                s.name, (long long)n, (long long)k, t_deq,
+                deq_ok ? "bit-exact" : "MISMATCH");
+    for (int64_t m : ms) {
+      // BF16 GEMM on the dequantized weight (the heuristic's first answer).
+      const CandInfo bf16{Cand::Bf16, "bf16", QScale::Scalar, QScale::Scalar};
+      Prepared p;
+      double t_bf16 = std::nan("");
+      if (prepare(env, bf16, view, m, p))
+        t_bf16 = time_algo(env, bf16, view, p, p.algos[0]);
+      std::printf("block shape=%s m=%lld cand=w8a16_bf16_gemm us=%.2f "
+                  "(+ %.2f to dequantize per call)\n",
+                  s.name, (long long)m, t_bf16, t_deq);
+#ifdef TURBINE_QGEMM_EVAL_CK
+      for (const bool prefill : {false, true}) {
+        const char *name = prefill ? "ck_abquant_prefill" : "ck_abquant_decode";
+        auto launch = [&](int i) {
+          return ck_qgemm(CkQuantMode::Block128, prefill, view.a_fp8,
+                          view.w_fp8[i % copies], view.c, view.as_dev,
+                          view.ws_dev, m, n, k, env.stream);
+        };
+        if (launch(0) != 0) {
+          std::printf("block shape=%s m=%lld cand=%s refused\n", s.name,
+                      (long long)m, name);
+          continue;
+        }
+        hip_ok(hipStreamSynchronize(env.stream), "sync");
+        std::vector<uint16_t> got(static_cast<size_t>(m * n));
+        hip_ok(hipMemcpy(got.data(), view.c, got.size() * 2,
+                         hipMemcpyDeviceToHost),
+               "d2h");
+        double max_abs = 0, ref_max = 0;
+        bool ok = true;
+        for (int64_t r : sample_rows(m)) {
+          for (int64_t j = 0; j < n; ++j) {
+            double acc = 0;
+            for (int64_t g = 0; g < kb; ++g) {
+              double part = 0;
+              const int64_t c1 = std::min(k, g * 128 + 128);
+              for (int64_t cc = g * 128; cc < c1; ++cc)
+                part += static_cast<double>(
+                            turbine_hip::fp8_e4m3_value(aq[r * k + cc])) *
+                        turbine_hip::fp8_e4m3_value(wq[j * k + cc]);
+              acc += part * sa[r * kb + g] * sw[(j / 128) * kb + g];
+            }
+            const double err = std::fabs(bf16_value(got[r * n + j]) - acc);
+            max_abs = std::max(max_abs, err);
+            ref_max = std::max(ref_max, std::fabs(acc));
+            if (!(err <= std::fabs(acc) / 256.0 + 1e-6 * (1 + std::fabs(acc))))
+              ok = false;
+          }
+        }
+        const double t = time_launches(env, [&](int i) { (void)launch(i); });
+        all_ok = all_ok && ok;
+        std::printf("block shape=%s m=%lld cand=%s us=%.2f max_abs=%.3e "
+                    "ref_max=%.3e %s\n",
+                    s.name, (long long)m, name, t, max_abs, ref_max,
+                    ok ? "ok" : "MISMATCH");
+      }
+#endif
+    }
+    free_shape(view);
+    (void)hipFree(deq);
+  }
+  return all_ok;
+}
+
+struct ExtRun {
+  QGemmProblem p;
+  hipblaslt_ext::Gemm *gemm = nullptr;
+  ~ExtRun() { delete gemm; }
+};
+
+// Builds and initializes the split-K-off call of algo on the rows x k
+// activations a (scales as: [rows] or [1]) into c (rows x n). With f32 the
+// call is the prefill path of vector scales: scalar scales (as, d.ws_dev read
+// as [1]) and F32 out.
+bool ext_init(const Env &env, const CandInfo &ci, ShapeData &d,
+              hipblasLtMatmulAlgo_t algo, const uint8_t *a, const float *as,
+              int64_t rows, void *c, size_t w, bool f32, ExtRun &r) {
+  const QGemmShape s{rows,
+                     d.n,
+                     d.k,
+                     d.k,
+                     d.n,
+                     f32 ? TURBINE_DTYPE_F32 : TURBINE_DTYPE_BF16,
+                     f32 ? QScale::Scalar : ci.w,
+                     f32 ? QScale::Scalar : ci.a};
+  if (r.p.make(s) != HIPBLAS_STATUS_SUCCESS)
+    return false;
+  if (r.p.set_scales(d.ws_dev, as) != HIPBLAS_STATUS_SUCCESS)
+    return false;
+  static const float alpha = 1.0f, beta = 0.0f;
+  try {
+    r.gemm = new hipblaslt_ext::Gemm(
+        env.lt, r.p.desc.handle, &alpha, d.w_fp8[w], r.p.weight.handle, a,
+        r.p.act.handle, &beta, c, r.p.out.handle, c, r.p.out.handle);
+    hipblaslt_ext::GemmTuning tuning;
+    tuning.setSplitK(1);
+    r.gemm->setMaxWorkspaceBytes(kWorkspaceBytes);
+    size_t ws = 0;
+    if (r.gemm->isAlgoSupported(algo, tuning, ws) != HIPBLAS_STATUS_SUCCESS ||
+        ws > kWorkspaceBytes)
+      return false;
+    return r.gemm->initialize(algo, tuning, env.workspace, false, env.stream) ==
+           HIPBLAS_STATUS_SUCCESS;
+  } catch (const std::exception &) {
+    return false;
+  }
+}
+
+// Rows [first, first + rows) of d's activations as their own call (raw
+// output bytes): the rows and their scales are copied into fresh (aligned)
+// buffers, as a prefill of a prompt's suffix has them.
+bool ext_rows(const Env &env, const CandInfo &ci, ShapeData &d,
+              hipblasLtMatmulAlgo_t algo, int64_t first, int64_t rows, bool f32,
+              std::vector<uint8_t> &out) {
+  uint8_t *a = nullptr;
+  float *as = nullptr;
+  hip_ok(hipMalloc(&a, static_cast<size_t>(rows * d.k)), "hipMalloc a");
+  hip_ok(hipMalloc(&as, static_cast<size_t>(rows) * sizeof(float)),
+         "hipMalloc as");
+  hip_ok(hipMemcpy(a, d.a_fp8 + first * d.k, static_cast<size_t>(rows * d.k),
+                   hipMemcpyDeviceToDevice),
+         "d2d a");
+  const bool vec = !f32 && ci.a == QScale::Vector;
+  hip_ok(hipMemcpy(as, d.as_dev + (vec ? first : 0),
+                   static_cast<size_t>(vec ? rows : 1) * sizeof(float),
+                   hipMemcpyDeviceToDevice),
+         "d2d as");
+  bool ok = false;
+  {
+    ExtRun r;
+    if (ext_init(env, ci, d, algo, a, as, rows, d.c, 0, f32, r) &&
+        r.gemm->run(env.stream) == HIPBLAS_STATUS_SUCCESS) {
+      hip_ok(hipStreamSynchronize(env.stream), "sync");
+      out.resize(static_cast<size_t>(rows * d.n) * (f32 ? 4 : 2));
+      hip_ok(hipMemcpy(out.data(), d.c, out.size(), hipMemcpyDeviceToHost),
+             "d2h");
+      ok = true;
+    }
+  }
+  (void)hipFree(a);
+  (void)hipFree(as);
+  return ok;
+}
+
+double ext_time(const Env &env, const CandInfo &ci, ShapeData &d,
+                hipblasLtMatmulAlgo_t algo, int64_t m, bool f32) {
+  std::vector<ExtRun> runs(d.w_fp8.size());
+  for (size_t w = 0; w < runs.size(); ++w)
+    if (!ext_init(env, ci, d, algo, d.a_fp8, d.as_dev, m, d.c, w, f32, runs[w]))
+      return std::nan("");
+  return time_launches(env, [&](int i) {
+    (void)runs[static_cast<size_t>(i) % runs.size()].gemm->run(env.stream);
+  });
+}
+
+// --tune-prefill 1: for each shape and FP8 scale layout, the prefill solution
+// of the pinned table (a row with m_max 0). Scalar scales: hipBLASLt's
+// e4m3 x e4m3 -> BF16 SAB solutions; vector scales: SAB solutions with F32
+// out whose sums the own epilogue (src/qgemm_epilogue.hpp) scales per row and
+// column (gfx1201 has no row-invariant OUTER_VEC solution). Every solution
+// that takes the m = 2048 problem with split-K off, fastest first (m = 2048
+// time + 4 x the m = 512 time), the first one whose rows are bitwise
+// independent of the call (rows of a 513-row call equal the same rows computed
+// as their own calls of 1, 7 and 128 rows from row 0, 213 rows from row 300 and
+// 64 rows from row 1, in fresh buffers: what a prefix-reused prefill of a
+// prompt's suffix needs) and that matches the reference:
+//   qgemm_tune n k scale 0 index name us_2048 us_512 invariant (...)
+// (vector rows' times include the epilogue).
+bool tune_prefill(Env &env, Rng &rng, const std::vector<std::string> &shapes) {
+  bool all_ok = true;
+  std::vector<hipblasLtMatmulHeuristicResult_t> all;
+  if (hipblaslt_ext::getAllAlgos(
+          env.lt, hipblaslt_ext::GemmType::HIPBLASLT_GEMM, HIPBLAS_OP_T,
+          HIPBLAS_OP_N, HIP_R_8F_E4M3, HIP_R_8F_E4M3, HIP_R_16BF, HIP_R_16BF,
+          HIPBLAS_COMPUTE_32F, all) != HIPBLAS_STATUS_SUCCESS) {
+    std::fprintf(stderr, "qgemm_eval: getAllAlgos (FP8) failed\n");
+    return false;
+  }
+  std::vector<hipblasLtMatmulHeuristicResult_t> all_f32;
+  (void)hipblaslt_ext::getAllAlgos(
+      env.lt, hipblaslt_ext::GemmType::HIPBLASLT_GEMM, HIPBLAS_OP_T,
+      HIPBLAS_OP_N, HIP_R_8F_E4M3, HIP_R_8F_E4M3, HIP_R_32F, HIP_R_32F,
+      HIPBLAS_COMPUTE_32F, all_f32);
+  std::printf("# %zu FP8 BF16-out and %zu F32-out solutions listed\n",
+              all.size(), all_f32.size());
+  const int64_t m_full = 513;
+  const std::pair<int64_t, int64_t> parts[] = {
+      {0, 1}, {0, 7}, {0, 128}, {300, 213}, {1, 64}};
+  for (const LinearShape &s : kShapes) {
+    if (std::find(shapes.begin(), shapes.end(), s.name) == shapes.end())
+      continue;
+    ShapeData d = make_shape(s, 2048, rng);
+    // The epilogue's cost for vector scales at m = 2048 and 512.
+    double epi[2] = {0, 0};
+    {
+      void *out = nullptr;
+      hip_ok(hipMalloc(&out, static_cast<size_t>(2048 * d.n) * 2),
+             "hipMalloc epilogue out");
+      const int64_t ms[2] = {2048, 512};
+      for (int i = 0; i < 2; ++i) {
+        epi[i] = time_launches(env, [&](int) {
+          (void)turbine_hip::launch_qgemm_scale_epilogue(
+              static_cast<const float *>(d.c), d.n, out, d.n, d.as_dev, true,
+              d.ws_dev, true, 1.0f, ms[i], d.n, env.stream);
+        });
+      }
+      (void)hipFree(out);
+    }
+    for (const CandInfo &ci : kCands) {
+      if (ci.cand != Cand::Sab && ci.cand != Cand::Sabv)
+        continue;
+      const bool f32 = ci.cand == Cand::Sabv;
+      const auto &list = f32 ? all_f32 : all;
+      struct Timed {
+        double us, us2048, us512;
+        size_t i;
+      };
+      std::vector<Timed> timed;
+      for (size_t i = 0; i < list.size(); ++i) {
+        const double t2048 = ext_time(env, ci, d, list[i].algo, 2048, f32);
+        if (std::isnan(t2048))
+          continue;
+        const double t512 = ext_time(env, ci, d, list[i].algo, 512, f32);
+        if (std::isnan(t512))
+          continue;
+        const double e2048 = f32 ? epi[0] : 0.0, e512 = f32 ? epi[1] : 0.0;
+        timed.push_back(
+            {t2048 + e2048 + 4 * (t512 + e512), t2048 + e2048, t512 + e512, i});
+      }
+      std::sort(timed.begin(), timed.end(),
+                [](const Timed &a, const Timed &b) { return a.us < b.us; });
+      bool found = false;
+      int rejected = 0;
+      for (const Timed &t : timed) {
+        const hipblasLtMatmulAlgo_t algo = list[t.i].algo;
+        std::vector<uint8_t> whole;
+        if (!ext_rows(env, ci, d, algo, 0, m_full, f32, whole))
+          continue;
+        const size_t row_bytes = static_cast<size_t>(d.n) * (f32 ? 4 : 2);
+        bool invariant = true;
+        for (const auto &[first, rows] : parts) {
+          std::vector<uint8_t> part;
+          if (!ext_rows(env, ci, d, algo, first, rows, f32, part) ||
+              !std::equal(part.begin(), part.end(),
+                          whole.begin() + first * row_bytes)) {
+            invariant = false;
+            break;
+          }
+        }
+        if (!invariant) {
+          ++rejected;
+          continue;
+        }
+        // Reference: the sums (F32 out, unit-scale semantics: ws[0], as[0])
+        // or the scaled BF16 values.
+        bool ok = true;
+        if (f32) {
+          std::vector<double> av(d.k);
+          for (int64_t r : sample_rows(m_full)) {
+            for (int64_t c = 0; c < d.k; ++c)
+              av[c] = turbine_hip::fp8_e4m3_value(d.aq[r * d.k + c]);
+            for (int64_t j = 0; j < d.n; ++j) {
+              double acc = 0;
+              for (int64_t c = 0; c < d.k; ++c)
+                acc += av[c] * turbine_hip::fp8_e4m3_value(d.wq[j * d.k + c]);
+              const double ref = acc * d.ws[0] * d.as[0];
+              float got;
+              std::memcpy(&got, &whole[(r * d.n + j) * 4], 4);
+              if (std::fabs(got - ref) > 1e-5 * (1 + std::fabs(ref)))
+                ok = false;
+            }
+          }
+        } else {
+          std::vector<uint16_t> row0;
+          (void)ext_rows(env, ci, d, algo, 0, m_full, false, whole);
+          ok = check(ci, d, m_full, row0).ok;
+        }
+        if (!ok) {
+          ++rejected;
+          continue;
+        }
+        hipblasLtMatmulAlgo_t a = algo;
+        std::printf("qgemm_tune %lld %lld %s 0 %d %s %.2f %.2f invariant "
+                    "(%s, %d faster solutions rejected, %zu timed)\n",
+                    (long long)s.n, (long long)s.k,
+                    ci.w == QScale::Vector ? "vector" : "scalar",
+                    hipblaslt_ext::getIndexFromAlgo(a),
+                    hipblaslt_ext::getSolutionNameFromAlgo(env.lt, a).c_str(),
+                    t.us2048, t.us512, f32 ? "SAB F32 + epilogue" : "SAB BF16",
+                    rejected, timed.size());
+        std::fflush(stdout);
+        found = true;
+        break;
+      }
+      if (!found) {
+        std::printf("qgemm_tune %lld %lld %s 0: no row-invariant solution "
+                    "(%zu timed)\n",
+                    (long long)s.n, (long long)s.k,
+                    ci.w == QScale::Vector ? "vector" : "scalar", timed.size());
+        all_ok = false;
+      }
+    }
+    free_shape(d);
+  }
+  return all_ok;
+}
+
 std::vector<std::string> split(const std::string &s) {
   std::vector<std::string> out;
   size_t start = 0;
@@ -522,6 +1027,9 @@ std::vector<std::string> split(const std::string &s) {
 int main(int argc, char **argv) {
   std::vector<int64_t> ms{1, 16, 128, 2048};
   std::vector<std::string> shapes{"qkv", "o", "gate_up", "down"};
+  bool tune_mode = false;
+  bool block_mode = false;
+  bool tune_prefill_mode = false;
   Env env{};
   env.iters = 20;
   env.rounds = 5;
@@ -537,10 +1045,17 @@ int main(int argc, char **argv) {
       env.rounds = std::stoi(value);
     } else if (flag == "--shapes") {
       shapes = split(value);
+    } else if (flag == "--tune") {
+      tune_mode = value == "1";
+    } else if (flag == "--block") {
+      block_mode = value == "1";
+    } else if (flag == "--tune-prefill") {
+      tune_prefill_mode = value == "1";
     } else {
       std::fprintf(stderr,
                    "usage: %s [--ms a,b] [--iters n] [--rounds n] "
-                   "[--shapes qkv,o,gate_up,down]\n",
+                   "[--shapes qkv,o,gate_up,down] [--tune 1] [--tune-prefill "
+                   "1] [--block 1]\n",
                    argv[0]);
       return 2;
     }
@@ -560,8 +1075,23 @@ int main(int argc, char **argv) {
   hip_ok(hipEventCreate(&env.e1), "hipEventCreate");
   std::printf("# device %s (%s), hipBLASLt %d, iters %d x rounds %d\n",
               prop.name, prop.gcnArchName, version, env.iters, env.rounds);
-  bool all_ok = true;
   Rng rng{7};
+  if (tune_prefill_mode) {
+    const bool ok = tune_prefill(env, rng, shapes);
+    std::printf("qgemm_eval: tune-prefill %s\n", ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
+  }
+  if (block_mode) {
+    const bool ok = eval_block(env, rng, shapes, ms);
+    std::printf("qgemm_eval: block %s\n", ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
+  }
+  if (tune_mode) {
+    const bool ok = tune(env, rng, shapes);
+    std::printf("qgemm_eval: tune %s\n", ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
+  }
+  bool all_ok = true;
   for (const LinearShape &s : kShapes) {
     if (std::find(shapes.begin(), shapes.end(), s.name) == shapes.end())
       continue;
