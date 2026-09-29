@@ -27,6 +27,12 @@
 //!   answer, promotions from L2, no checksum eviction (every promoted block's CRC32C matched the
 //!   value written), and at most 64 GiB of slab files under the path.
 //!
+//! - `prefix_reuse_matches_cold_fp8_kv`, `nvme_round_trip_matches_cold_fp8_kv` (Phase 6a S-14):
+//!   the same two checks at `kv.dtype: fp8_e4m3` — FP8 pages are copied through L1/L2 as their
+//!   bytes, so a warm or round-tripped prefix answers exactly like the cold FP8 run — plus the
+//!   FP8 L0 pool itself: F8E4M3 pages of half the bytes and at least 1.95× the BF16 run's blocks
+//!   in the same budget.
+//!
 //! Answers are compared by their text and completion token count: greedy decoding of the same
 //! token ids gives the same text, and any KV difference shows up within 64 tokens as a
 //! different continuation (the Phase 1 golden run showed a single BF16 rounding flip changes
@@ -49,6 +55,8 @@ const POLL: Duration = Duration::from_millis(200);
 /// The lab NVMe tier and its cap (P4 Constraints).
 const KV_DIR: &str = "/home/piwi/turbine-kv";
 const KV_CAP_BYTES: u64 = 64 << 30;
+/// How long the NVMe round trip retries a prefetch refused for L0 pressure.
+const PREFETCH_WAIT: Duration = Duration::from_secs(60);
 /// Greedy tokens per answer.
 const ANSWER_TOKENS: u32 = 64;
 
@@ -463,6 +471,54 @@ fn prefix_reuse_matches_cold_with(sets: &[String]) {
     println!("prefix_reuse_matches_cold ok");
 }
 
+/// The FP8 KV overrides (Phase 6a S-13).
+fn fp8_kv_sets() -> Vec<String> {
+    vec!["kv.dtype=fp8_e4m3".to_string()]
+}
+
+/// The L0 tier of `GET /turbine/v1/kv`: (page dtype, block bytes, total blocks).
+fn l0_tier(server: &LabServer) -> (String, u64, u64) {
+    let (status, text) = request(server.addr, "GET", "/turbine/v1/kv", None);
+    assert_eq!(status, 200, "{text}");
+    let v: Value = serde_json::from_str(&text).expect("KV document JSON");
+    let l0 = v["tiers"]
+        .as_array()
+        .and_then(|t| t.iter().find(|t| t["tier"] == "l0"))
+        .unwrap_or_else(|| panic!("no l0 tier: {text}"));
+    (
+        l0["dtype"].as_str().unwrap_or_default().to_string(),
+        l0["block_bytes"].as_u64().unwrap_or(0),
+        l0["blocks_total"].as_u64().unwrap_or(0),
+    )
+}
+
+/// Phase 6a S-13 / S-14: at `kv.dtype: fp8_e4m3` the L0 pool is F8E4M3 with half the block
+/// bytes and at least 1.95× the blocks of the BF16 run (same budget), and prefix reuse gives the
+/// cold FP8 answers exactly (see [`prefix_reuse_matches_cold`]). Breaks if the FP8 pool is not
+/// smaller per block, or a reused FP8 prefix differs from recomputing it.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn prefix_reuse_matches_cold_fp8_kv() {
+    if !require_backend("hip") {
+        return;
+    }
+    {
+        let _gpu = one_server_at_a_time();
+        let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+        let bf16 = l0_tier(&LabServer::start(&model_dir, &[]));
+        let fp8 = l0_tier(&LabServer::start(&model_dir, &fp8_kv_sets()));
+        let ratio = fp8.2 as f64 / bf16.2 as f64;
+        println!("L0 bf16 {bf16:?} fp8 {fp8:?}: {ratio:.3}x the blocks");
+        assert_eq!((bf16.0.as_str(), fp8.0.as_str()), ("bf16", "f8e4m3"));
+        assert_eq!(2 * fp8.1, bf16.1, "FP8 halves a block");
+        assert!(
+            ratio >= 1.95,
+            "FP8 KV holds only {ratio:.3}x the BF16 blocks"
+        );
+    }
+    prefix_reuse_matches_cold_with(&fp8_kv_sets());
+}
+
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn prefix_reuse_suffix_lengths_match_cold() {
@@ -564,34 +620,50 @@ fn nvme_round_trip_matches_cold() {
     if !require_backend("hip") {
         return;
     }
+    nvme_round_trip_matches_cold_with(&[]);
+}
+
+/// [`nvme_round_trip_matches_cold`] at `kv.dtype: fp8_e4m3` (Phase 6a S-14): the FP8 pages go to
+/// L2 and back as their bytes (checksummed), so A answers exactly as its cold FP8 run.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so, the Llama-3.2-3B weights and /home/piwi/turbine-kv"]
+fn nvme_round_trip_matches_cold_fp8_kv() {
+    if !require_backend("hip") {
+        return;
+    }
+    nvme_round_trip_matches_cold_with(&fp8_kv_sets());
+}
+
+/// [`nvme_round_trip_matches_cold`] on a server started with the extra overrides `sets`.
+fn nvme_round_trip_matches_cold_with(sets: &[String]) {
     let _gpu = one_server_at_a_time();
     let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
     let kv_dir = Path::new(KV_DIR);
     assert!(kv_dir.is_dir(), "{KV_DIR} is not mounted");
-    let server = LabServer::start(
-        &model_dir,
-        &[
-            format!("kv.nvme.path={KV_DIR}"),
-            "kv.nvme.max_bytes=64GiB".into(),
-            // L0 stays the lab config's 8 GiB: a smaller cap shrinks Phase 3's device budget
-            // below what the HIP runtime and libraries already hold, and the device_memory
-            // signal would put the server in SURVIVAL. Cached blocks are demoted by capacity
-            // past 70 % of L0, so filler prompts still push A down through a 1 GiB L1.
-            "kv.cpu.max_bytes=1GiB".into(),
-        ],
-    );
+    let tiers = [
+        format!("kv.nvme.path={KV_DIR}"),
+        "kv.nvme.max_bytes=64GiB".into(),
+        // L0 stays the lab config's 8 GiB: a smaller cap shrinks Phase 3's device budget
+        // below what the HIP runtime and libraries already hold, and the device_memory
+        // signal would put the server in SURVIVAL. Cached blocks are demoted by capacity
+        // past 70 % of L0, so filler prompts still push A down through a 1 GiB L1.
+        "kv.cpu.max_bytes=1GiB".into(),
+    ];
+    let server = LabServer::start(&model_dir, &[&tiers[..], sets].concat());
+    // 1 GiB of L1 holds this many blocks (73 BF16 Llama blocks of 14,680,064 bytes, 146 FP8).
+    let (_, block_bytes, _) = l0_tier(&server);
+    let l1_blocks = ((1u64 << 30) / block_bytes.max(1)) as f64;
     let a = prompt(100, 350);
     // A and the fillers are session turns: blocks of one-off requests are never copied down.
     let cold = server.complete_in(&a, ANSWER_TOKENS, Some("a"));
 
-    // 1 GiB of L1 holds 73 blocks of 14,680,064 bytes: once twice that many have gone on to L2,
-    // A's (the oldest, never touched again) are there.
+    // Once twice L1's blocks have gone on to L2, A's (the oldest, never touched again) are there.
     let to_l2 = || {
         server.metric(r#"turbine_kv_demotions_total{from="l1",to="l2"}"#)
             + server.metric(r#"turbine_kv_demotions_total{from="l0",to="l2"}"#)
     };
     let mut filler = 0;
-    while to_l2() < 2.0 * 73.0 {
+    while to_l2() < 2.0 * l1_blocks {
         filler += 1;
         assert!(
             filler <= 400,
@@ -611,7 +683,17 @@ fn nvme_round_trip_matches_cold() {
             + server.metric(r#"turbine_kv_promotions_total{from="l2",to="l1"}"#)
     };
     let body = json!({ "prompt": a }).to_string();
-    let (status, text) = request(server.addr, "POST", "/turbine/v1/kv/prefetch", Some(&body));
+    // The fillers leave L0 near its demotion threshold: a prefetch is refused (409
+    // `pressure_too_high`) while L0 pressure is ORANGE or above, until the demotions in flight
+    // complete, so it is retried for a bounded time.
+    let asked = Instant::now();
+    let (status, text) = loop {
+        let (status, text) = request(server.addr, "POST", "/turbine/v1/kv/prefetch", Some(&body));
+        if status != 409 || !text.contains("pressure_too_high") || asked.elapsed() > PREFETCH_WAIT {
+            break (status, text);
+        }
+        std::thread::sleep(POLL);
+    };
     assert_eq!(status, 202, "{text}");
     println!("prefetch of A: {text}");
     let started = Instant::now();
@@ -655,4 +737,30 @@ fn phase4_lab_config_loads() {
     let p = prompt(1, 350);
     assert!(p.split_whitespace().count() > 350);
     assert_ne!(prompt(1, 20)[..20], prompt(2, 20)[..20]);
+}
+
+/// The FP8 KV proof configs (plan Task 24) load and differ from their Phase 2c BF16 KV
+/// comparison only in `kv.dtype`.
+#[test]
+fn phase6_fp8kv_lab_configs_load() {
+    use turbine_core::config::KvDtypeChoice;
+    for model in ["llama", "olmoe"] {
+        let lab = repo_root().join("scripts/lab");
+        let fp8 = turbine_core::config::load(
+            &lab.join(format!("phase6-novanas-{model}-fp8kv.yaml")),
+            &[],
+        )
+        .expect("the FP8 KV config loads");
+        let bf16 =
+            turbine_core::config::load(&lab.join(format!("phase2c-novanas-{model}.yaml")), &[])
+                .expect("the Phase 2c config loads");
+        assert_eq!(fp8.kv.dtype, KvDtypeChoice::Fp8E4m3, "{model}");
+        assert_eq!(bf16.kv.dtype, KvDtypeChoice::Bf16, "{model}");
+        assert_eq!(fp8.model.path, bf16.model.path, "{model}");
+        assert_eq!(
+            fp8.scheduler.max_batch_tokens, bf16.scheduler.max_batch_tokens,
+            "{model}"
+        );
+        assert_eq!(fp8.kv.gpu.max_bytes, bf16.kv.gpu.max_bytes, "{model}");
+    }
 }

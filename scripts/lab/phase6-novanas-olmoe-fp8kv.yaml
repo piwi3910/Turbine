@@ -1,0 +1,35 @@
+# turbine-server configuration for the Phase 6a FP8 KV proof on novanas (plan Task 24):
+#   scripts/lab-bench.sh --model olmoe-fp8kv --golden16
+#   scripts/lab-serve.sh novanas scripts/lab/phase6-novanas-olmoe-fp8kv.yaml
+# scripts/lab/phase2c-novanas-olmoe.yaml (the BF16 KV comparison) with kv.dtype: fp8_e4m3: FP8 e4m3
+# L0 pages with per-layer scales (1.0: the checkpoint stores none), twice the blocks in the same
+# budget. Golden against tests/golden/<slug>-fp8kv/ (FP8 KV emulated in transformers).
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/olmoe-1b-7b-0125-instruct
+  served_name: allenai/OLMoE-1B-7B-0125-Instruct
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: false
+kv:
+  block_tokens: 128
+  dtype: fp8_e4m3
+  gpu:
+    max_bytes: 8GiB
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    # The Phase 2 scheduler.queue_timeout (CONFLICT C-1).
+    queue_timeout: 60s

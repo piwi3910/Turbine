@@ -4,9 +4,11 @@
 //! dynamic `per_group` 32 input tensors (`round_method: half_even`, `scale_calculation_mode:
 //! even`) it is `mxfp4_a4` and activations are quantize-dequantized to MXFP4 before each layer
 //! (`ActivationQuant::Mxfp4Emulated`, user decision 2026-09-28, Q6). Per-layer overrides
-//! (`layer_quant_config`, `layer_type_quant_config`), output or KV quantization are refused;
+//! (`layer_quant_config`, `layer_type_quant_config`) and output quantization are refused;
 //! `exclude` names modules left in BF16 (globs). A `kv_cache_quant_config` is ignored with a WARN
-//! (`kv_cache_quant_ignored`): the KV cache follows `kv.dtype`. GPTQ calibration with `desc_act` needs
+//! (`kv_cache_quant_ignored`): the KV cache follows `kv.dtype`; so are the `layer_quant_config`
+//! entries that repeat it for the K/V projections (same weight and input spec as the global one),
+//! and their `output_scale` tensors load as unexpected. GPTQ calibration with `desc_act` needs
 //! `static_groups` (the weights stay in order). Tensors: `X.weight` U8 `[n, k/2]`,
 //! `X.weight_scale` U8 `[n, k/32]` ([`super::mxfp4`]).
 
@@ -107,10 +109,37 @@ impl Mxfp4Packaging for QuarkMxfp4 {
                 ));
             }
         }
-        for field in ["layer_quant_config", "layer_type_quant_config"] {
-            if !empty(q.get(field)) {
-                return Err(scheme_unsupported(field, q[field].to_string(), "empty"));
+        if !empty(q.get("layer_type_quant_config")) {
+            return Err(scheme_unsupported(
+                "layer_type_quant_config",
+                q["layer_type_quant_config"].to_string(),
+                "empty",
+            ));
+        }
+        // Quark exports its KV recipe twice: in `kv_cache_quant_config` and as per-layer
+        // overrides of the K/V projections that differ from the global spec only in
+        // `output_tensors`. Such an override is part of the ignored KV recipe; any other one
+        // changes the layer's weight or activation scheme and is refused.
+        if let Some(layers) = q.get("layer_quant_config").and_then(Value::as_object) {
+            for (pattern, spec) in layers {
+                let kv_mirror = q["kv_cache_quant_config"].get(pattern) == Some(spec)
+                    && spec["weight"] == global["weight"]
+                    && spec["input_tensors"] == global["input_tensors"]
+                    && empty(spec.get("bias"));
+                if !kv_mirror {
+                    return Err(scheme_unsupported(
+                        &format!("layer_quant_config.{pattern}"),
+                        spec.to_string(),
+                        "only the K/V projections' kv_cache_quant_config entries",
+                    ));
+                }
             }
+        } else if !empty(q.get("layer_quant_config")) {
+            return Err(scheme_unsupported(
+                "layer_quant_config",
+                q["layer_quant_config"].to_string(),
+                "empty",
+            ));
         }
         // A quantized KV cache in the checkpoint's recipe (e.g. fp4 K/V projection outputs) is
         // not applied: the KV stays at the configured `kv.dtype` (user decision 2026-09-29).
