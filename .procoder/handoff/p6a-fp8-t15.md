@@ -54,3 +54,37 @@ next agent's.
 Fixture (`--act-quant none`), golden c1/c16, `lab-bench --model llama-fp8-block`, eval, soak, row flip,
 decisions/perf-log entries — plan Task 15 steps 4–6. The untracked golden/config files are in the old
 worktree `agent-adb021480bf19bfbe`.
+
+## Proof agent (2026-09-29, lead rotation 5)
+
+Merged `phase-6a-quantization` (a0ba309). Added `scripts/lab/phase6-novanas-llama-fp8-block.yaml` (the
+lab-bench config for `--model llama-fp8-block`; copy of the phase2c Llama config). The Mac-side
+`t15_serve.sh` (killed in the ssh outage) is replaced by one novanas-side detached driver that does
+the served-bytes check, the GSM8K-200 eval and the bench in one serve, then the vLLM baseline:
+
+- Script: `novanas:/home/piwi/turbine-ci/remote/agent-a4baec4689b995379/t15p/t15_proof_run.sh`
+  (Mac copy: session scratchpad `scratchpad/t15p/t15_proof_run.sh`), started 2026-09-29 09:24Z, pid 112710.
+  Builds `kbuild/libturbine_hip.so` (nice 19, cores 12-15), then pass A (Turbine, native, GPU 0) and
+  pass B (vLLM k3s Job, port 18100), each under port18000.lock → bench.gate → bench.lock, fixtures
+  paused. Queued behind the full-GSM8K FP8 KV requeue.
+- Log: `…/t15p/t15_proof_run.log`, last line `t15-proof: done rc=<rc> turbine=<rc> vllm=<rc>`, with
+  two `SUMMARY` lines (tok/s, TTFT/ITL p50, c1 ITL p50, GSM8K). Outputs in `…/t15p/`:
+  `load_events.txt`, `server.log`, `status.json`, `turbine-quality.json`, `eval-compare.txt`,
+  `turbine-bench{,-c1}.json`, `vllm-bench{,-c1}.json`, `vllm-quality.json`, `vllm-pod.log`.
+
+How to judge:
+
+1. `load_events.txt`: the `weight_format` event's `weight_bytes` = **3,607,615,488** exactly, every
+   decoder linear FP8 (`fp8_block_128x128`), lm_head/embedding BF16, `activation=none`, and **no**
+   `fp8_block_decoded` line. ~6.4 GB or a decoded line = the kernel refused a 3B shape: a bug in the
+   lead-owned loader/registry → `handoff(<file>)` commit before the proof counts.
+2. `eval-compare.txt`: exit 0 against `tests/eval/llama-3.2-3b-instruct/turbine-bf16.json` (0.805)
+   with max drop 0.02 (Q9). Copy `turbine-quality.json` to
+   `tests/eval/llama-3.2-3b-instruct-fp8-block/turbine.json` and `vllm-quality.json` to `vllm.json`.
+3. Bench: c16 tok/s ≥ 1.0 × BF16 (854.7, perf-log phase-start baseline); Turbine ≥ 0.9 × vLLM where
+   vLLM serves it. vLLM ran as a k3s Job (the GPU is k3s's pick, maybe GPU 1: its numbers are
+   indicative only if the pod landed on GPU 1). No BF16 c1 in this run.
+4. Still open after it: the golden fixture (`--act-quant none`, rank 4 in
+   `/home/piwi/turbine-ci/fixture.queue`), then `lab-bench --model llama-fp8-block --golden16 --c1`
+   (Mac-driven, background), tolerance from the self-spread, labbook, soak (ask the lead), row flip
+   as a `handoff(support.rs)` commit, perf-log row.
