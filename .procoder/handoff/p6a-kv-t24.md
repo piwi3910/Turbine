@@ -23,17 +23,31 @@ Written 2026-09-29 by the Task 24 wrap-up builder. Branch `p6a-kv-t24` (rebuilt 
   `phase-6a-quantization`) makes the full 1,319-item GSM8K the actual gate for Llama FP8 KV (and
   MXFP4-A16). Keep these 200-item numbers as a record only.
 
-## Not done — full GSM8K gate
+## Not done — full GSM8K gate (Llama AND OLMoE)
 
 `tests/eval/gsm8k-full.jsonl` is being written by another builder on branch `p6a-gsm8k-full`; as of
 now that branch's tip is only the decisions-doc commit (4f45232, same as this branch) — the dataset
 commit hasn't landed. Next agent: `git log p6a-gsm8k-full`, merge/cherry-pick once it's there, then
-serve+eval BF16 (`scripts/lab/phase2c-novanas-llama.yaml`) and FP8 KV
-(`scripts/lab/phase6-novanas-llama-fp8kv.yaml`) one after the other (never in parallel — one GPU job
-at a time on novanas), each `turbine-golden eval --tasks tests/eval/gsm8k-full.jsonl` with a ~6h
-timeout, following the `scratchpad/evals.sh` pattern (port18000 lock + fixture-pause). Output to
-`tests/eval/llama-3.2-3b-instruct/turbine-{bf16,fp8_e4m3}-full.json`, then `eval-compare --max-drop
-0.01`, then commit.
+
+**Coordinator addendum (2026-09-29, `.procoder/ask/decisions.md` commit 185ccee on this branch):**
+OLMoE's FP8 KV drop on GSM8K-200 (0.655 → 0.615, 0.040) is larger than Llama's and was found by
+this wrap-up — the full-GSM8K decision now covers OLMoE too, not just Llama. Run **both models**:
+
+1. Serve+eval BF16 (`scripts/lab/phase2c-novanas-llama.yaml`, then
+   `scripts/lab/phase2c-novanas-olmoe.yaml`) and FP8 KV (`scripts/lab/phase6-novanas-llama-fp8kv.yaml`,
+   then `scripts/lab/phase6-novanas-olmoe-fp8kv.yaml`) — four serve+eval runs total, one after another
+   (never in parallel — one GPU job at a time on novanas), each `turbine-golden eval --tasks
+tests/eval/gsm8k-full.jsonl` with a ~6h timeout, following the `scratchpad/evals.sh` pattern
+   (port18000 lock + fixture-pause).
+2. Output to `tests/eval/llama-3.2-3b-instruct/turbine-{bf16,fp8_e4m3}-full.json` and
+   `tests/eval/olmoe-1b-7b-0125-instruct/turbine-{bf16,fp8_e4m3}-full.json`, then `eval-compare
+--max-drop 0.01` for each model, then commit.
+3. If OLMoE still misses ≤ 0.01 on the full set: do not just accept it. Compare Turbine against the
+   emulated-FP8-KV transformers reference (`quant_reference.py --kv-quant fp8_e4m3` /
+   `self_spread.py --kv-quant fp8_e4m3`, already used for the golden fixtures) and check the
+   per-layer KV scales specifically — OLMoE's scales are per layer (unlike Llama's), so a scale
+   plumbing bug is a real candidate. Report the finding to the coordinator before any support-status
+   change; don't decide it yourself.
 
 ## Fixture job re-queued (golden fixtures lost to the crash)
 
