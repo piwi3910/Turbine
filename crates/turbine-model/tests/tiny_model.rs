@@ -1066,13 +1066,9 @@ fn quantized_matches_dequantized_bf16() {
         naive.act_quant = mode;
         naive.input_scales = input_scales(&fixture.quantized.dir);
         let reqs = executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default());
-        // Block-scaled FP8 is decoded to BF16 at load: no quantized GEMM.
-        let decoded =
-            cfg.weight_format.get().column() == turbine_core::support::WeightFormatColumn::Fp8Block;
-        assert_eq!(
+        assert!(
             reqs.iter().any(|r| matches!(r.spec, OpConfig::QGemm(_))),
-            !decoded,
-            "{name}: qgemm in the requirements"
+            "{name}: no qgemm in the requirements"
         );
         // Fused projections run one qgemm per stack; unfused, one per part over row slices of
         // the data and its scales.
@@ -1132,6 +1128,148 @@ fn quantized_matches_dequantized_bf16() {
             }
         }
     }
+}
+
+/// Phase 6a S-8 (user decision 2026-09-29, "Write own kernel in 6a"): a block-scaled FP8
+/// checkpoint keeps its layers FP8 on the device, and only a layer no provider runs falls back
+/// to its BF16 decode at load (`WeightFormat::for_kernels`, logged `fp8_block_decoded`), a
+/// fused stack's parts together. Here the kernels refuse the fused gate/up shape: every stack
+/// with a part or whole of that shape (gate/up, and any stack sharing it) loads as BF16 while
+/// the others stay e4m3 with their block scales, the
+/// weight bytes grow by exactly the decoded layers, and the model on the CPU provider still
+/// equals its dequantized BF16 twin bit for bit (weight-only). Breaks if the fallback splits a
+/// stack, leaves a refused layer in FP8, decodes one wrongly, or decodes a served layer.
+#[test]
+fn fp8_block_decode_fallback_per_stack() {
+    let tmp = TempDir::new("tiny-model-fp8-block-fallback");
+    let q = serde_json::json!({"quant_method": "fp8", "activation_scheme": "dynamic",
+                               "weight_block_size": [128, 128]});
+    let fixture = write_tiny_quantized(tmp.path(), SEED, &q, 128, 128);
+    let cfg = &fixture.quantized.config;
+    let format = cfg.weight_format.get();
+    let slots = cfg.family.0.weight_slots(cfg);
+    let is_gate_up = |name: &str| name.contains("mlp.gate_proj") || name.contains("mlp.up_proj");
+    let stack = slots
+        .iter()
+        .find(|s| is_gate_up(&s.name))
+        .and_then(|s| s.stack.clone())
+        .expect("a fused gate/up stack");
+    let refused = (stack.shape[0] as u32, stack.shape[1] as u32);
+    // A quantized layer's stack (or itself) and whether its own or its stack's [n, k] is the
+    // refused one: a stack with any such part is decoded whole.
+    let quantized: Vec<_> = slots
+        .iter()
+        .filter(|s| {
+            s.shape.len() == 2
+                && s.name != turbine_model::loader::LM_HEAD
+                && !s.name.ends_with("embed_tokens.weight")
+        })
+        .collect();
+    let key =
+        |s: &turbine_model::WeightSlot| s.stack.as_ref().map_or(s.name.clone(), |p| p.name.clone());
+    let hits = |s: &turbine_model::WeightSlot| {
+        let whole = s.stack.as_ref().map_or(s.shape[0], |p| p.shape[0]);
+        let k = s.shape[1] as u32;
+        (s.shape[0] as u32, k) == refused || (whole as u32, k) == refused
+    };
+    let decoded_stacks: std::collections::HashSet<String> = quantized
+        .iter()
+        .filter(|s| hits(s))
+        .map(|s| key(s))
+        .collect();
+    let expect_decoded = |s: &turbine_model::WeightSlot| decoded_stacks.contains(&key(s));
+    assert!(
+        quantized
+            .iter()
+            .filter(|s| is_gate_up(&s.name))
+            .all(|s| expect_decoded(s)),
+        "every gate/up part is refused"
+    );
+    assert!(
+        quantized.iter().any(|s| !expect_decoded(s)),
+        "some layer stays served in FP8"
+    );
+    assert!(
+        format.for_kernels(&slots, &|_| true).is_none(),
+        "every layer served: the format is unchanged"
+    );
+    let resolved = format
+        .for_kernels(&slots, &|c| (c.n, c.k) != refused)
+        .expect("the gate/up stacks fall back");
+    for s in &quantized {
+        let l = turbine_model::weights::LinearSlot {
+            name: s.name.clone(),
+            n: s.shape[0] as u32,
+            k: s.shape[1] as u32,
+        };
+        let want = if expect_decoded(s) {
+            turbine_model::weights::QuantScheme::Bf16
+        } else {
+            turbine_model::weights::QuantScheme::Fp8Block { n: 128, k: 128 }
+        };
+        assert_eq!(resolved.scheme(&l), want, "{}", s.name);
+    }
+    let decoded: u64 = quantized
+        .iter()
+        .filter(|s| expect_decoded(s))
+        .map(|s| {
+            let (n, k) = (s.shape[0] as u64, s.shape[1] as u64);
+            // BF16 instead of e4m3 codes plus F32 block scales.
+            n * k - n.div_ceil(128) * k.div_ceil(128) * 4
+        })
+        .sum();
+    let mut arch = cfg.clone();
+    arch.weight_format = turbine_model::weights::WeightFormatRef(resolved);
+    assert_eq!(
+        arch.weight_format.get().weight_bytes(&arch),
+        format.weight_bytes(cfg) + decoded
+    );
+
+    let spec = TinySpec {
+        dir: fixture.quantized.dir.clone(),
+        config: arch,
+        vocab: fixture.quantized.vocab,
+    };
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let index = SafetensorsIndex::open(&spec.dir).expect("index");
+    let loaded = WeightLoader::load_format(
+        spec.config.weight_format.get(),
+        &index,
+        &spec.config.family.0.weight_slots(&spec.config),
+        &mem,
+        MAX_STAGING_BYTES,
+    )
+    .expect("load");
+    assert_eq!(
+        loaded.weight_bytes,
+        spec.config.weight_format.get().weight_bytes(&spec.config)
+    );
+    for s in &quantized {
+        let want = if expect_decoded(s) {
+            DType::BF16
+        } else {
+            DType::F8E4M3
+        };
+        assert_eq!(loaded.tensors[&key(s)].dtype, want, "{}", s.name);
+    }
+    let mut exec = cpu_model(&spec, &mem, 64);
+    let mut twin = cpu_model(&fixture.twin, &mem, 64);
+    let layout = *exec.kv_layout();
+    let mut kv = SequenceKv::new(&mem, layout, MAX_SEQ_LEN).expect("kv");
+    let mut tkv = SequenceKv::new(&mem, layout, MAX_SEQ_LEN).expect("kv");
+    let feed = prompt(spec.vocab);
+    let positions: Vec<u32> = (0..feed.len() as u32).collect();
+    let got = kv
+        .forward(exec.as_mut(), &feed, &positions)
+        .expect("forward")
+        .row(0)
+        .to_vec();
+    let want = tkv
+        .forward(twin.as_mut(), &feed, &positions)
+        .expect("twin forward")
+        .row(0)
+        .to_vec();
+    assert_eq!(got, want, "partly decoded model differs from its twin");
 }
 
 /// One pool shared by the paged tests: `blocks` blocks of `layout`.
@@ -3775,10 +3913,18 @@ fn tp_rank(
     provider: Arc<dyn KernelProvider>,
     mem: &Arc<dyn DeviceMemory>,
 ) -> Box<dyn ModelExecutor> {
-    let cfg = &spec.config;
     let opts = ExecutorOptions::default();
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
-    let slots = tp::weight_slots(cfg, s).expect("shard slots");
+    let slots = tp::weight_slots(&spec.config, s).expect("shard slots");
+    // As the server's prepare step: layers the provider cannot run from this shard's layout
+    // (a block-scaled FP8 shard cutting a scale block) fall back to their decode.
+    let mut rank_cfg = spec.config.clone();
+    turbine_model::weights::resolve_for_providers(
+        &mut rank_cfg,
+        &slots,
+        std::slice::from_ref(&provider),
+    );
+    let cfg = &rank_cfg;
     let weights = WeightLoader::load_format(
         cfg.weight_format.get(),
         &index,
@@ -4045,8 +4191,9 @@ fn tp2_quantized_matches_tp1_on_host() {
                    "sym": true}),
         ),
         (
-            // Decoded to BF16 at load: splits like any BF16 weight.
-            "ct_fp8 block (decoded)",
+            // At tp 2 the gate/up rows of a rank (64) cut the 128-row blocks: those layers
+            // fall back to their BF16 decode (`fp8_block_decoded`), the rest stay FP8.
+            "ct_fp8 block (tp 2: misaligned layers decoded)",
             {
                 let mut q = ct_fp8("block", json!(null));
                 q["config_groups"]["group_0"]["weights"]["block_structure"] = json!([128, 128]);

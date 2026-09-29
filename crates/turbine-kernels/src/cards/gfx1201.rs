@@ -41,6 +41,7 @@ const QGEMM_SMALL_ORDER: &[&str] = &[
     "turbine_hip_int4_wmma",
     "turbine_hip_int4_dequant",
     "turbine_hip_mxfp4",
+    "turbine_hip_fp8_block",
 ];
 
 pub static GFX1201: CardProfile = CardProfile {
@@ -114,6 +115,7 @@ pub static GFX1201: CardProfile = CardProfile {
                         "turbine_hip_int4_dequant",
                         "turbine_hip_int4_wmma",
                         "turbine_hip_mxfp4",
+                        "turbine_hip_fp8_block",
                     ],
                 },
             ],
