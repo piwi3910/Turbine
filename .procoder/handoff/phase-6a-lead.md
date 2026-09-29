@@ -1,4 +1,14 @@
-# Handoff: Phase 6a lead (rotation at ~270k tokens, 2026-09-29 ~08:40 +04)
+# Handoff: Phase 6a lead (rotation at ~270k tokens, 2026-09-29 ~08:40 +04; updated by the second lead ~08:50)
+
+**Update (second lead, 08:50):** merged p6a-kv-t24 (c1ecafd; one "gate misses" entry, 185ccee's text) and the GSM8K
+dataset 781edad (d466c0b); d1de280 Quark K/V `layer_quant_config` mirrors ignored (W4A4 8B startup refusal); review
+file updated (386898a); fixture queue ordered by `scripts/lab/fixture-order.sh` + `/home/piwi/turbine-ci/fixture.queue`
+(9220129: fp8kv → p6a-int4 → llama-3.1-8b → fp8-block → yarn); gate ok 775 on 386898a. queue3.sh stopped (it paused
+the fixtures while waiting for bench.lock); its remaining steps went to the Task 20 builder. Dataset worktree removed.
+New builders: Task 18 INT4 `a74d419d213cc35b9` (worktree agent-abee0e2542a317f3c, p6a-int4), Task 20 MXFP4
+`a49bfb18f85acff9a` (worktree agent-a4784842b25c93376, p6a-mxfp4), both on non-fixture work first. Asked the YaRN
+builder whether it is blocked on the fold (its `timeout 21600 flock` expires ~13:18 while waiting). Items 1, 4, 5
+below are done or handed out; a19ca024910301566 finished.
 
 Integration worktree `.claude/worktrees/agent-a4b513efedb95892f`, branch `phase-6a-quantization`, tip 4f45232, clean.
 Lab runs from the clean detached worktree `agent-a4b513efedb95892f-lab` (lab scripts rsync uncommitted files).
