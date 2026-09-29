@@ -1,8 +1,10 @@
 //! `turbine-golden eval` / `eval-compare` (phase 8 S-4): task-set accuracy against an
-//! OpenAI-compatible endpoint, greedy, one request at a time, and the lossy-format gate.
+//! OpenAI-compatible endpoint, greedy, up to `--concurrency` requests in flight at once (default
+//! 1), and the lossy-format gate.
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 
 /// Per-request timeout (a 3B model answers a GSM8K item in seconds; 10 min is a hung server).
@@ -46,6 +48,10 @@ pub struct TaskResult {
     pub output: String,
 }
 
+fn default_concurrency() -> u32 {
+    1
+}
+
 /// JSON report (`--output json`), committed as `tests/eval/<model-slug>/<engine>.json`.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct EvalReport {
@@ -54,6 +60,10 @@ pub struct EvalReport {
     pub total: usize,
     pub correct: usize,
     pub accuracy: f64,
+    /// Requests kept in flight at once for this run; an older report with no field reads as 1
+    /// (sequential). `eval-compare` refuses a pair measured at different concurrencies.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: u32,
     pub results: Vec<TaskResult>,
 }
 
@@ -255,12 +265,15 @@ async fn complete(
         .ok_or_else(|| fail(format!("no completion text in {v}")))
 }
 
-/// Runs every task in order; the first failed request aborts the run (no partial report).
+/// Runs every task, up to `concurrency` requests in flight at once (`0` counts as 1, capped at
+/// 256 by the caller); results are reported in task-file order whatever order the replies
+/// arrive in. The first failed request aborts the run (no partial report).
 pub async fn run_eval(
     base: &str,
     model: Option<&str>,
     tasks_file: &Path,
     tasks: &[EvalTask],
+    concurrency: u32,
 ) -> Result<EvalReport, EvalError> {
     let base = base.trim_end_matches('/');
     let client = reqwest::Client::builder()
@@ -271,20 +284,33 @@ pub async fn run_eval(
         Some(m) => m.to_string(),
         None => served_model(&client, base).await?,
     };
+    let concurrency = (concurrency.max(1)) as usize;
+    let model = &model;
+    let client = &client;
+    let mut replies = stream::iter(tasks.iter().enumerate())
+        .map(|(index, task)| async move {
+            let output = complete(client, base, model, task).await?;
+            let correct = is_correct(task.match_kind, &task.answer, &output);
+            Ok::<_, EvalError>((
+                index,
+                TaskResult {
+                    id: task.id.clone(),
+                    correct,
+                    output,
+                },
+            ))
+        })
+        .buffer_unordered(concurrency);
     let mut results = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        let output = complete(&client, base, &model, task).await?;
-        let correct = is_correct(task.match_kind, &task.answer, &output);
-        results.push(TaskResult {
-            id: task.id.clone(),
-            correct,
-            output,
-        });
+    while let Some(reply) = replies.next().await {
+        results.push(reply?);
     }
+    results.sort_by_key(|(index, _)| *index);
+    let results: Vec<TaskResult> = results.into_iter().map(|(_, r)| r).collect();
     let correct = results.iter().filter(|r| r.correct).count();
     let total = results.len();
     Ok(EvalReport {
-        model,
+        model: model.clone(),
         tasks_file: tasks_file.display().to_string(),
         total,
         correct,
@@ -293,6 +319,7 @@ pub async fn run_eval(
         } else {
             correct as f64 / total as f64
         },
+        concurrency: concurrency as u32,
         results,
     })
 }

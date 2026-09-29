@@ -115,6 +115,10 @@ enum Command {
         model: Option<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
+        /// Requests in flight at once; results are still reported in task-file order. Both
+        /// sides of a comparison must use the same value.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=256))]
+        concurrency: u32,
     },
     /// Quality gate: exit 0 when candidate accuracy ≥ baseline accuracy − max drop, else 1.
     EvalCompare {
@@ -135,9 +139,10 @@ async fn run_eval(
     tasks_path: &Path,
     model: Option<&str>,
     output: OutputFormat,
+    concurrency: u32,
 ) -> ExitCode {
     let report = match eval::load_tasks(tasks_path) {
-        Ok(tasks) => eval::run_eval(url, model, tasks_path, &tasks).await,
+        Ok(tasks) => eval::run_eval(url, model, tasks_path, &tasks, concurrency).await,
         Err(e) => Err(e),
     };
     match report {
@@ -148,8 +153,13 @@ async fn run_eval(
                     serde_json::to_string_pretty(&report).expect("report serializes")
                 ),
                 OutputFormat::Text => println!(
-                    "model {} tasks {}: accuracy {:.4} ({}/{})",
-                    report.model, report.tasks_file, report.accuracy, report.correct, report.total
+                    "model {} tasks {}: accuracy {:.4} ({}/{}) at concurrency {}",
+                    report.model,
+                    report.tasks_file,
+                    report.accuracy,
+                    report.correct,
+                    report.total,
+                    report.concurrency
                 ),
             }
             ExitCode::SUCCESS
@@ -174,12 +184,20 @@ fn run_eval_compare(baseline: &Path, candidate: &Path, max_drop: f64) -> ExitCod
             return ExitCode::from(2);
         }
     };
+    if baseline.concurrency != candidate.concurrency {
+        eprintln!(
+            "turbine-golden eval-compare: baseline was measured at concurrency {} but candidate at concurrency {}; a comparison must use one concurrency on both sides",
+            baseline.concurrency, candidate.concurrency
+        );
+        return ExitCode::from(2);
+    }
     let o = eval::compare(&baseline, &candidate, max_drop);
     println!(
-        "baseline accuracy {:.4}, candidate accuracy {:.4}, max drop {:.4}: {}",
+        "baseline accuracy {:.4}, candidate accuracy {:.4}, max drop {:.4} (concurrency {}): {}",
         o.baseline_accuracy,
         o.candidate_accuracy,
         o.max_drop,
+        baseline.concurrency,
         if o.pass { "PASS" } else { "FAIL" }
     );
     ExitCode::from(if o.pass { 0 } else { 1 })
@@ -342,7 +360,8 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             tasks,
             model,
             output,
-        } => Ok(run_eval(&url, &tasks, model.as_deref(), output).await),
+            concurrency,
+        } => Ok(run_eval(&url, &tasks, model.as_deref(), output, concurrency).await),
         Command::EvalCompare {
             baseline,
             candidate,
