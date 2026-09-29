@@ -2,7 +2,7 @@
 # lab-bench.sh — fast land-and-measure step on novanas without a k8s Job.
 #
 #   scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests]
-#                         [--golden16] [--quick] [-- <--set k=v>...]
+#                         [--golden16] [--c1] [--quick] [-- <--set k=v>...]
 #   scripts/lab-bench.sh --print-model <model>
 #
 # <model>: llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16
@@ -21,7 +21,9 @@
 # 3. Under the exclusive benchmark lock: golden at concurrency 1 (the gate; always), golden at 16
 #    only with --golden16 (opt-in: it roughly doubles the golden time for a number this step does
 #    not gate on), and the fixed throughput bench (16 concurrent, 512-word prompts, 256 tokens;
-#    200 requests, or 64 with --quick for a faster read during iteration).
+#    200 requests, or 64 with --quick for a faster read during iteration); with --c1 also the
+#    single-request latency run (10 requests of 128 tokens, --ignore-eos), reported as itl_c1_p50
+#    and tok/s_c1 (Phase 6a targets stated in c1 ITL).
 # 4. Stops the server and prints one "BENCH ..." summary line (quick=1 added when --quick was
 #    used; golden16=SKIP when --golden16 was not); exits 1 if tests, golden c1 or the bench fail.
 #    Results land in target/lab-bench/<label>/ on the workstation.
@@ -34,10 +36,11 @@ model=llama
 label="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 run_tests=0
 run_golden16=0
+run_c1=0
 quick=0
 print_model=0
 usage() {
-	echo "usage: scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--quick] [-- --set k=v ...] | --print-model <model>" >&2
+	echo "usage: scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--c1] [--quick] [-- --set k=v ...] | --print-model <model>" >&2
 	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16" >&2
 	exit 2
 }
@@ -66,6 +69,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--golden16)
 		run_golden16=1
+		shift
+		;;
+	--c1)
+		run_c1=1
 		shift
 		;;
 	--quick)
@@ -254,12 +261,18 @@ golden="ssh -o BatchMode=yes $host cd '$remote/src' \\&\\& '$remote/target/relea
 ref="tests/golden/$golden_slug/reference.jsonl"
 golden16_cmd=""
 [[ $run_golden16 -eq 1 ]] && golden16_cmd="$golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 16 > '$out/golden16.txt' 2>&1"
+# --c1: the single-request decode latency (the Phase 1 baseline workload), for targets stated as
+# c1 ITL (Phase 6a: FP8 <= 0.75x, INT4 / MXFP4 <= 0.6x the BF16 run).
+c1_cmd=""
+rm -f "$out/bench-c1.json"
+[[ $run_c1 -eq 1 ]] && c1_cmd="$bench_cmd --concurrency 1 --requests 10 --max-tokens 128 --ignore-eos --output json > '$out/bench-c1.json' 2> '$out/bench-c1.err'"
 scripts/bench-lock.sh sh -c "
   $golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 1 > '$out/golden1.txt' 2>&1
   $golden16_cmd
   curl -s '$url/metrics' > '$out/metrics-before.txt'
   $bench_cmd --concurrency 16 --requests $requests --prompt-words 512 --max-tokens 256 \
     --ignore-eos --output json > '$out/bench.json' 2> '$out/bench.err'
+  $c1_cmd
 " 2>/dev/null
 curl -s "$url/metrics" >"$out/metrics.txt"
 curl -s "$url/turbine/v1/status" >"$out/status.json"
@@ -308,10 +321,20 @@ values = {"tok_s": round(d["output_token_throughput"], 1), "itl_p50_ms": round(d
           "golden_c1": g1.startswith("PASS")}
 if g16 != "SKIP":
     values["golden_c16"] = g16.startswith("PASS")
+c1_field = ""
+try:
+    c1 = json.load(open(f"{out}/bench-c1.json"))
+    values["itl_c1_p50_ms"] = round(c1["itl_ms"]["p50"], 2)
+    values["tok_s_c1"] = round(c1["output_token_throughput"], 1)
+    c1_field = f" itl_c1_p50={c1['itl_ms']['p50']:.2f} tok/s_c1={c1['output_token_throughput']:.1f}"
+except OSError:
+    pass
+except Exception as e:
+    c1_field = f" c1=FAILED({e})"
 json.dump({k: v for k, v in values.items() if v == v}, open(f"{out}/labbook-values.json", "w"))
 print(f"BENCH {label} {model} commit={commit} gpu={gpu} tests={tests} golden1={g1} golden16={g16}{quick_field}{formats} "
       f"ok={d['requests_ok']} failed={d['requests_failed']} tok/s={d['output_token_throughput']:.1f} "
-      f"itl_p50={d['itl_ms']['p50']:.1f} ttft_p50={d['ttft_ms']['p50']:.0f} decode_fwd_ms={avg('decode'):.1f}")
+      f"itl_p50={d['itl_ms']['p50']:.1f} ttft_p50={d['ttft_ms']['p50']:.0f} decode_fwd_ms={avg('decode'):.1f}{c1_field}")
 bad = (tests != "skipped" and not tests.endswith("/0")) or g1 != "PASS:" or d["requests_failed"] != 0
 if model == "olmoe":
     bad = (tests != "skipped" and not tests.endswith("/0")) or d["requests_failed"] != 0
@@ -327,7 +350,7 @@ if [[ $rc -eq 0 && "${LABBOOK_UPLOAD:-1}" != 0 && -f "$uploader" && -f "$HOME/.c
 	set_args=()
 	[[ -n "${LABBOOK_SET:-}" ]] && set_args=(--set "$LABBOOK_SET")
 	attach=()
-	for f in bench.json golden1.txt golden16.txt metrics.txt status.json; do
+	for f in bench.json bench-c1.json golden1.txt golden16.txt metrics.txt status.json; do
 		[[ -s "$out/$f" ]] && attach+=(--attach "$out/$f")
 	done
 	branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
