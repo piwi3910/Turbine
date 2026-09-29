@@ -155,7 +155,7 @@ main() {
 	return $rc
 }
 
+mkdir -p "$O"
 main >>"$O/fp8block-bench.log" 2>&1
 rc=$?
-mkdir -p "$O"
 echo "fp8block-bench: done rc=$rc" >>"$O/fp8block-bench.log"
