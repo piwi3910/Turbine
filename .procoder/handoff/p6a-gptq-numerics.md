@@ -80,3 +80,59 @@ concurrency 16 (6 h timeout), kills its server.
 Gate at 1f7290b: 785 passed, 1 failed — `turbine-server::tiny_server queue_full_429` (503 `queue_timeout`
 instead of 200, a timing flake while the GPTQ kernel build loaded the host); rerun alone it passes. No
 Rust change of this branch touches turbine-server (only the `int4_layer_dump` example).
+
+## Rotation 11: C then A (2026-09-30, builder r11)
+
+User decision 06a880f: C (AutoRound early data point, does NOT decide the row), then A (our own
+llm-compressor GPTQ, decides the row). `gptq_int4` stays `experimental`; the lead re-judges it.
+Branch merged `phase-6a-quantization` (c144abf) cleanly.
+
+First run (gptq-full, shuyuej): 972/1319 = 0.7369, drop 0.0432; `scripts/eval/paired_compare.py`
+reproduces it: lost 122 / gained 65, McNemar cc p 4.2e-5, exact p 3.7e-5, CI [+0.0230, +0.0634].
+
+Tools (committed):
+- `.procoder/handoff/gptq_full_run.sh --name <label> --model-dir <dir> --served-name <id>
+  --expect-packaging gptq|ct_pack_int4 [--vllm]` — the gptq-full driver, parameterised (no fork).
+  Waits for `gpu-queue/<label>.go`, then port18000 → bench.gate → bench.lock (held through the
+  vLLM pass, plus port18100.lock), GPU 0, cores 0-11. Checks `/turbine/v1/status` packaging and the
+  `gptq_int4` row before evaluating. Output `$REMOTE/<label>/`; markers `<label>: done rc=` and
+  `<label>-vllm: done rc=`. Each eval is judged into `turbine-paired.json` / `vllm-paired.json`.
+- `scripts/eval/paired_compare.py <bf16-full.json> <candidate.json> --max-drop 0.04 [--json]`.
+- `scripts/eval/gptq_calibrate.py` (uv inline script: torch 2.13.0+rocm7.2, triton-rocm 3.7.1,
+  llmcompressor 0.14.0, compressed-tensors 0.19.0, transformers 5.17.0, accelerate 1.15.0,
+  datasets 5.0.1; recipe W4A16 sym g128 damp 0.01 actorder None, lm_head ignored; 512 × 2048
+  ultrachat_200k @ 8049631c train_sft shard 0 seed 42). Writes `turbine_calibration.json` into the
+  checkpoint with all versions and the device.
+- `.procoder/handoff/gptq_calib_run.sh` — setup (dataset shard download, uv env `--check`, CPU,
+  GPU hidden, no lock) then waits for `gpu-queue/gptq-calib.go`, same three locks, one GPU
+  (ROCR/HIP_VISIBLE_DEVICES=0), 4 h timeout. Log `/home/piwi/turbine-ci/scratch/gptq-own/calib.log`
+  (first attempt's resolver failure kept as `calib-r1.log`: triton-rocm had to come from the
+  pytorch index too). uv cache / python under `/home/piwi/turbine-ci/scratch/gptq-own/` (delete
+  `uv-cache` after the run if disk is short).
+
+Detached on novanas (REMOTE=/home/piwi/turbine-ci/remote/agent-p6a-gptq-numerics):
+
+| go-file | what | log | marker |
+|---|---|---|---|
+| `gptq-autoround.go` | AutoRound full GSM8K c16 (Turbine) | `$REMOTE/gptq-autoround/run.log` | `gptq-autoround: done rc=` |
+| `gptq-calib.go` | llm-compressor calibration on GPU 0 | `/home/piwi/turbine-ci/scratch/gptq-own/calib.log` | `gptq-calib: done rc=` |
+| `gptq-own.go` | own checkpoint: Turbine, then vLLM-ROCm | `$REMOTE/gptq-own/run.log` | `gptq-own: done rc=`, `gptq-own-vllm: done rc=` |
+
+`gptq-own.go` must come after `gptq-calib: done rc=0` (the driver refuses with rc=1 if the
+checkpoint directory has no config.json when its pass starts).
+
+AutoRound checkpoint: `/home/piwi/turbine-models/llama-3.2-3b-instruct-autoround-gptq`
+(kaitchup @ e11f15d, 2.27 GB; quant_method gptq, bits 4, group 128, sym, desc_act false, no
+checkpoint_format → v1, damp 0.01, auto-round 0.4.5, 500 iters, 512 × 2048). Turbine loads it on
+the cpu backend: packaging `gptq`, row `gptq_int4` (experimental), 196 `int4_group_sym` layers.
+
+When the markers land:
+1. copy `$REMOTE/gptq-autoround/turbine-full.json` → `tests/eval/llama-3.2-3b-instruct/turbine-gptq-autoround-full.json`,
+   `$REMOTE/gptq-own/turbine-full.json` → `turbine-gptq-own-full.json`, `vllm-full.json` → `vllm-gptq-own-full.json`;
+2. `python3 scripts/eval/paired_compare.py tests/eval/llama-3.2-3b-instruct/turbine-bf16-full.json <each> --max-drop 0.04`
+   (already in `*-paired.json` on the host);
+3. check the own checkpoint's `config.json` quantization_config (one group, targets Linear, sym,
+   group 128, actorder null, ignore lm_head) and copy the versions of `turbine_calibration.json`
+   into `tests/eval/llama-3.2-3b-instruct/README.md`; if Turbine refused it, the loader change is a
+   lead-owned `handoff(<file>)` commit with a test first;
+4. delete `/home/piwi/turbine-ci/scratch/gptq-own/uv-cache` and any `*-gptq-own.tmp`.
