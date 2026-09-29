@@ -11,7 +11,7 @@ Serve FP8 (per-tensor/channel and block-scaled), INT4 AWQ/GPTQ and MXFP4 (compre
 
 ## Architecture
 
-Weights: `turbine_model::weights::WeightFormat` becomes a description of a quantized linear layer (`QuantScheme`, `ActivationQuant`, extra tensor slots, a repack step), with one registry entry per checkpoint packaging; the loader builds `QuantLinear` values that the decoder hands to a new quantized GEMM op. `turbine-kernels` gains `OpKind::QGemm` / `OpKind::QuantizeAct` with a CPU reference (`cpu::quant`) and the optional kernel ABI group v2.9 (`turbine_qgemm*`, `turbine_quantize_act*`, dtype codes F8E4M3 / U8); the HIP shim registers implementations chosen by recorded provider evaluations (hipBLASLt FP8 first for `fp8`, CK `gemm_quant` for block-scaled and INT4, CK microscale / llama.cpp for MXFP4). KV: `kv.dtype: fp8_e4m3` switches the L0 layout to one byte per element with per-layer scales and an FP8-reading paged attention. YaRN is a `RopeScaling::Yarn` variant computed on the host into the existing `inv_freq` table with the attention factor folded into the attention scale; the resolved RoPE parameters and the FP8 KV scales enter the namespace key.
+Weights: `turbine_model::weights::WeightFormat` becomes a description of a quantized linear layer (`QuantScheme`, `ActivationQuant`, extra tensor slots, a repack step), with one registry entry per checkpoint packaging; the loader builds `QuantLinear` values that the decoder hands to a new quantized GEMM op. `turbine-kernels` gains `OpKind::QGemm` / `OpKind::QuantizeAct` with a CPU reference (`cpu::quant`) and the optional kernel ABI group v2.9 (`turbine_qgemm*`, `turbine_quantize_act*`, dtype codes F8E4M3 / U8); the HIP shim registers implementations chosen by recorded provider evaluations (hipBLASLt FP8 first for `fp8`, CK `gemm_quant` for block-scaled and INT4, CK microscale / llama.cpp for MXFP4). KV: `kv.dtype: fp8_e4m3` switches the L0 layout to one byte per element with per-layer scales and an FP8-reading paged attention. YaRN is a `RopeScaling::Yarn` variant computed on the host into the existing `inv_freq` table, with the attention factor applied to cos/sin inside the rope op (kernel ABI v2.10 `turbine_rope_desc.attn_factor`, Task 28a; user decision 2026-09-29 superseding the fold into the attention scale); the resolved RoPE parameters and the FP8 KV scales enter the namespace key.
 
 ## Constraints
 
@@ -487,10 +487,29 @@ Interfaces:
   Covers: spec S-16 (proof); AC YaRN lab golden
   Depends on: Task 27
 
-- [ ] Fixture: `uv run scripts/golden/hf_reference.py --model-dir /home/piwi/turbine-models/llama-3.2-3b-instruct --config-override '{"rope_scaling":{"rope_type":"yarn","factor":16.0,"original_max_position_embeddings":8192,"beta_fast":32,"beta_slow":1}}' …` on the fixture's `prompts.jsonl`; tolerance: the Llama BF16 values unless `yarn_self_spread.py` on the override (and `--fold`, Turbine's attention-factor placement) shows a larger spread (recorded in the README; provisional until then).
+- [ ] Fixture: `uv run scripts/golden/hf_reference.py --model-dir /home/piwi/turbine-models/llama-3.2-3b-instruct --config-override '{"rope_scaling":{"rope_type":"yarn","factor":16.0,"original_max_position_embeddings":8192,"beta_fast":32,"beta_slow":1}}' …` on the fixture's `prompts.jsonl`; tolerance: the Llama BF16 values unless `yarn_self_spread.py` on the override (transformers' placement, no `--fold`, after Task 28a) shows a larger spread (recorded in the README).
 - [ ] Lab (GPU 0, bench lock): `scripts/lab-bench.sh --model llama-yarn16 --golden16` — expect PASS; `--model llama --golden16` unchanged.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `test(golden): YaRN Llama-3.2-3B reference and lab proof`
+
+## Task 28a: YaRN attention factor on cos/sin (kernel ABI v2.10)
+
+Amendment 2026-09-29 (user decision "YaRN attention factor: on cos/sin, not folded into the softmax scale"): the fold of Task 26 put m² on the rounded q·k and measured a p16 tail of 1.49 against 0.39 for transformers' placement.
+
+Files: `kernels/include/turbine_kernels.h` (`turbine_rope_desc.attn_factor`, `TURBINE_ABI_MINOR 10u`), `crates/turbine-kernels/src/ffi.rs` (`RopeDesc.attn_factor`, v2.10 detection, `ShimLibrary::rope_attn_factor() -> bool`), `crates/turbine-kernels/src/ops.rs` (`RopeContext.attn_factor: f32`), `crates/turbine-kernels/src/cpu/` (rope: cos/sin × m in F32, then the rotated values rounded to the dtype), `crates/turbine-kernels/src/backends/hip.rs` (passes it; refuses ≠ 1 below minor 10), `kernels/rocm/src/elementwise.hip` (rope kernel multiplies cos/sin by `attn_factor` when the library is built at minor 10), `kernels/rocm/` version, the stub libraries of `turbine-kernels` tests (`TURBINE_STUB_GFX942_V210`), `crates/turbine-model/src/config.rs` / `executor/rope.rs` (the resolved factor handed to the rope op, no longer to the attention scale), `crates/turbine-model/src/executor/decoder/mod.rs` (softmax scale back to head_dim^-0.5), `crates/turbine-server` startup refusal `rope_attn_factor_unavailable`, `tests/golden/llama-3.2-3b-instruct-yarn16/{tolerance.json,README.md}`, `.procoder/contract/interfaces.md` (v2.10 row)
+Interfaces:
+
+- `turbine_rope_desc { …, int32_t dtype; float attn_factor; }` (read at minor ≥ 10; 1.0 = none); Rust `RopeContext.attn_factor`
+  Covers: spec S-15 (placement), S-6 (v2.10); AC `yarn_cos_sin_times_factor_match_transformers`, `rope_attn_factor_scales_before_rounding`, `optional_groups_v210_rope`, YaRN lab golden
+  Depends on: Task 28
+
+- [ ] Write failing tests: `executor::rope::tests::yarn_cos_sin_times_factor_match_transformers` (committed transformers cos×m / sin×m and rotated BF16 q/k for the factor-16 override on a few positions, generated by `scripts/golden/yarn_params.py`), `cpu::tests::rope_attn_factor_scales_before_rounding`, `ffi::tests::optional_groups_v210_rope`, and a decoder test that the YaRN softmax scale is head_dim^-0.5. Run: `scripts/remote-cargo.sh test -p turbine-kernels -p turbine-model` — expect FAIL
+- [ ] Implement (header, ffi, ops, CPU, HIP, decoder, startup refusal).
+- [ ] Run: `scripts/remote-cargo.sh test -p turbine-kernels -p turbine-model -p turbine-server` — expect PASS; lab `scripts/lab-test.sh novanas --tier quick` (hip rope vs CPU) and `yarn_teacher_forced_vs_reference` (p16 tail within transformers' spread, ≈ 0.43).
+- [ ] Tolerance: `yarn_self_spread.py` without `--fold` → `tolerance.json` = max(spread, Llama BF16 bounds); README records the A/B.
+- [ ] Lab (GPU 0, bench lock): `scripts/lab-bench.sh --model llama-yarn16 --golden16` — expect PASS; `--model llama --golden16` unchanged.
+- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [ ] Commit: `feat(kernels): YaRN attention factor on cos/sin (ABI v2.10)`
 
 ## Task 29: Phase exit (6a)
 

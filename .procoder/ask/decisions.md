@@ -2010,3 +2010,30 @@ Lead's call (same day): the as-built floor guard — at the last rung a copy is 
 ## Keep going through crashes (2026-09-29)
 
 **Decision (user, 2026-09-29 15:25, relayed by the coordinator):** "keep going; if things crash we restart it and you continue." A novanas reboot is handled without asking: the lead requeues the detached runs from its handoff table (the scripts are idempotent) and carries on, without debugging the crash. The coordinator's heartbeat (:17 and :47) checks novanas with one ssh and `scratchpad/lead/r6-check.sh`, wakes the lead when a run finishes or the host rebooted, and starts a fresh lead from the handoff if none is alive. 6a runs to its close (collectors, the Task 14 FP8 proof, the remaining proofs, the Task 29 exit on everything runnable; the two-GPU items stay blocked on the PSU and are listed unfinished), merges into local main without a push, and 6b starts from main taking `p6b-groundwork` in, under the same rotation rules. Design questions go to the coordinator; everything else is the lead's call, recorded here and in `.procoder/review-2026-09-29.md`.
+
+## YaRN attention factor: on cos/sin, not folded into the softmax scale (2026-09-29, supersedes Q19's placement)
+
+Context: the Task 28 YaRN proof (Llama-3.2-3B-Instruct, `rope_scaling` yarn factor 16) missed the golden tail bound on
+prompt p16. The teacher-forced A/B (`yarn_teacher_forced_vs_reference`, lab, `yarn-tf-r5.out`) measured max |Δ logprob|
+(likely, tail) against transformers: CPU provider with the fold (`scale × attention_factor²`, Q19 as decided) 0.190 / 1.488;
+CPU provider with transformers' placement (cos/sin × m, then BF16 rounding of q and k, softmax scale head_dim^-0.5)
+0.067 / 0.395; HIP with the fold 0.099 / 1.382. transformers' own spread on the override is ≈ 0.43 tail. The HIP tail
+tracks the CPU fold, so the kernels are not the cause; the fold's placement of the factor (after BF16 rounding of q·k
+instead of before) is.
+
+- A) Keep the fold and widen the yarn16 tail bound to ≈ 1.5
+- B) Transformers' placement: the rope op multiplies cos and sin by the attention factor m before q and k are rounded to
+  BF16; the attention softmax scale returns to head_dim^-0.5. Needs a new field in `turbine_rope_desc` (a kernel ABI
+  minor bump) — chosen
+
+**Decision (user, 2026-09-29, relayed by the coordinator): B.** Supersedes the "attention factor folds into the attention
+scale, so the RoPE ABI does not change" part of Q19 (question 19, "YaRN proof and override", 2026-09-28); the rest of Q19
+(`model.rope_scaling`, factor 16 proof, the ≈ 12,000-token prompt) stands.
+
+Lead's calls (same day): the field is `float attn_factor` appended to `turbine_rope_desc`, read only when the library
+reports minor ≥ 10 (optional group v2.10, `TURBINE_ABI_MINOR 10u`; 1.0 or a minor < 10 library = no scaling; a YaRN model
+whose factor ≠ 1 on a library below minor 10 is refused at startup, exit 1, `event="kernel_capability"`, reason
+`rope_attn_factor_unavailable`). 6a merges first, so it takes v2.10; the 6b groups written as v2.10 (KV transcode,
+mixed-format attention) renumber to v2.11 when the 6b stack is rebased onto main. The yarn16 tolerance comes from
+`yarn_self_spread.py` without `--fold` (transformers' placement), floored at the Llama BF16 bounds (decision "Golden
+tolerance floor for quantized checkpoints" applied to YaRN). Spec S-15/S-6 and plan Task 28a amended the same day.
