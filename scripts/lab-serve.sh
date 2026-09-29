@@ -524,6 +524,10 @@ gpu_lock() {
 	[[ "$ONE_GPU_JOB" == 1 ]] || return 0
 	local gpus=$SERVE_GPUS
 	[[ "$MODE" == vllm ]] && gpus=$VLLM_GPUS
+	if [[ $gpus -eq 2 && $DRY_RUN -eq 1 ]]; then
+		echo "+ a real run refuses --gpus 2 while one GPU job at a time holds (TURBINE_LAB_ONE_GPU_JOB=0 overrides)"
+		return 0
+	fi
 	if [[ $gpus -eq 2 ]]; then
 		fail "--gpus 2 refused: one GPU job at a time on novanas until its PSU is replaced (TURBINE_LAB_ONE_GPU_JOB=0 overrides)" 2
 	fi
