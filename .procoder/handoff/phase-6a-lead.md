@@ -81,6 +81,11 @@ Finished (don't reuse): ad2d9c8c7cc380c42 (Task 24 wrap-up).
 - Disk: cleanup from ~100 GB free (209 GB at 07:56): `git worktree remove` merged clean finished trees →
   `TURBINE_PRUNE_IDLE_HOURS=1 scripts/lab-prune.sh --report` → real run only if it lists finished agents' trees only.
 - Rotation: one task per builder; replace at ~300k tokens with a handoff; sonnet for mechanical work.
+- No polling (coordinator, 2026-09-29): a builder whose only remaining work is waiting hours for a queued run writes
+  the run's paths and how to judge it into its handoff, messages the lead and ends. The lead checks the novanas logs
+  cheaply whenever woken and starts a short-lived collector (sonnet unless numerics) once a run has finished. The lead
+  keeps no monitor of its own. Told: a4baec4689b995379, aa94fe3bfacab12b1, a74d419d213cc35b9, a49bfb18f85acff9a
+  (the coordinator told a67eec8abc8f117eb).
 - Ownership: the lead owns the kernel header, `ffi.rs`, ops, registry, turbine-model config/decoder/loader/weights, core
   support/config, `.procoder/`; builders send `handoff(<file>)` commits. No push; merge into local main at 6a close.
 - Design questions go to the coordinator via SendMessage; keep working on anything independent.
