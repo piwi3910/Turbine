@@ -25,13 +25,14 @@ pub use ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
     ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
-    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplChoice, ImplInfo, KernelProvider,
-    KvCopyConfig, KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext,
-    LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
-    MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
-    ProviderId, QGemmConfig, QGemmContext, QGemmKernel, QuantizeActConfig, QuantizeActContext,
-    QuantizeActKernel, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
-    RopeKernel, RowSumsqConfig, RowSumsqContext, RowTier, ShardedNormKernel,
+    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplChoice, ImplInfo, KV_FMT_BF16,
+    KV_FMT_FP8_E4M3, KV_FMT_TQ2, KV_FMT_TQ4, KernelProvider, KvCopyConfig, KvCopyContext,
+    KvCopyKernel, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
+    MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
+    NormKernel, OpKind, PagedAttentionContext, ProviderId, QGemmConfig, QGemmContext, QGemmKernel,
+    QuantizeActConfig, QuantizeActContext, QuantizeActKernel, RmsnormShardedConfig,
+    RmsnormShardedContext, RopeConfig, RopeContext, RopeKernel, RowSumsqConfig, RowSumsqContext,
+    RowTier, ShardedNormKernel, TqEncodeFn, TqHeadTables, TqPaged, TqParams, kv_format_code,
 };
 pub use registry::{KernelMetrics, KernelRegistry, OpConfig, OpRequirement, Selection};
 pub use shim::{

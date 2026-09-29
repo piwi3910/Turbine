@@ -668,6 +668,67 @@ pub struct PagedAttentionContext<'a> {
     /// convention) for BF16 / F16 / F32 pages.
     pub k_scale: f32,
     pub v_scale: f32,
+    /// P6b S-5: one format code per `block_table` entry ([`KV_FMT_BF16`], [`KV_FMT_FP8_E4M3`],
+    /// [`KV_FMT_TQ4`], [`KV_FMT_TQ2`]), host memory; empty = every block in `cfg.dtype`. A
+    /// block's bytes are the first page bytes of its format in slot `b` of `kv_layer` (slots
+    /// of `cfg.dtype`'s page; the ladder's L0 step, S-7, adds class-page addressing).
+    pub block_formats: &'a [u8],
+    /// TurboQuant tables of this layer and the codec that encodes appended rows; required
+    /// when `cfg.dtype` or a block's format is TurboQuant.
+    pub tq: Option<TqPaged<'a>>,
+}
+
+/// Block format code of a BF16 page (the v2.10 `block_formats` byte).
+pub const KV_FMT_BF16: u8 = 0;
+/// Block format code of an FP8 e4m3 page.
+pub const KV_FMT_FP8_E4M3: u8 = 1;
+/// Block format code of a TurboQuant `tq4` page (K 3 + 1 bits, V 4 bits).
+pub const KV_FMT_TQ4: u8 = 2;
+/// Block format code of a TurboQuant `tq2` page (K 1 + 1 bits, V 2 bits).
+pub const KV_FMT_TQ2: u8 = 3;
+
+/// The block format code of KV pages of `dtype` (`None`: not a KV page dtype).
+pub fn kv_format_code(dtype: DType) -> Option<u8> {
+    match dtype {
+        DType::BF16 => Some(KV_FMT_BF16),
+        DType::F8E4M3 => Some(KV_FMT_FP8_E4M3),
+        DType::Tq4 => Some(KV_FMT_TQ4),
+        DType::Tq2 => Some(KV_FMT_TQ2),
+        _ => None,
+    }
+}
+
+/// The TurboQuant tables of one KV head of a layer (P6b S-5).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TqHeadTables {
+    /// ±1 signs of the K rotation (head_dim 128).
+    pub k_signs: Vec<f32>,
+    /// ±1 signs of the V rotation.
+    pub v_signs: Vec<f32>,
+    /// The QJL projection `S`, `128 × 128` row-major.
+    pub qjl: Vec<f32>,
+}
+
+/// TurboQuant parameters of one layer (P6b S-5; the v2.10 `tq_params`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TqParams {
+    /// Per KV head of the layer.
+    pub heads: Vec<TqHeadTables>,
+    /// Unit-variance Lloyd–Max codebooks of 1, 2, 3 and 4 bits (index `bits − 1`).
+    pub codebooks: [Vec<f32>; 4],
+}
+
+/// Encodes one token-head K/V pair (head_dim values each) of TurboQuant format `fmt`
+/// ([`KV_FMT_TQ4`] / [`KV_FMT_TQ2`]) into `record` (the format's record bytes) with `head`'s
+/// tables. The caller supplies the codec (`turbine-kv`'s TurboQuant `encode_record`), so this
+/// crate carries no copy of the encoder.
+pub type TqEncodeFn = fn(fmt: u8, k: &[f32], v: &[f32], head: &TqHeadTables, record: &mut [u8]);
+
+/// The TurboQuant side of a paged attention call.
+#[derive(Clone, Copy)]
+pub struct TqPaged<'a> {
+    pub params: &'a TqParams,
+    pub encode: TqEncodeFn,
 }
 
 /// Copies block `src` to block `dst` in every layer, for each `(src, dst)` of `pairs` in order.
