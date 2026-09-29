@@ -188,6 +188,7 @@ set(TURBINE_SOURCES
   src/quantize_act.hip
   src/qgemm_int4.hip
   src/qgemm_mxfp4.hip
+  src/qgemm_fp8_block.hip
   src/quantize_act_mxfp4.hip
   src/impl_table.cpp)
 set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/paged_attention_splitkv.cpp
