@@ -22,10 +22,14 @@ cargo_() { CARGO_TARGET_DIR=$R/target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4 nic
 
 stop_server() {
 	[ -f "$PIDF" ] || return 0
-	local p; p=$(cat "$PIDF")
+	local p
+	p=$(cat "$PIDF")
 	if [ "$(cat /proc/$p/comm 2>/dev/null)" = turbine-server ]; then
 		kill "$p"
-		for _ in $(seq 1 20); do [ -d /proc/$p ] || break; sleep 1; done
+		for _ in $(seq 1 20); do
+			[ -d /proc/$p ] || break
+			sleep 1
+		done
 	fi
 	rm -f "$PIDF"
 }
@@ -34,30 +38,41 @@ stop_server() {
 serve() {
 	local name=$1 cfg=$2
 	if ss -ltnH 'sport = :18000' | grep -q .; then
-		echo "t28a-lab: port 18000 already served; not starting $name"; return 1
+		echo "t28a-lab: port 18000 already served; not starting $name"
+		return 1
 	fi
 	rm -f "$PIDF"
-	( cd "$R/src" && setsid bash -c 'echo $$ >"$0"; exec "$@"' "$PIDF" \
+	(cd "$R/src" && setsid bash -c 'echo $$ >"$0"; exec "$@"' "$PIDF" \
 		env LD_LIBRARY_PATH=$LIBS TURBINE_AMD_SMI_LIBRARY=/opt/rocm/rocm/lib/libamd_smi.so.26.5.0 ROCR_VISIBLE_DEVICES=0 \
 		taskset -c 0-11 "$R/target/release/turbine-server" --config "$cfg" \
 		--set model.path=$MODEL --set execution.kernel_library=$R/kbuild/libturbine_hip.so \
-		>"$O/server-$name.log" 2>&1 </dev/null & )
-	for _ in $(seq 1 20); do [ -s "$PIDF" ] && break; sleep 0.5; done
+		>"$O/server-$name.log" 2>&1 </dev/null &)
+	for _ in $(seq 1 20); do
+		[ -s "$PIDF" ] && break
+		sleep 0.5
+	done
 	for _ in $(seq 1 300); do
 		[ "$(curl -s -o /dev/null -w '%{http_code}' $URL/ready)" = 200 ] && return 0
-		[ -d /proc/$(cat "$PIDF") ] || { echo "t28a-lab: $name server exited"; tail -20 "$O/server-$name.log"; return 1; }
+		[ -d /proc/$(cat "$PIDF") ] || {
+			echo "t28a-lab: $name server exited"
+			tail -20 "$O/server-$name.log"
+			return 1
+		}
 		sleep 2
 	done
-	echo "t28a-lab: $name not ready"; tail -20 "$O/server-$name.log"; stop_server; return 1
+	echo "t28a-lab: $name not ready"
+	tail -20 "$O/server-$name.log"
+	stop_server
+	return 1
 }
 
 # measure <name> <golden slug>: golden c1 / c16 and the c16 throughput bench (64 requests).
 measure() {
 	local name=$1 slug=$2 rc=0
-	( cd "$R/src" && taskset -c 0-11 "$R/target/release/turbine-golden" compare --url $URL \
-		--reference tests/golden/$slug/reference.jsonl --concurrency 1 ) >"$O/$name-golden1.txt" 2>&1 || rc=1
-	( cd "$R/src" && taskset -c 0-11 "$R/target/release/turbine-golden" compare --url $URL \
-		--reference tests/golden/$slug/reference.jsonl --concurrency 16 ) >"$O/$name-golden16.txt" 2>&1 || rc=1
+	(cd "$R/src" && taskset -c 0-11 "$R/target/release/turbine-golden" compare --url $URL \
+		--reference tests/golden/$slug/reference.jsonl --concurrency 1) >"$O/$name-golden1.txt" 2>&1 || rc=1
+	(cd "$R/src" && taskset -c 0-11 "$R/target/release/turbine-golden" compare --url $URL \
+		--reference tests/golden/$slug/reference.jsonl --concurrency 16) >"$O/$name-golden16.txt" 2>&1 || rc=1
 	taskset -c 0-11 "$R/target/release/turbine-bench" --url $URL --concurrency 16 --requests 64 \
 		--prompt-words 512 --max-tokens 256 --ignore-eos --output json >"$O/$name-bench.json" 2>"$O/$name-bench.err" || rc=1
 	curl -s $URL/turbine/v1/status >"$O/$name-status.json"
@@ -74,27 +89,54 @@ main() {
 	echo "t28a-lab: $(ts) kernel library build"
 	if [ ! -f "$R/kbuild/build.ninja" ]; then
 		nice -n 19 taskset -c 12-15 cmake -S kernels/rocm -B "$R/kbuild" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-			-DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 >"$O/cmake.log" 2>&1 || { tail -30 "$O/cmake.log"; return 1; }
+			-DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 >"$O/cmake.log" 2>&1 || {
+			tail -30 "$O/cmake.log"
+			return 1
+		}
 	fi
-	nice -n 19 taskset -c 12-15 cmake --build "$R/kbuild" -j 4 >"$O/kbuild.log" 2>&1 || { tail -40 "$O/kbuild.log"; return 1; }
+	nice -n 19 taskset -c 12-15 cmake --build "$R/kbuild" -j 4 >"$O/kbuild.log" 2>&1 || {
+		tail -40 "$O/kbuild.log"
+		return 1
+	}
 	echo "t28a-lab: $(ts) release binaries"
-	cargo_ build --release -p turbine-server -p turbine-bench >"$O/cargo-build.log" 2>&1 || { tail -40 "$O/cargo-build.log"; return 1; }
+	cargo_ build --release -p turbine-server -p turbine-bench >"$O/cargo-build.log" 2>&1 || {
+		tail -40 "$O/cargo-build.log"
+		return 1
+	}
 	local bin
 	bin=$(cargo_ test --release -p turbine-model --test golden --no-run --message-format=json 2>>"$O/cargo-test-build.err" |
 		grep -o '"executable":"[^"]*golden-[^"]*"' | tail -1 | cut -d'"' -f4)
-	[ -n "$bin" ] && [ -x "$bin" ] || { echo "t28a-lab: golden test build failed"; tail -40 "$O/cargo-test-build.err"; return 1; }
-	echo "t28a-lab: $(ts) built; waiting port18000.lock"
+	[ -n "$bin" ] && [ -x "$bin" ] || {
+		echo "t28a-lab: golden test build failed"
+		tail -40 "$O/cargo-test-build.err"
+		return 1
+	}
+	echo "t28a-lab: $(ts) built; waiting for go-file"
+	local GO=/home/piwi/turbine-ci/gpu-queue/t28a-lab.go waited=0
+	while [ ! -e "$GO" ]; do
+		[ $((waited % 1800)) -eq 0 ] && echo "t28a-lab: $(ts) waiting for go-file"
+		sleep 60
+		waited=$((waited + 60))
+		[ "$waited" -ge 86400 ] && {
+			echo "t28a-lab: $(ts) go-file timeout after 24h"
+			return 1
+		}
+	done
+	echo "t28a-lab: $(ts) go-file present; waiting port18000.lock"
 	exec 200>"$PORT_LOCK" 201>"$BENCH_GATE" 202>"$BENCH_LOCK"
-	flock -x 200; echo "t28a-lab: $(ts) waiting bench.gate"
-	flock -x 201; echo "t28a-lab: $(ts) waiting bench.lock"
-	flock -x 202; echo "t28a-lab: $(ts) locks held"
+	flock -x 200
+	echo "t28a-lab: $(ts) waiting bench.gate"
+	flock -x 201
+	echo "t28a-lab: $(ts) waiting bench.lock"
+	flock -x 202
+	echo "t28a-lab: $(ts) locks held"
 	trap "stop_server; pkill -CONT -u piwi -f 'scripts/[g]olden/' 2>/dev/null || true" EXIT
 	pkill -STOP -u piwi -f 'scripts/[g]olden/' 2>/dev/null || true
 	local rc=0
 	echo "t28a-lab: $(ts) 1. teacher-forced p16,p17-long"
-	( cd "$R/src/crates/turbine-model" && LD_LIBRARY_PATH=$LIBS ROCR_VISIBLE_DEVICES=0 TURBINE_TEST_BACKEND=hip \
+	(cd "$R/src/crates/turbine-model" && LD_LIBRARY_PATH=$LIBS ROCR_VISIBLE_DEVICES=0 TURBINE_TEST_BACKEND=hip \
 		TURBINE_KERNEL_LIBRARY=$R/kbuild/libturbine_hip.so TURBINE_TEST_MODEL_DIR=$MODEL TURBINE_GOLDEN_YARN=p16,p17-long \
-		timeout 4h taskset -c 0-11 "$bin" --ignored --exact yarn_teacher_forced_vs_reference --nocapture ) >"$O/tf.out" 2>&1 || rc=1
+		timeout 4h taskset -c 0-11 "$bin" --ignored --exact yarn_teacher_forced_vs_reference --nocapture) >"$O/tf.out" 2>&1 || rc=1
 	grep -E '^YaRN .* max' "$O/tf.out" | sed 's/^/t28a-lab: /'
 	echo "t28a-lab: $(ts) 2. llama-yarn16"
 	if serve yarn16 "$R/src/scripts/lab/phase6-novanas-llama-yarn16.yaml"; then

@@ -3,6 +3,15 @@
 Written 2026-09-29 by the 28a builder at rotation (coordinator request). Worktree
 `.claude/worktrees/agent-p6a-yarn-t28a`, branch `p6a-yarn-t28a`, off d877f55. `git status` first.
 
+Updated 2026-09-29 ~22:05 by rotation 9 builder: merged integration tip `eba77a1` (p6a-mxfp4,
+clean, no conflicts). `scripts/gate.sh` was attempted 3× (21:54, 22:01, 22:04 +04) and each time
+`ssh` to novanas died mid-clippy/mid-lab-prune (`Connection closed by UNKNOWN port 65535`), never
+a real test/lint failure — matches the documented novanas ssh instability under concurrent-session
+load. Per rules-r5.md ("don't retry in a loop"), stopped after 3 attempts; **gate still not
+clean-passed**. Added the `t28a-lab.go` go-file wait to `p6a-yarn-28a-lab.sh` (rotation-9 GPU
+queue-order rule) before it takes `port18000.lock`. Did not touch lab-test.sh or the GPU (per
+brief, asked the lead for a slot instead).
+
 ## Done (commits)
 
 - fd201ab `handoff(turbine_kernels.h, ffi.rs, ops)`: `turbine_rope_desc.attn_factor` (trailing float),
