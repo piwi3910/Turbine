@@ -387,22 +387,7 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     // Phase 6a weight formats on gfx1201 Llama: `experimental` while each proof runs (plan
     // Tasks 14, 15, 18, 20), `supported` only after its gate.
     gfx1201_quant_row(WeightFormatColumn::Fp8),
-    // fp8_block (plan Task 15) proof passed 2026-09-29 (t15-proof, novanas): weight_bytes exact
-    // (3,607,615,488), no fp8_block_decoded fallback, c16 1061.44 tok/s (>= 854.7 BF16 floor,
-    // 1.57x the same run's vLLM-ROCm pass), GSM8K-200 drop 0.005 (<= 0.02 gate). Labbook
-    // turbine-lab-bench runs 2e31910f (turbine) / a86153ab (vllm-rocm). Flip to `supported`;
-    // still pending before this counts as fully closed: the golden fixture with
-    // --act-quant none (queued, fixture.queue rank 4), lab-bench --golden16 --c1 against it,
-    // and the soak.
-    row(
-        Some("amd"),
-        Some("gfx1201"),
-        Some("LlamaForCausalLM"),
-        Some(WeightFormatColumn::Fp8Block),
-        KV_BF16,
-        NO_SPEC,
-        SupportStatus::Supported,
-    ),
+    gfx1201_quant_row(WeightFormatColumn::Fp8Block),
     gfx1201_quant_row(WeightFormatColumn::Mxfp4),
     gfx1201_quant_row(WeightFormatColumn::Mxfp4A4),
     gfx1201_quant_row(WeightFormatColumn::AwqInt4),
@@ -1045,21 +1030,13 @@ mod tests {
                 }
             }
         }
-        // Nothing but the AMD BF16 baseline is supported before the tracks add rows, except the
-        // gfx1201 Llama fp8_block row (plan Task 15) once its proof passes.
+        // Nothing but the AMD BF16 baseline is supported before the tracks add rows.
         for r in SUPPORT_MATRIX
             .iter()
             .filter(|r| r.status == SupportStatus::Supported)
         {
             assert_eq!(r.key.vendor, Some("amd"), "{:?}", r.view());
-            let is_fp8_block_proof = r.key.arch == Some("gfx1201")
-                && r.key.architecture == Some("LlamaForCausalLM")
-                && r.key.weight_format == Some(W::Fp8Block);
-            assert!(
-                r.key.weight_format == Some(W::Bf16) || is_fp8_block_proof,
-                "{:?}",
-                r.view()
-            );
+            assert_eq!(r.key.weight_format, Some(W::Bf16), "{:?}", r.view());
             assert_eq!(r.key.kv_format, Some(K::Bf16), "{:?}", r.view());
             assert_eq!(r.key.speculative, Some(S::None), "{:?}", r.view());
         }
@@ -1078,15 +1055,9 @@ mod tests {
             ]
         );
         for w in W::PHASE_6A {
-            // Experimental on gfx1201 Llama while each proof runs, except fp8_block: its proof
-            // (plan Task 15, t15-proof) passed 2026-09-29 and the row flipped to `supported`.
+            // Experimental on gfx1201 Llama while each proof runs; refused elsewhere.
             let k = key("amd", "gfx1201", "LlamaForCausalLM", w, K::Bf16, S::None);
-            let expected = if w == WeightFormatColumn::Fp8Block {
-                "supported"
-            } else {
-                "experimental"
-            };
-            assert_eq!(resolve(&k).as_str(), expected, "{k}");
+            assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
             let k = key("amd", "gfx1201", "OlmoeForCausalLM", w, K::Bf16, S::None);
             let status = resolve(&k);
             assert_eq!(status.as_str(), "unsupported", "{k}");
