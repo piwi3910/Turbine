@@ -1,6 +1,7 @@
 //! `kv` configuration section: the Phase 0 tier switches, the Phase 2 L0 pool size and the
 //! Phase 4 tier, policy, transfer, session and prefetch keys (P4 §Configuration, S-15).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -46,8 +47,11 @@ pub struct KvConfig {
     /// Whether requests without `x-turbine-kv-lossy` may reuse lossy cached blocks (P6b S-3,
     /// Q15).
     pub lossy_reuse: LossyReuse,
-    /// Planner retrieval-cost penalty per lossy codec (P6b S-3, Q16).
-    pub lossy_penalty: KvLossyPenalty,
+    /// Planner retrieval-cost penalty per codec name (P6b S-3, Q16): a lossy block's retrieval
+    /// cost is multiplied by `1 + penalty` (0..=100). Null: every codec's own default
+    /// (`KvCodec::default_lossy_penalty`); an entry overrides one codec and the others keep
+    /// theirs. The names are checked against the `kv_format` registry at startup.
+    pub lossy_penalty: Option<BTreeMap<ModuleName, f64>>,
     /// The pressure-driven compression ladder (P6b S-6, S-7).
     pub ladder: KvLadderConfig,
 }
@@ -69,7 +73,7 @@ impl Default for KvConfig {
             policy_weights: KvPolicyWeights::default(),
             lossless_tail_blocks: 1,
             lossy_reuse: LossyReuse::Allow,
-            lossy_penalty: KvLossyPenalty::default(),
+            lossy_penalty: None,
             ladder: KvLadderConfig::default(),
         }
     }
@@ -114,73 +118,6 @@ impl KvDtypeChoice {
     pub fn is_turboquant(self) -> bool {
         matches!(self, KvDtypeChoice::Tq4 | KvDtypeChoice::Tq2)
     }
-
-    /// Position on the lossiness order shared with [`KvTierFormat::lossiness`]: `bf16` 0,
-    /// `fp8_e4m3` 1, `tq4` 2, `tq2` 3.
-    pub fn lossiness(self) -> u8 {
-        match self {
-            KvDtypeChoice::Bf16 => 0,
-            KvDtypeChoice::Fp8E4m3 => 1,
-            KvDtypeChoice::Tq4 => 2,
-            KvDtypeChoice::Tq2 => 3,
-        }
-    }
-}
-
-/// A lower-tier KV format (`kv.cpu.format`, `kv.nvme.format`, `kv.ladder.max_format`; P6b
-/// S-2): the name of a codec of the `kv_format` registry (`turbine_kv::codec`). The server
-/// checks at startup that each configured name is registered and resolves it against
-/// `turbine_core::support::TIER_FORMAT_REFUSALS`.
-#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum KvTierFormat {
-    /// The L0 bytes unchanged (lossless; the default).
-    #[default]
-    L0,
-    /// FP8 e4m3 (the L0 format when L0 is FP8, else lossy).
-    Fp8E4m3,
-    /// TurboQuant 4-bit (lossy).
-    Tq4,
-    /// TurboQuant 2-bit (lossy).
-    Tq2,
-}
-
-impl KvTierFormat {
-    /// Every format, in the `kv_format` registry's order (the lossiness order of the ladder).
-    pub const ALL: [KvTierFormat; 4] = [
-        KvTierFormat::L0,
-        KvTierFormat::Fp8E4m3,
-        KvTierFormat::Tq4,
-        KvTierFormat::Tq2,
-    ];
-
-    /// The codec name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            KvTierFormat::L0 => "l0",
-            KvTierFormat::Fp8E4m3 => "fp8_e4m3",
-            KvTierFormat::Tq4 => "tq4",
-            KvTierFormat::Tq2 => "tq2",
-        }
-    }
-
-    /// Lossiness of a tier holding this format below an L0 of `l0`, on the order of
-    /// [`KvDtypeChoice::lossiness`]: `l0` is the L0 format itself, so `fp8_e4m3` below an FP8
-    /// L0 equals `l0`.
-    pub fn lossiness(self, l0: KvDtypeChoice) -> u8 {
-        match self {
-            KvTierFormat::L0 => l0.lossiness(),
-            KvTierFormat::Fp8E4m3 => 1,
-            KvTierFormat::Tq4 => 2,
-            KvTierFormat::Tq2 => 3,
-        }
-    }
-
-    /// Whether a tier of this format below an L0 of `l0` stores the L0 bytes unchanged.
-    pub fn is_l0(self, l0: KvDtypeChoice) -> bool {
-        self == KvTierFormat::L0 || (self == KvTierFormat::Fp8E4m3 && l0 == KvDtypeChoice::Fp8E4m3)
-    }
 }
 
 /// `kv.lossy_reuse`: the default for requests without `x-turbine-kv-lossy`.
@@ -194,52 +131,6 @@ pub enum LossyReuse {
     Deny,
 }
 
-/// `kv.lossy_penalty`: a lossy block's retrieval cost is multiplied by `1 + penalty` (0..=100).
-/// One entry per registered lossy codec, so an unknown codec name is an unknown key (exit 2);
-/// entries left out keep their defaults.
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields, default)]
-pub struct KvLossyPenalty {
-    pub fp8_e4m3: f64,
-    pub tq4: f64,
-    pub tq2: f64,
-}
-
-impl Default for KvLossyPenalty {
-    fn default() -> Self {
-        KvLossyPenalty {
-            fp8_e4m3: 0.1,
-            tq4: 0.5,
-            tq2: 1.0,
-        }
-    }
-}
-
-impl KvLossyPenalty {
-    /// The penalty of `format` (`l0`, lossless, has none).
-    pub fn of(&self, format: KvTierFormat) -> f64 {
-        match format {
-            KvTierFormat::L0 => 0.0,
-            KvTierFormat::Fp8E4m3 => self.fp8_e4m3,
-            KvTierFormat::Tq4 => self.tq4,
-            KvTierFormat::Tq2 => self.tq2,
-        }
-    }
-
-    fn validate(&self) -> Result<(), ConfigError> {
-        for format in KvTierFormat::ALL {
-            let value = self.of(format);
-            if format != KvTierFormat::L0 && !(0.0..=100.0).contains(&value) {
-                return Err(invalid(
-                    &format!("kv.lossy_penalty.{}", format.as_str()),
-                    format!("must be between 0 and 100, got {value}"),
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
 /// `kv.ladder`: the pressure-driven compression ladder (P6b S-6, S-7; user decision
 /// 2026-09-28, Q17, Q18). Off by default.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
@@ -249,8 +140,8 @@ pub struct KvLadderConfig {
     pub enabled: bool,
     /// Whether L0 joins the ladder (S-7); false keeps it in L1/L2.
     pub l0: bool,
-    /// The lossiest rung, a lossy registered codec.
-    pub max_format: KvTierFormat,
+    /// The lossiest rung: a lossy codec of the `kv_format` registry (checked at startup).
+    pub max_format: ModuleName,
     /// Tier fill above which an upper tier compresses (and the floor may drop); 0.5 < v ≤ 1.0.
     pub high_water: f64,
     /// At YELLOW the lowest tier compresses only while `fill + demand` exceeds this (GREEN
@@ -263,7 +154,7 @@ impl Default for KvLadderConfig {
         KvLadderConfig {
             enabled: false,
             l0: true,
-            max_format: KvTierFormat::Tq2,
+            max_format: ModuleName::fixed("tq2"),
             high_water: 0.95,
             low_water: 0.85,
         }
@@ -295,8 +186,9 @@ impl Default for KvGpuConfig {
 pub struct KvCpuConfig {
     pub enabled: bool,
     pub max_bytes: ByteSize,
-    /// Codec of the blocks L1 holds (P6b S-2); not more precise than L0.
-    pub format: KvTierFormat,
+    /// Codec of the blocks L1 holds (P6b S-2): a `kv_format` registry name, checked at startup
+    /// with the tier ordering (not more precise than L0).
+    pub format: ModuleName,
 }
 
 impl Default for KvCpuConfig {
@@ -304,7 +196,7 @@ impl Default for KvCpuConfig {
         KvCpuConfig {
             enabled: true,
             max_bytes: ByteSize::gib(64),
-            format: KvTierFormat::L0,
+            format: ModuleName::fixed("l0"),
         }
     }
 }
@@ -319,9 +211,9 @@ pub struct KvNvmeConfig {
     pub slab_bytes: ByteSize,
     pub max_queue_depth: u32,
     pub io_threads: u32,
-    /// Codec of the blocks L2 holds (P6b S-2); not more precise than L1 when L1 is enabled,
-    /// else than L0.
-    pub format: KvTierFormat,
+    /// Codec of the blocks L2 holds (P6b S-2): a `kv_format` registry name, not more precise
+    /// than L1 when L1 is enabled, else than L0 (checked at startup).
+    pub format: ModuleName,
 }
 
 impl Default for KvNvmeConfig {
@@ -333,7 +225,7 @@ impl Default for KvNvmeConfig {
             slab_bytes: ByteSize::gib(1),
             max_queue_depth: 64,
             io_threads: 4,
-            format: KvTierFormat::L0,
+            format: ModuleName::fixed("l0"),
         }
     }
 }
@@ -474,33 +366,10 @@ impl KvConfig {
         self.validate_formats()
     }
 
-    /// P6b S-2, S-3, S-6: tier formats ordered from L0 down, the lossless tail, the penalties
-    /// and the ladder.
+    /// P6b S-2, S-3, S-6: the lossless tail, the penalties and the ladder. Codec names and the
+    /// tier ordering need the `kv_format` registry: `Config::validate_modules` and the server's
+    /// startup check them.
     fn validate_formats(&self) -> Result<(), ConfigError> {
-        let l0 = self.dtype;
-        let mut above = ("kv.dtype", l0.as_str(), l0.lossiness());
-        for (enabled, key, format) in [
-            (self.cpu.enabled, "kv.cpu.format", self.cpu.format),
-            (self.nvme.enabled, "kv.nvme.format", self.nvme.format),
-        ] {
-            if !enabled {
-                continue;
-            }
-            let lossiness = format.lossiness(l0);
-            if lossiness < above.2 {
-                return Err(invalid(
-                    key,
-                    format!(
-                        "{} is more precise than {} ({}): a tier may not be more precise than \
-                         the tier above it",
-                        format.as_str(),
-                        above.0,
-                        above.1
-                    ),
-                ));
-            }
-            above = (key, format.as_str(), lossiness);
-        }
         if self.lossless_tail_blocks > 64 {
             return Err(invalid(
                 "kv.lossless_tail_blocks",
@@ -510,14 +379,15 @@ impl KvConfig {
                 ),
             ));
         }
-        self.lossy_penalty.validate()?;
-        let ladder = &self.ladder;
-        if ladder.max_format == KvTierFormat::L0 {
-            return Err(invalid(
-                "kv.ladder.max_format",
-                "must be a lossy codec (fp8_e4m3, tq4 or tq2), got l0",
-            ));
+        for (name, &value) in self.lossy_penalty.iter().flatten() {
+            if !(0.0..=100.0).contains(&value) {
+                return Err(invalid(
+                    &format!("kv.lossy_penalty.{name}"),
+                    format!("must be between 0 and 100, got {value}"),
+                ));
+            }
         }
+        let ladder = &self.ladder;
         if !(0.5..1.0).contains(&ladder.low_water) {
             return Err(invalid(
                 "kv.ladder.low_water",
@@ -587,6 +457,15 @@ impl KvConfig {
             ));
         }
         Ok(())
+    }
+
+    /// The configured `kv.lossy_penalty` of codec `name`, if any (else the codec's default).
+    pub fn lossy_penalty_override(&self, name: &str) -> Option<f64> {
+        self.lossy_penalty
+            .as_ref()?
+            .iter()
+            .find(|(n, _)| n.as_str() == name)
+            .map(|(_, &v)| v)
     }
 
     /// Rules that need the model's KV block size, checked at startup once the model config is

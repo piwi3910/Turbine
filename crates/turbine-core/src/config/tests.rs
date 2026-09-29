@@ -1366,28 +1366,26 @@ fn phase6_keys_rope() {
 }
 
 /// P6b S-2 / S-9 (`phase6_keys`): the per-tier KV format, lossy-reuse and ladder keys have the
-/// spec's defaults (nothing lossy by default) and are validated statically (exit 2) naming the
-/// key: a tier may not be more precise than the tier above it, `kv.lossless_tail_blocks` is
-/// 0..=64, the ladder's water marks are ordered, a lossy penalty names a registered lossy codec
-/// and `kv.dtype` accepts `tq4` / `tq2` (refused later, at startup). Breaks if a key is missing,
-/// defaults to a lossy behaviour or goes unvalidated.
+/// spec's defaults (nothing lossy by default) and their syntax and ranges are validated
+/// statically (exit 2) naming the key: codec names are module names (whether a codec of that
+/// name exists, and the tier ordering, are checked at startup against the `kv_format`
+/// registry), `kv.lossless_tail_blocks` is 0..=64, the ladder's water marks are ordered,
+/// penalties are 0..=100 and `kv.dtype` accepts `tq4` / `tq2` (refused later, at startup).
+/// Breaks if a key is missing, defaults to a lossy behaviour or goes unvalidated.
 #[test]
 fn phase6_keys() {
     let base = "model:\n  path: /m\n";
     let d = parse(base, &[]).unwrap().kv;
     assert_eq!(d.dtype, KvDtypeChoice::Bf16);
-    assert_eq!(d.cpu.format, KvTierFormat::L0);
-    assert_eq!(d.nvme.format, KvTierFormat::L0);
+    assert_eq!(d.cpu.format.as_str(), "l0");
+    assert_eq!(d.nvme.format.as_str(), "l0");
     assert_eq!(d.lossless_tail_blocks, 1);
     assert_eq!(d.lossy_reuse, LossyReuse::Allow);
-    assert_eq!(d.lossy_penalty.fp8_e4m3, 0.1);
-    assert_eq!(d.lossy_penalty.tq4, 0.5);
-    assert_eq!(d.lossy_penalty.tq2, 1.0);
-    assert_eq!(d.lossy_penalty.of(KvTierFormat::L0), 0.0);
-    assert_eq!(d.lossy_penalty.of(KvTierFormat::Tq4), 0.5);
+    // No override: every codec keeps its own default penalty (codec metadata).
+    assert_eq!(d.lossy_penalty_override("tq4"), None);
     assert!(!d.ladder.enabled);
     assert!(d.ladder.l0);
-    assert_eq!(d.ladder.max_format, KvTierFormat::Tq2);
+    assert_eq!(d.ladder.max_format.as_str(), "tq2");
     assert_eq!(d.ladder.high_water, 0.95);
     assert_eq!(d.ladder.low_water, 0.85);
 
@@ -1402,6 +1400,7 @@ fn phase6_keys() {
             "kv.lossless_tail_blocks=0",
             "kv.lossy_reuse=deny",
             "kv.lossy_penalty.tq4=0.7",
+            "kv.lossy_penalty.my_codec=2",
             "kv.ladder.enabled=true",
             "kv.ladder.l0=false",
             "kv.ladder.max_format=tq4",
@@ -1414,73 +1413,48 @@ fn phase6_keys() {
     assert_eq!(c.dtype, KvDtypeChoice::Tq4);
     assert_eq!(c.dtype.as_str(), "tq4");
     assert!(c.dtype.is_lossy() && c.dtype.is_turboquant());
-    assert_eq!(c.cpu.format, KvTierFormat::Tq4);
     assert_eq!(c.cpu.format.as_str(), "tq4");
-    assert_eq!(c.nvme.format, KvTierFormat::Tq2);
+    assert_eq!(c.nvme.format.as_str(), "tq2");
     assert_eq!(c.lossless_tail_blocks, 0);
     assert_eq!(c.lossy_reuse, LossyReuse::Deny);
-    // A partial penalty map keeps the other defaults.
-    assert_eq!(c.lossy_penalty.tq4, 0.7);
-    assert_eq!(c.lossy_penalty.fp8_e4m3, 0.1);
+    assert_eq!(c.lossy_penalty_override("tq4"), Some(0.7));
+    assert_eq!(c.lossy_penalty_override("my_codec"), Some(2.0));
+    assert_eq!(c.lossy_penalty_override("fp8_e4m3"), None);
     assert!(c.ladder.enabled && !c.ladder.l0);
-    assert_eq!(c.ladder.max_format, KvTierFormat::Tq4);
+    assert_eq!(c.ladder.max_format.as_str(), "tq4");
     assert_eq!((c.ladder.high_water, c.ladder.low_water), (0.9, 0.5));
     assert_eq!(
         parse(base, &["kv.dtype=tq2"]).unwrap().kv.dtype,
         KvDtypeChoice::Tq2
     );
-    // `fp8_e4m3` below an FP8 L0 is the L0 format; `l0` is always accepted.
-    for (dtype, cpu) in [
-        ("fp8_e4m3", "fp8_e4m3"),
-        ("fp8_e4m3", "l0"),
-        ("tq2", "l0"),
-        ("bf16", "tq2"),
+    // Any well-formed name parses (a new codec needs no core edit); the registry check is
+    // `validate_modules`.
+    let c = parse(base, &["kv.cpu.format=zstd", "kv.lossy_penalty={lz4: 1}"]).unwrap();
+    for (known, key) in [
+        (task1_modules(), "kv.cpu.format"),
+        (
+            ModuleNames {
+                kv_formats: &["l0", "fp8_e4m3", "tq4", "tq2", "zstd"],
+                ..task1_modules()
+            },
+            "kv.lossy_penalty.lz4",
+        ),
     ] {
-        let sets = [format!("kv.dtype={dtype}"), format!("kv.cpu.format={cpu}")];
-        let sets: Vec<&str> = sets.iter().map(String::as_str).collect();
-        assert!(parse(base, &sets).is_ok(), "{sets:?}");
+        let err = c.validate_modules(&known).unwrap_err();
+        assert_eq!(err.key(), Some(key), "{err}");
+        assert!(err.to_string().contains("is not registered"), "{err}");
     }
-    // With L1 off, L2 is compared with L0.
     assert!(
-        parse(
-            base,
-            &[
-                "kv.cpu.enabled=false",
-                "kv.cpu.format=tq2",
-                "kv.nvme.enabled=true",
-                "kv.nvme.format=fp8_e4m3",
-            ],
-        )
-        .is_ok()
+        parse(base, &["kv.ladder.max_format=tq4"])
+            .unwrap()
+            .validate_modules(&task1_modules())
+            .is_ok()
     );
-
-    // L2 more precise than L1: exit 2 naming both keys.
-    let err = parse(
-        base,
-        &[
-            "kv.cpu.format=tq4",
-            "kv.nvme.enabled=true",
-            "kv.nvme.format=fp8_e4m3",
-        ],
-    )
-    .unwrap_err();
-    assert_eq!(err.key(), Some("kv.nvme.format"), "{err}");
-    assert!(err.to_string().contains("kv.cpu.format"), "{err}");
-    // L1 more precise than L0: naming both keys.
-    for (dtype, cpu) in [("tq4", "fp8_e4m3"), ("tq2", "tq4"), ("fp8_e4m3", "bf16")] {
-        let sets = [format!("kv.dtype={dtype}"), format!("kv.cpu.format={cpu}")];
-        let sets: Vec<&str> = sets.iter().map(String::as_str).collect();
-        match parse(base, &sets) {
-            Ok(_) => panic!("{sets:?} accepted"),
-            Err(err) => {
-                assert_eq!(err.key(), Some("kv.cpu.format"), "{err}");
-                // `bf16` is not a tier format at all; the others name kv.dtype.
-                if cpu != "bf16" {
-                    assert!(err.to_string().contains("kv.dtype"), "{err}");
-                }
-            }
-        }
-    }
+    let err = parse(base, &["kv.ladder.max_format=tq3"])
+        .unwrap()
+        .validate_modules(&task1_modules())
+        .unwrap_err();
+    assert_eq!(err.key(), Some("kv.ladder.max_format"), "{err}");
 
     for (sets, key) in [
         (
@@ -1502,18 +1476,17 @@ fn phase6_keys() {
         (&["kv.ladder.high_water=1.01"][..], "kv.ladder.high_water"),
         (&["kv.ladder.low_water=0.49"][..], "kv.ladder.low_water"),
         (&["kv.ladder.low_water=.nan"][..], "kv.ladder.low_water"),
-        (&["kv.ladder.max_format=l0"][..], "kv.ladder.max_format"),
-        (&["kv.ladder.max_format=zstd"][..], "kv.ladder.max_format"),
+        (&["kv.ladder.max_format=Tq2"][..], "kv.ladder.max_format"),
         (
             &["kv.ladder.enabled=true", "kv.cpu.enabled=false"][..],
             "kv.ladder.enabled",
         ),
-        (&["kv.lossy_penalty={zstd: 1}"][..], "kv.lossy_penalty"),
+        (&["kv.lossy_penalty={Zstd: 1}"][..], "kv.lossy_penalty"),
         (&["kv.lossy_penalty.tq4=100.5"][..], "kv.lossy_penalty.tq4"),
         (&["kv.lossy_penalty.tq2=-0.1"][..], "kv.lossy_penalty.tq2"),
         (&["kv.lossy_reuse=maybe"][..], "kv.lossy_reuse"),
-        (&["kv.cpu.format=zstd"][..], "kv.cpu.format"),
-        (&["kv.nvme.format=bf16"][..], "kv.nvme.format"),
+        (&["kv.cpu.format=fp8-e4m3"][..], "kv.cpu.format"),
+        (&["kv.nvme.format=\"\""][..], "kv.nvme.format"),
         (&["kv.dtype=int8"][..], "kv.dtype"),
         (
             &["model.rope_scaling={rope_type: dynamic, factor: 2.0}"][..],
@@ -1522,16 +1495,6 @@ fn phase6_keys() {
     ] {
         assert_rejected(base, sets, key);
     }
-    // Codec names are checked against the `kv_format` registry's names.
-    let c = parse(base, &["kv.cpu.format=tq4"]).unwrap();
-    assert!(c.validate_modules(&task1_modules()).is_ok());
-    let known = ModuleNames {
-        kv_formats: &["l0", "fp8_e4m3", "tq2"],
-        ..task1_modules()
-    };
-    let err = c.validate_modules(&known).unwrap_err();
-    assert_eq!(err.key(), Some("kv.cpu.format"), "{err}");
-    assert!(err.to_string().contains("is not registered"), "{err}");
     // The ladder is accepted with L2 alone.
     assert!(
         parse(

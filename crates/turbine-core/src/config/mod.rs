@@ -69,7 +69,7 @@ fn invalid(key: &str, reason: impl Into<String>) -> ConfigError {
 /// The name of a module in a registry (Phase 2m S-1): `^[a-z0-9_]{1,64}$`. The configuration
 /// only checks the form; whether a module of that name exists is checked against the
 /// registries by [`Config::validate_modules`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ModuleName(String);
 
@@ -585,21 +585,26 @@ impl Config {
             None,
         )?;
         check("kv.policy", &self.kv.policy, known.eviction_policies, None)?;
-        for (key, format) in [
-            ("kv.cpu.format", self.kv.cpu.format),
-            ("kv.nvme.format", self.kv.nvme.format),
-            ("kv.ladder.max_format", self.kv.ladder.max_format),
-        ] {
-            if !known.kv_formats.contains(&format.as_str()) {
-                return Err(invalid(
-                    key,
-                    format!(
-                        "`{}` is not registered (registered: {})",
-                        format.as_str(),
-                        known.kv_formats.join(", ")
-                    ),
-                ));
-            }
+        check("kv.cpu.format", &self.kv.cpu.format, known.kv_formats, None)?;
+        check(
+            "kv.nvme.format",
+            &self.kv.nvme.format,
+            known.kv_formats,
+            None,
+        )?;
+        check(
+            "kv.ladder.max_format",
+            &self.kv.ladder.max_format,
+            known.kv_formats,
+            None,
+        )?;
+        for name in self.kv.lossy_penalty.iter().flat_map(|m| m.keys()) {
+            check(
+                &format!("kv.lossy_penalty.{name}"),
+                name,
+                known.kv_formats,
+                None,
+            )?;
         }
         check(
             "parallel.collective_backend",
