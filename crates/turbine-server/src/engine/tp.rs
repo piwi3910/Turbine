@@ -813,6 +813,17 @@ pub(crate) struct StaticWorker {
     pub tiers: super::tp_tiers::WorkerTierStart,
 }
 
+impl StaticWorker {
+    /// This worker's own rank number (from its `Hello`), for `startup::serve` to name it when
+    /// its thread does not join in time at shutdown.
+    pub(crate) fn rank(&self) -> u32 {
+        match &self.hello {
+            RankMessage::Hello { rank, .. } => *rank,
+            _ => 0,
+        }
+    }
+}
+
 /// A rank after its load, before the group's warm-up.
 struct RankLoaded {
     executor: Box<dyn ModelExecutor>,
