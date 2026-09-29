@@ -434,10 +434,14 @@ fn assert_implementations(p: &Pair) {
         [
             "hipblaslt_fp8",
             "turbine_hip_int4_wmma",
-            "turbine_hip_int4_dequant"
+            "turbine_hip_int4_dequant",
+            "turbine_hip_mxfp4"
         ]
     );
-    assert_eq!(names(OpKind::QuantizeAct), ["turbine_hip"]);
+    assert_eq!(
+        names(OpKind::QuantizeAct),
+        ["turbine_hip", "turbine_hip_mxfp4"]
+    );
 }
 
 /// Phase 6a S-7: `hipblaslt_fp8` matches the CPU reference for FP8_TENSOR and FP8_CHANNEL
