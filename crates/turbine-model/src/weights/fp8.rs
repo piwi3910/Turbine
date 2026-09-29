@@ -28,8 +28,9 @@ use std::sync::Arc;
 use turbine_core::registry::Module;
 use turbine_core::support::WeightFormatColumn;
 use turbine_core::types::DType;
+use turbine_kernels::QGemmConfig;
 use turbine_kernels::cpu::quant::{dequantize, fp8_e4m3_round, fp8_e4m3_value};
-use turbine_kernels::quant::QuantSchemeDesc;
+use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
 
 use super::common::{
     Follows, Owned, bf16_bytes, bf16_values, f32_bytes, matches_ignore, module_of, pow2_at_least,
@@ -66,6 +67,9 @@ pub struct Fp8Layout {
     pub ignore: Vec<String>,
     /// The weight-scale tensor suffix (`weight_scale` or `weight_scale_inv`).
     pub scale_suffix: &'static str,
+    /// Block-scaled layers (checkpoint weight names) decoded to BF16 at load because no
+    /// selected provider runs them ([`Fp8Layout::fallback_layers`]); empty as parsed.
+    pub decoded: Vec<String>,
 }
 
 /// A checkpoint container of FP8 weights: its registry name, how its `quantization_config`
@@ -97,15 +101,81 @@ impl Fp8Layout {
             && !self.ignore.iter().any(|pat| matches_ignore(pat, module))
     }
 
-    /// Block-scaled weights are decoded to BF16 at load and served by the BF16 GEMM: no
-    /// provider runs block-scaled FP8 on gfx1201 (6a Task 15 evaluation; lead decision
-    /// 2026-09-29, provisional). Their activations stay BF16.
-    pub fn decodes(&self) -> bool {
-        matches!(self.weights, Fp8Weights::Block { .. })
+    /// Whether block-scaled layer `name` is decoded to BF16 at load and served by the BF16
+    /// GEMM: the fallback for a layer no selected provider runs (user decision 2026-09-29,
+    /// "Write own kernel in 6a": `turbine_hip_fp8_block` serves the rest in FP8).
+    pub fn decodes(&self, name: &str) -> bool {
+        matches!(self.weights, Fp8Weights::Block { .. }) && self.decoded.iter().any(|d| d == name)
+    }
+
+    /// Activations of block-scaled layers stay BF16 (W8A16: `turbine_hip_fp8_block` and the
+    /// decode fallback, decision "P6: block-scaled FP8 GEMM"); else the checkpoint's scheme.
+    pub fn activation(&self) -> ActivationQuant {
+        match self.weights {
+            Fp8Weights::Block { .. } => ActivationQuant::None,
+            Fp8Weights::Tensor | Fp8Weights::Channel => self.act,
+        }
+    }
+
+    /// The block-scaled layers of `slots` (the slots one device loads) to decode to BF16 at
+    /// load, each stack with its `[n, k]` and reason: a layer whose stack (the parts of a fused
+    /// projection together) `supports` refuses at the stack's or a part's `[n, k]`
+    /// (`kernel_unsupported`), or whose tensor-parallel shard cuts a scale block
+    /// (`shard_misaligned`). Whole stacks, in slot order; empty for other weights.
+    pub fn fallback_layers(
+        &self,
+        slots: &[WeightSlot],
+        supports: &dyn Fn(&QGemmConfig) -> bool,
+    ) -> Vec<(Vec<String>, [usize; 2], &'static str)> {
+        let Fp8Weights::Block { n: bn, k: bk } = self.weights else {
+            return Vec::new();
+        };
+        let qgemm = |n: usize, k: usize| QGemmConfig {
+            n: n as u32,
+            k: k as u32,
+            scheme: QuantSchemeDesc::Fp8Block {
+                block_n: bn,
+                block_k: bk,
+            },
+            act_quant: ActQuantDesc::None,
+            a_dtype: super::ACTIVATION_DTYPE,
+            c_dtype: super::ACTIVATION_DTYPE,
+        };
+        // Per stack (or lone layer): its key, parts, [n, k] and first refusal.
+        type Group = (String, Vec<String>, [usize; 2], Option<&'static str>);
+        let mut groups: Vec<Group> = Vec::new();
+        for slot in slots {
+            if !self.quantizes(&slot.name, &slot.shape) || self.decodes(&slot.name) {
+                continue;
+            }
+            let (n, k) = (slot.shape[0], slot.shape[1]);
+            let (key, whole) = match &slot.stack {
+                Some(p) if p.shape.len() == 2 => (p.name.clone(), [p.shape[0], p.shape[1]]),
+                _ => (slot.name.clone(), [n, k]),
+            };
+            let reason = if !self.derive(slot).1 {
+                Some("shard_misaligned")
+            } else if !(supports(&qgemm(n, k)) && supports(&qgemm(whole[0], whole[1]))) {
+                Some("kernel_unsupported")
+            } else {
+                None
+            };
+            match groups.iter_mut().find(|g| g.0 == key) {
+                Some(g) => {
+                    g.1.push(slot.name.clone());
+                    g.3 = g.3.or(reason);
+                }
+                None => groups.push((key, vec![slot.name.clone()], whole, reason)),
+            }
+        }
+        groups
+            .into_iter()
+            .filter_map(|(_, parts, shape, reason)| reason.map(|r| (parts, shape, r)))
+            .collect()
     }
 
     pub fn scheme(&self, l: &LinearSlot) -> QuantScheme {
-        if !self.quantizes(&l.name, &[l.n as usize, l.k as usize]) || self.decodes() {
+        if !self.quantizes(&l.name, &[l.n as usize, l.k as usize]) || self.decodes(&l.name) {
             return QuantScheme::Bf16;
         }
         match self.weights {
@@ -159,7 +229,7 @@ impl Fp8Layout {
             return (out, true);
         }
         let module = module_of(&base.name).expect("quantizes() checked the suffix");
-        if self.decodes() {
+        if self.decodes(&base.name) {
             // The weight is decoded into its BF16 slot (sharded like any BF16 weight); its
             // scales (and a static input scale) are only read, as companions or checked.
             out.push(check_slot(&format!("{module}.{}", self.scale_suffix)));
@@ -255,7 +325,7 @@ impl Fp8Layout {
     }
 
     pub fn slot_dtype(&self, slot: &WeightSlot) -> DType {
-        if self.decodes() && self.quantizes(&slot.name, &slot.shape) {
+        if self.decodes(&slot.name) && self.quantizes(&slot.name, &slot.shape) {
             super::Bf16::DTYPE
         } else if self.repacks(slot) {
             DType::F32
@@ -273,13 +343,14 @@ impl Fp8Layout {
     /// The scale slots are converted to F32 (and expanded per row); a decoded block-scaled
     /// weight is converted to BF16.
     pub fn repacks(&self, slot: &WeightSlot) -> bool {
-        self.is_scale(&slot.name) || (self.decodes() && self.quantizes(&slot.name, &slot.shape))
+        self.is_scale(&slot.name)
+            || (self.decodes(&slot.name) && self.quantizes(&slot.name, &slot.shape))
     }
 
     /// A decoded weight reads its block scales.
     pub fn companions(&self, slot: &WeightSlot) -> Vec<String> {
         match module_of(&slot.name) {
-            Some(module) if self.decodes() && self.quantizes(&slot.name, &slot.shape) => {
+            Some(module) if self.decodes(&slot.name) && self.quantizes(&slot.name, &slot.shape) => {
                 vec![format!("{module}.{}", self.scale_suffix)]
             }
             _ => Vec::new(),
@@ -302,7 +373,7 @@ impl Fp8Layout {
         let Fp8Weights::Block { n: bn, k: bk } = self.weights else {
             return self.repack(slot, entry, bytes);
         };
-        if !self.quantizes(&slot.name, &slot.shape) {
+        if !(self.decodes(&slot.name) && self.quantizes(&slot.name, &slot.shape)) {
             return self.repack(slot, entry, bytes);
         }
         let [(scale_entry, scale_bytes)] = companions else {
@@ -482,11 +553,31 @@ impl<P: Fp8Packaging> WeightFormat for Fp8Format<P> {
     }
 
     fn activation(&self) -> ActivationQuant {
-        if self.layout.decodes() {
-            ActivationQuant::None
-        } else {
-            self.layout.act
+        self.layout.activation()
+    }
+
+    fn for_kernels(
+        &self,
+        slots: &[WeightSlot],
+        supports: &dyn Fn(&QGemmConfig) -> bool,
+    ) -> Option<Arc<dyn WeightFormat>> {
+        let fallback = self.layout.fallback_layers(slots, supports);
+        if fallback.is_empty() {
+            return None;
         }
+        let mut layout = self.layout.clone();
+        for (parts, [n, k], reason) in fallback {
+            tracing::warn!(
+                event = "fp8_block_decoded",
+                reason,
+                layers = %parts.join(","),
+                n,
+                k,
+                "block-scaled FP8 layer decoded to BF16 at load: no selected provider runs it in FP8"
+            );
+            layout.decoded.extend(parts);
+        }
+        Some(Arc::new(Fp8Format::<P>::with(layout)))
     }
 
     fn slots(&self, base: &WeightSlot) -> Vec<WeightSlot> {

@@ -2127,6 +2127,28 @@ fn lab_serve_gpus_2_renders_a_two_gpu_serve_job() {
     );
 }
 
+/// PSU rule (coordinator 2026-09-29): a real `lab-serve --gpus 2` is refused while one GPU job at
+/// a time holds, but its dry run still renders the Job and names the refusal. Breaks if the dry
+/// run starts failing (as e06afc9 did) or stops saying a real run would be refused.
+#[test]
+fn lab_serve_gpus_2_dry_run_names_the_one_gpu_refusal() {
+    let text = dry_run(
+        "lab-serve.sh",
+        "serve-gpus-2-psu",
+        &[
+            "--dry-run",
+            "novanas",
+            "scripts/lab/phase5-novanas-olmoe.yaml",
+            "--gpus",
+            "2",
+        ],
+    );
+    assert!(
+        text.contains("a real run refuses --gpus 2 while one GPU job at a time holds"),
+        "{text}"
+    );
+}
+
 /// Umbrella S-1 (amended by the Phase 6 split, 2026-09-28): `scripts/track-gate.sh` against a
 /// stub procoder launcher, temporary track specs and support-matrix files.
 #[cfg(unix)]

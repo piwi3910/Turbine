@@ -34,12 +34,15 @@
 //                                1 turbine_hip_int4_wmma [turbine_hip],
 //                                2 turbine_hip_int4_dequant [turbine_hip]
 //                                  (INT4_GROUP_ZP / _SYM, BF16 activations)
+//                                n turbine_hip_fp8_block [turbine_hip]
+//                                  (FP8_BLOCK 128 x 128, BF16 activations)
 //   quantize_act (v2.9)          0 turbine_hip [turbine_hip] (FP8 modes)
 //   qgemm 3, quantize_act 1      turbine_hip_mxfp4 [turbine_hip] (MXFP4
 //                                  weights x BF16 activations; the
 //                                  MXFP4_EMULATED quantize-dequantize)
 #include <string>
 
+#include "qgemm_fp8_block.hpp"
 #include "qgemm_impls.hpp"
 #include "qgemm_int4.hpp"
 #include "qgemm_mxfp4.hpp"
@@ -261,6 +264,8 @@ const ImplEntry kQGemm[] = {
     entry<Int4<Int4Path::Dequant>>("turbine_hip_int4_dequant", kTurbine),
     entry<Impl<turbine_qgemm_desc, qgemm_mxfp4_supports, qgemm_mxfp4_run>>(
         "turbine_hip_mxfp4", kTurbine),
+    entry<Impl<turbine_qgemm_desc, qgemm_fp8_block_supports,
+               qgemm_fp8_block_run>>("turbine_hip_fp8_block", kTurbine),
 };
 const ImplEntry kQuantizeAct[] = {
     entry<Impl<turbine_quantize_act_desc, quantize_act_fp8_supports,
