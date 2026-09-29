@@ -1971,7 +1971,6 @@ After the user's "Find another checkpoint" answer the lead searched Hugging Face
 
 
 ## Phase 6a gate misses on GSM8K-200: FP8 KV (Llama, OLMoE) and MXFP4-A16 (8B) (2026-09-29)
-
 Asked 2026-09-29 by the 6a lead after the lost agents' results were collected. GSM8K-200 (chain of thought, `final_number`):
 
 - FP8 KV on Llama-3.2-3B-Instruct (Task 24): BF16 KV 0.805 (161/200), FP8 KV 0.790 (158/200); drop 0.015 > the plan's 0.01 bound. Throughput and the `kv_gpu` round trips pass.
