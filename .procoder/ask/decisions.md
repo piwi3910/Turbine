@@ -1971,7 +1971,6 @@ After the user's "Find another checkpoint" answer the lead searched Hugging Face
 
 Correction (6a lead, 2026-09-29, facts only; the decision stands): the checkpoint's KV recipe is `fp8_e4m3` per-tensor static K/V projection outputs (with `k_proj` / `v_proj` `output_scale` tensors), not fp4. It appears both in `kv_cache_quant_config` and as identical `layer_quant_config` entries for `*k_proj` / `*v_proj`; d1de280 ignores both, and the scale tensors load as `unexpected_tensor` WARNs.
 
-
 ## Phase 6a gate misses on GSM8K-200: FP8 KV (Llama, OLMoE) and MXFP4-A16 (8B) (2026-09-29)
 
 Asked 2026-09-29 by the 6a lead after the lost agents' results were collected. GSM8K-200 (chain of thought, `final_number`):
