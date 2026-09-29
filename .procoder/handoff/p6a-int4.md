@@ -1,5 +1,45 @@
 # Handoff: p6a-int4 (plan Tasks 16–18)
 
+## State 2026-09-29 ~15:30 (T18 builder, lead rotation 7/8)
+
+T18 run (`t18-run/run.log`, commit d14402f): `ALLDONE rc: bf16=0 awq=0 gptq=1`.
+
+AWQ verdict: PASS (full 200 req, GPU 0, same-run BF16 pair):
+- c16: 1262.6 vs BF16 842.8 tok/s = 1.50× (≥ 0.9×). c1 ITL p50: 5.87 vs 12.37 ms = 0.47× (≤ 0.6×).
+- golden c1 16/16 strict, c16 16/16 batched. GSM8K-200 0.775 vs BF16 0.805 (−0.030, bound 0.04);
+  vLLM-ROCm AWQ 485.8/494.2 tok/s, 0.755 → Turbine 2.55×, +0.020.
+- Labbook (set phase-6a-quantization): `lab-bench:t18-llama-awq:d14402f` pass,
+  `lab-bench:t18-llama:d14402f` (BF16 pair) auto-status fail. The cause is the tok_s relMin 0.97 against the
+  previous comparable run, `p6a-fp8-pinned-llama:56720ea` (876.5 tok/s, a 64-request `--quick` run): 842.8 is
+  0.962×. golden_c16 has no bound, so it plays no part. Full 200-request BF16 runs sit at 839–853 (t24c 852.7).
+  The status is unchanged; the lead decides.
+
+GPTQ start-up failure fixed: 44c30eb `handoff(crates/turbine-model/src/safetensors.rs)`. When
+`<dir>/config.json` has `tie_word_embeddings: true`, a listed-but-absent `lm_head.weight` is dropped from
+the index (WARN `event="index_entry_absent"`). Every other absence, and an untied or config-less
+checkpoint, still errors (test `safetensors::tests::tied_lm_head_listed_but_absent`, red then green).
+Lead review needed.
+
+GPTQ-only requeue, started 13:18Z (pid 609880; got the locks at once) detached on novanas (script copy `.procoder/handoff/t18_gptq_run.sh`, on the host
+`/home/piwi/turbine-ci/scratch/p6a-int4/t18_gptq_run.sh`; binaries of 44c30eb in
+`agent-abee0e2542a317f3c/target/release`): kernel build, then the gptq pass (golden c1 + c16, bench c16
+200 req, c1, GSM8K-200) under port18000.lock → bench.gate → bench.lock.
+- Log `/home/piwi/turbine-ci/scratch/p6a-int4/t18-run/run-gptq.log`, last line `t18_gptq_run: done rc=<rc>`.
+- Done marker `t18-run/gptq/done` (written only on rc=0). Results `t18-run/gptq/{golden1,golden16}.txt`,
+  `bench.json`, `bench-c1.json`, `quality.json`, `server.log` (grep `index_entry_absent` to confirm the
+  fix fired).
+- Golden already in at 13:2xZ: c1 16/16 PASS strict (tail 0.91), c16 16/16 PASS batched.
+- Judge against the bf16 pass in `t18-run/bf16/` (842.8 tok/s, c1 ITL 12.37 ms):
+  - golden1 and golden16 last lines PASS.
+  - bench.json `output_token_throughput` ≥ 758.5 (0.9×).
+  - bench-c1.json `itl_ms.p50` ≤ 7.42 ms (0.6×).
+  - GSM8K: copy `quality.json` to `tests/eval/llama-3.2-3b-instruct-gptq/turbine.json`, then run
+    `turbine-golden eval-compare --baseline tests/eval/llama-3.2-3b-instruct/turbine-bf16.json
+    --candidate … --max-drop 0.04` (pass ≥ 0.765). vLLM refuses GPTQ, so there is no vLLM pair.
+
+Remaining after the GPTQ run: commit the GPTQ eval + perf-log rows, labbook GPTQ run, soak on AWQ (ask the
+lead first), `handoff(crates/turbine-core/src/support.rs)` flipping the passing awq/gptq rows.
+
 ## State 2026-09-29 ~13:40 (T18 builder, rotation 5)
 
 Branch tip after `phase-6a-quantization` (a0ba309) merged in: d14402f + this handoff. Gate ok 777 at d14402f.
