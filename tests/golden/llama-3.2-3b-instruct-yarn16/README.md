@@ -33,21 +33,24 @@ and is compared with transformers' native YaRN on the same weights carrying that
 
   `--config-override` replaces `config.json`'s `rope_scaling` before the model loads (the same
   as a copy of the checkpoint carrying that `config.json`, without copying the weights); the
-  script logged `rotary yarn, attention scaling 1.2772588722239782`, the attention factor Turbine
-  folds into the softmax scale (`scale × factor²`).
-- `tolerance.json`: the BF16 Llama bounds unchanged (|Δ logprob| ≤ 0.15 likely, ≤ 0.55 tail;
-  batched 0.25 / 0.75; `min_identical_prefix` 32, `top_k` 5, `margin_nats` 0.5), with
-  `min_prompts_passing` 15 of the 17 prompts (Llama's 14 of 16 plus the long prompt).
-  **Provisional** — not calibrated for YaRN, and not yet known to hold. The Llama bounds were
-  assumed to carry over on the grounds that YaRN changes no kernel or precision; the evidence
-  contradicts that: transformers' own spread on this fixture
-  (`uv run scripts/golden/yarn_self_spread.py`, variant `bf16-sdpa-full`) puts p16's tail at
-  0.43, while Turbine measures 1.38 (HIP) and 1.49 (cpu-reference provider) on p16 and 1.42 on
-  p17-long at a greedy-identical token stream. Whether the gap comes from where the YaRN
-  attention factor is applied (Turbine folds `factor²` into the softmax scale, transformers
-  scales cos/sin; `yarn_self_spread.py --fold` and the lab diagnostic
-  `turbine-model --test golden yarn_teacher_forced_vs_reference`, column `unf`, measure it) is
-  open; the bounds change only with that spread evidence and a recorded decision.
+  script logged `rotary yarn, attention scaling 1.2772588722239782`, the attention factor that
+  multiplies cos and sin (transformers and, from plan Task 28a, Turbine's rope op: kernel ABI
+  v2.10 `turbine_rope_desc.attn_factor`).
+- `tolerance.json`: the BF16 Llama bounds (|Δ logprob| ≤ 0.15 likely, ≤ 0.55 tail; batched
+  0.25 / 0.75; `min_identical_prefix` 32, `top_k` 5, `margin_nats` 0.5), with
+  `min_prompts_passing` 15 of the 17 prompts (Llama's 14 of 16 plus the long prompt). Rule (user
+  decision 2026-09-29, "YaRN attention factor: on cos/sin"): max(transformers' own spread on this
+  fixture with the factor on cos/sin, `uv run scripts/golden/yarn_self_spread.py` without
+  `--fold`, the Llama BF16 bounds). The spread run (Task 28a) is recorded below; until it lands
+  the bounds are the Llama floor.
+
+  A/B that decided the placement (Task 28, teacher-forced p16 against this reference, lab test
+  `turbine-model --test golden yarn_teacher_forced_vs_reference`, max |Δ| likely / tail):
+  cpu-reference with the factor folded into the softmax scale (`scale × factor²`, Q19) 0.190 /
+  1.488; cpu-reference with the factor on cos/sin before BF16 rounding (transformers' placement)
+  0.067 / 0.395; HIP with the fold 0.099 / 1.382; transformers' own spread (`bf16-sdpa-full`)
+  0.43 tail. The fold rounded q·k before the factor; Task 28a moved the factor onto cos/sin
+  (kernel ABI v2.10) and the softmax scale back to `head_dim^-0.5`.
 
 Gate: `LABBOOK_SET=phase-6a-quantization scripts/lab-bench.sh --model llama-yarn16 --golden16`
 (GPU 0), golden at concurrency 1 and 16.

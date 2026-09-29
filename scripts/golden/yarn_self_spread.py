@@ -12,8 +12,10 @@ variant loads the override. Fixture time only; reads the weights, downloads noth
 
 usage: uv run scripts/golden/yarn_self_spread.py [--fold] <model-dir> <reference.jsonl> <out.json> [variant,...]
 
-`--fold` applies the attention factor as Turbine does (softmax scale × factor², cos and sin
-unscaled; user decision 2026-09-28, Q19), to measure what that placement alone costs.
+`--fold` applies the attention factor as Turbine did before plan Task 28a (softmax scale ×
+factor², cos and sin unscaled; Q19, superseded 2026-09-29), to measure what that placement alone
+costs. Without it, the factor multiplies cos and sin as in transformers and in Turbine from Task
+28a (kernel ABI v2.10): the run that sets the yarn16 tolerance.
 """
 
 import json
@@ -49,8 +51,8 @@ def _with_override(path, *args, **kwargs):
         flush=True,
     )
     if FOLD:
-        # Turbine's placement of the attention factor (user decision 2026-09-28, Q19): cos and
-        # sin unscaled, the softmax scale multiplied by factor² instead.
+        # Turbine's placement before Task 28a (Q19, superseded): cos and sin unscaled, the
+        # softmax scale multiplied by factor² instead.
         factor = rotary.attention_scaling
         rotary.attention_scaling = 1.0
         for layer in model.model.layers:

@@ -36,8 +36,9 @@ pub enum RopeScaling {
     /// `original_max_position_embeddings` defaults to `max_position_embeddings`, the betas to
     /// 32 / 1, `truncate` to true, and `attention_factor` to
     /// [`crate::executor::rope::yarn_attention_factor`] of `factor`, `mscale` and
-    /// `mscale_all_dim`. The attention factor scales the attention logits by its square
-    /// ([`ModelArchConfig::attention_scale`]), not the rotary table.
+    /// `mscale_all_dim`. The attention factor multiplies cos and sin inside the rope op
+    /// ([`ModelArchConfig::rope_attention_factor`], kernel ABI v2.10), not the rotary table and
+    /// not the softmax scale (user decision 2026-09-29, superseding Q19's fold).
     Yarn {
         factor: f64,
         original_max_position_embeddings: u32,
@@ -148,17 +149,24 @@ impl ModelArchConfig {
         }
     }
 
-    /// The attention softmax scale: `head_dim^-0.5`, times YaRN's `attention_factor²`
-    /// (transformers scales cos and sin, hence Q and K, by the factor; folding it into the
-    /// scale keeps the RoPE ABI unchanged — user decision 2026-09-28, Q19). Without YaRN it is
-    /// exactly `1 / sqrt(head_dim)` in FP32, as before Phase 6a.
+    /// The attention softmax scale: exactly `1 / sqrt(head_dim)` in FP32, with or without
+    /// YaRN — YaRN's attention factor is applied to cos and sin instead
+    /// ([`ModelArchConfig::rope_attention_factor`]; user decision 2026-09-29: folding its
+    /// square into this scale rounded q·k before the factor and measured a p16 golden tail of
+    /// 1.49 against 0.39 for transformers' placement).
     pub fn attention_scale(&self) -> f32 {
-        let base = 1.0 / (self.head_dim as f32).sqrt();
+        1.0 / (self.head_dim as f32).sqrt()
+    }
+
+    /// The factor the rope op multiplies cos and sin by before rounding (kernel ABI v2.10
+    /// `turbine_rope_desc.attn_factor`, P6a S-15): YaRN's resolved `attention_factor` in FP32
+    /// (transformers' `attention_scaling`), 1.0 for every other RoPE.
+    pub fn rope_attention_factor(&self) -> f32 {
         match self.rope_scaling {
             Some(RopeScaling::Yarn {
                 attention_factor, ..
-            }) => base * (attention_factor * attention_factor) as f32,
-            _ => base,
+            }) => attention_factor as f32,
+            _ => 1.0,
         }
     }
 
@@ -1171,20 +1179,26 @@ mod tests {
                 (attention_factor - want_af).abs() <= 1e-12 * want_af,
                 "{name}: attention factor {attention_factor}, transformers {want_af}"
             );
-            let base = 1.0 / (cfg.head_dim as f32).sqrt();
+            // The factor goes to cos/sin; the softmax scale stays head_dim^-0.5 (Task 28a).
             assert_eq!(
                 cfg.attention_scale(),
-                base * (attention_factor * attention_factor) as f32,
+                1.0 / (cfg.head_dim as f32).sqrt(),
                 "{name}"
+            );
+            assert_eq!(
+                cfg.rope_attention_factor(),
+                want_af as f32,
+                "{name}: the rope factor is transformers' attention_scaling in f32"
             );
             eprintln!(
                 "{name}: inv_freq max relative error {max_rel:.3e}, attention factor \
                  {attention_factor}"
             );
         }
-        // Without YaRN the scale is exactly the Phase 1 one.
+        // Without YaRN the scale is exactly the Phase 1 one and the rope factor is 1.
         let plain = load_model_config(&fixture_dir()).unwrap();
         assert_eq!(plain.attention_scale(), 1.0 / (128f32).sqrt());
+        assert_eq!(plain.rope_attention_factor(), 1.0);
     }
 
     /// The configuration key `model.rope_scaling` replaces `config.json`'s entry wholesale

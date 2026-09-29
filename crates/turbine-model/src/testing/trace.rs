@@ -225,12 +225,13 @@ impl<'a> LocalChecker<'a> {
     fn rope(&self, x: &[f32], heads: usize, p0: usize) -> Vec<f32> {
         let d = self.cfg.head_dim as usize;
         let half = d / 2;
+        let m = self.cfg.rope_attention_factor();
         let mut x = x.to_vec();
         for (t, token) in x.chunks_exact_mut(heads * d).enumerate() {
             for head in token.chunks_exact_mut(d) {
                 for i in 0..half {
                     let f = (p0 + t) as f32 * self.inv_freq[i];
-                    let (c, s) = (bf(f.cos()), bf(f.sin()));
+                    let (c, s) = (bf(f.cos() * m), bf(f.sin() * m));
                     let (x1, x2) = (head[i], head[i + half]);
                     head[i] = bf(bf(x1 * c) + bf(-x2 * s));
                     head[i + half] = bf(bf(x2 * c) + bf(x1 * s));
