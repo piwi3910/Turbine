@@ -273,10 +273,27 @@ Interfaces:
 - [ ] Lab (GPU 0, bench lock): `scripts/lab-bench.sh --model llama-fp8 --golden16` and `--model llama-fp8-tensor --golden16` — expect golden1/golden16 PASS; record `BENCH` lines; compare with the targets (c16 ≥ 1.10 × BF16, c1 ITL ≤ 0.75 ×).
 - [ ] Reference engine: `scripts/lab-serve.sh novanas --vllm llama-3.2-3b-instruct-fp8-dynamic` then the standard bench and `turbine-golden eval` against port 18100; stop with `--stop`. If vLLM does not load it on gfx1201, record that and use the BF16 baseline with `gate.json` max drop 0.02 (Q9).
 - [ ] Eval: `turbine-golden eval` for BF16 Llama and the FP8 server, `turbine-golden eval-compare` per `gate.json` — expect exit 0.
+- [ ] Eval, full set (amendment 2026-09-29, user decision "FP8-dynamic (Task 14): accuracy on full GSM8K against vLLM, c1 ITL as a perf item"): `turbine-golden eval --tasks tests/eval/gsm8k-full.jsonl --concurrency 16` on the FP8-dynamic Turbine server and on vLLM serving the same checkpoint (port 18100), one detached novanas script under the one-GPU-job rule; `turbine-golden eval-compare --baseline <vllm> --candidate <turbine> --max-drop <gate.json value>` — expect exit 0. This, not the 0.75× c1 ITL target (Task 14b), gates the row.
 - [ ] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m --model /home/piwi/turbine-models/llama-3.2-3b-instruct-fp8-dynamic` — expect verdict pass.
 - [ ] Flip the row to `supported`; `support::tests::baseline_rows_present` updated to expect it. Run: `scripts/remote-cargo.sh test -p turbine-core support` — expect PASS
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `feat(core): fp8 weights supported on gfx1201 Llama (golden, bench, eval, soak recorded)`
+
+## Task 14b: FP8 decode ITL at M = 1 (perf follow-up, not a support gate)
+
+Amendment 2026-09-29 (user decision "FP8-dynamic (Task 14): accuracy on full GSM8K against vLLM, c1 ITL as a perf item"): FP8-dynamic reads c1 ITL p50 0.846× BF16 (per-tensor 0.855×) against the 0.75× target. FP8 halves the weight bytes, so M = 1 decode should approach ≈ 0.6×; the gap is likely the per-token activation quantization plus hipBLASLt FP8 GEMM overhead at M = 1.
+
+Files: `.procoder/perf-log.md` (profile and A/B rows), `kernels/rocm/` (only if a measured change lands), `.procoder/ask/decisions.md` (kernel-reuse evaluation if a provider changes)
+Interfaces:
+
+- none new; a change stays behind the registered `QGemm` / `QuantizeAct` implementations
+  Covers: spec perf target `fp8` c1 ITL (non-gating)
+  Depends on: Task 14
+
+- [ ] Measure first: per-op decode profile (`forward_profile`, lab `--tier perf`) of `llama-fp8` against `llama` at c1, attributing the ITL gap to activation quantization, the FP8 GEMM and launch overhead; record in `.procoder/perf-log.md`.
+- [ ] If a single cause dominates, evaluate existing providers first (kernel-reuse rule: hipBLASLt solutions at M = 1, CK, fused quantize-into-GEMM), then land one change at a time with `scripts/lab-bench.sh --model llama-fp8 --golden16` after each — expect golden PASS and c1 ITL lower; otherwise record the finding and stop.
+- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [ ] Commit: `perf(kernels): FP8 M=1 decode ITL (<cause>)` or `docs(perf): FP8 M=1 ITL profile`
 
 ## Task 15: `fp8_block` — evaluation, implementation, proof
 
