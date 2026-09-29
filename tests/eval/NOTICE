@@ -6,6 +6,16 @@ commit 3101c7d5072418e28b9008a6636bde82a006892c. Each question is wrapped in a s
 user message with an answer-format instruction; the answer is the number after "#### "
 with thousands separators removed. Regenerate with scripts/eval/make-gsm8k-200.sh.
 
+tests/eval/gsm8k-full.jsonl
+
+The full GSM8K test split (1,319 items), downloaded from the Hugging Face dataset
+https://huggingface.co/datasets/openai/gsm8k (config `main`, split `test`), revision
+740312add88f781978c0658806c59bc2815b9866. Same wrapper, id scheme (`gsm8k-test-NNNN`)
+and answer extraction as gsm8k-200.jsonl above — its first 200 items are byte-identical
+to the committed gsm8k-200.jsonl. Regenerate with scripts/eval/make-gsm8k-full.sh
+(downloads the dataset's test-split parquet file on demand; needs `hf` and `uv`, run on
+novanas — the Hugging Face token lives there and nothing is uploaded).
+
 The source is distributed under the MIT License:
 
 MIT License
