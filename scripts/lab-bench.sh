@@ -199,6 +199,10 @@ if ! ssh -o BatchMode=yes "$host" "test -f /home/piwi/turbine-models/$slug/confi
 fi
 
 # 2. serve natively, pinned to one card
+# CPU fixture jobs (scripts/golden/*) are paused from here to the end (scripts/fixture-pause.sh
+# explains why: their swap-in pushes the server's pressure controller into SURVIVAL).
+ssh -o BatchMode=yes "$host" "pkill -STOP -u piwi -f 'scripts/[g]olden/'" >/dev/null 2>&1 || true
+trap 'ssh -o BatchMode=yes "$host" "pkill -CONT -u piwi -f '"'"'scripts/[g]olden/'"'"'" >/dev/null 2>&1 || true' EXIT
 # Only this run's own server is ever stopped: its pid is kept in $pidf and checked to still be
 # a turbine-server before the kill (a blanket pkill would also end other agents' test servers
 # running as piwi). A port already served is refused, not taken over.
