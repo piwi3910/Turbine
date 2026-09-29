@@ -240,7 +240,7 @@ Interfaces:
 Files: `crates/turbine-kv/src/policy/mod.rs` (`EvictAction`, `LadderContext`, default `action`), `crates/turbine-kv/src/policy/cost_aware.rs` (ladder rule), `crates/turbine-kv/src/policy/lru.rs` (default), `crates/turbine-kv/src/metrics.rs` (`EvictReason::{Compressed, LadderFloor}`), `docs/extending/eviction-policy.md` (action, ladder, pitfalls)
 Interfaces:
 
-- as the spec's Interfaces; rung order from `kv.ladder.max_format` and the codec registry's lossiness order (`l0` < `fp8_e4m3` < `tq4` < `tq2`)
+- as the spec's Interfaces; rung order from `kv.ladder.max_format` and the codec registry's lossiness order (`l0` < `fp8_e4m3` < `tq4` < `tq2`); compression starts at YELLOW even when no tier is full (user decision 2026-09-29, "Start at YELLOW earlier"): the `p6b-groundwork` rule "a tier acts only when it is the lowest and about to drop, or above high water" becomes "at YELLOW or above the lowest enabled tier acts; at any non-GREEN state a tier about to drop or above high water acts", with `ladder_actions` updated (a YELLOW case with free room compresses one rung)
   Covers: spec S-6 (policy); AC `policy::tests::ladder_actions`
   Depends on: Task 9
 
