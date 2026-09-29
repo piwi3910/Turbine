@@ -238,7 +238,8 @@ pub struct KvFormatUnavailable {
 
 /// Refuses, before binding (exit 1), the KV formats that need the optional ABI v2.10 group
 /// (P6b S-1, S-5, S-7), which no kernel provider implements yet: TurboQuant L0 pages
-/// (`kv.dtype: tq4|tq2`) and the ladder's L0 step need the mixed-format paged attention
+/// (`kv.dtype: tq4|tq2`) on a GPU backend and the ladder's L0 step need the mixed-format paged
+/// attention
 /// (`kv_tq_unavailable`); a lower tier not stored at the L0 format and the ladder's L1/L2
 /// rungs need the KV transcode (`kv_transcode_unavailable`). Plan Tasks 5 and 12 replace these
 /// refusals with the loaded library's v2.10 check.
@@ -248,10 +249,12 @@ pub fn kv_format_availability(cfg: &Config) -> Result<(), KvFormatUnavailable> {
         code: "kv_tq_unavailable",
         message,
     };
-    if kv.dtype.is_turboquant() {
+    // The CPU reference provider reads TurboQuant pages (`cpu::tq_attention`, P6b S-5); a GPU
+    // provider needs the v2.10 mixed-format paged attention (plan Task 12).
+    if kv.dtype.is_turboquant() && vendor(cfg) != "cpu" {
         return Err(tq(format!(
-            "kv.dtype {} needs the ABI v2.10 mixed-format paged attention, which no kernel \
-             provider implements yet",
+            "kv.dtype {} needs the ABI v2.10 mixed-format paged attention, which no GPU kernel \
+             provider implements yet (the cpu backend runs it)",
             kv.dtype.as_str()
         )));
     }
@@ -274,7 +277,11 @@ pub fn kv_format_availability(cfg: &Config) -> Result<(), KvFormatUnavailable> {
         .into_iter()
         .filter(|(key, _)| *key != "kv.ladder.max_format")
     {
-        if turbine_kv::codec::tier_rung(format, l0) != l0_rung {
+        // Below TurboQuant L0 pages a tier stores them as they are (`l0`): the tier codecs
+        // encode from BF16 / FP8 pages only.
+        if turbine_kv::codec::tier_rung(format, l0) != l0_rung
+            || kv.dtype.is_turboquant() && format != "l0"
+        {
             return Err(transcode(format!("{key} {format}")));
         }
     }
@@ -580,14 +587,25 @@ mod tests {
             "kv_transcode_unavailable"
         );
 
+        // TurboQuant L0 pages (P6b S-5): the cpu backend runs them (`experimental`), a GPU
+        // backend is refused (`kv_tq_unavailable`; the support matrix first, naming kv.dtype),
+        // and a lower tier below them stores them as they are.
         for dtype in [KvDtypeChoice::Tq4, KvDtypeChoice::Tq2] {
             let mut l0 = config("cpu", llama.path());
             l0.kv.dtype = dtype;
-            let err = kv_format_availability(&l0).unwrap_err();
-            assert_eq!(err.code, "kv_tq_unavailable", "{err:?}");
-            // The support matrix refuses it first, naming kv.dtype (exit 2).
+            assert_eq!(kv_format_availability(&l0), Ok(()));
             assert_eq!(format_columns(&l0).1.as_str(), dtype.as_str());
-            let err = before_discovery(&l0).unwrap_err();
+            let first = before_discovery(&l0).unwrap();
+            assert_eq!(first.status, SupportStatus::Experimental, "{}", first.key);
+            l0.kv.cpu.format = name(dtype.as_str());
+            let err = kv_format_availability(&l0).unwrap_err();
+            assert_eq!(err.code, "kv_transcode_unavailable", "{err:?}");
+
+            let mut hip = config("hip", llama.path());
+            hip.kv.dtype = dtype;
+            let err = kv_format_availability(&hip).unwrap_err();
+            assert_eq!(err.code, "kv_tq_unavailable", "{err:?}");
+            let err = before_discovery(&hip).unwrap_err();
             assert_eq!(err.key(), Some("kv.dtype"), "{err}");
         }
     }

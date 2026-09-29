@@ -21,12 +21,10 @@ fn invalid(message: String) -> ModelError {
 
 const I32: usize = 4;
 
-/// Bytes of one block within one layer: `[2, block_tokens, kv_heads, head_dim]`.
+/// Bytes of one block within one layer: `[2, block_tokens, kv_heads, head_dim]`, or one
+/// TurboQuant record per (token, KV head) (P6b S-5).
 pub(crate) fn layer_block_bytes(layout: &KvLayout) -> u64 {
-    2 * u64::from(layout.block_tokens)
-        * u64::from(layout.num_kv_heads)
-        * u64::from(layout.head_dim)
-        * layout.dtype.size_bytes() as u64
+    layout.layer_block_bytes()
 }
 
 /// Checks that `kv` has the executor's layout and that its storage holds every layer.
@@ -56,13 +54,19 @@ pub(crate) fn check_pool(kv: &KvPoolView<'_>, layout: &KvLayout) -> Result<(), M
 }
 
 /// Layer `layer` of the pool as the dense `[num_blocks, 2, block_tokens, kv_heads, head_dim]`
-/// tensor the paged attention op takes. The pool must have passed [`check_pool`].
+/// tensor the paged attention op takes; TurboQuant pages (P6b S-5), whose records are not
+/// elements, as `[num_blocks, layer_block_bytes]` bytes of their dtype. The pool must have
+/// passed [`check_pool`].
 pub(crate) fn kv_layer<'a>(kv: &KvPoolView<'a>, layer: usize) -> TensorView<'a> {
     let l = &kv.layout;
-    let bytes = kv.num_blocks as usize * layer_block_bytes(l) as usize;
+    let block = layer_block_bytes(l) as usize;
+    let bytes = kv.num_blocks as usize * block;
     let slice = kv
         .storage
         .slice(layer * kv.layer_stride_bytes as usize, bytes);
+    if l.dtype.tq_record_bytes().is_some() {
+        return TensorView::contiguous(slice, 0, &[kv.num_blocks as usize, block], l.dtype);
+    }
     TensorView::contiguous(
         slice,
         0,

@@ -100,22 +100,50 @@ pub(crate) fn record_quantization(
 
 /// The L0 KV format of `kv.dtype` (Phase 6a S-13): BF16, or FP8 e4m3 with the checkpoint's
 /// per-layer `k_scale` / `v_scale` (1.0 when it stores none; user decision 2026-09-28, Q10).
+///
+/// TurboQuant pages (`kv.dtype: tq4 | tq2`, P6b S-5) carry the tables of every layer under the
+/// seed of their KV namespace ([`crate::kv_tq`]); on one device only (`sharded`: a tensor,
+/// expert or pipeline rank is refused with `kv_tq_unavailable`, never served as BF16 pages).
 fn kv_cache(
     config: &Config,
     index: &SafetensorsIndex,
-    num_layers: u32,
+    arch: &turbine_model::config::ModelArchConfig,
+    sharded: bool,
 ) -> Result<KvCache, StartupError> {
+    let num_layers = arch.num_layers;
     match config.kv.dtype {
         KvDtypeChoice::Bf16 => return Ok(KvCache::bf16()),
         KvDtypeChoice::Fp8E4m3 => {}
-        // Refused before binding (`support_startup::kv_format_availability`); never served as
-        // BF16 pages.
         other => {
-            return Err(StartupError::new(format!(
-                "kv_tq_unavailable: kv.dtype {} needs the ABI v2.10 mixed-format paged \
-                 attention, which no kernel provider implements yet",
+            let unavailable = |why: String| {
+                StartupError::new(format!(
+                    "kv_tq_unavailable: kv.dtype {}: {why}",
+                    other.as_str()
+                ))
+            };
+            let Some(dtype) = crate::kv_tq::dtype(other.as_str()) else {
+                return Err(unavailable("not an L0 KV format".into()));
+            };
+            if sharded {
+                return Err(unavailable(
+                    "TurboQuant L0 pages run on one device only (no tensor, expert or pipeline \
+                     parallelism)"
+                        .into(),
+                ));
+            }
+            let identity = model_identity(&config.model.path)?.with_rope(&arch.rope_identity());
+            let layout = KvLayout {
+                dtype,
+                ..arch.kv_layout(config.kv.block_tokens)
+            };
+            let cache = crate::kv_tq::kv_cache(&identity, layout).map_err(unavailable)?;
+            tracing::info!(
+                event = "kv_dtype",
+                dtype = other.as_str(),
+                "L0 KV pages are TurboQuant {} records (P6b S-5, experimental)",
                 other.as_str()
-            )));
+            );
+            return Ok(cache);
         }
     }
     let cache = KvCache::fp8_from_checkpoint(index, num_layers)
@@ -537,7 +565,8 @@ fn prepare_with(
     let index = SafetensorsIndex::open(dir).map_err(|e| model_error("weights", e))?;
     arch.check_supported_weights(&index)
         .map_err(|e| model_error("weights", e))?;
-    arch.kv_cache = kv_cache(config, &index, arch.num_layers)?;
+    let sharded = shard.is_some() || expert.is_some() || stage.is_some();
+    arch.kv_cache = kv_cache(config, &index, &arch, sharded)?;
 
     if !config.kv.gpu.enabled {
         return Err(StartupError::new(

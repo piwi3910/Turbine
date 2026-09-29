@@ -54,5 +54,8 @@ toktrie_hf_tokenizers.workspace = true
 unsafe_code = "forbid"
 
 [dev-dependencies]
+# The TurboQuant codec (records, rotation signs, QJL projection, codebooks) the TurboQuant L0
+# pages of tiny_model's `tq_kv_matches_reference` are encoded and checked with
+turbine-kv.workspace = true
 # structured::tests: constrained outputs validate against their schema
 jsonschema.workspace = true

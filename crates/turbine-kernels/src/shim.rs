@@ -2152,7 +2152,9 @@ impl GemmKernel for ShimProvider {
 impl AttentionKernel for ShimProvider {
     fn supports(&self, cfg: &AttentionConfig) -> bool {
         if let Some(trio) = self.paged_trio(cfg.kind) {
-            cfg.block_tokens.is_some_and(|b| b > 0) && Self::supported(trio, &paged_probe(cfg))
+            cfg.block_tokens.is_some_and(|b| b > 0)
+                && cfg.dtype.tq_record_bytes().is_none()
+                && Self::supported(trio, &paged_probe(cfg))
         } else if let Some(trio) = self.attention_trio(cfg.kind) {
             cfg.block_tokens.is_none() && Self::supported(trio, &attention_probe(cfg))
         } else {
@@ -2212,6 +2214,22 @@ impl AttentionKernel for ShimProvider {
                 cfg.block_tokens
             )));
         };
+        // P6b S-5: TurboQuant pages and mixed-format block tables need the ABI v2.10 fields
+        // (plan Task 12); below them every block is in `cfg.dtype`.
+        let base = crate::ops::kv_format_code(cfg.dtype);
+        if cfg.dtype.tq_record_bytes().is_some()
+            || ctx.tq.is_some()
+            || ctx.block_formats.iter().any(|f| Some(*f) != base)
+        {
+            return Err(KernelError::Unsupported {
+                message: format!(
+                    "{} over {} pages or a mixed-format block table needs the ABI v2.10 \
+                     mixed-format paged attention",
+                    cfg.op(),
+                    cfg.dtype.as_str()
+                ),
+            });
+        }
         let (hkv, d) = (cfg.num_kv_heads as usize, cfg.head_dim as usize);
         let new_stride_token = row_stride("k_new", &ctx.k_new, 3)?;
         if row_stride("v_new", &ctx.v_new, 3)? != new_stride_token {

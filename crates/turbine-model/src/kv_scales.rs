@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use half::{bf16, f16};
 use turbine_core::types::DType;
+use turbine_kernels::{TqEncodeFn, TqPaged, TqParams};
 
 use crate::ModelError;
 use crate::safetensors::{Dtype, SafetensorsIndex, TensorEntry, io_err, open_regular};
@@ -21,6 +22,28 @@ pub struct KvCache {
     pub k_scales: Arc<[f32]>,
     /// Per-layer V dequantization scales (FP8 only; empty for BF16).
     pub v_scales: Arc<[f32]>,
+    /// TurboQuant pages (P6b S-5): the tables of every layer and the codec; `None` otherwise.
+    pub tq: Option<TqKv>,
+}
+
+/// The TurboQuant side of TurboQuant L0 pages (P6b S-5): the rotation seed (the first 8 bytes
+/// of the unsalted KV namespace key), the tables of every model layer derived from it, and the
+/// codec that encodes appended rows (`turbine-kv`'s, supplied by the caller: this crate carries
+/// no encoder).
+#[derive(Clone, Debug)]
+pub struct TqKv {
+    pub seed: u64,
+    /// Per model layer.
+    pub layers: Arc<[TqParams]>,
+    pub encode: TqEncodeFn,
+}
+
+/// Equal tables under the same seed (function pointers have no reliable identity; the codec is
+/// the one `turbine-kv` encoder in every caller).
+impl PartialEq for TqKv {
+    fn eq(&self, other: &Self) -> bool {
+        self.seed == other.seed && self.layers == other.layers
+    }
 }
 
 impl KvCache {
@@ -30,6 +53,7 @@ impl KvCache {
             dtype: DType::BF16,
             k_scales: Arc::from(Vec::new()),
             v_scales: Arc::from(Vec::new()),
+            tq: None,
         }
     }
 
@@ -39,7 +63,29 @@ impl KvCache {
             dtype: DType::F8E4M3,
             k_scales: Arc::from(k_scales),
             v_scales: Arc::from(v_scales),
+            tq: None,
         }
+    }
+
+    /// TurboQuant pages of `dtype` ([`DType::Tq4`] or [`DType::Tq2`]) with `tq`'s tables.
+    pub fn turboquant(dtype: DType, tq: TqKv) -> KvCache {
+        debug_assert!(dtype.tq_record_bytes().is_some(), "{dtype:?}");
+        KvCache {
+            dtype,
+            k_scales: Arc::from(Vec::new()),
+            v_scales: Arc::from(Vec::new()),
+            tq: Some(tq),
+        }
+    }
+
+    /// The TurboQuant tables and codec of model layer `layer` for the paged attention; `None`
+    /// for BF16 / FP8 pages.
+    pub fn tq_paged(&self, layer: usize) -> Option<TqPaged<'_>> {
+        let tq = self.tq.as_ref()?;
+        Some(TqPaged {
+            params: tq.layers.get(layer)?,
+            encode: tq.encode,
+        })
     }
 
     /// True when the pages are quantized (FP8).

@@ -248,6 +248,32 @@ pub fn decode_record(
     decode_record_with(w, record, &HeadSigns::of(seed, layer, head))
 }
 
+/// Encodes one token-head K/V pair (`TQ_DIM` values each) into `record` (`w.record_bytes()`
+/// bytes, fully written, padding zeroed) with the (layer, head) rotation signs and QJL
+/// projection: exactly the record `encode_cpu` writes for these values. The L0 paged append of
+/// TurboQuant pages (P6b S-5) encodes new rows through it.
+pub fn encode_record(
+    w: TqWidths,
+    k: &[f32],
+    v: &[f32],
+    k_signs: &[f32],
+    v_signs: &[f32],
+    qjl_s: &[f32],
+    record: &mut [u8],
+) {
+    let f = Fields::of(w);
+    let k = encode_k(k, w.k_bits, k_signs, qjl_s);
+    let v = encode_v(v, w.v_bits, v_signs);
+    let r = &mut record[..w.record_bytes()];
+    r.fill(0);
+    r[f.k_codes..f.k_norm].copy_from_slice(&k.codes);
+    r[f.k_norm..f.qjl].copy_from_slice(&k.norm.to_le_bytes());
+    r[f.qjl..f.r_norm].copy_from_slice(&k.qjl);
+    r[f.r_norm..f.v_codes].copy_from_slice(&k.residual_norm.to_le_bytes());
+    r[f.v_codes..f.v_norm].copy_from_slice(&v.codes);
+    r[f.v_norm..f.v_norm + 2].copy_from_slice(&v.norm.to_le_bytes());
+}
+
 /// Shared implementation of `tq4` and `tq2`.
 fn tq_supports(name: &'static str, l0: &KvLayout) -> Result<(), CodecError> {
     check_l0_dtype(name, l0)?;
@@ -280,7 +306,6 @@ fn tq_encode(
     check_size(name, "source", src.len(), l0.block_bytes())?;
     check_size(name, "destination", dst.len(), tq_bytes(w, l0))?;
     let g = L0Geometry::of(l0);
-    let f = Fields::of(w);
     let rec = w.record_bytes();
     let read = |layer, kind, t, h| -> Vec<f32> {
         let base = g.vector_elem(layer, kind, t, h);
@@ -295,14 +320,8 @@ fn tq_encode(
             let s = HeadSigns::of(p.seed, layer, h);
             for t in 0..g.tokens {
                 let r = &mut dst[((layer * g.heads + h) * g.tokens + t) * rec..][..rec];
-                let k = encode_k(&read(layer, 0, t, h), w.k_bits, &s.k, &s.qjl);
-                let v = encode_v(&read(layer, 1, t, h), w.v_bits, &s.v);
-                r[f.k_codes..f.k_norm].copy_from_slice(&k.codes);
-                r[f.k_norm..f.qjl].copy_from_slice(&k.norm.to_le_bytes());
-                r[f.qjl..f.r_norm].copy_from_slice(&k.qjl);
-                r[f.r_norm..f.v_codes].copy_from_slice(&k.residual_norm.to_le_bytes());
-                r[f.v_codes..f.v_norm].copy_from_slice(&v.codes);
-                r[f.v_norm..f.v_norm + 2].copy_from_slice(&v.norm.to_le_bytes());
+                let (k, v) = (read(layer, 0, t, h), read(layer, 1, t, h));
+                encode_record(w, &k, &v, &s.k, &s.v, &s.qjl, r);
             }
         }
     }

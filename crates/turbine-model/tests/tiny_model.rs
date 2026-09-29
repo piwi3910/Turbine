@@ -26,6 +26,12 @@ use turbine_kernels::{
     PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel, ShimContext,
     ShimLibrary, cpu_reference_provider, shim_provider,
 };
+use turbine_kernels::{KV_FMT_TQ2, KV_FMT_TQ4, TqHeadTables, TqParams};
+use turbine_kv::codec::turboquant::codebook::{TQ_DIM, codebook};
+use turbine_kv::codec::turboquant::hadamard::{SignKind, rademacher};
+use turbine_kv::codec::turboquant::{
+    Tq2Codec, Tq4Codec, TqWidths, decode_record, encode_record, qjl,
+};
 use turbine_model::config::{ModelArchConfig, RopeScaling};
 use turbine_model::ep::{self, ExpertPlacement};
 use turbine_model::executor::{
@@ -34,7 +40,7 @@ use turbine_model::executor::{
     TokenFeed, TraceTensor, build_executor, graphs,
 };
 use turbine_model::families;
-use turbine_model::kv_scales::KvCache;
+use turbine_model::kv_scales::{KvCache, TqKv};
 use turbine_model::pp;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
@@ -231,6 +237,10 @@ struct Naive {
     /// FP8 KV (Phase 6a S-13): K after RoPE and V quantize-dequantized with each layer's
     /// scales before attention; from the config's `kv_cache`.
     kv_fp8: Option<KvCache>,
+    /// TurboQuant KV (P6b S-5): K after RoPE and V of every token and KV head replaced by the
+    /// decode of their record (`turbine-kv`'s codec, in F32) under this seed; from the
+    /// config's `kv_cache`.
+    kv_tq: Option<(TqWidths, u64)>,
     /// Quantized activations (Phase 6a S-5): the input of every decoder linear layer is
     /// quantize-dequantized in this mode before the projection, with the static scale of
     /// [`Naive::input_scales`] (by the projection's module name).
@@ -261,6 +271,11 @@ impl Naive {
             renormalize: cfg.moe.is_some_and(|m| m.norm_topk_prob),
             bf16_router: true,
             kv_fp8: cfg.kv_cache.is_fp8().then(|| cfg.kv_cache.clone()),
+            kv_tq: cfg
+                .kv_cache
+                .tq
+                .as_ref()
+                .map(|tq| (tq_widths(cfg.kv_cache.dtype), tq.seed)),
             act_quant: ActQuantDesc::None,
             input_scales: HashMap::new(),
         }
@@ -357,6 +372,33 @@ impl Naive {
                         dot * scale
                     })
                     .collect();
+                if self.kv_tq.is_some() {
+                    // `cpu::tq_attention`'s exact attention: F64 scores and softmax, unrounded
+                    // weights.
+                    let sc: Vec<f64> = (0..=i)
+                        .map(|j| {
+                            let kv = &k[(j * hkv + kvh) * d..][..d];
+                            let dot: f64 = qv
+                                .iter()
+                                .zip(kv)
+                                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                                .sum();
+                            dot * f64::from(scale)
+                        })
+                        .collect();
+                    let max = sc.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let w: Vec<f64> = sc.iter().map(|s| (s - max).exp()).collect();
+                    let total: f64 = w.iter().sum();
+                    let o = &mut out[(i * hq + h) * d..][..d];
+                    for (c, acc) in o.iter_mut().enumerate() {
+                        *acc = w
+                            .iter()
+                            .enumerate()
+                            .map(|(j, p)| p / total * f64::from(v[(j * hkv + kvh) * d + c]))
+                            .sum::<f64>() as f32;
+                    }
+                    continue;
+                }
                 let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0f32;
                 for s in &mut scores {
@@ -484,6 +526,26 @@ impl Naive {
                 let l = layer as usize;
                 fp8_quantize_dequantize(&mut k, kv.k_scale(l));
                 fp8_quantize_dequantize(&mut v, kv.v_scale(l));
+            }
+            if let Some((w, seed)) = self.kv_tq {
+                let d = c.head_dim as usize;
+                let hkv = c.num_kv_heads as usize;
+                for (i, (k, v)) in k.chunks_exact_mut(d).zip(v.chunks_exact_mut(d)).enumerate() {
+                    let tables = tq_head_tables(seed, layer, (i % hkv) as u32);
+                    let mut record = vec![0u8; w.record_bytes()];
+                    encode_record(
+                        w,
+                        k,
+                        v,
+                        &tables.k_signs,
+                        &tables.v_signs,
+                        &tables.qjl,
+                        &mut record,
+                    );
+                    let (dk, dv) = decode_record(w, &record, seed, layer as usize, i % hkv);
+                    k.copy_from_slice(&dk);
+                    v.copy_from_slice(&dv);
+                }
             }
             let attn = self.attention(&q, &k, &v, t);
             let attn = self.act_in(&attn, q_dim, &[attn_in("o_proj")]);
@@ -916,6 +978,149 @@ fn fp8_kv_matches_reference() {
         let read = KvCache::fp8_from_checkpoint(&index, spec.config.num_layers).expect("scales");
         assert_eq!((&read.k_scales[..], &read.v_scales[..]), (&k[..], &v[..]));
         check_fp8_kv(&spec, read, KvCache::fp8_e4m3(v.clone(), k.clone()));
+    }
+}
+
+/// The TurboQuant widths of an L0 page dtype.
+fn tq_widths(dtype: DType) -> TqWidths {
+    match dtype {
+        DType::Tq4 => Tq4Codec::WIDTHS,
+        DType::Tq2 => Tq2Codec::WIDTHS,
+        other => panic!("{other:?} is not a TurboQuant dtype"),
+    }
+}
+
+/// One KV head's TurboQuant tables of `layer` under `seed` (`turbine-kv`'s signs and QJL
+/// projection).
+fn tq_head_tables(seed: u64, layer: u32, head: u32) -> TqHeadTables {
+    TqHeadTables {
+        k_signs: rademacher(seed, layer, head, SignKind::K, TQ_DIM),
+        v_signs: rademacher(seed, layer, head, SignKind::V, TQ_DIM),
+        qjl: qjl::projection(seed, layer, head, TQ_DIM),
+    }
+}
+
+/// The paged append's TurboQuant codec: `turbine-kv`'s record encoder (the server passes the
+/// same one).
+fn tq_encode(fmt: u8, k: &[f32], v: &[f32], head: &TqHeadTables, record: &mut [u8]) {
+    let w = match fmt {
+        KV_FMT_TQ4 => Tq4Codec::WIDTHS,
+        KV_FMT_TQ2 => Tq2Codec::WIDTHS,
+        other => panic!("format {other} is not TurboQuant"),
+    };
+    encode_record(w, k, v, &head.k_signs, &head.v_signs, &head.qjl, record);
+}
+
+/// TurboQuant L0 pages of `dtype` for `cfg` under `seed`.
+fn tq_kv_cache(cfg: &ModelArchConfig, dtype: DType, seed: u64) -> KvCache {
+    let layers: Vec<TqParams> = (0..cfg.num_layers)
+        .map(|l| TqParams {
+            heads: (0..cfg.num_kv_heads)
+                .map(|h| tq_head_tables(seed, l, h))
+                .collect(),
+            codebooks: [codebook(1), codebook(2), codebook(3), codebook(4)].map(<[f32]>::to_vec),
+        })
+        .collect();
+    KvCache::turboquant(
+        dtype,
+        TqKv {
+            seed,
+            layers: Arc::from(layers),
+            encode: tq_encode,
+        },
+    )
+}
+
+/// Prefill and 10 greedy decode steps of `spec` with TurboQuant L0 pages of `dtype` on the
+/// CPU provider, each position's logits against the naive model attending exactly (F64) over
+/// the decode of every K/V record. The kernel reads records in the rotated domain, equal to
+/// decode-then-attend up to F64 rounding, so an attention output may land one BF16 step
+/// apart and the tiny model amplifies it: each position is held within 1e-4 or within a
+/// quarter of its distance to the naive model over BF16 KV, and the last one is far from the
+/// naive model over another seed's records. Returns the largest difference to the reference.
+fn check_tq_kv(spec: &TinySpec, dtype: DType) -> f32 {
+    const TQ_SEED: u64 = 0x7a11_5eed_0000_0042;
+    let mut tq = spec.clone();
+    tq.config.kv_cache = tq_kv_cache(&spec.config, dtype, TQ_SEED);
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = cpu_model(&tq, &mem, MAX_SEQ_LEN);
+    let layout = *exec.kv_layout();
+    assert_eq!(layout.dtype, dtype);
+    let record = tq_widths(dtype).record_bytes() as u64;
+    assert_eq!(
+        layout.block_bytes() * 512,
+        spec.config.kv_layout(BLOCK_TOKENS).block_bytes() * record,
+        "a TurboQuant page holds one record per token and KV head"
+    );
+    let mut kv = SequenceKv::new(&mem, layout, MAX_SEQ_LEN).expect("kv");
+    let naive = Naive::load(&tq.dir, &tq.config);
+    assert!(naive.kv_tq.is_some());
+    let mut bf16_kv = Naive::load(&tq.dir, &tq.config);
+    bf16_kv.kv_tq = None;
+
+    let name = format!("{} {}", tq.config.hf_architecture, dtype.as_str());
+    let mut worst = 0f32;
+    let mut check = |row: &[f32], tokens: &[u32], at: &str| {
+        let diff = max_abs_diff(row, &naive.logits(tokens));
+        let bf16 = max_abs_diff(row, &bf16_kv.logits(tokens));
+        assert!(
+            diff <= 1e-4 || diff <= 0.25 * bf16,
+            "{name} {at}: max abs diff {diff} to the TurboQuant reference, {bf16} to BF16 KV"
+        );
+        worst = worst.max(diff);
+        diff
+    };
+    let mut tokens = prompt(tq.vocab);
+    let positions: Vec<u32> = (0..tokens.len() as u32).collect();
+    let mut row = kv
+        .forward(exec.as_mut(), &tokens, &positions)
+        .expect("prefill")
+        .row(0)
+        .to_vec();
+    let mut last = check(&row, &tokens, "prefill");
+    for step in 0..10 {
+        let next = argmax(&row);
+        let pos = tokens.len() as u32;
+        tokens.push(next);
+        row = kv
+            .forward(exec.as_mut(), &[next], &[pos])
+            .expect("decode")
+            .row(0)
+            .to_vec();
+        last = check(&row, &tokens, &format!("decode step {step}"));
+    }
+    let mut other_seed = Naive::load(&tq.dir, &tq.config);
+    other_seed.kv_tq = Some((tq_widths(dtype), TQ_SEED ^ 1));
+    let far = max_abs_diff(&row, &other_seed.logits(&tokens));
+    assert!(
+        far > 0.1 && far > 4.0 * last,
+        "{name}: the rotation seed changes nothing ({far}, last diff {last})"
+    );
+    worst
+}
+
+/// P6b S-5: `kv.dtype: tq4` and `tq2` on the CPU provider, tiny Llama and OLMoE of head_dim
+/// 128. Pages hold TurboQuant records written by the paged append through the caller's codec
+/// and read by `cpu::tq_attention` in the rotated domain; the reference decodes every record
+/// (`turbine-kv`'s `decode_record`) and attends exactly. Breaks if appended rows are not
+/// encoded by the block's format, a block is read as BF16, or the layer's tables are not the
+/// seed's.
+#[test]
+fn tq_kv_matches_reference() {
+    let tmp = TempDir::new("tiny-model-tq-kv");
+    let specs = [
+        write_gpu_tiny(&tmp.path().join("llama")),
+        write_tiny_olmoe_with_head_dim(&tmp.path().join("olmoe"), SEED, GPU_HEAD_DIM),
+    ];
+    for spec in &specs {
+        for dtype in [DType::Tq4, DType::Tq2] {
+            let worst = check_tq_kv(spec, dtype);
+            eprintln!(
+                "tq_kv_matches_reference: {} {} max abs diff {worst}",
+                spec.config.hf_architecture,
+                dtype.as_str()
+            );
+        }
     }
 }
 

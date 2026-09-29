@@ -2528,6 +2528,7 @@ dependencies = [
  "turbine-device",
  "turbine-distributed",
  "turbine-kernels",
+ "turbine-kv",
  "turbine-observability",
  "turbine-tensor",
 ]

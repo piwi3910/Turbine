@@ -7,6 +7,7 @@ mod engine;
 mod exit;
 mod host;
 mod kv_orchestrator;
+mod kv_tq;
 mod metrics;
 mod model;
 mod modules;

@@ -62,6 +62,10 @@ pub enum KvDtype {
     Fp16,
     Fp8E4m3PerTensorScale,
     Fp8E4m3PerBlockScale,
+    /// TurboQuant `tq4` L0 pages (P6b S-5).
+    Tq4,
+    /// TurboQuant `tq2` L0 pages (P6b S-5).
+    Tq2,
 }
 
 impl KvDtype {
@@ -72,6 +76,8 @@ impl KvDtype {
             KvDtype::Fp16 => "fp16",
             KvDtype::Fp8E4m3PerTensorScale => "fp8_e4m3_per_tensor_scale",
             KvDtype::Fp8E4m3PerBlockScale => "fp8_e4m3_per_block_scale",
+            KvDtype::Tq4 => "tq4",
+            KvDtype::Tq2 => "tq2",
         }
     }
     /// TKV1 `kv_format` code.
@@ -81,6 +87,8 @@ impl KvDtype {
             KvDtype::Fp16 => 1,
             KvDtype::Fp8E4m3PerTensorScale => 2,
             KvDtype::Fp8E4m3PerBlockScale => 3,
+            KvDtype::Tq4 => 4,
+            KvDtype::Tq2 => 5,
         }
     }
 }
@@ -125,8 +133,19 @@ mod tests {
             (from.config_hash, from.weights_index_hash)
         );
         assert_eq!(
-            [KvDtype::Bf16, KvDtype::Fp8E4m3PerBlockScale].map(|d| (d.as_str(), d.wire_code())),
-            [("bf16", 0), ("fp8_e4m3_per_block_scale", 3)]
+            [
+                KvDtype::Bf16,
+                KvDtype::Fp8E4m3PerBlockScale,
+                KvDtype::Tq4,
+                KvDtype::Tq2
+            ]
+            .map(|d| (d.as_str(), d.wire_code())),
+            [
+                ("bf16", 0),
+                ("fp8_e4m3_per_block_scale", 3),
+                ("tq4", 4),
+                ("tq2", 5)
+            ]
         );
     }
 }

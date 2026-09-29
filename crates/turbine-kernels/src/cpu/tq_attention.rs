@@ -35,37 +35,13 @@ use super::invalid;
 use super::quant::fp8_e4m3_value;
 use crate::KernelError;
 
-/// Block format code of a BF16 page.
-pub const FMT_BF16: u8 = 0;
-/// Block format code of an FP8 e4m3 page.
-pub const FMT_FP8_E4M3: u8 = 1;
-/// Block format code of a TurboQuant `tq4` page (K 3 + 1 bits, V 4 bits).
-pub const FMT_TQ4: u8 = 2;
-/// Block format code of a TurboQuant `tq2` page (K 1 + 1 bits, V 2 bits).
-pub const FMT_TQ2: u8 = 3;
+pub use crate::ops::{
+    KV_FMT_BF16 as FMT_BF16, KV_FMT_FP8_E4M3 as FMT_FP8_E4M3, KV_FMT_TQ2 as FMT_TQ2,
+    KV_FMT_TQ4 as FMT_TQ4, TqHeadTables, TqParams,
+};
 
 /// The head dimension TurboQuant pages are defined for.
 pub const TQ_DIM: usize = 128;
-
-/// The TurboQuant tables of one KV head of the layer.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TqHeadTables {
-    /// ±1 signs of the K rotation (`TQ_DIM`).
-    pub k_signs: Vec<f32>,
-    /// ±1 signs of the V rotation (`TQ_DIM`).
-    pub v_signs: Vec<f32>,
-    /// The QJL projection `S`, `TQ_DIM × TQ_DIM` row-major.
-    pub qjl: Vec<f32>,
-}
-
-/// TurboQuant parameters of one layer.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TqParams {
-    /// Per KV head of the layer.
-    pub heads: Vec<TqHeadTables>,
-    /// Unit-variance Lloyd–Max codebooks of 1, 2, 3 and 4 bits (index `bits − 1`).
-    pub codebooks: [Vec<f32>; 4],
-}
 
 /// Which of the two equivalent computations to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,17 +203,30 @@ struct Seq {
     blocks: Vec<(usize, u8)>,
 }
 
+/// Bytes of one layer of one page of format `fmt` (`None`: an unknown format code).
+pub fn page_bytes_of(
+    fmt: u8,
+    block_tokens: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Option<usize> {
+    let elems = 2 * block_tokens * kv_heads * head_dim;
+    match fmt {
+        FMT_BF16 => Some(2 * elems),
+        FMT_FP8_E4M3 => Some(elems),
+        _ => tq_widths(fmt).map(|(k, v)| kv_heads * block_tokens * Record::of(k, v).bytes),
+    }
+}
+
+/// True for a TurboQuant format code.
+pub fn is_turboquant(fmt: u8) -> bool {
+    tq_widths(fmt).is_some()
+}
+
 /// Per-layer page bytes of format `fmt`.
 fn page_bytes(fmt: u8, l: &MixedPagedLayer<'_>) -> Result<usize, KernelError> {
-    let elems = 2 * l.block_tokens * l.num_kv_heads * l.head_dim;
-    match fmt {
-        FMT_BF16 => Ok(2 * elems),
-        FMT_FP8_E4M3 => Ok(elems),
-        _ => match tq_widths(fmt) {
-            Some((k, v)) => Ok(l.num_kv_heads * l.block_tokens * Record::of(k, v).bytes),
-            None => Err(invalid(format!("unknown KV block format {fmt}"))),
-        },
-    }
+    page_bytes_of(fmt, l.block_tokens, l.num_kv_heads, l.head_dim)
+        .ok_or_else(|| invalid(format!("unknown KV block format {fmt}")))
 }
 
 fn sequences(

@@ -799,6 +799,8 @@ fn paged_run(
             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
             k_scale: 1.0,
             v_scale: 1.0,
+            block_formats: &[],
+            tq: None,
         })
         .expect("paged attention");
     let out = read(&o);

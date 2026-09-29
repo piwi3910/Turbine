@@ -686,11 +686,7 @@ impl BlockPool {
     /// whole allocation).
     pub fn view(&self) -> KvPoolView<'_> {
         let num_blocks = self.base_blocks;
-        let per_layer_block = u64::from(self.layout.num_kv_heads)
-            * u64::from(self.layout.head_dim)
-            * u64::from(self.layout.block_tokens)
-            * 2
-            * self.layout.dtype.size_bytes() as u64;
+        let per_layer_block = self.layout.layer_block_bytes();
         KvPoolView {
             storage: &self.storage,
             layout: self.layout,

@@ -1238,6 +1238,8 @@ fn paged_case_pages(
             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
             k_scale,
             v_scale,
+            block_formats: &[],
+            tq: None,
         };
         kernel.execute_paged(&mut ctx).expect("paged attention");
     }
@@ -1878,6 +1880,8 @@ fn decode_attention_timings_fp8() {
                             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                             k_scale: 1.0,
                             v_scale: 1.0,
+                            block_formats: &[],
+                            tq: None,
                         })
                         .expect("paged decode attention");
                     });
@@ -1983,6 +1987,8 @@ fn prefill_op_timings_fp8() {
                             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                             k_scale: 1.0,
                             v_scale: 1.0,
+                            block_formats: &[],
+                            tq: None,
                         })
                         .expect("paged prefill attention");
                     });
@@ -3175,6 +3181,8 @@ fn decode_op_timings() {
                         scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                         k_scale: 1.0,
                         v_scale: 1.0,
+                        block_formats: &[],
+                        tq: None,
                     })
                     .expect("paged decode attention");
                 });
@@ -3721,6 +3729,8 @@ fn decode_forward_timing() {
                             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                             k_scale: 1.0,
                             v_scale: 1.0,
+                            block_formats: &[],
+                            tq: None,
                         })
                         .expect("paged decode attention")
                     });
@@ -4021,6 +4031,8 @@ fn decode_attention_timings() {
                         scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                         k_scale: 1.0,
                         v_scale: 1.0,
+                        block_formats: &[],
+                        tq: None,
                     })
                     .expect("paged decode attention");
                 });
@@ -4338,6 +4350,8 @@ fn fused_projection_timings() {
                 scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                 k_scale: 1.0,
                 v_scale: 1.0,
+                block_formats: &[],
+                tq: None,
             })
             .expect("paged decode attention");
         };

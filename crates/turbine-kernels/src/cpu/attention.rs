@@ -13,7 +13,9 @@ impl AttentionKernel for CpuReference {
         cfg.num_kv_heads > 0
             && cfg.num_q_heads.is_multiple_of(cfg.num_kv_heads)
             && cfg.head_dim > 0
-            && (is_float(cfg.dtype) || cfg.dtype == DType::F8E4M3 && cfg.kind.is_paged())
+            && (is_float(cfg.dtype)
+                || cfg.kind.is_paged()
+                    && (cfg.dtype == DType::F8E4M3 || cfg.dtype.tq_record_bytes().is_some()))
             && if cfg.kind.is_paged() {
                 cfg.block_tokens.is_some_and(|b| b > 0)
             } else {
@@ -22,7 +24,9 @@ impl AttentionKernel for CpuReference {
     }
 
     fn implementation(&self, cfg: &AttentionConfig) -> String {
-        if cfg.dtype == DType::F8E4M3 {
+        if cfg.dtype.tq_record_bytes().is_some() {
+            "cpu_attention_paged_tqkv_f64acc".into()
+        } else if cfg.dtype == DType::F8E4M3 {
             "cpu_attention_paged_fp8kv_f32acc".into()
         } else if cfg.kind.is_paged() {
             "cpu_attention_paged_f32acc".into()

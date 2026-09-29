@@ -195,11 +195,15 @@ impl StorageProbe for L2StorageProbe {
 /// The KV format of `layout` on one device: BF16 pages, or FP8 e4m3 pages with per-layer
 /// scales (`kv.dtype: fp8_e4m3`, Phase 6a S-13; the scales join in [`KvOrchestrator::start`]
 /// from [`KvStart::kv_scales`]). Lower tiers store the L0 page bytes as they are (S-14).
+///
+/// TurboQuant pages (P6b S-5) take their own namespace (`KvDtype::Tq4` / `Tq2`), so a block
+/// cached under one L0 format is never attached under another.
 pub fn kv_format(layout: KvLayout) -> KvFormat {
-    let dtype = if layout.dtype == DType::F8E4M3 {
-        KvDtype::Fp8E4m3PerTensorScale
-    } else {
-        KvDtype::Bf16
+    let dtype = match layout.dtype {
+        DType::F8E4M3 => KvDtype::Fp8E4m3PerTensorScale,
+        DType::Tq4 => KvDtype::Tq4,
+        DType::Tq2 => KvDtype::Tq2,
+        _ => KvDtype::Bf16,
     };
     KvFormat::single(dtype, layout)
 }
@@ -211,9 +215,8 @@ pub fn with_scales(
     scales: Option<KvScaleHashes>,
 ) -> Result<KvFormat, StartupError> {
     match (format.dtype, scales) {
-        (KvDtype::Fp8E4m3PerTensorScale, Some(_)) | (KvDtype::Bf16, None) => {
-            Ok(KvFormat { scales, ..format })
-        }
+        (KvDtype::Fp8E4m3PerTensorScale, Some(_))
+        | (KvDtype::Bf16 | KvDtype::Tq4 | KvDtype::Tq2, None) => Ok(KvFormat { scales, ..format }),
         (dtype, _) => Err(StartupError::new(format!(
             "a {} KV pool {} per-layer KV scales",
             dtype.as_str(),

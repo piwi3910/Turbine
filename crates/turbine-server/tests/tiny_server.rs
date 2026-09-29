@@ -141,6 +141,8 @@ struct Setup<'a> {
     quantization: Option<Value>,
     /// Extra `kv` keys, e.g. `"  dtype: fp8_e4m3\n"`.
     kv_extra: &'a str,
+    /// `head_dim` of the tiny Llama (default 16; TurboQuant KV pages need 128).
+    head_dim: Option<u32>,
 }
 
 impl Default for Setup<'_> {
@@ -158,6 +160,7 @@ impl Default for Setup<'_> {
             env: &[],
             quantization: None,
             kv_extra: "",
+            head_dim: None,
         }
     }
 }
@@ -227,6 +230,7 @@ impl TinyServer {
                 7,
                 &TinyOptions {
                     template_with_tools: setup.template_with_tools,
+                    head_dim: setup.head_dim.unwrap_or(TinyOptions::default().head_dim),
                     ..TinyOptions::default()
                 },
             );
@@ -873,6 +877,36 @@ fn status_reports_quantization() {
                 .any(|l| l.contains(r#""event":"weight_format""#) && l.contains("ct_fp8"))
         },
     );
+}
+
+/// P6b S-5: `kv.dtype: tq4` serves on the cpu backend (the tiny Llama with head_dim 128):
+/// completions run over TurboQuant L0 pages, and the resolved support row names the `tq4` KV
+/// column, `experimental`. Breaks if startup still refuses TurboQuant pages on the CPU
+/// provider or a forward over them fails.
+#[test]
+fn tq_kv_serves_on_cpu() {
+    let server = TinyServer::launch(&Setup {
+        kv_extra: "  dtype: tq4\n",
+        head_dim: Some(128),
+        ..Setup::default()
+    });
+    for _ in 0..2 {
+        let resp = server.post(
+            "/v1/completions",
+            &json!({"model": server.model, "prompt": "Hello there", "max_tokens": 8,
+                    "ignore_eos": true, "temperature": 0}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(
+            resp.json()["usage"]["completion_tokens"],
+            8,
+            "{}",
+            resp.body
+        );
+    }
+    let status = server.get("/turbine/v1/status").json();
+    assert_eq!(status["support"]["kv_format"], "tq4", "{status}");
+    assert_eq!(status["support"]["status"], "experimental", "{status}");
 }
 
 /// Phase 2m S-11: the support-matrix row resolved at startup is the `support` key of
