@@ -8,13 +8,23 @@
 // streamed into the WMMA registers; decode and small batches). Groups of 64,
 // 128 or 256.
 //
-// turbine_hip_int4_dequant: weight rows are dequantized in chunks of at most
-// kDequantChunkBytes of BF16 into a per-context staging buffer, each chunk
-// followed by the hipBLASLt BF16 GEMM of its output columns (turbine_gemm,
-// trans_b); for prefill-sized m, where the BF16 GEMM's efficiency outweighs
-// the extra pass over the weight. The weight is rounded to BF16 as the golden
-// reference's dequantized checkpoint is (bf16((q - z) * s)). Groups of a
-// multiple of 32.
+// turbine_hip_int4_dequant: the weight is dequantized to BF16 into a
+// per-context staging buffer, then the hipBLASLt BF16 GEMM runs on it
+// (turbine_gemm, trans_b) as one GEMM of the layer's own (n, k), the shape the
+// tuned GEMM table has rows for; only a weight above kDequantMaxBytes of BF16
+// is split into column chunks. For large m, where the BF16 GEMM's efficiency
+// outweighs the extra pass over the weight. The weight is rounded to BF16 as
+// the golden reference's dequantized checkpoint is (bf16((q - z) * s)). Groups
+// of a multiple of 32.
+//
+// Prefill steps (turbine_qgemm_desc::prefill = 1): both implementations run
+// the dequant path with the context's TURBINE_OPTION_GEMM_PREFILL raised for
+// the GEMM, so hipBLASLt runs the tuned table's invariant class (split-K off,
+// one solution for every m) and a row's result does not depend on how many
+// rows share the call: a prefix-reused prefill of a prompt's suffix computes
+// every row exactly as the whole-prompt prefill does (Phase 4), whatever row
+// tier the registry bound. Decode steps run the implementation as named (the
+// fused kernel's rows are invariant by construction).
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -41,8 +51,9 @@ int waves_for(int64_t groups) {
   return groups >= 64 ? 8 : groups >= 32 ? 4 : 2;
 }
 
-// Largest chunk of dequantized weight rows the dequant path stages at once.
-constexpr int64_t kDequantChunkBytes = 32 << 20;
+// Largest BF16 weight the dequant path stages whole (a Llama-3.1-8B gate_up
+// is 224 MiB); a larger one is staged and multiplied in column chunks.
+constexpr int64_t kDequantMaxBytes = 512 << 20;
 
 bool int4_scheme(int32_t scheme) {
   return scheme == TURBINE_QSCHEME_INT4_GROUP_ZP ||
@@ -164,9 +175,10 @@ bool qgemm_int4_supports(const turbine_qgemm_desc *d, Int4Path path) {
 
 namespace {
 
-int32_t run_dequant(turbine_ctx *ctx, const Int4Gemm &g) {
+// prefill: the GEMMs run as a prefill step's (TURBINE_OPTION_GEMM_PREFILL).
+int32_t run_dequant(turbine_ctx *ctx, const Int4Gemm &g, bool prefill) {
   const int64_t chunk_rows =
-      std::max<int64_t>(16, kDequantChunkBytes / (2 * g.k) / 16 * 16);
+      std::max<int64_t>(16, kDequantMaxBytes / (2 * g.k) / 16 * 16);
   const int64_t rows = std::min(chunk_rows, g.n);
   const size_t bytes = static_cast<size_t>(rows * g.k * 2);
   if (!ctx->qgemm_int4)
@@ -194,13 +206,17 @@ int32_t run_dequant(turbine_ctx *ctx, const Int4Gemm &g) {
     scratch.bytes = bytes;
   }
   const int64_t c_elem = g.c_f32 ? 4 : 2;
-  for (int64_t row0 = 0; row0 < g.n; row0 += rows) {
+  // The step kind the caller set for plain GEMMs, restored after ours.
+  const bool step_prefill = ctx->gemm_prefill;
+  ctx->gemm_prefill = prefill;
+  int32_t result = TURBINE_OK;
+  for (int64_t row0 = 0; row0 < g.n && result == TURBINE_OK; row0 += rows) {
     const int64_t count = std::min(rows, g.n - row0);
-    int32_t rc = check_hip(
+    result = check_hip(
         ctx, launch_int4_dequant(g, row0, count, scratch.buf, ctx->stream),
         "qgemm int4 dequant kernel launch");
-    if (rc != TURBINE_OK)
-      return rc;
+    if (result != TURBINE_OK)
+      break;
     turbine_gemm_desc gd{};
     gd.a = g.a;
     gd.b = scratch.buf;
@@ -217,11 +233,10 @@ int32_t run_dequant(turbine_ctx *ctx, const Int4Gemm &g) {
     gd.c_dtype = g.c_f32 ? TURBINE_DTYPE_F32 : TURBINE_DTYPE_BF16;
     gd.alpha = g.alpha;
     gd.beta = 0.0f;
-    rc = turbine_gemm(ctx, &gd);
-    if (rc != TURBINE_OK)
-      return rc;
+    result = turbine_gemm(ctx, &gd);
   }
-  return TURBINE_OK;
+  ctx->gemm_prefill = step_prefill;
+  return result;
 }
 
 } // namespace
@@ -252,8 +267,10 @@ int32_t qgemm_int4_run(turbine_ctx *ctx, const turbine_qgemm_desc *d,
   if (rc != TURBINE_OK)
     return rc;
   const Int4Gemm g = gemm_of(d);
-  if (path == Int4Path::Dequant)
-    return run_dequant(ctx, g);
+  // A prefill step runs one numerics class for every m (see the top of the
+  // file); a decode step the implementation as named.
+  if (d->prefill != 0 || path == Int4Path::Dequant)
+    return run_dequant(ctx, g, d->prefill != 0);
   return check_hip(ctx, launch_int4_wmma(g, ctx->stream),
                    "qgemm int4 wmma kernel launch");
 }

@@ -293,7 +293,7 @@ fn bound(p: &Pair, cfg: &QGemmConfig, name: &str) -> Arc<dyn KernelProvider> {
 }
 
 /// Runs `provider`'s qgemm of `a` (`[m, k]` BF16 on the provider's memory) against `wt` into a
-/// fresh `[m, n]` output and returns it decoded.
+/// fresh `[m, n]` output, as a prefill step's call when `prefill`, and returns it decoded.
 fn run(
     provider: &dyn KernelProvider,
     mem: &Arc<dyn DeviceMemory>,
@@ -301,6 +301,7 @@ fn run(
     a: TensorView<'_>,
     wt: &WeightTensors,
     m: usize,
+    prefill: bool,
 ) -> Vec<f32> {
     let n = cfg.n as usize;
     let c = tensor(
@@ -318,7 +319,7 @@ fn run(
         b_zeros: wt.zeros.as_ref().map(Tensor::view),
         c: c.view(),
         alpha: 1.0,
-        prefill: m > 1,
+        prefill,
     };
     provider
         .qgemm()
@@ -370,8 +371,10 @@ fn reference_bf16_weight(
     decode(c_dtype, &bytes(c.view()))
 }
 
-/// One INT4 GEMM case: every INT4 implementation at `m` rows vs its CPU reference on the sampled
-/// rows (the exact product for the fused kernel, the BF16-rounded weight's for the dequant path).
+/// One INT4 GEMM case: every INT4 implementation at `m` rows, as a decode and as a prefill
+/// step's call, vs its CPU reference on the sampled rows: the exact product for the fused kernel
+/// at decode, the BF16-rounded weight's for the dequant path and for every prefill call (a
+/// prefill runs the dequant path's invariant GEMM whichever implementation is bound).
 fn qgemm_case(p: &Pair, rng: &mut Rng, name: &str, m: usize, w: &Weight, c_dtype: DType) {
     let cfg = config(w, c_dtype);
     let k = w.k;
@@ -394,27 +397,38 @@ fn qgemm_case(p: &Pair, rng: &mut Rng, name: &str, m: usize, w: &Weight, c_dtype
         a_cpu.view(),
         &cpu_w,
         rows.len(),
+        false,
     );
     let rounded = reference_bf16_weight(p, w, a_cpu.view(), rows.len(), c_dtype);
     for impl_name in INT4_IMPLS {
-        let want = if impl_name == INT4_IMPLS[1] {
-            &rounded
-        } else {
-            &exact
-        };
         let provider = bound(p, &cfg, impl_name);
-        let got_all = run(provider.as_ref(), &p.hip_mem, cfg, a_hip.view(), &hip_w, m);
-        let n = w.n;
-        let got: Vec<f32> = rows
-            .iter()
-            .flat_map(|&r| got_all[r * n..(r + 1) * n].iter().copied())
-            .collect();
-        assert_close(
-            &format!("qgemm {name} m={m} {cfg} ({impl_name}) rows {rows:?}"),
-            &got,
-            want,
-            c_dtype,
-        );
+        for prefill in [false, true] {
+            let want = if prefill || impl_name == INT4_IMPLS[1] {
+                &rounded
+            } else {
+                &exact
+            };
+            let got_all = run(
+                provider.as_ref(),
+                &p.hip_mem,
+                cfg,
+                a_hip.view(),
+                &hip_w,
+                m,
+                prefill,
+            );
+            let n = w.n;
+            let got: Vec<f32> = rows
+                .iter()
+                .flat_map(|&r| got_all[r * n..(r + 1) * n].iter().copied())
+                .collect();
+            assert_close(
+                &format!("qgemm {name} m={m} {cfg} ({impl_name}, prefill={prefill}) rows {rows:?}"),
+                &got,
+                want,
+                c_dtype,
+            );
+        }
     }
 }
 
@@ -482,10 +496,19 @@ fn qgemm_int4_matches_cpu() {
     }
 }
 
-/// Phase 6a S-9: a row's `turbine_hip_int4_wmma` result is bitwise the same whether it is
-/// computed alone or inside a batch of 7, 16, 64 or 513 rows (the fused kernel's chain depends
-/// on k and the group only). Breaks if the k split or the wave reduction order depends on m, or
-/// if rows of a tile leak into each other.
+/// Phase 6a S-9 and Phase 4 (prefix reuse): a row's result is bitwise the same whether it is
+/// computed alone or inside a batch.
+/// - Decode calls of `turbine_hip_int4_wmma` (the fused kernel's chain depends on k and the group
+///   only): alone vs batches of 7, 16, 64 and 513 rows.
+/// - Prefill calls of either implementation (the registry binds the fused kernel up to 128 rows
+///   and the dequant path above, so a prompt's suffix and the whole prompt may be served by
+///   different implementations): alone and in batches of 7, 16, 64, 129, 200 and 513 rows, all
+///   equal to one 513-row prefill, across both bindings. This is what makes a prefix-reused
+///   prefill reproduce the whole-prompt prefill bit for bit.
+///
+/// Breaks if the k split or the wave reduction order depends on m, if rows of a tile leak into
+/// each other, or if a prefill call's numerics depend on the bound implementation or on m (a
+/// row tier, split-K, or a hipBLASLt solution chosen per m).
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn int4_rows_are_batch_invariant() {
@@ -499,7 +522,6 @@ fn int4_rows_are_batch_invariant() {
         for zp in [true, false] {
             let w = int4_weight(&mut rng, zp, n, k);
             let cfg = config(&w, DType::BF16);
-            let provider = bound(&p, &cfg, INT4_IMPLS[0]);
             let hip_w = weight_on(&p.hip_mem, &w);
             let max_m = 513;
             let x = rng.normal(max_m * k, 1.0);
@@ -509,38 +531,76 @@ fn int4_rows_are_batch_invariant() {
                 DType::BF16,
                 &encode(DType::BF16, &x),
             );
-            let batch_513 = run(provider.as_ref(), &p.hip_mem, cfg, a.view(), &hip_w, max_m);
-            for m in [7, 16, 64] {
-                let batch = run(
+            let check = |provider: &dyn KernelProvider,
+                         prefill: bool,
+                         batches: &[usize],
+                         whole: &[f32],
+                         what: &str| {
+                for &m in batches {
+                    let batch = run(
+                        provider,
+                        &p.hip_mem,
+                        cfg,
+                        rows_of(&a, 0, m),
+                        &hip_w,
+                        m,
+                        prefill,
+                    );
+                    assert_eq!(
+                        batch.to_bits(),
+                        whole[..m * n].to_bits(),
+                        "{name} zp={zp} {what}: rows of a {m}-row batch differ from the \
+                         513-row batch"
+                    );
+                }
+                for r in sample_rows(max_m) {
+                    let alone = run(
+                        provider,
+                        &p.hip_mem,
+                        cfg,
+                        rows_of(&a, r, 1),
+                        &hip_w,
+                        1,
+                        prefill,
+                    );
+                    assert_eq!(
+                        alone.to_bits(),
+                        whole[r * n..(r + 1) * n].to_bits(),
+                        "{name} zp={zp} {what}: row {r} alone differs from the 513-row batch"
+                    );
+                }
+            };
+            let fused = bound(&p, &cfg, INT4_IMPLS[0]);
+            let decode_513 = run(
+                fused.as_ref(),
+                &p.hip_mem,
+                cfg,
+                a.view(),
+                &hip_w,
+                max_m,
+                false,
+            );
+            check(fused.as_ref(), false, &[7, 16, 64], &decode_513, "decode");
+            let dequant = bound(&p, &cfg, INT4_IMPLS[1]);
+            let prefill_513 = run(
+                dequant.as_ref(),
+                &p.hip_mem,
+                cfg,
+                a.view(),
+                &hip_w,
+                max_m,
+                true,
+            );
+            for (provider, impl_name) in [(&fused, INT4_IMPLS[0]), (&dequant, INT4_IMPLS[1])] {
+                check(
                     provider.as_ref(),
-                    &p.hip_mem,
-                    cfg,
-                    rows_of(&a, 0, m),
-                    &hip_w,
-                    m,
-                );
-                assert_eq!(
-                    batch.to_bits(),
-                    batch_513[..m * n].to_bits(),
-                    "{name} zp={zp}: rows of a {m}-row batch differ from the 513-row batch"
+                    true,
+                    &[7, 16, 64, 129, 200, 513],
+                    &prefill_513,
+                    &format!("prefill ({impl_name})"),
                 );
             }
-            for r in sample_rows(max_m) {
-                let alone = run(
-                    provider.as_ref(),
-                    &p.hip_mem,
-                    cfg,
-                    rows_of(&a, r, 1),
-                    &hip_w,
-                    1,
-                );
-                assert_eq!(
-                    alone.to_bits(),
-                    batch_513[r * n..(r + 1) * n].to_bits(),
-                    "{name} zp={zp}: row {r} alone differs from the 513-row batch"
-                );
-            }
-            println!("{name} zp={zp}: rows batch-invariant");
+            println!("{name} zp={zp}: decode and prefill rows batch-invariant");
         }
     }
 }
