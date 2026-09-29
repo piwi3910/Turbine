@@ -2006,3 +2006,7 @@ How it is built (lead's reading, provisional until 6b Task 15 lands): at YELLOW 
 
 Lead's call (same day): the as-built floor guard — at the last rung a copy is dropped only when it must leave or its tier is above high water — matches the spec's edge case ("→ evict" at the floor, the lowest tier only) and is accepted; noted in `.procoder/handoff/p6b-groundwork.md`.
 
+
+## Keep going through crashes (2026-09-29)
+
+**Decision (user, 2026-09-29 15:25, relayed by the coordinator):** "keep going; if things crash we restart it and you continue." A novanas reboot is handled without asking: the lead requeues the detached runs from its handoff table (the scripts are idempotent) and carries on, without debugging the crash. The coordinator's heartbeat (:17 and :47) checks novanas with one ssh and `scratchpad/lead/r6-check.sh`, wakes the lead when a run finishes or the host rebooted, and starts a fresh lead from the handoff if none is alive. 6a runs to its close (collectors, the Task 14 FP8 proof, the remaining proofs, the Task 29 exit on everything runnable; the two-GPU items stay blocked on the PSU and are listed unfinished), merges into local main without a push, and 6b starts from main taking `p6b-groundwork` in, under the same rotation rules. Design questions go to the coordinator; everything else is the lead's call, recorded here and in `.procoder/review-2026-09-29.md`.

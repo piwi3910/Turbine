@@ -217,3 +217,16 @@ line). Merge both when they report (p6b-groundwork stays a separate branch until
 
 **Remaining after collections:** Task 14 proof (FP8 tensor/dynamic: spreads in fixtures-r5 step 4), Task 21 two-GPU leg and
 Task 29 two-GPU tier (blocked on the PSU), Task 29 exit, review file refresh (not yet updated with rotation 5), merge into local main.
+
+## Rotation 6 lead updates (14:05–) — read with the rotation 5 table above
+
+- Merged: f62fc8a (completion-form GSM8K-200 + AGENTS.md line), ae7fcca (flaky tests `sigterm_drains_then_cancels`,
+  `disconnect_releases_kv` robust under load), 090e09c (`turbine-golden eval --concurrency`, report records it, eval-compare
+  refuses mixed pairs). 6b docs: bb1aad9 (YELLOW depth = compress only until GREEN; spec S-6, plan T14/T15), review f1c8668.
+  p6b-groundwork tip 187c0dc (YELLOW depth policy side; stays separate until 6b; `kv.ladder.*` keys land with 6b Task 2).
+- Evals at c16 (lead call, review file): the full-GSM8K driver's and queue4n's `turbine-golden` are now a wrapper adding
+  `--concurrency 16` to `eval` (`/home/piwi/turbine-ci/scratch/eval-c16/wrapper.sh`; originals `*.c1`). Llama BF16 full ran at c1 →
+  re-run it at c16 after `ALLDONE` before judging Llama FP8 KV (the script's own compare exits 2 on the mix). T15/T18 stay c1.
+- Task 14 builder (branch p6a-fp8-t14, brief scratchpad/lead/brief-t14.md): fixtures + FP8-tensor spread (detached, fixture.lock)
+  + GPU proof driver (detached, lock chain). Its handoff `.procoder/handoff/p6a-fp8-t14.md` names the done markers.
+- Crash policy: decisions "Keep going through crashes (2026-09-29)". Coordinator heartbeat runs r6-check.sh at :17/:47.
