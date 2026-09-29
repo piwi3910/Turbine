@@ -1971,7 +1971,6 @@ After the user's "Find another checkpoint" answer the lead searched Hugging Face
 
 Correction (6a lead, 2026-09-29, facts only; the decision stands): the checkpoint's KV recipe is `fp8_e4m3` per-tensor static K/V projection outputs (with `k_proj` / `v_proj` `output_scale` tensors), not fp4. It appears both in `kv_cache_quant_config` and as identical `layer_quant_config` entries for `*k_proj` / `*v_proj`; d1de280 ignores both, and the scale tensors load as `unexpected_tensor` WARNs.
 
-
 ## Phase 6a gate misses on GSM8K-200: FP8 KV (Llama, OLMoE) and MXFP4-A16 (8B) (2026-09-29)
 
 Asked 2026-09-29 by the 6a lead after the lost agents' results were collected. GSM8K-200 (chain of thought, `final_number`):
@@ -2037,3 +2036,37 @@ whose factor ≠ 1 on a library below minor 10 is refused at startup, exit 1, `e
 mixed-format attention) renumber to v2.11 when the 6b stack is rebased onto main. The yarn16 tolerance comes from
 `yarn_self_spread.py` without `--fold` (transformers' placement), floored at the Llama BF16 bounds (decision "Golden
 tolerance floor for quantized checkpoints" applied to YaRN). Spec S-15/S-6 and plan Task 28a amended the same day.
+
+## OLMoE FP8 KV: full-GSM8K drop over the bound (2026-09-29)
+
+Context: the full-GSM8K FP8 KV gate (decision "Phase 6a gate misses", item 1; 1,319 items, c16, `p6a-kv-t24-full`
+511042e): Llama-3.2-3B BF16 KV 0.7801, FP8 KV 0.7885 (drop −0.0083, PASS). OLMoE-1B-7B BF16 KV 0.6603 (871), FP8 KV
+0.6459 (852): drop 0.0144 > 0.01; flips 122 lost / 103 gained, McNemar p = 0.23, 95% CI of the drop −0.008 to +0.037.
+Runs are bit-deterministic (first 200 items equal the GSM8K-200 runs), so every flip is the KV format's. No Turbine bug
+found: the checkpoint ships no K/V scales (1.0), no e4m3 saturation (max |K| ≤ 22, |V| ≤ 1.5), V underflows in layers
+0–4 (V relative error 4.2–7.6 % against the 2.7 % e4m3 floor), and OLMoE's top-8 routing amplifies the perturbation.
+
+- A) Accept the drop as noise and mark the OLMoE FP8 KV row `supported` alongside Llama's — chosen
+- B) Keep the OLMoE FP8 KV row `experimental`
+- C) Calibrate per-layer V scales (≈ amax/448) for scale-less checkpoints now and re-run the OLMoE FP8 KV pass
+
+**Decision (user, 2026-09-29, relayed by the coordinator): A.** Both gfx1201 FP8 KV rows (Llama, OLMoE) are
+`supported`; the result is recorded at the rows in `turbine-core::support` and in `.procoder/review-2026-09-29.md`.
+Calibrated scales for scale-less checkpoints stay a possible later improvement, not a gate.
+
+## FP8-dynamic (Task 14): accuracy on full GSM8K against vLLM, c1 ITL as a perf item (2026-09-29)
+
+Context: the T14 proof (`p6a-fp8-t14` 5e6a259) passes golden c1/c16 16/16 and c16 throughput (976 tok/s, 1.149× BF16),
+but reads GSM8K-200 0.79 (Turbine BF16 0.795, vLLM on the same checkpoint 0.82) and c1 ITL 0.846× BF16 against the
+plan's 0.75× target.
+
+- A) Mark FP8-dynamic `supported` now
+- B) Re-judge accuracy on the full 1,319-item GSM8K at c16 against vLLM on the same checkpoint (vLLM serves it on
+  gfx1201), flip to `supported` if it passes; the 0.75× c1 ITL target becomes a follow-up perf task that does not
+  block support — chosen
+- C) Hold the row until both the accuracy and the ITL gates pass
+
+**Decision (user, 2026-09-29, relayed by the coordinator): B.** Turbine and vLLM run at the same concurrency (16), queued
+as one detached script under the one-GPU-job rule. The ITL item: FP8 halves the weight bytes, so M = 1 decode should
+approach ≈ 0.6× BF16; the gap (0.846× measured) is likely the per-token activation quantization plus FP8 GEMM overhead at
+M = 1 — recorded as a perf item in the plan (Task 14 follow-up) and the review file, measured before any change.

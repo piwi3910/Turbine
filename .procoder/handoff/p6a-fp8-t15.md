@@ -88,3 +88,57 @@ How to judge:
    `/home/piwi/turbine-ci/fixture.queue`), then `lab-bench --model llama-fp8-block --golden16 --c1`
    (Mac-driven, background), tolerance from the self-spread, labbook, soak (ask the lead), row flip
    as a `handoff(support.rs)` commit, perf-log row.
+
+## Verdict (2026-09-29, proof collector, lead rotation 7)
+
+`t15_proof_run.log`: `t15-proof: done rc=0 turbine=0 vllm=0`. Collected the pass directory by scp
+from `novanas:/home/piwi/turbine-ci/remote/agent-a4baec4689b995379/t15p/` into this session's
+scratchpad (`t15p_collected/t15p/`). All four pass criteria hold:
+
+| Criterion | Required | Observed | Verdict |
+|---|---|---|---|
+| `weight_bytes` | 3,607,615,488 | 3,607,615,488 (`load_events.txt` `weight_format` event) | PASS (exact) |
+| `fp8_block_decoded` | absent | absent (grepped `load_events.txt`) | PASS |
+| c16 tok/s | ≥ 854.7 | 1061.44 | PASS (1.24× BF16 floor, 1.57× this run's own vLLM pass) |
+| GSM8K drop vs pair | ≤ 0.02 | baseline (BF16 turbine) 0.805 → candidate (fp8-block turbine) 0.800, drop 0.005 (`eval-compare.txt`: PASS) | PASS |
+
+Other load-event facts: `layers=fp8_block:196`, `activation=none`, `packaging=ct_fp8`, KV `bf16`.
+Support row logged at startup: `amd/gfx1201/LlamaForCausalLM/fp8_block/bf16/none` = `experimental`
+(WARN, as expected pre-flip).
+
+**BENCH-equivalent line** (not a `lab-bench.sh` run — the driver is `t15_proof_run.sh` — but the
+same fields):
+
+```
+BENCH t15-proof llama-fp8-block commit=d76d123 gpu=0 tests=skip golden1=SKIP golden16=SKIP \
+  tok_s=1061.44 tok_s_c1=114.68 itl_p50_ms=11.46 itl_c1_p50_ms=8.42 ttft_p50_ms=227.24 \
+  gsm8k=0.800 (bf16 ref 0.805, drop 0.005) \
+  vllm_tok_s=677.79 vllm_tok_s_c1=75.94 vllm_gsm8k=0.805 (vLLM GPU picked by k3s, may not be GPU 0) \
+  verdict=PASS
+```
+
+**Labbook**: test type `turbine-lab-bench`, set `phase-6a-quantization`.
+- Turbine run `2e31910f-20a4-4706-8ae7-e89b5f582a61` (`t15-proof:llama-fp8-block:turbine:d76d123`),
+  model `llama-3.2-3b-instruct-fp8-block`, status `pass`.
+- vLLM-ROCm run `a86153ab-ff32-49a9-82c3-64fe64434f8c`
+  (`t15-proof:llama-fp8-block:vllm-rocm:d76d123`), same model key, status `pass`; added as the
+  `vllm-rocm-0-23-gpu0` baseline's member for `model=llama-3.2-3b-instruct-fp8-block` (matching the
+  AWQ precedent). Turbine vs this baseline: tok_s ratio 1.566, itl_p50 ratio 0.624, ttft_p50 ratio
+  0.794 — target `≥ 75% of vLLM-ROCm 0.23.0 (GPU 0)` reads `on`. `golden_c1`/`golden_c16` left
+  unset on both runs (fixture not run yet); `golden_summary` on the Turbine row notes why.
+
+**Open questions / next steps** (unchanged from the previous rotation's list, still open):
+1. Golden fixture with `--act-quant none` — rank 4 in `/home/piwi/turbine-ci/fixture.queue`, not
+   yet run. Until it lands, this proof's PASS does not cover golden-level numerics, only the eval
+   accuracy gate.
+2. `lab-bench --model llama-fp8-block --golden16 --c1` once the fixture reference exists.
+3. Tolerance bounds from the self-spread method (as OLMoE's was calibrated) — not yet computed for
+   this checkpoint; the eval-compare 0.02 drop bound was used instead (Phase 6a per-format default
+   for FP8).
+4. Soak (`scripts/overload-soak.sh novanas --duration 10m` at minimum) — needs the lead's go-ahead
+   per the lab rules.
+5. perf-log row for this proof — not yet added; the labbook runs above are the durable record in
+   the meantime.
+
+**Row-flip commit**: prepared separately (see below), not merged into this branch's history — the
+lead reviews and applies it.
