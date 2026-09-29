@@ -14,6 +14,7 @@ use turbine_core::registry::{Module, Registry};
 use turbine_core::support::WeightFormatColumn;
 use turbine_core::types::DType;
 use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
+use turbine_kernels::{KernelProvider, OpConfig, QGemmConfig};
 
 use crate::ModelError;
 use crate::config::{self, ModelArchConfig};
@@ -199,6 +200,20 @@ pub trait WeightFormat: Module {
     fn repacks(&self, _slot: &WeightSlot) -> bool {
         false
     }
+    /// The format as the selected kernels serve it on one device (Phase 6a S-8): `supports`
+    /// answers whether a provider in the selection order runs a quantized layer's `qgemm`, and
+    /// a format with a load-time fallback moves the layers of `slots` (the slots the device
+    /// loads) it cannot serve there — block-scaled FP8 decoded to BF16, logged
+    /// `event="fp8_block_decoded"`. `None`: unchanged (for every other format an unserved layer
+    /// is the kernel registry's refusal).
+    fn for_kernels(
+        &self,
+        slots: &[WeightSlot],
+        supports: &dyn Fn(&QGemmConfig) -> bool,
+    ) -> Option<Arc<dyn WeightFormat>> {
+        let _ = (slots, supports);
+        None
+    }
     /// Other checkpoint tensors [`WeightFormat::repack_with`] of `slot` reads (e.g. the block
     /// scales of a weight decoded at load); the loader passes them in this order.
     fn companions(&self, _slot: &WeightSlot) -> Vec<String> {
@@ -347,6 +362,24 @@ impl WeightFormatRef {
     /// The format.
     pub fn get(&self) -> &dyn WeightFormat {
         self.0.as_ref()
+    }
+}
+
+/// Sets `cfg`'s weight format to the one `providers` (the selection order's) serve for the
+/// weight `slots` one device loads ([`WeightFormat::for_kernels`]); before the requirements, the
+/// memory budget and the load, which all read it. Unchanged for formats without a fallback.
+pub fn resolve_for_providers(
+    cfg: &mut ModelArchConfig,
+    slots: &[WeightSlot],
+    providers: &[Arc<dyn KernelProvider>],
+) {
+    let supports = |c: &QGemmConfig| {
+        providers
+            .iter()
+            .any(|p| OpConfig::QGemm(*c).supported_by(p.as_ref()))
+    };
+    if let Some(format) = cfg.weight_format.get().for_kernels(slots, &supports) {
+        cfg.weight_format = WeightFormatRef(format);
     }
 }
 
