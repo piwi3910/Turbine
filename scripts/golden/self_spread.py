@@ -24,7 +24,13 @@ reference's activation fake-quantization hooks (`quant_reference.install_hooks`,
 sharing the largest static input_scale), so the spread of a W8A8 / W4A4 reference is measured
 under the same quantization; weight-only formats run without it.
 
+With `--kv-quant fp8_e4m3` every variant runs with the reference's FP8 KV emulation
+(`quant_reference.install_kv_quant`, the checkpoint's per-layer K/V scales or 1.0), so the spread
+of an FP8-KV reference (`quant_reference.py --kv-quant fp8_e4m3`) is measured under the same KV
+quantization (Phase 6a S-13).
+
 usage: self_spread.py <model-dir> <reference.jsonl> <out.json> [variant,...] [--act-quant <mode>]
+                      [--kv-quant none|fp8_e4m3]
 """
 
 import json
@@ -48,14 +54,21 @@ if "--act-quant" in argv:
     i = argv.index("--act-quant")
     act_quant = argv[i + 1]
     del argv[i : i + 2]
+kv_quant = "none"
+if "--kv-quant" in argv:
+    i = argv.index("--kv-quant")
+    kv_quant = argv[i + 1]
+    del argv[i : i + 2]
+    if kv_quant not in ("none", "fp8_e4m3"):
+        sys.exit(f"--kv-quant: none or fp8_e4m3, got {kv_quant}")
 model_dir, ref_path, out_path = argv[0], argv[1], argv[2]
 layers = None
-if act_quant != "none":
+if act_quant != "none" or kv_quant != "none":
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import quant_reference
-
+if act_quant != "none":
     record = json.loads((Path(model_dir) / "turbine_dequant.json").read_text("utf-8"))
     layers = record["layers"]
 ALL = [
@@ -149,6 +162,11 @@ for variant in variants:
         if layers is not None:
             hooks = quant_reference.install_hooks(torch, model, layers, act_quant)
             print(f"{hooks} activation hooks ({act_quant})", flush=True)
+        if kv_quant != "none":
+            scales = quant_reference.kv_scales(
+                Path(model_dir), model.config.num_hidden_layers
+            )
+            print(quant_reference.install_kv_quant(torch, model, scales), flush=True)
         loaded = (dt, attn)
         print(f"loaded {dt} {attn} in {time.time() - t0:.0f}s", flush=True)
     t0 = time.time()

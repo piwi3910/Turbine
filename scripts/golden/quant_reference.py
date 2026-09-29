@@ -40,6 +40,16 @@ exits 1 and leaves no file. The dequantized copy lives in `--work-dir` (default:
 directory; on `novanas` use `/dev/shm`) and is removed at the end unless `--keep-dequantized`;
 `--dequantized <dir>` reuses a copy written earlier.
 
+`--kv-quant fp8_e4m3` (default `none`) emulates Turbine's FP8 e4m3 L0 KV cache (`kv.dtype:
+fp8_e4m3`, Phase 6a S-13): every attention call sees K (after RoPE) and V quantize-dequantized
+per layer as a page write and read, `bf16(e4m3(x / scale) · scale)` with FP8 rounding to nearest
+even saturated to ±448, the layer's `self_attn.k_scale` / `v_scale` (or `k_proj` /
+`v_proj.output_scale`) from the checkpoint when it stores them, else 1.0. The cache keeps the
+unquantized values and every call quantizes the whole K/V again, which gives the same values as
+quantizing once (each element's result depends on that element only). A checkpoint without a
+`quantization_config` (BF16) is then run as it is, without the dequantized copy (`--act-quant`
+must be `auto` or `none`). The engine gains `-kv-fp8_e4m3`.
+
 `--self-test` checks the vectorized torch quantizers used by the hooks against scalar ports of
 the Rust functions (every BF16 input, random F32 inputs, the Rust unit-test table) and exits.
 
@@ -49,6 +59,7 @@ Usage:
         [--act-quant auto|none|fp8_token|fp8_tensor|fp8_group128|mxfp4] [--top-logprobs 20] \
         [--work-dir /dev/shm] [--dequantized <dir>] [--keep-dequantized] [--model-name <hub-id>]
         [--input-scale fused-max|per-part] [--chat-template <file.jinja>]
+        [--kv-quant none|fp8_e4m3]
     uv run scripts/golden/quant_reference.py --self-test
 """
 
@@ -72,6 +83,7 @@ import dequantize_checkpoint as dq
 import hf_reference
 
 ACT_MODES = ["auto", "none", "fp8_token", "fp8_tensor", "fp8_group128", "mxfp4"]
+KV_MODES = ["none", "fp8_e4m3"]
 FP8_MAX = 448.0
 E2M1_MAX = 6.0
 MX_BLOCK = 32
@@ -111,6 +123,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="render chat prompts with this Jinja template instead of the checkpoint's "
         "(a base checkpoint without one; the served config names the same file)",
     )
+    p.add_argument("--kv-quant", choices=KV_MODES, default="none")
     args = p.parse_args(argv)
     if not args.self_test:
         missing = [
@@ -254,6 +267,88 @@ def install_hooks(torch, model, layers: dict, mode: str, fused_max: bool = True)
         module.register_forward_pre_hook(hook)
         count += 1
     return count
+
+
+# ---------------------------------------------------------------------------------------------
+# FP8 KV cache emulation (Phase 6a S-13), as the kv.dtype fp8_e4m3 pages of the CPU reference
+
+
+def kv_scales(model_dir: Path, num_layers: int) -> list[tuple[float, float]]:
+    """Per-layer (k_scale, v_scale): the checkpoint's `self_attn.{k,v}_scale` (or
+    `{k,v}_proj.output_scale`) scalars when it stores them for every layer, 1.0 when it stores
+    none, an error when only some (turbine_model::kv_scales::KvCache::fp8_from_checkpoint)."""
+    from safetensors import safe_open
+
+    index = model_dir / "model.safetensors.index.json"
+    if index.is_file():
+        files = sorted(
+            set(json.loads(index.read_text(encoding="utf-8"))["weight_map"].values())
+        )
+    else:
+        files = ["model.safetensors"]
+    values: dict[str, float] = {}
+    for name in files:
+        with safe_open(str(model_dir / name), framework="pt") as f:
+            for key in f.keys():
+                if key.endswith(("_scale", ".output_scale")) and ".self_attn." in key:
+                    values[key] = float(f.get_tensor(key).float().reshape(-1)[0])
+    out: list[tuple[float, float]] = []
+    found = missing = 0
+    for layer in range(num_layers):
+        pair = []
+        for half in ("k", "v"):
+            p = f"model.layers.{layer}.self_attn"
+            v = values.get(
+                f"{p}.{half}_scale", values.get(f"{p}.{half}_proj.output_scale")
+            )
+            if v is None:
+                missing += 1
+                v = 1.0
+            else:
+                found += 1
+                if not (math.isfinite(v) and v > 0.0):
+                    raise ValueError(f"{p}.{half}_scale = {v}: not finite and positive")
+            pair.append(v)
+        out.append((pair[0], pair[1]))
+    if found and missing:
+        raise ValueError(
+            f"the checkpoint stores {found} of the {2 * num_layers} per-layer KV scales"
+        )
+    return out
+
+
+def install_kv_quant(torch, model, scales: list[tuple[float, float]]) -> str:
+    """Wraps the model's attention function so every call sees K and V quantize-dequantized
+    with its layer's scales (in F32, back in the tensors' dtype). Returns the registered name."""
+    import importlib
+
+    from transformers import AttentionInterface
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    base = model.config._attn_implementation
+    if base == "eager":
+        inner = importlib.import_module(type(model).__module__).eager_attention_forward
+    else:
+        inner = ALL_ATTENTION_FUNCTIONS[base]
+
+    def qdq(x, scale: float):
+        s = torch.tensor(scale, dtype=torch.float32)
+        return fp8_qdq(torch, x.to(torch.float32), s).to(x.dtype)
+
+    def attention(module, query, key, value, attention_mask, **kwargs):
+        ks, vs = scales[module.layer_idx]
+        return inner(
+            module, query, qdq(key, ks), qdq(value, vs), attention_mask, **kwargs
+        )
+
+    name = f"turbine_fp8_kv_{base}"
+    AttentionInterface.register(name, attention)
+    model.config._attn_implementation = name
+    for sub in model.modules():
+        cfg = getattr(sub, "config", None)
+        if cfg is not None and cfg is not model.config:
+            cfg._attn_implementation = name
+    return name
 
 
 # ---------------------------------------------------------------------------------------------
@@ -480,15 +575,25 @@ def run(args: argparse.Namespace) -> None:
         )
     prompts = hf_reference.load_prompts(args.prompts)
     work = None
-    if args.dequantized is not None:
+    config = json.loads((args.model_dir / "config.json").read_text(encoding="utf-8"))
+    unquantized = args.kv_quant != "none" and "quantization_config" not in config
+    if unquantized and args.act_quant not in ("auto", "none"):
+        raise ValueError("a BF16 checkpoint has no activation quantization")
+    if unquantized:
+        bf16_dir = args.model_dir
+    elif args.dequantized is not None:
         bf16_dir = args.dequantized
     else:
         work = Path(tempfile.mkdtemp(prefix="turbine-dequant-", dir=args.work_dir))
         bf16_dir = work / "bf16"
         dq.dequantize(args.model_dir, bf16_dir, log=lambda m: print(m, file=sys.stderr))
     try:
-        record = json.loads(
-            (bf16_dir / "turbine_dequant.json").read_text(encoding="utf-8")
+        record = (
+            {"activation": "none", "packaging": "bf16", "layers": {}}
+            if unquantized
+            else json.loads(
+                (bf16_dir / "turbine_dequant.json").read_text(encoding="utf-8")
+            )
         )
         mode = record["activation"] if args.act_quant == "auto" else args.act_quant
         if mode != record["activation"]:
@@ -505,10 +610,20 @@ def run(args: argparse.Namespace) -> None:
         hooks = install_hooks(
             torch, model, record["layers"], mode, args.input_scale == "fused-max"
         )
+        if args.kv_quant != "none":
+            scales = kv_scales(args.model_dir, model.config.num_hidden_layers)
+            attn = install_kv_quant(torch, model, scales)
+            print(
+                f"{attn}: FP8 KV with {len(scales)} layer scale pairs "
+                f"({'checkpoint' if any(p != (1.0, 1.0) for p in scales) else 'all 1.0'})",
+                file=sys.stderr,
+            )
+        source = "" if unquantized else f"-dequant-{record['packaging']}"
         engine = (
             f"transformers-{transformers.__version__}-bf16-{args.device}"
-            f"-dequant-{record['packaging']}-act-{mode}"
-            f"{'-per-part-scales' if args.input_scale == 'per-part' else ''}-fp32-logits"
+            f"{source}-act-{mode}"
+            f"{'-per-part-scales' if args.input_scale == 'per-part' else ''}"
+            f"{'-kv-' + args.kv_quant if args.kv_quant != 'none' else ''}-fp32-logits"
         )
         name = args.model_name or hf_reference.model_name(args.model_dir)
         revision = hf_reference.model_revision(args.model_dir) or record.get("revision")
