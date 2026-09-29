@@ -28,42 +28,48 @@ Task 20 and the decisions "W4A4 proof checkpoint" and "Phase 6a gate misses on G
 
 ## Running (detached; do not start a second copy)
 
-**Lead note (10:40):** do not merge `phase-6a-quantization` into this worktree, and do not run gate / remote-cargo /
-lab-bench from it, until `queue4.log` says `queue4: done`. queue4 runs this worktree's scripts, and integration's
-newer `lab-serve.sh` takes bench.lock itself (f94cbf1 / e06afc9); under queue4's older `bench-lock.sh`, which does not
-export `TURBINE_BENCH_LOCK_HELD`, that would wait for its own caller. A remote-cargo sync would also replace
-the binaries the evals run. The collector judges from the files below; merge afterwards.
+Written 2026-09-29 ~13:25 by the third Task 20 builder. The Mac-side `queue4.sh` died in the 10:50 ssh
+outage before any step ran (its `ev3/` holds only "Killed" logs). `phase-6a-quantization` (a0ba309) is
+merged (877f394); release `turbine-server`/`turbine-golden` and `kbuild/libturbine_hip.so` rebuilt on novanas.
 
-Local `scratchpad/mxfp4/queue4.sh` (nohup, log `scratchpad/mxfp4/queue4.log`, one line per step; step
-outputs in `scratchpad/mxfp4/ev3/`; scratchpad = the path above). Every step takes `port18000` (or
-`port18100`) and then `bench.lock` exclusively and pauses the fixture queue only once it holds the lock.
-At 09:20 it waited on `port18000` behind the other builders' runs (FP8 KV full GSM8K ×4). Steps, in order:
+**queue4n** — one novanas-side detached script (copy of the template `gsm8k_full_run.sh`'s locking):
+`/home/piwi/turbine-ci/remote/agent-a4784842b25c93376/q4n/queue4n.sh` (source kept in the lead scratchpad
+`mxfp4/queue4n.sh`), log `…/q4n/queue4n.log`, results `…/q4n/<step>.json` (+ `.err`, `.server.log`).
+It runs frozen copies of the binaries in `…/q4n/bin/`, so a later remote-cargo sync does not disturb it.
+Each step: `flock -x` port18000.lock (vLLM: port18100.lock) → bench.gate → bench.lock, fixture jobs
+`pkill -STOP`ped while the GPU runs, native server on GPU 0 (`ROCR_VISIBLE_DEVICES=0`, cores 0-11),
+`/ready` wait ≤ 10 min, server always killed, one `<step>: done rc=<rc>` line, last line
+`queue4n: ALLDONE rc: …`. Started 13:19 local; queued behind the full-GSM8K FP8 KV requeue (hours).
 
-1. W4A4 8B GSM8K-200 (`mxeval2.sh`, lab-serve Job) → `ev3/llama8b-a4.json`, log `ev3/llama8b-a4.log`
-   (+ `.json.serve.log`).
-2. vLLM-ROCm on the W4A4 8B (`mxvllm2.sh`, port 18100) → `ev3/vllm-8b-a4.json` / `ev3/vllm-8b-a4.log`
-   (+ `.json.serve.log`: if vLLM refuses the checkpoint, the reason is there — record it in
-   `tests/eval/llama-3.1-8b-instruct-mxfp4-a4/gate.json` like the A16 one).
-3. Full GSM8K (1,319) MXFP4-A16 8B → `ev3/full-llama8b-mxfp4.json`, then BF16 8B →
-   `ev3/full-llama8b.json` (one after the other, 6 h eval timeout each).
-4. `lab-bench.sh --model llama8b | llama8b-mxfp4 | llama8b-mxfp4-a4 --label t20 --golden16 --c1`
-   (`LABBOOK_SET=phase-6a-quantization`) → `ev3/bench-<m>.log` (BENCH line), results in the worktree's
-   `target/lab-bench/t20-<m>/`. Golden verdicts are informational until the tolerances are calibrated;
-   the two quantized models have no reference yet, so their golden lines fail. lab-bench uploads to labbook
-   only when it exits 0 — upload the others by hand (labbook skill, set `phase-6a-quantization`).
+1. `llama8b-a4` — GSM8K-200, W4A4 8B (`phase6-novanas-llama8b-mxfp4-a4.yaml`) → `q4n/llama8b-a4.json`.
+   rc=90 means the server never became ready (tail of `q4n/llama8b-a4.server.log` in the log).
+2. `vllm-8b-a4` — vLLM-ROCm k3s Job `turbine-lab-vllm-<q4n/runid>` (the lab-serve template rendered to
+   `q4n/vllm-job.yaml`, port 18100, 40 min ready bound, Job always deleted) → `q4n/vllm-8b-a4.json`;
+   pod log `q4n/vllm-8b-a4.pod.log`. rc=92 = vLLM never ready: the refusal reason is in the pod log →
+   record it in `tests/eval/llama-3.1-8b-instruct-mxfp4-a4/gate.json` like the A16 one.
+3. `full-llama8b-mxfp4` then `full-llama8b` — full GSM8K (1,319), MXFP4-A16 8B then BF16 8B, 6 h eval
+   timeout each → `q4n/full-llama8b-mxfp4.json`, `q4n/full-llama8b.json`.
 
-Remote `fixq.sh` (fixture.lock, ranked third): log
-`/home/piwi/turbine-ci/remote/agent-a4784842b25c93376/scratch/fixtures/out/fixq3.log`, outputs in
-`…/scratch/fixtures/out/`: `llama-3.1-8b-instruct-mxfp4a16.{reference.jsonl,spread.json}`,
-`llama-3.1-8b-instruct-mxfp4-a4.{reference.jsonl,spread.json}` (`--act-quant mxfp4`),
-`llama-3.1-8b-instruct.spread.json`; last line `fixq: all done`. It deletes each dequantized /dev/shm
-copy after its spread. It runs the scripts of rev 2116221: check that the W4A4 reference step did not
-trip on the `*k_proj` / `*v_proj` KV entries (`quant_reference.py` has its own Quark parser).
+Copy the results back with one scp once `ALLDONE` is in the log:
+`scp 'piwi@192.168.10.203:/home/piwi/turbine-ci/remote/agent-a4784842b25c93376/q4n/*.json' <dir>`.
+
+**Then (Mac-driven, one at a time, background, only after ALLDONE — they queue on bench.lock otherwise):**
+`LABBOOK_SET=phase-6a-quantization scripts/lab-bench.sh --model <m> --label t20 --golden16 --c1` for
+`m` = `llama8b`, `llama8b-mxfp4`, `llama8b-mxfp4-a4`. Golden verdicts are informational until the
+tolerances are calibrated; the two quantized models have no reference yet, so their golden lines fail.
+lab-bench uploads to labbook only when it exits 0 — upload the others by hand (labbook skill).
+
+**Fixtures:** the old `fixq.sh` is gone (`fixq3.log` is stale). The 8B MXFP4 references/spreads now run
+inside the lead's `/home/piwi/turbine-ci/scratch/fixtures-r5/fixtures-r5.sh` (log `fixtures-r5.log`;
+outputs still in `…/agent-a4784842b25c93376/scratch/fixtures/out/`). At 13:14 its
+`mxfp4-llama-3.1-8b-instruct-mxfp4a16-reference` step ended **rc=143 (SIGTERM from outside, 3.5 min into a
+24 h timeout)**, so the A16 spread was skipped; the W4A4 reference started next. The A16 reference must be
+rerun (lead's pipeline) before the > 0.04 numerics check below can use it.
 
 ## How to judge (exact)
 
 - W4A4 GSM8K-200: `turbine-golden eval-compare --baseline tests/eval/llama-3.1-8b-instruct/turbine-bf16.json
-  --candidate <ev3/llama8b-a4.json> --max-drop 0.04` (4-bit bound; BF16 baseline unless vLLM serves it,
+--candidate <q4n/llama8b-a4.json> --max-drop 0.04` (4-bit bound; BF16 baseline unless vLLM serves it,
   then vLLM's result is the reference per Q9). Commit as `tests/eval/llama-3.1-8b-instruct-mxfp4-a4/{turbine.json,gate.json[,vllm.json]}`.
 - Full GSM8K: commit as `tests/eval/llama-3.1-8b-instruct/turbine-bf16-full.json` and
   `tests/eval/llama-3.1-8b-instruct-mxfp4a16/turbine-full.json`; `eval-compare --max-drop 0.04`.
