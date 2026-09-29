@@ -387,9 +387,24 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Supported,
     ),
-    // Phase 6a weight formats on gfx1201 Llama: `experimental` while each proof runs (plan
-    // Tasks 14, 15, 18, 20), `supported` only after its gate.
-    gfx1201_quant_row(WeightFormatColumn::Fp8),
+    // FP8 weights on gfx1201 Llama (Phase 6a Task 14): `supported`. The one `fp8` column covers
+    // both checkpoints the proof ran. Dynamic per-token (RedHatAI FP8-dynamic): full GSM8K at c16
+    // Turbine 0.7703 vs vLLM 0.7832 on the same checkpoint, a drop of 0.0129 over the 0.01 bound
+    // but not significant (McNemar exact p = 0.152, 95% CI -0.0295..+0.0037), accepted as noise
+    // (user decision 2026-09-29, "FP8-dynamic: accept the full-GSM8K drop as noise"); golden
+    // 16/16 at c1 and c16. Static per-tensor (RedHatAI FP8): golden 16/16 at c1 and c16 against
+    // the self-spread tolerance (likely 1.36, tail 2.99). The c1 ITL target stays a perf item.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("LlamaForCausalLM"),
+        Some(WeightFormatColumn::Fp8),
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Supported,
+    ),
+    // The other Phase 6a weight formats on gfx1201 Llama: `experimental` while each proof runs
+    // (plan Tasks 15, 18, 20), `supported` only after its gate.
     gfx1201_quant_row(WeightFormatColumn::Fp8Block),
     gfx1201_quant_row(WeightFormatColumn::Mxfp4),
     gfx1201_quant_row(WeightFormatColumn::Mxfp4A4),
@@ -1033,14 +1048,26 @@ mod tests {
                 }
             }
         }
-        // Nothing but the AMD BF16 baseline and the proven gfx1201 FP8 KV rows (Task 24) is
-        // supported before the tracks add rows.
+        // Nothing but the AMD BF16 baseline, the proven gfx1201 FP8 KV rows (Task 24) and the
+        // proven gfx1201 Llama FP8 weight row (Task 14, BF16 KV) is supported before the tracks
+        // add rows.
         for r in SUPPORT_MATRIX
             .iter()
             .filter(|r| r.status == SupportStatus::Supported)
         {
             assert_eq!(r.key.vendor, Some("amd"), "{:?}", r.view());
-            assert_eq!(r.key.weight_format, Some(W::Bf16), "{:?}", r.view());
+            if r.key.weight_format == Some(W::Fp8) {
+                assert_eq!(r.key.arch, Some("gfx1201"), "{:?}", r.view());
+                assert_eq!(
+                    r.key.architecture,
+                    Some("LlamaForCausalLM"),
+                    "{:?}",
+                    r.view()
+                );
+                assert_eq!(r.key.kv_format, Some(K::Bf16), "{:?}", r.view());
+            } else {
+                assert_eq!(r.key.weight_format, Some(W::Bf16), "{:?}", r.view());
+            }
             if r.key.kv_format == Some(K::Fp8E4m3) {
                 assert_eq!(r.key.arch, Some("gfx1201"), "{:?}", r.view());
             } else {
@@ -1063,9 +1090,15 @@ mod tests {
             ]
         );
         for w in W::PHASE_6A {
-            // Experimental on gfx1201 Llama while each proof runs; refused elsewhere.
+            // Supported on gfx1201 Llama once its gate passed (fp8), experimental while each
+            // other proof runs; refused elsewhere.
             let k = key("amd", "gfx1201", "LlamaForCausalLM", w, K::Bf16, S::None);
-            assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
+            let expected = if w == W::Fp8 {
+                "supported"
+            } else {
+                "experimental"
+            };
+            assert_eq!(resolve(&k).as_str(), expected, "{k}");
             let k = key("amd", "gfx1201", "OlmoeForCausalLM", w, K::Bf16, S::None);
             let status = resolve(&k);
             assert_eq!(status.as_str(), "unsupported", "{k}");

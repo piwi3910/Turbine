@@ -373,8 +373,8 @@ mod tests {
         );
         let key = key_before_discovery(&cfg, WeightFormatColumn::Fp8, KvFormatColumn::Bf16);
         assert_eq!(key.to_string(), "amd/*/LlamaForCausalLM/fp8/bf16/none");
-        // Experimental on gfx1201 Llama while its proof runs; another family is refused.
-        assert_eq!(support::check(key).unwrap().status.as_str(), "experimental");
+        // Supported on gfx1201 Llama after its gate; another family is refused.
+        assert_eq!(support::check(key).unwrap().status.as_str(), "supported");
         let qwen = model_dir(
             "fmt-qwen",
             serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}),
