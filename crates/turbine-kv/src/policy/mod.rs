@@ -488,12 +488,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// The ladder rule of `cost_aware` with pinned fills and pressure states (P6b S-6): it
-    /// compresses only when the controller is not GREEN and the lowest tier would drop or is
-    /// above high water, one rung at a time (`l0` → `fp8_e4m3` → `tq4` → `tq2` → evict, bounded
+    /// The ladder rule of `cost_aware` with pinned fills and pressure states (P6b S-6, user
+    /// decision 2026-09-29 "Start at YELLOW earlier"): from YELLOW on the lowest enabled tier
+    /// compresses even with free room; at any non-GREEN state an upper tier compresses only
+    /// above high water; one rung at a time (`l0` → `fp8_e4m3` → `tq4` → `tq2` → evict, bounded
     /// by `max_format`), an upper tier only once every tier below has reached the target rung;
-    /// it never upgrades a copy, and with the ladder off (or under `lru`) decides as Phase 4 did.
-    /// Breaks if a rung is skipped, a copy upgraded or compressed at GREEN.
+    /// at the floor the lowest tier evicts only a leaving copy or above high water; it never
+    /// upgrades a copy, and with the ladder off (or under `lru`) decides as Phase 4 did.
+    /// Breaks if a rung is skipped, a copy upgraded or compressed at GREEN, if the lowest tier
+    /// waits for high water at YELLOW (the pre-amendment rule), or if the floor evicts a copy
+    /// from a tier with free room.
     #[test]
     fn ladder_actions() {
         let p = CostAwarePolicy;
@@ -543,7 +547,9 @@ pub(crate) mod tests {
             assert!(matches!(act(c), EvictAction::Compress { .. }), "{state:?}");
         }
 
-        // A sweep (nothing must leave): compress only above high water; at the floor, evict.
+        // A sweep of the lowest tier (nothing must leave): from YELLOW on it compresses one
+        // rung even with free room (before the tiers are full); at the floor it evicts only
+        // above high water, never a copy of a tier with free room; GREEN never compresses.
         let sweep = |fill: f64, format: &'static str| {
             let mut c = ladder_ctx();
             c.must_leave = false;
@@ -551,20 +557,39 @@ pub(crate) mod tests {
             c.format = format;
             c
         };
-        assert_eq!(act(sweep(0.90, "l0")), EvictAction::Keep);
+        for state in [
+            PressureState::Yellow,
+            PressureState::Orange,
+            PressureState::Red,
+            PressureState::Survival,
+        ] {
+            for fill in [0.0, 0.10, 0.50, 0.90, 0.95, 0.96] {
+                let mut c = sweep(fill, "l0");
+                c.pressure = state;
+                assert_eq!(
+                    act(c),
+                    EvictAction::Compress { to: "fp8_e4m3" },
+                    "{state:?} at fill {fill}: the lowest tier compresses one rung"
+                );
+            }
+        }
+        assert_eq!(act(sweep(0.10, "tq4")), EvictAction::Compress { to: "tq2" });
         assert_eq!(
-            act(sweep(0.95, "l0")),
+            act(sweep(0.10, "tq2")),
+            EvictAction::Keep,
+            "the floor with free room keeps the copy"
+        );
+        assert_eq!(
+            act(sweep(0.95, "tq2")),
             EvictAction::Keep,
             "at high water, not above"
         );
-        assert_eq!(
-            act(sweep(0.96, "l0")),
-            EvictAction::Compress { to: "fp8_e4m3" }
-        );
         assert_eq!(act(sweep(0.96, "tq2")), EvictAction::Drop);
-        let mut green = sweep(0.99, "l0");
-        green.pressure = PressureState::Green;
-        assert_eq!(act(green), EvictAction::Keep);
+        for fill in [0.10, 0.99] {
+            let mut green = sweep(fill, "l0");
+            green.pressure = PressureState::Green;
+            assert_eq!(act(green), EvictAction::Keep, "GREEN at fill {fill}");
+        }
 
         // An upper tier (L1 above L2) compresses only once L2 has reached the target rung;
         // otherwise a victim is demoted as in Phase 4, at the lossier of the two formats.
@@ -590,6 +615,22 @@ pub(crate) mod tests {
             act(upper("fp8_e4m3", "l0", false)),
             EvictAction::Compress { to: "fp8_e4m3" }
         );
+        // At YELLOW only the lowest tier acts with free room: an upper tier at or below high
+        // water keeps its copy (or demotes a leaving one) even when L2 has reached the rung.
+        for fill in [0.10, 0.95] {
+            let mut c = upper("fp8_e4m3", "l0", false);
+            c.fill = fill;
+            assert_eq!(act(c), EvictAction::Keep, "L1 at fill {fill}");
+            c.must_leave = true;
+            assert_eq!(
+                act(c),
+                EvictAction::Demote {
+                    to: TierId::L2,
+                    format: "fp8_e4m3"
+                },
+                "leaving L1 copy at fill {fill}"
+            );
+        }
         assert_eq!(
             act(upper("fp8_e4m3", "fp8_e4m3", false)),
             EvictAction::Keep,

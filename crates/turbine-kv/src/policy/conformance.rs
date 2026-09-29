@@ -29,7 +29,7 @@ use crate::tier::TierId;
 ///   first.
 /// - `ladder_contract` (P6b S-6): `action` never upgrades a copy, never compresses at GREEN or
 ///   with the ladder off, never past `kv.ladder.max_format`, demotes only to the next tier and
-///   drops only from the lowest one.
+///   drops only from the lowest one, and only a leaving copy or above high water.
 pub(crate) fn eviction_policies_suite(
     reg: &Registry<dyn EvictionPolicy>,
 ) -> Result<(), Vec<String>> {
@@ -132,7 +132,8 @@ const RUNGS: [&str; 4] = ["l0", "fp8_e4m3", "tq4", "tq2"];
 /// `action` over seeded ladder contexts (every tier position, fill, pressure, format, rung,
 /// ladder setting): a compression only to a strictly lossier rung within `max_format`, never
 /// at GREEN or with the ladder off; a demotion only to the tier below, never more precise than
-/// the copy or that tier's rung; a drop only from the lowest tier. Deterministic.
+/// the copy or that tier's rung; a drop only from the lowest tier, and only of a copy that must
+/// leave or from a tier above high water (never evicting with free room). Deterministic.
 fn ladder_contract(p: &dyn EvictionPolicy, inputs: &[BlockScoreInputs]) -> Result<(), String> {
     let mut s = 0x001a_dde7_u64;
     let mut next = move || {
@@ -186,7 +187,10 @@ fn ladder_contract(p: &dyn EvictionPolicy, inputs: &[BlockScoreInputs]) -> Resul
                 .then_some("demoted more precisely than the copy or the tier's rung"),
                 _ => Some("demoted to a tier that is not the next one down"),
             },
-            EvictAction::Drop => (!ctx.lowest()).then_some("dropped from an upper tier"),
+            EvictAction::Drop if !ctx.lowest() => Some("dropped from an upper tier"),
+            EvictAction::Drop => (!ctx.must_leave
+                && ctx.ladder.is_none_or(|l| ctx.fill <= l.high_water))
+            .then_some("dropped a copy that need not leave from a tier at or below high water"),
             _ => None,
         };
         if let Some(what) = bad {
