@@ -16,6 +16,20 @@ to the committed gsm8k-200.jsonl. Regenerate with scripts/eval/make-gsm8k-full.s
 (downloads the dataset's test-split parquet file on demand; needs `hf` and `uv`, run on
 novanas — the Hugging Face token lives there and nothing is uploaded).
 
+tests/eval/gsm8k-200-completion.jsonl
+
+The completion-form (no chat template) counterpart of gsm8k-200.jsonl, for base
+checkpoints that have no chat template. Same 200 questions and answers, same source
+and commit as gsm8k-200.jsonl above, fetched again to keep each item's full worked
+solution (gsm8k-200.jsonl's jq filter keeps only the final number). Wraps each
+question in a fixed 8-shot chain-of-thought completion prompt whose exemplars are
+items 200..207 of the same source file (outside the 200 scored items), each rendered
+as "Question: ... / <instruction> / <steps> / Answer: <number>" with the source's
+calculator annotations (`<<...>>`) stripped; the scored item's prompt ends after the
+instruction line, and the request carries `stop: ["\n\nQuestion:"]` so the model does
+not run on into a new question. Regenerate with
+scripts/eval/make-gsm8k-200-completion.sh.
+
 The source is distributed under the MIT License:
 
 MIT License
