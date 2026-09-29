@@ -204,6 +204,7 @@ Timeouts: non-streaming → `504` type `timeout`, code `request_timeout`; stream
 - `n: 4` where forking needs more blocks than are free (fork waits; the prompt is not re-prefilled); `n: 2` with `response_format` (each choice has its own matcher).
 - Priority ties; a burst of high-priority requests while low-priority ones wait (no aging in Phase 2 — documented starvation risk).
 - Slow client whose channel fills while the request holds many blocks; client that resumes reading just before the slow-client timeout.
+- Slow client that reads part of its held backlog: partial reads do not reset the slow-client timer; it resets only once the whole held backlog has drained into the channel (the request un-pauses) — user decision 2026-09-29.
 - Request timeout firing during prefill or during grammar compilation; shutdown with a full queue.
 - _scheduler.max_batch_tokens_ smaller than a single decode set (more running requests than budget tokens is prevented by validation).
 - OLMoE: all 8 selected experts of every token in a batch land on the same expert (maximally unbalanced grouped GEMM); an expert selected by no token; router ties; a prompt longer than OLMoE's 4096 positions → 400 `context_length_exceeded`.

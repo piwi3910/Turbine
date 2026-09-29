@@ -2070,3 +2070,20 @@ plan's 0.75× target.
 as one detached script under the one-GPU-job rule. The ITL item: FP8 halves the weight bytes, so M = 1 decode should
 approach ≈ 0.6× BF16; the gap (0.846× measured) is likely the per-token activation quantization plus FP8 GEMM overhead at
 M = 1 — recorded as a perf item in the plan (Task 14 follow-up) and the review file, measured before any change.
+
+## Slow-client timer on partial reads (2026-09-29)
+
+Context: Phase 2 S-7 pauses a request whose output channel is full and cancels it with `slow_client` after
+_server.slow_client_timeout_; the spec did not say whether a client that reads part of the held backlog resets the timer.
+Found while fixing the `slow_client_paused_then_cancelled` failure (branch `p6a-server-flakes`: a slow-client close of a
+finished stream now ends with the `slow_client` error event instead of a bare close reported as `internal_error`).
+
+- A) The timer resets only when the whole held backlog has drained into the channel, i.e. when the request un-pauses
+  (current behaviour: `flush_outputs` → `Deadlines::resumed`) — chosen
+- B) Reset on any consumed event: friendlier to slow-but-steady readers, but a reader taking one event per
+  (timeout − ε) holds its KV until _server.request_timeout_
+- C) B with a floor: reset only after at least k events (or a share of the channel) were read since the last reset;
+  needs a new key or constant
+
+**Decision (user, 2026-09-29, relayed by the coordinator): A.** No code change; the phase-2 spec's edge-case list says
+partial reads do not reset the timer.
