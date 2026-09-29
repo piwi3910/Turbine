@@ -285,10 +285,17 @@ t28aspread, t28alab, gptqfull, w4a4segv, gpu-queue listing). Builder rules: `lea
 - `p6b-stack` fast-forwarded to 5d04199 (p6b-t3 reviewed; stays off integration until 6b). `p6b-t11b` builder ab673a1a58605e9eb
   restarted on the 78d3693 wip.
 
-**Waiting for the coordinator/user:** FP8-dynamic full GSM8K c16 Turbine 0.7703 vs vLLM 0.7832 (drop 0.0129 > 0.01, McNemar
-p=0.152) — options A accept / B numerics check / C hold sent; no flip until answered. GPTQ: full run waits for its go-file;
+**Answered:** FP8-dynamic full GSM8K drop accepted (A, aa66d8c). GPTQ: full run waits for its go-file;
 limit 0.04 vs turbine-bf16-full (gate.json); vLLM refuses the checkpoint, so a miss → coordinator (lead proposed a better
 checkpoint, damp 0.01, on both engines).
+
+**FP8 row flip (user decision A, aa66d8c) — NOT done yet, one catch:** the support matrix has a single `fp8` weight column
+(`WeightFormatColumn::Fp8`, per-tensor OR per-channel/dynamic), so flipping `gfx1201_quant_row(Fp8)` to `supported` also
+covers FP8 per-tensor checkpoints, whose golden is still unjudged (T14 per-tensor spread done → set its tolerance.json,
+re-judge the saved `capture.jsonl`, per `.procoder/handoff/p6a-fp8-t14.md`). Plan: judge the per-tensor golden first (small
+collector, sonnet), then flip the Fp8 row in support.rs (replace `gfx1201_quant_row(Fp8)` with an explicit `Supported` row + a
+comment citing both decisions; update any support test that expects fp8 experimental), gate, commit. If per-tensor fails,
+ask the coordinator (split the column, or keep fp8 experimental). Coordinator told of the catch at 00:25.
 
 **Small follow-ups to hand out:** (1) join the TP worker-rank thread at exit like the engine thread (10 s bound, timeout
 event, host test; coordinator-approved); (2) remote-cargo core pinning option 1 (tests on 8-11 when bench.lock is free, 12-15
