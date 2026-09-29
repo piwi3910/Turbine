@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use turbine_core::config::{Config, ConfigError, KvDtypeChoice, KvTierFormat};
+use turbine_core::config::{Config, ConfigError, KvDtypeChoice};
 use turbine_core::support::{
     self, HOST_VENDOR, KvFormatColumn, SupportDecision, SupportKey, SupportStatus,
     WeightFormatColumn,
@@ -106,36 +106,112 @@ pub fn before_discovery(cfg: &Config) -> Result<SupportDecision, ConfigError> {
 }
 
 /// The lower-tier KV formats in use, `(key, format)`: `kv.cpu.format` and `kv.nvme.format` of
-/// the enabled tiers and, with the ladder on, `kv.ladder.max_format` (the lossiest format a
-/// tier can reach).
-fn tier_format_keys(cfg: &Config) -> Vec<(&'static str, KvTierFormat)> {
+/// the enabled tiers, from L1 down, and, with the ladder on, `kv.ladder.max_format` (the
+/// lossiest format a tier can reach).
+fn tier_format_keys(cfg: &Config) -> Vec<(&'static str, &str)> {
     let kv = &cfg.kv;
     let mut keys = Vec::new();
     if kv.cpu.enabled {
-        keys.push(("kv.cpu.format", kv.cpu.format));
+        keys.push(("kv.cpu.format", kv.cpu.format.as_str()));
     }
     if kv.nvme.enabled {
-        keys.push(("kv.nvme.format", kv.nvme.format));
+        keys.push(("kv.nvme.format", kv.nvme.format.as_str()));
     }
     if kv.ladder.enabled {
-        keys.push(("kv.ladder.max_format", kv.ladder.max_format));
+        keys.push(("kv.ladder.max_format", kv.ladder.max_format.as_str()));
     }
     keys
 }
 
-/// Resolves every lower-tier KV format in use against `TIER_FORMAT_REFUSALS` (P6b S-2): an
-/// unsupported one is a configuration error naming its key (exit 2, also under
-/// `--check-config`); the rest are returned with their status.
-pub fn tier_formats(
-    cfg: &Config,
-) -> Result<Vec<(&'static str, &'static str, SupportStatus)>, ConfigError> {
+fn invalid(key: &str, reason: String) -> ConfigError {
+    ConfigError::Invalid {
+        key: key.to_string(),
+        reason,
+    }
+}
+
+/// The rung of `format` below the configured L0 (`turbine_kv::codec::tier_rung`); `key` names
+/// the setting in the error for an unregistered codec.
+fn rung(cfg: &Config, key: &str, format: &str) -> Result<usize, ConfigError> {
+    turbine_kv::codec::tier_rung(format, cfg.kv.dtype.as_str()).ok_or_else(|| {
+        invalid(
+            key,
+            format!(
+                "`{format}` is not registered (registered: {})",
+                turbine_kv::codec::registry().names().join(", ")
+            ),
+        )
+    })
+}
+
+/// The tier ordering of P6b S-2, from the `kv_format` registry's order (exit 2): each enabled
+/// lower tier no more precise than the tier above it (L1 against `kv.dtype`, L2 against L1
+/// when it is enabled, else `kv.dtype`), naming both keys; `kv.ladder.max_format` a lossy
+/// codec (not the first, lossless `l0`).
+fn tier_ordering(cfg: &Config) -> Result<(), ConfigError> {
+    let kv = &cfg.kv;
+    let l0 = kv.dtype.as_str();
+    let mut above = (
+        "kv.dtype",
+        l0,
+        turbine_kv::codec::tier_rung("l0", l0).unwrap_or(0),
+    );
+    for (enabled, key, format) in [
+        (kv.cpu.enabled, "kv.cpu.format", kv.cpu.format.as_str()),
+        (kv.nvme.enabled, "kv.nvme.format", kv.nvme.format.as_str()),
+    ] {
+        if !enabled {
+            continue;
+        }
+        let r = rung(cfg, key, format)?;
+        if r < above.2 {
+            return Err(invalid(
+                key,
+                format!(
+                    "{format} is more precise than {} ({}): a tier may not be more precise than \
+                     the tier above it",
+                    above.0, above.1
+                ),
+            ));
+        }
+        above = (key, format, r);
+    }
+    let max = kv.ladder.max_format.as_str();
+    if turbine_kv::codec::rung_index(max) == Some(0) {
+        return Err(invalid(
+            "kv.ladder.max_format",
+            format!("must be a lossy codec, got the lossless {max}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks the lower-tier KV formats in use (P6b S-2): first their ordering ([`tier_ordering`]),
+/// then each against `TIER_FORMAT_REFUSALS`: an unsupported one is a configuration error naming
+/// its key (exit 2, also under `--check-config`); the rest are returned with their status.
+pub fn tier_formats(cfg: &Config) -> Result<Vec<(&'static str, &str, SupportStatus)>, ConfigError> {
+    tier_ordering(cfg)?;
     tier_format_keys(cfg)
         .into_iter()
         .map(|(key, format)| {
-            let status = support::check_tier_format(key, format.as_str())?;
-            Ok((key, format.as_str(), status))
+            let status = support::check_tier_format(key, format)?;
+            Ok((key, format, status))
         })
         .collect()
+}
+
+/// The planner penalty of codec `name` (P6b S-3): `kv.lossy_penalty.<name>` when set, else the
+/// codec's own default (0 for an unregistered name, which startup has already refused).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the reuse planner reads it from 6b Task 4")
+)]
+pub fn lossy_penalty(cfg: &Config, name: &str) -> f64 {
+    cfg.kv.lossy_penalty_override(name).unwrap_or_else(|| {
+        turbine_kv::codec::registry()
+            .get(name)
+            .map_or(0.0, |c| c.default_lossy_penalty())
+    })
 }
 
 /// Logs every experimental lower-tier KV format as `event="support_matrix"` at WARN.
@@ -192,15 +268,14 @@ pub fn kv_format_availability(cfg: &Config) -> Result<(), KvFormatUnavailable> {
             "{what} needs the ABI v2.10 KV transcode, which no kernel provider implements yet"
         ),
     };
-    for (key, format) in [
-        (kv.cpu.enabled, ("kv.cpu.format", kv.cpu.format)),
-        (kv.nvme.enabled, ("kv.nvme.format", kv.nvme.format)),
-    ]
-    .into_iter()
-    .filter_map(|(enabled, pair)| enabled.then_some(pair))
+    let l0 = kv.dtype.as_str();
+    let l0_rung = turbine_kv::codec::tier_rung("l0", l0);
+    for (key, format) in tier_format_keys(cfg)
+        .into_iter()
+        .filter(|(key, _)| *key != "kv.ladder.max_format")
     {
-        if !format.is_l0(kv.dtype) {
-            return Err(transcode(format!("{key} {}", format.as_str())));
+        if turbine_kv::codec::tier_rung(format, l0) != l0_rung {
+            return Err(transcode(format!("{key} {format}")));
         }
     }
     if kv.ladder.enabled {
@@ -398,17 +473,17 @@ mod tests {
         assert_eq!(d.status, SupportStatus::Experimental);
     }
 
-    /// P6b S-2: the lower-tier formats in use are resolved against `TIER_FORMAT_REFUSALS`
-    /// (TurboQuant refused naming its key, exit 2, also under `--check-config`); the KV formats
-    /// that need the ABI v2.10 group are refused before binding with their reason code; the
-    /// `kv_format` registry holds exactly the configuration's codec names, in the same order.
-    /// Breaks if a tier format goes unchecked or a lossy format is silently served as `l0`.
+    /// P6b S-2: the lower-tier formats in use are ordered by the `kv_format` registry (a tier
+    /// never more precise than the tier above it, exit 2 naming both keys; the ladder's
+    /// `max_format` lossy) and resolved against `TIER_FORMAT_REFUSALS` (TurboQuant refused
+    /// naming its key, exit 2, also under `--check-config`); the KV formats that need the ABI
+    /// v2.10 group are refused before binding with their reason code; penalties default from
+    /// the codecs. Breaks if a tier format goes unchecked or a lossy format is silently served
+    /// as `l0`.
     #[test]
     fn tier_formats_and_availability() {
-        use turbine_core::config::{KvDtypeChoice, KvTierFormat};
-        let names: Vec<&str> = KvTierFormat::ALL.iter().map(|f| f.as_str()).collect();
-        assert_eq!(turbine_kv::codec::registry().names(), names);
-
+        use turbine_core::config::{KvDtypeChoice, ModuleName};
+        let name = |s: &str| ModuleName::new(s).unwrap();
         let llama = model_dir(
             "llama-tier-formats",
             serde_json::json!({"architectures": ["LlamaForCausalLM"]}),
@@ -419,12 +494,52 @@ mod tests {
             vec![("kv.cpu.format", "l0", SupportStatus::Supported)]
         );
         assert_eq!(kv_format_availability(&cfg), Ok(()));
+        assert_eq!(lossy_penalty(&cfg, "tq4"), 0.5);
+        assert_eq!(lossy_penalty(&cfg, "l0"), 0.0);
+        let mut over = config("hip", llama.path());
+        over.kv.lossy_penalty = Some([(name("tq4"), 0.7)].into_iter().collect());
+        assert_eq!(lossy_penalty(&over, "tq4"), 0.7);
+        assert_eq!(lossy_penalty(&over, "tq2"), 1.0);
+
+        // Ordering: L2 more precise than L1 (spec AC: nvme fp8_e4m3 under cpu tq4) names both
+        // keys, before the TurboQuant refusal of kv.cpu.format.
+        let mut order = config("hip", llama.path());
+        order.kv.cpu.format = name("tq4");
+        order.kv.nvme.enabled = true;
+        order.kv.nvme.format = name("fp8_e4m3");
+        let err = before_discovery(&order).unwrap_err();
+        assert_eq!(err.key(), Some("kv.nvme.format"), "{err}");
+        assert!(err.to_string().contains("kv.cpu.format"), "{err}");
+        // With L1 off, L2 is compared with L0 (kv.dtype).
+        order.kv.cpu.enabled = false;
+        assert!(tier_formats(&order).is_ok());
+        for (dtype, cpu) in [
+            (KvDtypeChoice::Tq4, "fp8_e4m3"),
+            (KvDtypeChoice::Tq2, "tq4"),
+        ] {
+            let mut c = config("cpu", llama.path());
+            c.kv.dtype = dtype;
+            c.kv.cpu.format = name(cpu);
+            let err = tier_formats(&c).unwrap_err();
+            assert_eq!(err.key(), Some("kv.cpu.format"), "{err}");
+            assert!(err.to_string().contains("kv.dtype"), "{err}");
+        }
+        // `fp8_e4m3` below an FP8 L0 is the L0 format; `l0` is always accepted.
+        for (dtype, cpu) in [
+            (KvDtypeChoice::Fp8E4m3, "fp8_e4m3"),
+            (KvDtypeChoice::Fp8E4m3, "l0"),
+            (KvDtypeChoice::Tq2, "l0"),
+        ] {
+            let mut c = config("cpu", llama.path());
+            c.kv.dtype = dtype;
+            c.kv.cpu.format = name(cpu);
+            assert!(tier_formats(&c).is_ok(), "{dtype:?} {cpu}");
+        }
 
         let mut fp8 = config("hip", llama.path());
-        fp8.kv.cpu.format = KvTierFormat::Fp8E4m3;
-        let tiers = tier_formats(&fp8).unwrap();
+        fp8.kv.cpu.format = name("fp8_e4m3");
         assert_eq!(
-            tiers,
+            tier_formats(&fp8).unwrap(),
             vec![("kv.cpu.format", "fp8_e4m3", SupportStatus::Supported)]
         );
         assert!(before_discovery(&fp8).is_ok());
@@ -437,7 +552,7 @@ mod tests {
 
         let mut tq = config("hip", llama.path());
         tq.kv.nvme.enabled = true;
-        tq.kv.nvme.format = KvTierFormat::Tq4;
+        tq.kv.nvme.format = name("tq4");
         let err = before_discovery(&tq).unwrap_err();
         assert_eq!(err.key(), Some("kv.nvme.format"), "{err}");
         assert!(err.to_string().contains("phase-6b-kv-compression"), "{err}");
@@ -449,7 +564,11 @@ mod tests {
         ladder.kv.ladder.enabled = true;
         let err = before_discovery(&ladder).unwrap_err();
         assert_eq!(err.key(), Some("kv.ladder.max_format"), "{err}");
-        ladder.kv.ladder.max_format = KvTierFormat::Fp8E4m3;
+        ladder.kv.ladder.max_format = name("l0");
+        let err = before_discovery(&ladder).unwrap_err();
+        assert_eq!(err.key(), Some("kv.ladder.max_format"), "{err}");
+        assert!(err.to_string().contains("lossy"), "{err}");
+        ladder.kv.ladder.max_format = name("fp8_e4m3");
         assert!(before_discovery(&ladder).is_ok());
         assert_eq!(
             kv_format_availability(&ladder).unwrap_err().code,

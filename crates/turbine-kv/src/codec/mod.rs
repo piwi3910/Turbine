@@ -86,6 +86,9 @@ pub trait KvCodec: Module {
     /// over a block's K and V (0 for a lossless one); the conformance suite holds every codec
     /// to it on seeded Gaussian and outlier-heavy blocks.
     fn nmse_bound(&self) -> f64;
+    /// Default planner penalty of a block stored in this codec (`kv.lossy_penalty`, P6b S-3,
+    /// Q16): its retrieval cost is multiplied by `1 + penalty`; 0 for a lossless codec.
+    fn default_lossy_penalty(&self) -> f64;
     /// Whether the codec can store blocks of this L0 layout.
     fn supports(&self, l0: &KvLayout) -> Result<(), CodecError> {
         check_l0_dtype(self.name(), l0)
@@ -123,6 +126,19 @@ pub fn registry() -> &'static Registry<dyn KvCodec> {
 /// Position of codec `name` on the compression ladder (0 = `l0`), from the registration order.
 pub fn rung_index(name: &str) -> Option<usize> {
     registry().iter().position(|c| c.name() == name)
+}
+
+/// Rung of a tier that stores codec `format` below an L0 whose page format is named `l0_dtype`
+/// (`kv.dtype`: `bf16`, or the name of the codec its pages are stored in): `l0` (the first
+/// codec, the L0 bytes unchanged) takes the L0 format's rung — 0 for BF16 — so `fp8_e4m3` below
+/// an FP8 L0 ranks as `l0`; every other codec its registration position. `None` for an
+/// unregistered `format`. A tier may not rank below the tier above it (P6b S-2).
+pub fn tier_rung(format: &str, l0_dtype: &str) -> Option<usize> {
+    if rung_index(format)? == 0 {
+        Some(rung_index(l0_dtype).unwrap_or(0))
+    } else {
+        rung_index(format)
+    }
 }
 
 /// The next lossier registered codec after `name`, if any.
@@ -406,6 +422,30 @@ pub(crate) mod tests {
         assert_eq!(next_rung("tq2"), None);
         assert_eq!(lossier("l0", "tq4"), "tq4");
         assert_eq!(lossier("tq2", "fp8_e4m3"), "tq2");
+    }
+
+    /// Tier ordering (P6b S-2) is read from the registry: a tier's rung is its codec's
+    /// position, except `l0`, which is the L0 page format's own rung (0 for BF16), so `fp8_e4m3`
+    /// below an FP8 L0 ranks as `l0`; lossy codecs carry their planner penalty defaults
+    /// (`kv.lossy_penalty`, Q16). Breaks if the ordering or the defaults drift.
+    #[test]
+    fn tier_ordering() {
+        assert_eq!(tier_rung("l0", "bf16"), Some(0));
+        assert_eq!(tier_rung("fp8_e4m3", "bf16"), Some(1));
+        assert_eq!(tier_rung("tq4", "bf16"), Some(2));
+        assert_eq!(tier_rung("tq2", "fp8_e4m3"), Some(3));
+        assert_eq!(
+            tier_rung("l0", "fp8_e4m3"),
+            tier_rung("fp8_e4m3", "fp8_e4m3")
+        );
+        assert_eq!(tier_rung("l0", "tq2"), Some(3));
+        assert!(tier_rung("fp8_e4m3", "tq4") < tier_rung("l0", "tq4"));
+        assert_eq!(tier_rung("zstd", "bf16"), None);
+        let penalties: Vec<f64> = registry()
+            .iter()
+            .map(|c| c.default_lossy_penalty())
+            .collect();
+        assert_eq!(penalties, [0.0, 0.1, 0.5, 1.0]);
     }
 
     /// `l0` stores the L0 bytes unchanged, for BF16 and FP8 pages. Breaks if the identity codec

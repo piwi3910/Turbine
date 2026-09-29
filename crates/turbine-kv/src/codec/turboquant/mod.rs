@@ -323,7 +323,7 @@ fn tq_decode(
 }
 
 macro_rules! tq_codec {
-    ($ty:ident, $name:literal, $abi:literal, $k:literal, $v:literal, $bound:literal, $doc:literal) => {
+    ($ty:ident, $name:literal, $abi:literal, $k:literal, $v:literal, $bound:literal, $penalty:literal, $doc:literal) => {
         #[doc = $doc]
         #[derive(Clone, Copy, Debug)]
         pub struct $ty;
@@ -355,6 +355,10 @@ macro_rules! tq_codec {
             /// the bound is the larger with a ≈ 30 % margin (`tq4` 0.053 → 0.07, `tq2` 0.567 → 0.75).
             fn nmse_bound(&self) -> f64 {
                 $bound
+            }
+
+            fn default_lossy_penalty(&self) -> f64 {
+                $penalty
             }
 
             fn supports(&self, l0: &KvLayout) -> Result<(), CodecError> {
@@ -395,6 +399,7 @@ tq_codec!(
     3,
     4,
     0.07,
+    0.5,
     "`tq4`: K 3 + 1 bits (MSE stage + QJL), V 4 bits; 144-byte records."
 );
 tq_codec!(
@@ -404,6 +409,7 @@ tq_codec!(
     1,
     2,
     0.75,
+    1.0,
     "`tq2`: K 1 + 1 bits (MSE stage + QJL), V 2 bits; 80-byte records."
 );
 

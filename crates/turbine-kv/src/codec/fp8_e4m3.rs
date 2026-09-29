@@ -49,6 +49,10 @@ impl KvCodec for Fp8E4m3Codec {
         1.0 / 256.0
     }
 
+    fn default_lossy_penalty(&self) -> f64 {
+        0.1
+    }
+
     fn bytes_per_block(&self, l0: &KvLayout) -> u64 {
         match l0.dtype {
             DType::F8E4M3 => l0.block_bytes(),

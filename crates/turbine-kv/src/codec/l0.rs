@@ -28,6 +28,10 @@ impl KvCodec for L0Codec {
         0.0
     }
 
+    fn default_lossy_penalty(&self) -> f64 {
+        0.0
+    }
+
     fn bytes_per_block(&self, l0: &KvLayout) -> u64 {
         l0.block_bytes()
     }

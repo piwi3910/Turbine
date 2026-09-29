@@ -38,8 +38,9 @@ kv:
     enabled: true
     # At most host MemTotal minus reliability.memory.host_reserve_bytes.
     max_bytes: 64GiB
-    # Codec of L1 blocks: l0 (the L0 bytes, lossless), fp8_e4m3, tq4 or tq2 (lossy); not more
-    # precise than kv.dtype. Anything but l0 needs a kernel library with the v2.10 transcode.
+    # Codec of L1 blocks, a kv_format registry name: l0 (the L0 bytes, lossless), fp8_e4m3,
+    # tq4 or tq2 (lossy); not more precise than kv.dtype. Anything stored other than at the L0
+    # format exits 1 (kv_transcode_unavailable) until the v2.10 KV transcode lands (6b Task 5).
     format: l0
   # L2 NVMe slab files; wiped at startup, nothing persists across restarts.
   nvme:
@@ -82,13 +83,13 @@ kv:
   lossless_tail_blocks: 1
   # allow or deny: may requests without x-turbine-kv-lossy reuse lossy cached blocks.
   lossy_reuse: allow
-  # A lossy block's retrieval cost is multiplied by 1 + penalty (0..100) when planning reuse.
-  lossy_penalty:
-    fp8_e4m3: 0.1
-    tq4: 0.5
-    tq2: 1.0
+  # Per codec: a lossy block's retrieval cost is multiplied by 1 + penalty (0..100) when
+  # planning reuse. null: each codec's default (fp8_e4m3 0.1, tq4 0.5, tq2 1.0); an entry
+  # such as {tq4: 0.7} overrides one codec.
+  lossy_penalty: null
   # Pressure-driven compression ladder (l0 -> fp8_e4m3 -> tq4 -> tq2 -> evict), off by default;
-  # needs L1 or L2 enabled.
+  # needs L1 or L2 enabled. Enabled, it exits 1 until its kernels land: kv_tq_unavailable
+  # with l0: true (6b Task 12), kv_transcode_unavailable with l0: false (6b Task 5).
   ladder:
     enabled: false
     # true: L0 joins the ladder (needs the v2.10 mixed-format paged attention).

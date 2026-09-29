@@ -12,6 +12,7 @@ A KV codec decides how one KV block is stored in a lower tier (Phase 6b S-1): it
 | `lossy(l0)`                 | True when `decode(encode(x))` may differ from `x` for an L0 of this layout (`fp8_e4m3` is lossless below an FP8 L0, lossy below a BF16 one).                                                |
 | `abi_code()`                | The `TURBINE_KVFMT_*` code of the ABI v2.10 `turbine_kv_transcode` op that runs this codec on the GPU.                                                                                      |
 | `nmse_bound()`              | The documented bound on ‖x − x̂‖² / ‖x‖² over a block (0 for a lossless codec); the suite holds the codec to it.                                                                             |
+| `default_lossy_penalty()`   | The planner penalty of a block in this codec when `kv.lossy_penalty` does not override it (its retrieval cost is multiplied by `1 + penalty`); 0 for a lossless codec.                      |
 | `supports(l0)`              | Whether the codec can store blocks of this L0 layout (default: BF16 or FP8 pages); e.g. TurboQuant needs `head_dim` 128.                                                                    |
 | `bytes_per_block(l0)`       | Bytes of one slot; never more than the L0 block, and never more than the previous codec in the registry.                                                                                    |
 | `encode_cpu` / `decode_cpu` | The CPU reference: deterministic, refusing a buffer of the wrong size. The GPU transcode must decode bit-exactly like it; `turbine-kv` stays GPU-free, so the codec itself has no GPU code. |
@@ -42,6 +43,7 @@ impl KvCodec for HalfCodec {
     fn lossy(&self, _l0: &KvLayout) -> bool { true }
     fn abi_code(&self) -> u8 { 4 }
     fn nmse_bound(&self) -> f64 { 1.0 }
+    fn default_lossy_penalty(&self) -> f64 { 0.8 }
     fn bytes_per_block(&self, l0: &KvLayout) -> u64 { l0.block_bytes() / 2 }
     fn encode_cpu(&self, src: &[u8], l0: &KvLayout, dst: &mut [u8], p: &CodecParams)
         -> Result<(), CodecError> { todo!() }
@@ -63,7 +65,7 @@ static REGISTRY: Registry<dyn KvCodec> = Registry::new(
 );
 ```
 
-Then pin the name in `codec::tests::registry_lists_codecs`, and add it to the configuration: a variant of `KvTierFormat` (`crates/turbine-core/src/config/kv.rs`, same place in the order, with its `lossiness` and a `kv.lossy_penalty` entry when lossy) — the server checks at startup that `KvTierFormat::ALL` and the registry name the same codecs in the same order (`support_startup::tests::tier_formats_and_availability`), and validates `kv.cpu.format`, `kv.nvme.format` and `kv.ladder.max_format` against `registry().names()` (`crates/turbine-server/src/modules.rs`). A new format starts refused or `experimental` in `TIER_FORMAT_REFUSALS` (`crates/turbine-core/src/support.rs`) until its quality gate passes.
+Then pin the name in `codec::tests::registry_lists_codecs`. Nothing else: the configuration takes codec names as plain module names, the server validates `kv.cpu.format`, `kv.nvme.format`, `kv.ladder.max_format` and the `kv.lossy_penalty` entries against `registry().names()` (`crates/turbine-server/src/modules.rs`), takes the tier ordering from the registration order (`codec::tier_rung`, checked at startup by `support_startup::tests::tier_formats_and_availability`) and a codec's planner penalty from `default_lossy_penalty` unless `kv.lossy_penalty.<name>` overrides it. A new format starts refused or `experimental` in `TIER_FORMAT_REFUSALS` (`crates/turbine-core/src/support.rs`) until its quality gate passes.
 
 ## Conformance suite
 
@@ -71,10 +73,14 @@ Then pin the name in `codec::tests::registry_lists_codecs`, and add it to the co
 
 - `scripts/remote-cargo.sh test -p turbine-kv registry_conformance` — the suite over the registry.
 - `scripts/remote-cargo.sh test -p turbine-kv codec::tests` — the registry order and the per-codec unit tests.
-- `scripts/remote-cargo.sh test -p turbine-core config::tests::phase6_keys` — the tier-format keys and their ordering rule.
+- `scripts/remote-cargo.sh test -p turbine-kv codec::tests::tier_ordering` — the tier ordering and the penalty defaults.
+- `scripts/remote-cargo.sh test -p turbine-server support_startup::tests::tier_formats_and_availability` — the startup checks: registry names, ordering (exit 2 naming both keys), refusals and the v2.10 gating.
+- `scripts/remote-cargo.sh test -p turbine-core config::tests::phase6_keys` — the keys' syntax, defaults and ranges.
 - `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — this page stays true to the tree.
 
 ## Lab checks
+
+Progressive gating (Phase 6b): until plan Task 5 lands the ABI v2.10 KV transcode, a lower tier not stored at the L0 format (`kv.cpu.format` / `kv.nvme.format` other than `l0`, or `fp8_e4m3` below a BF16 L0) and `kv.ladder.enabled: true` exit 1 before binding with `kv_transcode_unavailable`; until Task 12 lands the v2.10 mixed-format paged attention, `kv.dtype: tq4|tq2` and the ladder with `kv.ladder.l0: true` (the default) exit 1 with `kv_tq_unavailable`. `--check-config` does not load a kernel library, so it still answers `config ok` for them. The check is `support_startup::kv_format_availability` (`crates/turbine-server/src/support_startup.rs`); those tasks replace it with the loaded library's v2.10 check.
 
 A codec changes nothing until a tier names it, so landing its CPU reference needs no lab run. Its GPU transcode needs the lab test of the transcode op against the CPU codec (`scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops`, the `kv_transcode_matches_cpu` case: decode bit-exact, encode equal except at documented ties), and before its `TIER_FORMAT_REFUSALS` entry turns `supported` the quality gate of Phase 6b S-8 on GPU 0: `scripts/lab-bench.sh --model llama --golden16 -- --set kv.cpu.format=<name>` (and `--model olmoe`) with golden c1 and c16 under the batched bounds, plus `turbine-golden eval-compare` against the BF16 KV report.
 
