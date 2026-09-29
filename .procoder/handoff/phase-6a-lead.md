@@ -124,3 +124,50 @@ Update it at the next clean point.
   (pid 55147): its old bench-lock.sh would have run the T15 worktree's new self-locking lab-serve.sh and deadlocked
   on its own lock; relaunch it with the new scripts. Worktrees without e06afc9 (p6a-mxfp4 with queue4 running,
   p6a-int4, p6a-yarn-t28, p6a-kv-t24-full) must not merge integration while their old-script queues run.
+
+## Rotation of the second lead (~10:45, ~311k tokens) — START HERE
+
+Integration `phase-6a-quantization` tip = this commit (after 7544183), clean, no push. Scratchpad =
+`/private/tmp/claude-501/-Users-pascal-Development-Turbine/7482a1b1-2407-47bb-91f2-d826e25c21af/scratchpad`.
+
+**Gate:** last green = 386898a (775/0). Not yet green since: T15 merge (16b06ef), e06afc9 (lab-serve lock),
+f94cbf1 (builds off bench.lock), docs. Clippy passed on f94cbf1 in 19 s without a lock wait; the test step died
+twice to novanas ssh timeouts (the host is up since 07:01, no crash; ssh stalls under load ~10:28 and ~10:40).
+A gate on 7544183 was running in the background (`scratchpad/gate-7544183.txt`), likely failing on ssh. First
+action: rerun `scripts/gate.sh` (run_in_background) once `ssh novanas true` answers.
+
+**Restarts pending (after the gate is green; fresh agents; every brief says: never block in the foreground on a
+lock or a long remote run — run_in_background, get notified; no polling; `git status` first):**
+- T28 YaRN (dead aa94fe3bfacab12b1): worktree `agent-aa94fe3bfacab12b1`, branch `p6a-yarn-t28` (c06a1c8), no merge
+  state; uncommitted: golden.rs, hf_reference.py, yarn_long_prompt.py, yarn_self_spread.py, yarn16 config and
+  fixture dir. Its last known work: CPU-provider A/B, transformers-style attention factor (cos/sin × m before BF16)
+  vs the fold, on GPU 0 — the result may be in its scratch/logs; the fold placement is a design question to the
+  lead/coordinator before changing lead-owned files. Findings so far: p16 tail same on CPU and HIP (kernels ruled
+  out), p17-long HIP tail flatter than reference. The fold spread job may be left to time out (builder's call).
+- T15 proof (dead ae29a5cff88bf0bdb): worktree `agent-a4baec4689b995379`, branch `p6a-fp8-t15` (78e51fe, has
+  e06afc9 but not f94cbf1 — merge integration first), clean. Brief = the one given to ae29a5cff88bf0bdb (in this
+  handoff's history): served-bytes check first (below), then GSM8K-200 vs BF16 3B (FP8 bound 0.02), lab-bench
+  `--model llama-fp8-block --golden16 --c1`, vLLM fp8-block baseline, labbook, tolerance once the fp8-block
+  reference (fixture queue, `scratchpad/fp8/fixture_chain2.sh`) and a spread exist; soak asks the lead; row flip as
+  a handoff(support.rs) commit.
+
+**Detached runs / collectors:**
+- T15 served bytes: relaunched ~10:40 as `nohup scripts/bench-lock.sh --name port18000 bash scratchpad/t15_serve.sh`
+  from the T15 worktree (new lab-serve takes bench.lock itself). Its lock ssh printed a timeout — check
+  `scratchpad/t15_serve_lock.txt`; if bench-lock exited, relaunch the same way. Result: `scratchpad/t15_weight_bytes.txt`,
+  last line `t15-serve: done rc=… run=…`; pass = weight_bytes 3,607,615,488, no `fp8_block_decoded`.
+- T20 queue4 (dead builder ended deliberately; handoff committed 822d8a6 on `p6a-mxfp4`): local `bash queue4.sh`
+  (pid 34597, log `scratchpad/mxfp4/queue4.log`, outputs `scratchpad/mxfp4/ev3/`): W4A4 8B GSM8K-200 → vLLM 8B-a4 →
+  full GSM8K MXFP4-A16 then BF16 8B → 3 lab-benches. Done at `queue4: done`. Collector (default model if the full-set
+  MXFP4-A16 drop > 0.04: numerics check before any status change) follows `.procoder/handoff/p6a-mxfp4.md` "How to
+  judge". Plus fixq (fixture queue, rank 3). The T18 AWQ lab-bench (pid 6025 chain, from a74d419d213cc35b9's
+  background call) also waits on port18000.
+- Full-GSM8K FP8 KV (4 passes): see "Detached runs to collect" above (ALLDONE line; don't touch that worktree).
+- T18 INT4 builder a74d419d213cc35b9: still alive (background lab-bench); no report yet.
+
+**Must not merge integration while their old-script queues run** (their old bench-lock.sh doesn't export
+TURBINE_BENCH_LOCK_HELD, the new lab-serve.sh would wait on its own caller, and a remote-cargo sync replaces
+binaries mid-run): `p6a-mxfp4` (until `queue4: done`), `p6a-kv-t24-full` (until ALLDONE), `p6a-int4` (until its
+AWQ lab-bench and anything else it queued have finished; tell a74d419d213cc35b9). `p6a-yarn-t28`: check
+for detached runs before merging.
+
