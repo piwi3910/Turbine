@@ -371,6 +371,7 @@ pub(crate) mod tests {
         KvLocation {
             tier: TierId::L0,
             slot,
+            format: crate::tier::L0_FORMAT,
         }
     }
 
@@ -462,6 +463,7 @@ pub(crate) mod tests {
             let loc = KvLocation {
                 tier,
                 slot: i as u64,
+                format: crate::tier::L0_FORMAT,
             };
             dir.insert(block(
                 keys[i],

@@ -124,7 +124,12 @@ fn nvme_checksum_and_restart() {
     let slab = t.slab_path(0);
     let mut raw = std::fs::read(&slab).unwrap();
     assert_eq!(&raw[..8], SLAB_MAGIC);
-    assert_eq!(&raw[8..12], &1u32.to_le_bytes(), "format version 1");
+    assert_eq!(&raw[8..12], &2u32.to_le_bytes(), "format version 2");
+    assert_eq!(
+        &raw[60..76],
+        b"l0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+        "the slots' codec"
+    );
     assert_eq!(&raw[12..44], &[3u8; 32], "namespace key");
     // Slots are 8 KiB after the 4 KiB header and fill from slot 0: corrupt one byte of slot 1.
     raw[4096 + 8192 + 17] ^= 0xff;
@@ -712,4 +717,43 @@ fn faulty_tier_degrades_to_recompute() {
         "{reasons:?}"
     );
     assert_eq!(r.pool.referenced_blocks(), 0, "no reference leaked");
+}
+
+/// P6b S-1: L2 keeps each codec's blocks in slab files of their own (header version 2 names
+/// the codec and slot size), accounts a block at its own bytes, and rewrites a slab that no
+/// block uses for another codec once every slab file exists.
+#[test]
+fn nvme_slabs_per_codec() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = l2(dir.path(), 4, KvMetrics::unregistered());
+    for i in 0..4u8 {
+        t.put(key(i), TierBlockRef::Host(&bytes(i))).unwrap();
+    }
+    assert_eq!(
+        t.put_as(key(9), "fp8_e4m3", 3000, TierBlockRef::Host(&[1u8; 3000])),
+        Err(TierError::Full),
+        "the only slab file holds l0 blocks"
+    );
+    for i in 0..4u8 {
+        t.evict(&key(i)).unwrap();
+    }
+    // The emptied slab takes 4 KiB fp8 slots now: twice as many blocks.
+    for i in 0..8u8 {
+        let block = vec![i; 3000];
+        t.put_as(key(i), "fp8_e4m3", 3000, TierBlockRef::Host(&block))
+            .unwrap();
+    }
+    assert_eq!(t.used_bytes(), 8 * 3000);
+    let raw = std::fs::read(t.slab_path(0)).unwrap();
+    assert_eq!(&raw[44..52], &4096u64.to_le_bytes(), "slot size");
+    assert_eq!(&raw[52..60], &8u64.to_le_bytes(), "slot count");
+    assert_eq!(&raw[60..68], b"fp8_e4m3");
+    let mut out = vec![0u8; 3000];
+    t.get(&key(5), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, vec![5u8; 3000]);
+    assert_eq!(
+        t.put(key(20), TierBlockRef::Host(&bytes(20))),
+        Err(TierError::Full),
+        "no slab is free for an l0 block"
+    );
 }

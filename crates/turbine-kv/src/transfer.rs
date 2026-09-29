@@ -108,6 +108,34 @@ impl TransferPurpose {
     }
 }
 
+/// The formats at both ends of a copy (P6b S-1): the source copy is decoded from `from` and the
+/// destination copy encoded in `to`, both `kv_format` codec names (`l0` for an L0 block, whose
+/// pages hold the L0 format). `from_bytes` / `to_bytes` are the two copies' sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransferCodec {
+    pub from: &'static str,
+    pub from_bytes: u64,
+    pub to: &'static str,
+    pub to_bytes: u64,
+}
+
+impl TransferCodec {
+    /// A copy at the L0 format on both ends, `bytes` each.
+    pub fn l0(bytes: u64) -> Self {
+        TransferCodec {
+            from: crate::tier::L0_FORMAT,
+            from_bytes: bytes,
+            to: crate::tier::L0_FORMAT,
+            to_bytes: bytes,
+        }
+    }
+
+    /// The bytes move unchanged (no decode, no encode).
+    pub fn is_identity(&self) -> bool {
+        self.from == self.to
+    }
+}
+
 /// One block copy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferRequest {
@@ -121,6 +149,8 @@ pub struct TransferRequest {
     /// Backend slot numbers (L0 `BlockId`, or `slab << 32 | slot` in L1/L2).
     pub src_slot: u64,
     pub dst_slot: u64,
+    /// Formats of the source and destination copies (P6b S-1).
+    pub codec: TransferCodec,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -371,6 +401,9 @@ pub struct SimTransferBackend {
     l1: Option<Arc<dyn KvTier>>,
     l2: Option<Arc<dyn KvTier>>,
     scratch: Vec<u8>,
+    /// False when built with `block_bytes` 0: the tiers are payload-free and copies move no
+    /// bytes (a payload-free `MemTier` accounts the logical size `put_as` names).
+    payload: bool,
     due: HashMap<u64, Duration>,
     fail_next: u32,
 }
@@ -387,7 +420,8 @@ impl SimTransferBackend {
             costs: TransferPath::ALL.map(TransferPath::fallback),
             l1,
             l2,
-            scratch: vec![0; block_bytes],
+            scratch: Vec::with_capacity(block_bytes),
+            payload: block_bytes > 0,
             due: HashMap::new(),
             fail_next: 0,
         }
@@ -410,13 +444,33 @@ impl SimTransferBackend {
         }
     }
 
-    fn move_block(&self, req: &TransferRequest, buf: &mut [u8]) -> Result<TierSlot, TierError> {
-        match self.tier(req.path.from()) {
-            Some(src) => src.get(&req.key, TierBlockMut::Host(buf))?,
-            None => buf.fill(0),
+    /// Reads the source copy (`codec.from_bytes`) and stores the destination copy
+    /// (`codec.to_bytes`, labelled `codec.to`). The simulator does not transcode: when the
+    /// sizes differ, the destination holds the source bytes cut or zero-padded to its size.
+    fn move_block(&self, req: &TransferRequest, buf: &mut Vec<u8>) -> Result<TierSlot, TierError> {
+        let (src, dst) = (self.tier(req.path.from()), self.tier(req.path.to()));
+        if src.is_none() && dst.is_none() {
+            return Ok(TierSlot(req.dst_slot));
         }
-        match self.tier(req.path.to()) {
-            Some(dst) => dst.put(req.key, TierBlockRef::Host(buf)),
+        let c = req.codec;
+        let (from_len, to_len) = if self.payload {
+            (c.from_bytes as usize, c.to_bytes as usize)
+        } else {
+            (0, 0)
+        };
+        buf.clear();
+        buf.resize(from_len.max(to_len), 0);
+        if let Some(src) = src {
+            src.get(&req.key, TierBlockMut::Host(&mut buf[..from_len]))?;
+            buf[from_len..].fill(0);
+        }
+        match dst {
+            Some(dst) => dst.put_as(
+                req.key,
+                c.to,
+                c.to_bytes,
+                TierBlockRef::Host(&buf[..to_len]),
+            ),
             None => Ok(TierSlot(req.dst_slot)),
         }
     }
@@ -489,6 +543,8 @@ mod tests {
             purpose: TransferPurpose::Promote,
             src_slot: u64::from(key),
             dst_slot: u64::from(key),
+            // `bytes` only paces the copy; the tiers of these tests hold 4 KiB blocks.
+            codec: TransferCodec::l0(4096),
         }
     }
 

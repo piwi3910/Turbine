@@ -3,7 +3,13 @@
 //! it. Nothing persists across restarts: opening the tier deletes every `turbine-kv-*.slab`.
 //!
 //! Slab file layout: a 4 KiB header (magic `TKVSLAB1`, format version u32 LE, namespace key,
-//! slot size u64 LE, slot count u64 LE) followed by the slots, each one block padded to 4 KiB.
+//! slot size u64 LE, slot count u64 LE; version 2 adds the slots' `kv_format` codec name,
+//! 16 bytes NUL-padded, and its rotation seed u64 LE — P6b S-1) followed by the slots, each one
+//! block padded to 4 KiB.
+//!
+//! Formats (P6b S-1): each slab file holds blocks of one codec — `kv.nvme.format`, or `l0` for
+//! the lossless tail — in slots sized by the first block of that codec, never larger than the
+//! `l0` slab file (so `kv.nvme.max_bytes` still bounds the files).
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -20,7 +26,9 @@ use crate::identity::{KvKey, NamespaceKey};
 use crate::metrics::{EvictReason, KvMetrics};
 
 pub const SLAB_MAGIC: &[u8; 8] = b"TKVSLAB1";
-const SLAB_VERSION: u32 = 1;
+const SLAB_VERSION: u32 = 2;
+/// Bytes of the codec name in a version 2 header.
+const FORMAT_NAME_BYTES: usize = 16;
 /// Slot and header alignment (the `O_DIRECT` requirement on the lab NVMe drives).
 const ALIGN: usize = 4096;
 const HEADER_BYTES: u64 = 4096;
@@ -67,6 +75,15 @@ pub struct L2Config {
     pub namespace: NamespaceKey,
 }
 
+/// One slab file and the codec its slots hold.
+struct Slab {
+    file: File,
+    format: &'static str,
+    slot_bytes: usize,
+    /// Slots in use (stored, or being written); an unused slab may take another codec.
+    taken: usize,
+}
+
 #[derive(Clone, Copy)]
 struct SlotEntry {
     slab: usize,
@@ -76,9 +93,12 @@ struct SlotEntry {
 }
 
 struct L2State {
-    slabs: Vec<File>,
+    slabs: Vec<Slab>,
     index: HashMap<KvKey, SlotEntry>,
-    free: Vec<(usize, usize)>,
+    /// Free slots per codec name.
+    free: HashMap<&'static str, Vec<(usize, usize)>>,
+    /// Bytes of the stored blocks.
+    used: u64,
     health: TierHealth,
     latencies: VecDeque<f64>,
     calibration_p99: Option<f64>,
@@ -88,7 +108,9 @@ struct L2State {
 
 pub struct L2NvmeTier {
     cfg: L2Config,
+    /// Slot bytes of an `l0` block (the largest slot).
     slot_bytes: usize,
+    /// Slots of an `l0` slab file.
     slots_per_slab: usize,
     max_slabs: usize,
     clock: Arc<dyn Clock>,
@@ -190,7 +212,8 @@ impl L2NvmeTier {
             state: Mutex::new(L2State {
                 slabs: Vec::new(),
                 index: HashMap::new(),
-                free: Vec::new(),
+                free: HashMap::new(),
+                used: 0,
                 health: TierHealth::new(Some(PROBE_AFTER)),
                 latencies: VecDeque::with_capacity(LATENCY_WINDOW),
                 calibration_p99: None,
@@ -206,7 +229,7 @@ impl L2NvmeTier {
         self.cfg.path.join(format!("turbine-kv-{slab:04}.slab"))
     }
 
-    /// Size of one slab file: header plus its slots.
+    /// Size of one `l0` slab file (the largest): header plus its slots.
     pub fn slab_file_bytes(&self) -> u64 {
         HEADER_BYTES + (self.slots_per_slab * self.slot_bytes) as u64
     }
@@ -329,9 +352,74 @@ impl L2NvmeTier {
         r
     }
 
-    fn new_slab(&self, s: &mut L2State) -> Result<(), TierError> {
-        let idx = s.slabs.len();
+    /// Formats slab file `idx` for blocks of codec `format`, `slot_bytes` per slot: a new file
+    /// when `idx` is `s.slabs.len()`, else an unused slab of another codec, rewritten in place
+    /// (so blocks of one codec never starve for slabs the other codecs hold empty).
+    fn format_slab(
+        &self,
+        s: &mut L2State,
+        idx: usize,
+        format: &'static str,
+        slot_bytes: usize,
+    ) -> Result<(), TierError> {
+        let slots = (self.slots_per_slab * self.slot_bytes) / slot_bytes;
+        if format.len() > FORMAT_NAME_BYTES || slots == 0 {
+            return Err(TierError::Io(format!(
+                "no {slot_bytes}-byte `{format}` slot fits an L2 slab"
+            )));
+        }
         let path = self.slab_path(idx);
+        let reused = match s.slabs.get(idx) {
+            Some(old) => Some(
+                old.file
+                    .try_clone()
+                    .map_err(|e| TierError::Io(e.to_string()))?,
+            ),
+            None => None,
+        };
+        let file = match reused {
+            Some(f) => f,
+            None => self.open_new_slab(s, &path)?,
+        };
+        file.set_len(HEADER_BYTES + (slots * slot_bytes) as u64)
+            .map_err(|e| io_err(&path, e))?;
+        let mut header = AlignedBuf::zeroed(HEADER_BYTES as usize);
+        let h = header.bytes_mut();
+        h[0..8].copy_from_slice(SLAB_MAGIC);
+        h[8..12].copy_from_slice(&SLAB_VERSION.to_le_bytes());
+        h[12..44].copy_from_slice(&self.cfg.namespace.0);
+        h[44..52].copy_from_slice(&(slot_bytes as u64).to_le_bytes());
+        h[52..60].copy_from_slice(&(slots as u64).to_le_bytes());
+        let name = 60 + FORMAT_NAME_BYTES;
+        h[60..60 + format.len()].copy_from_slice(format.as_bytes());
+        h[name..name + 8].copy_from_slice(&self.codec_seed().to_le_bytes());
+        file.write_all_at(header.bytes(), 0)
+            .map_err(|e| io_err(&path, e))?;
+        let slab = Slab {
+            file,
+            format,
+            slot_bytes,
+            taken: 0,
+        };
+        if idx < s.slabs.len() {
+            let old = std::mem::replace(&mut s.slabs[idx], slab);
+            if let Some(free) = s.free.get_mut(old.format) {
+                free.retain(|&(i, _)| i != idx);
+            }
+        } else {
+            s.slabs.push(slab);
+        }
+        // Popped from the end: slot 0 first.
+        s.free
+            .entry(format)
+            .or_default()
+            .extend((0..slots).rev().map(|slot| (idx, slot)));
+        Ok(())
+    }
+
+    /// Opens a new slab file, falling back to buffered I/O where `O_DIRECT` is refused.
+    fn open_new_slab(&self, s: &mut L2State, path: &Path) -> Result<File, TierError> {
+        let path = path.to_path_buf();
         let file = match open_slab(&path, s.direct) {
             Ok(f) => f,
             Err(e) if s.direct && e.raw_os_error() == Some(EINVAL) => {
@@ -345,22 +433,119 @@ impl L2NvmeTier {
             }
             Err(e) => return Err(io_err(&path, e)),
         };
-        file.set_len(self.slab_file_bytes())
-            .map_err(|e| io_err(&path, e))?;
-        let mut header = AlignedBuf::zeroed(HEADER_BYTES as usize);
-        let h = header.bytes_mut();
-        h[0..8].copy_from_slice(SLAB_MAGIC);
-        h[8..12].copy_from_slice(&SLAB_VERSION.to_le_bytes());
-        h[12..44].copy_from_slice(&self.cfg.namespace.0);
-        h[44..52].copy_from_slice(&(self.slot_bytes as u64).to_le_bytes());
-        h[52..60].copy_from_slice(&(self.slots_per_slab as u64).to_le_bytes());
-        file.write_all_at(header.bytes(), 0)
-            .map_err(|e| io_err(&path, e))?;
-        s.slabs.push(file);
-        // Popped from the end: slot 0 first.
-        s.free
-            .extend((0..self.slots_per_slab).rev().map(|slot| (idx, slot)));
-        Ok(())
+        Ok(file)
+    }
+
+    /// The codecs' rotation seed (`CodecParams::seed`): the first 8 bytes of the namespace key,
+    /// little-endian.
+    fn codec_seed(&self) -> u64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&self.cfg.namespace.0[..8]);
+        u64::from_le_bytes(b)
+    }
+
+    /// Stores `bytes` under `key` in a slot of codec `format`.
+    fn store(&self, key: KvKey, format: &'static str, bytes: &[u8]) -> Result<TierSlot, TierError> {
+        if bytes.is_empty() || bytes.len() > self.slot_bytes {
+            return Err(TierError::Io(format!(
+                "block of {} bytes does not fit the {}-byte slot",
+                bytes.len(),
+                self.slot_bytes
+            )));
+        }
+        let (slab, slot, slot_bytes, file) = {
+            let mut s = self.lock();
+            if s.health.is_degraded() {
+                return Err(TierError::Degraded);
+            }
+            // A replaced block of the same codec is rewritten in its own slot; it is not
+            // readable meanwhile. Another codec's block moves to a slot of its own codec.
+            let old = s.index.remove(&key);
+            if let Some(e) = old {
+                s.used -= e.len as u64;
+            }
+            let fits = |s: &L2State, slab: usize| {
+                s.slabs[slab].format == format && bytes.len() <= s.slabs[slab].slot_bytes
+            };
+            let reuse = old.filter(|e| fits(&s, e.slab));
+            if let Some(e) = old.filter(|e| !fits(&s, e.slab)) {
+                self.free_slot(&mut s, e.slab, e.slot);
+            }
+            let (slab, slot) = match reuse {
+                Some(e) => (e.slab, e.slot),
+                None => match self.pop_free(&mut s, format, bytes.len()) {
+                    Some(free) => free,
+                    None => {
+                        let slot_bytes = if format == crate::tier::L0_FORMAT {
+                            self.slot_bytes
+                        } else {
+                            bytes.len().div_ceil(ALIGN) * ALIGN
+                        };
+                        let idx = if s.slabs.len() < self.max_slabs {
+                            s.slabs.len()
+                        } else {
+                            s.slabs
+                                .iter()
+                                .position(|x| x.taken == 0)
+                                .ok_or(TierError::Full)?
+                        };
+                        self.format_slab(&mut s, idx, format, slot_bytes)?;
+                        self.pop_free(&mut s, format, bytes.len())
+                            .ok_or(TierError::Full)?
+                    }
+                },
+            };
+            let file = s.slabs[slab]
+                .file
+                .try_clone()
+                .map_err(|e| TierError::Io(e.to_string()))?;
+            (slab, slot, s.slabs[slab].slot_bytes, file)
+        };
+        let mut buf = AlignedBuf::zeroed(slot_bytes);
+        buf.bytes_mut()[..bytes.len()].copy_from_slice(bytes);
+        let res = self.io(|| file.write_all_at(buf.bytes(), Self::offset(slot_bytes, slot)));
+        let mut s = self.lock();
+        match res {
+            Ok(()) => {
+                let entry = SlotEntry {
+                    slab,
+                    slot,
+                    crc: crc32c::crc32c(bytes),
+                    len: bytes.len(),
+                };
+                s.used += bytes.len() as u64;
+                s.index.insert(key, entry);
+                Ok(TierSlot(((slab as u64) << 32) | slot as u64))
+            }
+            Err(e) => {
+                self.free_slot(&mut s, slab, slot);
+                Err(self.io_error(&mut s, e))
+            }
+        }
+    }
+
+    /// A free slot of codec `format` holding `len` bytes.
+    fn pop_free(
+        &self,
+        s: &mut L2State,
+        format: &'static str,
+        len: usize,
+    ) -> Option<(usize, usize)> {
+        let slabs = &s.slabs;
+        let free = s.free.get_mut(format)?;
+        let i = free
+            .iter()
+            .rposition(|&(slab, _)| len <= slabs[slab].slot_bytes)?;
+        let (slab, slot) = free.remove(i);
+        s.slabs[slab].taken += 1;
+        Some((slab, slot))
+    }
+
+    fn free_slot(&self, s: &mut L2State, slab: usize, slot: usize) {
+        let x = &mut s.slabs[slab];
+        x.taken -= 1;
+        let format = x.format;
+        s.free.entry(format).or_default().push((slab, slot));
     }
 
     /// Counts one I/O error toward degradation and converts it.
@@ -378,8 +563,8 @@ impl L2NvmeTier {
         TierError::Io(e.to_string())
     }
 
-    fn offset(&self, slot: usize) -> u64 {
-        HEADER_BYTES + (slot * self.slot_bytes) as u64
+    fn offset(slot_bytes: usize, slot: usize) -> u64 {
+        HEADER_BYTES + (slot * slot_bytes) as u64
     }
 }
 
@@ -400,8 +585,9 @@ impl KvTier for L2NvmeTier {
         (self.max_slabs * self.slots_per_slab) as u64 * self.cfg.block_bytes
     }
 
+    /// Bytes of the stored blocks (each at its codec's size).
     fn used_bytes(&self) -> u64 {
-        self.lock().index.len() as u64 * self.cfg.block_bytes
+        self.lock().used
     }
 
     /// Storage queue fill on the contract thresholds (0.50 / 0.75 / 0.90).
@@ -428,57 +614,22 @@ impl KvTier for L2NvmeTier {
         self.lock().index.contains_key(key)
     }
 
+    /// Stores a block at the L0 format (`l0`).
     fn put(&self, key: KvKey, src: TierBlockRef<'_>) -> Result<TierSlot, TierError> {
         let TierBlockRef::Host(bytes) = src;
-        if bytes.len() > self.slot_bytes {
-            return Err(TierError::Io(format!(
-                "block of {} bytes exceeds the {}-byte slot",
-                bytes.len(),
-                self.slot_bytes
-            )));
-        }
-        let (slab, slot, file) = {
-            let mut s = self.lock();
-            if s.health.is_degraded() {
-                return Err(TierError::Degraded);
-            }
-            // A replaced block is rewritten in its own slot; it is not readable meanwhile.
-            let (slab, slot) = match s.index.remove(&key) {
-                Some(e) => (e.slab, e.slot),
-                None => match s.free.pop() {
-                    Some(free) => free,
-                    None if s.slabs.len() < self.max_slabs => {
-                        self.new_slab(&mut s)?;
-                        s.free.pop().ok_or(TierError::Full)?
-                    }
-                    None => return Err(TierError::Full),
-                },
-            };
-            let file = s.slabs[slab]
-                .try_clone()
-                .map_err(|e| TierError::Io(e.to_string()))?;
-            (slab, slot, file)
-        };
-        let mut buf = AlignedBuf::zeroed(self.slot_bytes);
-        buf.bytes_mut()[..bytes.len()].copy_from_slice(bytes);
-        let res = self.io(|| file.write_all_at(buf.bytes(), self.offset(slot)));
-        let mut s = self.lock();
-        match res {
-            Ok(()) => {
-                let entry = SlotEntry {
-                    slab,
-                    slot,
-                    crc: crc32c::crc32c(bytes),
-                    len: bytes.len(),
-                };
-                s.index.insert(key, entry);
-                Ok(TierSlot(((slab as u64) << 32) | slot as u64))
-            }
-            Err(e) => {
-                s.free.push((slab, slot));
-                Err(self.io_error(&mut s, e))
-            }
-        }
+        self.store(key, crate::tier::L0_FORMAT, bytes)
+    }
+
+    /// Stores a block in a slot of codec `format` (its slab header names the codec).
+    fn put_as(
+        &self,
+        key: KvKey,
+        format: &'static str,
+        _bytes: u64,
+        src: TierBlockRef<'_>,
+    ) -> Result<TierSlot, TierError> {
+        let TierBlockRef::Host(bytes) = src;
+        self.store(key, format, bytes)
     }
 
     fn get(&self, key: &KvKey, dst: TierBlockMut<'_>) -> Result<(), TierError> {
@@ -489,11 +640,14 @@ impl KvTier for L2NvmeTier {
                 return Err(TierError::Degraded);
             }
             let e = *s.index.get(key).ok_or(TierError::Missing)?;
-            let file = s.slabs[e.slab]
+            let slab = &s.slabs[e.slab];
+            let file = slab
+                .file
                 .try_clone()
                 .map_err(|e| TierError::Io(e.to_string()))?;
-            (e, file)
+            (e, (file, slab.slot_bytes))
         };
+        let (file, slot_bytes) = file;
         if out.len() != entry.len {
             return Err(TierError::Io(format!(
                 "block is {} bytes, buffer {}",
@@ -501,8 +655,9 @@ impl KvTier for L2NvmeTier {
                 out.len()
             )));
         }
-        let mut buf = AlignedBuf::zeroed(self.slot_bytes);
-        let res = self.io(|| file.read_exact_at(buf.bytes_mut(), self.offset(entry.slot)));
+        let mut buf = AlignedBuf::zeroed(slot_bytes);
+        let res =
+            self.io(|| file.read_exact_at(buf.bytes_mut(), Self::offset(slot_bytes, entry.slot)));
         let mut s = self.lock();
         if let Err(e) = res {
             return Err(self.io_error(&mut s, e));
@@ -515,7 +670,8 @@ impl KvTier for L2NvmeTier {
                 .is_some_and(|e| (e.slab, e.slot) == (entry.slab, entry.slot))
             {
                 s.index.remove(key);
-                s.free.push((entry.slab, entry.slot));
+                s.used -= entry.len as u64;
+                self.free_slot(&mut s, entry.slab, entry.slot);
             }
             self.metrics.eviction(TierId::L2, EvictReason::Checksum);
             tracing::warn!(
@@ -534,7 +690,8 @@ impl KvTier for L2NvmeTier {
     fn evict(&self, key: &KvKey) -> Result<(), TierError> {
         let mut s = self.lock();
         let e = s.index.remove(key).ok_or(TierError::Missing)?;
-        s.free.push((e.slab, e.slot));
+        s.used -= e.len as u64;
+        self.free_slot(&mut s, e.slab, e.slot);
         Ok(())
     }
 

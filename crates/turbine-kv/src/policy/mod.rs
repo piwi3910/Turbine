@@ -396,6 +396,7 @@ pub(crate) mod tests {
         let l1 = KvLocation {
             tier: TierId::L1,
             slot: 0,
+            format: crate::tier::L0_FORMAT,
         };
         dir.add_location(&k2, l1);
         dir.remove_location(&k2, TierId::L0);

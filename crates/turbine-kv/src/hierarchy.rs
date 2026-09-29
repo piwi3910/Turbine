@@ -20,7 +20,8 @@ use turbine_core::config::{KvConfig, KvPrefetchConfig, KvSessionConfig};
 use turbine_core::registry::UnknownModule;
 use turbine_core::request::SessionHints;
 use turbine_core::types::{
-    BlockId, MemoryKind, ModelFingerprint, ModelIdentity, PressureState, Priority, RequestId,
+    BlockId, KvLayout, MemoryKind, ModelFingerprint, ModelIdentity, PressureState, Priority,
+    RequestId,
 };
 
 use crate::directory::{
@@ -37,11 +38,11 @@ use crate::policy::{
 };
 use crate::pool::BlockPool;
 use crate::session::{PrefetchTracker, SessionAction, SessionTable};
-use crate::tier::{KvLocation, KvTier, TierId, demotion_target};
+use crate::tier::{KvLocation, KvTier, L0_FORMAT, TierId, demotion_target};
 use turbine_reliability::throttle::KvReclaimer;
 
 use crate::transfer::{
-    TransferBackend, TransferEngine, TransferPath, TransferPurpose, TransferRequest,
+    TransferBackend, TransferCodec, TransferEngine, TransferPath, TransferPurpose, TransferRequest,
 };
 
 /// The hierarchy's settings: the `kv` section plus the model's block size and memory kind.
@@ -59,14 +60,22 @@ pub struct HierarchyConfig {
     pub transfer_queue: usize,
     pub session: KvSessionConfig,
     pub prefetch: KvPrefetchConfig,
+    /// `kv_format` codecs L1 and L2 store blocks in (`kv.cpu.format`, `kv.nvme.format`, P6b
+    /// S-2); `l0` keeps the L0 bytes unchanged.
+    pub l1_format: &'static str,
+    pub l2_format: &'static str,
+    /// `kv.lossless_tail_blocks`: the last N full blocks of a finished sequence are demoted at
+    /// the L0 format whatever the tier's format.
+    pub lossless_tail_blocks: u32,
 }
 
 impl HierarchyConfig {
     /// Copies waiting to start, across all paths.
     pub const TRANSFER_QUEUE: usize = 4096;
 
-    /// `UnknownModule` when `kv.policy` names no registered eviction policy (the server
-    /// validates the name before any port is bound, so only a hand-built config gets here).
+    /// `UnknownModule` when `kv.policy` names no registered eviction policy or a tier format no
+    /// registered `kv_format` codec (the server validates the names before any port is bound,
+    /// so only a hand-built config gets here).
     pub fn from_config(
         kv: &KvConfig,
         block_bytes: u64,
@@ -83,8 +92,39 @@ impl HierarchyConfig {
             transfer_queue: Self::TRANSFER_QUEUE,
             session: kv.session.clone(),
             prefetch: kv.prefetch.clone(),
+            l1_format: codec_name(kv.cpu.format.as_str())?,
+            l2_format: codec_name(kv.nvme.format.as_str())?,
+            lossless_tail_blocks: kv.lossless_tail_blocks,
         })
     }
+}
+
+/// The registered `kv_format` codec's own (`'static`) name.
+fn codec_name(name: &str) -> Result<&'static str, UnknownModule> {
+    let reg = crate::codec::registry();
+    reg.get(name)
+        .map(|c| c.name())
+        .ok_or_else(|| reg.unknown(name))
+}
+
+/// Bytes of one block stored in codec `format`: `block_bytes` (every shard) at the L0 format,
+/// else the codec's size of each rank shard's `layout`, times `shards`.
+fn format_bytes(format: &str, block_bytes: u64, layout: &KvLayout, shards: u32) -> u64 {
+    match crate::codec::registry().get(format) {
+        Some(c) if format != crate::tier::L0_FORMAT => {
+            c.bytes_per_block(layout) * u64::from(shards.max(1))
+        }
+        _ => block_bytes,
+    }
+}
+
+/// One demotion copy in flight.
+#[derive(Clone, Copy, Debug)]
+struct Demoting {
+    from: TierId,
+    to: TierId,
+    /// Bytes of the destination copy (its format's).
+    bytes: u64,
 }
 
 /// What one admission sees of its cached prefix (the scheduler's `SchedRequest.cached_prefix`).
@@ -310,8 +350,14 @@ pub struct KvHierarchy {
     prefetch_inflight: HashMap<u64, BlockId>,
     /// Promotion tickets in flight → (owner, L0 target).
     promotions_by_ticket: HashMap<u64, (RequestId, BlockId)>,
-    /// Keys with a demotion copy in flight: (from, to).
-    demoting: HashMap<KvKey, (TierId, TierId)>,
+    /// Keys with a demotion copy in flight.
+    demoting: HashMap<KvKey, Demoting>,
+    /// The L0 layout of one rank shard and the shard count (codec sizes, P6b S-1).
+    layout: KvLayout,
+    shards: u32,
+    /// Keys within the last `lossless_tail_blocks` full blocks of the latest finished sequence
+    /// that holds them (P6b S-2): demoted at the L0 format. Entries leave with their block.
+    tail: HashSet<KvKey>,
     pending: HashMap<RequestId, Pending>,
     requests: HashMap<RequestId, RequestKv>,
     /// L0 block → the key the directory holds for it.
@@ -346,15 +392,20 @@ impl KvHierarchy {
         // L1 exists only on discrete-VRAM devices (S-5): on unified memory L0 demotes to L2.
         let l1 = l1.filter(|t| t.enabled() && cfg.memory_kind != MemoryKind::Unified);
         let l2 = l2.filter(|t| t.enabled());
-        let blocks_of = |t: &Option<Arc<dyn KvTier>>| {
+        // A tier holds the most blocks at its own format (lossless-tail blocks are larger).
+        let blocks_of = |t: &Option<Arc<dyn KvTier>>, f: &'static str| {
             t.as_ref().map_or(0, |t| {
-                usize::try_from(t.capacity_bytes() / cfg.block_bytes.max(1)).unwrap_or(usize::MAX)
+                let bytes = format_bytes(f, cfg.block_bytes, &format.layout, format.shards);
+                usize::try_from(t.capacity_bytes() / bytes.max(1)).unwrap_or(usize::MAX)
             })
         };
         let max_entries = (l0_blocks as usize)
-            .saturating_add(blocks_of(&l1))
-            .saturating_add(blocks_of(&l2));
+            .saturating_add(blocks_of(&l1, cfg.l1_format))
+            .saturating_add(blocks_of(&l2, cfg.l2_format));
         KvHierarchy {
+            layout: format.layout,
+            shards: format.shards.max(1),
+            tail: HashSet::new(),
             policy: cfg.policy,
             transfer: TransferEngine::new(
                 cfg.max_inflight_bytes,
@@ -407,7 +458,7 @@ impl KvHierarchy {
     pub fn l0_demotions_in_flight(&self) -> usize {
         self.demoting
             .values()
-            .filter(|(from, _)| *from == TierId::L0)
+            .filter(|d| d.from == TierId::L0)
             .count()
     }
 
@@ -464,6 +515,73 @@ impl KvHierarchy {
             TierId::L1 => 1,
             _ => 2,
         }
+    }
+
+    /// The `kv_format` codec `tier` stores blocks in (`l0` for L0 itself).
+    fn tier_format(&self, tier: TierId) -> &'static str {
+        match tier {
+            TierId::L1 => self.cfg.l1_format,
+            TierId::L2 => self.cfg.l2_format,
+            _ => L0_FORMAT,
+        }
+    }
+
+    fn format_bytes(&self, format: &str) -> u64 {
+        format_bytes(format, self.cfg.block_bytes, &self.layout, self.shards)
+    }
+
+    /// The formats of a copy of `key` from its copy in `from` to `to` (P6b S-1, S-2): into L0
+    /// the L0 format (a promotion decodes); into a lower tier that tier's format, or the L0
+    /// format for a lossless-tail block, but never more precise than the source copy.
+    fn copy_codec(&self, key: &KvKey, from: TierId, to: TierId) -> Option<TransferCodec> {
+        let src = self.dir.get(key)?.location(from)?.format;
+        let dst = if to == TierId::L0 {
+            L0_FORMAT
+        } else if self.tail.contains(key) {
+            crate::codec::lossier(src, L0_FORMAT)
+        } else {
+            crate::codec::lossier(src, self.tier_format(to))
+        };
+        Some(TransferCodec {
+            from: src,
+            from_bytes: self.format_bytes(src),
+            to: dst,
+            to_bytes: self.format_bytes(dst),
+        })
+    }
+
+    /// A copy request of `key` along `path` with its formats; the bytes it counts in flight
+    /// are the smaller copy's (the lower tier's, which crosses the host link).
+    #[allow(clippy::too_many_arguments)]
+    fn copy_request(
+        &self,
+        path: TransferPath,
+        key: KvKey,
+        owner: Option<RequestId>,
+        purpose: TransferPurpose,
+        src_slot: u64,
+        dst_slot: u64,
+    ) -> Option<TransferRequest> {
+        let codec = self.copy_codec(&key, path.from(), path.to())?;
+        Some(TransferRequest {
+            path,
+            key,
+            bytes: codec.from_bytes.min(codec.to_bytes),
+            owner,
+            purpose,
+            src_slot,
+            dst_slot,
+            codec,
+        })
+    }
+
+    /// Blocks of `tier`'s format a demotion of `key` from `from` into `tier` takes (more than
+    /// one for a lossless-tail block stored at the larger L0 format).
+    fn demotion_units(&self, key: &KvKey, from: TierId, tier: TierId) -> usize {
+        let unit = self.format_bytes(self.tier_format(tier)).max(1);
+        self.copy_codec(key, from, tier)
+            .map_or(1, |c| c.to_bytes.div_ceil(unit) as usize)
+            .max(1)
     }
 
     /// Admission-time prefix match (S-3, S-9): the planner's cutoff, L0 blocks attached by
@@ -563,15 +681,16 @@ impl KvHierarchy {
                 };
                 let path = TransferPath::between(mb.tier, TierId::L0)
                     .expect("a lower local tier has a path to L0");
-                let tr = TransferRequest {
-                    path,
-                    key: mb.key,
-                    bytes: self.cfg.block_bytes,
-                    owner: Some(req.request),
-                    purpose: TransferPurpose::Promote,
-                    src_slot: mb.location.slot,
-                    dst_slot: u64::from(ids[0].0),
-                };
+                let tr = self
+                    .copy_request(
+                        path,
+                        mb.key,
+                        Some(req.request),
+                        TransferPurpose::Promote,
+                        mb.location.slot,
+                        u64::from(ids[0].0),
+                    )
+                    .expect("a matched block has a copy in its tier");
                 match self.transfer.submit(tr) {
                     Ok(t) => {
                         self.promotions_by_ticket
@@ -691,6 +810,7 @@ impl KvHierarchy {
                 locations: SmallVec::from_slice(&[KvLocation {
                     tier: TierId::L0,
                     slot: u64::from(block.0),
+                    format: L0_FORMAT,
                 }]),
                 access_count: 0,
                 last_access: now,
@@ -747,6 +867,20 @@ impl KvHierarchy {
         if let Some(r) = self.requests.remove(&request) {
             for key in r.keys.iter().skip(r.committed) {
                 self.dir.clear_pending(key);
+            }
+            // The sequence's last full blocks form its lossless tail (P6b S-2); its earlier
+            // blocks are no longer the tail of the latest sequence holding them.
+            let committed = &r.keys[..r.committed];
+            let cut = committed
+                .len()
+                .saturating_sub(self.cfg.lossless_tail_blocks as usize);
+            for key in &committed[..cut] {
+                self.tail.remove(key);
+            }
+            for key in &committed[cut..] {
+                if self.dir.get(key).is_some() {
+                    self.tail.insert(*key);
+                }
             }
             if let Some(id) = r.session {
                 let keys = r.keys[..r.committed].to_vec();
@@ -817,8 +951,14 @@ impl KvHierarchy {
                     }
                     return;
                 }
-                self.dir
-                    .add_location(&req.key, KvLocation { tier: to, slot });
+                self.dir.add_location(
+                    &req.key,
+                    KvLocation {
+                        tier: to,
+                        slot,
+                        format: req.codec.to,
+                    },
+                );
                 self.metrics.demotion(from, to);
                 self.stats.demotions += 1;
                 self.remove_copy(pool, &req.key, from, EvictReason::Pressure);
@@ -833,6 +973,7 @@ impl KvHierarchy {
                         KvLocation {
                             tier: TierId::L0,
                             slot: u64::from(block.0),
+                            format: L0_FORMAT,
                         },
                     );
                 }
@@ -986,6 +1127,7 @@ impl KvHierarchy {
             }
             next = b.parent;
             self.dir.remove(&k);
+            self.tail.remove(&k);
         }
     }
 
@@ -1249,8 +1391,11 @@ impl KvHierarchy {
                 self.remove_copy(pool, &key, TierId::L0, EvictReason::Pressure);
                 departing.insert(key);
                 bytes += bb;
-            } else if room > 0 && budget > 0 && self.submit_demotion(pool, key, TierId::L0, to) {
-                room -= 1;
+            } else if budget > 0
+                && room >= self.demotion_units(&key, TierId::L0, to)
+                && self.submit_demotion(pool, key, TierId::L0, to)
+            {
+                room -= self.demotion_units(&key, TierId::L0, to);
                 budget -= 1;
                 departing.insert(key);
                 bytes += bb;
@@ -1259,8 +1404,13 @@ impl KvHierarchy {
         bytes
     }
 
-    fn inflight_into(&self, tier: TierId) -> usize {
-        self.demoting.values().filter(|(_, to)| *to == tier).count()
+    /// Bytes of the demotion copies in flight into `tier`.
+    fn inflight_into(&self, tier: TierId) -> u64 {
+        self.demoting
+            .values()
+            .filter(|d| d.to == tier)
+            .map(|d| d.bytes)
+            .sum()
     }
 
     /// Demotes (copy first, free on completion) the lowest-value unreferenced L0 blocks until
@@ -1277,11 +1427,7 @@ impl KvHierarchy {
     /// [`KvHierarchy::pressure_reclaim`].
     pub fn demote_to(&mut self, pool: &mut BlockPool, target: f64, reason: EvictReason) -> u64 {
         let total = f64::from(pool.total_blocks());
-        let leaving = self
-            .demoting
-            .values()
-            .filter(|(from, _)| *from == TierId::L0)
-            .count() as f64;
+        let leaving = self.l0_demotions_in_flight() as f64;
         let need = (f64::from(pool.used_blocks()) - leaving - target * total)
             .ceil()
             .max(0.0) as usize;
@@ -1322,11 +1468,12 @@ impl KvHierarchy {
                 bytes += bb;
                 continue;
             }
+            let units = self.demotion_units(&key, TierId::L0, to);
             if room == 0 {
                 break;
             }
-            if self.submit_demotion(pool, key, TierId::L0, to) {
-                room -= 1;
+            if room >= units && self.submit_demotion(pool, key, TierId::L0, to) {
+                room -= units;
                 bytes += bb;
             }
         }
@@ -1376,8 +1523,11 @@ impl KvHierarchy {
                 self.metrics.demotion(TierId::L0, to);
                 self.stats.demotions += 1;
                 self.remove_copy(pool, &k, TierId::L0, reason);
-            } else if room > 0 && self.submit_demotion(pool, k, TierId::L0, to) {
-                room -= 1;
+            } else {
+                let units = self.demotion_units(&k, TierId::L0, to);
+                if room >= units && self.submit_demotion(pool, k, TierId::L0, to) {
+                    room -= units;
+                }
             }
         }
     }
@@ -1418,35 +1568,34 @@ impl KvHierarchy {
             return false;
         };
         let path = TransferPath::between(from, to).expect("a demotion path exists");
-        let req = TransferRequest {
-            path,
-            key,
-            bytes: self.cfg.block_bytes,
-            owner: None,
-            purpose: TransferPurpose::Demote,
-            src_slot,
-            dst_slot: 0,
+        let Some(req) = self.copy_request(path, key, None, TransferPurpose::Demote, src_slot, 0)
+        else {
+            return false;
         };
+        let bytes = req.codec.to_bytes;
         if self.transfer.submit(req).is_err() {
             return false;
         }
         if from == TierId::L0 {
             pool.incref(BlockId(src_slot as u32));
         }
-        self.demoting.insert(key, (from, to));
+        self.demoting.insert(key, Demoting { from, to, bytes });
         true
     }
 
-    /// Makes room for up to `n` more blocks in `tier` and returns how many fit now. L1 victims
-    /// without an L2 copy move to L2 while storage accepts them (room appears when that copy
-    /// completes); other victims are evicted now.
+    /// Makes room for up to `n` more blocks of `tier`'s format in `tier` and returns how many
+    /// fit now (a lossless-tail block takes [`KvHierarchy::demotion_units`] of them). L1
+    /// victims without an L2 copy move to L2 while storage accepts them (room appears when that
+    /// copy completes); other victims are evicted now.
     fn make_room(&mut self, pool: &mut BlockPool, tier: TierId, n: usize) -> usize {
         let Some(t) = self.tier(tier).cloned() else {
             return 0;
         };
-        let bb = self.cfg.block_bytes.max(1);
-        let free = ((t.capacity_bytes() / bb) as usize)
-            .saturating_sub((t.used_bytes() / bb) as usize + self.inflight_into(tier));
+        let unit = self.format_bytes(self.tier_format(tier)).max(1);
+        let free = (t
+            .capacity_bytes()
+            .saturating_sub(t.used_bytes() + self.inflight_into(tier))
+            / unit) as usize;
         if free >= n {
             return n;
         }
@@ -1457,9 +1606,10 @@ impl KvHierarchy {
                 .dir
                 .get(&victim)
                 .is_some_and(|b| b.location(TierId::L2).is_some());
+            let units = self.demotion_units(&victim, TierId::L1, TierId::L2);
             if spill
                 && !has_l2
-                && self.make_room(pool, TierId::L2, 1) > 0
+                && self.make_room(pool, TierId::L2, units) >= units
                 && self.submit_demotion(pool, victim, TierId::L1, TierId::L2)
             {
                 continue;
@@ -1489,10 +1639,11 @@ impl KvHierarchy {
                                 && b.location(TierId::L2).is_none()
                                 && b.location(TierId::L0).is_none()
                         });
+                        let units = self.demotion_units(&k, TierId::L1, TierId::L2);
                         if movable
                             && !self.demoting.contains_key(&k)
                             && !self.transfer.is_busy_with(&k)
-                            && self.make_room(pool, TierId::L2, 1) > 0
+                            && self.make_room(pool, TierId::L2, units) >= units
                         {
                             self.submit_demotion(pool, k, TierId::L1, TierId::L2);
                         }
@@ -1563,15 +1714,16 @@ impl KvHierarchy {
             let Some(from) = b.fastest() else { break };
             let src_slot = b.location(from).expect("the fastest tier has a copy").slot;
             let Ok(ids) = pool.allocate(1) else { break };
-            let req = TransferRequest {
-                path: TransferPath::between(from, TierId::L0).expect("lower tier to L0"),
-                key: *key,
-                bytes: self.cfg.block_bytes,
-                owner: None,
-                purpose: TransferPurpose::Prefetch,
-                src_slot,
-                dst_slot: u64::from(ids[0].0),
-            };
+            let req = self
+                .copy_request(
+                    TransferPath::between(from, TierId::L0).expect("lower tier to L0"),
+                    *key,
+                    None,
+                    TransferPurpose::Prefetch,
+                    src_slot,
+                    u64::from(ids[0].0),
+                )
+                .expect("the fastest tier has a copy");
             match self.transfer.submit(req) {
                 Ok(t) => {
                     self.prefetch_inflight.insert(t.id, ids[0]);

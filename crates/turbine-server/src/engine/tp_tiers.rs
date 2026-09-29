@@ -58,7 +58,7 @@ use turbine_kv::tier::{
     TierBlockRef, TierError, TierId, TierSlot,
 };
 use turbine_kv::transfer::{
-    TransferBackend, TransferPath, TransferPurpose, TransferRequest, TransferTicket,
+    TransferBackend, TransferCodec, TransferPath, TransferPurpose, TransferRequest, TransferTicket,
 };
 use turbine_kv::{BlockPool, KvMetrics};
 
@@ -333,6 +333,7 @@ impl TierWorker for WorkerTiers {
                             purpose: TransferPurpose::Demote,
                             src_slot: u64::from(block.0),
                             dst_slot: u64::from(block.0),
+                            codec: TransferCodec::l0(self.shard_bytes),
                         },
                     };
                     match self.backend.start(&t) {
@@ -978,6 +979,7 @@ mod tests {
                 purpose: TransferPurpose::Demote,
                 src_slot: 1,
                 dst_slot: 0,
+                codec: TransferCodec::l0(layout().block_bytes()),
             },
         };
         let started = Instant::now();
@@ -1032,6 +1034,7 @@ mod tests {
                 purpose: TransferPurpose::Demote,
                 src_slot: 2,
                 dst_slot: 0,
+                codec: TransferCodec::l0(layout().block_bytes()),
             },
         };
         assert!(
@@ -1067,6 +1070,7 @@ mod tests {
                 purpose: TransferPurpose::Demote,
                 src_slot: 1,
                 dst_slot: 0,
+                codec: TransferCodec::l0(layout().block_bytes()),
             },
         };
         let err = g
@@ -1105,6 +1109,7 @@ mod tests {
                 purpose: TransferPurpose::Demote,
                 src_slot: 1,
                 dst_slot: 0,
+                codec: TransferCodec::l0(layout().block_bytes()),
             },
         };
         g.driver.backend(&mut g.local).start(&t).expect("starts");
@@ -1215,6 +1220,7 @@ mod tests {
                 purpose: TransferPurpose::Demote,
                 src_slot: 1,
                 dst_slot: 0,
+                codec: TransferCodec::l0(layout().block_bytes()),
             },
         };
         let took = g.driver.backend(&mut g.local).took(&t).expect("measured");

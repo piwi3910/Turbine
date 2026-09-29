@@ -67,6 +67,10 @@ static REGISTRY: Registry<dyn KvCodec> = Registry::new(
 
 Then pin the name in `codec::tests::registry_lists_codecs`. Nothing else: the configuration takes codec names as plain module names, the server validates `kv.cpu.format`, `kv.nvme.format`, `kv.ladder.max_format` and the `kv.lossy_penalty` entries against `registry().names()` (`crates/turbine-server/src/modules.rs`), takes the tier ordering from the registration order (`codec::tier_rung`, checked at startup by `support_startup::tests::tier_formats_and_availability`) and a codec's planner penalty from `default_lossy_penalty` unless `kv.lossy_penalty.<name>` overrides it. A new format starts refused or `experimental` in `TIER_FORMAT_REFUSALS` (`crates/turbine-core/src/support.rs`) until its quality gate passes.
 
+## How the tiers store a codec's blocks
+
+Every directory location carries its format (`KvLocation.format`, `l0` in L0). A demotion into L1 or L2 writes the tier's codec (`HierarchyConfig.l1_format` / `l2_format`), except the last `kv.lossless_tail_blocks` full blocks of the latest finished sequence holding them, which keep `l0`, and never a format more precise than the source copy; a promotion decodes back to the L0 format. Each copy request names both ends (`TransferRequest.codec`, a `TransferCodec`), and the tiers size slots by the codec: L1 slabs hold slots of one size each, L2 slab files (header version 2) name their slots' codec and rotation seed. On the host path (the I/O threads of `CopyStreamBackend` in `crates/turbine-server/src/kv_orchestrator.rs`) L0 ↔ L2 and L1 ↔ L2 copies run `encode_cpu` / `decode_cpu`; the L0 ↔ L1 copy stream moves `l0` blocks only until the v2.10 GPU transcode. `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim per_tier_formats` pins this.
+
 ## Conformance suite
 
 `kv_codecs_suite` (`crates/turbine-kv/src/codec/conformance.rs`) runs every registered codec over BF16 and FP8 L0 layouts with seeded Gaussian and outlier-heavy blocks: `fits_slot`, `size_order` (`l0` first, slots never grow), `round_trip` (bit-exact for a lossless codec, within `nmse_bound` for a lossy one), `deterministic` and `sizes_checked`.

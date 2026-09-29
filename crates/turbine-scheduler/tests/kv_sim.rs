@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use turbine_core::clock::{Clock, FakeClock};
-use turbine_core::config::KvConfig;
+use turbine_core::config::{KvConfig, ModuleName};
 use turbine_core::types::{
     DType, DeviceId, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, RequestId,
 };
+use turbine_kv::directory::KvBlock;
 use turbine_kv::hierarchy::{HierarchyConfig, KvHierarchy, PrefetchTarget};
 use turbine_kv::identity::KvFormat;
 use turbine_kv::metrics::KvMetrics;
@@ -339,6 +340,111 @@ fn demotion_under_pressure() {
         metric(&s.reg, r#"turbine_kv_demotions_total{from="l0",to="l1"}"#),
         0.0
     );
+}
+
+/// P6b S-1, S-2: L1 stores blocks in `kv.cpu.format` and L2 in `kv.nvme.format`, except the
+/// last full block of each finished sequence (`kv.lossless_tail_blocks: 1`), which keeps the L0
+/// format through both tiers; each tier accounts a copy at its codec's size, and a promoted
+/// block comes back at the L0 format.
+#[test]
+fn per_tier_formats() {
+    let mut kv = KvConfig::default();
+    kv.cpu.format = ModuleName::new("fp8_e4m3").unwrap();
+    kv.nvme.format = ModuleName::new("tq4").unwrap();
+    kv.lossless_tail_blocks = 1;
+    let mut s = setup(32, 8, 16, kv, MemoryKind::Dedicated);
+    let prompts = fill_l0(&mut s.driver);
+    let d = &mut s.driver;
+    let codec_bytes = |name: &str| {
+        turbine_kv::codec::registry()
+            .get(name)
+            .unwrap()
+            .bytes_per_block(&format().layout)
+    };
+    let (fp8, tq4) = (codec_bytes("fp8_e4m3"), codec_bytes("tq4"));
+    assert!(tq4 < fp8 && fp8 < block_bytes());
+
+    // RED: everything unreferenced leaves L0 for L1; L1 (8 L0-format blocks) fills and its
+    // victims move on to L2.
+    d.set_pressure(PressureState::Red);
+    for _ in 0..60 {
+        d.step();
+    }
+    // Every sequence ran 6 full blocks (96- and 98-token prompts): block 5 is its tail.
+    let tail = |b: &KvBlock| b.token_range.start == 80;
+    let mut seen = std::collections::HashMap::new();
+    for b in d.kv().directory().iter() {
+        for loc in &b.locations {
+            let want = match loc.tier {
+                TierId::L0 => "l0",
+                _ if tail(b) => "l0",
+                TierId::L1 => "fp8_e4m3",
+                _ => "tq4",
+            };
+            assert_eq!(
+                loc.format,
+                want,
+                "{:?} copy of block {:?} (tail {})",
+                loc.tier,
+                b.token_range,
+                tail(b)
+            );
+            *seen.entry((loc.tier, loc.format)).or_insert(0) += 1;
+        }
+    }
+    for (tier, format) in [
+        (TierId::L1, "fp8_e4m3"),
+        (TierId::L2, "tq4"),
+        (TierId::L2, "l0"),
+    ] {
+        assert!(
+            seen.get(&(tier, format)).is_some_and(|n| *n > 0),
+            "no {format} copy in {tier:?}: {seen:?}"
+        );
+    }
+    assert!(
+        seen.get(&(TierId::L1, "fp8_e4m3")).unwrap() + seen.get(&(TierId::L1, "l0")).unwrap_or(&0)
+            > 8,
+        "compressed copies let L1 hold more than 8 blocks: {seen:?}"
+    );
+
+    // Each copy is accounted at its format's size, and the tiers stay within capacity.
+    for (tier, mem) in [(TierId::L1, &s.l1), (TierId::L2, &s.l2)] {
+        let mut total = 0;
+        for (key, size) in mem.sizes() {
+            let loc = d.kv().directory().get(&key).and_then(|b| b.location(tier));
+            let format = loc.expect("a stored copy is in the directory").format;
+            let want = match format {
+                "l0" => block_bytes(),
+                f => codec_bytes(f),
+            };
+            assert_eq!(size, want, "{tier:?} copy in {format}");
+            total += size;
+        }
+        assert_eq!(mem.used_bytes(), total);
+        assert!(total <= mem.capacity_bytes());
+    }
+
+    // GREEN: the prefixes come back, promoted into L0 at the L0 format.
+    d.set_pressure(PressureState::Green);
+    let before = d.kv().stats().promotions;
+    for (i, p) in prompts.iter().enumerate() {
+        let id = rid(200 + i as u128);
+        let mut prompt = p.clone();
+        prompt.extend(60_000..60_008);
+        d.submit(id, prompt, 1);
+        drain(d);
+    }
+    assert!(
+        d.kv().stats().promotions > before,
+        "demoted blocks promoted"
+    );
+    for b in d.kv().directory().iter() {
+        if let Some(loc) = b.location(TierId::L0) {
+            assert_eq!(loc.format, "l0");
+        }
+    }
+    assert_eq!(d.violations(), &[] as &[String]);
 }
 
 #[test]

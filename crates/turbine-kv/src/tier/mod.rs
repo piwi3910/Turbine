@@ -51,11 +51,17 @@ impl TierId {
 }
 
 /// Where one copy of a block lives. `slot` is the L0 `BlockId`; for L1/L2 `slab << 32 | slot`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+/// `format` is the `kv_format` codec the copy is stored in (P6b S-1): `l0` (the L0 page bytes
+/// unchanged) for every L0 copy and for lower-tier copies kept at the L0 format.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize)]
 pub struct KvLocation {
     pub tier: TierId,
     pub slot: u64,
+    pub format: &'static str,
 }
+
+/// The `kv_format` codec name of a copy kept at the L0 format (the identity codec).
+pub const L0_FORMAT: &str = "l0";
 
 /// The slot a `put` stored a block in (same encoding as [`KvLocation::slot`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -100,6 +106,21 @@ pub trait KvTier: Send + Sync {
     fn contains(&self, key: &KvKey) -> bool;
     /// Stores a block, replacing any block stored under `key`.
     fn put(&self, key: KvKey, src: TierBlockRef<'_>) -> Result<TierSlot, TierError>;
+    /// Stores one block encoded by codec `format`, `bytes` logical bytes (P6b S-1): tiers that
+    /// label their slots by format (L2's slab headers) or account blocks without holding their
+    /// bytes (a payload-free [`MemTier`]) override it; the others store `src` as [`put`] does.
+    ///
+    /// [`put`]: KvTier::put
+    fn put_as(
+        &self,
+        key: KvKey,
+        format: &'static str,
+        bytes: u64,
+        src: TierBlockRef<'_>,
+    ) -> Result<TierSlot, TierError> {
+        let _ = (format, bytes);
+        self.put(key, src)
+    }
     fn get(&self, key: &KvKey, dst: TierBlockMut<'_>) -> Result<(), TierError>;
     fn evict(&self, key: &KvKey) -> Result<(), TierError>;
     fn degraded(&self) -> bool;

@@ -53,6 +53,7 @@ use turbine_core::types::{
     BlockId, DType, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, Priority,
     RequestId,
 };
+use turbine_kv::codec::{CodecParams, KvCodec};
 use turbine_kv::document::HitWindow;
 use turbine_kv::hierarchy::{
     AttachOutcome, AttachRequest, HierarchyConfig, KvHierarchy, KvReclaimHandle, PrefetchAccepted,
@@ -62,10 +63,10 @@ use turbine_kv::identity::{KvFormat, KvKey, KvScaleHashes, namespace_key};
 use turbine_kv::metrics::EvictReason;
 use turbine_kv::planner::PathCost;
 use turbine_kv::tier::{
-    KvTier, L1Config, L1PinnedTier, L2Config, L2NvmeTier, ShardSlots, ShardedL1Tier, TierBlockMut,
-    TierBlockRef, TierError, TierId, TierSlot,
+    KvTier, L0_FORMAT, L1Config, L1PinnedTier, L2Config, L2NvmeTier, ShardSlots, ShardedL1Tier,
+    TierBlockMut, TierBlockRef, TierError, TierId, TierSlot,
 };
-use turbine_kv::transfer::{TransferBackend, TransferPath, TransferTicket};
+use turbine_kv::transfer::{TransferBackend, TransferCodec, TransferPath, TransferTicket};
 use turbine_kv::{BlockPool, KvDocument, KvMetrics};
 use turbine_model::kv_scales::KvCache;
 use turbine_tensor::{
@@ -92,6 +93,37 @@ const REFRESH_FREE_SHARE: u32 = 10;
 const PREFILL_ALPHA: f64 = 0.2;
 /// Prefill iterations smaller than this do not update the prefill rate (launch overhead).
 const PREFILL_MIN_TOKENS: u32 = 64;
+
+/// Refuses (exit 1) a lower-tier format the host path cannot store (P6b S-1): one the codec
+/// cannot encode for this layout, or any format other than `l0` when a block is split into
+/// rank or stage shards (the host codec works on one shard's layout).
+fn check_tier_formats(
+    cfg: &KvConfig,
+    format: &KvFormat,
+    sharded: bool,
+) -> Result<(), StartupError> {
+    for (on, key, name) in [
+        (cfg.cpu.enabled, "kv.cpu.format", cfg.cpu.format.as_str()),
+        (cfg.nvme.enabled, "kv.nvme.format", cfg.nvme.format.as_str()),
+    ] {
+        if !on || name == L0_FORMAT {
+            continue;
+        }
+        let codec = turbine_kv::codec::registry()
+            .get(name)
+            .ok_or_else(|| StartupError::new(format!("{key}: no kv_format codec `{name}`")))?;
+        codec
+            .supports(&format.layout)
+            .map_err(|e| StartupError::new(format!("{key} {name}: {e}")))?;
+        if sharded {
+            return Err(StartupError::new(format!(
+                "{key} {name}: lower-tier formats other than l0 need one KV shard per block \
+                 (no tensor or pipeline parallelism) until the GPU transcode"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// The device side of block copies.
 #[derive(Clone)]
@@ -410,6 +442,8 @@ impl KvOrchestrator {
             None => format,
         };
         let format = with_scales(format, s.kv_scales)?;
+        check_tier_formats(s.cfg, &format, world > 1 || remote.is_some())?;
+        let host_codec = HostCodec::of(&s.identity, &format);
         if world > 1
             && s.cfg.cpu.enabled
             && s.cfg.cpu.max_bytes.0 / u64::from(world) < L1_SLAB_BYTES
@@ -504,13 +538,14 @@ impl KvOrchestrator {
         // Every I/O job belongs to an in-flight ticket, so this bound is never reached; the
         // L2 tier bounds concurrent I/O itself (`kv.nvme.max_queue_depth`).
         let io_capacity = (s.cfg.transfer.max_inflight_bytes.0 / block_bytes.max(1)) as usize + 1;
-        let backend = CopyStreamBackend::new(
+        let mut backend = CopyStreamBackend::new(
             shards,
             l1.clone(),
             l2_dyn,
             IoPoolBackend::new(io_threads, io_capacity),
             block_bytes as usize,
         );
+        backend.set_host_codec(host_codec);
         let (tx, commands) = mpsc::channel(s.cfg.prefetch.max_queue.max(1) as usize);
         let mut o = KvOrchestrator {
             h,
@@ -997,20 +1032,127 @@ enum IoOp {
         from: Arc<dyn KvTier>,
         to: Arc<dyn KvTier>,
         key: KvKey,
-        bytes: usize,
+        codec: HostTranscode,
     },
-    /// The staged shards of an L0 → L2 copy, stored as one block (the shards concatenated).
+    /// The staged shards of an L0 → L2 copy, stored as one block (the shards concatenated),
+    /// encoded in the tier's format.
     Write {
         to: Arc<dyn KvTier>,
         key: KvKey,
         bufs: Staged,
+        codec: HostTranscode,
     },
-    /// The first half of an L2 → L0 copy: the block split into the shards' staging buffers.
+    /// The first half of an L2 → L0 copy: the block decoded to the L0 format and split into
+    /// the shards' staging buffers.
     Read {
         from: Arc<dyn KvTier>,
         key: KvKey,
         bufs: Staged,
+        codec: HostTranscode,
     },
+}
+
+/// The L0 layout and codec parameters the host path encodes and decodes tier copies with (P6b
+/// S-1: the reference `encode_cpu` / `decode_cpu` on the I/O threads, until the v2.10 GPU
+/// transcode). Only for one logical block of one shard: startup refuses a lower-tier format
+/// other than `l0` under tensor or pipeline parallelism.
+#[derive(Clone, Debug)]
+pub struct HostCodec {
+    pub layout: KvLayout,
+    pub params: CodecParams,
+}
+
+impl HostCodec {
+    /// The layout of `format` (one shard) with the tier codecs' rotation seed: the first 8
+    /// bytes of the unsalted namespace key, little-endian, as L2's slab header records it.
+    /// FP8 L0 scales are not needed: the host path moves FP8 pages to `fp8_e4m3` unchanged and
+    /// the TurboQuant codecs decode in the L0 page's own scaled domain.
+    pub fn of(identity: &ModelIdentity, format: &KvFormat) -> HostCodec {
+        let ns = namespace_key(identity, format, "");
+        let mut seed = [0u8; 8];
+        seed.copy_from_slice(&ns.0[..8]);
+        HostCodec {
+            layout: format.layout,
+            params: CodecParams {
+                seed: u64::from_le_bytes(seed),
+                ..CodecParams::default()
+            },
+        }
+    }
+}
+
+/// One copy's formats with the host codec that converts between them.
+#[derive(Clone)]
+struct HostTranscode {
+    codec: TransferCodec,
+    host: Option<Arc<HostCodec>>,
+}
+
+impl HostTranscode {
+    fn codec(name: &str) -> Result<&'static dyn KvCodec, TierError> {
+        turbine_kv::codec::registry()
+            .get(name)
+            .ok_or_else(|| TierError::Io(format!("no kv_format codec `{name}`")))
+    }
+
+    fn host(&self) -> Result<&HostCodec, TierError> {
+        self.host.as_deref().ok_or_else(|| {
+            TierError::Io(format!(
+                "no host codec for a {} → {} copy",
+                self.codec.from, self.codec.to
+            ))
+        })
+    }
+
+    /// Encodes an L0-format block into the destination format (borrowed when that is `l0`).
+    fn encode<'a>(&self, l0: &'a [u8]) -> Result<std::borrow::Cow<'a, [u8]>, TierError> {
+        if self.codec.to == L0_FORMAT {
+            return Ok(std::borrow::Cow::Borrowed(l0));
+        }
+        let host = self.host()?;
+        let c = Self::codec(self.codec.to)?;
+        let mut out = vec![0u8; c.bytes_per_block(&host.layout) as usize];
+        c.encode_cpu(l0, &host.layout, &mut out, &host.params)
+            .map_err(|e| TierError::Io(e.to_string()))?;
+        Ok(std::borrow::Cow::Owned(out))
+    }
+
+    /// Decodes a source copy into an L0-format block (`out`, the L0 block's bytes).
+    fn decode(&self, src: &[u8], out: &mut [u8]) -> Result<(), TierError> {
+        if self.codec.from == L0_FORMAT {
+            if src.len() != out.len() {
+                return Err(TierError::Io(format!(
+                    "block is {} bytes, buffer {}",
+                    src.len(),
+                    out.len()
+                )));
+            }
+            out.copy_from_slice(src);
+            return Ok(());
+        }
+        let host = self.host()?;
+        Self::codec(self.codec.from)?
+            .decode_cpu(src, &host.layout, out, &host.params)
+            .map_err(|e| TierError::Io(e.to_string()))
+    }
+
+    /// Stores `l0` (an L0-format block) under `key` in `to`, in the destination format.
+    fn store(&self, to: &dyn KvTier, key: KvKey, l0: &[u8]) -> Result<TierSlot, TierError> {
+        let bytes = self.encode(l0)?;
+        to.put_as(
+            key,
+            self.codec.to,
+            bytes.len() as u64,
+            TierBlockRef::Host(&bytes),
+        )
+    }
+
+    /// Reads the source copy of `key` from `from` (`codec.from_bytes`).
+    fn load(&self, from: &dyn KvTier, key: &KvKey) -> Result<Vec<u8>, TierError> {
+        let mut v = vec![0u8; self.codec.from_bytes as usize];
+        from.get(key, TierBlockMut::Host(&mut v))?;
+        Ok(v)
+    }
 }
 
 struct IoDone {
@@ -1025,23 +1167,34 @@ fn run_io(op: IoOp) -> (Result<TierSlot, TierError>, Staged) {
             from,
             to,
             key,
-            bytes,
+            codec,
         } => {
-            let mut v = vec![0u8; bytes];
-            let r = from
-                .get(&key, TierBlockMut::Host(&mut v))
-                .and_then(|()| to.put(key, TierBlockRef::Host(&v)));
+            let r = codec.load(from.as_ref(), &key).and_then(|v| {
+                if codec.codec.is_identity() {
+                    to.put_as(key, codec.codec.to, v.len() as u64, TierBlockRef::Host(&v))
+                } else {
+                    let host = codec.host()?;
+                    let mut l0 = vec![0u8; host.layout.block_bytes() as usize];
+                    codec.decode(&v, &mut l0)?;
+                    codec.store(to.as_ref(), key, &l0)
+                }
+            });
             (r, Staged::new())
         }
-        IoOp::Write { to, key, bufs } => {
+        IoOp::Write {
+            to,
+            key,
+            bufs,
+            codec,
+        } => {
             let r = match bufs.as_slice() {
-                [one] => one.with(|b| to.put(key, TierBlockRef::Host(b))),
+                [one] => one.with(|b| codec.store(to.as_ref(), key, b)),
                 shards => {
                     let mut v = Vec::with_capacity(shards.iter().map(HostBuf::len).sum());
                     for b in shards {
                         b.with(|b| v.extend_from_slice(b));
                     }
-                    to.put(key, TierBlockRef::Host(&v))
+                    codec.store(to.as_ref(), key, &v)
                 }
             };
             (r, bufs)
@@ -1050,12 +1203,25 @@ fn run_io(op: IoOp) -> (Result<TierSlot, TierError>, Staged) {
             from,
             key,
             mut bufs,
+            codec,
         } => {
             let r = match bufs.as_mut_slice() {
-                [one] => one.with_mut(|b| from.get(&key, TierBlockMut::Host(b))),
+                [one] if codec.codec.from == L0_FORMAT => {
+                    one.with_mut(|b| from.get(&key, TierBlockMut::Host(b)))
+                }
+                [one] => codec
+                    .load(from.as_ref(), &key)
+                    .and_then(|v| one.with_mut(|b| codec.decode(&v, b))),
                 shards => {
                     let mut v = vec![0u8; shards.iter().map(HostBuf::len).sum()];
-                    from.get(&key, TierBlockMut::Host(&mut v)).map(|()| {
+                    let read = if codec.codec.from == L0_FORMAT {
+                        from.get(&key, TierBlockMut::Host(&mut v))
+                    } else {
+                        codec
+                            .load(from.as_ref(), &key)
+                            .and_then(|src| codec.decode(&src, &mut v))
+                    };
+                    read.map(|()| {
                         let mut at = 0usize;
                         for b in shards.iter_mut() {
                             b.with_mut(|b| {
@@ -1081,7 +1247,8 @@ pub struct IoPoolBackend {
     threads: Vec<JoinHandle<()>>,
     l1: Option<Arc<dyn KvTier>>,
     l2: Option<Arc<dyn KvTier>>,
-    block_bytes: usize,
+    /// Encodes and decodes tier copies not stored at the L0 format (P6b S-1).
+    host_codec: Option<Arc<HostCodec>>,
 }
 
 impl IoPoolBackend {
@@ -1126,7 +1293,14 @@ impl IoPoolBackend {
             threads,
             l1: None,
             l2: None,
-            block_bytes: 0,
+            host_codec: None,
+        }
+    }
+
+    fn transcode(&self, codec: TransferCodec) -> HostTranscode {
+        HostTranscode {
+            codec,
+            host: self.host_codec.clone(),
         }
     }
 
@@ -1170,7 +1344,7 @@ impl TransferBackend for IoPoolBackend {
                 from,
                 to,
                 key: t.req.key,
-                bytes: self.block_bytes,
+                codec: self.transcode(t.req.codec),
             },
         )
     }
@@ -1263,7 +1437,6 @@ impl CopyStreamBackend {
     ) -> CopyStreamBackend {
         io.l1 = l1.clone().map(|t| t as Arc<dyn KvTier>);
         io.l2 = l2.clone();
-        io.block_bytes = block_bytes;
         let even = block_bytes / shards.len().max(1);
         CopyStreamBackend {
             shards: shards
@@ -1284,6 +1457,12 @@ impl CopyStreamBackend {
             block_bytes,
             jobs: HashMap::new(),
         }
+    }
+
+    /// The host codec that encodes and decodes lower-tier copies not stored at the L0 format
+    /// (P6b S-1); without one such copies fail (and the hierarchy recomputes).
+    pub fn set_host_codec(&mut self, codec: HostCodec) {
+        self.io.host_codec = Some(Arc::new(codec));
     }
 
     /// Every shard has a copy stream (L1 needs one on every rank).
@@ -1470,6 +1649,14 @@ impl CopyStreamBackend {
                 self.io.start(t)?;
                 Ok(Job::Io(IoStage::Final))
             }
+            TransferPath::L0ToL1 | TransferPath::L1ToL0 if !req.codec.is_identity() => {
+                // Copy-stream L1 slots hold what the device pages hold: another format needs the
+                // v2.10 GPU transcode (P6b Task 5), which startup requires first.
+                Err(TierError::Io(format!(
+                    "the L1 copy stream moves L0-format blocks only, not {} → {}",
+                    req.codec.from, req.codec.to
+                )))
+            }
             TransferPath::L0ToL1 => {
                 if !self.all_streams() {
                     return Err(TierError::Io("L1 needs a copy stream".into()));
@@ -1531,12 +1718,14 @@ impl CopyStreamBackend {
             TransferPath::L2ToL0 => {
                 let l2 = self.l2.clone().ok_or(TierError::Missing)?;
                 let bufs = self.staging_bufs()?;
+                let codec = self.io.transcode(req.codec);
                 self.io.submit(
                     t.id,
                     IoOp::Read {
                         from: l2,
                         key: req.key,
                         bufs,
+                        codec,
                     },
                 )?;
                 Ok(Job::Io(IoStage::ThenIntoL0 {
@@ -1558,7 +1747,16 @@ impl CopyStreamBackend {
             }
             AfterCopies::WriteL2 { key, bufs } => {
                 let l2 = self.l2.clone().ok_or(TierError::Missing)?;
-                self.io.submit(t.id, IoOp::Write { to: l2, key, bufs })?;
+                let codec = self.io.transcode(t.req.codec);
+                self.io.submit(
+                    t.id,
+                    IoOp::Write {
+                        to: l2,
+                        key,
+                        bufs,
+                        codec,
+                    },
+                )?;
                 Ok(Job::Io(IoStage::Final))
             }
         }
@@ -1676,10 +1874,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use turbine_core::clock::SystemClock;
-    use turbine_core::config::ByteSize;
+    use turbine_core::config::{ByteSize, ModuleName};
     use turbine_core::types::{DType, DeviceId};
     use turbine_kv::BlockPoolConfig;
-    use turbine_kv::transfer::{TransferPurpose, TransferRequest};
+    use turbine_kv::transfer::{TransferCodec, TransferPurpose, TransferRequest};
     use turbine_model::testing::TempDir;
     use turbine_observability::MetricsRegistry;
     use turbine_tensor::host::HostMemory;
@@ -1769,16 +1967,30 @@ mod tests {
         src_slot: u64,
         dst_slot: u64,
     ) -> Result<TierSlot, TierError> {
+        let codec = TransferCodec::l0(o.backend.block_bytes as u64);
+        run_as(o, id, path, key, (src_slot, dst_slot), codec)
+    }
+
+    /// [`run`] with the copy's formats.
+    fn run_as(
+        o: &mut KvOrchestrator,
+        id: u64,
+        path: TransferPath,
+        key: KvKey,
+        (src_slot, dst_slot): (u64, u64),
+        codec: TransferCodec,
+    ) -> Result<TierSlot, TierError> {
         let t = TransferTicket {
             id,
             req: TransferRequest {
                 path,
                 key,
-                bytes: o.backend.block_bytes as u64,
+                bytes: codec.from_bytes.min(codec.to_bytes),
                 owner: None,
                 purpose: TransferPurpose::Demote,
                 src_slot,
                 dst_slot,
+                codec,
             },
         };
         o.backend.start(&t)?;
@@ -1947,6 +2159,95 @@ mod tests {
         assert_block(&ranks, 9, &want);
         let zeros = vec![0u8; want[0].len()];
         assert_block(&ranks, 5, &[zeros.clone(), zeros]);
+    }
+
+    /// P6b S-1, host path: with `kv.nvme.format: fp8_e4m3` an L0 → L2 copy stores the block
+    /// encoded by the codec's `encode_cpu` (the slab's slots hold the smaller bytes) and the
+    /// L2 → L0 copy decodes it, byte for byte the codec's own round trip.
+    #[test]
+    fn sync_l2_stores_the_tier_format() {
+        let dir = TempDir::new("turbine-kv-tier-format-sync");
+        let mut kv = kv_config(&dir, false);
+        kv.nvme.format = ModuleName::new("fp8_e4m3").unwrap();
+        let reg = MetricsRegistry::new();
+        let metrics = KvMetrics::register(&reg);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let format = kv_format(layout());
+        let l2 = open_l2(
+            &kv,
+            &format,
+            &identity(),
+            Arc::clone(&clock),
+            metrics.clone(),
+        )
+        .unwrap()
+        .expect("L2 is enabled");
+        let (mem, mut pool) = rank(0);
+        let (mut o, _handle) = KvOrchestrator::start(
+            KvStart {
+                cfg: &kv,
+                memory_kind: MemoryKind::Dedicated,
+                identity: identity(),
+                device: CopyDevice::Sync {
+                    mem: Arc::clone(&mem),
+                },
+                shards: Vec::new(),
+                l2: Some(Arc::clone(&l2)),
+                clock,
+                metrics,
+                remote: None,
+                kv_scales: None,
+            },
+            &mut pool,
+        )
+        .expect("the KV hierarchy starts");
+        let r = (mem, pool);
+        let bb = layout().block_bytes() as usize;
+        let block: Vec<u8> = (0..bb / 2)
+            .flat_map(|i| {
+                let x = ((i as f32) * 0.37).sin() * (1.0 + (i % 7) as f32);
+                turbine_kv::codec::f32_to_bf16(x).to_le_bytes()
+            })
+            .collect();
+        write_block(&r, 4, &block);
+        let fp8 = turbine_kv::codec::registry().get("fp8_e4m3").unwrap();
+        let small = fp8.bytes_per_block(&layout());
+        assert!(small < bb as u64);
+        let down = TransferCodec {
+            from: L0_FORMAT,
+            from_bytes: bb as u64,
+            to: "fp8_e4m3",
+            to_bytes: small,
+        };
+        let key = KvKey([5; 16]);
+        run_as(&mut o, 1, TransferPath::L0ToL2, key, (4, 0), down).unwrap();
+        assert_eq!(l2.used_bytes(), small, "L2 holds the encoded block");
+        let mut stored = vec![0u8; small as usize];
+        l2.get(&key, TierBlockMut::Host(&mut stored)).unwrap();
+        let params = HostCodec::of(&identity(), &format).params;
+        let mut want_enc = vec![0u8; small as usize];
+        fp8.encode_cpu(&block, &layout(), &mut want_enc, &params)
+            .unwrap();
+        assert_eq!(stored, want_enc, "encode_cpu on the I/O thread");
+
+        let up = TransferCodec {
+            from: "fp8_e4m3",
+            from_bytes: small,
+            to: L0_FORMAT,
+            to_bytes: bb as u64,
+        };
+        run_as(&mut o, 2, TransferPath::L2ToL0, key, (0, 9), up).unwrap();
+        let mut want = vec![0u8; bb];
+        fp8.decode_cpu(&want_enc, &layout(), &mut want, &params)
+            .unwrap();
+        assert_eq!(read_block(&r, 9), want, "decode_cpu into the L0 block");
+        assert_ne!(want, block, "fp8_e4m3 from BF16 is lossy");
+
+        // A copy stream moves L0-format blocks only (the GPU transcode is not there yet), and
+        // a sharded block refuses a lower-tier format other than l0 at startup.
+        assert!(check_tier_formats(&kv, &format, false).is_ok());
+        let err = check_tier_formats(&kv, &format, true).unwrap_err();
+        assert!(err.to_string().contains("kv.nvme.format fp8_e4m3"), "{err}");
     }
 
     /// A kernel-library context stand-in: copies are done when enqueued, and a pinned buffer
@@ -2281,6 +2582,7 @@ mod tests {
                 purpose: TransferPurpose::Demote,
                 src_slot,
                 dst_slot,
+                codec: TransferCodec::l0(o.backend.block_bytes as u64),
             },
         };
         let driver = o.remote.as_mut().expect("a static group");
