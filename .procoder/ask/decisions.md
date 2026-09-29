@@ -1962,3 +1962,10 @@ it and could beat BF16 at decode; it is allowed by the reuse rule (no provider w
 3. 6b ladder: **"Start at YELLOW earlier"** — compression begins at YELLOW, before the tiers are full, lowest tier first, one rung at a time (6b spec, plan and the `p6b-groundwork` policy and tests follow).
 
 Housekeeping by the coordinator: `origin/main` pushed (ecbd043..38703b9); on novanas the kubelet eviction thresholds are 5 % (imagefs and nodefs), so the disk floor is ≈ 45 GB free; the lead's cleanup trigger is ≈ 100 GB free.
+
+## W4A4 proof checkpoint: AMD Llama-3.1-8B-Instruct Quark W4A4 (2026-09-29)
+
+After the user's "Find another checkpoint" answer the lead searched Hugging Face: the only Instruct W4A4 MXFP4 checkpoint of a family Turbine serves on amd is `amd/Llama-3.1-8B-Instruct-MXFP4-W4A4-MLCAL-C1000-GPTQ` @ `00b0d018950a5466fa1fc8bc0ccf174bd38b15da` (AMD Quark fp4 weights and activations, per_group 32, e8m0, half_even, `even`; GPTQ with desc_act + static_groups; SmoothQuant folded; `exclude: [lm_head]`; ungated, 5,826,947,776 bytes, downloaded to `/home/piwi/turbine-models/llama-3.1-8b-instruct-mxfp4-a4`, free disk 232.5 GB → 226.9 GB); the others were Qwen3 / MoE / gpt-oss (Phase 7), GGUF or MLX. Its recipe also quantizes the KV cache (`kv_cache_quant_config`: fp4 K/V projection outputs), which the Quark parser refused. Options: (a) accept it and ignore the KV quantization with a WARN `kv_cache_quant_ignored`, the KV at the configured `kv.dtype`, the golden reference built the same way (activation fake-quant, BF16 KV), accuracy baseline BF16 Llama-3.1-8B-Instruct; (b) refuse it and fall back to completion prompts on the base 3B checkpoint; (c) keep looking or wait.
+
+**Decision (user, 2026-09-29, relayed by the coordinator): (a).** The base-3B checkpoint's accuracy is still reported against BF16 3B base as a side result.
+

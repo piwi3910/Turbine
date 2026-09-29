@@ -183,8 +183,18 @@ fi
 # A run on novanas holds the benchmark lock shared for its whole Job (scripts/bench-lock.sh):
 # k3s may place the Job on GPU 0, where lab-bench serves natively, so a benchmark waits for
 # running test Jobs and new ones wait for the benchmark (writer preference through the gate).
+# While novanas's PSU cannot hold both GPUs at peak (coordinator rule 2026-09-29, until the
+# replacement is in), GPU work runs one job at a time: the lock is taken exclusively and the
+# two-GPU leg is refused; TURBINE_LAB_ONE_GPU_JOB=0 restores the shared lock and `--gpus 2`.
+one_gpu_job=${TURBINE_LAB_ONE_GPU_JOB:-1}
+if [[ "$HOST" == novanas && $MODE == run && $one_gpu_job == 1 && $GPUS -eq 2 && $DRY_RUN -eq 0 ]]; then
+	echo "lab-test: --gpus 2 refused: one GPU job at a time on novanas until its PSU is replaced (TURBINE_LAB_ONE_GPU_JOB=0 overrides)" >&2
+	exit 2
+fi
 if [[ "$HOST" == novanas && $MODE == run && -z "${LAB_TEST_BENCH_SHARED:-}" && $DRY_RUN -eq 0 ]]; then
-	LAB_TEST_BENCH_SHARED=1 exec "$(dirname "${BASH_SOURCE[0]}")/bench-lock.sh" --shared \
+	lock_mode=(--shared)
+	[[ $one_gpu_job == 1 ]] && lock_mode=()
+	LAB_TEST_BENCH_SHARED=1 exec "$(dirname "${BASH_SOURCE[0]}")/bench-lock.sh" ${lock_mode[@]+"${lock_mode[@]}"} \
 		"${BASH_SOURCE[0]}" "${orig_args[@]}"
 fi
 

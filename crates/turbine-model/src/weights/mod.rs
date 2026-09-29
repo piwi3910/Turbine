@@ -762,6 +762,13 @@ mod tests {
         let (field, _) = refused(ct("channel", json!(null), act("token", false, json!(null))));
         assert_eq!(field, "input_activations");
 
+        // A Quark checkpoint quantizing its KV cache (the AMD Llama-3.1-8B-Instruct W4A4 proof
+        // checkpoint) loads: that part of its recipe is ignored with a WARN.
+        let mut kv_quark = quark(true);
+        kv_quark["kv_cache_quant_config"] = json!({"*k_proj": {"input_tensors": {"dtype": "fp4"}}});
+        let format = detect(&json!({ "quantization_config": kv_quark })).expect("loads");
+        assert_eq!(format.column(), WeightFormatColumn::Mxfp4A4);
+
         // MXFP4 refusals: a compressed-tensors group of 64; NVFP4 names the NVIDIA track.
         let (field, supported) = refused(json!({
             "quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",

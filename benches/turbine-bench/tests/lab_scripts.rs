@@ -1597,6 +1597,10 @@ fn lab_bench_model_map() {
             "llama-3.2-3b-instruct llama-3.2-3b-instruct-fp8kv scripts/lab/phase6-novanas-llama-fp8kv.yaml",
         ),
         (
+            "llama8b-mxfp4-a4",
+            "llama-3.1-8b-instruct-mxfp4-a4 llama-3.1-8b-instruct-mxfp4-a4 scripts/lab/phase6-novanas-llama8b-mxfp4-a4.yaml",
+        ),
+        (
             "olmoe-fp8kv",
             "olmoe-1b-7b-0125-instruct olmoe-1b-7b-0125-instruct-fp8kv scripts/lab/phase6-novanas-olmoe-fp8kv.yaml",
         ),
