@@ -66,6 +66,7 @@ Interfaces:
 - [ ] Implement.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-core`; `scripts/remote-cargo.sh run -p turbine-server -- --config examples/turbine.yaml --check-config --set kv.dtype=fp8_e4m3 --set kv.cpu.format=fp8_e4m3` — expect `config ok`; `--set kv.dtype=int8` — expect exit 2 naming `kv.dtype`
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- Note (lead, 2026-09-29): tier format names are registry-driven strings validated at startup against `kv_format` (ordering from codec metadata), not a core enum. Progressive gating: the S-9 `--check-config` criterion with a `tq4` / `tq2` tier exits 2 until those rows turn `experimental` (Task 9) — it is a phase-end criterion; a lossy tier or `kv.ladder.enabled` exits 1 (`kv_transcode_unavailable` / `kv_tq_unavailable`) until Tasks 5 and 12 land.
 - [ ] Commit: `feat(core): per-tier KV format and lossy-reuse configuration`
 
 ## Task 3: Per-tier demotion and promotion through codecs (host path)
@@ -105,7 +106,7 @@ Files: `kernels/include/turbine_kernels.h` (v2.10 group), `crates/turbine-kernel
 Interfaces:
 
 - C and Rust shapes as the spec's Interfaces; one staging buffer of `DEMOTION_INFLIGHT` × the largest encoded block per shard, allocated at startup when a lower-tier format is not `l0`
-  Covers: spec S-1 (GPU); AC `optional_groups_v210`, `kv_transcode_matches_cpu` (FP8)
+  Covers: spec S-1 (GPU); AC `optional_groups_v210`, `kv_transcode_matches_cpu` (FP8); when it lands, `fp8_e4m3` as a lower-tier format gets an `experimental` entry in `TIER_FORMAT_REFUSALS` (startup stops refusing it with `kv_transcode_unavailable`), `supported` after Task 6
   Depends on: Task 4
 
 - [ ] Evaluate transcode providers (short: CK `elementwise` / `batched_transpose` building blocks vs own) and write the entry.
