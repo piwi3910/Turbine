@@ -2,7 +2,8 @@
 # Full-GSM8K (1319 items) at concurrency 16 on Turbine GPTQ INT4 (Phase 6a Task 18 numerics
 # investigation, p6a-gptq-numerics). Built from agent-a67eec8abc8f117eb/gsm8k_full_run_r5.sh.
 # Runs entirely on novanas, detached (setsid nohup), so it survives the caller's disconnect:
-# kernel library build (no lock, nice 19, cores 12-15), then one pass under port18000.lock ->
+# kernel library build (no lock, nice 19, cores 12-15), then, once the lead's go-file
+# /home/piwi/turbine-ci/gpu-queue/gptq-full.go exists (24 h bound), one pass under port18000.lock ->
 # bench.gate -> bench.lock (the one-GPU-job PSU rule), CPU fixture jobs paused, GPU 0, cores 0-11.
 # Pair: tests/eval/llama-3.2-3b-instruct/turbine-bf16-full.json (0.7801, concurrency 16).
 # Output: $REMOTE/gptq-full/turbine-full.json (+ .err, server.log). Last log line:
@@ -20,6 +21,7 @@ PORT_LOCK=/home/piwi/turbine-ci/port18000.lock
 OUT=$REMOTE/gptq-full
 URL=http://127.0.0.1:18000
 PIDF=/tmp/gptqfull-server.pid
+GOFILE=/home/piwi/turbine-ci/gpu-queue/gptq-full.go
 
 mkdir -p "$OUT"
 cd "$SRC" || exit 1
@@ -101,6 +103,18 @@ run_pass() {
 		echo "gptq-full: done rc=1 (build)"
 		exit 1
 	fi
+	# GPU queue order (lead-owned go-files): wait for ours before touching any lock, bounded 24 h.
+	echo "== $(date -u +%FT%TZ) waiting for go-file $GOFILE"
+	waited=0
+	while [ ! -e "$GOFILE" ]; do
+		if [ "$waited" -ge 86400 ]; then
+			echo "gptq-full: done rc=1 (no go-file after 24 h)"
+			exit 1
+		fi
+		sleep 60
+		waited=$((waited + 60))
+	done
+	echo "== $(date -u +%FT%TZ) go-file present"
 	run_pass 200>"$PORT_LOCK" 201>"$BENCH_GATE" 202>"$BENCH_LOCK"
 	rc=$?
 	echo "gptq-full: done rc=$rc"
