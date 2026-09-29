@@ -61,6 +61,9 @@ if [[ "$state" != "locked" ]]; then
 	exit 1
 fi
 echo "bench-lock: holding $host $lock lock" >&2
+# Tells nested lab scripts (lab-serve.sh) which locks this process tree already holds, so they
+# do not queue behind their own caller: "<lock>:x" or "<lock>:s", space-separated.
+export TURBINE_BENCH_LOCK_HELD="${TURBINE_BENCH_LOCK_HELD:+$TURBINE_BENCH_LOCK_HELD }$lock:${mode#-}"
 
 rc=0
 "$@" || rc=$?
