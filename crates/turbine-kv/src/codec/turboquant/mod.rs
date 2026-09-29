@@ -216,6 +216,38 @@ fn get_u16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
 }
 
+/// K and V of one record, in F32 (before the L0 rounding).
+fn decode_record_with(w: TqWidths, r: &[u8], s: &HeadSigns) -> (Vec<f32>, Vec<f32>) {
+    let f = Fields::of(w);
+    let k = TqK {
+        codes: r[f.k_codes..f.k_norm].to_vec(),
+        norm: get_u16(r, f.k_norm),
+        qjl: r[f.qjl..f.r_norm].to_vec(),
+        residual_norm: get_u16(r, f.r_norm),
+    };
+    let v = TqV {
+        codes: r[f.v_codes..f.v_norm].to_vec(),
+        norm: get_u16(r, f.v_norm),
+    };
+    (
+        decode_k(&k, w.k_bits, &s.k, &s.qjl),
+        decode_v(&v, w.v_bits, &s.v),
+    )
+}
+
+/// Decodes one record (`w.record_bytes()` bytes of (layer, head) under `seed`) to its K and V
+/// in F32, without the rounding to the L0 dtype that `decode_cpu` applies: the values the
+/// reference TurboQuant attention (`turbine_kernels::cpu::tq_attention`) is held to.
+pub fn decode_record(
+    w: TqWidths,
+    record: &[u8],
+    seed: u64,
+    layer: usize,
+    head: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    decode_record_with(w, record, &HeadSigns::of(seed, layer, head))
+}
+
 /// Shared implementation of `tq4` and `tq2`.
 fn tq_supports(name: &'static str, l0: &KvLayout) -> Result<(), CodecError> {
     check_l0_dtype(name, l0)?;
@@ -289,27 +321,14 @@ fn tq_decode(
     check_size(name, "source", src.len(), tq_bytes(w, l0))?;
     check_size(name, "destination", dst.len(), l0.block_bytes())?;
     let g = L0Geometry::of(l0);
-    let f = Fields::of(w);
     let rec = w.record_bytes();
     for layer in 0..g.layers {
         for h in 0..g.heads {
             let s = HeadSigns::of(p.seed, layer, h);
             for t in 0..g.tokens {
                 let r = &src[((layer * g.heads + h) * g.tokens + t) * rec..][..rec];
-                let k = TqK {
-                    codes: r[f.k_codes..f.k_norm].to_vec(),
-                    norm: get_u16(r, f.k_norm),
-                    qjl: r[f.qjl..f.r_norm].to_vec(),
-                    residual_norm: get_u16(r, f.r_norm),
-                };
-                let v = TqV {
-                    codes: r[f.v_codes..f.v_norm].to_vec(),
-                    norm: get_u16(r, f.v_norm),
-                };
-                for (kind, x) in [
-                    (0, decode_k(&k, w.k_bits, &s.k, &s.qjl)),
-                    (1, decode_v(&v, w.v_bits, &s.v)),
-                ] {
+                let (k, v) = decode_record_with(w, r, &s);
+                for (kind, x) in [(0, k), (1, v)] {
                     let base = g.vector_elem(layer, kind, t, h);
                     let scale = p.l0_scale(layer, kind);
                     for (i, val) in (base..).zip(x) {
