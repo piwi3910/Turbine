@@ -34,12 +34,23 @@ if [[ $# -eq 0 ]]; then
 	exit 2
 fi
 
+# Writer preference through a gate lock: an exclusive taker holds <lock>.gate while it waits for
+# and holds <lock>; a shared taker passes the gate first (waiting while an exclusive taker is
+# queued or holding), so a stream of shared holders (lab-test Jobs) cannot starve a benchmark.
+base=/home/piwi/turbine-ci/$lock
+hold="sh -c 'echo locked; cat >/dev/null'"
+if [[ "$mode" == "-x" ]]; then
+	remote_cmd="flock -x $base.gate flock -x $base.lock $hold"
+else
+	remote_cmd="flock -x $base.gate true && flock -s $base.lock $hold"
+fi
+
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 mkfifo "$dir/in" "$dir/out"
 # The remote side prints "locked" once it holds the lock and keeps it until its stdin closes.
 ssh -o BatchMode=yes "$host" \
-	"flock $mode /home/piwi/turbine-ci/$lock.lock sh -c 'echo locked; cat >/dev/null'" \
+	"$remote_cmd" \
 	<"$dir/in" >"$dir/out" &
 lock_pid=$!
 exec 3>"$dir/in"

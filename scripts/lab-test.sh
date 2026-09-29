@@ -37,6 +37,7 @@
 # Exit code: the test command's exit code; 2 for usage errors; otherwise non-zero with a message
 # naming the failed step.
 set -euo pipefail
+orig_args=("$@")
 
 usage() {
 	echo "usage: scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas> [--gpus 1|2] [--with-hf-reference] [--features <list>] [--tier quick|perf|full] [-- <cargo test args>]" >&2
@@ -177,6 +178,14 @@ if [[ $GPUS -eq 2 && $TIER == perf && ${#CARGO_ARGS[@]} -eq 0 ]]; then
 fi
 if [[ $MODE == stop && ($GPUS_SET -eq 1 || $HF_REFERENCE -eq 1 || -n $FEATURES || $TIER != full || ${#CARGO_ARGS[@]} -gt 0) ]]; then
 	usage
+fi
+
+# A run on novanas holds the benchmark lock shared for its whole Job (scripts/bench-lock.sh):
+# k3s may place the Job on GPU 0, where lab-bench serves natively, so a benchmark waits for
+# running test Jobs and new ones wait for the benchmark (writer preference through the gate).
+if [[ "$HOST" == novanas && $MODE == run && -z "${LAB_TEST_BENCH_SHARED:-}" && $DRY_RUN -eq 0 ]]; then
+	LAB_TEST_BENCH_SHARED=1 exec "$(dirname "${BASH_SOURCE[0]}")/bench-lock.sh" --shared \
+		"${BASH_SOURCE[0]}" "${orig_args[@]}"
 fi
 
 # The test command, one argv: cargo test --no-fail-fast <selection> -- <harness args> [<extra>].
