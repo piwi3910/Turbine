@@ -114,12 +114,26 @@ Detached on novanas (REMOTE=/home/piwi/turbine-ci/remote/agent-p6a-gptq-numerics
 
 | go-file | what | log | marker |
 |---|---|---|---|
-| `gptq-autoround.go` | AutoRound full GSM8K c16 (Turbine) | `$REMOTE/gptq-autoround/run.log` | `gptq-autoround: done rc=` |
+| `gptq-autoround.go` | AutoRound, first try: FAILED rc=2 (circuit `latency_drift`, see below) | `$REMOTE/gptq-autoround/run.log` | `gptq-autoround: done rc=2` |
+| `gptq-autoround2.go` | AutoRound rerun, full GSM8K c16 (Turbine) | `$REMOTE/gptq-autoround2/run.log` | `gptq-autoround2: done rc=` |
 | `gptq-calib.go` | llm-compressor calibration on GPU 0 | `/home/piwi/turbine-ci/scratch/gptq-own/calib.log` | `gptq-calib: done rc=` |
 | `gptq-own.go` | own checkpoint: Turbine, then vLLM-ROCm | `$REMOTE/gptq-own/run.log` | `gptq-own: done rc=`, `gptq-own-vllm: done rc=` |
 
+Lead queue (r11): w4a4-rerun → `gptq-calib.go` → `gptq-own.go` (after calib rc=0) →
+`gptq-autoround2.go` (after gptq-own-vllm, or after gptq-own fails).
+
 `gptq-own.go` must come after `gptq-calib: done rc=0` (the driver refuses with rc=1 if the
 checkpoint directory has no config.json when its pass starts).
+
+AutoRound first try (21:46Z): the circuit opened on `latency_drift` (ratio >= 4, HEALTHY →
+CIRCUIT_OPEN directly, GREEN pressure) 2 min into the c16 eval; turbine-golden aborted on the 503
+(gsm8k-test-1185), rc=2. Host load was 12-13 (MXFP4 CPU fixture + my uv/torch env install, which
+was not under the fixture pause pattern). gptq-full ran the same config for 2 h with 0 circuit
+transitions. Fix in the driver: `--set reliability.circuit.latency_drift_open=100` (drift ≥ 2
+still degrades and is logged; the driver prints the run's circuit transitions after each eval;
+device errors / OOM / other triggers unchanged), and the kernel build is serialized on
+`kbuild.lock` (two drivers started together corrupted the shared build.ninja once). The CPU setup
+is finished; nothing CPU-heavy of mine runs during the GPU evals.
 
 AutoRound checkpoint: `/home/piwi/turbine-models/llama-3.2-3b-instruct-autoround-gptq`
 (kaitchup @ e11f15d, 2.27 GB; quant_method gptq, bits 4, group 128, sym, desc_act false, no
@@ -127,7 +141,7 @@ checkpoint_format → v1, damp 0.01, auto-round 0.4.5, 500 iters, 512 × 2048). 
 the cpu backend: packaging `gptq`, row `gptq_int4` (experimental), 196 `int4_group_sym` layers.
 
 When the markers land:
-1. copy `$REMOTE/gptq-autoround/turbine-full.json` → `tests/eval/llama-3.2-3b-instruct/turbine-gptq-autoround-full.json`,
+1. copy `$REMOTE/gptq-autoround2/turbine-full.json` → `tests/eval/llama-3.2-3b-instruct/turbine-gptq-autoround-full.json`,
    `$REMOTE/gptq-own/turbine-full.json` → `turbine-gptq-own-full.json`, `vllm-full.json` → `vllm-gptq-own-full.json`;
 2. `python3 scripts/eval/paired_compare.py tests/eval/llama-3.2-3b-instruct/turbine-bf16-full.json <each> --max-drop 0.04`
    (already in `*-paired.json` on the host);

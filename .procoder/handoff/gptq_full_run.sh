@@ -82,6 +82,13 @@ VURL=http://127.0.0.1:18100
 PIDF=/tmp/$NAME-server.pid
 GOFILE=$CI/gpu-queue/$NAME.go
 BASELINE=tests/eval/llama-3.2-3b-instruct/turbine-bf16-full.json
+# An accuracy eval, not a reliability test: a step-time drift of 4x (the default
+# reliability.circuit.latency_drift_open) opened the circuit 2 min into gptq-autoround's c16 eval
+# (2026-09-29T21:48Z, host load 12-13 from a CPU fixture plus a uv/torch install; gptq-full ran
+# the same config for 2 h with no transition) and aborted the whole run on one 503. Drift >= 2x
+# still DEGRADES the circuit and is logged (counted below after the eval); only a 100x step
+# time opens it. Device errors, OOM and every other circuit trigger are unchanged.
+DRIFT_OPEN=100
 MAX_DROP=0.04
 export KUBECTL_KUBERC=false
 
@@ -127,6 +134,7 @@ run_turbine() {
     TURBINE_AMD_SMI_LIBRARY=/opt/rocm/rocm/lib/libamd_smi.so.26.5.0 ROCR_VISIBLE_DEVICES=0 \
     exec taskset -c 0-11 '$BIN/turbine-server' --config scripts/lab/phase6-novanas-llama-gptq.yaml \
       --set model.path='$MODEL_DIR' --set model.served_name='$SERVED' \
+      --set reliability.circuit.latency_drift_open=$DRIFT_OPEN \
       --set execution.kernel_library='$KLIB'" \
 		>"$OUT/server.log" 2>&1 </dev/null &
 	local ready=0 code
@@ -161,7 +169,10 @@ run_turbine() {
 		>"$out" 2>"${out%.json}.err"
 	local rc=$?
 	echo "== $(date -u +%FT%TZ) pass turbine: eval rc=$rc"
+	curl -s $URL/turbine/v1/status >"$OUT/status-end.json"
 	stop_server
+	echo "pass turbine: circuit transitions during the run: $(grep -c 'circuit_transition' "$OUT/server.log")"
+	sed 's/\x1b\[[0-9;]*m//g' "$OUT/server.log" | grep 'circuit_transition' | head -n 20
 	[ "$rc" = 0 ] && judge "$out" "$OUT/turbine-paired.json"
 	return "$rc"
 }
@@ -229,10 +240,13 @@ run_vllm() {
 
 {
 	echo "== $(date -u +%FT%TZ) gptq_full_run.sh $NAME starting, pid $$ (model $MODEL_DIR, served $SERVED, vllm=$VLLM)"
-	echo "== kernel library build"
-	nice -n 19 taskset -c 12-15 cmake -S kernels/rocm -B "$KB" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 >/dev/null &&
-		nice -n 19 taskset -c 12-15 cmake --build "$KB" -j 4 >"$OUT/kbuild.log" 2>&1
+	echo "== kernel library build (serialized on $KB.lock: drivers share the build dir)"
+	(
+		flock -x 9
+		nice -n 19 taskset -c 12-15 cmake -S kernels/rocm -B "$KB" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+			-DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 >/dev/null &&
+			nice -n 19 taskset -c 12-15 cmake --build "$KB" -j 4 >"$OUT/kbuild.log" 2>&1
+	) 9>"$KB.lock"
 	krc=$?
 	echo "kernel build rc=$krc"
 	if [ "$krc" != 0 ] || [ ! -x "$BIN/turbine-server" ] || [ ! -x "$BIN/turbine-golden" ]; then
