@@ -1067,11 +1067,32 @@ fn lab_serve_dry_run_prints_the_start_sequence() {
             "kubectl apply -f -",
             &format!("kubectl -n turbine-ci logs -f job/turbine-lab-serve-{id}"),
             ready,
+            &format!("pkill -f '[l]ogs -f job/turbine-lab-serve-{id}'"),
         ],
     );
     assert!(
         !text.contains(" delete "),
         "a start deletes nothing: {text}"
+    );
+}
+
+#[test]
+fn lab_serve_stops_the_remote_log_stream_once() {
+    // The remote `logs -f` survives the local ssh client's kill under a ControlMaster (the
+    // overload-soak hang, rotation 11): lab-serve must also pkill it remotely, exactly once
+    // per run, with the bracket trick so the pkill invocation never matches its own command
+    // line.
+    let text = dry_run(
+        "lab-serve.sh",
+        "stream-stop",
+        &["--dry-run", "novanas", "scripts/lab/phase1-novanas.yaml"],
+    );
+    let id = run_id(&text, "lab-serve");
+    let pkill = format!("pkill -f '[l]ogs -f job/turbine-lab-serve-{id}'");
+    assert_eq!(
+        text.matches(&pkill).count(),
+        1,
+        "exactly one remote log-stream kill: {text}"
     );
 }
 
