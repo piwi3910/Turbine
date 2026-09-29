@@ -240,7 +240,7 @@ Interfaces:
 Files: `crates/turbine-kv/src/policy/mod.rs` (`EvictAction`, `LadderContext`, default `action`), `crates/turbine-kv/src/policy/cost_aware.rs` (ladder rule), `crates/turbine-kv/src/policy/lru.rs` (default), `crates/turbine-kv/src/metrics.rs` (`EvictReason::{Compressed, LadderFloor}`), `docs/extending/eviction-policy.md` (action, ladder, pitfalls)
 Interfaces:
 
-- as the spec's Interfaces; rung order from `kv.ladder.max_format` and the codec registry's lossiness order (`l0` < `fp8_e4m3` < `tq4` < `tq2`); compression starts at YELLOW even when no tier is full (user decision 2026-09-29, "Start at YELLOW earlier"): the `p6b-groundwork` rule "a tier acts only when it is the lowest and about to drop, or above high water" becomes "at YELLOW or above the lowest enabled tier acts; at any non-GREEN state a tier about to drop or above high water acts", with `ladder_actions` updated (a YELLOW case with free room compresses one rung)
+- as the spec's Interfaces; rung order from `kv.ladder.max_format` and the codec registry's lossiness order (`l0` < `fp8_e4m3` < `tq4` < `tq2`); compression starts at YELLOW even when no tier is full (user decision 2026-09-29, "Start at YELLOW earlier"): the `p6b-groundwork` rule "a tier acts only when it is the lowest and about to drop, or above high water" becomes "at YELLOW or above the lowest enabled tier acts; at any non-GREEN state a tier about to drop or above high water acts", with `ladder_actions` updated (a YELLOW case with free room compresses one rung); YELLOW depth (user decision 2026-09-29, "Compress only until GREEN"): at YELLOW, with `must_leave` false and the tier not above high water, the lowest tier compresses only while `ctx.fill + ctx.demand > low_water` (`LadderLimits.low_water`, `LadderContext.demand`), so `ladder_actions` also has: YELLOW with `fill + demand ≤ low_water` keeps; YELLOW with demand pushing it over low water compresses; GREEN after YELLOW keeps; ORANGE with room still compresses (as built); a repeated sweep at steady YELLOW with room never reaches `tq2`
   Covers: spec S-6 (policy); AC `policy::tests::ladder_actions`
   Depends on: Task 9
 
@@ -256,13 +256,14 @@ Files: `crates/turbine-kv/src/hierarchy.rs` (rung state per tier, hysteresis, bo
 Interfaces:
 
 - `HierarchyConfig.ladder: Option<LadderConfig { max_format, high_water, low_water, dwell }>`; `KvHierarchy::ladder_tick(&mut self, pool, pressure: PressureLevel, now)`; log event `kv_ladder`
+- YELLOW depth: `ladder_tick` fills `LadderContext.demand` from the bytes the YELLOW reclaim (`apply_reclaim` `DemoteIdle`, target the `kv_utilization` YELLOW threshold) would demote into the tier, refreshes `fill` after every rewrite and stops the tick once the policy keeps; the ≤ 32 rewrites per tick, ≥ 50 ms spacing and the `deescalate_dwell` hysteresis are unchanged. The committed trace holds a long steady-YELLOW stretch with room, and the expected sequence pins no rung change in it and none in the tick after GREEN returns
   Covers: spec S-6; AC `ladder_under_pinned_pressure`, `kv_metrics_bounded` (ladder families)
   Depends on: Task 14
 
 - [ ] Write failing test `kv_sim ladder_under_pinned_pressure` with the committed trace and expected rung sequence. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim ladder` — expect FAIL
 - [ ] Implement.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-server -p turbine-api` — expect PASS; `overload_sim` unchanged
-- [ ] Mutation check (do not commit): remove the dwell check on stepping up — expect `ladder_under_pinned_pressure` to FAIL on the rung sequence; revert.
+- [ ] Mutation check (do not commit): remove the dwell check on stepping up — expect `ladder_under_pinned_pressure` to FAIL on the rung sequence; revert. Then drop the `low_water` stop at YELLOW — expect it to FAIL on the steady-YELLOW stretch; revert.
 - [ ] Lab: `scripts/lab-test.sh novanas --tier quick` — expect PASS
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `feat(kv): pressure-driven compression ladder in L1 and L2`
