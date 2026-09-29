@@ -212,6 +212,13 @@ impl ShimLibrary {
         self.syms.v21.minor
     }
 
+    /// True when the library reads `turbine_rope_desc.attn_factor` (ABI minor ≥ 10, Phase 6a
+    /// Task 28a): YaRN's attention factor on cos/sin. A library below it is never handed a
+    /// factor other than 1.0 (`rope_attn_factor_unavailable`).
+    pub fn rope_attn_factor(&self) -> bool {
+        self.syms.v21.rope_attn_factor
+    }
+
     /// True when the library exports the ABI v2.1 graph functions (`turbine_graph_*`), so its
     /// contexts can capture and replay graphs.
     pub fn supports_graphs(&self) -> bool {
@@ -1489,6 +1496,7 @@ fn rope_probe(cfg: &RopeConfig) -> RopeDesc {
         k_stride_token: i64::from(cfg.num_kv_heads) * d,
         style: 0,
         dtype: cfg.dtype.abi_code(),
+        attn_factor: 1.0,
     }
 }
 
@@ -2504,8 +2512,24 @@ impl RopeKernel for ShimProvider {
         self.implementation_of(OpKind::Rope, &self.syms().rope, &rope_probe(cfg))
     }
 
+    fn attn_factor_supported(&self) -> bool {
+        self.ctx.library().rope_attn_factor()
+    }
+
     fn execute(&self, ctx: &mut RopeContext<'_>) -> Result<(), KernelError> {
+        if ctx.attn_factor != 1.0 && !self.attn_factor_supported() {
+            return Err(KernelError::Unsupported {
+                message: format!(
+                    "rope_attn_factor_unavailable: {} (kernel ABI minor {}) does not read the \
+                     rope attention factor {} (needs minor 10)",
+                    self.ctx.library().path().display(),
+                    self.ctx.library().abi_minor(),
+                    ctx.attn_factor
+                ),
+            });
+        }
         let mut d = rope_probe(&ctx.cfg);
+        d.attn_factor = ctx.attn_factor;
         d.q_stride_token = row_stride("q", &ctx.q, 3)?;
         d.k_stride_token = row_stride("k", &ctx.k, 3)?;
         d.num_tokens = to_i32("num_tokens", ctx.q.shape[0])?;
@@ -2772,7 +2796,7 @@ impl KernelProvider for ShimProvider {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::Path;
 
     use turbine_core::types::{BlockId, DType, DeviceId, MemoryKind, Vendor};
@@ -2783,7 +2807,7 @@ mod tests {
     use super::*;
     use crate::KernelError;
 
-    fn mocked_device(arch: &str) -> DeviceInfo {
+    pub(crate) fn mocked_device(arch: &str) -> DeviceInfo {
         DeviceInfo {
             index: DeviceId(0),
             vendor: Vendor::Amd,
@@ -2802,14 +2826,18 @@ mod tests {
     }
 
     /// Calls a test hook the stub exports besides the ABI (not part of turbine_kernels.h).
-    fn stub_hook<T: Copy, R>(lib: &ShimLibrary, name: &str, call: impl FnOnce(T) -> R) -> R {
+    pub(crate) fn stub_hook<T: Copy, R>(
+        lib: &ShimLibrary,
+        name: &str,
+        call: impl FnOnce(T) -> R,
+    ) -> R {
         let f: T = ffi::resolve(&lib._lib, &lib.path, name).expect("stub test hook");
         call(f)
     }
 
     /// Serializes the tests that create contexts in the gfx942 stub: its live-context counter is
     /// process-global, so a parallel test's context would shift `live_contexts`.
-    static STUB_CONTEXTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static STUB_CONTEXTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn live_contexts(lib: &ShimLibrary) -> i32 {
         stub_hook(

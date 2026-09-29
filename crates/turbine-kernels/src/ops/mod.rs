@@ -757,6 +757,11 @@ pub struct RopeContext<'a> {
     pub k: TensorView<'a>,
     pub positions: TensorView<'a>,
     pub inv_freq: TensorView<'a>,
+    /// YaRN's attention factor `m` (Phase 6a Task 28a, kernel ABI v2.10): cos and sin are
+    /// multiplied by it in F32 before they are rounded to the dtype, so the rotated q and k
+    /// carry it as transformers' do. 1.0 = none; a kernel whose
+    /// [`RopeKernel::attn_factor_supported`] is false refuses any other value.
+    pub attn_factor: f32,
 }
 
 /// `out = silu(gate) · up`, all `[rows, cols]`.
@@ -880,6 +885,13 @@ pub trait RopeKernel: Send + Sync {
     fn supports(&self, cfg: &RopeConfig) -> bool;
     fn implementation(&self, cfg: &RopeConfig) -> String;
     fn execute(&self, ctx: &mut RopeContext<'_>) -> Result<(), KernelError>;
+    /// True when `execute` applies a [`RopeContext::attn_factor`] other than 1.0 (a kernel
+    /// library at ABI minor ≥ 10, the cpu-reference provider). False by default, so a kernel
+    /// that does not read the factor is never handed one: a YaRN model whose factor is not 1 is
+    /// refused at startup (`rope_attn_factor_unavailable`).
+    fn attn_factor_supported(&self) -> bool {
+        false
+    }
 }
 
 /// SiLU-and-multiply.
