@@ -5,7 +5,7 @@
 #                         [--golden16] [--c1] [--quick] [-- <--set k=v>...]
 #   scripts/lab-bench.sh --print-model <model>
 #
-# <model>: llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16
+# <model>: llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16|llama-fp8kv|olmoe-fp8kv
 # (Phase 6a: one value per proof checkpoint; each maps to a weights directory under
 # /home/piwi/turbine-models/, a golden slug under tests/golden/ and a lab config).
 # --print-model prints "<weights> <golden slug> <config>" and exits without contacting a host.
@@ -41,7 +41,7 @@ quick=0
 print_model=0
 usage() {
 	echo "usage: scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--c1] [--quick] [-- --set k=v ...] | --print-model <model>" >&2
-	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16" >&2
+	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16 llama-fp8kv olmoe-fp8kv" >&2
 	exit 2
 }
 while [[ $# -gt 0 ]]; do
@@ -123,6 +123,16 @@ llama-mxfp4-a4) slug=llama-3.2-3b-mxfp4-a4 ;;
 llama-yarn16)
 	slug=llama-3.2-3b-instruct
 	golden_slug=llama-3.2-3b-instruct-yarn16
+	;;
+# FP8 KV (Phase 6a S-13): the BF16 checkpoints, `kv.dtype: fp8_e4m3` in their configs, judged
+# against a reference with FP8 KV emulated.
+llama-fp8kv)
+	slug=llama-3.2-3b-instruct
+	golden_slug=llama-3.2-3b-instruct-fp8kv
+	;;
+olmoe-fp8kv)
+	slug=olmoe-1b-7b-0125-instruct
+	golden_slug=olmoe-1b-7b-0125-instruct-fp8kv
 	;;
 *)
 	echo "lab-bench: unknown model $model" >&2

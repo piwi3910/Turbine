@@ -1592,6 +1592,14 @@ fn lab_bench_model_map() {
             "llama-yarn16",
             "llama-3.2-3b-instruct llama-3.2-3b-instruct-yarn16 scripts/lab/phase6-novanas-llama-yarn16.yaml",
         ),
+        (
+            "llama-fp8kv",
+            "llama-3.2-3b-instruct llama-3.2-3b-instruct-fp8kv scripts/lab/phase6-novanas-llama-fp8kv.yaml",
+        ),
+        (
+            "olmoe-fp8kv",
+            "olmoe-1b-7b-0125-instruct olmoe-1b-7b-0125-instruct-fp8kv scripts/lab/phase6-novanas-olmoe-fp8kv.yaml",
+        ),
     ];
     for (model, triple) in expected {
         let (out, called) = lab_script(
