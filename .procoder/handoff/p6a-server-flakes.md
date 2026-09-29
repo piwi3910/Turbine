@@ -94,6 +94,9 @@ Whichever is chosen, the tests should keep their bounds generous, as done here.
 - `remote-cargo test -p turbine-server --test tiny_server -- queue_full_429 phase2_metrics_and_reasons
   slow_client_paused_then_cancelled request_and_queue_timeouts`: 4 passed in 22.9 s. That run did not have
   the lead's heavy load, so it does not show robustness under load.
-- Gate: `scripts/gate.sh --base eba77a1`, log `scratchpad/flakes-gate.log`. It started 2026-09-29 around
-  23:50 +04. novanas cores 12-15 were so starved that clippy managed about one crate every two minutes.
-  See the gate line below.
+- Gate: `scripts/gate.sh --base eba77a1`. It is running detached from the Mac with nohup; its log,
+  `scratchpad/flakes-gate.log`, ends in `gate: …` and `rc=<n>`.
+  - The first attempt started about 23:50 +04 and had checked about 146 dependency crates after 80 min.
+    novanas cores 12-15 were starved: roughly one crate every 1-2 minutes.
+  - That attempt's remote clippy still holds the target-dir lock, and the detached rerun waits on it.
+  - **Gate result not yet known when this handoff was written.**
