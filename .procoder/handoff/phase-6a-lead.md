@@ -230,3 +230,37 @@ Task 29 two-GPU tier (blocked on the PSU), Task 29 exit, review file refresh (no
 - Task 14 builder (branch p6a-fp8-t14, brief scratchpad/lead/brief-t14.md): fixtures + FP8-tensor spread (detached, fixture.lock)
   + GPU proof driver (detached, lock chain). Its handoff `.procoder/handoff/p6a-fp8-t14.md` names the done markers.
 - Crash policy: decisions "Keep going through crashes (2026-09-29)". Coordinator heartbeat runs r6-check.sh at :17/:47.
+
+## Rotation 6 → 7 handoff (≈15:50) — START HERE next
+
+State notes: `scratchpad/lead/r5-state.md` (lines starting "R6"). Check script: `ssh novanas 'bash -s' < scratchpad/lead/r6-check.sh`
+(one ssh; covers the rotation 5 table + T14). Coordinator heartbeat runs it at :17/:47 and wakes the lead.
+
+**Disk (correction 2026-09-29):** novanas kubelet eviction thresholds were lowered to 5 % this morning (configz confirmed):
+pods evict at ≈ 45 GB free, not ≈ 134 GB. Lead cleanup trigger stays ≈ 100 GB free (was written as 150 in rotation 5).
+Own cleanup allowed: remote `target/` of a removed worktree of ours (`/home/piwi/turbine-ci/remote/agent-<id>/target`).
+
+**Integration `phase-6a-quantization`** tip = this commit (after 8ae7124). Merged in rotation 6: f62fc8a, ae7fcca, 090e09c, f51cc7b
+(Task 14 fixtures + drivers). Review file has the lead calls (eval c16, FP8-dynamic weak tail, p05 near-tie, YELLOW-depth reading).
+
+**Detached on novanas, in addition to the rotation 5 table:**
+| Run | Done marker | Then |
+| --- | --- | --- |
+| T14 GPU proof `scratch/p6a-fp8-t14/t14_proof_run.sh` | `t14_proof_run: done rc=` (log in that dir) | judge per `.procoder/handoff/p6a-fp8-t14.md`; p05 excuse only for the exact 9478@23 miss; then labbook, 10-min soak fp8-dynamic, support.rs row flip |
+| T14 per-tensor spread `t14_spread.sh` (2nd in fixture.queue) | `t14-spread: done rc=` | tensor `tolerance.json` (same derivation), check `reference-diff.txt`, re-judge saved `capture.jsonl` |
+Evals at c16: full-GSM8K driver and queue4n call a wrapper (`/home/piwi/turbine-ci/scratch/eval-c16/wrapper.sh`). Llama BF16 full
+ran at c1 → re-run it at c16 after `ALLDONE` before judging Llama FP8 KV. T15/T18 stay c1 (their baselines are c1).
+
+**6b host-only stack (not merged into 6a; rebase onto main after 6a merges, order groundwork → t2 → tq-attn → t3 / t11b):**
+- `p6b-groundwork` 187c0dc; `p6b-t2` 40fe8d6 (Task 2 + Task 1 support remainder; registry-driven tier formats, lossy_penalty map);
+  `p6b-tq-attn` b1606a9 (cpu::tq_attention, pool page classes); `p6b-stack` df47c83 = t2 + tq-attn (gate --base 187c0dc running →
+  `scratchpad/gate-p6b-stack.txt`; check it).
+- Builders running: Task 3 on `p6b-t3` (worktree agent-ab443ff21c9b66ddd, brief lead/brief-p6b-t3.md); Task 11 remainder (cpu
+  backend TurboQuant L0) on `p6b-t11b` (worktree agent-p6b-tq-attn, brief lead/brief-p6b-t11b.md). Review their handoff(<file>)
+  commits (ops, decoder, core are lead-owned). Next: Task 4 (after t3), Task 15 ladder tick + `ladder_under_pinned_pressure`
+  (after t3; must fill `demand`, assert stop at GREEN / no tq2 drift), wire `LadderLimits.low_water` from config there.
+- Lead calls this rotation: block_formats byte = absolute code (bf16 0, fp8 1, tq4 2, tq2 3; "l0" mapped at the boundary);
+  6b plan notes 8ae7124 (progressive gating; fp8 tier experimental at Task 5).
+
+**Remaining for 6a close:** collectors per tables; Task 14 proof; T15/T18/T20/T24/T28 judgements; Task 29 exit on everything
+runnable (two-GPU items blocked on the PSU → Unfinished in the review file); merge into local main (no push); start 6b from main.
