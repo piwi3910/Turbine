@@ -136,7 +136,7 @@ The sub-steps land in this order (user decision 2026-09-28, Q1): foundations (S-
 
 ### Performance targets (user decision 2026-09-28, Q20; novanas GPU 0, `lab-bench.sh`; BF16 Llama-3.2-3B baseline 855 tok/s at c16, ITL p50 15.4 ms)
 
-- `fp8` (Llama-3.2-3B FP8-dynamic): c16 tok/s ≥ 1.10 × BF16; c1 ITL p50 ≤ 0.75 × BF16.
+- `fp8` (Llama-3.2-3B FP8-dynamic): c16 tok/s ≥ 1.10 × BF16; c1 ITL p50 ≤ 0.75 × BF16 — a perf follow-up (plan Task 14b), not a support gate (user decision 2026-09-29, "FP8-dynamic (Task 14): accuracy on full GSM8K against vLLM, c1 ITL as a perf item"; measured 0.846×). Its accuracy gate is the full 1,319-item GSM8K at c16 against vLLM on the same checkpoint.
 - `fp8_block`: c16 tok/s ≥ 1.0 × BF16.
 - `awq_int4`, `gptq_int4` (3B): c1 ITL p50 ≤ 0.6 × BF16; c16 tok/s ≥ 0.9 × BF16. `mxfp4` (8B): c1 ITL p50 ≤ 0.6 × the 8B BF16 run; c16 ≥ 0.9 ×.
 - Where vLLM-ROCm serves the same checkpoint on `gfx1201`: Turbine c16 tok/s ≥ 0.9 × vLLM.

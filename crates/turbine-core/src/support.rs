@@ -364,8 +364,11 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Experimental,
     ),
-    // FP8 KV on gfx1201 (Phase 6a S-13, S-14): `experimental` while the lab proof runs (Task 24),
-    // `supported` only after its gate.
+    // FP8 KV on gfx1201 (Phase 6a S-13, S-14): `supported` after the Task 24 proof. Full GSM8K at
+    // c16 (1,319 items): Llama BF16 KV 0.7801, FP8 KV 0.7885; OLMoE 0.6603 vs 0.6459, a drop of
+    // 0.0144 over the 0.01 bound but not significant (McNemar p = 0.23, 95% CI -0.008..+0.037;
+    // the checkpoint ships no K/V scales), accepted as noise (user decision 2026-09-29, "OLMoE FP8
+    // KV: accept the full-GSM8K drop as noise").
     row(
         Some("amd"),
         Some("gfx1201"),
@@ -373,7 +376,7 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         BF16,
         Some(KvFormatColumn::Fp8E4m3),
         NO_SPEC,
-        SupportStatus::Experimental,
+        SupportStatus::Supported,
     ),
     row(
         Some("amd"),
@@ -382,7 +385,7 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         BF16,
         Some(KvFormatColumn::Fp8E4m3),
         NO_SPEC,
-        SupportStatus::Experimental,
+        SupportStatus::Supported,
     ),
     // Phase 6a weight formats on gfx1201 Llama: `experimental` while each proof runs (plan
     // Tasks 14, 15, 18, 20), `supported` only after its gate.
@@ -1030,14 +1033,19 @@ mod tests {
                 }
             }
         }
-        // Nothing but the AMD BF16 baseline is supported before the tracks add rows.
+        // Nothing but the AMD BF16 baseline and the proven gfx1201 FP8 KV rows (Task 24) is
+        // supported before the tracks add rows.
         for r in SUPPORT_MATRIX
             .iter()
             .filter(|r| r.status == SupportStatus::Supported)
         {
             assert_eq!(r.key.vendor, Some("amd"), "{:?}", r.view());
             assert_eq!(r.key.weight_format, Some(W::Bf16), "{:?}", r.view());
-            assert_eq!(r.key.kv_format, Some(K::Bf16), "{:?}", r.view());
+            if r.key.kv_format == Some(K::Fp8E4m3) {
+                assert_eq!(r.key.arch, Some("gfx1201"), "{:?}", r.view());
+            } else {
+                assert_eq!(r.key.kv_format, Some(K::Bf16), "{:?}", r.view());
+            }
             assert_eq!(r.key.speculative, Some(S::None), "{:?}", r.view());
         }
         // The Phase 6a formats exist and are refused naming the track; the NVIDIA-reserved
@@ -1076,11 +1084,11 @@ mod tests {
                 "{k}: {status:?}"
             );
         }
-        // FP8 KV: experimental on gfx1201 Llama and OLMoE while its lab proof runs (Task 24),
-        // refused naming the track anywhere else.
+        // FP8 KV: supported on gfx1201 Llama and OLMoE after the Task 24 proof, refused naming
+        // the track anywhere else.
         for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
             let k = key("amd", "gfx1201", architecture, W::Bf16, K::Fp8E4m3, S::None);
-            assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
+            assert_eq!(resolve(&k).as_str(), "supported", "{k}");
         }
         let k = key(
             "amd",
