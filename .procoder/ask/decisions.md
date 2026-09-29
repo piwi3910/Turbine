@@ -1969,3 +1969,16 @@ After the user's "Find another checkpoint" answer the lead searched Hugging Face
 
 **Decision (user, 2026-09-29, relayed by the coordinator): (a).** The base-3B checkpoint's accuracy is still reported against BF16 3B base as a side result.
 
+
+## Phase 6a gate misses on GSM8K-200: FP8 KV (Llama) and MXFP4-A16 (8B) (2026-09-29)
+
+Asked 2026-09-29 by the 6a lead after the lost agents' results were collected. GSM8K-200 (chain of thought, `final_number`):
+
+- FP8 KV on Llama-3.2-3B-Instruct (Task 24): BF16 KV 0.805 (161/200), FP8 KV 0.790 (158/200); drop 0.015 > the plan's 0.01 bound. Throughput and the `kv_gpu` round trips pass.
+- MXFP4-A16 on Llama-3.1-8B-Instruct (Task 20, `FabioTrindade/…-MXFP4A16`): BF16 8B 0.89 (178/200), MXFP4 0.835 (167/200); drop 0.055 > 0.04 (BF16 baseline because vLLM-ROCm refuses the checkpoint on gfx1201).
+
+**1. FP8 KV, Llama.** Options: A) run the full GSM8K test split (1,319 items) at BF16 KV and FP8 KV with the same prompt wrapper and matcher, pass if the drop ≤ 0.01 — chosen; B) accept the 200-item result as noise; C) keep the FP8 KV row `experimental`. **Decision (user, 2026-09-29, relayed by the coordinator): A.**
+
+**2. MXFP4-A16, 8B.** Options: A) run the full GSM8K on MXFP4-A16 and BF16 8B; if the drop is still > 0.04, do not blame the format yet — first look for a Turbine numerics error by comparing Turbine with the dequantized-checkpoint reference (logits / golden positions) and report to the coordinator before any support-status change — chosen; B) accept and document the drop; C) keep the row `experimental`. **Decision (user, 2026-09-29, relayed by the coordinator): A.**
+
+Dataset: `openai/gsm8k`, config `main`, split `test`, downloaded on novanas with `hf download --repo-type dataset` at a pinned revision (token stays on the host), converted by a committed generator script into `tests/eval/gsm8k-full.jsonl` (MIT, 1,319 items, < 1 MB) with the GSM8K-200 wrapper and matcher. Full runs (~6× GSM8K-200 each) queue under the one-GPU-job rule, never in parallel.
