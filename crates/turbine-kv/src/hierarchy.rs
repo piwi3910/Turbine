@@ -980,6 +980,7 @@ impl KvHierarchy {
                 let publish = lineage == Lineage::Exact
                     && b.lineage == Lineage::Exact
                     && b.location(TierId::L0).is_none()
+                    && !b.locations.is_empty()
                     && b.locations
                         .iter()
                         .all(|l| format_is_lossy(l.format, &b.format.layout))
@@ -2481,6 +2482,42 @@ pub(crate) mod tests {
             r.pool.used_blocks(),
             0,
             "pressure empties L0 of unreferenced blocks"
+        );
+    }
+
+    /// The Task 4 kv-sim regression (MultiTurn lru 251 → 199 s, cost_aware/lru 0.78 → 0.93):
+    /// the P6b S-3 publish rule ("an exact entry whose every copy is lossy") also fired for an
+    /// entry with *no* copy — a parent kept only by its children — so with L0-format tiers a
+    /// recomputed parent was re-keyed where the Phase 4 hierarchy leaves it unkeyed. Catches
+    /// `commit_progress` adding a copy to an existing entry that holds no lossy copy.
+    #[test]
+    fn commit_leaves_a_copyless_parent_unkeyed() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let mut r = rig(8, None, None, clock);
+        let prompt: Vec<u32> = (0..66).collect();
+        run(&mut r, &prompt);
+        let hasher = Blake3Hasher(r.h.namespaces.get(""));
+        let keys = prefix_keys(&hasher, &prompt, 16);
+        // Block 0 loses its only copy; its entry stays for its child.
+        r.h.remove_copy(&mut r.pool, &keys[0], TierId::L0, EvictReason::Capacity);
+        let parent = r.h.directory().get(&keys[0]).expect("kept for its child");
+        assert!(parent.locations.is_empty());
+
+        let again = run(&mut r, &prompt);
+        assert_eq!(again.cached_tokens, 0, "the prefix misses at block 0");
+        let parent =
+            r.h.directory()
+                .get(&keys[0])
+                .expect("still kept for its child");
+        assert!(
+            parent.locations.is_empty(),
+            "the recomputed block was filed under a copyless exact entry: {:?}",
+            parent.locations
+        );
+        assert_eq!(
+            r.h.l0_keys.len(),
+            3,
+            "only the first run's blocks 1-3 are keyed"
         );
     }
 }
