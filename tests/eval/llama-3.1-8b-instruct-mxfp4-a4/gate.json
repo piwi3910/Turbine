@@ -1,0 +1,16 @@
+{
+  "baseline": "tests/eval/llama-3.1-8b-instruct-mxfp4-a4/vllm.json",
+  "candidate": "tests/eval/llama-3.1-8b-instruct-mxfp4-a4/turbine.json",
+  "max_drop": 0.04,
+  "baseline_accuracy": 0.735,
+  "candidate_accuracy": 0.54,
+  "result": "FAIL",
+  "decided": "Phase 6 spec: provisional design choices (2026-09-28), Q9: vLLM-ROCm serves the W4A4 checkpoint (unlike the A16 checkpoint, which it refuses), so the reference here is vLLM's own GSM8K-200 result (147/200 = 0.735), not the BF16 8B baseline",
+  "informational_bf16_comparison": {
+    "baseline": "tests/eval/llama-3.1-8b-instruct/turbine-bf16.json",
+    "baseline_accuracy": 0.89,
+    "candidate_accuracy": 0.54,
+    "drop": 0.35,
+    "note": "far outside the 0.04 4-bit bound against BF16 too; both comparisons fail, so this is not a reference-choice artifact"
+  }
+}
