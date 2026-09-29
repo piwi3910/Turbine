@@ -264,3 +264,33 @@ ran at c1 → re-run it at c16 after `ALLDONE` before judging Llama FP8 KV. T15/
 
 **Remaining for 6a close:** collectors per tables; Task 14 proof; T15/T18/T20/T24/T28 judgements; Task 29 exit on everything
 runnable (two-GPU items blocked on the PSU → Unfinished in the review file); merge into local main (no push); start 6b from main.
+
+## Rotation 9 lead (21:50 +04 – 00:20) — START HERE next
+
+State notes: `scratchpad/lead/r5-state.md` (lines "R9"). Check script `scratchpad/lead/r6-check.sh` (one ssh; now also
+t28aspread, t28alab, gptqfull, w4a4segv, gpu-queue listing). Builder rules: `lead/rules-r5.md` + `lead/rules-r9-add.md`.
+
+**GPU order is enforced with go-files** `/home/piwi/turbine-ci/gpu-queue/<name>.go` (lead creates, in order). Created:
+`w4a4-segv.go` (00:12, running). Next: AWQ soak (Mac-side, builder a81aff2f6d011a14c starts it after `w4a4-segv: done`) →
+`gptq-full.go` → `t28a-lab.go` → `w4a4-rerun.go` (after the rope merge; script not written yet — base it on
+`scratch/w4a4-numerics/w4a4rope.sh` with the RAW checkpoint and integration binaries; GSM8K-200 c1 vs vLLM 0.735 + bench).
+
+**Integration** `phase-6a-quantization`: merged db6ba1a (p6a-server-flakes), ff051cd (p6a-gptq-numerics) — gate ok 313/0 —,
+6c4682c (decision: slow-client timer option A), 1bbbbe7 (p6a-w4a4-numerics: engine-join exit fix; NOT yet gated on integration).
+
+**Pending merges / reviews:**
+- `p6a-yarn-t28a` (builder a6caa4f092a670c9c, gate running in its background) → merge first; then `p6a-rope-parameters`
+  (021b5f3; config.rs reviewed and ACCEPTED; its gate failures were the load class now fixed) — resolve the config.rs conflict,
+  and UN-IGNORE (or delete as duplicate) `crates/turbine-model/tests/config_rope_parameters.rs` from the W4A4 merge.
+- `p6b-stack` fast-forwarded to 5d04199 (p6b-t3 reviewed; stays off integration until 6b). `p6b-t11b` builder ab673a1a58605e9eb
+  restarted on the 78d3693 wip.
+
+**Waiting for the coordinator/user:** FP8-dynamic full GSM8K c16 Turbine 0.7703 vs vLLM 0.7832 (drop 0.0129 > 0.01, McNemar
+p=0.152) — options A accept / B numerics check / C hold sent; no flip until answered. GPTQ: full run waits for its go-file;
+limit 0.04 vs turbine-bf16-full (gate.json); vLLM refuses the checkpoint, so a miss → coordinator (lead proposed a better
+checkpoint, damp 0.01, on both engines).
+
+**Small follow-ups to hand out:** (1) join the TP worker-rank thread at exit like the engine thread (10 s bound, timeout
+event, host test; coordinator-approved); (2) remote-cargo core pinning option 1 (tests on 8-11 when bench.lock is free, 12-15
+otherwise) — must never overlap a bench that starts mid-gate; find out what `bench.gate` is for first; (3) the review file is
+not updated for rotations 8–9.
