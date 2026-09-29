@@ -44,14 +44,18 @@ directory; on `novanas` use `/dev/shm`) and is removed at the end unless `--keep
 fp8_e4m3`, Phase 6a S-13): every attention call sees K (after RoPE) and V quantize-dequantized
 per layer as a page write and read, `bf16(e4m3(x / scale) · scale)` with FP8 rounding to nearest
 even saturated to ±448, the layer's `self_attn.k_scale` / `v_scale` (or `k_proj` /
-`v_proj.output_scale`) from the checkpoint when it stores them, else 1.0. The cache keeps the
-unquantized values and every call quantizes the whole K/V again, which gives the same values as
-quantizing once (each element's result depends on that element only). A checkpoint without a
+`v_proj.output_scale`) from the checkpoint when it stores them, else 1.0. The hook is a view of
+the KV cache handed to every attention layer (`install_kv_quant`), so it holds for every family
+and attention implementation (eager and sdpa alike, and OLMoE's per-class attention in 4.57.1).
+The cache keeps the unquantized values and every call quantizes the whole K/V again, which gives
+the same values as quantizing once (each element's result depends on that element only). A checkpoint without a
 `quantization_config` (BF16) is then run as it is, without the dequantized copy (`--act-quant`
 must be `auto` or `none`). The engine gains `-kv-fp8_e4m3`.
 
 `--self-test` checks the vectorized torch quantizers used by the hooks against scalar ports of
-the Rust functions (every BF16 input, random F32 inputs, the Rust unit-test table) and exits.
+the Rust functions (every BF16 input, random F32 inputs, the Rust unit-test table), then the FP8
+KV emulation on tiny random Llama and OLMoE models (eager equals sdpa, the KV quantization is
+applied, per-layer scales reach their layer), and exits.
 
 Usage:
     uv run scripts/golden/quant_reference.py --model-dir <quantized-dir> \
@@ -317,38 +321,167 @@ def kv_scales(model_dir: Path, num_layers: int) -> list[tuple[float, float]]:
     return out
 
 
-def install_kv_quant(torch, model, scales: list[tuple[float, float]]) -> str:
-    """Wraps the model's attention function so every call sees K and V quantize-dequantized
-    with its layer's scales (in F32, back in the tensors' dtype). Returns the registered name."""
-    import importlib
+class _Fp8KvCache:
+    """A view of a transformers KV cache whose `update` hands the attention its layer's whole K
+    and V quantize-dequantized, while the cache itself keeps the unquantized values."""
 
-    from transformers import AttentionInterface
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    def __init__(self, torch, cache, scales: list[tuple[float, float]]):
+        self._torch = torch
+        self._cache = cache
+        self._scales = scales
 
-    base = model.config._attn_implementation
-    if base == "eager":
-        inner = importlib.import_module(type(model).__module__).eager_attention_forward
-    else:
-        inner = ALL_ATTENTION_FUNCTIONS[base]
-
-    def qdq(x, scale: float):
+    def _qdq(self, x, scale: float):
+        torch = self._torch
         s = torch.tensor(scale, dtype=torch.float32)
         return fp8_qdq(torch, x.to(torch.float32), s).to(x.dtype)
 
-    def attention(module, query, key, value, attention_mask, **kwargs):
-        ks, vs = scales[module.layer_idx]
-        return inner(
-            module, query, qdq(key, ks), qdq(value, vs), attention_mask, **kwargs
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        k, v = self._cache.update(key_states, value_states, layer_idx, cache_kwargs)
+        ks, vs = self._scales[layer_idx]
+        return self._qdq(k, ks), self._qdq(v, vs)
+
+    def __getattr__(self, name):
+        return getattr(self._cache, name)
+
+
+def install_kv_quant(torch, model, scales: list[tuple[float, float]]) -> str:
+    """Makes every attention layer see its K (after RoPE) and V quantize-dequantized with its
+    layer's scales (in F32, back in the tensors' dtype), whatever the attention implementation.
+
+    The hook sits on the KV cache, not on the attention function: a forward pre-hook on each
+    layer's `self_attn` hands it a `_Fp8KvCache` view of `past_key_values`, whose `update` returns
+    the whole K/V quantize-dequantized. Every family calls `past_key_values.update` right after
+    RoPE and before its attention kernel, both the families on transformers' AttentionInterface
+    (Llama) and those that still pick an attention class at construction (OLMoE in 4.57.1, which
+    never calls a registered attention function), and the model's attention implementation and
+    its mask stay untouched (a custom AttentionInterface name gets no mask at all, which left the
+    eager path non-causal). An attention call without a cache raises: run with `use_cache=True`.
+    Returns a description for the log."""
+    layers = {}
+    for name, module in model.named_modules():
+        if name.endswith(".self_attn") and hasattr(module, "layer_idx"):
+            if module.layer_idx in layers:
+                raise ValueError(f"{name}: layer {module.layer_idx} seen twice")
+            layers[module.layer_idx] = module
+    if sorted(layers) != list(range(len(scales))):
+        raise ValueError(
+            f"FP8 KV: {len(scales)} layer scale pairs, attention layers {sorted(layers)}"
         )
 
-    name = f"turbine_fp8_kv_{base}"
-    AttentionInterface.register(name, attention)
-    model.config._attn_implementation = name
-    for sub in model.modules():
-        cfg = getattr(sub, "config", None)
-        if cfg is not None and cfg is not model.config:
-            cfg._attn_implementation = name
-    return name
+    def hook(module, args, kwargs):
+        cache = kwargs.get("past_key_values")
+        if cache is None:
+            raise ValueError(
+                f"FP8 KV emulation: layer {module.layer_idx} ran without a KV cache "
+                "(call the model with use_cache=True)"
+            )
+        if not isinstance(cache, _Fp8KvCache):
+            kwargs = dict(kwargs, past_key_values=_Fp8KvCache(torch, cache, scales))
+        return args, kwargs
+
+    for module in layers.values():
+        module.register_forward_pre_hook(hook, with_kwargs=True)
+    return (
+        f"fp8_kv_cache_view on {len(layers)} attention layers "
+        f"({model.config._attn_implementation} attention)"
+    )
+
+
+def kv_self_test() -> None:
+    """install_kv_quant on tiny random Llama and OLMoE models: eager and sdpa agree (F32, with
+    and without FP8 KV, prefill + incremental decode and one full forward), the FP8 KV changes
+    the output, each layer uses its own scales, and a call without a cache is refused."""
+    import copy
+
+    import torch
+    from transformers import (
+        LlamaConfig,
+        LlamaForCausalLM,
+        OlmoeConfig,
+        OlmoeForCausalLM,
+    )
+
+    torch.manual_seed(24)
+    common = {
+        "vocab_size": 97,
+        "hidden_size": 64,
+        "intermediate_size": 96,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 64,
+        "initializer_range": 0.2,
+        "tie_word_embeddings": False,
+    }
+    families = {
+        "llama": (LlamaForCausalLM, LlamaConfig(**common)),
+        "olmoe": (
+            OlmoeForCausalLM,
+            OlmoeConfig(**common, num_experts=4, num_experts_per_tok=2),
+        ),
+    }
+    ids = torch.randint(0, 97, (1, 12))
+    prompt, rest = ids[:, :7], ids[0, 7:]
+    scales = [(0.011, 0.007), (0.023, 0.005)]
+
+    def run(model, mode):
+        with torch.inference_mode():
+            if mode == "full":
+                return model.model(input_ids=ids, use_cache=True).last_hidden_state[0]
+            out = model.model(input_ids=prompt, use_cache=True)
+            rows = [out.last_hidden_state[0]]
+            for tok in rest:
+                out = model.model(
+                    input_ids=tok.view(1, 1),
+                    past_key_values=out.past_key_values,
+                    use_cache=True,
+                )
+                rows.append(out.last_hidden_state[0])
+            return torch.cat(rows)
+
+    for fam, (cls, cfg) in families.items():
+        state = cls(cfg).state_dict()
+        outs = {}
+        for attn in ("sdpa", "eager"):
+            for kv in (None, scales, [scales[0], (0.5, 0.5)]):
+                c = copy.deepcopy(cfg)
+                c._attn_implementation = attn
+                model = cls(c)
+                model.load_state_dict(state)
+                model.eval()
+                assert model.config._attn_implementation == attn, (fam, attn)
+                tag = "none" if kv is None else ("fp8" if kv is scales else "fp8-l1")
+                if kv is not None:
+                    install_kv_quant(torch, model, kv)
+                for mode in ("incremental", "full"):
+                    outs[(attn, tag, mode)] = run(model, mode)
+                if kv is scales:
+                    try:
+                        with torch.inference_mode():
+                            model.model(input_ids=prompt, use_cache=False)
+                    except ValueError:
+                        pass
+                    else:
+                        raise AssertionError(f"{fam}: a call without a cache ran")
+        for tag in ("none", "fp8", "fp8-l1"):
+            for mode in ("incremental", "full"):
+                d = (outs[("sdpa", tag, mode)] - outs[("eager", tag, mode)]).abs().max()
+                assert d < 1e-4, f"{fam} {tag} {mode}: eager vs sdpa differ by {d}"
+            d = (outs[("sdpa", tag, "incremental")] - outs[("sdpa", tag, "full")]).abs()
+            assert d.max() < 1e-4, (
+                f"{fam} {tag}: incremental vs full differ by {d.max()}"
+            )
+        for mode in ("incremental", "full"):
+            d = (outs[("sdpa", "fp8", mode)] - outs[("sdpa", "none", mode)]).abs().max()
+            assert d > 1e-3, f"{fam} {mode}: FP8 KV changed the output by only {d}"
+            # Each layer takes its own pair: changing only layer 1's changes the output.
+            d = (
+                (outs[("sdpa", "fp8-l1", mode)] - outs[("sdpa", "fp8", mode)])
+                .abs()
+                .max()
+            )
+            assert d > 1e-3, f"{fam} {mode}: layer 1's scales changed nothing ({d})"
+        print(f"quant_reference.py: kv self-test ok ({fam})", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -558,6 +691,7 @@ def self_test() -> None:
             f"{mode} rows differ"
         )
     print(f"quant_reference.py: self-test ok ({len(xs)} inputs)", file=sys.stderr)
+    kv_self_test()
 
 
 # ---------------------------------------------------------------------------------------------

@@ -786,9 +786,14 @@ mod phase8_eval {
     struct EvalTempDir(PathBuf);
 
     impl EvalTempDir {
+        /// Unique per call, not just per process: several `#[tokio::test]` functions in this
+        /// module run concurrently in the same process, and each needs its own tasks.jsonl.
         fn new() -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("turbine-golden-eval-{}", std::process::id()));
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, Ordering::SeqCst);
+            let dir = std::env::temp_dir()
+                .join(format!("turbine-golden-eval-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             EvalTempDir(dir)
@@ -981,6 +986,188 @@ mod phase8_eval {
         );
         assert!(out.stdout.is_empty());
     }
+
+    /// Counts requests in flight (and the peak) for the concurrency mock below.
+    struct ConcurrencyState {
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    /// `total` completion tasks `q0..q<total-1>`; task `i` answers after `(total - i) * 30 ms`,
+    /// so the *last* task in file order finishes *first* — replies arrive out of order.
+    async fn spawn_eval_concurrency_mock(total: u64) -> (String, std::sync::Arc<ConcurrencyState>) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let state = Arc::new(ConcurrencyState {
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        });
+        let returned_state = Arc::clone(&state);
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"object": "list", "data": [{"id": "mock-model"}]})) }),
+            )
+            .route(
+                "/v1/completions",
+                post(move |Json(body): Json<Value>| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        let prompt = body["prompt"].as_str().unwrap_or_default().to_string();
+                        let i: u64 = prompt.trim_start_matches('q').parse().unwrap_or(0);
+                        let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        state.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis((total - i) * 30))
+                            .await;
+                        state.in_flight.fetch_sub(1, Ordering::SeqCst);
+                        let text = eval_mock_reply(&prompt).expect("no fail prompt in this mock");
+                        Json(json!({"choices": [{"index": 0, "text": text}]}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), returned_state)
+    }
+
+    fn write_completion_tasks(path: &Path, total: u64) {
+        let mut lines = String::new();
+        for i in 0..total {
+            let task = json!({"id": format!("t{i}"), "prompt": format!("q{i}"),
+                "answer": eval_mock_answer(i).to_string(), "match": "number", "max_tokens": 16});
+            lines.push_str(&task.to_string());
+            lines.push('\n');
+        }
+        std::fs::write(path, lines).unwrap();
+    }
+
+    /// `--concurrency 3` against a mock that answers later tasks first: results still come back
+    /// in task-file order, and at most 3 requests are ever in flight at once. This is the test
+    /// the mutation check breaks: swap `buffer_unordered` + the index-based reorder for a plain
+    /// `buffer_unordered` with no reordering and the id-order assertion below fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eval_concurrency_keeps_item_order_and_bounds_in_flight() {
+        const TOTAL: u64 = 6;
+        let (base, state) = spawn_eval_concurrency_mock(TOTAL).await;
+        let dir = EvalTempDir::new();
+        let tasks = dir.path().join("tasks.jsonl");
+        write_completion_tasks(&tasks, TOTAL);
+
+        let out = tokio::task::spawn_blocking({
+            let tasks = tasks.clone();
+            move || {
+                eval_golden_cmd()
+                    .args([
+                        "eval",
+                        "--url",
+                        &base,
+                        "--output",
+                        "json",
+                        "--concurrency",
+                        "3",
+                        "--tasks",
+                    ])
+                    .arg(&tasks)
+                    .output()
+                    .unwrap()
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["concurrency"], 3, "{report}");
+        assert_eq!(report["accuracy"], json!(1.0), "{report}");
+        let ids: Vec<&str> = report["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        let expected: Vec<String> = (0..TOTAL).map(|i| format!("t{i}")).collect();
+        assert_eq!(
+            ids,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "results must stay in task-file order even though later tasks answered first"
+        );
+
+        let peak = state
+            .max_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (2..=3).contains(&peak),
+            "--concurrency 3 put {peak} requests in flight at once"
+        );
+    }
+
+    /// An older report with no `concurrency` field reads as concurrency 1.
+    #[test]
+    fn eval_report_without_concurrency_field_reads_as_one() {
+        use turbine_bench::golden::eval::EvalReport;
+        let json = r#"{"model":"m","tasks_file":"t.jsonl","total":1,"correct":1,"accuracy":1.0,
+            "results":[{"id":"t0","correct":true,"output":"1"}]}"#;
+        let report: EvalReport = serde_json::from_str(json).unwrap();
+        assert_eq!(report.concurrency, 1);
+    }
+
+    /// `eval-compare` refuses a pair measured at different concurrencies, naming both values,
+    /// and exits 2 without printing a verdict.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eval_compare_refuses_mismatched_concurrency() {
+        let base = spawn_eval_mock().await;
+        let dir = EvalTempDir::new();
+        let tasks = dir.path().join("tasks.jsonl");
+        write_eval_tasks(&tasks, None);
+
+        let baseline = dir.path().join("baseline.json");
+        tokio::task::spawn_blocking({
+            let (base, tasks, baseline) = (base.clone(), tasks.clone(), baseline.clone());
+            move || {
+                let out = eval_golden_cmd()
+                    .args(["eval", "--url", &base, "--output", "json", "--tasks"])
+                    .arg(&tasks)
+                    .output()
+                    .unwrap();
+                std::fs::write(&baseline, &out.stdout).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        // A candidate report identical to the baseline but measured at concurrency 16.
+        let mut candidate: Value =
+            serde_json::from_slice(&std::fs::read(&baseline).unwrap()).unwrap();
+        candidate["concurrency"] = json!(16);
+        let candidate_path = dir.path().join("candidate.json");
+        std::fs::write(&candidate_path, candidate.to_string()).unwrap();
+
+        let out = tokio::task::spawn_blocking(move || {
+            eval_golden_cmd()
+                .args(["eval-compare", "--baseline"])
+                .arg(&baseline)
+                .arg("--candidate")
+                .arg(&candidate_path)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains('1') && stderr.contains("16"), "{stderr}");
+        assert!(
+            out.stdout.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
 }
 
 /// Phase 8 (S-4): the committed GSM8K-200 task set every lossy-format gate runs, and
@@ -1060,6 +1247,39 @@ mod phase8_eval_task_set {
             "gsm8k-full.jsonl's first 200 items are byte-identical to gsm8k-200.jsonl"
         );
     }
+
+    /// The completion-form counterpart of gsm8k-200.jsonl (Phase 6a: base checkpoints have no
+    /// chat template): same shape, every task a `prompt` (never `messages`) with a `stop`
+    /// sequence so a base model does not run on past its answer, and its 200 answers equal
+    /// gsm8k-200.jsonl's in order (both wrap the same 200 GSM8K test-split questions).
+    #[test]
+    fn eval_task_set_completion_valid_and_matches_200_answers() {
+        use turbine_bench::golden::eval::load_tasks;
+
+        let root = eval_root();
+        let completion_path = root.join("gsm8k-200-completion.jsonl");
+        check_task_set(&completion_path, 200);
+
+        let completion_tasks = load_tasks(&completion_path).unwrap();
+        for t in &completion_tasks {
+            assert!(t.prompt.is_some(), "{}: completion form uses prompt", t.id);
+            assert!(t.messages.is_none(), "{}: never messages", t.id);
+            assert!(
+                t.stop.as_ref().is_some_and(|s| !s.is_empty()),
+                "{}: needs a stop sequence (no chat template to end the turn)",
+                t.id
+            );
+        }
+
+        let chat_tasks = load_tasks(&root.join("gsm8k-200.jsonl")).unwrap();
+        let chat_answers: Vec<&str> = chat_tasks.iter().map(|t| t.answer.as_str()).collect();
+        let completion_answers: Vec<&str> =
+            completion_tasks.iter().map(|t| t.answer.as_str()).collect();
+        assert_eq!(
+            completion_answers, chat_answers,
+            "same 200 questions in the same order, so the same answers"
+        );
+    }
 }
 
 /// Phase 6a (S-11): the golden fixture of every quantized proof checkpoint (and the 8B BF16
@@ -1118,9 +1338,9 @@ mod quant_fixtures {
             "hf_reference.py",
         ),
         (
-            "llama-3.2-3b-mxfp4-a4",
-            "matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq",
-            "91925ffda6977d097354a99718a20e035f8af80a",
+            "llama-3.1-8b-instruct-mxfp4-a4",
+            "amd/Llama-3.1-8B-Instruct-MXFP4-W4A4-MLCAL-C1000-GPTQ",
+            "00b0d018950a5466fa1fc8bc0ccf174bd38b15da",
             "quant_reference.py",
         ),
     ];

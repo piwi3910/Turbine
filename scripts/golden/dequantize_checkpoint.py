@@ -277,9 +277,21 @@ def detect(config: dict) -> Packaging:
     if method == "quark":
         gq = qc.get("global_quant_config") or {}
         w = gq.get("weight") or {}
-        if (qc.get("layer_quant_config") or {}) or (
-            qc.get("layer_type_quant_config") or {}
-        ):
+        # Quark repeats its KV recipe as per-layer overrides of the K/V projections that differ
+        # from the global spec only in `output_tensors`; Turbine ignores them (d1de280, the KV
+        # stays at kv.dtype), so they are ignored here too. Any other override is refused.
+        kv = qc.get("kv_cache_quant_config") or {}
+        overrides = {
+            pat: spec
+            for pat, spec in (qc.get("layer_quant_config") or {}).items()
+            if not (
+                kv.get(pat) == spec
+                and spec.get("weight") == gq.get("weight")
+                and spec.get("input_tensors") == gq.get("input_tensors")
+                and not spec.get("bias")
+            )
+        }
+        if overrides or (qc.get("layer_type_quant_config") or {}):
             raise DequantError("quark per-layer quant configs unsupported")
         if (
             w.get("dtype") != "fp4"
@@ -684,6 +696,8 @@ def dequantize(
         for name in tensors.names():
             if name in consumed:
                 continue
+            if name.endswith((".k_proj.output_scale", ".v_proj.output_scale")):
+                continue  # Quark's static FP8 KV scales: not weights (quant_reference.py reads them)
             if name.rsplit(".", 1)[0] in prefix_set:
                 raise DequantError(f"{name}: unexpected tensor of a quantized layer")
             if name.endswith((".k_scale", ".v_scale")):

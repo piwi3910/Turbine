@@ -177,3 +177,177 @@ for detached runs before merging.
 `pgrep -af '[f]ixture-order.sh'` and `tail /home/piwi/turbine-ci/fixture-order.log`. If it is gone, the waiters it
 stopped stay in state T: restart it (`setsid nohup bash /home/piwi/turbine-ci/fixture-order.sh >>…/fixture-order.log
 2>&1 </dev/null &`), or `kill -CONT` the `flock …/fixture.lock` waiters.
+
+## Rotation 5 lead (11:45–14:20, ~250k tokens) — START HERE
+
+Integration `phase-6a-quantization` tip = this commit, clean, no push. Scratchpad =
+`/private/tmp/claude-501/-Users-pascal-Development-Turbine/7482a1b1-2407-47bb-91f2-d826e25c21af/scratchpad`; running
+notes `scratchpad/lead/r5-state.md`; builder rules `scratchpad/lead/rules-r5.md` (add to every brief); briefs `lead/brief-*.md`.
+
+**ssh:** novanas via a shared ControlMaster through dgx-spark (`~/.ssh/config`). Never `-o ControlMaster=no`, `-S none`,
+`-F /dev/null`; nothing runs on dgx-spark. Drops happen: bounded background retries. Remote start trap: `pgrep -f name`
+inside `ssh host '…'` matches its own command line — start detached jobs from a script FILE on novanas.
+
+**Gate:** ok 777 on 807aabc. On a181274 (merges of T15/T20/T28 handoffs, fixtures, yaml, golden.rs test): 776/1, only
+`server_cli sigterm_drains_then_cancels` ("bad chunk size line", 16 s) while novanas carried GSM8K + fixtures; no server
+code changed since 807aabc. That test alone passed 3/3 (8–10 s) → load flake. Full gate on 8f1bea4+ started at rotation: `scratchpad/gate-r5-final.txt` — read it first.
+a0ba309 fixed e06afc9's lab-serve `--gpus 2` dry-run break (+ test).
+
+**Merged this rotation:** a0ba309, p6a-int4 (12449c4), decision 807aabc (tolerance floor = max(spread, BF16 bounds);
+native novanas measurement OK with a BENCH-equivalent line + labbook; AWQ/fp8-block soak yes after proof), p6a-fp8-t15
+(e1b1c00), p6a-mxfp4 (f6756e4), p6a-yarn-t28 (a181274, plan amendment 72c11b6, plan check COMPLETE), p6a-fp8kv-eager.
+
+**Detached on novanas (collect with a short-lived collector when each log says done; no polling):**
+| Run | Log / done marker | Then |
+| --- | --- | --- |
+| Full GSM8K FP8 KV ×4 | `/home/piwi/turbine-ci/remote/agent-a67eec8abc8f117eb/gsm8k_full_run_r5.log`, `ALLDONE rc:` (started 12:57, holds bench.lock pass by pass; everything GPU queues behind it) | verdicts per decisions "gate misses"; OLMoE miss → numerics check vs the NEW emulated reference |
+| Fixtures pass 1 | `/home/piwi/turbine-ci/scratch/fixtures-r5/fixtures-r5.log`, `fixtures-r5: ALLDONE` | pass 2 auto (`rerun-after.sh` → `fixtures-r5b.log`) redoes the MXFP4 8B a16 reference+spread I killed at 13:14 |
+| YaRN fold spread (read 1) | `…/fixtures-r5/yarn-fold-r5.log`; out `/home/piwi/turbine-ci/remote/agent-ad603c5a7f228a0ed/yarn-fold.json` | send p16 likely/tail to coordinator |
+| YaRN p16 A/B (read 2) | `/home/piwi/turbine-ci/remote/agent-aa94fe3bfacab12b1/yarn-tf-r5.log` `yarn-tf-r5: done rc=`, table `yarn-tf-r5.out` | unf≈0.43 & cpu≈1.49 → fold is the cause; both ≈1.49 → trace op by op. Coordinator then asks the user (Q19). |
+| FP8 KV emulation regen | `/home/piwi/turbine-ci/scratch/fp8kv-eager/fp8kv_eager_regen.log` `fp8kv-eager: done rc=` (4–6 h CPU, top of fixture.queue) | new OLMoE FP8 KV reference + 8 spreads, Llama 4 eager rows; then Task 24 tolerance + lab-bench fp8kv golden16 |
+| T15 fp8-block proof | `/home/piwi/turbine-ci/remote/agent-a4baec4689b995379/t15p/t15_proof_run.log` `t15-proof: done rc=` | judge per `.procoder/handoff/p6a-fp8-t15.md` (3,607,615,488 B, no fp8_block_decoded, c16 ≥ 854.7, GSM8K drop ≤ 0.02); then fixture (rank 4) → lab-bench --golden16 --c1 → tolerance → labbook → soak → support.rs handoff |
+| T18 INT4 proof | `/home/piwi/turbine-ci/scratch/p6a-int4/t18-run/run.log` `t18_int4_run: done rc=` | judge per `p6a-int4.md`; BENCH-equivalent line, labbook (vLLM AWQ baseline), support.rs handoff, AWQ 10-min soak |
+| T20 queue4n | `/home/piwi/turbine-ci/remote/agent-a4784842b25c93376/q4n/queue4n.log` `queue4n: ALLDONE rc:` | 3× `lab-bench --label t20 --golden16 --c1` per `p6a-mxfp4.md`; A16 full-set drop > 0.04 → numerics check first. BF16 8B spread needs `out/llama-3.1-8b-instruct.reference.jsonl` (ref8b.sh) — check. |
+
+**Void:** anything judged against the old OLMoE FP8 KV reference/spread (it was bitwise BF16). GSM8K FP8 KV numbers stay valid.
+
+**Builders running:** p6b-groundwork (a06fd6f5ca4a9419f: rebase onto integration + ladder from YELLOW, host-only);
+completion-form GSM8K sonnet (a423dc6830dee7f9c, worktree agent-p6a-gsm8k-completion; waiting on its gate; propose its AGENTS.md
+line). Merge both when they report (p6b-groundwork stays a separate branch until 6b).
+
+**Remaining after collections:** Task 14 proof (FP8 tensor/dynamic: spreads in fixtures-r5 step 4), Task 21 two-GPU leg and
+Task 29 two-GPU tier (blocked on the PSU), Task 29 exit, review file refresh (not yet updated with rotation 5), merge into local main.
+
+## Rotation 6 lead updates (14:05–) — read with the rotation 5 table above
+
+- Merged: f62fc8a (completion-form GSM8K-200 + AGENTS.md line), ae7fcca (flaky tests `sigterm_drains_then_cancels`,
+  `disconnect_releases_kv` robust under load), 090e09c (`turbine-golden eval --concurrency`, report records it, eval-compare
+  refuses mixed pairs). 6b docs: bb1aad9 (YELLOW depth = compress only until GREEN; spec S-6, plan T14/T15), review f1c8668.
+  p6b-groundwork tip 187c0dc (YELLOW depth policy side; stays separate until 6b; `kv.ladder.*` keys land with 6b Task 2).
+- Evals at c16 (lead call, review file): the full-GSM8K driver's and queue4n's `turbine-golden` are now a wrapper adding
+  `--concurrency 16` to `eval` (`/home/piwi/turbine-ci/scratch/eval-c16/wrapper.sh`; originals `*.c1`). Llama BF16 full ran at c1 →
+  re-run it at c16 after `ALLDONE` before judging Llama FP8 KV (the script's own compare exits 2 on the mix). T15/T18 stay c1.
+- Task 14 builder (branch p6a-fp8-t14, brief scratchpad/lead/brief-t14.md): fixtures + FP8-tensor spread (detached, fixture.lock)
+  + GPU proof driver (detached, lock chain). Its handoff `.procoder/handoff/p6a-fp8-t14.md` names the done markers.
+- Crash policy: decisions "Keep going through crashes (2026-09-29)". Coordinator heartbeat runs r6-check.sh at :17/:47.
+
+## Rotation 6 → 7 handoff (≈15:50) — START HERE next
+
+State notes: `scratchpad/lead/r5-state.md` (lines starting "R6"). Check script: `ssh novanas 'bash -s' < scratchpad/lead/r6-check.sh`
+(one ssh; covers the rotation 5 table + T14). Coordinator heartbeat runs it at :17/:47 and wakes the lead.
+
+**Disk (correction 2026-09-29):** novanas kubelet eviction thresholds were lowered to 5 % this morning (configz confirmed):
+pods evict at ≈ 45 GB free, not ≈ 134 GB. Lead cleanup trigger stays ≈ 100 GB free (was written as 150 in rotation 5).
+Own cleanup allowed: remote `target/` of a removed worktree of ours (`/home/piwi/turbine-ci/remote/agent-<id>/target`).
+
+**Integration `phase-6a-quantization`** tip = this commit (after 8ae7124). Merged in rotation 6: f62fc8a, ae7fcca, 090e09c, f51cc7b
+(Task 14 fixtures + drivers). Review file has the lead calls (eval c16, FP8-dynamic weak tail, p05 near-tie, YELLOW-depth reading).
+
+**Detached on novanas, in addition to the rotation 5 table:**
+| Run | Done marker | Then |
+| --- | --- | --- |
+| T14 GPU proof `scratch/p6a-fp8-t14/t14_proof_run.sh` | `t14_proof_run: done rc=` (log in that dir) | judge per `.procoder/handoff/p6a-fp8-t14.md`; p05 excuse only for the exact 9478@23 miss; then labbook, 10-min soak fp8-dynamic, support.rs row flip |
+| T14 per-tensor spread `t14_spread.sh` (2nd in fixture.queue) | `t14-spread: done rc=` | tensor `tolerance.json` (same derivation), check `reference-diff.txt`, re-judge saved `capture.jsonl` |
+Evals at c16: full-GSM8K driver and queue4n call a wrapper (`/home/piwi/turbine-ci/scratch/eval-c16/wrapper.sh`). Llama BF16 full
+ran at c1 → re-run it at c16 after `ALLDONE` before judging Llama FP8 KV. T15/T18 stay c1 (their baselines are c1).
+
+**6b host-only stack (not merged into 6a; rebase onto main after 6a merges, order groundwork → t2 → tq-attn → t3 / t11b):**
+- `p6b-groundwork` 187c0dc; `p6b-t2` 40fe8d6 (Task 2 + Task 1 support remainder; registry-driven tier formats, lossy_penalty map);
+  `p6b-tq-attn` b1606a9 (cpu::tq_attention, pool page classes); `p6b-stack` df47c83 = t2 + tq-attn (gate --base 187c0dc running →
+  `scratchpad/gate-p6b-stack.txt`; check it).
+- Builders running: Task 3 on `p6b-t3` (worktree agent-ab443ff21c9b66ddd, brief lead/brief-p6b-t3.md); Task 11 remainder (cpu
+  backend TurboQuant L0) on `p6b-t11b` (worktree agent-p6b-tq-attn, brief lead/brief-p6b-t11b.md). Review their handoff(<file>)
+  commits (ops, decoder, core are lead-owned). Next: Task 4 (after t3), Task 15 ladder tick + `ladder_under_pinned_pressure`
+  (after t3; must fill `demand`, assert stop at GREEN / no tq2 drift), wire `LadderLimits.low_water` from config there.
+- Lead calls this rotation: block_formats byte = absolute code (bf16 0, fp8 1, tq4 2, tq2 3; "l0" mapped at the boundary);
+  6b plan notes 8ae7124 (progressive gating; fp8 tier experimental at Task 5).
+
+**Remaining for 6a close:** collectors per tables; Task 14 proof; T15/T18/T20/T24/T28 judgements; Task 29 exit on everything
+runnable (two-GPU items blocked on the PSU → Unfinished in the review file); merge into local main (no push); start 6b from main.
+
+## Rotation 9 lead (21:50 +04 – 00:20) — START HERE next
+
+State notes: `scratchpad/lead/r5-state.md` (lines "R9"). Check script `scratchpad/lead/r6-check.sh` (one ssh; now also
+t28aspread, t28alab, gptqfull, w4a4segv, gpu-queue listing). Builder rules: `lead/rules-r5.md` + `lead/rules-r9-add.md`.
+
+**GPU order is enforced with go-files** `/home/piwi/turbine-ci/gpu-queue/<name>.go` (lead creates, in order). Created:
+`w4a4-segv.go` (00:12, running). Next: AWQ soak (Mac-side, builder a81aff2f6d011a14c starts it after `w4a4-segv: done`) →
+`gptq-full.go` → `t28a-lab.go` → `w4a4-rerun.go` (after the rope merge; script not written yet — base it on
+`scratch/w4a4-numerics/w4a4rope.sh` with the RAW checkpoint and integration binaries; GSM8K-200 c1 vs vLLM 0.735 + bench).
+
+**Integration** `phase-6a-quantization`: merged db6ba1a (p6a-server-flakes), ff051cd (p6a-gptq-numerics) — gate ok 313/0 —,
+6c4682c (decision: slow-client timer option A), 1bbbbe7 (p6a-w4a4-numerics: engine-join exit fix; gate ok 314/0 --base ff051cd).
+
+**Pending merges / reviews:**
+- `p6a-yarn-t28a` (builder a6caa4f092a670c9c, gate running in its background) → merge first; then `p6a-rope-parameters`
+  (021b5f3; config.rs reviewed and ACCEPTED; its gate failures were the load class now fixed) — resolve the config.rs conflict,
+  and UN-IGNORE (or delete as duplicate) `crates/turbine-model/tests/config_rope_parameters.rs` from the W4A4 merge.
+- `p6b-stack` fast-forwarded to 5d04199 (p6b-t3 reviewed; stays off integration until 6b). `p6b-t11b` builder ab673a1a58605e9eb
+  restarted on the 78d3693 wip.
+
+**Answered:** FP8-dynamic full GSM8K drop accepted (A, aa66d8c). GPTQ: full run waits for its go-file;
+limit 0.04 vs turbine-bf16-full (gate.json); vLLM refuses the checkpoint, so a miss → coordinator (lead proposed a better
+checkpoint, damp 0.01, on both engines).
+
+**FP8 row flip (user decision A, aa66d8c) — NOT done yet, one catch:** the support matrix has a single `fp8` weight column
+(`WeightFormatColumn::Fp8`, per-tensor OR per-channel/dynamic), so flipping `gfx1201_quant_row(Fp8)` to `supported` also
+covers FP8 per-tensor checkpoints, whose golden is still unjudged (T14 per-tensor spread done → set its tolerance.json,
+re-judge the saved `capture.jsonl`, per `.procoder/handoff/p6a-fp8-t14.md`). Plan: judge the per-tensor golden first (small
+collector, sonnet), then flip the Fp8 row in support.rs (replace `gfx1201_quant_row(Fp8)` with an explicit `Supported` row + a
+comment citing both decisions; update any support test that expects fp8 experimental), gate, commit. If per-tensor fails,
+ask the coordinator (split the column, or keep fp8 experimental). Coordinator told of the catch at 00:25.
+
+**Small follow-ups to hand out:** (1) join the TP worker-rank thread at exit like the engine thread (10 s bound, timeout
+event, host test; coordinator-approved); (2) remote-cargo core pinning option 1 (tests on 8-11 when bench.lock is free, 12-15
+otherwise) — must never overlap a bench that starts mid-gate; find out what `bench.gate` is for first; (3) the review file is
+not updated for rotations 8–9.
+
+## Rotation 10 lead (23:45 +04 – 01:15) — START HERE next
+
+State notes: `scratchpad/lead/r5-state.md` (lines "R10"). Check script `scratchpad/lead/r6-check.sh` (add: `tail -3
+scratchpad/fp8-soak/wait_and_soak.log` on the Mac). Builder rules: `lead/rules-r5.md` + `lead/rules-r9-add.md`.
+
+**Done this rotation (integration `phase-6a-quantization`):** 5803de9 fp8 weights `supported` on gfx1201 Llama (FP8-dynamic
+decision A aa66d8c; per-tensor golden judged from the saved T14 runs against its new self-spread tolerance likely 1.36 /
+tail 2.99 → 16/16 c1 and c16; `tests/golden/llama-3.2-3b-instruct-fp8/{tolerance.json,README.md}`), gate ok 788/0.
+5319ecc handoff note. 3137c14 merge p6a-int4 (awq_int4 `supported` after the AWQ 10-min soak PASS; support.rs conflict
+resolved: fp8 + awq_int4 rows, `baseline_rows_present` admits exactly those two non-BF16 rows), gate ok 788/0.
+a5e77bc + 06a880f decisions: GPTQ full GSM8K 0.7369 vs 0.7801 (drop 0.0432 > 0.04; McNemar p = 3.7e-5; overshoot p ≈
+0.38) → user B, then C-then-A (see below). Integration gate on 1bbbbe7 was ok 314/0. W4A4 segv repro: new build 8/8
+rc=0 stopped=1 (old build 0/8 segv too — the repro never reproduced the crash; the join fix stands on the host test).
+
+**6b (`p6b-stack`, worktree agent-p6b-t2):** fast-forwarded to 45d2e2c (p6b-t11b: TurboQuant L0 on cpu, gate --full 808/0),
+then e58f715 (contract §26 TQ names, `docs/extending/kv-format.md` TQ-in-L0 section, plan: block-table `(BlockId, format)`
+and class-page addressing moved from Task 11 to Task 17; `docs_extending` ok). Test-bound question accepted (seed mutation
+must fail it).
+
+**Running builders:** T28a a6caa4f092a670c9c (gate, then GPU proof on t28a-lab.go); 6b Task 4 adeb53d9bf3bd41d9 (branch
+p6b-t4, worktree agent-p6b-t4, gate running); 6b Task 15 a1246e2a457fb8c0b (branch p6b-t15, worktree agent-p6b-t15). Both 6b
+builders are from e58f715 and share hierarchy.rs (briefs split the areas) — merge t4 then t15 into p6b-stack, expect a
+hierarchy.rs conflict. Briefs `lead/brief-p6b-t4.md`, `lead/brief-p6b-t15.md`.
+
+**GPU queue now:** fp8 10-min soak RUNNING (Mac-side detached waiter pid 30476, `scratchpad/fp8-soak/wait_and_soak.sh`, log
+`wait_and_soak.log`, snapshot worktree `.claude/worktrees/lead-soak-fp8` @3137c14, model fp8-dynamic). It touches
+`t28a-lab.go` itself when the soak ends, then logs `fp8-soak: done rc=<rc>`. Judge `verdict.json` in the newest
+`target/soak/novanas-*` of the snapshot worktree; FAIL → revert the fp8 row to `experimental` (coordinator), gate, report.
+Then remove the snapshot worktree. Then: t28a-lab.go (auto) → w4a4-rerun.go (after the rope merge; script not written:
+base it on `scratch/w4a4-numerics/w4a4rope.sh`, RAW checkpoint, integration binaries, GSM8K-200 c1 vs vLLM 0.735 + bench)
+→ fp8_block jobs (golden fixture, golden16, own 10-min soak; the ef09f16 flip waits for them) → GPTQ runs below.
+Old go-files `gptq-full.go`, `w4a4-segv.go` are spent (may be removed).
+
+**GPTQ (user decision C then A, 06a880f), not started — needs a builder (opus for the quantization):**
+1. C, early data point only (label it AutoRound; does not decide the row): `kaitchup/Llama-3.2-3B-Instruct-AutoRoundGPTQ-4bit`
+   @ `e11f15d2291d8c343a4de84d6bb16ebf7c871dfc` → `hf download … --revision <sha> --local-dir /home/piwi/turbine-models/
+   llama-3.2-3b-instruct-autoround-gptq` on novanas (token stays there); full GSM8K c16 with the gptq-full driver
+   (`/home/piwi/turbine-ci/remote/agent-p6a-gptq-numerics/gptq-full/`, a go-file of its own); may run earlier if a slot fits.
+2. A: llm-compressor GPTQ W4A16 sym g128 damp 0.01 no act-order, ≈ 512 calibration samples, from
+   `/home/piwi/turbine-models/llama-3.2-3b-instruct`; Python (uv) at fixture time on novanas; calibration is its own queued
+   GPU job; output compressed-tensors pack-quantized (Turbine `ct_pack_int4` → `gptq_int4` row). Full GSM8K c16 on Turbine
+   and on vLLM-ROCm if it loads; re-judge against 0.04 vs `tests/eval/llama-3.2-3b-instruct/turbine-bf16-full.json`
+   (paired McNemar + CI as in the decision). gptq_int4 stays `experimental` until then. The first full run's output is in
+   `scratchpad/gptq-full/`.
+
+**Small follow-ups (no slot yet):** TP worker-rank thread join at exit (10 s bound, timeout event, host test); remote-cargo
+core pinning option 1; AGENTS.md prose "Phase 6 quantized formats unsupported on amd" is stale (fix at 6a close or next
+AGENTS touch); review file not updated for rotations 8–10. Merge order unchanged: T28a, then p6a-rope-parameters (un-ignore
+`crates/turbine-model/tests/config_rope_parameters.rs`), then the formal W4A4 rerun (mxfp4_a4 experimental until then).

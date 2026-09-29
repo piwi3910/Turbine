@@ -162,6 +162,11 @@ typedef struct turbine_rope_desc {
   /* 0 = half-split (HF rotate_half) */
   int32_t style;
   int32_t dtype;
+  /* v2.10 (read only by a library reporting minor >= 10): YaRN's attention
+   * factor. cos and sin are multiplied by it in F32 before they are rounded to
+   * dtype, so the rotated q and k carry it (transformers' placement); 1.0 =
+   * none. A caller never passes another value to a library below minor 10. */
+  float attn_factor;
 } turbine_rope_desc;
 
 /* out = silu(gate) * up */
@@ -400,8 +405,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * stream handle and the sharded RMSNorm ops; v2.7 host-mapped memory and the
  * one-shot collectives over it; v2.8 the device-sequenced (graph-capturable)
  * mapped collective step; v2.9 the quantized GEMM, activation quantization
- * and FP8 KV scales (all below). */
-#define TURBINE_ABI_MINOR 9u
+ * and FP8 KV scales (all below); v2.10 turbine_rope_desc.attn_factor (above,
+ * no new symbol). */
+#define TURBINE_ABI_MINOR 10u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return

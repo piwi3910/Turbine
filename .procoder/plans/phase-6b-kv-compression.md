@@ -66,6 +66,7 @@ Interfaces:
 - [ ] Implement.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-core`; `scripts/remote-cargo.sh run -p turbine-server -- --config examples/turbine.yaml --check-config --set kv.dtype=fp8_e4m3 --set kv.cpu.format=fp8_e4m3` — expect `config ok`; `--set kv.dtype=int8` — expect exit 2 naming `kv.dtype`
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- Note (lead, 2026-09-29): tier format names are registry-driven strings validated at startup against `kv_format` (ordering from codec metadata), not a core enum. Progressive gating: the S-9 `--check-config` criterion with a `tq4` / `tq2` tier exits 2 until those rows turn `experimental` (Task 9) — it is a phase-end criterion; a lossy tier or `kv.ladder.enabled` exits 1 (`kv_transcode_unavailable` / `kv_tq_unavailable`) until Tasks 5 and 12 land.
 - [ ] Commit: `feat(core): per-tier KV format and lossy-reuse configuration`
 
 ## Task 3: Per-tier demotion and promotion through codecs (host path)
@@ -105,7 +106,7 @@ Files: `kernels/include/turbine_kernels.h` (v2.10 group), `crates/turbine-kernel
 Interfaces:
 
 - C and Rust shapes as the spec's Interfaces; one staging buffer of `DEMOTION_INFLIGHT` × the largest encoded block per shard, allocated at startup when a lower-tier format is not `l0`
-  Covers: spec S-1 (GPU); AC `optional_groups_v210`, `kv_transcode_matches_cpu` (FP8)
+  Covers: spec S-1 (GPU); AC `optional_groups_v210`, `kv_transcode_matches_cpu` (FP8); when it lands, `fp8_e4m3` as a lower-tier format gets an `experimental` entry in `TIER_FORMAT_REFUSALS` (startup stops refusing it with `kv_transcode_unavailable`), `supported` after Task 6
   Depends on: Task 4
 
 - [ ] Evaluate transcode providers (short: CK `elementwise` / `batched_transpose` building blocks vs own) and write the entry.
@@ -240,7 +241,7 @@ Interfaces:
 Files: `crates/turbine-kv/src/policy/mod.rs` (`EvictAction`, `LadderContext`, default `action`), `crates/turbine-kv/src/policy/cost_aware.rs` (ladder rule), `crates/turbine-kv/src/policy/lru.rs` (default), `crates/turbine-kv/src/metrics.rs` (`EvictReason::{Compressed, LadderFloor}`), `docs/extending/eviction-policy.md` (action, ladder, pitfalls)
 Interfaces:
 
-- as the spec's Interfaces; rung order from `kv.ladder.max_format` and the codec registry's lossiness order (`l0` < `fp8_e4m3` < `tq4` < `tq2`); compression starts at YELLOW even when no tier is full (user decision 2026-09-29, "Start at YELLOW earlier"): the `p6b-groundwork` rule "a tier acts only when it is the lowest and about to drop, or above high water" becomes "at YELLOW or above the lowest enabled tier acts; at any non-GREEN state a tier about to drop or above high water acts", with `ladder_actions` updated (a YELLOW case with free room compresses one rung)
+- as the spec's Interfaces; rung order from `kv.ladder.max_format` and the codec registry's lossiness order (`l0` < `fp8_e4m3` < `tq4` < `tq2`); compression starts at YELLOW even when no tier is full (user decision 2026-09-29, "Start at YELLOW earlier"): the `p6b-groundwork` rule "a tier acts only when it is the lowest and about to drop, or above high water" becomes "at YELLOW or above the lowest enabled tier acts; at any non-GREEN state a tier about to drop or above high water acts", with `ladder_actions` updated (a YELLOW case with free room compresses one rung); YELLOW depth (user decision 2026-09-29, "Compress only until GREEN"): at YELLOW, with `must_leave` false and the tier not above high water, the lowest tier compresses only while `ctx.fill + ctx.demand > low_water` (`LadderLimits.low_water`, `LadderContext.demand`), so `ladder_actions` also has: YELLOW with `fill + demand ≤ low_water` keeps; YELLOW with demand pushing it over low water compresses; GREEN after YELLOW keeps; ORANGE with room still compresses (as built); a repeated sweep at steady YELLOW with room never reaches `tq2`
   Covers: spec S-6 (policy); AC `policy::tests::ladder_actions`
   Depends on: Task 9
 
@@ -256,13 +257,14 @@ Files: `crates/turbine-kv/src/hierarchy.rs` (rung state per tier, hysteresis, bo
 Interfaces:
 
 - `HierarchyConfig.ladder: Option<LadderConfig { max_format, high_water, low_water, dwell }>`; `KvHierarchy::ladder_tick(&mut self, pool, pressure: PressureLevel, now)`; log event `kv_ladder`
+- YELLOW depth: `ladder_tick` fills `LadderContext.demand` from the bytes the YELLOW reclaim (`apply_reclaim` `DemoteIdle`, target the `kv_utilization` YELLOW threshold) would demote into the tier, refreshes `fill` after every rewrite and stops the tick once the policy keeps; the ≤ 32 rewrites per tick, ≥ 50 ms spacing and the `deescalate_dwell` hysteresis are unchanged. The committed trace holds a long steady-YELLOW stretch with room, and the expected sequence pins no rung change in it and none in the tick after GREEN returns
   Covers: spec S-6; AC `ladder_under_pinned_pressure`, `kv_metrics_bounded` (ladder families)
   Depends on: Task 14
 
 - [ ] Write failing test `kv_sim ladder_under_pinned_pressure` with the committed trace and expected rung sequence. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim ladder` — expect FAIL
 - [ ] Implement.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-server -p turbine-api` — expect PASS; `overload_sim` unchanged
-- [ ] Mutation check (do not commit): remove the dwell check on stepping up — expect `ladder_under_pinned_pressure` to FAIL on the rung sequence; revert.
+- [ ] Mutation check (do not commit): remove the dwell check on stepping up — expect `ladder_under_pinned_pressure` to FAIL on the rung sequence; revert. Then drop the `low_water` stop at YELLOW — expect it to FAIL on the steady-YELLOW stretch; revert.
 - [ ] Lab: `scripts/lab-test.sh novanas --tier quick` — expect PASS
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `feat(kv): pressure-driven compression ladder in L1 and L2`

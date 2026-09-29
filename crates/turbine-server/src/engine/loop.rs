@@ -152,6 +152,10 @@ pub(crate) struct EngineParts {
     pub pipeline: Option<Arc<PipelineStats>>,
 }
 
+/// The message of the `slow_client` error event.
+const SLOW_CLIENT_MESSAGE: &str =
+    "the client did not read the stream within server.slow_client_timeout";
+
 enum Turn {
     Continue,
     Stop,
@@ -1230,13 +1234,20 @@ impl EngineLoop {
 
     /// Request deadlines and slow-client timers (P2 S-7, S-8): a live request is cancelled
     /// (the next plan frees its blocks and sends the error event); a finished one whose final
-    /// events stay unread past `server.slow_client_timeout` is dropped, which closes its stream.
+    /// events stay unread past `server.slow_client_timeout` is dropped, which closes its stream
+    /// with the `slow_client` error event in the slot reserved for it.
     fn expire_deadlines(&mut self) {
         for (id, reason) in self.deadlines.expired() {
             match self.requests.get(&id) {
                 Some(r) if r.done => {
                     if reason == CancelReason::SlowClient {
                         tracing::info!(event = "cancel", request_id = %id.0, reason = reason.as_str(), "closing a stream whose final events stay unread");
+                        if let Some(r) = self.requests.get_mut(&id) {
+                            r.close_with(ActiveRequest::error_event(
+                                ErrorCode::SlowClient,
+                                SLOW_CLIENT_MESSAGE,
+                            ));
+                        }
                         self.forget(id);
                     }
                 }
@@ -1294,10 +1305,7 @@ impl EngineLoop {
             ),
             CancelReason::SlowClient => (
                 Outcome::Cancelled,
-                Some((
-                    ErrorCode::SlowClient,
-                    "the client did not read the stream within server.slow_client_timeout",
-                )),
+                Some((ErrorCode::SlowClient, SLOW_CLIENT_MESSAGE)),
             ),
             CancelReason::Shutdown => (
                 Outcome::Cancelled,
@@ -2568,8 +2576,9 @@ fn plan_requests(
 mod tests {
     use std::time::Duration;
 
+    use tokio::sync::mpsc::error::TryRecvError;
     use tokio::sync::oneshot;
-    use turbine_core::clock::SystemClock;
+    use turbine_core::clock::{FakeClock, SystemClock};
     use turbine_core::config::{ByteSize, KvConfig, ReliabilityConfig};
     use turbine_core::request::CancelFlag;
     use turbine_core::types::{DeviceId, KvLayout, MemoryKind, ModelIdentity, ModelShape};
@@ -4014,7 +4023,8 @@ mod tests {
             Arc::clone(&tokenizer),
             params(4, 64),
         );
-        // Four events: `Started` and three tokens fill the slow stream's channel.
+        // Four slots, one reserved for a closing event: `Started` and two tokens fill the slow
+        // stream's channel.
         let (mut slow, admitted) = submit_with(&t.tx, request(&[256, 1, 2], 40), 4);
         let (dropped, _dropped_admitted) = submit(&t.tx, request(&[256, 3], 100));
         let (mut fast, _fast_admitted) = submit(&t.tx, request(&[256, 4], 20));
@@ -4051,6 +4061,83 @@ mod tests {
         for line in [
             r#"turbine_requests_cancelled_total{reason="client_disconnect"} 1"#,
             r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 2"#,
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="cancelled"} 1"#,
+        ] {
+            assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+    }
+
+    /// P2 S-7 slow client, deterministic on a fake clock: a stream that stops reading pauses,
+    /// is cancelled with `slow_client` one `server.slow_client_timeout` later (its error event
+    /// held behind the full channel), and when the client still reads nothing for another
+    /// timeout the engine closes the stream. The client reading on afterwards sees what the
+    /// channel buffered, then the `slow_client` error, then the end of the stream — never the
+    /// bare close the API turns into `internal_error`. Breaks if closing a finished request
+    /// drops its terminal event (the tiny_server `slow_client_paused_then_cancelled` failure on
+    /// a loaded host) or if the cancellation is not accounted as `slow_client`.
+    #[test]
+    fn slow_client_closed_after_cancel_ends_with_slow_client() {
+        let (_dir, spec, tokenizer) = tiny();
+        let mut t = engine(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+        );
+        let clock = FakeClock::new(Duration::from_secs(100));
+        let timeout = Duration::from_secs(1);
+        t.engine.deadlines = Deadlines::new(
+            Arc::new(clock.clone()),
+            Timeouts {
+                request: Duration::from_secs(600),
+                slow_client: timeout,
+            },
+        );
+        let req = request(&[256, 1, 2], 40);
+        let id = req.id;
+        let (mut slow, admitted) = submit_with(&t.tx, req, 4);
+        let mut engine = t.engine;
+        let mut turns = 0;
+        while !engine
+            .requests
+            .get(&id)
+            .is_some_and(ActiveRequest::has_held)
+        {
+            assert!(matches!(engine.turn(), Ok(Turn::Continue)));
+            turns += 1;
+            assert!(turns < 100, "the slow request never paused");
+        }
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+
+        // One timeout paused: cancelled, its error event held behind the full channel.
+        clock.advance(timeout);
+        assert!(matches!(engine.turn(), Ok(Turn::Continue)));
+        assert!(
+            engine
+                .requests
+                .get(&id)
+                .is_some_and(|r| r.done && r.has_held())
+        );
+        // Another timeout unread: the engine lets the request go and closes the stream.
+        clock.advance(timeout);
+        assert!(matches!(engine.turn(), Ok(Turn::Continue)));
+        assert!(!engine.requests.contains_key(&id), "the stream is closed");
+
+        let events: Vec<_> = std::iter::from_fn(|| slow.try_recv().ok()).collect();
+        assert!(token_count(&events) > 0, "{events:?}");
+        assert!(
+            matches!(
+                events.last(),
+                Some(GenerationEvent::Error {
+                    code: ErrorCode::SlowClient,
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
+        assert_eq!(slow.try_recv().err(), Some(TryRecvError::Disconnected));
+        let text = t.reg.render().unwrap();
+        for line in [
+            r#"turbine_requests_cancelled_total{reason="slow_client"} 1"#,
             r#"turbine_requests_total{endpoint="/v1/completions",outcome="cancelled"} 1"#,
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");

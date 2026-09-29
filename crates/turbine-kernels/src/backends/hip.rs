@@ -58,6 +58,7 @@ impl ExecutionBackend for HipBackend {
             backend = lib.backend_name(),
             abi_version = lib.abi_version(),
             abi_minor = lib.abi_minor(),
+            rope_attn_factor = lib.rope_attn_factor(),
             enumerates_implementations = lib.enumerates_implementations(),
             build_archs = %lib.build_archs().join(","),
             device_arch = device.arch.as_deref().unwrap_or("unknown"),

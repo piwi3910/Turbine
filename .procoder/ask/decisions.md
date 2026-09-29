@@ -1568,7 +1568,7 @@ Taken under "Continue through Phases 6a and 6b unattended (2026-09-29)" (rule 2:
 7. Seeds: SplitMix64 from the namespace seed mixed with (layer, head, kind: K 0, V 1, QJL 2); Box–Muller in F64 rounded to F32; block-local head index (global head index under TP is a 6b Task 8/15 decision). **User decision 2026-09-29: accepted as recommended.**
 8. Codebooks: trapezoid integration on 2^18 points, Lloyd iteration to 1e-13, committed as symmetrised F32 constants regenerated within 1e-6 by the test (distortion 0.3609 / 0.1160 / 0.0340 / 0.00931 for 1–4 bits vs the paper's 0.36 / 0.117 / 0.03 / 0.009). **User decision 2026-09-29: accepted as recommended.**
 9. Conformance NMSE bounds: tq4 0.07, tq2 0.75 over a block (K error ≈ (π/2)·D_mse from the Gaussian QJL). **User decision 2026-09-29: accepted as recommended.**
-10. Ladder policy: no action at GREEN; a tier acts only when it is the lowest and about to drop, or above high water; one rung down from the copy's own format, capped at `max_format`; an upper tier acts only once every lower tier reached the target rung; at the floor the lowest tier evicts and an upper tier keeps or demotes; `LadderContext` gains `format`, `must_leave`, `demote_to`, `lower_rung`, `ladder` (the spec's `PressureLevel` is `PressureState`). **User decision 2026-09-29: changed — "Start at YELLOW earlier": compression begins at YELLOW pressure, before the tiers are full, still the lowest tier first and one rung at a time.**
+10. Ladder policy: no action at GREEN; a tier acts only when it is the lowest and about to drop, or above high water; one rung down from the copy's own format, capped at `max_format`; an upper tier acts only once every lower tier reached the target rung; at the floor the lowest tier evicts and an upper tier keeps or demotes; `LadderContext` gains `format`, `must_leave`, `demote_to`, `lower_rung`, `ladder` (the spec's `PressureLevel` is `PressureState`). **User decision 2026-09-29: changed — "Start at YELLOW earlier": compression begins at YELLOW pressure, before the tiers are full, still the lowest tier first and one rung at a time.** Depth at YELLOW: see "6b ladder: YELLOW depth (2026-09-29)".
 11. `EvictReason::{Compressed, LadderFloor}` exist but join the pre-registered metric label sets only with 6b Task 15 (so `api.rs check_labels` stays green). **User decision 2026-09-29: accepted as recommended.**
 
 **FP8 packagings (6a Task 8, lead):**
@@ -1971,7 +1971,6 @@ After the user's "Find another checkpoint" answer the lead searched Hugging Face
 
 Correction (6a lead, 2026-09-29, facts only; the decision stands): the checkpoint's KV recipe is `fp8_e4m3` per-tensor static K/V projection outputs (with `k_proj` / `v_proj` `output_scale` tensors), not fp4. It appears both in `kv_cache_quant_config` and as identical `layer_quant_config` entries for `*k_proj` / `*v_proj`; d1de280 ignores both, and the scale tensors load as `unexpected_tensor` WARNs.
 
-
 ## Phase 6a gate misses on GSM8K-200: FP8 KV (Llama, OLMoE) and MXFP4-A16 (8B) (2026-09-29)
 
 Asked 2026-09-29 by the 6a lead after the lost agents' results were collected. GSM8K-200 (chain of thought, `final_number`):
@@ -1985,3 +1984,163 @@ Asked 2026-09-29 by the 6a lead after the lost agents' results were collected. G
 **2. MXFP4-A16, 8B.** Options: A) run the full GSM8K on MXFP4-A16 and BF16 8B; if the drop is still > 0.04, do not blame the format yet — first look for a Turbine numerics error by comparing Turbine with the dequantized-checkpoint reference (logits / golden positions) and report to the coordinator before any support-status change — chosen; B) accept and document the drop; C) keep the row `experimental`. **Decision (user, 2026-09-29, relayed by the coordinator): A.**
 
 Dataset: `openai/gsm8k`, config `main`, split `test`, downloaded on novanas with `hf download --repo-type dataset` at a pinned revision (token stays on the host), converted by a committed generator script into `tests/eval/gsm8k-full.jsonl` (MIT, 1,319 items, < 1 MB) with the GSM8K-200 wrapper and matcher. Full runs (~6× GSM8K-200 each) queue under the one-GPU-job rule, never in parallel; Llama and OLMoE runs (BF16 KV, FP8 KV each) queue one after another, not in parallel.
+
+## Golden tolerance floor for quantized checkpoints (lead decision, test policy, 2026-09-29)
+
+Asked by the Task 18 INT4 builder: a quantized checkpoint's golden tolerance is calibrated from transformers' own spread on the dequantized checkpoint (the OLMoE method); when that spread is tighter than the BF16 model's bounds, which applies? Options: A) the calibrated spread alone; B) max(calibrated spread, the BF16 model's bounds) — chosen. **Decision (6a lead, confirmed by the coordinator, 2026-09-29): B.** The golden check compares Turbine's kernels with transformers, so the kernel noise the BF16 bounds already accept applies to a quantized checkpoint as well; a bound tighter than BF16's would fail on noise already accepted. Applies to every Phase 6a weight format (AWQ, GPTQ, FP8, fp8_block, MXFP4). Test-policy detail, not a user decision.
+
+Related (coordinator, same day): a proof may measure natively on novanas with a detached script instead of `lab-bench.sh` (ssh rules), provided its collector prints a `BENCH`-equivalent line and uploads to labbook as usual; the 10-minute soak runs on AWQ once its proof passes, under the one-GPU-job rule.
+
+## 6b ladder: YELLOW depth (2026-09-29)
+
+Context: with "Start at YELLOW earlier" as built on `p6b-groundwork` (ef5b8d5), a sustained YELLOW makes the lowest enabled tier step every block down one rung per sweep until it reaches `kv.ladder.max_format` (`tq2`), even when the tier still has room — for example when YELLOW is held by L0 utilization, which compressing L1/L2 does not relieve. The loss then grows with the duration of YELLOW, not with the pressure.
+
+- A) YELLOW caps at one rung: at YELLOW the ladder stops at `fp8_e4m3`; `tq4` / `tq2` only from ORANGE on
+- B) Compress only until GREEN: at YELLOW the lowest tier compresses just enough to get back to GREEN headroom, then stops, so the loss stays proportional to the pressure
+- C) Keep as built
+
+**Decision (user, 2026-09-29, relayed by the coordinator): B — "Compress only until GREEN".**
+
+How it is built (lead's reading, provisional until 6b Task 15 lands): at YELLOW (and neither `must_leave` nor above `kv.ladder.high_water`, where the as-built rule applies unchanged), the lowest enabled tier compresses a copy only while its GREEN headroom is short: `fill + demand > kv.ladder.low_water`, where `demand` is the bytes the pressure controller's YELLOW reclaim wants to demote into that tier this tick, as a fraction of its capacity (0 when none). The hierarchy refreshes `fill` after each rewrite, so a tick stops as soon as the headroom is back; the pressure input returning to GREEN stops it at once (no compression at GREEN, unchanged). Under a steady YELLOW with no demand and `fill ≤ low_water` nothing is compressed, so the tier does not drift to `tq2`. ORANGE and above keep the as-built rule. The 32-rewrite cap per tick, ticks ≥ 50 ms apart and the `deescalate_dwell` hysteresis on stepping a tier's rung back up are unchanged. `LadderLimits` gains `low_water`; `LadderContext` gains `demand: f64`. Spec S-6 and plan Tasks 14 and 15 changed the same day.
+
+Lead's call (same day): the as-built floor guard — at the last rung a copy is dropped only when it must leave or its tier is above high water — matches the spec's edge case ("→ evict" at the floor, the lowest tier only) and is accepted; noted in `.procoder/handoff/p6b-groundwork.md`.
+
+
+## Keep going through crashes (2026-09-29)
+
+**Decision (user, 2026-09-29 15:25, relayed by the coordinator):** "keep going; if things crash we restart it and you continue." A novanas reboot is handled without asking: the lead requeues the detached runs from its handoff table (the scripts are idempotent) and carries on, without debugging the crash. The coordinator's heartbeat (:17 and :47) checks novanas with one ssh and `scratchpad/lead/r6-check.sh`, wakes the lead when a run finishes or the host rebooted, and starts a fresh lead from the handoff if none is alive. 6a runs to its close (collectors, the Task 14 FP8 proof, the remaining proofs, the Task 29 exit on everything runnable; the two-GPU items stay blocked on the PSU and are listed unfinished), merges into local main without a push, and 6b starts from main taking `p6b-groundwork` in, under the same rotation rules. Design questions go to the coordinator; everything else is the lead's call, recorded here and in `.procoder/review-2026-09-29.md`.
+
+## YaRN attention factor: on cos/sin, not folded into the softmax scale (2026-09-29, supersedes Q19's placement)
+
+Context: the Task 28 YaRN proof (Llama-3.2-3B-Instruct, `rope_scaling` yarn factor 16) missed the golden tail bound on
+prompt p16. The teacher-forced A/B (`yarn_teacher_forced_vs_reference`, lab, `yarn-tf-r5.out`) measured max |Δ logprob|
+(likely, tail) against transformers: CPU provider with the fold (`scale × attention_factor²`, Q19 as decided) 0.190 / 1.488;
+CPU provider with transformers' placement (cos/sin × m, then BF16 rounding of q and k, softmax scale head_dim^-0.5)
+0.067 / 0.395; HIP with the fold 0.099 / 1.382. transformers' own spread on the override is ≈ 0.43 tail. The HIP tail
+tracks the CPU fold, so the kernels are not the cause; the fold's placement of the factor (after BF16 rounding of q·k
+instead of before) is.
+
+- A) Keep the fold and widen the yarn16 tail bound to ≈ 1.5
+- B) Transformers' placement: the rope op multiplies cos and sin by the attention factor m before q and k are rounded to
+  BF16; the attention softmax scale returns to head_dim^-0.5. Needs a new field in `turbine_rope_desc` (a kernel ABI
+  minor bump) — chosen
+
+**Decision (user, 2026-09-29, relayed by the coordinator): B.** Supersedes the "attention factor folds into the attention
+scale, so the RoPE ABI does not change" part of Q19 (question 19, "YaRN proof and override", 2026-09-28); the rest of Q19
+(`model.rope_scaling`, factor 16 proof, the ≈ 12,000-token prompt) stands.
+
+Lead's calls (same day): the field is `float attn_factor` appended to `turbine_rope_desc`, read only when the library
+reports minor ≥ 10 (optional group v2.10, `TURBINE_ABI_MINOR 10u`; 1.0 or a minor < 10 library = no scaling; a YaRN model
+whose factor ≠ 1 on a library below minor 10 is refused at startup, exit 1, `event="kernel_capability"`, reason
+`rope_attn_factor_unavailable`). 6a merges first, so it takes v2.10; the 6b groups written as v2.10 (KV transcode,
+mixed-format attention) renumber to v2.11 when the 6b stack is rebased onto main. The yarn16 tolerance comes from
+`yarn_self_spread.py` without `--fold` (transformers' placement), floored at the Llama BF16 bounds (decision "Golden
+tolerance floor for quantized checkpoints" applied to YaRN). Spec S-15/S-6 and plan Task 28a amended the same day.
+
+## OLMoE FP8 KV: full-GSM8K drop over the bound (2026-09-29)
+
+Context: the full-GSM8K FP8 KV gate (decision "Phase 6a gate misses", item 1; 1,319 items, c16, `p6a-kv-t24-full`
+511042e): Llama-3.2-3B BF16 KV 0.7801, FP8 KV 0.7885 (drop −0.0083, PASS). OLMoE-1B-7B BF16 KV 0.6603 (871), FP8 KV
+0.6459 (852): drop 0.0144 > 0.01; flips 122 lost / 103 gained, McNemar p = 0.23, 95% CI of the drop −0.008 to +0.037.
+Runs are bit-deterministic (first 200 items equal the GSM8K-200 runs), so every flip is the KV format's. No Turbine bug
+found: the checkpoint ships no K/V scales (1.0), no e4m3 saturation (max |K| ≤ 22, |V| ≤ 1.5), V underflows in layers
+0–4 (V relative error 4.2–7.6 % against the 2.7 % e4m3 floor), and OLMoE's top-8 routing amplifies the perturbation.
+
+- A) Accept the drop as noise and mark the OLMoE FP8 KV row `supported` alongside Llama's — chosen
+- B) Keep the OLMoE FP8 KV row `experimental`
+- C) Calibrate per-layer V scales (≈ amax/448) for scale-less checkpoints now and re-run the OLMoE FP8 KV pass
+
+**Decision (user, 2026-09-29, relayed by the coordinator): A.** Both gfx1201 FP8 KV rows (Llama, OLMoE) are
+`supported`; the result is recorded at the rows in `turbine-core::support` and in `.procoder/review-2026-09-29.md`.
+Calibrated scales for scale-less checkpoints stay a possible later improvement, not a gate.
+
+## FP8-dynamic (Task 14): accuracy on full GSM8K against vLLM, c1 ITL as a perf item (2026-09-29)
+
+Context: the T14 proof (`p6a-fp8-t14` 5e6a259) passes golden c1/c16 16/16 and c16 throughput (976 tok/s, 1.149× BF16),
+but reads GSM8K-200 0.79 (Turbine BF16 0.795, vLLM on the same checkpoint 0.82) and c1 ITL 0.846× BF16 against the
+plan's 0.75× target.
+
+- A) Mark FP8-dynamic `supported` now
+- B) Re-judge accuracy on the full 1,319-item GSM8K at c16 against vLLM on the same checkpoint (vLLM serves it on
+  gfx1201), flip to `supported` if it passes; the 0.75× c1 ITL target becomes a follow-up perf task that does not
+  block support — chosen
+- C) Hold the row until both the accuracy and the ITL gates pass
+
+**Decision (user, 2026-09-29, relayed by the coordinator): B.** Turbine and vLLM run at the same concurrency (16), queued
+as one detached script under the one-GPU-job rule. The ITL item: FP8 halves the weight bytes, so M = 1 decode should
+approach ≈ 0.6× BF16; the gap (0.846× measured) is likely the per-token activation quantization plus FP8 GEMM overhead at
+M = 1 — recorded as a perf item in the plan (Task 14 follow-up) and the review file, measured before any change.
+
+## Slow-client timer on partial reads (2026-09-29)
+
+Context: Phase 2 S-7 pauses a request whose output channel is full and cancels it with `slow_client` after
+_server.slow_client_timeout_; the spec did not say whether a client that reads part of the held backlog resets the timer.
+Found while fixing the `slow_client_paused_then_cancelled` failure (branch `p6a-server-flakes`: a slow-client close of a
+finished stream now ends with the `slow_client` error event instead of a bare close reported as `internal_error`).
+
+- A) The timer resets only when the whole held backlog has drained into the channel, i.e. when the request un-pauses
+  (current behaviour: `flush_outputs` → `Deadlines::resumed`) — chosen
+- B) Reset on any consumed event: friendlier to slow-but-steady readers, but a reader taking one event per
+  (timeout − ε) holds its KV until _server.request_timeout_
+- C) B with a floor: reset only after at least k events (or a share of the channel) were read since the last reset;
+  needs a new key or constant
+
+**Decision (user, 2026-09-29, relayed by the coordinator): A.** No code change; the phase-2 spec's edge-case list says
+partial reads do not reset the timer.
+
+## FP8-dynamic: full-GSM8K drop against vLLM over the bound (2026-09-29)
+
+Context: the Task 14 gate (decision "FP8-dynamic (Task 14): accuracy on full GSM8K against vLLM…", option B) ran both
+engines on `llama-3.2-3b-instruct-fp8-dynamic` at c16 on the full 1,319-item GSM8K (`scratch/p6a-fp8-full/run/` on
+novanas): Turbine 0.7703, vLLM-ROCm 0.7832, drop 0.0129 > the 0.01 reference-engine bound (`eval-compare` rc 1). Paired:
+54 items only Turbine solves, 71 only vLLM; McNemar exact p = 0.152; difference 95 % CI −0.0295..+0.0037. Golden c1/c16
+16/16 and c16 throughput (1.149× BF16) already passed.
+
+- A) Accept the drop as noise and mark FP8-dynamic `supported` (same call as OLMoE FP8 KV) — chosen
+- B) Numerics check first (golden per-position against the FP8 reference, the activation-quantization path), then decide
+- C) Hold the row `experimental`
+
+**Decision (user, 2026-09-29, relayed by the coordinator): A.** The c1 ITL item (0.846× BF16 against the 0.75× target)
+stays a perf follow-up (plan Task 14b) and does not block support.
+
+## GPTQ INT4: full-GSM8K drop just over the 4-bit bound (2026-09-30)
+
+Context: the full-GSM8K gate for `gptq_int4` (1,319 items, c16; checkpoint `shuyuej/Llama-3.2-3B-Instruct-GPTQ` @
+`dd5a311f040728fbc612eb03c8dadfae0a90552f`; gate `tests/eval/llama-3.2-3b-instruct-gptq/gate.json`, max drop 0.04 against
+Turbine BF16, since vLLM-ROCm 0.23 cannot load this checkpoint): Turbine GPTQ 972/1319 = 0.7369 vs Turbine BF16
+1029/1319 = 0.7801, a drop of 0.0432 > 0.04. Paired: 122 items lost, 65 gained, McNemar exact p = 3.7e-5 (the drop
+against BF16 is real), 95% CI of the drop +0.0230 … +0.0634; the overshoot of the 0.04 bound is not significant
+(z = 0.31, one-sided p ≈ 0.38). Turbine's dequantization is bit-exact against an independent AutoGPTQ reference over 21
+layers (`p6a-gptq-numerics`), so the loss is the checkpoint's or GPTQ's own. For comparison AWQ INT4 dropped 0.030 on
+GSM8K-200.
+
+- A) Accept the overshoot as noise and mark `gptq_int4` `supported`
+- B) Re-judge on a better GPTQ checkpoint of Llama-3.2-3B-Instruct from a known publisher (damp 0.01, `desc_act`
+  false, preferably one vLLM-ROCm loads), full GSM8K at c16 on Turbine and on vLLM if it loads — chosen
+- C) Keep `gptq_int4` `experimental` and close 6a with AWQ as the supported 4-bit format
+
+**Decision (user, 2026-09-30, relayed by the coordinator): B.** The run queues after `w4a4-rerun` and the fp8_block
+jobs; weights are fetched on `novanas` with `hf download … --revision <pinned rev>` (the token stays there). If no
+suitable published checkpoint exists, the options (e.g. quantizing one ourselves with a Python tool at fixture time,
+off the serving path) go back to the user. `gptq_int4` stays `experimental` meanwhile.
+
+## GPTQ INT4: which better checkpoint (2026-09-30, follows "GPTQ INT4: full-GSM8K drop just over the 4-bit bound")
+
+Context: no published GPTQ checkpoint of Llama-3.2-3B-Instruct from a known publisher has damp 0.01 and `desc_act`
+false. RedHatAI / neuralmagic publish no 3B `w4a16`; `kaitchup/…-gptqmodel-4bit`, `clowman/…-GPTQ-Int4` and
+`ModelCloud/…-vortex-v3` use act-order (refused, `gptq_act_order`); `kaitchup/Llama-3.2-3B-Instruct-AutoRoundGPTQ-4bit`
+and `fbaldassarri/…-auto_gptq-int4-gs128-sym` fit the loader (damp 0.01, no act-order, sym, group 128, GPTQ packing) but
+were made with AutoRound. `ct_pack_int4` (compressed-tensors pack-quantized) also resolves to the `gptq_int4` row.
+
+- A) Quantize our own with llm-compressor (GPTQ modifier, W4A16 sym, group 128, damp 0.01, no act-order, ≈ 512
+  calibration samples, from the BF16 unsloth checkpoint; Python at fixture time on `novanas` only), served through
+  `ct_pack_int4` on Turbine and on vLLM-ROCm if it loads — chosen, second
+- B) As A with GPTQModel writing AutoGPTQ format (Turbine's `gptq` loader; vLLM likely hits the same `qzeros` defect)
+- C) A quick full-GSM8K c16 run on `kaitchup/Llama-3.2-3B-Instruct-AutoRoundGPTQ-4bit` (pinned revision) — chosen,
+  first, as an AutoRound early data point only: it does not decide the row
+- D) Keep `gptq_int4` `experimental` and close 6a with AWQ as the supported 4-bit format
+
+**Decision (user, 2026-09-30, relayed by the coordinator): C, then A.** Both queue after `w4a4-rerun` and the fp8_block
+jobs (the AutoRound run may go earlier when a GPU slot fits); calibration is its own queued GPU job; weights download on
+`novanas` with `hf download … --revision <pinned rev>` (the token stays there). The `gptq_int4` row is re-judged on the A
+run against the 0.04 bound; it stays `experimental` until then.

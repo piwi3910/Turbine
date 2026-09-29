@@ -46,7 +46,15 @@ Usage:
     uv run scripts/golden/hf_reference.py --model-dir <dir> \
         --prompts tests/golden/prompts.jsonl \
         --out tests/golden/<model-slug>/reference.jsonl \
-        [--top-logprobs 20] [--device cpu|cuda] [--model-name <hub-id>] [--bf16-logits]
+        [--top-logprobs 20] [--device cpu|cuda] [--model-name <hub-id>] [--bf16-logits] \
+        [--config-override <json>]
+
+`--config-override` (Phase 6a S-16) replaces top-level config.json keys with the
+given JSON object's before the model loads, e.g.
+`{"rope_scaling": {"rope_type": "yarn", "factor": 16.0, ...}}` for the YaRN golden:
+the same as loading a copy of the checkpoint whose config.json carries those keys,
+without copying the weights. The reference lines do not record it; the fixture's
+README does.
 """
 
 from __future__ import annotations
@@ -84,9 +92,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="log-softmax the model's BF16 logits (default: FP32 LM head on the BF16 final-norm output)",
     )
+    p.add_argument(
+        "--config-override",
+        type=json.loads,
+        help="JSON object whose keys replace config.json's top-level keys (e.g. rope_scaling)",
+    )
     args = p.parse_args(argv)
     if not 1 <= args.top_logprobs <= 20:
         p.error("--top-logprobs must be between 1 and 20")
+    if args.config_override is not None and not isinstance(args.config_override, dict):
+        p.error("--config-override must be a JSON object")
     return args
 
 
@@ -213,7 +228,7 @@ def generate(
 def run(args: argparse.Namespace) -> None:
     import torch
     import transformers
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
@@ -221,9 +236,22 @@ def run(args: argparse.Namespace) -> None:
         )
     prompts = load_prompts(args.prompts)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    model = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=torch.bfloat16)
+    config = AutoConfig.from_pretrained(args.model_dir)
+    for key, value in (args.config_override or {}).items():
+        setattr(config, key, value)
+    if args.config_override:
+        print(f"config override {json.dumps(args.config_override)}", file=sys.stderr)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_dir, config=config, dtype=torch.bfloat16
+    )
     model.to(args.device)
     model.eval()
+    rotary = getattr(getattr(model, "model", None), "rotary_emb", None)
+    if args.config_override and rotary is not None:
+        print(
+            f"rotary {rotary.rope_type}, attention scaling {rotary.attention_scaling}",
+            file=sys.stderr,
+        )
     engine = f"transformers-{transformers.__version__}-bf16-{args.device}"
     if not args.bf16_logits:
         engine += "-fp32-logits"

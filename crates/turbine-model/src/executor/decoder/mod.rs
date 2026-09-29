@@ -129,8 +129,11 @@ pub struct DecoderDims {
     /// RMSNorm epsilon.
     pub eps: f32,
     /// The attention softmax scale ([`ModelArchConfig::attention_scale`]: `head_dim^-0.5`,
-    /// times YaRN's attention factor squared).
+    /// YaRN included).
     pub attn_scale: f32,
+    /// The factor the rope op multiplies cos and sin by
+    /// ([`ModelArchConfig::rope_attention_factor`]: YaRN's attention factor, else 1.0).
+    pub rope_attn_factor: f32,
     /// Weights, activations and KV dtype (the weight format's; logits are F32).
     pub act: DType,
     /// The LM head is `embed_tokens` (`tie_word_embeddings`).
@@ -185,6 +188,7 @@ impl DecoderDims {
             layers: cfg.num_layers as usize,
             eps: cfg.rms_norm_eps,
             attn_scale: cfg.attention_scale(),
+            rope_attn_factor: cfg.rope_attention_factor(),
             act: cfg.activation_dtype(),
             tied_lm_head: cfg.tie_word_embeddings,
             moe: cfg.moe,
@@ -1789,6 +1793,7 @@ impl DecoderExecutor {
                 k: k_heads(),
                 positions: w.meta.positions_view(p),
                 inv_freq: b.inv_freq.view(),
+                attn_factor: d.rope_attn_factor,
             })
         })?;
         self.record(li, "q_rope", q())?;
@@ -2319,6 +2324,31 @@ mod tests {
     const BLOCK_TOKENS: u32 = 16;
     const MAX_SEQS: u32 = 16;
     const TABLE: u32 = 20;
+
+    /// Phase 6a Task 28a (spec S-15): with the factor-16 YaRN override the decoder's softmax
+    /// scale is `head_dim^-0.5`, as without YaRN, and the rope op gets transformers' attention
+    /// factor (`0.1 · ln 16 + 1`) — the factor is on cos/sin, not folded into the scale. Breaks
+    /// if the fold (scale × factor²) comes back or the factor stops reaching the rope op.
+    #[test]
+    fn yarn_softmax_scale_is_head_dim_rsqrt() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/llama-3.2-3b-instruct");
+        let yarn = serde_json::json!({
+            "rope_type": "yarn",
+            "factor": 16.0,
+            "original_max_position_embeddings": 8192,
+            "beta_fast": 32,
+            "beta_slow": 1
+        });
+        let cfg = crate::config::load_model_config_with(&dir, Some(&yarn)).expect("yarn config");
+        let plain = crate::config::load_model_config_with(&dir, None).expect("llama3 config");
+        let (d, p) = (DecoderDims::of(&cfg), DecoderDims::of(&plain));
+        assert_eq!(d.head_dim, 128);
+        assert_eq!(d.attn_scale, 1.0 / (128f32).sqrt());
+        assert_eq!(d.attn_scale, p.attn_scale);
+        assert_eq!(d.rope_attn_factor, (0.1 * 16f64.ln() + 1.0) as f32);
+        assert_eq!(p.rope_attn_factor, 1.0);
+    }
 
     /// The GraphKey formula of main's `LlamaExecutor::launch` / `OlmoeExecutor::launch`
     /// (Phase 2c), written out: `seqs` one-token sequences whose block tables need `blocks`
