@@ -105,7 +105,18 @@ pub struct GenerationConfig {
     pub top_k: Option<i32>,
 }
 
-const DEFAULT_ROPE_THETA: f64 = 10_000.0;
+/// transformers' `rope_theta` default per `model_type`, for the model types of the registered
+/// families (transformers 5.9.0: `RotaryEmbeddingConfigMixin.default_theta` 10000, overridden
+/// to 1e6 by `MixtralConfig`). A config with no `rope_theta` anywhere keeps this default with a
+/// WARN; any other `model_type` is refused.
+const TRANSFORMERS_DEFAULT_THETA: &[(&str, f64)] = &[
+    ("llama", 10_000.0),
+    ("mistral", 10_000.0),
+    ("mixtral", 1_000_000.0),
+    ("olmoe", 10_000.0),
+    ("qwen3", 10_000.0),
+    ("qwen3_moe", 10_000.0),
+];
 
 impl ModelArchConfig {
     /// The description budget and planners consume. `weight_bytes` is the stored size (in the
@@ -310,6 +321,10 @@ struct RawConfig {
     rope_theta: Option<f64>,
     #[serde(default)]
     rope_scaling: Option<serde_json::Value>,
+    /// transformers 5's layout: `rope_theta` and the scaling entry in one mapping, with no
+    /// top-level `rope_theta` / `rope_scaling`.
+    #[serde(default)]
+    rope_parameters: Option<serde_json::Value>,
     #[serde(default)]
     tie_word_embeddings: Option<bool>,
     vocab_size: u32,
@@ -431,8 +446,42 @@ pub fn load_model_config_with(
             return Err(invalid(format!("{name} must be non-zero")));
         }
     }
+    let (params_theta, params_scaling) = split_rope_parameters(raw.rope_parameters.as_ref())
+        .map_err(|e| match e {
+            ModelError::Io { detail, .. } => invalid(detail),
+            other => other,
+        })?;
+    let rope_theta = match (raw.rope_theta, params_theta) {
+        (Some(top), Some(params)) if top != params => {
+            return Err(invalid(format!(
+                "rope_theta {top} and rope_parameters.rope_theta {params} disagree"
+            )));
+        }
+        (Some(theta), _) | (None, Some(theta)) => theta,
+        (None, None) => {
+            let model_type = text.get("model_type").and_then(|t| t.as_str());
+            let default = TRANSFORMERS_DEFAULT_THETA
+                .iter()
+                .find(|(t, _)| Some(*t) == model_type)
+                .map(|&(_, theta)| theta);
+            let Some(theta) = default else {
+                return Err(invalid(format!(
+                    "no rope_theta or rope_parameters.rope_theta, and no transformers default \
+                     is known for model_type {}",
+                    model_type.unwrap_or("<missing>")
+                )));
+            };
+            tracing::warn!(
+                event = "rope_theta_defaulted",
+                family = family.name(),
+                model_type = model_type.unwrap_or_default(),
+                rope_theta = theta,
+                "config.json gives no rope_theta; using transformers' default for the model type"
+            );
+            theta
+        }
+    };
     // The inverse frequencies are theta^(-2i/d): a zero or negative base gives inf or NaN.
-    let rope_theta = raw.rope_theta.unwrap_or(DEFAULT_ROPE_THETA);
     if !(rope_theta.is_finite() && rope_theta > 0.0) {
         return Err(invalid(format!(
             "rope_theta must be a positive number (got {rope_theta})"
@@ -480,12 +529,26 @@ pub fn load_model_config_with(
             "model.rope_scaling",
             &config_path,
         )?,
-        None => parse_rope_scaling(
-            raw.rope_scaling.as_ref(),
-            raw.max_position_embeddings,
-            "rope_scaling",
-            &config_path,
-        )?,
+        None => {
+            let classic = raw.rope_scaling.as_ref().filter(|v| !v.is_null());
+            let max = raw.max_position_embeddings;
+            match (classic, params_scaling.as_ref()) {
+                (Some(c), Some(p)) => {
+                    let from_classic =
+                        parse_rope_scaling(Some(c), max, "rope_scaling", &config_path)?;
+                    let from_params =
+                        parse_rope_scaling(Some(p), max, "rope_parameters", &config_path)?;
+                    if from_classic != from_params {
+                        return Err(invalid(format!(
+                            "rope_scaling {c} and rope_parameters {p} disagree"
+                        )));
+                    }
+                    from_classic
+                }
+                (Some(c), None) => parse_rope_scaling(Some(c), max, "rope_scaling", &config_path)?,
+                (None, p) => parse_rope_scaling(p, max, "rope_parameters", &config_path)?,
+            }
+        }
     };
     let eos_token_ids = load_eos(dir, raw.eos_token_id, &config_path)?;
 
@@ -513,12 +576,63 @@ pub fn load_model_config_with(
     })
 }
 
+/// transformers 5's `rope_parameters` split into its `rope_theta` and its scaling entry: the
+/// rest of the mapping when it names a `rope_type` (or `type`), else `None` (transformers then
+/// takes `default`, no scaling). Per-layer-type mappings (`{"full_attention": {...}, ...}`)
+/// are refused: every layer shares one RoPE in Turbine. Errors carry an empty path; the caller
+/// names `config.json`.
+fn split_rope_parameters(
+    value: Option<&serde_json::Value>,
+) -> Result<(Option<f64>, Option<serde_json::Value>), ModelError> {
+    let invalid = |detail: String| ModelError::Io {
+        path: PathBuf::new(),
+        detail,
+    };
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok((None, None));
+    };
+    let Some(map) = value.as_object() else {
+        return Err(invalid(format!(
+            "rope_parameters must be a mapping (got {value})"
+        )));
+    };
+    let per_layer = !map.is_empty()
+        && !["rope_type", "type", "rope_theta"]
+            .iter()
+            .any(|k| map.contains_key(*k))
+        && map.values().all(|v| v.is_object());
+    if per_layer {
+        let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        return Err(unsupported(
+            "rope_parameters",
+            format!("per-layer-type ({})", keys.join(", ")),
+            "one mapping for every layer",
+        ));
+    }
+    let theta = match map.get("rope_theta") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(v.as_f64().ok_or_else(|| {
+            invalid(format!(
+                "rope_parameters.rope_theta must be a number (got {v})"
+            ))
+        })?),
+    };
+    let scaling = (map.contains_key("rope_type") || map.contains_key("type")).then(|| {
+        let mut rest = map.clone();
+        rest.remove("rope_theta");
+        serde_json::Value::Object(rest)
+    });
+    Ok((theta, scaling))
+}
+
 /// The RoPE scaling types Turbine implements; `dynamic`, `linear`, `longrope` and the rest are
 /// refused (dynamic scaling would change cached keys mid-sequence; P6a S-15).
 const SUPPORTED_ROPE_TYPES: &str = "default, llama3, yarn";
 
-/// `rope_scaling` of `config.json` (`key` = `rope_scaling`) or the `model.rope_scaling`
-/// override that replaces it (`key` = `model.rope_scaling`); refusals name `key`.
+/// `rope_scaling` of `config.json` (`key` = `rope_scaling`), the scaling part of its
+/// `rope_parameters` (`key` = `rope_parameters`), or the `model.rope_scaling` override that
+/// replaces either (`key` = `model.rope_scaling`); refusals name `key`.
 fn parse_rope_scaling(
     value: Option<&serde_json::Value>,
     max_position_embeddings: u32,
@@ -1369,6 +1483,279 @@ mod tests {
         assert_eq!(v["scaling"]["truncate"], true);
         let v: serde_json::Value = serde_json::from_str(&plain.rope_identity()).unwrap();
         assert_eq!(v["scaling"]["type"], "llama3");
+    }
+
+    /// `tests/fixtures/llama-3.1-8b-transformers5/config.json`: the `config.json` of the Quark
+    /// W4A4 Llama-3.1-8B-Instruct export (transformers 5.9.0, novanas
+    /// `/home/piwi/turbine-models/llama-3.1-8b-instruct-mxfp4-a4`) verbatim except for its
+    /// `quantization_config`: no top-level `rope_theta` / `rope_scaling`, only `rope_parameters`.
+    fn transformers5_dir() -> PathBuf {
+        family_fixture("llama-3.1-8b-transformers5")
+    }
+
+    /// The transformers-5 config moved to the classic layout (`rope_theta` + `rope_scaling`),
+    /// with `edit` applied, in a scratch directory.
+    fn transformers5_edited(name: &str, edit: impl FnOnce(&mut serde_json::Value)) -> PathBuf {
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&fs::read(transformers5_dir().join("config.json")).unwrap())
+                .unwrap();
+        edit(&mut v);
+        let dir = scratch(name);
+        fs::write(dir.join("config.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+        dir
+    }
+
+    fn to_classic(v: &mut serde_json::Value) {
+        let mut params = v
+            .as_object_mut()
+            .unwrap()
+            .remove("rope_parameters")
+            .unwrap();
+        let theta = params
+            .as_object_mut()
+            .unwrap()
+            .remove("rope_theta")
+            .unwrap();
+        v["rope_theta"] = theta;
+        v["rope_scaling"] = params;
+    }
+
+    fn io_detail(err: ModelError) -> String {
+        match err {
+            ModelError::Io { detail, .. } => detail,
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    /// transformers 5 writes RoPE only as `rope_parameters` (`rope_theta` plus the scaling
+    /// entry): it must resolve exactly as the classic `rope_theta` + `rope_scaling` layout does
+    /// (theta 500000 and llama3 factor 8, not the 10000 default with no scaling), down to the
+    /// inverse frequencies and the prefix-namespace RoPE identity (S-16).
+    #[test]
+    fn rope_parameters_transformers5_layout() {
+        let cfg = load_model_config(&transformers5_dir()).unwrap();
+        assert_eq!(cfg.rope_theta, 500_000.0);
+        let llama3 = Some(RopeScaling::Llama3 {
+            factor: 8.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8192,
+        });
+        assert_eq!(cfg.rope_scaling, llama3);
+
+        let dir = transformers5_edited("rope-classic", to_classic);
+        let classic = load_model_config(&dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(
+            (classic.rope_theta, classic.rope_scaling),
+            (500_000.0, llama3)
+        );
+        let freqs = |c: &ModelArchConfig| {
+            crate::executor::rope::inv_freq(c.rope_theta, c.head_dim, c.rope_scaling.as_ref())
+        };
+        assert_eq!(freqs(&cfg), freqs(&classic));
+        assert_eq!(cfg.rope_identity(), classic.rope_identity());
+
+        // Both layouts at once are fine while they agree.
+        let dir = transformers5_edited("rope-both-agree", |v| {
+            v["rope_theta"] = serde_json::json!(500_000.0);
+            v["rope_scaling"] = v["rope_parameters"].clone();
+        });
+        let both = load_model_config(&dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(both.rope_identity(), classic.rope_identity());
+
+        // `rope_type: default` is no scaling; the theta still comes from rope_parameters.
+        let dir = transformers5_edited("rope-params-default", |v| {
+            v["rope_parameters"] = serde_json::json!({"rope_type": "default", "rope_theta": 5e5});
+        });
+        let plain = load_model_config(&dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!((plain.rope_theta, plain.rope_scaling), (500_000.0, None));
+
+        // Refused scaling types are refused from rope_parameters too, naming that key.
+        let dir = transformers5_edited("rope-params-dynamic", |v| {
+            v["rope_parameters"]["rope_type"] = serde_json::json!("dynamic");
+        });
+        let (field, value, supported) = unsupported(load_model_config(&dir).unwrap_err());
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(
+            (field.as_str(), value.as_str(), supported.as_str()),
+            (
+                "rope_parameters.rope_type",
+                "dynamic",
+                "default, llama3, yarn"
+            )
+        );
+
+        // `model.rope_scaling` still replaces the scaling part; theta stays rope_parameters'.
+        let off = serde_json::json!({"rope_type": "default"});
+        let over = load_model_config_with(&transformers5_dir(), Some(&off)).unwrap();
+        assert_eq!((over.rope_theta, over.rope_scaling), (500_000.0, None));
+
+        // A wrapper's text_config carries rope_parameters the same way.
+        let dir = transformers5_edited("rope-params-nested", |v| {
+            let text = v.take();
+            *v = serde_json::json!({"architectures": ["Wrapper"], "text_config": text});
+        });
+        let nested = load_model_config(&dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(nested.rope_identity(), classic.rope_identity());
+    }
+
+    /// Both layouts present and disagreeing is refused naming both keys (transformers would
+    /// silently prefer one; which one the checkpoint meant is unknowable).
+    #[test]
+    fn rope_parameters_conflict_is_refused() {
+        let dir = transformers5_edited("rope-theta-conflict", |v| {
+            v["rope_theta"] = serde_json::json!(10_000.0);
+        });
+        let detail = io_detail(load_model_config(&dir).unwrap_err());
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            detail.contains("rope_theta") && detail.contains("rope_parameters.rope_theta"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("10000") && detail.contains("500000"),
+            "{detail}"
+        );
+
+        let dir = transformers5_edited("rope-scaling-conflict", |v| {
+            v["rope_scaling"] = v["rope_parameters"].clone();
+            v["rope_scaling"]["factor"] = serde_json::json!(32.0);
+        });
+        let detail = io_detail(load_model_config(&dir).unwrap_err());
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            detail.contains("rope_scaling") && detail.contains("rope_parameters"),
+            "{detail}"
+        );
+    }
+
+    /// One recorded event: its level and its fields as `(name, value)`.
+    type Event = (tracing::Level, Vec<(String, String)>);
+
+    /// The events recorded by [`capture_events`].
+    #[derive(Default)]
+    struct Captured(std::sync::Mutex<Vec<Event>>);
+
+    struct Recorder(std::sync::Arc<Captured>);
+
+    struct FieldVisitor<'a>(&'a mut Vec<(String, String)>);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Vec::new();
+            event.record(&mut FieldVisitor(&mut fields));
+            let level = *event.metadata().level();
+            self.0.0.lock().unwrap().push((level, fields));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn capture_events<T>(f: impl FnOnce() -> T) -> (T, Vec<Event>) {
+        let captured = std::sync::Arc::new(Captured::default());
+        let out = tracing::subscriber::with_default(Recorder(captured.clone()), f);
+        let events = std::mem::take(&mut *captured.0.lock().unwrap());
+        (out, events)
+    }
+
+    /// No rope_theta anywhere: transformers' own default for the `model_type` is kept, with a
+    /// WARN `event="rope_theta_defaulted"` naming the family and the value; a `model_type`
+    /// Turbine has no recorded transformers default for is refused.
+    #[test]
+    fn rope_theta_default_warns_or_refuses() {
+        let dir = edited_config("rope-theta-missing", |v| {
+            v.as_object_mut().unwrap().remove("rope_theta");
+        });
+        let (cfg, events) = capture_events(|| load_model_config(&dir));
+        let cfg = cfg.unwrap();
+        assert_eq!(cfg.rope_theta, 10_000.0);
+        let warn = events
+            .iter()
+            .find(|(level, fields)| {
+                *level == tracing::Level::WARN
+                    && fields.contains(&("event".into(), "rope_theta_defaulted".into()))
+            })
+            .unwrap_or_else(|| panic!("no rope_theta_defaulted WARN in {events:?}"));
+        assert!(
+            warn.1.contains(&("family".into(), "llama".into())),
+            "{warn:?}"
+        );
+        assert!(
+            warn.1.contains(&("rope_theta".into(), "10000.0".into())),
+            "{warn:?}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+
+        // An explicit theta logs nothing.
+        let (_, events) = capture_events(|| load_model_config(&fixture_dir()).unwrap());
+        assert!(
+            !events
+                .iter()
+                .any(|(_, f)| f.contains(&("event".into(), "rope_theta_defaulted".into()))),
+            "{events:?}"
+        );
+
+        // Mixtral's transformers default is 1e6, not the 1e4 of the base mixin.
+        let mixtral = family_fixture("mixtral-8x7b-instruct-v0.1");
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&fs::read(mixtral.join("config.json")).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("rope_theta");
+        let dir = scratch("rope-theta-missing-mixtral");
+        fs::write(dir.join("config.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+        fs::copy(
+            mixtral.join("generation_config.json"),
+            dir.join("generation_config.json"),
+        )
+        .unwrap();
+        assert_eq!(load_model_config(&dir).unwrap().rope_theta, 1_000_000.0);
+        fs::remove_dir_all(dir).unwrap();
+
+        // No model_type (or one without a recorded transformers default): refused.
+        for (name, model_type) in [
+            ("rope-theta-no-type", None),
+            ("rope-theta-odd-type", Some("llama_custom")),
+        ] {
+            let dir = edited_config(name, |v| {
+                let obj = v.as_object_mut().unwrap();
+                obj.remove("rope_theta");
+                match model_type {
+                    Some(t) => {
+                        obj.insert("model_type".into(), serde_json::json!(t));
+                    }
+                    None => {
+                        obj.remove("model_type");
+                    }
+                }
+            });
+            let detail = io_detail(load_model_config(&dir).unwrap_err());
+            fs::remove_dir_all(dir).unwrap();
+            assert!(
+                detail.contains("no rope_theta") && detail.contains("rope_parameters.rope_theta"),
+                "{name}: {detail}"
+            );
+        }
     }
 
     /// The `config.json` / `generation_config.json` of the Phase 8 checkpoints, copied verbatim
