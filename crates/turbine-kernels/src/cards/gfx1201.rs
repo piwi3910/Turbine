@@ -40,6 +40,7 @@ const QGEMM_SMALL_ORDER: &[&str] = &[
     "hipblaslt_fp8",
     "turbine_hip_int4_wmma",
     "turbine_hip_int4_dequant",
+    "turbine_hip_mxfp4",
 ];
 
 pub static GFX1201: CardProfile = CardProfile {
@@ -93,7 +94,9 @@ pub static GFX1201: CardProfile = CardProfile {
             row_tiers: &[],
         },
         // ABI v2.9 (Phase 6a): FP8 W8A8 on hipBLASLt and Turbine's own e4m3 activation
-        // quantization (decision "P6: FP8 GEMM — provider evaluation (kernel reuse rule)").
+        // quantization (decision "P6: FP8 GEMM — provider evaluation (kernel reuse rule)");
+        // MXFP4 weights and activation emulation on Turbine's own kernels at every row count
+        // (decision "P6: MXFP4 GEMM — provider evaluation (kernel reuse rule)").
         OpPreference {
             op: OpKind::QGemm,
             order: QGEMM_SMALL_ORDER,
@@ -110,13 +113,14 @@ pub static GFX1201: CardProfile = CardProfile {
                         "hipblaslt_fp8",
                         "turbine_hip_int4_dequant",
                         "turbine_hip_int4_wmma",
+                        "turbine_hip_mxfp4",
                     ],
                 },
             ],
         },
         OpPreference {
             op: OpKind::QuantizeAct,
-            order: &["turbine_hip"],
+            order: &["turbine_hip", "turbine_hip_mxfp4"],
             row_tiers: &[],
         },
         OpPreference {
