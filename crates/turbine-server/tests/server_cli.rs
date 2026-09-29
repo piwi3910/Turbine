@@ -548,6 +548,41 @@ fn sigterm_graceful_shutdown() {
     );
 }
 
+/// A clean shutdown waits for the engine thread to drop the executor, the KV pool and the
+/// kernel library's resources before `main` returns. Catches the process exiting (running the
+/// static destructors of the device runtime) while the engine thread still frees device
+/// buffers: the W4A4 8B server died with SIGSEGV after `shutdown complete` (2026-09-29).
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_engine_before_exit() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
+    let (_model, yaml) = tiny_model_yaml(addr);
+    let cfg = TempConfig::new("sigterm-engine-stop", &yaml);
+    let mut child = spawn_server(&[], &cfg.path);
+    let _reaper = KillOnDrop(child.id());
+    wait_until_serving(&mut child, addr);
+    wait_until_ready(&mut child, addr);
+
+    sigterm(&child);
+    let out = wait_with_timeout(child, Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(0));
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stopped = log
+        .find("engine_stopped")
+        .unwrap_or_else(|| panic!("no engine_stopped event in the log:\n{log}"));
+    let complete = log
+        .find("shutdown complete")
+        .unwrap_or_else(|| panic!("no shutdown complete line in the log:\n{log}"));
+    assert!(
+        stopped < complete,
+        "the engine must stop before shutdown completes:\n{log}"
+    );
+}
+
 /// `max_position_embeddings` of the checkpoint `long_model_yaml` serves, so streams can be held.
 const LONG_POSITIONS: u32 = 8192;
 /// Tokens of a stream that must outlive the shutdown grace: far more events than the output
