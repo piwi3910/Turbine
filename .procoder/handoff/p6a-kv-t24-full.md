@@ -100,3 +100,70 @@ Steps, one hypothesis at a time (procoder:debug):
 4. Report the finding (bug found + fixing commit with a test that catches it, or "format drop, Turbine
    matches the emulated reference") to the coordinator before any `support.rs` or tolerance change;
    `support.rs` changes go as a `handoff(crates/turbine-core/src/support.rs)` commit.
+
+## Verdict (collector, lead rotations 7 and 8, 2026-09-29 ~17:40 +04)
+
+All four passes finished (`ALLDONE`), and the Llama BF16 re-run at c16 finished too
+(`gsm8k_bf16_c16_r7.log`: `r7-bf16-c16: done rc=0`). The result JSONs are committed under
+`tests/eval/<slug>/turbine-{bf16,fp8_e4m3}-full.json`. The Llama BF16 c1 pass is kept as
+`turbine-bf16-full.c1.json`. All `.err` files are empty. `eval-compare --max-drop 0.01` ran on novanas.
+
+| model | BF16 KV (c16) | FP8 KV (c16) | drop | eval-compare | BF16→FP8 lost / gained | McNemar p | 95 % CI of drop |
+|---|---|---|---|---|---|---|---|
+| Llama-3.2-3B | 1029/1319 = 0.7801 | 1040/1319 = 0.7885 | −0.0083 | PASS (exit 0) | 41 / 52 | 0.30 | [−0.023, +0.006] |
+| OLMoE-1B-7B | 871/1319 = 0.6603 | 852/1319 = 0.6459 | +0.0144 | FAIL (exit 1) | 122 / 103 | 0.23 | [−0.008, +0.037] |
+
+Noise floor and determinism:
+- The first 200 items of every full run give the same outputs, bit for bit, as the GSM8K-200 runs
+  (OLMoE BF16 and FP8, 200/200). So run-to-run noise is zero and every flip comes from the KV format.
+- Llama BF16 at c1 vs c16: 14 lost / 9 gained (the drop is 0.0038, from batch composition alone).
+- OLMoE outputs diverge somewhere under FP8 KV in 1205/1319 items (91 %), against 1004/1319 (76 %) for Llama.
+  The median divergence point is 15 % into the BF16 answer.
+- No item flips when its output is unchanged.
+
+Numerics check (decision "Phase 6a gate misses on GSM8K-200", item 1):
+1. **Scales.** `/home/piwi/turbine-models/olmoe-1b-7b-0125-instruct/model.safetensors.index.json` has
+   0 `_scale` tensors, so every per-layer K/V scale is 1.0 (`kv_scales.rs` all-or-nothing default). The
+   "wrong layer's scale" path cannot matter for this checkpoint.
+2. **Range vs e4m3 at scale 1.0.**
+   - How it was measured: CPU transformers 4.57.1, BF16, on 12 GSM8K prompts plus Turbine's BF16 answers.
+     Script `/home/piwi/turbine-ci/scratch/kvrange-r7/kv_range.py`, outputs `olmoe.txt` and `llama.txt` beside it.
+     K is taken after k_norm and RoPE. The hooks are on `apply_rotary_pos_emb` and `v_proj`, because OLMoE in
+     4.57.1 has no `eager_attention_forward`.
+   - **No saturation.** max |K| ≤ 22 (OLMoE) and ≤ 24 (Llama), and max |V| ≤ 1.5 / 6.3, all far below 448.
+   - **Underflow.** OLMoE V is tiny in the early layers: RMS 0.008–0.014 in layers 0–4, against 0.06–0.25 for Llama.
+     - Share of V values in the e4m3 subnormal range (< 2^-6): 95 → 75 %, and 35 → 7 % flush to 0.
+     - V quantization relative error: 7.6 / 6.8 / 5.7 / 5.0 / 4.2 % in layers 0–4, against the 2.7 % e4m3
+       floor that later layers and all of Llama sit at.
+     - OLMoE K has many near-zero channels after k_norm (layer 0: 74 % flush to 0), but K's relative error
+       stays at 2.6–2.8 %, the same as Llama's.
+   - The attention-output relative error from K/V quantize-dequantize is 4.0–8.2 % per layer for OLMoE and
+     3.4–8.8 % for Llama, so the two are comparable. OLMoE's larger answer divergence is consistent with its
+     discrete top-8 expert routing amplifying the same size of perturbation.
+3. **Turbine vs the emulated FP8 KV reference.** Not run: the new OLMoE reference (fp8kv-eager regen) is not
+   ready. The old one is void.
+   - Reason: in transformers 4.57.1, `OlmoeDecoderLayer` builds its attention from
+     `OLMOE_ATTENTION_CLASSES[config._attn_implementation]` (modeling_olmoe.py:629). It never calls a
+     registered AttentionInterface function, so the pre-eager `install_kv_quant` swap never reached OLMoE.
+   - On the integration tip (d877f55), `scripts/golden/quant_reference.py:347-386` hooks the KV cache instead:
+     a forward pre-hook on every `self_attn` hands it a `_Fp8KvCache` view, and OLMoE calls
+     `past_key_values.update` after RoPE. That covers OLMoE.
+   - Transformers is pinned to 4.57.1 in the uv header (line 5).
+   - When the regen lands, run `turbine-golden compare --reference <new olmoe fp8kv reference> --concurrency 1`
+     against a `phase6-novanas-olmoe-fp8kv.yaml` serve. That is the remaining check for a Turbine bug.
+
+**Cause:** (b) + (c).
+- Nothing points at a Turbine bug. There is no saturation, the K error sits at the e4m3 floor, and the
+  attention-output perturbation is the same size as Llama's, which passes.
+- The measurable format effect is V underflow in OLMoE layers 0–4, from the missing scales at 1.0.
+  Calibrated per-layer V scales (≈ amax/448, e.g. 0.26/448 for layer 0) would put V in the normal range and
+  cut its error from 5–8 % to ≈ 2.7 %. K would not change.
+- The 0.0144 drop itself is not significant (122 vs 103 flips, McNemar p = 0.23, CI includes 0).
+
+**Recommendation for the rows:**
+- Llama FP8 KV: PASS, eligible for `supported`.
+- OLMoE FP8 KV: the literal 0.01 bound fails on a non-significant drop. Keep it `experimental` until the
+  emulated-reference compare (item 3) is done.
+- Then either accept it as format-limited noise (user decision) or add a calibrated / dynamic per-layer V scale
+  for checkpoints without scales, and re-run the OLMoE FP8 pass.
+- No `support.rs` change has been made.
