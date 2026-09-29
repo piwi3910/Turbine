@@ -4120,7 +4120,7 @@ mod tests {
         // Another timeout unread: the engine lets the request go and closes the stream.
         clock.advance(timeout);
         assert!(matches!(engine.turn(), Ok(Turn::Continue)));
-        assert!(engine.requests.get(&id).is_none(), "the stream is closed");
+        assert!(!engine.requests.contains_key(&id), "the stream is closed");
 
         let events: Vec<_> = std::iter::from_fn(|| slow.try_recv().ok()).collect();
         assert!(token_count(&events) > 0, "{events:?}");
