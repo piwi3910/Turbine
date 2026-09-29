@@ -1,3 +1,47 @@
+## State 2026-09-30 ~00:10 (AWQ soak builder, rotation 9)
+
+Merged `phase-6a-quantization` into `p6a-int4` first (fast-forward, 16 commits: engine-join exit
+fix 1bbbbe7, the w4a4/gptq numerics handoffs, `crates/turbine-server/src/engine/{loop,mod,requests}.rs`
+and `startup.rs` changes, `int4_layer_dump` example).
+
+GPU order: waited (background, one short ssh check every 5 min, bounded 2h — script
+`/private/tmp/claude-501/-Users-pascal-Development-Turbine/7482a1b1-2407-47bb-91f2-d826e25c21af/scratchpad/awq-soak/wait_and_soak.sh`,
+log alongside it) for `/home/piwi/turbine-ci/scratch/w4a4-segv/w4a4segv.log` to reach `done rc=`
+and `bench.lock` to be free. Both were already true on the first check (19:46:47Z) — the
+w4a4-segv repro had finished at 19:46:13Z (`rc=0`) — so the soak started immediately, no 2h wait
+needed.
+
+**AWQ 10-minute overload soak: PASS.** `scripts/overload-soak.sh novanas --duration 10m --model
+/home/piwi/turbine-models/llama-3.2-3b-instruct-awq` (ran as-is: no config keys needed for the
+weight format — `weights::detect` reads it from the checkpoint's `config.json`, so the stock
+`scripts/lab/phase3-novanas-soak.yaml` plus `--model` was enough; no AWQ soak config copy was
+committed). Output `target/soak/novanas-20260929T194647Z/`:
+- `verdict.json`: `"pass": true`, every check true (`server_never_restarted`,
+  `only_503_overload_codes`, `streams_complete`, `itl_p99_within_2x`, `reached_orange`,
+  `green_within_60s`, `kv_idle`, `reserve_held`).
+- `calibration_itl_p99_ms` 187.73, `overload_itl_p99_ms` 182.79 (0.97x, well within 2x).
+- `green_after_cooldown_s`: 0. `by_status`: 200×4915, 429×375. `by_error_code`:
+  `queue_full`×375, `queue_timeout`×4022 (all allowed 503/429 codes; no unexpected 5xx).
+- Ran 19:46:47Z–20:10:12Z UTC (serve start through stop), rc=0. Serve Job stopped cleanly by the
+  script's own trap (`lab-serve: novanas: stopped`); no orphaned Job.
+
+Commit `7043b8c handoff(crates/turbine-core/src/support.rs): awq_int4 gfx1201 Llama -> supported`
+flips only the `awq_int4` row on gfx1201 Llama to `supported` (matches the pattern of the
+unmerged `ef09f16` fp8_block flip — HOLD commit, not on this branch, lead's to apply separately).
+`gptq_int4` stays `experimental`: its GSM8K-200 drop (0.090) exceeds the 0.04 gate (see the
+"T18 GPTQ verdict: FAIL" section above). Verified locally only (`cargo test -p turbine-core
+support::` 3 passed, `cargo fmt -p turbine-core --check` clean) since support.rs is lead-owned;
+`scripts/gate.sh` (no `--full`) is running detached in the background
+(`/tmp/gate-p6a-int4-r9.log` on the Mac side) — its result will be in a follow-up message if it
+finishes before I hand off, otherwise check that log.
+
+Open questions for the lead:
+- Whether to also apply the pending `ef09f16` fp8_block flip now that awq_int4 is in, since both
+  follow the same pattern and are on separate un-merged commits.
+- AGENTS.md's `Commands` section still lists `awq_int4` only among the "unsupported ... except
+  experimental" formats — I left that prose alone since AGENTS.md/`.procoder/` edits are
+  lead-owned; it may want a one-line update once this lands.
+
 # Handoff: p6a-int4 (plan Tasks 16–18)
 
 ## State 2026-09-29 ~15:30 (T18 builder, lead rotation 7/8)
