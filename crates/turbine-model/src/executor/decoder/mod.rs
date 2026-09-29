@@ -281,7 +281,12 @@ impl DecoderDims {
     /// activation dtype, or F8E4M3 under `kv.dtype: fp8_e4m3`: the config then names the page
     /// dtype, [`AttentionConfig::dtype`]).
     fn attention(&self, kind: AttentionKind, block_tokens: u32, kv: DType) -> AttentionConfig {
-        let dtype = if kv == DType::F8E4M3 { kv } else { self.act };
+        // Quantized pages (FP8, TurboQuant) name the page dtype; float pages the activations'.
+        let dtype = if kv == DType::F8E4M3 || kv.tq_record_bytes().is_some() {
+            kv
+        } else {
+            self.act
+        };
         AttentionConfig {
             kind,
             num_q_heads: self.heads as u32,
@@ -1831,6 +1836,11 @@ impl DecoderExecutor {
                     scale: d.attn_scale,
                     k_scale,
                     v_scale,
+                    // P6b S-5: every L0 block is in the pool's one format until the ladder's L0
+                    // step (S-7) carves pages of other formats; TurboQuant pages take the
+                    // layer's tables and codec.
+                    block_formats: &[],
+                    tq: self.cfg.kv_cache.tq_paged(model_layer),
                 })
         })?;
         self.record(li, "attn", at(&b.attn))?;
