@@ -134,6 +134,9 @@ pub struct ModuleNames<'a> {
     pub rank_transports: &'a [&'a str],
     /// `parallel.router` (Phase 5).
     pub router_policies: &'a [&'a str],
+    /// `kv.cpu.format`, `kv.nvme.format` and `kv.ladder.max_format` (Phase 6b): the
+    /// `kv_format` registry.
+    pub kv_formats: &'a [&'a str],
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -582,6 +585,22 @@ impl Config {
             None,
         )?;
         check("kv.policy", &self.kv.policy, known.eviction_policies, None)?;
+        for (key, format) in [
+            ("kv.cpu.format", self.kv.cpu.format),
+            ("kv.nvme.format", self.kv.nvme.format),
+            ("kv.ladder.max_format", self.kv.ladder.max_format),
+        ] {
+            if !known.kv_formats.contains(&format.as_str()) {
+                return Err(invalid(
+                    key,
+                    format!(
+                        "`{}` is not registered (registered: {})",
+                        format.as_str(),
+                        known.kv_formats.join(", ")
+                    ),
+                ));
+            }
+        }
         check(
             "parallel.collective_backend",
             &self.parallel.collective_backend,
