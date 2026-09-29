@@ -57,6 +57,10 @@ struct QGemmCache;
 // The INT4 dequant path's BF16 staging buffer (qgemm_int4.hip).
 struct Int4Scratch;
 
+// The block-scaled FP8 dequant path's BF16 staging buffer
+// (qgemm_fp8_block.hip).
+struct Fp8BlockScratch;
+
 // The card profile a context holds (ABI v2.4 turbine_card_profile, copied by
 // turbine_ctx_set_profile). The turbine_<op> entry points read their
 // thresholds from it; the library itself names no card.
@@ -129,6 +133,9 @@ struct turbine_ctx {
   // INT4 dequant-path staging buffer (qgemm_int4.hip), created at its first
   // call.
   std::shared_ptr<turbine_hip::Int4Scratch> qgemm_int4;
+  // Block-scaled FP8 dequant-path staging buffer (qgemm_fp8_block.hip),
+  // created at its first use.
+  std::shared_ptr<turbine_hip::Fp8BlockScratch> qgemm_fp8_block;
   // hipDeviceAttributeWallClockRate of the device (kHz), read at the first
   // host-mapped collective step (hostmem.hip); 0 until then.
   int64_t wall_clock_khz = 0;
