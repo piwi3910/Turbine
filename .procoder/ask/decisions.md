@@ -1810,3 +1810,145 @@ MXFP4_EMULATED activation quantize-dequantize (`turbine_hip_mxfp4` `quantize_act
 
 **`fp8_block` served decoded to BF16 (6a Task 15; FP8 builder's evaluation, lead decision 2026-09-29), provisional, pending user review:** no provider computes block-scaled FP8 on gfx1201 — CK `ck_tile` ABQuantGrouped builds but returns ~1e38 on every shape (its own example fails its CPU check at this CK pin), hipBLASLt has no BLK128x128 kernels, and a per-call dequantize costs 2–4 × the BF16 GEMM. A) decode each block-scaled weight to BF16 once at load (`cpu::quant::dequantize` with its scales as a loader companion) and serve it through the BF16 GEMM with BF16 activations — chosen: BF16 speed and memory, no weight-memory saving, the checkpoint's activation scheme not applied (its golden reference is made with `--act-quant none`); B) an own fused W8A16 WMMA kernel (FP8 in memory, dequantized in registers) — deferred as a follow-up; C) refuse `fp8_block` on amd. The column stays `fp8_block`.
 
+## P6: FP8 GEMM — provider evaluation (kernel reuse rule)
+
+Date: 2026-09-29 (Phase 6a Task 12). Card: R9700 (gfx1201), GPU 0, ROCm 7.14.1, hipBLASLt 1.4.1
+(100401), CK at the pinned `cd9574023093742434e8c992d13b89ab9a6c1cf8` (therock-7.14.1).
+Harness: `kernels/rocm/tools/qgemm_eval.cpp` (+ `qgemm_eval_ck.cpp` for the CK candidates),
+built with `-DTURBINE_BUILD_QGEMM_EVAL=ON`, run under `scripts/bench-lock.sh` with
+`ROCR_VISIBLE_DEVICES=0`. Per candidate, shape and m: hipBLASLt's first heuristic answer and the
+best of its first 8 answers, median of 5 rounds × 20 calls, rotating over 2–8 copies of the weight (as many as 512 MiB allows, at most 8); correctness on 6 sampled rows against a host reference with the CPU provider's semantics
+(`cpu::qgemm`: e4m3 values × scales, exact products, one rounding to BF16); tolerance one BF16
+rounding (2^-8 relative) plus summation order; "row-invariant" = row 0 of the first answer is
+bitwise the same at every m.
+
+Shapes (Llama-3.2-3B, fused as the executor runs them): qkv 5120×3072, o 3072×3072,
+gate_up 16384×3072, down 3072×8192.
+
+### Candidates
+
+| Candidate                                                                                                                   | Builds                  | Correct                                                                                                                                                                                                                                                     | Notes                                                                                                                                                                                                                     |
+| --------------------------------------------------------------------------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| hipBLASLt BF16×BF16→BF16 on the dequantized weight (today's path; W8A16 via dequantize)                                     | yes                     | — (baseline)                                                                                                                                                                                                                                                | timing baseline                                                                                                                                                                                                           |
+| hipBLASLt e4m3×e4m3→BF16, scalar A/B scales (`SAB`: FP8_TENSOR × FP8_TENSOR)                                                | yes                     | yes, max \|Δ\| ≤ 1.9e-2 at outputs ≈ 5–9 (one BF16 ulp)                                                                                                                                                                                                     | 8 solutions per shape                                                                                                                                                                                                     |
+| hipBLASLt e4m3×e4m3→BF16, vector scales `OUTER_VEC_32F` on both (`SABV`: FP8_CHANNEL × FP8_TOKEN)                           | yes                     | yes, max \|Δ\| ≤ 2.6e-2 at outputs ≈ 9                                                                                                                                                                                                                      | 8 solutions per shape; row-invariant on every shape                                                                                                                                                                       |
+| hipBLASLt mixed scalar × vector (FP8_CHANNEL × FP8_TENSOR, FP8_TENSOR × FP8_TOKEN)                                          | —                       | —                                                                                                                                                                                                                                                           | no solution on gfx1201 (heuristic returns 0 algorithms); served by broadcasting the scalar to a vector and running `SABV`                                                                                                 |
+| hipBLASLt FP8 with vector scales and F32 D                                                                                  | —                       | —                                                                                                                                                                                                                                                           | no solution on gfx1201 (found by `hip_qgemm`): `hipblaslt_fp8` supports BF16 out only                                                                                                                                     |
+| CK `ck_tile` `gemm_quant` RowColQuant (per-token × per-channel), decode tile 16×64×256 and prefill tile 128×128×128, BF16 C | yes (gfx1201, OCP e4m3) | **no**: outputs of magnitude 1e35–1e38 on every shape; m = 1 (and m = 16 with the prefill tile) refused by `IsSupportedArgument` (kPadM = false); CK's own example (`tile_example_gemm_quant -quant_mode=rowcol`) fails its CPU verification on gfx1201 too | reported "times" (e.g. o m=2048 90 µs = 430 TFLOP/s, above the card's FP8 peak) are not real work                                                                                                                         |
+| CK `ck_tile` `gemm_quant` TensorQuant (scalar × scalar), same tiles                                                         | yes                     | **no** (same garbage outputs)                                                                                                                                                                                                                               |                                                                                                                                                                                                                           |
+| vLLM / aiter ROCm scaled-mm                                                                                                 | not built               | —                                                                                                                                                                                                                                                           | vLLM's FP8 linear on ROCm dispatches to `torch._scaled_mm` (hipBLASLt, i.e. the candidates above) or to aiter, whose kernels are gfx942/gfx950 assembly; no separate gfx12 provider exists                                |
+| Activation quantization: CK `add_rmsnorm2d_rdquant` (fused norm + per-row quant)                                            | not built               | —                                                                                                                                                                                                                                                           | the v2.9 `quantize_act` descriptor carries no norm inputs, so fusing needs an ABI addition (lead-owned); CK's rdquant also rounds by its own conversion and scale reciprocal, which the bit-exact reference rule excludes |
+| Activation quantization: Turbine elementwise kernel (`src/qgemm_quantize.hpp`)                                              | yes                     | **bit-exact** (codes and scales) for FP8_TOKEN, FP8_GROUP128, FP8_TENSOR at every size, including zero rows (floor), saturation, ties                                                                                                                       | own kernel: no provider fits the ABI op                                                                                                                                                                                   |
+
+### µs per call, GPU 0 (first heuristic answer / best of 8)
+
+| shape   | m    | BF16            | FP8 SAB       | FP8 SABV        |
+| ------- | ---- | --------------- | ------------- | --------------- |
+| qkv     | 1    | 64.8 / 54.6     | 48.4 / 26.7   | 66.8 / 35.4     |
+| qkv     | 16   | 56.5 / 55.2     | 36.7 / 27.6   | 57.9 / 36.2     |
+| qkv     | 128  | 58.5 / 58.5     | 49.0 / 32.4   | 60.4 / 44.1     |
+| qkv     | 2048 | 454.7 / 454.7   | 270.1 / 264.5 | 406.1 / 385.3   |
+| o       | 1    | 51.3 / 39.5     | 27.0 / 18.6   | 56.5 / 23.1     |
+| o       | 16   | 40.0 / 40.0     | 25.2 / 19.3   | 41.0 / 23.4     |
+| o       | 128  | 48.4 / 46.8     | 42.6 / 22.3   | 42.3 / 26.1     |
+| o       | 2048 | 302.1 / 301.3   | 164.3 / 164.3 | 256.1 / 248.5   |
+| gate_up | 1    | 168.3 / 162.4   | 97.1 / 90.2   | 124.3 / 117.9   |
+| gate_up | 16   | 172.8 / 166.5   | 105.7 / 92.9  | 130.8 / 127.1   |
+| gate_up | 128  | 233.8 / 221.4   | 167.6 / 107.1 | 182.1 / 160.3   |
+| gate_up | 2048 | 1644.6 / 1596.2 | 851.3 / 851.3 | 1238.5 / 1220.7 |
+| down    | 1    | 111.4 / 96.5    | 61.7 / 44.1   | 79.5 / 58.2     |
+| down    | 16   | 112.9 / 97.2    | 66.1 / 44.6   | 83.9 / 59.5     |
+| down    | 128  | 152.1 / 100.0   | 74.3 / 46.6   | 90.5 / 70.0     |
+| down    | 2048 | 1005.3 / 1005.3 | 581.9 / 474.6 | 1145.5 / 968.4  |
+
+Activation quantization (Turbine kernel, µs): FP8_TOKEN k=3072: 9.3 / 8.1 / 8.4 / 61.3 at
+m = 1 / 16 / 128 / 2048; k=8192: 15.8 / 15.6 / 16.8 / 125.1. FP8_GROUP128 k=3072: 11.9 / 11.4 /
+12.1 / 89.0; k=8192: 26.4 / 26.0 / 27.3 / 212.9. FP8_TENSOR k=3072: 6.3 / 6.4 / 6.7 / 53.9;
+k=8192: 11.9 / 11.8 / 12.5 / 92.7.
+
+Per decode layer at m = 16 (four GEMMs; the BF16 path runs its tuned table, ≈ best): BF16 358.9 µs;
+FP8 SABV 313.6 µs with the first heuristic answers, 246.2 µs with the best, plus ≈ 40 µs of
+activation quantization (three k=3072 and one k=8192 token quantizations).
+
+### Pick
+
+- `hipblaslt_fp8` (provider hipblaslt): FP8_TENSOR / FP8_CHANNEL weights × FP8_TENSOR / FP8_TOKEN
+  activations through hipBLASLt's FP8 kernels with `SCALAR_32F` (tensor × tensor) or
+  `OUTER_VEC_32F` (vector × vector) scale modes; a mixed pairing broadcasts its scalar scale to a
+  vector (a device buffer of the context, ≥ 65,536 floats, grown only outside graph capture);
+  BF16 out only; k and lda multiples of 16. The only correct provider on gfx1201.
+- Activation quantization: own kernel `turbine_hip` (`src/quantize_act.hip`,
+  `src/qgemm_quantize.hpp`) — no provider takes the v2.9 `quantize_act` op; CK's fused
+  norm+quant would need an ABI change and is not bit-exact with the reference rule.
+- Findings to act on: (1) the first heuristic answer is 1.2–2.4× slower than the best of hipBLASLt's
+  top 8 at decode sizes (qkv, o, down), so FP8 shapes need pinned solutions (a tuned FP8 table) to
+  reach the S-20 targets — without it FP8 decode GEMM time is ≈ BF16's; (2) SABV at m = 2048 is no
+  faster than BF16 on down (968 vs 1005 µs) and only 1.2–1.3× on the others (per-token × per-channel
+  checkpoints gain in decode, little in prefill); SAB (per-tensor) is 1.7–2.1× faster than BF16
+  at m = 2048. (3) CK `gemm_quant` RowCol/Tensor is not usable on gfx1201 at this CK pin.
+
+## P6: FP8 GEMM — pinned solutions and prefill row invariance (addendum to the FP8 GEMM evaluation)
+
+Date: 2026-09-29 (Phase 6a Task 13 follow-up, commit "perf(rocm): pinned FP8 decode solutions and
+row-invariant FP8 prefill"). GPU 0 under `scripts/bench-lock.sh`, hipBLASLt 1.4.1 (791 FP8
+BF16-out and 780 F32-out solutions listed).
+
+**Decode.** `turbine_qgemm_eval --tune 1` timed every FP8 solution that takes each Llama-3.2-3B
+shape at m ∈ {1, 2, 4, 8, 16, 32, 64}; the best beats hipBLASLt's first heuristic answer by
+1.3–2.9× (e.g. SABV qkv m=16 35.4 vs 103.7 µs, o 22.0 vs 62.4, down 53.5 vs 121.2). The winners are
+pinned in `kernels/rocm/src/qgemm_tuned.hpp` (decode steps only, `TURBINE_OPTION_GEMM_AUTOTUNE`).
+Per decode layer at m = 16 (qkv + o + gate_up + down): BF16 tuned 358.9 µs, FP8 SABV pinned
+240.0 µs, FP8 SAB pinned 167.0 µs, plus the activation quantization.
+
+**Prefill.** Prefix reuse (Phase 4) needs a prefill row's result to be bitwise independent of the
+call's size and of the row's position in it. `--tune-prefill 1` checked every solution with split-K
+off, fastest first, against rows of a 513-row call recomputed as calls of 1, 7, 128 rows (from
+row 0), 213 rows (from row 300) and 64 rows (from row 1), each in fresh buffers:
+
+- scalar scales (SAB, BF16 out): row-invariant solutions exist for every shape (1–25 faster ones
+  rejected); pinned as the shapes' prefill rows.
+- vector scales (OUTER_VEC, SABV): **none** of the 11 solutions that take the problem is
+  row-invariant on gfx1201. Evaluated alternative: a scalar-scale solution with unit scales and F32
+  out (row-invariant ones exist, 0–5 faster rejected) plus an **own epilogue kernel**
+  (`src/qgemm_epilogue.hpp`) applying the row and column scales into BF16. At m = 2048 (GEMM +
+  epilogue) vs SABV's first answer: qkv 320 vs 406 µs, o 200 vs 256, gate_up 1332 vs 1238, down
+  528 vs 1145. Picked for FP8_CHANNEL / FP8_TOKEN prefills (chunked to 64 MiB of F32 sums).
+
+Provisional, pending user review: the epilogue is an own kernel (no provider has a row-invariant
+vector-scale FP8 solution on gfx1201); the 64 MiB of prefill sums per context are not in the model's
+memory accounting; the 8B shapes have no pinned rows yet (they run the heuristic and log
+`event=qgemm_prefill_unpinned`).
+
+## P6: block-scaled FP8 GEMM — provider evaluation (kernel reuse rule)
+
+Date: 2026-09-29 (Phase 6a Task 15). Card: R9700 (gfx1201), GPU 0 under `scripts/bench-lock.sh`,
+ROCm 7.14.1, hipBLASLt 1.4.1, CK at the pinned `cd9574023093742434e8c992d13b89ab9a6c1cf8`.
+Harness: `kernels/rocm/tools/qgemm_eval.cpp --block 1` (CK instances in `qgemm_eval_ck.cpp`),
+Llama-3.2-3B shapes, 128 × 128 weight blocks (F32 block scales, `[n/128, k/128]`), activations
+per token and 128-column group (FP8_GROUP128) for the W8A8 candidates; correctness on 6 sampled
+rows against a host reference of `cpu::qgemm` semantics (one BF16 rounding of the exact sum).
+
+| Candidate                                                                                | Builds | Correct                                                                      | µs (m = 1 / 16 / 128 / 2048)                                                                                                |
+| ---------------------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| CK `ck_tile` `gemm_quant` ABQuantGrouped (A 1×1×128, B 1×128×128), decode tile 16×64×256 | yes    | **no**: outputs of magnitude 1e37–1e38 on every shape; m = 1 refused (kPadM) | qkv —/48/82/1070 (not real work)                                                                                            |
+| same, prefill tile 128×128×128 (`GemmConfigABQuantPrefill`)                              | yes    | **no** (same); m < 128 refused                                               | qkv —/—/54/203 (not real work)                                                                                              |
+| hipBLASLt block scales (`BLK128x128_32F`, `VEC128_32F`)                                  | —      | —                                                                            | "not supported yet" in hipBLASLt 1.4.1; no gfx1201 kernel                                                                   |
+| W8A16 per call: own dequantize-to-BF16 kernel + hipBLASLt BF16 GEMM                      | yes    | dequantize **bit-exact** vs the host decode                                  | dequantize 175 (qkv) / 111 (o) / 573 (gate_up) / 282 (down) per call, **plus** the BF16 GEMM: 2–4× the BF16 layer at decode |
+| W8A16 dequantized once at load (BF16 weights on the device, hipBLASLt BF16 GEMM)         | yes    | exact decode (host `cpu::quant::dequantize`)                                 | = BF16: qkv 56/57/59/454, o 40/40/52/312, gate_up 169/173/235/1499, down 114/113/143/1015                                   |
+
+CK's `ck_tile` FP8 `gemm_quant` path gives the same wrong results for RowColQuant and TensorQuant
+(decision "P6: FP8 GEMM — provider evaluation"), and CK's own `tile_example_gemm_quant` fails
+its CPU verification on gfx1201: not usable at this CK pin (a vendor defect, not debugged further).
+
+### Pick (per Q3: W8A16 through a dequantize-to-BF16 path)
+
+`fp8_block` is served W8A16 with its weights **dequantized to BF16 once at load** (the loader decodes
+each block-scaled tensor with `cpu::quant::dequantize` through the staging buffer and runs the layer
+on the BF16 GEMM; no activation quantization). It is the only candidate that is correct and meets
+the S-20 target (c16 ≥ 1.0 × BF16): the per-call dequantize path costs 2–4× the BF16 GEMM, and no
+provider has a correct block-scaled FP8 GEMM on gfx1201. `hipblaslt_fp8` keeps refusing
+`FP8_BLOCK`. The golden reference is made with `--act-quant none` (what is served).
+
+Provisional, pending user review: the memory saving of FP8 is given up for `fp8_block` (the device
+holds BF16 weights). An own fused W8A16 kernel (FP8 read, dequantized in registers, WMMA) would keep
+it and could beat BF16 at decode; it is allowed by the reuse rule (no provider works) but deferred.
