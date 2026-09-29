@@ -4,8 +4,8 @@
 //! `rope_theta` / `rope_scaling`). `load_model_config` reads neither and silently falls back to
 //! theta 10 000 with no llama3 scaling, so the model runs with the wrong rotary table.
 //!
-//! Ignored until the fix lands in `config.rs` (lead-owned); `cargo test -p turbine-model --test
-//! config_rope_parameters -- --ignored` fails today with `rope_theta 10000`.
+//! The fix (`config.rs` reads `rope_parameters`, no silent `rope_theta` default) landed with
+//! `p6a-rope-parameters`; this test guards it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,7 +40,6 @@ fn transformers5_config_dir() -> PathBuf {
 }
 
 #[test]
-#[ignore = "W4A4 8B root cause: rope_parameters is not read (config.rs, lead-owned); un-ignore with the fix"]
 fn rope_parameters_is_read_like_rope_theta_and_rope_scaling() {
     let cfg = load_model_config(&transformers5_config_dir()).unwrap();
     assert_eq!(cfg.rope_theta, 500_000.0, "rope_theta from rope_parameters");
