@@ -2123,3 +2123,24 @@ GSM8K-200.
 jobs; weights are fetched on `novanas` with `hf download … --revision <pinned rev>` (the token stays there). If no
 suitable published checkpoint exists, the options (e.g. quantizing one ourselves with a Python tool at fixture time,
 off the serving path) go back to the user. `gptq_int4` stays `experimental` meanwhile.
+
+## GPTQ INT4: which better checkpoint (2026-09-30, follows "GPTQ INT4: full-GSM8K drop just over the 4-bit bound")
+
+Context: no published GPTQ checkpoint of Llama-3.2-3B-Instruct from a known publisher has damp 0.01 and `desc_act`
+false. RedHatAI / neuralmagic publish no 3B `w4a16`; `kaitchup/…-gptqmodel-4bit`, `clowman/…-GPTQ-Int4` and
+`ModelCloud/…-vortex-v3` use act-order (refused, `gptq_act_order`); `kaitchup/Llama-3.2-3B-Instruct-AutoRoundGPTQ-4bit`
+and `fbaldassarri/…-auto_gptq-int4-gs128-sym` fit the loader (damp 0.01, no act-order, sym, group 128, GPTQ packing) but
+were made with AutoRound. `ct_pack_int4` (compressed-tensors pack-quantized) also resolves to the `gptq_int4` row.
+
+- A) Quantize our own with llm-compressor (GPTQ modifier, W4A16 sym, group 128, damp 0.01, no act-order, ≈ 512
+  calibration samples, from the BF16 unsloth checkpoint; Python at fixture time on `novanas` only), served through
+  `ct_pack_int4` on Turbine and on vLLM-ROCm if it loads — chosen, second
+- B) As A with GPTQModel writing AutoGPTQ format (Turbine's `gptq` loader; vLLM likely hits the same `qzeros` defect)
+- C) A quick full-GSM8K c16 run on `kaitchup/Llama-3.2-3B-Instruct-AutoRoundGPTQ-4bit` (pinned revision) — chosen,
+  first, as an AutoRound early data point only: it does not decide the row
+- D) Keep `gptq_int4` `experimental` and close 6a with AWQ as the supported 4-bit format
+
+**Decision (user, 2026-09-30, relayed by the coordinator): C, then A.** Both queue after `w4a4-rerun` and the fp8_block
+jobs (the AutoRound run may go earlier when a GPU slot fits); calibration is its own queued GPU job; weights download on
+`novanas` with `hf download … --revision <pinned rev>` (the token stays there). The `gptq_int4` row is re-judged on the A
+run against the 0.04 bound; it stays `experimental` until then.
