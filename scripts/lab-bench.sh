@@ -182,10 +182,10 @@ fi
 # 1. build (server + kernels) on novanas, tests alongside only with --with-tests
 (
 	scripts/remote-cargo.sh build -q --release -p turbine-server -p turbine-bench &&
-		ssh -o BatchMode=yes "$host" "cd '$remote/src' && flock -s /home/piwi/turbine-ci/bench.lock \
+		ssh -o BatchMode=yes "$host" "cd '$remote/src' && nice -n 19 taskset -c ${TURBINE_REMOTE_CPUS:-12-15} \
       cmake -S kernels/rocm -B '$remote/kbuild' -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 >/dev/null &&
-      flock -s /home/piwi/turbine-ci/bench.lock cmake --build '$remote/kbuild' >/dev/null"
+      nice -n 19 taskset -c ${TURBINE_REMOTE_CPUS:-12-15} cmake --build '$remote/kbuild' -j 4 >/dev/null"
 ) >"$out/build.log" 2>&1 &
 build_pid=$!
 if [[ $run_tests -eq 1 ]]; then
@@ -213,7 +213,7 @@ fi
 # explains why: their swap-in pushes the server's pressure controller into SURVIVAL).
 # From here to the end the run also holds bench.lock exclusively (the gate first, as
 # scripts/bench-lock.sh does): GPU 0 serves this run only, so kernel evaluations (bench-lock),
-# lab-test and lab-serve Jobs (bench-lock --shared) and builds (flock -s) wait for it.
+# lab-test and lab-serve Jobs wait for it; builds do not (nice 19 on cores 12-15, away from 0-11).
 lockdir="$(mktemp -d)"
 mkfifo "$lockdir/in" "$lockdir/out"
 ssh -o BatchMode=yes "$host" \

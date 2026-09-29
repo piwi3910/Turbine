@@ -34,6 +34,14 @@
 # --dry-run prints every command that would contact the host instead of running it.
 # TURBINE_LAB_SERVE_TIMEOUT: seconds to wait for /ready once the pod runs (default 3600; a cold
 #   run compiles Composable Kernel and the release server).
+# One GPU job at a time (coordinator rule 2026-09-29, until novanas's PSU is replaced;
+#   TURBINE_LAB_ONE_GPU_JOB=0 turns it off): a start first takes /home/piwi/turbine-ci/bench.lock
+#   exclusively (through bench.gate, like scripts/bench-lock.sh) in a holder process on novanas
+#   (runs/serve-locks/<run id>.sh) that keeps it while the serve Job exists and releases it when
+#   the Job is gone (--stop, a failed start, an interrupt), so it covers the whole life of a
+#   server this script leaves running. Under a caller that already holds bench.lock exclusively
+#   (scripts/bench-lock.sh exports TURBINE_BENCH_LOCK_HELD) no second lock is taken; under a
+#   shared hold the start is refused (it would wait for itself). --gpus 2 is refused.
 # Exit codes: 0 ready (or stopped), 2 usage error, otherwise non-zero with a message naming the
 # failed step.
 set -euo pipefail
@@ -280,6 +288,7 @@ failed_step() {
 # Deletes this run's Job and upload, nothing else.
 cleanup() {
 	kube "-n ${NS} delete job ${JOB} --ignore-not-found" >/dev/null || true
+	gpu_unlock
 	[[ "$MODE" == vllm ]] || remote "rm -rf ${RUN_DIR}" || true
 }
 
@@ -429,6 +438,7 @@ require_free_port() {
 start() {
 	say "run ${RUN_ID}: job ${JOB}"
 	require_free_port
+	gpu_lock
 
 	remote "mkdir -p ${RUN_DIR}/src ${CI_ROOT}/cache/slots && find ${CI_ROOT}/runs -mindepth 1 -maxdepth 1 -mmin +1440 -exec rm -rf {} +" ||
 		fail "ssh to ${REMOTE} failed"
@@ -469,6 +479,7 @@ start() {
 start_vllm() {
 	say "run ${RUN_ID}: job ${JOB} (vLLM-ROCm serving ${SLUG} as ${SERVED_NAME}, ${VLLM_GPUS} GPU(s)${VLLM_ARGS[*]+, ${VLLM_ARGS[*]}})"
 	require_free_port
+	gpu_lock
 	remote "test -d /home/piwi/turbine-models/${SLUG}" ||
 		fail "weights /home/piwi/turbine-models/${SLUG} are not provisioned (or ssh to ${REMOTE} failed)"
 	remote "command -v kubectl >/dev/null" || fail "kubectl is not available on ${HOST}"
@@ -499,6 +510,80 @@ start_vllm() {
 	else
 		say "vLLM ready at ${URL} (stop with: scripts/lab-serve.sh ${HOST} --stop)"
 	fi
+}
+
+ONE_GPU_JOB="${TURBINE_LAB_ONE_GPU_JOB:-1}"
+LOCK_DIR="${CI_ROOT}/runs/serve-locks"
+LOCK_TAG="${LOCK_DIR}/${RUN_ID}.sh"
+LOCK_HELD=0
+
+# Takes bench.lock for this run's serve Job (see the header); returns once the holder on the
+# host has it. The holder waits up to 1 h for the Job to appear (upload and apply), then holds
+# while `kubectl get job` finds it; a kubectl error counts as still present.
+gpu_lock() {
+	[[ "$ONE_GPU_JOB" == 1 ]] || return 0
+	local gpus=$SERVE_GPUS
+	[[ "$MODE" == vllm ]] && gpus=$VLLM_GPUS
+	if [[ $gpus -eq 2 && $DRY_RUN -eq 1 ]]; then
+		echo "+ a real run refuses --gpus 2 while one GPU job at a time holds (TURBINE_LAB_ONE_GPU_JOB=0 overrides)"
+		return 0
+	fi
+	if [[ $gpus -eq 2 ]]; then
+		fail "--gpus 2 refused: one GPU job at a time on novanas until its PSU is replaced (TURBINE_LAB_ONE_GPU_JOB=0 overrides)" 2
+	fi
+	case " ${TURBINE_BENCH_LOCK_HELD:-} " in
+	*" bench:x "*)
+		say "bench.lock already held exclusively by the caller"
+		return 0
+		;;
+	*" bench:s "*)
+		fail "bench.lock is held shared by the caller; one GPU job at a time needs it exclusively (wrap in scripts/bench-lock.sh without --shared)" 2
+		;;
+	esac
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ hold ${CI_ROOT}/bench.lock exclusively on ${HOST} (holder ${LOCK_TAG}) while job ${JOB} exists"
+		return 0
+	fi
+	remote_stdin "mkdir -p ${LOCK_DIR} && cat >${LOCK_TAG}" <<HOLDER || fail "cannot write the bench.lock holder ${LOCK_TAG}"
+export KUBECTL_KUBERC=false
+present() {
+	out=\$(kubectl -n ${NS} get job ${JOB} --ignore-not-found -o name 2>/dev/null) || return 0
+	[ -n "\$out" ]
+}
+echo locked >${LOCK_TAG}.state
+t=0
+while ! present; do
+	[ -e ${LOCK_TAG}.state ] || exit 0
+	t=\$((t + 5))
+	[ \$t -ge 3600 ] && break
+	sleep 5
+done
+while present; do sleep 5; done
+rm -f ${LOCK_TAG}.state
+HOLDER
+	remote "setsid nohup flock -x ${CI_ROOT}/bench.gate flock -x ${CI_ROOT}/bench.lock sh ${LOCK_TAG} >${LOCK_TAG}.log 2>&1 </dev/null &" ||
+		fail "cannot start the bench.lock holder on ${HOST}"
+	LOCK_HELD=1
+	trap on_interrupt INT TERM
+	say "waiting for ${CI_ROOT}/bench.lock (exclusive; one GPU job at a time)"
+	local waited=0
+	until remote "test -e ${LOCK_TAG}.state"; do
+		if ((waited % 300 == 0 && waited > 0)); then say "still waiting for bench.lock (${waited} s)"; fi
+		sleep 5
+		waited=$((waited + 5))
+	done
+	say "holding bench.lock until job ${JOB} is deleted"
+}
+
+# Ends this run's holder at once (a failed or interrupted start; otherwise the Job's deletion
+# ends it within 5 s).
+gpu_unlock() {
+	[[ $LOCK_HELD -eq 1 ]] || return 0
+	# Separate calls: a command line naming the holder's path would match its own pkill. A child
+	# of the holder (sleep 5, kubectl) keeps the lock fd until it exits, so the lock frees within ~5 s.
+	remote "rm -f ${LOCK_TAG}.state ${LOCK_TAG}" || true
+	remote "pkill -f '[r]uns/serve-locks/${RUN_ID}[.]sh'" || true
+	LOCK_HELD=0
 }
 
 case "$MODE" in

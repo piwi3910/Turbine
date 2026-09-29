@@ -1,4 +1,14 @@
-# Handoff: Phase 6a lead (rotation at ~270k tokens, 2026-09-29 ~08:40 +04)
+# Handoff: Phase 6a lead (rotation at ~270k tokens, 2026-09-29 ~08:40 +04; updated by the second lead ~08:50)
+
+**Update (second lead, 08:50):** merged p6a-kv-t24 (c1ecafd; one "gate misses" entry, 185ccee's text) and the GSM8K
+dataset 781edad (d466c0b); d1de280 Quark K/V `layer_quant_config` mirrors ignored (W4A4 8B startup refusal); review
+file updated (386898a); fixture queue ordered by `scripts/lab/fixture-order.sh` + `/home/piwi/turbine-ci/fixture.queue`
+(9220129: fp8kv → p6a-int4 → llama-3.1-8b → fp8-block → yarn); gate ok 775 on 386898a. queue3.sh stopped (it paused
+the fixtures while waiting for bench.lock); its remaining steps went to the Task 20 builder. Dataset worktree removed.
+New builders: Task 18 INT4 `a74d419d213cc35b9` (worktree agent-abee0e2542a317f3c, p6a-int4), Task 20 MXFP4
+`a49bfb18f85acff9a` (worktree agent-a4784842b25c93376, p6a-mxfp4), both on non-fixture work first. Asked the YaRN
+builder whether it is blocked on the fold (its `timeout 21600 flock` expires ~13:18 while waiting). Items 1, 4, 5
+below are done or handed out; a19ca024910301566 finished.
 
 Integration worktree `.claude/worktrees/agent-a4b513efedb95892f`, branch `phase-6a-quantization`, tip 4f45232, clean.
 Lab runs from the clean detached worktree `agent-a4b513efedb95892f-lab` (lab scripts rsync uncommitted files).
@@ -71,6 +81,14 @@ Finished (don't reuse): ad2d9c8c7cc380c42 (Task 24 wrap-up).
 - Disk: cleanup from ~100 GB free (209 GB at 07:56): `git worktree remove` merged clean finished trees →
   `TURBINE_PRUNE_IDLE_HOURS=1 scripts/lab-prune.sh --report` → real run only if it lists finished agents' trees only.
 - Rotation: one task per builder; replace at ~300k tokens with a handoff; sonnet for mechanical work.
+- Never block in the foreground on a lock or a long remote run (coordinator, 2026-09-29; three builders died to
+  the 600 s stream watchdog): start them with `run_in_background` (or detached on the host) and get notified. Put
+  this line in every builder brief. Builds and gates no longer take bench.lock (f94cbf1: nice 19, cores 12-15).
+- No polling (coordinator, 2026-09-29): a builder whose only remaining work is waiting hours for a queued run writes
+  the run's paths and how to judge it into its handoff, messages the lead and ends. The lead checks the novanas logs
+  cheaply whenever woken and starts a short-lived collector (sonnet unless numerics) once a run has finished. The lead
+  keeps no monitor of its own. Told: a4baec4689b995379, aa94fe3bfacab12b1, a74d419d213cc35b9, a49bfb18f85acff9a
+  (the coordinator told a67eec8abc8f117eb).
 - Ownership: the lead owns the kernel header, `ffi.rs`, ops, registry, turbine-model config/decoder/loader/weights, core
   support/config, `.procoder/`; builders send `handoff(<file>)` commits. No push; merge into local main at 6a close.
 - Design questions go to the coordinator via SendMessage; keep working on anything independent.
@@ -80,3 +98,82 @@ Finished (don't reuse): ad2d9c8c7cc380c42 (Task 24 wrap-up).
 `.procoder/review-2026-09-29.md` is as the previous lead left it (overnight state, through 2116221). Not yet updated
 with: the agent loss and rebuild, the new builders, the Task 24 / 18 / 20 numbers in this file, the GSM8K decisions.
 Update it at the next clean point.
+
+## Since 09:00 (second lead)
+
+- Merged p6a-fp8-t15 (16b06ef): `turbine_hip_fp8_block` (W8A16, fused WMMA decode, dequant+hipBLASLt prefill), FP8
+  layout in the loader with per-stack decode fallback (`for_kernels` / `resolve_for_providers`), the old widened test
+  bound removed. Lead-owned handoffs reviewed (weights/mod.rs, fp8.rs, model.rs) before the merge.
+- e06afc9: `lab-serve.sh` takes bench.lock itself for its serve Job's life (holder `runs/serve-locks/<run>.sh` on
+  novanas, released on Job deletion), `--gpus 2` refused; `bench-lock.sh` exports `TURBINE_BENCH_LOCK_HELD`.
+  Builders' worktrees get it when they merge integration.
+- Task 15 proof builder `ae29a5cff88bf0bdb` (worktree agent-a4baec4689b995379), gated on the served-bytes check.
+
+## Detached runs to collect (check cheaply when woken; start a short collector once done)
+
+- Full-GSM8K FP8 KV, 4 passes (a67eec8abc8f117eb, ended): handoff `.procoder/handoff/p6a-kv-t24-full.md` on
+  `p6a-kv-t24-full` (027803a). Log `/home/piwi/turbine-ci/remote/agent-a67eec8abc8f117eb/gsm8k_full_run.log`, done at
+  `ALLDONE rc: …`. Until then no remote-cargo / lab-bench / gate from that worktree and don't remove it. Both
+  checkpoints seem to lack k_scale/v_scale (scales 1.0): an OLMoE miss points at e4m3 range/saturation first, then
+  Turbine vs the emulated-FP8-KV reference; that collector needs the default model.
+- Task 15 served bytes: `scratchpad/t15_weight_bytes.txt` (last line `t15-serve: done rc=… run=…`; local pid 55147);
+  the Task 15 proof builder judges it (3,607,615,488 B, no `fp8_block_decoded`).
+
+
+- 10:30: novanas stopped answering ssh (ping ~300 ms); waited, not debugged. Killed the queued T15 served-bytes chain
+  (pid 55147): its old bench-lock.sh would have run the T15 worktree's new self-locking lab-serve.sh and deadlocked
+  on its own lock; relaunch it with the new scripts. Worktrees without e06afc9 (p6a-mxfp4 with queue4 running,
+  p6a-int4, p6a-yarn-t28, p6a-kv-t24-full) must not merge integration while their old-script queues run.
+
+## Rotation of the second lead (~10:45, ~311k tokens) — START HERE
+
+Integration `phase-6a-quantization` tip = this commit (after 7544183), clean, no push. Scratchpad =
+`/private/tmp/claude-501/-Users-pascal-Development-Turbine/7482a1b1-2407-47bb-91f2-d826e25c21af/scratchpad`.
+
+**Gate:** last green = 386898a (775/0). Not yet green since: T15 merge (16b06ef), e06afc9 (lab-serve lock),
+f94cbf1 (builds off bench.lock), docs. Clippy passed on f94cbf1 in 19 s without a lock wait; the test step died
+twice to novanas ssh timeouts (the host is up since 07:01, no crash; ssh stalls under load ~10:28 and ~10:40).
+A gate on 7544183 was running in the background (`scratchpad/gate-7544183.txt`), likely failing on ssh. First
+action: rerun `scripts/gate.sh` (run_in_background) once `ssh novanas true` answers.
+
+**Restarts pending (after the gate is green; fresh agents; every brief says: never block in the foreground on a
+lock or a long remote run — run_in_background, get notified; no polling; `git status` first):**
+- T28 YaRN (dead aa94fe3bfacab12b1): worktree `agent-aa94fe3bfacab12b1`, branch `p6a-yarn-t28` (c06a1c8), no merge
+  state; uncommitted: golden.rs, hf_reference.py, yarn_long_prompt.py, yarn_self_spread.py, yarn16 config and
+  fixture dir. Its last known work: CPU-provider A/B, transformers-style attention factor (cos/sin × m before BF16)
+  vs the fold, on GPU 0 — the result may be in its scratch/logs; the fold placement is a design question to the
+  lead/coordinator before changing lead-owned files. Findings so far: p16 tail same on CPU and HIP (kernels ruled
+  out), p17-long HIP tail flatter than reference. The fold spread job may be left to time out (builder's call).
+- T15 proof (dead ae29a5cff88bf0bdb): worktree `agent-a4baec4689b995379`, branch `p6a-fp8-t15` (78e51fe, has
+  e06afc9 but not f94cbf1 — merge integration first), clean. Brief = the one given to ae29a5cff88bf0bdb (in this
+  handoff's history): served-bytes check first (below), then GSM8K-200 vs BF16 3B (FP8 bound 0.02), lab-bench
+  `--model llama-fp8-block --golden16 --c1`, vLLM fp8-block baseline, labbook, tolerance once the fp8-block
+  reference (fixture queue, `scratchpad/fp8/fixture_chain2.sh`) and a spread exist; soak asks the lead; row flip as
+  a handoff(support.rs) commit.
+
+**Detached runs / collectors:**
+- T15 served bytes: relaunched ~10:40 as `nohup scripts/bench-lock.sh --name port18000 bash scratchpad/t15_serve.sh`
+  from the T15 worktree (new lab-serve takes bench.lock itself). Its lock ssh printed a timeout — check
+  `scratchpad/t15_serve_lock.txt`; if bench-lock exited, relaunch the same way. Result: `scratchpad/t15_weight_bytes.txt`,
+  last line `t15-serve: done rc=… run=…`; pass = weight_bytes 3,607,615,488, no `fp8_block_decoded`.
+- T20 queue4 (dead builder ended deliberately; handoff committed 822d8a6 on `p6a-mxfp4`): local `bash queue4.sh`
+  (pid 34597, log `scratchpad/mxfp4/queue4.log`, outputs `scratchpad/mxfp4/ev3/`): W4A4 8B GSM8K-200 → vLLM 8B-a4 →
+  full GSM8K MXFP4-A16 then BF16 8B → 3 lab-benches. Done at `queue4: done`. Collector (default model if the full-set
+  MXFP4-A16 drop > 0.04: numerics check before any status change) follows `.procoder/handoff/p6a-mxfp4.md` "How to
+  judge". Plus fixq (fixture queue, rank 3). The T18 AWQ lab-bench (pid 6025 chain, from a74d419d213cc35b9's
+  background call) also waits on port18000.
+- Full-GSM8K FP8 KV (4 passes): see "Detached runs to collect" above (ALLDONE line; don't touch that worktree).
+- T18 INT4 builder a74d419d213cc35b9: still alive (background lab-bench); no report yet.
+
+**Must not merge integration while their old-script queues run** (their old bench-lock.sh doesn't export
+TURBINE_BENCH_LOCK_HELD, the new lab-serve.sh would wait on its own caller, and a remote-cargo sync replaces
+binaries mid-run): `p6a-mxfp4` (until `queue4: done`), `p6a-kv-t24-full` (until ALLDONE), `p6a-int4` (until its
+AWQ lab-bench and anything else it queued have finished; tell a74d419d213cc35b9). `p6a-yarn-t28`: check
+for detached runs before merging.
+
+
+**Check first on novanas (unverified at rotation, ssh down):** the fixture dispatcher's launching ssh session ended
+(exit 1). The dispatcher was started with setsid nohup, so it should still run. Verify with
+`pgrep -af '[f]ixture-order.sh'` and `tail /home/piwi/turbine-ci/fixture-order.log`. If it is gone, the waiters it
+stopped stay in state T: restart it (`setsid nohup bash /home/piwi/turbine-ci/fixture-order.sh >>…/fixture-order.log
+2>&1 </dev/null &`), or `kill -CONT` the `flock …/fixture.lock` waiters.

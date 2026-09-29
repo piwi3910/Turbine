@@ -6,11 +6,10 @@
 # --name picks another lock file, /home/piwi/turbine-ci/<lock>.lock (lab-bench.sh holds
 # `port18000` for its whole serve-and-measure run, so two runs never share the port).
 #
-# Takes an exclusive flock on <host>:/home/piwi/turbine-ci/bench.lock (waiting for running
-# scripts/remote-cargo.sh builds, which hold it shared, to finish), runs <command> locally, then
-# releases the lock. While it is held no new remote-cargo build starts, so a benchmark against a
-# lab server measures the engine, not the CPU contention of parallel builds. Exits with the
-# command's exit code. --shared takes the lock shared instead: wrap scripts/lab-test.sh runs in it
+# Takes an exclusive flock on <host>:/home/piwi/turbine-ci/bench.lock (the GPU queue: lab-test
+# Jobs, lab-serve sessions, benchmarks), runs <command> locally, then releases the lock. Builds
+# (scripts/remote-cargo.sh) do not take it: they run at nice 19 on cores 12-15, away from a
+# benchmark's cores 0-11. Exits with the command's exit code. --shared takes the lock shared instead: wrap scripts/lab-test.sh runs in it
 # so their in-Job builds also wait while a benchmark holds the lock. Environment: TURBINE_REMOTE_HOST (default piwi@192.168.10.203, novanas).
 set -euo pipefail
 
@@ -61,6 +60,9 @@ if [[ "$state" != "locked" ]]; then
 	exit 1
 fi
 echo "bench-lock: holding $host $lock lock" >&2
+# Tells nested lab scripts (lab-serve.sh) which locks this process tree already holds, so they
+# do not queue behind their own caller: "<lock>:x" or "<lock>:s", space-separated.
+export TURBINE_BENCH_LOCK_HELD="${TURBINE_BENCH_LOCK_HELD:+$TURBINE_BENCH_LOCK_HELD }$lock:${mode#-}"
 
 rc=0
 "$@" || rc=$?

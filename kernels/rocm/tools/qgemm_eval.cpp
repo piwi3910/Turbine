@@ -44,6 +44,7 @@
 
 #include "gemm_problem.hpp"
 #include "qgemm_epilogue.hpp"
+#include "qgemm_fp8_block_kernels.hpp"
 #include "qgemm_problem.hpp"
 #include "qgemm_quantize.hpp"
 #ifdef TURBINE_QGEMM_EVAL_CK
@@ -711,6 +712,30 @@ bool eval_block(Env &env, Rng &rng, const std::vector<std::string> &shapes,
       std::printf("block shape=%s m=%lld cand=w8a16_bf16_gemm us=%.2f "
                   "(+ %.2f to dequantize per call)\n",
                   s.name, (long long)m, t_bf16, t_deq);
+      // The own fused W8A16 kernel (turbine_hip_fp8_block's decode path),
+      // launched as the library does (waves by k / 128).
+      if (m <= 64) {
+        const int64_t blocks = k / 128;
+        auto fused = [&](int i) {
+          const auto *w = static_cast<const uint8_t *>(view.w_fp8[i % copies]);
+          if (blocks >= 64)
+            (void)turbine_hip::fp8_block::launch_wmma<1, 8>(
+                view.a_bf16, w, view.ws_dev, view.c, m, n, k, k, n, false, 1.0f,
+                env.stream);
+          else if (blocks >= 32)
+            (void)turbine_hip::fp8_block::launch_wmma<1, 4>(
+                view.a_bf16, w, view.ws_dev, view.c, m, n, k, k, n, false, 1.0f,
+                env.stream);
+          else
+            (void)turbine_hip::fp8_block::launch_wmma<1, 2>(
+                view.a_bf16, w, view.ws_dev, view.c, m, n, k, k, n, false, 1.0f,
+                env.stream);
+        };
+        const double t_fused = time_launches(env, fused);
+        std::printf("block shape=%s m=%lld cand=turbine_hip_fp8_block_fused "
+                    "us=%.2f\n",
+                    s.name, (long long)m, t_fused);
+      }
 #ifdef TURBINE_QGEMM_EVAL_CK
       for (const bool prefill : {false, true}) {
         const char *name = prefill ? "ck_abquant_prefill" : "ck_abquant_decode";

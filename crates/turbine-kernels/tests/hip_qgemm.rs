@@ -20,8 +20,8 @@ use turbine_kernels::cpu::quant::{fp8_e4m3_round, fp8_e4m3_value};
 use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
 use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
-    KernelProvider, OpKind, QGemmConfig, QGemmContext, QuantizeActConfig, QuantizeActContext,
-    ShimLibrary, cpu_reference_provider, shim_provider,
+    GemmContext, KernelProvider, OpKind, QGemmConfig, QGemmContext, QuantizeActConfig,
+    QuantizeActContext, ShimLibrary, cpu_reference_provider, shim_provider,
 };
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceMemory, Tensor, TensorView};
@@ -437,7 +437,8 @@ fn assert_implementations(p: &Pair) {
             "hipblaslt_fp8",
             "turbine_hip_int4_wmma",
             "turbine_hip_int4_dequant",
-            "turbine_hip_mxfp4"
+            "turbine_hip_mxfp4",
+            "turbine_hip_fp8_block"
         ]
     );
     assert_eq!(
@@ -684,6 +685,282 @@ fn qgemm_prefill_rows_do_not_depend_on_m() {
                 );
             }
             println!("qgemm prefill {name} {cfg}: rows independent of m ok");
+        }
+    }
+}
+
+const FP8_BLOCK: QuantSchemeDesc = QuantSchemeDesc::Fp8Block {
+    block_n: 128,
+    block_k: 128,
+};
+
+/// e4m3 weights `[n, k]` with one F32 scale per 128 × 128 block (`[n/128, k/128]`, per-block
+/// amax / 448) of a unit-variance output layer.
+fn fp8_block_weights(rng: &mut Rng, n: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
+    let w = rng.normal(n * k, 1.0 / (k as f32).sqrt());
+    let (nb, kb) = (n.div_ceil(128), k.div_ceil(128));
+    let mut scales = vec![0f32; nb * kb];
+    for r in 0..n {
+        for c in 0..k {
+            let s = &mut scales[(r / 128) * kb + c / 128];
+            *s = s.max(w[r * k + c].abs());
+        }
+    }
+    for s in &mut scales {
+        *s /= 448.0;
+    }
+    let q = (0..n * k)
+        .map(|i| fp8_e4m3_round(w[i] / scales[(i / k / 128) * kb + (i % k) / 128]))
+        .collect();
+    (q, scales)
+}
+
+/// Rows up to which `turbine_hip_fp8_block` runs a decode step on its fused kernel
+/// (`kFusedMaxRows` in `qgemm_fp8_block.hip`); prefill steps and larger decode batches take the
+/// dequantize path.
+const FP8_BLOCK_FUSED_MAX_ROWS: usize = 64;
+
+/// One FP8_BLOCK weight in both of the forms the two paths are judged against: the codes and
+/// block scales (the CPU `qgemm` reference, exact `q · s` products), and the BF16 weight
+/// `bf16(e4m3(q) · s)` the dequantize path stages (the golden reference's dequantized checkpoint
+/// holds the same values), for the CPU BF16 `gemm` reference.
+struct Fp8BlockWeight {
+    codes: Vec<u8>,
+    scales: Vec<f32>,
+    dequantized_bf16: Vec<u8>,
+}
+
+impl Fp8BlockWeight {
+    fn new(codes: Vec<u8>, scales: Vec<f32>, k: usize) -> Self {
+        let kb = k.div_ceil(128);
+        let dequantized: Vec<f32> = codes
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| fp8_e4m3_value(q) * scales[(i / k / 128) * kb + (i % k) / 128])
+            .collect();
+        Self {
+            codes,
+            scales,
+            dequantized_bf16: encode(DType::BF16, &dequantized),
+        }
+    }
+}
+
+/// One FP8_BLOCK case: BF16 activations (W8A16) × block-scaled e4m3 weights on the GPU at `m`
+/// rows (`prefill` picks the step kind), judged on the sampled rows with the Phase 1 BF16 GEMM
+/// tolerance against the reference of the path the implementation takes: the fused kernel against
+/// the CPU `qgemm` (exact `q · s`; the kernel applies each block's scale to its exact partial sum,
+/// so only the F32 summation order differs), the dequantize path against the CPU BF16 `gemm` of
+/// the BF16-rounded weight `bf16(e4m3(q) · s)` (what it multiplies; off the exact products by up
+/// to 2^-9 relative per weight, which the Phase 1 bound does not cover at k = 3072).
+#[allow(clippy::too_many_arguments)]
+fn fp8_block_case(
+    p: &Pair,
+    rng: &mut Rng,
+    name: &str,
+    m: usize,
+    n: usize,
+    k: usize,
+    prefill: bool,
+    weight: &Fp8BlockWeight,
+) {
+    let cfg = QGemmConfig {
+        n: n as u32,
+        k: k as u32,
+        scheme: FP8_BLOCK,
+        act_quant: ActQuantDesc::None,
+        a_dtype: DType::BF16,
+        c_dtype: DType::BF16,
+    };
+    let fused = !prefill && m <= FP8_BLOCK_FUSED_MAX_ROWS;
+    let path = if fused { "fused" } else { "dequantize" };
+    let what = format!("qgemm {name} m={m} prefill={prefill} {cfg} [{path}]");
+    let hip = p.hip.qgemm().expect("hip qgemm (ABI v2.9)");
+    assert!(hip.supports(&cfg), "hip must support {what}");
+    let impl_name = hip.implementation(&cfg);
+    let x = rng.normal(m * k, 1.0);
+    let a_raw = encode(DType::BF16, &x);
+    let a_hip = tensor(&p.hip_mem, &[m, k], DType::BF16, &a_raw);
+    let b_hip = tensor(&p.hip_mem, &[n, k], DType::F8E4M3, &weight.codes);
+    let bs_hip = tensor(
+        &p.hip_mem,
+        &[weight.scales.len()],
+        DType::F32,
+        &encode(DType::F32, &weight.scales),
+    );
+    let c_hip = tensor(&p.hip_mem, &[m, n], DType::BF16, &vec![0u8; m * n * 2]);
+    let mut ctx = QGemmContext {
+        cfg,
+        a: a_hip.view(),
+        a_scales: None,
+        b: b_hip.view(),
+        b_scales: bs_hip.view(),
+        b_zeros: None,
+        c: c_hip.view(),
+        alpha: 1.0,
+        prefill,
+    };
+    hip.execute(&mut ctx).expect("hip qgemm");
+    let got_all = decode(DType::BF16, &bytes(c_hip.view()));
+
+    let rows = sample_rows(m);
+    let s = rows.len();
+    let sampled: Vec<u8> = rows
+        .iter()
+        .flat_map(|&r| a_raw[r * k * 2..(r + 1) * k * 2].iter().copied())
+        .collect();
+    let a_cpu = tensor(&p.cpu_mem, &[s, k], DType::BF16, &sampled);
+    let c_cpu = tensor(&p.cpu_mem, &[s, n], DType::BF16, &vec![0u8; s * n * 2]);
+    if fused {
+        let b_cpu = tensor(&p.cpu_mem, &[n, k], DType::F8E4M3, &weight.codes);
+        let bs_cpu = tensor(
+            &p.cpu_mem,
+            &[weight.scales.len()],
+            DType::F32,
+            &encode(DType::F32, &weight.scales),
+        );
+        let mut ctx = QGemmContext {
+            cfg,
+            a: a_cpu.view(),
+            a_scales: None,
+            b: b_cpu.view(),
+            b_scales: bs_cpu.view(),
+            b_zeros: None,
+            c: c_cpu.view(),
+            alpha: 1.0,
+            prefill: false,
+        };
+        p.cpu
+            .qgemm()
+            .expect("cpu qgemm")
+            .execute(&mut ctx)
+            .expect("cpu qgemm");
+    } else {
+        let b_cpu = tensor(&p.cpu_mem, &[n, k], DType::BF16, &weight.dequantized_bf16);
+        let mut ctx = GemmContext {
+            a: a_cpu.view(),
+            b: b_cpu.view(),
+            c: c_cpu.view(),
+            trans_b: true,
+            alpha: 1.0,
+            beta: 0.0,
+            prefill: false,
+        };
+        p.cpu
+            .gemm()
+            .expect("cpu gemm")
+            .execute(&mut ctx)
+            .expect("cpu gemm");
+    }
+    let want = decode(DType::BF16, &bytes(c_cpu.view()));
+    let got: Vec<f32> = rows
+        .iter()
+        .flat_map(|&r| got_all[r * n..(r + 1) * n].iter().copied())
+        .collect();
+    assert_close(
+        &format!("{what} ({impl_name}) rows {rows:?}"),
+        &got,
+        &want,
+        DType::BF16,
+    );
+}
+
+/// Phase 6a S-8 (user decision: own kernel): `turbine_hip_fp8_block` matches the CPU reference
+/// for 128 × 128 block-scaled e4m3 weights × BF16 activations, M ∈ {1, 7, 16, 128, 513}, every
+/// Llama-3.2-3B and Llama-3.1-8B linear shape, in decode steps (the fused kernel up to 64 rows,
+/// dequantize + BF16 GEMM above) and prefill steps (dequantize + the tuned table's invariant BF16
+/// GEMM). Breaks if a block scale is applied to the wrong block, a code decodes wrongly (e.g. an
+/// FNUZ instead of an OCP e4m3 conversion), or the k order of the two operands disagrees.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn qgemm_fp8_block_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(73);
+    for (name, n, k) in SHAPES_3B.into_iter().chain(SHAPES_8B) {
+        let (codes, scales) = fp8_block_weights(&mut rng, n, k);
+        let weight = Fp8BlockWeight::new(codes, scales, k);
+        for m in MS {
+            for prefill in [false, true] {
+                fp8_block_case(&p, &mut rng, name, m, n, k, prefill, &weight);
+            }
+        }
+    }
+}
+
+/// Phase 6a S-8 with Phase 4 prefix reuse: `turbine_hip_fp8_block`'s rows do not depend on the
+/// call. Prefill steps: rows of a 513-row call equal the same rows computed as calls of 1, 7, 128
+/// and 213 (from row 300) rows. Decode steps (the fused kernel): rows of a 64-row call equal
+/// calls of 1, 7 and 16 (from row 30) rows. Every Llama-3.2-3B shape (the tuned table has their
+/// invariant rows). Breaks if a path's summation order depends on m or on a row's position.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn qgemm_fp8_block_rows_do_not_depend_on_m() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(79);
+    let hip = p.hip.qgemm().expect("hip qgemm (ABI v2.9)");
+    for (name, n, k) in SHAPES_3B {
+        let cfg = QGemmConfig {
+            n: n as u32,
+            k: k as u32,
+            scheme: FP8_BLOCK,
+            act_quant: ActQuantDesc::None,
+            a_dtype: DType::BF16,
+            c_dtype: DType::BF16,
+        };
+        let (wq, ws) = fp8_block_weights(&mut rng, n, k);
+        let b = tensor(&p.hip_mem, &[n, k], DType::F8E4M3, &wq);
+        let bs = tensor(
+            &p.hip_mem,
+            &[ws.len()],
+            DType::F32,
+            &encode(DType::F32, &ws),
+        );
+        for (prefill, m, parts) in [
+            (true, 513, &[(0, 1), (0, 7), (0, 128), (300, 213)][..]),
+            (false, 64, &[(0, 1), (0, 7), (30, 16)][..]),
+        ] {
+            let x = rng.normal(m * k, 1.0);
+            let a = tensor(&p.hip_mem, &[m, k], DType::BF16, &encode(DType::BF16, &x));
+            let run = |first: usize, rows: usize| -> Vec<u8> {
+                let c = tensor(
+                    &p.hip_mem,
+                    &[rows, n],
+                    DType::BF16,
+                    &vec![0u8; rows * n * 2],
+                );
+                let mut ctx = QGemmContext {
+                    cfg,
+                    a: row_range(&a, first, rows),
+                    a_scales: None,
+                    b: b.view(),
+                    b_scales: bs.view(),
+                    b_zeros: None,
+                    c: c.view(),
+                    alpha: 1.0,
+                    prefill,
+                };
+                hip.execute(&mut ctx).expect("hip qgemm fp8 block");
+                bytes(c.view())
+            };
+            let whole = run(0, m);
+            for &(first, rows) in parts {
+                let part = run(first, rows);
+                assert!(
+                    part.as_slice() == &whole[first * n * 2..(first + rows) * n * 2],
+                    "qgemm fp8 block {name} prefill={prefill}: rows {first}..{} differ between a \
+                     {rows}-row call and the {m}-row call",
+                    first + rows
+                );
+            }
+            println!("qgemm fp8 block {name} prefill={prefill}: rows independent of m ok");
         }
     }
 }

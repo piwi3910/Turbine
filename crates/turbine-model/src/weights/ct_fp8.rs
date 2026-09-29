@@ -121,6 +121,7 @@ impl Fp8Packaging for CtFp8 {
         act: ActivationQuant::Fp8PerTokenDynamic,
         ignore: Vec::new(),
         scale_suffix: SCALE,
+        decoded: Vec::new(),
     };
 
     fn claims(q: &Value) -> Result<(), ModelError> {
@@ -160,6 +161,7 @@ impl Fp8Packaging for CtFp8 {
             act: activations_of(g.get("input_activations"))?,
             ignore: string_list(q, "ignore"),
             scale_suffix: SCALE,
+            decoded: Vec::new(),
         })
     }
 
