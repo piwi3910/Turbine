@@ -127,3 +127,32 @@ Worktree `.claude/worktrees/agent-abee0e2542a317f3c`, tip 2116221 — all commit
   `fixture-pause.sh` during benches.
 - The first GSM8K runs (`gsm8k=0.040/0.025`) used the old bare-number set — void; only the CoT results count.
 - novanas crashed twice this morning; re-check fixture logs for their `rc=` lines.
+
+## State 2026-09-29 ~18:00 (collector, lead rotation)
+
+**T18 GPTQ verdict: FAIL.** `t18-run/run-gptq.log` last line `t18_gptq_run: done rc=0`; results in
+`t18-run/gptq/`.
+
+- Throughput: `bench.json` `output_token_throughput` 1267.79 tok/s vs BF16 pair 842.8 = 1.505x (≥ 0.9x: PASS).
+- c1 ITL: `bench-c1.json` itl_ms.p50 5.7953 ms vs BF16 12.37 ms = 0.469x (≤ 0.6x: PASS).
+- Golden: c1 16/16 strict PASS, c16 16/16 batched PASS.
+- `index_entry_absent` fired once in `server.log` (the tied-lm_head fix, 44c30eb, confirmed working).
+- **GSM8K-200 accuracy: 0.715 (143/200) vs BF16 0.805 — drop 0.090, exceeds the 0.04 max-drop gate**
+  (floor 0.765). `turbine-golden eval-compare --baseline tests/eval/llama-3.2-3b-instruct/turbine-bf16.json
+  --candidate tests/eval/llama-3.2-3b-instruct-gptq/turbine.json --max-drop 0.04` →
+  `baseline accuracy 0.8050, candidate accuracy 0.7150, max drop 0.0400 (concurrency 1): FAIL`.
+  Committed: `tests/eval/llama-3.2-3b-instruct-gptq/turbine.json` (this run's quality.json).
+  vLLM refuses this checkpoint (transposed qzeros), so there is no vLLM pair to check whether the drop is
+  reference-relative or a real Turbine GPTQ numerics problem — needs investigation before any retry.
+
+**No support.rs commit is being made.** The task's flip condition ("if it passes") is not met for GPTQ:
+perf and golden pass, but GSM8K-200 accuracy fails the gate by a wide margin (0.09 drop vs 0.04 bound).
+Do not flip `gptq_int4` to `supported`. AWQ (rotation 7/8, commit d14402f) did pass its own gate in full
+(golden PASS/PASS, perf PASS, GSM8K 0.775 vs BF16 0.805, drop 0.030 ≤ 0.04) — whether to flip `awq_int4`
+alone, pending soak, is the lead's call.
+
+Labbook: submitted `lab-bench:t18-llama-gptq:44c30eb` (status fail, set `phase-6a-quantization`) with the
+full numbers and notes above.
+
+Remaining: root-cause the GPTQ GSM8K drop (dequant/group-size numerics? act-order layout?) before any
+retry; AWQ soak still pending (ask the lead first); no `support.rs` change from this rotation.
