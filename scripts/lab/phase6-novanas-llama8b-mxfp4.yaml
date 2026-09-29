@@ -1,0 +1,34 @@
+# turbine-server configuration for the Phase 6a `mxfp4` proof on novanas:
+#   scripts/lab-bench.sh --model llama8b-mxfp4 [--golden16]
+# Weights: FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16 @
+# 14c3aca849a72df8fcc8b3a30ab8d9eed86ee646 (compressed-tensors mxfp4-pack-quantized, W4A16) in
+# /home/piwi/turbine-models/llama-3.1-8b-instruct-mxfp4a16 (lab-bench passes model.path). The
+# same values as the BF16 baseline scripts/lab/phase6-novanas-llama8b.yaml; the weight format is
+# detected from the checkpoint (support row amd/gfx1201/LlamaForCausalLM/mxfp4/bf16/none).
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/llama-3.1-8b-instruct-mxfp4a16
+  served_name: FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: false
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 8GiB
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    queue_timeout: 60s
