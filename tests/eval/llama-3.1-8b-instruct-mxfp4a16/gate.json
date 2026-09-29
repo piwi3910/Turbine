@@ -1,0 +1,5 @@
+{
+  "baseline": "tests/eval/llama-3.1-8b-instruct/turbine-bf16.json",
+  "max_drop": 0.04,
+  "decided": "Phase 6 spec: provisional design choices (2026-09-28), Q9: vLLM-ROCm 0.23.1.dev1 refuses the checkpoint on gfx1201 (no kernel for the MXFP4 linear layer), so the gate is the BF16 model at the 4-bit drop"
+}

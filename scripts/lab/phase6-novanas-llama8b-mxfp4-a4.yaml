@@ -1,0 +1,39 @@
+# turbine-server configuration for the Phase 6a `mxfp4_a4` proof on novanas:
+#   scripts/lab-bench.sh --model llama8b-mxfp4-a4 [--golden16]
+# Weights: amd/Llama-3.1-8B-Instruct-MXFP4-W4A4-MLCAL-C1000-GPTQ @
+# 00b0d018950a5466fa1fc8bc0ccf174bd38b15da (AMD Quark W4A4: fp4 weights and dynamic fp4 input
+# activations per 32, E8M0 scales, GPTQ with static groups, SmoothQuant folded into the weights)
+# in /home/piwi/turbine-models/llama-3.1-8b-instruct-mxfp4-a4 (lab-bench passes model.path).
+# Turbine runs the weights on turbine_hip_mxfp4 after quantize-dequantizing each activation group
+# to MXFP4 (support row amd/gfx1201/LlamaForCausalLM/mxfp4_a4/bf16/none). The checkpoint's KV
+# recipe (fp8_e4m3 per-tensor K/V projection outputs, in kv_cache_quant_config and repeated for
+# *k_proj/*v_proj in layer_quant_config) is not served (WARN kv_cache_quant_ignored; the k/v
+# output_scale tensors load as unexpected_tensor WARNs); the KV stays BF16 here. The same values as
+# the BF16 baseline scripts/lab/phase6-novanas-llama8b.yaml.
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/llama-3.1-8b-instruct-mxfp4-a4
+  served_name: amd/Llama-3.1-8B-Instruct-MXFP4-W4A4-MLCAL-C1000-GPTQ
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: false
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 8GiB
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    queue_timeout: 60s

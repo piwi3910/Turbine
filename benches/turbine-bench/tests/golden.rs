@@ -1118,9 +1118,9 @@ mod quant_fixtures {
             "hf_reference.py",
         ),
         (
-            "llama-3.2-3b-mxfp4-a4",
-            "matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq",
-            "91925ffda6977d097354a99718a20e035f8af80a",
+            "llama-3.1-8b-instruct-mxfp4-a4",
+            "amd/Llama-3.1-8B-Instruct-MXFP4-W4A4-MLCAL-C1000-GPTQ",
+            "00b0d018950a5466fa1fc8bc0ccf174bd38b15da",
             "quant_reference.py",
         ),
     ];
