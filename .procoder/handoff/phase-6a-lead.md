@@ -171,3 +171,9 @@ binaries mid-run): `p6a-mxfp4` (until `queue4: done`), `p6a-kv-t24-full` (until 
 AWQ lab-bench and anything else it queued have finished; tell a74d419d213cc35b9). `p6a-yarn-t28`: check
 for detached runs before merging.
 
+
+**Check first on novanas (unverified at rotation, ssh down):** the fixture dispatcher's launching ssh session ended
+(exit 1). The dispatcher was started with setsid nohup, so it should still run. Verify with
+`pgrep -af '[f]ixture-order.sh'` and `tail /home/piwi/turbine-ci/fixture-order.log`. If it is gone, the waiters it
+stopped stay in state T: restart it (`setsid nohup bash /home/piwi/turbine-ci/fixture-order.sh >>…/fixture-order.log
+2>&1 </dev/null &`), or `kill -CONT` the `flock …/fixture.lock` waiters.
