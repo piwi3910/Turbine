@@ -116,14 +116,59 @@ Detached on novanas (REMOTE=/home/piwi/turbine-ci/remote/agent-p6a-gptq-numerics
 |---|---|---|---|
 | `gptq-autoround.go` | AutoRound, first try: FAILED rc=2 (circuit `latency_drift`, see below) | `$REMOTE/gptq-autoround/run.log` | `gptq-autoround: done rc=2` |
 | `gptq-autoround2.go` | AutoRound rerun, full GSM8K c16 (Turbine) | `$REMOTE/gptq-autoround2/run.log` | `gptq-autoround2: done rc=` |
-| `gptq-calib.go` | llm-compressor calibration on GPU 0 | `/home/piwi/turbine-ci/scratch/gptq-own/calib.log` | `gptq-calib: done rc=` |
+| `gptq-calib.go` | llm-compressor calibration on GPU 0: FAILED rc=1, ROCm Triton compile error (see below) | `/home/piwi/turbine-ci/scratch/gptq-own/calib.log` | `gptq-calib: done rc=1` |
+| `gptq-calib2.go` | llm-compressor calibration retry, torch (non-Triton) GPTQ block-update path | `/home/piwi/turbine-ci/scratch/gptq-own/calib2.log` | `gptq-calib2: done rc=` |
 | `gptq-own.go` | own checkpoint: Turbine, then vLLM-ROCm | `$REMOTE/gptq-own/run.log` | `gptq-own: done rc=`, `gptq-own-vllm: done rc=` |
 
-Lead queue (r11): w4a4-rerun → `gptq-calib.go` → `gptq-own.go` (after calib rc=0) →
+Lead queue (r11): w4a4-rerun → `gptq-calib2.go` → `gptq-own.go` (after calib2 rc=0) →
 `gptq-autoround2.go` (after gptq-own-vllm, or after gptq-own fails).
 
-`gptq-own.go` must come after `gptq-calib: done rc=0` (the driver refuses with rc=1 if the
+`gptq-own.go` must come after `gptq-calib2: done rc=0` (the driver refuses with rc=1 if the
 checkpoint directory has no config.json when its pass starts).
+
+### gptq-calib rc=1 fix (rotation 11, 2026-09-30): ROCm Triton GPTQ kernel does not compile
+
+`gptq-calib.go` (22:28Z) died with `RuntimeError: Implicit conversion of CUDA __nv_fdiv_rn device
+function has been dropped; ...` from Triton's AMD backend
+(`triton/backends/amd/compiler.py:make_llir` → `need_extern_lib`), raised while llm-compressor
+0.14.0's fused Triton GPTQ block update JIT-compiles
+(`llmcompressor/modifiers/gptq/gptq_quantize.py` `fused_gptq_block_update` →
+`_gptq_block_update_kernel`, called from `_gptq_block_update_triton` via the `compressed_tensors`
+`ImplBackend` dispatch in `quantize_weight`). The kernel's extern-lib lowering assumes CUDA libdevice
+and is not portable to ROCm Triton 3.7.1's AMD backend.
+
+Fix (no monkeypatch — a supported switch already exists, checked in this order per the brief):
+1. A `GPTQModifier` constructor argument: none — grepped `llmcompressor/modifiers/gptq/base.py` for
+   `triton`/`backend`, no hits.
+2. An environment variable: **yes** — `gptq_quantize.py`'s own dispatch predicate,
+   `_gptq_block_update_triton_req` (registered against `compressed_tensors.utils.impl_backend
+   .ImplBackend` at priority 0, ahead of the eager-torch `gptq_block_update` base implementation),
+   reads `os.environ.get("LLMCOMPRESSOR_DISABLE_GPTQ_TRITON", "0") != "1"` as one of its conditions;
+   setting it to `"1"` makes the predicate return `False` and the dispatcher falls through to the
+   plain-torch `gptq_block_update` (same file, ~line 152: per-column `fake_quantize` + Hessian-inverse
+   error propagation — the reference GPTQ algorithm, no CUDA/Triton). Algorithm is unchanged: same
+   recipe (GPTQ, damp 0.01, g128, sym, no act-order), same math, just the eager instead of the fused
+   kernel for the inner per-block update.
+3. `scripts/eval/gptq_calibrate.py`: added `--gptq-backend {auto,torch,triton}` (default `auto`).
+   `auto` sets `LLMCOMPRESSOR_DISABLE_GPTQ_TRITON=1` when `torch.version.hip is not None` (a ROCm
+   build) and leaves Triton alone on CUDA; `torch` / `triton` force it either way. The device print
+   line and `--check`'s JSON now include `gptq_backend`; `turbine_calibration.json` gets a
+   `"gptq_backend": "torch_eager"|"triton"` field recording which path ran.
+4. CPU-only smoke (cheap, ~1 s, on novanas under the existing uv env, GPU hidden): a tiny synthetic
+   layer (`weights` `[1,8,16]`, a random SPD Hessian, `QuantizationArgs` W4A16 group 8, blocksize 8)
+   through `quantize_weight` with `LLMCOMPRESSOR_DISABLE_GPTQ_TRITON=1`; confirmed
+   `_gptq_block_update_triton_req(...)` is `False` and the eager path returns a finite,
+   correctly-shaped, non-NaN quantized weight (`used_rtn_fallback=[False]`). Not committed (a
+   throwaway script under the session scratchpad, not the repo) — the real signal is the full
+   calibration run under `gptq-calib2.go`.
+5. Requeued: `.procoder/handoff/gptq_calib_run2.sh` (copy of `gptq_calib_run.sh` with the marker/log
+   renamed `gptq-calib2`/`calib2.log`, go-file `gpu-queue/gptq-calib2.go`, and `--gptq-backend auto`
+   passed explicitly to both the `--check` setup step and the real run for a self-documenting log
+   line) uploaded to `$REMOTE/gptq_calib_run2.sh` and started detached
+   (`setsid nohup bash … </dev/null &`, pid 1441715) on novanas; it is past setup and waiting on
+   `gpu-queue/gptq-calib2.go` now. Dataset shard and uv environment are reused from the first attempt
+   (no re-download). `gptq_calib_run.sh` / `gptq-calib.go` / `calib.log` are left as-is, the historical
+   record of the failure.
 
 AutoRound first try (21:46Z): the circuit opened on `latency_drift` (ratio >= 4, HEALTHY →
 CIRCUIT_OPEN directly, GREEN pressure) 2 min into the c16 eval; turbine-golden aborted on the 503

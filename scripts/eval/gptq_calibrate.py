@@ -115,9 +115,29 @@ def main():
     ap.add_argument("--damp", type=float, default=0.01)
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--allow-cpu", action="store_true")
+    ap.add_argument(
+        "--gptq-backend",
+        choices=["auto", "torch", "triton"],
+        default="auto",
+        help=(
+            "GPTQ block-update backend. 'auto' (default) disables llm-compressor's "
+            "fused Triton kernel on a ROCm build of torch (its extern-lib lowering "
+            "does not compile on ROCm Triton: 'Implicit conversion of CUDA "
+            "__nv_fdiv_rn device function has been dropped') and keeps it on CUDA; "
+            "'torch' / 'triton' force the eager or fused path via "
+            "LLMCOMPRESSOR_DISABLE_GPTQ_TRITON, the switch gptq_quantize.py's own "
+            "dispatch (_gptq_block_update_triton_req) already reads."
+        ),
+    )
     a = ap.parse_args()
 
     import torch
+
+    is_rocm = getattr(torch.version, "hip", None) is not None
+    disable_triton = a.gptq_backend == "torch" or (a.gptq_backend == "auto" and is_rocm)
+    gptq_backend_used = "torch_eager" if disable_triton else "triton"
+    if disable_triton:
+        os.environ["LLMCOMPRESSOR_DISABLE_GPTQ_TRITON"] = "1"
 
     recipe = build_recipe(a.damp)
     from llmcompressor import oneshot
@@ -126,7 +146,13 @@ def main():
     if a.check:
         print(
             json.dumps(
-                {"versions": v, "recipe": repr(recipe), "oneshot": oneshot.__module__},
+                {
+                    "versions": v,
+                    "recipe": repr(recipe),
+                    "oneshot": oneshot.__module__,
+                    "gptq_backend": gptq_backend_used,
+                    "torch_hip": torch.version.hip,
+                },
                 indent=1,
             )
         )
@@ -143,7 +169,11 @@ def main():
         )
         return 1
     device = torch.cuda.get_device_name(0) if gpu else "cpu"
-    print(f"gptq_calibrate: device {device}; versions {v}", flush=True)
+    print(
+        f"gptq_calibrate: device {device}; gptq_backend {gptq_backend_used}; "
+        f"versions {v}",
+        flush=True,
+    )
 
     from datasets import load_dataset
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -212,6 +242,7 @@ def main():
             "rendering": "model chat template, add_special_tokens false, truncation",
         },
         "device": device,
+        "gptq_backend": gptq_backend_used,
         "versions": v,
         "seconds": round(time.time() - t0, 1),
         "finished": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
