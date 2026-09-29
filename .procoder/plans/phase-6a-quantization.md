@@ -283,13 +283,13 @@ Interfaces:
 Files: `.procoder/ask/decisions.md` (entry "P6: block-scaled FP8 GEMM — provider evaluation"), `kernels/rocm/src/qgemm_ck_block.cpp` (CK `ABQuantGrouped` instance for gfx1201, or the W8A16 dequant path per Q3), `kernels/rocm/CMakeLists.txt` (CK instance generation filter), `kernels/rocm/src/impl_table.cpp`, `crates/turbine-kernels/tests/hip_ops.rs` (FP8_BLOCK cases), `tests/golden/llama-3.2-3b-instruct-fp8-block/{…}`, `scripts/lab/phase6-novanas-llama-fp8-block.yaml`, `tests/eval/llama-3.2-3b-instruct-fp8-block/{…}`, `crates/turbine-core/src/support.rs`, `.procoder/perf-log.md`
 Interfaces:
 
-- implementation `ck_tile_abquant_fp8` (scheme `FP8_BLOCK`, act `FP8_GROUP128`) or, per Q3 fallback, `dequant_fp8_block_bf16` + BF16 GEMM (act `NONE`, W8A16)
+- implementation `turbine_hip_fp8_block` (own fused kernel, user decision 2026-09-29 "Write own kernel in 6a" after the evaluation found no working provider): scheme `FP8_BLOCK`, FP8 weights on the device, act `FP8_GROUP128` (the checkpoint's) or `NONE` if the measured W8A16 variant is chosen and recorded; the load-time decode to BF16 (1c85bfd) stays only for shapes the kernel refuses, logged `event="fp8_block_decoded"`, and the loader keeps the FP8 layout (`P`, `P_scale`) whenever the kernel serves the shape
   Covers: spec S-8, S-11 (fp8_block), S-17
   Depends on: Task 14
 
 - [ ] Evaluate (GPU 0, bench lock, 20-minute timeout): CK `ABQuantGrouped` built from the pinned CK for gfx1201 (WMMA policy), correctness vs `cpu::quant`, timings; the dequant fallback candidates if it fails; write the decisions entry.
 - [ ] Write failing lab test cases `qgemm_matches_cpu` for `FP8_BLOCK`. Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops qgemm_matches_cpu` — expect FAIL
-- [ ] Implement the chosen path; run the lab test — expect PASS; `scripts/lab-test.sh novanas --tier quick` — expect PASS
+- [ ] Implement `turbine_hip_fp8_block` (own kernel files `kernels/rocm/src/qgemm_fp8_block.*`, the FP8 builder's) and, in the lead's files, restore the FP8 layout for `fp8_block` with the decode fallback per shape; run the lab test — expect PASS; `scripts/lab-test.sh novanas --tier quick` — expect PASS; weight bytes of the served 3B checkpoint ≈ half the BF16 model's
 - [ ] Fixture and proof exactly as Task 14's steps with `--act-quant` per the chosen arithmetic (`fp8_group128` if W8A8, `none` if W8A16), slug `llama-3.2-3b-instruct-fp8-block`, model `llama-fp8-block`, target c16 ≥ 1.0 × BF16; flip the row only when golden, bench, eval and soak pass, else leave it `experimental` and record the finding.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `feat(rocm): block-scaled FP8 GEMM and the fp8_block proof`

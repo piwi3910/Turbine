@@ -247,6 +247,11 @@ impl WeightLoader {
                 .ok_or_else(|| ModelError::MissingTensor(slot.name.clone()))?;
             format.check_tensor(entry)?;
             if format.repacks(slot) {
+                for name in format.companions(slot) {
+                    if index.get(&name).is_none() {
+                        return Err(ModelError::MissingTensor(name));
+                    }
+                }
                 planned.push((slot, entry));
                 continue;
             }
@@ -350,7 +355,13 @@ impl WeightLoader {
                 let mut raw = vec![0u8; entry.byte_len() as usize];
                 file.read_exact_at(&mut raw, entry.range.start)
                     .map_err(|e| io_err(&entry.file, e))?;
-                if !format.repack(slot, entry, raw)?.is_empty() {
+                let companions = read_companions(format, slot, index, &mut files)?;
+                let companions: Vec<(&TensorEntry, Vec<u8>)> =
+                    companions.iter().map(|(e, b)| (*e, b.clone())).collect();
+                if !format
+                    .repack_with(slot, entry, raw, &companions)?
+                    .is_empty()
+                {
                     return Err(ModelError::Safetensors {
                         file: entry.file.clone(),
                         tensor: entry.name.clone(),
@@ -362,22 +373,25 @@ impl WeightLoader {
             if !tensors.contains_key(key) {
                 tensors.insert(key.clone(), Tensor::empty(mem, shape, dtype)?);
             }
-            let tensor = tensors.get_mut(key).expect("inserted above");
             if format.repacks(slot) {
+                let companions = read_companions(format, slot, index, &mut files)?;
+                let companions: Vec<(&TensorEntry, Vec<u8>)> =
+                    companions.iter().map(|(e, b)| (*e, b.clone())).collect();
+                let file = files.get(&entry.file).expect("opened above");
                 let mut raw = vec![0u8; entry.byte_len() as usize];
                 file.read_exact_at(&mut raw, entry.range.start)
                     .map_err(|e| io_err(&entry.file, e))?;
                 // A sharded slot: the whole tensor is repacked into the loaded layout (the
                 // source's shape), then the rank's part is taken from it.
                 let bytes = match &slot.source {
-                    None => format.repack(slot, entry, raw)?,
+                    None => format.repack_with(slot, entry, raw, &companions)?,
                     Some(src) => {
                         let whole = WeightSlot {
                             shape: src.shape.clone(),
                             source: None,
                             ..slot.clone()
                         };
-                        let all = format.repack(&whole, entry, raw)?;
+                        let all = format.repack_with(&whole, entry, raw, &companions)?;
                         let mut part = take_part(&all, src, dtype.size_bytes());
                         // The last vocabulary shard's padding rows are zeros.
                         let want = slot.shape.iter().product::<usize>() * dtype.size_bytes();
@@ -400,11 +414,13 @@ impl WeightLoader {
                         ),
                     });
                 }
+                let tensor = tensors.get_mut(key).expect("inserted above");
                 tensor.storage.copy_from_host(base, &bytes)?;
                 mem.synchronize()?;
                 weight_bytes += bytes.len() as u64;
                 continue;
             }
+            let tensor = tensors.get_mut(key).expect("inserted above");
             if let Some(src) = &slot.source {
                 weight_bytes += upload_shard(
                     file,
@@ -444,6 +460,33 @@ impl WeightLoader {
             elsewhere,
         })
     }
+}
+
+/// The companion tensors of `slot` ([`WeightFormat::companions`]), each read whole.
+fn read_companions<'i>(
+    format: &dyn WeightFormat,
+    slot: &WeightSlot,
+    index: &'i SafetensorsIndex,
+    files: &mut HashMap<PathBuf, File>,
+) -> Result<Vec<(&'i TensorEntry, Vec<u8>)>, ModelError> {
+    format
+        .companions(slot)
+        .iter()
+        .map(|name| {
+            let entry = index
+                .get(name)
+                .ok_or_else(|| ModelError::MissingTensor(name.clone()))?;
+            if !files.contains_key(&entry.file) {
+                let f = open_regular(&entry.file)?;
+                files.insert(entry.file.clone(), f);
+            }
+            let file = &files[&entry.file];
+            let mut raw = vec![0u8; entry.byte_len() as usize];
+            file.read_exact_at(&mut raw, entry.range.start)
+                .map_err(|e| io_err(&entry.file, e))?;
+            Ok((entry, raw))
+        })
+        .collect()
 }
 
 /// The part `src` of a whole row-major tensor `all` of `src.shape` (elements of `es` bytes):

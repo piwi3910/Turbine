@@ -2,10 +2,10 @@
 # lab-bench.sh — fast land-and-measure step on novanas without a k8s Job.
 #
 #   scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests]
-#                         [--golden16] [--c1] [--quick] [-- <--set k=v>...]
+#                         [--golden16] [--c1] [--quality] [--quick] [-- <--set k=v>...]
 #   scripts/lab-bench.sh --print-model <model>
 #
-# <model>: llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16|llama-fp8kv|olmoe-fp8kv
+# <model>: llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16|llama-fp8kv|olmoe-fp8kv|llama8b-mxfp4-a4
 # (Phase 6a: one value per proof checkpoint; each maps to a weights directory under
 # /home/piwi/turbine-models/, a golden slug under tests/golden/ and a lab config).
 # --print-model prints "<weights> <golden slug> <config>" and exits without contacting a host.
@@ -23,7 +23,11 @@
 #    not gate on), and the fixed throughput bench (16 concurrent, 512-word prompts, 256 tokens;
 #    200 requests, or 64 with --quick for a faster read during iteration); with --c1 also the
 #    single-request latency run (10 requests of 128 tokens, --ignore-eos), reported as itl_c1_p50
-#    and tok/s_c1 (Phase 6a targets stated in c1 ITL).
+#    and tok/s_c1 (Phase 6a targets stated in c1 ITL). With --quality, after the measurement and
+#    outside the benchmark lock (the port stays this run's), the accuracy task set
+#    (turbine-golden, tests/eval/gsm8k-200.jsonl, greedy, one request at a time) against the
+#    served model: quality.json in the results (commit it as tests/eval/<slug>/turbine.json) and
+#    gsm8k=<accuracy> on the BENCH line (the Phase 6a S-17 quality gate).
 # 4. Stops the server and prints one "BENCH ..." summary line (quick=1 added when --quick was
 #    used; golden16=SKIP when --golden16 was not); exits 1 if tests, golden c1 or the bench fail.
 #    Results land in target/lab-bench/<label>/ on the workstation.
@@ -37,11 +41,12 @@ label="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 run_tests=0
 run_golden16=0
 run_c1=0
+run_quality=0
 quick=0
 print_model=0
 usage() {
-	echo "usage: scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--c1] [--quick] [-- --set k=v ...] | --print-model <model>" >&2
-	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16 llama-fp8kv olmoe-fp8kv" >&2
+	echo "usage: scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--c1] [--quality] [--quick] [-- --set k=v ...] | --print-model <model>" >&2
+	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16 llama-fp8kv olmoe-fp8kv llama8b-mxfp4-a4" >&2
 	exit 2
 }
 while [[ $# -gt 0 ]]; do
@@ -73,6 +78,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--c1)
 		run_c1=1
+		shift
+		;;
+	--quality)
+		run_quality=1
 		shift
 		;;
 	--quick)
@@ -120,6 +129,7 @@ llama-gptq) slug=llama-3.2-3b-instruct-gptq ;;
 llama8b-mxfp4) slug=llama-3.1-8b-instruct-mxfp4a16 ;;
 llama8b) slug=llama-3.1-8b-instruct ;;
 llama-mxfp4-a4) slug=llama-3.2-3b-mxfp4-a4 ;;
+llama8b-mxfp4-a4) slug=llama-3.1-8b-instruct-mxfp4-a4 ;;
 llama-yarn16)
 	slug=llama-3.2-3b-instruct
 	golden_slug=llama-3.2-3b-instruct-yarn16
@@ -201,8 +211,23 @@ fi
 # 2. serve natively, pinned to one card
 # CPU fixture jobs (scripts/golden/*) are paused from here to the end (scripts/fixture-pause.sh
 # explains why: their swap-in pushes the server's pressure controller into SURVIVAL).
+# From here to the end the run also holds bench.lock exclusively (the gate first, as
+# scripts/bench-lock.sh does): GPU 0 serves this run only, so kernel evaluations (bench-lock),
+# lab-test and lab-serve Jobs (bench-lock --shared) and builds (flock -s) wait for it.
+lockdir="$(mktemp -d)"
+mkfifo "$lockdir/in" "$lockdir/out"
+ssh -o BatchMode=yes "$host" \
+	"flock -x /home/piwi/turbine-ci/bench.gate flock -x /home/piwi/turbine-ci/bench.lock sh -c 'echo locked; cat >/dev/null'" \
+	<"$lockdir/in" >"$lockdir/out" &
+exec 7>"$lockdir/in"
+echo "lab-bench: waiting for the exclusive bench lock" >&2
+read -r lock_state <"$lockdir/out"
+if [[ "$lock_state" != locked ]]; then
+	echo "lab-bench: could not take the bench lock on $host" >&2
+	exit 1
+fi
 ssh -o BatchMode=yes "$host" "pkill -STOP -u piwi -f 'scripts/[g]olden/'" >/dev/null 2>&1 || true
-trap 'ssh -o BatchMode=yes "$host" "pkill -CONT -u piwi -f '"'"'scripts/[g]olden/'"'"'" >/dev/null 2>&1 || true' EXIT
+trap 'ssh -o BatchMode=yes "$host" "pkill -CONT -u piwi -f '"'"'scripts/[g]olden/'"'"'" >/dev/null 2>&1 || true; exec 7>&-; rm -rf "$lockdir"' EXIT
 # Only this run's own server is ever stopped: its pid is kept in $pidf and checked to still be
 # a turbine-server before the kill (a blanket pkill would also end other agents' test servers
 # running as piwi). A port already served is refused, not taken over.
@@ -280,7 +305,7 @@ golden16_cmd=""
 c1_cmd=""
 rm -f "$out/bench-c1.json"
 [[ $run_c1 -eq 1 ]] && c1_cmd="$bench_cmd --concurrency 1 --requests 10 --max-tokens 128 --ignore-eos --output json > '$out/bench-c1.json' 2> '$out/bench-c1.err'"
-scripts/bench-lock.sh sh -c "
+sh -c "
   $golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 1 > '$out/golden1.txt' 2>&1
   $golden16_cmd
   curl -s '$url/metrics' > '$out/metrics-before.txt'
@@ -290,6 +315,13 @@ scripts/bench-lock.sh sh -c "
 " 2>/dev/null
 curl -s "$url/metrics" >"$out/metrics.txt"
 curl -s "$url/turbine/v1/status" >"$out/status.json"
+rm -f "$out/quality.json"
+if [[ $run_quality -eq 1 ]]; then
+	ssh -o BatchMode=yes "$host" "cd '$remote/src' && taskset -c $bench_cpus \
+    '$remote/target/release/turbine-golden' eval --url http://127.0.0.1:18000 \
+      --tasks tests/eval/gsm8k-200.jsonl --output json" >"$out/quality.json" 2>"$out/quality.err" ||
+		echo "lab-bench: quality run failed (see $out/quality.err)" >&2
+fi
 ssh -o BatchMode=yes "$host" "cp /tmp/lab-bench-server.log /tmp/lab-bench-server.last.log; $stop_server"
 
 # 4. summary
@@ -345,6 +377,14 @@ except OSError:
     pass
 except Exception as e:
     c1_field = f" c1=FAILED({e})"
+try:
+    q = json.load(open(f"{out}/quality.json"))
+    values["gsm8k_accuracy"] = round(q["accuracy"], 4)
+    c1_field += f" gsm8k={q['accuracy']:.3f}"
+except OSError:
+    pass
+except Exception as e:
+    c1_field += f" gsm8k=FAILED({e})"
 json.dump({k: v for k, v in values.items() if v == v}, open(f"{out}/labbook-values.json", "w"))
 print(f"BENCH {label} {model} commit={commit} gpu={gpu} tests={tests} golden1={g1} golden16={g16}{quick_field}{formats} "
       f"ok={d['requests_ok']} failed={d['requests_failed']} tok/s={d['output_token_throughput']:.1f} "
@@ -364,7 +404,7 @@ if [[ $rc -eq 0 && "${LABBOOK_UPLOAD:-1}" != 0 && -f "$uploader" && -f "$HOME/.c
 	set_args=()
 	[[ -n "${LABBOOK_SET:-}" ]] && set_args=(--set "$LABBOOK_SET")
 	attach=()
-	for f in bench.json bench-c1.json golden1.txt golden16.txt metrics.txt status.json; do
+	for f in bench.json bench-c1.json quality.json golden1.txt golden16.txt metrics.txt status.json; do
 		[[ -s "$out/$f" ]] && attach+=(--attach "$out/$f")
 	done
 	branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"

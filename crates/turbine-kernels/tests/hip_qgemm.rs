@@ -357,7 +357,9 @@ fn qgemm_case(
         b_zeros: None,
         c: c_hip.view(),
         alpha: 1.0,
-        prefill: m > 1,
+        // Decode-sized calls take the pinned FP8 table rows (m <= 64), larger ones the prefill
+        // path (the first heuristic answer).
+        prefill: m > 64,
     };
     hip.execute(&mut ctx).expect("hip qgemm");
     let got_all = decode(c_dtype, &bytes(c_hip.view()));
@@ -575,5 +577,113 @@ fn quantize_act_matches_cpu() {
             mode,
             0.02,
         );
+    }
+}
+
+/// Rows `[first, first + count)` of the dense `[rows, cols]` (or `[rows]`) tensor `t`.
+fn row_range(t: &Tensor, first: usize, count: usize) -> TensorView<'_> {
+    let cols = t.shape.get(1).copied().unwrap_or(1);
+    let es = t.dtype.size_bytes();
+    let (shape, strides): (Vec<usize>, Vec<usize>) = if t.shape.len() == 2 {
+        (vec![count, cols], vec![cols, 1])
+    } else {
+        (vec![count], vec![1])
+    };
+    TensorView {
+        slice: t.storage.whole().sub(first * cols * es, count * cols * es),
+        shape: shape.as_slice().into(),
+        strides: strides.as_slice().into(),
+        dtype: t.dtype,
+    }
+}
+
+/// Phase 6a S-7 with Phase 4 prefix reuse: in a prefill step (`QGemmContext::prefill`) a row's
+/// `hipblaslt_fp8` result does not depend on how many rows the call has or where the row sits,
+/// so the prefill of a prompt's suffix (after a reused prefix) computes each row bit for bit as
+/// the whole-prompt prefill does. For every 3B shape and scale pairing, rows of a 513-row prefill
+/// are compared bitwise with the same rows run as calls of 1, 7, 128 and 213 rows (a suffix at
+/// row 300). Breaks if the prefill algorithm depends on m or runs with split-K.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn qgemm_prefill_rows_do_not_depend_on_m() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(71);
+    let m = 513;
+    let hip = p.hip.qgemm().expect("hip qgemm (ABI v2.9)");
+    for (name, n, k) in SHAPES_3B {
+        for (scheme, act) in [
+            (QuantSchemeDesc::Fp8Channel, ActQuantDesc::Fp8Token),
+            (QuantSchemeDesc::Fp8Channel, ActQuantDesc::Fp8Tensor),
+        ] {
+            let cfg = QGemmConfig {
+                n: n as u32,
+                k: k as u32,
+                scheme,
+                act_quant: act,
+                a_dtype: DType::F8E4M3,
+                c_dtype: DType::BF16,
+            };
+            let x = rng.normal(m * k, 1.0);
+            let (a, a_scales) = quantize_case(
+                &p,
+                &format!("quantize_act for prefill {name}"),
+                &x,
+                m,
+                k,
+                k,
+                DType::BF16,
+                act,
+                0.02,
+            );
+            let (wq, ws) = fp8_weights(&mut rng, scheme, n, k);
+            let b = tensor(&p.hip_mem, &[n, k], DType::F8E4M3, &wq);
+            let bs = tensor(
+                &p.hip_mem,
+                &[ws.len()],
+                DType::F32,
+                &encode(DType::F32, &ws),
+            );
+            let run = |first: usize, rows: usize| -> Vec<u8> {
+                let c = tensor(
+                    &p.hip_mem,
+                    &[rows, n],
+                    DType::BF16,
+                    &vec![0u8; rows * n * 2],
+                );
+                let scales = match act {
+                    ActQuantDesc::Fp8Token => row_range(&a_scales, first, rows),
+                    _ => a_scales.view(),
+                };
+                let mut ctx = QGemmContext {
+                    cfg,
+                    a: row_range(&a, first, rows),
+                    a_scales: Some(scales),
+                    b: b.view(),
+                    b_scales: bs.view(),
+                    b_zeros: None,
+                    c: c.view(),
+                    alpha: 1.0,
+                    prefill: true,
+                };
+                hip.execute(&mut ctx).expect("hip qgemm prefill");
+                bytes(c.view())
+            };
+            let whole = run(0, m);
+            for (first, rows) in [(0, 1), (0, 7), (0, 128), (300, 213)] {
+                let part = run(first, rows);
+                let want = &whole[first * n * 2..(first + rows) * n * 2];
+                assert!(
+                    part.as_slice() == want,
+                    "qgemm prefill {name} {cfg}: rows {first}..{} differ between a {rows}-row \
+                     call and the {m}-row call",
+                    first + rows
+                );
+            }
+            println!("qgemm prefill {name} {cfg}: rows independent of m ok");
+        }
     }
 }

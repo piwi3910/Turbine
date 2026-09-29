@@ -199,6 +199,23 @@ pub trait WeightFormat: Module {
     fn repacks(&self, _slot: &WeightSlot) -> bool {
         false
     }
+    /// Other checkpoint tensors [`WeightFormat::repack_with`] of `slot` reads (e.g. the block
+    /// scales of a weight decoded at load); the loader passes them in this order.
+    fn companions(&self, _slot: &WeightSlot) -> Vec<String> {
+        Vec::new()
+    }
+    /// [`WeightFormat::repack`] with the [`WeightFormat::companions`] of `slot` (entry and
+    /// bytes each, in order). Default: `repack`.
+    fn repack_with(
+        &self,
+        slot: &WeightSlot,
+        entry: &TensorEntry,
+        bytes: Vec<u8>,
+        companions: &[(&TensorEntry, Vec<u8>)],
+    ) -> Result<Vec<u8>, ModelError> {
+        let _ = companions;
+        self.repack(slot, entry, bytes)
+    }
     /// Rewrites the checkpoint tensor `entry`'s bytes into the layout of `slot` the kernels
     /// consume (e.g. AWQ's nibble order, scales to F32); the result must be exactly the slot's
     /// bytes in [`WeightFormat::slot_dtype`]. Only called when [`WeightFormat::repacks`].
@@ -589,16 +606,18 @@ mod tests {
                 ct("block", block.clone(), act("group", true, json!(128))),
                 "ct_fp8",
                 WeightFormatColumn::Fp8Block,
-                QuantScheme::Fp8Block { n: 128, k: 128 },
-                ActivationQuant::Fp8PerGroupDynamic { group: 128 },
+                // Block-scaled FP8 is decoded to BF16 at load (no gfx1201 provider).
+                QuantScheme::Bf16,
+                ActivationQuant::None,
             ),
             (
                 json!({"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
                        "weight_block_size": [128, 128]}),
                 "hf_fp8",
                 WeightFormatColumn::Fp8Block,
-                QuantScheme::Fp8Block { n: 128, k: 128 },
-                ActivationQuant::Fp8PerGroupDynamic { group: 128 },
+                // Block-scaled FP8 is decoded to BF16 at load (no gfx1201 provider).
+                QuantScheme::Bf16,
+                ActivationQuant::None,
             ),
             (
                 json!({"quant_method": "fp8", "activation_scheme": "static"}),
@@ -742,6 +761,13 @@ mod tests {
         );
         let (field, _) = refused(ct("channel", json!(null), act("token", false, json!(null))));
         assert_eq!(field, "input_activations");
+
+        // A Quark checkpoint quantizing its KV cache (the AMD Llama-3.1-8B-Instruct W4A4 proof
+        // checkpoint) loads: that part of its recipe is ignored with a WARN.
+        let mut kv_quark = quark(true);
+        kv_quark["kv_cache_quant_config"] = json!({"*k_proj": {"input_tensors": {"dtype": "fp4"}}});
+        let format = detect(&json!({ "quantization_config": kv_quark })).expect("loads");
+        assert_eq!(format.column(), WeightFormatColumn::Mxfp4A4);
 
         // MXFP4 refusals: a compressed-tensors group of 64; NVFP4 names the NVIDIA track.
         let (field, supported) = refused(json!({

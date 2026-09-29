@@ -5,7 +5,8 @@
 //! even`) it is `mxfp4_a4` and activations are quantize-dequantized to MXFP4 before each layer
 //! (`ActivationQuant::Mxfp4Emulated`, user decision 2026-09-28, Q6). Per-layer overrides
 //! (`layer_quant_config`, `layer_type_quant_config`), output or KV quantization are refused;
-//! `exclude` names modules left in BF16 (globs). GPTQ calibration with `desc_act` needs
+//! `exclude` names modules left in BF16 (globs). A `kv_cache_quant_config` is ignored with a WARN
+//! (`kv_cache_quant_ignored`): the KV cache follows `kv.dtype`. GPTQ calibration with `desc_act` needs
 //! `static_groups` (the weights stay in order). Tensors: `X.weight` U8 `[n, k/2]`,
 //! `X.weight_scale` U8 `[n, k/32]` ([`super::mxfp4`]).
 
@@ -106,14 +107,22 @@ impl Mxfp4Packaging for QuarkMxfp4 {
                 ));
             }
         }
-        for field in [
-            "layer_quant_config",
-            "layer_type_quant_config",
-            "kv_cache_quant_config",
-        ] {
+        for field in ["layer_quant_config", "layer_type_quant_config"] {
             if !empty(q.get(field)) {
                 return Err(scheme_unsupported(field, q[field].to_string(), "empty"));
             }
+        }
+        // A quantized KV cache in the checkpoint's recipe (e.g. fp4 K/V projection outputs) is
+        // not applied: the KV stays at the configured `kv.dtype` (user decision 2026-09-29).
+        if !empty(q.get("kv_cache_quant_config")) {
+            // Once per process: the server parses config.json more than once while starting.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    event = "kv_cache_quant_ignored",
+                    "the checkpoint's kv_cache_quant_config is ignored; the KV cache uses kv.dtype"
+                );
+            });
         }
         let export = &q["export"];
         if text(export, "weight_format") != "real_quantized" {
