@@ -113,6 +113,10 @@ pub struct KvMetrics {
     pub bytes: GaugeFamilyShare<Labels2>,
     pub lookups: Family<Labels1, Counter>,
     pub prefix_cached_tokens: Counter,
+    /// P6b S-3: prompt tokens served from lossy cached blocks.
+    pub lossy_cached_tokens: Counter,
+    /// P6b S-3: lookups a lossy-reuse opt-out cut at a block only a lossy copy held.
+    pub lossy_denied: Counter,
     pub prompt_tokens: Counter,
     pub promotions: Family<Labels2, Counter>,
     pub demotions: Family<Labels2, Counter>,
@@ -143,6 +147,8 @@ impl KvMetrics {
             bytes: GaugeFamilyShare::new(Family::default()),
             lookups: Family::default(),
             prefix_cached_tokens: Counter::default(),
+            lossy_cached_tokens: Counter::default(),
+            lossy_denied: Counter::default(),
             prompt_tokens: Counter::default(),
             promotions: Family::default(),
             demotions: Family::default(),
@@ -183,6 +189,16 @@ impl KvMetrics {
             "turbine_kv_prefix_cached_tokens",
             "Prompt tokens served from cached prefixes",
             m.prefix_cached_tokens.clone(),
+        );
+        reg.register(
+            "turbine_kv_lossy_cached_tokens",
+            "Prompt tokens served from lossy cached KV blocks",
+            m.lossy_cached_tokens.clone(),
+        );
+        reg.register(
+            "turbine_kv_lossy_denied",
+            "Prefix lookups cut at a lossy block by a lossy-reuse opt-out",
+            m.lossy_denied.clone(),
         );
         reg.register(
             "turbine_kv_prompt_tokens",
@@ -478,6 +494,8 @@ mod tests {
             "turbine_kv_bytes{",
             "turbine_kv_lookups_total{",
             "turbine_kv_prefix_cached_tokens_total",
+            "turbine_kv_lossy_cached_tokens_total 0",
+            "turbine_kv_lossy_denied_total 0",
             "turbine_kv_prompt_tokens_total",
             "turbine_kv_promotions_total{",
             "turbine_kv_demotions_total{",

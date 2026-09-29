@@ -1794,6 +1794,7 @@ fn reference_tokens(prompt: &[u32], sampling: SamplingParams, max_tokens: u32) -
         deadline_ms: u64::MAX,
         session: None,
         cache_salt: None,
+        kv_policy: None,
     };
     let cancel = turbine_core::request::CancelFlag::default();
     generate(

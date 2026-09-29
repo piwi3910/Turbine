@@ -510,6 +510,17 @@ struct KvSimRequest {
     /// Sampled tokens (deterministic stand-ins for the model's output).
     generated: Vec<u32>,
     stage: KvStage,
+    /// `x-turbine-kv-lossy` (P6b S-3); `None` takes `kv.lossy_reuse`.
+    allow_lossy: Option<bool>,
+}
+
+/// What one request was attached (P6b S-3 checks): its cached and lossy tokens and, per
+/// attached L0 block, the directory entry holding it with that entry's lineage.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttachRecord {
+    pub cached_tokens: u32,
+    pub lossy_tokens: u32,
+    pub entries: Vec<Option<(turbine_kv::identity::KvKey, turbine_kv::directory::Lineage)>>,
 }
 
 /// The real `Scheduler`, `BlockPool` and `KvHierarchy` against the simulated executor on
@@ -536,6 +547,7 @@ pub struct KvSimDriver {
     attaching: Vec<RequestId>,
     estimates: HashMap<RequestId, ResourceEstimate>,
     prefilled: HashMap<RequestId, u32>,
+    attached: HashMap<RequestId, AttachRecord>,
     violations: Vec<String>,
 }
 
@@ -576,12 +588,24 @@ impl KvSimDriver {
             attaching: Vec::new(),
             estimates: HashMap::new(),
             prefilled: HashMap::new(),
+            attached: HashMap::new(),
             violations: Vec::new(),
         }
     }
 
     /// A request arrives; it attaches its cached prefix on the next `step`.
     pub fn submit(&mut self, id: RequestId, prompt: Vec<u32>, max_tokens: u32) {
+        self.submit_with(id, prompt, max_tokens, None);
+    }
+
+    /// [`KvSimDriver::submit`] with the request's `x-turbine-kv-lossy` (P6b S-3).
+    pub fn submit_with(
+        &mut self,
+        id: RequestId,
+        prompt: Vec<u32>,
+        max_tokens: u32,
+        allow_lossy: Option<bool>,
+    ) {
         let seq = SeqId(self.next_seq);
         self.next_seq += 1;
         self.seq_request.insert(seq, id);
@@ -593,6 +617,7 @@ impl KvSimDriver {
                 max_tokens: max_tokens.max(1),
                 generated: Vec::new(),
                 stage: KvStage::Attaching,
+                allow_lossy,
             },
         );
         self.attaching.push(id);
@@ -724,6 +749,11 @@ impl KvSimDriver {
         self.prefilled.get(&id).copied().unwrap_or(0)
     }
 
+    /// What `id` was attached when it was handed to the scheduler.
+    pub fn attached(&self, id: RequestId) -> Option<&AttachRecord> {
+        self.attached.get(&id)
+    }
+
     /// The estimate `id` was submitted to the scheduler with.
     pub fn last_estimate(&self, id: RequestId) -> Option<ResourceEstimate> {
         self.estimates.get(&id).copied()
@@ -750,6 +780,7 @@ impl KvSimDriver {
                 cache_salt: "",
                 session: None,
                 priority: Priority::default(),
+                allow_lossy: r.allow_lossy,
             };
             match self.kv.attach_prefix(&mut self.pool, &req) {
                 AttachOutcome::Ready(a) => self.schedule(id, a),
@@ -771,6 +802,19 @@ impl KvSimDriver {
             return;
         };
         r.stage = KvStage::Scheduled;
+        let entries = attach
+            .blocks
+            .iter()
+            .map(|b| self.kv.l0_entry(*b).map(|e| (e.key, e.lineage)))
+            .collect();
+        self.attached.insert(
+            id,
+            AttachRecord {
+                cached_tokens: attach.cached_tokens,
+                lossy_tokens: attach.lossy_tokens,
+                entries,
+            },
+        );
         let bt = self.sched.params().block_tokens;
         let prompt = r.prompt.len() as u32;
         let mut sr = SchedRequest::new(id, smallvec::smallvec![r.seq], prompt, r.max_tokens, bt);

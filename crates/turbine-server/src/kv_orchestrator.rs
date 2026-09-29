@@ -47,11 +47,9 @@ use smallvec::SmallVec;
 use tokio::sync::{mpsc, oneshot};
 use turbine_core::clock::Clock;
 use turbine_core::config::KvConfig;
-use turbine_core::request::SessionHints;
 use turbine_core::telemetry::{StorageProbe, StorageSample};
 use turbine_core::types::{
-    BlockId, DType, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, Priority,
-    RequestId,
+    BlockId, DType, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, RequestId,
 };
 use turbine_kv::codec::{CodecParams, KvCodec};
 use turbine_kv::document::HitWindow;
@@ -599,27 +597,10 @@ impl KvOrchestrator {
     }
 
     /// Admission-time prefix match of a request (P4 S-3).
-    pub fn attach(
-        &mut self,
-        pool: &mut BlockPool,
-        request: RequestId,
-        prompt: &[u32],
-        cache_salt: &str,
-        session: Option<&SessionHints>,
-        priority: Priority,
-    ) -> AttachOutcome {
-        let outcome = self.h.attach_prefix(
-            pool,
-            &AttachRequest {
-                request,
-                prompt,
-                cache_salt,
-                session,
-                priority,
-            },
-        );
+    pub fn attach(&mut self, pool: &mut BlockPool, req: &AttachRequest<'_>) -> AttachOutcome {
+        let outcome = self.h.attach_prefix(pool, req);
         if let AttachOutcome::Ready(a) = &outcome {
-            self.record_hit(prompt.len(), a);
+            self.record_hit(req.prompt.len(), a);
         }
         outcome
     }

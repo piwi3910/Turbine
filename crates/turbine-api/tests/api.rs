@@ -1464,7 +1464,13 @@ mod kv_sim {
             }
         }
 
-        fn run(&self, prompt: &[u32], salt: &str, session: Option<&SessionHints>) -> PrefixAttach {
+        fn run(
+            &self,
+            prompt: &[u32],
+            salt: &str,
+            session: Option<&SessionHints>,
+            allow_lossy: Option<bool>,
+        ) -> PrefixAttach {
             let g = &mut *self.lock();
             let id = turbine_core::types::RequestId::new_v4();
             let req = AttachRequest {
@@ -1473,6 +1479,7 @@ mod kv_sim {
                 cache_salt: salt,
                 session,
                 priority: Priority::default(),
+                allow_lossy,
             };
             let attach = 'attach: loop {
                 match g.h.attach_prefix(&mut g.pool, &req) {
@@ -1529,13 +1536,15 @@ mod kv_sim {
                 end: req.hints.session_end,
             });
             let salt = req.hints.cache_salt.clone().unwrap_or_default();
-            let attach = self.run(&prompt, &salt, session.as_ref());
+            let allow_lossy = req.hints.kv_policy.map(|p| p.allow_lossy);
+            let attach = self.run(&prompt, &salt, session.as_ref(), allow_lossy);
             Box::pin(async move {
                 let (tx, rx) = tokio::sync::mpsc::channel(8);
                 let usage = Usage {
                     prompt_tokens: prompt.len() as u32,
                     completion_tokens: 1,
                     cached_tokens: attach.cached_tokens,
+                    lossy_cached_tokens: attach.lossy_tokens,
                 };
                 for e in [
                     GenerationEvent::Started { choice: 0 },
@@ -1965,6 +1974,44 @@ async fn kv_metrics_bounded() {
     sim.settle();
     sim.demote_all();
 
+    // P6b S-3: `usage.prompt_tokens_details.lossy_cached_tokens` in completion and chat
+    // responses (0: these tiers store the L0 bytes), and `x-turbine-kv-lossy` is allow or deny.
+    for deny in [&[][..], &[("x-turbine-kv-lossy", "deny")][..]] {
+        let (s, v) = post_json(
+            &app,
+            "/v1/completions",
+            json!({"model": kv_sim::MODEL, "prompt": prompt, "max_tokens": 1}),
+            deny,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["usage"]["prompt_tokens_details"]["lossy_cached_tokens"], 0,
+            "{v}"
+        );
+    }
+    let (s, v) = post_json(
+        &app,
+        "/v1/chat/completions",
+        json!({"model": kv_sim::MODEL, "max_tokens": 1,
+               "messages": [{"role": "user", "content": prompt}]}),
+        &[("x-turbine-kv-lossy", "allow")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["usage"]["prompt_tokens_details"]["lossy_cached_tokens"], 0,
+        "{v}"
+    );
+    let (s, v) = post_json(
+        &app,
+        "/v1/completions",
+        json!({"model": kv_sim::MODEL, "prompt": prompt, "max_tokens": 1}),
+        &[("x-turbine-kv-lossy", "maybe")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+
     let (s, _, body) = send(&app, "GET", "/metrics", Vec::new(), None).await;
     assert_eq!(s, StatusCode::OK);
     let text = String::from_utf8(body).unwrap();
@@ -1973,6 +2020,8 @@ async fn kv_metrics_bounded() {
         "turbine_kv_bytes{",
         "turbine_kv_lookups_total{",
         "turbine_kv_prefix_cached_tokens_total",
+        "turbine_kv_lossy_cached_tokens_total ",
+        "turbine_kv_lossy_denied_total ",
         "turbine_kv_prompt_tokens_total",
         "turbine_kv_promotions_total{",
         "turbine_kv_demotions_total{",

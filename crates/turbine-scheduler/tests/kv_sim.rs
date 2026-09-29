@@ -669,3 +669,177 @@ fn one_off_overload_does_not_demote() {
         "RED frees one-off blocks now"
     );
 }
+
+/// Exact keys of every full block of `prompt` under the simulation's unsalted namespace.
+fn exact_keys(prompt: &[u32]) -> Vec<turbine_kv::identity::KvKey> {
+    use turbine_kv::identity::{Blake3Hasher, namespace_key, prefix_keys};
+    let id = ModelIdentity {
+        config_hash: [3; 32],
+        weights_index_hash: [4; 32],
+        rope_hash: [0; 32],
+    };
+    let h = Blake3Hasher(namespace_key(&id, &format(), ""));
+    prefix_keys(&h, prompt, 16)
+}
+
+/// P6b S-3: over an L1 that stores `tq4` (every block lossy, no lossless tail), a seeded mix
+/// of opted-in and opted-out (`x-turbine-kv-lossy: deny`) requests. No opted-out request is
+/// ever attached a block of lossy lineage or a lossy copy; the first one on a prompt recomputes
+/// from its first lossy block and publishes an exact chain later exact lookups take; blocks
+/// prefilled over a lossy prefix carry lossy keys; `lossy_tokens` counts exactly the tokens of
+/// lossy blocks; and the planner retrieves a lossy block only while retrieval × (1 + penalty)
+/// is cheaper than recomputing it. Breaks if a lookup ignores the opt-out.
+#[test]
+fn lossy_lineage_never_reaches_opted_out() {
+    use turbine_kv::directory::Lineage;
+    use turbine_kv::transfer::TransferPath;
+
+    let lossy_setup = |penalty: Option<f64>| {
+        let mut kv = KvConfig::default();
+        kv.cpu.format = ModuleName::new("tq4").unwrap();
+        kv.lossless_tail_blocks = 0;
+        if let Some(p) = penalty {
+            kv.lossy_penalty = Some([(ModuleName::new("tq4").unwrap(), p)].into());
+        }
+        let mut s = setup(128, 16, 0, kv, MemoryKind::Dedicated);
+        let prompts = fill_l0(&mut s.driver);
+        // RED: every unreferenced block leaves L0 for L1, where it is stored lossy.
+        s.driver.set_pressure(PressureState::Red);
+        for _ in 0..60 {
+            s.driver.step();
+        }
+        s.driver.set_pressure(PressureState::Green);
+        assert_eq!(s.driver.pool().cached_unreferenced(), 0);
+        for b in s.driver.kv().directory().iter() {
+            let formats: Vec<_> = b.locations.iter().map(|l| (l.tier, l.format)).collect();
+            assert_eq!(formats, [(TierId::L1, "tq4")], "{:?}", b.token_range);
+        }
+        (s, prompts)
+    };
+    // One more full block past each prompt, and the two tokens reuse always recomputes.
+    let extended = |p: &Vec<u32>, i: usize| -> Vec<u32> {
+        let mut q = p.clone();
+        q.extend(70_000 + i as u32 * 100..70_000 + i as u32 * 100 + 16);
+        q.extend([7, 8]);
+        q
+    };
+
+    let tq4_bytes = turbine_kv::codec::registry()
+        .get("tq4")
+        .unwrap()
+        .bytes_per_block(&format().layout);
+    let recompute_block = 16.0 / 8_000.0;
+    let (mut s, prompts) = lossy_setup(None);
+    let d = &mut s.driver;
+    let mut exact_chain = [false; 5];
+    let mut lossy_first = [false; 5];
+    let mut seen = [false; 5];
+    let mut lossy_sum = 0u64;
+    let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+    for n in 0..30u128 {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let (i, opted_out) = ((rng % 5) as usize, (rng >> 8).is_multiple_of(2));
+        let id = rid(1000 + n);
+        d.submit_with(id, extended(&prompts[i], i), 1, Some(!opted_out));
+        drain(d);
+        let rec = d.attached(id).expect("scheduled").clone();
+        let est = d.kv().transfer().estimate(TransferPath::L1ToL0);
+        assert!(
+            est.block_seconds(tq4_bytes) * 1.5 < recompute_block,
+            "tq4 (penalty 0.5) stays worth retrieving: {est:?}"
+        );
+        let lossy_blocks = rec
+            .entries
+            .iter()
+            .filter(|e| e.is_some_and(|(_, l)| l.is_lossy()))
+            .count() as u32;
+        assert_eq!(
+            rec.lossy_tokens,
+            16 * lossy_blocks,
+            "request {n}: lossy tokens are the lossy blocks' tokens: {rec:?}"
+        );
+        assert!(rec.entries.iter().all(Option::is_some), "{rec:?}");
+        lossy_sum += u64::from(rec.lossy_tokens);
+        if opted_out {
+            assert_eq!(rec.lossy_tokens, 0, "request {n}: {rec:?}");
+            assert!(
+                rec.entries
+                    .iter()
+                    .all(|e| e.is_some_and(|(_, l)| l == Lineage::Exact)),
+                "request {n}: an opted-out request got a lossy block: {rec:?}"
+            );
+            if !exact_chain[i] {
+                assert_eq!(
+                    rec.cached_tokens, 0,
+                    "request {n}: recomputes from the first lossy block"
+                );
+                exact_chain[i] = true;
+            } else {
+                assert_eq!(rec.cached_tokens, 112, "request {n}: the exact chain");
+            }
+        } else if !exact_chain[i] {
+            assert!(rec.lossy_tokens >= 96, "request {n}: reuses lossy: {rec:?}");
+        } else {
+            assert_eq!(
+                (rec.cached_tokens, rec.lossy_tokens),
+                (112, 0),
+                "request {n}: an exact chain goes first"
+            );
+        }
+        if !seen[i] {
+            seen[i] = true;
+            lossy_first[i] = !opted_out;
+        }
+    }
+    assert!(
+        exact_chain.iter().any(|x| *x) && lossy_first.iter().any(|x| *x),
+        "the seed mixes both first requests: {exact_chain:?} {lossy_first:?}"
+    );
+
+    // The published exact chains, and the lossy lineage of blocks prefilled over lossy prefixes.
+    for (i, p) in prompts.iter().enumerate() {
+        let q = extended(p, i);
+        let keys = exact_keys(&q);
+        let dir = d.kv().directory();
+        if exact_chain[i] {
+            for k in &keys {
+                let b = dir.get(k).expect("the exact chain is published");
+                assert_eq!(b.lineage, Lineage::Exact);
+                assert!(b.location(TierId::L0).is_some());
+            }
+        }
+        if lossy_first[i] {
+            let ext = &q[96..112];
+            let lossy_ext: Vec<_> = dir.iter().filter(|b| *b.tokens == *ext).collect();
+            assert!(
+                lossy_ext
+                    .iter()
+                    .any(|b| b.lineage == (Lineage::Lossy { format: "tq4" }) && b.key != keys[6]),
+                "block 6 of prompt {i} prefilled over a lossy prefix has a lossy key"
+            );
+        }
+        for b in dir.iter().filter(|b| b.lineage.is_lossy()) {
+            assert!(!keys.contains(&b.key), "a lossy block under an exact key");
+        }
+    }
+    assert!(lossy_sum > 0);
+    assert_eq!(
+        metric(&s.reg, "turbine_kv_lossy_cached_tokens_total"),
+        lossy_sum as f64
+    );
+    assert!(metric(&s.reg, "turbine_kv_lossy_denied_total") >= 1.0);
+    assert_eq!(s.driver.violations(), &[] as &[String]);
+
+    // At the maximum penalty a lossy retrieval costs more than recomputing: never used.
+    let (mut s, prompts) = lossy_setup(Some(100.0));
+    let est = s.driver.kv().transfer().estimate(TransferPath::L1ToL0);
+    assert!(est.block_seconds(tq4_bytes) * 101.0 > recompute_block);
+    let d = &mut s.driver;
+    d.submit_with(rid(2000), extended(&prompts[0], 0), 1, Some(true));
+    drain(d);
+    let rec = d.attached(rid(2000)).unwrap();
+    assert_eq!((rec.cached_tokens, rec.lossy_tokens), (0, 0), "{rec:?}");
+    assert_eq!(metric(&s.reg, "turbine_kv_lossy_cached_tokens_total"), 0.0);
+}

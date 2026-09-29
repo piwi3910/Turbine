@@ -370,6 +370,7 @@ async fn backend_submit_seam() {
                 prompt_tokens: 1,
                 completion_tokens: 0,
                 cached_tokens: 0,
+                lossy_cached_tokens: 0,
             }),
         },
     ];
@@ -573,6 +574,7 @@ fn hello_script() -> Vec<GenerationEvent> {
                 prompt_tokens: 3,
                 completion_tokens: 3,
                 cached_tokens: 0,
+                lossy_cached_tokens: 0,
             }),
         },
     ]
@@ -613,7 +615,7 @@ async fn response_shapes_and_stream_order() {
     assert_eq!(
         v["usage"],
         json!({"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6,
-               "prompt_tokens_details": {"cached_tokens": 0}})
+               "prompt_tokens_details": {"cached_tokens": 0, "lossy_cached_tokens": 0}})
     );
 
     // Non-streaming chat.
@@ -677,7 +679,7 @@ async fn response_shapes_and_stream_order() {
     assert_eq!(
         chunks[4]["usage"],
         json!({"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6,
-               "prompt_tokens_details": {"cached_tokens": 0}})
+               "prompt_tokens_details": {"cached_tokens": 0, "lossy_cached_tokens": 0}})
     );
     assert_eq!(chunks[5], "[DONE]");
 
@@ -907,6 +909,7 @@ fn finished(choice: u32, reason: FinishReason, completion_tokens: u32) -> Genera
             prompt_tokens: 3,
             completion_tokens,
             cached_tokens: 0,
+            lossy_cached_tokens: 0,
         }),
     }
 }
@@ -984,7 +987,7 @@ async fn phase2_shapes() {
     assert_eq!(
         v["usage"],
         json!({"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6,
-               "prompt_tokens_details": {"cached_tokens": 0}})
+               "prompt_tokens_details": {"cached_tokens": 0, "lossy_cached_tokens": 0}})
     );
 
     // n = 2, non-streaming completion.
