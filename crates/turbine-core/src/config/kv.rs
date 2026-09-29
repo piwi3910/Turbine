@@ -91,10 +91,11 @@ pub enum KvDtypeChoice {
     /// OCP e4m3fn pages with one K and one V scale per layer (the checkpoint's `k_scale` /
     /// `v_scale` when present, else 1.0): half the bytes, lossy.
     Fp8E4m3,
-    /// TurboQuant 4-bit pages (P6b S-5). Parsed now; startup refuses it with
-    /// `kv_tq_unavailable` until a provider runs the v2.10 mixed-format paged attention.
+    /// TurboQuant 4-bit pages (P6b S-5): served by the CPU reference provider
+    /// (`experimental`); a GPU backend refuses it at startup with `kv_tq_unavailable` until a
+    /// provider runs the v2.10 mixed-format paged attention.
     Tq4,
-    /// TurboQuant 2-bit pages (P6b S-5); refused at startup like [`KvDtypeChoice::Tq4`].
+    /// TurboQuant 2-bit pages (P6b S-5); like [`KvDtypeChoice::Tq4`].
     Tq2,
 }
 

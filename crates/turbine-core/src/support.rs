@@ -429,6 +429,26 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Experimental,
     ),
+    // TurboQuant L0 pages on the CPU reference provider (P6b S-5, `cpu::tq_attention`): tests
+    // and tiny checkpoints; a GPU provider needs the v2.10 mixed-format attention (Task 12).
+    row(
+        Some("cpu"),
+        None,
+        None,
+        BF16,
+        Some(KvFormatColumn::Tq4),
+        NO_SPEC,
+        SupportStatus::Experimental,
+    ),
+    row(
+        Some("cpu"),
+        None,
+        None,
+        BF16,
+        Some(KvFormatColumn::Tq2),
+        NO_SPEC,
+        SupportStatus::Experimental,
+    ),
     // Reserved for the tracks; each track replaces its refusal with validated rows.
     family_row("amd", "Qwen3ForCausalLM"),
     family_row("amd", "Qwen3MoeForCausalLM"),
@@ -1170,13 +1190,19 @@ mod tests {
             status.reason().unwrap().contains("phase-6a-quantization"),
             "{status:?}"
         );
-        // TurboQuant L0 pages (P6b S-5): refused naming the track on every vendor, blaming
-        // kv.dtype; the lower-tier formats resolve through TIER_FORMAT_REFUSALS.
+        // TurboQuant L0 pages (P6b S-5): `experimental` on the CPU reference provider (BF16
+        // weights), refused naming the track on every other vendor, blaming kv.dtype; the
+        // lower-tier formats resolve through TIER_FORMAT_REFUSALS.
         for kv in [K::Tq4, K::Tq2] {
+            for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
+                let k = key("cpu", "cpu", architecture, W::Bf16, kv, S::None);
+                assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
+                let k = key("cpu", "cpu", architecture, W::Fp8, kv, S::None);
+                assert_eq!(resolve(&k).as_str(), "unsupported", "{k}");
+            }
             for (vendor, arch, architecture) in [
                 ("amd", "gfx1201", "LlamaForCausalLM"),
                 ("amd", "gfx1201", "OlmoeForCausalLM"),
-                ("cpu", "cpu", "LlamaForCausalLM"),
             ] {
                 let k = key(vendor, arch, architecture, W::Bf16, kv, S::None);
                 let status = resolve(&k);
