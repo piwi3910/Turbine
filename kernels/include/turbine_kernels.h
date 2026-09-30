@@ -406,8 +406,8 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * one-shot collectives over it; v2.8 the device-sequenced (graph-capturable)
  * mapped collective step; v2.9 the quantized GEMM, activation quantization
  * and FP8 KV scales (all below); v2.10 turbine_rope_desc.attn_factor (above,
- * no new symbol). */
-#define TURBINE_ABI_MINOR 10u
+ * no new symbol); v2.11 the KV transcode (below). */
+#define TURBINE_ABI_MINOR 11u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -977,6 +977,67 @@ int32_t turbine_quantize_act(turbine_ctx *ctx,
                              const turbine_quantize_act_desc *d);
 int32_t turbine_quantize_act_supported(const turbine_quantize_act_desc *d);
 const char *turbine_quantize_act_impl(const turbine_quantize_act_desc *d);
+
+/* ======== v2.11 (additive, optional): KV transcode ========
+ * Phase 6b. Resolved only when turbine_abi_minor() >= 11, all three trio
+ * functions exist and the v2.9 (dtype codes) and v2.5 (the pinned copy path
+ * the encoded bytes cross) groups are resolved; a library without it keeps
+ * every lower KV tier at the page format (kv.cpu.format / kv.nvme.format other
+ * than l0 are then refused at startup, kv_transcode_unavailable).
+ *
+ * One call encodes (direction ENCODE) or decodes (DECODE) a batch of KV blocks
+ * between their L0 pages and a device buffer of encoded slots; the encoded
+ * bytes then cross the host link through the existing pinned copies, so this
+ * op reads host memory only for the page table below.
+ *
+ * Codec formats (TURBINE_KVFMT_*): L0 is the page format itself (never a
+ * transcode); FP8_E4M3 is the OCP e4m3fn codec of crates/turbine-kv (slot =
+ * layers x [K scale, V scale] F32 little-endian, then one e4m3 byte per page
+ * element in page order; a scale is max(absmax / 448, 1 / (448 * 512)) of one
+ * layer's K or V of the block, an element is e4m3(x / scale), rounded to
+ * nearest even and saturated to +-448, decoded as bf16(e4m3 * scale));
+ * TQ4 and TQ2 are the TurboQuant codecs (slot layouts of crates/turbine-kv
+ * codec/turboquant; their kernels and descriptor fields arrive with them).
+ * Encode equals the CPU codec byte for byte, decode bit for bit. */
+#define TURBINE_KVFMT_L0 0
+#define TURBINE_KVFMT_FP8_E4M3 1
+#define TURBINE_KVFMT_TQ4 2
+#define TURBINE_KVFMT_TQ2 3
+#define TURBINE_KV_ENCODE 0
+#define TURBINE_KV_DECODE 1
+#define TURBINE_OP_KV_TRANSCODE 19
+
+typedef struct turbine_kv_transcode_desc {
+  /* host array [num_blocks * layers] of device addresses: entry b * layers + l
+   * is layer l of block b, one page of 2 * block_tokens * num_kv_heads *
+   * head_dim elements of page_dtype laid out [K, V][block_tokens][num_kv_heads]
+   * [head_dim] (read by ENCODE, written by DECODE). Read during the call only.
+   */
+  void *const *pages;
+  /* device F32 [layers] scales of FP8 pages (value = e4m3 * scale); NULL = 1.0;
+   * read only with page_dtype F8E4M3 */
+  const float *k_scales;
+  const float *v_scales;
+  /* num_blocks consecutive slots of coded_block_bytes (written by ENCODE, read
+   * by DECODE) */
+  void *coded;
+  int64_t coded_block_bytes;
+  /* TurboQuant rotation seed; ignored by FP8_E4M3 */
+  uint64_t seed;
+  int32_t num_blocks, layers, block_tokens, num_kv_heads, head_dim;
+  /* TURBINE_DTYPE_* of the pages (BF16, or F8E4M3 for codecs that start from
+   * FP8 pages) */
+  int32_t page_dtype;
+  /* TURBINE_KVFMT_* of the coded slots (not L0) */
+  int32_t format;
+  /* TURBINE_KV_ENCODE or TURBINE_KV_DECODE */
+  int32_t direction;
+} turbine_kv_transcode_desc;
+
+int32_t turbine_kv_transcode(turbine_ctx *ctx,
+                             const turbine_kv_transcode_desc *d);
+int32_t turbine_kv_transcode_supported(const turbine_kv_transcode_desc *d);
+const char *turbine_kv_transcode_impl(const turbine_kv_transcode_desc *d);
 
 #ifdef __cplusplus
 }

@@ -21,10 +21,10 @@ use crate::ops::{
     ActivationConfig, ActivationKernel, AddRmsnormConfig, AddRmsnormKernel, AttentionConfig,
     AttentionKernel, ElementwiseConfig, ElementwiseKernel, EmbeddingConfig, EmbeddingKernel,
     GemmConfig, GemmKernel, ImplChoice, ImplInfo, KernelProvider, KvCopyConfig, KvCopyKernel,
-    LogitsReduceConfig, LogitsReduceKernel, MoeExpertsConfig, MoeKernel, MoeRouteConfig,
-    NormConfig, NormKernel, OpKind, ProviderId, QGemmConfig, QGemmKernel, QuantizeActConfig,
-    QuantizeActKernel, RmsnormShardedConfig, RopeConfig, RopeKernel, RowSumsqConfig, RowTier,
-    ShardedNormKernel,
+    KvTranscodeConfig, KvTranscodeKernel, LogitsReduceConfig, LogitsReduceKernel, MoeExpertsConfig,
+    MoeKernel, MoeRouteConfig, NormConfig, NormKernel, OpKind, ProviderId, QGemmConfig,
+    QGemmKernel, QuantizeActConfig, QuantizeActKernel, RmsnormShardedConfig, RopeConfig,
+    RopeKernel, RowSumsqConfig, RowTier, ShardedNormKernel,
 };
 
 /// `reason_code` of a selection: the card profile's first listed implementation (that the
@@ -93,6 +93,8 @@ pub enum OpConfig {
     QGemm(QGemmConfig),
     /// ABI v2.9; a shim library without the group has no provider for it.
     QuantizeAct(QuantizeActConfig),
+    /// ABI v2.11; a shim library without the group has no provider for it.
+    KvTranscode(KvTranscodeConfig),
 }
 
 impl OpConfig {
@@ -114,6 +116,7 @@ impl OpConfig {
             OpConfig::RmsnormSharded(_) => OpKind::RmsnormSharded,
             OpConfig::QGemm(_) => OpKind::QGemm,
             OpConfig::QuantizeAct(_) => OpKind::QuantizeAct,
+            OpConfig::KvTranscode(_) => OpKind::KvTranscode,
         }
     }
 
@@ -136,6 +139,7 @@ impl OpConfig {
             OpConfig::RmsnormSharded(cfg) => cfg.to_string(),
             OpConfig::QGemm(cfg) => cfg.to_string(),
             OpConfig::QuantizeAct(cfg) => cfg.to_string(),
+            OpConfig::KvTranscode(cfg) => cfg.to_string(),
         }
     }
 
@@ -206,6 +210,10 @@ impl OpConfig {
                 .map(|k| k.implementation(cfg)),
             OpConfig::QuantizeAct(cfg) => provider
                 .quantize_act()
+                .filter(|k| k.supports(cfg))
+                .map(|k| k.implementation(cfg)),
+            OpConfig::KvTranscode(cfg) => provider
+                .kv_transcode()
                 .filter(|k| k.supports(cfg))
                 .map(|k| k.implementation(cfg)),
         }
@@ -695,6 +703,13 @@ impl KernelRegistry {
         self.provider(OpConfig::QuantizeAct(*cfg))
             .quantize_act()
             .expect("the selected provider implements quantize_act")
+    }
+
+    /// The KV transcode kernel selected for `cfg` (ABI v2.11).
+    pub fn kv_transcode(&self, cfg: &KvTranscodeConfig) -> &dyn KvTranscodeKernel {
+        self.provider(OpConfig::KvTranscode(*cfg))
+            .kv_transcode()
+            .expect("the selected provider implements kv_transcode")
     }
 }
 

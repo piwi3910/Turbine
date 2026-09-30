@@ -207,7 +207,7 @@ fn header_declares_the_v24_minor_revision() {
     );
     // v2.5 (Phase 4), v2.6, v2.7 and v2.8 (Phase 5) and v2.9 (Phase 6a) raised the minor; the
     // v2.4 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
     for (i, op) in OpKind::ALL.iter().enumerate() {
         let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
         assert_eq!(define(&code, &name), i.to_string(), "{name}");
@@ -247,7 +247,7 @@ fn header_declares_the_v25_copy_streams() {
         "v2.5 keeps major 2"
     );
     // v2.6, v2.7 and v2.8 (Phase 5) raised the minor; the v2.5 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
     assert_eq!(define(&code, "TURBINE_COPY_H2D"), "0");
     assert_eq!(define(&code, "TURBINE_COPY_D2H"), "1");
     assert_eq!(define(&code, "TURBINE_COPY_D2D"), "2");
@@ -281,7 +281,7 @@ fn header_declares_the_v26_tensor_parallel_group() {
         "v2.6 keeps major 2"
     );
     // v2.7 and v2.8 raised the minor; the v2.6 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
     assert_eq!(define(&code, "TURBINE_OP_ROW_SUMSQ"), "15");
     assert_eq!(define(&code, "TURBINE_OP_RMSNORM_SHARDED"), "16");
     for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
@@ -324,7 +324,7 @@ fn header_declares_the_v27_host_mapped_group() {
         "v2.7 keeps major 2"
     );
     // v2.8 raised the minor; the v2.7 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
     for (name, value) in [
         ("TURBINE_MAPPED_ALL_REDUCE", "0"),
         ("TURBINE_MAPPED_ALL_GATHER", "1"),
@@ -377,7 +377,7 @@ fn header_declares_the_v28_device_sequenced_step() {
         "2u",
         "v2.8 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
     assert_eq!(
         OpKind::ALL.iter().filter(|op| op.abi_minor() <= 8).count(),
         17,
@@ -402,7 +402,7 @@ fn header_declares_the_v29_quantization_group() {
     use turbine_core::types::DType;
     use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
     assert_eq!(define(&code, "TURBINE_OP_QGEMM"), "17");
     assert_eq!(define(&code, "TURBINE_OP_QUANTIZE_ACT"), "18");
     assert_eq!(OpKind::QGemm.abi_code(), 17);
@@ -473,10 +473,10 @@ fn header_declares_the_v29_quantization_group() {
 #[test]
 fn header_declares_the_v210_rope_attn_factor() {
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
     assert_eq!(
-        OpKind::ALL.iter().filter(|op| op.abi_minor() <= 9).count(),
-        OpKind::ALL.len(),
+        OpKind::ALL.iter().filter(|op| op.abi_minor() == 10).count(),
+        0,
         "v2.10 adds no op code"
     );
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -485,4 +485,53 @@ fn header_declares_the_v210_rope_attn_factor() {
         flat.contains(decl),
         "turbine_kernels.h lacks the v2.10 {decl}"
     );
+}
+
+/// v2.11 (Phase 6b Task 5): the minor becomes 11; the KV transcode trio is declared with op code
+/// 19, the format codes equal `KvTranscodeFormat::abi_code` (and the 6b block format codes of
+/// `KV_FMT_*`), the direction codes are 0 and 1, and the descriptor keeps its field order.
+/// Breaks if a code drifts between the header and `turbine_kernels::ops` (a library would
+/// encode with the wrong codec) or the descriptor fields move.
+#[test]
+fn header_declares_the_v211_kv_transcode_group() {
+    use turbine_kernels::{
+        KV_FMT_BF16, KV_FMT_FP8_E4M3, KV_FMT_TQ2, KV_FMT_TQ4, KvTranscodeFormat,
+    };
+    let code = strip_comments(&header());
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
+    assert_eq!(define(&code, "TURBINE_OP_KV_TRANSCODE"), "19");
+    assert_eq!(OpKind::KvTranscode.abi_code(), 19);
+    assert_eq!(OpKind::KvTranscode.abi_minor(), 11);
+    assert_eq!(OpKind::ALL.len(), 20);
+    for (name, format, block_format) in [
+        ("TURBINE_KVFMT_L0", KvTranscodeFormat::L0, KV_FMT_BF16),
+        (
+            "TURBINE_KVFMT_FP8_E4M3",
+            KvTranscodeFormat::Fp8E4m3,
+            KV_FMT_FP8_E4M3,
+        ),
+        ("TURBINE_KVFMT_TQ4", KvTranscodeFormat::Tq4, KV_FMT_TQ4),
+        ("TURBINE_KVFMT_TQ2", KvTranscodeFormat::Tq2, KV_FMT_TQ2),
+    ] {
+        assert_eq!(define(&code, name), format.abi_code().to_string(), "{name}");
+        assert_eq!(i32::from(block_format), format.abi_code(), "{name}");
+    }
+    assert_eq!(define(&code, "TURBINE_KV_ENCODE"), "0");
+    assert_eq!(define(&code, "TURBINE_KV_DECODE"), "1");
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for decl in [
+        "void *const *pages; const float *k_scales; const float *v_scales; void *coded; \
+         int64_t coded_block_bytes; uint64_t seed; int32_t num_blocks, layers, block_tokens, \
+         num_kv_heads, head_dim; int32_t page_dtype; int32_t format; int32_t direction; } \
+         turbine_kv_transcode_desc;",
+        "int32_t turbine_kv_transcode(turbine_ctx *ctx, const turbine_kv_transcode_desc *d);",
+        "int32_t turbine_kv_transcode_supported(const turbine_kv_transcode_desc *d);",
+        "const char *turbine_kv_transcode_impl(const turbine_kv_transcode_desc *d);",
+    ] {
+        let decl = decl.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(&decl),
+            "turbine_kernels.h lacks the v2.11 {decl}"
+        );
+    }
 }

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use half::bf16;
 use turbine_core::config::DevicesConfig;
-use turbine_core::types::{BlockId, DType, DeviceId, Vendor};
+use turbine_core::types::{BlockId, DType, DeviceId, KvLayout, Vendor};
 use turbine_device::{DiscoveryOptions, discover};
 use turbine_kernels::cards::GFX1201;
 use turbine_kernels::cpu::quant::fp8_e4m3_round;
@@ -23,15 +23,16 @@ use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
     AttentionContext, AttentionKind, ElementwiseConfig, ElementwiseContext, EmbeddingConfig,
-    EmbeddingContext, GemmConfig, GemmContext, ImplChoice, ImplInfo, KernelProvider, KvCopyConfig,
-    KvCopyContext, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
+    EmbeddingContext, GemmConfig, GemmContext, ImplChoice, ImplInfo, KernelProvider, KvCodecFns,
+    KvCopyConfig, KvCopyContext, KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat,
+    LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
     MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, OpConfig, OpKind,
     PagedAttentionContext, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
     RowSumsqConfig, RowSumsqContext, ShimContext, ShimLibrary, TURBINE_OPTION_GEMM_AUTOTUNE,
     TURBINE_OPTION_GEMM_TUNED_SHAPES, cpu_reference_provider, shim_provider,
 };
 use turbine_tensor::host::HostMemory;
-use turbine_tensor::{DeviceMemory, HostStaging, Tensor, TensorView};
+use turbine_tensor::{DeviceBuffer, DeviceMemory, HostStaging, Tensor, TensorView};
 
 // Llama-3.2-3B shapes.
 const HIDDEN: usize = 3072;
@@ -5229,6 +5230,8 @@ fn implementations_enumerated() {
                 ("turbine_hip_mxfp4", "turbine_hip", false),
             ],
         ),
+        // ABI v2.11 (Phase 6b).
+        (OpKind::KvTranscode, one("turbine_hip_fp8", "turbine_hip")),
     ];
     assert_eq!(table.len(), OpKind::ALL.len());
     for (op, want) in &table {
@@ -5578,6 +5581,11 @@ fn every_implementation_matches_cpu() {
         if matches!(op, OpKind::QGemm | OpKind::QuantizeAct) {
             continue;
         }
+        // The v2.11 KV transcode is judged against the `turbine-kv` codecs by
+        // `kv_transcode_matches_cpu`.
+        if op == OpKind::KvTranscode {
+            continue;
+        }
         for info in p.hip.implementations(op) {
             if ran.iter().any(|(o, n)| *o == op && *n == info.name) {
                 continue;
@@ -5817,4 +5825,384 @@ fn gemm_table_matches_cpu() {
     p.ctx
         .set_option(TURBINE_OPTION_GEMM_AUTOTUNE, 1)
         .expect("table on");
+}
+
+// ------------------------------------------------------ KV transcode (lab, P6b S-1)
+
+/// The `turbine-kv` codecs as the function table the CPU provider runs.
+struct KvCodecs;
+
+impl KvCodecs {
+    fn layout(cfg: &KvTranscodeConfig) -> KvLayout {
+        KvLayout {
+            num_layers: cfg.layers,
+            num_kv_heads: cfg.num_kv_heads,
+            head_dim: cfg.head_dim,
+            dtype: cfg.page_dtype,
+            block_tokens: cfg.block_tokens,
+        }
+    }
+
+    fn params(seed: u64, scales: (&[f32], &[f32])) -> turbine_kv::codec::CodecParams {
+        turbine_kv::codec::CodecParams {
+            seed,
+            k_scales: scales.0.to_vec(),
+            v_scales: scales.1.to_vec(),
+        }
+    }
+}
+
+impl KvCodecFns for KvCodecs {
+    fn encode(
+        &self,
+        cfg: &KvTranscodeConfig,
+        seed: u64,
+        scales: (&[f32], &[f32]),
+        block: &[u8],
+        slot: &mut [u8],
+    ) -> Result<(), String> {
+        let name = cfg.codec().expect("a direction").as_str();
+        let codec = turbine_kv::codec::registry().get(name).expect("codec");
+        codec
+            .encode_cpu(block, &Self::layout(cfg), slot, &Self::params(seed, scales))
+            .map_err(|e| e.to_string())
+    }
+
+    fn decode(
+        &self,
+        cfg: &KvTranscodeConfig,
+        seed: u64,
+        scales: (&[f32], &[f32]),
+        slot: &[u8],
+        block: &mut [u8],
+    ) -> Result<(), String> {
+        let name = cfg.codec().expect("a direction").as_str();
+        let codec = turbine_kv::codec::registry().get(name).expect("codec");
+        codec
+            .decode_cpu(slot, &Self::layout(cfg), block, &Self::params(seed, scales))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// `blocks` blocks of `layers` BF16 pages (`[2, T, H, D]` each) of seeded data in the shapes a
+/// KV cache holds: per (layer, K or V) a different scale, a few outliers, and the cases the FP8
+/// codec must get bit for bit: an all-zero half (the scale floor), values on exact rounding
+/// ties (the largest element 448 makes the scale 1.0, so 1.0625 is the tie between 1.0 and
+/// 1.125), saturation, subnormals and a NaN and an infinity in one block.
+fn kv_pages(rng: &mut Rng, cfg: &KvTranscodeConfig, blocks: usize) -> Vec<Vec<u8>> {
+    let half = cfg.half_layer_elems();
+    (0..blocks)
+        .map(|b| {
+            let mut block = Vec::new();
+            for layer in 0..cfg.layers as usize {
+                let mut values = Vec::with_capacity(2 * half);
+                for kind in 0..2 {
+                    let scale = 0.05 * (1.0 + layer as f32) * (1.0 + 3.0 * kind as f32);
+                    let mut v = rng.normal(half, scale);
+                    for i in (0..half).step_by(97) {
+                        v[i] *= 12.0; // outliers
+                    }
+                    match (b % 5, layer % 3, kind) {
+                        (1, 0, 0) => v.iter_mut().for_each(|x| *x = 0.0),
+                        (2, 1, _) => {
+                            v[0] = 448.0;
+                            for (i, t) in [1.0625f32, -1.0625, 1.1875, 0.0703125, 240.0, 464.0]
+                                .into_iter()
+                                .enumerate()
+                            {
+                                v[1 + i] = t;
+                            }
+                            // Subnormal e4m3 magnitudes (multiples of 2^-9) and a midpoint.
+                            v[8] = 0.001953125;
+                            v[9] = 0.0029296875;
+                            v[10] = 1.0e-7;
+                        }
+                        (3, 2, 1) => v[5] = f32::NAN,
+                        (4, 0, 0) => v[7] = f32::INFINITY,
+                        _ => {}
+                    }
+                    values.extend(v);
+                }
+                block.extend(encode(DType::BF16, &values));
+            }
+            block
+        })
+        .collect()
+}
+
+/// The encode config of a transcode case and the byte size of its coded slot.
+struct KvBatch {
+    cfg: KvTranscodeConfig,
+    slot: usize,
+}
+
+impl KvBatch {
+    fn encode_cfg(&self) -> KvTranscodeConfig {
+        self.cfg
+    }
+
+    fn decode_cfg(&self) -> KvTranscodeConfig {
+        KvTranscodeConfig {
+            src_format: self.cfg.dst_format,
+            dst_format: self.cfg.src_format,
+            ..self.cfg
+        }
+    }
+
+    /// Runs the op on `mem`'s provider: `blocks` are the page bytes (encode) or the expected
+    /// page buffers to fill (decode); returns the host bytes of the coded slots (encode) or of
+    /// the decoded pages (decode).
+    fn run(
+        &self,
+        provider: &Arc<dyn KernelProvider>,
+        mem: &Arc<dyn DeviceMemory>,
+        cfg: KvTranscodeConfig,
+        pages_in: &[Vec<u8>],
+        coded_in: &[Vec<u8>],
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let layers = cfg.layers as usize;
+        let page = cfg.page_bytes();
+        let blocks = pages_in.len();
+        let bufs: Vec<DeviceBuffer> = (0..blocks * layers)
+            .map(|i| {
+                let mut b = DeviceBuffer::alloc(mem, page).expect("page");
+                let (blk, l) = (i / layers, i % layers);
+                if !pages_in[blk].is_empty() {
+                    b.copy_from_host(0, &pages_in[blk][l * page..(l + 1) * page])
+                        .expect("page upload");
+                }
+                b
+            })
+            .collect();
+        let mut coded = DeviceBuffer::alloc(mem, blocks * self.slot).expect("coded");
+        for (b, bytes) in coded_in.iter().enumerate() {
+            coded
+                .copy_from_host(b * self.slot, bytes)
+                .expect("coded upload");
+        }
+        let slices: Vec<_> = bufs.iter().map(DeviceBuffer::whole).collect();
+        provider
+            .kv_transcode()
+            .expect("the kv_transcode family")
+            .execute(&mut KvTranscodeContext {
+                cfg,
+                pages: &slices,
+                coded: coded.whole(),
+                coded_block_bytes: self.slot,
+                seed: 0,
+                k_scales: None,
+                v_scales: None,
+                codecs: &KvCodecs,
+            })
+            .expect("kv_transcode");
+        mem.synchronize().expect("synchronize");
+        let mut coded_out = vec![0u8; blocks * self.slot];
+        coded.copy_to_host(0, &mut coded_out).expect("coded read");
+        let coded_out = coded_out.chunks(self.slot).map(<[u8]>::to_vec).collect();
+        let pages_out = (0..blocks)
+            .map(|b| {
+                let mut block = vec![0u8; layers * page];
+                for l in 0..layers {
+                    bufs[b * layers + l]
+                        .copy_to_host(0, &mut block[l * page..(l + 1) * page])
+                        .expect("page read");
+                }
+                block
+            })
+            .collect();
+        (coded_out, pages_out)
+    }
+}
+
+/// Phase 6b S-1 (ABI v2.11): the FP8 e4m3 KV transcode on the HIP library equals the
+/// `turbine-kv` codec (`fp8_e4m3`, the CPU reference) byte for byte when encoding and bit for
+/// bit when decoding, at the Llama-3.2-3B and OLMoE-1B-7B page shapes and a small odd one, over
+/// data that includes the scale floor, exact ties, saturation, subnormals, NaN and infinity; the
+/// cpu-reference provider over the same codec table agrees with both; the op refuses the
+/// formats and page dtypes no kernel of this library implements; encode and decode of a
+/// demotion batch (32 blocks, Llama) are timed. Breaks if a rounding, a scale or a page offset
+/// differs from the codec (a demoted block would promote into different bits).
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn kv_transcode_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(611);
+    let shapes = [
+        ("llama-3.2-3b", 28u32, 8u32, 128u32, 128u32, 7usize),
+        ("olmoe-1b-7b", 16, 16, 128, 128, 6),
+        ("odd", 3, 2, 72, 16, 10),
+    ];
+    let codec = turbine_kv::codec::registry()
+        .get("fp8_e4m3")
+        .expect("the fp8_e4m3 codec");
+    for (name, layers, kv_heads, head_dim, block_tokens, blocks) in shapes {
+        let cfg = KvTranscodeConfig {
+            src_format: KvTranscodeFormat::L0,
+            dst_format: KvTranscodeFormat::Fp8E4m3,
+            page_dtype: DType::BF16,
+            head_dim,
+            num_kv_heads: kv_heads,
+            block_tokens,
+            layers,
+        };
+        let layout = KvCodecs::layout(&cfg);
+        let slot = codec.bytes_per_block(&layout) as usize;
+        let batch = KvBatch { cfg, slot };
+        let pages = kv_pages(&mut rng, &cfg, blocks);
+
+        // The codec's own bytes, the reference for both directions.
+        let params = turbine_kv::codec::CodecParams::default();
+        let want_coded: Vec<Vec<u8>> = pages
+            .iter()
+            .map(|block| {
+                let mut out = vec![0u8; slot];
+                codec
+                    .encode_cpu(block, &layout, &mut out, &params)
+                    .expect("cpu encode");
+                out
+            })
+            .collect();
+        let want_pages: Vec<Vec<u8>> = want_coded
+            .iter()
+            .map(|slot_bytes| {
+                let mut out = vec![0u8; pages[0].len()];
+                codec
+                    .decode_cpu(slot_bytes, &layout, &mut out, &params)
+                    .expect("cpu decode");
+                out
+            })
+            .collect();
+
+        let kernel = p.hip.kv_transcode().expect("hip kv_transcode");
+        assert!(kernel.supports(&batch.encode_cfg()), "{name} encode");
+        assert!(kernel.supports(&batch.decode_cfg()), "{name} decode");
+        assert_eq!(kernel.implementation(&cfg), "turbine_hip_fp8", "{name}");
+
+        let empty = vec![Vec::new(); blocks];
+        let (coded, _) = batch.run(
+            &p.hip,
+            &p.hip_mem,
+            batch.encode_cfg(),
+            &pages,
+            &vec![vec![0u8; slot]; blocks],
+        );
+        for (b, (got, want)) in coded.iter().zip(&want_coded).enumerate() {
+            let first = got.iter().zip(want).position(|(g, w)| g != w);
+            assert!(
+                first.is_none(),
+                "{name}: encoded block {b} differs from the codec at byte {first:?}"
+            );
+        }
+        let (_, decoded) = batch.run(&p.hip, &p.hip_mem, batch.decode_cfg(), &empty, &want_coded);
+        for (b, (got, want)) in decoded.iter().zip(&want_pages).enumerate() {
+            let first = got.iter().zip(want).position(|(g, w)| g != w);
+            assert!(
+                first.is_none(),
+                "{name}: decoded block {b} differs from the codec at byte {first:?}"
+            );
+        }
+
+        // The cpu-reference provider over the same table agrees.
+        let (cpu_coded, _) = batch.run(
+            &p.cpu,
+            &p.cpu_mem,
+            batch.encode_cfg(),
+            &pages,
+            &vec![vec![0u8; slot]; blocks],
+        );
+        assert_eq!(cpu_coded, want_coded, "{name}: cpu provider encode");
+        let (_, cpu_decoded) =
+            batch.run(&p.cpu, &p.cpu_mem, batch.decode_cfg(), &empty, &want_coded);
+        assert_eq!(cpu_decoded, want_pages, "{name}: cpu provider decode");
+        println!("kv_transcode {name}: {blocks} blocks, encode and decode equal the codec");
+    }
+
+    // What this library does not implement is refused, not approximated.
+    let base = KvTranscodeConfig {
+        src_format: KvTranscodeFormat::L0,
+        dst_format: KvTranscodeFormat::Fp8E4m3,
+        page_dtype: DType::BF16,
+        head_dim: 128,
+        num_kv_heads: 8,
+        block_tokens: 128,
+        layers: 28,
+    };
+    let kernel = p.hip.kv_transcode().expect("hip kv_transcode");
+    for (what, cfg) in [
+        (
+            "tq4",
+            KvTranscodeConfig {
+                dst_format: KvTranscodeFormat::Tq4,
+                ..base
+            },
+        ),
+        (
+            "fp8 pages (the copy path)",
+            KvTranscodeConfig {
+                page_dtype: DType::F8E4M3,
+                ..base
+            },
+        ),
+        (
+            "l0 to l0",
+            KvTranscodeConfig {
+                dst_format: KvTranscodeFormat::L0,
+                ..base
+            },
+        ),
+    ] {
+        assert!(!kernel.supports(&cfg), "{what} must not be supported");
+    }
+
+    // Demotion-batch timings (32 blocks, Llama shape): the pick of the decisions entry
+    // "P6b: KV transcode - provider evaluation".
+    let layout = KvCodecs::layout(&base);
+    let slot = codec.bytes_per_block(&layout) as usize;
+    let blocks = 32usize;
+    let page = base.page_bytes();
+    let layers = base.layers as usize;
+    let raw = encode(DType::BF16, &rng.normal(base.half_layer_elems() * 2, 0.3));
+    let bufs: Vec<DeviceBuffer> = (0..blocks * layers)
+        .map(|_| {
+            let mut b = DeviceBuffer::alloc(&p.hip_mem, page).expect("page");
+            b.copy_from_host(0, &raw).expect("upload");
+            b
+        })
+        .collect();
+    let slices: Vec<_> = bufs.iter().map(DeviceBuffer::whole).collect();
+    let coded = DeviceBuffer::alloc(&p.hip_mem, blocks * slot).expect("coded");
+    let time = |cfg: KvTranscodeConfig| {
+        time_us(&p, 20, || {
+            kernel
+                .execute(&mut KvTranscodeContext {
+                    cfg,
+                    pages: &slices,
+                    coded: coded.whole(),
+                    coded_block_bytes: slot,
+                    seed: 0,
+                    k_scales: None,
+                    v_scales: None,
+                    codecs: &KvCodecs,
+                })
+                .expect("kv_transcode")
+        })
+    };
+    let decode_cfg = KvTranscodeConfig {
+        src_format: base.dst_format,
+        dst_format: base.src_format,
+        ..base
+    };
+    let (enc_us, dec_us) = (time(base), time(decode_cfg));
+    let bytes = (blocks * layers * page) as f64;
+    println!(
+        "kv_transcode timing llama 32 blocks ({:.1} MiB of pages): encode {enc_us:.0} us \
+         ({:.0} GB/s of pages), decode {dec_us:.0} us ({:.0} GB/s)",
+        bytes / (1 << 20) as f64,
+        bytes / enc_us / 1e3,
+        bytes / dec_us / 1e3
+    );
 }

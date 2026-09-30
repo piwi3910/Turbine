@@ -46,17 +46,18 @@ use turbine_tensor::{
 use crate::cards::CardProfile;
 use crate::ffi::{
     self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo,
-    EmbeddingDesc, GemmDesc, LogitsReduceDesc, MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE,
-    MoeExpertsDesc, MoeRouteDesc, OpTrio, QGemmDesc, QuantizeActDesc, RmsnormDesc,
-    RmsnormShardedDesc, RopeDesc, RowSumsqDesc, ShimSymbols, SiluMulDesc, StagingFns, TurbineCtx,
-    TurbineEvent, TurbineGraph,
+    EmbeddingDesc, GemmDesc, KvTranscodeDesc, LogitsReduceDesc, MOE_ROUTE_BF16_LOGITS,
+    MOE_ROUTE_RENORMALIZE, MoeExpertsDesc, MoeRouteDesc, OpTrio, QGemmDesc, QuantizeActDesc,
+    RmsnormDesc, RmsnormShardedDesc, RopeDesc, RowSumsqDesc, ShimSymbols, SiluMulDesc, StagingFns,
+    TurbineCtx, TurbineEvent, TurbineGraph,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
     ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
     EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplChoice, ImplInfo, KernelProvider,
-    KvCopyConfig, KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext,
+    KvCopyConfig, KvCopyContext, KvCopyKernel, KvTranscodeConfig, KvTranscodeContext,
+    KvTranscodeDirection, KvTranscodeKernel, LogitsReduceConfig, LogitsReduceContext,
     LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
     MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
     ProviderId, QGemmConfig, QGemmContext, QGemmKernel, QuantizeActConfig, QuantizeActContext,
@@ -1593,6 +1594,32 @@ fn qgemm_probe(cfg: &QGemmConfig) -> QGemmDesc {
     }
 }
 
+fn kv_transcode_probe(cfg: &KvTranscodeConfig) -> KvTranscodeDesc {
+    let direction = cfg.direction();
+    let codec = cfg.codec();
+    KvTranscodeDesc {
+        pages: std::ptr::null(),
+        k_scales: std::ptr::null(),
+        v_scales: std::ptr::null(),
+        coded: null(),
+        // A slot's size is the codec's: `_supported` does not look at it.
+        coded_block_bytes: 0,
+        seed: 0,
+        num_blocks: 1,
+        layers: cfg.layers as i32,
+        block_tokens: cfg.block_tokens as i32,
+        num_kv_heads: cfg.num_kv_heads as i32,
+        head_dim: cfg.head_dim as i32,
+        page_dtype: cfg.page_dtype.abi_code(),
+        // No direction or codec (both sides L0, or two codecs): a format no library takes.
+        format: codec.map_or(-1, |c| c.abi_code()),
+        direction: direction.map_or(-1, |d| match d {
+            KvTranscodeDirection::Encode => 0,
+            KvTranscodeDirection::Decode => 1,
+        }),
+    }
+}
+
 fn quantize_act_probe(cfg: &QuantizeActConfig) -> QuantizeActDesc {
     let cols = i64::from(cfg.cols);
     QuantizeActDesc {
@@ -2055,6 +2082,92 @@ fn check_qgemm(ctx: &QGemmContext<'_>) -> Result<(i64, i64), KernelError> {
         (false, _) => {}
     }
     Ok((lda, ldc))
+}
+
+impl ShimProvider {
+    /// The v2.11 trio; `KernelProvider::kv_transcode` is `Some` exactly when it exists.
+    fn kv_transcode_trio(&self) -> Result<&OpTrio<KvTranscodeDesc>, KernelError> {
+        self.syms()
+            .v21
+            .kv_transcode
+            .as_ref()
+            .ok_or_else(|| self.ctx.lib.lacks("the ABI v2.11 kv_transcode group"))
+    }
+}
+
+impl KvTranscodeKernel for ShimProvider {
+    fn supports(&self, cfg: &KvTranscodeConfig) -> bool {
+        self.kv_transcode_trio().is_ok_and(|t| {
+            cfg.direction().is_some() && Self::supported(t, &kv_transcode_probe(cfg))
+        })
+    }
+
+    fn implementation(&self, cfg: &KvTranscodeConfig) -> String {
+        self.kv_transcode_trio()
+            .map(|t| self.implementation_of(OpKind::KvTranscode, t, &kv_transcode_probe(cfg)))
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut KvTranscodeContext<'_>) -> Result<(), KernelError> {
+        let trio = self.kv_transcode_trio()?;
+        let cfg = ctx.cfg;
+        let probe = kv_transcode_probe(&cfg);
+        if probe.direction < 0 {
+            return Err(invalid(format!(
+                "kv_transcode: {cfg} needs exactly one side at l0 (the pages)"
+            )));
+        }
+        let layers = cfg.layers as usize;
+        let page_bytes = cfg.page_bytes();
+        let slot = ctx.coded_block_bytes;
+        let num_blocks = ctx.num_blocks();
+        if layers == 0 || slot == 0 || ctx.coded.len() != num_blocks * slot {
+            return Err(invalid(format!(
+                "kv_transcode: coded buffer of {} bytes is not whole slots of {slot} bytes \
+                 ({layers} layers)",
+                ctx.coded.len()
+            )));
+        }
+        if ctx.pages.len() != num_blocks * layers {
+            return Err(invalid(format!(
+                "kv_transcode: {} pages for {num_blocks} blocks of {layers} layers",
+                ctx.pages.len()
+            )));
+        }
+        if let Some(bad) = ctx.pages.iter().position(|p| p.len() != page_bytes) {
+            return Err(invalid(format!(
+                "kv_transcode: page {bad} holds {} bytes, a page is {page_bytes}",
+                ctx.pages[bad].len()
+            )));
+        }
+        if num_blocks == 0 {
+            return Ok(());
+        }
+        let mut table: Vec<*mut c_void> = Vec::with_capacity(ctx.pages.len());
+        for page in ctx.pages {
+            table.push(self.ctx.slice_ptr("page", page)?);
+        }
+        let scales = |name: &str, v: Option<&TensorView<'_>>| -> Result<*const f32, KernelError> {
+            match v {
+                None => Ok(std::ptr::null()),
+                Some(v) => {
+                    dense(name, v, &[layers], DType::F32)?;
+                    Ok(self.ctx.device_ptr(name, v)?.cast_const().cast())
+                }
+            }
+        };
+        let d = KvTranscodeDesc {
+            pages: table.as_ptr(),
+            k_scales: scales("k_scales", ctx.k_scales.as_ref())?,
+            v_scales: scales("v_scales", ctx.v_scales.as_ref())?,
+            coded: self.ctx.slice_ptr("coded", &ctx.coded)?,
+            coded_block_bytes: to_i64("coded_block_bytes", slot)?,
+            seed: ctx.seed,
+            num_blocks: to_i32("num_blocks", num_blocks)?,
+            ..probe
+        };
+        self.run(OpKind::KvTranscode, trio, &d, num_blocks)
+    }
 }
 
 /// Checks that `v` is a dense F32 view of shape `[rows]` (the per-row sums of squares).
@@ -2832,6 +2945,13 @@ impl KernelProvider for ShimProvider {
             .is_some()
             .then_some(self as &dyn QuantizeActKernel)
     }
+    fn kv_transcode(&self) -> Option<&dyn KvTranscodeKernel> {
+        self.syms()
+            .v21
+            .kv_transcode
+            .is_some()
+            .then_some(self as &dyn KvTranscodeKernel)
+    }
 
     fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
         self.ctx.lib.implementations(op)
@@ -2929,6 +3049,10 @@ impl KernelProvider for ShimProvider {
             OpConfig::QGemm(cfg) => lib.impl_supports(OpKind::QGemm, index, &qgemm_probe(cfg)),
             OpConfig::QuantizeAct(cfg) => {
                 lib.impl_supports(OpKind::QuantizeAct, index, &quantize_act_probe(cfg))
+            }
+            OpConfig::KvTranscode(cfg) => {
+                cfg.direction().is_some()
+                    && lib.impl_supports(OpKind::KvTranscode, index, &kv_transcode_probe(cfg))
             }
         }
     }
@@ -3503,6 +3627,7 @@ pub(crate) mod tests {
             size_of::<ffi::MappedCollectiveDesc>(),
             size_of::<ffi::QGemmDesc>(),
             size_of::<ffi::QuantizeActDesc>(),
+            size_of::<ffi::KvTranscodeDesc>(),
         ];
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");

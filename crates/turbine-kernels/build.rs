@@ -12,8 +12,11 @@
 //! memory and collectives, `-DTURBINE_STUB_V27`; minor 7), `TURBINE_STUB_GFX942_V28` (also
 //! the v2.8 device-sequenced collective step, `-DTURBINE_STUB_V28`; minor 8),
 //! `TURBINE_STUB_GFX942_V29` (also the v2.9 quantized GEMM and activation quantization trios,
-//! `-DTURBINE_STUB_V29`; minor 9) and `TURBINE_STUB_GFX942_V210` (also `-DTURBINE_STUB_V210`:
-//! minor 10, the rope attention factor).
+//! `-DTURBINE_STUB_V29`; minor 9), `TURBINE_STUB_GFX942_V210` (also `-DTURBINE_STUB_V210`:
+//! minor 10, the rope attention factor), `TURBINE_STUB_GFX942_V211` (also `-DTURBINE_STUB_V211`:
+//! minor 11, the KV transcode trio), `TURBINE_STUB_GFX942_V211_PARTIAL` (the same without
+//! `turbine_kv_transcode_impl`, `-DTURBINE_STUB_V211_PARTIAL`) and
+//! `TURBINE_STUB_GFX942_V211_NOQUANT` (minor 11 with the v2.11 trio but no v2.9 group).
 use std::path::{Path, PathBuf};
 
 fn build_stub(
@@ -161,6 +164,43 @@ fn main() {
     println!(
         "cargo:rustc-env=TURBINE_STUB_GFX942_V210={}",
         gfx942_v210.display()
+    );
+    const UP_TO_V210: [&str; 8] = [
+        "TURBINE_STUB_V21",
+        "TURBINE_STUB_V24",
+        "TURBINE_STUB_V25",
+        "TURBINE_STUB_V26",
+        "TURBINE_STUB_V27",
+        "TURBINE_STUB_V28",
+        "TURBINE_STUB_V29",
+        "TURBINE_STUB_V210",
+    ];
+    let v211 = |name: &str, defines: &[&str], env: &str| {
+        let path = build_stub(&out_dir, name, 2, "hip", "gfx942", defines);
+        println!("cargo:rustc-env={env}={}", path.display());
+    };
+    let mut full: Vec<&str> = UP_TO_V210.to_vec();
+    full.push("TURBINE_STUB_V211");
+    v211(
+        "turbine_stub_gfx942_v211",
+        &full,
+        "TURBINE_STUB_GFX942_V211",
+    );
+    full.push("TURBINE_STUB_V211_PARTIAL");
+    v211(
+        "turbine_stub_gfx942_v211_partial",
+        &full,
+        "TURBINE_STUB_GFX942_V211_PARTIAL",
+    );
+    let noquant: Vec<&str> = UP_TO_V210[..6]
+        .iter()
+        .copied()
+        .chain(["TURBINE_STUB_V211"])
+        .collect();
+    v211(
+        "turbine_stub_gfx942_v211_noquant",
+        &noquant,
+        "TURBINE_STUB_GFX942_V211_NOQUANT",
     );
     println!("cargo:rustc-env=TURBINE_STUB_ABI999={}", abi999.display());
     println!(

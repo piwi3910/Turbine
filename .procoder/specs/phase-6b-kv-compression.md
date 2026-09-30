@@ -98,7 +98,7 @@ The sub-steps land in this order (user decision 2026-09-28, Q1, Q11): per-tier f
 
 ### Kernel C ABI (optional minor group; `TURBINE_ABI_VERSION` stays 2)
 
-- v2.11 (`TURBINE_ABI_MINOR` ≥ 10, needs v2.9 and v2.5): `TURBINE_KVFMT_{L0 0, FP8_E4M3 1, TQ4 2, TQ2 3}`; `turbine_kv_transcode_desc { src_pages, src_dtype, k_scale, v_scale, dst, dst_format, seed, num_blocks, layers, block_tokens, num_kv_heads, head_dim, direction /*0 encode, 1 decode*/ }`, `turbine_kv_transcode` / `_supported` / `_impl` (op 19); `turbine_attention_paged_desc` gains `const uint8_t *block_formats` and `const turbine_tq_params *tq_params` (`seed`, codebook pointers for K, V and the residual), read only at minor ≥ 10; `TURBINE_DTYPE_TQ4` 18 and `TURBINE_DTYPE_TQ2` 19 as page dtypes.
+- v2.11 (`TURBINE_ABI_MINOR` ≥ 11, needs v2.9 and v2.5): `TURBINE_KVFMT_{L0 0, FP8_E4M3 1, TQ4 2, TQ2 3}`; `turbine_kv_transcode_desc { pages /*host array [num_blocks × layers] of device page addresses*/, k_scales, v_scales /*device F32 [layers] of FP8 pages, NULL = 1*/, coded /*num_blocks slots*/, coded_block_bytes, seed, num_blocks, layers, block_tokens, num_kv_heads, head_dim, page_dtype, format, direction /*0 encode, 1 decode*/ }` (one descriptor for both directions, as built in Task 5), `turbine_kv_transcode` / `_supported` / `_impl` (op 19); `turbine_attention_paged_desc` gains `const uint8_t *block_formats` and `const turbine_tq_params *tq_params` (`seed`, codebook pointers for K, V and the residual), read only at minor ≥ 10; `TURBINE_DTYPE_TQ4` 18 and `TURBINE_DTYPE_TQ2` 19 as page dtypes.
 
 ### Metrics (added)
 

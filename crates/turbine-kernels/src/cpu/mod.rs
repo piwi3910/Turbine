@@ -19,8 +19,8 @@ use turbine_tensor::TensorView;
 use crate::KernelError;
 use crate::ops::{
     ActivationKernel, AddRmsnormKernel, AttentionKernel, ElementwiseKernel, EmbeddingKernel,
-    GemmKernel, KernelProvider, KvCopyKernel, LogitsReduceKernel, MoeKernel, NormKernel,
-    ProviderId, QGemmKernel, QuantizeActKernel, RopeKernel, ShardedNormKernel,
+    GemmKernel, KernelProvider, KvCopyKernel, KvTranscodeKernel, LogitsReduceKernel, MoeKernel,
+    NormKernel, ProviderId, QGemmKernel, QuantizeActKernel, RopeKernel, ShardedNormKernel,
 };
 
 // One file per op family (Phase 2m S-5); `math`, `paged` and `topk` hold the shared numerics.
@@ -30,6 +30,7 @@ mod elementwise;
 mod embedding;
 mod gemm;
 mod kv_copy;
+mod kv_transcode;
 mod logits_reduce;
 mod math;
 mod moe;
@@ -344,6 +345,9 @@ impl KernelProvider for CpuReference {
         Some(self)
     }
     fn quantize_act(&self) -> Option<&dyn QuantizeActKernel> {
+        Some(self)
+    }
+    fn kv_transcode(&self) -> Option<&dyn KvTranscodeKernel> {
         Some(self)
     }
 }

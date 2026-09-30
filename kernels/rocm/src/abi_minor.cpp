@@ -1,6 +1,6 @@
 // turbine_abi_minor: the minor revision of the library it is linked into.
 //
-// libturbine_hip.so reports TURBINE_ABI_MINOR (10): besides the ABI v2 trios it
+// libturbine_hip.so reports TURBINE_ABI_MINOR (11): besides the ABI v2 trios it
 // exports the optional add_rmsnorm trio (rmsnorm.cpp), the v2.1 context
 // options (context.cpp: the tuned GEMM table switch), logits_reduce
 // (logits_reduce.hip), the graph functions (graph.cpp), the v2.3 pinned host
@@ -13,7 +13,8 @@
 // FP8 KV scales of turbine_attention_paged_desc are read only with F8E4M3
 // pages, which paged attention refuses until an implementation takes them.
 // v2.10 adds no symbol: the rope kernels (elementwise.hip) multiply cos and
-// sin by turbine_rope_desc.attn_factor (YaRN's attention factor).
+// sin by turbine_rope_desc.attn_factor (YaRN's attention factor). v2.11 adds
+// the KV transcode trio (kv_transcode.hip).
 // libturbine_hip_v23.so, compiled with TURBINE_V23_BUILD, is the same kernels
 // without impl_exports.cpp and reports 3, so a caller keeps the library's own
 // choice of implementation (the fallback the v2.4 group is optional against)

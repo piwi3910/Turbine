@@ -2305,3 +2305,35 @@ them does nothing (ARC recreates them while jobs queue).
 - C) Lower the runner CPU request (e.g. 1) so more fit
 
 **Decision (user, 2026-09-30): B.** `maxRunners` of `arc-runners/arc-azrtydxb-amd64` set to 5.
+
+## P6b: KV transcode — provider evaluation (kernel reuse rule)
+
+Date: 2026-09-30 (Phase 6b Task 5). Op: `turbine_kv_transcode` (ABI v2.11), FP8 e4m3 encode (BF16 page → e4m3 bytes
+with the block's per-layer K and V scales) and decode, the exact contract of the CPU codec `fp8_e4m3`
+(`crates/turbine-kv/src/codec/fp8_e4m3.rs`): scale `max(absmax / 448, 1 / (448 × 512))` per (layer, K or V) of a block,
+element `e4m3(x / scale)` rounded to nearest even and saturated to ±448, NaN code `0x7f`, decode `bf16(e4m3 × scale)`;
+encode byte-exact and decode bit-exact (spec S-1). Card: R9700 (gfx1201), ROCm 7.14.1 headers on `novanas`, CK at the
+pinned `cd9574023093742434e8c992d13b89ab9a6c1cf8`. The CK candidates were judged on their headers
+(`/opt/rocm/rocm/include/ck_tile/ops/{elementwise,batched_transpose,reduce}`), not built: each fails the contract before
+a build could matter.
+
+| Candidate                                                                    | Builds on gfx1201?                                       | Fits the contract?                                                                                                                                                                                                                                                                                                                                          | Outcome                                                                           |
+| ---------------------------------------------------------------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| CK `ck_tile` `elementwise` (`ElementWiseKernel`, unary op)                   | yes (header-only, used by the FMHA instances' toolchain) | no: one strided tensor in, one out per call, while a batch is `num_blocks × layers` scattered page addresses; no reduction feeding a scale; its FP8 conversion is `type_convert<fp8_t>` (the hardware e4m3 instruction, rounding and NaN code chosen by `CK_TILE_FLOAT_TO_FP8_DEFAULT`), not the codec's rule, so the bytes are not pinned to the reference | rejected                                                                          |
+| CK `ck_tile` `batched_transpose`                                             | yes                                                      | no: a layout change, no conversion and no scale                                                                                                                                                                                                                                                                                                             | rejected                                                                          |
+| CK `ck_tile` `reduce` for the per-(layer, K or V) absmax, then `elementwise` | yes                                                      | partly: a second launch and a scale buffer per batch, the same gather and rounding gaps as above; the absmax and scale would still be ours                                                                                                                                                                                                                  | rejected (two launches, contract gaps remain)                                     |
+| Turbine's own `fp8_e4m3_round` / `fp8_e4m3_value` (`qgemm_quantize.hpp`)     | yes (already the bit-exact oracle of `quantize_act`)     | yes: the codec's rounding transcribed, F32 division (HIP's correctly rounded default), no hardware conversion; one workgroup per (block, layer, K or V): absmax, scale and encode in one launch, page addresses through one pinned table upload per batch                                                                                                   | **picked**: `kernels/rocm/src/kv_transcode.hip`, implementation `turbine_hip_fp8` |
+
+Pick: an own small kernel (`turbine_hip_fp8`, provider `turbine_hip`), per the table; no provider covers the op's
+contract, and the conversion is the reused `qgemm_quantize.hpp` code. Timing (the op is bandwidth-bound: it reads or
+writes each page once plus the coded bytes): measured by `hip_ops::kv_transcode_matches_cpu`, which prints encode and
+decode µs and GB/s of pages for a 32-block demotion batch at the Llama-3.2-3B shape; the number is recorded below when
+the lab run lands.
+
+Timing (lab, R9700, job `turbine-lab-test-0930171713-1c3059d1`): a 32-block demotion batch at the Llama-3.2-3B shape
+(28 layers × 8 KV heads × 128 × 128 tokens, 448 MiB of BF16 pages): encode 2382 µs (197 GB/s of pages; the pages are
+read twice, once for the absmax and once to encode), decode 1554 µs (302 GB/s). A 14 MiB block of pages takes about 0.6 ms to cross a 25 GB/s link, against 0.07 ms of transcode per block in the
+batch, so the transcode is not the demotion bottleneck and no CK building block needs to be measured against it. Correctness: encode byte-exact and decode bit-exact against
+`turbine_kv::codec::fp8_e4m3` at the Llama, OLMoE and an odd shape over data with the scale floor, exact ties,
+saturation, subnormals, NaN and infinity (`hip_ops::kv_transcode_matches_cpu`); a mutation that drops the scale
+floor fails it (`encoded block 1 differs from the codec at byte 0`).

@@ -7,7 +7,8 @@
  *   -DSTUB_ABI=<n>u  -DSTUB_BACKEND="<name>"  -DSTUB_ARCHS="<a,b>"
  *   [-DTURBINE_STUB_V21] [-DTURBINE_STUB_V24] [-DTURBINE_STUB_V25]
  *   [-DTURBINE_STUB_V26] [-DTURBINE_STUB_V27] [-DTURBINE_STUB_V28]
- *   [-DTURBINE_STUB_V29] [-DTURBINE_STUB_V210]
+ *   [-DTURBINE_STUB_V29] [-DTURBINE_STUB_V210] [-DTURBINE_STUB_V211]
+ *   [-DTURBINE_STUB_V211_PARTIAL]
  * With TURBINE_STUB_V21 it also exports the optional ABI v2.1 and v2.3
  * symbols: turbine_abi_minor (3, a v2.3 library), context options
  * (TURBINE_OPTION_GEMM_AUTOTUNE kept per context,
@@ -26,8 +27,12 @@
  * device-sequenced step (see the v2.8 section); with TURBINE_STUB_V29 as well
  * it reports minor 9 and exports the v2.9 qgemm and quantize_act trios
  * (unsupported like every op; see the v2.9 section at the end); with
- * TURBINE_STUB_V210 as well it reports minor TURBINE_ABI_MINOR (10), whose
- * only addition is turbine_rope_desc.attn_factor.
+ * TURBINE_STUB_V210 as well it reports minor 10, whose only addition is
+ * turbine_rope_desc.attn_factor; with TURBINE_STUB_V211 as well it reports
+ * minor TURBINE_ABI_MINOR (11) and exports the v2.11 kv_transcode trio
+ * (unsupported like every op; see the v2.11 section at the end), except that
+ * TURBINE_STUB_V211_PARTIAL leaves out turbine_kv_transcode_impl (a library
+ * exporting part of the group).
  *
  * turbine_rope records each call: stub_rope_calls() counts them and
  * stub_rope_last_attn_factor() returns the attn_factor of the last one
@@ -75,7 +80,8 @@ int32_t stub_live_contexts(void) { return atomic_load(&live_contexts); }
  * attention, rmsnorm, rope, silu_mul, embedding, add, then v2: ctx_info,
  * attention_paged, copy_blocks, moe_route, moe_experts, then v2.1:
  * add_rmsnorm, logits_reduce, then v2.6: row_sumsq, rmsnorm_sharded, then
- * v2.7: mapped_collective, then v2.9: qgemm, quantize_act); 0 past the end. */
+ * v2.7: mapped_collective, then v2.9: qgemm, quantize_act, then v2.11:
+ * kv_transcode); 0 past the end. */
 size_t stub_desc_size(int32_t which) {
   switch (which) {
   case 0:
@@ -116,6 +122,8 @@ size_t stub_desc_size(int32_t which) {
     return sizeof(turbine_qgemm_desc);
   case 18:
     return sizeof(turbine_quantize_act_desc);
+  case 19:
+    return sizeof(turbine_kv_transcode_desc);
   default:
     return 0;
   }
@@ -281,8 +289,10 @@ STUB_OP(moe_experts, turbine_moe_experts_desc)
 STUB_OP(add_rmsnorm, turbine_add_rmsnorm_desc)
 STUB_OP(logits_reduce, turbine_logits_reduce_desc)
 
-#if defined(TURBINE_STUB_V210)
+#if defined(TURBINE_STUB_V211)
 uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
+#elif defined(TURBINE_STUB_V210)
+uint32_t turbine_abi_minor(void) { return 10u; }
 #elif defined(TURBINE_STUB_V29)
 uint32_t turbine_abi_minor(void) { return 9u; }
 #elif defined(TURBINE_STUB_V28)
@@ -510,9 +520,12 @@ static const char *const stub_op_names[] = {
     "stub_row_sumsq",
     "stub_rmsnorm_sharded",
 #endif
-#ifdef TURBINE_STUB_V29
+#if defined(TURBINE_STUB_V29) || defined(TURBINE_STUB_V211)
     "stub_qgemm",
     "stub_quantize_act",
+#endif
+#ifdef TURBINE_STUB_V211
+    "stub_kv_transcode",
 #endif
 };
 #define STUB_OPS ((int32_t)(sizeof stub_op_names / sizeof stub_op_names[0]))
@@ -1068,3 +1081,25 @@ int32_t turbine_mapped_all_reduce_dma(turbine_ctx *ctx,
 STUB_OP(qgemm, turbine_qgemm_desc)
 STUB_OP(quantize_act, turbine_quantize_act_desc)
 #endif /* TURBINE_STUB_V29 */
+
+#ifdef TURBINE_STUB_V211
+/* v2.11: the kv_transcode trio (unsupported like every op). With
+ * TURBINE_STUB_V211_PARTIAL the _impl symbol is missing: a library exporting
+ * part of the group, which the Rust side must not resolve at all. */
+int32_t turbine_kv_transcode(turbine_ctx *ctx,
+                             const turbine_kv_transcode_desc *d) {
+  (void)d;
+  set_error(ctx->last_error, "stub: kv_transcode is not implemented");
+  return TURBINE_E_UNSUPPORTED;
+}
+int32_t turbine_kv_transcode_supported(const turbine_kv_transcode_desc *d) {
+  (void)d;
+  return 0;
+}
+#ifndef TURBINE_STUB_V211_PARTIAL
+const char *turbine_kv_transcode_impl(const turbine_kv_transcode_desc *d) {
+  (void)d;
+  return "stub_kv_transcode";
+}
+#endif
+#endif /* TURBINE_STUB_V211 */

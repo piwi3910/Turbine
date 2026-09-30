@@ -40,8 +40,11 @@
 //   qgemm 3, quantize_act 1      turbine_hip_mxfp4 [turbine_hip] (MXFP4
 //                                  weights x BF16 activations; the
 //                                  MXFP4_EMULATED quantize-dequantize)
+//   kv_transcode (v2.11)         0 turbine_hip_fp8 [turbine_hip] (FP8 e4m3
+//                                  codec, BF16 pages; TurboQuant follows)
 #include <string>
 
+#include "kv_transcode.hpp"
 #include "qgemm_fp8_block.hpp"
 #include "qgemm_impls.hpp"
 #include "qgemm_int4.hpp"
@@ -274,6 +277,11 @@ const ImplEntry kQuantizeAct[] = {
                quantize_act_mxfp4_run>>("turbine_hip_mxfp4", kTurbine),
 };
 
+const ImplEntry kKvTranscode[] = {
+    entry<Impl<turbine_kv_transcode_desc, kv_transcode_fp8_supports,
+               kv_transcode_fp8_run>>("turbine_hip_fp8", kTurbine),
+};
+
 struct OpImpls {
   const ImplEntry *entries;
   int32_t count;
@@ -304,14 +312,15 @@ const OpImpls kOps[] = {
     of(kRmsnormSharded),
     of(kQGemm),
     of(kQuantizeAct),
+    of(kKvTranscode),
 };
-static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_QUANTIZE_ACT + 1,
+static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_KV_TRANSCODE + 1,
               "one implementation list per TURBINE_OP_* code");
 
 } // namespace
 
 const ImplEntry *impl_entries(int32_t op, int32_t *count) {
-  if (op < 0 || op > TURBINE_OP_QUANTIZE_ACT) {
+  if (op < 0 || op > TURBINE_OP_KV_TRANSCODE) {
     *count = 0;
     return nullptr;
   }
