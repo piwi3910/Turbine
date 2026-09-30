@@ -245,6 +245,17 @@ fn open_sharded(dir: &Path, index_path: &Path) -> Result<Vec<TensorEntry>, Model
                     format!("{INDEX_FILE} maps it to {shard} but it is stored in another shard"),
                 ));
             }
+            // A tied-embedding export may list `lm_head.weight` without storing it (the head
+            // reads the embedding); drop that one entry, every other absence stays an error.
+            None if tensor == TIED_HEAD && ties_embeddings(dir) => {
+                tracing::warn!(
+                    event = "index_entry_absent",
+                    tensor = TIED_HEAD,
+                    shard = %shard,
+                    "{INDEX_FILE} lists {TIED_HEAD} but the shard does not hold it; \
+                     the model ties embeddings, so the entry is ignored"
+                );
+            }
             None => {
                 return Err(st_err(
                     &path,
@@ -255,6 +266,23 @@ fn open_sharded(dir: &Path, index_path: &Path) -> Result<Vec<TensorEntry>, Model
         }
     }
     Ok(all.into_values().collect())
+}
+
+/// The LM head tensor a tied-embedding model may omit.
+const TIED_HEAD: &str = "lm_head.weight";
+
+/// Whether `<dir>/config.json` sets `tie_word_embeddings: true`; false when the file is absent,
+/// unreadable or malformed (the index check then stays strict).
+fn ties_embeddings(dir: &Path) -> bool {
+    #[derive(Deserialize)]
+    struct Tie {
+        #[serde(default)]
+        tie_word_embeddings: bool,
+    }
+    read_small_file(&dir.join("config.json"), MAX_INDEX_BYTES)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Tie>(&raw).ok())
+        .is_some_and(|t| t.tie_word_embeddings)
 }
 
 /// Every key/value pair of the header object in file order, duplicates kept (a map type would
@@ -616,6 +644,67 @@ mod tests {
         assert_eq!(c.range, data_start + 4..data_start + 8);
         assert_eq!(index.get("a").expect("a").file, s1);
         assert!(index.get("missing").is_none());
+    }
+
+    /// A tied-embedding checkpoint whose index lists `lm_head.weight` without the shard holding
+    /// it (e.g. the GPTQ Llama-3.2-3B export) opens without the entry; every other
+    /// listed-but-absent tensor, or an untied model, still errors.
+    #[test]
+    fn tied_lm_head_listed_but_absent() {
+        let dir = TempDir::new("st-tied");
+        let shard = dir.path().join(SINGLE_FILE);
+        write_raw(
+            &shard,
+            r#"{"model.embed_tokens.weight":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#,
+            &[0; 4],
+        );
+        let write_index = |extra: &str| {
+            std::fs::write(
+                dir.path().join(INDEX_FILE),
+                format!(
+                    r#"{{"weight_map":{{"model.embed_tokens.weight":"model.safetensors","{extra}":"model.safetensors"}}}}"#
+                ),
+            )
+            .expect("write index");
+        };
+        let write_config = |tied: bool| {
+            std::fs::write(
+                dir.path().join("config.json"),
+                format!(r#"{{"model_type":"llama","tie_word_embeddings":{tied}}}"#),
+            )
+            .expect("write config");
+        };
+        write_index("lm_head.weight");
+
+        // No config.json: strict.
+        expect_rule(
+            SafetensorsIndex::open(dir.path()),
+            &shard,
+            "lm_head.weight",
+            "absent from the shard",
+        );
+        // Untied: strict.
+        write_config(false);
+        expect_rule(
+            SafetensorsIndex::open(dir.path()),
+            &shard,
+            "lm_head.weight",
+            "absent from the shard",
+        );
+        // Tied: the entry is dropped.
+        write_config(true);
+        let index = SafetensorsIndex::open(dir.path()).expect("tied checkpoint opens");
+        assert!(index.get("lm_head.weight").is_none());
+        assert!(index.get("model.embed_tokens.weight").is_some());
+        assert_eq!(index.entries().count(), 1);
+        // Tied, but another listed tensor is absent: strict.
+        write_index("model.norm.weight");
+        expect_rule(
+            SafetensorsIndex::open(dir.path()),
+            &shard,
+            "model.norm.weight",
+            "absent from the shard",
+        );
     }
 
     #[test]

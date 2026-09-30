@@ -257,7 +257,12 @@ bool path_serves(const turbine_attention_paged_desc *d,
   case turbine_hip::PagedPath::Turbine:
     return !fp8;
   case turbine_hip::PagedPath::CkPagedkvFp8Staged:
-    return fp8 && ck_serves(d);
+    // Its single-query rows run the FP8 decode kernel, whose LDS holds at most
+    // kPagedFp8DecodeMaxGroup query heads per KV head: larger groups go to
+    // TurbineFp8 (review r13 P1).
+    return fp8 && ck_serves(d) &&
+           d->num_q_heads / d->num_kv_heads <=
+               turbine_hip::kPagedFp8DecodeMaxGroup;
   case turbine_hip::PagedPath::TurbineFp8Decode:
     return fp8 && d->max_q_len <= 1 && d->total_q <= d->num_seqs &&
            d->num_q_heads / d->num_kv_heads <=

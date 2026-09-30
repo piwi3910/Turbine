@@ -377,8 +377,13 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Experimental,
     ),
-    // FP8 KV on gfx1201 (Phase 6a S-13, S-14): `experimental` while the lab proof runs (Task 24),
-    // `supported` only after its gate.
+    // FP8 KV on gfx1201 (Phase 6a S-13, S-14). Llama: `supported` after the Task 24 proof, full
+    // GSM8K at c16 (1,319 items) BF16 KV 0.7801, FP8 KV 0.7885, golden c1 / c16 16/16 against
+    // tests/golden/llama-3.2-3b-instruct-fp8kv (7ad4b03). OLMoE: `experimental` for 6a (user
+    // decision 2026-09-30, "OLMoE FP8 KV: golden against the emulated-KV reference misses", B):
+    // full GSM8K 0.6603 vs 0.6459 (drop 0.0144, accepted as noise 2026-09-29), but golden c1 / c16
+    // 13/16 against tests/golden/olmoe-1b-7b-0125-instruct-fp8kv (need 14; p03 tail 5.38). The
+    // checkpoint ships no K/V scales; calibrated V scales and the golden miss are a Phase 7 item.
     row(
         Some("amd"),
         Some("gfx1201"),
@@ -386,7 +391,7 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         BF16,
         Some(KvFormatColumn::Fp8E4m3),
         NO_SPEC,
-        SupportStatus::Experimental,
+        SupportStatus::Supported,
     ),
     row(
         Some("amd"),
@@ -397,14 +402,73 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Experimental,
     ),
-    // Phase 6a weight formats on gfx1201 Llama: `experimental` while each proof runs (plan
-    // Tasks 14, 15, 18, 20), `supported` only after its gate.
-    gfx1201_quant_row(WeightFormatColumn::Fp8),
-    gfx1201_quant_row(WeightFormatColumn::Fp8Block),
+    // FP8 weights on gfx1201 Llama (Phase 6a Task 14): `supported`. The one `fp8` column covers
+    // both checkpoints the proof ran. Dynamic per-token (RedHatAI FP8-dynamic): full GSM8K at c16
+    // Turbine 0.7703 vs vLLM 0.7832 on the same checkpoint, a drop of 0.0129 over the 0.01 bound
+    // but not significant (McNemar exact p = 0.152, 95% CI -0.0295..+0.0037), accepted as noise
+    // (user decision 2026-09-29, "FP8-dynamic: accept the full-GSM8K drop as noise"); golden
+    // 16/16 at c1 and c16. Static per-tensor (RedHatAI FP8): golden 16/16 at c1 and c16 against
+    // the self-spread tolerance (likely 1.36, tail 2.99). The c1 ITL target stays a perf item.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("LlamaForCausalLM"),
+        Some(WeightFormatColumn::Fp8),
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Supported,
+    ),
+    // fp8_block (plan Task 15) proof passed 2026-09-29 (t15-proof, novanas): weight_bytes exact
+    // (3,607,615,488), no fp8_block_decoded fallback, c16 1061.44 tok/s (>= 854.7 BF16 floor,
+    // 1.57x the same run's vLLM-ROCm pass), GSM8K-200 drop 0.005 (<= 0.02 gate). Labbook
+    // turbine-lab-bench runs 2e31910f (turbine) / a86153ab (vllm-rocm). Closed 2026-09-30: golden
+    // c1 / c16 16/16 against tests/golden/llama-3.2-3b-instruct-fp8-block (1062.4 tok/s) and the
+    // 10-min overload soak PASS 8/8.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("LlamaForCausalLM"),
+        Some(WeightFormatColumn::Fp8Block),
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Supported,
+    ),
+    // mxfp4 and mxfp4_a4 on gfx1201 Llama stay `experimental` for 6a (user decisions
+    // 2026-09-30, A: Phase 7 items); awq_int4 and gptq_int4 below are `supported` after their gate.
     gfx1201_quant_row(WeightFormatColumn::Mxfp4),
     gfx1201_quant_row(WeightFormatColumn::Mxfp4A4),
-    gfx1201_quant_row(WeightFormatColumn::AwqInt4),
-    gfx1201_quant_row(WeightFormatColumn::GptqInt4),
+    // awq_int4 (plan Task 18) proof passed 2026-09-29 (t18-run, novanas, commit d14402f):
+    // c16 1262.6 vs BF16 842.8 tok/s (1.50x, >= 0.9x), c1 ITL p50 5.87 vs 12.37 ms (0.47x,
+    // <= 0.6x), golden c1 16/16 strict and c16 16/16 batched, GSM8K-200 0.775 vs BF16 0.805
+    // (drop 0.030, <= 0.04 gate; vLLM-ROCm AWQ 485.8 tok/s, 0.755). The 10-minute overload soak
+    // (rotation 9, novanas, target/soak/novanas-20260929T194647Z) passed every check
+    // (server_never_restarted, only_503_overload_codes, streams_complete, itl_p99_within_2x,
+    // reached_orange, green_within_60s, kv_idle, reserve_held). Flip to `supported`.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("LlamaForCausalLM"),
+        Some(WeightFormatColumn::AwqInt4),
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Supported,
+    ),
+    // gptq_int4 (plan Task 18) proof on kaitchup's AutoRound GPTQ checkpoint (spec S-11, user
+    // decision 2026-09-30 B), passed 2026-09-30 on novanas (commit 2a53dbb): full GSM8K at c16
+    // 0.7566 vs BF16 0.7801 (drop 0.0235, <= 0.04 gate), golden c1 16/16 strict and c16 16/16
+    // batched against tests/golden/llama-3.2-3b-instruct-autoround-gptq, c16 1267.3 tok/s
+    // (labbook run 1659f427), and the 10-minute overload soak
+    // (target/soak/novanas-20260930T140754Z, calibration 7.97 req/s) passed every check,
+    // reached_orange included. Flip to `supported`.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("LlamaForCausalLM"),
+        Some(WeightFormatColumn::GptqInt4),
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Supported,
+    ),
     // Quantized weights on the CPU reference provider (Phase 6a S-3): tests and tiny
     // checkpoints only, with BF16 or FP8 KV.
     cpu_quant_row(WeightFormatColumn::Fp8, KvFormatColumn::Bf16),
@@ -1125,14 +1189,43 @@ mod tests {
                 }
             }
         }
-        // Nothing but the AMD BF16 baseline is supported before the tracks add rows.
+        // Nothing but the AMD BF16 baseline, the proven gfx1201 Llama FP8 KV row (Task 24) and the
+        // proven gfx1201 Llama weight rows with BF16 KV (fp8, Task 14; fp8_block, Task 15;
+        // awq_int4 and gptq_int4, Task 18) are supported before the tracks add rows.
         for r in SUPPORT_MATRIX
             .iter()
             .filter(|r| r.status == SupportStatus::Supported)
         {
             assert_eq!(r.key.vendor, Some("amd"), "{:?}", r.view());
-            assert_eq!(r.key.weight_format, Some(W::Bf16), "{:?}", r.view());
-            assert_eq!(r.key.kv_format, Some(K::Bf16), "{:?}", r.view());
+            if r.key.weight_format != Some(W::Bf16) {
+                assert!(
+                    matches!(
+                        r.key.weight_format,
+                        Some(W::Fp8 | W::Fp8Block | W::AwqInt4 | W::GptqInt4)
+                    ),
+                    "{:?}",
+                    r.view()
+                );
+                assert_eq!(r.key.arch, Some("gfx1201"), "{:?}", r.view());
+                assert_eq!(
+                    r.key.architecture,
+                    Some("LlamaForCausalLM"),
+                    "{:?}",
+                    r.view()
+                );
+                assert_eq!(r.key.kv_format, Some(K::Bf16), "{:?}", r.view());
+            }
+            if r.key.kv_format == Some(K::Fp8E4m3) {
+                assert_eq!(r.key.arch, Some("gfx1201"), "{:?}", r.view());
+                assert_eq!(
+                    r.key.architecture,
+                    Some("LlamaForCausalLM"),
+                    "{:?}",
+                    r.view()
+                );
+            } else {
+                assert_eq!(r.key.kv_format, Some(K::Bf16), "{:?}", r.view());
+            }
             assert_eq!(r.key.speculative, Some(S::None), "{:?}", r.view());
         }
         // The Phase 6a formats exist and are refused naming the track; the NVIDIA-reserved
@@ -1150,9 +1243,16 @@ mod tests {
             ]
         );
         for w in W::PHASE_6A {
-            // Experimental on gfx1201 Llama while each proof runs; refused elsewhere.
+            // Supported on gfx1201 Llama once its gate passed (fp8, Task 14; fp8_block, Task 15;
+            // awq_int4, Task 18 plus the rotation 9 soak; gptq_int4, Task 18 on the AutoRound
+            // checkpoint), experimental otherwise (mxfp4, mxfp4_a4); refused elsewhere.
             let k = key("amd", "gfx1201", "LlamaForCausalLM", w, K::Bf16, S::None);
-            assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
+            let expected = if matches!(w, W::Fp8 | W::Fp8Block | W::AwqInt4 | W::GptqInt4) {
+                "supported"
+            } else {
+                "experimental"
+            };
+            assert_eq!(resolve(&k).as_str(), expected, "{k}");
             let k = key("amd", "gfx1201", "OlmoeForCausalLM", w, K::Bf16, S::None);
             let status = resolve(&k);
             assert_eq!(status.as_str(), "unsupported", "{k}");
@@ -1171,11 +1271,14 @@ mod tests {
                 "{k}: {status:?}"
             );
         }
-        // FP8 KV: experimental on gfx1201 Llama and OLMoE while its lab proof runs (Task 24),
-        // refused naming the track anywhere else.
-        for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
+        // FP8 KV: supported on gfx1201 Llama after the Task 24 proof, experimental on gfx1201
+        // OLMoE (golden miss, user decision 2026-09-30 B), refused naming the track anywhere else.
+        for (architecture, expected) in [
+            ("LlamaForCausalLM", "supported"),
+            ("OlmoeForCausalLM", "experimental"),
+        ] {
             let k = key("amd", "gfx1201", architecture, W::Bf16, K::Fp8E4m3, S::None);
-            assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
+            assert_eq!(resolve(&k).as_str(), expected, "{k}");
         }
         let k = key(
             "amd",

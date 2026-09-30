@@ -6,7 +6,9 @@
 
 use serde_json::{Value, json};
 
-use super::common::{scheme_unsupported, string_list};
+use super::common::{
+    ct_check_kv_scheme, ct_check_output_activations, scheme_unsupported, string_list,
+};
 use super::int4::{Int4Format, Int4Kind, Int4Layout, Int4Packaging, check_group};
 use crate::ModelError;
 use crate::config::unsupported;
@@ -65,6 +67,8 @@ impl Int4Packaging for CtPackInt4 {
                 "[\"Linear\"]",
             ));
         }
+        ct_check_kv_scheme(q)?;
+        ct_check_output_activations(g)?;
         if g.get("input_activations").is_some_and(|a| !a.is_null()) {
             return Err(scheme_unsupported(
                 "input_activations",

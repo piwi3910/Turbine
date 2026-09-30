@@ -1,4 +1,88 @@
+## State 2026-09-30 ~00:10 (AWQ soak builder, rotation 9)
+
+Merged `phase-6a-quantization` into `p6a-int4` first (fast-forward, 16 commits: engine-join exit
+fix 1bbbbe7, the w4a4/gptq numerics handoffs, `crates/turbine-server/src/engine/{loop,mod,requests}.rs`
+and `startup.rs` changes, `int4_layer_dump` example).
+
+GPU order: waited (background, one short ssh check every 5 min, bounded 2h — script
+`/private/tmp/claude-501/-Users-pascal-Development-Turbine/7482a1b1-2407-47bb-91f2-d826e25c21af/scratchpad/awq-soak/wait_and_soak.sh`,
+log alongside it) for `/home/piwi/turbine-ci/scratch/w4a4-segv/w4a4segv.log` to reach `done rc=`
+and `bench.lock` to be free. Both were already true on the first check (19:46:47Z) — the
+w4a4-segv repro had finished at 19:46:13Z (`rc=0`) — so the soak started immediately, no 2h wait
+needed.
+
+**AWQ 10-minute overload soak: PASS.** `scripts/overload-soak.sh novanas --duration 10m --model
+/home/piwi/turbine-models/llama-3.2-3b-instruct-awq` (ran as-is: no config keys needed for the
+weight format — `weights::detect` reads it from the checkpoint's `config.json`, so the stock
+`scripts/lab/phase3-novanas-soak.yaml` plus `--model` was enough; no AWQ soak config copy was
+committed). Output `target/soak/novanas-20260929T194647Z/`:
+- `verdict.json`: `"pass": true`, every check true (`server_never_restarted`,
+  `only_503_overload_codes`, `streams_complete`, `itl_p99_within_2x`, `reached_orange`,
+  `green_within_60s`, `kv_idle`, `reserve_held`).
+- `calibration_itl_p99_ms` 187.73, `overload_itl_p99_ms` 182.79 (0.97x, well within 2x).
+- `green_after_cooldown_s`: 0. `by_status`: 200×4915, 429×375. `by_error_code`:
+  `queue_full`×375, `queue_timeout`×4022 (all allowed 503/429 codes; no unexpected 5xx).
+- Ran 19:46:47Z–20:10:12Z UTC (serve start through stop), rc=0. Serve Job stopped cleanly by the
+  script's own trap (`lab-serve: novanas: stopped`); no orphaned Job.
+
+Commit `7043b8c handoff(crates/turbine-core/src/support.rs): awq_int4 gfx1201 Llama -> supported`
+flips only the `awq_int4` row on gfx1201 Llama to `supported` (matches the pattern of the
+unmerged `ef09f16` fp8_block flip — HOLD commit, not on this branch, lead's to apply separately).
+`gptq_int4` stays `experimental`: its GSM8K-200 drop (0.090) exceeds the 0.04 gate (see the
+"T18 GPTQ verdict: FAIL" section above). Verified locally only (`cargo test -p turbine-core
+support::` 3 passed, `cargo fmt -p turbine-core --check` clean) since support.rs is lead-owned;
+`scripts/gate.sh` (no `--full`) is running detached in the background
+(`/tmp/gate-p6a-int4-r9.log` on the Mac side) — its result will be in a follow-up message if it
+finishes before I hand off, otherwise check that log.
+
+Open questions for the lead:
+- Whether to also apply the pending `ef09f16` fp8_block flip now that awq_int4 is in, since both
+  follow the same pattern and are on separate un-merged commits.
+- AGENTS.md's `Commands` section still lists `awq_int4` only among the "unsupported ... except
+  experimental" formats — I left that prose alone since AGENTS.md/`.procoder/` edits are
+  lead-owned; it may want a one-line update once this lands.
+
 # Handoff: p6a-int4 (plan Tasks 16–18)
+
+## State 2026-09-29 ~15:30 (T18 builder, lead rotation 7/8)
+
+T18 run (`t18-run/run.log`, commit d14402f): `ALLDONE rc: bf16=0 awq=0 gptq=1`.
+
+AWQ verdict: PASS (full 200 req, GPU 0, same-run BF16 pair):
+- c16: 1262.6 vs BF16 842.8 tok/s = 1.50× (≥ 0.9×). c1 ITL p50: 5.87 vs 12.37 ms = 0.47× (≤ 0.6×).
+- golden c1 16/16 strict, c16 16/16 batched. GSM8K-200 0.775 vs BF16 0.805 (−0.030, bound 0.04);
+  vLLM-ROCm AWQ 485.8/494.2 tok/s, 0.755 → Turbine 2.55×, +0.020.
+- Labbook (set phase-6a-quantization): `lab-bench:t18-llama-awq:d14402f` pass,
+  `lab-bench:t18-llama:d14402f` (BF16 pair) auto-status fail. The cause is the tok_s relMin 0.97 against the
+  previous comparable run, `p6a-fp8-pinned-llama:56720ea` (876.5 tok/s, a 64-request `--quick` run): 842.8 is
+  0.962×. golden_c16 has no bound, so it plays no part. Full 200-request BF16 runs sit at 839–853 (t24c 852.7).
+  The status is unchanged; the lead decides.
+
+GPTQ start-up failure fixed: 44c30eb `handoff(crates/turbine-model/src/safetensors.rs)`. When
+`<dir>/config.json` has `tie_word_embeddings: true`, a listed-but-absent `lm_head.weight` is dropped from
+the index (WARN `event="index_entry_absent"`). Every other absence, and an untied or config-less
+checkpoint, still errors (test `safetensors::tests::tied_lm_head_listed_but_absent`, red then green).
+Lead review needed.
+
+GPTQ-only requeue, started 13:18Z (pid 609880; got the locks at once) detached on novanas (script copy `.procoder/handoff/t18_gptq_run.sh`, on the host
+`/home/piwi/turbine-ci/scratch/p6a-int4/t18_gptq_run.sh`; binaries of 44c30eb in
+`agent-abee0e2542a317f3c/target/release`): kernel build, then the gptq pass (golden c1 + c16, bench c16
+200 req, c1, GSM8K-200) under port18000.lock → bench.gate → bench.lock.
+- Log `/home/piwi/turbine-ci/scratch/p6a-int4/t18-run/run-gptq.log`, last line `t18_gptq_run: done rc=<rc>`.
+- Done marker `t18-run/gptq/done` (written only on rc=0). Results `t18-run/gptq/{golden1,golden16}.txt`,
+  `bench.json`, `bench-c1.json`, `quality.json`, `server.log` (grep `index_entry_absent` to confirm the
+  fix fired).
+- Golden already in at 13:2xZ: c1 16/16 PASS strict (tail 0.91), c16 16/16 PASS batched.
+- Judge against the bf16 pass in `t18-run/bf16/` (842.8 tok/s, c1 ITL 12.37 ms):
+  - golden1 and golden16 last lines PASS.
+  - bench.json `output_token_throughput` ≥ 758.5 (0.9×).
+  - bench-c1.json `itl_ms.p50` ≤ 7.42 ms (0.6×).
+  - GSM8K: copy `quality.json` to `tests/eval/llama-3.2-3b-instruct-gptq/turbine.json`, then run
+    `turbine-golden eval-compare --baseline tests/eval/llama-3.2-3b-instruct/turbine-bf16.json
+    --candidate … --max-drop 0.04` (pass ≥ 0.765). vLLM refuses GPTQ, so there is no vLLM pair.
+
+Remaining after the GPTQ run: commit the GPTQ eval + perf-log rows, labbook GPTQ run, soak on AWQ (ask the
+lead first), `handoff(crates/turbine-core/src/support.rs)` flipping the passing awq/gptq rows.
 
 ## State 2026-09-29 ~13:40 (T18 builder, rotation 5)
 
@@ -87,3 +171,32 @@ Worktree `.claude/worktrees/agent-abee0e2542a317f3c`, tip 2116221 — all commit
   `fixture-pause.sh` during benches.
 - The first GSM8K runs (`gsm8k=0.040/0.025`) used the old bare-number set — void; only the CoT results count.
 - novanas crashed twice this morning; re-check fixture logs for their `rc=` lines.
+
+## State 2026-09-29 ~18:00 (collector, lead rotation)
+
+**T18 GPTQ verdict: FAIL.** `t18-run/run-gptq.log` last line `t18_gptq_run: done rc=0`; results in
+`t18-run/gptq/`.
+
+- Throughput: `bench.json` `output_token_throughput` 1267.79 tok/s vs BF16 pair 842.8 = 1.505x (≥ 0.9x: PASS).
+- c1 ITL: `bench-c1.json` itl_ms.p50 5.7953 ms vs BF16 12.37 ms = 0.469x (≤ 0.6x: PASS).
+- Golden: c1 16/16 strict PASS, c16 16/16 batched PASS.
+- `index_entry_absent` fired once in `server.log` (the tied-lm_head fix, 44c30eb, confirmed working).
+- **GSM8K-200 accuracy: 0.715 (143/200) vs BF16 0.805 — drop 0.090, exceeds the 0.04 max-drop gate**
+  (floor 0.765). `turbine-golden eval-compare --baseline tests/eval/llama-3.2-3b-instruct/turbine-bf16.json
+  --candidate tests/eval/llama-3.2-3b-instruct-gptq/turbine.json --max-drop 0.04` →
+  `baseline accuracy 0.8050, candidate accuracy 0.7150, max drop 0.0400 (concurrency 1): FAIL`.
+  Committed: `tests/eval/llama-3.2-3b-instruct-gptq/turbine.json` (this run's quality.json).
+  vLLM refuses this checkpoint (transposed qzeros), so there is no vLLM pair to check whether the drop is
+  reference-relative or a real Turbine GPTQ numerics problem — needs investigation before any retry.
+
+**No support.rs commit is being made.** The task's flip condition ("if it passes") is not met for GPTQ:
+perf and golden pass, but GSM8K-200 accuracy fails the gate by a wide margin (0.09 drop vs 0.04 bound).
+Do not flip `gptq_int4` to `supported`. AWQ (rotation 7/8, commit d14402f) did pass its own gate in full
+(golden PASS/PASS, perf PASS, GSM8K 0.775 vs BF16 0.805, drop 0.030 ≤ 0.04) — whether to flip `awq_int4`
+alone, pending soak, is the lead's call.
+
+Labbook: submitted `lab-bench:t18-llama-gptq:44c30eb` (status fail, set `phase-6a-quantization`) with the
+full numbers and notes above.
+
+Remaining: root-cause the GPTQ GSM8K drop (dequant/group-size numerics? act-order layout?) before any
+retry; AWQ soak still pending (ask the lead first); no `support.rs` change from this rotation.

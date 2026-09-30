@@ -207,7 +207,7 @@ fn header_declares_the_v24_minor_revision() {
     );
     // v2.5 (Phase 4), v2.6, v2.7 and v2.8 (Phase 5) and v2.9 (Phase 6a) raised the minor; the
     // v2.4 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
     for (i, op) in OpKind::ALL.iter().enumerate() {
         let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
         assert_eq!(define(&code, &name), i.to_string(), "{name}");
@@ -247,7 +247,7 @@ fn header_declares_the_v25_copy_streams() {
         "v2.5 keeps major 2"
     );
     // v2.6, v2.7 and v2.8 (Phase 5) raised the minor; the v2.5 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
     assert_eq!(define(&code, "TURBINE_COPY_H2D"), "0");
     assert_eq!(define(&code, "TURBINE_COPY_D2H"), "1");
     assert_eq!(define(&code, "TURBINE_COPY_D2D"), "2");
@@ -281,7 +281,7 @@ fn header_declares_the_v26_tensor_parallel_group() {
         "v2.6 keeps major 2"
     );
     // v2.7 and v2.8 raised the minor; the v2.6 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
     assert_eq!(define(&code, "TURBINE_OP_ROW_SUMSQ"), "15");
     assert_eq!(define(&code, "TURBINE_OP_RMSNORM_SHARDED"), "16");
     for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
@@ -324,7 +324,7 @@ fn header_declares_the_v27_host_mapped_group() {
         "v2.7 keeps major 2"
     );
     // v2.8 raised the minor; the v2.7 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
     for (name, value) in [
         ("TURBINE_MAPPED_ALL_REDUCE", "0"),
         ("TURBINE_MAPPED_ALL_GATHER", "1"),
@@ -377,7 +377,7 @@ fn header_declares_the_v28_device_sequenced_step() {
         "2u",
         "v2.8 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
     assert_eq!(
         OpKind::ALL.iter().filter(|op| op.abi_minor() <= 8).count(),
         17,
@@ -402,7 +402,7 @@ fn header_declares_the_v29_quantization_group() {
     use turbine_core::types::DType;
     use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "9u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
     assert_eq!(define(&code, "TURBINE_OP_QGEMM"), "17");
     assert_eq!(define(&code, "TURBINE_OP_QUANTIZE_ACT"), "18");
     assert_eq!(OpKind::QGemm.abi_code(), 17);
@@ -464,4 +464,25 @@ fn header_declares_the_v29_quantization_group() {
             "turbine_kernels.h lacks the v2.9 {decl}"
         );
     }
+}
+
+/// v2.10 (Phase 6a Task 28a): the minor becomes 10 and `turbine_rope_desc` gains the trailing
+/// `float attn_factor` (YaRN's attention factor on cos/sin); no op code and no symbol are added.
+/// Breaks if the field moves (a library would read another field as the factor) or a v2.10 op
+/// code appears.
+#[test]
+fn header_declares_the_v210_rope_attn_factor() {
+    let code = strip_comments(&header());
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "10u");
+    assert_eq!(
+        OpKind::ALL.iter().filter(|op| op.abi_minor() <= 9).count(),
+        OpKind::ALL.len(),
+        "v2.10 adds no op code"
+    );
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let decl = "int32_t style; int32_t dtype; float attn_factor; } turbine_rope_desc;";
+    assert!(
+        flat.contains(decl),
+        "turbine_kernels.h lacks the v2.10 {decl}"
+    );
 }

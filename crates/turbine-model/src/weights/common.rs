@@ -116,6 +116,51 @@ pub fn scheme_unsupported(field: &str, value: impl Into<String>, supported: &str
     )
 }
 
+/// compressed-tensors `kv_cache_scheme`: null, or static FP8 per tensor (its scales are read by
+/// `kv.dtype`); anything else is refused `quant_scheme_unsupported` (spec S-3), whichever
+/// weight packaging the checkpoint uses.
+pub fn ct_check_kv_scheme(q: &serde_json::Value) -> Result<(), ModelError> {
+    let text = |v: &serde_json::Value, key: &str| {
+        v.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    match q.get("kv_cache_scheme").filter(|k| !k.is_null()) {
+        None => Ok(()),
+        Some(k)
+            if k.get("num_bits").and_then(serde_json::Value::as_u64) == Some(8)
+                && text(k, "type") == "float"
+                && text(k, "strategy") == "tensor"
+                && !k
+                    .get("dynamic")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false) =>
+        {
+            Ok(())
+        }
+        Some(k) => Err(scheme_unsupported(
+            "kv_cache_scheme",
+            k.to_string(),
+            "null or static 8-bit float per tensor",
+        )),
+    }
+}
+
+/// A compressed-tensors config group's `output_activations`: only null is served — no packaging
+/// quantizes a layer's output, so a declared output quantization would be silently dropped
+/// (review r13 C7).
+pub fn ct_check_output_activations(group: &serde_json::Value) -> Result<(), ModelError> {
+    match group.get("output_activations").filter(|o| !o.is_null()) {
+        None => Ok(()),
+        Some(o) => Err(scheme_unsupported(
+            "output_activations",
+            o.to_string(),
+            "null (no output quantization)",
+        )),
+    }
+}
+
 /// How a slot derived from a quantized layer (its scales, zero points, packed data) follows the
 /// layer's `[n, k]` weight when tensor parallelism shards it (Phase 6a S-12).
 #[derive(Clone, Copy, Debug)]

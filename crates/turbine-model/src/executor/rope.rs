@@ -2,9 +2,9 @@
 //! scaled bands match the transformers formula (`_compute_llama3_parameters`) exactly and the
 //! YaRN blend (`_compute_yarn_parameters`, transformers 4.57.1) to within 2 FP32 ulps
 //! (transformers evaluates it in FP32 with a 1-ulp `powf`; P6a S-15). YaRN's attention factor
-//! is not applied here: it folds into the attention softmax scale
-//! (`ModelArchConfig::attention_scale`, user decision 2026-09-28, Q19), so the RoPE ABI and
-//! kernels are unchanged.
+//! is not applied here: the rope op multiplies cos and sin by it before rounding
+//! (`ModelArchConfig::rope_attention_factor`, `RopeContext::attn_factor`, kernel ABI v2.10;
+//! user decision 2026-09-29, superseding Q19's fold into the softmax scale).
 use std::f64::consts::PI;
 
 use crate::config::RopeScaling;
@@ -222,5 +222,163 @@ mod tests {
         let plain = yarn_attention_factor(40.0, None, None);
         assert_eq!(yarn_attention_factor(40.0, Some(0.0), Some(1.0)), plain);
         assert_eq!(yarn_attention_factor(40.0, Some(1.0), None), plain);
+    }
+
+    /// Phase 6a Task 28a (spec S-15): the cpu-reference rope with YaRN's attention factor
+    /// equals transformers bitwise on `tests/fixtures/yarn_rope.json`
+    /// (`scripts/golden/yarn_params.py --rope-out`, the factor-16 Llama override): at eight
+    /// positions up to 60,000, cos·m and sin·m rounded to BF16 (read back by rotating the unit
+    /// pairs `(1, 0)`) and the rotated BF16 q (2 heads) and k (1 head) of
+    /// `apply_rotary_pos_emb`. The table is transformers' own `inv_freq`, the factor
+    /// transformers' default for factor 16 as Turbine resolves it. Breaks if the factor is
+    /// folded into the softmax scale (cos/sin unscaled), applied after rounding, or rounded
+    /// differently.
+    #[test]
+    fn yarn_cos_sin_times_factor_match_transformers() {
+        use std::sync::Arc;
+
+        use turbine_core::types::{DType, DeviceId};
+        use turbine_kernels::ops::{RopeConfig, RopeContext};
+        use turbine_tensor::host::HostMemory;
+        use turbine_tensor::{DeviceMemory, Tensor};
+
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/yarn_rope.json");
+        let fx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture")).expect("json");
+        let floats = |v: &serde_json::Value| -> Vec<f32> {
+            v.as_array()
+                .expect("array")
+                .iter()
+                .map(|x| x.as_f64().expect("number") as f32)
+                .collect()
+        };
+        let bits = |v: &serde_json::Value| -> Vec<u16> {
+            v.as_array()
+                .expect("array")
+                .iter()
+                .map(|x| u16::try_from(x.as_u64().expect("bits")).expect("16 bits"))
+                .collect()
+        };
+        let rows = |v: &serde_json::Value, f: &dyn Fn(&serde_json::Value) -> Vec<u16>| {
+            v.as_array()
+                .expect("rows")
+                .iter()
+                .flat_map(f)
+                .collect::<Vec<u16>>()
+        };
+
+        // The factor as Turbine resolves it for the override equals transformers' in f32.
+        let c = &fx["config"];
+        let factor = c["rope_scaling"]["factor"].as_f64().unwrap();
+        let m = yarn_attention_factor(factor, None, None) as f32;
+        assert_eq!(m, fx["attention_factor"].as_f64().unwrap() as f32);
+
+        let head_dim = c["head_dim"].as_u64().unwrap() as usize;
+        let half = head_dim / 2;
+        let inv_freq = floats(&fx["inv_freq"]);
+        assert_eq!(inv_freq.len(), half);
+        let positions: Vec<i32> = fx["positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_i64().unwrap() as i32)
+            .collect();
+        let n = positions.len();
+        let (hq, hk) = (
+            fx["q_heads"].as_u64().unwrap() as usize,
+            fx["k_heads"].as_u64().unwrap() as usize,
+        );
+
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 24);
+        let upload = |shape: &[usize], dtype: DType, bytes: Vec<u8>| {
+            let t = Tensor::empty(&mem, shape, dtype).expect("tensor");
+            t.view().slice.write_bytes(&bytes).expect("upload");
+            t
+        };
+        let bf16 = |v: &[u16]| v.iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>();
+        let read_bf16 = |t: &Tensor| -> Vec<u16> {
+            t.view()
+                .slice
+                .read_bytes()
+                .expect("read")
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect()
+        };
+        let rope = turbine_kernels::cpu_reference_provider();
+        let rope = rope.rope().expect("cpu rope");
+        let run = |q: &[u16], k: &[u16], hq: usize, hk: usize| {
+            let cfg = RopeConfig {
+                num_q_heads: hq as u32,
+                num_kv_heads: hk as u32,
+                head_dim: head_dim as u32,
+                rotary_dim: head_dim as u32,
+                dtype: DType::BF16,
+            };
+            let q = upload(&[n, hq, head_dim], DType::BF16, bf16(q));
+            let k = upload(&[n, hk, head_dim], DType::BF16, bf16(k));
+            let pos = upload(
+                &[n],
+                DType::I32,
+                positions.iter().flat_map(|p| p.to_le_bytes()).collect(),
+            );
+            let freq = upload(
+                &[half],
+                DType::F32,
+                inv_freq.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            );
+            rope.execute(&mut RopeContext {
+                cfg,
+                q: q.view(),
+                k: k.view(),
+                positions: pos.view(),
+                inv_freq: freq.view(),
+                attn_factor: m,
+            })
+            .expect("rope");
+            (read_bf16(&q), read_bf16(&k))
+        };
+
+        // cos·m and sin·m: rotating (1, 0) in every pair returns (c, s).
+        const ONE: u16 = 0x3f80;
+        let unit: Vec<u16> = (0..n)
+            .flat_map(|_| (0..head_dim).map(|j| if j < half { ONE } else { 0 }))
+            .collect();
+        let (cs, _) = run(&unit, &unit, 1, 1);
+        let want_cos = rows(&fx["cos_bf16"], &bits);
+        let want_sin = rows(&fx["sin_bf16"], &bits);
+        for t in 0..n {
+            let row = &cs[t * head_dim..][..head_dim];
+            assert_eq!(
+                &row[..half],
+                &want_cos[t * half..][..half],
+                "cos·m at position {}",
+                positions[t]
+            );
+            assert_eq!(
+                &row[half..],
+                &want_sin[t * half..][..half],
+                "sin·m at position {}",
+                positions[t]
+            );
+        }
+        // The fixture's BF16 cos/sin are its FP32 ones rounded (transformers' `.to(bf16)`).
+        let to_bf16 = |v: f32| (turbine_kernels::round_to(DType::BF16, v).to_bits() >> 16) as u16;
+        let cos32: Vec<f32> = fx["cos_f32"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(floats)
+            .collect();
+        assert_eq!(
+            cos32.iter().map(|&v| to_bf16(v)).collect::<Vec<_>>(),
+            want_cos
+        );
+
+        // A full rotation of random BF16 q and k.
+        let (q, k) = run(&rows(&fx["q"], &bits), &rows(&fx["k"], &bits), hq, hk);
+        assert_eq!(q, rows(&fx["q_rot"], &bits), "rotated q");
+        assert_eq!(k, rows(&fx["k_rot"], &bits), "rotated k");
     }
 }

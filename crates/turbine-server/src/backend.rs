@@ -41,7 +41,7 @@ use turbine_kernels::Selection;
 use turbine_kv::blocks_for_tokens;
 use turbine_kv::hierarchy::PrefetchError;
 use turbine_model::weights::QuantizationSummary;
-use turbine_model::{ChatTemplate, Tokenizer, ToolChoice};
+use turbine_model::{ChatTemplate, RopeSummary, Tokenizer, ToolChoice};
 use turbine_observability::MetricsRegistry;
 use turbine_reliability::budget::PoolKind;
 use turbine_reliability::controller::ControllerHandle;
@@ -105,6 +105,9 @@ struct ModelStatus<'a> {
     architecture: &'a str,
     weight_bytes: u64,
     load_seconds: Option<f64>,
+    /// The resolved RoPE configuration (P6a followups; `event="rope_config"` at load,
+    /// `crate::model::log_rope_config`).
+    rope: RopeSummary,
 }
 
 /// `GET /turbine/v1/status` document.
@@ -232,6 +235,8 @@ pub struct ModelBackend {
     kernels: Vec<KernelChoiceView>,
     /// `quantization` of the status document (Phase 6a S-19).
     quantization: QuantizationSummary,
+    /// `model.rope` of the status document (P6a followups).
+    rope: RopeSummary,
     /// The support-matrix row resolved at startup (`support` of the status document).
     support: Option<SupportRowView>,
     /// The node topology graph captured at startup (`GET /turbine/v1/topology`, P5 S-1).
@@ -299,6 +304,7 @@ impl ModelBackend {
                 .map(KernelChoiceView::from)
                 .collect(),
             quantization: QuantizationSummary::of(&model.arch),
+            rope: model.arch.rope_summary(),
             support: None,
             topology: None,
             parallel: None,
@@ -936,6 +942,7 @@ impl Diagnostics for ModelBackend {
                 architecture: &self.architecture,
                 weight_bytes: loaded.map_or(self.expected_weight_bytes, |l| l.weight_bytes),
                 load_seconds: loaded.map(|l| l.load_seconds),
+                rope: self.rope,
             },
             modules: &self.modules,
             kernels: &self.kernels,

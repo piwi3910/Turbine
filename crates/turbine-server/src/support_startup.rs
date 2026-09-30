@@ -443,9 +443,9 @@ mod tests {
         }
     }
 
-    /// Phase 6a S-13: the KV column is the configured `kv.dtype`; FP8 KV is experimental on
-    /// `amd` gfx1201 Llama / OLMoE during its lab proof, refused elsewhere on `amd` (exit 2
-    /// naming `kv.dtype`) until its gate passes, and experimental on the cpu backend.
+    /// Phase 6a S-13: the KV column is the configured `kv.dtype`; FP8 KV is supported on `amd`
+    /// gfx1201 Llama / OLMoE (Task 24 proof), refused elsewhere on `amd` (exit 2 naming
+    /// `kv.dtype`), and experimental on the cpu backend.
     /// Breaks if the KV column is still hard-coded BF16.
     #[test]
     fn kv_column_follows_kv_dtype() {
@@ -457,10 +457,10 @@ mod tests {
         assert_eq!(format_columns(&cfg).1, KvFormatColumn::Bf16);
         cfg.kv.dtype = turbine_core::config::KvDtypeChoice::Fp8E4m3;
         assert_eq!(format_columns(&cfg).1, KvFormatColumn::Fp8E4m3);
-        // Before discovery the arch is unknown: the gfx1201 row (experimental during the lab
+        // Before discovery the arch is unknown: the gfx1201 row (supported after the Task 24
         // proof) is the best any card could give.
         let d = before_discovery(&cfg).unwrap();
-        assert_eq!(d.status.as_str(), "experimental", "{:?}", d.key);
+        assert_eq!(d.status.as_str(), "supported", "{:?}", d.key);
         // A key on another architecture family is refused naming `kv.dtype`.
         let qwen = model_dir(
             "qwen-fp8-kv",
@@ -694,8 +694,8 @@ mod tests {
         );
         let key = key_before_discovery(&cfg, WeightFormatColumn::Fp8, KvFormatColumn::Bf16);
         assert_eq!(key.to_string(), "amd/*/LlamaForCausalLM/fp8/bf16/none");
-        // Experimental on gfx1201 Llama while its proof runs; another family is refused.
-        assert_eq!(support::check(key).unwrap().status.as_str(), "experimental");
+        // Supported on gfx1201 Llama after its gate; another family is refused.
+        assert_eq!(support::check(key).unwrap().status.as_str(), "supported");
         let qwen = model_dir(
             "fmt-qwen",
             serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}),

@@ -59,7 +59,9 @@ pub(crate) use deadlines::Timeouts;
 pub(crate) use r#loop::{EngineLoop, EngineParts};
 pub(crate) use requests::{Submission, ToolOutput, ToolParser};
 
-/// Events buffered per request between the engine and the HTTP response (P2 S-7).
+/// Events buffered per request between the engine and the HTTP response (P2 S-7); one slot
+/// of it stays reserved for the error event that ends a stream the engine closes on a slow
+/// client.
 pub const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// The engine's answer to a submission: queued, or refused by the scheduler's checks.
@@ -206,6 +208,9 @@ pub(crate) fn copy_device(prepared: &PreparedModel) -> CopyDevice {
 /// its workers ([`tp::load_group`]); with `pipeline` (P5 S-10) it is the last stage of a
 /// pipeline, loaded with the earlier stages ([`pp::load_pipeline`]), and the engine keeps up to
 /// `parallel.pipeline.micro_batches` micro-batches in flight. Failures are reported on `fatal`.
+/// The thread logs `engine_stopped` once everything it owns is dropped; a clean shutdown joins
+/// the returned handle ([`crate::startup`]) so that the process never exits (running the device
+/// runtime's static destructors) while the engine still frees device memory.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     prepared: PreparedModel,
@@ -217,7 +222,7 @@ pub fn spawn(
     queue_capacity: usize,
     timeouts: Timeouts,
     fatal: UnboundedSender<Fatal>,
-) -> std::io::Result<()> {
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     let replica = startup.replica;
     std::thread::Builder::new()
         .name(if replica == 0 {
@@ -226,247 +231,257 @@ pub fn spawn(
             format!("turbine-engine-{replica}")
         })
         .spawn(move || {
-            // `scheduler.policy` was checked against the registry before any port was bound
-            // (`Config::validate_modules`); `select` logs `module_selected`.
-            let policy = match policy::registry()
-                .select(&prepared.modules.scheduling_policy, "scheduler.policy")
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
-                    return;
-                }
-            };
-            let warmup_token = prepared.generation.bos_token_id.unwrap_or(0);
-            let stats = pipeline.as_ref().map(|p| Arc::clone(&p.stats));
-            let loaded = match (group, pipeline) {
-                (_, Some(pipeline)) => {
-                    let phase = |reason| backend.set_loading(reason);
-                    pp::load_pipeline(
-                        &prepared,
-                        pipeline,
-                        warmup_token,
-                        &metrics.model,
-                        &startup.metrics,
-                        &phase,
-                    )
-                }
-                (None, None) => {
-                    model::load(&prepared, warmup_token, &metrics.model, &startup.metrics)
-                }
-                (Some(group), None) => {
-                    let phase = |reason| backend.set_loading(reason);
-                    tp::load_group(
-                        &prepared,
-                        group,
-                        warmup_token,
-                        &metrics.model,
-                        &startup.metrics,
-                        &phase,
-                    )
-                }
-            };
-            let mut loaded = match loaded {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
-                    return;
-                }
-            };
-            let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
-            // Phase 4: the KV hierarchy over the pool, before the reliability side that drives
-            // it. L1 needs the kernel library's copy engine (ABI v2.3 + v2.5). Under tensor
-            // parallelism every worker rank's pool is a shard of each block (P5).
-            let shards = std::mem::take(&mut loaded.shards);
-            let mut pool = loaded.pool;
-            let device = copy_device(&prepared);
-            let l2 = startup.kv.l2.clone();
-            // A pipeline's pool is its last stage's; the earlier stages' shards come first.
-            let start_kv = if stats.is_some() {
-                KvOrchestrator::start_pipeline
-            } else {
-                KvOrchestrator::start
-            };
-            let started = start_kv(
-                KvStart {
-                    cfg: &startup.kv.cfg,
-                    memory_kind: prepared.provider.opened.memory_kind,
-                    identity: prepared.identity,
-                    device,
-                    shards,
-                    l2: startup.kv.l2,
-                    clock: Arc::clone(&clock),
-                    metrics: metrics.kv.clone(),
-                    remote: loaded.remote_tiers.take(),
-                    kv_scales: crate::kv_orchestrator::scale_hashes(&prepared.arch.kv_cache),
-                },
-                &mut pool,
-            );
-            let (kv, kv_handle) = match started {
-                Ok(k) => k,
-                Err(e) => {
-                    let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
-                    return;
-                }
-            };
-            let reliability = &prepared.reliability;
-            #[cfg(feature = "fault-injection")]
+            // Everything the engine owns (executor, KV pool and tiers, sampler, the prepared
+            // model and its kernel provider) is captured by `serve` and dropped when it returns,
+            // so `engine_stopped` is logged only once the device resources are released.
+            let serve = move || {
+                // `scheduler.policy` was checked against the registry before any port was bound
+                // (`Config::validate_modules`); `select` logs `module_selected`.
+                let policy = match policy::registry()
+                    .select(&prepared.modules.scheduling_policy, "scheduler.policy")
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
+                        return;
+                    }
+                };
+                let warmup_token = prepared.generation.bos_token_id.unwrap_or(0);
+                let stats = pipeline.as_ref().map(|p| Arc::clone(&p.stats));
+                let loaded = match (group, pipeline) {
+                    (_, Some(pipeline)) => {
+                        let phase = |reason| backend.set_loading(reason);
+                        pp::load_pipeline(
+                            &prepared,
+                            pipeline,
+                            warmup_token,
+                            &metrics.model,
+                            &startup.metrics,
+                            &phase,
+                        )
+                    }
+                    (None, None) => {
+                        model::load(&prepared, warmup_token, &metrics.model, &startup.metrics)
+                    }
+                    (Some(group), None) => {
+                        let phase = |reason| backend.set_loading(reason);
+                        tp::load_group(
+                            &prepared,
+                            group,
+                            warmup_token,
+                            &metrics.model,
+                            &startup.metrics,
+                            &phase,
+                        )
+                    }
+                };
+                let mut loaded = match loaded {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
+                        return;
+                    }
+                };
+                let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+                // Phase 4: the KV hierarchy over the pool, before the reliability side that drives
+                // it. L1 needs the kernel library's copy engine (ABI v2.3 + v2.5). Under tensor
+                // parallelism every worker rank's pool is a shard of each block (P5).
+                let shards = std::mem::take(&mut loaded.shards);
+                let mut pool = loaded.pool;
+                let device = copy_device(&prepared);
+                let l2 = startup.kv.l2.clone();
+                // A pipeline's pool is its last stage's; the earlier stages' shards come first.
+                let start_kv = if stats.is_some() {
+                    KvOrchestrator::start_pipeline
+                } else {
+                    KvOrchestrator::start
+                };
+                let started = start_kv(
+                    KvStart {
+                        cfg: &startup.kv.cfg,
+                        memory_kind: prepared.provider.opened.memory_kind,
+                        identity: prepared.identity,
+                        device,
+                        shards,
+                        l2: startup.kv.l2,
+                        clock: Arc::clone(&clock),
+                        metrics: metrics.kv.clone(),
+                        remote: loaded.remote_tiers.take(),
+                        kv_scales: crate::kv_orchestrator::scale_hashes(&prepared.arch.kv_cache),
+                    },
+                    &mut pool,
+                );
+                let (kv, kv_handle) = match started {
+                    Ok(k) => k,
+                    Err(e) => {
+                        let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
+                        return;
+                    }
+                };
+                let reliability = &prepared.reliability;
+                #[cfg(feature = "fault-injection")]
             let injector = reliability.fault_injection.clone().map(|cfg| {
                 tracing::warn!(event = "fault_injection", config = ?cfg, "fault injection is on");
                 Arc::new(turbine_reliability::fault::FaultInjector::new(cfg))
             });
-            // Startup reservations are taken; injected allocation failures start with requests.
-            #[cfg(feature = "fault-injection")]
-            if let Some(injector) = &injector {
-                loaded.ledger.set_fault_injector(Arc::clone(injector));
-            }
-            let layout = *loaded.executor.kv_layout();
-            let ledger = Arc::clone(&loaded.ledger);
-            // P5 S-8: a tensor-parallel group admits against every rank's ledger.
-            let group = std::mem::take(&mut loaded.group);
-            let probe_group = group
-                .iter()
-                .map(|(b, l)| (b.device, Arc::clone(l)))
-                .collect();
-            let parts = rel::build(ReliabilityInputs {
-                config: reliability,
-                budget: loaded.budget,
-                ledger: Arc::clone(&ledger),
-                reserve: loaded.reserve,
-                held: loaded.held,
-                params: &prepared.scheduler,
-                block_bytes: layout.block_bytes(),
-                workspace_bytes_per_token: prepared.workspace_bytes
-                    / u64::from(prepared.scheduler.max_batch_tokens.max(1)),
-                metrics: startup.metrics.clone(),
-                clock: Arc::clone(&clock),
-                reclaimer: kv.reclaimer(),
-                replica,
-                group,
-            });
-            #[allow(unused_mut)]
-            let mut executor: Box<dyn ModelExecutor> = loaded.executor;
-            #[cfg(feature = "fault-injection")]
-            if let Some(injector) = &injector {
-                // The backend in use names its sticky errors; one without any (the cpu backend)
-                // borrows the first registered backend's, which `KernelError::is_sticky` knows.
-                let sticky_name = std::iter::once(prepared.provider.backend)
-                    .chain(turbine_kernels::backends::registry().iter())
-                    .find_map(|b| b.sticky_error_prefixes().first().copied())
-                    .unwrap_or("device error");
-                executor = Box::new(rel::FaultyExecutor::new(
-                    executor,
-                    Arc::clone(injector),
-                    sticky_name,
-                ));
-            }
-            #[allow(unused_mut)]
-            let mut vendor: Vec<Box<dyn VendorTelemetry>> =
-                vendor_backends(&DiscoveryOptions::from_config(&startup.devices));
-            #[cfg(feature = "fault-injection")]
-            if let Some(cfg) = reliability.fault_injection.as_ref()
-                && (cfg.telemetry_temperature_c.is_some() || cfg.telemetry_delay.is_some())
-            {
-                vendor = vendor
-                    .into_iter()
-                    .map(|v| -> Box<dyn VendorTelemetry> {
-                        Box::new(rel::FaultyVendor::new(
-                            v,
-                            cfg.telemetry_temperature_c,
-                            cfg.telemetry_delay.map(|d| d.0),
-                        ))
-                    })
+                // Startup reservations are taken; injected allocation failures start with requests.
+                #[cfg(feature = "fault-injection")]
+                if let Some(injector) = &injector {
+                    loaded.ledger.set_fault_injector(Arc::clone(injector));
+                }
+                let layout = *loaded.executor.kv_layout();
+                let ledger = Arc::clone(&loaded.ledger);
+                // P5 S-8: a tensor-parallel group admits against every rank's ledger.
+                let group = std::mem::take(&mut loaded.group);
+                let probe_group = group
+                    .iter()
+                    .map(|(b, l)| (b.device, Arc::clone(l)))
                     .collect();
-            }
-            let probe = EngineLedgerProbe::new(
-                ledger,
-                prepared.device,
-                Arc::clone(&parts.queue_len),
-                reliability.admission.max_queue,
-            )
-            .with_group(probe_group);
-            let mut core = SamplerCore::new(
-                TelemetryConfig::from_config(&reliability.telemetry),
-                &startup.inventory,
-                vendor,
-                Box::new(FsProc::default()),
-                Arc::new(probe),
-                Arc::clone(&clock),
-            )
-            .with_metrics(startup.telemetry.clone());
-            if let Some(l2) = l2 {
-                core = core.with_storage(Arc::new(L2StorageProbe {
-                    l2,
-                    max_queue_depth: startup.kv.cfg.nvme.max_queue_depth,
-                }));
-            }
-            let (sampler, latest) = TelemetrySampler::spawn_core(core);
+                let parts = rel::build(ReliabilityInputs {
+                    config: reliability,
+                    budget: loaded.budget,
+                    ledger: Arc::clone(&ledger),
+                    reserve: loaded.reserve,
+                    held: loaded.held,
+                    params: &prepared.scheduler,
+                    block_bytes: layout.block_bytes(),
+                    workspace_bytes_per_token: prepared.workspace_bytes
+                        / u64::from(prepared.scheduler.max_batch_tokens.max(1)),
+                    metrics: startup.metrics.clone(),
+                    clock: Arc::clone(&clock),
+                    reclaimer: kv.reclaimer(),
+                    replica,
+                    group,
+                });
+                #[allow(unused_mut)]
+                let mut executor: Box<dyn ModelExecutor> = loaded.executor;
+                #[cfg(feature = "fault-injection")]
+                if let Some(injector) = &injector {
+                    // The backend in use names its sticky errors; one without any (the cpu backend)
+                    // borrows the first registered backend's, which `KernelError::is_sticky` knows.
+                    let sticky_name = std::iter::once(prepared.provider.backend)
+                        .chain(turbine_kernels::backends::registry().iter())
+                        .find_map(|b| b.sticky_error_prefixes().first().copied())
+                        .unwrap_or("device error");
+                    executor = Box::new(rel::FaultyExecutor::new(
+                        executor,
+                        Arc::clone(injector),
+                        sticky_name,
+                    ));
+                }
+                #[allow(unused_mut)]
+                let mut vendor: Vec<Box<dyn VendorTelemetry>> =
+                    vendor_backends(&DiscoveryOptions::from_config(&startup.devices));
+                #[cfg(feature = "fault-injection")]
+                if let Some(cfg) = reliability.fault_injection.as_ref()
+                    && (cfg.telemetry_temperature_c.is_some() || cfg.telemetry_delay.is_some())
+                {
+                    vendor = vendor
+                        .into_iter()
+                        .map(|v| -> Box<dyn VendorTelemetry> {
+                            Box::new(rel::FaultyVendor::new(
+                                v,
+                                cfg.telemetry_temperature_c,
+                                cfg.telemetry_delay.map(|d| d.0),
+                            ))
+                        })
+                        .collect();
+                }
+                let probe = EngineLedgerProbe::new(
+                    ledger,
+                    prepared.device,
+                    Arc::clone(&parts.queue_len),
+                    reliability.admission.max_queue,
+                )
+                .with_group(probe_group);
+                let mut core = SamplerCore::new(
+                    TelemetryConfig::from_config(&reliability.telemetry),
+                    &startup.inventory,
+                    vendor,
+                    Box::new(FsProc::default()),
+                    Arc::new(probe),
+                    Arc::clone(&clock),
+                )
+                .with_metrics(startup.telemetry.clone());
+                if let Some(l2) = l2 {
+                    core = core.with_storage(Arc::new(L2StorageProbe {
+                        l2,
+                        max_queue_depth: startup.kv.cfg.nvme.max_queue_depth,
+                    }));
+                }
+                let (sampler, latest) = TelemetrySampler::spawn_core(core);
 
-            let PreparedModel {
-                tokenizer,
-                max_seq_len,
-                scheduler: params,
-                overlap_scheduling,
-                reliability,
-                ..
-            } = prepared;
-            let scheduler = Scheduler::new(params, Arc::clone(&clock))
-                .with_policy(policy)
-                .with_metrics(metrics.scheduler.clone())
-                .with_gate(parts.gate)
-                .with_micro_batches(stats.as_ref().map_or(1, |s| s.micro_batches));
-            let (submit_tx, commands) = mpsc::channel(queue_capacity.max(1));
-            let stop = Arc::new(AtomicBool::new(false));
-            if let Err(e) = rel::spawn_controller(
-                parts.controller,
-                latest,
-                parts.stats,
-                reliability.telemetry.interval.0,
-                submit_tx.downgrade(),
-                Arc::clone(&stop),
-            ) {
-                let _ = fatal.send(Fatal::LoadFailed(format!(
-                    "cannot start the pressure controller thread: {e}"
-                )));
-                return;
-            }
-            let controller = parts.engine.handle.clone();
-            let shared = Arc::new(EngineShared::default());
-            let engine = EngineLoop::new(EngineParts {
-                executor,
-                pool,
-                kv,
-                scheduler,
-                clock,
-                commands,
-                shared: Arc::clone(&shared),
-                tokenizer,
-                max_seq_len,
-                metrics,
-                timeouts,
-                overlap: overlap_scheduling,
-                reliability: parts.engine,
-                pipeline: stats,
-            });
-            backend.set_ready(
+                let PreparedModel {
+                    tokenizer,
+                    max_seq_len,
+                    scheduler: params,
+                    overlap_scheduling,
+                    reliability,
+                    ..
+                } = prepared;
+                let scheduler = Scheduler::new(params, Arc::clone(&clock))
+                    .with_policy(policy)
+                    .with_metrics(metrics.scheduler.clone())
+                    .with_gate(parts.gate)
+                    .with_micro_batches(stats.as_ref().map_or(1, |s| s.micro_batches));
+                let (submit_tx, commands) = mpsc::channel(queue_capacity.max(1));
+                let stop = Arc::new(AtomicBool::new(false));
+                if let Err(e) = rel::spawn_controller(
+                    parts.controller,
+                    latest,
+                    parts.stats,
+                    reliability.telemetry.interval.0,
+                    submit_tx.downgrade(),
+                    Arc::clone(&stop),
+                ) {
+                    let _ = fatal.send(Fatal::LoadFailed(format!(
+                        "cannot start the pressure controller thread: {e}"
+                    )));
+                    return;
+                }
+                let controller = parts.engine.handle.clone();
+                let shared = Arc::new(EngineShared::default());
+                let engine = EngineLoop::new(EngineParts {
+                    executor,
+                    pool,
+                    kv,
+                    scheduler,
+                    clock,
+                    commands,
+                    shared: Arc::clone(&shared),
+                    tokenizer,
+                    max_seq_len,
+                    metrics,
+                    timeouts,
+                    overlap: overlap_scheduling,
+                    reliability: parts.engine,
+                    pipeline: stats,
+                });
+                backend.set_ready(
+                    replica,
+                    EngineHandle {
+                        submit_tx,
+                        kv: kv_handle,
+                    },
+                    shared,
+                    controller,
+                    loaded.load_seconds,
+                    loaded.weight_bytes,
+                );
+                tracing::info!(replica, "ready");
+                drop(backend);
+                let result = engine.run();
+                stop.store(true, Ordering::Release);
+                drop(sampler);
+                if let Err(message) = result {
+                    let _ = fatal.send(Fatal::DeviceFatal(message));
+                }
+            };
+            serve();
+            tracing::info!(
+                event = "engine_stopped",
                 replica,
-                EngineHandle {
-                    submit_tx,
-                    kv: kv_handle,
-                },
-                shared,
-                controller,
-                loaded.load_seconds,
-                loaded.weight_bytes,
+                "engine stopped; its device resources are released"
             );
-            tracing::info!(replica, "ready");
-            drop(backend);
-            let result = engine.run();
-            stop.store(true, Ordering::Release);
-            drop(sampler);
-            if let Err(message) = result {
-                let _ = fatal.send(Fatal::DeviceFatal(message));
-            }
         })
-        .map(|_| ())
 }

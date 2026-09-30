@@ -277,9 +277,21 @@ def detect(config: dict) -> Packaging:
     if method == "quark":
         gq = qc.get("global_quant_config") or {}
         w = gq.get("weight") or {}
-        if (qc.get("layer_quant_config") or {}) or (
-            qc.get("layer_type_quant_config") or {}
-        ):
+        # Quark repeats its KV recipe as per-layer overrides of the K/V projections that differ
+        # from the global spec only in `output_tensors`; Turbine ignores them (d1de280, the KV
+        # stays at kv.dtype), so they are ignored here too. Any other override is refused.
+        kv = qc.get("kv_cache_quant_config") or {}
+        overrides = {
+            pat: spec
+            for pat, spec in (qc.get("layer_quant_config") or {}).items()
+            if not (
+                kv.get(pat) == spec
+                and spec.get("weight") == gq.get("weight")
+                and spec.get("input_tensors") == gq.get("input_tensors")
+                and not spec.get("bias")
+            )
+        }
+        if overrides or (qc.get("layer_type_quant_config") or {}):
             raise DequantError("quark per-layer quant configs unsupported")
         if (
             w.get("dtype") != "fp4"
@@ -646,6 +658,44 @@ class ShardWriter:
         )
 
 
+def _fix_rope_parameters(config: dict) -> None:
+    """Some checkpoints (transformers >= 5) fold RoPE into one `rope_parameters` object and
+    carry no top-level `rope_theta` / `rope_scaling`. transformers 4.57.1 (pinned for the
+    reference generators) reads only the old top-level keys and silently defaults `rope_theta`
+    to its class default (e.g. 10000.0 for Llama) with no scaling when both are absent — the
+    root cause found for the W4A4 8B checkpoint (`.procoder/handoff/p6a-w4a4-numerics.md`),
+    which gave the CPU reference wrong RoPE just like Turbine did before `config.rs` learned to
+    read `rope_parameters` (same split: `rope_theta` from the object, the rest as `rope_scaling`
+    when a `rope_type` is present). Mutates `config` in place; a no-op when the checkpoint
+    already carries the classic keys or has no `rope_parameters`.
+    """
+    params = config.get("rope_parameters")
+    if not isinstance(params, dict):
+        return
+    if config.get("rope_theta") is None and "rope_theta" in params:
+        config["rope_theta"] = params["rope_theta"]
+    if config.get("rope_scaling") is None:
+        scaling = {k: v for k, v in params.items() if k != "rope_theta"}
+        if scaling.get("rope_type", scaling.get("type", "default")) != "default":
+            config["rope_scaling"] = scaling
+
+
+def _fix_tokenizer_class(out: Path) -> None:
+    """transformers >= 5 writes `"tokenizer_class": "TokenizersBackend"` into
+    `tokenizer_config.json` (e.g. the W4A4 8B checkpoint); transformers 4.57.1 (pinned for the
+    reference generators) has no such class and refuses to load the tokenizer. The checkpoint
+    ships a `tokenizer.json`, so the equivalent 4.x class is `PreTrainedTokenizerFast`. Rewrites
+    the BF16 copy's file in place; a no-op for any other class.
+    """
+    path = out / "tokenizer_config.json"
+    if not path.is_file():
+        return
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    if cfg.get("tokenizer_class") == "TokenizersBackend":
+        cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
+        path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+
 def dequantize(
     model_dir: Path, out: Path, shard_bytes: int = 4_000_000_000, log=print
 ) -> dict:
@@ -684,6 +734,8 @@ def dequantize(
         for name in tensors.names():
             if name in consumed:
                 continue
+            if name.endswith((".k_proj.output_scale", ".v_proj.output_scale")):
+                continue  # Quark's static FP8 KV scales: not weights (quant_reference.py reads them)
             if name.rsplit(".", 1)[0] in prefix_set:
                 raise DequantError(f"{name}: unexpected tensor of a quantized layer")
             if name.endswith((".k_scale", ".v_scale")):
@@ -699,6 +751,7 @@ def dequantize(
     config.pop("quantization_config", None)
     config.pop("compression_config", None)
     config["torch_dtype"] = "bfloat16"
+    _fix_rope_parameters(config)
     (out / "config.json").write_text(
         json.dumps(config, indent=2) + "\n", encoding="utf-8"
     )
@@ -709,6 +762,7 @@ def dequantize(
             and not f.name.endswith(".safetensors")
         ):
             shutil.copy2(f, out / f.name)
+    _fix_tokenizer_class(out)
     acts = [e.get("input_scale") for e in layers.values()]
     if pk.activation == ACT_FP8_TENSOR and any(a is None for a in acts):
         raise DequantError("static FP8 activations but a layer has no input_scale")

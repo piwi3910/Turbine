@@ -149,6 +149,10 @@ case "$2" in
 		SERVED_NAME=shuyuej/Llama-3.2-3B-Instruct-GPTQ
 		MAX_MODEL_LEN=32768
 		;;
+	llama-3.2-3b-instruct-gptq-own)
+		SERVED_NAME=turbine/Llama-3.2-3B-Instruct-GPTQ-own
+		MAX_MODEL_LEN=32768
+		;;
 	# Phase 6a FP8 proof checkpoints (served_name as in scripts/lab/phase6-novanas-llama-fp8*.yaml).
 	llama-3.2-3b-instruct-fp8-dynamic)
 		SERVED_NAME=RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic
@@ -163,7 +167,7 @@ case "$2" in
 		MAX_MODEL_LEN=32768
 		;;
 	*)
-		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, llama-3.1-8b-instruct, llama-3.1-8b-instruct-mxfp4a16, llama-3.2-3b-mxfp4-a4, llama-3.1-8b-instruct-mxfp4-a4, llama-3.2-3b-instruct-awq, llama-3.2-3b-instruct-gptq, llama-3.2-3b-instruct-fp8-dynamic, llama-3.2-3b-instruct-fp8 or llama-3.2-3b-instruct-fp8-block)" >&2
+		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, llama-3.1-8b-instruct, llama-3.1-8b-instruct-mxfp4a16, llama-3.2-3b-mxfp4-a4, llama-3.1-8b-instruct-mxfp4-a4, llama-3.2-3b-instruct-awq, llama-3.2-3b-instruct-gptq, llama-3.2-3b-instruct-gptq-own, llama-3.2-3b-instruct-fp8-dynamic, llama-3.2-3b-instruct-fp8 or llama-3.2-3b-instruct-fp8-block)" >&2
 		usage
 		;;
 	esac
@@ -319,11 +323,16 @@ on_interrupt() {
 }
 
 LOG_PID=""
+STREAM_STARTED=0
 stop_log_stream() {
 	if [[ -n "$LOG_PID" ]]; then
 		kill "$LOG_PID" 2>/dev/null || true
 		wait "$LOG_PID" 2>/dev/null || true
 		LOG_PID=""
+	fi
+	if [[ $STREAM_STARTED -eq 1 ]]; then
+		stop_remote_log_stream
+		STREAM_STARTED=0
 	fi
 }
 trap stop_log_stream EXIT
@@ -334,10 +343,22 @@ stream_log() {
 	local cmd="export KUBECTL_KUBERC=false; kubectl -n ${NS} logs -f job/${JOB} 2>&1 | grep --line-buffered -v 'permission denied'"
 	if [[ $DRY_RUN -eq 1 ]]; then
 		echo "+ ssh ${SSH_OPTS[*]} ${REMOTE} '${cmd}'"
+		STREAM_STARTED=1
 		return
 	fi
 	(exec ssh -n "${SSH_OPTS[@]}" "$REMOTE" "$cmd") &
 	LOG_PID=$!
+	STREAM_STARTED=1
+}
+
+# Kills the remote `kubectl logs -f job/${JOB}` (and, once it exits, its `grep`) that an ssh
+# ControlMaster keeps running after the local ssh client above is killed: under ControlMaster the
+# remote command survives the local kill, so the master keeps the passed stdout open and a
+# caller piping lab-serve.sh through `tee` never sees EOF (the overload-soak's 19-minute hang,
+# rotation 11). As with gpu_unlock's pkill above, the bracket trick keeps this pkill's own
+# command line — which literally contains "[l]ogs -f job/${JOB}" — from matching itself.
+stop_remote_log_stream() {
+	remote "pkill -f '[l]ogs -f job/${JOB}'" || true
 }
 
 wait_for_pod() {

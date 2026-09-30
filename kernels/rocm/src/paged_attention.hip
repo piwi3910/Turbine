@@ -724,6 +724,13 @@ int32_t launch_paged_attention(turbine_ctx *ctx,
 int32_t launch_paged_decode_fp8(turbine_ctx *ctx,
                                 const turbine_attention_paged_desc *d) {
   const int32_t group = d->num_q_heads / d->num_kv_heads;
+  // The kernel's LDS holds kPagedFp8DecodeMaxGroup query heads per KV head: a
+  // larger group would index past it (review r13 P1). Callers route such
+  // shapes to the Turbine FP8 kernel; this is the last line of defence.
+  if (group > kPagedFp8DecodeMaxGroup)
+    return fail(ctx, TURBINE_E_UNSUPPORTED,
+                "paged FP8 decode: GQA group " + std::to_string(group) +
+                    " exceeds " + std::to_string(kPagedFp8DecodeMaxGroup));
   const dim3 grid(static_cast<unsigned>(d->num_seqs),
                   static_cast<unsigned>(d->num_kv_heads));
   auto launch = [&](auto kernel) {

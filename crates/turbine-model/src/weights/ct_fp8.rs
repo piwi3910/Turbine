@@ -9,7 +9,9 @@
 use serde_json::{Value, json};
 
 use super::ActivationQuant;
-use super::common::{pair, scheme_unsupported, string_list};
+use super::common::{
+    ct_check_kv_scheme, ct_check_output_activations, pair, scheme_unsupported, string_list,
+};
 use super::fp8::{Fp8Format, Fp8Layout, Fp8Packaging, Fp8Weights, check_block};
 use crate::ModelError;
 use crate::config::unsupported;
@@ -94,26 +96,6 @@ fn activations_of(a: Option<&Value>) -> Result<ActivationQuant, ModelError> {
     }
 }
 
-/// `kv_cache_scheme`: null, or static FP8 per tensor (its scales are read by `kv.dtype`).
-fn check_kv_scheme(q: &Value) -> Result<(), ModelError> {
-    match q.get("kv_cache_scheme").filter(|k| !k.is_null()) {
-        None => Ok(()),
-        Some(k)
-            if k.get("num_bits").and_then(Value::as_u64) == Some(8)
-                && text(k, "type") == "float"
-                && text(k, "strategy") == "tensor"
-                && !k.get("dynamic").and_then(Value::as_bool).unwrap_or(false) =>
-        {
-            Ok(())
-        }
-        Some(k) => Err(scheme_unsupported(
-            "kv_cache_scheme",
-            k.to_string(),
-            "null or static 8-bit float per tensor",
-        )),
-    }
-}
-
 impl Fp8Packaging for CtFp8 {
     const NAME: &'static str = "ct_fp8";
     const DEFAULT: Fp8Layout = Fp8Layout {
@@ -155,7 +137,8 @@ impl Fp8Packaging for CtFp8 {
         let weights = g
             .get("weights")
             .ok_or_else(|| scheme_unsupported("weights", "none", "8-bit float"))?;
-        check_kv_scheme(q)?;
+        ct_check_kv_scheme(q)?;
+        ct_check_output_activations(g)?;
         Ok(Fp8Layout {
             weights: weights_of(weights)?,
             act: activations_of(g.get("input_activations"))?,
