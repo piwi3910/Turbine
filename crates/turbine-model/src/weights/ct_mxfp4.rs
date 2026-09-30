@@ -8,7 +8,9 @@
 use serde_json::{Value, json};
 
 use super::ActivationQuant;
-use super::common::{scheme_unsupported, string_list};
+use super::common::{
+    ct_check_kv_scheme, ct_check_output_activations, scheme_unsupported, string_list,
+};
 use super::mxfp4::{Mxfp4Format, Mxfp4Kind, Mxfp4Layout, Mxfp4Packaging};
 use crate::ModelError;
 use crate::config::unsupported;
@@ -65,6 +67,8 @@ impl Mxfp4Packaging for CtMxfp4 {
                 "[\"Linear\"]",
             ));
         }
+        ct_check_kv_scheme(q)?;
+        ct_check_output_activations(g)?;
         if g.get("input_activations").is_some_and(|a| !a.is_null()) {
             return Err(scheme_unsupported(
                 "input_activations",

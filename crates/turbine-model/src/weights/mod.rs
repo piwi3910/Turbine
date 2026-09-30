@@ -200,6 +200,12 @@ pub trait WeightFormat: Module {
     fn repacks(&self, _slot: &WeightSlot) -> bool {
         false
     }
+    /// Whether `slot` (a check-only slot, no elements) may be absent from the checkpoint: the
+    /// loader validates it when present and skips it otherwise (compressed-tensors
+    /// `weight_g_idx`). Default: every slot is required.
+    fn optional(&self, _slot: &WeightSlot) -> bool {
+        false
+    }
     /// The format as the selected kernels serve it on one device (Phase 6a S-8): `supports`
     /// answers whether a provider in the selection order runs a quantized layer's `qgemm`, and
     /// a format with a load-time fallback moves the layers of `slots` (the slots the device
@@ -862,6 +868,56 @@ mod tests {
             supported.starts_with("quant_scheme_unsupported"),
             "{supported}"
         );
+    }
+
+    /// Review r13 C7, C8: every compressed-tensors packaging (FP8, packed INT4, MXFP4) refuses a
+    /// non-null `output_activations` and a `kv_cache_scheme` other than null or static FP8 per
+    /// tensor with `quant_scheme_unsupported`, and accepts the static FP8 KV scheme. Breaks if a
+    /// packaging silently drops an output quantization or skips the shared KV-scheme check.
+    #[test]
+    fn ct_packagings_refuse_output_and_kv_schemes() {
+        let int4 = json!({"quant_method": "compressed-tensors", "format": "pack-quantized",
+            "config_groups": {"group_0": {"targets": ["Linear"], "input_activations": null,
+                "weights": {"num_bits": 4, "type": "int", "symmetric": true,
+                            "strategy": "group", "group_size": 128, "actorder": null}}}});
+        let mx = json!({"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+            "config_groups": {"group_0": {"targets": ["Linear"], "input_activations": null,
+                "weights": {"num_bits": 4, "type": "float", "strategy": "group",
+                            "group_size": 32, "actorder": "static"}}}});
+        let fp8 = ct("channel", json!(null), act("token", true, json!(null)));
+        for (name, base) in [("ct_fp8", fp8), ("ct_pack_int4", int4), ("ct_mxfp4", mx)] {
+            let top = |q: serde_json::Value| json!({ "quantization_config": q });
+            assert_eq!(detect(&top(base.clone())).expect(name).name(), name);
+
+            let mut out = base.clone();
+            out["config_groups"]["group_0"]["output_activations"] =
+                act("tensor", false, json!(null));
+            let (field, supported) = refused(out);
+            assert_eq!(field, "output_activations", "{name}");
+            assert!(
+                supported.starts_with("quant_scheme_unsupported"),
+                "{name}: {supported}"
+            );
+
+            for kv in [
+                json!({"num_bits": 4, "type": "int", "strategy": "tensor", "dynamic": false}),
+                json!({"num_bits": 8, "type": "float", "strategy": "tensor", "dynamic": true}),
+                json!({"num_bits": 8, "type": "float", "strategy": "channel", "dynamic": false}),
+            ] {
+                let mut q = base.clone();
+                q["kv_cache_scheme"] = kv.clone();
+                let (field, supported) = refused(q);
+                assert_eq!(field, "kv_cache_scheme", "{name} {kv}");
+                assert!(
+                    supported.starts_with("quant_scheme_unsupported"),
+                    "{name}: {supported}"
+                );
+            }
+            let mut q = base.clone();
+            q["kv_cache_scheme"] =
+                json!({"num_bits": 8, "type": "float", "strategy": "tensor", "dynamic": false});
+            assert_eq!(detect(&top(q)).expect(name).name(), name, "static FP8 KV");
+        }
     }
 
     /// Phase 6a S-3: the BF16 entry describes every linear layer of a tiny Llama as unquantized

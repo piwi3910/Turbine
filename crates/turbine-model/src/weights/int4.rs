@@ -113,6 +113,8 @@ struct Names {
     zeros: Option<&'static str>,
     /// Tensors only validated (not stored).
     checks: &'static [&'static str],
+    /// Tensors validated when the checkpoint has them (compressed-tensors `weight_g_idx`).
+    optional_checks: &'static [&'static str],
 }
 
 impl Int4Kind {
@@ -123,18 +125,21 @@ impl Int4Kind {
                 scales: "scales",
                 zeros: Some("qzeros"),
                 checks: &[],
+                optional_checks: &[],
             },
             Int4Kind::Gptq => Names {
                 data: "qweight",
                 scales: "scales",
                 zeros: Some("qzeros"),
                 checks: &["g_idx"],
+                optional_checks: &[],
             },
             Int4Kind::CtPack => Names {
                 data: "weight_packed",
                 scales: "weight_scale",
                 zeros: None,
                 checks: &["weight_shape"],
+                optional_checks: &["weight_g_idx"],
             },
         }
     }
@@ -193,7 +198,7 @@ impl Int4Layout {
             } else {
                 Part::Check
             }
-        } else if names.checks.contains(&suffix) {
+        } else if names.checks.contains(&suffix) || names.optional_checks.contains(&suffix) {
             Part::Check
         } else {
             Part::Plain
@@ -228,6 +233,11 @@ impl Int4Layout {
         let names = self.kind.names();
         let (n, k) = (base.shape[0], base.shape[1]);
         let groups = k.div_ceil(self.group as usize);
+        // The layer's whole [n, k] (a check-only tensor is read whole, never sharded).
+        let full = base
+            .source
+            .as_ref()
+            .map_or((n, k), |src| (src.shape[0], src.shape[1]));
         // The stack's leading dimensions and rows, and `base`'s first row among them.
         let (key, lead, rows, row0) = match &base.stack {
             Some(p) => {
@@ -263,7 +273,7 @@ impl Int4Layout {
             out.push(if self.zero_points {
                 per_row(zeros, format!("{key}_zeros"), groups)
             } else {
-                check_slot(module, zeros)
+                check_slot(module, zeros, full)
             });
         }
         let mut aligned = true;
@@ -272,7 +282,7 @@ impl Int4Layout {
             let g = self.group as usize;
             let per_row = [(2, full_k / 2), (g, full_k / g), (g, full_k / g)];
             for (slot, (cols, full_cols)) in out.iter_mut().zip(per_row) {
-                if slot.shape != [0] {
+                if slot.shape.iter().product::<usize>() != 0 {
                     aligned &= shard_like(
                         slot,
                         src,
@@ -285,7 +295,13 @@ impl Int4Layout {
                 }
             }
         }
-        out.extend(names.checks.iter().map(|c| check_slot(module, c)));
+        out.extend(
+            names
+                .checks
+                .iter()
+                .chain(names.optional_checks)
+                .map(|c| check_slot(module, c, full)),
+        );
         (out, aligned)
     }
 
@@ -335,6 +351,13 @@ impl Int4Layout {
             }
         }
         Ok(())
+    }
+
+    /// Whether `slot` is a check-only tensor the checkpoint may omit (the loader skips it when
+    /// absent): compressed-tensors `weight_g_idx`.
+    pub fn optional(&self, slot: &WeightSlot) -> bool {
+        let suffix = slot.name.rsplit('.').next().unwrap_or("");
+        slot.name.contains('.') && self.kind.names().optional_checks.contains(&suffix)
     }
 
     /// `(n, k)` of a packed data tensor's shape.
@@ -431,7 +454,7 @@ impl Int4Layout {
                 }
                 Ok(transpose(&zeros, groups, n))
             }
-            Part::Check => self.check(entry, &bytes).map(|()| Vec::new()),
+            Part::Check => self.check(slot, entry, &bytes).map(|()| Vec::new()),
         }
     }
 
@@ -448,8 +471,25 @@ impl Int4Layout {
             .collect()
     }
 
-    /// Validates a check-only tensor.
-    fn check(&self, entry: &TensorEntry, bytes: &[u8]) -> Result<(), ModelError> {
+    /// Validates a check-only tensor against its layer's `[n, k]` (the slot's shape
+    /// `[0, n, k]`; review r13 C9: an empty tensor no longer passes vacuously).
+    fn check(
+        &self,
+        slot: &WeightSlot,
+        entry: &TensorEntry,
+        bytes: &[u8],
+    ) -> Result<(), ModelError> {
+        let bad = |rule: String| ModelError::Safetensors {
+            file: entry.file.clone(),
+            tensor: entry.name.clone(),
+            rule,
+        };
+        let &[0, n, k] = slot.shape.as_slice() else {
+            return Err(bad(format!(
+                "check-only slot of shape {:?} carries no [0, n, k]",
+                slot.shape
+            )));
+        };
         let ints: Vec<i64> = match entry.dtype {
             Dtype::I64 => bytes
                 .chunks_exact(8)
@@ -462,7 +502,10 @@ impl Int4Layout {
         };
         let suffix = entry.name.rsplit('.').next().unwrap_or("");
         match suffix {
-            "g_idx" => {
+            "g_idx" | "weight_g_idx" => {
+                if ints.len() != k {
+                    return Err(bad(format!("{} group indices for {k} inputs", ints.len())));
+                }
                 let g = i64::from(self.group);
                 if let Some((i, v)) = (0i64..).zip(&ints).find(|(i, v)| **v != i / g) {
                     return Err(unsupported(
@@ -475,6 +518,10 @@ impl Int4Layout {
             }
             "qzeros" => {
                 // Symmetric GPTQ: every zero point must be the implicit 8.
+                let want = [k.div_ceil(self.group as usize), n / 8];
+                if entry.shape != want || ints.len() != want[0] * want[1] {
+                    return Err(bad(format!("shape {:?} != {want:?}", entry.shape)));
+                }
                 let words: Vec<u32> = ints.iter().map(|&w| w as u32).collect();
                 let zeros = self.zeros_of(&words, words.len(), 8);
                 match zeros.iter().find(|&&z| z != 8) {
@@ -486,7 +533,7 @@ impl Int4Layout {
                     )),
                 }
             }
-            "weight_shape" if ints.len() == 2 && ints.iter().all(|&d| d > 0) => Ok(()),
+            "weight_shape" if ints == [n as i64, k as i64] => Ok(()),
             _ => Err(ModelError::Safetensors {
                 file: entry.file.clone(),
                 tensor: entry.name.clone(),
@@ -496,11 +543,12 @@ impl Int4Layout {
     }
 }
 
-/// A slot only validated: no elements, not stored.
-fn check_slot(module: &str, suffix: &str) -> WeightSlot {
+/// A slot only validated: no elements (shape `[0, n, k]`, the layer's dims for the check),
+/// not stored.
+fn check_slot(module: &str, suffix: &str, (n, k): (usize, usize)) -> WeightSlot {
     WeightSlot {
         name: format!("{module}.{suffix}"),
-        shape: vec![0],
+        shape: vec![0, n, k],
         stack: None,
         source: None,
     }
@@ -662,6 +710,10 @@ impl<P: Int4Packaging> WeightFormat for Int4Format<P> {
 
     fn repacks(&self, slot: &WeightSlot) -> bool {
         self.layout.repacks(slot)
+    }
+
+    fn optional(&self, slot: &WeightSlot) -> bool {
+        self.layout.optional(slot)
     }
 
     fn repack(
@@ -949,10 +1001,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(zeros, (1..=8).collect::<Vec<u8>>());
-        // g_idx: identity passes, act order refused.
+        // g_idx (a check-only slot carrying the layer's [n, k]): identity passes, act order
+        // refused; review r13 C9: an empty or short one no longer passes vacuously.
         let g = |v: &[u32]| {
             l.repack(
-                &slot("m.g_idx", vec![0]),
+                &slot("m.g_idx", vec![0, 8, 8]),
                 &entry("m.g_idx", Dtype::I32, vec![v.len()]),
                 words(v),
             )
@@ -960,18 +1013,75 @@ mod tests {
         assert_eq!(g(&[0; 8]).unwrap(), Vec::<u8>::new());
         let err = g(&[0, 0, 0, 0, 0, 0, 0, 1]).unwrap_err().to_string();
         assert!(err.contains("gptq_act_order"), "{err}");
-        // Symmetric: every stored zero must restore to 8.
+        assert!(g(&[]).is_err());
+        assert!(g(&[0; 4]).is_err());
+        // Symmetric: every stored zero must restore to 8, and `qzeros` must be
+        // [k / group, n / 8] (not empty).
         let sym = layout(Int4Kind::Gptq, false, 1);
-        let q = |z: u32| {
+        let q = |shape: Vec<usize>, ws: &[u32]| {
             sym.repack(
-                &slot("m.qzeros", vec![0]),
-                &entry("m.qzeros", Dtype::I32, vec![1, 1]),
-                words(&[(0..8).fold(0u32, |w, i| w | (z << (4 * i)))]),
+                &slot("m.qzeros", vec![0, 8, 8]),
+                &entry("m.qzeros", Dtype::I32, shape),
+                words(ws),
             )
         };
-        assert!(q(7).is_ok());
-        let err = q(6).unwrap_err().to_string();
+        let packed = |z: u32| (0..8).fold(0u32, |w, i| w | (z << (4 * i)));
+        assert!(q(vec![1, 1], &[packed(7)]).is_ok());
+        let err = q(vec![1, 1], &[packed(6)]).unwrap_err().to_string();
         assert!(err.contains("quant_scheme_unsupported"), "{err}");
+        assert!(q(vec![0, 1], &[]).is_err());
+        assert!(q(vec![2, 1], &[packed(7), packed(7)]).is_err());
+    }
+
+    /// Review r13 C4, C9: compressed-tensors `weight_shape` must be the layer's logical
+    /// `[n, k]` (not just two positive values), and an optional `weight_g_idx` is a check-only
+    /// slot the checkpoint may omit — when present it must map input `i` to group `i / group`
+    /// over all `k` inputs, else `gptq_act_order`. Breaks if a non-identity group map is
+    /// ignored (execution would pick the scale by `column / group`) or `weight_shape` is not
+    /// compared with the layer.
+    #[test]
+    fn ct_pack_checks_weight_shape_and_g_idx() {
+        let l = layout(Int4Kind::CtPack, false, 0);
+        let shape = |v: &[u32]| {
+            l.repack(
+                &slot("m.weight_shape", vec![0, 8, 16]),
+                &entry("m.weight_shape", Dtype::I32, vec![v.len()]),
+                words(v),
+            )
+        };
+        assert!(shape(&[8, 16]).is_ok());
+        for bad in [&[1u32, 1][..], &[16, 8], &[8], &[8, 16, 1]] {
+            assert!(shape(bad).is_err(), "{bad:?}");
+        }
+        let g = |v: &[u32]| {
+            l.repack(
+                &slot("m.weight_g_idx", vec![0, 8, 16]),
+                &entry("m.weight_g_idx", Dtype::I32, vec![v.len()]),
+                words(v),
+            )
+        };
+        let identity: Vec<u32> = (0..16).map(|i| i / 8).collect();
+        assert!(g(&identity).is_ok());
+        let mut swapped = identity.clone();
+        swapped.swap(0, 15);
+        let err = g(&swapped).unwrap_err().to_string();
+        assert!(err.contains("gptq_act_order"), "{err}");
+        assert!(g(&identity[..8]).is_err());
+        // The slot is derived for every quantized layer, is check-only and optional.
+        let base = slot("model.layers.0.mlp.down_proj.weight", vec![8, 16]);
+        let g_slot = l
+            .slots(&base)
+            .into_iter()
+            .find(|s| s.name.ends_with(".weight_g_idx"))
+            .expect("a weight_g_idx slot");
+        assert_eq!(g_slot.shape, [0, 8, 16]);
+        assert!(l.optional(&g_slot));
+        let ws = l
+            .slots(&base)
+            .into_iter()
+            .find(|s| s.name.ends_with(".weight_shape"))
+            .expect("a weight_shape slot");
+        assert!(!l.optional(&ws));
     }
 
     /// compressed-tensors: `weight_packed [n=8, k/8=1]`, nibble `i` = input `i`, codes as
