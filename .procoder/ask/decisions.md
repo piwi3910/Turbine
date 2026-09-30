@@ -2430,3 +2430,20 @@ Pick: an own kernel, implementation `turbine_hip_tq` behind its own `ImplEntry`,
 the one reused building block. No upstream kernel implements this codec (seeded signs, Lloyd–Max codebooks on the
 √d-scaled coordinate and the paper's Gaussian QJL residual together), and the only complete TurboQuant implementation
 (vLLM) is Python and a different codec. Timing and tie counts are recorded below when the lab run lands.
+
+## 6b Task 8: TurboQuant tables through the transcode descriptor (2026-09-30)
+
+Found by the Task 8 builder (`p6b-t8`, c3839c9). `turbine_kv_transcode_desc` carries only `seed`. The K/V signs are
+integer work the GPU can regenerate bit-exactly, but the codebooks have no field, and the 128×128 QJL projection `S`
+is generated with F64 `ln`/`cos`/`sin` from the host math library (`qjl.rs`: the GPU must receive it, never
+regenerate it).
+
+- A) Add `const turbine_tq_params *tq_params` at the end of `turbine_kv_transcode_desc` (read only for TQ4/TQ2):
+  `seed`, device `codebooks[4]`, device F32 `tables` per (layer, KV head) = k_signs | v_signs | S — the same struct
+  the spec's attention line gives Task 12; uploaded once at startup (~15 MiB Llama, ~17 MiB OLMoE); bit-exact by
+  construction
+- B) No new field: the GPU regenerates everything, codebooks as kernel constants (not guaranteed bit-exact,
+  contradicts `qjl.rs`, F64 slow on RDNA4)
+- C) As A, but `tables` holds only `S`; the signs come from `seed` on the GPU
+
+**Decision (user, 2026-09-30): A.** `tq_params` joins the end of `turbine_kv_transcode_desc`; the Task 8 builder takes the header, ffi, ops and shim-validation files for it.
