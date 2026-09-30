@@ -91,7 +91,7 @@ use turbine_core::request::{
 };
 use turbine_core::types::{BlockId, CircuitState, PressureState, Priority, RequestId, SeqId};
 use turbine_kv::BlockPool;
-use turbine_kv::hierarchy::{AttachOutcome, PrefixAttach};
+use turbine_kv::hierarchy::{AttachOutcome, AttachRequest, PrefixAttach};
 use turbine_model::executor::{
     BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice,
     TokenFeed,
@@ -796,6 +796,7 @@ impl EngineLoop {
             deadline_ms: u64::MAX,
             session: None,
             cache_salt: None,
+            kv_policy: None,
             endpoint: Endpoint::Completions,
             http_request_id: "circuit-probe".into(),
             prompt_tokens: self.probe_prompt.clone(),
@@ -1003,11 +1004,14 @@ impl EngineLoop {
     fn attach(&mut self, id: RequestId, request: &GenerationRequest) -> AttachOutcome {
         self.kv.attach(
             &mut self.pool,
-            id,
-            &request.prompt_tokens,
-            request.cache_salt.as_deref().unwrap_or(""),
-            request.session.as_ref(),
-            request.priority,
+            &AttachRequest {
+                request: id,
+                prompt: &request.prompt_tokens,
+                cache_salt: request.cache_salt.as_deref().unwrap_or(""),
+                session: request.session.as_ref(),
+                priority: request.priority,
+                allow_lossy: request.kv_policy.map(|p| p.allow_lossy),
+            },
         )
     }
 
@@ -1039,6 +1043,7 @@ impl EngineLoop {
             return;
         }
         let cached_tokens = attach.as_ref().map_or(0, |a| a.cached_tokens);
+        let lossy_cached_tokens = attach.as_ref().map_or(0, |a| a.lossy_tokens);
         if !zero_tokens {
             let bt = self.pool.layout().block_tokens;
             let mut r =
@@ -1074,6 +1079,7 @@ impl EngineLoop {
         ));
         let mut active = ActiveRequest::new(submission, events, &seqs, &self.tokenizer);
         active.cached_tokens = cached_tokens;
+        active.lossy_cached_tokens = lossy_cached_tokens;
         for (i, &seq) in seqs.iter().enumerate() {
             self.seqs.insert(seq, (id, i));
         }
@@ -2678,6 +2684,7 @@ mod tests {
             deadline_ms: u64::MAX,
             session: None,
             cache_salt: None,
+            kv_policy: None,
             endpoint: Endpoint::Completions,
             http_request_id: "t".into(),
             prompt_tokens: prompt.to_vec(),

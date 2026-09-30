@@ -134,6 +134,8 @@ pub(crate) struct ActiveRequest {
     pub done: bool,
     /// Prompt tokens served from a cached prefix (Phase 4), reported in `usage`.
     pub cached_tokens: u32,
+    /// Of them, tokens served from lossy cached KV (P6b S-3), reported in `usage`.
+    pub lossy_cached_tokens: u32,
 }
 
 impl ActiveRequest {
@@ -190,6 +192,7 @@ impl ActiveRequest {
             held: VecDeque::new(),
             done: false,
             cached_tokens: 0,
+            lossy_cached_tokens: 0,
         }
     }
 
@@ -313,6 +316,7 @@ impl ActiveRequest {
                 prompt_tokens: self.prompt_len(),
                 completion_tokens: c.generated.len() as u32,
                 cached_tokens: self.cached_tokens,
+                lossy_cached_tokens: self.lossy_cached_tokens,
             }),
         }
     }
@@ -636,6 +640,7 @@ mod tests {
             deadline_ms: u64::MAX,
             session: None,
             cache_salt: None,
+            kv_policy: None,
             endpoint: Endpoint::Completions,
             http_request_id: "t".into(),
             prompt_tokens: prompt.to_vec(),
@@ -968,7 +973,8 @@ mod tests {
                 usage: Some(Usage {
                     prompt_tokens: 2,
                     completion_tokens: 3,
-                    cached_tokens: 0
+                    cached_tokens: 0,
+                    lossy_cached_tokens: 0,
                 })
             }
         );

@@ -221,6 +221,7 @@ impl Generation<'_> {
             completion_tokens: self.generated,
             // The single-request loop keeps no prefix cache.
             cached_tokens: 0,
+            lossy_cached_tokens: 0,
         };
         tracing::debug!(
             request_id = ?self.req.id,
@@ -402,6 +403,7 @@ mod tests {
             deadline_ms: u64::MAX,
             session: None,
             cache_salt: None,
+            kv_policy: None,
             endpoint: Endpoint::Completions,
             http_request_id: "test".into(),
             prompt_tokens: prompt.to_vec(),
@@ -514,7 +516,8 @@ mod tests {
                 Some(Usage {
                     prompt_tokens: 3,
                     completion_tokens: 3,
-                    cached_tokens: 0
+                    cached_tokens: 0,
+                    lossy_cached_tokens: 0,
                 })
             );
             // prefill of the prompt, then one decode per token except after the last

@@ -394,6 +394,7 @@ pub fn run(args: &KvSimArgs) -> KvSimReport {
             cache_salt: "",
             session: r.session.as_ref(),
             priority: Priority::default(),
+            allow_lossy: None,
         };
         let (attach, waited) = e.attach(&req);
         let recompute = f64::from(attach.plan.recompute_tokens) / PREFILL_TPS;

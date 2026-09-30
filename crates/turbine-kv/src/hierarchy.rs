@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use smallvec::SmallVec;
 use turbine_core::clock::Clock;
-use turbine_core::config::{KvConfig, KvPrefetchConfig, KvSessionConfig};
+use turbine_core::config::{KvConfig, KvPrefetchConfig, KvSessionConfig, LossyReuse};
 use turbine_core::registry::UnknownModule;
 use turbine_core::request::SessionHints;
 use turbine_core::types::{
@@ -25,12 +25,15 @@ use turbine_core::types::{
 };
 
 use crate::directory::{
-    CostEstimate, KvBlock, KvDirectory, KvPriority, PrefixMatch, SessionId, TokenRange,
+    CostEstimate, KvBlock, KvDirectory, KvPriority, Lineage, PrefixMatch, SessionId, TokenRange,
+    format_is_lossy,
 };
 use crate::document::{
     HitRate, KvDocument, KvSummary, KvTierDocument, Prefetch, Sessions, TierState, Transfers,
 };
-use crate::identity::{Blake3Hasher, KeyHasher, KvFormat, KvKey, NamespaceCache, prefix_keys};
+use crate::identity::{
+    Blake3Hasher, KeyHasher, KvFormat, KvKey, NamespaceCache, lossy_key, prefix_keys,
+};
 use crate::metrics::{EvictReason, KvMetrics, PrefetchOutcome};
 use crate::planner::{KvPlan, PlanInputs, PlanReason, plan_prefix};
 use crate::policy::{
@@ -67,6 +70,12 @@ pub struct HierarchyConfig {
     /// `kv.lossless_tail_blocks`: the last N full blocks of a finished sequence are demoted at
     /// the L0 format whatever the tier's format.
     pub lossless_tail_blocks: u32,
+    /// `kv.lossy_reuse: allow`: requests without `x-turbine-kv-lossy` may reuse lossy blocks
+    /// (P6b S-3).
+    pub allow_lossy: bool,
+    /// `kv.lossy_penalty` resolved for every registered `kv_format` codec (one entry each):
+    /// a lossy block's retrieval cost is multiplied by `1 + penalty`.
+    pub lossy_penalty: Vec<(&'static str, f64)>,
 }
 
 impl HierarchyConfig {
@@ -95,7 +104,25 @@ impl HierarchyConfig {
             l1_format: codec_name(kv.cpu.format.as_str())?,
             l2_format: codec_name(kv.nvme.format.as_str())?,
             lossless_tail_blocks: kv.lossless_tail_blocks,
+            allow_lossy: kv.lossy_reuse == LossyReuse::Allow,
+            lossy_penalty: crate::codec::registry()
+                .iter()
+                .map(|c| {
+                    let p = kv
+                        .lossy_penalty_override(c.name())
+                        .unwrap_or_else(|| c.default_lossy_penalty());
+                    (c.name(), p)
+                })
+                .collect(),
         })
+    }
+
+    /// The planner penalty of a block served lossy in codec `format`.
+    pub fn penalty_of(&self, format: &str) -> f64 {
+        self.lossy_penalty
+            .iter()
+            .find(|(n, _)| *n == format)
+            .map_or(0.0, |(_, p)| *p)
     }
 }
 
@@ -135,6 +162,9 @@ pub struct PrefixAttach {
     /// Tokens the blocks cover (`blocks × block_tokens`); feeds
     /// `ResourceEstimate.cached_prefix_tokens`.
     pub cached_tokens: u32,
+    /// Of `cached_tokens`, those served from lossy blocks (P6b S-3): `usage.prompt_tokens_details
+    /// .lossy_cached_tokens`.
+    pub lossy_tokens: u32,
     pub plan: KvPlan,
 }
 
@@ -155,6 +185,9 @@ pub struct AttachRequest<'a> {
     pub cache_salt: &'a str,
     pub session: Option<&'a SessionHints>,
     pub priority: Priority,
+    /// `x-turbine-kv-lossy` (P6b S-3): `Some(false)` never reuses a lossy block; `None` takes
+    /// `kv.lossy_reuse`.
+    pub allow_lossy: Option<bool>,
 }
 
 /// Plain counters for diagnostics and the offline simulator.
@@ -319,6 +352,8 @@ impl Eq for Victim {}
 struct Pending {
     attach: PrefixAttach,
     promotions: Vec<BlockId>,
+    /// Per attached block: served lossy (recounts `lossy_tokens` when a promotion fails).
+    lossy: Vec<bool>,
 }
 
 /// Per-request KV state from attach until `request_done`.
@@ -326,10 +361,37 @@ struct RequestKv {
     salt: String,
     session: Option<SessionId>,
     priority: KvPriority,
-    /// Keys of the full blocks seen so far (prompt, then generated tokens).
+    /// Keys of the full blocks seen so far (prompt, then generated tokens): the hash chain
+    /// the request's own blocks are keyed by (a lossy chain after a lossy reused block).
     keys: Vec<KvKey>,
     /// Blocks already keyed in the directory (or attached from it).
     committed: usize,
+    /// Lineage of the blocks this request computes (P6b S-3).
+    lineage: Lineage,
+    /// The directory entries of the attached blocks (a lossy copy's promoted entry for a
+    /// lossy-promoted block); the first computed block's parent is the last of them.
+    used: Vec<KvKey>,
+    /// With a lossy lineage: the first lossy attached block and the prompt's exact keys, to
+    /// fall back to when a failed promotion cuts the prefix before it.
+    lossy_from: Option<(usize, Vec<KvKey>)>,
+}
+
+impl RequestKv {
+    /// The directory entry of full block `i`: the attached entry, else its key.
+    fn entry(&self, i: usize) -> KvKey {
+        self.used.get(i).copied().unwrap_or(self.keys[i])
+    }
+
+    /// The prefix was cut to its first `n` attached blocks.
+    fn truncate_attached(&mut self, n: usize) {
+        self.used.truncate(n);
+        if self.lossy_from.as_ref().is_some_and(|(s, _)| *s >= n)
+            && let Some((_, exact)) = self.lossy_from.take()
+        {
+            self.keys = exact;
+            self.lineage = Lineage::Exact;
+        }
+    }
 }
 
 pub struct KvHierarchy {
@@ -352,6 +414,11 @@ pub struct KvHierarchy {
     promotions_by_ticket: HashMap<u64, (RequestId, BlockId)>,
     /// Keys with a demotion copy in flight.
     demoting: HashMap<KvKey, Demoting>,
+    /// Promotion and prefetch tickets copying a lossy copy of an exact block into L0 → the
+    /// lossy key and codec its L0 copy is filed under (P6b S-3). Bounded by the transfers.
+    lossy_targets: HashMap<u64, (KvKey, &'static str)>,
+    /// The `lossy_key` seed: the tier codecs' rotation seed (the unsalted namespace's).
+    lossy_seed: u64,
     /// The L0 layout of one rank shard and the shard count (codec sizes, P6b S-1).
     layout: KvLayout,
     shards: u32,
@@ -402,7 +469,11 @@ impl KvHierarchy {
         let max_entries = (l0_blocks as usize)
             .saturating_add(blocks_of(&l1, cfg.l1_format))
             .saturating_add(blocks_of(&l2, cfg.l2_format));
+        let mut namespaces = NamespaceCache::new(model, format);
+        let lossy_seed = namespaces.get("").seed();
         KvHierarchy {
+            lossy_targets: HashMap::new(),
+            lossy_seed,
             layout: format.layout,
             shards: format.shards.max(1),
             tail: HashSet::new(),
@@ -413,7 +484,7 @@ impl KvHierarchy {
                 clock.clone(),
             ),
             sessions: SessionTable::new(cfg.session.clone(), &cfg.prefetch),
-            namespaces: NamespaceCache::new(model, format),
+            namespaces,
             dir: KvDirectory::new(max_entries),
             model: model.fingerprint(),
             cfg,
@@ -447,6 +518,11 @@ impl KvHierarchy {
 
     pub fn directory(&self) -> &KvDirectory {
         &self.dir
+    }
+
+    /// The directory entry holding L0 block `block`, if it is keyed.
+    pub fn l0_entry(&self, block: BlockId) -> Option<&KvBlock> {
+        self.l0_keys.get(&block).and_then(|k| self.dir.get(k))
     }
 
     pub fn transfer(&self) -> &TransferEngine {
@@ -609,12 +685,17 @@ impl KvHierarchy {
                     priority: KvPriority::from_class(req.priority.class()),
                     keys: Vec::new(),
                     committed: 0,
+                    lineage: Lineage::Exact,
+                    used: Vec::new(),
+                    lossy_from: None,
                 },
             );
         }
+        let allow_lossy = req.allow_lossy.unwrap_or(self.cfg.allow_lossy);
         let hasher = Blake3Hasher(self.namespaces.get(req.cache_salt));
         let m = if self.cfg.prefix_sharing {
-            self.dir.lookup(&hasher, req.prompt, bt, now)
+            self.dir
+                .lookup(&hasher, req.prompt, bt, now, allow_lossy, self.lossy_seed)
         } else {
             PrefixMatch {
                 keys: prefix_keys(&hasher, req.prompt, bt),
@@ -630,9 +711,6 @@ impl KvHierarchy {
         {
             return AttachOutcome::WaitForPrefix;
         }
-        if let Some(r) = self.requests.get_mut(&req.request) {
-            r.keys = m.keys.clone();
-        }
         self.metrics.record_lookup(&m);
         for b in &m.blocks {
             self.stats.lookups[Self::lookup_slot(b.tier)] += 1;
@@ -640,6 +718,16 @@ impl KvHierarchy {
         self.stats.lookups[3] += (m.keys.len() - m.blocks.len()) as u64;
 
         let tiers: Vec<TierId> = m.blocks.iter().map(|b| b.tier).collect();
+        let penalties: Vec<Option<f64>> = m
+            .blocks
+            .iter()
+            .map(|b| b.lossy.map(|f| self.cfg.penalty_of(f)))
+            .collect();
+        let copy_bytes: Vec<u64> = m
+            .blocks
+            .iter()
+            .map(|b| self.format_bytes(b.location.format))
+            .collect();
         let inputs = PlanInputs {
             matched: &tiers,
             prompt_tokens: req.prompt.len() as u32,
@@ -657,6 +745,9 @@ impl KvHierarchy {
             l0_state: self.l0_state,
             l1_degraded: self.l1.as_ref().is_some_and(|t| t.degraded()),
             l2_degraded: self.l2.as_ref().is_some_and(|t| t.degraded()),
+            copy_bytes: &copy_bytes,
+            lossy_penalty: &penalties,
+            allow_lossy,
         };
         let mut plan = plan_prefix(&inputs);
         let k = plan.cutoff_blocks() as usize;
@@ -693,6 +784,9 @@ impl KvHierarchy {
                     .expect("a matched block has a copy in its tier");
                 match self.transfer.submit(tr) {
                     Ok(t) => {
+                        if let Some(target) = self.lossy_target(&mb.key, mb.location) {
+                            self.lossy_targets.insert(t.id, target);
+                        }
                         self.promotions_by_ticket
                             .insert(t.id, (req.request, ids[0]));
                         promotions.push(ids[0]);
@@ -719,11 +813,41 @@ impl KvHierarchy {
             pool.release(&unused);
             plan = truncated_plan(&tiers[..cut], req.prompt.len() as u32, bt, plan.reason);
         }
+        // The keys and lineage of the blocks this request computes (P6b S-3): a lossy chain
+        // once a block before the cut is served lossy.
+        let (keys, lineage) = m.keys_for(cut);
+        let keys = keys.to_vec();
         // Blocks this request will compute are pending, so an identical concurrent prefix waits.
-        for key in m.keys.iter().skip(m.blocks.len()) {
+        for key in keys.iter().skip(m.blocks.len()) {
             self.dir.register_pending(*key, now);
         }
+        let lossy: Vec<bool> = m.blocks[..cut].iter().map(|b| b.lossy.is_some()).collect();
+        let used: Vec<KvKey> = m.blocks[..cut]
+            .iter()
+            .map(|b| {
+                self.lossy_target(&b.key, b.location)
+                    .map_or(b.key, |(k, _)| k)
+            })
+            .collect();
         let cached_tokens = blocks.len() as u32 * bt;
+        let lossy_tokens = lossy.iter().filter(|l| **l).count() as u32 * bt;
+        self.metrics
+            .lossy_cached_tokens
+            .inc_by(u64::from(lossy_tokens));
+        if m.denied {
+            self.metrics.lossy_denied.inc();
+        }
+        if lossy_tokens > 0 || m.denied {
+            let mut formats: Vec<&str> = m.blocks[..cut].iter().filter_map(|b| b.lossy).collect();
+            formats.dedup();
+            tracing::debug!(
+                event = "kv_lossy_reuse",
+                request_id = ?req.request,
+                lossy_tokens,
+                formats = ?formats,
+                denied = m.denied,
+            );
+        }
         self.metrics.plan(plan.reason, plan.recompute_tokens);
         self.metrics.prompt_tokens.inc_by(req.prompt.len() as u64);
         self.metrics
@@ -744,18 +868,70 @@ impl KvHierarchy {
         );
         if let Some(r) = self.requests.get_mut(&req.request) {
             r.committed = blocks.len();
+            r.lossy_from = match (lineage, m.lossy_from) {
+                (Lineage::Lossy { .. }, Some((s, _))) => Some((s, m.keys.clone())),
+                _ => None,
+            };
+            r.keys = keys;
+            r.lineage = lineage;
+            r.used = used;
         }
         let attach = PrefixAttach {
             blocks,
             cached_tokens,
+            lossy_tokens,
             plan,
         };
         if promotions.is_empty() {
             AttachOutcome::Ready(attach)
         } else {
-            self.pending
-                .insert(req.request, Pending { attach, promotions });
+            self.pending.insert(
+                req.request,
+                Pending {
+                    attach,
+                    promotions,
+                    lossy,
+                },
+            );
             AttachOutcome::Promoting
+        }
+    }
+
+    /// The lossy key and codec a copy of `key` at `loc` promoted into L0 is filed under: a
+    /// lossy-format copy of an exact block (P6b S-3); `None` otherwise (its L0 copy joins the
+    /// block's own entry).
+    fn lossy_target(&self, key: &KvKey, loc: KvLocation) -> Option<(KvKey, &'static str)> {
+        if loc.tier == TierId::L0 {
+            return None;
+        }
+        let b = self.dir.get(key)?;
+        (b.lineage == Lineage::Exact && format_is_lossy(loc.format, &b.format.layout))
+            .then(|| (lossy_key(*key, loc.format, self.lossy_seed), loc.format))
+    }
+
+    /// The entry a lossy copy of exact block `key` promoted into L0 is filed under: `lk`,
+    /// created (lossy lineage, the block's parent) when absent. `None` when `key` is gone or
+    /// the directory is full.
+    fn lossy_entry(&mut self, key: &KvKey, lk: KvKey, format: &'static str) -> Option<KvKey> {
+        if self.dir.get(&lk).is_some() {
+            return Some(lk);
+        }
+        let src = self.dir.get(key)?;
+        let entry = KvBlock {
+            key: lk,
+            locations: SmallVec::new(),
+            access_count: 0,
+            ref_count: 0,
+            child_count: 0,
+            lineage: Lineage::Lossy { format },
+            ..src.clone()
+        };
+        match self.dir.insert(entry) {
+            Ok(()) => Some(lk),
+            Err(e) => {
+                tracing::debug!(event = "kv_commit_skipped", key = %lk, error = %e);
+                None
+            }
         }
     }
 
@@ -789,15 +965,45 @@ impl KvHierarchy {
         if start >= full {
             return;
         }
-        let (session, priority) = (r.session.clone(), r.priority);
+        let (session, priority, lineage) = (r.session.clone(), r.priority, r.lineage);
         let keys: Vec<KvKey> = r.keys[..full].to_vec();
+        // The first computed block hangs off the last attached entry (a lossy copy's entry
+        // after a lossy-promoted block); later ones off their predecessor.
+        let attached = (r.used.len(), r.used.last().copied());
         r.committed = full;
         for i in start..full {
             let (key, block) = (keys[i], table[i]);
             self.dir.clear_pending(&key);
-            if self.dir.get(&key).is_some() {
+            if let Some(b) = self.dir.get(&key) {
+                // An exact block whose every copy is lossy, recomputed by a request that did
+                // not reuse them: its exact L0 copy is published alongside (P6b S-3).
+                let publish = lineage == Lineage::Exact
+                    && b.lineage == Lineage::Exact
+                    && b.location(TierId::L0).is_none()
+                    && !b.locations.is_empty()
+                    && b.locations
+                        .iter()
+                        .all(|l| format_is_lossy(l.format, &b.format.layout))
+                    && !self.incoming(&key);
+                if publish {
+                    self.dir.add_location(
+                        &key,
+                        KvLocation {
+                            tier: TierId::L0,
+                            slot: u64::from(block.0),
+                            format: L0_FORMAT,
+                        },
+                    );
+                    pool.set_keyed(block);
+                    self.l0_keys.insert(block, key);
+                }
                 continue;
             }
+            let parent = match i.checked_sub(1) {
+                Some(p) if i == attached.0 => attached.1.or(Some(keys[p])),
+                Some(p) => Some(keys[p]),
+                None => None,
+            };
             let kv = KvBlock {
                 key,
                 model: self.model,
@@ -822,9 +1028,10 @@ impl KvHierarchy {
                 decayed_hits: 0.0,
                 decayed_at: now,
                 session: session.clone(),
-                parent: i.checked_sub(1).map(|p| keys[p]),
+                parent,
                 child_count: 0,
                 tokens: tokens[i * bt..(i + 1) * bt].into(),
+                lineage,
             };
             match self.dir.insert(kv) {
                 Ok(()) => {
@@ -846,6 +1053,7 @@ impl KvHierarchy {
         let now = self.now();
         if cancelled {
             for t in self.transfer.cancel_owner(request) {
+                self.lossy_targets.remove(&t.id);
                 if let Some((_, block)) = self.promotions_by_ticket.remove(&t.id) {
                     pool.release(&[block]);
                 }
@@ -870,7 +1078,8 @@ impl KvHierarchy {
             }
             // The sequence's last full blocks form its lossless tail (P6b S-2); its earlier
             // blocks are no longer the tail of the latest sequence holding them.
-            let committed = &r.keys[..r.committed];
+            // Directory entries, so a lossy-promoted attached block names its lossy entry.
+            let committed: Vec<KvKey> = (0..r.committed).map(|i| r.entry(i)).collect();
             let cut = committed
                 .len()
                 .saturating_sub(self.cfg.lossless_tail_blocks as usize);
@@ -883,7 +1092,7 @@ impl KvHierarchy {
                 }
             }
             if let Some(id) = r.session {
-                let keys = r.keys[..r.committed].to_vec();
+                let keys = committed;
                 if self.sessions.finish(&id, keys, now) {
                     tracing::debug!(event = "kv_session_ended", session = %id.key);
                 }
@@ -965,11 +1174,22 @@ impl KvHierarchy {
             }
             TransferPurpose::Promote | TransferPurpose::Prefetch => {
                 let block = BlockId(req.dst_slot as u32);
-                if self.dir.get(&req.key).is_some() {
+                // A lossy copy of an exact block lands under its lossy key (P6b S-3), never as
+                // an exact L0 copy of the block.
+                let key = match self.lossy_targets.remove(&ticket) {
+                    Some((lk, format)) => self.lossy_entry(&req.key, lk, format),
+                    None => self.dir.get(&req.key).map(|_| req.key),
+                };
+                if let Some(key) = key
+                    && self
+                        .dir
+                        .get(&key)
+                        .is_some_and(|b| b.location(TierId::L0).is_none())
+                {
                     pool.set_keyed(block);
-                    self.l0_keys.insert(block, req.key);
+                    self.l0_keys.insert(block, key);
                     self.dir.add_location(
-                        &req.key,
+                        &key,
                         KvLocation {
                             tier: TierId::L0,
                             slot: u64::from(block.0),
@@ -1003,6 +1223,7 @@ impl KvHierarchy {
     }
 
     fn on_copy_failed(&mut self, pool: &mut BlockPool, ticket: u64, req: &TransferRequest) {
+        self.lossy_targets.remove(&ticket);
         for t in [req.path.from(), req.path.to()] {
             if let Some(tier) = self.tier(t)
                 && tier.degraded()
@@ -1040,6 +1261,7 @@ impl KvHierarchy {
                 };
                 for t in self.transfer.cancel_owner(owner) {
                     self.promotions_by_ticket.remove(&t.id);
+                    self.lossy_targets.remove(&t.id);
                 }
                 // In-flight targets are released when their copies complete (owner cancelled).
                 let still_inflight: HashSet<BlockId> = self
@@ -1064,6 +1286,8 @@ impl KvHierarchy {
                 let bt = self.cfg.block_tokens;
                 let prompt = p.attach.cached_tokens + p.attach.plan.recompute_tokens;
                 p.attach.cached_tokens = p.attach.blocks.len() as u32 * bt;
+                p.lossy.truncate(p.attach.blocks.len());
+                p.attach.lossy_tokens = p.lossy.iter().filter(|l| **l).count() as u32 * bt;
                 p.attach.plan = KvPlan {
                     reuse_l0: p.attach.plan.reuse_l0.min(p.attach.blocks.len() as u32),
                     promote: Vec::new(),
@@ -1074,6 +1298,7 @@ impl KvHierarchy {
                     .plan(PlanReason::TierDegraded, p.attach.plan.recompute_tokens);
                 if let Some(r) = self.requests.get_mut(&owner) {
                     r.committed = p.attach.blocks.len();
+                    r.truncate_attached(p.attach.blocks.len());
                 }
                 self.ready.push((owner, p.attach));
             }
@@ -1712,7 +1937,8 @@ impl KvHierarchy {
                 break;
             }
             let Some(from) = b.fastest() else { break };
-            let src_slot = b.location(from).expect("the fastest tier has a copy").slot;
+            let loc = b.location(from).expect("the fastest tier has a copy");
+            let (src_slot, target) = (loc.slot, self.lossy_target(key, loc));
             let Ok(ids) = pool.allocate(1) else { break };
             let req = self
                 .copy_request(
@@ -1726,6 +1952,9 @@ impl KvHierarchy {
                 .expect("the fastest tier has a copy");
             match self.transfer.submit(req) {
                 Ok(t) => {
+                    if let Some(target) = target {
+                        self.lossy_targets.insert(t.id, target);
+                    }
                     self.prefetch_inflight.insert(t.id, ids[0]);
                     acc.blocks_queued += 1;
                 }
@@ -1977,6 +2206,7 @@ pub(crate) mod tests {
             cache_salt: "",
             session: None,
             priority: Priority(0),
+            allow_lossy: None,
         };
         r.h.attach_prefix(&mut r.pool, &req)
     }
@@ -2209,6 +2439,7 @@ pub(crate) mod tests {
             cache_salt: "",
             session: Some(&hints),
             priority: Priority(0),
+            allow_lossy: None,
         };
         let a = match r.h.attach_prefix(&mut r.pool, &req) {
             AttachOutcome::Ready(a) => a,
@@ -2251,6 +2482,42 @@ pub(crate) mod tests {
             r.pool.used_blocks(),
             0,
             "pressure empties L0 of unreferenced blocks"
+        );
+    }
+
+    /// The Task 4 kv-sim regression (MultiTurn lru 251 → 199 s, cost_aware/lru 0.78 → 0.93):
+    /// the P6b S-3 publish rule ("an exact entry whose every copy is lossy") also fired for an
+    /// entry with *no* copy — a parent kept only by its children — so with L0-format tiers a
+    /// recomputed parent was re-keyed where the Phase 4 hierarchy leaves it unkeyed. Catches
+    /// `commit_progress` adding a copy to an existing entry that holds no lossy copy.
+    #[test]
+    fn commit_leaves_a_copyless_parent_unkeyed() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let mut r = rig(8, None, None, clock);
+        let prompt: Vec<u32> = (0..66).collect();
+        run(&mut r, &prompt);
+        let hasher = Blake3Hasher(r.h.namespaces.get(""));
+        let keys = prefix_keys(&hasher, &prompt, 16);
+        // Block 0 loses its only copy; its entry stays for its child.
+        r.h.remove_copy(&mut r.pool, &keys[0], TierId::L0, EvictReason::Capacity);
+        let parent = r.h.directory().get(&keys[0]).expect("kept for its child");
+        assert!(parent.locations.is_empty());
+
+        let again = run(&mut r, &prompt);
+        assert_eq!(again.cached_tokens, 0, "the prefix misses at block 0");
+        let parent =
+            r.h.directory()
+                .get(&keys[0])
+                .expect("still kept for its child");
+        assert!(
+            parent.locations.is_empty(),
+            "the recomputed block was filed under a copyless exact entry: {:?}",
+            parent.locations
+        );
+        assert_eq!(
+            r.h.l0_keys.len(),
+            3,
+            "only the first run's blocks 1-3 are keyed"
         );
     }
 }
