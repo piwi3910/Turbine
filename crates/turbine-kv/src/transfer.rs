@@ -412,7 +412,8 @@ impl TransferEngine {
 
 /// Virtual-time backend for tests and `turbine-bench kv-sim`: a copy completes once
 /// latency + bytes / bandwidth of its path has passed on the clock, then moves the block between
-/// the host tiers with get/put. L0, and any host tier not given to the simulator, holds no
+/// the host tiers with get/put, and reports that modelled time as its duration (`took`), not
+/// the time until the poll that sees it done. L0, and any host tier not given to the simulator, holds no
 /// bytes: a copy out of it reads zeros and a copy into it lands in `dst_slot`.
 pub struct SimTransferBackend {
     clock: Arc<dyn Clock>,
@@ -423,7 +424,10 @@ pub struct SimTransferBackend {
     /// False when built with `block_bytes` 0: the tiers are payload-free and copies move no
     /// bytes (a payload-free `MemTier` accounts the logical size `put_as` names).
     payload: bool,
-    due: HashMap<u64, Duration>,
+    /// Per ticket: when the copy completes and how long it takes.
+    due: HashMap<u64, (Duration, Duration)>,
+    /// Durations of copies `poll` just completed, until `took` reads them.
+    took: HashMap<u64, Duration>,
     fail_next: u32,
 }
 
@@ -442,6 +446,7 @@ impl SimTransferBackend {
             scratch: Vec::with_capacity(block_bytes),
             payload: block_bytes > 0,
             due: HashMap::new(),
+            took: HashMap::new(),
             fail_next: 0,
         }
     }
@@ -504,13 +509,13 @@ impl SimTransferBackend {
 impl TransferBackend for SimTransferBackend {
     fn start(&mut self, t: &TransferTicket) -> Result<(), TierError> {
         let secs = self.costs[t.req.path.index()].block_seconds(t.req.bytes);
-        let due = self.clock.now_mono() + Duration::from_secs_f64(secs.max(0.0));
-        self.due.insert(t.id, due);
+        let took = Duration::from_secs_f64(secs.max(0.0));
+        self.due.insert(t.id, (self.clock.now_mono() + took, took));
         Ok(())
     }
 
     fn poll(&mut self, t: &TransferTicket) -> Result<Option<TierSlot>, TierError> {
-        let due = *self.due.get(&t.id).ok_or(TierError::Missing)?;
+        let (due, took) = *self.due.get(&t.id).ok_or(TierError::Missing)?;
         if self.clock.now_mono() < due {
             return Ok(None);
         }
@@ -522,7 +527,14 @@ impl TransferBackend for SimTransferBackend {
         let mut buf = std::mem::take(&mut self.scratch);
         let result = self.move_block(&t.req, &mut buf);
         self.scratch = buf;
+        if result.is_ok() {
+            self.took.insert(t.id, took);
+        }
         result.map(Some)
+    }
+
+    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
+        self.took.remove(&t.id)
     }
 }
 
@@ -689,6 +701,39 @@ mod tests {
         }
         let est = engine.estimate(path);
         for bytes in [full, small] {
+            let (want, got) = (cost.block_seconds(bytes), est.block_seconds(bytes));
+            assert!(
+                (got - want).abs() < want * 0.05,
+                "{bytes} B: {got} s vs {want} s ({est:?})"
+            );
+        }
+    }
+
+    /// The simulator's copies are timed by the simulator, not by the poll that sees them done:
+    /// polled at 1 ms iteration boundaries, a compressed L2 → L0 copy (0.39 ms) looked like 1 ms
+    /// and an fp8 one (1.02 ms) like 2 ms, which dragged the path's per-byte rate down until a
+    /// full block priced above recomputing it (kv_sim `ladder_under_pinned_pressure`). Breaks if
+    /// `SimTransferBackend` stops reporting the copy time it models.
+    #[test]
+    fn simulated_copies_are_timed_by_the_simulator() {
+        let (fake, clock) = fake();
+        let mut engine = TransferEngine::new(GIB, 16, clock.clone());
+        let mut backend = SimTransferBackend::new(clock, None, None, 0);
+        let path = TransferPath::L2ToL0;
+        let cost = path.fallback();
+        let sizes = [1_835_008u64, 917_728, 286_720];
+        for i in 0..96u8 {
+            let bytes = sizes[i as usize % sizes.len()];
+            engine.submit(request(path, i, bytes, None)).unwrap();
+            engine.pump(&mut backend);
+            let mut done = 0;
+            while done == 0 {
+                fake.advance(Duration::from_millis(1));
+                done = engine.pump(&mut backend).len();
+            }
+        }
+        let est = engine.estimate(path);
+        for bytes in sizes {
             let (want, got) = (cost.block_seconds(bytes), est.block_seconds(bytes));
             assert!(
                 (got - want).abs() < want * 0.05,
