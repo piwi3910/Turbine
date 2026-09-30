@@ -460,3 +460,55 @@ Phase 6 line; review file (rotations 8–12; add: tiny_server harness defaults k
 gate --full, lab-test full, `TURBINE_LAB_ONE_GPU_JOB=0 scripts/lab-test.sh novanas --gpus 2 --features fault-injection
 --tier full`, golden16 per proof model, soaks, support matrix, docs; merge into local main; stop everything; final
 handoff. Go-files: none pending (spent ones removed). Mac waiter and novanas sequencers r12/r12c ended.
+
+## Rotation 13 lead (11:20 – 13:45 +04) — START HERE next
+
+State notes: `scratchpad/lead/r5-state.md` (lines "R13"). Builder rules: `lead/brief-r12-common.md` (now also: jev-triage
+before any sub-agent; procoder commit hook's local cargo allowed, delete `target/debug` after Rust commits).
+
+**User rules now binding (2026-09-30):** Claude usage is low. NO new Claude builders: Claude only for the lead and
+merge-time fixes. Everything else goes through `~/.claude/skills/external-agents/run.sh` (read its SKILL.md): pi
+(`fastllm/coder`) for mechanical work, Codex (gpt-6-astra) for judgement or code, `--write` in a dedicated worktree;
+the lead reviews, gates and commits (Codex's sandbox cannot create git's index.lock: commit for it). Their sandbox
+blocks ssh: the lead runs every lab job itself with plain Bash in the background. jev-triage only to pick codex vs pi.
+Report which agent and model did each item. No cargo on the Mac except fmt and the commit hook. cpuhost: no 8B jobs
+(no swap, 93 GB ARC, the user's apps) unless the user caps the ARC; nothing of ours is there.
+
+**Integration `phase-6a-quantization` tip 2e76974:** 2262da0 merge p6a-fp8-t15 (fp8_block supported) + 60ad853 row
+comment; 56aae0e merge p6a-mxfp4-golden (A16 fixture, df8d788, d64f0cc, trace diagnostic; mxfp4 experimental);
+5c5f69b decision mxfp4 stays experimental (A) + Phase 7 item (plan 6-8 Task 11) + fixture README p05; 3c9c512 merge
+p6a-review-fixes (12 findings of the Codex + pi/gpt-5.5 review; branch gate 489/0, lab-test quick PASS,
+`check_checkpoint` 14/14 real dirs); 2e76974 decision commit-hook cargo (B). Gate --base 96d3b76 on 5c5f69b ok 801/0.
+Review dismissals: pi P2 (YaRN max_positions = spec S-15), pi P3 (odd k refused earlier). pi on fastllm/coder gave
+nothing actionable; rerun on gpt-5.5 did.
+
+**gptq_int4 (branch p6a-gptq-numerics, worktree agent-p6a-gptq-numerics, tip 26c9f19, NOT merged):** builder
+a2b56fef ended (handoff c79df57 has every command). 26c9f19 fixture: Codex derived tolerance (tail 1.06 strict +
+batched from fp32 spread 1.0545 p16; likely 0.15/0.25), lead fixed the RoPE line and committed. `lab-bench --model
+llama-gptq-own --golden16`: golden1/16 PASS, 1266.7 tok/s, ITL p50 9.2 ms. **Running (local bg, launched 13:40):**
+chain vLLM serve → bench (`scratchpad/gptq-own/vllm-bench.json`) → `lab-serve --stop` → `overload-soak.sh novanas
+--duration 10m --model …/llama-3.2-3b-instruct-gptq-own`; log `scratchpad/gptq-own/vllm-soak.log` (lines `vllm-serve
+rc=`, `vllm-bench rc=`, `vllm-stop rc=`, `soak rc=`); verdict under that worktree's `target/soak/`. If the chain died
+with the lead's session, check `kubectl -n turbine-ci get jobs` for a leftover vLLM serve Job and stop it
+(`scripts/lab-serve.sh novanas --stop`), then rerun the missing steps. **When the soak passes:** gptq_int4 flip in
+support.rs as the LAST commit (copy the awq_int4 row's comment and test pattern; handoff c79df57 lists the tests), a
+perf-log row (1266.7 tok/s, vLLM number), labbook runs, amend spec S-11 (proof checkpoint = own llm-compressor
+checkpoint), gate, merge; delete target/debug after.
+
+**mxfp4_a4 (W4A4 8B):** reference done on novanas (orphan run, 16 lines, rope ok) at
+`/home/piwi/turbine-ci/scratch/w4a4-fixture/llama-3.1-8b-instruct-mxfp4-a4.reference.jsonl`. Spread (8 variants,
+`--act-quant mxfp4`) holds fixture.lock: waiter `scratch/w4a4-fixture/w4a4-spread-r13.sh`, log
+`w4a4-spread-r13.log`, marker `w4a4-spread: done rc=`, output `…mxfp4-a4.spread.json`, removes `dequant-bf16` on
+rc=0; first variant at p08 at 09:40Z → hours. Then: Codex derives tolerance + README (slug
+`tests/golden/llama-3.1-8b-instruct-mxfp4-a4/`, never tighter than the BF16 8B slug), lead runs `lab-bench --model
+llama8b-mxfp4-a4 --golden16`, soak, flip `mxfp4_a4` last. The first killed try showed large early prefix divergence
+(p07 prefix 4, p08 prefix 1 on bf16-sdpa-full): expect a wide tolerance or a golden question for the coordinator.
+Queue after it: record-only `mxfp4-inc-spread` (MXFP4-A16 16-prompt incremental, informational).
+
+**Remaining to close 6a:** the two items above; AGENTS.md Phase 6 line, review file (rotations 8–13; add tiny_server
+harness default kv.cpu.max_bytes 64 GiB, the r13 review round) and docs/support-matrix sweep → pi / Codex `--write`;
+Task 29 exit (`gate --full`; `lab-test --tier full`; `TURBINE_LAB_ONE_GPU_JOB=0 scripts/lab-test.sh novanas --gpus 2
+--features fault-injection --tier full`; `lab-bench --golden16` per proof model; soaks for newly supported rows;
+support matrix; docs; `docs: phase 6a exit`); merge into local main (no push); stop everything; nothing of ours on
+novanas / cpuhost, no go-files; remove `dequant-bf16` leftovers and `fixture.queue.bak-r13`; final handoff; report.
+6b stays frozen.
