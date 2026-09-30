@@ -2168,3 +2168,24 @@ time).
 **Decision (user, 2026-09-30, relayed by the coordinator): A.** The incremental spread runs as a CPU fixture job under
 `fixture.lock`, ahead of the W4A4 fixture (`/home/piwi/turbine-ci/scratch/mxfp4_inc_spread.sh`, markers
 `mxfp4-inc: p05 rc=` and `mxfp4-inc: done rc=`).
+
+## MXFP4-A16 8B: `mxfp4` status for 6a after the p05 incremental spread (2026-09-30, follows "MXFP4-A16 8B golden: one knife-edge decode position on p05")
+
+Context: decision A above ran the p05 self-spread with transformers' decode-shaped (incremental) variants on the
+dequantized MXFP4-A16 8B copy (`/home/piwi/turbine-ci/scratch/mxfp4-inc/spread-p05.json`). None flips p05 position 5:
+bf16 sdpa incremental (the reference configuration, control) 0.0000 / 0.0000, bf16 eager incremental likely 0.0520 /
+tail 0.1985, fp32 sdpa incremental 0.0407 / 0.4003, fp32 eager incremental 0.0407 / 0.4003; worst tail 0.40, no
+reference top-5 id missing, prefix 32/32 on every variant. Turbine's HIP decode misses there (likely 0.3066, tail
+6.0156, reference top-5 id 18476 missing) and Turbine's scalar CPU prefill flips the same position; the investigation
+found no kernel bug. So the miss is not explained by transformers' own spread, and by decision A `mxfp4` stays
+`experimental`.
+
+- A) `mxfp4` stays `experimental` for 6a; investigate later: Phase 7 traces Turbine's CPU path against transformers op by
+  op on p05 (e.g. where intermediates round to BF16), since the same rounding may affect other models — chosen
+- B) Investigate now, before 6a closes, and flip `mxfp4` if the cause is found and fixed
+
+**Decision (user, 2026-09-30, relayed by the coordinator): A.** The `p6a-mxfp4-golden` branch merges for its fixture
+(`tests/golden/llama-3.1-8b-instruct-mxfp4a16/`), the `dequantize_checkpoint.py` fixes (df8d788 rope_parameters, d64f0cc
+TokenizersBackend) and the `mxfp4_decode_vs_prefill_trace` diagnostic; the `mxfp4` gfx1201 Llama row stays
+`experimental`. The Phase 7 item is in `.procoder/plans/phase-6-8-expansion.md` Task 11. The full 16-prompt incremental
+run (`mxfp4-inc: done rc=`, `spread-inc.json`) is kept for the record only.

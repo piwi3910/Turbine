@@ -65,3 +65,26 @@ the batched tail (as `../llama-3.2-3b-instruct-fp8/README.md` does when the meas
 exceeds the batched floor too). Final: likely 0.15 / 0.15 batched, tail 0.90 / 0.90 batched,
 `min_prompts_passing` 14, the other keys unchanged. Re-run the spread and re-derive the bounds if
 the reference, the transformers version or the prompts change.
+
+## p05: knife-edge decode position (2026-09-30) — `mxfp4` stays `experimental`
+
+`lab-bench --model llama8b-mxfp4 --golden16` passes 15/16 prompts at c1 and c16 (identical numbers); p05 misses at one
+position: prefix 32/32, likely 0.3066 (bound 0.15), tail 6.0156 (bound 0.90), reference top-5 id 18476 missing at
+position 5. Teacher-forced prefill at that position is within bounds (tail 0.58); every execution switch off changes
+nothing; decode and prefill first differ by ≈ 1e-3 in layer-1 attention and the gap doubles per layer from layer 8
+(`mxfp4_decode_vs_prefill_trace` in `crates/turbine-model/tests/golden.rs`); Turbine's scalar CPU prefill flips the
+position too. No kernel bug was found.
+
+transformers' decode-shaped (incremental) variants on p05 do NOT flip it (`self_spread.py` with the four
+`*-incremental` variants on a reference file holding only p05, `scratch/mxfp4_inc_spread.sh`, novanas 2026-09-30):
+
+| variant                         | prefix ok | max likely | max tail | missing |
+| ------------------------------- | --------- | ---------- | -------- | ------- |
+| bf16 sdpa incremental (control) | 1/1       | 0.0000     | 0.0000   | —       |
+| bf16 eager incremental          | 1/1       | 0.0520     | 0.1985   | —       |
+| fp32 sdpa incremental           | 1/1       | 0.0407     | 0.4003   | —       |
+| fp32 eager incremental          | 1/1       | 0.0407     | 0.4003   | —       |
+
+So the tolerance above is unchanged and the `mxfp4` row stays `experimental` (user decision 2026-09-30,
+`.procoder/ask/decisions.md`). Phase 7 traces Turbine's CPU path against transformers op by op on p05 (where
+intermediates round to BF16) before the row is revisited.
