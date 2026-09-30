@@ -1327,7 +1327,7 @@ fn mxfp4_decode_vs_prefill_trace() {
         "resid_mlp",
     ];
     // Step s of (A) holds positions n_prompt + s − 1 (s ≥ 1); (B) holds them all.
-    for s in 1..=pos {
+    for (s, step) in steps.iter().enumerate().skip(1) {
         let b_row = n_prompt + s - 1;
         println!("== {id} decode step {s} (position {b_row}) A − B, per layer: max |Δ| (max ulps)");
         println!("layer {}", OPS.join(" "));
@@ -1336,7 +1336,7 @@ fn mxfp4_decode_vs_prefill_trace() {
             let cells: Vec<String> = OPS
                 .iter()
                 .map(
-                    |name| match (find(&steps[s], l, name), find(&trace_b, l, name)) {
+                    |name| match (find(step, l, name), find(&trace_b, l, name)) {
                         (Some(ta), Some(tb)) => {
                             let d = DiffStats::of(&row(&tb, b_row), &row(&ta, 0));
                             format!("{:.3e}({:.0})", d.max_abs, d.max_ulps)
