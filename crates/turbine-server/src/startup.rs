@@ -795,7 +795,7 @@ async fn serve(
                 Fatal::DeviceFatal(m) => (format!("device error: {m}"), ExitCode::DeviceFatal),
                 Fatal::RankStopped(None) => {
                     tracing::info!(event = "rank_shutdown", "the leader shut this rank down");
-                    return ExitCode::Clean;
+                    return rank_shutdown(|| backend.stop_engine(), engines, rank_workers).await;
                 }
                 Fatal::RankStopped(Some(m)) => (format!("rank stopped: {m}"), ExitCode::Startup),
             };
@@ -923,6 +923,20 @@ async fn join_engines_and_workers(
     join_engines(engines).await;
     let remaining = ENGINE_STOP_LIMIT.saturating_sub(started.elapsed());
     join_rank_workers(workers, remaining).await;
+}
+
+/// The clean exit of a rank the leader shut down (`Fatal::RankStopped(None)`): the worker
+/// rank sends that before its thread drops the prepared model, so the exit stops the engine and
+/// waits on the same bounded join as every other clean exit — returning at once would let the
+/// process exit while a worker still releases device resources (review r13 C6).
+async fn rank_shutdown(
+    stop_engine: impl FnOnce(),
+    engines: Vec<std::thread::JoinHandle<()>>,
+    workers: Vec<(u32, std::thread::JoinHandle<()>)>,
+) -> ExitCode {
+    stop_engine();
+    join_engines_and_workers(engines, workers).await;
+    ExitCode::Clean
 }
 
 async fn shutdown_signal() {
@@ -1055,5 +1069,37 @@ mod tests {
             "expected the timeout event in the log: {log}"
         );
         assert!(log.contains('7'), "expected rank 7 named in the log: {log}");
+    }
+
+    /// Review r13 C6: the clean exit of a rank the leader shut down (`RankStopped(None)`) stops
+    /// the engine and does not return before the worker-rank thread, still tearing down after
+    /// it sent the message (a 30 ms sleep stands in for dropping the prepared model), has
+    /// finished. Breaks if that exit returns `Clean` without the bounded join.
+    #[test]
+    fn rank_shutdown_joins_the_worker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread runtime");
+        let stopped = AtomicBool::new(false);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&dropped);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let code = rt.block_on(rank_shutdown(
+            || stopped.store(true, Ordering::SeqCst),
+            Vec::new(),
+            vec![(1, worker)],
+        ));
+        assert_eq!(code, ExitCode::Clean);
+        assert!(stopped.load(Ordering::SeqCst), "the engine was not stopped");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "rank_shutdown returned before the worker rank finished"
+        );
     }
 }
