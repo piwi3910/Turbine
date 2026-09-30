@@ -2189,3 +2189,18 @@ found no kernel bug. So the miss is not explained by transformers' own spread, a
 TokenizersBackend) and the `mxfp4_decode_vs_prefill_trace` diagnostic; the `mxfp4` gfx1201 Llama row stays
 `experimental`. The Phase 7 item is in `.procoder/plans/phase-6-8-expansion.md` Task 11. The full 16-prompt incremental
 run (`mxfp4-inc: done rc=`, `spread-inc.json`) is kept for the record only.
+
+## procoder commit hook: local cargo check / clippy on the Mac (2026-09-30)
+
+Context: every Rust commit in a worktree leaves a local `target/debug` (~0.5–4.6 GB): the procoder commit hook runs a
+local `cargo check` / clippy on the Mac, which breaks the rule that cargo runs only on `novanas` (`scripts/gate.sh`,
+`scripts/remote-cargo.sh`; `cargo fmt` the only local exception).
+
+- A) Find procoder's setting to skip the local Rust lint and rely on the `novanas` gate
+- B) Allow the hook's local cargo check / clippy as a second exception to the no-Mac-builds rule, and delete the
+  worktree's `target/debug` after each Rust commit — chosen
+- C) Investigate first
+
+**Decision (user, 2026-09-30, relayed by the coordinator): B.** Builds and tests still run only on `novanas`; agents
+delete any worktree `target/debug` after a Rust commit. The root `target/release` stays (the local `turbine-bench` /
+`turbine-golden` client `scripts/lab-bench.sh` uses).
