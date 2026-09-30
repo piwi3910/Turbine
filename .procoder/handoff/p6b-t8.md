@@ -1,44 +1,56 @@
 # Handoff: p6b-t8 (Phase 6b Task 8, TurboQuant GPU transcode)
 
-Branch `p6b-t8` from 0bae895 (the Task 5 kernel commit merged with `p6b-stack`). Step 1 of the task is done; steps 2
-to 4 are NOT started.
+Branch `p6b-t8` from 0bae895 (the Task 5 kernel commit merged with `p6b-stack`). Task 8 is done at the kernel level;
+the server upload of the tables is the remaining item (not part of Task 8, lead's scope note).
 
-**Checkpoint: stopped on an ABI question (below), per the task rule "no new ABI fields unless unavoidable — if
-unavoidable, stop and report first".**
+**Checkpoint: done — ready to merge into `p6b-stack`.**
 
-## Done
+## Commits
 
-- Provider evaluation, decisions entry "P6b: TurboQuant transcode — provider evaluation (kernel reuse rule)": vLLM's
-  TurboQuant is Triton / FlyDSL (Python) and a different codec (no seeded signs, no QJL, uniform V, FP16 norm); SGLang
-  has only a generic CUDA FWHT; CK has no Hadamard; llama.cpp `ggml-cuda/fwht.cu` (MIT, HIP-built) has the codec's
-  butterfly order but scales before the butterflies. Pick: own kernel `turbine_hip_tq` in `kv_transcode_tq.hip`,
-  reusing llama.cpp's wave32 shuffle-then-register FWHT pattern with the scale moved after.
+- c3839c9 `docs(decisions)`: provider evaluation "P6b: TurboQuant transcode — provider evaluation (kernel reuse
+  rule)" (vLLM Triton/FlyDSL and a different codec, SGLang generic CUDA FWHT, CK nothing; pick: own `turbine_hip_tq`
+  with llama.cpp's wave-shuffle FWHT pattern) and the first version of this handoff (stopped on the ABI question).
+- 1abac18 (lead): user decision A — `const turbine_tq_params *tq_params` at the end of `turbine_kv_transcode_desc`.
+- 2b1f46f `test(kernels)`: the ABI field and the Rust plumbing, plus the failing lab cases.
+- feb5d83 `feat(rocm): TurboQuant KV transcode`: `kernels/rocm/src/kv_transcode_tq.hip`, the `impl_table.cpp` entry,
+  CMake, the result paragraph of the decisions entry.
 
-## The ABI question
+## What was built
 
-The descriptor carries `seed` only. The codec needs, per (layer, KV head): K and V signs (integer SplitMix64 of the
-seed — the GPU can regenerate them bit-exactly), the four codebooks (plan: "codebooks and seeds passed through
-`turbine_kv_transcode_desc`") and the 128 × 128 QJL projection `S`, which `qjl.rs` generates with F64 `ln` / `cos` /
-`sin` (platform libm) and documents as "the GPU codec receives the same table from the host, never regenerates it".
-The header comment of the v2.11 group already says the TurboQuant "descriptor fields arrive with them". So a field is
-needed unless the GPU regenerates `S` (ocml vs glibc F64 transcendentals: not guaranteed equal; a 1-ulp F64 difference
-flips the F32 of `S` with probability ≈ 2⁻²⁸ per element, ≈ 3.7 M elements at the Llama shape) and hard-codes the
-codebooks.
+- Header (still minor 11): `turbine_tq_params { seed, codebooks[4], tables }` (device F32; `tables` =
+  `[layers][num_kv_heads][2·128 + 128²]`: K signs, V signs, QJL `S` row-major), trailing `tq_params` in the transcode
+  descriptor (required by TQ4/TQ2, ignored by FP8, NULL in probes). Contract §9.1 / §26 updated.
+- Rust (`turbine-kernels`), source-compatible for FP8 callers: `KvTranscodeContext` is unchanged; new
+  `KvTranscodeTables { codebooks: [TensorView; 4], tables: TensorView }` (`head_elems`) and
+  `KvTranscodeKernel::execute_with_tables(ctx, Option<&KvTranscodeTables>)` (default method: `execute` when `None`).
+  The shim refuses a TurboQuant call without tables and checks their shapes; `ffi::TqParamsDesc`; stub
+  `stub_desc_size(20)`. The cpu-reference provider ignores the tables.
+- HIP `turbine_hip_tq`: BF16 pages, head_dim 128, one workgroup per (KV head, layer, block), 32-token chunks in LDS,
+  `#pragma clang fp contract(off)`; refuses tables of another seed, unaligned tables, NULL codebooks. FP8 pages are
+  refused (the codec supports them on the CPU; not built here).
 
-- A) Append `const turbine_tq_params *tq_params` to `turbine_kv_transcode_desc` (read only for TQ4 / TQ2), with
-  `turbine_tq_params { uint64_t seed; const float *codebooks[4] /*device, 2/4/8/16 entries*/; const float *tables
-/*device F32 [layers][num_kv_heads][k_signs 128 | v_signs 128 | S 128×128]*/ }` — the same struct Task 12 appends to
-  `turbine_attention_paged_desc` (spec Interfaces line). Rust: `KvTranscodeContext.tq: Option<…>` of device slices;
-  the server uploads the tables once at startup (≈ 15 MiB Llama, ≈ 17 MiB OLMoE). Recommended: matches the codec doc,
-  the plan's "codebooks through the descriptor" and Task 12; bit-exact by construction.
-- B) No new field: signs from `seed` on the GPU, codebooks as kernel constants, `S` regenerated on the GPU in F64 (and
-  cached per seed in the library). Not bit-exact by construction, contradicts `qjl.rs`, F64 is slow on RDNA4.
-- C) As A, but `tables` holds only `S` (signs regenerated from `seed` on the GPU): 1.5 % smaller, one more place the
-  sign derivation lives.
+## Evidence
+
+- Red: `turbine-lab-test-0930193434-121fdc52` (tq4 unsupported). Green: `turbine-lab-test-0930194110-3ffc00fb` —
+  tq4 / tq2 at Llama, OLMoE and an odd shape: encode byte-exact (**0 tie bytes**, counted per field), decode bit-exact;
+  cpu provider agrees.
+- Timings (32 blocks, Llama): tq4 encode 20,473 µs, decode 8,116 µs; tq2 17,328 / 7,889 µs (FP8 2,390 / 1,555).
+- Mutation (snapshot / restore, not committed): the encode's K rotation reading the V signs → lab `kv_transcode_matches_cpu` FAILS (`tq4 llama-3.2-3b: encode differs from the codec in 14646388 bytes`, job `turbine-lab-test-0930201928-1dd65272`).
+- `scripts/gate.sh`: `gate: ok crates=all passed=857 failed=0` on both commits.
+- `scripts/lab-test.sh novanas --tier quick` (`turbine-lab-test-0930194331-114c0002`): every target passes except
+  `turbine-model --test tiny_model`, which crashes (SIGSEGV) in `hip_decode_graph_matches_eager` with hipBLASLt
+  "operation would make the legacy stream depend on a capturing blocking stream". Reproduced on this branch
+  (`turbine-lab-test-0930201409-3203b425`) **and on the base 0bae895 without any Task 8 change**
+  (`turbine-lab-test-0930201801-10529cff`), so it predates Task 8 (known intermittent in
+  `.procoder/review-2026-09-29.md`, now reproducible on the 6b stack). Not investigated further here.
 
 ## Left
 
-Steps 2 to 4 of the task once the question is answered: failing `hip_ops::kv_transcode_matches_cpu` tq4 / tq2 cases
-(Llama, OLMoE, odd shape; decode bit-exact, encode ties counted and bounded), the kernel, lab runs, timing, mutation
-check. With A or C, the header, `ffi::KvTranscodeDesc`, `KvTranscodeContext`, the shim provider's validation and the
-contract §9.1 / §26 change too (files beyond this task's list; the lead assigns them).
+1. Server: build the tables once at startup from `turbine_kv::codec::turboquant` (`hadamard::rademacher`,
+   `qjl::projection`, `codebook::codebook`, as `hip_ops::TqTables` and `kv_tq::layer_params` do) for the namespace
+   seed, upload them (≈ 15 MiB Llama, ≈ 17 MiB OLMoE per rank), and call `execute_with_tables` in `CopyStreamBackend`
+   for `tq4` / `tq2` tiers; then the support-matrix / `TIER_FORMAT_REFUSALS` step for `tq4` / `tq2` on `amd`.
+2. The `tiny_model` hipBLASLt capture SIGSEGV on the 6b stack (pre-existing; needs an owner).
+3. Encode speed: 0.64 ms a block bounds demotion (≈ 4× the link time of the coded bytes); optimise the F64 norm loops
+   and the `S · r` products if Task 9's lab proof shows demotion lagging.
+4. FP8 L0 pages under a TurboQuant lower tier are refused by `turbine_hip_tq` (`supports` false).
