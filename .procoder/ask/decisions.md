@@ -2345,3 +2345,17 @@ roughly with the lower tier's compression, so a set threshold drops more blocks 
 - B) Make it relative (e.g. to the block's value at L0 format) as a later task
 
 **Decision (user, 2026-09-30): A.**
+
+## 6b: production KV copy backends time copies to the polling boundary (2026-09-30)
+
+Found by the t4+t15 builder (181c156): the simulator's ladder loss was copy timing rounded up to the next poll
+(compressed copies 2–2.6× slower than modelled, so the planner recomputed instead of retrieving). The sim now times
+its own copies. `IoPoolBackend` and `CopyStreamBackend` (`crates/turbine-server/src/kv_orchestrator.rs`) still time a
+copy to the engine iteration that polls it: the same bias at decode-step granularity, so lossy tiers look slower
+than they are on the server.
+
+- A) The backends time their own copies (start to completion, as `tp_tiers.rs` already does)
+- B) The estimator subtracts the poll interval
+- C) Leave it; the planner leans toward recompute
+
+**Decision (user, 2026-09-30): A.** The backends time their own copies; done by the Task 5 builder, who owns `kv_orchestrator.rs`.
