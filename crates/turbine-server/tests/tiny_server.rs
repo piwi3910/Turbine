@@ -1542,6 +1542,25 @@ fn run_failing(dir: &TempDir, yaml: &str) -> (Option<i32>, String) {
     )
 }
 
+/// Phase 4 (found by the P6b Task 6 lab test): `POST /turbine/v1/kv/prefetch` on an idle engine
+/// answers. The engine parks on its command channel when nothing runs, and the prefetch travels
+/// on the KV command channel, so without a wake it waited for the next request (the lab tests'
+/// 300 s read timeouts). Breaks if the prefetch is queued without waking the engine.
+#[test]
+fn prefetch_on_an_idle_engine_answers() {
+    let server = TinyServer::start("");
+    // Let the engine finish its warm-up turns and park.
+    std::thread::sleep(Duration::from_secs(1));
+    let resp = request_within(
+        server.addr,
+        "POST",
+        "/turbine/v1/kv/prefetch",
+        Some(&json!({"prompt": "hello there, this is a prompt"}).to_string()),
+        Duration::from_secs(10),
+    );
+    assert_eq!(resp.status, 202, "{}", resp.body);
+}
+
 /// P6b S-1 (Task 6 fix): the device staging of the KV transcode is a fixed cost in the workspace
 /// pool, counted before the KV pool is sized. With a lossy lower tier (`kv.nvme.format:
 /// fp8_e4m3` under the BF16 pages) the budget error's `workspace=` is larger than with `l0`

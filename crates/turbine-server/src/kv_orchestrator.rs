@@ -77,6 +77,7 @@ use turbine_tensor::{
     PinnedBuffer, PinnedMemory,
 };
 
+use crate::engine::EngineCommand;
 use crate::engine::tp_tiers::TierDriver;
 use crate::model::StartupError;
 
@@ -281,9 +282,19 @@ pub enum KvCommand {
 #[derive(Clone)]
 pub struct KvHandle {
     tx: mpsc::Sender<KvCommand>,
+    /// The engine's command channel: an idle engine parks on it, so a queued KV command wakes
+    /// it there (`EngineCommand::Wake`). Weak, like the pressure controller's: the handles
+    /// going away still stops the engine.
+    wake: Option<mpsc::WeakSender<EngineCommand>>,
 }
 
 impl KvHandle {
+    /// Wakes the engine thread when a command is queued for it.
+    pub fn with_wake(mut self, engine: mpsc::WeakSender<EngineCommand>) -> KvHandle {
+        self.wake = Some(engine);
+        self
+    }
+
     /// `POST /turbine/v1/kv/prefetch`. A full command channel is `QueueFull` at once: a
     /// prefetch never waits (P4 Failure modes, "prefetch overload").
     pub async fn prefetch(
@@ -297,6 +308,10 @@ impl KvHandle {
                 return Err(PrefetchRefused::Kv(PrefetchError::QueueFull));
             }
             Err(mpsc::error::TrySendError::Closed(_)) => return Err(PrefetchRefused::EngineGone),
+        }
+        if let Some(engine) = self.wake.as_ref().and_then(mpsc::WeakSender::upgrade) {
+            // A full channel wakes the engine anyway.
+            let _ = engine.try_send(EngineCommand::Wake);
         }
         match answer.await {
             Ok(r) => r.map_err(PrefetchRefused::Kv),
@@ -589,7 +604,7 @@ impl KvOrchestrator {
                 "KV tier copies are stored per tensor-parallel rank (or pipeline stage) shard"
             );
         }
-        Ok((o, KvHandle { tx }))
+        Ok((o, KvHandle { tx, wake: None }))
     }
 
     /// Runs the lower tiers' format copies (`kv.cpu.format`, `kv.nvme.format`) on the device
