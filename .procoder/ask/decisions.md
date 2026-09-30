@@ -2319,3 +2319,29 @@ uncompressed size, which overstates compressed copies. Pricing only the return t
 - C) Price only the return trip at encoded size and re-pin `per_tier_formats`
 
 **Decision (user, 2026-09-30): B.** Both terms at the encoded size, as its own task with the policy tests re-checked.
+
+## 6b: `make_room` overshoot found while landing encoded-size eviction scores (2026-09-30)
+
+Found by the t4+t15 builder while implementing the decision above (candidate patch
+`.procoder/handoff/p6b-t4t15-optionB-wip.patch` on `p6b-t4t15`). With encoded-size scores alone, `per_tier_formats`
+fails (L1 ends with 7 copies, test wants > 8). Root cause predates it: when L1 is full, `make_room` spills to L2
+without counting spills already in flight, so under RED L1 goes from full to empty in 3 steps (a Phase 4 bug the
+test passed only by where the run stopped). With the in-flight count fixed, every test passes except the S-6 AC
+"ladder recomputes fewer tokens than ladder off": off improves to 138,336, on is 140,752.
+
+- A) Land the `make_room` fix (Phase 4 behaviour change), then investigate why the ladder no longer wins before the
+  S-6 AC is judged
+- B) Land the scoring without the fix and make `per_tier_formats` check L1's peak occupancy (12) instead of its end
+  state (weaker assertion; the overshoot stays)
+
+**Decision (user, 2026-09-30): A.**
+
+## 6b: `demote_min_value` under encoded-size scores (2026-09-30)
+
+`demote_min_value` is absolute (default 0.0, inert unless set). With encoded-size scores an L0 block's value falls
+roughly with the lower tier's compression, so a set threshold drops more blocks exactly when the lower tier is cheaper.
+
+- A) Keep its meaning and document the interaction
+- B) Make it relative (e.g. to the block's value at L0 format) as a later task
+
+**Decision (user, 2026-09-30): A.**
