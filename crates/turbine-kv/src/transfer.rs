@@ -96,6 +96,12 @@ pub enum TransferPurpose {
     Demote,
     Promote,
     Prefetch,
+    /// A compression-ladder rewrite (P6b S-6): the copy in `path.from()` is re-encoded from
+    /// `codec.from` to `codec.to` and stored back in the same tier under the same key. `path`
+    /// is that tier's path to L0, the route a device transcode stages the block through; the
+    /// rewrite is not a copy between tiers, so it feeds neither the path's estimate nor its
+    /// transfer metrics.
+    Compress,
 }
 
 impl TransferPurpose {
@@ -104,6 +110,7 @@ impl TransferPurpose {
             TransferPurpose::Demote => "demote",
             TransferPurpose::Promote => "promote",
             TransferPurpose::Prefetch => "prefetch",
+            TransferPurpose::Compress => "compress",
         }
     }
 }
@@ -267,8 +274,15 @@ impl TransferEngine {
                 Err(e) => Err(e),
             };
             self.inflight_bytes -= ticket.req.bytes;
-            if let Ok((took, _)) = &result {
-                self.observe(ticket.req.path, ticket.req.bytes, *took);
+            if let Ok((took, _)) = &result
+                && ticket.req.purpose != TransferPurpose::Compress
+            {
+                // Estimates are per block at the larger end's format (the planner prices a
+                // block by its L0 bytes): a copy of a compressed block moves fewer bytes in
+                // about the same per-copy time, and must not read as a slower path.
+                let c = ticket.req.codec;
+                let logical = ticket.req.bytes.max(c.from_bytes).max(c.to_bytes);
+                self.observe(ticket.req.path, logical, *took);
             }
             let owner_cancelled = ticket
                 .req
@@ -448,7 +462,13 @@ impl SimTransferBackend {
     /// (`codec.to_bytes`, labelled `codec.to`). The simulator does not transcode: when the
     /// sizes differ, the destination holds the source bytes cut or zero-padded to its size.
     fn move_block(&self, req: &TransferRequest, buf: &mut Vec<u8>) -> Result<TierSlot, TierError> {
-        let (src, dst) = (self.tier(req.path.from()), self.tier(req.path.to()));
+        let src = self.tier(req.path.from());
+        // A ladder rewrite stores the re-encoded copy back in its own tier.
+        let dst = if req.purpose == TransferPurpose::Compress {
+            src
+        } else {
+            self.tier(req.path.to())
+        };
         if src.is_none() && dst.is_none() {
             return Ok(TierSlot(req.dst_slot));
         }
