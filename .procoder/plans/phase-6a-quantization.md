@@ -1,6 +1,6 @@
 # phase-6a-quantization — implementation plan
 
-Status: draft
+Status: complete
 Spec: .procoder/specs/phase-6a-quantization.md
 
 The user answered questions 1–20 of `.procoder/ask/decisions.md`, entry "Phase 6 spec: provisional design choices (2026-09-28)", and split Phase 6 in two (entry "Phase 6 split: 6a quantization, 6b KV compression (2026-09-28)"). This plan builds 6a: foundations (Tasks 1–4), weights (5–21), FP8 KV (22–25), YaRN (26–28), phase exit (29). `phase-6b-kv-compression` (per-tier formats, TurboQuant, the ladder) has its own plan and starts after Task 29.
