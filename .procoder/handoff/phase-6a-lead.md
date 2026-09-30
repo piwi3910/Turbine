@@ -521,3 +521,8 @@ novanas / cpuhost, no go-files; remove `dequant-bf16` leftovers and `fixture.que
 coordinator (the INT4 3B leaves the KV pool so large that admission's queue timeout sheds load before pressure
 reaches ORANGE; compare with the awq_int4 soak that passed in rotation 9). No flip until a soak passes or the
 coordinator rules.
+**Soak 2 (14:30, `…/target/soak/novanas-20260930T101457Z/`):** same single failure `reached_orange: false` (ITL p99 157
+→ 227 ms, 1289 ok, 374 `queue_timeout`, GREEN at 0 s, all other checks true) → reproducible, sent to the coordinator
+as a question. The passing fp8 / fp8_block soaks shed thousands of requests (queue_timeout 4041 / 2939, plus
+queue_full and overloaded); here only a few hundred: the overload never builds KV pressure (calibration 4R = 1.99
+req/s for gptq-own — compare the fp8 soaks' calibration rate in their logs first). No flip until the coordinator rules.
