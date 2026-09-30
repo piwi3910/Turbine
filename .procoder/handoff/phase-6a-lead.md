@@ -415,3 +415,48 @@ unsupported on amd" line stale; review file (rotations 8–11); core pinning in 
 
 **Builders running:** a25695ab898be5398 (GPTQ calib fix). fp8_block builder a156d1c78ad466746 finishing its gate/handoff —
 retire it (don't resume). One slot free.
+
+## Rotation 12 lead (02:50 – 11:30 +04) — START HERE next
+
+State notes: `scratchpad/lead/r5-state.md` (lines "R12"). Check: `scratchpad/lead/r6-check.sh` + `lead/r12-extra.sh`
+(`( cat lead/r6-check.sh; cat lead/r12-extra.sh ) | ssh novanas 'bash -s'`). Builder rules: every brief points to
+`lead/brief-r12-common.md` (includes NO local cargo on the Mac — a builder breached it; its target/ and every worktree's
+target/debug were deleted). Briefs this rotation: `lead/brief-r12-*.md`.
+
+**Integration** `phase-6a-quantization` tip 96d3b76: 0f3b312 merge p6a-followups (d2033fd TP worker-thread join, 10 s
+shared budget, `tp_worker_join_timeout`; e5c28fa INFO `event="rope_config"` + `status.model.rope`, config.rs RopeSummary
+reviewed OK; gate 800/0 on base aecb157), 96d3b76 decision MXFP4 p05 (option A).
+
+**Done / verdicts:**
+- fp8_block soak PASS 8/8 (`scratchpad/fp8block-soak/novanas-20260929T224540Z/`). fp8_block self-spread (all 8 variants)
+  rc=0 after a relaunch (its script had a Mac log path): max likely 0.1829, tail 0.3107.
+- r12gpu chain on 0f3b312: lab-test --tier quick PASS; `BENCH r12-yarn16` golden1/16 PASS 845.8 tok/s; `BENCH r12-llama`
+  golden1/16 PASS 854.2 tok/s (labbook recorded); **Task 21 two-GPU leg tp2-novanas PASS**. T28a leftovers closed.
+- GPTQ own checkpoint (calib3 rc=0 after two ROCm-Triton fixes 1608189 / 2c3fbb7): Turbine 988/1319 = 0.7491, drop 0.0311
+  ≤ 0.04 PASS; vLLM same checkpoint 0.7491; AutoRound2 0.7566 (drop 0.0235, data point only).
+- Disk: 13 merged worktrees removed, lab-prune 94 GB → novanas ~165–178 GB free.
+- MXFP4-A16 8B golden (fixture cb4bd66): 15/16, p05 pos 5 decode-only knife edge (likely 0.3066, tail 6.0156), no
+  kernel bug (investigation b62373f/579f746/9a35f21). User decision A: incremental spread. **p05-only result is in:
+  transformers' incremental variants do NOT flip p05** (bf16-eager-inc likely 0.0520 tail 0.1985; fp32 sdpa/eager-inc
+  0.0407 / 0.4003; no missing). Per the decision: mxfp4 stays experimental, numbers go to the coordinator (sent with this
+  handoff). The 16-prompt incremental run continues (`scratch/mxfp4-inc/run.log`, marker `mxfp4-inc: done rc=`,
+  `spread-inc.json`) — informational now.
+
+**Builders running (2 = limit):**
+- fp8_block completion a3854f9c5d591ea48 (sonnet, `lead/brief-r12-fp8block-finish.md`, worktree agent-a4baec4689b995379,
+  p6a-fp8-t15): merge integration, fixture + tolerance, `lab-bench --model llama-fp8-block --golden16`, then "ready to
+  merge". Lead merges p6a-fp8-t15 (flip last).
+- gptq_int4 proof a2b56fef5216b94f8 (sonnet, `lead/brief-r12-gptq-proof.md`, worktree agent-p6a-gptq-numerics): eval
+  files, own-checkpoint golden fixture (8 variants, queue line `gptq-own-fixture` in novanas fixture.queue), lab-bench
+  `--model llama-gptq-own --golden16`, vLLM tok/s, soak, flip gptq_int4 last. **Lead amends spec S-11 at merge** (proof
+  checkpoint = own llm-compressor checkpoint; told the coordinator).
+
+**Next builder (brief ready, not started — slot limit):** W4A4 8B reference + spread on **cpuhost** (`lead/brief-r12-
+w4a4-cpuhost.md`; user-lent TrueNAS box, rules in the brief). The novanas W4A4 job was killed and removed from the queue.
+
+**Remaining 6a after these:** mxfp4 (coordinator answer on p05 numbers); W4A4 fixture → golden → soak → flip mxfp4_a4;
+merge p6a-mxfp4-golden (fixture cb4bd66, df8d788, d64f0cc, trace diagnostic) — mxfp4 row not flipped; AGENTS.md stale
+Phase 6 line; review file (rotations 8–12; add: tiny_server harness defaults kv.cpu.max_bytes 64 GiB); Task 29 exit:
+gate --full, lab-test full, `TURBINE_LAB_ONE_GPU_JOB=0 scripts/lab-test.sh novanas --gpus 2 --features fault-injection
+--tier full`, golden16 per proof model, soaks, support matrix, docs; merge into local main; stop everything; final
+handoff. Go-files: none pending (spent ones removed). Mac waiter and novanas sequencers r12/r12c ended.
