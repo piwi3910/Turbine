@@ -182,6 +182,18 @@ impl LabServer {
         max_tokens: u32,
         session: Option<&str>,
     ) -> IdAnswer {
+        self.complete_with_headers(prompt, max_tokens, session, &[])
+    }
+
+    /// [`LabServer::complete_with_logprobs`] with extra request headers
+    /// (`x-turbine-kv-lossy: deny`).
+    fn complete_with_headers(
+        &self,
+        prompt: Value,
+        max_tokens: u32,
+        session: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> IdAnswer {
         let mut body = json!({
             "model": SERVED_NAME,
             "prompt": prompt,
@@ -193,11 +205,12 @@ impl LabServer {
         if let Some(key) = session {
             body["prompt_cache_key"] = json!(key);
         }
-        let (status, text) = request(
+        let (status, text) = request_with(
             self.addr,
             "POST",
             "/v1/completions",
             Some(&body.to_string()),
+            headers,
         );
         assert_eq!(status, 200, "{text}");
         let v: Value = serde_json::from_str(&text).expect("JSON response");
@@ -264,12 +277,27 @@ impl Drop for LabServer {
 
 /// Sends one request with `Connection: close`; returns the status and the body.
 fn request(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    request_with(addr, method, path, body, &[])
+}
+
+/// [`request`] with extra request headers.
+fn request_with(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    headers: &[(&str, &str)],
+) -> (u16, String) {
     let mut conn = TcpStream::connect(addr).expect("connect");
     conn.set_read_timeout(Some(REQUEST_TIMEOUT)).unwrap();
     let body = body.unwrap_or("");
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     write!(
         conn,
-        "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n{extra}\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
@@ -786,9 +814,9 @@ fn nvme_round_trip_matches_cold_with(sets: &[String]) {
 /// (`POST /turbine/v1/kv/prefetch`) without a copy error or a checksum failure, and A still
 /// answers within the codec's bound of its cold run: the first tokens' logprobs within 0.3 and
 /// at least 90 % of all positions within 0.5 (the FP8 KV golden's bounds are 0.15 / 0.55).
-/// Whether a lookup then reuses the decoded lossy copies, rather than the planner recomputing
-/// a three-block prefix, is the lossy-reuse lab test's business (plan Task 6), so the answer
-/// here is checked whichever way it was computed. The `l0` default stays bit-exact
+/// The prefetched, decoded lossy copies are then the reused prefix (`cached_tokens` and
+/// `lossy_cached_tokens` > 0: the lookup takes the promoted L0 copy over the L2 one). The `l0`
+/// default stays bit-exact
 /// (`nvme_round_trip_matches_cold`).
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so, the Llama-3.2-3B weights and /home/piwi/turbine-kv"]
@@ -812,24 +840,16 @@ fn nvme_round_trip_fp8_tier() {
     prefetch_a_from_l2(&server, &a);
 
     let warm = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, None);
-    assert_eq!(warm.completion_tokens, cold.completion_tokens);
-    let diff: Vec<f64> = cold
-        .logprobs
-        .iter()
-        .zip(&warm.logprobs)
-        .map(|(c, w)| (c - w).abs())
-        .collect();
-    let head = diff.iter().take(8).cloned().fold(0.0, f64::max);
-    let within = diff.iter().filter(|d| **d <= 0.5).count() as f64 / diff.len().max(1) as f64;
-    println!(
-        "fp8 tier: worst of the first 8 |Δ logprob| {head:.3}, {within:.2} within 0.5 \
-         (cached {}, lossy cached {})",
-        warm.cached_tokens, warm.lossy_cached_tokens
-    );
-    assert!(head <= 0.3, "first tokens differ by {head}");
+    if warm.cached_tokens == 0 || warm.lossy_cached_tokens == 0 {
+        dump_kv(&server);
+    }
+    assert_within_codec_bound(&cold, &warm, "fp8 tier");
+    // The decoded lossy copies are the reused prefix, not recomputed (the lookup takes the
+    // promoted L0 copy over the L2 one): the lossless tail block comes back exact.
+    assert!(warm.cached_tokens > 0, "A reused no prefix");
     assert!(
-        within >= 0.9,
-        "only {within} of the positions are within 0.5"
+        warm.lossy_cached_tokens > 0,
+        "no reused block was served from a lossy copy: {warm:?}"
     );
     for series in [
         r#"turbine_kv_evictions_total{tier="l2",reason="checksum"}"#,
@@ -842,6 +862,124 @@ fn nvme_round_trip_fp8_tier() {
     println!(
         "nvme_round_trip_fp8_tier ok: {} promotions from L2",
         from_l2(&server)
+    );
+}
+
+/// A lossy-tier answer against the cold run (the FP8 tier's bound): the same completion length,
+/// the first 8 tokens' logprobs within 0.3 and at least 90 % of all positions within 0.5 (the
+/// FP8 KV golden's bounds are 0.15 / 0.55).
+fn assert_within_codec_bound(cold: &IdAnswer, warm: &IdAnswer, label: &str) {
+    assert_eq!(warm.completion_tokens, cold.completion_tokens);
+    let diff: Vec<f64> = cold
+        .logprobs
+        .iter()
+        .zip(&warm.logprobs)
+        .map(|(c, w)| (c - w).abs())
+        .collect();
+    let head = diff.iter().take(8).cloned().fold(0.0, f64::max);
+    let within = diff.iter().filter(|d| **d <= 0.5).count() as f64 / diff.len().max(1) as f64;
+    println!(
+        "{label}: worst of the first 8 |Δ logprob| {head:.3}, {within:.2} within 0.5 \
+         (cached {}, lossy cached {})",
+        warm.cached_tokens, warm.lossy_cached_tokens
+    );
+    assert!(head <= 0.3, "first tokens differ by {head}");
+    assert!(
+        within >= 0.9,
+        "only {within} of the positions are within 0.5"
+    );
+}
+
+/// P6b S-2 / S-3 / S-8 (plan Task 6): with `kv.cpu.format: fp8_e4m3` below the BF16 pool, blocks
+/// that capacity demotion moved to L1 are encoded; a later request for the same prompt reuses
+/// them as lossy blocks (`usage.prompt_tokens_details.lossy_cached_tokens` > 0) and answers
+/// within the FP8 tier's bound of its cold run; with `x-turbine-kv-lossy: deny` the lossy
+/// blocks are not reused and the answer equals the cold one bit for bit. Breaks if a lossy block
+/// is reused by a request that opted out, or a lossy L1 copy is never reused.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn lossy_tier_reuse() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let server = LabServer::start(
+        &model_dir,
+        &[
+            "kv.cpu.format=fp8_e4m3".to_string(),
+            "kv.cpu.max_bytes=2GiB".to_string(),
+            "kv.nvme.enabled=false".to_string(),
+        ],
+    );
+    let a = prompt(100, 350);
+    let cold = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    assert_eq!(cold.lossy_cached_tokens, 0);
+    // Filler session turns until capacity demotion has sent well over A's blocks to L1 (A is the
+    // oldest session, never touched again).
+    let to_l1 = |s: &LabServer| s.metric(r#"turbine_kv_demotions_total{from="l0",to="l1"}"#);
+    let mut filler = 0;
+    while to_l1(&server) < 40.0 {
+        filler += 1;
+        assert!(filler <= 400, "demotion to L1 never happened");
+        let key = format!("filler-{filler}");
+        server.complete_in(&prompt(1_000 + filler, 1_800), 1, Some(&key));
+    }
+    println!(
+        "{filler} filler prompts moved {} blocks to L1",
+        to_l1(&server)
+    );
+    let used = server.metric(r#"turbine_kv_bytes{tier="l1",kind="used"}"#);
+    let (_, block_bytes, _) = l0_tier(&server);
+    println!(
+        "L1 holds {used} bytes for {} demoted blocks of {block_bytes} bytes",
+        to_l1(&server)
+    );
+    assert!(
+        used < 0.75 * to_l1(&server) * block_bytes as f64,
+        "L1 holds {used} bytes: not encoded"
+    );
+
+    let warm = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, None);
+    if warm.lossy_cached_tokens == 0 {
+        dump_kv(&server);
+    }
+    assert!(
+        warm.lossy_cached_tokens > 0,
+        "no reused block was served from a lossy copy: {warm:?}"
+    );
+    assert_within_codec_bound(&cold, &warm, "lossy L1 reuse");
+    assert_eq!(
+        server.metric(r#"turbine_kv_evictions_total{tier="l1",reason="checksum"}"#),
+        0.0
+    );
+
+    let denied = server.complete_with_headers(
+        json!(a),
+        ANSWER_TOKENS,
+        None,
+        &[("x-turbine-kv-lossy", "deny")],
+    );
+    println!(
+        "deny: cached {} lossy cached {}",
+        denied.cached_tokens, denied.lossy_cached_tokens
+    );
+    assert_eq!(
+        denied.lossy_cached_tokens, 0,
+        "a denied request reused lossy"
+    );
+    assert_eq!(
+        denied.output(),
+        cold.output(),
+        "x-turbine-kv-lossy: deny must equal the cold run bit for bit"
+    );
+    assert!(
+        server.metric("turbine_kv_lossy_denied_total") >= 1.0,
+        "the denial is counted"
+    );
+    println!(
+        "lossy_tier_reuse ok: lossy cached {} of {} prompt tokens",
+        warm.lossy_cached_tokens, warm.prompt_tokens
     );
 }
 

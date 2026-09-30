@@ -3173,6 +3173,69 @@ pub(crate) mod tests {
         );
     }
 
+    /// P6b Task 6: after a prefetch of a prompt whose lower-tier copies are lossy (fp8 L2), the
+    /// promoted L0 copies sit under their `lossy_key` entries and the next lookup reuses them
+    /// from L0 (the fastest lossy copy), not the exact entries' lossy L2 locations (which the
+    /// planner then priced against recompute). No exact entry gains an L0 location (S-3). Breaks
+    /// if the lookup prefers the exact entry's lossy L2 copy over the promoted L0 one.
+    #[test]
+    fn lookup_prefers_the_promoted_lossy_l0_copy() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l2 = Arc::new(MemTier::new(TierId::L2, 16 * bb, arc));
+        let mut r = rig(16, None, Some(l2.clone()), clock);
+        r.h.cfg.l2_format = "fp8_e4m3";
+        r.h.cfg.allow_lossy = true;
+        let prompt: Vec<u32> = (0..66).collect();
+        run(&mut r, &prompt);
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        for _ in 0..4 {
+            r.clock.advance(Duration::from_millis(10));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+        assert!(l2.len() >= 2, "blocks sit in L2");
+
+        let accepted =
+            r.h.prefetch(
+                &mut r.pool,
+                PrefetchTarget::Tokens {
+                    prompt: &prompt,
+                    cache_salt: "",
+                },
+            )
+            .expect("prefetch accepted");
+        assert!(accepted.blocks_queued >= 2, "{accepted:?}");
+        for _ in 0..6 {
+            r.clock.advance(Duration::from_millis(10));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+        let hasher = Blake3Hasher(r.h.namespaces.get(""));
+        for k in prefix_keys(&hasher, &prompt, 16) {
+            let exact = r.h.directory().get(&k).expect("the exact entry");
+            // (The sequence's tail stays lossless, and block 0 never left L0: exact copies.)
+            let has_fp8 = exact.locations.iter().any(|l| l.format == "fp8_e4m3");
+            assert!(
+                !has_fp8 || exact.location(TierId::L0).is_none(),
+                "a lossy L0 copy is never filed under the exact entry: {:?}",
+                exact.locations
+            );
+        }
+
+        let id = RequestId::new_v4();
+        let a = match attach(&mut r, id, &prompt) {
+            AttachOutcome::Ready(a) => a,
+            other => panic!("the promoted blocks are in L0: Ready, got {other:?}"),
+        };
+        assert_eq!(a.cached_tokens, 64, "all four blocks reused");
+        assert_eq!(
+            a.lossy_tokens, 48,
+            "the three promoted blocks are served lossy"
+        );
+        assert!(a.plan.promote.is_empty(), "no copy: {:?}", a.plan);
+        assert_eq!(a.plan.reason, PlanReason::AllL0);
+    }
+
     /// The Task 4 kv-sim regression (MultiTurn lru 251 → 199 s, cost_aware/lru 0.78 → 0.93):
     /// the P6b S-3 publish rule ("an exact entry whose every copy is lossy") also fired for an
     /// entry with *no* copy — a parent kept only by its children — so with L0-format tiers a
