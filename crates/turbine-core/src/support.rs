@@ -406,10 +406,9 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     // fp8_block (plan Task 15) proof passed 2026-09-29 (t15-proof, novanas): weight_bytes exact
     // (3,607,615,488), no fp8_block_decoded fallback, c16 1061.44 tok/s (>= 854.7 BF16 floor,
     // 1.57x the same run's vLLM-ROCm pass), GSM8K-200 drop 0.005 (<= 0.02 gate). Labbook
-    // turbine-lab-bench runs 2e31910f (turbine) / a86153ab (vllm-rocm). Flip to `supported`;
-    // still pending before this counts as fully closed: the golden fixture with
-    // --act-quant none (queued, fixture.queue rank 4), lab-bench --golden16 --c1 against it,
-    // and the soak.
+    // turbine-lab-bench runs 2e31910f (turbine) / a86153ab (vllm-rocm). Closed 2026-09-30: golden
+    // c1 / c16 16/16 against tests/golden/llama-3.2-3b-instruct-fp8-block (1062.4 tok/s) and the
+    // 10-min overload soak PASS 8/8.
     row(
         Some("amd"),
         Some("gfx1201"),
