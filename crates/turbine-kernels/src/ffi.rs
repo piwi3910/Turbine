@@ -1155,10 +1155,10 @@ mod tests {
         let pages: Vec<DeviceBuffer> = (0..cfg.layers)
             .map(|_| DeviceBuffer::alloc(&mem, page).expect("page"))
             .collect();
-        let slots: Vec<_> = pages.iter().map(DeviceBuffer::whole).collect();
+        let slots: Vec<_> = pages.iter().map(DeviceBuffer::ptr).collect();
         let slot = cfg.layers as usize * (8 + page / 2);
         let coded = DeviceBuffer::alloc(&mem, slot).expect("coded");
-        let call = |pages: &[turbine_tensor::DeviceSlice<'_>], bytes: usize| {
+        let call = |pages: &[turbine_tensor::DevicePtr], bytes: usize| {
             kernel.execute(&mut KvTranscodeContext {
                 cfg,
                 pages,

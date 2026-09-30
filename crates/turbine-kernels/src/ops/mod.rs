@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use turbine_core::types::{BlockId, DType};
-use turbine_tensor::{DeviceSlice, TensorView};
+use turbine_tensor::{DevicePtr, DeviceSlice, TensorView};
 
 use crate::KernelError;
 use crate::cards::CardProfile;
@@ -753,15 +753,17 @@ pub trait KvCodecFns: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// `pages`: `num_blocks × layers` slices, block-major (`pages[b * layers + l]` is layer `l` of
-/// block `b`), each exactly `cfg.page_bytes()` long (read when encoding, written when
-/// decoding); `coded`: `num_blocks` consecutive slots of `coded_block_bytes` (written when
-/// encoding, read when decoding); `k_scales` / `v_scales`: F32 `[layers]` scales of FP8 pages
-/// (`None` = 1.0; unused with BF16 pages); `seed`: the TurboQuant rotation seed; `codecs`: read
-/// by the CPU provider only.
+/// `pages`: `num_blocks × layers` device addresses, block-major (`pages[b * layers + l]` is
+/// layer `l` of block `b`), each the start of `cfg.page_bytes()` bytes of the same device as
+/// `coded` (read when encoding, written when decoding; like the addresses of
+/// `CopyEngine::copy_async`, the caller guarantees they address live pool pages); `coded`:
+/// `num_blocks` consecutive slots of `coded_block_bytes` (written when encoding, read when
+/// decoding); `k_scales` / `v_scales`: F32 `[layers]` scales of FP8 pages (`None` = 1.0; unused
+/// with BF16 pages); `seed`: the TurboQuant rotation seed; `codecs`: read by the CPU provider
+/// only.
 pub struct KvTranscodeContext<'a> {
     pub cfg: KvTranscodeConfig,
-    pub pages: &'a [DeviceSlice<'a>],
+    pub pages: &'a [DevicePtr],
     pub coded: DeviceSlice<'a>,
     pub coded_block_bytes: usize,
     pub seed: u64,

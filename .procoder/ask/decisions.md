@@ -2473,3 +2473,4 @@ capturing blocking stream" during decode-graph capture, then SIGSEGV. It passed 
 - B) Mark it a known failure and keep going; investigate later
 
 **Decision (user, 2026-10-01): A.** Investigated now as its own task (builder on `p6b-graph-segv`).
+

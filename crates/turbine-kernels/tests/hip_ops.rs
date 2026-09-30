@@ -5984,7 +5984,7 @@ impl KvBatch {
                 .copy_from_host(b * self.slot, bytes)
                 .expect("coded upload");
         }
-        let slices: Vec<_> = bufs.iter().map(DeviceBuffer::whole).collect();
+        let slices: Vec<_> = bufs.iter().map(DeviceBuffer::ptr).collect();
         provider
             .kv_transcode()
             .expect("the kv_transcode family")
@@ -6207,7 +6207,7 @@ fn kv_transcode_matches_cpu() {
             b
         })
         .collect();
-    let slices: Vec<_> = bufs.iter().map(DeviceBuffer::whole).collect();
+    let slices: Vec<_> = bufs.iter().map(DeviceBuffer::ptr).collect();
     let coded = DeviceBuffer::alloc(&p.hip_mem, blocks * slot).expect("coded");
     let time = |cfg: KvTranscodeConfig| {
         time_us(&p, 20, || {
@@ -6487,7 +6487,7 @@ fn tq_transcode_cases(p: &Pair, rng: &mut Rng) {
         layers: 3,
     };
     let page = DeviceBuffer::alloc(&p.hip_mem, cfg.page_bytes()).expect("page");
-    let pages = vec![page.whole(); 3];
+    let pages = vec![page.ptr(); 3];
     let slot = 3 * 2 * 20 * 144;
     let coded = DeviceBuffer::alloc(&p.hip_mem, slot).expect("coded");
     let err = kernel
@@ -6536,7 +6536,7 @@ fn tq_transcode_timing(p: &Pair, rng: &mut Rng) {
                 b
             })
             .collect();
-        let slices: Vec<_> = bufs.iter().map(DeviceBuffer::whole).collect();
+        let slices: Vec<_> = bufs.iter().map(DeviceBuffer::ptr).collect();
         let coded = DeviceBuffer::alloc(&p.hip_mem, blocks * slot).expect("coded");
         let time = |cfg: KvTranscodeConfig| {
             time_us(p, 10, || {

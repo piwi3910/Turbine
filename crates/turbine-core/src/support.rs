@@ -897,9 +897,14 @@ pub struct TierFormatRefusal {
 const TQ_TIER_REASON: &str =
     "TurboQuant lower-tier KV is not validated yet (track phase-6b-kv-compression)";
 
-/// Lower-tier formats that are not `supported`: TurboQuant is refused until its codec lands
-/// (P6b Tasks 7–9), then `experimental` until the S-8 gate passes.
+/// Lower-tier formats that are not `supported`: `fp8_e4m3` is `experimental` from the ABI v2.11
+/// transcode (P6b Task 5) until its lab proof (Task 6); TurboQuant is refused until its codec
+/// lands (P6b Tasks 7–9), then `experimental` until the S-8 gate passes.
 pub static TIER_FORMAT_REFUSALS: &[TierFormatRefusal] = &[
+    TierFormatRefusal {
+        format: "fp8_e4m3",
+        status: SupportStatus::Experimental,
+    },
     TierFormatRefusal {
         format: "tq4",
         status: unsupported(TQ_TIER_REASON),
@@ -1324,10 +1329,15 @@ mod tests {
             assert!(msg.contains("phase-6b-kv-compression"), "{msg}");
             assert!(msg.contains(&format!("tier format {format}")), "{msg}");
         }
-        for format in ["l0", "fp8_e4m3"] {
+        // `fp8_e4m3` is experimental from the ABI v2.11 transcode (P6b Task 5) until its lab
+        // proof (Task 6); `l0` is always supported.
+        for (format, want) in [
+            ("l0", SupportStatus::Supported),
+            ("fp8_e4m3", SupportStatus::Experimental),
+        ] {
             assert_eq!(
                 check_tier_format("kv.cpu.format", format).unwrap(),
-                SupportStatus::Supported,
+                want,
                 "{format}"
             );
         }

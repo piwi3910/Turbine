@@ -52,6 +52,7 @@ impl KvTranscodeKernel for CpuReference {
                 ctx.coded.len()
             )));
         }
+        let mem = ctx.coded.memory();
         let scales = |v: &Option<turbine_tensor::TensorView<'_>>| -> Result<Vec<f32>, KernelError> {
             v.as_ref().map_or(Ok(Vec::new()), load)
         };
@@ -69,7 +70,9 @@ impl KvTranscodeKernel for CpuReference {
                 KvTranscodeDirection::Encode => {
                     let mut block = Vec::with_capacity(layers * page_bytes);
                     for p in pages {
-                        block.extend(p.read_bytes()?);
+                        let mut page = vec![0u8; page_bytes];
+                        mem.copy_d2h(&mut page, *p)?;
+                        block.extend(page);
                     }
                     let mut out = vec![0u8; slot];
                     ctx.codecs
@@ -89,7 +92,7 @@ impl KvTranscodeKernel for CpuReference {
                         )
                         .map_err(fail)?;
                     for (p, bytes) in pages.iter().zip(block.chunks(page_bytes)) {
-                        p.write_bytes(bytes)?;
+                        mem.copy_h2d(*p, bytes)?;
                     }
                 }
             }
@@ -180,7 +183,7 @@ mod tests {
         let coded = DeviceBuffer::alloc(&mem, 2 * slot).unwrap();
         let provider = crate::cpu_reference_provider();
         let kernel = provider.kv_transcode().expect("cpu kv_transcode");
-        let pages: Vec<_> = src.iter().map(DeviceBuffer::whole).collect();
+        let pages: Vec<_> = src.iter().map(DeviceBuffer::ptr).collect();
         kernel
             .execute(&mut KvTranscodeContext {
                 cfg,
@@ -205,7 +208,7 @@ mod tests {
             dst_format: KvTranscodeFormat::L0,
             ..cfg
         };
-        let pages: Vec<_> = dst.iter().map(DeviceBuffer::whole).collect();
+        let pages: Vec<_> = dst.iter().map(DeviceBuffer::ptr).collect();
         kernel
             .execute(&mut KvTranscodeContext {
                 cfg: decode,

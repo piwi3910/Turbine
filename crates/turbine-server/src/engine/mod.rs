@@ -319,6 +319,19 @@ pub fn spawn(
                     }
                 };
                 let reliability = &prepared.reliability;
+                // P6b S-1: lower-tier formats are transcoded on the device when the library has
+                // the ABI v2.11 group (the cpu reference provider serves the cpu backend).
+                let (kernel, kernel_mem) = match &prepared.provider.opened.context {
+                    Some(ctx) => (
+                        turbine_kernels::shim_provider(Arc::clone(ctx)),
+                        Arc::clone(ctx) as Arc<dyn turbine_tensor::DeviceMemory>,
+                    ),
+                    None => (
+                        turbine_kernels::cpu_reference_provider(),
+                        Arc::clone(&prepared.provider.opened.mem),
+                    ),
+                };
+                kv.enable_device_transcode(&startup.kv.cfg, kernel, &kernel_mem);
                 kv.set_ladder_dwell(reliability.pressure.deescalate_dwell.0);
                 #[cfg(feature = "fault-injection")]
             let injector = reliability.fault_injection.clone().map(|cfg| {

@@ -236,14 +236,18 @@ pub struct KvFormatUnavailable {
     pub message: String,
 }
 
-/// Refuses, before binding (exit 1), the KV formats that need the optional ABI v2.10 group
-/// (P6b S-1, S-5, S-7), which no kernel provider implements yet: TurboQuant L0 pages
-/// (`kv.dtype: tq4|tq2`) on a GPU backend and the ladder's L0 step need the mixed-format paged
-/// attention
-/// (`kv_tq_unavailable`); a lower tier not stored at the L0 format and the ladder's L1/L2
-/// rungs need the KV transcode (`kv_transcode_unavailable`). Plan Tasks 5 and 12 replace these
-/// refusals with the loaded library's v2.10 check.
-pub fn kv_format_availability(cfg: &Config) -> Result<(), KvFormatUnavailable> {
+/// Refuses, before binding (exit 1), the KV formats whose kernel group the provider lacks (P6b
+/// S-1, S-5, S-7): TurboQuant L0 pages (`kv.dtype: tq4|tq2`) on a GPU backend and the ladder's
+/// L0 step need the ABI v2.10 mixed-format paged attention, which no GPU provider implements
+/// yet (`kv_tq_unavailable`; plan Task 12 replaces that refusal); a lower tier not stored at
+/// the L0 format needs the ABI v2.11 KV transcode (`kv_transcode_unavailable`). `transcode` is
+/// `library`: whether the loaded kernel library has it (`None` before the library is loaded: the
+/// transcode checks wait for the second call); the ladder's L1/L2 rungs stay refused until
+/// their rewrites run on the device transcode too.
+pub fn kv_format_availability(
+    cfg: &Config,
+    library: Option<bool>,
+) -> Result<(), KvFormatUnavailable> {
     let kv = &cfg.kv;
     let tq = |message: String| KvFormatUnavailable {
         code: "kv_tq_unavailable",
@@ -268,7 +272,7 @@ pub fn kv_format_availability(cfg: &Config) -> Result<(), KvFormatUnavailable> {
     let transcode = |what: String| KvFormatUnavailable {
         code: "kv_transcode_unavailable",
         message: format!(
-            "{what} needs the ABI v2.10 KV transcode, which no kernel provider implements yet"
+            "{what} needs the ABI v2.11 KV transcode, which the kernel library does not provide"
         ),
     };
     let l0 = kv.dtype.as_str();
@@ -278,15 +282,21 @@ pub fn kv_format_availability(cfg: &Config) -> Result<(), KvFormatUnavailable> {
         .filter(|(key, _)| *key != "kv.ladder.max_format")
     {
         // Below TurboQuant L0 pages a tier stores them as they are (`l0`): the tier codecs
-        // encode from BF16 / FP8 pages only.
-        if turbine_kv::codec::tier_rung(format, l0) != l0_rung
-            || kv.dtype.is_turboquant() && format != "l0"
+        // encode from BF16 / FP8 pages only. Any other lossier tier needs the library's
+        // transcode, once it is known.
+        if kv.dtype.is_turboquant() && format != "l0"
+            || library == Some(false) && turbine_kv::codec::tier_rung(format, l0) != l0_rung
         {
             return Err(transcode(format!("{key} {format}")));
         }
     }
     if kv.ladder.enabled {
-        return Err(transcode("kv.ladder.enabled".to_string()));
+        return Err(KvFormatUnavailable {
+            code: "kv_transcode_unavailable",
+            message: "kv.ladder.enabled: the ladder's L1/L2 rewrites are not wired to the device \
+                      transcode yet"
+                .to_string(),
+        });
     }
     Ok(())
 }
@@ -500,7 +510,7 @@ mod tests {
             tier_formats(&cfg).unwrap(),
             vec![("kv.cpu.format", "l0", SupportStatus::Supported)]
         );
-        assert_eq!(kv_format_availability(&cfg), Ok(()));
+        assert_eq!(kv_format_availability(&cfg, None), Ok(()));
         assert_eq!(lossy_penalty(&cfg, "tq4"), 0.5);
         assert_eq!(lossy_penalty(&cfg, "l0"), 0.0);
         let mut over = config("hip", llama.path());
@@ -547,15 +557,19 @@ mod tests {
         fp8.kv.cpu.format = name("fp8_e4m3");
         assert_eq!(
             tier_formats(&fp8).unwrap(),
-            vec![("kv.cpu.format", "fp8_e4m3", SupportStatus::Supported)]
+            vec![("kv.cpu.format", "fp8_e4m3", SupportStatus::Experimental)]
         );
         assert!(before_discovery(&fp8).is_ok());
-        let err = kv_format_availability(&fp8).unwrap_err();
+        // Before the library is loaded nothing is known; a library with the v2.11 transcode
+        // (or the cpu reference) accepts it, one without refuses it.
+        assert_eq!(kv_format_availability(&fp8, None), Ok(()));
+        assert_eq!(kv_format_availability(&fp8, Some(true)), Ok(()));
+        let err = kv_format_availability(&fp8, Some(false)).unwrap_err();
         assert_eq!(err.code, "kv_transcode_unavailable", "{err:?}");
         assert!(err.message.contains("kv.cpu.format fp8_e4m3"), "{err:?}");
         // fp8_e4m3 below an FP8 L0 is the L0 format: nothing to transcode.
         fp8.kv.dtype = KvDtypeChoice::Fp8E4m3;
-        assert_eq!(kv_format_availability(&fp8), Ok(()));
+        assert_eq!(kv_format_availability(&fp8, Some(false)), Ok(()));
 
         let mut tq = config("hip", llama.path());
         tq.kv.nvme.enabled = true;
@@ -578,12 +592,12 @@ mod tests {
         ladder.kv.ladder.max_format = name("fp8_e4m3");
         assert!(before_discovery(&ladder).is_ok());
         assert_eq!(
-            kv_format_availability(&ladder).unwrap_err().code,
+            kv_format_availability(&ladder, None).unwrap_err().code,
             "kv_tq_unavailable"
         );
         ladder.kv.ladder.l0 = false;
         assert_eq!(
-            kv_format_availability(&ladder).unwrap_err().code,
+            kv_format_availability(&ladder, None).unwrap_err().code,
             "kv_transcode_unavailable"
         );
 
@@ -593,17 +607,17 @@ mod tests {
         for dtype in [KvDtypeChoice::Tq4, KvDtypeChoice::Tq2] {
             let mut l0 = config("cpu", llama.path());
             l0.kv.dtype = dtype;
-            assert_eq!(kv_format_availability(&l0), Ok(()));
+            assert_eq!(kv_format_availability(&l0, None), Ok(()));
             assert_eq!(format_columns(&l0).1.as_str(), dtype.as_str());
             let first = before_discovery(&l0).unwrap();
             assert_eq!(first.status, SupportStatus::Experimental, "{}", first.key);
             l0.kv.cpu.format = name(dtype.as_str());
-            let err = kv_format_availability(&l0).unwrap_err();
+            let err = kv_format_availability(&l0, None).unwrap_err();
             assert_eq!(err.code, "kv_transcode_unavailable", "{err:?}");
 
             let mut hip = config("hip", llama.path());
             hip.kv.dtype = dtype;
-            let err = kv_format_availability(&hip).unwrap_err();
+            let err = kv_format_availability(&hip, None).unwrap_err();
             assert_eq!(err.code, "kv_tq_unavailable", "{err:?}");
             let err = before_discovery(&hip).unwrap_err();
             assert_eq!(err.key(), Some("kv.dtype"), "{err}");
