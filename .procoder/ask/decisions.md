@@ -2223,3 +2223,25 @@ HTTP 200 in both runs. lab-bench (512-word prompts) showed golden PASS and 1266.
 
 **Decision (user, 2026-09-30, relayed by the coordinator): A.** `gptq_int4` stays `experimental` and
 `p6a-gptq-numerics` stays unmerged until a soak passes.
+
+## gptq_int4 proof checkpoint after the long-prompt probe (2026-09-30)
+
+Context: the "find and fix first" investigation above found no Turbine fault. GPTQ and AWQ take the same prefill path
+(dequantize to BF16, hipBLASLt above M=128) with equal TTFT at 64/1000/3000/6000 words (31/104/244/431 ms against
+31/105/247/435 ms). The own llm-compressor checkpoint rarely emits EOS on long random-word prompts (3000/6000 words run
+to the 1024-token cap: e2e p50 10.5 / 15.1 s, AWQ 0.42 / 0.78 s), which cut the calibrated rate to ~0.5 req/s; its
+empty streams are a first-token EOS. vLLM-ROCm serving the same checkpoint on the same seeded prompts behaves the same
+(3000/6000 words to the cap, e2e p50 21.7 / 23.3 s; empty streams at the same request indices 3, 13, 14, 29), so it is
+the checkpoint's behaviour, not Turbine's. Data: `scratchpad/gptq-prof/` of the rotation-14 lead.
+
+- A) Add a fixed overload rate to `overload-soak.sh` and rerun the own checkpoint at AWQ's 8.85 req/s
+- B) Prove `gptq_int4` with a different GPTQ checkpoint — chosen
+- C) Re-quantize the own checkpoint with long-context calibration data
+- D) Flip now, accepting `reached_orange` false with the vLLM parity as evidence
+
+**Decision (user, 2026-09-30, relayed by the coordinator): B.** The proof checkpoint is kaitchup's AutoRound GPTQ
+(`llama-3.2-3b-instruct-autoround-gptq`, pinned e11f15d…; full GSM8K 0.7566, drop 0.0235 against the 0.04 bound; loads
+as `gptq_int4`); the shuyuej GPTQ checkpoint failed GSM8K and is not a candidate. First a long-prompt probe (64–6000
+words, EOS allowed): if it also runs to the cap, back to the user. Otherwise golden fixture, tolerance, lab-bench
+c1/c16, 10-minute soak, flip; spec S-11 names the AutoRound checkpoint as the proof and keeps the own checkpoint's
+GSM8K and vLLM-parity results as supporting data.
