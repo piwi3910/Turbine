@@ -191,6 +191,7 @@ set(TURBINE_SOURCES
   src/qgemm_fp8_block.hip
   src/quantize_act_mxfp4.hip
   src/kv_transcode.hip
+  src/kv_transcode_tq.hip
   src/impl_table.cpp)
 set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/paged_attention_splitkv.cpp
   src/rmsnorm.cpp ${FMHA_BLOBS})

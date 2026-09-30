@@ -2429,7 +2429,21 @@ matter.
 Pick: an own kernel, implementation `turbine_hip_tq` behind its own `ImplEntry`, with llama.cpp's FWHT lane pattern as
 the one reused building block. No upstream kernel implements this codec (seeded signs, Lloyd–Max codebooks on the
 √d-scaled coordinate and the paper's Gaussian QJL residual together), and the only complete TurboQuant implementation
-(vLLM) is Python and a different codec. Timing and tie counts are recorded below when the lab run lands.
+(vLLM) is Python and a different codec.
+
+Result (lab, R9700, job `turbine-lab-test-0930194110-3ffc00fb`, `hip_ops::kv_transcode_matches_cpu`): `tq4` and `tq2`
+at the Llama (4 blocks, 114,688 records), OLMoE (3 blocks, 98,304 records) and an odd shape (3 layers × 2 KV heads × 20
+tokens, 6 blocks: a chunk tail) encode byte for byte like the CPU codec — **0 tie bytes** in every case (the lab case
+counts differing bytes per record field and allows none: every step is the codec's own F32 / F64 operation in its
+order, contraction off, so no tie-breaking arises) — and decode bit for bit; the cpu-reference provider agrees on the
+odd shape. Data: seeded KV-like values with outliers, per block an all-zero vector (the `inv = 0` branch), a
+one-coordinate vector, a constant vector and a ×4096 vector; non-finite pages are outside the TurboQuant contract (a
+NaN's payload is not pinned). Timing, a 32-block demotion batch at the Llama-3.2-3B shape (448 MiB of BF16 pages):
+`tq4` encode 20,473 µs (23 GB/s of pages, 0.64 ms a block), decode 8,116 µs (58 GB/s); `tq2` encode 17,328 µs, decode
+7,889 µs (FP8 for comparison: 2,390 / 1,555 µs). A `tq4` block is 3.9 MiB coded, ≈ 0.16 ms on a 25 GB/s link, so the
+TurboQuant encode (F64 sequential norms and the 128 × 128 QJL projection per K vector), not the link, bounds a
+demotion's rate (≈ 1,500 blocks/s); decode (promotion) is ≈ 0.25 ms a block. Not optimised further here (no target in
+the spec); the headroom is in the per-thread F64 norm loops and the S · r dot products.
 
 ## 6b Task 8: TurboQuant tables through the transcode descriptor (2026-09-30)
 

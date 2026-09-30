@@ -999,10 +999,9 @@ const char *turbine_quantize_act_impl(const turbine_quantize_act_desc *d);
  * TQ4 and TQ2 are the TurboQuant codecs (slot layouts of crates/turbine-kv
  * codec/turboquant: one record per (layer, KV head, token), head_dim 128),
  * which read their rotation signs, codebooks and QJL projection from
- * tq_params (below). FP8_E4M3 encodes equal the CPU codec byte for byte;
- * TurboQuant encodes equal it except where a rotated coordinate or a
- * projection lies on a rounding tie the codec documents; decode is bit for bit
- * for every format. */
+ * tq_params (below). Encode equals the CPU codec byte for byte and decode bit
+ * for bit, for every format (TurboQuant over finite pages: a NaN's payload is
+ * not pinned). */
 #define TURBINE_KVFMT_L0 0
 #define TURBINE_KVFMT_FP8_E4M3 1
 #define TURBINE_KVFMT_TQ4 2

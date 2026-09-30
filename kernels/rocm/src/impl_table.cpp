@@ -41,7 +41,9 @@
 //                                  weights x BF16 activations; the
 //                                  MXFP4_EMULATED quantize-dequantize)
 //   kv_transcode (v2.11)         0 turbine_hip_fp8 [turbine_hip] (FP8 e4m3
-//                                  codec, BF16 pages; TurboQuant follows)
+//                                  codec, BF16 pages), 1 turbine_hip_tq
+//                                  [turbine_hip] (TurboQuant tq4 / tq2,
+//                                  BF16 pages, head_dim 128)
 #include <string>
 
 #include "kv_transcode.hpp"
@@ -280,6 +282,8 @@ const ImplEntry kQuantizeAct[] = {
 const ImplEntry kKvTranscode[] = {
     entry<Impl<turbine_kv_transcode_desc, kv_transcode_fp8_supports,
                kv_transcode_fp8_run>>("turbine_hip_fp8", kTurbine),
+    entry<Impl<turbine_kv_transcode_desc, kv_transcode_tq_supports,
+               kv_transcode_tq_run>>("turbine_hip_tq", kTurbine),
 };
 
 struct OpImpls {
