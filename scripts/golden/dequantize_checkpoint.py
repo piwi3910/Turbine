@@ -680,6 +680,22 @@ def _fix_rope_parameters(config: dict) -> None:
             config["rope_scaling"] = scaling
 
 
+def _fix_tokenizer_class(out: Path) -> None:
+    """transformers >= 5 writes `"tokenizer_class": "TokenizersBackend"` into
+    `tokenizer_config.json` (e.g. the W4A4 8B checkpoint); transformers 4.57.1 (pinned for the
+    reference generators) has no such class and refuses to load the tokenizer. The checkpoint
+    ships a `tokenizer.json`, so the equivalent 4.x class is `PreTrainedTokenizerFast`. Rewrites
+    the BF16 copy's file in place; a no-op for any other class.
+    """
+    path = out / "tokenizer_config.json"
+    if not path.is_file():
+        return
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    if cfg.get("tokenizer_class") == "TokenizersBackend":
+        cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
+        path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+
 def dequantize(
     model_dir: Path, out: Path, shard_bytes: int = 4_000_000_000, log=print
 ) -> dict:
@@ -746,6 +762,7 @@ def dequantize(
             and not f.name.endswith(".safetensors")
         ):
             shutil.copy2(f, out / f.name)
+    _fix_tokenizer_class(out)
     acts = [e.get("input_scale") for e in layers.values()]
     if pk.activation == ACT_FP8_TENSOR and any(a is None for a in acts):
         raise DequantError("static FP8 activations but a layer has no input_scale")
