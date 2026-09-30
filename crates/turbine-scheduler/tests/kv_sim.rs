@@ -908,10 +908,10 @@ const LADDER_TURNS: u32 = 10;
 /// trace, with the ladder on or off: every `arrival_every` steps a seeded session sends its next
 /// turn (its previous prompt plus 32 tokens; 48-token session bases, three bases per session
 /// taking turns, so older prefixes come back after they left L0). L1 (32 blocks) and L2 (150
-/// blocks) are too small for the workload's prefixes at the L0 format: L2 passes low water
-/// late in the YELLOW stretch, and both tiers fill under ORANGE and RED. Checks, every step, that each ladder tick
-/// window starts ≥ 50 ms after the previous one and holds at most 32 rewrites, and that no
-/// rewrite starts on a block a running request references.
+/// blocks) are too small for the workload's prefixes at the L0 format: both tiers pass low
+/// water within the YELLOW stretch, and both fill under ORANGE and RED. Checks, every step,
+/// that each ladder tick window starts ≥ 50 ms after the previous one and holds at most 32
+/// rewrites, and that no rewrite starts on a block a running request references.
 fn ladder_run(trace: &LadderTrace, enabled: bool) -> LadderRun {
     let mut kv = KvConfig::default();
     kv.ladder.enabled = enabled;
