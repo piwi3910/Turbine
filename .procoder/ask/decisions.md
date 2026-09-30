@@ -2274,3 +2274,15 @@ GSM8K drop accepted as noise). OLMoE BF16 KV golden passes at the same tip (wors
 
 **Decision (user, 2026-09-30): B.** The OLMoE FP8 KV row on gfx1201 is `experimental` for 6a; the golden miss and
 calibrated V scales for scale-less checkpoints are a Phase 7 item. Llama FP8 KV stays `supported`.
+
+## novanas ARC runner scale set oversubscribes the node CPU (2026-09-30)
+
+Context: `arc-runners/arc-azrtydxb-amd64` (not a Turbine workload) allows up to 20 runners at 2 CPU requested each (40
+CPU) on the 16-CPU novanas node, already 88 % requested; ~6 run and 14 sit Pending on `Insufficient cpu`. Deleting
+them does nothing (ARC recreates them while jobs queue).
+
+- A) Leave it; the owner of that CI changes it
+- B) Lower `maxRunners` of the scale set to 5
+- C) Lower the runner CPU request (e.g. 1) so more fit
+
+**Decision (user, 2026-09-30): B.** `maxRunners` of `arc-runners/arc-azrtydxb-amd64` set to 5.
