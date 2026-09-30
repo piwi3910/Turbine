@@ -120,13 +120,30 @@ def main():
         choices=["auto", "torch", "triton"],
         default="auto",
         help=(
-            "GPTQ block-update backend. 'auto' (default) disables llm-compressor's "
-            "fused Triton kernel on a ROCm build of torch (its extern-lib lowering "
-            "does not compile on ROCm Triton: 'Implicit conversion of CUDA "
-            "__nv_fdiv_rn device function has been dropped') and keeps it on CUDA; "
-            "'torch' / 'triton' force the eager or fused path via "
-            "LLMCOMPRESSOR_DISABLE_GPTQ_TRITON, the switch gptq_quantize.py's own "
-            "dispatch (_gptq_block_update_triton_req) already reads."
+            "GPTQ block-update AND compressed-tensors quantize/compress backend. "
+            "'auto' (default) disables every Triton kernel this run can reach on a "
+            "ROCm build of torch and keeps them on CUDA; 'torch' / 'triton' force "
+            "the eager or fused path either way. Two independent ROCm Triton "
+            "kernels are affected, both via a documented switch: (1) "
+            "llm-compressor's fused GPTQ block-update kernel "
+            "(llmcompressor.modifiers.gptq.gptq_quantize._gptq_block_update_triton, "
+            "its extern-lib lowering assumes CUDA libdevice: 'Implicit conversion "
+            "of CUDA __nv_fdiv_rn device function has been dropped'), gated by the "
+            "env var LLMCOMPRESSOR_DISABLE_GPTQ_TRITON that "
+            "_gptq_block_update_triton_req already reads; (2) compressed-tensors' "
+            "own Triton quantize kernel used at compression/save time "
+            "(compressed_tensors.quantization.lifecycle.forward_helpers."
+            "_quantize_triton, called from ModelCompressor.compress_model -> "
+            "compress_module -> compress -> quantize, same 'Implicit conversion of "
+            "CUDA __nv_rintf device function has been dropped' failure), which has "
+            "no env-var switch, so it is disabled by setting the module flag "
+            "compressed_tensors.utils.triton.HAS_TRITON = False that its own "
+            "requirement predicate (triton_req, and every ImplBackend.register "
+            "callsite that guards a Triton path: _quantize_triton, "
+            "_grid_search_mse in llmcompressor's MSE observer, and nvfp4's "
+            "cast_to_fp4 helper) reads at call time -- turning it off up front "
+            "covers all of them for this run, not only the one that has failed so "
+            "far."
         ),
     )
     a = ap.parse_args()
@@ -138,6 +155,16 @@ def main():
     gptq_backend_used = "torch_eager" if disable_triton else "triton"
     if disable_triton:
         os.environ["LLMCOMPRESSOR_DISABLE_GPTQ_TRITON"] = "1"
+        # No env-var switch exists for compressed-tensors' own Triton quantize
+        # kernel (used at ModelCompressor.compress_model time, i.e. inside
+        # model.save_pretrained(save_compressed=True)); every callsite that would
+        # otherwise dispatch to it (forward_helpers._quantize_triton,
+        # llmcompressor's MSE observer, nvfp4's cast_to_fp4) is guarded by
+        # `triton_req()`, which reads this module attribute fresh on every call,
+        # so setting it once before the model is touched disables all of them.
+        import compressed_tensors.utils.triton as _ct_triton
+
+        _ct_triton.HAS_TRITON = False
 
     recipe = build_recipe(a.damp)
     from llmcompressor import oneshot
@@ -151,6 +178,7 @@ def main():
                     "recipe": repr(recipe),
                     "oneshot": oneshot.__module__,
                     "gptq_backend": gptq_backend_used,
+                    "ct_triton": "disabled" if disable_triton else "enabled",
                     "torch_hip": torch.version.hip,
                 },
                 indent=1,
@@ -171,7 +199,7 @@ def main():
     device = torch.cuda.get_device_name(0) if gpu else "cpu"
     print(
         f"gptq_calibrate: device {device}; gptq_backend {gptq_backend_used}; "
-        f"versions {v}",
+        f"ct_triton {'disabled' if disable_triton else 'enabled'}; versions {v}",
         flush=True,
     )
 
@@ -243,6 +271,7 @@ def main():
         },
         "device": device,
         "gptq_backend": gptq_backend_used,
+        "ct_triton": "disabled" if disable_triton else "enabled",
         "versions": v,
         "seconds": round(time.time() - t0, 1),
         "finished": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

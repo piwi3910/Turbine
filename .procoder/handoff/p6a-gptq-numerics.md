@@ -117,13 +117,15 @@ Detached on novanas (REMOTE=/home/piwi/turbine-ci/remote/agent-p6a-gptq-numerics
 | `gptq-autoround.go` | AutoRound, first try: FAILED rc=2 (circuit `latency_drift`, see below) | `$REMOTE/gptq-autoround/run.log` | `gptq-autoround: done rc=2` |
 | `gptq-autoround2.go` | AutoRound rerun, full GSM8K c16 (Turbine) | `$REMOTE/gptq-autoround2/run.log` | `gptq-autoround2: done rc=` |
 | `gptq-calib.go` | llm-compressor calibration on GPU 0: FAILED rc=1, ROCm Triton compile error (see below) | `/home/piwi/turbine-ci/scratch/gptq-own/calib.log` | `gptq-calib: done rc=1` |
-| `gptq-calib2.go` | llm-compressor calibration retry, torch (non-Triton) GPTQ block-update path | `/home/piwi/turbine-ci/scratch/gptq-own/calib2.log` | `gptq-calib2: done rc=` |
+| `gptq-calib2.go` | llm-compressor calibration retry, torch (non-Triton) GPTQ block-update path: ran through all layers, then FAILED rc=1 at save/compress time on a SECOND, independent ROCm Triton kernel (see Rotation 12 below) | `/home/piwi/turbine-ci/scratch/gptq-own/calib2.log` | `gptq-calib2: done rc=1` |
+| `gptq-calib3.go` | llm-compressor calibration retry, torch GPTQ block-update AND compressed-tensors' compress-time quantize forced off Triton | `/home/piwi/turbine-ci/scratch/gptq-own/calib3.log` | `gptq-calib3: done rc=` |
 | `gptq-own.go` | own checkpoint: Turbine, then vLLM-ROCm | `$REMOTE/gptq-own/run.log` | `gptq-own: done rc=`, `gptq-own-vllm: done rc=` |
 
-Lead queue (r11): w4a4-rerun → `gptq-calib2.go` → `gptq-own.go` (after calib2 rc=0) →
-`gptq-autoround2.go` (after gptq-own-vllm, or after gptq-own fails).
+Lead queue (r11, superseded by r12c below for the calib leg): w4a4-rerun → `gptq-calib2.go` →
+`gptq-own.go` (after calib2 rc=0) → `gptq-autoround2.go` (after gptq-own-vllm, or after gptq-own
+fails).
 
-`gptq-own.go` must come after `gptq-calib2: done rc=0` (the driver refuses with rc=1 if the
+`gptq-own.go` must come after `gptq-calib3: done rc=0` (the driver refuses with rc=1 if the
 checkpoint directory has no config.json when its pass starts).
 
 ### gptq-calib rc=1 fix (rotation 11, 2026-09-30): ROCm Triton GPTQ kernel does not compile
@@ -195,3 +197,91 @@ When the markers land:
    into `tests/eval/llama-3.2-3b-instruct/README.md`; if Turbine refused it, the loader change is a
    lead-owned `handoff(<file>)` commit with a test first;
 4. delete `/home/piwi/turbine-ci/scratch/gptq-own/uv-cache` and any `*-gptq-own.tmp`.
+
+## Rotation 12: second ROCm Triton kernel, calib3 (2026-09-30, builder r12)
+
+`gptq-calib2.go` (23:24Z) ran the full calibration (all layers, GPTQ block updates on the eager
+torch path from rotation 11's fix) and then died in `model.save_pretrained(save_compressed=True)`:
+
+```
+File ".../compressed_tensors/compressors/model_compressors/model_compressor.py", compress_model
+File ".../compressed_tensors/compressors/base.py", compress_module -> compressor.compress_module
+File ".../compressed_tensors/compressors/base.py", compress_module -> cls.compress(state_dict, scheme)
+File ".../compressed_tensors/compressors/pack_quantized/base.py", compress -> quantize(...)
+File ".../compressed_tensors/quantization/lifecycle/forward.py", quantize -> _process_quantization
+  -> _process_group -> _apply_quantize_op -> _quantize
+File ".../compressed_tensors/utils/impl_backend.py", wrapper -> backend_fn(...) [ImplBackend dispatch]
+File ".../compressed_tensors/quantization/lifecycle/forward_helpers.py", _quantize_triton
+  -> _quantize_kernel[grid](...) [Triton JIT]
+RuntimeError: Implicit conversion of CUDA __nv_rintf device function has been dropped; ...
+```
+
+Kernel: `compressed_tensors.quantization.lifecycle.forward_helpers._quantize_triton`
+(compressed-tensors 0.19.0), registered as the priority-0 `ImplBackend` backend for `"_quantize"`
+via `@ImplBackend.register("_quantize", _quantize_triton_req, 0)`, dispatched from
+`PackedQuantizationCompressor.compress()`'s call to `quantize(...)` at compress/save time — exactly
+the pack-quantized path this checkpoint uses. Same ROCm-Triton AMD-backend `need_extern_lib`
+lowering issue as rotation 11's kernel, but a second, independent Triton kernel: no relation to
+`LLMCOMPRESSOR_DISABLE_GPTQ_TRITON`, which only gates llm-compressor's own GPTQ block-update
+kernel and had no effect here.
+
+Fix (checked in order per the brief):
+1. A `PackedQuantizationCompressor` / `ModelCompressor` argument or constructor switch: none
+   (`compress()` takes only `state_dict, scheme`; `compress_model` no Triton toggle).
+2. An environment variable: none. `_quantize_triton_req`'s only condition is `triton_req(x)` (plus
+   an FP8 sub-check irrelevant to our INT4 W4A16 scheme), and `triton_req()`
+   (`compressed_tensors/utils/triton.py`) reads only `HAS_TRITON` and `x.is_cuda`/`x.is_xpu` — no
+   env var anywhere in compressed-tensors 0.19.0 gates it.
+3. Minimal monkeypatch in `scripts/eval/gptq_calibrate.py`: when `--gptq-backend` resolves to
+   `torch` (the ROCm default), also `import compressed_tensors.utils.triton as ct_triton;
+   ct_triton.HAS_TRITON = False`, right after the existing `LLMCOMPRESSOR_DISABLE_GPTQ_TRITON=1`.
+   `triton_req()` is defined in that module and reads `HAS_TRITON` as its own module global at
+   *call* time, not at the import time of whoever imported the name (`forward_helpers.py`,
+   `llmcompressor/observers/mse_quant.py`, `compressed_tensors/quantization/utils/fp4_utils.py` all
+   do `from compressed_tensors.utils.triton import ... triton_req`), so setting the attribute once
+   before the model is touched disables every Triton path gated by it, not just the one that
+   failed. Algorithm unchanged (same GPTQ W4A16 sym g128 damp 0.01 recipe, same quantize/pack math,
+   eager torch instead of the fused Triton kernel at both the block-update and the compress step).
+   Recorded in `turbine_calibration.json` and `--check`'s JSON as `"ct_triton":
+   "disabled"|"enabled"`, next to `"gptq_backend"`; the device print line now reads
+   `gptq_backend <x>; ct_triton <disabled|enabled>; versions ...`.
+4. Checked the rest of the reachable save path for further Triton use: grepped every file under
+   the installed `compressed_tensors/` and `llmcompressor/` trees on novanas for
+   `HAS_TRITON`/`triton_req`/`import triton`. Three other call sites exist —
+   `compressed_tensors/quantization/utils/fp4_utils.py` (`cast_to_fp4`, NVFP4 only, not reached by
+   our INT4 recipe), `llmcompressor/observers/mse_quant.py` (`_grid_search_mse`, the MSE observer;
+   `GPTQModifier`'s default observer is minmax, not reached either) — all three are gated by the
+   same `triton_req()` predicate, so the one `HAS_TRITON = False` patch covers every one of them,
+   not only `_quantize_triton`. No further supported switch or monkeypatch is needed for a third
+   run to avoid dying the same way.
+   CPU-only smoke (not committed — scratchpad, ~1 s, GPU hidden, `taskset -c 12-15`): a tiny
+   synthetic weight (`16x128`, group 128, W4A16 sym) through
+   `PackedQuantizationCompressor.compress()` — the exact classmethod on the exact crash traceback —
+   with `compressed_tensors.utils.triton.HAS_TRITON = False`; confirmed `_quantize_triton_req(...)`
+   is `False` and `compress()` returns a finite, correctly-shaped `int32` `weight_packed`
+   (`ct_pack_smoke: ok packed_shape (16, 16) packed_dtype torch.int32`).
+5. Resume vs rerun: `gptq-calib2` crashed *inside* `model.save_pretrained` before it wrote anything
+   — GPTQ's quantized weights live only in the in-memory model object; there is no `<out>.tmp` on
+   disk to resume from (`ls /home/piwi/turbine-models/llama-3.2-3b-instruct-gptq-own*` — nothing).
+   Reran the whole calibration.
+6. Requeued: `.procoder/handoff/gptq_calib_run3.sh` (copy of `gptq_calib_run2.sh` with the
+   marker/log renamed `gptq-calib3`/`calib3.log`, go-file `gpu-queue/gptq-calib3.go`) uploaded to
+   `$REMOTE/gptq_calib_run3.sh` and started detached (`setsid nohup … </dev/null &`) on novanas;
+   past setup (dataset/uv-env reused, `--check` prints `"ct_triton": "disabled"`), waiting on
+   `gpu-queue/gptq-calib3.go`. `gptq_calib_run.sh`/`gptq_calib_run2.sh` and their logs are left
+   as-is, the historical record.
+7. Replaced the lead's sequencer: `gpu-queue-seq-r12.sh` (watching `calib2.log` for `gptq-calib2:
+   done rc=`) already exited once calib2 ended at rc=1 (it only releases `gptq-own.go` on rc=0, so
+   it logged "calib2 not ok" and stopped; confirmed not running — only `gpu-queue-seq-r11b.sh`,
+   pid 1386054, watching the separate `gptq-own` driver's log for the autoround2 release, is still
+   alive). Wrote `/home/piwi/turbine-ci/gpu-queue-seq-r12c.sh` (same shape, log
+   `gpu-queue/gpuseq-r12.log`): waits on `gptq-calib3: done rc=` in `calib3.log`, releases
+   `gptq-own.go` on `rc=0`. Started detached (pid 1679463), waiting.
+
+Nothing else in the tree changed; no code outside `scripts/eval/` and `.procoder/handoff/` was
+touched, so no `scripts/gate.sh` run is needed for this commit.
+
+Ready state: `/home/piwi/turbine-ci/gpu-queue/gptq-calib3.go` is the next go-file for the lead to
+place (bench.lock serializes it behind other GPU work; the lead releases it whenever). Once
+`gptq-calib3: done rc=0` lands, `gpu-queue-seq-r12c.sh` touches `gptq-own.go` itself — no further
+action needed to unblock the `gptq-own` driver (pid 1377410).
