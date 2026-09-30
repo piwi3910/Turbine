@@ -2005,7 +2005,6 @@ How it is built (lead's reading, provisional until 6b Task 15 lands): at YELLOW 
 
 Lead's call (same day): the as-built floor guard — at the last rung a copy is dropped only when it must leave or its tier is above high water — matches the spec's edge case ("→ evict" at the floor, the lowest tier only) and is accepted; noted in `.procoder/handoff/p6b-groundwork.md`.
 
-
 ## Keep going through crashes (2026-09-29)
 
 **Decision (user, 2026-09-29 15:25, relayed by the coordinator):** "keep going; if things crash we restart it and you continue." A novanas reboot is handled without asking: the lead requeues the detached runs from its handoff table (the scripts are idempotent) and carries on, without debugging the crash. The coordinator's heartbeat (:17 and :47) checks novanas with one ssh and `scratchpad/lead/r6-check.sh`, wakes the lead when a run finishes or the host rebooted, and starts a fresh lead from the handoff if none is alive. 6a runs to its close (collectors, the Task 14 FP8 proof, the remaining proofs, the Task 29 exit on everything runnable; the two-GPU items stay blocked on the PSU and are listed unfinished), merges into local main without a push, and 6b starts from main taking `p6b-groundwork` in, under the same rotation rules. Design questions go to the coordinator; everything else is the lead's call, recorded here and in `.procoder/review-2026-09-29.md`.
@@ -2245,3 +2244,15 @@ as `gptq_int4`); the shuyuej GPTQ checkpoint failed GSM8K and is not a candidate
 words, EOS allowed): if it also runs to the cap, back to the user. Otherwise golden fixture, tolerance, lab-bench
 c1/c16, 10-minute soak, flip; spec S-11 names the AutoRound checkpoint as the proof and keeps the own checkpoint's
 GSM8K and vLLM-parity results as supporting data.
+
+## mxfp4_a4 (W4A4, Llama-3.1-8B-Instruct Quark MXFP4 W4A4): golden tolerance after the self-spread (2026-09-30)
+
+Context: the reference (bf16, sdpa, incremental decode, activation fake-quant) and the all-8 transformers self-spread
+finished on novanas (`/home/piwi/turbine-ci/scratch/w4a4-fixture/`). transformers disagrees with itself badly under
+activation quantization: apart from the reference's own variant (16/16, 0.0), the other seven variants keep only 5–8
+of 16 prompts on an identical prefix, with worst likely |Δ logprob| 1.67–4.56 and tail 5.47–8.32 (2–8 missing
+candidates). A tolerance derived from that spread (likely ~4.6, tail ~8.3, ~5/16 prefixes) would not test anything.
+
+- A) Keep `mxfp4_a4` experimental for 6a, like `mxfp4` (Phase 7 item)
+- B) Gate it on GSM8K and throughput only, with a loose golden (informational)
+- C) Build the reference with Turbine's exact activation-quant rounding and derive the tolerance from a narrower variant set
