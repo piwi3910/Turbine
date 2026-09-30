@@ -49,7 +49,7 @@ use crate::ffi::{
     EmbeddingDesc, GemmDesc, KvTranscodeDesc, LogitsReduceDesc, MOE_ROUTE_BF16_LOGITS,
     MOE_ROUTE_RENORMALIZE, MoeExpertsDesc, MoeRouteDesc, OpTrio, QGemmDesc, QuantizeActDesc,
     RmsnormDesc, RmsnormShardedDesc, RopeDesc, RowSumsqDesc, ShimSymbols, SiluMulDesc, StagingFns,
-    TurbineCtx, TurbineEvent, TurbineGraph,
+    TqParamsDesc, TurbineCtx, TurbineEvent, TurbineGraph,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -57,12 +57,13 @@ use crate::ops::{
     ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
     EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplChoice, ImplInfo, KernelProvider,
     KvCopyConfig, KvCopyContext, KvCopyKernel, KvTranscodeConfig, KvTranscodeContext,
-    KvTranscodeDirection, KvTranscodeKernel, LogitsReduceConfig, LogitsReduceContext,
-    LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
-    MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
-    ProviderId, QGemmConfig, QGemmContext, QGemmKernel, QuantizeActConfig, QuantizeActContext,
-    QuantizeActKernel, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
-    RopeKernel, RowSumsqConfig, RowSumsqContext, ShardedNormKernel,
+    KvTranscodeDirection, KvTranscodeFormat, KvTranscodeKernel, KvTranscodeTables,
+    LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
+    MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
+    NormKernel, OpKind, PagedAttentionContext, ProviderId, QGemmConfig, QGemmContext, QGemmKernel,
+    QuantizeActConfig, QuantizeActContext, QuantizeActKernel, RmsnormShardedConfig,
+    RmsnormShardedContext, RopeConfig, RopeContext, RopeKernel, RowSumsqConfig, RowSumsqContext,
+    ShardedNormKernel,
 };
 use crate::pinned::PinnedState;
 use crate::quant::{ActQuantDesc, QuantSchemeDesc};
@@ -1617,6 +1618,7 @@ fn kv_transcode_probe(cfg: &KvTranscodeConfig) -> KvTranscodeDesc {
             KvTranscodeDirection::Encode => 0,
             KvTranscodeDirection::Decode => 1,
         }),
+        tq_params: std::ptr::null(),
     }
 }
 
@@ -2109,6 +2111,14 @@ impl KvTranscodeKernel for ShimProvider {
     }
 
     fn execute(&self, ctx: &mut KvTranscodeContext<'_>) -> Result<(), KernelError> {
+        self.execute_with_tables(ctx, None)
+    }
+
+    fn execute_with_tables(
+        &self,
+        ctx: &mut KvTranscodeContext<'_>,
+        tables: Option<&KvTranscodeTables<'_>>,
+    ) -> Result<(), KernelError> {
         let trio = self.kv_transcode_trio()?;
         let cfg = ctx.cfg;
         let probe = kv_transcode_probe(&cfg);
@@ -2156,7 +2166,45 @@ impl KvTranscodeKernel for ShimProvider {
                 }
             }
         };
+        // The TurboQuant formats read their tables through `tq_params`; FP8 takes none.
+        let turboquant = matches!(
+            cfg.codec(),
+            Some(KvTranscodeFormat::Tq4 | KvTranscodeFormat::Tq2)
+        );
+        let tq = match (turboquant, tables) {
+            (false, _) => None,
+            (true, None) => {
+                return Err(invalid(format!(
+                    "kv_transcode: {cfg} needs the TurboQuant tables (execute_with_tables)"
+                )));
+            }
+            (true, Some(t)) => {
+                let mut codebooks = [std::ptr::null::<f32>(); 4];
+                for (bits, (cb, out)) in t.codebooks.iter().zip(&mut codebooks).enumerate() {
+                    dense("codebook", cb, &[1 << (bits + 1)], DType::F32)?;
+                    *out = self.ctx.device_ptr("codebook", cb)?.cast_const().cast();
+                }
+                let heads = cfg.num_kv_heads as usize;
+                let per_head = KvTranscodeTables::head_elems(cfg.head_dim);
+                dense(
+                    "tq tables",
+                    &t.tables,
+                    &[layers * heads * per_head],
+                    DType::F32,
+                )?;
+                Some(TqParamsDesc {
+                    seed: ctx.seed,
+                    codebooks,
+                    tables: self
+                        .ctx
+                        .device_ptr("tq tables", &t.tables)?
+                        .cast_const()
+                        .cast(),
+                })
+            }
+        };
         let d = KvTranscodeDesc {
+            tq_params: tq.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
             pages: table.as_ptr(),
             k_scales: scales("k_scales", ctx.k_scales.as_ref())?,
             v_scales: scales("v_scales", ctx.v_scales.as_ref())?,
@@ -3628,6 +3676,7 @@ pub(crate) mod tests {
             size_of::<ffi::QGemmDesc>(),
             size_of::<ffi::QuantizeActDesc>(),
             size_of::<ffi::KvTranscodeDesc>(),
+            size_of::<ffi::TqParamsDesc>(),
         ];
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");

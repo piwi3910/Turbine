@@ -28,13 +28,13 @@ pub use ops::{
     EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplChoice, ImplInfo, KV_FMT_BF16,
     KV_FMT_FP8_E4M3, KV_FMT_TQ2, KV_FMT_TQ4, KernelProvider, KvCodecFns, KvCopyConfig,
     KvCopyContext, KvCopyKernel, KvTranscodeConfig, KvTranscodeContext, KvTranscodeDirection,
-    KvTranscodeFormat, KvTranscodeKernel, LogitsReduceConfig, LogitsReduceContext,
-    LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
-    MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
-    ProviderId, QGemmConfig, QGemmContext, QGemmKernel, QuantizeActConfig, QuantizeActContext,
-    QuantizeActKernel, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
-    RopeKernel, RowSumsqConfig, RowSumsqContext, RowTier, ShardedNormKernel, TqEncodeFn,
-    TqHeadTables, TqPaged, TqParams, kv_format_code,
+    KvTranscodeFormat, KvTranscodeKernel, KvTranscodeTables, LogitsReduceConfig,
+    LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel,
+    MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind,
+    PagedAttentionContext, ProviderId, QGemmConfig, QGemmContext, QGemmKernel, QuantizeActConfig,
+    QuantizeActContext, QuantizeActKernel, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig,
+    RopeContext, RopeKernel, RowSumsqConfig, RowSumsqContext, RowTier, ShardedNormKernel,
+    TqEncodeFn, TqHeadTables, TqPaged, TqParams, kv_format_code,
 };
 pub use registry::{KernelMetrics, KernelRegistry, OpConfig, OpRequirement, Selection};
 pub use shim::{

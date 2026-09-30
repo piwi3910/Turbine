@@ -6,7 +6,10 @@ use turbine_core::types::DType;
 
 use super::{CpuReference, invalid, load};
 use crate::KernelError;
-use crate::ops::{KvTranscodeConfig, KvTranscodeContext, KvTranscodeDirection, KvTranscodeKernel};
+use crate::ops::{
+    KvTranscodeConfig, KvTranscodeContext, KvTranscodeDirection, KvTranscodeKernel,
+    KvTranscodeTables,
+};
 
 impl KvTranscodeKernel for CpuReference {
     fn supports(&self, cfg: &KvTranscodeConfig) -> bool {
@@ -18,6 +21,15 @@ impl KvTranscodeKernel for CpuReference {
 
     fn implementation(&self, _cfg: &KvTranscodeConfig) -> String {
         "cpu_kv_transcode_ref".into()
+    }
+
+    /// The codec table the context carries is the whole codec: device tables add nothing.
+    fn execute_with_tables(
+        &self,
+        ctx: &mut KvTranscodeContext<'_>,
+        _tables: Option<&KvTranscodeTables<'_>>,
+    ) -> Result<(), KernelError> {
+        self.execute(ctx)
     }
 
     fn execute(&self, ctx: &mut KvTranscodeContext<'_>) -> Result<(), KernelError> {

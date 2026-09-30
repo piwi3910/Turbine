@@ -385,6 +385,16 @@ pub(crate) struct KvTranscodeDesc {
     pub page_dtype: i32,
     pub format: i32,
     pub direction: i32,
+    pub tq_params: *const TqParamsDesc,
+}
+
+/// `turbine_tq_params` (v2.11): the TurboQuant tables, device pointers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TqParamsDesc {
+    pub seed: u64,
+    pub codebooks: [*const f32; 4],
+    pub tables: *const f32,
 }
 
 /// `turbine_rmsnorm_sharded_desc` (v2.6).
@@ -948,7 +958,7 @@ mod tests {
     use crate::KernelError;
     use crate::ops::{
         KernelProvider, KvCodecFns, KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat,
-        OpKind, RopeConfig, RopeContext,
+        KvTranscodeTables, OpKind, RopeConfig, RopeContext,
     };
     use crate::registry::OpConfig;
     use crate::shim::tests::{STUB_CONTEXTS, mocked_device, stub_hook};
@@ -1167,6 +1177,48 @@ mod tests {
         assert!(err.to_string().contains("pages for 1 blocks"), "{err}");
         let err = call(&slots, slot - 1).expect_err("a partial slot");
         assert!(err.to_string().contains("whole slots"), "{err}");
-        drop((pages, coded, provider, mem, ctx));
+
+        // TurboQuant (Task 8): the tables are required, checked for shape, then passed on.
+        let tq = KvTranscodeConfig {
+            dst_format: KvTranscodeFormat::Tq4,
+            ..cfg
+        };
+        let codebooks: Vec<Tensor> = [2, 4, 8, 16]
+            .iter()
+            .map(|n| Tensor::empty(&mem, &[*n], DType::F32).expect("codebook"))
+            .collect();
+        let per_layer = cfg.num_kv_heads as usize * KvTranscodeTables::head_elems(cfg.head_dim);
+        let run_tq = |table_layers: usize, with: bool| {
+            let tables =
+                Tensor::empty(&mem, &[table_layers * per_layer], DType::F32).expect("tq tables");
+            let t = KvTranscodeTables {
+                codebooks: std::array::from_fn(|i| codebooks[i].view()),
+                tables: tables.view(),
+            };
+            kernel.execute_with_tables(
+                &mut KvTranscodeContext {
+                    cfg: tq,
+                    pages: &slots,
+                    coded: coded.slice(0, slot),
+                    coded_block_bytes: slot,
+                    seed: 7,
+                    k_scales: None,
+                    v_scales: None,
+                    codecs: &NoCodecs,
+                },
+                with.then_some(&t),
+            )
+        };
+        let layers = cfg.layers as usize;
+        let err = run_tq(layers, false).expect_err("tq4 without tables");
+        assert!(
+            err.to_string().contains("needs the TurboQuant tables"),
+            "{err}"
+        );
+        let err = run_tq(layers - 1, true).expect_err("tables one layer short");
+        assert!(err.to_string().contains("tq tables"), "{err}");
+        let err = run_tq(layers, true).expect_err("the stub kv_transcode fails");
+        assert!(err.to_string().contains("stub: kv_transcode"), "{err}");
+        drop((codebooks, pages, coded, provider, mem, ctx));
     }
 }

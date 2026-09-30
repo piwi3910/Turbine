@@ -81,7 +81,7 @@ int32_t stub_live_contexts(void) { return atomic_load(&live_contexts); }
  * attention_paged, copy_blocks, moe_route, moe_experts, then v2.1:
  * add_rmsnorm, logits_reduce, then v2.6: row_sumsq, rmsnorm_sharded, then
  * v2.7: mapped_collective, then v2.9: qgemm, quantize_act, then v2.11:
- * kv_transcode); 0 past the end. */
+ * kv_transcode, tq_params); 0 past the end. */
 size_t stub_desc_size(int32_t which) {
   switch (which) {
   case 0:
@@ -124,6 +124,8 @@ size_t stub_desc_size(int32_t which) {
     return sizeof(turbine_quantize_act_desc);
   case 19:
     return sizeof(turbine_kv_transcode_desc);
+  case 20:
+    return sizeof(turbine_tq_params);
   default:
     return 0;
   }

@@ -997,8 +997,12 @@ const char *turbine_quantize_act_impl(const turbine_quantize_act_desc *d);
  * layer's K or V of the block, an element is e4m3(x / scale), rounded to
  * nearest even and saturated to +-448, decoded as bf16(e4m3 * scale));
  * TQ4 and TQ2 are the TurboQuant codecs (slot layouts of crates/turbine-kv
- * codec/turboquant; their kernels and descriptor fields arrive with them).
- * Encode equals the CPU codec byte for byte, decode bit for bit. */
+ * codec/turboquant: one record per (layer, KV head, token), head_dim 128),
+ * which read their rotation signs, codebooks and QJL projection from
+ * tq_params (below). FP8_E4M3 encodes equal the CPU codec byte for byte;
+ * TurboQuant encodes equal it except where a rotated coordinate or a
+ * projection lies on a rounding tie the codec documents; decode is bit for bit
+ * for every format. */
 #define TURBINE_KVFMT_L0 0
 #define TURBINE_KVFMT_FP8_E4M3 1
 #define TURBINE_KVFMT_TQ4 2
@@ -1006,6 +1010,23 @@ const char *turbine_quantize_act_impl(const turbine_quantize_act_desc *d);
 #define TURBINE_KV_ENCODE 0
 #define TURBINE_KV_DECODE 1
 #define TURBINE_OP_KV_TRANSCODE 19
+
+/* The TurboQuant tables of a namespace (seed): read by the TQ4 / TQ2 KV
+ * transcode, and shared with the paged attention over TurboQuant pages. The
+ * host builds them from the codec (crates/turbine-kv codec/turboquant) and a
+ * library never regenerates them. */
+typedef struct turbine_tq_params {
+  /* the rotation seed the tables were built from */
+  uint64_t seed;
+  /* device F32 unit-variance Lloyd-Max codebooks of 1, 2, 3 and 4 bits
+   * (index bits - 1), 2, 4, 8 and 16 ascending centroids */
+  const float *codebooks[4];
+  /* device F32 [layers][num_kv_heads][2 * head_dim + head_dim * head_dim]:
+   * per (layer, KV head) the K rotation signs (+-1, head_dim), the V rotation
+   * signs, then the QJL projection S of the K residual (head_dim x head_dim,
+   * row-major) */
+  const float *tables;
+} turbine_tq_params;
 
 typedef struct turbine_kv_transcode_desc {
   /* host array [num_blocks * layers] of device addresses: entry b * layers + l
@@ -1032,6 +1053,10 @@ typedef struct turbine_kv_transcode_desc {
   int32_t format;
   /* TURBINE_KV_ENCODE or TURBINE_KV_DECODE */
   int32_t direction;
+  /* host pointer, read during the call only: the TurboQuant tables of seed,
+   * required by TQ4 / TQ2 (tables for layers x num_kv_heads) and ignored by
+   * FP8_E4M3; NULL in a _supported / _impl probe */
+  const turbine_tq_params *tq_params;
 } turbine_kv_transcode_desc;
 
 int32_t turbine_kv_transcode(turbine_ctx *ctx,

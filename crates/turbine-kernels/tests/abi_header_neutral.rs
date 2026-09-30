@@ -489,7 +489,8 @@ fn header_declares_the_v210_rope_attn_factor() {
 
 /// v2.11 (Phase 6b Task 5): the minor becomes 11; the KV transcode trio is declared with op code
 /// 19, the format codes equal `KvTranscodeFormat::abi_code` (and the 6b block format codes of
-/// `KV_FMT_*`), the direction codes are 0 and 1, and the descriptor keeps its field order.
+/// `KV_FMT_*`), the direction codes are 0 and 1, and the descriptor keeps its field order, ending
+/// with the TurboQuant tables `tq_params` (Task 8) whose struct keeps its own.
 /// Breaks if a code drifts between the header and `turbine_kernels::ops` (a library would
 /// encode with the wrong codec) or the descriptor fields move.
 #[test]
@@ -522,8 +523,10 @@ fn header_declares_the_v211_kv_transcode_group() {
     for decl in [
         "void *const *pages; const float *k_scales; const float *v_scales; void *coded; \
          int64_t coded_block_bytes; uint64_t seed; int32_t num_blocks, layers, block_tokens, \
-         num_kv_heads, head_dim; int32_t page_dtype; int32_t format; int32_t direction; } \
-         turbine_kv_transcode_desc;",
+         num_kv_heads, head_dim; int32_t page_dtype; int32_t format; int32_t direction; \
+         const turbine_tq_params *tq_params; } turbine_kv_transcode_desc;",
+        "typedef struct turbine_tq_params { uint64_t seed; const float *codebooks[4]; \
+         const float *tables; } turbine_tq_params;",
         "int32_t turbine_kv_transcode(turbine_ctx *ctx, const turbine_kv_transcode_desc *d);",
         "int32_t turbine_kv_transcode_supported(const turbine_kv_transcode_desc *d);",
         "const char *turbine_kv_transcode_impl(const turbine_kv_transcode_desc *d);",

@@ -780,6 +780,26 @@ impl KvTranscodeContext<'_> {
     }
 }
 
+/// The TurboQuant tables of a `tq4` / `tq2` transcode in device memory (ABI v2.11
+/// `turbine_tq_params`), built on the host from the codec (`turbine_kv::codec::turboquant`) for
+/// the context's seed; a library never regenerates them. `codebooks[bits − 1]`: F32 `[2^bits]`,
+/// the unit-variance Lloyd–Max centroids; `tables`: F32 `[layers, num_kv_heads, 2·head_dim +
+/// head_dim²]`, per (layer, KV head) the K signs, the V signs and the QJL projection `S`
+/// (row-major), as [`TqHeadTables`] holds them.
+#[derive(Clone, Debug)]
+pub struct KvTranscodeTables<'a> {
+    pub codebooks: [TensorView<'a>; 4],
+    pub tables: TensorView<'a>,
+}
+
+impl KvTranscodeTables<'_> {
+    /// F32 elements of one (layer, KV head)'s entry of `tables`.
+    pub fn head_elems(head_dim: u32) -> usize {
+        let d = head_dim as usize;
+        2 * d + d * d
+    }
+}
+
 /// `a`: `[m, k]`; `b`: `[n, k]` when `trans_b`, else `[k, n]`; `c`: `[m, n]`. Row strides are
 /// the leading dimensions.
 pub struct GemmContext<'a> {
@@ -1208,7 +1228,26 @@ pub trait QuantizeActKernel: Send + Sync {
 pub trait KvTranscodeKernel: Send + Sync {
     fn supports(&self, cfg: &KvTranscodeConfig) -> bool;
     fn implementation(&self, cfg: &KvTranscodeConfig) -> String;
+    /// Runs a transcode that needs no tables (`fp8_e4m3`); a library refuses `tq4` / `tq2`
+    /// here, since they need [`Self::execute_with_tables`].
     fn execute(&self, ctx: &mut KvTranscodeContext<'_>) -> Result<(), KernelError>;
+
+    /// Runs a transcode with the TurboQuant tables of `ctx.seed` (`tables` is required by
+    /// `tq4` / `tq2` on a library and ignored by `fp8_e4m3`; the cpu-reference provider runs
+    /// `ctx.codecs` and ignores it). The default knows no tables: it runs [`Self::execute`]
+    /// when `tables` is `None` and refuses otherwise.
+    fn execute_with_tables(
+        &self,
+        ctx: &mut KvTranscodeContext<'_>,
+        tables: Option<&KvTranscodeTables<'_>>,
+    ) -> Result<(), KernelError> {
+        match tables {
+            None => self.execute(ctx),
+            Some(_) => Err(KernelError::Unsupported {
+                message: format!("kv_transcode: {} takes no TurboQuant tables", ctx.cfg),
+            }),
+        }
+    }
 }
 
 /// One implementation source (`cpu-reference`, a loaded shim library). A family the provider

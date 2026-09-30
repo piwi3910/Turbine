@@ -25,11 +25,12 @@ use turbine_kernels::{
     AttentionContext, AttentionKind, ElementwiseConfig, ElementwiseContext, EmbeddingConfig,
     EmbeddingContext, GemmConfig, GemmContext, ImplChoice, ImplInfo, KernelProvider, KvCodecFns,
     KvCopyConfig, KvCopyContext, KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat,
-    LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
-    MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, OpConfig, OpKind,
-    PagedAttentionContext, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
-    RowSumsqConfig, RowSumsqContext, ShimContext, ShimLibrary, TURBINE_OPTION_GEMM_AUTOTUNE,
-    TURBINE_OPTION_GEMM_TUNED_SHAPES, cpu_reference_provider, shim_provider,
+    KvTranscodeTables, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
+    MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
+    OpConfig, OpKind, PagedAttentionContext, RmsnormShardedConfig, RmsnormShardedContext,
+    RopeConfig, RopeContext, RowSumsqConfig, RowSumsqContext, ShimContext, ShimLibrary,
+    TURBINE_OPTION_GEMM_AUTOTUNE, TURBINE_OPTION_GEMM_TUNED_SHAPES, cpu_reference_provider,
+    shim_provider,
 };
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceBuffer, DeviceMemory, HostStaging, Tensor, TensorView};
@@ -5930,10 +5931,12 @@ fn kv_pages(rng: &mut Rng, cfg: &KvTranscodeConfig, blocks: usize) -> Vec<Vec<u8
         .collect()
 }
 
-/// The encode config of a transcode case and the byte size of its coded slot.
+/// The encode config of a transcode case, the byte size of its coded slot and the rotation seed
+/// (TurboQuant; the FP8 codec ignores it).
 struct KvBatch {
     cfg: KvTranscodeConfig,
     slot: usize,
+    seed: u64,
 }
 
 impl KvBatch {
@@ -5951,7 +5954,7 @@ impl KvBatch {
 
     /// Runs the op on `mem`'s provider: `blocks` are the page bytes (encode) or the expected
     /// page buffers to fill (decode); returns the host bytes of the coded slots (encode) or of
-    /// the decoded pages (decode).
+    /// the decoded pages (decode). `tables`: the TurboQuant tables in `mem` (TurboQuant only).
     fn run(
         &self,
         provider: &Arc<dyn KernelProvider>,
@@ -5959,6 +5962,7 @@ impl KvBatch {
         cfg: KvTranscodeConfig,
         pages_in: &[Vec<u8>],
         coded_in: &[Vec<u8>],
+        tables: Option<&KvTranscodeTables<'_>>,
     ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let layers = cfg.layers as usize;
         let page = cfg.page_bytes();
@@ -5984,16 +5988,19 @@ impl KvBatch {
         provider
             .kv_transcode()
             .expect("the kv_transcode family")
-            .execute(&mut KvTranscodeContext {
-                cfg,
-                pages: &slices,
-                coded: coded.whole(),
-                coded_block_bytes: self.slot,
-                seed: 0,
-                k_scales: None,
-                v_scales: None,
-                codecs: &KvCodecs,
-            })
+            .execute_with_tables(
+                &mut KvTranscodeContext {
+                    cfg,
+                    pages: &slices,
+                    coded: coded.whole(),
+                    coded_block_bytes: self.slot,
+                    seed: self.seed,
+                    k_scales: None,
+                    v_scales: None,
+                    codecs: &KvCodecs,
+                },
+                tables,
+            )
             .expect("kv_transcode");
         mem.synchronize().expect("synchronize");
         let mut coded_out = vec![0u8; blocks * self.slot];
@@ -6018,9 +6025,10 @@ impl KvBatch {
 /// `turbine-kv` codec (`fp8_e4m3`, the CPU reference) byte for byte when encoding and bit for
 /// bit when decoding, at the Llama-3.2-3B and OLMoE-1B-7B page shapes and a small odd one, over
 /// data that includes the scale floor, exact ties, saturation, subnormals, NaN and infinity; the
-/// cpu-reference provider over the same codec table agrees with both; the op refuses the
-/// formats and page dtypes no kernel of this library implements; encode and decode of a
-/// demotion batch (32 blocks, Llama) are timed. Breaks if a rounding, a scale or a page offset
+/// cpu-reference provider over the same codec table agrees with both; the TurboQuant `tq4` and
+/// `tq2` codecs likewise ([`tq_transcode_cases`], Task 8); the op refuses the formats and page
+/// dtypes no kernel of this library implements; encode and decode of a demotion batch (32
+/// blocks, Llama) are timed for every format. Breaks if a rounding, a scale or a page offset
 /// differs from the codec (a demoted block would promote into different bits).
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
@@ -6051,7 +6059,7 @@ fn kv_transcode_matches_cpu() {
         };
         let layout = KvCodecs::layout(&cfg);
         let slot = codec.bytes_per_block(&layout) as usize;
-        let batch = KvBatch { cfg, slot };
+        let batch = KvBatch { cfg, slot, seed: 0 };
         let pages = kv_pages(&mut rng, &cfg, blocks);
 
         // The codec's own bytes, the reference for both directions.
@@ -6089,6 +6097,7 @@ fn kv_transcode_matches_cpu() {
             batch.encode_cfg(),
             &pages,
             &vec![vec![0u8; slot]; blocks],
+            None,
         );
         for (b, (got, want)) in coded.iter().zip(&want_coded).enumerate() {
             let first = got.iter().zip(want).position(|(g, w)| g != w);
@@ -6097,7 +6106,14 @@ fn kv_transcode_matches_cpu() {
                 "{name}: encoded block {b} differs from the codec at byte {first:?}"
             );
         }
-        let (_, decoded) = batch.run(&p.hip, &p.hip_mem, batch.decode_cfg(), &empty, &want_coded);
+        let (_, decoded) = batch.run(
+            &p.hip,
+            &p.hip_mem,
+            batch.decode_cfg(),
+            &empty,
+            &want_coded,
+            None,
+        );
         for (b, (got, want)) in decoded.iter().zip(&want_pages).enumerate() {
             let first = got.iter().zip(want).position(|(g, w)| g != w);
             assert!(
@@ -6113,10 +6129,17 @@ fn kv_transcode_matches_cpu() {
             batch.encode_cfg(),
             &pages,
             &vec![vec![0u8; slot]; blocks],
+            None,
         );
         assert_eq!(cpu_coded, want_coded, "{name}: cpu provider encode");
-        let (_, cpu_decoded) =
-            batch.run(&p.cpu, &p.cpu_mem, batch.decode_cfg(), &empty, &want_coded);
+        let (_, cpu_decoded) = batch.run(
+            &p.cpu,
+            &p.cpu_mem,
+            batch.decode_cfg(),
+            &empty,
+            &want_coded,
+            None,
+        );
         assert_eq!(cpu_decoded, want_pages, "{name}: cpu provider decode");
         println!("kv_transcode {name}: {blocks} blocks, encode and decode equal the codec");
     }
@@ -6134,9 +6157,18 @@ fn kv_transcode_matches_cpu() {
     let kernel = p.hip.kv_transcode().expect("hip kv_transcode");
     for (what, cfg) in [
         (
-            "tq4",
+            "tq4 from fp8 pages",
             KvTranscodeConfig {
                 dst_format: KvTranscodeFormat::Tq4,
+                page_dtype: DType::F8E4M3,
+                ..base
+            },
+        ),
+        (
+            "tq2 at head_dim 64",
+            KvTranscodeConfig {
+                dst_format: KvTranscodeFormat::Tq2,
+                head_dim: 64,
                 ..base
             },
         ),
@@ -6157,6 +6189,8 @@ fn kv_transcode_matches_cpu() {
     ] {
         assert!(!kernel.supports(&cfg), "{what} must not be supported");
     }
+
+    tq_transcode_cases(&p, &mut rng);
 
     // Demotion-batch timings (32 blocks, Llama shape): the pick of the decisions entry
     // "P6b: KV transcode - provider evaluation".
@@ -6205,4 +6239,339 @@ fn kv_transcode_matches_cpu() {
         bytes / enc_us / 1e3,
         bytes / dec_us / 1e3
     );
+    tq_transcode_timing(&p, &mut rng);
+}
+
+/// The TurboQuant tables of `seed` in `mem`, built from the codec as the server builds them
+/// (`turbine_kv::codec::turboquant`: rotation signs, QJL projection, codebooks).
+struct TqTables {
+    codebooks: Vec<Tensor>,
+    tables: Tensor,
+}
+
+impl TqTables {
+    fn new(mem: &Arc<dyn DeviceMemory>, seed: u64, layers: u32, heads: u32) -> Self {
+        use turbine_kv::codec::turboquant::{codebook, hadamard, qjl};
+        let d = codebook::TQ_DIM;
+        let mut flat =
+            Vec::with_capacity((layers * heads) as usize * KvTranscodeTables::head_elems(d as u32));
+        for layer in 0..layers {
+            for head in 0..heads {
+                for kind in [hadamard::SignKind::K, hadamard::SignKind::V] {
+                    flat.extend(hadamard::rademacher(seed, layer, head, kind, d));
+                }
+                flat.extend(qjl::projection(seed, layer, head, d));
+            }
+        }
+        let upload = |v: &[f32]| {
+            let mut t = Tensor::empty(mem, &[v.len()], DType::F32).expect("tq alloc");
+            t.storage
+                .copy_from_host(0, &encode(DType::F32, v))
+                .expect("tq upload");
+            t
+        };
+        TqTables {
+            codebooks: (1..=4).map(|b| upload(codebook::codebook(b))).collect(),
+            tables: upload(&flat),
+        }
+    }
+
+    fn view(&self) -> KvTranscodeTables<'_> {
+        KvTranscodeTables {
+            codebooks: std::array::from_fn(|i| self.codebooks[i].view()),
+            tables: self.tables.view(),
+        }
+    }
+}
+
+/// `blocks` blocks of `layers` BF16 pages of seeded, finite KV-like data for TurboQuant: per
+/// (layer, K or V) a different scale, outliers, and per block one all-zero vector (norm 0, the
+/// codec's `inv = 0` branch), one vector of a single non-zero coordinate, one constant vector
+/// (a rotation onto a single coordinate), and one vector of large values. Non-finite values are
+/// outside the TurboQuant contract (a NaN's payload is not pinned by either side).
+fn tq_pages(rng: &mut Rng, cfg: &KvTranscodeConfig, blocks: usize) -> Vec<Vec<u8>> {
+    let d = cfg.head_dim as usize;
+    let half = cfg.half_layer_elems();
+    (0..blocks)
+        .map(|b| {
+            let mut block = Vec::new();
+            for layer in 0..cfg.layers as usize {
+                let mut values = Vec::with_capacity(2 * half);
+                for kind in 0..2 {
+                    let scale = 0.05 * (1.0 + layer as f32) * (1.0 + 3.0 * kind as f32);
+                    let mut v = rng.normal(half, scale);
+                    for i in (0..half).step_by(97) {
+                        v[i] *= 12.0;
+                    }
+                    let vectors = half / d;
+                    let pick = |k: usize| ((b * 7 + layer * 3 + kind + k * 5) % vectors) * d;
+                    v[pick(0)..pick(0) + d].fill(0.0);
+                    let one = pick(1);
+                    v[one..one + d].fill(0.0);
+                    v[one + (b + layer) % d] = -2.5;
+                    let flat = pick(2);
+                    v[flat..flat + d].fill(0.75);
+                    let big = pick(3);
+                    v[big..big + d].iter_mut().for_each(|x| *x *= 4096.0);
+                    values.extend(v);
+                }
+                block.extend(encode(DType::BF16, &values));
+            }
+            block
+        })
+        .collect()
+}
+
+/// Which field of a TurboQuant record byte `at` of a slot falls in (`record` bytes per record).
+fn tq_field(fmt: KvTranscodeFormat, at: usize) -> (&'static str, usize) {
+    let (k_bits, v_bits, record) = match fmt {
+        KvTranscodeFormat::Tq4 => (3, 4, 144),
+        _ => (1, 2, 80),
+    };
+    let (kc, vc) = (128 * k_bits / 8, 128 * v_bits / 8);
+    let o = at % record;
+    let field = if o < kc {
+        "k codes"
+    } else if o < kc + 2 {
+        "k norm"
+    } else if o < kc + 18 {
+        "k qjl"
+    } else if o < kc + 20 {
+        "k residual norm"
+    } else if o < kc + 20 + vc {
+        "v codes"
+    } else if o < kc + 22 + vc {
+        "v norm"
+    } else {
+        "padding"
+    };
+    (field, at / record)
+}
+
+/// Phase 6b S-4 (Task 8): the TurboQuant `tq4` / `tq2` transcode on the HIP library against the
+/// CPU codec, at the Llama and OLMoE page shapes and an odd one (3 layers, 2 KV heads, 20
+/// tokens: a chunk tail), with the tables of a non-zero seed. Decode of the codec's own slots is
+/// bit for bit; encode is compared byte for byte and every differing byte is a tie: counted per
+/// field, printed, and bounded (none are expected — every step is the codec's own F32 / F64
+/// operation in its order, with contraction off). The cpu-reference provider agrees on the odd
+/// shape; a call without the tables is refused. Breaks if a sign, a codebook index, the
+/// rotation's scale placement, a norm, the QJL projection or a record offset differs.
+fn tq_transcode_cases(p: &Pair, rng: &mut Rng) {
+    let shapes = [
+        ("llama-3.2-3b", 28u32, 8u32, 128u32, 4usize),
+        ("olmoe-1b-7b", 16, 16, 128, 3),
+        ("odd", 3, 2, 20, 6),
+    ];
+    let kernel = p.hip.kv_transcode().expect("hip kv_transcode");
+    for fmt in [KvTranscodeFormat::Tq4, KvTranscodeFormat::Tq2] {
+        let codec = turbine_kv::codec::registry()
+            .get(fmt.as_str())
+            .expect("the TurboQuant codec");
+        for (name, layers, kv_heads, block_tokens, blocks) in shapes {
+            let cfg = KvTranscodeConfig {
+                src_format: KvTranscodeFormat::L0,
+                dst_format: fmt,
+                page_dtype: DType::BF16,
+                head_dim: 128,
+                num_kv_heads: kv_heads,
+                block_tokens,
+                layers,
+            };
+            let what = format!("{} {name}", fmt.as_str());
+            let seed = 0x6b54_7138_0000_0000 ^ u64::from(layers * 131 + kv_heads);
+            let layout = KvCodecs::layout(&cfg);
+            let slot = codec.bytes_per_block(&layout) as usize;
+            let batch = KvBatch { cfg, slot, seed };
+            let hip_tables = TqTables::new(&p.hip_mem, seed, layers, kv_heads);
+            let tables = hip_tables.view();
+            let pages = tq_pages(rng, &cfg, blocks);
+            let params = turbine_kv::codec::CodecParams {
+                seed,
+                ..Default::default()
+            };
+            let want_coded: Vec<Vec<u8>> = pages
+                .iter()
+                .map(|block| {
+                    let mut out = vec![0u8; slot];
+                    codec
+                        .encode_cpu(block, &layout, &mut out, &params)
+                        .expect("cpu encode");
+                    out
+                })
+                .collect();
+            let want_pages: Vec<Vec<u8>> = want_coded
+                .iter()
+                .map(|s| {
+                    let mut out = vec![0u8; pages[0].len()];
+                    codec
+                        .decode_cpu(s, &layout, &mut out, &params)
+                        .expect("cpu decode");
+                    out
+                })
+                .collect();
+
+            assert!(kernel.supports(&batch.encode_cfg()), "{what} encode");
+            assert!(kernel.supports(&batch.decode_cfg()), "{what} decode");
+            assert_eq!(kernel.implementation(&cfg), "turbine_hip_tq", "{what}");
+
+            let zeros = vec![vec![0u8; slot]; blocks];
+            let (coded, _) = batch.run(
+                &p.hip,
+                &p.hip_mem,
+                batch.encode_cfg(),
+                &pages,
+                &zeros,
+                Some(&tables),
+            );
+            // Ties: every differing byte, by field.
+            let mut ties: std::collections::BTreeMap<&str, usize> = Default::default();
+            let mut first = None;
+            for (b, (got, want)) in coded.iter().zip(&want_coded).enumerate() {
+                for (at, (g, w)) in got.iter().zip(want).enumerate() {
+                    if g != w {
+                        let (field, record) = tq_field(fmt, at);
+                        *ties.entry(field).or_default() += 1;
+                        first.get_or_insert((b, record, field, *g, *w));
+                    }
+                }
+            }
+            let records = blocks * (layers * kv_heads * block_tokens) as usize;
+            let tie_bytes: usize = ties.values().sum();
+            println!(
+                "kv_transcode {what}: {blocks} blocks ({records} records), encode ties \
+                 {tie_bytes} bytes {ties:?}"
+            );
+            assert!(
+                tie_bytes == 0,
+                "{what}: encode differs from the codec in {tie_bytes} bytes {ties:?}, first \
+                 (block, record, field, got, want) {first:?}"
+            );
+            let (_, decoded) = batch.run(
+                &p.hip,
+                &p.hip_mem,
+                batch.decode_cfg(),
+                &vec![Vec::new(); blocks],
+                &want_coded,
+                Some(&tables),
+            );
+            for (b, (got, want)) in decoded.iter().zip(&want_pages).enumerate() {
+                let first = got.iter().zip(want).position(|(g, w)| g != w);
+                assert!(
+                    first.is_none(),
+                    "{what}: decoded block {b} differs from the codec at byte {first:?}"
+                );
+            }
+            if name == "odd" {
+                let cpu_tables = TqTables::new(&p.cpu_mem, seed, layers, kv_heads);
+                let (cpu_coded, _) = batch.run(
+                    &p.cpu,
+                    &p.cpu_mem,
+                    batch.encode_cfg(),
+                    &pages,
+                    &zeros,
+                    Some(&cpu_tables.view()),
+                );
+                assert_eq!(cpu_coded, want_coded, "{what}: cpu provider encode");
+            }
+            println!("kv_transcode {what}: decode equals the codec bit for bit");
+        }
+    }
+    // The tables are not optional for TurboQuant.
+    let cfg = KvTranscodeConfig {
+        src_format: KvTranscodeFormat::L0,
+        dst_format: KvTranscodeFormat::Tq4,
+        page_dtype: DType::BF16,
+        head_dim: 128,
+        num_kv_heads: 2,
+        block_tokens: 20,
+        layers: 3,
+    };
+    let page = DeviceBuffer::alloc(&p.hip_mem, cfg.page_bytes()).expect("page");
+    let pages = vec![page.whole(); 3];
+    let slot = 3 * 2 * 20 * 144;
+    let coded = DeviceBuffer::alloc(&p.hip_mem, slot).expect("coded");
+    let err = kernel
+        .execute(&mut KvTranscodeContext {
+            cfg,
+            pages: &pages,
+            coded: coded.whole(),
+            coded_block_bytes: slot,
+            seed: 1,
+            k_scales: None,
+            v_scales: None,
+            codecs: &KvCodecs,
+        })
+        .expect_err("tq4 without tables");
+    assert!(err.to_string().contains("TurboQuant tables"), "{err}");
+}
+
+/// TurboQuant demotion-batch timings (32 blocks, Llama shape): encode and decode µs per format,
+/// recorded in the decisions entry "P6b: TurboQuant transcode - provider evaluation".
+fn tq_transcode_timing(p: &Pair, rng: &mut Rng) {
+    let kernel = p.hip.kv_transcode().expect("hip kv_transcode");
+    let (layers, heads, tokens, blocks) = (28u32, 8u32, 128u32, 32usize);
+    let seed = 0x7154_7134;
+    let tables = TqTables::new(&p.hip_mem, seed, layers, heads);
+    let view = tables.view();
+    for fmt in [KvTranscodeFormat::Tq4, KvTranscodeFormat::Tq2] {
+        let cfg = KvTranscodeConfig {
+            src_format: KvTranscodeFormat::L0,
+            dst_format: fmt,
+            page_dtype: DType::BF16,
+            head_dim: 128,
+            num_kv_heads: heads,
+            block_tokens: tokens,
+            layers,
+        };
+        let codec = turbine_kv::codec::registry()
+            .get(fmt.as_str())
+            .expect("codec");
+        let slot = codec.bytes_per_block(&KvCodecs::layout(&cfg)) as usize;
+        let page = cfg.page_bytes();
+        let raw = encode(DType::BF16, &rng.normal(cfg.half_layer_elems() * 2, 0.3));
+        let bufs: Vec<DeviceBuffer> = (0..blocks * layers as usize)
+            .map(|_| {
+                let mut b = DeviceBuffer::alloc(&p.hip_mem, page).expect("page");
+                b.copy_from_host(0, &raw).expect("upload");
+                b
+            })
+            .collect();
+        let slices: Vec<_> = bufs.iter().map(DeviceBuffer::whole).collect();
+        let coded = DeviceBuffer::alloc(&p.hip_mem, blocks * slot).expect("coded");
+        let time = |cfg: KvTranscodeConfig| {
+            time_us(p, 10, || {
+                kernel
+                    .execute_with_tables(
+                        &mut KvTranscodeContext {
+                            cfg,
+                            pages: &slices,
+                            coded: coded.whole(),
+                            coded_block_bytes: slot,
+                            seed,
+                            k_scales: None,
+                            v_scales: None,
+                            codecs: &KvCodecs,
+                        },
+                        Some(&view),
+                    )
+                    .expect("kv_transcode")
+            })
+        };
+        let decode_cfg = KvTranscodeConfig {
+            src_format: fmt,
+            dst_format: KvTranscodeFormat::L0,
+            ..cfg
+        };
+        let (enc_us, dec_us) = (time(cfg), time(decode_cfg));
+        let bytes = (blocks * layers as usize * page) as f64;
+        println!(
+            "kv_transcode timing {} llama 32 blocks ({:.1} MiB of pages, {:.1} MiB coded): \
+             encode {enc_us:.0} us ({:.0} GB/s of pages), decode {dec_us:.0} us ({:.0} GB/s)",
+            fmt.as_str(),
+            bytes / (1 << 20) as f64,
+            (blocks * slot) as f64 / (1 << 20) as f64,
+            bytes / enc_us / 1e3,
+            bytes / dec_us / 1e3
+        );
+    }
 }

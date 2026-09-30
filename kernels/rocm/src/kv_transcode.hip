@@ -22,9 +22,9 @@
 // reference; decode multiplies the e4m3 value by the scale in F32 and rounds to
 // BF16 with ties to even (bf16.hpp). No hardware conversion is used.
 //
-// Slots for TurboQuant (Task 8) go in kv_transcode_tq.hip behind their own
-// implementation entries; the descriptor and the page table upload below are
-// shared with them (kv_transcode.hpp).
+// The TurboQuant slots (Task 8) are kv_transcode_tq.hip behind their own
+// implementation entry; the page table upload below is shared with them
+// (kv_transcode.hpp, kv_transcode_upload_pages).
 #include "kv_transcode.hpp"
 
 #include <algorithm>
@@ -278,6 +278,12 @@ int32_t turbine_kv_transcode(turbine_ctx *ctx,
 } // extern "C"
 
 namespace turbine_hip {
+
+int32_t kv_transcode_upload_pages(turbine_ctx *ctx,
+                                  const turbine_kv_transcode_desc *d,
+                                  void ***device) {
+  return upload_pages(ctx, d, device);
+}
 
 bool kv_transcode_fp8_supports(const turbine_kv_transcode_desc *d) {
   return fp8_supported(d);
