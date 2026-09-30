@@ -134,14 +134,16 @@ impl Naive {
         self.rmsnorm(x, w)
     }
 
+    /// HF `rotate_half` with cos and sin times YaRN's attention factor before BF16 rounding.
     fn rope(&self, x: &mut [f32], heads: usize) {
         let d = self.cfg.head_dim as usize;
         let half = d / 2;
+        let m = self.cfg.rope_attention_factor();
         for (pos, token) in x.chunks_exact_mut(heads * d).enumerate() {
             for head in token.chunks_exact_mut(d) {
                 for i in 0..half {
                     let f = pos as f32 * self.inv_freq[i];
-                    let (c, s) = (bf(f.cos()), bf(f.sin()));
+                    let (c, s) = (bf(f.cos() * m), bf(f.sin() * m));
                     let (x1, x2) = (head[i], head[i + half]);
                     head[i] = bf(bf(x1 * c) + bf(-x2 * s));
                     head[i + half] = bf(bf(x2 * c) + bf(x1 * s));
@@ -157,7 +159,7 @@ impl Naive {
         let d = self.cfg.head_dim as usize;
         let hq = self.cfg.num_attention_heads as usize;
         let hkv = self.cfg.num_kv_heads as usize;
-        let scale = 1.0 / (d as f32).sqrt();
+        let scale = self.cfg.attention_scale();
         let mut out = vec![0f32; t * hq * d];
         for i in 0..t {
             for h in 0..hq {
@@ -353,6 +355,33 @@ fn inv_freq(cfg: &ModelArchConfig) -> Vec<f32> {
                             / (high_freq_factor - low_freq_factor);
                         (1.0 - smooth) * f / factor + smooth * f
                     }
+                }
+                // transformers' `_compute_yarn_parameters`: a linear ramp between the
+                // correction dimensions of beta_fast and beta_slow rotations blends `f`
+                // (below) into `f / factor` (above).
+                Some(RopeScaling::Yarn {
+                    factor,
+                    original_max_position_embeddings,
+                    beta_fast,
+                    beta_slow,
+                    truncate,
+                    ..
+                }) => {
+                    let old = f64::from(original_max_position_embeddings);
+                    let corr = |rot: f64| {
+                        d * (old / (rot * 2.0 * std::f64::consts::PI)).ln()
+                            / (2.0 * cfg.rope_theta.ln())
+                    };
+                    let (mut lo, mut hi) = (corr(beta_fast), corr(beta_slow));
+                    if truncate {
+                        (lo, hi) = (lo.floor(), hi.ceil());
+                    }
+                    let (lo, mut hi) = (lo.max(0.0), hi.min(d - 1.0));
+                    if lo == hi {
+                        hi += 0.001;
+                    }
+                    let ramp = ((f64::from(i) - lo) / (hi - lo)).clamp(0.0, 1.0);
+                    f / factor * ramp + f * (1.0 - ramp)
                 }
             };
             scaled as f32

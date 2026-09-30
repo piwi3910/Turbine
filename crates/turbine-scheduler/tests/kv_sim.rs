@@ -34,6 +34,7 @@ fn format() -> KvFormat {
             block_tokens: 16,
         },
         shards: 1,
+        scales: None,
     }
 }
 
@@ -78,6 +79,7 @@ fn setup_with(
         ModelIdentity {
             config_hash: [3; 32],
             weights_index_hash: [4; 32],
+            rope_hash: [0; 32],
         },
         format(),
         l0,

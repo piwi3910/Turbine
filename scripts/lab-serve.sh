@@ -34,6 +34,14 @@
 # --dry-run prints every command that would contact the host instead of running it.
 # TURBINE_LAB_SERVE_TIMEOUT: seconds to wait for /ready once the pod runs (default 3600; a cold
 #   run compiles Composable Kernel and the release server).
+# One GPU job at a time (coordinator rule 2026-09-29, until novanas's PSU is replaced;
+#   TURBINE_LAB_ONE_GPU_JOB=0 turns it off): a start first takes /home/piwi/turbine-ci/bench.lock
+#   exclusively (through bench.gate, like scripts/bench-lock.sh) in a holder process on novanas
+#   (runs/serve-locks/<run id>.sh) that keeps it while the serve Job exists and releases it when
+#   the Job is gone (--stop, a failed start, an interrupt), so it covers the whole life of a
+#   server this script leaves running. Under a caller that already holds bench.lock exclusively
+#   (scripts/bench-lock.sh exports TURBINE_BENCH_LOCK_HELD) no second lock is taken; under a
+#   shared hold the start is refused (it would wait for itself). --gpus 2 is refused.
 # Exit codes: 0 ready (or stopped), 2 usage error, otherwise non-zero with a message naming the
 # failed step.
 set -euo pipefail
@@ -116,8 +124,50 @@ case "$2" in
 		SERVED_NAME=allenai/OLMoE-1B-7B-0125-Instruct
 		MAX_MODEL_LEN=4096
 		;;
+	llama-3.1-8b-instruct)
+		SERVED_NAME=meta-llama/Llama-3.1-8B-Instruct
+		MAX_MODEL_LEN=32768
+		;;
+	llama-3.1-8b-instruct-mxfp4a16)
+		SERVED_NAME=FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16
+		MAX_MODEL_LEN=32768
+		;;
+	llama-3.2-3b-mxfp4-a4)
+		SERVED_NAME=matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq
+		MAX_MODEL_LEN=32768
+		;;
+	llama-3.1-8b-instruct-mxfp4-a4)
+		SERVED_NAME=amd/Llama-3.1-8B-Instruct-MXFP4-W4A4-MLCAL-C1000-GPTQ
+		MAX_MODEL_LEN=32768
+		;;
+	# Phase 6a INT4 proofs (as in scripts/lab/phase6-novanas-llama-{awq,gptq}.yaml).
+	llama-3.2-3b-instruct-awq)
+		SERVED_NAME=casperhansen/llama-3.2-3b-instruct-awq
+		MAX_MODEL_LEN=32768
+		;;
+	llama-3.2-3b-instruct-gptq)
+		SERVED_NAME=shuyuej/Llama-3.2-3B-Instruct-GPTQ
+		MAX_MODEL_LEN=32768
+		;;
+	llama-3.2-3b-instruct-gptq-own)
+		SERVED_NAME=turbine/Llama-3.2-3B-Instruct-GPTQ-own
+		MAX_MODEL_LEN=32768
+		;;
+	# Phase 6a FP8 proof checkpoints (served_name as in scripts/lab/phase6-novanas-llama-fp8*.yaml).
+	llama-3.2-3b-instruct-fp8-dynamic)
+		SERVED_NAME=RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic
+		MAX_MODEL_LEN=32768
+		;;
+	llama-3.2-3b-instruct-fp8)
+		SERVED_NAME=RedHatAI/Llama-3.2-3B-Instruct-FP8
+		MAX_MODEL_LEN=32768
+		;;
+	llama-3.2-3b-instruct-fp8-block)
+		SERVED_NAME=unsloth/Llama-3.2-3B-Instruct-FP8-Block
+		MAX_MODEL_LEN=32768
+		;;
 	*)
-		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct or olmoe-1b-7b-0125-instruct)" >&2
+		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, llama-3.1-8b-instruct, llama-3.1-8b-instruct-mxfp4a16, llama-3.2-3b-mxfp4-a4, llama-3.1-8b-instruct-mxfp4-a4, llama-3.2-3b-instruct-awq, llama-3.2-3b-instruct-gptq, llama-3.2-3b-instruct-gptq-own, llama-3.2-3b-instruct-fp8-dynamic, llama-3.2-3b-instruct-fp8 or llama-3.2-3b-instruct-fp8-block)" >&2
 		usage
 		;;
 	esac
@@ -242,6 +292,7 @@ failed_step() {
 # Deletes this run's Job and upload, nothing else.
 cleanup() {
 	kube "-n ${NS} delete job ${JOB} --ignore-not-found" >/dev/null || true
+	gpu_unlock
 	[[ "$MODE" == vllm ]] || remote "rm -rf ${RUN_DIR}" || true
 }
 
@@ -272,11 +323,16 @@ on_interrupt() {
 }
 
 LOG_PID=""
+STREAM_STARTED=0
 stop_log_stream() {
 	if [[ -n "$LOG_PID" ]]; then
 		kill "$LOG_PID" 2>/dev/null || true
 		wait "$LOG_PID" 2>/dev/null || true
 		LOG_PID=""
+	fi
+	if [[ $STREAM_STARTED -eq 1 ]]; then
+		stop_remote_log_stream
+		STREAM_STARTED=0
 	fi
 }
 trap stop_log_stream EXIT
@@ -287,10 +343,22 @@ stream_log() {
 	local cmd="export KUBECTL_KUBERC=false; kubectl -n ${NS} logs -f job/${JOB} 2>&1 | grep --line-buffered -v 'permission denied'"
 	if [[ $DRY_RUN -eq 1 ]]; then
 		echo "+ ssh ${SSH_OPTS[*]} ${REMOTE} '${cmd}'"
+		STREAM_STARTED=1
 		return
 	fi
 	(exec ssh -n "${SSH_OPTS[@]}" "$REMOTE" "$cmd") &
 	LOG_PID=$!
+	STREAM_STARTED=1
+}
+
+# Kills the remote `kubectl logs -f job/${JOB}` (and, once it exits, its `grep`) that an ssh
+# ControlMaster keeps running after the local ssh client above is killed: under ControlMaster the
+# remote command survives the local kill, so the master keeps the passed stdout open and a
+# caller piping lab-serve.sh through `tee` never sees EOF (the overload-soak's 19-minute hang,
+# rotation 11). As with gpu_unlock's pkill above, the bracket trick keeps this pkill's own
+# command line — which literally contains "[l]ogs -f job/${JOB}" — from matching itself.
+stop_remote_log_stream() {
+	remote "pkill -f '[l]ogs -f job/${JOB}'" || true
 }
 
 wait_for_pod() {
@@ -391,6 +459,7 @@ require_free_port() {
 start() {
 	say "run ${RUN_ID}: job ${JOB}"
 	require_free_port
+	gpu_lock
 
 	remote "mkdir -p ${RUN_DIR}/src ${CI_ROOT}/cache/slots && find ${CI_ROOT}/runs -mindepth 1 -maxdepth 1 -mmin +1440 -exec rm -rf {} +" ||
 		fail "ssh to ${REMOTE} failed"
@@ -431,6 +500,7 @@ start() {
 start_vllm() {
 	say "run ${RUN_ID}: job ${JOB} (vLLM-ROCm serving ${SLUG} as ${SERVED_NAME}, ${VLLM_GPUS} GPU(s)${VLLM_ARGS[*]+, ${VLLM_ARGS[*]}})"
 	require_free_port
+	gpu_lock
 	remote "test -d /home/piwi/turbine-models/${SLUG}" ||
 		fail "weights /home/piwi/turbine-models/${SLUG} are not provisioned (or ssh to ${REMOTE} failed)"
 	remote "command -v kubectl >/dev/null" || fail "kubectl is not available on ${HOST}"
@@ -461,6 +531,80 @@ start_vllm() {
 	else
 		say "vLLM ready at ${URL} (stop with: scripts/lab-serve.sh ${HOST} --stop)"
 	fi
+}
+
+ONE_GPU_JOB="${TURBINE_LAB_ONE_GPU_JOB:-1}"
+LOCK_DIR="${CI_ROOT}/runs/serve-locks"
+LOCK_TAG="${LOCK_DIR}/${RUN_ID}.sh"
+LOCK_HELD=0
+
+# Takes bench.lock for this run's serve Job (see the header); returns once the holder on the
+# host has it. The holder waits up to 1 h for the Job to appear (upload and apply), then holds
+# while `kubectl get job` finds it; a kubectl error counts as still present.
+gpu_lock() {
+	[[ "$ONE_GPU_JOB" == 1 ]] || return 0
+	local gpus=$SERVE_GPUS
+	[[ "$MODE" == vllm ]] && gpus=$VLLM_GPUS
+	if [[ $gpus -eq 2 && $DRY_RUN -eq 1 ]]; then
+		echo "+ a real run refuses --gpus 2 while one GPU job at a time holds (TURBINE_LAB_ONE_GPU_JOB=0 overrides)"
+		return 0
+	fi
+	if [[ $gpus -eq 2 ]]; then
+		fail "--gpus 2 refused: one GPU job at a time on novanas until its PSU is replaced (TURBINE_LAB_ONE_GPU_JOB=0 overrides)" 2
+	fi
+	case " ${TURBINE_BENCH_LOCK_HELD:-} " in
+	*" bench:x "*)
+		say "bench.lock already held exclusively by the caller"
+		return 0
+		;;
+	*" bench:s "*)
+		fail "bench.lock is held shared by the caller; one GPU job at a time needs it exclusively (wrap in scripts/bench-lock.sh without --shared)" 2
+		;;
+	esac
+	if [[ $DRY_RUN -eq 1 ]]; then
+		echo "+ hold ${CI_ROOT}/bench.lock exclusively on ${HOST} (holder ${LOCK_TAG}) while job ${JOB} exists"
+		return 0
+	fi
+	remote_stdin "mkdir -p ${LOCK_DIR} && cat >${LOCK_TAG}" <<HOLDER || fail "cannot write the bench.lock holder ${LOCK_TAG}"
+export KUBECTL_KUBERC=false
+present() {
+	out=\$(kubectl -n ${NS} get job ${JOB} --ignore-not-found -o name 2>/dev/null) || return 0
+	[ -n "\$out" ]
+}
+echo locked >${LOCK_TAG}.state
+t=0
+while ! present; do
+	[ -e ${LOCK_TAG}.state ] || exit 0
+	t=\$((t + 5))
+	[ \$t -ge 3600 ] && break
+	sleep 5
+done
+while present; do sleep 5; done
+rm -f ${LOCK_TAG}.state
+HOLDER
+	remote "setsid nohup flock -x ${CI_ROOT}/bench.gate flock -x ${CI_ROOT}/bench.lock sh ${LOCK_TAG} >${LOCK_TAG}.log 2>&1 </dev/null &" ||
+		fail "cannot start the bench.lock holder on ${HOST}"
+	LOCK_HELD=1
+	trap on_interrupt INT TERM
+	say "waiting for ${CI_ROOT}/bench.lock (exclusive; one GPU job at a time)"
+	local waited=0
+	until remote "test -e ${LOCK_TAG}.state"; do
+		if ((waited % 300 == 0 && waited > 0)); then say "still waiting for bench.lock (${waited} s)"; fi
+		sleep 5
+		waited=$((waited + 5))
+	done
+	say "holding bench.lock until job ${JOB} is deleted"
+}
+
+# Ends this run's holder at once (a failed or interrupted start; otherwise the Job's deletion
+# ends it within 5 s).
+gpu_unlock() {
+	[[ $LOCK_HELD -eq 1 ]] || return 0
+	# Separate calls: a command line naming the holder's path would match its own pkill. A child
+	# of the holder (sleep 5, kubectl) keeps the lock fd until it exits, so the lock frees within ~5 s.
+	remote "rm -f ${LOCK_TAG}.state ${LOCK_TAG}" || true
+	remote "pkill -f '[r]uns/serve-locks/${RUN_ID}[.]sh'" || true
+	LOCK_HELD=0
 }
 
 case "$MODE" in

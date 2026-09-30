@@ -1,43 +1,397 @@
-//! Weight formats (Phase 2m S-10, contract §24 `weight_format`): how a checkpoint's weights
-//! are stored and which dtypes the executor, the loader and the KV cache use for them. One file
-//! per format and one entry in [`registry`]; [`detect`] picks the format of a `config.json`.
+//! Weight formats (Phase 2m S-10, amended by Phase 6a S-3; contract §24 `weight_format`): one
+//! entry per checkpoint *packaging* (BF16, compressed-tensors FP8, AutoAWQ, …), describing how
+//! each linear layer is quantized ([`QuantScheme`]), how activations are quantized before it
+//! ([`ActivationQuant`]), which tensors a layer needs and how they are repacked into the layout
+//! the kernels consume. Activations always run in BF16 and the KV dtype is configured
+//! (`kv.dtype`), not a property of the checkpoint. One file per packaging and one entry in
+//! [`registry`]; [`detect`] picks the packaging of a `config.json` and configures it from the
+//! `quantization_config` ([`WeightFormat::configure`]).
+
+use std::path::Path;
+use std::sync::Arc;
 
 use turbine_core::registry::{Module, Registry};
+use turbine_core::support::WeightFormatColumn;
 use turbine_core::types::DType;
+use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
+use turbine_kernels::{KernelProvider, OpConfig, QGemmConfig};
 
 use crate::ModelError;
+use crate::config::{self, ModelArchConfig};
+use crate::loader::WeightSlot;
 use crate::safetensors::TensorEntry;
 
+pub mod awq;
 pub mod bf16;
+mod common;
+pub mod ct_fp8;
+pub mod ct_mxfp4;
+pub mod ct_pack_int4;
+mod fp8;
+pub mod gptq;
+pub mod hf_fp8;
+mod int4;
+mod mxfp4;
+pub mod openai_mxfp4;
+pub mod quark_mxfp4;
 
 pub use bf16::Bf16;
 
-/// A checkpoint weight format: the `config.json` keys that declare it, the tensors it accepts
-/// and the dtypes weights, activations and the KV cache use.
+/// How one linear layer's weight is stored after loading (Phase 6a S-3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum QuantScheme {
+    /// Unquantized BF16 (also every layer a checkpoint leaves unquantized, e.g. `lm_head`).
+    Bf16,
+    Fp8Tensor,
+    Fp8Channel,
+    Fp8Block {
+        n: u32,
+        k: u32,
+    },
+    Int4Group {
+        group: u32,
+        zero_points: bool,
+    },
+    Mxfp4,
+}
+
+impl QuantScheme {
+    /// The kernel-side scheme; `None` for BF16 (the plain GEMM runs it).
+    pub fn kernel(self) -> Option<QuantSchemeDesc> {
+        Some(match self {
+            QuantScheme::Bf16 => return None,
+            QuantScheme::Fp8Tensor => QuantSchemeDesc::Fp8Tensor,
+            QuantScheme::Fp8Channel => QuantSchemeDesc::Fp8Channel,
+            QuantScheme::Fp8Block { n, k } => QuantSchemeDesc::Fp8Block {
+                block_n: n,
+                block_k: k,
+            },
+            QuantScheme::Int4Group {
+                group,
+                zero_points: true,
+            } => QuantSchemeDesc::Int4GroupZp { group },
+            QuantScheme::Int4Group {
+                group,
+                zero_points: false,
+            } => QuantSchemeDesc::Int4GroupSym { group },
+            QuantScheme::Mxfp4 => QuantSchemeDesc::Mxfp4,
+        })
+    }
+
+    /// Device bytes of an `n × k` layer in this scheme: packed data, F32 scales (E8M0 bytes for
+    /// MXFP4) and zero points.
+    pub fn bytes(self, n: u64, k: u64) -> u64 {
+        let Some(desc) = self.kernel() else {
+            return n * k * DType::BF16.size_bytes() as u64;
+        };
+        let (nu, ku) = (n as usize, k as usize);
+        let data = desc.data_bytes(nu, ku) as u64;
+        let scales = desc.scale_count(nu, ku) as u64;
+        match desc {
+            QuantSchemeDesc::Mxfp4 => data + scales,
+            QuantSchemeDesc::Int4GroupZp { .. } => data + 4 * scales + scales,
+            _ => data + 4 * scales,
+        }
+    }
+}
+
+/// How activations are quantized before a quantized linear layer (Phase 6a S-3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum ActivationQuant {
+    /// BF16 activations (weight-only schemes, and every BF16 layer).
+    None,
+    /// FP8 with the checkpoint's static per-tensor `input_scale`.
+    Fp8PerTensorStatic,
+    Fp8PerTokenDynamic,
+    Fp8PerGroupDynamic {
+        group: u32,
+    },
+    /// MXFP4 quantize-dequantize (Quark W4A4, emulated on RDNA4).
+    Mxfp4Emulated,
+}
+
+impl ActivationQuant {
+    /// The name in `/turbine/v1/status` and the `weight_format` log event (`none`,
+    /// `fp8_tensor_static`, `fp8_token`, `fp8_group128`, `mxfp4_emulated`).
+    pub fn name(self) -> String {
+        match self {
+            ActivationQuant::None => "none".into(),
+            ActivationQuant::Fp8PerTensorStatic => "fp8_tensor_static".into(),
+            ActivationQuant::Fp8PerTokenDynamic => "fp8_token".into(),
+            ActivationQuant::Fp8PerGroupDynamic { group } => format!("fp8_group{group}"),
+            ActivationQuant::Mxfp4Emulated => "mxfp4_emulated".into(),
+        }
+    }
+
+    /// The kernel-side mode (the static FP8 scale, `input_scale`, travels with each call).
+    pub fn kernel(self) -> ActQuantDesc {
+        match self {
+            ActivationQuant::None => ActQuantDesc::None,
+            ActivationQuant::Fp8PerTensorStatic => ActQuantDesc::Fp8Tensor,
+            ActivationQuant::Fp8PerTokenDynamic => ActQuantDesc::Fp8Token,
+            ActivationQuant::Fp8PerGroupDynamic { group } => ActQuantDesc::Fp8Group { group },
+            ActivationQuant::Mxfp4Emulated => ActQuantDesc::Mxfp4Emulated,
+        }
+    }
+}
+
+/// A linear layer of the model: the checkpoint tensor name of its weight (`….weight`) and its
+/// `n` output rows × `k` input columns.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LinearSlot {
+    pub name: String,
+    pub n: u32,
+    pub k: u32,
+}
+
+/// The dtype every executor activation uses, whatever the weight format (Phase 6a: quantized
+/// formats dequantize or quantize at the GEMM; `model.dtype` is `bf16`).
+pub const ACTIVATION_DTYPE: DType = Bf16::DTYPE;
+
+/// A checkpoint packaging: the `config.json` keys that declare it, the tensors it accepts, the
+/// support-matrix column it serves, and how each linear layer is stored and fed.
 pub trait WeightFormat: Module {
     /// `Ok` when the top-level `config.json` declares this format; else the refusal naming the
     /// offending key.
     fn check_config(&self, top: &serde_json::Value) -> Result<(), ModelError>;
+    /// The format as the `config.json` `top` (which [`WeightFormat::check_config`] accepted)
+    /// configures it: which layers are quantized, the weight and activation schemes. Refuses a
+    /// declared variant this packaging does not serve (`quant_scheme_unsupported` naming the
+    /// field). A format without parameters returns itself.
+    fn configure(&self, top: &serde_json::Value) -> Result<Arc<dyn WeightFormat>, ModelError>;
+    /// The configured format in words (its name, plus the parameters for a configured format):
+    /// two formats are equal when their descriptions are.
+    fn describe(&self) -> String {
+        self.name().to_string()
+    }
     /// `Ok` when a checkpoint tensor is stored in this format; else the refusal naming it.
     fn check_tensor(&self, entry: &TensorEntry) -> Result<(), ModelError>;
-    /// The dtype of the loaded parameters.
-    fn weight_dtype(&self) -> DType;
-    /// The dtype of the executor's activations.
-    fn activation_dtype(&self) -> DType;
-    /// The dtype of the KV cache.
-    fn kv_dtype(&self) -> DType;
-    /// Stored bytes per parameter (the budget's weight term).
-    fn bytes_per_param(&self) -> u64;
+    /// The support-matrix `weight_format` column of checkpoints in this packaging.
+    fn column(&self) -> WeightFormatColumn;
+    /// The scheme of one linear layer (`Bf16` for layers the checkpoint leaves unquantized).
+    fn scheme(&self, _layer: &LinearSlot) -> QuantScheme {
+        QuantScheme::Bf16
+    }
+    /// How activations are quantized before the quantized layers.
+    fn activation(&self) -> ActivationQuant {
+        ActivationQuant::None
+    }
+    /// The checkpoint tensors the loader reads for `base` (a family's slot): for a quantized
+    /// linear layer its packed data plus scales, zero points or activation scales; else `base`.
+    fn slots(&self, base: &WeightSlot) -> Vec<WeightSlot> {
+        vec![base.clone()]
+    }
+    /// The dtype a loaded slot is stored in on the device.
+    fn slot_dtype(&self, _slot: &WeightSlot) -> DType {
+        Bf16::DTYPE
+    }
+    /// Refuses a tensor-parallel shard of family slot `base` (its `source` set) that cuts a
+    /// quantized layer's groups or blocks (`quant_shard_misaligned` naming the layer). The
+    /// loader calls it before [`WeightFormat::slots`]; unquantized slots always split.
+    fn check_shard(&self, base: &WeightSlot) -> Result<(), ModelError> {
+        let _ = base;
+        Ok(())
+    }
+    /// Whether the loader passes `slot`'s checkpoint bytes through [`WeightFormat::repack`]
+    /// (read whole, rewritten, then uploaded) instead of copying them as they are. The shape of a
+    /// repacked slot is the loaded layout; its checkpoint tensor may differ in shape and dtype.
+    fn repacks(&self, _slot: &WeightSlot) -> bool {
+        false
+    }
+    /// Whether `slot` (a check-only slot, no elements) may be absent from the checkpoint: the
+    /// loader validates it when present and skips it otherwise (compressed-tensors
+    /// `weight_g_idx`). Default: every slot is required.
+    fn optional(&self, _slot: &WeightSlot) -> bool {
+        false
+    }
+    /// The format as the selected kernels serve it on one device (Phase 6a S-8): `supports`
+    /// answers whether a provider in the selection order runs a quantized layer's `qgemm`, and
+    /// a format with a load-time fallback moves the layers of `slots` (the slots the device
+    /// loads) it cannot serve there — block-scaled FP8 decoded to BF16, logged
+    /// `event="fp8_block_decoded"`. `None`: unchanged (for every other format an unserved layer
+    /// is the kernel registry's refusal).
+    fn for_kernels(
+        &self,
+        slots: &[WeightSlot],
+        supports: &dyn Fn(&QGemmConfig) -> bool,
+    ) -> Option<Arc<dyn WeightFormat>> {
+        let _ = (slots, supports);
+        None
+    }
+    /// Other checkpoint tensors [`WeightFormat::repack_with`] of `slot` reads (e.g. the block
+    /// scales of a weight decoded at load); the loader passes them in this order.
+    fn companions(&self, _slot: &WeightSlot) -> Vec<String> {
+        Vec::new()
+    }
+    /// [`WeightFormat::repack`] with the [`WeightFormat::companions`] of `slot` (entry and
+    /// bytes each, in order). Default: `repack`.
+    fn repack_with(
+        &self,
+        slot: &WeightSlot,
+        entry: &TensorEntry,
+        bytes: Vec<u8>,
+        companions: &[(&TensorEntry, Vec<u8>)],
+    ) -> Result<Vec<u8>, ModelError> {
+        let _ = companions;
+        self.repack(slot, entry, bytes)
+    }
+    /// Rewrites the checkpoint tensor `entry`'s bytes into the layout of `slot` the kernels
+    /// consume (e.g. AWQ's nibble order, scales to F32); the result must be exactly the slot's
+    /// bytes in [`WeightFormat::slot_dtype`]. Only called when [`WeightFormat::repacks`].
+    fn repack(
+        &self,
+        _slot: &WeightSlot,
+        _entry: &TensorEntry,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, ModelError> {
+        Ok(bytes)
+    }
+    /// Device bytes of every parameter `cfg` loads: every slot of [`WeightFormat::slots`] at
+    /// its shape and [`WeightFormat::slot_dtype`] (a quantized layer's packed data, scales, zero
+    /// points and activation scales; embeddings and norms in BF16). The memory budget's weight
+    /// term; exactly the bytes the loader uploads.
+    fn weight_bytes(&self, cfg: &ModelArchConfig) -> u64 {
+        cfg.family
+            .0
+            .weight_slots(cfg)
+            .iter()
+            .flat_map(|s| self.slots(s))
+            .map(|s| {
+                s.shape.iter().map(|&d| d as u64).product::<u64>()
+                    * self.slot_dtype(&s).size_bytes() as u64
+            })
+            .sum()
+    }
+    /// Test support (Phase 6a fixtures): rewrites the BF16 tiny checkpoint in `dir` (written by
+    /// a family's `write_tiny`) into this packaging as configured — every tensor it quantizes,
+    /// and `config.json`'s `quantization_config` — and, when `twin` is given, writes there the
+    /// same model in BF16 whose weights are the exact dequantized values (the reference the
+    /// quantized checkpoint is compared with). `Ok(false)`: the format has no tiny writer.
+    fn write_tiny(&self, dir: &Path, twin: Option<&Path>) -> Result<bool, ModelError> {
+        let _ = (dir, twin);
+        Ok(false)
+    }
 }
 
-/// A registered weight format as a value of `ModelArchConfig`: equal by name, printed as its
-/// name.
-#[derive(Clone, Copy)]
-pub struct WeightFormatRef(pub &'static dyn WeightFormat);
+impl QuantScheme {
+    /// The name in the `weight_format` log event (`bf16`, `fp8_channel`, `int4_group_zp`, …).
+    pub fn name(self) -> &'static str {
+        self.kernel().map_or("bf16", QuantSchemeDesc::as_str)
+    }
+}
+
+/// What `/turbine/v1/status` reports under `quantization` and the `weight_format` log event
+/// records (Phase 6a S-19): the support-matrix column, the packaging, the activation scheme,
+/// the L0 KV dtype and the number of linear layers per scheme.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct QuantizationSummary {
+    pub weight_format: &'static str,
+    pub packaging: &'static str,
+    pub activation: String,
+    pub kv_dtype: &'static str,
+    /// Linear layers (the LM head included) per scheme name.
+    pub layers: std::collections::BTreeMap<&'static str, u32>,
+}
+
+impl QuantizationSummary {
+    pub fn of(cfg: &ModelArchConfig) -> QuantizationSummary {
+        let format = cfg.weight_format.get();
+        let mut layers = std::collections::BTreeMap::new();
+        for l in cfg.linear_slots() {
+            *layers.entry(format.scheme(&l).name()).or_insert(0) += 1;
+        }
+        QuantizationSummary {
+            weight_format: format.column().as_str(),
+            packaging: format.name(),
+            activation: format.activation().name(),
+            kv_dtype: if cfg.kv_cache.is_fp8() {
+                "fp8_e4m3"
+            } else {
+                "bf16"
+            },
+            layers,
+        }
+    }
+
+    /// The `weight_format` INFO event at load (Phase 6a S-19), with the loaded `weight_bytes`.
+    pub fn log(&self, weight_bytes: u64) {
+        let layers: Vec<String> = self
+            .layers
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect();
+        tracing::info!(
+            event = "weight_format",
+            weight_format = self.weight_format,
+            packaging = self.packaging,
+            activation = %self.activation,
+            kv_dtype = self.kv_dtype,
+            layers = %layers.join(","),
+            weight_bytes,
+            "weights loaded"
+        );
+    }
+}
+
+/// The reason code of a quantization refusal in `e`'s text (`quant_scheme_unsupported`,
+/// `gptq_act_order`, `quant_moe_phase7`, `quant_shard_misaligned`,
+/// `quant_pipeline_unsupported`, `phase-2b-nvidia`); `None` for any other error.
+pub fn quant_refusal_reason(e: &ModelError) -> Option<&'static str> {
+    const CODES: [&str; 6] = [
+        "quant_scheme_unsupported",
+        "gptq_act_order",
+        "quant_moe_phase7",
+        "quant_shard_misaligned",
+        "quant_pipeline_unsupported",
+        "phase-2b-nvidia",
+    ];
+    let text = e.to_string();
+    CODES.into_iter().find(|c| text.contains(c))
+}
+
+/// Logs `e` as the `quant_refused` ERROR event (Phase 6a S-19) when it is a quantization
+/// refusal; nothing otherwise.
+pub fn log_quant_refusal(context: &str, e: &ModelError) {
+    if let Some(reason) = quant_refusal_reason(e) {
+        tracing::error!(event = "quant_refused", reason, context, "{e}");
+    }
+}
+
+/// A configured weight format as a value of `ModelArchConfig`: equal by
+/// [`WeightFormat::describe`], printed as its name.
+#[derive(Clone)]
+pub struct WeightFormatRef(pub Arc<dyn WeightFormat>);
+
+impl WeightFormatRef {
+    /// The format.
+    pub fn get(&self) -> &dyn WeightFormat {
+        self.0.as_ref()
+    }
+}
+
+/// Sets `cfg`'s weight format to the one `providers` (the selection order's) serve for the
+/// weight `slots` one device loads ([`WeightFormat::for_kernels`]); before the requirements, the
+/// memory budget and the load, which all read it. Unchanged for formats without a fallback.
+pub fn resolve_for_providers(
+    cfg: &mut ModelArchConfig,
+    slots: &[WeightSlot],
+    providers: &[Arc<dyn KernelProvider>],
+) {
+    let supports = |c: &QGemmConfig| {
+        providers
+            .iter()
+            .any(|p| OpConfig::QGemm(*c).supported_by(p.as_ref()))
+    };
+    if let Some(format) = cfg.weight_format.get().for_kernels(slots, &supports) {
+        cfg.weight_format = WeightFormatRef(format);
+    }
+}
 
 impl PartialEq for WeightFormatRef {
     fn eq(&self, other: &WeightFormatRef) -> bool {
-        self.0.name() == other.0.name()
+        self.0.describe() == other.0.describe()
     }
 }
 
@@ -55,20 +409,72 @@ impl std::fmt::Debug for WeightFormatRef {
     }
 }
 
-static WEIGHT_FORMATS: Registry<dyn WeightFormat> = Registry::new("weight_format", &[&Bf16]);
+static WEIGHT_FORMATS: Registry<dyn WeightFormat> = Registry::new(
+    "weight_format",
+    &[
+        &Bf16,
+        &ct_fp8::CT_FP8,
+        &hf_fp8::HF_FP8,
+        &awq::AWQ,
+        &gptq::GPTQ,
+        &ct_pack_int4::CT_PACK_INT4,
+        &ct_mxfp4::CT_MXFP4,
+        &quark_mxfp4::QUARK_MXFP4,
+        &openai_mxfp4::OPENAI_MXFP4,
+    ],
+);
 
 /// Every weight format, in detection order.
 pub fn registry() -> &'static Registry<dyn WeightFormat> {
     &WEIGHT_FORMATS
 }
 
+/// Test support: copies every file of the checkpoint directory `from` into `to` (created).
+pub(crate) fn copy_checkpoint(from: &Path, to: &Path) -> Result<(), ModelError> {
+    let io = |path: &Path, e: std::io::Error| ModelError::Io {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    };
+    std::fs::create_dir_all(to).map_err(|e| io(to, e))?;
+    for entry in std::fs::read_dir(from).map_err(|e| io(from, e))? {
+        let path = entry.map_err(|e| io(from, e))?.path();
+        if path.is_file() {
+            let dest = to.join(path.file_name().expect("a file has a name"));
+            std::fs::copy(&path, &dest).map_err(|e| io(&dest, e))?;
+        }
+    }
+    Ok(())
+}
+
+/// The containers the umbrella reserves for the deferred `phase-2b-nvidia` (NVFP4, ModelOpt):
+/// their refusal names that track instead of "no format".
+fn reserved_for_nvidia(top: &serde_json::Value) -> Option<ModelError> {
+    let q = top.get("quantization_config").filter(|q| !q.is_null())?;
+    let text = |k: &str| q.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let container = match (text("quant_method"), text("format")) {
+        ("modelopt", _) => "modelopt",
+        (_, "nvfp4-pack-quantized") => "compressed-tensors nvfp4-pack-quantized",
+        _ => return None,
+    };
+    Some(config::unsupported(
+        "quantization_config",
+        container,
+        "phase-2b-nvidia: NVFP4 and ModelOpt checkpoints arrive with NVIDIA support",
+    ))
+}
+
 /// The format of a top-level `config.json`: the first registered format whose
-/// [`WeightFormat::check_config`] accepts it, else the first format's refusal.
-pub fn detect(top: &serde_json::Value) -> Result<&'static dyn WeightFormat, ModelError> {
+/// [`WeightFormat::check_config`] accepts it, configured from it
+/// ([`WeightFormat::configure`], whose refusal is returned); a container reserved for the
+/// deferred NVIDIA track is refused naming `phase-2b-nvidia`; else the first format's refusal.
+pub fn detect(top: &serde_json::Value) -> Result<Arc<dyn WeightFormat>, ModelError> {
+    if let Some(err) = reserved_for_nvidia(top) {
+        return Err(err);
+    }
     let mut first_err = None;
     for format in registry().iter() {
         match format.check_config(top) {
-            Ok(()) => return Ok(format),
+            Ok(()) => return format.configure(top),
             Err(e) => {
                 first_err.get_or_insert(e);
             }
@@ -144,13 +550,439 @@ mod tests {
         ] {
             let format = detect(&top).unwrap();
             assert_eq!(format.name(), "bf16", "{top}");
-            assert_eq!(format.bytes_per_param(), 2);
-            assert_eq!(format.weight_dtype().size_bytes(), 2);
-            assert_eq!(format.activation_dtype(), format.weight_dtype());
-            assert_eq!(format.kv_dtype(), format.weight_dtype());
+            assert_eq!(format.column(), WeightFormatColumn::Bf16);
         }
         let a = WeightFormatRef(detect(&json!({})).unwrap());
-        assert_eq!(a, WeightFormatRef(registry().get("bf16").unwrap()));
+        assert_eq!(a, WeightFormatRef(Arc::new(Bf16)));
         assert_eq!(format!("{a:?}"), "bf16");
+    }
+
+    /// A compressed-tensors FP8 `quantization_config` of weight strategy `strategy` and input
+    /// activations `input` (`null`: weight-only).
+    fn ct(strategy: &str, block: serde_json::Value, input: serde_json::Value) -> serde_json::Value {
+        json!({
+            "config_groups": {"group_0": {
+                "input_activations": input,
+                "targets": ["Linear"],
+                "weights": {"num_bits": 8, "type": "float", "strategy": strategy,
+                            "dynamic": false, "symmetric": true, "block_structure": block},
+            }},
+            "format": "float-quantized",
+            "ignore": ["lm_head"],
+            "kv_cache_scheme": null,
+            "quant_method": "compressed-tensors",
+        })
+    }
+
+    fn act(strategy: &str, dynamic: bool, group: serde_json::Value) -> serde_json::Value {
+        json!({"num_bits": 8, "type": "float", "strategy": strategy, "dynamic": dynamic,
+               "group_size": group, "symmetric": true})
+    }
+
+    /// The field and supported text of a `quant_scheme_unsupported` refusal.
+    fn refused(q: serde_json::Value) -> (String, String) {
+        match detect(&json!({ "quantization_config": q })) {
+            Err(ModelError::Unsupported {
+                field, supported, ..
+            }) => (field, supported),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A Quark MXFP4 `quantization_config` (weight-only, or W4A4 with `a4`).
+    fn quark(a4: bool) -> serde_json::Value {
+        let mx = |dynamic: bool| {
+            json!({"dtype": "fp4", "qscheme": "per_group", "group_size": 32,
+                   "scale_format": "e8m0", "is_dynamic": dynamic, "round_method": "half_even",
+                   "scale_calculation_mode": "even"})
+        };
+        json!({
+            "quant_method": "quark",
+            "global_quant_config": {"weight": mx(false),
+                                    "input_tensors": if a4 { mx(true) } else { json!(null) },
+                                    "output_tensors": null, "bias": null},
+            "exclude": ["lm_head"],
+            "export": {"weight_format": "real_quantized", "pack_method": "reorder"},
+            "algo_config": [{"name": "gptq", "desc_act": true, "static_groups": true}],
+            "layer_quant_config": {}, "layer_type_quant_config": {}, "kv_cache_quant_config": {},
+        })
+    }
+
+    /// Phase 6a S-2, S-3: tiny checkpoints written in each FP8, INT4 and MXFP4 variant (all
+    /// nine packagings) are detected as the right packaging and column, with the
+    /// right scheme on a projection, `BF16` on the LM head, and the right activation mode;
+    /// unsupported variants are refused `quant_scheme_unsupported` naming the field. Breaks if
+    /// a container maps to the wrong column, scheme or activation, or a refusal loses its
+    /// reason.
+    #[test]
+    fn detect_every_packaging() {
+        use crate::testing::tiny::write_tiny_quantized;
+        let tmp = crate::testing::TempDir::new("turbine-detect-packaging");
+        let block = json!([128, 128]);
+        let cases = [
+            (
+                ct("tensor", json!(null), act("tensor", false, json!(null))),
+                "ct_fp8",
+                WeightFormatColumn::Fp8,
+                QuantScheme::Fp8Channel,
+                ActivationQuant::Fp8PerTensorStatic,
+            ),
+            (
+                ct("channel", json!(null), act("token", true, json!(null))),
+                "ct_fp8",
+                WeightFormatColumn::Fp8,
+                QuantScheme::Fp8Channel,
+                ActivationQuant::Fp8PerTokenDynamic,
+            ),
+            (
+                ct("channel", json!(null), json!(null)),
+                "ct_fp8",
+                WeightFormatColumn::Fp8,
+                QuantScheme::Fp8Channel,
+                ActivationQuant::None,
+            ),
+            (
+                ct("block", block.clone(), act("group", true, json!(128))),
+                "ct_fp8",
+                WeightFormatColumn::Fp8Block,
+                // Block-scaled FP8 stays FP8 (W8A16: BF16 activations); decoding to BF16 is
+                // only the per-device fallback (`for_kernels`).
+                QuantScheme::Fp8Block { n: 128, k: 128 },
+                ActivationQuant::None,
+            ),
+            (
+                json!({"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+                       "weight_block_size": [128, 128]}),
+                "hf_fp8",
+                WeightFormatColumn::Fp8Block,
+                // Block-scaled FP8 stays FP8 (W8A16: BF16 activations); decoding to BF16 is
+                // only the per-device fallback (`for_kernels`).
+                QuantScheme::Fp8Block { n: 128, k: 128 },
+                ActivationQuant::None,
+            ),
+            (
+                json!({"quant_method": "fp8", "activation_scheme": "static"}),
+                "hf_fp8",
+                WeightFormatColumn::Fp8,
+                QuantScheme::Fp8Channel,
+                ActivationQuant::Fp8PerTensorStatic,
+            ),
+            (
+                json!({"quant_method": "awq", "bits": 4, "group_size": 128, "zero_point": true,
+                       "version": "gemm", "modules_to_not_convert": null}),
+                "awq",
+                WeightFormatColumn::AwqInt4,
+                QuantScheme::Int4Group {
+                    group: 128,
+                    zero_points: true,
+                },
+                ActivationQuant::None,
+            ),
+            (
+                json!({"quant_method": "gptq", "bits": 4, "group_size": 128, "desc_act": false,
+                       "sym": true}),
+                "gptq",
+                WeightFormatColumn::GptqInt4,
+                QuantScheme::Int4Group {
+                    group: 128,
+                    zero_points: false,
+                },
+                ActivationQuant::None,
+            ),
+            (
+                json!({"quant_method": "gptq", "bits": 4, "group_size": 64, "desc_act": false,
+                       "sym": false, "checkpoint_format": "gptq"}),
+                "gptq",
+                WeightFormatColumn::GptqInt4,
+                QuantScheme::Int4Group {
+                    group: 64,
+                    zero_points: true,
+                },
+                ActivationQuant::None,
+            ),
+            (
+                json!({"quant_method": "compressed-tensors", "format": "pack-quantized",
+                       "ignore": ["lm_head"],
+                       "config_groups": {"group_0": {"targets": ["Linear"],
+                           "input_activations": null,
+                           "weights": {"num_bits": 4, "type": "int", "symmetric": true,
+                                       "strategy": "group", "group_size": 128,
+                                       "actorder": null}}}}),
+                "ct_pack_int4",
+                WeightFormatColumn::GptqInt4,
+                QuantScheme::Int4Group {
+                    group: 128,
+                    zero_points: false,
+                },
+                ActivationQuant::None,
+            ),
+            (
+                json!({"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+                       "ignore": ["lm_head"],
+                       "config_groups": {"group_0": {"targets": ["Linear"],
+                           "input_activations": null,
+                           "weights": {"num_bits": 4, "type": "float", "strategy": "group",
+                                       "group_size": 32, "actorder": "static"}}}}),
+                "ct_mxfp4",
+                WeightFormatColumn::Mxfp4,
+                QuantScheme::Mxfp4,
+                ActivationQuant::None,
+            ),
+            (
+                quark(false),
+                "quark_mxfp4",
+                WeightFormatColumn::Mxfp4,
+                QuantScheme::Mxfp4,
+                ActivationQuant::None,
+            ),
+            (
+                quark(true),
+                "quark_mxfp4",
+                WeightFormatColumn::Mxfp4A4,
+                QuantScheme::Mxfp4,
+                ActivationQuant::Mxfp4Emulated,
+            ),
+            (
+                json!({"quant_method": "mxfp4", "modules_to_not_convert": ["lm_head"]}),
+                "openai_mxfp4",
+                WeightFormatColumn::Mxfp4,
+                QuantScheme::Mxfp4,
+                ActivationQuant::None,
+            ),
+        ];
+        for (i, (q, name, column, scheme, activation)) in cases.into_iter().enumerate() {
+            let fixture = write_tiny_quantized(&tmp.path().join(i.to_string()), 3, &q, 128, 128);
+            let cfg = &fixture.quantized.config;
+            let format = cfg.weight_format.get();
+            assert_eq!(
+                (format.name(), format.column(), format.activation()),
+                (name, column, activation),
+                "{q}"
+            );
+            let linear = cfg.linear_slots();
+            let q_proj = linear
+                .iter()
+                .find(|l| l.name.ends_with("layers.0.self_attn.q_proj.weight"))
+                .expect("q_proj");
+            assert_eq!(format.scheme(q_proj), scheme, "{q}");
+            let lm_head = crate::weights::LinearSlot {
+                name: crate::loader::LM_HEAD.into(),
+                n: cfg.vocab_size,
+                k: cfg.hidden,
+            };
+            assert_eq!(format.scheme(&lm_head), QuantScheme::Bf16, "{q}");
+            // The twin is plain BF16.
+            assert_eq!(fixture.twin.config.weight_format.get().name(), "bf16");
+            // Configured formats compare by their parameters.
+            assert_ne!(cfg.weight_format, WeightFormatRef(Arc::new(Bf16)), "{q}");
+        }
+
+        let mut four_bit = ct("channel", json!(null), json!(null));
+        four_bit["config_groups"]["group_0"]["weights"]["num_bits"] = json!(4);
+        let (field, supported) = refused(four_bit);
+        assert_eq!(field, "weights");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
+        let (field, supported) = refused(ct("block", json!([64, 64]), json!(null)));
+        assert_eq!(field, "weights.block_structure");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
+        let (field, supported) = refused(
+            json!({"quant_method": "fp8", "activation_scheme": "dynamic",
+                   "weight_block_size": [64, 64]}),
+        );
+        assert_eq!(field, "weight_block_size");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
+        let (field, _) = refused(ct("channel", json!(null), act("token", false, json!(null))));
+        assert_eq!(field, "input_activations");
+
+        // A Quark checkpoint quantizing its KV cache (the AMD Llama-3.1-8B-Instruct W4A4 proof
+        // checkpoint) loads: that part of its recipe is ignored with a WARN.
+        let mut kv_quark = quark(true);
+        kv_quark["kv_cache_quant_config"] = json!({"*k_proj": {"input_tensors": {"dtype": "fp4"}}});
+        let format = detect(&json!({ "quantization_config": kv_quark })).expect("loads");
+        assert_eq!(format.column(), WeightFormatColumn::Mxfp4A4);
+        // Quark repeats that KV recipe as K/V projection overrides that change only
+        // `output_tensors` (the AMD 8B checkpoint): accepted. An override that changes a
+        // projection's weight scheme, or one not mirrored in kv_cache_quant_config, is refused.
+        let mut kv_layers = quark(true);
+        let mut kv_spec = kv_layers["global_quant_config"].clone();
+        kv_spec["output_tensors"] = json!({"dtype": "fp8_e4m3", "qscheme": "per_tensor"});
+        let recipe = json!({"*k_proj": kv_spec.clone(), "*v_proj": kv_spec.clone()});
+        kv_layers["kv_cache_quant_config"] = recipe.clone();
+        kv_layers["layer_quant_config"] = recipe;
+        let format = detect(&json!({ "quantization_config": kv_layers.clone() })).expect("loads");
+        assert_eq!(format.column(), WeightFormatColumn::Mxfp4A4);
+        let mut other_weight = kv_layers.clone();
+        other_weight["layer_quant_config"]["*k_proj"]["weight"]["group_size"] = json!(64);
+        other_weight["kv_cache_quant_config"]["*k_proj"]["weight"]["group_size"] = json!(64);
+        assert_eq!(refused(other_weight).0, "layer_quant_config.*k_proj");
+        let mut not_kv = kv_layers;
+        not_kv["layer_quant_config"]["*o_proj"] = kv_spec;
+        assert_eq!(refused(not_kv).0, "layer_quant_config.*o_proj");
+
+        // MXFP4 refusals: a compressed-tensors group of 64; NVFP4 names the NVIDIA track.
+        let (field, supported) = refused(json!({
+            "quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+            "config_groups": {"group_0": {"targets": ["Linear"], "input_activations": null,
+                "weights": {"num_bits": 4, "type": "float", "strategy": "group",
+                            "group_size": 64}}}}));
+        assert_eq!(field, "weights.group_size");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
+        let (field, supported) = refused(json!({
+            "quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized"}));
+        assert_eq!(field, "quantization_config");
+        assert!(supported.starts_with("phase-2b-nvidia"), "{supported}");
+
+        // INT4 refusals: 3-bit GPTQ, act order, AWQ GEMV, a group of 16.
+        let (field, supported) =
+            refused(json!({"quant_method": "gptq", "bits": 3, "group_size": 128}));
+        assert_eq!(field, "bits");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
+        let (field, supported) = refused(
+            json!({"quant_method": "gptq", "bits": 4, "group_size": 128, "desc_act": true}),
+        );
+        assert_eq!(field, "desc_act");
+        assert!(supported.starts_with("gptq_act_order"), "{supported}");
+        let (field, _) = refused(json!({"quant_method": "awq", "bits": 4, "group_size": 128,
+                                        "zero_point": true, "version": "gemv"}));
+        assert_eq!(field, "version");
+        let (field, supported) =
+            refused(json!({"quant_method": "awq", "bits": 4, "group_size": 16,
+                           "zero_point": true, "version": "gemm"}));
+        assert_eq!(field, "group_size");
+        assert!(
+            supported.starts_with("quant_scheme_unsupported"),
+            "{supported}"
+        );
+    }
+
+    /// Review r13 C7, C8: every compressed-tensors packaging (FP8, packed INT4, MXFP4) refuses a
+    /// non-null `output_activations` and a `kv_cache_scheme` other than null or static FP8 per
+    /// tensor with `quant_scheme_unsupported`, and accepts the static FP8 KV scheme. Breaks if a
+    /// packaging silently drops an output quantization or skips the shared KV-scheme check.
+    #[test]
+    fn ct_packagings_refuse_output_and_kv_schemes() {
+        let int4 = json!({"quant_method": "compressed-tensors", "format": "pack-quantized",
+            "config_groups": {"group_0": {"targets": ["Linear"], "input_activations": null,
+                "weights": {"num_bits": 4, "type": "int", "symmetric": true,
+                            "strategy": "group", "group_size": 128, "actorder": null}}}});
+        let mx = json!({"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+            "config_groups": {"group_0": {"targets": ["Linear"], "input_activations": null,
+                "weights": {"num_bits": 4, "type": "float", "strategy": "group",
+                            "group_size": 32, "actorder": "static"}}}});
+        let fp8 = ct("channel", json!(null), act("token", true, json!(null)));
+        for (name, base) in [("ct_fp8", fp8), ("ct_pack_int4", int4), ("ct_mxfp4", mx)] {
+            let top = |q: serde_json::Value| json!({ "quantization_config": q });
+            assert_eq!(detect(&top(base.clone())).expect(name).name(), name);
+
+            let mut out = base.clone();
+            out["config_groups"]["group_0"]["output_activations"] =
+                act("tensor", false, json!(null));
+            let (field, supported) = refused(out);
+            assert_eq!(field, "output_activations", "{name}");
+            assert!(
+                supported.starts_with("quant_scheme_unsupported"),
+                "{name}: {supported}"
+            );
+
+            for kv in [
+                json!({"num_bits": 4, "type": "int", "strategy": "tensor", "dynamic": false}),
+                json!({"num_bits": 8, "type": "float", "strategy": "tensor", "dynamic": true}),
+                json!({"num_bits": 8, "type": "float", "strategy": "channel", "dynamic": false}),
+            ] {
+                let mut q = base.clone();
+                q["kv_cache_scheme"] = kv.clone();
+                let (field, supported) = refused(q);
+                assert_eq!(field, "kv_cache_scheme", "{name} {kv}");
+                assert!(
+                    supported.starts_with("quant_scheme_unsupported"),
+                    "{name}: {supported}"
+                );
+            }
+            let mut q = base.clone();
+            q["kv_cache_scheme"] =
+                json!({"num_bits": 8, "type": "float", "strategy": "tensor", "dynamic": false});
+            assert_eq!(detect(&top(q)).expect(name).name(), name, "static FP8 KV");
+        }
+    }
+
+    /// Phase 6a S-3: the BF16 entry describes every linear layer of a tiny Llama as unquantized
+    /// BF16 with BF16 activations, its slots are the family's, and its weight bytes are two per
+    /// parameter; the scheme byte counts include scales and zero points. Breaks if a default
+    /// quantizes a BF16 layer or the byte accounting drops the scale tensors.
+    #[test]
+    fn bf16_describes_linear_layers() {
+        let tmp = crate::testing::TempDir::new("turbine-bf16-linear");
+        let family = crate::families::registry().get("llama").expect("llama");
+        let spec = family.write_tiny(tmp.path(), 3);
+        let cfg = &spec.config;
+        let format = registry().get("bf16").unwrap();
+        let linear = cfg.linear_slots();
+        assert!(!linear.is_empty());
+        // q/k/v/o and gate/up/down per layer, plus lm_head when untied.
+        let per_layer = 7;
+        let head = usize::from(!cfg.tie_word_embeddings);
+        assert_eq!(linear.len(), cfg.num_layers as usize * per_layer + head);
+        for l in &linear {
+            assert_eq!(format.scheme(l), QuantScheme::Bf16, "{}", l.name);
+            assert!(!l.name.contains("embed_tokens"), "{}", l.name);
+        }
+        assert_eq!(format.activation(), ActivationQuant::None);
+        for s in family.weight_slots(cfg) {
+            assert_eq!(format.slots(&s), vec![s.clone()]);
+            assert_eq!(format.slot_dtype(&s), DType::BF16);
+        }
+        let params: u64 = family
+            .weight_slots(cfg)
+            .iter()
+            .map(|s| s.shape.iter().map(|&d| d as u64).product::<u64>())
+            .sum();
+        assert_eq!(format.weight_bytes(cfg), 2 * params);
+        assert_eq!(cfg.shape().weight_bytes, 2 * params);
+
+        // Scheme sizes for a 256 × 512 layer.
+        assert_eq!(QuantScheme::Bf16.bytes(256, 512), 262_144);
+        assert_eq!(QuantScheme::Fp8Tensor.bytes(256, 512), 131_072 + 4);
+        assert_eq!(QuantScheme::Fp8Channel.bytes(256, 512), 131_072 + 4 * 256);
+        assert_eq!(
+            QuantScheme::Fp8Block { n: 128, k: 128 }.bytes(256, 512),
+            131_072 + 4 * 8
+        );
+        assert_eq!(
+            QuantScheme::Int4Group {
+                group: 128,
+                zero_points: true
+            }
+            .bytes(256, 512),
+            65_536 + 5 * 1024
+        );
+        assert_eq!(
+            QuantScheme::Int4Group {
+                group: 128,
+                zero_points: false
+            }
+            .bytes(256, 512),
+            65_536 + 4 * 1024
+        );
+        assert_eq!(QuantScheme::Mxfp4.bytes(256, 512), 65_536 + 4096);
+        assert_eq!(QuantScheme::Bf16.kernel(), None);
+        assert_eq!(
+            ActivationQuant::Fp8PerTensorStatic.kernel(),
+            ActQuantDesc::Fp8Tensor
+        );
     }
 }

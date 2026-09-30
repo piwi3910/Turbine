@@ -97,6 +97,16 @@ pub struct ModelMetrics {
     pub token_mask_seconds: Histogram,
     /// Tool-call parser results by parser and outcome (P2 S-18).
     pub tool_calls: Family<ToolCallLabels, Counter>,
+    /// `turbine_weight_format_info{format,packaging}` = 1 for the loaded checkpoint (Phase 6a
+    /// S-19).
+    pub weight_format_info: Family<WeightFormatInfoLabels, Gauge>,
+}
+
+/// Labels of `turbine_weight_format_info`: the support-matrix column and the packaging.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct WeightFormatInfoLabels {
+    pub format: &'static str,
+    pub packaging: &'static str,
 }
 
 impl ModelMetrics {
@@ -139,7 +149,19 @@ impl ModelMetrics {
                 "Tool-call parser results by parser and outcome",
                 Family::default(),
             ),
+            weight_format_info: reg.register(
+                "turbine_weight_format_info",
+                "The loaded checkpoint's weight format and packaging; 1 for the loaded one",
+                Family::default(),
+            ),
         }
+    }
+
+    /// Sets `turbine_weight_format_info{format,packaging}` to 1 for the loaded checkpoint.
+    pub fn record_weight_format(&self, format: &'static str, packaging: &'static str) {
+        self.weight_format_info
+            .get_or_create(&WeightFormatInfoLabels { format, packaging })
+            .set(1);
     }
 
     /// Counts one tool-call parse of a choice's output by `parser` (e.g. `llama3_json`).

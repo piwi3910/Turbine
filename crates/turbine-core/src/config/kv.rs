@@ -23,6 +23,9 @@ pub struct HostFacts {
 #[serde(deny_unknown_fields, default)]
 pub struct KvConfig {
     pub block_tokens: u32,
+    /// Element format of the L0 pages (Phase 6a S-13); `bf16`, the exact default, or the
+    /// lossy `fp8_e4m3`, which is only ever an explicit setting.
+    pub dtype: KvDtypeChoice,
     pub gpu: KvGpuConfig,
     pub cpu: KvCpuConfig,
     pub nvme: KvNvmeConfig,
@@ -43,6 +46,7 @@ impl Default for KvConfig {
     fn default() -> Self {
         KvConfig {
             block_tokens: 128,
+            dtype: KvDtypeChoice::Bf16,
             gpu: KvGpuConfig::default(),
             cpu: KvCpuConfig::default(),
             nvme: KvNvmeConfig::default(),
@@ -54,6 +58,35 @@ impl Default for KvConfig {
             prefetch: KvPrefetchConfig::default(),
             policy_weights: KvPolicyWeights::default(),
         }
+    }
+}
+
+/// `kv.dtype`: how the L0 pool stores K and V (Phase 6a S-13; `tq4` / `tq2` arrive with
+/// `phase-6b-kv-compression`).
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum KvDtypeChoice {
+    /// BF16 pages: exact.
+    #[default]
+    Bf16,
+    /// OCP e4m3fn pages with one K and one V scale per layer (the checkpoint's `k_scale` /
+    /// `v_scale` when present, else 1.0): half the bytes, lossy.
+    Fp8E4m3,
+}
+
+impl KvDtypeChoice {
+    /// The configuration spelling, also the support-matrix KV column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KvDtypeChoice::Bf16 => "bf16",
+            KvDtypeChoice::Fp8E4m3 => "fp8_e4m3",
+        }
+    }
+
+    /// True for a lossy (quantized) format.
+    pub fn is_lossy(self) -> bool {
+        self != KvDtypeChoice::Bf16
     }
 }
 
@@ -353,5 +386,34 @@ impl KvConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    fn parse(yaml: &str) -> Result<super::super::Config, ConfigError> {
+        super::super::load_from_str(yaml, Path::new("test.yaml"), &[])
+    }
+
+    /// `kv.dtype` defaults to the exact `bf16`, accepts `fp8_e4m3`, and refuses anything else
+    /// naming the key. Breaks if the default turns lossy or the key is not wired.
+    #[test]
+    fn kv_dtype_key() {
+        let base = "model: {path: /models/m}\n";
+        let default = parse(base).expect("defaults");
+        assert_eq!(default.kv.dtype, KvDtypeChoice::Bf16);
+        assert!(!default.kv.dtype.is_lossy());
+        let fp8 = parse(&format!("{base}kv: {{dtype: fp8_e4m3}}\n")).expect("fp8_e4m3");
+        assert_eq!(fp8.kv.dtype, KvDtypeChoice::Fp8E4m3);
+        assert_eq!(fp8.kv.dtype.as_str(), "fp8_e4m3");
+        assert!(fp8.kv.dtype.is_lossy());
+        for bad in ["int8", "fp8", "tq4"] {
+            let err = parse(&format!("{base}kv: {{dtype: {bad}}}\n")).expect_err(bad);
+            assert_eq!(err.key(), Some("kv.dtype"), "{bad}: {err}");
+        }
     }
 }

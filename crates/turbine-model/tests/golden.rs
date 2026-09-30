@@ -8,9 +8,11 @@
 //! - `olmoe_logits_match_reference` (lab only, likewise): OLMoE-1B-7B on the HIP provider against
 //!   `tests/golden/olmoe-1b-7b-0125-instruct/reference.jsonl` under its own calibrated
 //!   `tolerance.json` (see the README beside it).
-//! - `hip_trace_vs_cpu_3b` and `olmoe_teacher_forced_vs_reference` (lab diagnostics, no-ops
-//!   unless their environment variable names prompts): op-by-op HIP-vs-CPU traces of the 3B,
-//!   and teacher-forced OLMoE log-probabilities of both providers against its reference.
+//! - `hip_trace_vs_cpu_3b`, `olmoe_teacher_forced_vs_reference` and
+//!   `mxfp4_decode_vs_prefill_trace` (lab diagnostics, no-ops unless their environment variable
+//!   names prompts): op-by-op HIP-vs-CPU traces of the 3B, teacher-forced OLMoE
+//!   log-probabilities of both providers against its reference, and the MXFP4-A16 8B's decode
+//!   steps against one prefill of the same tokens, op by op.
 //!
 //! The first three judge with the committed `tolerance.json` and the same rule as `turbine-golden compare`,
 //! re-implemented in [`compare_prompt`] because this crate cannot depend on `turbine-bench`
@@ -39,7 +41,7 @@ use turbine_model::testing::tiny::write_tiny_llama;
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::{
     ChatTemplate, MAX_STAGING_BYTES, SafetensorsIndex, Tokenizer, WeightLoader, llama_slots,
-    load_model_config,
+    load_model_config, load_model_config_with,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::DeviceMemory;
@@ -880,7 +882,18 @@ fn build_any_executor(
     mem: Arc<dyn DeviceMemory>,
     max_seq_len: u32,
 ) -> AnyRunner {
-    let cfg = load_model_config(model_dir).expect("config.json");
+    build_any_executor_with(model_dir, None, provider, mem, max_seq_len)
+}
+
+/// [`build_any_executor`] with a `model.rope_scaling` override (the YaRN golden).
+fn build_any_executor_with(
+    model_dir: &Path,
+    rope_scaling: Option<&serde_json::Value>,
+    provider: Arc<dyn KernelProvider>,
+    mem: Arc<dyn DeviceMemory>,
+    max_seq_len: u32,
+) -> AnyRunner {
+    let cfg = load_model_config_with(model_dir, rope_scaling).expect("config.json");
     let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
     let slots = cfg.family.0.weight_slots(&cfg);
     let weights =
@@ -926,6 +939,8 @@ struct ForcedPosition {
     argmax: u32,
     likely: f32,
     tail: f32,
+    /// The reference's top-5 at this position: (token, reference logprob, ours).
+    candidates: Vec<(u32, f32, f32)>,
 }
 
 /// Runs `r`'s prompt and then its reference tokens (teacher-forced: every position sees the
@@ -946,7 +961,9 @@ fn teacher_forced(runner: &mut AnyRunner, r: &ReferenceRecord, floor: f32) -> Ve
             .max_by(|&a, &b| lp[a].total_cmp(&lp[b]).then(b.cmp(&a)))
             .expect("non-empty vocab") as u32;
         let (mut likely, mut tail) = (0f32, 0f32);
+        let mut candidates = Vec::with_capacity(5);
         for &(id, ref_lp) in r.top_logprobs[step].iter().take(5) {
+            candidates.push((id, ref_lp, lp[id as usize]));
             let d = (lp[id as usize] - ref_lp).abs();
             if ref_lp > floor {
                 likely = likely.max(d);
@@ -958,6 +975,7 @@ fn teacher_forced(runner: &mut AnyRunner, r: &ReferenceRecord, floor: f32) -> Ve
             argmax,
             likely,
             tail,
+            candidates,
         });
         p0 += batch.len();
         batch = vec![r.tokens[step]];
@@ -1033,5 +1051,338 @@ fn olmoe_teacher_forced_vs_reference() {
             worst(&c),
             worst(&h)
         );
+    }
+}
+
+// ------------------------------------------------------------------------------- YaRN
+
+/// The factor-16 YaRN override of `tests/golden/llama-3.2-3b-instruct-yarn16/` (its README and
+/// `scripts/lab/phase6-novanas-llama-yarn16.yaml`).
+fn yarn16_override() -> serde_json::Value {
+    serde_json::json!({
+        "rope_type": "yarn",
+        "factor": 16.0,
+        "original_max_position_embeddings": 8192,
+        "beta_fast": 32,
+        "beta_slow": 1
+    })
+}
+
+/// Prompts at most this long also run on the (scalar) cpu-reference provider in
+/// [`yarn_teacher_forced_vs_reference`]; longer ones run on HIP only.
+const YARN_CPU_MAX_TOKENS: usize = 1024;
+
+/// Lab diagnostic (P6a Tasks 28 / 28a, YaRN tail numerics), a no-op unless `TURBINE_GOLDEN_YARN`
+/// names prompts of the YaRN golden (comma-separated ids); run it alone in a release build.
+/// For each named prompt, Llama-3.2-3B with the factor-16 YaRN override runs the reference's
+/// prompt and then its tokens teacher-forced, and prints per position the largest |Δ logprob|
+/// against the transformers reference's top-5 for `hip` (the HIP provider) and `cpu` (the
+/// cpu-reference provider, only for prompts up to [`YARN_CPU_MAX_TOKENS`]), then every
+/// candidate of the positions whose tail |Δ| exceeds 0.3. Both place the attention factor on
+/// cos/sin as transformers does (Task 28a; before it, the fold into the softmax scale measured
+/// p16 tails of 1.49 cpu / 1.38 hip against 0.40 for transformers' placement).
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY, TURBINE_TEST_MODEL_DIR and TURBINE_GOLDEN_YARN"]
+fn yarn_teacher_forced_vs_reference() {
+    let Some(ids) = std::env::var("TURBINE_GOLDEN_YARN")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        println!("TURBINE_GOLDEN_YARN is not set: nothing compared");
+        return;
+    };
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let _gpu = gpu_model_lock();
+    let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+
+    let fixture = golden_dir().join("llama-3.2-3b-instruct-yarn16");
+    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
+    let tol = read_tolerance(&fixture.join("tolerance.json"));
+    let selected: Vec<&ReferenceRecord> = ids
+        .split(',')
+        .map(|id| {
+            references
+                .iter()
+                .find(|r| r.id == id.trim())
+                .unwrap_or_else(|| panic!("no reference prompt {id}"))
+        })
+        .collect();
+    let seq_len = |r: &&ReferenceRecord| (r.prompt_token_ids.len() + r.tokens.len()) as u32;
+    let max_seq_len = selected.iter().map(seq_len).max().expect("a prompt");
+    let cpu_seq_len = selected
+        .iter()
+        .filter(|r| r.prompt_token_ids.len() <= YARN_CPU_MAX_TOKENS)
+        .map(seq_len)
+        .max();
+    let rope = yarn16_override();
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut hip = build_any_executor_with(
+        &model_dir,
+        Some(&rope),
+        shim_provider(ctx),
+        mem,
+        max_seq_len,
+    );
+    let host = || HostMemory::new(turbine_core::types::DeviceId(0), 16 << 30);
+    let mut cpu = cpu_seq_len.map(|len| {
+        build_any_executor_with(
+            &model_dir,
+            Some(&rope),
+            cpu_reference_provider(),
+            host(),
+            len,
+        )
+    });
+    let worst = |v: &[ForcedPosition]| {
+        v.iter()
+            .fold((0f32, 0f32), |(l, t), p| (l.max(p.likely), t.max(p.tail)))
+    };
+    let cols = |v: &[ForcedPosition], pos: usize| {
+        v.get(pos).map_or((u32::MAX, f32::NAN, f32::NAN), |p| {
+            (p.argmax, p.likely, p.tail)
+        })
+    };
+    for r in selected {
+        let short = r.prompt_token_ids.len() <= YARN_CPU_MAX_TOKENS;
+        let h = teacher_forced(&mut hip, r, tol.likely_logprob_floor);
+        println!("YaRN {} hip max {:?}", r.id, worst(&h));
+        let forced = |runner: Option<&mut AnyRunner>| match runner {
+            Some(runner) if short => teacher_forced(runner, r, tol.likely_logprob_floor),
+            _ => Vec::new(),
+        };
+        let c = forced(cpu.as_mut());
+        println!(
+            "YaRN {} teacher-forced vs transformers (|Δ| likely / tail):",
+            r.id
+        );
+        println!("pos  ref_tok  cpu_argmax cpu_likely cpu_tail  hip_argmax hip_likely hip_tail");
+        for (pos, h) in h.iter().enumerate() {
+            let (ca, cl, ct) = cols(&c, pos);
+            println!(
+                "{pos:>3} {:>8} {ca:>10} {cl:>10.4} {ct:>8.4} {:>11} {:>10.4} {:>8.4}",
+                r.tokens[pos], h.argmax, h.likely, h.tail
+            );
+        }
+        for (pos, h) in h.iter().enumerate() {
+            let cpu_pos = c.get(pos);
+            if h.tail <= 0.3 && cpu_pos.is_none_or(|p| p.tail <= 0.3) {
+                continue;
+            }
+            println!("YaRN {} pos {pos} candidates (token ref cpu hip):", r.id);
+            for (i, &(id, ref_lp, hip_lp)) in h.candidates.iter().enumerate() {
+                let cpu_lp = cpu_pos.map_or(f32::NAN, |p| p.candidates[i].2);
+                println!("    {id:>8} {ref_lp:>9.4} {cpu_lp:>9.4} {hip_lp:>9.4}");
+            }
+        }
+        if short {
+            println!(
+                "YaRN {} max: cpu {:?}, hip {:?}",
+                r.id,
+                worst(&c),
+                worst(&h)
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------- MXFP4 decode
+
+/// Lab diagnostic (the MXFP4-A16 8B p05 golden miss), a no-op unless `TURBINE_GOLDEN_MXFP4`
+/// names `<prompt id>:<position>` (e.g. `p05:5`); needs `TURBINE_TEST_MXFP4_MODEL_DIR` (the
+/// `llama-3.1-8b-instruct-mxfp4a16` checkpoint). On the HIP provider, the prompt and the
+/// reference's first `position` tokens run twice, traced, on one executor and two KV caches:
+/// (A) the prompt as one prefill, then one decode step per token, as the server generates;
+/// (B) everything as one prefill. Prints, for the row predicting `position`, each op's
+/// difference A − B per layer (the first layer that departs is where decode and prefill
+/// disagree), the same for the K/V rows the decode steps appended, and both logprob rows.
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY, TURBINE_TEST_MXFP4_MODEL_DIR and TURBINE_GOLDEN_MXFP4"]
+fn mxfp4_decode_vs_prefill_trace() {
+    use turbine_model::executor::TraceTensor;
+    use turbine_model::testing::trace::DiffStats;
+
+    let Some(spec) = std::env::var("TURBINE_GOLDEN_MXFP4")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        println!("TURBINE_GOLDEN_MXFP4 is not set: nothing traced");
+        return;
+    };
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let _gpu = gpu_model_lock();
+    let (id, pos) = spec
+        .split_once(':')
+        .expect("TURBINE_GOLDEN_MXFP4=<id>:<position>");
+    let pos: usize = pos.parse().expect("position");
+    let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MXFP4_MODEL_DIR");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+    let fixture = golden_dir().join("llama-3.1-8b-instruct-mxfp4a16");
+    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
+    let r = references
+        .iter()
+        .find(|r| r.id == id)
+        .unwrap_or_else(|| panic!("no reference prompt {id}"));
+    let n_prompt = r.prompt_token_ids.len();
+    let max_seq_len = (n_prompt + pos + 1) as u32;
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let cfg = load_model_config(&model_dir).expect("config.json");
+    let index = SafetensorsIndex::open(&model_dir).expect("open safetensors");
+    let build = |provider: Arc<dyn KernelProvider>, mem: Arc<dyn DeviceMemory>| -> Runner {
+        let weights = WeightLoader::load_format(
+            cfg.weight_format.get(),
+            &index,
+            &llama_slots(&cfg),
+            &mem,
+            MAX_STAGING_BYTES,
+        )
+        .expect("load weights");
+        let order = [provider.id()];
+        let card = provider.card_profile();
+        let reqs = executor::available_requirements(
+            &cfg,
+            BLOCK_TOKENS,
+            ExecutorOptions::default(),
+            std::slice::from_ref(&provider),
+        );
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
+            .expect("every op has a provider");
+        let exec = DecoderExecutor::new(
+            &cfg,
+            families::llama::decoder_spec(),
+            weights,
+            Arc::new(registry),
+            mem.clone(),
+            ExecutorLimits {
+                block_tokens: BLOCK_TOKENS,
+                max_batch_tokens: max_seq_len,
+                max_seqs: 1,
+            },
+            ExecutorOptions::default(),
+        )
+        .expect("executor");
+        let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
+        Runner { exec, kv }
+    };
+    let mut a = build(shim_provider(ctx), mem.clone());
+    let mut kv_b = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
+    a.exec.set_trace(true);
+
+    // (A) prefill, then decode steps; keep every step's trace.
+    let mut steps: Vec<Vec<TraceTensor>> = Vec::new();
+    let mut batch = r.prompt_token_ids.clone();
+    let mut p0 = 0usize;
+    let mut logits_a = Vec::new();
+    for step in 0..=pos {
+        let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
+        let logits =
+            a.kv.forward(&mut a.exec, &batch, &positions)
+                .expect("forward");
+        logits_a = log_softmax(logits.row(0));
+        steps.push(a.exec.take_trace());
+        p0 += batch.len();
+        if step < pos {
+            batch = vec![r.tokens[step]];
+        }
+    }
+    // (B) one prefill of the same tokens.
+    let mut all = r.prompt_token_ids.clone();
+    all.extend_from_slice(&r.tokens[..pos]);
+    let positions: Vec<u32> = (0..all.len() as u32).collect();
+    let logits = kv_b
+        .forward(&mut a.exec, &all, &positions)
+        .expect("forward");
+    let logits_b = log_softmax(logits.row(0));
+    let trace_b = a.exec.take_trace();
+
+    let row = |t: &TraceTensor, i: usize| -> Vec<f32> {
+        let cols = t.shape[1];
+        t.data[i * cols..(i + 1) * cols].to_vec()
+    };
+    let find = |trace: &[TraceTensor], layer: Option<usize>, name: &str| -> Option<TraceTensor> {
+        trace
+            .iter()
+            .find(|e| e.layer == layer && e.name == name)
+            .cloned()
+    };
+    const OPS: [&str; 14] = [
+        "attn_norm",
+        "q",
+        "k",
+        "v",
+        "q_rope",
+        "k_rope",
+        "attn",
+        "o_proj",
+        "resid_attn",
+        "mlp_norm",
+        "gate",
+        "up",
+        "down",
+        "resid_mlp",
+    ];
+    // Step s of (A) holds positions n_prompt + s − 1 (s ≥ 1); (B) holds them all.
+    for (s, step) in steps.iter().enumerate().skip(1) {
+        let b_row = n_prompt + s - 1;
+        println!("== {id} decode step {s} (position {b_row}) A − B, per layer: max |Δ| (max ulps)");
+        println!("layer {}", OPS.join(" "));
+        for layer in 0..cfg.num_layers as usize {
+            let l = Some(layer);
+            let cells: Vec<String> = OPS
+                .iter()
+                .map(
+                    |name| match (find(step, l, name), find(&trace_b, l, name)) {
+                        (Some(ta), Some(tb)) => {
+                            let d = DiffStats::of(&row(&tb, b_row), &row(&ta, 0));
+                            format!("{:.3e}({:.0})", d.max_abs, d.max_ulps)
+                        }
+                        _ => "-".into(),
+                    },
+                )
+                .collect();
+            println!("{layer:>3} {}", cells.join(" "));
+        }
+    }
+    for name in ["final_norm", "logits"] {
+        if let (Some(ta), Some(tb)) = (find(&steps[pos], None, name), find(&trace_b, None, name)) {
+            let d = DiffStats::of(&row(&tb, 0), &row(&ta, 0));
+            println!("{name}: max |Δ| {:.4e} ({:.0} ulps)", d.max_abs, d.max_ulps);
+        }
+    }
+    println!("position {pos}: reference top-5 / decode (A) / prefill (B) logprobs");
+    for &(tok, lp) in r.top_logprobs[pos].iter().take(5) {
+        println!(
+            "  {tok:>7} ref {lp:>9.4} A {:>9.4} B {:>9.4}",
+            logits_a[tok as usize], logits_b[tok as usize]
+        );
+    }
+    let top = |lp: &[f32]| {
+        let mut v: Vec<(usize, f32)> = lp.iter().copied().enumerate().collect();
+        v.sort_by(|x, y| y.1.total_cmp(&x.1));
+        v.truncate(5);
+        v
+    };
+    println!("  A top-5 {:?}", top(&logits_a));
+    println!("  B top-5 {:?}", top(&logits_b));
+    // (C) with TURBINE_GOLDEN_MXFP4_CPU set: the same prefill on the cpu-reference provider
+    // (scalar, sequential f32 sums: a third, independent rounding of the same model).
+    if std::env::var_os("TURBINE_GOLDEN_MXFP4_CPU").is_some() {
+        let host: Arc<dyn DeviceMemory> =
+            HostMemory::new(turbine_core::types::DeviceId(0), 24 << 30);
+        let mut c = build(cpu_reference_provider(), host);
+        let logits =
+            c.kv.forward(&mut c.exec, &all, &positions)
+                .expect("forward");
+        let logits_c = log_softmax(logits.row(0));
+        println!("position {pos}: reference / cpu-reference prefill (C)");
+        for &(tok, lp) in r.top_logprobs[pos].iter().take(5) {
+            println!("  {tok:>7} ref {lp:>9.4} C {:>9.4}", logits_c[tok as usize]);
+        }
+        println!("  C top-5 {:?}", top(&logits_c));
     }
 }

@@ -1,0 +1,16 @@
+{
+  "format": "fp8",
+  "checkpoint": "RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic@c308a86de78778c5f904a1d82401ac85e18ca205",
+  "tasks": "tests/eval/gsm8k-200.jsonl",
+  "concurrency": 16,
+  "baseline": "vllm.json",
+  "baseline_engine": "vllm-rocm 0.23.0 (rocm/vllm rocm7.14.1_rdna, gfx1201), same checkpoint, GSM8K-200 at concurrency 16",
+  "max_drop": 0.01,
+  "rule": "spec S-17 (user decision 2026-09-28, Q9): when vLLM-ROCm serves the checkpoint on gfx1201, the gate is the reference engine on the same checkpoint at quality.max_accuracy_drop; the BF16 model at the FP8 per-format drop 0.02 is recorded alongside. If vLLM refuses it (Task 14 driver pass `vllm`, status REFUSED), the gate is the BF16 model at 0.02: set baseline to bf16_baseline, max_drop to 0.02, record the refusal here as vllm_refusal, and use bf16_command.",
+  "bf16_baseline": "../llama-3.2-3b-instruct/turbine-bf16-c16.json",
+  "bf16_baseline_engine": "turbine, BF16 Llama-3.2-3B-Instruct (unsloth @ 006f5dcd1393c3add266de40994ba96225e9689d), GSM8K-200 at concurrency 16",
+  "bf16_max_drop": 0.02,
+  "status": "run 2026-09-29 (Task 14 proof, commit 3635f68, vllm status SERVED): vLLM 0.82 (164/200), turbine 0.79 (158/200), drop 0.03 > max_drop 0.01 -> `command` FAILS (rc=1). Alongside, BF16 turbine (turbine-bf16-c16.json) 0.795 (159/200) vs turbine 0.79, drop 0.005 <= bf16_max_drop 0.02 -> `bf16_command` PASSES. The gate.json rule above makes the vLLM comparison binding since vLLM served the checkpoint: this criterion is a MISS.",
+  "command": "turbine-golden eval-compare --baseline tests/eval/llama-3.2-3b-instruct-fp8-dynamic/vllm.json --candidate tests/eval/llama-3.2-3b-instruct-fp8-dynamic/turbine.json --max-drop 0.01",
+  "bf16_command": "turbine-golden eval-compare --baseline tests/eval/llama-3.2-3b-instruct/turbine-bf16-c16.json --candidate tests/eval/llama-3.2-3b-instruct-fp8-dynamic/turbine.json --max-drop 0.02"
+}

@@ -20,7 +20,7 @@ use crate::KernelError;
 use crate::ops::{
     ActivationKernel, AddRmsnormKernel, AttentionKernel, ElementwiseKernel, EmbeddingKernel,
     GemmKernel, KernelProvider, KvCopyKernel, LogitsReduceKernel, MoeKernel, NormKernel,
-    ProviderId, RopeKernel, ShardedNormKernel,
+    ProviderId, QGemmKernel, QuantizeActKernel, RopeKernel, ShardedNormKernel,
 };
 
 // One file per op family (Phase 2m S-5); `math`, `paged` and `topk` hold the shared numerics.
@@ -35,6 +35,8 @@ mod math;
 mod moe;
 mod norm;
 mod paged;
+mod qgemm;
+pub mod quant;
 mod rope;
 mod topk;
 
@@ -176,6 +178,44 @@ pub(crate) fn load(v: &TensorView<'_>) -> Result<Vec<f32>, KernelError> {
     Ok(offsets.iter().map(|&o| codec.decode(&bytes[o..])).collect())
 }
 
+/// Reads a one-byte view (U8 or F8E4M3) as its raw bytes, in logical row-major order.
+pub(crate) fn load_bytes(v: &TensorView<'_>) -> Result<Vec<u8>, KernelError> {
+    if v.dtype.size_bytes() != 1 {
+        return Err(invalid(format!(
+            "expected a one-byte view, got {}",
+            v.dtype.as_str()
+        )));
+    }
+    let offsets = element_offsets(v)?;
+    let bytes = v.slice.read_bytes()?;
+    Ok(offsets.iter().map(|&o| bytes[o]).collect())
+}
+
+/// Writes raw bytes into a one-byte view (U8 or F8E4M3) in logical row-major order; bytes of
+/// the slice the view does not address are preserved.
+pub(crate) fn store_bytes(v: &TensorView<'_>, values: &[u8]) -> Result<(), KernelError> {
+    if v.dtype.size_bytes() != 1 {
+        return Err(invalid(format!(
+            "expected a one-byte view, got {}",
+            v.dtype.as_str()
+        )));
+    }
+    let offsets = element_offsets(v)?;
+    if values.len() != offsets.len() {
+        return Err(invalid(format!(
+            "{} values for a view of {} elements",
+            values.len(),
+            offsets.len()
+        )));
+    }
+    let mut bytes = v.slice.read_bytes()?;
+    for (&o, &b) in offsets.iter().zip(values) {
+        bytes[o] = b;
+    }
+    v.slice.write_bytes(&bytes)?;
+    Ok(())
+}
+
 /// Reads an I32 view exactly.
 pub(crate) fn load_i32(v: &TensorView<'_>) -> Result<Vec<i32>, KernelError> {
     if v.dtype != DType::I32 {
@@ -297,6 +337,12 @@ impl KernelProvider for CpuReference {
         Some(self)
     }
     fn sharded_norm(&self) -> Option<&dyn ShardedNormKernel> {
+        Some(self)
+    }
+    fn qgemm(&self) -> Option<&dyn QGemmKernel> {
+        Some(self)
+    }
+    fn quantize_act(&self) -> Option<&dyn QuantizeActKernel> {
         Some(self)
     }
 }

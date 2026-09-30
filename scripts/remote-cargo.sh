@@ -12,17 +12,21 @@
 # checkout's remote directory.
 #
 # Environment: TURBINE_REMOTE_HOST (default piwi@192.168.10.203, novanas), TURBINE_REMOTE_TOOLCHAIN
-# (default 1.97), TURBINE_REMOTE_JOBS (cargo build jobs, default 6: several checkouts share 16 cores).
+# (default 1.97), TURBINE_REMOTE_JOBS (cargo build jobs, default 4), TURBINE_REMOTE_CPUS (cores
+# cargo and the tests it runs may use, default 12-15).
 # Only builds and host-side tests run here: GPU tests stay #[ignore]d and run through lab-test.sh.
-# Builds take a shared lock on /home/piwi/turbine-ci/bench.lock: a benchmark holds it exclusively
-# (scripts/bench-lock.sh) so that no build competes with the server for CPU while it measures.
+# Builds are CPU work and never wait for the GPU queue (bench.lock; coordinator 2026-09-29: a gate
+# queued behind hours of one-at-a-time GPU jobs): they run at nice 19 pinned to cores 12-15, like
+# the CPU fixture jobs, while a lab-bench server and client are pinned to 0-11, so a build cannot
+# skew a benchmark. Test binaries see only those cores, so their thread pools size to them.
 # Before syncing it runs scripts/lab-prune.sh: stale remote/agent-*/target caches of removed
 # worktrees (idle 12 h) are deleted and logged.
 set -euo pipefail
 
 host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
 toolchain="${TURBINE_REMOTE_TOOLCHAIN:-1.97}"
-jobs="${TURBINE_REMOTE_JOBS:-6}"
+jobs="${TURBINE_REMOTE_JOBS:-4}"
+cpus="${TURBINE_REMOTE_CPUS:-12-15}"
 if [[ "${1:-}" == "--host" ]]; then
 	host="$2"
 	shift 2
@@ -54,5 +58,5 @@ for a in "$@"; do
 	args+=" $(printf '%q' "$a")"
 done
 exec ssh -o BatchMode=yes "$host" \
-	"cd '$remote/src' && flock -s /home/piwi/turbine-ci/bench.lock env CARGO_TARGET_DIR='$remote/target' CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=$jobs \
-   CARGO_TERM_COLOR=never nice -n 5 \$HOME/.cargo/bin/cargo +$toolchain$args"
+	"cd '$remote/src' && env CARGO_TARGET_DIR='$remote/target' CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=$jobs \
+   CARGO_TERM_COLOR=never nice -n 19 taskset -c $cpus \$HOME/.cargo/bin/cargo +$toolchain$args"

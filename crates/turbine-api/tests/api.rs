@@ -1401,11 +1401,13 @@ mod kv_sim {
                 ModelIdentity {
                     config_hash: [5; 32],
                     weights_index_hash: [6; 32],
+                    rope_hash: [0; 32],
                 },
                 KvFormat {
                     dtype: KvDtype::Bf16,
                     layout,
                     shards: 1,
+                    scales: None,
                 },
                 64,
                 Some(l1.clone()),

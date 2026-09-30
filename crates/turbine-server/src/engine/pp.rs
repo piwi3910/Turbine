@@ -1006,6 +1006,7 @@ pub(crate) fn load_pipeline(
         last.arch.weight_format.0.name(),
         tail.weight_bytes,
     );
+    model::record_quantization(metrics, &last.arch, tail.weight_bytes);
     tracing::info!(
         event = "pp_pipeline_ready",
         stages,
@@ -1117,7 +1118,7 @@ pub(crate) mod testing {
         let index = SafetensorsIndex::open(&spec.dir).unwrap();
         let slots = pp::weight_slots(cfg, &s).unwrap();
         let weights = WeightLoader::load_part(
-            cfg.weight_format.0,
+            cfg.weight_format.get(),
             &index,
             &slots,
             &llama_slots(cfg),

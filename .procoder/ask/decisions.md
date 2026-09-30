@@ -1336,3 +1336,941 @@ User proposal: instead of fixed per-tier formats, start lossless everywhere. Whe
 Refined in discussion: a per-block ladder (lossless → FP8 → ~4-bit → ~2-bit → evict) driven by the pressure controller. "Compress" becomes a third eviction-policy action next to demote and evict, applied to the blocks least likely to be reused, which in practice means oldest-first from the lowest tier. It works mostly on new demotions, rewrites existing blocks only oldest-first and bounded per step, uses hysteresis, and never upgrades a block that has lost precision. L1/L2 come first; L0 joins after mixed-format attention.
 
 **Answer (2026-09-28, user): do it.** Added to `phase-6-quantization` scope as its last step (umbrella S-6 amended), after the weight formats, FP8 KV, TurboQuant and the per-tier formats. Observability rules: reason codes, per-tier × format metrics, lossy-token counts per response, an opt-out that recomputes instead, and tests that pin the pressure state.
+
+## Phase 6 spec: provisional design choices (2026-09-28)
+
+Written with `.procoder/specs/phase-6-quantization.md` and its plan. The scope, the formats, the MXFP4 packagings and proof checkpoints, YaRN, TurboQuant, the per-tier formats and the compression ladder are fixed by the entries "Roadmap reorganisation after Phase 5", "Phase 6 MXFP4: packaging formats and proof checkpoints", "YaRN RoPE scaling moves into Phase 6", "KV-cache quantization beyond FP8", "Sub-8-bit KV and per-tier KV formats in Phase 6" and "Pressure-driven KV compression ladder in Phase 6" (all 2026-09-28). The choices below are the ones those entries leave open. The spec first wrote each recommended option marked "(provisional)"; the user answered all twenty on 2026-09-28 (below; Q11 differs from the recommendation). Facts behind them, gathered 2026-09-28: hipBLASLt on `novanas` (ROCm 7.14.1, `gfx1201`) ships FP8 × FP8 → BF16/F32 Tensile kernels with scalar (`SAB`) and per-row/column vector (`SABV`) scales, but no BF16 × FP8 mixed kernel and no block-scaled or microscaled variant; the pinned CK (`therock-7.14.1`) has `ck_tile` `gemm_quant` (`TensorQuant`, `RowColQuant`, `AQuantGrouped`, `BQuantGrouped`, `ABQuantGrouped`, a microscale pipeline, some with WMMA policies) and FP8 hooks in the paged / split-KV FMHA kernels; whether any of them builds and is correct on `gfx1201` is what the reuse evaluations of the plan establish.
+
+**1. Order of the sub-steps.** The kickoff listed weights → FP8 KV → TurboQuant → per-tier formats → YaRN → ladder.
+
+- A) As listed
+- B) Foundations → weights (fp8, fp8_block, INT4, MXFP4) → FP8 KV in L0 → YaRN → per-tier formats (first with `fp8_e4m3` as the lower-tier format) → TurboQuant (a registered codec plugged into the per-tier path) → ladder. Reason: TurboQuant in Phase 6 is a lower-tier storage format (question 11), so it needs the per-tier transcoding path first; proving that path with FP8 (a cheap, well-understood codec) separates plumbing bugs from codec bugs. YaRN is small and independent and changes the prefix namespace, so it lands before the per-tier identity rework (recommended)
+- C) YaRN first (smallest, and Phase 7 depends on it), then B's order
+
+**2. FP8 weight arithmetic (`fp8`).** No BF16 × FP8 kernel exists in hipBLASLt on `gfx1201`; FP8 × FP8 does.
+
+- A) W8A8 following the checkpoint: activations quantized to FP8 e4m3 per the checkpoint's `input_activations` (static per-tensor scale, or dynamic per-token), then hipBLASLt FP8 × FP8 → BF16 with the weight's per-tensor or per-channel scale; a checkpoint without an activation scheme runs W8A16 through a dequantize path. Same arithmetic the checkpoint was calibrated for, and what vLLM runs (recommended)
+- B) W8A16 always: dequantize FP8 weights to BF16 inside the GEMM (needs a dequant kernel — CK or own); decode gains the bandwidth, prefill runs at BF16 speed
+- C) Both, selectable with a configuration key
+
+**3. `fp8_block` kernel fallback.** Block-scaled FP8 (128 × 128 weight blocks, per-token groups of 128 activations) has no hipBLASLt kernel; the plan evaluates CK `ABQuantGrouped` first.
+
+- A) If CK does not work on `gfx1201`: W8A16 for `fp8_block` through a dequantize-to-BF16 path (CK, llama.cpp-style, or own — each own kernel recorded by the reuse rule) (recommended)
+- B) If CK does not work: `fp8_block` stays `experimental` and the phase continues
+- C) Write an own block-scaled FP8 WMMA kernel
+
+**4. Proof checkpoints for `fp8`, `fp8_block`, `awq_int4`, `gptq_int4`** (all `LlamaForCausalLM` Llama-3.2-3B-Instruct, ungated, revisions read 2026-09-28; no quantized OLMoE checkpoint exists).
+
+- A) `fp8`: `RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic` @ `c308a86de78778c5f904a1d82401ac85e18ca205` (compressed-tensors, per-channel weights, dynamic per-token activations, 4.4 GB) as the gate, plus `RedHatAI/Llama-3.2-3B-Instruct-FP8` @ `377571d314b30f1d58448499e4100e2deafe7d7d` (per-tensor weights, static per-tensor activations) for the per-tensor path; `fp8_block`: `unsloth/Llama-3.2-3B-Instruct-FP8-Block` @ `08cf804398b23fab4a1df02fbe8d4d5a11a800cc` (compressed-tensors 128 × 128 blocks, 3.6 GB); `awq_int4`: `casperhansen/llama-3.2-3b-instruct-awq` @ `272b3bde867b606760447deb9a4d2719fbdfd3ae` (AutoAWQ GEMM, zero points, group 128, 2.3 GB); `gptq_int4`: `shuyuej/Llama-3.2-3B-Instruct-GPTQ` @ `dd5a311f040728fbc612eb03c8dadfae0a90552f` (AutoGPTQ, symmetric, `desc_act: false`, group 128, Apache-2.0, 2.3 GB) (recommended)
+- B) As A, `fp8` with the dynamic checkpoint only
+- C) As A, `awq_int4` from `AMead10/Llama-3.2-3B-Instruct-AWQ` @ `df494d4903f031dadaeb40434529f1c01efcd130` (3.1 GB) instead
+
+The MXFP4 proofs are fixed: `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16` @ `14c3aca849a72df8fcc8b3a30ab8d9eed86ee646` (5.8 GB) and `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` @ `91925ffda6977d097354a99718a20e035f8af80a` (2.3 GB); the BF16 quality baseline for the 8B proof is `unsloth/Llama-3.1-8B-Instruct` @ `4699cc75b550f9c6f3173fb80f4703b62d946aa5` (ungated mirror of `meta-llama/Llama-3.1-8B-Instruct`, 16.1 GB) unless the user prefers the gated original.
+
+**5. Checkpoint containers per `weight_format`.**
+
+- A) `fp8` ← compressed-tensors `float-quantized` 8-bit with weight strategy `tensor` or `channel`, and HF/Quark `quant_method: fp8` without `weight_block_size`; `fp8_block` ← compressed-tensors weight strategy `block` [128, 128], and `quant_method: fp8` with `weight_block_size` [128, 128]; `awq_int4` ← `quant_method: awq`, `version: gemm`, 4 bits, with zero points; `gptq_int4` ← `quant_method: gptq` 4 bits with `desc_act: false`, and compressed-tensors `pack-quantized` 4-bit int group strategy (W4A16) without a non-trivial `g_idx`; MXFP4 as question 6. Act-order (`desc_act: true`, or a non-identity `g_idx`) is refused with reason `gptq_act_order` (recommended)
+- B) As A, plus act-order GPTQ (permute the weight's input dimension at load and the activation columns at run time)
+- C) As A, without compressed-tensors `pack-quantized` (AutoGPTQ containers only)
+
+**6. Support-matrix values for the three MXFP4 packagings.** The Quark proof is W4A4 (activation FP4 emulated) and may end `experimental` while compressed-tensors W4A16 ends `supported`, on the same architecture; one column value cannot hold both.
+
+- A) Two values: `mxfp4` (weight-only W4A16: compressed-tensors, OpenAI native, and Quark weight-only checkpoints) and `mxfp4_a4` (W4A4 checkpoints, activations quantize-dequantized to MXFP4 before a BF16 GEMM); this widens the umbrella's bounded `weight_format` set by one value, which amends `phase-6-8-expansion` Interfaces (recommended)
+- B) One `mxfp4` value; the Quark W4A4 checkpoint is refused by a separate refusal list (like `PARALLEL_REFUSALS`) until it passes
+- C) One value per packaging: `mxfp4_ct`, `mxfp4_openai`, `mxfp4_quark`
+
+**7. Quantized MoE experts and tensor parallelism.** No quantized OLMoE checkpoint exists; Phase 7 needs FP8 experts (Qwen3-MoE, Mixtral with TP 2) and MXFP4 experts (gpt-oss).
+
+- A) Phase 6 quantizes dense linear layers (attention and dense MLP projections) at tp 1 and under Phase 5 TP (scales sharded with their rows or columns; a block or group boundary that does not divide the shard is refused with `quant_shard_misaligned`), proven at tp 2 by the lab golden for `fp8` and `awq_int4`; quantized MoE expert GEMMs move to Phase 7 with the families that need them (recommended)
+- B) As A, plus quantized MoE experts proven on an OLMoE FP8 checkpoint quantized offline at fixture time (llm-compressor FP8-dynamic; test data, not a served format)
+- C) Phase 6 at tp 1 only; everything under TP moves to Phase 7
+
+**8. Golden references for quantized checkpoints.** The umbrella asks for the checkpoint's own reference output; transformers' AWQ/GPTQ/Quark integrations need extra packages that are mostly GPU-only.
+
+- A) A fixture script `scripts/golden/quant_reference.py` decodes the checkpoint's weights exactly (FP8 × scale, INT4 (q − zero) × scale, FP4 × 2^E8M0) into a temporary BF16 checkpoint and runs the existing transformers reference on it, with activation fake-quantization hooks for W8A8 (FP8 e4m3, the checkpoint's scheme) and W4A4 (MXFP4); the tolerance per slug is calibrated from transformers' own spread (`self_spread.py`, the OLMoE method); where the checkpoint's own integration runs on CPU (compressed-tensors FP8), one cross-check is recorded (recommended)
+- B) Capture the reference from vLLM-ROCm on the same checkpoint where it loads on `gfx1201`, transformers-dequant elsewhere
+- C) Each checkpoint's own transformers integration only; formats whose integration does not run are `experimental`
+
+**9. Accuracy gate for lossy formats.** The umbrella gate is GSM8K-200 accuracy within `quality.max_accuracy_drop` (default 0.01) of BF16. With 200 items one answer is 0.005, the paired noise is about ±0.02, and published 4-bit Llama-3.2-3B results lose 1–3 points on GSM8K, so a literal 0.01 against BF16 would likely fail every 4-bit weight format without a defect.
+
+- A) Weight formats: compared with the reference engine on the same checkpoint (vLLM-ROCm, where it loads the checkpoint on `gfx1201`) at 0.01; where it does not, compared with BF16 at a per-format drop recorded in `tests/eval/<slug>/gate.json` (provisional: FP8 0.02, INT4 and MXFP4 0.04), confirmed by the user at the track close. KV formats (FP8 KV, TurboQuant, the ladder): compared with the same weights at BF16 KV at 0.01 (recommended)
+- B) The umbrella literally: BF16 at 0.01 for everything; a format that fails stays `experimental`
+- C) As A, but the gate runs on the full GSM8K test split (1,319 items) to cut the noise
+
+**10. FP8 KV scales and attention.**
+
+- A) Per-layer K and V scales from the checkpoint (`kv_cache_scheme`, `k_scale` / `v_scale` tensors) when present, else 1.0 (vLLM's default); `kv.dtype: fp8_e4m3` must be set explicitly (nothing lossy by default); attention reads FP8 pages through the provider the evaluation picks (CK FMHA FP8 instances first, then an FP8-reading variant of the Turbine paged kernel) (recommended)
+- B) As A, but calibrate missing scales at warm-up on a fixed prompt set (deterministic, logged)
+- C) Per-block dynamic scales (`KvDtype::Fp8E4m3PerBlockScale`), computed at page write
+
+**11. Where TurboQuant runs in Phase 6.**
+
+- A) As a lower-tier storage format only (L1/L2, and ladder rungs there): encoded on the GPU at demotion, decoded to the L0 format on promotion; attention never reads it. L0 formats stay `bf16` / `fp8_e4m3`; TurboQuant attention and mixed-format attention are deferred to a later decision (recommended)
+- B) Also as an L0 format, decoded into a BF16 scratch before attention
+- C) Also as an L0 format with a native TurboQuant attention kernel
+
+**12. TurboQuant formats and bit widths.**
+
+- A) Two registered formats: `tq4` (K: 3-bit Lloyd–Max codebook for the rotated coordinates + 1-bit QJL residual sign, the paper's inner-product variant; V: 4-bit MSE codebook; one BF16 norm per token-head vector for K, V and the K residual; ≈ 4.4 bits per element) and `tq2` (K: 1-bit codebook + 1-bit QJL; V: 2-bit codebook; ≈ 2.4 bits); the rotation is a randomized Hadamard transform (random signs from a seed fixed per namespace, then the fast Walsh–Hadamard transform over `head_dim` = 128); the same widths for every layer (recommended)
+- B) As A, but keep the first and last two layers at FP8 in `tq2`
+- C) Three formats: `tq4`, `tq3` (3.5 bits, the paper's quality-neutral point) and `tq2`
+
+**13. Per-tier configuration and the recent window.**
+
+- A) `kv.cpu.format` and `kv.nvme.format` ∈ {`l0` (the L0 format, default), `fp8_e4m3`, `tq4`, `tq2`}; a tier may not hold a format more precise than the tier above it; the last `kv.lossless_tail_blocks` full blocks of a sequence (default 1) are demoted at the L0 format whatever the tier's format; a partial last block never leaves L0 (recommended)
+- B) As A, with the window in tokens (`kv.lossless_tail_tokens`, default 256)
+- C) No window: every demoted block takes the tier's format
+
+**14. Prefix identity of lossy blocks.** A block that passed through a lossy tier no longer holds the exact KV, and a block prefilled on top of it inherits the difference.
+
+- A) Lineage keys: a block keeps its exact key while any copy of it is exact; a lossy copy is filed under `lossy_key(key, format)`; a block computed on top of a lossy prefix is chained from the lossy parent key, so exact and lossy lineages never alias; a lookup takes the exact chain first and, unless the request opts out, continues on lossy keys; the format and the TurboQuant seed enter the key (recommended)
+- B) One key per block; locations carry a format tag; blocks computed on top of a lossy prefix are never published (no aliasing, less reuse)
+- C) One key per block with a format tag and no lineage (a child computed over lossy KV may be served to an exact request)
+
+**15. Per-request opt-out and reporting.**
+
+- A) Header `x-turbine-kv-lossy: deny` and config default `kv.lossy_reuse: allow|deny` (default `allow`); an opted-out request matches exact lineage only and recomputes the rest; every response reports `usage.prompt_tokens_details.lossy_cached_tokens` (Turbine extension, 0 when none) (recommended)
+- B) A body field instead of the header
+- C) Default `deny`: lossy reuse only for requests that ask for it
+
+**16. Lossy retrieve against recompute in the planner.**
+
+- A) A lossy block's retrieval cost is multiplied by `1 + penalty(format)` (provisional `fp8_e4m3` 0.1, `tq4` 0.5, `tq2` 1.0, config `kv.lossy_penalty`), so a lossy block is used only when clearly cheaper than recompute; every plan logs the penalty (recommended)
+- B) No penalty: transfer cost only
+- C) Lossy blocks used only at pressure ORANGE or worse
+
+**17. The ladder's trigger and bounds.**
+
+- A) Compress replaces a drop: when the policy would drop (not demote) a block from the lowest enabled tier, or that tier is above its high-water mark (0.95 used), the oldest, least-reusable blocks of that tier move one rung down (`l0` → `fp8_e4m3` → `tq4` → `tq2` → evict), then the next tier up once the lowest tier sits on one rung; new demotions into a tier take its current rung; at most 32 rewrites per reclaim tick, ticks ≥ 50 ms apart (the Phase 4 bounds); a tier's rung for new demotions steps back up only after it has stayed below 0.85 used for `reliability.pressure.deescalate_dwell`; compressed blocks are never upgraded; no compression while the pressure controller is GREEN (recommended)
+- B) Driven by the global pressure state only: YELLOW → new demotions at `fp8_e4m3`, ORANGE → `tq4` plus rewrites, RED → `tq2`
+- C) As A, and L0 joins now (needs mixed BF16/FP8 attention)
+
+**18. The "lossless" rung.**
+
+- A) The L0 format's bytes unchanged; no general-purpose compression in Phase 6 (recommended)
+- B) LZ4 on L2 slots at the lossless rung
+
+**19. YaRN proof and override.**
+
+- A) A `model.rope_scaling` configuration key (a mapping with HF's field names; replaces `config.json`'s `rope_scaling` and enters the model identity) serves Llama-3.2-3B-Instruct with `{rope_type: yarn, factor: 16.0, original_max_position_embeddings: 8192, beta_fast: 32, beta_slow: 1}`; the reference is transformers' native YaRN on a copy of the checkpoint with that `config.json`, over the 16 golden prompts plus one ≈ 12,000-token prompt; the attention factor (`mscale`) folds into the attention scale (`scale × mscale²`), so the RoPE ABI does not change; `truncate: false` (gpt-oss) is parsed and unit-tested (recommended)
+- B) As A with a Qwen3-style override (`factor: 4.0`, `original_max_position_embeddings: 32768`)
+- C) As A, but mscale scales the cos/sin tables through a new RoPE descriptor field (a minor ABI group), as transformers does
+
+**20. Performance targets** (novanas GPU 0, `lab-bench.sh`, Llama-3.2-3B, against the BF16 baseline of 855 tok/s at c16).
+
+- A) `fp8`: c16 tok/s ≥ 1.10 × BF16 and c1 ITL p50 ≤ 0.75 × BF16; `fp8_block`: c16 ≥ 1.0 ×; `awq_int4` / `gptq_int4` / `mxfp4` (on 3B-sized checkpoints): c1 ITL p50 ≤ 0.6 × BF16 and c16 tok/s ≥ 0.9 × BF16; where vLLM-ROCm serves the same checkpoint, Turbine c16 tok/s ≥ 0.9 × vLLM; FP8 KV: pool blocks ≥ 1.95 × BF16 KV and c16 tok/s ≥ 0.95 × BF16 KV; `tq4` in L1: L1 blocks per GiB ≥ 3.5 × `l0`, and multi-turn `mt_cached` not below the `l0` run; the ladder: `scripts/overload-soak.sh novanas --duration 10m` passes with a small L1/L2 (recommended)
+- B) No hard targets; record the numbers and decide at the track close
+
+**Answers (2026-09-28, user, relayed by the coordinator):**
+
+- **Q1: B** — foundations → weights → FP8 KV → YaRN → per-tier formats (proven with FP8) → TurboQuant → ladder.
+- **Q2: A** — W8A8 FP8 on hipBLASLt following the checkpoint's activation scheme.
+- **Q3: A** — block-scaled FP8 falls back to a dequantize-to-BF16 path if CK does not work on `gfx1201`.
+- **Q4: A** — the proof checkpoints as listed, with `unsloth/Llama-3.1-8B-Instruct` as the 8B BF16 baseline. The ≈ 41 GB of downloads are approved; keep ≥ 60 GB free on `novanas`.
+- **Q5: A** — container mapping as listed; act-order GPTQ refused (`gptq_act_order`).
+- **Q6: A** — a separate `mxfp4_a4` column value. **Signed off as an amendment of the umbrella** `phase-6-8-expansion` (bounded `weight_format` set).
+- **Q7: A** — dense linear layers only, including under TP; quantized MoE experts move to Phase 7 (added to the umbrella's S-8 list).
+- **Q8: A** — exact-BF16 dequantized references with activation fake-quantization, tolerances calibrated from transformers' spread.
+- **Q9: A** — weights: vLLM-ROCm on the same checkpoint where it runs (0.01), otherwise BF16 with max drop 0.02 for FP8 and 0.04 for 4-bit formats; KV formats: 0.01 against BF16 KV. **Signed off as an amendment of the umbrella** S-3 item 4.
+- **Q10: A** — FP8 KV scales from the checkpoint, else 1.0; explicit setting only.
+- **Q11: changed from the recommendation — TurboQuant also lives in L0 in Phase 6.** Build a TurboQuant-aware paged attention with a per-block format tag: attention reads BF16/FP8 blocks and `tq4`/`tq2` blocks, rotates q once per step and dots against the compressed K, and decodes V. Reuse first: evaluate existing quantized-KV attention (llama.cpp HIP flash attention with q4/q8 KV, CK FP8 KV, vLLM/aiter) before writing our own, and record it. Gates: a bitwise or tolerance test against a CPU reference TurboQuant attention; golden and eval-compare with `tq4`/`tq2` KV in L0; the decode ITL impact measured and reported. Consequence: mixed-format attention exists in Phase 6, so the compression ladder includes L0 once that attention has passed its correctness and performance gates — L1/L2 first, L0 as the ladder's final sub-step.
+- **Q12: A** — `tq4` and `tq2` with the randomized Hadamard rotation.
+- **Q13: A** — `kv.cpu.format` / `kv.nvme.format`, the last full block kept at the L0 format.
+- **Q14: A** — lineage keys for lossy blocks and their descendants.
+- **Q15: A** — header `x-turbine-kv-lossy: deny` plus `usage.prompt_tokens_details.lossy_cached_tokens`.
+- **Q16: A** — per-format lossy retrieval penalty.
+- **Q17: A** — ladder driven by tier fill, never at GREEN, ≤ 32 rewrites per tick with hysteresis (L0 joins as the final sub-step, per Q11).
+- **Q18: A** — the lossless rung stored plain.
+- **Q19: A** — `model.rope_scaling`, factor 16 proof plus a ≈ 12,000-token prompt, attention factor folded into the scale.
+- **Q20: A** — the performance targets as listed; for `tq4`/`tq2` in L0 the decode ITL impact is measured and reported (no fixed bound).
+
+The spec and plan now mark these "(user decision 2026-09-28)".
+
+## Phase 6 split: 6a quantization, 6b KV compression (2026-09-28)
+
+After the answers to "Phase 6 spec: provisional design choices" (with Q11 widening TurboQuant into L0), the user split Phase 6 in two. Options shown by the coordinator:
+
+**1. Where does YaRN go?**
+
+- A) In 6a, with the weight formats and FP8 KV
+- B) In 6b, with the KV compression work
+
+**Answer (2026-09-28, user): A — YaRN in 6a.**
+
+**2. When does 6b run?**
+
+- A) Right after 6a
+- B) After Phase 5p
+- C) After Phase 7
+
+**Answer (2026-09-28, user): A — right after 6a.**
+
+The split, as decided:
+
+- `phase-6a-quantization`: foundations (the quality-gate tooling port from `runahead/p8-umbrella` and the support-matrix cleanup), every weight format (`fp8`, `fp8_block`, `mxfp4` in three packagings, `mxfp4_a4`, `awq_int4`, `gptq_int4`), FP8 KV in L0, YaRN.
+- `phase-6b-kv-compression`: per-tier KV formats (proven with FP8 first), TurboQuant `tq4` / `tq2` including the TurboQuant-aware L0 attention, the pressure-driven compression ladder (L1/L2, then L0). It starts only after 6a closes and gets its own full test and gate cycle.
+- Order: 6a → 6b → 5p → 7 → 8.
+
+Consequences (docs changed the same day): the joint `phase-6-quantization` spec and plan are replaced by `.procoder/specs/phase-6a-quantization.md` / `.procoder/plans/phase-6a-quantization.md` and `.procoder/specs/phase-6b-kv-compression.md` / `.procoder/plans/phase-6b-kv-compression.md`; the answers of "Phase 6 spec: provisional design choices" carry over unchanged. 6a keeps the joint spec's item numbers S-1 … S-16 (its gate items S-22 … S-25 become S-17 … S-20); 6b renumbers its items S-1 … S-11 (joint S-17 … S-21, S-26, S-27, gates S-22 … S-25). The work branch `phase-6-quantization` was renamed `phase-6a-quantization` before any code landed. The umbrella `phase-6-8-expansion` S-1 lists 6a and 6b as the two phases of track 1; AGENTS.md's order line follows. `scripts/track-gate.sh` (ported in 6a Task 1) knows both track names.
+
+## Continue through Phases 6a and 6b unattended (2026-09-29)
+
+**Decision (user, 2026-09-29, relayed by the coordinator):** "continue through all the phases a and b" — the user has gone to bed; 6a runs to its close, then 6b from the merged main to its close. Rules (the same as the 2026-09-27 overnight run, "Continue through the phases unattended"):
+
+1. This entry records the decision.
+2. Design decisions: the user is not available, so questions are not waited on — the recommended option is taken, marked here "provisional, pending user review", and listed one line each (options and pick) in `.procoder/review-2026-09-29.md`.
+3. Lab runs: the instruction covers every 6a/6b lab run on novanas (`lab-test.sh`, `lab-bench.sh`, `lab-serve.sh`, `lab-cluster.sh`, the vLLM baselines of the new formats, the 10-minute soak) under the usual rules: novanas only, nothing on the Sparks and nothing NVIDIA; perf numbers on GPU 0 only; a busy GPU or bench lock is identified first, our own hung runs stopped, nothing that is not ours evicted; serve Jobs always `--stop`ped. The HF token stays on novanas (`hf download --revision <pinned>`, never read or passed); only the models the 6a/6b specs name are downloaded, after a free-disk check.
+4. Perf: one change, then measure (`lab-bench.sh --quick` plus golden); results in labbook, with vLLM-ROCm as the baseline of each new format.
+5. Phase close: 6a closes when every exit gate passes (tier full, the two-GPU leg, golden16, soak) and each format's accuracy gate holds; it merges into local main, not pushed. 6b starts from that main, closes the same way and merges locally; pushing waits for the user's review. A failing gate that needs a real design change takes the provisional option; a truly blocked item (host down, model unavailable) is left unfinished, written in the review file, and the rest continues.
+6. novanas crashes (flaky PSU until the new one arrives): wait with a bounded check (every 10 min, up to 2 h), then continue; do not debug the crash.
+7. `.procoder/review-2026-09-29.md` is kept current: what landed, perf against vLLM, provisional decisions, anything unfinished — the file the user reads in the morning.
+
+Also relayed the same night (coordinator, at the user's request "more speed"): build in parallel. The Phase 6a lead stays the integrator; builder agents run in their own worktrees on branches cut from `phase-6a-quantization`, one owner per file (a shared registry or config file is owned by one track and the other sends its edit to the owner), each task test-first, one commit, `scripts/gate.sh` clean, merged or rebased back by the lead after it passes the gate; GPU work staggered (`lab-test.sh --tier quick` on either card, every perf number on GPU 0 under the bench lock). Branch `scout-fixes` is merged into main by the coordinator; main may move under the phase branches.
+
+## Phase 6a proof checkpoints downloaded (2026-09-29)
+
+Downloaded on `novanas` by the fixtures builder with `hf download <repo> --revision <sha> --local-dir /home/piwi/turbine-models/<slug>` (approved: user answer Q4 and "Continue through Phases 6a and 6b unattended"), every one rc 0, `config.json` and the listed safetensors present:
+
+| Slug                                | Repo @ revision                                                                                       | Bytes         |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------- | ------------- |
+| `llama-3.2-3b-instruct-fp8-dynamic` | `RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic` @ `c308a86de78778c5f904a1d82401ac85e18ca205`             | 4,413,814,259 |
+| `llama-3.2-3b-instruct-fp8`         | `RedHatAI/Llama-3.2-3B-Instruct-FP8` @ `377571d314b30f1d58448499e4100e2deafe7d7d`                     | 4,404,163,249 |
+| `llama-3.2-3b-instruct-fp8-block`   | `unsloth/Llama-3.2-3B-Instruct-FP8-Block` @ `08cf804398b23fab4a1df02fbe8d4d5a11a800cc`                | 3,624,601,065 |
+| `llama-3.2-3b-instruct-awq`         | `casperhansen/llama-3.2-3b-instruct-awq` @ `272b3bde867b606760447deb9a4d2719fbdfd3ae`                 | 2,270,034,219 |
+| `llama-3.2-3b-instruct-gptq`        | `shuyuej/Llama-3.2-3B-Instruct-GPTQ` @ `dd5a311f040728fbc612eb03c8dadfae0a90552f`                     | 2,264,970,345 |
+| `llama-3.2-3b-mxfp4-a4`             | `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` @ `91925ffda6977d097354a99718a20e035f8af80a`             | 2,303,041,140 |
+| `llama-3.1-8b-instruct-mxfp4a16`    | `FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16` @ `14c3aca849a72df8fcc8b3a30ab8d9eed86ee646` | 5,827,024,421 |
+
+Free disk went from 99.0 GB before to 72.3 GB after the last download (00:17). The 8B BF16 baseline (`unsloth/Llama-3.1-8B-Instruct` @ `4699cc75b550f9c6f3173fb80f4703b62d946aa5`, 16 GB) is on hold: novanas fell to 49 GB free at 00:25 (other workspaces' build trees) and the kubelet evicts lab pods below ~47.7 GB; it is downloaded once stale build trees are cleared.
+
+## Phase 6a/6b builder decisions (2026-09-29; answered by the user 2026-09-29)
+
+Taken under "Continue through Phases 6a and 6b unattended (2026-09-29)" (rule 2: recommended option, user decision 2026-09-29: accepted as recommended); each is also a line of `.procoder/review-2026-09-29.md`.
+
+**YaRN (6a Task 26, landed 42ee226):**
+
+1. Tolerance of `yarn_parameters_match_transformers`: transformers computes the YaRN table in FP32 with a `powf` 1 ulp off, so the spec's 1e-7 relative is below FP32 resolution. A) FP64 as specified, each value within 2 FP32 ulps (max seen 1.46e-7) — chosen; B) mimic transformers' FP32 operation order (252/256 bitwise, the rest 1 ulp, max 1.12e-7). Spec S-15 criterion amended to "within 2 FP32 ulps". **User decision 2026-09-29: accepted as recommended — A.**
+2. Context extension: YaRN extends `max_positions` only when `original_max_position_embeddings` < `max_position_embeddings` (the spec's edge case literally; a model with both equal, e.g. Qwen2.5 at 32768, is not extended). Alternative: always allow up to `max(factor × original, max_position_embeddings)`. **User decision 2026-09-29: accepted as recommended — as the spec.**
+3. Refusals where transformers only warns: factor < 1, attention factor ≤ 0, `beta_slow` > `beta_fast` or ≤ 0. **User decision 2026-09-29: accepted as recommended.**
+4. Defaults follow Python's `or` (0 means default for the original length and the betas); unknown keys ignored; `dynamic: false` accepted. **User decision 2026-09-29: accepted as recommended.**
+5. `rope_identity()` includes `rotary_dim` next to theta and the scaling fields. **User decision 2026-09-29: accepted as recommended.**
+
+**FP8 KV (6a Task 22, landed 877b0ab):** a paged `AttentionConfig.dtype` of F8E4M3 means FP8 pages while Q, the new rows and the output stay BF16 (the C descriptor's `dtype` = 16 means the same); the CPU row `cpu/*/*/bf16/fp8_e4m3/none` is `experimental`, `amd` stays `unsupported` until Task 24's gate. **User decision 2026-09-29: accepted as recommended.**
+
+**6b groundwork (branch `p6b-groundwork`: 0a0b20a, 3d07054, 66dcf2d; lands with 6b):**
+
+1. TurboQuant QJL projection: the plan's second randomized Hadamard (`H·(s'⊙r)`) failed the unbiasedness test (overestimates ⟨q, r⟩ by ~2.7 %: tq4 mean error 6.5e-4 > 3 SE 3.7e-4). A) the paper's Gaussian projection S (128 × 128, seeded per layer and head) — chosen: unbiased (tq4 5.4e-5 vs limit 6.0e-4), but O(d²) encode/decode and 64 KB of S per (layer, head) passed to the GPU codec (~15 MB Llama, ~17 MB OLMoE); B) one S per namespace (64 KB); C) keep Hadamard and loosen unbiasedness. **User decision 2026-09-29: accepted as recommended — A** (final); 6b plan Task 7 / spec S-4 updated when 6b starts.
+2. `turbine-kv` keeps its own bit-exact copy of the e4m3fn rounding (tested against the kernels' table) instead of moving it to `turbine-core`. **User decision 2026-09-29: accepted as recommended.**
+3. `KvCodec`: takes `&KvLayout`; `CodecParams` carries per-layer `k_scales` / `v_scales`; `lossy(layout)` (FP8 is lossless from an FP8 L0); extra `abi_code`, `nmse_bound`, `supports`; registration order is the ladder order. **User decision 2026-09-29: accepted as recommended.**
+4. FP8 codec from BF16 L0: one K and one V scale per block per layer, `max(absmax / 448, 1 / (448·512))`, in a slot header (alternative: per token or per head). **User decision 2026-09-29: accepted as recommended.**
+5. TurboQuant record layout: array of structs per token-head in the spec's field order, padded to 16 bytes (tq4 144 B = 3.56× BF16, tq2 80 B = 6.4×; unpadded would be 3.82× / 7.3×); codes LSB-first. Alternatives: struct of arrays per (layer, head), or no padding. **User decision 2026-09-29: accepted as recommended.**
+6. Rounding: codes from the exact F32 norm, decode and residual from the BF16-rounded norm (QJL corrects the norm rounding); ties between centroids take the lower code; a zero QJL projection signs +1. **User decision 2026-09-29: accepted as recommended.**
+7. Seeds: SplitMix64 from the namespace seed mixed with (layer, head, kind: K 0, V 1, QJL 2); Box–Muller in F64 rounded to F32; block-local head index (global head index under TP is a 6b Task 8/15 decision). **User decision 2026-09-29: accepted as recommended.**
+8. Codebooks: trapezoid integration on 2^18 points, Lloyd iteration to 1e-13, committed as symmetrised F32 constants regenerated within 1e-6 by the test (distortion 0.3609 / 0.1160 / 0.0340 / 0.00931 for 1–4 bits vs the paper's 0.36 / 0.117 / 0.03 / 0.009). **User decision 2026-09-29: accepted as recommended.**
+9. Conformance NMSE bounds: tq4 0.07, tq2 0.75 over a block (K error ≈ (π/2)·D_mse from the Gaussian QJL). **User decision 2026-09-29: accepted as recommended.**
+10. Ladder policy: no action at GREEN; a tier acts only when it is the lowest and about to drop, or above high water; one rung down from the copy's own format, capped at `max_format`; an upper tier acts only once every lower tier reached the target rung; at the floor the lowest tier evicts and an upper tier keeps or demotes; `LadderContext` gains `format`, `must_leave`, `demote_to`, `lower_rung`, `ladder` (the spec's `PressureLevel` is `PressureState`). **User decision 2026-09-29: changed — "Start at YELLOW earlier": compression begins at YELLOW pressure, before the tiers are full, still the lowest tier first and one rung at a time.** Depth at YELLOW: see "6b ladder: YELLOW depth (2026-09-29)".
+11. `EvictReason::{Compressed, LadderFloor}` exist but join the pre-registered metric label sets only with 6b Task 15 (so `api.rs check_labels` stays green). **User decision 2026-09-29: accepted as recommended.**
+
+**FP8 packagings (6a Task 8, lead):**
+
+1. `quant_method: fp8` without `weight_block_size` and `activation_scheme: dynamic`: activations quantized per token (vLLM quantizes them per tensor, dynamically, a mode the v2.9 ABI does not have). A) per token — chosen (at least as accurate, one fewer kernel mode); B) add a dynamic per-tensor mode to the ABI to match vLLM exactly. **User decision 2026-09-29: accepted as recommended — A.**
+2. A layer's quantization is decided from `config.json` (the packaging's ignore list, plus `lm_head` always BF16), not from each tensor's dtype; a checkpoint that leaves a layer in BF16 without listing it is refused by the tensor check. Alternative: decide per tensor from the checkpoint dtype (needs the index before the memory budget). **User decision 2026-09-29: accepted as recommended.**
+3. Weight formats are configured per checkpoint: `WeightFormat::configure(config.json)` returns an `Arc<dyn WeightFormat>` and `ModelArchConfig::weight_format` holds it (registry entries stay `&'static`, their default layout feeding the conformance fixtures). Alternative: pass the parsed `quantization_config` to every trait method. **User decision 2026-09-29: accepted as recommended.**
+4. A decoder with some BF16 and some quantized linear layers requires both the GEMM and `qgemm` configs for each linear shape (the registry resolves a BF16 GEMM that a fully quantized model never calls). Alternative: per-layer requirements. **User decision 2026-09-29: accepted as recommended.**
+5. Tiny fixtures are written by each format (`WeightFormat::write_tiny`, test support in the format's file, as families' `write_tiny`), not by one writer in `testing/tiny.rs`; power-of-two scales so the dequantized twin is exact in BF16; static input scales differ per projection so the fused-stack max rule is tested. **User decision 2026-09-29: accepted as recommended.**
+
+## Phase 6a proof checkpoints downloaded on novanas (2026-09-29)
+
+Task 11, fixtures builder, under the approved downloads (user decision 2026-09-28, ≈ 41 GB, ≥ 60 GB free kept; floor raised to 70 GB by the coordinator on 2026-09-29). `hf download <repo> --revision <sha> --local-dir /home/piwi/turbine-models/<slug>`; the token stayed on the host. Every run exited 0; each directory holds `config.json` and every safetensors file the Hub lists. Free disk in bytes (`df -B1 /home/piwi`); two lanes ran at once, so an "after" can include the other lane's progress.
+
+| slug                              | repo                                                   | revision                                 | bytes (du)     | free before     | free after      |
+| --------------------------------- | ------------------------------------------------------ | ---------------------------------------- | -------------- | --------------- | --------------- |
+| llama-3.2-3b-instruct-fp8-dynamic | RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic             | c308a86de78778c5f904a1d82401ac85e18ca205 | 4,413,814,259  | 99,008,782,336  | 94,534,942,720  |
+| llama-3.2-3b-instruct-fp8         | RedHatAI/Llama-3.2-3B-Instruct-FP8                     | 377571d314b30f1d58448499e4100e2deafe7d7d | 4,404,163,249  | 92,897,808,384  | 87,486,226,432  |
+| llama-3.2-3b-instruct-fp8-block   | unsloth/Llama-3.2-3B-Instruct-FP8-Block                | 08cf804398b23fab4a1df02fbe8d4d5a11a800cc | 3,624,601,065  | 94,534,942,720  | 90,773,061,632  |
+| llama-3.2-3b-instruct-awq         | casperhansen/llama-3.2-3b-instruct-awq                 | 272b3bde867b606760447deb9a4d2719fbdfd3ae | 2,270,034,219  | 90,773,061,632  | 86,498,451,456  |
+| llama-3.2-3b-instruct-gptq        | shuyuej/Llama-3.2-3B-Instruct-GPTQ                     | dd5a311f040728fbc612eb03c8dadfae0a90552f | 2,264,970,345  | 87,486,226,432  | 82,073,235,456  |
+| llama-3.2-3b-mxfp4-a4             | matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq             | 91925ffda6977d097354a99718a20e035f8af80a | 2,303,041,140  | 86,498,451,456  | 80,744,726,528  |
+| llama-3.1-8b-instruct-mxfp4a16    | FabioTrindade/Llama-3.1-8B-Instruct-W4A16KV16-MXFP4A16 | 14c3aca849a72df8fcc8b3a30ab8d9eed86ee646 | 5,827,024,421  | 82,076,160,000  | 72,268,472,320  |
+| llama-3.1-8b-instruct             | unsloth/Llama-3.1-8B-Instruct                          | 4699cc75b550f9c6f3173fb80f4703b62d946aa5 | 16,077,901,654 | 132,625,727,488 | 116,133,445,632 |
+
+Total 41,185,550,352 bytes. The 8B BF16 download waited while free disk was ≈ 49 GB and ran after the cleanup (70 GB floor).
+
+**Fixture scripts (Task 11, fixtures builder) (user decision 2026-09-29: accepted as recommended):**
+
+1. The dequantized reference copy rounds each decoded weight (computed in F32) to nearest-even BF16: exact for MXFP4, up to 2^-9 relative for FP8 and INT4 × scale. Alternative: an F32 copy with F32 quantized layers in the reference.
+2. Activation fake-quantization hooks run in F32 and hand BF16 back to the layer, which runs in BF16. Alternative: those linears in F32.
+3. F16 embeddings and norms of AWQ / GPTQ checkpoints are rounded to BF16 in the copy (as a BF16 transformers load).
+4. Unsupported variants (compressed-tensors asymmetric INT4, act-order `g_idx`) exit with an error; `hf_fp8` activations map dynamic → per token (per group 128 with blocks), static → per tensor.
+5. `dequantize_checkpoint.py` uses the CPU torch build; `quant_reference.py` keeps `hf_reference.py`'s exact pins.
+6. `--act-quant` defaults to `auto` (the checkpoint's scheme); an explicit different mode only warns.
+7. `quant_fixtures_valid` lists the 8B BF16 baseline slug; `yarn16` is left out (not quantized, 17 prompts).
+8. The reference's `model` field is `--model-name`, else the directory name (the checkpoints' `_name_or_path` is a local path); committed fixtures pass `--model-name <hub-id>`.
+
+**YaRN namespace (6a Task 27, YaRN builder, landed c848810 + 835d37d) (user decision 2026-09-29: accepted as recommended):**
+
+1. `ModelIdentity` carries `rope_hash: [u8; 32]` (BLAKE3 of `ModelArchConfig::rope_identity()`) instead of the plan's `rope: String`, keeping `ModelIdentity` `Copy`; the namespace key is equivalent (its JSON is hashed).
+2. The model fingerprint does not include RoPE (lookups go through the namespace); alternative: fold it in, changing the fingerprint golden.
+3. `rope_hash` is always in the namespace JSON, so every cached key changes once (L2 is wiped at startup anyway).
+
+**INT4 packagings (6a Task 9, lead) (user decision 2026-09-29: accepted as recommended):**
+
+1. Group sizes 32, 64 and 128 are served (the proof checkpoints use 128; 32 lets every registered family's tiny checkpoint be written in the format for the conformance suite); others are refused `quant_scheme_unsupported`. Alternative: 128 only.
+2. GPTQ `sym: false` loads with stored zero points (`Int4GroupZp`, `checkpoint_format: gptq` zeros + 1); symmetric GPTQ must store zero 8 everywhere, else refused. Alternative: refuse asymmetric GPTQ.
+3. AWQ and GPTQ tensors left unquantized may be F16 and are converted to BF16 at load, each read whole (an embedding is up to ≈ 1 GB of host memory for an 8B model, above the 256 MB staging bound). Alternative: a chunked conversion in the loader.
+4. AWQ `modules_to_not_convert` entries match as substrings of the module name (AutoAWQ / vLLM), compressed-tensors `ignore` entries as compressed-tensors defines them.
+5. compressed-tensors `pack-quantized` is served symmetric only and without `actorder` (refused `gptq_act_order`), matching the fixture scripts.
+
+**MXFP4 packagings (6a Task 10, lead) (user decision 2026-09-29: accepted as recommended):**
+
+1. compressed-tensors `actorder: static` (the FabioTrindade 8B checkpoint) and Quark GPTQ `desc_act: true` with `static_groups: true` (the matmelis 3B checkpoint) are served: static groups keep the weights in order, so nothing is permuted at run time; other act orders are refused `gptq_act_order`. The same `static` acceptance now applies to compressed-tensors INT4.
+2. Quark checkpoints are served only with an empty `layer_quant_config` / `layer_type_quant_config` / `kv_cache_quant_config`, `export.weight_format: real_quantized`, `pack_method` `reorder` or `order`, weights and inputs `fp4 per_group 32 e8m0 half_even even`; anything else is refused `quant_scheme_unsupported`.
+3. Ignore entries written as globs (Quark `exclude`, OpenAI `modules_to_not_convert`) match with `*` as any text from the start of the module name.
+4. `quant_method: modelopt` and compressed-tensors `nvfp4-pack-quantized` are refused naming `phase-2b-nvidia` before any format is tried.
+
+**Quantized layers under tensor parallelism (6a Task 21, lead) (user decision 2026-09-29: accepted as recommended):**
+
+1. With quantized activations (static per-tensor, per-token or per-group FP8, MXFP4 emulation) the host TP test holds greedy tokens and the likely candidates (logprob > −2) to the golden bounds but not the far tail: each all-reduce's BF16 rounding can flip an FP8 code of the next layer's input (seen: a −25 logprob candidate moved 0.79 at tp 2 with static FP8). Weight-only formats keep the full golden bounds (worst 0.34–0.41 of them). The lab gate against each slug's reference (`--batched-bounds`) stays the real bound. Alternative: a looser tail bound, or quantizing activations on the full rows before the split.
+2. Per-token dynamic activation scales are computed per rank on its row-parallel input slice (as vLLM does), not over the full row.
+3. Pipeline-parallel stages with quantized weights are refused (`quant_pipeline_unsupported`) until tested; the spec's S-12 names tensor parallelism only.
+4. The test is model-level (`tiny_model tp2_quantized_matches_tp1_on_host`, host collective) instead of the plan's server-level `tiny_server`; the lab two-GPU leg stays for when the HIP kernels land (Tasks 14, 18, 20).
+
+**Quantization status and metrics (6a Task 25, lead) (user decision 2026-09-29: accepted as recommended):**
+
+1. `turbine_qgemm_calls_total{scheme,impl}` is dropped: a decode-graph replay runs every quantized GEMM without the host call a counter would count; the per-config implementation is already `turbine_kernel_provider_selected{op="qgemm",…}`. Alternative: count per graph key at capture and add on replay. Spec S-19 and Interfaces amended.
+2. The support key's weight column is now the detected packaging's (Task 2 had left it BF16). Every Phase 6a format gets an `experimental` row on `amd/gfx1201/LlamaForCausalLM` with BF16 KV while its proof runs (turned `supported` by each proof task after its gate), and on the `cpu` backend with BF16 or FP8 KV (tests and tiny checkpoints). Without these rows the proofs could not serve.
+3. The status test lives in `tiny_server` (the server harness) instead of `turbine-api tests/api.rs`.
+
+## P6: FP8 paged attention — provider evaluation (kernel reuse rule)
+
+Plan Task 23 (spec S-13): `kv.dtype: fp8_e4m3` stores L0 pages as OCP e4m3fn bytes with one K and one V scale per layer (decision Q10). Contract kept from the CPU reference: a page element is written `e4m3(x / scale)` and read `bf16(e4m3 · scale)`, and attention is then exactly the BF16 attention of the CPU model (Q, P and the output stay BF16/F32 as today). Candidates, on `gfx1201` (R9700, ROCm 7.14.1, CK `therock-7.14.1` as pinned by `kernels/rocm/CMakeLists.txt`):
+
+| Candidate                                                                                                                                                                                                                    | Builds on gfx1201?                                                      | Fits the contract?                                                                                                                                                                                                                                                                                                                              | Outcome                                                                                                                                                        |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| CK `fmha_fwd_pagedkv` / `fmha_fwd_splitkv` FP8 instances (`01_fmha/codegen/ops/fmha_pagedkv_prefill.py`, `fmha_fwd_splitkv.py`: gfx12 factory has `fp8`/`bf8` d64/128/256 tiles)                                             | the generator lists them (`FmhaFwdFp8`)                                 | no: `FmhaFwdTypeConfig<FmhaFwdFp8>` makes Q, K, V **and P and O** e4m3 with `do_fp8_static_quant` (static `scale_s`/`scale_p`/`scale_o`); the BF16-output variant `fp8bf16` is `pass # TODO` for pagedkv and split-KV. Using it would quantize Q, the probabilities and the output with static scales we do not have (Q10 excludes calibration) | rejected on numerics (not measured)                                                                                                                            |
+| CK BF16 `fmha_fwd_pagedkv` over FP8 pages **dequantized into a BF16 staging pool** (the batch's pages converted to BF16 blocks in the context's attention scratch with a staged block table, then the unchanged CK instance) | yes (existing instances)                                                | yes: CK sees exactly the BF16 values the contract defines                                                                                                                                                                                                                                                                                       | **chosen for prefill** (`ck_tile_fmha_pagedkv_fp8_staged`, pages of a multiple of 128) — see timings                                                           |
+| Same staging for decode (CK split-KV over staged pages)                                                                                                                                                                      | yes                                                                     | yes                                                                                                                                                                                                                                                                                                                                             | rejected: decode is bandwidth-bound; staging reads 1 B + writes 2 B + CK reads 2 B per element (2.5× the BF16 KV traffic)                                      |
+| FP8-reading variant of the Turbine paged kernel (dequantize on load into the LDS tiles)                                                                                                                                      | yes                                                                     | yes                                                                                                                                                                                                                                                                                                                                             | kept as the any-page-size fallback (`turbine_hip_fp8`); scalar two-pass kernel, too slow as the main prefill path — see timings                                |
+| llama.cpp HIP flash attention with quantized KV (`fattn-vec`/`fattn-tile`)                                                                                                                                                   | (built for the Pre-Phase-5 #3 evaluation at a97cce8)                    | no: its quantized KV types are q8_0/q4_0/… blocks with F16 scales, not e4m3 pages; contiguous per-stream KV with a mask, no page table — adapting means a new KV type plus a page-table load path, i.e. our own kernel inside its templates                                                                                                     | rejected                                                                                                                                                       |
+| vLLM ROCm paged attention (`csrc/rocm/attention.cu`, FP8 KV via `Fp8KVCacheDataType`, gfx12 WMMA path)                                                                                                                       | not built                                                               | partly: FP8 K/V with per-layer scales and BF16 Q is exactly this contract, but pages of 16/32 tokens only, K laid out `[blocks, kv_heads, head/x, block, x]` and V transposed (a KV-format change for pool, append, prefill and tiers), decode only, and the file includes torch headers                                                        | rejected (layout/page size, as in "Pre-Phase-5 #3")                                                                                                            |
+| aiter paged attention FP8                                                                                                                                                                                                    | no: MFMA (gfx9) / gfx1250 ASM only; the Gluon path is Triton (excluded) | –                                                                                                                                                                                                                                                                                                                                               | rejected                                                                                                                                                       |
+| Own FP8 decode kernel (`turbine_hip_fp8_decode`: one workgroup per sequence and KV head, every query head of the group at once, K/V rows read once as bytes, exact two-pass maximum)                                         | yes                                                                     | yes (CPU model up to f32 summation order)                                                                                                                                                                                                                                                                                                       | **chosen for decode** (P rounded against a running maximum as in CK's FMHA, so within the BF16 tolerance rather than bit-exact to the CPU model) — see timings |
+
+Timings (GPU 0, bench lock, `hip_ops decode_attention_timings_fp8` / `prefill_op_timings_fp8`, µs per call, append included):
+
+Decode, `attention_decode_paged` at 128-token pages (µs; BF16 rows are the served CK choice, FP8 rows the new implementations; final kernel = online-softmax version):
+
+| shape               | BF16 CK split-KV (Llama) / pagedkv (OLMoE) | FP8 `turbine_hip_fp8_decode` | FP8 `turbine_hip_fp8` (Turbine kernel) | BF16 `turbine_hip` |
+| ------------------- | ------------------------------------------ | ---------------------------- | -------------------------------------- | ------------------ |
+| Llama 24/8 b1 @768  | 49.6–54.6                                  | 55.4–56.4                    | 484                                    | 396                |
+| Llama b16 @768      | 117.5–131.9                                | 133.8–138.5                  | 1,048                                  | 855                |
+| Llama b64 @768      | 394–403                                    | 481–496                      | 3,027                                  | 2,497              |
+| Llama b16 @2k       | 250–260                                    | 289–294                      | 2,726                                  | 2,190              |
+| Llama b16 @8k       | 882–890                                    | 928–966                      | 11,497                                 | 9,221              |
+| OLMoE 16/16 b1 @768 | 48.8                                       | 50.2                         | 491                                    | 386                |
+| OLMoE b16 @768      | 200.4                                      | 157.2                        | 1,466                                  | 1,198              |
+| OLMoE b64 @768      | 698.8                                      | 721.1                        | 5,269                                  | 4,438              |
+| OLMoE b16 @2k       | 479.0                                      | 349.6                        | 3,877                                  | 3,264              |
+| OLMoE b16 @8k       | 1,765                                      | 1,143                        | 16,377                                 | 12,947             |
+
+(A first two-pass version of the FP8 decode kernel with the exact CPU maximum ran 226 µs at Llama b16 @768 and 1,648 at @8k; the single-pass online-softmax version above is within ~5–10 % of CK split-KV for Llama and faster than CK pagedkv for OLMoE, whose KV bytes it halves.)
+
+Prefill, `attention_prefill_paged` at 128-token pages (µs):
+
+| shape                                 | BF16 CK pagedkv | FP8 `ck_tile_fmha_pagedkv_fp8_staged` | FP8 `turbine_hip_fp8` |
+| ------------------------------------- | --------------- | ------------------------------------- | --------------------- |
+| Llama 16 × 512 new                    | 500             | 701                                   | 20,514                |
+| Llama 16 × 512 new after 1,024 cached | 1,696           | 1,926                                 | 86,324                |
+| Llama 1 × 2,048                       | 336             | 480                                   | 19,987                |
+| OLMoE 16 × 512                        | 577             | 857                                   | 14,372                |
+| OLMoE 16 × 512 after 1,024            | 2,482           | 3,050                                 | 57,915                |
+| OLMoE 1 × 2,048                       | 259             | 534                                   | 14,527                |
+
+The staging adds 140–560 µs per call (convert + a second CK read of BF16), small against the prefill GEMMs; the Turbine FP8 kernel is 30–45× slower than CK and stays the any-page-size fallback only.
+
+Correctness (lab, R9700): `hip_ops paged_fp8_matches_cpu` passes (worst |Δ| vs CPU 3.9e-3 for the staged CK and Turbine FP8 kernels, 9.8e-4 for the FP8 decode kernel in its two-pass form, 3.9e-3 in the final online form, all within the paged BF16 tolerance) (prefill and decode, 128- and 16-token pages, Llama 24/8, OLMoE 16/16, GQA 32/8, unit and non-unit scales, every FP8 implementation bound alone, page bytes exact after the append, a 64-sequence batch staged in two CK groups, a 66,000-token sequence that exceeds the 256 MiB staging bound and runs the Turbine FP8 kernel) and `every_implementation_matches_cpu` (FP8 cases added).
+
+- A) Prefill `ck_tile_fmha_pagedkv_fp8_staged` (BF16 CK over staged pages, groups of ≤ 256 MiB of staged pages, the Turbine FP8 kernel for a sequence that alone exceeds it), decode own `turbine_hip_fp8_decode`, `turbine_hip_fp8` for other page sizes (chosen, provisional pending user review)
+- B) The Turbine FP8 kernel for everything (smallest code, slower prefill and decode)
+- C) Fork CK's pagedkv pipeline to convert FP8 K/V tiles to BF16 after the DRAM load (no staging copy; a CK pipeline fork to maintain)
+
+## P6: INT4 group GEMM — provider evaluation (kernel reuse rule)
+
+Phase 6a Task 16 (INT4 builder, 2026-09-29). W4A16 with group-128 scales, BF16 activations, for AWQ zero points (`INT4_GROUP_ZP`) and symmetric GPTQ (`INT4_GROUP_SYM`, implicit 8), at the Llama-3.2-3B linear shapes qkv 5120 × 3072, o 3072 × 3072, gate_up 16384 × 3072 and down 3072 × 8192. Everything ran natively on novanas GPU 0 under `scripts/bench-lock.sh` (the harness also checks correctness on GPU 1). Third-party sources were fetched shallow and sparse into `/home/piwi/turbine-ci/scratch/p6a-int4/` (coordinator's approval, 2026-09-29) and deleted after this entry: ggml-org/llama.cpp @ `680a036285273a3ff56032ec5d7f3352609eba4f` (MIT) and vllm-project/vllm @ `32cc3f1ea886c38cbacde35550eb74defaa7bca1` (Apache-2.0). Nothing from them is in the repository. CK is the pinned `cd9574023093742434e8c992d13b89ab9a6c1cf8` (MIT). The harness is `kernels/rocm/tools/qgemm_int4_eval.cpp` (`-DTURBINE_BUILD_QGEMM_INT4_EVAL=ON`). It runs every `turbine_qgemm` implementation of the library through the ABI, plus the BF16 baseline (`turbine_gemm` on the BF16-rounded dequantized weight: the BF16 model's cost). It rotates over ≥ 256 MiB of weight copies (past the 64 MiB Infinity Cache), reports the median µs of 5 × 20 calls, and checks the sampled rows against the CPU provider's semantics.
+
+| Candidate                                                                                          | Builds on gfx1201?                                                                                                                                                                                                                                                                              | Correct?                                                                                                                                         | m=1 (µs, qkv/o/gate_up/down = sum)                               | m=16                                 | m=128              | m=2048                                                       |
+| -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------- | ------------------------------------ | ------------------ | ------------------------------------------------------------ |
+| BF16 baseline (hipBLASLt, tuned table; not an INT4 candidate)                                      | yes                                                                                                                                                                                                                                                                                             | reference                                                                                                                                        | 57.0/36.1/164.8/85.6 = 344                                       | 358                                  | 439                | 5,663                                                        |
+| CK `ck_tile` `gemm_quant` BQuantGrouped, BF16 A × `pk_int4` B, F32 group scales                    | the plain BQuant pipeline does not (its block GEMM static-asserts FP8/BF8 compute: W4A8 only); the preshuffled-B pipeline (`WPQuantBPipelineAgBgCrV2`) builds with a 16×16×16 WMMA warp tile and K tile 128 (CK example 38's own configs fail on gfx12: K tile < group, warp-GEMM distribution) | CK's CPU check: correct at m 1/4/16 (sym)                                                                                                        | 29.8/27.6/40.8/58.6 = 157                                        | 156                                  | 519                | 7,516 (≈ 55 TFLOPS; the 128×128 prefill config is 3× slower) |
+| llama.cpp HIP `mul_mat_vec_q` / `mmq`, q4_0 (sym) and q4_1 (scale + min), `test-backend-ops perf`  | yes (FA off, gfx1201)                                                                                                                                                                                                                                                                           | its own test mode passes; W4A8 (activations quantized to q8_1), not the W4A16 reference; q4_1's FP16 d and m cannot hold AWQ's (q − z)·s exactly | q4_0 24.5/112.8†/42.3/18.8 (weights not rotated: cache-resident) | 147                                  | q4_0 397, q4_1 431 | q4_0 4,803, q4_1 5,225                                       |
+| vLLM `wvSplitK_int4_g` (`csrc/rocm/skinny_gemms_int4.cu`, gfx11/gfx12)                             | yes (kernel templates, no torch; scratch driver)                                                                                                                                                                                                                                                | yes after a repack: its own nibble interleave, BF16 scales, zero points [n/8, groups] u32                                                        | ZP 18.1/13.0/45.2/25.7 = 102                                     | not supported (≤ 4 tokens; m=4: 145) | –                  | –                                                            |
+| vLLM `gptq_gemm_rdna3` / `_wmma` (`csrc/rocm/q_gemm_rdna3*.cu`)                                    | no: compiled for `__gfx1100__` only, gfx11 WMMA builtins (duplicated-lane operands)                                                                                                                                                                                                             | –; its K-split accumulates with BF16 atomics (order-dependent results)                                                                           | –                                                                | –                                    | –                  | –                                                            |
+| vLLM AWQ on ROCm / aiter                                                                           | excluded: Triton (Python) / gfx9 only                                                                                                                                                                                                                                                           | –                                                                                                                                                | –                                                                | –                                    | –                  | –                                                            |
+| **Own `turbine_hip_int4_wmma`** (codes streamed into the WMMA registers, `qgemm_int4_kernels.hpp`) | yes                                                                                                                                                                                                                                                                                             | yes: exact F32 weights, max \|Δ\| ≤ 2.6e-5 in F32 (`hip_qgemm_int4`); rows batch-invariant                                                       | ZP 21.3/15.2/52.9/31.9 = **121**                                 | **134**                              | **637**            | 9,868                                                        |
+| **Own `turbine_hip_int4_dequant`** (dequantize 32 MiB chunks to BF16, then hipBLASLt)              | yes                                                                                                                                                                                                                                                                                             | yes: bitwise the BF16 baseline's arithmetic (the golden reference's BF16-rounded weight)                                                         | 551                                                              | 551                                  | 705                | **5,136**                                                    |
+
+† an outlier of that run (q4_1 241.8). All µs are GPU 0, ZP; SYM within 2 % (e.g. fused m=1 120, m=128 632). The external candidates are from the run of 03:28, the BF16 baseline and the own implementations from the harness run of 04:08 (0 failures, every INT4 implementation within tolerance at every m). The own kernels at m=64 take 347 µs (fused) and 591 (dequant), at 256 1,239 and 886, at 512 2,414 and 1,400 (BF16: 370, 751, 1,484). Launch-shape sweep (`--sweep 1`, m 1 and 16): one 16-column tile per wave is best; 2 waves splitting k are best for k 3072 (gate_up m=1 53.2 µs vs 60.4 with 8 waves) and 8 for k 8192 (down 31.3 vs 44.0 with 2).
+
+Why the own kernels. No external kernel serves the ABI v2.9 INT4 layout (`[n, k/2]`, low nibble first, F32 scales, U8 zero points) with BF16 activations and zero points:
+
+- CK has no zero points and needs its preshuffled B. A preshuffle would be a load-time repack per implementation, which the v2.9 ABI does not have.
+- vLLM's kernel stops at 4 tokens and needs its own packing.
+- llama.cpp changes the arithmetic (8-bit activations) and would bring in ggml's CUDA/HIP tree.
+
+What each external candidate did well:
+
+- vLLM's skinny kernel is 16 % faster at one token (102 vs 121 µs per layer).
+- CK is faster from about 64 to 128 rows (519 vs 637 at 128).
+- llama.cpp's mmq is faster at 128 rows (397), but on cache-resident weights and W4A8.
+
+The fused kernel decodes codes without arithmetic: 0x4300 | q is the BF16 of 128 + q. A ones-WMMA gives each group's Σa, and the group adds s·(acc − (128 + z)·Σa) in F32. It streams 16 bytes of codes per lane per 64-deep step, and the waves of a block split k by a rule that depends on k only (2 waves for k 3072, 8 for k 8192). The sweep of 1/2/4 column tiles × 1–8 waves is in `--sweep`. Rows are therefore batch invariant.
+
+**Chosen (2026-09-29): user decision 2026-09-29: accepted as recommended:**
+
+1. Own kernels, registered as `turbine_hip_int4_wmma` and `turbine_hip_int4_dequant`, after `hipblaslt_fp8` in library order. Alternative: vendor vLLM's `wvSplitK_int4_g` (Apache-2.0, adapted to the ABI layout and F32 scales) as a third implementation for m ≤ 2, for about 0.5 ms per token at c1.
+2. The gfx1201 card profile gives `qgemm` row tiers: ≤ 128 rows the fused kernel, above that the dequant path (layer sums 637 vs 705 µs at 128, 1,239 vs 886 at 256). The FP8 implementation leads both tiers' orders. Alternative: 64, the earlier GPU 1 crossover.
+3. The dequant path's staging buffer: the largest layer's BF16 weight (96 MiB for the 3B gate_up, 224 MiB for the 8B; above 512 MiB the weight is staged in column chunks), per context, grown at its first call (refused while a graph is captured) and freed with the context. It is not in the memory budget, like the MoE scratch. Decode graphs are decode steps (`scheduler.max_running_requests` 64 rows in the lab configs), so they run the fused kernel and never grow it. Alternative: register the buffer with the memory budget (a qgemm workspace the loader sizes).
+4. Supported groups:
+   - fused: 64, 128 and 256 (the step is 64 deep);
+   - dequant: any multiple of 32, so group-32 checkpoints (the tiny conformance fixtures) run the dequant path on HIP;
+   - others are refused by `supports`.
+5. Numerics. The fused kernel uses exact F32 weights; the dequant path uses the BF16-rounded weight, as the golden references do. Decode calls run the implementation their row tier binds. Prefill calls (`turbine_qgemm_desc::prefill`) run the dequant path under either binding, as one GEMM of the layer's own shape with `TURBINE_OPTION_GEMM_PREFILL` raised, so hipBLASLt runs the tuned table's invariant class and every row is computed the same way whatever m. A prefix-reused INT4 prefill therefore reproduces the cold one bit for bit (Phase 4), as BF16 does, for shapes with table rows (Llama-3.2-3B at tp 1 and 2); `hip_qgemm_int4 int4_rows_are_batch_invariant` checks prefill rows at 1 to 513 rows across both bindings (coordinator's correction, 2026-09-29: this item was first recorded as not bit-exact, which Phase 4 does not allow). Cost: a small prefill chunk pays the dequant pass (about 0.55 ms per Llama-3.2-3B layer set at any m) instead of the fused kernel.
+6. Follow-up, not in this task: a mid-m kernel (weights reused across row tiles, 64–512 rows), where CK and llama.cpp show 20–40 % headroom over both tiers.
+
+**Golden tolerance for activation-quantized checkpoints (6a Tasks 14, 20; lead, 2026-09-29) (user decision 2026-09-29: accepted as recommended):** FP8 W8A8 golden c1 fails the BF16 Llama bounds (likely |Δ| 0.17–0.57, tail 0.5–2.8; greedy tokens mostly identical, divergences at margins 0.01–0.17) while `hipblaslt_fp8` matches the CPU reference within one BF16 ulp. A) calibrate each activation-quantized slug from transformers' own spread with the activation fake-quantization hooks (`self_spread.py --act-quant`, the OLMoE method) and make `quant_reference.py` quantize a fused projection with its parts' largest `input_scale` as the loader and vLLM do — chosen; B) adopt a fixed looser bound (e.g. OLMoE's 1.01 / 1.66) without calibration; C) keep the BF16 bounds and leave the rows unsupported. The FP8 builder owns `scripts/golden/{self_spread,quant_reference}.py` from now on.
+
+## P6: MXFP4 GEMM — provider evaluation (kernel reuse rule)
+
+Date: 2026-09-29 (Phase 6a Task 19, MXFP4 builder). Card: R9700 (gfx1201), GPU 0 under `bench.lock` (and `port18000.lock`, queued like lab-bench) with no swap-in, ROCm 7.14.1, hipBLASLt 1.4.1, CK at the pinned `cd9574023093742434e8c992d13b89ab9a6c1cf8`, llama.cpp at `680a036285273a3ff56032ec5d7f3352609eba4f` (the INT4 builder's checkout, copied; nothing downloaded). Harness: `kernels/rocm/tools/qgemm_mxfp4_eval.cpp` (`-DTURBINE_BUILD_QGEMM_MXFP4_EVAL=ON`): per shape and m, hipBLASLt BF16 on the dequantized weight (first heuristic answer and best of 8), a dequantize-to-BF16 kernel + that GEMM, and each `turbine_hip_mxfp4` tile; median of 5 rounds × 20 calls, rotating over enough weight copies (≥ 512 MiB) to defeat the 64 MiB infinity cache; correctness on 6 sampled rows against a host reference with `cpu::qgemm`'s semantics (E2M1 × 2^(E8M0 − 127) weights, BF16 activations, exact products, one rounding to BF16; bound one BF16 rounding plus 1e-6). Shapes: Llama-3.2-3B qkv 5120×3072, o 3072×3072, gate_up 16384×3072, down 3072×8192; Llama-3.1-8B qkv 6144×4096, o 4096×4096, gate_up 28672×4096, down 4096×14336.
+
+### Candidates
+
+| Candidate                                                                                                                                                                            | Builds on gfx1201 | Correct                                                                                                                                                                                                                                                                                                                | Notes                                                                                                                                                                                                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| CK `ck_tile` MX GEMM (`example/ck_tile/42_mx_gemm`, `gemm_mx` ops)                                                                                                                   | no                | —                                                                                                                                                                                                                                                                                                                      | gfx950 only (scaled MFMA); its CMake lists `SUPPORTED_GPUS gfx950`                                                                                                                                                                                                   |
+| CK `ck_tile` `gemm_quant` BQuantGrouped BF16 × `pk_fp4_t` with E8M0 group-32 scales (`38_block_scale_gemm/gemm_bquant_quantgrouped_mx_bf16fp4.cpp`, the W4A16 MXFP4 microscale path) | yes               | **no** with the example's `GemmConfigQuantPrefill` (all outputs 0, 98 % wrong, "353 TFLOPS"); **yes** with the WMMA warp tile `GemmConfigBQuantPrefill_Wmma` (16×16×16), CK's own CPU check passes at m = 128 and 2048                                                                                                 | m must be a multiple of 128 (`kPadM` false: m = 1, 16, 513 refused `Arguments not supported`); 11–13 TFLOPS at m = 2048 on every shape (3b.o 3.02 ms vs 0.27 ms hipBLASLt BF16; 8b.gate_up 43.5 ms vs 4.4 ms): ~10× slower than BF16                                 |
+| llama.cpp HIP `GGML_TYPE_MXFP4` `mul_mat_vec_q` / `mmq` (`test-backend-ops`, patched perf list with our shapes)                                                                      | yes               | its own check vs ggml's CPU backend passes (46/46 MUL_MAT mxfp4 cases); **not the checkpoint's arithmetic**: activations are quantized to 8 bits per 32 (`q8_1`) before an int8 dot product, i.e. W4A8, not W4A16 (and not the BF16 GEMM after MXFP4 emulation that Quark W4A4 needs); F16 activations are unsupported | decode (m 4–16) about equal to `turbine_hip_mxfp4` (its perf mode does not rotate weights, so shapes under 64 MiB run from the infinity cache: 3b.gate_up m = 1 at an apparent 900 GB/s); prefill equal to ours (3b.gate_up m = 2048 2,213 µs vs 2,223)              |
+| hipBLASLt                                                                                                                                                                            | not probed        | —                                                                                                                                                                                                                                                                                                                      | the FP8 evaluation found no mixed BF16 × low-precision kernel on gfx1201; MXFP4 needs BF16 × FP4 with E8M0 vector-32 scales, which hipBLASLt offers only for gfx950 FP4 × FP4 (inference, not measured)                                                              |
+| The INT4 path generalised to E2M1 × E8M0: dequantize to BF16 + hipBLASLt (`dequant+bf16` in the harness; the INT4 tier above 128 rows)                                               | yes               | yes                                                                                                                                                                                                                                                                                                                    | needs an n × k BF16 scratch (up to 235 MB for 8b.gate_up); 1.5–9× slower than the fused kernel up to m = 128; at m = 2048 faster on 3b.qkv (20 %), 3b.gate_up (14 %) and 3b.o (9 %), equal on 3b.down, 8b.qkv and 8b.gate_up, slower on 8b.o (4 %) and 8b.down (9 %) |
+| The INT4 path generalised: a fused WMMA kernel decoding the codes in registers (own) — `turbine_hip_mxfp4`                                                                           | yes               | yes (all rows within the bound, max \|Δ\| ≤ 2e-2 at outputs ≈ 4–8; lab `hip_qgemm_mxfp4` below)                                                                                                                                                                                                                        | picked, see below                                                                                                                                                                                                                                                    |
+
+### µs per call, GPU 0 (the recorded run, `turbine_hip_mxfp4` with its final tiles)
+
+| shape      | m    | BF16 first | BF16 best of 8 | dequant+BF16 | `turbine_hip_mxfp4` | llama.cpp MXFP4 (cached) | llama.cpp BF16 |
+| ---------- | ---- | ---------- | -------------- | ------------ | ------------------- | ------------------------ | -------------- |
+| 3b.qkv     | 1    | 68.0       | 54.6           | 122.1        | **16.1**            | 25.0                     | 38.4           |
+| 3b.qkv     | 16   | 68.0       | 55.6           | 123.9        | **17.9**            | 23.3                     | 23.2           |
+| 3b.qkv     | 128  | 70.8       | 59.2           | 139.2        | **78.0**            | 68.7                     | 44.3           |
+| 3b.qkv     | 2048 | 453.3      | 447.0          | 576.1        | **715.9**           | 731.5                    | 545.0          |
+| 3b.o       | 1    | 49.1       | 39.5           | 80.4         | **12.1**            | 124.3                    | 47.8           |
+| 3b.o       | 16   | 52.3       | 40.6           | 79.7         | **13.6**            | 19.6                     | 14.8           |
+| 3b.o       | 128  | 65.3       | 47.0           | 92.1         | **52.3**            | 45.0                     | 38.3           |
+| 3b.o       | 2048 | 308.9      | 269.1          | 384.5        | **421.1**           | 432.1                    | 385.8          |
+| 3b.gate_up | 1    | 174.2      | 165.6          | 510.4        | **69.8**            | 29.9                     | 169.8          |
+| 3b.gate_up | 16   | 178.0      | 170.4          | 514.4        | **66.5**            | 51.6                     | 174.8          |
+| 3b.gate_up | 128  | 241.1      | 220.0          | 534.0        | **153.4**           | 147.5                    | 257.7          |
+| 3b.gate_up | 2048 | 1497.3     | 1511.4         | 1901.1       | **2223.0**          | 2213.4                   | 1807.7         |
+| 3b.down    | 1    | 116.9      | 98.8           | 235.5        | **47.3**            | 21.9                     | 48.5           |
+| 3b.down    | 16   | 118.2      | 98.5           | 234.8        | **49.8**            | 40.2                     | 53.8           |
+| 3b.down    | 128  | 169.8      | 103.2          | 339.7        | **132.7**           | 114.0                    | 134.8          |
+| 3b.down    | 2048 | 1019.2     | 1005.4         | 1181.0       | **1185.6**          | 1213.2                   | 1206.3         |
+| 8b.qkv     | 1    | 95.5       | 83.5           | 198.9        | **38.2**            | 33.6                     | 51.5           |
+| 8b.qkv     | 16   | 84.4       | 84.3           | 199.4        | **43.4**            | 30.8                     | 39.3           |
+| 8b.qkv     | 128  | 100.1      | 89.8           | 237.4        | **113.4**           | 94.7                     | 76.7           |
+| 8b.qkv     | 2048 | 961.3      | 885.5          | 1148.2       | **1157.1**          | 1142.5                   | 1116.2         |
+| 8b.o       | 1    | 71.9       | 57.2           | 151.6        | **20.9**            | 37.6                     | 46.9           |
+| 8b.o       | 16   | 83.2       | 57.5           | 154.2        | **24.8**            | 24.0                     | 26.0           |
+| 8b.o       | 128  | 76.6       | 59.7           | 172.6        | **71.9**            | 65.3                     | 80.0           |
+| 8b.o       | 2048 | 714.1      | 581.0          | 814.7        | **779.7**           | 788.7                    | 675.6          |
+| 8b.gate_up | 1    | 372.8      | 371.7          | 1136.3       | **110.4**           | 56.5                     | 380.4          |
+| 8b.gate_up | 16   | 380.4      | 379.9          | 1142.4       | **116.7**           | 109.1                    | 391.2          |
+| 8b.gate_up | 128  | 471.0      | 470.4          | 1259.7       | **354.9**           | 344.6                    | 513.7          |
+| 8b.gate_up | 2048 | 4359.5     | 4385.4         | 5183.8       | **5174.2**          | 5252.6                   | 4566.4         |
+| 8b.down    | 1    | 221.0      | 189.5          | 606.0        | **61.5**            | 33.4                     | 197.2          |
+| 8b.down    | 16   | 224.9      | 197.8          | 607.2        | **75.0**            | 70.9                     | 192.3          |
+| 8b.down    | 128  | 246.2      | 212.0          | 646.2        | **226.8**           | 205.3                    | 310.2          |
+| 8b.down    | 2048 | 2342.7     | 2089.2         | 2790.4       | **2561.7**          | 2763.4                   | 2356.0         |
+
+(m = 4 rows are in the log; they equal m = 1 within noise.) The tile sweep before it (same lock rules, less host load: no lab-test build running) measured the decode tile 25–40 % faster than this run on some shapes (3b.down m = 1–16 29–34 µs, 3b.gate_up 51–58, 8b.down 60–67, 8b.gate_up 108–117; BF16 unchanged), so the decode ratios above are conservative: `turbine_hip_mxfp4` streams the 4.25-bit weights at 400–520 GB/s for m ≤ 16, 3–4× the BF16 GEMM. Tile sweep (µs, m = 32 / 64, the medium tiles chosen): 3b.down 52 / 73, 3b.gate_up 65 / 97, 3b.o 15 / 23, 8b.down 75 / 137, 8b.gate_up 129 / 225 (BF16 best 98–400).
+
+MXFP4_EMULATED activation quantize-dequantize (`turbine_hip_mxfp4` `quantize_act`, own): bit-exact with `cpu::quant` (values and scales) at every size; 3.4–4.1 µs for 1–16 rows, 115 / 152 / 303 / 561 µs for 2,048 rows of 3072 / 4096 / 8192 / 14336 columns (~210 GB/s: one wave per 32-column group, not tuned).
+
+### Pick (user decision 2026-09-29: accepted as recommended)
+
+- `turbine_hip_mxfp4` (provider turbine_hip, own; `src/qgemm_mxfp4.hip`) for every MXFP4 GEMM, scheme MXFP4 with act NONE or MXFP4_EMULATED, BF16 activations, BF16 or F32 out, k a multiple of 64: m ≤ 16 a decode tile (one 16-row fragment, one column fragment per wave, k split over 8 waves, the group sums scaled after the WMMAs), m ≤ 64 2 or 4 row fragments with k split over 4, above an LDS-staged 128 × 128 tile (scaled weights decoded once for 8 row fragments). Codes become BF16 through a 256-entry LDS byte table; the half-waves exchange codes so each WMMA slice holds one group's k values in both operands. Decode-step calls pick the tile by m; every prefill-step call (`prefill` set) runs the LDS tile, whose per-row summation order does not depend on m, so prefill rows are bitwise the same in any batch (Phase 4 prefix reuse; lab `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_rows_are_batch_invariant`).
+- Not taken: CK BQuant MX (10× slower, m multiple of 128 only); llama.cpp (W4A8 arithmetic, not the checkpoint's; no faster where both run from memory); dequantize + hipBLASLt (a 235 MB scratch outside the memory budget for 9–20 % at m = 2048 on 3 of 8 shapes, 1.5–9× slower up to m = 128).
+- Activation emulation: own kernel, no provider takes the v2.9 `quantize_act` op (CK's MX quantization lives inside its gfx950 MX GEMM pipelines).
+- Findings to act on: (1) prefill (m = 2048) takes 1.18–1.60× the hipBLASLt BF16 time (3b.qkv 1.60×, 3b.o 1.56×, 3b.gate_up 1.47×, 3b.down 1.18×, 8B 1.18–1.34×): TTFT of MXFP4 checkpoints is above BF16's; an MXFP4 prefill kernel at hipBLASLt speed is a follow-up (the S-20 targets are c1 ITL and c16 tok/s). (2) Decode-step rows depend on the tile (k-split order), like hipBLASLt's `speed` rows for Llama; prefill-step rows do not (above). (3) The quantize-dequantize is ~210 GB/s at 2,048 rows (~5 % of a W4A4 prefill step), untuned.
+
+**FP8 KV golden (6a Task 24; lead, 2026-09-29) (user decision 2026-09-29: accepted as recommended):** Llama with FP8 KV (scales 1.0) fails the BF16 golden bounds (c1 4/16, c16 9/16; likely |Δ| up to 0.44, tail 1.58; greedy tokens mostly identical) while the HIP kernels match the CPU reference. A) judge FP8 KV by the token rule and the GSM8K eval only; B′) a transformers reference with FP8 KV emulated (K after RoPE and V quantize-dequantized with the served scales, read back as BF16) and a tolerance calibrated with `self_spread.py --kv-quant fp8_e4m3` (the method used for activation-quantized weights) — chosen; C) warm-up scale calibration (declined at Q10). Spec S-13 AC amended; lab-bench models `llama-fp8kv` / `olmoe-fp8kv`.
+
+**Quark W4A4 accuracy baseline (6a Task 20; lead with the coordinator's approval for the sleeping user, 2026-09-29) (user decision 2026-09-29: accepted as recommended):** the proof checkpoint `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` quantizes the Llama-3.2-3B _base_ model, so the S-17 gate against BF16 3B _Instruct_ would fail on instruction following regardless of quantization. A) keep the Instruct baseline as written; B) compare with BF16 Llama-3.2-3B base — chosen, with A's result reported alongside; C) drop the W4A4 proof. Download (not in the approved list; approved as provisional): `unsloth/Llama-3.2-3B` @ `d4446454d87d51aa42e1fb174f25acc5f8762331` into `/home/piwi/turbine-models/llama-3.2-3b` (the `meta-llama` repo is gated for the host token; unsloth's is the same weights, ungated, the source the Instruct model already came from). Golden prompts: the overnight pick (the Instruct chat template on the base checkpoint) is replaced by the user's answer **"Find another checkpoint"** — prove W4A4 golden on an Instruct W4A4 MXFP4 checkpoint loadable by our packagings (pinned, downloaded on novanas); if none exists, completion prompts only for the base checkpoint; no self-made quantization without asking. The base-3B accuracy baseline stays as chosen. Downloaded 2026-09-29: 6,442,822,178 bytes, exit 0, revision recorded in the local metadata (free on `/` 220.3 GB before, 149.2 GB after — other agents' builds ran meanwhile).
+
+**GSM8K-200 task set (umbrella S-4 tool, used by the Phase 6a S-17 gates; lead, 2026-09-29) (user decision 2026-09-29: accepted as recommended):** the committed set asked for a bare number in 32 tokens; Turbine BF16 scored 5/200 (Llama-3.2-3B-Instruct) and 16/200 (Llama-3.1-8B-Instruct) — it measured format compliance (`$18`, a sentence), and a 0.02 / 0.04 drop bound on 5–16 correct answers has no power. A) chain of thought: "Solve the problem step by step. On the last line, write "Answer: " followed by the final answer as a number.", `max_tokens` 512, matcher `final_number` (the number after the last `Answer:`, else the last number; `$`, `,` and units ignored) — chosen; B) keep the bare-number prompt, loosen only the matcher (still no reasoning room); C) few-shot prompting. Same 200 items (commit 3101c7d); every baseline and candidate is re-run on the new set; the old eval JSONs are void.
+
+**`fp8_block` served decoded to BF16 (6a Task 15; FP8 builder's evaluation, lead decision 2026-09-29) (user decision 2026-09-29: changed):** no provider computes block-scaled FP8 on gfx1201 — CK `ck_tile` ABQuantGrouped builds but returns ~1e38 on every shape (its own example fails its CPU check at this CK pin), hipBLASLt has no BLK128x128 kernels, and a per-call dequantize costs 2–4 × the BF16 GEMM. A) decode each block-scaled weight to BF16 once at load (`cpu::quant::dequantize` with its scales as a loader companion) and serve it through the BF16 GEMM with BF16 activations — the overnight pick: BF16 speed and memory, no weight-memory saving, the checkpoint's activation scheme not applied (its golden reference is made with `--act-quant none`); B) an own fused W8A16 WMMA kernel (FP8 in memory, dequantized in registers) — **chosen by the user: "Write own kernel in 6a"** (the reuse evaluation above stands: no working block-scaled FP8 provider on gfx1201), with real memory savings, tests against the CPU reference and the fp8_block proof; A stays only as the logged fallback for shapes the kernel does not support; C) refuse `fp8_block` on amd. The column stays `fp8_block`.
+
+## P6: FP8 GEMM — provider evaluation (kernel reuse rule)
+
+Date: 2026-09-29 (Phase 6a Task 12). Card: R9700 (gfx1201), GPU 0, ROCm 7.14.1, hipBLASLt 1.4.1
+(100401), CK at the pinned `cd9574023093742434e8c992d13b89ab9a6c1cf8` (therock-7.14.1).
+Harness: `kernels/rocm/tools/qgemm_eval.cpp` (+ `qgemm_eval_ck.cpp` for the CK candidates),
+built with `-DTURBINE_BUILD_QGEMM_EVAL=ON`, run under `scripts/bench-lock.sh` with
+`ROCR_VISIBLE_DEVICES=0`. Per candidate, shape and m: hipBLASLt's first heuristic answer and the
+best of its first 8 answers, median of 5 rounds × 20 calls, rotating over 2–8 copies of the weight (as many as 512 MiB allows, at most 8); correctness on 6 sampled rows against a host reference with the CPU provider's semantics
+(`cpu::qgemm`: e4m3 values × scales, exact products, one rounding to BF16); tolerance one BF16
+rounding (2^-8 relative) plus summation order; "row-invariant" = row 0 of the first answer is
+bitwise the same at every m.
+
+Shapes (Llama-3.2-3B, fused as the executor runs them): qkv 5120×3072, o 3072×3072,
+gate_up 16384×3072, down 3072×8192.
+
+### Candidates
+
+| Candidate                                                                                                                   | Builds                  | Correct                                                                                                                                                                                                                                                     | Notes                                                                                                                                                                                                                     |
+| --------------------------------------------------------------------------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| hipBLASLt BF16×BF16→BF16 on the dequantized weight (today's path; W8A16 via dequantize)                                     | yes                     | — (baseline)                                                                                                                                                                                                                                                | timing baseline                                                                                                                                                                                                           |
+| hipBLASLt e4m3×e4m3→BF16, scalar A/B scales (`SAB`: FP8_TENSOR × FP8_TENSOR)                                                | yes                     | yes, max \|Δ\| ≤ 1.9e-2 at outputs ≈ 5–9 (one BF16 ulp)                                                                                                                                                                                                     | 8 solutions per shape                                                                                                                                                                                                     |
+| hipBLASLt e4m3×e4m3→BF16, vector scales `OUTER_VEC_32F` on both (`SABV`: FP8_CHANNEL × FP8_TOKEN)                           | yes                     | yes, max \|Δ\| ≤ 2.6e-2 at outputs ≈ 9                                                                                                                                                                                                                      | 8 solutions per shape; row-invariant on every shape                                                                                                                                                                       |
+| hipBLASLt mixed scalar × vector (FP8_CHANNEL × FP8_TENSOR, FP8_TENSOR × FP8_TOKEN)                                          | —                       | —                                                                                                                                                                                                                                                           | no solution on gfx1201 (heuristic returns 0 algorithms); served by broadcasting the scalar to a vector and running `SABV`                                                                                                 |
+| hipBLASLt FP8 with vector scales and F32 D                                                                                  | —                       | —                                                                                                                                                                                                                                                           | no solution on gfx1201 (found by `hip_qgemm`): `hipblaslt_fp8` supports BF16 out only                                                                                                                                     |
+| CK `ck_tile` `gemm_quant` RowColQuant (per-token × per-channel), decode tile 16×64×256 and prefill tile 128×128×128, BF16 C | yes (gfx1201, OCP e4m3) | **no**: outputs of magnitude 1e35–1e38 on every shape; m = 1 (and m = 16 with the prefill tile) refused by `IsSupportedArgument` (kPadM = false); CK's own example (`tile_example_gemm_quant -quant_mode=rowcol`) fails its CPU verification on gfx1201 too | reported "times" (e.g. o m=2048 90 µs = 430 TFLOP/s, above the card's FP8 peak) are not real work                                                                                                                         |
+| CK `ck_tile` `gemm_quant` TensorQuant (scalar × scalar), same tiles                                                         | yes                     | **no** (same garbage outputs)                                                                                                                                                                                                                               |                                                                                                                                                                                                                           |
+| vLLM / aiter ROCm scaled-mm                                                                                                 | not built               | —                                                                                                                                                                                                                                                           | vLLM's FP8 linear on ROCm dispatches to `torch._scaled_mm` (hipBLASLt, i.e. the candidates above) or to aiter, whose kernels are gfx942/gfx950 assembly; no separate gfx12 provider exists                                |
+| Activation quantization: CK `add_rmsnorm2d_rdquant` (fused norm + per-row quant)                                            | not built               | —                                                                                                                                                                                                                                                           | the v2.9 `quantize_act` descriptor carries no norm inputs, so fusing needs an ABI addition (lead-owned); CK's rdquant also rounds by its own conversion and scale reciprocal, which the bit-exact reference rule excludes |
+| Activation quantization: Turbine elementwise kernel (`src/qgemm_quantize.hpp`)                                              | yes                     | **bit-exact** (codes and scales) for FP8_TOKEN, FP8_GROUP128, FP8_TENSOR at every size, including zero rows (floor), saturation, ties                                                                                                                       | own kernel: no provider fits the ABI op                                                                                                                                                                                   |
+
+### µs per call, GPU 0 (first heuristic answer / best of 8)
+
+| shape   | m    | BF16            | FP8 SAB       | FP8 SABV        |
+| ------- | ---- | --------------- | ------------- | --------------- |
+| qkv     | 1    | 64.8 / 54.6     | 48.4 / 26.7   | 66.8 / 35.4     |
+| qkv     | 16   | 56.5 / 55.2     | 36.7 / 27.6   | 57.9 / 36.2     |
+| qkv     | 128  | 58.5 / 58.5     | 49.0 / 32.4   | 60.4 / 44.1     |
+| qkv     | 2048 | 454.7 / 454.7   | 270.1 / 264.5 | 406.1 / 385.3   |
+| o       | 1    | 51.3 / 39.5     | 27.0 / 18.6   | 56.5 / 23.1     |
+| o       | 16   | 40.0 / 40.0     | 25.2 / 19.3   | 41.0 / 23.4     |
+| o       | 128  | 48.4 / 46.8     | 42.6 / 22.3   | 42.3 / 26.1     |
+| o       | 2048 | 302.1 / 301.3   | 164.3 / 164.3 | 256.1 / 248.5   |
+| gate_up | 1    | 168.3 / 162.4   | 97.1 / 90.2   | 124.3 / 117.9   |
+| gate_up | 16   | 172.8 / 166.5   | 105.7 / 92.9  | 130.8 / 127.1   |
+| gate_up | 128  | 233.8 / 221.4   | 167.6 / 107.1 | 182.1 / 160.3   |
+| gate_up | 2048 | 1644.6 / 1596.2 | 851.3 / 851.3 | 1238.5 / 1220.7 |
+| down    | 1    | 111.4 / 96.5    | 61.7 / 44.1   | 79.5 / 58.2     |
+| down    | 16   | 112.9 / 97.2    | 66.1 / 44.6   | 83.9 / 59.5     |
+| down    | 128  | 152.1 / 100.0   | 74.3 / 46.6   | 90.5 / 70.0     |
+| down    | 2048 | 1005.3 / 1005.3 | 581.9 / 474.6 | 1145.5 / 968.4  |
+
+Activation quantization (Turbine kernel, µs): FP8_TOKEN k=3072: 9.3 / 8.1 / 8.4 / 61.3 at
+m = 1 / 16 / 128 / 2048; k=8192: 15.8 / 15.6 / 16.8 / 125.1. FP8_GROUP128 k=3072: 11.9 / 11.4 /
+12.1 / 89.0; k=8192: 26.4 / 26.0 / 27.3 / 212.9. FP8_TENSOR k=3072: 6.3 / 6.4 / 6.7 / 53.9;
+k=8192: 11.9 / 11.8 / 12.5 / 92.7.
+
+Per decode layer at m = 16 (four GEMMs; the BF16 path runs its tuned table, ≈ best): BF16 358.9 µs;
+FP8 SABV 313.6 µs with the first heuristic answers, 246.2 µs with the best, plus ≈ 40 µs of
+activation quantization (three k=3072 and one k=8192 token quantizations).
+
+### Pick
+
+- `hipblaslt_fp8` (provider hipblaslt): FP8_TENSOR / FP8_CHANNEL weights × FP8_TENSOR / FP8_TOKEN
+  activations through hipBLASLt's FP8 kernels with `SCALAR_32F` (tensor × tensor) or
+  `OUTER_VEC_32F` (vector × vector) scale modes; a mixed pairing broadcasts its scalar scale to a
+  vector (a device buffer of the context, ≥ 65,536 floats, grown only outside graph capture);
+  BF16 out only; k and lda multiples of 16. The only correct provider on gfx1201.
+- Activation quantization: own kernel `turbine_hip` (`src/quantize_act.hip`,
+  `src/qgemm_quantize.hpp`) — no provider takes the v2.9 `quantize_act` op; CK's fused
+  norm+quant would need an ABI change and is not bit-exact with the reference rule.
+- Findings to act on: (1) the first heuristic answer is 1.2–2.4× slower than the best of hipBLASLt's
+  top 8 at decode sizes (qkv, o, down), so FP8 shapes need pinned solutions (a tuned FP8 table) to
+  reach the S-20 targets — without it FP8 decode GEMM time is ≈ BF16's; (2) SABV at m = 2048 is no
+  faster than BF16 on down (968 vs 1005 µs) and only 1.2–1.3× on the others (per-token × per-channel
+  checkpoints gain in decode, little in prefill); SAB (per-tensor) is 1.7–2.1× faster than BF16
+  at m = 2048. (3) CK `gemm_quant` RowCol/Tensor is not usable on gfx1201 at this CK pin.
+
+## P6: FP8 GEMM — pinned solutions and prefill row invariance (addendum to the FP8 GEMM evaluation)
+
+Date: 2026-09-29 (Phase 6a Task 13 follow-up, commit "perf(rocm): pinned FP8 decode solutions and
+row-invariant FP8 prefill"). GPU 0 under `scripts/bench-lock.sh`, hipBLASLt 1.4.1 (791 FP8
+BF16-out and 780 F32-out solutions listed).
+
+**Decode.** `turbine_qgemm_eval --tune 1` timed every FP8 solution that takes each Llama-3.2-3B
+shape at m ∈ {1, 2, 4, 8, 16, 32, 64}; the best beats hipBLASLt's first heuristic answer by
+1.3–2.9× (e.g. SABV qkv m=16 35.4 vs 103.7 µs, o 22.0 vs 62.4, down 53.5 vs 121.2). The winners are
+pinned in `kernels/rocm/src/qgemm_tuned.hpp` (decode steps only, `TURBINE_OPTION_GEMM_AUTOTUNE`).
+Per decode layer at m = 16 (qkv + o + gate_up + down): BF16 tuned 358.9 µs, FP8 SABV pinned
+240.0 µs, FP8 SAB pinned 167.0 µs, plus the activation quantization.
+
+**Prefill.** Prefix reuse (Phase 4) needs a prefill row's result to be bitwise independent of the
+call's size and of the row's position in it. `--tune-prefill 1` checked every solution with split-K
+off, fastest first, against rows of a 513-row call recomputed as calls of 1, 7, 128 rows (from
+row 0), 213 rows (from row 300) and 64 rows (from row 1), each in fresh buffers:
+
+- scalar scales (SAB, BF16 out): row-invariant solutions exist for every shape (1–25 faster ones
+  rejected); pinned as the shapes' prefill rows.
+- vector scales (OUTER_VEC, SABV): **none** of the 11 solutions that take the problem is
+  row-invariant on gfx1201. Evaluated alternative: a scalar-scale solution with unit scales and F32
+  out (row-invariant ones exist, 0–5 faster rejected) plus an **own epilogue kernel**
+  (`src/qgemm_epilogue.hpp`) applying the row and column scales into BF16. At m = 2048 (GEMM +
+  epilogue) vs SABV's first answer: qkv 320 vs 406 µs, o 200 vs 256, gate_up 1332 vs 1238, down
+  528 vs 1145. Picked for FP8_CHANNEL / FP8_TOKEN prefills (chunked to 64 MiB of F32 sums).
+
+User decision 2026-09-29: accepted as recommended: the epilogue is an own kernel (no provider has a row-invariant
+vector-scale FP8 solution on gfx1201); the 64 MiB of prefill sums per context are not in the model's
+memory accounting; the 8B shapes have no pinned rows yet (they run the heuristic and log
+`event=qgemm_prefill_unpinned`).
+
+## P6: block-scaled FP8 GEMM — provider evaluation (kernel reuse rule)
+
+Date: 2026-09-29 (Phase 6a Task 15). Card: R9700 (gfx1201), GPU 0 under `scripts/bench-lock.sh`,
+ROCm 7.14.1, hipBLASLt 1.4.1, CK at the pinned `cd9574023093742434e8c992d13b89ab9a6c1cf8`.
+Harness: `kernels/rocm/tools/qgemm_eval.cpp --block 1` (CK instances in `qgemm_eval_ck.cpp`),
+Llama-3.2-3B shapes, 128 × 128 weight blocks (F32 block scales, `[n/128, k/128]`), activations
+per token and 128-column group (FP8_GROUP128) for the W8A8 candidates; correctness on 6 sampled
+rows against a host reference of `cpu::qgemm` semantics (one BF16 rounding of the exact sum).
+
+| Candidate                                                                                | Builds | Correct                                                                      | µs (m = 1 / 16 / 128 / 2048)                                                                                                |
+| ---------------------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| CK `ck_tile` `gemm_quant` ABQuantGrouped (A 1×1×128, B 1×128×128), decode tile 16×64×256 | yes    | **no**: outputs of magnitude 1e37–1e38 on every shape; m = 1 refused (kPadM) | qkv —/48/82/1070 (not real work)                                                                                            |
+| same, prefill tile 128×128×128 (`GemmConfigABQuantPrefill`)                              | yes    | **no** (same); m < 128 refused                                               | qkv —/—/54/203 (not real work)                                                                                              |
+| hipBLASLt block scales (`BLK128x128_32F`, `VEC128_32F`)                                  | —      | —                                                                            | "not supported yet" in hipBLASLt 1.4.1; no gfx1201 kernel                                                                   |
+| W8A16 per call: own dequantize-to-BF16 kernel + hipBLASLt BF16 GEMM                      | yes    | dequantize **bit-exact** vs the host decode                                  | dequantize 175 (qkv) / 111 (o) / 573 (gate_up) / 282 (down) per call, **plus** the BF16 GEMM: 2–4× the BF16 layer at decode |
+| W8A16 dequantized once at load (BF16 weights on the device, hipBLASLt BF16 GEMM)         | yes    | exact decode (host `cpu::quant::dequantize`)                                 | = BF16: qkv 56/57/59/454, o 40/40/52/312, gate_up 169/173/235/1499, down 114/113/143/1015                                   |
+
+CK's `ck_tile` FP8 `gemm_quant` path gives the same wrong results for RowColQuant and TensorQuant
+(decision "P6: FP8 GEMM — provider evaluation"), and CK's own `tile_example_gemm_quant` fails
+its CPU verification on gfx1201: not usable at this CK pin (a vendor defect, not debugged further).
+
+### Pick (per Q3: W8A16 through a dequantize-to-BF16 path)
+
+`fp8_block` is served W8A16 with its weights **dequantized to BF16 once at load** (the loader decodes
+each block-scaled tensor with `cpu::quant::dequantize` through the staging buffer and runs the layer
+on the BF16 GEMM; no activation quantization). It is the only candidate that is correct and meets
+the S-20 target (c16 ≥ 1.0 × BF16): the per-call dequantize path costs 2–4× the BF16 GEMM, and no
+provider has a correct block-scaled FP8 GEMM on gfx1201. `hipblaslt_fp8` keeps refusing
+`FP8_BLOCK`. The golden reference is made with `--act-quant none` (what is served).
+
+User decision 2026-09-29: accepted as recommended: the memory saving of FP8 is given up for `fp8_block` (the device
+holds BF16 weights). An own fused W8A16 kernel (FP8 read, dequantized in registers, WMMA) would keep
+it and could beat BF16 at decode; it is allowed by the reuse rule (no provider works) but deferred.
+
+## User review of the 2026-09-29 overnight decisions (2026-09-29)
+
+**Decision (user, 2026-09-29, relayed by the coordinator):** every provisional decision of the unattended run is answered. Accepted as recommended: the GSM8K chain of thought; the W4A4 base-3B accuracy baseline with the Instruct result reported too; FP8 per-token activation scales; the FP8 KV golden against the emulated FP8 reference; the calibrated fake-quant tolerance for activation-quantized formats; the TP quantized gate on greedy tokens and likely candidates; TurboQuant's Gaussian `S` per (layer, head) and its 16-byte-padded layout; one page class per format in L0; the 1 h prune for finished agents; and every remaining minor item (YaRN details, FP8 KV page semantics, the e4m3 copy in `turbine-kv`, `KvCodec` details, TurboQuant rounding, seeds and NMSE bounds, FP8 layer selection and configured formats, the Task 25 status items, the MXFP4 act-order / Quark / NVFP4 items, the INT4 details, the fixture scripts). Changed:
+
+1. `fp8_block`: **"Write own kernel in 6a"** — a fused block-scaled FP8 GEMM for gfx1201 as a registered implementation, with real memory savings, correctness tests against the CPU reference and the fp8_block proof; BF16 decode only as a logged fallback for shapes it does not support (spec and plan Task 15 amended).
+2. W4A4 golden prompts: **"Find another checkpoint"** — an Instruct W4A4 MXFP4 checkpoint loadable by our packagings; else completion prompts only for the base checkpoint; do not quantize one ourselves without asking.
+3. 6b ladder: **"Start at YELLOW earlier"** — compression begins at YELLOW, before the tiers are full, lowest tier first, one rung at a time (6b spec, plan and the `p6b-groundwork` policy and tests follow).
+
+Housekeeping by the coordinator: `origin/main` pushed (ecbd043..38703b9); on novanas the kubelet eviction thresholds are 5 % (imagefs and nodefs), so the disk floor is ≈ 45 GB free; the lead's cleanup trigger is ≈ 100 GB free.
+
+## W4A4 proof checkpoint: AMD Llama-3.1-8B-Instruct Quark W4A4 (2026-09-29)
+
+After the user's "Find another checkpoint" answer the lead searched Hugging Face: the only Instruct W4A4 MXFP4 checkpoint of a family Turbine serves on amd is `amd/Llama-3.1-8B-Instruct-MXFP4-W4A4-MLCAL-C1000-GPTQ` @ `00b0d018950a5466fa1fc8bc0ccf174bd38b15da` (AMD Quark fp4 weights and activations, per_group 32, e8m0, half_even, `even`; GPTQ with desc_act + static_groups; SmoothQuant folded; `exclude: [lm_head]`; ungated, 5,826,947,776 bytes, downloaded to `/home/piwi/turbine-models/llama-3.1-8b-instruct-mxfp4-a4`, free disk 232.5 GB → 226.9 GB); the others were Qwen3 / MoE / gpt-oss (Phase 7), GGUF or MLX. Its recipe also quantizes the KV cache (`kv_cache_quant_config`: fp4 K/V projection outputs), which the Quark parser refused. Options: (a) accept it and ignore the KV quantization with a WARN `kv_cache_quant_ignored`, the KV at the configured `kv.dtype`, the golden reference built the same way (activation fake-quant, BF16 KV), accuracy baseline BF16 Llama-3.1-8B-Instruct; (b) refuse it and fall back to completion prompts on the base 3B checkpoint; (c) keep looking or wait.
+
+**Decision (user, 2026-09-29, relayed by the coordinator): (a).** The base-3B checkpoint's accuracy is still reported against BF16 3B base as a side result.
+
+Correction (6a lead, 2026-09-29, facts only; the decision stands): the checkpoint's KV recipe is `fp8_e4m3` per-tensor static K/V projection outputs (with `k_proj` / `v_proj` `output_scale` tensors), not fp4. It appears both in `kv_cache_quant_config` and as identical `layer_quant_config` entries for `*k_proj` / `*v_proj`; d1de280 ignores both, and the scale tensors load as `unexpected_tensor` WARNs.
+
+## Phase 6a gate misses on GSM8K-200: FP8 KV (Llama, OLMoE) and MXFP4-A16 (8B) (2026-09-29)
+
+Asked 2026-09-29 by the 6a lead after the lost agents' results were collected. GSM8K-200 (chain of thought, `final_number`):
+
+- FP8 KV on Llama-3.2-3B-Instruct (Task 24): BF16 KV 0.805 (161/200), FP8 KV 0.790 (158/200); drop 0.015 > the plan's 0.01 bound. Throughput and the `kv_gpu` round trips pass.
+- FP8 KV on OLMoE-1B-7B-0125-Instruct (Task 24): BF16 KV 0.655 (131/200), FP8 KV 0.615 (123/200); drop 0.040 > the plan's 0.01 bound — larger than Llama's.
+- MXFP4-A16 on Llama-3.1-8B-Instruct (Task 20, `FabioTrindade/…-MXFP4A16`): BF16 8B 0.89 (178/200), MXFP4 0.835 (167/200); drop 0.055 > 0.04 (BF16 baseline because vLLM-ROCm refuses the checkpoint on gfx1201).
+
+**1. FP8 KV, Llama and OLMoE.** Options: A) run the full GSM8K test split (1,319 items) at BF16 KV and FP8 KV with the same prompt wrapper and matcher, pass if the drop ≤ 0.01 (each model judged separately) — chosen; B) accept the 200-item result as noise; C) keep the FP8 KV row `experimental`. **Decision (user, 2026-09-29, relayed by the coordinator): A**, for Llama initially; **extended by the coordinator to OLMoE, 2026-09-29** (the OLMoE drop, found by the Task 24 wrap-up, is larger than Llama's and was not in the original ask). If OLMoE still misses the ≤ 0.01 bound on the full set, look for a numerics cause before reporting to the coordinator: compare Turbine against the emulated-FP8-KV reference and check the per-layer KV scales (OLMoE's are per layer, unlike Llama's) — do not just accept the drop.
+
+**2. MXFP4-A16, 8B.** Options: A) run the full GSM8K on MXFP4-A16 and BF16 8B; if the drop is still > 0.04, do not blame the format yet — first look for a Turbine numerics error by comparing Turbine with the dequantized-checkpoint reference (logits / golden positions) and report to the coordinator before any support-status change — chosen; B) accept and document the drop; C) keep the row `experimental`. **Decision (user, 2026-09-29, relayed by the coordinator): A.**
+
+Dataset: `openai/gsm8k`, config `main`, split `test`, downloaded on novanas with `hf download --repo-type dataset` at a pinned revision (token stays on the host), converted by a committed generator script into `tests/eval/gsm8k-full.jsonl` (MIT, 1,319 items, < 1 MB) with the GSM8K-200 wrapper and matcher. Full runs (~6× GSM8K-200 each) queue under the one-GPU-job rule, never in parallel; Llama and OLMoE runs (BF16 KV, FP8 KV each) queue one after another, not in parallel.
+
+## Golden tolerance floor for quantized checkpoints (lead decision, test policy, 2026-09-29)
+
+Asked by the Task 18 INT4 builder: a quantized checkpoint's golden tolerance is calibrated from transformers' own spread on the dequantized checkpoint (the OLMoE method); when that spread is tighter than the BF16 model's bounds, which applies? Options: A) the calibrated spread alone; B) max(calibrated spread, the BF16 model's bounds) — chosen. **Decision (6a lead, confirmed by the coordinator, 2026-09-29): B.** The golden check compares Turbine's kernels with transformers, so the kernel noise the BF16 bounds already accept applies to a quantized checkpoint as well; a bound tighter than BF16's would fail on noise already accepted. Applies to every Phase 6a weight format (AWQ, GPTQ, FP8, fp8_block, MXFP4). Test-policy detail, not a user decision.
+
+Related (coordinator, same day): a proof may measure natively on novanas with a detached script instead of `lab-bench.sh` (ssh rules), provided its collector prints a `BENCH`-equivalent line and uploads to labbook as usual; the 10-minute soak runs on AWQ once its proof passes, under the one-GPU-job rule.
+
+## 6b ladder: YELLOW depth (2026-09-29)
+
+Context: with "Start at YELLOW earlier" as built on `p6b-groundwork` (ef5b8d5), a sustained YELLOW makes the lowest enabled tier step every block down one rung per sweep until it reaches `kv.ladder.max_format` (`tq2`), even when the tier still has room — for example when YELLOW is held by L0 utilization, which compressing L1/L2 does not relieve. The loss then grows with the duration of YELLOW, not with the pressure.
+
+- A) YELLOW caps at one rung: at YELLOW the ladder stops at `fp8_e4m3`; `tq4` / `tq2` only from ORANGE on
+- B) Compress only until GREEN: at YELLOW the lowest tier compresses just enough to get back to GREEN headroom, then stops, so the loss stays proportional to the pressure
+- C) Keep as built
+
+**Decision (user, 2026-09-29, relayed by the coordinator): B — "Compress only until GREEN".**
+
+How it is built (lead's reading, provisional until 6b Task 15 lands): at YELLOW (and neither `must_leave` nor above `kv.ladder.high_water`, where the as-built rule applies unchanged), the lowest enabled tier compresses a copy only while its GREEN headroom is short: `fill + demand > kv.ladder.low_water`, where `demand` is the bytes the pressure controller's YELLOW reclaim wants to demote into that tier this tick, as a fraction of its capacity (0 when none). The hierarchy refreshes `fill` after each rewrite, so a tick stops as soon as the headroom is back; the pressure input returning to GREEN stops it at once (no compression at GREEN, unchanged). Under a steady YELLOW with no demand and `fill ≤ low_water` nothing is compressed, so the tier does not drift to `tq2`. ORANGE and above keep the as-built rule. The 32-rewrite cap per tick, ticks ≥ 50 ms apart and the `deescalate_dwell` hysteresis on stepping a tier's rung back up are unchanged. `LadderLimits` gains `low_water`; `LadderContext` gains `demand: f64`. Spec S-6 and plan Tasks 14 and 15 changed the same day.
+
+Lead's call (same day): the as-built floor guard — at the last rung a copy is dropped only when it must leave or its tier is above high water — matches the spec's edge case ("→ evict" at the floor, the lowest tier only) and is accepted; noted in `.procoder/handoff/p6b-groundwork.md`.
+
+## Keep going through crashes (2026-09-29)
+
+**Decision (user, 2026-09-29 15:25, relayed by the coordinator):** "keep going; if things crash we restart it and you continue." A novanas reboot is handled without asking: the lead requeues the detached runs from its handoff table (the scripts are idempotent) and carries on, without debugging the crash. The coordinator's heartbeat (:17 and :47) checks novanas with one ssh and `scratchpad/lead/r6-check.sh`, wakes the lead when a run finishes or the host rebooted, and starts a fresh lead from the handoff if none is alive. 6a runs to its close (collectors, the Task 14 FP8 proof, the remaining proofs, the Task 29 exit on everything runnable; the two-GPU items stay blocked on the PSU and are listed unfinished), merges into local main without a push, and 6b starts from main taking `p6b-groundwork` in, under the same rotation rules. Design questions go to the coordinator; everything else is the lead's call, recorded here and in `.procoder/review-2026-09-29.md`.
+
+## YaRN attention factor: on cos/sin, not folded into the softmax scale (2026-09-29, supersedes Q19's placement)
+
+Context: the Task 28 YaRN proof (Llama-3.2-3B-Instruct, `rope_scaling` yarn factor 16) missed the golden tail bound on
+prompt p16. The teacher-forced A/B (`yarn_teacher_forced_vs_reference`, lab, `yarn-tf-r5.out`) measured max |Δ logprob|
+(likely, tail) against transformers: CPU provider with the fold (`scale × attention_factor²`, Q19 as decided) 0.190 / 1.488;
+CPU provider with transformers' placement (cos/sin × m, then BF16 rounding of q and k, softmax scale head_dim^-0.5)
+0.067 / 0.395; HIP with the fold 0.099 / 1.382. transformers' own spread on the override is ≈ 0.43 tail. The HIP tail
+tracks the CPU fold, so the kernels are not the cause; the fold's placement of the factor (after BF16 rounding of q·k
+instead of before) is.
+
+- A) Keep the fold and widen the yarn16 tail bound to ≈ 1.5
+- B) Transformers' placement: the rope op multiplies cos and sin by the attention factor m before q and k are rounded to
+  BF16; the attention softmax scale returns to head_dim^-0.5. Needs a new field in `turbine_rope_desc` (a kernel ABI
+  minor bump) — chosen
+
+**Decision (user, 2026-09-29, relayed by the coordinator): B.** Supersedes the "attention factor folds into the attention
+scale, so the RoPE ABI does not change" part of Q19 (question 19, "YaRN proof and override", 2026-09-28); the rest of Q19
+(`model.rope_scaling`, factor 16 proof, the ≈ 12,000-token prompt) stands.
+
+Lead's calls (same day): the field is `float attn_factor` appended to `turbine_rope_desc`, read only when the library
+reports minor ≥ 10 (optional group v2.10, `TURBINE_ABI_MINOR 10u`; 1.0 or a minor < 10 library = no scaling; a YaRN model
+whose factor ≠ 1 on a library below minor 10 is refused at startup, exit 1, `event="kernel_capability"`, reason
+`rope_attn_factor_unavailable`). 6a merges first, so it takes v2.10; the 6b groups written as v2.10 (KV transcode,
+mixed-format attention) renumber to v2.11 when the 6b stack is rebased onto main. The yarn16 tolerance comes from
+`yarn_self_spread.py` without `--fold` (transformers' placement), floored at the Llama BF16 bounds (decision "Golden
+tolerance floor for quantized checkpoints" applied to YaRN). Spec S-15/S-6 and plan Task 28a amended the same day.
+
+## OLMoE FP8 KV: full-GSM8K drop over the bound (2026-09-29)
+
+Context: the full-GSM8K FP8 KV gate (decision "Phase 6a gate misses", item 1; 1,319 items, c16, `p6a-kv-t24-full`
+511042e): Llama-3.2-3B BF16 KV 0.7801, FP8 KV 0.7885 (drop −0.0083, PASS). OLMoE-1B-7B BF16 KV 0.6603 (871), FP8 KV
+0.6459 (852): drop 0.0144 > 0.01; flips 122 lost / 103 gained, McNemar p = 0.23, 95% CI of the drop −0.008 to +0.037.
+Runs are bit-deterministic (first 200 items equal the GSM8K-200 runs), so every flip is the KV format's. No Turbine bug
+found: the checkpoint ships no K/V scales (1.0), no e4m3 saturation (max |K| ≤ 22, |V| ≤ 1.5), V underflows in layers
+0–4 (V relative error 4.2–7.6 % against the 2.7 % e4m3 floor), and OLMoE's top-8 routing amplifies the perturbation.
+
+- A) Accept the drop as noise and mark the OLMoE FP8 KV row `supported` alongside Llama's — chosen
+- B) Keep the OLMoE FP8 KV row `experimental`
+- C) Calibrate per-layer V scales (≈ amax/448) for scale-less checkpoints now and re-run the OLMoE FP8 KV pass
+
+**Decision (user, 2026-09-29, relayed by the coordinator): A.** Both gfx1201 FP8 KV rows (Llama, OLMoE) are
+`supported`; the result is recorded at the rows in `turbine-core::support` and in `.procoder/review-2026-09-29.md`.
+Calibrated scales for scale-less checkpoints stay a possible later improvement, not a gate.
+
+## FP8-dynamic (Task 14): accuracy on full GSM8K against vLLM, c1 ITL as a perf item (2026-09-29)
+
+Context: the T14 proof (`p6a-fp8-t14` 5e6a259) passes golden c1/c16 16/16 and c16 throughput (976 tok/s, 1.149× BF16),
+but reads GSM8K-200 0.79 (Turbine BF16 0.795, vLLM on the same checkpoint 0.82) and c1 ITL 0.846× BF16 against the
+plan's 0.75× target.
+
+- A) Mark FP8-dynamic `supported` now
+- B) Re-judge accuracy on the full 1,319-item GSM8K at c16 against vLLM on the same checkpoint (vLLM serves it on
+  gfx1201), flip to `supported` if it passes; the 0.75× c1 ITL target becomes a follow-up perf task that does not
+  block support — chosen
+- C) Hold the row until both the accuracy and the ITL gates pass
+
+**Decision (user, 2026-09-29, relayed by the coordinator): B.** Turbine and vLLM run at the same concurrency (16), queued
+as one detached script under the one-GPU-job rule. The ITL item: FP8 halves the weight bytes, so M = 1 decode should
+approach ≈ 0.6× BF16; the gap (0.846× measured) is likely the per-token activation quantization plus FP8 GEMM overhead at
+M = 1 — recorded as a perf item in the plan (Task 14 follow-up) and the review file, measured before any change.
+
+## Slow-client timer on partial reads (2026-09-29)
+
+Context: Phase 2 S-7 pauses a request whose output channel is full and cancels it with `slow_client` after
+_server.slow_client_timeout_; the spec did not say whether a client that reads part of the held backlog resets the timer.
+Found while fixing the `slow_client_paused_then_cancelled` failure (branch `p6a-server-flakes`: a slow-client close of a
+finished stream now ends with the `slow_client` error event instead of a bare close reported as `internal_error`).
+
+- A) The timer resets only when the whole held backlog has drained into the channel, i.e. when the request un-pauses
+  (current behaviour: `flush_outputs` → `Deadlines::resumed`) — chosen
+- B) Reset on any consumed event: friendlier to slow-but-steady readers, but a reader taking one event per
+  (timeout − ε) holds its KV until _server.request_timeout_
+- C) B with a floor: reset only after at least k events (or a share of the channel) were read since the last reset;
+  needs a new key or constant
+
+**Decision (user, 2026-09-29, relayed by the coordinator): A.** No code change; the phase-2 spec's edge-case list says
+partial reads do not reset the timer.
+
+## FP8-dynamic: full-GSM8K drop against vLLM over the bound (2026-09-29)
+
+Context: the Task 14 gate (decision "FP8-dynamic (Task 14): accuracy on full GSM8K against vLLM…", option B) ran both
+engines on `llama-3.2-3b-instruct-fp8-dynamic` at c16 on the full 1,319-item GSM8K (`scratch/p6a-fp8-full/run/` on
+novanas): Turbine 0.7703, vLLM-ROCm 0.7832, drop 0.0129 > the 0.01 reference-engine bound (`eval-compare` rc 1). Paired:
+54 items only Turbine solves, 71 only vLLM; McNemar exact p = 0.152; difference 95 % CI −0.0295..+0.0037. Golden c1/c16
+16/16 and c16 throughput (1.149× BF16) already passed.
+
+- A) Accept the drop as noise and mark FP8-dynamic `supported` (same call as OLMoE FP8 KV) — chosen
+- B) Numerics check first (golden per-position against the FP8 reference, the activation-quantization path), then decide
+- C) Hold the row `experimental`
+
+**Decision (user, 2026-09-29, relayed by the coordinator): A.** The c1 ITL item (0.846× BF16 against the 0.75× target)
+stays a perf follow-up (plan Task 14b) and does not block support.
+
+## GPTQ INT4: full-GSM8K drop just over the 4-bit bound (2026-09-30)
+
+Context: the full-GSM8K gate for `gptq_int4` (1,319 items, c16; checkpoint `shuyuej/Llama-3.2-3B-Instruct-GPTQ` @
+`dd5a311f040728fbc612eb03c8dadfae0a90552f`; gate `tests/eval/llama-3.2-3b-instruct-gptq/gate.json`, max drop 0.04 against
+Turbine BF16, since vLLM-ROCm 0.23 cannot load this checkpoint): Turbine GPTQ 972/1319 = 0.7369 vs Turbine BF16
+1029/1319 = 0.7801, a drop of 0.0432 > 0.04. Paired: 122 items lost, 65 gained, McNemar exact p = 3.7e-5 (the drop
+against BF16 is real), 95% CI of the drop +0.0230 … +0.0634; the overshoot of the 0.04 bound is not significant
+(z = 0.31, one-sided p ≈ 0.38). Turbine's dequantization is bit-exact against an independent AutoGPTQ reference over 21
+layers (`p6a-gptq-numerics`), so the loss is the checkpoint's or GPTQ's own. For comparison AWQ INT4 dropped 0.030 on
+GSM8K-200.
+
+- A) Accept the overshoot as noise and mark `gptq_int4` `supported`
+- B) Re-judge on a better GPTQ checkpoint of Llama-3.2-3B-Instruct from a known publisher (damp 0.01, `desc_act`
+  false, preferably one vLLM-ROCm loads), full GSM8K at c16 on Turbine and on vLLM if it loads — chosen
+- C) Keep `gptq_int4` `experimental` and close 6a with AWQ as the supported 4-bit format
+
+**Decision (user, 2026-09-30, relayed by the coordinator): B.** The run queues after `w4a4-rerun` and the fp8_block
+jobs; weights are fetched on `novanas` with `hf download … --revision <pinned rev>` (the token stays there). If no
+suitable published checkpoint exists, the options (e.g. quantizing one ourselves with a Python tool at fixture time,
+off the serving path) go back to the user. `gptq_int4` stays `experimental` meanwhile.
+
+## GPTQ INT4: which better checkpoint (2026-09-30, follows "GPTQ INT4: full-GSM8K drop just over the 4-bit bound")
+
+Context: no published GPTQ checkpoint of Llama-3.2-3B-Instruct from a known publisher has damp 0.01 and `desc_act`
+false. RedHatAI / neuralmagic publish no 3B `w4a16`; `kaitchup/…-gptqmodel-4bit`, `clowman/…-GPTQ-Int4` and
+`ModelCloud/…-vortex-v3` use act-order (refused, `gptq_act_order`); `kaitchup/Llama-3.2-3B-Instruct-AutoRoundGPTQ-4bit`
+and `fbaldassarri/…-auto_gptq-int4-gs128-sym` fit the loader (damp 0.01, no act-order, sym, group 128, GPTQ packing) but
+were made with AutoRound. `ct_pack_int4` (compressed-tensors pack-quantized) also resolves to the `gptq_int4` row.
+
+- A) Quantize our own with llm-compressor (GPTQ modifier, W4A16 sym, group 128, damp 0.01, no act-order, ≈ 512
+  calibration samples, from the BF16 unsloth checkpoint; Python at fixture time on `novanas` only), served through
+  `ct_pack_int4` on Turbine and on vLLM-ROCm if it loads — chosen, second
+- B) As A with GPTQModel writing AutoGPTQ format (Turbine's `gptq` loader; vLLM likely hits the same `qzeros` defect)
+- C) A quick full-GSM8K c16 run on `kaitchup/Llama-3.2-3B-Instruct-AutoRoundGPTQ-4bit` (pinned revision) — chosen,
+  first, as an AutoRound early data point only: it does not decide the row
+- D) Keep `gptq_int4` `experimental` and close 6a with AWQ as the supported 4-bit format
+
+**Decision (user, 2026-09-30, relayed by the coordinator): C, then A.** Both queue after `w4a4-rerun` and the fp8_block
+jobs (the AutoRound run may go earlier when a GPU slot fits); calibration is its own queued GPU job; weights download on
+`novanas` with `hf download … --revision <pinned rev>` (the token stays there). The `gptq_int4` row is re-judged on the A
+run against the 0.04 bound; it stays `experimental` until then.
+
+## MXFP4-A16 8B golden: one knife-edge decode position on p05 (2026-09-30)
+
+Context: `lab-bench --model llama8b-mxfp4 --golden16` (fixture cb4bd66 on `p6a-mxfp4-golden`) passes 15/16 prompts at c1
+and c16 (identical numbers), but p05 misses the bounds at one position: identical prefix 32/32, likely 0.3066 (bound
+0.15), tail 6.0156 (bound 0.90), reference top-5 token 18476 missing at position 5. The investigation (branch
+`p6a-mxfp4-golden`, b62373f / 579f746 trace diagnostic `mxfp4_decode_vs_prefill_trace`, 9a35f21 handoff) found no kernel
+bug: teacher-forced prefill at position 5 is within bounds (tail 0.58) and matches the reference to 0.0007; turning off
+every execution switch changes nothing; decode vs prefill differ first by ≈ 1e-3 in layer-1 attention and the gap
+doubles per layer from layer 8; Turbine's scalar CPU prefill flips the position too. transformers' own spread is also
+largest on p05 (tail 0.8914), and it was measured with the full-sequence variants only (incremental skipped for CPU
+time).
+
+- A) Recalibrate: rerun the self-spread with the incremental (decode-shaped) variants (p05 alone first, then all
+  prompts). If transformers' own incremental decode also flips p05 position 5, set the tolerance from the full spread by
+  the calibration rule, re-judge golden c1 / c16 from the existing captures, then soak and flip `mxfp4`; if it does not,
+  `mxfp4` stays `experimental` and the numbers go to the user — chosen
+- B) Extend the golden margin excuse (every slug): a prompt passes when the teacher-forced run at the same position is
+  within bounds even if free-running decode reshuffles the top-5 there
+- C) Keep the rule: `mxfp4` stays `experimental` for 6a, the investigation moves to Phase 7
+
+**Decision (user, 2026-09-30, relayed by the coordinator): A.** The incremental spread runs as a CPU fixture job under
+`fixture.lock`, ahead of the W4A4 fixture (`/home/piwi/turbine-ci/scratch/mxfp4_inc_spread.sh`, markers
+`mxfp4-inc: p05 rc=` and `mxfp4-inc: done rc=`).
+
+## MXFP4-A16 8B: `mxfp4` status for 6a after the p05 incremental spread (2026-09-30, follows "MXFP4-A16 8B golden: one knife-edge decode position on p05")
+
+Context: decision A above ran the p05 self-spread with transformers' decode-shaped (incremental) variants on the
+dequantized MXFP4-A16 8B copy (`/home/piwi/turbine-ci/scratch/mxfp4-inc/spread-p05.json`). None flips p05 position 5:
+bf16 sdpa incremental (the reference configuration, control) 0.0000 / 0.0000, bf16 eager incremental likely 0.0520 /
+tail 0.1985, fp32 sdpa incremental 0.0407 / 0.4003, fp32 eager incremental 0.0407 / 0.4003; worst tail 0.40, no
+reference top-5 id missing, prefix 32/32 on every variant. Turbine's HIP decode misses there (likely 0.3066, tail
+6.0156, reference top-5 id 18476 missing) and Turbine's scalar CPU prefill flips the same position; the investigation
+found no kernel bug. So the miss is not explained by transformers' own spread, and by decision A `mxfp4` stays
+`experimental`.
+
+- A) `mxfp4` stays `experimental` for 6a; investigate later: Phase 7 traces Turbine's CPU path against transformers op by
+  op on p05 (e.g. where intermediates round to BF16), since the same rounding may affect other models — chosen
+- B) Investigate now, before 6a closes, and flip `mxfp4` if the cause is found and fixed
+
+**Decision (user, 2026-09-30, relayed by the coordinator): A.** The `p6a-mxfp4-golden` branch merges for its fixture
+(`tests/golden/llama-3.1-8b-instruct-mxfp4a16/`), the `dequantize_checkpoint.py` fixes (df8d788 rope_parameters, d64f0cc
+TokenizersBackend) and the `mxfp4_decode_vs_prefill_trace` diagnostic; the `mxfp4` gfx1201 Llama row stays
+`experimental`. The Phase 7 item is in `.procoder/plans/phase-6-8-expansion.md` Task 11. The full 16-prompt incremental
+run (`mxfp4-inc: done rc=`, `spread-inc.json`) is kept for the record only.
+
+## procoder commit hook: local cargo check / clippy on the Mac (2026-09-30)
+
+Context: every Rust commit in a worktree leaves a local `target/debug` (~0.5–4.6 GB): the procoder commit hook runs a
+local `cargo check` / clippy on the Mac, which breaks the rule that cargo runs only on `novanas` (`scripts/gate.sh`,
+`scripts/remote-cargo.sh`; `cargo fmt` the only local exception).
+
+- A) Find procoder's setting to skip the local Rust lint and rely on the `novanas` gate
+- B) Allow the hook's local cargo check / clippy as a second exception to the no-Mac-builds rule, and delete the
+  worktree's `target/debug` after each Rust commit — chosen
+- C) Investigate first
+
+**Decision (user, 2026-09-30, relayed by the coordinator): B.** Builds and tests still run only on `novanas`; agents
+delete any worktree `target/debug` after a Rust commit. The root `target/release` stays (the local `turbine-bench` /
+`turbine-golden` client `scripts/lab-bench.sh` uses).
+
+## gptq_int4 soak: `reached_orange` false twice (2026-09-30)
+
+Context: two 10-minute overload soaks of the own llm-compressor GPTQ checkpoint
+(`/home/piwi/turbine-models/llama-3.2-3b-instruct-gptq-own`, `target/soak/novanas-20260930T095436Z` and `…T101457Z`
+in `agent-p6a-gptq-numerics`) failed only `reached_orange` (GREEN/YELLOW only, KV peak 0.82, 259 / 374
+`queue_timeout`). Same soak config and KV pool (~1860 blocks) as the passing AWQ soak (rotation 9), but calibration
+(64–6000-word prompts, concurrency 4) measured R ≈ 0.50 / 0.56 req/s against AWQ's 2.21, so the 4R overload was ~2 req/s
+against AWQ's 8.85 and requests timed out queued before KV filled. 6 of 72 calibration requests count as failed with
+HTTP 200 in both runs. lab-bench (512-word prompts) showed golden PASS and 1266.7 tok/s.
+
+- A) Find and fix first: profile long-prompt GPTQ prefill against AWQ over 64–6000 words, explain the 6 failed
+  calibration requests, fix, soak again — chosen
+- B) Add a fixed-rate / multiplier option to `overload-soak.sh` and rerun at AWQ's 8.85 req/s (tests the pressure path,
+  leaves the slowdown)
+- C) Flip `gptq_int4` now, accepting the failed check, and carry the slowdown as a known issue
+
+**Decision (user, 2026-09-30, relayed by the coordinator): A.** `gptq_int4` stays `experimental` and
+`p6a-gptq-numerics` stays unmerged until a soak passes.
+
+## gptq_int4 proof checkpoint after the long-prompt probe (2026-09-30)
+
+Context: the "find and fix first" investigation above found no Turbine fault. GPTQ and AWQ take the same prefill path
+(dequantize to BF16, hipBLASLt above M=128) with equal TTFT at 64/1000/3000/6000 words (31/104/244/431 ms against
+31/105/247/435 ms). The own llm-compressor checkpoint rarely emits EOS on long random-word prompts (3000/6000 words run
+to the 1024-token cap: e2e p50 10.5 / 15.1 s, AWQ 0.42 / 0.78 s), which cut the calibrated rate to ~0.5 req/s; its
+empty streams are a first-token EOS. vLLM-ROCm serving the same checkpoint on the same seeded prompts behaves the same
+(3000/6000 words to the cap, e2e p50 21.7 / 23.3 s; empty streams at the same request indices 3, 13, 14, 29), so it is
+the checkpoint's behaviour, not Turbine's. Data: `scratchpad/gptq-prof/` of the rotation-14 lead.
+
+- A) Add a fixed overload rate to `overload-soak.sh` and rerun the own checkpoint at AWQ's 8.85 req/s
+- B) Prove `gptq_int4` with a different GPTQ checkpoint — chosen
+- C) Re-quantize the own checkpoint with long-context calibration data
+- D) Flip now, accepting `reached_orange` false with the vLLM parity as evidence
+
+**Decision (user, 2026-09-30, relayed by the coordinator): B.** The proof checkpoint is kaitchup's AutoRound GPTQ
+(`llama-3.2-3b-instruct-autoround-gptq`, pinned e11f15d…; full GSM8K 0.7566, drop 0.0235 against the 0.04 bound; loads
+as `gptq_int4`); the shuyuej GPTQ checkpoint failed GSM8K and is not a candidate. First a long-prompt probe (64–6000
+words, EOS allowed): if it also runs to the cap, back to the user. Otherwise golden fixture, tolerance, lab-bench
+c1/c16, 10-minute soak, flip; spec S-11 names the AutoRound checkpoint as the proof and keeps the own checkpoint's
+GSM8K and vLLM-parity results as supporting data.
+
+## mxfp4_a4 (W4A4, Llama-3.1-8B-Instruct Quark MXFP4 W4A4): golden tolerance after the self-spread (2026-09-30)
+
+Context: the reference (bf16, sdpa, incremental decode, activation fake-quant) and the all-8 transformers self-spread
+finished on novanas (`/home/piwi/turbine-ci/scratch/w4a4-fixture/`). transformers disagrees with itself badly under
+activation quantization: apart from the reference's own variant (16/16, 0.0), the other seven variants keep only 5–8
+of 16 prompts on an identical prefix, with worst likely |Δ logprob| 1.67–4.56 and tail 5.47–8.32 (2–8 missing
+candidates). A tolerance derived from that spread (likely ~4.6, tail ~8.3, ~5/16 prefixes) would not test anything.
+
+- A) Keep `mxfp4_a4` experimental for 6a, like `mxfp4` (Phase 7 item)
+- B) Gate it on GSM8K and throughput only, with a loose golden (informational)
+- C) Build the reference with Turbine's exact activation-quant rounding and derive the tolerance from a narrower variant set
+
+## OLMoE FP8 KV: golden against the emulated-KV reference misses (2026-09-30)
+
+Context: the FP8 KV golden fixtures (Task 24 B′) were never committed; they were built at the 6a exit (7ad4b03) from
+the 2026-09-29 regenerated references and spreads (tolerance = max(spread, BF16 bounds)). Llama FP8 KV passes 16/16 at
+c1 and c16 (worst likely 0.29 / tail 1.11 against 0.40 / 2.44). OLMoE FP8 KV fails at c1 and c16 alike (bit-equal):
+13/16 against `min_prompts_passing` 14, bounds likely 1.10 / tail 2.01. p03: all 32 tokens identical, likely 0.06,
+one tail candidate off by 5.38; p05: diverges at token 31 at reference margin 0.558 (the excuse is < 0.5); p13: likely
+1.126. The `amd/gfx1201/OlmoeForCausalLM/bf16/fp8_e4m3` row is already `supported` (user decision 2026-09-29 A, full
+GSM8K drop accepted as noise). OLMoE BF16 KV golden passes at the same tip (worst likely 1.00 / tail 1.15).
+
+- A) Diagnose first (bounded, ~1–2 h): per-position |Δ| for p03 / p13 (`turbine-golden positions`), HIP vs CPU
+  provider trace on OLMoE with FP8 KV; then back to the user with the cause
+- B) Demote the OLMoE FP8 KV row to `experimental` for 6a (Phase 7 item, with calibrated V scales), keep Llama's
+- C) Keep it `supported`: record the golden miss next to the GSM8K acceptance, no tolerance change
+
+**Decision (user, 2026-09-30): B.** The OLMoE FP8 KV row on gfx1201 is `experimental` for 6a; the golden miss and
+calibrated V scales for scale-less checkpoints are a Phase 7 item. Llama FP8 KV stays `supported`.

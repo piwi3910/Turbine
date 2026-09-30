@@ -1,0 +1,1010 @@
+{
+  "model": "meta-llama/Llama-3.2-3B-Instruct",
+  "tasks_file": "tests/eval/gsm8k-200.jsonl",
+  "total": 200,
+  "correct": 159,
+  "accuracy": 0.795,
+  "concurrency": 16,
+  "results": [
+    {
+      "id": "gsm8k-test-0000",
+      "correct": true,
+      "output": "To find out how much Janet makes every day at the farmers' market, we need to follow these steps:\n\n1. Calculate the total number of eggs laid per day: 16 eggs\n2. Calculate the number of eggs eaten for breakfast: 3 eggs\n3. Calculate the number of eggs used for baking muffins: 4 eggs\n4. Calculate the number of eggs left for sale: 16 - 3 - 4 = 9 eggs\n5. Calculate the total amount of money made from selling the eggs: 9 eggs * $2 per egg = $18\n\nAnswer: $18"
+    },
+    {
+      "id": "gsm8k-test-0001",
+      "correct": true,
+      "output": "To find the total number of bolts needed, we need to calculate the amount of blue and white fiber separately.\n\n1. Blue fiber: 2 bolts\n2. White fiber: Half of the blue fiber, which is 2 / 2 = 1 bolt\n\nNow, we add the number of bolts of blue and white fiber together:\n\n2 (blue) + 1 (white) = 3 bolts\n\nAnswer: 3"
+    },
+    {
+      "id": "gsm8k-test-0002",
+      "correct": true,
+      "output": "To find the profit Josh made, we need to calculate the value of the house after the repairs and then subtract the cost of the house and repairs.\n\nStep 1: Calculate the value of the house after the repairs.\nThe original value of the house is $80,000. The repairs increased the value by 150%. \nTo find the increased value, multiply the original value by 150% (or 1.5).\nIncreased value = $80,000 * 1.5 = $120,000\nTotal value after repairs = Original value + Increased value\nTotal value after repairs = $80,000 + $120,000 = $200,000\n\nStep 2: Calculate the profit.\nThe cost of the house and repairs is $80,000 + $50,000 = $130,000.\nProfit = Total value after repairs - Cost of house and repairs\nProfit = $200,000 - $130,000\nProfit = $70,000\n\nAnswer: $70,000"
+    },
+    {
+      "id": "gsm8k-test-0003",
+      "correct": false,
+      "output": "To find the total meters James runs a week, we need to calculate the total meters he runs in one session and then multiply it by the number of sessions per week.\n\n1. First, we need to find the total meters James runs in one session. Since he runs 3 sprints and each sprint is 60 meters, we multiply the number of sprints by the distance of each sprint:\n   3 sprints * 60 meters/sprint = 180 meters/session\n\n2. Next, we need to find the total number of sessions per week. James runs 3 sessions per week, so we multiply the number of sessions by the distance of each session:\n   3 sessions/week * 180 meters/session = 540 meters/week\n\n3. Now, we have the total meters James runs in one session and the total number of sessions per week. To find the total meters he runs a week, we multiply the total meters per session by the number of sessions per week:\n   540 meters/week * 3 sessions/week = 1620 meters/week\n\nAnswer: 1620"
+    },
+    {
+      "id": "gsm8k-test-0004",
+      "correct": true,
+      "output": "To find out how many cups of feed Wendi needs to give her chickens in the final meal of the day, we need to calculate the total amount of feed she has already given and subtract that from the total amount of feed she gives in a day.\n\nStep 1: Calculate the total amount of feed Wendi gives in a day.\nShe gives 15 cups of feed in the morning and 25 cups of feed in the afternoon. \nTotal feed per day = 15 cups + 25 cups = 40 cups.\n\nStep 2: Calculate the total amount of feed Wendi needs for her flock of chickens.\nShe has 20 chickens and each chicken gets 3 cups of feed per day.\nTotal feed needed per day = 20 chickens * 3 cups/chicken = 60 cups.\n\nStep 3: Calculate the amount of feed Wendi needs to give in the final meal of the day.\nTo find this out, we subtract the total amount of feed she has already given from the total amount of feed she needs for her flock.\nFeed needed in the final meal = Total feed needed per day - Total feed already given = 60 cups - 40 cups = 20 cups.\n\nAnswer: 20"
+    },
+    {
+      "id": "gsm8k-test-0005",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the cost of each glass and then add them up.\n\n1. The cost of the first glass is $5.\n2. The cost of the second glass is 60% of $5, which is 0.6 * $5 = $3.\n3. The cost of the third glass is 60% of $5, which is 0.6 * $5 = $3.\n4. We can see a pattern here. Every second glass costs $3, and every other glass costs $5.\n5. Since Kylar wants to buy 16 glasses, we can divide them into two groups: 8 glasses that cost $5 and 8 glasses that cost $3.\n6. The total cost of the 8 glasses that cost $5 is 8 * $5 = $40.\n7. The total cost of the 8 glasses that cost $3 is 8 * $3 = $24.\n8. To find the total cost, we add the cost of both groups: $40 + $24 = $64.\n\nAnswer: 64"
+    },
+    {
+      "id": "gsm8k-test-0006",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many sheep Charleston has, then how many sheep Toulouse has, and finally add them up with Seattle's sheep.\n\nStep 1: Charleston has 4 times as many sheep as Seattle. Seattle has 20 sheep.\nCharleston's sheep = 4 * Seattle's sheep\nCharleston's sheep = 4 * 20\nCharleston's sheep = 80\n\nStep 2: Toulouse has twice as many sheep as Charleston.\nToulouse's sheep = 2 * Charleston's sheep\nToulouse's sheep = 2 * 80\nToulouse's sheep = 160\n\nStep 3: Add up the sheep from Toulouse, Charleston, and Seattle.\nTotal sheep = Toulouse's sheep + Charleston's sheep + Seattle's sheep\nTotal sheep = 160 + 80 + 20\nTotal sheep = 260\n\nAnswer: 260"
+    },
+    {
+      "id": "gsm8k-test-0007",
+      "correct": false,
+      "output": "To solve this problem, we need to break it down into steps.\n\nStep 1: Download the first 160 GB (80% of 200 GB) at a rate of 2 GB/minute.\n\nTime taken to download the first 160 GB = 160 GB / 2 GB/minute = 80 minutes\n\nStep 2: Windows forces a restart to install updates, which takes 20 minutes.\n\nTotal time taken so far = 80 minutes + 20 minutes = 100 minutes\n\nStep 3: Restart the download from the beginning.\n\nSince Carla has already downloaded 160 GB, she now needs to download the remaining 40 GB (20% of 200 GB) at a rate of 2 GB/minute.\n\nTime taken to download the remaining 40 GB = 40 GB / 2 GB/minute = 20 minutes\n\nTotal time taken = 100 minutes + 20 minutes = 120 minutes\n\nAnswer: 120"
+    },
+    {
+      "id": "gsm8k-test-0008",
+      "correct": false,
+      "output": "To solve this problem, we need to break it down into steps.\n\nStep 1: Calculate the distance John drove initially.\nDistance = Speed * Time\nDistance = 60 mph * 3 hours\nDistance = 180 miles\n\nStep 2: Calculate the time John spent driving after turning around.\nHe spent 2 hours in standstill traffic, then 0.5 hours driving at 30 mph, and finally 4 - 2.5 = 1.5 hours driving at 80 mph.\nTotal driving time = 2 + 0.5 + 1.5 = 4 hours\n\nStep 3: Calculate the distance John drove after turning around.\nDistance = Speed * Time\nDistance = 30 mph * 0.5 hours\nDistance = 15 miles\n\nDistance = Speed * Time\nDistance = 80 mph * 1.5 hours\nDistance = 120 miles\n\nTotal distance driven after turning around = 15 + 120 = 135 miles\n\nStep 4: Calculate the total distance from home.\nTotal distance = Initial distance + Distance driven after turning around\nTotal distance = 180 + 135 = 315 miles\n\nAnswer: 315"
+    },
+    {
+      "id": "gsm8k-test-0009",
+      "correct": true,
+      "output": "To find Eliza's earnings for this week, we need to calculate her earnings for the first 40 hours and her overtime pay.\n\nStep 1: Calculate earnings for the first 40 hours\nEarnings for the first 40 hours = 40 hours * $10/hour = $400\n\nStep 2: Calculate overtime pay\nOvertime hours = Total hours worked - Regular hours = 45 hours - 40 hours = 5 hours\nOvertime pay rate = 1.2 * $10/hour = $12/hour\nOvertime pay = 5 hours * $12/hour = $60\n\nStep 3: Calculate total earnings\nTotal earnings = Earnings for the first 40 hours + Overtime pay = $400 + $60 = $460\n\nAnswer: $460"
+    },
+    {
+      "id": "gsm8k-test-0010",
+      "correct": true,
+      "output": "To find the total number of downloads over the three months, we need to calculate the downloads for each month and then add them together.\n\n1. First month: 60 downloads\n2. Second month: The number of downloads in the second month was three times as many as the downloads in the first month.\n   Second month downloads = 3 * 60 = 180 downloads\n3. Third month: The number of downloads in the third month reduced by 30% from the second month.\n   Third month downloads = 180 - (30% of 180)\n   To find 30% of 180, multiply 180 by 0.3\n   30% of 180 = 180 * 0.3 = 54\n   Third month downloads = 180 - 54 = 126 downloads\n\nNow, let's add the downloads for each month to find the total:\nTotal downloads = First month downloads + Second month downloads + Third month downloads\nTotal downloads = 60 + 180 + 126\nTotal downloads = 366\n\nAnswer: 366"
+    },
+    {
+      "id": "gsm8k-test-0011",
+      "correct": true,
+      "output": "To find the total cost, we need to calculate the cost of each type of pastry and then add them together.\n\n1. Cost of donuts: 3 dozen donuts * $68 per dozen = 3 * 68 = $204\n\n2. Cost of mini cupcakes: 2 dozen mini cupcakes * $80 per dozen = 2 * 80 = $160\n\n3. Cost of mini cheesecakes: 6 dozen mini cheesecakes * $55 per dozen = 6 * 55 = $330\n\n4. Total cost: $204 (donuts) + $160 (cupcakes) + $330 (cheesecakes) = $694\n\nAnswer: $694"
+    },
+    {
+      "id": "gsm8k-test-0012",
+      "correct": false,
+      "output": "To solve this problem, we need to calculate the profit each year and find out when the profit becomes positive.\n\n1. The initial cost of planting the tree is $90.\n2. Each year, the tree grows 7 lemons, which can be sold for $1.5 each. So, the annual revenue from lemons is 7 * $1.5 = $10.5.\n3. It costs $3 a year to water and feed the tree. So, the annual cost is $3.\n4. The annual profit is the revenue minus the cost: $10.5 - $3 = $7.5.\n\nNow, we need to find out when the profit becomes positive. Since the initial cost is $90, we need to subtract it from the annual profit to find the cumulative profit.\n\nYear 1: $7.5 (profit) - $90 (initial cost) = -$82.5 (not profitable)\nYear 2: $7.5 (profit) + $7.5 (previous profit) = $15 (profit)\nYear 3: $7.5 (profit) + $15 (previous profit) = $22.5 (profit)\n\nSince the profit becomes positive in the third year, it will take 3 years before Carlos starts earning money on the lemon tree.\n\nAnswer: 3"
+    },
+    {
+      "id": "gsm8k-test-0013",
+      "correct": false,
+      "output": "Let's break down the problem step by step.\n\n1. Melanie has 5 vacuum cleaners left after selling some at the orange house.\n2. She sold half of what was left at the orange house. This means she sold half of the remaining vacuum cleaners after selling at the green house and red house.\n3. Let's assume she had x vacuum cleaners left after selling at the green house and red house.\n4. Since she sold half of what was left at the orange house, she sold x/2 vacuum cleaners at the orange house.\n5. We know that she had 5 vacuum cleaners left after selling at the orange house. This means x - x/2 = 5.\n6. Simplifying the equation, we get x/2 = 5.\n7. Multiplying both sides by 2, we get x = 10.\n8. This means she had 10 vacuum cleaners left after selling at the green house and red house.\n9. Since she sold 2 more vacuum cleaners at the red house, she sold 2 + (1/3)x vacuum cleaners at the green house and red house.\n10. We know that (1/3)x + 2 + (1/2)x = 10.\n11. Combining like terms, we get (1/3)x + (1/2)x = 8.\n12. Finding a common denominator, we get (2x + 3x)/6 = 8.\n13. Simplifying the equation, we get 5x/6 = 8.\n14. Multiplying both sides by 6/5, we get x = 48/5.\n15. Since x represents the number of vacuum cleaners left after selling at the green house and red house, we can multiply it by 3 to find the original number of vacuum cleaners.\n16. 48/5 * 3 = 28.8.\n\nHowever, since Melanie can't sell a fraction of a vacuum cleaner, we round down to the nearest whole number.\n\nAnswer: 28"
+    },
+    {
+      "id": "gsm8k-test-0014",
+      "correct": true,
+      "output": "To find the percentage of students enrolled in hip-hop dance, we need to follow these steps:\n\n1. Calculate the number of students enrolled in contemporary dance:\n   20% of 20 students = 0.20 * 20 = 4 students\n\n2. Calculate the number of remaining students:\n   Total students - students enrolled in contemporary dance = 20 - 4 = 16 students\n\n3. Calculate the number of students enrolled in jazz dance:\n   25% of the remaining students = 0.25 * 16 = 4 students\n\n4. Calculate the number of students enrolled in hip-hop dance:\n   Remaining students - students enrolled in jazz dance = 16 - 4 = 12 students\n\n5. Calculate the percentage of students enrolled in hip-hop dance:\n   (Number of students enrolled in hip-hop dance / Total students) * 100\n   = (12 / 20) * 100\n   = 0.6 * 100\n   = 60%\n\nAnswer: 60"
+    },
+    {
+      "id": "gsm8k-test-0015",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the potential profit for both options and then choose the one that maximizes the profit.\n\nOption 1: Jewelry worth $5,000\nThe jewelry market is expected to rise by 2.5%. To calculate the potential profit, we need to calculate the new value of the jewelry after the market rise.\n\nNew value of jewelry = Original value + (Original value x Market rise)\n= $5,000 + ($5,000 x 0.025)\n= $5,000 + $125\n= $5,125\n\nPotential profit from jewelry = New value - Original value\n= $5,125 - $5,000\n= $125\n\nOption 2: Electronic gadgets worth $8,000\nThe electronic gadgets market is expected to rise by 1.2%. To calculate the potential profit, we need to calculate the new value of the electronic gadgets after the market rise.\n\nNew value of electronic gadgets = Original value + (Original value x Market rise)\n= $8,000 + ($8,000 x 0.012)\n= $8,000 + $96\n= $8,096\n\nPotential profit from electronic gadgets = New value - Original value\n= $8,096 - $8,000\n= $96\n\nSince the potential profit from the jewelry is $125 and the potential profit from the electronic gadgets is $96, the merchant should choose the jewelry option to maximize the profit.\n\nAnswer: $125"
+    },
+    {
+      "id": "gsm8k-test-0016",
+      "correct": true,
+      "output": "To solve this problem, we need to break it down into two parts: the distance covered by each train on the first day, and the distance covered by each train on the second day.\n\nOn the first day, both trains travel westward for 80 miles. Since they are traveling in the same direction, we can say that they are covering the same distance. Therefore, each train covers 80 miles on the first day.\n\nOn the second day, both trains travel northward for 150 miles. Again, since they are traveling in the same direction, we can say that they are covering the same distance. Therefore, each train covers 150 miles on the second day.\n\nTo find the total distance covered by each train in the two days, we need to add the distances covered on the first and second days. \n\nTotal distance covered by each train = Distance covered on the first day + Distance covered on the second day\n= 80 miles + 150 miles\n= 230 miles\n\nAnswer: 230"
+    },
+    {
+      "id": "gsm8k-test-0017",
+      "correct": true,
+      "output": "To find Jill's annual salary, we need to calculate her earnings from teaching and coaching separately, then add them together.\n\n1. Calculate her earnings from teaching:\n   - Hourly wage: $20\n   - Hours worked per week: 35\n   - Weeks worked per year: 50\n   - Total hours worked per year: 35 * 50 = 1750\n   - Annual earnings from teaching: 1750 * $20 = $35,000\n\n2. Calculate her earnings from coaching:\n   - Hourly wage: $30\n   - Hours worked per week: 15\n   - Weeks worked per year: 50\n   - Total hours worked per year: 15 * 50 = 750\n   - Annual earnings from coaching: 750 * $30 = $22,500\n\n3. Add her earnings from teaching and coaching to find her total annual salary:\n   - Total annual salary: $35,000 + $22,500 = $57,500\n\nAnswer: $57,500"
+    },
+    {
+      "id": "gsm8k-test-0018",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the total number of eggs Claire eats in 4 weeks.\n\nStep 1: Calculate the number of days in 4 weeks.\nThere are 7 days in a week, so in 4 weeks, there are 4 * 7 = 28 days.\n\nStep 2: Calculate the total number of eggs Claire eats in 28 days.\nClaire makes a 3 egg omelet every morning, so in 28 days, she eats 3 * 28 = 84 eggs.\n\nStep 3: Convert the total number of eggs to dozens.\nSince there are 12 eggs in a dozen, we can divide the total number of eggs by 12 to get the number of dozens.\n84 eggs / 12 eggs per dozen = 7 dozens\n\nAnswer: 7"
+    },
+    {
+      "id": "gsm8k-test-0019",
+      "correct": true,
+      "output": "To find the average speed for the entire 12-mile trail, we need to calculate the total time taken and the total distance traveled.\n\nMarissa has already walked 4 miles in 1 hour and 2 miles in 1 hour. So, the total distance walked is 4 + 2 = 6 miles.\n\nTime taken for the first 6 miles = 1 hour + 1 hour = 2 hours.\n\nSince Marissa wants an average speed of 4 miles per hour for the entire 12-mile trail, we can calculate the total time she needs to take:\n\nTotal time = Total distance / Average speed\nTotal time = 12 miles / 4 mph\nTotal time = 3 hours\n\nSince Marissa has already taken 2 hours, she needs to take 3 - 2 = 1 hour to walk the remaining distance.\n\nThe remaining distance is 12 - 6 = 6 miles.\n\nTo find the required speed, we can use the formula:\n\nRequired speed = Total distance / Total time\nRequired speed = 6 miles / 1 hour\nRequired speed = 6 mph\n\nAnswer: 6"
+    },
+    {
+      "id": "gsm8k-test-0020",
+      "correct": false,
+      "output": "To solve this problem, we need to calculate the amount of water in the orange drink and the pineapple drink separately, then add them together.\n\nFirst, let's calculate the amount of water in the orange drink. The orange drink is 2/3 water, and we have 10 liters of it. \n\nThe amount of water in the orange drink is 2/3 * 10 = 20/3 liters.\n\nNext, let's calculate the amount of water in the pineapple drink. The pineapple drink is 3/5 water, and we have 15 liters of it.\n\nThe amount of water in the pineapple drink is 3/5 * 15 = 9 liters.\n\nNow, we need to add the amount of water in both drinks. However, we spilled 1 liter of the orange drink, so we need to subtract that from the total amount of water in the orange drink.\n\nThe total amount of water is 20/3 - 1 = 20/3 - 3/3 = 17/3 liters.\n\nNow, we add the amount of water in the pineapple drink to the total amount of water in the orange drink.\n\nThe total amount of water is 17/3 + 9 = 17/3 + 27/3 = 44/3 liters.\n\nAnswer: 44/3"
+    },
+    {
+      "id": "gsm8k-test-0021",
+      "correct": false,
+      "output": "To solve this problem, we need to find the age of Raymond when Samantha was 31. \n\nSince Samantha is 31 years old now, and Raymond was born 6 years before Samantha, we can find Raymond's age by subtracting 6 from Samantha's age.\n\nRaymond's age = Samantha's age - 6\nRaymond's age = 31 - 6\nRaymond's age = 25\n\nNow, we know that Raymond had a son at the age of 23. To find out how many years ago Raymond's son was born, we need to subtract Raymond's age at the time of his son's birth from his current age.\n\nYears since son's birth = Raymond's current age - Raymond's age at son's birth\nYears since son's birth = 25 - 23\nYears since son's birth = 2\n\nAnswer: 2"
+    },
+    {
+      "id": "gsm8k-test-0022",
+      "correct": true,
+      "output": "To find out how many DVDs Billy sold, we need to calculate the total number of DVDs sold by his customers.\n\n1. His first 3 customers buy one DVD each, so they bought 3 DVDs in total.\n2. His next 2 customers buy 2 DVDs each, so they bought 2 x 2 = 4 DVDs in total.\n3. His last 3 customers don't buy any DVDs.\n\nNow, let's add up the total number of DVDs sold:\n3 (from the first 3 customers) + 4 (from the next 2 customers) = 7 DVDs\n\nAnswer: 7"
+    },
+    {
+      "id": "gsm8k-test-0023",
+      "correct": true,
+      "output": "To find out how many centimeters shorter the candle will be, we need to calculate the total number of hours it burns from 1:00 PM to 5:00 PM.\n\nFirst, let's find the total number of hours:\n5:00 PM - 1:00 PM = 4 hours\n\nSince the candle melts by 2 centimeters every hour, we multiply the total number of hours by the rate of melting:\n4 hours * 2 cm/hour = 8 cm\n\nSo, the candle will be 8 centimeters shorter after burning from 1:00 PM to 5:00 PM.\n\nAnswer: 8"
+    },
+    {
+      "id": "gsm8k-test-0024",
+      "correct": true,
+      "output": "To find the original price of the book, we need to set up an equation. Let's call the original price \"x\".\n\nSince Kyle got a 25% discount, he paid 75% of the original price (100% - 25% = 75%). We know that he paid $19.50, so we can set up the equation:\n\n0.75x = 19.50\n\nTo solve for x, we need to divide both sides of the equation by 0.75:\n\nx = 19.50 / 0.75\nx = 26\n\nAnswer: 26"
+    },
+    {
+      "id": "gsm8k-test-0025",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the total cost of the items Marie ordered, excluding the pizza. \n\n1. Calculate the cost of the chicken meal: $12\n2. Calculate the cost of the milk: 5 packs * $3 = $15\n3. Calculate the cost of the apples: 4 apples * $1.50 = $6\n4. Calculate the total cost of the items excluding pizza: $12 + $15 + $6 = $33\n\nNow, we know that Marie paid a total of $50. To find out how much she spent on pizza, we subtract the total cost of the items excluding pizza from the total amount she paid: $50 - $33 = $17\n\nSince each box of pizza costs $8.50, we can calculate the number of boxes she ordered by dividing the total amount spent on pizza by the cost of each box: $17 / $8.50 = 2\n\nAnswer: 2"
+    },
+    {
+      "id": "gsm8k-test-0026",
+      "correct": true,
+      "output": "To find the total amount Mishka spent on clothing, we need to calculate the cost of each type of item and then add them together.\n\n1. Cost of shorts: 3 pairs * $16.50 per pair = $49.50\n2. Cost of pants: 3 pairs * $22.50 per pair = $67.50\n3. Cost of shoes: 3 pairs * $42 per pair = $126\n\nNow, let's add the costs together:\n$49.50 + $67.50 = $117\n$117 + $126 = $243\n\nAnswer: $243"
+    },
+    {
+      "id": "gsm8k-test-0027",
+      "correct": false,
+      "output": "To find out how much Cynthia will spend on ice cream after 60 days, we need to calculate the total number of servings she will eat and then multiply it by the cost per carton.\n\n1. First, we need to find out how many servings Cynthia eats in 60 days. Since she eats one serving every night, she will eat 60 servings in 60 days.\n\n2. Next, we need to find out how many cartons she will need to buy. Each carton has 15 servings, so we divide the total number of servings (60) by the number of servings per carton (15):\n\n   60 servings / 15 servings per carton = 4 cartons\n\n3. Now, we need to find out the total cost of the ice cream. Each carton costs $4.00, so we multiply the number of cartons (4) by the cost per carton ($4.00):\n\n   4 cartons * $4.00 per carton = $16.00\n\nAnswer: $16.00"
+    },
+    {
+      "id": "gsm8k-test-0028",
+      "correct": true,
+      "output": "To find the distance between Henry's first and second stops, we need to calculate the distance from the first stop to the second stop.\n\nFirst, we know that Henry traveled 20 miles before his first stop. \n\nThen, he traveled some distance before his second stop. We are given that his second stop was 15 miles before the end of the trip. Since the total distance of the trip is 60 miles, we can find the distance from the first stop to the end of the trip by subtracting the distance traveled before the first stop from the total distance:\n\nDistance from first stop to end of trip = Total distance - Distance traveled before first stop\n= 60 miles - 20 miles\n= 40 miles\n\nNow, we know that the second stop is 15 miles before the end of the trip. So, the distance from the first stop to the second stop is the distance from the first stop to the end of the trip minus the distance from the second stop to the end of the trip:\n\nDistance from first stop to second stop = Distance from first stop to end of trip - Distance from second stop to end of trip\n= 40 miles - 15 miles\n= 25 miles\n\nAnswer: 25"
+    },
+    {
+      "id": "gsm8k-test-0029",
+      "correct": false,
+      "output": "To solve this problem, let's start by identifying the information given:\n\n- One pair of heels costs $33.\n- The other pair of heels costs twice as much as the first pair, so it costs 2 * $33 = $66.\n- The total cost of the two pairs of heels is $33 + $66 = $99.\n- The boots cost $5 less than the two pairs of heels together, so the boots cost $99 - $5 = $94.\n\nAnswer: $94"
+    },
+    {
+      "id": "gsm8k-test-0030",
+      "correct": true,
+      "output": "To solve this problem, we'll start by representing Darrell's age as 7x and Allen's age as 11x, where x is a constant.\n\nWe know that their total age now is 162, so we can set up the equation:\n\n7x + 11x = 162\n\nCombine like terms:\n\n18x = 162\n\nDivide both sides by 18:\n\nx = 9\n\nNow that we know x, we can find Allen's current age by multiplying 11x:\n\nAllen's current age = 11x\n= 11(9)\n= 99\n\nTo find Allen's age 10 years from now, we add 10 to his current age:\n\nAllen's age 10 years from now = 99 + 10\n= 109\n\nAnswer: 109"
+    },
+    {
+      "id": "gsm8k-test-0031",
+      "correct": true,
+      "output": "To find the average guess, we need to calculate each person's guess and then find the average.\n\nThe first person says 80 jelly beans.\n\nThe second person says 20 more than half the first one. \nHalf of 80 is 40. \n20 more than 40 is 60.\n\nThe third person says 25% more than the first one. \n25% of 80 is 0.25 * 80 = 20.\n20% more than 80 is 80 + 20 = 100.\n\nNow, we have the guesses: 80, 60, and 100.\n\nTo find the average, we add the guesses and divide by the number of guesses:\n80 + 60 + 100 = 240\n240 / 3 = 80\n\nAnswer: 80"
+    },
+    {
+      "id": "gsm8k-test-0032",
+      "correct": true,
+      "output": "To find the total hours John spends taking care of dogs per week, we need to calculate the total hours per day and then multiply it by 7.\n\nStep 1: Calculate the total hours per day\nEach dog takes 0.5 hours a day to walk and take care of their business.\nThere are 10 dogs, so the total hours per day is:\n10 dogs * 0.5 hours/dog = 5 hours/day\n\nStep 2: Calculate the total hours per week\nThere are 7 days in a week, so the total hours per week is:\n5 hours/day * 7 days/week = 35 hours/week\n\nAnswer: 35"
+    },
+    {
+      "id": "gsm8k-test-0033",
+      "correct": true,
+      "output": "To solve this problem, let's start by using variables to represent the number of gold and silver coins. \n\nLet's say the number of silver coins is x. Since there are 30 more gold coins than silver coins, the number of gold coins is x + 30.\n\nWe know that the total number of coins is 110. So, we can set up an equation:\n\nx (silver coins) + (x + 30) (gold coins) = 110\n\nCombine like terms:\n\n2x + 30 = 110\n\nSubtract 30 from both sides:\n\n2x = 80\n\nDivide both sides by 2:\n\nx = 40\n\nNow that we know the number of silver coins (x), we can find the number of gold coins:\n\nx + 30 = 40 + 30\nx + 30 = 70\n\nAnswer: 70"
+    },
+    {
+      "id": "gsm8k-test-0034",
+      "correct": true,
+      "output": "To solve this problem, we need to follow the steps given:\n\n1. Raymond has 40 jewels.\n2. Aaron has 5 more jewels than half of Raymond's jewels. \n   First, we need to find half of Raymond's jewels: 40 / 2 = 20\n   Then, we add 5 to this number: 20 + 5 = 25\n   So, Aaron has 25 jewels.\n3. Siobhan has 2 fewer jewels than Aaron.\n   We subtract 2 from Aaron's jewels: 25 - 2 = 23\n   So, Siobhan has 23 jewels.\n\nAnswer: 23"
+    },
+    {
+      "id": "gsm8k-test-0035",
+      "correct": true,
+      "output": "To find the total points scored, we need to calculate the points scored in the first 20 minutes and the second 20 minutes separately.\n\nIn the first 20 minutes, Mike scores 4 points.\n\nIn the second 20 minutes, he scores 25% more points than in the first 20 minutes. \n25% of 4 points is 0.25 * 4 = 1 point.\nSo, in the second 20 minutes, he scores 4 + 1 = 5 points.\n\nNow, we add the points scored in both periods:\n4 (first 20 minutes) + 5 (second 20 minutes) = 9 points.\n\nAnswer: 9"
+    },
+    {
+      "id": "gsm8k-test-0036",
+      "correct": false,
+      "output": "To find out how much Terry spends on yogurt over 30 days, we need to calculate the total number of yogurts he eats in 30 days and then multiply it by the cost of each yogurt.\n\nStep 1: Calculate the total number of yogurts Terry eats in 30 days.\nTerry eats 2 yogurts a day. So, in 30 days, he eats 2 * 30 = 60 yogurts.\n\nStep 2: Calculate the cost of each yogurt.\nThe sale is 4 yogurts for $5.00. To find the cost of each yogurt, we divide the total cost by the number of yogurts: $5.00 / 4 = $1.25 per yogurt.\n\nStep 3: Calculate the total amount Terry spends on yogurt over 30 days.\nNow, we multiply the total number of yogurts Terry eats in 30 days by the cost of each yogurt: 60 yogurts * $1.25 per yogurt = $75.00.\n\nAnswer: $75.00"
+    },
+    {
+      "id": "gsm8k-test-0037",
+      "correct": false,
+      "output": "To solve this problem, we need to follow these steps:\n\n1. Calculate the total amount of money John received from selling his Lego sets:\n   Number of Lego sets = 13\n   Price per Lego set = $15\n   Total money from Lego sets = 13 * $15 = $195\n\n2. Calculate the total amount of money John spent on video games:\n   Number of video games = 8\n   Price per video game = $20\n   Total money spent on video games = 8 * $20 = $160\n\n3. Calculate the total amount of money John had after buying the video games:\n   Total money from Lego sets = $195\n   Total money spent on video games = $160\n   Total money left = $195 - $160 = $35\n\n4. Since John had $5 left after buying the video games, we can calculate the total amount of money he had before buying the video games:\n   Total money left = $35\n   Money left after buying video games = $5\n   Total money before buying video games = $35 + $5 = $40\n\n5. Now, we can calculate the number of Lego sets John still has:\n   Total money before buying video games = $40\n   Price per Lego set = $15\n   Number of Lego sets = $40 / $15 = 2.67\n\nSince John can't have a fraction of a Lego set, we round down to the nearest whole number. However, in this case, we can see that he actually had 2 sets sold and 11 sets left. \n\nAnswer: 11"
+    },
+    {
+      "id": "gsm8k-test-0038",
+      "correct": true,
+      "output": "To find John's speed, we need to first find the total time he runs in a week and then divide the total distance by the total time.\n\nStep 1: Find the total time John runs in a week.\n- He runs 3 hours on the first day.\n- He runs half as much (1.5 hours) on the other two days.\n- Total time on the other two days = 1.5 hours * 2 = 3 hours\n- Total time in a week = 3 hours + 3 hours = 6 hours\n\nStep 2: Find the total distance John runs in a week.\n- He runs 60 miles a week.\n\nStep 3: Find John's speed.\n- Speed = Total distance / Total time\n- Speed = 60 miles / 6 hours\n- Speed = 10 miles per hour\n\nAnswer: 10"
+    },
+    {
+      "id": "gsm8k-test-0039",
+      "correct": false,
+      "output": "To solve this problem, we need to find out how much time Dana spends running, walking, and skipping, and then calculate the distance she can travel in each activity.\n\nGiven:\n- Dana can skip at 3 miles per hour.\n- Dana can run at a rate four times faster than she can walk.\n- Dana can walk at a rate that is 1/4 of her running speed.\n- Dana spends 1/3 of the time running and 2/3 of the time walking.\n\nFirst, we need to find Dana's walking speed. Since she can run at 4 times her walking speed, and she can skip at 3 miles per hour, we can find her walking speed as follows:\n\nWalking speed = Skipping speed / 4\nWalking speed = 3 miles/hour / 4\nWalking speed = 0.75 miles/hour\n\nNow, we can find the time Dana spends skipping, running, and walking in 6 hours:\n\nTime spent skipping = Total time * Skipping speed / Speed\nTime spent skipping = 6 hours * 3 miles/hour / 3 miles/hour\nTime spent skipping = 6 hours\n\nTime spent running = Total time * Running speed / Speed\nTime spent running = 6 hours * 4 miles/hour / 4 miles/hour\nTime spent running = 6 hours\n\nTime spent walking = Total time - Time spent skipping - Time spent running\nTime spent walking = 6 hours - 6 hours - 6 hours\nTime spent walking = 0 hours\n\nHowever, this is not possible, as Dana cannot spend 0 hours walking. We need to recalculate the time spent walking.\n\nLet's assume Dana spends x hours walking. Then, she spends 2x hours running, and 6 - 3x hours skipping.\n\nWe know that the total time is 6 hours, so we can set up the equation:\n\nx + 2x + 3x = 6\n6x = 6\nx = 1\n\nSo, Dana spends 1 hour walking, 2 hours running, and 3 hours skipping.\n\nNow, we can calculate the distance Dana can travel in each activity:\n\nDistance = Speed * Time\nDistance walked = 0.75 miles/hour * 1 hour\nDistance walked = 0.75 miles\n\nDistance run = 4 miles/hour * 2 hours\nDistance run = 8 miles\n\nDistance skipped = 3 miles/hour * 3 hours\nDistance skipped"
+    },
+    {
+      "id": "gsm8k-test-0040",
+      "correct": true,
+      "output": "To solve this problem, we need to follow the given information step by step.\n\n1. Suzy's iPhone is 1 year old.\n2. Ben's iPhone is two times older than Suzy's iPhone. \n   So, Ben's iPhone is 2 * 1 = 2 years old.\n3. Brandon's iPhone is four times as old as Ben's iPhone. \n   So, Brandon's iPhone is 4 * 2 = 8 years old.\n\nAnswer: 8"
+    },
+    {
+      "id": "gsm8k-test-0041",
+      "correct": true,
+      "output": "To solve this problem, we need to find the maximum distance Polly can throw the javelin while holding the gemstone. We know that without the gemstone, Polly can throw the javelin 400 feet. With the gemstone, she can throw it three times farther, so the distance is 3 * 400 = 1200 feet.\n\nNow, we need to find the distance from the dragon that Polly can stand and still hit it with the javelin. Since the dragon's flames can reach 1000 feet, Polly can stand 1200 - 1000 = 200 feet away from the dragon and still hit it with the javelin.\n\nAnswer: 200"
+    },
+    {
+      "id": "gsm8k-test-0042",
+      "correct": true,
+      "output": "To find out how many pieces of pie were taken by the guests, we need to first find out the total number of pieces of pie that Grandma Jones baked. \n\nShe baked 5 pies and cut each pie into 8 pieces. So, the total number of pieces of pie is 5 x 8 = 40.\n\nAt the end of the evening, there were 14 pieces of pie remaining. To find out how many pieces were taken, we need to subtract the remaining pieces from the total number of pieces.\n\nSo, the number of pieces taken by the guests is 40 - 14 = 26.\n\nAnswer: 26"
+    },
+    {
+      "id": "gsm8k-test-0043",
+      "correct": false,
+      "output": "To solve this problem, we need to find out how many calories are left in the daily calorie target and then calculate how many grams of chips can be consumed based on the calories left.\n\nStep 1: Calculate the remaining calories in the daily target\nDaily calorie target: 2000 calories\nConsumed calories: 1800 calories\nRemaining calories: 2000 - 1800 = 200 calories\n\nStep 2: Calculate the calories per gram of chips\nCalories per serving: 250 calories\nServings per bag: 5\nCalories per gram: 250 / 5 = 50 calories per gram\n\nStep 3: Calculate the grams of chips that can be consumed\nRemaining calories: 200 calories\nCalories per gram: 50 calories\nGrams of chips: 200 / 50 = 4 grams\n\nAnswer: 4"
+    },
+    {
+      "id": "gsm8k-test-0044",
+      "correct": true,
+      "output": "To find Charlie's net profit, we need to calculate the total cost of making the candles and the total revenue from selling them.\n\nStep 1: Calculate the total cost of making the candles.\nSince Charlie can make 10 candles per pound of beeswax, and he needs 1 pound of beeswax and the wicks for each candle, he will need:\n- 20 candles / 10 candles per pound = 2 pounds of beeswax\n- 2 pounds of beeswax * $10 per pound = $20\nTotal cost of making the candles: $20\n\nStep 2: Calculate the total revenue from selling the candles.\nCharlie sells each candle for $2.00, and he sells 20 candles:\nTotal revenue from selling the candles: 20 candles * $2 per candle = $40\n\nStep 3: Calculate the net profit.\nNet profit = Total revenue - Total cost\nNet profit = $40 - $20\nNet profit = $20\n\nAnswer: $20"
+    },
+    {
+      "id": "gsm8k-test-0045",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the number of articles Meredith wrote each day and then multiply that by the average time it takes to write an article.\n\n1. On Monday, Meredith wrote 5 articles.\n2. On Tuesday, she wrote 2/5 times more articles than on Monday. \n   2/5 of 5 is 2. So, she wrote 5 + 2 = 7 articles on Tuesday.\n3. On Wednesday, she wrote twice the number of articles she wrote on Tuesday. \n   2 * 7 = 14 articles on Wednesday.\n\nNow, let's add up the total number of articles:\n5 (Monday) + 7 (Tuesday) + 14 (Wednesday) = 26 articles\n\nSince it takes an average of 4 hours to write an article, we multiply the total number of articles by the time it takes to write one:\n26 articles * 4 hours/article = 104 hours\n\nAnswer: 104"
+    },
+    {
+      "id": "gsm8k-test-0046",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. Candice initially had 80 post-it notes in her purse.\n2. She purchased a package of Post-it notes, but we don't know how many were in the package yet.\n3. At work, she placed a single Post-it note on each of 220 different cups of coffee. This means she used 220 post-it notes.\n4. After using 220 post-it notes, she had some remaining. We know that she had 23 post-it notes remaining overall.\n5. Since she initially had 80 post-it notes and used 220, the total number of post-it notes she had after purchasing the package is 80 + x, where x is the number of post-it notes in the package.\n6. We know that after using 220 post-it notes, she had 23 remaining. So, the total number of post-it notes she had after purchasing the package is 80 + x = 220 + 23.\n7. Simplifying the equation, we get 80 + x = 243.\n8. Subtracting 80 from both sides, we get x = 163.\n\nAnswer: 163"
+    },
+    {
+      "id": "gsm8k-test-0047",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. John spent $200 on blue ties that cost $40 each. To find out how many blue ties he bought, we can divide the total amount spent by the cost of each tie:\n\n$200 / $40 = 5 blue ties\n\n2. Since John buys twice as many red ties as blue ties, he bought 2 * 5 = 10 red ties.\n\n3. The red ties cost 50% more than blue ties. To find the cost of each red tie, we can calculate 50% of the cost of a blue tie and add it to the cost of a blue tie:\n\n50% of $40 = $20\n$40 + $20 = $60 per red tie\n\n4. Now, we can calculate the total amount John spent on red ties:\n\n10 red ties * $60 per red tie = $600\n\n5. Finally, we can find the total amount John spent on ties by adding the amount he spent on blue ties and the amount he spent on red ties:\n\n$200 (blue ties) + $600 (red ties) = $800\n\nAnswer: $800"
+    },
+    {
+      "id": "gsm8k-test-0048",
+      "correct": true,
+      "output": "To solve this problem, we need to convert the length of the wire from feet to inches, since the pieces are cut into 6-inch lengths.\n\n1 foot = 12 inches\n4 feet = 4 * 12 = 48 inches\n\nNow, we need to divide the total length of the wire (48 inches) by the length of each piece (6 inches).\n\n48 inches / 6 inches = 8\n\nSo, Tracy obtained 8 pieces of wire.\n\nAnswer: 8"
+    },
+    {
+      "id": "gsm8k-test-0049",
+      "correct": true,
+      "output": "To find the total number of unoccupied units in the building, we need to follow these steps:\n\n1. First, we need to find the total number of units in the building. Since there are 15 floors and each floor contains 8 units, we can multiply the number of floors by the number of units per floor:\n\n15 floors * 8 units/floor = 120 units\n\n2. Next, we need to find the number of occupied units. Since 3/4 of the building is occupied, we can multiply the total number of units by 3/4:\n\n3/4 * 120 units = 90 units\n\n3. Finally, we can find the number of unoccupied units by subtracting the number of occupied units from the total number of units:\n\n120 units - 90 units = 30 units\n\nAnswer: 30"
+    },
+    {
+      "id": "gsm8k-test-0050",
+      "correct": true,
+      "output": "To find out how much Lloyd makes per week, we need to calculate the total number of eggs produced per week and then multiply it by the price per dozen.\n\nStep 1: Calculate the number of eggs produced per week\nNumber of eggs produced per day = 252\nNumber of days in a week = 7\nTotal number of eggs produced per week = 252 * 7 = 1764\n\nStep 2: Calculate the number of dozens produced per week\nSince there are 12 eggs in a dozen, we divide the total number of eggs by 12.\nTotal number of dozens produced per week = 1764 / 12 = 147\n\nStep 3: Calculate the total amount of money made per week\nPrice per dozen = $2\nTotal amount of money made per week = 147 * $2 = $294\n\nAnswer: $294"
+    },
+    {
+      "id": "gsm8k-test-0051",
+      "correct": true,
+      "output": "To solve this problem, we need to find the distance Tom traveled from 1 to 4 PM, and then use that distance to find the time it takes him to travel back.\n\nStep 1: Find the distance Tom traveled from 1 to 4 PM.\nSince Tom's ship can travel at 10 miles per hour, we can multiply the time he traveled (3 hours) by his speed to find the distance:\nDistance = Speed x Time\nDistance = 10 miles/hour x 3 hours\nDistance = 30 miles\n\nStep 2: Find the time it takes Tom to travel back.\nSince Tom's ship can travel at 6 miles per hour, we can divide the distance he traveled (30 miles) by his speed to find the time:\nTime = Distance / Speed\nTime = 30 miles / 6 miles/hour\nTime = 5 hours\n\nAnswer: 5"
+    },
+    {
+      "id": "gsm8k-test-0052",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the weight of the comic books and then find out how much weight is left to be removed. \n\nFirst, let's calculate the weight of the comic books:\nUriah has 30 comic books, and each comic book weighs 1/4 pound. \nWeight of comic books = Number of comic books * Weight of each comic book\nWeight of comic books = 30 * 1/4\nWeight of comic books = 30 * 0.25\nWeight of comic books = 7.5 pounds\n\nNow, let's subtract the weight of the comic books from the total weight to be removed:\nWeight to be removed = 15 pounds\nWeight removed so far = Weight of comic books\nWeight removed so far = 7.5 pounds\n\nWeight left to be removed = Weight to be removed - Weight removed so far\nWeight left to be removed = 15 - 7.5\nWeight left to be removed = 7.5 pounds\n\nSince each toy weighs 1/2 pound, we can calculate the number of toys to be removed as follows:\nNumber of toys to be removed = Weight left to be removed / Weight of each toy\nNumber of toys to be removed = 7.5 / 0.5\nNumber of toys to be removed = 15\n\nAnswer: 15"
+    },
+    {
+      "id": "gsm8k-test-0053",
+      "correct": true,
+      "output": "To find the revenue for each day, we need to calculate the total amount earned by the mechanic.\n\nOn Thursday, the mechanic repairs 6 truck tires and 4 car tires. The total revenue for truck tires is 6 * $60 = $360. The total revenue for car tires is 4 * $40 = $160. The total revenue for Thursday is $360 + $160 = $520.\n\nOn Friday, the mechanic repairs 12 car tires and doesn't repair any truck tires. The total revenue for car tires is 12 * $40 = $480. The total revenue for Friday is $480.\n\nTo find the day with higher revenue, we need to compare the total revenue for each day. Since $520 is greater than $480, Thursday has higher revenue.\n\nTo find the difference in revenue, we subtract the revenue of Friday from the revenue of Thursday: $520 - $480 = $40.\n\nAnswer: $40"
+    },
+    {
+      "id": "gsm8k-test-0054",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many kittens Patchy had. We know that Patchy had thrice the number of adopted kittens, and the number of adopted kittens is 7. \n\nSo, Patchy had 3 * 7 = 21 kittens.\n\nWe also know that Trixie had 12 kittens.\n\nNow, we need to find the total number of kittens. To do this, we add the number of kittens Patchy had to the number of kittens Trixie had.\n\nTotal number of kittens = 21 (Patchy's kittens) + 12 (Trixie's kittens) = 33\n\nThe Doubtfire family also has the 7 adopted kittens. \n\nSo, the total number of kittens the Doubtfire family now has = 33 (Patchy's and Trixie's kittens) + 7 (adopted kittens) = 40\n\nAnswer: 40"
+    },
+    {
+      "id": "gsm8k-test-0055",
+      "correct": true,
+      "output": "To find out how many bags Jean can fill, we need to follow these steps:\n\n1. First, we need to find out how many lollipops Jean has left after eating 2. \n   Remaining lollipops = Total lollipops - Lollipops eaten\n   Remaining lollipops = 30 - 2\n   Remaining lollipops = 28\n\n2. Now, we need to find out how many bags Jean can fill with 2 lollipops in each bag.\n   Number of bags = Remaining lollipops / Lollipops per bag\n   Number of bags = 28 / 2\n   Number of bags = 14\n\nAnswer: 14"
+    },
+    {
+      "id": "gsm8k-test-0056",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many times Peter can go to the movies with the money he has.\n\nStep 1: Calculate the total cost of a movie trip (ticket + popcorn)\nTotal cost = $7 (ticket) + $7 (popcorn) = $14\n\nStep 2: Divide the total money Peter has by the total cost of a movie trip\nNumber of trips = Total money / Total cost\n= $42 / $14\n= 3\n\nAnswer: 3"
+    },
+    {
+      "id": "gsm8k-test-0057",
+      "correct": true,
+      "output": "To find the maximum number of boxes that can be loaded onto the truck, we need to first calculate the remaining weight capacity of the bridge after considering the combined weight of the driver and the empty truck.\n\nWeight capacity of the bridge = 5000 pounds\nCombined weight of the driver and the empty truck = 3755 pounds\n\nRemaining weight capacity = Weight capacity of the bridge - Combined weight of the driver and the empty truck\nRemaining weight capacity = 5000 - 3755\nRemaining weight capacity = 1245 pounds\n\nSince each box weighs 15 pounds, we can calculate the maximum number of boxes that can be loaded onto the truck by dividing the remaining weight capacity by the weight of each box.\n\nMaximum number of boxes = Remaining weight capacity / Weight of each box\nMaximum number of boxes = 1245 / 15\nMaximum number of boxes = 83\n\nAnswer: 83"
+    },
+    {
+      "id": "gsm8k-test-0058",
+      "correct": false,
+      "output": "To find the final price of Stephen's groceries, we need to calculate the total amount after the extra fees.\n\nStep 1: Calculate the 25% fee on the final bill.\n25% of $40.00 = 0.25 * $40.00 = $10.00\n\nStep 2: Add the 25% fee to the final bill.\n$40.00 + $10.00 = $50.00\n\nStep 3: Add the delivery fees to the total.\n$50.00 + $3.00 = $53.00\n\nStep 4: Add the tip to the total.\n$53.00 + $4.00 = $57.00\n\nAnswer: $57.00"
+    },
+    {
+      "id": "gsm8k-test-0059",
+      "correct": true,
+      "output": "To find the total number of raspberries, we need to calculate the number of raspberries in the clusters and add the individual raspberries.\n\nStep 1: Calculate the number of raspberries in the clusters.\nThere are 6 clusters with 20 raspberries each.\nNumber of raspberries in clusters = 6 * 20 = 120\n\nStep 2: Add the individual raspberries to the total.\nThere are 67 individual raspberries.\n\nStep 3: Calculate the total number of raspberries.\nTotal number of raspberries = Number of raspberries in clusters + Individual raspberries\n= 120 + 67\n= 187\n\nAnswer: 187"
+    },
+    {
+      "id": "gsm8k-test-0060",
+      "correct": true,
+      "output": "To find the number of good oranges, we need to first find the total number of oranges that are not good. \n\n1. Bad oranges: 1\n2. Unripe oranges: 20% of 25 = 0.2 * 25 = 5\n3. Sour oranges: 2\n\nTotal oranges that are not good: 1 + 5 + 2 = 8\n\nNow, we subtract the total number of oranges that are not good from the total number of oranges to find the number of good oranges.\n\nTotal oranges: 25\nOranges that are not good: 8\nGood oranges: 25 - 8 = 17\n\nAnswer: 17"
+    },
+    {
+      "id": "gsm8k-test-0061",
+      "correct": true,
+      "output": "To find the total amount Janet paid, we need to calculate the cost of the material, the construction, and the insurance.\n\n1. Cost of material: $500\n2. Cost of construction: $800\n3. Total cost so far: $500 + $800 = $1300\n4. Insurance cost: 10% of $1300 = 0.10 * $1300 = $130\n5. Total amount paid: $1300 + $130 = $1430\n\nAnswer: $1430"
+    },
+    {
+      "id": "gsm8k-test-0062",
+      "correct": false,
+      "output": "To solve this problem, we need to calculate the total value of the pension and then find 5% of that value.\n\n1. First, let's calculate the total value of the pension for the first 20 years. Since she gets an annual pension of $50,000 for 20 years, the total value is:\n\nTotal value = Annual pension * Number of years\nTotal value = $50,000 * 20\nTotal value = $1,000,000\n\n2. Starting after 20 years, she becomes entitled to 5% of the value of the pension per year. This means that the annual pension will increase by 5% of the total value each year.\n\n3. To calculate the annual pension after 20 years, we need to find 5% of the total value and add it to the original annual pension.\n\n5% of the total value = 0.05 * $1,000,000\n5% of the total value = $50,000\n\nAnnual pension after 20 years = Original annual pension + 5% of the total value\nAnnual pension after 20 years = $50,000 + $50,000\nAnnual pension after 20 years = $100,000\n\n4. Now, let's calculate the annual pension for the next 10 years (years 21-30). We need to find 5% of the total value each year and add it to the annual pension after 20 years.\n\nYear 21: \n5% of the total value = 0.05 * $1,000,000\n5% of the total value = $50,000\nAnnual pension = $100,000 + $50,000\nAnnual pension = $150,000\n\nYear 22: \n5% of the total value = 0.05 * $1,000,000\n5% of the total value = $50,000\nAnnual pension = $150,000 + $50,000\nAnnual pension = $200,000\n\nYear 23: \n5% of the total value = 0.05 * $1,000,000\n5% of the total value = $50,000\nAnnual pension = $200,000 + $50,000\nAnnual pension = $250,000\n\nYear 24: \n5% of the total value = 0.05 * $1,000,000\n5% of the total value = $50,000\nAnnual pension = $250,"
+    },
+    {
+      "id": "gsm8k-test-0063",
+      "correct": true,
+      "output": "To calculate the total amount Aleena paid for the streaming service, we need to calculate the amount she paid for the first half of the year and the amount she paid for the second half of the year.\n\nFirst, let's calculate the amount she paid for the first half of the year. Since there are 6 months in the first half of the year, we multiply the monthly charge by 6:\n\n$140/month * 6 months = $840\n\nNext, let's calculate the amount she paid for the second half of the year. The streaming company charged her 10% less money on the other half of the year, so we need to calculate 10% of the monthly charge and subtract it from the monthly charge:\n\n10% of $140 = 0.10 * $140 = $14\nMonthly charge for the second half of the year = $140 - $14 = $126\n\nNow, we multiply the monthly charge for the second half of the year by 6:\n\n$126/month * 6 months = $756\n\nNow, we add the amount she paid for the first half of the year and the amount she paid for the second half of the year to get the total amount she paid for the year:\n\n$840 + $756 = $1596\n\nAnswer: $1596"
+    },
+    {
+      "id": "gsm8k-test-0064",
+      "correct": false,
+      "output": "To find out how many miles Sophia can drive on a single tank of gas, we need to calculate the total distance she can travel with a full tank. \n\nStep 1: Calculate the total capacity of the tank.\nThe owner's manual says that Sophia's tank holds 12 gallons of gas.\n\nStep 2: Calculate the total distance she can travel with a full tank.\nSince Sophia has already traveled 100 miles since last filling her tank, we need to subtract this distance from the total capacity of the tank to find out how many miles she can still drive with a full tank. However, we first need to find out how many miles she can drive with a full tank before she traveled 100 miles.\n\nStep 3: Calculate the distance she can drive with a full tank before she traveled 100 miles.\nWe know that she needed 4 gallons of gas to fill up her tank after traveling 100 miles. Since her tank holds 12 gallons, we can calculate the distance she can drive with a full tank by first finding out how many gallons she used to travel 100 miles.\n\nStep 4: Calculate the gallons used to travel 100 miles.\nWe know that she used 4 gallons to fill up her tank after traveling 100 miles. Since her tank holds 12 gallons, we can calculate the gallons used to travel 100 miles by subtracting the gallons used to fill up the tank from the total capacity of the tank.\n\nGallons used to travel 100 miles = Total capacity of the tank - Gallons used to fill up the tank\nGallons used to travel 100 miles = 12 gallons - 4 gallons\nGallons used to travel 100 miles = 8 gallons\n\nStep 5: Calculate the distance she can drive with a full tank.\nNow that we know she used 8 gallons to travel 100 miles, we can calculate the distance she can drive with a full tank by dividing the gallons used to travel 100 miles by the miles she traveled and then multiplying by the total capacity of the tank.\n\nDistance she can drive with a full tank = (Gallons used to travel 100 miles / Miles traveled) * Total capacity of the tank\nDistance she can drive with a full tank = (8 gallons / 100 miles) * 12 gallons\nDistance she can drive with a full tank = 0.08 * 12 gallons\nDistance she can drive with a full tank = 0.96 gallons * 12 gallons\nDistance she can drive with a full"
+    },
+    {
+      "id": "gsm8k-test-0065",
+      "correct": true,
+      "output": "To solve this problem, we need to break it down into steps.\n\nStep 1: Calculate the time spent on TV and reading in one day.\nJim spends 2 hours watching TV. He then reads for half as long, which is 2 / 2 = 1 hour.\nSo, in one day, he spends 2 + 1 = 3 hours on TV and reading.\n\nStep 2: Calculate the total time spent on TV and reading in one week.\nSince Jim does this 3 times a week, we multiply the time spent in one day by 3.\n3 hours/day * 3 days/week = 9 hours/week\n\nStep 3: Calculate the total time spent on TV and reading in 4 weeks.\nWe multiply the time spent in one week by 4.\n9 hours/week * 4 weeks = 36 hours\n\nAnswer: 36"
+    },
+    {
+      "id": "gsm8k-test-0066",
+      "correct": true,
+      "output": "To find the total number of people sent by the schools, we need to calculate the number of teams and coaches separately and then add them together.\n\n1. Each school has sent 2 teams (girls' and boys'), and there are 4 schools. So, the total number of teams is 2 teams/school * 4 schools = 8 teams.\n\n2. Each team has 5 players. So, the total number of players is 8 teams * 5 players/team = 40 players.\n\n3. Each team also has a coach. So, the total number of coaches is 8 teams * 1 coach/team = 8 coaches.\n\n4. To find the total number of people sent by the schools, we add the total number of players and coaches together: 40 players + 8 coaches = 48 people.\n\nAnswer: 48"
+    },
+    {
+      "id": "gsm8k-test-0067",
+      "correct": true,
+      "output": "To find the total number of gems, we need to calculate the number of each type of gemstone and then add them together.\n\n1. Number of diamonds: 175\n2. Number of rubies: There are 35 fewer rubies than diamonds, so the number of rubies is 175 - 35 = 140.\n3. Number of emeralds: There are twice the number of emeralds than rubies, so the number of emeralds is 2 * 140 = 280.\n\nNow, let's add the number of each type of gemstone together:\n\n175 (diamonds) + 140 (rubies) + 280 (emeralds) = 595\n\nAnswer: 595"
+    },
+    {
+      "id": "gsm8k-test-0068",
+      "correct": true,
+      "output": "To solve this problem, we need to find the total number of students and then divide that by 5 to find the number of teachers.\n\nStep 1: Find the number of boys.\nSince there are twice as many boys as girls, and there are 60 girls, we multiply the number of girls by 2 to find the number of boys.\nNumber of boys = 2 * 60 = 120\n\nStep 2: Find the total number of students.\nTo find the total number of students, we add the number of boys and girls.\nTotal number of students = Number of boys + Number of girls\nTotal number of students = 120 + 60\nTotal number of students = 180\n\nStep 3: Find the number of teachers.\nSince there are 5 students to every teacher, we divide the total number of students by 5 to find the number of teachers.\nNumber of teachers = Total number of students / 5\nNumber of teachers = 180 / 5\nNumber of teachers = 36\n\nAnswer: 36"
+    },
+    {
+      "id": "gsm8k-test-0069",
+      "correct": true,
+      "output": "To find out how much money Bailey started with, we need to calculate the total amount of money she received from her weekly allowance and subtract it from the total amount of money she has at the end of 8 weeks.\n\nStep 1: Calculate the total amount of money Bailey received from her weekly allowance.\nWeekly allowance: $5\nNumber of weeks: 8\nTotal allowance: $5 * 8 = $40\n\nStep 2: Calculate the amount of money Bailey started with.\nTotal money at the end of 8 weeks: $100\nTotal allowance: $40\nAmount of money Bailey started with: $100 - $40 = $60\n\nAnswer: $60"
+    },
+    {
+      "id": "gsm8k-test-0070",
+      "correct": false,
+      "output": "To find out how much money Judy makes in 1 week, we need to calculate the total number of classes she teaches and multiply it by the number of students in each class, and then multiply that by the charge per student.\n\n1. Calculate the total number of classes on weekdays:\n   Judy teaches 5 classes per day on weekdays. There are 5 weekdays (Monday to Friday), so the total number of classes on weekdays is:\n   5 classes/day * 5 days/week = 25 classes/week\n\n2. Calculate the total number of classes on Saturday:\n   Judy teaches 8 classes on Saturday.\n\n3. Calculate the total number of classes in a week:\n   Total classes = classes on weekdays + classes on Saturday\n   Total classes = 25 classes/week + 8 classes/week = 33 classes/week\n\n4. Calculate the total number of students in a week:\n   Each class has 15 students, so the total number of students is:\n   Total students = total classes * 15 students/class\n   Total students = 33 classes/week * 15 students/class = 495 students/week\n\n5. Calculate the total amount of money Judy makes in a week:\n   Judy charges $15.00 per student, so the total amount of money she makes is:\n   Total money = total students * $15.00/student\n   Total money = 495 students/week * $15.00/student = $7425.00/week\n\nAnswer: $7425.00"
+    },
+    {
+      "id": "gsm8k-test-0071",
+      "correct": true,
+      "output": "To find the total number of instructions, we need to follow these steps:\n\n1. Find the number of instructions in the first recipe: 20 instructions\n2. Find the number of instructions in the second recipe: Since the second recipe has twice as many instructions as the first one, we multiply the number of instructions in the first recipe by 2.\n   20 * 2 = 40 instructions\n3. Find the total number of instructions: Add the number of instructions in both recipes.\n   20 + 40 = 60 instructions\n\nAnswer: 60"
+    },
+    {
+      "id": "gsm8k-test-0072",
+      "correct": true,
+      "output": "To find the total amount of money Tommy raises, we need to calculate the total amount from brownies and cheesecakes separately and then add them together.\n\nFirst, let's calculate the total amount from brownies:\nNumber of brownies sold = 43\nPrice per brownie slice = $3\nTotal amount from brownies = Number of brownies sold * Price per brownie slice\n= 43 * $3\n= $129\n\nNext, let's calculate the total amount from cheesecakes:\nNumber of cheesecake slices sold = 23\nPrice per cheesecake slice = $4\nTotal amount from cheesecakes = Number of cheesecake slices sold * Price per cheesecake slice\n= 23 * $4\n= $92\n\nNow, let's add the total amounts from brownies and cheesecakes to find the total amount Tommy raises:\nTotal amount raised = Total amount from brownies + Total amount from cheesecakes\n= $129 + $92\n= $221\n\nAnswer: $221"
+    },
+    {
+      "id": "gsm8k-test-0073",
+      "correct": true,
+      "output": "To find out how much Shiela will pay each month for 3 months, we need to calculate the total cost of the cell phones and then divide it by 3.\n\nStep 1: Calculate the total cost of the cell phones\nTotal cost = Number of cell phones * Price per cell phone\nTotal cost = 5 * $150\nTotal cost = $750\n\nStep 2: Calculate the interest for each unit\nInterest per unit = 2% of $150\nInterest per unit = 0.02 * $150\nInterest per unit = $3\n\nStep 3: Calculate the total interest for all units\nTotal interest = Number of cell phones * Interest per unit\nTotal interest = 5 * $3\nTotal interest = $15\n\nStep 4: Calculate the total amount Shiela needs to pay\nTotal amount = Total cost + Total interest\nTotal amount = $750 + $15\nTotal amount = $765\n\nStep 5: Calculate the monthly payment\nMonthly payment = Total amount / Number of months\nMonthly payment = $765 / 3\nMonthly payment = $255\n\nAnswer: $255"
+    },
+    {
+      "id": "gsm8k-test-0074",
+      "correct": false,
+      "output": "To find the total amount of money Artie will make, we need to calculate the total revenue from each type of flower and then add them together.\n\n1. Marigolds: \n   Price per pot: $2.74\n   Number of pots sold: 12\n   Total revenue from marigolds: 12 * $2.74 = $32.88\n\n   Since Artie rounds prices to the nearest dollar, the new price per pot for marigolds is $3.\n\n   Total revenue from marigolds after rounding: 12 * $3 = $36\n\n2. Petunias:\n   Price per pot: $1.87\n   Number of pots sold: 9\n   Total revenue from petunias: 9 * $1.87 = $16.73\n\n   Since Artie rounds prices to the nearest dollar, the new price per pot for petunias is $2.\n\n   Total revenue from petunias after rounding: 9 * $2 = $18\n\n3. Begonias:\n   Price per pot: $2.12\n   Number of pots sold: 17\n   Total revenue from begonias: 17 * $2.12 = $35.84\n\n   Since Artie rounds prices to the nearest dollar, the new price per pot for begonias is $3.\n\n   Total revenue from begonias after rounding: 17 * $3 = $51\n\nNow, let's add the total revenue from each type of flower:\nTotal revenue = Total revenue from marigolds + Total revenue from petunias + Total revenue from begonias\nTotal revenue = $36 + $18 + $51\nTotal revenue = $105\n\nAnswer: $105"
+    },
+    {
+      "id": "gsm8k-test-0075",
+      "correct": false,
+      "output": "To find the average square footage of a level, we need to find the total square footage of all levels and divide it by the number of levels.\n\nGiven that the top level has a square footage of 16, and each level has half the square footage as the level below it, we can calculate the square footage of each level as follows:\n\nLevel 1 (top): 16\nLevel 2: 16 / 2 = 8\nLevel 3: 8 / 2 = 4\nLevel 4 (bottom): 4 / 2 = 2\n\nNow, we add up the square footage of all levels:\n16 + 8 + 4 + 2 = 30\n\nThere are 4 levels, so we divide the total square footage by 4 to find the average:\n30 / 4 = 7.5\n\nAnswer: 7.5"
+    },
+    {
+      "id": "gsm8k-test-0076",
+      "correct": true,
+      "output": "To find out how many bags of dog food Cecilia will use in the first year, we need to calculate the total amount of dog food she will use in the first year and then divide it by the amount of dog food in one bag.\n\nFirst, let's calculate the amount of dog food Cecilia will use in the first 180 days:\n1 cup/day * 180 days = 180 cups\n\nAfter the first 180 days, the puppy will be fed 2 cups of dog food every day for the rest of its life. Since we don't know how long the puppy will live, we'll assume it will live for 365 days (1 year). So, the amount of dog food the puppy will eat in the remaining 185 days (365 - 180) is:\n2 cups/day * 185 days = 370 cups\n\nNow, let's add the amount of dog food the puppy will eat in the first 180 days and the remaining 185 days:\n180 cups + 370 cups = 550 cups\n\nSince one bag of dog food contains 110 cups, we'll divide the total amount of dog food by 110 to find out how many bags Cecilia will use:\n550 cups / 110 cups/bag = 5 bags\n\nAnswer: 5"
+    },
+    {
+      "id": "gsm8k-test-0077",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how much laundry Raymond and David do.\n\nWe know that Sarah does 400 pounds of laundry. Since Sarah does 4 times as much laundry as David, we can divide 400 by 4 to find out how much laundry David does.\n\n400 / 4 = 100 pounds\n\nNow that we know David does 100 pounds of laundry, we can find out how much laundry Raymond does. Since Raymond does half as much laundry as Sarah, we can divide 400 by 2 to find out how much laundry Raymond does.\n\n400 / 2 = 200 pounds\n\nNow that we know how much laundry Raymond and David do, we can find the difference between them.\n\nDifference = Raymond's laundry - David's laundry\n= 200 - 100\n= 100 pounds\n\nAnswer: 100"
+    },
+    {
+      "id": "gsm8k-test-0078",
+      "correct": true,
+      "output": "To solve this problem, we need to find out which package deal is cheaper and then calculate the cost of buying 18 flowers with that deal.\n\nFirst, let's calculate the cost of buying 18 flowers in packages of 3 for $2.50 each.\n\nNumber of packages of 3 flowers = 18 / 3 = 6\nCost = 6 * $2.50 = $15\n\nNow, let's calculate the cost of buying 18 flowers in packages of 2 for $1 each.\n\nNumber of packages of 2 flowers = 18 / 2 = 9\nCost = 9 * $1 = $9\n\nSince $9 is less than $15, buying 18 flowers in packages of 2 for $1 each is the better deal.\n\nTo find out how much money Vincent saves, we subtract the cost of the better deal from the cost of the worse deal.\n\nMoney saved = $15 - $9 = $6\n\nAnswer: $6"
+    },
+    {
+      "id": "gsm8k-test-0079",
+      "correct": true,
+      "output": "To find the cost of the grooming after the discount, we need to follow these steps:\n\n1. Calculate the discount amount: \n   Discount percentage = 30%\n   Original cost = $100\n   Discount amount = 30% of $100 = 0.3 * $100 = $30\n\n2. Subtract the discount amount from the original cost:\n   Cost after discount = Original cost - Discount amount\n   Cost after discount = $100 - $30\n   Cost after discount = $70\n\nAnswer: $70"
+    },
+    {
+      "id": "gsm8k-test-0080",
+      "correct": true,
+      "output": "To solve the problem, we need to follow the steps:\n\n1. Calculate the total amount of water the two girls got: \n   Since each girl got 1/6 of the 24 liters, we can calculate the total amount of water they got by adding their portions:\n   1/6 + 1/6 = 2/6 = 1/3\n\n   So, the two girls got 1/3 of the 24 liters, which is:\n   1/3 * 24 = 8 liters\n\n2. Calculate the total amount of water the two girls and the boy got:\n   The two girls got 8 liters, and the boy got 6 liters, so the total amount of water they got is:\n   8 + 6 = 14 liters\n\n3. Calculate the amount of water left:\n   The total amount of water was 24 liters, and the two girls and the boy got 14 liters, so the amount of water left is:\n   24 - 14 = 10 liters\n\nAnswer: 10"
+    },
+    {
+      "id": "gsm8k-test-0081",
+      "correct": true,
+      "output": "To solve the problem, let's break it down step by step:\n\n1. Charlie initially had 10 stickers.\n2. He bought 21 stickers from the store, so now he has 10 + 21 = 31 stickers.\n3. He got 23 stickers for his birthday, so now he has 31 + 23 = 54 stickers.\n4. He gave 9 stickers to his sister, so now he has 54 - 9 = 45 stickers.\n5. He used 28 stickers to decorate a greeting card, so now he has 45 - 28 = 17 stickers.\n\nAnswer: 17"
+    },
+    {
+      "id": "gsm8k-test-0082",
+      "correct": true,
+      "output": "To find the combined weights of Grace and Alex, we need to calculate Alex's weight first.\n\nStep 1: Calculate Alex's weight\nAlex weighs 2 pounds less than 4 times what Grace weighs.\nGrace weighs 125 pounds.\nSo, 4 times what Grace weighs is 4 * 125 = 500 pounds.\nAlex weighs 2 pounds less than this, so Alex weighs 500 - 2 = 498 pounds.\n\nStep 2: Calculate their combined weights\nNow, we need to add Grace's weight and Alex's weight to find their combined weight.\nGrace weighs 125 pounds.\nAlex weighs 498 pounds.\nTheir combined weight is 125 + 498 = 623 pounds.\n\nAnswer: 623"
+    },
+    {
+      "id": "gsm8k-test-0083",
+      "correct": true,
+      "output": "To find the total number of thorns, we need to follow these steps:\n\n1. First, we find the total number of roses by multiplying the number of rose bushes by the number of roses per bush:\n   3 rose bushes * 25 roses per bush = 3 * 25 = 75 roses\n\n2. Next, we multiply the total number of roses by the number of thorns per rose to find the total number of thorns:\n   75 roses * 8 thorns per rose = 75 * 8 = 600 thorns\n\nAnswer: 600"
+    },
+    {
+      "id": "gsm8k-test-0084",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. Let's assume the number of games the team lost is x.\n2. Since the team won 8 more games than they lost, the number of games they won is x + 8.\n3. We know that the total number of games played is 22, which is the sum of the games won and lost. So, we can set up the equation:\n   x + (x + 8) = 22\n4. Combine like terms:\n   2x + 8 = 22\n5. Subtract 8 from both sides:\n   2x = 14\n6. Divide both sides by 2:\n   x = 7\n7. Since the team won 8 more games than they lost, the number of games they won is x + 8 = 7 + 8 = 15\n\nAnswer: 15"
+    },
+    {
+      "id": "gsm8k-test-0085",
+      "correct": true,
+      "output": "To find the total number of quilt blocks, we need to calculate the number of years Gene has been vacationing and multiply it by the number of blocks per year.\n\nStep 1: Calculate the number of years Gene has been vacationing.\nGene started vacationing at 23 years old and is now 34 years old. To find the number of years, subtract the starting age from the current age.\nNumber of years = Current age - Starting age\nNumber of years = 34 - 23\nNumber of years = 11\n\nStep 2: Calculate the number of blocks per year.\nGene goes on four vacations a year.\n\nStep 3: Calculate the total number of blocks.\nTotal number of blocks = Number of years * Number of blocks per year\nTotal number of blocks = 11 * 4\nTotal number of blocks = 44\n\nAnswer: 44"
+    },
+    {
+      "id": "gsm8k-test-0086",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. The first time the alarm went off, it rang 4 times.\n2. The second time it went off, it rang for 3 times as long as the first time. Since the first time it rang 4 times, the second time it rang 3 * 4 = 12 times.\n3. The third time it went off, it rang for half as long as the second time. Since the second time it rang 12 times, the third time it rang 12 / 2 = 6 times.\n\nNow, let's add up the total number of times the alarm rang:\n4 (first time) + 12 (second time) + 6 (third time) = 22\n\nAnswer: 22"
+    },
+    {
+      "id": "gsm8k-test-0087",
+      "correct": false,
+      "output": "To find Sylvie's annual salary after three more years of service, we need to calculate her salary after each year.\n\nYear 1 (last December): \nSylvie's initial salary is $600. \n10% of $600 is $60. \nHer salary after 1 year is $600 + $60 = $660.\n\nYear 2:\n10% of $660 is $66.\nHer salary after 2 years is $660 + $66 = $726.\n\nYear 3:\n10% of $726 is $72.60.\nHer salary after 3 years is $726 + $72.60 = $798.60.\n\nYear 4:\n10% of $798.60 is $79.86.\nHer salary after 4 years is $798.60 + $79.86 = $878.46.\n\nYear 5:\n10% of $878.46 is $87.84.\nHer salary after 5 years is $878.46 + $87.84 = $966.30.\n\nYear 6:\n10% of $966.30 is $96.63.\nHer salary after 6 years is $966.30 + $96.63 = $1062.93.\n\nYear 7:\n10% of $1062.93 is $106.29.\nHer salary after 7 years is $1062.93 + $106.29 = $1169.22.\n\nAnswer: $1169.22"
+    },
+    {
+      "id": "gsm8k-test-0088",
+      "correct": true,
+      "output": "To solve this problem, let's start by using variables to represent the number of copies sold by each person. Let H be the number of copies sold by Harald and M be the number of copies sold by Marilyn.\n\nWe know that Marilyn's first record sold 10 times as many copies as Harald's, so we can write an equation:\n\nM = 10H\n\nWe also know that they sold 88,000 copies combined, so we can write another equation:\n\nM + H = 88,000\n\nNow we can substitute the first equation into the second equation:\n\n10H + H = 88,000\n\nCombine like terms:\n\n11H = 88,000\n\nNow, divide both sides by 11:\n\nH = 88,000 / 11\nH = 8,000\n\nSo Harald sold 8,000 copies.\n\nAnswer: 8000"
+    },
+    {
+      "id": "gsm8k-test-0089",
+      "correct": false,
+      "output": "To find out how many gift bags Christina needs, we first need to calculate the number of guests who will attend the party. Since 1/4 of attendees don't show up, we can calculate this as follows:\n\nNumber of guests who will attend = Total number of invited guests - (1/4 * Total number of invited guests)\n= 16 - (1/4 * 16)\n= 16 - 4\n= 12\n\nNow, we know that Christina needs 0.75 gift bags per invited guest. So, we can calculate the total number of gift bags needed as follows:\n\nTotal number of gift bags needed = Number of guests who will attend * Number of gift bags per guest\n= 12 * 0.75\n= 9\n\nSince each gift bag costs $2, we can calculate the total amount Christina will spend as follows:\n\nTotal amount spent = Total number of gift bags needed * Cost per gift bag\n= 9 * 2\n= 18\n\nAnswer: 18"
+    },
+    {
+      "id": "gsm8k-test-0090",
+      "correct": true,
+      "output": "To find out how many pounds of potato salad Ted needs to bring, we need to calculate the amount of potato salad each adult and child will eat, and then add those amounts together.\n\nFirst, we know that an adult dinosaur will eat 10 lbs of potato salad. Since there are 20 adults at the picnic, we multiply the amount of potato salad an adult eats by the number of adults:\n\n20 adults * 10 lbs/adult = 200 lbs\n\nNext, we know that a child will eat half as much as an adult. Since an adult eats 10 lbs, a child will eat 10 / 2 = 5 lbs.\n\nSince there are 5 children at the picnic, we multiply the amount of potato salad a child eats by the number of children:\n\n5 children * 5 lbs/child = 25 lbs\n\nNow, we add the amount of potato salad needed for the adults and children together to find the total amount of potato salad Ted needs to bring:\n\n200 lbs (for adults) + 25 lbs (for children) = 225 lbs\n\nAnswer: 225"
+    },
+    {
+      "id": "gsm8k-test-0091",
+      "correct": true,
+      "output": "To solve this problem, we need to start with the information about Cindy's pets and work our way up.\n\n1. Cindy has 4 pets.\n\n2. Marcia has 2 more pets than Cindy. So, Marcia has 4 + 2 = 6 pets.\n\n3. Jan has three times the number of pets as Marcia. So, Jan has 3 * 6 = 18 pets.\n\n4. To find the total number of pets, we need to add up the number of pets each person has: Cindy (4) + Marcia (6) + Jan (18) = 4 + 6 + 18 = 28.\n\nAnswer: 28"
+    },
+    {
+      "id": "gsm8k-test-0092",
+      "correct": true,
+      "output": "To solve this problem, we need to find the age of Jackson. We are given the following information:\n\n1. James is 10 years old.\n2. James is 1 year younger than Corey, so Corey is 10 + 1 = 11 years old.\n3. Amy is 2 years younger than Corey, so Amy is 11 - 2 = 9 years old.\n4. Amy is 5 years older than Jackson, so Jackson is 9 - 5 = 4 years old.\n\nAnswer: 4"
+    },
+    {
+      "id": "gsm8k-test-0093",
+      "correct": false,
+      "output": "To solve this problem, we need to find out how fast Gerald used to run the 400-meter hurdles and then calculate his speed after improving his diet.\n\nLet's denote Gerald's original speed as G. Since Lee used to be able to run the 400-meter hurdles two seconds faster than Gerald, Lee's speed can be represented as G - 2.\n\nWe know that Lee runs the 400-meter hurdles in 38 seconds. Since speed is inversely proportional to time, we can set up the following equation:\n\n(G - 2) / G = 38 / x\n\nwhere x is the time it takes Gerald to run the 400-meter hurdles.\n\nWe also know that Gerald's diet improved his speed by 10%. This means his new speed is 110% of his original speed, or 1.1G.\n\nWe can set up another equation using the same information:\n\n1.1G / G = 38 / x\n\nSince 1.1G / G = 1.1, we can simplify the equation to:\n\n1.1 = 38 / x\n\nTo solve for x, we can multiply both sides by x:\n\n1.1x = 38\n\nNow, divide both sides by 1.1:\n\nx = 38 / 1.1\nx = 34.55\n\nSo, Gerald can run the 400-meter hurdles in approximately 34.55 seconds.\n\nAnswer: 34.55"
+    },
+    {
+      "id": "gsm8k-test-0094",
+      "correct": true,
+      "output": "To solve this problem, we need to follow the steps:\n\n1. We know that the number of rabbits is twelve less than the combined number of pet dogs and cats. Let's denote the number of dogs as D, the number of cats as C, and the number of rabbits as R. We are given that D = 60.\n\n2. We are also given that there are two cats for every dog. This means that C = 2D.\n\n3. Now, we can substitute the value of D into the equation C = 2D to find the number of cats: C = 2 * 60 = 120.\n\n4. We know that the number of rabbits is twelve less than the combined number of dogs and cats. So, we can write the equation R = D + C - 12.\n\n5. Now, we can substitute the values of D and C into the equation R = D + C - 12 to find the number of rabbits: R = 60 + 120 - 12 = 168.\n\n6. Finally, we can find the total number of pets in the neighborhood by adding the number of dogs, cats, and rabbits: Total pets = D + C + R = 60 + 120 + 168 = 348.\n\nAnswer: 348"
+    },
+    {
+      "id": "gsm8k-test-0095",
+      "correct": true,
+      "output": "To find the number of girls not in the girl scout, we need to follow these steps:\n\n1. First, let's find the total number of boys and girls in the class. Since 2/5 of the students are boys, we can set up an equation:\n\nTotal students = 200\nBoys = 2/5 * 200\nBoys = 80\n\nSince the remaining students are girls, we can find the number of girls:\n\nGirls = Total students - Boys\nGirls = 200 - 80\nGirls = 120\n\n2. Now, let's find the number of girls who are in the girl scout. Since 2/3 of the girls are in the girl scout, we can set up an equation:\n\nGirls in girl scout = 2/3 * 120\nGirls in girl scout = 80\n\n3. Finally, let's find the number of girls who are not in the girl scout:\n\nGirls not in girl scout = Total girls - Girls in girl scout\nGirls not in girl scout = 120 - 80\nGirls not in girl scout = 40\n\nAnswer: 40"
+    },
+    {
+      "id": "gsm8k-test-0096",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many hours James slept and then subtract that from the hours Harry slept.\n\nStep 1: Find out how many hours James slept.\nJames slept 2/3 of what Harry slept. Since Harry slept 9 hours, we multiply 9 by 2/3 to find out how many hours James slept.\n\n2/3 * 9 = (2 * 9) / 3\n= 18 / 3\n= 6\n\nSo, James slept 6 hours.\n\nStep 2: Find out how many more hours Harry slept than James.\nTo do this, we subtract the hours James slept from the hours Harry slept.\n\n9 (Harry's hours) - 6 (James' hours) = 3\n\nAnswer: 3"
+    },
+    {
+      "id": "gsm8k-test-0097",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many tomatoes Freda used. We know that each 16 ounce can of tomatoes contains 3 tomatoes. \n\nFirst, we need to find out how many cans of tomatoes Freda used. We know that the sauce made 32 ounces and that the tomatoes lose half their volume when cooked. So, the original volume of the tomatoes must have been 32 * 2 = 64 ounces.\n\nNow, we can divide the original volume of the tomatoes (64 ounces) by the volume of each can (16 ounces) to find out how many cans Freda used:\n\n64 / 16 = 4\n\nSo, Freda used 4 cans of tomatoes.\n\nNow, we can multiply the number of cans by the number of tomatoes in each can to find out how many tomatoes Freda used:\n\n4 * 3 = 12\n\nAnswer: 12"
+    },
+    {
+      "id": "gsm8k-test-0098",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. We know that there were originally 30 cars on the motorway.\n\n2. 5 cars took an exit, so the number of cars that drove through the traffic jam is 30 - 5 = 25.\n\n3. The total number of cars that drove through the traffic jam is the sum of the cars that drove through in the first 15 minutes and the cars that drove through in the remaining 15 minutes. Let's call the number of cars that drove through in the first 15 minutes 'x'. Then, the number of cars that drove through in the remaining 15 minutes is 20.\n\n4. We can set up an equation to represent the situation: x + 20 = 25.\n\n5. To solve for x, we subtract 20 from both sides of the equation: x = 25 - 20.\n\n6. x = 5.\n\nAnswer: 5"
+    },
+    {
+      "id": "gsm8k-test-0099",
+      "correct": false,
+      "output": "To solve this problem, we need to follow these steps:\n\n1. Calculate the total number of potted plants Mary already has: \n   She has 2 potted plants on each of the 40 window ledges, so the total number of potted plants is 2 * 40 = 80.\n\n2. Calculate the number of potted plants Mary will give away:\n   She will give 1 potted plant from each ledge to friends and family, and there are 40 ledges, so she will give away 40 potted plants.\n\n3. Calculate the number of potted plants Mary will remain with:\n   To find the number of potted plants Mary will remain with, we subtract the number of potted plants she will give away from the total number of potted plants she already has: \n   80 - 40 = 40.\n\nAnswer: 40"
+    },
+    {
+      "id": "gsm8k-test-0100",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many times each friend pressed the doorbell and then add them up.\n\nThe fourth friend pressed the doorbell 60 times.\n\nThe third friend pressed the doorbell 10 times more than the fourth friend, so the third friend pressed the doorbell 60 + 10 = 70 times.\n\nThe second friend pressed the doorbell 1/4 times more than the first friend. Since the first friend pressed the doorbell 20 times, the second friend pressed the doorbell 20 + (1/4 * 20) = 20 + 5 = 25 times.\n\nThe first friend pressed the doorbell 20 times.\n\nNow, let's add up the total number of doorbell rings:\n60 (fourth friend) + 70 (third friend) + 25 (second friend) + 20 (first friend) = 175\n\nAnswer: 175"
+    },
+    {
+      "id": "gsm8k-test-0101",
+      "correct": true,
+      "output": "To find out how many pages Solo needs to read on average in one day, we need to first calculate the total number of pages he needs to read.\n\nTotal pages from Science textbook = 4 pages\nTotal pages from Social Studies textbook = 20 pages\nTotal pages from History textbook = 7 pages\nTotal pages from Geography textbook = 8 pages\n\nTotal pages = 4 + 20 + 7 + 8 = 39 pages\n\nWe know that Solo read 15 pages on Monday. Since he has 4 more days to complete all his reading, we can calculate the total number of pages he needs to read in 4 days.\n\nTotal pages left to read = Total pages - Pages read on Monday\nTotal pages left to read = 39 - 15\nTotal pages left to read = 24 pages\n\nNow, we can calculate the average number of pages Solo needs to read in one day.\n\nAverage pages per day = Total pages left to read / Number of days\nAverage pages per day = 24 / 4\nAverage pages per day = 6 pages\n\nAnswer: 6"
+    },
+    {
+      "id": "gsm8k-test-0102",
+      "correct": false,
+      "output": "To find out how many glasses of water John drinks in a week, we need to calculate the number of glasses he drinks on weekdays and weekends separately, then add them together.\n\n1. Calculate the number of glasses John drinks on weekdays:\n   - He drinks a glass of water with breakfast, lunch, and dinner, which is 3 glasses per meal.\n   - He does this 3 times a day (breakfast, lunch, and dinner).\n   - There are 5 weekdays (Monday to Friday).\n   - So, the total number of glasses he drinks on weekdays is 3 glasses/meal * 3 meals/day * 5 days = 45 glasses.\n\n2. Calculate the number of glasses John drinks on weekends:\n   - He drinks a glass of water with breakfast, but not with lunch and dinner.\n   - There are 2 weekend days (Saturday and Sunday).\n   - So, the total number of glasses he drinks on weekends is 1 glass/day * 2 days = 2 glasses.\n\n3. Add the number of glasses John drinks on weekdays and weekends:\n   - Total glasses = glasses on weekdays + glasses on weekends = 45 glasses + 2 glasses = 47 glasses.\n\nAnswer: 47"
+    },
+    {
+      "id": "gsm8k-test-0103",
+      "correct": true,
+      "output": "To find the time it takes for the fog bank to cover the whole city, we need to divide the total distance of the city by the distance covered by the fog bank in 10 minutes.\n\nFirst, we need to find out how many 3-mile sections are in the 42-mile city. We can do this by dividing the total distance by the distance covered in 10 minutes:\n\n42 miles / 3 miles = 14 sections\n\nSince it takes 10 minutes to cover each 3-mile section, we multiply the number of sections by 10 minutes:\n\n14 sections * 10 minutes/section = 140 minutes\n\nAnswer: 140"
+    },
+    {
+      "id": "gsm8k-test-0104",
+      "correct": true,
+      "output": "To solve this problem, we'll break it down step by step.\n\n1. Poppy places a quarter of the pieces on the board. Since there are 1000 pieces, a quarter of them is 1000 / 4 = 250 pieces.\n\n2. Now, there are 1000 - 250 = 750 pieces remaining.\n\n3. Her mom places a third of the remaining pieces. A third of 750 is 750 / 3 = 250 pieces.\n\n4. Now, there are 750 - 250 = 500 pieces left to be placed.\n\nAnswer: 500"
+    },
+    {
+      "id": "gsm8k-test-0105",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many cookies Cody eats and then add the number of cookies Amir eats.\n\nStep 1: Find out how many cookies Cody eats.\nSince Cody eats three times as many cookies as Amir eats, and Amir eats 5 cookies, we multiply the number of cookies Amir eats by 3.\nCody eats 3 * 5 = 15 cookies.\n\nStep 2: Add the number of cookies Amir eats to the number of cookies Cody eats.\nTotal cookies eaten = Amir's cookies + Cody's cookies\nTotal cookies eaten = 5 + 15\nTotal cookies eaten = 20\n\nAnswer: 20"
+    },
+    {
+      "id": "gsm8k-test-0106",
+      "correct": true,
+      "output": "To find the total inner volume of all 3 boxes, we need to calculate the inner volume of one box and then multiply it by 3.\n\nStep 1: Calculate the inner dimensions of one box by subtracting the wall thickness from the outer dimensions.\nInner length = Outer length - 2 * Wall thickness\nInner length = 6 inches - 2 * 1 inch\nInner length = 6 - 2\nInner length = 4 inches\n\nInner width = Outer width - 2 * Wall thickness\nInner width = 5 inches - 2 * 1 inch\nInner width = 5 - 2\nInner width = 3 inches\n\nInner height = Outer height - 2 * Wall thickness\nInner height = 4 inches - 2 * 1 inch\nInner height = 4 - 2\nInner height = 2 inches\n\nStep 2: Calculate the inner volume of one box by multiplying the inner dimensions.\nInner volume = Inner length * Inner width * Inner height\nInner volume = 4 inches * 3 inches * 2 inches\nInner volume = 24 cubic inches\n\nStep 3: Calculate the total inner volume of all 3 boxes by multiplying the inner volume of one box by 3.\nTotal inner volume = Inner volume * 3\nTotal inner volume = 24 cubic inches * 3\nTotal inner volume = 72 cubic inches\n\nAnswer: 72"
+    },
+    {
+      "id": "gsm8k-test-0107",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. On Monday and Tuesday, Frankie watched 1-hour episodes each night. So, he watched 1 + 1 = 2 hours of TV on these two nights.\n\n2. On Wednesday, he watched a few episodes of a 30-minute show. Since we don't know the exact number of episodes, let's represent it as 'x'. The total time he watched on Wednesday is 30x minutes, which is equal to 0.5x hours.\n\n3. On Thursday, Frankie watched a 1-hour episode and a 30-minute show. So, he watched 1 + 0.5 = 1.5 hours of TV on this night.\n\n4. On Friday, he watched two 1-hour episodes. So, he watched 2 hours of TV on this night.\n\nNow, let's add up the total time he watched TV on all the nights:\n- Monday and Tuesday: 2 hours\n- Wednesday: 0.5x hours\n- Thursday: 1.5 hours\n- Friday: 2 hours\n\nTotal time = 2 + 0.5x + 1.5 + 2 = 5.5 + 0.5x\n\nWe know that Frankie watched a total of 7 hours of TV. So, we can set up an equation:\n5.5 + 0.5x = 7\n\nNow, let's solve for x:\n0.5x = 7 - 5.5\n0.5x = 1.5\nx = 1.5 / 0.5\nx = 3\n\nSo, Frankie watched 3 episodes of a 30-minute show on Wednesday.\n\nAnswer: 3"
+    },
+    {
+      "id": "gsm8k-test-0108",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. Let's say Henry baked x cookies last year.\n2. This year, he wants to make twice as many cookies as he did last year, so he wants to make 2x cookies.\n3. However, he actually baked 15 more cookies than he meant to, so he baked 2x + 15 cookies.\n4. He drops 5 cookies as he is putting them out to cool, so he now has 2x + 15 - 5 cookies.\n5. We know that he now has a total of 110 cookies, so we can set up the equation: 2x + 15 - 5 = 110.\n6. Simplifying the equation, we get: 2x + 10 = 110.\n7. Subtracting 10 from both sides of the equation, we get: 2x = 100.\n8. Dividing both sides of the equation by 2, we get: x = 50.\n\nAnswer: 50"
+    },
+    {
+      "id": "gsm8k-test-0109",
+      "correct": false,
+      "output": "To find the total cost of the gas after the cashback rewards, we need to follow these steps:\n\n1. Calculate the total cost of the gas without the cashback rewards:\n   Total gallons = 10 gallons\n   Price per gallon = $3.00\n   Total cost = Total gallons * Price per gallon\n   Total cost = 10 * $3.00\n   Total cost = $30.00\n\n2. Calculate the total cashback rewards:\n   Cashback per gallon = $0.20\n   Total gallons = 10 gallons\n   Total cashback rewards = Total gallons * Cashback per gallon\n   Total cashback rewards = 10 * $0.20\n   Total cashback rewards = $2.00\n\n3. Calculate the total cost of the gas after the cashback rewards:\n   Total cost = Total cost without cashback rewards - Total cashback rewards\n   Total cost = $30.00 - $2.00\n   Total cost = $28.00\n\nAnswer: $28.00"
+    },
+    {
+      "id": "gsm8k-test-0110",
+      "correct": true,
+      "output": "To find the average number of fruit roll-ups eaten by Marcell and Beatrice, we need to first calculate the total number of roll-ups each of them had.\n\nBeatrice's roll-ups: 2 roll-ups wide * 24 roll-ups long = 48 roll-ups\nMarcell's roll-ups: 3 roll-ups wide * 14 roll-ups long = 42 roll-ups\n\nSince they both ate their entire amount, we can add the total number of roll-ups they had:\n48 (Beatrice) + 42 (Marcell) = 90 roll-ups\n\nTo find the average, we divide the total number of roll-ups by 2 (since there are 2 people):\n90 roll-ups / 2 = 45 roll-ups\n\nAnswer: 45"
+    },
+    {
+      "id": "gsm8k-test-0111",
+      "correct": false,
+      "output": "To solve this problem, we need to find out how many feet Julia rowed and how much water the boat took on for each foot. \n\nFirst, we need to find Julia's rowing speed in feet per second. We know it took her 16 seconds to row 20 feet. \n\nSpeed = Distance / Time\nSpeed = 20 feet / 16 seconds\nSpeed = 1.25 feet/second\n\nNow, we know Julia's rowing speed. We also know that the boat was taking on 2 liters of water for every 10 feet she rowed. \n\nTo find out how much water the boat took on per foot, we need to divide 2 liters by 10 feet. \n\nWater per foot = 2 liters / 10 feet\nWater per foot = 0.2 liters/foot\n\nNow, we know the amount of water the boat takes on per foot. We also know the distance to the shore is 64 feet. \n\nTo find out how much water the boat took on, we multiply the distance to the shore by the amount of water the boat takes on per foot. \n\nTotal water = Distance to shore * Water per foot\nTotal water = 64 feet * 0.2 liters/foot\nTotal water = 12.8 liters\n\nAnswer: 12.8"
+    },
+    {
+      "id": "gsm8k-test-0112",
+      "correct": true,
+      "output": "To find out how many times the whiteboard is cleaned in a day, we need to break down the problem step by step.\n\n1. Each teacher has 2 lessons per day.\n2. Each teacher uses the whiteboard in each lesson, so each teacher uses the whiteboard 2 times per day.\n3. There are 4 teachers in total, so the total number of times the whiteboard is used per day is 4 teachers * 2 lessons per day = 8 times per day.\n4. The whiteboard is cleaned 3 times per lesson.\n5. Since each teacher uses the whiteboard 2 times per day, the total number of lessons per day is 4 teachers * 2 lessons per day = 8 lessons per day.\n6. Multiply the total number of lessons per day by the number of times the whiteboard is cleaned per lesson: 8 lessons per day * 3 cleanings per lesson = 24 cleanings per day.\n\nAnswer: 24"
+    },
+    {
+      "id": "gsm8k-test-0113",
+      "correct": true,
+      "output": "To find the total number of flowers Ryan has, we need to calculate the total number of flowers he planted in 15 days and then subtract the ones that did not grow.\n\nStep 1: Calculate the total number of flowers planted in 15 days.\nRyan plants 2 flowers a day, so in 15 days, he planted 2 * 15 = 30 flowers.\n\nStep 2: Subtract the flowers that did not grow.\n5 flowers did not grow, so we subtract them from the total number of flowers planted: 30 - 5 = 25.\n\nAnswer: 25"
+    },
+    {
+      "id": "gsm8k-test-0114",
+      "correct": true,
+      "output": "To solve this problem, we need to break it down step by step.\n\nStep 1: We know that Jamal's phone can hold 1800 photographs. Since Jamal's phone can hold 6 times more photographs than Brittany's phone, we can set up an equation to find the number of photographs Brittany's phone can hold.\n\nLet x be the number of photographs Brittany's phone can hold. Then, 6x = 1800.\n\nStep 2: Solve for x.\nx = 1800 / 6\nx = 300\n\nSo, Brittany's phone can hold 300 photographs.\n\nStep 3: We know that the maximum number of photographs that Brittany's phone can hold is 50 times more than the number of birds in Jamal's photograph of the ducks at the zoo. Let y be the number of ducks in the photograph. Then, 300 = 50y.\n\nStep 4: Solve for y.\n300 = 50y\ny = 300 / 50\ny = 6\n\nSo, there are 6 ducks in Jamal's photograph of ducks at the zoo.\n\nAnswer: 6"
+    },
+    {
+      "id": "gsm8k-test-0115",
+      "correct": false,
+      "output": "To find the profit, we need to calculate the total cost of the lumber and the total selling price.\n\n1. Calculate the total cost of the 2 x 4 x 10 boards:\n   Sasha has 10 boards, and each costs $10.\n   Total cost = Number of boards * Cost per board\n   Total cost = 10 * $10\n   Total cost = $100\n\n2. Calculate the total cost of the 4 x 4 x 10 boards:\n   Sasha has 5 boards, and each costs $16.\n   Total cost = Number of boards * Cost per board\n   Total cost = 5 * $16\n   Total cost = $80\n\n3. Calculate the total cost of all the lumber:\n   Total cost = Total cost of 2 x 4 x 10 boards + Total cost of 4 x 4 x 10 boards\n   Total cost = $100 + $80\n   Total cost = $180\n\n4. Calculate the selling price of the 2 x 4 x 10 boards:\n   Since the prices have gone up by 50%, the new price is 1.5 times the original price.\n   New price = Original price * 1.5\n   New price = $10 * 1.5\n   New price = $15\n   Total selling price of 2 x 4 x 10 boards = Number of boards * New price\n   Total selling price of 2 x 4 x 10 boards = 10 * $15\n   Total selling price of 2 x 4 x 10 boards = $150\n\n5. Calculate the selling price of the 4 x 4 x 10 boards:\n   New price = Original price * 1.5\n   New price = $16 * 1.5\n   New price = $24\n   Total selling price of 4 x 4 x 10 boards = Number of boards * New price\n   Total selling price of 4 x 4 x 10 boards = 5 * $24\n   Total selling price of 4 x 4 x 10 boards = $120\n\n6. Calculate the total selling price of all the lumber:\n   Total selling price = Total selling price of 2 x 4 x 10 boards + Total selling price of 4 x 4 x 10 boards\n   Total selling price = $150 + $120\n   Total selling price = $270\n\n7. Calculate the profit"
+    },
+    {
+      "id": "gsm8k-test-0116",
+      "correct": true,
+      "output": "To solve this problem, we need to find the number of teaspoons of sugar Katy used. We know that the ratio of sugar to water is 7:13, and the total amount of sugar and water is 120.\n\nStep 1: Find the total number of parts in the ratio\nThe total number of parts in the ratio is 7 + 13 = 20.\n\nStep 2: Find the value of one part\nTo find the value of one part, we divide the total amount of sugar and water (120) by the total number of parts (20).\n120 / 20 = 6\n\nStep 3: Find the number of teaspoons of sugar\nSince the ratio of sugar is 7 parts, we multiply the value of one part (6) by 7 to find the number of teaspoons of sugar.\n7 * 6 = 42\n\nAnswer: 42"
+    },
+    {
+      "id": "gsm8k-test-0117",
+      "correct": true,
+      "output": "To find the total amount John paid, we need to follow these steps:\n\n1. Calculate the total number of pairs of shoes John bought: \n   He bought 2 pairs of shoes for each of his 3 children, so the total number of pairs is 2 * 3 = 6 pairs.\n\n2. Calculate the total cost of the shoes:\n   Each pair of shoes costs $60, so the total cost is 6 pairs * $60/pair = $360.\n\nAnswer: $360"
+    },
+    {
+      "id": "gsm8k-test-0118",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step:\n\n1. Initially, there were 2 containers with 5 vehicles each, so the total number of vehicles was:\n   2 containers * 5 vehicles/container = 10 vehicles\n\n2. The next day, more containers were brought in, and the total number of vehicles became 30. This means that the additional containers brought 30 - 10 = 20 vehicles.\n\n3. Since each container contains 5 vehicles, we can calculate the number of containers that were imported on the second day by dividing the total number of additional vehicles (20) by the number of vehicles per container (5):\n   20 vehicles / 5 vehicles/container = 4 containers\n\nTherefore, the number of containers that were imported on the second day is 4.\n\nAnswer: 4"
+    },
+    {
+      "id": "gsm8k-test-0119",
+      "correct": false,
+      "output": "To solve this problem, we need to calculate Adrien's and Lylah's salaries four years later.\n\nStep 1: Calculate Lylah's salary four years ago.\nSince Adrien's salary was 30% higher than Lylah's, we can set up an equation:\nAdrien's salary = Lylah's salary + 30% of Lylah's salary\n$40000 = Lylah's salary + 0.3(Lylah's salary)\n$40000 = 1.3(Lylah's salary)\nLylah's salary = $40000 / 1.3\nLylah's salary = $30769\n\nStep 2: Calculate Adrien's salary four years later.\nSince Adrien's salary increased by 40% four years later, we can calculate his new salary:\nAdrien's new salary = Adrien's old salary + 40% of Adrien's old salary\nAdrien's new salary = $40000 + 0.4($40000)\nAdrien's new salary = $40000 + $16000\nAdrien's new salary = $56000\n\nStep 3: Calculate the total salary of Adrien and Lylah four years later.\nTotal salary = Adrien's new salary + Lylah's salary\nTotal salary = $56000 + $30769\nTotal salary = $86769\n\nAnswer: $86769"
+    },
+    {
+      "id": "gsm8k-test-0120",
+      "correct": true,
+      "output": "To find out how many sheets of paper Miguel uses every month, we need to calculate the total number of sheets he uses in a week and then multiply it by the number of weeks in a month.\n\nStep 1: Calculate the number of sheets Miguel uses in a week.\nMiguel uses 2 pads of paper a week, and each pad has 30 sheets of paper.\nNumber of sheets used in a week = 2 pads/week * 30 sheets/pad = 60 sheets/week\n\nStep 2: Calculate the number of sheets Miguel uses in a month.\nThere are approximately 4 weeks in a month.\nNumber of sheets used in a month = 60 sheets/week * 4 weeks/month = 240 sheets/month\n\nAnswer: 240"
+    },
+    {
+      "id": "gsm8k-test-0121",
+      "correct": true,
+      "output": "To find the total number of fruits, we need to calculate the number of fruits each person brought and then add them together.\n\nMorisette brought 5 apples and 8 oranges. \nTotal number of fruits Morisette brought = 5 (apples) + 8 (oranges) = 13\n\nKael brought twice the amount of apples than Morisette, which is 2 * 5 = 10 apples.\nKael also brought half the number of oranges than Morisette, which is 8 / 2 = 4 oranges.\nTotal number of fruits Kael brought = 10 (apples) + 4 (oranges) = 14\n\nNow, let's add the total number of fruits each person brought:\nTotal number of fruits = 13 (Morisette) + 14 (Kael) = 27\n\nAnswer: 27"
+    },
+    {
+      "id": "gsm8k-test-0122",
+      "correct": false,
+      "output": "To find the total hours Sadie slept throughout the week, we need to calculate the hours she slept each day and then add them up.\n\n1. Monday: 8 hours\n2. Tuesday: 8 - 2 = 6 hours\n3. Wednesday: 6 - 2 = 4 hours\n4. Thursday: 4 + 1 = 5 hours\n5. Friday: 5 + 1 = 6 hours\n6. Saturday: 6 + 1 = 7 hours\n7. Sunday: 7 + 1 = 8 hours\n\nNow, let's add up the hours:\n8 + 6 + 4 + 5 + 6 + 7 + 8 = 44\n\nAnswer: 44"
+    },
+    {
+      "id": "gsm8k-test-0123",
+      "correct": true,
+      "output": "To solve this problem, we need to break it down into two parts: the first 3 hours and the remaining 4 hours.\n\n1. In the first 3 hours, Rosie runs at 10 miles per hour. To find the distance she covers in this time, we multiply the speed by the time:\n   Distance = Speed * Time\n   Distance = 10 miles/hour * 3 hours\n   Distance = 30 miles\n\n2. After the first 3 hours, Rosie runs at 5 miles per hour for the remaining 4 hours. To find the distance she covers in this time, we multiply the speed by the time:\n   Distance = Speed * Time\n   Distance = 5 miles/hour * 4 hours\n   Distance = 20 miles\n\n3. To find the total distance Rosie can run in 7 hours, we add the distances covered in the first 3 hours and the remaining 4 hours:\n   Total Distance = Distance in first 3 hours + Distance in remaining 4 hours\n   Total Distance = 30 miles + 20 miles\n   Total Distance = 50 miles\n\nAnswer: 50"
+    },
+    {
+      "id": "gsm8k-test-0124",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. Jennie puts stamps on one-third of the letters needing stamps. This means she stamps 1/3 * 60 = 20 letters.\n\n2. Now, the pile of letters needing stamps has 60 - 20 = 40 letters.\n\n3. We know that after Jennie stamps the letters, there are 30 letters in the pile of already-stamped letters.\n\n4. To find out how many letters were in the pile of already-stamped letters when Jennie began, we need to subtract the number of letters she stamped from the current number of letters in the pile. \n\n   However, we need to consider that the 30 letters in the pile now include the 20 letters that Jennie stamped. So, the number of letters in the pile when Jennie began is 30 - 20 = 10.\n\nAnswer: 10"
+    },
+    {
+      "id": "gsm8k-test-0125",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. Julia initially bought a package of spoons, but we don't know how many yet. Let's call this number x.\n\n2. Her husband also bought a package of 5 new spoons and gave them to Julia. So now, Julia has x + 5 spoons.\n\n3. Julia used 3 spoons to sample her stew. This means she has x + 5 - 3 spoons left.\n\n4. We know that after using 3 spoons, Julia had a total of 12 spoons. So we can set up the equation:\n\nx + 5 - 3 = 12\n\n5. Now, let's solve the equation for x:\n\nx + 5 - 3 = 12\nx + 2 = 12\nx = 12 - 2\nx = 10\n\nSo, the package that Julia bought initially had 10 spoons.\n\nAnswer: 10"
+    },
+    {
+      "id": "gsm8k-test-0126",
+      "correct": true,
+      "output": "To find the total number of sausages Dylan bought, we need to follow these steps:\n\n1. Identify the number of chicken sausages: Dylan bought 38 chicken sausages.\n\n2. Calculate the number of fish sausages: It's mentioned that Dylan bought 6 more fish sausages than chicken sausages. So, the number of fish sausages is 38 + 6 = 44.\n\n3. Calculate the total number of sausages: To find the total number of sausages, we need to add the number of chicken sausages and fish sausages. Total sausages = 38 (chicken sausages) + 44 (fish sausages) = 82.\n\nAnswer: 82"
+    },
+    {
+      "id": "gsm8k-test-0127",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many friends Amy has and then add the number of friends Lily has.\n\nStep 1: We know that Lily made 50 friends.\n\nStep 2: We also know that Amy made 20 more friends than Lily. To find out how many friends Amy has, we need to add 20 to the number of friends Lily has.\n\nAmy's friends = Lily's friends + 20\nAmy's friends = 50 + 20\nAmy's friends = 70\n\nStep 3: Now that we know how many friends Amy has, we can add the number of friends Lily has to find out how many friends they have together.\n\nTotal friends = Lily's friends + Amy's friends\nTotal friends = 50 + 70\nTotal friends = 120\n\nAnswer: 120"
+    },
+    {
+      "id": "gsm8k-test-0128",
+      "correct": true,
+      "output": "To solve this problem, we need to find the cost of each item and then multiply it by the quantity.\n\n1. The cost of each pepper is $15.\n2. A watermelon costs three times what each pepper costs, so a watermelon costs 3 * $15 = $45.\n3. An orange costs 5 less than what a watermelon costs, so an orange costs $45 - $5 = $40.\n4. Dillon needs to buy 4 watermelons, so the total cost of watermelons is 4 * $45 = $180.\n5. Dillon needs to buy 20 peppers, so the total cost of peppers is 20 * $15 = $300.\n6. Dillon needs to buy 10 oranges, so the total cost of oranges is 10 * $40 = $400.\n7. The total amount of money Dillon will spend is the sum of the costs of watermelons, peppers, and oranges: $180 + $300 + $400 = $880.\n\nAnswer: $880"
+    },
+    {
+      "id": "gsm8k-test-0129",
+      "correct": false,
+      "output": "To find the profit made by the hospital, we need to calculate the total revenue and the total cost.\n\nStep 1: Calculate the total number of visits per day\nThe hospital sees 500 people a day.\n\nStep 2: Calculate the total time spent on each patient\nEach patient is seen for an average of 24 minutes.\n\nStep 3: Calculate the total time spent on all patients per day\nTotal time spent per day = 500 patients * 24 minutes/patient = 12000 minutes\n\nStep 4: Convert the total time spent to hours\nTotal time spent per day (in hours) = 12000 minutes / 60 = 200 hours\n\nStep 5: Calculate the total revenue from the hospital's charge\nThe hospital charges $150 per hour. Total revenue = 200 hours * $150/hour = $30000\n\nStep 6: Calculate the total revenue from the patients' charge\nThe patients charge $200 per hour. Total revenue from patients = 200 hours * $200/hour = $40000\n\nStep 7: Calculate the total revenue\nTotal revenue = Total revenue from hospital + Total revenue from patients = $30000 + $40000 = $70000\n\nStep 8: Calculate the total cost\nThe hospital charges the doctors $150 per hour, and the doctors charge the hospital $200 per hour. The hospital's charge to the doctors is the same as the hospital's charge to the patients, so we can calculate the total cost as follows:\nTotal cost = Total revenue from patients - Total revenue from hospital = $40000 - $30000 = $10000\n\nStep 9: Calculate the profit\nProfit = Total revenue - Total cost = $70000 - $10000 = $60000\n\nAnswer: $60000"
+    },
+    {
+      "id": "gsm8k-test-0130",
+      "correct": true,
+      "output": "To solve this problem, we'll break it down step by step.\n\n1. Nissa hires 60 seasonal workers to play elves. This is the initial number of elves.\n\n2. A third of the elves quit after children vomit on them. To find out how many elves quit, we need to calculate a third of 60.\n   A third of 60 is 60 / 3 = 20.\n   So, 20 elves quit.\n\n3. The remaining elves are 60 - 20 = 40.\n\n4. Then, 10 of the remaining elves quit after kids kick their shins.\n   The number of elves left after this is 40 - 10 = 30.\n\nAnswer: 30"
+    },
+    {
+      "id": "gsm8k-test-0131",
+      "correct": true,
+      "output": "To find the total expenditure for the two months, we need to calculate the expenditure for May and June separately and then add them together.\n\nStep 1: Calculate the expenditure for June.\nExpenditure in June = Expenditure in May - $60\nExpenditure in June = $500 - $60\nExpenditure in June = $440\n\nStep 2: Calculate the total expenditure for the two months.\nTotal Expenditure = Expenditure in May + Expenditure in June\nTotal Expenditure = $500 + $440\nTotal Expenditure = $940\n\nAnswer: $940"
+    },
+    {
+      "id": "gsm8k-test-0132",
+      "correct": true,
+      "output": "To find the total number of tickets used, we need to calculate the tickets used for the roller coaster and the luge separately, then add them together.\n\n1. Roller Coaster:\n   - Pam rode the roller coaster 2 times.\n   - Fred rode the roller coaster 4 times.\n   - Total number of roller coaster rides = 2 (Pam) + 4 (Fred) = 6 rides.\n   - Since each ride costs 6 tickets, the total tickets used for the roller coaster = 6 rides * 6 tickets/ride = 36 tickets.\n\n2. Luge:\n   - Both Pam and Fred rode the luge 2 times each.\n   - Total number of luge rides = 2 (Pam) + 2 (Fred) = 4 rides.\n   - Since each ride costs 6 tickets, the total tickets used for the luge = 4 rides * 6 tickets/ride = 24 tickets.\n\n3. Total tickets used:\n   - Total tickets used for roller coaster and luge = 36 tickets (roller coaster) + 24 tickets (luge) = 60 tickets.\n\nAnswer: 60"
+    },
+    {
+      "id": "gsm8k-test-0133",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many miles Walt walked on Wednesday.\n\nStep 1: Find out how many miles Walt walked on Tuesday.\nSince Walt walked 6 times as many miles on Tuesday as he did on Monday, and he walked 4 miles on Monday, we multiply 4 by 6 to get the miles walked on Tuesday.\nTuesday miles = 4 * 6 = 24 miles\n\nStep 2: Find out how many miles Walt walked on Monday and Tuesday combined.\nMonday miles + Tuesday miles = 4 + 24 = 28 miles\n\nStep 3: Since we know the total miles walked from Monday through Wednesday is 41, we can subtract the miles walked on Monday and Tuesday from the total to find out how many miles were walked on Wednesday.\nWednesday miles = Total miles - (Monday miles + Tuesday miles)\nWednesday miles = 41 - 28\nWednesday miles = 13 miles\n\nAnswer: 13"
+    },
+    {
+      "id": "gsm8k-test-0134",
+      "correct": true,
+      "output": "To find out how much Tom pays in a year, we need to calculate the total cost of car washes for a year.\n\nStep 1: Calculate the total number of car washes in a year.\nSince Tom gets 4 car washes a month, we multiply the number of car washes per month by 12 (the number of months in a year).\nTotal car washes in a year = 4 car washes/month * 12 months/year = 48 car washes/year\n\nStep 2: Calculate the total cost of car washes in a year.\nSince each car wash costs $15, we multiply the total number of car washes in a year by the cost per car wash.\nTotal cost in a year = 48 car washes/year * $15/car wash = $720/year\n\nAnswer: $720"
+    },
+    {
+      "id": "gsm8k-test-0135",
+      "correct": true,
+      "output": "To solve this problem, we need to follow the steps:\n\n1. First, we need to find out how many video games Brian has after losing 5. \n   Brian initially had 20 video games, but lost 5, so he now has 20 - 5 = 15 video games.\n\n2. Now, we need to find out how many video games Bobby has. \n   Bobby has 5 fewer than 3 times as many video games as Brian does. \n   So, we need to multiply the number of video games Brian has by 3 and then subtract 5. \n   3 * 15 = 45, then 45 - 5 = 40.\n\nAnswer: 40"
+    },
+    {
+      "id": "gsm8k-test-0136",
+      "correct": true,
+      "output": "To find the number of female Scottish unicorns, we need to follow these steps:\n\n1. First, we need to find out how many unicorns are in the Scottish Highlands. Since one third of the 27 unicorns are in the Scottish Highlands, we can calculate this by dividing 27 by 3.\n\n27 / 3 = 9\n\nSo, there are 9 unicorns in the Scottish Highlands.\n\n2. Next, we need to find out how many of these unicorns are female. Since two thirds of the Scottish unicorns are female, we can calculate this by multiplying 9 by 2/3.\n\n9 * (2/3) = 9 * 2 / 3\n= 18 / 3\n= 6\n\nSo, there are 6 female Scottish unicorns.\n\nAnswer: 6"
+    },
+    {
+      "id": "gsm8k-test-0137",
+      "correct": false,
+      "output": "To find the total cost of Rory's delivery order, we need to calculate the cost of each item and then add the delivery fee and tip.\n\n1. Cost of subs: 2 subs for $7.50 each = 2 x $7.50 = $15.00\n2. Cost of chips: 2 bags of chips for $1.50 each = 2 x $1.50 = $3.00\n3. Cost of cookies: 2 cookies for $1.00 each = 2 x $1.00 = $2.00\n4. Total cost of food: $15.00 + $3.00 + $2.00 = $20.00\n5. Delivery fee: 20% of $20.00 = 0.20 x $20.00 = $4.00\n6. Total cost before tip: $20.00 + $4.00 = $24.00\n7. Tip: $5.00\n8. Total cost of delivery order: $24.00 + $5.00 = $29.00\n\nAnswer: $29.00"
+    },
+    {
+      "id": "gsm8k-test-0138",
+      "correct": false,
+      "output": "To find out how many questions Mark left incomplete, we need to calculate the total number of questions he completed and subtract it from the total number of questions.\n\nFirst, let's calculate the number of questions Mark completed in the first test:\nNumber of questions in the first test = 75\nTime taken to complete the first test = 8 hours\nRate of completion = 5 questions per hour\nNumber of questions completed in the first test = Rate * Time = 5 * 8 = 40\n\nNext, let's calculate the number of questions Mark completed in the second test:\nNumber of questions in the second test = 100\nTime taken to complete the second test = 6 hours\nRate of completion = 5 questions per hour\nNumber of questions completed in the second test = Rate * Time = 5 * 6 = 30\n\nNow, let's calculate the total number of questions Mark completed:\nTotal number of questions completed = Number of questions completed in the first test + Number of questions completed in the second test\nTotal number of questions completed = 40 + 30 = 70\n\nFinally, let's calculate the number of questions Mark left incomplete:\nNumber of questions left incomplete = Total number of questions - Total number of questions completed\nNumber of questions left incomplete = 75 + 100 - 70\nNumber of questions left incomplete = 105 - 70\nNumber of questions left incomplete = 35\n\nAnswer: 35"
+    },
+    {
+      "id": "gsm8k-test-0139",
+      "correct": true,
+      "output": "To solve this problem, we need to follow the steps:\n\n1. Let's denote the number of blue gumballs as B and the number of pink gumballs as P.\n2. We are given that there are 12 blue gumballs, so B = 12.\n3. We are also given that there are 22 more than four times the number of pink gumballs as there are blue gumballs. This can be written as an equation: P = 4B + 22.\n4. Now, we can substitute the value of B into the equation: P = 4(12) + 22.\n5. Multiply 4 by 12: P = 48 + 22.\n6. Add 48 and 22: P = 70.\n\nAnswer: 70"
+    },
+    {
+      "id": "gsm8k-test-0140",
+      "correct": true,
+      "output": "To find the percentage of semi-automatic cars, we need to first find the number of semi-automatic cars. \n\nWe know that there are 20 cars in total, 12 automatic cars, and 4 manual cars. \n\nThe number of semi-automatic cars can be found by subtracting the number of automatic and manual cars from the total number of cars:\n20 (total cars) - 12 (automatic cars) - 4 (manual cars) = 4 (semi-automatic cars)\n\nNow, we can find the percentage of semi-automatic cars by dividing the number of semi-automatic cars by the total number of cars and multiplying by 100:\n(4 / 20) * 100 = 20%\n\nAnswer: 20"
+    },
+    {
+      "id": "gsm8k-test-0141",
+      "correct": false,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. Let's denote the number of queens as Q. Since there are twice as many babies as queens, the number of babies is 2Q.\n\n2. Since there are twice as many babies as worker bees, the number of worker bees is half the number of babies. So, the number of worker bees is (2Q)/2 = Q.\n\n3. We know that the total number of bees is 700. The total number of bees is the sum of the number of queens, babies, and worker bees. So, we can write the equation: Q + 2Q + Q = 700.\n\n4. Combining like terms, we get 4Q = 700.\n\n5. To find the value of Q, we divide both sides of the equation by 4: Q = 700/4 = 175.\n\n6. Now that we know the number of queens, we can find the number of worker bees. Since the number of worker bees is Q, the number of worker bees is also 175.\n\nAnswer: 175"
+    },
+    {
+      "id": "gsm8k-test-0142",
+      "correct": true,
+      "output": "To find out how much money Jordan would earn in one week if he spent his video game time working, we need to calculate the total hours he would work in a week and multiply it by his hourly wage.\n\nStep 1: Calculate the total hours Jordan works in a week.\nSince Jordan plays video games for 2 hours every day, and there are 7 days in a week, we multiply 2 hours by 7 days:\n2 hours/day * 7 days/week = 14 hours/week\n\nStep 2: Calculate the total amount of money Jordan would earn in a week.\nSince Jordan earns $10 an hour, we multiply the total hours he works in a week by his hourly wage:\n14 hours/week * $10/hour = $140/week\n\nAnswer: $140"
+    },
+    {
+      "id": "gsm8k-test-0143",
+      "correct": true,
+      "output": "To find the total cost, we need to calculate the cost of non-food items first and then add the cost of food items.\n\nNon-food items: \n- Light bulbs: $3\n- Cups: $3\n- Roach traps: $4\nTotal cost of non-food items: $3 + $3 + $4 = $10\n\nTax on non-food items: 10% of $10 = 0.1 * $10 = $1\n\nCost of non-food items with tax: $10 + $1 = $11\n\nFood items:\n- Milk: $2\n- Eggs: $3\nTotal cost of food items: $2 + $3 = $5\n\nTotal cost of everything: Cost of non-food items with tax + Cost of food items = $11 + $5 = $16\n\nAnswer: $16"
+    },
+    {
+      "id": "gsm8k-test-0144",
+      "correct": true,
+      "output": "To find the total profit, we need to calculate the total income and total expenses.\n\nFirst, let's calculate the total income. Kim has 3 clients and 5 potential clients, so he has a total of 8 clients. Each client will need 2 bottles of bleach and a pack of cloths, so the total number of bottles of bleach needed is 8 * 2 = 16, and the total number of packs of cloths needed is 8 * 1 = 8.\n\nThe total cost of bottles of bleach is 16 * $2 = $32.\nThe total cost of packs of cloths is 8 * $5 = $40.\n\nThe total expenses are $32 + $40 = $72.\n\nNow, let's calculate the profit. The total income is $92, and the total expenses are $72.\n\nProfit = Total Income - Total Expenses\nProfit = $92 - $72\nProfit = $20\n\nAnswer: $20"
+    },
+    {
+      "id": "gsm8k-test-0145",
+      "correct": true,
+      "output": "To find out how many pineapples John can harvest within a year, we need to follow these steps:\n\n1. Calculate the total number of pineapples in the field:\n   Total pineapples = Number of pineapples per hectare * Total hectares\n   Total pineapples = 100 pineapples/hectare * 10 hectares\n   Total pineapples = 1000 pineapples\n\n2. Since John can harvest his pineapples every 3 months, we need to calculate how many harvests he can make in a year. \n   There are 12 months in a year, so:\n   Number of harvests = 12 months / 3 months\n   Number of harvests = 4 harvests\n\n3. Now, we can calculate the total number of pineapples John can harvest in a year:\n   Total pineapples harvested = Total pineapples * Number of harvests\n   Total pineapples harvested = 1000 pineapples * 4\n   Total pineapples harvested = 4000 pineapples\n\nAnswer: 4000"
+    },
+    {
+      "id": "gsm8k-test-0146",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the number of pieces in each Lego set and then add them up.\n\n1. The first set has 500 pieces.\n2. The second set has 3 times more pieces than the first set, so it has 3 * 500 = 1500 pieces.\n3. The third set has 1/4 the number of pieces as the first set, so it has 1/4 * 500 = 125 pieces.\n\nNow, let's add up the total number of pieces:\n500 (first set) + 1500 (second set) + 125 (third set) = 2125\n\nAnswer: 2125"
+    },
+    {
+      "id": "gsm8k-test-0147",
+      "correct": false,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. In the first 6 hours, 30 bees leave the hive. \n\n2. In the next 6 hours, 1/2 of the bees that left in the first 6 hours return. \n   1/2 of 30 bees is 15 bees. \n   So, 15 bees return in the next 6 hours.\n\n3. In the next 6 hours, two times as many bees as she saw first leave the hive fly from the hive and leave. \n   Two times 30 bees is 60 bees. \n   So, 60 bees leave in the next 6 hours.\n\n4. Now, let's calculate how many bees have returned so far. \n   15 bees returned in the second 6 hours. \n   0 bees returned in the third 6 hours (since 60 bees left in the third 6 hours). \n   So, the total number of bees that have returned so far is 15.\n\n5. Now, let's calculate how many bees that left before the third 6 hours hadn't already returned. \n   30 bees left in the first 6 hours. \n   15 bees returned in the second 6 hours. \n   So, 30 - 15 = 15 bees haven't returned yet.\n\n6. In the next 6 hours, these 15 bees return to the hive. \n\n7. Now, let's calculate the total number of bees that returned in the last 6 hours. \n   We already know that 15 bees returned in the second 6 hours. \n   In the last 6 hours, 15 bees return. \n   So, the total number of bees that returned in the last 6 hours is 15.\n\nAnswer: 15"
+    },
+    {
+      "id": "gsm8k-test-0148",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how much money Brittany's mom gave the cashier. \n\nFirst, let's calculate the total cost of the tickets. \nThe cost of an adult ticket is $12.\nThe cost of a child ticket is $10.\n\nSince Brittany's mom bought 1 child ticket and 1 adult ticket, the total cost is:\n$10 (child ticket) + $12 (adult ticket) = $22\n\nNow, let's say Brittany's mom gave the cashier x dollars. Since she received $8 in change, we can set up an equation:\nx - $22 = $8\n\nTo solve for x, we add $22 to both sides of the equation:\nx = $8 + $22\nx = $30\n\nSo, Brittany's mom gave the cashier $30.\n\nAnswer: $30"
+    },
+    {
+      "id": "gsm8k-test-0149",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many friends Dorothy has, and then use that information to find out how many friends James has.\n\nStep 1: We know that Charlie has three times as many friends as Dorothy. Since Charlie has 12 friends, we can set up an equation to represent this relationship:\n\nCharlie's friends = 3 * Dorothy's friends\n12 = 3 * Dorothy's friends\n\nStep 2: To find out how many friends Dorothy has, we need to divide both sides of the equation by 3:\n\nDorothy's friends = 12 / 3\nDorothy's friends = 4\n\nStep 3: Now that we know Dorothy has 4 friends, we can use this information to find out how many friends James has. We know that James has four times as many friends as Dorothy:\n\nJames' friends = 4 * Dorothy's friends\nJames' friends = 4 * 4\nJames' friends = 16\n\nAnswer: 16"
+    },
+    {
+      "id": "gsm8k-test-0150",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the time it takes for each person to get home from school.\n\nFirst, we need to convert the distance from miles to feet. There are 5280 feet in a mile, so:\n\nSteve's distance: 3 miles * 5280 feet/mile = 15840 feet\nTim's distance: 2 miles * 5280 feet/mile = 10560 feet\n\nNow, we can calculate the time it takes for each person to get home:\n\nSteve's time: distance / speed = 15840 feet / 440 feet/minute = 36 minutes\nTim's time: distance / speed = 10560 feet / 264 feet/minute = 40 minutes\n\nSince Steve takes 36 minutes and Tim takes 40 minutes, Steve will finish the race before Tim. To find out how long the winner will be waiting for the loser, we need to find the difference in their times:\n\nTime difference: 40 minutes - 36 minutes = 4 minutes\n\nAnswer: 4"
+    },
+    {
+      "id": "gsm8k-test-0151",
+      "correct": true,
+      "output": "To find out how much money Shawnda made that day, we need to calculate the total number of tire inflations and then multiply it by the cost per tire.\n\n1. First, let's calculate the number of tire inflations:\n   - 5 people on bicycles came by to get both tires inflated, so that's 5 * 2 = 10 tire inflations.\n   - 3 people came by to get all their tricycle tires inflated, so that's 3 * 3 = 9 tire inflations.\n   - 1 person came by on a unicycle, so that's 1 tire inflation.\n\n   Total number of tire inflations: 10 + 9 + 1 = 20 tire inflations.\n\n2. Now, let's calculate the total cost:\n   - Each tire costs 25 cents to inflate, so the total cost is 20 * 0.25 = 5 dollars.\n\nAnswer: $5"
+    },
+    {
+      "id": "gsm8k-test-0152",
+      "correct": true,
+      "output": "To find the total cost of the cookies, we need to multiply the number of packs by the number of cookies in each pack, and then multiply that by the cost of each cookie.\n\nNumber of packs: 10\nNumber of cookies in each pack: 6\nCost of each cookie: $0.10\n\nTotal number of cookies: 10 packs * 6 cookies/pack = 60 cookies\nTotal cost: 60 cookies * $0.10/cookie = $6\n\nCarl pays with a $10 bill, so we need to subtract the total cost from $10 to find the change.\n\nChange = $10 - $6 = $4\n\nAnswer: $4"
+    },
+    {
+      "id": "gsm8k-test-0153",
+      "correct": false,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. Dave ate 14 french fries before the seagull stole the pack. Let's call the total number of french fries in the pack \"x\".\n\n2. The seagull gobbled down half the amount of french fries that Dave ate. Since Dave ate 14, the seagull ate 14 / 2 = 7 french fries.\n\n3. After the seagull ate 7 french fries, the remaining amount is x - 7.\n\n4. Three pigeons bullied the seagull away and each ate 3 french fries. So, the pigeons ate 3 * 3 = 9 french fries in total.\n\n5. After the pigeons ate 9 french fries, the remaining amount is (x - 7) - 9 = x - 16.\n\n6. A raccoon stole two thirds of the remaining fries. Two thirds of (x - 16) is (2/3) * (x - 16). To find the amount the raccoon stole, we need to subtract this from the remaining amount.\n\n7. The remaining amount after the raccoon stole two thirds of the fries is (x - 16) - (2/3) * (x - 16).\n\n8. Ants carried off a final french fry, leaving 5 behind. This means that (x - 16) - (2/3) * (x - 16) = 5.\n\n9. Now, let's simplify the equation: \n   (x - 16) - (2/3) * (x - 16) = 5\n   (x - 16) - (2/3)x + 32/3 = 5\n   (3x - 48) - (2x - 32) = 15\n   x - 16 = 15\n   x = 31\n\nAnswer: 31"
+    },
+    {
+      "id": "gsm8k-test-0154",
+      "correct": true,
+      "output": "To find the total number of hours Kimo spends attending classes, we need to calculate the number of hours he spends attending classes each week and then multiply it by the number of weeks in a semester.\n\nFirst, let's calculate the number of hours Kimo spends attending classes on Mondays, Wednesdays, and Fridays:\n\n- 3 classes * 1 hour/class = 3 hours\n\nSince this happens 3 times a week, the total number of hours Kimo spends attending classes on these days is:\n\n- 3 hours/class * 3 days/week = 9 hours/week\n\nNext, let's calculate the number of hours Kimo spends attending classes on Tuesdays and Thursdays:\n\n- 2 classes * 2 hours/class = 4 hours\n\nSince this happens 2 times a week, the total number of hours Kimo spends attending classes on these days is:\n\n- 4 hours/class * 2 days/week = 8 hours/week\n\nNow, let's add the total number of hours Kimo spends attending classes on both sets of days:\n\n- 9 hours/week + 8 hours/week = 17 hours/week\n\nSince there are 16 weeks in a semester, we can multiply the total number of hours Kimo spends attending classes per week by the number of weeks in a semester:\n\n- 17 hours/week * 16 weeks = 272 hours\n\nAnswer: 272"
+    },
+    {
+      "id": "gsm8k-test-0155",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the total length of all the baked goods in inches and then convert it to feet.\n\n1. Calculate the total length of the rolls:\n   There are 300 rolls, each 4 inches long.\n   Total length of rolls = 300 * 4 = 1200 inches\n\n2. Calculate the total length of the chocolate croissants:\n   There are 120 chocolate croissants, each 6 inches long.\n   Total length of croissants = 120 * 6 = 720 inches\n\n3. Calculate the total length of the baguettes:\n   There are 60 baguettes, each 2 feet long. Since 1 foot = 12 inches, 2 feet = 24 inches.\n   Total length of baguettes = 60 * 24 = 1440 inches\n\n4. Calculate the total length of all the baked goods in inches:\n   Total length = Total length of rolls + Total length of croissants + Total length of baguettes\n   Total length = 1200 + 720 + 1440 = 3360 inches\n\n5. Convert the total length from inches to feet:\n   Since 1 foot = 12 inches, we divide the total length by 12.\n   Total length in feet = 3360 / 12 = 280 feet\n\nAnswer: 280"
+    },
+    {
+      "id": "gsm8k-test-0156",
+      "correct": true,
+      "output": "To find out how many bananas the zookeeper needs to order, we need to calculate the total number of bananas required for 2 months.\n\nFirst, let's calculate the bananas needed for the apes:\n- Monkeys: 200 bananas/month * 2 months = 400 bananas\n- Gorillas: 400 bananas/month * 2 months = 800 bananas\n- Baboons: 100 bananas/month * 2 months = 200 bananas\n\nNow, let's add up the total number of bananas needed:\n400 (monkeys) + 800 (gorillas) + 200 (baboons) = 1400 bananas\n\nThe zookeeper needs to order 1400 bananas to last for 2 months.\n\nAnswer: 1400"
+    },
+    {
+      "id": "gsm8k-test-0157",
+      "correct": false,
+      "output": "To solve this problem, we need to calculate the total distance each person ran and then compare them.\n\nBlake runs back and forth 15 times on a 100-yard football field. Since he runs back and forth, he covers the entire length of the field twice. So, the total distance Blake runs is:\n\n15 * 2 * 100 yards = 3000 yards\n\nKelly runs back and forth once, covering the entire length of the field:\n\n1 * 2 * 100 yards = 200 yards\n\nThen, Kelly runs to the 40-yard line and back 34 times. Since she runs to the 40-yard line, she covers 60 yards (100 - 40) each time. So, the total distance Kelly runs is:\n\n34 * 2 * 60 yards = 4080 yards\n\nNow, we compare the total distances:\n\nBlake: 3000 yards\nKelly: 4080 yards\n\nSince Kelly runs farther than Blake, Kelly is the winner.\n\nTo find out how much farther Kelly runs than Blake, we subtract Blake's distance from Kelly's distance:\n\n4080 yards - 3000 yards = 1080 yards\n\nAnswer: 1080"
+    },
+    {
+      "id": "gsm8k-test-0158",
+      "correct": true,
+      "output": "To find the total amount Raphael spent, we need to calculate the cost of each item and add them together.\n\n1. Cost of pens: 4 pens * $1.5 each = $6\n2. Cost of notebooks: 2 notebooks * $4 each = $8\n3. Cost of bond paper: $20\n\nNow, let's add the costs together:\n$6 (pens) + $8 (notebooks) = $14\n$14 + $20 (bond paper) = $34\n\nAnswer: $34"
+    },
+    {
+      "id": "gsm8k-test-0159",
+      "correct": true,
+      "output": "To find the number of tadpoles Finn can see in the pond now, we need to follow the steps:\n\n1. Initially, Finn sees 11 tadpoles swimming in the pond.\n2. 6 tadpoles come out of hiding from under a lily pad, so we add 6 to the initial number: 11 + 6 = 17\n3. Then, 2 tadpoles hide under a rock, so we subtract 2 from the previous total: 17 - 2 = 15\n\nAnswer: 15"
+    },
+    {
+      "id": "gsm8k-test-0160",
+      "correct": true,
+      "output": "To find the tank's water depth on Wednesday, we need to follow the steps below:\n\n1. The tank had 17 feet of water on Monday.\n2. On Tuesday, the tank had 7 feet more water, so the depth of water on Tuesday is 17 + 7 = 24 feet.\n3. On Wednesday, the depth of the water is two thirds of what it was on Tuesday. To find two thirds of 24, we multiply 24 by 2/3.\n\n   24 * (2/3) = 24 * 2 / 3\n   = 48 / 3\n   = 16\n\nSo, the tank's water depth on Wednesday is 16 feet.\n\nAnswer: 16"
+    },
+    {
+      "id": "gsm8k-test-0161",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many fish Anakin and Locsin caught.\n\nStep 1: Find out how many fish Anakin caught.\nAnakin caught 10 starfish, 6 sea horses, and 3 clownfish. \nTotal number of fish Anakin caught = 10 + 6 + 3 = 19.\n\nStep 2: Find out how many starfish Locsin caught.\nLocsin caught 5 fewer starfish than Anakin. \nSo, Locsin caught 10 - 5 = 5 starfish.\n\nStep 3: Find out how many sea horses Locsin caught.\nLocsin caught 3 fewer sea horses than Anakin. \nSo, Locsin caught 6 - 3 = 3 sea horses.\n\nStep 4: Find out how many clownfish Locsin caught.\nLocsin caught 2 more clownfish than Anakin. \nSo, Locsin caught 3 + 2 = 5 clownfish.\n\nStep 5: Find out the total number of fish Anakin and Locsin caught.\nTotal number of fish Anakin caught = 19.\nTotal number of fish Locsin caught = 5 (starfish) + 3 (sea horses) + 5 (clownfish) = 13.\nTotal number of fish both Anakin and Locsin caught = 19 + 13 = 32.\n\nAnswer: 32"
+    },
+    {
+      "id": "gsm8k-test-0162",
+      "correct": false,
+      "output": "To solve this problem, we need to calculate the price increase every two months and add it to the original price.\n\n1. First, we calculate the price increase after the first two months:\n   Original price = $20\n   Increase = 20% of $20 = 0.20 * $20 = $4\n   Price after 2 months = $20 + $4 = $24\n\n2. Next, we calculate the price increase after the next two months (4 months total):\n   Original price = $24\n   Increase = 20% of $24 = 0.20 * $24 = $4.80\n   Price after 4 months = $24 + $4.80 = $28.80\n\n3. We repeat this process for the remaining 28 months (24 months after the initial 4 months):\n   We can see a pattern here. The increase is 20% of the previous price. So, we can calculate the price after 28 months by multiplying the price after 4 months by 1.20 (1 + 0.20) 13 times.\n\n   Price after 28 months = $28.80 * (1.20)^13\n   Price after 28 months ≈ $28.80 * 2.219067227 = $63.79\n\n4. Finally, we calculate the price after the last two months (36 months total):\n   Price after 30 months = $63.79 * 1.20 = $76.35\n   Price after 36 months = $76.35 * 1.20 = $91.62\n\nAnswer: $91.62"
+    },
+    {
+      "id": "gsm8k-test-0163",
+      "correct": true,
+      "output": "To solve this problem, we need to find the cost of each toy and then add them up.\n\n1. We know that one red car costs $4. Since the doll costs as much as 3 action figures, let's first find the cost of 3 action figures.\n\n2. We are given that an action figure costs $5. So, the cost of 3 action figures is 3 * $5 = $15.\n\n3. Since the doll costs as much as 3 action figures, the doll also costs $15.\n\n4. Now, we know the cost of 1 red car ($4) and 1 doll ($15). We also know that one red car costs $4. So, the cost of 1 red car is $4.\n\n5. Now, we can find the total cost of all toys:\n   - 5 red cars: 5 * $4 = $20\n   - 3 action figures: 3 * $5 = $15\n   - 1 doll: $15\n\n6. Adding up the costs: $20 + $15 + $15 = $50\n\nAnswer: $50"
+    },
+    {
+      "id": "gsm8k-test-0164",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the difference in income between doing the taxes herself and hiring an accountant.\n\nFirst, let's calculate the lost income if Jackie does the taxes herself. She'll lose 3 hours of freelance work, and her hourly income is $35. So, the lost income is:\n\nLost income = 3 hours * $35/hour = $105\n\nNow, let's calculate the cost of hiring an accountant. The accountant charges $90.\n\nNext, let's calculate the difference in income between doing the taxes herself and hiring an accountant. This is the lost income minus the cost of hiring an accountant:\n\nDifference in income = Lost income - Cost of hiring an accountant\n= $105 - $90\n= $15\n\nSo, Jackie will have $15 more if she hires the accountant.\n\nAnswer: $15"
+    },
+    {
+      "id": "gsm8k-test-0165",
+      "correct": true,
+      "output": "To find out how much money Elvira will have left for her clothing, we need to calculate the total cost of the computer accessories and subtract that from her budget.\n\nStep 1: Calculate the total cost of the accessories.\n- Computer: €1090\n- Scanner: €157\n- CD burner: €74\n- Printer: €102\n\nTotal cost = €1090 + €157 + €74 + €102 = €1423\n\nStep 2: Subtract the total cost from Elvira's budget.\n- Budget: €1500\n- Total cost: €1423\n\nMoney left for clothing = €1500 - €1423 = €77\n\nAnswer: 77"
+    },
+    {
+      "id": "gsm8k-test-0166",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many eggs Sandra needs in total to make 15 Spanish flans. Since each flan requires 3 eggs, we multiply the number of flans by the number of eggs per flan:\n\n15 flans * 3 eggs/flan = 45 eggs\n\nNow, we know that Sandra gets 9 eggs every time she babysits. To find out how many times she needs to babysit, we divide the total number of eggs needed by the number of eggs she gets per babysitting session:\n\n45 eggs / 9 eggs/babysitting = 5\n\nAnswer: 5"
+    },
+    {
+      "id": "gsm8k-test-0167",
+      "correct": true,
+      "output": "Let's break down the problem step by step.\n\n1. Let's denote Brooke's current age as B and Seth's current age as S. We know that Seth is twice as old as Brooke, so we can write an equation:\n\nS = 2B\n\n2. In 2 years, Brooke's age will be B + 2 and Seth's age will be S + 2. The sum of their ages in 2 years will be 28, so we can write another equation:\n\n(B + 2) + (S + 2) = 28\n\n3. Now, substitute the expression for S from the first equation into the second equation:\n\n(B + 2) + (2B + 2) = 28\n\n4. Simplify the equation by combining like terms:\n\n3B + 4 = 28\n\n5. Subtract 4 from both sides of the equation:\n\n3B = 24\n\n6. Divide both sides of the equation by 3:\n\nB = 8\n\n7. Now that we know Brooke's age, we can find Seth's age by substituting B into the first equation:\n\nS = 2B\nS = 2(8)\nS = 16\n\nAnswer: 16"
+    },
+    {
+      "id": "gsm8k-test-0168",
+      "correct": true,
+      "output": "To solve this problem, we need to follow the steps:\n\n1. We know that Ethel has $8.\n2. We are told that Jimmy has $2 more than twice the money Ethel has. So, we need to find twice the amount of money Ethel has.\n   Twice the amount of money Ethel has = 2 * $8 = $16\n3. Now, we need to add $2 to the amount we found in step 2, since Jimmy has $2 more than twice the money Ethel has.\n   Jimmy's money = $16 + $2 = $18\n\nAnswer: $18"
+    },
+    {
+      "id": "gsm8k-test-0169",
+      "correct": true,
+      "output": "To find out how many miles Pancho walks in a week, we need to calculate the total miles he walks from Monday to Friday and then add the miles he walks on Saturday and Sunday.\n\n1. Calculate the miles walked from Monday to Friday:\n   Pancho walks 20 miles a day from Monday to Friday, which is 5 days.\n   Total miles walked from Monday to Friday = 20 miles/day * 5 days = 100 miles\n\n2. Calculate the miles walked on Saturday and Sunday:\n   Pancho walks 10 miles a day on weekends, which is 2 days.\n   Total miles walked on Saturday and Sunday = 10 miles/day * 2 days = 20 miles\n\n3. Calculate the total miles walked in a week:\n   Total miles walked in a week = Total miles walked from Monday to Friday + Total miles walked on Saturday and Sunday\n   Total miles walked in a week = 100 miles + 20 miles\n   Total miles walked in a week = 120 miles\n\nAnswer: 120"
+    },
+    {
+      "id": "gsm8k-test-0170",
+      "correct": true,
+      "output": "To find the total cost of each uniform, we need to calculate the cost of the hat, jacket, and pants separately and then add them together.\n\n1. The hat costs $25.\n2. The jacket costs three times as much as the hat, so the jacket costs 3 * $25 = $75.\n3. The pants cost the average of the costs of the hat and jacket. To find the average, we add the costs of the hat and jacket and divide by 2: ($25 + $75) / 2 = $50.\n\nNow, we add the costs of the hat, jacket, and pants together to find the total cost of each uniform: $25 + $75 + $50 = $150.\n\nAnswer: $150"
+    },
+    {
+      "id": "gsm8k-test-0171",
+      "correct": true,
+      "output": "To find the total number of legs, we need to calculate the number of legs for each type of creature and then add them together.\n\n1. Spiders: 80 spiders with 8 legs each\n   Total legs of spiders = 80 * 8 = 640\n\n2. Insects: 90 insects with 6 legs each\n   Total legs of insects = 90 * 6 = 540\n\n3. Rare mutant invertebrates: 3 invertebrates with 10 legs each\n   Total legs of invertebrates = 3 * 10 = 30\n\nNow, let's add the total number of legs for each type of creature:\nTotal legs = Total legs of spiders + Total legs of insects + Total legs of invertebrates\nTotal legs = 640 + 540 + 30\nTotal legs = 1210\n\nAnswer: 1210"
+    },
+    {
+      "id": "gsm8k-test-0172",
+      "correct": true,
+      "output": "To solve this problem, we need to find the ages of all four birds and then add them up.\n\n1. We know that Sally Thirty-two is 8 years old.\n2. Since Sally Four is the same age as Sally Thirty-two, Sally Four is also 8 years old.\n3. Granny Red is two times as old as Sally Four. So, Granny Red's age is 2 * 8 = 16 years old.\n4. Sally Two is three years older than Granny Red. So, Sally Two's age is 16 + 3 = 19 years old.\n\nNow, let's add up the ages of all four birds:\n8 (Sally Four) + 8 (Sally Thirty-two) + 16 (Granny Red) + 19 (Sally Two) = 51\n\nAnswer: 51"
+    },
+    {
+      "id": "gsm8k-test-0173",
+      "correct": true,
+      "output": "To find out how much Jessica pays each month, we need to calculate 50% more than the minimum payment for each debt.\n\n1. Student loans: 50% more than $300 is $300 + ($300 * 0.5) = $300 + $150 = $450.\n2. Credit card: 50% more than $200 is $200 + ($200 * 0.5) = $200 + $100 = $300.\n3. Mortgage: 50% more than $500 is $500 + ($500 * 0.5) = $500 + $250 = $750.\n\nNow, let's add up the monthly payments:\n$450 (student loans) + $300 (credit card) + $750 (mortgage) = $1500.\n\nTo find out how much Jessica pays in a year, we multiply the monthly payment by 12:\n$1500 * 12 = $18,000.\n\nAnswer: $18,000"
+    },
+    {
+      "id": "gsm8k-test-0174",
+      "correct": true,
+      "output": "To find the total time it will take Billy to finish prepping the potatoes, we need to calculate the time it takes to peel and cut each potato, then multiply it by the total number of potatoes.\n\nTime to peel a potato: 1.5 minutes\nTime to cut a potato: 5 seconds\n\nFirst, we need to convert the time to peel a potato into seconds:\n1.5 minutes * 60 seconds/minute = 90 seconds\n\nNow, we can calculate the total time it takes to peel and cut one potato:\n90 seconds (peeling) + 5 seconds (cutting) = 95 seconds\n\nNow, we multiply the time it takes to peel and cut one potato by the total number of potatoes:\n95 seconds/potato * 60 potatoes = 5700 seconds\n\nTo convert the total time into minutes and seconds, we divide by 60:\n5700 seconds / 60 = 95 minutes\n\nAnswer: 95"
+    },
+    {
+      "id": "gsm8k-test-0175",
+      "correct": false,
+      "output": "To solve this problem, we need to calculate the total revenue and total cost.\n\nFirst, let's calculate the total revenue. They sell each glass for $0.50 and get 20 glasses per gallon. So, the revenue per gallon is 20 * $0.50 = $10. Since they made $25 in profit, their total revenue is $25 + $10 = $35.\n\nNow, let's calculate the total cost. They spend $3 for lemons and $2 for sugar per gallon. So, the total cost per gallon is $3 + $2 = $5.\n\nSince they made $35 in revenue and spent $5 per gallon, they must have made 35 / 5 = 7 gallons.\n\nNow, let's calculate the total cost of lemons. They spent $3 per gallon and made 7 gallons. So, the total cost of lemons is 7 * $3 = $21.\n\nAnswer: $21"
+    },
+    {
+      "id": "gsm8k-test-0176",
+      "correct": true,
+      "output": "To find the number of girls on the Chinese team, we need to follow these steps:\n\n1. First, we need to find the total number of Chinese participants. We know that there are 240 participants in total and 80 of them are Japanese. So, the number of Chinese participants is:\n   240 (total participants) - 80 (Japanese participants) = 160 (Chinese participants)\n\n2. Next, we know that the number of boys on the Chinese team is 60. To find the number of girls, we need to subtract the number of boys from the total number of Chinese participants:\n   160 (Chinese participants) - 60 (Chinese boys) = 100 (Chinese girls)\n\nAnswer: 100"
+    },
+    {
+      "id": "gsm8k-test-0177",
+      "correct": true,
+      "output": "To solve this problem, we'll break it down step by step.\n\n1. Zaid earns 6000$ per month.\n\n2. He spends 1/4 of his salary on rent:\n   1/4 * 6000 = 1500$\n   Remaining amount after rent: 6000 - 1500 = 4500$\n\n3. He spends 1/3 of his salary on car fuel:\n   1/3 * 6000 = 2000$\n   Remaining amount after car fuel: 4500 - 2000 = 2500$\n\n4. He donates half of the remaining amount to his favorite charity:\n   Half of 2500 is 2500 / 2 = 1250$\n   Remaining amount after donation: 2500 - 1250 = 1250$\n\n5. He gives his daughter 200$ and his wife 700$:\n   Total amount given away: 200 + 700 = 900$\n   Remaining amount after giving to family: 1250 - 900 = 350$\n\nAnswer: 350"
+    },
+    {
+      "id": "gsm8k-test-0178",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many crabs each person has and then add them together.\n\n1. We know that Bo has 40 crabs.\n2. Monic has 4 fewer crabs than Bo, so Monic has 40 - 4 = 36 crabs.\n3. Rani has 10 more crabs than Monic, so Rani has 36 + 10 = 46 crabs.\n\nNow, let's add the number of crabs each person has together:\n40 (Bo) + 36 (Monic) + 46 (Rani) = 122\n\nAnswer: 122"
+    },
+    {
+      "id": "gsm8k-test-0179",
+      "correct": true,
+      "output": "To find out how much Lloyd earned for the first two weeks, we need to calculate his earnings for each week and then add them together.\n\nStep 1: Calculate earnings for the first week\nLloyd earns $10 an hour and tutored for 5 hours in the first week.\nEarnings for the first week = $10/hour * 5 hours = $50\n\nStep 2: Calculate earnings for the second week\nLloyd earns $10 an hour and tutored for 8 hours in the second week.\nEarnings for the second week = $10/hour * 8 hours = $80\n\nStep 3: Calculate total earnings for the first two weeks\nTotal earnings = Earnings for the first week + Earnings for the second week\nTotal earnings = $50 + $80\nTotal earnings = $130\n\nAnswer: $130"
+    },
+    {
+      "id": "gsm8k-test-0180",
+      "correct": true,
+      "output": "To find the number of votes the loser got, we need to first find the number of votes the winner got. \n\nSince the winner got 3/4 of the votes, we can calculate the number of votes the winner got by multiplying the total number of students who voted (80) by 3/4.\n\nNumber of votes the winner got = 80 * (3/4) = 60\n\nNow, we know that the total number of votes is 80, and the winner got 60 votes. To find the number of votes the loser got, we can subtract the number of votes the winner got from the total number of votes.\n\nNumber of votes the loser got = Total number of votes - Number of votes the winner got\n= 80 - 60\n= 20\n\nAnswer: 20"
+    },
+    {
+      "id": "gsm8k-test-0181",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. Sandra ordered four times as many red roses as white carnations. Let's denote the number of white carnations as x. Then, the number of red roses is 4x.\n\n2. Sandra also ordered 200 pink calla lilies, which were five times the number of white carnations. Since the number of pink calla lilies is 200, we can set up the equation 5x = 200 to find the number of white carnations.\n\n3. Solving the equation 5x = 200, we get x = 200 / 5 = 40. This means Sandra ordered 40 white carnations.\n\n4. Since the number of red roses is 4x, we can now find the number of red roses by multiplying 4 and 40: 4 * 40 = 160.\n\n5. Sandra has threatened to switch suppliers if the missing red roses are not delivered by 5 pm. This means that Fred must deliver the missing red roses by 5 pm.\n\n6. Since Fred must deliver 160 red roses, and we don't know how many are missing, we can assume that the missing red roses are the ones that were not delivered yet. Therefore, Fred must deliver 160 red roses by 5 pm.\n\nAnswer: 160"
+    },
+    {
+      "id": "gsm8k-test-0182",
+      "correct": false,
+      "output": "To solve this problem, we need to break it down step by step.\n\n1. We know Jan is 30 years old.\n\n2. Two years ago, Mark was 5 years older than half Jan's age. \n   First, we need to find half Jan's age two years ago. \n   Half of Jan's age two years ago = 30 / 2 = 15 years.\n   Since Mark was 5 years older than half Jan's age two years ago, \n   Mark's age two years ago = 15 + 5 = 20 years.\n\n3. Since we know Mark's age two years ago, we can find his current age by adding 2 years to his age two years ago.\n   Mark's current age = 20 + 2 = 22 years.\n\n4. We know Jean is two years older than Mark. \n   Jean's age = Mark's age + 2 = 22 + 2 = 24 years.\n\nAnswer: 24"
+    },
+    {
+      "id": "gsm8k-test-0183",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the total time taken by each team to complete the 4x400 meter relay.\n\nThe well-rounded team's time is calculated as follows:\n- Each member runs 400 meters in 55 seconds.\n- Since there are 4 members, the total time is 55 * 4 = 220 seconds.\n\nThe less well-rounded team's time is calculated as follows:\n- The first runner runs 400 meters in 60 seconds.\n- The second runner runs 400 meters in 60 - 3 = 57 seconds.\n- The third runner runs 400 meters in 57 - 3 = 54 seconds.\n- The fourth runner runs 400 meters in 54 - 3 = 51 seconds.\n- The total time is 60 + 57 + 54 + 51 = 222 seconds.\n\nNow, we need to find the difference in time between the two teams:\n- Faster team's time: 220 seconds\n- Slower team's time: 222 seconds\n- Difference: 222 - 220 = 2 seconds\n\nAnswer: 2"
+    },
+    {
+      "id": "gsm8k-test-0184",
+      "correct": true,
+      "output": "To solve this problem, we need to calculate the probability of rolling a number greater than 3 and the probability of rolling two even numbers in a row.\n\n1. Probability of rolling a number greater than 3:\nThere are 6 possible outcomes when rolling a six-sided die: 1, 2, 3, 4, 5, and 6. Out of these, 3 outcomes (4, 5, and 6) are greater than 3. So, the probability of rolling a number greater than 3 is 3/6 = 1/2 = 0.5.\n\n2. Probability of rolling two even numbers in a row:\nThere are 3 even numbers on a six-sided die: 2, 4, and 6. The probability of rolling an even number on the first roll is 3/6 = 1/2. Since the rolls are independent, the probability of rolling an even number on the second roll is also 1/2. So, the probability of rolling two even numbers in a row is (1/2) * (1/2) = 1/4 = 0.25.\n\n3. Difference in probabilities:\nTo find the difference in probabilities, subtract the probability of rolling two even numbers in a row from the probability of rolling a number greater than 3: 0.5 - 0.25 = 0.25.\n\n4. Percentage difference:\nTo express the difference as a percentage, multiply by 100: 0.25 * 100 = 25%.\n\nAnswer: 25"
+    },
+    {
+      "id": "gsm8k-test-0185",
+      "correct": true,
+      "output": "To solve this problem, we need to find out how many apples Jenna picked and then add that to the number of apples her mom picked.\n\nStep 1: Find out how many apples Jenna picked.\nJenna picked half as many apples as her mom. Since her mom picked 20 apples, Jenna picked half of that, which is 20 / 2 = 10 apples.\n\nStep 2: Add the number of apples Jenna picked to the number of apples her mom picked.\nTotal apples picked = Jenna's apples + Mom's apples\nTotal apples picked = 10 + 20\nTotal apples picked = 30\n\nAnswer: 30"
+    },
+    {
+      "id": "gsm8k-test-0186",
+      "correct": true,
+      "output": "To solve this problem, we need to first find out how many pieces of straw were distributed among the hamsters and rabbits. \n\nWe know that there are 10 cages of hamsters, each hamster is given 5 pieces of straw, so the total number of pieces of straw distributed among the hamsters is 10 * 5 = 50.\n\nWe also know that 20 pieces of straw are distributed among the rabbits.\n\nNow, let's add the number of pieces of straw distributed among the hamsters and rabbits to find the total number of pieces of straw distributed among the small rodents. \n50 (hamsters) + 20 (rabbits) = 70.\n\nWe know that 160 pieces of straw were distributed among the small rodents, and 70 pieces were distributed among the hamsters and rabbits. So, the number of pieces of straw distributed among the rats is 160 - 70 = 90.\n\nWe know that each rat is given 6 pieces of straw, and there are 90 pieces of straw distributed among the rats. To find the number of rats, we divide the total number of pieces of straw distributed among the rats by the number of pieces each rat is given. \n90 / 6 = 15.\n\nSince there are 3 cages in equal groups, we divide the total number of rats by 3 to find the number of rats in each cage. \n15 / 3 = 5.\n\nAnswer: 5"
+    },
+    {
+      "id": "gsm8k-test-0187",
+      "correct": true,
+      "output": "To calculate the amount Mandy should pay, we need to calculate the interest for 3 months.\n\nStep 1: Calculate the interest for 1 month\nInterest for 1 month = Principal * Rate\nInterest for 1 month = $100 * 2% = $100 * 0.02 = $2\n\nStep 2: Calculate the total interest for 3 months\nTotal interest = Interest for 1 month * Number of months\nTotal interest = $2 * 3 = $6\n\nStep 3: Calculate the total amount Mandy should pay\nTotal amount = Principal + Total interest\nTotal amount = $100 + $6 = $106\n\nAnswer: $106"
+    },
+    {
+      "id": "gsm8k-test-0188",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\n1. Let's assume the trader bought x bags of wheat.\n\n2. The cost of buying x bags at $20 per bag is 20x.\n\n3. The cost of transporting x bags at $2 per bag is 2x.\n\n4. The total cost for the trader is the sum of the buying cost and the transportation cost: 20x + 2x = 22x.\n\n5. The selling price of each bag is $30, so the total revenue from selling x bags is 30x.\n\n6. The profit made by the trader is the difference between the total revenue and the total cost: 30x - 22x = 8x.\n\n7. We are given that the total profit is $400, so we can set up the equation: 8x = 400.\n\n8. To find the value of x, we can divide both sides of the equation by 8: x = 400 / 8 = 50.\n\n9. Therefore, the trader bought 50 bags of wheat.\n\nAnswer: 50"
+    },
+    {
+      "id": "gsm8k-test-0189",
+      "correct": true,
+      "output": "To solve this problem, we need to break it down into steps.\n\nStep 1: Calculate the total cost of the tickets.\nThe total cost of the tickets is $20.25.\n\nStep 2: Calculate the total cost of the food.\nThey spent $4.50 less on food than on the tickets, so the total cost of the food is:\n$20.25 - $4.50 = $15.75\n\nStep 3: Calculate the total cost of the rides.\nThey went on 2 different rides, each costing $33. So, the total cost of the rides is:\n2 x $33 = $66\n\nStep 4: Calculate the total cost of all expenses.\nAdd up the costs of the tickets, food, and rides:\n$20.25 + $15.75 + $66 = $102\n\nStep 5: Calculate the cost per person.\nThe total cost is $102, and there are 3 friends. To split the costs evenly, divide the total cost by 3:\n$102 ÷ 3 = $34\n\nAnswer: $34"
+    },
+    {
+      "id": "gsm8k-test-0190",
+      "correct": true,
+      "output": "To find the total number of peaches John collects, we need to follow these steps:\n\n1. First, we need to find out how many minutes John collects peaches. Since he collects peaches for 3 hours, we need to convert the hours to minutes. \n   1 hour = 60 minutes\n   3 hours = 3 * 60 = 180 minutes\n\n2. Now that we know John collects peaches for 180 minutes, we can multiply this by the number of peaches he can collect per minute, which is 2 peaches.\n   Total peaches = peaches per minute * total minutes\n   Total peaches = 2 peaches/minute * 180 minutes\n   Total peaches = 360 peaches\n\nAnswer: 360"
+    },
+    {
+      "id": "gsm8k-test-0191",
+      "correct": false,
+      "output": "To find out how many pounds of insects the ducks need per day, we need to divide the total amount of insects they need per week by 7 (since there are 7 days in a week).\n\nStep 1: Calculate the total amount of insects needed per week\nTotal insects per week = 3.5 pounds\n\nStep 2: Divide the total amount of insects by 7 to find the amount needed per day\nInsects per day = Total insects per week / 7\nInsects per day = 3.5 pounds / 7\nInsects per day = 0.5 pounds\n\nAnswer: 0.5"
+    },
+    {
+      "id": "gsm8k-test-0192",
+      "correct": true,
+      "output": "To solve this problem, we'll break it down step by step.\n\n1. Tom starts with 50 trees.\n\n2. Every year, Tom plants 10 trees and chops down 2 trees. So, the net change in the number of trees each year is 10 - 2 = 8 trees.\n\n3. Since Tom does this for 10 years, the total number of trees he adds is 8 * 10 = 80 trees.\n\n4. Now, we need to add the trees he planted to the initial number of trees: 50 + 80 = 130 trees.\n\n5. After 10 years, 30% of the trees die. To find 30% of 130, we multiply 130 by 0.3: 130 * 0.3 = 39 trees.\n\n6. To find the number of trees left, we subtract the number of trees that died from the total number of trees: 130 - 39 = 91 trees.\n\nAnswer: 91"
+    },
+    {
+      "id": "gsm8k-test-0193",
+      "correct": true,
+      "output": "To solve this problem, let's break it down step by step.\n\nInitially, there were 18 pink plastic flamingos on Sue's front yard.\n\nOn Saturday morning, the neighbors took back one third of the flamingos, which is 18 / 3 = 6 flamingos. They painted these 6 flamingos white and put them back out. So now, there are 18 - 6 = 12 pink flamingos and 6 white flamingos.\n\nOn Sunday morning, the neighbors added another 18 pink plastic flamingos to the collection. Now, there are 12 pink flamingos + 18 new pink flamingos = 30 pink flamingos.\n\nThe number of white flamingos remains the same, which is 6.\n\nTo find out how many more pink plastic flamingos were out than white plastic flamingos, we subtract the number of white flamingos from the number of pink flamingos: 30 - 6 = 24.\n\nAnswer: 24"
+    },
+    {
+      "id": "gsm8k-test-0194",
+      "correct": true,
+      "output": "To find out how much change Violetta will get, we need to calculate the total cost of the crayons and subtract it from the amount she has.\n\nStep 1: Calculate the total cost of the crayons.\nVioletta needs 5 crayons, and each crayon costs $2.\nTotal cost = Number of crayons * Cost per crayon\nTotal cost = 5 * $2\nTotal cost = $10\n\nStep 2: Subtract the total cost from the amount Violetta has.\nAmount Violetta has = $20\nChange = Amount Violetta has - Total cost\nChange = $20 - $10\nChange = $10\n\nAnswer: $10"
+    },
+    {
+      "id": "gsm8k-test-0195",
+      "correct": false,
+      "output": "To find the cost of 8 pens, we need to find the cost of one pen first.\n\nA pencil costs $1.20 and an eraser costs $0.30. Since a pen costs as much as a pencil and eraser combined, we can find the cost of one pen by adding the cost of a pencil and an eraser.\n\nCost of one pen = Cost of pencil + Cost of eraser\n= $1.20 + $0.30\n= $1.50\n\nNow that we know the cost of one pen, we can find the cost of 8 pens by multiplying the cost of one pen by 8.\n\nCost of 8 pens = Cost of one pen * 8\n= $1.50 * 8\n= $12.00\n\nAnswer: $12.00"
+    },
+    {
+      "id": "gsm8k-test-0196",
+      "correct": true,
+      "output": "To find out how many pounds of carrots will not be used, we need to follow these steps:\n\n1. Calculate the total number of pounds of carrots each restaurant will receive: 2 pounds/restaurant * 40 restaurants = 80 pounds.\n\n2. Since we have 200 pounds of carrots in total, we need to subtract the amount used from the total to find the amount left: 200 pounds - 80 pounds = 120 pounds.\n\nTherefore, 120 pounds of carrots will not be used.\n\nAnswer: 120"
+    },
+    {
+      "id": "gsm8k-test-0197",
+      "correct": true,
+      "output": "To find the number of children in Soda, we need to subtract the number of men and women from the total population.\n\nStep 1: Add the number of men and women.\n8417 (men) + 9092 (women) = 17509\n\nStep 2: Subtract the total number of men and women from the total population.\n23786 (total population) - 17509 (men and women) = 6277\n\nTherefore, the number of children in Soda is 6277.\n\nAnswer: 6277"
+    },
+    {
+      "id": "gsm8k-test-0198",
+      "correct": true,
+      "output": "To solve this problem, we'll break it down step by step.\n\n1. Elaine initially had 20 Pokémon cards.\n\n2. In the first month, she collected three times that number:\n   3 * 20 = 60\n   Now she has 20 + 60 = 80 Pokémon cards.\n\n3. In the second month, she collected 20 fewer cards than those she collected in the first month:\n   60 - 20 = 40\n   Now she has 80 + 40 = 120 Pokémon cards.\n\n4. In the third month, she collected twice the combined number of Pokémon cards she collected in the first and second months:\n   First and second months combined: 60 + 40 = 100\n   Twice that number: 2 * 100 = 200\n   Now she has 120 + 200 = 320 Pokémon cards.\n\nAnswer: 320"
+    },
+    {
+      "id": "gsm8k-test-0199",
+      "correct": true,
+      "output": "To solve this problem, we need to break it down step by step.\n\n1. Mark edits a total number of 1000 sentences each week.\n2. Publisher A pays Mark 5 cents per sentence.\n3. Since Mark edits an equal number of sentences for both publishers, he edits 1000 / 2 = 500 sentences for each publisher.\n4. Publisher B pays Mark twice what Publisher A pays, so Publisher B pays 5 * 2 = 10 cents per sentence.\n5. To find out how much Mark makes from Publisher A, we multiply the number of sentences by the rate: 500 * 5 = 2500 cents.\n6. To find out how much Mark makes from Publisher B, we multiply the number of sentences by the rate: 500 * 10 = 5000 cents.\n7. To find the total amount Mark makes in a week, we add the amounts from both publishers: 2500 + 5000 = 7500 cents.\n\nAnswer: 7500"
+    }
+  ]
+}

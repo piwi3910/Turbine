@@ -32,7 +32,7 @@ use turbine_distributed::plan::{
 
 use turbine_distributed::collective::CollectiveLibrary;
 use turbine_model::ep::{self, EpAttention, EpShard, ExpertCountsSnapshot, ExpertTokenCounts};
-use turbine_model::load_model_config;
+use turbine_model::load_model_config_with;
 use turbine_model::tp::ShardSpec;
 use turbine_observability::MetricsRegistry;
 
@@ -75,9 +75,10 @@ pub fn plan_for(
         let mut plan = plan_execution_device(p, exec.device, None, host).map_err(plan_error)?;
         if plan.pp > 1 {
             // The cpu host path's stages (P5 S-10): split by the model's costs, device order.
-            let shape = load_model_config(&config.model.path)
-                .map_err(|e| PlanFailure::Startup(format!("model config: {e}")))?
-                .shape();
+            let shape =
+                load_model_config_with(&config.model.path, config.model.rope_scaling.as_ref())
+                    .map_err(|e| PlanFailure::Startup(format!("model config: {e}")))?
+                    .shape();
             plan_stages(&mut plan, p, &shape, &|_| None).map_err(plan_error)?;
         }
         return Ok(plan);
@@ -97,7 +98,7 @@ pub fn plan_for(
     if single_default {
         return plan_execution_device(p, exec.device, Some(vendor), host).map_err(plan_error);
     }
-    let shape = load_model_config(&config.model.path)
+    let shape = load_model_config_with(&config.model.path, config.model.rope_scaling.as_ref())
         .map_err(|e| PlanFailure::Startup(format!("model config: {e}")))?
         .shape();
     // Phase 3's device budget replaces this: total memory less the emergency reserve.
@@ -127,7 +128,7 @@ pub fn check_executable(plan: &mut ParallelPlan, config: &Config) -> Result<(), 
         return check_expert_parallel(plan, config);
     }
     if plan.pp > 1 {
-        let arch = load_model_config(&config.model.path)
+        let arch = load_model_config_with(&config.model.path, config.model.rope_scaling.as_ref())
             .map_err(|e| PlanFailure::Startup(format!("model config: {e}")))?;
         return turbine_model::pp::check(&arch, &plan.stages).map_err(|e| {
             tracing::error!(
@@ -154,7 +155,7 @@ pub fn check_executable(plan: &mut ParallelPlan, config: &Config) -> Result<(), 
                 .into(),
         ));
     }
-    let arch = load_model_config(&config.model.path)
+    let arch = load_model_config_with(&config.model.path, config.model.rope_scaling.as_ref())
         .map_err(|e| PlanFailure::Startup(format!("model config: {e}")))?;
     turbine_model::tp::check(
         &arch,
@@ -180,7 +181,7 @@ pub fn check_executable(plan: &mut ParallelPlan, config: &Config) -> Result<(), 
 
 /// [`check_executable`] of an expert-parallel plan.
 fn check_expert_parallel(plan: &mut ParallelPlan, config: &Config) -> Result<(), PlanFailure> {
-    let arch = load_model_config(&config.model.path)
+    let arch = load_model_config_with(&config.model.path, config.model.rope_scaling.as_ref())
         .map_err(|e| PlanFailure::Startup(format!("model config: {e}")))?;
     let refuse = |reason: &str, message: String| {
         tracing::error!(

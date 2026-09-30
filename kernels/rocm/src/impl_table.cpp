@@ -8,9 +8,14 @@
 //                                  BF16 buckets), 1 turbine_hip [turbine_hip]
 //   attention_prefill_paged      0 ck_tile_fmha_pagedkv [ck] (pages of a
 //                                  multiple of 128 tokens), 1 turbine_hip
+//                                  (BF16 pages); FP8 pages (v2.9): 2
+//                                  ck_tile_fmha_pagedkv_fp8_staged [ck]
+//                                  (multiple of 128), 3 turbine_hip_fp8
 //   attention_decode_paged       0 ck_tile_fmha_splitkv [ck] (grouped query
 //                                  heads, pages of a multiple of 128 tokens),
 //                                  1 ck_tile_fmha_pagedkv [ck], 2 turbine_hip
+//                                  (BF16 pages); FP8 pages: 3
+//                                  turbine_hip_fp8_decode, 4 turbine_hip_fp8
 //   copy_blocks                  0 hip_memcpy_d2d [turbine_hip]
 //   moe_experts                  0 turbine_hip_moe_small_m (hidden and inter
 //                                  multiples of 8; the first row tier),
@@ -23,8 +28,24 @@
 //   rope, silu_mul, embedding,   0 turbine_hip [turbine_hip]
 //   add, moe_route, logits_reduce,
 //   row_sumsq, rmsnorm_sharded (v2.6)
+//   qgemm (v2.9)                 0 hipblaslt_fp8 [hipblaslt] (FP8_TENSOR /
+//                                  FP8_CHANNEL weights, FP8_TENSOR /
+//                                  FP8_TOKEN activations)
+//                                1 turbine_hip_int4_wmma [turbine_hip],
+//                                2 turbine_hip_int4_dequant [turbine_hip]
+//                                  (INT4_GROUP_ZP / _SYM, BF16 activations)
+//                                n turbine_hip_fp8_block [turbine_hip]
+//                                  (FP8_BLOCK 128 x 128, BF16 activations)
+//   quantize_act (v2.9)          0 turbine_hip [turbine_hip] (FP8 modes)
+//   qgemm 3, quantize_act 1      turbine_hip_mxfp4 [turbine_hip] (MXFP4
+//                                  weights x BF16 activations; the
+//                                  MXFP4_EMULATED quantize-dequantize)
 #include <string>
 
+#include "qgemm_fp8_block.hpp"
+#include "qgemm_impls.hpp"
+#include "qgemm_int4.hpp"
+#include "qgemm_mxfp4.hpp"
 #include "turbine_hip.hpp"
 
 namespace turbine_hip {
@@ -161,6 +182,10 @@ const ImplEntry kPrefillPagedImpls[] = {
     entry<Paged<kPrefillPaged, PagedPath::CkPagedkv>>(
         "ck_tile_fmha_pagedkv", kCk, 0, page_multiple_allows),
     entry<Paged<kPrefillPaged, PagedPath::Turbine>>("turbine_hip", kTurbine),
+    entry<Paged<kPrefillPaged, PagedPath::CkPagedkvFp8Staged>>(
+        "ck_tile_fmha_pagedkv_fp8_staged", kCk),
+    entry<Paged<kPrefillPaged, PagedPath::TurbineFp8>>("turbine_hip_fp8",
+                                                       kTurbine),
 };
 const ImplEntry kDecodePagedImpls[] = {
     entry<Paged<kDecodePaged, PagedPath::CkSplitkv>>(
@@ -168,6 +193,10 @@ const ImplEntry kDecodePagedImpls[] = {
     entry<Paged<kDecodePaged, PagedPath::CkPagedkv>>(
         "ck_tile_fmha_pagedkv", kCk, 0, page_multiple_allows),
     entry<Paged<kDecodePaged, PagedPath::Turbine>>("turbine_hip", kTurbine),
+    entry<Paged<kDecodePaged, PagedPath::TurbineFp8Decode>>(
+        "turbine_hip_fp8_decode", kTurbine),
+    entry<Paged<kDecodePaged, PagedPath::TurbineFp8>>("turbine_hip_fp8",
+                                                      kTurbine),
 };
 const ImplEntry kCopyBlocks[] = {
     whole<turbine_copy_blocks_desc, turbine_copy_blocks_supported,
@@ -205,6 +234,46 @@ const ImplEntry kRmsnormSharded[] = {
           turbine_rmsnorm_sharded>("turbine_hip", kTurbine),
 };
 
+// An implementation given by its supports / run pair (qgemm_impls.hpp).
+template <typename D, bool (*Supports)(const D *),
+          int32_t (*Run)(turbine_ctx *, const D *)>
+struct Impl {
+  static bool supports(const void *d) {
+    return Supports(static_cast<const D *>(d));
+  }
+  static int32_t run(turbine_ctx *ctx, const void *d) {
+    return Run(ctx, static_cast<const D *>(d));
+  }
+};
+
+template <Int4Path Path> struct Int4 {
+  static bool supports(const void *d) {
+    return qgemm_int4_supports(static_cast<const turbine_qgemm_desc *>(d),
+                               Path);
+  }
+  static int32_t run(turbine_ctx *ctx, const void *d) {
+    return qgemm_int4_run(ctx, static_cast<const turbine_qgemm_desc *>(d),
+                          Path);
+  }
+};
+
+const ImplEntry kQGemm[] = {
+    entry<Impl<turbine_qgemm_desc, qgemm_fp8_supports, qgemm_fp8_run>>(
+        "hipblaslt_fp8", kHipblaslt),
+    entry<Int4<Int4Path::Wmma>>("turbine_hip_int4_wmma", kTurbine),
+    entry<Int4<Int4Path::Dequant>>("turbine_hip_int4_dequant", kTurbine),
+    entry<Impl<turbine_qgemm_desc, qgemm_mxfp4_supports, qgemm_mxfp4_run>>(
+        "turbine_hip_mxfp4", kTurbine),
+    entry<Impl<turbine_qgemm_desc, qgemm_fp8_block_supports,
+               qgemm_fp8_block_run>>("turbine_hip_fp8_block", kTurbine),
+};
+const ImplEntry kQuantizeAct[] = {
+    entry<Impl<turbine_quantize_act_desc, quantize_act_fp8_supports,
+               quantize_act_fp8_run>>("turbine_hip", kTurbine),
+    entry<Impl<turbine_quantize_act_desc, quantize_act_mxfp4_supports,
+               quantize_act_mxfp4_run>>("turbine_hip_mxfp4", kTurbine),
+};
+
 struct OpImpls {
   const ImplEntry *entries;
   int32_t count;
@@ -233,14 +302,16 @@ const OpImpls kOps[] = {
     of(kLogitsReduce),
     of(kRowSumsq),
     of(kRmsnormSharded),
+    of(kQGemm),
+    of(kQuantizeAct),
 };
-static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_RMSNORM_SHARDED + 1,
+static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_QUANTIZE_ACT + 1,
               "one implementation list per TURBINE_OP_* code");
 
 } // namespace
 
 const ImplEntry *impl_entries(int32_t op, int32_t *count) {
-  if (op < 0 || op > TURBINE_OP_RMSNORM_SHARDED) {
+  if (op < 0 || op > TURBINE_OP_QUANTIZE_ACT) {
     *count = 0;
     return nullptr;
   }

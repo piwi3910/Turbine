@@ -311,11 +311,13 @@ impl Engine {
             ModelIdentity {
                 config_hash: [7; 32],
                 weights_index_hash: [9; 32],
+                rope_hash: [0; 32],
             },
             KvFormat {
                 dtype: KvDtype::Bf16,
                 layout,
                 shards: 1,
+                scales: None,
             },
             args.l0_blocks,
             l1.clone(),

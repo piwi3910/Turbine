@@ -92,6 +92,9 @@ pub(crate) struct RopeDesc {
     pub k_stride_token: i64,
     pub style: i32,
     pub dtype: i32,
+    /// v2.10: YaRN's attention factor on cos/sin (1.0 = none); a library below minor 10 does
+    /// not read it and is only ever handed 1.0 ([`V21Symbols::rope_attn_factor`]).
+    pub attn_factor: f32,
 }
 
 /// `turbine_silu_mul_desc`.
@@ -186,6 +189,10 @@ pub(crate) struct AttentionPagedDesc {
     pub scale: f32,
     pub causal: i32,
     pub dtype: i32,
+    /// v2.9: per-layer K / V scales of FP8 pages (read only by a library of minor ≥ 9; 1.0
+    /// otherwise).
+    pub k_scale: f32,
+    pub v_scale: f32,
 }
 
 /// `turbine_copy_blocks_desc` (v2). `src_blocks`/`dst_blocks` are host arrays.
@@ -317,6 +324,49 @@ pub(crate) struct RowSumsqDesc {
     pub dtype: i32,
 }
 
+/// `turbine_qgemm_desc` (v2.9).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QGemmDesc {
+    pub a: *const c_void,
+    pub a_scales: *const f32,
+    pub b: *const c_void,
+    pub b_scales: *const c_void,
+    pub b_zeros: *const u8,
+    pub c: *mut c_void,
+    pub m: i64,
+    pub n: i64,
+    pub k: i64,
+    pub lda: i64,
+    pub ldc: i64,
+    pub scheme: i32,
+    pub act_quant: i32,
+    pub a_dtype: i32,
+    pub c_dtype: i32,
+    pub group_size: i32,
+    pub block_n: i32,
+    pub block_k: i32,
+    pub alpha: f32,
+    pub prefill: i32,
+}
+
+/// `turbine_quantize_act_desc` (v2.9).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuantizeActDesc {
+    pub x: *const c_void,
+    pub out: *mut c_void,
+    pub scales: *mut f32,
+    pub rows: i64,
+    pub cols: i64,
+    pub x_stride_row: i64,
+    pub out_stride_row: i64,
+    pub mode: i32,
+    pub static_scale: f32,
+    pub x_dtype: i32,
+    pub out_dtype: i32,
+}
+
 /// `turbine_rmsnorm_sharded_desc` (v2.6).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -444,6 +494,13 @@ pub(crate) struct TensorParallelFns {
     pub rmsnorm_sharded: OpTrio<RmsnormShardedDesc>,
 }
 
+/// The v2.9 quantization group: the `qgemm` and `quantize_act` trios.
+#[derive(Clone, Copy)]
+pub(crate) struct QuantFns {
+    pub qgemm: OpTrio<QGemmDesc>,
+    pub quantize_act: OpTrio<QuantizeActDesc>,
+}
+
 /// The v2.7 host-mapped group: `turbine_host_{alloc,free}_mapped`,
 /// `turbine_host_mapped_device_ptr` and the `mapped_collective` trio.
 #[derive(Clone, Copy)]
@@ -529,11 +586,12 @@ pub(crate) struct ImplFns {
     pub set_profile: unsafe extern "C" fn(*mut TurbineCtx, *const CardProfileDesc) -> i32,
 }
 
-/// The optional ABI v2.1–v2.7 functions. `minor` is `turbine_abi_minor()` (0 when the library
+/// The optional ABI v2.1–v2.10 functions. `minor` is `turbine_abi_minor()` (0 when the library
 /// lacks it); every v2.1 group is `None` unless `minor` ≥ 1, `staging` unless `minor` ≥ 3,
 /// `impls` unless `minor` ≥ 4, `copies` unless `minor` ≥ 5 and `staging` is resolved,
 /// `tensor_parallel` unless `minor` ≥ 6, `mapped` unless `minor` ≥ 7, and each only when the
-/// library exports the whole group.
+/// library exports the whole group; `rope_attn_factor` (a descriptor field, no symbol) is set
+/// from minor 10.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct V21Symbols {
     pub minor: u32,
@@ -555,6 +613,10 @@ pub(crate) struct V21Symbols {
     pub mapped_dseq: Option<MappedDseqFn>,
     /// v2.8 copy-engine all-reduce (needs the v2.7 group and the v2.3 / v2.5 copy functions).
     pub mapped_dma: Option<MappedDmaFns>,
+    /// v2.9 quantized GEMM and activation quantization (Phase 6a).
+    pub quant: Option<QuantFns>,
+    /// v2.10: the library reads `turbine_rope_desc.attn_factor` (minor ≥ 10; no new symbol).
+    pub rope_attn_factor: bool,
 }
 
 impl V21Symbols {
@@ -658,10 +720,21 @@ impl V21Symbols {
                 alloc: optional(lib, "turbine_host_alloc_dma")?,
             })
         })();
+        let quant = (|| {
+            if minor < 9 {
+                return None;
+            }
+            Some(QuantFns {
+                qgemm: optional_trio(lib, "qgemm")?,
+                quantize_act: optional_trio(lib, "quantize_act")?,
+            })
+        })();
         V21Symbols {
             minor,
+            rope_attn_factor: minor >= 10,
             mapped_dseq,
             mapped_dma,
+            quant,
             options,
             add_rmsnorm: optional_trio(lib, "add_rmsnorm"),
             logits_reduce: optional_trio(lib, "logits_reduce"),
@@ -833,4 +906,120 @@ pub(crate) fn check(
             message: format!("unknown status {other}: {message}"),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use turbine_core::types::DType;
+    use turbine_tensor::{DeviceMemory, Tensor};
+
+    use crate::KernelError;
+    use crate::ops::{KernelProvider, RopeConfig, RopeContext};
+    use crate::shim::tests::{STUB_CONTEXTS, mocked_device, stub_hook};
+    use crate::shim::{ShimLibrary, shim_provider};
+
+    /// Calls of `turbine_rope` the stub has seen and the `attn_factor` of the last one.
+    fn rope_calls(lib: &ShimLibrary) -> (i32, f32) {
+        let calls = stub_hook(
+            lib,
+            "stub_rope_calls",
+            |f: unsafe extern "C" fn() -> i32| {
+                // SAFETY: the stub defines `int32_t stub_rope_calls(void)`; the library is loaded.
+                unsafe { f() }
+            },
+        );
+        let last = stub_hook(
+            lib,
+            "stub_rope_last_attn_factor",
+            |f: unsafe extern "C" fn() -> f32| {
+                // SAFETY: the stub defines `float stub_rope_last_attn_factor(void)`.
+                unsafe { f() }
+            },
+        );
+        (calls, last)
+    }
+
+    /// Runs the provider's rope on 1-token device tensors with `attn_factor`.
+    fn run_rope(
+        provider: &Arc<dyn KernelProvider>,
+        mem: &Arc<dyn DeviceMemory>,
+        attn_factor: f32,
+    ) -> Result<(), KernelError> {
+        let cfg = RopeConfig {
+            num_q_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 4,
+            rotary_dim: 4,
+            dtype: DType::BF16,
+        };
+        let q = Tensor::empty(mem, &[1, 1, 4], DType::BF16).expect("q");
+        let k = Tensor::empty(mem, &[1, 1, 4], DType::BF16).expect("k");
+        let positions = Tensor::empty(mem, &[1], DType::I32).expect("positions");
+        let inv_freq = Tensor::empty(mem, &[2], DType::F32).expect("inv_freq");
+        provider
+            .rope()
+            .expect("rope family")
+            .execute(&mut RopeContext {
+                cfg,
+                q: q.view(),
+                k: k.view(),
+                positions: positions.view(),
+                inv_freq: inv_freq.view(),
+                attn_factor,
+            })
+    }
+
+    /// ABI v2.10 (Phase 6a Task 28a): `turbine_rope_desc.attn_factor` is handed only to a
+    /// library at minor ≥ 10. A minor-9 library reports no support, is refused a factor ≠ 1
+    /// with `rope_attn_factor_unavailable` before the library is called, and gets 1.0
+    /// otherwise; a minor-10 library reports support and receives the factor as passed.
+    /// Breaks if an older library is handed a factor it would ignore (a silent YaRN error) or
+    /// the factor does not reach a v2.10 library.
+    #[test]
+    fn optional_groups_v210_rope() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let m = 1.277_258_9_f32;
+
+        let v29 = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V29")), "hip")
+            .expect("a v2.9 library loads");
+        assert_eq!(v29.abi_minor(), 9);
+        assert!(!v29.rope_attn_factor());
+        let ctx = v29
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let provider = shim_provider(Arc::clone(&ctx));
+        assert!(!provider.rope().expect("rope").attn_factor_supported());
+        let before = rope_calls(&v29).0;
+        let err = run_rope(&provider, &mem, m).expect_err("a factor on a minor-9 library");
+        assert!(
+            err.to_string().contains("rope_attn_factor_unavailable"),
+            "{err}"
+        );
+        assert_eq!(rope_calls(&v29).0, before, "the library must not be called");
+        // Factor 1: the call reaches the library (the stub's rope is unsupported) with 1.0.
+        let err = run_rope(&provider, &mem, 1.0).expect_err("the stub rope fails");
+        assert!(err.to_string().contains("stub: rope"), "{err}");
+        assert_eq!(rope_calls(&v29), (before + 1, 1.0));
+        drop((provider, mem, ctx));
+
+        let v210 = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V210")), "hip")
+            .expect("a v2.10 library loads");
+        assert_eq!((v210.abi_version(), v210.abi_minor()), (2, 10));
+        assert!(v210.rope_attn_factor());
+        let ctx = v210
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let provider = shim_provider(Arc::clone(&ctx));
+        assert!(provider.rope().expect("rope").attn_factor_supported());
+        let before = rope_calls(&v210).0;
+        let err = run_rope(&provider, &mem, m).expect_err("the stub rope fails");
+        assert!(err.to_string().contains("stub: rope"), "{err}");
+        assert_eq!(rope_calls(&v210), (before + 1, m));
+        drop((provider, mem, ctx));
+    }
 }

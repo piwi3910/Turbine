@@ -1,0 +1,55 @@
+tests/eval/gsm8k-200.jsonl
+
+Derived from the first 200 items of the GSM8K test split
+(grade_school_math/data/test.jsonl) in https://github.com/openai/grade-school-math,
+commit 3101c7d5072418e28b9008a6636bde82a006892c. Each question is wrapped in a single
+user message with an answer-format instruction; the answer is the number after "#### "
+with thousands separators removed. Regenerate with scripts/eval/make-gsm8k-200.sh.
+
+tests/eval/gsm8k-full.jsonl
+
+The full GSM8K test split (1,319 items), downloaded from the Hugging Face dataset
+https://huggingface.co/datasets/openai/gsm8k (config `main`, split `test`), revision
+740312add88f781978c0658806c59bc2815b9866. Same wrapper, id scheme (`gsm8k-test-NNNN`)
+and answer extraction as gsm8k-200.jsonl above — its first 200 items are byte-identical
+to the committed gsm8k-200.jsonl. Regenerate with scripts/eval/make-gsm8k-full.sh
+(downloads the dataset's test-split parquet file on demand; needs `hf` and `uv`, run on
+novanas — the Hugging Face token lives there and nothing is uploaded).
+
+tests/eval/gsm8k-200-completion.jsonl
+
+The completion-form (no chat template) counterpart of gsm8k-200.jsonl, for base
+checkpoints that have no chat template. Same 200 questions and answers, same source
+and commit as gsm8k-200.jsonl above, fetched again to keep each item's full worked
+solution (gsm8k-200.jsonl's jq filter keeps only the final number). Wraps each
+question in a fixed 8-shot chain-of-thought completion prompt whose exemplars are
+items 200..207 of the same source file (outside the 200 scored items), each rendered
+as "Question: ... / <instruction> / <steps> / Answer: <number>" with the source's
+calculator annotations (`<<...>>`) stripped; the scored item's prompt ends after the
+instruction line, and the request carries `stop: ["\n\nQuestion:"]` so the model does
+not run on into a new question. Regenerate with
+scripts/eval/make-gsm8k-200-completion.sh.
+
+The source is distributed under the MIT License:
+
+MIT License
+
+Copyright (c) 2021 OpenAI
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

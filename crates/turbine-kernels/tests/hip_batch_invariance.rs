@@ -797,6 +797,8 @@ fn paged_run(
             max_kv_len: seqs.iter().map(|s| s.kv_len).max().unwrap_or(0) as u32,
             max_blocks_per_seq: max_blocks as u32,
             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+            k_scale: 1.0,
+            v_scale: 1.0,
         })
         .expect("paged attention");
     let out = read(&o);

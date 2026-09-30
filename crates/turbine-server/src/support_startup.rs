@@ -1,16 +1,20 @@
 //! The startup support-matrix decision (Phase 2m S-11, from the Phase 8 run-ahead): the key is
 //! built from the module registries — `vendor` from the configured execution backend
 //! (`ExecutionBackend::vendor`), `architecture` from the model's `config.json` (the Hugging Face
-//! name a `ModelFamily` claims), `arch` from the discovered device — with BF16 weights and KV and
-//! no speculation. It runs twice: [`before_discovery`] right after the configuration is read
+//! name a `ModelFamily` claims), `arch` from the discovered device, and the format columns from
+//! [`format_columns`] (the checkpoint's weight format and the configured L0 KV dtype; no
+//! speculation). It runs twice: [`before_discovery`] right after the configuration is read
 //! (also under `--check-config`; `arch` unknown except on the host backend), and
 //! [`after_discovery`] once the device's architecture is known. An `unsupported` resolution is a
 //! configuration error (exit 2, before any port is bound).
 
 use std::path::Path;
 
-use turbine_core::config::{Config, ConfigError};
-use turbine_core::support::{self, HOST_VENDOR, SupportDecision, SupportKey, SupportStatus};
+use turbine_core::config::{Config, ConfigError, KvDtypeChoice};
+use turbine_core::support::{
+    self, HOST_VENDOR, KvFormatColumn, SupportDecision, SupportKey, SupportStatus,
+    WeightFormatColumn,
+};
 use turbine_device::DeviceInventory;
 
 /// The support-matrix vendor column of `execution.backend` (already validated against the
@@ -54,13 +58,46 @@ pub fn device_arch(cfg: &Config, vendor: &str, inventory: &DeviceInventory) -> O
         .and_then(|d| d.arch.clone())
 }
 
+/// The format columns of the configured model: `(weight_format, kv_format)`. The weight column
+/// is the one of the checkpoint's packaging (`turbine_model::weights::detect` on `config.json`,
+/// Phase 6a S-3); BF16 when `config.json` cannot be read or detection refuses it (the model load
+/// then reports why). The KV column is `kv.dtype` (Phase 6a S-13).
+pub fn format_columns(cfg: &Config) -> (WeightFormatColumn, KvFormatColumn) {
+    (weight_column(&cfg.model.path), kv_column(cfg.kv.dtype))
+}
+
+/// The support-matrix weight column of the checkpoint in `model_dir`.
+pub fn weight_column(model_dir: &Path) -> WeightFormatColumn {
+    std::fs::read_to_string(model_dir.join("config.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|top| turbine_model::weights::detect(&top).ok())
+        .map_or(WeightFormatColumn::Bf16, |format| format.column())
+}
+
+/// The support-matrix KV column of `kv.dtype`: the column of the same spelling (a `kv.dtype`
+/// value lands together with its column).
+pub fn kv_column(dtype: KvDtypeChoice) -> KvFormatColumn {
+    KvFormatColumn::ALL
+        .into_iter()
+        .find(|c| c.as_str() == dtype.as_str())
+        .expect("every kv.dtype value has a support-matrix KV column")
+}
+
+/// The key before device discovery for `cfg` with the given format columns.
+pub fn key_before_discovery(
+    cfg: &Config,
+    weight: WeightFormatColumn,
+    kv: KvFormatColumn,
+) -> SupportKey {
+    let architecture = read_architecture(&cfg.model.path);
+    SupportKey::before_discovery(vendor(cfg), architecture.as_deref(), weight, kv)
+}
+
 /// The decision before device discovery (startup and `--check-config`).
 pub fn before_discovery(cfg: &Config) -> Result<SupportDecision, ConfigError> {
-    let architecture = read_architecture(&cfg.model.path);
-    support::check(SupportKey::before_discovery(
-        vendor(cfg),
-        architecture.as_deref(),
-    ))
+    let (weight, kv) = format_columns(cfg);
+    support::check(key_before_discovery(cfg, weight, kv))
 }
 
 /// The decision once the device is known; `first` is kept when the device arch is unknown.
@@ -76,7 +113,14 @@ pub fn after_discovery(
     if arch == first.key.arch {
         return Ok(first);
     }
-    let key = SupportKey::bf16(vendor, &arch, &first.key.architecture);
+    let key = SupportKey::for_model(
+        vendor,
+        &arch,
+        &first.key.architecture,
+        first.key.weight_format,
+        first.key.kv_format,
+        first.key.speculative,
+    );
     support::check(key)
 }
 
@@ -187,7 +231,12 @@ mod tests {
         for family in turbine_model::families::registry().iter() {
             for architecture in family.hf_architectures() {
                 for vendor in VENDORS {
-                    let key = SupportKey::before_discovery(vendor, Some(architecture));
+                    let key = SupportKey::before_discovery(
+                        vendor,
+                        Some(architecture),
+                        WeightFormatColumn::Bf16,
+                        KvFormatColumn::Bf16,
+                    );
                     let status = support::resolve_partial_in(support::SUPPORT_MATRIX, &key);
                     assert_ne!(
                         status.reason(),
@@ -201,6 +250,43 @@ mod tests {
         for backend in turbine_kernels::backends::registry().iter() {
             assert!(VENDORS.contains(&backend.vendor()), "{}", backend.name());
         }
+    }
+
+    /// Phase 6a S-13: the KV column is the configured `kv.dtype`; FP8 KV is supported on `amd`
+    /// gfx1201 Llama / OLMoE (Task 24 proof), refused elsewhere on `amd` (exit 2 naming
+    /// `kv.dtype`), and experimental on the cpu backend.
+    /// Breaks if the KV column is still hard-coded BF16.
+    #[test]
+    fn kv_column_follows_kv_dtype() {
+        let llama = model_dir(
+            "llama-fp8-kv",
+            serde_json::json!({"architectures": ["LlamaForCausalLM"]}),
+        );
+        let mut cfg = config("hip", llama.path());
+        assert_eq!(format_columns(&cfg).1, KvFormatColumn::Bf16);
+        cfg.kv.dtype = turbine_core::config::KvDtypeChoice::Fp8E4m3;
+        assert_eq!(format_columns(&cfg).1, KvFormatColumn::Fp8E4m3);
+        // Before discovery the arch is unknown: the gfx1201 row (supported after the Task 24
+        // proof) is the best any card could give.
+        let d = before_discovery(&cfg).unwrap();
+        assert_eq!(d.status.as_str(), "supported", "{:?}", d.key);
+        // A key on another architecture family is refused naming `kv.dtype`.
+        let qwen = model_dir(
+            "qwen-fp8-kv",
+            serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}),
+        );
+        let mut other = config("hip", qwen.path());
+        other.kv.dtype = turbine_core::config::KvDtypeChoice::Fp8E4m3;
+        let err = before_discovery(&other).unwrap_err();
+        assert_eq!(err.key(), Some("kv.dtype"), "{err}");
+        let mut cpu = config("cpu", llama.path());
+        cpu.kv.dtype = turbine_core::config::KvDtypeChoice::Fp8E4m3;
+        let d = before_discovery(&cpu).unwrap();
+        assert_eq!(
+            d.key.to_string(),
+            "cpu/cpu/LlamaForCausalLM/bf16/fp8_e4m3/none"
+        );
+        assert_eq!(d.status, SupportStatus::Experimental);
     }
 
     #[test]
@@ -242,20 +328,76 @@ mod tests {
         assert_eq!(d.status, SupportStatus::Experimental);
         assert_eq!(after_discovery(&cpu, &none, d.clone()).unwrap(), d);
 
-        // A Phase 8 family is refused on the GPU vendor before discovery, served on the host.
+        // A Phase 7 family is refused on the GPU vendor before discovery, served on the host.
         let qwen = model_dir(
             "qwen",
             serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}),
         );
         let err = before_discovery(&config("hip", qwen.path())).unwrap_err();
         assert_eq!(err.key(), Some("execution.backend"));
-        assert!(err.to_string().contains("phase-8c-model-families"), "{err}");
+        assert!(err.to_string().contains("phase-7-model-families"), "{err}");
         assert!(before_discovery(&config("cpu", qwen.path())).is_ok());
 
         // No config.json: the architecture is unknown.
         let empty = TempDir::new("empty");
         let d = before_discovery(&config("hip", empty.path())).unwrap();
         assert_eq!(d.key.architecture, WILDCARD);
+    }
+
+    /// Phase 6a S-1: the key carries the checkpoint's weight format and the L0 KV dtype instead
+    /// of hard-coded BF16, before and after discovery. Breaks if either column is dropped.
+    #[test]
+    fn key_uses_detected_format() {
+        let llama = model_dir(
+            "fmt",
+            serde_json::json!({"architectures": ["LlamaForCausalLM"]}),
+        );
+        let cfg = config("hip", llama.path());
+        // No `quantization_config`: BF16 weights; nothing configured: BF16 KV.
+        assert_eq!(
+            format_columns(&cfg),
+            (WeightFormatColumn::Bf16, KvFormatColumn::Bf16)
+        );
+        // A compressed-tensors FP8 checkpoint: the detected column.
+        let fp8 = model_dir(
+            "fmt-fp8",
+            serde_json::json!({"architectures": ["LlamaForCausalLM"],
+                "quantization_config": {"quant_method": "compressed-tensors",
+                    "format": "float-quantized", "ignore": ["lm_head"],
+                    "config_groups": {"group_0": {"targets": ["Linear"],
+                        "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}}}}}),
+        );
+        assert_eq!(
+            format_columns(&config("hip", fp8.path())),
+            (WeightFormatColumn::Fp8, KvFormatColumn::Bf16)
+        );
+        let key = key_before_discovery(&cfg, WeightFormatColumn::Fp8, KvFormatColumn::Bf16);
+        assert_eq!(key.to_string(), "amd/*/LlamaForCausalLM/fp8/bf16/none");
+        // Supported on gfx1201 Llama after its gate; another family is refused.
+        assert_eq!(support::check(key).unwrap().status.as_str(), "supported");
+        let qwen = model_dir(
+            "fmt-qwen",
+            serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}),
+        );
+        let key = key_before_discovery(
+            &config("hip", qwen.path()),
+            WeightFormatColumn::Fp8,
+            KvFormatColumn::Bf16,
+        );
+        let err = support::check(key).unwrap_err();
+        assert_eq!(err.key(), Some("model.path"));
+
+        // After discovery the format columns are kept.
+        let first = SupportDecision {
+            key: key_before_discovery(&cfg, WeightFormatColumn::Fp8, KvFormatColumn::Fp8E4m3),
+            status: SupportStatus::Experimental,
+        };
+        let err = after_discovery(&cfg, &inventory("gfx1201"), first).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("amd/gfx1201/LlamaForCausalLM/fp8/fp8_e4m3/none"),
+            "{err}"
+        );
     }
 
     #[test]

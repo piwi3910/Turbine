@@ -47,8 +47,9 @@ use crate::cards::CardProfile;
 use crate::ffi::{
     self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo,
     EmbeddingDesc, GemmDesc, LogitsReduceDesc, MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE,
-    MoeExpertsDesc, MoeRouteDesc, OpTrio, RmsnormDesc, RmsnormShardedDesc, RopeDesc, RowSumsqDesc,
-    ShimSymbols, SiluMulDesc, StagingFns, TurbineCtx, TurbineEvent, TurbineGraph,
+    MoeExpertsDesc, MoeRouteDesc, OpTrio, QGemmDesc, QuantizeActDesc, RmsnormDesc,
+    RmsnormShardedDesc, RopeDesc, RowSumsqDesc, ShimSymbols, SiluMulDesc, StagingFns, TurbineCtx,
+    TurbineEvent, TurbineGraph,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -58,10 +59,12 @@ use crate::ops::{
     KvCopyConfig, KvCopyContext, KvCopyKernel, LogitsReduceConfig, LogitsReduceContext,
     LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
     MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
-    ProviderId, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext, RopeKernel,
-    RowSumsqConfig, RowSumsqContext, ShardedNormKernel,
+    ProviderId, QGemmConfig, QGemmContext, QGemmKernel, QuantizeActConfig, QuantizeActContext,
+    QuantizeActKernel, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
+    RopeKernel, RowSumsqConfig, RowSumsqContext, ShardedNormKernel,
 };
 use crate::pinned::PinnedState;
+use crate::quant::{ActQuantDesc, QuantSchemeDesc};
 use crate::registry::OpConfig;
 use crate::{KernelError, TURBINE_KERNELS_ABI_VERSION};
 
@@ -208,6 +211,13 @@ impl ShimLibrary {
     /// v2.0 library such as the Phase 2 HIP build or the Phase 2b CUDA shim).
     pub fn abi_minor(&self) -> u32 {
         self.syms.v21.minor
+    }
+
+    /// True when the library reads `turbine_rope_desc.attn_factor` (ABI minor ≥ 10, Phase 6a
+    /// Task 28a): YaRN's attention factor on cos/sin. A library below it is never handed a
+    /// factor other than 1.0 (`rope_attn_factor_unavailable`).
+    pub fn rope_attn_factor(&self) -> bool {
+        self.syms.v21.rope_attn_factor
     }
 
     /// True when the library exports the ABI v2.1 graph functions (`turbine_graph_*`), so its
@@ -1487,6 +1497,7 @@ fn rope_probe(cfg: &RopeConfig) -> RopeDesc {
         k_stride_token: i64::from(cfg.num_kv_heads) * d,
         style: 0,
         dtype: cfg.dtype.abi_code(),
+        attn_factor: 1.0,
     }
 }
 
@@ -1551,6 +1562,51 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         scale: 1.0 / (cfg.head_dim.max(1) as f32).sqrt(),
         causal: i32::from(cfg.causal),
         dtype: cfg.dtype.abi_code(),
+        k_scale: 1.0,
+        v_scale: 1.0,
+    }
+}
+
+fn qgemm_probe(cfg: &QGemmConfig) -> QGemmDesc {
+    let (group_size, block_n, block_k) = cfg.scheme.abi_shape();
+    QGemmDesc {
+        a: null(),
+        a_scales: std::ptr::null(),
+        b: null(),
+        b_scales: null(),
+        b_zeros: std::ptr::null(),
+        c: null(),
+        m: 1,
+        n: i64::from(cfg.n),
+        k: i64::from(cfg.k),
+        lda: i64::from(cfg.k),
+        ldc: i64::from(cfg.n),
+        scheme: cfg.scheme.abi_code(),
+        act_quant: cfg.act_quant.abi_code(),
+        a_dtype: cfg.a_dtype.abi_code(),
+        c_dtype: cfg.c_dtype.abi_code(),
+        group_size,
+        block_n,
+        block_k,
+        alpha: 1.0,
+        prefill: 0,
+    }
+}
+
+fn quantize_act_probe(cfg: &QuantizeActConfig) -> QuantizeActDesc {
+    let cols = i64::from(cfg.cols);
+    QuantizeActDesc {
+        x: null(),
+        out: null(),
+        scales: std::ptr::null_mut(),
+        rows: 1,
+        cols,
+        x_stride_row: cols,
+        out_stride_row: cols,
+        mode: cfg.mode.abi_code(),
+        static_scale: 1.0,
+        x_dtype: cfg.x_dtype.abi_code(),
+        out_dtype: cfg.out_dtype.abi_code(),
     }
 }
 
@@ -1755,6 +1811,250 @@ impl ShimProvider {
                 .lacks("the ABI v2.6 row_sumsq / rmsnorm_sharded group")
         })
     }
+}
+
+impl ShimProvider {
+    /// The v2.9 group; `KernelProvider::qgemm` / `quantize_act` are `Some` exactly when it
+    /// exists.
+    fn quant_fns(&self) -> Result<&ffi::QuantFns, KernelError> {
+        self.syms().v21.quant.as_ref().ok_or_else(|| {
+            self.ctx
+                .lib
+                .lacks("the ABI v2.9 qgemm / quantize_act group")
+        })
+    }
+}
+
+/// A dense view's device pointer, or null for `None`.
+fn optional_ptr(
+    ctx: &ShimContext,
+    name: &str,
+    v: Option<&TensorView<'_>>,
+) -> Result<*const c_void, KernelError> {
+    v.map_or(Ok(null()), |v| {
+        ctx.device_ptr(name, v).map(|p| p as *const c_void)
+    })
+}
+
+impl QGemmKernel for ShimProvider {
+    fn supports(&self, cfg: &QGemmConfig) -> bool {
+        abi_act_mode(cfg.act_quant).is_ok()
+            && self
+                .quant_fns()
+                .is_ok_and(|f| Self::supported(&f.qgemm, &qgemm_probe(cfg)))
+    }
+
+    fn implementation(&self, cfg: &QGemmConfig) -> String {
+        self.quant_fns()
+            .map(|f| self.implementation_of(OpKind::QGemm, &f.qgemm, &qgemm_probe(cfg)))
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut QGemmContext<'_>) -> Result<(), KernelError> {
+        let fns = self.quant_fns()?;
+        let (lda, ldc) = check_qgemm(ctx)?;
+        let (m, k) = (ctx.a.shape[0], ctx.a.shape[1]);
+        let n = ctx.c.shape[1];
+        let (group_size, block_n, block_k) = ctx.cfg.scheme.abi_shape();
+        let d = QGemmDesc {
+            a: self.ctx.device_ptr("a", &ctx.a)?,
+            a_scales: optional_ptr(&self.ctx, "a_scales", ctx.a_scales.as_ref())?.cast(),
+            b: self.ctx.device_ptr("b", &ctx.b)?,
+            b_scales: self.ctx.device_ptr("b_scales", &ctx.b_scales)?,
+            b_zeros: optional_ptr(&self.ctx, "b_zeros", ctx.b_zeros.as_ref())?.cast(),
+            c: self.ctx.device_ptr("c", &ctx.c)?,
+            m: to_i64("m", m)?,
+            n: to_i64("n", n)?,
+            k: to_i64("k", k)?,
+            lda,
+            ldc,
+            scheme: ctx.cfg.scheme.abi_code(),
+            act_quant: ctx.cfg.act_quant.abi_code(),
+            a_dtype: ctx.a.dtype.abi_code(),
+            c_dtype: ctx.c.dtype.abi_code(),
+            group_size,
+            block_n,
+            block_k,
+            alpha: ctx.alpha,
+            prefill: i32::from(ctx.prefill),
+        };
+        self.run(OpKind::QGemm, &fns.qgemm, &d, m)
+    }
+}
+
+impl QuantizeActKernel for ShimProvider {
+    fn supports(&self, cfg: &QuantizeActConfig) -> bool {
+        abi_act_mode(cfg.mode).is_ok()
+            && self
+                .quant_fns()
+                .is_ok_and(|f| Self::supported(&f.quantize_act, &quantize_act_probe(cfg)))
+    }
+
+    fn implementation(&self, cfg: &QuantizeActConfig) -> String {
+        self.quant_fns()
+            .map(|f| {
+                self.implementation_of(
+                    OpKind::QuantizeAct,
+                    &f.quantize_act,
+                    &quantize_act_probe(cfg),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut QuantizeActContext<'_>) -> Result<(), KernelError> {
+        let fns = self.quant_fns()?;
+        abi_act_mode(ctx.cfg.mode)?;
+        let x_stride_row = row_stride("x", &ctx.x, 2)?;
+        let out_stride_row = row_stride("out", &ctx.out, 2)?;
+        let (rows, cols) = (ctx.x.shape[0], ctx.x.shape[1]);
+        if ctx.out.shape.as_slice() != [rows, cols] {
+            return Err(invalid(format!(
+                "quantize_act: out has shape {:?}, expected [{rows}, {cols}]",
+                ctx.out.shape.as_slice()
+            )));
+        }
+        let scales = ctx.cfg.mode.scale_count(rows, cols);
+        dense("scales", &ctx.scales, &[scales], DType::F32)?;
+        let d = QuantizeActDesc {
+            x: self.ctx.device_ptr("x", &ctx.x)?,
+            out: self.ctx.device_ptr("out", &ctx.out)?,
+            scales: self.ctx.device_ptr("scales", &ctx.scales)?.cast(),
+            rows: to_i64("rows", rows)?,
+            cols: to_i64("cols", cols)?,
+            x_stride_row,
+            out_stride_row,
+            mode: ctx.cfg.mode.abi_code(),
+            static_scale: ctx.static_scale,
+            x_dtype: ctx.x.dtype.abi_code(),
+            out_dtype: ctx.out.dtype.abi_code(),
+        };
+        self.run(OpKind::QuantizeAct, &fns.quantize_act, &d, rows)
+    }
+}
+
+/// Refuses an activation mode the C ABI cannot describe: `TURBINE_ACTQ_FP8_GROUP128` carries no
+/// group size, so an FP8 group other than 128 would reach the library as 128 columns per scale
+/// (a scale buffer sized for fewer groups than the kernel writes or reads).
+fn abi_act_mode(mode: ActQuantDesc) -> Result<(), KernelError> {
+    match mode {
+        ActQuantDesc::Fp8Group { group } if group != ABI_ACT_GROUP => Err(invalid(format!(
+            "activation mode fp8_group of {group} columns: the ABI carries only groups of \
+             {ABI_ACT_GROUP}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The one FP8 activation group size of the C ABI (`TURBINE_ACTQ_FP8_GROUP128`).
+const ABI_ACT_GROUP: u32 = 128;
+
+/// Checks that `v` is a dense view of `dtype` holding exactly `count` elements (a scale or
+/// zero-point buffer the descriptor passes as a bare pointer: its shape is free, its extent
+/// is not).
+fn dense_count(
+    name: &str,
+    v: &TensorView<'_>,
+    count: usize,
+    dtype: DType,
+) -> Result<(), KernelError> {
+    let elems: usize = v.shape.iter().product();
+    if v.dtype != dtype || elems != count || v.strides != contiguous_strides(&v.shape) {
+        return Err(invalid(format!(
+            "{name} must be a dense {} view of {count} elements, has {} shape {:?} strides {:?}",
+            dtype.as_str(),
+            v.dtype.as_str(),
+            v.shape.as_slice(),
+            v.strides.as_slice()
+        )));
+    }
+    Ok(())
+}
+
+/// Validates every operand of a quantized GEMM against the layout its scheme and activation
+/// mode imply (`crate::quant`, the header's QGEMM comment) before any pointer reaches the
+/// library, and returns `(lda, ldc)`. The descriptor carries bare pointers for the weight data,
+/// scales and zero points, so an undersized buffer would be read out of bounds on the device.
+fn check_qgemm(ctx: &QGemmContext<'_>) -> Result<(i64, i64), KernelError> {
+    let cfg = ctx.cfg;
+    abi_act_mode(cfg.act_quant)?;
+    let lda = row_stride("a", &ctx.a, 2)?;
+    let ldc = row_stride("c", &ctx.c, 2)?;
+    let (m, k) = (ctx.a.shape[0], ctx.a.shape[1]);
+    let n = ctx.c.shape[1];
+    if ctx.c.shape[0] != m || (n, k) != (cfg.n as usize, cfg.k as usize) {
+        return Err(invalid(format!(
+            "qgemm: a {:?} and c {:?} do not form the m × {} by {} × {} product of {cfg}",
+            ctx.a.shape.as_slice(),
+            ctx.c.shape.as_slice(),
+            cfg.k,
+            cfg.n,
+            cfg.k
+        )));
+    }
+    if ctx.a.dtype != cfg.a_dtype || ctx.c.dtype != cfg.c_dtype {
+        return Err(invalid(format!(
+            "qgemm: a is {} and c is {}, the config says {} and {}",
+            ctx.a.dtype.as_str(),
+            ctx.c.dtype.as_str(),
+            cfg.a_dtype.as_str(),
+            cfg.c_dtype.as_str()
+        )));
+    }
+    let scheme = cfg.scheme;
+    let (data_dtype, scale_dtype) = match scheme {
+        QuantSchemeDesc::Fp8Tensor
+        | QuantSchemeDesc::Fp8Channel
+        | QuantSchemeDesc::Fp8Block { .. } => (DType::F8E4M3, DType::F32),
+        QuantSchemeDesc::Int4GroupZp { .. } | QuantSchemeDesc::Int4GroupSym { .. } => {
+            (DType::U8, DType::F32)
+        }
+        QuantSchemeDesc::Mxfp4 => (DType::U8, DType::U8),
+    };
+    if data_dtype == DType::U8 && k % 2 != 0 {
+        return Err(invalid(format!(
+            "qgemm: {} packs two columns per byte, k = {k} is odd",
+            scheme.as_str()
+        )));
+    }
+    dense("b", &ctx.b, &[n, scheme.data_bytes(1, k)], data_dtype)?;
+    let groups = scheme.scale_count(n, k);
+    dense_count("b_scales", &ctx.b_scales, groups, scale_dtype)?;
+    match (scheme, ctx.b_zeros.as_ref()) {
+        (QuantSchemeDesc::Int4GroupZp { .. }, Some(z)) => {
+            dense_count("b_zeros", z, groups, DType::U8)?;
+        }
+        (QuantSchemeDesc::Int4GroupZp { .. }, None) => {
+            return Err(invalid("qgemm: int4_group_zp needs b_zeros".into()));
+        }
+        _ => {}
+    }
+    let mode = cfg.act_quant;
+    match (mode.is_fp8(), ctx.a_scales.as_ref()) {
+        (true, Some(s)) => {
+            // The activation scratch may hold more scales than this call's rows use.
+            let need = mode.scale_count(m, k);
+            let elems: usize = s.shape.iter().product();
+            if s.dtype != DType::F32 || elems < need || s.strides != contiguous_strides(&s.shape) {
+                return Err(invalid(format!(
+                    "a_scales must be a dense f32 view of at least {need} elements for {m} × \
+                     {k} in mode {}, has {} shape {:?} strides {:?}",
+                    mode.as_str(),
+                    s.dtype.as_str(),
+                    s.shape.as_slice(),
+                    s.strides.as_slice()
+                )));
+            }
+        }
+        (true, None) => {
+            return Err(invalid(format!(
+                "qgemm: activation mode {} needs a_scales",
+                mode.as_str()
+            )));
+        }
+        (false, _) => {}
+    }
+    Ok((lda, ldc))
 }
 
 /// Checks that `v` is a dense F32 view of shape `[rows]` (the per-row sums of squares).
@@ -2090,6 +2390,8 @@ impl AttentionKernel for ShimProvider {
             scale: ctx.scale,
             causal: i32::from(cfg.causal),
             dtype: cfg.dtype.abi_code(),
+            k_scale: ctx.k_scale,
+            v_scale: ctx.v_scale,
         };
         self.run(cfg.op(), trio, &d, 0)
     }
@@ -2331,8 +2633,24 @@ impl RopeKernel for ShimProvider {
         self.implementation_of(OpKind::Rope, &self.syms().rope, &rope_probe(cfg))
     }
 
+    fn attn_factor_supported(&self) -> bool {
+        self.ctx.library().rope_attn_factor()
+    }
+
     fn execute(&self, ctx: &mut RopeContext<'_>) -> Result<(), KernelError> {
+        if ctx.attn_factor != 1.0 && !self.attn_factor_supported() {
+            return Err(KernelError::Unsupported {
+                message: format!(
+                    "rope_attn_factor_unavailable: {} (kernel ABI minor {}) does not read the \
+                     rope attention factor {} (needs minor 10)",
+                    self.ctx.library().path().display(),
+                    self.ctx.library().abi_minor(),
+                    ctx.attn_factor
+                ),
+            });
+        }
         let mut d = rope_probe(&ctx.cfg);
+        d.attn_factor = ctx.attn_factor;
         d.q_stride_token = row_stride("q", &ctx.q, 3)?;
         d.k_stride_token = row_stride("k", &ctx.k, 3)?;
         d.num_tokens = to_i32("num_tokens", ctx.q.shape[0])?;
@@ -2482,6 +2800,20 @@ impl KernelProvider for ShimProvider {
             .is_some()
             .then_some(self as &dyn ShardedNormKernel)
     }
+    fn qgemm(&self) -> Option<&dyn QGemmKernel> {
+        self.syms()
+            .v21
+            .quant
+            .is_some()
+            .then_some(self as &dyn QGemmKernel)
+    }
+    fn quantize_act(&self) -> Option<&dyn QuantizeActKernel> {
+        self.syms()
+            .v21
+            .quant
+            .is_some()
+            .then_some(self as &dyn QuantizeActKernel)
+    }
 
     fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
         self.ctx.lib.implementations(op)
@@ -2576,12 +2908,16 @@ impl KernelProvider for ShimProvider {
                     && cfg.full_dim >= cfg.dim
                     && lib.impl_supports(OpKind::RmsnormSharded, index, &rmsnorm_sharded_probe(cfg))
             }
+            OpConfig::QGemm(cfg) => lib.impl_supports(OpKind::QGemm, index, &qgemm_probe(cfg)),
+            OpConfig::QuantizeAct(cfg) => {
+                lib.impl_supports(OpKind::QuantizeAct, index, &quantize_act_probe(cfg))
+            }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::Path;
 
     use turbine_core::types::{BlockId, DType, DeviceId, MemoryKind, Vendor};
@@ -2592,7 +2928,7 @@ mod tests {
     use super::*;
     use crate::KernelError;
 
-    fn mocked_device(arch: &str) -> DeviceInfo {
+    pub(crate) fn mocked_device(arch: &str) -> DeviceInfo {
         DeviceInfo {
             index: DeviceId(0),
             vendor: Vendor::Amd,
@@ -2611,14 +2947,18 @@ mod tests {
     }
 
     /// Calls a test hook the stub exports besides the ABI (not part of turbine_kernels.h).
-    fn stub_hook<T: Copy, R>(lib: &ShimLibrary, name: &str, call: impl FnOnce(T) -> R) -> R {
+    pub(crate) fn stub_hook<T: Copy, R>(
+        lib: &ShimLibrary,
+        name: &str,
+        call: impl FnOnce(T) -> R,
+    ) -> R {
         let f: T = ffi::resolve(&lib._lib, &lib.path, name).expect("stub test hook");
         call(f)
     }
 
     /// Serializes the tests that create contexts in the gfx942 stub: its live-context counter is
     /// process-global, so a parallel test's context would shift `live_contexts`.
-    static STUB_CONTEXTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static STUB_CONTEXTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn live_contexts(lib: &ShimLibrary) -> i32 {
         stub_hook(
@@ -3143,6 +3483,8 @@ mod tests {
             size_of::<RowSumsqDesc>(),
             size_of::<RmsnormShardedDesc>(),
             size_of::<ffi::MappedCollectiveDesc>(),
+            size_of::<ffi::QGemmDesc>(),
+            size_of::<ffi::QuantizeActDesc>(),
         ];
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");
@@ -3475,6 +3817,272 @@ mod tests {
         drop((dev, mem, ctx));
         assert_eq!(live_contexts(&lib), contexts - 1);
         assert_eq!(stub_count(&lib, "stub_live_streams"), 0);
+    }
+
+    /// ABI v2.9 (Phase 6a Task 7): a v2.8 library has no quantized GEMM and no activation
+    /// quantization, is not asked for their op codes, and a quantized config is not supported
+    /// by it; the v2.9 stub resolves both trios (named by the library's `_impl`, unsupported
+    /// like every stub op) and enumerates the new ops. Breaks if the group resolves on an older
+    /// library or is missing on a v2.9 one.
+    #[test]
+    fn optional_groups_v29() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let q_cfg = QGemmConfig {
+            n: 3072,
+            k: 3072,
+            scheme: QuantSchemeDesc::Fp8Channel,
+            act_quant: ActQuantDesc::Fp8Token,
+            a_dtype: DType::F8E4M3,
+            c_dtype: DType::BF16,
+        };
+        let a_cfg = QuantizeActConfig {
+            cols: 3072,
+            mode: ActQuantDesc::Fp8Token,
+            x_dtype: DType::BF16,
+            out_dtype: DType::F8E4M3,
+        };
+
+        let v28 = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V28")), "hip")
+            .expect("a v2.8 library loads");
+        assert_eq!(v28.abi_minor(), 8);
+        let old = v28
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let old_provider = shim_provider(Arc::clone(&old));
+        assert!(old_provider.qgemm().is_none());
+        assert!(old_provider.quantize_act().is_none());
+        assert!(!OpConfig::QGemm(q_cfg).supported_by(old_provider.as_ref()));
+        for op in [OpKind::QGemm, OpKind::QuantizeAct] {
+            assert!(v28.implementations(op).is_empty(), "{op}");
+        }
+        drop((old_provider, old));
+
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V29")), "hip")
+            .expect("a v2.9 library loads");
+        assert_eq!((lib.abi_version(), lib.abi_minor()), (2, 9));
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let provider = shim_provider(Arc::clone(&ctx));
+        let qgemm = provider.qgemm().expect("the v2.9 qgemm family");
+        assert!(!qgemm.supports(&q_cfg));
+        assert_eq!(qgemm.implementation(&q_cfg), "stub_qgemm");
+        let quant = provider
+            .quantize_act()
+            .expect("the v2.9 quantize_act family");
+        assert!(!quant.supports(&a_cfg));
+        assert_eq!(quant.implementation(&a_cfg), "stub_quantize_act");
+        for (op, name) in [
+            (OpKind::QGemm, "stub_qgemm"),
+            (OpKind::QuantizeAct, "stub_quantize_act"),
+        ] {
+            let impls = lib.implementations(op);
+            assert_eq!(impls.len(), 1, "{op}");
+            assert_eq!(impls[0].name, name);
+        }
+        drop((provider, ctx));
+    }
+
+    /// Review r13 C1: every quantized-GEMM operand is checked against its scheme's layout
+    /// before a pointer reaches the library. The reviewer's case (group-64 INT4, a `[1, 64]`,
+    /// c `[1, 16]`, b U8 `[16, 1]` instead of `[16, 32]`) and undersized or mistyped scales, zero
+    /// points and activation scales are refused; the well-formed operands pass. Breaks if any
+    /// buffer the descriptor passes as a bare pointer is forwarded without its extent checked.
+    #[test]
+    fn qgemm_operands_checked_against_scheme_layout() {
+        let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 16);
+        let t = |shape: &[usize], dtype: DType| Tensor::empty(&host, shape, dtype).unwrap();
+        let (m, n, k) = (3usize, 16usize, 64usize);
+        let zp = QuantSchemeDesc::Int4GroupZp { group: 64 };
+        let cfg = |scheme, act_quant, a_dtype| QGemmConfig {
+            n: n as u32,
+            k: k as u32,
+            scheme,
+            act_quant,
+            a_dtype,
+            c_dtype: DType::BF16,
+        };
+        let a = t(&[m, k], DType::BF16);
+        let a8 = t(&[m, k], DType::F8E4M3);
+        let c = t(&[m, n], DType::BF16);
+        let b4 = t(&[n, k / 2], DType::U8);
+        let b8 = t(&[n, k], DType::F8E4M3);
+        let scales = t(&[n, 1], DType::F32);
+        let zeros = t(&[n, 1], DType::U8);
+        let check = |cfg: QGemmConfig,
+                     a: &Tensor,
+                     a_scales: Option<&Tensor>,
+                     b: &Tensor,
+                     b_scales: &Tensor,
+                     b_zeros: Option<&Tensor>| {
+            check_qgemm(&QGemmContext {
+                cfg,
+                a: a.view(),
+                a_scales: a_scales.map(Tensor::view),
+                b: b.view(),
+                b_scales: b_scales.view(),
+                b_zeros: b_zeros.map(Tensor::view),
+                c: c.view(),
+                alpha: 1.0,
+                prefill: false,
+            })
+        };
+        let refused = |r: Result<(i64, i64), KernelError>, what: &str| match r {
+            Err(KernelError::InvalidArgument { message }) => {
+                assert!(message.contains(what), "{what}: {message}")
+            }
+            other => panic!("{what} must be refused, got {other:?}"),
+        };
+        let none = ActQuantDesc::None;
+        let int4 = cfg(zp, none, DType::BF16);
+        assert!(check(int4, &a, None, &b4, &scales, Some(&zeros)).is_ok());
+        // The reviewer's undersized packed weight.
+        refused(
+            check(
+                int4,
+                &a,
+                None,
+                &t(&[n, 1], DType::U8),
+                &scales,
+                Some(&zeros),
+            ),
+            "b must be",
+        );
+        // BF16 bytes where packed INT4 codes belong.
+        refused(
+            check(
+                int4,
+                &a,
+                None,
+                &t(&[n, k / 4], DType::BF16),
+                &scales,
+                Some(&zeros),
+            ),
+            "b must be",
+        );
+        refused(
+            check(int4, &a, None, &b4, &t(&[n / 2], DType::F32), Some(&zeros)),
+            "b_scales",
+        );
+        refused(
+            check(int4, &a, None, &b4, &t(&[n], DType::BF16), Some(&zeros)),
+            "b_scales",
+        );
+        refused(check(int4, &a, None, &b4, &scales, None), "b_zeros");
+        refused(
+            check(int4, &a, None, &b4, &scales, Some(&t(&[1], DType::U8))),
+            "b_zeros",
+        );
+        // A config that does not describe the views.
+        let wide = QGemmConfig { k: 128, ..int4 };
+        refused(check(wide, &a, None, &b4, &scales, Some(&zeros)), "product");
+
+        // FP8 block: [n/8, k/32] scales; a [k/32, n/8]-shaped buffer of the same count is not a
+        // layout question here (the loader checks shapes), a short one is.
+        let block = QuantSchemeDesc::Fp8Block {
+            block_n: 8,
+            block_k: 32,
+        };
+        let fp8 = cfg(block, ActQuantDesc::Fp8Token, DType::F8E4M3);
+        let bs = t(&[2, 2], DType::F32);
+        let a_scales = t(&[m], DType::F32);
+        assert!(check(fp8, &a8, Some(&a_scales), &b8, &bs, None).is_ok());
+        refused(
+            check(fp8, &a8, Some(&a_scales), &b8, &t(&[2], DType::F32), None),
+            "b_scales",
+        );
+        refused(
+            check(fp8, &a8, Some(&a_scales), &b4, &bs, None),
+            "b must be",
+        );
+        refused(
+            check(fp8, &a8, Some(&t(&[m - 1], DType::F32)), &b8, &bs, None),
+            "a_scales",
+        );
+        refused(check(fp8, &a8, None, &b8, &bs, None), "a_scales");
+        refused(
+            check(fp8, &a, Some(&a_scales), &b8, &bs, None),
+            "config says",
+        );
+
+        // MXFP4 scales are E8M0 bytes, one per 32 columns.
+        let mx = cfg(QuantSchemeDesc::Mxfp4, none, DType::BF16);
+        assert!(check(mx, &a, None, &b4, &t(&[n, 2], DType::U8), None).is_ok());
+        refused(
+            check(mx, &a, None, &b4, &t(&[n, 2], DType::F32), None),
+            "b_scales",
+        );
+    }
+
+    /// Review r13 C2: `TURBINE_ACTQ_FP8_GROUP128` carries no group size, so an FP8 activation
+    /// group other than 128 is refused by `quantize_act` and `qgemm` (both `supports` and
+    /// `execute`, before any buffer is touched) instead of reaching the library as 128. Breaks
+    /// if another group is forwarded under the GROUP128 code.
+    #[test]
+    fn fp8_act_group_other_than_128_is_refused() {
+        assert!(abi_act_mode(ActQuantDesc::Fp8Group { group: 128 }).is_ok());
+        for group in [64, 256] {
+            assert!(
+                abi_act_mode(ActQuantDesc::Fp8Group { group }).is_err(),
+                "{group}"
+            );
+        }
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V29")), "hip")
+            .expect("a v2.9 library loads");
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let provider = shim_provider(Arc::clone(&ctx));
+        let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 16);
+        let x = Tensor::empty(&host, &[1, 256], DType::BF16).unwrap();
+        let out = Tensor::empty(&host, &[1, 256], DType::F8E4M3).unwrap();
+        let scales = Tensor::empty(&host, &[1], DType::F32).unwrap();
+        let mode = ActQuantDesc::Fp8Group { group: 256 };
+        let err = provider
+            .quantize_act()
+            .expect("v2.9")
+            .execute(&mut QuantizeActContext {
+                cfg: QuantizeActConfig {
+                    cols: 256,
+                    mode,
+                    x_dtype: DType::BF16,
+                    out_dtype: DType::F8E4M3,
+                },
+                x: x.view(),
+                out: out.view(),
+                scales: scales.view(),
+                static_scale: 1.0,
+            })
+            .expect_err("group 256 is refused");
+        assert!(err.to_string().contains("only groups of 128"), "{err}");
+        let b = Tensor::empty(&host, &[4, 256], DType::F8E4M3).unwrap();
+        let bs = Tensor::empty(&host, &[4], DType::F32).unwrap();
+        let c = Tensor::empty(&host, &[1, 4], DType::BF16).unwrap();
+        let err = provider
+            .qgemm()
+            .expect("v2.9")
+            .execute(&mut QGemmContext {
+                cfg: QGemmConfig {
+                    n: 4,
+                    k: 256,
+                    scheme: QuantSchemeDesc::Fp8Channel,
+                    act_quant: mode,
+                    a_dtype: DType::F8E4M3,
+                    c_dtype: DType::BF16,
+                },
+                a: out.view(),
+                a_scales: Some(scales.view()),
+                b: b.view(),
+                b_scales: bs.view(),
+                b_zeros: None,
+                c: c.view(),
+                alpha: 1.0,
+                prefill: false,
+            })
+            .expect_err("group 256 is refused");
+        assert!(err.to_string().contains("only groups of 128"), "{err}");
+        drop((provider, ctx));
     }
 
     /// ABI v2.6 (Phase 5 Task 6): a v2.5 library has no native stream handle (the compute

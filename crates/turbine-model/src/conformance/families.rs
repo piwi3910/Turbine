@@ -152,9 +152,14 @@ fn cpu_model(
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).map_err(|e| e.to_string())?;
     let slots = cfg.family.0.weight_slots(cfg);
-    let weights =
-        WeightLoader::load_format(cfg.weight_format.0, &index, &slots, mem, MAX_STAGING_BYTES)
-            .map_err(|e| e.to_string())?;
+    let weights = WeightLoader::load_format(
+        cfg.weight_format.get(),
+        &index,
+        &slots,
+        mem,
+        MAX_STAGING_BYTES,
+    )
+    .map_err(|e| e.to_string())?;
     ensure(
         weights.unexpected.is_empty() && weights.ignored.is_empty(),
         || {

@@ -16,8 +16,8 @@ use crate::executor::decoder::{DecoderDims, FfnHook, HookBuffers, HookWeights, L
 use crate::executor::{ExecutorOptions, Split};
 use crate::loader::{LoadedWeights, gate_up_proj_name};
 
-/// Parameter indices of [`HookWeights`]: `[2·inter, hidden]` gate rows then up rows, and
-/// `[hidden, inter]` down.
+/// Linear-layer indices of [`HookWeights`] (BF16 or quantized, [`DecoderDims::take_linear`]):
+/// `[2·inter, hidden]` gate rows then up rows, and `[hidden, inter]` down.
 const GATE_UP: usize = 0;
 const DOWN: usize = 1;
 /// Buffer indices of [`HookBuffers::tensors`]: the gate/up projections (`[tokens, 2·inter]`,
@@ -58,11 +58,10 @@ impl FfnHook for SwiGlu {
         } else {
             d.inter
         };
-        vec![
-            OpConfig::Gemm(d.gemm(gate_up_rows, d.hidden, d.act)),
-            OpConfig::SiluMul(activation_cfg(d)),
-            OpConfig::Gemm(d.gemm(d.hidden, d.inter, d.act)),
-        ]
+        let mut ops = d.linear_ops(gate_up_rows, d.hidden);
+        ops.push(OpConfig::SiluMul(activation_cfg(d)));
+        ops.extend(d.linear_ops(d.hidden, d.inter));
+        ops
     }
 
     /// Per token the gate, up and SiLU·up rows (`3·inter` activation-dtype elements).
@@ -94,10 +93,17 @@ impl FfnHook for SwiGlu {
         weights: &mut LoadedWeights,
         _opts: ExecutorOptions,
     ) -> Result<HookWeights, ModelError> {
-        Ok(HookWeights(vec![
-            d.take_weight(weights, &gate_up_proj_name(layer), &[2 * d.inter, d.hidden])?,
-            weights.take(&format!("{prefix}.mlp.down_proj.weight"))?,
-        ]))
+        Ok(HookWeights(
+            Vec::new(),
+            vec![
+                d.take_linear(weights, &gate_up_proj_name(layer), &[2 * d.inter, d.hidden])?,
+                d.take_linear(
+                    weights,
+                    &format!("{prefix}.mlp.down_proj.weight"),
+                    &[d.hidden, d.inter],
+                )?,
+            ],
+        ))
     }
 
     fn forward(&self, run: &LayerRun<'_>, w: &HookWeights) -> Result<(), ModelError> {
@@ -111,9 +117,9 @@ impl FfnHook for SwiGlu {
         let gate = || split.part(gate_up, 0, t, &[d.inter]);
         let up = || split.part(gate_up, 1, t, &[d.inter]);
         if split.fused {
-            run.linear(run.normed(), w.0[GATE_UP].view(), split.whole(gate_up, t))?;
+            run.linear(run.normed(), w.1[GATE_UP].view(), split.whole(gate_up, t))?;
         } else {
-            let w = |r| w.0[GATE_UP].view().rows(r, d.inter);
+            let w = |r| w.1[GATE_UP].view().rows(r, d.inter);
             run.linear(run.normed(), w(0), gate())?;
             run.linear(run.normed(), w(d.inter), up())?;
         }
@@ -130,7 +136,7 @@ impl FfnHook for SwiGlu {
                 })
         })?;
         run.trace("act", &rows(act, t))?;
-        run.linear(rows(act, t), w.0[DOWN].view(), run.ffn_out())?;
+        run.linear(rows(act, t), w.1[DOWN].view(), run.ffn_out())?;
         run.trace("down", &run.ffn_out())
     }
 }

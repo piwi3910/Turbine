@@ -60,7 +60,7 @@ use turbine_kernels::{
     AddRmsnormConfig, AddRmsnormContext, AttentionConfig, AttentionKind, ElementwiseConfig,
     ElementwiseContext, EmbeddingConfig, EmbeddingContext, GemmConfig, GemmContext, KernelError,
     KernelRegistry, NormConfig, NormContext, OpConfig, OpRequirement, PagedAttentionContext,
-    RopeConfig, RopeContext,
+    QGemmContext, QuantizeActContext, RopeConfig, RopeContext,
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, StreamRef, Tensor, TensorView};
 
@@ -80,7 +80,10 @@ use crate::pp::PpContext;
 use crate::tp::{TpContext, rank_config};
 
 pub mod hooks;
+mod linear;
 mod trace;
+
+pub use linear::{Linear, LinearQuant, LinearView, QuantParts, QuantView};
 
 pub use hooks::{MOE, PLAIN_ATTENTION, QK_NORM_FULL, QK_NORM_PER_HEAD, SWIGLU};
 pub use trace::TraceTensor;
@@ -125,6 +128,12 @@ pub struct DecoderDims {
     pub layers: usize,
     /// RMSNorm epsilon.
     pub eps: f32,
+    /// The attention softmax scale ([`ModelArchConfig::attention_scale`]: `head_dim^-0.5`,
+    /// YaRN included).
+    pub attn_scale: f32,
+    /// The factor the rope op multiplies cos and sin by
+    /// ([`ModelArchConfig::rope_attention_factor`]: YaRN's attention factor, else 1.0).
+    pub rope_attn_factor: f32,
     /// Weights, activations and KV dtype (the weight format's; logits are F32).
     pub act: DType,
     /// The LM head is `embed_tokens` (`tie_word_embeddings`).
@@ -140,6 +149,11 @@ pub struct DecoderDims {
     /// An expert-parallel rank's experts and counts ([`crate::ep`]); `None` without expert
     /// parallelism.
     pub ep: Option<Arc<EpDims>>,
+    /// The quantization of the decoder's quantized linear layers (Phase 6a); `None` when every
+    /// layer is BF16. The LM head is always BF16.
+    pub quant: Option<LinearQuant>,
+    /// Some decoder linear layers stay BF16 (the checkpoint's ignore list, or no quantization).
+    pub bf16_linears: bool,
 }
 
 /// What a tensor-parallel rank's dims add ([`DecoderDims::for_shard`]).
@@ -160,6 +174,8 @@ pub struct TpDims {
 impl DecoderDims {
     pub fn of(cfg: &ModelArchConfig) -> DecoderDims {
         let head_dim = cfg.head_dim as usize;
+        // Mixed schemes are refused by the executor's weight-format check.
+        let (quant, bf16_linears) = LinearQuant::of(cfg).unwrap_or((None, true));
         DecoderDims {
             hidden: cfg.hidden as usize,
             heads: cfg.num_attention_heads as usize,
@@ -171,12 +187,16 @@ impl DecoderDims {
             vocab: cfg.vocab_size as usize,
             layers: cfg.num_layers as usize,
             eps: cfg.rms_norm_eps,
-            act: cfg.weight_format.0.activation_dtype(),
+            attn_scale: cfg.attention_scale(),
+            rope_attn_factor: cfg.rope_attention_factor(),
+            act: cfg.activation_dtype(),
             tied_lm_head: cfg.tie_word_embeddings,
             moe: cfg.moe,
             vocab_rows: cfg.vocab_size as usize,
             tp: None,
             ep: None,
+            quant,
+            bf16_linears,
         }
     }
 
@@ -261,14 +281,17 @@ impl DecoderDims {
         }
     }
 
-    /// Paged causal GQA attention over blocks of `block_tokens` tokens.
-    fn attention(&self, kind: AttentionKind, block_tokens: u32) -> AttentionConfig {
+    /// Paged causal GQA attention over blocks of `block_tokens` tokens of `kv` pages (the
+    /// activation dtype, or F8E4M3 under `kv.dtype: fp8_e4m3`: the config then names the page
+    /// dtype, [`AttentionConfig::dtype`]).
+    fn attention(&self, kind: AttentionKind, block_tokens: u32, kv: DType) -> AttentionConfig {
+        let dtype = if kv == DType::F8E4M3 { kv } else { self.act };
         AttentionConfig {
             kind,
             num_q_heads: self.heads as u32,
             num_kv_heads: self.kv_heads as u32,
             head_dim: self.head_dim as u32,
-            dtype: self.act,
+            dtype,
             block_tokens: Some(block_tokens),
             causal: true,
         }
@@ -295,8 +318,16 @@ impl DecoderDims {
     }
 }
 
-/// One layer's parameters of a hook, in the order the hook took them.
-pub struct HookWeights(pub Vec<Tensor>);
+/// One layer's parameters of a hook, in the order the hook took them: tensors, and linear
+/// layers that may be quantized ([`DecoderDims::take_linear`]).
+pub struct HookWeights(pub Vec<Tensor>, pub Vec<Linear>);
+
+impl HookWeights {
+    /// Tensors only.
+    pub fn tensors(tensors: Vec<Tensor>) -> HookWeights {
+        HookWeights(tensors, Vec::new())
+    }
+}
 
 /// A hook's activation buffers, allocated once for `max_batch_tokens` tokens
 /// ([`FfnHook::alloc`]): tensors and raw provider scratch, in the order the hook allocated them.
@@ -420,14 +451,15 @@ impl LayerRun<'_> {
         self.exec.profiler.step(self.exec.mem.as_ref(), op, imp, f)
     }
 
-    /// `c = a · wᵀ` for a `[n, k]` weight view `w`.
-    pub fn linear(
+    /// `c = a · wᵀ` for a `[n, k]` weight view `w` (a BF16 view, or a [`LinearView`] of a
+    /// possibly quantized layer).
+    pub fn linear<'w>(
         &self,
         a: TensorView<'_>,
-        w: TensorView<'_>,
+        w: impl Into<LinearView<'w>>,
         c: TensorView<'_>,
     ) -> Result<(), ModelError> {
-        self.exec.linear(a, w, c)
+        self.exec.linear(a, w.into(), c)
     }
 
     /// RMSNorm of `x` with weight `w` over rows of `w.len()` elements into `out` (may be `x`).
@@ -564,20 +596,76 @@ pub fn rows(buf: &Tensor, t: usize) -> TensorView<'_> {
     buf.view().rows(0, t)
 }
 
-/// Refuses a configuration whose weight format stores weights, activations and KV in different
-/// dtypes (the skeleton runs one dtype for all three).
-fn check_weight_format(cfg: &ModelArchConfig) -> Result<(), ModelError> {
-    let format = cfg.weight_format.0;
-    let act = format.activation_dtype();
-    if format.weight_dtype() == act && format.kv_dtype() == act {
-        Ok(())
-    } else {
-        Err(invalid(format!(
-            "the decoder executor runs weights, activations and KV in one dtype; weight format \
-             {} is not supported",
+/// Refuses what the decoder cannot run of a quantized weight format (Phase 6a): layers of
+/// different quantized schemes, a stacked parameter (fused Q/K/V, gate/up) whose parts differ
+/// in scheme, block-scaled parts not on block boundaries, a quantized LM head, quantized
+/// experts (`quant_moe_phase7`: mixture-of-experts layers are Phase 7's) and pipeline
+/// parallelism (`pipeline` set: not yet proven with quantized stages). Tensor parallelism is
+/// served (Phase 6a S-12): the loader refuses a shard that cuts a group or block
+/// (`quant_shard_misaligned`).
+fn check_weight_format(cfg: &ModelArchConfig, pipeline: bool) -> Result<(), ModelError> {
+    use crate::weights::QuantScheme;
+    let format = cfg.weight_format.get();
+    let (quant, _) = LinearQuant::of(cfg).map_err(|e| {
+        invalid(format!(
+            "quant_scheme_unsupported: weight format {} mixes schemes: {e}",
             format.name()
-        )))
+        ))
+    })?;
+    let Some(quant) = quant else {
+        return Ok(());
+    };
+    let refuse = |why: String| Err(invalid(format!("weight format {}: {why}", format.name())));
+    if cfg.moe.is_some() {
+        return refuse(
+            "quant_moe_phase7: quantized mixture-of-experts models arrive with Phase 7".into(),
+        );
     }
+    if pipeline {
+        return refuse(
+            "quant_pipeline_unsupported: quantized pipeline stages are not served".into(),
+        );
+    }
+    let schemes: std::collections::HashMap<String, QuantScheme> = cfg
+        .linear_slots()
+        .into_iter()
+        .map(|l| (l.name.clone(), format.scheme(&l)))
+        .collect();
+    if schemes
+        .get(LM_HEAD)
+        .is_some_and(|s| *s != QuantScheme::Bf16)
+    {
+        return refuse("quant_scheme_unsupported: a quantized lm_head (it stays BF16)".into());
+    }
+    let block_n = match quant.scheme {
+        QuantScheme::Fp8Block { n, .. } => n as usize,
+        _ => 1,
+    };
+    let mut stacks: std::collections::HashMap<String, QuantScheme> =
+        std::collections::HashMap::new();
+    for slot in cfg.family.0.weight_slots(cfg) {
+        let (Some(place), Some(scheme)) = (&slot.stack, schemes.get(&slot.name)) else {
+            continue;
+        };
+        if let Some(other) = stacks.insert(place.name.clone(), *scheme)
+            && other != *scheme
+        {
+            return refuse(format!(
+                "quant_scheme_unsupported: the parts of {} differ in scheme ({other:?}, {scheme:?} for {})",
+                place.name, slot.name
+            ));
+        }
+        if *scheme != QuantScheme::Bf16
+            && !(slot.shape[0].is_multiple_of(block_n)
+                && (place.offset / slot.shape[1]).is_multiple_of(block_n))
+        {
+            return refuse(format!(
+                "quant_scheme_unsupported: {} rows are not on {block_n}-row block boundaries of {}",
+                slot.name, place.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn batch_limits(cfg: &ModelArchConfig, limits: ExecutorLimits) -> BatchLimits {
@@ -585,7 +673,7 @@ fn batch_limits(cfg: &ModelArchConfig, limits: ExecutorLimits) -> BatchLimits {
         vocab: cfg.vocab_size,
         max_batch_tokens: limits.max_batch_tokens,
         max_seqs: limits.max_seqs,
-        max_positions: cfg.max_position_embeddings,
+        max_positions: cfg.max_positions(),
         layout: cfg.kv_layout(limits.block_tokens),
     }
 }
@@ -594,8 +682,8 @@ fn batch_limits(cfg: &ModelArchConfig, limits: ExecutorLimits) -> BatchLimits {
 struct Layer {
     input_norm: Tensor,
     /// `[q_dim + 2·kv_dim, hidden]`: Q rows, then K, then V.
-    w_qkv: Tensor,
-    wo: Tensor,
+    w_qkv: Linear,
+    wo: Linear,
     post_norm: Tensor,
     attention: HookWeights,
     ffn: HookWeights,
@@ -669,6 +757,9 @@ pub struct DecoderExecutor {
     lm_head: Option<Tensor>,
     bufs: Buffers,
     ffn_buffers: HookBuffers,
+    /// The activation-quantization scratch before a quantized layer: the quantized
+    /// `[tokens, k]` matrix and its scales, flat ([`DecoderDims::alloc_act_quant`]).
+    act_quant: Option<(Tensor, Tensor)>,
     /// The LM head output, its device reduction and the logits copy.
     head: LogitsHead,
     meta: DeviceBatch,
@@ -730,31 +821,32 @@ impl DecoderExecutor {
         block_tokens: u32,
         opts: ExecutorOptions,
     ) -> Vec<OpRequirement> {
-        let act = d.act;
         let mut specs = vec![
             OpConfig::Embedding(d.embedding()),
             OpConfig::Rmsnorm(d.norm(d.hidden)),
         ];
         if opts.fused_projections && spec.attention.fuses_qkv() {
-            specs.push(OpConfig::Gemm(d.gemm(
-                d.q_dim + 2 * d.kv_dim,
-                d.hidden,
-                act,
-            )));
+            specs.extend(d.linear_ops(d.q_dim + 2 * d.kv_dim, d.hidden));
         } else {
-            specs.extend([
-                OpConfig::Gemm(d.gemm(d.q_dim, d.hidden, act)),
-                OpConfig::Gemm(d.gemm(d.kv_dim, d.hidden, act)),
-            ]);
+            specs.extend(d.linear_ops(d.q_dim, d.hidden));
+            specs.extend(d.linear_ops(d.kv_dim, d.hidden));
         }
         specs.extend(spec.attention.requirements(d));
         specs.extend([
             OpConfig::Rope(d.rope()),
-            OpConfig::Attention(d.attention(AttentionKind::PrefillPaged, block_tokens)),
-            OpConfig::Attention(d.attention(AttentionKind::DecodePaged, block_tokens)),
-            OpConfig::Gemm(d.gemm(d.hidden, d.q_dim, act)),
-            OpConfig::Add(d.add()),
+            OpConfig::Attention(d.attention(
+                AttentionKind::PrefillPaged,
+                block_tokens,
+                cfg.kv_cache.dtype,
+            )),
+            OpConfig::Attention(d.attention(
+                AttentionKind::DecodePaged,
+                block_tokens,
+                cfg.kv_cache.dtype,
+            )),
         ]);
+        specs.extend(d.linear_ops(d.hidden, d.q_dim));
+        specs.push(OpConfig::Add(d.add()));
         if opts.fused_ops {
             specs.push(OpConfig::AddRmsnorm(d.add_norm()));
         }
@@ -844,6 +936,7 @@ impl DecoderExecutor {
         let per_seq = es * d.hidden as u64;
         let t = limits.max_batch_tokens;
         u64::from(t) * per_token
+            + d.act_quant_bytes(t as usize)
             + spec.ffn.workspace_bytes(d, t as usize)
             + u64::from(limits.max_seqs) * per_seq
             + LogitsHead::bytes(d.vocab, head_rows)
@@ -1023,7 +1116,7 @@ impl DecoderExecutor {
                  {max_seqs} must be positive"
             )));
         }
-        check_weight_format(cfg)?;
+        check_weight_format(cfg, pp.is_some())?;
         let d = match &ep {
             Some(e) => crate::ep::rank_dims(
                 cfg,
@@ -1052,13 +1145,15 @@ impl DecoderExecutor {
         for local in 0..cfg.num_layers {
             let i = first + local;
             let p = format!("model.layers.{i}");
-            let w_qkv = d.take_weight(&mut weights, &qkv_proj_name(i), &[qkv.width(), d.hidden])?;
+            let w_qkv = d.take_linear(&mut weights, &qkv_proj_name(i), &[qkv.width(), d.hidden])?;
+            let wo = d.take_linear(
+                &mut weights,
+                &format!("{p}.self_attn.o_proj.weight"),
+                &[d.hidden, d.q_dim],
+            )?;
             let mut take = |s: &str| weights.take(&format!("{p}.{s}.weight"));
-            let (input_norm, wo, post_norm) = (
-                take("input_layernorm")?,
-                take("self_attn.o_proj")?,
-                take("post_attention_layernorm")?,
-            );
+            let (input_norm, post_norm) =
+                (take("input_layernorm")?, take("post_attention_layernorm")?);
             let attention = spec.attention.load_layer(&d, &p, &mut weights)?;
             let ffn = spec.ffn.load_layer(&d, i, &p, &mut weights, opts)?;
             layers.push(Layer {
@@ -1099,6 +1194,7 @@ impl DecoderExecutor {
         let freq_bytes: Vec<u8> = freqs.iter().flat_map(|f| f.to_le_bytes()).collect();
         inv_freq.storage.copy_from_host(0, &freq_bytes)?;
         let ffn_buffers = spec.ffn.alloc(&d, t, &mem)?;
+        let act_quant = d.alloc_act_quant(t, &mem)?;
         mem.synchronize()?;
         let bufs = Buffers {
             inv_freq,
@@ -1143,6 +1239,7 @@ impl DecoderExecutor {
             lm_head,
             bufs,
             ffn_buffers,
+            act_quant,
             head,
             meta,
             host: HostBatch::default(),
@@ -1322,14 +1419,71 @@ impl DecoderExecutor {
         self.trace.record(layer, name, &view)
     }
 
-    /// `c = a · wᵀ` for a `[n, k]` weight view `w`.
+    /// `c = a · wᵀ` for a `[n, k]` layer `w`: the GEMM for a BF16 weight; for a quantized one
+    /// `quantize_act` into the scratch (when activations are quantized), then `qgemm`.
     fn linear(
+        &self,
+        a: TensorView<'_>,
+        w: LinearView<'_>,
+        c: TensorView<'_>,
+    ) -> Result<(), ModelError> {
+        let Some(q) = w.q else {
+            return self.gemm(a, w.w, c);
+        };
+        // `k` from the activations: packed 4-bit weights hold two columns per byte.
+        let (m, n, k) = (a.shape[0], w.w.shape[0], a.shape[1]);
+        let prefill = self.step_prefill.load(Ordering::Relaxed);
+        let (a, a_scales) = match (self.dims.quantize_act(k, q.quant), &self.act_quant) {
+            (None, _) => (a, None),
+            (Some(qa), Some((out, scales))) => {
+                let out = TensorView::contiguous(out.storage.whole(), 0, &[m, k], qa.out_dtype);
+                let count = qa.mode.scale_count(m, k).max(1);
+                let scales =
+                    TensorView::contiguous(scales.storage.whole(), 0, &[count], DType::F32);
+                self.op(OpConfig::QuantizeAct(qa), || {
+                    self.registry
+                        .quantize_act(&qa)
+                        .execute(&mut QuantizeActContext {
+                            cfg: qa,
+                            x: a,
+                            out: out.clone(),
+                            scales: scales.clone(),
+                            static_scale: q.input_scale,
+                        })
+                })?;
+                (out, qa.mode.is_fp8().then_some(scales))
+            }
+            (Some(_), None) => {
+                return Err(invalid(
+                    "quantized activations without the quantization scratch".into(),
+                ));
+            }
+        };
+        let cfg = self.dims.qgemm(n, k, q.quant);
+        self.op(OpConfig::QGemm(cfg), || {
+            self.registry.qgemm(&cfg).execute(&mut QGemmContext {
+                cfg,
+                a,
+                a_scales,
+                b: w.w,
+                b_scales: q.scales,
+                b_zeros: q.zeros,
+                c,
+                alpha: 1.0,
+                prefill,
+            })
+        })
+    }
+
+    /// `c = a · wᵀ` for a BF16 `[n, k]` weight view `w`.
+    fn gemm(
         &self,
         a: TensorView<'_>,
         w: TensorView<'_>,
         c: TensorView<'_>,
     ) -> Result<(), ModelError> {
         let cfg = self.dims.gemm(w.shape[0], w.shape[1], c.dtype);
+
         self.op(OpConfig::Gemm(cfg), || {
             self.registry.gemm(&cfg).execute(&mut GemmContext {
                 a,
@@ -1451,7 +1605,7 @@ impl DecoderExecutor {
         let f32 = DType::F32.size_bytes();
         let shard =
             TensorView::contiguous(bufs.shard_logits.storage.whole(), 0, &[n, vr], DType::F32);
-        self.linear(rows(&self.bufs.last, n), head.view(), shard.clone())?;
+        self.gemm(rows(&self.bufs.last, n), head.view(), shard.clone())?;
         let mut gathered = bufs.gathered.storage.whole().sub(0, world * n * vr * f32);
         self.profiler.step(
             self.mem.as_ref(),
@@ -1639,6 +1793,7 @@ impl DecoderExecutor {
                 k: k_heads(),
                 positions: w.meta.positions_view(p),
                 inv_freq: b.inv_freq.view(),
+                attn_factor: d.rope_attn_factor,
             })
         })?;
         self.record(li, "q_rope", q())?;
@@ -1648,7 +1803,14 @@ impl DecoderExecutor {
         } else {
             AttentionKind::PrefillPaged
         };
-        let attn = d.attention(kind, self.kv_layout.block_tokens);
+        let attn = d.attention(kind, self.kv_layout.block_tokens, self.kv_layout.dtype);
+        // The KV scales are the model layer's (a pipeline stage's layer `i` is model layer
+        // `layers.start + i`); every tensor-parallel rank has the same ones.
+        let model_layer = self.pp.as_ref().map_or(0, |pp| pp.layers.start as usize) + i;
+        let (k_scale, v_scale) = (
+            self.cfg.kv_cache.k_scale(model_layer),
+            self.cfg.kv_cache.v_scale(model_layer),
+        );
         let out = TensorView::contiguous(
             b.attn.storage.whole(),
             w.r0 * d.heads * d.head_dim,
@@ -1671,7 +1833,9 @@ impl DecoderExecutor {
                     max_q_len: p.max_q_len,
                     max_kv_len: p.max_kv_len,
                     max_blocks_per_seq: p.max_blocks_per_seq,
-                    scale: 1.0 / (d.head_dim as f32).sqrt(),
+                    scale: d.attn_scale,
+                    k_scale,
+                    v_scale,
                 })
         })?;
         self.record(li, "attn", at(&b.attn))?;
@@ -1868,7 +2032,7 @@ impl DecoderExecutor {
             .ok_or_else(|| invalid("LM head on a stage without it".into()))?;
         match (&self.tp, &self.tp_bufs) {
             (Some(tp), Some(bufs)) => self.tp_lm_head(tp, bufs, head, n)?,
-            _ => self.linear(rows(&b.last, n), head.view(), self.head.rows(n))?,
+            _ => self.gemm(rows(&b.last, n), head.view(), self.head.rows(n))?,
         }
         self.record(None, "logits", self.head.rows(n))?;
         self.head
@@ -2160,6 +2324,54 @@ mod tests {
     const BLOCK_TOKENS: u32 = 16;
     const MAX_SEQS: u32 = 16;
     const TABLE: u32 = 20;
+
+    /// Phase 6a Task 28a (spec S-15): with the factor-16 YaRN override the decoder's softmax
+    /// scale is `head_dim^-0.5`, as without YaRN, and the rope op gets transformers' attention
+    /// factor (`0.1 · ln 16 + 1`) — the factor is on cos/sin, not folded into the scale. Breaks
+    /// if the fold (scale × factor²) comes back or the factor stops reaching the rope op.
+    #[test]
+    fn yarn_softmax_scale_is_head_dim_rsqrt() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/llama-3.2-3b-instruct");
+        let yarn = serde_json::json!({
+            "rope_type": "yarn",
+            "factor": 16.0,
+            "original_max_position_embeddings": 8192,
+            "beta_fast": 32,
+            "beta_slow": 1
+        });
+        let cfg = crate::config::load_model_config_with(&dir, Some(&yarn)).expect("yarn config");
+        let plain = crate::config::load_model_config_with(&dir, None).expect("llama3 config");
+        let (d, p) = (DecoderDims::of(&cfg), DecoderDims::of(&plain));
+        assert_eq!(d.head_dim, 128);
+        assert_eq!(d.attn_scale, 1.0 / (128f32).sqrt());
+        assert_eq!(d.attn_scale, p.attn_scale);
+        assert_eq!(d.rope_attn_factor, (0.1 * 16f64.ln() + 1.0) as f32);
+        assert_eq!(p.rope_attn_factor, 1.0);
+    }
+
+    /// Review r13 P5: the activation-quantization scratch of an FP8-activation model is sized
+    /// with checked arithmetic — a token count whose `tokens × k` does not fit gives
+    /// `u64::MAX` (which no memory budget holds) and `alloc_act_quant` an error, never a wrapped
+    /// small size or a panic — while a real size is unchanged. Breaks if the product wraps.
+    #[test]
+    fn act_quant_scratch_size_does_not_wrap() {
+        use crate::weights::{ActivationQuant, QuantScheme};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/llama-3.2-3b-instruct");
+        let cfg = crate::config::load_model_config_with(&dir, None).expect("llama config");
+        let mut d = DecoderDims::of(&cfg);
+        d.quant = Some(LinearQuant {
+            scheme: QuantScheme::Fp8Channel,
+            act: ActivationQuant::Fp8PerTokenDynamic,
+        });
+        let k = d.hidden.max(d.q_dim).max(d.inter) as u64;
+        assert_eq!(d.act_quant_bytes(8), 8 * k + 8 * 4);
+        let huge = usize::MAX / 2;
+        assert_eq!(d.act_quant_bytes(huge), u64::MAX);
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 20);
+        assert!(d.alloc_act_quant(huge, &mem).is_err());
+    }
 
     /// The GraphKey formula of main's `LlamaExecutor::launch` / `OlmoeExecutor::launch`
     /// (Phase 2c), written out: `seqs` one-token sequences whose block tables need `blocks`

@@ -363,6 +363,7 @@ pub(crate) mod tests {
                 block_tokens: 16,
             },
             shards: 1,
+            scales: None,
         }
     }
 

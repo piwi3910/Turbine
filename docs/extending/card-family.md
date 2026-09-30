@@ -6,14 +6,14 @@ A card profile describes one GPU family declaratively: the device architectures 
 
 `turbine_kernels::cards::CardProfile` (`crates/turbine-kernels/src/cards/mod.rs`) — a `static`, not a trait implementation:
 
-| Field          | Meaning                                                                                                                                                                                                           |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`         | The registry and configuration name.                                                                                                                                                                              |
-| `vendor`       | The support-matrix vendor column (`amd`).                                                                                                                                                                         |
-| `archs`        | `DeviceInfo::arch` values it describes (`gfx1201`); each arch belongs to exactly one profile.                                                                                                                     |
-| `capabilities` | `CardCapabilities { matrix_instructions, bf16, wave_size, lds_bytes }`; `turbine_ctx_set_profile` refuses a wave size the library was not compiled for, or too little LDS.                                        |
-| `thresholds`   | `CardThresholds { moe_small_max_rows, paged_page_multiple }` — the tuned numbers the library's default path and the backend's notes read; never literals in C++.                                                  |
-| `preferences`  | `&[OpPreference { op, order, row_tiers }]`: implementation names in preference order per `OpKind`; `row_tiers` (ascending `max_rows`, last `None`) for `moe_experts`. An op without an entry keeps library order. |
+| Field          | Meaning                                                                                                                                                                                                                       |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`         | The registry and configuration name.                                                                                                                                                                                          |
+| `vendor`       | The support-matrix vendor column (`amd`).                                                                                                                                                                                     |
+| `archs`        | `DeviceInfo::arch` values it describes (`gfx1201`); each arch belongs to exactly one profile.                                                                                                                                 |
+| `capabilities` | `CardCapabilities { matrix_instructions, bf16, wave_size, lds_bytes }`; `turbine_ctx_set_profile` refuses a wave size the library was not compiled for, or too little LDS.                                                    |
+| `thresholds`   | `CardThresholds { moe_small_max_rows, paged_page_multiple }` — the tuned numbers the library's default path and the backend's notes read; never literals in C++.                                                              |
+| `preferences`  | `&[OpPreference { op, order, row_tiers }]`: implementation names in preference order per `OpKind`; `row_tiers` (ascending `max_rows`, last `None`) for `moe_experts` and `qgemm`. An op without an entry keeps library order. |
 
 ## Files to add
 

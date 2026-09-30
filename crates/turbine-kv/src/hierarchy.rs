@@ -1788,6 +1788,7 @@ pub(crate) mod tests {
         let model = ModelIdentity {
             config_hash: [1; 32],
             weights_index_hash: [2; 32],
+            rope_hash: [0; 32],
         };
         let h = KvHierarchy::new(
             cfg,

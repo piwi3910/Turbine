@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -50,6 +51,15 @@ struct GemmChoice {
 };
 
 struct TunedGemm;
+
+// The per-context state of the quantized GEMM (qgemm.cpp).
+struct QGemmCache;
+// The INT4 dequant path's BF16 staging buffer (qgemm_int4.hip).
+struct Int4Scratch;
+
+// The block-scaled FP8 dequant path's BF16 staging buffer
+// (qgemm_fp8_block.hip).
+struct Fp8BlockScratch;
 
 // The card profile a context holds (ABI v2.4 turbine_card_profile, copied by
 // turbine_ctx_set_profile). The turbine_<op> entry points read their
@@ -117,6 +127,15 @@ struct turbine_ctx {
   std::map<int32_t, std::map<std::string, int>> gemm_solutions;
   // Table rows whose fallback was logged (once per row and context).
   std::set<const turbine_hip::TunedGemm *> gemm_table_logged;
+  // v2.9 quantized GEMM algorithm cache (qgemm.cpp), created at the first
+  // turbine_qgemm call.
+  std::shared_ptr<turbine_hip::QGemmCache> qgemm;
+  // INT4 dequant-path staging buffer (qgemm_int4.hip), created at its first
+  // call.
+  std::shared_ptr<turbine_hip::Int4Scratch> qgemm_int4;
+  // Block-scaled FP8 dequant-path staging buffer (qgemm_fp8_block.hip),
+  // created at its first use.
+  std::shared_ptr<turbine_hip::Fp8BlockScratch> qgemm_fp8_block;
   // hipDeviceAttributeWallClockRate of the device (kHz), read at the first
   // host-mapped collective step (hostmem.hip); 0 until then.
   int64_t wall_clock_khz = 0;
@@ -296,7 +315,16 @@ int32_t add_rmsnorm_run(turbine_ctx *ctx, const turbine_add_rmsnorm_desc *d,
 // paged_attention.cpp: the paged attention implementations -- CK
 // fmha_fwd_pagedkv, CK fmha_fwd_splitkv (decode of grouped query heads only)
 // or the Turbine kernel; entry names the op in error messages.
-enum class PagedPath { CkPagedkv, CkSplitkv, Turbine };
+// FP8 pages (Phase 6a S-13): CkPagedkvFp8Staged (prefill, the pages staged as
+// BF16 for CK pagedkv), TurbineFp8Decode, TurbineFp8; the others are BF16 only.
+enum class PagedPath {
+  CkPagedkv,
+  CkSplitkv,
+  Turbine,
+  CkPagedkvFp8Staged,
+  TurbineFp8Decode,
+  TurbineFp8
+};
 bool paged_supports(const turbine_attention_paged_desc *d, PagedPath path);
 int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                   const char *entry, PagedPath path);

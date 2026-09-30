@@ -13,6 +13,7 @@ use turbine_tensor::{DeviceSlice, TensorView};
 
 use crate::KernelError;
 use crate::cards::CardProfile;
+use crate::quant::{ActQuantDesc, QuantSchemeDesc};
 use crate::registry::OpConfig;
 
 /// One entry point of the kernel C ABI; `as_str` is the `turbine_<op>` suffix and the `op`
@@ -43,6 +44,10 @@ pub enum OpKind {
     /// ABI v2.6 (optional in a shim library): RMSNorm of a slice with the all-reduced sum of
     /// squares of the full row.
     RmsnormSharded,
+    /// ABI v2.9 (optional in a shim library): GEMM against a quantized weight (Phase 6a).
+    QGemm,
+    /// ABI v2.9 (optional in a shim library): activation quantization before a quantized GEMM.
+    QuantizeAct,
 }
 
 impl OpKind {
@@ -66,6 +71,8 @@ impl OpKind {
         OpKind::LogitsReduce,
         OpKind::RowSumsq,
         OpKind::RmsnormSharded,
+        OpKind::QGemm,
+        OpKind::QuantizeAct,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -87,6 +94,8 @@ impl OpKind {
             OpKind::LogitsReduce => "logits_reduce",
             OpKind::RowSumsq => "row_sumsq",
             OpKind::RmsnormSharded => "rmsnorm_sharded",
+            OpKind::QGemm => "qgemm",
+            OpKind::QuantizeAct => "quantize_act",
         }
     }
 
@@ -110,6 +119,8 @@ impl OpKind {
             OpKind::LogitsReduce => 14,
             OpKind::RowSumsq => 15,
             OpKind::RmsnormSharded => 16,
+            OpKind::QGemm => 17,
+            OpKind::QuantizeAct => 18,
         }
     }
 
@@ -119,6 +130,7 @@ impl OpKind {
         match self {
             OpKind::AddRmsnorm | OpKind::LogitsReduce => 1,
             OpKind::RowSumsq | OpKind::RmsnormSharded => 6,
+            OpKind::QGemm | OpKind::QuantizeAct => 9,
             _ => 0,
         }
     }
@@ -245,6 +257,11 @@ pub struct AttentionConfig {
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
+    /// Element type of Q, the new K/V rows, the output and the KV. A paged kind may name
+    /// [`DType::F8E4M3`] (Phase 6a S-13, `kv.dtype: fp8_e4m3`): the pool pages are then OCP
+    /// e4m3fn bytes with one K and one V scale per layer ([`PagedAttentionContext::k_scale`]),
+    /// while Q, the new rows and the output stay BF16 (the C ABI's `dtype` names the pages the
+    /// same way).
     pub dtype: DType,
     /// KV page size in tokens for paged attention; `None` for the contiguous per-sequence KV of
     /// Phase 1.
@@ -518,7 +535,87 @@ impl fmt::Display for RmsnormShardedConfig {
     }
 }
 
+/// GEMM against a quantized weight (ABI v2.9 `qgemm`, Phase 6a):
+/// `c[m, n] = alpha · a[m, k] · dequant(b)[n, k]ᵀ`, F32 accumulation. `a_dtype` is BF16 for
+/// weight-only schemes (and MXFP4-emulated activations) or F8E4M3 for the FP8 activation
+/// modes; `c_dtype` BF16 or F32.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct QGemmConfig {
+    pub n: u32,
+    pub k: u32,
+    pub scheme: QuantSchemeDesc,
+    pub act_quant: ActQuantDesc,
+    pub a_dtype: DType,
+    pub c_dtype: DType,
+}
+
+impl fmt::Display for QGemmConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "n={} k={} scheme={} act={} a={} c={}",
+            self.n,
+            self.k,
+            self.scheme.as_str(),
+            self.act_quant.as_str(),
+            self.a_dtype.as_str(),
+            self.c_dtype.as_str()
+        )
+    }
+}
+
+/// Activation quantization before a quantized GEMM (ABI v2.9 `quantize_act`): `cols`-wide rows
+/// of `x_dtype` into `out_dtype` (F8E4M3 for the FP8 modes, BF16 for MXFP4 emulation).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct QuantizeActConfig {
+    pub cols: u32,
+    pub mode: ActQuantDesc,
+    pub x_dtype: DType,
+    pub out_dtype: DType,
+}
+
+impl fmt::Display for QuantizeActConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cols={} mode={} x={} out={}",
+            self.cols,
+            self.mode.as_str(),
+            self.x_dtype.as_str(),
+            self.out_dtype.as_str()
+        )
+    }
+}
+
 // --------------------------------------------------------------------------------- contexts
+
+/// `a`: `[m, k]` (`a_dtype`); `a_scales`: the activation scales of the FP8 modes (F32, dense:
+/// `[1]`, `[m]` or `[m, k / 128]`), else `None`; `b`: the packed weight bytes `[n, row bytes]`
+/// (U8 or F8E4M3) in the scheme's layout; `b_scales`: F32 scales, or E8M0 bytes (U8) for MXFP4;
+/// `b_zeros`: U8 zero points (INT4 with zero points only); `c`: `[m, n]`.
+pub struct QGemmContext<'a> {
+    pub cfg: QGemmConfig,
+    pub a: TensorView<'a>,
+    pub a_scales: Option<TensorView<'a>>,
+    pub b: TensorView<'a>,
+    pub b_scales: TensorView<'a>,
+    pub b_zeros: Option<TensorView<'a>>,
+    pub c: TensorView<'a>,
+    pub alpha: f32,
+    /// As [`GemmContext::prefill`].
+    pub prefill: bool,
+}
+
+/// `x`: `[rows, cols]`; `out`: `[rows, cols]` (F8E4M3 or BF16); `scales`: F32, dense, as many
+/// as the mode has for `rows × cols` (`ActQuantDesc::scale_count`); `static_scale`: the
+/// checkpoint's `input_scale` for [`ActQuantDesc::Fp8Tensor`].
+pub struct QuantizeActContext<'a> {
+    pub cfg: QuantizeActConfig,
+    pub x: TensorView<'a>,
+    pub out: TensorView<'a>,
+    pub scales: TensorView<'a>,
+    pub static_scale: f32,
+}
 
 /// `a`: `[m, k]`; `b`: `[n, k]` when `trans_b`, else `[k, n]`; `c`: `[m, n]`. Row strides are
 /// the leading dimensions.
@@ -566,6 +663,11 @@ pub struct PagedAttentionContext<'a> {
     pub max_blocks_per_seq: u32,
     /// Usually `1 / sqrt(head_dim)`.
     pub scale: f32,
+    /// FP8 pages (`cfg.dtype` F8E4M3): a K element is stored as `e4m3(k / k_scale)` and read as
+    /// `e4m3 · k_scale` rounded to the activation dtype, likewise V with `v_scale` (this layer's scales, > 0). Ignored (1.0 by
+    /// convention) for BF16 / F16 / F32 pages.
+    pub k_scale: f32,
+    pub v_scale: f32,
 }
 
 /// Copies block `src` to block `dst` in every layer, for each `(src, dst)` of `pairs` in order.
@@ -655,6 +757,11 @@ pub struct RopeContext<'a> {
     pub k: TensorView<'a>,
     pub positions: TensorView<'a>,
     pub inv_freq: TensorView<'a>,
+    /// YaRN's attention factor `m` (Phase 6a Task 28a, kernel ABI v2.10): cos and sin are
+    /// multiplied by it in F32 before they are rounded to the dtype, so the rotated q and k
+    /// carry it as transformers' do. 1.0 = none; a kernel whose
+    /// [`RopeKernel::attn_factor_supported`] is false refuses any other value.
+    pub attn_factor: f32,
 }
 
 /// `out = silu(gate) · up`, all `[rows, cols]`.
@@ -778,6 +885,13 @@ pub trait RopeKernel: Send + Sync {
     fn supports(&self, cfg: &RopeConfig) -> bool;
     fn implementation(&self, cfg: &RopeConfig) -> String;
     fn execute(&self, ctx: &mut RopeContext<'_>) -> Result<(), KernelError>;
+    /// True when `execute` applies a [`RopeContext::attn_factor`] other than 1.0 (a kernel
+    /// library at ABI minor ≥ 10, the cpu-reference provider). False by default, so a kernel
+    /// that does not read the factor is never handed one: a YaRN model whose factor is not 1 is
+    /// refused at startup (`rope_attn_factor_unavailable`).
+    fn attn_factor_supported(&self) -> bool {
+        false
+    }
 }
 
 /// SiLU-and-multiply.
@@ -852,6 +966,20 @@ pub trait ShardedNormKernel: Send + Sync {
     fn rmsnorm_sharded(&self, ctx: &mut RmsnormShardedContext<'_>) -> Result<(), KernelError>;
 }
 
+/// GEMM against a quantized weight (ABI v2.9).
+pub trait QGemmKernel: Send + Sync {
+    fn supports(&self, cfg: &QGemmConfig) -> bool;
+    fn implementation(&self, cfg: &QGemmConfig) -> String;
+    fn execute(&self, ctx: &mut QGemmContext<'_>) -> Result<(), KernelError>;
+}
+
+/// Activation quantization (ABI v2.9).
+pub trait QuantizeActKernel: Send + Sync {
+    fn supports(&self, cfg: &QuantizeActConfig) -> bool;
+    fn implementation(&self, cfg: &QuantizeActConfig) -> String;
+    fn execute(&self, ctx: &mut QuantizeActContext<'_>) -> Result<(), KernelError>;
+}
+
 /// One implementation source (`cpu-reference`, a loaded shim library). A family the provider
 /// does not implement at all returns `None`; per-config support is `supports`. The ABI v2.1 and
 /// v2.6 families default to `None`, so a provider (or a shim library) without them is a
@@ -875,6 +1003,14 @@ pub trait KernelProvider: Send + Sync {
     }
     /// ABI v2.6: `None` (the default) for a provider without the sharded RMSNorm ops.
     fn sharded_norm(&self) -> Option<&dyn ShardedNormKernel> {
+        None
+    }
+    /// ABI v2.9: `None` (the default) for a provider without the quantized GEMM.
+    fn qgemm(&self) -> Option<&dyn QGemmKernel> {
+        None
+    }
+    /// ABI v2.9: `None` (the default) for a provider without activation quantization.
+    fn quantize_act(&self) -> Option<&dyn QuantizeActKernel> {
         None
     }
 
@@ -935,7 +1071,9 @@ mod tests {
                 "add_rmsnorm",
                 "logits_reduce",
                 "row_sumsq",
-                "rmsnorm_sharded"
+                "rmsnorm_sharded",
+                "qgemm",
+                "quantize_act"
             ]
         );
         assert_eq!(OpKind::SiluMul.to_string(), "silu_mul");
@@ -1088,7 +1226,7 @@ mod tests {
     }
 
     /// The minor that introduced each op: the v2 ops 0, the v2.1 fused ops 1, the v2.6 sharded
-    /// RMSNorm ops 6. Breaks if a new op is appended without saying which minor group adds it (an
+    /// RMSNorm ops 6, the v2.9 quantization ops 9. Breaks if a new op is appended without saying which minor group adds it (an
     /// older library would be asked for an op code it does not know).
     #[test]
     fn op_minor_revisions() {
@@ -1096,7 +1234,8 @@ mod tests {
             let want = match op.abi_code() {
                 0..=12 => 0,
                 13 | 14 => 1,
-                _ => 6,
+                15 | 16 => 6,
+                _ => 9,
             };
             assert_eq!(op.abi_minor(), want, "{op}");
         }

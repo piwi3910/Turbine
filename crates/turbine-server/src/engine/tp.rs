@@ -813,6 +813,17 @@ pub(crate) struct StaticWorker {
     pub tiers: super::tp_tiers::WorkerTierStart,
 }
 
+impl StaticWorker {
+    /// This worker's own rank number (from its `Hello`), for `startup::serve` to name it when
+    /// its thread does not join in time at shutdown.
+    pub(crate) fn rank(&self) -> u32 {
+        match &self.hello {
+            RankMessage::Hello { rank, .. } => *rank,
+            _ => 0,
+        }
+    }
+}
+
 /// A rank after its load, before the group's warm-up.
 struct RankLoaded {
     executor: Box<dyn ModelExecutor>,
@@ -1268,6 +1279,7 @@ pub(crate) fn load_group(
         leader.arch.weight_format.0.name(),
         rank0.weight_bytes,
     );
+    model::record_quantization(metrics, &leader.arch, rank0.weight_bytes);
     tracing::info!(
         event = "tp_group_ready",
         world,
@@ -1823,6 +1835,7 @@ mod tests {
                 clock: Arc::clone(&clock),
                 metrics: metrics.kv.clone(),
                 remote: loaded.remote_tiers.take(),
+                kv_scales: None,
             },
             &mut pool,
         )
