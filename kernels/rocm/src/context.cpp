@@ -209,6 +209,14 @@ int32_t turbine_ctx_create(int32_t device_ordinal, turbine_ctx **out) {
     return create_fail(hip_code(err), hip_message(err, "hipSetDevice"));
   }
 
+  // No capture of the process may be open while hipblasLtCreate (and the
+  // rest of the construction) runs (turbine_hip.hpp, CreationGuard).
+  const turbine_hip::CreationGuard no_capture;
+  if (!no_capture.ok()) {
+    return create_fail(TURBINE_E_ARGUMENT,
+                       "turbine_ctx_create: not allowed on a thread with a "
+                       "graph capture in progress");
+  }
   auto *ctx = new turbine_ctx();
   ctx->device = device_ordinal;
   {
