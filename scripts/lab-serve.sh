@@ -149,6 +149,10 @@ case "$2" in
 		SERVED_NAME=shuyuej/Llama-3.2-3B-Instruct-GPTQ
 		MAX_MODEL_LEN=32768
 		;;
+	llama-3.2-3b-instruct-gptq-own)
+		SERVED_NAME=turbine/Llama-3.2-3B-Instruct-GPTQ-own
+		MAX_MODEL_LEN=32768
+		;;
 	# Phase 6a FP8 proof checkpoints (served_name as in scripts/lab/phase6-novanas-llama-fp8*.yaml).
 	llama-3.2-3b-instruct-fp8-dynamic)
 		SERVED_NAME=RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic
@@ -163,7 +167,7 @@ case "$2" in
 		MAX_MODEL_LEN=32768
 		;;
 	*)
-		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, llama-3.1-8b-instruct, llama-3.1-8b-instruct-mxfp4a16, llama-3.2-3b-mxfp4-a4, llama-3.1-8b-instruct-mxfp4-a4, llama-3.2-3b-instruct-awq, llama-3.2-3b-instruct-gptq, llama-3.2-3b-instruct-fp8-dynamic, llama-3.2-3b-instruct-fp8 or llama-3.2-3b-instruct-fp8-block)" >&2
+		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, llama-3.1-8b-instruct, llama-3.1-8b-instruct-mxfp4a16, llama-3.2-3b-mxfp4-a4, llama-3.1-8b-instruct-mxfp4-a4, llama-3.2-3b-instruct-awq, llama-3.2-3b-instruct-gptq, llama-3.2-3b-instruct-gptq-own, llama-3.2-3b-instruct-fp8-dynamic, llama-3.2-3b-instruct-fp8 or llama-3.2-3b-instruct-fp8-block)" >&2
 		usage
 		;;
 	esac
