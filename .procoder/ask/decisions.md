@@ -2204,3 +2204,22 @@ local `cargo check` / clippy on the Mac, which breaks the rule that cargo runs o
 **Decision (user, 2026-09-30, relayed by the coordinator): B.** Builds and tests still run only on `novanas`; agents
 delete any worktree `target/debug` after a Rust commit. The root `target/release` stays (the local `turbine-bench` /
 `turbine-golden` client `scripts/lab-bench.sh` uses).
+
+## gptq_int4 soak: `reached_orange` false twice (2026-09-30)
+
+Context: two 10-minute overload soaks of the own llm-compressor GPTQ checkpoint
+(`/home/piwi/turbine-models/llama-3.2-3b-instruct-gptq-own`, `target/soak/novanas-20260930T095436Z` and `…T101457Z`
+in `agent-p6a-gptq-numerics`) failed only `reached_orange` (GREEN/YELLOW only, KV peak 0.82, 259 / 374
+`queue_timeout`). Same soak config and KV pool (~1860 blocks) as the passing AWQ soak (rotation 9), but calibration
+(64–6000-word prompts, concurrency 4) measured R ≈ 0.50 / 0.56 req/s against AWQ's 2.21, so the 4R overload was ~2 req/s
+against AWQ's 8.85 and requests timed out queued before KV filled. 6 of 72 calibration requests count as failed with
+HTTP 200 in both runs. lab-bench (512-word prompts) showed golden PASS and 1266.7 tok/s.
+
+- A) Find and fix first: profile long-prompt GPTQ prefill against AWQ over 64–6000 words, explain the 6 failed
+  calibration requests, fix, soak again — chosen
+- B) Add a fixed-rate / multiplier option to `overload-soak.sh` and rerun at AWQ's 8.85 req/s (tests the pressure path,
+  leaves the slowdown)
+- C) Flip `gptq_int4` now, accepting the failed check, and carry the slowdown as a known issue
+
+**Decision (user, 2026-09-30, relayed by the coordinator): A.** `gptq_int4` stays `experimental` and
+`p6a-gptq-numerics` stays unmerged until a soak passes.
