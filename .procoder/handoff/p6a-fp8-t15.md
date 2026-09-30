@@ -266,3 +266,37 @@ against the release binaries already built in this run's workspace) rather than 
 `fp8block-soak.go` was also created; the soak (GPU job B) is running as of this note (job
 `turbine-lab-serve-0929224541-301172b6`, snapshot worktree `r11-soak-fp8block`) — not finished,
 judge `scratchpad/fp8block-soak/wait_and_soak.log` for its `fp8block-soak: done rc=` line.
+
+## Rotation 12 (2026-09-30, lead brief r12-fp8block-finish): closed out
+
+Merged `phase-6a-quantization` tip `96d3b76` (clean, no conflicts; support.rs untouched upstream,
+so the flip `7d7e644` stays the last commit touching it) — merge commit `46374d6`.
+
+1. **Fixture committed** (`ee6bfb1`): `tests/golden/llama-3.2-3b-instruct-fp8-block/{reference.jsonl,tolerance.json,README.md}`.
+   The self-spread (queued job from rotation 11) finished clean before this rotation started:
+   8 variants, all 16/16 prefix-ok, max likely 0.1829 (bf16-sdpa-full), max tail 0.3107
+   (bf16/eager incremental+full) — both below the BF16 Llama floor (0.15/0.55 strict,
+   0.25/0.75 batched), so `tolerance.json` is floor-bound: likely 0.19, tail 0.55, batched
+   unchanged at 0.25/0.75. `cargo test -p turbine-bench --test golden quant_fixtures_valid`
+   passes (run through `scripts/remote-cargo.sh`).
+2. **Job A's server.log checked**: 0 occurrences of `fp8_block_decoded` and `CIRCUIT_OPEN` —
+   the rotation-11 bench numbers (1054.96 tok/s c16, 112.66 tok/s c1) are clean.
+3. **Golden c1+c16 rerun** with the fixture in place: `scripts/lab-bench.sh --model llama-fp8-block
+   --label r12-fp8block --golden16` (background) — both PASS (16/16 each; c1 strict bounds, c16
+   batched bounds). tok/s 1062.4, ITL p50 11.5 ms, TTFT p50 226 ms; no `fp8_block_decoded` /
+   `CIRCUIT_OPEN` in `/tmp/lab-bench-server.last.log` either. Auto-recorded in labbook
+   (`turbine-lab-bench`, run `a9b6beb4-e35d-410d-9a96-d6c2e9c482a9`, status pass) including
+   `golden_c1`/`golden_c16`.
+4. **Soak** (rotation 11's job, judged here): `scratchpad/fp8block-soak/novanas-20260929T224540Z/verdict.json`
+   `pass: true`, all 8 checks true (ITL p99 216.4 vs calibration 186.6 ms, GREEN 30 s after
+   cool-down, no drops). Recorded in labbook (`turbine-overload-soak`, run
+   `d5d92074-83fa-4e23-b1f2-3cb8d1efa3b6`, set `phase-6a-quantization`).
+5. **perf-log row** added (Task 15 proof line, `.procoder/perf-log.md`) with the full set of
+   numbers: golden PASS/PASS, tok/s 1062.4 (1.24× BF16 floor 854.7), c1 ITL 8.43 ms, GSM8K 0.800
+   vs BF16 0.805 (drop 0.005), vLLM-ROCm 677.8 tok/s (1.57×), soak PASS, support row `supported`.
+6. **Gate**: `scripts/gate.sh --base 46374d6` → `gate: ok crates=turbine-model,turbine-server
+   passed=323 failed=0`.
+
+All four proof legs (numerics/golden, throughput, accuracy, soak) now pass on the merged tip.
+The support-matrix flip (`7d7e644`, already in this branch's history) is confirmed, not
+provisional. **Ready to merge** — sent to the lead.
