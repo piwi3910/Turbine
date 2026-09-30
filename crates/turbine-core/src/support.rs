@@ -364,11 +364,13 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Experimental,
     ),
-    // FP8 KV on gfx1201 (Phase 6a S-13, S-14): `supported` after the Task 24 proof. Full GSM8K at
-    // c16 (1,319 items): Llama BF16 KV 0.7801, FP8 KV 0.7885; OLMoE 0.6603 vs 0.6459, a drop of
-    // 0.0144 over the 0.01 bound but not significant (McNemar p = 0.23, 95% CI -0.008..+0.037;
-    // the checkpoint ships no K/V scales), accepted as noise (user decision 2026-09-29, "OLMoE FP8
-    // KV: accept the full-GSM8K drop as noise").
+    // FP8 KV on gfx1201 (Phase 6a S-13, S-14). Llama: `supported` after the Task 24 proof, full
+    // GSM8K at c16 (1,319 items) BF16 KV 0.7801, FP8 KV 0.7885, golden c1 / c16 16/16 against
+    // tests/golden/llama-3.2-3b-instruct-fp8kv (7ad4b03). OLMoE: `experimental` for 6a (user
+    // decision 2026-09-30, "OLMoE FP8 KV: golden against the emulated-KV reference misses", B):
+    // full GSM8K 0.6603 vs 0.6459 (drop 0.0144, accepted as noise 2026-09-29), but golden c1 / c16
+    // 13/16 against tests/golden/olmoe-1b-7b-0125-instruct-fp8kv (need 14; p03 tail 5.38). The
+    // checkpoint ships no K/V scales; calibrated V scales and the golden miss are a Phase 7 item.
     row(
         Some("amd"),
         Some("gfx1201"),
@@ -385,7 +387,7 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         BF16,
         Some(KvFormatColumn::Fp8E4m3),
         NO_SPEC,
-        SupportStatus::Supported,
+        SupportStatus::Experimental,
     ),
     // FP8 weights on gfx1201 Llama (Phase 6a Task 14): `supported`. The one `fp8` column covers
     // both checkpoints the proof ran. Dynamic per-token (RedHatAI FP8-dynamic): full GSM8K at c16
@@ -1092,7 +1094,7 @@ mod tests {
                 }
             }
         }
-        // Nothing but the AMD BF16 baseline, the proven gfx1201 FP8 KV rows (Task 24) and the
+        // Nothing but the AMD BF16 baseline, the proven gfx1201 Llama FP8 KV row (Task 24) and the
         // proven gfx1201 Llama weight rows with BF16 KV (fp8, Task 14; fp8_block, Task 15;
         // awq_int4 and gptq_int4, Task 18) are supported before the tracks add rows.
         for r in SUPPORT_MATRIX
@@ -1120,6 +1122,12 @@ mod tests {
             }
             if r.key.kv_format == Some(K::Fp8E4m3) {
                 assert_eq!(r.key.arch, Some("gfx1201"), "{:?}", r.view());
+                assert_eq!(
+                    r.key.architecture,
+                    Some("LlamaForCausalLM"),
+                    "{:?}",
+                    r.view()
+                );
             } else {
                 assert_eq!(r.key.kv_format, Some(K::Bf16), "{:?}", r.view());
             }
@@ -1168,11 +1176,14 @@ mod tests {
                 "{k}: {status:?}"
             );
         }
-        // FP8 KV: supported on gfx1201 Llama and OLMoE after the Task 24 proof, refused naming
-        // the track anywhere else.
-        for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
+        // FP8 KV: supported on gfx1201 Llama after the Task 24 proof, experimental on gfx1201
+        // OLMoE (golden miss, user decision 2026-09-30 B), refused naming the track anywhere else.
+        for (architecture, expected) in [
+            ("LlamaForCausalLM", "supported"),
+            ("OlmoeForCausalLM", "experimental"),
+        ] {
             let k = key("amd", "gfx1201", architecture, W::Bf16, K::Fp8E4m3, S::None);
-            assert_eq!(resolve(&k).as_str(), "supported", "{k}");
+            assert_eq!(resolve(&k).as_str(), expected, "{k}");
         }
         let k = key(
             "amd",

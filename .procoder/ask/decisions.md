@@ -2256,3 +2256,21 @@ candidates). A tolerance derived from that spread (likely ~4.6, tail ~8.3, ~5/16
 - A) Keep `mxfp4_a4` experimental for 6a, like `mxfp4` (Phase 7 item)
 - B) Gate it on GSM8K and throughput only, with a loose golden (informational)
 - C) Build the reference with Turbine's exact activation-quant rounding and derive the tolerance from a narrower variant set
+
+## OLMoE FP8 KV: golden against the emulated-KV reference misses (2026-09-30)
+
+Context: the FP8 KV golden fixtures (Task 24 B′) were never committed; they were built at the 6a exit (7ad4b03) from
+the 2026-09-29 regenerated references and spreads (tolerance = max(spread, BF16 bounds)). Llama FP8 KV passes 16/16 at
+c1 and c16 (worst likely 0.29 / tail 1.11 against 0.40 / 2.44). OLMoE FP8 KV fails at c1 and c16 alike (bit-equal):
+13/16 against `min_prompts_passing` 14, bounds likely 1.10 / tail 2.01. p03: all 32 tokens identical, likely 0.06,
+one tail candidate off by 5.38; p05: diverges at token 31 at reference margin 0.558 (the excuse is < 0.5); p13: likely
+1.126. The `amd/gfx1201/OlmoeForCausalLM/bf16/fp8_e4m3` row is already `supported` (user decision 2026-09-29 A, full
+GSM8K drop accepted as noise). OLMoE BF16 KV golden passes at the same tip (worst likely 1.00 / tail 1.15).
+
+- A) Diagnose first (bounded, ~1–2 h): per-position |Δ| for p03 / p13 (`turbine-golden positions`), HIP vs CPU
+  provider trace on OLMoE with FP8 KV; then back to the user with the cause
+- B) Demote the OLMoE FP8 KV row to `experimental` for 6a (Phase 7 item, with calibrated V scales), keep Llama's
+- C) Keep it `supported`: record the golden miss next to the GSM8K acceptance, no tolerance change
+
+**Decision (user, 2026-09-30): B.** The OLMoE FP8 KV row on gfx1201 is `experimental` for 6a; the golden miss and
+calibrated V scales for scale-less checkpoints are a Phase 7 item. Llama FP8 KV stays `supported`.
