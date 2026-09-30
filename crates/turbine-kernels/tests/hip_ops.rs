@@ -5980,7 +5980,7 @@ impl KvBatch {
                 .copy_from_host(b * self.slot, bytes)
                 .expect("coded upload");
         }
-        let slices: Vec<_> = bufs.iter().map(DeviceBuffer::whole).collect();
+        let slices: Vec<_> = bufs.iter().map(DeviceBuffer::ptr).collect();
         provider
             .kv_transcode()
             .expect("the kv_transcode family")
@@ -6173,7 +6173,7 @@ fn kv_transcode_matches_cpu() {
             b
         })
         .collect();
-    let slices: Vec<_> = bufs.iter().map(DeviceBuffer::whole).collect();
+    let slices: Vec<_> = bufs.iter().map(DeviceBuffer::ptr).collect();
     let coded = DeviceBuffer::alloc(&p.hip_mem, blocks * slot).expect("coded");
     let time = |cfg: KvTranscodeConfig| {
         time_us(&p, 20, || {

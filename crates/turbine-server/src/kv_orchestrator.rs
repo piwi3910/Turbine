@@ -51,6 +51,9 @@ use turbine_core::telemetry::{StorageProbe, StorageSample};
 use turbine_core::types::{
     BlockId, DType, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, RequestId,
 };
+use turbine_kernels::{
+    KernelProvider, KvCodecFns, KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat,
+};
 use turbine_kv::codec::{CodecParams, KvCodec};
 use turbine_kv::document::HitWindow;
 use turbine_kv::hierarchy::{
@@ -70,7 +73,8 @@ use turbine_kv::transfer::{
 use turbine_kv::{BlockPool, KvDocument, KvMetrics};
 use turbine_model::kv_scales::KvCache;
 use turbine_tensor::{
-    CopyEngine, CopyTarget, CopyTicket, DeviceMemory, DevicePtr, PinnedBuffer, PinnedMemory,
+    CopyEngine, CopyTarget, CopyTicket, DeviceBuffer, DeviceMemory, DevicePtr, MemoryError,
+    PinnedBuffer, PinnedMemory,
 };
 
 use crate::engine::tp_tiers::TierDriver;
@@ -588,6 +592,25 @@ impl KvOrchestrator {
         Ok((o, KvHandle { tx }))
     }
 
+    /// Runs the lower tiers' format copies (`kv.cpu.format`, `kv.nvme.format`) on the device
+    /// through `kernel`'s ABI v2.11 transcode, with staging slots allocated in `mem` (P6b S-1;
+    /// the host codec serves whatever the library does not). True when the device path is on.
+    pub fn enable_device_transcode(
+        &mut self,
+        cfg: &KvConfig,
+        kernel: Arc<dyn KernelProvider>,
+        mem: &Arc<dyn DeviceMemory>,
+    ) -> bool {
+        let formats: Vec<&str> = [
+            (cfg.cpu.enabled, cfg.cpu.format.as_str()),
+            (cfg.nvme.enabled, cfg.nvme.format.as_str()),
+        ]
+        .into_iter()
+        .filter_map(|(on, f)| on.then_some(f))
+        .collect();
+        self.backend.enable_device_transcode(kernel, mem, &formats)
+    }
+
     /// `reliability.pressure.deescalate_dwell`: the compression ladder's step-up dwell (P6b S-6).
     pub fn set_ladder_dwell(&mut self, dwell: Duration) {
         self.h.set_ladder_dwell(dwell);
@@ -1077,6 +1100,9 @@ impl HostCodec {
 struct HostTranscode {
     codec: TransferCodec,
     host: Option<Arc<HostCodec>>,
+    /// The bytes were already encoded (or are still to be decoded) on the device: the I/O
+    /// thread moves `to_bytes` / `from_bytes` of them as they are (P6b S-1, ABI v2.11).
+    pre_encoded: bool,
 }
 
 impl HostTranscode {
@@ -1097,6 +1123,14 @@ impl HostTranscode {
 
     /// Encodes an L0-format block into the destination format (borrowed when that is `l0`).
     fn encode<'a>(&self, l0: &'a [u8]) -> Result<std::borrow::Cow<'a, [u8]>, TierError> {
+        if self.pre_encoded {
+            return l0
+                .get(..self.codec.to_bytes as usize)
+                .map(std::borrow::Cow::Borrowed)
+                .ok_or_else(|| {
+                    TierError::Io("staged block shorter than its encoded bytes".into())
+                });
+        }
         if self.codec.to == L0_FORMAT {
             return Ok(std::borrow::Cow::Borrowed(l0));
         }
@@ -1197,6 +1231,15 @@ fn run_io(op: IoOp) -> (Result<TierSlot, TierError>, Staged) {
             codec,
         } => {
             let r = match bufs.as_mut_slice() {
+                [one] if codec.pre_encoded => {
+                    let n = codec.codec.from_bytes as usize;
+                    one.with_mut(|b| match b.get_mut(..n) {
+                        Some(part) => from.get(&key, TierBlockMut::Host(part)),
+                        None => Err(TierError::Io(
+                            "staging buffer shorter than the block".into(),
+                        )),
+                    })
+                }
                 [one] if codec.codec.from == L0_FORMAT => {
                     one.with_mut(|b| from.get(&key, TierBlockMut::Host(b)))
                 }
@@ -1292,6 +1335,7 @@ impl IoPoolBackend {
         HostTranscode {
             codec,
             host: self.host_codec.clone(),
+            pre_encoded: false,
         }
     }
 
@@ -1372,10 +1416,29 @@ type Copies = Vec<(usize, CopyTicket)>;
 enum AfterCopies {
     /// L0 → L1: the reserved slots become visible.
     CommitL1(KvKey),
-    /// → L0: done; the staging buffers (if any) go back to their shards.
-    IntoL0 { block: u64, bufs: Staged },
-    /// L0 → L2: the staged shards are written by the I/O pool.
-    WriteL2 { key: KvKey, bufs: Staged },
+    /// → L0: done; the staging buffers (if any) go back to their shards, and the device
+    /// staging slot (a decoded promotion) to the transcoder.
+    IntoL0 {
+        block: u64,
+        bufs: Staged,
+        gpu_slot: Option<usize>,
+    },
+    /// L0 → L1 or L2: the staged shards are written by the I/O pool. With `gpu_slot` they hold
+    /// the block encoded on the device (the slot is free once they are copied out).
+    WriteTier {
+        to: Arc<dyn KvTier>,
+        key: KvKey,
+        bufs: Staged,
+        gpu_slot: Option<usize>,
+    },
+    /// L1 or L2 → L0 with the block's encoded bytes now in the device staging slot: decode them
+    /// into L0 block `block`.
+    Decode {
+        block: u64,
+        bufs: Staged,
+        gpu_slot: usize,
+        format: &'static str,
+    },
 }
 
 enum IoStage {
@@ -1383,12 +1446,203 @@ enum IoStage {
     Final,
     /// L2 → L0: the shards read into the staging buffers are copied into L0 block `block`.
     ThenIntoL0 { block: u64 },
+    /// L1 or L2 → L0 through the device transcode: the encoded bytes read into the staging
+    /// buffer are copied into device staging slot `gpu_slot` and decoded into block `block`.
+    ThenDecode {
+        block: u64,
+        gpu_slot: usize,
+        format: &'static str,
+        bytes: usize,
+    },
 }
 
 enum Job {
     Copies { copies: Copies, then: AfterCopies },
     Io(IoStage),
     Done(Result<TierSlot, TierError>),
+}
+
+/// The registered tier codecs as the function table of the cpu-reference transcode (a kernel
+/// library ignores it): the reference `encode_cpu` / `decode_cpu` over one block.
+struct CodecTable;
+
+impl CodecTable {
+    fn layout(cfg: &KvTranscodeConfig) -> KvLayout {
+        KvLayout {
+            num_layers: cfg.layers,
+            num_kv_heads: cfg.num_kv_heads,
+            head_dim: cfg.head_dim,
+            dtype: cfg.page_dtype,
+            block_tokens: cfg.block_tokens,
+        }
+    }
+
+    fn codec(cfg: &KvTranscodeConfig) -> Result<&'static dyn KvCodec, String> {
+        let name = cfg.codec().map_or(L0_FORMAT, KvTranscodeFormat::as_str);
+        turbine_kv::codec::registry()
+            .get(name)
+            .ok_or_else(|| format!("no kv_format codec `{name}`"))
+    }
+
+    fn params(seed: u64, scales: (&[f32], &[f32])) -> CodecParams {
+        CodecParams {
+            seed,
+            k_scales: scales.0.to_vec(),
+            v_scales: scales.1.to_vec(),
+        }
+    }
+}
+
+impl KvCodecFns for CodecTable {
+    fn encode(
+        &self,
+        cfg: &KvTranscodeConfig,
+        seed: u64,
+        scales: (&[f32], &[f32]),
+        block: &[u8],
+        slot: &mut [u8],
+    ) -> Result<(), String> {
+        Self::codec(cfg)?
+            .encode_cpu(block, &Self::layout(cfg), slot, &Self::params(seed, scales))
+            .map_err(|e| e.to_string())
+    }
+
+    fn decode(
+        &self,
+        cfg: &KvTranscodeConfig,
+        seed: u64,
+        scales: (&[f32], &[f32]),
+        slot: &[u8],
+        block: &mut [u8],
+    ) -> Result<(), String> {
+        Self::codec(cfg)?
+            .decode_cpu(slot, &Self::layout(cfg), block, &Self::params(seed, scales))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The kernel library's ABI v2.11 KV transcode for the demotion and promotion paths (P6b S-1):
+/// encodes L0 pages into a device staging slot (one slot per copy in flight,
+/// `DEMOTION_INFLIGHT` of them, each the largest encoded block of the configured tier formats)
+/// whose small bytes then cross the host link through the pinned copies, and decodes a
+/// promoted block from a slot into its L0 pages. A copy it cannot serve (another format, no
+/// free slot) takes the host codec path instead.
+pub struct DeviceTranscode {
+    kernel: Arc<dyn KernelProvider>,
+    /// Fences the compute stream (a decode still reads its slot); `None` when kernels and
+    /// copies are synchronous.
+    engine: Option<Arc<dyn CopyEngine>>,
+    layout: KvLayout,
+    seed: u64,
+    staging: DeviceBuffer,
+    slot_bytes: usize,
+    free: Vec<usize>,
+}
+
+impl DeviceTranscode {
+    /// The codec `name` as a transcode format (`None` for `l0` and unknown names).
+    fn format_of(name: &str) -> Option<KvTranscodeFormat> {
+        [
+            KvTranscodeFormat::Fp8E4m3,
+            KvTranscodeFormat::Tq4,
+            KvTranscodeFormat::Tq2,
+        ]
+        .into_iter()
+        .find(|f| f.as_str() == name)
+    }
+
+    fn config(&self, name: &str, decode: bool) -> Option<KvTranscodeConfig> {
+        let codec = Self::format_of(name)?;
+        let (src_format, dst_format) = if decode {
+            (codec, KvTranscodeFormat::L0)
+        } else {
+            (KvTranscodeFormat::L0, codec)
+        };
+        Some(KvTranscodeConfig {
+            src_format,
+            dst_format,
+            page_dtype: self.layout.dtype,
+            head_dim: self.layout.head_dim,
+            num_kv_heads: self.layout.num_kv_heads,
+            block_tokens: self.layout.block_tokens,
+            layers: self.layout.num_layers,
+        })
+    }
+
+    /// Whether the library runs codec `name` in both directions for this layout.
+    fn serves(&self, name: &str) -> bool {
+        let Some(kernel) = self.kernel.kv_transcode() else {
+            return false;
+        };
+        [false, true].into_iter().all(|decode| {
+            self.config(name, decode)
+                .is_some_and(|c| kernel.supports(&c))
+        })
+    }
+
+    fn take(&mut self) -> Option<usize> {
+        self.free.pop()
+    }
+
+    fn give(&mut self, slot: usize) {
+        debug_assert!(!self.free.contains(&slot));
+        self.free.push(slot);
+    }
+
+    fn slot_ptr(&self, slot: usize) -> DevicePtr {
+        self.staging.ptr().offset((slot * self.slot_bytes) as u64)
+    }
+
+    /// Enqueues the transcode of the pages of one block (layer order) to or from slot `slot`.
+    fn run(
+        &self,
+        name: &str,
+        decode: bool,
+        slot: usize,
+        pages: &[DevicePtr],
+    ) -> Result<(), TierError> {
+        let cfg = self
+            .config(name, decode)
+            .ok_or_else(|| TierError::Io(format!("no device transcode for `{name}`")))?;
+        let kernel = self
+            .kernel
+            .kv_transcode()
+            .ok_or_else(|| TierError::Io("the kernel library has no KV transcode".into()))?;
+        let codec = encoded_bytes(name, &self.layout)?;
+        kernel
+            .execute(&mut KvTranscodeContext {
+                cfg,
+                pages,
+                coded: self.staging.slice(slot * self.slot_bytes, codec),
+                coded_block_bytes: codec,
+                seed: self.seed,
+                k_scales: None,
+                v_scales: None,
+                codecs: &CodecTable,
+            })
+            .map_err(|e| TierError::Io(format!("kv transcode ({name}): {e}")))
+    }
+
+    /// A ticket for the compute-stream work enqueued so far (`None`: nothing to wait for).
+    fn fence(&self) -> Result<Option<CopyTicket>, TierError> {
+        match &self.engine {
+            None => Ok(None),
+            Some(e) => match e.fence_compute() {
+                Ok(t) => Ok(Some(t)),
+                // A copy engine without compute-stream events belongs to a synchronous backend.
+                Err(MemoryError::Unsupported(_)) => Ok(None),
+                Err(e) => Err(TierError::Io(format!("compute fence: {e}"))),
+            },
+        }
+    }
+}
+
+/// Encoded bytes of one block in codec `name`.
+fn encoded_bytes(name: &str, layout: &KvLayout) -> Result<usize, TierError> {
+    turbine_kv::codec::registry()
+        .get(name)
+        .map(|c| c.bytes_per_block(layout) as usize)
+        .ok_or_else(|| TierError::Io(format!("no kv_format codec `{name}`")))
 }
 
 /// One rank's end of the copy backend: its device, its pool's block addresses and its staging
@@ -1420,6 +1674,9 @@ pub struct CopyStreamBackend {
     /// Bytes of one logical block (every shard).
     block_bytes: usize,
     jobs: HashMap<u64, Job>,
+    /// The device transcode of lower-tier copies (P6b S-1), when the library has one and the
+    /// staging slots could be allocated.
+    gpu: Option<DeviceTranscode>,
 }
 
 impl CopyStreamBackend {
@@ -1454,7 +1711,77 @@ impl CopyStreamBackend {
             io,
             block_bytes,
             jobs: HashMap::new(),
+            gpu: None,
         }
+    }
+
+    /// Runs lower-tier copies of `formats` on the device through `kernel` (P6b S-1) when it
+    /// implements them in both directions for this layout: allocates the staging slots in `mem`
+    /// (`DEMOTION_INFLIGHT` × the largest encoded block) and returns whether it is on. Any other
+    /// copy keeps the host codec path; nothing is allocated when no format needs the device.
+    pub fn enable_device_transcode(
+        &mut self,
+        kernel: Arc<dyn KernelProvider>,
+        mem: &Arc<dyn DeviceMemory>,
+        formats: &[&str],
+    ) -> bool {
+        let (Some(host), 1) = (self.io.host_codec.clone(), self.shards.len()) else {
+            return false;
+        };
+        let engine = match &self.shards[0].device {
+            CopyDevice::Stream { engine, .. } => Some(Arc::clone(engine)),
+            CopyDevice::Sync { .. } => None,
+        };
+        let mut dev = DeviceTranscode {
+            kernel,
+            engine,
+            layout: host.layout,
+            seed: host.params.seed,
+            // Replaced below once the slot size is known.
+            staging: match DeviceBuffer::alloc(mem, 1) {
+                Ok(b) => b,
+                Err(_) => return false,
+            },
+            slot_bytes: 0,
+            free: Vec::new(),
+        };
+        let served: Vec<&str> = formats
+            .iter()
+            .copied()
+            .filter(|f| *f != L0_FORMAT && dev.serves(f))
+            .collect();
+        let Some(slot_bytes) = served
+            .iter()
+            .filter_map(|f| encoded_bytes(f, &dev.layout).ok())
+            .max()
+        else {
+            return false;
+        };
+        let slots = turbine_kv::hierarchy::DEMOTION_INFLIGHT;
+        dev.staging = match DeviceBuffer::alloc(mem, slot_bytes * slots) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    event = "kv_transcode_staging_failed",
+                    bytes = slot_bytes * slots,
+                    error = %e,
+                    "the device staging of the KV transcode could not be allocated; lower-tier \
+                     copies use the host codec"
+                );
+                return false;
+            }
+        };
+        dev.slot_bytes = slot_bytes;
+        dev.free = (0..slots).rev().collect();
+        tracing::info!(
+            event = "kv_transcode_device",
+            formats = ?served,
+            slots,
+            slot_bytes,
+            "lower-tier copies are transcoded on the device"
+        );
+        self.gpu = Some(dev);
+        true
     }
 
     /// The host codec that encodes and decodes lower-tier copies not stored at the L0 format
@@ -1655,12 +1982,14 @@ impl CopyStreamBackend {
                 Ok(Job::Io(IoStage::Final))
             }
             TransferPath::L0ToL1 | TransferPath::L1ToL0 if !req.codec.is_identity() => {
-                // Copy-stream L1 slots hold what the device pages hold: another format needs the
-                // v2.11 GPU transcode (P6b Task 5), which startup requires first.
-                Err(TierError::Io(format!(
-                    "the L1 copy stream moves L0-format blocks only, not {} → {}",
-                    req.codec.from, req.codec.to
-                )))
+                // Copy-stream L1 slots hold what the device pages hold: another format goes
+                // through the staging buffers and the I/O pool like L2's.
+                let l1: Arc<dyn KvTier> = self.l1.clone().ok_or(TierError::Missing)?;
+                if req.path == TransferPath::L0ToL1 {
+                    self.start_write(t, l1)
+                } else {
+                    self.start_read(t, l1)
+                }
             }
             TransferPath::L0ToL1 => {
                 if !self.all_streams() {
@@ -1692,6 +2021,7 @@ impl CopyStreamBackend {
                         then: AfterCopies::IntoL0 {
                             block: req.dst_slot,
                             bufs: Staged::new(),
+                            gpu_slot: None,
                         },
                     }),
                     Err((shard, e)) => {
@@ -1701,43 +2031,172 @@ impl CopyStreamBackend {
                 }
             }
             TransferPath::L0ToL2 => {
-                if self.l2.is_none() {
-                    return Err(TierError::Missing);
-                }
-                let mut bufs = self.staging_bufs()?;
-                match self.staged_copies(req.src_slot, &mut bufs, false) {
-                    // Synchronous copies only: the block is staged already.
-                    Ok(copies) if copies.is_empty() => {
-                        self.finish_copies(t, AfterCopies::WriteL2 { key: req.key, bufs })
-                    }
-                    Ok(copies) => Ok(Job::Copies {
-                        copies,
-                        then: AfterCopies::WriteL2 { key: req.key, bufs },
-                    }),
-                    Err(e) => {
-                        self.release_staging(bufs);
-                        Err(e)
-                    }
-                }
+                let l2: Arc<dyn KvTier> = self.l2.clone().ok_or(TierError::Missing)?;
+                self.start_write(t, l2)
             }
             TransferPath::L2ToL0 => {
-                let l2 = self.l2.clone().ok_or(TierError::Missing)?;
-                let bufs = self.staging_bufs()?;
-                let codec = self.io.transcode(req.codec);
-                self.io.submit(
-                    t.id,
-                    IoOp::Read {
-                        from: l2,
-                        key: req.key,
-                        bufs,
-                        codec,
-                    },
-                )?;
-                Ok(Job::Io(IoStage::ThenIntoL0 {
-                    block: req.dst_slot,
-                }))
+                let l2: Arc<dyn KvTier> = self.l2.clone().ok_or(TierError::Missing)?;
+                self.start_read(t, l2)
             }
         }
+    }
+
+    /// A free device staging slot for codec `name`, when the device serves it.
+    fn gpu_slot(&mut self, name: &str) -> Option<usize> {
+        let gpu = self.gpu.as_mut()?;
+        if gpu.serves(name) { gpu.take() } else { None }
+    }
+
+    fn gpu_give(&mut self, slot: Option<usize>) {
+        if let (Some(gpu), Some(slot)) = (self.gpu.as_mut(), slot) {
+            gpu.give(slot);
+        }
+    }
+
+    /// The device addresses of the layer pages of L0 block `block` (one shard).
+    fn block_pages(&self, block: u64) -> SmallVec<[DevicePtr; 64]> {
+        self.shards[0]
+            .addresses
+            .segments(BlockId(block as u32))
+            .iter()
+            .map(|&(ptr, _)| ptr)
+            .collect()
+    }
+
+    /// Copies `bytes` of device staging slot `slot` into (`to_device` false) or from the first
+    /// staging buffer of `bufs`: on the copy stream (returned), or before returning when the
+    /// backend is synchronous.
+    fn slot_copies(
+        &self,
+        slot: usize,
+        bufs: &mut Staged,
+        bytes: usize,
+        to_device: bool,
+    ) -> Result<Copies, TierError> {
+        let gpu = self
+            .gpu
+            .as_ref()
+            .expect("a slot came from the device transcode");
+        let ptr = gpu.slot_ptr(slot);
+        let io = |e: MemoryError| TierError::Io(format!("staging copy: {e}"));
+        match &self.shards[0].device {
+            CopyDevice::Stream { engine, .. } => {
+                let HostBuf::Pinned(p) = &bufs[0] else {
+                    unreachable!("a copy stream stages in pinned memory")
+                };
+                let pinned = CopyTarget::Pinned {
+                    buffer_id: p.id(),
+                    offset: 0,
+                };
+                let (dst, src) = if to_device {
+                    (CopyTarget::Device(ptr), pinned)
+                } else {
+                    (pinned, CopyTarget::Device(ptr))
+                };
+                let ticket = engine.copy_async(dst, src, bytes).map_err(io)?;
+                Ok(vec![(0, ticket)])
+            }
+            CopyDevice::Sync { mem } => {
+                bufs[0]
+                    .with_mut(|b| {
+                        if to_device {
+                            mem.copy_h2d(ptr, &b[..bytes])
+                        } else {
+                            mem.copy_d2h(&mut b[..bytes], ptr)
+                        }
+                    })
+                    .map_err(io)?;
+                Ok(Copies::new())
+            }
+        }
+    }
+
+    /// L0 → L1 or L2 of block `t.req.src_slot` into `to`: the block staged on the host (or,
+    /// for another format the device serves, encoded into a device slot and only its small
+    /// bytes staged), then stored by the I/O pool.
+    fn start_write(&mut self, t: &TransferTicket, to: Arc<dyn KvTier>) -> Result<Job, TierError> {
+        let req = &t.req;
+        let mut bufs = self.staging_bufs()?;
+        let gpu_slot = if req.codec.is_identity() {
+            None
+        } else {
+            self.gpu_slot(req.codec.to)
+        };
+        let staged = match gpu_slot {
+            Some(slot) => {
+                let pages = self.block_pages(req.src_slot);
+                let gpu = self.gpu.as_ref().expect("a slot came from it");
+                gpu.run(req.codec.to, false, slot, &pages).and_then(|()| {
+                    self.slot_copies(slot, &mut bufs, req.codec.to_bytes as usize, false)
+                })
+            }
+            None => self.staged_copies(req.src_slot, &mut bufs, false),
+        };
+        match staged {
+            Ok(copies) => {
+                let then = AfterCopies::WriteTier {
+                    to,
+                    key: req.key,
+                    bufs,
+                    gpu_slot,
+                };
+                // Synchronous copies only: the block is staged already.
+                if copies.is_empty() {
+                    self.finish_copies(t, then)
+                } else {
+                    Ok(Job::Copies { copies, then })
+                }
+            }
+            Err(e) => {
+                self.gpu_give(gpu_slot);
+                self.release_staging(bufs);
+                if gpu_slot.is_some()
+                    && req.path == TransferPath::L0ToL1
+                    && let Some(l1) = &self.l1
+                {
+                    l1.record_copy_error(0);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// L1 or L2 → L0 block `t.req.dst_slot` from `from`: the I/O pool reads the block (decoded
+    /// on the host, or for another format the device serves, only its encoded bytes), then it
+    /// reaches the pages (copied, or decoded on the device from a staging slot).
+    fn start_read(&mut self, t: &TransferTicket, from: Arc<dyn KvTier>) -> Result<Job, TierError> {
+        let req = &t.req;
+        let bufs = self.staging_bufs()?;
+        let gpu_slot = if req.codec.is_identity() {
+            None
+        } else {
+            self.gpu_slot(req.codec.from)
+        };
+        let mut codec = self.io.transcode(req.codec);
+        codec.pre_encoded = gpu_slot.is_some();
+        if let Err(e) = self.io.submit(
+            t.id,
+            IoOp::Read {
+                from,
+                key: req.key,
+                bufs,
+                codec,
+            },
+        ) {
+            self.gpu_give(gpu_slot);
+            return Err(e);
+        }
+        Ok(Job::Io(match gpu_slot {
+            Some(gpu_slot) => IoStage::ThenDecode {
+                block: req.dst_slot,
+                gpu_slot,
+                format: req.codec.from,
+                bytes: req.codec.from_bytes as usize,
+            },
+            None => IoStage::ThenIntoL0 {
+                block: req.dst_slot,
+            },
+        }))
     }
 
     fn finish_copies(&mut self, t: &TransferTicket, then: AfterCopies) -> Result<Job, TierError> {
@@ -1746,17 +2205,29 @@ impl CopyStreamBackend {
                 let l1 = self.l1.clone().ok_or(TierError::Missing)?;
                 Ok(Job::Done(Ok(l1.commit(&key))))
             }
-            AfterCopies::IntoL0 { block, bufs } => {
+            AfterCopies::IntoL0 {
+                block,
+                bufs,
+                gpu_slot,
+            } => {
                 self.release_staging(bufs);
+                self.gpu_give(gpu_slot);
                 Ok(Job::Done(Ok(TierSlot(block))))
             }
-            AfterCopies::WriteL2 { key, bufs } => {
-                let l2 = self.l2.clone().ok_or(TierError::Missing)?;
-                let codec = self.io.transcode(t.req.codec);
+            AfterCopies::WriteTier {
+                to,
+                key,
+                bufs,
+                gpu_slot,
+            } => {
+                // The encoded bytes are out of the device slot.
+                self.gpu_give(gpu_slot);
+                let mut codec = self.io.transcode(t.req.codec);
+                codec.pre_encoded = gpu_slot.is_some();
                 self.io.submit(
                     t.id,
                     IoOp::Write {
-                        to: l2,
+                        to,
                         key,
                         bufs,
                         codec,
@@ -1764,15 +2235,98 @@ impl CopyStreamBackend {
                 )?;
                 Ok(Job::Io(IoStage::Final))
             }
+            AfterCopies::Decode {
+                block,
+                bufs,
+                gpu_slot,
+                format,
+            } => {
+                let pages = self.block_pages(block);
+                let gpu = self
+                    .gpu
+                    .as_ref()
+                    .expect("a slot came from the device transcode");
+                match gpu
+                    .run(format, true, gpu_slot, &pages)
+                    .and_then(|()| gpu.fence())
+                {
+                    // The kernel still reads its slot: the fence says when it is free.
+                    Ok(Some(fence)) => Ok(Job::Copies {
+                        copies: vec![(0, fence)],
+                        then: AfterCopies::IntoL0 {
+                            block,
+                            bufs,
+                            gpu_slot: Some(gpu_slot),
+                        },
+                    }),
+                    Ok(None) => self.finish_copies(
+                        t,
+                        AfterCopies::IntoL0 {
+                            block,
+                            bufs,
+                            gpu_slot: Some(gpu_slot),
+                        },
+                    ),
+                    Err(e) => {
+                        self.gpu_give(Some(gpu_slot));
+                        self.release_staging(bufs);
+                        if t.req.path == TransferPath::L1ToL0
+                            && let Some(l1) = &self.l1
+                        {
+                            l1.record_copy_error(0);
+                        }
+                        Err(e)
+                    }
+                }
+            }
         }
     }
 
-    fn finish_io(&mut self, stage: IoStage, done: IoDone) -> Result<Job, TierError> {
+    fn finish_io(
+        &mut self,
+        t: &TransferTicket,
+        stage: IoStage,
+        done: IoDone,
+    ) -> Result<Job, TierError> {
         let IoDone { result, bufs, .. } = done;
         match stage {
             IoStage::Final => {
                 self.release_staging(bufs);
                 Ok(Job::Done(result))
+            }
+            IoStage::ThenDecode {
+                block,
+                gpu_slot,
+                format,
+                bytes,
+            } => {
+                let mut bufs = bufs;
+                if bufs.is_empty() || result.is_err() {
+                    let e = result.err().unwrap_or(TierError::Missing);
+                    self.release_staging(bufs);
+                    self.gpu_give(Some(gpu_slot));
+                    return Err(e);
+                }
+                match self.slot_copies(gpu_slot, &mut bufs, bytes, true) {
+                    Ok(copies) => {
+                        let then = AfterCopies::Decode {
+                            block,
+                            bufs,
+                            gpu_slot,
+                            format,
+                        };
+                        if copies.is_empty() {
+                            self.finish_copies(t, then)
+                        } else {
+                            Ok(Job::Copies { copies, then })
+                        }
+                    }
+                    Err(e) => {
+                        self.release_staging(bufs);
+                        self.gpu_give(Some(gpu_slot));
+                        Err(e)
+                    }
+                }
             }
             IoStage::ThenIntoL0 { block } => {
                 let mut bufs = bufs;
@@ -1790,7 +2344,11 @@ impl CopyStreamBackend {
                     }
                     Ok(copies) => Ok(Job::Copies {
                         copies,
-                        then: AfterCopies::IntoL0 { block, bufs },
+                        then: AfterCopies::IntoL0 {
+                            block,
+                            bufs,
+                            gpu_slot: None,
+                        },
                     }),
                     Err(e) => {
                         self.release_staging(bufs);
@@ -1807,7 +2365,7 @@ impl CopyStreamBackend {
             Job::Done(r) => Ok(Job::Done(r)),
             Job::Io(stage) => match self.io.take(t.id) {
                 None => Ok(Job::Io(stage)),
-                Some(done) => self.finish_io(stage, done),
+                Some(done) => self.finish_io(t, stage, done),
             },
             Job::Copies { copies, then } => {
                 let mut all = true;
@@ -1842,7 +2400,8 @@ impl CopyStreamBackend {
                     l1.record_copy_error(shard);
                 }
             }
-            AfterCopies::IntoL0 { bufs, .. } => {
+            AfterCopies::IntoL0 { bufs, gpu_slot, .. } => {
+                self.gpu_give(gpu_slot);
                 if t.req.path == TransferPath::L1ToL0
                     && let Some(l1) = &self.l1
                 {
@@ -1850,7 +2409,24 @@ impl CopyStreamBackend {
                 }
                 self.release_staging(bufs);
             }
-            AfterCopies::WriteL2 { bufs, .. } => self.release_staging(bufs),
+            AfterCopies::WriteTier { bufs, gpu_slot, .. } => {
+                self.gpu_give(gpu_slot);
+                if t.req.path == TransferPath::L0ToL1
+                    && let Some(l1) = &self.l1
+                {
+                    l1.record_copy_error(shard);
+                }
+                self.release_staging(bufs);
+            }
+            AfterCopies::Decode { bufs, gpu_slot, .. } => {
+                self.gpu_give(Some(gpu_slot));
+                if t.req.path == TransferPath::L1ToL0
+                    && let Some(l1) = &self.l1
+                {
+                    l1.record_copy_error(shard);
+                }
+                self.release_staging(bufs);
+            }
         }
     }
 }
@@ -2248,11 +2824,134 @@ mod tests {
         assert_eq!(read_block(&r, 9), want, "decode_cpu into the L0 block");
         assert_ne!(want, block, "fp8_e4m3 from BF16 is lossy");
 
-        // A copy stream moves L0-format blocks only (the GPU transcode is not there yet), and
-        // a sharded block refuses a lower-tier format other than l0 at startup.
+        // A sharded block refuses a lower-tier format other than l0 at startup.
         assert!(check_tier_formats(&kv, &format, false).is_ok());
         let err = check_tier_formats(&kv, &format, true).unwrap_err();
         assert!(err.to_string().contains("kv.nvme.format fp8_e4m3"), "{err}");
+    }
+
+    /// P6b S-1, device path: with `kv.cpu.format` and `kv.nvme.format` `fp8_e4m3` the block is
+    /// encoded by the kernel library's `kv_transcode` (here the cpu-reference provider over the
+    /// codec table) into a device staging slot, its small bytes cross the copy stream into L1
+    /// and L2, and promotions decode from a slot into the L0 pages. The bytes stored and the
+    /// pages decoded equal the host path's (`encode_cpu` / `decode_cpu`), and every staging slot
+    /// is back afterwards. Breaks if a slot leaks, an encoded length is wrong (the tier would
+    /// store L0-sized blocks) or the device path differs from the codec.
+    #[test]
+    fn device_transcode_matches_the_host_codec_through_l1_and_l2() {
+        let fp8 = turbine_kv::codec::registry().get("fp8_e4m3").unwrap();
+        let small = fp8.bytes_per_block(&layout());
+        let bb = layout().block_bytes() as usize;
+        let block: Vec<u8> = (0..bb / 2)
+            .flat_map(|i| {
+                let x = ((i as f32) * 0.37).sin() * (1.0 + (i % 7) as f32);
+                turbine_kv::codec::f32_to_bf16(x).to_le_bytes()
+            })
+            .collect();
+        let format = kv_format(layout());
+        let params = HostCodec::of(&identity(), &format).params;
+        let mut want_enc = vec![0u8; small as usize];
+        fp8.encode_cpu(&block, &layout(), &mut want_enc, &params)
+            .unwrap();
+        let mut want_dec = vec![0u8; bb];
+        fp8.decode_cpu(&want_enc, &layout(), &mut want_dec, &params)
+            .unwrap();
+        let down = TransferCodec {
+            from: L0_FORMAT,
+            from_bytes: bb as u64,
+            to: "fp8_e4m3",
+            to_bytes: small,
+        };
+        let up = TransferCodec {
+            from: "fp8_e4m3",
+            from_bytes: small,
+            to: L0_FORMAT,
+            to_bytes: bb as u64,
+        };
+
+        for device_path in [false, true] {
+            let dir = TempDir::new("turbine-kv-device-transcode");
+            let mut kv = kv_config(&dir, true);
+            kv.cpu.format = ModuleName::new("fp8_e4m3").unwrap();
+            kv.nvme.format = ModuleName::new("fp8_e4m3").unwrap();
+            let reg = MetricsRegistry::new();
+            let metrics = KvMetrics::register(&reg);
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+            let l2 = open_l2(
+                &kv,
+                &format,
+                &identity(),
+                Arc::clone(&clock),
+                metrics.clone(),
+            )
+            .unwrap()
+            .expect("L2 is enabled");
+            let (mem, mut pool) = rank(0);
+            let (mut o, _handle) = KvOrchestrator::start(
+                KvStart {
+                    cfg: &kv,
+                    memory_kind: MemoryKind::Dedicated,
+                    identity: identity(),
+                    device: stream(&mem, 0),
+                    shards: Vec::new(),
+                    l2: Some(Arc::clone(&l2)),
+                    clock,
+                    metrics,
+                    remote: None,
+                    kv_scales: None,
+                },
+                &mut pool,
+            )
+            .expect("the KV hierarchy starts");
+            let l1 = o.backend.l1.clone().expect("L1");
+            if device_path {
+                assert!(
+                    o.enable_device_transcode(&kv, turbine_kernels::cpu_reference_provider(), &mem),
+                    "the cpu-reference provider serves fp8_e4m3"
+                );
+            }
+            let slots = |o: &KvOrchestrator| o.backend.gpu.as_ref().map(|g| g.free.len());
+            let r = (mem, pool);
+            write_block(&r, 4, &block);
+
+            let key = KvKey([5; 16]);
+            run_as(&mut o, 1, TransferPath::L0ToL1, key, (4, 0), down).unwrap();
+            let mut stored = vec![0u8; small as usize];
+            l1.get(&key, TierBlockMut::Host(&mut stored)).unwrap();
+            assert_eq!(
+                stored, want_enc,
+                "L1 holds the encoded block (device {device_path})"
+            );
+            run_as(&mut o, 2, TransferPath::L1ToL0, key, (0, 9), up).unwrap();
+            assert_eq!(
+                read_block(&r, 9),
+                want_dec,
+                "L1 → L0 (device {device_path})"
+            );
+
+            let key2 = KvKey([6; 16]);
+            run_as(&mut o, 3, TransferPath::L0ToL2, key2, (4, 0), down).unwrap();
+            assert_eq!(l2.used_bytes(), small, "L2 holds the encoded block");
+            let mut stored = vec![0u8; small as usize];
+            l2.get(&key2, TierBlockMut::Host(&mut stored)).unwrap();
+            assert_eq!(stored, want_enc, "L2 (device {device_path})");
+            run_as(&mut o, 4, TransferPath::L2ToL0, key2, (0, 11), up).unwrap();
+            assert_eq!(
+                read_block(&r, 11),
+                want_dec,
+                "L2 → L0 (device {device_path})"
+            );
+
+            if device_path {
+                assert_eq!(
+                    slots(&o),
+                    Some(turbine_kv::hierarchy::DEMOTION_INFLIGHT),
+                    "every staging slot is back"
+                );
+            } else {
+                assert_eq!(slots(&o), None);
+            }
+        }
     }
 
     /// A kernel-library context stand-in: copies are done when enqueued, and a pinned buffer
@@ -2264,8 +2963,11 @@ mod tests {
         copies: AtomicU64,
     }
 
+    /// A pinned buffer with a lock of its own.
+    type FakeBuf = Arc<Mutex<Box<[u8]>>>;
+
     struct FakeInner {
-        bufs: Mutex<HashMap<u64, Box<[u8]>>>,
+        bufs: Mutex<HashMap<u64, FakeBuf>>,
         next: AtomicU64,
     }
 
@@ -2284,7 +2986,10 @@ mod tests {
 
     impl PinnedOwner for FakeInner {
         fn with_bytes_dyn(&self, id: u64, f: &mut dyn FnMut(&mut [u8])) {
-            f(self.bufs.lock().unwrap().get_mut(&id).expect("live buffer"));
+            // A buffer lock of its own, as the kernel library's: a closure may touch another
+            // buffer of the context (an I/O write reads its staging buffer into an L1 slot).
+            let buf = Arc::clone(self.bufs.lock().unwrap().get(&id).expect("live buffer"));
+            f(&mut buf.lock().unwrap());
         }
 
         fn free_pinned(&self, id: u64) {
@@ -2295,11 +3000,10 @@ mod tests {
     impl PinnedMemory for FakeCtx {
         fn alloc_pinned(&self, bytes: usize) -> Result<PinnedBuffer, MemoryError> {
             let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
-            self.inner
-                .bufs
-                .lock()
-                .unwrap()
-                .insert(id, vec![0u8; bytes].into_boxed_slice());
+            self.inner.bufs.lock().unwrap().insert(
+                id,
+                Arc::new(Mutex::new(vec![0u8; bytes].into_boxed_slice())),
+            );
             Ok(PinnedBuffer::new(id, bytes, Arc::clone(&self.inner) as _))
         }
     }
@@ -2311,17 +3015,19 @@ mod tests {
             src: CopyTarget,
             bytes: usize,
         ) -> Result<CopyTicket, MemoryError> {
-            let mut bufs = self.inner.bufs.lock().unwrap();
+            let bufs = self.inner.bufs.lock().unwrap();
             let foreign =
                 |id: u64| MemoryError::InvalidArgument(format!("pinned buffer {id} is foreign"));
             match (dst, src) {
                 (CopyTarget::Pinned { buffer_id, offset }, CopyTarget::Device(ptr)) => {
-                    let buf = bufs.get_mut(&buffer_id).ok_or_else(|| foreign(buffer_id))?;
-                    self.mem.copy_d2h(&mut buf[offset..offset + bytes], ptr)?;
+                    let buf = bufs.get(&buffer_id).ok_or_else(|| foreign(buffer_id))?;
+                    self.mem
+                        .copy_d2h(&mut buf.lock().unwrap()[offset..offset + bytes], ptr)?;
                 }
                 (CopyTarget::Device(ptr), CopyTarget::Pinned { buffer_id, offset }) => {
                     let buf = bufs.get(&buffer_id).ok_or_else(|| foreign(buffer_id))?;
-                    self.mem.copy_h2d(ptr, &buf[offset..offset + bytes])?;
+                    self.mem
+                        .copy_h2d(ptr, &buf.lock().unwrap()[offset..offset + bytes])?;
                 }
                 _ => return Err(MemoryError::InvalidArgument("unsupported copy".into())),
             }

@@ -221,6 +221,12 @@ impl ShimLibrary {
         self.syms.v21.rope_attn_factor
     }
 
+    /// True when the library resolves the ABI v2.11 KV transcode group (Phase 6b S-1): a lower
+    /// KV tier may then store a codec other than the page format, transcoded on the device.
+    pub fn kv_transcode(&self) -> bool {
+        self.syms.v21.kv_transcode.is_some()
+    }
+
     /// True when the library exports the ABI v2.1 graph functions (`turbine_graph_*`), so its
     /// contexts can capture and replay graphs.
     pub fn supports_graphs(&self) -> bool {
@@ -2118,7 +2124,6 @@ impl KvTranscodeKernel for ShimProvider {
             )));
         }
         let layers = cfg.layers as usize;
-        let page_bytes = cfg.page_bytes();
         let slot = ctx.coded_block_bytes;
         let num_blocks = ctx.num_blocks();
         if layers == 0 || slot == 0 || ctx.coded.len() != num_blocks * slot {
@@ -2134,19 +2139,12 @@ impl KvTranscodeKernel for ShimProvider {
                 ctx.pages.len()
             )));
         }
-        if let Some(bad) = ctx.pages.iter().position(|p| p.len() != page_bytes) {
-            return Err(invalid(format!(
-                "kv_transcode: page {bad} holds {} bytes, a page is {page_bytes}",
-                ctx.pages[bad].len()
-            )));
-        }
         if num_blocks == 0 {
             return Ok(());
         }
-        let mut table: Vec<*mut c_void> = Vec::with_capacity(ctx.pages.len());
-        for page in ctx.pages {
-            table.push(self.ctx.slice_ptr("page", page)?);
-        }
+        // The pages are the caller's pool addresses (contract of `KvTranscodeContext::pages`);
+        // the coded buffer is checked to be this context's memory.
+        let table: Vec<*mut c_void> = ctx.pages.iter().map(|p| p.addr() as *mut c_void).collect();
         let scales = |name: &str, v: Option<&TensorView<'_>>| -> Result<*const f32, KernelError> {
             match v {
                 None => Ok(std::ptr::null()),

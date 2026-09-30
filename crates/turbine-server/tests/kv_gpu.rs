@@ -171,14 +171,28 @@ impl LabServer {
 
     /// One greedy completion of the token-id prompt `ids` with each token's logprob.
     fn complete_ids(&self, ids: &[u32], max_tokens: u32) -> IdAnswer {
-        let body = json!({
+        self.complete_with_logprobs(json!(ids), max_tokens, None)
+    }
+
+    /// One greedy completion of `prompt` (text or token ids, as the request's JSON) with each
+    /// token's logprob, as a turn of session `session` when given.
+    fn complete_with_logprobs(
+        &self,
+        prompt: Value,
+        max_tokens: u32,
+        session: Option<&str>,
+    ) -> IdAnswer {
+        let mut body = json!({
             "model": SERVED_NAME,
-            "prompt": ids,
+            "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0.0,
             "ignore_eos": true,
             "logprobs": 1,
         });
+        if let Some(key) = session {
+            body["prompt_cache_key"] = json!(key);
+        }
         let (status, text) = request(
             self.addr,
             "POST",
@@ -634,54 +648,64 @@ fn nvme_round_trip_matches_cold_fp8_kv() {
     nvme_round_trip_matches_cold_with(&fp8_kv_sets());
 }
 
-/// [`nvme_round_trip_matches_cold`] on a server started with the extra overrides `sets`.
-fn nvme_round_trip_matches_cold_with(sets: &[String]) {
-    let _gpu = one_server_at_a_time();
+/// The L2 tests' server: L2 under [`KV_DIR`] and a 1 GiB L1 (L0 stays the lab config's 8 GiB:
+/// a smaller cap shrinks Phase 3's device budget below what the HIP runtime and libraries
+/// already hold, and the device_memory signal would put the server in SURVIVAL; cached blocks
+/// are demoted by capacity past 70 % of L0, so filler prompts still push A down through L1),
+/// with the extra overrides `sets`. Returns it with the blocks 1 GiB of L1 holds (73 BF16
+/// Llama blocks of 14,680,064 bytes, 146 FP8).
+fn nvme_server(sets: &[String]) -> (LabServer, f64) {
     let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
     let kv_dir = Path::new(KV_DIR);
     assert!(kv_dir.is_dir(), "{KV_DIR} is not mounted");
     let tiers = [
         format!("kv.nvme.path={KV_DIR}"),
         "kv.nvme.max_bytes=64GiB".into(),
-        // L0 stays the lab config's 8 GiB: a smaller cap shrinks Phase 3's device budget
-        // below what the HIP runtime and libraries already hold, and the device_memory
-        // signal would put the server in SURVIVAL. Cached blocks are demoted by capacity
-        // past 70 % of L0, so filler prompts still push A down through a 1 GiB L1.
         "kv.cpu.max_bytes=1GiB".into(),
     ];
     let server = LabServer::start(&model_dir, &[&tiers[..], sets].concat());
-    // 1 GiB of L1 holds this many blocks (73 BF16 Llama blocks of 14,680,064 bytes, 146 FP8).
     let (_, block_bytes, _) = l0_tier(&server);
     let l1_blocks = ((1u64 << 30) / block_bytes.max(1)) as f64;
-    let a = prompt(100, 350);
-    // A and the fillers are session turns: blocks of one-off requests are never copied down.
-    let cold = server.complete_in(&a, ANSWER_TOKENS, Some("a"));
+    (server, l1_blocks)
+}
 
-    // Once twice L1's blocks have gone on to L2, A's (the oldest, never touched again) are there.
-    let to_l2 = || {
-        server.metric(r#"turbine_kv_demotions_total{from="l1",to="l2"}"#)
-            + server.metric(r#"turbine_kv_demotions_total{from="l0",to="l2"}"#)
-    };
+/// Blocks that have gone down to L2 (from L1 or straight from L0).
+fn to_l2(server: &LabServer) -> f64 {
+    server.metric(r#"turbine_kv_demotions_total{from="l1",to="l2"}"#)
+        + server.metric(r#"turbine_kv_demotions_total{from="l0",to="l2"}"#)
+}
+
+/// Blocks promoted out of L2.
+fn from_l2(server: &LabServer) -> f64 {
+    server.metric(r#"turbine_kv_promotions_total{from="l2",to="l0"}"#)
+        + server.metric(r#"turbine_kv_promotions_total{from="l2",to="l1"}"#)
+}
+
+/// Filler session turns until twice L1's blocks have gone on to L2: A's (the oldest, never
+/// touched again) are there.
+fn fill_until_l2(server: &LabServer, l1_blocks: f64) {
     let mut filler = 0;
-    while to_l2() < 2.0 * l1_blocks {
+    while to_l2(server) < 2.0 * l1_blocks {
         filler += 1;
         assert!(
             filler <= 400,
             "demotion to L2 never happened ({} blocks)",
-            to_l2()
+            to_l2(server)
         );
         let key = format!("filler-{filler}");
         server.complete_in(&prompt(1_000 + filler, 1_800), 1, Some(&key));
     }
-    println!("{filler} filler prompts moved {} blocks to L2", to_l2());
+    println!(
+        "{filler} filler prompts moved {} blocks to L2",
+        to_l2(server)
+    );
+}
 
-    // Bring A back explicitly (`POST /turbine/v1/kv/prefetch`): on the R9700 the planner may
-    // rightly find recomputing a few blocks cheaper than reading them from NVMe, and this test
-    // is about the bytes surviving the round trip, not about that choice.
-    let from_l2 = || {
-        server.metric(r#"turbine_kv_promotions_total{from="l2",to="l0"}"#)
-            + server.metric(r#"turbine_kv_promotions_total{from="l2",to="l1"}"#)
-    };
+/// Brings A back explicitly (`POST /turbine/v1/kv/prefetch`): on the R9700 the planner may
+/// rightly find recomputing a few blocks cheaper than reading them from NVMe, and these tests
+/// are about the bytes surviving the round trip, not about that choice. Returns once a block
+/// was promoted out of L2.
+fn prefetch_a_from_l2(server: &LabServer, a: &str) {
     let body = json!({ "prompt": a }).to_string();
     // The fillers leave L0 near its demotion threshold: a prefetch is refused (409
     // `pressure_too_high`) while L0 pressure is ORANGE or above, until the demotions in flight
@@ -697,7 +721,7 @@ fn nvme_round_trip_matches_cold_with(sets: &[String]) {
     assert_eq!(status, 202, "{text}");
     println!("prefetch of A: {text}");
     let started = Instant::now();
-    while from_l2() < 1.0 {
+    while from_l2(server) < 1.0 {
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "the prefetch never promoted from L2: {text}"
@@ -705,6 +729,17 @@ fn nvme_round_trip_matches_cold_with(sets: &[String]) {
         std::thread::sleep(POLL);
     }
     std::thread::sleep(Duration::from_secs(2));
+}
+
+/// [`nvme_round_trip_matches_cold`] on a server started with the extra overrides `sets`.
+fn nvme_round_trip_matches_cold_with(sets: &[String]) {
+    let _gpu = one_server_at_a_time();
+    let (server, l1_blocks) = nvme_server(sets);
+    let a = prompt(100, 350);
+    // A and the fillers are session turns: blocks of one-off requests are never copied down.
+    let cold = server.complete_in(&a, ANSWER_TOKENS, Some("a"));
+    fill_until_l2(&server, l1_blocks);
+    prefetch_a_from_l2(&server, &a);
 
     let warm = server.complete(&a, ANSWER_TOKENS);
     assert_eq!(
@@ -713,16 +748,71 @@ fn nvme_round_trip_matches_cold_with(sets: &[String]) {
         "A after its L2 round trip"
     );
     assert!(warm.2 > 0, "A reused no prefix");
-    let promoted = from_l2();
+    let promoted = from_l2(&server);
     assert!(promoted > 0.0, "nothing was promoted from L2");
     assert_eq!(
         server.metric(r#"turbine_kv_evictions_total{tier="l2",reason="checksum"}"#),
         0.0,
         "a promoted block's bytes differed from what was written"
     );
-    let slabs = slab_bytes(kv_dir);
+    let slabs = slab_bytes(Path::new(KV_DIR));
     assert!(slabs <= KV_CAP_BYTES, "{slabs} bytes of slab files");
     println!("nvme_round_trip_matches_cold ok: {promoted} promotions from L2, {slabs} slab bytes");
+}
+
+/// P6b S-1 (ABI v2.11 KV transcode, FP8 on the demotion path): with `kv.nvme.format:
+/// fp8_e4m3` below the BF16 pool, blocks go to L2 encoded on the device (a block of L2 holds
+/// well under the BF16 block bytes: the last block of each sequence stays at `l0`,
+/// `kv.lossless_tail_blocks`), come back decoded into the pages by the kernel, and A answers
+/// within the codec's bound of its cold run: the first tokens' logprobs within 0.3 and at
+/// least 90 % of all positions within 0.5 (the FP8 KV golden's bounds are 0.15 / 0.55), with a
+/// reused prefix and no checksum failure. The `l0` default stays bit-exact
+/// (`nvme_round_trip_matches_cold`).
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so, the Llama-3.2-3B weights and /home/piwi/turbine-kv"]
+fn nvme_round_trip_fp8_tier() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let (server, l1_blocks) = nvme_server(&["kv.nvme.format=fp8_e4m3".to_string()]);
+    let (_, block_bytes, _) = l0_tier(&server);
+    let a = prompt(100, 350);
+    let cold = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    fill_until_l2(&server, l1_blocks);
+    let stored = to_l2(&server);
+    let used = server.metric(r#"turbine_kv_bytes{tier="l2",kind="used"}"#);
+    println!("L2 holds {used} bytes for {stored} demoted blocks of {block_bytes} bytes");
+    assert!(
+        used < 0.75 * stored * block_bytes as f64,
+        "L2 holds {used} bytes for {stored} blocks of {block_bytes}: not encoded"
+    );
+    prefetch_a_from_l2(&server, &a);
+
+    let warm = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, None);
+    assert!(warm.cached_tokens > 0, "A reused no prefix");
+    assert_eq!(warm.completion_tokens, cold.completion_tokens);
+    let diff: Vec<f64> = cold
+        .logprobs
+        .iter()
+        .zip(&warm.logprobs)
+        .map(|(c, w)| (c - w).abs())
+        .collect();
+    let head = diff.iter().take(8).cloned().fold(0.0, f64::max);
+    let within = diff.iter().filter(|d| **d <= 0.5).count() as f64 / diff.len().max(1) as f64;
+    println!("fp8 tier: worst of the first 8 |Δ logprob| {head:.3}, {within:.2} within 0.5");
+    assert!(head <= 0.3, "first tokens differ by {head}");
+    assert!(
+        within >= 0.9,
+        "only {within} of the positions are within 0.5"
+    );
+    assert_eq!(
+        server.metric(r#"turbine_kv_evictions_total{tier="l2",reason="checksum"}"#),
+        0.0,
+        "a promoted block's bytes differed from what was written"
+    );
+    assert!(from_l2(&server) > 0.0, "nothing was promoted from L2");
+    println!("nvme_round_trip_fp8_tier ok");
 }
 
 /// The lab config loads and spells out the tiers the lab tests rely on.

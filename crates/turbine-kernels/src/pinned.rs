@@ -476,6 +476,21 @@ impl CopyEngine for ShimContext {
         }
     }
 
+    fn fence_compute(&self) -> Result<CopyTicket, MemoryError> {
+        let (staging, _) = self.copy_fns()?;
+        let mut s = self.pinned_state().lock();
+        let event = self.new_event(&staging)?;
+        // SAFETY: `event` is a live event of this context; a null stream is the compute stream
+        // (as in `mark_staged`). The event is destroyed when its ticket is polled or waited.
+        let code =
+            unsafe { (staging.event_record)(self.raw_ctx(), event.raw, std::ptr::null_mut()) };
+        self.check_code(code)?;
+        s.next_ticket += 1;
+        let id = s.next_ticket;
+        s.tickets.insert(id, event);
+        Ok(CopyTicket { id, bytes: 0 })
+    }
+
     fn wait(&self, t: &CopyTicket) -> Result<(), MemoryError> {
         let (staging, _) = self.copy_fns()?;
         // Taken out of the table first, so other copies proceed while this one is awaited.

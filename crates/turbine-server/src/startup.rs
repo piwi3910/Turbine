@@ -165,7 +165,7 @@ pub fn run(cli: Cli) -> ExitCode {
     support_startup::log(&support);
     support_startup::log_tier_formats(&config);
     // P6b: KV formats that need the ABI v2.10 group no provider has yet: exit 1 before binding.
-    if let Err(e) = support_startup::kv_format_availability(&config) {
+    if let Err(e) = support_startup::kv_format_availability(&config, None) {
         tracing::error!(event = e.code, error = %e.message, "KV format unavailable");
         eprintln!("turbine-server: {}: {}", e.code, e.message);
         return ExitCode::Startup;
@@ -376,6 +376,19 @@ pub fn run(cli: Cli) -> ExitCode {
             || tp_kv_format(prepared.pool.layout, group_size),
             |p| p.format,
         );
+        // P6b S-1: a lower tier not stored at the page format needs the loaded library's v2.11
+        // KV transcode (the cpu reference provider has it).
+        let transcode = prepared
+            .provider
+            .opened
+            .context
+            .as_ref()
+            .is_none_or(|ctx| ctx.library().kv_transcode());
+        if let Err(e) = support_startup::kv_format_availability(&cfg, Some(transcode)) {
+            tracing::error!(event = e.code, error = %e.message, "KV format unavailable");
+            eprintln!("turbine-server: {}: {}", e.code, e.message);
+            return ExitCode::Startup;
+        }
         if let Err(e) = cfg.kv.validate_block_bytes(format.block_bytes()) {
             eprintln!("turbine-server: invalid configuration: {e}");
             return ExitCode::Config;

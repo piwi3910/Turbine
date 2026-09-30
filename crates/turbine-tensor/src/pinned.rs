@@ -104,4 +104,13 @@ pub trait CopyEngine: Send + Sync {
     /// `Ok(true)` once the ticket's event has signalled.
     fn poll(&self, t: &CopyTicket) -> Result<bool, MemoryError>;
     fn wait(&self, t: &CopyTicket) -> Result<(), MemoryError>;
+    /// A ticket that signals once the work already enqueued on the device's compute stream has
+    /// completed (an event recorded on it): what a caller waits on before reusing a buffer a
+    /// compute-stream kernel (a KV transcode, P6b S-1) may still be reading. `Unsupported` for
+    /// an engine without compute-stream events.
+    fn fence_compute(&self) -> Result<CopyTicket, MemoryError> {
+        Err(MemoryError::Unsupported(
+            "this copy engine cannot fence the compute stream".into(),
+        ))
+    }
 }
