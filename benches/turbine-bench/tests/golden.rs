@@ -1294,7 +1294,7 @@ mod quant_fixtures {
     /// Slugs of spec phase-6a Data with the Hub repository, the pinned revision and the fixture
     /// script the README must name. `llama-3.2-3b-instruct-yarn16` is not listed: it is not a
     /// quantized checkpoint and holds a 17th (long) prompt.
-    const QUANT_SLUGS: [(&str, &str, &str, &str); 9] = [
+    const QUANT_SLUGS: [(&str, &str, &str, &str); 11] = [
         (
             "llama-3.2-3b-instruct-fp8-dynamic",
             "RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic",
@@ -1329,6 +1329,18 @@ mod quant_fixtures {
             "llama-3.2-3b-instruct-autoround-gptq",
             "kaitchup/Llama-3.2-3B-Instruct-AutoRoundGPTQ-4bit",
             "e11f15d2291d8c343a4de84d6bb16ebf7c871dfc",
+            "quant_reference.py",
+        ),
+        (
+            "llama-3.2-3b-instruct-fp8kv",
+            "unsloth/Llama-3.2-3B-Instruct",
+            "006f5dcd1393c3add266de40994ba96225e9689d",
+            "quant_reference.py",
+        ),
+        (
+            "olmoe-1b-7b-0125-instruct-fp8kv",
+            "allenai/OLMoE-1B-7B-0125-Instruct",
+            "b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e",
             "quant_reference.py",
         ),
         (
