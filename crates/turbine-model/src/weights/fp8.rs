@@ -388,13 +388,18 @@ impl Fp8Layout {
             block_n: bn,
             block_k: bk,
         };
-        if bytes.len() != n * k || scales.len() != scheme.scale_count(n, k) {
+        let blocks = [n.div_ceil(bn as usize), k.div_ceil(bk as usize)];
+        if bytes.len() != n * k
+            || scales.len() != scheme.scale_count(n, k)
+            || scale_entry.shape != blocks
+        {
             return Err(ModelError::Safetensors {
                 file: entry.file.clone(),
                 tensor: entry.name.clone(),
                 rule: format!(
-                    "{} bytes and {} block scales for [{n}, {k}]",
+                    "{} bytes and block scales of shape {:?} ({} values) for [{n}, {k}]",
                     bytes.len(),
+                    scale_entry.shape,
                     scales.len()
                 ),
             });
@@ -443,6 +448,29 @@ impl Fp8Layout {
         let values = scale_values(entry, &bytes)?;
         let want: usize = slot.shape.iter().product();
         let per_tensor = slot.name.ends_with(".input_scale") || self.weights == Fp8Weights::Tensor;
+        // The count alone does not say which scale goes to which rows or block: a transposed
+        // block-scale tensor has the right count (review r13 C5).
+        let shape_ok = match (per_tensor, self.weights) {
+            (true, _) => entry.shape.iter().all(|&d| d == 1),
+            (false, Fp8Weights::Block { .. }) => entry.shape == slot.shape,
+            (false, _) => {
+                let n = slot.shape[0];
+                entry.shape == [n] || entry.shape == [n, 1]
+            }
+        };
+        if !shape_ok {
+            return Err(ModelError::Safetensors {
+                file: entry.file.clone(),
+                tensor: entry.name.clone(),
+                rule: format!(
+                    "scale shape {:?} for a slot of shape {:?} ({:?} weights{})",
+                    entry.shape,
+                    slot.shape,
+                    self.weights,
+                    if per_tensor { ", one value" } else { "" }
+                ),
+            });
+        }
         let out: Vec<f32> = if per_tensor && values.len() == 1 {
             vec![values[0]; want]
         } else if values.len() == want && !per_tensor {
@@ -473,8 +501,29 @@ fn check_slot(name: &str) -> WeightSlot {
     }
 }
 
-/// A scale tensor's values as F32.
+/// A scale tensor's values as F32: at least one, every one finite and positive (a weight or
+/// input scale of zero, a negative or a NaN one would silently corrupt every product it
+/// scales; review r13 P4 — the lab FP8 checkpoints hold no zero scale).
 fn scale_values(entry: &TensorEntry, bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
+    let values = decode_scales(entry, bytes)?;
+    let bad = values
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !(v.is_finite() && **v > 0.0));
+    if values.is_empty() || bad.is_some() {
+        return Err(ModelError::Safetensors {
+            file: entry.file.clone(),
+            tensor: entry.name.clone(),
+            rule: match bad {
+                Some((i, v)) => format!("scale {i} is {v}; scales must be finite and positive"),
+                None => "no scale values".to_string(),
+            },
+        });
+    }
+    Ok(values)
+}
+
+fn decode_scales(entry: &TensorEntry, bytes: &[u8]) -> Result<Vec<f32>, ModelError> {
     Ok(match entry.dtype {
         Dtype::F32 => bytes
             .chunks_exact(4)
@@ -742,4 +791,154 @@ fn write_tiny_fp8(
         quantized.push((name, Dtype::F8_E4M3, shape, codes));
     }
     write_fixture(dir, twin, &quantized, dequantized, config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(weights: Fp8Weights) -> Fp8Layout {
+        Fp8Layout {
+            weights,
+            act: ActivationQuant::Fp8PerTensorStatic,
+            ignore: Vec::new(),
+            scale_suffix: "weight_scale",
+            decoded: Vec::new(),
+        }
+    }
+
+    fn entry(name: &str, shape: Vec<usize>) -> TensorEntry {
+        TensorEntry {
+            name: name.to_string(),
+            dtype: Dtype::F32,
+            shape,
+            file: "model.safetensors".into(),
+            range: 0..0,
+        }
+    }
+
+    fn slot(name: &str, shape: Vec<usize>) -> WeightSlot {
+        WeightSlot {
+            name: name.to_string(),
+            shape,
+            stack: None,
+            source: None,
+        }
+    }
+
+    fn ones(n: usize) -> Vec<u8> {
+        f32_bytes(&vec![1.0; n])
+    }
+
+    /// Review r13 C5: a scale tensor must have its slot's layout, not just its count — block
+    /// scales `[n/128, k/128]` exactly (a transposed `[k/128, n/128]` tensor of the same count
+    /// is refused), channel scales `[n]` or `[n, 1]`, a per-tensor weight or input scale one
+    /// value (`[]` or `[1]`). Breaks if repack accepts a scale tensor by its count alone.
+    #[test]
+    fn repack_checks_the_scale_shape() {
+        let block = layout(Fp8Weights::Block { n: 128, k: 128 });
+        let s = slot("m.weight_scale", vec![2, 4]);
+        assert!(
+            block
+                .repack(&s, &entry("m.weight_scale", vec![2, 4]), ones(8))
+                .is_ok()
+        );
+        let err = block
+            .repack(&s, &entry("m.weight_scale", vec![4, 2]), ones(8))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scale shape [4, 2]"), "{err}");
+        assert!(
+            block
+                .repack(&s, &entry("m.weight_scale", vec![8]), ones(8))
+                .is_err()
+        );
+
+        let channel = layout(Fp8Weights::Channel);
+        let s = slot("m.weight_scale", vec![6]);
+        for ok in [vec![6], vec![6, 1]] {
+            assert!(
+                channel
+                    .repack(&s, &entry("m.weight_scale", ok), ones(6))
+                    .is_ok()
+            );
+        }
+        for bad in [vec![1, 6], vec![2, 3]] {
+            assert!(
+                channel
+                    .repack(&s, &entry("m.weight_scale", bad.clone()), ones(6))
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
+
+        let tensor = layout(Fp8Weights::Tensor);
+        let s = slot("m.weight_scale", vec![6]);
+        for ok in [vec![], vec![1]] {
+            assert!(
+                tensor
+                    .repack(&s, &entry("m.weight_scale", ok), ones(1))
+                    .is_ok()
+            );
+        }
+        let input = slot("m.input_scale", vec![6]);
+        assert!(
+            channel
+                .repack(&input, &entry("m.input_scale", vec![1]), ones(1))
+                .is_ok()
+        );
+        assert!(
+            channel
+                .repack(&input, &entry("m.input_scale", vec![6]), ones(6))
+                .is_err()
+        );
+    }
+
+    /// Review r13 P4: weight and input scales must be present, finite and positive — an empty
+    /// tensor, a zero, a negative, a NaN or an infinite value is refused at load (the check-only
+    /// path too). Breaks if a bad scale reaches the GEMM or the static activation quantizer.
+    #[test]
+    fn scales_must_be_finite_and_positive() {
+        let channel = layout(Fp8Weights::Channel);
+        let s = slot("m.weight_scale", vec![2]);
+        assert!(
+            channel
+                .repack(
+                    &s,
+                    &entry("m.weight_scale", vec![2]),
+                    f32_bytes(&[0.5, 2.0])
+                )
+                .is_ok()
+        );
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let err = channel
+                .repack(
+                    &s,
+                    &entry("m.weight_scale", vec![2]),
+                    f32_bytes(&[0.5, bad]),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("finite and positive"), "{bad}: {err}");
+        }
+        let input = slot("m.input_scale", vec![2]);
+        for bad in [-0.02, f32::NAN] {
+            assert!(
+                channel
+                    .repack(&input, &entry("m.input_scale", vec![1]), f32_bytes(&[bad]))
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        let err = channel
+            .repack_with(
+                &slot("m.input_scale", vec![0]),
+                &entry("m.input_scale", vec![0]),
+                Vec::new(),
+                &[],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no scale values"), "{err}");
+    }
 }
