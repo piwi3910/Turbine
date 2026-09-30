@@ -1184,6 +1184,8 @@ struct IoDone {
     ticket: u64,
     result: Result<TierSlot, TierError>,
     bufs: Staged,
+    /// When the I/O thread finished the job: the copy's end, not the poll that collects it.
+    finished: Instant,
 }
 
 fn run_io(op: IoOp) -> (Result<TierSlot, TierError>, Staged) {
@@ -1283,6 +1285,10 @@ pub struct IoPoolBackend {
     l2: Option<Arc<dyn KvTier>>,
     /// Encodes and decodes tier copies not stored at the L0 format (P6b S-1).
     host_codec: Option<Arc<HostCodec>>,
+    /// Copies started through [`TransferBackend::start`], each with its start time.
+    started: HashMap<u64, Instant>,
+    /// Durations of copies `poll` just completed, until `took` reads them.
+    took: HashMap<u64, Duration>,
 }
 
 impl IoPoolBackend {
@@ -1309,6 +1315,7 @@ impl IoPoolBackend {
                                     ticket,
                                     result,
                                     bufs,
+                                    finished: Instant::now(),
                                 })
                                 .is_err()
                             {
@@ -1328,6 +1335,8 @@ impl IoPoolBackend {
             l1: None,
             l2: None,
             host_codec: None,
+            started: HashMap::new(),
+            took: HashMap::new(),
         }
     }
 
@@ -1380,6 +1389,7 @@ impl TransferBackend for IoPoolBackend {
         let (Some(from), Some(to)) = (self.tier(from), self.tier(to)) else {
             return Err(TierError::Missing);
         };
+        let started = Instant::now();
         self.submit(
             t.id,
             IoOp::Move {
@@ -1388,14 +1398,27 @@ impl TransferBackend for IoPoolBackend {
                 key: t.req.key,
                 codec: self.transcode(t.req.codec),
             },
-        )
+        )?;
+        self.started.insert(t.id, started);
+        Ok(())
     }
 
     fn poll(&mut self, t: &TransferTicket) -> Result<Option<TierSlot>, TierError> {
-        match self.take(t.id) {
-            None => Ok(None),
-            Some(d) => d.result.map(Some),
+        let Some(d) = self.take(t.id) else {
+            return Ok(None);
+        };
+        // Timed by the I/O thread's own clock reading, not by the iteration that polls.
+        if let Some(started) = self.started.remove(&t.id)
+            && d.result.is_ok()
+        {
+            self.took
+                .insert(t.id, d.finished.saturating_duration_since(started));
         }
+        d.result.map(Some)
+    }
+
+    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
+        self.took.remove(&t.id)
     }
 }
 
@@ -1674,6 +1697,15 @@ pub struct CopyStreamBackend {
     /// Bytes of one logical block (every shard).
     block_bytes: usize,
     jobs: HashMap<u64, Job>,
+    /// Copies in flight with their start time, and when the I/O pool finished the last stage of
+    /// those that ended in it: a copy is timed start to completion, not to the iteration that
+    /// polls it (decision "6b: production KV copy backends time copies to the polling
+    /// boundary"). A copy that ends on the copy stream is timed to the poll that sees its event
+    /// complete (the ABI has no event timestamps).
+    started: HashMap<u64, Instant>,
+    io_finished: HashMap<u64, Instant>,
+    /// Durations of copies `poll` just completed, until `took` reads them.
+    took: HashMap<u64, Duration>,
     /// The device transcode of lower-tier copies (P6b S-1), when the library has one and the
     /// staging slots could be allocated.
     gpu: Option<DeviceTranscode>,
@@ -1711,6 +1743,9 @@ impl CopyStreamBackend {
             io,
             block_bytes,
             jobs: HashMap::new(),
+            started: HashMap::new(),
+            io_finished: HashMap::new(),
+            took: HashMap::new(),
             gpu: None,
         }
     }
@@ -2365,7 +2400,12 @@ impl CopyStreamBackend {
             Job::Done(r) => Ok(Job::Done(r)),
             Job::Io(stage) => match self.io.take(t.id) {
                 None => Ok(Job::Io(stage)),
-                Some(done) => self.finish_io(t, stage, done),
+                Some(done) => {
+                    if matches!(stage, IoStage::Final) {
+                        self.io_finished.insert(t.id, done.finished);
+                    }
+                    self.finish_io(t, stage, done)
+                }
             },
             Job::Copies { copies, then } => {
                 let mut all = true;
@@ -2433,20 +2473,44 @@ impl CopyStreamBackend {
 
 impl TransferBackend for CopyStreamBackend {
     fn start(&mut self, t: &TransferTicket) -> Result<(), TierError> {
+        let started = Instant::now();
         let job = self.start_job(t)?;
+        self.started.insert(t.id, started);
         self.jobs.insert(t.id, job);
         Ok(())
     }
 
     fn poll(&mut self, t: &TransferTicket) -> Result<Option<TierSlot>, TierError> {
         let job = self.jobs.remove(&t.id).ok_or(TierError::Missing)?;
-        match self.advance(t, job)? {
-            Job::Done(r) => r.map(Some),
+        let advanced = match self.advance(t, job) {
+            Ok(job) => job,
+            Err(e) => {
+                self.started.remove(&t.id);
+                self.io_finished.remove(&t.id);
+                return Err(e);
+            }
+        };
+        match advanced {
+            Job::Done(r) => {
+                let started = self.started.remove(&t.id);
+                let end = self.io_finished.remove(&t.id).unwrap_or_else(Instant::now);
+                if r.is_ok()
+                    && let Some(started) = started
+                {
+                    self.took
+                        .insert(t.id, end.saturating_duration_since(started));
+                }
+                r.map(Some)
+            }
             pending => {
                 self.jobs.insert(t.id, pending);
                 Ok(None)
             }
         }
+    }
+
+    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
+        self.took.remove(&t.id)
     }
 }
 
@@ -2952,6 +3016,97 @@ mod tests {
                 assert_eq!(slots(&o), None);
             }
         }
+    }
+
+    /// Decision "6b: production KV copy backends time copies to the polling boundary": a copy
+    /// that the I/O pool finished long before the engine polled it reports the time it took,
+    /// start to the I/O thread's completion, not start to the poll (an L0 → L2 copy through the
+    /// staging path, and an L1 → L2 copy on the pool alone). Breaks if `took` stays `None`
+    /// (the transfer engine then times the copy to the poll) or is stamped when polled.
+    #[test]
+    fn copies_are_timed_to_their_completion_not_to_the_poll() {
+        let dir = TempDir::new("turbine-kv-copy-timing");
+        let kv = kv_config(&dir, true);
+        let reg = MetricsRegistry::new();
+        let metrics = KvMetrics::register(&reg);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let format = kv_format(layout());
+        let l2 = open_l2(
+            &kv,
+            &format,
+            &identity(),
+            Arc::clone(&clock),
+            metrics.clone(),
+        )
+        .unwrap()
+        .expect("L2 is enabled");
+        let (mem, mut pool) = rank(0);
+        let (mut o, _handle) = KvOrchestrator::start(
+            KvStart {
+                cfg: &kv,
+                memory_kind: MemoryKind::Dedicated,
+                identity: identity(),
+                device: stream(&mem, 0),
+                shards: Vec::new(),
+                l2: Some(l2),
+                clock,
+                metrics,
+                remote: None,
+                kv_scales: None,
+            },
+            &mut pool,
+        )
+        .expect("the KV hierarchy starts");
+        let r = (mem, pool);
+        let bb = layout().block_bytes() as usize;
+        write_block(&r, 3, &pattern(1, 3, bb));
+        let ticket = |id, path, key, src_slot, dst_slot| TransferTicket {
+            id,
+            req: TransferRequest {
+                path,
+                key,
+                bytes: bb as u64,
+                owner: None,
+                purpose: TransferPurpose::Demote,
+                src_slot,
+                dst_slot,
+                codec: TransferCodec::l0(bb as u64),
+            },
+        };
+        let late = Duration::from_millis(600);
+        let key = KvKey([8; 16]);
+
+        // L0 → L2: staged on the host (the first poll moves it on to the I/O pool), stored by
+        // the pool, collected by a poll long after.
+        let t = ticket(1, TransferPath::L0ToL2, key, 3, 0);
+        o.backend.start(&t).unwrap();
+        let mut done = o.backend.poll(&t).unwrap().is_some();
+        std::thread::sleep(late);
+        for _ in 0..3 {
+            done = done || o.backend.poll(&t).unwrap().is_some();
+        }
+        assert!(done, "the copy completed");
+        let took = o.backend.took(&t).expect("the backend timed its own copy");
+        assert!(took < late / 2, "timed to the poll: {took:?}");
+
+        // L1 → L2 on the I/O pool alone.
+        let l1 = o.backend.l1.clone().expect("L1");
+        let key1 = KvKey([9; 16]);
+        l1.put(key1, TierBlockRef::Host(&pattern(2, 4, bb)))
+            .unwrap();
+        let t = ticket(2, TransferPath::L1ToL2, key1, 0, 0);
+        o.backend.io.start(&t).unwrap();
+        std::thread::sleep(late);
+        let mut done = false;
+        for _ in 0..2 {
+            done |= o.backend.io.poll(&t).unwrap().is_some();
+            if done {
+                break;
+            }
+        }
+        assert!(done, "the pool finished the copy");
+        let took = o.backend.io.took(&t).expect("the pool timed its own copy");
+        assert!(took < late / 2, "timed to the poll: {took:?}");
     }
 
     /// A kernel-library context stand-in: copies are done when enqueued, and a pinned buffer
