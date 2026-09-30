@@ -1,11 +1,7 @@
-# Handoff: p6b-t5 (Phase 6b Task 5, kernel level: ABI v2.11 `kv_transcode`, FP8 on HIP)
+# Handoff: p6b-t5 (Phase 6b Task 5: ABI v2.11 `kv_transcode`, FP8 on HIP and on the demotion path)
 
-Branch `p6b-t5` from `p6b-stack` 254a0c7. Steps 1 to 3 of the task are done; the server step (4) and the
-support-matrix flip (5) are NOT started: the t4+t15 merge had not landed on `p6b-stack` when steps 1 to 3
-finished (`git log p6b-stack` shows no commit mentioning t4t15), and `crates/turbine-server/src/kv_orchestrator.rs`
-belongs to that builder until then.
-
-**Checkpoint: ready for the server step.**
+Branch `p6b-t5` from `p6b-stack` 254a0c7, merged with `p6b-stack` twice (t4t15 at 403ed0b, then 71574a6).
+Steps 1 to 5 are done: kernel level (first half of this file), then the server side (second half).
 
 ## Done
 
@@ -56,20 +52,67 @@ header_declares_the_v211_kv_transcode_group`, `ops::tests::op_minor_revisions` (
 - `scripts/lab-test.sh novanas --tier quick`: PASS, job `turbine-lab-test-0930173016-0ad31d4b` (whole workspace, slow
   perf tests skipped).
 
-## Left (step 4 and 5, blocked on the t4+t15 merge)
+## Server side (step 4 and 5)
 
-1. `git merge p6b-stack` once a commit mentioning t4t15 is on it.
-2. `CopyStreamBackend` (`crates/turbine-server/src/kv_orchestrator.rs`): demotion = build the `pages` table from the
-   pool (`KvPoolView.storage.slice(offset, len)` from each `block_segments` address, one `DeviceSlice` per layer),
-   run `kv_transcode` (encode) into a device staging buffer, then the existing pinned copies of the coded bytes;
-   promotion = pinned copy of the small bytes into the staging buffer, decode into the L0 pages. Staging =
-   `DEMOTION_INFLIGHT` × the largest encoded block per shard, allocated at startup only when a lower-tier format
-   is not `l0`. A `KvCodecFns` over `turbine_kv::codec` (see `KvCodecs` in `tests/hip_ops.rs`) is the CPU table. Task 3
-   left the L1 copy stream refusing a non-identity codec and the host `HostCodec` path (L2) in place; the GPU path
-   replaces the refusal. Transcode failure: the demotion is abandoned, the tier marked degraded (spec S-12).
-3. `support_startup::kv_format_availability` stops refusing `fp8_e4m3` with `kv_transcode_unavailable` when the
-   library resolves v2.11 (`ShimLibrary` → `kv_transcode` family present); `TIER_FORMAT_REFUSALS` (`turbine-core`
-   `support.rs`) gets `fp8_e4m3` as `experimental`; update `docs/extending/kv-format.md` "Progressive gating".
-4. Lab `kv_gpu::nvme_round_trip_fp8_tier` (written with the server step, since it cannot pass before it: L2
-   `fp8_e4m3` from BF16 L0 within the codec bound, `l0` still bit-exact), then `scripts/lab-test.sh novanas -- -p
-turbine-server --test kv_gpu`, `scripts/lab-test.sh novanas --tier quick`, `scripts/gate.sh`.
+- `crates/turbine-server/src/kv_orchestrator.rs`:
+  - `DeviceTranscode` (kernel provider + copy engine + device staging): `DEMOTION_INFLIGHT` slots of the largest
+    encoded block among the served tier formats, allocated only when a configured tier format is one the library
+    serves in both directions (`fp8_e4m3` over BF16 pages today), else nothing is allocated. Switched on by
+    `KvOrchestrator::enable_device_transcode` (engine thread, after `start`; the cpu backend passes the
+    cpu-reference provider). `CodecTable` is the `KvCodecFns` over `turbine_kv::codec`.
+  - Demotion (L0 to L1 or L2, non-identity codec): encode kernel into a slot, D2H of the small bytes into the pinned
+    staging buffer (ordered after the kernel by `copy_async`'s compute wait), slot freed, then the I/O pool stores
+    `to_bytes` of them (`HostTranscode.pre_encoded`). Promotion: the pool reads `from_bytes` into the staging
+    buffer, H2D into a slot, decode kernel into the L0 pages, a compute fence (`CopyEngine::fence_compute`, new;
+    `ShimContext` implements it with an event on the compute stream) frees the slot once the kernel has read it.
+    L1 non-identity copies now take the same staging/I-O path as L2 (the old "copy stream moves l0 blocks only"
+    refusal is gone); a copy the device cannot serve (another codec, no free slot) uses the host codec as before.
+    A transcode failure abandons the copy, frees slot and buffers and counts an L1 copy error.
+  - Copies are timed by the backends (decision "6b: production KV copy backends time copies to the polling
+    boundary", A): `IoPoolBackend` and `CopyStreamBackend` implement `TransferBackend::took` from a start time and
+    the I/O thread's own finish time (`IoDone.finished`). A copy that ends on the copy stream is timed to the poll
+    that sees its event complete (the ABI has no event timestamps), and the stage hops of a staged copy still happen
+    at polls: the bias is gone for I/O, reduced for staged copies, unchanged for pure stream copies.
+  - `KvTranscodeContext.pages` is `&[DevicePtr]` now (the pool exposes addresses, not `DeviceSlice`s), documented
+    like `copy_async`'s addresses; the `coded` slice is still owner-checked.
+- Startup: `support_startup::kv_format_availability(cfg, library: Option<bool>)` runs before the library is loaded
+  (`None`) and again in `startup.rs` once the provider is prepared (`Some(ShimLibrary::kv_transcode())`; cpu
+  reference = true); a lower tier needing the transcode on a library without it exits 1
+  `kv_transcode_unavailable`. `kv.ladder.enabled` stays refused (its rewrites still run on the host codec).
+  `TIER_FORMAT_REFUSALS`: `fp8_e4m3` `experimental` (WARN `support_matrix` at startup).
+- Tests: `kv_orchestrator::tests::device_transcode_matches_the_host_codec_through_l1_and_l2` (host/device paths store
+  and promote the same bytes through L1 and L2, all slots back; mutation: not returning the slot on promotion fails
+  it), `copies_are_timed_to_their_completion_not_to_the_poll` (mutations: stamping the I/O finish at the poll, and
+  stamping the pool's own timing at the poll, each fail it), `support_startup::tests::tier_formats_and_availability`,
+  `core support::tests::baseline_rows_present`, lab `kv_gpu::nvme_round_trip_fp8_tier`.
+- The FakeCtx test stand-in now has a lock per pinned buffer (it held one lock across the closure, which deadlocked
+  an I/O write into an L1 slot; the kernel library already locks per buffer).
+
+## Evidence (server side)
+
+- `scripts/gate.sh`: `gate: ok crates=all passed=859 failed=0`. `scripts/lab-test.sh novanas --tier quick`: PASS, job
+  `turbine-lab-test-0930204040-223f1dd3`.
+- Lab `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu`: job `turbine-lab-test-0930203108-3bd31291`
+  PASS, 8 tests including `nvme_round_trip_fp8_tier` (L2 holds 1.23 GB for 156 demoted blocks of 14.7 MB: the
+  blocks are encoded; A answers within the bound after its prefetch, worst first-8 logprob difference 0.000) and
+  both `nvme_round_trip_matches_cold` variants (bit-exact, `l0`).
+- Two earlier full runs hung one test each on a 300 s HTTP read timeout (`WouldBlock` in `request`): job
+  `turbine-lab-test-0930191933-2d68e07e` (`nvme_round_trip_matches_cold_fp8_kv`, a test that uses no lower-tier
+  format) and `turbine-lab-test-0930202024-378e678b` (`nvme_round_trip_fp8_tier`, at the prefetch); the same
+  tests pass alone and in the two other full runs (`...0930193806-34574682`, `...0930203108-3bd31291`). Other
+  Turbine jobs were running on the node at those times. Not reproduced and not explained; if it recurs, take a
+  thread dump of the server before the read timeout.
+
+## Open
+
+1. A fp8 lower tier does not get reused by a lookup after a prefetch: `POST /turbine/v1/kv/prefetch` promotes the
+   lossy blocks into L0 under their own `lossy_key` entries, but the exact chain still finds the entries' lossy L2
+   locations first, and for three blocks the planner then recomputes (`recompute_cheaper`); the decoded L0 copies
+   are not consulted. That is the lossy lineage of Task 4 meeting the planner (Task 6 writes the lab test
+   `lossy_tier_reuse` for it), so `nvme_round_trip_fp8_tier` checks encoded size, promotion without a copy or
+   checksum error, and the answer's logprobs, not a reused prefix. Options for Task 6: prefer the L0 lossy copy in
+   the lookup, or make the prefetch also add the L0 location to the exact entry.
+2. The staging slots are allocated after the memory budget is fixed (`DEMOTION_INFLIGHT` x 7 MiB for Llama FP8,
+   235 MiB): they are not in the reliability ledger. A failed allocation falls back to the host codec with a WARN.
+3. The ladder (`kv.ladder.enabled`) still refuses at startup; its `Compress` rewrites are host-codec I/O jobs.
+4. Tensor or pipeline parallelism still refuses a lower-tier format other than `l0` (one shard per block).
