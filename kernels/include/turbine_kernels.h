@@ -502,7 +502,11 @@ const char *turbine_logits_reduce_impl(const turbine_logits_reduce_desc *d);
  * which is captured as a copy node). A failed capture
  * leaves the context usable. A graph records the device pointers its ops were
  * captured with: the caller keeps those buffers alive and destroys the graph
- * before freeing them. */
+ * before freeing them. A capture and a context creation never overlap within
+ * one process: turbine_ctx_create waits until no context captures (and returns
+ * TURBINE_E_ARGUMENT on a thread with a capture open), and turbine_graph_begin
+ * waits while a context is being created, because a library may make device
+ * runtime calls during creation that break every capture in progress. */
 typedef struct turbine_graph turbine_graph;
 int32_t turbine_graph_begin(turbine_ctx *ctx);
 int32_t turbine_graph_end(turbine_ctx *ctx, turbine_graph **out);

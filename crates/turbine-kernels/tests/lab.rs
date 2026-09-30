@@ -1,10 +1,10 @@
 //! Lab only (novanas R9700, P4 S-5/S-6/S-17, CONFLICT C-6): kernel C ABI v2.3 + v2.5 pinned host
 //! memory and copy streams through `libturbine_hip.so`. Run by `scripts/lab-test.sh novanas`,
 //! which sets `TURBINE_TEST_BACKEND=hip` and `TURBINE_KERNEL_LIBRARY`.
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
-use turbine_kernels::test_support::{open_context, require_backend};
+use turbine_kernels::test_support::{open_backend, open_context, require_backend};
 use turbine_tensor::{CopyEngine, CopyTarget, DeviceBuffer, DeviceMemory, PinnedMemory};
 
 /// One Llama-3.2-3B BF16 KV block (28 layers × 8 KV heads × 128 × 16 tokens × K+V × 2 bytes).
@@ -290,4 +290,63 @@ fn host_link_probe() {
             h2d[1]
         );
     }
+}
+
+/// A context created on one thread while another thread's context captures a graph waits for
+/// the capture to end instead of breaking it. HIP (ROCm 7.14) refuses a synchronous
+/// `hipMemset` anywhere in the process while any stream captures, whatever the capture mode,
+/// and invalidates every capture; `hipblasLtCreate` (inside `turbine_ctx_create`) issues one
+/// and `exit(1)`s on the error, so without the shim's capture gate this binary dies here
+/// (`tiny_model hip_decode_graph_matches_eager`, 2026-10-01).
+#[test]
+#[ignore = "needs a HIP device and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn context_created_during_another_threads_capture_waits() {
+    if !require_backend("hip") {
+        return;
+    }
+    const BYTES: usize = 4096;
+    let opened = open_backend("hip");
+    let device = opened
+        .device
+        .clone()
+        .expect("the hip backend runs on a device");
+    let ctx = opened.context.clone().expect("a kernel library context");
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut src = DeviceBuffer::alloc(&mem, BYTES).expect("source");
+    let dst = DeviceBuffer::alloc(&mem, BYTES).expect("destination");
+    src.copy_from_host(0, &[7u8; BYTES]).expect("seed source");
+    mem.synchronize().expect("seeded");
+
+    ctx.graph_begin().expect("begin capture");
+    mem.copy_d2d(dst.ptr(), src.ptr(), BYTES)
+        .expect("a D2D copy is captured");
+    let lib = Arc::clone(ctx.library());
+    let (started_tx, started_rx) = mpsc::channel();
+    let creator = std::thread::spawn(move || {
+        started_tx.send(()).expect("main thread waits");
+        let created = lib.create_context(&device);
+        (created, Instant::now())
+    });
+    started_rx.recv().expect("creator started");
+    // Long enough for the creator to reach hipblasLtCreate while the capture is open.
+    std::thread::sleep(Duration::from_millis(500));
+    let ending = Instant::now();
+    let graph = ctx
+        .graph_end()
+        .expect("the capture survives a context created on another thread");
+    let (created, created_at) = creator.join().expect("creator thread");
+    let other = created.expect("second context");
+    assert!(
+        created_at >= ending,
+        "the context was created while the capture was open"
+    );
+    ctx.graph_launch(&graph).expect("replay");
+    mem.synchronize().expect("replayed");
+    let mut got = [0u8; BYTES];
+    dst.copy_to_host(0, &mut got).expect("read back");
+    assert!(
+        got.iter().all(|&b| b == 7),
+        "the replayed copy wrote the source"
+    );
+    drop(other);
 }

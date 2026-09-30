@@ -19,6 +19,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -148,6 +149,9 @@ struct turbine_ctx {
   // True between turbine_graph_begin and turbine_graph_end (graph.cpp): the
   // stream is being captured, so copies, syncs and allocations are refused.
   bool capturing = false;
+  // The thread that began the capture in progress (valid while capturing): its
+  // entry in the process-wide capture gate (graph.cpp).
+  std::thread::id capture_thread;
   std::mutex error_mutex;
   std::string last_error;
 };
@@ -176,6 +180,31 @@ int32_t refuse_while_capturing(turbine_ctx *ctx, const char *what);
 // Ends and discards a capture in progress on ctx (no-op otherwise), e.g. before
 // the context is destroyed (graph.cpp).
 void abandon_capture(turbine_ctx *ctx);
+
+// Process-wide capture gate (graph.cpp). HIP (ROCm 7.14 clr) refuses a
+// synchronous runtime call such as hipMemset or hipMemcpy anywhere in the
+// process while any stream is capturing, whatever the capture mode
+// (thread-local included), and invalidates every capture in progress
+// (hipErrorStreamCaptureImplicit, "operation would make the legacy stream
+// depend on a capturing blocking stream"). hipblasLtCreate makes one such call
+// (a hipMemset of its synchronizer) and exit(1)s when it fails.
+// turbine_ctx_create therefore holds a CreationGuard around the context's
+// construction: it waits until no context of the process is capturing, and
+// turbine_graph_begin waits while any guard is held, so a capture and a context
+// creation never overlap. A thread that has a capture open cannot create a
+// context (it would wait for itself): ok() is then false and the guard holds
+// nothing.
+class CreationGuard {
+public:
+  CreationGuard();
+  ~CreationGuard();
+  CreationGuard(const CreationGuard &) = delete;
+  CreationGuard &operator=(const CreationGuard &) = delete;
+  bool ok() const { return ok_; }
+
+private:
+  bool ok_ = false;
+};
 
 // hipGetErrorName-style name of a hipBLAS status.
 const char *blaslt_status_name(hipblasStatus_t status);
