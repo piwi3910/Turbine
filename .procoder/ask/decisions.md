@@ -2144,3 +2144,27 @@ were made with AutoRound. `ct_pack_int4` (compressed-tensors pack-quantized) als
 jobs (the AutoRound run may go earlier when a GPU slot fits); calibration is its own queued GPU job; weights download on
 `novanas` with `hf download … --revision <pinned rev>` (the token stays there). The `gptq_int4` row is re-judged on the A
 run against the 0.04 bound; it stays `experimental` until then.
+
+## MXFP4-A16 8B golden: one knife-edge decode position on p05 (2026-09-30)
+
+Context: `lab-bench --model llama8b-mxfp4 --golden16` (fixture cb4bd66 on `p6a-mxfp4-golden`) passes 15/16 prompts at c1
+and c16 (identical numbers), but p05 misses the bounds at one position: identical prefix 32/32, likely 0.3066 (bound
+0.15), tail 6.0156 (bound 0.90), reference top-5 token 18476 missing at position 5. The investigation (branch
+`p6a-mxfp4-golden`, b62373f / 579f746 trace diagnostic `mxfp4_decode_vs_prefill_trace`, 9a35f21 handoff) found no kernel
+bug: teacher-forced prefill at position 5 is within bounds (tail 0.58) and matches the reference to 0.0007; turning off
+every execution switch changes nothing; decode vs prefill differ first by ≈ 1e-3 in layer-1 attention and the gap
+doubles per layer from layer 8; Turbine's scalar CPU prefill flips the position too. transformers' own spread is also
+largest on p05 (tail 0.8914), and it was measured with the full-sequence variants only (incremental skipped for CPU
+time).
+
+- A) Recalibrate: rerun the self-spread with the incremental (decode-shaped) variants (p05 alone first, then all
+  prompts). If transformers' own incremental decode also flips p05 position 5, set the tolerance from the full spread by
+  the calibration rule, re-judge golden c1 / c16 from the existing captures, then soak and flip `mxfp4`; if it does not,
+  `mxfp4` stays `experimental` and the numbers go to the user — chosen
+- B) Extend the golden margin excuse (every slug): a prompt passes when the teacher-forced run at the same position is
+  within bounds even if free-running decode reshuffles the top-5 there
+- C) Keep the rule: `mxfp4` stays `experimental` for 6a, the investigation moves to Phase 7
+
+**Decision (user, 2026-09-30, relayed by the coordinator): A.** The incremental spread runs as a CPU fixture job under
+`fixture.lock`, ahead of the W4A4 fixture (`/home/piwi/turbine-ci/scratch/mxfp4_inc_spread.sh`, markers
+`mxfp4-inc: p05 rc=` and `mxfp4-inc: done rc=`).
