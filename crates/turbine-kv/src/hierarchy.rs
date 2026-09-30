@@ -9,7 +9,7 @@
 //! so allocation can never reclaim a block while it is being read.
 
 use std::cmp::{Ordering as CmpOrdering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -29,7 +29,8 @@ use crate::directory::{
     format_is_lossy,
 };
 use crate::document::{
-    HitRate, KvDocument, KvSummary, KvTierDocument, Prefetch, Sessions, TierState, Transfers,
+    FormatUsage, HitRate, KvDocument, KvSummary, KvTierDocument, Prefetch, Sessions, TierState,
+    Transfers,
 };
 use crate::identity::{
     Blake3Hasher, KeyHasher, KvFormat, KvKey, NamespaceCache, lossy_key, prefix_keys,
@@ -2610,6 +2611,19 @@ impl KvHierarchy {
         let bb = self.cfg.block_bytes;
         let dtype = self.namespaces.format().layout.dtype.as_str();
         let blocks = |bytes: u64| u32::try_from(bytes / bb.max(1)).unwrap_or(u32::MAX);
+        // Copies per tier and codec (the codec's encoded size per copy).
+        let mut formats: HashMap<TierId, BTreeMap<&'static str, FormatUsage>> = HashMap::new();
+        for b in self.dir.iter() {
+            for l in &b.locations {
+                let u = formats
+                    .entry(l.tier)
+                    .or_default()
+                    .entry(l.format)
+                    .or_default();
+                u.blocks += 1;
+                u.bytes += self.format_bytes(l.format);
+            }
+        }
         let mut tiers = vec![KvTierDocument {
             tier: TierId::L0.as_str(),
             dtype,
@@ -2629,6 +2643,7 @@ impl KvHierarchy {
                 est_latency_seconds: 0.0,
                 est_bandwidth_bytes_per_second: None,
             }),
+            formats: formats.remove(&TierId::L0).unwrap_or_default(),
         }];
         for id in [TierId::L1, TierId::L2] {
             let t = self.tier(id);
@@ -2652,6 +2667,7 @@ impl KvHierarchy {
                     est_latency_seconds: t.map_or(0.0, |t| t.est_latency().as_secs_f64()),
                     est_bandwidth_bytes_per_second: t.and_then(|t| t.est_bandwidth()),
                 }),
+                formats: formats.remove(&id).unwrap_or_default(),
             });
         }
         KvDocument {
@@ -3264,6 +3280,39 @@ pub(crate) mod tests {
             .expect("prefetch accepted");
         assert_eq!(again.blocks_queued, 0, "{again:?}");
         assert_eq!(again.blocks_resident, 4, "{again:?}");
+    }
+
+    /// P6b S-2 (`GET /turbine/v1/kv`): each tier lists its copies per codec, with the bytes at
+    /// that codec's encoded block size, so a lossy tier's capacity in its own blocks can be read
+    /// (`blocks_total` counts L0-format blocks). Breaks if the lists drop a copy, count it in
+    /// the wrong tier or codec, or price an fp8 copy at the L0 block size.
+    #[test]
+    fn document_lists_copies_per_codec() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l2 = Arc::new(MemTier::new(TierId::L2, 16 * bb, arc));
+        let mut r = rig(16, None, Some(l2), clock);
+        r.h.cfg.l2_format = "fp8_e4m3";
+        let fp8 = r.h.format_bytes("fp8_e4m3");
+        assert!(fp8 < bb);
+        run(&mut r, &(0..66).collect::<Vec<u32>>());
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        for _ in 0..4 {
+            r.clock.advance(Duration::from_millis(10));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+        let doc = r.h.document(&r.pool, (0, 0));
+        let tier = |name: &str| doc.tiers.iter().find(|t| t.tier == name).expect("tier");
+        let l2 = &tier("l2").formats;
+        assert_eq!(l2["fp8_e4m3"].blocks, 2, "{l2:?}");
+        assert_eq!(l2["fp8_e4m3"].bytes, 2 * fp8);
+        // The lossless tail is demoted at the L0 format.
+        assert_eq!(l2[L0_FORMAT].blocks, 1, "{l2:?}");
+        assert_eq!(l2[L0_FORMAT].bytes, bb);
+        let l0 = &tier("l0").formats;
+        assert_eq!(l0[L0_FORMAT].blocks, 1, "{l0:?}");
+        assert!(tier("l1").formats.is_empty());
     }
 
     /// The Task 4 kv-sim regression (MultiTurn lru 251 → 199 s, cost_aware/lru 0.78 → 0.93):
