@@ -10,9 +10,10 @@
 //! `TURBINE_STUB_GFX942_V26` (also the v2.6 native stream handles and sharded RMSNorm trios,
 //! `-DTURBINE_STUB_V26`; minor 6), `TURBINE_STUB_GFX942_V27` (also the v2.7 host-mapped
 //! memory and collectives, `-DTURBINE_STUB_V27`; minor 7), `TURBINE_STUB_GFX942_V28` (also
-//! the v2.8 device-sequenced collective step, `-DTURBINE_STUB_V28`; minor 8) and
+//! the v2.8 device-sequenced collective step, `-DTURBINE_STUB_V28`; minor 8),
 //! `TURBINE_STUB_GFX942_V29` (also the v2.9 quantized GEMM and activation quantization trios,
-//! `-DTURBINE_STUB_V29`; minor 9).
+//! `-DTURBINE_STUB_V29`; minor 9) and `TURBINE_STUB_GFX942_V210` (also `-DTURBINE_STUB_V210`:
+//! minor 10, the rope attention factor).
 use std::path::{Path, PathBuf};
 
 fn build_stub(
@@ -139,6 +140,27 @@ fn main() {
     println!(
         "cargo:rustc-env=TURBINE_STUB_GFX942_V29={}",
         gfx942_v29.display()
+    );
+    let gfx942_v210 = build_stub(
+        &out_dir,
+        "turbine_stub_gfx942_v210",
+        2,
+        "hip",
+        "gfx942",
+        &[
+            "TURBINE_STUB_V21",
+            "TURBINE_STUB_V24",
+            "TURBINE_STUB_V25",
+            "TURBINE_STUB_V26",
+            "TURBINE_STUB_V27",
+            "TURBINE_STUB_V28",
+            "TURBINE_STUB_V29",
+            "TURBINE_STUB_V210",
+        ],
+    );
+    println!(
+        "cargo:rustc-env=TURBINE_STUB_GFX942_V210={}",
+        gfx942_v210.display()
     );
     println!("cargo:rustc-env=TURBINE_STUB_ABI999={}", abi999.display());
     println!(

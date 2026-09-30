@@ -7,7 +7,7 @@
  *   -DSTUB_ABI=<n>u  -DSTUB_BACKEND="<name>"  -DSTUB_ARCHS="<a,b>"
  *   [-DTURBINE_STUB_V21] [-DTURBINE_STUB_V24] [-DTURBINE_STUB_V25]
  *   [-DTURBINE_STUB_V26] [-DTURBINE_STUB_V27] [-DTURBINE_STUB_V28]
- *   [-DTURBINE_STUB_V29]
+ *   [-DTURBINE_STUB_V29] [-DTURBINE_STUB_V210]
  * With TURBINE_STUB_V21 it also exports the optional ABI v2.1 and v2.3
  * symbols: turbine_abi_minor (3, a v2.3 library), context options
  * (TURBINE_OPTION_GEMM_AUTOTUNE kept per context,
@@ -24,9 +24,14 @@
  * protocol on the calling thread (see the v2.7 section); with
  * TURBINE_STUB_V28 as well it reports minor 8 and exports the v2.8
  * device-sequenced step (see the v2.8 section); with TURBINE_STUB_V29 as well
- * it reports minor TURBINE_ABI_MINOR (9) and exports the v2.9 qgemm and
- * quantize_act trios (unsupported like every op; see the v2.9 section at the
- * end).
+ * it reports minor 9 and exports the v2.9 qgemm and quantize_act trios
+ * (unsupported like every op; see the v2.9 section at the end); with
+ * TURBINE_STUB_V210 as well it reports minor TURBINE_ABI_MINOR (10), whose
+ * only addition is turbine_rope_desc.attn_factor.
+ *
+ * turbine_rope records each call: stub_rope_calls() counts them and
+ * stub_rope_last_attn_factor() returns the attn_factor of the last one
+ * (test hooks, not part of the ABI).
  *
  * stub_live_contexts() is a test hook (not part of the ABI): the number of
  * contexts created and not yet destroyed, so tests can prove the Rust side
@@ -240,7 +245,29 @@ STUB_OP(gemm, turbine_gemm_desc)
 STUB_OP(attention_prefill, turbine_attention_prefill_desc)
 STUB_OP(attention_decode, turbine_attention_decode_desc)
 STUB_OP(rmsnorm, turbine_rmsnorm_desc)
-STUB_OP(rope, turbine_rope_desc)
+/* rope: unsupported like every op, but it records the call (test hooks). */
+static atomic_int rope_calls;
+static _Atomic float rope_last_attn_factor;
+
+int32_t stub_rope_calls(void) { return atomic_load(&rope_calls); }
+float stub_rope_last_attn_factor(void) {
+  return atomic_load(&rope_last_attn_factor);
+}
+
+int32_t turbine_rope(turbine_ctx *ctx, const turbine_rope_desc *d) {
+  atomic_store(&rope_last_attn_factor, d->attn_factor);
+  atomic_fetch_add(&rope_calls, 1);
+  set_error(ctx->last_error, "stub: rope is not implemented");
+  return TURBINE_E_UNSUPPORTED;
+}
+int32_t turbine_rope_supported(const turbine_rope_desc *d) {
+  (void)d;
+  return 0;
+}
+const char *turbine_rope_impl(const turbine_rope_desc *d) {
+  (void)d;
+  return "stub_rope";
+}
 STUB_OP(silu_mul, turbine_silu_mul_desc)
 STUB_OP(embedding, turbine_embedding_desc)
 STUB_OP(add, turbine_add_desc)
@@ -254,8 +281,10 @@ STUB_OP(moe_experts, turbine_moe_experts_desc)
 STUB_OP(add_rmsnorm, turbine_add_rmsnorm_desc)
 STUB_OP(logits_reduce, turbine_logits_reduce_desc)
 
-#if defined(TURBINE_STUB_V29)
+#if defined(TURBINE_STUB_V210)
 uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
+#elif defined(TURBINE_STUB_V29)
+uint32_t turbine_abi_minor(void) { return 9u; }
 #elif defined(TURBINE_STUB_V28)
 uint32_t turbine_abi_minor(void) { return 8u; }
 #elif defined(TURBINE_STUB_V27)

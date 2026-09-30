@@ -41,6 +41,8 @@ const KV_HEADS: usize = 8;
 const HEAD_DIM: usize = 128;
 const VOCAB: usize = 128256;
 const ROPE_THETA: f64 = 500_000.0;
+/// YaRN's attention factor of the factor-16 Llama override (`0.1 · ln 16 + 1`, ABI v2.10).
+const YARN16_ATTN_FACTOR: f32 = 1.277_258_9;
 
 // OLMoE-1B-7B shapes.
 const MOE_HIDDEN: usize = 2048;
@@ -412,8 +414,9 @@ fn norm_case(p: &Pair, rng: &mut Rng, t: usize) {
     assert_close(&what, &impl_name, &read(&o_hip), &read(&o_cpu), DType::BF16);
 }
 
-/// RoPE over `t` tokens at the Llama head shapes.
-fn rope_case(p: &Pair, rng: &mut Rng, t: usize) {
+/// RoPE over `t` tokens at the Llama head shapes, cos and sin scaled by `attn_factor` (YaRN's
+/// attention factor, kernel ABI v2.10; 1.0 = none).
+fn rope_case(p: &Pair, rng: &mut Rng, t: usize, attn_factor: f32) {
     // RoPE (in place on q and k), Llama-3 theta, positions spread over [0, 4096).
     let cfg = RopeConfig {
         num_q_heads: Q_HEADS as u32,
@@ -463,12 +466,13 @@ fn rope_case(p: &Pair, rng: &mut Rng, t: usize) {
             k: k.view(),
             positions: pos.view(),
             inv_freq: f.view(),
+            attn_factor,
         };
         kernel.execute(&mut ctx).expect("rope");
     }
-    let what = format!("rope q tokens={t} {cfg}");
+    let what = format!("rope q tokens={t} attn_factor={attn_factor} {cfg}");
     assert_close(&what, &impl_name, &read(&q_hip), &read(&q_cpu), DType::BF16);
-    let what = format!("rope k tokens={t} {cfg}");
+    let what = format!("rope k tokens={t} attn_factor={attn_factor} {cfg}");
     assert_close(&what, &impl_name, &read(&k_hip), &read(&k_cpu), DType::BF16);
 }
 
@@ -590,7 +594,8 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     let mut rng = Rng(3);
     let t = 17usize;
     norm_case(&p, &mut rng, t);
-    rope_case(&p, &mut rng, t);
+    rope_case(&p, &mut rng, t, 1.0);
+    rope_case(&p, &mut rng, t, YARN16_ATTN_FACTOR);
     silu_mul_case(&p, &mut rng, t);
     embedding_case(&p, &mut rng, t);
     add_case(&p, &mut rng, t);
@@ -3105,6 +3110,7 @@ fn decode_op_timings() {
                     k: k.view().rows(0, m),
                     positions: pos.view(),
                     inv_freq: freq.view(),
+                    attn_factor: 1.0,
                 })
                 .expect("rope");
             });
@@ -3701,6 +3707,7 @@ fn decode_forward_timing() {
                             k: heads(&k, m, model.kv_heads),
                             positions: rows(&positions, m),
                             inv_freq: inv_freq.view(),
+                            attn_factor: 1.0,
                         })
                         .expect("rope")
                     });
@@ -4289,6 +4296,7 @@ fn fused_projection_timings() {
                 k,
                 positions: pos.view(),
                 inv_freq: freq.view(),
+                attn_factor: 1.0,
             })
             .expect("rope");
         };
@@ -4534,17 +4542,31 @@ fn prefill_shapes_match_cpu() {
     let p = setup();
     let mut rng = Rng(17);
 
-    // RoPE: (q heads, kv heads, theta, tokens, first position).
+    // RoPE: (q heads, kv heads, theta, tokens, first position, attention factor); the YaRN
+    // factor (ABI v2.10) on both kernels (below and from 128 tokens), past 8192 positions.
     let rope_cases = [
-        (Q_HEADS, KV_HEADS, ROPE_THETA, 127, 0),
-        (Q_HEADS, KV_HEADS, ROPE_THETA, 128, 0),
-        (Q_HEADS, KV_HEADS, ROPE_THETA, 300, 5000),
-        (Q_HEADS, KV_HEADS, ROPE_THETA, 2048, 0),
-        (16, 16, 10_000.0, 680, 2048),
+        (Q_HEADS, KV_HEADS, ROPE_THETA, 127, 0, 1.0),
+        (Q_HEADS, KV_HEADS, ROPE_THETA, 128, 0, 1.0),
+        (Q_HEADS, KV_HEADS, ROPE_THETA, 300, 5000, 1.0),
+        (Q_HEADS, KV_HEADS, ROPE_THETA, 2048, 0, 1.0),
+        (16, 16, 10_000.0, 680, 2048, 1.0),
+        (Q_HEADS, KV_HEADS, ROPE_THETA, 17, 9000, YARN16_ATTN_FACTOR),
+        (
+            Q_HEADS,
+            KV_HEADS,
+            ROPE_THETA,
+            300,
+            11_900,
+            YARN16_ATTN_FACTOR,
+        ),
     ];
     let hip = p.hip.rope().expect("hip rope");
+    assert!(
+        hip.attn_factor_supported(),
+        "the HIP library reads attn_factor (v2.10)"
+    );
     let half = HEAD_DIM / 2;
-    for (qh, kh, theta, t, first) in rope_cases {
+    for (qh, kh, theta, t, first, attn_factor) in rope_cases {
         let cfg = RopeConfig {
             num_q_heads: qh as u32,
             num_kv_heads: kh as u32,
@@ -4574,10 +4596,13 @@ fn prefill_shapes_match_cpu() {
                 k: column_block(x, q_rows, width, t, &[kh, HEAD_DIM]),
                 positions: pos.view(),
                 inv_freq: f.view(),
+                attn_factor,
             };
             kernel.execute(&mut ctx).expect("rope");
         }
-        let what = format!("rope fused qkv tokens={t} first_position={first} {cfg}");
+        let what = format!(
+            "rope fused qkv tokens={t} first_position={first} attn_factor={attn_factor} {cfg}"
+        );
         assert_close(&what, &impl_name, &read(&x_hip), &read(&x_cpu), DType::BF16);
     }
 
@@ -4745,6 +4770,7 @@ fn prefill_op_timings() {
                     k: column_block(&qkv, q_rows, qkv_w, m, &[kh, HEAD_DIM]),
                     positions: pos.view(),
                     inv_freq: freq.view(),
+                    attn_factor: 1.0,
                 })
                 .expect("rope");
             });
@@ -5267,7 +5293,7 @@ fn every_implementation_matches_cpu() {
                 rotary_dim: HEAD_DIM as u32,
                 dtype: bf16,
             }),
-            Box::new(|p, rng| rope_case(p, rng, 17)),
+            Box::new(|p, rng| rope_case(p, rng, 17, 1.0)),
         ),
         case(
             OpConfig::SiluMul(ActivationConfig {

@@ -20,8 +20,10 @@
 //! `server.shutdown_grace` has passed; then `EngineCommand::Shutdown` cancels the rest with
 //! reason `shutdown` (their streams end with `shutting_down`), the engine delivers what it holds
 //! and stops, the listener closes, open connections finish (bounded by [`CLOSE_LIMIT`]), the
-//! engine threads are joined once they have released their device resources (bounded by
-//! [`ENGINE_STOP_LIMIT`]) and the process exits 0.
+//! engine threads are joined once they have released their device resources, then the local
+//! tensor-parallel worker-rank threads (`replica.worker`), both bounded by [`ENGINE_STOP_LIMIT`]
+//! in total (`join_engines_and_workers`; a worker still running past it is named in one WARN,
+//! `event="tp_worker_join_timeout"`), and the process exits 0.
 //!
 //! A load or warm-up failure after binding keeps `/ready` at 503 `model_load_failed` for
 //! [`FAILURE_GRACE`] and exits 1. A fatal circuit (P3 S-12: a sticky device error, a pressure
@@ -77,7 +79,9 @@ const CLOSE_LIMIT: Duration = Duration::from_millis(500);
 /// the executor, the KV tiers, the telemetry sampler and the kernel provider before the process
 /// exits regardless (`engine_stop_timeout`). Returning from `main` runs the device runtime's
 /// static destructors; an engine thread still freeing device memory then crashed the W4A4 8B
-/// server with SIGSEGV after `shutdown complete` (2026-09-29).
+/// server with SIGSEGV after `shutdown complete` (2026-09-29). Shared with the local
+/// tensor-parallel worker-rank threads (`join_rank_workers`): whatever this budget has left once
+/// the engine threads joined bounds their join too, so the two together never exceed it.
 const ENGINE_STOP_LIMIT: Duration = Duration::from_secs(10);
 /// Test-only, not a configuration key: a positive byte count caps every accepted connection's
 /// kernel send buffer (`SO_SNDBUF`; Linux doubles it and turns its autotuning off). The request
@@ -489,8 +493,9 @@ pub fn run(cli: Cli) -> ExitCode {
         replicas,
         support.view(),
     ));
-    // The engine threads were joined on a clean exit (`join_engines`); never wait for other
-    // in-flight blocking work on the way out.
+    // The engine threads and the local tensor-parallel worker-rank threads were joined on a
+    // clean exit (`join_engines_and_workers`); never wait for other in-flight blocking work on
+    // the way out.
     runtime.shutdown_background();
     code
 }
@@ -660,6 +665,9 @@ async fn serve(
 
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut engines = Vec::new();
+    // Local tensor-parallel worker-rank threads (`replica.worker`, module doc): not engine
+    // threads, but joined the same way at clean exit (`join_rank_workers`).
+    let mut rank_workers: Vec<(u32, std::thread::JoinHandle<()>)> = Vec::new();
     let queue_capacity = config.scheduler.max_queued_requests as usize;
     let reliability_metrics = ReliabilityMetrics::register(&state.metrics);
     let telemetry_metrics = TelemetryMetrics::register(&state.metrics);
@@ -689,6 +697,7 @@ async fn serve(
         };
         if let Some(worker) = replica.worker {
             // P5 S-5: a static worker rank runs its shard, not an engine.
+            let worker_rank = worker.rank();
             let (backend, fatal, reliability) = (
                 Arc::clone(&backend),
                 fatal_tx.clone(),
@@ -708,10 +717,13 @@ async fn serve(
                     );
                     let _ = fatal.send(Fatal::RankStopped(result.err()));
                 });
-            if let Err(e) = spawned {
-                let _ = fatal_tx.send(Fatal::LoadFailed(format!(
-                    "cannot start the worker rank thread: {e}"
-                )));
+            match spawned {
+                Ok(handle) => rank_workers.push((worker_rank, handle)),
+                Err(e) => {
+                    let _ = fatal_tx.send(Fatal::LoadFailed(format!(
+                        "cannot start the worker rank thread: {e}"
+                    )));
+                }
             }
             continue;
         }
@@ -760,7 +772,7 @@ async fn serve(
             Ok(()) => {
                 // Every connection has closed; the engine cancels anything left and stops.
                 backend.stop_engine();
-                join_engines(engines).await;
+                join_engines_and_workers(engines, rank_workers).await;
                 tracing::info!("shutdown complete");
                 ExitCode::Clean
             }
@@ -773,7 +785,7 @@ async fn serve(
         () = connections_closed => {
             tracing::warn!(event = "shutdown_connections_open", "connections still open after shutdown; exiting");
             backend.stop_engine();
-            join_engines(engines).await;
+            join_engines_and_workers(engines, rank_workers).await;
             ExitCode::Clean
         }
         Some(fatal) = fatal_rx.recv() => {
@@ -861,6 +873,58 @@ async fn join_engines(engines: Vec<std::thread::JoinHandle<()>>) {
     }
 }
 
+/// Waits up to `limit` for the local tensor-parallel worker-rank threads (`replica.worker`,
+/// module doc) to end, polling [`std::thread::JoinHandle::is_finished`] (never blocks on a
+/// stuck one). A finished thread is joined right away (a cheap, non-blocking join, to reap it);
+/// any left running once `limit` is up are named in one WARN
+/// (`event="tp_worker_join_timeout"`) and left to finish on their own — the process exits
+/// regardless.
+async fn join_rank_workers(workers: Vec<(u32, std::thread::JoinHandle<()>)>, limit: Duration) {
+    if workers.is_empty() {
+        return;
+    }
+    let started = tokio::time::Instant::now();
+    let mut remaining = workers;
+    loop {
+        remaining = remaining
+            .into_iter()
+            .filter_map(|(rank, h)| {
+                if h.is_finished() {
+                    let _ = h.join();
+                    None
+                } else {
+                    Some((rank, h))
+                }
+            })
+            .collect();
+        if remaining.is_empty() || started.elapsed() >= limit {
+            break;
+        }
+        tokio::time::sleep(SHUTDOWN_POLL).await;
+    }
+    if !remaining.is_empty() {
+        let ranks: Vec<u32> = remaining.iter().map(|(rank, _)| *rank).collect();
+        tracing::warn!(
+            event = "tp_worker_join_timeout",
+            ?ranks,
+            limit_seconds = limit.as_secs_f64(),
+            "tensor-parallel worker rank threads did not stop in time; exiting while they still run"
+        );
+    }
+}
+
+/// [`join_engines`], then [`join_rank_workers`] with whatever [`ENGINE_STOP_LIMIT`] has left:
+/// the two joins together never exceed that one budget.
+async fn join_engines_and_workers(
+    engines: Vec<std::thread::JoinHandle<()>>,
+    workers: Vec<(u32, std::thread::JoinHandle<()>)>,
+) {
+    let started = tokio::time::Instant::now();
+    join_engines(engines).await;
+    let remaining = ENGINE_STOP_LIMIT.saturating_sub(started.elapsed());
+    join_rank_workers(workers, remaining).await;
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -899,5 +963,97 @@ mod tests {
             let err = send_buffer_cap(Some(bad)).unwrap_err();
             assert!(err.contains(SEND_BUFFER_ENV), "{bad:?}: {err}");
         }
+    }
+
+    /// Captures the `tracing` output of `f`, so a test can assert on what was logged (the
+    /// pattern of `turbine_kv::test_log::capture` and `turbine_reliability::state::tests`,
+    /// inlined here since this is the only test in this crate that needs it).
+    fn capture_tracing<R>(f: impl FnOnce() -> R) -> (R, String) {
+        use std::io::Write;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let r = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+        (r, text)
+    }
+
+    /// Item 1 (cpu backend, no GPU: plain `std::thread`s stand in for the local tensor-parallel
+    /// worker-rank threads `startup::serve` spawns for `replica.worker`):
+    /// (a) a clean shutdown's `join_rank_workers` does not return before every worker rank
+    /// thread has run to completion — racy otherwise, since the threads finish on their own
+    /// regardless of whether they are joined; the 30 ms sleep before each sets its flag makes a
+    /// removed join fail this deterministically, not just occasionally; and
+    /// (b) a worker rank that outlives the bound is named in one WARN
+    /// `event="tp_worker_join_timeout"`, and the call still returns well within the bound
+    /// (the shutdown path never hangs on a stuck rank).
+    #[test]
+    fn join_rank_workers_bounded() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread runtime");
+
+        // (a)
+        let ran: Vec<Arc<AtomicBool>> = (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let workers: Vec<(u32, std::thread::JoinHandle<()>)> = ran
+            .iter()
+            .enumerate()
+            .map(|(i, flag)| {
+                let flag = Arc::clone(flag);
+                let handle = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(30));
+                    flag.store(true, Ordering::SeqCst);
+                });
+                (i as u32 + 1, handle)
+            })
+            .collect();
+        rt.block_on(join_rank_workers(workers, Duration::from_millis(1000)));
+        for (i, flag) in ran.iter().enumerate() {
+            assert!(
+                flag.load(Ordering::SeqCst),
+                "worker rank {} was not joined before join_rank_workers returned",
+                i + 1
+            );
+        }
+
+        // (b)
+        let stuck = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(5)));
+        let started = std::time::Instant::now();
+        let (_, log) = capture_tracing(|| {
+            rt.block_on(join_rank_workers(
+                vec![(7, stuck)],
+                Duration::from_millis(80),
+            ));
+        });
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "join_rank_workers blocked past its bound: {elapsed:?}"
+        );
+        assert!(
+            log.contains("tp_worker_join_timeout"),
+            "expected the timeout event in the log: {log}"
+        );
+        assert!(log.contains('7'), "expected rank 7 named in the log: {log}");
     }
 }

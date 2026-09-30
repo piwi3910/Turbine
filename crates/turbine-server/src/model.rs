@@ -151,6 +151,64 @@ fn check_fp8_attention(
     Ok(())
 }
 
+/// A YaRN model whose attention factor is not 1 needs a rope kernel that multiplies cos and sin
+/// Logs the resolved RoPE configuration at model load (P6a followups), once `config.json` and
+/// any `model.rope_scaling` override are resolved: `rope_theta`, the scaling's name (`default`,
+/// `llama3`, `yarn`), its `factor` when scaled, and YaRN's attention factor when present. The
+/// same values go into `/turbine/v1/status`'s `model.rope` (`ModelBackend::new`, `Diagnostics::status`).
+fn log_rope_config(arch: &ModelArchConfig) {
+    let rope = arch.rope_summary();
+    tracing::info!(
+        event = "rope_config",
+        rope_theta = rope.theta,
+        rope_type = rope.rope_type,
+        factor = rope.factor,
+        attention_factor = rope.attention_factor,
+        "resolved RoPE configuration"
+    );
+}
+
+/// by it (kernel ABI v2.10, P6a S-15): exit 1 `rope_attn_factor_unavailable`, logged as
+/// `event="kernel_capability"`, before any weight is read when the rope kernel the selection
+/// order picks (the first provider that supports the rope requirement) does not apply the factor
+/// — a kernel library below minor 10 would silently rotate without it.
+fn check_rope_attn_factor(
+    attn_factor: f32,
+    requirements: &[OpRequirement],
+    ordered: &[Arc<dyn KernelProvider>],
+) -> Result<(), StartupError> {
+    if attn_factor == 1.0 {
+        return Ok(());
+    }
+    for r in requirements {
+        let OpConfig::Rope(cfg) = &r.spec else {
+            continue;
+        };
+        let chosen = ordered
+            .iter()
+            .filter_map(|p| p.rope().map(|k| (p.id(), k)))
+            .find(|(_, k)| k.supports(cfg));
+        if let Some((id, kernel)) = chosen
+            && !kernel.attn_factor_supported()
+        {
+            tracing::error!(
+                event = "kernel_capability",
+                reason = "rope_attn_factor_unavailable",
+                provider = %id,
+                attn_factor,
+                "the rope kernel does not apply the YaRN attention factor (kernel ABI v2.10)"
+            );
+            return Err(StartupError::new(format!(
+                "rope_attn_factor_unavailable: the YaRN attention factor {attn_factor} needs a \
+                 rope kernel that scales cos and sin (kernel ABI minor 10); the selected \
+                 provider {id} ({} {}) does not",
+                r.op, r.config
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `model.served_name` default: `<org>/<name>` for a Hugging Face cache snapshot
 /// (`…/models--<org>--<name>/snapshots/<rev>`), else the last path component.
 pub fn default_served_name(path: &Path) -> String {
@@ -503,6 +561,7 @@ fn prepare_with(
     }
     let mut arch = load_model_config_with(dir, config.model.rope_scaling.as_ref())
         .map_err(|e| model_error("model config", e))?;
+    log_rope_config(&arch);
     let generation = if dir.join("generation_config.json").is_file() {
         load_generation_config(dir).map_err(|e| model_error("generation config", e))?
     } else {
@@ -631,6 +690,7 @@ fn prepare_with(
         requirements.push(reduce);
     }
     check_fp8_attention(&requirements, &ordered)?;
+    check_rope_attn_factor(arch.rope_attention_factor(), &requirements, &ordered)?;
     let registry = KernelRegistry::build(
         opened.providers.clone(),
         &opened.order,
@@ -1318,6 +1378,85 @@ mod tests {
     use super::*;
     use turbine_model::families::{Llama, Mistral, Mixtral, Olmoe, Qwen3, Qwen3Moe};
     use turbine_model::formats::llama3_json::LLAMA3_JSON;
+
+    /// A provider whose rope runs every shape but ignores the attention factor, like a kernel
+    /// library below ABI minor 10.
+    struct OldRope;
+
+    impl turbine_kernels::RopeKernel for OldRope {
+        fn supports(&self, _cfg: &turbine_kernels::RopeConfig) -> bool {
+            true
+        }
+        fn implementation(&self, _cfg: &turbine_kernels::RopeConfig) -> String {
+            "old_rope".into()
+        }
+        fn execute(&self, _ctx: &mut turbine_kernels::RopeContext<'_>) -> Result<(), KernelError> {
+            Ok(())
+        }
+    }
+
+    impl KernelProvider for OldRope {
+        fn id(&self) -> turbine_kernels::ProviderId {
+            turbine_kernels::ProviderId("old-rope")
+        }
+        fn gemm(&self) -> Option<&dyn turbine_kernels::GemmKernel> {
+            None
+        }
+        fn attention(&self) -> Option<&dyn turbine_kernels::AttentionKernel> {
+            None
+        }
+        fn norm(&self) -> Option<&dyn turbine_kernels::NormKernel> {
+            None
+        }
+        fn rope(&self) -> Option<&dyn turbine_kernels::RopeKernel> {
+            Some(self)
+        }
+        fn activation(&self) -> Option<&dyn turbine_kernels::ActivationKernel> {
+            None
+        }
+        fn embedding(&self) -> Option<&dyn turbine_kernels::EmbeddingKernel> {
+            None
+        }
+        fn elementwise(&self) -> Option<&dyn turbine_kernels::ElementwiseKernel> {
+            None
+        }
+        fn kv_copy(&self) -> Option<&dyn turbine_kernels::KvCopyKernel> {
+            None
+        }
+        fn moe(&self) -> Option<&dyn turbine_kernels::MoeKernel> {
+            None
+        }
+    }
+
+    /// Phase 6a Task 28a: a YaRN factor ≠ 1 is refused with `rope_attn_factor_unavailable`
+    /// when the selected rope kernel does not apply it (a library below ABI minor 10), and
+    /// accepted when it does (the cpu-reference provider) or when the factor is 1. Breaks if a
+    /// YaRN model would start on a rope that silently drops the factor.
+    #[test]
+    fn rope_attn_factor_unavailable_refuses_old_rope() {
+        let rope = OpRequirement::from(OpConfig::Rope(turbine_kernels::RopeConfig {
+            num_q_heads: 24,
+            num_kv_heads: 8,
+            head_dim: 128,
+            rotary_dim: 128,
+            dtype: DType::BF16,
+        }));
+        let requirements = [rope];
+        let old: Vec<Arc<dyn KernelProvider>> = vec![Arc::new(OldRope)];
+        let m = 1.277_258_9;
+        let err = check_rope_attn_factor(m, &requirements, &old).expect_err("refused");
+        assert!(
+            err.to_string().starts_with("rope_attn_factor_unavailable"),
+            "{err}"
+        );
+        check_rope_attn_factor(1.0, &requirements, &old).expect("factor 1 needs nothing");
+        let cpu = vec![turbine_kernels::cpu_reference_provider()];
+        check_rope_attn_factor(m, &requirements, &cpu).expect("the cpu rope applies it");
+        // The first provider in the selection order that runs the shape is the one that counts.
+        let mut both = old.clone();
+        both.extend(cpu);
+        assert!(check_rope_attn_factor(m, &requirements, &both).is_err());
+    }
 
     #[test]
     fn served_name_from_hf_snapshot_or_last_component() {

@@ -33,21 +33,37 @@ and is compared with transformers' native YaRN on the same weights carrying that
 
   `--config-override` replaces `config.json`'s `rope_scaling` before the model loads (the same
   as a copy of the checkpoint carrying that `config.json`, without copying the weights); the
-  script logged `rotary yarn, attention scaling 1.2772588722239782`, the attention factor Turbine
-  folds into the softmax scale (`scale × factor²`).
-- `tolerance.json`: the BF16 Llama bounds unchanged (|Δ logprob| ≤ 0.15 likely, ≤ 0.55 tail;
-  batched 0.25 / 0.75; `min_identical_prefix` 32, `top_k` 5, `margin_nats` 0.5), with
-  `min_prompts_passing` 15 of the 17 prompts (Llama's 14 of 16 plus the long prompt).
-  **Provisional** — not calibrated for YaRN, and not yet known to hold. The Llama bounds were
-  assumed to carry over on the grounds that YaRN changes no kernel or precision; the evidence
-  contradicts that: transformers' own spread on this fixture
-  (`uv run scripts/golden/yarn_self_spread.py`, variant `bf16-sdpa-full`) puts p16's tail at
-  0.43, while Turbine measures 1.38 (HIP) and 1.49 (cpu-reference provider) on p16 and 1.42 on
-  p17-long at a greedy-identical token stream. Whether the gap comes from where the YaRN
-  attention factor is applied (Turbine folds `factor²` into the softmax scale, transformers
-  scales cos/sin; `yarn_self_spread.py --fold` and the lab diagnostic
-  `turbine-model --test golden yarn_teacher_forced_vs_reference`, column `unf`, measure it) is
-  open; the bounds change only with that spread evidence and a recorded decision.
+  script logged `rotary yarn, attention scaling 1.2772588722239782`, the attention factor that
+  multiplies cos and sin (transformers and, from plan Task 28a, Turbine's rope op: kernel ABI
+  v2.10 `turbine_rope_desc.attn_factor`).
+- `tolerance.json`: max(transformers' own spread on this fixture with the factor on cos/sin,
+  `uv run scripts/golden/yarn_self_spread.py` without `--fold`, the Llama BF16 bounds) — user
+  decision 2026-09-29, "YaRN attention factor: on cos/sin". The spread run (Task 28a,
+  `bf16-sdpa-incremental` / `bf16-sdpa-full` / `bf16-eager-incremental` / `fp32-sdpa-incremental`
+  on p01–p16, `bf16-sdpa-incremental` alone on p17-long: it is the only variant that finishes
+  12,030 tokens in reasonable CPU time) landed at max |Δ| likely 0.1864, tail 0.8378 across every
+  prompt and variant — above the Llama BF16 floor (0.15 / 0.55) on both tiers, and above the
+  batched floor (0.25 / 0.75) on tail but not on likely. `tolerance.json` (values rounded up from
+  the spread) is therefore strict likely 0.187 (max(0.1864, 0.15)), strict tail 0.838
+  (max(0.8378, 0.55)), batched likely 0.25 (max(0.1864, 0.25), the batched floor wins) and batched
+  tail 0.838 (max(0.8378, 0.75), the spread wins again). `min_identical_prefix` 32, `top_k` 5,
+  `margin_nats` 0.5, `min_prompts_passing` 15 of the 17 prompts (Llama's 14 of 16 plus the long
+  prompt) are unchanged.
+
+  A/B that decided the placement (Task 28, teacher-forced p16 against this reference, lab test
+  `turbine-model --test golden yarn_teacher_forced_vs_reference`, max |Δ| likely / tail):
+  cpu-reference with the factor folded into the softmax scale (`scale × factor²`, Q19) 0.190 /
+  1.488; cpu-reference with the factor on cos/sin before BF16 rounding (transformers' placement)
+  0.067 / 0.395; HIP with the fold 0.099 / 1.382; transformers' own spread (`bf16-sdpa-full`)
+  0.43 tail. The fold rounded q·k before the factor; Task 28a moved the factor onto cos/sin
+  (kernel ABI v2.10) and the softmax scale back to `head_dim^-0.5`.
+
+  GPU proof (Task 28a lab run, kernel ABI v2.10, `attn_factor` on cos/sin): teacher-forced p16 max
+  |Δ| likely/tail cpu (0.0667, 0.3945) hip (0.0968, 0.2922), p17-long hip (0.0229, 0.4038) — all
+  under the new tolerance. Served `llama-yarn16` golden concurrency 1 and 16: 17/17 prompts
+  passing (need 15) on both, tok/s 854.7 (64-request bench). Served `llama` (BF16, unchanged)
+  golden concurrency 1 and 16: 16/16 passing (need 14) on both, tok/s 871.9 — the plain-Llama gate
+  is unaffected by the change.
 
 Gate: `LABBOOK_SET=phase-6a-quantization scripts/lab-bench.sh --model llama-yarn16 --golden16`
 (GPU 0), golden at concurrency 1 and 16.
