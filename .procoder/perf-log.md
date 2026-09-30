@@ -182,3 +182,28 @@ Workload unchanged (`scripts/lab-bench.sh`, novanas GPU 0, 16 concurrent, 512-wo
 | 2026-09-30 | 7ad4b03 | Task 29 exit: FP8 KV against the new emulated-KV fixtures (tolerance 1.10 / 2.01) — 13/16 (need 14); row demoted to `experimental` (user decision 2026-09-30 B)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | OLMoE FP8 KV             | 631.1  | 23.5         | 127           | FAIL / FAIL                        |
 
 6a summary (2026-09-30, Task 29): every `supported` quantized row beats the BF16 Llama baseline at c16 — FP8-dynamic 1.12×, FP8 per-tensor 1.12×, FP8-block 1.23×, AWQ 1.48×, GPTQ (AutoRound) 1.49×; Llama FP8 KV 0.97× (the KV format saves memory, not time); BF16 Llama 0.999× and OLMoE 0.982× the phase start. Open perf items: FP8 c1 ITL (Task 14b), an MXFP4 prefill kernel at hipBLASLt speed, OLMoE BF16 at the edge of the 0.98× bound.
+
+## Phase 6b: KV compression (branch `p6b-stack`, labbook set `phase-6b-kv-compression`)
+
+Task 6, per-tier FP8 (`kv.cpu.format=fp8_e4m3`, `kv.cpu.max_bytes=4GiB`), Llama-3.2-3B BF16 weights and BF16 KV pages, novanas GPU 0, phase2c config. Phase-6a exit baseline for the BF16 path: 854.2 tok/s, ITL p50 15.4 ms, TTFT p50 207 ms.
+
+| Date       | Commit  | Change                                                                                                                                              | tok/s | ITL p50 (ms) | TTFT p50 (ms) | golden c1 / c16 |
+| ---------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ----- | ------------ | ------------- | --------------- |
+| 2026-10-01 | d6e564e | Task 6: `scripts/lab-bench.sh --model llama --golden16 -- --set kv.cpu.format=fp8_e4m3 --set kv.cpu.max_bytes=4GiB` (0.995x of the 6a baseline; labbook run 7683e112) | 849.6 | 15.4         | 208           | PASS / PASS     |
+
+Multi-turn (`turbine-bench --profile multi-turn --turns 8 --shared-prefix-words 2000 --session-hints`, client on novanas, `lab-serve.sh` with `phase2c-novanas-llama.yaml --set kv.cpu.format=<f> --set kv.cpu.max_bytes=4GiB`, one run per cell):
+
+| Workload                                           | L1 format  | Requests ok | cached_tokens_ratio | later-turn TTFT p50 / p99 (ms) | L1 lookups | lossy_cached_tokens |
+| -------------------------------------------------- | ---------- | ----------- | ------------------- | ------------------------------ | ---------- | ------------------- |
+| spec command: 16 sessions, c8                      | `l0`       | 128/128     | 0.9064              | 75.7 / 109                     | 0          | 0                   |
+| spec command: 16 sessions, c8                      | `fp8_e4m3` | 128/128     | 0.9056              | 76.4 / 137                     | 0          | 0                   |
+| stressed: 32 sessions, c32, `--think-time 1..4`    | `l0`       | 256/256     | 0.6180              | 2102 / 23370                   | 2062       | 0                   |
+| stressed: 32 sessions, c32, `--think-time 1..4`    | `fp8_e4m3` | 256/256     | 0.6324              | 522 / 8502                     | 2016       | 384                 |
+
+The spec command never reaches L1 for reuse (L0 holds the 16 sessions), so both ratios equal; the stressed run (L0 of 585 blocks is smaller than the live histories) is the discriminating one. 64 sessions at c64 overloaded the server (SURVIVAL, 503 `overloaded`, 350 of 512 requests failed in both arms) and is not used. An earlier fp8 run of the stressed workload lost 65 of 256 requests to 503 `overloaded` (ratio 0.735, not comparable); the recorded cell is its rerun.
+
+L1 capacity in the same 4 GiB (`/turbine/v1/kv` `formats`, added in this task): `l0` 292 blocks; `fp8_e4m3` 438 fp8 blocks (7.34 MB each) plus 60 blocks at the lossless-tail `l0` format = 498 blocks in 4.10 GB of 4.29 GB, i.e. 1.71x at 95.5 % fill, about 1.78x when full with the observed 12 % tail share, 2.0x for pure fp8 (584). The kv_sim AC (>= 1.9x) assumes no tail blocks.
+
+The planner chose `recompute_cheaper` for 155 of the stressed fp8 run's requests even with L1 lookups at 2016 (lossy penalty 0.1 on the fp8 copies plus the measured L1 to L0 rate), so few lossy blocks were reused (384 tokens = 3 blocks) and the ratio gain is 0.014.
+
+GSM8K-200 at concurrency 16 with `kv.cpu.format=fp8_e4m3` (server after the stressed run): 162/200 = 0.810 (`tests/eval/llama-3.2-3b-instruct/turbine-l1-fp8.json`) against `turbine-bf16-c16.json` 0.795: `eval-compare --max-drop 0.01` PASS. The eval's prompts share no full block, so no lossy block was reused during it (`lossy_cached_tokens` unchanged across the eval); it shows the tier configuration does not disturb serving, not the quality of lossy reuse. That is `kv_gpu::lossy_tier_reuse` (worst first-8 |delta logprob| 0.067, `x-turbine-kv-lossy: deny` bit-equal to cold).
