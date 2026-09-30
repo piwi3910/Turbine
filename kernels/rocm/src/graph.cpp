@@ -9,10 +9,21 @@
 // capture (an op error, or a runtime call the capture rejected) leaves the
 // context usable: the caller runs the work eagerly instead.
 //
+// Every capture holds an entry in the process-wide capture gate from
+// turbine_graph_begin until the capture ends (turbine_graph_end or
+// abandon_capture); turbine_ctx_create waits until the gate is empty and keeps
+// new captures from beginning meanwhile (turbine_hip.hpp, CreationGuard): HIP
+// breaks every capture of the process on the synchronous hipMemset inside
+// hipblasLtCreate.
+//
 // Ownership: a turbine_graph owns its instantiated hipGraphExec_t and remembers
 // the context it was captured on; it records the device pointers of the
 // captured ops, which the caller keeps alive until turbine_graph_destroy.
+#include <algorithm>
+#include <condition_variable>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "turbine_hip.hpp"
 
@@ -25,7 +36,78 @@ struct turbine_graph {
   hipGraphExec_t exec = nullptr;
 };
 
+namespace {
+
+// The capture gate: one entry (the beginning thread) per open capture, and the
+// number of context creations in progress. Allocated once and never freed, so
+// a thread still ending a capture while the process exits never touches a
+// destroyed mutex.
+struct CaptureGate {
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::vector<std::thread::id> capture_threads;
+  int creating = 0;
+};
+
+CaptureGate &gate() {
+  static CaptureGate *g = new CaptureGate();
+  return *g;
+}
+
+// Registers a capture about to begin on the calling thread; waits while a
+// context is being created.
+void gate_enter_capture() {
+  CaptureGate &g = gate();
+  std::unique_lock<std::mutex> lock(g.mutex);
+  g.changed.wait(lock, [&g] { return g.creating == 0; });
+  g.capture_threads.push_back(std::this_thread::get_id());
+}
+
+// Removes the entry of a capture begun on thread `id` (it ended, or failed to
+// begin).
+void gate_leave_capture(std::thread::id id) {
+  CaptureGate &g = gate();
+  {
+    std::lock_guard<std::mutex> lock(g.mutex);
+    auto it = std::find(g.capture_threads.begin(), g.capture_threads.end(), id);
+    if (it != g.capture_threads.end())
+      g.capture_threads.erase(it);
+  }
+  g.changed.notify_all();
+}
+
+// Marks ctx's capture ended (whatever became of it) and leaves the gate.
+void capture_ended(turbine_ctx *ctx) {
+  ctx->capturing = false;
+  gate_leave_capture(ctx->capture_thread);
+}
+
+} // namespace
+
 namespace turbine_hip {
+
+CreationGuard::CreationGuard() {
+  CaptureGate &g = gate();
+  std::unique_lock<std::mutex> lock(g.mutex);
+  if (std::find(g.capture_threads.begin(), g.capture_threads.end(),
+                std::this_thread::get_id()) != g.capture_threads.end()) {
+    return;
+  }
+  ++g.creating;
+  g.changed.wait(lock, [&g] { return g.capture_threads.empty(); });
+  ok_ = true;
+}
+
+CreationGuard::~CreationGuard() {
+  if (!ok_)
+    return;
+  CaptureGate &g = gate();
+  {
+    std::lock_guard<std::mutex> lock(g.mutex);
+    --g.creating;
+  }
+  g.changed.notify_all();
+}
 
 int32_t refuse_while_capturing(turbine_ctx *ctx, const char *what) {
   return fail(ctx, TURBINE_E_ARGUMENT,
@@ -37,10 +119,11 @@ int32_t refuse_while_capturing(turbine_ctx *ctx, const char *what) {
 void abandon_capture(turbine_ctx *ctx) {
   if (!ctx->capturing)
     return;
-  ctx->capturing = false;
   hipGraph_t graph = nullptr;
-  if (hipStreamEndCapture(ctx->stream, &graph) == hipSuccess &&
-      graph != nullptr) {
+  const hipError_t ended = hipStreamEndCapture(ctx->stream, &graph);
+  // Leave the gate only once the stream no longer captures.
+  capture_ended(ctx);
+  if (ended == hipSuccess && graph != nullptr) {
     (void)hipGraphDestroy(graph);
   }
   (void)hipGetLastError();
@@ -59,13 +142,16 @@ int32_t turbine_graph_begin(turbine_ctx *ctx) {
   }
   if (int32_t rc = enter(ctx); rc != TURBINE_OK)
     return rc;
+  gate_enter_capture();
   if (int32_t rc = check_hip(
           ctx,
           hipStreamBeginCapture(ctx->stream, hipStreamCaptureModeThreadLocal),
           "hipStreamBeginCapture");
       rc != TURBINE_OK) {
+    gate_leave_capture(std::this_thread::get_id());
     return rc;
   }
+  ctx->capture_thread = std::this_thread::get_id();
   ctx->capturing = true;
   return TURBINE_OK;
 }
@@ -84,10 +170,10 @@ int32_t turbine_graph_end(turbine_ctx *ctx, turbine_graph **out) {
     return fail(ctx, TURBINE_E_ARGUMENT, "turbine_graph_end: out is NULL");
   }
   (void)hipSetDevice(ctx->device);
-  ctx->capturing = false;
   hipGraph_t graph = nullptr;
-  if (int32_t rc = check_hip(ctx, hipStreamEndCapture(ctx->stream, &graph),
-                             "hipStreamEndCapture");
+  const hipError_t ended = hipStreamEndCapture(ctx->stream, &graph);
+  capture_ended(ctx);
+  if (int32_t rc = check_hip(ctx, ended, "hipStreamEndCapture");
       rc != TURBINE_OK) {
     if (graph != nullptr)
       (void)hipGraphDestroy(graph);
