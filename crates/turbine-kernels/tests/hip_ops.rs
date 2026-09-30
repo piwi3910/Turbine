@@ -5198,8 +5198,23 @@ fn implementations_enumerated() {
         (OpKind::RowSumsq, one("turbine_hip", "turbine_hip")),
         (OpKind::RmsnormSharded, one("turbine_hip", "turbine_hip")),
         // ABI v2.9 (Phase 6a).
-        (OpKind::QGemm, one("hipblaslt_fp8", "hipblaslt")),
-        (OpKind::QuantizeAct, one("turbine_hip", "turbine_hip")),
+        (
+            OpKind::QGemm,
+            vec![
+                ("hipblaslt_fp8", "hipblaslt", false),
+                ("turbine_hip_int4_wmma", "turbine_hip", false),
+                ("turbine_hip_int4_dequant", "turbine_hip", false),
+                ("turbine_hip_mxfp4", "turbine_hip", false),
+                ("turbine_hip_fp8_block", "turbine_hip", false),
+            ],
+        ),
+        (
+            OpKind::QuantizeAct,
+            vec![
+                ("turbine_hip", "turbine_hip", false),
+                ("turbine_hip_mxfp4", "turbine_hip", false),
+            ],
+        ),
     ];
     assert_eq!(table.len(), OpKind::ALL.len());
     for (op, want) in &table {
