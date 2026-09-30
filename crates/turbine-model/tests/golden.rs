@@ -8,9 +8,11 @@
 //! - `olmoe_logits_match_reference` (lab only, likewise): OLMoE-1B-7B on the HIP provider against
 //!   `tests/golden/olmoe-1b-7b-0125-instruct/reference.jsonl` under its own calibrated
 //!   `tolerance.json` (see the README beside it).
-//! - `hip_trace_vs_cpu_3b` and `olmoe_teacher_forced_vs_reference` (lab diagnostics, no-ops
-//!   unless their environment variable names prompts): op-by-op HIP-vs-CPU traces of the 3B,
-//!   and teacher-forced OLMoE log-probabilities of both providers against its reference.
+//! - `hip_trace_vs_cpu_3b`, `olmoe_teacher_forced_vs_reference` and
+//!   `mxfp4_decode_vs_prefill_trace` (lab diagnostics, no-ops unless their environment variable
+//!   names prompts): op-by-op HIP-vs-CPU traces of the 3B, teacher-forced OLMoE
+//!   log-probabilities of both providers against its reference, and the MXFP4-A16 8B's decode
+//!   steps against one prefill of the same tokens, op by op.
 //!
 //! The first three judge with the committed `tolerance.json` and the same rule as `turbine-golden compare`,
 //! re-implemented in [`compare_prompt`] because this crate cannot depend on `turbine-bench`
@@ -1183,5 +1185,204 @@ fn yarn_teacher_forced_vs_reference() {
                 worst(&h)
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------- MXFP4 decode
+
+/// Lab diagnostic (the MXFP4-A16 8B p05 golden miss), a no-op unless `TURBINE_GOLDEN_MXFP4`
+/// names `<prompt id>:<position>` (e.g. `p05:5`); needs `TURBINE_TEST_MXFP4_MODEL_DIR` (the
+/// `llama-3.1-8b-instruct-mxfp4a16` checkpoint). On the HIP provider, the prompt and the
+/// reference's first `position` tokens run twice, traced, on one executor and two KV caches:
+/// (A) the prompt as one prefill, then one decode step per token, as the server generates;
+/// (B) everything as one prefill. Prints, for the row predicting `position`, each op's
+/// difference A − B per layer (the first layer that departs is where decode and prefill
+/// disagree), the same for the K/V rows the decode steps appended, and both logprob rows.
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY, TURBINE_TEST_MXFP4_MODEL_DIR and TURBINE_GOLDEN_MXFP4"]
+fn mxfp4_decode_vs_prefill_trace() {
+    use turbine_model::executor::TraceTensor;
+    use turbine_model::testing::trace::DiffStats;
+
+    let Some(spec) = std::env::var("TURBINE_GOLDEN_MXFP4")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        println!("TURBINE_GOLDEN_MXFP4 is not set: nothing traced");
+        return;
+    };
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let _gpu = gpu_model_lock();
+    let (id, pos) = spec
+        .split_once(':')
+        .expect("TURBINE_GOLDEN_MXFP4=<id>:<position>");
+    let pos: usize = pos.parse().expect("position");
+    let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MXFP4_MODEL_DIR");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+    let fixture = golden_dir().join("llama-3.1-8b-instruct-mxfp4a16");
+    let references: Vec<ReferenceRecord> = read_jsonl(&fixture.join("reference.jsonl"));
+    let r = references
+        .iter()
+        .find(|r| r.id == id)
+        .unwrap_or_else(|| panic!("no reference prompt {id}"));
+    let n_prompt = r.prompt_token_ids.len();
+    let max_seq_len = (n_prompt + pos + 1) as u32;
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let cfg = load_model_config(&model_dir).expect("config.json");
+    let index = SafetensorsIndex::open(&model_dir).expect("open safetensors");
+    let build = |provider: Arc<dyn KernelProvider>, mem: Arc<dyn DeviceMemory>| -> Runner {
+        let weights = WeightLoader::load_format(
+            cfg.weight_format.get(),
+            &index,
+            &llama_slots(&cfg),
+            &mem,
+            MAX_STAGING_BYTES,
+        )
+        .expect("load weights");
+        let order = [provider.id()];
+        let card = provider.card_profile();
+        let reqs = executor::available_requirements(
+            &cfg,
+            BLOCK_TOKENS,
+            ExecutorOptions::default(),
+            std::slice::from_ref(&provider),
+        );
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
+            .expect("every op has a provider");
+        let exec = DecoderExecutor::new(
+            &cfg,
+            families::llama::decoder_spec(),
+            weights,
+            Arc::new(registry),
+            mem.clone(),
+            ExecutorLimits {
+                block_tokens: BLOCK_TOKENS,
+                max_batch_tokens: max_seq_len,
+                max_seqs: 1,
+            },
+            ExecutorOptions::default(),
+        )
+        .expect("executor");
+        let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
+        Runner { exec, kv }
+    };
+    let mut a = build(shim_provider(ctx), mem.clone());
+    let mut kv_b = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
+    a.exec.set_trace(true);
+
+    // (A) prefill, then decode steps; keep every step's trace.
+    let mut steps: Vec<Vec<TraceTensor>> = Vec::new();
+    let mut batch = r.prompt_token_ids.clone();
+    let mut p0 = 0usize;
+    let mut logits_a = Vec::new();
+    for step in 0..=pos {
+        let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
+        let logits =
+            a.kv.forward(&mut a.exec, &batch, &positions)
+                .expect("forward");
+        logits_a = log_softmax(logits.row(0));
+        steps.push(a.exec.take_trace());
+        p0 += batch.len();
+        if step < pos {
+            batch = vec![r.tokens[step]];
+        }
+    }
+    // (B) one prefill of the same tokens.
+    let mut all = r.prompt_token_ids.clone();
+    all.extend_from_slice(&r.tokens[..pos]);
+    let positions: Vec<u32> = (0..all.len() as u32).collect();
+    let logits = kv_b
+        .forward(&mut a.exec, &all, &positions)
+        .expect("forward");
+    let logits_b = log_softmax(logits.row(0));
+    let trace_b = a.exec.take_trace();
+
+    let row = |t: &TraceTensor, i: usize| -> Vec<f32> {
+        let cols = t.shape[1];
+        t.data[i * cols..(i + 1) * cols].to_vec()
+    };
+    let find = |trace: &[TraceTensor], layer: Option<usize>, name: &str| -> Option<TraceTensor> {
+        trace
+            .iter()
+            .find(|e| e.layer == layer && e.name == name)
+            .cloned()
+    };
+    const OPS: [&str; 14] = [
+        "attn_norm",
+        "q",
+        "k",
+        "v",
+        "q_rope",
+        "k_rope",
+        "attn",
+        "o_proj",
+        "resid_attn",
+        "mlp_norm",
+        "gate",
+        "up",
+        "down",
+        "resid_mlp",
+    ];
+    // Step s of (A) holds positions n_prompt + s − 1 (s ≥ 1); (B) holds them all.
+    for (s, step) in steps.iter().enumerate().skip(1) {
+        let b_row = n_prompt + s - 1;
+        println!("== {id} decode step {s} (position {b_row}) A − B, per layer: max |Δ| (max ulps)");
+        println!("layer {}", OPS.join(" "));
+        for layer in 0..cfg.num_layers as usize {
+            let l = Some(layer);
+            let cells: Vec<String> = OPS
+                .iter()
+                .map(
+                    |name| match (find(step, l, name), find(&trace_b, l, name)) {
+                        (Some(ta), Some(tb)) => {
+                            let d = DiffStats::of(&row(&tb, b_row), &row(&ta, 0));
+                            format!("{:.3e}({:.0})", d.max_abs, d.max_ulps)
+                        }
+                        _ => "-".into(),
+                    },
+                )
+                .collect();
+            println!("{layer:>3} {}", cells.join(" "));
+        }
+    }
+    for name in ["final_norm", "logits"] {
+        if let (Some(ta), Some(tb)) = (find(&steps[pos], None, name), find(&trace_b, None, name)) {
+            let d = DiffStats::of(&row(&tb, 0), &row(&ta, 0));
+            println!("{name}: max |Δ| {:.4e} ({:.0} ulps)", d.max_abs, d.max_ulps);
+        }
+    }
+    println!("position {pos}: reference top-5 / decode (A) / prefill (B) logprobs");
+    for &(tok, lp) in r.top_logprobs[pos].iter().take(5) {
+        println!(
+            "  {tok:>7} ref {lp:>9.4} A {:>9.4} B {:>9.4}",
+            logits_a[tok as usize], logits_b[tok as usize]
+        );
+    }
+    let top = |lp: &[f32]| {
+        let mut v: Vec<(usize, f32)> = lp.iter().copied().enumerate().collect();
+        v.sort_by(|x, y| y.1.total_cmp(&x.1));
+        v.truncate(5);
+        v
+    };
+    println!("  A top-5 {:?}", top(&logits_a));
+    println!("  B top-5 {:?}", top(&logits_b));
+    // (C) with TURBINE_GOLDEN_MXFP4_CPU set: the same prefill on the cpu-reference provider
+    // (scalar, sequential f32 sums: a third, independent rounding of the same model).
+    if std::env::var_os("TURBINE_GOLDEN_MXFP4_CPU").is_some() {
+        let host: Arc<dyn DeviceMemory> =
+            HostMemory::new(turbine_core::types::DeviceId(0), 24 << 30);
+        let mut c = build(cpu_reference_provider(), host);
+        let logits =
+            c.kv.forward(&mut c.exec, &all, &positions)
+                .expect("forward");
+        let logits_c = log_softmax(logits.row(0));
+        println!("position {pos}: reference / cpu-reference prefill (C)");
+        for &(tok, lp) in r.top_logprobs[pos].iter().take(5) {
+            println!("  {tok:>7} ref {lp:>9.4} C {:>9.4}", logits_c[tok as usize]);
+        }
+        println!("  C top-5 {:?}", top(&logits_c));
     }
 }
