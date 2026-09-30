@@ -628,6 +628,7 @@ impl ModelBackend {
                     end: req.hints.session_end,
                 }),
             cache_salt: req.hints.cache_salt.clone(),
+            kv_policy: req.hints.kv_policy,
             endpoint: req.endpoint,
             http_request_id: req.http_request_id.clone(),
             prompt_tokens,

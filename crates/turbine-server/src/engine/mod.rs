@@ -311,7 +311,7 @@ pub fn spawn(
                     },
                     &mut pool,
                 );
-                let (kv, kv_handle) = match started {
+                let (mut kv, kv_handle) = match started {
                     Ok(k) => k,
                     Err(e) => {
                         let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
@@ -319,6 +319,7 @@ pub fn spawn(
                     }
                 };
                 let reliability = &prepared.reliability;
+                kv.set_ladder_dwell(reliability.pressure.deescalate_dwell.0);
                 #[cfg(feature = "fault-injection")]
             let injector = reliability.fault_injection.clone().map(|cfg| {
                 tracing::warn!(event = "fault_injection", config = ?cfg, "fault injection is on");

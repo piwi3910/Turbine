@@ -170,6 +170,30 @@ pub fn block_key(ns: &NamespaceKey, parent: Option<&KvKey>, tokens: &[u32]) -> K
     KvKey(out)
 }
 
+/// Key of a lossy copy of block `key` stored in codec `format` (P6b S-3): the first 16 bytes of
+/// BLAKE3("lossy" ‖ key ‖ format ‖ seed LE). A lossy copy promoted into L0 is filed under it, and
+/// a block computed over a lossy prefix chains from it, so exact and lossy lineages never alias.
+pub fn lossy_key(key: KvKey, format: &str, seed: u64) -> KvKey {
+    let mut h = blake3::Hasher::new();
+    h.update(b"lossy");
+    h.update(&key.0);
+    h.update(format.as_bytes());
+    h.update(&seed.to_le_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    KvKey(out)
+}
+
+impl NamespaceKey {
+    /// The tier codecs' rotation seed of this namespace (also the [`lossy_key`] seed): its
+    /// first 8 bytes, little-endian.
+    pub fn seed(&self) -> u64 {
+        let mut seed = [0u8; 8];
+        seed.copy_from_slice(&self.0[..8]);
+        u64::from_le_bytes(seed)
+    }
+}
+
 /// Computes a block's key from its parent and tokens. Production uses [`Blake3Hasher`]; tests
 /// substitute a colliding hasher to prove a collision is a miss.
 pub trait KeyHasher {
@@ -271,6 +295,21 @@ mod tests {
     const GOLDEN_NS: &str = "ed23b1a59bb18212b164ef794fa9cf9d322aab219e06c339fae5ed8039daf370";
     const GOLDEN_K0: &str = "c702bd85238874d09bfd14994b61c7dd";
     const GOLDEN_K1: &str = "3160290f63b886a8ec86883ec3e382cf";
+
+    /// P6b S-3: a lossy key differs from its block's key and from every other format's or
+    /// seed's, and is stable. Breaks if lossy copies could alias the exact block.
+    #[test]
+    fn lossy_keys_never_alias() {
+        let ns = namespace_key(&model(1), &llama_format(16), "");
+        let k = block_key(&ns, None, &[1, 2, 3]);
+        let tq4 = lossy_key(k, "tq4", ns.seed());
+        assert_ne!(tq4, k);
+        assert_eq!(tq4, lossy_key(k, "tq4", ns.seed()));
+        assert_ne!(tq4, lossy_key(k, "tq2", ns.seed()));
+        assert_ne!(tq4, lossy_key(k, "tq4", ns.seed() ^ 1));
+        assert_ne!(tq4, lossy_key(KvKey([1; 16]), "tq4", ns.seed()));
+        assert_eq!(ns.seed(), u64::from_le_bytes(ns.0[..8].try_into().unwrap()));
+    }
 
     #[test]
     fn keys_are_stable_and_scoped() {

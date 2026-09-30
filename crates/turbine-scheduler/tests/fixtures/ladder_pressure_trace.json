@@ -1,0 +1,11 @@
+{
+  "seed": 20260930,
+  "dwell_ms": 2000,
+  "segments": [
+    { "state": "GREEN", "steps": 600, "arrival_every": 6 },
+    { "state": "YELLOW", "steps": 3000, "arrival_every": 6 },
+    { "state": "ORANGE", "steps": 900, "arrival_every": 6 },
+    { "state": "RED", "steps": 600, "arrival_every": 6 },
+    { "state": "GREEN", "steps": 2400, "arrival_every": 6 }
+  ]
+}

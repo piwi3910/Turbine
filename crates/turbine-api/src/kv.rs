@@ -5,6 +5,8 @@
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 
+use turbine_core::request::RequestKvPolicy;
+
 use crate::error::ApiError;
 use crate::openai::request::ChatMessageIn;
 
@@ -12,6 +14,8 @@ pub const SESSION_RESUME_WITHIN: &str = "x-turbine-session-resume-within";
 pub const SESSION_END: &str = "x-turbine-session-end";
 pub const CACHE_SALT: &str = "x-turbine-cache-salt";
 pub const TARGET_REPLICA: &str = "x-turbine-target-replica";
+/// `allow` or `deny` (P6b S-3): whether the request may reuse lossy cached KV.
+pub const KV_LOSSY: &str = "x-turbine-kv-lossy";
 
 /// Longest `prompt_cache_key` and cache salt, in characters.
 const MAX_ID_CHARS: usize = 128;
@@ -29,6 +33,8 @@ pub struct TurbineHeaders {
     pub cache_salt: Option<String>,
     /// `x-turbine-target-replica` (Phase 6 fault injection); carried, not interpreted here.
     pub target_replica: Option<String>,
+    /// `x-turbine-kv-lossy: allow|deny` (P6b S-3); `None` takes `kv.lossy_reuse`.
+    pub kv_policy: Option<RequestKvPolicy>,
 }
 
 /// 1–128 visible ASCII characters (`!`..=`~`).
@@ -66,6 +72,17 @@ pub fn parse_cache_salt(h: &HeaderMap) -> Result<Option<String>, ApiError> {
     }
 }
 
+/// `x-turbine-kv-lossy`: `allow` or `deny`, else 400 `invalid_request`.
+pub fn parse_kv_lossy(h: &HeaderMap) -> Result<Option<RequestKvPolicy>, ApiError> {
+    let bad = || ApiError::invalid_request("x-turbine-kv-lossy must be allow or deny");
+    match header_text(h, KV_LOSSY, bad)? {
+        None => Ok(None),
+        Some("allow") => Ok(Some(RequestKvPolicy { allow_lossy: true })),
+        Some("deny") => Ok(Some(RequestKvPolicy { allow_lossy: false })),
+        Some(_) => Err(bad()),
+    }
+}
+
 /// Parses and validates the `x-turbine-*` headers (P4 §Session hints): resume-within an integer
 /// 1..=86400, session-end `true` or `false`, the salt 1–128 visible ASCII characters; either
 /// session header without a `prompt_cache_key` is `invalid_session_hint`.
@@ -100,6 +117,7 @@ pub fn parse_turbine_headers(
         session_end,
         cache_salt: parse_cache_salt(h)?,
         target_replica,
+        kv_policy: parse_kv_lossy(h)?,
     })
 }
 
@@ -210,6 +228,24 @@ mod tests {
                 validate_session_id(bad).unwrap_err().code.as_str(),
                 "invalid_session_id"
             );
+        }
+    }
+
+    /// P6b S-3: `x-turbine-kv-lossy` is `allow` or `deny`, absent is `None`, anything else a
+    /// 400. Breaks if a bad value is silently taken as either.
+    #[test]
+    fn kv_lossy_header() {
+        let policy = |v: &str| parse_turbine_headers(&headers(&[(KV_LOSSY, v)]), false);
+        assert_eq!(
+            policy("deny").unwrap().kv_policy,
+            Some(RequestKvPolicy { allow_lossy: false })
+        );
+        assert_eq!(
+            policy("allow").unwrap().kv_policy,
+            Some(RequestKvPolicy { allow_lossy: true })
+        );
+        for bad in ["", "Deny", "no", "true"] {
+            assert_eq!(code(policy(bad)), "invalid_request", "{bad:?}");
         }
     }
 

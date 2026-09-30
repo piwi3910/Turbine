@@ -191,6 +191,17 @@ pub struct Usage {
     /// Prompt tokens served from a cached prefix (Phase 4; 0 before).
     #[serde(default)]
     pub cached_tokens: u32,
+    /// Of `cached_tokens`, those served from lossy cached KV (P6b S-3; 0 when none).
+    #[serde(default)]
+    pub lossy_cached_tokens: u32,
+}
+
+/// A request's KV reuse policy (P6b S-3), from `x-turbine-kv-lossy: allow|deny`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RequestKvPolicy {
+    /// False: the request never reuses a lossy cached block (it recomputes from the first
+    /// one); its own KV is still stored as configured.
+    pub allow_lossy: bool,
 }
 
 /// Built by `turbine-server` after templating and tokenization.
@@ -217,6 +228,8 @@ pub struct GenerationRequest {
     pub session: Option<SessionHints>,
     /// Phase 4: `x-turbine-cache-salt`; only requests with the same salt share prefixes.
     pub cache_salt: Option<String>,
+    /// P6b S-3: `x-turbine-kv-lossy`; `None` takes `kv.lossy_reuse`.
+    pub kv_policy: Option<RequestKvPolicy>,
 }
 
 /// What constrains a request's output (P2 S-17, S-18).

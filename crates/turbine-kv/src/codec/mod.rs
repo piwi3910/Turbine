@@ -6,7 +6,7 @@
 //! entry in [`registry`]; `kv.cpu.format` / `kv.nvme.format` select it by name.
 //!
 //! This crate stays GPU-free: `encode_cpu` / `decode_cpu` are the reference every GPU transcode
-//! (the v2.10 `turbine_kv_transcode` op, identified by [`KvCodec::abi_code`]) is tested against.
+//! (the v2.11 `turbine_kv_transcode` op, identified by [`KvCodec::abi_code`]) is tested against.
 //!
 //! Registration order is the lossiness order of the compression ladder (P6b S-6): `l0` (the L0
 //! bytes unchanged) < `fp8_e4m3` < `tq4` < `tq2`. [`rung_index`] and [`next_rung`] read it; the
@@ -80,7 +80,7 @@ pub enum CodecError {
 pub trait KvCodec: Module {
     /// True when `decode(encode(x))` may differ from `x` for an L0 of this layout.
     fn lossy(&self, l0: &KvLayout) -> bool;
-    /// `TURBINE_KVFMT_*` code of the v2.10 transcode op (`l0` 0, `fp8_e4m3` 1, `tq4` 2, `tq2` 3).
+    /// `TURBINE_KVFMT_*` code of the v2.11 transcode op (`l0` 0, `fp8_e4m3` 1, `tq4` 2, `tq2` 3).
     fn abi_code(&self) -> u8;
     /// Documented bound on the normalised reconstruction error of a lossy codec, ‖x − x̂‖² / ‖x‖²
     /// over a block's K and V (0 for a lossless one); the conformance suite holds every codec
