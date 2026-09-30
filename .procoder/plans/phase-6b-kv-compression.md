@@ -11,7 +11,7 @@ Add per-tier KV formats with GPU-side transcoding (proven with FP8 first), Turbo
 
 ## Architecture
 
-`turbine_kv::codec` is a new `kv_format` registry of codecs (`l0`, `fp8_e4m3`, `tq4`, `tq2`) whose CPU side lives in `turbine-kv` and whose GPU side is the v2.10 `turbine_kv_transcode` op called by the server's orchestrator around the existing demotion/promotion copies. Directory locations carry a format; lossy copies and blocks computed over them get lineage keys; the planner weighs lossy retrieval with a penalty; requests may opt out with `x-turbine-kv-lossy: deny`. In L0, block-table entries carry a format tag, pages come from one page class per format, and a mixed-format paged attention (v2.10) reads BF16 / FP8 blocks directly and TurboQuant blocks in the rotated domain (q rotated once per step, V accumulated rotated and rotated back once). The ladder is a third `EvictAction` (`Compress`) decided by the eviction policy from tier fill and the pressure state and applied by the hierarchy within the Phase 4 per-tick bounds, first in L1/L2 and then in L0.
+`turbine_kv::codec` is a new `kv_format` registry of codecs (`l0`, `fp8_e4m3`, `tq4`, `tq2`) whose CPU side lives in `turbine-kv` and whose GPU side is the v2.11 `turbine_kv_transcode` op called by the server's orchestrator around the existing demotion/promotion copies. Directory locations carry a format; lossy copies and blocks computed over them get lineage keys; the planner weighs lossy retrieval with a penalty; requests may opt out with `x-turbine-kv-lossy: deny`. In L0, block-table entries carry a format tag, pages come from one page class per format, and a mixed-format paged attention (v2.11) reads BF16 / FP8 blocks directly and TurboQuant blocks in the rotated domain (q rotated once per step, V accumulated rotated and rotated back once). The ladder is a third `EvictAction` (`Compress`) decided by the eviction policy from tier fill and the pressure state and applied by the hierarchy within the Phase 4 per-tick bounds, first in L1/L2 and then in L0.
 
 ## Constraints
 
@@ -31,7 +31,7 @@ Copied verbatim from the spec (Constraints):
 
 From the interface contract and the work in flight (binding):
 
-- Names in `.procoder/contract/interfaces.md` §9 (kernel C ABI), §11 (`turbine-kv`), §12 (`turbine-scheduler`), §17 (metrics), §24 (registries) and the §26 "Phase 6 additions" written by 6a are used verbatim; this phase appends its additions to §26 and adds the optional minor v2.10 (`TURBINE_ABI_VERSION` stays `2u`).
+- Names in `.procoder/contract/interfaces.md` §9 (kernel C ABI), §11 (`turbine-kv`), §12 (`turbine-scheduler`), §17 (metrics), §24 (registries) and the §26 "Phase 6 additions" written by 6a are used verbatim; this phase appends its additions to §26 and adds the optional minor v2.11 (`TURBINE_ABI_VERSION` stays `2u`).
 - Toolchain edition 2024, `rust-version = "1.97"`; `#[non_exhaustive]` on `EvictAction`, `EvictReason`, `KvDtypeChoice`, `KvFormatColumn`; config structs `#[serde(deny_unknown_fields, default)]`; metric labels from closed enums rendered with `as_str()`; time through `Arc<dyn Clock>`.
 - Starting point: `phase-6a-quantization` closed (its exit task done, its rows in the support matrix); this phase branches from that tip as `phase-6b-kv-compression`. Task references written "6a Task N" point into `.procoder/plans/phase-6a-quantization.md`.
 - Builds and tests run on novanas through `scripts/remote-cargo.sh`; every task ends with `scripts/gate.sh` printing `gate: ok`; GPU-facing tasks add `scripts/lab-test.sh novanas --tier quick`; every task that changes serving code ends with `scripts/lab-bench.sh --quick --model llama` and `--model olmoe` (GPU 0, under `scripts/bench-lock.sh`, `LABBOOK_SET=phase-6b-kv-compression`) and a row in `.procoder/perf-log.md` — one change, then measure.
@@ -100,21 +100,21 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `feat(kv): lossy lineage keys, per-request opt-out and lossy token counts`
 
-## Task 5: Kernel ABI v2.10 `kv_transcode` and the FP8 transcode on HIP
+## Task 5: Kernel ABI v2.11 `kv_transcode` and the FP8 transcode on HIP
 
-Files: `kernels/include/turbine_kernels.h` (v2.10 group), `crates/turbine-kernels/src/ffi.rs` (`V210Symbols`, depends on v2.9 and v2.5), `crates/turbine-kernels/src/ops/mod.rs` (`OpKind::KvTranscode`, config, trait), `crates/turbine-kernels/src/cpu/kv_transcode.rs` (CPU provider calls a codec function table passed in from the server, keeping `turbine-kernels` free of `turbine-kv`), `kernels/rocm/src/kv_transcode.hip` (FP8 encode/decode; the TurboQuant slots added by Task 8), `kernels/rocm/src/impl_table.cpp`, `kernels/rocm/src/abi_minor.cpp` (10), `crates/turbine-server/src/kv_orchestrator.rs` (`CopyStreamBackend`: encode into a device staging buffer, then the existing pinned copies; promotion: copy small bytes into a device staging buffer, decode into the L0 page), `.procoder/ask/decisions.md` (entry "P6b: KV transcode — provider evaluation": CK elementwise/transform, own), `crates/turbine-kernels/tests/hip_ops.rs` (`kv_transcode_matches_cpu`), `crates/turbine-server/tests/kv_gpu.rs` (`nvme_round_trip_fp8_tier`)
+Files: `kernels/include/turbine_kernels.h` (v2.11 group), `crates/turbine-kernels/src/ffi.rs` (`V211Symbols`, depends on v2.9 and v2.5), `crates/turbine-kernels/src/ops/mod.rs` (`OpKind::KvTranscode`, config, trait), `crates/turbine-kernels/src/cpu/kv_transcode.rs` (CPU provider calls a codec function table passed in from the server, keeping `turbine-kernels` free of `turbine-kv`), `kernels/rocm/src/kv_transcode.hip` (FP8 encode/decode; the TurboQuant slots added by Task 8), `kernels/rocm/src/impl_table.cpp`, `kernels/rocm/src/abi_minor.cpp` (10), `crates/turbine-server/src/kv_orchestrator.rs` (`CopyStreamBackend`: encode into a device staging buffer, then the existing pinned copies; promotion: copy small bytes into a device staging buffer, decode into the L0 page), `.procoder/ask/decisions.md` (entry "P6b: KV transcode — provider evaluation": CK elementwise/transform, own), `crates/turbine-kernels/tests/hip_ops.rs` (`kv_transcode_matches_cpu`), `crates/turbine-server/tests/kv_gpu.rs` (`nvme_round_trip_fp8_tier`)
 Interfaces:
 
 - C and Rust shapes as the spec's Interfaces; one staging buffer of `DEMOTION_INFLIGHT` × the largest encoded block per shard, allocated at startup when a lower-tier format is not `l0`
-  Covers: spec S-1 (GPU); AC `optional_groups_v210`, `kv_transcode_matches_cpu` (FP8); when it lands, `fp8_e4m3` as a lower-tier format gets an `experimental` entry in `TIER_FORMAT_REFUSALS` (startup stops refusing it with `kv_transcode_unavailable`), `supported` after Task 6
+  Covers: spec S-1 (GPU); AC `optional_groups_v211`, `kv_transcode_matches_cpu` (FP8); when it lands, `fp8_e4m3` as a lower-tier format gets an `experimental` entry in `TIER_FORMAT_REFUSALS` (startup stops refusing it with `kv_transcode_unavailable`), `supported` after Task 6
   Depends on: Task 4
 
 - [ ] Evaluate transcode providers (short: CK `elementwise` / `batched_transpose` building blocks vs own) and write the entry.
-- [ ] Write failing tests: `ffi::tests::optional_groups_v210`, lab `hip_ops::kv_transcode_matches_cpu` (FP8), lab `kv_gpu::nvme_round_trip_fp8_tier` (L2 `fp8_e4m3` from BF16 L0 within the codec bound; `l0` still bit-exact). Run: `scripts/remote-cargo.sh test -p turbine-kernels ffi::tests` — expect FAIL; `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops kv_transcode` — expect FAIL
+- [ ] Write failing tests: `ffi::tests::optional_groups_v211`, lab `hip_ops::kv_transcode_matches_cpu` (FP8), lab `kv_gpu::nvme_round_trip_fp8_tier` (L2 `fp8_e4m3` from BF16 L0 within the codec bound; `l0` still bit-exact). Run: `scripts/remote-cargo.sh test -p turbine-kernels ffi::tests` — expect FAIL; `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops kv_transcode` — expect FAIL
 - [ ] Implement.
 - [ ] Run the three — expect PASS; `scripts/lab-test.sh novanas --tier quick` — expect PASS; `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu` — expect PASS
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(rocm): ABI v2.10 KV transcode with FP8 on the demotion path`
+- [ ] Commit: `feat(rocm): ABI v2.11 KV transcode with FP8 on the demotion path`
 
 ## Task 6: Per-tier FP8 lab proof
 
@@ -207,9 +207,9 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `feat(kv): per-format L0 page classes, block format tags and the CPU TurboQuant attention`
 
-## Task 12: Mixed-format paged attention on HIP (ABI v2.10)
+## Task 12: Mixed-format paged attention on HIP (ABI v2.11)
 
-Files: `kernels/include/turbine_kernels.h` (v2.10: `block_formats`, `turbine_tq_params`, `TURBINE_DTYPE_TQ4` 18, `TURBINE_DTYPE_TQ2` 19), `crates/turbine-kernels/src/ffi.rs` (desc fields read at minor ≥ 10), `kernels/rocm/src/paged_attention_mixed.*` (the Task 10 pick: an adapted provider kernel or own; TurboQuant append encoding through Task 8's codec), `kernels/rocm/src/impl_table.cpp`, `crates/turbine-kernels/tests/hip_ops.rs` (`paged_mixed_matches_cpu`), `scripts/lab-test.sh` (timing variant into `SLOW_TESTS`)
+Files: `kernels/include/turbine_kernels.h` (v2.11: `block_formats`, `turbine_tq_params`, `TURBINE_DTYPE_TQ4` 18, `TURBINE_DTYPE_TQ2` 19), `crates/turbine-kernels/src/ffi.rs` (desc fields read at minor ≥ 10), `kernels/rocm/src/paged_attention_mixed.*` (the Task 10 pick: an adapted provider kernel or own; TurboQuant append encoding through Task 8's codec), `kernels/rocm/src/impl_table.cpp`, `crates/turbine-kernels/tests/hip_ops.rs` (`paged_mixed_matches_cpu`), `scripts/lab-test.sh` (timing variant into `SLOW_TESTS`)
 Interfaces:
 
 - implementation name from the pick (e.g. `turbine_hip_mixed`); `supports` requires head_dim 128 and block_tokens a multiple of 16; BF16-only block tables keep choosing the existing CK implementations (no change to the BF16 path)
