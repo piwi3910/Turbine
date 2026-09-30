@@ -106,7 +106,7 @@ impl LabServer {
         // The kernel library comes from TURBINE_KERNEL_LIBRARY (set by the lab Job); the log
         // goes straight to the test output.
         let child = cmd
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", "info,turbine_kv=debug,turbine_server::kv_orchestrator=debug")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
