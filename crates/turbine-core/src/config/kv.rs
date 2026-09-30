@@ -33,7 +33,10 @@ pub struct KvConfig {
     /// Eviction policy (Phase 4; an `eviction_policy` registry name, validated with the other
     /// module keys by `Config::validate_modules`).
     pub policy: ModuleName,
-    /// Blocks scoring below this are dropped instead of demoted.
+    /// Blocks scoring below this are dropped instead of demoted. Absolute, on the eviction
+    /// policy's scale: the policy prices a block's return trip at the lower tier's encoded size
+    /// (P6b), so with a compressing lower tier an L0 block scores lower and a set threshold drops
+    /// more blocks the cheaper that tier is (`docs/extending/eviction-policy.md`, Pitfalls).
     pub demote_min_value: f64,
     /// `false`: no prefix lookup and no reuse (A/B switch).
     pub prefix_sharing: bool,
