@@ -1789,6 +1789,81 @@ fn paged_fp8_matches_cpu() {
     assert_eq!(got, "ck_tile_fmha_pagedkv_fp8_staged");
 }
 
+/// Review r13 P1: the staged FP8 prefill finishes its single-query rows with the FP8 decode
+/// kernel, whose LDS holds at most 8 query heads per KV head. At a GQA group of 16 (32/2 heads)
+/// the staged implementation does not serve, the library routes a prefill batch with a
+/// single-query row to the Turbine FP8 kernel, and the output matches the CPU reference; the
+/// decode kind likewise falls back from the FP8 decode kernel. Breaks if the staged path (or
+/// the decode kernel) is chosen for a group it would read past its LDS for.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn paged_fp8_group16_avoids_the_decode_kernel() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(29);
+    let heads = (32usize, 2usize);
+    let pages = Pages::Fp8 {
+        k_scale: 0.07,
+        v_scale: 0.11,
+    };
+    let cfg = |kind| AttentionConfig {
+        kind,
+        num_q_heads: heads.0 as u32,
+        num_kv_heads: heads.1 as u32,
+        head_dim: HEAD_DIM as u32,
+        dtype: DType::F8E4M3,
+        block_tokens: Some(128),
+        causal: true,
+    };
+    let hip = p.hip.attention().expect("hip attention");
+    for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
+        let spec = OpConfig::Attention(cfg(kind));
+        for info in p.hip.implementations(spec.op()) {
+            if matches!(
+                info.name.as_str(),
+                "ck_tile_fmha_pagedkv_fp8_staged" | "turbine_hip_fp8_decode"
+            ) {
+                assert!(
+                    !p.hip.implementation_supports(&spec, info.index, None),
+                    "{} must not serve GQA group 16 ({kind:?})",
+                    info.name
+                );
+            }
+        }
+        assert_eq!(
+            hip.implementation(&cfg(kind)),
+            "turbine_hip_fp8",
+            "{kind:?}"
+        );
+    }
+    // A prefill batch with single-query rows riding along.
+    let got = paged_case_pages(
+        &p,
+        &mut rng,
+        AttentionKind::PrefillPaged,
+        heads,
+        128,
+        &[300, 1, 17, 1],
+        &[400, 256, 17, 2],
+        pages,
+    );
+    assert_eq!(got, "turbine_hip_fp8");
+    let got = paged_case_pages(
+        &p,
+        &mut rng,
+        AttentionKind::DecodePaged,
+        heads,
+        128,
+        &[1, 1, 1],
+        &[1, 129, 1001],
+        pages,
+    );
+    assert_eq!(got, "turbine_hip_fp8");
+}
+
 /// FP8 KV paged decode timings (plan Task 23 provider evaluation): `attention_decode_paged`
 /// (append + attend) of every implementation that takes BF16 pages, then every one that takes
 /// FP8 pages, bound as the registry binds it, for Llama (24/8) and OLMoE (16/16) at 128-token

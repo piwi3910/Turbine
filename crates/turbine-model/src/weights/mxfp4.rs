@@ -219,7 +219,11 @@ impl Mxfp4Layout {
     pub fn check_tensor(&self, entry: &TensorEntry) -> Result<(), ModelError> {
         let (data, scales) = self.kind.names();
         let suffix = entry.name.rsplit('.').next().unwrap_or("");
-        let packed = suffix == scales || (suffix == data && entry.dtype == Dtype::U8);
+        // The data is packed U8 whenever its name is its own (compressed-tensors
+        // `weight_packed`, OpenAI `weight_blocks`); only Quark's data shares the name `weight`
+        // with an unquantized BF16 layer, so there the dtype tells them apart (review r13 C3).
+        let packed =
+            suffix == scales || (suffix == data && (data != "weight" || entry.dtype == Dtype::U8));
         let ok = if packed {
             entry.dtype == Dtype::U8
         } else {
@@ -438,6 +442,112 @@ fn write_tiny_mxfp4(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::safetensors::SafetensorsIndex;
+    use crate::weights::common::write_owned;
+    use crate::{WeightLoader, families};
+
+    fn layout(kind: Mxfp4Kind) -> Mxfp4Layout {
+        Mxfp4Layout {
+            kind,
+            act: ActivationQuant::None,
+            ignore: Vec::new(),
+        }
+    }
+
+    fn entry(name: &str, dtype: Dtype, shape: Vec<usize>) -> TensorEntry {
+        TensorEntry {
+            name: name.to_string(),
+            dtype,
+            shape,
+            file: "model.safetensors".into(),
+            range: 0..0,
+        }
+    }
+
+    /// Review r13 C3: MXFP4 data whose tensor name is its own (compressed-tensors
+    /// `weight_packed`, OpenAI `weight_blocks`) must be U8 — a BF16 one is refused, not taken
+    /// for an unquantized layer — while Quark's `weight` keeps the dtype rule (U8 packed data,
+    /// BF16 an unquantized layer). Breaks if BF16 packed data passes `check_tensor`.
+    #[test]
+    fn packed_data_must_be_u8() {
+        let ct = layout(Mxfp4Kind::CompressedTensors);
+        let name = "model.layers.0.mlp.gate_proj.weight_packed";
+        assert!(
+            ct.check_tensor(&entry(name, Dtype::U8, vec![256, 64]))
+                .is_ok()
+        );
+        let err = ct
+            .check_tensor(&entry(name, Dtype::BF16, vec![256, 64]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tensor dtype"), "{err}");
+        let oa = layout(Mxfp4Kind::OpenAi);
+        let blocks = "model.layers.0.mlp.gate_proj.weight_blocks";
+        assert!(
+            oa.check_tensor(&entry(blocks, Dtype::U8, vec![256, 4, 16]))
+                .is_ok()
+        );
+        assert!(
+            oa.check_tensor(&entry(blocks, Dtype::BF16, vec![256, 4, 16]))
+                .is_err()
+        );
+        let quark = layout(Mxfp4Kind::Quark);
+        let w = "model.layers.0.mlp.gate_proj.weight";
+        assert!(
+            quark
+                .check_tensor(&entry(w, Dtype::U8, vec![256, 64]))
+                .is_ok()
+        );
+        assert!(
+            quark
+                .check_tensor(&entry(w, Dtype::BF16, vec![256, 128]))
+                .is_ok()
+        );
+    }
+
+    /// Review r13 C3 (loader): a Quark layer whose `weight` is BF16 but shaped like packed data
+    /// (`[n, k/2]`) passes the dtype rule (it looks unquantized) and the shape check; the
+    /// loader refuses it by its byte length instead of copying twice the slot's bytes over the
+    /// next part of the fused gate/up stack. Breaks if an as-stored upload is not checked
+    /// against its slot's byte length.
+    #[test]
+    fn loader_refuses_a_wider_tensor_of_the_slot_shape() {
+        let tmp = crate::testing::TempDir::new("mxfp4-wide-data");
+        let q = serde_json::json!({
+            "quant_method": "quark",
+            "global_quant_config": {
+                "weight": {"dtype": "fp4", "qscheme": "per_group", "group_size": 32,
+                           "scale_format": "e8m0", "is_dynamic": false,
+                           "round_method": "half_even", "scale_calculation_mode": "even"},
+                "input_tensors": null, "output_tensors": null, "bias": null},
+            "exclude": ["lm_head"],
+            "export": {"weight_format": "real_quantized", "pack_method": "reorder"},
+            "algo_config": [], "layer_quant_config": {}, "layer_type_quant_config": {},
+            "kv_cache_quant_config": {},
+        });
+        let fixture = crate::testing::tiny::write_tiny_quantized(tmp.path(), 3, &q, 128, 128);
+        let cfg = &fixture.quantized.config;
+        let file = fixture.quantized.dir.join("model.safetensors");
+        let target = "model.layers.0.mlp.gate_proj.weight";
+        let mut tensors = read_owned(&file).expect("read");
+        let t = tensors
+            .iter_mut()
+            .find(|t| t.0 == target)
+            .expect("the gate projection");
+        assert_eq!(t.1, Dtype::U8);
+        t.1 = Dtype::BF16;
+        t.3 = vec![0; t.3.len() * 2];
+        write_owned(&file, &tensors).expect("write");
+        let index = SafetensorsIndex::open(&fixture.quantized.dir).expect("index");
+        let format = cfg.weight_format.get();
+        let slots = families::llama_slots(cfg);
+        let mem: Arc<dyn turbine_tensor::DeviceMemory> =
+            turbine_tensor::host::HostMemory::new(turbine_core::types::DeviceId(0), 1 << 30);
+        let err = WeightLoader::load_format(format, &index, &slots, &mem, 1 << 20)
+            .expect_err("a BF16 tensor in a U8 slot")
+            .to_string();
+        assert!(err.contains(target) && err.contains("bytes"), "{err}");
+    }
 
     #[test]
     fn glob_ignores() {

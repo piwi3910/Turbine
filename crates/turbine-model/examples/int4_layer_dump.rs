@@ -59,9 +59,10 @@ fn main() {
     };
     let mut stored = Vec::new();
     for slot in fmt.slots(&base) {
-        let e = index
-            .get(&slot.name)
-            .unwrap_or_else(|| panic!("{} not in the checkpoint", slot.name));
+        let Some(e) = index.get(&slot.name) else {
+            assert!(fmt.optional(&slot), "{} not in the checkpoint", slot.name);
+            continue;
+        };
         fmt.check_tensor(e).expect("check_tensor");
         let bytes = fmt.repack(&slot, e, read(e)).expect("repack");
         eprintln!(
@@ -70,7 +71,7 @@ fn main() {
             slot.shape,
             bytes.len()
         );
-        if slot.shape != [0] {
+        if slot.shape.iter().product::<usize>() != 0 {
             stored.push(bytes);
         }
     }

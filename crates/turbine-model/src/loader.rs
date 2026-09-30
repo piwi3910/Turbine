@@ -214,6 +214,75 @@ impl WeightLoader {
         WeightLoader::load_part(format, index, slots, &[], mem, staging_bytes)
     }
 
+    /// The validation half of [`WeightLoader::load_part`] over already-derived slots (the
+    /// format's [`WeightFormat::slots`]): every slot's tensor present (an absent optional
+    /// check-only slot skipped), stored in `format`, of the expected shape and, when copied as
+    /// stored, the slot's byte length, and every stack consistent. Reads headers only; returns
+    /// each slot to load with its checkpoint tensor.
+    pub fn plan<'s>(
+        format: &dyn WeightFormat,
+        index: &'s SafetensorsIndex,
+        slots: &'s [WeightSlot],
+    ) -> Result<Vec<(&'s WeightSlot, &'s TensorEntry)>, ModelError> {
+        let mut planned: Vec<(&WeightSlot, &TensorEntry)> = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let empty = slot.shape.iter().product::<usize>() == 0;
+            let entry = match index.get(&slot.name) {
+                Some(entry) => entry,
+                None if empty && format.optional(slot) => continue,
+                None => return Err(ModelError::MissingTensor(slot.name.clone())),
+            };
+            format.check_tensor(entry)?;
+            if format.repacks(slot) {
+                for name in format.companions(slot) {
+                    if index.get(&name).is_none() {
+                        return Err(ModelError::MissingTensor(name));
+                    }
+                }
+                planned.push((slot, entry));
+                continue;
+            }
+            let expected = slot.source.as_ref().map_or(&slot.shape, |src| &src.shape);
+            if entry.shape != *expected {
+                return Err(ModelError::Safetensors {
+                    file: entry.file.clone(),
+                    tensor: entry.name.clone(),
+                    rule: format!("shape {:?} != expected {:?}", entry.shape, expected),
+                });
+            }
+            // Copied as stored: its bytes must be exactly the slot's, else a tensor of the
+            // right shape in a wider dtype would spill into the next slot of a stack (review
+            // r13 C3).
+            let dtype = format.slot_dtype(slot);
+            let want = expected.iter().product::<usize>() as u64 * dtype.size_bytes() as u64;
+            if entry.byte_len() != want {
+                return Err(ModelError::Safetensors {
+                    file: entry.file.clone(),
+                    tensor: entry.name.clone(),
+                    rule: format!(
+                        "{} {} bytes for a {} slot of shape {:?} ({want} bytes)",
+                        entry.dtype,
+                        entry.byte_len(),
+                        dtype.as_str(),
+                        expected
+                    ),
+                });
+            }
+            if let Some(src) = &slot.source
+                && !src.fits(&slot.shape)
+            {
+                return Err(ModelError::Safetensors {
+                    file: entry.file.clone(),
+                    tensor: entry.name.clone(),
+                    rule: format!("shard {src:?} does not fit slot shape {:?}", slot.shape),
+                });
+            }
+            planned.push((slot, entry));
+        }
+        check_stacks(slots)?;
+        Ok(planned)
+    }
+
     /// [`WeightLoader::load_format`] of one part of a model split by pipeline stages or expert
     /// ranks: `whole` is the unsplit model's slot list (the family's
     /// `weight_slots`); a checkpoint tensor it names but `slots` does not belongs to another
@@ -240,41 +309,7 @@ impl WeightLoader {
         let slots: Vec<WeightSlot> = slots.iter().flat_map(|s| format.slots(s)).collect();
         let whole: Vec<WeightSlot> = whole.iter().flat_map(|s| format.slots(s)).collect();
         let (slots, whole) = (slots.as_slice(), whole.as_slice());
-        let mut planned: Vec<(&WeightSlot, &TensorEntry)> = Vec::with_capacity(slots.len());
-        for slot in slots {
-            let entry = index
-                .get(&slot.name)
-                .ok_or_else(|| ModelError::MissingTensor(slot.name.clone()))?;
-            format.check_tensor(entry)?;
-            if format.repacks(slot) {
-                for name in format.companions(slot) {
-                    if index.get(&name).is_none() {
-                        return Err(ModelError::MissingTensor(name));
-                    }
-                }
-                planned.push((slot, entry));
-                continue;
-            }
-            let expected = slot.source.as_ref().map_or(&slot.shape, |src| &src.shape);
-            if entry.shape != *expected {
-                return Err(ModelError::Safetensors {
-                    file: entry.file.clone(),
-                    tensor: entry.name.clone(),
-                    rule: format!("shape {:?} != expected {:?}", entry.shape, expected),
-                });
-            }
-            if let Some(src) = &slot.source
-                && !src.fits(&slot.shape)
-            {
-                return Err(ModelError::Safetensors {
-                    file: entry.file.clone(),
-                    tensor: entry.name.clone(),
-                    rule: format!("shard {src:?} does not fit slot shape {:?}", slot.shape),
-                });
-            }
-            planned.push((slot, entry));
-        }
-        check_stacks(slots)?;
+        let planned = WeightLoader::plan(format, index, slots)?;
 
         let wanted: HashSet<&str> = slots.iter().map(|s| s.name.as_str()).collect();
         let others: HashSet<&str> = whole

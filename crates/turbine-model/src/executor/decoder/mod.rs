@@ -2350,6 +2350,29 @@ mod tests {
         assert_eq!(p.rope_attn_factor, 1.0);
     }
 
+    /// Review r13 P5: the activation-quantization scratch of an FP8-activation model is sized
+    /// with checked arithmetic — a token count whose `tokens × k` does not fit gives
+    /// `u64::MAX` (which no memory budget holds) and `alloc_act_quant` an error, never a wrapped
+    /// small size or a panic — while a real size is unchanged. Breaks if the product wraps.
+    #[test]
+    fn act_quant_scratch_size_does_not_wrap() {
+        use crate::weights::{ActivationQuant, QuantScheme};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/llama-3.2-3b-instruct");
+        let cfg = crate::config::load_model_config_with(&dir, None).expect("llama config");
+        let mut d = DecoderDims::of(&cfg);
+        d.quant = Some(LinearQuant {
+            scheme: QuantScheme::Fp8Channel,
+            act: ActivationQuant::Fp8PerTokenDynamic,
+        });
+        let k = d.hidden.max(d.q_dim).max(d.inter) as u64;
+        assert_eq!(d.act_quant_bytes(8), 8 * k + 8 * 4);
+        let huge = usize::MAX / 2;
+        assert_eq!(d.act_quant_bytes(huge), u64::MAX);
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 20);
+        assert!(d.alloc_act_quant(huge, &mem).is_err());
+    }
+
     /// The GraphKey formula of main's `LlamaExecutor::launch` / `OlmoeExecutor::launch`
     /// (Phase 2c), written out: `seqs` one-token sequences whose block tables need `blocks`
     /// entries, rows all reduced at `top_n` candidates (0: none reduced), tokens fed from

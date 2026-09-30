@@ -197,15 +197,22 @@ impl DecoderDims {
     }
 
     /// Device bytes of the activation-quantization scratch for `tokens` rows (none for
-    /// BF16 or weight-only layers).
+    /// BF16 or weight-only layers); `u64::MAX` when the size does not fit, so the memory
+    /// budget refuses it instead of sizing a wrapped scratch (review r13 P5).
     pub fn act_quant_bytes(&self, tokens: usize) -> u64 {
         let Some(q) = self.quant else { return 0 };
         let Some(cfg) = self.quantize_act(self.widest_input(), q) else {
             return 0;
         };
-        let k = self.widest_input();
-        (tokens * k * cfg.out_dtype.size_bytes()
-            + cfg.mode.scale_count(tokens, k) * DType::F32.size_bytes()) as u64
+        let k = self.widest_input() as u64;
+        let tokens = tokens as u64;
+        let size = |count: Option<u64>, dtype: DType| {
+            count.and_then(|c| c.checked_mul(dtype.size_bytes() as u64))
+        };
+        size(tokens.checked_mul(k), cfg.out_dtype)
+            .zip(size(scale_count(cfg.mode, tokens, k), DType::F32))
+            .and_then(|(a, b)| a.checked_add(b))
+            .unwrap_or(u64::MAX)
     }
 
     /// The activation-quantization scratch for `tokens` rows: the quantized matrix and its F32
@@ -220,8 +227,14 @@ impl DecoderDims {
         let Some(cfg) = self.quantize_act(k, q) else {
             return Ok(None);
         };
+        let elems = tokens.checked_mul(k).ok_or_else(|| {
+            invalid(format!(
+                "the activation-quantization scratch of {tokens} × {k} does not fit usize"
+            ))
+        })?;
+        // At most one scale per element (`scale_count` ≤ `tokens · k`): no overflow past here.
         Ok(Some((
-            Tensor::empty(mem, &[tokens * k], cfg.out_dtype)?,
+            Tensor::empty(mem, &[elems], cfg.out_dtype)?,
             Tensor::empty(mem, &[cfg.mode.scale_count(tokens, k).max(1)], DType::F32)?,
         )))
     }
@@ -280,12 +293,36 @@ impl DecoderDims {
     }
 }
 
-/// The largest value of an F32 tensor (read back once at load).
+/// The largest value of an F32 static activation-scale tensor (read back once at load): at
+/// least one value, and finite and positive (the loader validated each; an empty tensor would
+/// otherwise give `f32::MIN`; review r13 P4).
 fn largest_f32(t: &Tensor) -> Result<f32, ModelError> {
     let mut bytes = vec![0u8; t.shape.iter().product::<usize>() * 4];
     t.storage.copy_to_host(0, &mut bytes)?;
-    Ok(bytes
+    let values: Vec<f32> = bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .fold(f32::MIN, f32::max))
+        .collect();
+    let largest = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if values.is_empty() || values.iter().any(|v| !(v.is_finite() && *v > 0.0)) {
+        return Err(invalid(format!(
+            "a static activation scale of {} values is not finite and positive (largest \
+             {largest})",
+            values.len()
+        )));
+    }
+    Ok(largest)
+}
+
+/// [`ActQuantDesc::scale_count`] of a `tokens × k` matrix in `u64`, `None` on overflow.
+fn scale_count(mode: ActQuantDesc, tokens: u64, k: u64) -> Option<u64> {
+    match mode {
+        ActQuantDesc::Fp8Tensor => Some(1),
+        ActQuantDesc::Fp8Token => Some(tokens),
+        ActQuantDesc::Fp8Group { group } => tokens.checked_mul(k.div_ceil(u64::from(group.max(1)))),
+        ActQuantDesc::Mxfp4Emulated => {
+            tokens.checked_mul(k.div_ceil(turbine_kernels::quant::MX_BLOCK as u64))
+        }
+        _ => Some(0),
+    }
 }
