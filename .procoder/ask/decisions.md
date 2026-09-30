@@ -2337,3 +2337,15 @@ batch, so the transcode is not the demotion bottleneck and no CK building block 
 `turbine_kv::codec::fp8_e4m3` at the Llama, OLMoE and an odd shape over data with the scale floor, exact ties,
 saturation, subnormals, NaN and infinity (`hip_ops::kv_transcode_matches_cpu`); a mutation that drops the scale
 floor fails it (`encoded block 1 differs from the codec at byte 0`).
+
+## 6b Task 5: `turbine_kv_transcode_desc` fields differ from the spec's interface line (2026-09-30)
+
+Built on `p6b-t5` (2cd30bf). The spec named `{ src_pages, src_dtype, k_scale, v_scale, dst, dst_format, seed, … }`.
+As built, one descriptor serves both directions: `pages` (host array `[num_blocks × layers]` of device page addresses),
+`k_scales` / `v_scales` (device F32 per layer, NULL = 1, since FP8 KV scales are per layer), `coded` (one slot per
+block) with `coded_block_bytes`, `page_dtype`, `format`, `direction`. Spec line, contract §9.1 / §26 already updated.
+
+- A) Accept the built fields; the spec keeps the amended line
+- B) Rename back to the spec's original names (behaviour unchanged)
+
+**Decision (user, 2026-09-30): A.** The built descriptor fields stand; the amended spec line is the interface.
