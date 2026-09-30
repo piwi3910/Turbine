@@ -148,3 +148,61 @@ builder's job):**
   run) — the `rotary.txt` check above is the gate for whether it actually worked end to end.
 - Nothing here touched `support.rs`, `.procoder/`, `ffi.rs`, the kernel header or
   `turbine-model` config/loader/weights, other than reading them.
+
+## r12 p05 investigation (brief-r12-mxfp4-p05.md)
+
+Golden c1/c16 (`target/lab-bench/r12-mxfp4-llama8b-mxfp4/`, commit cb4bd66): 15/16. Only p05 is
+out of bounds (likely 0.3066, tail 6.0156, `missing_top_k` 18476 at position 5), so both are FAIL.
+**Not flipped, tolerance not touched.**
+
+Findings (all runs on GPU 0 under bench.lock, detached scripts
+`/home/piwi/turbine-ci/scratch/p05_{run,ab,batch,trace}.sh`, outputs under
+`/home/piwi/turbine-ci/scratch/p05-mxfp4/`):
+
+1. **One position, only on the decode path.** `turbine-golden positions --url` (teacher-forced,
+   each position a prefill) puts all 32 positions in bounds. The worst is pos 5 tail 0.58 (35304
+   ref −9.33, got −8.74). The free-running capture (decode, greedy history identical 32/32)
+   differs only at pos 5: 108142 −0.0016 → −0.3082, 35304 −9.33 → −3.31, 18476/198/21341 drop
+   out of the top-20 and 46961 enters at −2.96. Positions 0–4 and 6–31 are ≤ ~0.2. The result is
+   deterministic: the same 0.3066/6.0156 in lab-bench c1, c16 and 2× reruns.
+2. **Not a switch.** `decode_graphs`, `device_sampling`, `fused_ops`, `gemm_autotune` off (each,
+   and all four together) give the same numbers (`ab/p05_ab.log`).
+3. **Batch probe** (`batch/base-batch.txt`, pos-5 logprobs of 108142/35304/18476/46961):
+   - prefill (Large tile): −0.0023/−8.74/−9.22/−10.07 at every concurrency;
+   - one decode step on prefill-written KV: −0.007/−7.35/−9.27/−6.36;
+   - five decode steps: Small tile (m ≤ 16) −0.308/−3.31/–/−2.96, Medium (m 17–64)
+     −0.306/−3.37/–/−3.90.
+4. **Op trace** (new `golden.rs mxfp4_decode_vs_prefill_trace`, b62373f;
+   `trace/trace-p05-5.txt`): decode steps (A) against one prefill of the same tokens (B), per
+   layer, on the row predicting pos 5 (position 25).
+   - Layer 0 is bit-identical, MXFP4 GEMMs included. The first difference is layer-1
+     attention, at ~5e-4.
+   - Layers 1–7 stay at ~1e-3 to 1e-2, the same as at step 1 (position 21), where A−B stays
+     ≤ 0.1 through all 32 layers.
+   - From layer 8 the gap roughly doubles per layer: q at layer 16 1.3, resid_attn at layer 31
+     11, final_norm 7.4, logits 8.3.
+   - No single op injects a large error; the state at position 25 amplifies ulp-level
+     differences.
+5. **The cpu-reference provider flips too.** A scalar prefill with sequential f32 sums on the
+   same checkpoint (Turbine's own MXFP4 decode) gives 108142 −0.133, 35304 −4.07, 46961 −3.48:
+   the "bad" state, with no GPU kernel involved. Turbine's HIP prefill and transformers' 4
+   full-sequence variants land in the "good" state; Turbine's HIP decode tiles and its CPU
+   reference land in the "bad" one. So the MXFP4 dequantization is not the cause: the HIP prefill
+   uses the same decoded weights and matches the reference to 0.0007. Step 4 of the brief (the
+   dequantizer vs Turbine decode) was therefore not needed.
+6. **BF16 8B** (its own reference, a different greedy path): p05 is in bounds at c1, both
+   teacher-forced and captured (worst 0.034 / 0.080).
+
+**Verdict: no kernel bug.** p05 position 5 of this checkpoint sits on a numerical knife edge.
+Which state an engine lands in depends on rounding order alone. The spread calibration never saw
+the flip because it ran only the 4 full-sequence variants: the incremental (decode-shaped)
+variants were skipped for 8B, and the reference itself is incremental.
+
+**Open, for the lead (tolerance/design, not built):**
+- (a) Run `self_spread.py` with the incremental variants (at least on p05) on the dequantized
+  copy. If transformers' own decode-shaped variants flip at p05 pos 5, the calibrated tail bound
+  legitimately covers it (or p05 is documented as unjudgeable for this slug).
+- (b) A comparator rule change: allow the logprob bound to fail on at most
+  16 − `min_prompts_passing` prompts instead of requiring it on every prompt. This is global and
+  affects every fixture.
+- (c) Leave `mxfp4` experimental.
