@@ -1562,7 +1562,9 @@ impl KvHierarchy {
             self.prefill_tps,
         );
         // Bringing the block back costs a copy from where it would go, or a recompute when it
-        // would be dropped.
+        // would be dropped. The copy is priced at the L0 block size, like the `memory` term's
+        // `size_bytes`: path estimates are rates per encoded byte, so this overstates the
+        // retrieval of a compressed copy (the planner prices it at its encoded bytes).
         let retrieval = match demotion_target(tier, self.l1.is_some(), self.l2.is_some()) {
             Some(to) => {
                 let path = TransferPath::between(to, TierId::L0).expect("lower tier to L0");

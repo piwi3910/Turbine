@@ -277,12 +277,10 @@ impl TransferEngine {
             if let Ok((took, _)) = &result
                 && ticket.req.purpose != TransferPurpose::Compress
             {
-                // Estimates are per block at the larger end's format (the planner prices a
-                // block by its L0 bytes): a copy of a compressed block moves fewer bytes in
-                // about the same per-copy time, and must not read as a slower path.
-                let c = ticket.req.codec;
-                let logical = ticket.req.bytes.max(c.from_bytes).max(c.to_bytes);
-                self.observe(ticket.req.path, logical, *took);
+                // Estimates are rates per encoded byte, the bytes the copy moved (the smaller
+                // end's, `req.bytes`): the planner and the eviction score price a copy at its
+                // encoded size (P6b S-3, decision A), so the compression saving counts once.
+                self.observe(ticket.req.path, ticket.req.bytes, *took);
             }
             let owner_cancelled = ticket
                 .req
@@ -369,14 +367,21 @@ impl TransferEngine {
         self.queued.is_empty() && self.inflight.is_empty()
     }
 
-    /// Folds one completed copy into its path's EWMAs. A single copy cannot separate latency
-    /// from bandwidth, so bandwidth is the effective rate (bytes over the whole duration, which
-    /// errs slow) and latency is what the duration leaves beyond the current bandwidth estimate.
+    /// Folds one completed copy of `bytes` encoded bytes into its path's EWMAs, keeping the
+    /// estimate `latency + bytes / bandwidth` linear in the moved bytes (P6b S-3: one path
+    /// carries L0-format and compressed copies of very different sizes). A single copy cannot
+    /// separate latency from bandwidth, so the bandwidth sample is the rate over the duration
+    /// the current latency estimate leaves, taken only when that is at least half the copy
+    /// (a latency-bound copy says little about the rate), and latency is what the duration
+    /// leaves beyond the current bandwidth estimate.
     fn observe(&mut self, path: TransferPath, bytes: u64, took: Duration) {
         let secs = took.as_secs_f64().max(1e-9);
         let e = &mut self.estimates[path.index()];
+        let moving = secs - e.latency_s.clamp(0.0, secs);
+        if moving >= secs / 2.0 {
+            e.bandwidth_bps = (1.0 - ALPHA) * e.bandwidth_bps + ALPHA * (bytes as f64 / moving);
+        }
         let latency = (secs - bytes as f64 / e.bandwidth_bps.max(1.0)).clamp(0.0, secs);
-        e.bandwidth_bps = (1.0 - ALPHA) * e.bandwidth_bps + ALPHA * (bytes as f64 / secs);
         e.latency_s = (1.0 - ALPHA) * e.latency_s + ALPHA * latency;
     }
 
@@ -619,6 +624,77 @@ mod tests {
             TransferPath::L1ToL0.fallback(),
             "completions update the estimate"
         );
+    }
+
+    /// P6b S-3 (decision "6b Task 4: planner copy bytes", A): the planner prices a copy at the
+    /// block's encoded bytes (`PlanInputs.copy_bytes`), so estimates are rates per encoded
+    /// (moved) byte. Breaks if completions of compressed copies are observed at the decoded
+    /// size, which would count the compression saving twice.
+    #[test]
+    fn estimates_are_per_encoded_byte() {
+        let (fake, clock) = fake();
+        let mut engine = TransferEngine::new(GIB, 16, clock.clone());
+        let mut backend = SimTransferBackend::new(clock, None, None, 0);
+        let cost = PathCost {
+            latency_s: 0.0,
+            bandwidth_bps: 1e9,
+        };
+        backend.set_cost(TransferPath::L1ToL0, cost);
+        // A tq4-sized copy (1 MB moved) decoded into a 4 MB L0 block.
+        let encoded = 1_000_000;
+        for i in 0..64u8 {
+            let mut req = request(TransferPath::L1ToL0, i, encoded, None);
+            req.codec = TransferCodec {
+                from: "tq4",
+                from_bytes: encoded,
+                to: crate::tier::L0_FORMAT,
+                to_bytes: 4 * encoded,
+            };
+            engine.submit(req).unwrap();
+            engine.pump(&mut backend);
+            fake.advance(Duration::from_secs_f64(cost.block_seconds(encoded)));
+            assert_eq!(engine.pump(&mut backend).len(), 1);
+        }
+        let est = engine.estimate(TransferPath::L1ToL0);
+        let (want, got) = (cost.block_seconds(encoded), est.block_seconds(encoded));
+        assert!(
+            (got - want).abs() < want * 0.05,
+            "the estimate prices the encoded bytes at the moved rate: {got} s vs {want} s ({est:?})"
+        );
+    }
+
+    /// Copies of mixed encoded sizes (L0-format and compressed blocks on one path) keep the
+    /// estimate linear in the bytes: latency is not folded into the per-byte rate, so small,
+    /// latency-bound copies do not make a full-size block look slower than it is. Breaks if the
+    /// bandwidth sample includes the latency (a full block then prices ~50 % slow here).
+    #[test]
+    fn mixed_copy_sizes_keep_latency_out_of_the_rate() {
+        let (fake, clock) = fake();
+        let mut engine = TransferEngine::new(GIB, 16, clock.clone());
+        let mut backend = SimTransferBackend::new(clock, None, None, 0);
+        let path = TransferPath::L2ToL0;
+        let cost = path.fallback();
+        assert_eq!(
+            engine.estimate(path),
+            cost,
+            "estimates start at the fallback"
+        );
+        let (full, small) = (1_835_008u64, 131_072u64);
+        for i in 0..64u8 {
+            let bytes = if i % 4 == 0 { full } else { small };
+            engine.submit(request(path, i, bytes, None)).unwrap();
+            engine.pump(&mut backend);
+            fake.advance(Duration::from_secs_f64(cost.block_seconds(bytes)));
+            assert_eq!(engine.pump(&mut backend).len(), 1);
+        }
+        let est = engine.estimate(path);
+        for bytes in [full, small] {
+            let (want, got) = (cost.block_seconds(bytes), est.block_seconds(bytes));
+            assert!(
+                (got - want).abs() < want * 0.05,
+                "{bytes} B: {got} s vs {want} s ({est:?})"
+            );
+        }
     }
 
     #[test]
