@@ -21,12 +21,14 @@ pub const TIER_L0: &str = "l0";
 
 type Labels1 = [(&'static str, &'static str); 1];
 type Labels2 = [(&'static str, &'static str); 2];
+type Labels4 = [(&'static str, &'static str); 4];
 
 /// Why a copy left a tier (or its rung). `turbine_kv_evictions_total{reason}` uses the first
 /// five; `turbine_kv_drops_total{reason}` (a block gone from every tier) adds `below_min_value`
 /// and `no_room`. The compression ladder (P6b S-6) adds `compressed` (a copy rewritten one rung
-/// down) and `ladder_floor` (evicted at `kv.ladder.max_format`), [`EvictReason::LADDER`]; they
-/// join the pre-registered label sets when the hierarchy applies the ladder (plan Task 15).
+/// down) and `ladder_floor` (evicted at `kv.ladder.max_format`), [`EvictReason::LADDER`]:
+/// pre-registered on `turbine_kv_evictions_total` (both) and `turbine_kv_drops_total`
+/// (`ladder_floor`).
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EvictReason {
@@ -78,6 +80,45 @@ impl EvictReason {
     }
 }
 
+/// Why the compression ladder acted (`turbine_kv_ladder_actions_total{reason}`, P6b S-6): a
+/// copy rewritten one rung down by the ladder's sweep of a tier under pressure
+/// (`fill_high_water`) or instead of being dropped from the lowest tier (`would_drop`), a
+/// demotion stored at the tier's ladder rung instead of its configured format
+/// (`new_demotion`), the tier's rung for new demotions stepping back up after the dwell
+/// (`rung_step_up`), a copy evicted at the lossiest rung (`floor_evict`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LadderReason {
+    FillHighWater,
+    WouldDrop,
+    NewDemotion,
+    RungStepUp,
+    FloorEvict,
+}
+
+impl LadderReason {
+    pub const ALL: [LadderReason; 5] = [
+        LadderReason::FillHighWater,
+        LadderReason::WouldDrop,
+        LadderReason::NewDemotion,
+        LadderReason::RungStepUp,
+        LadderReason::FloorEvict,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LadderReason::FillHighWater => "fill_high_water",
+            LadderReason::WouldDrop => "would_drop",
+            LadderReason::NewDemotion => "new_demotion",
+            LadderReason::RungStepUp => "rung_step_up",
+            LadderReason::FloorEvict => "floor_evict",
+        }
+    }
+}
+
+/// The `to` label of a `floor_evict` ladder action: the copy left the tier.
+pub const LADDER_EVICT: &str = "evict";
+
 /// Outcome of one prefetched block (`turbine_kv_prefetch_total{outcome}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PrefetchOutcome {
@@ -113,6 +154,10 @@ pub struct KvMetrics {
     pub bytes: GaugeFamilyShare<Labels2>,
     pub lookups: Family<Labels1, Counter>,
     pub prefix_cached_tokens: Counter,
+    /// P6b S-3: prompt tokens served from lossy cached blocks.
+    pub lossy_cached_tokens: Counter,
+    /// P6b S-3: lookups a lossy-reuse opt-out cut at a block only a lossy copy held.
+    pub lossy_denied: Counter,
     pub prompt_tokens: Counter,
     pub promotions: Family<Labels2, Counter>,
     pub demotions: Family<Labels2, Counter>,
@@ -128,6 +173,11 @@ pub struct KvMetrics {
     pub tier_degraded: Family<Labels1, Gauge>,
     pub storage_queue_depth: GaugeShare,
     pub storage_latency: Histogram,
+    /// `turbine_kv_ladder_rung{tier}`: rung index (registration order of the `kv_format`
+    /// codecs: 0 `l0`, 1 `fp8_e4m3`, 2 `tq4`, 3 `tq2`) new demotions into the tier take.
+    pub ladder_rung: Family<Labels1, Gauge>,
+    /// `turbine_kv_ladder_actions_total{tier,from,to,reason}` (P6b S-6).
+    pub ladder_actions: Family<Labels4, Counter>,
 }
 
 /// 10 µs .. ~42 s in ×4 steps: covers pinned copies of one block through slow NVMe reads.
@@ -143,6 +193,8 @@ impl KvMetrics {
             bytes: GaugeFamilyShare::new(Family::default()),
             lookups: Family::default(),
             prefix_cached_tokens: Counter::default(),
+            lossy_cached_tokens: Counter::default(),
+            lossy_denied: Counter::default(),
             prompt_tokens: Counter::default(),
             promotions: Family::default(),
             demotions: Family::default(),
@@ -158,6 +210,8 @@ impl KvMetrics {
             tier_degraded: Family::default(),
             storage_queue_depth: GaugeShare::default(),
             storage_latency: latency_histogram(),
+            ladder_rung: Family::default(),
+            ladder_actions: Family::default(),
         }
     }
 
@@ -183,6 +237,16 @@ impl KvMetrics {
             "turbine_kv_prefix_cached_tokens",
             "Prompt tokens served from cached prefixes",
             m.prefix_cached_tokens.clone(),
+        );
+        reg.register(
+            "turbine_kv_lossy_cached_tokens",
+            "Prompt tokens served from lossy cached KV blocks",
+            m.lossy_cached_tokens.clone(),
+        );
+        reg.register(
+            "turbine_kv_lossy_denied",
+            "Prefix lookups cut at a lossy block by a lossy-reuse opt-out",
+            m.lossy_denied.clone(),
         );
         reg.register(
             "turbine_kv_prompt_tokens",
@@ -259,6 +323,16 @@ impl KvMetrics {
             "Latency of one L2 NVMe I/O operation",
             m.storage_latency.clone(),
         );
+        reg.register(
+            "turbine_kv_ladder_rung",
+            "Compression ladder rung new demotions into a tier take (0 l0, 1 fp8_e4m3, 2 tq4, 3 tq2)",
+            m.ladder_rung.clone(),
+        );
+        reg.register(
+            "turbine_kv_ladder_actions",
+            "Compression ladder actions, by tier, formats and reason",
+            m.ladder_actions.clone(),
+        );
         m.init_labels();
         m
     }
@@ -286,10 +360,42 @@ impl KvMetrics {
             }
             let _ = self.lookups.get_or_create(&[("result", t.as_str())]);
             let _ = self.tier_degraded.get_or_create(&[("tier", t.as_str())]);
-            for r in EvictReason::EVICTION {
+            for r in EvictReason::EVICTION.into_iter().chain(EvictReason::LADDER) {
                 let _ = self
                     .evictions
                     .get_or_create(&[("tier", t.as_str()), ("reason", r.as_str())]);
+            }
+            let _ = self.ladder_rung.get_or_create(&[("tier", t.as_str())]);
+        }
+        let _ = self
+            .drops
+            .get_or_create(&[("reason", EvictReason::LadderFloor.as_str())]);
+        // The ladder's one-rung moves of L1 and L2 (P6b S-6): each adjacent pair of the
+        // `kv_format` codecs down (sweep, would-drop) and up (dwell), and the floor eviction.
+        let rungs: Vec<&'static str> = crate::codec::registry().iter().map(|c| c.name()).collect();
+        for t in [TierId::L1, TierId::L2] {
+            for pair in rungs.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                for (from, to, r) in [
+                    (a, b, LadderReason::FillHighWater),
+                    (a, b, LadderReason::WouldDrop),
+                    (b, a, LadderReason::RungStepUp),
+                ] {
+                    let _ = self.ladder_actions.get_or_create(&[
+                        ("tier", t.as_str()),
+                        ("from", from),
+                        ("to", to),
+                        ("reason", r.as_str()),
+                    ]);
+                }
+            }
+            if let Some(last) = rungs.last() {
+                let _ = self.ladder_actions.get_or_create(&[
+                    ("tier", t.as_str()),
+                    ("from", last),
+                    ("to", LADDER_EVICT),
+                    ("reason", LadderReason::FloorEvict.as_str()),
+                ]);
             }
         }
         let _ = self.lookups.get_or_create(&[("result", "miss")]);
@@ -406,6 +512,56 @@ impl KvMetrics {
             .set(bandwidth_ewma);
     }
 
+    /// The rung new demotions into `tier` take (a registered codec name).
+    pub fn set_ladder_rung(&self, tier: TierId, rung: &str) {
+        let index = crate::codec::rung_index(rung).unwrap_or(0);
+        self.ladder_rung
+            .get_or_create(&[("tier", tier.as_str())])
+            .set(i64::try_from(index).unwrap_or(0));
+    }
+
+    /// One ladder action on a copy of `tier` (or its rung) from codec `from` to codec `to`
+    /// ([`LADDER_EVICT`] for a floor eviction).
+    pub fn ladder_action(&self, tier: TierId, from: &str, to: &str, reason: LadderReason) {
+        // Label values must be `'static`: codec names come from the registry.
+        let name = |f: &str| -> &'static str {
+            crate::codec::registry().get(f).map_or(
+                if f == LADDER_EVICT {
+                    LADDER_EVICT
+                } else {
+                    "unknown"
+                },
+                |c| c.name(),
+            )
+        };
+        self.ladder_actions
+            .get_or_create(&[
+                ("tier", tier.as_str()),
+                ("from", name(from)),
+                ("to", name(to)),
+                ("reason", reason.as_str()),
+            ])
+            .inc();
+    }
+
+    /// Current `turbine_kv_ladder_actions_total` value of one series.
+    pub fn ladder_actions_value(
+        &self,
+        tier: TierId,
+        from: &'static str,
+        to: &'static str,
+        reason: LadderReason,
+    ) -> u64 {
+        self.ladder_actions
+            .get_or_create(&[
+                ("tier", tier.as_str()),
+                ("from", from),
+                ("to", to),
+                ("reason", reason.as_str()),
+            ])
+            .get()
+    }
+
     pub fn set_degraded(&self, tier: TierId, degraded: bool) {
         self.tier_degraded
             .get_or_create(&[("tier", tier.as_str())])
@@ -478,6 +634,8 @@ mod tests {
             "turbine_kv_bytes{",
             "turbine_kv_lookups_total{",
             "turbine_kv_prefix_cached_tokens_total",
+            "turbine_kv_lossy_cached_tokens_total 0",
+            "turbine_kv_lossy_denied_total 0",
             "turbine_kv_prompt_tokens_total",
             "turbine_kv_promotions_total{",
             "turbine_kv_demotions_total{",
@@ -507,8 +665,8 @@ mod tests {
         assert!(!text.contains(r#"turbine_kv_evictions_total{tier="l0",reason="no_room"}"#));
     }
 
-    /// The ladder's reason codes render as the spec's label values and are not yet part of the
-    /// pre-registered sets (plan Task 15 adds them with the hierarchy wiring).
+    /// The ladder's reason codes render as the spec's label values and stay out of the Phase 4
+    /// constant sets (`init_labels` pre-registers them beside those, [`ladder_families`]).
     #[test]
     fn ladder_reasons() {
         let labels: Vec<&str> = EvictReason::LADDER.iter().map(|r| r.as_str()).collect();
@@ -516,5 +674,39 @@ mod tests {
         for r in EvictReason::LADDER {
             assert!(!EvictReason::EVICTION.contains(&r) && !EvictReason::ALL.contains(&r));
         }
+    }
+
+    /// P6b S-6: the ladder families render from startup (the rung per tier at 0, the eviction
+    /// and drop reasons pre-registered) and count with the spec's label values only.
+    #[test]
+    fn ladder_families() {
+        let reg = MetricsRegistry::new();
+        let m = KvMetrics::register(&reg);
+        m.set_ladder_rung(TierId::L2, "tq4");
+        m.ladder_action(TierId::L2, "l0", "fp8_e4m3", LadderReason::FillHighWater);
+        m.ladder_action(TierId::L2, "tq2", LADDER_EVICT, LadderReason::FloorEvict);
+        let text = reg.render().unwrap();
+        for line in [
+            r#"turbine_kv_ladder_rung{tier="l1"} 0"#,
+            r#"turbine_kv_ladder_rung{tier="l2"} 2"#,
+            r#"turbine_kv_evictions_total{tier="l1",reason="compressed"} 0"#,
+            r#"turbine_kv_evictions_total{tier="l2",reason="ladder_floor"} 0"#,
+            r#"turbine_kv_drops_total{reason="ladder_floor"} 0"#,
+            r#"turbine_kv_ladder_actions_total{tier="l2",from="l0",to="fp8_e4m3",reason="fill_high_water"} 1"#,
+            r#"turbine_kv_ladder_actions_total{tier="l2",from="tq2",to="evict",reason="floor_evict"} 1"#,
+        ] {
+            assert!(text.contains(line), "{line} missing from:\n{text}");
+        }
+        let labels: Vec<&str> = LadderReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "fill_high_water",
+                "would_drop",
+                "new_demotion",
+                "rung_step_up",
+                "floor_evict"
+            ]
+        );
     }
 }

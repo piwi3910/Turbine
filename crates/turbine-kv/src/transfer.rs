@@ -96,6 +96,12 @@ pub enum TransferPurpose {
     Demote,
     Promote,
     Prefetch,
+    /// A compression-ladder rewrite (P6b S-6): the copy in `path.from()` is re-encoded from
+    /// `codec.from` to `codec.to` and stored back in the same tier under the same key. `path`
+    /// is that tier's path to L0, the route a device transcode stages the block through; the
+    /// rewrite is not a copy between tiers, so it feeds neither the path's estimate nor its
+    /// transfer metrics.
+    Compress,
 }
 
 impl TransferPurpose {
@@ -104,6 +110,7 @@ impl TransferPurpose {
             TransferPurpose::Demote => "demote",
             TransferPurpose::Promote => "promote",
             TransferPurpose::Prefetch => "prefetch",
+            TransferPurpose::Compress => "compress",
         }
     }
 }
@@ -267,7 +274,12 @@ impl TransferEngine {
                 Err(e) => Err(e),
             };
             self.inflight_bytes -= ticket.req.bytes;
-            if let Ok((took, _)) = &result {
+            if let Ok((took, _)) = &result
+                && ticket.req.purpose != TransferPurpose::Compress
+            {
+                // Estimates are rates per encoded byte, the bytes the copy moved (the smaller
+                // end's, `req.bytes`): the planner and the eviction score price a copy at its
+                // encoded size (P6b S-3, decision A), so the compression saving counts once.
                 self.observe(ticket.req.path, ticket.req.bytes, *took);
             }
             let owner_cancelled = ticket
@@ -355,14 +367,21 @@ impl TransferEngine {
         self.queued.is_empty() && self.inflight.is_empty()
     }
 
-    /// Folds one completed copy into its path's EWMAs. A single copy cannot separate latency
-    /// from bandwidth, so bandwidth is the effective rate (bytes over the whole duration, which
-    /// errs slow) and latency is what the duration leaves beyond the current bandwidth estimate.
+    /// Folds one completed copy of `bytes` encoded bytes into its path's EWMAs, keeping the
+    /// estimate `latency + bytes / bandwidth` linear in the moved bytes (P6b S-3: one path
+    /// carries L0-format and compressed copies of very different sizes). A single copy cannot
+    /// separate latency from bandwidth, so the bandwidth sample is the rate over the duration
+    /// the current latency estimate leaves, taken only when that is at least half the copy
+    /// (a latency-bound copy says little about the rate), and latency is what the duration
+    /// leaves beyond the current bandwidth estimate.
     fn observe(&mut self, path: TransferPath, bytes: u64, took: Duration) {
         let secs = took.as_secs_f64().max(1e-9);
         let e = &mut self.estimates[path.index()];
+        let moving = secs - e.latency_s.clamp(0.0, secs);
+        if moving >= secs / 2.0 {
+            e.bandwidth_bps = (1.0 - ALPHA) * e.bandwidth_bps + ALPHA * (bytes as f64 / moving);
+        }
         let latency = (secs - bytes as f64 / e.bandwidth_bps.max(1.0)).clamp(0.0, secs);
-        e.bandwidth_bps = (1.0 - ALPHA) * e.bandwidth_bps + ALPHA * (bytes as f64 / secs);
         e.latency_s = (1.0 - ALPHA) * e.latency_s + ALPHA * latency;
     }
 
@@ -393,7 +412,8 @@ impl TransferEngine {
 
 /// Virtual-time backend for tests and `turbine-bench kv-sim`: a copy completes once
 /// latency + bytes / bandwidth of its path has passed on the clock, then moves the block between
-/// the host tiers with get/put. L0, and any host tier not given to the simulator, holds no
+/// the host tiers with get/put, and reports that modelled time as its duration (`took`), not
+/// the time until the poll that sees it done. L0, and any host tier not given to the simulator, holds no
 /// bytes: a copy out of it reads zeros and a copy into it lands in `dst_slot`.
 pub struct SimTransferBackend {
     clock: Arc<dyn Clock>,
@@ -404,7 +424,10 @@ pub struct SimTransferBackend {
     /// False when built with `block_bytes` 0: the tiers are payload-free and copies move no
     /// bytes (a payload-free `MemTier` accounts the logical size `put_as` names).
     payload: bool,
-    due: HashMap<u64, Duration>,
+    /// Per ticket: when the copy completes and how long it takes.
+    due: HashMap<u64, (Duration, Duration)>,
+    /// Durations of copies `poll` just completed, until `took` reads them.
+    took: HashMap<u64, Duration>,
     fail_next: u32,
 }
 
@@ -423,6 +446,7 @@ impl SimTransferBackend {
             scratch: Vec::with_capacity(block_bytes),
             payload: block_bytes > 0,
             due: HashMap::new(),
+            took: HashMap::new(),
             fail_next: 0,
         }
     }
@@ -448,7 +472,13 @@ impl SimTransferBackend {
     /// (`codec.to_bytes`, labelled `codec.to`). The simulator does not transcode: when the
     /// sizes differ, the destination holds the source bytes cut or zero-padded to its size.
     fn move_block(&self, req: &TransferRequest, buf: &mut Vec<u8>) -> Result<TierSlot, TierError> {
-        let (src, dst) = (self.tier(req.path.from()), self.tier(req.path.to()));
+        let src = self.tier(req.path.from());
+        // A ladder rewrite stores the re-encoded copy back in its own tier.
+        let dst = if req.purpose == TransferPurpose::Compress {
+            src
+        } else {
+            self.tier(req.path.to())
+        };
         if src.is_none() && dst.is_none() {
             return Ok(TierSlot(req.dst_slot));
         }
@@ -479,13 +509,13 @@ impl SimTransferBackend {
 impl TransferBackend for SimTransferBackend {
     fn start(&mut self, t: &TransferTicket) -> Result<(), TierError> {
         let secs = self.costs[t.req.path.index()].block_seconds(t.req.bytes);
-        let due = self.clock.now_mono() + Duration::from_secs_f64(secs.max(0.0));
-        self.due.insert(t.id, due);
+        let took = Duration::from_secs_f64(secs.max(0.0));
+        self.due.insert(t.id, (self.clock.now_mono() + took, took));
         Ok(())
     }
 
     fn poll(&mut self, t: &TransferTicket) -> Result<Option<TierSlot>, TierError> {
-        let due = *self.due.get(&t.id).ok_or(TierError::Missing)?;
+        let (due, took) = *self.due.get(&t.id).ok_or(TierError::Missing)?;
         if self.clock.now_mono() < due {
             return Ok(None);
         }
@@ -497,7 +527,14 @@ impl TransferBackend for SimTransferBackend {
         let mut buf = std::mem::take(&mut self.scratch);
         let result = self.move_block(&t.req, &mut buf);
         self.scratch = buf;
+        if result.is_ok() {
+            self.took.insert(t.id, took);
+        }
         result.map(Some)
+    }
+
+    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
+        self.took.remove(&t.id)
     }
 }
 
@@ -599,6 +636,110 @@ mod tests {
             TransferPath::L1ToL0.fallback(),
             "completions update the estimate"
         );
+    }
+
+    /// P6b S-3 (decision "6b Task 4: planner copy bytes", A): the planner prices a copy at the
+    /// block's encoded bytes (`PlanInputs.copy_bytes`), so estimates are rates per encoded
+    /// (moved) byte. Breaks if completions of compressed copies are observed at the decoded
+    /// size, which would count the compression saving twice.
+    #[test]
+    fn estimates_are_per_encoded_byte() {
+        let (fake, clock) = fake();
+        let mut engine = TransferEngine::new(GIB, 16, clock.clone());
+        let mut backend = SimTransferBackend::new(clock, None, None, 0);
+        let cost = PathCost {
+            latency_s: 0.0,
+            bandwidth_bps: 1e9,
+        };
+        backend.set_cost(TransferPath::L1ToL0, cost);
+        // A tq4-sized copy (1 MB moved) decoded into a 4 MB L0 block.
+        let encoded = 1_000_000;
+        for i in 0..64u8 {
+            let mut req = request(TransferPath::L1ToL0, i, encoded, None);
+            req.codec = TransferCodec {
+                from: "tq4",
+                from_bytes: encoded,
+                to: crate::tier::L0_FORMAT,
+                to_bytes: 4 * encoded,
+            };
+            engine.submit(req).unwrap();
+            engine.pump(&mut backend);
+            fake.advance(Duration::from_secs_f64(cost.block_seconds(encoded)));
+            assert_eq!(engine.pump(&mut backend).len(), 1);
+        }
+        let est = engine.estimate(TransferPath::L1ToL0);
+        let (want, got) = (cost.block_seconds(encoded), est.block_seconds(encoded));
+        assert!(
+            (got - want).abs() < want * 0.05,
+            "the estimate prices the encoded bytes at the moved rate: {got} s vs {want} s ({est:?})"
+        );
+    }
+
+    /// Copies of mixed encoded sizes (L0-format and compressed blocks on one path) keep the
+    /// estimate linear in the bytes: latency is not folded into the per-byte rate, so small,
+    /// latency-bound copies do not make a full-size block look slower than it is. Breaks if the
+    /// bandwidth sample includes the latency (a full block then prices ~50 % slow here).
+    #[test]
+    fn mixed_copy_sizes_keep_latency_out_of_the_rate() {
+        let (fake, clock) = fake();
+        let mut engine = TransferEngine::new(GIB, 16, clock.clone());
+        let mut backend = SimTransferBackend::new(clock, None, None, 0);
+        let path = TransferPath::L2ToL0;
+        let cost = path.fallback();
+        assert_eq!(
+            engine.estimate(path),
+            cost,
+            "estimates start at the fallback"
+        );
+        let (full, small) = (1_835_008u64, 131_072u64);
+        for i in 0..64u8 {
+            let bytes = if i % 4 == 0 { full } else { small };
+            engine.submit(request(path, i, bytes, None)).unwrap();
+            engine.pump(&mut backend);
+            fake.advance(Duration::from_secs_f64(cost.block_seconds(bytes)));
+            assert_eq!(engine.pump(&mut backend).len(), 1);
+        }
+        let est = engine.estimate(path);
+        for bytes in [full, small] {
+            let (want, got) = (cost.block_seconds(bytes), est.block_seconds(bytes));
+            assert!(
+                (got - want).abs() < want * 0.05,
+                "{bytes} B: {got} s vs {want} s ({est:?})"
+            );
+        }
+    }
+
+    /// The simulator's copies are timed by the simulator, not by the poll that sees them done:
+    /// polled at 1 ms iteration boundaries, a compressed L2 → L0 copy (0.39 ms) looked like 1 ms
+    /// and an fp8 one (1.02 ms) like 2 ms, which dragged the path's per-byte rate down until a
+    /// full block priced above recomputing it (kv_sim `ladder_under_pinned_pressure`). Breaks if
+    /// `SimTransferBackend` stops reporting the copy time it models.
+    #[test]
+    fn simulated_copies_are_timed_by_the_simulator() {
+        let (fake, clock) = fake();
+        let mut engine = TransferEngine::new(GIB, 16, clock.clone());
+        let mut backend = SimTransferBackend::new(clock, None, None, 0);
+        let path = TransferPath::L2ToL0;
+        let cost = path.fallback();
+        let sizes = [1_835_008u64, 917_728, 286_720];
+        for i in 0..96u8 {
+            let bytes = sizes[i as usize % sizes.len()];
+            engine.submit(request(path, i, bytes, None)).unwrap();
+            engine.pump(&mut backend);
+            let mut done = 0;
+            while done == 0 {
+                fake.advance(Duration::from_millis(1));
+                done = engine.pump(&mut backend).len();
+            }
+        }
+        let est = engine.estimate(path);
+        for bytes in sizes {
+            let (want, got) = (cost.block_seconds(bytes), est.block_seconds(bytes));
+            assert!(
+                (got - want).abs() < want * 0.05,
+                "{bytes} B: {got} s vs {want} s ({est:?})"
+            );
+        }
     }
 
     #[test]

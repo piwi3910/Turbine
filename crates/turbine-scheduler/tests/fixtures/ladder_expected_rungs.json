@@ -1,0 +1,56 @@
+[
+  {
+    "step": 2266,
+    "tier": "l1",
+    "from": "l0",
+    "to": "fp8_e4m3"
+  },
+  {
+    "step": 2266,
+    "tier": "l2",
+    "from": "l0",
+    "to": "fp8_e4m3"
+  },
+  {
+    "step": 3620,
+    "tier": "l2",
+    "from": "fp8_e4m3",
+    "to": "tq4"
+  },
+  {
+    "step": 3661,
+    "tier": "l2",
+    "from": "tq4",
+    "to": "tq2"
+  },
+  {
+    "step": 3691,
+    "tier": "l1",
+    "from": "fp8_e4m3",
+    "to": "tq4"
+  },
+  {
+    "step": 4010,
+    "tier": "l1",
+    "from": "tq4",
+    "to": "tq2"
+  },
+  {
+    "step": 5111,
+    "tier": "l2",
+    "from": "tq2",
+    "to": "tq4"
+  },
+  {
+    "step": 5740,
+    "tier": "l2",
+    "from": "tq4",
+    "to": "fp8_e4m3"
+  },
+  {
+    "step": 6260,
+    "tier": "l2",
+    "from": "fp8_e4m3",
+    "to": "l0"
+  }
+]

@@ -47,11 +47,9 @@ use smallvec::SmallVec;
 use tokio::sync::{mpsc, oneshot};
 use turbine_core::clock::Clock;
 use turbine_core::config::KvConfig;
-use turbine_core::request::SessionHints;
 use turbine_core::telemetry::{StorageProbe, StorageSample};
 use turbine_core::types::{
-    BlockId, DType, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, Priority,
-    RequestId,
+    BlockId, DType, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, RequestId,
 };
 use turbine_kv::codec::{CodecParams, KvCodec};
 use turbine_kv::document::HitWindow;
@@ -66,7 +64,9 @@ use turbine_kv::tier::{
     KvTier, L0_FORMAT, L1Config, L1PinnedTier, L2Config, L2NvmeTier, ShardSlots, ShardedL1Tier,
     TierBlockMut, TierBlockRef, TierError, TierId, TierSlot,
 };
-use turbine_kv::transfer::{TransferBackend, TransferCodec, TransferPath, TransferTicket};
+use turbine_kv::transfer::{
+    TransferBackend, TransferCodec, TransferPath, TransferPurpose, TransferTicket,
+};
 use turbine_kv::{BlockPool, KvDocument, KvMetrics};
 use turbine_model::kv_scales::KvCache;
 use turbine_tensor::{
@@ -588,6 +588,11 @@ impl KvOrchestrator {
         Ok((o, KvHandle { tx }))
     }
 
+    /// `reliability.pressure.deescalate_dwell`: the compression ladder's step-up dwell (P6b S-6).
+    pub fn set_ladder_dwell(&mut self, dwell: Duration) {
+        self.h.set_ladder_dwell(dwell);
+    }
+
     /// The lock-free reclaim requests the Phase 3 controller issues (`KvReclaimer`).
     pub fn reclaimer(&self) -> Arc<KvReclaimHandle> {
         self.h.reclaimer()
@@ -599,27 +604,10 @@ impl KvOrchestrator {
     }
 
     /// Admission-time prefix match of a request (P4 S-3).
-    pub fn attach(
-        &mut self,
-        pool: &mut BlockPool,
-        request: RequestId,
-        prompt: &[u32],
-        cache_salt: &str,
-        session: Option<&SessionHints>,
-        priority: Priority,
-    ) -> AttachOutcome {
-        let outcome = self.h.attach_prefix(
-            pool,
-            &AttachRequest {
-                request,
-                prompt,
-                cache_salt,
-                session,
-                priority,
-            },
-        );
+    pub fn attach(&mut self, pool: &mut BlockPool, req: &AttachRequest<'_>) -> AttachOutcome {
+        let outcome = self.h.attach_prefix(pool, req);
         if let AttachOutcome::Ready(a) = &outcome {
-            self.record_hit(prompt.len(), a);
+            self.record_hit(req.prompt.len(), a);
         }
         outcome
     }
@@ -1056,7 +1044,7 @@ enum IoOp {
 }
 
 /// The L0 layout and codec parameters the host path encodes and decodes tier copies with (P6b
-/// S-1: the reference `encode_cpu` / `decode_cpu` on the I/O threads, until the v2.10 GPU
+/// S-1: the reference `encode_cpu` / `decode_cpu` on the I/O threads, until the v2.11 GPU
 /// transcode). Only for one logical block of one shard: startup refuses a lower-tier format
 /// other than `l0` under tensor or pipeline parallelism.
 #[derive(Clone, Debug)]
@@ -1336,8 +1324,15 @@ impl IoPoolBackend {
 }
 
 impl TransferBackend for IoPoolBackend {
+    /// An L1 ↔ L2 copy, or a ladder rewrite (P6b S-6: the copy re-encoded by the host codec
+    /// and stored back in its own tier) of an L1 or L2 copy.
     fn start(&mut self, t: &TransferTicket) -> Result<(), TierError> {
-        let (from, to) = (t.req.path.from(), t.req.path.to());
+        let from = t.req.path.from();
+        let to = if t.req.purpose == TransferPurpose::Compress {
+            from
+        } else {
+            t.req.path.to()
+        };
         let (Some(from), Some(to)) = (self.tier(from), self.tier(to)) else {
             return Err(TierError::Missing);
         };
@@ -1647,6 +1642,13 @@ impl CopyStreamBackend {
 
     fn start_job(&mut self, t: &TransferTicket) -> Result<Job, TierError> {
         let req = &t.req;
+        if req.purpose == TransferPurpose::Compress {
+            // A ladder rewrite runs on the I/O pool with the host codec (the v2.11 device
+            // transcode through staging replaces it with P6b Task 5); the ladder is refused at
+            // startup until then.
+            self.io.start(t)?;
+            return Ok(Job::Io(IoStage::Final));
+        }
         match req.path {
             TransferPath::L1ToL2 | TransferPath::L2ToL1 => {
                 self.io.start(t)?;
@@ -1654,7 +1656,7 @@ impl CopyStreamBackend {
             }
             TransferPath::L0ToL1 | TransferPath::L1ToL0 if !req.codec.is_identity() => {
                 // Copy-stream L1 slots hold what the device pages hold: another format needs the
-                // v2.10 GPU transcode (P6b Task 5), which startup requires first.
+                // v2.11 GPU transcode (P6b Task 5), which startup requires first.
                 Err(TierError::Io(format!(
                     "the L1 copy stream moves L0-format blocks only, not {} → {}",
                     req.codec.from, req.codec.to

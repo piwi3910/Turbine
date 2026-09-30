@@ -1899,6 +1899,7 @@ mod tests {
             deadline_ms: u64::MAX,
             session: None,
             cache_salt: None,
+            kv_policy: None,
             endpoint: Endpoint::Completions,
             http_request_id: "t".into(),
             prompt_tokens: prompt,
