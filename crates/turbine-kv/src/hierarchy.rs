@@ -3229,8 +3229,8 @@ pub(crate) mod tests {
         };
         assert_eq!(a.cached_tokens, 64, "all four blocks reused");
         assert_eq!(
-            a.lossy_tokens, 48,
-            "the three promoted blocks are served lossy"
+            a.lossy_tokens, 32,
+            "the two promoted lossy blocks are served lossy"
         );
         assert!(a.plan.promote.is_empty(), "no copy: {:?}", a.plan);
         assert_eq!(a.plan.reason, PlanReason::AllL0);
