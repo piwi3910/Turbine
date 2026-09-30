@@ -1022,3 +1022,19 @@ fn phase6_fp8kv_lab_configs_load() {
         assert_eq!(fp8.kv.gpu.max_bytes, bf16.kv.gpu.max_bytes, "{model}");
     }
 }
+
+/// The Phase 6b per-tier lab config (plan Task 6) loads, spells out the tiers and differs from
+/// the Phase 2c config only in its `kv` section's lower tiers.
+#[test]
+fn phase6b_tier_lab_config_loads() {
+    let lab = repo_root().join("scripts/lab");
+    let tier = turbine_core::config::load(&lab.join("phase6-novanas-llama.yaml"), &[])
+        .expect("the per-tier config loads");
+    let base = turbine_core::config::load(&lab.join("phase2c-novanas-llama.yaml"), &[])
+        .expect("the Phase 2c config loads");
+    assert!(tier.kv.cpu.enabled && !tier.kv.nvme.enabled);
+    assert_eq!(tier.kv.cpu.format.as_str(), "l0");
+    assert_eq!(tier.kv.gpu.max_bytes, base.kv.gpu.max_bytes);
+    assert_eq!(tier.kv.dtype, base.kv.dtype);
+    assert_eq!(tier.model.path, base.model.path);
+}

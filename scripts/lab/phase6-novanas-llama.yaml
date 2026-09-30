@@ -1,0 +1,52 @@
+# turbine-server configuration for the Phase 6b per-tier KV format proofs on novanas (plan Task 6):
+#   scripts/lab-serve.sh novanas scripts/lab/phase6-novanas-llama.yaml [--set <k>=<v>]...
+#   scripts/lab-bench.sh --model llama --golden16 -- --set kv.cpu.format=fp8_e4m3 --set kv.cpu.max_bytes=4GiB
+# scripts/lab/phase2c-novanas-llama.yaml (BF16 weights and BF16 KV pages in L0) with the lower
+# tiers spelled out. A tier's `format` is the codec of the blocks it holds (`l0` = the pool's
+# pages as they are; `fp8_e4m3` = 8-bit values with a per-layer scale, about half the bytes
+# below a BF16 pool, encoded on the device by the ABI v2.11 transcode kernel): the same bytes hold
+# about twice the blocks, and a block that comes back is a lossy copy (reported as
+# usage.prompt_tokens_details.lossy_cached_tokens; `x-turbine-kv-lossy: deny` opts a request out).
+# Compare tiers on the same bytes:
+#   --set kv.cpu.format=l0          (the default: blocks stored as they are)
+#   --set kv.cpu.format=fp8_e4m3    (L1 holds ~2x the blocks per GiB)
+#   --set kv.nvme.format=fp8_e4m3   (L2 on NVMe, needs kv.nvme.enabled: true and a path)
+#   --set kv.lossy_reuse=deny       (no request reuses a lossy block unless it sends allow)
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/llama-3.2-3b-instruct
+  served_name: meta-llama/Llama-3.2-3B-Instruct
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: false
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 8GiB
+  cpu:
+    enabled: true
+    max_bytes: 4GiB
+    format: l0
+  nvme:
+    enabled: false
+    # path: /home/piwi/turbine-kv
+    # max_bytes: 64GiB
+    # format: fp8_e4m3
+  lossy_reuse: allow
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    # The Phase 2 scheduler.queue_timeout (CONFLICT C-1).
+    queue_timeout: 60s
