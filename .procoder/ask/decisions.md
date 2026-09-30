@@ -2305,3 +2305,17 @@ them does nothing (ARC recreates them while jobs queue).
 - C) Lower the runner CPU request (e.g. 1) so more fit
 
 **Decision (user, 2026-09-30): B.** `maxRunners` of `arc-runners/arc-azrtydxb-amd64` set to 5.
+
+## 6b: eviction score of compressed copies after the per-encoded-byte pricing (2026-09-30)
+
+Asked by the t4+t15 merge builder (`p6b-t4t15`, fe4d430). Transfer estimates are now latency + a rate per encoded
+byte. The `cost_aware` eviction score still prices a block's return trip (and its memory term) at the full
+uncompressed size, which overstates compressed copies. Pricing only the return trip at encoded size breaks
+`per_tier_formats` (L1 holds 7 blocks, the test expects more than 8).
+
+- A) Keep as is (errs on the safe side; the stack's behaviour before t15)
+- B) Price both the return trip and the memory term at the copy's encoded size, as its own task with the policy tests
+  re-checked (changes the policy's values for lossy tiers; `demote_min_value` is absolute)
+- C) Price only the return trip at encoded size and re-pin `per_tier_formats`
+
+**Decision (user, 2026-09-30): B.** Both terms at the encoded size, as its own task with the policy tests re-checked.
