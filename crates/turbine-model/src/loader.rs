@@ -214,32 +214,16 @@ impl WeightLoader {
         WeightLoader::load_part(format, index, slots, &[], mem, staging_bytes)
     }
 
-    /// [`WeightLoader::load_format`] of one part of a model split by pipeline stages or expert
-    /// ranks: `whole` is the unsplit model's slot list (the family's
-    /// `weight_slots`); a checkpoint tensor it names but `slots` does not belongs to another
-    /// stage or rank and is skipped quietly (counted in [`LoadedWeights::elsewhere`], one
-    /// `debug` line) instead of warning `unexpected_tensor`. Tensors neither list names still
-    /// warn. An empty `whole` is [`WeightLoader::load_format`].
-    ///
-    /// Both lists are the family's slots: each is expanded by [`WeightFormat::slots`] (a
-    /// quantized layer's scales, zero points and activation scales). A slot the format
-    /// [`WeightFormat::repacks`] is read whole, rewritten by [`WeightFormat::repack`] and
-    /// uploaded (its checkpoint tensor's shape is the format's to check), or only validated
-    /// when it has no elements (a check-only slot); every other slot is copied as stored.
-    pub fn load_part(
+    /// The validation half of [`WeightLoader::load_part`] over already-derived slots (the
+    /// format's [`WeightFormat::slots`]): every slot's tensor present (an absent optional
+    /// check-only slot skipped), stored in `format`, of the expected shape and, when copied as
+    /// stored, the slot's byte length, and every stack consistent. Reads headers only; returns
+    /// each slot to load with its checkpoint tensor.
+    pub fn plan<'s>(
         format: &dyn WeightFormat,
-        index: &SafetensorsIndex,
-        slots: &[WeightSlot],
-        whole: &[WeightSlot],
-        mem: &Arc<dyn DeviceMemory>,
-        staging_bytes: usize,
-    ) -> Result<LoadedWeights, ModelError> {
-        for base in slots.iter().filter(|s| s.source.is_some()) {
-            format.check_shard(base)?;
-        }
-        let slots: Vec<WeightSlot> = slots.iter().flat_map(|s| format.slots(s)).collect();
-        let whole: Vec<WeightSlot> = whole.iter().flat_map(|s| format.slots(s)).collect();
-        let (slots, whole) = (slots.as_slice(), whole.as_slice());
+        index: &'s SafetensorsIndex,
+        slots: &'s [WeightSlot],
+    ) -> Result<Vec<(&'s WeightSlot, &'s TensorEntry)>, ModelError> {
         let mut planned: Vec<(&WeightSlot, &TensorEntry)> = Vec::with_capacity(slots.len());
         for slot in slots {
             let empty = slot.shape.iter().product::<usize>() == 0;
@@ -296,6 +280,36 @@ impl WeightLoader {
             planned.push((slot, entry));
         }
         check_stacks(slots)?;
+        Ok(planned)
+    }
+
+    /// [`WeightLoader::load_format`] of one part of a model split by pipeline stages or expert
+    /// ranks: `whole` is the unsplit model's slot list (the family's
+    /// `weight_slots`); a checkpoint tensor it names but `slots` does not belongs to another
+    /// stage or rank and is skipped quietly (counted in [`LoadedWeights::elsewhere`], one
+    /// `debug` line) instead of warning `unexpected_tensor`. Tensors neither list names still
+    /// warn. An empty `whole` is [`WeightLoader::load_format`].
+    ///
+    /// Both lists are the family's slots: each is expanded by [`WeightFormat::slots`] (a
+    /// quantized layer's scales, zero points and activation scales). A slot the format
+    /// [`WeightFormat::repacks`] is read whole, rewritten by [`WeightFormat::repack`] and
+    /// uploaded (its checkpoint tensor's shape is the format's to check), or only validated
+    /// when it has no elements (a check-only slot); every other slot is copied as stored.
+    pub fn load_part(
+        format: &dyn WeightFormat,
+        index: &SafetensorsIndex,
+        slots: &[WeightSlot],
+        whole: &[WeightSlot],
+        mem: &Arc<dyn DeviceMemory>,
+        staging_bytes: usize,
+    ) -> Result<LoadedWeights, ModelError> {
+        for base in slots.iter().filter(|s| s.source.is_some()) {
+            format.check_shard(base)?;
+        }
+        let slots: Vec<WeightSlot> = slots.iter().flat_map(|s| format.slots(s)).collect();
+        let whole: Vec<WeightSlot> = whole.iter().flat_map(|s| format.slots(s)).collect();
+        let (slots, whole) = (slots.as_slice(), whole.as_slice());
+        let planned = WeightLoader::plan(format, index, slots)?;
 
         let wanted: HashSet<&str> = slots.iter().map(|s| s.name.as_str()).collect();
         let others: HashSet<&str> = whole
