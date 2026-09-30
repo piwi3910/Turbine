@@ -403,9 +403,23 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Supported,
     ),
+    // fp8_block (plan Task 15) proof passed 2026-09-29 (t15-proof, novanas): weight_bytes exact
+    // (3,607,615,488), no fp8_block_decoded fallback, c16 1061.44 tok/s (>= 854.7 BF16 floor,
+    // 1.57x the same run's vLLM-ROCm pass), GSM8K-200 drop 0.005 (<= 0.02 gate). Labbook
+    // turbine-lab-bench runs 2e31910f (turbine) / a86153ab (vllm-rocm). Closed 2026-09-30: golden
+    // c1 / c16 16/16 against tests/golden/llama-3.2-3b-instruct-fp8-block (1062.4 tok/s) and the
+    // 10-min overload soak PASS 8/8.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("LlamaForCausalLM"),
+        Some(WeightFormatColumn::Fp8Block),
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Supported,
+    ),
     // The other Phase 6a weight formats on gfx1201 Llama: `experimental` while each proof runs
-    // (plan Tasks 15, 18, 20), `supported` only after its gate (awq_int4 below).
-    gfx1201_quant_row(WeightFormatColumn::Fp8Block),
+    // (plan Tasks 18, 20), `supported` only after its gate (awq_int4 below).
     gfx1201_quant_row(WeightFormatColumn::Mxfp4),
     gfx1201_quant_row(WeightFormatColumn::Mxfp4A4),
     // awq_int4 (plan Task 18) proof passed 2026-09-29 (t18-run, novanas, commit d14402f):
@@ -1065,8 +1079,8 @@ mod tests {
             }
         }
         // Nothing but the AMD BF16 baseline, the proven gfx1201 FP8 KV rows (Task 24) and the
-        // proven gfx1201 Llama weight rows with BF16 KV (fp8, Task 14; awq_int4, Task 18) are
-        // supported before the tracks add rows.
+        // proven gfx1201 Llama weight rows with BF16 KV (fp8, Task 14; fp8_block, Task 15;
+        // awq_int4, Task 18) are supported before the tracks add rows.
         for r in SUPPORT_MATRIX
             .iter()
             .filter(|r| r.status == SupportStatus::Supported)
@@ -1074,7 +1088,7 @@ mod tests {
             assert_eq!(r.key.vendor, Some("amd"), "{:?}", r.view());
             if r.key.weight_format != Some(W::Bf16) {
                 assert!(
-                    matches!(r.key.weight_format, Some(W::Fp8 | W::AwqInt4)),
+                    matches!(r.key.weight_format, Some(W::Fp8 | W::Fp8Block | W::AwqInt4)),
                     "{:?}",
                     r.view()
                 );
@@ -1109,11 +1123,11 @@ mod tests {
             ]
         );
         for w in W::PHASE_6A {
-            // Supported on gfx1201 Llama once its gate passed (fp8, Task 14; awq_int4, Task 18
-            // plus the rotation 9 soak), experimental while each other proof runs; refused
-            // elsewhere.
+            // Supported on gfx1201 Llama once its gate passed (fp8, Task 14; fp8_block, Task 15;
+            // awq_int4, Task 18 plus the rotation 9 soak), experimental while each other proof
+            // runs; refused elsewhere.
             let k = key("amd", "gfx1201", "LlamaForCausalLM", w, K::Bf16, S::None);
-            let expected = if matches!(w, W::Fp8 | W::AwqInt4) {
+            let expected = if matches!(w, W::Fp8 | W::Fp8Block | W::AwqInt4) {
                 "supported"
             } else {
                 "experimental"
