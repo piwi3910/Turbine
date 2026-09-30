@@ -1542,6 +1542,46 @@ fn run_failing(dir: &TempDir, yaml: &str) -> (Option<i32>, String) {
     )
 }
 
+/// P6b S-1 (Task 6 fix): the device staging of the KV transcode is a fixed cost in the workspace
+/// pool, counted before the KV pool is sized. With a lossy lower tier (`kv.nvme.format:
+/// fp8_e4m3` under the BF16 pages) the budget error's `workspace=` is larger than with `l0`
+/// tiers by the staging slots; the budget is too small to start either way, so the refusal (exit
+/// 1, the pools named) is what is compared. Breaks if the staging is allocated outside the
+/// budget again.
+#[test]
+fn transcode_staging_is_in_the_workspace_pool() {
+    let dir = TempDir::new("turbine-staging-budget");
+    let tiny = dir.path().join("tiny");
+    write_tiny_llama(&tiny, 7);
+    let workspace = |format: &str| -> u64 {
+        let addr = free_addr();
+        let yaml = format!(
+            "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cpu\n\
+             kv:\n  nvme:\n    enabled: true\n    path: {}\n    max_bytes: 1GiB\n    \
+             format: {format}\nreliability:\n  memory:\n    workspace_bytes: 1KiB\n    \
+             device_budget_bytes: 1KiB\n",
+            tiny.display(),
+            dir.path().join("kv").display()
+        );
+        let (code, stderr) = run_failing(&dir, &yaml);
+        assert_eq!(code, Some(1), "{format}: stderr:\n{stderr}");
+        let at = stderr
+            .find("workspace=")
+            .unwrap_or_else(|| panic!("{format}: no pool named:\n{stderr}"));
+        stderr[at + "workspace=".len()..]
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{format}: unreadable workspace:\n{stderr}"))
+    };
+    let plain = workspace("l0");
+    let staged = workspace("fp8_e4m3");
+    assert!(
+        staged > plain,
+        "workspace {plain} bytes with l0 tiers, {staged} with an fp8 tier"
+    );
+}
+
 #[test]
 fn startup_failures_exit_1() {
     let dir = TempDir::new("turbine-startup-failures");

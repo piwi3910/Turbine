@@ -486,6 +486,9 @@ pub struct PreparedModel {
     pub kv_cap: Option<ByteSize>,
     /// Bytes of the executor workspace for `scheduler.max_batch_tokens`.
     pub workspace_bytes: u64,
+    /// Device bytes of the KV transcode's staging slots (P6b S-1), 0 when no lower tier needs
+    /// them. The workspace pool holds them next to `workspace_bytes`.
+    pub transcode_staging_bytes: u64,
     /// What the KV cache depends on: the namespace of every cached block (P4 S-1).
     pub identity: ModelIdentity,
     /// The kernel crate's metrics, registered once and shared by every replica (P5).
@@ -805,7 +808,14 @@ fn prepare_with(
         .mem_info()
         .map_err(|e| StartupError::new(format!("device memory info: {e}")))?
         .free_bytes;
-    let reliability = reliability_for_workspace(&config.reliability, workspace);
+    // P6b S-1: the KV transcode's device staging (one shard per block only) is a fixed cost like
+    // the executor workspace, counted before the KV pool is sized.
+    let transcode_staging = if shard.is_none() && stage.is_none() && expert.is_none() {
+        crate::kv_orchestrator::transcode_staging_bytes(&config.kv, &layout)
+    } else {
+        0
+    };
+    let reliability = reliability_for_workspace(&config.reliability, workspace + transcode_staging);
     let device = config.execution.device;
     // P3 S-2 pre-check: the budget of the memory free now, before any weight byte is read,
     // must hold the model; the engine re-measures it after the weights load.
@@ -915,6 +925,7 @@ fn prepare_with(
         reliability,
         kv_cap: config.kv.gpu.max_bytes,
         workspace_bytes: workspace,
+        transcode_staging_bytes: transcode_staging,
         identity,
         kernel_metrics: kernel_metrics.clone(),
         shard,
@@ -1301,7 +1312,10 @@ pub(crate) fn post_load_budget(
     let mut held = Vec::with_capacity(3);
     for (pool, bytes) in [
         (PoolKind::Weights, weight_bytes),
-        (PoolKind::Workspace, prepared.workspace_bytes),
+        (
+            PoolKind::Workspace,
+            prepared.workspace_bytes + prepared.transcode_staging_bytes,
+        ),
         (PoolKind::Collective, collective),
     ] {
         if bytes == 0 && pool == PoolKind::Collective {
