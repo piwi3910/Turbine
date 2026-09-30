@@ -512,3 +512,12 @@ Task 29 exit (`gate --full`; `lab-test --tier full`; `TURBINE_LAB_ONE_GPU_JOB=0 
 support matrix; docs; `docs: phase 6a exit`); merge into local main (no push); stop everything; nothing of ours on
 novanas / cpuhost, no go-files; remove `dequant-bf16` leftovers and `fixture.queue.bak-r13`; final handoff; report.
 6b stays frozen.
+
+**Rotation 13 addendum (14:05):** gptq-own vLLM-ROCm 461.9 tok/s (200 ok; Turbine 1266.7 = 2.74×). Soak 1
+(`agent-p6a-gptq-numerics/target/soak/novanas-20260930T095436Z/verdict.json`) FAIL on one check only:
+`reached_orange: false` (calibration 4R 1.99 req/s; ITL p99 150 → 226 ms within 2×; 1133 ok, 259 `queue_timeout`, no
+`queue_full` / `overloaded`, GREEN at 0 s; every safety check true). Rerun started 14:05 (local bg, log
+`scratchpad/gptq-own/soak2.log`, line `soak2 rc=`). If it fails the same way: not a flake — a question for the
+coordinator (the INT4 3B leaves the KV pool so large that admission's queue timeout sheds load before pressure
+reaches ORANGE; compare with the awq_int4 soak that passed in rotation 9). No flip until a soak passes or the
+coordinator rules.
