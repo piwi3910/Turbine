@@ -2461,3 +2461,15 @@ regenerate it).
 - C) As A, but `tables` holds only `S`; the signs come from `seed` on the GPU
 
 **Decision (user, 2026-09-30): A.** `tq_params` joins the end of `turbine_kv_transcode_desc`; the Task 8 builder takes the header, ffi, ops and shim-validation files for it.
+
+## 6b: `tiny_model hip_decode_graph_matches_eager` SIGSEGV now reproduces on the stack (2026-10-01)
+
+Logged as intermittent in 6a (`.procoder/review-2026-09-29.md`). On the 6b stack it failed three times in a row: the
+Task 8 quick tier (`turbine-lab-test-0930194331-114c0002`), its rerun (`-0930201409-3203b425`) and the base commit
+0bae895 without Task 8 (`-0930201801-10529cff`): hipBLASLt "operation would make the legacy stream depend on a
+capturing blocking stream" during decode-graph capture, then SIGSEGV. It passed at the 6a exit tip fbddca9 on rerun.
+
+- A) Investigate now as its own task (reproducible now, so bisect 6a tip → stack; blocks a clean quick tier for 6b)
+- B) Mark it a known failure and keep going; investigate later
+
+**Decision (user, 2026-10-01): A.** Investigated now as its own task (builder on `p6b-graph-segv`).
