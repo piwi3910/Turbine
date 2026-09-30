@@ -762,7 +762,21 @@ fn prefetch_a_from_l2(server: &LabServer, a: &str) {
         );
         std::thread::sleep(POLL);
     }
-    std::thread::sleep(Duration::from_secs(2));
+    for i in 0..10 {
+        let (_, metrics) = request(server.addr, "GET", "/metrics", None);
+        let lines: Vec<&str> = metrics
+            .lines()
+            .filter(|l| {
+                (l.starts_with("turbine_kv_evictions_total")
+                    || l.starts_with("turbine_kv_demotions_total")
+                    || l.starts_with("turbine_kv_promotions_total")
+                    || l.starts_with("turbine_kv_blocks{tier=\"l0\""))
+                    && !l.ends_with(" 0")
+            })
+            .collect();
+        println!("DIAG t+{}ms: {}", i * 300, lines.join(" | "));
+        std::thread::sleep(Duration::from_millis(300));
+    }
 }
 
 /// Prints the KV document and the KV metric series (what a failed reuse assertion needs).
