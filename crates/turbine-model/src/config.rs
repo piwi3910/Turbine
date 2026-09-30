@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use turbine_core::types::{KvLayout, ModelShape};
 
@@ -47,6 +47,18 @@ pub enum RopeScaling {
         attention_factor: f64,
         truncate: bool,
     },
+}
+
+/// [`ModelArchConfig::rope_summary`].
+#[derive(Clone, Copy, PartialEq, Debug, Serialize)]
+pub struct RopeSummary {
+    pub theta: f64,
+    /// `default`, `llama3` or `yarn`.
+    pub rope_type: &'static str,
+    /// The scaling factor; `None` for `default`.
+    pub factor: Option<f64>,
+    /// YaRN's resolved attention factor; `None` outside YaRN.
+    pub attention_factor: Option<f64>,
 }
 
 /// The architecture description of a checkpoint, as far as Turbine uses it.
@@ -178,6 +190,37 @@ impl ModelArchConfig {
                 attention_factor, ..
             }) => attention_factor as f32,
             _ => 1.0,
+        }
+    }
+
+    /// The resolved RoPE configuration for logging (`event="rope_config"`) and
+    /// `/turbine/v1/status`'s `model.rope` (P6a followups): `theta`, the scaling's name
+    /// (`default`, `llama3`, `yarn`), its `factor` when scaled, and YaRN's resolved attention
+    /// factor when present.
+    pub fn rope_summary(&self) -> RopeSummary {
+        match self.rope_scaling {
+            None => RopeSummary {
+                theta: self.rope_theta,
+                rope_type: "default",
+                factor: None,
+                attention_factor: None,
+            },
+            Some(RopeScaling::Llama3 { factor, .. }) => RopeSummary {
+                theta: self.rope_theta,
+                rope_type: "llama3",
+                factor: Some(factor),
+                attention_factor: None,
+            },
+            Some(RopeScaling::Yarn {
+                factor,
+                attention_factor,
+                ..
+            }) => RopeSummary {
+                theta: self.rope_theta,
+                rope_type: "yarn",
+                factor: Some(factor),
+                attention_factor: Some(attention_factor),
+            },
         }
     }
 
@@ -958,6 +1001,50 @@ mod tests {
         let llama = load_model_config(&fixture_dir()).unwrap();
         assert_eq!(llama.moe, None);
         assert!(!llama.qk_norm);
+    }
+
+    /// [`ModelArchConfig::rope_summary`] (P6a followups: logged at load, `event="rope_config"`,
+    /// and reported at `/turbine/v1/status` as `model.rope`) names the resolved scaling and
+    /// carries its `factor`, with a config that has `rope_scaling` (Llama's `llama3`), one that
+    /// has none (OLMoE: `default`, no factor), and a YaRN override (both `factor` and the
+    /// resolved attention factor).
+    #[test]
+    fn rope_summary_reflects_scaling() {
+        let llama = load_model_config(&fixture_dir()).unwrap();
+        assert_eq!(
+            llama.rope_summary(),
+            RopeSummary {
+                theta: 500_000.0,
+                rope_type: "llama3",
+                factor: Some(32.0),
+                attention_factor: None,
+            }
+        );
+
+        let olmoe = load_model_config(&olmoe_fixture_dir()).unwrap();
+        assert_eq!(
+            olmoe.rope_summary(),
+            RopeSummary {
+                theta: 10_000.0,
+                rope_type: "default",
+                factor: None,
+                attention_factor: None,
+            }
+        );
+
+        let yarn = serde_json::json!({"rope_type": "yarn", "factor": 4.0});
+        let over = load_model_config_with(&fixture_dir(), Some(&yarn)).unwrap();
+        let summary = over.rope_summary();
+        assert_eq!(summary.theta, 500_000.0);
+        assert_eq!(summary.rope_type, "yarn");
+        assert_eq!(summary.factor, Some(4.0));
+        let Some(RopeScaling::Yarn {
+            attention_factor, ..
+        }) = over.rope_scaling
+        else {
+            panic!("expected Yarn, got {:?}", over.rope_scaling);
+        };
+        assert_eq!(summary.attention_factor, Some(attention_factor));
     }
 
     /// Dimensions whose weights cannot be addressed are refused at load, before any slot offset
