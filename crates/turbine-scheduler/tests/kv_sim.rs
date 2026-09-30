@@ -1035,14 +1035,15 @@ fn ladder_run(trace: &LadderTrace, enabled: bool) -> LadderRun {
 /// ORANGE → RED → GREEN) over the seeded multi-turn workload with small L1/L2 yields exactly
 /// the committed sequence of rung changes; at most 32 rewrites per ladder tick, ticks ≥ 50 ms
 /// apart (checked every step by [`ladder_run`]); a steady YELLOW never walks a tier to `tq2`;
-/// back at GREEN no rewrite starts and a rung steps back up only after `deescalate_dwell` below
-/// low water (no oscillation within the dwell); no referenced block is rewritten; and the ladder
+/// back at GREEN no rewrite starts; a rung steps back up only while the pinned state is GREEN
+/// and only after `deescalate_dwell` below low water (no oscillation within the dwell; user
+/// decision 2026-09-30, option A); no referenced block is rewritten; and the ladder
 /// recomputes fewer prompt tokens than the same run with `kv.ladder.enabled: false`, which never
 /// changes a rung. Set `TURBINE_LADDER_BLESS=1` to rewrite the expected sequence where the test
 /// runs (review it; `scripts/remote-cargo.sh` does not forward it, the printed sequence does).
 ///
 /// Breaks if the ladder's behaviour depends on anything but the pinned inputs, if a rung is
-/// stepped up before its dwell, if YELLOW drifts to `tq2`, or if rewrites continue at GREEN.
+/// stepped up before its dwell or while the pressure is not GREEN, if YELLOW drifts to `tq2`, or if rewrites continue at GREEN.
 #[test]
 fn ladder_under_pinned_pressure() {
     let trace: LadderTrace =
@@ -1101,6 +1102,12 @@ fn ladder_under_pinned_pressure() {
             _ => {}
         }
         if !down {
+            // User decision 2026-09-30 (option A): a rung relaxes only at GREEN.
+            assert_eq!(
+                *state,
+                PressureState::Green,
+                "{c:?}: rung_step_up while the pinned state is not GREEN"
+            );
             stepped_up = true;
             if let Some(prev) = last_change.get(c.tier.as_str()) {
                 assert!(

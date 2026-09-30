@@ -90,10 +90,11 @@ pub struct LadderConfig {
     /// `kv.ladder.high_water`.
     pub high_water: f64,
     /// `kv.ladder.low_water`: also the fill a tier must stay below for `dwell` before its rung
-    /// steps back up.
+    /// steps back up (at GREEN only).
     pub low_water: f64,
     /// How long a tier stays below `low_water` before its rung for new demotions steps back up
-    /// one rung (`reliability.pressure.deescalate_dwell`; the server sets it).
+    /// one rung, which happens only at GREEN (`reliability.pressure.deescalate_dwell`; the
+    /// server sets it).
     pub dwell: Duration,
 }
 
@@ -2251,11 +2252,12 @@ impl KvHierarchy {
         }
     }
 
-    /// One ladder tick (P6b S-6), at most every [`LADDER_TICK_INTERVAL`]: a tier that has
-    /// stayed below low water for the dwell steps its rung for new demotions back up one rung
-    /// (never above its configured format); then, while the pressure controller is not GREEN,
-    /// the eviction policy decides on the copies of each enabled lower tier, lowest tier first
-    /// — oldest, least-reusable and most precise first — and at most
+    /// One ladder tick (P6b S-6), at most every [`LADDER_TICK_INTERVAL`]: at GREEN, a tier that
+    /// has stayed below low water for the dwell steps its rung for new demotions back up one
+    /// rung (never above its configured format; the dwell runs whatever the pressure, but no
+    /// rung steps up while the controller is not GREEN); then, while the pressure controller
+    /// is not GREEN, the eviction policy decides on the copies of each enabled lower tier,
+    /// lowest tier first — oldest, least-reusable and most precise first — and at most
     /// [`LADDER_REWRITES_PER_TICK`] rewrites start (fewer while earlier ones are in flight). A
     /// tier's sweep stops at the first copy the policy keeps. Copies of blocks a running
     /// request references, and copies being copied, are never rewritten. `tick` calls it.
@@ -2273,7 +2275,9 @@ impl KvHierarchy {
         let (low, dwell) = (l.cfg.low_water, l.cfg.dwell);
         let tiers: SmallVec<[TierRung; 2]> = l.tiers.clone();
         self.stats.ladder_ticks += 1;
-        // Hysteresis: one rung up after the dwell below low water.
+        // Hysteresis: one rung up once the controller is GREEN and the tier has been below low
+        // water for the dwell (user decision 2026-09-30, option A: never while not GREEN, so a
+        // sustained pressure does not step a floor tier up and compress it again every dwell).
         for t in &tiers {
             let below = self.tier_fill(t.tier) < low;
             let Some(tr) = self
@@ -2288,7 +2292,10 @@ impl KvHierarchy {
                 continue;
             }
             let since = *tr.below_since.get_or_insert(now);
-            if now.saturating_sub(since) >= dwell && tr.rung != tr.base {
+            if pressure == PressureState::Green
+                && now.saturating_sub(since) >= dwell
+                && tr.rung != tr.base
+            {
                 let up = prev_rung(tr.rung)
                     .filter(|u| crate::codec::rung_index(u) >= crate::codec::rung_index(tr.base))
                     .unwrap_or(tr.base);
