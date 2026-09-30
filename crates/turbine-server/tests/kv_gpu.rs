@@ -106,7 +106,7 @@ impl LabServer {
         // The kernel library comes from TURBINE_KERNEL_LIBRARY (set by the lab Job); the log
         // goes straight to the test output.
         let child = cmd
-            .env("RUST_LOG", "info,turbine_kv=debug,turbine_server::kv_orchestrator=debug")
+            .env("RUST_LOG", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -735,11 +735,37 @@ fn fill_until_l2(server: &LabServer, blocks: f64) {
     );
 }
 
+/// Waits until the demotions the fillers left in flight have drained L0: its used blocks are
+/// unchanged over 1.5 s. A prefetch issued while L0 is draining (above its demotion threshold,
+/// the lab runs stopped at 87 %) has its promoted blocks demoted again within a second, as the
+/// lowest-value cached blocks, before any request can use them.
+fn wait_l0_settled(server: &LabServer) {
+    const SERIES: &str = r#"turbine_kv_blocks{tier="l0",state="used"}"#;
+    let started = Instant::now();
+    let mut last = server.metric(SERIES);
+    let mut stable = 0;
+    while stable < 5 {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "L0 never settled ({last} blocks used)"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let now = server.metric(SERIES);
+        stable = if now == last { stable + 1 } else { 0 };
+        last = now;
+    }
+    println!(
+        "L0 settled at {last} blocks used after {:?}",
+        started.elapsed()
+    );
+}
+
 /// Brings A back explicitly (`POST /turbine/v1/kv/prefetch`): on the R9700 the planner may
 /// rightly find recomputing a few blocks cheaper than reading them from NVMe, and these tests
 /// are about the bytes surviving the round trip, not about that choice. Returns once a block
 /// was promoted out of L2.
 fn prefetch_a_from_l2(server: &LabServer, a: &str) {
+    wait_l0_settled(server);
     let body = json!({ "prompt": a }).to_string();
     // The fillers leave L0 near its demotion threshold: a prefetch is refused (409
     // `pressure_too_high`) while L0 pressure is ORANGE or above, until the demotions in flight
@@ -762,21 +788,7 @@ fn prefetch_a_from_l2(server: &LabServer, a: &str) {
         );
         std::thread::sleep(POLL);
     }
-    for i in 0..10 {
-        let (_, metrics) = request(server.addr, "GET", "/metrics", None);
-        let lines: Vec<&str> = metrics
-            .lines()
-            .filter(|l| {
-                (l.starts_with("turbine_kv_evictions_total")
-                    || l.starts_with("turbine_kv_demotions_total")
-                    || l.starts_with("turbine_kv_promotions_total")
-                    || l.starts_with("turbine_kv_blocks{tier=\"l0\""))
-                    && !l.ends_with(" 0")
-            })
-            .collect();
-        println!("DIAG t+{}ms: {}", i * 300, lines.join(" | "));
-        std::thread::sleep(Duration::from_millis(300));
-    }
+    std::thread::sleep(Duration::from_secs(2));
 }
 
 /// Prints the KV document and the KV metric series (what a failed reuse assertion needs).

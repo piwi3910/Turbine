@@ -1350,6 +1350,7 @@ impl KvHierarchy {
                     Some((lk, format)) => self.lossy_entry(&req.key, lk, format),
                     None => self.dir.get(&req.key).map(|_| req.key),
                 };
+                let filed = key;
                 if let Some(key) = key
                     && self
                         .dir
@@ -1371,7 +1372,8 @@ impl KvHierarchy {
                 self.stats.promotions += 1;
                 if req.purpose == TransferPurpose::Prefetch {
                     self.prefetch_inflight.remove(&ticket);
-                    self.prefetch.issued(req.key);
+                    // Tracked under the entry the copy is filed in, the key a request attaches.
+                    self.prefetch.issued(filed.unwrap_or(req.key));
                     pool.release(&[block]);
                     return;
                 }
@@ -2505,6 +2507,18 @@ impl KvHierarchy {
                 acc.blocks_resident += 1;
                 continue;
             }
+            // A lossy copy promoted earlier sits in L0 under its lossy key (P6b S-3).
+            if let Some((lk, _)) = b.fastest().and_then(|t| {
+                let loc = b.location(t)?;
+                self.lossy_target(key, loc)
+            }) && self
+                .dir
+                .get(&lk)
+                .is_some_and(|l| l.location(TierId::L0).is_some())
+            {
+                acc.blocks_resident += 1;
+                continue;
+            }
             if self.transfer.is_busy_with(key) {
                 continue;
             }
@@ -3234,6 +3248,22 @@ pub(crate) mod tests {
         );
         assert!(a.plan.promote.is_empty(), "no copy: {:?}", a.plan);
         assert_eq!(a.plan.reason, PlanReason::AllL0);
+        // Every prefetched block is counted used once attached (the lossy ones by their lossy
+        // key), and a second prefetch finds them all resident instead of promoting again.
+        assert_eq!(r.h.prefetch_stats().used, accepted.blocks_queued as u64);
+        r.pool.release(&a.blocks);
+        r.h.request_done(&mut r.pool, id, false);
+        let again =
+            r.h.prefetch(
+                &mut r.pool,
+                PrefetchTarget::Tokens {
+                    prompt: &prompt,
+                    cache_salt: "",
+                },
+            )
+            .expect("prefetch accepted");
+        assert_eq!(again.blocks_queued, 0, "{again:?}");
+        assert_eq!(again.blocks_resident, 4, "{again:?}");
     }
 
     /// The Task 4 kv-sim regression (MultiTurn lru 251 → 199 s, cost_aware/lru 0.78 → 0.93):
