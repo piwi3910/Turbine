@@ -209,7 +209,7 @@ Interfaces:
 
 ## Task 12: Mixed-format paged attention on HIP (ABI v2.11)
 
-Files: `kernels/include/turbine_kernels.h` (v2.11: `block_formats`, `turbine_tq_params`, `TURBINE_DTYPE_TQ4` 18, `TURBINE_DTYPE_TQ2` 19), `crates/turbine-kernels/src/ffi.rs` (desc fields read at minor ≥ 10), `kernels/rocm/src/paged_attention_mixed.*` (the Task 10 pick: an adapted provider kernel or own; TurboQuant append encoding through Task 8's codec), `kernels/rocm/src/impl_table.cpp`, `crates/turbine-kernels/tests/hip_ops.rs` (`paged_mixed_matches_cpu`), `scripts/lab-test.sh` (timing variant into `SLOW_TESTS`)
+Files: `kernels/include/turbine_kernels.h` (v2.11: `block_formats`, `turbine_tq_params`, `TURBINE_DTYPE_TQ4` 18, `TURBINE_DTYPE_TQ2` 19), `crates/turbine-kernels/src/ffi.rs` (desc fields read at minor ≥ 11), `kernels/rocm/src/paged_attention_mixed.*` (the Task 10 pick: an adapted provider kernel or own; TurboQuant append encoding through Task 8's codec), `kernels/rocm/src/impl_table.cpp`, `crates/turbine-kernels/tests/hip_ops.rs` (`paged_mixed_matches_cpu`), `scripts/lab-test.sh` (timing variant into `SLOW_TESTS`)
 Interfaces:
 
 - implementation name from the pick (e.g. `turbine_hip_mixed`); `supports` requires head_dim 128 and block_tokens a multiple of 16; BF16-only block tables keep choosing the existing CK implementations (no change to the BF16 path)
