@@ -1107,6 +1107,183 @@ mod phase8_eval {
         );
     }
 
+    /// Mock of a server with a lossy lower KV tier: chat items `q<i>` behind a system message
+    /// report `usage` as the real server does. The first item computes cold; an item after it
+    /// reuses 896 of its 1000 prompt tokens from cache, and from lossy blocks only when a
+    /// filler (a one-token request) was served between the first item and it, which is what
+    /// pushes the prefix out of L0. The log records the order requests arrived in.
+    async fn spawn_eval_usage_mock() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let state = log.clone();
+        let app = Router::new()
+            .route("/v1/models", get(|| async { Json(json!({"object": "list", "data": [{"id": "mock-model"}]})) }))
+            .route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let log = state.clone();
+                    async move {
+                        let messages = body["messages"].as_array().unwrap();
+                        let last = messages.last().unwrap()["content"].as_str().unwrap();
+                        let mut log = log.lock().unwrap();
+                        if body["max_tokens"] == 1 {
+                            log.push("filler".into());
+                            return Ok::<_, StatusCode>(Json(json!({"choices": [{"index": 0,
+                                "message": {"role": "assistant", "content": "0"}}]})));
+                        }
+                        let text = eval_mock_reply(last)?;
+                        let first = !log.iter().any(|l| l.starts_with('q'));
+                        let after_filler = log.iter().any(|l| l == "filler");
+                        log.push(last.to_string());
+                        let (cached, lossy) = match (first, after_filler) {
+                            (true, _) => (0, 0),
+                            (false, true) => (896, 896),
+                            (false, false) => (896, 0),
+                        };
+                        Ok(Json(json!({"choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": text}}],
+                            "usage": {"prompt_tokens": 1000,
+                                "prompt_tokens_details": {"cached_tokens": cached, "lossy_cached_tokens": lossy}}})))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), log)
+    }
+
+    /// 20 chat items behind a shared system message.
+    fn write_shared_prefix_tasks(path: &Path) {
+        let mut lines = String::new();
+        for i in 0..20u64 {
+            let task = json!({"id": format!("t{i}"), "messages": [
+                {"role": "system", "content": "shared prefix"},
+                {"role": "user", "content": format!("q{i}")}],
+                "answer": eval_mock_answer(i).to_string(), "match": "number", "max_tokens": 16});
+            lines.push_str(&task.to_string());
+            lines.push('\n');
+        }
+        std::fs::write(path, lines).unwrap();
+    }
+
+    /// Runs `turbine-golden eval` over the usage mock with `extra` flags; (exit code, stdout,
+    /// stderr, the mock's request log).
+    async fn eval_with_usage_mock(extra: &[&str]) -> (Option<i32>, String, String, Vec<String>) {
+        let (base, log) = spawn_eval_usage_mock().await;
+        let dir = EvalTempDir::new();
+        let tasks = dir.path().join("tasks.jsonl");
+        write_shared_prefix_tasks(&tasks);
+        let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        let out = tokio::task::spawn_blocking(move || {
+            eval_golden_cmd()
+                .args([
+                    "eval",
+                    "--url",
+                    &base,
+                    "--output",
+                    "json",
+                    "--concurrency",
+                    "4",
+                ])
+                .args(extra)
+                .arg("--tasks")
+                .arg(&tasks)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let log = log.lock().unwrap().clone();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            log,
+        )
+    }
+
+    /// With fillers the first item runs alone, then the fillers, then the other items, so those
+    /// are served from the lossy tier; the report carries the token usage and the guard passes.
+    /// This is the test the mutation check breaks: send the fillers after the whole set (or not
+    /// at all) and no item reports lossy-cached tokens, so the guard fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eval_fillers_push_the_prefix_to_the_lossy_tier_before_the_rest() {
+        let (code, stdout, stderr, log) = eval_with_usage_mock(&[
+            "--filler-requests",
+            "3",
+            "--filler-words",
+            "50",
+            "--min-lossy-cached-ratio",
+            "0.8",
+            "--min-cached-ratio",
+            "0.8",
+        ])
+        .await;
+        assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(&log[..4], ["q0", "filler", "filler", "filler"], "{log:?}");
+        assert_eq!(log.len(), 4 + 19);
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["filler_requests"], 3);
+        assert_eq!(report["filler_words"], 50);
+        assert_eq!(report["total"], 20, "fillers are not scored items");
+        let results = report["results"].as_array().unwrap();
+        assert_eq!(results[0]["id"], "t0", "task-file order");
+        assert_eq!(results[0]["cached_tokens"], 0);
+        assert_eq!(results[1]["lossy_cached_tokens"], 896);
+        assert_eq!(results[19]["prompt_tokens"], 1000);
+    }
+
+    /// Without fillers the prefix never leaves L0, nothing lossy is reused, and a stated
+    /// `--min-lossy-cached-ratio` fails the run (exit 1) after printing the report.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eval_lossy_reuse_guard_fails_a_run_that_reused_nothing_lossy() {
+        let (code, stdout, stderr, log) = eval_with_usage_mock(&[
+            "--min-lossy-cached-ratio",
+            "0.5",
+            "--min-cached-ratio",
+            "0.8",
+        ])
+        .await;
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("--min-lossy-cached-ratio"), "{stderr}");
+        assert!(!log.iter().any(|l| l == "filler"));
+        let report: Value = serde_json::from_str(&stdout).expect("the report is still printed");
+        assert_eq!(report["results"][1]["lossy_cached_tokens"], 0);
+        // The same run without the guard exits 0.
+        let (code, _, _, _) = eval_with_usage_mock(&[]).await;
+        assert_eq!(code, Some(0));
+    }
+
+    /// `eval-compare` refuses a pair measured with different fillers, naming both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eval_compare_refuses_mismatched_fillers() {
+        let dir = EvalTempDir::new();
+        let report = json!({"model": "m", "tasks_file": "t", "total": 1, "correct": 1,
+            "accuracy": 1.0, "concurrency": 4, "filler_requests": 0,
+            "results": [{"id": "x", "correct": true, "output": "1"}]});
+        let mut candidate = report.clone();
+        candidate["filler_requests"] = json!(8);
+        candidate["filler_words"] = json!(2000);
+        let (b, c) = (dir.path().join("b.json"), dir.path().join("c.json"));
+        std::fs::write(&b, report.to_string()).unwrap();
+        std::fs::write(&c, candidate.to_string()).unwrap();
+        let out = eval_golden_cmd()
+            .args(["eval-compare", "--baseline"])
+            .arg(&b)
+            .arg("--candidate")
+            .arg(&c)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("filler") && stderr.contains("8"),
+            "{stderr}"
+        );
+        assert!(out.stdout.is_empty());
+    }
+
     /// An older report with no `concurrency` field reads as concurrency 1.
     #[test]
     fn eval_report_without_concurrency_field_reads_as_one() {
@@ -1279,6 +1456,63 @@ mod phase8_eval_task_set {
             completion_answers, chat_answers,
             "same 200 questions in the same order, so the same answers"
         );
+    }
+
+    /// The lossy-KV gate variant (Phase 6b, user decision 2026-10-01 "6b Task 6" point 1 A):
+    /// the same 200 items behind one identical long system message, so every request after the
+    /// first can reuse the prefix's KV blocks. Pins (a) the items equal gsm8k-200.jsonl's apart
+    /// from the leading system message, (b) every record carries the same system message,
+    /// byte for byte (so after the chat template every record has the same token prefix: the
+    /// template's header and the system text are fixed, and the system turn ends at a special
+    /// end-of-turn token that no neighbouring text can merge with), (c) that message is the
+    /// preamble plus the bench's seeded 2000-word prompt, regenerated here with the Rust code
+    /// the Python generator ports, and (d) it is long enough to span many `kv.block_tokens`
+    /// (128) blocks (a word is at least two tokens, so 2000 words are at least 4000 tokens).
+    #[test]
+    fn eval_task_set_shared_prefix_valid() {
+        use turbine_bench::golden::eval::load_tasks;
+
+        const PREAMBLE: &str = "Background notes for a tutoring session. They are unrelated to the math problems that follow; ignore them when solving.\n\n";
+        const PREFIX_SEED: u64 = 20_261_001;
+        const PREFIX_WORDS: u32 = 2000;
+
+        let root = eval_root();
+        let path = root.join("gsm8k-200-shared-prefix.jsonl");
+        check_task_set(&path, 200);
+        let tasks = load_tasks(&path).unwrap();
+        let plain = load_tasks(&root.join("gsm8k-200.jsonl")).unwrap();
+
+        let expected_system = format!(
+            "{PREAMBLE}{}",
+            turbine_bench::prompt::prompt(PREFIX_SEED, 0, PREFIX_WORDS)
+        );
+        assert!(
+            expected_system.split_whitespace().count() >= 2000,
+            "about 2000 words"
+        );
+        for (t, p) in tasks.iter().zip(&plain) {
+            assert_eq!(t.id, p.id);
+            assert_eq!(t.answer, p.answer, "{}", t.id);
+            assert_eq!(t.match_kind, p.match_kind, "{}", t.id);
+            assert_eq!(t.max_tokens, p.max_tokens, "{}", t.id);
+            assert_eq!(t.stop, p.stop, "{}", t.id);
+            assert!(t.prompt.is_none(), "{}: chat form", t.id);
+            let messages = t.messages.as_ref().unwrap();
+            assert_eq!(messages.len(), 2, "{}: system + user", t.id);
+            assert_eq!(messages[0]["role"], "system", "{}", t.id);
+            assert_eq!(
+                messages[0]["content"].as_str().unwrap(),
+                expected_system,
+                "{}: the shared prefix changed (regenerate with scripts/eval/make-gsm8k-200-shared-prefix.sh, and record why: every lossy-KV baseline report must be re-measured)",
+                t.id
+            );
+            assert_eq!(
+                messages[1],
+                p.messages.as_ref().unwrap()[0],
+                "{}: the user message is gsm8k-200's, unchanged",
+                t.id
+            );
+        }
     }
 }
 
