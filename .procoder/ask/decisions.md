@@ -2775,3 +2775,16 @@ looks too eager (the earlier decision declined only the forecast review for the 
 - B) Later (after 6b), note it as a reliability item
 
 **Decisions (user, 2026-10-01):** prefix demotion — **A** (copy ahead in `turbine-kv`); SURVIVAL at 20+ sessions — **A** (investigate the exhaustion forecast now).
+
+## 6b: quality bound in `lossy_tier_reuse_tq4` (2026-10-01)
+
+From `p6b-tqtables` (merged 7f5f271). The device transcode is bit-exact to the host codec, but a prefix reused from a
+tq4 lower tier drifts far from cold: worst first-8-token logprob difference 2.47 (fp8: 0.067). The test asserts the
+mechanism (lossy reuse happens, opt-out bit-equal to cold) and prints the spread, with no quality bound.
+
+- A) Task 9 sets the bound from the S-8 gates (golden batched bounds + shared-prefix GSM8K); Task 9 also checks whether
+  the drift is the codec's inherent loss or a defect (e.g. compare the CPU codec's K/V reconstruction error and
+  attention-score error against the paper's D_mse / D_prod bounds on real Llama K/V)
+- B) Pin a provisional 2.5 bound now (would hide a later regression up to 2.5)
+
+**Decision (user, 2026-10-01): A.** Task 9 sets the bound and first checks inherent loss vs defect against the paper's bounds on real Llama K/V.
