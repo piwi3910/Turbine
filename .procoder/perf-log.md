@@ -342,3 +342,18 @@ Paired, the gate pair differs on 14 items: 8 are right only at BF16, 6 only at F
 Discarded, because another builder's overload soak sent traffic to whatever server held port 18000 between about 11:00 and 11:18 UTC: 1001105753-3afb91e2 (BF16, 0.775, 2,943,726 prompt tokens), 1001110311-3d1b4cef and 1001110705-21e8b128 (fp8, 503 at filler 2–3 with L0 RED; 4.9M and 4.5M prompt tokens) and 1001111055-19904604 (base, 0.770, 1.77M). The first committed pair (565723b) was replaced by the rerun (7ebf9b8).
 
 `scripts/lab-bench.sh --quick --model llama -- --set kv.cpu.enabled=true --set kv.cpu.max_bytes=4GiB` on 40cad6e: golden c1 PASS, 877.1 tok/s, ITL p50 15.4 ms, TTFT p50 246 ms (64 requests, client novanas). The de6f948 quick run without L1 measured 877.3 / 15.4 / 247, so there is no BF16 regression (the bench shares no prefix, so copy ahead stays idle).
+
+### FP8 lower-tier gate on 3 + 3 runs (decision "6b: FP8 lower-tier shared-prefix gate passes exactly at the bound", A; branch `p6b-fp8gate`)
+
+Same recipe as above on the f9a4c91 tree (a fresh server per run, GPU 0 under the bench lock, c16, 32 fillers, 4 GiB L0 and L1, `phase6-novanas-llama.yaml`); the fp8 runs add `--set kv.cpu.format=fp8_e4m3` and `--min-lossy-cached-ratio 0.5` (all passed). Every server counted exactly the eval's own 726,723 prompt tokens (`turbine_kv_prompt_tokens_total`); cached ratio 0.931 and lossy cached ratio 0.927 (582,912 of 629,014 tokens) in all three fp8 runs.
+
+| Arm    | Report                      | Serve run id        | Accuracy    |
+| ------ | --------------------------- | ------------------- | ----------- |
+| BF16 1 | `turbine-bf16-sp-r1.json`   | 1001131143-01812869 | 0.780 (156) |
+| BF16 2 | `turbine-bf16-sp-r2.json`   | 1001131324-3eaf9425 | 0.785 (157) |
+| BF16 3 | `turbine-bf16-sp-r3.json`   | 1001131447-036a8926 | 0.770 (154) |
+| FP8 1  | `turbine-l1-fp8-sp-r1.json` | 1001135450-3cc7df5a | 0.775 (155) |
+| FP8 2  | `turbine-l1-fp8-sp-r2.json` | 1001135611-001242f8 | 0.775 (155) |
+| FP8 3  | `turbine-l1-fp8-sp-r3.json` | 1001135732-13b1af29 | 0.770 (154) |
+
+Medians: BF16 0.780, FP8 0.775: drop 0.005 (max 0.01), PASS. Paired exact two-sided McNemar (binomial on the discordant items, alpha 0.05, as for 6a's FP8 KV) on all nine BF16 x FP8 pairs: lost/gained 5/4, 7/6, 7/5, 5/3, 7/5, 7/4, 4/5, 4/5, 6/6; p between 0.55 and 1.0, none significant (median pair BF16 1 vs FP8 1: 5/4, p = 1.0; pooled 52 lost, 43 gained). `kv_gpu` on gfx1201 (job 1001135903-1ec4bf89): 12 passed, 0 failed (the 10 tests plus the config-load tests). Lower-tier `fp8_e4m3` flipped to `supported`.

@@ -559,7 +559,7 @@ mod tests {
         fp8.kv.cpu.format = name("fp8_e4m3");
         assert_eq!(
             tier_formats(&fp8).unwrap(),
-            vec![("kv.cpu.format", "fp8_e4m3", SupportStatus::Experimental)]
+            vec![("kv.cpu.format", "fp8_e4m3", SupportStatus::Supported)]
         );
         assert!(before_discovery(&fp8).is_ok());
         // Before the library is loaded nothing is known; a library with the v2.11 transcode
