@@ -42,6 +42,9 @@
 #   server this script leaves running. Under a caller that already holds bench.lock exclusively
 #   (scripts/bench-lock.sh exports TURBINE_BENCH_LOCK_HELD) no second lock is taken; under a
 #   shared hold the start is refused (it would wait for itself). --gpus 2 is refused.
+#   Every exit before the Job is applied (upload failure, apply failure, interrupt) releases the
+#   holder at once (EXIT trap); a holder whose Job has not appeared 15 min after it got the lock
+#   (TURBINE_LAB_HOLDER_GRACE seconds) releases itself, even if the script was killed outright.
 # Exit codes: 0 ready (or stopped), 2 usage error, otherwise non-zero with a message naming the
 # failed step.
 set -euo pipefail
@@ -335,7 +338,17 @@ stop_log_stream() {
 		STREAM_STARTED=0
 	fi
 }
-trap stop_log_stream EXIT
+# Set once the serve Job is applied: from then on the Job's deletion ends the bench.lock holder.
+# Any exit before that (upload or apply failure, a fail, an interrupt) releases the holder here.
+JOB_APPLIED=0
+on_exit() {
+	stop_log_stream
+	if [[ $JOB_APPLIED -eq 0 && ${LOCK_HELD:-0} -eq 1 ]]; then
+		kube "-n ${NS} delete job ${JOB} --ignore-not-found" >/dev/null 2>&1 || true
+		gpu_unlock
+	fi
+}
+trap on_exit EXIT
 
 # Streams the Job log in the background; the stream is stopped once the server is ready.
 # shellcheck disable=SC2029
@@ -482,6 +495,7 @@ start() {
 		-e "s/__GPUS__/${SERVE_GPUS}/g" \
 		"${REPO_ROOT}/scripts/lab/novanas-serve-job.yaml" |
 		remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" || fail "kubectl apply failed"
+	JOB_APPLIED=1
 
 	say "waiting for the pod"
 	wait_for_pod
@@ -518,6 +532,7 @@ start_vllm() {
 		"${REPO_ROOT}/scripts/lab/novanas-vllm-job.yaml" |
 		awk -v extra="$extra" '/# __EXTRA_ARGS__$/ { printf "%s", extra; next } { print }' |
 		remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" || fail "kubectl apply failed"
+	JOB_APPLIED=1
 
 	say "waiting for the pod"
 	wait_for_pod
@@ -537,9 +552,12 @@ ONE_GPU_JOB="${TURBINE_LAB_ONE_GPU_JOB:-1}"
 LOCK_DIR="${CI_ROOT}/runs/serve-locks"
 LOCK_TAG="${LOCK_DIR}/${RUN_ID}.sh"
 LOCK_HELD=0
+# Seconds the holder waits, once it has the lock, for this run's Job to appear (tree upload,
+# namespace check, apply: normally under a few minutes) before it lets go on its own.
+HOLDER_GRACE="${TURBINE_LAB_HOLDER_GRACE:-900}"
 
 # Takes bench.lock for this run's serve Job (see the header); returns once the holder on the
-# host has it. The holder waits up to 1 h for the Job to appear (upload and apply), then holds
+# host has it. The holder waits up to HOLDER_GRACE (15 min) for the Job to appear (upload and apply), then holds
 # while `kubectl get job` finds it; a kubectl error counts as still present.
 gpu_lock() {
 	[[ "$ONE_GPU_JOB" == 1 ]] || return 0
@@ -576,7 +594,7 @@ t=0
 while ! present; do
 	[ -e ${LOCK_TAG}.state ] || exit 0
 	t=\$((t + 5))
-	[ \$t -ge 3600 ] && break
+	[ \$t -ge ${HOLDER_GRACE} ] && break
 	sleep 5
 done
 while present; do sleep 5; done

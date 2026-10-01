@@ -2246,6 +2246,92 @@ fn lab_serve_gpus_2_dry_run_names_the_one_gpu_refusal() {
     );
 }
 
+/// A real (not dry-run) `lab-serve.sh` start whose ssh always succeeds, curl sees no server and
+/// rsync fails: the upload fails after bench.lock is taken. Returns the output and the stub calls.
+#[cfg(unix)]
+fn serve_with_failing_upload(tag: &str) -> (Output, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let stubs =
+        std::env::temp_dir().join(format!("turbine-lab-scripts-{}-{tag}", std::process::id()));
+    let _ = fs::remove_dir_all(&stubs);
+    fs::create_dir_all(&stubs).expect("stub dir");
+    let calls = stubs.join("calls.log");
+    for (tool, body) in [
+        ("ssh", "cat >/dev/null || true\nexit 0"),
+        ("curl", "printf 000\nexit 7"),
+        ("rsync", "exit 23"),
+        ("kubectl", "exit 0"),
+    ] {
+        let path = stubs.join(tool);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"{tool} $*\" >> '{}'\n{body}\n",
+                calls.display()
+            ),
+        )
+        .expect("write stub");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    }
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/lab-serve.sh"))
+        .args(["novanas", "scripts/lab/phase1-novanas.yaml"])
+        .current_dir(repo_root())
+        .env("PATH", path)
+        .env_remove("TURBINE_BENCH_LOCK_HELD")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run bash");
+    let log = fs::read_to_string(&calls).unwrap_or_default();
+    let _ = fs::remove_dir_all(&stubs);
+    (out, log)
+}
+
+/// Bug 2026-10-01: an upload that fails after lab-serve took bench.lock left the holder waiting
+/// up to an hour for a Job that never appeared, blocking every GPU job. Every exit before the
+/// Job is applied must kill this run's holder and remove its files.
+#[cfg(unix)]
+#[test]
+fn lab_serve_failed_upload_releases_the_bench_lock_holder() {
+    let (out, log) = serve_with_failing_upload("serve-upload-fails");
+    let err = stderr(&out);
+    assert!(!out.status.success(), "the start must fail: {err}");
+    assert!(err.contains("rsync to"), "{err}");
+    let start = log
+        .find("setsid nohup flock -x")
+        .unwrap_or_else(|| panic!("the holder was never started:\n{log}"));
+    let after = &log[start..];
+    assert!(
+        after.contains("pkill -f '[r]uns/serve-locks/"),
+        "the holder survived the failed upload:\n{log}"
+    );
+    assert!(
+        after.contains("rm -f /home/piwi/turbine-ci/runs/serve-locks/"),
+        "{log}"
+    );
+}
+
+/// A holder never outlives its run: with no Job after the grace it lets go by itself (the script
+/// may have been SIGKILLed or lost its ssh); the grace is bounded and the old hour is gone.
+#[test]
+fn lab_serve_holder_self_terminates_without_a_job() {
+    let src = fs::read_to_string(repo_root().join("scripts/lab-serve.sh")).expect("read");
+    assert!(
+        src.contains(r#"HOLDER_GRACE="${TURBINE_LAB_HOLDER_GRACE:-900}""#),
+        "grace must default to 900 s"
+    );
+    assert!(
+        src.contains(r"[ \$t -ge ${HOLDER_GRACE} ] && break"),
+        "the holder loop must use it"
+    );
+    assert!(!src.contains("-ge 3600"), "the one-hour wait is the bug");
+}
+
 /// Umbrella S-1 (amended by the Phase 6 split, 2026-09-28): `scripts/track-gate.sh` against a
 /// stub procoder launcher, temporary track specs and support-matrix files.
 #[cfg(unix)]
