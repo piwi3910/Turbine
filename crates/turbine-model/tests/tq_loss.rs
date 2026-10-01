@@ -1,10 +1,11 @@
-//! defect? Lab only (HIP device and weights): one prefill of the long golden prompt `p09` is
+//! `tq_loss_on_real_kv`: how much do the TurboQuant KV formats lose on real model K/V, and is a
+//! loss a codec defect? Lab only (HIP device and weights): one prefill of the long golden prompt `p09` is
 //! traced, and every layer's post-RoPE K (`k_rope`), V and post-RoPE q (`q_rope`) are run through
 //! the CPU reference codec (bit-exact to the GPU transcode). Per layer it prints:
 //!
 //! - `nmse` of K and V (Σ‖x̂ − x‖² / Σ‖x‖², decoded values rounded to BF16 as the L0 write does),
 //!   against the paper's D_mse (√3·π/2·4^−b bound; measured 0.36 / 0.117 / 0.03 / 0.009 for
-//!   b = 1 … 4) and, for K, the QJL variant's ≈ (π/2)·D_mse(b − 1);
+//!   b = 1 … 4);
 //! - `rot²`: mean of the rotated, √d/‖x‖-scaled coordinates squared (1 for a correct rotation)
 //!   and their kurtosis (3 for the Gaussian the codebook assumes);
 //! - `mean`: ‖mean of the head's K‖² / mean ‖k‖² — the share of K that is common to every token;
@@ -15,8 +16,10 @@
 //! - the attention output error of those queries (prefix keys and values decoded, the last 128
 //!   exact): mean ‖ô − o‖ / ‖o‖ and the mean total variation of the probabilities.
 //!
-//! Besides the shipped formats it measures K with all its bits in the MSE stage (`k4mse`, `k2mse`:
-//! the V path applied to K, no QJL) — the alternative TurboQuant_mse construction for K.
+//! The shipped formats code K and V alike (TurboQuant_mse). The former inner-product K (b − 1 MSE
+//! bits plus a 1-bit QJL residual) measured 5× the K nmse and about twice the attention-output
+//! error here (Llama tq4 K nmse 0.051 vs 0.009, out_rel 0.145 vs 0.080), which decided "6b Task
+//! 9: TurboQuant K quantizer" (A); the table of that run is in `.procoder/ask/decisions.md`.
 //!
 //! Asserts that each format's K and V nmse on real K/V stays within the codec's documented
 //! `nmse_bound` and that the rotation is normalised; the table is the evidence.
@@ -27,9 +30,7 @@ use serde::Deserialize;
 use turbine_kernels::{KernelMetrics, KernelRegistry, shim_provider};
 use turbine_kv::codec::turboquant::codebook::TQ_DIM;
 use turbine_kv::codec::turboquant::hadamard::{SignKind, rademacher, rotate};
-use turbine_kv::codec::turboquant::{
-    Tq2Codec, Tq4Codec, TqWidths, decode_record, decode_v, encode_record, encode_v, qjl,
-};
+use turbine_kv::codec::turboquant::{Tq2Codec, Tq4Codec, TqWidths, decode_record, encode_record};
 use turbine_kv::codec::{KvCodec, bf16_to_f32, f32_to_bf16};
 use turbine_model::executor::{
     self, DecoderExecutor, ExecutorLimits, ExecutorOptions, SequenceKv, TraceTensor,
@@ -71,22 +72,8 @@ fn bf(x: f32) -> f32 {
     bf16_to_f32(f32_to_bf16(x))
 }
 
-/// How one format turns a K or V vector into its decoded (BF16-rounded) value.
-#[derive(Clone, Copy, Debug)]
-enum Variant {
-    /// A shipped record (`encode_record` / `decode_record`).
-    Record(&'static str, TqWidths),
-    /// K with every bit in the MSE stage (the V path, no QJL); V as in the record.
-    KMse(&'static str, TqWidths, u32),
-}
-
-impl Variant {
-    fn name(self) -> &'static str {
-        match self {
-            Variant::Record(n, _) | Variant::KMse(n, _, _) => n,
-        }
-    }
-}
+/// A shipped format: its name and widths.
+type Variant = (&'static str, TqWidths);
 
 /// Decoded K and V of one (layer, head), `[tokens, d]` each.
 fn decode_head(
@@ -99,19 +86,12 @@ fn decode_head(
     let d = TQ_DIM;
     let ks = rademacher(SEED, layer as u32, head as u32, SignKind::K, d);
     let vs = rademacher(SEED, layer as u32, head as u32, SignKind::V, d);
-    let s = qjl::projection(SEED, layer as u32, head as u32, d);
-    let w = match v {
-        Variant::Record(_, w) | Variant::KMse(_, w, _) => w,
-    };
+    let w = v.1;
     let mut rec = vec![0u8; w.record_bytes()];
     let (mut kh, mut vh) = (Vec::with_capacity(k.len()), Vec::with_capacity(val.len()));
     for (kx, vx) in k.chunks_exact(d).zip(val.chunks_exact(d)) {
-        encode_record(w, kx, vx, &ks, &vs, &s, &mut rec);
+        encode_record(w, kx, vx, &ks, &vs, &mut rec);
         let (kd, vd) = decode_record(w, &rec, SEED, layer, head);
-        let kd = match v {
-            Variant::Record(..) => kd,
-            Variant::KMse(_, _, bits) => decode_v(&encode_v(kx, bits, &ks), bits, &ks),
-        };
         kh.extend(kd.into_iter().map(bf));
         vh.extend(vd.into_iter().map(bf));
     }
@@ -363,12 +343,7 @@ fn run(model_dir: &Path, slug: &str) {
         hkv: cfg.num_kv_heads as usize,
         scale: f64::from(cfg.attention_scale()),
     };
-    let variants = [
-        Variant::Record("tq4", Tq4Codec::WIDTHS),
-        Variant::KMse("tq4/k4mse", Tq4Codec::WIDTHS, 4),
-        Variant::Record("tq2", Tq2Codec::WIDTHS),
-        Variant::KMse("tq2/k2mse", Tq2Codec::WIDTHS, 2),
-    ];
+    let variants: [Variant; 2] = [("tq4", Tq4Codec::WIDTHS), ("tq2", Tq2Codec::WIDTHS)];
     let layers = cfg.num_layers as usize;
     let rows: Vec<Row> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..layers)
@@ -403,12 +378,12 @@ fn run(model_dir: &Path, slug: &str) {
             "layer {l}: rotated second moment {}",
             desc.0
         );
-        for (vi, b) in [(0, bounds[0]), (2, bounds[1])] {
+        for (vi, b) in [(0, bounds[0]), (1, bounds[1])] {
             let r = &per[vi];
             assert!(
                 r.k_nmse <= b && r.v_nmse <= b,
                 "layer {l} {}: K nmse {:.4}, V nmse {:.4} above the codec bound {b}",
-                variants[vi].name(),
+                variants[vi].0,
                 r.k_nmse,
                 r.v_nmse
             );
@@ -433,14 +408,7 @@ fn print_table(slug: &str, t: usize, variants: &[Variant], rows: &[Row]) {
         for (i, r) in per.iter().enumerate() {
             print!(
                 " {}: {:.4} {:.4} {:+.4} {:.3} {:.3} {:.4} {:.4} |",
-                variants[i].name(),
-                r.k_nmse,
-                r.v_nmse,
-                r.bias,
-                r.sd,
-                r.prod_d,
-                r.out_rel,
-                r.tv
+                variants[i].0, r.k_nmse, r.v_nmse, r.bias, r.sd, r.prod_d, r.out_rel, r.tv
             );
             let a = &mut avg[i];
             a.k_nmse += r.k_nmse;
@@ -457,7 +425,7 @@ fn print_table(slug: &str, t: usize, variants: &[Variant], rows: &[Row]) {
     for (i, a) in avg.iter().enumerate() {
         println!(
             "mean {:<10} K nmse {:.4}  V nmse {:.4}  e_bias {:+.4}  e_sd {:.3}  prod*d {:.3}  out_rel {:.4}  tv {:.4}",
-            variants[i].name(),
+            variants[i].0,
             a.k_nmse / n,
             a.v_nmse / n,
             a.bias / n,

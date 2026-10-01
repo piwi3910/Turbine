@@ -7,23 +7,23 @@
 //! - norm: `‖x‖` stored in BF16 (`n`);
 //! - codes: each `y_i·√d/‖x‖` quantized to the nearest centroid of the `b`-bit Lloyd–Max
 //!   codebook ([`codebook`]); decode `ŷ_i = c[code_i]·n/√d`;
-//! - K only (the paper's inner-product variant): the residual `r = y − ŷ` quantized to 1-bit QJL
-//!   signs of a seeded Gaussian projection with `‖r‖` in BF16 ([`qjl`]); decode adds `r̂`;
-//! - decode: `x̂ = s ⊙ (H·(ŷ [+ r̂]))/√d`, written to the L0 dtype.
+//! - decode: `x̂ = s ⊙ (H·ŷ)/√d`, written to the L0 dtype.
 //!
-//! `tq4`: K 3 + 1 bits, V 4 bits; `tq2`: K 1 + 1 bits, V 2 bits; every layer alike.
+//! K and V take the same path (the paper's TurboQuant_mse) with their own rotation signs: on real
+//! Llama / OLMoE K the inner-product variant (b − 1 MSE bits plus a 1-bit QJL residual) has 5×
+//! the reconstruction error and twice the attention-output error (decision "6b Task 9: TurboQuant
+//! K quantizer", user decision A, 2026-10-01). `tq4`: K and V 4 bits; `tq2`: K and V 2 bits;
+//! every layer alike.
 //!
 //! Slot layout (spec Data): records of one token-head vector pair, ordered per layer, per KV
 //! head, per token (record `(layer·heads + head)·block_tokens + token`); a record is K codes
-//! (bit-packed), K norm (BF16), K residual signs (bit-packed), K residual norm (BF16), V codes,
-//! V norm (BF16), zero padding to a multiple of 16 bytes, so every record — and its K codes —
-//! starts 16-byte aligned. Codes are packed least-significant bit first: code `i` of `b` bits
+//! (bit-packed), K norm (BF16), V codes, V norm (BF16), zero padding to a multiple of 16 bytes,
+//! so every record — and its K codes — starts 16-byte aligned (V codes 2-byte aligned). Codes are packed least-significant bit first: code `i` of `b` bits
 //! occupies bits `i·b ..` of the field (byte `bit / 8`, bit `bit % 8`). BF16 values are
 //! little-endian. `tq4` records are 144 bytes (BF16 L0: 512), `tq2` records 80.
 
 pub mod codebook;
 pub mod hadamard;
-pub mod qjl;
 
 use turbine_core::registry::Module;
 use turbine_core::types::KvLayout;
@@ -38,7 +38,7 @@ use super::{
 /// The widths of one TurboQuant variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TqWidths {
-    /// Bits of K's MSE stage (K also stores 1 QJL bit per coordinate).
+    /// Bits of K.
     pub k_bits: u32,
     /// Bits of V.
     pub v_bits: u32,
@@ -53,23 +53,14 @@ impl TqWidths {
     }
     /// Bytes of one record (one K and one V vector), padded to 16.
     pub fn record_bytes(self) -> usize {
-        let raw = self.k_code_bytes() + 2 + TQ_DIM / 8 + 2 + self.v_code_bytes() + 2;
+        let raw = self.k_code_bytes() + 2 + self.v_code_bytes() + 2;
         raw.div_ceil(16) * 16
     }
 }
 
-/// One encoded K vector.
+/// One encoded K or V vector: packed codes and the BF16 norm.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TqK {
-    pub codes: Vec<u8>,
-    pub norm: u16,
-    pub qjl: Vec<u8>,
-    pub residual_norm: u16,
-}
-
-/// One encoded V vector.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TqV {
+pub struct TqVec {
     pub codes: Vec<u8>,
     pub norm: u16,
 }
@@ -82,19 +73,6 @@ fn norm(x: &[f32]) -> f32 {
     x.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt() as f32
 }
 
-/// MSE stage: codes (one per coordinate, unpacked), the BF16 norm, the rotated vector and its
-/// decoded approximation.
-fn mse_encode(x: &[f32], bits: u32, signs: &[f32]) -> (Vec<u8>, u16, Vec<f32>, Vec<f32>) {
-    let cb = codebook(bits);
-    let n = norm(x);
-    let nb = f32_to_bf16(n);
-    let y = rotate(x, signs);
-    let inv = if n > 0.0 { sqrt_d() / n } else { 0.0 };
-    let codes: Vec<u8> = y.iter().map(|v| nearest(cb, v * inv)).collect();
-    let yhat = mse_values(&codes, nb, bits);
-    (codes, nb, y, yhat)
-}
-
 /// `ŷ_i = c[code_i]·n/√d` (rotated domain).
 fn mse_values(codes: &[u8], norm: u16, bits: u32) -> Vec<f32> {
     let cb = codebook(bits);
@@ -102,39 +80,24 @@ fn mse_values(codes: &[u8], norm: u16, bits: u32) -> Vec<f32> {
     codes.iter().map(|c| cb[usize::from(*c)] * k).collect()
 }
 
-/// Encodes one K vector (`TQ_DIM` values): `bits` MSE bits plus the QJL residual.
-pub fn encode_k(x: &[f32], bits: u32, k_signs: &[f32], qjl_s: &[f32]) -> TqK {
-    let (codes, nb, y, yhat) = mse_encode(x, bits, k_signs);
-    let r: Vec<f32> = y.iter().zip(&yhat).map(|(a, b)| a - b).collect();
-    TqK {
+/// Encodes one K or V vector (`TQ_DIM` values) with `bits` bits per coordinate and the
+/// rotation `signs` of its kind: codes of `y·√d/‖x‖` against the Lloyd–Max codebook.
+pub fn encode_vec(x: &[f32], bits: u32, signs: &[f32]) -> TqVec {
+    let cb = codebook(bits);
+    let n = norm(x);
+    let y = rotate(x, signs);
+    let inv = if n > 0.0 { sqrt_d() / n } else { 0.0 };
+    let codes: Vec<u8> = y.iter().map(|v| nearest(cb, v * inv)).collect();
+    TqVec {
         codes: pack(&codes, bits),
-        norm: nb,
-        qjl: qjl::encode(&r, qjl_s),
-        residual_norm: f32_to_bf16(norm(&r)),
+        norm: f32_to_bf16(n),
     }
 }
 
-/// Decodes one K vector: `s ⊙ H·(ŷ + r̂)/√d`.
-pub fn decode_k(k: &TqK, bits: u32, k_signs: &[f32], qjl_s: &[f32]) -> Vec<f32> {
-    let mut y = mse_values(&unpack(&k.codes, bits, TQ_DIM), k.norm, bits);
-    let r = qjl::decode(&k.qjl, bf16_to_f32(k.residual_norm), qjl_s);
-    y.iter_mut().zip(&r).for_each(|(a, b)| *a += b);
-    unrotate(&y, k_signs)
-}
-
-/// Encodes one V vector (`TQ_DIM` values) with `bits` MSE bits.
-pub fn encode_v(x: &[f32], bits: u32, v_signs: &[f32]) -> TqV {
-    let (codes, nb, _, _) = mse_encode(x, bits, v_signs);
-    TqV {
-        codes: pack(&codes, bits),
-        norm: nb,
-    }
-}
-
-/// Decodes one V vector: `s ⊙ H·ŷ/√d`.
-pub fn decode_v(v: &TqV, bits: u32, v_signs: &[f32]) -> Vec<f32> {
+/// Decodes one K or V vector: `s ⊙ H·ŷ/√d`.
+pub fn decode_vec(v: &TqVec, bits: u32, signs: &[f32]) -> Vec<f32> {
     let y = mse_values(&unpack(&v.codes, bits, TQ_DIM), v.norm, bits);
-    unrotate(&y, v_signs)
+    unrotate(&y, signs)
 }
 
 /// Packs `bits`-bit codes least-significant bit first.
@@ -169,8 +132,6 @@ pub fn unpack(packed: &[u8], bits: u32, n: usize) -> Vec<u8> {
 struct HeadSigns {
     k: Vec<f32>,
     v: Vec<f32>,
-    /// `d × d` row-major Gaussian projection of the QJL residual.
-    qjl: Vec<f32>,
 }
 
 impl HeadSigns {
@@ -179,7 +140,6 @@ impl HeadSigns {
         HeadSigns {
             k: s(SignKind::K),
             v: s(SignKind::V),
-            qjl: qjl::projection(seed, layer as u32, head as u32, TQ_DIM),
         }
     }
 }
@@ -188,8 +148,6 @@ impl HeadSigns {
 struct Fields {
     k_codes: usize,
     k_norm: usize,
-    qjl: usize,
-    r_norm: usize,
     v_codes: usize,
     v_norm: usize,
 }
@@ -197,15 +155,11 @@ struct Fields {
 impl Fields {
     fn of(w: TqWidths) -> Self {
         let k_norm = w.k_code_bytes();
-        let qjl = k_norm + 2;
-        let r_norm = qjl + TQ_DIM / 8;
-        let v_codes = r_norm + 2;
+        let v_codes = k_norm + 2;
         let v_norm = v_codes + w.v_code_bytes();
         Fields {
             k_codes: 0,
             k_norm,
-            qjl,
-            r_norm,
             v_codes,
             v_norm,
         }
@@ -219,19 +173,17 @@ fn get_u16(b: &[u8], at: usize) -> u16 {
 /// K and V of one record, in F32 (before the L0 rounding).
 fn decode_record_with(w: TqWidths, r: &[u8], s: &HeadSigns) -> (Vec<f32>, Vec<f32>) {
     let f = Fields::of(w);
-    let k = TqK {
+    let k = TqVec {
         codes: r[f.k_codes..f.k_norm].to_vec(),
         norm: get_u16(r, f.k_norm),
-        qjl: r[f.qjl..f.r_norm].to_vec(),
-        residual_norm: get_u16(r, f.r_norm),
     };
-    let v = TqV {
+    let v = TqVec {
         codes: r[f.v_codes..f.v_norm].to_vec(),
         norm: get_u16(r, f.v_norm),
     };
     (
-        decode_k(&k, w.k_bits, &s.k, &s.qjl),
-        decode_v(&v, w.v_bits, &s.v),
+        decode_vec(&k, w.k_bits, &s.k),
+        decode_vec(&v, w.v_bits, &s.v),
     )
 }
 
@@ -249,8 +201,7 @@ pub fn decode_record(
 }
 
 /// Encodes one token-head K/V pair (`TQ_DIM` values each) into `record` (`w.record_bytes()`
-/// bytes, fully written, padding zeroed) with the (layer, head) rotation signs and QJL
-/// projection: exactly the record `encode_cpu` writes for these values. The L0 paged append of
+/// bytes, fully written, padding zeroed) with the (layer, head) rotation signs: exactly the record `encode_cpu` writes for these values. The L0 paged append of
 /// TurboQuant pages (P6b S-5) encodes new rows through it.
 pub fn encode_record(
     w: TqWidths,
@@ -258,18 +209,15 @@ pub fn encode_record(
     v: &[f32],
     k_signs: &[f32],
     v_signs: &[f32],
-    qjl_s: &[f32],
     record: &mut [u8],
 ) {
     let f = Fields::of(w);
-    let k = encode_k(k, w.k_bits, k_signs, qjl_s);
-    let v = encode_v(v, w.v_bits, v_signs);
+    let k = encode_vec(k, w.k_bits, k_signs);
+    let v = encode_vec(v, w.v_bits, v_signs);
     let r = &mut record[..w.record_bytes()];
     r.fill(0);
     r[f.k_codes..f.k_norm].copy_from_slice(&k.codes);
-    r[f.k_norm..f.qjl].copy_from_slice(&k.norm.to_le_bytes());
-    r[f.qjl..f.r_norm].copy_from_slice(&k.qjl);
-    r[f.r_norm..f.v_codes].copy_from_slice(&k.residual_norm.to_le_bytes());
+    r[f.k_norm..f.v_codes].copy_from_slice(&k.norm.to_le_bytes());
     r[f.v_codes..f.v_norm].copy_from_slice(&v.codes);
     r[f.v_norm..f.v_norm + 2].copy_from_slice(&v.norm.to_le_bytes());
 }
@@ -321,7 +269,7 @@ fn tq_encode(
             for t in 0..g.tokens {
                 let r = &mut dst[((layer * g.heads + h) * g.tokens + t) * rec..][..rec];
                 let (k, v) = (read(layer, 0, t, h), read(layer, 1, t, h));
-                encode_record(w, &k, &v, &s.k, &s.v, &s.qjl, r);
+                encode_record(w, &k, &v, &s.k, &s.v, r);
             }
         }
     }
@@ -388,9 +336,10 @@ macro_rules! tq_codec {
                 $abi
             }
 
-            /// K: ≈ (π/2)·D_mse(k_bits) — the QJL term buys an unbiased inner product with
-            /// reconstruction error (`‖r̂‖² ≈ (1 + π/2)·‖r‖²` for a Gaussian `S`); V: D_mse(v_bits);
-            /// the bound is the larger with a ≈ 30 % margin (`tq4` 0.053 → 0.07, `tq2` 0.567 → 0.75).
+            /// K and V: D_mse(bits) of the committed codebook with a ≈ 25 % margin over the
+            /// largest measured block nmse (`kv_codecs_suite`, Gaussian and outlier blocks over
+            /// BF16 and FP8 L0: `tq4` ≤ 0.0098, `tq2` ≤ 0.119; real Llama-3.2-3B / OLMoE K and
+            /// V, `tq_loss_on_real_kv`: ≤ 0.0094 / ≤ 0.118): `tq4` 0.0125, `tq2` 0.15.
             fn nmse_bound(&self) -> f64 {
                 $bound
             }
@@ -434,21 +383,21 @@ tq_codec!(
     Tq4Codec,
     "tq4",
     2,
-    3,
     4,
-    0.07,
+    4,
+    0.0125,
     0.5,
-    "`tq4`: K 3 + 1 bits (MSE stage + QJL), V 4 bits; 144-byte records."
+    "`tq4`: K and V 4 bits; 144-byte records."
 );
 tq_codec!(
     Tq2Codec,
     "tq2",
     3,
-    1,
     2,
-    0.75,
+    2,
+    0.15,
     1.0,
-    "`tq2`: K 1 + 1 bits (MSE stage + QJL), V 2 bits; 80-byte records."
+    "`tq2`: K and V 2 bits; 80-byte records."
 );
 
 #[cfg(test)]

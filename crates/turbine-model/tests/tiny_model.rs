@@ -29,9 +29,7 @@ use turbine_kernels::{
 use turbine_kernels::{KV_FMT_TQ2, KV_FMT_TQ4, TqHeadTables, TqParams};
 use turbine_kv::codec::turboquant::codebook::{TQ_DIM, codebook};
 use turbine_kv::codec::turboquant::hadamard::{SignKind, rademacher};
-use turbine_kv::codec::turboquant::{
-    Tq2Codec, Tq4Codec, TqWidths, decode_record, encode_record, qjl,
-};
+use turbine_kv::codec::turboquant::{Tq2Codec, Tq4Codec, TqWidths, decode_record, encode_record};
 use turbine_model::config::{ModelArchConfig, RopeScaling};
 use turbine_model::ep::{self, ExpertPlacement};
 use turbine_model::executor::{
@@ -533,15 +531,7 @@ impl Naive {
                 for (i, (k, v)) in k.chunks_exact_mut(d).zip(v.chunks_exact_mut(d)).enumerate() {
                     let tables = tq_head_tables(seed, layer, (i % hkv) as u32);
                     let mut record = vec![0u8; w.record_bytes()];
-                    encode_record(
-                        w,
-                        k,
-                        v,
-                        &tables.k_signs,
-                        &tables.v_signs,
-                        &tables.qjl,
-                        &mut record,
-                    );
+                    encode_record(w, k, v, &tables.k_signs, &tables.v_signs, &mut record);
                     let (dk, dv) = decode_record(w, &record, seed, layer as usize, i % hkv);
                     k.copy_from_slice(&dk);
                     v.copy_from_slice(&dv);
@@ -990,13 +980,11 @@ fn tq_widths(dtype: DType) -> TqWidths {
     }
 }
 
-/// One KV head's TurboQuant tables of `layer` under `seed` (`turbine-kv`'s signs and QJL
-/// projection).
+/// One KV head's TurboQuant tables of `layer` under `seed` (`turbine-kv`'s rotation signs).
 fn tq_head_tables(seed: u64, layer: u32, head: u32) -> TqHeadTables {
     TqHeadTables {
         k_signs: rademacher(seed, layer, head, SignKind::K, TQ_DIM),
         v_signs: rademacher(seed, layer, head, SignKind::V, TQ_DIM),
-        qjl: qjl::projection(seed, layer, head, TQ_DIM),
     }
 }
 
@@ -1008,7 +996,7 @@ fn tq_encode(fmt: u8, k: &[f32], v: &[f32], head: &TqHeadTables, record: &mut [u
         KV_FMT_TQ2 => Tq2Codec::WIDTHS,
         other => panic!("format {other} is not TurboQuant"),
     };
-    encode_record(w, k, v, &head.k_signs, &head.v_signs, &head.qjl, record);
+    encode_record(w, k, v, &head.k_signs, &head.v_signs, record);
 }
 
 /// TurboQuant L0 pages of `dtype` for `cfg` under `seed`.

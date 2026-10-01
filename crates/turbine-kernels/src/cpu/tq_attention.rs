@@ -13,20 +13,20 @@
 //! - `fp8_e4m3`: the same elements as OCP e4m3 bytes, read as `bf16(e4m3 × scale)` with the
 //!   layer's K / V scale (the 6a FP8 page contract, as the GPU kernels read them);
 //! - `tq4` / `tq2`: `kv_heads × block_tokens` records of the `turbine-kv` TurboQuant codec
-//!   (record `head·block_tokens + token`; K codes, K norm, QJL signs, residual norm, V codes,
-//!   V norm, padded to 16 bytes; `tq4` 144 bytes, `tq2` 80).
+//!   (record `head·block_tokens + token`; K codes, K norm, V codes, V norm, padded to 16 bytes;
+//!   K and V 4 bits in `tq4`, 144 bytes, 2 bits in `tq2`, 80 bytes).
 //!
 //! Two formulations, equal within 1e-5 (`rotated_equals_decoded`):
 //! - [`Formulation::DecodeThenAttend`]: every TurboQuant record decoded to F32 exactly as the
 //!   codec's `decode_record` does, then exact attention (F64 accumulation) over the values;
 //! - [`Formulation::Rotated`]: per query row and KV head, `q` is rotated once
-//!   (`Rq = H·(s_k ⊙ q)/√d`) and projected once more (`S·Rq`) for the QJL residual; a TurboQuant
-//!   key scores `norm/√d · ⟨Rq, c[codes]⟩ + √(π/2)/d · ‖r‖ · ⟨S·Rq, z⟩`; V is accumulated as
+//!   (`Rq = H·(s_k ⊙ q)/√d`); a TurboQuant key scores `norm/√d · ⟨Rq, c[codes]⟩` (the
+//!   rotated-domain MSE reconstruction; K is TurboQuant_mse like V); V is accumulated as
 //!   `norm/√d · c[codes]` in the rotated domain and rotated back once per output row
 //!   (`s_v ⊙ H·acc/√d`), added to the plain-domain accumulation of BF16 / FP8 blocks.
 //!
 //! The TurboQuant math here is a copy of `turbine-kv`'s codec decode (this crate does not
-//! depend on `turbine-kv`; the rotation signs, the QJL projection and the codebooks arrive as
+//! depend on `turbine-kv`; the rotation signs and the codebooks arrive as
 //! data in [`TqParams`], which the caller builds from the codec, as the GPU receives them).
 //! `matches_decoded_attention` holds the copy to the codec's `decode_record`.
 
@@ -82,8 +82,8 @@ pub struct MixedPagedLayer<'a> {
 /// The widths of a TurboQuant format: (K MSE bits, V bits).
 fn tq_widths(fmt: u8) -> Option<(usize, usize)> {
     match fmt {
-        FMT_TQ4 => Some((3, 4)),
-        FMT_TQ2 => Some((1, 2)),
+        FMT_TQ4 => Some((4, 4)),
+        FMT_TQ2 => Some((2, 2)),
         _ => None,
     }
 }
@@ -94,8 +94,6 @@ struct Record {
     k_bits: usize,
     v_bits: usize,
     k_norm: usize,
-    qjl: usize,
-    r_norm: usize,
     v_codes: usize,
     v_norm: usize,
     bytes: usize,
@@ -104,16 +102,12 @@ struct Record {
 impl Record {
     fn of(k_bits: usize, v_bits: usize) -> Record {
         let k_norm = TQ_DIM * k_bits / 8;
-        let qjl = k_norm + 2;
-        let r_norm = qjl + TQ_DIM / 8;
-        let v_codes = r_norm + 2;
+        let v_codes = k_norm + 2;
         let v_norm = v_codes + TQ_DIM * v_bits / 8;
         Record {
             k_bits,
             v_bits,
             k_norm,
-            qjl,
-            r_norm,
             v_codes,
             v_norm,
             bytes: (v_norm + 2).div_ceil(16) * 16,
@@ -131,15 +125,6 @@ fn code(packed: &[u8], bits: usize, i: usize) -> usize {
         let bit = i * bits + j;
         c | (usize::from(packed[bit / 8] >> (bit % 8) & 1) << j)
     })
-}
-
-/// QJL sign `i` as ±1.
-fn sign(bits: &[u8], i: usize) -> f32 {
-    if bits[i / 8] >> (i % 8) & 1 == 1 {
-        1.0
-    } else {
-        -1.0
-    }
 }
 
 fn sqrt_d() -> f32 {
@@ -174,18 +159,11 @@ fn unrotate_f32(y: &[f32], signs: &[f32]) -> Vec<f32> {
 /// K and V of one record in F32, the codec's `decode_record` step for step.
 fn decode_record(r: &[u8], rec: Record, head: &TqHeadTables, cbs: &[Vec<f32>; 4]) -> [Vec<f32>; 2] {
     let (kcb, vcb) = (&cbs[rec.k_bits - 1], &cbs[rec.v_bits - 1]);
-    // K: ŷ = c[code]·n/√d plus the QJL residual r̂ = √(π/2)/d · ‖r‖ · Sᵀ·z, then unrotated.
+    // K: ŷ = c[code]·n/√d, unrotated.
     let kk = get_bf16(r, rec.k_norm) / sqrt_d();
-    let mut y: Vec<f32> = (0..TQ_DIM)
+    let y: Vec<f32> = (0..TQ_DIM)
         .map(|i| kcb[code(&r[..rec.k_norm], rec.k_bits, i)] * kk)
         .collect();
-    let mut res = vec![0f32; TQ_DIM];
-    for (i, row) in head.qjl.chunks_exact(TQ_DIM).enumerate() {
-        let z = sign(&r[rec.qjl..rec.r_norm], i);
-        res.iter_mut().zip(row).for_each(|(o, a)| *o += z * a);
-    }
-    let rk = ((std::f64::consts::PI / 2.0).sqrt() / TQ_DIM as f64) as f32 * get_bf16(r, rec.r_norm);
-    y.iter_mut().zip(&res).for_each(|(a, b)| *a += b * rk);
     let k = unrotate_f32(&y, &head.k_signs);
     // V: ŷ = c[code]·n/√d, unrotated.
     let vk = get_bf16(r, rec.v_norm) / sqrt_d();
@@ -376,17 +354,8 @@ fn attend_row(
     scale: f32,
 ) -> Vec<f32> {
     let d = q.len();
-    let rot = |h: &TqHeadTables| {
-        let rq = rotate_f64(q, &h.k_signs);
-        let sq: Vec<f64> = h
-            .qjl
-            .chunks_exact(TQ_DIM)
-            .map(|row| row.iter().zip(&rq).map(|(a, b)| f64::from(*a) * b).sum())
-            .collect();
-        (rq, sq)
-    };
     let rotated = match (how, head) {
-        (Formulation::Rotated, Some(h)) => Some(rot(h)),
+        (Formulation::Rotated, Some(h)) => Some(rotate_f64(q, &h.k_signs)),
         _ => None,
     };
     let decoded: Vec<Option<[Vec<f32>; 2]>> = entries[..visible]
@@ -409,18 +378,12 @@ fn attend_row(
         .map(|i| {
             let s = match (values(i), &entries[i], &rotated) {
                 (Some(kv), _, _) => dot(q, &kv[0]),
-                (None, Entry::Tq(r, rec), Some((rq, sq))) => {
+                (None, Entry::Tq(r, rec), Some(rq)) => {
                     let cb = &tq.codebooks[rec.k_bits - 1];
                     let mse: f64 = (0..TQ_DIM)
                         .map(|j| rq[j] * f64::from(cb[code(&r[..rec.k_norm], rec.k_bits, j)]))
                         .sum();
-                    let qjl: f64 = (0..TQ_DIM)
-                        .map(|j| sq[j] * f64::from(sign(&r[rec.qjl..rec.r_norm], j)))
-                        .sum();
                     f64::from(get_bf16(r, rec.k_norm)) / (TQ_DIM as f64).sqrt() * mse
-                        + (std::f64::consts::PI / 2.0).sqrt() / TQ_DIM as f64
-                            * f64::from(get_bf16(r, rec.r_norm))
-                            * qjl
                 }
                 _ => unreachable!("a TurboQuant entry is decoded or rotated"),
             };
@@ -539,7 +502,7 @@ mod tests {
     use turbine_core::types::{DType, KvLayout};
     use turbine_kv::codec::turboquant::codebook::codebook;
     use turbine_kv::codec::turboquant::hadamard::{SignKind, rademacher};
-    use turbine_kv::codec::turboquant::{Tq2Codec, Tq4Codec, decode_record, qjl};
+    use turbine_kv::codec::turboquant::{Tq2Codec, Tq4Codec, decode_record};
     use turbine_kv::codec::{CodecParams, KvCodec};
 
     use super::*;
@@ -579,7 +542,6 @@ mod tests {
                 .map(|h| TqHeadTables {
                     k_signs: rademacher(SEED, LAYER as u32, h as u32, SignKind::K, TQ_DIM),
                     v_signs: rademacher(SEED, LAYER as u32, h as u32, SignKind::V, TQ_DIM),
-                    qjl: qjl::projection(SEED, LAYER as u32, h as u32, TQ_DIM),
                 })
                 .collect(),
             codebooks: [codebook(1), codebook(2), codebook(3), codebook(4)].map(<[f32]>::to_vec),
@@ -783,7 +745,7 @@ mod tests {
 
     /// Prefill (a 40-token chunk after 0 and a 10-token chunk after 30) and decode over
     /// all-`tq4` and all-`tq2` tables equal exact attention over the codec's F32 decode of the
-    /// records. Breaks if the record layout, the codebook, the QJL term or the rotation signs
+    /// records. Breaks if the record layout, the codebook, the K path or the rotation signs
     /// of the reference differ from the codec.
     #[test]
     fn matches_decoded_attention() {
@@ -815,7 +777,7 @@ mod tests {
 
     /// The rotated-domain formulation (q rotated once, V accumulated rotated and rotated back
     /// once) equals decode-then-attend within 1e-5 for prefill and decode over every format.
-    /// Breaks if the QJL correction, the norm scaling or the V back-rotation drifts.
+    /// Breaks if the K score, the norm scaling or the V back-rotation drifts.
     #[test]
     fn rotated_equals_decoded() {
         let blocks: Vec<Block> = [FMT_TQ4, FMT_TQ2, FMT_BF16, FMT_FP8_E4M3, FMT_TQ2, FMT_TQ4]

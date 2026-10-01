@@ -785,9 +785,8 @@ impl KvTranscodeContext<'_> {
 /// The TurboQuant tables of a `tq4` / `tq2` transcode in device memory (ABI v2.11
 /// `turbine_tq_params`), built on the host from the codec (`turbine_kv::codec::turboquant`) for
 /// the context's seed; a library never regenerates them. `codebooks[bits − 1]`: F32 `[2^bits]`,
-/// the unit-variance Lloyd–Max centroids; `tables`: F32 `[layers, num_kv_heads, 2·head_dim +
-/// head_dim²]`, per (layer, KV head) the K signs, the V signs and the QJL projection `S`
-/// (row-major), as [`TqHeadTables`] holds them.
+/// the unit-variance Lloyd–Max centroids; `tables`: F32 `[layers, num_kv_heads, 2·head_dim]`,
+/// per (layer, KV head) the K signs then the V signs, as [`TqHeadTables`] holds them.
 #[derive(Clone, Debug)]
 pub struct KvTranscodeTables<'a> {
     pub codebooks: [TensorView<'a>; 4],
@@ -797,8 +796,7 @@ pub struct KvTranscodeTables<'a> {
 impl KvTranscodeTables<'_> {
     /// F32 elements of one (layer, KV head)'s entry of `tables`.
     pub fn head_elems(head_dim: u32) -> usize {
-        let d = head_dim as usize;
-        2 * d + d * d
+        2 * head_dim as usize
     }
 }
 
@@ -872,9 +870,9 @@ pub struct PagedAttentionContext<'a> {
 pub const KV_FMT_BF16: u8 = 0;
 /// Block format code of an FP8 e4m3 page.
 pub const KV_FMT_FP8_E4M3: u8 = 1;
-/// Block format code of a TurboQuant `tq4` page (K 3 + 1 bits, V 4 bits).
+/// Block format code of a TurboQuant `tq4` page (K and V 4 bits).
 pub const KV_FMT_TQ4: u8 = 2;
-/// Block format code of a TurboQuant `tq2` page (K 1 + 1 bits, V 2 bits).
+/// Block format code of a TurboQuant `tq2` page (K and V 2 bits).
 pub const KV_FMT_TQ2: u8 = 3;
 
 /// The block format code of KV pages of `dtype` (`None`: not a KV page dtype).
@@ -895,8 +893,6 @@ pub struct TqHeadTables {
     pub k_signs: Vec<f32>,
     /// ±1 signs of the V rotation.
     pub v_signs: Vec<f32>,
-    /// The QJL projection `S`, `128 × 128` row-major.
-    pub qjl: Vec<f32>,
 }
 
 /// TurboQuant parameters of one layer (P6b S-5; the host side of the v2.11 `tq_params`).

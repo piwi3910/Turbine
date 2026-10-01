@@ -3,7 +3,7 @@
 //!
 //! The rotation seed is the tier codecs' ([`HostCodec::of`]): the first 8 bytes of the unsalted
 //! namespace key of the L0 format, so an L0 record and a lower-tier copy of it decode alike.
-//! Every table is derived from `turbine-kv`'s TurboQuant codec (rotation signs, QJL projection,
+//! Every table is derived from `turbine-kv`'s TurboQuant codec (rotation signs,
 //! Lloyd–Max codebooks) and its `encode_record`, so L0 records are byte for byte the records
 //! `encode_cpu` writes.
 
@@ -13,7 +13,7 @@ use turbine_core::types::{DType, KvLayout, ModelIdentity};
 use turbine_kernels::{KV_FMT_TQ2, KV_FMT_TQ4, TqHeadTables, TqParams};
 use turbine_kv::codec::turboquant::codebook::{TQ_DIM, codebook};
 use turbine_kv::codec::turboquant::hadamard::{SignKind, rademacher};
-use turbine_kv::codec::turboquant::{Tq2Codec, Tq4Codec, TqWidths, encode_record, qjl};
+use turbine_kv::codec::turboquant::{Tq2Codec, Tq4Codec, TqWidths, encode_record};
 use turbine_model::kv_scales::{KvCache, TqKv};
 
 use crate::kv_orchestrator::{HostCodec, kv_format};
@@ -31,7 +31,6 @@ pub fn layer_params(seed: u64, layer: u32, num_kv_heads: u32) -> TqParams {
             .map(|h| TqHeadTables {
                 k_signs: rademacher(seed, layer, h, SignKind::K, TQ_DIM),
                 v_signs: rademacher(seed, layer, h, SignKind::V, TQ_DIM),
-                qjl: qjl::projection(seed, layer, h, TQ_DIM),
             })
             .collect(),
         codebooks: [codebook(1), codebook(2), codebook(3), codebook(4)].map(<[f32]>::to_vec),
@@ -51,7 +50,7 @@ fn widths(fmt: u8) -> Option<TqWidths> {
 /// The kernel only calls it for TurboQuant blocks (a record of another format is left as is).
 pub fn encode(fmt: u8, k: &[f32], v: &[f32], head: &TqHeadTables, record: &mut [u8]) {
     if let Some(w) = widths(fmt) {
-        encode_record(w, k, v, &head.k_signs, &head.v_signs, &head.qjl, record);
+        encode_record(w, k, v, &head.k_signs, &head.v_signs, record);
     }
 }
 
@@ -142,7 +141,6 @@ mod tests {
                 &v,
                 &p.params.heads[1].k_signs,
                 &p.params.heads[1].v_signs,
-                &p.params.heads[1].qjl,
                 &mut again,
             );
             assert_eq!(record, again);

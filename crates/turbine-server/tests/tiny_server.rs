@@ -1639,8 +1639,8 @@ fn write_tiny_llama_128(dir: &TempDir) -> (PathBuf, u64, u64) {
 fn tq_tables_are_in_the_workspace_pool() {
     let dir = TempDir::new("turbine-tq-budget");
     let (tiny, layers, heads) = write_tiny_llama_128(&dir);
-    // layers x KV heads x (K signs + V signs + S) F32, and the four codebooks.
-    let tables = 4 * (layers * heads * (2 * 128 + 128 * 128) + 2 + 4 + 8 + 16);
+    // layers x KV heads x (K signs + V signs) F32, and the four codebooks.
+    let tables = 4 * (layers * heads * 2 * 128 + 2 + 4 + 8 + 16);
     let workspace = |kv: &str| -> u64 {
         let addr = free_addr();
         let yaml = format!(

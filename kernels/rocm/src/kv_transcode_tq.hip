@@ -3,9 +3,10 @@
 // TurboQuant records in a device buffer of coded slots, and decode them back
 // (Phase 6b S-4, Task 8).
 //
-// `turbine_hip_tq`: the codecs tq4 (K 3 + 1 bits, V 4 bits, 144-byte records)
-// and tq2 (K 1 + 1, V 2, 80 bytes) of crates/turbine-kv codec/turboquant,
-// head_dim 128. An own kernel per the decision "P6b: TurboQuant transcode —
+// `turbine_hip_tq`: the codecs tq4 (K and V 4 bits, 144-byte records) and tq2
+// (K and V 2 bits, 80 bytes) of crates/turbine-kv codec/turboquant, head_dim
+// 128; K and V are both TurboQuant_mse (decision "6b Task 9: TurboQuant K
+// quantizer" A). An own kernel per the decision "P6b: TurboQuant transcode —
 // provider evaluation (kernel reuse rule)": no upstream kernel implements the
 // codec (vLLM's TurboQuant is Triton / FlyDSL and a different codec, SGLang
 // and CK have no TurboQuant), and the one building block reused is the
@@ -24,14 +25,10 @@
 //   codes      nearest centroid of y * (f32(sqrt(128)) / norm) (0 when the
 //              norm is not positive), midpoints (c[i] + c[i+1]) * 0.5 compared
 //              with >, so a value on a midpoint takes the lower code;
-//   K residual r = y - c[code] * (bf16(norm) / f32(sqrt(128))), its F64 norm
-//              in BF16, and the sign bits of S * r (each row an F32 dot
-//              product summed in column order; bit set when >= 0);
-//   decode     (c[code] * k [+ r_hat]) through fwht, times
-//              f32(1 / sqrt(128)) * s, to BF16; r_hat_j = (sum over rows i
-//              in order of +-S[i][j]) * (f32(sqrt(pi / 2) / 128) * bf16(rnorm)).
-// The signs, S and the codebooks come from d->tq_params, built on the host
-// from the codec; nothing is regenerated here.
+//   decode     c[code] * (bf16(norm) / f32(sqrt(128))) through fwht, times
+//              f32(1 / sqrt(128)) * s, to BF16.
+// The signs and the codebooks come from d->tq_params, built on the host from
+// the codec; nothing is regenerated here.
 //
 // One workgroup per (KV head, layer, block): 128 threads, the block's tokens
 // in chunks of 32, staged in LDS. The page table goes up through the upload
@@ -55,8 +52,7 @@ constexpr const char *kTqImpl = "turbine_hip_tq";
 using namespace turbine_hip::tq;
 
 int record_bytes(int32_t format) {
-  return format == TURBINE_KVFMT_TQ4 ? Record<3, 4>::kBytes
-                                     : Record<1, 2>::kBytes;
+  return format == TURBINE_KVFMT_TQ4 ? Tq4::kBytes : Tq2::kBytes;
 }
 
 int64_t tq_slot_bytes(const turbine_kv_transcode_desc *d) {
@@ -255,12 +251,6 @@ int32_t kv_transcode_tq_run(turbine_ctx *ctx,
                     std::to_string(tq->seed) + ", the call of seed " +
                     std::to_string(d->seed));
   }
-  // The tables' S rows are read as float4.
-  if (reinterpret_cast<uintptr_t>(tq->tables) % 16 != 0) {
-    return fail(ctx, TURBINE_E_ARGUMENT,
-                "turbine_kv_transcode: TurboQuant tables are not 16-byte "
-                "aligned");
-  }
   if (d->coded_block_bytes != tq_slot_bytes(d)) {
     return fail(ctx, TURBINE_E_ARGUMENT,
                 std::string("turbine_kv_transcode (") + kTqImpl +
@@ -289,9 +279,9 @@ int32_t kv_transcode_tq_run(turbine_ctx *ctx,
       rc != TURBINE_OK)
     return rc;
   if (d->format == TURBINE_KVFMT_TQ4)
-    launch<3, 4>(ctx, d, table, tq->codebooks);
+    launch<4, 4>(ctx, d, table, tq->codebooks);
   else
-    launch<1, 2>(ctx, d, table, tq->codebooks);
+    launch<2, 2>(ctx, d, table, tq->codebooks);
   return check_hip(ctx, hipGetLastError(), "turbine_kv_transcode launch");
 }
 

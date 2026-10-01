@@ -1,5 +1,6 @@
-//! `codec::turboquant::tests` (P6b S-4 acceptance): rotation, codebooks, the K inner-product
-//! estimator, the V MSE against the paper's D_mse and the packed layout.
+//! `codec::turboquant::tests` (P6b S-4 acceptance): rotation, codebooks, the K and V MSE against
+//! the paper's D_mse (K and V both TurboQuant_mse, decision "6b Task 9: TurboQuant K quantizer")
+//! and the packed layout.
 
 use super::codebook::*;
 use super::hadamard::*;
@@ -9,11 +10,6 @@ use turbine_core::types::DType;
 
 fn gaussian(rng: &mut Rng) -> Vec<f32> {
     (0..TQ_DIM).map(|_| rng.normal() as f32).collect()
-}
-
-fn unit(x: Vec<f32>) -> Vec<f32> {
-    let n = norm(&x);
-    x.into_iter().map(|v| v / n).collect()
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f64 {
@@ -37,42 +33,45 @@ fn stats(v: &[f64]) -> (f64, f64, f64) {
     (mean, var.sqrt(), (var / n).sqrt())
 }
 
-/// `tq4` and `tq2` K estimates `⟨q, k̂⟩` of `⟨q, k⟩` are unbiased over 10,000 seeded pairs of unit
-/// vectors with ⟨q, k⟩ ≈ 0.71 (|mean error| < 3 standard errors), and their variance stays
-/// within the paper's D_prod bound (√3·π²/d)·4^−b. The pairs are correlated so that an
-/// MSE-only estimate (no QJL term), which shrinks every inner product by ≈ D_mse, is far
-/// outside 3 standard errors. Breaks if the QJL residual is dropped or mis-scaled.
+/// `tq4` and `tq2` records, through `encode_record` / `decode_record` (the shipped path): K and V
+/// reconstruction MSE over 4,000 seeded Gaussian pairs of random norms, each within 10 % of the
+/// paper's D_mse of the format's bits (0.009 / 0.117), and the K and V of a record are coded
+/// alike (same widths). Breaks on a regression to the inner-product K (b − 1 MSE bits plus a
+/// QJL residual: K MSE 0.05 / 0.55, 5× the bound) or to fewer K bits.
 #[test]
-fn k_inner_product_unbiased() {
-    for (name, w) in [("tq4", Tq4Codec::WIDTHS), ("tq2", Tq2Codec::WIDTHS)] {
-        let mut rng = Rng(0xbad5eed);
-        let mut err = Vec::with_capacity(10_000);
-        for i in 0..10_000 {
-            let k = unit(gaussian(&mut rng));
-            let noise = gaussian(&mut rng);
-            let q = unit(k.iter().zip(&noise).map(|(a, b)| a + b / 11.3).collect());
-            let s = signs_for(i);
-            let enc = encode_k(&k, w.k_bits, &s.k, &s.qjl);
-            let khat = decode_k(&enc, w.k_bits, &s.k, &s.qjl);
-            err.push(dot(&q, &khat) - dot(&q, &k));
+fn k_mse_bound_records() {
+    for (name, w, paper) in [
+        ("tq4", Tq4Codec::WIDTHS, 0.009),
+        ("tq2", Tq2Codec::WIDTHS, 0.117),
+    ] {
+        assert_eq!(w.k_bits, w.v_bits, "{name}: K and V widths");
+        let mut rng = Rng(0x6b9_0000 + u64::from(w.k_bits));
+        let (mut ek, mut ev) = (Vec::new(), Vec::new());
+        let mut rec = vec![0u8; w.record_bytes()];
+        for i in 0..4_000 {
+            let pair: Vec<Vec<f32>> = (0..2)
+                .map(|_| {
+                    let scale = (rng.normal() * 2.0).exp() as f32;
+                    gaussian(&mut rng).into_iter().map(|v| v * scale).collect()
+                })
+                .collect();
+            let (seed, layer, head) = (0x7e57 ^ (i as u64 * 0x9e37_79b9), i % 28, i % 8);
+            let s = HeadSigns::of(seed, layer, head);
+            encode_record(w, &pair[0], &pair[1], &s.k, &s.v, &mut rec);
+            let (k, v) = decode_record(w, &rec, seed, layer, head);
+            for (x, xhat, out) in [(&pair[0], k, &mut ek), (&pair[1], v, &mut ev)] {
+                let d: Vec<f32> = x.iter().zip(&xhat).map(|(a, b)| a - b).collect();
+                out.push(dot(&d, &d) / dot(x, x));
+            }
         }
-        let (mean, sd, se) = stats(&err);
-        let b = w.k_bits as i32 + 1;
-        let bound = 3f64.sqrt() * std::f64::consts::PI.powi(2) / TQ_DIM as f64 / 4f64.powi(b);
-        println!(
-            "{name} K: mean error {mean:.3e}, 3·SE {:.3e}, variance {:.3e} (D_prod bound {bound:.3e})",
-            3.0 * se,
-            sd * sd
-        );
-        assert!(
-            mean.abs() < 3.0 * se,
-            "{name}: biased, mean {mean} vs SE {se}"
-        );
-        assert!(
-            sd * sd <= bound,
-            "{name}: variance {} above {bound}",
-            sd * sd
-        );
+        for (kind, e) in [("K", &ek), ("V", &ev)] {
+            let (mean, _, se) = stats(e);
+            println!("{name} {kind}: MSE {mean:.5} ± {se:.5} (paper {paper})");
+            assert!(
+                (mean - paper).abs() <= 0.1 * paper,
+                "{name} {kind}: MSE {mean} vs paper {paper}"
+            );
+        }
     }
 }
 
@@ -86,7 +85,7 @@ fn v_mse(bits: u32, paper: f64) {
         let scale = (rng.normal() * 2.0).exp() as f32;
         let x: Vec<f32> = gaussian(&mut rng).into_iter().map(|v| v * scale).collect();
         let s = signs_for(i);
-        let xhat = decode_v(&encode_v(&x, bits, &s.v), bits, &s.v);
+        let xhat = decode_vec(&encode_vec(&x, bits, &s.v), bits, &s.v);
         let d: Vec<f32> = x.iter().zip(&xhat).map(|(a, b)| a - b).collect();
         e.push(dot(&d, &d) / dot(&x, &x));
     }
@@ -100,14 +99,14 @@ fn v_mse(bits: u32, paper: f64) {
     assert!(mean <= theorem);
 }
 
-/// `tq4`'s V (4 bits): MSE within 10 % of the paper's 0.009. Breaks with a wrong codebook,
+/// 4 bits (`tq4`'s K and V): MSE within 10 % of the paper's 0.009. Breaks with a wrong codebook,
 /// norm or rotation.
 #[test]
 fn v_mse_bound_4bit() {
     v_mse(4, 0.009);
 }
 
-/// `tq2`'s V (2 bits): MSE within 10 % of the paper's 0.117.
+/// 2 bits (`tq2`'s K and V): MSE within 10 % of the paper's 0.117.
 #[test]
 fn v_mse_bound_2bit() {
     v_mse(2, 0.117);
@@ -168,18 +167,18 @@ fn layout_round_trip() {
                     let at = ((layer * g.heads + h) * g.tokens + t) * rec;
                     assert_eq!(at % 16, 0);
                     let r = &enc[at..at + rec];
-                    let k = encode_k(&vec_of(&src, layer, 0, t, h), w.k_bits, &s.k, &s.qjl);
-                    let v = encode_v(&vec_of(&src, layer, 1, t, h), w.v_bits, &s.v);
+                    let k = encode_vec(&vec_of(&src, layer, 0, t, h), w.k_bits, &s.k);
+                    let v = encode_vec(&vec_of(&src, layer, 1, t, h), w.v_bits, &s.v);
                     assert_eq!(&r[..f.k_norm], &k.codes[..]);
                     assert_eq!(get_u16(r, f.k_norm), k.norm);
-                    assert_eq!(&r[f.qjl..f.r_norm], &k.qjl[..]);
-                    assert_eq!(get_u16(r, f.r_norm), k.residual_norm);
+                    assert_eq!(f.v_codes, f.k_norm + 2);
+                    assert_eq!(f.v_codes % 2, 0, "V codes 2-byte aligned");
                     assert_eq!(&r[f.v_codes..f.v_norm], &v.codes[..]);
                     assert_eq!(get_u16(r, f.v_norm), v.norm);
                     assert!(r[f.v_norm + 2..].iter().all(|b| *b == 0), "padding");
                     for (kind, x) in [
-                        (0, decode_k(&k, w.k_bits, &s.k, &s.qjl)),
-                        (1, decode_v(&v, w.v_bits, &s.v)),
+                        (0, decode_vec(&k, w.k_bits, &s.k)),
+                        (1, decode_vec(&v, w.v_bits, &s.v)),
                     ] {
                         let want: Vec<f32> =
                             x.iter().map(|v| bf16_to_f32(f32_to_bf16(*v))).collect();
