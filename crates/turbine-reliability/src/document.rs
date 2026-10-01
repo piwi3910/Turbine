@@ -193,7 +193,8 @@ pub fn memory_doc(budget: &DeviceBudget, ledger: &Ledger, reserve_held: bool) ->
                 PoolDoc {
                     name,
                     capacity_bytes: u.capacity,
-                    used_bytes: u.used,
+                    // Held outside reservations included (P6b: attached cached prefixes).
+                    used_bytes: u.in_use(),
                     reserved_bytes: u.reserved,
                 }
             })

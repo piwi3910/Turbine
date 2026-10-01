@@ -307,3 +307,21 @@ At this load both arms are equal within run-to-run spread (ratio −0.003, TTFT 
 
 Shared-prefix eval (`tests/eval/gsm8k-200-shared-prefix.jsonl`, c16, `phase6-novanas-llama.yaml --set kv.gpu.max_bytes=4GiB --set kv.cpu.max_bytes=4GiB`, `--filler-words 2000`): BF16 KV (`kv.cpu.format=l0`) 8 fillers 0.755 (1001095429-021df70e), 16 fillers 0.775 (1001095706-39bc19c8); FP8 L1 16 fillers 0.790 (1001095956-0c96bdb6) with 0 lossy-cached tokens, so its `--min-lossy-cached-ratio 0.5` guard failed (exit 1) and no gate pair exists. In all three the prefix (2,944 tokens, 23 blocks) stayed in L0 (0 demotions, 0 L1 lookups, 585,856 of 629,014 prompt tokens cached from L0): capacity demotion cannot take a prefix whose L0 children lack reuse evidence (`p6b-planner2` handoff, options A–C).
 
+### SURVIVAL at 20–32 multi-turn sessions (decision "6b: SURVIVAL at 20–32 multi-turn sessions", A; branch `p6b-survival`)
+
+Same workload as above (`turbine-bench --profile multi-turn --turns 8 --shared-prefix-words 2000 --think-time 1..4 --session-hints`, `--sessions N --concurrency N`, client on novanas), `lab-serve.sh` with `phase2c-novanas-llama.yaml --set kv.cpu.format=l0 --set kv.cpu.max_bytes=4GiB` (585 L0 blocks), GPU 0, one fresh server per row. `/turbine/v1/pressure` and `/turbine/v1/kv` were polled every 100 ms.
+
+Before, e02e8c2, 32 sessions (serve 1001102511-200e23db): 184/256 ok. GREEN → SURVIVAL on `exhaustion_horizon` 31 s in. In the 100 ms before the transition L0 went from 563 to 585 of 585 blocks referenced (0 free, 0 cached), while `kv_utilization` read 0.70 (104 blocks reserved, about 308 committed). The horizon went from +∞ (growth still fit the 22 free blocks) to 0 in one tick. The server logged `decode_deferred reason="kv_exhausted"` for admitted decodes just before. The forecast was right: L0 really was full. The ledger was wrong: a request's reservation leaves out the cached prefix blocks it attaches, so blocks taken from the cache were in no reservation, and ~173 referenced blocks were invisible to `kv_utilization` and to admission. That is why YELLOW, ORANGE and RED never fired.
+
+After, 083b1c7 (the engine reports L0's referenced blocks to the ledger as `held`):
+
+| Sessions / c | Serve run id        | ok      | cached_tokens_ratio | later-turn TTFT p50 / p95 / p99 (ms) | max kv_utilization | deepest state | SURVIVAL | decode_deferred |
+| ------------ | ------------------- | ------- | ------------------- | ------------------------------------ | ------------------ | ------------- | -------- | --------------- |
+| 32 / 32      | 1001104326-1aa26258 | 256/256 | 0.7487              | 3868 / 35676 / 43617                 | 0.959              | RED           | 0        | 0               |
+| 24 / 24      | 1001105324-0a5182ca | 192/192 | 0.8191              | 162 / 36284 / 39656                  | 0.962              | RED           | 0        | 0               |
+| 20 / 20      | 1001105601-324c03b7 | 160/160 | 0.8827              | 114 / 6994 / 7863                    | 0.894              | ORANGE        | 0        | 0               |
+| 16 / 16      | 1001105744-298258fb | 128/128 | 0.9056              | 78 / 139 / 180                       | 0.714              | GREEN         | 0        | 0               |
+
+All four counts now stay out of SURVIVAL, and none fails a request (before: 32 → 184–186/256, 24 → 155/192, 20 → 150/160 in 1 of 3). The live histories at 20+ sessions exceed L0. Pressure now climbs one state at a time (kv_utilization, then YELLOW demotions and ORANGE/RED admission queueing: 32 sessions queued 55 requests in ORANGE/RED, 14 s mean wait). So the overload shows up as tail TTFT instead of 503 `overloaded`. Before, TTFT counted only the requests that succeeded. 16 sessions is unchanged (78 vs 80 ms p50). One run per row.
+
+10-minute overload soak on 59e36ff (`scripts/overload-soak.sh novanas --duration 10m`, serve 1001112421-15fb3885): PASS, all 8 checks true; ITL p99 211 ms (calibration 176 ms), GREEN 24 s into the cool-down, 4385 × 200, 72 × 503 `overloaded`, 2421 `queue_timeout`.

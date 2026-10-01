@@ -956,7 +956,11 @@ pub struct Ledger { /* per device, per pool */ }
 impl Ledger {
     pub fn new(budget: &DeviceBudget) -> Arc<Ledger>;
     pub fn reserve(self: &Arc<Self>, device: DeviceId, pool: PoolKind, bytes: u64) -> Result<Reservation, LedgerError>;
-    pub fn usage(&self, device: DeviceId, pool: PoolKind) -> PoolUsage;   // PoolUsage { capacity, used, reserved }
+    pub fn usage(&self, device: DeviceId, pool: PoolKind) -> PoolUsage;   // PoolUsage { capacity, used, reserved, held }
+    // P6b: the pool's owner reports the bytes it holds (the KV block pool: referenced blocks, every
+    // submission and plan); what commits do not cover is `held`. available = capacity − (used + held) − reserved,
+    // utilization = (used + held + reserved) / capacity; not journaled, not in the digest.
+    pub fn set_held(&self, device: DeviceId, pool: PoolKind, in_use: u64);
 }
 pub struct Reservation { /* … */ }  impl Reservation { pub fn commit(&mut self); pub fn bytes(&self) -> u64; }  impl Drop for Reservation {}
 #[derive(Debug, thiserror::Error)] pub enum LedgerError { #[error("pool {pool:?} exhausted: requested {requested}, available {available}")] Exhausted { pool: PoolKind, requested: u64, available: u64 }, #[error("injected allocation failure")] Injected }
