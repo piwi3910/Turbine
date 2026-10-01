@@ -438,8 +438,10 @@ impl Admission {
             if usage.capacity == 0 {
                 return true;
             }
+            // `kv_utilization` counts the bytes held outside any reservation (P6b), so the
+            // headroom does too.
             let after = usage
-                .used
+                .in_use()
                 .saturating_add(usage.reserved)
                 .saturating_add(need);
             (after as f64 / usage.capacity as f64) <= limit
@@ -1008,6 +1010,39 @@ mod tests {
         assert_eq!(
             plain.evaluate(&est40, PressureState::Yellow, h, 0),
             AdmissionDecision::Admit
+        );
+    }
+
+    /// The headroom rule judges the `kv_utilization` the controller reads, which counts KV held
+    /// outside any reservation (`Ledger::set_held`, P6b: cached prefix blocks requests attached).
+    /// On the lab (32 multi-turn sessions, queued-prefix demotion) RED refilled three requests of
+    /// whole-prompt reservations into a pool that held blocks filled, and `kv_utilization` went
+    /// from 0.93 to 0.98, past SURVIVAL's 0.97. Breaks if the headroom leaves held bytes out.
+    #[test]
+    fn kv_headroom_counts_held_bytes() {
+        let (a, ledger) = setup(1024, true);
+        let thresholds = crate::signals::default_thresholds()[&PressureSignal::KvUtilization];
+        let a = a.with_kv_headroom(thresholds);
+        let h = CircuitState::Healthy;
+        // 800 of 1,024 blocks held by the pool's owner, none reserved (0.781).
+        ledger.set_held(DeviceId(0), PoolKind::Kv, 800 * BLOCK_BYTES);
+        assert_eq!(
+            a.evaluate(&est(40), PressureState::Yellow, h, 0),
+            AdmissionDecision::Queue {
+                reason: PressureReason::KvReservation
+            },
+            "0.820 > ORANGE 0.82"
+        );
+        assert_eq!(
+            a.evaluate(&est(20), PressureState::Yellow, h, 0),
+            AdmissionDecision::Admit
+        );
+        assert_eq!(
+            a.evaluate_refill(&est(200), PressureState::Red, h),
+            AdmissionDecision::Queue {
+                reason: PressureReason::KvReservation
+            },
+            "0.977 > SURVIVAL 0.97"
         );
     }
 
