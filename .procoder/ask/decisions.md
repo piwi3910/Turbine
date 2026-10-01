@@ -2656,3 +2656,14 @@ point at the layer). Rust `ops::TqPaged.params` and `cpu::tq_attention` are alre
   bounds-check: a second field or an unchecked offset)
 
 **Decision (user, 2026-10-01): A.** The caller passes `tq_params` with `tables` at the layer's slice; no new field.
+
+## 6b Task 12: `/turbine/v1/status` names the BF16 kernel when the mixed kernel runs (2026-10-01)
+
+From `p6b-t12` (handoff). With a BF16 L0 pool and a mixed block table (lossy promoted copies in L0), the registry
+binds the BF16 attention kernel, so `/status` `kernels` shows it, while the library runs `turbine_hip_mixed` for that
+call. Rule: every kernel choice is visible in `/status`.
+
+- A) Leave it until Task 17 (the L0 ladder makes mixed tables routine) and fix it there
+- B) Add a `mixed` flag to `AttentionConfig` now so the registry binds (and `/status` reports) the mixed kernel
+
+**Decision (user, 2026-10-01): A.** Fixed with Task 17.
