@@ -19,7 +19,9 @@ use turbine_core::types::DeviceId;
 use crate::budget::{DeviceBudget, PoolKind};
 use crate::metrics::{DevicePoolLabels, PoolLabels, ReliabilityMetrics};
 
-/// One pool's bytes. Invariant: `used + reserved <= capacity`.
+/// One pool's bytes. Reservations alone never take `used + reserved` past `capacity`; bytes
+/// `held` outside any reservation ([`Ledger::set_held`]) can, when the pool's owner already
+/// holds more than the reservations account for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PoolUsage {
     pub capacity: u64,
@@ -27,21 +29,31 @@ pub struct PoolUsage {
     pub used: u64,
     /// Reserved but not yet committed bytes.
     pub reserved: u64,
+    /// Bytes in use that no reservation covers: the KV pool's referenced blocks beyond the
+    /// committed bytes, e.g. cached prefix blocks a request attached (P4 S-3), which its
+    /// reservation leaves out. Set by [`Ledger::set_held`]; never journaled.
+    pub held: u64,
 }
 
 impl PoolUsage {
+    /// Bytes in use: committed plus held outside any reservation.
+    pub fn in_use(&self) -> u64 {
+        self.used.saturating_add(self.held)
+    }
+
     pub fn available(&self) -> u64 {
         self.capacity
-            .saturating_sub(self.used)
+            .saturating_sub(self.in_use())
             .saturating_sub(self.reserved)
     }
 
-    /// (used + reserved) / capacity; 0 for an empty pool.
+    /// (used + held + reserved) / capacity; 0 for an empty pool. Above 1 when the pool's owner
+    /// holds more than the reservations left room for.
     pub fn utilization(&self) -> f64 {
         if self.capacity == 0 {
             0.0
         } else {
-            (self.used + self.reserved) as f64 / self.capacity as f64
+            (self.in_use() + self.reserved) as f64 / self.capacity as f64
         }
     }
 }
@@ -235,6 +247,22 @@ impl Ledger {
         })
     }
 
+    /// The pool's owner reports `in_use` bytes it holds now (the KV block pool: its referenced
+    /// blocks). What the committed bytes do not cover counts as `held`, so admission and
+    /// `kv_utilization` see blocks taken without a reservation (P6b: attached cached prefixes
+    /// filled L0 while the ledger showed 70 %). Not journaled: a mirror's owner reports its own.
+    pub fn set_held(&self, device: DeviceId, pool: PoolKind, in_use: u64) {
+        let mut pools = self.lock();
+        if let Some(usage) = pools.get_mut(&(device, pool)) {
+            let held = in_use.saturating_sub(usage.used);
+            if usage.held != held {
+                usage.held = held;
+                let snapshot = *usage;
+                self.publish(device, pool, &snapshot);
+            }
+        }
+    }
+
     /// Current usage of one pool (all zero for an unknown pool).
     pub fn usage(&self, device: DeviceId, pool: PoolKind) -> PoolUsage {
         self.lock()
@@ -284,7 +312,8 @@ impl Ledger {
         let Some(m) = self.metrics.get() else { return };
         for (kind, v) in [
             ("capacity", usage.capacity),
-            ("used", usage.used),
+            // Everything in use, held outside reservations included (P6b).
+            ("used", usage.in_use()),
             ("reserved", usage.reserved),
         ] {
             m.memory_pool_bytes
@@ -601,7 +630,8 @@ mod tests {
             PoolUsage {
                 capacity: CAPACITY,
                 used: 100,
-                reserved: 200
+                reserved: 200,
+                held: 0,
             }
         );
         r.commit();
@@ -615,6 +645,70 @@ mod tests {
             ledger.reserve(DeviceId(0), PoolKind::Workspace, 1),
             Err(LedgerError::Exhausted { available: 0, .. })
         ));
+    }
+
+    /// P6b: blocks the KV pool holds outside any reservation (attached cached prefixes) count
+    /// against admission and utilisation: with 100 of 300 reserved bytes committed and the pool
+    /// holding 400, 400 + 200 = 60 % is in use or promised and a reservation of 500 is refused;
+    /// held bytes the commits already cover add nothing; reporting 0 clears them; a mirror's
+    /// digest ignores them. Breaks if `set_held` is ignored, double-counts committed bytes, or
+    /// enters the digest.
+    #[test]
+    fn held_bytes_outside_reservations_count() {
+        let budget = DeviceBudget {
+            device: DeviceId(0),
+            memory_kind: MemoryKind::Dedicated,
+            budget_bytes: 1000,
+            pools: vec![(PoolKind::Kv, 1000)],
+        };
+        let ledger = Ledger::new(&budget);
+        let metrics = ReliabilityMetrics::unregistered();
+        ledger.set_metrics(metrics.clone());
+        let (d, kv) = (DeviceId(0), PoolKind::Kv);
+        let mut r = ledger.reserve(d, kv, 300).unwrap();
+        r.commit_bytes(100);
+        let digest = ledger.digest(d, kv);
+        ledger.set_held(d, kv, 400);
+        let u = ledger.usage(d, kv);
+        assert_eq!((u.used, u.held, u.reserved), (100, 300, 200), "{u:?}");
+        assert!((u.utilization() - 0.6).abs() < 1e-12, "{u:?}");
+        assert_eq!(u.available(), 400);
+        assert!(matches!(
+            ledger.reserve(d, kv, 500),
+            Err(LedgerError::Exhausted { available: 400, .. })
+        ));
+        let used_gauge = metrics
+            .memory_pool_bytes
+            .get_or_create(&PoolLabels {
+                device: 0,
+                pool: "kv",
+                kind: "used",
+            })
+            .get();
+        assert_eq!(used_gauge, 400, "the used gauge shows what is in use");
+        assert_eq!(
+            ledger.digest(d, kv),
+            digest,
+            "held bytes stay out of the digest"
+        );
+        // Held bytes the commits cover add nothing.
+        ledger.set_held(d, kv, 50);
+        assert_eq!(ledger.usage(d, kv).held, 0);
+        assert!((ledger.usage(d, kv).utilization() - 0.3).abs() < 1e-12);
+        // Holding more than the capacity reads above 1 and leaves nothing available.
+        ledger.set_held(d, kv, 1100);
+        let u = ledger.usage(d, kv);
+        assert!(u.utilization() > 1.0, "{u:?}");
+        assert_eq!(u.available(), 0);
+        ledger.set_held(d, kv, 0);
+        drop(r);
+        assert_eq!(
+            ledger.usage(d, kv),
+            PoolUsage {
+                capacity: 1000,
+                ..PoolUsage::default()
+            }
+        );
     }
 
     /// P5 Task 33: a mirror journals every reservation, commit and release (group members
