@@ -93,6 +93,14 @@ pub struct CopyTicket {
     pub bytes: usize,
 }
 
+/// One copy of a batch ([`CopyEngine::copy_async_batch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyOp {
+    pub dst: CopyTarget,
+    pub src: CopySource,
+    pub bytes: usize,
+}
+
 /// The dedicated copy stream of one device (P4 S-6).
 pub trait CopyEngine: Send + Sync {
     fn copy_async(
@@ -101,6 +109,27 @@ pub trait CopyEngine: Send + Sync {
         src: CopySource,
         bytes: usize,
     ) -> Result<CopyTicket, MemoryError>;
+    /// Enqueues `ops` in order on the copy stream (the device segments of one KV block) and
+    /// returns their tickets: an engine with a stream fences the compute stream once and records
+    /// one event for the whole batch, so it returns one ticket of the batch's bytes (a fence and
+    /// an event per 512 KiB segment halved pinned device-to-host bandwidth on the R9700,
+    /// `.procoder/perf-log.md` "Pinned D2H"). On an `Err` no copy of the batch is in flight.
+    /// The default enqueues each op with [`CopyEngine::copy_async`].
+    fn copy_async_batch(&self, ops: &[CopyOp]) -> Result<Vec<CopyTicket>, MemoryError> {
+        let mut tickets = Vec::with_capacity(ops.len());
+        for op in ops {
+            match self.copy_async(op.dst, op.src, op.bytes) {
+                Ok(t) => tickets.push(t),
+                Err(e) => {
+                    for t in &tickets {
+                        let _ = self.wait(t);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(tickets)
+    }
     /// `Ok(true)` once the ticket's event has signalled.
     fn poll(&self, t: &CopyTicket) -> Result<bool, MemoryError>;
     fn wait(&self, t: &CopyTicket) -> Result<(), MemoryError>;
