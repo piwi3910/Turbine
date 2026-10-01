@@ -1532,6 +1532,31 @@ enum IoStage {
     },
 }
 
+impl AfterCopies {
+    /// The stage these copies are, in `kv_copy_stages`.
+    fn name(&self) -> &'static str {
+        match self {
+            AfterCopies::CommitL1(_) => "copy_l1",
+            AfterCopies::IntoL0 { gpu_slot: None, .. } => "copy_l0",
+            AfterCopies::IntoL0 { .. } => "decode",
+            AfterCopies::WriteTier { gpu_slot: None, .. } => "d2h_staging",
+            AfterCopies::WriteTier { .. } => "encode_d2h",
+            AfterCopies::Decode { .. } => "h2d_slot",
+        }
+    }
+}
+
+impl IoStage {
+    /// The I/O-pool stage this is, in `kv_copy_stages`.
+    fn name(&self) -> &'static str {
+        match self {
+            IoStage::Final => "io",
+            IoStage::ThenIntoL0 { .. } => "io_read",
+            IoStage::ThenDecode { .. } => "io_read_coded",
+        }
+    }
+}
+
 enum Job {
     Copies { copies: Copies, then: AfterCopies },
     Io(IoStage),
@@ -1553,6 +1578,8 @@ struct CopyClock {
     at_least: Duration,
     /// When the last stage ended on the I/O pool: the copy's exact end.
     ended: Option<Instant>,
+    /// The finished stages (name, certainly ran, seen done after), for `kv_copy_stages`.
+    stages: SmallVec<[(&'static str, Duration, Duration); 4]>,
 }
 
 impl CopyClock {
@@ -1563,14 +1590,21 @@ impl CopyClock {
             running_at: None,
             at_least: Duration::ZERO,
             ended: None,
+            stages: SmallVec::new(),
         }
     }
 
-    /// The current stage ended at `end` (known) or by `now` (seen done at a poll); the next
-    /// starts now.
-    fn stage_done(&mut self, end: Option<Instant>, now: Instant) {
+    /// The current stage `name` ended at `end` (known) or by `now` (seen done at a poll); the
+    /// next starts now.
+    fn stage_done(&mut self, name: &'static str, end: Option<Instant>, now: Instant) {
         let ran_until = end.or(self.running_at).unwrap_or(self.stage);
-        self.at_least += ran_until.saturating_duration_since(self.stage);
+        let ran = ran_until.saturating_duration_since(self.stage);
+        self.stages.push((
+            name,
+            ran,
+            end.unwrap_or(now).saturating_duration_since(self.stage),
+        ));
+        self.at_least += ran;
         self.ended = end;
         self.stage = now;
         self.running_at = None;
@@ -1585,6 +1619,34 @@ impl CopyClock {
             },
         }
     }
+}
+
+/// The DEBUG event `kv_copy_stages` of a finished copy: its stages in order as
+/// `name:ran..seen` milliseconds (`ran` it certainly took, `seen` until the poll or I/O thread
+/// that saw it done), the codec and the total. A lossy copy without a `decode` or `encode_d2h`
+/// stage ran the host codec on the I/O pool.
+fn log_stages(t: &TransferTicket, clock: &CopyClock, now: Instant) {
+    use std::fmt::Write as _;
+    let mut stages = String::new();
+    for (i, (name, ran, seen)) in clock.stages.iter().enumerate() {
+        let sep = if i == 0 { "" } else { "," };
+        let _ = write!(
+            stages,
+            "{sep}{name}:{:.2}..{:.2}",
+            ran.as_secs_f64() * 1e3,
+            seen.as_secs_f64() * 1e3
+        );
+    }
+    tracing::debug!(
+        event = "kv_copy_stages",
+        path = t.req.path.as_str(),
+        purpose = t.req.purpose.as_str(),
+        from = t.req.codec.from,
+        to = t.req.codec.to,
+        bytes = t.req.bytes,
+        stages = %stages,
+        total_ms = now.saturating_duration_since(clock.started).as_secs_f64() * 1e3,
+    );
 }
 
 /// The registered tier codecs as the function table of the cpu-reference transcode (a kernel
@@ -2566,7 +2628,7 @@ impl CopyStreamBackend {
                 None => Ok(Job::Io(stage)),
                 Some(done) => {
                     if let Some(c) = self.clocks.get_mut(&t.id) {
-                        c.stage_done(Some(done.finished), Instant::now());
+                        c.stage_done(stage.name(), Some(done.finished), Instant::now());
                     }
                     self.finish_io(t, stage, done)
                 }
@@ -2588,7 +2650,7 @@ impl CopyStreamBackend {
                 let now = Instant::now();
                 if let Some(c) = self.clocks.get_mut(&t.id) {
                     if all {
-                        c.stage_done(None, now);
+                        c.stage_done(then.name(), None, now);
                     } else {
                         c.running_at = Some(now);
                     }
@@ -2649,7 +2711,7 @@ impl TransferBackend for CopyStreamBackend {
         let job = self.start_job(t)?;
         if matches!(job, Job::Done(_)) {
             // Synchronous copies: done before `start_job` returned.
-            clock.stage_done(Some(Instant::now()), Instant::now());
+            clock.stage_done("sync", Some(Instant::now()), Instant::now());
         }
         self.clocks.insert(t.id, clock);
         self.jobs.insert(t.id, job);
@@ -2671,7 +2733,11 @@ impl TransferBackend for CopyStreamBackend {
                 if r.is_ok()
                     && let Some(clock) = clock
                 {
-                    self.took.insert(t.id, clock.time(Instant::now()));
+                    let now = Instant::now();
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        log_stages(t, &clock, now);
+                    }
+                    self.took.insert(t.id, clock.time(now));
                 }
                 r.map(Some)
             }
