@@ -53,3 +53,16 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+tests/eval/gsm8k-200-shared-prefix.jsonl
+
+The lossy-KV gate variant of gsm8k-200.jsonl (Phase 6b, user decision 2026-10-01): the same
+200 items (ids, user message, answer, matcher, max_tokens unchanged), each behind one
+identical `system` message of a fixed preamble plus 2000 pseudo-words, so a gate run reuses
+the prefix's KV blocks across requests. The words are generated, not quoted: the bench's
+seeded synthetic prompt (`turbine_bench::prompt::prompt(20261001, 0, 2000)`: a built-in
+syllable word list drawn by SplitMix64), so the text carries no third-party license. Regenerate
+with scripts/eval/make-gsm8k-200-shared-prefix.sh (offline, reads gsm8k-200.jsonl);
+`eval_task_set_shared_prefix_valid` fails if any record's prefix differs from the Rust
+regeneration. A prefix change invalidates every shared-prefix report committed under
+tests/eval/<slug>/.

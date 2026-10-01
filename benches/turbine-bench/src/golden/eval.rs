@@ -46,7 +46,80 @@ pub struct TaskResult {
     pub id: String,
     pub correct: bool,
     pub output: String,
+    /// The response's `usage.prompt_tokens`; absent when the server sent no usage (and in a
+    /// report from before Phase 6b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    /// `usage.prompt_tokens_details.cached_tokens` (0 when the details are absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+    /// `usage.prompt_tokens_details.lossy_cached_tokens` (0 when absent): the prompt tokens
+    /// served from lossy KV blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossy_cached_tokens: Option<u64>,
 }
+
+/// Prompt-token counts of one response's `usage`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    pub lossy_cached_tokens: u64,
+}
+
+impl Usage {
+    /// `None` when the body has no `usage.prompt_tokens`.
+    fn from_response(v: &serde_json::Value) -> Option<Usage> {
+        let usage = v.get("usage")?;
+        Some(Usage {
+            prompt_tokens: usage["prompt_tokens"].as_u64()?,
+            cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+            lossy_cached_tokens: usage["prompt_tokens_details"]["lossy_cached_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+        })
+    }
+}
+
+/// Sum of the scored items' prompt-token counts (fillers excluded).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenTotals {
+    pub prompt: u64,
+    pub cached: u64,
+    pub lossy_cached: u64,
+}
+
+impl TokenTotals {
+    pub fn cached_ratio(&self) -> f64 {
+        ratio(self.cached, self.prompt)
+    }
+    pub fn lossy_cached_ratio(&self) -> f64 {
+        ratio(self.lossy_cached, self.prompt)
+    }
+}
+
+fn ratio(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 / whole as f64
+    }
+}
+
+/// Unrelated requests sent between the first item and the rest (`--filler-requests`): they
+/// fill L0 so the first item's shared prefix is demoted to the lower KV tier before the other
+/// items arrive and a lossy tier format serves it (Phase 6b lossy-KV gates).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fillers {
+    pub requests: u32,
+    pub words: u32,
+}
+
+/// Seed of the filler prompts (`crate::prompt::prompt(FILLER_SEED, i, words)`), apart from the
+/// shared-prefix variant's own seed so no filler shares a block with it.
+pub const FILLER_SEED: u64 = 6_000_001;
 
 fn default_concurrency() -> u32 {
     1
@@ -64,7 +137,67 @@ pub struct EvalReport {
     /// (sequential). `eval-compare` refuses a pair measured at different concurrencies.
     #[serde(default = "default_concurrency")]
     pub concurrency: u32,
+    /// `--filler-requests` / `--filler-words` of this run (0 = none). `eval-compare` refuses a
+    /// pair measured with different fillers.
+    #[serde(default)]
+    pub filler_requests: u32,
+    #[serde(default)]
+    pub filler_words: u32,
     pub results: Vec<TaskResult>,
+}
+
+impl EvalReport {
+    /// Prompt-token totals over the results; `None` unless every result carries its usage.
+    pub fn token_totals(&self) -> Option<TokenTotals> {
+        let mut t = TokenTotals {
+            prompt: 0,
+            cached: 0,
+            lossy_cached: 0,
+        };
+        for r in &self.results {
+            t.prompt += r.prompt_tokens?;
+            t.cached += r.cached_tokens?;
+            t.lossy_cached += r.lossy_cached_tokens?;
+        }
+        Some(t)
+    }
+}
+
+/// The reuse guards of a lossy-KV gate run: `Err` names the miss. A guard needs the server's
+/// usage on every item, so a missing usage fails it too (a gate that cannot show it reused
+/// lossy blocks must not pass).
+pub fn check_reuse(
+    report: &EvalReport,
+    min_cached_ratio: Option<f64>,
+    min_lossy_cached_ratio: Option<f64>,
+) -> Result<(), String> {
+    if min_cached_ratio.is_none() && min_lossy_cached_ratio.is_none() {
+        return Ok(());
+    }
+    let Some(t) = report.token_totals() else {
+        return Err("the server reported no usage.prompt_tokens on every item".into());
+    };
+    if let Some(min) = min_cached_ratio
+        && t.cached_ratio() < min
+    {
+        return Err(format!(
+            "cached prompt tokens {} of {} ({:.3}) are below --min-cached-ratio {min}",
+            t.cached,
+            t.prompt,
+            t.cached_ratio()
+        ));
+    }
+    if let Some(min) = min_lossy_cached_ratio
+        && t.lossy_cached_ratio() < min
+    {
+        return Err(format!(
+            "lossy-cached prompt tokens {} of {} ({:.3}) are below --min-lossy-cached-ratio {min}: no lossy KV block was reused (is the shared prefix demoted to the lossy tier? raise --filler-requests or shrink kv.gpu.max_bytes)",
+            t.lossy_cached,
+            t.prompt,
+            t.lossy_cached_ratio()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -244,12 +377,22 @@ async fn complete(
     base: &str,
     model: &str,
     task: &EvalTask,
-) -> Result<String, EvalError> {
+) -> Result<(String, Option<Usage>), EvalError> {
+    let (path, body) = request_body(model, task);
+    post_completion(client, base, path, body, &task.id).await
+}
+
+async fn post_completion(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    body: serde_json::Value,
+    id: &str,
+) -> Result<(String, Option<Usage>), EvalError> {
     let fail = |detail: String| EvalError::Request {
-        id: task.id.clone(),
+        id: id.to_string(),
         detail,
     };
-    let (path, body) = request_body(model, task);
     let sent = client
         .post(format!("{base}{path}"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -258,22 +401,67 @@ async fn complete(
         .await;
     let v = json_body(sent).await.map_err(fail)?;
     let choice = &v["choices"][0];
-    choice["text"]
+    let text = choice["text"]
         .as_str()
         .or_else(|| choice["message"]["content"].as_str())
         .map(str::to_string)
-        .ok_or_else(|| fail(format!("no completion text in {v}")))
+        .ok_or_else(|| fail(format!("no completion text in {v}")))?;
+    Ok((text, Usage::from_response(&v)))
+}
+
+/// One filler request (`--filler-requests`): an unrelated random-word chat prompt, one token.
+async fn send_filler(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    index: u32,
+    words: u32,
+) -> Result<(), EvalError> {
+    let prompt = crate::prompt::prompt(FILLER_SEED, u64::from(index), words);
+    let body = serde_json::json!({"model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1, "temperature": 0.0, "stream": false});
+    post_completion(
+        client,
+        base,
+        "/v1/chat/completions",
+        body,
+        &format!("filler-{index}"),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn run_task(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    task: &EvalTask,
+) -> Result<TaskResult, EvalError> {
+    let (output, usage) = complete(client, base, model, task).await?;
+    Ok(TaskResult {
+        id: task.id.clone(),
+        correct: is_correct(task.match_kind, &task.answer, &output),
+        output,
+        prompt_tokens: usage.map(|u| u.prompt_tokens),
+        cached_tokens: usage.map(|u| u.cached_tokens),
+        lossy_cached_tokens: usage.map(|u| u.lossy_cached_tokens),
+    })
 }
 
 /// Runs every task, up to `concurrency` requests in flight at once (`0` counts as 1, capped at
 /// 256 by the caller); results are reported in task-file order whatever order the replies
-/// arrive in. The first failed request aborts the run (no partial report).
+/// arrive in. The first failed request aborts the run (no partial report). With
+/// `fillers.requests` > 0 the first task runs alone, then the fillers one after another, then
+/// the rest at `concurrency`: the first task publishes the shared prefix, the fillers push it
+/// out of L0, and the rest read it back from the lower tier.
 pub async fn run_eval(
     base: &str,
     model: Option<&str>,
     tasks_file: &Path,
     tasks: &[EvalTask],
     concurrency: u32,
+    fillers: Fillers,
 ) -> Result<EvalReport, EvalError> {
     let base = base.trim_end_matches('/');
     let client = reqwest::Client::builder()
@@ -287,26 +475,31 @@ pub async fn run_eval(
     let concurrency = (concurrency.max(1)) as usize;
     let model = &model;
     let client = &client;
-    let mut replies = stream::iter(tasks.iter().enumerate())
+    let (head, rest) = if fillers.requests > 0 {
+        tasks.split_at(tasks.len().min(1))
+    } else {
+        tasks.split_at(0)
+    };
+    let mut results: Vec<TaskResult> = Vec::with_capacity(tasks.len());
+    for task in head {
+        results.push(run_task(client, base, model, task).await?);
+    }
+    if !head.is_empty() {
+        for i in 0..fillers.requests {
+            send_filler(client, base, model, i, fillers.words).await?;
+        }
+    }
+    let mut replies = stream::iter(rest.iter().enumerate())
         .map(|(index, task)| async move {
-            let output = complete(client, base, model, task).await?;
-            let correct = is_correct(task.match_kind, &task.answer, &output);
-            Ok::<_, EvalError>((
-                index,
-                TaskResult {
-                    id: task.id.clone(),
-                    correct,
-                    output,
-                },
-            ))
+            Ok::<_, EvalError>((index, run_task(client, base, model, task).await?))
         })
         .buffer_unordered(concurrency);
-    let mut results = Vec::with_capacity(tasks.len());
+    let mut tail = Vec::with_capacity(rest.len());
     while let Some(reply) = replies.next().await {
-        results.push(reply?);
+        tail.push(reply?);
     }
-    results.sort_by_key(|(index, _)| *index);
-    let results: Vec<TaskResult> = results.into_iter().map(|(_, r)| r).collect();
+    tail.sort_by_key(|(index, _)| *index);
+    results.extend(tail.into_iter().map(|(_, r)| r));
     let correct = results.iter().filter(|r| r.correct).count();
     let total = results.len();
     Ok(EvalReport {
@@ -320,6 +513,8 @@ pub async fn run_eval(
             correct as f64 / total as f64
         },
         concurrency: concurrency as u32,
+        filler_requests: fillers.requests,
+        filler_words: fillers.words,
         results,
     })
 }
@@ -442,5 +637,86 @@ mod tests {
         let json = r#"{"id":"x","prompt":"p","answer":"1","match":"final_number","max_tokens":8,"stop":["\n\nQ:"]}"#;
         let t: EvalTask = serde_json::from_str(json).unwrap();
         assert_eq!(t.stop, Some(vec!["\n\nQ:".to_string()]));
+    }
+
+    fn result(id: &str, usage: Option<(u64, u64, u64)>) -> TaskResult {
+        TaskResult {
+            id: id.into(),
+            correct: true,
+            output: String::new(),
+            prompt_tokens: usage.map(|u| u.0),
+            cached_tokens: usage.map(|u| u.1),
+            lossy_cached_tokens: usage.map(|u| u.2),
+        }
+    }
+
+    fn report(results: Vec<TaskResult>) -> EvalReport {
+        EvalReport {
+            model: "m".into(),
+            tasks_file: "t".into(),
+            total: results.len(),
+            correct: results.len(),
+            accuracy: 1.0,
+            concurrency: 1,
+            filler_requests: 0,
+            filler_words: 0,
+            results,
+        }
+    }
+
+    #[test]
+    fn usage_is_read_from_the_response_and_defaults_missing_details_to_zero() {
+        let v = serde_json::json!({"usage": {"prompt_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 64, "lossy_cached_tokens": 32}}});
+        assert_eq!(
+            Usage::from_response(&v),
+            Some(Usage {
+                prompt_tokens: 100,
+                cached_tokens: 64,
+                lossy_cached_tokens: 32
+            })
+        );
+        let v = serde_json::json!({"usage": {"prompt_tokens": 7}});
+        assert_eq!(
+            Usage::from_response(&v),
+            Some(Usage {
+                prompt_tokens: 7,
+                ..Usage::default()
+            })
+        );
+        assert_eq!(Usage::from_response(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn reuse_guards_judge_the_token_shares() {
+        let r = report(vec![
+            result("a", Some((1000, 0, 0))),
+            result("b", Some((1000, 900, 600))),
+        ]);
+        let t = r.token_totals().unwrap();
+        assert_eq!((t.prompt, t.cached, t.lossy_cached), (2000, 900, 600));
+        assert_eq!(check_reuse(&r, None, None), Ok(()));
+        assert_eq!(check_reuse(&r, Some(0.45), Some(0.3)), Ok(()));
+        let e = check_reuse(&r, Some(0.5), None).unwrap_err();
+        assert!(e.contains("--min-cached-ratio"), "{e}");
+        let e = check_reuse(&r, None, Some(0.31)).unwrap_err();
+        assert!(e.contains("--min-lossy-cached-ratio"), "{e}");
+        // No usage on one item: a guard cannot be shown to hold, no guard asks nothing.
+        let r = report(vec![result("a", Some((10, 0, 0))), result("b", None)]);
+        assert!(r.token_totals().is_none());
+        assert!(check_reuse(&r, None, Some(0.0)).is_err());
+        assert_eq!(check_reuse(&r, None, None), Ok(()));
+    }
+
+    #[test]
+    fn an_older_report_without_usage_or_fillers_still_reads() {
+        let json = r#"{"model":"m","tasks_file":"t","total":1,"correct":1,"accuracy":1.0,
+            "results":[{"id":"x","correct":true,"output":"1"}]}"#;
+        let r: EvalReport = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            (r.concurrency, r.filler_requests, r.filler_words),
+            (1, 0, 0)
+        );
+        assert!(r.token_totals().is_none());
     }
 }

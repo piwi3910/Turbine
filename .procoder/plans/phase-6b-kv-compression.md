@@ -118,7 +118,7 @@ Interfaces:
 
 ## Task 6: Per-tier FP8 lab proof
 
-Files: `scripts/lab/phase6-novanas-llama.yaml` (commented per-tier example), `tests/eval/llama-3.2-3b-instruct/turbine-l1-fp8.json`, `.procoder/perf-log.md`, `crates/turbine-server/tests/kv_gpu.rs` (`lossy_tier_reuse` with FP8 L1)
+Files: `scripts/lab/phase6-novanas-llama.yaml` (commented per-tier example), `tests/eval/llama-3.2-3b-instruct/{turbine-l1-fp8.json,turbine-bf16-sp.json,turbine-l1-fp8-sp.json}`, `.procoder/perf-log.md`, `crates/turbine-server/tests/kv_gpu.rs` (`lossy_tier_reuse` with FP8 L1)
 Interfaces:
 
 - no new interface; measures S-1 … S-3 with the FP8 codec
@@ -126,7 +126,7 @@ Interfaces:
   Depends on: Task 5
 
 - [ ] Write failing lab test `kv_gpu::lossy_tier_reuse` (FP8 L1 from BF16 L0: within the golden token rule, `lossy_cached_tokens` > 0; with `x-turbine-kv-lossy: deny` bit-equal to cold). Run: `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu lossy_tier_reuse` — expect FAIL, then implement any gap — expect PASS
-- [ ] Lab (GPU 0, bench lock): `scripts/lab-bench.sh --model llama --golden16 -- --set kv.cpu.format=fp8_e4m3 --set kv.cpu.max_bytes=4GiB` — expect PASS; the Phase 4 multi-turn profile with `kv.cpu.format` `fp8_e4m3` vs `l0` on the same L1 bytes (commands of the spec's TurboQuant lab criterion) — record `cached_tokens_ratio` and L1 blocks per GiB; eval-compare at 0.01 — expect exit 0.
+- [ ] Lab (GPU 0, bench lock): `scripts/lab-bench.sh --model llama --golden16 -- --set kv.cpu.format=fp8_e4m3 --set kv.cpu.max_bytes=4GiB` — expect PASS; the Phase 4 multi-turn profile with `kv.cpu.format` `fp8_e4m3` vs `l0` on the same L1 bytes (commands of the spec's TurboQuant lab criterion) — record `cached_tokens_ratio` and L1 blocks per GiB with the lossless-tail share (the 1.9 × target is the codec's, held by `kv_sim`; user decision 2026-10-01); re-gate on the shared-prefix variant (reports `turbine-bf16-sp.json`, `turbine-l1-fp8-sp.json` via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) and eval-compare at 0.01 — expect exit 0.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `test(kv): per-tier FP8 lab proof`
 
@@ -163,14 +163,14 @@ Interfaces:
 
 ## Task 9: TurboQuant lab proof
 
-Files: `tests/eval/llama-3.2-3b-instruct/{turbine-l1-tq4.json,turbine-l1-tq2.json}`, `tests/eval/olmoe-1b-7b-0125-instruct/{…}`, `crates/turbine-core/src/support.rs` (`TIER_FORMAT_REFUSALS` → `supported` for the passing codecs), `.procoder/perf-log.md`, `crates/turbine-server/tests/kv_gpu.rs` (`lossy_tier_reuse` with `tq4`)
+Files: `tests/eval/llama-3.2-3b-instruct/{turbine-l1-tq4-sp.json,turbine-l1-tq2-sp.json}`, `tests/eval/olmoe-1b-7b-0125-instruct/{…}`, `crates/turbine-core/src/support.rs` (`TIER_FORMAT_REFUSALS` → `supported` for the passing codecs), `.procoder/perf-log.md`, `crates/turbine-server/tests/kv_gpu.rs` (`lossy_tier_reuse` with `tq4`)
 Interfaces:
 
 - no new interface; decides `tq4` / `tq2` `supported` or `experimental`
   Covers: spec S-4, S-8; AC TurboQuant lab criterion, `lossy_tier_reuse`
   Depends on: Task 8
 
-- [ ] Run the spec's TurboQuant lab criterion for Llama and OLMoE, `tq4` then `tq2` (GPU 0, bench lock): lab-bench golden16 with `kv.cpu.format`, the multi-turn profile against `lab-serve.sh`, `/turbine/v1/kv` capacity, eval-compare — record every number in the perf log and labbook.
+- [ ] Run the spec's TurboQuant lab criterion for Llama and OLMoE, `tq4` then `tq2` (GPU 0, bench lock): lab-bench golden16 with `kv.cpu.format`, the multi-turn profile against `lab-serve.sh`, `/turbine/v1/kv` capacity (measured ratio with the lossless-tail share; the 3.5 × / 6 × targets are the codec's, held by `kv_sim`), eval-compare on the shared-prefix variant (reports `turbine-bf16-sp.json`, `turbine-l1-<fmt>-sp.json` via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — record every number in the perf log and labbook.
 - [ ] `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu lossy_tier_reuse` with the `tq4` case — expect PASS
 - [ ] Flip the passing codecs; `support::tests` updated. Run: `scripts/remote-cargo.sh test -p turbine-core support` — expect PASS
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
@@ -224,14 +224,14 @@ Interfaces:
 
 ## Task 13: TurboQuant in L0 — lab proof and decode ITL
 
-Files: `tests/eval/llama-3.2-3b-instruct/{turbine-l0-tq4.json,turbine-l0-tq2.json}`, `tests/eval/olmoe-1b-7b-0125-instruct/{turbine-l0-tq4.json,turbine-l0-tq2.json}`, `crates/turbine-core/src/support.rs` (`KvFormatColumn` `tq4`/`tq2` rows `supported` or `experimental`), `.procoder/perf-log.md`
+Files: `tests/eval/llama-3.2-3b-instruct/{turbine-l0-tq4-sp.json,turbine-l0-tq2-sp.json}`, `tests/eval/olmoe-1b-7b-0125-instruct/{turbine-l0-tq4-sp.json,turbine-l0-tq2-sp.json}`, `crates/turbine-core/src/support.rs` (`KvFormatColumn` `tq4`/`tq2` rows `supported` or `experimental`), `.procoder/perf-log.md`
 Interfaces:
 
 - no new interface; decides the L0 TurboQuant rows
   Covers: spec S-5 (gates), S-8; AC S-5 lab criterion
   Depends on: Task 12
 
-- [ ] Lab (GPU 0, bench lock): `scripts/lab-bench.sh --model llama --golden16 -- --set kv.dtype=tq4`, then `tq2`, then the same for `--model olmoe` — expect golden1/golden16 PASS under the batched bounds; record L0 blocks from `/turbine/v1/kv` (targets ≥ 3.5 × / ≥ 6 ×) and the c1 (`scripts/lab-bench.sh --quick` with the bench at concurrency 1 through `turbine-bench --concurrency 1 --requests 32 --max-tokens 256 --ignore-eos`) and c16 decode ITL p50 against the BF16 KV runs; eval-compare at 0.01 — expect exit 0.
+- [ ] Lab (GPU 0, bench lock): `scripts/lab-bench.sh --model llama --golden16 -- --set kv.dtype=tq4`, then `tq2`, then the same for `--model olmoe` — expect golden1/golden16 PASS under the batched bounds; record L0 blocks from `/turbine/v1/kv` (targets ≥ 3.5 × / ≥ 6 ×) and the c1 (`scripts/lab-bench.sh --quick` with the bench at concurrency 1 through `turbine-bench --concurrency 1 --requests 32 --max-tokens 256 --ignore-eos`) and c16 decode ITL p50 against the BF16 KV runs; eval-compare at 0.01 on the shared-prefix variant (`turbine-bf16-sp.json` vs `turbine-l0-<fmt>-sp.json`, same concurrency; L0 formats need no lossy-ratio guard; same fillers as the baseline) — expect exit 0.
 - [ ] Flip the passing rows; update `baseline_rows_present`. Run: `scripts/remote-cargo.sh test -p turbine-core support` — expect PASS
 - [ ] Report the ITL numbers to the coordinator (milestone).
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
@@ -275,14 +275,14 @@ Step-up (user decision 2026-09-30, option A): a rung relaxes only at GREEN after
 
 ## Task 16: Ladder lab proof and soak
 
-Files: `scripts/lab/phase6-novanas-ladder.yaml` (small L1/L2, `kv.ladder.enabled: true`), `.procoder/perf-log.md`, `tests/eval/llama-3.2-3b-instruct/turbine-ladder.json`
+Files: `scripts/lab/phase6-novanas-ladder.yaml` (small L1/L2, `kv.ladder.enabled: true`), `.procoder/perf-log.md`, `tests/eval/llama-3.2-3b-instruct/turbine-ladder-sp.json`
 Interfaces:
 
 - no new interface
   Covers: spec S-6, S-8, S-11; AC ladder soak criterion
   Depends on: Task 15
 
-- [ ] Lab (GPU 0, bench lock): the multi-turn profile with the ladder config and with `kv.ladder.enabled: false` on the same bytes — record recomputed tokens, `cached_tokens_ratio`, rung metrics; eval-compare at 0.01 against BF16 KV — expect exit 0.
+- [ ] Lab (GPU 0, bench lock): the multi-turn profile with the ladder config and with `kv.ladder.enabled: false` on the same bytes — record recomputed tokens, `cached_tokens_ratio`, rung metrics; eval-compare at 0.01 against BF16 KV on the shared-prefix variant (`turbine-ladder-sp.json`, via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — expect exit 0.
 - [ ] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m` with the ladder config — expect verdict pass and `turbine_kv_ladder_actions_total` > 0.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `test(kv): compression ladder lab proof and soak`
@@ -307,14 +307,14 @@ Interfaces:
 
 ## Task 18: L0 ladder lab proof and soak
 
-Files: `scripts/lab/phase6-novanas-ladder.yaml` (`kv.ladder.l0: true` variant), `.procoder/perf-log.md`, `tests/eval/llama-3.2-3b-instruct/turbine-ladder-l0.json`
+Files: `scripts/lab/phase6-novanas-ladder.yaml` (`kv.ladder.l0: true` variant), `.procoder/perf-log.md`, `tests/eval/llama-3.2-3b-instruct/turbine-ladder-l0-sp.json`
 Interfaces:
 
 - no new interface
   Covers: spec S-7, S-8, S-11; AC S-7 lab criterion
   Depends on: Task 17
 
-- [ ] Lab (GPU 0, bench lock): the multi-turn profile with `kv.ladder.l0: true` against `false` on the same budget — record recomputed tokens, `cached_tokens_ratio`, rung metrics, golden c1; eval-compare at 0.01 — expect exit 0.
+- [ ] Lab (GPU 0, bench lock): the multi-turn profile with `kv.ladder.l0: true` against `false` on the same budget — record recomputed tokens, `cached_tokens_ratio`, rung metrics, golden c1; eval-compare at 0.01 on the shared-prefix variant (`turbine-ladder-l0-sp.json`, via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — expect exit 0.
 - [ ] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m` with the L0 ladder config — expect pass and `turbine_kv_ladder_actions_total{tier="l0"}` above 0.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `test(kv): L0 compression ladder lab proof and soak`

@@ -119,6 +119,26 @@ enum Command {
         /// sides of a comparison must use the same value.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=256))]
         concurrency: u32,
+        /// After the first item, send this many unrelated filler requests (one token each),
+        /// one after another, before the other items: they fill L0 so the first item's shared
+        /// prefix is demoted to a lossy lower KV tier and the other items reuse it from there
+        /// (lossy-KV gates on `tests/eval/gsm8k-200-shared-prefix.jsonl`). Both sides of a
+        /// comparison must use the same value.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=1000))]
+        filler_requests: u32,
+        /// Words in each filler prompt (about the shared prefix's size fills L0 fastest).
+        #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u32).range(1..=20000))]
+        filler_words: u32,
+        /// Exit 1 (the report is still printed) when fewer than this share of the items'
+        /// prompt tokens were served from cached KV (`usage.prompt_tokens_details.cached_tokens`).
+        #[arg(long)]
+        min_cached_ratio: Option<f64>,
+        /// Exit 1 (the report is still printed) when fewer than this share of the items'
+        /// prompt tokens were served from lossy KV blocks
+        /// (`usage.prompt_tokens_details.lossy_cached_tokens`): a lossy-KV gate that reused no
+        /// lossy block measured nothing.
+        #[arg(long)]
+        min_lossy_cached_ratio: Option<f64>,
     },
     /// Quality gate: exit 0 when candidate accuracy ≥ baseline accuracy − max drop, else 1.
     EvalCompare {
@@ -140,9 +160,20 @@ async fn run_eval(
     model: Option<&str>,
     output: OutputFormat,
     concurrency: u32,
+    fillers: eval::Fillers,
+    guards: (Option<f64>, Option<f64>),
 ) -> ExitCode {
+    if guards
+        .0
+        .into_iter()
+        .chain(guards.1)
+        .any(|r| !(0.0..=1.0).contains(&r))
+    {
+        eprintln!("turbine-golden eval: reuse ratios must be between 0 and 1");
+        return ExitCode::from(2);
+    }
     let report = match eval::load_tasks(tasks_path) {
-        Ok(tasks) => eval::run_eval(url, model, tasks_path, &tasks, concurrency).await,
+        Ok(tasks) => eval::run_eval(url, model, tasks_path, &tasks, concurrency, fillers).await,
         Err(e) => Err(e),
     };
     match report {
@@ -152,15 +183,31 @@ async fn run_eval(
                     "{}",
                     serde_json::to_string_pretty(&report).expect("report serializes")
                 ),
-                OutputFormat::Text => println!(
-                    "model {} tasks {}: accuracy {:.4} ({}/{}) at concurrency {}",
-                    report.model,
-                    report.tasks_file,
-                    report.accuracy,
-                    report.correct,
-                    report.total,
-                    report.concurrency
-                ),
+                OutputFormat::Text => {
+                    println!(
+                        "model {} tasks {}: accuracy {:.4} ({}/{}) at concurrency {}",
+                        report.model,
+                        report.tasks_file,
+                        report.accuracy,
+                        report.correct,
+                        report.total,
+                        report.concurrency
+                    );
+                    if let Some(t) = report.token_totals() {
+                        println!(
+                            "prompt tokens {}: cached {} ({:.3}), lossy cached {} ({:.3})",
+                            t.prompt,
+                            t.cached,
+                            t.cached_ratio(),
+                            t.lossy_cached,
+                            t.lossy_cached_ratio()
+                        );
+                    }
+                }
+            }
+            if let Err(why) = eval::check_reuse(&report, guards.0, guards.1) {
+                eprintln!("turbine-golden eval: {why}");
+                return ExitCode::from(1);
             }
             ExitCode::SUCCESS
         }
@@ -188,6 +235,18 @@ fn run_eval_compare(baseline: &Path, candidate: &Path, max_drop: f64) -> ExitCod
         eprintln!(
             "turbine-golden eval-compare: baseline was measured at concurrency {} but candidate at concurrency {}; a comparison must use one concurrency on both sides",
             baseline.concurrency, candidate.concurrency
+        );
+        return ExitCode::from(2);
+    }
+    if (baseline.filler_requests, baseline.filler_words)
+        != (candidate.filler_requests, candidate.filler_words)
+    {
+        eprintln!(
+            "turbine-golden eval-compare: baseline was measured with {} filler requests of {} words but candidate with {} of {}; a comparison must use the same fillers on both sides",
+            baseline.filler_requests,
+            baseline.filler_words,
+            candidate.filler_requests,
+            candidate.filler_words
         );
         return ExitCode::from(2);
     }
@@ -361,7 +420,23 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             model,
             output,
             concurrency,
-        } => Ok(run_eval(&url, &tasks, model.as_deref(), output, concurrency).await),
+            filler_requests,
+            filler_words,
+            min_cached_ratio,
+            min_lossy_cached_ratio,
+        } => Ok(run_eval(
+            &url,
+            &tasks,
+            model.as_deref(),
+            output,
+            concurrency,
+            eval::Fillers {
+                requests: filler_requests,
+                words: filler_words,
+            },
+            (min_cached_ratio, min_lossy_cached_ratio),
+        )
+        .await),
         Command::EvalCompare {
             baseline,
             candidate,
