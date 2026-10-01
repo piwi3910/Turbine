@@ -67,3 +67,13 @@ sides. Everything below is provisional until the first run shows the real token 
   count works, the fallback is a server-side hook (not in this task's ownership).
 - `server_cli::sigterm_drains_then_cancels` failed once in the full-workspace gate under load 14 on novanas ("bad chunk size line") and passed
   alone; unrelated to this change.
+
+## Measured by p6b-planner2 (2026-10-01; `.procoder/handoff/p6b-planner2.md`)
+
+- The shared system message renders to 2,944 tokens (23 blocks of 128), an item's prompt to about 3,150; a 2000-word filler is about 23 blocks
+  too, so the 47-block estimate above is twice the real size.
+- The runner now sends the first two items before the fillers (`FILLER_HEAD`, so the prefix has a hit). Even so, with `kv.gpu.max_bytes=4GiB`
+  (292 blocks) and 8 or 16 fillers the prefix never leaves L0: capacity demotion walks leaf-first over blocks with reuse evidence only, and the
+  head items' own blocks (children of the prefix, no evidence) keep it from ever being a leaf; allocation drops the fillers instead. Raising
+  `--filler-requests` or shrinking L0 does not change that. The recipe needs one of the options in `p6b-planner2.md` before it can gate.
+
