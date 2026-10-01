@@ -103,6 +103,15 @@ impl ShardedL1Tier {
         self.shards.iter().map(|s| s.locate(key)).collect()
     }
 
+    /// Rank 0's slot of a stored block with its bytes ([`L1PinnedTier::locate_len`]), when the
+    /// tier has one shard.
+    pub fn locate_len(&self, key: &KvKey) -> Option<(u64, usize, usize)> {
+        match self.shards.as_slice() {
+            [one] => one.locate_len(key),
+            _ => None,
+        }
+    }
+
     /// Reserves `key` in every shard, or in none: a shard that cannot reserve aborts the
     /// reservations already taken.
     pub fn reserve(&self, key: KvKey) -> Result<ShardSlots, TierError> {

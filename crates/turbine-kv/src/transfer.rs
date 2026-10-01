@@ -299,6 +299,9 @@ pub struct TransferEngine {
     seeded: [PathCost; 6],
     /// When each path's estimate last took a sample (`None`: never, it is the seed).
     sampled_at: [Option<Duration>; 6],
+    /// Per ticket id: when it was queued, then (once started) how long it waited in the queue,
+    /// for `kv_copy_timed`.
+    queued: HashMap<u64, Duration>,
 }
 
 impl TransferEngine {
@@ -320,6 +323,7 @@ impl TransferEngine {
             estimates: TransferPath::ALL.map(TransferPath::fallback),
             seeded: TransferPath::ALL.map(TransferPath::fallback),
             sampled_at: [None; 6],
+            queued: HashMap::new(),
         }
     }
 
@@ -334,6 +338,7 @@ impl TransferEngine {
             req: r,
         };
         self.next_id += 1;
+        self.queued.insert(ticket.id, self.clock.now_mono());
         *self.busy.entry(ticket.req.key).or_insert(0) += 1;
         if is_background(&ticket.req) {
             self.background.push_back(ticket.clone());
@@ -386,6 +391,12 @@ impl TransferEngine {
                     path = ticket.req.path.as_str(),
                     purpose = ticket.req.purpose.as_str(),
                     bytes = ticket.req.bytes,
+                    queued_s = self
+                        .queued
+                        .get(&ticket.id)
+                        .copied()
+                        .unwrap_or_default()
+                        .as_secs_f64(),
                     took_s = took.reported().as_secs_f64(),
                     exact = matches!(took, CopyTime::Exact(_)),
                     sample_s = sample.as_secs_f64(),
@@ -393,6 +404,7 @@ impl TransferEngine {
                     est_bandwidth_bps = e.bandwidth_bps,
                 );
             }
+            self.queued.remove(&ticket.id);
             let result = result.map(|(took, slot)| (took.reported(), slot));
             let owner_cancelled = ticket
                 .req
@@ -450,6 +462,9 @@ impl TransferEngine {
         now: Duration,
         out: &mut Vec<TransferCompletion>,
     ) {
+        if let Some(q) = self.queued.get_mut(&ticket.id) {
+            *q = now.saturating_sub(*q);
+        }
         match b.start(&ticket) {
             Ok(()) => {
                 if on_stream(&ticket.req) {
@@ -460,7 +475,10 @@ impl TransferEngine {
                 self.peak_inflight_bytes = self.peak_inflight_bytes.max(self.inflight_bytes);
                 self.inflight.push((ticket, now, None));
             }
-            Err(e) => self.finish(ticket, Err(e), false, out),
+            Err(e) => {
+                self.queued.remove(&ticket.id);
+                self.finish(ticket, Err(e), false, out)
+            }
         }
     }
 
@@ -480,6 +498,7 @@ impl TransferEngine {
             dropped.extend(gone);
         }
         for t in &dropped {
+            self.queued.remove(&t.id);
             self.unbusy(&t.req.key);
         }
         if self

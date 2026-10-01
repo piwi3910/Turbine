@@ -444,3 +444,39 @@ Later-turn TTFT p50 is equal or better with TurboQuant (fewer bytes over the lin
 `kv_gpu` (job 1001170002-222ba975, e88c333): 12 passed, 0 failed. `lossy_tier_reuse_tq4` is now held to (0.25, 0.75, 0.9): the first 8 tokens within 0.25 of cold, 90 % of 64 positions within 0.75. These bounds are golden's Llama batched bounds, which the tq4 golden16 run passed, and the GSM8K gate showed that reuse at that level costs no accuracy. Measured: first-8 worst 0.242, 0.98 of positions within 0.75, worst position 0.979.
 
 Result: `tq2` fails the GSM8K gate on both models. `tq4` passes golden and GSM8K on both, but misses the multi-turn ratio criterion (Llama by 0.020, from slow promotions; OLMoE by 0.003). Both stay `experimental` in `TIER_FORMAT_REFUSALS`. Options are in `.procoder/handoff/p6b-t9.md`. Labbook set `phase-6b-kv-compression`: the 4 lab-bench runs, 18 multi-turn runs and the kv_gpu run.
+
+### TurboQuant promotion path (decision "6b Task 9: TurboQuant lower-tier gate results" 1 A; branch `p6b-tqspeed`)
+
+Workload and arms as in Task 9: `turbine-bench --profile multi-turn --sessions 16 --turns 8 --concurrency 16 --think-time 1..4 --session-hints` (Llama `--shared-prefix-words 2000`; OLMoE the spec's variant `--shared-prefix-words 600 --prompt-words 128 --max-tokens 64` with `--set kv.gpu.max_bytes=4GiB`), `phase2c-novanas-<m>.yaml --set kv.cpu.format=<f> --set kv.cpu.max_bytes=4GiB`, `logging.level: info,turbine_kv=debug,turbine_server::kv_orchestrator=debug`. Every server ran natively on GPU 0 (`ROCR_VISIBLE_DEVICES=0`, cores 0-11) under `bench.lock` and `port18000.lock`, a fresh server per run, the client on novanas.
+
+Profile (ae67d24): the DEBUG event `kv_copy_stages` lists each finished copy's stages as `name:ran..seen` ms, and `kv_copy_timed` gained `queued_s`. A lossy L1 → L0 promotion ran three stages: the I/O pool read the encoded L1 slot into a pinned staging buffer (`io_read_coded`), the copy stream moved it into a device staging slot (`h2d_slot`), and the decode kernel ran with a compute fence (`decode`). Each stage is seen done at the next engine poll. One run per format, Llama:
+
+| L1 format | promotions | mean / p50 / p90 (ms) | `io_read_coded` seen mean / p90 | `h2d_slot` mean | `decode` mean | host-codec demotions (I/O pool) | demotion I/O mean / p90 | recompute / retrieve | ratio  |
+| --------- | ---------- | --------------------- | ------------------------------- | --------------- | ------------- | ------------------------------- | ----------------------- | -------------------- | ------ |
+| `l0`      | 267        | 40 / 42 / 58          | — (one copy-stream stage)       | —               | —             | —                               | —                       | 0 / 30               | 0.9055 |
+| `tq2`     | 49         | 123 / 76 / 181        | 2.1 / 3.8                       | 42              | 32            | 5 of 202                        | 12 / 3                  | 0 / 3                | 0.9050 |
+| `tq4`     | 131        | 272 / 147 / 926       | 162 / 858                       | 46              | 38            | 59 of 398                       | 254 / 852               | 11 / 9               | 0.8795 |
+
+Cause: the tq4 promotions queued on the I/O pool behind demotion writes. When all 32 device staging slots (`DEMOTION_INFLIGHT`) were taken, a demotion fell back to the host codec. Each tq4 host encode of a 14.7 MB block holds an I/O thread for hundreds of ms. A promotion took its slot first and then held it through that wait, so fewer slots were free and more demotions fell back: a feedback loop. `tq2` had 5 fallbacks and did not enter it. The decode kernel was not the cost: its stage is one poll, like the H2D. The kernel itself takes about 0.25 ms per block (Task 8: 8.1 ms per 32 blocks).
+
+Fix (b6c8e11): a lossy L1 → L0 promotion that the device transcode serves copies the encoded L1 slot (pinned) straight into the device staging slot on the copy stream (`L1PinnedTier::locate_len`), then decodes. It never touches the I/O pool. Otherwise (several shards, no free slot, a slot of another size) it takes the old path. Test: `kv_orchestrator::tests::device_transcode_matches_the_host_codec_through_l1_and_l2` (the promotion starts as copy-stream copies; mutation "path disabled": FAIL). No kernel changed.
+
+After, one profile run (Llama tq4): 281 promotions, mean / p50 / p90 66.6 / 56.7 / 126 ms, all `h2d_slot/decode`. Recompute / retrieve 0 / 14, ratio 0.9052, later-turn p99 325 ms. 46 demotions still took the host codec (demotion I/O p90 529 ms); promotions no longer wait for them.
+
+Multi-turn A/B after the fix (b6c8e11), medians of 3, arms interleaved:
+
+| Model | L1 format | cached_tokens_ratio (runs) | median     | later-turn TTFT p50 / p99 (ms, median) | mean L1→L0 promotion (ms) | recompute / retrieve plans | L1 blocks per GiB (tail share) |
+| ----- | --------- | -------------------------- | ---------- | -------------------------------------- | ------------------------- | -------------------------- | ------------------------------ |
+| Llama | `l0`      | 0.9016 / 0.9033 / 0.8904   | 0.9016     | 80.6 / 411                             | 44 / 47 / 43              | 0 / 28–31                  | 73.1                           |
+| Llama | `tq4`     | 0.9047 / 0.9061 / 0.9020   | **0.9047** | 78.2 / 255                             | 61 / 50 / 63              | 0 / 11–15                  | 224.5–227.8 (0.055–0.062)      |
+| OLMoE | `l0`      | 0.8626 / 0.8633 / 0.8617   | 0.8626     | 51.7 / 280                             | 40 / 27 / 38              | 0 / 45–48                  |                                |
+| OLMoE | `tq4`     | 0.8605 / 0.8584 / 0.8591   | 0.8591     | 48.2 / 150                             | 45 / 43 / 44              | 0 / 24–31                  |                                |
+
+- Llama: the criterion holds (0.9047 ≥ 0.9016). tq4 promotions dropped from 245–289 ms to 50–63 ms, no plan recomputes, and later-turn p99 fell from 1.8–2.1 s to 255 ms (the `l0` arm's is 411 ms).
+- OLMoE: it still misses by 0.0035, and every tq4 run is below every `l0` run. This is not promotion speed: promotions take 43–45 vs 27–40 ms and there are no recompute plans. With prompt tokens in the same range (274.9–275.8k vs 274.0–276.2k), tq4 caches about 1k fewer tokens per run (236.4–236.8k vs 236.5–238.0k). It also has more lookup misses (247 vs 231, r3 vs r2) and fewer retrieve plans. The shortfall equals Task 9's (−0.003), so it predates this fix. Not investigated further here; options are in `.procoder/handoff/p6b-tqspeed.md`.
+
+Transcode kernels, remeasured with MSE-only K (no kernel changed; lab job `turbine-lab-test-1001211526-3189c413`, `kv_transcode_matches_cpu` and `paged_mixed_matches_cpu` PASS), 32 Llama blocks: `tq4` encode 22,387 µs and decode 1,299 µs (Task 8 with the QJL K: 20,473 / 8,116), `tq2` 12,586 / 1,164, FP8 2,449 / 1,576.
+
+`kv_gpu lossy_tier_reuse_tq4` / `lossy_tier_reuse` through the new path (job `turbine-lab-test-1001211921-28c11f9d`): PASS, the same numbers as Task 9 (tq4 first-8 worst 0.242, 0.98 within 0.75; fp8 0.067), so the copy-stream promotion decodes the same bytes.
+
+Result: `tq4` stays `experimental`. It passes on Llama and misses on OLMoE.
