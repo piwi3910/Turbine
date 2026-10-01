@@ -167,12 +167,16 @@ novanas)
 esac
 
 step start
+serve_rc=0
 [[ "$HOST" == novanas ]] ||
 	fail "the Spark serve path (Phase 2b docker image) is not available in this tree"
 TURBINE_LAB_SERVE_TIMEOUT=600 "${REPO_ROOT}/scripts/lab-serve.sh" novanas \
 	"${REPO_ROOT}/scripts/lab/phase3-novanas-soak.yaml" \
-	--set "model.path=/models/$(basename "$MODEL")" 2>&1 | tee "$OUT/serve.log" || true
+	--set "model.path=/models/$(basename "$MODEL")" 2>&1 | tee "$OUT/serve.log" || serve_rc=$?
 RUN_ID=$(sed -n 's/^lab-serve: novanas: run \([0-9a-f-]*\): .*/\1/p' "$OUT/serve.log" | head -n 1)
+# A refused start (e.g. another server already answers on the port) must not go on to measure
+# whatever answers there: that is someone else's server.
+[[ "$serve_rc" -eq 0 ]] || fail "lab-serve did not start the soak's server (exit ${serve_rc}; see $OUT/serve.log)"
 curl -fsS -m 5 "$URL/ready" >/dev/null || fail "turbine-server did not become ready within 10 min (see $OUT/serve.log)"
 STARTED=$(date +%s)
 MODEL_ID=$(curl -fsS -m 5 "$URL/v1/models" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])') ||

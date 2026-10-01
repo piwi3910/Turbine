@@ -1742,6 +1742,80 @@ fn soak_precondition_refuses_busy_gpu() {
     }
 }
 
+/// P6b (p6b-survival): when `lab-serve.sh` refuses to start because another server already
+/// answers on port 18000, the soak fails at `start` and never calibrates or overloads that server
+/// (on 2026-10-01 it overloaded another builder's server for 10 minutes and reported its
+/// shutdown as a soak failure). The stubs answer the VRAM probe with a free card and every curl
+/// with 200, like a foreign server on the port. Breaks if the start step ignores lab-serve's exit.
+#[test]
+fn soak_refuses_a_server_it_did_not_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let stubs = std::env::temp_dir().join(format!(
+        "turbine-lab-scripts-{}-soak-foreign",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&stubs);
+    fs::create_dir_all(&stubs).expect("stub dir");
+    let calls = stubs.join("calls.log");
+    let log = calls.display();
+    let write = |name: &str, body: String| {
+        let p = stubs.join(name);
+        fs::write(&p, body).expect("write stub");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    };
+    write(
+        "ssh",
+        format!(
+            "#!/bin/sh\necho \"ssh $*\" >> '{log}'\ncase \"$*\" in *mem_info_vram_used*) echo 536870912; exit 0;; esac\nexit 97\n"
+        ),
+    );
+    write(
+        "curl",
+        format!(
+            "#!/bin/sh\necho \"curl $*\" >> '{log}'\ncase \"$*\" in *http_code*) printf 200;; *v1/models*) echo '{{\"data\":[{{\"id\":\"m\"}}]}}';; *) echo '{{}}';; esac\nexit 0\n"
+        ),
+    );
+    for tool in ["rsync", "scp", "kubectl"] {
+        write(
+            tool,
+            format!("#!/bin/sh\necho \"{tool} $*\" >> '{log}'\nexit 97\n"),
+        );
+    }
+    write(
+        "bench",
+        format!(
+            "#!/bin/sh\necho \"bench $*\" >> '{log}'\necho '{{\"requests_ok\":1,\"wall_seconds\":1}}'\n"
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/overload-soak.sh"))
+        .args(["novanas", "--duration", "1m"])
+        .current_dir(repo_root())
+        .env("PATH", path)
+        .env("SOAK_BENCH", stubs.join("bench"))
+        .env("SOAK_CALIBRATE", "1s")
+        .env("SOAK_COOLDOWN_SECONDS", "0")
+        .output()
+        .expect("run bash");
+    let called = fs::read_to_string(&calls).unwrap_or_default();
+    let _ = fs::remove_dir_all(&stubs);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("did not start the soak's server"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        !called.lines().any(|l| l.starts_with("bench ")),
+        "the soak loaded a server it did not start:\n{called}"
+    );
+}
+
 /// The soak's server configuration loads through the real configuration model, on the hip
 /// backend with the Phase 3 reliability keys it states.
 #[test]

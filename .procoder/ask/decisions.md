@@ -2789,6 +2789,36 @@ mechanism (lossy reuse happens, opt-out bit-equal to cold) and prints the spread
 
 **Decision (user, 2026-10-01): A.** Task 9 sets the bound and first checks inherent loss vs defect against the paper's bounds on real Llama K/V.
 
+## 6b: after the held-prefix ledger fix — tail latency and queued prefixes (2026-10-01)
+
+From `p6b-survival` (merged da097d1): attached prefix blocks are now counted (`held`) in the ledger, so 20–32
+multi-turn sessions escalate through YELLOW/ORANGE/RED instead of jumping to SURVIVAL; soak PASS 8/8. Overload now
+shows as admission queueing: later-turn TTFT p99 ~40 s at 24–32 sessions (p50 162 ms at 24, 3.9 s at 32).
+
+1. Tail TTFT at 24–32 sessions:
+   - A) Accept it as the designed ladder (admission queueing under overload)
+   - B) Have YELLOW/ORANGE demote the prefixes held by queued requests (`turbine-kv` work, pairs with copy-ahead)
+   - C) Leave it to configuration (larger L0 / a lossy L1 for this workload)
+2. Queued requests hold their prefix blocks; if those alone filled L0 with nothing running, the queue head would wait
+   up to `queue_timeout` (60 s). Not observed.
+   - A) Leave it (not observed; the timeout bounds it)
+   - B) Release a queued request's prefix after a wait and re-attach on admission
+
+**Decision (user, 2026-10-01): 1 B, 2 A.** YELLOW/ORANGE may demote prefixes held by queued requests (after copy-ahead lands, same area); queued pins left as they are.
+
+## 6b: FP8 lower-tier shared-prefix gate passes exactly at the bound (2026-10-01)
+
+From `p6b-copyahead` (merged): clean runs only (four runs that took stray soak traffic discarded), c16, 32 fillers:
+BF16 0.780, FP8 L1 0.770 (drop 0.010, max 0.01, PASS) and 0.775 on a second clean run (drop 0.005); lossy cached
+ratio 0.927. Paired flips 8 vs 6; exact-KV runs vary 0.755–0.790 at c16. (The `kv_gpu` disk precondition is solved:
+`lab-prune` freed 190 GB, 235 GB free.)
+
+- A) More pairs: 3 baseline + 3 candidate runs, judge on the medians (and the paired McNemar test as for 6a's FP8)
+- B) The full GSM8K shared-prefix variant (1,319 items) for one pair
+- C) Accept the pass at the bound
+
+**Decision (user, 2026-10-01): A.** Three baseline and three candidate runs, judged on the medians plus the paired McNemar test; the same method applies to the TurboQuant tier gates (Task 9).
+
 ## 6b Task 9: TurboQuant K quantizer — QJL (as specified) or MSE-only (2026-10-01)
 
 From `p6b-t9` (521816e, `tq_loss_on_real_kv`; table in `.procoder/handoff/p6b-t9.md`). No codec defect: tq4 K

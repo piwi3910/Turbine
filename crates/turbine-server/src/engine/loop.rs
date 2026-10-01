@@ -97,6 +97,7 @@ use turbine_model::executor::{
     TokenFeed,
 };
 use turbine_model::{ForwardPhase, ModelError, SampleJob, SampledToken, Tokenizer, sample_rows};
+use turbine_reliability::budget::PoolKind;
 use turbine_reliability::circuit::{CircuitEvent, CircuitReason};
 use turbine_reliability::controller::{EngineStats, Snapshot};
 use turbine_reliability::recovery::RecoveryStep;
@@ -778,6 +779,7 @@ impl EngineLoop {
             self.pool.layout().block_tokens,
         );
         r.arrival = self.clock.now_mono();
+        self.sync_kv_held();
         if let Err(e) = self.sched.submit_probe(r, self.pool.total_blocks()) {
             tracing::warn!(
                 event = "circuit_probe",
@@ -867,8 +869,21 @@ impl EngineLoop {
         self.kv.record_prefill(prefill, prefill_s);
     }
 
+    /// Reports the L0 blocks requests hold to the ledger's `kv` pool (P6b): a request's KV
+    /// reservation leaves out the cached prefix blocks it attached (P4 S-3), so without this the
+    /// ledger missed every block a request took from the cache. Admission and `kv_utilization`
+    /// then count them; called before each submission and plan and with the stats.
+    fn sync_kv_held(&self) {
+        if let Some((ledger, device)) = self.pool.ledger() {
+            let bytes = u64::from(self.pool.referenced_blocks())
+                .saturating_mul(self.pool.layout().block_bytes());
+            ledger.set_held(*device, PoolKind::Kv, bytes);
+        }
+    }
+
     /// The figures the pressure controller reads on its next tick.
     fn publish_stats(&self) {
+        self.sync_kv_held();
         let p95 = self.decode_steps.p95();
         self.rel.publish(EngineStats {
             running_remaining_tokens: self.sched.remaining_tokens(),
@@ -1055,6 +1070,7 @@ impl EngineLoop {
             if let Some(a) = attach {
                 r.attach_prefix(a, bt);
             }
+            self.sync_kv_held();
             if let Err(e) = self.sched.submit(r, self.pool.total_blocks()) {
                 if let Some(blocks) = blocks {
                     self.pool.release(&blocks);
@@ -1157,6 +1173,8 @@ impl EngineLoop {
             }
         }
         self.kv.before_plan(&mut self.pool, self.snap.state);
+        // The plan's refills from the admission queue reserve against what the pool holds now.
+        self.sync_kv_held();
     }
 
     /// The full blocks each item of `plan` completes, with their tokens (choice 0 of a request
@@ -4072,6 +4090,63 @@ mod tests {
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");
         }
+    }
+
+    /// P6b SURVIVAL at 20+ multi-turn sessions: a request that attaches a cached prefix holds
+    /// its blocks without a reservation for them (the reservation leaves the attached prefix
+    /// out), so the ledger must still count them. A 100-token prompt runs once (6 full
+    /// 16-token blocks cached), then again with a stream that stops reading, so it pauses
+    /// holding the 6 attached blocks plus its tail. The ledger's kv `used` + `reserved` then
+    /// covers every block the pool holds. Breaks if the engine does not report the pool's
+    /// referenced blocks to the ledger: the ledger showed 2 of the 7 held blocks, and on the lab
+    /// L0 filled to 585 of 585 blocks while `kv_utilization` read 0.70, until admitted decodes
+    /// waited for a block (`decode_deferred`) and the horizon jumped GREEN → SURVIVAL.
+    #[test]
+    fn attached_prefix_blocks_count_in_the_ledger() {
+        let (_dir, spec, tokenizer) = tiny();
+        let t = engine(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+        );
+        let block_bytes = t.engine.pool.layout().block_bytes() as f64;
+        let prompt: Vec<u32> = std::iter::once(256).chain(1..100).collect();
+        assert_eq!(prompt.len(), 100);
+        let TestEngine {
+            engine,
+            tx,
+            shared,
+            reg,
+            ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+        let (_, cached) = run_one(&tx, request(&prompt, 8));
+        assert_eq!(cached, 0);
+        // `Started` and two tokens fill the four slots; the request pauses with its KV.
+        let (mut slow, admitted) = submit_with(&tx, request(&prompt, 20), 4);
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shared.docs().unwrap().scheduler.paused != 1 {
+            assert!(Instant::now() < deadline, "the request never paused");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let held = held_blocks(&shared.docs().unwrap()) as f64;
+        assert!(held >= 7.0, "6 attached blocks and a tail: {held}");
+        let gauge = |kind: &str| {
+            metric(
+                &reg,
+                &format!(r#"turbine_memory_pool_bytes{{device="0",pool="kv",kind="{kind}"}}"#),
+            )
+        };
+        let ledger_blocks = (gauge("used") + gauge("reserved")) / block_bytes;
+        assert!(
+            ledger_blocks >= held,
+            "the ledger counts {ledger_blocks} blocks, the pool holds {held}"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| slow.blocking_recv()).collect();
+        assert_eq!(token_count(&events), 20);
+        drop(tx);
+        assert_eq!(handle.join().unwrap(), Ok(()));
     }
 
     /// P2 S-7 slow client, deterministic on a fake clock: a stream that stops reading pauses,
