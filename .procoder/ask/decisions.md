@@ -2474,3 +2474,16 @@ capturing blocking stream" during decode-graph capture, then SIGSEGV. It passed 
 
 **Decision (user, 2026-10-01): A.** Investigated now as its own task (builder on `p6b-graph-segv`).
 
+## ROCm upstream reports for the graph-capture SIGSEGV (2026-10-01)
+
+Root cause found on `p6b-graph-segv` (67fc7ef, merged 3d60c68): in ROCm 7.14.1 HIP's `CHECK_STREAM_CAPTURING` fails
+synchronous calls (`hipMemset`, `hipMemcpy`) with error 906 while any stream in the process is capturing, in every
+capture mode, and invalidates every open capture — unlike CUDA for a thread-local capture on a non-blocking stream.
+`hipblasLtCreate` issues a synchronous `hipMemset` (`hipblaslt.cpp:165`) and calls `exit(1)` on any error. Turbine's
+workaround: a shim lock between context creation and graph capture.
+
+- A) Draft two upstream reports (HIP: cross-thread capture invalidation in thread-local mode; hipBLASLt: synchronous
+  memset in `hipblasLtCreate` and `exit(1)` instead of an error) for the user to review before anything is filed
+- B) Keep the lock as the permanent workaround and file nothing
+
+**Decision (user, 2026-10-01): A.** Draft both reports for the user to review; nothing is filed before that.
