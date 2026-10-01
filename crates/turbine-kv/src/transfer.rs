@@ -228,16 +228,56 @@ pub enum TransferError {
 /// EWMA weight of one completed copy.
 const ALPHA: f64 = 0.2;
 
-/// Bounded copy scheduler (P4 S-6): a FIFO queue bounded by `max_queued`, in-flight bytes
+/// Longest stretch of background copies (demotions, ladder rewrites) into or out of L0 handed
+/// to the device's copy stream ahead of time (the first pump's, and after an idle spell); below
+/// it, the time since the previous pump (about one engine iteration). debt: a constant, set from the 25–200 ms engine
+/// iterations of the stressed multi-turn run (decision "6b planner follow-ups", 1 A).
+pub const BACKGROUND_WINDOW_MAX: Duration = Duration::from_millis(250);
+
+/// Whether a copy is background work (it serves no waiting request), started after the queued
+/// promotions and prefetches.
+fn is_background(r: &TransferRequest) -> bool {
+    matches!(
+        r.purpose,
+        TransferPurpose::Demote | TransferPurpose::Compress
+    )
+}
+
+/// Whether a copy runs on the device's copy stream: L0 <-> L1 (pinned L1 exists only with a
+/// copy stream; L0 <-> L2 exists only on unified memory, which has none), or a ladder rewrite
+/// staged through it.
+fn on_stream(r: &TransferRequest) -> bool {
+    matches!(r.path, TransferPath::L0ToL1 | TransferPath::L1ToL0)
+}
+
+/// Bounded copy scheduler (P4 S-6): queues bounded by `max_queued` together, in-flight bytes
 /// bounded by `max_inflight_bytes`, per-path latency and bandwidth EWMAs, and cancellation by
 /// owner. Driven synchronously by `pump` at iteration boundaries; decisions read the injected
 /// clock only.
+///
+/// Promotions and prefetches start before background copies (decision "6b planner
+/// follow-ups", 1 A): a GPU has one FIFO copy stream per device, so a promotion started behind
+/// hundreds of MB of demotions waits for all of them. Background copies on the copy stream are
+/// therefore started only while the copy stream's backlog (every copy handed to it, priced at
+/// its path's unloaded cost, run one after another) is below the time since the previous pump,
+/// at most
+/// [`BACKGROUND_WINDOW_MAX`]: the stream stays busy until the next pump, and a promotion
+/// waits behind at most about one iteration of them. Demotions cannot starve: while none is in
+/// flight, promotions leave room under the in-flight bound for the first queued one, and one
+/// always starts when none is on the stream.
 pub struct TransferEngine {
     max_inflight_bytes: u64,
     max_queued: usize,
     clock: Arc<dyn Clock>,
     next_id: u64,
-    queued: VecDeque<TransferTicket>,
+    /// Queued promotions and prefetches, then queued background copies, each in FIFO order.
+    urgent: VecDeque<TransferTicket>,
+    background: VecDeque<TransferTicket>,
+    /// The previous pump.
+    last_pump: Option<Duration>,
+    /// When the copies handed to the copy stream end, at their paths' unloaded costs (the
+    /// stream runs them one after another).
+    stream_free_at: Duration,
     /// In-flight tickets with their start time and the last poll that saw them running.
     inflight: Vec<(TransferTicket, Duration, Option<Duration>)>,
     inflight_bytes: u64,
@@ -259,7 +299,10 @@ impl TransferEngine {
             max_queued,
             clock,
             next_id: 1,
-            queued: VecDeque::with_capacity(max_queued.min(1024)),
+            urgent: VecDeque::new(),
+            background: VecDeque::new(),
+            last_pump: None,
+            stream_free_at: Duration::ZERO,
             inflight: Vec::new(),
             inflight_bytes: 0,
             peak_inflight_bytes: 0,
@@ -270,9 +313,10 @@ impl TransferEngine {
         }
     }
 
-    /// Queues a copy; it starts on a later `pump` in FIFO order.
+    /// Queues a copy; it starts on a later `pump`, promotions and prefetches before background
+    /// copies, each in FIFO order.
     pub fn submit(&mut self, r: TransferRequest) -> Result<TransferTicket, TransferError> {
-        if self.queued.len() >= self.max_queued {
+        if self.queued() >= self.max_queued {
             return Err(TransferError::QueueFull(self.max_queued));
         }
         let ticket = TransferTicket {
@@ -281,14 +325,25 @@ impl TransferEngine {
         };
         self.next_id += 1;
         *self.busy.entry(ticket.req.key).or_insert(0) += 1;
-        self.queued.push_back(ticket.clone());
+        if is_background(&ticket.req) {
+            self.background.push_back(ticket.clone());
+        } else {
+            self.urgent.push_back(ticket.clone());
+        }
         Ok(ticket)
     }
 
     /// Polls in-flight copies (completions update the path estimates), then starts queued copies
-    /// while in-flight bytes stay within the bound; a copy larger than the bound starts alone.
+    /// while in-flight bytes stay within the bound, promotions first (type comment); a copy
+    /// larger than the bound starts alone.
     pub fn pump(&mut self, b: &mut dyn TransferBackend) -> Vec<TransferCompletion> {
         let now = self.clock.now_mono();
+        let window = self
+            .last_pump
+            .map_or(BACKGROUND_WINDOW_MAX, |l| now.saturating_sub(l))
+            .min(BACKGROUND_WINDOW_MAX)
+            .as_secs_f64();
+        self.last_pump = Some(now);
         let mut out = Vec::new();
         let mut running = Vec::with_capacity(self.inflight.len());
         for (ticket, started, seen_running) in std::mem::take(&mut self.inflight) {
@@ -340,33 +395,80 @@ impl TransferEngine {
         self.cancelled
             .retain(|o| inflight.iter().any(|(t, _, _)| t.req.owner == Some(*o)));
 
-        while let Some(front) = self.queued.front() {
+        if !self.inflight.iter().any(|(t, _, _)| on_stream(&t.req)) {
+            self.stream_free_at = now;
+        }
+        // Room under the bound kept for the first queued background copy while none runs.
+        let background_running = self.inflight.iter().any(|(t, _, _)| is_background(&t.req));
+        let reserve = match self.background.front() {
+            Some(t) if !background_running => t.req.bytes,
+            _ => 0,
+        };
+        while let Some(front) = self.urgent.front() {
             let fits = self.inflight.is_empty()
-                || self.inflight_bytes + front.req.bytes <= self.max_inflight_bytes;
+                || self.inflight_bytes + front.req.bytes + reserve <= self.max_inflight_bytes;
             if !fits {
                 break;
             }
-            let ticket = self.queued.pop_front().expect("front exists");
-            match b.start(&ticket) {
-                Ok(()) => {
-                    self.inflight_bytes += ticket.req.bytes;
-                    self.peak_inflight_bytes = self.peak_inflight_bytes.max(self.inflight_bytes);
-                    self.inflight.push((ticket, now, None));
-                }
-                Err(e) => self.finish(ticket, Err(e), false, &mut out),
+            let ticket = self.urgent.pop_front().expect("front exists");
+            self.start(b, ticket, now, &mut out);
+        }
+        let mut i = 0;
+        while let Some(next) = self.background.get(i) {
+            let fits = self.inflight.is_empty()
+                || self.inflight_bytes + next.req.bytes <= self.max_inflight_bytes;
+            if !fits {
+                break;
             }
+            let backlog = self.stream_free_at.saturating_sub(now).as_secs_f64();
+            if on_stream(&next.req) && backlog > 0.0 && backlog >= window {
+                // The stream has its iteration of work; copies off the stream (L1 <-> L2 on
+                // the I/O pool) may still start.
+                i += 1;
+                continue;
+            }
+            let ticket = self.background.remove(i).expect("index in range");
+            self.start(b, ticket, now, &mut out);
         }
         out
+    }
+
+    fn start(
+        &mut self,
+        b: &mut dyn TransferBackend,
+        ticket: TransferTicket,
+        now: Duration,
+        out: &mut Vec<TransferCompletion>,
+    ) {
+        match b.start(&ticket) {
+            Ok(()) => {
+                if on_stream(&ticket.req) {
+                    let unloaded = Duration::from_secs_f64(self.unloaded_seconds(&ticket.req));
+                    self.stream_free_at = self.stream_free_at.max(now) + unloaded;
+                }
+                self.inflight_bytes += ticket.req.bytes;
+                self.peak_inflight_bytes = self.peak_inflight_bytes.max(self.inflight_bytes);
+                self.inflight.push((ticket, now, None));
+            }
+            Err(e) => self.finish(ticket, Err(e), false, out),
+        }
+    }
+
+    /// Seconds the copy takes on its path without load (calibration, else the fallback).
+    fn unloaded_seconds(&self, r: &TransferRequest) -> f64 {
+        self.seeded[r.path.index()].block_seconds(r.bytes)
     }
 
     /// Drops the queued copies of `owner` (returned) and marks its in-flight ones, whose
     /// completions then carry `owner_cancelled`.
     pub fn cancel_owner(&mut self, owner: RequestId) -> Vec<TransferTicket> {
-        let (dropped, kept): (Vec<_>, Vec<_>) = self
-            .queued
-            .drain(..)
-            .partition(|t| t.req.owner == Some(owner));
-        self.queued = kept.into();
+        let mut dropped = Vec::new();
+        for queue in [&mut self.urgent, &mut self.background] {
+            let (gone, kept): (Vec<_>, Vec<_>) =
+                queue.drain(..).partition(|t| t.req.owner == Some(owner));
+            *queue = kept.into();
+            dropped.extend(gone);
+        }
         for t in &dropped {
             self.unbusy(&t.req.key);
         }
@@ -403,7 +505,7 @@ impl TransferEngine {
     }
 
     pub fn queued(&self) -> usize {
-        self.queued.len()
+        self.urgent.len() + self.background.len()
     }
 
     /// Whether a copy of `key` is queued or in flight.
@@ -412,7 +514,7 @@ impl TransferEngine {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.queued.is_empty() && self.inflight.is_empty()
+        self.queued() == 0 && self.inflight.is_empty()
     }
 
     /// Folds one completed copy of `bytes` encoded bytes into its path's EWMAs, keeping the
@@ -927,6 +1029,194 @@ mod tests {
             (got - want).abs() < want * 0.05,
             "back to the calibrated {want} s per block: {got} s"
         );
+    }
+
+    /// One GPU copy stream: copies run one after another in the order they were started (a
+    /// FIFO), each for its path's cost; completions are seen only at polls (no `took`).
+    struct FifoStream {
+        clock: Arc<dyn Clock>,
+        costs: [PathCost; 6],
+        free_at: Duration,
+        due: HashMap<u64, Duration>,
+        started: Vec<(u64, TransferPurpose)>,
+    }
+
+    impl FifoStream {
+        fn new(clock: Arc<dyn Clock>, costs: [PathCost; 6]) -> Self {
+            FifoStream {
+                clock,
+                costs,
+                free_at: Duration::ZERO,
+                due: HashMap::new(),
+                started: Vec::new(),
+            }
+        }
+    }
+
+    impl TransferBackend for FifoStream {
+        fn start(&mut self, t: &TransferTicket) -> Result<(), TierError> {
+            let cost = self.costs[t.req.path.index()].block_seconds(t.req.bytes);
+            let begin = self.free_at.max(self.clock.now_mono());
+            self.free_at = begin + Duration::from_secs_f64(cost);
+            self.due.insert(t.id, self.free_at);
+            self.started.push((t.id, t.req.purpose));
+            Ok(())
+        }
+        fn poll(&mut self, t: &TransferTicket) -> Result<Option<TierSlot>, TierError> {
+            let due = self.due[&t.id];
+            if self.clock.now_mono() < due {
+                return Ok(None);
+            }
+            self.due.remove(&t.id);
+            Ok(Some(TierSlot(t.req.dst_slot)))
+        }
+    }
+
+    fn demotion(key: u8, bytes: u64) -> TransferRequest {
+        TransferRequest {
+            purpose: TransferPurpose::Demote,
+            ..request(TransferPath::L0ToL1, key, bytes, None)
+        }
+    }
+
+    /// Decision "6b planner follow-ups", 1 A: promotions go ahead of demotions on the copy
+    /// stream. The server's stressed run had promotions wait 33–255 ms behind 250–800 MB of
+    /// pressure demotions (L0 → L1 at 1.6 GB/s) handed to the same FIFO copy stream. A
+    /// promotion queued behind demotions starts before them, and demotions are handed to the
+    /// stream only about one engine iteration (the time between pumps) ahead, so a later
+    /// promotion waits at most that long; demotions still progress while promotions keep
+    /// coming. Breaks if the queue is FIFO across purposes, if every demotion that fits the
+    /// in-flight bound is started at once, or if promotions can starve demotions.
+    #[test]
+    fn promotions_go_ahead_of_demotions() {
+        let (fake, clock) = fake();
+        let mut engine = TransferEngine::new(GIB, 4096, clock.clone());
+        let block = 14_680_064u64;
+        let d2h = PathCost {
+            latency_s: 20e-6,
+            bandwidth_bps: 1.6e9,
+        };
+        let h2d = PathCost {
+            latency_s: 20e-6,
+            bandwidth_bps: 10.45e9,
+        };
+        engine.seed(TransferPath::L0ToL1, d2h);
+        engine.seed(TransferPath::L1ToL0, h2d);
+        let mut costs = TransferPath::ALL.map(TransferPath::fallback);
+        costs[TransferPath::L0ToL1.index()] = d2h;
+        costs[TransferPath::L1ToL0.index()] = h2d;
+        let mut stream = FifoStream::new(clock.clone(), costs);
+        let iteration = Duration::from_millis(25);
+        // The engine pumps once per iteration.
+        for _ in 0..2 {
+            engine.pump(&mut stream);
+            fake.advance(iteration);
+        }
+
+        // Queued together: 32 demotions (470 MB, 290 ms of stream), then one promotion.
+        for i in 0..32u8 {
+            engine.submit(demotion(i, block)).unwrap();
+        }
+        let promote = engine
+            .submit(request(TransferPath::L1ToL0, 200, block, None))
+            .unwrap();
+        engine.pump(&mut stream);
+        assert_eq!(
+            stream.started.first().map(|s| s.0),
+            Some(promote.id),
+            "the promotion starts first: {:?}",
+            stream.started
+        );
+        assert!(
+            stream
+                .started
+                .iter()
+                .any(|s| s.1 == TransferPurpose::Demote),
+            "a demotion starts in the same pump"
+        );
+
+        // A promotion submitted while demotions are on the stream waits for at most about one
+        // iteration of them, and later demotions queue behind it.
+        let mut promoted_after = Vec::new();
+        let mut demotions_done = 0;
+        for round in 0..40u8 {
+            fake.advance(iteration);
+            let submitted = fake.now_mono();
+            let t = engine
+                .submit(request(TransferPath::L1ToL0, 100 + round, block, None))
+                .unwrap();
+            let mut seen = None;
+            for c in engine.pump(&mut stream) {
+                assert!(c.result.is_ok());
+                if c.ticket.req.purpose == TransferPurpose::Demote {
+                    demotions_done += 1;
+                }
+            }
+            // The promotion's due time on the stream.
+            if let Some(due) = stream.due.get(&t.id) {
+                seen = Some(due.saturating_sub(submitted));
+            }
+            promoted_after.push(seen.expect("the promotion started at its pump"));
+            if round < 8 {
+                engine.submit(demotion(50 + round, block)).unwrap();
+            }
+        }
+        let worst = promoted_after.iter().max().unwrap();
+        assert!(
+            *worst < Duration::from_millis(60),
+            "promotions wait at most about one iteration of demotions: worst {worst:?} \
+             ({promoted_after:?})"
+        );
+        // 40 iterations of 25 ms are 1 s of stream: every one of the 40 demotions (590 MB,
+        // 370 ms at 1.6 GB/s) has completed although a promotion arrived every iteration.
+        while !engine.is_idle() {
+            fake.advance(iteration);
+            for c in engine.pump(&mut stream) {
+                if c.ticket.req.purpose == TransferPurpose::Demote {
+                    demotions_done += 1;
+                }
+            }
+        }
+        assert_eq!(demotions_done, 40);
+        assert!(
+            fake.now_mono() < Duration::from_millis(1100),
+            "demotions kept pace with the stream: done at {:?}",
+            fake.now_mono()
+        );
+
+        // Promotions that alone would fill the in-flight bound every pump leave room for a
+        // demotion: it starts at the next pump and completes.
+        let mut engine = TransferEngine::new(2 * block, 4096, clock.clone());
+        engine.seed(TransferPath::L0ToL1, d2h);
+        engine.seed(TransferPath::L1ToL0, h2d);
+        let mut stream = FifoStream::new(clock.clone(), costs);
+        for i in 0..2u8 {
+            engine
+                .submit(request(TransferPath::L1ToL0, i, block, None))
+                .unwrap();
+        }
+        engine.pump(&mut stream);
+        let demote = engine.submit(demotion(99, block)).unwrap();
+        let mut done = false;
+        for round in 0..20u8 {
+            for i in 0..2u8 {
+                engine
+                    .submit(request(
+                        TransferPath::L1ToL0,
+                        10 + 2 * round + i,
+                        block,
+                        None,
+                    ))
+                    .unwrap();
+            }
+            fake.advance(iteration);
+            done |= engine
+                .pump(&mut stream)
+                .iter()
+                .any(|c| c.ticket.id == demote.id);
+            assert!(engine.inflight_bytes() <= 2 * block);
+        }
+        assert!(done, "promotions starved the demotion");
     }
 
     fn fake_clock(fake: &Arc<FakeClock>) -> Arc<dyn Clock> {
