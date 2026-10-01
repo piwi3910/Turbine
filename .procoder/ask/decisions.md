@@ -2788,3 +2788,20 @@ mechanism (lossy reuse happens, opt-out bit-equal to cold) and prints the spread
 - B) Pin a provisional 2.5 bound now (would hide a later regression up to 2.5)
 
 **Decision (user, 2026-10-01): A.** Task 9 sets the bound and first checks inherent loss vs defect against the paper's bounds on real Llama K/V.
+
+## 6b: after the held-prefix ledger fix — tail latency and queued prefixes (2026-10-01)
+
+From `p6b-survival` (merged da097d1): attached prefix blocks are now counted (`held`) in the ledger, so 20–32
+multi-turn sessions escalate through YELLOW/ORANGE/RED instead of jumping to SURVIVAL; soak PASS 8/8. Overload now
+shows as admission queueing: later-turn TTFT p99 ~40 s at 24–32 sessions (p50 162 ms at 24, 3.9 s at 32).
+
+1. Tail TTFT at 24–32 sessions:
+   - A) Accept it as the designed ladder (admission queueing under overload)
+   - B) Have YELLOW/ORANGE demote the prefixes held by queued requests (`turbine-kv` work, pairs with copy-ahead)
+   - C) Leave it to configuration (larger L0 / a lossy L1 for this workload)
+2. Queued requests hold their prefix blocks; if those alone filled L0 with nothing running, the queue head would wait
+   up to `queue_timeout` (60 s). Not observed.
+   - A) Leave it (not observed; the timeout bounds it)
+   - B) Release a queued request's prefix after a wait and re-attach on admission
+
+**Decision (user, 2026-10-01): 1 B, 2 A.** YELLOW/ORANGE may demote prefixes held by queued requests (after copy-ahead lands, same area); queued pins left as they are.
