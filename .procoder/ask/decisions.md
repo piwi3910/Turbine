@@ -2737,3 +2737,17 @@ was based on GPU 1 being Gen4 x8. Today both cards are Gen5 x8 to the CPU (above
   lab-bench and the notes
 
 **Decision (user, 2026-10-01): A.** Perf stays on GPU 0 only, for comparability; the AGENTS.md reason line is corrected to the measured links.
+
+## 6b Task 12: follow-ups after the GPU results (2026-10-01)
+
+From `p6b-t12` (merged a1c640f). Decode tq4 / BF16: Llama 1.15–1.46×, OLMoE 0.58–1.08×. Staged-CK prefill 4–7× BF16
+(includes encoding every new row to TurboQuant; Task 10's 2.1–2.6× did not).
+
+1. Staged prefill cost:
+   - A) Profile encode vs staging vs CK when Task 13 measures TTFT with `kv.dtype: tq4`, optimise the dominant part then
+   - B) Leave it
+2. More Llama decode work (per-coordinate score table, several keys per lane):
+   - A) Not now (within 1.5× of BF16; the spec only records the ITL numbers)
+   - B) Now, before Task 13
+
+**Decision (user, 2026-10-01): 1 A, 2 A.**
