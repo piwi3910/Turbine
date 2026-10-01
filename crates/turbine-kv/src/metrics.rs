@@ -178,6 +178,10 @@ pub struct KvMetrics {
     pub ladder_rung: Family<Labels1, Gauge>,
     /// `turbine_kv_ladder_actions_total{tier,from,to,reason}` (P6b S-6).
     pub ladder_actions: Family<Labels4, Counter>,
+    /// `turbine_kv_copy_ahead_total{to}` (P6b S-8, decision "6b: shared-prefix eval never
+    /// demotes the prefix to L1", A): copies of a shared parent into a lower tier made while
+    /// its L0 copy stays.
+    pub copy_ahead: Family<Labels1, Counter>,
 }
 
 /// 10 µs .. ~42 s in ×4 steps: covers pinned copies of one block through slow NVMe reads.
@@ -212,6 +216,7 @@ impl KvMetrics {
             storage_latency: latency_histogram(),
             ladder_rung: Family::default(),
             ladder_actions: Family::default(),
+            copy_ahead: Family::default(),
         }
     }
 
@@ -333,6 +338,11 @@ impl KvMetrics {
             "Compression ladder actions, by tier, formats and reason",
             m.ladder_actions.clone(),
         );
+        reg.register(
+            "turbine_kv_copy_ahead",
+            "Shared-prefix KV blocks copied into a slower tier while their L0 copy stays",
+            m.copy_ahead.clone(),
+        );
         m.init_labels();
         m
     }
@@ -397,6 +407,9 @@ impl KvMetrics {
                     ("reason", LadderReason::FloorEvict.as_str()),
                 ]);
             }
+        }
+        for t in [TierId::L1, TierId::L2] {
+            let _ = self.copy_ahead.get_or_create(&[("to", t.as_str())]);
         }
         let _ = self.lookups.get_or_create(&[("result", "miss")]);
         for p in TransferPath::ALL {
@@ -478,6 +491,16 @@ impl KvMetrics {
         self.demotions
             .get_or_create(&[("from", from.as_str()), ("to", to.as_str())])
             .inc();
+    }
+
+    /// One copy-ahead copy into `to` landed (the L0 copy stays).
+    pub fn copy_ahead(&self, to: TierId) {
+        self.copy_ahead.get_or_create(&[("to", to.as_str())]).inc();
+    }
+
+    /// Current `turbine_kv_copy_ahead_total{to}` value.
+    pub fn copy_ahead_value(&self, to: TierId) -> u64 {
+        self.copy_ahead.get_or_create(&[("to", to.as_str())]).get()
     }
 
     pub fn promotion(&self, from: TierId, to: TierId) {
