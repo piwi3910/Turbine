@@ -2642,3 +2642,32 @@ copies", A), no question.
    - B) Later
 
 **Decision (user, 2026-10-01): 1 A, 2 A, 3 A, 4 A.** Charge a plan's path latency once and promote ahead of demotions; decay a slow estimate toward the calibrated cost; A/B just below SURVIVAL with medians of 3 runs; investigate the slow device-to-host copies now.
+
+## 6b: KV copy bandwidth after the D2H batching fix (2026-10-01)
+
+From `p6b-d2h` (6be446b): calibration D2H / H2D 4.16 / 10.63 → 11.57 / 11.52 GB/s on GPU 0. About 12.5 GB/s each way
+is the SDMA ceiling here (one 64 MiB copy), on a link good for ~26; GPU copy kernels reach 18.5 GB/s for one large
+H2D copy but are slower at KV segment sizes.
+
+1. Copy bandwidth beyond the SDMA ceiling:
+   - A) Leave it (SDMA at ~12.5 GB/s)
+   - B) A block gather/scatter copy kernel (competes with compute)
+   - C) A contiguous per-block KV layout (large change)
+2. Link facts: sysfs shows both GPUs behind PCIe Gen5 x8 root ports (GPU 0 not x16, GPU 1 not Gen4), unlike the
+   notes (GPU 0 Gen5 x16; GPU 1 Gen4 x8, not for perf). Needs the user's confirmation before notes and the
+   `host_link_probe` test doc change.
+
+**Decision (user, 2026-10-01): 1 A** (leave SDMA at ~12.5 GB/s; revisit if a proof is copy-bound). **2: "check"** —
+lead checked sysfs read-only: both R9700s (03:00.0, 06:00.0) link at Gen5 x16 to their on-card switch, and both
+switches at Gen5 x8 to bifurcated CPU root ports 00:01.0 / 00:01.1. Both cards have the same host link today.
+
+## GPU 1 for performance runs (2026-10-01)
+
+The rule "perf only on GPU 0; GPU 1's PCIe link is not throughput-comparable" (AGENTS.md, lab-bench refuses GPU 1)
+was based on GPU 1 being Gen4 x8. Today both cards are Gen5 x8 to the CPU (above).
+
+- A) Keep GPU 0 only (comparability with all recorded numbers; GPU 1 may still differ in p2p or thermals)
+- B) Allow perf on either card after one A/B (same bench on GPU 0 and GPU 1 within noise), then update AGENTS.md,
+  lab-bench and the notes
+
+**Decision (user, 2026-10-01): A.** Perf stays on GPU 0 only, for comparability; the AGENTS.md reason line is corrected to the measured links.
