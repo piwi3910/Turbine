@@ -2508,3 +2508,97 @@ cached_tokens_ratio 0.632 vs 0.618 (`l0`), later-turn TTFT p50 522 vs 2102 ms, L
    - B) Accept; TTFT already improves 4× and the AC (≥ `l0`) holds
 
 **Decision (user, 2026-10-01): 1 A, 2 A, 3 A.** A long-shared-prefix eval variant gates every lossy-KV format; the 1.9× capacity target applies to codec block bytes (kv_sim), real runs report the measured ratio; the planner's recompute choice on the GPU server is investigated before Task 9.
+
+## P6b: mixed-format / TurboQuant paged attention — provider evaluation (kernel reuse rule)
+
+Date: 2026-10-01 (Phase 6b Task 10). Op: `attention_{decode,prefill}_paged` over one layer whose blocks carry a format
+tag (`bf16`, `fp8_e4m3`, `tq4`, `tq2`) in one block table (spec S-5). Contract from the CPU reference
+`cpu::tq_attention` (Task 11): a TurboQuant key scores `n/√d · ⟨Rq, c[codes]⟩ + √(π/2)/d · ‖r‖ · ⟨S·Rq, z⟩` with
+`Rq = H·(s_k ⊙ q)/√d` computed once per query row and KV head; a TurboQuant value is accumulated as `n/√d · c[codes]`
+in the rotated domain and rotated back once per output row (`s_v ⊙ H·acc/√d`); BF16 / FP8 blocks are read as in 6a;
+the reference (`Formulation::DecodeThenAttend`, equal to `Rotated` within 1e-5) decodes in F32 and attends in F64.
+Card: R9700 (gfx1201), GPU 0 under `bench.lock`, ROCm 7.14.1, CK at the pinned `cd9574023093742434e8c992d13b89ab9a6c1cf8`.
+Upstream sources read (shallow, sparse, in `/home/piwi/turbine-ci/scratch/p6b-t10/`, deleted after this entry):
+llama.cpp `0c1e57098bba43ac29e6e3b677cdceebdd22334f` (MIT), vLLM `2eaa3bc5ac03aa5c0b3282782fd89eb92e074bfb`
+(Apache-2.0), aiter `b68b0e5c7200ec690bf9652c6f7eb5f87ab17f08` (MIT), CK develop
+`2e9832eac66975495136fb08fc40e15dc25da803` (MIT). Nothing from them is in the repository; no licence file is added.
+
+Harness: `kernels/rocm/tools/attn_eval.cpp` (`-DTURBINE_BUILD_ATTN_EVAL=ON`, links `libturbine_hip.so`). It builds
+pages of each format for the Llama-3.2-3B (24 / 8 heads) and OLMoE (16 / 16) layouts at 128-token pages (Gaussian K/V
+with outlier channels, a host TurboQuant encoder of the codec's record layout, random signs and Gaussian `S`), runs
+the library's implementations through `turbine_impl_run`, the staged candidate through `turbine_kv_transcode` +
+`turbine_impl_run`, and a prototype own kernel; checks every output against a host reference with
+`cpu::tq_attention`'s semantics over the pages read back after the call (bound per element
+`|Δ| ≤ 4e-3 + |ref|/128`; staged against the TurboQuant values rounded to BF16, which its staging pages hold); times
+the median of 5 rounds × 20 calls (prefill 5), rotating over ≥ 256 MiB of pool and table copies. Every own-kernel
+case passes, mixed tables included (worst 0.44 of the bound); runs `turbine_attn_eval` (timings) and
+`--check-only 1` (correctness after the FP8 reference was aligned with 6a's `bf16(e4m3 · scale)` read). llama.cpp was
+timed with its own `test-backend-ops perf -o FLASH_ATTN_EXT` (our shapes added in the scratch copy only).
+
+| Candidate                                                                                                                                   | Builds on gfx1201?                                                                           | Fits the contract?                                                                                                                                                                                                                                                                                                                                                                                                                          | Outcome                                                                                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| llama.cpp HIP flash attention, q4_0 / q8_0 KV (`ggml-cuda/fattn-vec.cuh`, `fattn-common.cuh` `vec_dot_fattn_vec_KQ_q4_0`, `dequantize_V_*`) | yes (`ggml-hip`, `test-backend-ops`)                                                         | no: quantized K/V only in the vector kernel (≤ 2 query rows; prefill converts K/V to F16 first); Q is quantized to q8_1 for an int8 `dp4a` K dot (not the F32 rotated-domain score); block types are 32-element blocks with an F16 scale, K and V separate contiguous tensors with a mask, no page table, one type per tensor (no per-block tag); no TurboQuant / QJL type (`tq1_0` / `tq2_0` are ternary weights, `q1_0` / `q2_0` uniform) | rejected; **reused as a pattern** (dequantize-on-load in the K dot and the V loop, as 6a's FP8 decode kernel already does); timed as a speed reference |
+| CK FMHA `fmha_fwd_pagedkv` / `fmha_fwd_splitkv` FP8 (6a Task 23's instances) and CK develop                                                 | yes (BF16 instances served today)                                                            | no: as in "P6: FP8 paged attention": FP8 instances quantize Q, P and O with static scales; `fp8bf16` is still `TODO` for pagedkv / split-KV at 2e9832e, and the new `fmha_batch_prefill` `kv_blockscale` FP8 path is generated for gfx9 only (skipped for gfx12 in `fmha_batch_prefill.py`); no hook to decode a custom format on load (a pipeline fork)                                                                                    | natively rejected; **adapted as `staged_ck`** below                                                                                                    |
+| `staged_ck`: TurboQuant pages decoded to BF16 pages by Task 8's `turbine_hip_tq` transcode, then CK BF16 pagedkv / split-KV                 | yes (both in `libturbine_hip.so`)                                                            | partly: correct (within the bound against the BF16-rounded decoded values, 1.19× / 1.26× of it in two prefill cases; 1.4–9× of the bound against the unrounded reference: the BF16 rounding of decoded K/V); but it materialises K and V, which S-5 excludes, and the staging decode dominates                                                                                                                                              | rejected for decode (4–20× BF16); **candidate for prefill** (2.1–2.5× BF16 attention) — open question below                                            |
+| vLLM ROCm paged attention (`csrc/rocm/attention.cu`, gfx12 WMMA path, `Fp8KVCacheDataType`)                                                 | not built                                                                                    | no: FP8 only, 16 / 32-token pages, K split `[blocks, heads, head/x, block, x]` and V transposed, decode only, torch headers (as in 6a); its TurboQuant attention (`triton_turboquant_decode.py`, FlyDSL) is Python and a different codec (no QJL, uniform V; "P6b: TurboQuant transcode")                                                                                                                                                   | rejected (paper); its split-KV TurboQuant decode with precomputed `Q_rot` confirms the rotated-domain design                                           |
+| aiter paged attention (`csrc/cpp_itfs/pa/*`, `pa_gluon_aot`)                                                                                | no: MFMA (gfx9 / gfx950) instructions, jinja templates JIT-built from Python, Gluon = Triton | –                                                                                                                                                                                                                                                                                                                                                                                                                                           | rejected (paper)                                                                                                                                       |
+| Own: Turbine paged decode kernel with per-block format tags (`own_rot`, prototype in the harness)                                           | yes                                                                                          | yes: one workgroup per (query row, KV head), every query head of the group at once; per block its tag; TurboQuant K scored in the rotated domain (q rotated by an LDS FWHT and projected by `S` once per workgroup), V accumulated in a second, rotated accumulator and rotated back once; BF16 / FP8 as 6a's FP8 decode kernel; online softmax in F32                                                                                      | **picked for decode**; as a prefill kernel (one workgroup per row, scalar) 50–100× slower than CK — rejected for prefill                               |
+
+Decode, µs per call (128-token pages; BF16 = the served CK choice, split-KV for Llama, pagedkv for OLMoE; no append in
+the own rows, the ABI rows include their append):
+
+| shape               | BF16 CK | FP8 `turbine_hip_fp8_decode` | tq4 own | tq2 own | tq4 staged_ck | tq2 staged_ck | BF16 own (same kernel) | llama.cpp f16 / q8_0 / q4_0 (contiguous) |
+| ------------------- | ------- | ---------------------------- | ------- | ------- | ------------- | ------------- | ---------------------- | ---------------------------------------- |
+| Llama 24/8 b1 @768  | 42.9    | 143.5                        | 134.6   | 132.1   | 291.4         | 286.5         | 47.7                   | 164 / 160 / 150 (noisy)                  |
+| Llama b16 @768      | 100.2   | 373.3                        | 257.8   | 242.8   | 1,031         | 1,005         | 131.1                  | 75.2 / 92.4 / 78.7                       |
+| Llama b16 @2k       | 234.5   | 872.9                        | 597.4   | 568.4   | 2,530         | 2,476         | 294.4                  | 244.0 / 187.8 / 172.9                    |
+| OLMoE 16/16 b1 @768 | 52.4    | 75.9                         | 36.0    | 31.3    | 256.4         | 279.5         | 42.1                   | 12.9 / 144.2 / 15.8 (noisy)              |
+| OLMoE b16 @768      | 182.4   | 292.4                        | 131.4   | 115.5   | 2,037         | 1,973         | 211.3                  | 183.7 / 76.9 / 60.8                      |
+| OLMoE b16 @2k       | 463.3   | 667.1                        | 272.4   | 244.7   | 5,063         | 4,950         | 515.0                  | 455.4 / 253.6 / 166.5                    |
+
+Prefill, µs per call:
+
+| shape                      | BF16 CK pagedkv | FP8 `ck_tile_fmha_pagedkv_fp8_staged` | tq4 staged_ck | tq2 staged_ck | tq4 own (scalar) | llama.cpp f16 / q4_0 (converts to F16) |
+| -------------------------- | --------------- | ------------------------------------- | ------------- | ------------- | ---------------- | -------------------------------------- |
+| Llama 16 × 512 after 1,024 | 1,750           | 1,988                                 | 3,709         | 3,690         | 174,242          | 3,611 / 4,138                          |
+| Llama 1 × 2,048            | 342             | 497                                   | 568           | 583           | 37,338           | –                                      |
+| OLMoE 16 × 512 after 1,024 | 2,543           | 3,105                                 | 6,227         | 6,135         | 73,075           | 9,204 / 10,053                         |
+| OLMoE 1 × 2,048            | 265             | 553                                   | 681           | 665           | 15,384           | –                                      |
+
+Reading the numbers: the own prototype reads TurboQuant in the rotated domain at 0.6–0.7× the BF16 CK time for OLMoE
+(group 1: one score per key, 3.6× / 6.4× fewer KV bytes) and 2.4–2.6× for Llama (group 3: each lane scores the key
+for three heads, 128 codebook lookups and 128 sign adds per head — compute-bound in the scoring loop); its BF16 path
+is within 1.1–1.3× of CK, so the structure is sound. At b1 Llama (8 workgroups) the per-workgroup prologue (two LDS
+FWHTs and the 64 KiB `S · Rq` read) and the lack of a split over keys dominate. The staged path costs the Task 8
+decode (≈ 9 µs per block-layer, including the 128 × 128 `Sᵀ·z` per K vector), not CK. llama.cpp's own numbers
+(contiguous KV, no cache rotation, its first cases noisy) show dequantize-on-load costing little at c16 for uniform
+byte-aligned blocks, and its prefill converting quantized KV to F16 (+15 % Llama) — the staged pattern.
+
+Pick: **own** mixed-format decode kernel, implementation `turbine_hip_mixed` (Task 12), built from the prototype's
+design (the 6a FP8 decode kernel's workgroup layout and online softmax, a format switch per key, a rotated V
+accumulator rotated back once, the q rotation and `S·Rq` once per workgroup). No upstream kernel implements this
+codec's score or a per-block format tag; llama.cpp's dequantize-on-load loop is the reused pattern. Work Task 12
+should carry over: a split over keys for small batches (Llama b1 134.6 vs 42.9 µs), a cheaper TurboQuant score for
+grouped heads (a per-(coordinate, code) table of `Rq·c`, or scoring several keys per lane), vectorised FP8 / tq loads.
+Prefill: open, see below. Tolerance for the Task 12 lab test (`paged_mixed_matches_cpu`): every element within
+`4e-3 + |ref|/128` of `cpu::tq_attention` (the prototype's worst element is 0.44 of it); note that
+`cpu::tq_attention` reads FP8 blocks as `e4m3 · scale` in F32 while the 6a kernels (and the prototype) read
+`bf16(e4m3 · scale)` — within this bound, but Task 11/12 should pick one.
+
+ABI needs beyond the spec's v2.11 list (`block_formats`, `turbine_tq_params`; for Task 12 to decide, nothing added
+here): `block_formats` must be a device pointer like `block_table` (the decode graph captures paged attention, and a
+host array would need an upload during capture, which the transcode already refuses; `ops::PagedAttentionContext`
+calls it host memory); the attention descriptor is per layer while `turbine_tq_params.tables` is
+`[layers][kv_heads][…]`, so either the caller passes `tables` offset to the layer (a documented convention, no field)
+or the descriptor gains a `layer` index; the spec's ABI line says v2.11 but "read only at minor ≥ 10". A staged
+prefill needs no ABI field (the context's attention scratch, bounded as 6a's 256 MiB staging).
+
+Open: TurboQuant prefill.
+
+- A) Staged: TurboQuant blocks decoded to BF16 in the attention scratch, then CK pagedkv (6a's FP8 prefill scheme;
+  measured 2.1–2.5× the BF16 prefill attention with Task 8's decode, less with a faster staging decode); amends S-5
+  for prefill ("without materialising K or V" becomes decode-only) and the prefill tolerance is against the
+  BF16-rounded decoded values (provisional pick: reuse first, faster than any own path measured)
+- B) Own WMMA prefill in the rotated domain (`Q' = [Rq | S·Rq]` against tiles of codebook values and residual signs
+  decoded into LDS, V in the rotated domain; the spec as written), not built or measured; the most work
+- C) The scalar own kernel for prefill too (one code path; 50–100× slower than CK)
