@@ -646,6 +646,31 @@ impl KvOrchestrator {
         outcome
     }
 
+    /// The attach of a queued request that released its prefix ([`KvOrchestrator::detach_prefix`])
+    /// once it was admitted: the planner decides again; its tokens were already counted in the
+    /// hit-rate window by the first attach.
+    pub fn attach_again(&mut self, pool: &mut BlockPool, req: &AttachRequest<'_>) -> AttachOutcome {
+        self.h.attach_prefix(pool, req)
+    }
+
+    /// A request in the admission queue released its attached prefix for pressure reclaim
+    /// (`KvHierarchy::detach_prefix`).
+    pub fn detach_prefix(
+        &mut self,
+        pool: &mut BlockPool,
+        request: RequestId,
+        attach: &PrefixAttach,
+        alone: usize,
+    ) {
+        self.h.detach_prefix(pool, request, attach, alone);
+    }
+
+    /// Blocks the last YELLOW/ORANGE pressure reclaim found no unreferenced block for
+    /// (`KvHierarchy::take_queued_prefix_demand`).
+    pub fn take_queued_prefix_demand(&mut self) -> usize {
+        self.h.take_queued_prefix_demand()
+    }
+
     /// Transfer completions: requests whose promotions all landed, with their prefixes.
     pub fn poll(&mut self, pool: &mut BlockPool) -> Vec<(RequestId, PrefixAttach)> {
         match &mut self.remote {

@@ -582,6 +582,19 @@ impl<T, K: Ord + Copy> AdmissionQueue<T, K> {
         self.entries.iter()
     }
 
+    /// The entries behind the head, the last to be admitted first, with their estimate and
+    /// payload mutable (their keys and order stay): the admission queue's side of releasing
+    /// queued requests' cached prefixes under pressure (P6b).
+    pub fn behind_head_rev_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (RequestId, &mut ResourceEstimate, &mut T)> {
+        self.entries
+            .iter_mut()
+            .skip(1)
+            .rev()
+            .map(|e| (e.id, &mut e.estimate, &mut e.payload))
+    }
+
     /// Queue at `key` (unique per entry; equal keys keep insertion order). `enqueued_at` starts
     /// the `queue_timeout` clock. Err(payload) when the queue is full.
     #[allow(clippy::too_many_arguments)]

@@ -91,7 +91,7 @@ use turbine_core::request::{
 };
 use turbine_core::types::{BlockId, CircuitState, PressureState, Priority, RequestId, SeqId};
 use turbine_kv::BlockPool;
-use turbine_kv::hierarchy::{AttachOutcome, AttachRequest, PrefixAttach};
+use turbine_kv::hierarchy::{AttachOutcome, AttachRequest, CAPACITY_BATCH, PrefixAttach};
 use turbine_model::executor::{
     BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice,
     TokenFeed,
@@ -222,6 +222,9 @@ pub(crate) struct EngineLoop {
     /// Requests that ended this turn, reported to the KV hierarchy after `complete`
     /// (`true`: cancelled or failed).
     kv_done: Vec<(RequestId, bool)>,
+    /// Admitted requests that released their prefix while queued and whose new attach waits for
+    /// promotions ([`EngineLoop::reattach_released`]).
+    reattaching: HashSet<RequestId>,
     /// Pipeline parallelism: the stages' timing and placement, and the micro-batch count.
     pipeline: Option<Arc<PipelineStats>>,
     /// Pipeline parallelism: the micro-batches launched into the stages, oldest first.
@@ -365,6 +368,7 @@ impl EngineLoop {
             kv: p.kv,
             held: HashMap::new(),
             kv_done: Vec::new(),
+            reattaching: HashSet::new(),
             pipeline: p.pipeline,
             pipe: VecDeque::new(),
             last_collect: None,
@@ -1133,6 +1137,10 @@ impl EngineLoop {
     /// (its KV released), then the reclaim order and the controller's pressure state.
     fn kv_before_plan(&mut self) {
         for (id, attach) in self.kv.poll(&mut self.pool) {
+            if self.reattaching.remove(&id) {
+                self.reattached(id, attach);
+                continue;
+            }
             match self.held.remove(&id) {
                 Some(h) => self.admit_submission(h.submission, h.events, h.ack, Some(attach)),
                 None => {
@@ -1172,8 +1180,81 @@ impl EngineLoop {
                 }
             }
         }
+        self.reattach_released();
         self.kv.before_plan(&mut self.pool, self.snap.state);
         // The plan's refills from the admission queue reserve against what the pool holds now.
+        self.sync_kv_held();
+    }
+
+    /// Admitted requests that released their prefix in the admission queue
+    /// ([`EngineLoop::release_queued_prefixes`]) attach it again through the planner before
+    /// they start: resident blocks now, promotions when they land, or a recompute; one waiting on
+    /// another request's block tries again next turn. Their KV reservation stays whole.
+    fn reattach_released(&mut self) {
+        for id in self.sched.awaiting_reattach() {
+            if self.reattaching.contains(&id) {
+                continue;
+            }
+            let Some(r) = self.requests.get(&id) else {
+                continue;
+            };
+            let request = &r.request;
+            let outcome = self.kv.attach_again(
+                &mut self.pool,
+                &AttachRequest {
+                    request: id,
+                    prompt: &request.prompt_tokens,
+                    cache_salt: request.cache_salt.as_deref().unwrap_or(""),
+                    session: request.session.as_ref(),
+                    priority: request.priority,
+                    allow_lossy: request.kv_policy.map(|p| p.allow_lossy),
+                },
+            );
+            match outcome {
+                AttachOutcome::Ready(a) => self.reattached(id, a),
+                AttachOutcome::Promoting => {
+                    self.reattaching.insert(id);
+                }
+                AttachOutcome::WaitForPrefix => {}
+            }
+        }
+    }
+
+    /// A released request's prefix is attached again: the scheduler may start it, and its
+    /// `usage.cached_tokens` are the new attach's. One the scheduler no longer waits for
+    /// (cancelled meanwhile) gives the blocks back.
+    fn reattached(&mut self, id: RequestId, attach: PrefixAttach) {
+        let (cached, lossy) = (attach.cached_tokens, attach.lossy_tokens);
+        match self.sched.reattach(id, attach) {
+            None => {
+                if let Some(r) = self.requests.get_mut(&id) {
+                    r.cached_tokens = cached;
+                    r.lossy_cached_tokens = lossy;
+                }
+            }
+            Some(attach) => self.pool.release(&attach.blocks),
+        }
+    }
+
+    /// At YELLOW and ORANGE the pressure reclaim may want more blocks than L0 holds
+    /// unreferenced (decision "6b: after the held-prefix ledger fix", 1 B): requests waiting in
+    /// the admission queue then release their whole prefixes, the last to be admitted first, up
+    /// to that shortfall and at most [`CAPACITY_BATCH`] blocks per controller tick (decision "6b:
+    /// queued-prefix demotion — granularity and scope", 1 A, 2 A). The released blocks leave the
+    /// ledger's `held` now and the next reclaim demotes them; each request attaches again once
+    /// admitted ([`EngineLoop::reattach_released`]).
+    fn release_queued_prefixes(&mut self) {
+        let want = self.kv.take_queued_prefix_demand().min(CAPACITY_BATCH);
+        if want == 0 {
+            return;
+        }
+        let released = self.sched.detach_queued_prefixes(&self.pool, want);
+        if released.is_empty() {
+            return;
+        }
+        for (id, attach, alone) in released {
+            self.kv.detach_prefix(&mut self.pool, id, &attach, alone);
+        }
         self.sync_kv_held();
     }
 
@@ -1210,9 +1291,11 @@ impl EngineLoop {
     /// session TTLs.
     fn kv_end_turn(&mut self) {
         for (id, cancelled) in std::mem::take(&mut self.kv_done) {
+            self.reattaching.remove(&id);
             self.kv.request_done(&mut self.pool, id, cancelled);
         }
         self.kv.end_turn(&mut self.pool);
+        self.release_queued_prefixes();
     }
 
     /// Step 2.
@@ -2604,7 +2687,11 @@ mod tests {
     use tokio::sync::oneshot;
     use turbine_core::clock::{FakeClock, SystemClock};
     use turbine_core::config::{ByteSize, KvConfig, ReliabilityConfig};
+    use turbine_core::pressure::PressureSignal;
     use turbine_core::request::CancelFlag;
+    use turbine_core::telemetry::{
+        DeviceSample, HostSample, LedgerSample, SourceStatus, TelemetrySample,
+    };
     use turbine_core::types::{DeviceId, KvLayout, MemoryKind, ModelIdentity, ModelShape};
     use turbine_kernels::test_support::plain_device_error;
     use turbine_kernels::{KernelError, KernelMetrics, KernelRegistry, cpu_reference_provider};
@@ -2620,7 +2707,7 @@ mod tests {
     };
     use turbine_observability::MetricsRegistry;
     use turbine_reliability::budget::{DeviceBudget, PoolKind};
-    use turbine_reliability::controller::ControllerHandle;
+    use turbine_reliability::controller::{ControllerHandle, PressureController};
     use turbine_reliability::ledger::Ledger;
     use turbine_reliability::metrics::ReliabilityMetrics;
     use turbine_reliability::reserve::EmergencyReserve;
@@ -2724,6 +2811,9 @@ mod tests {
         shared: Arc<EngineShared>,
         reg: MetricsRegistry,
         controller: ControllerHandle,
+        /// The pressure controller itself: a test ticks it (no controller thread runs).
+        pressure: Arc<std::sync::Mutex<PressureController>>,
+        clock: Arc<dyn Clock>,
     }
 
     /// An engine over `exec` with a 64-block pool, overlap scheduling off.
@@ -2773,9 +2863,28 @@ mod tests {
         tokenizer: Arc<Tokenizer>,
         params: SchedulerParams,
         overlap: bool,
+        kv: KvConfig,
+        l2: impl FnOnce(&KvConfig, &KvFormat, KvMetrics) -> Option<Arc<L2NvmeTier>>,
+        pipeline: Option<Arc<PipelineStats>>,
+    ) -> TestEngine {
+        let config = ReliabilityConfig {
+            emergency_vram_reserve: ByteSize(0),
+            ..ReliabilityConfig::default()
+        };
+        engine_full(exec, tokenizer, params, overlap, kv, l2, pipeline, config)
+    }
+
+    /// [`engine_with_pipeline`] under the reliability section `config`.
+    #[allow(clippy::too_many_arguments)]
+    fn engine_full(
+        exec: Box<dyn ModelExecutor>,
+        tokenizer: Arc<Tokenizer>,
+        params: SchedulerParams,
+        overlap: bool,
         mut kv: KvConfig,
         l2: impl FnOnce(&KvConfig, &KvFormat, KvMetrics) -> Option<Arc<L2NvmeTier>>,
         pipeline: Option<Arc<PipelineStats>>,
+        config: ReliabilityConfig,
     ) -> TestEngine {
         let reg = MetricsRegistry::new();
         let metrics = EngineMetrics {
@@ -2806,10 +2915,6 @@ mod tests {
             reliability_metrics.clone(),
         )
         .unwrap();
-        let config = ReliabilityConfig {
-            emergency_vram_reserve: ByteSize(0),
-            ..ReliabilityConfig::default()
-        };
         let mut pool = BlockPool::new(
             BlockPoolConfig {
                 layout,
@@ -2859,6 +2964,8 @@ mod tests {
             .with_gate(parts.gate)
             .with_micro_batches(pipeline.as_ref().map_or(1, |p| p.micro_batches));
         let controller = parts.engine.handle.clone();
+        let pressure = Arc::clone(&parts.controller);
+        let test_clock = Arc::clone(&clock);
         let (tx, commands) = mpsc::channel(8);
         let shared = Arc::new(EngineShared::default());
         let engine = EngineLoop::new(EngineParts {
@@ -2886,6 +2993,8 @@ mod tests {
             shared,
             reg,
             controller,
+            pressure,
+            clock: test_clock,
         }
     }
 
@@ -4145,6 +4254,181 @@ mod tests {
         );
         let events: Vec<_> = std::iter::from_fn(|| slow.blocking_recv()).collect();
         assert_eq!(token_count(&events), 20);
+        drop(tx);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+    }
+
+    /// A telemetry sample at `clock`'s now with KV utilisation `kv` (host and device calm).
+    fn calm_sample(clock: &Arc<dyn Clock>, kv: f64) -> TelemetrySample {
+        TelemetrySample {
+            at_mono_ns: clock.now_mono().as_nanos() as u64,
+            host: HostSample {
+                mem_available_bytes: Some(64 << 30),
+                swap_total_bytes: Some(0),
+                swap_free_bytes: Some(0),
+                pswpin_total: Some(0),
+                psi_memory_some_avg10: Some(0.0),
+                status: SourceStatus::Ok,
+            },
+            // No device memory figure: the test budget is only the 64-block pool.
+            devices: vec![DeviceSample {
+                temperature_c: Some(40.0),
+                slowdown_temperature_c: Some(90.0),
+                clock_mhz: Some(2350),
+                ..DeviceSample::empty(DeviceId(0), SourceStatus::Ok)
+            }],
+            ledger: LedgerSample {
+                kv_utilization: kv,
+                queue_fill: 0.0,
+            },
+            storage: None,
+        }
+    }
+
+    /// One controller tick at KV utilisation `kv` (the test is the controller thread).
+    fn tick(t: &(Arc<std::sync::Mutex<PressureController>>, Arc<dyn Clock>), kv: f64) {
+        let stats = EngineStats {
+            block_tokens: BLOCK_TOKENS,
+            free_kv_blocks: 64,
+            ..EngineStats::default()
+        };
+        t.0.lock().unwrap().tick(&calm_sample(&t.1, kv), &stats);
+    }
+
+    /// Queued-prefix demotion on the cpu backend (decisions "6b: after the held-prefix ledger
+    /// fix", 1 B, and "6b: queued-prefix demotion — granularity and scope", 1 A, 2 A): a request
+    /// waiting in the admission queue behind its head holds its 6 attached blocks at GREEN, even when the
+    /// controller asks for more than L0 holds unreferenced. At YELLOW the reclaim's shortfall
+    /// makes it release them: they leave the referenced blocks and the next reclaim demotes them
+    /// to L2. Admitted once the running request ends, it attaches again through the planner (L2
+    /// or recompute) and yields the cold run's greedy tokens. Breaks if a queued prefix is
+    /// released at GREEN, never released at YELLOW, not demoted afterwards, or if the released
+    /// request never re-attaches (it would wait forever) or produces other tokens.
+    #[test]
+    fn yellow_releases_queued_prefixes_and_they_reattach() {
+        let (dir, spec, tokenizer) = tiny();
+        let mut kv = KvConfig::default();
+        kv.nvme.enabled = true;
+        kv.nvme.path = dir.path().join("kv");
+        kv.nvme.max_bytes = ByteSize(16 << 20);
+        kv.nvme.slab_bytes = ByteSize(1 << 20);
+        let mut config = ReliabilityConfig {
+            emergency_vram_reserve: ByteSize(0),
+            ..ReliabilityConfig::default()
+        };
+        // YELLOW from 1 % KV utilisation: its reclaim target (1 % of 64 blocks) is below what
+        // the requests hold, so the reclaim always falls short.
+        config.pressure.thresholds.insert(
+            PressureSignal::KvUtilization,
+            [Some(0.01), Some(0.9), Some(0.95), Some(0.99)],
+        );
+        let t = engine_full(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(1, 64),
+            false,
+            kv,
+            |cfg, format, metrics| {
+                crate::kv_orchestrator::open_l2(
+                    cfg,
+                    format,
+                    &ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                    Arc::new(SystemClock::new()),
+                    metrics,
+                )
+                .expect("L2 opens in the temp directory")
+            },
+            None,
+            config,
+        );
+        let reclaim = t.engine.kv.reclaimer();
+        let ctl = (Arc::clone(&t.pressure), Arc::clone(&t.clock));
+        let TestEngine {
+            engine,
+            tx,
+            shared,
+            reg,
+            controller,
+            ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+        let detached = "turbine_kv_queued_prefix_detached_blocks_total";
+        let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
+
+        let prompt: Vec<u32> = std::iter::once(256).chain(1..100).collect();
+        let (cold, _) = run_one(&tx, request(&prompt, 8));
+        // R holds the only running slot: paused behind a full channel, with its KV.
+        let other: Vec<u32> = std::iter::once(256).chain(150..189).collect();
+        let (mut slow, admitted) = submit_with(&tx, request(&other, 20), 4);
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shared.docs().unwrap().scheduler.paused != 1 {
+            assert!(Instant::now() < deadline, "R never paused");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The admission queue's head H (it keeps whatever it holds), then Q with the prompt's 6
+        // cached blocks attached.
+        let (mut head, admitted) = submit(&tx, request(&[256, 5, 6, 7], 4));
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let (mut queued, admitted) = submit(&tx, request(&prompt, 8));
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shared.docs().unwrap().scheduler.waiting != 2 {
+            assert!(Instant::now() < deadline, "H and Q are not both queued");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let held = held_blocks(&shared.docs().unwrap());
+        assert!(held >= 9, "R's 3 blocks and Q's 6: {held}");
+
+        // GREEN: a reclaim that falls short releases nothing.
+        reclaim.demote(0.01);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(metric(&reg, detached), 0.0, "nothing released at GREEN");
+        assert_eq!(held_blocks(&shared.docs().unwrap()), held);
+
+        // YELLOW: the controller's reclaim falls short, Q's blocks are released and demoted.
+        for _ in 0..3 {
+            tick(&ctl, 0.5);
+        }
+        assert_eq!(controller.state(), PressureState::Yellow);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while metric(&reg, detached) < 6.0 || metric(&reg, demoted) < 6.0 {
+            assert!(
+                Instant::now() < deadline,
+                "Q's prefix was not released and demoted: {} released, {} demoted",
+                metric(&reg, detached),
+                metric(&reg, demoted)
+            );
+            tick(&ctl, 0.5);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(metric(&reg, detached), 6.0, "only Q's own blocks");
+        assert_eq!(
+            held_blocks(&shared.docs().unwrap()),
+            held - 6,
+            "the released blocks left the referenced ones"
+        );
+
+        // R and H end; Q is admitted, attaches again (from L2 or recomputed) and matches the
+        // cold run.
+        let events: Vec<_> = std::iter::from_fn(|| slow.blocking_recv()).collect();
+        assert_eq!(token_count(&events), 20);
+        let events: Vec<_> = std::iter::from_fn(|| head.blocking_recv()).collect();
+        assert_eq!(token_count(&events), 4);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut events = Vec::new();
+        loop {
+            match queued.try_recv() {
+                Ok(e) => events.push(e),
+                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "Q never ran: {events:?}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        assert!(!internal_error(&events), "{events:?}");
+        assert_eq!(generated(&events), cold, "Q yields the cold run's tokens");
         drop(tx);
         assert_eq!(handle.join().unwrap(), Ok(()));
     }

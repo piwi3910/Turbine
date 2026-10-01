@@ -11,6 +11,8 @@ use std::sync::Arc;
 use turbine_core::clock::Clock;
 use turbine_core::request::ResourceEstimate;
 use turbine_core::types::RequestId;
+use turbine_kv::BlockPool;
+use turbine_kv::hierarchy::PrefixAttach;
 use turbine_reliability::admission::{
     Admission, AdmissionDecision, AdmissionQueue, PressureReason, Queued, RejectionReason,
 };
@@ -235,6 +237,44 @@ impl AdmissionGate {
                 false
             }
         }
+    }
+
+    /// Pressure reclaim at YELLOW and ORANGE (P6b, decision "6b: queued-prefix demotion —
+    /// granularity and scope", 1 A, 2 A): the requests behind the queue head, the last to be
+    /// admitted first, release their whole attached prefixes until the blocks only they held
+    /// (pool refcount 1) reach `want`; the head keeps its own, and a request holding no block
+    /// alone keeps its prefix. A released request is marked `reattach`, and its estimate (with
+    /// the queue's copy, which the pump reserves) covers `full_blocks` again: the prefix it
+    /// attaches on admission may be recomputed. Returns each release with its alone count; the
+    /// caller gives the references back.
+    pub fn detach_prefixes(
+        &mut self,
+        pool: &BlockPool,
+        want: usize,
+        full_blocks: impl Fn(&SchedRequest) -> u32,
+    ) -> Vec<(RequestId, PrefixAttach, usize)> {
+        let mut out = Vec::new();
+        let mut covered = 0;
+        for (id, estimate, waiting) in self.queue.behind_head_rev_mut() {
+            if covered >= want {
+                break;
+            }
+            let r = &mut waiting.req;
+            let Some(a) = &r.cached_prefix else {
+                continue;
+            };
+            let alone = a.blocks.iter().filter(|b| pool.refcount(**b) == 1).count();
+            if alone == 0 {
+                continue;
+            }
+            let a = r.cached_prefix.take().expect("checked above");
+            r.reattach = true;
+            r.estimate.projected_kv_blocks = full_blocks(r);
+            *estimate = r.estimate;
+            covered += alone;
+            out.push((id, a, alone));
+        }
+        out
     }
 
     /// Take `id` out of the queue (client disconnect): it never took a reservation.

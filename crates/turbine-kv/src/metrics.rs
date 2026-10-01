@@ -182,6 +182,10 @@ pub struct KvMetrics {
     /// demotes the prefix to L1", A): copies of a shared parent into a lower tier made while
     /// its L0 copy stays.
     pub copy_ahead: Family<Labels1, Counter>,
+    /// `turbine_kv_queued_prefix_detached_blocks_total` (decision "6b: queued-prefix demotion —
+    /// granularity and scope"): blocks requests in the admission queue released for pressure
+    /// reclaim at YELLOW/ORANGE, counting only those no other request held.
+    pub queued_prefix_detached_blocks: Counter,
 }
 
 /// 10 µs .. ~42 s in ×4 steps: covers pinned copies of one block through slow NVMe reads.
@@ -217,6 +221,7 @@ impl KvMetrics {
             ladder_rung: Family::default(),
             ladder_actions: Family::default(),
             copy_ahead: Family::default(),
+            queued_prefix_detached_blocks: Counter::default(),
         }
     }
 
@@ -342,6 +347,11 @@ impl KvMetrics {
             "turbine_kv_copy_ahead",
             "Shared-prefix KV blocks copied into a slower tier while their L0 copy stays",
             m.copy_ahead.clone(),
+        );
+        reg.register(
+            "turbine_kv_queued_prefix_detached_blocks",
+            "KV blocks queued requests released for pressure reclaim (reason queued_prefix)",
+            m.queued_prefix_detached_blocks.clone(),
         );
         m.init_labels();
         m
