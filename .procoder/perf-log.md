@@ -270,3 +270,40 @@ BF16 KV after the attention changes (`scripts/lab-bench.sh --quick`, 64 requests
 | 2026-10-01 | de6f948 | OLMoE | 623.0 | 24.7         | 126           | 1.034× (602.5), 1.06× (119) |
 
 de6f948 is the pre-squash tip; its tree is ee7b950's. The Llama quick TTFT (247 ms) sits above the 1.10× bound of the 200-request baseline, as the earlier quick run did (225 ms, 64 requests, `p6b-d2h` above); the quick run's 64 requests weigh the start-up burst more. The bound is judged on the 200-request phase-exit run, not here.
+
+### Planner follow-ups re-measured (decision "6b planner follow-ups", 1 A, 2 A, 3 A; branch `p6b-planner2`)
+
+Commits under test: 70ea0ce (path latency once per plan), 2df40ad (promotions ahead of demotions on the copy stream), c206b19 (slow estimates decay toward the calibration, half-life 5 s), ef244fa (static-mode timing, not on this path). Server tree dbcd614. Same workload as above (`turbine-bench --profile multi-turn --turns 8 --shared-prefix-words 2000 --think-time 1..4 --session-hints`, client on novanas) with `--sessions N --concurrency N`, `lab-serve.sh` with `phase2c-novanas-llama.yaml --set kv.cpu.format=<f> --set kv.cpu.max_bytes=4GiB`, every serve Job on GPU 0, one fresh server per row. Plans, L1 lookups, lossy tokens and SURVIVAL from the server's `/metrics` after the run (`turbine_kv_plans_total`, `turbine_kv_lookups_total`, `turbine_kv_lossy_cached_tokens_total`, `turbine_pressure_transitions_total{to="SURVIVAL"}`).
+
+Finding the load below SURVIVAL (step down from the Task 6 stressed settings until no run trips it):
+
+| Sessions / c | L1 format  | Serve run id        | ok      | cached_tokens_ratio | later-turn TTFT p50 / p99 (ms) | recompute / retrieve plans | lossy_cached_tokens | SURVIVAL |
+| ------------ | ---------- | ------------------- | ------- | ------------------- | ------------------------------ | -------------------------- | ------------------- | -------- |
+| 32 / 32      | `fp8_e4m3` | 1001090845-268475a9 | 186/256 | 0.8388              | 167 / 24928                    | 19 / 53                    | 97408               | 1        |
+| 24 / 24      | `fp8_e4m3` | 1001093332-12db5255 | 155/192 | 0.8839              | 145 / 14370                    | 0 / 51                     | 137984              | 1        |
+| 20 / 20      | `fp8_e4m3` | 1001094018-3cbef529 | 160/160 | 0.8810              | 88 / 600                       | 7 / 41                     | 79616               | 0        |
+| 20 / 20      | `fp8_e4m3` | 1001094533-1aa82c1e | 160/160 | 0.8999              | 99 / 383                       | 0 / 53                     | 115328              | 0        |
+| 20 / 20      | `l0`       | 1001094346-268a78ce | 150/160 | 0.8432              | 90 / 959                       | 0 / 46                     | 0                   | 1        |
+
+Every SURVIVAL entry here is `GREEN → SURVIVAL` on `exhaustion_horizon` (the reliability forecast), never a KV-utilisation climb. 20 sessions still tripped it once (`l0`), so the A/B runs at 16 sessions, c16, where none of six runs did:
+
+| L1 format  | Serve run id        | ok      | cached_tokens_ratio | later-turn TTFT p50 / p99 (ms) | L1 lookups | recompute / retrieve plans | lossy_cached_tokens | SURVIVAL |
+| ---------- | ------------------- | ------- | ------------------- | ------------------------------ | ---------- | -------------------------- | ------------------- | -------- |
+| `l0`       | 1001094722-33d84df4 | 128/128 | 0.9029              | 83.9 / 257                     | 290        | 0 / 29                     | 0                   | 0        |
+| `l0`       | 1001094943-0d7025d6 | 128/128 | 0.9065              | 80.4 / 392                     | 191        | 0 / 25                     | 0                   | 0        |
+| `l0`       | 1001095216-35931fb7 | 128/128 | 0.9059              | 74.6 / 329                     | 220        | 1 / 27                     | 0                   | 0        |
+| `fp8_e4m3` | 1001093713-05302d5a | 128/128 | 0.9027              | 77.8 / 420                     | 291        | 2 / 21                     | 48512               | 0        |
+| `fp8_e4m3` | 1001094830-3695e953 | 128/128 | 0.9042              | 78.4 / 290                     | 209        | 0 / 26                     | 42624               | 0        |
+| `fp8_e4m3` | 1001095100-0fcb95f7 | 128/128 | 0.8785              | 81.7 / 561                     | 328        | 7 / 19                     | 30336               | 0        |
+
+Medians of 3 (16 sessions, c16):
+
+| L1 format  | cached_tokens_ratio | later-turn TTFT p50 (ms) | recompute / retrieve plans | lossy_cached_tokens |
+| ---------- | ------------------- | ------------------------ | -------------------------- | ------------------- |
+| `l0`       | 0.9059              | 80.4                     | 0 / 27                     | 0                   |
+| `fp8_e4m3` | 0.9027              | 78.4                     | 2 / 21                     | 42624               |
+
+At this load both arms are equal within run-to-run spread (ratio −0.003, TTFT −2 ms): L0 holds most of the 16 live histories, L1 serves 191–328 lookups per run and the fp8 tier's extra capacity is not needed. Recomputes of L1 hits are now rare (0–7 plans, against 35–111 per run before these commits at 32 sessions); at 32 sessions the fp8 arm still recomputed 19 plans, all in the minutes around its SURVIVAL episode. The remaining SURVIVAL trips at 20–32 sessions come from `exhaustion_horizon` (decision point 3 B, reliability code, not this branch).
+
+Shared-prefix eval (`tests/eval/gsm8k-200-shared-prefix.jsonl`, c16, `phase6-novanas-llama.yaml --set kv.gpu.max_bytes=4GiB --set kv.cpu.max_bytes=4GiB`, `--filler-words 2000`): BF16 KV (`kv.cpu.format=l0`) 8 fillers 0.755 (1001095429-021df70e), 16 fillers 0.775 (1001095706-39bc19c8); FP8 L1 16 fillers 0.790 (1001095956-0c96bdb6) with 0 lossy-cached tokens, so its `--min-lossy-cached-ratio 0.5` guard failed (exit 1) and no gate pair exists. In all three the prefix (2,944 tokens, 23 blocks) stayed in L0 (0 demotions, 0 L1 lookups, 585,856 of 629,014 prompt tokens cached from L0): capacity demotion cannot take a prefix whose L0 children lack reuse evidence (`p6b-planner2` handoff, options A–C).
+

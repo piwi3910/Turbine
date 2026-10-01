@@ -119,8 +119,9 @@ enum Command {
         /// sides of a comparison must use the same value.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=256))]
         concurrency: u32,
-        /// After the first item, send this many unrelated filler requests (one token each),
-        /// one after another, before the other items: they fill L0 so the first item's shared
+        /// After the first two items (the second hits the prefix the first published), send
+        /// this many unrelated filler requests (one token each), one after another, before the
+        /// other items: they fill L0 so the first items' shared
         /// prefix is demoted to a lossy lower KV tier and the other items reuse it from there
         /// (lossy-KV gates on `tests/eval/gsm8k-200-shared-prefix.jsonl`). Both sides of a
         /// comparison must use the same value.

@@ -2979,8 +2979,12 @@ pub(crate) mod tests {
             0,
             "a request is applied once"
         );
-        r.h.poll(&mut r.pool, &mut r.backend);
-        r.clock.advance(Duration::from_millis(10));
+        // Background copies are paced by the time between pumps (one at a time here, where
+        // the first pumps share an instant).
+        for _ in 0..3 {
+            r.h.poll(&mut r.pool, &mut r.backend);
+            r.clock.advance(Duration::from_millis(10));
+        }
         r.h.poll(&mut r.pool, &mut r.backend);
         assert_eq!(r.pool.used_blocks(), 2);
         assert_eq!(handle.free_unreferenced(0.0), 2 * bb);
