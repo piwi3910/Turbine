@@ -2487,3 +2487,24 @@ workaround: a shim lock between context creation and graph capture.
 - B) Keep the lock as the permanent workaround and file nothing
 
 **Decision (user, 2026-10-01): A.** Draft both reports for the user to review; nothing is filed before that.
+
+## 6b Task 6: FP8 lower-tier proof — three open points (2026-10-01)
+
+From `p6b-t6` (merged 6df93a1; `.procoder/handoff/p6b-t6.md`, perf-log "Phase 6b"). Golden c1/c16 PASS with FP8 L1
+(849.6 tok/s), `lossy_tier_reuse` PASS, GSM8K-200 c16 0.810 vs 0.795 (PASS). Stressed multi-turn (32 sessions, c32):
+cached_tokens_ratio 0.632 vs 0.618 (`l0`), later-turn TTFT p50 522 vs 2102 ms, L1 blocks in 4 GiB 498 vs 292.
+
+1. GSM8K reuses no lossy block (short independent prompts), so it does not measure lossy-reuse quality.
+   - A) Add a long-shared-prefix variant of the eval (same GSM8K items behind a shared ~2000-word prefix) and use it
+     for every lossy-KV gate (FP8 tier now, TurboQuant later)
+   - B) Keep GSM8K-200 as is; golden + `lossy_tier_reuse` cover lossy quality
+2. FP8 L1 capacity is 1.71× at 95.5 % fill (~1.78× full) because 12 % of blocks are lossless tails
+   (`kv.lossless_tail_blocks` 1); the kv_sim AC says 1.9×.
+   - A) The 1.9× target applies to the codec's block bytes (kv_sim, no tails); real runs report the measured ratio
+   - B) Hold real runs to 1.9× too (needs fewer lossless tails or a different measurement)
+3. In the stressed run the planner chose `recompute_cheaper` in 155 plans despite 2016 L1 lookups; only 3 lossy blocks
+   were reused (ratio +0.014). TurboQuant's AC needs cached_tokens_ratio ≥ the `l0` run.
+   - A) Investigate the planner's recompute choice on the GPU server before the TurboQuant proof (Task 9)
+   - B) Accept; TTFT already improves 4× and the AC (≥ `l0`) holds
+
+**Decision (user, 2026-10-01): 1 A, 2 A, 3 A.** A long-shared-prefix eval variant gates every lossy-KV format; the 1.9× capacity target applies to codec block bytes (kv_sim), real runs report the measured ratio; the planner's recompute choice on the GPU server is investigated before Task 9.
