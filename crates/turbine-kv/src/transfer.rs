@@ -261,14 +261,17 @@ impl TransferEngine {
         let mut out = Vec::new();
         let mut running = Vec::with_capacity(self.inflight.len());
         for (ticket, started) in std::mem::take(&mut self.inflight) {
+            let mut timed_by = "backend";
             let result = match b.poll(&ticket) {
                 Ok(None) => {
                     running.push((ticket, started));
                     continue;
                 }
                 Ok(Some(slot)) => Ok((
-                    b.took(&ticket)
-                        .unwrap_or_else(|| now.saturating_sub(started)),
+                    b.took(&ticket).unwrap_or_else(|| {
+                        timed_by = "poll";
+                        now.saturating_sub(started)
+                    }),
                     slot,
                 )),
                 Err(e) => Err(e),
@@ -281,6 +284,17 @@ impl TransferEngine {
                 // end's, `req.bytes`): the planner and the eviction score price a copy at its
                 // encoded size (P6b S-3, decision A), so the compression saving counts once.
                 self.observe(ticket.req.path, ticket.req.bytes, *took);
+                let e = self.estimates[ticket.req.path.index()];
+                tracing::debug!(
+                    event = "kv_copy_timed",
+                    path = ticket.req.path.as_str(),
+                    purpose = ticket.req.purpose.as_str(),
+                    bytes = ticket.req.bytes,
+                    took_s = took.as_secs_f64(),
+                    timed_by,
+                    est_latency_s = e.latency_s,
+                    est_bandwidth_bps = e.bandwidth_bps,
+                );
             }
             let owner_cancelled = ticket
                 .req

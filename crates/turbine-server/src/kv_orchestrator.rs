@@ -761,6 +761,13 @@ impl KvOrchestrator {
         };
         self.prefill_tps = Some(tps);
         self.h.set_prefill_tps(tps);
+        tracing::debug!(
+            event = "kv_prefill_rate",
+            tokens,
+            seconds,
+            sample_tps = sample,
+            prefill_tps = tps,
+        );
     }
 
     /// `GET /turbine/v1/kv` (P4 §Data).
