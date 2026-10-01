@@ -46,7 +46,7 @@ sides. Everything below is provisional until the first run shows the real token 
    not send a cache salt (the eval sends none). Stop the serve Job by its run id afterwards.
 2. For each server (baseline then candidate; GPU 0, under the bench lock like the other numbers):
    `turbine-golden eval --url http://192.168.10.203:18000 --tasks tests/eval/gsm8k-200-shared-prefix.jsonl --concurrency 16
---filler-requests 8 --filler-words 2000 --output json > tests/eval/<slug>/turbine-<name>-sp.json`
+--filler-requests 32 --filler-words 2000 --output json > tests/eval/<slug>/turbine-<name>-sp.json` (32, not 8: see "Measured by p6b-copyahead" below)
    - candidate only, add `--min-lossy-cached-ratio 0.5` (about 0.8 expected when the prefix is about 90 % of the prompt and all 199 items hit);
    - baseline only, add `--min-cached-ratio 0.5` (the exact prefix is reused from L1 or L0; it shows the baseline has the same reuse shape);
    - exit 1 from a guard means no usable report: do not commit it. If the lossy ratio is 0, the prefix was never demoted (raise
@@ -77,3 +77,16 @@ sides. Everything below is provisional until the first run shows the real token 
   head items' own blocks (children of the prefix, no evidence) keep it from ever being a leaf; allocation drops the fillers instead. Raising
   `--filler-requests` or shrinking L0 does not change that. The recipe needs one of the options in `p6b-planner2.md` before it can gate.
 
+## Measured by p6b-copyahead (2026-10-01; `.procoder/handoff/p6b-copyahead.md`)
+
+- With `--filler-requests 32` (and `kv.gpu.max_bytes=4GiB`, `kv.cpu.max_bytes=4GiB`, c16) the prefix leaves L0 before the other 198
+  items arrive: allocation reclaims the head items' own blocks, then the prefix (copied ahead into L1 at GREEN since a8c3b7c) is freed
+  from L0 with no further copy and promoted back once. FP8 L1: lossy cached ratio 0.927. The base commit e02e8c2 gets there too with 32
+  fillers (through the YELLOW reclaim), so 8 or 16 fillers were simply too few.
+- Llama gate pair committed: `tests/eval/llama-3.2-3b-instruct/turbine-bf16-sp.json` 0.775 and `turbine-l1-fp8-sp.json` 0.775,
+  `eval-compare --max-drop 0.01` PASS. Use the same 32 fillers for every later `-sp` pair (`eval-compare` refuses mixed fillers), so new
+  pairs compare against this baseline.
+- The eval client: nothing is built on the Mac; build `turbine-golden` with `scripts/remote-cargo.sh build --release -p turbine-bench
+--bin turbine-golden` and run it over ssh from the remote workspace against `http://127.0.0.1:18000`.
+- 2 of 4 fp8 serve runs got 503 at filler 2–3, with L0 RED and only 5–7 of 292 blocks used (the early pressure trip under
+  investigation elsewhere). Rerun such a run rather than reading it as a quality result.
