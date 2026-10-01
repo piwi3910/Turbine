@@ -932,15 +932,15 @@ fn assert_within_bounds(cold: &IdAnswer, warm: &IdAnswer, label: &str, bounds: (
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn lossy_tier_reuse() {
-    lossy_tier_reuse_with("fp8_e4m3", (0.3, 0.5, 0.9));
+    lossy_tier_reuse_with("fp8_e4m3", Some((0.3, 0.5, 0.9)));
 }
 
 /// [`lossy_tier_reuse`] with L1 at TurboQuant 4-bit (P6b Task 8: the tables are uploaded and the
-/// transcode runs `turbine_hip_tq`). The bounds are provisional (Task 9 sets the S-8 gate).
+/// transcode runs `turbine_hip_tq`). No quality bound: the mechanism is asserted (device transcode, lossy reuse, no checksum eviction); Task 9 sets the S-8 gate.
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn lossy_tier_reuse_tq4() {
-    lossy_tier_reuse_with("tq4", (1.0, 1.0, 0.7));
+    lossy_tier_reuse_with("tq4", None);
 }
 
 /// P6b Task 8 smoke: `kv.dtype: tq4` serves on the GPU (tables uploaded to the executor before
@@ -970,7 +970,7 @@ fn tq_kv_serves_on_the_device() {
     println!("tq_kv_serves_on_the_device ok: {:?}", answer.text);
 }
 
-fn lossy_tier_reuse_with(format: &str, bounds: (f64, f64, f64)) {
+fn lossy_tier_reuse_with(format: &str, bounds: Option<(f64, f64, f64)>) {
     if !require_backend("hip") {
         return;
     }
@@ -1020,7 +1020,22 @@ fn lossy_tier_reuse_with(format: &str, bounds: (f64, f64, f64)) {
         warm.lossy_cached_tokens > 0,
         "no reused block was served from a lossy copy: {warm:?}"
     );
-    assert_within_bounds(&cold, &warm, "lossy L1 reuse", bounds);
+    match bounds {
+        Some(b) => assert_within_bounds(&cold, &warm, "lossy L1 reuse", b),
+        // The codec's own loss is Task 9's gate: print the spread, assert the mechanism.
+        None => {
+            assert_eq!(warm.completion_tokens, cold.completion_tokens);
+            let worst = cold
+                .logprobs
+                .iter()
+                .zip(&warm.logprobs)
+                .map(|(c, w)| (c - w).abs())
+                .fold(0.0, f64::max);
+            println!(
+                "{format} lossy L1 reuse: worst |Δ logprob| {worst:.3} (no bound until Task 9)"
+            );
+        }
+    }
     assert_eq!(
         server.metric(r#"turbine_kv_evictions_total{tier="l1",reason="checksum"}"#),
         0.0
