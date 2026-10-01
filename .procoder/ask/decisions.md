@@ -2602,3 +2602,17 @@ Open: TurboQuant prefill.
 - B) Own WMMA prefill in the rotated domain (`Q' = [Rq | S·Rq]` against tiles of codebook values and residual signs
   decoded into LDS, V in the rotated domain; the spec as written), not built or measured; the most work
 - C) The scalar own kernel for prefill too (one code path; 50–100× slower than CK)
+
+## 6b Task 10: TurboQuant prefill attention (2026-10-01)
+
+From the Task 10 evaluation (`p6b-t10` 72fb62d, merged). Decode: own `turbine_hip_mixed` (prototype passes against
+`cpu::tq_attention`, mixed tables included). Prefill options measured: CK FMHA on pages first decoded to BF16 by the
+Task 8 transcode ("staged") runs at 2.1–2.5× BF16 (Llama 16×512 after 1,024 tokens: 3,709 vs 1,750 µs) but
+materialises K/V, which S-5 excludes; the own decode-style kernel used for prefill is 50–100× slower.
+
+- A) Staged CK for prefill: amend S-5 so "without materialising K/V" applies to decode only; prefill judged against
+  BF16-rounded decoded values (provisional pick of the evaluator)
+- B) Own matrix-core prefill kernel in the rotated domain (matches the spec as written; unbuilt, unmeasured, most work)
+- C) The slow own kernel for prefill too
+
+**Decision (user, 2026-10-01): A.** Staged CK for prefill; S-5 amended so "without materialising K/V" applies to decode only, prefill judged against BF16-rounded decoded values (Task 12 makes the spec edit).
