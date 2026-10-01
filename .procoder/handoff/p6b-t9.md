@@ -1,6 +1,55 @@
-# Handoff: p6b-t9 (Task 9 TurboQuant tier proof) — builder stalled after step 1
+# Handoff: p6b-t9 (Task 9 TurboQuant tier proof)
 
-Branch `p6b-t9`. Done: 521816e `tq_loss_on_real_kv` lab diagnostic (job 1001115104-105799f0); slow-test list entry. Verdict: no codec defect (tq4 K prod·d 0.051 vs paper D_prod 0.047; rotations normalised). Next: decision on the K quantizer (decisions.md), then the lab proof (steps 2–4 of the brief).
+Branch `p6b-t9`. Builder rotated after step 1 (MSE-only K). Steps 2-3 (the Task 9 lab gates and the support rows) are not started.
+
+## Done
+
+- 521816e `tq_loss_on_real_kv` lab diagnostic; user decision "6b Task 9: TurboQuant K quantizer" A (K becomes MSE-only).
+- 2c3c1f0 `feat(kv): TurboQuant K is MSE-only (tq4 K/V 4 bits, tq2 K/V 2 bits)`. It replaces the earlier `wip:` commit. It covers the
+  codec (`encode_vec` / `decode_vec`, `qjl.rs` removed), `cpu::tq_attention`, the HIP `tq_device.hpp`, `kv_transcode_tq.hip` and
+  `paged_attention_mixed.hip` (no S·Rq prep, no nibble tables), the table upload (`[layers][heads][2·128]`: 229 KB for Llama, 262 KB for
+  OLMoE, down from 14.9 / 17.0 MB), the ABI v2.11 header docs (still minor 11, unshipped), `tq_loss.rs` (shipped formats only), spec S-4 /
+  S-5 and their acceptance line, the contract, plan Task 7 and `docs/extending/kv-format.md`. `kernels/rocm/tools/attn_eval.cpp` (off by
+  default) is marked as frozen at its evaluation commit.
+- `nmse_bound` comes from measurements. The conformance suite's largest block nmse is tq4 0.0098 and tq2 0.119 (Gaussian and outlier
+  blocks, BF16 and FP8 L0). Real K/V reach 0.0094 and 0.118. The bounds stay at 0.0125 and 0.15, about a 25 % margin.
+- Gate: `gate: ok crates=all passed=896`.
+- Host mutation: masking the low code bit of K fails `k_mse_bound_records` and `layout_round_trip`.
+- GPU mutation, run 1001145445-17ecfcb0. Swapping the K/V signs in `decode_chunk` and dropping the K norm in `tq_score` fails both
+  `kv_transcode_matches_cpu` and `paged_mixed_matches_cpu`. The tree was restored.
+- Lab `--tier quick`, run 1001141634-0bbd1fbc. `kv_transcode_matches_cpu`, `paged_mixed_matches_cpu`, `tq_kv_matches_reference`,
+  `lossy_tier_reuse_tq4` and `tq_kv_serves_on_the_device` all pass. One failure, `turbine-server engine::tp::tests::static_tiers_flood_then_resume`
+  (static resumed `[0,0,0,0]` against `[32,…]`), is unrelated: it is a BF16 L2 test on the CPU, not owned by this branch, and passed 5 out
+  of 5 reruns on novanas and in the gate. It is a flake under lab load and goes to the lead.
+- Lab `tq_loss_on_real_kv`, run 1001145040-2cb1960f, exit 0. The shipped formats now equal the old `k4mse` / `k2mse` columns exactly:
+
+| mean      | K nmse | V nmse | score e_sd | out_rel | TV     |
+| --------- | ------ | ------ | ---------- | ------- | ------ |
+| Llama tq4 | 0.0089 | 0.0092 | 0.277      | 0.0803  | 0.0341 |
+| Llama tq2 | 0.1115 | 0.1152 | 0.956      | 0.5477  | 0.2052 |
+| OLMoE tq4 | 0.0089 | 0.0093 | 0.128      | 0.0428  | 0.0297 |
+| OLMoE tq2 | 0.1101 | 0.1152 | 0.512      | 0.2219  | 0.1328 |
+
+## Next (steps 2-3 of the brief, in order; GPU 0, bench lock, every long run with `run_in_background`)
+
+1. Merge `p6b-stack` first. It has the three BF16 shared-prefix baselines `tests/eval/<slug>/turbine-bf16-sp-r{1,2,3}.json`, and
+   lower-tier `fp8_e4m3` is `supported` there. Reuse the baselines only if their recipe and BF16 serving path match this tree (the K change
+   touches only TQ paths, so they should, but check their commit); otherwise run your own.
+2. Llama, then OLMoE; `tq4`, then `tq2`:
+   `scripts/lab-bench.sh --model <m> --label p6b-t9-<fmt> --golden16 -- --set kv.cpu.format=<fmt> --set kv.cpu.max_bytes=4GiB`.
+3. Multi-turn A/B against `l0` at 16 sessions and c16. Take the median of 3 runs of `cached_tokens_ratio`, later-turn TTFT, and L1 blocks
+   per GiB (from `/turbine/v1/kv`, with the lossless-tail share).
+4. Shared-prefix GSM8K, 3 candidate runs per format, following the recipe in `.procoder/handoff/p6b-eval-prefix.md`: 32 fillers,
+   `kv.gpu.max_bytes=4GiB`, `kv.cpu.max_bytes=4GiB`, c16, `--min-lossy-cached-ratio 0.5`. Check that `turbine_kv_prompt_tokens_total` is
+   726,723 per server. Judge each pair r_i↔r_i with `scripts/eval/paired_compare.py <baseline> <candidate> --max-drop 0.01 --json`
+   (lead's instruction) and commit the output beside the reports as `turbine-l1-<fmt>-sp-r<i>-paired.json`, following the FP8 example on
+   `p6b-stack`. Judge on medians plus McNemar.
+5. Derive the `kv_gpu lossy_tier_reuse_tq4` bound from those gates. Record the numbers in perf log 6b and in labbook set
+   `phase-6b-kv-compression`.
+6. Flip `TIER_FORMAT_REFUSALS` `tq4` / `tq2` to `supported` only for a codec that passes all its gates. Otherwise keep it `experimental`
+   and report the numbers with options. Expectation from the loss table: tq4 is plausible, and tq2 (out_rel 0.55 on Llama) is likely to fail.
+
+## Former QJL K measurements (pre-decision; for the record)
 
 ```
 layer  rot2   kurt  mean  s_sd   | per format: K nmse  V nmse  e_bias  e_sd  prod*d  out_rel  tv
