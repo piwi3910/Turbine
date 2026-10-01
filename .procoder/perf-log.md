@@ -373,6 +373,8 @@ Same workload and server as the SURVIVAL entry above (`turbine-bench --profile m
 
 Serve runs: before 1001141442-049a53ef, 1001155401-3ca25ff3, 1001141632-377fd80b (24), 1001144706-2c618051, 1001155900-001efbd1, 1001145036-04655602 (32); after 1001160525-10d3639e, 1001160934-0dbc4787, 1001161119-0b337166 (24), 1001161254-05f78725, 1001161502-31f8c2c5, 1001164854-089ab7df (32); control 1001165347-3ce64578 (24), 1001170243-27dd7125, 1001172320-0bbfe0e9 (32). The before failures are `queue_timeout` (11 and 7). Every before row at 32 sessions ran on GPU 1 (the device plugin's choice; the workload is bound by L0 capacity and admission queueing, not by the PCIe link, but the rows are not GPU-0 numbers).
 
+Card placement (lead, 2026-10-01): the three 32-session "before" runs landed on GPU 1 (`lab-serve.sh` cannot pin a card), so under the GPU-0-only perf rule the 32-session before/after comparison is indicative, not a recorded perf result; the builder reported no other run off GPU 0, but card placement was not recorded per run. A GPU-0 rerun of the 32-session "before" arm is needed before quoting those numbers as a gain.
+
 What the first lab runs found (each fixed with a test, commits on the branch):
 
 - c96a07a alone, 24 sessions (1001145510-34f70592): 163/192 ok, SURVIVAL, 18 `overloaded`. A released request keeps a whole-request reservation (it may recompute), and its re-attached blocks were referenced, so the ledger's `held` counted them while the reservation still did: `kv_utilization` 0.58 → 0.99. 8c5de54 commits the attached blocks against the reservation.
