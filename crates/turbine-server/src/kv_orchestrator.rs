@@ -665,6 +665,12 @@ impl KvOrchestrator {
         self.h.detach_prefix(pool, request, attach, alone);
     }
 
+    /// L0 blocks `request`'s attach holds while its promotions are in flight
+    /// (`KvHierarchy::pending_blocks`).
+    pub fn pending_blocks(&self, request: RequestId) -> usize {
+        self.h.pending_blocks(request)
+    }
+
     /// Blocks the last YELLOW/ORANGE pressure reclaim found no unreferenced block for
     /// (`KvHierarchy::take_queued_prefix_demand`).
     pub fn take_queued_prefix_demand(&mut self) -> usize {

@@ -1145,6 +1145,14 @@ impl KvHierarchy {
         );
     }
 
+    /// L0 blocks the pending attach of `request` holds (reused ones and promotion targets), 0
+    /// when none is pending.
+    pub fn pending_blocks(&self, request: RequestId) -> usize {
+        self.pending
+            .get(&request)
+            .map_or(0, |p| p.attach.blocks.len())
+    }
+
     /// The blocks the last pressure reclaim wanted at YELLOW or ORANGE beyond every
     /// unreferenced L0 block (0 at GREEN, RED and SURVIVAL); taken once.
     pub fn take_queued_prefix_demand(&mut self) -> usize {
@@ -3936,6 +3944,11 @@ pub(crate) mod tests {
         assert_eq!(r.pool.used_blocks(), 0, "and left L0");
         let outcome = attach(&mut r, id, &prompt);
         assert_eq!(outcome, AttachOutcome::Promoting, "back from L1, no wait");
+        assert_eq!(
+            r.h.pending_blocks(id),
+            4,
+            "the promotion targets are held now"
+        );
         let mut ready = Vec::new();
         for _ in 0..4 {
             r.clock.advance(Duration::from_millis(10));

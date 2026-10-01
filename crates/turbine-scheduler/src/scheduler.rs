@@ -777,12 +777,11 @@ impl Scheduler {
         attach: PrefixAttach,
         block_bytes: u64,
     ) -> Option<PrefixAttach> {
-        let Some(r) = self.requests.get_mut(&id).filter(|r| r.req.reattach) else {
+        if !self.requests.get(&id).is_some_and(|r| r.req.reattach) {
             return Some(attach);
-        };
-        if let Some(res) = r.reservation.as_mut() {
-            res.commit_bytes((attach.blocks.len() as u64).saturating_mul(block_bytes));
         }
+        self.commit_reattached(id, attach.blocks.len(), block_bytes);
+        let r = self.requests.get_mut(&id).expect("checked above");
         let cached = attach.cached_tokens;
         let e = &mut r.req.estimate;
         e.cached_prefix_tokens = cached;
@@ -790,6 +789,24 @@ impl Scheduler {
         r.req.reattach = false;
         r.req.cached_prefix = (!attach.blocks.is_empty()).then_some(attach);
         None
+    }
+
+    /// A released request's new attach holds `blocks` L0 blocks (also while its promotions are
+    /// in flight: their targets are allocated and referenced at once): its reservation has
+    /// `blocks × block_bytes` committed in all, so the ledger counts them once (as committed, not
+    /// also as `held`). Nothing else has committed against the reservation of a request that
+    /// has not started.
+    pub fn commit_reattached(&mut self, id: RequestId, blocks: usize, block_bytes: u64) {
+        let Some(res) = self
+            .requests
+            .get_mut(&id)
+            .filter(|r| r.req.reattach)
+            .and_then(|r| r.reservation.as_mut())
+        else {
+            return;
+        };
+        let target = (blocks as u64).saturating_mul(block_bytes);
+        res.commit_bytes(target.saturating_sub(res.committed()));
     }
 
     /// The client's output channel is full: stop decoding `seq`, keep its KV.
@@ -2989,6 +3006,11 @@ mod tests {
                 s.reattach(id(9), attached(&again), 1).is_some(),
                 "not waiting"
             );
+            // While its promotions are in flight their targets are already held (here 1 of the
+            // 2 blocks: a block reused from L0 needs none); the landed attach commits the rest.
+            s.commit_reattached(id(3), 1, 1);
+            let kv = ledger.usage(DeviceId(0), PoolKind::Kv);
+            assert_eq!((kv.reserved, kv.used), (2, 1));
             assert!(s.reattach(id(3), attached(&again), 1).is_none());
             // The re-attached blocks are committed against the reservation (the ledger's `held`
             // counts them as referenced blocks; reserved would count them again).

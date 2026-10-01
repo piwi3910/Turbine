@@ -1213,6 +1213,11 @@ impl EngineLoop {
             match outcome {
                 AttachOutcome::Ready(a) => self.reattached(id, a),
                 AttachOutcome::Promoting => {
+                    // The promotion targets are referenced now: commit them against the
+                    // reservation, or the ledger counts them twice until they land.
+                    let blocks = self.kv.pending_blocks(id);
+                    let block_bytes = self.pool.layout().block_bytes();
+                    self.sched.commit_reattached(id, blocks, block_bytes);
                     self.reattaching.insert(id);
                 }
                 AttachOutcome::WaitForPrefix => {}
