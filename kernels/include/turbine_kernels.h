@@ -79,6 +79,12 @@ extern "C" {
  * gives the meaning). */
 #define TURBINE_DTYPE_F8E4M3 16
 #define TURBINE_DTYPE_U8 17
+/* Phase 6b (v2.11 paged attention): TurboQuant tq4 / tq2 KV pages, one record
+ * per (KV head, token) of the codec (crates/turbine-kv codec/turboquant: 144 /
+ * 80 bytes at head_dim 128); a page is num_kv_heads * block_tokens records,
+ * record h * block_tokens + t. Only a paged attention descriptor's dtype. */
+#define TURBINE_DTYPE_TQ4 18
+#define TURBINE_DTYPE_TQ2 19
 
 typedef struct turbine_ctx turbine_ctx;
 
@@ -284,6 +290,25 @@ typedef struct turbine_attention_paged_desc {
   /* v2.9: per-layer K and V scales of TURBINE_DTYPE_F8E4M3 pages (value =
    * e4m3 * scale); read only by a library reporting minor >= 9 */
   float k_scale, v_scale;
+  /* v2.11 (Phase 6b S-5), read only by a library reporting minor >= 11:
+   * device uint8_t [num_seqs, max_blocks_per_seq] laid out like block_table,
+   * the TURBINE_KVFMT_* format of each entry's block (TURBINE_KVFMT_L0 = a
+   * BF16 page); NULL = every block in dtype. Block b's bytes are the first page
+   * bytes of its format at kv_layer + b * (the page bytes of dtype): BF16 and
+   * FP8 pages [2, block_tokens, num_kv_heads, head_dim], TurboQuant pages as
+   * TURBINE_DTYPE_TQ4 / _TQ2. A block's page must fit a page of dtype (a
+   * kernel skips one that does not). The append writes each new row in its
+   * block's format; FP8 blocks read k_scale / v_scale. Device memory, so a
+   * decode graph can capture the call. */
+  const uint8_t *block_formats;
+  /* v2.11: host pointer, read during the call only (its device pointers are
+   * captured with the call): the TurboQuant tables of THIS layer -- tables
+   * points at the layer's [num_kv_heads][2 * head_dim + head_dim * head_dim]
+   * slice of the model's tables (the caller offsets it; there is no layer
+   * field), codebooks and seed as for the transcode. Required when dtype is
+   * TQ4 / TQ2 or block_formats is not NULL (a table may hold TurboQuant
+   * blocks); NULL otherwise and in a _supported / _impl probe. */
+  const struct turbine_tq_params *tq_params;
 } turbine_attention_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_prefill_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_decode_paged_desc;
@@ -406,7 +431,8 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * one-shot collectives over it; v2.8 the device-sequenced (graph-capturable)
  * mapped collective step; v2.9 the quantized GEMM, activation quantization
  * and FP8 KV scales (all below); v2.10 turbine_rope_desc.attn_factor (above,
- * no new symbol); v2.11 the KV transcode (below). */
+ * no new symbol); v2.11 the KV transcode (below) and the mixed-format paged
+ * attention fields (block_formats, tq_params; no new symbol). */
 #define TURBINE_ABI_MINOR 11u
 uint32_t turbine_abi_minor(void);
 

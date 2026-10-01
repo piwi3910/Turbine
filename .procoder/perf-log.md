@@ -257,3 +257,16 @@ Fix (6be446b): `CopyEngine::copy_async_batch` — the shim resolves every end, f
 | `kv_calibration` l0_to_l1 / l1_to_l0 (GB/s)                     | 4.16 / 10.63             | 11.57 / 11.52                                           |
 | lab `pinned_block_batches_d2h_keeps_up_with_h2d` (k3s Job card) | per segment 5.21 / 8.80  | batched 9.42 / 9.22 (ratio 1.02)                        |
 | `lab-bench --quick` (golden c1, tok/s, ITL p50, TTFT p50)       | 854.2 (6a exit, 200 req) | PASS, 863.7, 15.4 ms, 225 ms (64 req; labbook 71350afa) |
+
+### Mixed-format paged attention (Task 12; branch `p6b-t12`, ee7b950)
+
+Kernel timings (`hip_ops paged_mixed_timings`, GPU 0 under `bench.lock`, pools rotated over ≥ 256 MiB, append included) are in the decisions entry "P6b: mixed-format / TurboQuant paged attention — provider evaluation", result paragraph. Decode tq4 / BF16 CK: Llama 1.26× (b1 @768), 1.46× (b16 @768), 1.15× (b16 @2k); OLMoE 1.08×, 0.90×, 0.58×. Staged CK prefill tq4 / BF16 3.95–7.31× (TurboQuant append encode included). Served ITL with `kv.dtype: tq4` / `tq2` is Task 13.
+
+BF16 KV after the attention changes (`scripts/lab-bench.sh --quick`, 64 requests, client on novanas, golden c1 PASS both), against the 6a-exit baseline (200 requests):
+
+| Date       | Commit  | Model | tok/s | ITL p50 (ms) | TTFT p50 (ms) | vs baseline (tok/s, TTFT)   |
+| ---------- | ------- | ----- | ----- | ------------ | ------------- | --------------------------- |
+| 2026-10-01 | de6f948 | Llama | 877.3 | 15.4         | 247           | 1.027× (854.2), 1.19× (207) |
+| 2026-10-01 | de6f948 | OLMoE | 623.0 | 24.7         | 126           | 1.034× (602.5), 1.06× (119) |
+
+de6f948 is the pre-squash tip; its tree is ee7b950's. The Llama quick TTFT (247 ms) sits above the 1.10× bound of the 200-request baseline, as the earlier quick run did (225 ms, 64 requests, `p6b-d2h` above); the quick run's 64 requests weigh the start-up burst more. The bound is judged on the 200-request phase-exit run, not here.

@@ -23,13 +23,14 @@ use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
     AttentionContext, AttentionKind, ElementwiseConfig, ElementwiseContext, EmbeddingConfig,
-    EmbeddingContext, GemmConfig, GemmContext, ImplChoice, ImplInfo, KernelProvider, KvCodecFns,
-    KvCopyConfig, KvCopyContext, KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat,
-    KvTranscodeTables, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
-    MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
-    OpConfig, OpKind, PagedAttentionContext, RmsnormShardedConfig, RmsnormShardedContext,
-    RopeConfig, RopeContext, RowSumsqConfig, RowSumsqContext, ShimContext, ShimLibrary,
-    TURBINE_OPTION_GEMM_AUTOTUNE, TURBINE_OPTION_GEMM_TUNED_SHAPES, cpu_reference_provider,
+    EmbeddingContext, GemmConfig, GemmContext, ImplChoice, ImplInfo, KV_FMT_BF16, KV_FMT_FP8_E4M3,
+    KV_FMT_TQ2, KV_FMT_TQ4, KernelProvider, KvCodecFns, KvCopyConfig, KvCopyContext,
+    KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat, KvTranscodeTables,
+    LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
+    MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, OpConfig, OpKind,
+    PagedAttentionContext, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
+    RowSumsqConfig, RowSumsqContext, ShimContext, ShimLibrary, TURBINE_OPTION_GEMM_AUTOTUNE,
+    TURBINE_OPTION_GEMM_TUNED_SHAPES, TqHeadTables, TqPaged, TqParams, cpu_reference_provider,
     shim_provider,
 };
 use turbine_tensor::host::HostMemory;
@@ -1245,7 +1246,7 @@ fn paged_case_pages(
             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
             k_scale,
             v_scale,
-            block_formats: &[],
+            block_formats: None,
             tq: None,
         };
         kernel.execute_paged(&mut ctx).expect("paged attention");
@@ -1962,7 +1963,7 @@ fn decode_attention_timings_fp8() {
                             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                             k_scale: 1.0,
                             v_scale: 1.0,
-                            block_formats: &[],
+                            block_formats: None,
                             tq: None,
                         })
                         .expect("paged decode attention");
@@ -2069,7 +2070,7 @@ fn prefill_op_timings_fp8() {
                             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                             k_scale: 1.0,
                             v_scale: 1.0,
-                            block_formats: &[],
+                            block_formats: None,
                             tq: None,
                         })
                         .expect("paged prefill attention");
@@ -3264,7 +3265,7 @@ fn decode_op_timings() {
                         scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                         k_scale: 1.0,
                         v_scale: 1.0,
-                        block_formats: &[],
+                        block_formats: None,
                         tq: None,
                     })
                     .expect("paged decode attention");
@@ -3813,7 +3814,7 @@ fn decode_forward_timing() {
                             scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                             k_scale: 1.0,
                             v_scale: 1.0,
-                            block_formats: &[],
+                            block_formats: None,
                             tq: None,
                         })
                         .expect("paged decode attention")
@@ -4115,7 +4116,7 @@ fn decode_attention_timings() {
                         scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                         k_scale: 1.0,
                         v_scale: 1.0,
-                        block_formats: &[],
+                        block_formats: None,
                         tq: None,
                     })
                     .expect("paged decode attention");
@@ -4435,7 +4436,7 @@ fn fused_projection_timings() {
                 scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                 k_scale: 1.0,
                 v_scale: 1.0,
-                block_formats: &[],
+                block_formats: None,
                 tq: None,
             })
             .expect("paged decode attention");
@@ -6574,4 +6575,770 @@ fn tq_transcode_timing(p: &Pair, rng: &mut Rng) {
             bytes / dec_us / 1e3
         );
     }
+}
+
+// ---- mixed-format paged attention (ABI v2.11, P6b Task 12) ----
+
+/// The KV format of each block of a mixed case: every block in the pool's `base` dtype
+/// (`block_formats` `None`), or a table whose entry `(s, j)` is `table(s, j)`.
+#[derive(Clone, Copy)]
+enum MixedFormats {
+    Uniform,
+    Table(fn(usize, usize) -> u8),
+}
+
+/// What a mixed case's output is held to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MixedCheck {
+    /// The own kernel: `cpu::tq_attention` (through the CPU provider) within
+    /// `4e-3 + |ref| / 128` per element (decision "P6b: mixed-format / TurboQuant paged
+    /// attention — provider evaluation").
+    Rotated,
+    /// A staged implementation (user decision "6b Task 10", A): the CPU BF16 paged attention
+    /// over the BF16-rounded decode of every block, within the BF16 attention tolerance.
+    Staged,
+}
+
+/// The paged append's TurboQuant codec of the CPU provider: `turbine-kv`'s record encoder.
+fn tq_encode_record(fmt: u8, k: &[f32], v: &[f32], head: &TqHeadTables, record: &mut [u8]) {
+    use turbine_kv::codec::turboquant::{Tq2Codec, Tq4Codec, encode_record};
+    let w = if fmt == KV_FMT_TQ4 {
+        Tq4Codec::WIDTHS
+    } else {
+        Tq2Codec::WIDTHS
+    };
+    encode_record(w, k, v, &head.k_signs, &head.v_signs, &head.qjl, record);
+}
+
+/// The host tables of layer `layer` under `seed` (what `TqTables` uploads for it).
+fn tq_host_params(seed: u64, layer: u32, heads: u32) -> TqParams {
+    use turbine_kv::codec::turboquant::{codebook, hadamard, qjl};
+    let d = codebook::TQ_DIM;
+    TqParams {
+        heads: (0..heads)
+            .map(|h| TqHeadTables {
+                k_signs: hadamard::rademacher(seed, layer, h, hadamard::SignKind::K, d),
+                v_signs: hadamard::rademacher(seed, layer, h, hadamard::SignKind::V, d),
+                qjl: qjl::projection(seed, layer, h, d),
+            })
+            .collect(),
+        codebooks: [1, 2, 3, 4].map(|b| codebook::codebook(b).to_vec()),
+    }
+}
+
+/// Page bytes of one layer of one block of format `fmt`.
+fn mixed_page_bytes(fmt: u8, bt: usize, hkv: usize) -> usize {
+    turbine_kernels::cpu::tq_attention::page_bytes_of(fmt, bt, hkv, HEAD_DIM).expect("format")
+}
+
+/// A page of format `fmt` holding KV-like history: BF16 / FP8 values of normal samples, or the
+/// TurboQuant records of them (through the codec, `params`' tables).
+fn mixed_history(rng: &mut Rng, fmt: u8, bt: usize, hkv: usize, params: &TqParams) -> Vec<u8> {
+    let n = 2 * bt * hkv * HEAD_DIM;
+    match fmt {
+        KV_FMT_BF16 => encode(DType::BF16, &rng.normal(n, 1.0)),
+        KV_FMT_FP8_E4M3 => fp8_history(rng, n),
+        _ => {
+            let rec = mixed_page_bytes(fmt, bt, hkv) / (hkv * bt);
+            let mut page = vec![0u8; hkv * bt * rec];
+            let (k, v) = (
+                rng.normal(bt * hkv * HEAD_DIM, 1.0),
+                rng.normal(bt * hkv * HEAD_DIM, 1.0),
+            );
+            for g in 0..hkv {
+                for t in 0..bt {
+                    let at = (t * hkv + g) * HEAD_DIM;
+                    let r = &mut page[(g * bt + t) * rec..][..rec];
+                    tq_encode_record(
+                        fmt,
+                        &k[at..at + HEAD_DIM],
+                        &v[at..at + HEAD_DIM],
+                        &params.heads[g],
+                        r,
+                    );
+                }
+            }
+            page
+        }
+    }
+}
+
+/// The BF16 values `[2, bt, hkv, d]` attention reads from a page of format `fmt`: BF16 as is,
+/// FP8 as `bf16(e4m3 · scale)`, TurboQuant records decoded by the codec and rounded to BF16
+/// (what the staging writes).
+#[allow(clippy::too_many_arguments)]
+fn mixed_decoded(
+    page: &[u8],
+    fmt: u8,
+    bt: usize,
+    hkv: usize,
+    scales: (f32, f32),
+    seed: u64,
+    layer: usize,
+) -> Vec<f32> {
+    use turbine_kernels::cpu::quant::fp8_e4m3_value;
+    use turbine_kv::codec::turboquant::{Tq2Codec, Tq4Codec, decode_record};
+    let n = 2 * bt * hkv * HEAD_DIM;
+    let r16 = |x: f32| bf16::from_f32(x).to_f32();
+    match fmt {
+        KV_FMT_BF16 => decode(DType::BF16, &page[..2 * n]),
+        KV_FMT_FP8_E4M3 => (0..n)
+            .map(|e| r16(fp8_e4m3_value(page[e]) * if e < n / 2 { scales.0 } else { scales.1 }))
+            .collect(),
+        _ => {
+            let w = if fmt == KV_FMT_TQ4 {
+                Tq4Codec::WIDTHS
+            } else {
+                Tq2Codec::WIDTHS
+            };
+            let rec = w.record_bytes();
+            let mut out = vec![0f32; n];
+            for g in 0..hkv {
+                for t in 0..bt {
+                    let (k, v) =
+                        decode_record(w, &page[(g * bt + t) * rec..][..rec], seed, layer, g);
+                    for (kind, x) in [(0, k), (1, v)] {
+                        let at = ((kind * bt + t) * hkv + g) * HEAD_DIM;
+                        for (o, val) in out[at..at + HEAD_DIM].iter_mut().zip(x) {
+                            *o = r16(val);
+                        }
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+/// One ragged batch of mixed-format paged attention on both providers: the pool's blocks hold
+/// `formats` (in slots of `base`'s page), KV history in every block, the TurboQuant tables of
+/// layer 1 of a two-layer table (the caller-offset convention of the v2.11 `tq_params`). The
+/// pool after the append is compared byte for byte (the TurboQuant records bit-exact with the
+/// codec), the output per `check`. Returns the HIP implementation that ran (`impl_name`).
+#[allow(clippy::too_many_arguments)]
+fn paged_mixed_case(
+    p: &Pair,
+    rng: &mut Rng,
+    kind: AttentionKind,
+    heads: (usize, usize),
+    block_tokens: usize,
+    q_lens: &[usize],
+    kv_lens: &[usize],
+    base: DType,
+    formats: MixedFormats,
+    check: MixedCheck,
+    impl_name: &str,
+) {
+    const SEED: u64 = 0x5eed_7a5c_0012_0001;
+    const LAYER: u32 = 1;
+    let (q_heads, kv_heads) = heads;
+    let (bt, hkv, d) = (block_tokens, kv_heads, HEAD_DIM);
+    let (k_scale, v_scale) = (0.07f32, 0.11f32);
+    let cfg = AttentionConfig {
+        kind,
+        num_q_heads: q_heads as u32,
+        num_kv_heads: hkv as u32,
+        head_dim: d as u32,
+        dtype: base,
+        block_tokens: Some(bt as u32),
+        causal: true,
+    };
+    let base_fmt = turbine_kernels::kv_format_code(base).expect("KV dtype");
+    let seqs = q_lens.len();
+    let blocks_of: Vec<usize> = kv_lens.iter().map(|&kv| kv.div_ceil(bt)).collect();
+    let max_blocks = blocks_of.iter().copied().max().expect("a sequence");
+    let num_blocks = blocks_of.iter().sum::<usize>() + 2;
+    let order = shuffled(rng, num_blocks);
+    let mut table = vec![0f32; seqs * max_blocks];
+    let mut fmt_table = vec![base_fmt; seqs * max_blocks];
+    let mut block_fmt = vec![base_fmt; num_blocks];
+    let mut next = 0;
+    for (s, &n) in blocks_of.iter().enumerate() {
+        for j in 0..n {
+            let b = order[next];
+            next += 1;
+            table[s * max_blocks + j] = b as f32;
+            if let MixedFormats::Table(f) = formats {
+                fmt_table[s * max_blocks + j] = f(s, j);
+                block_fmt[b] = f(s, j);
+            }
+        }
+    }
+    let params = tq_host_params(SEED, LAYER, hkv as u32);
+    let slot = mixed_page_bytes(base_fmt, bt, hkv);
+    let mut raw = vec![0u8; num_blocks * slot];
+    for (b, &fmt) in block_fmt.iter().enumerate() {
+        let page = mixed_history(rng, fmt, bt, hkv, &params);
+        raw[b * slot..b * slot + page.len()].copy_from_slice(&page);
+    }
+    let pool_shape: Vec<usize> = if base.tq_record_bytes().is_some() {
+        vec![num_blocks, slot]
+    } else {
+        vec![num_blocks, 2, bt, hkv, d]
+    };
+    let mut pool_hip = Tensor::empty(&p.hip_mem, &pool_shape, base).expect("HIP pool");
+    let mut pool_cpu = Tensor::empty(&p.cpu_mem, &pool_shape, base).expect("host pool");
+    pool_hip
+        .storage
+        .copy_from_host(0, &raw)
+        .expect("copy to HIP");
+    pool_cpu
+        .storage
+        .copy_from_host(0, &raw)
+        .expect("copy to host");
+    let mut indptr = vec![0f32];
+    for &q in q_lens {
+        indptr.push(indptr.last().copied().unwrap_or(0.0) + q as f32);
+    }
+    let kvf: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
+    let total_q: usize = q_lens.iter().sum();
+    let q_shape = [total_q, q_heads, d];
+    let new_shape = [total_q, hkv, d];
+    let (q_hip, q_cpu) = twin(
+        p,
+        &q_shape,
+        DType::BF16,
+        &rng.normal(total_q * q_heads * d, 1.0),
+    );
+    let (k_hip, k_cpu) = twin(
+        p,
+        &new_shape,
+        DType::BF16,
+        &rng.normal(total_q * hkv * d, 1.0),
+    );
+    let (v_hip, v_cpu) = twin(
+        p,
+        &new_shape,
+        DType::BF16,
+        &rng.normal(total_q * hkv * d, 1.0),
+    );
+    let (o_hip, o_cpu) = twin(p, &q_shape, DType::BF16, &vec![0.0; total_q * q_heads * d]);
+    let (bt_hip, bt_cpu) = twin(p, &[seqs, max_blocks], DType::I32, &table);
+    let (ip_hip, ip_cpu) = twin(p, &[seqs + 1], DType::I32, &indptr);
+    let (kv_hip, kv_cpu) = twin(p, &[seqs], DType::I32, &kvf);
+    let fmt_tensor = |mem: &Arc<dyn DeviceMemory>| {
+        let mut t = Tensor::empty(mem, &[seqs, max_blocks], DType::U8).expect("formats");
+        t.storage
+            .copy_from_host(0, &fmt_table)
+            .expect("formats upload");
+        t
+    };
+    let (f_hip, f_cpu) = (fmt_tensor(&p.hip_mem), fmt_tensor(&p.cpu_mem));
+    let device_tables = TqTables::new(&p.hip_mem, SEED, LAYER + 1, hkv as u32);
+    let per_layer = hkv * KvTranscodeTables::head_elems(d as u32);
+    let layer_tables = KvTranscodeTables {
+        codebooks: std::array::from_fn(|i| device_tables.codebooks[i].view()),
+        tables: TensorView::contiguous(
+            device_tables.tables.storage.whole(),
+            LAYER as usize * per_layer,
+            &[per_layer],
+            DType::F32,
+        ),
+    };
+    let mixed_table = matches!(formats, MixedFormats::Table(_));
+    let runs = [
+        (
+            p.hip.attention().expect("hip attention"),
+            [&q_hip, &k_hip, &v_hip, &o_hip, &pool_hip],
+            [&bt_hip, &ip_hip, &kv_hip],
+            &f_hip,
+            Some(layer_tables),
+        ),
+        (
+            p.cpu.attention().expect("cpu attention"),
+            [&q_cpu, &k_cpu, &v_cpu, &o_cpu, &pool_cpu],
+            [&bt_cpu, &ip_cpu, &kv_cpu],
+            &f_cpu,
+            None,
+        ),
+    ];
+    for (kernel, [q, k, v, o, pool], [btt, ip, kv], f, device) in runs {
+        let mut ctx = PagedAttentionContext {
+            cfg,
+            q: q.view(),
+            k_new: k.view(),
+            v_new: v.view(),
+            out: o.view(),
+            kv_layer: pool.view(),
+            block_table: btt.view(),
+            q_indptr: ip.view(),
+            kv_lens: kv.view(),
+            max_q_len: q_lens.iter().copied().max().unwrap_or(0) as u32,
+            max_kv_len: kv_lens.iter().copied().max().unwrap_or(0) as u32,
+            max_blocks_per_seq: max_blocks as u32,
+            scale: 1.0 / (d as f32).sqrt(),
+            k_scale,
+            v_scale,
+            block_formats: mixed_table.then(|| f.view()),
+            tq: Some(TqPaged {
+                params: &params,
+                encode: tq_encode_record,
+                seed: SEED,
+                device,
+            }),
+        };
+        kernel
+            .execute_paged(&mut ctx)
+            .expect("mixed paged attention");
+    }
+    let what = format!(
+        "{} heads={q_heads}/{hkv} block_tokens={bt} base={} table={mixed_table} \
+         q_lens={q_lens:?} kv_lens={kv_lens:?}",
+        cfg.op(),
+        base.as_str()
+    );
+    let bytes = |t: &Tensor| t.view().slice.read_bytes().expect("read back");
+    let (hip_pool, cpu_pool) = (bytes(&pool_hip), bytes(&pool_cpu));
+    let first = hip_pool.iter().zip(&cpu_pool).position(|(h, c)| h != c);
+    assert!(
+        first.is_none(),
+        "{what} pool after append ({impl_name}): byte {first:?} differs (block {:?})",
+        first.map(|b| b / slot)
+    );
+    let got = read(&o_hip);
+    let row_elems = q_heads * d;
+    // Against cpu::tq_attention within `4e-3 + |ref|/128`: the rows `rotated(row)` picks.
+    let check_rotated = |rotated: &dyn Fn(usize) -> bool| {
+        let want = read(&o_cpu);
+        let mut worst = (0usize, 0f32);
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            if !rotated(i / row_elems) {
+                continue;
+            }
+            let bound = 4e-3 + w.abs() / 128.0;
+            let ratio = (g - w).abs() / bound;
+            assert!(
+                ratio <= 1.0,
+                "{what} ({impl_name}): element {i}: hip {g} vs cpu::tq_attention {w}"
+            );
+            if ratio > worst.1 {
+                worst = (i, ratio);
+            }
+        }
+        println!(
+            "{what}: impl={impl_name} worst {:.2} of the bound at {} ok",
+            worst.1, worst.0
+        );
+    };
+    match check {
+        MixedCheck::Rotated => check_rotated(&|_| true),
+        MixedCheck::Staged => {
+            // The reference over the BF16-rounded decode of the pages after the append: the
+            // CPU BF16 paged attention, its append given the decoded new rows (so it writes
+            // what the pages hold).
+            let decoded: Vec<Vec<f32>> = block_fmt
+                .iter()
+                .enumerate()
+                .map(|(b, &fmt)| {
+                    mixed_decoded(
+                        &hip_pool[b * slot..],
+                        fmt,
+                        bt,
+                        hkv,
+                        (k_scale, v_scale),
+                        SEED,
+                        LAYER as usize,
+                    )
+                })
+                .collect();
+            let mut k_dec = vec![0f32; total_q * hkv * d];
+            let mut v_dec = vec![0f32; total_q * hkv * d];
+            for s in 0..seqs {
+                let row0 = indptr[s] as usize;
+                for i in 0..q_lens[s] {
+                    let pos = kv_lens[s] - q_lens[s] + i;
+                    let b = table[s * max_blocks + pos / bt] as usize;
+                    for g in 0..hkv {
+                        let dst = ((row0 + i) * hkv + g) * d;
+                        let at = |kind: usize| ((kind * bt + pos % bt) * hkv + g) * d;
+                        k_dec[dst..dst + d].copy_from_slice(&decoded[b][at(0)..at(0) + d]);
+                        v_dec[dst..dst + d].copy_from_slice(&decoded[b][at(1)..at(1) + d]);
+                    }
+                }
+            }
+            let flat: Vec<f32> = decoded.concat();
+            let pool_ref = tensor_of(&p.cpu_mem, &[num_blocks, 2, bt, hkv, d], DType::BF16, &flat);
+            let k_ref = tensor_of(&p.cpu_mem, &new_shape, DType::BF16, &k_dec);
+            let v_ref = tensor_of(&p.cpu_mem, &new_shape, DType::BF16, &v_dec);
+            let o_ref = tensor_of(
+                &p.cpu_mem,
+                &q_shape,
+                DType::BF16,
+                &vec![0.0; total_q * q_heads * d],
+            );
+            p.cpu
+                .attention()
+                .expect("cpu attention")
+                .execute_paged(&mut PagedAttentionContext {
+                    cfg: AttentionConfig {
+                        dtype: DType::BF16,
+                        ..cfg
+                    },
+                    q: q_cpu.view(),
+                    k_new: k_ref.view(),
+                    v_new: v_ref.view(),
+                    out: o_ref.view(),
+                    kv_layer: pool_ref.view(),
+                    block_table: bt_cpu.view(),
+                    q_indptr: ip_cpu.view(),
+                    kv_lens: kv_cpu.view(),
+                    max_q_len: q_lens.iter().copied().max().unwrap_or(0) as u32,
+                    max_kv_len: kv_lens.iter().copied().max().unwrap_or(0) as u32,
+                    max_blocks_per_seq: max_blocks as u32,
+                    scale: 1.0 / (d as f32).sqrt(),
+                    k_scale: 1.0,
+                    v_scale: 1.0,
+                    block_formats: None,
+                    tq: None,
+                })
+                .expect("BF16 reference");
+            // Decode rows riding along in a staged prefill run turbine_hip_mixed after the
+            // staged attention (so their result does not depend on the batch): they are judged
+            // against cpu::tq_attention, the prefill rows against the BF16-rounded decode.
+            let decode_row: Vec<bool> = q_lens
+                .iter()
+                .flat_map(|&q| std::iter::repeat_n(q == 1, q))
+                .collect();
+            check_rotated(&|row| decode_row[row]);
+            let keep = |v: &[f32]| -> Vec<f32> {
+                v.chunks(row_elems)
+                    .zip(&decode_row)
+                    .filter(|&(_, &dec)| !dec)
+                    .flat_map(|(r, _)| r.iter().copied())
+                    .collect()
+            };
+            assert_close(
+                &format!("{what} prefill rows vs the BF16-rounded decode"),
+                impl_name,
+                &keep(&got),
+                &keep(&read(&o_ref)),
+                DType::BF16,
+            );
+        }
+    }
+}
+
+/// A dense tensor of `data` in `mem`.
+fn tensor_of(mem: &Arc<dyn DeviceMemory>, shape: &[usize], dtype: DType, data: &[f32]) -> Tensor {
+    let mut t = Tensor::empty(mem, shape, dtype).expect("alloc");
+    t.storage
+        .copy_from_host(0, &encode(dtype, data))
+        .expect("upload");
+    t
+}
+
+/// Every format in one table: entry `(s, j)` cycles through bf16, tq4, fp8, tq2.
+fn four_formats(s: usize, j: usize) -> u8 {
+    [KV_FMT_BF16, KV_FMT_TQ4, KV_FMT_FP8_E4M3, KV_FMT_TQ2][(s + j) % 4]
+}
+
+/// Lab (P6b Task 12, AC `paged_mixed_matches_cpu`): the mixed-format paged attention of ABI
+/// v2.11 — TurboQuant `tq4` / `tq2` pools and BF16 pools whose block table mixes all four
+/// formats — at the Llama (24/8) and OLMoE (16/16) head layouts and 128- and 16-token pages,
+/// prefill (long chunks over history, short ones, decode rows riding along) and decode
+/// (ragged lengths), through every mixed implementation: the own `turbine_hip_mixed` against
+/// `cpu::tq_attention` within `4e-3 + |ref|/128`, the staged prefills against the CPU BF16
+/// attention over the BF16-rounded decode (their decode rows, which run `turbine_hip_mixed`
+/// after the staged attention, against `cpu::tq_attention`); the pool after the append byte for byte (TurboQuant
+/// records bit-exact with the codec). The library's own choice is the staged CK prefill at
+/// 128-token pages, the staged Turbine prefill at 16 and `turbine_hip_mixed` for decode, and the
+/// BF16 / FP8 implementations refuse TurboQuant pages. Breaks if a block is read or written in
+/// another format than its tag, the layer's tables are offset wrongly, a split or the rotation
+/// back is wrong, or a staged block is decoded wrongly.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn paged_mixed_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(41);
+    let prefill: &[(usize, usize)] = &[(200, 300), (17, 0), (1, 255), (64, 64), (1, 1)];
+    let decode_lens = [1usize, 17, 128, 129, 1001];
+    let ragged16: Vec<usize> = (0..16).map(|s| 740 + (37 * s) % 90).collect();
+    let bases = [
+        (DType::Tq4, MixedFormats::Uniform),
+        (DType::Tq2, MixedFormats::Uniform),
+        (DType::BF16, MixedFormats::Table(four_formats)),
+    ];
+    for heads in [(Q_HEADS, KV_HEADS), (16, 16)] {
+        for block_tokens in [128usize, 16] {
+            for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
+                let probe = AttentionConfig {
+                    kind,
+                    num_q_heads: heads.0 as u32,
+                    num_kv_heads: heads.1 as u32,
+                    head_dim: HEAD_DIM as u32,
+                    dtype: DType::Tq4,
+                    block_tokens: Some(block_tokens as u32),
+                    causal: true,
+                };
+                let hip = p.hip.attention().expect("hip attention");
+                let want = match (kind, block_tokens) {
+                    (AttentionKind::DecodePaged, _) => "turbine_hip_mixed",
+                    (_, 128) => "ck_tile_fmha_pagedkv_mixed_staged",
+                    _ => "turbine_hip_mixed_staged",
+                };
+                assert_eq!(
+                    hip.implementation(&probe),
+                    want,
+                    "{kind:?} {heads:?} {block_tokens}"
+                );
+                let spec = OpConfig::Attention(probe);
+                let impls: Vec<ImplInfo> = p
+                    .hip
+                    .implementations(spec.op())
+                    .into_iter()
+                    .filter(|i| p.hip.implementation_supports(&spec, i.index, None))
+                    .collect();
+                assert!(
+                    !impls.is_empty() && impls.iter().all(|i| i.name.contains("mixed")),
+                    "only mixed-format implementations take TurboQuant pages: {impls:?}"
+                );
+                for info in &impls {
+                    let b = bound(&p, &spec, info.index);
+                    let check = if info.name.contains("staged") {
+                        MixedCheck::Staged
+                    } else {
+                        MixedCheck::Rotated
+                    };
+                    for (base, formats) in bases {
+                        let run = |rng: &mut Rng, batch: &[(usize, usize)]| {
+                            let q_lens: Vec<usize> = batch.iter().map(|&(q, _)| q).collect();
+                            let kv_lens: Vec<usize> = batch.iter().map(|&(q, c)| q + c).collect();
+                            paged_mixed_case(
+                                &b,
+                                rng,
+                                kind,
+                                heads,
+                                block_tokens,
+                                &q_lens,
+                                &kv_lens,
+                                base,
+                                formats,
+                                check,
+                                &info.name,
+                            );
+                        };
+                        match kind {
+                            AttentionKind::PrefillPaged => run(&mut rng, prefill),
+                            _ => {
+                                for batch in [&decode_lens[..], &ragged16] {
+                                    let batch: Vec<(usize, usize)> =
+                                        batch.iter().map(|&k| (1, k - 1)).collect();
+                                    run(&mut rng, &batch);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Lab perf (P6b Task 12, in `SLOW_TESTS`): decode µs of `turbine_hip_mixed` over `tq4`, `tq2`
+/// and a table mixing all formats against the BF16 CK choice over BF16 pages, at Llama and
+/// OLMoE shapes, batch 1 and 16 at ~768 and ~2,048 tokens (128-token pages), and the staged
+/// prefill against the BF16 prefill; prints one line per case for the perf log. Run on GPU 0
+/// (`scripts/lab-test.sh novanas --tier perf`).
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn paged_mixed_timings() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(43);
+    for heads in [(Q_HEADS, KV_HEADS), (16, 16)] {
+        for (seqs, ctx) in [(1usize, 768usize), (16, 768), (16, 2048)] {
+            let kv_lens: Vec<usize> = (0..seqs).map(|s| ctx + (37 * s) % 60).collect();
+            let q_lens = vec![1usize; seqs];
+            let mut line = format!("mixed decode {:?} b{seqs} @{ctx}:", heads);
+            for (name, base, formats) in [
+                ("bf16", DType::BF16, MixedFormats::Uniform),
+                ("tq4", DType::Tq4, MixedFormats::Uniform),
+                ("tq2", DType::Tq2, MixedFormats::Uniform),
+                ("mixed", DType::BF16, MixedFormats::Table(four_formats)),
+            ] {
+                let us = mixed_time_us(
+                    &p,
+                    &mut rng,
+                    AttentionKind::DecodePaged,
+                    heads,
+                    &q_lens,
+                    &kv_lens,
+                    base,
+                    formats,
+                );
+                line += &format!(" {name}={us:.1}us");
+            }
+            println!("{line}");
+        }
+        for (q, cached) in [(512usize, 1024usize), (2048, 0)] {
+            let seqs = if q == 512 { 16 } else { 1 };
+            let q_lens = vec![q; seqs];
+            let kv_lens = vec![q + cached; seqs];
+            let mut line = format!("mixed prefill {:?} {seqs}x{q} after {cached}:", heads);
+            for (name, base) in [
+                ("bf16", DType::BF16),
+                ("tq4", DType::Tq4),
+                ("tq2", DType::Tq2),
+            ] {
+                let us = mixed_time_us(
+                    &p,
+                    &mut rng,
+                    AttentionKind::PrefillPaged,
+                    heads,
+                    &q_lens,
+                    &kv_lens,
+                    base,
+                    MixedFormats::Uniform,
+                );
+                line += &format!(" {name}={us:.1}us");
+            }
+            println!("{line}");
+        }
+    }
+}
+
+/// Mean µs per call (50 calls after a warm-up) of the library's own choice for one batch over
+/// 128-token pages (the append included, as served), pages of `base` (or a mixed table), the
+/// pool rotated over ≥ 256 MiB of copies.
+#[allow(clippy::too_many_arguments)]
+fn mixed_time_us(
+    p: &Pair,
+    rng: &mut Rng,
+    kind: AttentionKind,
+    heads: (usize, usize),
+    q_lens: &[usize],
+    kv_lens: &[usize],
+    base: DType,
+    formats: MixedFormats,
+) -> f64 {
+    const SEED: u64 = 0x5eed_7a5c_0012_0002;
+    let (q_heads, hkv) = heads;
+    let (bt, d) = (128usize, HEAD_DIM);
+    let cfg = AttentionConfig {
+        kind,
+        num_q_heads: q_heads as u32,
+        num_kv_heads: hkv as u32,
+        head_dim: d as u32,
+        dtype: base,
+        block_tokens: Some(bt as u32),
+        causal: true,
+    };
+    let base_fmt = turbine_kernels::kv_format_code(base).expect("KV dtype");
+    let seqs = q_lens.len();
+    let max_blocks = kv_lens.iter().map(|k| k.div_ceil(bt)).max().expect("seq");
+    let num_blocks = seqs * max_blocks;
+    let order = shuffled(rng, num_blocks);
+    let table: Vec<f32> = order.iter().map(|&b| b as f32).collect();
+    let fmt_table: Vec<u8> = (0..seqs * max_blocks)
+        .map(|e| match formats {
+            MixedFormats::Uniform => base_fmt,
+            MixedFormats::Table(f) => f(e / max_blocks, e % max_blocks),
+        })
+        .collect();
+    let params = tq_host_params(SEED, 0, hkv as u32);
+    let slot = mixed_page_bytes(base_fmt, bt, hkv);
+    let mut raw = vec![0u8; num_blocks * slot];
+    for (e, &b) in order.iter().enumerate() {
+        let page = mixed_history(rng, fmt_table[e], bt, hkv, &params);
+        raw[b * slot..b * slot + page.len()].copy_from_slice(&page);
+    }
+    let pool_shape: Vec<usize> = if base.tq_record_bytes().is_some() {
+        vec![num_blocks, slot]
+    } else {
+        vec![num_blocks, 2, bt, hkv, d]
+    };
+    // Copies of the pool cycled call by call, ≥ 256 MiB in all (as the Task 10 harness), so
+    // the pages are read from memory as in a served model, not from the last-level cache.
+    let copies = (256usize << 20).div_ceil(raw.len()).clamp(1, 256);
+    let pools: Vec<Tensor> = (0..copies)
+        .map(|_| {
+            let mut pool = Tensor::empty(&p.hip_mem, &pool_shape, base).expect("pool");
+            pool.storage.copy_from_host(0, &raw).expect("pool upload");
+            pool
+        })
+        .collect();
+    let mut indptr = vec![0f32];
+    for &q in q_lens {
+        indptr.push(indptr.last().copied().unwrap_or(0.0) + q as f32);
+    }
+    let total_q: usize = q_lens.iter().sum();
+    let mem = &p.hip_mem;
+    let q = tensor_of(
+        mem,
+        &[total_q, q_heads, d],
+        DType::BF16,
+        &rng.normal(total_q * q_heads * d, 1.0),
+    );
+    let k = tensor_of(
+        mem,
+        &[total_q, hkv, d],
+        DType::BF16,
+        &rng.normal(total_q * hkv * d, 1.0),
+    );
+    let v = tensor_of(
+        mem,
+        &[total_q, hkv, d],
+        DType::BF16,
+        &rng.normal(total_q * hkv * d, 1.0),
+    );
+    let o = tensor_of(
+        mem,
+        &[total_q, q_heads, d],
+        DType::BF16,
+        &vec![0.0; total_q * q_heads * d],
+    );
+    let btt = tensor_of(mem, &[seqs, max_blocks], DType::I32, &table);
+    let ip = tensor_of(mem, &[seqs + 1], DType::I32, &indptr);
+    let kvl = tensor_of(
+        mem,
+        &[seqs],
+        DType::I32,
+        &kv_lens.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+    );
+    let mut f = Tensor::empty(mem, &[seqs, max_blocks], DType::U8).expect("formats");
+    f.storage
+        .copy_from_host(0, &fmt_table)
+        .expect("formats upload");
+    let tables = TqTables::new(mem, SEED, 1, hkv as u32);
+    let mixed_table = matches!(formats, MixedFormats::Table(_));
+    let hip = p.hip.attention().expect("hip attention");
+    let tq_needed = mixed_table || base.tq_record_bytes().is_some();
+    let mut call = 0usize;
+    let mut run = || {
+        let pool = &pools[call % copies];
+        call += 1;
+        hip.execute_paged(&mut PagedAttentionContext {
+            cfg,
+            q: q.view(),
+            k_new: k.view(),
+            v_new: v.view(),
+            out: o.view(),
+            kv_layer: pool.view(),
+            block_table: btt.view(),
+            q_indptr: ip.view(),
+            kv_lens: kvl.view(),
+            max_q_len: q_lens.iter().copied().max().unwrap_or(0) as u32,
+            max_kv_len: kv_lens.iter().copied().max().unwrap_or(0) as u32,
+            max_blocks_per_seq: max_blocks as u32,
+            scale: 1.0 / (d as f32).sqrt(),
+            k_scale: 0.07,
+            v_scale: 0.11,
+            block_formats: mixed_table.then(|| f.view()),
+            tq: tq_needed.then(|| TqPaged {
+                params: &params,
+                encode: tq_encode_record,
+                seed: SEED,
+                device: Some(tables.view()),
+            }),
+        })
+        .expect("timed mixed attention");
+    };
+    time_us(p, 50, &mut run)
 }

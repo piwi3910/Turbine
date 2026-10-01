@@ -85,6 +85,9 @@ impl KvCache {
         Some(TqPaged {
             params: tq.layers.get(layer)?,
             encode: tq.encode,
+            seed: tq.seed,
+            // The device copy is the executor's (`DecoderExecutor::set_tq_device_tables`).
+            device: None,
         })
     }
 

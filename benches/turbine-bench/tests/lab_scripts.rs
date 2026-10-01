@@ -718,6 +718,7 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "prefill_shapes_match_cpu",
         "moe_decode_tier_timings",
         "decode_attention_timings",
+        "paged_mixed_timings",
     ];
 
     let text = dry_run(

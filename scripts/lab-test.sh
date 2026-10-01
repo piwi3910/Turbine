@@ -108,6 +108,8 @@ SLOW_TESTS=(
 	moe_decode_tier_timings
 	# crates/turbine-kernels/tests/hip_ops.rs (Pre-Phase-5 #3)
 	decode_attention_timings
+	# crates/turbine-kernels/tests/hip_ops.rs (P6b Task 12)
+	paged_mixed_timings
 )
 
 DRY_RUN=0

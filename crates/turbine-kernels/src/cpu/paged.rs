@@ -160,10 +160,11 @@ fn sequences(
 /// over its gathered K/V history with the same math as the contiguous op.
 pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelError> {
     let base = kv_format_code(ctx.cfg.dtype);
+    let formats = load_formats(ctx)?;
     if ctx.cfg.dtype.tq_record_bytes().is_some()
-        || ctx.block_formats.iter().any(|f| Some(*f) != base)
+        || formats.iter().flatten().any(|f| Some(*f) != base)
     {
-        return mixed(ctx);
+        return mixed(ctx, formats);
     }
     let hq = ctx.cfg.num_q_heads as usize;
     let hkv = ctx.cfg.num_kv_heads as usize;
@@ -278,13 +279,33 @@ pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelErr
     store(&ctx.out, &out)
 }
 
+/// The block formats of `ctx` (`None`: every block in `cfg.dtype`): a dense U8
+/// `[num_seqs, max_blocks_per_seq]` view.
+fn load_formats(ctx: &PagedAttentionContext<'_>) -> Result<Option<Vec<u8>>, KernelError> {
+    let Some(v) = &ctx.block_formats else {
+        return Ok(None);
+    };
+    let num_seqs = ctx.kv_lens.shape.first().copied().unwrap_or(0);
+    let want = [num_seqs, ctx.max_blocks_per_seq as usize];
+    if v.dtype != DType::U8 || v.shape.as_slice() != want {
+        return Err(invalid(format!(
+            "block_formats must be u8 {want:?}, is {} {:?}",
+            v.dtype.as_str(),
+            v.shape.as_slice()
+        )));
+    }
+    let offsets = super::element_offsets(v)?;
+    let bytes = v.slice.read_bytes()?;
+    Ok(Some(offsets.iter().map(|&o| bytes[o]).collect()))
+}
+
 /// Mixed-format pages (P6b S-5): TurboQuant L0 pages, or a block table whose format codes
 /// differ from `cfg.dtype`'s. Each new row is encoded into its block by the block's format
 /// (TurboQuant records through the caller's codec, `ctx.tq`), then attention reads every block
 /// by its format through [`tq_attention`] (the rotated-domain formulation), rows of a prefill
 /// chunk included. Block `b`'s bytes are the first page bytes of its format in slot `b` of
 /// `kv_layer` (a dense view whose rows are the slots).
-fn mixed(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelError> {
+fn mixed(ctx: &PagedAttentionContext<'_>, formats: Option<Vec<u8>>) -> Result<(), KernelError> {
     let hq = ctx.cfg.num_q_heads as usize;
     let hkv = ctx.cfg.num_kv_heads as usize;
     let d = ctx.cfg.head_dim as usize;
@@ -328,16 +349,7 @@ fn mixed(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelError> {
     let seqs = sequences(ctx, total_q, num_blocks, bt)?;
     let max_blocks = ctx.max_blocks_per_seq as usize;
     let entries = seqs.len() * max_blocks;
-    let formats: Vec<u8> = if ctx.block_formats.is_empty() {
-        vec![base; entries]
-    } else if ctx.block_formats.len() == entries {
-        ctx.block_formats.to_vec()
-    } else {
-        return Err(invalid(format!(
-            "block_formats has {} entries, the block table {entries}",
-            ctx.block_formats.len()
-        )));
-    };
+    let formats: Vec<u8> = formats.unwrap_or_else(|| vec![base; entries]);
     let page_len = |fmt: u8| -> Result<usize, KernelError> {
         match tq_attention::page_bytes_of(fmt, bt, hkv, d) {
             Some(n) if n <= slot => Ok(n),
@@ -362,7 +374,7 @@ fn mixed(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelError> {
         heads: Vec::new(),
         codebooks: Default::default(),
     };
-    let tq = ctx.tq;
+    let tq = ctx.tq.as_ref();
     if block_fmt.values().any(|f| tq_attention::is_turboquant(*f)) {
         let Some(t) = tq else {
             return Err(invalid(
@@ -522,7 +534,7 @@ mod tests {
             scale: 1.0 / (d as f32).sqrt(),
             k_scale: scales.0,
             v_scale: scales.1,
-            block_formats: &[],
+            block_formats: None,
             tq: None,
         })?;
         Ok((
@@ -707,7 +719,7 @@ mod tests {
             scale: 1.0 / (d as f32).sqrt(),
             k_scale: 1.0,
             v_scale: 1.0,
-            block_formats: &[],
+            block_formats: None,
             tq: None,
         })
         .expect("paged attention");
@@ -952,6 +964,12 @@ mod tests {
         let table_t = i32_tensor_2d(&mem, 1, &table.map(|b| b as i32));
         let q_indptr = i32_tensor(&mem, &[0, t as i32]);
         let kv_lens = i32_tensor(&mem, &[t as i32]);
+        let formats_t = Tensor::empty(&mem, &[1, 3], DType::U8).expect("formats");
+        formats_t
+            .view()
+            .slice
+            .write_bytes(&formats)
+            .expect("formats");
         cpu_reference_provider()
             .attention()
             .expect("attention family")
@@ -971,10 +989,12 @@ mod tests {
                 scale: 1.0 / (d as f32).sqrt(),
                 k_scale,
                 v_scale,
-                block_formats: &formats,
+                block_formats: Some(formats_t.view()),
                 tq: Some(TqPaged {
                     params: &params,
                     encode,
+                    seed: 0,
+                    device: None,
                 }),
             })
             .expect("mixed paged attention");

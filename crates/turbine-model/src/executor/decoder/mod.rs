@@ -60,7 +60,7 @@ use turbine_kernels::{
     AddRmsnormConfig, AddRmsnormContext, AttentionConfig, AttentionKind, ElementwiseConfig,
     ElementwiseContext, EmbeddingConfig, EmbeddingContext, GemmConfig, GemmContext, KernelError,
     KernelRegistry, NormConfig, NormContext, OpConfig, OpRequirement, PagedAttentionContext,
-    QGemmContext, QuantizeActContext, RopeConfig, RopeContext,
+    QGemmContext, QuantizeActContext, RopeConfig, RopeContext, TqPaged,
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, StreamRef, Tensor, TensorView};
 
@@ -81,11 +81,13 @@ use crate::tp::{TpContext, rank_config};
 
 pub mod hooks;
 mod linear;
+mod tq_tables;
 mod trace;
 
 pub use linear::{Linear, LinearQuant, LinearView, QuantParts, QuantView};
 
 pub use hooks::{MOE, PLAIN_ATTENTION, QK_NORM_FULL, QK_NORM_PER_HEAD, SWIGLU};
+pub use tq_tables::TqDeviceTables;
 pub use trace::TraceTensor;
 use trace::Tracer;
 
@@ -782,6 +784,9 @@ pub struct DecoderExecutor {
     step_prefill: AtomicBool,
     /// The tensor-parallel prefill overlap, when on (P5 Task 32).
     overlap: Option<PrefillOverlap>,
+    /// TurboQuant L0 pages on a GPU provider (P6b S-5): every model layer's tables in device
+    /// memory, set by [`DecoderExecutor::set_tq_device_tables`].
+    tq_device: Option<TqDeviceTables>,
 }
 
 impl DecoderExecutor {
@@ -1254,12 +1259,38 @@ impl DecoderExecutor {
             profiler: Profiler::default(),
             step_prefill: AtomicBool::new(false),
             overlap: None,
+            tq_device: None,
         })
     }
 
     /// The family's hooks.
     pub fn spec(&self) -> DecoderSpec {
         self.spec
+    }
+
+    /// TurboQuant L0 pages (P6b S-5): the device copy of every model layer's TurboQuant tables
+    /// the paged attention of a GPU provider reads (each call gets its layer's slice). Set it
+    /// before the first forward (decode graphs capture the pointers); the CPU provider reads
+    /// the host tables of `kv_cache` and needs none. Refused when the pages are not TurboQuant
+    /// or the tables do not cover every model layer and this rank's KV heads.
+    pub fn set_tq_device_tables(&mut self, tables: TqDeviceTables) -> Result<(), ModelError> {
+        let Some(tq) = self.cfg.kv_cache.tq.as_ref() else {
+            return Err(invalid(format!(
+                "TurboQuant tables for {} KV pages",
+                self.cfg.kv_cache.dtype.as_str()
+            )));
+        };
+        if tables.layers != tq.layers.len() || tables.kv_heads != self.dims.kv_heads {
+            return Err(invalid(format!(
+                "TurboQuant tables of {} layers x {} KV heads, the model has {} x {}",
+                tables.layers,
+                tables.kv_heads,
+                tq.layers.len(),
+                self.dims.kv_heads
+            )));
+        }
+        self.tq_device = Some(tables);
+        Ok(())
     }
 
     /// Diagnostics: while enabled every forward records its intermediate tensors (one blocking
@@ -1844,8 +1875,14 @@ impl DecoderExecutor {
                     // P6b S-5: every L0 block is in the pool's one format until the ladder's L0
                     // step (S-7) carves pages of other formats; TurboQuant pages take the
                     // layer's tables and codec.
-                    block_formats: &[],
-                    tq: self.cfg.kv_cache.tq_paged(model_layer),
+                    block_formats: None,
+                    tq: self.cfg.kv_cache.tq_paged(model_layer).map(|t| TqPaged {
+                        device: self
+                            .tq_device
+                            .as_ref()
+                            .and_then(|dev| dev.layer(model_layer, d.head_dim as u32)),
+                        ..t
+                    }),
                 })
         })?;
         self.record(li, "attn", at(&b.attn))?;

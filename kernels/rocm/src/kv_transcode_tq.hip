@@ -41,6 +41,7 @@
 #include <string>
 
 #include "bf16.hpp"
+#include "tq_device.hpp"
 
 #pragma clang fp contract(off)
 
@@ -51,31 +52,7 @@ using turbine_hip::fail;
 namespace {
 
 constexpr const char *kTqImpl = "turbine_hip_tq";
-constexpr int kDim = 128;         // head_dim of the committed codebooks
-constexpr int kThreads = 128;     // 4 groups of 32 lanes
-constexpr int kGroup = 32;        // lanes holding one vector
-constexpr int kPer = kDim / kGroup; // elements of a vector per lane
-constexpr int kChunk = 32;        // tokens staged at once
-constexpr int kPad = kDim + 1;    // LDS row stride (bank spread)
-// Elements of one (layer, KV head) entry of the tables: K signs, V signs, S.
-constexpr int64_t kHeadElems = 2 * kDim + kDim * kDim;
-
-// f32(sqrt(128)), f32(1 / sqrt(128)) and f32(sqrt(pi / 2) / 128), the codec's
-// constants (each rounded once from F64).
-constexpr float kSqrtD = 0x1.6a09e6p+3f;
-constexpr float kInvSqrtD = 0x1.6a09e6p-4f;
-constexpr float kQjl = 0x1.40d932p-7f;
-
-// Field offsets of a record of KB-bit K codes and VB-bit V codes.
-template <int KB, int VB> struct Record {
-  static constexpr int kKCodes = 0;
-  static constexpr int kKNorm = kDim * KB / 8;
-  static constexpr int kQjl = kKNorm + 2;
-  static constexpr int kRNorm = kQjl + kDim / 8;
-  static constexpr int kVCodes = kRNorm + 2;
-  static constexpr int kVNorm = kVCodes + kDim * VB / 8;
-  static constexpr int kBytes = (kVNorm + 2 + 15) / 16 * 16;
-};
+using namespace turbine_hip::tq;
 
 int record_bytes(int32_t format) {
   return format == TURBINE_KVFMT_TQ4 ? Record<3, 4>::kBytes
@@ -118,78 +95,6 @@ std::string describe(const turbine_kv_transcode_desc *d) {
          " head_dim=" + std::to_string(d->head_dim);
 }
 
-// The unnormalised Walsh-Hadamard transform of the vector 32 lanes hold
-// (v[i] is element i * 32 + lane), in the codec's butterfly order.
-__device__ inline void fwht(float (&v)[kPer], int lane) {
-#pragma unroll
-  for (int h = 1; h < kGroup; h *= 2) {
-#pragma unroll
-    for (int i = 0; i < kPer; ++i) {
-      const float other = __shfl_xor(v[i], h, kGroup);
-      v[i] = (lane & h) == 0 ? v[i] + other : other - v[i];
-    }
-  }
-#pragma unroll
-  for (int step = 1; step < kPer; step *= 2) {
-#pragma unroll
-    for (int i = 0; i < kPer; i += 2 * step) {
-#pragma unroll
-      for (int k = 0; k < step; ++k) {
-        const float a = v[i + k];
-        const float b = v[i + k + step];
-        v[i + k] = a + b;
-        v[i + k + step] = a - b;
-      }
-    }
-  }
-}
-
-// sqrt of the F64 sum of squares of row[0 .. 128) in order, to F32.
-__device__ inline float norm_of(const float *row) {
-  double acc = 0.0;
-  for (int j = 0; j < kDim; ++j) {
-    const double v = static_cast<double>(row[j]);
-    acc = acc + v * v;
-  }
-  return static_cast<float>(sqrt(acc));
-}
-
-// Index of the nearest centroid of an ascending codebook of n entries; a
-// value on a midpoint takes the lower one (codebook.rs nearest).
-__device__ inline int nearest(const float *cb, int n, float x) {
-  int code = 0;
-  for (int i = 0; i + 1 < n; ++i) {
-    if (x > (cb[i] + cb[i + 1]) * 0.5f)
-      ++code;
-    else
-      break;
-  }
-  return code;
-}
-
-// Byte `byte` of the packed (LSB first) B-bit codes.
-template <int B>
-__device__ inline uint8_t packed_byte(const uint8_t *codes, int byte) {
-  uint32_t out = 0;
-#pragma unroll
-  for (int b = 0; b < 8; ++b) {
-    const int p = byte * 8 + b;
-    out |= static_cast<uint32_t>((codes[p / B] >> (p % B)) & 1u) << b;
-  }
-  return static_cast<uint8_t>(out);
-}
-
-template <int B>
-__device__ inline int unpack_code(const uint8_t *packed, int i) {
-  int code = 0;
-#pragma unroll
-  for (int j = 0; j < B; ++j) {
-    const int p = i * B + j;
-    code |= ((packed[p / 8] >> (p % 8)) & 1) << j;
-  }
-  return code;
-}
-
 // The element offset of (kind, token, head, 0) in a page.
 __device__ inline int64_t vec_offset(int kind, int token, int head, int tokens,
                                      int heads) {
@@ -205,32 +110,22 @@ __global__ void __launch_bounds__(kThreads)
                      int32_t heads, const float *tables, const float *cb_k,
                      const float *cb_v) {
   using R = Record<KB, VB>;
-  __shared__ float xs[2][kChunk][kPad]; // x, then y - y_hat (K)
-  __shared__ uint8_t codes[2][kChunk][kDim];
-  __shared__ float norms[2][kChunk];
-  __shared__ uint16_t norm_bits[2][kChunk];
-  __shared__ uint16_t rnorm_bits[kChunk];
-  __shared__ uint32_t qjl[kChunk][kDim / 32];
-  __shared__ float cbk[1 << KB];
-  __shared__ float cbv[1 << VB];
+  __shared__ EncodeLds<KB, VB> lds;
 
   const int tid = threadIdx.x;
-  const int group = tid / kGroup;
-  const int lane = tid % kGroup;
   const int head = blockIdx.x;
   const int layer = blockIdx.y;
   const int64_t b = blockIdx.z;
   const uint16_t *page = pages[b * layers + layer];
   const float *head_tables =
       tables + (static_cast<int64_t>(layer) * heads + head) * kHeadElems;
-  const float *qjl_s = head_tables + 2 * kDim;
   uint8_t *records =
       coded + b * slot_bytes +
       (static_cast<int64_t>(layer) * heads + head) * tokens * R::kBytes;
   if (tid < (1 << KB))
-    cbk[tid] = cb_k[tid];
+    lds.cbk[tid] = cb_k[tid];
   if (tid < (1 << VB))
-    cbv[tid] = cb_v[tid];
+    lds.cbv[tid] = cb_v[tid];
 
   for (int t0 = 0; t0 < tokens; t0 += kChunk) {
     const int nt = min(kChunk, tokens - t0);
@@ -239,101 +134,16 @@ __global__ void __launch_bounds__(kThreads)
       const int kind = i / (nt * kDim);
       const int tok = (i / kDim) % nt;
       const int e = i % kDim;
-      xs[kind][tok][e] = turbine_hip::bf16_to_f32(turbine_hip::Bf16{
+      lds.xs[kind][tok][e] = turbine_hip::bf16_to_f32(turbine_hip::Bf16{
           page[vec_offset(kind, t0 + tok, head, tokens, heads) + e]});
     }
     __syncthreads();
-    // Norms: one thread per vector, coordinates in order.
-    if (tid < 2 * kChunk && tid % kChunk < nt) {
-      const int kind = tid / kChunk;
-      const int tok = tid % kChunk;
-      const float n = norm_of(xs[kind][tok]);
-      norms[kind][tok] = n;
-      norm_bits[kind][tok] = turbine_hip::f32_to_bf16(n).bits;
-    }
-    __syncthreads();
-    // Rotate and quantize: each group of 32 lanes one vector at a time.
-    for (int vec = group; vec < 2 * nt; vec += kThreads / kGroup) {
-      const int kind = vec / nt;
-      const int tok = vec % nt;
-      const float *signs = head_tables + kind * kDim;
-      float y[kPer];
-#pragma unroll
-      for (int i = 0; i < kPer; ++i) {
-        const int e = i * kGroup + lane;
-        y[i] = xs[kind][tok][e] * signs[e];
-      }
-      fwht(y, lane);
-      const float n = norms[kind][tok];
-      const float inv = n > 0.0f ? kSqrtD / n : 0.0f;
-      const float k =
-          turbine_hip::bf16_to_f32(turbine_hip::Bf16{norm_bits[kind][tok]}) /
-          kSqrtD;
-#pragma unroll
-      for (int i = 0; i < kPer; ++i) {
-        const int e = i * kGroup + lane;
-        const float yi = y[i] * kInvSqrtD;
-        const int code = kind == 0 ? nearest(cbk, 1 << KB, yi * inv)
-                                   : nearest(cbv, 1 << VB, yi * inv);
-        codes[kind][tok][e] = static_cast<uint8_t>(code);
-        if (kind == 0)
-          xs[0][tok][e] = yi - cbk[code] * k;
-      }
-    }
-    __syncthreads();
-    // Residual norms, then the sign bits of S * r: thread i owns row i of S.
-    if (tid < nt) {
-      rnorm_bits[tid] =
-          turbine_hip::f32_to_bf16(norm_of(xs[0][tid])).bits;
-    }
-    {
-      float acc[kChunk];
-#pragma unroll
-      for (int t = 0; t < kChunk; ++t)
-        acc[t] = -0.0f;
-      const float *row = qjl_s + static_cast<int64_t>(tid) * kDim;
-      for (int j = 0; j < kDim; j += 4) {
-        const float4 s4 = *reinterpret_cast<const float4 *>(row + j);
-        const float s[4] = {s4.x, s4.y, s4.z, s4.w};
-#pragma unroll
-        for (int q = 0; q < 4; ++q) {
-#pragma unroll
-          for (int t = 0; t < kChunk; ++t)
-            acc[t] = acc[t] + s[q] * xs[0][t][j + q];
-        }
-      }
-      for (int t = 0; t < nt; ++t) {
-        const uint64_t mask = __ballot(acc[t] >= 0.0f);
-        if (lane == 0) {
-          // Rows group * 32 .. + 31 are bits of qjl bytes 4 * group .. + 3.
-          const int shift = (threadIdx.x % warpSize) / kGroup * kGroup;
-          qjl[t][group] = static_cast<uint32_t>(mask >> shift);
-        }
-      }
-    }
-    __syncthreads();
-    // The chunk's records are contiguous: assemble them byte by byte.
-    for (int i = tid; i < nt * R::kBytes; i += kThreads) {
-      const int tok = i / R::kBytes;
-      const int o = i % R::kBytes;
-      uint8_t v = 0;
-      if (o < R::kKNorm) {
-        v = packed_byte<KB>(codes[0][tok], o);
-      } else if (o < R::kQjl) {
-        v = static_cast<uint8_t>(norm_bits[0][tok] >> (8 * (o - R::kKNorm)));
-      } else if (o < R::kRNorm) {
-        const int q = o - R::kQjl;
-        v = static_cast<uint8_t>(qjl[tok][q / 4] >> (8 * (q % 4)));
-      } else if (o < R::kVCodes) {
-        v = static_cast<uint8_t>(rnorm_bits[tok] >> (8 * (o - R::kRNorm)));
-      } else if (o < R::kVNorm) {
-        v = packed_byte<VB>(codes[1][tok], o - R::kVCodes);
-      } else if (o < R::kVNorm + 2) {
-        v = static_cast<uint8_t>(norm_bits[1][tok] >> (8 * (o - R::kVNorm)));
-      }
-      records[static_cast<int64_t>(t0) * R::kBytes + i] = v;
-    }
-    __syncthreads();
+    // The chunk's records are contiguous.
+    encode_chunk<KB, VB>(lds, nt, head_tables,
+                         [&](int tok, int o, uint8_t v) {
+                           records[static_cast<int64_t>(t0 + tok) * R::kBytes +
+                                   o] = v;
+                         });
   }
 }
 
@@ -344,87 +154,33 @@ __global__ void __launch_bounds__(kThreads)
                      int32_t heads, const float *tables, const float *cb_k,
                      const float *cb_v) {
   using R = Record<KB, VB>;
-  __shared__ uint8_t recs[kChunk][R::kBytes];
-  __shared__ float rhat[kChunk][kPad];
-  __shared__ float cbk[1 << KB];
-  __shared__ float cbv[1 << VB];
+  __shared__ DecodeLds<KB, VB> lds;
 
   const int tid = threadIdx.x;
-  const int group = tid / kGroup;
-  const int lane = tid % kGroup;
   const int head = blockIdx.x;
   const int layer = blockIdx.y;
   const int64_t b = blockIdx.z;
   uint16_t *page = pages[b * layers + layer];
   const float *head_tables =
       tables + (static_cast<int64_t>(layer) * heads + head) * kHeadElems;
-  const float *qjl_s = head_tables + 2 * kDim;
   const uint8_t *records =
       coded + b * slot_bytes +
       (static_cast<int64_t>(layer) * heads + head) * tokens * R::kBytes;
   if (tid < (1 << KB))
-    cbk[tid] = cb_k[tid];
+    lds.cbk[tid] = cb_k[tid];
   if (tid < (1 << VB))
-    cbv[tid] = cb_v[tid];
+    lds.cbv[tid] = cb_v[tid];
 
   for (int t0 = 0; t0 < tokens; t0 += kChunk) {
     const int nt = min(kChunk, tokens - t0);
     for (int i = tid; i < nt * R::kBytes; i += kThreads)
-      recs[i / R::kBytes][i % R::kBytes] =
+      lds.recs[i / R::kBytes][i % R::kBytes] =
           records[static_cast<int64_t>(t0) * R::kBytes + i];
     __syncthreads();
-    // r_hat: thread j owns column j of S; rows in order.
-    {
-      float acc[kChunk];
-#pragma unroll
-      for (int t = 0; t < kChunk; ++t)
-        acc[t] = 0.0f;
-      for (int i = 0; i < kDim; ++i) {
-        const float a = qjl_s[static_cast<int64_t>(i) * kDim + tid];
-#pragma unroll
-        for (int t = 0; t < kChunk; ++t) {
-          const float z =
-              (recs[t][R::kQjl + i / 8] >> (i % 8)) & 1 ? 1.0f : -1.0f;
-          acc[t] = acc[t] + z * a;
-        }
-      }
-      for (int t = 0; t < nt; ++t) {
-        const uint16_t rn = static_cast<uint16_t>(
-            recs[t][R::kRNorm] | (recs[t][R::kRNorm + 1] << 8));
-        const float k =
-            kQjl * turbine_hip::bf16_to_f32(turbine_hip::Bf16{rn});
-        rhat[t][tid] = acc[t] * k;
-      }
-    }
-    __syncthreads();
-    for (int vec = group; vec < 2 * nt; vec += kThreads / kGroup) {
-      const int kind = vec / nt;
-      const int tok = vec % nt;
-      const uint8_t *rec = recs[tok];
-      const int at = kind == 0 ? R::kKNorm : R::kVNorm;
-      const uint16_t nb = static_cast<uint16_t>(rec[at] | (rec[at + 1] << 8));
-      const float k = turbine_hip::bf16_to_f32(turbine_hip::Bf16{nb}) / kSqrtD;
-      float y[kPer];
-#pragma unroll
-      for (int i = 0; i < kPer; ++i) {
-        const int e = i * kGroup + lane;
-        if (kind == 0) {
-          y[i] = cbk[unpack_code<KB>(rec + R::kKCodes, e)] * k;
-          y[i] = y[i] + rhat[tok][e];
-        } else {
-          y[i] = cbv[unpack_code<VB>(rec + R::kVCodes, e)] * k;
-        }
-      }
-      fwht(y, lane);
-      const float *signs = head_tables + kind * kDim;
-      uint16_t *dst = page + vec_offset(kind, t0 + tok, head, tokens, heads);
-#pragma unroll
-      for (int i = 0; i < kPer; ++i) {
-        const int e = i * kGroup + lane;
-        dst[e] = turbine_hip::f32_to_bf16(y[i] * (kInvSqrtD * signs[e])).bits;
-      }
-    }
-    __syncthreads();
+    decode_chunk<KB, VB>(
+        lds, nt, head_tables, [&](int kind, int tok, int e, uint16_t bits) {
+          page[vec_offset(kind, t0 + tok, head, tokens, heads) + e] = bits;
+        });
   }
 }
 

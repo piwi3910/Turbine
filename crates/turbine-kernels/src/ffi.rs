@@ -193,6 +193,11 @@ pub(crate) struct AttentionPagedDesc {
     /// otherwise).
     pub k_scale: f32,
     pub v_scale: f32,
+    /// v2.11: device U8 `[num_seqs, max_blocks_per_seq]` block formats, NULL = every block in
+    /// `dtype` (read only by a library of minor ≥ 11).
+    pub block_formats: *const u8,
+    /// v2.11: host pointer to this layer's TurboQuant tables (read during the call only).
+    pub tq_params: *const TqParamsDesc,
 }
 
 /// `turbine_copy_blocks_desc` (v2). `src_blocks`/`dst_blocks` are host arrays.

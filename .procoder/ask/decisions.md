@@ -2603,6 +2603,47 @@ Open: TurboQuant prefill.
   decoded into LDS, V in the rotated domain; the spec as written), not built or measured; the most work
 - C) The scalar own kernel for prefill too (one code path; 50–100× slower than CK)
 
+Result (Task 12, 2026-10-01, `p6b-t12` ee7b950; prefill decided A, entry "6b Task 10" below). Built as picked:
+`turbine_hip_mixed` (decode, and prefill pages of any size), `ck_tile_fmha_pagedkv_mixed_staged` (prefill, 128-token
+multiples: staged CK) and `turbine_hip_mixed_staged` (prefill, other sizes), with the mixed append (TurboQuant encode
+shared with the transcode, `tq_device.hpp`). Two of the carry-overs are in: the split over keys (at most 16 splits of
+multiples of 128 keys, the split length fixed by the row's own visible keys, so batch-invariant), and a cheaper
+grouped-head score (each key's 128 codebook lookups done once and dotted with every head's `Rq`, the QJL sum from
+per-workgroup nibble tables: 32 lookups instead of 128 adds per head). Not done: a per-(coordinate, code) `Rq·c` table or
+several keys per lane. Lab `hip_ops paged_mixed_matches_cpu` green (job `1001085555-2edd5dc7`; worst element 0.51 of
+`4e-3 + |ref|/128`; mutation `tq_score` with the wrong codebook → RED, job `1001090015-2c264241`);
+`kv_transcode_matches_cpu` green on the shared encoder (job `1001084402-0e1aeca1`).
+
+Timings: `hip_ops paged_mixed_timings` run natively on GPU 0 under `bench.lock` (`ROCR_VISIBLE_DEVICES=0`, release
+build), mean of 50 calls, the append included (BF16 rows too), pools rotated over ≥ 256 MiB of copies. Without the
+rotation, BF16 at @768 (≈ 27 MB of KV) runs from the last-level cache and reads 2.6× faster (Llama b16: 65 vs 166 µs),
+which a served model's 28 layers never get. The Task 10 column is the prototype's tq4 / BF16 ratio (no append in its own
+rows), so it is a trend, not a like-for-like comparison.
+
+| decode, µs          | BF16 CK | tq4   | tq2   | mixed table | tq4 / BF16 | tq2 / BF16 | Task 10 tq4 / BF16 |
+| ------------------- | ------- | ----- | ----- | ----------- | ---------- | ---------- | ------------------ |
+| Llama 24/8 b1 @768  | 68.0    | 86.0  | 110.7 | 127.1       | 1.26×      | 1.63×      | 3.14×              |
+| Llama b16 @768      | 166.5   | 242.5 | 217.4 | 268.3       | 1.46×      | 1.31×      | 2.57×              |
+| Llama b16 @2k       | 270.0   | 309.8 | 288.5 | 430.0       | 1.15×      | 1.07×      | 2.55×              |
+| OLMoE 16/16 b1 @768 | 55.7    | 60.4  | 52.5  | 93.9        | 1.08×      | 0.94×      | 0.69×              |
+| OLMoE b16 @768      | 220.6   | 197.9 | 158.2 | 287.8       | 0.90×      | 0.72×      | 0.72×              |
+| OLMoE b16 @2k       | 491.5   | 285.8 | 238.1 | 425.9       | 0.58×      | 0.48×      | 0.59×              |
+
+| prefill, µs                | BF16 CK pagedkv | tq4 staged CK | tq2 staged CK | tq4 / BF16 | Task 10 staged tq4 / BF16 |
+| -------------------------- | --------------- | ------------- | ------------- | ---------- | ------------------------- |
+| Llama 16 × 512 after 1,024 | 1,796           | 7,088         | 6,849         | 3.95×      | 2.12×                     |
+| Llama 1 × 2,048            | 353             | 1,517         | 1,410         | 4.29×      | 1.66×                     |
+| OLMoE 16 × 512 after 1,024 | 2,538           | 11,391        | 10,879        | 4.49×      | 2.45×                     |
+| OLMoE 1 × 2,048            | 267             | 1,952         | 1,801         | 7.31×      | 2.57×                     |
+
+Reading: Llama decode, the grouped case, falls from 2.5–3.1× to 1.15–1.46× BF16 (tq4), under the 2× the lead asked to
+be told about; S-5 sets no bound (Q20), only that the ITL be measured and reported, which is Task 13's served number.
+OLMoE stays below BF16 from b16 on. A table that mixes all four formats costs 1.5–1.9× its uniform-format runs (one
+format branch per key and two accumulators). The staged prefill is 4–7× the BF16 attention, against Task 10's
+2.1–2.6×: Task 12's numbers include the TurboQuant append encode of every new row (8,192 or 2,048 rows × KV heads;
+the phase-6b lead handoff lists the tq4 encode at ≈ 0.64 ms per block), which the Task 10 staged measurement did not have. How the time
+splits between encode, staging decode and CK was not measured; a follow-up if Task 13's TTFT asks for it.
+
 ## 6b Task 10: TurboQuant prefill attention (2026-10-01)
 
 From the Task 10 evaluation (`p6b-t10` 72fb62d, merged). Decode: own `turbine_hip_mixed` (prototype passes against

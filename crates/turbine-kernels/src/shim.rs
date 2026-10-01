@@ -1405,6 +1405,23 @@ impl ShimProvider {
         self.ctx.check(code)
     }
 
+    /// True when this provider is bound to an implementation of `op` that supports the
+    /// descriptor `d` itself (`turbine_impl_supports`; its pointers are not read).
+    fn bound_takes<D>(&self, op: OpKind, d: &D) -> bool {
+        let Some(bound) = self.bound.as_ref().filter(|b| b.op == op) else {
+            return false;
+        };
+        let (Some(fns), Ok(index)) = (
+            self.syms().v21.impls,
+            i32::try_from(bound.choice.index_for(0)),
+        ) else {
+            return false;
+        };
+        // SAFETY: `turbine_impl_supports` reads the descriptor of `op`'s type during the call
+        // and dereferences none of its pointers (header v2.4).
+        unsafe { (fns.supports)(op.abi_code(), index, std::ptr::from_ref(d).cast()) == 1 }
+    }
+
     /// The contiguous entry point for `kind`; `None` for the paged kinds. The match lists every
     /// kind so a new one cannot silently fall into another kind's entry point.
     fn attention_trio(&self, kind: AttentionKind) -> Option<&OpTrio<AttentionDesc>> {
@@ -1572,6 +1589,8 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         dtype: cfg.dtype.abi_code(),
         k_scale: 1.0,
         v_scale: 1.0,
+        block_formats: std::ptr::null(),
+        tq_params: std::ptr::null(),
     }
 }
 
@@ -2440,8 +2459,9 @@ impl GemmKernel for ShimProvider {
 impl AttentionKernel for ShimProvider {
     fn supports(&self, cfg: &AttentionConfig) -> bool {
         if let Some(trio) = self.paged_trio(cfg.kind) {
+            // TurboQuant pages need the v2.11 descriptor fields (P6b S-5).
             cfg.block_tokens.is_some_and(|b| b > 0)
-                && cfg.dtype.tq_record_bytes().is_none()
+                && (cfg.dtype.tq_record_bytes().is_none() || self.ctx.lib.abi_minor() >= 11)
                 && Self::supported(trio, &paged_probe(cfg))
         } else if let Some(trio) = self.attention_trio(cfg.kind) {
             cfg.block_tokens.is_none() && Self::supported(trio, &attention_probe(cfg))
@@ -2502,19 +2522,17 @@ impl AttentionKernel for ShimProvider {
                 cfg.block_tokens
             )));
         };
-        // P6b S-5: TurboQuant pages and mixed-format block tables need the ABI v2.10 fields
-        // (plan Task 12); below them every block is in `cfg.dtype`.
-        let base = crate::ops::kv_format_code(cfg.dtype);
-        if cfg.dtype.tq_record_bytes().is_some()
-            || ctx.tq.is_some()
-            || ctx.block_formats.iter().any(|f| Some(*f) != base)
-        {
+        // P6b S-5: TurboQuant pages and mixed-format block tables travel in the ABI v2.11
+        // fields; a library below minor 11 would ignore them.
+        let mixed = cfg.dtype.tq_record_bytes().is_some() || ctx.block_formats.is_some();
+        if mixed && self.ctx.lib.abi_minor() < 11 {
             return Err(KernelError::Unsupported {
                 message: format!(
-                    "{} over {} pages or a mixed-format block table needs the ABI v2.10 \
-                     mixed-format paged attention",
+                    "{} over {} pages or a mixed-format block table needs a kernel library of \
+                     ABI minor 11 (this one is {})",
                     cfg.op(),
-                    cfg.dtype.as_str()
+                    cfg.dtype.as_str(),
+                    self.ctx.lib.abi_minor()
                 ),
             });
         }
@@ -2526,14 +2544,65 @@ impl AttentionKernel for ShimProvider {
             ));
         }
         let num_blocks = ctx.kv_layer.shape.first().copied().unwrap_or(0);
-        dense(
-            "kv_layer",
-            &ctx.kv_layer,
-            &[num_blocks, 2, block_tokens as usize, hkv, d],
-            cfg.dtype,
-        )?;
+        match cfg.dtype.tq_record_bytes() {
+            // TurboQuant pages: `[num_blocks, page bytes]`, one record per (KV head, token).
+            Some(record) => dense(
+                "kv_layer",
+                &ctx.kv_layer,
+                &[num_blocks, hkv * block_tokens as usize * record as usize],
+                cfg.dtype,
+            )?,
+            None => dense(
+                "kv_layer",
+                &ctx.kv_layer,
+                &[num_blocks, 2, block_tokens as usize, hkv, d],
+                cfg.dtype,
+            )?,
+        }
         let num_seqs = ctx.kv_lens.shape.first().copied().unwrap_or(0);
         let max_blocks = ctx.max_blocks_per_seq as usize;
+        let block_formats = match &ctx.block_formats {
+            Some(f) => {
+                dense("block_formats", f, &[num_seqs, max_blocks], DType::U8)?;
+                self.ctx.device_ptr("block_formats", f)?.cast_const().cast()
+            }
+            None => std::ptr::null(),
+        };
+        // The layer's TurboQuant tables in device memory: required when a block can be
+        // TurboQuant (header v2.11).
+        let tq = if mixed {
+            let Some(t) = ctx
+                .tq
+                .as_ref()
+                .and_then(|t| t.device.as_ref().map(|dev| (t, dev)))
+            else {
+                return Err(invalid(format!(
+                    "{} over {} pages or a mixed-format block table needs the layer's \
+                     TurboQuant tables in device memory (TqPaged::device)",
+                    cfg.op(),
+                    cfg.dtype.as_str()
+                )));
+            };
+            let (t, dev) = t;
+            let mut codebooks = [std::ptr::null::<f32>(); 4];
+            for (bits, (cb, out)) in dev.codebooks.iter().zip(&mut codebooks).enumerate() {
+                dense("codebook", cb, &[1 << (bits + 1)], DType::F32)?;
+                *out = self.ctx.device_ptr("codebook", cb)?.cast_const().cast();
+            }
+            let per_head = KvTranscodeTables::head_elems(cfg.head_dim);
+            dense("tq tables", &dev.tables, &[hkv * per_head], DType::F32)?;
+            Some(TqParamsDesc {
+                seed: t.seed,
+                codebooks,
+                tables: self
+                    .ctx
+                    .device_ptr("tq tables", &dev.tables)?
+                    .cast_const()
+                    .cast(),
+            })
+        } else {
+            None
+        };
         dense("kv_lens", &ctx.kv_lens, &[num_seqs], DType::I32)?;
         dense("q_indptr", &ctx.q_indptr, &[num_seqs + 1], DType::I32)?;
         dense(
@@ -2569,7 +2638,19 @@ impl AttentionKernel for ShimProvider {
             dtype: cfg.dtype.abi_code(),
             k_scale: ctx.k_scale,
             v_scale: ctx.v_scale,
+            block_formats,
+            tq_params: tq.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
         };
+        if ctx.block_formats.is_some() && !self.bound_takes(cfg.op(), &d) {
+            // A block table that may mix formats, and a bound implementation (chosen for pages
+            // of `cfg.dtype` alone) that does not read it: the library's own choice, which is
+            // a mixed-format implementation (only those take a block_formats table).
+            // SAFETY: as in `run`: every pointer in `d` comes from `ShimContext::device_ptr`
+            // (bounds-checked views of this context's memory), `tq_params` points at `tq`,
+            // which outlives the call, and the library keeps no pointer beyond it.
+            let code = unsafe { (trio.run)(self.ctx.raw, &d) };
+            return self.ctx.check(code);
+        }
         self.run(cfg.op(), trio, &d, 0)
     }
 }
