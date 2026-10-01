@@ -2616,3 +2616,29 @@ materialises K/V, which S-5 excludes; the own decode-style kernel used for prefi
 - C) The slow own kernel for prefill too
 
 **Decision (user, 2026-10-01): A.** Staged CK for prefill; S-5 amended so "without materialising K/V" applies to decode only, prefill judged against BF16-rounded decoded values (Task 12 makes the spec edit).
+
+## 6b planner follow-ups after the poll-bounded copy timing fix (2026-10-01)
+
+From `p6b-planner` (merged 82ba3ff; `.procoder/handoff/p6b-planner.md`). Retrieve plans 2–6 → 29–48 per run, lossy
+cached tokens 768 → 44k–87k; the stressed run now often trips SURVIVAL, so cached ratios are not comparable yet.
+`tp_tiers.rs` still times copies at the poll: fixed the same way under the earlier decision ("backends time their own
+copies", A), no question.
+
+1. Remaining recomputes follow real 33–255 ms waits behind 250–800 MB of demotions on the same copy stream; the
+   planner charges that shared wait once per block.
+   - A) Charge a plan's path latency once, and put promotions ahead of demotions on the copy stream
+   - B) Charge once only
+   - C) Leave it
+2. An estimate that looks slow never recovers when nothing is promoted.
+   - A) Decay it toward the calibrated cost over time
+   - B) Periodic probe copies
+   - C) Leave it
+3. SURVIVAL makes the stressed A/B too noisy.
+   - A) A/B on a lighter variant (below SURVIVAL), medians of 3 runs
+   - B) Also review whether promotion bursts belong in the exhaustion forecast (reliability code)
+   - C) Medians of 3+ runs at the current load
+4. Device→host copies calibrate at 1.6 GB/s vs 10.45 GB/s host→device (the demotions promotions wait behind).
+   - A) Investigate now (pinned D2H on GPU 0 should be far faster)
+   - B) Later
+
+**Decision (user, 2026-10-01): 1 A, 2 A, 3 A, 4 A.** Charge a plan's path latency once and promote ahead of demotions; decay a slow estimate toward the calibrated cost; A/B just below SURVIVAL with medians of 3 runs; investigate the slow device-to-host copies now.
