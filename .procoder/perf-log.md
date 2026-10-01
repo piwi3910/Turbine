@@ -187,18 +187,18 @@ Workload unchanged (`scripts/lab-bench.sh`, novanas GPU 0, 16 concurrent, 512-wo
 
 Task 6, per-tier FP8 (`kv.cpu.format=fp8_e4m3`, `kv.cpu.max_bytes=4GiB`), Llama-3.2-3B BF16 weights and BF16 KV pages, novanas GPU 0, phase2c config. Phase-6a exit baseline for the BF16 path: 854.2 tok/s, ITL p50 15.4 ms, TTFT p50 207 ms.
 
-| Date       | Commit  | Change                                                                                                                                              | tok/s | ITL p50 (ms) | TTFT p50 (ms) | golden c1 / c16 |
-| ---------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ----- | ------------ | ------------- | --------------- |
+| Date       | Commit  | Change                                                                                                                                                                | tok/s | ITL p50 (ms) | TTFT p50 (ms) | golden c1 / c16 |
+| ---------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- | ------------ | ------------- | --------------- |
 | 2026-10-01 | d6e564e | Task 6: `scripts/lab-bench.sh --model llama --golden16 -- --set kv.cpu.format=fp8_e4m3 --set kv.cpu.max_bytes=4GiB` (0.995x of the 6a baseline; labbook run 7683e112) | 849.6 | 15.4         | 208           | PASS / PASS     |
 
 Multi-turn (`turbine-bench --profile multi-turn --turns 8 --shared-prefix-words 2000 --session-hints`, client on novanas, `lab-serve.sh` with `phase2c-novanas-llama.yaml --set kv.cpu.format=<f> --set kv.cpu.max_bytes=4GiB`, one run per cell):
 
-| Workload                                           | L1 format  | Requests ok | cached_tokens_ratio | later-turn TTFT p50 / p99 (ms) | L1 lookups | lossy_cached_tokens |
-| -------------------------------------------------- | ---------- | ----------- | ------------------- | ------------------------------ | ---------- | ------------------- |
-| spec command: 16 sessions, c8                      | `l0`       | 128/128     | 0.9064              | 75.7 / 109                     | 0          | 0                   |
-| spec command: 16 sessions, c8                      | `fp8_e4m3` | 128/128     | 0.9056              | 76.4 / 137                     | 0          | 0                   |
-| stressed: 32 sessions, c32, `--think-time 1..4`    | `l0`       | 256/256     | 0.6180              | 2102 / 23370                   | 2062       | 0                   |
-| stressed: 32 sessions, c32, `--think-time 1..4`    | `fp8_e4m3` | 256/256     | 0.6324              | 522 / 8502                     | 2016       | 384                 |
+| Workload                                        | L1 format  | Requests ok | cached_tokens_ratio | later-turn TTFT p50 / p99 (ms) | L1 lookups | lossy_cached_tokens |
+| ----------------------------------------------- | ---------- | ----------- | ------------------- | ------------------------------ | ---------- | ------------------- |
+| spec command: 16 sessions, c8                   | `l0`       | 128/128     | 0.9064              | 75.7 / 109                     | 0          | 0                   |
+| spec command: 16 sessions, c8                   | `fp8_e4m3` | 128/128     | 0.9056              | 76.4 / 137                     | 0          | 0                   |
+| stressed: 32 sessions, c32, `--think-time 1..4` | `l0`       | 256/256     | 0.6180              | 2102 / 23370                   | 2062       | 0                   |
+| stressed: 32 sessions, c32, `--think-time 1..4` | `fp8_e4m3` | 256/256     | 0.6324              | 522 / 8502                     | 2016       | 384                 |
 
 The spec command never reaches L1 for reuse (L0 holds the 16 sessions), so both ratios equal; the stressed run (L0 of 585 blocks is smaller than the live histories) is the discriminating one. 64 sessions at c64 overloaded the server (SURVIVAL, 503 `overloaded`, 350 of 512 requests failed in both arms) and is not used. An earlier fp8 run of the stressed workload lost 65 of 256 requests to 503 `overloaded` (ratio 0.735, not comparable); the recorded cell is its rerun.
 
@@ -207,3 +207,28 @@ L1 capacity in the same 4 GiB (`/turbine/v1/kv` `formats`, added in this task): 
 The planner chose `recompute_cheaper` for 155 of the stressed fp8 run's requests even with L1 lookups at 2016 (lossy penalty 0.1 on the fp8 copies plus the measured L1 to L0 rate), so few lossy blocks were reused (384 tokens = 3 blocks) and the ratio gain is 0.014.
 
 GSM8K-200 at concurrency 16 with `kv.cpu.format=fp8_e4m3` (server after the stressed run): 162/200 = 0.810 (`tests/eval/llama-3.2-3b-instruct/turbine-l1-fp8.json`) against `turbine-bf16-c16.json` 0.795: `eval-compare --max-drop 0.01` PASS. The eval's prompts share no full block, so no lossy block was reused during it (`lossy_cached_tokens` unchanged across the eval); it shows the tier configuration does not disturb serving, not the quality of lossy reuse. That is `kv_gpu::lossy_tier_reuse` (worst first-8 |delta logprob| 0.067, `x-turbine-kv-lossy: deny` bit-equal to cold).
+
+### Planner recompute investigation (decision "6b Task 6", point 3, A; branch `p6b-planner`)
+
+Same stressed workload as Task 6 (`turbine-bench --profile multi-turn --sessions 32 --turns 8 --concurrency 32 --shared-prefix-words 2000 --think-time 1..4 --session-hints`, client on novanas), served by `lab-serve.sh` with `phase2c-novanas-llama.yaml` plus `logging.level: info,turbine_kv=debug,turbine_server::kv_orchestrator=debug` and `--set kv.cpu.format=<f> --set kv.cpu.max_bytes=4GiB`, GPU 0 unless noted, one serve Job per row. The DEBUG events `kv_plan` (planner inputs and costs), `kv_copy_timed` and `kv_prefill_rate` (c420c09) give the estimator's inputs at decision time.
+
+Root cause: copies that end on the GPU copy stream (L0 → L1, L1 → L0, the device transcode) were timed to the poll that saw their event done, once per engine iteration (25–200 ms here). Startup calibration measures L1 → L0 at 10.45 GB/s (1.4 ms per 14.7 MB block); the observed L1 → L0 "durations" were 23–149 ms, so after a handful of promotions the latency estimate sat at 63 ms (`l0`) / 97 ms (`fp8_e4m3`) and every L1 block priced above recomputing its 128 tokens (prefill EWMA 7–12k tok/s, 11–18 ms per block). With no further promotions the estimate never saw another sample: in the pre-fix fp8 run only 8 L1 → L0 copies were ever observed and 154 of 156 L1-hit plans recomputed. Not the cause: the lossy penalty (0.1, fp8 copies are half-size), in-flight caps (no truncated plans), L0 pressure (no `l0_pressure` plans), the lossless-tail rule, session hints.
+
+Fix: 69769e2 (a copy seen done only at a poll is `CopyTime::Within { at_least, at_most }`, folded in clamped to its bounds) and d9b5f92 (the clamped value is the path's unloaded, calibrated cost, so a slow burst no longer pins the estimate at the poll interval).
+
+| Run                               | Commit  | Serve run id        | ok      | cached_tokens_ratio | later-turn TTFT p50 / p99 (ms) | L1 lookups | recompute / retrieve plans | lossy_cached_tokens | SURVIVAL |
+| --------------------------------- | ------- | ------------------- | ------- | ------------------- | ------------------------------ | ---------- | -------------------------- | ------------------- | -------- |
+| `l0` before                       | c420c09 | 1001033606-2395994b | 174/256 | 0.7638              | 191 / 25145                    | 830        | 74 / 6                     | 0                   | 1        |
+| `fp8_e4m3` before                 | c420c09 | 1001034410-0eb35462 | 256/256 | 0.6240              | 653 / 8347                     | 2090       | 154 / 2                    | 768                 | 0        |
+| `l0` bound, current prior (GPU 1) | 69769e2 | 1001041537-02a98dff | 256/256 | 0.7762              | 381 / 34739                    | 1273       | 114 / 41                   | 0                   | 0        |
+| `fp8_e4m3` bound, current prior   | 69769e2 | 1001041816-09badab7 | 193/256 | 0.8012              | 162 / 38578                    | 705        | 73 / 36                    | 26624               | 1        |
+| `l0` after                        | d9b5f92 | 1001043044-2fcc68d3 | 184/256 | 0.7911              | 143 / 22517                    | 813        | 49 / 30                    | 0                   | 1        |
+| `l0` after                        | d9b5f92 | 1001043549-023f6b3f | 256/256 | 0.6359              | 597 / 8467                     | 1959       | 111 / 29                   | 0                   | 0        |
+| `l0` after                        | d9b5f92 | 1001044056-042c265a | 256/256 | 0.6470              | 445 / 8220                     | 1896       | 98 / 38                    | 0                   | 0        |
+| `fp8_e4m3` after                  | d9b5f92 | 1001043218-2938a6a8 | 143/256 | 0.8569              | 128 / 1164                     | 480        | 36 / 32                    | 44160               | 1        |
+| `fp8_e4m3` after                  | d9b5f92 | 1001043815-041607a7 | 214/256 | 0.7873              | 227 / 43094                    | 740        | 86 / 45                    | 74240               | 1        |
+| `fp8_e4m3` after                  | d9b5f92 | 1001044322-1dfee52b | 175/256 | 0.8202              | 182 / 22043                    | 549        | 35 / 48                    | 87040               | 1        |
+
+Retrievals rose from 2–6 to 29–48 plans and lossy reuse from 768 to 44k–87k tokens, but the comparison is confounded: the workload sits at the overload edge and a run that trips SURVIVAL (`exhaustion_horizon`, 10 s of 503 `overloaded`) loses its later turns, which raises the ratio over the requests that succeed. The fp8 arm tripped it in 3 of 3 runs after the fix (once right after a 64-block promotion burst), against 0 of 1 before (Task 6 also lost one earlier fp8 run to it); `l0` 1 of 3 after, 1 of 1 before. `cached_tokens_ratio` across arms is not comparable until the runs are clean.
+
+Remaining `recompute_cheaper` plans (35–111 per run): every one ran while the L1 → L0 latency estimate was above 1 ms after a genuinely slow burst. Each slow burst (promotions seen running 33–255 ms) coincided with 250–800 MB of pressure demotions (L0 → L1, calibrated at only 1.6 GB/s device-to-host) on the same FIFO copy stream: the promotions really waited, but the planner sums that shared wait once per block (`k × latency`).

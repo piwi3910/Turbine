@@ -36,7 +36,7 @@ use crate::identity::{
     Blake3Hasher, KeyHasher, KvFormat, KvKey, NamespaceCache, lossy_key, prefix_keys,
 };
 use crate::metrics::{EvictReason, KvMetrics, LADDER_EVICT, LadderReason, PrefetchOutcome};
-use crate::planner::{KvPlan, PlanInputs, PlanReason, plan_prefix};
+use crate::planner::{KvPlan, PlanInputs, PlanReason, plan_cost, plan_prefix, reuse_cap};
 use crate::policy::{
     BlockScoreInputs, EvictAction, KvBlockSummary, LadderContext, LadderLimits, SelectedPolicy,
     make_policy, recompute_seconds,
@@ -884,6 +884,20 @@ impl KvHierarchy {
             allow_lossy,
         };
         let mut plan = plan_prefix(&inputs);
+        // The planner's inputs and costs, for the `kv_plan` DEBUG event: the cost of no reuse,
+        // of the chosen cutoff and of reusing every block the plan may reuse.
+        let reusable = reuse_cap(inputs.prompt_tokens, bt).min(tiers.len());
+        let plan_costs = (
+            plan_cost(&inputs, 0),
+            plan_cost(&inputs, plan.cutoff_blocks() as usize),
+            plan_cost(&inputs, reusable),
+        );
+        let l1_est = inputs.l1_to_l0;
+        let lower_bytes = copy_bytes
+            .iter()
+            .zip(&tiers)
+            .find(|(_, t)| **t != TierId::L0)
+            .map_or(0, |(b, _)| *b);
         let k = plan.cutoff_blocks() as usize;
         // Reference every reused L0 block first so allocating promotion targets can never
         // reclaim one of them.
@@ -996,9 +1010,17 @@ impl KvHierarchy {
             matched_l0 = tiers.iter().filter(|t| **t == TierId::L0).count(),
             matched_l1 = tiers.iter().filter(|t| **t == TierId::L1).count(),
             matched_l2 = tiers.iter().filter(|t| **t == TierId::L2).count(),
+            matched_lossy = penalties.iter().filter(|p| p.is_some()).count(),
             cutoff = blocks.len(),
             recompute_tokens = plan.recompute_tokens,
             reason = plan.reason.as_str(),
+            prefill_tps = self.prefill_tps,
+            l1_latency_s = l1_est.map_or(0.0, |e| e.latency_s),
+            l1_bandwidth_bps = l1_est.map_or(0.0, |e| e.bandwidth_bps),
+            lower_copy_bytes = lower_bytes,
+            cost_recompute_s = plan_costs.0,
+            cost_chosen_s = plan_costs.1,
+            cost_reuse_all_s = plan_costs.2,
         );
         if let Some(r) = self.requests.get_mut(&req.request) {
             r.committed = blocks.len();

@@ -58,7 +58,8 @@ use turbine_kv::tier::{
     TierBlockRef, TierError, TierId, TierSlot,
 };
 use turbine_kv::transfer::{
-    TransferBackend, TransferCodec, TransferPath, TransferPurpose, TransferRequest, TransferTicket,
+    CopyTime, TransferBackend, TransferCodec, TransferPath, TransferPurpose, TransferRequest,
+    TransferTicket,
 };
 use turbine_kv::{BlockPool, KvMetrics};
 
@@ -782,8 +783,8 @@ impl TransferBackend for StaticBackend<'_> {
         self.driver.finish(t, p)
     }
 
-    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
-        self.driver.took.remove(&t.id)
+    fn took(&mut self, t: &TransferTicket) -> Option<CopyTime> {
+        self.driver.took.remove(&t.id).map(CopyTime::Exact)
     }
 }
 
@@ -1223,7 +1224,12 @@ mod tests {
                 codec: TransferCodec::l0(layout().block_bytes()),
             },
         };
-        let took = g.driver.backend(&mut g.local).took(&t).expect("measured");
+        let took = g
+            .driver
+            .backend(&mut g.local)
+            .took(&t)
+            .expect("measured")
+            .reported();
         assert!(took >= reported, "at least the worker's own copy: {took:?}");
         assert!(
             took < delay / 3,

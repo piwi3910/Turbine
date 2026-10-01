@@ -68,7 +68,7 @@ use turbine_kv::tier::{
     TierBlockMut, TierBlockRef, TierError, TierId, TierSlot,
 };
 use turbine_kv::transfer::{
-    TransferBackend, TransferCodec, TransferPath, TransferPurpose, TransferTicket,
+    CopyTime, TransferBackend, TransferCodec, TransferPath, TransferPurpose, TransferTicket,
 };
 use turbine_kv::{BlockPool, KvDocument, KvMetrics};
 use turbine_model::kv_scales::KvCache;
@@ -761,6 +761,13 @@ impl KvOrchestrator {
         };
         self.prefill_tps = Some(tps);
         self.h.set_prefill_tps(tps);
+        tracing::debug!(
+            event = "kv_prefill_rate",
+            tokens,
+            seconds,
+            sample_tps = sample,
+            prefill_tps = tps,
+        );
     }
 
     /// `GET /turbine/v1/kv` (P4 §Data).
@@ -1426,8 +1433,8 @@ impl TransferBackend for IoPoolBackend {
         d.result.map(Some)
     }
 
-    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
-        self.took.remove(&t.id)
+    fn took(&mut self, t: &TransferTicket) -> Option<CopyTime> {
+        self.took.remove(&t.id).map(CopyTime::Exact)
     }
 }
 
@@ -1492,6 +1499,55 @@ enum Job {
     Copies { copies: Copies, then: AfterCopies },
     Io(IoStage),
     Done(Result<TierSlot, TierError>),
+}
+
+/// What a [`CopyStreamBackend`] knows of one copy's duration. A copy runs in stages (copy-stream
+/// copies, an I/O-pool job, a device transcode), each started at the poll that saw the previous
+/// one done. A stage on the I/O pool reports when it ended; a stage on the copy stream is seen
+/// done only at a poll, so it ran at least until the last poll that saw it running (0 when the
+/// first poll found it done) and at most until the poll that saw it done.
+struct CopyClock {
+    started: Instant,
+    /// When the current stage started.
+    stage: Instant,
+    /// The last poll that saw the current copy-stream stage still running.
+    running_at: Option<Instant>,
+    /// The time the finished stages certainly took.
+    at_least: Duration,
+    /// When the last stage ended on the I/O pool: the copy's exact end.
+    ended: Option<Instant>,
+}
+
+impl CopyClock {
+    fn new(now: Instant) -> Self {
+        CopyClock {
+            started: now,
+            stage: now,
+            running_at: None,
+            at_least: Duration::ZERO,
+            ended: None,
+        }
+    }
+
+    /// The current stage ended at `end` (known) or by `now` (seen done at a poll); the next
+    /// starts now.
+    fn stage_done(&mut self, end: Option<Instant>, now: Instant) {
+        let ran_until = end.or(self.running_at).unwrap_or(self.stage);
+        self.at_least += ran_until.saturating_duration_since(self.stage);
+        self.ended = end;
+        self.stage = now;
+        self.running_at = None;
+    }
+
+    fn time(&self, now: Instant) -> CopyTime {
+        match self.ended {
+            Some(end) => CopyTime::Exact(end.saturating_duration_since(self.started)),
+            None => CopyTime::Within {
+                at_least: self.at_least,
+                at_most: now.saturating_duration_since(self.started),
+            },
+        }
+    }
 }
 
 /// The registered tier codecs as the function table of the cpu-reference transcode (a kernel
@@ -1738,15 +1794,14 @@ pub struct CopyStreamBackend {
     /// Bytes of one logical block (every shard).
     block_bytes: usize,
     jobs: HashMap<u64, Job>,
-    /// Copies in flight with their start time, and when the I/O pool finished the last stage of
-    /// those that ended in it: a copy is timed start to completion, not to the iteration that
-    /// polls it (decision "6b: production KV copy backends time copies to the polling
-    /// boundary"). A copy that ends on the copy stream is timed to the poll that sees its event
-    /// complete (the ABI has no event timestamps).
-    started: HashMap<u64, Instant>,
-    io_finished: HashMap<u64, Instant>,
-    /// Durations of copies `poll` just completed, until `took` reads them.
-    took: HashMap<u64, Duration>,
+    /// The clock of each copy in flight: a copy is timed start to completion, not to the
+    /// iteration that polls it (decision "6b: production KV copy backends time copies to the
+    /// polling boundary"). One that ends on the I/O pool is timed exactly; one that ends on the
+    /// copy stream only within bounds, since the ABI has no event timestamps (decision "6b Task
+    /// 6", point 3).
+    clocks: HashMap<u64, CopyClock>,
+    /// Times of copies `poll` just completed, until `took` reads them.
+    took: HashMap<u64, CopyTime>,
     /// The device transcode of lower-tier copies (P6b S-1), when the library has one and the
     /// staging slots could be allocated.
     gpu: Option<DeviceTranscode>,
@@ -1784,8 +1839,7 @@ impl CopyStreamBackend {
             io,
             block_bytes,
             jobs: HashMap::new(),
-            started: HashMap::new(),
-            io_finished: HashMap::new(),
+            clocks: HashMap::new(),
             took: HashMap::new(),
             gpu: None,
         }
@@ -2442,8 +2496,8 @@ impl CopyStreamBackend {
             Job::Io(stage) => match self.io.take(t.id) {
                 None => Ok(Job::Io(stage)),
                 Some(done) => {
-                    if matches!(stage, IoStage::Final) {
-                        self.io_finished.insert(t.id, done.finished);
+                    if let Some(c) = self.clocks.get_mut(&t.id) {
+                        c.stage_done(Some(done.finished), Instant::now());
                     }
                     self.finish_io(t, stage, done)
                 }
@@ -2460,6 +2514,14 @@ impl CopyStreamBackend {
                             self.copy_failed(t, then, *s);
                             return Err(TierError::Io(format!("copy stream: {e}")));
                         }
+                    }
+                }
+                let now = Instant::now();
+                if let Some(c) = self.clocks.get_mut(&t.id) {
+                    if all {
+                        c.stage_done(None, now);
+                    } else {
+                        c.running_at = Some(now);
                     }
                 }
                 if all {
@@ -2514,9 +2576,13 @@ impl CopyStreamBackend {
 
 impl TransferBackend for CopyStreamBackend {
     fn start(&mut self, t: &TransferTicket) -> Result<(), TierError> {
-        let started = Instant::now();
+        let mut clock = CopyClock::new(Instant::now());
         let job = self.start_job(t)?;
-        self.started.insert(t.id, started);
+        if matches!(job, Job::Done(_)) {
+            // Synchronous copies: done before `start_job` returned.
+            clock.stage_done(Some(Instant::now()), Instant::now());
+        }
+        self.clocks.insert(t.id, clock);
         self.jobs.insert(t.id, job);
         Ok(())
     }
@@ -2526,20 +2592,17 @@ impl TransferBackend for CopyStreamBackend {
         let advanced = match self.advance(t, job) {
             Ok(job) => job,
             Err(e) => {
-                self.started.remove(&t.id);
-                self.io_finished.remove(&t.id);
+                self.clocks.remove(&t.id);
                 return Err(e);
             }
         };
         match advanced {
             Job::Done(r) => {
-                let started = self.started.remove(&t.id);
-                let end = self.io_finished.remove(&t.id).unwrap_or_else(Instant::now);
+                let clock = self.clocks.remove(&t.id);
                 if r.is_ok()
-                    && let Some(started) = started
+                    && let Some(clock) = clock
                 {
-                    self.took
-                        .insert(t.id, end.saturating_duration_since(started));
+                    self.took.insert(t.id, clock.time(Instant::now()));
                 }
                 r.map(Some)
             }
@@ -2550,7 +2613,7 @@ impl TransferBackend for CopyStreamBackend {
         }
     }
 
-    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
+    fn took(&mut self, t: &TransferTicket) -> Option<CopyTime> {
         self.took.remove(&t.id)
     }
 }
@@ -3155,7 +3218,11 @@ mod tests {
         }
         assert!(done, "the copy completed");
         let took = o.backend.took(&t).expect("the backend timed its own copy");
-        assert!(took < late / 2, "timed to the poll: {took:?}");
+        assert!(
+            matches!(took, CopyTime::Exact(_)),
+            "ends on the pool: {took:?}"
+        );
+        assert!(took.reported() < late / 2, "timed to the poll: {took:?}");
 
         // L1 → L2 on the I/O pool alone.
         let l1 = o.backend.l1.clone().expect("L1");
@@ -3174,7 +3241,32 @@ mod tests {
         }
         assert!(done, "the pool finished the copy");
         let took = o.backend.io.took(&t).expect("the pool timed its own copy");
-        assert!(took < late / 2, "timed to the poll: {took:?}");
+        assert_eq!(took, CopyTime::Exact(took.reported()));
+        assert!(took.reported() < late / 2, "timed to the poll: {took:?}");
+
+        // L0 → L1 and L1 → L0 end on the copy stream (done as enqueued here), seen done only
+        // by a poll long after: the backend cannot say when they ended, so it reports the poll
+        // as an upper bound, never as the copy's duration (decision "6b Task 6", point 3: the
+        // planner priced 1.4 ms L1 blocks at the 25-100 ms iterations that polled them).
+        let key = KvKey([10; 16]);
+        write_block(&r, 5, &pattern(3, 5, bb));
+        for (id, path, src, dst) in [
+            (3, TransferPath::L0ToL1, 5, 0),
+            (4, TransferPath::L1ToL0, 0, 6),
+        ] {
+            let t = ticket(id, path, key, src, dst);
+            o.backend.start(&t).unwrap();
+            std::thread::sleep(late);
+            assert!(o.backend.poll(&t).unwrap().is_some(), "{path:?} completed");
+            match o.backend.took(&t) {
+                Some(CopyTime::Within { at_least, at_most }) => {
+                    assert!(at_least < late / 2, "{path:?}: ran at least {at_least:?}");
+                    assert!(at_most >= late, "{path:?}: seen done at {at_most:?}");
+                }
+                other => panic!("{path:?}: a stream copy is bounded by its poll: {other:?}"),
+            }
+        }
+        assert_eq!(read_block(&r, 6), pattern(3, 5, bb), "L1 → L0 landed");
     }
 
     /// A kernel-library context stand-in: copies are done when enqueued, and a pinned buffer
