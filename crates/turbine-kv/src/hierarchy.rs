@@ -9,7 +9,7 @@
 //! so allocation can never reclaim a block while it is being read.
 
 use std::cmp::{Ordering as CmpOrdering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -29,7 +29,8 @@ use crate::directory::{
     format_is_lossy,
 };
 use crate::document::{
-    HitRate, KvDocument, KvSummary, KvTierDocument, Prefetch, Sessions, TierState, Transfers,
+    FormatUsage, HitRate, KvDocument, KvSummary, KvTierDocument, Prefetch, Sessions, TierState,
+    Transfers,
 };
 use crate::identity::{
     Blake3Hasher, KeyHasher, KvFormat, KvKey, NamespaceCache, lossy_key, prefix_keys,
@@ -1350,6 +1351,7 @@ impl KvHierarchy {
                     Some((lk, format)) => self.lossy_entry(&req.key, lk, format),
                     None => self.dir.get(&req.key).map(|_| req.key),
                 };
+                let filed = key;
                 if let Some(key) = key
                     && self
                         .dir
@@ -1371,7 +1373,8 @@ impl KvHierarchy {
                 self.stats.promotions += 1;
                 if req.purpose == TransferPurpose::Prefetch {
                     self.prefetch_inflight.remove(&ticket);
-                    self.prefetch.issued(req.key);
+                    // Tracked under the entry the copy is filed in, the key a request attaches.
+                    self.prefetch.issued(filed.unwrap_or(req.key));
                     pool.release(&[block]);
                     return;
                 }
@@ -2505,6 +2508,18 @@ impl KvHierarchy {
                 acc.blocks_resident += 1;
                 continue;
             }
+            // A lossy copy promoted earlier sits in L0 under its lossy key (P6b S-3).
+            if let Some((lk, _)) = b.fastest().and_then(|t| {
+                let loc = b.location(t)?;
+                self.lossy_target(key, loc)
+            }) && self
+                .dir
+                .get(&lk)
+                .is_some_and(|l| l.location(TierId::L0).is_some())
+            {
+                acc.blocks_resident += 1;
+                continue;
+            }
             if self.transfer.is_busy_with(key) {
                 continue;
             }
@@ -2596,6 +2611,19 @@ impl KvHierarchy {
         let bb = self.cfg.block_bytes;
         let dtype = self.namespaces.format().layout.dtype.as_str();
         let blocks = |bytes: u64| u32::try_from(bytes / bb.max(1)).unwrap_or(u32::MAX);
+        // Copies per tier and codec (the codec's encoded size per copy).
+        let mut formats: HashMap<TierId, BTreeMap<&'static str, FormatUsage>> = HashMap::new();
+        for b in self.dir.iter() {
+            for l in &b.locations {
+                let u = formats
+                    .entry(l.tier)
+                    .or_default()
+                    .entry(l.format)
+                    .or_default();
+                u.blocks += 1;
+                u.bytes += self.format_bytes(l.format);
+            }
+        }
         let mut tiers = vec![KvTierDocument {
             tier: TierId::L0.as_str(),
             dtype,
@@ -2615,6 +2643,7 @@ impl KvHierarchy {
                 est_latency_seconds: 0.0,
                 est_bandwidth_bytes_per_second: None,
             }),
+            formats: formats.remove(&TierId::L0).unwrap_or_default(),
         }];
         for id in [TierId::L1, TierId::L2] {
             let t = self.tier(id);
@@ -2638,6 +2667,7 @@ impl KvHierarchy {
                     est_latency_seconds: t.map_or(0.0, |t| t.est_latency().as_secs_f64()),
                     est_bandwidth_bytes_per_second: t.and_then(|t| t.est_bandwidth()),
                 }),
+                formats: formats.remove(&id).unwrap_or_default(),
             });
         }
         KvDocument {
@@ -3171,6 +3201,118 @@ pub(crate) mod tests {
             0,
             "pressure empties L0 of unreferenced blocks"
         );
+    }
+
+    /// P6b Task 6: after a prefetch of a prompt whose lower-tier copies are lossy (fp8 L2), the
+    /// promoted L0 copies sit under their `lossy_key` entries and the next lookup reuses them
+    /// from L0 (the fastest lossy copy), not the exact entries' lossy L2 locations (which the
+    /// planner then priced against recompute). No exact entry gains an L0 location (S-3). Breaks
+    /// if the lookup prefers the exact entry's lossy L2 copy over the promoted L0 one.
+    #[test]
+    fn lookup_prefers_the_promoted_lossy_l0_copy() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l2 = Arc::new(MemTier::new(TierId::L2, 16 * bb, arc));
+        let mut r = rig(16, None, Some(l2.clone()), clock);
+        r.h.cfg.l2_format = "fp8_e4m3";
+        r.h.cfg.allow_lossy = true;
+        let prompt: Vec<u32> = (0..66).collect();
+        run(&mut r, &prompt);
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        for _ in 0..4 {
+            r.clock.advance(Duration::from_millis(10));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+        assert!(l2.len() >= 2, "blocks sit in L2");
+
+        let accepted =
+            r.h.prefetch(
+                &mut r.pool,
+                PrefetchTarget::Tokens {
+                    prompt: &prompt,
+                    cache_salt: "",
+                },
+            )
+            .expect("prefetch accepted");
+        assert!(accepted.blocks_queued >= 2, "{accepted:?}");
+        for _ in 0..6 {
+            r.clock.advance(Duration::from_millis(10));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+        let hasher = Blake3Hasher(r.h.namespaces.get(""));
+        for k in prefix_keys(&hasher, &prompt, 16) {
+            let exact = r.h.directory().get(&k).expect("the exact entry");
+            // (The sequence's tail stays lossless, and block 0 never left L0: exact copies.)
+            let has_fp8 = exact.locations.iter().any(|l| l.format == "fp8_e4m3");
+            assert!(
+                !has_fp8 || exact.location(TierId::L0).is_none(),
+                "a lossy L0 copy is never filed under the exact entry: {:?}",
+                exact.locations
+            );
+        }
+
+        let id = RequestId::new_v4();
+        let a = match attach(&mut r, id, &prompt) {
+            AttachOutcome::Ready(a) => a,
+            other => panic!("the promoted blocks are in L0: Ready, got {other:?}"),
+        };
+        assert_eq!(a.cached_tokens, 64, "all four blocks reused");
+        assert_eq!(
+            a.lossy_tokens, 32,
+            "the two promoted lossy blocks are served lossy"
+        );
+        assert!(a.plan.promote.is_empty(), "no copy: {:?}", a.plan);
+        assert_eq!(a.plan.reason, PlanReason::AllL0);
+        // Every prefetched block is counted used once attached (the lossy ones by their lossy
+        // key), and a second prefetch finds them all resident instead of promoting again.
+        assert_eq!(r.h.prefetch_stats().used, accepted.blocks_queued as u64);
+        r.pool.release(&a.blocks);
+        r.h.request_done(&mut r.pool, id, false);
+        let again =
+            r.h.prefetch(
+                &mut r.pool,
+                PrefetchTarget::Tokens {
+                    prompt: &prompt,
+                    cache_salt: "",
+                },
+            )
+            .expect("prefetch accepted");
+        assert_eq!(again.blocks_queued, 0, "{again:?}");
+        assert_eq!(again.blocks_resident, 4, "{again:?}");
+    }
+
+    /// P6b S-2 (`GET /turbine/v1/kv`): each tier lists its copies per codec, with the bytes at
+    /// that codec's encoded block size, so a lossy tier's capacity in its own blocks can be read
+    /// (`blocks_total` counts L0-format blocks). Breaks if the lists drop a copy, count it in
+    /// the wrong tier or codec, or price an fp8 copy at the L0 block size.
+    #[test]
+    fn document_lists_copies_per_codec() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l2 = Arc::new(MemTier::new(TierId::L2, 16 * bb, arc));
+        let mut r = rig(16, None, Some(l2), clock);
+        r.h.cfg.l2_format = "fp8_e4m3";
+        let fp8 = r.h.format_bytes("fp8_e4m3");
+        assert!(fp8 < bb);
+        run(&mut r, &(0..66).collect::<Vec<u32>>());
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        for _ in 0..4 {
+            r.clock.advance(Duration::from_millis(10));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+        let doc = r.h.document(&r.pool, (0, 0));
+        let tier = |name: &str| doc.tiers.iter().find(|t| t.tier == name).expect("tier");
+        let l2 = &tier("l2").formats;
+        assert_eq!(l2["fp8_e4m3"].blocks, 2, "{l2:?}");
+        assert_eq!(l2["fp8_e4m3"].bytes, 2 * fp8);
+        // The lossless tail is demoted at the L0 format.
+        assert_eq!(l2[L0_FORMAT].blocks, 1, "{l2:?}");
+        assert_eq!(l2[L0_FORMAT].bytes, bb);
+        let l0 = &tier("l0").formats;
+        assert_eq!(l0[L0_FORMAT].blocks, 1, "{l0:?}");
+        assert!(tier("l1").formats.is_empty());
     }
 
     /// The Task 4 kv-sim regression (MultiTurn lru 251 → 199 s, cost_aware/lru 0.78 → 0.93):

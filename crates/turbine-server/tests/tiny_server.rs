@@ -1542,6 +1542,65 @@ fn run_failing(dir: &TempDir, yaml: &str) -> (Option<i32>, String) {
     )
 }
 
+/// Phase 4 (found by the P6b Task 6 lab test): `POST /turbine/v1/kv/prefetch` on an idle engine
+/// answers. The engine parks on its command channel when nothing runs, and the prefetch travels
+/// on the KV command channel, so without a wake it waited for the next request (the lab tests'
+/// 300 s read timeouts). Breaks if the prefetch is queued without waking the engine.
+#[test]
+fn prefetch_on_an_idle_engine_answers() {
+    let server = TinyServer::start("");
+    // Let the engine finish its warm-up turns and park.
+    std::thread::sleep(Duration::from_secs(1));
+    let resp = request_within(
+        server.addr,
+        "POST",
+        "/turbine/v1/kv/prefetch",
+        Some(&json!({"prompt": "hello there, this is a prompt"}).to_string()),
+        Duration::from_secs(10),
+    );
+    assert_eq!(resp.status, 202, "{}", resp.body);
+}
+
+/// P6b S-1 (Task 6 fix): the device staging of the KV transcode is a fixed cost in the workspace
+/// pool, counted before the KV pool is sized. With a lossy lower tier (`kv.nvme.format:
+/// fp8_e4m3` under the BF16 pages) the budget error's `workspace=` is larger than with `l0`
+/// tiers by the staging slots; the budget is too small to start either way, so the refusal (exit
+/// 1, the pools named) is what is compared. Breaks if the staging is allocated outside the
+/// budget again.
+#[test]
+fn transcode_staging_is_in_the_workspace_pool() {
+    let dir = TempDir::new("turbine-staging-budget");
+    let tiny = dir.path().join("tiny");
+    write_tiny_llama(&tiny, 7);
+    let workspace = |format: &str| -> u64 {
+        let addr = free_addr();
+        let yaml = format!(
+            "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cpu\n\
+             kv:\n  nvme:\n    enabled: true\n    path: {}\n    max_bytes: 1GiB\n    \
+             format: {format}\nreliability:\n  memory:\n    workspace_bytes: 1KiB\n    \
+             device_budget_bytes: 1KiB\n",
+            tiny.display(),
+            dir.path().join("kv").display()
+        );
+        let (code, stderr) = run_failing(&dir, &yaml);
+        assert_eq!(code, Some(1), "{format}: stderr:\n{stderr}");
+        let at = stderr
+            .find("workspace=")
+            .unwrap_or_else(|| panic!("{format}: no pool named:\n{stderr}"));
+        stderr[at + "workspace=".len()..]
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{format}: unreadable workspace:\n{stderr}"))
+    };
+    let plain = workspace("l0");
+    let staged = workspace("fp8_e4m3");
+    assert!(
+        staged > plain,
+        "workspace {plain} bytes with l0 tiers, {staged} with an fp8 tier"
+    );
+}
+
 #[test]
 fn startup_failures_exit_1() {
     let dir = TempDir::new("turbine-startup-failures");

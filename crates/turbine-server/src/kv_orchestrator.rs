@@ -77,6 +77,7 @@ use turbine_tensor::{
     PinnedBuffer, PinnedMemory,
 };
 
+use crate::engine::EngineCommand;
 use crate::engine::tp_tiers::TierDriver;
 use crate::model::StartupError;
 
@@ -281,9 +282,19 @@ pub enum KvCommand {
 #[derive(Clone)]
 pub struct KvHandle {
     tx: mpsc::Sender<KvCommand>,
+    /// The engine's command channel: an idle engine parks on it, so a queued KV command wakes
+    /// it there (`EngineCommand::Wake`). Weak, like the pressure controller's: the handles
+    /// going away still stops the engine.
+    wake: Option<mpsc::WeakSender<EngineCommand>>,
 }
 
 impl KvHandle {
+    /// Wakes the engine thread when a command is queued for it.
+    pub fn with_wake(mut self, engine: mpsc::WeakSender<EngineCommand>) -> KvHandle {
+        self.wake = Some(engine);
+        self
+    }
+
     /// `POST /turbine/v1/kv/prefetch`. A full command channel is `QueueFull` at once: a
     /// prefetch never waits (P4 Failure modes, "prefetch overload").
     pub async fn prefetch(
@@ -297,6 +308,10 @@ impl KvHandle {
                 return Err(PrefetchRefused::Kv(PrefetchError::QueueFull));
             }
             Err(mpsc::error::TrySendError::Closed(_)) => return Err(PrefetchRefused::EngineGone),
+        }
+        if let Some(engine) = self.wake.as_ref().and_then(mpsc::WeakSender::upgrade) {
+            // A full channel wakes the engine anyway.
+            let _ = engine.try_send(EngineCommand::Wake);
         }
         match answer.await {
             Ok(r) => r.map_err(PrefetchRefused::Kv),
@@ -589,7 +604,7 @@ impl KvOrchestrator {
                 "KV tier copies are stored per tensor-parallel rank (or pipeline stage) shard"
             );
         }
-        Ok((o, KvHandle { tx }))
+        Ok((o, KvHandle { tx, wake: None }))
     }
 
     /// Runs the lower tiers' format copies (`kv.cpu.format`, `kv.nvme.format`) on the device
@@ -601,14 +616,8 @@ impl KvOrchestrator {
         kernel: Arc<dyn KernelProvider>,
         mem: &Arc<dyn DeviceMemory>,
     ) -> bool {
-        let formats: Vec<&str> = [
-            (cfg.cpu.enabled, cfg.cpu.format.as_str()),
-            (cfg.nvme.enabled, cfg.nvme.format.as_str()),
-        ]
-        .into_iter()
-        .filter_map(|(on, f)| on.then_some(f))
-        .collect();
-        self.backend.enable_device_transcode(kernel, mem, &formats)
+        self.backend
+            .enable_device_transcode(kernel, mem, &tier_formats(cfg))
     }
 
     /// `reliability.pressure.deescalate_dwell`: the compression ladder's step-up dwell (P6b S-6).
@@ -1542,6 +1551,38 @@ impl KvCodecFns for CodecTable {
             .decode_cpu(slot, &Self::layout(cfg), block, &Self::params(seed, scales))
             .map_err(|e| e.to_string())
     }
+}
+
+/// The codecs of the enabled lower tiers (`kv.cpu.format`, `kv.nvme.format`).
+fn tier_formats(cfg: &KvConfig) -> Vec<&str> {
+    [
+        (cfg.cpu.enabled, cfg.cpu.format.as_str()),
+        (cfg.nvme.enabled, cfg.nvme.format.as_str()),
+    ]
+    .into_iter()
+    .filter_map(|(on, f)| on.then_some(f))
+    .collect()
+}
+
+/// Device bytes the KV transcode's staging slots need for a pool of `layout` pages (P6b S-1):
+/// `DEMOTION_INFLIGHT` slots of the largest encoded block among the enabled lower tiers' lossy
+/// formats the device transcode can run; 0 when no tier needs it (every tier at `l0`, or a
+/// format that is lossless below these pages and so is copied as its bytes). The memory budget
+/// counts it in the workspace pool before the KV pool is sized, so a budget that cannot hold it
+/// refuses at startup like any other fixed cost; [`DeviceTranscode`] allocates the same bytes.
+pub fn transcode_staging_bytes(cfg: &KvConfig, layout: &KvLayout) -> u64 {
+    tier_formats(cfg)
+        .into_iter()
+        .filter(|f| {
+            *f != L0_FORMAT
+                && DeviceTranscode::format_of(f).is_some()
+                && turbine_kv::directory::format_is_lossy(f, layout)
+        })
+        .filter_map(|f| encoded_bytes(f, layout).ok())
+        .max()
+        .map_or(0, |slot| {
+            slot as u64 * turbine_kv::hierarchy::DEMOTION_INFLIGHT as u64
+        })
 }
 
 /// The kernel library's ABI v2.11 KV transcode for the demotion and promotion paths (P6b S-1):
@@ -3016,6 +3057,33 @@ mod tests {
                 assert_eq!(slots(&o), None);
             }
         }
+    }
+
+    /// P6b S-1: the device staging the transcode allocates is sized before the budget is fixed:
+    /// `DEMOTION_INFLIGHT` slots of the largest encoded block among the enabled tiers' lossy
+    /// formats, and nothing for `l0` tiers, disabled tiers or FP8 pages (copied as their bytes).
+    /// Breaks if the estimate differs from what `enable_device_transcode` allocates.
+    #[test]
+    fn transcode_staging_is_sized_from_the_tier_formats() {
+        let dir = TempDir::new("turbine-kv-staging-bytes");
+        let mut kv = kv_config(&dir, true);
+        assert_eq!(transcode_staging_bytes(&kv, &layout()), 0, "l0 tiers");
+        let fp8 = turbine_kv::codec::registry().get("fp8_e4m3").unwrap();
+        let slot = fp8.bytes_per_block(&layout());
+        kv.nvme.format = ModuleName::new("fp8_e4m3").unwrap();
+        let want = slot * turbine_kv::hierarchy::DEMOTION_INFLIGHT as u64;
+        assert_eq!(transcode_staging_bytes(&kv, &layout()), want);
+        kv.cpu.format = ModuleName::new("fp8_e4m3").unwrap();
+        assert_eq!(transcode_staging_bytes(&kv, &layout()), want, "same slots");
+        kv.nvme.enabled = false;
+        kv.cpu.enabled = false;
+        assert_eq!(transcode_staging_bytes(&kv, &layout()), 0, "no lower tier");
+        kv.nvme.enabled = true;
+        let fp8_pages = KvLayout {
+            dtype: DType::F8E4M3,
+            ..layout()
+        };
+        assert_eq!(transcode_staging_bytes(&kv, &fp8_pages), 0, "FP8 pages");
     }
 
     /// Decision "6b: production KV copy backends time copies to the polling boundary": a copy

@@ -4,6 +4,8 @@
 //! `KvDocument::from_pool` still renders exactly the Phase 2 JSON while `KvHierarchy::document`
 //! renders the full Phase 4 document (every P2 tier field kept inside each tier object).
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use turbine_core::types::PressureState;
 
@@ -29,6 +31,19 @@ pub struct KvTierDocument {
     pub blocks_free: u32,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub state: Option<TierState>,
+    /// P6b S-2: the copies the tier holds per codec (`blocks` copies, `bytes` at that codec's
+    /// encoded block size); empty in the Phase 2 document. `blocks_total` and `blocks_used`
+    /// count L0-format blocks, so a lossy tier's capacity in its own blocks is
+    /// `capacity_bytes` over the codec's `bytes / blocks`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub formats: BTreeMap<&'static str, FormatUsage>,
+}
+
+/// One codec's share of a tier (`formats` of [`KvTierDocument`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct FormatUsage {
+    pub blocks: u64,
+    pub bytes: u64,
 }
 
 /// Phase 4 per-tier keys (P4 §Data).
@@ -101,6 +116,7 @@ impl KvDocument {
                 blocks_used: pool.used_blocks(),
                 blocks_free: pool.free_blocks(),
                 state: None,
+                formats: BTreeMap::new(),
             }],
             summary: None,
         }

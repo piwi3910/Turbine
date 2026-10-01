@@ -474,8 +474,8 @@ pub fn spawn(
                 backend.set_ready(
                     replica,
                     EngineHandle {
+                        kv: kv_handle.with_wake(submit_tx.downgrade()),
                         submit_tx,
-                        kv: kv_handle,
                     },
                     shared,
                     controller,
