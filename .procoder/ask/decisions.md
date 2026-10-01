@@ -2751,3 +2751,27 @@ From `p6b-t12` (merged a1c640f). Decode tq4 / BF16: Llama 1.15–1.46×, OLMoE 0
    - B) Now, before Task 13
 
 **Decision (user, 2026-10-01): 1 A, 2 A.**
+
+## 6b: shared-prefix eval never demotes the prefix to L1 (2026-10-01)
+
+From `p6b-planner2` (handoff). The prefix is 2,944 tokens (23 blocks). In every run it stayed in L0 (0 demotions):
+L0 → L1 demotion takes a block only once its children have left L0, and the first items' own blocks (children of the
+prefix) are never demoted, so the prefix never becomes eligible. More fillers or a smaller L0 do not change it. The
+FP8-L1 candidate scored 0.790 (baseline 0.755–0.775) with 0 lossy cached tokens, so the guard (correctly) exited 1.
+Real shared system prompts have the same shape.
+
+- A) Copy ahead in `turbine-kv`: demotion may copy a shared parent down while keeping its L0 copy, dropping the L0
+  copy later (lets lower tiers hold shared prefixes)
+- B) Tag the two head items with a session key in the eval runner (runner-only; exercises the session path)
+- C) A diagnostics endpoint that demotes a prefix, used only by the gate
+
+## 6b: SURVIVAL at 20–32 multi-turn sessions on Llama-3.2-3B (2026-10-01)
+
+From `p6b-planner2`: 32, 24 and 20 sessions (concurrency = sessions, think 1..4 s) each went GREEN → SURVIVAL on
+`exhaustion_horizon`; 16 sessions was clean in 6 of 6 runs. A direct GREEN → SURVIVAL jump at 20 sessions of a 3B model
+looks too eager (the earlier decision declined only the forecast review for the A/B, not the behaviour itself).
+
+- A) Investigate the exhaustion forecast now (what it predicts vs what happens; whether promotion bursts belong in it)
+- B) Later (after 6b), note it as a reliability item
+
+**Decisions (user, 2026-10-01):** prefix demotion — **A** (copy ahead in `turbine-kv`); SURVIVAL at 20+ sessions — **A** (investigate the exhaustion forecast now).
