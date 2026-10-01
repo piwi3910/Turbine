@@ -314,3 +314,21 @@ if(TURBINE_BUILD_QGEMM_MXFP4_EVAL)
   turbine_hip_settings(turbine_qgemm_mxfp4_eval)
   set_target_properties(turbine_qgemm_mxfp4_eval PROPERTIES LINKER_LANGUAGE HIP)
 endif()
+
+# The mixed-format / TurboQuant paged attention provider evaluation harness (Phase 6b Task 10,
+# decision "P6b: mixed-format / TurboQuant paged attention — provider evaluation (kernel reuse
+# rule)"): builds BF16, FP8, tq4 and tq2 pages for the Llama-3.2-3B and OLMoE head layouts and
+# runs the library's paged attention implementations, the TurboQuant pages staged to BF16 by the
+# Task 8 transcode then CK, and a prototype own rotated-domain mixed-format kernel; checks each
+# against a host reference with cpu::tq_attention's semantics and times decode and prefill shapes.
+# A lab tool, off by default: -DTURBINE_BUILD_ATTN_EVAL=ON.
+option(TURBINE_BUILD_ATTN_EVAL "Build the mixed-format paged attention evaluation harness" OFF)
+if(TURBINE_BUILD_ATTN_EVAL)
+  add_executable(turbine_attn_eval tools/attn_eval.cpp)
+  set_source_files_properties(tools/attn_eval.cpp PROPERTIES LANGUAGE HIP)
+  set_target_properties(turbine_attn_eval PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+  target_include_directories(turbine_attn_eval PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(turbine_attn_eval PRIVATE hip::host turbine_hip)
+endif()
